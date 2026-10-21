@@ -1512,6 +1512,59 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* The optional LUT must not turn a sparse but sorted column into a
+ * declined shortcut. Intern padding BEFORE the used names. */
+static test_result_t test_sorted_symbol_sparse_fallback(void) {
+    ray_heap_init();
+    ray_sym_init();
+    for (int i = 0; i < 70000; i++) {
+        char name[40];
+        int len = snprintf(name, sizeof(name), "unused-rank-padding-%d", i);
+        ray_sym_intern(name, (size_t)len);
+    }
+    int64_t z = ray_sym_intern("late-z", 6);
+    int64_t a = ray_sym_intern("late-a", 6);
+    TEST_ASSERT_TRUE(a > 65536 && z > 65536);
+    int64_t values[] = {a, a, a, a, z, z, z, z};
+    ray_t* sym = ray_vec_from_raw(RAY_SYM, values, 8);
+    ray_t* hdr = NULL;
+    TEST_ASSERT_TRUE(build_enum_rank(sym, 8, &hdr) == NULL);
+    TEST_ASSERT_TRUE(hdr == NULL); /* density guard, not allocation failure */
+    TEST_ASSERT_TRUE(ray_key_cols_sorted(&sym, 1, 0, 8));
+    TEST_ASSERT_FALSE(ray_key_cols_sorted(&sym, 1, 1, 8));
+    int64_t name = ray_sym_intern("sparse-key", 10);
+    ray_t* keys = make_sym_atom(name);
+    ray_t* table = ray_table_new(1);
+    table = ray_table_add_col(table, name, sym);
+    ray_t* result = ray_xasc_fn(table, keys);
+    TEST_ASSERT_TRUE(result == table); /* shortcut retained, not a full sort */
+    ray_release(result);
+    int64_t* data = ray_data(sym);
+    for (int i = 0; i < 8; i++) data[i] = i < 4 ? z : a;
+    TEST_ASSERT_TRUE(ray_key_cols_sorted(&sym, 1, 1, 8));
+    result = ray_xdesc_fn(table, keys);
+    TEST_ASSERT_TRUE(result == table);
+    ray_release(result);
+    data[7] = z;
+    TEST_ASSERT_FALSE(ray_key_cols_sorted(&sym, 1, 1, 8));
+    ray_release(table);
+    ray_release(keys);
+    ray_release(sym);
+
+    /* Within the LUT budget, repeated constant segments still need only
+     * the equal-ID scan; ray_key_cols_sorted must not build dense ranks. */
+    ray_t* constant = ray_vec_new(RAY_SYM, 10000);
+    constant->len = 10000;
+    data = ray_data(constant);
+    for (int i = 0; i < 10000; i++) data[i] = a;
+    for (int i = 0; i < 20; i++)
+        TEST_ASSERT_TRUE(ray_key_cols_sorted(&constant, 1, i % 2, 10000));
+    ray_release(constant);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Lexical rank checks must not compare raw intern order. Exercise the
  * generic and specialized key orders, both directions, and a late inversion
  * beyond a dispatch boundary. The runner's pool supplies parallel coverage. */
@@ -1565,6 +1618,7 @@ static test_result_t test_sorted_symbol_rank_check(void) {
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/sorted_symbol_sparse_fallback", test_sorted_symbol_sparse_fallback, NULL, NULL },
     { "sort/sorted_symbol_rank_check", test_sorted_symbol_rank_check, NULL, NULL },
     /* xrank tests */
     { "sort/xrank_basic",               test_xrank_basic,               NULL, NULL },

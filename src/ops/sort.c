@@ -4256,6 +4256,24 @@ typedef struct {
     _Atomic int* ordered;
 } sorted_check_ctx_t;
 
+/* Unranked symbol keys are scanned serially; a rank budget refusal does
+ * not mean their lexical order is undecidable. Equal IDs need no lookup. */
+static int sorted_check_sym_cmp(const sorted_check_ctx_t* c, int64_t k,
+                                int64_t ia, int64_t ib) {
+    if (ia == ib) return 0;
+    if (c->sym_ranks[k])
+        return (c->sym_ranks[k][ia] > c->sym_ranks[k][ib]) -
+               (c->sym_ranks[k][ia] < c->sym_ranks[k][ib]);
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(c->key_cols[k]);
+    ray_t* sa = ray_sym_domain_str(dom, ia);
+    ray_t* sb = ray_sym_domain_str(dom, ib);
+    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+    uint32_t ml = la < lb ? la : lb;
+    int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
+    return cmp ? cmp : (la > lb) - (la < lb);
+}
+
 static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
@@ -4265,7 +4283,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
      * (sym, time) shape.  The generic loop below pays a type-switch per
      * read and an atomic flag load per row; here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
-     * rank comparison only runs at run boundaries), the secondary key
+     * lexical comparison only runs at run boundaries), the secondary key
      * reads raw i64, and the bail flag is polled per 4096-row block.
      *
      * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
@@ -4292,8 +4310,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
                 if (RAY_LIKELY(ia == ib)) {
                     if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
                 } else {
-                    int cmp = (c->sym_ranks[0][ia] > c->sym_ranks[0][ib]) -
-                              (c->sym_ranks[0][ia] < c->sym_ranks[0][ib]);
+                    int cmp = sorted_check_sym_cmp(c, 0, ia, ib);
                     if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
                 }
             }
@@ -4310,8 +4327,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
                 int64_t ia = ray_read_sym(ray_data(col), i - 1, RAY_SYM, col->attrs);
                 int64_t ib = ray_read_sym(ray_data(col), i,     RAY_SYM, col->attrs);
                 if (ia != ib) {
-                    cmp = (c->sym_ranks[k][ia] > c->sym_ranks[k][ib]) -
-                          (c->sym_ranks[k][ia] < c->sym_ranks[k][ib]);
+                    cmp = sorted_check_sym_cmp(c, k, ia, ib);
                 }
             } else {
                 int64_t va = read_col_i64(ray_data(col), i - 1, col->type, col->attrs);
@@ -4323,37 +4339,39 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     }
 }
 
-/* Never resolve symbols inside parallel row comparisons: the runtime symbol
- * domain uses a shared lock. Resolve and rank each ID once before dispatch,
- * using exactly the lexical ordering of the radix sort. On allocation failure
- * decline the shortcut and let the normal sort handle the input. */
+/* Table sorts may prepare ranks for a parallel scan. The per-partition
+ * caller keeps the original O(rows) string scan: rebuilding a domain-sized
+ * LUT for every small or constant segment is not economical. If any symbol
+ * key lacks ranks (including density-budget refusal or OOM), scan serially
+ * with its original comparator, preserving sortedness admission without
+ * making workers contend on the runtime symbol lock. */
 static bool sorted_check_run(ray_t** key_cols, int64_t n_keys,
-                             uint8_t descending, int64_t nrows) {
+                             uint8_t descending, int64_t nrows,
+                             bool prepare_sym_ranks) {
     if (nrows < 2) return true;
     uint32_t* ranks[n_keys];
     ray_t* rank_hdrs[n_keys];
     memset(ranks, 0, sizeof(ranks));
     memset(rank_hdrs, 0, sizeof(rank_hdrs));
-    bool ready = true;
+    bool parallel_safe = true;
     for (int64_t k = 0; k < n_keys; k++) {
         if (key_cols[k]->type != RAY_SYM) continue;
-        ranks[k] = build_enum_rank(key_cols[k], nrows, &rank_hdrs[k]);
-        if (!ranks[k]) { ready = false; break; }
+        if (prepare_sym_ranks)
+            ranks[k] = build_enum_rank(key_cols[k], nrows, &rank_hdrs[k]);
+        if (!ranks[k]) { parallel_safe = false; break; }
     }
     _Atomic int ordered = 1;
-    if (ready) {
-        sorted_check_ctx_t sctx = {
-            .key_cols = key_cols, .sym_ranks = ranks, .n_keys = n_keys,
-            .descending = descending, .ordered = &ordered,
-        };
-        ray_pool_t* pool = ray_pool_get();
-        if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
-            ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
-        else
-            sorted_check_fn(&sctx, 0, 1, nrows);
-    }
+    sorted_check_ctx_t sctx = {
+        .key_cols = key_cols, .sym_ranks = ranks, .n_keys = n_keys,
+        .descending = descending, .ordered = &ordered,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (parallel_safe && pool && nrows >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
+    else
+        sorted_check_fn(&sctx, 0, 1, nrows);
     for (int64_t k = 0; k < n_keys; k++) scratch_free(rank_hdrs[k]);
-    return ready && atomic_load_explicit(&ordered, memory_order_relaxed) != 0;
+    return atomic_load_explicit(&ordered, memory_order_relaxed) != 0;
 }
 
 /* Public: are these key columns already in sorted order under the sort's
@@ -4376,8 +4394,8 @@ static bool sorted_check_run(ray_t** key_cols, int64_t n_keys,
  * asked for the other end.  So the rejection is conservatism about the
  * requested placement, not an undecidable ordering — a caller that pins the
  * default could decide it.
- * Symbol keys prepare lexical ranks before scanning; integer-only keys
- * retain O(nrows) with early bail on the first violation. A 0/1-row column is
+ * O(nrows) with early bail on the first violation. Symbol keys use a serial
+ * string scan without domain-sized rank preparation. A 0/1-row column is
  * trivially sorted.  Used by the parted ORDER BY streaming path in query.c
  * to verify each partition is internally sorted at O(partition), never a
  * full sort. */
@@ -4396,7 +4414,7 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
             t != RAY_TIMESTAMP && t != RAY_SYM)
             return false;
     }
-    return sorted_check_run(key_cols, n_keys, descending, nrows);
+    return sorted_check_run(key_cols, n_keys, descending, nrows, false);
 }
 
 static bool sort_part_key_type(int8_t t) {
@@ -4562,7 +4580,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 detectable = false;
         }
         if (detectable) {
-            if (sorted_check_run(key_cols, n_keys, descending, nrows)) {
+            if (sorted_check_run(key_cols, n_keys, descending, nrows, true)) {
                 ray_t* out = (descending || n_keys <= 1) ? NULL
                     : sort_stamp_ordered_table(tbl, key_ids[0], key_cols[0],
                                                n_keys > 1 ? key_ids[1] : -1);
