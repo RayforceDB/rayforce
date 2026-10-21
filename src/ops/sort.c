@@ -4272,10 +4272,10 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
      * about in-band nulls: this loop ranks sym 0 by its domain string, i.e.
      * smallest, whereas the real sort places nulls by the `nulls_first` flag
      * independently of payload.  See the note on ray_key_cols_sorted. */
+    /* TIME/DATE have 32-bit cells; the direct secondary loads below are i64. */
     if (!c->descending && c->n_keys == 2 &&
         c->key_cols[0]->type == RAY_SYM &&
         (c->key_cols[1]->type == RAY_I64 ||
-         c->key_cols[1]->type == RAY_TIME ||
          c->key_cols[1]->type == RAY_TIMESTAMP) &&
         !ray_vec_may_have_nulls(c->key_cols[1])) {
         ray_t* sc = c->key_cols[0];

@@ -40,6 +40,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/internal.h"
 #include "table/sym.h"
 #include "lang/internal.h"
 #include <string.h>
@@ -1511,9 +1512,109 @@ static test_result_t test_sort_sym_w8_gather(void) {
     PASS();
 }
 
+/* A valid TIME slice makes the incorrect 64-bit read reproducible without
+ * relying on allocation padding: packed adjacent backing pairs look ordered,
+ * while the two logical 32-bit TIME cells are descending. Exercise both users
+ * of sorted_check_fn, and aligned/non-8-byte-aligned zero-copy views. */
+static test_result_t test_time_key_width(void) {
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    for (int negative = 0; negative < 2; negative++) {
+        for (int64_t offset = 0; offset < 2; offset++) {
+            int32_t raw[5] = {42, 42, 42, 42, 42};
+            raw[offset] = negative ? -1000 : 2000;
+            raw[offset + 1] = negative ? -2000 : 1000;
+            raw[offset + 2] = negative ? -1000 : 3000;
+            raw[offset + 3] = negative ? -1000 : 2000;
+            ray_t* parent = ray_vec_from_raw(RAY_TIME, raw, offset + 4);
+            TEST_ASSERT_TRUE(parent && !RAY_IS_ERR(parent));
+            ray_t* times = ray_vec_slice(parent, offset, 2);
+            TEST_ASSERT_TRUE(times && !RAY_IS_ERR(times));
+            TEST_ASSERT_TRUE((times->attrs & RAY_ATTR_SLICE) != 0);
+            ray_t* syms = ray_eval_str("[a a]");
+            TEST_ASSERT_TRUE(syms && !RAY_IS_ERR(syms) && syms->type == RAY_SYM && syms->len == 2);
+            ray_t* cols[] = {syms, times};
+            TEST_ASSERT_FALSE(ray_key_cols_sorted(cols, 2, 0, 2));
+            TEST_ASSERT_TRUE(ray_key_cols_sorted(cols, 2, 1, 2));
+            ray_t* table = ray_table_new(2);
+            TEST_ASSERT_TRUE(table && !RAY_IS_ERR(table));
+            table = ray_table_add_col(table, ray_sym_intern("s", 1), syms);
+            TEST_ASSERT_TRUE(table && !RAY_IS_ERR(table));
+            table = ray_table_add_col(table, ray_sym_intern("t", 1), times);
+            TEST_ASSERT_TRUE(table && !RAY_IS_ERR(table));
+            ray_t* keys = ray_eval_str("[s t]");
+            TEST_ASSERT_TRUE(keys && !RAY_IS_ERR(keys));
+            ray_t* out = ray_xasc_fn(table, keys);
+            TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out));
+            ray_t* got = ray_table_col(out, ray_sym_intern("t", 1));
+            TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TIME && got->len == 2);
+            TEST_ASSERT_EQ_I(((int32_t*)ray_data(got))[0], raw[offset + 1]);
+            TEST_ASSERT_EQ_I(((int32_t*)ray_data(got))[1], raw[offset]);
+            TEST_ASSERT_TRUE(memcmp(ray_data(parent), raw, (size_t)(offset + 4) * sizeof(int32_t)) == 0);
+            ray_release(out); ray_release(keys); ray_release(table);
+            ray_release(syms); ray_release(times); ray_release(parent);
+        }
+    }
+    ray_runtime_destroy(rt);
+    PASS();
+}
+
+/* The sole logical inversion straddles the usual 8192-row morsel edge.
+ * Every adjacent pair in the wider backing view still looks increasing.
+ * The test also runs correctly without background workers; eligibility does
+ * not claim that every configured worker physically participated. */
+static test_result_t test_time_key_width_parallel(void) {
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    const int64_t n = RAY_PARALLEL_THRESHOLD + 1;
+    const int64_t edge = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    TEST_ASSERT_TRUE(edge > 0 && edge < n);
+    int32_t* raw = malloc((size_t)(2 * n) * sizeof(int32_t));
+    TEST_ASSERT_NOT_NULL(raw);
+    for (int64_t i = 0; i < 2 * n; i++) raw[i] = (int32_t)i;
+    raw[edge - 1] = (int32_t)edge; raw[edge] = (int32_t)(edge - 1);
+    ray_t* parent = ray_vec_from_raw(RAY_TIME, raw, 2 * n);
+    free(raw);
+    TEST_ASSERT_TRUE(parent && !RAY_IS_ERR(parent));
+    ray_t* times = ray_vec_slice(parent, 0, n);
+    TEST_ASSERT_TRUE(times && !RAY_IS_ERR(times) && (times->attrs & RAY_ATTR_SLICE));
+    char expr[64];
+    snprintf(expr, sizeof(expr), "(take [a] %lld)", (long long)n);
+    ray_t* syms = ray_eval_str(expr);
+    TEST_ASSERT_TRUE(syms && !RAY_IS_ERR(syms) && syms->type == RAY_SYM && syms->len == n);
+    ray_t* cols[] = {syms, times};
+    TEST_ASSERT_FALSE(ray_key_cols_sorted(cols, 2, 0, n));
+    ray_t* table = ray_table_new(2);
+    TEST_ASSERT_TRUE(table && !RAY_IS_ERR(table));
+    table = ray_table_add_col(table, ray_sym_intern("s", 1), syms);
+    TEST_ASSERT_TRUE(table && !RAY_IS_ERR(table));
+    table = ray_table_add_col(table, ray_sym_intern("t", 1), times);
+    TEST_ASSERT_TRUE(table && !RAY_IS_ERR(table));
+    ray_t* keys = ray_eval_str("[s t]");
+    TEST_ASSERT_TRUE(keys && !RAY_IS_ERR(keys));
+    ray_t* out = ray_xasc_fn(table, keys);
+    TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out));
+    ray_t* got = ray_table_col(out, ray_sym_intern("t", 1));
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TIME && got->len == n);
+    const int32_t* data = ray_data(got);
+    for (int64_t i = 0; i < n; i++) TEST_ASSERT_EQ_I(data[i], i);
+    const int32_t* input = ray_data(parent);
+    for (int64_t i = 0; i < 2 * n; i++) {
+        int32_t expected = i == edge - 1 ? (int32_t)edge :
+                           i == edge ? (int32_t)(edge - 1) : (int32_t)i;
+        TEST_ASSERT_EQ_I(input[i], expected);
+    }
+    ray_release(out); ray_release(keys); ray_release(table);
+    ray_release(syms); ray_release(times); ray_release(parent);
+    ray_runtime_destroy(rt);
+    PASS();
+}
+
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
+    { "sort/time_key_width_parallel",     test_time_key_width_parallel, NULL, NULL },
+    { "sort/time_key_width",              test_time_key_width,          NULL, NULL },
     /* xrank tests */
     { "sort/xrank_basic",               test_xrank_basic,               NULL, NULL },
     { "sort/xrank_single_group",        test_xrank_single_group,        NULL, NULL },
