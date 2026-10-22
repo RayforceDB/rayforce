@@ -269,15 +269,11 @@ static bool const_expr_to_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
     int64_t c_i = 0;
     bool c_is_f64 = false;
     if (!eval_const_numeric_expr(g, op, &c_f, &c_i, &c_is_f64)) return false;
-    if (!c_is_f64) {
-        *out = c_i;
-        return true;
-    }
-    if (!isfinite(c_f)) return false;
-    double ip = 0.0;
-    if (modf(c_f, &ip) != 0.0) return false;
-    if (ip > (double)INT64_MAX || ip < (double)INT64_MIN) return false;
-    *out = (int64_t)ip;
+    /* A FLOAT constant, even a whole-number one (2.0), makes the expression
+     * F64, but the linear plan sums integer terms and emits SUM as I64.
+     * Decline it so the expression is evaluated with its F64 type. */
+    if (c_is_f64) return false;
+    *out = c_i;
     return true;
 }
 
@@ -486,11 +482,33 @@ static ray_t* affine_base_obj(ray_col_src_t* src) {
     return ready ? ready : src->obj;
 }
 
+/* A delayed F64 bias is equivalent to per-row F64 addition only when every
+ * addition and the entire reduction are exact.  Bound this from the type and
+ * row count, without reading the column.  I64 has no useful type-wide bound:
+ * casting a value above 2^53 can discard bits before the addition. */
+static bool affine_int_f64_bias_exact(int8_t bt, double bias, int64_t nrows,
+                                      bool may_null) {
+    if (may_null || nrows <= 0 || !isfinite(bias) || trunc(bias) != bias)
+        return false;
+    long double max_abs;
+    switch (bt) {
+        case RAY_I32:  max_abs = 2147483648.0L; break;
+        case RAY_I16:  max_abs = 32768.0L; break;
+        case RAY_U8:   max_abs = 255.0L; break;
+        case RAY_BOOL: max_abs = 1.0L; break;
+        default: return false;
+    }
+    return ((max_abs + fabsl((long double)bias)) * (long double)nrows) <=
+           9007199254740992.0L;
+}
+
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return the scan's
  * column object (a plain vector, or a RAY_ENCCOL the caller binds: see
  * affine_base_obj) plus the additive bias so we can adjust results from
- * (sum,count) directly. */
+ * (sum,count) directly.  f64_bias_ok: the caller emits a FLOAT bias over an
+ * integer column as F64 (agg_affine_t.f64). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                                    bool f64_bias_ok,
                                     ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
@@ -557,16 +575,21 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     if (bt == RAY_I64 || bt == RAY_TIMESTAMP ||
         bt == RAY_I32 || bt == RAY_I16 || bt == RAY_U8 || bt == RAY_BOOL ||
         RAY_IS_SYM(bt)) {
-        int64_t c = 0;
+        /* A FLOAT bias needs per-row F64 casts/additions.  Delay it only
+         * when type and row-count bounds prove those operations, plus the
+         * reduction, exact; otherwise evaluate the expression as written. */
         if (c_is_f64) {
-            if (!isfinite(c_f)) return false;
-            double ip = 0.0;
-            if (modf(c_f, &ip) != 0.0) return false;
-            if (ip > (double)INT64_MAX || ip < (double)INT64_MIN) return false;
-            c = (int64_t)ip;
-        } else {
-            c = c_i;
+            if (!f64_bias_ok || !affine_int_f64_bias_exact(bt, c_f,
+                    base_src->len, base_src->may_null)) return false;
+            base_vec = affine_base_obj(base_src);
+            out_affine->enabled = true;
+            out_affine->f64 = true;
+            out_affine->bias_f64 = (double)sign * c_f;
+            out_affine->bias_i64 = 0;
+            *out_vec = base_vec;
+            return true;
         }
+        int64_t c = c_i;
         base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
         out_affine->bias_i64 = sign > 0 ? c : -c;

@@ -45,7 +45,8 @@
 ;; (div 10.0 3) → OP_IDIV, l_is_f64=true.
 ;; At line 111: l_is_f64=true → F64 branch fires.
 ;; Line 120: case OP_IDIV: r = rv!=0.0 ? floor(lv/rv) : NAN → floor(10.0/3)=3.0.
-;; const_expr_to_i64: c_is_f64=true, c_f=3.0, modf(3.0)==0.0 → *out=3.
+;; const_expr_to_i64: c_is_f64=true → declines the linear plan; the
+;; evaluator applies the builtin, whose (div 10.0 3) is the I64 3.
 ;; sum(x * 3) = 45.
 ;; ===================================================================
 (select {s: (sum (* x (div 10.0 3))) from: Tce}) -- (table [s] (list [45]))
@@ -111,7 +112,8 @@
 ;; ===================================================================
 ;; F64 NEG constant → eval_const_numeric_expr NEG/ABS branch (line 83:25)
 ;; (neg 3.0): inner CONST is F64 → a_is_f64=true → Branch(83:25) True.
-;; const_expr_to_i64: modf(-3.0)=0 → k=-3.
-;; sum(x * -3) = (1+2+3+4+5)*(-3) = -45
+;; const_expr_to_i64: c_is_f64=true → declines the linear plan, so the
+;; F64 product is summed as F64, as the builtin does.
+;; sum(x * -3.0) = (1+2+3+4+5)*(-3.0) = -45.0
 ;; ===================================================================
-(select {s: (sum (* x (neg 3.0))) from: Tce}) -- (table [s] (list [-45]))
+(select {s: (sum (* x (neg 3.0))) from: Tce}) -- (table [s] (list [-45.0]))

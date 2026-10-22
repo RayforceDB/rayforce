@@ -960,6 +960,8 @@ static inline void sym_elem(const ray_t* input, int64_t i,
 
 typedef struct {
     bool    enabled;
+    bool    f64;        /* a FLOAT bias over an integer column: SUM and AVG
+                         * emit F64 from the integer sum (bias_i64 unused) */
     double  bias_f64;
     int64_t bias_i64;
 } agg_affine_t;
@@ -1364,6 +1366,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
  * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
  * yet materialized declines them (*err NULL). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                             bool f64_bias_ok,
                              ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                  agg_linear_t* out_plan, ray_t** err);
@@ -1564,6 +1567,8 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
  * radix); 3 also skip the slice-group probe.  Disarmed by
  * ray_test_hooks_off. */
 void ray_group_test_route(int route);
+/* Fail the next scalar chunk-buffer allocation, then disarm automatically. */
+void ray_group_test_fail_scalar_alloc(int fail);
 /* Test hook (C tests only): the scalar route's chunk walk (scalar_chunk_fn)
  * runs serially in tasks of `rows` rows, any cut (as ray_pool_dispatch's
  * grain after its ring clamp); 0 dispatches as usual.  Disarmed by
