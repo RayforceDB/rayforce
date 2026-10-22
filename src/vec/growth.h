@@ -35,7 +35,8 @@ static inline size_t ray_cell_growth_limit(void) {
     return (limit & ~(size_t)4095) - RAY_DIRECT_HDR - 32;
 }
 
-/* Validate before COW/index changes; no signed sum or byte product may wrap.
+/* Check actual growth requests; no signed sum or byte product may wrap.
+ * Bulk APIs preflight externally requested counts before COW/index changes.
  * Physical width matters (notably for narrow SYM). Zero-count raw appends
  * retain their earlier no-op path and need not call this helper. */
 static inline bool ray_cell_growth_bytes(int64_t len, int64_t count,
@@ -67,6 +68,17 @@ static inline bool ray_cell_growth_request(size_t room, size_t required,
     }
     *request = bytes;
     return true;
+}
+
+/* Rare allocation geometry must not inflate the register frame of a
+ * reserved-capacity single append. Bulk callers preflight their count. */
+static __attribute__((cold, noinline, unused))
+ray_t* ray_cell_grow_one(ray_t* value, size_t width) {
+    size_t required, request;
+    if (!ray_cell_growth_bytes(value->len, 1, width, &required) ||
+        !ray_cell_growth_request(ray_block_data_bytes(value), required, &request))
+        return NULL;
+    return ray_scratch_realloc(value, request);
 }
 
 #endif /* RAY_CELL_GROWTH_H */
