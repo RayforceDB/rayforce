@@ -8,10 +8,11 @@
 ;; `(% (at T 'k) 0)` gives [0Nl 0Nl].  They now write the null sentinel
 ;; (the destination is already nullable, expr_op_generates_null), and the
 ;; output scan sets HAS_NULLS, so nil? finds the nulls and sum / avg skip
-;; them.  The typed executor's zero-divisor pass also covers I16, U8, BOOL,
-;; F64 and F32 divisor columns (it covered I64 / I32 only), and constant
-;; folding no longer folds a zero divisor to 0 (or x/0 to inf).  Where the
-;; builtin's result is U8, or `%` takes a U8 divisor, there is no null: the
+;; them.  The typed executor covers I16, U8, BOOL, F64 and F32 divisors
+;; (it covered I64 / I32 only); the I16-to-I64 div kernel writes nulls in
+;; its producer loop. Constant folding no longer folds a zero divisor to 0
+;; (or x/0 to inf). Where the builtin's result is U8, or `%` takes a U8
+;; divisor, there is no null: the
 ;; result stays 0.
 
 (set T (table [k i h u b f e g w] (list [5 7 -3 9 4 -8] (as 'I32 [2 0 5 0 3 1]) (as 'I16 [2 0 5 0 3 1]) (as 'U8 [2 0 5 0 3 1]) [true false true false true true] [2.0 0.0 5.0 0.0 3.0 1.0] (as 'F32 [2.0 0.0 5.0 0.0 3.0 1.0]) [0 1 0 1 0 1] [1 1 0 1 1 1])))
@@ -47,6 +48,7 @@
 (% (at T 'u) (at T 'u)) -- [0x00 0x00 0x00 0x00 0x00 0x00]
 (at (select {x: (% u u) from: T}) 'x) -- [0x00 0x00 0x00 0x00 0x00 0x00]
 (at (select {x: (% i u) from: T}) 'x) -- (% (at T 'i) (at T 'u))
+(at (select {x: (+ (% k u) 1) from: T}) 'x) -- [2 1 3 1 2 1]
 (at (update {x: (% i u) from: T}) 'x) -- (% (at T 'i) (at T 'u))
 (% (at T 'k) 0x00) -- [0 0 0 0 0 0]
 (at (select {x: (% k 0x00) from: T}) 'x) -- [0 0 0 0 0 0]
@@ -83,6 +85,9 @@
 (at (select {n: (sum (nil? (% k j))) from: B}) 'n) -- [28572]
 (at (select {s: (sum (% k j)) from: B}) 's) -- (enlist (sum (% (at B 'k) (at B 'j))))
 (at (select {x: (div k j) from: B}) 'x) -- (div (at B 'k) (at B 'j))
+(set H (table [k h] (list (til 200000) (as 'I16 (% (til 200000) 7)))))
+(at (select {n: (sum (nil? (div k h))) from: H}) 'n) -- [28572]
+(at (select {x: (div k h) from: H}) 'x) -- (div (at H 'k) (at H 'h))
 
 ;; ── `%` by a U8 divisor ─────────────────────────────────────────────────────
 ;; A zero U8 divisor gives the builtin's 0 (U8 has no null).  A length-one
@@ -109,6 +114,7 @@
 (set Z (table [h u] (list (as 'I16 [-7 300 5 -1]) (as 'U8 [3 7 0 4]))))
 (at (select {x: (% h u) from: Z}) 'x) -- (as 'I16 [2 6 0 3])
 (at (update {x: (% h u) from: Z}) 'x) -- (as 'I16 [2 6 0 3])
+(at (select {x: (+ (% h u) 1) from: Z}) 'x) -- (as 'I16 [3 7 1 4])
 (at (select {x: (% h 0x03) from: Z}) 'x) -- (as 'I16 [2 0 2 2])
 
 ;; ── floor modulo in the I16 arm (xbar's lowering, I16 divisors) ─────────────

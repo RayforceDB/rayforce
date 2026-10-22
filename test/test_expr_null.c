@@ -1883,6 +1883,21 @@ static ray_op_t* build_zd_mod_add(ray_graph_t* g) {
     return ray_add(g, ray_mod(g, ray_scan(g, "x"), ray_scan(g, "y")), ray_const_i64(g, 1));
 }
 
+static test_result_t test_u8_mod_composition_fuses(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    int64_t xv[] = {7, -7, 5, 9, -3, 1, 4, 8};
+    uint8_t yv[] = {3, 0, 2, 0, 5, 1, 0, 2};
+    ray_t* xcol = ray_vec_from_raw(RAY_I64, xv, 8);
+    ray_t* ycol = ray_vec_from_raw(RAY_U8, yv, 8);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    test_result_t r = diff_run(tbl, build_zd_mod_add, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 /* Fused result: nulls exactly at the rows in want[], HAS_NULLS set, and
  * equal to the forced fallback.  fused: the program must compile (an I64
  * divisor does; a narrower one may take the typed executor, whose
@@ -1961,6 +1976,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_i64_div",            test_diff_i64_div,                     NULL, NULL },
     { "expr_null/diff_i64_mod",            test_diff_i64_mod,                     NULL, NULL },
     { "expr_null/zero_divisor_nullfree",   test_zero_divisor_nullfree,            NULL, NULL },
+    { "expr_null/u8_mod_composition_fuses", test_u8_mod_composition_fuses,        NULL, NULL },
     { "expr_null/diff_i64_min2",           test_diff_i64_min2,                    NULL, NULL },
     { "expr_null/diff_i64_max2",           test_diff_i64_max2,                    NULL, NULL },
     { "expr_null/diff_i64_neg",            test_diff_i64_neg,                     NULL, NULL },
