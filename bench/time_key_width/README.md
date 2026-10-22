@@ -21,7 +21,7 @@ Choose allowed logical CPUs on your host. The environment counts **background
 helpers**, not total participants; actual worker participation is not measured.
 Use the same compiler/flags/base on both sides and no overlapping builds/tests.
 
-## Local observation / alternative under comparison
+## Historical pre-#937 observation (`a9217925`)
 
 The reference is the **correct generic fallback** (remove TIME from the i64
 shortcut), not the old wrong-width kernel. Both reference and proposal include
@@ -41,3 +41,24 @@ is claimed. An initial five-sample I64 control was noisy (3.460/4.947ms, propose
 range3.422–7.998). A **16-fresh-process unchanged-code repeat** gave3.562/3.490ms
 with overlapping ranges. Retain that limitation rather than claiming a universal
 no-regression result. The tests check semantics, not a flaky wall-time threshold.
+
+## Integration with #937
+
+The shared probe and worker now instantiate the same loop for TIME/int32 and
+I64/TIMESTAMP/int64. The type choice remains outside rows; only unequal SYM
+boundaries spend the rank-preparation comparison budget. The direct unranked
+helper is serial after #937 even when background helpers are configured: do not
+reuse the historical three-helper timings as current parallel performance.
+
+A new matched Clang18/current-dev-D715 common archive comparison replaced only
+the immutable sort object. TIME ascending remains compared against a **correct
+generic** reference, never the incorrect 64-bit read. One discarded warm process
+per cell followed by eight randomized fresh processes: TIME ascending14.502→
+3.850ms; descending14.510→14.551ms with overlapping ranges. Both at zero helpers.
+Whole-xasc I64 controls were22.643→22.939ms(1participant),22.552→22.914(4);
+TIMESTAMP22.741→22.923 and22.578→22.827. All control ranges overlap; small
+median increases remain disclosed rather than claiming universal neutrality.
+There were108validated processes total(12warm/96measured). Output values and
+source buffers were checked outside timing; requested participants do not prove
+physical worker participation. This is a single-sort-TU/common-library study,
+not a newly built whole-candidate release or an end-to-end ClickBench result.
