@@ -14491,17 +14491,14 @@ static test_result_t test_expr_binary_sym_w32_arith(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* BOOL comparison: sw == 2 → lp_u32 in BOOL slow path (integer src_is_i64_all)
-     * Also covers lp_u32 in BOOL block src_is_i64_all EQ loop */
+    /* Mixed SYM/I64 equality must decline, not compare raw IDs. Do not
+     * pass a declined node into ray_sum (#768). Arithmetic above is unchanged. */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "sw");
     c = ray_const_i64(g, 2);
     op = ray_eq(g, col, c);
-    s = ray_sum(g, op);
-    result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 1);  /* only position 1 (val=2) matches */
-    ray_release(result);
+    TEST_ASSERT(op == NULL, "symbol/numeric equality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline leaves evaluator fallback available");
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -14570,16 +14567,13 @@ static test_result_t test_expr_binary_sym_w32_rhs(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* BOOL: 2 == sw2 → rp_u32 in BOOL src_is_i64_all EQ loop */
+    /* Reversed numeric/SYM equality has the same constructor contract. */
     g = ray_graph_new(tbl);
     a = ray_const_i64(g, 2);
     col = ray_scan(g, "sw2");
     op = ray_eq(g, a, col);
-    s = ray_sum(g, op);
-    result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 1);  /* only val=2 matches */
-    ray_release(result);
+    TEST_ASSERT(op == NULL, "numeric/symbol equality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline leaves evaluator fallback available");
     ray_graph_free(g);
 
     /* SYM W32 vec-vs-vec: two W32 cols → lp_u32 + rp_u32 simultaneously */
@@ -15591,23 +15585,21 @@ static test_result_t test_expr_binary_bool_float_path_lhs(void) {
         TEST_ASSERT_EQ_I(result->i64, 1);
         ray_release(result); ray_graph_free(g);
 
-        /* EQ: 2==1→F, 3==3→T, 4==5→F, 3==3→T → sum=2 */
+        /* EQ/NE no longer admit raw ID versus F64 comparisons (#768). */
         g = ray_graph_new(tbl);
         a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
-        op = ray_eq(g, a, b); s = ray_sum(g, op);
-        result = ray_execute(g, s);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 2);
-        ray_release(result); ray_graph_free(g);
+        op = ray_eq(g, a, b);
+        TEST_ASSERT(op == NULL, "SYM/F64 equality declines");
+        TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+        ray_graph_free(g);
 
         /* NE */
         g = ray_graph_new(tbl);
         a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
-        op = ray_ne(g, a, b); s = ray_sum(g, op);
-        result = ray_execute(g, s);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 2);
-        ray_release(result); ray_graph_free(g);
+        op = ray_ne(g, a, b);
+        TEST_ASSERT(op == NULL, "SYM/F64 equality declines");
+        TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+        ray_graph_free(g);
 
         /* LE: 2<=1→F, 3<=3→T, 4<=5→T, 3<=3→T → sum=3 */
         g = ray_graph_new(tbl);
@@ -15827,31 +15819,29 @@ static test_result_t test_expr_binary_bool_int_w32_lhs(void) {
     ray_t* tbl = make_two_col_table(na, vs, nb, vb);
     ray_release(vs); ray_release(vb);
 
-    /* EQ: 1==2→F, 3==3→T, 5==4→F, 3==3→T → sum=2 */
+    /* EQ/NE decline incompatible logical types, rather than compare IDs. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a = ray_scan(g, "bip_lw32");
     ray_op_t* b = ray_scan(g, "bip_ri64");
     ray_op_t* op = ray_eq(g, a, b);
-    ray_op_t* s = ray_sum(g, op);
-    ray_t* result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result); ray_graph_free(g);
+    TEST_ASSERT(op == NULL, "SYM/I64 equality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+    ray_graph_free(g);
 
-    /* NE: 1!=2→T, 3!=3→F, 5!=4→T, 3!=3→F → sum=2 */
+    /* NE has the same incompatible-type decline. */
     g = ray_graph_new(tbl);
     a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
-    op = ray_ne(g, a, b); s = ray_sum(g, op);
-    result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result); ray_graph_free(g);
+    op = ray_ne(g, a, b);
+    TEST_ASSERT(op == NULL, "SYM/I64 inequality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+    ray_graph_free(g);
 
     /* LT: 1<2→T, 3<3→F, 5<4→F, 3<3→F → sum=1 */
     g = ray_graph_new(tbl);
     a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
-    op = ray_lt(g, a, b); s = ray_sum(g, op);
-    result = ray_execute(g, s);
+    op = ray_lt(g, a, b);
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->i64, 1);
     ray_release(result); ray_graph_free(g);
