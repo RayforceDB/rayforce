@@ -962,6 +962,7 @@ done:
 
 /* ht_heads is accessed atomically from multiple workers during join build.
  * Using _Atomic(uint32_t)* for C11-compliant atomic access. */
+#define JHT_MIN_CAP 256u
 #define JHT_EMPTY UINT32_MAX  /* sentinel for empty HT slot/chain end */
 
 typedef struct {
@@ -1036,7 +1037,7 @@ typedef struct {
 } join_probe_ctx_t;
 
 /* Pass 2a: count matches per morsel */
-static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1059,7 +1060,7 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
             continue;
         }
 
-        if (l + 8 < row_end) {
+        if (prefetch_heads && l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
@@ -1077,8 +1078,16 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
     c->morsel_counts[tid] = count;
 }
 
+/* Compile both modes from one body; select once per pass, not per row. */
+static void join_count_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, true);
+}
+static void join_count_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, false);
+}
+
 /* Pass 2b: fill match pairs using pre-computed offsets */
-static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1108,7 +1117,7 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
             continue;
         }
 
-        if (l + 8 < row_end) {
+        if (prefetch_heads && l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
@@ -1131,6 +1140,14 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
             off++;
         }
     }
+}
+
+/* Compile both modes from one body; select once per pass, not per row. */
+static void join_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, true);
+}
+static void join_fill_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, false);
 }
 
 /* Segment count of a parted table = length of any parted column's segs
@@ -1541,7 +1558,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
 
 chained_ht_fallback:;
     /* ── Chained HT path (small joins / radix OOM fallback) ────────── */
-    uint64_t ht_cap64 = 256;
+    uint64_t ht_cap64 = JHT_MIN_CAP;
     uint64_t target = (uint64_t)right_rows * 2;
     while (ht_cap64 < target) ht_cap64 *= 2;
     if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
@@ -1679,12 +1696,16 @@ chained_ht_fallback:;
         .nullfree    = keys_nullfree,
     };
 
+    /* Minimum heads occupy only 1 KiB: choose no-lookahead callbacks here.
+     * Bodies share their implementation; constant modes remove the row-loop
+     * capacity decision instead of relying on compiler loop unswitching. */
+    const ray_pool_fn count_probe = ht_cap > JHT_MIN_CAP ? join_count_fn : join_count_tiny_fn;
     /* 2a: Count matches per morsel */
     if (pool && n_tasks > 1)
-        ray_pool_dispatch_n(pool, join_count_fn, &probe_ctx, n_tasks);
+        ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
     else
         for (uint32_t t = 0; t < n_tasks; t++)
-            join_count_fn(&probe_ctx, 0, t, t + 1);
+            count_probe(&probe_ctx, 0, t, t + 1);
 
     /* Prefix sum → morsel_offsets (reuse counts array as offsets) */
     pair_count = 0;
@@ -1707,11 +1728,12 @@ chained_ht_fallback:;
     probe_ctx.r_idx = r_idx;
 
     if (pair_count > 0) {
+        const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP ? join_fill_fn : join_fill_tiny_fn;
         if (pool && n_tasks > 1)
-            ray_pool_dispatch_n(pool, join_fill_fn, &probe_ctx, n_tasks);
+            ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
         else
             for (uint32_t t = 0; t < n_tasks; t++)
-                join_fill_fn(&probe_ctx, 0, t, t + 1);
+                fill_probe(&probe_ctx, 0, t, t + 1);
     }
 
     CHECK_CANCEL_GOTO(pool, join_cleanup);
