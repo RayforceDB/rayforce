@@ -1251,9 +1251,87 @@ static test_result_t test_jb_nf_differential(void) {
     return result;
 }
 
+/* Identity LEFT gathers must retain ownership and fall back on expansion. */
+static test_result_t test_jb_left_identity(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int64_t keys[] = {1, 2, 3};
+    const int64_t rhs[] = {1, 3};
+    ray_t* lt = jb_table1("lk", keys, 3);
+    ray_t* rt = jb_table1("rk", rhs, 2);
+    ray_t* payload = ray_vec_from_raw(RAY_I64, keys, 3);
+    ray_vec_set_null(payload, 1, true);
+    lt = ray_table_add_col(lt, ray_sym_intern("payload", 7), payload);
+    ray_release(payload);
+    ray_t* strings = ray_vec_new(RAY_STR, 3);
+    strings = ray_str_vec_append(strings, "alpha", 5);
+    strings = ray_str_vec_append(strings, "beta", 4);
+    strings = ray_str_vec_append(strings, "gamma", 5);
+    lt = ray_table_add_col(lt, ray_sym_intern("strings", 7), strings);
+    ray_release(strings);
+    ray_t* got = jb_join(lt, "lk", rt, "rk", 1);
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "identity left join");
+    ray_t* src = ray_table_col_idx(lt, 1);
+    ray_t* out = ray_table_col_idx(got, 1);
+    TEST_ASSERT(out == src, "identity left output shares its source");
+    TEST_ASSERT(ray_vec_is_null(out, 1), "shared null metadata");
+    ray_retain(out);
+    int64_t value = 99;
+    ray_t* changed = ray_vec_set(out, 0, &value);
+    TEST_ASSERT(changed && !RAY_IS_ERR(changed), "copy on write");
+    TEST_ASSERT(changed != src, "mutation detaches shared output");
+    TEST_ASSERT(*(int64_t*)ray_vec_get(src, 0) == 1, "source remains unchanged");
+    ray_release(changed);
+    ray_release(lt);
+    TEST_ASSERT(*(int64_t*)ray_vec_get(out, 2) == 3, "output survives source release");
+    ray_t* out_strings = ray_table_col_idx(got, 2);
+    size_t str_len = 0;
+    const char* str = ray_str_vec_get(out_strings, 2, &str_len);
+    TEST_ASSERT(str && str_len == 5 && memcmp(str, "gamma", 5) == 0,
+                "shared string pool survives source release");
+    ray_release(got);
+    ray_release(rt);
+
+    const int64_t duplicates[] = {1, 1, 3};
+    lt = jb_table1("lk", keys, 3);
+    rt = jb_table1("rk", duplicates, 3);
+    got = jb_join(lt, "lk", rt, "rk", 1);
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "duplicate left join");
+    TEST_ASSERT(ray_table_nrows(got) == 4, "duplicates expand rows");
+    TEST_ASSERT(ray_table_col_idx(got, 0) != ray_table_col_idx(lt, 0),
+                "expanded output must gather");
+    ray_release(got);
+    ray_release(lt);
+    ray_release(rt);
+
+    const int64_t n = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t* large_keys = malloc((size_t)n * sizeof(*large_keys));
+    TEST_ASSERT(large_keys, "large identity fixture allocation");
+    for (int64_t i = 0; i < n; i++) large_keys[i] = i;
+    lt = jb_table1("lk", large_keys, n);
+    /* Keep the build side below radix dispatch: radix partitioning may
+     * reorder pairs and must fail the explicit identity check. */
+    rt = jb_table1("rk", large_keys, 3);
+    free(large_keys);
+    got = jb_join(lt, "lk", rt, "rk", 1);
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "large identity left join");
+    TEST_ASSERT(ray_table_nrows(got) == n, "large identity row count");
+    TEST_ASSERT(ray_table_col_idx(got, 0) == ray_table_col_idx(lt, 0),
+                "large identity shares its source");
+    TEST_ASSERT(*(int64_t*)ray_vec_get(ray_table_col_idx(got, 0), n - 1) == n - 1,
+                "large identity preserves final row");
+    ray_release(got);
+    ray_release(lt);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
+    { "join_buildside/left_identity", test_jb_left_identity, NULL, NULL },
     { "join_buildside/force_fallback_ordinary", test_jb_force_fallback_ordinary, NULL, NULL },
     { "join_buildside/auto_fallback_dup", test_jb_auto_fallback_dup, NULL, NULL },
     { "join_buildside/baseline_radix_inner", test_jb_baseline_radix_inner, NULL, NULL },
