@@ -2840,12 +2840,12 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));   TEST_ASSERT_NULL(err);
             TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));   TEST_ASSERT_NULL(err);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_ENCCOL);
             TEST_ASSERT_TRUE(vec == ray_table_get_col_enc(t, ray_sym_intern("f", 1)));
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_ENCCOL);
             ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0);
             /* a published materialization is a ready column: the plans take it */
@@ -2860,10 +2860,10 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(prod.pa == ray_data(ff) && prod.pb == ray_data(fg));
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(vec == ff && vec->type == RAY_F64 && aff.bias_f64 == -1.5);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(vec == fa && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         } else {
             /* linear: 2 * b + a + 7 */
@@ -2885,12 +2885,12 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(prod.ta == RAY_F64 && prod.tb == RAY_I64);
             /* affine: f - 1.5, a + 5 */
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_F64 && vec->len == CP_N);
             TEST_ASSERT_TRUE(((const double*)ray_data(vec))[5] == 2.5);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         }
 
@@ -2919,7 +2919,7 @@ static test_result_t test_try_plans_bound(void) {
         if (err) ray_error_free(err);
         err = NULL;
         ray_graph_bind_test_fail_alloc(1);
-        r = try_affine_sumavg_input(gr, t, da, &vec, &aff, &err);
+        r = try_affine_sumavg_input(gr, t, da, false, &vec, &aff, &err);
         ray_graph_bind_test_fail_alloc(0);
         bool bind_err3 = !r && cp_is_bind_error(err);
         if (err) ray_error_free(err);
@@ -2943,7 +2943,7 @@ static test_result_t test_try_plans_bound(void) {
             err = NULL;
             ray_enccol_test_fail_alloc(1);
             memset(&aff, 0, sizeof aff);
-            r = try_affine_sumavg_input(gr, t, da, &vec, &aff, &err);
+            r = try_affine_sumavg_input(gr, t, da, false, &vec, &aff, &err);
             ray_enccol_test_fail_alloc(0);
             bool plain_err3 = !r && err && RAY_IS_ERR(err);
             if (err) ray_error_free(err);

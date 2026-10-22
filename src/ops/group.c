@@ -8437,10 +8437,12 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
         /* agg_col == NULL means a fused input.  The accumulator family
          * follows the FUSION, not the expression's out_type: a fused
          * product accumulates F64; the linear i64 plan accumulates i64
-         * even when its compiled expression promotes to F64. */
+         * (it takes no FLOAT constant, const_expr_to_i64). */
         bool is_f64 = agg_col
             ? group_fp_type(agg_col->type)
             : (prod && prod[a].enabled);
+        /* `(sum (+ x c))` with a FLOAT c over an integer x is F64 */
+        bool f64_bias = affine && affine[a].enabled && affine[a].f64;
         int8_t out_type;
         switch (agg_op) {
             case OP_AVG:
@@ -8464,7 +8466,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                  * from the aggregation input op when the vector is absent. */
                 int8_t src_t = agg_col ? agg_col->type
                              : (op_node(g, ext->agg_ins[a]) ? op_node(g, ext->agg_ins[a])->out_type : 0);
-                out_type = is_f64 ? RAY_F64 : (src_t == RAY_TIME ? RAY_TIME : RAY_I64);
+                out_type = is_f64 || f64_bias ? RAY_F64
+                         : (src_t == RAY_TIME ? RAY_TIME : RAY_I64);
                 break;
             }
             case OP_PROD:
@@ -8497,7 +8500,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 double v;
                 switch (agg_op) {
                     case OP_SUM:
-                        v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
+                        v = is_f64 ? sum_f64[idx]
+                          : sum_hi64 ? ray_i128_to_f64(sum_hi64[idx], (uint64_t)sum_i64[idx])
+                          : (double)sum_i64[idx];
                         /* `(sum (+ x c))`: c once per non-null x (#814) */
                         if (affine && affine[a].enabled)
                             v += affine[a].bias_f64 * nn;
@@ -8508,6 +8513,14 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         break;
                     case OP_AVG:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
+                        if (f64_bias) {
+                            /* the sum of the F64 values over their count,
+                             * as the builtin avg divides it */
+                            v = sum_hi64 ? ray_i128_to_f64(sum_hi64[idx], (uint64_t)sum_i64[idx])
+                                         : (double)sum_i64[idx];
+                            v = (v + affine[a].bias_f64 * nn) / nn;
+                            break;
+                        }
                         v = is_f64 ? sum_f64[idx] / nn
                           : sum_hi64 ? ray_i128_to_f64(sum_hi64[idx], (uint64_t)sum_i64[idx]) / nn
                           : (double)sum_i64[idx] / nn;
@@ -14848,6 +14861,8 @@ static ray_t* sp_walk_key_range(sp_walk_ctx_t* c, int64_t n_scan) {
 /* Route test hook (ray_group_test_route, internal.h). */
 static int g_group_test_route;
 void ray_group_test_route(int route) { g_group_test_route = route; }
+static int g_group_test_fail_scalar_alloc;
+void ray_group_test_fail_scalar_alloc(int fail) { g_group_test_fail_scalar_alloc = fail; }
 
 /* The error for a by: key that is no value: a function or null.  Out of
  * line and cold: exec_group_run is hot, and the error is rare. */
@@ -15303,6 +15318,19 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (key_own_src[s_].obj) ray_col_src_release(&key_own_src[s_]); \
     } while (0)
 
+    /* Binary aggregators (OP_PEARSON_CORR) carry cross-term row slots
+     * (off_sum_y / off_sumsq_y / off_sumxy) and a y-side input that the
+     * scalar da_accum_t path neither allocates nor reads — mirror the
+     * DA-path guard below and fall through to the HT path which computes
+     * them. Without this the Pearson slot accumulates nothing and emit
+     * falls to its integer default, returning 0. */
+    bool sc_has_binary = false;
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (agg_is_binary_agg(ext->agg_ops[a])) { sc_has_binary = true; break; }
+    /* The scalar route is the one that emits a FLOAT affine bias over an
+     * integer column as F64 (emit_agg_columns); the others decline it. */
+    bool sc_route = n_keys == 0 && nrows > 0 && !sc_has_binary;
+
     ray_t* rerr = NULL;     /* a failed column bind in the planners below */
     for (uint32_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
@@ -15311,7 +15339,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_affine_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a], &agg_affine[a], &rerr)) {
+            try_affine_sumavg_input(g, tbl, agg_input_op, sc_route,
+                                    &agg_vecs[a], &agg_affine[a], &rerr)) {
             if (agg_vecs[a] && agg_vecs[a]->type == RAY_ENCCOL) {   /* staged base */
                 rerr = ray_col_src_bind(agg_vecs[a], &agg_own_src[a]);
                 agg_vecs[a] = NULL;
@@ -15487,6 +15516,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         AGG_OWN_SRC_RELEASE();
+        if (match_idx_block) ray_release(match_idx_block);
         scratch_free(vla_hdr);
         return rerr;
     }
@@ -15601,16 +15631,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          ext->agg_ops[emit_filter.agg_index] == OP_MAX);
 
     /* ---- Scalar aggregate fast path (n_keys == 0): flat vector scan ---- */
-    /* Binary aggregators (OP_PEARSON_CORR) carry cross-term row slots
-     * (off_sum_y / off_sumsq_y / off_sumxy) and a y-side input that the
-     * scalar da_accum_t path neither allocates nor reads — mirror the
-     * DA-path guard below and fall through to the HT path which computes
-     * them. Without this the Pearson slot accumulates nothing and emit
-     * falls to its integer default, returning 0. */
-    bool sc_has_binary = false;
-    for (uint32_t a = 0; a < n_aggs; a++)
-        if (agg_is_binary_agg(ext->agg_ops[a])) { sc_has_binary = true; break; }
-    if (n_keys == 0 && nrows > 0 && !sc_has_binary) {
+    if (sc_route) {
         /* Staged inputs this route cannot read by pieces take their plain
          * column (R-RANDOM: holistic and row-gathered aggregates, wide
          * types, any op outside the streaming set). */
@@ -15661,6 +15682,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         bool sc_any_nullable = false;
         /* Integer AVG divides the exact 128-bit sum: carry high words. */
         bool sc_need_sum128 = false;
+        bool sc_has_f64_affine = false;
         /* Some input is read by range (a staged source, agg_ptrs NULL). */
         bool sc_staged = false;
         for (uint32_t a = 0; a < n_aggs; a++) {
@@ -15708,6 +15730,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (ext->agg_ops[a] == OP_AVG && !group_fp_type(agg_types[a]) &&
                 !agg_strlen[a] && group_avg_needs_hi(agg_types[a], nrows))
                 sc_need_sum128 = true;
+            /* An F64 sum of integers does not wrap: emit it from the
+             * exact 128-bit total. */
+            if (agg_affine[a].f64) {
+                sc_need_sum128 = true;
+                sc_has_f64_affine = true;
+            }
         }
 
         if (!match_idx && !rowsel && !sc_any_nullable && n_aggs > 1) {
@@ -15981,9 +16009,21 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* sc_hdr = NULL;
         /* After the per-chunk blocks: one pinned vocabulary per aggregate. */
         const size_t sc_pin_off = (size_t)sc_n * sc_bytes + sc_line;
-        void* sc_raw = scratch_calloc(&sc_hdr, sc_pin_off +
+        bool fail_scalar_alloc = g_group_test_fail_scalar_alloc != 0;
+        g_group_test_fail_scalar_alloc = 0;
+        void* sc_raw = fail_scalar_alloc ? NULL : scratch_calloc(&sc_hdr, sc_pin_off +
             (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1) + sc_line);
-        if (!sc_raw) { scratch_free(sc_vla_hdr); goto da_path; }
+        if (!sc_raw) {
+            scratch_free(sc_vla_hdr);
+            /* The fallback emit cannot apply an F64 affine bias.  Report
+             * the allocation failure instead of returning an I64 sum with
+             * the bias silently dropped. */
+            if (sc_has_f64_affine) {
+                rerr = ray_error("oom", NULL);
+                goto resolve_fail;
+            }
+            goto da_path;
+        }
         ray_sym_domain_raw_t* sc_agg_raw = (ray_sym_domain_raw_t*)(void*)
             (((uintptr_t)sc_raw + sc_pin_off + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
         uint8_t* sc_agg_raw_ok = (uint8_t*)(sc_agg_raw + n_aggs);
@@ -18445,9 +18485,10 @@ ht_path:;
                                              + (uint16_t)agg_slot * 8u);
             /* `(sum (+ x c))` aggregates x; phase 3 adds c once per
              * non-null x (topn_bias_off below).  An
-             * integer slot's affine constant is always integral (a
-             * fractional one declines the rewrite, try_affine_sumavg_input),
-             * so the heap folds bias_i64 in exactly as the emit does. */
+             * integer slot's affine constant is always an integer (a FLOAT
+             * one declines the rewrite off the scalar route,
+             * try_affine_sumavg_input), so the heap folds bias_i64 in
+             * exactly as the emit does. */
             if (agg_affine[ai].enabled) {
                 topn_bias = agg_affine[ai].bias_i64;
                 /* c is added once per non-null x: a nullable layout keeps

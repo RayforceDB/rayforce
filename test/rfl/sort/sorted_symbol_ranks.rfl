@@ -1,0 +1,18 @@
+;; Lexical order differs from symbol creation order. Prefixes and equal-key
+;; rows check lexical ranking and stable row order through xasc/xdesc.
+(set syms [rank-z rank-a rank-aa rank-a rank-z rank-aa rank-a])
+(set times (as 'TIMESTAMP [2 1 1 2 1 2 1]))
+(set t (table [ts sym row] (list times syms (til 7))))
+(set asc_ts (xasc t [ts sym]))
+(at asc_ts 'row) -- [1 6 2 4 3 5 0]
+(at (xasc asc_ts [ts sym]) 'row) -- [1 6 2 4 3 5 0]
+(at (xasc (reverse t) [ts sym]) 'row) -- [6 1 2 4 3 5 0]
+(set desc_ts (xdesc t [ts sym]))
+(at desc_ts 'row) -- [0 5 3 4 2 1 6]
+(at (xdesc desc_ts [ts sym]) 'row) -- [0 5 3 4 2 1 6]
+(set asc_sym (xasc t [sym ts]))
+(at asc_sym 'row) -- [1 6 3 2 5 4 0]
+(at (xasc asc_sym [sym ts]) 'row) -- [1 6 3 2 5 4 0]
+(set desc_sym (xdesc t [sym ts]))
+(at desc_sym 'row) -- [0 4 5 2 3 1 6]
+(at (xdesc desc_sym [sym ts]) 'row) -- [0 4 5 2 3 1 6]

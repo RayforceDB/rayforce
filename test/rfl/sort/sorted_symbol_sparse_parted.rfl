@@ -1,0 +1,27 @@
+;; @requires: posix
+;; Populate the database FILE domain before writing the used symbol. Merely
+;; interning unrelated runtime names would not give the file column high IDs.
+(.sys.exec "rm -rf /tmp/rfl_sparse_rank_parts")
+(set padding (as 'SYM (map (fn [i] (format "unused-rank-%" i)) (til 70000))))
+(.db.splayed.set "/tmp/rfl_sparse_rank_parts/2024.01.01/padding/" (table [s] (list padding)))
+(set late (take [late-sorted-key] 10000))
+(.db.splayed.set "/tmp/rfl_sparse_rank_parts/2024.01.01/t/" (table [s seq] (list late (til 10000))))
+(.db.splayed.set "/tmp/rfl_sparse_rank_parts/2024.01.02/t/" (table [s seq] (list late (+ 10000 (til 10000)))))
+(set parts (.db.parted.get "/tmp/rfl_sparse_rank_parts/" 't))
+;; Each 10k-row segment is within the rank builder's density budget. Repeated
+;; calls must preserve streaming without preparing a 70k-ID LUT per segment.
+(set before (at (.sys.mem) 'sort-perpart-runs))
+(set first (select {from: parts asc: s}))
+(set second (select {from: parts desc: s}))
+(- (at (.sys.mem) 'sort-perpart-runs) before) -- 4
+(at first 'seq) -- (til 20000)
+(at second 'seq) -- (til 20000)
+;; Eight-row segments exceed the LUT density budget but are still sorted.
+(.db.splayed.set "/tmp/rfl_sparse_rank_parts/2024.01.01/tiny/" (table [s seq] (list (take late 8) (til 8))))
+(.db.splayed.set "/tmp/rfl_sparse_rank_parts/2024.01.02/tiny/" (table [s seq] (list (take late 8) (+ 8 (til 8)))))
+(set tiny (.db.parted.get "/tmp/rfl_sparse_rank_parts/" 'tiny))
+(set before (at (.sys.mem) 'sort-perpart-runs))
+(set result (select {from: tiny asc: s}))
+(- (at (.sys.mem) 'sort-perpart-runs) before) -- 2
+(at result 'seq) -- (til 16)
+(.sys.exec "rm -rf /tmp/rfl_sparse_rank_parts")

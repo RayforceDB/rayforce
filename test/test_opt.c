@@ -59,6 +59,75 @@ static ray_t* make_test_table(void) {
     return tbl;
 }
 
+/* Admission uses logical types, not the integer representation of symbol IDs. */
+static test_result_t test_sym_compare_admission(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_graph_t* g = ray_graph_new(NULL);
+    TEST_ASSERT(g != NULL, "graph");
+    ray_t* atom = ray_sym(ray_sym_intern("alpha", 5));
+    ray_op_t* n = ray_const_atom(g, atom);
+    ray_release(atom);
+    TEST_ASSERT(n != NULL, "symbol constant");
+    uint32_t sym_id = n->id;
+    uint32_t bad[4];
+    n = ray_const_i64(g, 1); TEST_ASSERT(n != NULL, "integer constant"); bad[0] = n->id;
+    n = ray_const_bool(g, true); TEST_ASSERT(n != NULL, "bool constant"); bad[1] = n->id;
+    n = ray_const_f64(g, 1.0); TEST_ASSERT(n != NULL, "float constant"); bad[2] = n->id;
+    n = ray_const_i64(g, NULL_I64); TEST_ASSERT(n != NULL, "typed null"); bad[3] = n->id;
+    for (int op = 0; op < 2; op++) {
+        for (int i = 0; i < 4; i++) {
+            for (int reverse = 0; reverse < 2; reverse++) {
+                uint32_t a = reverse ? bad[i] : sym_id;
+                uint32_t b = reverse ? sym_id : bad[i];
+                ray_op_t* out = op ? ray_ne(g, &g->nodes[a], &g->nodes[b])
+                                   : ray_eq(g, &g->nodes[a], &g->nodes[b]);
+                TEST_ASSERT(out == NULL, "mixed symbol pair must decline");
+                TEST_ASSERT(ray_binop(g, op ? OP_NE : OP_EQ,
+                                     &g->nodes[a], &g->nodes[b]) == NULL,
+                            "generic comparison must also decline");
+            }
+        }
+    }
+    TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+    uint32_t good[3];
+    n = ray_const_str(g, "alpha", 5); TEST_ASSERT(n != NULL, "text literal"); good[0] = n->id;
+    ray_t* text = ray_vec_new(RAY_STR, 1);
+    TEST_ASSERT(text && !RAY_IS_ERR(text), "text vector");
+    text = ray_str_vec_append(text, "alpha", 5);
+    TEST_ASSERT(text && !RAY_IS_ERR(text), "text cell");
+    n = ray_const_vec(g, text); ray_release(text);
+    TEST_ASSERT(n != NULL, "text-vector constant"); good[1] = n->id;
+    atom = ray_sym(0); n = ray_const_atom(g, atom); ray_release(atom);
+    TEST_ASSERT(n != NULL, "null symbol"); good[2] = n->id;
+    for (int op = 0; op < 2; op++) {
+        for (int i = 0; i < 3; i++) {
+            for (int reverse = 0; reverse < 2; reverse++) {
+                uint32_t a = reverse ? good[i] : sym_id;
+                uint32_t b = reverse ? sym_id : good[i];
+                TEST_ASSERT(ray_binop(g, op ? OP_NE : OP_EQ,
+                                     &g->nodes[a], &g->nodes[b]) != NULL,
+                            "symbol/text admission retained");
+            }
+        }
+    }
+    n = ray_scan(g, "unbound"); TEST_ASSERT(n != NULL, "unbound scan");
+    uint32_t unknown = n->id;
+    TEST_ASSERT_EQ_I(n->out_type, 0);
+    TEST_ASSERT(ray_eq(g, &g->nodes[sym_id], &g->nodes[unknown]) == NULL,
+                "unknown source needs evaluator fallback");
+    TEST_ASSERT(ray_ne(g, &g->nodes[unknown], &g->nodes[sym_id]) == NULL,
+                "reverse unknown source needs fallback");
+    TEST_ASSERT(ray_eq(g, &g->nodes[unknown], &g->nodes[good[0]]) != NULL,
+                "text literal is not a real symbol operand");
+    TEST_ASSERT(ray_ne(g, &g->nodes[good[0]], &g->nodes[unknown]) != NULL,
+                "reverse text literal keeps existing admission");
+    ray_graph_free(g);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Direct proof fixtures intentionally do not execute or optimize malformed DAGs. */
 static test_result_t test_subset_proof_pointwise(void) {
     ray_heap_init();
@@ -3207,6 +3276,7 @@ static test_result_t test_filter_domain_barriers(void) {
 }
 
 const test_entry_t opt_entries[] = {
+    { "opt/sym_compare_admission", test_sym_compare_admission, NULL, NULL },
     { "opt/subset_property", test_subset_property, NULL, NULL },
     { "opt/filter_domain_barriers", test_filter_domain_barriers, NULL, NULL },
     { "opt/subset_proof_pointwise", test_subset_proof_pointwise, NULL, NULL },
