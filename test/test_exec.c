@@ -6870,7 +6870,7 @@ static test_result_t test_expr_affine_f64_bias_scalar_oom(void) {
         ray_group_test_fail_scalar_alloc(0);
         ray_group_test_route(0);
         TEST_ASSERT_TRUE(result && RAY_IS_ERR(result));
-        ray_release(result);
+        ray_error_free(result);
         ray_graph_free(g);
     }
     ray_release(tbl);
