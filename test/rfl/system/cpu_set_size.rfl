@@ -20,9 +20,7 @@
 ;; -c within what the process may use: no warning
 (.sys.exec "set -- $(taskset -pc $$ | sed 's/.*: //' | tr ',' '\\n' | awk -F- '{ if (NF == 2) for (i = $1; i <= $2; i++) print i; else print $1 }'); [ $# -ge 2 ] || exit 0; q=$(env -u RAYFORCE_CORES ./rayforce -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); q=${q#* }; e=2; [ \"$q\" -lt 2 ] && e=$q; ! env -u RAYFORCE_CORES taskset -c $1,$2 ./rayforce -c $e -f /tmp/rf_cpu_set/info.rfl 2>&1 >/dev/null | grep -q warning") -- 0
 
-;; A CPU quota of 1.5 CPUs gives a pool of 2 threads, while cores still
-;; counts every allowed CPU.  Runs only where a user systemd can make a
-;; scope with a quota (a scope of its own, outside the runner's cgroup).
-(.sys.exec "command -v systemd-run >/dev/null || exit 0; [ $(nproc) -ge 3 ] || exit 0; systemd-run --user --scope -q -p CPUQuota=150% true 2>/dev/null || exit 0; o=$(env -u RAYFORCE_CORES systemd-run --user --scope -q -p CPUQuota=150% ./rayforce -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); [ \"$o\" = \"$(nproc) 2\" ]") -- 0
+;; The CPU quota case runs as pool/cpu_quota_child (test/test_pool.c), where
+;; a missing systemd user manager shows as a skip.
 
 (.sys.exec "rm -rf /tmp/rf_cpu_set")

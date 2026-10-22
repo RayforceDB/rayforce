@@ -422,13 +422,27 @@ uint32_t ray_thread_count(void) {
  * online count; the online count elsewhere.  The mask read is the calling
  * thread's: the process's, unless an embedding application narrowed the
  * thread that first uses the pool (whose workers then inherit it). */
+/* Test hook: a mask buffer below this many bytes fails as a kernel whose
+ * mask is wider than the buffer fails it (EINVAL); 0 = none. */
+static size_t g_cpu_set_test_min;
+void ray_cpu_set_test_min_bytes(size_t n) { g_cpu_set_test_min = n; }
+
 uint32_t ray_cpu_set_count(void) {
 #if defined(RAY_OS_LINUX)
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        int n = CPU_COUNT(&set);
-        if (n > 0) return (uint32_t)n;
+    /* A kernel built for more CPUs than a cpu_set_t holds (1024) rejects
+     * the fixed buffer with EINVAL however few CPUs the process may use:
+     * retry with a larger one. */
+    for (size_t sz = sizeof(cpu_set_t); sz <= ((size_t)1 << 20); sz *= 2) {
+        cpu_set_t* set = (cpu_set_t*)ray_sys_alloc(sz);
+        if (!set) break;
+        memset(set, 0, sz);
+        int rc, err = EINVAL;
+        if (sz < g_cpu_set_test_min) rc = -1;
+        else { rc = sched_getaffinity(0, sz, set); err = errno; }
+        int n = rc == 0 ? CPU_COUNT_S(sz, set) : 0;
+        ray_sys_free(set);
+        if (rc == 0) { if (n > 0) return (uint32_t)n; break; }
+        if (err != EINVAL) break;
     }
 #endif
     return ray_thread_count();
@@ -685,8 +699,17 @@ static int64_t cgroup_cpu_read(const char* dir, bool v2) {
     return (int64_t)((q * 1000 + per - 1) / per);
 }
 
-/* Smallest quota over `root`/`cgpath` and every ancestor, as the memory
- * limit walk above. */
+/* Test hook: a directory /proc/self/{cgroup,mountinfo} and the cgroup
+ * files of the quota reader are taken from (NULL: the real ones). */
+static const char* g_cg_test_root;
+void ray_os_cgroup_test_root(const char* dir) { g_cg_test_root = dir; }
+
+static void cg_path(char* out, size_t n, const char* p) {
+    snprintf(out, n, "%s%s", g_cg_test_root ? g_cg_test_root : "", p);
+}
+
+/* Smallest quota over `root`/`cgpath` and every ancestor up to `root`, as
+ * the memory limit walk above. */
 static int64_t cgroup_cpu_walk(const char* root, const char* cgpath, bool v2) {
     char dir[512];
     if (snprintf(dir, sizeof(dir), "%s%s", root, cgpath) >= (int)sizeof(dir)) return 0;
@@ -703,19 +726,113 @@ static int64_t cgroup_cpu_walk(const char* root, const char* cgpath, bool v2) {
     return m;
 }
 
-/* True when the comma-separated controller list names "cpu". */
-static bool cgroup_has_cpu(const char* ctrls) {
-    while (*ctrls) {
-        size_t n = strcspn(ctrls, ",");
-        if (n == 3 && strncmp(ctrls, "cpu", 3) == 0) return true;
-        ctrls += n;
-        if (*ctrls == ',') ctrls++;
+/* True when the comma-separated list names `want`. */
+static bool cgroup_list_has(const char* list, const char* want) {
+    size_t wl = strlen(want);
+    while (*list) {
+        size_t n = strcspn(list, ",");
+        if (n == wl && strncmp(list, want, n) == 0) return true;
+        list += n;
+        if (*list == ',') list++;
     }
     return false;
 }
 
+/* mountinfo escapes space, tab, newline and backslash as \ooo */
+static void cg_unescape(char* s) {
+    char* o = s;
+    for (char* p = s; *p; p++) {
+        if (p[0] == '\\' && p[1] >= '0' && p[1] <= '3' && p[2] >= '0' && p[2] <= '7' &&
+            p[3] >= '0' && p[3] <= '7') {
+            *o++ = (char)((p[1] - '0') * 64 + (p[2] - '0') * 8 + (p[3] - '0'));
+            p += 3;
+        } else {
+            *o++ = *p;
+        }
+    }
+    *o = 0;
+}
+
+/* Where a cgroup hierarchy is mounted: the v2 one (`ctrl` NULL), or the v1
+ * one whose super options name `ctrl`.  Its mount point, and the path in
+ * the hierarchy that the mount shows (its root: "/" unless a subtree was
+ * mounted).  False when /proc/self/mountinfo lists none. */
+static bool cgroup_mount(const char* ctrl, char* mnt, size_t mn, char* root, size_t rn) {
+    char path[600];
+    cg_path(path, sizeof(path), "/proc/self/mountinfo");
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char line[2048];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        /* "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS" */
+        line[strcspn(line, "\n")] = 0;
+        char* sep = strstr(line, " - ");
+        if (!sep) continue;
+        *sep = 0;
+        char* f_root = NULL; char* f_mnt = NULL;
+        char* save = NULL;
+        int i = 0;
+        for (char* t = strtok_r(line, " ", &save); t; t = strtok_r(NULL, " ", &save), i++) {
+            if (i == 3) f_root = t;
+            else if (i == 4) { f_mnt = t; break; }
+        }
+        if (!f_root || !f_mnt) continue;
+        char* fstype = strtok_r(sep + 3, " ", &save);
+        char* source = fstype ? strtok_r(NULL, " ", &save) : NULL;
+        char* super = source ? strtok_r(NULL, " ", &save) : NULL;
+        if (!fstype) continue;
+        if (ctrl ? (strcmp(fstype, "cgroup") == 0 && super && cgroup_list_has(super, ctrl))
+                 : strcmp(fstype, "cgroup2") == 0) {
+            cg_unescape(f_root);
+            cg_unescape(f_mnt);
+            found = snprintf(mnt, mn, "%s", f_mnt) < (int)mn &&
+                    snprintf(root, rn, "%s", f_root) < (int)rn;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* The quota of a membership path `cgpath` ("" for the root) of the v2
+ * hierarchy (`ctrl` NULL) or the v1 one carrying `ctrl`: the membership is
+ * translated through the mount's root to its directory under the mount
+ * point, and the walk stops at the mount point (ancestors outside the
+ * mount are not visible).  Without mountinfo, the conventional mounts. */
+static int64_t cgroup_cpu_member(const char* ctrl, const char* v1list, const char* cgpath) {
+    char mnt[512], root[512], base[600];
+    if (cgroup_mount(ctrl, mnt, sizeof(mnt), root, sizeof(root))) {
+        const char* rel = cgpath;
+        if (strcmp(root, "/") != 0) {
+            size_t rl = strlen(root);
+            if (strncmp(cgpath, root, rl) != 0 || (cgpath[rl] != 0 && cgpath[rl] != '/'))
+                return 0;   /* membership outside the visible subtree */
+            rel = cgpath + rl;
+        }
+        cg_path(base, sizeof(base), mnt);
+        return cgroup_cpu_walk(base, rel, ctrl == NULL);
+    }
+    if (!ctrl) {
+        cg_path(base, sizeof(base), "/sys/fs/cgroup");
+        return cgroup_cpu_walk(base, cgpath, true);
+    }
+    /* v1 mounts the controller as the directory named by its list
+     * ("cpu,cpuacct"), usually with a "cpu" link to it */
+    char dir[300];
+    snprintf(dir, sizeof(dir), "/sys/fs/cgroup/%s", v1list);
+    cg_path(base, sizeof(base), dir);
+    int64_t v = cgroup_cpu_walk(base, cgpath, false);
+    if (!v) {
+        cg_path(base, sizeof(base), "/sys/fs/cgroup/cpu");
+        v = cgroup_cpu_walk(base, cgpath, false);
+    }
+    return v;
+}
+
 int64_t ray_os_cgroup_cpu_quota(void) {
-    FILE* f = fopen("/proc/self/cgroup", "r");
+    char path[600];
+    cg_path(path, sizeof(path), "/proc/self/cgroup");
+    FILE* f = fopen(path, "r");
     if (!f) return 0;
     int64_t m = 0;
     char line[512];
@@ -729,16 +846,8 @@ int64_t ray_os_cgroup_cpu_quota(void) {
         cgpath[strcspn(cgpath, "\n")] = 0;
         if (strcmp(cgpath, "/") == 0) cgpath[0] = 0;
         int64_t v = 0;
-        if (*ctrls == 0) {
-            v = cgroup_cpu_walk("/sys/fs/cgroup", cgpath, true);
-        } else if (cgroup_has_cpu(ctrls)) {
-            /* v1 mounts the controller as the directory named by its list
-             * ("cpu,cpuacct"), usually with a "cpu" link to it */
-            char root[300];
-            snprintf(root, sizeof(root), "/sys/fs/cgroup/%s", ctrls);
-            v = cgroup_cpu_walk(root, cgpath, false);
-            if (!v) v = cgroup_cpu_walk("/sys/fs/cgroup/cpu", cgpath, false);
-        }
+        if (*ctrls == 0) v = cgroup_cpu_member(NULL, NULL, cgpath);
+        else if (cgroup_list_has(ctrls, "cpu")) v = cgroup_cpu_member("cpu", ctrls, cgpath);
         if (v > 0 && (m == 0 || v < m)) m = v;
     }
     fclose(f);
@@ -764,6 +873,7 @@ bool ray_os_cgroup_stat_flush(const char* cg) {
 #else
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
+void    ray_os_cgroup_test_root(const char* dir) { (void)dir; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 #endif
@@ -1072,6 +1182,7 @@ uint32_t ray_thread_count(void) {
     return (uint32_t)si.dwNumberOfProcessors;
 }
 uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
+void     ray_cpu_set_test_min_bytes(size_t n) { (void)n; }
 
 /* Windows: no cheap topology read here — fall back to the logical count
  * (the SMT-aware default sizing is a POSIX-side optimization). */
@@ -1081,6 +1192,7 @@ uint32_t ray_physical_core_count(void) {
 
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
+void    ray_os_cgroup_test_root(const char* dir) { (void)dir; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 
@@ -1271,8 +1383,10 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 
 uint32_t ray_thread_count(void) { return 1; }
 uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
+void     ray_cpu_set_test_min_bytes(size_t n) { (void)n; }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
 int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
+void    ray_os_cgroup_test_root(const char* dir) { (void)dir; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 static uint64_t cache_llc_probe(void) { return 0; }

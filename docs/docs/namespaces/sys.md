@@ -78,7 +78,7 @@ Signature: `(.sys.build)`. Returns a dict with `version` (string) and `build-dat
 Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64, workers: i64, pid: i64, hostname: str}` on every platform (on Windows from `GetSystemInfo` / `GlobalMemoryStatusEx`).
 
 - `cores`: the CPUs this process may run on. On Linux that is its affinity mask, which `taskset`, a cpuset or `docker --cpuset-cpus` may narrow below the machine's CPU count.
-- `workers`: the threads of the execution pool, main included (see [Running Several Instances](../guides/instances.md)).
+- `workers`: the threads of the execution pool, main included; before the pool exists, the size it will get. `.sys.info` does not create the pool (see [Running Several Instances](../guides/instances.md)).
 
 ```lisp
 (.sys.info)

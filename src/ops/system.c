@@ -1601,11 +1601,11 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     vals = ray_list_append(vals, v3); ray_release(v3);
 #endif
 
-    /* workers: the threads of the execution pool, main included */
-    ray_pool_t* pool = ray_pool_get();
+    /* workers: the threads of the execution pool, main included (the size
+     * a default pool would get while none exists; none is created here) */
     int64_t sw = ray_sym_intern("workers", 7);
     keys = ray_vec_append(keys, &sw);
-    ray_t* vw = make_i64(pool ? (int64_t)ray_pool_total_workers(pool) : 1);
+    ray_t* vw = make_i64((int64_t)ray_pool_size());
     vals = ray_list_append(vals, vw); ray_release(vw);
 
     /* Process and host identity (#573).  An embedded process previously had

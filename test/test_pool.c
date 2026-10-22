@@ -1806,6 +1806,54 @@ static test_result_t test_auto_all_logical_cpus(void) {
 #endif
 
 #if defined(__linux__)
+/* "cores workers" from a child rayforce run under `prefix`, or false. */
+static bool cq_child(const char* prefix, const char* script, long* cores, long* workers) {
+    char cmd[512], out[512];
+    snprintf(cmd, sizeof(cmd), "env -u RAYFORCE_CORES %s ./rayforce -f %s 2>/dev/null", prefix, script);
+    FILE* p = popen(cmd, "r");
+    if (!p) return false;
+    size_t n = fread(out, 1, sizeof(out) - 1, p);
+    out[n] = 0;
+    if (pclose(p) != 0) return false;
+    while (n && (out[n - 1] == '\n' || out[n - 1] == ' ')) out[--n] = 0;
+    char* last = strrchr(out, '\n');
+    return sscanf(last ? last + 1 : out, "%ld %ld", cores, workers) == 2;
+}
+#endif
+
+/* A child under a CPU quota of 1.5 CPUs (a systemd user scope, as docker
+ * --cpus would set) sizes its default pool to 2 threads, or fewer when a
+ * quota above the scope is tighter: the same child in a scope without a
+ * quota gives that bound.  cores still counts every allowed CPU.  Skipped
+ * where no systemd user manager makes scopes, and without ./rayforce (the
+ * TSan job builds only the test binary). */
+static test_result_t test_cpu_quota_child(void) {
+#if !defined(__linux__)
+    SKIP("cgroup CPU quotas are Linux-only");
+#else
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    if (system("command -v systemd-run >/dev/null 2>&1 && "
+               "systemd-run --user --scope -q true >/dev/null 2>&1") != 0)
+        SKIP("no systemd user manager to make a scope with a CPU quota");
+    char script[128];
+    snprintf(script, sizeof(script), "/tmp/rayforce_cq_%d.rfl", (int)getpid());
+    FILE* f = fopen(script, "w");
+    TEST_ASSERT_TRUE(f != NULL);
+    fputs("(set i (.sys.info))\n(println (format \"% %\" (at i 'cores) (at i 'workers)))\n", f);
+    fclose(f);
+    long c0 = 0, w0 = 0, c1 = 0, w1 = 0;
+    bool ok0 = cq_child("systemd-run --user --scope -q", script, &c0, &w0);
+    bool ok1 = cq_child("systemd-run --user --scope -q -p CPUQuota=150%", script, &c1, &w1);
+    unlink(script);
+    TEST_ASSERT_TRUE(ok0);
+    TEST_ASSERT_TRUE(ok1);
+    TEST_ASSERT_EQ_I(c1, c0);
+    TEST_ASSERT_EQ_I(w1, w0 < 2 ? w0 : 2);
+    PASS();
+#endif
+}
+
+#if defined(__linux__)
 #include <sched.h>
 /* The default pool follows the CPUs the process may run on: with the
  * calling thread narrowed to two of them (as taskset does for a process),
@@ -2510,6 +2558,7 @@ const test_entry_t pool_entries[] = {
 #if defined(__linux__)
     { "pool/auto_follows_cpu_set",  test_auto_follows_cpu_set,  NULL, NULL },
 #endif
+    { "pool/cpu_quota_child",       test_cpu_quota_child,       NULL, NULL },
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
     { "pool/dispatch_reclaims_worker_blocks", test_dispatch_reclaims_worker_blocks, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
