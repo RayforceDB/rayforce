@@ -218,7 +218,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `map` | variadic | — | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
-| `pmap` | variadic | — | Parallel map (multi-threaded, returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
+| `pmap` | variadic | — | Currently a sequential alias for `map` (returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
@@ -236,7 +236,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 ; Transform each row with map
 (map (fn [x] (* x x)) [1 2 3 4])  ; (1 4 9 16)
 
-; Parallel map for expensive computation
+; pmap currently uses the same sequential callback loop as map
 (pmap (fn [t] (sum (til t))) [100 200 300])
 
 ; Running sum with scan
