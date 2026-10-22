@@ -490,17 +490,16 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_SUB: r = lv - rv; break;
                 case OP_MUL: r = lv * rv; break;
                 case OP_MOD:
-                    if (rv == 0.0f) r = NULL_F32;
-                    else {
-                        r = fmodf(lv, rv);
-                        if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
-                    }
+                    if (rv == 0.0f) return false;   /* 0Nf at run time */
+                    r = fmodf(lv, rv);
+                    if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
                 default: return false;
             }
-            folded = ray_f32(isfinite(r) ? r : NULL_F32);
+            if (!isfinite(r)) return false;   /* see the F64 arm */
+            folded = ray_f32(r);
             break;
         }
         case RAY_F64: {
@@ -511,8 +510,11 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_ADD: r = lv + rv; break;
                 case OP_SUB: r = lv - rv; break;
                 case OP_MUL: r = lv * rv; break;
-                case OP_DIV: r = lv / rv; break;  /* IEEE 754: ±Inf or NaN */
-                case OP_MOD: r = fmod(lv, rv); break;  /* IEEE 754: NaN for rv==0 */
+                case OP_DIV: r = lv / rv; break;
+                case OP_MOD:
+                    r = fmod(lv, rv);
+                    if (r != 0.0 && ((r > 0.0) != (rv > 0.0))) r += rv;
+                    break;
                 case OP_POW:
                     if (!pow_atom_type_admitted(le->literal) ||
                         !pow_atom_type_admitted(re->literal))
@@ -523,6 +525,10 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MAX2: r = fmax(lv, rv); break;  /* NaN-propagating */
                 default: return false;
             }
+            /* A non-finite result (x/0, overflow) is 0Nf at run time; a
+             * folded constant would carry Inf/NaN without its null flag,
+             * so leave it to the kernels. */
+            if (!isfinite(r)) return false;
             folded = ray_f64(r);
             break;
         }
@@ -534,11 +540,17 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_ADD: r = (int64_t)((uint64_t)lv + (uint64_t)rv); break;
                 case OP_SUB: r = (int64_t)((uint64_t)lv - (uint64_t)rv); break;
                 case OP_MUL: r = (int64_t)((uint64_t)lv * (uint64_t)rv); break;
+                /* A zero divisor (or INT64_MIN / -1) is 0Nl at run time:
+                 * leave it to the kernels rather than fold a 0. */
                 case OP_DIV:
-                    r = (rv != 0 && !(lv == INT64_MIN && rv == -1)) ? lv / rv : 0;
+                    if (rv == 0 || (lv == INT64_MIN && rv == -1)) return false;
+                    r = lv / rv;
+                    if (r * rv != lv && ((lv < 0) != (rv < 0))) r--;
                     break;
                 case OP_MOD:
-                    r = (rv != 0 && !(lv == INT64_MIN && rv == -1)) ? lv % rv : 0;
+                    if (rv == 0 || (lv == INT64_MIN && rv == -1)) return false;
+                    r = lv % rv;
+                    if (r != 0 && ((r ^ rv) < 0)) r += rv;
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -576,10 +588,14 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_SUB: r = (int32_t)((uint32_t)lv - (uint32_t)rv); break;
                 case OP_MUL: r = (int32_t)((uint32_t)lv * (uint32_t)rv); break;
                 case OP_DIV:
-                    r = (rv != 0 && !(lv == INT32_MIN && rv == -1)) ? lv / rv : 0;
+                    if (rv == 0 || (lv == INT32_MIN && rv == -1)) return false;
+                    r = lv / rv;
+                    if (r * rv != lv && ((lv < 0) != (rv < 0))) r--;
                     break;
                 case OP_MOD:
-                    r = (rv != 0 && !(lv == INT32_MIN && rv == -1)) ? lv % rv : 0;
+                    if (rv == 0 || (lv == INT32_MIN && rv == -1)) return false;
+                    r = lv % rv;
+                    if (r != 0 && ((r ^ rv) < 0)) r += rv;
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;

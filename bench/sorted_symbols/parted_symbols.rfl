@@ -1,0 +1,18 @@
+;; Repeated 10k-row constant segments in a 70k-symbol FILE domain.
+;; Populate the database FILE domain before writing the used symbol. Merely
+;; interning unrelated runtime names would not give the file column high IDs.
+(.sys.exec "rm -rf /tmp/rayforce_bench_rank_parts")
+(set padding (as 'SYM (map (fn [i] (format "unused-rank-%" i)) (til 70000))))
+(.db.splayed.set "/tmp/rayforce_bench_rank_parts/2024.01.01/padding/" (table [s] (list padding)))
+(set late (take [late-sorted-key] 10000))
+(.db.splayed.set "/tmp/rayforce_bench_rank_parts/2024.01.01/t/" (table [s seq] (list late (til 10000))))
+(.db.splayed.set "/tmp/rayforce_bench_rank_parts/2024.01.02/t/" (table [s seq] (list late (+ 10000 (til 10000)))))
+(set parts (.db.parted.get "/tmp/rayforce_bench_rank_parts/" 't))
+(set repeats 50)
+(set before (at (.sys.mem) 'sort-perpart-runs))
+(set elapsed_ms (timeit (set counts (map (fn [i] (count (select {from: parts asc: s}))) (til repeats)))))
+(set streamed (- (at (.sys.mem) 'sort-perpart-runs) before))
+(set valid (and (all (== counts 20000)) (== streamed (* repeats 2))))
+(if (not valid) (raise "parted symbol benchmark did not stream correctly"))
+(println (format "PARTED|%|checks=%|partitions=%" elapsed_ms repeats streamed))
+(.sys.exec "rm -rf /tmp/rayforce_bench_rank_parts")

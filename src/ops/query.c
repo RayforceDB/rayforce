@@ -20750,6 +20750,10 @@ static void xbar_par_fn(void* vctx, uint32_t worker_id,
         if (c->pow2) {
             int64_t mask = ~(b - 1);
             for (int64_t i = start; i < end; i++) o[i] = in[i] & mask;
+        } else if (b == -1) {
+            /* Every integer is a multiple of -1; dividing the null
+             * sentinel INT64_MIN by -1 would trap (SIGFPE). */
+            for (int64_t i = start; i < end; i++) o[i] = in[i];
         } else {
             for (int64_t i = start; i < end; i++) {
                 int64_t a = in[i];
@@ -20819,7 +20823,9 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
          col->type == RAY_I16 || col->type == RAY_TIMESTAMP ||
          col->type == RAY_DATE || col->type == RAY_TIME) &&
         !RAY_ATOM_IS_NULL(bucket)) {
-        int64_t b = bucket->i64;
+        /* Read the bucket by its own width: a narrow atom keeps only its
+         * low bytes, so bucket->i64 of an I16/I32 -7 is 65529/4294967289. */
+        int64_t b = as_i64(bucket);
         if (b == 0) return ray_error("domain", "xbar: bucket size must be non-zero");
         if (!xbar_bucket_fits_vec_type(col->type, b))
             return atomic_map_binary(ray_xbar_fn, col, bucket);
@@ -20874,31 +20880,39 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
     /* Both are integer types (i64, i32, i16) → integer xbar */
     if (is_numeric(col) && is_numeric(bucket) && !is_float_op(col, bucket)) {
         int64_t a = as_i64(col), b = as_i64(bucket);
-        if (b == 0 || RAY_ATOM_IS_NULL(col) || RAY_ATOM_IS_NULL(bucket))
-            return ray_error("domain", "xbar: bucket size must be non-zero and operands non-null");
+        if (b == 0 || RAY_ATOM_IS_NULL(bucket))
+            return ray_error("domain", "xbar: bucket size must be non-zero and non-null");
+        /* Result type follows the wider of the two operands */
+        int8_t rt = -RAY_I64;
+        if (col->type == -RAY_I32 && bucket->type == -RAY_I32) rt = -RAY_I32;
+        if (col->type == -RAY_I16 && bucket->type == -RAY_I16) rt = -RAY_I16;
+        /* A null value buckets to the null of the result type, as a null
+         * element of a vector does. */
+        if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(rt);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
         int64_t result = q * b;
-        /* Result type follows the wider of the two operands */
-        if (col->type == -RAY_I32 && bucket->type == -RAY_I32) return make_i32((int32_t)result);
-        if (col->type == -RAY_I16 && bucket->type == -RAY_I16) return make_i16((int16_t)result);
+        if (rt == -RAY_I32) return make_i32((int32_t)result);
+        if (rt == -RAY_I16) return make_i16((int16_t)result);
         return make_i64(result);
     }
     /* Float path: either operand is f64 */
     if (is_numeric(col) && is_numeric(bucket)) {
-        if (RAY_ATOM_IS_NULL(col) || RAY_ATOM_IS_NULL(bucket))
-            return ray_error("domain", "xbar: operands must be non-null");
         double c = as_f64(col), b = as_f64(bucket);
-        if (b == 0.0) return ray_error("domain", "xbar: bucket size must be non-zero");
+        if (b == 0.0 || RAY_ATOM_IS_NULL(bucket))
+            return ray_error("domain", "xbar: bucket size must be non-zero and non-null");
+        if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(-RAY_F64);
         double fq = floor(c / b);
         return make_f64(fq * b);
     }
     /* Temporal xbar: col is temporal, bucket is integer or temporal (not float) */
     if (is_temporal(col) && (is_temporal(bucket) ||
         (is_numeric(bucket) && bucket->type != -RAY_F64))) {
-        int64_t a = col->i64, b;
+        /* DATE / TIME atoms are 32-bit: their typed null writes only the
+         * low word, so col->i64 of 0Nd read 2^31 (5881610.07.10). */
+        int64_t a = col->type == -RAY_TIMESTAMP ? col->i64 : (int64_t)col->i32, b;
         if (is_temporal(bucket)) {
-            b = bucket->i64;
+            b = bucket->type == -RAY_TIMESTAMP ? bucket->i64 : (int64_t)bucket->i32;
             /* Cross-temporal conversion: TIME(ms) bucket on TIMESTAMP(ns) col */
             if (col->type == -RAY_TIMESTAMP && bucket->type == -RAY_TIME)
                 b *= 1000000LL;
@@ -20906,6 +20920,8 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
             b = as_i64(bucket);
         }
         if (b == 0 || RAY_ATOM_IS_NULL(bucket)) return ray_error("domain", "xbar: bucket size must be non-zero and non-null");
+        /* A null value is the column type's null, as in the vector path. */
+        if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(col->type);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
         int64_t result = q * b;
