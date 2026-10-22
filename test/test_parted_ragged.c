@@ -767,7 +767,56 @@ static test_result_t test_lazy_save(void) {
     PASS();
 }
 
+/* The pruning key is a validated physical slot, not necessarily slot 0.
+ * Reorder a reader-created table through normal retaining table APIs, keeping
+ * encoded slots encoded. Explicit projections normalize output column order. */
+static test_result_t test_partition_key_position(void) {
+    for (unsigned gen2 = 0; gen2 <= 7; gen2 += 7) {
+        char root[512];
+        snprintf(root, sizeof root, "%s/key_position_%u", ray_test_tmp(PR_TMP), gen2);
+        TEST_ASSERT_TRUE(write_db(root, gen2, false));
+        ray_t* src = load_db(root);
+        TEST_ASSERT_NOT_NULL(src);
+        int64_t nc = ray_table_ncols(src);
+        TEST_ASSERT_TRUE(nc > 1);
+        ray_col_meta_t m;
+        TEST_ASSERT_TRUE(ray_table_col_meta_idx(src, 0, &m) && m.type == RAY_MAPCOMMON);
+        ray_enc_counters_reset();
+        ray_t* reordered = ray_table_new(nc);
+        TEST_ASSERT_TRUE(reordered && !RAY_IS_ERR(reordered));
+        for (int64_t j = 1; j <= nc; j++) {
+            int64_t c = j % nc;                    /* original key moves last */
+            ray_t* slot = ray_table_get_col_enc_idx(src, c);
+            if (!slot) slot = ray_table_col_idx(src, c);
+            TEST_ASSERT_TRUE(slot && !RAY_IS_ERR(slot));
+            reordered = ray_table_add_col(reordered, ray_table_col_name(src, c), slot);
+            TEST_ASSERT_TRUE(reordered && !RAY_IS_ERR(reordered));
+        }
+        TEST_ASSERT_TRUE(ray_table_col_meta_idx(reordered, nc - 1, &m) && m.type == RAY_MAPCOMMON);
+        TEST_ASSERT_EQ_I(m.len, 9);                 /* public metadata rows stay meaningful */
+        ray_enc_counters_t counters;
+        ray_enc_counters_get(&counters);
+        TEST_ASSERT_EQ_I((int64_t)counters.materialized, 0);
+        static const char* const q[] = {
+            "(select {date: date a: a b: b from: t where: (> a 0)})",
+            "(select {date: date a: a b: b from: t where: (>= date 2024.01.02)})",
+            NULL,
+        };
+        for (int i = 0; q[i]; i++) {
+            bind_t(src); ray_t* want = ray_eval_str(q[i]);
+            bind_t(reordered); ray_t* got = ray_eval_str(q[i]);
+            bool same = same_value(want, got);
+            drop_out(want); drop_out(got);
+            TEST_ASSERT_FMT(same, "gen2 %u, key-last: %s", gen2, q[i]);
+        }
+        bind_t(NULL);
+        ray_release(reordered); ray_release(src);
+    }
+    PASS();
+}
+
 const test_entry_t parted_ragged_entries[] = {
+    { "parted_ragged/key_position",         test_partition_key_position, pr_setup, pr_teardown },
     { "parted_ragged/fill_every_type",      test_fill_every_type,      pr_setup, pr_teardown },
     { "parted_ragged/issue_repro",          test_issue_repro,          pr_setup, pr_teardown },
     { "parted_ragged/gen0",                 test_ragged_gen0,          pr_setup, pr_teardown },
