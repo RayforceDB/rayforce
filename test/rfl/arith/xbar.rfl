@@ -22,3 +22,59 @@
 (xbar (as 'I32 [-10 20]) 4294967296) -- [-4294967296 0]
 (type (xbar (as 'I16 [10 20]) 65536)) -- 'I64
 (xbar (as 'I16 [-10 20]) 65536) -- [-65536 0]
+
+;; A null atom buckets to its typed null, as a null element of a vector does.
+;; The temporal atom path read a DATE / TIME atom through its 64-bit slot, so
+;; 0Nd (low word 0x80000000) bucketed to 5881610.07.10; the integer and float
+;; atom paths raised a domain error that the vector path never raised.
+(xbar 0Nd 7) -- 0Nd
+(type (xbar 0Nd 7)) -- 'date
+(xbar 0Nd 7) -- (first (xbar [0Nd] 7))
+(xbar 0Nd -7) -- 0Nd
+(xbar 0Nd (as 'I16 7)) -- 0Nd
+(xbar 0Nd 2000.01.08) -- 0Nd
+(xbar 0Nt 7000) -- 0Nt
+(type (xbar 0Nt 7000)) -- 'time
+(xbar 0Nt 7000) -- (first (xbar [0Nt] 7000))
+(xbar 0Np 60000000000) -- 0Np
+(xbar 0Np 00:01:00.000) -- 0Np
+(type (xbar 0Np 60000000000)) -- 'timestamp
+(xbar 0Nl 7) -- 0Nl
+(xbar 0Nl 7) -- (first (xbar [0Nl] 7))
+(xbar 0Ni (as 'I32 7)) -- 0Ni
+(xbar 0Nh (as 'I16 7)) -- 0Nh
+(xbar 0Nl 2.5) -- 0Nf
+(xbar 0Nf 2.0) -- 0Nf
+(xbar [1.5 0Nf 4.5] 2.0) -- [0.0 0Nf 4.0]
+;; non-null temporal atoms, either side of the epoch
+(xbar 2000.01.10 7) -- 2000.01.08
+(xbar 1999.12.26 7) -- 1999.12.25
+(xbar 2000.01.10 7) -- (first (xbar [2000.01.10] 7))
+;; a zero or null bucket stays a domain error, null value or not
+(xbar 0Nd 0) !- domain
+(xbar 0Nd 0N) !- domain
+(xbar 2000.01.10 0N) !- domain
+(xbar 0Nl 0) !- domain
+(xbar 17 0N) !- domain
+(xbar 0Nf 0Nf) !- domain
+(xbar 'a 7) !- type
+;; a constant null atom in a query the evaluator serves
+(set Tn (table [d x] (list [2000.01.10 0Nd 1999.12.26] [1 2 3])))
+(at (select {k: (xbar 0Nd 7) from: Tn by: x}) 'k) -- [0Nd 0Nd 0Nd]
+(at (select {k: (xbar 0Nd 7) from: Tn}) 'k) -- [0Nd 0Nd 0Nd]
+(at (select {k: (xbar d 7) from: Tn}) 'k) -- [2000.01.08 0Nd 1999.12.25]
+
+;; A negative narrow bucket in the vector fast path: the bucket was read
+;; through its 64-bit slot, so an I16 -7 was 65529 and an I32 -7 4294967289.
+(xbar [17 -17] (as 'I16 -7)) -- [21 -14]
+(xbar [17 -17] (as 'I32 -7)) -- [21 -14]
+(xbar (as 'I32 [17 -17]) (as 'I16 -7)) -- (as 'I32 [21 -14])
+(xbar [2000.01.10 1999.12.26] (as 'I16 -7)) -- [2000.01.15 2000.01.01]
+(xbar [2000.01.01D00:00:00.000000010] (as 'I32 -7)) -- [2000.01.01D00:00:00.000000014]
+
+;; A -1 bucket over a 64-bit vector holding a null divided the INT64_MIN
+;; sentinel by -1 in the fast path, which traps (SIGFPE).
+(xbar [0Nl 5 -5] -1) -- [0Nl 5 -5]
+(xbar [0Np 2000.01.01D00:00:00.000000005] -1) -- [0Np 2000.01.01D00:00:00.000000005]
+(xbar 0Np -1) -- 0Np
+(xbar 0Nl -1) -- 0Nl
