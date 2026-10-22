@@ -1783,6 +1783,17 @@ join_gather:;
      * indices), falling back to per-column gather for nullable RIGHT columns. */
     int64_t left_ncols = ray_table_ncols(left_table);
     int64_t right_ncols = ray_table_ncols(right_table);
+    /* Share left columns only when the LEFT join's actual mapping preserves
+     * every left row in order. Cardinality alone is not sufficient: radix
+     * partitioning can reorder even a one-to-one join's output.
+     * Retained columns already carry their nulls, pools and symbol domains;
+     * do not rewrite metadata on these shared objects below. */
+    bool left_identity = join_type == 1 && pair_count == left_rows;
+    if (left_identity) {
+        for (int64_t i = 0; i < pair_count; i++) {
+            if (l_idx[i] != i) { left_identity = false; break; }
+        }
+    }
     result = ray_table_new(left_ncols + right_ncols);
     if (!result || RAY_IS_ERR(result)) goto join_cleanup;
 
@@ -1824,9 +1835,17 @@ join_gather:;
             result = col;
             goto join_cleanup;
         }
-        ray_t* new_col = col->type == RAY_LIST
-            ? join_gather_list_col(col, l_idx, pair_count)
-            : col_vec_new(col, pair_count);
+        ray_t* new_col;
+        /* Slice COW copies only its header, leaving the parent shared.
+         * Preserve the old independent gather for this representation. */
+        if (left_identity && !(col->attrs & RAY_ATTR_SLICE)) {
+            ray_retain(col);
+            new_col = col;
+        } else {
+            new_col = col->type == RAY_LIST
+                ? join_gather_list_col(col, l_idx, pair_count)
+                : col_vec_new(col, pair_count);
+        }
         if (!new_col || RAY_IS_ERR(new_col)) {
             ray_t* err = new_col ? new_col : ray_error("oom", NULL);
             for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
@@ -1835,7 +1854,7 @@ join_gather:;
             goto join_cleanup;
         }
         if (col->type == RAY_LIST) l_has_list = true;
-        else new_col->len = pair_count;
+        else if (new_col != col) new_col->len = pair_count;
         l_out_cols[l_out_count] = new_col;
         l_src_cols[l_out_count] = col;
         l_out_names[l_out_count] = ray_table_col_name(left_table, c);
@@ -1885,7 +1904,7 @@ join_gather:;
     if (pair_count > 0) {
         /* Left columns: multi_gather (non-nullable for INNER/LEFT) */
         bool l_nullable = (join_type == 2);  /* only FULL OUTER */
-        if (!l_nullable && !l_has_list &&
+        if (!left_identity && !l_nullable && !l_has_list &&
             l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
             multi_gather_ctx_t mgctx = { .idx = l_idx, .ncols = l_out_count };
             for (int64_t si = 0; si < l_out_count; si++) {
@@ -1899,10 +1918,11 @@ join_gather:;
             else
                 multi_gather_fn(&mgctx, 0, 0, pair_count);
         } else {
-            /* Fall back to per-column gather for nullable or single column */
+            /* Gather newly allocated columns, including slice fallbacks.
+             * Retained identity outputs already have their source values. */
             for (int64_t si = 0; si < l_out_count; si++) {
                 ray_t* col = l_src_cols[si];
-                if (col->type != RAY_LIST) {
+                if (l_out_cols[si] != col && col->type != RAY_LIST) {
                     gather_ctx_t gctx = {
                         .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
                         .esz = col_esz(col), .nullable = l_nullable,
@@ -1952,6 +1972,7 @@ join_gather:;
     {
         for (int64_t si = 0; si < l_out_count; si++) {
             ray_t* col = l_src_cols[si];
+            if (l_out_cols[si] == col) continue;  /* retained, metadata intact */
             col_propagate_str_pool(l_out_cols[si], col);
             if (col->type != RAY_LIST)
                 col_propagate_nulls_gather(l_out_cols[si], col, l_idx, pair_count);
