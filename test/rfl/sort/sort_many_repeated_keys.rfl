@@ -1,0 +1,10 @@
+;; Repeated names are valid sort keys. The 300k-key list needs heap storage,
+;; even for a tiny table whose keys all tie and take the sorted shortcut.
+(set keys (take [s] 300000))
+(set symbols (table [s row] (list [same-key same-key] [2 1])))
+(at (xasc symbols keys) 'row) -- [2 1]
+(at (xdesc symbols keys) 'row) -- [2 1]
+;; Integer checks must also avoid per-key stack buffers.
+(set integers (table [s row] (list [7 7] [2 1])))
+(at (xasc integers keys) 'row) -- [2 1]
+(at (xdesc integers keys) 'row) -- [2 1]
