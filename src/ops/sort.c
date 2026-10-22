@@ -4279,50 +4279,58 @@ static int sorted_check_sym_cmp(const sorted_check_ctx_t* c, int64_t k,
     return cmp ? cmp : (la > lb) - (la < lb);
 }
 
-/* Reuse the typed SYM-first scan in the preparation probe. With no budget
- * output this is the existing worker scan; with next_row it stops only after
- * enough run-boundary comparisons to justify rank setup. The equal-ID hot
- * loop keeps raw i64 reads and has no generic per-key type dispatch. */
-static bool sorted_check_sym_i64(sorted_check_ctx_t* c, int64_t start,
-                                  int64_t end, int64_t* next_row) {
-    int64_t comparisons = 0;
-    ray_t* sc = c->key_cols[0];
-    const void* sd = ray_data(sc);
-    uint8_t sattrs = sc->attrs;
-    const int64_t* restrict tv = (const int64_t*)ray_data(c->key_cols[1]);
-    for (int64_t b = start; b < end; b += 4096) {
-        if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return false;
-        int64_t e = b + 4096 < end ? b + 4096 : end;
-        for (int64_t i = b; i < e; i++) {
-            int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs);
-            int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs);
-            if (RAY_LIKELY(ia == ib)) {
-                if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return false; }
-            } else {
-                int cmp = sorted_check_sym_cmp(c, 0, ia, ib);
-                if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return false; }
-                if (next_row && ++comparisons >= RAY_MORSEL_ELEMS) {
-                    *next_row = i + 1;
-                    return true;
-                }
-            }
-        }
-    }
-    if (next_row) *next_row = end;
-    return true;
+/* Share the budgeted probe and worker scan at the secondary's physical
+ * width. TIME is int32_t; I64/TIMESTAMP are int64_t. Dispatch once outside
+ * rows; comparison budget is still spent only at unequal SYM boundaries. */
+#define SORTED_SYM_SECONDARY(lane_t) do { \
+    int64_t comparisons = 0; \
+    ray_t* sc = c->key_cols[0]; \
+    const void* sd = ray_data(sc); \
+    uint8_t sattrs = sc->attrs; \
+    const lane_t* restrict tv = (const lane_t*)ray_data(c->key_cols[1]); \
+    for (int64_t b = start; b < end; b += 4096) { \
+        if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return false; \
+        int64_t e = b + 4096 < end ? b + 4096 : end; \
+        for (int64_t i = b; i < e; i++) { \
+            int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs); \
+            int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs); \
+            if (RAY_LIKELY(ia == ib)) { \
+                if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return false; } \
+            } else { \
+                int cmp = sorted_check_sym_cmp(c, 0, ia, ib); \
+                if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return false; } \
+                if (next_row && ++comparisons >= RAY_MORSEL_ELEMS) { \
+                    *next_row = i + 1; \
+                    return true; \
+                } \
+            } \
+        } \
+    } \
+    if (next_row) *next_row = end; \
+    return true; \
+} while (0)
+
+static bool sorted_check_sym_numeric(sorted_check_ctx_t* c, int64_t start,
+                                      int64_t end, int64_t* next_row) {
+    if (c->key_cols[1]->type == RAY_TIME)
+        SORTED_SYM_SECONDARY(int32_t);
+    else
+        SORTED_SYM_SECONDARY(int64_t);
 }
+#undef SORTED_SYM_SECONDARY
 
 static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
     if (start < 1) start = 1;
 
-    /* Specialized (SYM, i64-family) two-key loop — the canonical
-     * (sym, time) shape.  The generic loop below pays a type-switch per
-     * read and an atomic flag load per row; here adjacent sym ids
+    /* Specialized (SYM, integer-secondary) two-key loop.  The generic loop
+     * below pays a type-switch per read and an atomic flag load per row;
+     * here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
      * lexical comparison only runs at run boundaries), the secondary key
-     * reads raw i64, and the bail flag is polled per 4096-row block.
+     * reads TIME as int32_t and I64/TIMESTAMP as int64_t, and the bail flag
+     * is polled per 4096-row block.
      *
      * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
      * actual nulls up front, including for SYM).  That is not squeamishness
@@ -4335,7 +4343,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
          c->key_cols[1]->type == RAY_TIME ||
          c->key_cols[1]->type == RAY_TIMESTAMP) &&
         !ray_vec_may_have_nulls(c->key_cols[1])) {
-        sorted_check_sym_i64(c, start, end, NULL);
+        sorted_check_sym_numeric(c, start, end, NULL);
         return;
     }
 
@@ -4366,14 +4374,14 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
  * low-transition inputs finish here without any rank preparation. */
 static bool sorted_check_probe(sorted_check_ctx_t* c, int64_t nrows,
                                 int64_t* next_row) {
-    /* Match the existing ascending typed route for true 64-bit secondary
-     * keys. TIME's separate width repair is not part of this probe change. */
+    /* Probe and worker use the same width-correct ascending typed scan. */
     if (!c->descending && c->n_keys == 2 &&
         c->key_cols[0]->type == RAY_SYM &&
         (c->key_cols[1]->type == RAY_I64 ||
+         c->key_cols[1]->type == RAY_TIME ||
          c->key_cols[1]->type == RAY_TIMESTAMP) &&
         !ray_vec_may_have_nulls(c->key_cols[1]))
-        return sorted_check_sym_i64(c, 1, nrows, next_row);
+        return sorted_check_sym_numeric(c, 1, nrows, next_row);
     int64_t comparisons = 0;
     for (int64_t i = 1; i < nrows; i++) {
         int cmp = 0;
