@@ -6,6 +6,9 @@ and gathering unchanged columns and preserves their null bitmaps, string
 pools and symbol domains. Updates retain the existing copy-on-write
 semantics. Duplicate expansion and reordered output use the gather path;
 FULL joins also keep that path because right-only rows change the left side.
+Slice-valued left columns are gathered independently even with an identity
+mapping: slice-header COW does not detach their parent. Other columns in the
+same table can still be retained.
 
 ## Standalone probe
 
@@ -39,12 +42,13 @@ shuffled order (seed 22), without concurrent local compilation or tests:
 
 | Median | Base | Candidate |
 |---|---:|---:|
-| Post-run checks | 1139.00 ms | 1033.27 ms |
-| Whole process | 4.007 s | 3.917 s |
-| Peak RSS | 1607.8 MiB | 1588.6 MiB |
+| Post-run checks | 1146.46 ms | 1047.97 ms |
+| Whole process | 4.137 s | 4.022 s |
+| Peak RSS | 1608.2 MiB | 1590.1 MiB |
 
-Check ranges: base 1120.70–1146.35 ms, candidate 1013.85–1056.53 ms.
-Process ranges: base 3.997–4.017 s, candidate 3.898–3.921 s.
+These measurements include the slice fallback review correction.
+Check ranges: base 1134.08–1163.55 ms, candidate 1043.04–1051.07 ms.
+Process ranges: base 4.074–4.326 s, candidate 4.011–4.052 s.
 This small experiment on a shared host is evidence for this workload,
 not a general speedup guarantee. The backtester and its generated data are
 external to this repository; the standalone probe above needs neither.
@@ -53,9 +57,16 @@ external to this repository; the standalone probe above needs neither.
 
 `test/test_join_buildside.c` checks pointer sharing, copy-on-write, null
 metadata, string-pool lifetime after releasing the source, duplicate
-expansion and a large order-preserving join. The large fixture keeps its
-build side below radix dispatch: radix partitioning may reorder rows, which
-must fail the explicit identity guard even when cardinality is unchanged.
+expansion and a large order-preserving join. The large sharing fixture keeps
+its build side below radix dispatch.
+A separate equal-cardinality fixture takes the radix route and verifies
+that output really is reordered, every left/right payload remains matched,
+and reordered columns are gathered. The slice fixture mutates an owned
+output and verifies the source slice, its parent and the original join
+result retain their values, while an ordinary column still shares.
+The slice regression fails on the original PR at the source-value assertion.
+Deliberately removing the mapping guard fails the radix test at the
+left/right payload-association assertion; restoring the guard passes.
 
 `test/rfl/join/join_identity.rfl` checks nulls, symbols, nested lists,
 source/result update isolation, missing matches, duplicate expansion and

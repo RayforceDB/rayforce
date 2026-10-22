@@ -57,7 +57,9 @@ string key on the other side.
 The `left-join` function keeps all rows from the left table. Unmatched rows have null in the right-side columns.
 
 When each left row produces exactly one output row in its original position,
-the flat join executor retains the left columns instead of copying them.
+the flat join executor retains ordinary left columns instead of copying them.
+Slice-valued columns still use an independent gather because copying a slice
+header does not detach its parent payload.
 Subsequent updates use copy-on-write, preserving the source and result as
 independent values. Duplicate matches still expand and gather the rows.
 

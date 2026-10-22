@@ -1328,9 +1328,108 @@ static test_result_t test_jb_left_identity(void) {
     PASS();
 }
 
+/* Slice-header COW does not detach the underlying parent payload. */
+static test_result_t test_jb_left_identity_slice(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int64_t keys[] = {1, 2};
+    const int64_t values[] = {10, 20, 30, 40};
+    ray_t* lt = jb_table1("lk", keys, 2);
+    ray_t* rt = jb_table1("rk", keys, 2);
+    ray_t* parent = ray_vec_from_raw(RAY_I64, values, 4);
+    ray_t* slice = ray_vec_slice(parent, 1, 2);
+    TEST_ASSERT(slice && !RAY_IS_ERR(slice), "slice fixture");
+    lt = ray_table_add_col(lt, ray_sym_intern("payload", 7), slice);
+    ray_release(slice);
+    ray_t* got = jb_join(lt, "lk", rt, "rk", 1);
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "identity join with slice payload");
+    ray_t* src = ray_table_col_idx(lt, 1);
+    ray_t* out = ray_table_col_idx(got, 1);
+    ray_retain(out);
+    int64_t value = 99;
+    ray_t* changed = ray_vec_set(out, 0, &value);
+    TEST_ASSERT(changed && !RAY_IS_ERR(changed), "owned output mutation");
+    TEST_ASSERT(*(int64_t*)ray_vec_get(changed, 0) == 99, "changed value");
+    TEST_ASSERT(*(int64_t*)ray_vec_get(src, 0) == 20, "source slice unchanged");
+    TEST_ASSERT(*(int64_t*)ray_vec_get(out, 0) == 20, "original join unchanged");
+    for (int64_t i = 0; i < 4; i++)
+        TEST_ASSERT(*(int64_t*)ray_vec_get(parent, i) == values[i],
+                    "source parent unchanged");
+    TEST_ASSERT(!(out->attrs & RAY_ATTR_SLICE), "slice output is gathered");
+    TEST_ASSERT(ray_table_col_idx(got, 0) == ray_table_col_idx(lt, 0),
+                "ordinary column still shares in mixed representation table");
+    ray_release(changed);
+    ray_release(lt);
+    ray_release(parent);
+    TEST_ASSERT(*(int64_t*)ray_vec_get(out, 1) == 30, "gathered slice lifetime");
+    ray_release(got);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Equal cardinality cannot prove identity: radix output is partition ordered. */
+static test_result_t test_jb_left_identity_radix(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int64_t n = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t* keys = malloc((size_t)n * sizeof(*keys));
+    int64_t* values = malloc((size_t)n * sizeof(*values));
+    TEST_ASSERT(keys && values, "radix fixture allocation");
+    for (int64_t i = 0; i < n; i++) { keys[i] = i; values[i] = 7 * i + 11; }
+    ray_t* lt = jb_table1("lk", keys, n);
+    ray_t* rt = jb_table1("rk", keys, n);
+    ray_t* right_ids = ray_vec_from_raw(RAY_I64, keys, n);
+    rt = ray_table_add_col(rt, ray_sym_intern("right_id", 8), right_ids);
+    ray_release(right_ids);
+    ray_t* payload = ray_vec_from_raw(RAY_I64, values, n);
+    lt = ray_table_add_col(lt, ray_sym_intern("payload", 7), payload);
+    ray_release(payload);
+    free(keys);
+    free(values);
+    ray_t* got = jb_join(lt, "lk", rt, "rk", 1);
+    TEST_ASSERT(got && !RAY_IS_ERR(got), "radix left join");
+    TEST_ASSERT(ray_table_nrows(got) == n, "equal output cardinality");
+    ray_t* out_key = ray_table_col_idx(got, 0);
+    ray_t* out_value = ray_table_col_idx(got, 1);
+    ray_t* out_right_id = ray_table_col_idx(got, 2);
+    uint8_t* seen = calloc((size_t)n, 1);
+    TEST_ASSERT(seen, "radix membership allocation");
+    bool reordered = false;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t key = *(int64_t*)ray_vec_get(out_key, i);
+        TEST_ASSERT(key >= 0 && key < n && !seen[key], "unique output key");
+        seen[key] = 1;
+        reordered |= key != i;
+        TEST_ASSERT(*(int64_t*)ray_vec_get(out_right_id, i) == key,
+                    "left and right payloads remain matched after reorder");
+        TEST_ASSERT(*(int64_t*)ray_vec_get(out_value, i) == 7 * key + 11,
+                    "payload follows its original row through radix reorder");
+    }
+    free(seen);
+    TEST_ASSERT(reordered, "fixture exercises a nonidentity radix mapping");
+    TEST_ASSERT(out_key != ray_table_col_idx(lt, 0), "reordered keys gathered");
+    TEST_ASSERT(out_value != ray_table_col_idx(lt, 1), "reordered payload gathered");
+    for (int64_t i = 0; i < n; i++) {
+        TEST_ASSERT(*(int64_t*)ray_vec_get(ray_table_col_idx(lt, 0), i) == i,
+                    "source keys unchanged");
+        TEST_ASSERT(*(int64_t*)ray_vec_get(ray_table_col_idx(lt, 1), i) == 7 * i + 11,
+                    "source payload unchanged");
+    }
+    ray_release(got);
+    ray_release(lt);
+    ray_release(rt);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
+    { "join_buildside/left_identity_slice", test_jb_left_identity_slice, NULL, NULL },
+    { "join_buildside/left_identity_radix", test_jb_left_identity_radix, NULL, NULL },
     { "join_buildside/left_identity", test_jb_left_identity, NULL, NULL },
     { "join_buildside/force_fallback_ordinary", test_jb_force_fallback_ordinary, NULL, NULL },
     { "join_buildside/auto_fallback_dup", test_jb_auto_fallback_dup, NULL, NULL },
