@@ -1,0 +1,62 @@
+;; @requires: posix
+;; Reusing the validated partition-key column index must leave pruning's
+;; answers, schema and nulls unchanged. These semantic checks are expected
+;; to pass before the performance repair too; metadata-call counting is a
+;; separate structural control, not a wall-clock CI assertion.
+(.sys.exec "rm -rf rf_prune_meta_whole rf_prune_meta_ragged") -- 0
+(set w1 (table [id label v] (list [0 1 2 3 4] [a b a c a] (as 'I32 [-3 -2 -1 0 1]))))
+(set w2 (table [id label v] (list [5 6 7 8 9 10 11] [b a c a b a c] (as 'I32 [2 3 0Nl 5 6 7 8]))))
+(set w3 (table [id label v] (list [12 13 14 15] [a b a c] (as 'I32 [9 10 11 12]))))
+(.db.splayed.set "rf_prune_meta_whole/2024.01.01/t/" w1 "rf_prune_meta_whole/.sym")
+(.db.splayed.set "rf_prune_meta_whole/2024.01.02/t/" w2 "rf_prune_meta_whole/.sym")
+(.db.splayed.set "rf_prune_meta_whole/2024.01.03/t/" w3 "rf_prune_meta_whole/.sym")
+(.db.splayed.set "rf_prune_meta_ragged/2024.01.01/t/" w1 "rf_prune_meta_ragged/.sym")
+(.db.splayed.set "rf_prune_meta_ragged/2024.01.02/t/" (table [id label] (list [5 6 7 8 9 10 11] [b a c a b a c])) "rf_prune_meta_ragged/.sym")
+(.db.splayed.set "rf_prune_meta_ragged/2024.01.03/t/" w3 "rf_prune_meta_ragged/.sym")
+(set P (.db.parted.get "rf_prune_meta_whole/" 't))
+(set R (.db.parted.get "rf_prune_meta_ragged/" 't))
+(set dates (concat (concat (take 2024.01.01 5) (take 2024.01.02 7)) (take 2024.01.03 4)))
+(set labels [a b a c a b a c a b a c a b a c])
+(set F (table [date id label v] (list dates (til 16) labels (as 'I32 [-3 -2 -1 0 1 2 3 0Nl 5 6 7 8 9 10 11 12]))))
+(set G (table [date id label v] (list dates (til 16) labels (as 'I32 [-3 -2 -1 0 1 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 9 10 11 12]))))
+(set eqc (fn [a b c] (all (== (as 'STR (at a c)) (as 'STR (at b c))))))
+(set eqt (fn [a b] (all (map (fn [c] (eqc a b c)) (cols a)))))
+;; No partition-key predicate, and an explicit all-kept key predicate.
+(set qa (fn [tb] (select {from: tb where: (== label 'a)})))
+(set qt (fn [tb] (select {from: tb where: (>= date 2024.01.01)})))
+(eqt (qa P) (qa F)) -- true
+(eqt (qa R) (qa G)) -- true
+(at (qa P) 'id) -- [0 2 4 6 8 10 12 14]
+(sum (nil? (at (qa R) 'v))) -- 3
+(eqt (qt P) (qt F)) -- true
+(eqt (qt R) (qt G)) -- true
+(count (qt R)) -- 16
+;; Partial pruning keeps the formerly missing column's partition too.
+(set qp (fn [tb] (select {from: tb where: (and (>= date 2024.01.02) (== label 'a)) take: 3})))
+(eqt (qp P) (qp F)) -- true
+(eqt (qp R) (qp G)) -- true
+(at (qp P) 'id) -- [6 8 10]
+(sum (nil? (at (qp R) 'v))) -- 3
+(type (at (qp R) 'v)) -- 'I32
+;; Exclude the ragged partition; retain rows/order and group cardinalities.
+(set qe (fn [tb] (select {from: tb where: (in date [2024.01.01 2024.01.03])})))
+(eqt (qe P) (qe F)) -- true
+(eqt (qe R) (qe G)) -- true
+(at (qe R) 'id) -- [0 1 2 3 4 12 13 14 15]
+(sum (at (qe R) 'v)) -- 37
+(at (select {n: (count id) by: date from: R where: (>= date 2024.01.02) asc: date}) 'n) -- [7 4]
+;; All pruned still retains the empty projected schema.
+(set qn (fn [tb] (select {from: tb where: (> date 2024.01.03)})))
+(eqt (qn P) (qn F)) -- true
+(eqt (qn R) (qn G)) -- true
+(count (qn R)) -- 0
+(type (at (qn R) 'v)) -- 'I32
+;; A nonlocal predicate is not newly eligible for partition pruning.
+;; AVG sees the whole 16-row WHERE domain (7.5), not just the later dates.
+(set qu (fn [tb] (select {from: tb where: (and (>= date 2024.01.02) (> id (avg id)))})))
+(eqt (qu P) (qu F)) -- true
+(eqt (qu R) (qu G)) -- true
+(at (qu P) 'id) -- [8 9 10 11 12 13 14 15]
+(set P 0)
+(set R 0)
+(.sys.exec "rm -rf rf_prune_meta_whole rf_prune_meta_ragged") -- 0
