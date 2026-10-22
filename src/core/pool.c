@@ -32,6 +32,32 @@
 #include <stdio.h>
 #include <sched.h>
 
+uint32_t ray_pool_default_total(void) {
+    uint32_t n = ray_cpu_set_count();
+    int64_t q = ray_os_cgroup_cpu_quota();   /* millicpus, 0 = none */
+    if (q > 0 && (q + 999) / 1000 < (int64_t)n) n = (uint32_t)((q + 999) / 1000);
+    return n > 0 ? n : 1;
+}
+
+/* Spawned workers of a default pool.  The RAYFORCE_CORES env var overrides
+ * the size — the test harness sets it (see the Makefile `test` target) so
+ * neither the in-process runtime nor the server children it spawns via
+ * .sys.exec each create a thread per CPU on a many-core box.  An explicit
+ * positive -c uses ray_pool_init_total() with exact sizing and bypasses
+ * this entirely.  Otherwise every CPU the process may run on (its affinity
+ * mask: every online CPU unless taskset or a cpuset narrowed it), or fewer
+ * under a cgroup CPU quota; individual operations may bound their task
+ * count to their workload or memory budget. */
+static uint32_t pool_default_workers(void) {
+    const char* env = getenv("RAYFORCE_CORES");
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+        return (v > 0) ? (uint32_t)v : 0;
+    }
+    uint32_t ncpu = ray_pool_default_total();
+    return (ncpu > 1) ? ncpu - 1 : 0;
+}
+
 /* Per-worker query-statistics slab (see core/qstats.h).  Zero-initialised;
  * disabled (mode == 0) until a profiling/progress consumer turns it on. */
 ray_qstats_t g_qstats;
@@ -569,23 +595,7 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
     }
 
     if (auto_size) {
-        /* Auto-size to ncpu-1. The RAYFORCE_CORES env var overrides this
-         * default worker count — the test harness sets it (see the Makefile
-         * `test` target) so neither the in-process runtime nor the server
-         * children it spawns via .sys.exec each create ncpu-1 threads on a
-         * many-core box. An explicit positive -c uses ray_pool_init_total()
-         * with exact sizing and bypasses this entirely; a non-test run with
-         * the var unset keeps the historical ncpu-1 default. */
-        const char* env = getenv("RAYFORCE_CORES");
-        if (env && *env) {
-            long v = strtol(env, NULL, 10);
-            n_workers = (v > 0) ? (uint32_t)v : 0;
-        } else {
-            /* Default to every online logical CPU. Individual operations may
-             * bound their task count to their workload or memory budget. */
-            uint32_t ncpu = ray_thread_count();
-            n_workers = (ncpu > 1) ? ncpu - 1 : 0;
-        }
+        n_workers = pool_default_workers();
     }
 
     pool->n_workers = n_workers;
@@ -1051,6 +1061,12 @@ static void pool_trace_atexit(void) {
 static void pool_trace_arm(void) {
     static bool armed = false;
     if (!armed && g_pool.trace) { armed = true; atexit(pool_trace_atexit); }
+}
+
+uint32_t ray_pool_size(void) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        return ray_pool_total_workers(&g_pool);
+    return pool_default_workers() + 1;
 }
 
 ray_pool_t* ray_pool_get(void) {

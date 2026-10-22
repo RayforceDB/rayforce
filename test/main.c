@@ -424,6 +424,13 @@ static test_result_t run_rfl_file(const char* path) {
         SKIP("requires POSIX shell/filesystem");
     }
 #endif
+    /* ";; @requires: linux": Linux-only facilities (taskset, cgroups). */
+#if !defined(__linux__)
+    if (strstr(src, ";; @requires: linux")) {
+        free(src);
+        SKIP("requires Linux");
+    }
+#endif
 
     int   line_no       = 0;
     int   assert_count  = 0;  /* tallies LHS -- RHS and EXPR !- SUBSTR lines */

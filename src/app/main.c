@@ -313,6 +313,13 @@ int main(int argc, char** argv) {
      * (file load, REPL eval, builtins).  If -c wasn't given, leave the
      * pool to its lazy default on first use. */
     if (n_cores >= 0) {
+        /* the CPUs this process may run on, or its CPU quota when smaller */
+        uint32_t ncpu = ray_pool_default_total();
+        if ((uint32_t)n_cores > ncpu)
+            fprintf(stderr, "warning: -c %d gives %d threads, more than the %u CPU%s this process "
+                            "may use, and they take turns; use -c %u, or drop -c to size the pool "
+                            "to the CPUs\n",
+                    n_cores, n_cores, ncpu, ncpu == 1 ? "" : "s", ncpu);
         ray_err_t err = ray_pool_init_total((uint32_t)n_cores);
         if (err != RAY_OK) {
             fprintf(stderr, "error: ray_pool_init_total(%d) failed (%d)\n",

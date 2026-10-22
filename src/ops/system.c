@@ -48,6 +48,7 @@
 #include "core/mcast.h"
 #include "core/poll.h"
 #include "core/timer.h"
+#include "core/pool.h"      /* ray_pool_get — the pool size in .sys.info */
 
 /* Forward decls: keep this TU decoupled from core/runtime.h — only
  * the opaque accessors are needed. */
@@ -1565,9 +1566,10 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
 #if !defined(RAY_OS_WINDOWS)
+    /* cores: the CPUs this process may run on (its affinity mask) */
     int64_t s1 = ray_sym_intern("cores", 5);
     keys = ray_vec_append(keys, &s1);
-    ray_t* v1 = make_i64(sysconf(_SC_NPROCESSORS_ONLN));
+    ray_t* v1 = make_i64((int64_t)ray_cpu_set_count());
     vals = ray_list_append(vals, v1); ray_release(v1);
 
     int64_t s2 = ray_sym_intern("page-size", 9);
@@ -1598,6 +1600,13 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     ray_t* v3 = make_i64(ray_sys_total_ram());
     vals = ray_list_append(vals, v3); ray_release(v3);
 #endif
+
+    /* workers: the threads of the execution pool, main included (the size
+     * a default pool would get while none exists; none is created here) */
+    int64_t sw = ray_sym_intern("workers", 7);
+    keys = ray_vec_append(keys, &sw);
+    ray_t* vw = make_i64((int64_t)ray_pool_size());
+    vals = ray_list_append(vals, vw); ray_release(vw);
 
     /* Process and host identity (#573).  An embedded process previously had
      * no way to name itself: pid plus hostname plus a start timestamp is a
