@@ -6743,9 +6743,10 @@ static test_result_t test_expr_group_affine_f64_i64(void) {
 
 /* ---- a FLOAT constant over an integer column: SUM and AVG are F64 ----
  *
- * try_affine_sumavg_input takes a FLOAT c over an integer column only when
- * the caller emits it as F64 (f64_bias_ok: the scalar route); the linear
- * plan declines a FLOAT constant outright.  The keyed group at the end is a
+ * try_affine_sumavg_input takes a FLOAT c over a narrow integer column only
+ * when its type-wide bound proves exact F64 arithmetic (f64_bias_ok: the
+ * scalar route). I64 and a large or fractional bias must be evaluated per
+ * row. The linear plan declines a FLOAT constant outright. The keyed group at the end is a
  * control: that route already summed (a + 5.0) as F64, and still does. */
 static test_result_t test_expr_affine_f64_bias_route(void) {
     ray_heap_init();
@@ -6756,15 +6757,22 @@ static test_result_t test_expr_affine_f64_bias_route(void) {
     ray_t* a_vec  = ray_vec_from_raw(RAY_I64, a_raw, 3);
     ray_t* k_vec  = ray_vec_from_raw(RAY_I64, k_raw, 3);
     ray_t* ts_vec = ray_vec_from_raw(RAY_TIMESTAMP, a_raw, 3);
-    ray_t* tbl = ray_table_new(3);
+    int16_t h_raw[] = {10, 20, 30};
+    ray_t* h_vec = ray_vec_from_raw(RAY_I16, h_raw, 3);
+    ray_t* tbl = ray_table_new(4);
     tbl = ray_table_add_col(tbl, ray_sym_intern("a", 1), a_vec);
     tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), k_vec);
     tbl = ray_table_add_col(tbl, ray_sym_intern("ts", 2), ts_vec);
-    ray_release(a_vec); ray_release(k_vec); ray_release(ts_vec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("h", 1), h_vec);
+    ray_release(a_vec); ray_release(k_vec); ray_release(ts_vec); ray_release(h_vec);
 
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* add_f = ray_add(g, ray_scan(g, "a"), ray_const_f64(g, 5.0));
     ray_op_t* add_i = ray_add(g, ray_scan(g, "a"), ray_const_i64(g, 5));
+    ray_op_t* add_h = ray_add(g, ray_scan(g, "h"), ray_const_f64(g, 5.0));
+    ray_op_t* add_h_big = ray_add(g, ray_scan(g, "h"),
+                                  ray_const_f64(g, 9007199254740992.0));
+    ray_op_t* add_h_fraction = ray_add(g, ray_scan(g, "h"), ray_const_f64(g, 0.5));
     ray_op_t* ts_f  = ray_add(g, ray_scan(g, "ts"), ray_const_f64(g, 5.0));
     ray_op_t* mul_f = ray_mul(g, ray_scan(g, "a"), ray_const_f64(g, 2.0));
     ray_op_t* mul_i = ray_mul(g, ray_scan(g, "a"), ray_const_i64(g, 2));
@@ -6773,16 +6781,27 @@ static test_result_t test_expr_affine_f64_bias_route(void) {
     ray_t* vec = NULL;
     ray_t* err = NULL;
 
-    /* (a + 5.0): declined unless the caller emits F64, then an F64 bias */
+    /* I64 values may round on conversion before the addition. */
     memset(&aff, 0, sizeof aff);
     TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_FALSE(aff.enabled);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_f, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_FALSE(aff.enabled);
+    /* Small whole-number biases on a narrow type have exact row and sum
+     * arithmetic; a fractional or very large bias does not. */
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_h, true, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_TRUE(aff.enabled && aff.f64 && aff.bias_f64 == 5.0);
-    TEST_ASSERT_TRUE(vec && vec->type == RAY_I64);
+    TEST_ASSERT_TRUE(vec && vec->type == RAY_I16);
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_big, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_fraction, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
     /* (ts + 5.0) is no F64 sum at all: declined either way */
     memset(&aff, 0, sizeof aff);
     TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, ts_f, true, &vec, &aff, &err));

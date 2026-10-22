@@ -7,8 +7,9 @@
 ;; for the linear plan, so SUM came back I64: keyless selects over in-memory
 ;; and splayed tables, grouped selects over zero rows, grouped top-N
 ;; (desc:/asc: take:) and the parted by-dict route.  100.5 was declined and
-;; already F64.  Now the scalar (keyless) route takes the FLOAT bias and emits
-;; the integer sum as F64; every other route, and the linear plan, decline it.
+;; already F64. The scalar route delays a whole-number FLOAT bias only when
+;; type and row-count bounds prove exact per-row and reduction arithmetic;
+;; every other route, and the linear plan, evaluate the FLOAT expression.
 ;; @requires: posix
 
 ;; ─── fixtures: nullable I64 w, I32 i, non-null n and U8 u ──────────────────
@@ -40,6 +41,18 @@
 ;; ─── the F64 sum does not wrap at 2^63, as the builtin's does not ─────────
 (set B (table [w] (list [9000000000000000000 9000000000000000000])))
 (== (at (at (select {m: (sum (+ w 100.0)) from: B}) 'm) 0) 1.8e19) -- true
+
+;; Integer accumulation followed by a bias is not equivalent to converting
+;; and adding on each row: the first I64 loses its low bit on F64 conversion.
+(set C (table [x k] (list [9007199254740993 -9007199254740992] [0 0])))
+(set CV (+ (at C 'x) 0.5))
+(at (select {m: (sum (+ x 0.5)) from: C}) 'm) -- (enlist (sum CV))
+(at (select {m: (avg (+ x 0.5)) from: C}) 'm) -- (enlist (avg CV))
+(at (select {m: (sum (+ x 0.5)) from: C by: k}) 'm) -- (enlist (sum CV))
+(at (select {m: (sum (+ x 1.0)) from: C}) 'm) -- [1.0]
+;; A narrow column can also round per row when the FLOAT bias is large.
+(set D (table [h] (list (as 'I16 [1 2]))))
+(at (select {m: (sum (+ h 9007199254740992.0)) from: D}) 'm) -- (enlist (sum (+ (at D 'h) 9007199254740992.0)))
 
 ;; ─── avg: the F64 values summed, then divided, as the builtin avg does ────
 (set X (+ (at W 'w) -3.0))

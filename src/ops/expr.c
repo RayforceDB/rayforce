@@ -482,6 +482,26 @@ static ray_t* affine_base_obj(ray_col_src_t* src) {
     return ready ? ready : src->obj;
 }
 
+/* A delayed F64 bias is equivalent to per-row F64 addition only when every
+ * addition and the entire reduction are exact.  Bound this from the type and
+ * row count, without reading the column.  I64 has no useful type-wide bound:
+ * casting a value above 2^53 can discard bits before the addition. */
+static bool affine_int_f64_bias_exact(int8_t bt, double bias, int64_t nrows,
+                                      bool may_null) {
+    if (may_null || nrows <= 0 || !isfinite(bias) || trunc(bias) != bias)
+        return false;
+    long double max_abs;
+    switch (bt) {
+        case RAY_I32:  max_abs = 2147483648.0L; break;
+        case RAY_I16:  max_abs = 32768.0L; break;
+        case RAY_U8:   max_abs = 255.0L; break;
+        case RAY_BOOL: max_abs = 1.0L; break;
+        default: return false;
+    }
+    return ((max_abs + fabsl((long double)bias)) * (long double)nrows) <=
+           9007199254740992.0L;
+}
+
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return the scan's
  * column object (a plain vector, or a RAY_ENCCOL the caller binds: see
  * affine_base_obj) plus the additive bias so we can adjust results from
@@ -555,14 +575,12 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     if (bt == RAY_I64 || bt == RAY_TIMESTAMP ||
         bt == RAY_I32 || bt == RAY_I16 || bt == RAY_U8 || bt == RAY_BOOL ||
         RAY_IS_SYM(bt)) {
-        /* (col +/- c) with a FLOAT c, even a whole-number one (100.0), is
-         * F64.  Only a caller that emits the integer sum as F64 takes it
-         * (f64_bias_ok); every other one declines, and the expression is
-         * evaluated with its F64 type.  A temporal or SYM col + FLOAT is
-         * not an F64 sum at all (the builtin rejects it). */
+        /* A FLOAT bias needs per-row F64 casts/additions.  Delay it only
+         * when type and row-count bounds prove those operations, plus the
+         * reduction, exact; otherwise evaluate the expression as written. */
         if (c_is_f64) {
-            if (!f64_bias_ok || !isfinite(c_f) ||
-                bt == RAY_TIMESTAMP || RAY_IS_SYM(bt)) return false;
+            if (!f64_bias_ok || !affine_int_f64_bias_exact(bt, c_f,
+                    base_src->len, base_src->may_null)) return false;
             base_vec = affine_base_obj(base_src);
             out_affine->enabled = true;
             out_affine->f64 = true;
