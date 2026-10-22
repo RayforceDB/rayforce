@@ -19,7 +19,7 @@ echo '(+ 1 2)' | ./rayforce
 
 Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, logical CPU count, and worker count, then shows the `‣` prompt. By default the pool includes every logical CPU the process may run on (all online CPUs, unless `taskset` or a cpuset narrowed them), including SMT threads. Use `-c N` to choose a total worker count explicitly: N must contain decimal digits only; `0` selects the automatic size, and `1..1023` sets the total count, including the main thread. Values outside this range are rejected before the pool starts. Individual operations may use fewer tasks when their workload or memory budget requires it. Use `-m SIZE` (`--mem`; a byte count or a `K`/`M`/`G`/`T` suffix) to set the RAM budget: anonymous memory past it spills to disk instead of risking the OOM killer. `(.sys.mem)` reports the effective value as [`anon-watermark`](../namespaces/sys.md#sys-mem).
 
-On Linux a pool with one thread per allowed CPU is pinned: the main thread runs on the first CPU and each worker on one of the others, one hardware thread of every physical core first, alternating NUMA nodes, then the hyperthread siblings. Programs started with `.sys.exec` still get every allowed CPU. `RAY_POOL_PIN=0` turns pinning off; `RAY_POOL_PIN=1` also pins a smaller pool. See [Running Several Instances](../guides/instances.md) for choosing CPUs per instance.
+Under a cgroup CPU quota (`docker --cpus`, systemd `CPUQuota=`) the default pool has one thread per CPU of the quota, rounded up. A `-c` larger than the allowed CPUs prints a warning. See [Running Several Instances](../guides/instances.md) for choosing CPUs per instance.
 
 ### Environment Variables
 

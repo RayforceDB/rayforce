@@ -62,6 +62,8 @@ uint64_t ray_vm_willneed_bytes(void) {
 #include <errno.h>        /* EINTR — ray_os_cgroup_stat_flush */
 #include <stdatomic.h>
 #include <sys/resource.h> /* getrusage: ray_io_counters */
+#include <sched.h>        /* sched_getaffinity: ray_cpu_set_count */
+#include <stdint.h>       /* INT64_MAX: the cgroup quota */
 #if !defined(RUSAGE_THREAD)
 #define RUSAGE_THREAD 1
 #endif
@@ -415,6 +417,23 @@ uint32_t ray_thread_count(void) {
     return (n > 0) ? (uint32_t)n : 1;
 }
 
+/* The CPUs this process may run on: its affinity mask on Linux, which
+ * taskset, a cgroup cpuset or docker --cpuset-cpus may narrow below the
+ * online count; the online count elsewhere.  The mask read is the calling
+ * thread's: the process's, unless an embedding application narrowed the
+ * thread that first uses the pool (whose workers then inherit it). */
+uint32_t ray_cpu_set_count(void) {
+#if defined(RAY_OS_LINUX)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return (uint32_t)n;
+    }
+#endif
+    return ray_thread_count();
+}
+
 /* Physical cores (SMT siblings collapsed).  The worker pool's kernels are
  * memory-bound; two hyperthreads sharing one core's load/store machinery
  * only add contention (measured: the full ClickBench suite runs ~11%
@@ -634,6 +653,98 @@ int64_t ray_os_cgroup_mem_limit(void) {
     return cgroup_mem_limit(NULL, 0);
 }
 
+/* CPU quota (docker --cpus, systemd CPUQuota=): the CPU time a cgroup may
+ * use per period, as v2 cpu.max "QUOTA PERIOD" ("max" = none) or v1
+ * cpu.cfs_quota_us (-1 = none) over cpu.cfs_period_us, in millicpus.  A
+ * quota does not narrow the affinity mask, so a pool sized to the mask
+ * would run more threads than the quota lets run and be throttled. */
+static int64_t cgroup_cpu_read(const char* dir, bool v2) {
+    char path[640], buf[64];
+    long long q = 0, per = 0;
+    if (v2) {
+        snprintf(path, sizeof(path), "%s/cpu.max", dir);
+        FILE* f = fopen(path, "r");
+        if (!f) return 0;
+        buf[0] = 0;
+        if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+        fclose(f);
+        if (strncmp(buf, "max", 3) == 0 || sscanf(buf, "%lld %lld", &q, &per) != 2) return 0;
+    } else {
+        snprintf(path, sizeof(path), "%s/cpu.cfs_quota_us", dir);
+        FILE* f = fopen(path, "r");
+        if (!f) return 0;
+        if (fscanf(f, "%lld", &q) != 1) q = 0;
+        fclose(f);
+        snprintf(path, sizeof(path), "%s/cpu.cfs_period_us", dir);
+        f = fopen(path, "r");
+        if (!f) return 0;
+        if (fscanf(f, "%lld", &per) != 1) per = 0;
+        fclose(f);
+    }
+    if (q <= 0 || per <= 0 || q > (long long)(INT64_MAX / 1000) - per) return 0;
+    return (int64_t)((q * 1000 + per - 1) / per);
+}
+
+/* Smallest quota over `root`/`cgpath` and every ancestor, as the memory
+ * limit walk above. */
+static int64_t cgroup_cpu_walk(const char* root, const char* cgpath, bool v2) {
+    char dir[512];
+    if (snprintf(dir, sizeof(dir), "%s%s", root, cgpath) >= (int)sizeof(dir)) return 0;
+    size_t rootlen = strlen(root);
+    int64_t m = 0;
+    for (;;) {
+        int64_t v = cgroup_cpu_read(dir, v2);
+        if (v > 0 && (m == 0 || v < m)) m = v;
+        if (strlen(dir) <= rootlen) break;
+        char* slash = strrchr(dir, '/');
+        if (!slash || (size_t)(slash - dir) < rootlen) break;
+        *slash = 0;
+    }
+    return m;
+}
+
+/* True when the comma-separated controller list names "cpu". */
+static bool cgroup_has_cpu(const char* ctrls) {
+    while (*ctrls) {
+        size_t n = strcspn(ctrls, ",");
+        if (n == 3 && strncmp(ctrls, "cpu", 3) == 0) return true;
+        ctrls += n;
+        if (*ctrls == ',') ctrls++;
+    }
+    return false;
+}
+
+int64_t ray_os_cgroup_cpu_quota(void) {
+    FILE* f = fopen("/proc/self/cgroup", "r");
+    if (!f) return 0;
+    int64_t m = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char* c1 = strchr(line, ':');
+        char* c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c2) continue;
+        *c2 = 0;
+        const char* ctrls = c1 + 1;
+        char* cgpath = c2 + 1;
+        cgpath[strcspn(cgpath, "\n")] = 0;
+        if (strcmp(cgpath, "/") == 0) cgpath[0] = 0;
+        int64_t v = 0;
+        if (*ctrls == 0) {
+            v = cgroup_cpu_walk("/sys/fs/cgroup", cgpath, true);
+        } else if (cgroup_has_cpu(ctrls)) {
+            /* v1 mounts the controller as the directory named by its list
+             * ("cpu,cpuacct"), usually with a "cpu" link to it */
+            char root[300];
+            snprintf(root, sizeof(root), "/sys/fs/cgroup/%s", ctrls);
+            v = cgroup_cpu_walk(root, cgpath, false);
+            if (!v) v = cgroup_cpu_walk("/sys/fs/cgroup/cpu", cgpath, false);
+        }
+        if (v > 0 && (m == 0 || v < m)) m = v;
+    }
+    fclose(f);
+    return m;
+}
+
 bool ray_os_cgroup_mem_dir(char* buf, size_t n) {
     if (n) buf[0] = 0;
     return n && cgroup_mem_limit(buf, n) > 0 && buf[0];
@@ -652,6 +763,7 @@ bool ray_os_cgroup_stat_flush(const char* cg) {
 }
 #else
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 #endif
@@ -959,6 +1071,7 @@ uint32_t ray_thread_count(void) {
     GetSystemInfo(&si);
     return (uint32_t)si.dwNumberOfProcessors;
 }
+uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
 
 /* Windows: no cheap topology read here — fall back to the logical count
  * (the SMT-aware default sizing is a POSIX-side optimization). */
@@ -967,6 +1080,7 @@ uint32_t ray_physical_core_count(void) {
 }
 
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 
@@ -1156,7 +1270,9 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
+uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 static uint64_t cache_llc_probe(void) { return 0; }

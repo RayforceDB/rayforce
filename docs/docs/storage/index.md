@@ -222,7 +222,9 @@ The global symbol intern table maps strings to integer IDs. When saving data to 
 
 ### Append-Only .sym Files
 
-Symbol files use an append-only format. New symbols are appended to the end of the file without rewriting existing entries, so a symbol's position never changes and updates are incremental. One process writes a database at a time: a writer whose view of the file is out of date fails with `RAY_ERR_CORRUPT` instead of overwriting another writer's symbols (see [Running Several Instances](../guides/instances.md)).
+A table's symbol file, which `.db.splayed.set` and the importers write, is append-only: new symbols are appended to the end of the file without rewriting existing entries, so a symbol's position never changes and updates are incremental. One process writes a database at a time: a writer whose view of the file is out of date fails with `RAY_ERR_CORRUPT` instead of overwriting another writer's symbols (see [Running Several Instances](../guides/instances.md)).
+
+The C functions below work on the runtime's global symbol table instead. `ray_sym_save` writes the whole table to a temporary file and renames it over the target, and `ray_sym_load` merges a file into the running table.
 
 | Function | Description |
 |---|---|

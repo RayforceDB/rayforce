@@ -284,6 +284,11 @@ ray_err_t ray_pool_init(uint32_t n_workers);
 /* Initialize by total execution participants, including the main thread.
  * Pass 0 to auto-detect. Used by the CLI, where -c is a total-core count. */
 ray_err_t ray_pool_init_total(uint32_t total_workers);
+
+/* The default pool size, main included: one thread per CPU the process may
+ * run on (ray_cpu_set_count), or per CPU of a cgroup CPU quota, rounded up,
+ * when that is smaller (docker --cpus, systemd CPUQuota=). */
+uint32_t ray_pool_default_total(void);
 void     ray_pool_destroy(void);
 
 /* Call fn on the heap of every worker of the live singleton pool; nothing

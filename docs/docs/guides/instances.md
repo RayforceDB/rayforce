@@ -6,7 +6,7 @@ Several rayforce processes can run on one machine. Each process sizes its thread
 
 Choose the CPUs of each instance when you start it: `taskset -c LIST`, `docker run --cpuset-cpus=LIST`, or `CPUAffinity=` in a systemd unit. Every thread of the instance, and every program it starts with `.sys.exec`, stays within that list.
 
-On Linux an instance uses one thread per CPU of its list. Such a pool is pinned: the main thread runs on the first CPU and each worker on one of the others, taking one hardware thread of every physical core first, alternating NUMA nodes, and the hyperthread siblings after. Pinning keeps each worker's memory on its own node.
+On Linux an instance sizes its thread pool to its list: one thread per CPU of it, the main thread included. The operating system keeps the threads within the list and moves them between its CPUs as it sees fit; rayforce does not tie a thread to one CPU. On other platforms the pool has one thread per online CPU.
 
 ```bash
 taskset -c 0,2,4,6,24,26,28,30 rayforce -p 5001 &
@@ -19,19 +19,19 @@ taskset -c 8,10,12,14,32,34,36,38 rayforce -p 5002 &
 - Keep an instance on one NUMA node when its CPU count fits in one.
 - CPU numbering does not follow the layout on every machine. On a two-socket machine that numbers sockets alternately (even CPUs on socket 0, odd on socket 1) with CPU `k` and `k+24` on one core, the ranges `0-7`, `8-15`, … `40-47` put every instance on both sockets, and the last three ranges on the hyperthreads of the first three. For six instances of 8 threads on that machine use `0,2,4,6,24,26,28,30`, `8,10,12,14,32,34,36,38`, `16,18,20,22,40,42,44,46`, `1,3,5,7,25,27,29,31`, `9,11,13,15,33,35,37,39` and `17,19,21,23,41,43,45,47`.
 
+**CPU quota.** `docker run --cpus=N` and systemd `CPUQuota=` limit CPU time, not CPUs: the instance may still run on every CPU. Its default pool then has one thread per CPU of the quota, rounded up. Give it `--cpuset-cpus` or `CPUAffinity=` as well to choose its CPUs.
+
 **Do not:**
 
-- start two instances on overlapping lists: their pinned threads share CPUs and neither can move away;
+- start two instances on overlapping lists: they share those CPUs;
 - start instances without a list and leave each at its default size: every instance takes every CPU;
-- pass `-c` larger than the list: the threads share CPUs and are not pinned (rayforce prints a warning).
+- pass `-c` larger than the list: the threads take turns on its CPUs (rayforce prints a warning).
 
-`RAY_POOL_PIN=0` turns pinning off; then size the instances with `-c` so that their pools add up to the CPU count. `RAY_POOL_PIN=1` also pins a pool smaller than its list, always to the same first CPUs of it, so use it only with lists that do not overlap.
-
-To see where an instance's threads run, read every thread: `grep Cpus_allowed_list /proc/PID/task/*/status`. `taskset -p PID` shows only the main thread.
+`(.sys.info)` reports the CPUs of the instance (`cores`) and its pool size (`workers`); `taskset -p PID` shows its list.
 
 ## Memory
 
-Each instance treats the machine's whole physical RAM as its own and does not read container memory limits. It moves its working set to disk only when its own memory would pass that amount, so several busy instances can together exhaust RAM before any of them spills. Start every instance with `-m SIZE` and keep the sizes, plus room for the page cache, within RAM:
+Each instance treats the machine's whole physical RAM, or the memory limit of its container or cgroup when one is set, as its own. It moves its working set to disk only when its own memory would pass that amount, so several busy instances without limits of their own can together exhaust RAM before any of them spills. Start every instance with `-m SIZE` and keep the sizes, plus room for the page cache, within RAM:
 
 ```bash
 taskset -c 0-11 rayforce -m 40G -p 5001 &
@@ -62,8 +62,6 @@ Instances that read the same tables share the operating system's page cache, so 
 (.db.splayed.set "/db/.stage/2026.10.02/t/" t "/db/.sym")
 (.sys.exec "mv /db/.stage/2026.10.02 /db/2026.10.02")
 ```
-
-- If a first write of a table fails, its directory is left without a schema and every `.db.parted.get` of that database fails with `cannot read .d schema`. Remove that directory.
 
 **Files.** Never change table files in place: no `cp` over them, no `rsync --inplace`, no `truncate`, no editors. Instances that have the table open see the change at once, its stored statistics no longer match the data, and a shortened file crashes them with `SIGBUS`. Replace tables with `.db.splayed.set`, or write a new file and rename it over the old one. The same applies to files written with `write`, `write-bytes` and `hnsw-save`, which rewrite their target in place.
 

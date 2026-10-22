@@ -3017,8 +3017,8 @@ static int run_cli_capture(const char* command, char* output, size_t capacity,
 
 /* /proc/self/task observes the exact process-wide total, so this catches both
  * the ordinary off-by-one and the -c 1 collision with the pool's auto mode. */
-static int run_cli_task_count(const char* cores, long* out_count) {
-    char command[256], output[512];
+static int run_cli_task_count(const char* cores, long* out_count, bool* warned) {
+    char command[256], output[1024];
     int status;
     snprintf(command, sizeof(command),
              "printf '(count (.fs.list \"/proc/self/task\"))\\n'"
@@ -3028,30 +3028,42 @@ static int run_cli_task_count(const char* cores, long* out_count) {
         strstr(output, "ray_pool_init_total") != NULL ||
         strstr(output, "heap-ID pool exhausted") != NULL)
         return -1;
+    /* a -c past the CPUs the process may use is warned of on stderr first */
+    char* at = output;
+    if (warned) *warned = strncmp(at, "warning:", 8) == 0;
+    while (strncmp(at, "warning:", 8) == 0) {
+        char* nl = strchr(at, '\n');
+        if (!nl) return -2;
+        at = nl + 1;
+    }
     char* end = NULL;
-    long count = strtol(output, &end, 10);
-    if (end == output) return -2;
+    long count = strtol(at, &end, 10);
+    if (end == at) return -2;
     *out_count = count;
     return 0;
 }
 
 static test_result_t test_repl_cli_cores_are_total(void) {
     long count = 0;
-    int rc = run_cli_task_count("1", &count);
+    bool warned = false;
+    int rc = run_cli_task_count("1", &count, &warned);
     TEST_ASSERT_FMT(rc == 0, "-c 1 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 1, "-c 1 created %ld total threads", count);
+    TEST_ASSERT_FALSE(warned);
 
-    rc = run_cli_task_count("3", &count);
+    rc = run_cli_task_count("3", &count, NULL);
     TEST_ASSERT_FMT(rc == 0, "-c 3 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 3, "-c 3 created %ld total threads", count);
 
-    rc = run_cli_task_count("007", &count);
+    rc = run_cli_task_count("007", &count, NULL);
     TEST_ASSERT_FMT(rc == 0, "-c 007 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 7, "-c 007 created %ld total threads", count);
 
-    rc = run_cli_task_count("1023", &count);
+    /* more threads than any runner has CPUs: obeyed, with a warning */
+    rc = run_cli_task_count("1023", &count, &warned);
     TEST_ASSERT_FMT(rc == 0, "-c 1023 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 1023, "-c 1023 created %ld total threads", count);
+    TEST_ASSERT_TRUE(warned);
     PASS();
 }
 
