@@ -1030,6 +1030,7 @@ typedef struct {
     uint8_t src1;       /* source 1 register */
     uint8_t src2;       /* source 2 register (0xFF for unary) */
     uint8_t null_aware; /* 1 = use sentinel-checking kernel variant */
+    uint8_t u8_mod_zero; /* U8 divisor: modulo by zero yields 0 */
 } expr_ins_t;
 
 enum { REG_SCAN = 0, REG_CONST = 1, REG_SCRATCH = 2 };
