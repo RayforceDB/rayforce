@@ -14861,6 +14861,8 @@ static ray_t* sp_walk_key_range(sp_walk_ctx_t* c, int64_t n_scan) {
 /* Route test hook (ray_group_test_route, internal.h). */
 static int g_group_test_route;
 void ray_group_test_route(int route) { g_group_test_route = route; }
+static int g_group_test_fail_scalar_alloc;
+void ray_group_test_fail_scalar_alloc(int fail) { g_group_test_fail_scalar_alloc = fail; }
 
 /* The error for a by: key that is no value: a function or null.  Out of
  * line and cold: exec_group_run is hot, and the error is rare. */
@@ -15514,6 +15516,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         AGG_OWN_SRC_RELEASE();
+        if (match_idx_block) ray_release(match_idx_block);
         scratch_free(vla_hdr);
         return rerr;
     }
@@ -15679,6 +15682,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         bool sc_any_nullable = false;
         /* Integer AVG divides the exact 128-bit sum: carry high words. */
         bool sc_need_sum128 = false;
+        bool sc_has_f64_affine = false;
         /* Some input is read by range (a staged source, agg_ptrs NULL). */
         bool sc_staged = false;
         for (uint32_t a = 0; a < n_aggs; a++) {
@@ -15728,7 +15732,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_need_sum128 = true;
             /* An F64 sum of integers does not wrap: emit it from the
              * exact 128-bit total. */
-            if (agg_affine[a].f64) sc_need_sum128 = true;
+            if (agg_affine[a].f64) {
+                sc_need_sum128 = true;
+                sc_has_f64_affine = true;
+            }
         }
 
         if (!match_idx && !rowsel && !sc_any_nullable && n_aggs > 1) {
@@ -16002,9 +16009,21 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* sc_hdr = NULL;
         /* After the per-chunk blocks: one pinned vocabulary per aggregate. */
         const size_t sc_pin_off = (size_t)sc_n * sc_bytes + sc_line;
-        void* sc_raw = scratch_calloc(&sc_hdr, sc_pin_off +
+        bool fail_scalar_alloc = g_group_test_fail_scalar_alloc != 0;
+        g_group_test_fail_scalar_alloc = 0;
+        void* sc_raw = fail_scalar_alloc ? NULL : scratch_calloc(&sc_hdr, sc_pin_off +
             (size_t)n_aggs * (sizeof(ray_sym_domain_raw_t) + 1) + sc_line);
-        if (!sc_raw) { scratch_free(sc_vla_hdr); goto da_path; }
+        if (!sc_raw) {
+            scratch_free(sc_vla_hdr);
+            /* The fallback emit cannot apply an F64 affine bias.  Report
+             * the allocation failure instead of returning an I64 sum with
+             * the bias silently dropped. */
+            if (sc_has_f64_affine) {
+                rerr = ray_error("oom", NULL);
+                goto resolve_fail;
+            }
+            goto da_path;
+        }
         ray_sym_domain_raw_t* sc_agg_raw = (ray_sym_domain_raw_t*)(void*)
             (((uintptr_t)sc_raw + sc_pin_off + sc_line - 1) & ~(uintptr_t)(sc_line - 1));
         uint8_t* sc_agg_raw_ok = (uint8_t*)(sc_agg_raw + n_aggs);

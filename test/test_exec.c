@@ -6847,6 +6847,38 @@ static test_result_t test_expr_affine_f64_bias_route(void) {
     PASS();
 }
 
+/* A failed scalar buffer allocation must not fall through to the hash
+ * emitter, which cannot apply the F64 affine bias. */
+static test_result_t test_expr_affine_f64_bias_scalar_oom(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    int16_t raw[] = {10, 20, 30};
+    ray_t* vec = ray_vec_from_raw(RAY_I16, raw, 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("h", 1), vec);
+    ray_release(vec);
+
+    for (int i = 0; i < 2; i++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* input = ray_add(g, ray_scan(g, "h"), ray_const_f64(g, 5.0));
+        uint16_t op[] = {i == 0 ? OP_SUM : OP_AVG};
+        ray_op_t* ins[] = {input};
+        ray_op_t* group = ray_group(g, NULL, 0, op, ins, 1);
+        ray_group_test_route(1);
+        ray_group_test_fail_scalar_alloc(1);
+        ray_t* result = ray_execute(g, group);
+        ray_group_test_fail_scalar_alloc(0);
+        ray_group_test_route(0);
+        TEST_ASSERT_TRUE(result && RAY_IS_ERR(result));
+        ray_release(result);
+        ray_graph_free(g);
+    }
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- linear_expr_add_term: update existing term (lines 183-185) ---- */
 static test_result_t test_expr_group_linear_double_term(void) {
     ray_heap_init();
@@ -18121,6 +18153,7 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_group_nonlinear_fallback", test_expr_group_nonlinear_fallback, NULL, NULL },
     { "exec/expr_group_affine_f64_i64", test_expr_group_affine_f64_i64, NULL, NULL },
     { "exec/expr_affine_f64_bias_route", test_expr_affine_f64_bias_route, NULL, NULL },
+    { "exec/expr_affine_f64_bias_scalar_oom", test_expr_affine_f64_bias_scalar_oom, NULL, NULL },
     { "exec/expr_group_linear_double_term", test_expr_group_linear_double_term, NULL, NULL },
     { "exec/expr_group_linear_mid_cancel", test_expr_group_linear_mid_cancel, NULL, NULL },
     { "exec/expr_group_affine_neg_i64_const", test_expr_group_affine_neg_i64_const, NULL, NULL },
