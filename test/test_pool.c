@@ -1862,7 +1862,8 @@ static test_result_t test_cpu_quota_child(void) {
 static test_result_t test_auto_follows_cpu_set(void) {
     cpu_set_t before, two;
     CPU_ZERO(&before);
-    TEST_ASSERT_EQ_I(sched_getaffinity(0, sizeof(before), &before), 0);
+    if (sched_getaffinity(0, sizeof(before), &before) != 0)
+        SKIP("the kernel's CPU mask is wider than a cpu_set_t: no fixed-size snapshot");
     if (CPU_COUNT(&before) < 3) SKIP("needs at least 3 CPUs");
     CPU_ZERO(&two);
     for (int c = 0, k = 0; c < CPU_SETSIZE && k < 2; c++)

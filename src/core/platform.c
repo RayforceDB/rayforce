@@ -753,65 +753,72 @@ static void cg_unescape(char* s) {
     *o = 0;
 }
 
-/* Where a cgroup hierarchy is mounted: the v2 one (`ctrl` NULL), or the v1
- * one whose super options name `ctrl`.  Its mount point, and the path in
- * the hierarchy that the mount shows (its root: "/" unless a subtree was
- * mounted).  False when /proc/self/mountinfo lists none. */
-static bool cgroup_mount(const char* ctrl, char* mnt, size_t mn, char* root, size_t rn) {
-    char path[600];
-    cg_path(path, sizeof(path), "/proc/self/mountinfo");
-    FILE* f = fopen(path, "r");
-    if (!f) return false;
-    char line[2048];
-    bool found = false;
-    while (!found && fgets(line, sizeof(line), f)) {
-        /* "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS" */
-        line[strcspn(line, "\n")] = 0;
-        char* sep = strstr(line, " - ");
-        if (!sep) continue;
-        *sep = 0;
-        char* f_root = NULL; char* f_mnt = NULL;
-        char* save = NULL;
-        int i = 0;
-        for (char* t = strtok_r(line, " ", &save); t; t = strtok_r(NULL, " ", &save), i++) {
-            if (i == 3) f_root = t;
-            else if (i == 4) { f_mnt = t; break; }
-        }
-        if (!f_root || !f_mnt) continue;
-        char* fstype = strtok_r(sep + 3, " ", &save);
-        char* source = fstype ? strtok_r(NULL, " ", &save) : NULL;
-        char* super = source ? strtok_r(NULL, " ", &save) : NULL;
-        if (!fstype) continue;
-        if (ctrl ? (strcmp(fstype, "cgroup") == 0 && super && cgroup_list_has(super, ctrl))
-                 : strcmp(fstype, "cgroup2") == 0) {
-            cg_unescape(f_root);
-            cg_unescape(f_mnt);
-            found = snprintf(mnt, mn, "%s", f_mnt) < (int)mn &&
-                    snprintf(root, rn, "%s", f_root) < (int)rn;
-        }
+/* One mount of a cgroup hierarchy from a /proc/self/mountinfo line: the
+ * v2 one (`ctrl` NULL), or the v1 one whose super options name `ctrl`.
+ * Its mount point, and the path in the hierarchy the mount shows (its
+ * root: "/" unless a subtree was mounted).  The line is consumed. */
+static bool cgroup_mount_line(char* line, const char* ctrl, char** mnt, char** root) {
+    /* "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS" */
+    line[strcspn(line, "\n")] = 0;
+    char* sep = strstr(line, " - ");
+    if (!sep) return false;
+    *sep = 0;
+    char* f_root = NULL; char* f_mnt = NULL;
+    char* save = NULL;
+    int i = 0;
+    for (char* t = strtok_r(line, " ", &save); t; t = strtok_r(NULL, " ", &save), i++) {
+        if (i == 3) f_root = t;
+        else if (i == 4) { f_mnt = t; break; }
     }
-    fclose(f);
-    return found;
+    if (!f_root || !f_mnt) return false;
+    char* fstype = strtok_r(sep + 3, " ", &save);
+    char* source = fstype ? strtok_r(NULL, " ", &save) : NULL;
+    char* super = source ? strtok_r(NULL, " ", &save) : NULL;
+    if (!fstype) return false;
+    if (ctrl ? !(strcmp(fstype, "cgroup") == 0 && super && cgroup_list_has(super, ctrl))
+             : strcmp(fstype, "cgroup2") != 0)
+        return false;
+    cg_unescape(f_root);
+    cg_unescape(f_mnt);
+    *mnt = f_mnt;
+    *root = f_root;
+    return true;
 }
 
 /* The quota of a membership path `cgpath` ("" for the root) of the v2
- * hierarchy (`ctrl` NULL) or the v1 one carrying `ctrl`: the membership is
- * translated through the mount's root to its directory under the mount
- * point, and the walk stops at the mount point (ancestors outside the
- * mount are not visible).  Without mountinfo, the conventional mounts. */
+ * hierarchy (`ctrl` NULL) or the v1 one carrying `ctrl`.  Every mount of
+ * the hierarchy whose subtree holds the membership is a view of it: the
+ * membership is translated through the view's root to its directory under
+ * the mount point, and the cgroup and its ancestors visible there (up to
+ * the mount point) are read.  The tightest quota of all views counts, as
+ * each shows a part of the same ancestry.  Without mountinfo, or with no
+ * mount of the hierarchy listed, the conventional mounts. */
 static int64_t cgroup_cpu_member(const char* ctrl, const char* v1list, const char* cgpath) {
-    char mnt[512], root[512], base[600];
-    if (cgroup_mount(ctrl, mnt, sizeof(mnt), root, sizeof(root))) {
-        const char* rel = cgpath;
-        if (strcmp(root, "/") != 0) {
-            size_t rl = strlen(root);
-            if (strncmp(cgpath, root, rl) != 0 || (cgpath[rl] != 0 && cgpath[rl] != '/'))
-                return 0;   /* membership outside the visible subtree */
-            rel = cgpath + rl;
+    char path[600], base[600];
+    cg_path(path, sizeof(path), "/proc/self/mountinfo");
+    FILE* f = fopen(path, "r");
+    bool listed = false;
+    int64_t m = 0;
+    if (f) {
+        char line[2048];
+        while (fgets(line, sizeof(line), f)) {
+            char* mnt; char* root;
+            if (!cgroup_mount_line(line, ctrl, &mnt, &root)) continue;
+            listed = true;
+            const char* rel = cgpath;
+            if (strcmp(root, "/") != 0) {
+                size_t rl = strlen(root);
+                if (strncmp(cgpath, root, rl) != 0 || (cgpath[rl] != 0 && cgpath[rl] != '/'))
+                    continue;   /* the membership is outside this view */
+                rel = cgpath + rl;
+            }
+            cg_path(base, sizeof(base), mnt);
+            int64_t v = cgroup_cpu_walk(base, rel, ctrl == NULL);
+            if (v > 0 && (m == 0 || v < m)) m = v;
         }
-        cg_path(base, sizeof(base), mnt);
-        return cgroup_cpu_walk(base, rel, ctrl == NULL);
+        fclose(f);
     }
+    if (listed) return m;
     if (!ctrl) {
         cg_path(base, sizeof(base), "/sys/fs/cgroup");
         return cgroup_cpu_walk(base, cgpath, true);

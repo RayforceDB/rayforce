@@ -224,6 +224,20 @@ static test_result_t test_cgroup_cpu_quota(void) {
     /* a membership outside the visible subtree has no readable quota */
     TEST_ASSERT_EQ_I(cgq_quota("out", "0::/other/job\n",
                                "30 25 0:26 /tenant /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", sub), 0);
+    /* several views of the hierarchy: the one holding the membership counts,
+     * whatever comes first in mountinfo */
+    const char* const lim[] = { "sys/fs/cgroup/limited/cpu.max", "150000 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("multi", "0::/limited\n",
+                               "30 25 0:26 /other /unrelated rw - cgroup2 cgroup2 rw\n"
+                               "31 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", lim), 1500);
+    /* a narrow view and a full one: the ancestor quota only the full view
+     * shows is the tighter one */
+    const char* const both[] = { "narrow/leaf/cpu.max", "150000 100000\n",
+                                 "sys/fs/cgroup/org/tenant/leaf/cpu.max", "150000 100000\n",
+                                 "sys/fs/cgroup/org/cpu.max", "50000 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("views", "0::/org/tenant/leaf\n",
+                               "30 25 0:26 /org/tenant /narrow rw - cgroup2 cgroup2 rw\n"
+                               "31 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", both), 500);
     /* a v1 cpu controller mounted off the conventional place */
     const char* const v1[] = { "cgroup/cpu/x/cpu.cfs_quota_us", "50000\n",
                                "cgroup/cpu/x/cpu.cfs_period_us", "100000\n", NULL };
@@ -253,7 +267,8 @@ static test_result_t test_cpu_set_count_wide_mask(void) {
 #ifdef RAY_OS_LINUX
     cpu_set_t set, two;
     CPU_ZERO(&set);
-    TEST_ASSERT_EQ_I(sched_getaffinity(0, sizeof(set), &set), 0);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0)
+        SKIP("the kernel's CPU mask is wider than a cpu_set_t: no fixed-size snapshot");
     TEST_ASSERT_EQ_I(n, CPU_COUNT(&set));
     if (CPU_COUNT(&set) < 3) SKIP("needs at least 3 CPUs");
     /* two CPUs of the mask, so the fallback (every online CPU) differs */

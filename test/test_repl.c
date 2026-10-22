@@ -48,6 +48,7 @@
 #include "core/ipc.h"
 #include "core/sock.h"
 #include "core/platform.h"
+#include "core/pool.h"      /* ray_pool_default_total: the -c warning test */
 #include "core/runtime.h"
 #include "mem/sys.h"
 
@@ -3059,11 +3060,12 @@ static test_result_t test_repl_cli_cores_are_total(void) {
     TEST_ASSERT_FMT(rc == 0, "-c 007 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 7, "-c 007 created %ld total threads", count);
 
-    /* more threads than any runner has CPUs: obeyed, with a warning */
+    /* obeyed; warned of exactly when it passes the CPUs the process may use
+     * (the child runs under the same mask and quota) */
     rc = run_cli_task_count("1023", &count, &warned);
     TEST_ASSERT_FMT(rc == 0, "-c 1023 launcher probe failed: %d", rc);
     TEST_ASSERT_FMT(count == 1023, "-c 1023 created %ld total threads", count);
-    TEST_ASSERT_TRUE(warned);
+    TEST_ASSERT_TRUE(warned == (1023 > ray_pool_default_total()));
     PASS();
 }
 
