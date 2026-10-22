@@ -572,7 +572,26 @@ static uint16_t cmp_flip(uint16_t opcode) {
     }
 }
 
+/* Called only for an otherwise mismatched SYM pair. String literals carry
+ * SYM execution metadata but must keep their existing text admission path. */
+static int cmp_is_symbol_value(ray_graph_t* g, ray_op_t* x) {
+    if (x->opcode != OP_CONST) return 1;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    return !ext || !ext->literal || ext->literal->type != -RAY_STR;
+}
+
 static ray_op_t* make_cmp(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
+    int8_t a_type = a->out_type, b_type = b->out_type;
+    if (RAY_IS_PARTED(a_type)) a_type = (int8_t)RAY_PARTED_BASETYPE(a_type);
+    if (RAY_IS_PARTED(b_type)) b_type = (int8_t)RAY_PARTED_BASETYPE(b_type);
+    /* Symbol IDs are not numeric values. Let the evaluator apply its
+     * value-sensitive builtin/null rules to unsupported equality pairs. */
+    if ((opcode == OP_EQ || opcode == OP_NE) &&
+        ((a_type == RAY_SYM && b_type != RAY_SYM && b_type != RAY_STR &&
+          cmp_is_symbol_value(g, a)) ||
+         (b_type == RAY_SYM && a_type != RAY_SYM && a_type != RAY_STR &&
+          cmp_is_symbol_value(g, b))))
+        return NULL;
     int8_t ta = cmp_temporal_type(g, a);
     int8_t tb = cmp_temporal_type(g, b);
     if (!ta || !tb || ta == tb) return make_binary(g, opcode, a, b, RAY_BOOL);

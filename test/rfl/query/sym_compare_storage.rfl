@@ -1,0 +1,49 @@
+;; @requires: posix
+;; The equivalence runner repeats this fixture with generation2 writes.
+(set T768 (table [s b k n r] (list (take ['a 'b 'c] 9) (take [true false false] 9) (til 9) (as 'sym (take ["" "a" ""] 9)) (take ["a" "b" "c"] 9))))
+(.db.splayed.set "__sym768/sp/" T768 "__sym768/sp.sym")
+(.db.splayed.set "__sym768/pt/2024.01.01/t/" (table [s b k n r] (list ['a 'b 'c] [true false false] [0 1 2] (as 'sym ["" "a" ""]) ["a" "b" "c"])) "__sym768/pt/.sym")
+(.db.splayed.set "__sym768/pt/2024.01.02/t/" (table [s b k n r] (list ['a 'b 'c 'a 'b 'c] [true false false true false false] [3 4 5 6 7 8] (as 'sym ["" "a" "" "" "a" ""]) ["a" "b" "c" "a" "b" "c"])) "__sym768/pt/.sym")
+(set S768 (.db.splayed.get "__sym768/sp/" "__sym768/sp.sym"))
+(set P768 (.db.parted.get "__sym768/pt/" 't))
+(count (select {from: S768 where: (== s 1)})) !- type
+(select {from: S768 where: (== 1 s)}) !- type
+(select {from: S768 where: (!= s 1)}) !- type
+(count (select {from: S768 where: (!= 1 s)})) !- type
+(select {from: S768 where: (== s b)}) !- type
+(select {from: S768 where: (!= b s)}) !- type
+(count (select {from: S768 where: (== s 'b)})) !- type
+(select {from: S768 where: (!= 'k s)}) !- type
+(select {from: S768 where: (== s true) take: 2}) !- type
+(select {from: S768 where: (and b (== s 1))}) !- type
+(select {from: S768 where: (or b (== s 1))}) !- type
+(select {from: S768 where: (== n 1)}) !- type
+(at (select {from: S768 where: (== s 'a)}) 'k) -- [0 3 6]
+(at (select {from: S768 where: (== s "a")}) 'k) -- [0 3 6]
+(at (select {from: S768 where: (== r "a")}) 'k) -- [0 3 6]
+(count (select {from: S768 where: (== s 's)})) -- 9
+(count (select {from: S768 where: (== s 'zz)})) -- 0
+(at (select {from: S768 where: (== n 0Nl)}) 'k) -- [0 2 3 5 6 8]
+(at (select {from: S768 where: (!= 0Nl n)}) 'k) -- [1 4 7]
+(count (select {from: P768 where: (== s 1)})) !- type
+(select {from: P768 where: (== 1 s)}) !- type
+(select {from: P768 where: (!= s 1)}) !- type
+(count (select {from: P768 where: (!= 1 s)})) !- type
+(select {from: P768 where: (== s b)}) !- type
+(select {from: P768 where: (!= b s)}) !- type
+(count (select {from: P768 where: (== s 'b)})) !- type
+(select {from: P768 where: (!= 'k s)}) !- type
+(select {from: P768 where: (== s true) take: 2}) !- type
+(select {from: P768 where: (and b (== s 1))}) !- type
+(select {from: P768 where: (or b (== s 1))}) !- type
+(select {from: P768 where: (== n 1)}) !- type
+(at (select {from: P768 where: (== s 'a)}) 'k) -- [0 3 6]
+(at (select {from: P768 where: (== s "a")}) 'k) -- [0 3 6]
+(at (select {from: P768 where: (== r "a")}) 'k) -- [0 3 6]
+(count (select {from: P768 where: (== s 's)})) -- 9
+(count (select {from: P768 where: (== s 'zz)})) -- 0
+(at (select {from: P768 where: (== n 0Nl)}) 'k) -- [0 2 3 5 6 8]
+(at (select {from: P768 where: (!= 0Nl n)}) 'k) -- [1 4 7]
+(set S768 0)
+(set P768 0)
+(.sys.exec "rm -rf __sym768")
