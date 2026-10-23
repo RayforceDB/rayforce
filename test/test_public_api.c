@@ -498,6 +498,40 @@ static test_result_t test_public_runtime_destroy_null_is_noop(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Anon watermark — an embedder sets the spill threshold the engine's
+ * -m/--mem sets, through rayforce.h alone (this file does not include
+ * mem/heap.h), and reads it and the peak back.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static test_result_t test_public_anon_watermark_setget(void) {
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(1) << 30);
+    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), INT64_C(1) << 30);
+
+    ray_heap_set_anon_watermark(0);                /* 0 = default */
+    int64_t limit = ray_sys_ram_limit();
+    int64_t room = limit / 4;
+    if (room < (INT64_C(3) << 30)) room = INT64_C(3) << 30;
+    if (room > limit / 2) room = limit / 2;
+    int64_t want = limit - room;
+    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), want);
+
+    ray_heap_set_anon_watermark(previous == want ? 0 : previous);
+    PASS();
+}
+
+static test_result_t test_public_anon_peak(void) {
+    int64_t before = ray_heap_anon_peak();
+    TEST_ASSERT(before > 0, "a live runtime has committed RAM");
+    ray_t* v = ray_vec_new(RAY_I64, 1 << 20);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    ray_release(v);
+    TEST_ASSERT(ray_heap_anon_peak() >= before, "the peak never falls");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * Interrupt API — global flag (eval.c).  Happy-path set/get round-trip
  * for the public ray_*_interrupt names and their legacy ray_eval_*
  * wrappers.  The flag is thread-local sig_atomic_t storage; here we
@@ -772,6 +806,9 @@ const test_entry_t public_api_entries[] = {
     { "public/runtime_create_with_sym_eval",      test_public_runtime_create_with_sym_eval,     NULL, NULL },
     { "public/runtime_create_with_sym_err_eval",  test_public_runtime_create_with_sym_err_eval, NULL, NULL },
     { "public/runtime_destroy_null_is_noop",      test_public_runtime_destroy_null_is_noop,     NULL, NULL },
+
+    { "public/anon_watermark_setget",  test_public_anon_watermark_setget,  public_api_setup, public_api_teardown },
+    { "public/anon_peak",              test_public_anon_peak,              public_api_setup, public_api_teardown },
 
     /* eval interrupt / nfo / restricted / error-trace public API. */
     { "public/interrupt_roundtrip",            test_public_interrupt_roundtrip,            NULL, NULL },

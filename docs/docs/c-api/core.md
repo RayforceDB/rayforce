@@ -127,6 +127,24 @@ ray_t* col = ray_vec_new(RAY_I64, 1000000);
 caml_alloc_custom_mem(&ops, sizeof(ray_t*), ray_shallow_bytes(col));  /* OCaml: charge the GC */
 ```
 
+### ray_heap_set_anon_watermark / ray_heap_anon_watermark / ray_heap_anon_peak
+
+The memory budget the engine's `-m SIZE` sets, for a program that embeds the library. Past the anon watermark the heap backs new allocations with spill files (under `RAY_HEAP_SWAP`, else `TMPDIR`) instead of anonymous RAM, so the process spills to disk rather than meeting the OOM killer (see [Memory](../guides/memory.md)). The default is `ray_sys_ram_limit()` — physical RAM, or a smaller container/cgroup limit — less a quarter of it, at least 3 GiB and at most half, left to the page cache.
+
+```c
+void    ray_heap_set_anon_watermark(int64_t bytes);  /* 0 restores the default */
+int64_t ray_heap_anon_watermark(void);               /* the threshold in force */
+int64_t ray_heap_anon_peak(void);                    /* peak anonymous bytes committed */
+```
+
+`ray_heap_anon_watermark` resolves 0 to the default. `ray_heap_anon_peak` is the high-water mark of committed anonymous bytes since process start, spill excluded: the peak RAM the process demanded. They are what `.sys.mem` reports as `anon-watermark` and `anon-peak`.
+
+On Linux the watermark also bounds, with half the RAM limit, the memory the heap locks against swap-out. An embedding keeps its host's `RLIMIT_MEMLOCK`, and what does not fit stays unlocked (see [Memory](../guides/memory.md#8-total-ram-and-out-of-core-spill)); `RAY_HEAP_MLOCK=0` turns locking off.
+
+```c
+ray_heap_set_anon_watermark(INT64_C(6) << 30);   /* as -m 6G */
+```
+
 ### ray_cow
 
 Copy-on-write: if `v` is the sole owner (`rc == 1`), returns `v` unchanged. Otherwise, creates a deep copy and returns it with `rc = 1`. The original is not modified. After `ray_cow()`, if the returned pointer differs from the original, the caller must release it on error paths.

@@ -376,6 +376,21 @@ int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informationa
 int64_t  ray_sys_ram_limit(void);   /* RAM this process may use: min(physical RAM,
                                      * container/cgroup limit); the default anon watermark */
 
+/* The anon watermark: anonymous (RAM-resident) bytes the heap may commit
+ * before new allocations are backed by spill files under RAY_HEAP_SWAP
+ * (else TMPDIR) instead.  The default is ray_sys_ram_limit() less a quarter
+ * of it, at least 3 GiB and at most half, left to the page cache.
+ * ray_heap_set_anon_watermark sets the threshold, as the engine's -m/--mem
+ * does; 0 restores the default.  ray_heap_anon_watermark is the threshold
+ * in force (0 resolved to the default), and ray_heap_anon_peak the
+ * high-water mark of committed anonymous bytes since process start (the
+ * peak RAM demanded; spill excluded), as .sys.mem reports them.  On Linux
+ * the threshold also bounds, with half the RAM limit, the heap memory
+ * locked against swap-out (RAY_HEAP_MLOCK=0 turns locking off). */
+void     ray_heap_set_anon_watermark(int64_t bytes);
+int64_t  ray_heap_anon_watermark(void);
+int64_t  ray_heap_anon_peak(void);
+
 /* ===== Interrupt API =====
  * Long-running queries poll ray_interrupted() at morsel granularity
  * and bail out with a "cancel" error. The REPL's SIGINT handler wires
