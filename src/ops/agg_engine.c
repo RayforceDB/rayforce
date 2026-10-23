@@ -1417,6 +1417,25 @@ static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows
     return !*err && distinct * 4 >= SAMPLES;
 }
 
+/* Whether a single-key plan of total_slots runs as the one shared slab of a
+ * wide plan: every aggregate updates a shared state, the slab and its
+ * occupancy bits fit three quarters of the room under the anonymous
+ * watermark, and the key shows many groups (agg_wide_populated).  The
+ * caller checks the plan's shape (pool, rows, streaming states, no group
+ * limit, one key).  *err is set on a failed range read. */
+static bool agg_wide_shared_fits(const agg_vtable_t** vts, uint32_t n_aggs, size_t block,
+                                 int64_t total_slots, int64_t eff_n, ray_t* key_col,
+                                 const agg_rr_t* rr, int64_t nrows, ray_t** err) {
+    *err = NULL;
+    if (agg_no_wide_dense) return false;
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (vts[a]->update_shared == NULL) return false;
+    size_t slot_bytes = agg_count32_slab(vts, n_aggs, eff_n) ? sizeof(uint32_t) : block;
+    double need = (double)total_slots * (double)slot_bytes + (double)total_slots / 8;
+    if (need > (double)agg_dense_wide_room() / 4 * 3) return false;
+    return agg_wide_populated(key_col, rr, nrows, err);
+}
+
 /* agg_dense_plan over keys bound for range reads: krr's staged keys (their
  * key_cols are stand-ins) take their bounds from the directory or by
  * pieces.  False with *err set: a range error. */
@@ -11941,13 +11960,9 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     if (dp.wide) {
         bool shared = pool && eff_n >= RAY_PARALLEL_THRESHOLD && all_streaming &&
                       group_limit <= 0 && ext->n_keys == 1;
-        for (uint32_t a = 0; a < ext->n_aggs && shared; a++)
-            shared = vts[a]->update_shared != NULL;
-        size_t slot_bytes = agg_count32_slab(vts, ext->n_aggs, eff_n) ? sizeof(uint32_t) : block;
-        double need = (double)dp.total_slots * (double)slot_bytes + (double)dp.total_slots / 8;
-        bool fits = shared && !agg_no_wide_dense && need <= (double)agg_dense_wide_room() / 4 * 3;
         ray_t* werr = NULL;
-        if (fits) fits = agg_wide_populated(key_cols[0], &ks->rr, nrows, &werr);
+        bool fits = shared && agg_wide_shared_fits(vts, ext->n_aggs, block, dp.total_slots, eff_n,
+                                                   key_cols[0], &ks->rr, nrows, &werr);
         if (werr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return werr; }
         if (!fits) {
             agg_dense_plan_free(&dp);
@@ -12109,6 +12124,25 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (terr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return terr; }
             if (touched_slots * (block + sizeof(int64_t) + 1) > scatter_budget / 2)
                 dense_par_ok = false;
+        }
+        /* No per-worker or partitioned dense plan fits the budget: a single
+         * key still runs as the one shared slab of a wide plan, as when its
+         * slab alone passes the budget, rather than scattered by radix. */
+        if (dp.ok && !dp.wide && !dense_par_ok && ext->n_keys == 1 && group_limit <= 0) {
+            ray_t* werr = NULL;
+            bool fits = agg_wide_shared_fits(vts, ext->n_aggs, block, dp.total_slots, eff_n,
+                                             key_cols[0], &ks->rr, nrows, &werr);
+            if (werr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return werr; }
+            if (fits) {
+                dp.wide = true;
+                route_stats.dense_worker_budget = false;
+                ray_profile_tick("group: wide shared after the worker budget");
+                agg_route_record(AGG_ROUTE_V2_DENSE);
+                ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
+                    nrows, pool, &dp, ray_pool_total_workers(pool), AGG_DENSE_SHARED, sel, sel_prefix, n_sel, efp, 0);
+                agg_vo_free(&vo); agg_dense_plan_free(&dp);
+                return result;
+            }
         }
         route_stats.dense_worker_budget = dp.ok && !dense_par_ok;
         if (route_stats.nullable_key) ray_profile_tick("group: nullable key");

@@ -148,6 +148,7 @@ static void enccol_free(ray_enccol_t* e) {
     if (e->wrapper) ray_release(e->wrapper);
     if (e->dom && e->dom_owned) ray_sym_domain_release(e->dom);
     if (e->map)     ray_file_map_release(e->map);
+    ray_free_raw((void*)e->touch_ok);
     ray_free_raw(e);
 }
 
@@ -269,6 +270,10 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
      * format keeps every offset 8-aligned, and a mapping starts on a page. */
     ray_t* err = ((uintptr_t)mapped & 7) ? ray_error("nyi", "column %s: mapping not 8-aligned", e->path)
                                          : enc_parse_load(e, &saved);
+    if (!err && e->n_chunks > 0 && e->type != RAY_GUID && e->type != RAY_STR) {
+        e->touch_ok = ray_calloc_raw((size_t)e->n_chunks);
+        if (!e->touch_ok) err = ray_error("oom", "column %s: chunk flags", e->path);
+    }
     if (!err && e->type == RAY_SYM) {
         if (dom) {
             /* the symfile the caller named must hold every id the column
@@ -1231,6 +1236,24 @@ const void* ray_enccol_raw_view(ray_enccol_t* e, int64_t c, int j, const ray_enc
         d->encoding != RAY_ENC_RAW || d->n_nulls != 0 || (d->flags & RAY_ENC_DESC_TRAILER))
         return NULL;
     ray_enc_dirent_t de; dirent_at(e, c, &de);
+    if (e->touch_ok && !atomic_load_explicit(&e->touch_ok[c], memory_order_acquire)) {
+        /* A chunk's RAW payloads are read through once, in order, when its
+         * first vector is viewed.  A grouping that re-scans its input in
+         * waves then finds those pages still cached where memory is short:
+         * without this pass a 2 GB box read the near-unique two-key count
+         * (WatchID, ClientIP) half as much again from disk on every run. */
+        const ray_enc_desc_t* descs = ray_enccol_descs(e, c);
+        int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+        uint64_t acc = 0;
+        for (int v = 0; v < nv; v++) {
+            if (descs[v].encoding != RAY_ENC_RAW) continue;
+            const uint64_t* w = (const uint64_t*)(e->base + de.offset + descs[v].payload_off);
+            for (uint64_t i = 0; i < descs[v].payload_bytes / 8; i++) acc ^= w[i];
+        }
+        static volatile uint64_t sink;
+        sink ^= acc;
+        atomic_store_explicit(&e->touch_ok[c], 1, memory_order_release);
+    }
     return e->base + de.offset + d->payload_off;      /* no bitmap: n_nulls == 0 */
 }
 

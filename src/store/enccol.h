@@ -98,6 +98,7 @@ typedef struct ray_enccol_s {
     _Atomic(bool)   dec_listed;
     _Atomic(uint64_t) dec_used;     /* the statement that last asked for the decode */
     _Atomic(uint64_t) decoded_bytes;  /* bytes produced by this column's vector decodes */
+    _Atomic(uint8_t)* touch_ok;     /* per chunk: its RAW payloads read through (ray_enccol_raw_view) */
     /* single file: ray_enccol_dir_totals' cache; totals_state 0 none,
      * 1 being stored, 2 stored (acquire before reading totals) */
     _Atomic(uint8_t) totals_state;

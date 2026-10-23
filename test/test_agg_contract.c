@@ -870,6 +870,74 @@ static test_result_t test_dense_wide_budget(void) {
     PASS();
 }
 
+/* A key whose slab alone fits the dense budget (a quarter of a low watermark)
+ * but whose per-worker slabs and partitioned plan do not: the planner keeps
+ * it off the wide plan, and no per-worker dense plan fits, so the one shared
+ * u32 slab runs it instead of the radix scatter.  The slab is sized from the
+ * room this heap has: 0.9 of a quarter of the watermark, over twice as many
+ * rows, every group counted twice. */
+static test_result_t test_dense_wide_after_worker_budget(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    const int64_t wm = ray_heap_anon_watermark();
+    int64_t base = ray_heap_anon_committed() - ray_heap_anon_reusable();
+    if (base < 0) base = 0;
+    const int64_t room = INT64_C(64) << 20;
+    int64_t range = (int64_t)(0.9 * (double)((base + room) / 4) / (8 + 8 + 1)) | 1;
+    while (range % 7919 == 0) range += 2;
+    const int64_t n = 2 * range;
+    ray_t* key = ray_vec_new(RAY_I64, n);
+    key->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(key))[i] = (i * 7919) % range;
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
+    ray_release(key);
+    for (int level = 0; level < 2; level++) {
+        ray_graph_t* graph = ray_graph_new(tbl);
+        ray_op_t* keys[] = {ray_scan(graph, "k")};
+        uint16_t ops[] = {OP_COUNT};
+        ray_op_t* inputs[] = {ray_scan(graph, "k")};
+        ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, 1);
+        /* level 0: the watermark 64 MB past what this heap holds (the table
+         * included); level 1: 1 MB past it, under the u32 slab */
+        int64_t held = ray_heap_anon_committed() - ray_heap_anon_reusable();
+        int64_t tight = (held > 0 ? held : 0) + (level ? INT64_C(1) << 20 : room);
+        if (!level) TEST_ASSERT_TRUE(range * (8 + 8 + 1) <= tight / 4);   /* the slab alone fits */
+        ray_heap_set_anon_watermark(tight);
+        agg_route_reset();
+        ray_t* out = ray_execute(graph, group);
+        agg_route_stats_t st = agg_route_stats();
+        ray_heap_set_anon_watermark(wm);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+#if ATOMIC_LLONG_LOCK_FREE == 2
+        if (!level) {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 1);
+            TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_SHARED);
+            TEST_ASSERT_TRUE(st.dense_count32);
+            TEST_ASSERT_FALSE(st.dense_worker_budget);
+            TEST_ASSERT_EQ_I(st.radix_spill_bytes, 0);
+        } else {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 0);
+        }
+#endif
+        TEST_ASSERT_EQ_I(ray_table_nrows(out), range);
+        ray_t* ko = ray_table_get_col_idx(out, 0);
+        ray_t* co = ray_table_get_col_idx(out, 1);
+        bool* seen = ray_calloc_raw((size_t)range);
+        TEST_ASSERT_NOT_NULL(seen);
+        for (int64_t r = 0; r < ko->len; r++) {
+            int64_t k = ((int64_t*)ray_data(ko))[r];
+            TEST_ASSERT_TRUE(k >= 0 && k < range && !seen[k]);
+            seen[k] = true;
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(co))[r], 2);
+        }
+        ray_free_raw(seen);
+        ray_release(out); ray_graph_free(graph);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 /* The same ordering under a where filter: the plan within the row count whose
  * per-worker slabs do not fit is promoted to the one shared slab, which
  * counts the selected rows only. */
@@ -4194,6 +4262,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
     { "agg_contract/dense_task_local", test_dense_task_local, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_range", test_dense_wide_range, contract_setup, contract_teardown },
+    { "agg_contract/dense_wide_after_worker_budget", test_dense_wide_after_worker_budget, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_budget", test_dense_wide_budget, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_budget_sel", test_dense_wide_budget_sel, contract_setup, contract_teardown },
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },
