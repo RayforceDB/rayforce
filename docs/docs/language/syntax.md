@@ -481,6 +481,12 @@ and shared dictionary paths retain copy-on-write isolation. Other operations
 retain their existing allocation behavior; named mutation does not promise
 that every operation or representation avoids allocation.
 
+A closure with a computed `alter` or `insert` target retains the enclosing
+bindings that the target could name, just as dynamic `eval` or `resolve`
+does. Constructing the target symbol at runtime does not redirect a captured
+local write into a same-named global. Captures remain values: amending one
+inside the closure does not change the enclosing function's binding.
+
 A separately defined function does not gain access to its caller's locals.
 Query source columns/aliases are not writable named targets, and a dotted
 mutation path must traverse dictionaries rather than table columns or methods.

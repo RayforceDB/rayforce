@@ -61,3 +61,38 @@ vg -- [50 60 9]
 
 (alter 'unknown_950 set 0 1) !- name
 (insert 'unknown_950 1) !- domain
+
+;; Nested closures capture computed mutator targets just like literal ones.
+;; None of these may clobber the same-named global; closure writes keep the
+;; enclosing value unchanged under copy-on-write.
+(set capv [50 60])
+((fn [] (let capv (til 3)) (let capf (fn [] (alter (as 'SYM "capv") set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (alter 'capv set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (count capv) (alter (as 'SYM "capv") set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (insert (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (insert 'capv 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (count capv) (insert (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+
+;; Capture selection also applies to interpreted closure creation and to
+;; a target passed through a captured variable or another nested function.
+((fn [] (let capv (til 3)) (let capf (eval (quote (fn [] (alter (as 'SYM "capv") set 0 9))))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (eval (quote (fn [] (insert (as 'SYM "capv") 9))))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let target 'capv) (let capf (fn [] (alter target set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] ((fn [] (insert (as 'SYM "capv") 9))))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+
+;; Computed dictionary paths retain the captured root, too.
+(set capstate (dict [v] (list [50 60])))
+((fn [] (let capstate (dict [v] (list (til 3)))) (let capf (fn [] (alter (as 'SYM "capstate.v") set 0 9))) (capf) capstate.v)) -- [0 1 2]
+capstate.v -- [50 60]
+((fn [] (let capstate (dict [v] (list (til 3)))) (let capf (fn [] (insert (as 'SYM "capstate.v") 9))) (capf) capstate.v)) -- [0 1 2]
+capstate.v -- [50 60]
