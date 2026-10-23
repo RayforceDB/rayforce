@@ -1,0 +1,92 @@
+[
+  {
+    "round": 0,
+    "version": "before",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 218.801\nrotating-symbols-ns 169.404\nread-control-ns 1.574\ndotted-control-ns 278.167\nchecksum=7000000\n",
+    "same-symbol-ns": 218.801,
+    "rotating-symbols-ns": 169.404,
+    "read-control-ns": 1.574,
+    "dotted-control-ns": 278.167
+  },
+  {
+    "round": 0,
+    "version": "after",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 18.126\nrotating-symbols-ns 18.160\nread-control-ns 1.594\ndotted-control-ns 64.269\nchecksum=7000000\n",
+    "same-symbol-ns": 18.126,
+    "rotating-symbols-ns": 18.16,
+    "read-control-ns": 1.594,
+    "dotted-control-ns": 64.269
+  },
+  {
+    "round": 1,
+    "version": "after",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 20.572\nrotating-symbols-ns 18.130\nread-control-ns 1.596\ndotted-control-ns 65.109\nchecksum=7000000\n",
+    "same-symbol-ns": 20.572,
+    "rotating-symbols-ns": 18.13,
+    "read-control-ns": 1.596,
+    "dotted-control-ns": 65.109
+  },
+  {
+    "round": 1,
+    "version": "before",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 225.420\nrotating-symbols-ns 170.536\nread-control-ns 1.611\ndotted-control-ns 284.237\nchecksum=7000000\n",
+    "same-symbol-ns": 225.42,
+    "rotating-symbols-ns": 170.536,
+    "read-control-ns": 1.611,
+    "dotted-control-ns": 284.237
+  },
+  {
+    "round": 2,
+    "version": "before",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 219.613\nrotating-symbols-ns 174.640\nread-control-ns 1.508\ndotted-control-ns 287.257\nchecksum=7000000\n",
+    "same-symbol-ns": 219.613,
+    "rotating-symbols-ns": 174.64,
+    "read-control-ns": 1.508,
+    "dotted-control-ns": 287.257
+  },
+  {
+    "round": 2,
+    "version": "after",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 24.651\nrotating-symbols-ns 18.575\nread-control-ns 1.502\ndotted-control-ns 65.479\nchecksum=7000000\n",
+    "same-symbol-ns": 24.651,
+    "rotating-symbols-ns": 18.575,
+    "read-control-ns": 1.502,
+    "dotted-control-ns": 65.479
+  },
+  {
+    "round": 3,
+    "version": "after",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 22.402\nrotating-symbols-ns 18.597\nread-control-ns 1.622\ndotted-control-ns 64.089\nchecksum=7000000\n",
+    "same-symbol-ns": 22.402,
+    "rotating-symbols-ns": 18.597,
+    "read-control-ns": 1.622,
+    "dotted-control-ns": 64.089
+  },
+  {
+    "round": 3,
+    "version": "before",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 240.902\nrotating-symbols-ns 168.516\nread-control-ns 1.599\ndotted-control-ns 277.287\nchecksum=7000000\n",
+    "same-symbol-ns": 240.902,
+    "rotating-symbols-ns": 168.516,
+    "read-control-ns": 1.599,
+    "dotted-control-ns": 277.287
+  },
+  {
+    "round": 4,
+    "version": "before",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 216.269\nrotating-symbols-ns 172.480\nread-control-ns 1.588\ndotted-control-ns 283.377\nchecksum=7000000\n",
+    "same-symbol-ns": 216.269,
+    "rotating-symbols-ns": 172.48,
+    "read-control-ns": 1.588,
+    "dotted-control-ns": 283.377
+  },
+  {
+    "round": 4,
+    "version": "after",
+    "stdout": "bindings=864 iterations=1000000\nsame-symbol-ns 18.273\nrotating-symbols-ns 18.274\nread-control-ns 1.620\ndotted-control-ns 65.189\nchecksum=7000000\n",
+    "same-symbol-ns": 18.273,
+    "rotating-symbols-ns": 18.274,
+    "read-control-ns": 1.62,
+    "dotted-control-ns": 65.189
+  }
+]

@@ -46,3 +46,27 @@
 (at (.idx.info A 'v) 'materialized) -- false
 (at (.idx.info A 'f) 'materialized) -- false
 (.sys.exec "rm -rf /tmp/rf_test_cscan") -- 0
+;; A computed key or a count distinct over a compressed column whose whole
+;; decode would not stay cached (past a quarter of the anon watermark, as
+;; every 4- and 8-byte column here is under -m 2M) reads it by range: in a
+;; child run under that watermark the by-dict minute key, the computed key
+;; beside a distinct output, the global count distinct and the grouped ones
+;; answer as over the plain copy, with u, et and r left unmaterialized (read
+;; in the query's own statement: the boundary drops a decode that size).
+;; Here, under the default watermark, they decode as before and answer the
+;; same.
+(.sys.exec "rm -rf /tmp/rf_test_cscan_r") -- 0
+(set i (til 140000))
+(set h (% (* i 2654435761) 1000003))
+(set T (table [u et r s] (list (+ (at [0N 0 0 0 0 0 0] (% i 7)) (% (+ (* h 7919) i) 9000)) (+ 2013.07.01D00:00:00.000000000 (* 1000000000 (% (* h 13) 86400))) (as 'I32 (sqrt (as 'F64 (% (* h h) 2500)))) (at (as 'SYMBOL (map (fn [k] (format "p%" k)) (til 3000))) (% (* (% (* h h) 1009) 13) 3000)))))
+(.db.splayed.set "/tmp/rf_test_cscan_r/c/" T "/tmp/rf_test_cscan_r/c.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_cscan_r/p/" T "/tmp/rf_test_cscan_r/p.sym")
+(.sys.exec "printf '%s\n' '(set C (.db.splayed.get \"/tmp/rf_test_cscan_r/c/\" \"/tmp/rf_test_cscan_r/c.sym\"))' '(set P (.db.splayed.get \"/tmp/rf_test_cscan_r/p/\" \"/tmp/rf_test_cscan_r/p.sym\"))' '(set nv (fn [v] (if (== (type v) (quote SYM)) (as (quote STR) v) v)))' '(set fp (fn [x] (if (== (type x) (quote TABLE)) (ser (xasc (table (cols x) (map (fn [c] (nv (at x c))) (cols x))) (cols x))) x)))' '(set eq (fn [a b] (if (== (count a) (count b)) (all (== a b)) false)))' '(set un (fn [c] (not (at (.idx.info C c) (quote materialized)))))' '(set chk (fn [f] (do (set a (fp (f C))) (set m (and (un (quote u)) (and (un (quote et)) (un (quote r))))) (and m (eq a (fp (f P)))))))' '(println (chk (fn [t] (select {from: t by: {u: u m: (minute et)} c: (count u)}))))' '(println (chk (fn [t] (select {from: t by: (hour et) d: (count (distinct u))}))))' '(println (chk (fn [t] (count (distinct (at t (quote u)))))))' '(println (chk (fn [t] (select {from: t by: r d: (count (distinct u))}))))' '(println (chk (fn [t] (select {from: t by: r c: (count u) d: (count (distinct u))}))))' '(println (chk (fn [t] (select {from: t by: s d: (count (distinct u)) where: (!= s \"p7\")}))))' > /tmp/rf_test_cscan_r/q.rfl") -- 0
+(.sys.exec "./rayforce -m 2M /tmp/rf_test_cscan_r/q.rfl </dev/null >/tmp/rf_test_cscan_r/q.out 2>&1; [ $(grep -c '^true$' /tmp/rf_test_cscan_r/q.out) -eq 6 ]") -- 0
+(set A (.db.splayed.get "/tmp/rf_test_cscan_r/c/" "/tmp/rf_test_cscan_r/c.sym"))
+(set B (.db.splayed.get "/tmp/rf_test_cscan_r/p/" "/tmp/rf_test_cscan_r/p.sym"))
+(at (select {from: A by: {u: u m: (minute et)} c: (count u) desc: c take: 5}) 'c) -- (at (select {from: B by: {u: u m: (minute et)} c: (count u) desc: c take: 5}) 'c)
+(count (distinct (at A 'u))) -- (count (distinct (at B 'u)))
+(at (select {from: A by: r d: (count (distinct u)) asc: r}) 'd) -- (at (select {from: B by: r d: (count (distinct u)) asc: r}) 'd)
+(at (select {from: A by: r c: (count u) d: (count (distinct u)) asc: r}) 'd) -- (at (select {from: B by: r c: (count u) d: (count (distinct u)) asc: r}) 'd)
+(.sys.exec "rm -rf /tmp/rf_test_cscan_r") -- 0

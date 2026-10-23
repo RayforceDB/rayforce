@@ -46,12 +46,6 @@ typedef struct {
     int64_t len;                    /* rows (parted: sum over segments) */
     bool    may_null;               /* HAS_NULLS, or directory null counts for generation 2 */
     bool    parted;                 /* a parted source (per-range attrs are authoritative) */
-    bool    stats_guard;            /* set by a consumer that sized memory from this source's
-                                     * directory statistics (before its pass reads it): every
-                                     * range read checks its values against their chunk's
-                                     * statistics (ray_enccol_check_dir), a widened read
-                                     * declines until its vector passed; `corrupt` on a
-                                     * value outside them */
     _Atomic(int64_t*) seg_off;      /* parted: segment row offsets (n_segs + 1), built on the
                                      * first range read, published once, owned (a by-value
                                      * copy would free it twice), freed on release */
@@ -140,9 +134,8 @@ ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
  * when it ends inside [start, start + n) and is not STR or GUID (SYM: of
  * the width in `attrs`): *got = its rows (a RAW vector: with the RAW
  * vectors after it inside the range, copied at once).  Else *got = 0 and nothing is
- * read: read the rows with ray_col_range or a cursor.  A guarded source
- * (stats_guard) always declines: its range reads check each vector.  dst
- * may hold a partial vector on an error.  NULL or an owned error. */
+ * read: read the rows with ray_col_range or a cursor.  dst may hold a
+ * partial vector on an error.  NULL or an owned error. */
 ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_scratch_t* sc,
                           uint8_t attrs, void* dst, int64_t* got);
 /* Test hook: ray_col_range_into's deliveries and the rows they held
@@ -159,9 +152,7 @@ ray_t* ray_table_col_src(ray_t* tbl, int64_t name_id, ray_col_src_t* out);
 
 /* The bound source's plain column (borrowed; valid while the source is
  * bound): the object itself for generation 0, the cached materialization
- * for generation 2, checked against its chunks' statistics under
- * stats_guard (ray_enccol_check_dir_all: `corrupt` naming the column).
- * NULL or an owned error. */
+ * for generation 2.  NULL or an owned error. */
 ray_t*  ray_col_src_plain(ray_col_src_t* s, ray_t** out);
 /* Literal translation into the source's SYM domain, without decoding:
  * the position of the bytes, -1 when absent. */
@@ -184,11 +175,8 @@ static inline bool ray_col_src_encoded(const ray_col_src_t* s) {
 
 /* The plain column a scan can read in place, without decoding: a plain
  * object (vector, slice, plain parted wrapper) itself, or a RAY_ENCCOL's
- * published materialization; NULL when reading it would decode.  Under
- * stats_guard a materialization is ready only once its values lie inside
- * their chunks' statistics (ray_enccol_check_dir_all); otherwise NULL, and
- * the range reads report `corrupt`.  Borrowed from the source; never
- * decodes. */
+ * published materialization; NULL when reading it would decode.
+ * Borrowed from the source; never decodes. */
 ray_t*  ray_col_src_ready(const ray_col_src_t* s);
 /* The base pointer (row 0) a scan reads the source at in place: the ready
  * plain vector's data; NULL when it must be read by range (not ready, or a
@@ -201,15 +189,11 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s);
  * column; false otherwise (plain, parted, slice). */
 bool ray_col_src_chunk_stat(const ray_col_src_t* s, int64_t c, struct ray_enc_chunk_stat_s* out);
 /* Vector v's statistics (rows [v * RAY_ENC_VEC, + RAY_ENC_VEC), the
- * vector's descriptor, validated with its chunk once per column and nested
- * inside the chunk's statistics) when the source is a single-file
- * generation-2 column and the vector carries them: min / max are
- * logical_T values as ray_enc_chunk_stat_t's, n_nulls the vector's null
- * count.  False otherwise: not such a source, v outside it, statistics
- * absent (every row null, or a type without them), or descriptors that
- * fail validation (the read of the vector then reports them).  For
- * answer-only decisions (skip or fill a vector); nothing may be sized from
- * them without stats_guard. */
+ * vector's descriptor, nested inside the chunk's statistics) when the
+ * source is a single-file generation-2 column and the vector carries them:
+ * min / max are logical_T values as ray_enc_chunk_stat_t's, n_nulls the
+ * vector's null count.  False otherwise: not such a source, v outside it,
+ * or statistics absent (every row null, or a type without them). */
 bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64_t* max, uint32_t* n_nulls);
 /* Vector v of a single-file generation-2 source (not synthetic, not
  * materialized) as a view: ray_enccol_vview's 1 / 0 / -1.  0 for any
@@ -220,9 +204,7 @@ int  ray_col_src_vview(const ray_col_src_t* s, int64_t v, struct ray_enc_vview_s
  * called for rows [lo, hi) of every RAY_ENC_CHUNK-row chunk of every
  * segment, with the chunk's directory statistics when the segment is a
  * single-file generation-2 column, else NULL (a plain segment).  False
- * when the source is not parted, or with an owned *err (OOM).  A consumer
- * that sizes memory from these statistics sets stats_guard: the range
- * reads then check every segment's values against its own chunks'. */
+ * when the source is not parted, or with an owned *err (OOM). */
 typedef void (*ray_col_chunk_fn)(void* ctx, int64_t lo, int64_t hi, const struct ray_enc_chunk_stat_s* st);
 bool ray_col_src_parted_chunks(ray_col_src_t* s, void* ctx, ray_col_chunk_fn fn, ray_t** err);
 /* The segments of a parted source: *n of them in row order (borrowed
@@ -235,7 +217,7 @@ bool ray_col_src_parted_segs(ray_col_src_t* s, int64_t* n, ray_t*** segs, const 
  * DICT over FOR_BP, CONST or RLE, without nulls; a parted row is its
  * segment's): 1
  * served into *out (the value widened to int64), 0 declined (read the row
- * through a cursor, which decodes or reports the vector; always for a
+ * through a cursor, which decodes the vector; always for a
  * plain or materialized source or segment), -1 an owned error in *err.
  * For samplers: a sampled row costs no vector decode.  A parted source
  * publishes its segment offsets on first use (so the source is not const). */
@@ -260,23 +242,18 @@ bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* h
  * (segment-local vectors), neither materialized, whose descriptor says
  * CONST or RLE (no other codec builds a view) and which ray_enccol_vview
  * vouches for, without a bitmap of nulls (SYM nulls are in-band ids, run
- * values like the others).  Under stats_guard the run values, which are
- * the vector's values, are checked as a range read checks them: their
- * [min, max] inside the chunk's directory statistics
- * (ray_enccol_check_dir_range), `corrupt` naming the column otherwise.
- * *lo / *hi are set in every case to rows of the source holding row and
- * read alike: the vector, or a plain, materialized or stand-in segment
- * (the source) whole.  1: the view of the vector [*lo, *hi); 0 declined
- * (read the rows through a cursor, which decodes or reports the vector);
- * -1 an owned *err (the descriptors', the payload's or the guard's). */
+ * values like the others).  *lo / *hi are set in every case to rows of
+ * the source holding row and read alike: the vector, or a plain,
+ * materialized or stand-in segment (the source) whole.  1: the view of the
+ * vector [*lo, *hi); 0 declined (read the rows through a cursor, which
+ * decodes the vector); -1 an owned *err (a side entry's oom). */
 int  ray_col_src_runview(ray_col_src_t* s, int64_t row, struct ray_enc_vview_s* out, int64_t* lo, int64_t* hi, ray_t** err);
 /* Open decision D2 (ruled per codec at the measured crossovers of a
  * batched point read against one decode, re-measured in Task 10b): a
  * vector's requested rows are point-read when there are at most
  * RAY_ENC_VEC / 32 of them in a FOR_BP vector, RAY_ENC_VEC / 16 in an RLE,
- * CONST or DICT one or any vector with a null bitmap, RAY_ENC_VEC / 128 in
- * a RAW one whose chunk is not yet validated; any other codec
- * declines (ray_enccol_points_i64 decides; enccol.c records the
+ * CONST or DICT one or any vector with a null bitmap (a RAW one without
+ * nulls is read in place); any other codec declines (ray_enccol_points_i64 decides; enccol.c records the
  * measurements).  RAY_COL_POINT_ROWS is the largest of them, the most
  * rows a caller hands one call (RAY_ENC_VEC = RAY_MORSEL_ELEMS values).
  * Structural ratios, not knobs. */

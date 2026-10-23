@@ -17,6 +17,7 @@
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "table/sym.h"
+#include "store/enccol.h"   /* ray_enccol_of: decoded bytes of a generation-2 column */
 #include <math.h>
 #include <stdlib.h>
 
@@ -32,6 +33,9 @@ static void contract_setup(void) {
 static void contract_teardown(void) {
     ray_agg_engine_v2 = true;
     ray_agg_first_n = true;
+    ray_agg_tablestack = true;
+    ray_agg_radix_wave_bytes = 0;
+    ray_agg_radix_spill = 0;
     ray_runtime_destroy(contract_runtime);
     if (ray_pool_total_workers(ray_pool_get()) != contract_cores) {
         ray_pool_destroy();
@@ -650,6 +654,346 @@ static test_result_t test_dense_symbol_output(void) {
         }
         ray_release(tbl);
     }
+    PASS();
+}
+
+/* One integer key whose range passes the row count (600k rows, a 1.2M-slot
+ * range) runs as the shared slab when the slab fits the room under the memory
+ * watermark, and takes the radix route it took before when the watermark
+ * leaves no room.  Both answer alike: each group's count and sum equal the
+ * oracle's; a count-only slab holds u32 counters and a count + sum slab the
+ * 8-byte states; and under an armed `desc|asc: count take: 10` filter exactly
+ * the oracle's ten groups come out (ties at the boundary cut by first row),
+ * the dense emit allocating those ten and no entry per group. */
+static test_result_t test_dense_wide_range(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    const int64_t n = 600000, groups = 150000, step = 8;
+    ray_t* key = ray_vec_new(RAY_I64, n);
+    ray_t* val = ray_vec_new(RAY_I64, n);
+    key->len = val->len = n;
+    static int64_t counts[150000], sums[150000], firstrow[150000];
+    static bool want[2][150000];
+    memset(counts, 0, sizeof counts); memset(sums, 0, sizeof sums); memset(want, 0, sizeof want);
+    for (int64_t g = 0; g < groups; g++) firstrow[g] = INT64_MAX;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t g = i % 4 == 0 ? (i / 4) % 1000 : (i * 31) % groups;
+        ((int64_t*)ray_data(key))[i] = g * step + 5;
+        ((int64_t*)ray_data(val))[i] = i % 97;
+        counts[g]++; sums[g] += i % 97;
+        if (firstrow[g] == INT64_MAX) firstrow[g] = i;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), val);
+    ray_release(key); ray_release(val);
+    int64_t present = 0;
+    for (int64_t g = 0; g < groups; g++) present += counts[g] > 0;
+    /* the ten groups a top-10 cut answers: by count, then by first row */
+    for (int dir = 0; dir < 2; dir++)         /* 0: desc, 1: asc */
+        for (int pick = 0; pick < 10; pick++) {
+            int64_t best = -1;
+            for (int64_t g = 0; g < groups; g++) {
+                if (!counts[g] || want[dir][g]) continue;
+                if (best < 0 || (dir ? counts[g] < counts[best] : counts[g] > counts[best]) ||
+                    (counts[g] == counts[best] && firstrow[g] < firstrow[best])) best = g;
+            }
+            want[dir][best] = true;
+        }
+    /* the boundary of the desc cut is a tie of several groups */
+    int64_t tied = 0, edge = 0;
+    for (int64_t g = 0; g < groups; g++) if (want[0][g] && (!edge || counts[g] < edge)) edge = counts[g];
+    for (int64_t g = 0; g < groups; g++) tied += counts[g] == edge;
+    TEST_ASSERT_TRUE(tied > 1);
+    const int64_t wm = ray_heap_anon_watermark();
+    for (int room = 0; room < 4; room++) {
+        /* 0 count, 1 count+sum, 2 count desc take 10, 3 count asc take 10,
+         * 4 count+sum desc take 10 */
+        for (int mode = 0; mode < 5; mode++) {
+            ray_graph_t* graph = ray_graph_new(tbl);
+            ray_op_t* keys[] = {ray_scan(graph, "k")};
+            ray_op_t* v = ray_scan(graph, "v");
+            ray_op_t* inputs[] = {v, v};
+            uint16_t ops[] = {OP_COUNT, OP_SUM};
+            ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, mode == 1 || mode == 4 ? 2 : 1);
+            ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+            if (mode >= 2) {
+                ray_group_emit_filter_t f = {0};
+                f.enabled = 1; f.agg_index = 0; f.top_count_take = 10; f.desc = mode != 3;
+                ray_group_emit_filter_set(f);
+            }
+            /* little room: the watermark sits a megabyte (room 1: under the range
+             * cap), 6 MB (room 2: past the cap, short of the u32 slab and a third
+             * more) or 8 MB (room 3: the u32 slab fits, the 8-byte states do not)
+             * past what is committed and not reusable by this heap */
+            if (room) {
+                int64_t tight = ray_heap_anon_committed() - ray_heap_anon_reusable()
+                    + (room == 1 ? INT64_C(1) << 20 : room == 2 ? INT64_C(6) << 20 : INT64_C(8) << 20);
+                ray_heap_set_anon_watermark(tight > 0 ? tight : 1);
+            }
+            agg_route_reset();
+            ray_t* out = ray_execute(graph, group);
+            agg_route_stats_t st = agg_route_stats();
+            ray_heap_set_anon_watermark(wm);
+            ray_group_emit_filter_set(prev);
+            TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+            TEST_ASSERT_EQ_I(st.radix_spill_bytes, 0);
+            bool dense = false;
+            bool count_only = mode == 0 || mode == 2 || mode == 3;
+#if ATOMIC_LLONG_LOCK_FREE == 2
+            if ((!room || (room == 3 && count_only)) && wm > 0) {
+                dense = true;
+                TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 1);
+                TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_SHARED);
+                TEST_ASSERT_EQ_I(st.dense_local_slots, (groups - 1) * step + 1);
+                /* count alone: u32 counters; count + sum: the 8-byte states */
+                TEST_ASSERT_EQ_I(st.dense_count32, count_only);
+                /* under a top-N filter the emit allocates the ten groups only */
+                TEST_ASSERT_EQ_I(st.dense_emit_slots, mode >= 2 ? 10 : present);
+            }
+            if (room && !dense) {
+                TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 0);
+                TEST_ASSERT_FALSE(st.dense_plan_available);
+            }
+#endif
+            ray_t* ko = ray_table_get_col_idx(out, 0);
+            ray_t* co = ray_table_get_col_idx(out, 1);
+            ray_t* so = mode == 1 || mode == 4 ? ray_table_get_col_idx(out, 2) : NULL;
+            TEST_ASSERT_EQ_I(ko->len, mode >= 2 ? 10 : present);
+            int64_t prev_first = -1;
+            for (int64_t r = 0; r < ko->len; r++) {
+                int64_t k = ((int64_t*)ray_data(ko))[r];
+                TEST_ASSERT_EQ_I((k - 5) % step, 0);
+                int64_t g = (k - 5) / step;
+                TEST_ASSERT_TRUE(g >= 0 && g < groups);
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(co))[r], counts[g]);
+                if (so) TEST_ASSERT_EQ_I(((int64_t*)ray_data(so))[r], sums[g]);
+                if (mode >= 2) {
+                    TEST_ASSERT_TRUE(want[mode == 3][g]);
+                    /* equal counts keep first-row order, as the radix route emits them */
+                    if (dense) { TEST_ASSERT_TRUE(firstrow[g] > prev_first); prev_first = firstrow[g]; }
+                }
+            }
+            ray_release(out); ray_graph_free(graph);
+        }
+    }
+    /* Four groups spread over the same wide range: the sample sees few
+     * distinct keys, so the range is not worth a slab and the key keeps its
+     * sparse-key route. */
+    {
+        ray_t* sk = ray_vec_new(RAY_I64, n);
+        sk->len = n;
+        for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(sk))[i] = (i % 4) * 1000000;
+        ray_t* st = ray_table_new(1);
+        st = ray_table_add_col(st, ray_sym_intern("k", 1), sk);
+        ray_release(sk);
+        ray_graph_t* graph = ray_graph_new(st);
+        ray_op_t* keys[] = {ray_scan(graph, "k")};
+        uint16_t ops[] = {OP_COUNT};
+        ray_op_t* inputs[] = {ray_scan(graph, "k")};
+        ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, 1);
+        agg_route_reset();
+        ray_t* out = ray_execute(graph, group);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_DENSE], 0);
+        TEST_ASSERT_EQ_I(ray_table_nrows(out), 4);
+        ray_release(out); ray_graph_free(graph); ray_release(st);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
+/* A key whose range is within the row count but whose per-worker slabs do not
+ * fit the dense budget (a quarter of a low watermark) is a wide plan too: the
+ * shared u32 slab is considered before the per-worker budget check turns the
+ * grouping to the radix route.  With less room than that slab it still takes
+ * the radix route; the answers are the same. */
+static test_result_t test_dense_wide_budget(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    const int64_t n = 600000, range = 590000;
+    ray_t* key = ray_vec_new(RAY_I64, n);
+    ray_t* val = ray_vec_new(RAY_I64, n);
+    key->len = val->len = n;
+    static int64_t counts[590000];
+    memset(counts, 0, sizeof counts);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t g = (i * 7919) % range;
+        ((int64_t*)ray_data(key))[i] = g;
+        ((int64_t*)ray_data(val))[i] = i;
+        counts[g]++;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), val);
+    ray_release(key); ray_release(val);
+    const int64_t wm = ray_heap_anon_watermark();
+    for (int level = 0; level < 2; level++) {
+        ray_graph_t* graph = ray_graph_new(tbl);
+        ray_op_t* keys[] = {ray_scan(graph, "k")};
+        ray_op_t* v = ray_scan(graph, "v");
+        ray_op_t* inputs[32];
+        uint16_t ops[32];
+        for (int a = 0; a < 32; a++) { inputs[a] = v; ops[a] = OP_COUNT; }
+        ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, 32);
+        /* level 0: 20 MB of room, a quarter of the watermark under the 156 MB
+         * the per-worker slabs need; level 1: 1 MB of room, under the slab */
+        int64_t tight = ray_heap_anon_committed() - ray_heap_anon_reusable()
+            + (level ? INT64_C(1) << 20 : INT64_C(20) << 20);
+        TEST_ASSERT_TRUE(tight / 4 < range * (32 * 8 + 9));
+        ray_heap_set_anon_watermark(tight > 0 ? tight : 1);
+        agg_route_reset();
+        ray_t* out = ray_execute(graph, group);
+        agg_route_stats_t st = agg_route_stats();
+        ray_heap_set_anon_watermark(wm);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+#if ATOMIC_LLONG_LOCK_FREE == 2
+        if (!level) {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 1);
+            TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_SHARED);
+            TEST_ASSERT_TRUE(st.dense_count32);
+            TEST_ASSERT_FALSE(st.dense_worker_budget);
+        } else {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 0);
+        }
+#endif
+        ray_t* ko = ray_table_get_col_idx(out, 0);
+        TEST_ASSERT_EQ_I(ko->len, range);
+        for (int a = 1; a <= 32; a++) {
+            ray_t* co = ray_table_get_col_idx(out, a);
+            for (int64_t r = 0; r < ko->len; r += 97)
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(co))[r], counts[((int64_t*)ray_data(ko))[r]]);
+        }
+        ray_release(out); ray_graph_free(graph);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
+/* A key whose slab alone fits the dense budget (a quarter of a low watermark)
+ * but whose per-worker slabs and partitioned plan do not: the planner keeps
+ * it off the wide plan, and no per-worker dense plan fits, so the one shared
+ * u32 slab runs it instead of the radix scatter.  The slab is sized from the
+ * room this heap has: 0.9 of a quarter of the watermark, over twice as many
+ * rows, every group counted twice. */
+static test_result_t test_dense_wide_after_worker_budget(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    const int64_t wm = ray_heap_anon_watermark();
+    int64_t base = ray_heap_anon_committed() - ray_heap_anon_reusable();
+    if (base < 0) base = 0;
+    const int64_t room = INT64_C(64) << 20;
+    int64_t range = (int64_t)(0.9 * (double)((base + room) / 4) / (8 + 8 + 1)) | 1;
+    while (range % 7919 == 0) range += 2;
+    const int64_t n = 2 * range;
+    ray_t* key = ray_vec_new(RAY_I64, n);
+    key->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(key))[i] = (i * 7919) % range;
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), key);
+    ray_release(key);
+    for (int level = 0; level < 2; level++) {
+        ray_graph_t* graph = ray_graph_new(tbl);
+        ray_op_t* keys[] = {ray_scan(graph, "k")};
+        uint16_t ops[] = {OP_COUNT};
+        ray_op_t* inputs[] = {ray_scan(graph, "k")};
+        ray_op_t* group = ray_group(graph, keys, 1, ops, inputs, 1);
+        /* level 0: the watermark 64 MB past what this heap holds (the table
+         * included); level 1: 1 MB past it, under the u32 slab */
+        int64_t held = ray_heap_anon_committed() - ray_heap_anon_reusable();
+        int64_t tight = (held > 0 ? held : 0) + (level ? INT64_C(1) << 20 : room);
+        if (!level) TEST_ASSERT_TRUE(range * (8 + 8 + 1) <= tight / 4);   /* the slab alone fits */
+        ray_heap_set_anon_watermark(tight);
+        agg_route_reset();
+        ray_t* out = ray_execute(graph, group);
+        agg_route_stats_t st = agg_route_stats();
+        ray_heap_set_anon_watermark(wm);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+#if ATOMIC_LLONG_LOCK_FREE == 2
+        if (!level) {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 1);
+            TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_SHARED);
+            TEST_ASSERT_TRUE(st.dense_count32);
+            TEST_ASSERT_FALSE(st.dense_worker_budget);
+            TEST_ASSERT_EQ_I(st.radix_spill_bytes, 0);
+        } else {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 0);
+        }
+#endif
+        TEST_ASSERT_EQ_I(ray_table_nrows(out), range);
+        ray_t* ko = ray_table_get_col_idx(out, 0);
+        ray_t* co = ray_table_get_col_idx(out, 1);
+        bool* seen = ray_calloc_raw((size_t)range);
+        TEST_ASSERT_NOT_NULL(seen);
+        for (int64_t r = 0; r < ko->len; r++) {
+            int64_t k = ((int64_t*)ray_data(ko))[r];
+            TEST_ASSERT_TRUE(k >= 0 && k < range && !seen[k]);
+            seen[k] = true;
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(co))[r], 2);
+        }
+        ray_free_raw(seen);
+        ray_release(out); ray_graph_free(graph);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
+/* The same ordering under a where filter: the plan within the row count whose
+ * per-worker slabs do not fit is promoted to the one shared slab, which
+ * counts the selected rows only. */
+static test_result_t test_dense_wide_budget_sel(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    const int64_t n = 600000, range = 590000, cut = 1000;
+    static int64_t counts[590000];
+    memset(counts, 0, sizeof counts);
+    int64_t kept = 0;
+    for (int64_t i = cut + 1; i < n; i++) { counts[(i * 7919) % range]++; kept++; }
+    ray_t* r = ray_eval_str("(set wbs_i (til 600000))"
+                            "(set wbs_t (table [k v] (list (% (* wbs_i 7919) 590000) wbs_i)))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    char q[2048];
+    int len = snprintf(q, sizeof q, "(select {from: wbs_t by: k");
+    for (int a = 0; a < 32; a++) len += snprintf(q + len, sizeof q - len, " c%d: (count v)", a);
+    snprintf(q + len, sizeof q - len, " where: (> v %lld)})", (long long)cut);
+    const int64_t wm = ray_heap_anon_watermark();
+    for (int level = 0; level < 2; level++) {
+        int64_t tight = ray_heap_anon_committed() - ray_heap_anon_reusable()
+            + (level ? INT64_C(1) << 20 : INT64_C(20) << 20);
+        TEST_ASSERT_TRUE(tight / 4 < range * (32 * 8 + 9));
+        ray_heap_set_anon_watermark(tight > 0 ? tight : 1);
+        agg_route_reset();
+        ray_t* out = ray_eval_str(q);
+        agg_route_stats_t st = agg_route_stats();
+        ray_heap_set_anon_watermark(wm);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+#if ATOMIC_LLONG_LOCK_FREE == 2
+        if (!level) {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 1);
+            TEST_ASSERT_EQ_I(st.dense_strategy, AGG_DENSE_SHARED);
+            TEST_ASSERT_TRUE(st.dense_count32);
+            TEST_ASSERT_FALSE(st.dense_worker_budget);
+        } else {
+            TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_DENSE], 0);
+        }
+#endif
+        ray_t* ko = ray_table_get_col_idx(out, 0);
+        int64_t present = 0, total = 0;
+        for (int64_t g = 0; g < range; g++) present += counts[g] > 0;
+        TEST_ASSERT_EQ_I(ko->len, present);
+        for (int a = 1; a <= 32; a += 31) {
+            ray_t* co = ray_table_get_col_idx(out, a);
+            for (int64_t i = 0; i < ko->len; i++) {
+                int64_t k = ((int64_t*)ray_data(ko))[i];
+                TEST_ASSERT_EQ_I(((int64_t*)ray_data(co))[i], counts[k]);
+                if (a == 1) total += counts[k];
+            }
+        }
+        TEST_ASSERT_EQ_I(total, kept);
+        ray_release(out);
+    }
+    r = ray_eval_str("(set wbs_i 0) (set wbs_t 0)");
+    if (r) ray_release(r);
     PASS();
 }
 
@@ -2203,6 +2547,513 @@ static test_result_t test_first_n_take(void) {
     PASS();
 }
 
+/* A per-process directory name for the stores the wave test writes. */
+#if !defined(_WIN32)
+#include <unistd.h>
+#include <dirent.h>
+static long long wave_pid(void) { return (long long)getpid(); }
+#else
+static long long wave_pid(void) { return 0; }
+#endif
+#if defined(__linux__)
+/* Descriptors this process holds (the directory read itself is one, always). */
+static int wave_open_fds(void) {
+    int n = 0;
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    while (readdir(d)) n++;
+    closedir(d);
+    return n;
+}
+#endif
+
+/* Radix wave knobs of one run: payload bytes per wave (0 = from the heap,
+ * < 0 = the unreduced one-pass oracle) and how later waves are fed (0 = by
+ * bytes moved, 1 = re-scan, 2 = spill file). */
+typedef struct { int64_t bytes; int spill; } wave_knob_t;
+
+/* Run `q` under `knob` and return its result and the route counters of that
+ * run; the knobs go back to their defaults. */
+static ray_t* wave_run(const char* q, wave_knob_t knob, agg_route_stats_t* st) {
+    ray_agg_radix_wave_bytes = knob.bytes;
+    ray_agg_radix_spill = knob.spill;
+    agg_route_reset();
+    ray_t* r = ray_eval_str(q);
+    *st = agg_route_stats();
+    ray_agg_radix_wave_bytes = 0;
+    ray_agg_radix_spill = 0;
+    return r;
+}
+
+/* The heap's own watermark setting: an explicit one reads back the same
+ * from both accessors; the default (0) leaves the budget at the RAM limit. */
+static int64_t wave_watermark_setting(void) {
+    int64_t wm = ray_heap_anon_watermark();
+    return ray_heap_mem_budget() == wm ? wm : 0;
+}
+
+/* The group node alone under an armed `desc|asc: count take: N` filter: its
+ * output is the kept superset (every group beyond the threshold plus N tied
+ * ones, in first-row order) that the select's sort+take then cuts. */
+static ray_t* wave_group_kept(ray_t* tbl, wave_knob_t knob, uint8_t desc, int64_t take,
+                              agg_route_stats_t* st) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_op_t* a = ray_scan(g, "a");
+    uint16_t ops[] = { OP_COUNT };
+    ray_op_t* ins[] = { a };
+    ray_op_t* keys[] = { a };
+    ray_op_t* grp = ray_group(g, keys, 1, ops, ins, 1);
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t f = {0};
+    f.enabled = 1;
+    f.agg_index = 0;
+    f.top_count_take = take;
+    f.desc = desc;
+    ray_group_emit_filter_set(f);
+    ray_agg_radix_wave_bytes = knob.bytes;
+    ray_agg_radix_spill = knob.spill;
+    agg_route_reset();
+    ray_t* res = grp ? ray_execute(g, grp) : NULL;
+    *st = agg_route_stats();
+    ray_agg_radix_wave_bytes = 0;
+    ray_agg_radix_spill = 0;
+    ray_group_emit_filter_set(prev);
+    ray_graph_free(g);
+    return res;
+}
+
+/* Top-N radix groupings (`desc:|asc: AGG take: N`) reduce every finished
+ * partition to its 2N best groups, and under memory pressure scatter the
+ * payload in waves of partitions.  Neither may change a byte of the answer:
+ * each shape is compared, cell by cell and in row order, with the one-pass
+ * unreduced radix (knob < 0), with the reduction alone (default knob, one
+ * wave on this box), with forced waves, and with one partition per wave.
+ * Counts of 1 and 2 put ~60k groups on the take boundary, so the tie cut
+ * (smaller first row first) decides most emitted rows. */
+static test_result_t test_radix_topn_waves(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    agg_test_no_wide_dense(true);   /* the keys are a wide sparse range: keep them on the radix route */
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_agg_radix_waves_%lld", wave_pid());
+    ray_t* setup = ray_eval_str(
+        "(set wv_i (til 250000)) "
+        "(set wv_a (% (* wv_i 7919) 190000)) "
+        "(set wv_t (table [i a b v w s] (list wv_i wv_a (as 'I32 (% wv_a 1000)) "
+        "(as 'I16 (% wv_i 2)) (as 'I16 (% (* wv_i 13) 1900)) "
+        "(as 'SYM (as 'STR (% (* wv_i 31) 70000)))))) "
+        /* nulls: in both keys (one null-key group of ~2.6k rows) and in w */
+        "(set wv_n (update {from: wv_t a: 0Nl b: 0Ni where: (== (% i 97) 0)})) "
+        "(set wv_n (update {from: wv_n w: 0Nh where: (== (% i 89) 0)})) "
+        /* a few groups over a sparse key: most partitions stay empty */
+        "(set wv_e (table [a v] (list (* (% wv_i 40) 1000000007) (% wv_i 7)))) "
+        /* just over the parallel threshold: 512 partitions */
+        "(set wv_m (take wv_t 70000))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    /* a splayed copy (file-domain SYM column) and a two-partition parted one */
+    char store_src[1024];
+    snprintf(store_src, sizeof store_src,
+        "(.db.splayed.set \"%s/sp/\" wv_t) "
+        "(set wv_sp (.db.splayed.get \"%s/sp/\")) "
+        "(.db.splayed.set \"%s/pt/1/t/\" (take wv_t 125000)) "
+        "(.db.splayed.set \"%s/pt/2/t/\" (take wv_t -125000)) "
+        "(set wv_pt (.db.parted.get \"%s/pt/\" 't))",
+        dir, dir, dir, dir, dir);
+    setup = ray_eval_str(store_src);
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    ray_agg_tablestack = false;   /* the empty-partition shape is low-cardinality */
+    /* reduced: the emit filter is armed and the partitions shrink (an avg
+     * ordering arms no filter: the full result is sorted and cut, as before;
+     * forty groups never fill a partition past 2N) */
+    enum { FULL, NATIVE, REDUCED };
+    static const struct { const char* q; bool radix; int mode; int64_t rows; } shapes[] = {
+        { "(select {from:wv_t by:[a b] c:(count b) sr:(sum v) ar:(avg w) desc:c take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_t by:[a b] c:(count b) asc:c take:7})", true, REDUCED, 7 },
+        { "(select {from:wv_t by:[a b] sr:(sum v) c:(count b) desc:sr take:25})", true, REDUCED, 25 },
+        { "(select {from:wv_t by:[a b] ar:(avg w) c:(count b) desc:ar take:10})", true, FULL, 10 },
+        { "(select {from:wv_t by:[a b] mx:(max w) asc:mx take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_t by:[a b] c:(count b) sr:(sum v) where:(< w 1500) desc:c take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_n by:[a b] c:(count b) sr:(sum v) ar:(avg w) desc:c take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_n by:[a b] mn:(min w) c:(count b) asc:mn take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_t by:[a s] c:(count a) desc:c take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_sp by:[a s] c:(count a) sr:(sum v) desc:c take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_sp by:{s: s a: a} c:(count a) desc:c take:10})", true, REDUCED, 10 },
+        { "(select {from:wv_e by:a c:(count v) sv:(sum v) desc:sv take:3})", true, NATIVE, 3 },
+        { "(select {from:wv_m by:[a b] c:(count b) sr:(sum v) desc:c take:10})", true, REDUCED, 10 },
+        /* parted: too many groups per partition for the per-partition
+         * merge, so the concatenated rows group on the radix route */
+        { "(select {from:wv_pt by:[a b] c:(count b) sr:(sum v) ar:(avg w) desc:c take:10})", true, REDUCED, 10 },
+    };
+    const wave_knob_t oracle = { -1, 0 };
+    const wave_knob_t knobs[] = { { 0, 0 }, { (int64_t)1 << 40, 0 }, { 1500000, 1 }, { 1500000, 2 } };
+    for (size_t c = 0; c < sizeof(shapes) / sizeof(shapes[0]); c++) {
+        agg_route_stats_t base_st;
+        ray_t* base = wave_run(shapes[c].q, oracle, &base_st);
+        TEST_ASSERT_NOT_NULL(base); TEST_ASSERT_FALSE(RAY_IS_ERR(base));
+        TEST_ASSERT_FMT(ray_table_nrows(base) == shapes[c].rows, "case %zu rows", c);
+        TEST_ASSERT_FMT(base_st.radix_compacted == 0 && base_st.radix_waves <= 1,
+                        "case %zu oracle reduced", c);
+        if (shapes[c].radix)
+            TEST_ASSERT_FMT(base_st.routes[AGG_ROUTE_V2_RADIX] == 1, "case %zu not radix", c);
+        if (c == 13) TEST_ASSERT_EQ_I(base_st.routes[AGG_ROUTE_PARTED], 1);
+        for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) {
+            agg_route_stats_t st;
+            ray_t* r = wave_run(shapes[c].q, knobs[k], &st);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(first_n_same_table(base, r), "case %zu knob %zu differs", c, k);
+            /* the group emit itself keeps the same superset: every group
+             * beyond the threshold and N tied ones */
+            TEST_ASSERT_FMT(st.topn_kept == base_st.topn_kept, "case %zu knob %zu kept %lld, oracle %lld",
+                            c, k, (long long)st.topn_kept, (long long)base_st.topn_kept);
+            for (int64_t col = 0; col < ray_table_ncols(r); col++)
+                TEST_ASSERT_FMT((ray_table_get_col_idx(r, col)->attrs & RAY_ATTR_HAS_NULLS) ==
+                                (ray_table_get_col_idx(base, col)->attrs & RAY_ATTR_HAS_NULLS),
+                                "case %zu knob %zu column %lld nulls flag", c, k, (long long)col);
+            if (shapes[c].radix)
+                TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_RADIX] == 1, "case %zu knob %zu route", c, k);
+            TEST_ASSERT_FMT(st.topn_native == (shapes[c].mode != FULL),
+                            "case %zu knob %zu native %d", c, k, (int)st.topn_native);
+            if (shapes[c].mode == FULL) {
+                TEST_ASSERT_FMT(st.radix_compacted == 0 && st.radix_waves <= 1,
+                                "case %zu knob %zu reduced an unfiltered run", c, k);
+            } else {
+                /* the waves follow the knob: one at the default (this box
+                 * has the room) and past any payload, several below it */
+                if (k <= 1) TEST_ASSERT_FMT(st.radix_waves == 1, "case %zu knob %zu waves %u", c, k, st.radix_waves);
+                else TEST_ASSERT_FMT(st.radix_waves > 1, "case %zu knob %zu waves %u", c, k, st.radix_waves);
+                if (shapes[c].mode == REDUCED)
+                    TEST_ASSERT_FMT(st.radix_compacted > 0, "case %zu knob %zu not reduced", c, k);
+                else
+                    TEST_ASSERT_EQ_I(st.radix_compacted, 0);
+                /* the forced file holds every later wave's records */
+                TEST_ASSERT_FMT((st.radix_spill_bytes > 0) == (knobs[k].spill == 2),
+                                "case %zu knob %zu spilled %llu", c, k,
+                                (unsigned long long)st.radix_spill_bytes);
+            }
+            ray_release(r);
+        }
+        ray_release(base);
+    }
+    ray_agg_tablestack = true;
+    /* one partition per wave: as many waves as partitions, same answer */
+    {
+        agg_route_stats_t st;
+        ray_t* base = wave_run(shapes[12].q, oracle, &st);
+        ray_t* r = wave_run(shapes[12].q, (wave_knob_t){ 1, 1 }, &st);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(st.radix_waves, 512);
+        TEST_ASSERT_TRUE(first_n_same_table(base, r));
+        ray_release(r); ray_release(base);
+    }
+    /* The production plan (default knobs) under real watermarks.  Shape 0
+     * scatters 250k records of 32 bytes: 8 MB of payload.  Below the
+     * committed memory the plan still cuts at most 64 waves; with 12 MB of
+     * room one wave holds the whole payload (the in-flight tables and the
+     * candidates need about 1 MB, not half the room); with 5 MB it splits.
+     * In-memory input never spills; the splayed copy's file-backed columns
+     * make the spill file move fewer bytes than 64 re-scans. */
+    {
+        int64_t saved = wave_watermark_setting();
+        /* kb > 0 fixes the wave size (the room then only bounds the spill
+         * buffers: at most an eighth of it); sp is the spill knob. */
+        static const struct { int q; int64_t room; uint32_t lo, hi; bool spill; int64_t kb; int sp; } plans[] = {
+            { 0, -1, 2, 64, false, 0, 0 },
+            { 0, 12 << 20, 1, 1, false, 0, 0 },
+            { 0, 5 << 20, 2, 8, false, 0, 0 },
+            { 0, 8200000, 2, 8, false, 0, 0 },
+            /* file-backed, past the watermark: no room for buffers, re-scan */
+            { 9, -1, 2, 64, false, 0, 0 },
+            { 9, 6 << 20, 2, 2, false, 0, 0 },
+            { 9, 5000000, 2, 2, false, 0, 0 },
+            /* the cost rule: many waves spill, few re-scan */
+            { 9, 64 << 20, 5, 64, true, 300000, 0 },
+            { 9, 64 << 20, 2, 4, false, 3000000, 0 },
+            /* a forced spill whose buffers (>= 64 KB per worker and wave)
+             * do not fit an eighth of a 512 KB room is refused: re-scan */
+            { 9, 512 << 10, 5, 64, false, 300000, 2 },
+        };
+        for (size_t i = 0; i < sizeof(plans) / sizeof(plans[0]); i++) {
+            agg_route_stats_t bst, st;
+            ray_t* base = wave_run(shapes[plans[i].q].q, oracle, &bst);
+            TEST_ASSERT_NOT_NULL(base); TEST_ASSERT_FALSE(RAY_IS_ERR(base));
+            ray_heap_set_anon_watermark(plans[i].room < 0 ? 1
+                                        : ray_heap_anon_committed() + plans[i].room);
+            ray_t* r = wave_run(shapes[plans[i].q].q, (wave_knob_t){ plans[i].kb, plans[i].sp }, &st);
+            ray_heap_set_anon_watermark(saved);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(st.radix_waves >= plans[i].lo && st.radix_waves <= plans[i].hi,
+                            "plan %zu waves %u", i, st.radix_waves);
+            TEST_ASSERT_FMT((st.radix_spill_bytes > 0) == plans[i].spill,
+                            "plan %zu spilled %llu", i, (unsigned long long)st.radix_spill_bytes);
+            if (plans[i].spill)
+                TEST_ASSERT_FMT(st.radix_spill_buf > 0 && (int64_t)st.radix_spill_buf <= plans[i].room / 8,
+                                "plan %zu buffers %llu of %lld", i,
+                                (unsigned long long)st.radix_spill_buf, (long long)plans[i].room / 8);
+            else
+                TEST_ASSERT_FMT(st.radix_spill_buf == 0, "plan %zu buffers %llu", i,
+                                (unsigned long long)st.radix_spill_buf);
+            TEST_ASSERT_FMT(first_n_same_table(base, r), "plan %zu differs", i);
+            ray_release(r); ray_release(base);
+        }
+    }
+#if !defined(_WIN32)
+    /* No spill file to be had (a missing spill directory): the forced spill
+     * falls back to re-scanning every wave, same answer. */
+    {
+        const char* prev = getenv("RAY_HEAP_SWAP");
+        char keep[512] = "";
+        if (prev) snprintf(keep, sizeof keep, "%s", prev);
+        setenv("RAY_HEAP_SWAP", "/nonexistent/rf_agg_radix_waves/", 1);
+        agg_route_stats_t bst, st;
+        ray_t* base = wave_run(shapes[0].q, oracle, &bst);
+        ray_t* r = wave_run(shapes[0].q, knobs[3], &st);
+        if (prev) setenv("RAY_HEAP_SWAP", keep, 1); else unsetenv("RAY_HEAP_SWAP");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_TRUE(st.radix_waves > 1);
+        TEST_ASSERT_EQ_I(st.radix_spill_bytes, 0);
+        TEST_ASSERT_TRUE(first_n_same_table(base, r));
+        ray_release(r); ray_release(base);
+    }
+    /* The spill file fails after it was opened (every write, or every
+     * read-back): the waves not yet served are re-scanned from the restored
+     * cursors, same answer as the one-pass oracle.  The process holds the same
+     * number of open descriptors after all of the runs, cancelled ones
+     * included (the file is unlinked at open, so a leaked descriptor is the
+     * only trace a leaked spill file leaves). */
+    {
+        const char* prev = getenv("RAY_HEAP_SWAP");
+        char keep[512] = "";
+        if (prev) snprintf(keep, sizeof keep, "%s", prev);
+        setenv("RAY_HEAP_SWAP", dir, 1);
+        agg_route_stats_t bst, st;
+#if defined(__linux__)
+        ray_release(wave_run(shapes[0].q, oracle, &bst));   /* lazy descriptors opened */
+        int fds_before = wave_open_fds();
+#endif
+        for (int fault = 3; fault <= 4; fault++) {
+            for (int q = 0; q <= 9; q += 9) {
+                ray_t* base = wave_run(shapes[q].q, oracle, &bst);
+                ray_t* r = wave_run(shapes[q].q, (wave_knob_t){ 1500000, fault }, &st);
+                TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+                TEST_ASSERT_FMT(st.radix_waves > 1, "fault %d shape %d waves %u", fault, q, st.radix_waves);
+                TEST_ASSERT_FMT(st.radix_spill_bytes > 0, "fault %d shape %d: spill never entered", fault, q);
+                TEST_ASSERT_FMT(first_n_same_table(base, r), "fault %d shape %d differs", fault, q);
+                ray_release(r); ray_release(base);
+            }
+        }
+        /* cancelled during the read-back, and in a later wave's reduction */
+        for (int fault = 5; fault <= 6; fault++) {
+            ray_t* r = wave_run(shapes[0].q, (wave_knob_t){ 1500000, fault }, &st);
+            atomic_store_explicit(&ray_pool_get()->cancelled, 0, memory_order_relaxed);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+            TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+            ray_error_free(r);
+        }
+        ray_t* ok = wave_run(shapes[0].q, oracle, &bst);   /* the pool is usable again */
+        TEST_ASSERT_NOT_NULL(ok); TEST_ASSERT_FALSE(RAY_IS_ERR(ok));
+        ray_release(ok);
+#if defined(__linux__)
+        int fds_after = wave_open_fds();
+#endif
+        if (prev) setenv("RAY_HEAP_SWAP", keep, 1); else unsetenv("RAY_HEAP_SWAP");
+#if defined(__linux__)
+        TEST_ASSERT_FMT(fds_after == fds_before, "open fds %d before, %d after", fds_before, fds_after);
+#endif
+    }
+#endif
+    /* A buffered aggregate beside the ordering count: its per-group states
+     * own memory (destroy hook), so no partition may be cut — the shape
+     * leaves the radix route for the shared index today; either way it is
+     * never reduced and answers as the oracle does. */
+    {
+        const char* q = "(select {from:wv_t by:[a b] m:(med w) c:(count b) desc:c take:10})";
+        agg_route_stats_t bst, st;
+        ray_t* base = wave_run(q, oracle, &bst);
+        ray_t* r = wave_run(q, knobs[3], &st);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(st.radix_compacted, 0);
+        TEST_ASSERT_TRUE(st.radix_waves <= 1);
+        TEST_ASSERT_TRUE(first_n_same_table(base, r));
+        ray_release(r); ray_release(base);
+    }
+    /* The kept superset itself, on keys that all hash to radix partition 0
+     * of 512: nine of count 3 (beyond the threshold 2) and ten of count 2
+     * whose first rows are the earliest of all the tied groups, so the
+     * superset is those 19 groups.  Partition 0 holds them plus its share of
+     * the later count-2 filler, so its 2N = 20 survivors must be exactly the
+     * nine strict groups and all ten early ties; anything less (a cut at N)
+     * would keep later ties from other partitions instead. */
+    setup = ray_eval_str(
+        "(set adv_p [1000068 1000212 1001329 1001673 1002214 1002415 1003521 1003768 1004324 "
+        "1004465 1006438 1007204 1007594 1007644 1008544 1008966 1009034 1009730 1010993]) "
+        "(set adv_a (concat (concat (at adv_p (+ 9 (% (til 20) 10))) (at adv_p (% (til 27) 9))) "
+        "(+ 2000000 (div (til 69953) 2)))) "
+        "(set wv_adv (table [a v] (list adv_a (til 70000))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    {
+        ray_t* adv = ray_eval_str("wv_adv");
+        TEST_ASSERT_NOT_NULL(adv); TEST_ASSERT_FALSE(RAY_IS_ERR(adv));
+        agg_route_stats_t st;
+        ray_t* base = wave_group_kept(adv, oracle, 1, 10, &st);
+        TEST_ASSERT_NOT_NULL(base); TEST_ASSERT_FALSE(RAY_IS_ERR(base));
+        TEST_ASSERT_EQ_I(st.routes[AGG_ROUTE_V2_RADIX], 1);
+        TEST_ASSERT_TRUE(st.topn_native);
+        TEST_ASSERT_EQ_I(ray_table_nrows(base), 19);
+        const int64_t* bk = (const int64_t*)ray_data(ray_table_get_col_idx(base, 0));
+        const int64_t* bc = (const int64_t*)ray_data(ray_table_get_col_idx(base, 1));
+        static const int64_t adv_p[19] = { 1000068, 1000212, 1001329, 1001673, 1002214,
+            1002415, 1003521, 1003768, 1004324, 1004465, 1006438, 1007204, 1007594,
+            1007644, 1008544, 1008966, 1009034, 1009730, 1010993 };
+        for (int i = 0; i < 19; i++) {   /* first-row order: the ties, then the strict */
+            TEST_ASSERT_EQ_I(bk[i], adv_p[i < 10 ? 9 + i : i - 10]);
+            TEST_ASSERT_EQ_I(bc[i], i < 10 ? 2 : 3);
+        }
+        for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) {
+            ray_t* r = wave_group_kept(adv, knobs[k], 1, 10, &st);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_TRUE(st.radix_compacted > 0);
+            TEST_ASSERT_FMT(first_n_same_table(base, r), "superset knob %zu differs", k);
+            ray_release(r);
+        }
+        ray_release(base);
+        /* asc: the last filler key (one row) lies beyond the threshold 2,
+         * and the ten early partition-0 pairs are the first tied groups */
+        base = wave_group_kept(adv, oracle, 0, 10, &st);
+        TEST_ASSERT_NOT_NULL(base); TEST_ASSERT_FALSE(RAY_IS_ERR(base));
+        TEST_ASSERT_EQ_I(ray_table_nrows(base), 11);
+        for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) {
+            ray_t* r = wave_group_kept(adv, knobs[k], 0, 10, &st);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(first_n_same_table(base, r), "asc superset knob %zu differs", k);
+            ray_release(r);
+        }
+        ray_release(base);
+        ray_release(adv);
+    }
+    /* independent oracle: the full grouping, sorted and cut the same way */
+    ray_t* check = ray_eval_str(
+        "(all (== (at (select {from:wv_t by:[a b] c:(count b) desc:c take:10}) 'c) "
+        "(take (at (xdesc (select {from:wv_t by:[a b] c:(count b)}) 'c) 'c) 10)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check);
+    char cleanup[256];
+    snprintf(cleanup, sizeof cleanup,
+             "(set wv_sp 0) (set wv_pt 0) (.sys.exec \"rm -rf %s\")", dir);
+    ray_release(ray_eval_str(cleanup));
+    ray_release(ray_eval_str("(set wv_i 0) (set wv_a 0) (set wv_t 0) (set wv_n 0) (set wv_e 0) (set wv_m 0) "
+                             "(set adv_p 0) (set adv_a 0) (set wv_adv 0)"));
+    agg_test_no_wide_dense(false);
+    PASS();
+}
+
+/* Bytes the range reads of generation-2 column `name` of table `tname`
+ * decoded so far (0 when the column is not encoded). */
+static uint64_t wave_g2_decoded(const char* tname, const char* name) {
+    ray_t* t = ray_eval_str(tname);
+    if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return 0; }
+    ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern(name, strlen(name)));
+    ray_enccol_t* e = ec ? ray_enccol_of(ec) : NULL;
+    uint64_t r = e && e->kind == RAY_ENCCOL_SINGLE ? atomic_load(&e->decoded_bytes) : 0;
+    ray_release(t);
+    return r;
+}
+
+/* The waved and spilled radix top-N over a generation-2 (compressed) table:
+ * its columns are read by range, every wave re-reading them through the
+ * cursors (re-scan), or one scatter writing the later waves to the spill
+ * file.  Each shape answers, cell by cell and in row order, as the one-pass
+ * unreduced radix over the same table and over its generation-0 copy; the
+ * waved runs take the two passes (the fused pass's chunk-major payload does
+ * not split), and the key column's range reads decode it once more per
+ * re-scanned wave. */
+static test_result_t test_radix_topn_waves_gen2(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_agg_radix_waves_g2_%lld", wave_pid());
+    char src[1024];
+    snprintf(src, sizeof src,
+        "(set wg_i (til 250000)) "
+        "(set wg_a (%% (* wg_i 7919) 190000)) "
+        "(set wg_t (table [a b v w s] (list wg_a (as 'I32 (%% wg_a 1000)) "
+        "(as 'I16 (%% wg_i 2)) (as 'I16 (%% (* wg_i 13) 1900)) "
+        "(as 'SYM (as 'STR (%% (* wg_i 31) 70000)))))) "
+        "(.db.splayed.set \"%s/g0/\" wg_t {compress: false}) "
+        "(.db.splayed.set \"%s/g2/\" wg_t {compress: true}) "
+        "(set wg_0 (.db.splayed.get \"%s/g0/\")) "
+        "(set wg_2 (.db.splayed.get \"%s/g2/\"))",
+        dir, dir, dir, dir);
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    {
+        ray_t* t2 = ray_eval_str("wg_2");
+        TEST_ASSERT_NOT_NULL(t2); TEST_ASSERT_FALSE(RAY_IS_ERR(t2));
+        TEST_ASSERT_TRUE(ray_table_get_col_enc(t2, ray_sym_intern("a", 1)) != NULL);
+        ray_release(t2);
+    }
+    ray_agg_tablestack = false;
+    static const char* const shapes[] = {
+        "(select {from:%s by:[a b] c:(count b) sr:(sum v) desc:c take:10})",
+        "(select {from:%s by:[a b] mx:(max w) asc:mx take:10})",
+        "(select {from:%s by:[a s] c:(count a) sr:(sum v) desc:c take:10})",
+        "(select {from:%s by:[a b] c:(count b) sr:(sum v) where:(< w 1500) desc:c take:10})",
+    };
+    const wave_knob_t oracle = { -1, 0 };
+    const wave_knob_t knobs[] = { { 0, 0 }, { 1500000, 1 }, { 1500000, 2 } };
+    for (size_t c = 0; c < sizeof(shapes) / sizeof(shapes[0]); c++) {
+        char q0[256], q2[256];
+        snprintf(q0, sizeof q0, shapes[c], "wg_0");
+        snprintf(q2, sizeof q2, shapes[c], "wg_2");
+        agg_route_stats_t st0, st2;
+        ray_t* base0 = wave_run(q0, oracle, &st0);
+        ray_t* base2 = wave_run(q2, oracle, &st2);
+        TEST_ASSERT_NOT_NULL(base0); TEST_ASSERT_FALSE(RAY_IS_ERR(base0));
+        TEST_ASSERT_NOT_NULL(base2); TEST_ASSERT_FALSE(RAY_IS_ERR(base2));
+        TEST_ASSERT_FMT(st2.routes[AGG_ROUTE_V2_RADIX] == 1, "case %zu gen2 oracle not radix", c);
+        TEST_ASSERT_FMT(st2.radix_compacted == 0 && st2.radix_waves <= 1, "case %zu oracle reduced", c);
+        TEST_ASSERT_FMT(first_n_same_table(base0, base2), "case %zu gen2 oracle differs from gen0", c);
+        for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); k++) {
+            agg_route_stats_t st;
+            uint64_t a0 = wave_g2_decoded("wg_2", "a");
+            ray_t* r = wave_run(q2, knobs[k], &st);
+            uint64_t da = wave_g2_decoded("wg_2", "a") - a0;
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_RADIX] == 1, "case %zu knob %zu route", c, k);
+            TEST_ASSERT_FMT(first_n_same_table(base2, r), "case %zu knob %zu differs", c, k);
+            TEST_ASSERT_FMT(st.topn_kept == st2.topn_kept, "case %zu knob %zu kept %lld, oracle %lld",
+                            c, k, (long long)st.topn_kept, (long long)st2.topn_kept);
+            TEST_ASSERT_FMT(st.radix_compacted > 0, "case %zu knob %zu not reduced", c, k);
+            if (k == 0) {
+                TEST_ASSERT_FMT(st.radix_waves == 1, "case %zu default waves %u", c, st.radix_waves);
+                ray_release(r);
+                continue;
+            }
+            TEST_ASSERT_FMT(st.radix_waves > 1, "case %zu knob %zu waves %u", c, k, st.radix_waves);
+            TEST_ASSERT_FMT(st.radix_phase1 == AGG_RADIX_P1_TWO_PASS,
+                            "case %zu knob %zu phase 1 %u", c, k, (unsigned)st.radix_phase1);
+            TEST_ASSERT_FMT((st.radix_spill_bytes > 0) == (knobs[k].spill == 2),
+                            "case %zu knob %zu spilled %llu", c, k,
+                            (unsigned long long)st.radix_spill_bytes);
+            /* key a (8-byte I64, 250k rows) read by range: the count pass,
+             * then one scatter per wave (re-scan) or one in all (spill) */
+            uint64_t full = 250000u * 8u;
+            uint64_t want = knobs[k].spill == 2 ? 2 * full : (uint64_t)(1 + st.radix_waves) * full;
+            TEST_ASSERT_FMT(da >= want, "case %zu knob %zu decoded %llu of a, want %llu", c, k,
+                            (unsigned long long)da, (unsigned long long)want);
+            ray_release(r);
+        }
+        ray_release(base0); ray_release(base2);
+    }
+    ray_agg_tablestack = true;
+    char cleanup[256];
+    snprintf(cleanup, sizeof cleanup,
+             "(set wg_0 0) (set wg_2 0) (set wg_t 0) (set wg_i 0) (set wg_a 0) (.sys.exec \"rm -rf %s\")", dir);
+    ray_release(ray_eval_str(cleanup));
+    PASS();
+}
+
 #if defined(__linux__)
 #include <dirent.h>
 #include <fcntl.h>
@@ -2274,6 +3125,7 @@ static test_result_t test_select_read_ahead_mapped(void) {
         { "(select {from:X s:(sum (+ u v)) where:(> v 5)})", AGG_ROUTE_NONE },
         { "(select {from:X where:(> v 970) asc:u take:5})", AGG_ROUTE_NONE },
     };
+    agg_test_no_wide_dense(true);   /* case 3 is the radix route on a mapped key */
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
         char qm[512], qt[512];
         const char* x = strstr(cases[c].q, "X");
@@ -2300,6 +3152,7 @@ static test_result_t test_select_read_ahead_mapped(void) {
             TEST_ASSERT_FMT(stats.routes[cases[c].route] >= 1,
                             "case %zu: expected route %d", c, (int)cases[c].route);
     }
+    agg_test_no_wide_dense(false);
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
     (void)ray_test_rm_rf(PFS_ROOT);
@@ -2732,6 +3585,445 @@ static test_result_t test_card_estimate(void) {
     PASS();
 }
 
+static int cdb_pair_cmp(const void* a, const void* b) {
+    const int64_t* x = (const int64_t*)a;
+    const int64_t* y = (const int64_t*)b;
+    if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
+    return x[1] < y[1] ? -1 : x[1] > y[1];
+}
+
+#define CDB_MAX_ROUNDS_TEST 5   /* the kernel's CDB_MAX_ROUNDS (3) and the rounding of its take */
+
+static int cdb_rounds(void) {
+    int rounds = 0;
+    for (int32_t i = 0; i < g_ray_profile.n; i++)
+        if (g_ray_profile.spans[i].msg &&
+            !strcmp(g_ray_profile.spans[i].msg, "count-distinct: bounded round")) rounds++;
+    return rounds;
+}
+
+/* The bounded grouped count-distinct (ray_cd_bounded) under a budget far
+ * below its sets counts in several rounds, each reading the input again for
+ * the partitions the earlier ones left, and agrees with one round and with a
+ * sorted-pairs oracle: 8- and 4-byte values, 2- and 4-byte group tags (past
+ * 65534 groups), group ids from the key column (through the result keys, in
+ * an order of their own, a null key among them) and from a row map, nulls
+ * among the values, and keys with no group skipped.  The last shape has
+ * more groups than per-worker count arrays are kept for (2.1 M groups,
+ * shared counts), in one round. */
+static test_result_t test_cd_bounded_rounds(void) {
+    const int64_t n_max = 4200000;
+    ray_t* pairs_hdr = ray_alloc((size_t)n_max * 2 * sizeof(int64_t));
+    ray_t* gid_hdr = ray_alloc((size_t)n_max * sizeof(int64_t));
+    ray_t* expect_hdr = ray_alloc((size_t)2100002 * sizeof(int64_t));
+    TEST_ASSERT_TRUE(pairs_hdr && gid_hdr && expect_hdr);
+    int64_t* pairs = (int64_t*)ray_data(pairs_hdr);
+    int64_t* row_gid = (int64_t*)ray_data(gid_hdr);
+    int64_t* expect = (int64_t*)ray_data(expect_hdr);
+    for (int shape = 0; shape < 5; shape++) {
+        bool narrow = shape & 1;
+        bool shared = shape == 4;
+        const int64_t n = shared ? n_max : 400000;
+        /* groups with a key, plus the null key */
+        int64_t ng = shared ? 2100000 : (shape & 2) ? 70000 : 1000;
+        ray_t* key = ray_vec_new(RAY_I64, n);
+        ray_t* val = ray_vec_new(narrow ? RAY_I32 : RAY_I64, n);
+        ray_t* gk = ray_vec_new(RAY_I64, ng + 2);
+        TEST_ASSERT_TRUE(key && val && gk);
+        key->len = val->len = n;
+        gk->len = ng + 2;
+        /* result key g is ng-1-g; the null key is group ng; group ng+1
+         * repeats group 0's key, which keeps its first group (no rows
+         * here); key ng (every 1013th row) has no group */
+        for (int64_t g = 0; g < ng; g++) ((int64_t*)ray_data(gk))[g] = ng - 1 - g;
+        ((int64_t*)ray_data(gk))[ng] = NULL_I64;
+        ((int64_t*)ray_data(gk))[ng + 1] = ng - 1;
+        int64_t np = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t k = i % 97 == 0 ? NULL_I64 : i % 1013 == 0 ? ng : (i * 40503) % ng;
+            int64_t v = i % 89 == 0 ? (narrow ? NULL_I32 : NULL_I64) : (i * 7919) % 3001;
+            ((int64_t*)ray_data(key))[i] = k;
+            if (narrow) ((int32_t*)ray_data(val))[i] = (int32_t)v;
+            else ((int64_t*)ray_data(val))[i] = v;
+            int64_t gid = k == NULL_I64 ? ng : k == ng ? -1 : ng - 1 - k;
+            row_gid[i] = gid;
+            if (gid >= 0) { pairs[np * 2] = gid; pairs[np * 2 + 1] = v; np++; }
+        }
+        qsort(pairs, (size_t)np, 2 * sizeof(int64_t), cdb_pair_cmp);
+        memset(expect, 0, (size_t)(ng + 2) * sizeof(int64_t));
+        for (int64_t i = 0; i < np; i++)
+            if (i == 0 || pairs[i * 2] != pairs[i * 2 - 2] || pairs[i * 2 + 1] != pairs[i * 2 - 1])
+                expect[pairs[i * 2]]++;
+
+        for (int run = 0; run < 3; run++) {
+            if (shared && run == 1) continue;
+            int64_t watermark = ray_heap_anon_watermark();
+            if (run > 0 && !shared)
+                ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() +
+                                            (INT64_C(2) << 20));
+            g_ray_profile.active = true;
+            g_ray_profile.n = 0;
+            ray_t* out = ray_cd_bounded(NULL, run < 2 ? key : NULL, run < 2 ? gk : NULL,
+                                        run < 2 ? NULL : row_gid, ng + 2, val, NULL, n);
+            int rounds = cdb_rounds();
+            g_ray_profile.active = false;
+            g_ray_profile.n = 0;
+            ray_heap_set_anon_watermark(watermark);
+            TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "shape %d run %d failed", shape, run);
+            TEST_ASSERT_EQ_I(out->type, RAY_I64);
+            TEST_ASSERT_EQ_I(out->len, ng + 2);
+            if (run == 0 || shared) TEST_ASSERT_EQ_I(rounds, 1);
+            else TEST_ASSERT_FMT(rounds >= 2 && rounds <= 4, "shape %d run %d: %d rounds under a 2 MB room",
+                                 shape, run, rounds);
+            for (int64_t g = 0; g <= ng + 1; g++)
+                TEST_ASSERT_FMT(((int64_t*)ray_data(out))[g] == expect[g],
+                                "shape %d run %d group %lld: %lld, expected %lld", shape, run,
+                                (long long)g, (long long)((int64_t*)ray_data(out))[g],
+                                (long long)expect[g]);
+            ray_release(out);
+        }
+        ray_release(key); ray_release(val); ray_release(gk);
+    }
+    ray_free(pairs_hdr); ray_free(gid_hdr); ray_free(expect_hdr);
+
+    /* 2 M distinct pairs, some 30 MB of sets, under the 4 MB floor of a
+     * 2 MB room: the first trim's projection raises the budget, so the
+     * input is read a few times, not once a partition. */
+    {
+        ray_t* key = ray_eval_str("(% (til 2000000) 1000)");
+        ray_t* val = ray_eval_str("(til 2000000)");
+        ray_t* gk = ray_eval_str("(til 1000)");
+        TEST_ASSERT_TRUE(key && val && gk && !RAY_IS_ERR(key) && !RAY_IS_ERR(val) && !RAY_IS_ERR(gk));
+        int64_t watermark = ray_heap_anon_watermark();
+        ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() +
+                                    (INT64_C(2) << 20));
+        g_ray_profile.active = true;
+        g_ray_profile.n = 0;
+        ray_t* out = ray_cd_bounded(NULL, key, gk, NULL, 1000, val, NULL, 2000000);
+        int rounds = cdb_rounds();
+        g_ray_profile.active = false;
+        g_ray_profile.n = 0;
+        ray_heap_set_anon_watermark(watermark);
+        TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out) && out->len == 1000);
+        TEST_ASSERT_FMT(rounds >= 2 && rounds <= CDB_MAX_ROUNDS_TEST, "%d rounds over 2 M pairs", rounds);
+        for (int64_t g = 0; g < 1000; g++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[g], 2000);
+        ray_release(out); ray_release(key); ray_release(val); ray_release(gk);
+    }
+    PASS();
+}
+
+/* The kernel under a room of a few MB or none against the answer it gives
+ * with all the memory it wants (one round) and the pairs counted by
+ * construction (row i is key i mod ng, value i): no cliff at the budget
+ * floor — 100 K pairs, whose sets fit the floor, count in one round whatever
+ * the room, and the others in at most CDB_MAX_ROUNDS_TEST — and the same
+ * query repeated under one watermark fixed beforehand takes the same rounds
+ * (the blocks the first leaves on the heap's freelists are room again). */
+static test_result_t test_cd_bounded_floor(void) {
+    static const struct { int64_t n, ng, room; } c[] = {
+        { 100000, 1000, 2 }, { 100000, 1000, 0 }, { 200000, 1000, 2 }, { 400000, 1000, 2 },
+        { 200000, 50, 0 }, { 800000, 1000, 2 }, { 1500000, 1000, 2 }, { 300000, 70000, 2 },
+    };
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        char b[160];
+        snprintf(b, sizeof b, "(%% (til %lld) %lld)", (long long)c[i].n, (long long)c[i].ng);
+        ray_t* key = ray_eval_str(b);
+        snprintf(b, sizeof b, "(til %lld)", (long long)c[i].n);
+        ray_t* val = ray_eval_str(b);
+        snprintf(b, sizeof b, "(til %lld)", (long long)c[i].ng);
+        ray_t* gk = ray_eval_str(b);
+        TEST_ASSERT_TRUE(key && val && gk && !RAY_IS_ERR(key) && !RAY_IS_ERR(val) && !RAY_IS_ERR(gk));
+        ray_t* ref = ray_cd_bounded(NULL, key, gk, NULL, c[i].ng, val, NULL, c[i].n);
+        TEST_ASSERT_TRUE(ref && !RAY_IS_ERR(ref) && ref->len == c[i].ng);
+        int64_t watermark = ray_heap_anon_watermark();
+        ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() +
+                                    (c[i].room << 20));
+        g_ray_profile.active = true;
+        g_ray_profile.n = 0;
+        ray_t* out = ray_cd_bounded(NULL, key, gk, NULL, c[i].ng, val, NULL, c[i].n);
+        int rounds = cdb_rounds();
+        g_ray_profile.active = false;
+        g_ray_profile.n = 0;
+        ray_heap_set_anon_watermark(watermark);
+        TEST_ASSERT_FMT(out && !RAY_IS_ERR(out) && out->len == c[i].ng, "case %zu failed", i);
+        if (i < 2) TEST_ASSERT_FMT(rounds == 1, "case %zu: %d rounds for sets within the floor", i, rounds);
+        TEST_ASSERT_FMT(rounds >= 1 && rounds <= CDB_MAX_ROUNDS_TEST, "case %zu: %d rounds", i, rounds);
+        for (int64_t g = 0; g < c[i].ng; g++) {
+            int64_t want = (c[i].n - g + c[i].ng - 1) / c[i].ng;
+            TEST_ASSERT_FMT(((int64_t*)ray_data(out))[g] == want &&
+                            ((int64_t*)ray_data(ref))[g] == want,
+                            "case %zu group %lld: %lld (unbounded %lld), expected %lld", i,
+                            (long long)g, (long long)((int64_t*)ray_data(out))[g],
+                            (long long)((int64_t*)ray_data(ref))[g], (long long)want);
+        }
+        ray_release(out); ray_release(ref); ray_release(key); ray_release(val); ray_release(gk);
+    }
+    /* the same query repeated, a freed block having left reusable room: the
+     * room is the watermark's less what is committed and not reusable */
+    {
+        ray_t* key = ray_eval_str("(% (til 400000) 1000)");
+        ray_t* val = ray_eval_str("(til 400000)");
+        ray_t* gk = ray_eval_str("(til 1000)");
+        TEST_ASSERT_TRUE(key && val && gk && !RAY_IS_ERR(key) && !RAY_IS_ERR(val) && !RAY_IS_ERR(gk));
+        ray_t* pad = ray_alloc((size_t)24 << 20);   /* leaves reusable blocks behind */
+        TEST_ASSERT_TRUE(pad && !RAY_IS_ERR(pad));
+        ray_free(pad);
+        int64_t watermark = ray_heap_anon_watermark();
+        ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() +
+                                    (INT64_C(64) << 20));
+        int rounds[3];
+        for (int run = 0; run < 3; run++) {
+            g_ray_profile.active = true;
+            g_ray_profile.n = 0;
+            ray_t* out = ray_cd_bounded(NULL, key, gk, NULL, 1000, val, NULL, 400000);
+            rounds[run] = cdb_rounds();
+            g_ray_profile.active = false;
+            g_ray_profile.n = 0;
+            TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out) && out->len == 1000);
+            for (int64_t g = 0; g < 1000; g++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[g], 400);
+            ray_release(out);
+        }
+        ray_heap_set_anon_watermark(watermark);
+        TEST_ASSERT_FMT(rounds[0] == 1 && rounds[1] == 1 && rounds[2] == 1,
+                        "rounds of one query repeated in 64 MB of room: %d %d %d",
+                        rounds[0], rounds[1], rounds[2]);
+        ray_release(key); ray_release(val); ray_release(gk);
+    }
+    PASS();
+}
+
+/* A partition that alone outgrows the budget: 300 K distinct values, all in
+ * the pairs' partition 0 (found with the kernel's hash), each twice, one
+ * group, under a 2 MB room.  The round trims every other partition and keeps
+ * that one whole, past the budget; the count is the number of values. */
+static test_result_t test_cd_bounded_hot_partition(void) {
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, 600000, 65536);
+    uint32_t W = par ? ray_pool_total_workers(pool) : 1;
+    uint32_t P = 256;
+    while (P < 1024u && P < 8 * W) P <<= 1;
+    const uint64_t limit = UINT64_MAX >> __builtin_ctz(P);   /* hash <= limit: top bits zero */
+    const int64_t nv = 300000;
+    ray_t* val = ray_vec_new(RAY_I64, 2 * nv);
+    ray_t* key = ray_vec_new(RAY_I64, 2 * nv);
+    ray_t* gk = ray_eval_str("[0]");
+    TEST_ASSERT_TRUE(val && key && gk && !RAY_IS_ERR(gk));
+    int64_t* vd = (int64_t*)ray_data(val);
+    int64_t found = 0;
+    for (uint64_t x = 1; found < nv; x++) {
+        uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ULL + 1 * 0xC2B2AE3D27D4EB4FULL;
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+        if (h <= limit) { vd[2 * found] = vd[2 * found + 1] = (int64_t)x; found++; }
+    }
+    val->len = key->len = 2 * nv;
+    memset(ray_data(key), 0, (size_t)(2 * nv) * sizeof(int64_t));
+    int64_t watermark = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() + (INT64_C(2) << 20));
+    ray_t* out = ray_cd_bounded(NULL, key, gk, NULL, 1, val, NULL, 2 * nv);
+    ray_heap_set_anon_watermark(watermark);
+    TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out) && out->len == 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[0], nv);
+    ray_release(out); ray_release(key); ray_release(val); ray_release(gk);
+    PASS();
+}
+
+/* ray_cd_bounded on the shapes its route gate leaves to the slices in
+ * memory: a single group of all-distinct and of all-equal values, F64
+ * values (every NaN the null, -0.0 equal to 0.0), SYM keys and values with
+ * SYM nulls among them — one call each, from the key column through the
+ * result keys. */
+static test_result_t test_cd_bounded_edges(void) {
+    static const struct { const char* key; const char* gk; const char* val; int64_t ng; int64_t expect[4]; } c[] = {
+        { "(* 0 (til 100000))", "[0]", "(til 100000)", 1, { 100000 } },
+        { "(* 0 (til 100000))", "[0]", "(+ 7 (* 0 (til 100000)))", 1, { 1 } },
+        { "(% (til 100000) 4)", "[0 1 2 3]",
+          "(at [0Nf 1.5 -0.0 2.5 0Nf 1.5 0.0 3.5] (% (til 100000) 8))", 4, { 1, 1, 1, 2 } },
+        { "(% (til 100000) 4)", "[3 2 1 0]",
+          "(at (% [0.0 1.5 0.0 2.5 0Nf 1.5 7.5 3.5] [0.0 2.0 0.0 3.0 1.0 2.0 8.0 4.0]) (% (til 100000) 8))", 4, { 2, 2, 1, 1 } },
+        { "(at ['a 'b 'c] (% (til 100000) 3))", "['c 'a 'b]",
+          "(at ['p 'q 'r 's 't] (% (til 100000) 5))", 3, { 5, 5, 5 } },
+        { "(at ['a 'b 'c] (% (til 100000) 3))", "['a 'b 'c]",
+          "(at ['p 'q 'r 's 't] (% (til 100000) 15))", 3, { 3, 3, 2 } },   /* past 't: null */
+    };
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        ray_t* key = ray_eval_str(c[i].key);
+        ray_t* gk = ray_eval_str(c[i].gk);
+        ray_t* val = ray_eval_str(c[i].val);
+        TEST_ASSERT_FMT(key && gk && val && !RAY_IS_ERR(key) && !RAY_IS_ERR(gk) && !RAY_IS_ERR(val),
+                        "case %zu inputs", i);
+        ray_t* out = ray_cd_bounded(NULL, key, gk, NULL, c[i].ng, val, NULL, 100000);
+        TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "case %zu failed", i);
+        TEST_ASSERT_EQ_I(out->len, c[i].ng);
+        for (int64_t g = 0; g < c[i].ng; g++)
+            TEST_ASSERT_FMT(((int64_t*)ray_data(out))[g] == c[i].expect[g],
+                            "case %zu group %lld: %lld, expected %lld", i, (long long)g,
+                            (long long)((int64_t*)ray_data(out))[g], (long long)c[i].expect[g]);
+        ray_release(out); ray_release(key); ray_release(gk); ray_release(val);
+    }
+    PASS();
+}
+
+/* Selects whose count-distinct scatter takes ray_cd_bounded because the
+ * slices' row buffers do not fit (the anon watermark lowered to a few MB
+ * above what is committed and cannot be reused), against the same count
+ * through a group by [k v] computed beforehand: another aggregate beside
+ * the count, nulls in the key and the value, a selection, a composite key
+ * (the row-map source), top-N on the count of the group, SYM values, a
+ * parted table — the route asserted by the kernel's profile ticks — whose
+ * SYM columns are 16-bit indices past 32767 into a shared symfile, one with
+ * a partition that lacks the counted column (its rows nulls), grouped by a
+ * column and by the partition date (MAPCOMMON); and a
+ * composite key over STR values, which the kernel does not read: the row
+ * map's slices are built for it (no kernel round), however short memory
+ * is.  The first query counts in more than one round. */
+static test_result_t test_cd_bounded_select(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set i (til 300000))"
+        " (set T (table [k v s a] (list (at (concat [0N] (til 96)) (% i 97)) (at (concat [0N] (til 2999)) (% (* i 7919) 3000))"
+        "   (at ['p 'q 'r 's 't 'u 'v] (% (* i 13) 7)) (% i 5))))"
+        " (set T2 (table [k1 k2 s a] (list (% i 7) (% i 11) (at (as 'STR (list \"p\" \"q\" \"r\" \"s\" \"t\")) (% i 5)) (% i 3))))"
+        " (set T3 (table [k f w kc ov uq nv a] (list (at (concat [0N] (til 96)) (% i 97))"
+        "   (at [0Nf 1.5 -0.0 2.5 0.0 3.5] (% i 6)) (as 'I32 (% (* i 7919) 3000)) (* 0 i) (+ 7 (* 0 i)) i"
+        "   (at [0N] (* 0 i)) (% i 5))))"
+        " (.sys.exec \"rm -rf /tmp/rayforce_test_cdb\")"
+        " (set Z (as 'SYM (as 'STR (+ 2000000 (til 40000)))))"
+        " (set K (as 'SYM (as 'STR (+ 3000000 (til 100)))))"
+        " (set j (til 100000))"
+        " (.db.splayed.set \"/tmp/rayforce_test_cdb/2024.01.01/t/\" (table [v k c] (list (at Z (% j 40000)) (at K (% j 100)) j)))"
+        " (.db.splayed.set \"/tmp/rayforce_test_cdb/2024.01.02/t/\" (table [v k c] (list (at Z (% (* j 7919) 3000)) (at K (% j 100)) j)))"
+        " (set P (.db.parted.get \"/tmp/rayforce_test_cdb/\" 't))"
+        " (set m (til 30000))"
+        " (.db.splayed.set \"/tmp/rayforce_test_cdb/r/2024.01.01/t/\" (table [k v] (list (% m 10) (% m 1000))))"
+        " (.db.splayed.set \"/tmp/rayforce_test_cdb/r/2024.01.02/t/\" (table [k v] (list (% m 10) (+ 500 (% m 1000)))))"
+        " (.db.splayed.set \"/tmp/rayforce_test_cdb/r/2024.01.03/t/\" (table [k] (list (% m 10))))"
+        " (set R (.db.parted.get \"/tmp/rayforce_test_cdb/r/\" 't)) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    static const struct { const char* query; const char* oracle; bool kernel; } q[] = {
+        { "(at (select {u: (count (distinct v)) s: (sum a) from: T by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T by: [k v]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct v)) c: (count a) from: T where: (== (% (* i 13) 11) 3) by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T where: (== (% (* i 13) 11) 3) by: [k v]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct v)) c: (count a) from: T by: [k s] asc: [k s]}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T by: [k s v]}) by: [k s] asc: [k s]}) 'n)", true },
+        { "(at (select {u: (count (distinct v)) c: (count a) from: T by: k desc: c take: 5}) 'u)",
+          "(at (select {n: (count x) c: (sum x) from: (select {x: (count a) from: T by: [k v]}) by: k desc: c take: 5}) 'n)", true },
+        { "(at (select {u: (count (distinct s)) c: (count a) from: T by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T by: [k s]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct v)) c: (count c) from: P by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count c) from: P by: [k v]}) by: k asc: k}) 'n)", true },
+        /* a partition without v reads as nulls: g mod 10 over [0, 1500) and the null */
+        { "(at (select {u: (count (distinct v)) c: (count k) from: R by: k asc: k}) 'u)", "[151 151 151 151 151 151 151 151 151 151]", true },
+        { "(at (select {u: (count (distinct v)) c: (count k) from: R by: date}) 'u)", "[1000 1000 1]", true },
+        { "(at (select {u: (count (distinct s)) c: (count a) from: T2 by: [k1 k2] asc: [k1 k2]}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T2 by: [k1 k2 s]}) by: [k1 k2] asc: [k1 k2]}) 'n)", false },
+        /* F64 (null, -0.0 equal to 0.0), I32, all-null, one value, one value a row, one group */
+        { "(at (select {u: (count (distinct f)) c: (count a) from: T3 by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T3 by: [k f]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct w)) c: (count a) from: T3 by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T3 by: [k w]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct nv)) c: (count a) from: T3 by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T3 by: [k nv]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct ov)) c: (count a) from: T3 by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T3 by: [k ov]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct uq)) c: (count a) from: T3 by: k asc: k}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T3 by: [k uq]}) by: k asc: k}) 'n)", true },
+        { "(at (select {u: (count (distinct uq)) c: (count a) from: T3 by: kc}) 'u)", "[300000]", true },
+        { "(at (select {u: (count (distinct f)) c: (count a) from: T3 by: kc}) 'u)", "[5]", true },
+        { "(at (select {u: (count (distinct ov)) c: (count a) from: T3 by: kc}) 'u)", "[1]", true },
+        /* STR values are not read by the kernel: the slices count them */
+        { "(at (select {u: (count (distinct s)) c: (count a) from: T2 by: k1 asc: k1}) 'u)",
+          "(at (select {n: (count x) from: (select {x: (count a) from: T2 by: [k1 s]}) by: k1 asc: k1}) 'n)", false },
+    };
+    for (size_t i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
+        ray_t* want = ray_eval_str(q[i].oracle);
+        TEST_ASSERT_FMT(want && !RAY_IS_ERR(want) && want->type == RAY_I64, "oracle %zu", i);
+        int64_t watermark = ray_heap_anon_watermark();
+        ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() +
+                                    (INT64_C(4) << 20));
+        g_ray_profile.active = true;
+        ray_t* got = ray_eval_str(q[i].query);
+        int rounds = cdb_rounds();
+        g_ray_profile.active = false;
+        g_ray_profile.n = 0;
+        ray_heap_set_anon_watermark(watermark);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_I64, "query %zu", i);
+        if (q[i].kernel)
+            TEST_ASSERT_FMT(rounds >= (i == 0 ? 2 : 1), "query %zu: %d bounded rounds", i, rounds);
+        else
+            TEST_ASSERT_FMT(rounds == 0, "query %zu: %d bounded rounds", i, rounds);
+        TEST_ASSERT_EQ_I(got->len, want->len);
+        for (int64_t g = 0; g < got->len; g++)
+            TEST_ASSERT_FMT(((int64_t*)ray_data(got))[g] == ((int64_t*)ray_data(want))[g],
+                            "query %zu group %lld: %lld, expected %lld", i, (long long)g,
+                            (long long)((int64_t*)ray_data(got))[g],
+                            (long long)((int64_t*)ray_data(want))[g]);
+        ray_release(got); ray_release(want);
+    }
+    if (q[5].kernel) {   /* the parted counts: 100 groups, 42940 pairs */
+        ray_t* tot = ray_eval_str("(sum (at (select {u: (count (distinct v)) c: (count c) from: P by: k}) 'u))");
+        TEST_ASSERT_TRUE(tot && !RAY_IS_ERR(tot));
+        TEST_ASSERT_EQ_I(tot->i64, 42940);
+        ray_release(tot);
+    }
+    ray_t* rm = ray_eval_str("(do (set P 0) (set R 0) (.sys.exec \"rm -rf /tmp/rayforce_test_cdb\"))");
+    if (rm) ray_release(rm);
+    PASS();
+}
+
+static int cdb_ticks(const char* msg) {
+    int n = 0;
+    for (int32_t i = 0; i < g_ray_profile.n; i++)
+        if (g_ray_profile.spans[i].msg && !strcmp(g_ray_profile.spans[i].msg, msg)) n++;
+    return n;
+}
+
+/* A selective where: over a composite key counted by the bounded kernel
+ * keeps a row map of the kept rows only (one id for each, not one for every
+ * row of the table), whatever the selection holds: whole segments, mixed
+ * ones, none.  The counts equal a group by [k s v] counted beforehand, at a
+ * watermark a few MB above what is committed. */
+static test_result_t test_cd_bounded_filtered(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set i (til 300000))"
+        " (set TF (table [k s v a] (list (% i 7) (at ['p 'q 'r 's 't 'u 'v] (% (* i 13) 7))"
+        "   (at (concat [0N] (til 2999)) (% (* i 7919) 3000)) (% i 5)))) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    static const char* wh[] = {
+        "(== (% (* i 13) 11) 3)",            /* mixed segments */
+        "(< i 100000)",                      /* whole segments and a mixed one */
+        "(> i 290000)",                      /* none in most segments */
+        "(== (% i 9973) 5)",                 /* a few rows */
+    };
+    for (size_t w = 0; w < sizeof(wh) / sizeof(wh[0]); w++) {
+        char qs[512], os[512];
+        snprintf(qs, sizeof(qs),
+                 "(at (select {u: (count (distinct v)) c: (count a) from: TF where: %s by: [k s] asc: [k s]}) 'u)", wh[w]);
+        snprintf(os, sizeof(os),
+                 "(at (select {n: (count x) from: (select {x: (count a) from: TF where: %s by: [k s v]}) by: [k s] asc: [k s]}) 'n)", wh[w]);
+        ray_t* want = ray_eval_str(os);
+        TEST_ASSERT_FMT(want && !RAY_IS_ERR(want) && want->type == RAY_I64, "oracle %zu", w);
+        int64_t watermark = ray_heap_anon_watermark();
+        ray_heap_set_anon_watermark(ray_heap_anon_committed() - ray_heap_anon_reusable() +
+                                    (INT64_C(4) << 20));
+        g_ray_profile.active = true;
+        ray_t* got = ray_eval_str(qs);
+        int maps = cdb_ticks("count-distinct: row map over the kept rows");
+        int rounds = cdb_rounds();
+        g_ray_profile.active = false;
+        g_ray_profile.n = 0;
+        ray_heap_set_anon_watermark(watermark);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_I64, "query %zu", w);
+        TEST_ASSERT_FMT(maps == 1 && rounds >= 1, "query %zu: %d kept-row maps, %d rounds", w, maps, rounds);
+        TEST_ASSERT_EQ_I(got->len, want->len);
+        for (int64_t g = 0; g < got->len; g++)
+            TEST_ASSERT_FMT(((int64_t*)ray_data(got))[g] == ((int64_t*)ray_data(want))[g],
+                            "query %zu group %lld", w, (long long)g);
+        ray_release(got); ray_release(want);
+    }
+    PASS();
+}
+
 /* The route gate for a grouped distinct count (ray_cd_two_pass_preferred,
  * #756): the two-pass rewrite (true) against the slice dedup (false), from
  * the estimates above over 1,048,576 rows.  Each case turns on one rule. */
@@ -2949,6 +4241,12 @@ static test_result_t test_cd_route(void) {
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
+    { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
+    { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
+    { "agg_contract/cd_bounded_floor", test_cd_bounded_floor, contract_setup, contract_teardown },
+    { "agg_contract/cd_bounded_hot_partition", test_cd_bounded_hot_partition, contract_setup, contract_teardown },
+    { "agg_contract/cd_bounded_select", test_cd_bounded_select, contract_setup, contract_teardown },
+    { "agg_contract/cd_bounded_filtered", test_cd_bounded_filtered, contract_setup, contract_teardown },
     { "agg_contract/empty_inference_errors", test_empty_inference_errors, contract_setup, contract_teardown },
     { "agg_contract/nth_bounds", test_nth_bounds, contract_setup, contract_teardown },
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
@@ -2963,6 +4261,10 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
     { "agg_contract/dense_task_local", test_dense_task_local, contract_setup, contract_teardown },
+    { "agg_contract/dense_wide_range", test_dense_wide_range, contract_setup, contract_teardown },
+    { "agg_contract/dense_wide_after_worker_budget", test_dense_wide_after_worker_budget, contract_setup, contract_teardown },
+    { "agg_contract/dense_wide_budget", test_dense_wide_budget, contract_setup, contract_teardown },
+    { "agg_contract/dense_wide_budget_sel", test_dense_wide_budget_sel, contract_setup, contract_teardown },
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },
     { "agg_contract/dense_composite_compaction", test_dense_composite_compaction, contract_setup, contract_teardown },
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
@@ -2970,6 +4272,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
+    { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
+    { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },

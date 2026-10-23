@@ -13,6 +13,7 @@
 ;;   - n_groups <= 50000                       → count_distinct_per_group_buf
 ;;       └─ n_groups >= 4 + pool >= 2 + flat   → parallel cdpg_buf_par_fn
 ;;       └─ else / type miss                   → exec_count_distinct per group
+;;   - either, when ray_cd_bounded_preferred   → ray_cd_bounded (section 14)
 ;;
 ;; All inputs are happy-path: correct types/shapes, no null payloads.
 ;;
@@ -328,3 +329,140 @@
 (sum (at Rxc 'c)) -- 6
 ;; Ungrouped reference: distinct(v) over the whole column = {10,20,30,40,50,60} = 6.
 (count (distinct (at Txc 'v))) -- 6
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. Bounded scatter — ray_cd_bounded (cdfuse.c)
+;;     From 65536 rows up to 50000 groups the post-group scatter counts
+;;     (count (distinct col)) from the key and value columns themselves —
+;;     no row map, no per-group slices — where the slices would not fit
+;;     the memory budget, for a parted or not-resident column, and (sampled,
+;;     from 64 M rows) for a dominant group or pairs that dedup to a quarter
+;;     of the rows.  In memory these shapes take the slices (parted ones
+;;     too, below 64 M rows); the same selects under a budget that sends
+;;     them to the kernel, its route asserted, are agg_contract/
+;;     cd_bounded_select.  A second aggregate beside the
+;;     count keeps these off the count-only rewrite (try_count_distinct_
+;;     v2_rewrite), which is how a select reaches the scatter.  The
+;;     oracle is the same count through a group by [k v].  The kernel's
+;;     rounds under a small budget, its slot layouts and single-group
+;;     shapes are in test_agg_contract.c (agg_contract/cd_bounded_*).
+;; ════════════════════════════════════════════════════════════════════
+
+(set Nb2 300000)
+(set ib (til Nb2))
+(set Tb2 (table [k v a] (list (% ib 97) (% ib 503) (% ib 5))))
+;; 97 and 503 are coprime and every group has >= 503 rows: each group
+;; holds all 503 values.  The other aggregates ride the same select.
+(set Rb2 (select {s: (sum a) c: (count a) m: (avg a) u: (count (distinct v)) from: Tb2 by: k}))
+(count Rb2) -- 97
+(distinct (at Rb2 'u)) -- [503]
+(sum (at Rb2 's)) -- 600000
+(sum (at Rb2 'c)) -- 300000
+(set Ob2 (select {n: (count x) from: (select {x: (count v) from: Tb2 by: [k v]}) by: k asc: k}))
+(at (select {u: (count (distinct v)) c: (count v) from: Tb2 by: k asc: k}) 'u) -- (at Ob2 'n)
+
+;; pseudo-random pairs with repeats, I64 and I32 values (8- and 4-byte slots)
+(set Tb3 (table [k v w] (list (% (* ib 40503) 1000) (% (* ib 7919) 61) (as 'I32 (% (* ib 7919) 61)))))
+(set Ob3 (select {n: (count x) from: (select {x: (count v) from: Tb3 by: [k v]}) by: k asc: k}))
+(set Rb3 (select {u: (count (distinct v)) uw: (count (distinct w)) c: (count v) from: Tb3 by: k asc: k}))
+(at Rb3 'u) -- (at Ob3 'n)
+(at Rb3 'uw) -- (at Ob3 'n)
+
+;; nulls in the key and in the value: the null key is a group of its own,
+;; a null value one distinct value
+;;   k 0N -> 0N 0N   one     k 1 -> 10 10   one
+;;   k 2  -> 0N 30   two     k 3 -> 20 40   two
+(set Mb 262144)
+(set rb (til Mb))
+(set gb (% rb 4))
+(set Tbn (table [k v] (list (at [0N 1 2 3] gb) (at [0N 10 0N 20 0N 10 30 40] (% rb 8)))))
+(set Rbn (select {n: (count (distinct v)) c: (count v) from: Tbn by: k asc: k}))
+(at Rbn 'n) -- [1 1 2 2]
+(at Rbn 'k) -- [0N 1 2 3]
+
+;; a single group: all-distinct and all-equal values
+(set Tb1 (table [k v w] (list (* 0 rb) rb (* 0 rb))))
+(set Rb1 (select {n: (count (distinct v)) m: (count (distinct w)) c: (count v) from: Tb1 by: k}))
+(at Rb1 'n) -- [262144]
+(at Rb1 'm) -- [1]
+
+;; SYM values, and STR values (the slices serve those): five per group
+(set Tbs (table [k v] (list (% rb 3) (at ['a 'b 'c 'd 'e] (% rb 5)))))
+(at (select {n: (count (distinct v)) c: (count v) from: Tbs by: k}) 'n) -- [5 5 5]
+(set SVb (as 'STR (list "p" "q" "r" "s" "t")))
+(set Tbt (table [k v] (list (% rb 3) (at SVb (% rb 5)))))
+(at (select {n: (count (distinct v)) c: (count v) from: Tbt by: k}) 'n) -- [5 5 5]
+
+;; F64 values: every NaN is the null, -0.0 is 0.0
+;;   g0 -> 0Nf 0Nf one   g1 -> 1.5 1.5 one   g2 -> -0.0 0.0 one   g3 -> 2.5 3.5 two
+(set Tbf (table [k v] (list gb (at [0Nf 1.5 -0.0 2.5 0Nf 1.5 0.0 3.5] (% rb 8)))))
+(at (select {n: (count (distinct v)) c: (count v) from: Tbf by: k}) 'n) -- [1 1 1 2]
+(set nanb (% 0.0 0.0))
+(set Tbf2 (table [k v] (list gb (at (list nanb 1.5 nanb 2.5 0Nf 1.5 7.5 3.5) (% rb 8)))))
+(at (select {n: (count (distinct v)) c: (count v) from: Tbf2 by: k}) 'n) -- [1 1 2 2]
+
+;; a selection (where:) over the rows: mixed morsels
+(set Wb (select {u: (count (distinct v)) c: (count v) from: Tb3 where: (== (% (* ib 13) 7) 2) by: k asc: k}))
+(set Ob4 (select {n: (count x) from: (select {x: (count v) from: Tb3 where: (== (% (* ib 13) 7) 2) by: [k v]}) by: k asc: k}))
+(at Wb 'u) -- (at Ob4 'n)
+(at Wb 'k) -- (at Ob4 'k)
+
+;; a composite key: the row map is built, the slices are not
+;; 77 groups (period lcm(7,11)), each sees all 13 residues of v
+(set Tbm (table [k1 k2 v] (list (% rb 7) (% rb 11) (% rb 13))))
+(set Rbm (select {n: (count (distinct v)) c: (count v) from: Tbm by: [k1 k2]}))
+(count Rbm) -- 77
+(distinct (at Rbm 'n)) -- [13]
+
+;; more rows than one chunk of tasks: 1.2 M rows, 50000 groups (the last
+;; group count the scatter takes), 5 values a group
+(set Nbc 1200000)
+(set ic (til Nbc))
+(set Tbc (table [k v] (list (% ic 50000) (% (div ic 50000) 5))))
+(set Rbc (select {n: (count (distinct v)) c: (count v) from: Tbc by: k}))
+(count Rbc) -- 50000
+(distinct (at Rbc 'n)) -- [5]
+(sum (at Rbc 'c)) -- 1200000
+
+;; the count-only shape (ClickBench's #9 form) below the fused kernel's
+;; rows and without a dense (K, X) pack, then desc/take on the count
+(set Tb9 (table [k v] (list (% rb 211) (% (* rb 104729) 200003))))
+(set Rb9 (select {u: (count (distinct v)) from: Tb9 by: k desc: u take: 3}))
+(count Rb9) -- 3
+(set Ob9 (select {n: (count x) from: (select {x: (count v) from: Tb9 by: [k v]}) by: k desc: n take: 3}))
+(at Rb9 'u) -- (at Ob9 'n)
+
+;; a parted table: 3 partitions of 30000 rows, the last without v (its rows
+;; read as nulls).  By k: values = g mod 10 over [0, 1500) plus the null
+;; = 151; by the partition date (MAPCOMMON key): 1000, 1000, the null; by
+;; a SYM key: [0, 1500) plus the null; a MAPCOMMON value: 3 dates.
+(set Mp 30000)
+(set ip (til Mp))
+(.sys.exec "rm -rf /tmp/rfl_cdb")
+(.db.splayed.set "/tmp/rfl_cdb/2024.01.01/t/" (table [k s v] (list (% ip 10) (at ['a 'b 'c] (% ip 3)) (% ip 1000))))
+(.db.splayed.set "/tmp/rfl_cdb/2024.01.02/t/" (table [k s v] (list (% ip 10) (at ['a 'b 'c] (% ip 3)) (+ 500 (% ip 1000)))))
+(.db.splayed.set "/tmp/rfl_cdb/2024.01.03/t/" (table [k s] (list (% ip 10) (at ['a 'b 'c] (% ip 3)))))
+(set Pb (.db.parted.get "/tmp/rfl_cdb/" 't))
+(count Pb) -- 90000
+(distinct (at (select {u: (count (distinct v)) c: (count k) from: Pb by: k}) 'u)) -- [151]
+(at (select {u: (count (distinct v)) c: (count k) from: Pb by: date}) 'u) -- [1000 1000 1]
+(distinct (at (select {u: (count (distinct v)) c: (count k) from: Pb by: s}) 'u)) -- [1501]
+(distinct (at (select {u: (count (distinct date)) c: (count k) from: Pb by: k}) 'u)) -- [3]
+(at (select {u: (count (distinct v)) c: (count k) from: Pb where: (> k 4) by: k}) 'u) -- [151 151 151 151 151]
+(.sys.exec "rm -rf /tmp/rfl_cdb") -- 0
+
+;; a parted table whose SYM columns index a symfile of 40100 symbols at 16
+;; bits: ids past 32767 must read unsigned.  Partition 1: 40000 values a
+;; 100th each per key (400 distinct a key); partition 2: 3000 values over
+;; the same keys.  agg_contract/cd_bounded_select counts the same table
+;; through the kernel.
+(set Zb (as 'SYM (as 'STR (+ 2000000 (til 40000)))))
+(set Kb (as 'SYM (as 'STR (+ 3000000 (til 100)))))
+(set jb (til 100000))
+(.sys.exec "rm -rf /tmp/rfl_cdb16")
+(.db.splayed.set "/tmp/rfl_cdb16/2024.01.01/t/" (table [v k c] (list (at Zb (% jb 40000)) (at Kb (% jb 100)) jb)))
+(.db.splayed.set "/tmp/rfl_cdb16/2024.01.02/t/" (table [v k c] (list (at Zb (% (* jb 7919) 3000)) (at Kb (% jb 100)) jb)))
+(set Pb16 (.db.parted.get "/tmp/rfl_cdb16/" 't))
+(sum (at (select {u: (count (distinct v)) c: (count c) from: Pb16 by: k}) 'u)) -- 42940
+(sum (at (select {n: (count x) from: (select {x: (count c) from: Pb16 by: [k v]}) by: k}) 'n)) -- 42940
+(.sys.exec "rm -rf /tmp/rfl_cdb16") -- 0

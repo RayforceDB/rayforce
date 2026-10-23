@@ -284,6 +284,32 @@ spill threshold (`anon-watermark`):
 This shows the workload uses 29.4% of the RAM it may take before new memory
 starts going to spill files.
 
+**No swap.** On Linux the heap locks the anonymous memory it maps under the
+watermark — pools, large blocks, large off-heap tables — against swap-out
+(`mlock2` with `MLOCK_ONFAULT`: a page is locked when it is first touched,
+nothing is faulted in ahead), so the kernel never moves it to swap to make room
+for page cache, and a query never waits for a swap-in. Memory past the
+watermark and spill files are never locked, and the locked bytes stay within
+the smaller of the watermark and half the RAM limit (the watermark alone is
+half the limit on a small machine but up to three quarters on a large one, and
+`-m` may set it past RAM). An empty pool kept for reuse is unlocked while it is
+parked, and `(.sys.gc)` and the idle decay unlock the blocks the heap keeps
+cached.
+
+`RLIMIT_MEMLOCK` bounds it too: the `rayforce` binary raises the soft limit to
+the hard one at startup (an embedding keeps its host's limits, and children of
+`.sys.exec` inherit the raised soft limit). A process with `CAP_IPC_LOCK` — root
+outside a container — is past any limit; a user often has 8 or 64 MB, and a
+container as little as 64 KB, root inside it too. What does not fit is left
+unlocked, the heap works on as before, and `(.sys.mem)` counts it
+(`lock-skipped`, `lock-failed`); `locked-bytes` shows the mapped bytes locked.
+`RAY_HEAP_MLOCK=0` turns locking off (read once, at the first lock). The
+bound follows the RAM limit read at startup: a cgroup limit lowered later is
+not seen, and what was locked stays locked until it is freed. Each process
+bounds only its own
+locking: on a machine shared by several heavy rayforce processes, give each a
+`-m` that adds up, or turn locking off.
+
 A spill file is mapped shared.  An embedding process that `fork()`s and keeps
 running rayforce code in the child shares the spilled blocks with the parent
 instead of getting its own copy, so the child must not write them; run the

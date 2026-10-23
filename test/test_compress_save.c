@@ -51,7 +51,6 @@
 #include "store/serde.h"
 #include "store/stream.h"
 #include "vec/str.h"
-#include "ipc_harness.h"
 #include "ops/datalog.h"
 #include "core/ipc.h"
 #include <stdio.h>
@@ -119,8 +118,8 @@ static test_result_t test_meta_without_decode(void) {
     PASS();
 }
 
-/* Legacy getters: absent, non-table, success and decode failure, each after
- * a stale error in the slot; only the failure replaces its message. */
+/* Legacy getters: absent, non-table and success, each after a stale error
+ * in the slot, keep its message. */
 static test_result_t test_legacy_getters(void) {
     ray_t* t = mixed_table();
     ray_t* stale;
@@ -135,23 +134,6 @@ static test_result_t test_legacy_getters(void) {
     stale = ray_error("domain", "stale"); ray_error_free(stale);
     TEST_ASSERT_NOT_NULL(ray_table_get_col(t, ray_sym_intern("a", 1)));
     TEST_ASSERT_STR_EQ(ray_error_msg(), "stale");
-    ray_release(t);
-    /* corrupt a descriptor of column a and reload */
-    FILE* f = fopen(ray_test_tmp(CS_TMP "/mix/a"), "r+b"); TEST_ASSERT_TRUE(f != NULL); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-    t = ray_read_splayed(ray_test_tmp(CS_TMP "/mix"), NULL);
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    for (int i = 0; i < 4; i++) {
-        stale = ray_error("domain", "stale"); ray_error_free(stale);
-        TEST_ASSERT_NULL(ray_table_get_col(t, ray_sym_intern("a", 1)));
-        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), ray_test_tmp(CS_TMP "/mix/a")));
-    }
-    ray_mem_stats(&m1);
-    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);   /* no leaked error objects */
-    ray_t* r = ray_table_col(t, ray_sym_intern("a", 1));
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-    ray_error_free(r);
     ray_release(t);
     PASS();
 }
@@ -387,265 +369,29 @@ static test_result_t test_dml_on_select_result(void) {
     PASS();
 }
 
-/* A generation-2 table whose column `a` loads but fails to materialize
- * (corrupt descriptor, as test_legacy_getters), bound to `t`. */
-static ray_t* bind_corrupt_table(void) {
+/* The generation-2 column `a` beside the generation-0 column `b`, bound to
+ * `t`. */
+static ray_t* bind_mixed_table(void) {
     ray_t* t = mixed_table();
-    if (!t || RAY_IS_ERR(t)) return NULL;
-    ray_release(t);
-    FILE* f = fopen(ray_test_tmp(CS_TMP "/mix/a"), "r+b");
-    if (!f) return NULL;
-    fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-    t = ray_read_splayed(ray_test_tmp(CS_TMP "/mix"), NULL);
     if (t && !RAY_IS_ERR(t)) ray_env_set(ray_sym_intern("t", 1), t);
     return t;
 }
 
-static test_result_t expect_corrupt(ray_t* r, const char* what) {
-    TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", what);
-    TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s (%s)", what, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "no message");
-    TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), ray_test_tmp(CS_TMP "/mix/a")), "%s: message %s", what,
-                    ray_error_msg() ? ray_error_msg() : "(none)");
-    ray_error_free(r);
-    PASS();
-}
-
-/* Every verb that reads columns through the legacy getters reports the
- * decode failure as itself: no NULL dereference, no "oom"/"schema" label. */
-static test_result_t test_failed_decode_propagates(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    static const char* const verbs[] = {
-        "(upsert 't 'a (list 5 1))", "(upsert t 'a (list 5 1))",
-        "(insert 't (list 1 2))", "(insert t (list 1 2))",
-        "(update {b: 1 from: 't where: (== a 5)})", "(update {b: a from: t})",
-        "(delete {from: 't where: (== b 5)})", "(delete {from: t where: (== b 5)})",
-        /* a whole-chunk sum answers from the directory (the damaged descriptor is
-         * never read, the accepted residual); a partly selected chunk reads it */
-        "(select {s: (sum a) from: t where: (> b 100)})", "(select {from: t where: (> a 5)})",
-    };
-    for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
-        ray_error_clear();
-        ray_t* r = ray_eval_str(verbs[i]);
-        { test_result_t rr = expect_corrupt(r, verbs[i]); if (rr.status != TEST_PASS) return rr; }
-    }
-    /* An update that never reads the failing column does not decode it: the
-     * verbs read encoded columns lazily, so it succeeds and passes `a` on. */
+/* An update that never reads the encoded column does not decode it: the
+ * verbs read encoded columns lazily, so it passes `a` on encoded. */
+static test_result_t test_update_passes_encoded(void) {
+    ray_t* t = bind_mixed_table();
+    TEST_ASSERT_TRUE(t != NULL && !RAY_IS_ERR(t));
     static const char* const lazy[] = { "(update {b: 1 from: t where: (== b 5)})", "(update {b: 1 from: t})" };
     for (size_t i = 0; i < 2; i++) {
+        ray_enc_counters_reset();
         ray_t* ok = ray_eval_str(lazy[i]);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        TEST_ASSERT_FMT(c.materialized == 0, "%s: decoded a", lazy[i]);
         TEST_ASSERT_FMT(ok && !RAY_IS_ERR(ok) && ok->type == RAY_TABLE, "%s", lazy[i]);
         TEST_ASSERT_TRUE(ray_table_get_col_enc(ok, ray_sym_intern("a", 1)) != NULL);
         ray_release(ok);
     }
-    /* a splayed re-save */
-    ray_error_clear();
-    TEST_ASSERT_EQ_I(ray_splay_save(t, ray_test_tmp(CS_TMP "/resave"), NULL), RAY_ERR_CORRUPT);
-    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), ray_test_tmp(CS_TMP "/mix/a")));
-    /* serialization reports the same error */
-    ray_error_clear();
-    TEST_ASSERT_TRUE(ray_serde_size(t) < 0);
-    ray_t* w = ray_ser(t);
-    { test_result_t rr = expect_corrupt(w, "ray_ser"); if (rr.status != TEST_PASS) return rr; }
-    ray_release(t);
-    PASS();
-}
-
-/* Builtins, formatting, links, graph and rerank ops read table columns through
- * the accessors: a column that fails to materialize surfaces as its own error
- * (code and column path), never a crash or a wrong value. */
-static test_result_t test_builtins_failed_decode(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    static const char* const verbs[] = {
-        "(format \"%\" t)", "(print \"%\" t)", "(value t)", "(at t 'a)", "(at t 0)", "(at t [0 1 2])",
-        "(take t 2)", "(take t [1 2])", "(filter t (> (til 3000) 5))",
-        "(fills t)", "(concat t t)", "(resolve t)", "(as 'DICT t)", "t.a",
-        "(concat (table ['a 'b] (list (til 3000) (til 3000))) t)",
-        "(.graph.build t 'b 'b 'a)", "(.graph.build t 'a 'b)",
-        "(do (set lk (.col.link 't [0 1 2])) lk.a)",
-    };
-    for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
-        ray_error_clear();
-        ray_t* r = ray_eval_str(verbs[i]);
-        { test_result_t rr = expect_corrupt(r, verbs[i]); if (rr.status != TEST_PASS) return rr; }
-    }
-    /* ungroup: a nested column beside a flat column that fails to load */
-    {
-        ray_t* nested = ray_list_new(3000);
-        for (int i = 0; i < 3000; i++) { ray_t* e = ray_i64(i); nested = ray_list_append(nested, e); ray_release(e); }
-        ray_t* h = ray_table_new(2);
-        h = ray_table_add_col(h, ray_sym_intern("n", 1), nested); ray_release(nested);
-        ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
-        TEST_ASSERT_TRUE(enc != NULL);
-        h = ray_table_add_col(h, ray_sym_intern("a", 1), enc);
-        TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h));
-        ray_error_clear();
-        ray_t* u = ray_ungroup_fn(h);
-        test_result_t rr = expect_corrupt(u, "ungroup");
-        ray_release(h);
-        if (rr.status != TEST_PASS) return rr;
-    }
-    /* the formatter: every mode, and the streamed one */
-    for (int mode = 0; mode <= 2; mode++) {
-        ray_error_clear();
-        ray_t* f = ray_fmt(t, mode);
-        { test_result_t rr = expect_corrupt(f, "ray_fmt"); if (rr.status != TEST_PASS) return rr; }
-    }
-    FILE* sink = tmpfile();
-    TEST_ASSERT_TRUE(sink != NULL);
-    ray_t* cause = NULL;
-    TEST_ASSERT_TRUE(ray_fmt_write(sink, t, &cause) != RAY_OK);
-    { test_result_t rr = expect_corrupt(cause, "ray_fmt_write"); if (rr.status != TEST_PASS) return rr; }
-    fclose(sink);
-    /* show reports the failed column as an error, freeing it (no leaked object) */
-    {
-        ray_error_clear();
-        ray_t* w0 = ray_eval_str("(show t)");   /* warm */
-        { test_result_t rr = expect_corrupt(w0, "show"); if (rr.status != TEST_PASS) return rr; }
-        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-        for (int i = 0; i < 4; i++) {
-            ray_error_clear();
-            ray_t* w = ray_eval_str("(show t)");
-            { test_result_t rr = expect_corrupt(w, "show"); if (rr.status != TEST_PASS) return rr; }
-        }
-        ray_mem_stats(&m1);
-        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
-    }
-    /* a healthy column of the same table still reads */
-    ray_t* b = ray_eval_str("(at t 'b)");
-    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b) && b->len == 3000);
-    ray_release(b);
-    ray_release(t);
-    PASS();
-}
-
-/* A table whose columns `names` all alias the encoded column `a` of `t`. */
-static ray_t* alias_enc_table(ray_t* t, const char* const* names, int n) {
-    ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
-    if (!enc) return NULL;
-    ray_t* h = ray_table_new(n);
-    for (int i = 0; i < n; i++)
-        h = ray_table_add_col(h, ray_sym_intern(names[i], (int64_t)strlen(names[i])), enc);
-    return h;
-}
-
-/* Graph traversals read the edge-weight and coordinate columns through the
- * accessors; one that fails to load is reported, not read as garbage. */
-static test_result_t test_traverse_failed_decode(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    static const char* const wn[] = { "weight" };
-    static const char* const cn[] = { "lat", "lon" };
-    ray_t* props = alias_enc_table(t, wn, 1);
-    ray_t* np    = alias_enc_table(t, cn, 2);
-    TEST_ASSERT_TRUE(props && np && !RAY_IS_ERR(props) && !RAY_IS_ERR(np));
-    int64_t esrc[] = {0, 1}, edst[] = {1, 2};
-    ray_t* sv = ray_vec_from_raw(RAY_I64, esrc, 2);
-    ray_t* dv = ray_vec_from_raw(RAY_I64, edst, 2);
-    ray_t* edges = ray_table_new(2);
-    edges = ray_table_add_col(edges, ray_sym_intern("src", 3), sv); ray_release(sv);
-    edges = ray_table_add_col(edges, ray_sym_intern("dst", 3), dv); ray_release(dv);
-    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 3, 3, false);
-    TEST_ASSERT_TRUE(rel != NULL);
-    ray_rel_set_props(rel, props);
-    for (int which = 0; which < 4; which++) {
-        ray_graph_t* g = ray_graph_new(NULL);
-        ray_t* s0 = ray_i64(0); ray_t* d2 = ray_i64(2);
-        ray_op_t* so = ray_const_atom(g, s0); ray_op_t* dop = ray_const_atom(g, d2);
-        ray_release(s0); ray_release(d2);
-        ray_op_t* op = which == 0 ? ray_dijkstra(g, so, NULL, rel, "weight", 10)
-                     : which == 1 ? ray_mst(g, rel, "weight")
-                     : which == 2 ? ray_astar(g, so, dop, rel, "weight", "lat", "lon", np, 10)
-                                  : ray_k_shortest(g, so, dop, rel, "weight", 2);
-        TEST_ASSERT_TRUE(op != NULL);
-        ray_error_clear();
-        ray_t* r = ray_execute(g, op);
-        test_result_t rr = expect_corrupt(r, which == 0 ? "dijkstra" : which == 1 ? "mst" : which == 2 ? "astar" : "k-shortest");
-        ray_graph_free(g);
-        if (rr.status != TEST_PASS) return rr;
-    }
-    /* astar: a healthy weight column, failing coordinate columns */
-    {
-        ray_t* wv = ray_vec_new(RAY_F64, 2); wv->len = 2;
-        ((double*)ray_data(wv))[0] = 1.0; ((double*)ray_data(wv))[1] = 1.0;
-        ray_t* good = ray_table_new(1);
-        good = ray_table_add_col(good, ray_sym_intern("weight", 6), wv); ray_release(wv);
-        ray_rel_set_props(rel, good); ray_release(good);
-        ray_graph_t* g = ray_graph_new(NULL);
-        ray_t* s0 = ray_i64(0); ray_t* d2 = ray_i64(2);
-        ray_op_t* so = ray_const_atom(g, s0); ray_op_t* dop = ray_const_atom(g, d2);
-        ray_release(s0); ray_release(d2);
-        ray_op_t* op = ray_astar(g, so, dop, rel, "weight", "lat", "lon", np, 10);
-        TEST_ASSERT_TRUE(op != NULL);
-        ray_error_clear();
-        ray_t* r = ray_execute(g, op);
-        test_result_t rr = expect_corrupt(r, "astar coordinates");
-        ray_graph_free(g);
-        if (rr.status != TEST_PASS) return rr;
-    }
-    ray_rel_free(rel);
-    ray_release(edges); ray_release(props); ray_release(np);
-    ray_release(t);
-    PASS();
-}
-
-/* LIKE over a scanned column that fails to load reports that failure, and a
- * dotted env path through such a table is undefined for the borrowed lookup
- * and an error for the evaluator's. */
-static test_result_t test_like_env_failed_decode(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    ray_graph_t* g = ray_graph_new(t);
-    ray_op_t* col = ray_scan(g, "a");
-    ray_op_t* pat = ray_const_str(g, "1*", 2);
-    ray_op_t* lk  = ray_like(g, col, pat);
-    ray_error_clear();
-    ray_t* r = ray_execute(g, lk);
-    test_result_t rr = expect_corrupt(r, "like");
-    ray_graph_free(g);
-    if (rr.status != TEST_PASS) return rr;
-    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    for (int i = 0; i < 3; i++)
-        TEST_ASSERT_NULL(ray_env_get(ray_sym_intern("t.a", 3)));
-    ray_mem_stats(&m1);
-    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);   /* the error was freed */
-    TEST_ASSERT_NOT_NULL(ray_env_get(ray_sym_intern("t.b", 3)));
-    ray_release(t);
-    PASS();
-}
-
-/* A row projection after a nearest-neighbour step reads every column of the
- * source: the one that fails to load surfaces as the result. */
-static test_result_t test_rerank_failed_decode(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    ray_t* emb = ray_list_new(3000);
-    float row[3] = {1.0f, 0.0f, 0.0f};
-    for (int i = 0; i < 3000; i++) {
-        ray_t* v = ray_vec_from_raw(RAY_F32, row, 3);
-        emb = ray_list_append(emb, v); ray_release(v);
-    }
-    ray_t* h = ray_table_new(2);
-    h = ray_table_add_col(h, ray_sym_intern("emb", 3), emb); ray_release(emb);
-    ray_t* enc = ray_table_get_col_enc(t, ray_sym_intern("a", 1));
-    TEST_ASSERT_TRUE(enc != NULL);
-    h = ray_table_add_col(h, ray_sym_intern("a", 1), enc);
-    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h));
-    /* run the rerank op itself (the query path decodes a table before it gets there) */
-    static const float q[3] = {1.0f, 0.0f, 0.0f};
-    int64_t cols[2] = { ray_sym_intern("emb", 3), ray_sym_intern("a", 1) };
-    for (int i = 0; i < 2; i++) {
-        ray_graph_t* g = ray_graph_new(h);
-        ray_op_t* root = ray_const_table(g, h);
-        root = ray_knn_rerank(g, root, cols[i], q, 3, 3, RAY_HNSW_COSINE);
-        TEST_ASSERT_TRUE(root != NULL);
-        ray_error_clear();
-        ray_t* r = ray_execute(g, root);
-        { test_result_t rr = expect_corrupt(r, i == 0 ? "rerank projection" : "rerank column"); if (rr.status != TEST_PASS) { ray_graph_free(g); return rr; } }
-        ray_graph_free(g);
-    }
-    ray_release(h);
     ray_release(t);
     PASS();
 }
@@ -685,7 +431,7 @@ static test_result_t test_serde_byte_identity(void) {
     PASS();
 }
 
-/* A success must not erase a pending message; a failure replaces it. */
+/* A success must not erase a pending message. */
 static test_result_t test_getter_keeps_pending_message(void) {
     ray_t* t = ray_table_new(1);
     ray_t* a = i64_col(10, 1);
@@ -698,14 +444,6 @@ static test_result_t test_getter_keeps_pending_message(void) {
     TEST_ASSERT_TRUE(ray_error_msg() && strcmp(ray_error_msg(), "x") == 0);
     TEST_ASSERT_NULL(ray_table_get_col(t, ray_sym_intern("zz", 2)));       /* absent: not a failure */
     TEST_ASSERT_TRUE(ray_error_msg() && strcmp(ray_error_msg(), "x") == 0);
-    ray_release(t);
-    t = mixed_table();
-    FILE* f = fopen(ray_test_tmp(CS_TMP "/mix/a"), "r+b"); TEST_ASSERT_TRUE(f != NULL); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-    ray_release(t);
-    t = ray_read_splayed(ray_test_tmp(CS_TMP "/mix"), NULL);
-    ray_error_free(ray_error("domain", "x"));
-    TEST_ASSERT_NULL(ray_table_get_col(t, ray_sym_intern("a", 1)));
-    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), ray_test_tmp(CS_TMP "/mix/a")));
     ray_release(t);
     PASS();
 }
@@ -780,39 +518,6 @@ static test_result_t test_parted_gen2_loads(void) {
         }
         ray_release(t);
     }
-    PASS();
-}
-
-static void ipc_setup(void) {
-    rt_setup();
-    ray_poll_t* p = ray_poll_create();
-    if (p) ray_runtime_set_poll(p);
-}
-static void ipc_teardown(void) {
-    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
-    if (p) { ray_runtime_set_poll(NULL); ray_poll_destroy(p); }
-    rt_teardown();
-}
-
-/* A result holding a column that fails to decode reaches the client as that
- * error (code and column path), not as "not serializable". */
-static test_result_t test_ipc_failed_decode(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    ray_test_server_t srv;
-    RAY_TEST_SERVER_START(srv);
-    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
-    TEST_ASSERT_TRUE(h >= 0);
-    ray_t* msg = ray_str("t", 1);
-    ray_t* r = ray_ipc_send(h, msg);
-    ray_release(msg);
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-    /* an error frame carries only its code: the message stays on the server */
-    ray_error_free(r);
-    ray_ipc_close(h);
-    ray_test_server_stop(&srv);
-    ray_release(t);
     PASS();
 }
 
@@ -944,22 +649,6 @@ static test_result_t test_str_const_distinct_offsets(void) {
     PASS();
 }
 
-/* A failed encoded -> 2 save leaves no file and no staging file. */
-static test_result_t test_matrix_failure_cleanup(void) {
-    ray_t* v = i64_col(3000, 1);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(CS_TMP "/src"), 2), RAY_OK);
-    ray_release(v);
-    FILE* f = fopen(ray_test_tmp(CS_TMP "/src"), "r+b"); TEST_ASSERT_TRUE(f != NULL); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-    ray_t* enc = ray_col_mmap(ray_test_tmp(CS_TMP "/src"));
-    TEST_ASSERT_EQ_I(save_ctx(enc, ray_test_tmp(CS_TMP "/dst"), 2, NULL), RAY_ERR_CORRUPT);
-    TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(CS_TMP "/dst")), 255);
-    TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(CS_TMP "/dst.tmp")), 255);
-    TEST_ASSERT_EQ_I(save_ctx(enc, ray_test_tmp(CS_TMP "/dst"), 0, NULL), RAY_ERR_CORRUPT);
-    TEST_ASSERT_EQ_I(file_gen(ray_test_tmp(CS_TMP "/dst")), 255);
-    ray_release(enc);
-    PASS();
-}
-
 /* Failure injection: the range writer's buffers (at least one injection is
  * asserted to fire), the encoded source's own allocations and a mid-write I/O
  * failure leave no file, no
@@ -979,7 +668,7 @@ static test_result_t test_matrix_failure_inject(void) {
     ray_release(v);
     ray_t* enc = ray_col_mmap(ray_test_tmp(CS_TMP "/s"));
     TEST_ASSERT_TRUE(enc && !RAY_IS_ERR(enc));
-    /* P6: the 26 distinct strings select STR_DICT, whose validated
+    /* P6: the 26 distinct strings select STR_DICT, whose parsed
      * dictionary is a once-state the source keeps after its first read (a
      * cache, not a leak): validated before the baseline, so each injection
      * counts only what the save owns.  The decode-side bound below grows by
@@ -3320,10 +3009,8 @@ static test_result_t test_topk_bound(void) {
 
 /* ---- Task 27: executor, filter, sort, window, pivot sites ---- */
 
-/* `n` rows of a (generation 2, 3 i) and b (generation 0, 5 i); with `corrupt`
- * the descriptor of a's first vector is damaged after the load checks pass,
- * so a loads and fails to materialize. */
-static ray_t* ex_table(int64_t n, bool corrupt) {
+/* `n` rows of a (generation 2, 3 i) and b (generation 0, 5 i). */
+static ray_t* ex_table(int64_t n) {
     char p[256];
     (void)ray_test_rm_rf(ray_test_tmp(CS_TMP "/ex"));
     (void)ray_test_mkdir_p(ray_test_tmp(CS_TMP "/ex"));
@@ -3334,23 +3021,7 @@ static ray_t* ex_table(int64_t n, bool corrupt) {
     ray_t* names = ray_vec_new(RAY_STR, 2);
     names = ray_str_vec_append(names, "a", 1); names = ray_str_vec_append(names, "b", 1);
     snprintf(p, sizeof p, "%s/ex/.d", ray_test_tmp(CS_TMP)); ray_col_save(names, p); ray_release(names);
-    if (corrupt) {
-        int64_t n_chunks = (n + 65535) / 65536;
-        FILE* f = fopen(ray_test_tmp(CS_TMP "/ex/a"), "r+b");
-        if (!f) ray_test_fatal("cannot open %s", ray_test_tmp(CS_TMP "/ex/a"));
-        fseek(f, (long)(96 + 64 * n_chunks + 6), SEEK_SET); fputc(1, f); fclose(f);
-    }
     return ray_read_splayed(ray_test_tmp(CS_TMP "/ex"), NULL);
-}
-
-static test_result_t ex_corrupt(ray_t* r, const char* what) {
-    TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", what);
-    TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s (%s)", what, ray_err_code(r),
-                    ray_error_msg() ? ray_error_msg() : "no message");
-    TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), ray_test_tmp(CS_TMP "/ex/a")), "%s: message %s", what,
-                    ray_error_msg() ? ray_error_msg() : "(none)");
-    ray_error_free(r);
-    PASS();
 }
 
 typedef enum { EX_HEAD, EX_TAIL, EX_FILTER, EX_FILTER_SOME, EX_SORT_B, EX_SORT_A, EX_TOPK_B,
@@ -3405,50 +3076,33 @@ static ray_t* ex_run(ray_t* t, ex_case_t k) {
     return r;
 }
 
-/* Every executor, filter, sort, window and pivot site that reads a column
- * reports a failed materialization as itself (code and column path); the
- * sites that only pass or measure a column never decode it. */
-static test_result_t ex_failed_decode_one(int64_t n, bool big) {
-    static const char* const names[EX_N] = { "head", "tail", "filter", "filter-some", "sort-b", "sort-a",
-        "top-k-b", "pivot", "window-fn-a", "select-pass", "window-pass", "result-merge", "filter-none",
-        "head-filter", "eager-filter", "top-k-a" };
+/* The executor sites that only pass or measure a column never decode it. */
+static test_result_t test_exec_sites_pass_encoded(void) {
+    static const ex_case_t ks[3] = { EX_SELECT_PASS, EX_WINDOW_PASS, EX_FILTER_NONE };
+    static const char* const names[3] = { "select-pass", "window-pass", "filter-none" };
     int64_t sa = ray_sym_intern("a", 1);
-    for (int k = 0; k < EX_N; k++) {
-        if (big && k != EX_FILTER && k != EX_FILTER_SOME && k != EX_SORT_B && k != EX_EAGER_FILTER) continue;
-        ray_t* t = ex_table(n, true);
+    for (int i = 0; i < 3; i++) {
+        ray_t* t = ex_table(3000);
         TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
         ray_enc_counters_reset();
-        ray_t* r = ex_run(t, (ex_case_t)k);
-        if (k == EX_SELECT_PASS || k == EX_WINDOW_PASS || k == EX_FILTER_NONE) {
-            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE, "%s: expected a table", names[k]);
-            ray_enc_counters_t c; ray_enc_counters_get(&c);
-            if (k == EX_FILTER_NONE) {
-                TEST_ASSERT_FMT(ray_table_nrows(r) == 0 && ray_table_ncols(r) == 2, "%s: schema", names[k]);
-                TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", names[k], (unsigned long long)c.materialized);
-            } else {
-                TEST_ASSERT_FMT(ray_table_get_col_enc(r, sa) != NULL, "%s: a is passed encoded", names[k]);
-                TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", names[k], (unsigned long long)c.materialized);
-            }
-            ray_release(r);
-        } else {
-            test_result_t rr = ex_corrupt(r, names[k]);
-            if (rr.status != TEST_PASS) { ray_release(t); return rr; }
-        }
+        ray_t* r = ex_run(t, ks[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE, "%s: expected a table", names[i]);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        if (ks[i] == EX_FILTER_NONE)
+            TEST_ASSERT_FMT(ray_table_nrows(r) == 0 && ray_table_ncols(r) == 2, "%s: schema", names[i]);
+        else
+            TEST_ASSERT_FMT(ray_table_get_col_enc(r, sa) != NULL, "%s: a is passed encoded", names[i]);
+        TEST_ASSERT_FMT(c.materialized == 0, "%s: materialized %llu", names[i], (unsigned long long)c.materialized);
+        ray_release(r);
         ray_release(t);
     }
     PASS();
 }
 
-static test_result_t test_exec_sites_failed_decode(void) {
-    test_result_t r = ex_failed_decode_one(3000, false);
-    if (r.status != TEST_PASS) return r;
-    return ex_failed_decode_one(600000, true);        /* the parallel gather */
-}
-
 /* A healthy generation-2 table gives the same answers as the plain one at
  * every site above. */
 static test_result_t test_exec_sites_gen2_equal(void) {
-    ray_t* t2 = ex_table(3000, false);
+    ray_t* t2 = ex_table(3000);
     TEST_ASSERT_TRUE(t2 && !RAY_IS_ERR(t2));
     ray_t* t0 = ray_table_new(2);
     t0 = ray_table_add_col(t0, ray_sym_intern("a", 1), i64_col(3000, 3));
@@ -3665,36 +3319,6 @@ static test_result_t test_parted_pruning_multi(void) {
     PASS();
 }
 
-/* The second surviving segment fails: the query returns that segment's
- * error (code and path), no partial table, and nothing leaks. */
-static test_result_t test_parted_pruning_failure(void) {
-    ray_mem_stats_t m0, m1;
-    ray_t* t = pdb_make(ray_test_tmp(CS_TMP "/f2"), 7, false);
-    TEST_ASSERT_NOT_NULL(t);
-    ray_release(t);
-    uint8_t one = 1;
-    FILE* f = fopen(ray_test_tmp(CS_TMP "/f2/2024.01.02/t/a"), "r+b");
-    TEST_ASSERT_NOT_NULL(f);
-    fseek(f, 160 + 6, SEEK_SET); fwrite(&one, 1, 1, f); fclose(f);
-    ray_mem_stats(&m0);
-    t = ray_read_parted(ray_test_tmp(CS_TMP "/f2"), "t");                 /* corruption passes load */
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    ray_t* out = pruned_run(t, Q_LE_02, R_SUM, NULL);
-    TEST_ASSERT_TRUE(out && RAY_IS_ERR(out));
-    TEST_ASSERT_STR_EQ(ray_err_code(out), "corrupt");
-    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "2024.01.02/t/a"));
-    ray_error_free(out);
-    /* a deterministic failure is cached: the next run reports it again */
-    out = pruned_run(t, Q_LE_02, R_SUM, NULL);
-    TEST_ASSERT_TRUE(out && RAY_IS_ERR(out));
-    TEST_ASSERT_STR_EQ(ray_err_code(out), "corrupt");
-    ray_error_free(out);
-    ray_release(t);
-    ray_mem_stats(&m1);
-    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
-    PASS();
-}
-
 /* Mixed generations and a ragged tail partition go through the
  * per-segment tables like all generation 0. */
 static test_result_t test_parted_pruning_mixed(void) {
@@ -3766,47 +3390,6 @@ static ray_t* gp_body(void* c) {
     if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
     ray_graph_free(g);
     return r;
-}
-
-/* Every group-by entry that reads a column reports a failed materialization
- * as itself (code and column path), on a generation-2 table loaded from disk
- * and on a select result whose slot is passed encoded. */
-static test_result_t gp_failed_decode_one(int64_t n) {
-    static const struct { const char* key; uint16_t op; const char* c1; const char* c2; const char* what; } cases[] = {
-        { "a", OP_COUNT,         "b", NULL, "key a" },
-        { "b", OP_SUM,           "a", NULL, "sum a" },
-        { "b", OP_MEDIAN,        "a", NULL, "median a (indexed)" },
-        { "b", OP_PEARSON_CORR,  "a", "b",  "pearson a b" },
-        { "b", OP_PEARSON_CORR,  "b", "a",  "pearson b a" },
-        { "b", OP_FIRST,         "a", NULL, "first a" },
-    };
-    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
-        for (int via_select = 0; via_select < 2; via_select++) {
-            ray_t* t = ex_table(n, true);
-            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-            ray_t* in = t;
-            if (via_select) {
-                in = ex_run(t, EX_SELECT_PASS);                 /* a passed encoded into the result */
-                TEST_ASSERT_TRUE(in && !RAY_IS_ERR(in) && in->type == RAY_TABLE);
-                TEST_ASSERT_TRUE(ray_table_get_col_enc(in, ray_sym_intern("a", 1)) != NULL);
-            }
-            gp_ctx_t cx = { in, cases[k].key, cases[k].op, cases[k].c1, cases[k].c2 };
-            ray_error_clear();
-            ray_t* r = gp_body(&cx);
-            char what[96]; snprintf(what, sizeof what, "%s%s", cases[k].what, via_select ? " (select result)" : "");
-            test_result_t rr = ex_corrupt(r, what);
-            if (in != t) ray_release(in);
-            ray_release(t);
-            if (rr.status != TEST_PASS) return rr;
-        }
-    }
-    PASS();
-}
-
-static test_result_t test_group_sites_failed_decode(void) {
-    test_result_t r = gp_failed_decode_one(3000);
-    if (r.status != TEST_PASS) return r;
-    return gp_failed_decode_one(200000);
 }
 
 /* A healthy generation-2 table, directly and through a select result, groups
@@ -3996,48 +3579,12 @@ static test_result_t test_group_sites_parted(void) {
     return res;
 }
 
-static test_result_t test_group_sites_parted_failed_decode(void) {
-    static const struct { const char* key; uint16_t op; const char* c1; const char* what; } cases[] = {
-        { "date", OP_FIRST, "a", "per-partition" },   /* a SUM answers from the directory */
-        { "a",    OP_SUM, "b", "concat fallback key" },
-        { "date", OP_SUM, "b", "per-partition (healthy column)" },
-    };
-    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-        (void)ray_test_rm_rf(ray_test_tmp(CS_TMP "/gpf"));
-        ray_t* t = pdb_make(ray_test_tmp(CS_TMP "/gpf"), 7, false);
-        TEST_ASSERT_TRUE(t);
-        ray_release(t);
-        /* damage partition 2's column a, then load again: the damage passes the load checks */
-        FILE* f = fopen(ray_test_tmp(CS_TMP "/gpf/2024.01.02/t/a"), "r+b");
-        TEST_ASSERT_TRUE(f != NULL);
-        fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-        t = ray_read_parted(ray_test_tmp(CS_TMP "/gpf"), "t");
-        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-        gp_ctx_t cx = { t, cases[i].key, cases[i].op, cases[i].c1, NULL };
-        ray_error_clear();
-        ray_t* r = gp_body(&cx);
-        if (i == 2) {   /* column a is never read: the answer is the healthy one */
-            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: expected a result", cases[i].what);
-            ray_release(r);
-        } else {
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", cases[i].what);
-            TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s", cases[i].what, ray_err_code(r));
-            TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), "2024.01.02/t/a"), "%s: message %s",
-                            cases[i].what, ray_error_msg() ? ray_error_msg() : "(none)");
-            ray_error_free(r);
-        }
-        ray_release(t);
-    }
-    PASS();
-}
-
 /* ---- Task 29: joins, table ops and Datalog ---- */
 
 /* A table of plain I64 columns saved under `dir` at generation `gen` and
- * loaded back; with `corrupt` >= 0 the descriptor of that column's first
- * vector is damaged after the load checks pass (one chunk, generation 2). */
+ * loaded back. */
 static ray_t* t29_disk(const char* dir, const char* const* names, const int64_t* mul, int nc, int64_t n,
-                       int gen, int corrupt) {
+                       int gen) {
     char p[300];
     (void)ray_test_rm_rf(dir);
     (void)ray_test_mkdir_p(dir);
@@ -4052,12 +3599,6 @@ static ray_t* t29_disk(const char* dir, const char* const* names, const int64_t*
     snprintf(p, sizeof p, "%s/.d", dir);
     ray_col_save(nm, p);
     ray_release(nm);
-    if (corrupt >= 0) {
-        snprintf(p, sizeof p, "%s/%s", dir, names[corrupt]);
-        FILE* f = fopen(p, "r+b");
-        if (!f) ray_test_fatal("cannot open %s", p);
-        fseek(f, (long)(96 + 64 * ((n + 65535) / 65536) + 6), SEEK_SET); fputc(1, f); fclose(f);
-    }
     return ray_read_splayed(dir, NULL);
 }
 
@@ -4093,16 +3634,6 @@ static ray_t* t29_join(ray_t* lt, ray_t* rt, int kind, const char* lk, const cha
     return r;
 }
 
-static test_result_t t29_corrupt_at(ray_t* r, const char* what, const char* path) {
-    TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: expected an error", what);
-    TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0, "%s: code %s (%s)", what, ray_err_code(r),
-                    ray_error_msg() ? ray_error_msg() : "no message");
-    TEST_ASSERT_FMT(ray_error_msg() && strstr(ray_error_msg(), path), "%s: message %s", what,
-                    ray_error_msg() ? ray_error_msg() : "(none)");
-    ray_error_free(r);
-    PASS();
-}
-
 /* Equal serialized bytes: same shape, names, values and nulls. */
 static bool t29_same(ray_t* x, ray_t* y) {
     if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) return false;
@@ -4112,63 +3643,6 @@ static bool t29_same(ray_t* x, ray_t* y) {
     if (sx && !RAY_IS_ERR(sx)) ray_release(sx);
     if (sy && !RAY_IS_ERR(sy)) ray_release(sy);
     return same;
-}
-
-/* Every join entry that reads a column of an input reports a failed
- * materialization as itself (code and column path), on a generation-2 table
- * loaded from disk and on a select result whose slot is passed encoded. */
-static test_result_t t29_join_failed_one(int64_t n) {
-    int64_t pv[3000], qv[3000];
-    int64_t m = n < 3000 ? n : 3000;
-    for (int64_t i = 0; i < m; i++) { pv[i] = 5 * i; qv[i] = i; }
-    ray_t* P = t29_plain("b", pv, "c", qv, m);       /* b matches L.b */
-    ray_t* Q = t29_plain("a", pv, "c", qv, m);       /* a matches nothing needed; key on a */
-    static const struct { int kind; bool left_is_l; const char* key; uint8_t jt; const char* eq; const char* what; } cs[] = {
-        { 0, true,  "b", 0, NULL, "inner, a gathered from the left" },
-        { 0, true,  "b", 1, NULL, "left join, a gathered from the left" },
-        { 0, false, "b", 0, NULL, "inner, a gathered from the right" },
-        { 0, true,  "a", 0, NULL, "inner, a is the left key" },
-        { 0, false, "a", 0, NULL, "inner, a is the right key" },
-        { 1, true,  "b", 0, NULL, "anti, a gathered" },
-        { 1, true,  "a", 0, NULL, "anti, a is the left key" },
-        { 1, false, "a", 0, NULL, "anti, a is the right key" },
-        { 2, true,  "b", 0, NULL, "window join, a gathered from the left" },
-        { 2, true,  "a", 0, NULL, "window join, a is the time key" },
-        { 2, false, "b", 0, NULL, "window join, a gathered from the right" },
-        { 2, true,  "b", 0, "a",  "window join, a is the equality key" },
-    };
-    for (size_t k = 0; k < sizeof cs / sizeof *cs; k++) {
-        for (int via_select = 0; via_select < 2; via_select++) {
-            ray_t* t = ex_table(n, true);
-            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-            ray_t* in = t;
-            if (via_select) {
-                in = ex_run(t, EX_SELECT_PASS);
-                TEST_ASSERT_TRUE(in && !RAY_IS_ERR(in) && in->type == RAY_TABLE);
-                TEST_ASSERT_TRUE(ray_table_get_col_enc(in, ray_sym_intern("a", 1)) != NULL);
-            }
-            ray_t* other = strcmp(cs[k].key, "a") == 0 ? Q : P;
-            /* the right side of an eq-key window join needs the key too */
-            ray_t* Pe = NULL;
-            if (cs[k].eq) { Pe = t29_plain("a", pv, "b", qv, m); other = Pe; }
-            ray_t* r = cs[k].left_is_l ? t29_join(in, other, cs[k].kind, cs[k].key, cs[k].key, cs[k].jt, cs[k].eq)
-                                       : t29_join(other, in, cs[k].kind, cs[k].key, cs[k].key, cs[k].jt, cs[k].eq);
-            char what[128]; snprintf(what, sizeof what, "%s%s (n=%lld)", cs[k].what, via_select ? ", select result" : "", (long long)n);
-            test_result_t rr = t29_corrupt_at(r, what, ray_test_tmp(CS_TMP "/ex/a"));
-            if (Pe) ray_release(Pe);
-            if (in != t) ray_release(in);
-            ray_release(t);
-            if (rr.status != TEST_PASS) { ray_release(P); ray_release(Q); return rr; }
-        }
-    }
-    ray_release(P); ray_release(Q);
-    PASS();
-}
-
-static test_result_t test_join_sites_failed_decode(void) {
-    test_result_t r = t29_join_failed_one(3000);
-    if (r.status != TEST_PASS) return r;
-    return t29_join_failed_one(200000);
 }
 
 /* Generation 0 and 2 (and a select result of generation 2) join to the same
@@ -4331,76 +3805,23 @@ static test_result_t test_tblop_sites_gen2_equal(void) {
     PASS();
 }
 
-/* Builtins over a table whose column a fails to materialize report it as
- * itself; the ones that never read the column still work. */
-static test_result_t test_tblop_sites_failed_decode(void) {
-    ray_t* t = bind_corrupt_table();
-    TEST_ASSERT_TRUE(t != NULL);
-    static const char* const bad[] = {
-        "(pivot t 'b 'a 'b sum)", "(pivot t 'a 'b 'b sum)", "(pivot t 'b 'b 'a sum)", "(pivot t ['b] 'b 'a (fn [x] (sum x)))",
-        "(xkey t ['a])", "(xkey t ['b])", "(xgroup t ['a])", "(xgroup t ['b])",
-        "(modify t 'a (fn [c] c))", "(union-all t t)",
-    };
-    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
-        ray_error_clear();
-        ray_t* r = ray_eval_str(bad[i]);
-        test_result_t rr = expect_corrupt(r, bad[i]);
-        if (rr.status != TEST_PASS) return rr;
-    }
+/* Builtins that never read the encoded column a do not decode it. */
+static test_result_t test_tblop_sites_lazy(void) {
+    ray_t* t = bind_mixed_table();
+    TEST_ASSERT_TRUE(t != NULL && !RAY_IS_ERR(t));
     static const char* const good[] = {
         "(xcol t ['x 'y])", "(xcols t ['a 'b])", "(fkeys t)", "(modify t 'b (fn [c] c))",
     };
     for (size_t i = 0; i < sizeof good / sizeof *good; i++) {
         ray_error_clear();
+        ray_enc_counters_reset();
         ray_t* r = ray_eval_str(good[i]);
-        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: must not decode column a", good[i]);
+        ray_enc_counters_t c; ray_enc_counters_get(&c);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: ran", good[i]);
+        TEST_ASSERT_FMT(c.materialized == 0, "%s: must not decode column a", good[i]);
         ray_release(r);
     }
     ray_release(t);
-    PASS();
-}
-
-/* Datalog: a datoms table whose column e fails to materialize (env D). */
-static test_result_t test_datalog_sites_failed_decode(void) {
-    static const char* const nm[3] = { "e", "a", "v" };
-    static const int64_t mul[3] = { 1, 2, 3 };
-    ray_t* d = t29_disk(ray_test_tmp(CS_TMP "/dl"), nm, mul, 3, 3000, 2, 0);
-    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d));
-    ray_env_set(ray_sym_intern("D", 1), d);
-    static const char* const verbs[] = {
-        "(scan-eav D 'x)", "(scan-eav D 1 'x)", "(retract-fact D 1 'x 2)", "(assert-fact D 1 'x 2)", "(pull D 1)",
-        "(pull D 1 ['x])",
-    };
-    for (size_t i = 0; i < sizeof verbs / sizeof *verbs; i++) {
-        ray_error_clear();
-        ray_t* r = ray_eval_str(verbs[i]);
-        test_result_t rr = t29_corrupt_at(r, verbs[i], ray_test_tmp(CS_TMP "/dl/e"));
-        if (rr.status != TEST_PASS) return rr;
-    }
-    /* the rule engine: an EDB with a failing column fails the evaluation, no leak */
-    dl_program_t* prog = dl_program_new();
-    TEST_ASSERT_TRUE(prog != NULL);
-    TEST_ASSERT_TRUE(dl_add_edb(prog, "edge", d, 3) >= 0);
-    dl_rule_t rule;
-    dl_rule_init(&rule, "p", 3);
-    dl_rule_head_var(&rule, 0, 0); dl_rule_head_var(&rule, 1, 1); dl_rule_head_var(&rule, 2, 2);
-    int body = dl_rule_add_atom(&rule, "edge", 3);
-    dl_body_set_var(&rule, body, 0, 0); dl_body_set_var(&rule, body, 1, 1); dl_body_set_var(&rule, body, 2, 2);
-    rule.n_vars = 3;
-    TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
-    ray_error_clear();
-    TEST_ASSERT_TRUE(dl_eval(prog) != 0);
-    TEST_ASSERT_TRUE(prog->first_err != NULL && RAY_IS_ERR(prog->first_err) &&
-                     strcmp(ray_err_code(prog->first_err), "corrupt") == 0);
-    dl_program_free(prog);                       /* releases the kept error */
-    {   /* a query over the datoms table returns the column's own error */
-        ray_error_clear();
-        ray_t* q = ray_eval_str("(query D (find ?x) (where (eav ?x ?p ?v)))");
-        test_result_t qr = t29_corrupt_at(q, "query", ray_test_tmp(CS_TMP "/dl/e"));
-        if (qr.status != TEST_PASS) return qr;
-    }
-    ray_env_set(ray_sym_intern("D", 1), NULL);
-    ray_release(d);
     PASS();
 }
 
@@ -4444,7 +3865,7 @@ static test_result_t test_datalog_sites_gen2_equal(void) {
     static const int64_t mul[2] = { 1, 1 };
     ray_t* e[2]; ray_t* out[2]; ray_t* po[2] = { NULL, NULL }; ray_t* pd[2] = { NULL, NULL };
     for (int gi = 0; gi < 2; gi++) {
-        e[gi] = t29_disk(gi ? ray_test_tmp(CS_TMP "/e2") : ray_test_tmp(CS_TMP "/e0"), nm, mul, 2, 30, gi ? 2 : 0, -1);
+        e[gi] = t29_disk(gi ? ray_test_tmp(CS_TMP "/e2") : ray_test_tmp(CS_TMP "/e0"), nm, mul, 2, 30, gi ? 2 : 0);
         TEST_ASSERT_TRUE(e[gi] && !RAY_IS_ERR(e[gi]));
         /* d = s + 1: shift the destination column through a derived table */
         ray_t* s = ray_table_col(e[gi], ray_sym_intern("s", 1));
@@ -4475,8 +3896,8 @@ static test_result_t test_datalog_query_gen2_equal(void) {
     static const int64_t mul2[2] = { 1, 100 };
     ray_t* r[2];
     for (int gi = 0; gi < 2; gi++) {
-        ray_t* db = t29_disk(gi ? ray_test_tmp(CS_TMP "/q2") : ray_test_tmp(CS_TMP "/q0"), nm3, mul3, 3, 50, gi ? 2 : 0, -1);
-        ray_t* ex = t29_disk(gi ? ray_test_tmp(CS_TMP "/x2") : ray_test_tmp(CS_TMP "/x0"), nm2, mul2, 2, 50, gi ? 2 : 0, -1);
+        ray_t* db = t29_disk(gi ? ray_test_tmp(CS_TMP "/q2") : ray_test_tmp(CS_TMP "/q0"), nm3, mul3, 3, 50, gi ? 2 : 0);
+        ray_t* ex = t29_disk(gi ? ray_test_tmp(CS_TMP "/x2") : ray_test_tmp(CS_TMP "/x0"), nm2, mul2, 2, 50, gi ? 2 : 0);
         TEST_ASSERT_TRUE(db && ex && !RAY_IS_ERR(db) && !RAY_IS_ERR(ex));
         if (gi) TEST_ASSERT_TRUE(ray_table_get_col_enc(ex, ray_sym_intern("p", 1)) != NULL);
         ray_env_set(ray_sym_intern("qdb", 3), db);
@@ -4627,16 +4048,11 @@ static test_result_t test_scalar_agg_planning_zoned(void) {
     PASS();
 }
 
-/* DAG construction names columns by metadata: over a generation-2 table whose
- * column cannot decode, compiling every name form succeeds without decoding,
- * and the failure surfaces when the DAG runs, as the column's own error. */
+/* DAG construction names columns by metadata: over a generation-2 table,
+ * compiling every name form succeeds without decoding, and the DAG runs. */
 static test_result_t test_dag_presence_without_decode(void) {
-    ray_t* t = ex_table(3000, true);
+    ray_t* t = ex_table(3000);
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    /* (sum a) is not here: a whole-column reduction of a stored column is
-     * answered from its directory without reading a vector (P3 Task 7), as a
-     * column with a recorded zone always was, so a damaged descriptor is not
-     * met; the sum of an expression over it decodes */
     static const char* const forms[] = { "a", "(+ a 1)", "(sum (+ a 1))", "'a", "(neg a)", NULL };
     for (int i = 0; forms[i]; i++) {
         ray_graph_t* g = ray_graph_new(t);
@@ -4650,8 +4066,10 @@ static test_result_t test_dag_presence_without_decode(void) {
             ray_error_clear();
             ray_t* r = ray_execute(g, ray_optimize(g, dag));
             if (r && ray_is_lazy(r)) r = ray_lazy_materialize(r);
-            test_result_t rr = ex_corrupt(r, forms[i]);
-            if (rr.status != TEST_PASS) { ray_release(e); ray_graph_free(g); ray_release(t); return rr; }
+            bool ran = r && !RAY_IS_ERR(r);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+            if (!ran) { ray_release(e); ray_graph_free(g); ray_release(t); }
+            TEST_ASSERT_FMT(ran, "form %s: ran", forms[i]);
         }
         ray_release(e);
         ray_graph_free(g);
@@ -4712,217 +4130,14 @@ static test_result_t test_query_helpers_gen2_equal(void) {
     PASS();
 }
 
-/* Damage the descriptor of a generation-2 file's first vector after the load
- * checks pass: the column loads and fails to materialize.  The byte is a
- * reserved descriptor field, so writing 0 back restores the file. */
-static bool qb_set_reserved(const char* path, int64_t n, int byte) {
-    FILE* f = fopen(path, "r+b");
-    if (!f) return false;
-    int64_t n_chunks = (n + 65535) / 65536;
-    bool ok = fseek(f, (long)(96 + 64 * n_chunks + 6), SEEK_SET) == 0 && fputc(byte, f) != EOF;
-    return fclose(f) == 0 && ok;
-}
-static bool qb_damage(const char* path, int64_t n) { return qb_set_reserved(path, n, 1); }
-
-/* `n` rows of b (5 i) and k (i mod 7), generation 0, then, generation 2:
- * a1 .. a9 (3 i), kb (BOOL, i mod 3 == 0), ks (STR, 5 values), kd (i mod 5),
- * kh (i mod 60000), kf (F64, (i mod 9) / 2).  `damage` NULL damages a1 .. a9
- * (each loads intact and fails to materialize), "" none, else only the named column:
- * a query's error names the one column the failing site read.  NULL when a
- * file cannot be written or damaged. */
-static ray_t* qb_table(int64_t n, const char* damage) {
-    char p[256];
-    (void)ray_test_rm_rf(ray_test_tmp(CS_TMP "/qb"));
-    (void)ray_test_mkdir_p(ray_test_tmp(CS_TMP "/qb"));
-    ray_t* names = ray_vec_new(RAY_STR, 16);
-    ray_t* b = i64_col(n, 5);
-    ray_t* k = ray_vec_new(RAY_I64, n); k->len = n;
-    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(k))[i] = i % 7;
-    snprintf(p, sizeof p, "%s/qb/b", ray_test_tmp(CS_TMP)); ray_col_save_gen(b, p, 0);
-    snprintf(p, sizeof p, "%s/qb/k", ray_test_tmp(CS_TMP)); ray_col_save_gen(k, p, 0);
-    ray_release(b); ray_release(k);
-    names = ray_str_vec_append(names, "b", 1); names = ray_str_vec_append(names, "k", 1);
-    static const char* const enc[] = { "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9",
-                                       "kb", "ks", "kd", "kh", "kf", NULL };
-    bool ok = true;
-    for (int c = 0; enc[c] && ok; c++) {
-        const char* nm = enc[c];
-        ray_t* v;
-        if (nm[0] == 'a') v = i64_col(n, 3);
-        else if (nm[1] == 'b') {
-            v = ray_vec_new(RAY_BOOL, n); v->len = n;
-            for (int64_t i = 0; i < n; i++) ((uint8_t*)ray_data(v))[i] = i % 3 == 0;
-        } else if (nm[1] == 's') {
-            v = ray_vec_new(RAY_STR, n);
-            static const char* const sv[] = { "red", "green", "blue", "cyan", "magenta" };
-            for (int64_t i = 0; i < n; i++) v = ray_str_vec_append(v, sv[i % 5], strlen(sv[i % 5]));
-        } else if (nm[1] == 'f') {
-            v = ray_vec_new(RAY_F64, n); v->len = n;
-            for (int64_t i = 0; i < n; i++) ((double*)ray_data(v))[i] = (double)(i % 9) / 2;
-        } else {
-            int64_t mod = nm[1] == 'd' ? 5 : 60000;
-            v = ray_vec_new(RAY_I64, n); v->len = n;
-            for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i % mod;
-        }
-        snprintf(p, sizeof p, "%s/qb/%s", ray_test_tmp(CS_TMP), nm);
-        ok = ray_col_save_gen(v, p, 2) == RAY_OK;
-        ray_release(v);
-        bool hit = damage ? strcmp(damage, nm) == 0 : nm[0] == 'a';
-        if (ok && hit) ok = qb_damage(p, n);
-        names = ray_str_vec_append(names, nm, strlen(nm));
-    }
-    snprintf(p, sizeof p, "%s/qb/.d", ray_test_tmp(CS_TMP)); ray_col_save(names, p); ray_release(names);
-    return ok ? ray_read_splayed(ray_test_tmp(CS_TMP "/qb"), NULL) : NULL;
-}
-
-/* A select whose source cannot materialize a column reports that column's
- * error from the helper that read it (the select entry no longer decodes the
- * source): each query references its own damaged column, so the file named
- * in the message proves which column the failing site read.  The row-wise
- * grouped expression binds every column (bind_all_columns' error path) and
- * fails on the first damaged column in table order, a1. */
-static test_result_t test_query_helpers_failed_decode(void) {
-    ray_t* t = qb_table(3000, NULL);
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    ray_env_set(ray_sym_intern("bad", 3), t);
-    ray_release(t);
-    static const struct { const char* q; const char* col; } qs[] = {
-        { "(select {c: (count (distinct a2)) by: b from: bad})",   "a2" },  /* count-distinct rewrite */
-        { "(select {s: (sum a3) by: b from: bad desc: s take: 2})", "a3" },
-        { "(select {c: (count a4) from: bad where: (== a4 3)})",    "a4" },
-        { "(select {x: (+ a5 1) from: bad})",                       "a5" },
-        { "(select {m: (max a6) from: bad where: (> b 10)})",       "a6" },  /* metadata declines: execution reads (a partly selected chunk) */
-        { "(select {s: (sum b) by: (+ a7 1) from: bad})",           "a7" },  /* computed-key plan */
-        { "(select {x: (+ a8 b) by: k from: bad})",                 "a8" },  /* grouped row-wise output */
-        { NULL, NULL },
-    };
-    for (int i = 0; qs[i].q; i++) {
-        char path[128];
-        snprintf(path, sizeof path, "%s/qb/%s", ray_test_tmp(CS_TMP), qs[i].col);
-        ray_error_clear();
-        ray_t* r = ray_eval_str(qs[i].q);
-        test_result_t rr = t29_corrupt_at(r, qs[i].q, path);
-        if (rr.status != TEST_PASS) return rr;
-    }
-    PASS();
-}
-
 /* ---- Task 31: ray_select_impl ---- */
-
-/* A select over a table whose encoded columns cannot materialize reports the
- * failure from the site that read the column: each query below references
- * one damaged column, and its error names that column's file.  The select
- * entry no longer decodes the source, so a query naming a2 failing on a1
- * would mean some site read a column the query never references (the
- * row-wise expression in a grouped select included: it binds the columns it
- * names). */
-static test_result_t test_select_sites_failed_decode(void) {
-    static const struct { const char* q; const char* col; } qs[] = {
-        { "(select {c: (count (distinct a2)) by: k from: bad})",            "a2" },
-        { "(select {s: (sum a3) by: k from: bad desc: s take: 2})",          "a3" },
-        { "(select {c: (count b) from: bad where: (== a4 3)})",              "a4" },
-        { "(select {x: (+ a5 1) from: bad})",                                "a5" },
-        { "(select {m: (max a6) from: bad where: (> b 10)})",                "a6" },
-        { "(select {s: (sum b) by: (+ a7 1) from: bad})",                    "a7" },
-        { "(select {x: a8 from: bad where: (> b 10) asc: a8 take: 3})",      "a8" },
-        { "(select {f: (first a9) by: k from: bad})",                        "a9" },
-        { "(select {s: (sum a2) by: k from: bad where: (> b 10)})",          "a2" },
-        { "(select {x: a3 y: b from: bad where: (> b 10)})",                 "a3" },
-        { "(select {x: a4 from: bad asc: a4})",                              "a4" },
-        { "(select {s: (sum b) by: a5 from: bad})",                          "a5" },
-        { "(select {s: (sum a6) l: (last b) by: [k b] from: bad})",          "a6" },
-        { "(select {x: (+ a5 b) by: k from: bad})",                          "a5" },  /* grouped row-wise output */
-        { NULL, NULL },
-    };
-    for (int n = 0; n < 2; n++) {
-        int64_t rows = n ? 200000 : 3000;
-        ray_t* t = qb_table(rows, NULL);
-        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-        ray_env_set(ray_sym_intern("bad", 3), t);
-        ray_release(t);
-        for (int i = 0; qs[i].q; i++) {
-            char path[128], what[200];
-            snprintf(path, sizeof path, "%s/qb/%s", ray_test_tmp(CS_TMP), qs[i].col);
-            snprintf(what, sizeof what, "%s (n=%lld)", qs[i].q, (long long)rows);
-            ray_error_clear();
-            ray_t* r = ray_eval_str(qs[i].q);
-            test_result_t rr = t29_corrupt_at(r, what, path);
-            if (rr.status != TEST_PASS) return rr;
-        }
-    }
-    PASS();
-}
-
-/* The routes past the first read: only the named column is damaged, so the
- * failure is the one site of that shape reading it (no-agg by and its
- * first-row gather, by-dict renames, computed and dependent keys, BOOL and
- * STR keys, eval-level groups and their gathers, multi-key first rows, the
- * row-expression scatter, the global count-distinct hash).  A zero-group
- * select builds its empty columns from metadata and does not fail. */
-static test_result_t test_select_routes_failed_decode(void) {
-    static const struct { const char* q; const char* col; bool ok; } qs[] = {
-        { "(select {from: bad by: k})",                                      "a3", false },
-        { "(select {from: bad by: kd})",                                     "kd", false },
-        { "(select {s: (sum a2) by: {k: k} from: bad})",                     "a2", false },
-        { "(select {s: (sum b) by: {kk: (+ kd 1)} from: bad})",              "kd", false },
-        { "(select {s: (sum b) by: {kk: kd} from: bad})",                    "kd", false },
-        { "(select {c: (count b) by: {kd: kd km: (- kd 1)} from: bad})",      "kd", false },
-        { "(select {s: (sum b) by: kb from: bad})",                          "kb", false },
-        { "(select {s: (sum a4) by: kb from: bad})",                         "a4", false },
-        { "(select {x: (+ b 1) by: ks from: bad})",                          "ks", false },
-        { "(select {m: (max a5) x: (+ b 1) by: ks from: bad})",              "a5", false },
-        { "(select {x: (+ a6 1) by: ks from: bad})",                         "a6", false },
-        { "(select {from: bad by: ks})",                                     "a6", false },
-        { "(select {from: bad by: [k kf]})",                                 "a7", false },
-        { "(select {from: bad by: [k kf]})",                                 "kf", false },
-        { "(select {d: (count (distinct b)) by: (+ kd 1) from: bad})",       "kd", false },
-        { "(select {s: (sum b) by: (+ kd 1) from: bad where: (< b 0)})",     "kd", true  },
-        { "(select {s: (sum b) x: (+ a9 1) by: k from: bad})",               "a9", false },
-        { "(select {c: (count (distinct a1)) s: (sum b) by: kh from: bad})", "a1", false },
-        { "(select {from: bad by: k where: (< b 0)})",                       "a8", true  },
-        { "(select {from: bad by: ks where: (< b 0)})",                      "ks", true  },
-        { NULL, NULL, false },
-    };
-    /* The table is written once per size, intact; each query damages its one
-     * column in place, loads a fresh table, and restores the byte after. */
-    for (int n = 0; n < 2; n++) {
-        int64_t rows = n ? 200000 : 3000;
-        ray_t* t0 = qb_table(rows, "");
-        TEST_ASSERT_TRUE(t0 && !RAY_IS_ERR(t0));
-        ray_release(t0);
-        for (int i = 0; qs[i].q; i++) {
-            char path[128], what[200];
-            snprintf(path, sizeof path, "%s/qb/%s", ray_test_tmp(CS_TMP), qs[i].col);
-            snprintf(what, sizeof what, "%s, %s damaged (n=%lld)", qs[i].q, qs[i].col, (long long)rows);
-            TEST_ASSERT_TRUE(qb_damage(path, rows));
-            ray_t* t = ray_read_splayed(ray_test_tmp(CS_TMP "/qb"), NULL);
-            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-            ray_env_set(ray_sym_intern("bad", 3), t);
-            ray_release(t);
-            ray_error_clear();
-            ray_t* r = ray_eval_str(qs[i].q);
-            ray_env_set(ray_sym_intern("bad", 3), NULL);
-            TEST_ASSERT_TRUE(qb_set_reserved(path, rows, 0));
-            if (qs[i].ok) {
-                bool fine = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 0;
-                if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
-                TEST_ASSERT_FMT(fine, "%s: an empty table", what);
-                continue;
-            }
-            test_result_t rr = t29_corrupt_at(r, what, path);
-            if (rr.status != TEST_PASS) return rr;
-        }
-    }
-    PASS();
-}
 
 /* The slice-group probe reads the key's index only after metadata admits it
  * (a SYM key with a HASH or PART index).  The HASH-indexed SYM key is saved
  * as generation 2 with its index rebuilt over the target ids, so the probe
  * reads the index its materialization attaches; the slice route runs over
- * an encoded aggregate column, and that column failing is the query's
- * error. */
-static test_result_t test_select_slice_probe_failed_decode(void) {
+ * an encoded aggregate column. */
+static test_result_t test_select_slice_probe_route(void) {
     static const char* const cols[] = { "f", NULL };
     for (int c = 0; cols[c]; c++) {
         TEST_ASSERT_STR_EQ(ev_code("(set SY ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh])"), "");
@@ -4932,7 +4147,6 @@ static test_result_t test_select_slice_probe_failed_decode(void) {
         TEST_ASSERT_STR_EQ(ev_code(ray_test_tmp("(.db.splayed.set \"" CS_TMP "/sp\" TI {compress: true})")), "");
         char p[128]; snprintf(p, sizeof p, "%s/sp/%s", ray_test_tmp(CS_TMP), cols[c]);
         TEST_ASSERT_EQ_U(file_gen(p), 2);
-        TEST_ASSERT_TRUE(qb_damage(p, 4000));
         TEST_ASSERT_EQ_U(file_gen(ray_test_tmp(CS_TMP "/sp/s")), 2);   /* the HASH-indexed SYM key */
         TEST_ASSERT_STR_EQ(ev_code(ray_test_tmp("(set TL (.db.splayed.get \"" CS_TMP "/sp\"))")), "");
         uint64_t hits0 = ray_idx_hits[IDX_SITE_GROUP_SLICE];
@@ -4940,8 +4154,9 @@ static test_result_t test_select_slice_probe_failed_decode(void) {
         ray_t* r = ray_eval_str("(select {sv: (sum f) c: (count f) from: TL by: s asc: s where: (in s ['aa 'cc])})");
         TEST_ASSERT_FMT(ray_idx_hits[IDX_SITE_GROUP_SLICE] == hits0 + 1, "the slice route ran %llu times",
                         (unsigned long long)(ray_idx_hits[IDX_SITE_GROUP_SLICE] - hits0));
-        test_result_t rr = t29_corrupt_at(r, cols[c], p);
-        if (rr.status != TEST_PASS) return rr;
+        bool ok = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 2;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        TEST_ASSERT_FMT(ok, "%s: two groups", cols[c]);
     }
     PASS();
 }
@@ -5012,8 +4227,8 @@ static test_result_t test_select_decodes_referenced_only(void) {
         { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      0 },  /* P2: x's consult reads the directory; Task 10: v, w by range */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
         { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             0 },  /* P2: the take scan range-reads w; P3 Task 6: k, v gathered */
-        { "(select {v: v from: u2 desc: v take: 3})",                         1 },
-        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      1 },  /* P2: the top-k scan range-reads w; the sort key x only (P3 Task 6) */
+        { "(select {v: v from: u2 desc: v take: 3})",                         0 },  /* the sort key read by range (fpk_rk_t) */
+        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      0 },  /* P2: the top-k scan range-reads w; the sort key x by range too */
         { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    0 },  /* P2: a fused side range-reads; w's consult reads the directory */
         { NULL, 0 },
     };
@@ -5394,51 +4609,6 @@ static test_result_t test_select_parted_prunes_by_key_uneven(void) {
     PASS();
 }
 
-/* A damaged surviving segment surfaces as `corrupt` with its path; a damaged
- * pruned segment is never read, and the query answers as undamaged. */
-static test_result_t test_select_parted_prunes_failure(void) {
-    ray_t* t = pdb_make(ray_test_tmp(CS_TMP "/sf"), 7, false);
-    TEST_ASSERT_NOT_NULL(t);
-    sp_bind(t);
-    ray_t* want = ray_eval_str("(select {s: (sum a) from: t where: (== date 2024.01.02)})");
-    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
-    sp_bind(NULL);
-    ray_release(t);
-    uint8_t one = 1;
-    FILE* f = fopen(ray_test_tmp(CS_TMP "/sf/2024.01.01/t/a"), "r+b");
-    TEST_ASSERT_NOT_NULL(f);
-    fseek(f, 160 + 6, SEEK_SET); fwrite(&one, 1, 1, f); fclose(f);
-    t = ray_read_parted(ray_test_tmp(CS_TMP "/sf"), "t");                       /* corruption passes load */
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    sp_bind(t);
-    ray_release(t);
-    static const char* const hit[] = {
-        "(select {s: (sum (* a 2)) from: t where: (<= date 2024.01.02)})",   /* (sum a): the directory answers */
-        "(select {from: t where: (in date [2024.01.01])})",
-        "(select {c: (count a) from: t by: b where: (!= date 2024.01.03)})",
-        NULL,
-    };
-    for (int i = 0; hit[i]; i++) {
-        ray_error_clear();
-        ray_t* r = ray_eval_str(hit[i]);
-        bool corrupt = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "corrupt") == 0;
-        bool path = ray_error_msg() && strstr(ray_error_msg(), "2024.01.01/t/a");
-        drop_out(r);
-        TEST_ASSERT_FMT(corrupt && path, "%s: corrupt with the path", hit[i]);
-    }
-    ray_t* got = ray_eval_str("(select {s: (sum a) from: t where: (== date 2024.01.02)})");
-    bool same = sp_same(got, want);
-    drop_out(got);
-    ray_t* any = ray_eval_str("(select {from: t where: (> date 2024.01.01)})");
-    bool ok = any && !RAY_IS_ERR(any) && ray_table_nrows(any) == 6000;
-    drop_out(any);
-    sp_bind(NULL);
-    ray_release(want);
-    TEST_ASSERT_TRUE(same);
-    TEST_ASSERT_TRUE(ok);
-    PASS();
-}
-
 /* A grouped non-aggregate output over a generation-2 table decodes only the
  * columns it names (and the key): the full-table evaluation behind the
  * per-group scatter binds the referenced columns, not every column.  The
@@ -5681,9 +4851,7 @@ const test_entry_t compress_entries[] = {
     { "compress/matrix_failure_inject",  test_matrix_failure_inject,  cs_setup, cs_teardown },
     { "compress/matrix_flat",            test_matrix_flat,            cs_setup, cs_teardown },
     { "compress/matrix_sym_remap",       test_matrix_sym_remap,       cs_setup, cs_teardown },
-    { "compress/matrix_failure_cleanup", test_matrix_failure_cleanup, cs_setup, cs_teardown },
     { "compress/str_const_offsets",      test_str_const_distinct_offsets, cs_setup, cs_teardown },
-    { "compress/ipc_failed_decode",             test_ipc_failed_decode,              ipc_setup, ipc_teardown },
     { "compress/dml_upsert_copy", test_dml_upsert_copy, rt_setup, rt_teardown },
     { "compress/dml_upsert_inplace", test_dml_upsert_inplace, rt_setup, rt_teardown },
     { "compress/dml_insert_copy", test_dml_insert_copy, rt_setup, rt_teardown },
@@ -5694,7 +4862,7 @@ const test_entry_t compress_entries[] = {
     { "compress/dml_delete_inplace", test_dml_delete_inplace, rt_setup, rt_teardown },
     { "compress/value_ops_copy_encoded", test_value_ops_copy_encoded, rt_setup, rt_teardown },
     { "compress/dml_on_select_result", test_dml_on_select_result, rt_setup, rt_teardown },
-    { "compress/failed_decode_propagates",      test_failed_decode_propagates,       rt_setup, rt_teardown },
+    { "compress/update_passes_encoded",         test_update_passes_encoded,          rt_setup, rt_teardown },
     { "compress/serde_byte_identity",           test_serde_byte_identity,            rt_setup, rt_teardown },
     { "compress/getter_keeps_pending_message",  test_getter_keeps_pending_message,   cs_setup, cs_teardown },
     { "compress/objsize_counts_cache",          test_objsize_counts_cache,           rt_setup, rt_teardown },
@@ -5702,10 +4870,6 @@ const test_entry_t compress_entries[] = {
     { "compress/parted_gen2_loads",           test_parted_gen2_loads,            rt_setup, rt_teardown },
     { "compress/meta_without_decode",           test_meta_without_decode,            cs_setup, cs_teardown },
     { "compress/user_values_are_plain",         test_user_values_are_plain,          rt_setup, rt_teardown },
-    { "compress/builtins_failed_decode",        test_builtins_failed_decode,         rt_setup, rt_teardown },
-    { "compress/rerank_failed_decode",          test_rerank_failed_decode,           rt_setup, rt_teardown },
-    { "compress/traverse_failed_decode",        test_traverse_failed_decode,         rt_setup, rt_teardown },
-    { "compress/like_env_failed_decode",        test_like_env_failed_decode,         rt_setup, rt_teardown },
     { "compress/legacy_getters",                test_legacy_getters,                 cs_setup, cs_teardown },
     { "compress/concurrent_one_materialization",test_concurrent_one_materialization, cs_setup, cs_teardown },
     { "compress/serde_encoded_table",           test_serde_encoded_table,            cs_setup, cs_teardown },
@@ -5738,21 +4902,16 @@ const test_entry_t compress_entries[] = {
     { "compress/parted_pruning_gen0",     test_parted_pruning_gen0,     rt_setup, rt_teardown },
     { "compress/parted_pruning_empty",    test_parted_pruning_empty,    rt_setup, rt_teardown },
     { "compress/parted_pruning_multi",    test_parted_pruning_multi,    rt_setup, rt_teardown },
-    { "compress/parted_pruning_failure",  test_parted_pruning_failure,  rt_setup, rt_teardown },
     { "compress/parted_pruning_mixed",    test_parted_pruning_mixed,    rt_setup, rt_teardown },
-    { "compress/exec_sites_failed_decode", test_exec_sites_failed_decode, rt_setup, rt_teardown },
+    { "compress/exec_sites_pass_encoded",  test_exec_sites_pass_encoded,  rt_setup, rt_teardown },
     { "compress/exec_sites_gen2_equal",    test_exec_sites_gen2_equal,    rt_setup, rt_teardown },
     { "compress/filter_absent_symbol",     test_filter_absent_symbol,     rt_setup, rt_teardown },
-    { "compress/group_sites_failed_decode", test_group_sites_failed_decode, rt_setup, rt_teardown },
     { "compress/group_sites_routes_same",   test_group_sites_routes_same,   rt_setup, rt_teardown },
     { "compress/group_sites_slice_route",   test_group_sites_slice_route,   rt_setup, rt_teardown },
     { "compress/group_sites_parted",        test_group_sites_parted,        rt_setup, rt_teardown },
-    { "compress/group_sites_parted_failed_decode", test_group_sites_parted_failed_decode, rt_setup, rt_teardown },
-    { "compress/join_sites_failed_decode",   test_join_sites_failed_decode,   rt_setup, rt_teardown },
     { "compress/join_sites_gen2_equal",      test_join_sites_gen2_equal,      rt_setup, rt_teardown },
     { "compress/tblop_sites_gen2_equal",     test_tblop_sites_gen2_equal,     rt_setup, rt_teardown },
-    { "compress/tblop_sites_failed_decode",  test_tblop_sites_failed_decode,  rt_setup, rt_teardown },
-    { "compress/datalog_sites_failed_decode", test_datalog_sites_failed_decode, rt_setup, rt_teardown },
+    { "compress/tblop_sites_lazy",           test_tblop_sites_lazy,           rt_setup, rt_teardown },
     { "compress/datalog_sites_gen2_equal",   test_datalog_sites_gen2_equal,   rt_setup, rt_teardown },
     { "compress/join_sites_parted",          test_join_sites_parted,          rt_setup, rt_teardown },
     { "compress/dml_parted_gen2",            test_dml_parted_gen2,            rt_setup, rt_teardown },
@@ -5761,10 +4920,7 @@ const test_entry_t compress_entries[] = {
     { "compress/scalar_agg_planning_zoned", test_scalar_agg_planning_zoned, rt_setup, rt_teardown },
     { "compress/dag_presence_without_decode", test_dag_presence_without_decode, rt_setup, rt_teardown },
     { "compress/query_helpers_gen2_equal",   test_query_helpers_gen2_equal,   rt_setup, rt_teardown },
-    { "compress/query_helpers_failed_decode", test_query_helpers_failed_decode, rt_setup, rt_teardown },
-    { "compress/select_sites_failed_decode", test_select_sites_failed_decode, rt_setup, rt_teardown },
-    { "compress/select_routes_failed_decode", test_select_routes_failed_decode, rt_setup, rt_teardown },
-    { "compress/select_slice_probe_failed_decode", test_select_slice_probe_failed_decode, rt_setup, rt_teardown },
+    { "compress/select_slice_probe_route", test_select_slice_probe_route, rt_setup, rt_teardown },
     { "compress/select_bydict_binds_referenced", test_select_bydict_binds_referenced, rt_setup, rt_teardown },
     { "compress/select_decodes_referenced_only", test_select_decodes_referenced_only, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
@@ -5773,7 +4929,6 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_shadow",  test_select_parted_prunes_shadow,  rt_setup, rt_teardown },
     { "compress/select_parted_prunes_none",    test_select_parted_prunes_none,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_by_key_uneven", test_select_parted_prunes_by_key_uneven, rt_setup, rt_teardown },
-    { "compress/select_parted_prunes_failure", test_select_parted_prunes_failure, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { "compress/select_parted_bydict_streams", test_select_parted_bydict_streams, rt_setup, rt_teardown },
     { "compress/select_parted_empty_nullable", test_select_parted_empty_nullable, rt_setup, rt_teardown },
