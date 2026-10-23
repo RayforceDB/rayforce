@@ -54,6 +54,7 @@
 #include "store/enccol.h"    /* ray_enccol_adopt_domain — empty columns of encoded SYM */
 #include "store/enceval.h"   /* ray_enc_count_cmp — the count fast path on views */
 #include "mem/heap.h"
+#include "mem/arena.h"       /* the views of a compressed vocabulary (dk_chunk_views) */
 
 #include <string.h>
 #include <math.h>
@@ -6457,15 +6458,32 @@ static void dk_chunk_fill_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
     }
 }
 
+/* A compressed vocabulary's entries of a chunk, decoded into the places
+ * dk_chunk_views gave them. */
+static void dk_chunk_decode_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    dk_chunk_ctx_t* c = (dk_chunk_ctx_t*)vctx;
+    for (int64_t i = start; i < end; i++) {
+        if (c->len[i] == UINT32_MAX || (c->want && !c->want[i])) continue;
+        int64_t pos = ray_read_sym(c->dv, c->lo + i, RAY_SYM, c->dattrs);
+        ray_sym_domain_raw_decode(c->raw, pos, (char*)c->ptr[i]);
+    }
+}
+
+/* The calling thread's buffer for the views of a compressed vocabulary. */
+static _Thread_local ray_arena_t* g_dk_zarena;
+
 /* The bytes of entries dv[lo, lo+n) as (ptr, len) views: read on the
  * workers off the raw snapshot (FILE) or the borrowed atom array (the
  * runtime domain), a position past either resolved through the domain on
  * the calling thread.  With `want`, only the entries it marks are read (the
- * others come out as empty views, their bytes untouched).  False on a
- * length past UINT32_MAX. */
+ * others come out as empty views, their bytes untouched).  A compressed
+ * vocabulary's entries are decoded into a buffer of the calling thread
+ * that holds them until a later call with `fresh`.  False on a length past
+ * UINT32_MAX or on OOM. */
 static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n,
                            const ray_sym_domain_raw_t* raw, struct ray_sym_domain_s* dom,
-                           const uint8_t* want, const char** ptr, uint32_t* len) {
+                           const uint8_t* want, const char** ptr, uint32_t* len, bool fresh) {
     dk_chunk_ctx_t c;
     memset(&c, 0, sizeof(c));
     c.dv = dv; c.dattrs = dattrs; c.lo = lo; c.raw = raw;
@@ -6479,7 +6497,34 @@ static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n
     }
     atomic_store_explicit(&c.late, 0, memory_order_relaxed);
     ray_pool_t* pool = ray_pool_get();
-    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
+    if (raw && raw->z && !c.rstr) {
+        /* lengths from the index, places in the buffer, then the decode */
+        if (!g_dk_zarena && !(g_dk_zarena = ray_arena_new((size_t)1 << 20))) return false;
+        if (fresh) ray_arena_reset(g_dk_zarena);
+        uint64_t total = 0;
+        int late = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (want && !want[i]) { ptr[i] = ""; len[i] = 0; continue; }
+            int64_t pos = ray_read_sym(dv, lo + i, RAY_SYM, dattrs);
+            int64_t l = pos >= 0 && pos < raw->count ? ray_sym_domain_raw_len(raw, pos) : -1;
+            if (l > UINT32_MAX) return false;
+            if (l < 0) { ptr[i] = NULL; len[i] = UINT32_MAX; late++; continue; }
+            len[i] = (uint32_t)l;
+            total += (uint64_t)l + 8;
+        }
+        char* at = total ? (char*)ray_arena_alloc_raw(g_dk_zarena, (size_t)total) : NULL;
+        if (total && !at) return false;
+        for (int64_t i = 0; i < n; i++) {
+            if (len[i] == UINT32_MAX || (want && !want[i])) continue;
+            ptr[i] = at;
+            at += (size_t)len[i] + 8;
+        }
+        if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
+            ray_pool_dispatch(pool, dk_chunk_decode_fn, &c, n);
+        else
+            dk_chunk_decode_fn(&c, 0, 0, n);
+        if (late) atomic_store_explicit(&c.late, late, memory_order_relaxed);
+    } else if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
         ray_pool_dispatch(pool, dk_chunk_scan_fn, &c, n);
     else
         dk_chunk_scan_fn(&c, 0, 0, n);
@@ -7218,6 +7263,25 @@ static inline const char* dkh_item_key(const dkh_item_t* it) {
     return it->l <= DKH_INLINE ? it->kb : it->p;
 }
 
+/* The bytes of a min / max candidate by its index when the vocabulary is a
+ * compressed file: its strings are decoded per read (domain.h), so a
+ * pointer to one does not last; the best value is kept by its index and
+ * decoded again for each comparison.  `dv` NULL: the index is the position. */
+typedef struct {
+    const ray_sym_domain_raw_t* raw;
+    struct ray_sym_domain_s*    dom;
+    const void*                 dv;
+    uint8_t                     dattrs;
+} dkh_zr_t;
+
+static inline const dkh_zr_t* dkh_zr_set(dkh_zr_t* z, const ray_sym_domain_raw_t* raw,
+                                         struct ray_sym_domain_s* dom, const void* dv,
+                                         uint8_t dattrs) {
+    if (!raw || !raw->z) return NULL;
+    z->raw = raw; z->dom = dom; z->dv = dv; z->dattrs = dattrs;
+    return z;
+}
+
 typedef struct {
     /* inputs */
     ray_t*                      by_expr;
@@ -7250,6 +7314,8 @@ typedef struct {
     const int64_t*              wrank;
     int64_t                     r_empty;  /* rank of the empty key's group by its first value, -1 */
     ray_t*                      hdrs[8];
+    dkh_zr_t                    zr;       /* min / max of a compressed vocabulary: */
+    const dkh_zr_t*             zp;       /* &zr then, else NULL */
 } dkh_t;
 
 static inline uint32_t dkh_part_of(uint64_t h) { return (uint32_t)(h >> (64 - DKH_PART_BITS)); }
@@ -7258,15 +7324,36 @@ static inline uint64_t dkh_slot(uint64_t h) { return (h * 0x9E3779B97F4A7C15ull)
 /* One value's min / max candidate against the best so far (bi < 0: none):
  * by bytes, then length; of equal values the lower value index wins (the
  * first in value order, as the row path keeps the first row). */
-static inline void dkh_minmax(int64_t* bi, const char** bp, uint32_t* bl, int64_t vi,
-                              const char* p, uint32_t l, bool is_max) {
+static const char* dkh_zget(const dkh_zr_t* z, int64_t i, uint32_t* l) {
+    int64_t pos = z->dv ? ray_read_sym(z->dv, i, RAY_SYM, z->dattrs) : i;
+    if (pos >= 0 && pos < z->raw->count) {
+        size_t sl = 0;
+        const char* p = ray_sym_domain_raw_str(z->raw, pos, &sl);
+        *l = (uint32_t)sl;
+        return p ? p : "";
+    }
+    ray_t* a = ray_sym_domain_str(z->dom, pos);
+    *l = a ? (uint32_t)ray_str_len(a) : 0;
+    return a ? ray_str_ptr(a) : "";
+}
+
+/* Value vi (bytes p, l; with `z`, p may be NULL: read by its index) into
+ * the best (*bi, *bp, *bl) so far; with `z` the best is kept by index only. */
+static inline void dkh_minmax(const dkh_zr_t* z, int64_t* bi, const char** bp, uint32_t* bl,
+                              int64_t vi, const char* p, uint32_t l, bool is_max) {
     if (*bi >= 0) {
-        uint32_t m = l < *bl ? l : *bl;
-        int cmp = m ? memcmp(p, *bp, m) : 0;
-        if (cmp == 0) cmp = (l > *bl) - (l < *bl);
+        const char* q = *bp;
+        uint32_t ql = *bl;
+        if (z) {
+            if (!p) p = dkh_zget(z, vi, &l);
+            q = dkh_zget(z, *bi, &ql);
+        }
+        uint32_t m = l < ql ? l : ql;
+        int cmp = m ? memcmp(p, q, m) : 0;
+        if (cmp == 0) cmp = (l > ql) - (l < ql);
         if (cmp == 0 ? vi > *bi : (is_max ? cmp < 0 : cmp > 0)) return;
     }
-    *bi = vi; *bp = p; *bl = l;
+    *bi = vi; *bp = z ? NULL : p; *bl = l;
 }
 
 static void dkh_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
@@ -7378,8 +7465,8 @@ static void dkh_group_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
             if (cnt) cnt[g] += it->k;
             if (it->null) { P->null_g = g; P->null_vi = vi; continue; }
             if (lenw) lenw[g] += it->k * (int64_t)it->vl;
-            if (mn) dkh_minmax(&mn[g], &mnp[g], &mnl[g], vi, c->sp[it->i], it->vl, false);
-            if (mx) dkh_minmax(&mx[g], &mxp[g], &mxl[g], vi, c->sp[it->i], it->vl, true);
+            if (mn) dkh_minmax(c->zp, &mn[g], &mnp[g], &mnl[g], vi, c->sp[it->i], it->vl, false);
+            if (mx) dkh_minmax(c->zp, &mx[g], &mxp[g], &mxl[g], vi, c->sp[it->i], it->vl, true);
         }
         P->kbn = kbn;
         P->ng = ng;
@@ -7584,6 +7671,7 @@ static bool dkh_build(dkh_t* c) {
     for (int p = 0; p < DKH_NPART; p++) { c->part[p].null_g = -1; c->part[p].empty_g = -1; }
     c->dv = ray_data(c->dvec);
     c->dattrs = c->dvec->attrs;
+    c->zp = dkh_zr_set(&c->zr, c->raw, c->dom, c->dv, c->dattrs);
     ray_pool_t* pool = ray_pool_get();
     uint32_t nwork = ray_pool_par_dispatch_ok(pool, 2, 1) ? ray_pool_total_workers(pool) : 1;
 
@@ -7623,7 +7711,7 @@ static bool dkh_build(dkh_t* c) {
         int64_t n = du - lo < chunk ? du - lo : chunk;
         c->lo = lo; c->n = n;
         bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
-        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, NULL, c->sp, c->sl)) return false;
+        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, NULL, c->sp, c->sl, true)) return false;
         ray_t* kc = NULL;
         if (!dkh_keys_of(c->by_expr, c->col, use_prog ? prog : NULL, regs, c->sp, c->sl, n,
                          c->kp, c->kl, c->kh, &kc)) return false;
@@ -7899,8 +7987,8 @@ static void dkh_mm_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
             const dkh_mm_item_t* it = &m->items[j];
             int64_t vi = m->lo + it->i;
             uint32_t o = it->o;
-            if (m->mn) dkh_minmax(&m->mn[o], &m->mnp[o], &m->mnl[o], vi, it->p, it->l, false);
-            if (m->mx) dkh_minmax(&m->mx[o], &m->mxp[o], &m->mxl[o], vi, it->p, it->l, true);
+            if (m->mn) dkh_minmax(m->c->zp, &m->mn[o], &m->mnp[o], &m->mnl[o], vi, it->p, it->l, false);
+            if (m->mx) dkh_minmax(m->c->zp, &m->mx[o], &m->mxp[o], &m->mxl[o], vi, it->p, it->l, true);
         }
     }
 }
@@ -7936,7 +8024,7 @@ static bool dkh_kept_minmax_scatter(const dkh_t* c, const uint32_t* oix,
         bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
         if (par) ray_pool_dispatch(pool, dkh_mm_want_fn, &m, n);
         else     dkh_mm_want_fn(&m, 0, 0, n);
-        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, m.want, m.sp, m.sl)) { ok = false; break; }
+        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, m.want, m.sp, m.sl, true)) { ok = false; break; }
         int64_t nt = 1;
         if (par) {
             nt = nt_max;
@@ -8019,8 +8107,8 @@ static void dkh_mmw_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         const char* p; uint32_t l;
         if (!dkh_mmw_str(m, pos, &p, &l)) { late++; continue; }
         size_t s = base + o;
-        if (m->mn) dkh_minmax(&m->mn[s], &m->mnp[s], &m->mnl[s], vi, p, l, false);
-        if (m->mx) dkh_minmax(&m->mx[s], &m->mxp[s], &m->mxl[s], vi, p, l, true);
+        if (m->mn) dkh_minmax(c->zp, &m->mn[s], &m->mnp[s], &m->mnl[s], vi, p, l, false);
+        if (m->mx) dkh_minmax(c->zp, &m->mx[s], &m->mxp[s], &m->mxl[s], vi, p, l, true);
     }
     if (late) atomic_fetch_add_explicit(&m->late, late, memory_order_relaxed);
 }
@@ -8066,8 +8154,8 @@ static bool dkh_kept_minmax(const dkh_t* c, const uint32_t* oix, int64_t K,
     for (int64_t o = 0; ok && o < K; o++) {
         for (int64_t wk = 0; wk < nw; wk++) {
             size_t s = (size_t)wk * (size_t)K + (size_t)o;
-            if (mn && wmn[s] >= 0) dkh_minmax(&mn[o], &mnp[o], &mnl[o], wmn[s], wmnp[s], wmnl[s], false);
-            if (mx && wmx[s] >= 0) dkh_minmax(&mx[o], &mxp[o], &mxl[o], wmx[s], wmxp[s], wmxl[s], true);
+            if (mn && wmn[s] >= 0) dkh_minmax(c->zp, &mn[o], &mnp[o], &mnl[o], wmn[s], wmnp[s], wmnl[s], false);
+            if (mx && wmx[s] >= 0) dkh_minmax(c->zp, &mx[o], &mxp[o], &mxl[o], wmx[s], wmxp[s], wmxl[s], true);
         }
     }
     /* the values no worker could read, through the domain */
@@ -8084,8 +8172,8 @@ static bool dkh_kept_minmax(const dkh_t* c, const uint32_t* oix, int64_t K,
             if (sl > UINT32_MAX) { ok = false; break; }
             p = a ? ray_str_ptr(a) : "";
             l = (uint32_t)sl;
-            if (mn) dkh_minmax(&mn[o], &mnp[o], &mnl[o], vi, p, l, false);
-            if (mx) dkh_minmax(&mx[o], &mxp[o], &mxl[o], vi, p, l, true);
+            if (mn) dkh_minmax(c->zp, &mn[o], &mnp[o], &mnl[o], vi, p, l, false);
+            if (mx) dkh_minmax(c->zp, &mx[o], &mxp[o], &mxl[o], vi, p, l, true);
         }
     }
     scratch_free(ohdr);
@@ -8489,6 +8577,8 @@ typedef struct {
     uint64_t*                   unres;    /* per value: marked */
     atomic_int                  n_unres;
     int64_t                     null_g, null_cnt;
+    dkh_zr_t                    zr;       /* min / max of a compressed vocabulary, by position */
+    const dkh_zr_t*             zp;
 } dk2_t;
 
 static inline uint32_t dk2_sc(const dk2_t* c, int64_t v) {
@@ -8755,16 +8845,16 @@ static inline void dk2_add(dk2_t* c, dk2_acc_t* a, int64_t g, int64_t v, const c
     if (pos < a->fpos) a->fpos = pos;
     if (pos <= 0) { c->null_g = g; c->null_cnt = k; return; }   /* the one null value */
     if (c->want_lenw) a->lenw += k * (int64_t)l;
-    if (c->want_mn) dkh_minmax(&a->mn, &a->mnp, &a->mnl, pos, p, l, false);
-    if (c->want_mx) dkh_minmax(&a->mx, &a->mxp, &a->mxl, pos, p, l, true);
+    if (c->want_mn) dkh_minmax(c->zp, &a->mn, &a->mnp, &a->mnl, pos, p, l, false);
+    if (c->want_mx) dkh_minmax(c->zp, &a->mx, &a->mxp, &a->mxl, pos, p, l, true);
 }
 
-static void dk2_acc_merge(dk2_acc_t* a, const dk2_acc_t* b) {
+static void dk2_acc_merge(const dkh_zr_t* z, dk2_acc_t* a, const dk2_acc_t* b) {
     a->cnt += b->cnt;
     a->lenw += b->lenw;
     if (b->fpos < a->fpos) a->fpos = b->fpos;
-    if (b->mn >= 0) dkh_minmax(&a->mn, &a->mnp, &a->mnl, b->mn, b->mnp, b->mnl, false);
-    if (b->mx >= 0) dkh_minmax(&a->mx, &a->mxp, &a->mxl, b->mx, b->mxp, b->mxl, true);
+    if (b->mn >= 0) dkh_minmax(z, &a->mn, &a->mnp, &a->mnl, b->mn, b->mnp, b->mnl, false);
+    if (b->mx >= 0) dkh_minmax(z, &a->mx, &a->mxp, &a->mxl, b->mx, b->mxp, b->mxl, true);
 }
 
 /* pass B selection: per task, the chunk's values it takes and their count */
@@ -8852,7 +8942,7 @@ static bool dk2_select(dk2_t* c, int64_t lo, int64_t n, int64_t nt_max, ray_t** 
     for (int64_t t = 0; t < nt; t++) { int64_t k = c->tcnt[t]; c->tcnt[t] = run; run += k; }
     c->m = run;
     if (run == 0) return true;
-    if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, c->want, c->sp, c->sl)) return false;
+    if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, c->want, c->sp, c->sl, true)) return false;
     atomic_store_explicit(&c->n_none, 0, memory_order_relaxed);
     if (nt > 1) ray_pool_dispatch_n(pool, dk2_compact_fn, c, (uint32_t)nt);
     else        dk2_compact_fn(c, 0, 0, 1);
@@ -8904,6 +8994,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
     c->by_expr = by_expr; c->col = col;
     c->dv = ray_data(Hc); c->dattrs = Hc->attrs;
     c->dom = dom; c->raw = raw; c->du = du;
+    c->zp = dkh_zr_set(&c->zr, raw, dom, NULL, 0);
     c->hn = (int64_t*)ray_data(Hn);
     c->having = having;
     c->null_g = -1;
@@ -8963,7 +9054,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
         int64_t n = du - lo < chunk ? du - lo : chunk;
         c->lo = lo; c->n = n;
         bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
-        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, raw, dom, NULL, c->sp, c->sl)) goto done;
+        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, raw, dom, NULL, c->sp, c->sl, true)) goto done;
         if (!dkh_keys_of(by_expr, col, c->prog, c->regs, c->sp, c->sl, n, c->kp, c->kl, c->kh, &kc)) goto done;
         int64_t nt = 1;
         if (par) {
@@ -9039,7 +9130,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
         uint32_t* rsl = (uint32_t*)m;        m += (size_t)NC * sizeof(uint32_t);
         uint32_t* rkl = (uint32_t*)m;
         for (int64_t j = 0; j < NC; j++)
-            if (!dk_chunk_views(c->dv, c->dattrs, cv[j], 1, raw, dom, NULL, &rsp[j], &rsl[j])) goto done;
+            if (!dk_chunk_views(c->dv, c->dattrs, cv[j], 1, raw, dom, NULL, &rsp[j], &rsl[j], j == 0)) goto done;
         if (!dkh_keys_of(by_expr, col, c->prog, c->regs, rsp, rsl, NC, rkp, rkl, rkh, &kc)) goto done;
         for (int64_t j = 0; j < NC; j++) {
             /* the same program over the same bytes: the same hash */
@@ -9073,7 +9164,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
             scratch_free(khdr); khdr = NULL;
         }
         for (int64_t g = 0; g < NC; g++)
-            for (int64_t t = 0; t < c->nacc; t++) dk2_acc_merge(&c->grp[g].a, &c->acc[t * NC + g]);
+            for (int64_t t = 0; t < c->nacc; t++) dk2_acc_merge(c->zp, &c->grp[g].a, &c->acc[t * NC + g]);
         scratch_free(acc_hdr); acc_hdr = NULL; c->acc = NULL;
         ray_profile_tick("derived key: pass B, candidate keys");
 

@@ -85,6 +85,16 @@ int64_t ray_fsst_decode(const ray_fsst_table_t* t, const uint8_t* in, uint32_t l
     return (int64_t)o;
 }
 
+int64_t ray_fsst_decode_fast(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len, uint8_t* out) {
+    size_t o = 0;
+    for (uint32_t i = 0; i < len;) {
+        uint8_t c = in[i++];
+        if (c != RAY_FSST_ESC) { memcpy(out + o, t->sym[c], 8); o += t->len[c]; }
+        else out[o++] = in[i++];
+    }
+    return (int64_t)o;
+}
+
 int64_t ray_fsst_table_bytes(const ray_fsst_table_t* t) {
     return 8 + (((int64_t)t->n + 7) & ~(int64_t)7) + 8 * (int64_t)t->n;
 }

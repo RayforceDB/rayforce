@@ -92,6 +92,7 @@
 #include "sym.h"            /* ray_sym_intern_prehashed (runtime fallback) */
 #include "symimp.h"         /* DOM_IMPORT */
 #include "store/enccol.h"   /* ray_enccol_of: a generation-2 SYM column's domain */
+#include "store/fsst.h"     /* compressed symfiles: each record FSST-coded */
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -122,6 +123,17 @@
 
 /* Same on-disk format constant as src/table/sym.c (private there). */
 #define DOMAIN_STRL_MAGIC 0x4C525453U /* "STRL" */
+
+/* A compressed symfile, "STRZ": the STRL header, then the FSST symbol table
+ * the records are coded with (fixed size: the symbol count, 255 lengths,
+ * 255 symbols of 8 bytes), then one record per entry, [u32 coded length |
+ * coded bytes].  Its index (.ix) gives each entry's string length decoded,
+ * as for a plain file, so a length is still read without its record; the
+ * records of a block are walked by their own headers.  Written by
+ * ray_sym_domain_compress; appends to it are coded with its table. */
+#define DOMAIN_STRZ_MAGIC 0x5A525453U /* "STRZ" */
+#define DOM_Z_TAB  (1 + 255 + 255 * 8)
+#define DOM_Z_REC0 ((size_t)12 + DOM_Z_TAB)   /* byte offset of a compressed file's first record */
 
 typedef enum {
     DOM_RUNTIME = 0,
@@ -333,6 +345,18 @@ struct ray_sym_domain_s {
     dom_retired_t* retired; /* replaced directories, checkpoints, snapshot records, LUTs */
 
     struct ray_symimp_s* imp; /* DOM_IMPORT: the import dictionary */
+
+    /* FILE, compressed symfile: its symbol table and the encoder's index
+     * (immutable after open), the byte offset of its first record (12 for
+     * a plain file), and a decode buffer for the paths under g_dom_lock. */
+    ray_fsst_table_t* z;
+    ray_fsst_index_t* zix;
+    size_t    rec0;
+    uint8_t*  zbuf;
+    size_t    zcap;
+
+    /* FILE: the bytes of the file read whole at open (ray_sym_domain_preload); 0: lazy */
+    size_t    preloaded;
 
     struct ray_sym_domain_s* next; /* cache chain */
 };
@@ -587,6 +611,71 @@ static inline int64_t dom_ck_count(int64_t entries) {
 static inline uint32_t dom_rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline uint64_t dom_rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
+_Static_assert(sizeof(ray_fsst_table_t) == DOM_Z_TAB, "a symbol table is stored as laid out");
+
+/* The byte offset of the first record of a symfile image (by its magic). */
+static inline size_t dom_rec0_of(const uint8_t* map) {
+    return dom_rd32(map) == DOMAIN_STRZ_MAGIC ? DOM_Z_REC0 : 12;
+}
+
+/* Buffer `*buf` of at least `need` bytes (sys memory, grown by doubling). */
+static uint8_t* dom_buf_need(uint8_t** buf, size_t* cap, size_t need) {
+    if (need <= *cap) return *buf;
+    size_t c = *cap ? *cap : 256;
+    while (c < need) c *= 2;
+    uint8_t* nb = (uint8_t*)ray_sys_alloc(c);
+    if (!nb) return NULL;
+    ray_sys_free(*buf);
+    *buf = nb;
+    *cap = c;
+    return nb;
+}
+
+/* The coded record of entry `pos` of a compressed image: past the records
+ * before it in its block by their own headers. */
+static inline const uint8_t* dom_z_rec(const uint8_t* map, const dom_ixb_t* ib, int64_t pos,
+                                       uint32_t* clen) {
+    int64_t k = pos / DOM_IX_STRIDE, j = pos % DOM_IX_STRIDE;
+    const uint8_t* p = map + ib[k].off;
+    for (int64_t i = 0; i < j; i++) p += 4 + (size_t)dom_rd32(p);
+    *clen = dom_rd32(p);
+    return p + 4;
+}
+
+/* Entry `pos`'s decoded length: from the index, the escape's from its record. */
+static inline size_t dom_z_len(const ray_fsst_table_t* z, const dom_ixb_t* ib, int64_t pos,
+                               const uint8_t* rec, uint32_t clen) {
+    uint16_t e = ib[pos / DOM_IX_STRIDE].len[pos % DOM_IX_STRIDE];
+    return e < DOM_LEN_LONG ? e : (size_t)ray_fsst_expanded_len(z, rec, clen);
+}
+
+/* The decode buffers of the calling thread, used in turn (domain.h). */
+typedef struct {
+    uint8_t* b[RAY_SYM_RAW_RING];
+    size_t   cap[RAY_SYM_RAW_RING];
+    unsigned at;
+} dom_zring_t;
+static _Thread_local dom_zring_t g_zring;
+
+void ray_sym_domain_raw_decode(const ray_sym_domain_raw_t* r, int64_t pos, char* out) {
+    uint32_t clen;
+    const uint8_t* rec = dom_z_rec(r->map, r->ib, pos, &clen);
+    ray_fsst_decode_fast((const ray_fsst_table_t*)r->z, rec, clen, (uint8_t*)out);
+}
+
+const char* ray_sym_domain_raw_str_z(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len) {
+    const ray_fsst_table_t* z = (const ray_fsst_table_t*)r->z;
+    uint32_t clen;
+    const uint8_t* rec = dom_z_rec(r->map, r->ib, pos, &clen);
+    size_t dl = dom_z_len(z, r->ib, pos, rec, clen);
+    unsigned k = g_zring.at++ % RAY_SYM_RAW_RING;
+    uint8_t* out = dom_buf_need(&g_zring.b[k], &g_zring.cap[k], dl + 8);
+    if (!out) { *len = 0; return NULL; }
+    ray_fsst_decode_fast(z, rec, clen, out);
+    *len = dl;
+    return (const char*)out;
+}
+
 /* A block table for `count` entries; with room for its own checkpoints
  * and lengths when `own` (else both are the index file's, set by the
  * caller).  NULL on OOM. */
@@ -714,17 +803,24 @@ static const uint8_t* dom_src_get(dom_src_t* s, uint64_t off, uint64_t len) {
 
 /* Walk entries [from, b->count) of the image, the first at byte *off: the
  * checkpoint of every block that starts on the way and, into the table's own
- * lengths, the length of every entry.  False when a read of the file fails. */
-static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t* off) {
+ * lengths, the length of every entry (of a compressed image `z`, decoded
+ * from its record).  False when a read of the file fails. */
+static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t* off,
+                             const ray_fsst_table_t* z) {
     uint64_t o = *off;
     for (int64_t i = from; i < b->count; i++) {
         int64_t k = i / DOM_IX_STRIDE, j = i % DOM_IX_STRIDE;
         if (!j) b->own_ib[k].off = o;
         const uint8_t* h = dom_src_get(src, o, 4);
         if (!h) return false;
-        uint32_t l = dom_rd32(h);
+        uint32_t l = dom_rd32(h), sl = l;
+        if (z) {
+            const uint8_t* rec = dom_src_get(src, o + 4, l);
+            if (!rec) return false;
+            sl = (uint32_t)ray_fsst_expanded_len(z, rec, l);
+        }
         o += 4 + (uint64_t)l;
-        b->own_ib[k].len[j] = l < DOM_LEN_LONG ? (uint16_t)l : (uint16_t)DOM_LEN_LONG;
+        b->own_ib[k].len[j] = sl < DOM_LEN_LONG ? (uint16_t)sl : (uint16_t)DOM_LEN_LONG;
     }
     *off = (size_t)o;
     return true;
@@ -748,24 +844,51 @@ static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
                          const dom_blk_t* b, const ray_file_id_t* id);
 static size_t dom_ix_min(void);
 
-/* Entry `pos` of the mapped prefix.  Under g_dom_lock.  NULL when out of
- * range. */
+/* The string of a compressed record [rec, rec + clen) of length `dl`,
+ * decoded into the domain's buffer.  Under g_dom_lock. */
+static const uint8_t* dom_z_decode_locked(ray_sym_domain_t* d, const uint8_t* rec, uint32_t clen,
+                                          size_t dl) {
+    uint8_t* out = dom_buf_need(&d->zbuf, &d->zcap, dl + 8);
+    if (!out) return NULL;
+    ray_fsst_decode_fast(d->z, rec, clen, out);
+    return out;
+}
+
+/* Entry `pos` of the mapped prefix (of a compressed file decoded, valid
+ * until the next such read).  Under g_dom_lock.  NULL when out of range. */
 static const uint8_t* dom_entry_locked(ray_sym_domain_t* d, int64_t pos, uint32_t* len) {
     if (pos < 0 || pos >= d->base_count || !d->blk) return NULL;
+    if (d->z) {
+        uint32_t clen;
+        const uint8_t* rec = dom_z_rec((const uint8_t*)d->map, d->blk->ib, pos, &clen);
+        size_t dl = dom_z_len(d->z, d->blk->ib, pos, rec, clen);
+        *len = (uint32_t)dl;
+        return dom_z_decode_locked(d, rec, clen, dl);
+    }
     return dom_blk_entry((const uint8_t*)d->map, d->blk, pos, len);
 }
 
 /* Bytes of entry `pos` in order, for a pass over the whole vocabulary
- * (pos = 0, 1, ..., *off starting at 12): the mapped records read in turn,
- * then the appended atoms.  Under g_dom_lock. */
+ * (pos = 0, 1, ..., *off starting at d->rec0): the mapped records read in
+ * turn (a compressed one decoded, valid until the next call), then the
+ * appended atoms.  Under g_dom_lock. */
 static bool dom_next_locked(ray_sym_domain_t* d, int64_t pos, size_t* off,
                             const char** p, size_t* len) {
     if (pos < d->base_count) {
         size_t o = *off;
         uint32_t l = dom_rd32((const uint8_t*)d->map + o);
-        *p = (const char*)d->map + o + 4;
-        *len = l;
+        const uint8_t* rec = (const uint8_t*)d->map + o + 4;
         *off = o + 4 + l;
+        if (d->z) {
+            size_t dl = dom_z_len(d->z, d->blk->ib, pos, rec, l);
+            const uint8_t* out = dom_z_decode_locked(d, rec, l, dl);
+            if (!out) return false;
+            *p = (const char*)out;
+            *len = dl;
+            return true;
+        }
+        *p = (const char*)rec;
+        *len = l;
         return true;
     }
     ray_t* a = dom_slot_get(atomic_load_explicit(&d->atoms, memory_order_relaxed), pos);
@@ -788,8 +911,14 @@ static const char* dom_bytes_locked(ray_sym_domain_t* d, int64_t pos, size_t* le
 
 /* Free a FILE domain after the last reference dropped.  Caller has
  * already unlinked it from the cache. */
+static void dom_preload_release(ray_sym_domain_t* d);
+
 static void dom_destroy(ray_sym_domain_t* d) {
+    dom_preload_release(d);
     if (d->imp) ray_symimp_free(d->imp);
+    ray_sys_free(d->z);
+    ray_sys_free(d->zix);
+    ray_sys_free(d->zbuf);
     /* Atoms and slot chunks are arena memory — never individually freed.
      * The arena bulk-frees them; only the directory is freed here. */
     ray_sys_free(atomic_load_explicit(&d->atoms, memory_order_relaxed));
@@ -1029,7 +1158,8 @@ static bool dom_write_blocks(FILE* f, const uint64_t* ck, const dom_lsrc_t* ls, 
 static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
                         const uint64_t* ck, int64_t n, const dom_lsrc_t* ls,
                         int64_t count, uint64_t end, const ray_file_id_t* id) {
-    if (!path || count <= 0 || n != dom_ck_count(count) || end > map_size || ck[0] != 12 ||
+    if (!path || count <= 0 || n != dom_ck_count(count) || end > map_size || map_size < 12 ||
+        ck[0] != dom_rec0_of(map) ||
         ck[n - 1] >= end || (ls->na > 0 && !ls->pb) || (ls->na < count && !ls->lb))
         return;
     char ip[PATH_MAX], tp[PATH_MAX];
@@ -1081,7 +1211,7 @@ static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
     dom_ixh_t x;
     bool app = f && fread(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR && dom_ixh_get(h, &x) &&
                x.count == ix_count && x.end == ix_end && x.count <= count &&
-               (uint64_t)n <= x.cap && ck[0] == 12 && ck[n - 1] < end;
+               (uint64_t)n <= x.cap && size >= 12 && ck[0] == dom_rec0_of(map) && ck[n - 1] < end;
     if (app) {
         int64_t k0 = dom_ck_count(x.count) - 1;
         x.count = count;
@@ -1150,10 +1280,10 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
         b = dom_blk_new(count, true);
         if (!b) return false;
         b->end = size;
-        size_t o = 12;
+        size_t o = d->rec0;
         dom_src_t src;
         if (!dom_src_open(&src, d->path, &d->map_id, size)) src = dom_src_map(map, size);
-        bool walked = dom_blk_walk_src(&src, b, 0, &o);
+        bool walked = dom_blk_walk_src(&src, b, 0, &o, d->z);
         dom_src_close(&src);
         if (!walked) { ray_sys_free(b); return false; }
     }
@@ -1196,6 +1326,7 @@ static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
  * appends (a second writer) — fails.  Called under g_dom_lock with the
  * file's current size in st_size. */
 static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
+    if (d->z) return false;   /* a compressed file grows only by this process's flushes */
     int64_t count = atomic_load_explicit(&d->count, memory_order_relaxed);
     if (st_size < d->disk_size) return false;       /* shrunk: rewritten */
     if (count != d->disk_count) return false;       /* our tail is dirty */
@@ -1248,7 +1379,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             size_t o = 12;
             dom_src_t src;
             if (!dom_src_open(&src, d->path, &nid, map_size)) src = dom_src_map(nbase, map_size);
-            bool walked = dom_blk_walk_src(&src, nb, 0, &o);
+            bool walked = dom_blk_walk_src(&src, nb, 0, &o, NULL);
             dom_src_close(&src);
             if (!walked) { ray_sys_free(nb); nb = NULL; ok = false; break; }
         }
@@ -1390,6 +1521,93 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     return ok;
 }
 
+/* ---- preload ----
+ * A symbol file the memory holds with room to spare is read whole when its
+ * table opens (ray_sym_domain_preload): the pool's workers read it in
+ * DOM_PL_CHUNK pieces, many requests in flight, so the page cache holds it
+ * before the first query and the query's reads of the mapping are minor
+ * faults.  A storage request takes its latency however fast the device is,
+ * so one sequential stream reads at a fraction of its throughput.  A file
+ * left out stays lazy (read by the faults of the queries that touch it).
+ * The kernel still evicts these pages under pressure; the lazy path then
+ * reads them again. */
+#define DOM_PL_CHUNK    ((size_t)8 << 20)
+#define DOM_PL_MIN      ((size_t)1 << 20)   /* smaller files: their faults are cheap */
+static _Atomic(int64_t) g_dom_preloaded;   /* bytes of the open domains read at open */
+
+typedef struct {
+    int    fd;
+    size_t size;
+} dom_pl_ctx_t;
+
+static void dom_preload_fn(void* raw, uint32_t wid, int64_t c0, int64_t c1) {
+    (void)wid;
+    const dom_pl_ctx_t* x = (const dom_pl_ctx_t*)raw;
+    uint8_t* buf = (uint8_t*)ray_sys_alloc(DOM_PL_CHUNK);
+    if (!buf) return;   /* the pages stay lazy */
+    for (int64_t c = c0; c < c1; c++) {
+        size_t off = (size_t)c * DOM_PL_CHUNK;
+        size_t n = x->size - off < DOM_PL_CHUNK ? x->size - off : DOM_PL_CHUNK;
+        for (size_t got = 0; got < n;) {
+            ssize_t r = pread(x->fd, buf + got, n - got, (off_t)(off + got));
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+    }
+    ray_sys_free(buf);
+}
+
+void ray_sym_domain_preload(ray_sym_domain_t* d, int64_t headroom) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    if (!d || d->kind != DOM_FILE || d->preloaded) return;
+    size_t size = d->map_size;
+    if (!d->map || size < DOM_PL_MIN) return;
+    const char* e = getenv("RAY_SYM_PRELOAD");
+    int mode = (e && *e) ? atoi(e) : -1;   /* -1: by the memory left; 0 never; 1 always */
+    if (mode == 0) return;
+    bool trace = getenv("RAY_SYM_TRACE") != NULL;
+    int64_t lim = ray_sys_ram_limit();
+    int64_t anon = ray_heap_anon_committed();
+    int64_t had = atomic_fetch_add_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);
+    int64_t left = lim - anon - had - (int64_t)size;
+    if (mode < 0 && (lim <= 0 || left < headroom)) {
+        atomic_fetch_sub_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);
+        if (trace)
+            fprintf(stderr, "sym preload %s: lazy (%zu B; would leave %lld B, needs %lld B)\n",
+                    d->path, size, (long long)left, (long long)headroom);
+        return;
+    }
+    int fd = open(d->path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        atomic_fetch_sub_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);
+        return;
+    }
+    d->preloaded = size;
+    int64_t t0 = trace ? ray_profile_now_ns() : 0;
+    dom_pl_ctx_t x = { fd, size };
+    int64_t nc = (int64_t)((size + DOM_PL_CHUNK - 1) / DOM_PL_CHUNK);
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, nc, 2))
+        ray_pool_dispatch_n(pool, dom_preload_fn, &x, (uint32_t)nc);
+    else
+        dom_preload_fn(&x, 0, 0, nc);
+    close(fd);
+    if (trace)
+        fprintf(stderr, "sym preload %s: read %zu B in %.2f s (leaves %lld B, needs %lld B)\n",
+                d->path, size, (double)(ray_profile_now_ns() - t0) / 1e9,
+                (long long)left, (long long)headroom);
+#else
+    (void)d; (void)headroom;
+#endif
+}
+
+static void dom_preload_release(ray_sym_domain_t* d) {
+    if (d->preloaded)
+        atomic_fetch_sub_explicit(&g_dom_preloaded, (int64_t)d->preloaded, memory_order_relaxed);
+    d->preloaded = 0;
+}
+
 static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!path) return NULL;
 
@@ -1434,6 +1652,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     atomic_store_explicit(&d->raw_snap, NULL, memory_order_relaxed);
     d->retired_maps = NULL;
     d->path = rpath;
+    d->rec0 = 12;
     /* String atoms (lazy file slots + runtime-appended interns) live here,
      * off the per-thread buddy heap.  64 KB chunks. */
     d->arena = ray_arena_new(64 * 1024);
@@ -1448,6 +1667,18 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         const uint8_t* m = (const uint8_t*)d->map;
         if (m && d->map_size >= 12 && dom_rd32(m) == DOMAIN_STRL_MAGIC)
             memcpy(&count, m + 4, 8);
+        if (m && d->map_size >= DOM_Z_REC0 && dom_rd32(m) == DOMAIN_STRZ_MAGIC) {
+            /* a compressed file: its symbol table (and the encoder's index,
+             * for appends) is copied out of the header */
+            d->z = (ray_fsst_table_t*)ray_sys_alloc(sizeof(ray_fsst_table_t));
+            d->zix = (ray_fsst_index_t*)ray_sys_alloc(sizeof(ray_fsst_index_t));
+            if (d->z && d->zix) {
+                memcpy(d->z, m + 12, DOM_Z_TAB);
+                ray_fsst_index_build(d->z, d->zix);
+                d->rec0 = DOM_Z_REC0;
+                memcpy(&count, m + 4, 8);
+            }
+        }
         if (count < 0 || count > (int64_t)UINT32_MAX || !dom_index_image(d, count)) {
             dom_destroy(d);
             return NULL;
@@ -1520,6 +1751,7 @@ ray_sym_domain_t* ray_sym_domain_new(void) {
     if (!d) return NULL;
     d->kind = DOM_FILE;
     d->rc = 1;
+    d->rec0 = 12;
     atomic_store_explicit(&d->raw_snap, NULL, memory_order_relaxed);
     d->arena = ray_arena_new(64 * 1024);
     if (!d->arena) { ray_sys_free(d); return NULL; }
@@ -1586,6 +1818,7 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     out->count = snap->count;
     out->blk = snap->blk;
     out->dom = dom;
+    out->z = dom->z;
     return true;
 }
 
@@ -1640,7 +1873,7 @@ const int64_t* ray_sym_domain_runtime_lut(ray_sym_domain_t* dom) {
          * it.  Callers that hand ids to ray_pool_dispatch workers
          * must request this LUT during sequential setup — interning
          * inside a worker violates sym.c's frozen-table rule. */
-        size_t off = 12;
+        size_t off = dom->rec0;
         for (int64_t i = 0; i < count; i++) {
             const char* p = NULL;
             size_t l = 0;
@@ -1690,7 +1923,7 @@ static bool dom_build_index_locked(ray_sym_domain_t* d, int64_t extra) {
         }
     } else {
         /* One pass over the records, hashed where they lie: no atom. */
-        size_t off = 12;
+        size_t off = d->rec0;
         for (int64_t i = 0; i < count; i++) {
             const char* p = NULL;
             size_t l = 0;
@@ -2388,6 +2621,17 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom) {
  * appended to the index on disk, at the cost of the records flushed
  * (dom_ix_refresh), so a reader never finds an index short of the file.
  * Called under the symfile's `.lk` flock. */
+/* The record bytes of an appended string `s`: itself, or of a compressed
+ * file coded with its table into *buf.  NULL on OOM. */
+static const uint8_t* dom_rec_bytes(const ray_sym_domain_t* dom, const char* s, size_t slen,
+                                    uint8_t** buf, size_t* cap, size_t* rlen) {
+    if (!dom->z) { *rlen = slen; return (const uint8_t*)s; }
+    uint8_t* out = dom_buf_need(buf, cap, 2 * slen + 8);
+    if (!out) return NULL;
+    *rlen = (size_t)ray_fsst_encode_ix(dom->z, dom->zix, (const uint8_t*)s, (uint32_t)slen, out);
+    return out;
+}
+
 static void dom_flush_index(ray_sym_domain_t* dom, int64_t count, uint64_t end) {
     dom_lock();
     bool want = end >= dom_ix_min();
@@ -2490,7 +2734,8 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
                 int64_t fcount = -1;
                 if (!vf || fread(&magic, 4, 1, vf) != 1 ||
                     fread(&fcount, 8, 1, vf) != 1 ||
-                    magic != DOMAIN_STRL_MAGIC || fcount != disk_count)
+                    magic != (dom->z ? DOMAIN_STRZ_MAGIC : DOMAIN_STRL_MAGIC) ||
+                    fcount != disk_count)
                     ok = false;
                 if (vf) fclose(vf);
             }
@@ -2512,7 +2757,9 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
             ray_file_close(lock_fd);
             return RAY_ERR_IO;
         }
-        uint32_t magic = DOMAIN_STRL_MAGIC;
+        /* a compressed file keeps its header (the symbol table) and codes
+         * the new records with it */
+        uint32_t magic = dom->z && base_count > 0 ? DOMAIN_STRZ_MAGIC : DOMAIN_STRL_MAGIC;
         err = RAY_OK;
         if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&count, 8, 1, f) != 1)
             err = RAY_ERR_IO;
@@ -2525,7 +2772,8 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
          * entry dominated the flush of a big vocabulary. */
         enum { FLUSH_BUF = 1u << 20 };
         uint8_t* wb = (uint8_t*)ray_sys_alloc(FLUSH_BUF);
-        size_t wn = 0;
+        uint8_t* zb = NULL;
+        size_t zc = 0, wn = 0;
         if (!wb) err = RAY_ERR_OOM;
         for (int64_t i = base_count; err == RAY_OK && i < count; i++) {
             ray_t* s = dom_slot_get(dir, i);
@@ -2536,6 +2784,8 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
             }
             size_t slen = ray_str_len(s);
             if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+            const uint8_t* rb = dom_rec_bytes(dom, ray_str_ptr(s), slen, &zb, &zc, &slen);
+            if (!rb) { err = RAY_ERR_OOM; break; }
             uint32_t len32 = (uint32_t)slen;
             if (wn + 4 + slen > FLUSH_BUF) {
                 if (wn && fwrite(wb, 1, wn, f) != wn) { err = RAY_ERR_IO; break; }
@@ -2544,19 +2794,20 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
             if (4 + slen > FLUSH_BUF) {
                 /* Oversized record: straight through. */
                 if (fwrite(&len32, 4, 1, f) != 1 ||
-                    fwrite(ray_str_ptr(s), 1, slen, f) != slen) {
+                    fwrite(rb, 1, slen, f) != slen) {
                     err = RAY_ERR_IO;
                     break;
                 }
             } else {
                 memcpy(wb + wn, &len32, 4);
-                if (slen) memcpy(wb + wn + 4, ray_str_ptr(s), slen);
+                if (slen) memcpy(wb + wn + 4, rb, slen);
                 wn += 4 + slen;
             }
             written_size += 4 + slen;
         }
         if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
         ray_sys_free(wb);
+        ray_sys_free(zb);
         if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
     }
     if (err != RAY_OK) goto fail_tmp;
@@ -2669,7 +2920,8 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     dom_ck_t tail = {0};
     enum { FLUSH_BUF = 1u << 20 };
     uint8_t* wb = err == RAY_OK ? (uint8_t*)ray_sys_alloc(FLUSH_BUF) : NULL;
-    size_t wn = 0;
+    uint8_t* zb = NULL;
+    size_t zc = 0, wn = 0;
     if (err == RAY_OK && !wb) err = RAY_ERR_OOM;
     for (int64_t i = disk_count; err == RAY_OK && i < count; i++) {
         ray_t* s = dom_slot_get(dir, i);
@@ -2677,25 +2929,29 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         if (!(i % DOM_IX_STRIDE) && !dom_ck_push(&tail, size)) { err = RAY_ERR_OOM; break; }
         size_t slen = ray_str_len(s);
         if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+        /* appended to a compressed file: coded with its table */
+        const uint8_t* rb = dom_rec_bytes(dom, ray_str_ptr(s), slen, &zb, &zc, &slen);
+        if (!rb) { err = RAY_ERR_OOM; break; }
         uint32_t len32 = (uint32_t)slen;
         if (wn + 4 + slen > FLUSH_BUF) {
             if (wn && fwrite(wb, 1, wn, f) != wn) { err = RAY_ERR_IO; break; }
             wn = 0;
         }
         if (4 + slen > FLUSH_BUF) {
-            if (fwrite(&len32, 4, 1, f) != 1 || fwrite(ray_str_ptr(s), 1, slen, f) != slen) {
+            if (fwrite(&len32, 4, 1, f) != 1 || fwrite(rb, 1, slen, f) != slen) {
                 err = RAY_ERR_IO;
                 break;
             }
         } else {
             memcpy(wb + wn, &len32, 4);
-            if (slen) memcpy(wb + wn + 4, ray_str_ptr(s), slen);
+            if (slen) memcpy(wb + wn + 4, rb, slen);
             wn += 4 + slen;
         }
         size += 4 + slen;
     }
     if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
     ray_sys_free(wb);
+    ray_sys_free(zb);
     /* the count goes in last, once the records it covers are written */
     if (err == RAY_OK && (fflush(f) != 0 || !dom_fseek(f, 4) ||
                           fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0))
@@ -2725,6 +2981,192 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     dom_ck_free(&tail);
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
+    return err;
+}
+
+/* ---- compressing a symfile -------------------------------------------------- */
+
+/* One window of the coding pass: chunk c holds the records of blocks
+ * [k0 + c * cb, k0 + (c + 1) * cb), coded into out[c] (olen[c] bytes), the
+ * offset of each of its blocks' first record in rel[c][]. */
+typedef struct {
+    const uint8_t*          map;
+    const dom_ixb_t*        ib;
+    int64_t                 n, count, k0, cb;
+    uint64_t                end;
+    const ray_fsst_table_t* t;
+    const ray_fsst_index_t* ix;
+    uint8_t**               out;
+    size_t*                 cap;
+    size_t*                 olen;
+    uint64_t**              rel;
+    _Atomic(bool)           oom;
+} dom_zc_ctx_t;
+
+static void dom_zc_chunk_fn(void* vctx, uint32_t wid, int64_t c0, int64_t c1) {
+    (void)wid;
+    dom_zc_ctx_t* x = (dom_zc_ctx_t*)vctx;
+    for (int64_t c = c0; c < c1; c++) {
+        int64_t ka = x->k0 + c * x->cb, kb = ka + x->cb < x->n ? ka + x->cb : x->n;
+        uint64_t lo = x->ib[ka].off, hi = kb < x->n ? x->ib[kb].off : x->end;
+        uint8_t* out = dom_buf_need(&x->out[c], &x->cap[c], 2 * (size_t)(hi - lo) + 16);
+        if (!out) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); return; }
+        const uint8_t* p = x->map + lo;
+        size_t o = 0;
+        int64_t ie = kb * DOM_IX_STRIDE < x->count ? kb * DOM_IX_STRIDE : x->count;
+        for (int64_t i = ka * DOM_IX_STRIDE; i < ie; i++) {
+            if (!(i % DOM_IX_STRIDE)) x->rel[c][i / DOM_IX_STRIDE - ka] = o;
+            uint32_t l = dom_rd32(p);
+            uint32_t cl = (uint32_t)ray_fsst_encode_ix(x->t, x->ix, p + 4, l, out + o + 4);
+            memcpy(out + o, &cl, 4);
+            o += 4 + cl;
+            p += 4 + l;
+        }
+        x->olen[c] = o;
+    }
+}
+
+ray_err_t ray_sym_domain_compress(const char* path) {
+    if (!path) return RAY_ERR_TYPE;
+    char* rpath = dom_resolve_path(path);
+    if (!rpath) return RAY_ERR_IO;
+    /* the file is replaced under its name: no domain may have it open */
+    dom_lock();
+    for (ray_sym_domain_t* d = g_domains; d; d = d->next)
+        if (dom_path_eq(d->path, rpath)) { dom_unlock(); ray_sys_free(rpath); return RAY_ERR_DOMAIN; }
+    dom_unlock();
+
+    size_t size = 0;
+    ray_file_id_t id;
+    const uint8_t* map = (const uint8_t*)ray_vm_map_file_id(rpath, &size, &id);
+    int64_t count = -1;
+    if (map && size >= 12 && dom_rd32(map) == DOMAIN_STRL_MAGIC) memcpy(&count, map + 4, 8);
+    if (count <= 0 || count > (int64_t)UINT32_MAX) {
+        /* not a plain symfile with entries (a compressed one stays as it is) */
+        if (map) ray_vm_unmap_file((void*)map, size);
+        ray_sys_free(rpath);
+        return RAY_OK;
+    }
+    ray_vm_advise_seq((void*)map, size);
+    /* the block table: from the file's index, else one walk */
+    dom_ixh_t hx;
+    void* ixm = NULL;
+    size_t ixs = 0;
+    dom_blk_t* b = dom_ix_load(rpath, map, size, count, &id, &ixm, &ixs, &hx);
+    if (!b) {
+        b = dom_blk_new(count, true);
+        size_t o = 12;
+        dom_src_t src;
+        if (b && !dom_src_open(&src, rpath, &id, size)) src = dom_src_map(map, size);
+        bool walked = b && dom_blk_walk_src(&src, b, 0, &o, NULL);
+        if (b) dom_src_close(&src);
+        if (!walked) {
+            ray_sys_free(b);
+            ray_vm_unmap_file((void*)map, size);
+            ray_sys_free(rpath);
+            return b ? RAY_ERR_IO : RAY_ERR_OOM;
+        }
+        b->end = size;
+    }
+    ray_err_t err = RAY_OK;
+    int64_t n = b->n;
+
+    /* the training sample: every record of every sb-th block, some 1 MiB */
+    int64_t sb = (int64_t)((size - 12) >> 20);
+    if (sb < 1) sb = 1;
+    int64_t sn = 0, scap = ((n + sb - 1) / sb) * DOM_IX_STRIDE;
+    const uint8_t** sp = (const uint8_t**)ray_sys_alloc((size_t)scap * sizeof(*sp));
+    uint32_t* sl = (uint32_t*)ray_sys_alloc((size_t)scap * sizeof(*sl));
+    ray_fsst_table_t* t = (ray_fsst_table_t*)ray_sys_alloc(sizeof(*t));
+    ray_fsst_index_t* tix = (ray_fsst_index_t*)ray_sys_alloc(sizeof(*tix));
+    if (!sp || !sl || !t || !tix) err = RAY_ERR_OOM;
+    for (int64_t k = 0; err == RAY_OK && k < n; k += sb) {
+        const uint8_t* p = map + b->ib[k].off;
+        int64_t ie = (k + 1) * DOM_IX_STRIDE < count ? (k + 1) * DOM_IX_STRIDE : count;
+        for (int64_t i = k * DOM_IX_STRIDE; i < ie; i++) {
+            sl[sn] = dom_rd32(p);
+            sp[sn++] = p + 4;
+            p += 4 + (size_t)dom_rd32(p);
+        }
+    }
+    int tr = err == RAY_OK ? ray_fsst_train(sp, sl, sn, t) : 0;
+    ray_sys_free(sp);
+    ray_sys_free(sl);
+    if (err == RAY_OK && tr < 0) err = RAY_ERR_OOM;
+    bool code = err == RAY_OK && tr > 0;   /* no table: the file stays plain */
+
+    char tp[PATH_MAX];
+    uint64_t* ck = code ? (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t)) : NULL;
+    if (code && (!ck || snprintf(tp, sizeof(tp), "%s.z.%llu.tmp", rpath, dom_pid()) >= (int)sizeof(tp)))
+        err = ck ? RAY_ERR_IO : RAY_ERR_OOM;
+    FILE* f = code && err == RAY_OK ? fopen(tp, "wb") : NULL;
+    if (code && err == RAY_OK && !f) err = RAY_ERR_IO;
+    uint64_t pos = DOM_Z_REC0;
+    if (f) {
+        ray_fsst_index_build(t, tix);
+        uint32_t magic = DOMAIN_STRZ_MAGIC;
+        if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&count, 8, 1, f) != 1 ||
+            fwrite(t, 1, DOM_Z_TAB, f) != DOM_Z_TAB)
+            err = RAY_ERR_IO;
+        /* windows of chunks of some 2 MiB of records, coded in parallel and
+         * written in order */
+        ray_pool_t* pool = ray_pool_get();
+        uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+        int64_t cb = (int64_t)(((uint64_t)(2u << 20) * (uint64_t)n) / (size - 12));
+        if (cb < 1) cb = 1;
+        int64_t wn = 2 * (int64_t)nw < 64 ? 2 * (int64_t)nw : 64;
+        dom_zc_ctx_t x;
+        memset(&x, 0, sizeof(x));
+        x.map = map; x.ib = b->ib; x.n = n; x.count = count; x.cb = cb; x.end = size;
+        x.t = t; x.ix = tix;
+        x.out = (uint8_t**)ray_sys_alloc((size_t)wn * sizeof(uint8_t*));
+        x.cap = (size_t*)ray_sys_alloc((size_t)wn * sizeof(size_t));
+        x.olen = (size_t*)ray_sys_alloc((size_t)wn * sizeof(size_t));
+        x.rel = (uint64_t**)ray_sys_alloc((size_t)wn * sizeof(uint64_t*));
+        if (!x.out || !x.cap || !x.olen || !x.rel) err = RAY_ERR_OOM;
+        for (int64_t c = 0; err == RAY_OK && c < wn; c++)
+            if (!(x.rel[c] = (uint64_t*)ray_sys_alloc((size_t)cb * sizeof(uint64_t)))) err = RAY_ERR_OOM;
+        for (int64_t k0 = 0; err == RAY_OK && k0 < n; k0 += wn * cb) {
+            int64_t nc = (n - k0 + cb - 1) / cb;
+            if (nc > wn) nc = wn;
+            x.k0 = k0;
+            if (pool && nc > 1) ray_pool_dispatch_n(pool, dom_zc_chunk_fn, &x, (uint32_t)nc);
+            else dom_zc_chunk_fn(&x, 0, 0, nc);
+            if (atomic_load_explicit(&x.oom, memory_order_relaxed)) { err = RAY_ERR_OOM; break; }
+            for (int64_t c = 0; c < nc; c++) {
+                int64_t ka = k0 + c * cb, kb = ka + cb < n ? ka + cb : n;
+                for (int64_t k = ka; k < kb; k++) ck[k] = pos + x.rel[c][k - ka];
+                if (fwrite(x.out[c], 1, x.olen[c], f) != x.olen[c]) { err = RAY_ERR_IO; break; }
+                pos += x.olen[c];
+            }
+        }
+        for (int64_t c = 0; x.out && c < wn; c++) ray_sys_free(x.out[c]);
+        for (int64_t c = 0; x.rel && c < wn; c++) ray_sys_free(x.rel[c]);
+        ray_sys_free(x.out); ray_sys_free(x.cap); ray_sys_free(x.olen); ray_sys_free(x.rel);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+        /* the index describes the old file until it is written anew */
+        if (err == RAY_OK) ray_sym_domain_index_remove(rpath);
+        if (err == RAY_OK) err = ray_file_rename(tp, rpath);
+        if (err != RAY_OK) remove(tp);
+    }
+    if (code && err == RAY_OK && pos >= dom_ix_min()) {
+        size_t zsize = 0;
+        ray_file_id_t zid;
+        const uint8_t* zmap = (const uint8_t*)ray_vm_map_file_id(rpath, &zsize, &zid);
+        if (zmap) {
+            /* the lengths are the strings', as before: the old table's */
+            dom_lsrc_t ls = { b->ib, count, NULL };
+            dom_ix_save(rpath, zmap, zsize, ck, n, &ls, count, zsize, &zid);
+            ray_vm_unmap_file((void*)zmap, zsize);
+        }
+    }
+    ray_sys_free(ck);
+    ray_sys_free(t);
+    ray_sys_free(tix);
+    ray_sys_free(b);
+    if (ixm) ray_vm_unmap_file(ixm, ixs);
+    ray_vm_unmap_file((void*)map, size);
+    ray_sys_free(rpath);
     return err;
 }
 

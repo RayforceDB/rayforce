@@ -156,25 +156,47 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
  * `count` (the file prefix) are readable this way; runtime-appended
  * positions keep going through ray_sym_domain_str.  ray_sym_domain_raw_str
  * returns NULL (and *len 0) for a position out of range.  Unpin is a no-op
- * kept for symmetry. */
+ * kept for symmetry.
+ *
+ * A compressed symfile (each record FSST-coded, see domain.c) has `z` set:
+ * its strings are decoded into a small ring of buffers of the calling
+ * thread, so a pointer ray_sym_domain_raw_str returns for it stays valid
+ * only until that thread's RAY_SYM_RAW_RING-th next read of a compressed
+ * entry.  Enough for a comparison of two entries; a caller that keeps
+ * pointers longer copies the bytes (or reads their lengths with
+ * ray_sym_domain_raw_len, which decodes nothing). */
 #define RAY_SYM_INDEX_STRIDE 28   /* entries in a block of the index: 64 bytes with its offset */
 typedef struct {
     uint64_t off;                          /* byte offset of the block's first record */
     uint16_t len[RAY_SYM_INDEX_STRIDE];    /* the entries' string lengths, 65535 = 65535 or longer */
 } ray_sym_ixblk_t;
 _Static_assert(sizeof(ray_sym_ixblk_t) == 64, "an index block is one cache line");
+#define RAY_SYM_RAW_RING 4   /* decode buffers per thread for compressed entries */
 typedef struct {
     const unsigned char* map;
     const ray_sym_ixblk_t* ib;   /* block k: starts at map + ib[k].off; NULL: none */
     int64_t              count;
     void*                blk;    /* the domain's block table */
     ray_sym_domain_t*    dom;
+    const void*          z;      /* the symbol table of a compressed file; NULL: plain */
 } ray_sym_domain_raw_t;
 bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out);
+/* Reads the file of a FILE domain whole into the page cache, in parallel,
+ * when the memory left after it (the RAM limit less the committed heap and
+ * the files read so far) is at least `headroom`; else leaves it lazy.  Once
+ * per domain.  RAY_SYM_PRELOAD=0 never reads, =1 always; RAY_SYM_TRACE
+ * prints the decision. */
+void ray_sym_domain_preload(ray_sym_domain_t* dom, int64_t headroom);
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom);
+const char* ray_sym_domain_raw_str_z(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len);
+/* Entry `pos` (below r->count) of a compressed file decoded into `out`, which
+ * holds its length (ray_sym_domain_raw_len) and 8 bytes more: a caller that
+ * keeps the bytes places them itself. */
+void ray_sym_domain_raw_decode(const ray_sym_domain_raw_t* r, int64_t pos, char* out);
 static inline const char* ray_sym_domain_raw_str(const ray_sym_domain_raw_t* r,
                                                  int64_t pos, size_t* len) {
     if (pos < 0 || pos >= r->count || !r->ib) { *len = 0; return NULL; }
+    if (r->z) return ray_sym_domain_raw_str_z(r, pos, len);
     /* past the records before the entry by their lengths (65535: the
      * record header's) */
     const int64_t k = pos / RAY_SYM_INDEX_STRIDE;
@@ -317,6 +339,16 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable);
  * `durable` also syncs the file and its directory, even when nothing new
  * was interned. */
 ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable);
+
+/* Rewrite the plain symfile at `path` compressed: each string coded with an
+ * FSST symbol table trained on a sample of them (domain.c, "STRZ"), the
+ * positions, lengths and index kept.  For a file written whole and read
+ * after, such as one column's vocabulary: reads of an entry then decode it
+ * (ray_sym_domain_raw_str), and the file and the memory it takes when read
+ * shrink.  No domain may have the file open (RAY_ERR_DOMAIN).  A file with
+ * no entries, one already compressed or one no table helps stays as it is
+ * (RAY_OK). */
+ray_err_t ray_sym_domain_compress(const char* path);
 
 /* RAY_SYM_AUDIT=1 support (cached at ray_sym_init): when set,
  * ray_sym_vec_cell cross-checks every resolution and aborts with full

@@ -212,12 +212,40 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                              a ? ray_type_name(a->type) : "null");
         }
     }
+    /* options: compress (true/false) and symfile ('shared/'column) */
+    ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
+    for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
+        ray_t* k = ray_sym_vec_cell(okeys, i);
+        bool known = k && ((ray_str_len(k) == 8 && memcmp(ray_str_ptr(k), "compress", 8) == 0) ||
+                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "symfile", 7) == 0));
+        if (!known)
+            return ray_error("domain", "unknown option '%.*s' (compress and symfile are accepted)",
+                             k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
+    }
     ray_compress_t mode;
-    ray_t* oerr = ray_compress_opt_parse(opts, true, &mode);
+    ray_t* oerr = ray_compress_opt_parse(opts, false, &mode);
+    if (oerr) return oerr;
+    ray_symfile_t layout;
+    oerr = ray_symfile_opt_parse(opts, &layout);
     if (oerr) return oerr;
     if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
+    /* A symfile per column has no shared symfile to name, and the segments
+     * of a parted table resolve over its one root symfile: 'column takes
+     * neither a symfile path nor a partition directory (whose convention
+     * resolves to the parted root's symfile, not dir/.sym). */
+    if (layout == RAY_SYMFILE_COLUMN) {
+        char own[1024];
+        size_t dlen = strlen(dir);
+        while (dlen > 1 && dir[dlen - 1] == '/') dlen--;
+        int on = snprintf(own, sizeof(own), "%.*s/.sym", (int)dlen, dir);
+        bool partition = sym_path && on > 0 && (size_t)on < sizeof(own) && strcmp(own, sym_path) != 0;
+        if (sym_given || partition)
+            return ray_error("domain", sym_given
+                ? ".db.splayed.set: a symfile path with symfile 'column"
+                : ".db.splayed.set: symfile 'column for a partition of a parted table");
+    }
 
-    ray_err_t err = ray_splay_save_mode(tbl, dir, sym_path, mode);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);

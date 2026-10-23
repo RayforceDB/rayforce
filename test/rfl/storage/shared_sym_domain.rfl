@@ -75,5 +75,78 @@
 (count Back) -- 0
 (count (at Back 's)) -- 0
 
+;; ── per-column symfiles: {symfile: 'column} ────────────────────────────
+;; Every SYM column gets its own symfile, `.<col>.sym` next to its column
+;; file, so the two SYM columns of one table resolve over two different FILE
+;; domains.  Every cross-column operation must answer as over the in-memory
+;; table (one runtime domain).  70000 rows: past the 65536-row fast paths.
+;; FP: a position-weighted string-length sum, independent of any domain.
+(.sys.exec "rm -rf /tmp/rfl_col_dom")
+(set I (til 70000))
+(set P (as 'SYM (concat [""] (map (fn [x] (format "https://site%.com/p/%" (% x 97) x)) (til 6000)))))
+(set CT (table [id URL Ref] (list I (at P (% (* I 7919) 5001)) (at P (+ 1000 (% (* I 104729) 5001))))))
+(set FP (fn [v] (sum (* (+ 1 (til (count v))) (strlen v)))))
+(.db.splayed.set "/tmp/rfl_col_dom/c0/" CT {symfile: 'column})
+(.db.splayed.set "/tmp/rfl_col_dom/c2/" CT {symfile: 'column compress: true})
+(.sys.exec "cd /tmp/rfl_col_dom/c0 && test -f .URL.sym && test -f .Ref.sym && test ! -e .sym && test ! -e .id.sym") -- 0
+(.sys.exec "cd /tmp/rfl_col_dom/c2 && test -f .URL.sym && test -f .Ref.sym && test ! -e .sym") -- 0
+(set C0 (.db.splayed.get "/tmp/rfl_col_dom/c0/"))
+(set C2 (.db.splayed.get "/tmp/rfl_col_dom/c2/"))
+(FP (at C0 'URL)) -- (FP (at CT 'URL))
+(FP (at C2 'Ref)) -- (FP (at CT 'Ref))
+;; comparisons between the columns of two domains
+(sum (== (at C0 'URL) (at C0 'Ref))) -- (sum (== (at CT 'URL) (at CT 'Ref)))
+(count (select {from: C2 where: (== URL Ref)})) -- (count (select {from: CT where: (== URL Ref)}))
+(count (select {from: C0 where: (!= URL Ref)})) -- (count (select {from: CT where: (!= URL Ref)}))
+(sum (< (at C0 'URL) (at C2 'Ref))) -- (sum (< (at CT 'URL) (at CT 'Ref)))
+(sum (in (at C0 'URL) (at C2 'Ref))) -- (sum (in (at CT 'URL) (at CT 'Ref)))
+(count (select {from: C2 where: (like URL "*site1*")})) -- (count (select {from: CT where: (like URL "*site1*")}))
+;; grouping by both columns, distinct over a union, set operations
+(set GT (xasc (select {n: (count id) from: CT by: [URL Ref]}) ['URL 'Ref]))
+(set G0 (xasc (select {n: (count id) from: C0 by: [URL Ref]}) ['URL 'Ref]))
+(set G2 (xasc (select {n: (count id) from: C2 by: [Ref URL]}) ['URL 'Ref]))
+(count G0) -- (count GT)
+(FP (at G0 'URL)) -- (FP (at GT 'URL))
+(FP (at G0 'Ref)) -- (FP (at GT 'Ref))
+(FP (at G2 'Ref)) -- (FP (at GT 'Ref))
+(sum (* (til (count G2)) (at G2 'n))) -- (sum (* (til (count GT)) (at GT 'n)))
+(FP (asc (distinct (concat (at C0 'URL) (at C2 'Ref))))) -- (FP (asc (distinct (concat (at CT 'URL) (at CT 'Ref)))))
+(FP (asc (union (at C2 'URL) (at C0 'Ref)))) -- (FP (asc (union (at CT 'URL) (at CT 'Ref))))
+(FP (asc (except (at C0 'URL) (at C0 'Ref)))) -- (FP (asc (except (at CT 'URL) (at CT 'Ref))))
+(FP (concat (at C0 'URL) (at C0 'Ref))) -- (FP (concat (at CT 'URL) (at CT 'Ref)))
+;; joins on SYM keys drawn from different columns and tables
+(set JT (inner-join [k] (select {k: URL v: id from: CT}) (select {k: Ref w: id from: CT})))
+(set J0 (inner-join [k] (select {k: URL v: id from: C0}) (select {k: Ref w: id from: C2})))
+(count J0) -- (count JT)
+(sum (at J0 'w)) -- (sum (at JT 'w))
+(count (inner-join [URL Ref] (select {URL: URL Ref: Ref v: id from: C0}) (select {URL: Ref Ref: URL w: id from: C2}))) -- (count (inner-join [URL Ref] (select {URL: URL Ref: Ref v: id from: CT}) (select {URL: Ref Ref: URL w: id from: CT})))
+;; sort and table concat over both layouts
+(FP (at (xasc C0 ['Ref 'URL 'id]) 'URL)) -- (FP (at (xasc CT ['Ref 'URL 'id]) 'URL))
+(FP (at (xasc (concat C0 C2) ['URL 'id]) 'Ref)) -- (FP (at (xasc (concat CT CT) ['URL 'id]) 'Ref))
+;; re-saves across layouts: per-column to shared, and shared back to per-column
+(.db.splayed.set "/tmp/rfl_col_dom/s/" C2 {symfile: 'shared})
+(.sys.exec "test -f /tmp/rfl_col_dom/s/.sym && test ! -e /tmp/rfl_col_dom/s/.URL.sym") -- 0
+(FP (at (.db.splayed.get "/tmp/rfl_col_dom/s/") 'Ref)) -- (FP (at CT 'Ref))
+(.db.splayed.set "/tmp/rfl_col_dom/c0/" (.db.splayed.get "/tmp/rfl_col_dom/s/") {symfile: 'column})
+(FP (at (.db.splayed.get "/tmp/rfl_col_dom/c0/") 'URL)) -- (FP (at CT 'URL))
+;; the first write's root symfiles go with its root columns
+(.sys.exec "test ! -e /tmp/rfl_col_dom/c0/.URL.sym && test ! -e /tmp/rfl_col_dom/c0/URL") -- 0
+;; a shared re-save over a per-column table: its generation has no column symfile
+(.db.splayed.set "/tmp/rfl_col_dom/c0/" C0)
+(FP (at (.db.splayed.get "/tmp/rfl_col_dom/c0/") 'Ref)) -- (FP (at CT 'Ref))
+;; option errors
+(.db.splayed.set "/tmp/rfl_col_dom/e/" CT {symfile: 'bogus}) !- domain
+(.db.splayed.set "/tmp/rfl_col_dom/e/" CT {symfile: 1}) !- domain
+(.db.splayed.set "/tmp/rfl_col_dom/e/" CT "/tmp/rfl_col_dom/e.sym" {symfile: 'column}) !- domain
+(.db.splayed.set "/tmp/rfl_col_dom/e/" CT "/tmp/rfl_col_dom/e/.sym" {symfile: 'column}) !- domain
+(.db.splayed.set "/tmp/rfl_col_dom/e/" CT {bogus: true}) !- domain
+(.db.splayed.set "/tmp/rfl_col_dom/2024.01.01/t/" CT {symfile: 'column}) !- domain
+(.sys.exec "test ! -e /tmp/rfl_col_dom/e && test ! -e /tmp/rfl_col_dom/2024.01.01") -- 0
+;; a partition takes no column symfile: its segments share the root .sym
+(.db.splayed.set "/tmp/rfl_col_dom/db/2024.01.01/t/" (take CT 10))
+(count (.db.parted.get "/tmp/rfl_col_dom/db/" 't)) -- 10
+(.sys.exec "cp /tmp/rfl_col_dom/c2/.URL.sym /tmp/rfl_col_dom/db/2024.01.01/t/.URL.sym") -- 0
+(.db.parted.get "/tmp/rfl_col_dom/db/" 't) !- nyi
+
 ;; ── cleanup ────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_shared_dom /tmp/rfl_shared_dom_lone /tmp/rfl_shared_dom_empty") -- 0
+(.sys.exec "rm -rf /tmp/rfl_shared_dom /tmp/rfl_shared_dom_lone /tmp/rfl_shared_dom_empty /tmp/rfl_col_dom") -- 0

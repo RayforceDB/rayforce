@@ -3274,6 +3274,117 @@ static test_result_t test_save_hash_in_place(void) {
     PASS();
 }
 
+/* The per-column layout (RAY_SYMFILE_COLUMN): each SYM column's vocabulary
+ * in its own symfile next to the column file, `<dir>/.<col>.sym`, and no
+ * shared one.  Loads resolve each column over its own FILE domain (two
+ * domains in one table), in front of any symfile the caller names; a
+ * partition refuses one; a damaged one fails loudly.  Generations 0 and 2. */
+static int64_t symfile_count(const char* path) {
+    FILE* f = fopen(path, "rb");
+    int64_t cnt = -1;
+    if (f && fseek(f, 4, SEEK_SET) == 0 && fread(&cnt, 8, 1, f) != 1) cnt = -1;
+    if (f) fclose(f);
+    return cnt;
+}
+static bool path_ends_with(const char* p, const char* tail) {
+    size_t n = p ? strlen(p) : 0, k = strlen(tail);
+    return n >= k && memcmp(p + n - k, tail, k) == 0;
+}
+static test_result_t test_per_column_symfiles(void) {
+    int64_t s_a = ray_sym_intern("a", 1), s_b = ray_sym_intern("b", 1), s_n = ray_sym_intern("n", 1);
+    int64_t v[4] = { ray_sym_intern("pc_one", 6), ray_sym_intern("pc_two", 6),
+                     ray_sym_intern("pc_three", 8), ray_sym_intern("pc_four", 7) };
+    enum { R = 6 };
+    static const int ia[R] = { 0, 1, 0, 2, 1, 0 }, ib[R] = { 1, 3, 1, 1, 0, 3 };
+    ray_t* ca = ray_sym_vec_new(RAY_SYM_W64, R);
+    ray_t* cb = ray_sym_vec_new(RAY_SYM_W64, R);
+    ray_t* cn = ray_vec_new(RAY_I64, R);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ca)); TEST_ASSERT_FALSE(RAY_IS_ERR(cb)); TEST_ASSERT_FALSE(RAY_IS_ERR(cn));
+    ca->len = cb->len = cn->len = R;
+    for (int i = 0; i < R; i++) {
+        ((int64_t*)ray_data(ca))[i] = v[ia[i]];
+        ((int64_t*)ray_data(cb))[i] = v[ib[i]];
+        ((int64_t*)ray_data(cn))[i] = i;
+    }
+    ray_t* t = ray_table_new(3);
+    t = ray_table_add_col(t, s_a, ca);
+    t = ray_table_add_col(t, s_b, cb);
+    t = ray_table_add_col(t, s_n, cn);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    /* an unrelated shared symfile, named to the loader: the columns' own win */
+    const char* odir = ray_test_tmp(TMP_SPLAY_BASE "/pcol_other");
+    char osym[512]; snprintf(osym, sizeof osym, "%s/.sym", odir);
+    rm_rf(odir);
+    {
+        ray_t* oc = ray_sym_vec_new(RAY_SYM_W64, 1);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(oc));
+        oc->len = 1; ((int64_t*)ray_data(oc))[0] = ray_sym_intern("pc_unrelated", 12);
+        ray_t* ot = ray_table_add_col(ray_table_new(1), s_a, oc);
+        TEST_ASSERT_EQ_I(ray_splay_save(ot, odir, osym), RAY_OK);
+        ray_release(oc); ray_release(ot);
+    }
+    for (int gen = 0; gen < 2; gen++) {
+        const char* dir = ray_test_tmp(gen ? TMP_SPLAY_BASE "/pcol2" : TMP_SPLAY_BASE "/pcol0");
+        rm_rf(dir);
+        char shared[512], pa[512], pb[512], pn[512];
+        snprintf(shared, sizeof shared, "%s/.sym", dir);
+        snprintf(pa, sizeof pa, "%s/.a.sym", dir);
+        snprintf(pb, sizeof pb, "%s/.b.sym", dir);
+        snprintf(pn, sizeof pn, "%s/.n.sym", dir);
+        TEST_ASSERT_EQ_I(ray_splay_save_layout(t, dir, shared, gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF,
+                                               RAY_SYMFILE_COLUMN), RAY_OK);
+        struct stat st;
+        TEST_ASSERT_TRUE(stat(shared, &st) != 0);            /* no shared symfile */
+        TEST_ASSERT_TRUE(stat(pn, &st) != 0);                /* none for a non-SYM column */
+        TEST_ASSERT_EQ_I(symfile_count(pa), 4);              /* "", one, two, three */
+        TEST_ASSERT_EQ_I(symfile_count(pb), 4);              /* "", two, four, one */
+        for (int how = 0; how < 3; how++) {
+            ray_t* l = how == 0 ? ray_read_splayed(dir, NULL)
+                     : how == 1 ? ray_splay_load(dir, NULL) : ray_read_splayed(dir, osym);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(l));
+            ray_t* la = ray_table_get_col_idx(l, 0);
+            ray_t* lb = ray_table_get_col_idx(l, 1);
+            TEST_ASSERT_TRUE(la && lb && la->type == RAY_SYM && lb->type == RAY_SYM);
+            struct ray_sym_domain_s* da = ray_sym_vec_domain(la);
+            struct ray_sym_domain_s* db = ray_sym_vec_domain(lb);
+            TEST_ASSERT_TRUE(da != db);
+            TEST_ASSERT_TRUE(da != ray_sym_runtime_domain() && db != ray_sym_runtime_domain());
+            TEST_ASSERT_TRUE(path_ends_with(ray_sym_domain_path(da), "/.a.sym"));
+            TEST_ASSERT_TRUE(path_ends_with(ray_sym_domain_path(db), "/.b.sym"));
+            for (int i = 0; i < R; i++) {
+                ray_t* xa = ray_sym_vec_cell(la, i);
+                ray_t* xb = ray_sym_vec_cell(lb, i);
+                ray_t* ea = ray_sym_str(v[ia[i]]);
+                ray_t* eb = ray_sym_str(v[ib[i]]);
+                TEST_ASSERT_TRUE(xa && xb && ea && eb);
+                TEST_ASSERT_EQ_I((int64_t)ray_str_len(xa), (int64_t)ray_str_len(ea));
+                TEST_ASSERT_MEM_EQ(ray_str_len(ea), ray_str_ptr(xa), ray_str_ptr(ea));
+                TEST_ASSERT_EQ_I((int64_t)ray_str_len(xb), (int64_t)ray_str_len(eb));
+                TEST_ASSERT_MEM_EQ(ray_str_len(eb), ray_str_ptr(xb), ray_str_ptr(eb));
+            }
+            ray_release(l);
+        }
+        /* a partition's segments share one domain: a column symfile is refused */
+        ray_t* pr = ray_read_splayed_dom(dir, NULL);
+        TEST_ASSERT_TRUE(pr && RAY_IS_ERR(pr));
+        TEST_ASSERT_STR_EQ(ray_err_code(pr), "nyi");
+        ray_error_free(pr);
+        /* a damaged column symfile fails the load, loudly */
+        FILE* f = fopen(pb, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        TEST_ASSERT_EQ_I(ftruncate(fileno(f), 3), 0);
+        fclose(f);
+        ray_t* bad = ray_read_splayed(dir, NULL);
+        TEST_ASSERT_TRUE(bad && RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_error_free(bad);
+        rm_rf(dir);
+    }
+    rm_rf(odir);
+    ray_release(ca); ray_release(cb); ray_release(cn); ray_release(t);
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
 #ifndef _WIN32
     { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
@@ -3336,5 +3447,6 @@ const test_entry_t splay_entries[] = {
     { "splay/csv_symfile_order",          test_csv_splayed_symfile_order,       splay_setup, splay_teardown },
     { "splay/csv_quote_mode_per_file",    test_csv_splayed_quote_mode_per_file, splay_setup, splay_teardown },
     { "splay/save_hash_in_place",         test_save_hash_in_place,              splay_setup, splay_teardown },
+    { "splay/per_column_symfiles",        test_per_column_symfiles,             splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };
