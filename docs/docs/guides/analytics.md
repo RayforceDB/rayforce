@@ -347,15 +347,16 @@ Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (
 
     - **Prefer `select` with `by:`** over manual group-then-map. The `select` pipeline fuses grouping and aggregation into a single pass, avoiding intermediate materialization.
     - **Use `xbar` for time bucketing** to bin timestamps into fixed intervals (e.g., 5-minute bars). This avoids materializing group keys and is faster than building date groups by hand.
-    - **Use `pmap` for embarrassingly parallel work.** It distributes a function across list elements using worker threads. Ideal for independent per-group transformations:
+    - **Express column work with vector builtins and queries.** Eligible kernels can use the morsel-driven pool; scheduling depends on the operator, input size and available workers. For example, squaring a vector does not require a callback per element:
 
         ```lisp
-        (pmap (fn [x] (* x x)) (list 1 2 3 4 5))
+        (set x [1 2 3 4 5])
+        (* x x)  ; [1 4 9 16 25]
         ```
 
-        ```text
-        (1 4 9 16 25)
-        ```
+        This small example may run serially. See [Thread Pool](../architecture/pipeline.md#thread-pool) for the distinction between kernel parallelism and language evaluation.
+
+    - **Do not use `pmap` as a parallel task scheduler.** It is currently a sequential alias for `map`, including for large inputs and expensive lambdas. Builtins inside a callback may use workers independently, but the callback invocations themselves remain sequential. For independent backtest configurations or other Rayfall task sweeps, use separate processes with an explicit per-process worker budget; see [Multiple Instances](instances.md).
 
 ## Next Steps
 

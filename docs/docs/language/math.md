@@ -627,11 +627,23 @@ Keep elements of `vec` where the boolean `mask` is true.
 
 ### `(pmap f x)`
 
-Parallel map. Like `map` but distributes work across threads for large inputs.
+Currently a **sequential alias for `map`**: it calls the function for each
+input element in order on the calling thread's VM and returns the same list as
+`map`. A larger input or a larger `-c` setting does not distribute these callback
+invocations across workers. The name can signal intent, but does not currently
+provide parallel lambda evaluation.
 
 ```lisp
-(pmap (fn [x] (* x x)) (til 1000000))
+(pmap (fn [x] (* x x)) [1 2 3])  ; (1 4 9), evaluated sequentially
 ```
+
+Eligible vector builtins and query operators can use the morsel-driven thread
+pool **inside** a callback; that is separate from scheduling callbacks in
+parallel. Eligibility, input-size thresholds and worker availability depend on
+the operator; a large vector alone is not a guarantee of parallel execution.
+See [Thread Pool](../architecture/pipeline.md#thread-pool). For independent
+Rayfall task sweeps today, use separate processes and budget their workers as
+described in [Multiple Instances](../guides/instances.md).
 
 ## Quick Reference Table
 
