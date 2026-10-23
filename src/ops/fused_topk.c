@@ -1152,9 +1152,12 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             int64_t* hidx = &ctx.heap_idx[(size_t)w * (size_t)k];
             for (int32_t i = 0; i < hn; i++) {
                 if (global_n < (int32_t)k) {
+                    // cppcheck-suppress objectIndex // heap_idx is an nw*k scratch buffer and hn <= k; cppcheck misreads ray_data's inline payload as a scalar
                     global_idx[global_n++] = hidx[i];
                     if (global_n == (int32_t)k) fpk_rk_heapify(&ctx, global_idx, global_n);
+                // cppcheck-suppress objectIndex // same nw*k buffer as above
                 } else if (fpk_rk_ent_cmp(&ctx, hidx[i], global_idx[0]) < 0) {
+                    // cppcheck-suppress objectIndex // same nw*k buffer as above
                     global_idx[0] = hidx[i];
                     fpk_rk_sift_down(&ctx, global_idx, global_n, 0);
                 }
