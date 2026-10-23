@@ -3098,14 +3098,26 @@ static inline int64_t ix_nblk(int64_t count) { return (count + IXS - 1) / IXS; }
 static inline int64_t ix_cap(int64_t count) { int64_t n = ix_nblk(count); return n + n / 4 + 64; }
 
 static inline size_t ix_bytes(int64_t count) { return IXH + 64 * (size_t)ix_cap(count); }
-/* struct stat's nanosecond times: st_mtim/st_ctim, on macOS st_mtimespec/st_ctimespec. */
-#if defined(__APPLE__)
-#define IX_MTIM st_mtimespec
-#define IX_CTIM st_ctimespec
+/* A file's modification and status-change times in nanoseconds. */
+static int64_t ix_mtime_ns(const struct stat* st) {
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+    /* Darwin's POSIX namespace exposes seconds/nanoseconds separately. */
+    return (int64_t)st->st_mtime * 1000000000 + st->st_mtimensec;
+#elif defined(__APPLE__)
+    return (int64_t)st->st_mtimespec.tv_sec * 1000000000 + st->st_mtimespec.tv_nsec;
 #else
-#define IX_MTIM st_mtim
-#define IX_CTIM st_ctim
+    return (int64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec;
 #endif
+}
+static int64_t ix_ctime_ns(const struct stat* st) {
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+    return (int64_t)st->st_ctime * 1000000000 + st->st_ctimensec;
+#elif defined(__APPLE__)
+    return (int64_t)st->st_ctimespec.tv_sec * 1000000000 + st->st_ctimespec.tv_nsec;
+#else
+    return (int64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec;
+#endif
+}
 /* Claim an index for a file's current identity, as one written for that
  * very file is. */
 static void ix_stamp(uint8_t* ix, const char* path) {
@@ -3113,8 +3125,8 @@ static void ix_stamp(uint8_t* ix, const char* path) {
     uint64_t ino = 0, stamp = 0;
     if (path && stat(path, &st) == 0) {
         ino = (uint64_t)st.st_ino;
-        int64_t mt = (int64_t)st.IX_MTIM.tv_sec * 1000000000 + st.IX_MTIM.tv_nsec;
-        int64_t ct = (int64_t)st.IX_CTIM.tv_sec * 1000000000 + st.IX_CTIM.tv_nsec;
+        int64_t mt = ix_mtime_ns(&st);
+        int64_t ct = ix_ctime_ns(&st);
         stamp = (uint64_t)mt ^ ((uint64_t)ct * UINT64_C(0x9E3779B97F4A7C15));
     }
     memcpy(ix + 32, &ino, 8);
@@ -3161,8 +3173,7 @@ static void ix_wait_fs_tick(const char* path) {
         FILE* f = fopen(probe, "wb");
         if (f) { fputc('t', f); fclose(f); }
         if (stat(probe, &pr) == 0 &&
-            (pr.IX_CTIM.tv_sec > st.IX_CTIM.tv_sec ||
-             (pr.IX_CTIM.tv_sec == st.IX_CTIM.tv_sec && pr.IX_CTIM.tv_nsec > st.IX_CTIM.tv_nsec)))
+            ix_ctime_ns(&pr) > ix_ctime_ns(&st))
             break;
         struct timespec ts = { 0, 1000 * 1000 };
         nanosleep(&ts, NULL);
