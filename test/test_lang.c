@@ -9384,6 +9384,89 @@ static test_result_t test_builtin_enlist_fn(void) {
     PASS();
 }
 
+/* Mixed enlist promotion is only defined for I64/F64 atoms. Check every
+ * argument position and ordering, including values whose payload resembles
+ * an integer but whose logical type must be preserved. */
+static test_result_t test_builtin_enlist_mixed_atoms(void) {
+    const uint8_t guid[16] = {1, 2, 3, 4};
+    const int64_t nested[] = {-2, 3};
+    ray_t* other[] = {
+        ray_i32(-1), ray_i16(-1), ray_u8(255), ray_f32(1.25f),
+        ray_bool(true), ray_date(8766), ray_time(1234),
+        ray_timestamp(1234), ray_timespan(1234),
+        ray_sym(ray_sym_intern("enlist_guard", 12)), ray_str("s", 1),
+        ray_guid(guid), ray_typed_null(-RAY_I32),
+        ray_vec_from_raw(RAY_I64, nested, 2)
+    };
+    static const uint8_t order[][3] = {
+        {0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+        {1, 2, 0}, {2, 0, 1}, {2, 1, 0}
+    };
+    ray_t* integer = ray_i64(2);
+    ray_t* floating = ray_f64(1.5);
+    bool preserved = true;
+    for (size_t k = 0; k < sizeof(other) / sizeof(other[0]); k++) {
+        ray_t* values[] = {integer, floating, other[k]};
+        for (size_t j = 0; j < sizeof(order) / sizeof(order[0]); j++) {
+            ray_t* args[] = {values[order[j][0]], values[order[j][1]],
+                             values[order[j][2]]};
+            ray_t* r = ray_enlist_fn(args, 3);
+            if (!r || RAY_IS_ERR(r)) {
+                preserved = false;
+                if (r) ray_error_free(r);
+                continue;
+            }
+            if (r->type != RAY_LIST || r->len != 3) {
+                preserved = false;
+            } else {
+                ray_t** cells = (ray_t**)ray_data(r);
+                for (int i = 0; i < 3; i++)
+                    if (cells[i] != args[i]) preserved = false;
+            }
+            ray_release(r);
+        }
+    }
+    for (size_t k = 0; k < sizeof(other) / sizeof(other[0]); k++)
+        ray_release(other[k]);
+    ray_release(integer);
+    ray_release(floating);
+    TEST_ASSERT_TRUE(preserved);
+    PASS();
+}
+
+static test_result_t test_builtin_enlist_promotion_payload(void) {
+    ray_t* values[] = {ray_i64(5), ray_f64(2.5), ray_f64(-3.0)};
+    ray_t* null_value = ray_typed_null(-RAY_I64);
+    const double expected[] = {5.0, 2.5, -3.0};
+    bool correct = true;
+    for (int null_at = -1; null_at < 3; null_at++) {
+        ray_t* args[] = {values[0], values[1], values[2]};
+        if (null_at >= 0) args[null_at] = null_value;
+        ray_t* r = ray_enlist_fn(args, 3);
+        if (!r || RAY_IS_ERR(r)) {
+            correct = false;
+            if (r) ray_error_free(r);
+            continue;
+        }
+        if (r->type != RAY_F64 || r->len != 3) {
+            correct = false;
+        } else {
+            const double* data = (const double*)ray_data(r);
+            if (!!(r->attrs & RAY_ATTR_HAS_NULLS) != (null_at >= 0))
+                correct = false;
+            for (int i = 0; i < 3; i++) {
+                if (!!ray_vec_is_null(r, i) != (i == null_at)) correct = false;
+                if (i != null_at && data[i] != expected[i]) correct = false;
+            }
+        }
+        ray_release(r);
+    }
+    for (int i = 0; i < 3; i++) ray_release(values[i]);
+    ray_release(null_value);
+    TEST_ASSERT_TRUE(correct);
+    PASS();
+}
+
 /* ── builtins.c coverage: ray_resolve_fn ─────────────────────────────────────
  * ray_resolve_fn replaces I64 sym-ID columns with SYM columns in a table.
  * Call it with a plain I64 atom (non-table path: return as-is). */
@@ -10533,6 +10616,8 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/idiv_fn",             test_builtin_idiv_fn,             lang_setup, lang_teardown },
     { "lang/builtin/concat_fn",           test_builtin_concat_fn,           lang_setup, lang_teardown },
     { "lang/builtin/enlist_fn",           test_builtin_enlist_fn,           lang_setup, lang_teardown },
+    { "lang/builtin/enlist_mixed_atoms", test_builtin_enlist_mixed_atoms, lang_setup, lang_teardown },
+    { "lang/builtin/enlist_promotion_payload", test_builtin_enlist_promotion_payload, lang_setup, lang_teardown },
     { "lang/builtin/resolve_fn",          test_builtin_resolve_fn,          lang_setup, lang_teardown },
     { "lang/builtin/nil_rfl",             test_builtin_nil_rfl,             lang_setup, lang_teardown },
     { "lang/builtin/where_rfl",           test_builtin_where_rfl,           lang_setup, lang_teardown },
