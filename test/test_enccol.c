@@ -40,6 +40,9 @@
 #include "store/encw.h"
 #include "store/part.h"
 #include "store/colrange.h"
+#include "core/block.h"
+#include "lang/format.h"
+#include "lang/eval.h"
 #include <math.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -3314,7 +3317,129 @@ static test_result_t test_parted_equals_gen0(void) {
     PASS();
 }
 
+/* The statement-boundary trim drops whole-column decodes that do not fit a
+ * quarter of the watermark, least recently asked for first.  A decode a
+ * caller retained is neither counted nor dropped; the column decodes again
+ * when next read; a budget they fit keeps them. */
+static ray_t* trim_col(const char* name, int64_t n, int64_t mul, ray_t** src) {
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * mul) % 1000003 - 500000;
+    if (ray_col_save_gen(v, ray_test_tmp(name), 2) != RAY_OK) { ray_release(v); return NULL; }
+    *src = v;
+    return ray_col_mmap(ray_test_tmp(name));
+}
+static bool trim_same(ray_t* m, ray_t* src) {
+    if (!m || RAY_IS_ERR(m) || m->len != src->len) return false;
+    return memcmp(ray_data(m), ray_data(src), (size_t)src->len * sizeof(int64_t)) == 0;
+}
+static void trim_with(int64_t wm) {
+    int64_t prev = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(wm);
+    ray_enccol_cache_trim();
+    ray_heap_set_anon_watermark(prev);
+}
+
+static test_result_t test_cache_trim_at_boundary(void) {
+    const int64_t n = 70000;
+    ray_t *sa = NULL, *sb = NULL;
+    ray_t* a = trim_col(ENCCOL_TMP "/ta", n, 7919, &sa);
+    ray_t* b = trim_col(ENCCOL_TMP "/tb", n, 104729, &sb);
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && a->type == RAY_ENCCOL);
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b) && b->type == RAY_ENCCOL);
+    trim_with(1);                                   /* nothing kept from before */
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+
+    ray_t* ma = ray_enccol_materialize(a);
+    TEST_ASSERT_TRUE(trim_same(ma, sa));
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(a), ma);
+    int64_t one = (int64_t)ray_block_size(ma);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), one);
+    ray_retain(ma);                                 /* a caller keeps it: dropping frees nothing */
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    trim_with(1);
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(a), ma);
+    ray_release(ma);                                /* only the cache holds it now */
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), one);
+    trim_with(1);
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(a));
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    ray_t* ma2 = ray_enccol_materialize(a);         /* decodes again */
+    TEST_ASSERT_TRUE(trim_same(ma2, sa));
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(a), ma2);
+
+    /* a budget both fit keeps both; one that fits one keeps the later one */
+    int64_t roomy = 4 * (2 * one + 4096), tight = 4 * (one + 4096);
+    trim_with(roomy);                               /* A: this statement */
+    ray_t* mb = ray_enccol_materialize(b);          /* B: the next one */
+    TEST_ASSERT_TRUE(trim_same(mb, sb));
+    trim_with(roomy);
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(a), ma2);
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(b), mb);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 2 * one);
+    trim_with(tight);
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(a));   /* least recently asked for */
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(b), mb);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), one);
+
+    /* no watermark keeps everything */
+    ray_t* ma3 = ray_enccol_materialize(a);
+    TEST_ASSERT_TRUE(trim_same(ma3, sa));
+    trim_with(0);
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(a), ma3);
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(b), mb);
+
+    ray_release(a); ray_release(b);                 /* a freed column leaves the list */
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    ray_release(sa); ray_release(sb);
+    PASS();
+}
+
+/* (take tbl n) and the table display read an encoded column's taken or
+ * shown rows by range: neither leaves the column decoded whole.  A plain
+ * read still does. */
+static test_result_t test_take_show_read_window(void) {
+    const int64_t n = 70000;
+    ray_t* tbl = ray_table_new(1);
+    ray_t* a = ray_vec_new(RAY_I32, n); a->len = n;
+    for (int64_t i = 0; i < n; i++) ((int32_t*)ray_data(a))[i] = (int32_t)(i % 977);
+    int64_t cb = ray_sym_intern("cb", 2);
+    tbl = ray_table_add_col(tbl, cb, a);
+    ray_release(a);
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, ray_test_tmp(ENCCOL_TMP "/tw"), NULL), RAY_OK);
+    ray_release(tbl);
+    TEST_ASSERT_EQ_I(save_i32_rows(ray_test_tmp(ENCCOL_TMP "/tw/cb"), n), RAY_OK);
+    ray_t* r = ray_read_splayed(ray_test_tmp(ENCCOL_TMP "/tw"), NULL);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_t* enc = ray_table_get_col_enc(r, cb);
+    TEST_ASSERT_NOT_NULL(enc);
+
+    ray_t* k = ray_i64(-3);
+    ray_t* t3 = ray_take_fn(r, k);
+    ray_release(k);
+    TEST_ASSERT_TRUE(t3 && !RAY_IS_ERR(t3) && ray_table_nrows(t3) == 3);
+    ray_t* c3 = ray_table_col(t3, cb);
+    TEST_ASSERT_TRUE(c3 && c3->type == RAY_I32 && c3->len == 3);
+    for (int i = 0; i < 3; i++) TEST_ASSERT_EQ_I(((int32_t*)ray_data(c3))[i], (n - 3 + i) % 977);
+    ray_release(t3);
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(enc));
+
+    ray_t* shown = ray_fmt(r, 1);
+    TEST_ASSERT_TRUE(shown && !RAY_IS_ERR(shown));
+    TEST_ASSERT_TRUE(strstr(ray_str_ptr(shown), "70000 rows") != NULL);
+    TEST_ASSERT_TRUE(strstr(ray_str_ptr(shown), "│ 632 ") != NULL);  /* the last row: 69999 % 977 */
+    ray_release(shown);
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(enc));
+
+    ray_t* plain = ray_table_col(r, cb);              /* a plain read decodes */
+    TEST_ASSERT_TRUE(plain && !RAY_IS_ERR(plain));
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(enc), plain);
+    ray_release(r);
+    PASS();
+}
+
 const test_entry_t enccol_entries[] = {
+    { "enccol/take_show_read_window", test_take_show_read_window, enccol_setup, enccol_teardown },
+    { "enccol/cache_trim_at_boundary", test_cache_trim_at_boundary, enccol_setup, enccol_teardown },
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_rejects",        test_load_rejects,        enccol_setup, enccol_teardown },
     { "enccol/sym_requires_domain", test_sym_requires_domain, enccol_setup, enccol_teardown },

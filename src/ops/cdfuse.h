@@ -68,8 +68,10 @@ bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
  * sequential pass over the K and X columns per round: each row's group id
  * comes from K through a table of the n_groups result keys `grp_keys`
  * (rows whose key is not among them are skipped), or from `row_gid` when
- * the caller has the row map already (then `key_col`, `grp_keys` and `sel`
- * are unused: the map carries the selection as -1).  The (group, value)
+ * the caller has the row map already (then `key_col` and `grp_keys` are
+ * unused, and the map carries the selection as -1 — or, with `sel` given
+ * too, holds one id for each row `sel` keeps, in order: sel->total_pass
+ * ids, not nrows).  The (group, value)
  * pairs are hash-partitioned and deduplicated chunk by chunk into
  * partition-local sets; when the sets would outgrow the memory budget (a
  * share of what the anon watermark leaves), the partitions past it are

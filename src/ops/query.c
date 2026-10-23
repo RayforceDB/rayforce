@@ -4953,21 +4953,25 @@ static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
  * that is tens of GB that never come back.
  *
  * Here the referenced column is presented to the same DAG as a STR column
- * built from the vocabulary bytes, CHUNK rows at a time: every
- * intermediate is then a chunk-sized STR vector that dies with the chunk,
- * and only the FINAL key strings are interned — once per distinct value,
- * into a domain of the key vector's own (released with the result; the
- * global table never grows by a derived value; positions = first-seen
- * order of the keys, the order unsorted groups come out in).  Applies only when the
+ * built from the vocabulary bytes, CHUNK rows at a time (or, when the key
+ * compiles to one, to a per-value program over the bytes): every
+ * intermediate then dies with the chunk.  The keys are grouped by a hash
+ * of their bytes, compared byte for byte (dkh_build: no dictionary while
+ * grouping), and each group's key is interned once, into a domain of the
+ * key vector's own (released with the result; the global table never
+ * grows by a derived value; positions = first-seen order of the keys, the
+ * order unsorted groups come out in).  Applies only when the
  * expression's result over the SYM column is SYM (so the result has the
  * type the caller expects).  File prefixes use the raw snapshot, the
  * runtime domain its borrowed atom array, and a private in-memory domain
  * resolves its stable atoms through the tail path.  Any other shape
  * returns NULL and the caller takes the one-shot SYM evaluation. */
 /* Chunk length in distinct values: 256 dispatch rounds of morsels (2M
- * rows).  Enough rows for the pooled string ops to spread over the
- * workers, while every chunk-scoped STR intermediate stays in the
- * low hundreds of MB at URL-sized strings. */
+ * rows) when the key runs as a DAG — enough rows for the pooled string ops
+ * to spread over the workers, while every chunk-scoped STR intermediate
+ * stays in the low hundreds of MB at URL-sized strings — and an eighth of
+ * that for the per-value program and the passes that read values only (a
+ * chunk's per-value arrays stay in the tens of MB and in cache reach). */
 #define DERIVED_KEY_CHUNK ((int64_t)RAY_MORSEL_ELEMS * RAY_DISPATCH_MORSELS * 256)
 #ifdef DEBUG
 static int64_t g_derived_key_chunk_test = 0;
@@ -4977,13 +4981,12 @@ void ray_derived_key_chunk_set_for_test(int64_t rows) {
     g_derived_key_chunk_test = rows > 0 ? rows : 0;
 }
 #endif
-static int64_t derived_key_chunk_rows(void) {
+static int64_t derived_key_chunk_rows(bool dag) {
 #ifdef DEBUG
     if (g_derived_key_chunk_test > 0) return g_derived_key_chunk_test;
 #endif
-    return DERIVED_KEY_CHUNK;
+    return dag ? DERIVED_KEY_CHUNK : DERIVED_KEY_CHUNK / 8;
 }
-
 /* ---- chunk STR build: the entries at positions dv[lo, lo+n) as one STR
  * vector over one pool.  Lengths and byte pointers are read on the workers
  * (the raw snapshot needs no lock); a position past the file prefix — a
@@ -5002,6 +5005,7 @@ typedef struct {
     char*                       pool;
     ray_t* const*               rstr;   /* runtime domain: the borrowed atom array */
     uint32_t                    rcnt;
+    const uint8_t*              want;   /* NULL = every entry; else only where set */
     atomic_int                  late;
 } dk_chunk_ctx_t;
 
@@ -5010,6 +5014,7 @@ static void dk_chunk_scan_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
     dk_chunk_ctx_t* c = (dk_chunk_ctx_t*)vctx;
     int late = 0;
     for (int64_t i = start; i < end; i++) {
+        if (c->want && !c->want[i]) { c->ptr[i] = ""; c->len[i] = 0; continue; }
         int64_t pos = ray_read_sym(c->dv, c->lo + i, RAY_SYM, c->dattrs);
         if (c->rstr) {
             /* runtime domain: the atom array borrowed once per chunk (no
@@ -5059,15 +5064,18 @@ static void dk_chunk_fill_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
 /* The bytes of entries dv[lo, lo+n) as (ptr, len) views: read on the
  * workers off the raw snapshot (FILE) or the borrowed atom array (the
  * runtime domain), a position past either resolved through the domain on
- * the calling thread.  False on a length past UINT32_MAX. */
+ * the calling thread.  With `want`, only the entries it marks are read (the
+ * others come out as empty views, their bytes untouched).  False on a
+ * length past UINT32_MAX. */
 static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n,
                            const ray_sym_domain_raw_t* raw, struct ray_sym_domain_s* dom,
-                           const char** ptr, uint32_t* len) {
+                           const uint8_t* want, const char** ptr, uint32_t* len) {
     dk_chunk_ctx_t c;
     memset(&c, 0, sizeof(c));
     c.dv = dv; c.dattrs = dattrs; c.lo = lo; c.raw = raw;
     c.ptr = ptr;
     c.len = len;
+    c.want = want;
     if (dom == ray_sym_runtime_domain()) {
         ray_t** rs = NULL; uint32_t rc = 0;
         ray_sym_strings_borrow(&rs, &rc);
@@ -5093,20 +5101,16 @@ static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n
     return true;
 }
 
-static ray_t* derived_key_chunk_strs(const void* dv, uint8_t dattrs, int64_t lo, int64_t n,
-                                     const ray_sym_domain_raw_t* raw,
-                                     struct ray_sym_domain_s* dom) {
+/* The n views (ptr[i], len[i]) as one STR vector over one pool. */
+static ray_t* derived_key_chunk_strs(const char** ptr, uint32_t* len, int64_t n) {
     ray_t* aux_hdr = NULL;
-    size_t ptr_sz = (size_t)n * sizeof(const char*);
-    size_t u32_sz = (size_t)n * sizeof(uint32_t);
-    char* mem = (char*)scratch_alloc(&aux_hdr, ptr_sz + 2 * u32_sz);
-    if (!mem) return NULL;
+    uint32_t* off = (uint32_t*)scratch_alloc(&aux_hdr, (size_t)n * sizeof(uint32_t));
+    if (!off) return NULL;
     dk_chunk_ctx_t c;
     memset(&c, 0, sizeof(c));
-    c.ptr = (const char**)mem;
-    c.len = (uint32_t*)(mem + ptr_sz);
-    c.off = (uint32_t*)(mem + ptr_sz + u32_sz);
-    if (!dk_chunk_views(dv, dattrs, lo, n, raw, dom, c.ptr, c.len)) { scratch_free(aux_hdr); return NULL; }
+    c.ptr = ptr;
+    c.len = len;
+    c.off = off;
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
     uint64_t total = 0;
@@ -5132,316 +5136,6 @@ static ray_t* derived_key_chunk_strs(const void* dv, uint8_t dattrs, int64_t lo,
     else     dk_chunk_fill_fn(&c, 0, 0, n);
     scratch_free(aux_hdr);
     return sv;
-}
-
-/* ---- chunk result interning: each distinct key string of a chunk is
- * interned once, all of them under one lock, in the order of their first
- * row (the order the ids — and with them the group order — came out in
- * when one serial pass did the dedupe), and its id spread over the rows
- * that hold it.  The hashes are the intern table's own (ray_hash_bytes).
- * The dedupe runs on the workers: the rows are split into DK_NPART
- * partitions by the top bits of their hash (a count and a stable scatter
- * over row ranges), and each partition is deduped by one task in an
- * open-addressing table of its own, rows in row order, so every string's
- * representative is its first row.  One serial pass over the rows then
- * lists the representatives in row order for the batch intern. */
-#define DK_PART_BITS 6
-#define DK_NPART     (1 << DK_PART_BITS)
-/* A row as its partition's dedupe reads it: everything in one place, the
- * partition's rows contiguous. */
-typedef struct dk_item_s {
-    const char* p;
-    uint32_t    h;
-    uint32_t    l;
-    int32_t     row;
-    int32_t     pad;
-} dk_item_t;
-typedef struct {
-    const char* const* sp;
-    const uint32_t*    sl;
-    const uint32_t*    hash;
-    int64_t            n;
-    int64_t            nt;      /* row ranges of the count / scatter passes */
-    int64_t*           cnt;     /* [nt][DK_NPART]: counts, then write cursors */
-    struct dk_item_s*  items;   /* rows grouped by partition, row order within */
-    const int64_t*     pbase;   /* [DK_NPART + 1]: partition starts in items */
-    const int64_t*     tbase;   /* [DK_NPART + 1]: partition tables in tab */
-    uint64_t*          tab;     /* hash << 32 | index in the partition; all ones = empty */
-    int32_t*           rep;     /* first row holding the same string */
-    int32_t*           ord;     /* at a representative row: its ordinal */
-    const int64_t*     did;     /* id per ordinal */
-    int64_t*           out;
-    int64_t*           rcnt;    /* [nt]: representatives per row range, then their base */
-    const char**       dstr;    /* the representatives' strings, lengths, hashes */
-    size_t*            dlen;
-    uint32_t*          dhsh;
-} dk_dedupe_ctx_t;
-
-static inline uint32_t dk_part_of(uint32_t h) { return h >> (32 - DK_PART_BITS); }
-
-static void dk_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
-    (void)wid;
-    dk_dedupe_ctx_t* c = (dk_dedupe_ctx_t*)vctx;
-    for (int64_t t = t0; t < t1; t++) {
-        int64_t* k = c->cnt + t * DK_NPART;
-        memset(k, 0, DK_NPART * sizeof(int64_t));
-        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt;
-        for (int64_t i = lo; i < hi; i++) k[dk_part_of(c->hash[i])]++;
-    }
-}
-
-static void dk_scatter_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
-    (void)wid;
-    dk_dedupe_ctx_t* c = (dk_dedupe_ctx_t*)vctx;
-    for (int64_t t = t0; t < t1; t++) {
-        int64_t* k = c->cnt + t * DK_NPART;
-        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt;
-        for (int64_t i = lo; i < hi; i++) {
-            uint32_t h = c->hash[i];
-            dk_item_t* it = &c->items[k[dk_part_of(h)]++];
-            it->p = c->sp[i];
-            it->h = h;
-            it->l = c->sl[i];
-            it->row = (int32_t)i;
-            it->pad = 0;
-        }
-    }
-}
-
-static void dk_dedupe_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
-    (void)wid;
-    dk_dedupe_ctx_t* c = (dk_dedupe_ctx_t*)vctx;
-    for (int64_t p = p0; p < p1; p++) {
-        int64_t lo = c->pbase[p], hi = c->pbase[p + 1];
-        if (lo == hi) continue;
-        uint64_t* tab = c->tab + c->tbase[p];
-        uint64_t mask = (uint64_t)(c->tbase[p + 1] - c->tbase[p]) - 1;
-        memset(tab, 0xff, (size_t)(mask + 1) * sizeof(uint64_t));
-        const dk_item_t* items = c->items + lo;
-        for (int64_t k = 0; k < hi - lo; k++) {
-            const dk_item_t* it = &items[k];
-            uint32_t h = it->h;
-            uint32_t l = it->l;
-            uint64_t s = ((uint64_t)h * 0x9E3779B97F4A7C15ull >> 32) & mask;
-            for (;;) {
-                uint64_t e = tab[s];
-                if (e == UINT64_MAX) {
-                    tab[s] = (uint64_t)h << 32 | (uint32_t)k;
-                    c->rep[it->row] = it->row;
-                    break;
-                }
-                const dk_item_t* rt = &items[(uint32_t)e];
-                if ((uint32_t)(e >> 32) == h && rt->l == l &&
-                    (l == 0 || memcmp(rt->p, it->p, l) == 0)) {
-                    c->rep[it->row] = rt->row;
-                    break;
-                }
-                s = (s + 1) & mask;
-            }
-        }
-    }
-}
-
-static void dk_reps_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
-    (void)wid;
-    const dk_dedupe_ctx_t* c = (const dk_dedupe_ctx_t*)vctx;
-    for (int64_t t = t0; t < t1; t++) {
-        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt, k = 0;
-        for (int64_t i = lo; i < hi; i++) k += c->rep[i] == (int32_t)i;
-        c->rcnt[t] = k;
-    }
-}
-
-static void dk_reps_list_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
-    (void)wid;
-    const dk_dedupe_ctx_t* c = (const dk_dedupe_ctx_t*)vctx;
-    for (int64_t t = t0; t < t1; t++) {
-        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt, d = c->rcnt[t];
-        for (int64_t i = lo; i < hi; i++) {
-            if (c->rep[i] != (int32_t)i) continue;
-            c->ord[i] = (int32_t)d;
-            c->dstr[d] = c->sp[i]; c->dlen[d] = c->sl[i]; c->dhsh[d] = c->hash[i];
-            d++;
-        }
-    }
-}
-
-static void dk_assign_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
-    (void)wid;
-    const dk_dedupe_ctx_t* c = (const dk_dedupe_ctx_t*)vctx;
-    for (int64_t i = lo; i < hi; i++) c->out[i] = c->did[c->ord[c->rep[i]]];
-}
-
-/* Intern the n strings (sp[i], sl[i]) with hashes hash[i] into the key
- * domain kdom; out[i] gets the position of string i.  n stays below
- * INT32_MAX (a chunk).  The partitioned rows and their tables live only
- * through the dedupe; the arrays the batch intern reads are sized by the
- * distinct count.  The domain is this execution's own and the
- * representatives are handed over in first-row order, so a key's position
- * is its first-seen rank — the order unsorted groups come out in, the same
- * at every thread count. */
-static bool dk_intern_views(const char* const* sp, const uint32_t* sl, const uint32_t* hash,
-                            int64_t n, struct ray_sym_domain_s* kdom, int64_t* out) {
-    if (n <= 0) return true;
-    ray_pool_t* pool = ray_pool_get();
-    bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
-    int64_t nt = 1;
-    if (par) {
-        nt = (int64_t)ray_pool_total_workers(pool) * 4;
-        if (nt > n / 4096) nt = n / 4096;
-        if (nt < 1) nt = 1;
-    }
-    size_t cnt_sz  = (size_t)nt * DK_NPART * sizeof(int64_t);
-    size_t base_sz = (size_t)(DK_NPART + 1) * sizeof(int64_t);
-    size_t i32_sz  = (size_t)n * sizeof(int32_t);
-    ray_t *hdr = NULL, *ihdr = NULL, *thdr = NULL, *dhdr = NULL;
-    char* mem = (char*)scratch_alloc(&hdr, cnt_sz + 2 * base_sz + 2 * i32_sz);
-    dk_item_t* items = (dk_item_t*)scratch_alloc(&ihdr, (size_t)n * sizeof(dk_item_t));
-    if (!mem || !items) { scratch_free(hdr); scratch_free(ihdr); return false; }
-    int64_t* cnt   = (int64_t*)mem;  mem += cnt_sz;
-    int64_t* pbase = (int64_t*)mem;  mem += base_sz;
-    int64_t* tbase = (int64_t*)mem;  mem += base_sz;
-    int32_t* rep   = (int32_t*)mem;  mem += i32_sz;
-    int32_t* ord   = (int32_t*)mem;
-
-    dk_dedupe_ctx_t c = {
-        .sp = sp, .sl = sl, .hash = hash, .n = n, .nt = nt, .cnt = cnt, .items = items,
-        .pbase = pbase, .tbase = tbase, .rep = rep, .ord = ord, .out = out,
-    };
-    if (par) ray_pool_dispatch_n(pool, dk_count_fn, &c, (uint32_t)nt);
-    else     dk_count_fn(&c, 0, 0, nt);
-    /* partition starts, per-range write cursors, table extents (a power
-     * of two at least twice the partition's rows) */
-    int64_t run = 0, tsz = 0;
-    for (int p = 0; p < DK_NPART; p++) {
-        pbase[p] = run;
-        tbase[p] = tsz;
-        int64_t pc = 0;
-        for (int64_t t = 0; t < nt; t++) {
-            int64_t k = cnt[t * DK_NPART + p];
-            cnt[t * DK_NPART + p] = run + pc;
-            pc += k;
-        }
-        run += pc;
-        int64_t slots = 16;
-        while (slots < 2 * pc) slots <<= 1;
-        tsz += pc ? slots : 0;
-    }
-    pbase[DK_NPART] = run;
-    tbase[DK_NPART] = tsz;
-    c.tab = (uint64_t*)scratch_alloc(&thdr, (size_t)(tsz ? tsz : 1) * sizeof(uint64_t));
-    if (!c.tab) { scratch_free(ihdr); scratch_free(hdr); return false; }
-    if (par) ray_pool_dispatch_n(pool, dk_scatter_fn, &c, (uint32_t)nt);
-    else     dk_scatter_fn(&c, 0, 0, nt);
-    if (par) ray_pool_dispatch_n(pool, dk_dedupe_fn, &c, DK_NPART);
-    else     dk_dedupe_fn(&c, 0, 0, DK_NPART);
-    ray_profile_tick("derived key: keys deduplicated");
-    scratch_free(thdr);
-    scratch_free(ihdr);
-
-    /* the representatives in row order: ordinals, then their strings —
-     * counted per row range on the workers, a prefix over the ranges, then
-     * numbered and listed per range (the count array is free by now) */
-    c.rcnt = cnt;
-    if (par) ray_pool_dispatch_n(pool, dk_reps_count_fn, &c, (uint32_t)nt);
-    else     dk_reps_count_fn(&c, 0, 0, nt);
-    int64_t nd = 0;
-    for (int64_t t = 0; t < nt; t++) { int64_t k = cnt[t]; cnt[t] = nd; nd += k; }
-    size_t dstr_sz = (size_t)nd * sizeof(const char*);
-    size_t dlen_sz = (size_t)nd * sizeof(size_t);
-    size_t did_sz  = (size_t)nd * sizeof(int64_t);
-    char* dm = (char*)scratch_alloc(&dhdr, dstr_sz + dlen_sz + did_sz + (size_t)nd * sizeof(uint32_t));
-    if (!dm) { scratch_free(hdr); return false; }
-    const char** dstr = (const char**)dm;  dm += dstr_sz;
-    size_t*      dlen = (size_t*)dm;       dm += dlen_sz;
-    int64_t*     did  = (int64_t*)dm;      dm += did_sz;
-    uint32_t*    dhsh = (uint32_t*)dm;
-    c.dstr = dstr; c.dlen = dlen; c.dhsh = dhsh;
-    if (par) ray_pool_dispatch_n(pool, dk_reps_list_fn, &c, (uint32_t)nt);
-    else     dk_reps_list_fn(&c, 0, 0, nt);
-    /* Key strings are values of this query, not names: they go into the
-     * key vector's own domain (released with it), never into the global
-     * table — a host extracted from millions of URLs costs one entry
-     * there for as long as the result lives, and nothing afterwards. */
-    ray_profile_tick("derived key: representatives listed");
-    bool ok = ray_sym_domain_intern_batch(kdom, nd, dstr, dlen, dhsh, did);
-    ray_profile_tick("derived key: key domain interned");
-    if (ok) {
-        c.did = did;
-        if (par) ray_pool_dispatch(pool, dk_assign_fn, &c, n);
-        else     dk_assign_fn(&c, 0, 0, n);
-        ray_profile_tick("derived key: keys interned");
-    }
-    scratch_free(dhdr);
-    scratch_free(hdr);
-    return ok;
-}
-
-/* The STR evaluation's key vector: its views and hashes (workers), then
- * the view interning above. */
-typedef struct {
-    const ray_str_t* desc;
-    const char*      pool;
-    const char**     sp;
-    uint32_t*        sl;
-    uint32_t*        hash;
-} dk_hash_ctx_t;
-
-static void dk_hash_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    const dk_hash_ctx_t* c = (const dk_hash_ctx_t*)vctx;
-    for (int64_t i = start; i < end; i++) {
-        const ray_str_t* d = &c->desc[i];
-        const char* p = ray_str_t_ptr(d, c->pool);
-        c->sp[i] = p;
-        c->sl[i] = d->len;
-        c->hash[i] = (uint32_t)ray_hash_bytes(p, d->len);
-    }
-}
-
-static bool derived_key_intern_chunk(ray_t* kc, int64_t n, struct ray_sym_domain_s* kdom,
-                                     int64_t* out) {
-    dk_hash_ctx_t hc;
-    memset(&hc, 0, sizeof(hc));
-    str_resolve(kc, &hc.desc, &hc.pool);
-    ray_t* hdr = NULL;
-    char* mem = (char*)scratch_alloc(&hdr, (size_t)n * (sizeof(const char*) + 2 * sizeof(uint32_t)));
-    if (!mem) return false;
-    hc.sp   = (const char**)mem;
-    hc.sl   = (uint32_t*)(mem + (size_t)n * sizeof(const char*));
-    hc.hash = hc.sl + n;
-    ray_pool_t* rp = ray_pool_get();
-    if (ray_pool_par_dispatch_ok(rp, n, RAY_PARALLEL_THRESHOLD))
-        ray_pool_dispatch(rp, dk_hash_fn, &hc, n);
-    else
-        dk_hash_fn(&hc, 0, 0, n);
-    bool ok = dk_intern_views(hc.sp, hc.sl, hc.hash, n, kdom, out);
-    scratch_free(hdr);
-    return ok;
-}
-
-/* A chunk result that is already SYM (a symbol-literal arm, say): its
- * cells as strings through their own domain, interned into the key
- * domain like any other key string. */
-static bool derived_key_intern_sym_cells(ray_t* kc, int64_t n, struct ray_sym_domain_s* kdom,
-                                         int64_t* out) {
-    ray_t* hdr = NULL;
-    char* mem = (char*)scratch_alloc(&hdr, (size_t)n * (sizeof(const char*) + 2 * sizeof(uint32_t)));
-    if (!mem) return false;
-    const char** sp = (const char**)mem;
-    uint32_t* sl = (uint32_t*)(mem + (size_t)n * sizeof(const char*));
-    uint32_t* hash = sl + n;
-    for (int64_t i = 0; i < n; i++) {
-        ray_t* a = ray_sym_vec_cell(kc, i);
-        size_t l = a ? ray_str_len(a) : 0;
-        if (l > UINT32_MAX) { scratch_free(hdr); return false; }
-        sp[i] = a ? ray_str_ptr(a) : "";
-        sl[i] = (uint32_t)l;
-        hash[i] = (uint32_t)ray_hash_bytes(sp[i], l);
-    }
-    bool ok = dk_intern_views(sp, sl, hash, n, kdom, out);
-    scratch_free(hdr);
-    return ok;
 }
 
 /* ---- the spread pass of derived_key_over_sym_domain: each row takes the
@@ -5883,14 +5577,34 @@ static void dkp_run_batch(const dkp_prog_t* P, dkp_reg_t* R, const char* const* 
     }
 }
 
-/* Workers: each value's key, in place over its view, and the key's hash.
- * regs holds one register file per worker. */
+/* The key hash of the derived-key grouping: ray_hash_bytes, all 64 bits. */
+#ifdef DEBUG
+static int g_derived_key_hash_bits_test = 0;
+/* Test seam: a value in [1, 63] keeps only that many low bits of every key
+ * hash until reset to 0, so distinct keys share hashes and the byte
+ * compare alone keeps them apart. */
+void ray_derived_key_hash_bits_set_for_test(int bits) {
+    g_derived_key_hash_bits_test = bits > 0 && bits < 64 ? bits : 0;
+}
+#endif
+static inline uint64_t dkh_hash(const char* p, uint32_t l) {
+    uint64_t h = ray_hash_bytes(p, l);
+#ifdef DEBUG
+    if (g_derived_key_hash_bits_test) h &= ((uint64_t)1 << g_derived_key_hash_bits_test) - 1;
+#endif
+    return h;
+}
+
+/* Workers: each value's key as a view (of the value itself or of a
+ * literal) and the key's hash.  regs holds one register file per worker. */
 typedef struct {
-    const dkp_prog_t* prog;
-    const char**      sp;
-    uint32_t*         sl;
-    uint32_t*         hash;
-    dkp_reg_t*        regs;
+    const dkp_prog_t*  prog;
+    const char* const* sp;
+    const uint32_t*    sl;
+    const char**       kp;
+    uint32_t*          kl;
+    uint64_t*          kh;
+    dkp_reg_t*         regs;
 } dkp_run_ctx_t;
 
 static void dkp_run_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -5912,139 +5626,1076 @@ static void dkp_run_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         for (int t = 0; t < m; t++) {
             const char* p = res[t].v ? res[t].p : "";
             uint32_t l = (uint32_t)res[t].v;
-            c->sp[i + t] = p;
-            c->sl[i + t] = l;
-            c->hash[i + t] = (uint32_t)ray_hash_bytes(p, l);
+            c->kp[i + t] = p;
+            c->kl[i + t] = l;
+            c->kh[i + t] = dkh_hash(p, l);
         }
     }
 }
 
-/* The keys of dv[lo, lo+n) through the program, interned into the key
- * domain kdom as kd[0, n). */
-static bool dkp_chunk_keys(const dkp_prog_t* P, const void* dv, uint8_t dattrs, int64_t lo,
-                           int64_t n, const ray_sym_domain_raw_t* raw,
-                           struct ray_sym_domain_s* dom, struct ray_sym_domain_s* kdom,
-                           int64_t* kd) {
+/* The chunk DAG's key vector (STR, or SYM for a symbol arm) as views and
+ * hashes (workers). */
+typedef struct {
+    ray_t*           kc;
+    const ray_str_t* desc;
+    const char*      pool;
+    const char**     kp;
+    uint32_t*        kl;
+    uint64_t*        kh;
+    atomic_int       bad;
+} dk_kview_ctx_t;
+
+static void dk_kview_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    dk_kview_ctx_t* c = (dk_kview_ctx_t*)vctx;
+    for (int64_t i = start; i < end; i++) {
+        const char* p; size_t l;
+        if (c->desc) {
+            const ray_str_t* d = &c->desc[i];
+            p = ray_str_t_ptr(d, c->pool);
+            l = d->len;
+        } else {
+            ray_t* a = ray_sym_vec_cell(c->kc, i);
+            p = a ? ray_str_ptr(a) : "";
+            l = a ? ray_str_len(a) : 0;
+        }
+        if (l > UINT32_MAX) { atomic_store_explicit(&c->bad, 1, memory_order_relaxed); l = 0; }
+        if (!p) p = "";
+        c->kp[i] = p;
+        c->kl[i] = (uint32_t)l;
+        c->kh[i] = dkh_hash(p, (uint32_t)l);
+    }
+}
+
+/* The keys of the n values (sp[i], sl[i]) as views kp/kl and hashes kh:
+ * the per-value program on the workers when prog is set (regs: one
+ * register file per worker), the chunk DAG over a STR column of the values
+ * otherwise — the views then point into *kc, the DAG's key vector, which
+ * the caller releases once it is done with them.  False on failure. */
+static bool dkh_keys_of(ray_t* by_expr, int64_t col, const dkp_prog_t* prog, dkp_reg_t* regs,
+                        const char** sp, uint32_t* sl, int64_t n,
+                        const char** kp, uint32_t* kl, uint64_t* kh, ray_t** kc_out) {
+    *kc_out = NULL;
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
-    uint32_t nwork = par ? ray_pool_total_workers(pool) : 1;
-    ray_t *hdr = NULL, *rhdr = NULL;
-    char* mem = (char*)scratch_alloc(&hdr, (size_t)n * (sizeof(const char*) + 2 * sizeof(uint32_t)));
-    dkp_reg_t* regs = (dkp_reg_t*)scratch_alloc(&rhdr, (size_t)nwork * (size_t)P->n *
-                                                       DKP_BATCH * sizeof(dkp_reg_t));
-    if (!mem || !regs) { scratch_free(hdr); scratch_free(rhdr); return false; }
-    dkp_run_ctx_t c = { .prog = P, .regs = regs };
-    c.sp   = (const char**)mem;
-    c.sl   = (uint32_t*)(mem + (size_t)n * sizeof(const char*));
-    c.hash = c.sl + n;
-    bool ok = dk_chunk_views(dv, dattrs, lo, n, raw, dom, c.sp, c.sl);
-    if (ok) {
-        if (par) ray_pool_dispatch(pool, dkp_run_fn, &c, n);
-        else     dkp_run_fn(&c, 0, 0, n);
+    if (prog) {
+        dkp_run_ctx_t rc = { .prog = prog, .sp = sp, .sl = sl,
+                             .kp = kp, .kl = kl, .kh = kh, .regs = regs };
+        if (par) ray_pool_dispatch(pool, dkp_run_fn, &rc, n);
+        else     dkp_run_fn(&rc, 0, 0, n);
         ray_profile_tick("derived key: program over values");
-        ok = dk_intern_views(c.sp, c.sl, c.hash, n, kdom, kd);
+        return true;
     }
-    scratch_free(rhdr);
-    scratch_free(hdr);
+    ray_t* kc = NULL;
+    ray_t* sv = derived_key_chunk_strs(sp, sl, n);
+    if (!sv) return false;
+    ray_t* mini = ray_table_new(0);
+    if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, col, sv);
+    ray_release(sv);
+    if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); return false; }
+    ray_graph_t* g2 = ray_graph_new(mini);
+    if (g2) {
+        ray_op_t* kop = compile_expr_dag(g2, by_expr);
+        if (kop) kop = ray_optimize(g2, kop);
+        if (kop) kc = ray_execute(g2, kop);
+        ray_graph_free(g2);
+    }
+    ray_release(mini);
+    if (kc && !RAY_IS_ERR(kc) && ray_is_lazy(kc)) kc = ray_lazy_materialize(kc);
+    if (!kc || RAY_IS_ERR(kc)) { if (kc) ray_error_free(kc); return false; }
+    if (!ray_is_vec(kc) || kc->len != n || (kc->type != RAY_STR && !RAY_IS_SYM(kc->type))) {
+        ray_release(kc); return false;
+    }
+    ray_profile_tick("derived key: chunk DAG");
+    dk_kview_ctx_t vc;
+    memset(&vc, 0, sizeof(vc));
+    vc.kc = kc; vc.kp = kp; vc.kl = kl; vc.kh = kh;
+    if (kc->type == RAY_STR) str_resolve(kc, &vc.desc, &vc.pool);
+    atomic_store_explicit(&vc.bad, 0, memory_order_relaxed);
+    /* a SYM key's cells resolve through its domain's atoms: serial */
+    if (par && kc->type == RAY_STR) ray_pool_dispatch(pool, dk_kview_fn, &vc, n);
+    else                            dk_kview_fn(&vc, 0, 0, n);
+    if (atomic_load_explicit(&vc.bad, memory_order_relaxed)) { ray_release(kc); return false; }
+    *kc_out = kc;
+    return true;
+}
+
+/* The type the one-shot SYM evaluation gives the key: the expression
+ * compiled (only) against the SYM column of distinct values. */
+static bool dk_key_is_sym(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec) {
+    int8_t sym_out = 0;
+    ray_t* probe = ray_table_new(0);
+    /* add_col retains the column itself; the caller keeps its own ref. */
+    if (probe && !RAY_IS_ERR(probe)) probe = ray_table_add_col(probe, col_sym, dom_vec);
+    if (!probe || RAY_IS_ERR(probe)) { if (probe) ray_error_free(probe); return false; }
+    ray_graph_t* gp = ray_graph_new(probe);
+    if (gp) {
+        ray_op_t* kop = compile_expr_dag(gp, by_expr);
+        /* A key that compiles to a constant — a literal, or a let whose
+         * body is one — evaluates to that literal: a string literal is
+         * typed SYM by the compiler but executes as the STR it is.  The
+         * one-shot evaluation (and the row path behind it) keeps that
+         * type; this path would make it a symbol. */
+        if (kop && kop->opcode != OP_CONST) sym_out = kop->out_type;
+        ray_graph_free(gp);
+    }
+    ray_release(probe);
+    return sym_out == RAY_SYM;
+}
+
+/* ---- the distinct values grouped by their key ---------------------------
+ * The key of every distinct value of C is computed (the per-value program,
+ * or the chunk DAG over a STR column of the values) and the values are
+ * grouped by key without a dictionary: the key's 64-bit hash picks one of
+ * DKH_NPART partitions (its top bits) and a slot in that partition's
+ * open-addressing table; a slot holds the hash and a group, and a group
+ * holds a copy of its key's bytes (in the partition's byte arena, made when
+ * the group is created) and the index of its first value.  A key joins a
+ * group only when hash, length and bytes all equal the group's; a key whose
+ * hash equals a group's but whose bytes do not (a collision) keeps probing
+ * and makes a group of its own.  So the grouping is exact whatever the
+ * hashes do, and the bytes are compared once per distinct value, against a
+ * copy that stays in cache for the frequent keys.  Nothing is interned.
+ *
+ * The values are taken in chunks: their views, their keys, a scatter by
+ * partition in value order, then one task per partition, which owns its
+ * table, groups and arena (nothing shared, nothing locked).  Before the
+ * tasks run, the calling thread sizes every partition as if all its
+ * pending values made new groups (dkh_grow), so a chunk's partitions run in
+ * one dispatch; a task that still runs out of room stops where it is and
+ * resumes after the next sizing.  Every buffer is allocated and freed on
+ * the calling thread.
+ *
+ * Optionally, per group: the row count (hn per value; 1 without it), the
+ * length-weighted row count, the min and max value (by bytes, the null
+ * value skipped, of equal values the one first in value order); per
+ * value its group code (local group << DKH_PART_BITS |
+ * partition).  Groups are then ranked by their first value, the group of
+ * the empty key first (the position a key domain gives "").  */
+#define DKH_PART_BITS 8
+#define DKH_NPART     (1 << DKH_PART_BITS)
+#define DKH_MAX_LOCAL ((int64_t)1 << (32 - DKH_PART_BITS))
+enum { DKH_F_CNT = 1, DKH_F_LENW = 2, DKH_F_MIN = 4, DKH_F_MAX = 8 };
+/* group fields */
+enum { DKH_G_FIRST, DKH_G_KOFF, DKH_G_KLEN, DKH_G_CNT, DKH_G_LENW,
+       DKH_G_MN, DKH_G_MNP, DKH_G_MNL, DKH_G_MX, DKH_G_MXP, DKH_G_MXL, DKH_NG };
+static const uint8_t dkh_gsize[DKH_NG] = { 8, 8, 4, 8, 8, 8, sizeof(void*), 4, 8, sizeof(void*), 4 };
+
+typedef struct {
+    /* table: hash and group + 1 per slot (0 = empty) */
+    uint64_t* th;    uint32_t* tg;    int64_t tcap;  ray_t *th_hdr, *tg_hdr;
+    /* groups */
+    int64_t   ng, gcap;
+    void*     gf[DKH_NG];  ray_t* gh[DKH_NG];
+    /* key bytes */
+    char*     kb;    uint64_t kbn, kbcap;  ray_t* kb_hdr;
+    /* this chunk's items [cur, end) of the item array */
+    int64_t   cur, end;
+    uint64_t  ibytes;
+    int       full;            /* the task stopped for room */
+    int64_t   null_g;          /* group of the null value, -1 */
+    int64_t   null_vi;         /* the null value's index */
+    int64_t   empty_g;         /* group of the empty key, -1 */
+    /* replacement buffers, staged by the calling thread */
+    uint64_t* nth;   uint32_t* ntg;   int64_t ntcap; ray_t *nth_hdr, *ntg_hdr;
+    void*     ngf[DKH_NG]; ray_t* ngh[DKH_NG]; int64_t ngcap;
+    char*     nkb;   uint64_t nkbcap; ray_t* nkb_hdr;
+    bool      grow;
+} dkh_part_t;
+
+/* A value as its partition's task reads it: all it needs in one place, the
+ * partition's values contiguous (no gather by value index per value).  A
+ * key of up to DKH_INLINE bytes is copied in, so the task compares it
+ * without reading the value's bytes, which lie wherever its symbol lies. */
+#define DKH_INLINE 24
+typedef struct dkh_item_s {
+    const char* p;             /* the key */
+    uint64_t    h;
+    int64_t     k;             /* the value's row count */
+    uint32_t    l;
+    uint32_t    i;             /* chunk-relative value index */
+    uint32_t    vl;            /* the value's length */
+    uint32_t    null;          /* the value is the null symbol */
+    char        kb[DKH_INLINE];/* the key, when l <= DKH_INLINE */
+} dkh_item_t;
+static inline const char* dkh_item_key(const dkh_item_t* it) {
+    return it->l <= DKH_INLINE ? it->kb : it->p;
+}
+
+typedef struct {
+    /* inputs */
+    ray_t*                      by_expr;
+    int64_t                     col;
+    ray_t*                      dvec;     /* the distinct values (SYM) */
+    const void*                 dv;
+    uint8_t                     dattrs;
+    struct ray_sym_domain_s*    dom;
+    const ray_sym_domain_raw_t* raw;
+    int64_t                     du;
+    const int64_t*              hn;       /* rows per value, or NULL */
+    unsigned                    flags;
+    bool                        want_codes;
+    /* chunk state */
+    int64_t                     lo, n, nt;
+    const char**                sp;  uint32_t* sl;            /* the values */
+    const char**                kp;  uint32_t* kl;  uint64_t* kh;   /* their keys */
+    dkh_item_t*                 items;
+    int64_t*                    tcnt;     /* [nt][DKH_NPART] counts, then cursors */
+    uint64_t*                   tbytes;   /* [nt][DKH_NPART] key bytes */
+    /* results */
+    dkh_part_t                  part[DKH_NPART];
+    uint32_t*                   codes;    /* per value, when want_codes */
+    int64_t                     G;
+    int64_t                     pbase[DKH_NPART + 1];
+    uint32_t*                   rank;     /* [pbase[p] + g]: the group's rank */
+    uint32_t*                   order;    /* [rank]: the group's code */
+    /* ranking */
+    uint64_t*                   bits;
+    const int64_t*              wrank;
+    int64_t                     r_empty;  /* rank of the empty key's group by its first value, -1 */
+    ray_t*                      hdrs[8];
+} dkh_t;
+
+static inline uint32_t dkh_part_of(uint64_t h) { return (uint32_t)(h >> (64 - DKH_PART_BITS)); }
+static inline uint64_t dkh_slot(uint64_t h) { return (h * 0x9E3779B97F4A7C15ull) >> 29; }
+
+/* One value's min / max candidate against the best so far (bi < 0: none):
+ * by bytes, then length; of equal values the lower value index wins (the
+ * first in value order, as the row path keeps the first row). */
+static inline void dkh_minmax(int64_t* bi, const char** bp, uint32_t* bl, int64_t vi,
+                              const char* p, uint32_t l, bool is_max) {
+    if (*bi >= 0) {
+        uint32_t m = l < *bl ? l : *bl;
+        int cmp = m ? memcmp(p, *bp, m) : 0;
+        if (cmp == 0) cmp = (l > *bl) - (l < *bl);
+        if (cmp == 0 ? vi > *bi : (is_max ? cmp < 0 : cmp > 0)) return;
+    }
+    *bi = vi; *bp = p; *bl = l;
+}
+
+static void dkh_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkh_t* c = (dkh_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t* k = c->tcnt + t * DKH_NPART;
+        uint64_t* b = c->tbytes + t * DKH_NPART;
+        memset(k, 0, DKH_NPART * sizeof(int64_t));
+        memset(b, 0, DKH_NPART * sizeof(uint64_t));
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt;
+        for (int64_t i = lo; i < hi; i++) {
+            uint32_t p = dkh_part_of(c->kh[i]);
+            k[p]++;
+            b[p] += c->kl[i];
+        }
+    }
+}
+
+static void dkh_scatter_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkh_t* c = (dkh_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t* k = c->tcnt + t * DKH_NPART;
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt;
+        for (int64_t i = lo; i < hi; i++) {
+            uint64_t h = c->kh[i];
+            dkh_item_t* it = &c->items[k[dkh_part_of(h)]++];
+            it->p = c->kp[i];
+            it->h = h;
+            it->k = c->hn ? c->hn[c->lo + i] : 1;
+            it->l = c->kl[i];
+            it->i = (uint32_t)i;
+            it->vl = c->sl[i];
+            it->null = ray_read_sym(c->dv, c->lo + i, RAY_SYM, c->dattrs) <= 0;
+            if (it->l <= DKH_INLINE) memcpy(it->kb, it->p, it->l);
+        }
+    }
+}
+
+#define DKH_GF(P, f, T) ((T*)(P)->gf[f])
+
+static void dkh_group_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dkh_t* c = (dkh_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        dkh_part_t* P = &c->part[p];
+        if (P->cur >= P->end) continue;
+        int64_t*  first = DKH_GF(P, DKH_G_FIRST, int64_t);
+        uint64_t* koff  = DKH_GF(P, DKH_G_KOFF, uint64_t);
+        uint32_t* klen  = DKH_GF(P, DKH_G_KLEN, uint32_t);
+        int64_t*  cnt   = DKH_GF(P, DKH_G_CNT, int64_t);
+        int64_t*  lenw  = DKH_GF(P, DKH_G_LENW, int64_t);
+        int64_t*  mn    = DKH_GF(P, DKH_G_MN, int64_t);
+        const char** mnp = DKH_GF(P, DKH_G_MNP, const char*);
+        uint32_t* mnl   = DKH_GF(P, DKH_G_MNL, uint32_t);
+        int64_t*  mx    = DKH_GF(P, DKH_G_MX, int64_t);
+        const char** mxp = DKH_GF(P, DKH_G_MXP, const char*);
+        uint32_t* mxl   = DKH_GF(P, DKH_G_MXL, uint32_t);
+        bool aggs = cnt || lenw || mn || mx;
+        /* the partition's state in locals for the loop, stored back after */
+        uint64_t* th = P->th;
+        uint32_t* tg = P->tg;
+        char* kb = P->kb;
+        uint64_t kbn = P->kbn, kbcap = P->kbcap;
+        int64_t ng = P->ng, gcap = P->gcap, tcap = P->tcap;
+        int64_t cur = P->cur, end = P->end;
+        const dkh_item_t* items = c->items;
+        uint32_t* codes = c->codes;
+        const int64_t lo = c->lo;
+        uint64_t mask = (uint64_t)tcap - 1;
+        for (; cur < end; cur++) {
+            const dkh_item_t* it = &items[cur];
+            uint64_t h = it->h;
+            uint32_t l = it->l;
+            uint64_t s = dkh_slot(h) & mask;
+            int64_t g = -1;
+            for (;;) {
+                uint32_t e = tg[s];
+                if (!e) break;
+                if (th[s] == h) {
+                    int64_t q = (int64_t)e - 1;
+                    if (klen[q] == l && (l == 0 || memcmp(kb + koff[q], dkh_item_key(it), l) == 0)) { g = q; break; }
+                }
+                s = (s + 1) & mask;
+            }
+            int64_t vi = lo + it->i;
+            if (g < 0) {
+                if ((ng + 1) * 2 > tcap || ng >= gcap || kbn + l > kbcap) {
+                    P->full = 1;
+                    break;
+                }
+                g = ng++;
+                tg[s] = (uint32_t)(g + 1);
+                th[s] = h;
+                first[g] = vi;
+                koff[g] = kbn;
+                klen[g] = l;
+                if (l) memcpy(kb + kbn, dkh_item_key(it), l);
+                kbn += l;
+                if (l == 0) P->empty_g = g;
+                if (cnt) cnt[g] = 0;
+                if (lenw) lenw[g] = 0;
+                if (mn) mn[g] = -1;
+                if (mx) mx[g] = -1;
+            }
+            if (codes) codes[vi] = (uint32_t)((uint64_t)g << DKH_PART_BITS | (uint64_t)p);
+            if (!aggs) continue;
+            if (cnt) cnt[g] += it->k;
+            if (it->null) { P->null_g = g; P->null_vi = vi; continue; }
+            if (lenw) lenw[g] += it->k * (int64_t)it->vl;
+            if (mn) dkh_minmax(&mn[g], &mnp[g], &mnl[g], vi, c->sp[it->i], it->vl, false);
+            if (mx) dkh_minmax(&mx[g], &mxp[g], &mxl[g], vi, c->sp[it->i], it->vl, true);
+        }
+        P->kbn = kbn;
+        P->ng = ng;
+        P->cur = cur;
+    }
+}
+
+/* Moves a partition into its staged buffers: the table rehashed, the
+ * groups and key bytes copied. */
+static void dkh_grow_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dkh_t* c = (dkh_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        dkh_part_t* P = &c->part[p];
+        if (!P->grow) continue;
+        if (P->ntg) {
+            memset(P->ntg, 0, (size_t)P->ntcap * sizeof(uint32_t));
+            uint64_t nm = (uint64_t)P->ntcap - 1;
+            for (int64_t s = 0; s < P->tcap; s++) {
+                uint32_t e = P->tg[s];
+                if (!e) continue;
+                uint64_t h = P->th[s];
+                uint64_t d = dkh_slot(h) & nm;
+                while (P->ntg[d]) d = (d + 1) & nm;
+                P->ntg[d] = e;
+                P->nth[d] = h;
+            }
+        }
+        for (int f = 0; f < DKH_NG; f++)
+            if (P->ngf[f] && P->gf[f] && P->ng)
+                memcpy(P->ngf[f], P->gf[f], (size_t)P->ng * dkh_gsize[f]);
+        if (P->nkb && P->kbn) memcpy(P->nkb, P->kb, (size_t)P->kbn);
+    }
+}
+
+static bool dkh_field_on(const dkh_t* c, int f) {
+    switch (f) {
+    case DKH_G_FIRST: case DKH_G_KOFF: case DKH_G_KLEN: return true;
+    case DKH_G_CNT:  return (c->flags & DKH_F_CNT) != 0;
+    case DKH_G_LENW: return (c->flags & DKH_F_LENW) != 0;
+    case DKH_G_MN: case DKH_G_MNP: case DKH_G_MNL: return (c->flags & DKH_F_MIN) != 0;
+    default:         return (c->flags & DKH_F_MAX) != 0;
+    }
+}
+
+/* Stage larger buffers for every partition whose pending items might not
+ * fit, move the content over on the workers, and free what was replaced.
+ * The share of pending values expected to make new groups is the share so
+ * far (a quarter before the first chunk), with half again for slack; the
+ * group arrays, the table (at half load) and the arena are sized for that
+ * and grown by half at least.  A task that still runs out of room stops,
+ * and the next call sizes it again.  False on OOM or past the code width. */
+static bool dkh_grow(dkh_t* c, bool par) {
+    ray_pool_t* pool = ray_pool_get();
+    bool any = false, ok = true;
+    int64_t ng_all = 0;
+    for (int p = 0; p < DKH_NPART; p++) ng_all += c->part[p].ng;
+    double share = c->lo > 0 ? 1.5 * (double)ng_all / (double)c->lo : 0.25;
+    if (share > 1.0) share = 1.0;
+    for (int p = 0; p < DKH_NPART && ok; p++) {
+        dkh_part_t* P = &c->part[p];
+        P->grow = false;
+        int64_t pend = P->end - P->cur;
+        if (pend <= 0) continue;
+        int64_t need_g = P->ng + (int64_t)((double)pend * share) + 16;
+        if (need_g > P->ng + pend) need_g = P->ng + pend;
+        if (need_g > DKH_MAX_LOCAL) need_g = DKH_MAX_LOCAL;
+        uint64_t need_b = P->kbn + (uint64_t)((double)P->ibytes * share) + 256;
+        if (need_b > P->kbn + P->ibytes) need_b = P->kbn + P->ibytes;
+        if (P->full) {                  /* room for the value it stopped at, at least */
+            if (need_g < P->ng + 1) need_g = P->ng + 1;
+            uint64_t nb = P->kbn + c->items[P->cur].l;
+            if (need_b < nb) need_b = nb;
+        }
+        if (need_g > DKH_MAX_LOCAL) { ok = false; break; }      /* past the code width */
+        if (2 * need_g > P->tcap) {
+            int64_t cap = P->tcap ? P->tcap : 64;
+            while (cap < 2 * need_g) cap <<= 1;
+            P->nth = (uint64_t*)scratch_alloc(&P->nth_hdr, (size_t)cap * sizeof(uint64_t));
+            P->ntg = (uint32_t*)scratch_alloc(&P->ntg_hdr, (size_t)cap * sizeof(uint32_t));
+            if (!P->nth || !P->ntg) { ok = false; break; }
+            P->ntcap = cap;
+        }
+        if (need_g > P->gcap) {
+            int64_t cap = P->gcap + P->gcap / 2;
+            if (cap < need_g) cap = need_g;
+            if (cap > DKH_MAX_LOCAL) cap = DKH_MAX_LOCAL;
+            for (int f = 0; f < DKH_NG && ok; f++) {
+                if (!dkh_field_on(c, f)) continue;
+                P->ngf[f] = scratch_alloc(&P->ngh[f], (size_t)cap * dkh_gsize[f]);
+                if (!P->ngf[f]) ok = false;
+            }
+            P->ngcap = cap;
+        }
+        if (need_b > P->kbcap || P->kbcap == 0) {
+            uint64_t cap = P->kbcap + P->kbcap / 2;
+            if (cap < need_b) cap = need_b;
+            if (cap < 1024) cap = 1024;
+            P->nkb = (char*)scratch_alloc(&P->nkb_hdr, (size_t)cap);
+            if (!P->nkb) { ok = false; break; }
+            P->nkbcap = cap;
+        }
+        P->grow = P->ntg || P->ngcap || P->nkb;
+        any |= P->grow;
+    }
+    if (ok && any) {
+        if (par) ray_pool_dispatch_n(pool, dkh_grow_fn, c, DKH_NPART);
+        else     dkh_grow_fn(c, 0, 0, DKH_NPART);
+        if (ray_interrupted()) ok = false;
+    }
+    /* swap in what moved (or drop what was staged, on failure) */
+    for (int p = 0; p < DKH_NPART; p++) {
+        dkh_part_t* P = &c->part[p];
+        if (ok && P->grow) {
+            if (P->ntg) {
+                scratch_free(P->th_hdr); scratch_free(P->tg_hdr);
+                P->th = P->nth; P->tg = P->ntg; P->tcap = P->ntcap;
+                P->th_hdr = P->nth_hdr; P->tg_hdr = P->ntg_hdr;
+            }
+            if (P->ngcap) {
+                for (int f = 0; f < DKH_NG; f++) {
+                    if (!P->ngf[f]) continue;
+                    scratch_free(P->gh[f]);
+                    P->gf[f] = P->ngf[f]; P->gh[f] = P->ngh[f];
+                }
+                P->gcap = P->ngcap;
+            }
+            if (P->nkb) {
+                scratch_free(P->kb_hdr);
+                P->kb = P->nkb; P->kbcap = P->nkbcap; P->kb_hdr = P->nkb_hdr;
+            }
+            P->full = 0;
+        } else {
+            scratch_free(P->nth_hdr); scratch_free(P->ntg_hdr);
+            for (int f = 0; f < DKH_NG; f++) scratch_free(P->ngh[f]);
+            scratch_free(P->nkb_hdr);
+        }
+        P->nth = NULL; P->ntg = NULL; P->ntcap = 0; P->nth_hdr = P->ntg_hdr = NULL;
+        memset(P->ngf, 0, sizeof(P->ngf)); memset(P->ngh, 0, sizeof(P->ngh)); P->ngcap = 0;
+        P->nkb = NULL; P->nkbcap = 0; P->nkb_hdr = NULL;
+        P->grow = false;
+    }
     return ok;
 }
 
+static void dkh_free(dkh_t* c) {
+    for (int p = 0; p < DKH_NPART; p++) {
+        dkh_part_t* P = &c->part[p];
+        scratch_free(P->th_hdr); scratch_free(P->tg_hdr);
+        for (int f = 0; f < DKH_NG; f++) scratch_free(P->gh[f]);
+        scratch_free(P->kb_hdr);
+    }
+    for (int k = 0; k < 8; k++) scratch_free(c->hdrs[k]);
+}
+
+/* Ranks: a bitmap of the groups' first values (set on the workers), a
+ * running popcount per word, the rank of each group, the group of the
+ * empty key moved first. */
+static void dkh_mark_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dkh_t* c = (dkh_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        const dkh_part_t* P = &c->part[p];
+        const int64_t* first = DKH_GF(P, DKH_G_FIRST, int64_t);
+        for (int64_t g = 0; g < P->ng; g++)
+            atomic_fetch_or_explicit((_Atomic(uint64_t)*)&c->bits[first[g] >> 6],
+                                     (uint64_t)1 << (first[g] & 63), memory_order_relaxed);
+    }
+}
+
+static inline int64_t dkh_first_rank(const dkh_t* c, int64_t v) {
+    int64_t w = v >> 6;
+    return c->wrank[w] + __builtin_popcountll(c->bits[w] & (((uint64_t)1 << (v & 63)) - 1));
+}
+
+static void dkh_rank_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dkh_t* c = (dkh_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        const dkh_part_t* P = &c->part[p];
+        const int64_t* first = DKH_GF(P, DKH_G_FIRST, int64_t);
+        uint32_t* rk = c->rank + c->pbase[p];
+        for (int64_t g = 0; g < P->ng; g++) {
+            int64_t r = dkh_first_rank(c, first[g]);
+            if (c->r_empty > 0) r = r == c->r_empty ? 0 : r + (r < c->r_empty);
+            rk[g] = (uint32_t)r;
+            c->order[r] = (uint32_t)((uint64_t)g << DKH_PART_BITS | (uint64_t)p);
+        }
+    }
+}
+
+static inline uint32_t dkh_code_rank(const dkh_t* c, uint32_t code) {
+    return c->rank[c->pbase[code & (DKH_NPART - 1)] + (code >> DKH_PART_BITS)];
+}
+
+/* Group the du distinct values of c->dvec by their key (see above).  The
+ * caller fills the inputs and calls dkh_free afterwards, whatever this
+ * returns. */
+static bool dkh_build(dkh_t* c) {
+    int64_t du = c->du;
+    if (du <= 0 || du >= INT32_MAX) return false;
+    for (int p = 0; p < DKH_NPART; p++) { c->part[p].null_g = -1; c->part[p].empty_g = -1; }
+    c->dv = ray_data(c->dvec);
+    c->dattrs = c->dvec->attrs;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nwork = ray_pool_par_dispatch_ok(pool, 2, 1) ? ray_pool_total_workers(pool) : 1;
+
+    dkp_prog_t* prog = NULL;
+    ray_t* prog_hdr = NULL;
+    prog = (dkp_prog_t*)scratch_alloc(&prog_hdr, sizeof(dkp_prog_t));
+    c->hdrs[0] = prog_hdr;
+    if (!prog) return false;
+    bool use_prog = dkp_build(prog, c->by_expr, c->col);
+
+    const int64_t chunk = derived_key_chunk_rows(!use_prog);
+    int64_t cn = du < chunk ? du : chunk;
+    int64_t nt_max = (int64_t)nwork * 4;
+    if (nt_max < 1) nt_max = 1;
+    size_t per = 2 * sizeof(const char*) + 2 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(dkh_item_t);
+    char* mem = (char*)scratch_alloc(&c->hdrs[1], (size_t)cn * per);
+    char* tm  = (char*)scratch_alloc(&c->hdrs[2], (size_t)nt_max * DKH_NPART * (sizeof(int64_t) + sizeof(uint64_t)));
+    dkp_reg_t* regs = NULL;
+    if (use_prog)
+        regs = (dkp_reg_t*)scratch_alloc(&c->hdrs[3], (size_t)nwork * (size_t)prog->n * DKP_BATCH * sizeof(dkp_reg_t));
+    if (!mem || !tm || (use_prog && !regs)) return false;
+    c->items = (dkh_item_t*)mem;              mem += (size_t)cn * sizeof(dkh_item_t);
+    c->sp = (const char**)mem;                mem += (size_t)cn * sizeof(const char*);
+    c->kp = (const char**)mem;                mem += (size_t)cn * sizeof(const char*);
+    c->kh = (uint64_t*)mem;                   mem += (size_t)cn * sizeof(uint64_t);
+    c->sl = (uint32_t*)mem;                   mem += (size_t)cn * sizeof(uint32_t);
+    c->kl = (uint32_t*)mem;
+    c->tcnt = (int64_t*)tm;
+    c->tbytes = (uint64_t*)(tm + (size_t)nt_max * DKH_NPART * sizeof(int64_t));
+    if (c->want_codes) {
+        c->codes = (uint32_t*)scratch_alloc(&c->hdrs[4], (size_t)du * sizeof(uint32_t));
+        if (!c->codes) return false;
+    }
+
+    for (int64_t lo = 0; lo < du; lo += chunk) {
+        if (ray_interrupted()) return false;
+        int64_t n = du - lo < chunk ? du - lo : chunk;
+        c->lo = lo; c->n = n;
+        bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
+        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, NULL, c->sp, c->sl)) return false;
+        ray_t* kc = NULL;
+        if (!dkh_keys_of(c->by_expr, c->col, use_prog ? prog : NULL, regs, c->sp, c->sl, n,
+                         c->kp, c->kl, c->kh, &kc)) return false;
+
+        /* scatter by partition, value order kept within each */
+        int64_t nt = 1;
+        if (par) {
+            nt = nt_max;
+            if (nt > n / 4096) nt = n / 4096;
+            if (nt < 1) nt = 1;
+        }
+        c->nt = nt;
+        if (nt > 1) ray_pool_dispatch_n(pool, dkh_count_fn, c, (uint32_t)nt);
+        else        dkh_count_fn(c, 0, 0, 1);
+        int64_t run = 0;
+        for (int p = 0; p < DKH_NPART; p++) {
+            dkh_part_t* P = &c->part[p];
+            P->cur = run;
+            P->ibytes = 0;
+            for (int64_t t = 0; t < nt; t++) {
+                int64_t k = c->tcnt[t * DKH_NPART + p];
+                P->ibytes += c->tbytes[t * DKH_NPART + p];
+                c->tcnt[t * DKH_NPART + p] = run;
+                run += k;
+            }
+            P->end = run;
+        }
+        if (nt > 1) ray_pool_dispatch_n(pool, dkh_scatter_fn, c, (uint32_t)nt);
+        else        dkh_scatter_fn(c, 0, 0, 1);
+
+        /* the partitions, until every one has taken its items */
+        bool ok = dkh_grow(c, par);
+        while (ok) {
+            if (par) ray_pool_dispatch_n(pool, dkh_group_fn, c, DKH_NPART);
+            else     dkh_group_fn(c, 0, 0, DKH_NPART);
+            if (ray_interrupted()) { ok = false; break; }
+            bool pending = false;
+            for (int p = 0; p < DKH_NPART; p++) if (c->part[p].cur < c->part[p].end) pending = true;
+            if (!pending) break;
+            ok = dkh_grow(c, par);
+        }
+        if (kc) ray_release(kc);
+        if (!ok) return false;
+        ray_profile_tick("derived key: values grouped");
+    }
+
+    /* ranks by first value */
+    int64_t G = 0;
+    for (int p = 0; p < DKH_NPART; p++) { c->pbase[p] = G; G += c->part[p].ng; }
+    c->pbase[DKH_NPART] = G;
+    c->G = G;
+    if (G <= 0 || G > du) return false;
+    int64_t nw = (du + 63) / 64;
+    c->bits = (uint64_t*)scratch_calloc(&c->hdrs[5], (size_t)nw * sizeof(uint64_t));
+    int64_t* wrank = (int64_t*)scratch_alloc(&c->hdrs[6], (size_t)nw * sizeof(int64_t));
+    char* rm = (char*)scratch_alloc(&c->hdrs[7], (size_t)G * 2 * sizeof(uint32_t));
+    if (!c->bits || !wrank || !rm) return false;
+    c->rank = (uint32_t*)rm;
+    c->order = c->rank + G;
+    bool par = ray_pool_par_dispatch_ok(pool, G, RAY_PARALLEL_THRESHOLD);
+    if (par) ray_pool_dispatch_n(pool, dkh_mark_fn, c, DKH_NPART);
+    else     dkh_mark_fn(c, 0, 0, DKH_NPART);
+    int64_t run = 0;
+    for (int64_t w = 0; w < nw; w++) { wrank[w] = run; run += __builtin_popcountll(c->bits[w]); }
+    c->wrank = wrank;
+    if (run != G) return false;
+    c->r_empty = -1;
+    for (int p = 0; p < DKH_NPART; p++) {
+        const dkh_part_t* P = &c->part[p];
+        if (P->empty_g >= 0)
+            c->r_empty = dkh_first_rank(c, DKH_GF(P, DKH_G_FIRST, int64_t)[P->empty_g]);
+    }
+    if (par) ray_pool_dispatch_n(pool, dkh_rank_fn, c, DKH_NPART);
+    else     dkh_rank_fn(c, 0, 0, DKH_NPART);
+    scratch_free(c->hdrs[5]); c->hdrs[5] = NULL; c->bits = NULL;
+    scratch_free(c->hdrs[6]); c->hdrs[6] = NULL; c->wrank = NULL;
+    /* the chunk buffers are done */
+    scratch_free(c->hdrs[1]); c->hdrs[1] = NULL;
+    scratch_free(c->hdrs[2]); c->hdrs[2] = NULL;
+    scratch_free(c->hdrs[3]); c->hdrs[3] = NULL;
+    ray_profile_tick("derived key: groups ranked");
+    return true;
+}
+
+/* The key bytes of group `code`. */
+static inline const char* dkh_key(const dkh_t* c, uint32_t code, uint32_t* len) {
+    const dkh_part_t* P = &c->part[code & (DKH_NPART - 1)];
+    uint32_t g = code >> DKH_PART_BITS;
+    *len = DKH_GF(P, DKH_G_KLEN, uint32_t)[g];
+    return P->kb + DKH_GF(P, DKH_G_KOFF, uint64_t)[g];
+}
+
+/* The keys of groups order[0, n) (codes) into a fresh key domain, in that
+ * order — all distinct, so one batch appends them: position = order
+ * (after the domain's "" at 0).  The domain hash is computed here, never
+ * the grouping's. */
+typedef struct {
+    const dkh_t*    c;
+    const uint32_t* codes;
+    const char**    strs;
+    size_t*         lens;
+    uint32_t*       h32;
+} dkh_keys_ctx_t;
+
+static void dkh_keys_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const dkh_keys_ctx_t* k = (const dkh_keys_ctx_t*)vctx;
+    for (int64_t r = lo; r < hi; r++) {
+        uint32_t l;
+        const char* p = dkh_key(k->c, k->codes[r], &l);
+        k->strs[r] = p;
+        k->lens[r] = l;
+        k->h32[r] = (uint32_t)ray_hash_bytes(p, l);
+    }
+}
+
+static bool dkh_intern_keys(const dkh_t* c, const uint32_t* codes, int64_t n,
+                            struct ray_sym_domain_s* kdom, int64_t* pos) {
+    if (n <= 0) return true;
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)n * (sizeof(const char*) + sizeof(size_t) + sizeof(uint32_t)));
+    if (!mem) return false;
+    dkh_keys_ctx_t k = { .c = c, .codes = codes };
+    k.strs = (const char**)mem;
+    k.lens = (size_t*)(mem + (size_t)n * sizeof(const char*));
+    k.h32  = (uint32_t*)(mem + (size_t)n * (sizeof(const char*) + sizeof(size_t)));
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, dkh_keys_fn, &k, n);
+    else                                                          dkh_keys_fn(&k, 0, 0, n);
+    bool ok = ray_sym_domain_intern_batch(kdom, n, k.strs, k.lens, k.h32, pos);
+    scratch_free(hdr);
+    ray_profile_tick("derived key: key domain interned");
+    return ok;
+}
+
+/* Per value: the key domain position of its group. */
+typedef struct {
+    const dkh_t*   c;
+    const int64_t* kpos;
+    int64_t*       out;
+} dkh_spread_ctx_t;
+
+static void dkh_spread_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const dkh_spread_ctx_t* s = (const dkh_spread_ctx_t*)vctx;
+    for (int64_t i = lo; i < hi; i++) s->out[i] = s->kpos[dkh_code_rank(s->c, s->c->codes[i])];
+}
+
+/* The key of each of the du values of dom_vec, as a SYM vector over a key
+ * domain of its own: the distinct values grouped by key (dkh_build), the
+ * groups' keys interned once each in first-seen order, every value given
+ * its group's position.  Applies only when the expression's result over
+ * the SYM column is SYM (the type the caller expects).  NULL otherwise. */
 static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom_vec,
                                      struct ray_sym_domain_s* dom, int64_t du) {
     if (!dom || du <= 0) return NULL;
+    if (!dk_key_is_sym(by_expr, col_sym, dom_vec)) return NULL;
     ray_sym_domain_raw_t raw = {0};
     (void)ray_sym_domain_raw_pin(dom, &raw);
-
-    /* The result type the SYM evaluation would give: compile (only) the
-     * expression against the SYM column. */
-    int8_t sym_out = 0;
+    ray_t* out = NULL;
+    ray_t* chdr = NULL;
+    dkh_t* c = (dkh_t*)scratch_calloc(&chdr, sizeof(dkh_t));
+    if (!c) goto done;
+    c->by_expr = by_expr; c->col = col_sym; c->dvec = dom_vec; c->dom = dom; c->raw = &raw;
+    c->du = du; c->want_codes = true;
+    if (!dkh_build(c)) goto done;
     {
-        ray_t* probe = ray_table_new(0);
-        /* add_col retains the column itself; the caller keeps its own ref. */
-        if (probe && !RAY_IS_ERR(probe)) probe = ray_table_add_col(probe, col_sym, dom_vec);
-        if (!probe || RAY_IS_ERR(probe)) { if (probe) ray_error_free(probe); goto unpin_null; }
-        ray_graph_t* gp = ray_graph_new(probe);
-        if (gp) {
-            ray_op_t* kop = compile_expr_dag(gp, by_expr);
-            /* A key that compiles to a constant — a literal, or a let whose
-             * body is one — evaluates to that literal: a string literal is
-             * typed SYM by the compiler but executes as the STR it is.  The
-             * one-shot evaluation (and the row path behind it) keeps that
-             * type; this path would intern it into a symbol. */
-            if (kop && kop->opcode != OP_CONST) sym_out = kop->out_type;
-            ray_graph_free(gp);
-        }
-        ray_release(probe);
-    }
-    if (sym_out != RAY_SYM) goto unpin_null;
-
-    ray_t* key_dom = ray_vec_new(RAY_SYM, du);
-    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); goto unpin_null; }
-    key_dom->len = du;
-    int64_t* kd = (int64_t*)ray_data(key_dom);
-    const void* dv = ray_data(dom_vec);
-    /* The key strings live in a domain of their own, owned by the key
-     * vector (and by every vector that adopts it): the query's derived
-     * values never enter the global table, and the whole dictionary goes
-     * when the last result column holding it does.  Its positions are
-     * this execution's first-seen ranks of the keys (dk_intern_views). */
-    {
+        ray_t* key_dom = ray_vec_new(RAY_SYM, du);
+        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); goto done; }
+        key_dom->len = du;
+        /* The key strings live in a domain of their own, owned by the key
+         * vector (and by every vector that adopts it): the query's derived
+         * values never enter the global table, and the whole dictionary
+         * goes when the last result column holding it does. */
         struct ray_sym_domain_s* kdom = ray_sym_domain_new();
-        if (!kdom) { ray_release(key_dom); goto unpin_null; }
+        if (!kdom) { ray_release(key_dom); goto done; }
         key_dom->sym_domain = kdom;               /* the vector takes the ref */
+        ray_t* phdr = NULL;
+        int64_t* kpos = (int64_t*)scratch_alloc(&phdr, (size_t)c->G * sizeof(int64_t));
+        if (!kpos || !dkh_intern_keys(c, c->order, c->G, kdom, kpos)) {
+            scratch_free(phdr); ray_release(key_dom); goto done;
+        }
+        dkh_spread_ctx_t sc = { .c = c, .kpos = kpos, .out = (int64_t*)ray_data(key_dom) };
+        ray_pool_t* pool = ray_pool_get();
+        if (ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, dkh_spread_fn, &sc, du);
+        else                                                           dkh_spread_fn(&sc, 0, 0, du);
+        scratch_free(phdr);
+        ray_profile_tick("derived key: keys spread");
+        out = key_dom;
     }
-    struct ray_sym_domain_s* kdom = key_dom->sym_domain;
+done:
+    if (c) dkh_free(c);
+    scratch_free(chdr);
+    ray_sym_domain_raw_unpin(dom);
+    return out;
+}
 
-    /* The per-value program when the key compiles to one, the chunk DAG
-     * otherwise. */
-    dkp_prog_t prog;
-    bool use_prog = dkp_build(&prog, by_expr, col_sym);
+/* ---- min / max of the kept groups, after the grouping: only the values
+ * of kept groups are read (their bytes off the mapping, in value order),
+ * scattered by their group's partition, and one task per partition
+ * compares its groups' values — the first of equal values kept, as the row
+ * path keeps it.  oix[rank] is the group's output row (UINT32_MAX: not
+ * kept); mn/mx NULL when not wanted. */
+typedef struct {
+    const char* p;
+    uint32_t    i;             /* chunk-relative value index */
+    uint32_t    l;
+    uint32_t    o;             /* the group's output row */
+    uint32_t    pad;
+} dkh_mm_item_t;
+typedef struct {
+    const dkh_t*    c;
+    const uint32_t* oix;
+    int64_t         lo, n, nt;
+    uint8_t*        want;
+    uint32_t*       wo;        /* per value: its group's output row */
+    const char**    sp;
+    uint32_t*       sl;
+    int64_t*        tcnt;      /* [nt][DKH_NPART]: counts, then cursors */
+    dkh_mm_item_t*  items;     /* the wanted values, by partition */
+    int64_t         pstart[DKH_NPART + 1];
+    int64_t*        mn; const char** mnp; uint32_t* mnl;
+    int64_t*        mx; const char** mxp; uint32_t* mxl;
+} dkh_mm_ctx_t;
 
-    const int64_t chunk = derived_key_chunk_rows();
-    for (int64_t lo = 0; lo < du; lo += chunk) {
-        int64_t n = du - lo < chunk ? du - lo : chunk;
-        if (use_prog) {
-            if (!dkp_chunk_keys(&prog, dv, dom_vec->attrs, lo, n, &raw, dom, kdom, kd + lo)) goto fail;
-            continue;
-        }
-        ray_t* sv = derived_key_chunk_strs(dv, dom_vec->attrs, lo, n, &raw, dom);
-        if (!sv) goto fail;
-        ray_t* mini = ray_table_new(0);
-        if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, col_sym, sv);
-        ray_release(sv);
-        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); goto fail; }
-        ray_t* kc = NULL;
-        ray_graph_t* g2 = ray_graph_new(mini);
-        if (g2) {
-            ray_op_t* kop = compile_expr_dag(g2, by_expr);
-            if (kop) kop = ray_optimize(g2, kop);
-            if (kop) kc = ray_execute(g2, kop);
-            ray_graph_free(g2);
-        }
-        ray_release(mini);
-        if (kc && !RAY_IS_ERR(kc) && ray_is_lazy(kc)) kc = ray_lazy_materialize(kc);
-        if (!kc || RAY_IS_ERR(kc)) { if (kc) ray_error_free(kc); goto fail; }
-        if (!ray_is_vec(kc) || kc->len != n) { ray_release(kc); goto fail; }
-        ray_profile_tick("derived key: chunk DAG");
-        if (kc->type == RAY_STR) {
-            if (!derived_key_intern_chunk(kc, n, kdom, kd + lo)) { ray_release(kc); goto fail; }
-        } else if (RAY_IS_SYM(kc->type)) {
-            /* The STR evaluation still produced symbols (e.g. a literal
-             * symbol branch): their strings, into the key domain. */
-            if (!derived_key_intern_sym_cells(kc, n, kdom, kd + lo)) { ray_release(kc); goto fail; }
-        } else {
-            ray_release(kc);
-            goto fail;
-        }
-        ray_release(kc);
+static void dkh_mm_want_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    dkh_mm_ctx_t* m = (dkh_mm_ctx_t*)vctx;
+    const dkh_t* c = m->c;
+    for (int64_t i = lo; i < hi; i++) {
+        int64_t vi = m->lo + i;
+        uint32_t o = m->oix[dkh_code_rank(c, c->codes[vi])];
+        m->wo[i] = o;
+        m->want[i] = o != UINT32_MAX && ray_read_sym(c->dv, vi, RAY_SYM, c->dattrs) > 0;
     }
-    ray_sym_domain_raw_unpin(dom);
-    return key_dom;
-fail:
-    ray_release(key_dom);
-unpin_null:
-    ray_sym_domain_raw_unpin(dom);
-    return NULL;
+}
+
+static void dkh_mm_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkh_mm_ctx_t* m = (dkh_mm_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t* k = m->tcnt + t * DKH_NPART;
+        memset(k, 0, DKH_NPART * sizeof(int64_t));
+        int64_t lo = m->n * t / m->nt, hi = m->n * (t + 1) / m->nt;
+        for (int64_t i = lo; i < hi; i++)
+            if (m->want[i]) k[m->c->codes[m->lo + i] & (DKH_NPART - 1)]++;
+    }
+}
+
+static void dkh_mm_scatter_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkh_mm_ctx_t* m = (dkh_mm_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t* k = m->tcnt + t * DKH_NPART;
+        int64_t lo = m->n * t / m->nt, hi = m->n * (t + 1) / m->nt;
+        for (int64_t i = lo; i < hi; i++) {
+            if (!m->want[i]) continue;
+            dkh_mm_item_t* it = &m->items[k[m->c->codes[m->lo + i] & (DKH_NPART - 1)]++];
+            it->p = m->sp[i];
+            it->i = (uint32_t)i;
+            it->l = m->sl[i];
+            it->o = m->wo[i];
+            it->pad = 0;
+        }
+    }
+}
+
+static void dkh_mm_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dkh_mm_ctx_t* m = (dkh_mm_ctx_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        for (int64_t j = m->pstart[p]; j < m->pstart[p + 1]; j++) {
+            const dkh_mm_item_t* it = &m->items[j];
+            int64_t vi = m->lo + it->i;
+            uint32_t o = it->o;
+            if (m->mn) dkh_minmax(&m->mn[o], &m->mnp[o], &m->mnl[o], vi, it->p, it->l, false);
+            if (m->mx) dkh_minmax(&m->mx[o], &m->mxp[o], &m->mxl[o], vi, it->p, it->l, true);
+        }
+    }
+}
+
+static bool dkh_kept_minmax_scatter(const dkh_t* c, const uint32_t* oix,
+                                    int64_t* mn, const char** mnp, uint32_t* mnl,
+                                    int64_t* mx, const char** mxp, uint32_t* mxl) {
+    if (!c->codes) return false;
+    ray_pool_t* pool = ray_pool_get();
+    const int64_t chunk = derived_key_chunk_rows(false);
+    int64_t cn = c->du < chunk ? c->du : chunk;
+    int64_t nt_max = (int64_t)ray_pool_total_workers(pool) * 4;
+    if (nt_max < 1) nt_max = 1;
+    ray_t *hdr = NULL, *thdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)cn * (sizeof(dkh_mm_item_t) + sizeof(const char*) +
+                                                         2 * sizeof(uint32_t) + 1));
+    int64_t* tcnt = (int64_t*)scratch_alloc(&thdr, (size_t)nt_max * DKH_NPART * sizeof(int64_t));
+    if (!mem || !tcnt) { scratch_free(hdr); scratch_free(thdr); return false; }
+    dkh_mm_ctx_t m;
+    memset(&m, 0, sizeof(m));
+    m.c = c; m.oix = oix; m.tcnt = tcnt;
+    m.mn = mn; m.mnp = mnp; m.mnl = mnl; m.mx = mx; m.mxp = mxp; m.mxl = mxl;
+    m.items = (dkh_mm_item_t*)mem; mem += (size_t)cn * sizeof(dkh_mm_item_t);
+    m.sp    = (const char**)mem;   mem += (size_t)cn * sizeof(const char*);
+    m.sl    = (uint32_t*)mem;      mem += (size_t)cn * sizeof(uint32_t);
+    m.wo    = (uint32_t*)mem;      mem += (size_t)cn * sizeof(uint32_t);
+    m.want  = (uint8_t*)mem;
+    bool ok = true;
+    for (int64_t lo = 0; lo < c->du && ok; lo += chunk) {
+        if (ray_interrupted()) { ok = false; break; }
+        int64_t n = c->du - lo < chunk ? c->du - lo : chunk;
+        m.lo = lo; m.n = n;
+        bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
+        if (par) ray_pool_dispatch(pool, dkh_mm_want_fn, &m, n);
+        else     dkh_mm_want_fn(&m, 0, 0, n);
+        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, m.want, m.sp, m.sl)) { ok = false; break; }
+        int64_t nt = 1;
+        if (par) {
+            nt = nt_max;
+            if (nt > n / 4096) nt = n / 4096;
+            if (nt < 1) nt = 1;
+        }
+        m.nt = nt;
+        if (nt > 1) ray_pool_dispatch_n(pool, dkh_mm_count_fn, &m, (uint32_t)nt);
+        else        dkh_mm_count_fn(&m, 0, 0, 1);
+        int64_t run = 0;
+        for (int p = 0; p < DKH_NPART; p++) {
+            m.pstart[p] = run;
+            for (int64_t t = 0; t < nt; t++) {
+                int64_t k = tcnt[t * DKH_NPART + p];
+                tcnt[t * DKH_NPART + p] = run;
+                run += k;
+            }
+        }
+        m.pstart[DKH_NPART] = run;
+        if (nt > 1) ray_pool_dispatch_n(pool, dkh_mm_scatter_fn, &m, (uint32_t)nt);
+        else        dkh_mm_scatter_fn(&m, 0, 0, 1);
+        if (par) ray_pool_dispatch_n(pool, dkh_mm_fn, &m, DKH_NPART);
+        else     dkh_mm_fn(&m, 0, 0, DKH_NPART);
+        if (ray_interrupted()) ok = false;
+    }
+    scratch_free(hdr);
+    scratch_free(thdr);
+    ray_profile_tick("derived key: min/max of kept groups by partition");
+    return ok;
+}
+
+/* The same for few kept groups: every worker takes value ranges in value
+ * order and keeps a best per kept group of its own (no scatter, the
+ * values' bytes read in mapping order); the bests are merged per group
+ * afterwards.  A value past the file prefix / the borrowed atom array is
+ * left to the calling thread. */
+typedef struct {
+    const dkh_t*    c;
+    const uint32_t* oc;        /* [pbase[p] + g]: the group's output row */
+    int64_t         K;
+    int64_t*        mn; const char** mnp; uint32_t* mnl;   /* [worker][K] */
+    int64_t*        mx; const char** mxp; uint32_t* mxl;
+    ray_t* const*   rstr;
+    uint32_t        rcnt;
+    atomic_int      late;
+} dkh_mmw_ctx_t;
+
+static inline uint32_t dkh_mmw_out(const dkh_mmw_ctx_t* m, int64_t vi) {
+    uint32_t code = m->c->codes[vi];
+    return m->oc[m->c->pbase[code & (DKH_NPART - 1)] + (code >> DKH_PART_BITS)];
+}
+
+/* The bytes of value vi when a worker may read them; false = late. */
+static inline bool dkh_mmw_str(const dkh_mmw_ctx_t* m, int64_t pos, const char** p, uint32_t* l) {
+    if (m->rstr) {
+        ray_t* a = pos < (int64_t)m->rcnt ? m->rstr[pos] : NULL;
+        if (!a || ray_str_len(a) > UINT32_MAX) return false;
+        *p = ray_str_ptr(a);
+        *l = (uint32_t)ray_str_len(a);
+        return true;
+    }
+    if (pos >= m->c->raw->count) return false;
+    size_t sl = 0;
+    const char* s = ray_sym_domain_raw_str(m->c->raw, pos, &sl);
+    *p = s ? s : "";
+    *l = (uint32_t)sl;
+    return true;
+}
+
+static void dkh_mmw_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    dkh_mmw_ctx_t* m = (dkh_mmw_ctx_t*)vctx;
+    const dkh_t* c = m->c;
+    size_t base = (size_t)wid * (size_t)m->K;
+    int late = 0;
+    for (int64_t vi = lo; vi < hi; vi++) {
+        uint32_t o = dkh_mmw_out(m, vi);
+        if (o == UINT32_MAX) continue;
+        int64_t pos = ray_read_sym(c->dv, vi, RAY_SYM, c->dattrs);
+        if (pos <= 0) continue;
+        const char* p; uint32_t l;
+        if (!dkh_mmw_str(m, pos, &p, &l)) { late++; continue; }
+        size_t s = base + o;
+        if (m->mn) dkh_minmax(&m->mn[s], &m->mnp[s], &m->mnl[s], vi, p, l, false);
+        if (m->mx) dkh_minmax(&m->mx[s], &m->mxp[s], &m->mxl[s], vi, p, l, true);
+    }
+    if (late) atomic_fetch_add_explicit(&m->late, late, memory_order_relaxed);
+}
+
+static bool dkh_kept_minmax(const dkh_t* c, const uint32_t* oix, int64_t K,
+                            int64_t* mn, const char** mnp, uint32_t* mnl,
+                            int64_t* mx, const char** mxp, uint32_t* mxl) {
+    if (!c->codes) return false;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, c->du, RAY_PARALLEL_THRESHOLD);
+    int64_t nw = par ? (int64_t)ray_pool_total_workers(pool) : 1;
+    if (K * nw > ((int64_t)1 << 20))
+        return dkh_kept_minmax_scatter(c, oix, mn, mnp, mnl, mx, mxp, mxl);
+    ray_t *ohdr = NULL, *whdr = NULL;
+    uint32_t* oc = (uint32_t*)scratch_alloc(&ohdr, (size_t)c->G * sizeof(uint32_t));
+    size_t per = sizeof(int64_t) + sizeof(const char*) + sizeof(uint32_t);
+    char* w = (char*)scratch_alloc(&whdr, (size_t)nw * (size_t)K * per * 2);
+    if (!oc || !w) { scratch_free(ohdr); scratch_free(whdr); return false; }
+    for (int64_t q = 0; q < c->G; q++) oc[q] = oix[c->rank[q]];
+    dkh_mmw_ctx_t m;
+    memset(&m, 0, sizeof(m));
+    m.c = c; m.oc = oc; m.K = K;
+    size_t nk = (size_t)nw * (size_t)K;
+    int64_t* wmn = (int64_t*)w;          w += nk * sizeof(int64_t);
+    int64_t* wmx = (int64_t*)w;          w += nk * sizeof(int64_t);
+    const char** wmnp = (const char**)w; w += nk * sizeof(const char*);
+    const char** wmxp = (const char**)w; w += nk * sizeof(const char*);
+    uint32_t* wmnl = (uint32_t*)w;       w += nk * sizeof(uint32_t);
+    uint32_t* wmxl = (uint32_t*)w;
+    for (size_t s = 0; s < nk; s++) { wmn[s] = -1; wmx[s] = -1; }
+    if (mn) { m.mn = wmn; m.mnp = wmnp; m.mnl = wmnl; }
+    if (mx) { m.mx = wmx; m.mxp = wmxp; m.mxl = wmxl; }
+    if (c->dom == ray_sym_runtime_domain()) {
+        ray_t** rs = NULL; uint32_t rcnt = 0;
+        ray_sym_strings_borrow(&rs, &rcnt);
+        m.rstr = rs; m.rcnt = rcnt;
+    }
+    atomic_store_explicit(&m.late, 0, memory_order_relaxed);
+    if (par) ray_pool_dispatch(pool, dkh_mmw_fn, &m, c->du);
+    else     dkh_mmw_fn(&m, 0, 0, c->du);
+    bool ok = !ray_interrupted();
+    /* merge: per kept group, the best over the workers */
+    for (int64_t o = 0; ok && o < K; o++) {
+        for (int64_t wk = 0; wk < nw; wk++) {
+            size_t s = (size_t)wk * (size_t)K + (size_t)o;
+            if (mn && wmn[s] >= 0) dkh_minmax(&mn[o], &mnp[o], &mnl[o], wmn[s], wmnp[s], wmnl[s], false);
+            if (mx && wmx[s] >= 0) dkh_minmax(&mx[o], &mxp[o], &mxl[o], wmx[s], wmxp[s], wmxl[s], true);
+        }
+    }
+    /* the values no worker could read, through the domain */
+    if (ok && atomic_load_explicit(&m.late, memory_order_relaxed)) {
+        for (int64_t vi = 0; vi < c->du; vi++) {
+            uint32_t o = dkh_mmw_out(&m, vi);
+            if (o == UINT32_MAX) continue;
+            int64_t pos = ray_read_sym(c->dv, vi, RAY_SYM, c->dattrs);
+            if (pos <= 0) continue;
+            const char* p; uint32_t l;
+            if (dkh_mmw_str(&m, pos, &p, &l)) continue;
+            ray_t* a = ray_sym_domain_str(c->dom, pos);
+            size_t sl = a ? ray_str_len(a) : 0;
+            if (sl > UINT32_MAX) { ok = false; break; }
+            p = a ? ray_str_ptr(a) : "";
+            l = (uint32_t)sl;
+            if (mn) dkh_minmax(&mn[o], &mnp[o], &mnl[o], vi, p, l, false);
+            if (mx) dkh_minmax(&mx[o], &mxp[o], &mxl[o], vi, p, l, true);
+        }
+    }
+    scratch_free(ohdr);
+    scratch_free(whdr);
+    ray_profile_tick("derived key: min/max of kept groups");
+    return ok;
 }
 
 /* ---- aggregates over the vocabulary -------------------------------------
@@ -6055,8 +6706,15 @@ unpin_null:
  * its strlen sum the length-weighted count.  So: one grouping of the rows by
  * C itself (the engine's fastest shape: a column key, a count) gives the
  * distinct values with their counts; the key expression runs once per
- * distinct value (derived_key_str_chunks); and the aggregates are rewritten
- * over that per-value table.  Nothing per row is evaluated or accumulated
+ * distinct value and the values are grouped by key (dkh_build), each
+ * group's count, length-weighted count and min/max accumulated as its
+ * values join it.  With a having cut armed by the enclosing select (a
+ * where over the count, dkv_having_count) that few groups can pass, the
+ * values are grouped in two passes instead (dk2_run: counts by key hash,
+ * then exact aggregates for the keys under the hashes that pass); with one
+ * that many can pass, min/max are found afterwards for the kept groups
+ * only.  Only the output groups' keys are interned.
+ * Nothing per row is evaluated or accumulated
  * beyond the count histogram.  count(C) counts null rows too, avg(strlen C)
  * divides by the non-null rows, min/max skip null — the row-wise rules.
  * Returns NULL for every shape it does not take (the caller runs the row
@@ -6135,52 +6793,11 @@ static int dkv_agg_kind(ray_t* v, int64_t col) {
     #undef DKV_IS
 }
 
-/* Per distinct value (workers): its non-null row count and its
- * length-weighted row count, the length read off the pinned mapping.  A
- * position past the file prefix is marked (lenw = INT64_MIN) and resolved
- * through the domain on the calling thread. */
-typedef struct {
-    const void*    hc;
-    uint8_t        attrs;
-    const int64_t* cnt;
-    int64_t*       nn;
-    int64_t*       lenw;
-    struct ray_sym_domain_s* dom;
-    ray_sym_domain_raw_t raw;
-    bool           raw_ok;
-    ray_t* const*  rstr;      /* runtime domain: the borrowed atom array */
-    uint32_t       rcnt;
-    atomic_int     late;
-} dkv_len_ctx_t;
-
-static void dkv_len_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
-    (void)wid;
-    dkv_len_ctx_t* c = (dkv_len_ctx_t*)vctx;
-    int late = 0;
-    for (int64_t i = lo; i < hi; i++) {
-        int64_t pos = ray_read_sym(c->hc, i, RAY_SYM, c->attrs);
-        c->nn[i] = pos > 0 ? c->cnt[i] : 0;
-        if (pos <= 0) { c->lenw[i] = 0; continue; }
-        if (c->rstr) {
-            ray_t* a = pos < (int64_t)c->rcnt ? c->rstr[pos] : NULL;
-            if (a) c->lenw[i] = c->cnt[i] * (int64_t)ray_str_len(a);
-            else { c->lenw[i] = INT64_MIN; late++; }
-        } else if (c->raw_ok && pos < c->raw.count) {
-            size_t l; (void)ray_sym_domain_raw_str(&c->raw, pos, &l);
-            c->lenw[i] = c->cnt[i] * (int64_t)l;
-        } else {
-            c->lenw[i] = INT64_MIN;
-            late++;
-        }
-    }
-    if (late) atomic_fetch_add_explicit(&c->late, late, memory_order_relaxed);
-}
-
 /* H (distinct values of C with their counts) in C's domain-position order.
  * The grouping that produced H emits in an order that depends on the core
- * count; the key domain is filled in H's order, and the rewrite's output
- * is put in key-position order, so it comes out the same at every core
- * count (the first-seen order of the key values over the vocabulary).  Positions are distinct, so the order is the
+ * count; the groups are ranked by their first value in H, so the output
+ * comes out the same at every core count (the first-seen order of the
+ * key values over the vocabulary).  Positions are distinct, so the order is the
  * rank of each position among those present: a bitmap over the domain
  * (set on the workers), a running popcount per word, then a scatter on the
  * workers.  Returns a new table, or NULL (H kept). */
@@ -6228,6 +6845,18 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     ray_t* Hn = tbl_col_idx_or_null(H, 1);
     int64_t du = ray_table_nrows(H);
     if (!Hc || !Hn || dom_count <= 0 || du <= 1) return NULL;
+    /* A dense grouping emits its groups ascending by code already: keep H
+     * rather than hold a second copy of it. */
+    {
+        const void* cd = ray_data(Hc);
+        int64_t prev = ray_read_sym(cd, 0, RAY_SYM, Hc->attrs), i = 1;
+        for (; i < du; i++) {
+            int64_t cur = ray_read_sym(cd, i, RAY_SYM, Hc->attrs);
+            if (cur <= prev) break;
+            prev = cur;
+        }
+        if (i == du) return NULL;
+    }
     int64_t nw = (dom_count + 63) / 64;
     ray_t *bh = NULL, *rh = NULL;
     uint64_t* bits  = (uint64_t*)scratch_calloc(&bh, (size_t)nw * sizeof(uint64_t));
@@ -6275,6 +6904,881 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     return out;
 }
 
+/* An enclosing select whose `where: (> c N)` reads a count output of this
+ * one arms the group emit filter for it (match_group_count_emit_filter):
+ * the groups that filter drops are dropped here as well, before a key or a
+ * min / max is made for them — the enclosing select still applies its
+ * where as written, so the answer is the same.  N when the filter targets
+ * an output that counts C and this select has no sort or take; -1
+ * otherwise. */
+static int64_t dkv_having_count(ray_t** dict_elems, int64_t dict_n, int64_t from_id,
+                                int64_t by_id, int64_t where_id, int64_t take_id,
+                                int64_t asc_id, int64_t desc_id, const int64_t* alias,
+                                const int* kind, int n_aggs, bool plain) {
+    if (!plain) return -1;
+    ray_group_emit_filter_t ef = ray_group_emit_filter_active();
+    if (!ef.enabled || ef.top_count_take > 0 || ef.min_count_exclusive <= 0) return -1;
+    if (ef.agg_op != 0 && ef.agg_op != OP_COUNT) return -1;
+    /* the filter names its output by its index among the select's
+     * aggregate outputs, counted as match_group_count_emit_filter counts */
+    uint8_t ai = 0;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id)
+            continue;
+        if (!is_group_dag_agg_expr(dict_elems[i + 1], NULL)) continue;
+        if (ai == ef.agg_index) {
+            for (int a = 0; a < n_aggs; a++)
+                if (alias[a] == kid) return kind[a] == DKV_COUNT ? ef.min_count_exclusive : -1;
+            return -1;
+        }
+        ai++;
+    }
+    return -1;
+}
+
+/* The output of K groups: kv, their key column (consumed), then the
+ * aggregates as written — per output row o, cnt[o] rows, nn[o] of them not
+ * null, lenw[o] the length-weighted count, mnpos[o] / mxpos[o] the position
+ * of the min / max value in C's domain (<= 0: none).  NULL on failure. */
+static ray_t* dkv_emit(ray_t* by_expr, const int64_t* alias, const int* kind, int n_aggs,
+                       ray_t* Hc, ray_t* kv, int64_t K, const int64_t* cnt, const int64_t* nn,
+                       const int64_t* lenw, const int64_t* mnpos, const int64_t* mxpos) {
+    ray_t* cols[DKV_MAX_AGGS + 1];
+    memset(cols, 0, sizeof(cols));
+    cols[0] = kv;
+    bool ok = true;
+    for (int a = 0; a < n_aggs && ok; a++) {
+        int k = kind[a];
+        ray_t* v;
+        if (k == DKV_MIN || k == DKV_MAX) v = ray_sym_vec_new(Hc->attrs & RAY_SYM_W_MASK, K);
+        else v = ray_vec_new(k == DKV_AVG_LEN ? RAY_F64 : RAY_I64, K);
+        if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); ok = false; break; }
+        v->len = K;
+        cols[a + 1] = v;
+        if (k == DKV_MIN || k == DKV_MAX) ray_sym_vec_adopt_domain(v, Hc);
+        bool nulls = false;
+        for (int64_t o = 0; o < K; o++) {
+            if (k == DKV_COUNT) {
+                ((int64_t*)ray_data(v))[o] = cnt[o];
+            } else if (k == DKV_SUM_LEN) {
+                ((int64_t*)ray_data(v))[o] = lenw[o];
+            } else if (k == DKV_AVG_LEN) {
+                double d = nn[o] ? ray_f64_fin((double)lenw[o] / (double)nn[o]) : NULL_F64;
+                if (d != d) nulls = true;
+                ((double*)ray_data(v))[o] = d;
+            } else {
+                int64_t pos = k == DKV_MIN ? mnpos[o] : mxpos[o];
+                if (pos <= 0) { pos = 0; nulls = true; }
+                ray_write_sym(ray_data(v), o, (uint64_t)pos, RAY_SYM, v->attrs);
+            }
+        }
+        if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    ray_t* O = NULL;
+    if (ok) {
+        /* the key column is named as the row path names a computed key */
+        int64_t kname = derived_key_name(by_expr);
+        for (int a = 0; a < n_aggs; a++)
+            if (alias[a] == kname) { kname = ray_sym_intern("key", 3); break; }
+        O = ray_table_new(n_aggs + 1);
+        if (O && !RAY_IS_ERR(O)) O = ray_table_add_col(O, kname, cols[0]);
+        for (int a = 0; a < n_aggs && O && !RAY_IS_ERR(O); a++)
+            O = ray_table_add_col(O, alias[a], cols[a + 1]);
+        if (O && RAY_IS_ERR(O)) { ray_error_free(O); O = NULL; }
+    }
+    for (int a = 0; a <= n_aggs; a++) if (cols[a]) ray_release(cols[a]);
+    if (!ok || !O) { if (O) ray_release(O); return NULL; }
+    return O;
+}
+
+/* ---- the derived-key grouping under a having cut, in two passes ---------
+ * With a count cut armed (dkv_having_count: only the groups of more than N
+ * rows are kept) at most rows / (N + 1) groups survive, while dkh_build
+ * holds every group's key bytes and aggregates — hundreds of MB over a
+ * URL-sized vocabulary — to keep a few dozen.  So:
+ *   pass A: every value's key and its 64-bit hash; the row counts summed by
+ *     hash alone (one 16-byte slot per hash: the hash, the count and the
+ *     first value — no key bytes, no other aggregate), in the partitioned
+ *     chunk structure of dkh_build.  Per value, the low 32 bits of its
+ *     key's hash and, when the key is the per-value program's view of the
+ *     value, where in the value it lies (dk2_sc_of: in the high half of the
+ *     value's row count when H is ours alone, else in an array);
+ *   candidates: the hashes whose count passes the cut.  A key's count is at
+ *     most its hash's, so no kept group is missed;
+ *   pass B: the key of each candidate's first value, copied out, makes a
+ *     group of its own.  Then only the values whose low 32 bits are a
+ *     candidate's are read again, their keys taken off their bytes by the
+ *     slice (the program runs again only for a chunk with a value that
+ *     has none, the chunk DAG for every chunk): a value whose key's bytes
+ *     equal a group's adds to that group's exact aggregates (on the
+ *     workers, an accumulator set per task).  A value whose key is no
+ *     group's (another key under a candidate's hash, or under its low 32
+ *     bits only) is marked, and the marked values are grouped afterwards on
+ *     the calling thread, exactly, making the groups they need;
+ *   the cut again, over the exact counts: every key past it is under a
+ *     candidate hash, so it has a group, and every group's count is exact.
+ * The answer is dkh_build's: the kept groups ordered by their first value
+ * in C's position order (the smallest position among their values), the
+ * empty key first; min / max by bytes; the null value counted, not
+ * measured. */
+#define DK2_MAX_CAND    ((int64_t)1 << 18)   /* groups a cut may let through */
+#define DK2_STAGE_BYTES ((size_t)16 << 20)   /* pass A tables moved per round */
+#ifdef DEBUG
+static int64_t g_dk2_stats[5];
+/* Test seam: runs of the two-pass grouping, then of the last run the
+ * groups it emitted, its candidate hashes, the groups made for marked
+ * values, and whether the key slices went into H's counts. */
+void ray_derived_key_two_pass_stats_for_test(int64_t out[5]) {
+    memcpy(out, g_dk2_stats, sizeof(g_dk2_stats));
+}
+#endif
+
+typedef struct { uint64_t h; uint32_t cnt; uint32_t f1; } dk2_slot_t;   /* f1: first value + 1, 0 = empty */
+typedef struct { uint64_t h; uint32_t k; uint32_t i; } dk2_item_t;     /* hash, rows, chunk-relative value */
+typedef struct {
+    dk2_slot_t* t;   int64_t cap, ng;  ray_t* hdr;
+    dk2_slot_t* nt;  int64_t ncap;     ray_t* nhdr;    /* staged by the calling thread */
+    int64_t     cur, end;
+    int         full;                                  /* the task stopped for room */
+} dk2_part_t;
+typedef struct {
+    int64_t     cnt, lenw;
+    int64_t     fpos;                  /* smallest position among the values */
+    int64_t     mn, mx;                /* positions of the min / max value, -1 */
+    const char* mnp; const char* mxp;
+    uint32_t    mnl, mxl;
+} dk2_acc_t;
+typedef struct { uint64_t h, koff; uint32_t klen, pad; dk2_acc_t a; } dk2_grp_t;
+typedef struct { uint32_t g1, h32; } dk2_ts_t;                         /* group + 1, its low 32 bits */
+
+typedef struct {
+    /* inputs */
+    ray_t*                      by_expr;
+    int64_t                     col;
+    const void*                 dv;
+    uint8_t                     dattrs;
+    struct ray_sym_domain_s*    dom;
+    const ray_sym_domain_raw_t* raw;
+    int64_t                     du;
+    int64_t*                    hn;       /* rows per value in the low 32 bits */
+    uint32_t*                   h32;      /* the values' low 32 hash bits */
+    uint32_t*                   sc;       /* the values' key slices (dk2_sc_of); NULL: hn's high half */
+    atomic_int                  n_none;   /* selected values of the chunk without a slice */
+    const char*                 lit_p[DKP_MAX_INS];   /* the program's string literals */
+    uint32_t                    lit_l[DKP_MAX_INS];
+    int                         nlit;
+    int64_t                     having;
+    bool                        want_lenw, want_mn, want_mx;
+    const dkp_prog_t*           prog;
+    dkp_reg_t*                  regs;
+    /* chunk state */
+    int64_t                     lo, n, nt, m, at;
+    int                         mode;     /* pass B selection: 0 a candidate's low bits, 1 marked */
+    const char**                sp;  uint32_t* sl;
+    const char**                kp;  uint32_t* kl;  uint64_t* kh;
+    dk2_item_t*                 items;
+    const char**                wsp; uint32_t* wsl; uint32_t* wix;   /* the selected values */
+    uint8_t*                    want;
+    int64_t*                    tcnt;     /* [nt][DKH_NPART] counts, then cursors */
+    /* pass A */
+    dk2_part_t                  part[DKH_NPART];
+    /* pass B: the groups, their table (by low 32 bits) and key bytes */
+    dk2_grp_t*                  grp;  int64_t ng, gcap;     ray_t* grp_hdr;
+    dk2_ts_t*                   tab;  int64_t tcap;         ray_t* tab_hdr;
+    char*                       kb;   uint64_t kbn, kbcap;  ray_t* kb_hdr;
+    int64_t                     ng0, nacc;
+    dk2_acc_t*                  acc;      /* [task][ng0] */
+    uint64_t*                   unres;    /* per value: marked */
+    atomic_int                  n_unres;
+    int64_t                     null_g, null_cnt;
+} dk2_t;
+
+static inline uint32_t dk2_sc(const dk2_t* c, int64_t v) {
+    return c->sc ? c->sc[v] : (uint32_t)((uint64_t)c->hn[v] >> 32);
+}
+static inline int64_t dk2_cnt(const dk2_t* c, int64_t v) { return (int64_t)(uint32_t)c->hn[v]; }
+
+/* Where a value's key lies, so pass B reads it back without running the
+ * key again: off << 20 | length when the key's bytes are the value's bytes
+ * at off (off < DK2_SC_LIT) — a view the program returned, or the DAG's
+ * key found in the value —, DK2_SC_LIT << 20 | i for the program's string
+ * literal i, DK2_SC_NONE for any other key (whose value runs the key
+ * again).  The bytes are compared or the pointer is the value's own, so a
+ * slice gives the key's bytes exactly. */
+#define DK2_SC_NONE UINT32_MAX
+#define DK2_SC_LIT  4095u
+#define DK2_SC_LEN  (((uint32_t)1 << 20) - 1)
+static inline uint32_t dk2_sc_of(const dk2_t* c, const char* v, uint32_t vl, const char* k, uint32_t kl) {
+    if (kl == 0) return 0;
+    if (kl >= DK2_SC_LEN) return DK2_SC_NONE;
+    uintptr_t vp = (uintptr_t)v, kp = (uintptr_t)k;
+    if (kp >= vp && kp + kl <= vp + vl && kp - vp < DK2_SC_LIT)
+        return (uint32_t)((kp - vp) << 20 | kl);
+    if (c->prog) {
+        for (int i = 0; i < c->nlit; i++)
+            if (c->lit_p[i] == k && c->lit_l[i] == kl) return DK2_SC_LIT << 20 | (uint32_t)i;
+        return DK2_SC_NONE;
+    }
+    if (kl > vl) return DK2_SC_NONE;
+    size_t lim = (size_t)vl < (size_t)DK2_SC_LIT - 1 + kl ? (size_t)vl : (size_t)DK2_SC_LIT - 1 + kl;
+    int64_t off = memcmp(v, k, kl) == 0 ? 0 : dkp_find_literal(v, lim, k, kl);
+    if (off == NULL_I64 || off < 0 || off >= (int64_t)DK2_SC_LIT) return DK2_SC_NONE;
+    return (uint32_t)((uint64_t)off << 20 | kl);
+}
+
+/* The key bytes of slice sc (not DK2_SC_NONE) of value bytes v. */
+static inline const char* dk2_sc_key(const dk2_t* c, uint32_t sc, const char* v, uint32_t* kl) {
+    uint32_t off = sc >> 20, len = sc & DK2_SC_LEN;
+    if (off < DK2_SC_LIT) { *kl = len; return v + off; }
+    *kl = c->lit_l[len];
+    return c->lit_p[len];
+}
+
+/* pass A slot: any table size (no power of two to double into) */
+static inline uint64_t dk2_aslot(uint64_t h, int64_t cap) {
+    return (uint64_t)(((unsigned __int128)(h * 0x9E3779B97F4A7C15ull) * (uint64_t)cap) >> 64);
+}
+
+static void dk2_count_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t* k = c->tcnt + t * DKH_NPART;
+        memset(k, 0, DKH_NPART * sizeof(int64_t));
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt;
+        for (int64_t i = lo; i < hi; i++) k[dkh_part_of(c->kh[i])]++;
+    }
+}
+
+static void dk2_scatter_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t* k = c->tcnt + t * DKH_NPART;
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt;
+        for (int64_t i = lo; i < hi; i++) {
+            uint64_t h = c->kh[i];
+            int64_t v = c->lo + i;
+            uint32_t cnt = (uint32_t)c->hn[v];
+            dk2_item_t* it = &c->items[k[dkh_part_of(h)]++];
+            it->h = h;
+            it->k = cnt;
+            it->i = (uint32_t)i;
+            c->h32[v] = (uint32_t)h;
+            uint32_t sc = dk2_sc_of(c, c->sp[i], c->sl[i], c->kp[i], c->kl[i]);
+            if (c->sc) c->sc[v] = sc;
+            else       c->hn[v] = (int64_t)((uint64_t)sc << 32 | cnt);
+        }
+    }
+}
+
+static void dk2_group_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        dk2_part_t* P = &c->part[p];
+        if (P->cur >= P->end) continue;
+        dk2_slot_t* t = P->t;
+        const uint64_t cap = (uint64_t)P->cap;
+        int64_t ng = P->ng, cur = P->cur, end = P->end;
+        const dk2_item_t* items = c->items;
+        for (; cur < end; cur++) {
+            const dk2_item_t* it = &items[cur];
+            uint64_t h = it->h;
+            uint64_t s = dk2_aslot(h, P->cap);
+            while (t[s].f1 && t[s].h != h) if (++s == cap) s = 0;
+            if (!t[s].f1) {
+                if ((uint64_t)(ng + 1) * 5 > cap * 4) { P->full = 1; break; }
+                t[s].h = h;
+                t[s].cnt = 0;
+                t[s].f1 = (uint32_t)(c->lo + it->i + 1);
+                ng++;
+            }
+            t[s].cnt += it->k;
+        }
+        P->ng = ng;
+        P->cur = cur;
+    }
+}
+
+/* Moves the staged partitions' slots into their new tables. */
+static void dk2_move_fn(void* vctx, uint32_t wid, int64_t p0, int64_t p1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t p = p0; p < p1; p++) {
+        dk2_part_t* P = &c->part[p];
+        if (!P->nt) continue;
+        memset(P->nt, 0, (size_t)P->ncap * sizeof(dk2_slot_t));
+        const uint64_t ncap = (uint64_t)P->ncap;
+        for (int64_t s = 0; s < P->cap; s++) {
+            if (!P->t[s].f1) continue;
+            uint64_t d = dk2_aslot(P->t[s].h, P->ncap);
+            while (P->nt[d].f1) if (++d == ncap) d = 0;
+            P->nt[d] = P->t[s];
+        }
+    }
+}
+
+/* Sizes every partition whose pending items might not fit at load 4/5:
+ * the share of pending values expected to make new hashes is the share so
+ * far (a quarter before the first chunk) with half again for slack, and a
+ * table grows to load 3/5 of that, by half at least.  The tables move a
+ * batch of DK2_STAGE_BYTES at a time, so old and new tables coexist for
+ * that batch only.  False on OOM or interrupt. */
+static bool dk2_grow(dk2_t* c, bool par) {
+    ray_pool_t* pool = ray_pool_get();
+    int64_t ng_all = 0;
+    for (int p = 0; p < DKH_NPART; p++) ng_all += c->part[p].ng;
+    double share = c->lo > 0 ? 1.5 * (double)ng_all / (double)c->lo : 0.25;
+    if (share > 1.0) share = 1.0;
+    bool ok = true;
+    size_t staged = 0;
+    for (int p = 0; p < DKH_NPART && ok; p++) {
+        dk2_part_t* P = &c->part[p];
+        int64_t pend = P->end - P->cur;
+        if (pend > 0) {
+            int64_t need = P->ng + (int64_t)((double)pend * share) + 16;
+            if (need > P->ng + pend) need = P->ng + pend;
+            if (need < P->ng + 1) need = P->ng + 1;
+            if (need * 5 > P->cap * 4) {
+                int64_t ncap = need * 5 / 3;
+                if (ncap < P->cap + P->cap / 2) ncap = P->cap + P->cap / 2;
+                ncap += 64;
+                P->nt = (dk2_slot_t*)scratch_alloc(&P->nhdr, (size_t)ncap * sizeof(dk2_slot_t));
+                if (!P->nt) { P->nhdr = NULL; ok = false; break; }
+                P->ncap = ncap;
+                staged += (size_t)ncap * sizeof(dk2_slot_t);
+            }
+        }
+        if (staged && (staged >= DK2_STAGE_BYTES || p == DKH_NPART - 1)) {
+            if (par) ray_pool_dispatch_n(pool, dk2_move_fn, c, DKH_NPART);
+            else     dk2_move_fn(c, 0, 0, DKH_NPART);
+            for (int q = 0; q <= p; q++) {
+                dk2_part_t* Q = &c->part[q];
+                if (!Q->nt) continue;
+                scratch_free(Q->hdr);
+                Q->t = Q->nt; Q->cap = Q->ncap; Q->hdr = Q->nhdr;
+                Q->nt = NULL; Q->ncap = 0; Q->nhdr = NULL;
+            }
+            staged = 0;
+        }
+    }
+    for (int p = 0; p < DKH_NPART; p++) {
+        dk2_part_t* P = &c->part[p];
+        if (P->nt) { scratch_free(P->nhdr); P->nt = NULL; P->ncap = 0; P->nhdr = NULL; }
+        P->full = 0;
+    }
+    return ok && !ray_interrupted();
+}
+
+/* pass B table: slot of a hash's low 32 bits */
+static inline uint64_t dk2_tslot(uint32_t h32, int64_t tcap) {
+    return (((uint64_t)h32 * 0x9E3779B97F4A7C15ull) >> 32) & (uint64_t)(tcap - 1);
+}
+
+/* Is h32 the low 32 bits of a group's hash? */
+static inline bool dk2_want(const dk2_t* c, uint32_t h32) {
+    const uint64_t mask = (uint64_t)c->tcap - 1;
+    for (uint64_t s = dk2_tslot(h32, c->tcap); c->tab[s].g1; s = (s + 1) & mask)
+        if (c->tab[s].h32 == h32) return true;
+    return false;
+}
+
+/* The group of key (p, l), whose hash has low 32 bits h32, or -1: equal
+ * bytes are the same key, so the low bits pick the slots to compare. */
+static inline int64_t dk2_find(const dk2_t* c, uint32_t h32, const char* p, uint32_t l) {
+    const uint64_t mask = (uint64_t)c->tcap - 1;
+    for (uint64_t s = dk2_tslot(h32, c->tcap); c->tab[s].g1; s = (s + 1) & mask) {
+        if (c->tab[s].h32 != h32) continue;
+        const dk2_grp_t* g = &c->grp[c->tab[s].g1 - 1];
+        if (g->klen == l && (l == 0 || memcmp(c->kb + g->koff, p, l) == 0)) return (int64_t)c->tab[s].g1 - 1;
+    }
+    return -1;
+}
+
+static inline void dk2_acc_init(dk2_acc_t* a) {
+    memset(a, 0, sizeof(*a));
+    a->fpos = INT64_MAX;
+    a->mn = -1;
+    a->mx = -1;
+}
+
+/* A new group for key (p, l) with hash h (calling thread only); -1 on OOM. */
+static int64_t dk2_insert(dk2_t* c, uint64_t h, const char* p, uint32_t l) {
+    if ((c->ng + 1) * 2 > c->tcap) {
+        int64_t cap = c->tcap ? c->tcap * 2 : 64;
+        while ((c->ng + 1) * 2 > cap) cap *= 2;
+        ray_t* hdr = NULL;
+        dk2_ts_t* tab = (dk2_ts_t*)scratch_calloc(&hdr, (size_t)cap * sizeof(dk2_ts_t));
+        if (!tab) return -1;
+        scratch_free(c->tab_hdr);
+        c->tab = tab; c->tcap = cap; c->tab_hdr = hdr;
+        for (int64_t g = 0; g < c->ng; g++) {
+            uint64_t s = dk2_tslot((uint32_t)c->grp[g].h, cap);
+            while (tab[s].g1) s = (s + 1) & (uint64_t)(cap - 1);
+            tab[s].g1 = (uint32_t)(g + 1);
+            tab[s].h32 = (uint32_t)c->grp[g].h;
+        }
+    }
+    if (c->ng >= c->gcap) {
+        int64_t cap = c->gcap ? c->gcap * 2 : 64;
+        dk2_grp_t* g = (dk2_grp_t*)scratch_realloc(&c->grp_hdr, (size_t)c->ng * sizeof(dk2_grp_t),
+                                                   (size_t)cap * sizeof(dk2_grp_t));
+        if (!g) return -1;
+        c->grp = g; c->gcap = cap;
+    }
+    if (c->kbn + l > c->kbcap) {
+        uint64_t cap = c->kbcap * 2;
+        if (cap < c->kbn + l) cap = c->kbn + l;
+        if (cap < 1024) cap = 1024;
+        char* kb = (char*)scratch_realloc(&c->kb_hdr, (size_t)c->kbn, (size_t)cap);
+        if (!kb) return -1;
+        c->kb = kb; c->kbcap = cap;
+    }
+    int64_t g = c->ng++;
+    dk2_grp_t* G = &c->grp[g];
+    G->h = h; G->koff = c->kbn; G->klen = l; G->pad = 0;
+    dk2_acc_init(&G->a);
+    if (l) memcpy(c->kb + c->kbn, p, l);
+    c->kbn += l;
+    uint64_t s = dk2_tslot((uint32_t)h, c->tcap);
+    while (c->tab[s].g1) s = (s + 1) & (uint64_t)(c->tcap - 1);
+    c->tab[s].g1 = (uint32_t)(g + 1);
+    c->tab[s].h32 = (uint32_t)h;
+    return g;
+}
+
+/* Value v (bytes p, l) into accumulator a of group g: rows always, the
+ * null value's rows noted, the others' lengths and bytes measured. */
+static inline void dk2_add(dk2_t* c, dk2_acc_t* a, int64_t g, int64_t v, const char* p, uint32_t l) {
+    int64_t k = dk2_cnt(c, v);
+    int64_t pos = ray_read_sym(c->dv, v, RAY_SYM, c->dattrs);
+    a->cnt += k;
+    if (pos < a->fpos) a->fpos = pos;
+    if (pos <= 0) { c->null_g = g; c->null_cnt = k; return; }   /* the one null value */
+    if (c->want_lenw) a->lenw += k * (int64_t)l;
+    if (c->want_mn) dkh_minmax(&a->mn, &a->mnp, &a->mnl, pos, p, l, false);
+    if (c->want_mx) dkh_minmax(&a->mx, &a->mxp, &a->mxl, pos, p, l, true);
+}
+
+static void dk2_acc_merge(dk2_acc_t* a, const dk2_acc_t* b) {
+    a->cnt += b->cnt;
+    a->lenw += b->lenw;
+    if (b->fpos < a->fpos) a->fpos = b->fpos;
+    if (b->mn >= 0) dkh_minmax(&a->mn, &a->mnp, &a->mnl, b->mn, b->mnp, b->mnl, false);
+    if (b->mx >= 0) dkh_minmax(&a->mx, &a->mxp, &a->mxl, b->mx, b->mxp, b->mxl, true);
+}
+
+/* pass B selection: per task, the chunk's values it takes and their count */
+static void dk2_mark_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt, k = 0;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = c->lo + i;
+            bool w = c->mode ? ((c->unres[v >> 6] >> (v & 63)) & 1) != 0 : dk2_want(c, c->h32[v]);
+            c->want[i] = w;
+            k += w;
+        }
+        c->tcnt[t] = k;
+    }
+}
+
+static void dk2_compact_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t lo = c->n * t / c->nt, hi = c->n * (t + 1) / c->nt, j = c->tcnt[t];
+        int none = 0;
+        for (int64_t i = lo; i < hi; i++) {
+            if (!c->want[i]) continue;
+            c->wsp[j] = c->sp[i];
+            c->wsl[j] = c->sl[i];
+            c->wix[j] = (uint32_t)i;
+            /* the key off the value, where pass A found it */
+            uint32_t sc = dk2_sc(c, c->lo + i);
+            if (sc == DK2_SC_NONE) { c->kl[j] = UINT32_MAX; none++; }
+            else c->kp[j] = dk2_sc_key(c, sc, c->sp[i], &c->kl[j]);
+            j++;
+        }
+        if (none) atomic_fetch_add_explicit(&c->n_none, none, memory_order_relaxed);
+    }
+}
+
+/* pass B on the workers: each task its share of the selected values, into
+ * its own accumulator set. */
+static void dk2_acc_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dk2_t* c = (dk2_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        dk2_acc_t* A = c->acc + t * c->ng0;
+        int64_t lo = c->m * t / c->at, hi = c->m * (t + 1) / c->at;
+        int marked = 0;
+        for (int64_t j = lo; j < hi; j++) {
+            int64_t v = c->lo + c->wix[j];
+            int64_t g = dk2_find(c, c->h32[v], c->kp[j], c->kl[j]);
+            if (g < 0) {
+                /* another key under a candidate's low 32 bits */
+                atomic_fetch_or_explicit((_Atomic(uint64_t)*)&c->unres[v >> 6],
+                                         (uint64_t)1 << (v & 63), memory_order_relaxed);
+                marked++;
+                continue;
+            }
+            dk2_add(c, &A[g], g, v, c->wsp[j], c->wsl[j]);
+        }
+        if (marked) atomic_fetch_add_explicit(&c->n_unres, marked, memory_order_relaxed);
+    }
+}
+
+/* The selected values of chunk [lo, lo + n) (c->mode): marked, their bytes
+ * read, compacted (c->m of them) and their keys taken off the values by
+ * their slices; the keys of the values without one computed again (*kc as
+ * dkh_keys_of leaves it, *khdr the buffers of that). */
+static bool dk2_select(dk2_t* c, int64_t lo, int64_t n, int64_t nt_max, ray_t** kc, ray_t** khdr) {
+    *kc = NULL;
+    *khdr = NULL;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
+    c->lo = lo; c->n = n;
+    int64_t nt = 1;
+    if (par) {
+        nt = nt_max;
+        if (nt > n / 4096) nt = n / 4096;
+        if (nt < 1) nt = 1;
+    }
+    c->nt = nt;
+    if (nt > 1) ray_pool_dispatch_n(pool, dk2_mark_fn, c, (uint32_t)nt);
+    else        dk2_mark_fn(c, 0, 0, 1);
+    int64_t run = 0;
+    for (int64_t t = 0; t < nt; t++) { int64_t k = c->tcnt[t]; c->tcnt[t] = run; run += k; }
+    c->m = run;
+    if (run == 0) return true;
+    if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, c->want, c->sp, c->sl)) return false;
+    atomic_store_explicit(&c->n_none, 0, memory_order_relaxed);
+    if (nt > 1) ray_pool_dispatch_n(pool, dk2_compact_fn, c, (uint32_t)nt);
+    else        dk2_compact_fn(c, 0, 0, 1);
+    int64_t np = atomic_load_explicit(&c->n_none, memory_order_relaxed);
+    if (np == 0) return true;
+    /* the values without a slice: their keys again, then into place */
+    size_t per = 2 * sizeof(const char*) + 3 * sizeof(uint32_t) + sizeof(uint64_t);
+    char* m = (char*)scratch_alloc(khdr, (size_t)np * per);
+    if (!m) return false;
+    const char** psp = (const char**)m;  m += (size_t)np * sizeof(const char*);
+    const char** pkp = (const char**)m;  m += (size_t)np * sizeof(const char*);
+    uint64_t* pkh = (uint64_t*)m;        m += (size_t)np * sizeof(uint64_t);
+    uint32_t* psl = (uint32_t*)m;        m += (size_t)np * sizeof(uint32_t);
+    uint32_t* pkl = (uint32_t*)m;        m += (size_t)np * sizeof(uint32_t);
+    uint32_t* pix = (uint32_t*)m;
+    int64_t q = 0;
+    for (int64_t j = 0; j < run && q < np; j++)
+        if (c->kl[j] == UINT32_MAX) { psp[q] = c->wsp[j]; psl[q] = c->wsl[j]; pix[q] = (uint32_t)j; q++; }
+    if (q != np) return false;
+    if (!dkh_keys_of(c->by_expr, c->col, c->prog, c->regs, psp, psl, np, pkp, pkl, pkh, kc)) return false;
+    for (int64_t k = 0; k < np; k++) { c->kp[pix[k]] = pkp[k]; c->kl[pix[k]] = pkl[k]; }
+    return true;
+}
+
+typedef struct { int64_t key; int64_t g; } dk2_ord_t;
+static int dk2_ord_cmp(const void* a, const void* b) {
+    int64_t x = ((const dk2_ord_t*)a)->key, y = ((const dk2_ord_t*)b)->key;
+    return (x > y) - (x < y);
+}
+
+/* The grouping of H's du values (Hc, counts Hn) by key under the cut
+ * `having`, and its output (see above); NULL on failure.  pack: H and Hn
+ * are ours alone, so Hn's high halves may hold the key slices (every count
+ * fits 32 bits: the caller checked the rows). */
+static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pack,
+                      struct ray_sym_domain_s* dom, const ray_sym_domain_raw_t* raw,
+                      int64_t having, const int64_t* alias, const int* kind, int n_aggs) {
+    int64_t du = ray_len(Hc);
+    if (du <= 0 || du >= INT32_MAX || having <= 0) return NULL;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t nwork = ray_pool_par_dispatch_ok(pool, 2, 1) ? ray_pool_total_workers(pool) : 1;
+    ray_t *chdr = NULL, *prog_hdr = NULL, *regs_hdr = NULL, *mem_hdr = NULL, *tm_hdr = NULL;
+    ray_t *h32_hdr = NULL, *cand_hdr = NULL, *rep_hdr = NULL, *acc_hdr = NULL, *un_hdr = NULL;
+    ray_t *ord_hdr = NULL, *out_hdr = NULL, *sc_hdr = NULL, *khdr = NULL;
+    ray_t* kc = NULL;
+    ray_t* O = NULL;
+    dk2_t* c = (dk2_t*)scratch_calloc(&chdr, sizeof(dk2_t));
+    if (!c) return NULL;
+    c->by_expr = by_expr; c->col = col;
+    c->dv = ray_data(Hc); c->dattrs = Hc->attrs;
+    c->dom = dom; c->raw = raw; c->du = du;
+    c->hn = (int64_t*)ray_data(Hn);
+    c->having = having;
+    c->null_g = -1;
+    for (int a = 0; a < n_aggs; a++) {
+        if (kind[a] == DKV_SUM_LEN || kind[a] == DKV_AVG_LEN) c->want_lenw = true;
+        if (kind[a] == DKV_MIN) c->want_mn = true;
+        if (kind[a] == DKV_MAX) c->want_mx = true;
+    }
+    atomic_store_explicit(&c->n_unres, 0, memory_order_relaxed);
+
+    dkp_prog_t* prog = (dkp_prog_t*)scratch_alloc(&prog_hdr, sizeof(dkp_prog_t));
+    if (!prog) goto done;
+    bool use_prog = dkp_build(prog, by_expr, col);
+    if (use_prog) {
+        c->prog = prog;
+        c->regs = (dkp_reg_t*)scratch_alloc(&regs_hdr, (size_t)nwork * (size_t)prog->n * DKP_BATCH * sizeof(dkp_reg_t));
+        if (!c->regs) goto done;
+    }
+    const int64_t chunk = derived_key_chunk_rows(!use_prog);
+    int64_t cn = du < chunk ? du : chunk;
+    int64_t nt_max = (int64_t)nwork * 4;
+    {
+        size_t per = 2 * sizeof(const char*) + 2 * sizeof(uint32_t) + sizeof(uint64_t) +
+                     sizeof(dk2_item_t) + 1;
+        char* mem = (char*)scratch_alloc(&mem_hdr, (size_t)cn * per);
+        c->tcnt = (int64_t*)scratch_alloc(&tm_hdr, (size_t)nt_max * DKH_NPART * sizeof(int64_t));
+        if (!mem || !c->tcnt) goto done;
+        c->items = (dk2_item_t*)mem;
+        c->wsp = (const char**)mem;                         /* pass B: the item array again */
+        c->wsl = (uint32_t*)(mem + (size_t)cn * sizeof(const char*));
+        c->wix = (uint32_t*)(mem + (size_t)cn * (sizeof(const char*) + sizeof(uint32_t)));
+        mem += (size_t)cn * sizeof(dk2_item_t);
+        c->sp = (const char**)mem;  mem += (size_t)cn * sizeof(const char*);
+        c->kp = (const char**)mem;  mem += (size_t)cn * sizeof(const char*);
+        c->kh = (uint64_t*)mem;     mem += (size_t)cn * sizeof(uint64_t);
+        c->sl = (uint32_t*)mem;     mem += (size_t)cn * sizeof(uint32_t);
+        c->kl = (uint32_t*)mem;     mem += (size_t)cn * sizeof(uint32_t);
+        c->want = (uint8_t*)mem;
+    }
+    c->h32 = (uint32_t*)scratch_alloc(&h32_hdr, (size_t)du * sizeof(uint32_t));
+    if (!c->h32) goto done;
+    if (!pack) {
+        c->sc = (uint32_t*)scratch_alloc(&sc_hdr, (size_t)du * sizeof(uint32_t));
+        if (!c->sc) goto done;
+    }
+    if (use_prog)
+        for (int k = 0; k < prog->n; k++)
+            if (prog->ins[k].op == DKO_LSTR) {
+                c->lit_p[c->nlit] = prog->ins[k].sp;
+                c->lit_l[c->nlit] = prog->ins[k].sl;
+                c->nlit++;
+            }
+
+    /* pass A: rows by hash */
+    for (int64_t lo = 0; lo < du; lo += chunk) {
+        if (ray_interrupted()) goto done;
+        int64_t n = du - lo < chunk ? du - lo : chunk;
+        c->lo = lo; c->n = n;
+        bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
+        if (!dk_chunk_views(c->dv, c->dattrs, lo, n, raw, dom, NULL, c->sp, c->sl)) goto done;
+        if (!dkh_keys_of(by_expr, col, c->prog, c->regs, c->sp, c->sl, n, c->kp, c->kl, c->kh, &kc)) goto done;
+        int64_t nt = 1;
+        if (par) {
+            nt = nt_max;
+            if (nt > n / 4096) nt = n / 4096;
+            if (nt < 1) nt = 1;
+        }
+        c->nt = nt;
+        if (nt > 1) ray_pool_dispatch_n(pool, dk2_count_fn, c, (uint32_t)nt);
+        else        dk2_count_fn(c, 0, 0, 1);
+        int64_t run = 0;
+        for (int p = 0; p < DKH_NPART; p++) {
+            dk2_part_t* P = &c->part[p];
+            P->cur = run;
+            for (int64_t t = 0; t < nt; t++) {
+                int64_t k = c->tcnt[t * DKH_NPART + p];
+                c->tcnt[t * DKH_NPART + p] = run;
+                run += k;
+            }
+            P->end = run;
+        }
+        if (nt > 1) ray_pool_dispatch_n(pool, dk2_scatter_fn, c, (uint32_t)nt);
+        else        dk2_scatter_fn(c, 0, 0, 1);
+        if (kc) { ray_release(kc); kc = NULL; }   /* the slices are taken: hashes only from here */
+        bool ok = dk2_grow(c, par);
+        while (ok) {
+            if (par) ray_pool_dispatch_n(pool, dk2_group_fn, c, DKH_NPART);
+            else     dk2_group_fn(c, 0, 0, DKH_NPART);
+            if (ray_interrupted()) { ok = false; break; }
+            bool pending = false;
+            for (int p = 0; p < DKH_NPART; p++) if (c->part[p].cur < c->part[p].end) pending = true;
+            if (!pending) break;
+            ok = dk2_grow(c, par);
+        }
+        if (!ok) goto done;
+    }
+    ray_profile_tick("derived key: pass A, rows by hash");
+
+    /* the candidates: hash and first value of every hash past the cut */
+    int64_t NC = 0;
+    for (int p = 0; p < DKH_NPART; p++) {
+        const dk2_part_t* P = &c->part[p];
+        for (int64_t s = 0; s < P->cap; s++)
+            if (P->t[s].f1 && (int64_t)P->t[s].cnt > having) NC++;
+    }
+    uint64_t* ch = NULL;
+    uint32_t* cv = NULL;
+    if (NC > 0) {
+        char* m = (char*)scratch_alloc(&cand_hdr, (size_t)NC * (sizeof(uint64_t) + sizeof(uint32_t)));
+        if (!m) goto done;
+        ch = (uint64_t*)m;
+        cv = (uint32_t*)(m + (size_t)NC * sizeof(uint64_t));
+        int64_t j = 0;
+        for (int p = 0; p < DKH_NPART; p++) {
+            const dk2_part_t* P = &c->part[p];
+            for (int64_t s = 0; s < P->cap; s++)
+                if (P->t[s].f1 && (int64_t)P->t[s].cnt > having) { ch[j] = P->t[s].h; cv[j] = P->t[s].f1 - 1; j++; }
+        }
+    }
+    for (int p = 0; p < DKH_NPART; p++) {
+        scratch_free(c->part[p].hdr);
+        c->part[p].hdr = NULL; c->part[p].t = NULL; c->part[p].cap = 0;
+    }
+    ray_profile_tick("derived key: candidates");
+
+    if (NC > 0) {
+        /* pass B: a group per candidate, keyed by its first value's key */
+        char* m = (char*)scratch_alloc(&rep_hdr, (size_t)NC * (2 * sizeof(const char*) + 2 * sizeof(uint32_t) + sizeof(uint64_t)));
+        if (!m) goto done;
+        const char** rsp = (const char**)m;  m += (size_t)NC * sizeof(const char*);
+        const char** rkp = (const char**)m;  m += (size_t)NC * sizeof(const char*);
+        uint64_t* rkh = (uint64_t*)m;        m += (size_t)NC * sizeof(uint64_t);
+        uint32_t* rsl = (uint32_t*)m;        m += (size_t)NC * sizeof(uint32_t);
+        uint32_t* rkl = (uint32_t*)m;
+        for (int64_t j = 0; j < NC; j++)
+            if (!dk_chunk_views(c->dv, c->dattrs, cv[j], 1, raw, dom, NULL, &rsp[j], &rsl[j])) goto done;
+        if (!dkh_keys_of(by_expr, col, c->prog, c->regs, rsp, rsl, NC, rkp, rkl, rkh, &kc)) goto done;
+        for (int64_t j = 0; j < NC; j++) {
+            /* the same program over the same bytes: the same hash */
+            if (rkh[j] != ch[j] || dk2_insert(c, rkh[j], rkp[j], rkl[j]) != j) goto done;
+        }
+        if (kc) { ray_release(kc); kc = NULL; }
+        scratch_free(rep_hdr); rep_hdr = NULL;
+        scratch_free(cand_hdr); cand_hdr = NULL;
+        c->ng0 = NC;
+        c->nacc = nwork;
+        if (c->nacc * NC > DK2_MAX_CAND) c->nacc = DK2_MAX_CAND / NC;
+        if (c->nacc < 1) c->nacc = 1;
+        c->acc = (dk2_acc_t*)scratch_alloc(&acc_hdr, (size_t)c->nacc * (size_t)NC * sizeof(dk2_acc_t));
+        c->unres = (uint64_t*)scratch_calloc(&un_hdr, (size_t)((du + 63) / 64) * sizeof(uint64_t));
+        if (!c->acc || !c->unres) goto done;
+        for (int64_t s = 0; s < c->nacc * NC; s++) dk2_acc_init(&c->acc[s]);
+
+        /* the values under a candidate's low 32 bits, on the workers */
+        c->mode = 0;
+        for (int64_t lo = 0; lo < du; lo += chunk) {
+            if (ray_interrupted()) goto done;
+            int64_t n = du - lo < chunk ? du - lo : chunk;
+            if (!dk2_select(c, lo, n, nt_max, &kc, &khdr)) goto done;
+            if (c->m > 0) {
+                bool par = ray_pool_par_dispatch_ok(pool, c->m, RAY_PARALLEL_THRESHOLD);
+                c->at = par ? c->nacc : 1;
+                if (c->at > 1) ray_pool_dispatch_n(pool, dk2_acc_fn, c, (uint32_t)c->at);
+                else           dk2_acc_fn(c, 0, 0, 1);
+            }
+            if (kc) { ray_release(kc); kc = NULL; }
+            scratch_free(khdr); khdr = NULL;
+        }
+        for (int64_t g = 0; g < NC; g++)
+            for (int64_t t = 0; t < c->nacc; t++) dk2_acc_merge(&c->grp[g].a, &c->acc[t * NC + g]);
+        scratch_free(acc_hdr); acc_hdr = NULL; c->acc = NULL;
+        ray_profile_tick("derived key: pass B, candidate keys");
+
+        /* the marked values: other keys under a candidate hash, grouped
+         * here exactly */
+        if (atomic_load_explicit(&c->n_unres, memory_order_relaxed) > 0) {
+            c->mode = 1;
+            for (int64_t lo = 0; lo < du; lo += chunk) {
+                if (ray_interrupted()) goto done;
+                int64_t n = du - lo < chunk ? du - lo : chunk;
+                if (!dk2_select(c, lo, n, nt_max, &kc, &khdr)) goto done;
+                for (int64_t j = 0; j < c->m; j++) {
+                    int64_t v = lo + c->wix[j];
+                    int64_t g = dk2_find(c, c->h32[v], c->kp[j], c->kl[j]);
+                    if (g < 0) {
+                        uint64_t h = dkh_hash(c->kp[j], c->kl[j]);
+                        /* the same bytes: pass A's hash */
+                        if ((uint32_t)h != c->h32[v]) goto done;
+                        g = dk2_insert(c, h, c->kp[j], c->kl[j]);
+                    }
+                    if (g < 0) goto done;
+                    dk2_add(c, &c->grp[g].a, g, v, c->wsp[j], c->wsl[j]);
+                }
+                if (kc) { ray_release(kc); kc = NULL; }
+                scratch_free(khdr); khdr = NULL;
+            }
+            ray_profile_tick("derived key: pass B, colliding keys");
+        }
+    }
+
+    /* the cut over the exact counts; the kept groups by first value, the
+     * empty key first */
+    {
+        int64_t K = 0;
+        for (int64_t g = 0; g < c->ng; g++) if (c->grp[g].a.cnt > having) K++;
+        dk2_ord_t* ord = (dk2_ord_t*)scratch_alloc(&ord_hdr, (size_t)(K ? K : 1) * sizeof(dk2_ord_t));
+        size_t per = 5 * sizeof(int64_t) + sizeof(const char*) + sizeof(size_t) + sizeof(uint32_t);
+        char* m = (char*)scratch_alloc(&out_hdr, (size_t)(K ? K : 1) * per);
+        if (!ord || !m) goto done;
+        int64_t k = 0;
+        for (int64_t g = 0; g < c->ng; g++) {
+            if (c->grp[g].a.cnt <= having) continue;
+            ord[k].key = c->grp[g].klen == 0 ? -1 : c->grp[g].a.fpos;
+            ord[k].g = g;
+            k++;
+        }
+        if (K > 1) qsort(ord, (size_t)K, sizeof(dk2_ord_t), dk2_ord_cmp);
+        int64_t* ocnt  = (int64_t*)m;  m += (size_t)K * sizeof(int64_t);
+        int64_t* onn   = (int64_t*)m;  m += (size_t)K * sizeof(int64_t);
+        int64_t* olenw = (int64_t*)m;  m += (size_t)K * sizeof(int64_t);
+        int64_t* omn   = (int64_t*)m;  m += (size_t)K * sizeof(int64_t);
+        int64_t* omx   = (int64_t*)m;  m += (size_t)K * sizeof(int64_t);
+        const char** ks = (const char**)m; m += (size_t)K * sizeof(const char*);
+        size_t* kls    = (size_t*)m;   m += (size_t)K * sizeof(size_t);
+        uint32_t* kh32 = (uint32_t*)m;
+        for (int64_t o = 0; o < K; o++) {
+            const dk2_grp_t* G = &c->grp[ord[o].g];
+            ocnt[o]  = G->a.cnt;
+            onn[o]   = G->a.cnt - (ord[o].g == c->null_g ? c->null_cnt : 0);
+            olenw[o] = G->a.lenw;
+            omn[o]   = G->a.mn >= 0 ? G->a.mn : 0;
+            omx[o]   = G->a.mx >= 0 ? G->a.mx : 0;
+            ks[o]    = G->klen ? c->kb + G->koff : "";   /* no key bytes stored when every key is empty */
+            kls[o]   = G->klen;
+            kh32[o]  = (uint32_t)ray_hash_bytes(ks[o], G->klen);
+        }
+        ray_t* kv = ray_vec_new(RAY_SYM, K);
+        if (!kv || RAY_IS_ERR(kv)) { if (kv) ray_error_free(kv); goto done; }
+        kv->len = K;
+        /* the key strings in a domain of the key vector's own (as
+         * derived_key_str_chunks) */
+        struct ray_sym_domain_s* kdom = ray_sym_domain_new();
+        if (!kdom) { ray_release(kv); goto done; }
+        kv->sym_domain = kdom;
+        if (K > 0 && !ray_sym_domain_intern_batch(kdom, K, ks, kls, kh32, (int64_t*)ray_data(kv))) {
+            ray_release(kv); goto done;
+        }
+        ray_profile_tick("derived key: key domain interned");
+        O = dkv_emit(by_expr, alias, kind, n_aggs, Hc, kv, K, ocnt, onn, olenw, omn, omx);
+#ifdef DEBUG
+        if (O) {
+            g_dk2_stats[0]++;
+            g_dk2_stats[1] = K;
+            g_dk2_stats[2] = c->ng0;
+            g_dk2_stats[3] = c->ng - c->ng0;
+            g_dk2_stats[4] = pack;
+        }
+#endif
+    }
+done:
+    if (kc) ray_release(kc);
+    scratch_free(khdr);
+    for (int p = 0; p < DKH_NPART; p++) { scratch_free(c->part[p].hdr); scratch_free(c->part[p].nhdr); }
+    scratch_free(c->grp_hdr); scratch_free(c->tab_hdr); scratch_free(c->kb_hdr);
+    scratch_free(ord_hdr); scratch_free(out_hdr); scratch_free(un_hdr); scratch_free(acc_hdr);
+    scratch_free(rep_hdr); scratch_free(cand_hdr); scratch_free(h32_hdr); scratch_free(sc_hdr);
+    scratch_free(tm_hdr); scratch_free(mem_hdr); scratch_free(regs_hdr); scratch_free(prog_hdr);
+    scratch_free(chdr);
+    return O;
+}
+
 static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_expr,
                                      ray_t** dict_elems, int64_t dict_n,
                                      int64_t from_id, int64_t by_id, int64_t where_id,
@@ -6286,10 +7790,21 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     int64_t col = ref_syms[0];
     int64_t bound[32];
     if (!derived_key_expr_ok(by_expr, tbl, col, bound, 0)) return NULL;
-    ray_t* C = tbl_col_or_null(tbl, col);
     int64_t nrows = ray_table_nrows(tbl);
-    if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 65536) return NULL;
-    struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
+    /* A single-file encoded column answers type, rows and domain from its
+     * directory: decoding it here would hold the whole column in memory for
+     * a check, while the grouping below reads it by range. */
+    struct ray_sym_domain_s* dom = NULL;
+    ray_t* E = ray_table_get_col_enc(tbl, col);
+    ray_enccol_t* e = E ? ray_enccol_of(E) : NULL;
+    if (e && e->kind == RAY_ENCCOL_SINGLE && e->type == RAY_SYM && e->dom) {
+        if (e->len != nrows || nrows < 65536) return NULL;
+        dom = e->dom;
+    } else {
+        ray_t* C = tbl_col_or_null(tbl, col);
+        if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 65536) return NULL;
+        dom = ray_sym_vec_domain(C);
+    }
     if (!dom) return NULL;
 
     /* Every output is one of the decomposable aggregates over C; sort/take
@@ -6320,26 +7835,45 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
         }
     }
 
-    /* 1. the rows grouped by C itself: distinct values with their counts */
+    /* 1. the rows grouped by C itself: distinct values with their counts.
+     * A filter that is a pure function of C alone (its only column, every
+     * head elementwise) passes or fails every row of a value together, so
+     * it runs over the distinct values after the grouping instead of over
+     * the rows before it: no row selection, one predicate per value. */
     int64_t s_t = ray_sym_intern("__dkv_t", 7), s_cnt = ray_sym_intern("__dkv_cnt", 9);
-    int64_t s_s = ray_sym_intern("__dkv_s", 7), s_k = ray_sym_intern("__dkv_k", 7);
-    int64_t s_ref = ray_sym_intern("__dkv_ref", 9), s_nn = ray_sym_intern("__dkv_nn", 8);
-    int64_t s_lenw = ray_sym_intern("__dkv_lenw", 10);
+    bool where_on_values = false;
+    if (where_expr) {
+        int64_t wrefs[2], wbound[32];
+        where_on_values = collect_col_refs(where_expr, tbl, wrefs, 2, 0) == 1 && wrefs[0] == col &&
+                          derived_key_expr_ok(where_expr, tbl, col, wbound, 0);
+    }
     ray_t* H = NULL;
-    {
+    for (int step = 0; step < (where_on_values ? 2 : 1); step++) {
         int64_t keys[4]; ray_t* vals[4]; int64_t n = 0;
         keys[n] = from_id; vals[n++] = ray_sym(s_t);
-        keys[n] = by_id;   vals[n++] = ray_sym(col);
-        keys[n] = s_cnt;   vals[n++] = dkv_call("count", ray_sym(col), NULL);
-        if (where_expr) { keys[n] = where_id; ray_retain(where_expr); vals[n++] = where_expr; }
-        for (int64_t i = 0; i < n; i++) if (!vals[i]) { for (int64_t j = 0; j < n; j++) if (vals[j]) ray_release(vals[j]); return NULL; }
+        if (step == 0) {
+            keys[n] = by_id;   vals[n++] = ray_sym(col);
+            keys[n] = s_cnt;   vals[n++] = dkv_call("count", ray_sym(col), NULL);
+        }
+        if (where_expr && (step == 1 || !where_on_values)) {
+            keys[n] = where_id; ray_retain(where_expr); vals[n++] = where_expr;
+        }
+        for (int64_t i = 0; i < n; i++) if (!vals[i]) {
+            for (int64_t j = 0; j < n; j++) if (vals[j]) ray_release(vals[j]);
+            if (H && !RAY_IS_ERR(H)) ray_release(H);
+            return NULL;
+        }
         ray_t* q = dkv_select(keys, vals, n);
-        if (!q) return NULL;
-        if (ray_env_push_query_scope() != RAY_OK) { ray_release(q); return NULL; }
-        ray_env_set_query_local(s_t, tbl);
-        H = ray_eval(q);
+        if (!q) { if (H && !RAY_IS_ERR(H)) ray_release(H); return NULL; }
+        if (ray_env_push_query_scope() != RAY_OK) { ray_release(q); if (H && !RAY_IS_ERR(H)) ray_release(H); return NULL; }
+        ray_t* src = step == 0 ? tbl : H;
+        ray_env_set_query_local(s_t, src);
+        ray_t* r = ray_eval(q);
         ray_env_pop_scope();
         ray_release(q);
+        if (step == 1) ray_release(H);
+        H = r;
+        if (!H || RAY_IS_ERR(H) || H->type != RAY_TABLE) break;
     }
     if (!H || RAY_IS_ERR(H) || H->type != RAY_TABLE || ray_table_ncols(H) != 2) {
         if (H && !RAY_IS_ERR(H)) ray_release(H); else if (H) ray_error_free(H);
@@ -6350,6 +7884,26 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     int64_t du = ray_table_nrows(H);
     if (!Hc || !Hn || Hc->type != RAY_SYM || Hn->type != RAY_I64 || du <= 0 ||
         ray_sym_vec_domain(Hc) != dom) { ray_release(H); return NULL; }
+    bool plain = true;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == take_id || kid == asc_id || kid == desc_id) plain = false;
+    }
+    int64_t having = dkv_having_count(dict_elems, dict_n, from_id, by_id, where_id, take_id,
+                                      asc_id, desc_id, alias, kind, n_aggs, plain);
+    /* A having cut that at most DK2_MAX_CAND groups can pass takes the
+     * two-pass grouping (dk2_run); its counts fit 32 bits there. */
+    bool two_pass = false;
+    if (having > 0 && nrows < ((int64_t)1 << 32) && du < INT32_MAX) {
+        int64_t bound = nrows / (having + 1);
+        if (bound > DK2_MAX_CAND) {
+            const int64_t* hn = (const int64_t*)ray_data(Hn);
+            int64_t total = 0;
+            for (int64_t i = 0; i < du; i++) total += hn[i];
+            bound = total / (having + 1);
+        }
+        two_pass = bound <= DK2_MAX_CAND;
+    }
     {
         ray_t* Ho = dkv_order_by_position(H, ray_sym_domain_count(dom));
         if (Ho) {
@@ -6361,175 +7915,169 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
     }
 
     ray_profile_tick("derived key: distinct values");
-    /* 2. the key once per distinct value */
-    ray_t* key_dom = derived_key_str_chunks(by_expr, col, Hc, dom, du);
-    if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); ray_release(H); return NULL; }
-
-    /* 3. the per-value table: key, count, the value, its non-null count,
-     *    its length-weighted count */
-    ray_t* S = NULL;
-    {
-        ray_t* nn   = ray_vec_new(RAY_I64, du);
-        ray_t* lenw = ray_vec_new(RAY_I64, du);
-        if (!nn || RAY_IS_ERR(nn) || !lenw || RAY_IS_ERR(lenw)) {
-            if (nn && !RAY_IS_ERR(nn)) ray_release(nn);
-            if (lenw && !RAY_IS_ERR(lenw)) ray_release(lenw);
-            ray_release(key_dom); ray_release(H); return NULL;
-        }
-        nn->len = du; lenw->len = du;
-        dkv_len_ctx_t lc = {
-            .hc = ray_data(Hc), .attrs = Hc->attrs, .cnt = (const int64_t*)ray_data(Hn),
-            .nn = (int64_t*)ray_data(nn), .lenw = (int64_t*)ray_data(lenw), .dom = dom,
-        };
-        lc.raw_ok = ray_sym_domain_raw_pin(dom, &lc.raw);
-        if (dom == ray_sym_runtime_domain()) {
-            ray_t** rs = NULL; uint32_t rcnt = 0;
-            ray_sym_strings_borrow(&rs, &rcnt);
-            lc.rstr = rs; lc.rcnt = rcnt;
-        }
-        atomic_store_explicit(&lc.late, 0, memory_order_relaxed);
-        ray_pool_t* pool = ray_pool_get();
-        if (ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD))
-            ray_pool_dispatch(pool, dkv_len_fn, &lc, du);
-        else
-            dkv_len_fn(&lc, 0, 0, du);
-        if (atomic_load_explicit(&lc.late, memory_order_relaxed)) {
-            /* positions past the file prefix: resolved through the domain on
-             * the calling thread */
-            for (int64_t i = 0; i < du; i++) {
-                if (lc.lenw[i] != INT64_MIN) continue;
-                int64_t pos = ray_read_sym(lc.hc, i, RAY_SYM, lc.attrs);
-                ray_t* a = ray_sym_domain_str(dom, pos);
-                lc.lenw[i] = lc.cnt[i] * (a ? (int64_t)ray_str_len(a) : 0);
-            }
-        }
-        S = ray_table_new(5);
-        if (S && !RAY_IS_ERR(S)) S = ray_table_add_col(S, s_k, key_dom);
-        if (S && !RAY_IS_ERR(S)) S = ray_table_add_col(S, s_cnt, Hn);
-        if (S && !RAY_IS_ERR(S)) S = ray_table_add_col(S, s_ref, Hc);
-        if (S && !RAY_IS_ERR(S)) S = ray_table_add_col(S, s_nn, nn);
-        if (S && !RAY_IS_ERR(S)) S = ray_table_add_col(S, s_lenw, lenw);
-        ray_release(nn); ray_release(lenw);
+    if (two_pass) {
+        if (!dk_key_is_sym(by_expr, col, Hc)) { ray_release(H); return NULL; }
+        /* H and its counts ours alone: the counts' high halves take the
+         * key slices, no array of their own */
+        bool pack = ray_atomic_load(&H->rc) == 1 && ray_atomic_load(&Hn->rc) == 1 &&
+                    !(Hn->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+        ray_sym_domain_raw_t raw = {0};
+        (void)ray_sym_domain_raw_pin(dom, &raw);
+        ray_t* O2 = dk2_run(by_expr, col, Hc, Hn, pack, dom, &raw, having, alias, kind, n_aggs);
+        ray_sym_domain_raw_unpin(dom);
+        ray_release(H);
+        if (!O2) return NULL;
+        ray_profile_tick("derived key: output built");
+        agg_route_note_key_domain();
+        return O2;
     }
-    ray_release(key_dom);
-    ray_release(H);
-    if (!S || RAY_IS_ERR(S)) { if (S) ray_error_free(S); return NULL; }
-
-    ray_profile_tick("derived key: per-value table");
-    /* 4. the aggregates rewritten over the per-value table, sort/take as
-     *    written */
-    ray_t* R = NULL;
-    {
-        int64_t keys[DKV_MAX_AGGS + 8]; ray_t* vals[DKV_MAX_AGGS + 8]; int64_t n = 0;
-        bool bad = false;
-        for (int64_t i = 0; i + 1 < dict_n && !bad; i += 2) {
-            int64_t kid = dict_elems[i]->i64;
-            ray_t* v = NULL;
-            if (kid == from_id)       v = ray_sym(s_s);
-            else if (kid == by_id)    v = ray_sym(s_k);
-            else if (kid == where_id) continue;
-            else if (kid == take_id || kid == asc_id || kid == desc_id) { v = dict_elems[i + 1]; ray_retain(v); }
-            else {
-                int k = 0;
-                for (int a = 0; a < n_aggs; a++) if (alias[a] == kid) k = kind[a];
-                switch (k) {
-                case DKV_COUNT:   v = dkv_call("sum", ray_sym(s_cnt), NULL); break;
-                case DKV_MIN:     v = dkv_call("min", ray_sym(s_ref), NULL); break;
-                case DKV_MAX:     v = dkv_call("max", ray_sym(s_ref), NULL); break;
-                case DKV_SUM_LEN: v = dkv_call("sum", ray_sym(s_lenw), NULL); break;
-                case DKV_AVG_LEN: v = dkv_call("/", dkv_call("sum", ray_sym(s_lenw), NULL),
-                                                    dkv_call("sum", ray_sym(s_nn), NULL)); break;
-                default: v = NULL;
-                }
-            }
-            if (!v) { bad = true; break; }
-            keys[n] = kid; vals[n++] = v;
+    /* 2. the distinct values grouped by key, with the aggregates per group
+     *    (dkh_build) */
+    bool want_min = false, want_max = false;
+    unsigned flags = having >= 0 ? DKH_F_CNT : 0;
+    for (int a = 0; a < n_aggs; a++) {
+        switch (kind[a]) {
+        case DKV_COUNT:   flags |= DKH_F_CNT; break;
+        case DKV_MIN:     want_min = true; break;
+        case DKV_MAX:     want_max = true; break;
+        case DKV_SUM_LEN: flags |= DKH_F_LENW; break;
+        default:          flags |= DKH_F_CNT | DKH_F_LENW; break;   /* avg */
         }
-        if (bad) { for (int64_t j = 0; j < n; j++) ray_release(vals[j]); ray_release(S); return NULL; }
+    }
+    /* With a having cut, min / max are found afterwards for the kept
+     * groups only; otherwise while grouping. */
+    bool post_mm = having >= 0 && (want_min || want_max);
+    if (!post_mm) {
+        if (want_min) flags |= DKH_F_MIN;
+        if (want_max) flags |= DKH_F_MAX;
+    }
+    if (!dk_key_is_sym(by_expr, col, Hc)) { ray_release(H); return NULL; }
+    ray_sym_domain_raw_t raw = {0};
+    (void)ray_sym_domain_raw_pin(dom, &raw);
+    ray_t *chdr = NULL, *khdr = NULL, *mhdr = NULL;
+    ray_t* O = NULL;
+    dkh_t* c = (dkh_t*)scratch_calloc(&chdr, sizeof(dkh_t));
+    if (!c) goto vfail;
+    c->by_expr = by_expr; c->col = col; c->dvec = Hc; c->dom = dom; c->raw = &raw; c->du = du;
+    c->hn = (const int64_t*)ray_data(Hn); c->flags = flags; c->want_codes = post_mm;
+    if (!dkh_build(c)) goto vfail;
+
+    /* 3. the kept groups in rank order: oix[rank] = output row, or none */
+    int64_t G = c->G, K = 0;
+    uint32_t* oix = (uint32_t*)scratch_alloc(&khdr, (size_t)G * 2 * sizeof(uint32_t));
+    if (!oix) goto vfail;
+    uint32_t* ko = oix + G;
+    for (int64_t r = 0; r < G; r++) {
+        uint32_t code = c->order[r];
+        const dkh_part_t* P = &c->part[code & (DKH_NPART - 1)];
+        bool keep = having < 0 || DKH_GF(P, DKH_G_CNT, int64_t)[code >> DKH_PART_BITS] > having;
+        oix[r] = keep ? (uint32_t)K : UINT32_MAX;
+        if (keep) ko[K++] = code;
+    }
+    ray_profile_tick("derived key: groups kept");
+
+    /* min / max per kept group: value index, bytes, length */
+    int64_t *smn = NULL, *smx = NULL;
+    const char **smnp = NULL, **smxp = NULL;
+    uint32_t *smnl = NULL, *smxl = NULL;
+    if (post_mm && K > 0) {
+        size_t per = sizeof(int64_t) + sizeof(const char*) + sizeof(uint32_t);
+        char* m = (char*)scratch_alloc(&mhdr, (size_t)K * per * 2);
+        if (!m) goto vfail;
+        smn  = (int64_t*)m;      m += (size_t)K * sizeof(int64_t);
+        smx  = (int64_t*)m;      m += (size_t)K * sizeof(int64_t);
+        smnp = (const char**)m;  m += (size_t)K * sizeof(const char*);
+        smxp = (const char**)m;  m += (size_t)K * sizeof(const char*);
+        smnl = (uint32_t*)m;     m += (size_t)K * sizeof(uint32_t);
+        smxl = (uint32_t*)m;
+        for (int64_t o = 0; o < K; o++) { smn[o] = -1; smx[o] = -1; }
+        if (!dkh_kept_minmax(c, oix, K, want_min ? smn : NULL, smnp, smnl,
+                             want_max ? smx : NULL, smxp, smxl)) goto vfail;
+    }
+
+    /* 4. the output columns, key first, the aggregates as written */
+    {
+        int64_t null_cnt = 0;
+        for (int p = 0; p < DKH_NPART; p++)
+            if (c->part[p].null_g >= 0) null_cnt = c->hn[c->part[p].null_vi];
+        ray_t* ahdr = NULL;
+        int64_t* av = (int64_t*)scratch_alloc(&ahdr, (size_t)(K ? K : 1) * 5 * sizeof(int64_t));
+        if (!av) goto vfail;
+        int64_t *acnt = av, *ann = av + K, *alenw = av + 2 * K, *amn = av + 3 * K, *amx = av + 4 * K;
+        const void* hd = ray_data(Hc);
+        for (int64_t o = 0; o < K; o++) {
+            uint32_t code = ko[o];
+            const dkh_part_t* P = &c->part[code & (DKH_NPART - 1)];
+            uint32_t g = code >> DKH_PART_BITS;
+            acnt[o]  = (flags & DKH_F_CNT) ? DKH_GF(P, DKH_G_CNT, int64_t)[g] : 0;
+            alenw[o] = (flags & DKH_F_LENW) ? DKH_GF(P, DKH_G_LENW, int64_t)[g] : 0;
+            ann[o]   = acnt[o] - ((int64_t)g == P->null_g ? null_cnt : 0);
+            int64_t bi = -1;
+            if (want_min) bi = post_mm ? smn[o] : DKH_GF(P, DKH_G_MN, int64_t)[g];
+            amn[o] = bi >= 0 ? ray_read_sym(hd, bi, RAY_SYM, Hc->attrs) : 0;
+            bi = -1;
+            if (want_max) bi = post_mm ? smx[o] : DKH_GF(P, DKH_G_MX, int64_t)[g];
+            amx[o] = bi >= 0 ? ray_read_sym(hd, bi, RAY_SYM, Hc->attrs) : 0;
+        }
+        ray_t* kv = ray_vec_new(RAY_SYM, K);
+        if (!kv || RAY_IS_ERR(kv)) { if (kv) ray_error_free(kv); scratch_free(ahdr); goto vfail; }
+        kv->len = K;
+        struct ray_sym_domain_s* kdom = ray_sym_domain_new();
+        bool ok = kdom != NULL;
+        if (ok) {
+            kv->sym_domain = kdom;                /* the vector takes the ref */
+            ok = dkh_intern_keys(c, ko, K, kdom, (int64_t*)ray_data(kv));
+        }
+        if (!ok) { ray_release(kv); scratch_free(ahdr); goto vfail; }
+        O = dkv_emit(by_expr, alias, kind, n_aggs, Hc, kv, K, acnt, ann, alenw, amn, amx);
+        scratch_free(ahdr);
+        if (!O) goto vfail;
+    }
+    ray_profile_tick("derived key: output built");
+    dkh_free(c); scratch_free(chdr); chdr = NULL; c = NULL;
+    scratch_free(khdr); khdr = NULL;
+    scratch_free(mhdr); mhdr = NULL;
+    ray_sym_domain_raw_unpin(dom);
+    ray_release(H);
+
+    /* Unsorted output comes out in the order of the groups' first values in
+     * the vocabulary order of C (the key "" first), the same at every core
+     * count.  A sort or take clause runs over that, as written. */
+    if (!plain) {
+        int64_t s_s = ray_sym_intern("__dkv_s", 7);
+        int64_t keys[4]; ray_t* vals[4]; int64_t n = 0;
+        keys[n] = from_id; vals[n++] = ray_sym(s_s);
+        for (int64_t i = 0; i + 1 < dict_n && n < 4; i += 2) {
+            int64_t kid = dict_elems[i]->i64;
+            if (kid == take_id || kid == asc_id || kid == desc_id) {
+                keys[n] = kid; vals[n] = dict_elems[i + 1]; ray_retain(vals[n]); n++;
+            }
+        }
         ray_t* q = dkv_select(keys, vals, n);
-        if (!q) { ray_release(S); return NULL; }
-        if (ray_env_push_query_scope() != RAY_OK) { ray_release(q); ray_release(S); return NULL; }
-        ray_env_set_query_local(s_s, S);
-        R = ray_eval(q);
+        if (!q) { ray_release(O); return NULL; }
+        if (ray_env_push_query_scope() != RAY_OK) { ray_release(q); ray_release(O); return NULL; }
+        ray_env_set_query_local(s_s, O);
+        ray_t* R = ray_eval(q);
         ray_env_pop_scope();
         ray_release(q);
-    }
-    ray_release(S);
-    if (!R || RAY_IS_ERR(R)) { if (R) ray_error_free(R); return NULL; }
-    if (ray_is_lazy(R)) R = ray_lazy_materialize(R);
-    if (!R || RAY_IS_ERR(R) || R->type != RAY_TABLE || ray_table_ncols(R) == 0) {
-        if (R && !RAY_IS_ERR(R)) ray_release(R); else if (R) ray_error_free(R);
-        return NULL;
-    }
-    /* The engine emits a post-aggregate expression (the avg quotient)
-     * after the plain aggregates: put the outputs back in the order they
-     * were written, key first. */
-    int64_t rc = ray_table_ncols(R);
-    if (rc != n_aggs + 1) { ray_release(R); return NULL; }
-    ray_t* O = ray_table_new(rc);
-    if (!O || RAY_IS_ERR(O)) { if (O) ray_error_free(O); ray_release(R); return NULL; }
-    O = ray_table_add_col(O, ray_table_col_name(R, 0), ray_table_slot_idx(R, 0));
-    for (int a = 0; a < n_aggs && O && !RAY_IS_ERR(O); a++) {
-        ray_t* col = ray_table_slot(R, alias[a]);
-        if (!col) { ray_release(O); ray_release(R); return NULL; }
-        O = ray_table_add_col(O, alias[a], col);
-    }
-    ray_release(R);
-    if (!O || RAY_IS_ERR(O)) { if (O) ray_error_free(O); return NULL; }
-    /* the key column is named as the row path names a computed key */
-    int64_t kname = derived_key_name(by_expr);
-    for (int64_t c = 1; c < rc; c++)
-        if (ray_table_col_name(O, c) == kname) { kname = ray_sym_intern("key", 3); break; }
-    ray_table_set_col_name(O, 0, kname);
-    /* Unsorted output comes out in the order of the key domain's positions
-     * — this execution's first-seen ranks over S, i.e. the vocabulary order
-     * of the values — whatever order the grouping over S emitted in (its
-     * strategy, and with it the order, depends on the core count).  A sort
-     * or take clause fixes the order itself. */
-    bool plain = true;
-    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
-        int64_t kid = dict_elems[i]->i64;
-        if (kid == take_id || kid == asc_id || kid == desc_id) plain = false;
-    }
-    int64_t orows = ray_table_nrows(O);
-    ray_t* okey = tbl_col_idx_or_null(O, 0);
-    if (plain && orows > 1 && okey && okey->type == RAY_SYM) {
-        struct ray_sym_domain_s* kdom = ray_sym_vec_domain(okey);
-        int64_t kn = ray_sym_domain_count(kdom);
-        ray_t *shdr = NULL, *ihdr = NULL;
-        int64_t* slot = (int64_t*)scratch_alloc(&shdr, (size_t)(kn > 0 ? kn : 1) * sizeof(int64_t));
-        int64_t* idx  = (int64_t*)scratch_alloc(&ihdr, (size_t)orows * sizeof(int64_t));
-        bool ok = slot && idx;
-        if (ok) {
-            memset(slot, 0xff, (size_t)kn * sizeof(int64_t));
-            const void* kd = ray_data(okey);
-            for (int64_t i = 0; i < orows && ok; i++) {
-                int64_t pos = ray_read_sym(kd, i, RAY_SYM, okey->attrs);
-                if (pos < 0 || pos >= kn || slot[pos] >= 0) ok = false;   /* not a grouping by this key */
-                else slot[pos] = i;
-            }
+        ray_release(O);
+        if (R && !RAY_IS_ERR(R) && ray_is_lazy(R)) R = ray_lazy_materialize(R);
+        if (!R || RAY_IS_ERR(R) || R->type != RAY_TABLE) {
+            if (R && !RAY_IS_ERR(R)) ray_release(R); else if (R) ray_error_free(R);
+            return NULL;
         }
-        if (ok) {
-            int64_t m = 0;
-            for (int64_t pos = 0; pos < kn; pos++) if (slot[pos] >= 0) idx[m++] = slot[pos];
-            ok = m == orows;
-        }
-        if (ok) {
-            ray_t* P = ray_table_new(rc);
-            for (int64_t c = 0; c < rc && P && !RAY_IS_ERR(P); c++) {
-                ray_t* src = tbl_col_idx_or_null(O, c);
-                ray_t* g = src ? gather_by_idx(src, idx, orows) : NULL;
-                if (!g || RAY_IS_ERR(g)) { if (g) ray_error_free(g); ray_release(P); P = NULL; break; }
-                P = ray_table_add_col(P, ray_table_col_name(O, c), g);
-                ray_release(g);
-            }
-            if (P && !RAY_IS_ERR(P)) { ray_release(O); O = P; }
-            else if (P) ray_error_free(P);
-        }
-        scratch_free(shdr); scratch_free(ihdr);
+        O = R;
     }
     agg_route_note_key_domain();
     return O;
+vfail:
+    if (c) dkh_free(c);
+    scratch_free(chdr);
+    scratch_free(khdr);
+    scratch_free(mhdr);
+    ray_sym_domain_raw_unpin(dom);
+    ray_release(H);
+    return NULL;
 }
 
 /* `sel` (a rowsel over tbl, or NULL): only the rows it selects decide
@@ -9027,6 +10575,8 @@ typedef struct {
     const uint32_t*    sel_offs;
     const uint16_t*    sel_idx;
     uint32_t           sel_n_segs;
+    const int64_t*     sel_pre;    /* compact map: rank of each segment's first kept row */
+    int64_t            nrows;      /* compact map: rows of the table */
 } rgid_probe_mk_ctx_t;
 
 static inline uint64_t rgid_mk_hash_step(uint64_t h, int64_t v) {
@@ -9097,6 +10647,30 @@ static void rgid_probe_mk_fn(void* ctx_, uint32_t worker_id,
     for (int64_t r = covered; r < end; r++) x->row_gid[r] = -1;
 }
 
+/* The compact sibling of rgid_probe_mk_fn: tasks are segments [start, end)
+ * of the selection, and the gid of the j-th selected row lands in
+ * row_gid[j] (sel_pre[seg] is the rank of a segment's first kept row). */
+static void rgid_probe_mk_compact_fn(void* ctx_, uint32_t worker_id,
+                                     int64_t start, int64_t end) {
+    (void)worker_id;
+    const rgid_probe_mk_ctx_t* x = (const rgid_probe_mk_ctx_t*)ctx_;
+    for (int64_t seg = start; seg < end; seg++) {
+        uint8_t f = x->sel_flg[seg];
+        if (f == RAY_SEL_NONE) continue;
+        int64_t base = seg * RAY_MORSEL_ELEMS;
+        int64_t* out = x->row_gid + x->sel_pre[seg];
+        if (f == RAY_SEL_ALL) {
+            int64_t n = x->nrows - base < RAY_MORSEL_ELEMS ? x->nrows - base : RAY_MORSEL_ELEMS;
+            for (int64_t i = 0; i < n; i++) out[i] = rgid_mk_probe_row(x, base + i);
+        } else {
+            uint32_t off = x->sel_offs[seg];
+            uint32_t cnt = x->sel_offs[seg + 1] - off;
+            for (uint32_t i = 0; i < cnt; i++)
+                out[i] = rgid_mk_probe_row(x, base + x->sel_idx[off + i]);
+        }
+    }
+}
+
 /* The base types the composite probe reads: KEY_READ's coverage less STR,
  * which the single-key scatter resolves through its own descriptor probe. */
 static int rgid_mk_key_type_ok(int8_t bt) {
@@ -9133,10 +10707,11 @@ static int multikey_scatter_keys_ok(ray_t* by_expr, ray_t* tbl) {
  * `result`'s key columns, hashed; then every row of `tbl`'s key columns is
  * probed (in parallel when the input is large).  Parted source keys are
  * flattened for the probe.  Rows `selection` drops get -1.  Returns NULL on
- * success, else an owned error. */
+ * success, else an owned error.  `compact`: row_gid holds the selected rows
+ * only, in selection order (total_pass cells), not one per row. */
 static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
                                   int64_t nrows, int64_t n_groups,
-                                  ray_t* selection, int64_t* row_gid) {
+                                  ray_t* selection, int64_t* row_gid, bool compact) {
     int nk = (int)ray_len(by_expr);
     const int64_t* ids = (const int64_t*)ray_data(by_expr);
     ray_t* err = NULL;
@@ -9228,7 +10803,33 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
             ctx.sel_n_segs = sm->n_segs;
         }
         ray_pool_t* pool = ray_pool_get();
-        if (pool && nrows >= 200000 && ray_pool_total_workers(pool) >= 2)
+        ray_t* pre_hdr = NULL;
+        if (compact && selection) {
+            int64_t ns = (int64_t)ctx.sel_n_segs;
+            int64_t* pre = (int64_t*)scratch_alloc(&pre_hdr, (size_t)(ns + 1) * sizeof(int64_t));
+            if (!pre) err = ray_error("oom", NULL);
+            else {
+                int64_t run = 0;
+                for (int64_t s = 0; s < ns; s++) {
+                    pre[s] = run;
+                    uint8_t f = ctx.sel_flg[s];
+                    if (f == RAY_SEL_ALL) {
+                        int64_t lo = s * RAY_MORSEL_ELEMS;
+                        run += (nrows - lo < RAY_MORSEL_ELEMS ? nrows - lo : RAY_MORSEL_ELEMS);
+                    } else if (f != RAY_SEL_NONE) {
+                        run += ctx.sel_offs[s + 1] - ctx.sel_offs[s];
+                    }
+                }
+                pre[ns] = run;
+                ctx.sel_pre = pre;
+                ctx.nrows = nrows;
+                if (pool && nrows >= 200000 && ray_pool_total_workers(pool) >= 2)
+                    ray_pool_dispatch(pool, rgid_probe_mk_compact_fn, &ctx, ns);
+                else
+                    rgid_probe_mk_compact_fn(&ctx, 0, 0, ns);
+            }
+            if (pre_hdr) scratch_free(pre_hdr);
+        } else if (pool && nrows >= 200000 && ray_pool_total_workers(pool) >= 2)
             ray_pool_dispatch(pool, rgid_probe_mk_fn, &ctx, nrows);
         else
             rgid_probe_mk_fn(&ctx, 0, 0, nrows);
@@ -20080,8 +21681,21 @@ by_dict_done:
 
                 /* Allocations — any failure errors out rather than
                  * silently returning partial results. */
+                /* A composite key under a selection whose every non-agg the
+                 * bounded kernel counts: the row map holds the selected
+                 * rows only (in selection order), not one cell for every
+                 * row of the table. */
+                bool cd_compact = mk_nk > 1 && saved_selection && n_nonaggs > 0 &&
+                                  ray_cd_bounded_preferred(tbl, NULL, NULL, NULL, nrows, n_groups);
+                for (int64_t ni = 0; ni < n_nonaggs && cd_compact; ni++) {
+                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+                    cd_compact = cd_inner && cd_inner->type == -RAY_SYM &&
+                                 !(cd_inner->attrs & ATTR_QUOTED) &&
+                                 cd_src_bounded_ok(tbl, cd_inner);
+                }
+                int64_t rg_rows = cd_compact ? ray_rowsel_meta(saved_selection)->total_pass : nrows;
                 ray_t* gk_hdr  = ray_alloc((size_t)n_groups * sizeof(int64_t));
-                ray_t* rg_hdr  = ray_alloc((size_t)nrows    * sizeof(int64_t));
+                ray_t* rg_hdr  = ray_alloc((size_t)(rg_rows > 0 ? rg_rows : 1) * sizeof(int64_t));
                 ray_t* cnt_hdr = ray_alloc((size_t)n_groups * sizeof(int64_t));
                 ray_t* off_hdr = ray_alloc((size_t)n_groups * sizeof(int64_t));
                 ray_t* pos_hdr = ray_alloc((size_t)n_groups * sizeof(int64_t));
@@ -20117,7 +21731,8 @@ by_dict_done:
                 int rgid_did_mask = 0;
                 if (mk_nk > 1) {
                     ray_t* mk_err = rgid_build_multikey(tbl, result, by_expr, nrows,
-                                                        n_groups, saved_selection, row_gid);
+                                                        n_groups, saved_selection, row_gid,
+                                                        cd_compact);
                     if (mk_err) {
                         ray_free(gk_hdr); ray_free(rg_hdr); ray_free(cnt_hdr);
                         ray_free(off_hdr); ray_free(pos_hdr);
@@ -20126,6 +21741,7 @@ by_dict_done:
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return mk_err;
                     }
                     rgid_did_mask = 1;   /* the probe applied the selection */
+                    if (cd_compact) ray_profile_tick("count-distinct: row map over the kept rows");
                 } else if (okt == RAY_STR) {
                     /* Dict-code row_gid fast path: when the group key is a
                      * dict-encoded STR column, exec_group already grouped on its
@@ -20512,7 +22128,10 @@ by_dict_done:
                         if (src_for_global && cd_bounded_rows &&
                             ray_cd_bounded_col_ok(src_for_global, true)) {
                             col = ray_cd_bounded(tbl, NULL, NULL, row_gid, n_groups,
-                                                 src_for_global, NULL, nrows);
+                                                 src_for_global, cd_compact ? saved_selection : NULL,
+                                                 nrows);
+                            if (!col && cd_compact)
+                                col = ray_error("domain", "select by: count distinct column does not cover the table's rows");
                             if (!col && !idx_buf && n_groups <= 50000)
                                 col = ray_error("domain", "select by: count distinct column does not cover the table's rows");
                         }

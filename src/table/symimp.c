@@ -491,17 +491,17 @@ fail:
  * records: the offset of the first of every block of them, which this
  * dictionary knows. */
 static void si_save_index(ray_symimp_t* m, int64_t count, int64_t tail) {
-    int64_t n = (count + ((int64_t)1 << RAY_SYM_INDEX_LOG) - 1) >> RAY_SYM_INDEX_LOG;
+    int64_t n = (count + RAY_SYM_INDEX_STRIDE - 1) / RAY_SYM_INDEX_STRIDE;
     if (n <= 0) return;
     uint64_t* ck = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
-    uint8_t* lens = (uint8_t*)ray_sys_alloc((size_t)count);
+    uint16_t* lens = (uint16_t*)ray_sys_alloc((size_t)count * 2);
     if (ck && lens) {
-        for (int64_t k = 0; k < n; k++) ck[k] = si_off(m, k << RAY_SYM_INDEX_LOG);
+        for (int64_t k = 0; k < n; k++) ck[k] = si_off(m, k * RAY_SYM_INDEX_STRIDE);
         /* the lengths, from the offsets this dictionary keeps of every record */
         for (int64_t i = 0; i < count; i++) {
             uint64_t a = si_off(m, i), b = i + 1 < count ? si_off(m, i + 1) : (uint64_t)tail;
             uint64_t l = b - a - 4;
-            lens[i] = l < 255 ? (uint8_t)l : (uint8_t)255;
+            lens[i] = l < 65535 ? (uint16_t)l : (uint16_t)65535;
         }
         ray_sym_domain_index_save(m->path, ck, n, lens, count, (uint64_t)tail);
     }

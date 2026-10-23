@@ -30,6 +30,7 @@
 #include "mem/heap.h"
 #include "store/part.h"
 #include "store/splay.h"
+#include "store/enccol.h"
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
@@ -9591,6 +9592,374 @@ static test_result_t test_select_derived_key_file_chunks(void) {
     PASS();
 }
 
+/* On a compressed (generation 2) column the derived-key grouping reads the
+ * key by range: it must answer as the row path does and leave the column's
+ * whole-column decode cache empty. */
+static test_result_t test_select_derived_key_gen2_no_decode(void) {
+    ray_t* r = ray_eval_str(
+        ray_test_tmp("(do (set __dg_i (til 70000)) "
+        "    (set __dg_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
+        "    (set __dg_mk (fn [k] ((fn [j] (if (== 0 (% j 11)) \"\" (if (== 0 (% j 7)) "
+        "        (format \"https://www.%/p/%\" (at __dg_hosts (% (* 31 j) 37)) (% j 13)) "
+        "        (format \"http://%/a/%\" (at __dg_hosts (% (* 31 j) 37)) (% j 17))))) (% k 500)))) "
+        "    (set __dg_T (table [ref v] (list (as 'SYMBOL (map __dg_mk __dg_i)) (as 'F64 (% (* __dg_i 7) 101))))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_dk_gen2/; mkdir -p /tmp/rf_test_dk_gen2\") "
+        "    (.db.splayed.set \"/tmp/rf_test_dk_gen2/t/\" __dg_T \"/tmp/rf_test_dk_gen2/t.sym\" {compress: true}) "
+        "    (set __dg_F (.db.splayed.get \"/tmp/rf_test_dk_gen2/t/\" \"/tmp/rf_test_dk_gen2/t.sym\")) "
+        "    (set __dg_key (fn [ref] (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "        (let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))))) "
+        "    (set __dg_fp (fn [r] (ser (xasc (xasc (table [k c mn] (list (at (value r) 0) (at r 'c) (at r 'mn))) 'mn) 'c)))) "
+        "    0)"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    ray_t* F = ray_eval_str("__dg_F");
+    TEST_ASSERT_NOT_NULL(F); TEST_ASSERT_FALSE(RAY_IS_ERR(F));
+    ray_t* E = ray_table_get_col_enc(F, ray_sym_intern("ref", 3));
+    TEST_ASSERT_NOT_NULL(E);                    /* the column is stored encoded */
+    ray_enccol_t* e = ray_enccol_of(E);
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_TRUE(e->decoded == NULL);
+
+    ray_t* got = ray_eval_str("(do (set __dg_r (select {from: __dg_F by: (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "(let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "(if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
+        "c: (count ref) mn: (min ref) where: (!= ref \"\")})) (count __dg_r))");
+    TEST_ASSERT_NOT_NULL(got); TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+    TEST_ASSERT_TRUE(got->i64 > 0);
+    ray_release(got);
+    bool undecoded = e->decoded == NULL;        /* read before the oracle decodes it */
+
+    ray_t* same = ray_eval_str("(all (== (__dg_fp __dg_r) (__dg_fp (select {from: (select {from: __dg_T p: (__dg_key ref) "
+        "ref: ref where: (!= ref \"\")}) by: p c: (count ref) mn: (min ref)}))))");
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_dk_gen2/\")"));
+    ray_release(cleanup);
+    TEST_ASSERT_TRUE(undecoded);
+    TEST_ASSERT_NOT_NULL(same); TEST_ASSERT_FALSE(RAY_IS_ERR(same));
+    TEST_ASSERT_EQ_I(same->type, -RAY_BOOL);
+    TEST_ASSERT_TRUE(same->b8);
+    ray_release(same);
+    ray_release(F);
+    PASS();
+}
+
+/* The two-pass grouping with every key empty stores no key bytes: it answers
+ * as the unarmed grouping cut afterwards (a sanitizer build checks the
+ * pointer arithmetic over the empty key store). */
+static test_result_t test_select_derived_key_two_pass_empty_keys(void) {
+    ray_t* r = ray_eval_str(
+        "(do (set __de_T (table [ref] (list (as 'SYMBOL (map (fn [j] (format \"s%\" (% j 300))) (til 90000)))))) "
+        "    (set __de_in (select {from: __de_T by: (substr ref 20 5) c: (count ref)})) "
+        "    (set __de_a (select {from: (select {from: __de_T by: (substr ref 20 5) c: (count ref)}) where: (> c 100)})) "
+        "    (all (== (ser __de_a) (ser (select {from: __de_in where: (> c 100)})))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_BOOL);
+    TEST_ASSERT_TRUE(r->b8);
+    ray_release(r);
+    PASS();
+}
+
+/* A filter that reads only the grouped column runs over its distinct values
+ * after the grouping: every form answers as the same grouping of the table
+ * filtered first, and one that reads another column keeps the row filter. */
+static test_result_t test_select_derived_key_where_on_values(void) {
+    ray_t* r = ray_eval_str(
+        ray_test_tmp("(do (set __dw_i (til 70000)) "
+        "    (set __dw_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
+        "    (set __dw_mk (fn [k] ((fn [j] (if (== 0 (% j 6)) \"\" (if (== 0 (% j 7)) "
+        "        (format \"https://www.%/p/%\" (at __dw_hosts (% (* 31 j) 37)) (% j 13)) "
+        "        (if (== 0 (% j 5)) (at __dw_hosts (% (* 31 j) 37)) "
+        "        (format \"http://%/a/%\" (at __dw_hosts (% (* 31 j) 37)) (% j 17)))))) (% k 500)))) "
+        "    (set __dw_T (table [ref v] (list (as 'SYMBOL (map __dw_mk __dw_i)) (% (* __dw_i 7) 101)))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_dk_where/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_dk_where/t/\" __dw_T \"/tmp/rf_test_dk_where/t.sym\" {compress: true}) "
+        "    (set __dw_F (.db.splayed.get \"/tmp/rf_test_dk_where/t/\" \"/tmp/rf_test_dk_where/t.sym\")) "
+        "    (set __dw_fp (fn [r] (ser (xasc (xasc (table [k c l mn] (list (at (value r) 0) (at r 'c) (at r 'l) (at r 'mn))) 'mn) 'c)))) "
+        "    0)"));
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    static const char* const W[] = {
+        "(!= ref \"\")",
+        "(like ref \"http*\")",
+        "(not (nil? ref))",
+        "(and (!= ref \"\") (> (strlen ref) 24))",
+        "(nil? ref)",
+        "(> v 50)",
+    };
+    for (size_t w = 0; w < sizeof(W) / sizeof(W[0]); w++) {
+        char q[4096];
+        const char* key = "(let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+            "(let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+            "(if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref)))))";
+        snprintf(q, sizeof q,
+            "(all (== (__dw_fp (select {from: __dw_F by: %s c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: %s})) "
+            "(__dw_fp (select {from: (select {from: __dw_T ref: ref v: v where: %s}) by: %s c: (count ref) l: (avg (strlen ref)) mn: (min ref)}))))",
+            key, W[w], W[w], key);
+        ray_t* same = ray_eval_str(q);
+        TEST_ASSERT_NOT_NULL(same);
+        TEST_ASSERT_FMT(!RAY_IS_ERR(same), "filter %s: error", W[w]);
+        TEST_ASSERT_FMT(same->type == -RAY_BOOL && same->b8, "filter %s: answers differ", W[w]);
+        ray_release(same);
+    }
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_dk_where/\")"));
+    ray_release(cleanup);
+    PASS();
+}
+
+/* The derived-key grouping keys on a 64-bit hash of the key and compares
+ * the bytes on every hash match.  With the hash cut to two bits (four
+ * values over hundreds of keys) every group shares its hash with dozens of
+ * others: each answer must still be exactly the full-hash one — the
+ * per-value aggregates (count, avg/sum of strlen, min/max), the having cut
+ * an enclosing where arms, and the per-row key of a grouping that also
+ * reads another column — and agree with the row path. */
+static test_result_t test_select_derived_key_hash_collisions(void) {
+    ray_t* r = ray_eval_str(
+        ray_test_tmp("(do (set __dh_i (til 80000)) "
+        "    (set __dh_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
+        "    (set __dh_mk (fn [k] ((fn [j] (if (== 0 (% j 11)) \"\" (if (== 0 (% j 7)) "
+        "        (format \"https://www.%/p/%\" (at __dh_hosts (% (* 31 j) 37)) (% j 13)) "
+        "        (if (== 0 (% j 5)) (format \"plain%.x\" j) "
+        "        (format \"http://%/a/%\" (at __dh_hosts (% (* 31 j) 37)) (% j 17)))))) (% (* k 7919) 3000)))) "
+        "    (set __dh_T (table [ref v] (list (as 'SYMBOL (map __dh_mk __dh_i)) (% __dh_i 101)))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_dh/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_dh/\" __dh_T) "
+        "    (set __dh_F (.db.splayed.get \"/tmp/rf_test_dh/\")) "
+        "    (set __dh_q1 (fn [t] (select {from: t by: (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "        (let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
+        "        c: (count ref) l: (avg (strlen ref)) mn: (min ref) mx: (max ref) sl: (sum (strlen ref)) where: (!= ref \"\")}))) "
+        "    (set __dh_o1 (fn [t] (select {from: t by: (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "        (let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
+        "        c: (count ref) l: (avg (strlen ref)) mn: (min ref) mx: (max ref) sl: (sum (strlen ref)) sv: (sum v) where: (!= ref \"\")}))) "
+        "    (set __dh_q2 (fn [t] (select {from: t by: (substr ref 1 9) c: (count ref) l: (avg (strlen ref)) mn: (min ref) mx: (max ref)}))) "
+        "    (set __dh_q3 (fn [t] (select {from: (select {from: t by: (let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) "
+        "        (let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") "
+        "        (if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref))))) "
+        "        l: (avg (strlen ref)) c: (count ref) mn: (min ref) where: (!= ref \"\")}) where: (> c 900) desc: l})) ) "
+        "    (set __dh_q4 (fn [t] (select {from: t by: (let p (str-find ref \"://\") (substr ref (+ p 4) 9)) c: (count ref) s: (sum v) mn: (min ref)}))) "
+        "    (set __dh_fp (fn [r] (ser (xasc (xasc (xasc (table [k c mn] (list (as 'STR (at (value r) 0)) (at r 'c) (as 'STR (at r 'mn)))) 'mn) 'k) 'c)))) "
+        "    (set __dh_q5 (fn [t] (select {from: t by: (substr ref 1 (+ 3 (% (strlen ref) 5))) c: (count ref) mn: (min ref)}))) "
+        "    (set __dh_all (fn [] (list (ser (__dh_q1 __dh_F)) (ser (__dh_q2 __dh_F)) (ser (__dh_q3 __dh_F)) (ser (__dh_q4 __dh_F)) (ser (__dh_q1 __dh_T)) (ser (__dh_q5 __dh_F))))) "
+        "    (set __dh_same (fn [] (do (set __dh_now (__dh_all)) (all (map (fn [k] (if (== (count (at __dh_now k)) (count (at __dh_base k))) (all (== (at __dh_now k) (at __dh_base k))) false)) (til 6)))))) "
+        "    (count (distinct (at __dh_F 'ref))))"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 1487);              /* vocabulary of 1487 values */
+    ray_release(r);
+
+    ray_t* base = ray_eval_str("(set __dh_base (__dh_all))");
+    TEST_ASSERT_NOT_NULL(base); TEST_ASSERT_FALSE(RAY_IS_ERR(base));
+    ray_release(base);
+    /* the full-hash answers agree with the row path */
+    ray_t* ora = ray_eval_str("(and (== (__dh_fp (__dh_q1 __dh_F)) (__dh_fp (__dh_o1 __dh_F))) "
+                              "(== (count (__dh_q3 __dh_F)) (count (select {from: (__dh_o1 __dh_F) where: (> c 900)}))))");
+    TEST_ASSERT_NOT_NULL(ora); TEST_ASSERT_FALSE(RAY_IS_ERR(ora));
+    TEST_ASSERT_TRUE(ora->b8);
+    ray_release(ora);
+    ray_t* groups = ray_eval_str("(count (__dh_q1 __dh_F))");
+    TEST_ASSERT_NOT_NULL(groups); TEST_ASSERT_FALSE(RAY_IS_ERR(groups));
+    TEST_ASSERT_TRUE(groups->i64 > 100);
+    ray_release(groups);
+
+    ray_derived_key_hash_bits_set_for_test(2);   /* four hash values */
+    ray_t* same2 = ray_eval_str("(__dh_same)");
+    ray_derived_key_chunk_set_for_test(7);       /* and many chunks */
+    ray_t* same7 = ray_eval_str("(__dh_same)");
+    ray_derived_key_hash_bits_set_for_test(0);
+
+    /* A private in-memory domain (a scan's dictionary): no mapped prefix,
+     * so every value's bytes come through the domain on the calling
+     * thread — the grouping, the having cut and the kept groups' min. */
+    ray_t* original = ray_eval_str("__dh_T");
+    TEST_ASSERT_NOT_NULL(original); TEST_ASSERT_FALSE(RAY_IS_ERR(original));
+    ray_t* refs = ray_table_get_col_idx(original, 0);
+    ray_sym_domain_t* domain = ray_sym_domain_new(); TEST_ASSERT_NOT_NULL(domain);
+    ray_t* private = ray_sym_vec_new(RAY_SYM_W32, refs->len);
+    TEST_ASSERT_NOT_NULL(private); TEST_ASSERT_FALSE(RAY_IS_ERR(private));
+    private->sym_domain = domain; private->len = refs->len;
+    for (int64_t i = 0; i < refs->len; i++) {
+        ray_t* s = ray_sym_vec_cell(refs, i);
+        int64_t id = ray_sym_domain_intern(domain, ray_str_ptr(s), ray_str_len(s));
+        TEST_ASSERT_TRUE(id >= 0);
+        ((uint32_t*)ray_data(private))[i] = (uint32_t)id;
+        if (!id) private->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    ray_t* table = ray_table_new(0);
+    table = ray_table_add_col(table, ray_sym_intern("ref", 3), private);
+    table = ray_table_add_col(table, ray_sym_intern("v", 1), ray_table_get_col_idx(original, 1));
+    TEST_ASSERT_NOT_NULL(table); TEST_ASSERT_FALSE(RAY_IS_ERR(table));
+    ray_env_set(ray_sym_intern("__dh_private", 12), table);
+    ray_release(private); ray_release(table); ray_release(original);
+    ray_derived_key_hash_bits_set_for_test(2);
+    ray_t* priv = ray_eval_str("(and (all (== (__dh_fp (__dh_q1 __dh_private)) (__dh_fp (__dh_q1 __dh_F)))) "
+                               "(and (all (== (__dh_fp (__dh_q3 __dh_private)) (__dh_fp (__dh_q3 __dh_F)))) "
+                               "(all (== (__dh_fp (__dh_q5 __dh_private)) (__dh_fp (__dh_q5 __dh_F))))))");
+    ray_derived_key_hash_bits_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(priv); TEST_ASSERT_FALSE(RAY_IS_ERR(priv));
+    TEST_ASSERT_TRUE(priv->b8);
+    ray_release(priv);
+    ray_derived_key_chunk_set_for_test(0);
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_dh/\")"));
+    ray_release(cleanup);
+    TEST_ASSERT_NOT_NULL(same2); TEST_ASSERT_FALSE(RAY_IS_ERR(same2));
+    TEST_ASSERT_TRUE(same2->b8);
+    TEST_ASSERT_NOT_NULL(same7); TEST_ASSERT_FALSE(RAY_IS_ERR(same7));
+    TEST_ASSERT_TRUE(same7->b8);
+    ray_release(same2);
+    ray_release(same7);
+    PASS();
+}
+
+/* Under an armed count cut (an enclosing `where: (> c N)`) the derived-key
+ * grouping runs in two passes: the rows summed by key hash alone, then the
+ * exact aggregates of the keys under the hashes that pass, the cut applied
+ * again to the exact counts.  Each answer must be the one-pass grouping's
+ * (the same groups in the same order: the unarmed grouping cut afterwards)
+ * and the row path's — for a cut some keys pass, one every key passes and
+ * one no key passes.  With the hash cut to two bits every pass-A bucket
+ * merges hundreds of keys and passes the cut while most of its keys do
+ * not: the keys under one hash are told apart by their bytes, and only
+ * those past the cut are emitted.  Three keys: the per-value program's view
+ * of the value (pass B reads it back off the value), one with a literal
+ * arm, and one only the chunk DAG computes, which is no view of the
+ * value for the upper-case values (pass B computes those again). */
+#define D2_KEY0 "(let p (str-find ref \"://\") (let s (substr ref (+ p 4) -1) " \
+    "(let r (if (== (str-find s \"www.\") 0) (substr s 5 -1) s) (let sl (str-find r \"/\") " \
+    "(if (and (within p [4 5]) (== (substr ref 1 4) \"http\") (not (nil? sl))) (substr r 1 sl) ref)))))"
+#define D2_KEY1 "(if (== (str-find ref \"https\") 0) \"secure\" (substr ref 1 (+ 9 (% (strlen ref) 5))))"
+#define D2_KEY2 "(lower (substr ref 1 12))"
+#define D2_AGGS "c: (count ref) l: (avg (strlen ref)) sl: (sum (strlen ref)) mn: (min ref) mx: (max ref)"
+static const char* const d2_keys[] = { D2_KEY0, D2_KEY1, D2_KEY2 };
+
+/* One armed query by key ki over table t (inner where w, or none): the
+ * two-pass grouping ran, emitted what it returned, and agrees with the
+ * one-pass grouping (in order) and with the row path.  *k: the rows
+ * returned. */
+static bool d2_case(const char* t, int ki, const char* w, int64_t n, int64_t* k) {
+    char q[4096];
+    int64_t s0[5], s1[5];
+    ray_derived_key_two_pass_stats_for_test(s0);
+    snprintf(q, sizeof(q), "(set __d2_r (select {from: (select {from: %s by: %s " D2_AGGS "%s%s}) "
+             "where: (> c %lld)}))", t, d2_keys[ki], w ? " where: " : "", w ? w : "", (long long)n);
+    ray_t* r = ray_eval_str(q);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return false; }
+    ray_release(r);
+    ray_derived_key_two_pass_stats_for_test(s1);
+    /* against the unarmed one-pass grouping and the row path (both
+     * evaluated once, at the full hash), cut afterwards */
+    const char* wv = w ? "w" : "n";
+    snprintf(q, sizeof(q), "(and (all (== (__d2_cv __d2_r) (__d2_cv (select {from: __d2_b%s%s%d where: (> c %lld)})))) "
+             "(all (== (__d2_fp __d2_r) (__d2_fp (select {from: __d2_O%s%d where: (> c %lld)})))))",
+             wv, t + strlen(t) - 1, ki, (long long)n, wv, ki, (long long)n);
+    ray_t* same = ray_eval_str(q);
+    bool ok = same && !RAY_IS_ERR(same) && same->type == -RAY_BOOL && same->b8;
+    if (same) { if (RAY_IS_ERR(same)) ray_error_free(same); else ray_release(same); }
+    ray_t* cnt = ray_eval_str("(count __d2_r)");
+    *k = cnt && !RAY_IS_ERR(cnt) ? cnt->i64 : -1;
+    if (cnt) { if (RAY_IS_ERR(cnt)) ray_error_free(cnt); else ray_release(cnt); }
+    return ok && s1[0] == s0[0] + 1 && s1[1] == *k;
+}
+
+static test_result_t test_select_derived_key_two_pass(void) {
+    ray_t* r = ray_eval_str(
+        ray_test_tmp("(do (set __d2_i (til 80000)) "
+        "    (set __d2_hosts (map (fn [k] (format \"h%.example.com\" k)) (til 37))) "
+        "    (set __d2_mk (fn [k] ((fn [j] (if (== 0 (% j 11)) \"\" (if (== 0 (% j 7)) "
+        "        (format \"https://www.%/p/%\" (at __d2_hosts (% (* 31 j) 37)) (% j 13)) "
+        "        (if (== 0 (% j 13)) (format \"HTTP://WWW.%/Q/%\" (at __d2_hosts (% (* 31 j) 37)) (% j 3)) "
+        "        (if (== 0 (% j 5)) (format \"plain%.x\" j) "
+        "        (format \"http://%/a/%\" (at __d2_hosts (% (* 31 j) 37)) (% j 17))))))) (% (* k 7919) 3000)))) "
+        "    (set __d2_T (table [ref v] (list (as 'SYMBOL (map __d2_mk __d2_i)) (% __d2_i 101)))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_d2/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_d2/\" __d2_T) "
+        "    (set __d2_F (.db.splayed.get \"/tmp/rf_test_d2/\")) "
+        "    (set __d2_cvt (fn [r] (table [k c l sl mn mx] (list (as 'STR (at (value r) 0)) (at r 'c) (at r 'l) "
+        "        (at r 'sl) (as 'STR (at r 'mn)) (as 'STR (at r 'mx)))))) "
+        "    (set __d2_cv (fn [r] (ser (__d2_cvt r)))) "
+        "    (set __d2_fp (fn [r] (ser (xasc (__d2_cvt r) 'k)))) "
+        "    (count (distinct (at __d2_F 'ref))))"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 1558);              /* vocabulary of 1558 values */
+    ray_release(r);
+    /* per key: the unarmed one-pass groupings (__d2_b{n,w}{F,T}k), the row
+     * path (__d2_O{n,w}k), the group count and the least and most rows */
+    int64_t all[3], cmin[3], cmax[3];
+    for (int ki = 0; ki < 3; ki++) {
+        char q[4096];
+        snprintf(q, sizeof(q), "(do (set __d2_u (fn [t] (select {from: t by: %s " D2_AGGS "}))) "
+                 "(set __d2_uw (fn [t] (select {from: t by: %s " D2_AGGS " where: (!= ref \"\")}))) "
+                 "(set __d2_bnF%d (__d2_u __d2_F)) (set __d2_bwF%d (__d2_uw __d2_F)) "
+                 "(set __d2_bnT%d (__d2_u __d2_T)) (set __d2_bwT%d (__d2_uw __d2_T)) "
+                 "(set __d2_On%d (select {from: (select {from: __d2_T p: %s ref: ref}) by: p " D2_AGGS "})) "
+                 "(set __d2_Ow%d (select {from: (select {from: __d2_T p: %s ref: ref where: (!= ref \"\")}) by: p " D2_AGGS "})) "
+                 "(list (count __d2_bnF%d) (min (at __d2_bnF%d 'c)) (max (at __d2_bnF%d 'c))))",
+                 d2_keys[ki], d2_keys[ki], ki, ki, ki, ki, ki, d2_keys[ki], ki, d2_keys[ki], ki, ki, ki);
+        ray_t* v = ray_eval_str(q);
+        TEST_ASSERT_NOT_NULL(v); TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        TEST_ASSERT_EQ_I(ray_len(v), 3);
+        ray_t* a0 = ray_list_get(v, 0); ray_t* a1 = ray_list_get(v, 1); ray_t* a2 = ray_list_get(v, 2);
+        TEST_ASSERT_NOT_NULL(a0); TEST_ASSERT_NOT_NULL(a1); TEST_ASSERT_NOT_NULL(a2);
+        all[ki] = a0->i64; cmin[ki] = a1->i64; cmax[ki] = a2->i64;
+        ray_release(v);
+        TEST_ASSERT_TRUE(all[ki] > 300);
+        TEST_ASSERT_TRUE(cmin[ki] > 1);          /* every key passes a cut of 1 */
+        TEST_ASSERT_TRUE(cmax[ki] > 900);
+    }
+
+    /* the first failing line, reported once the seams are reset */
+    int bad = 0;
+    #define D2_CHECK(x) do { if (!(x) && !bad) bad = __LINE__; } while (0)
+    static const char* const tabs[] = { "__d2_F", "__d2_T" };
+    int64_t k = -1, st[5];
+    for (int bits = 0; bits <= 2 && !bad; bits += 2) {
+        ray_derived_key_hash_bits_set_for_test(bits);   /* full hash, then four hash values */
+        for (int ki = 0; ki < 3 && !bad; ki++) {
+            for (int ti = 0; ti < 2 && !bad; ti++) {
+                /* some keys pass */
+                D2_CHECK(d2_case(tabs[ti], ki, NULL, 900, &k));
+                D2_CHECK(k > 0 && k < all[ki]);
+                ray_derived_key_two_pass_stats_for_test(st);
+                if (bits) {
+                    /* the buckets merged keys: a group per key under them, most cut */
+                    D2_CHECK(st[2] > 0 && st[2] <= 4);
+                    D2_CHECK(st[3] > 0);
+                    D2_CHECK(k < st[2] + st[3]);
+                }
+                D2_CHECK(d2_case(tabs[ti], ki, "(!= ref \"\")", 900, &k));
+                D2_CHECK(k > 0 && k < all[ki]);
+                /* every key passes */
+                D2_CHECK(d2_case(tabs[ti], ki, NULL, 1, &k));
+                D2_CHECK(k == all[ki]);
+                /* no key passes; under two bits every bucket still does */
+                D2_CHECK(d2_case(tabs[ti], ki, NULL, cmax[ki], &k));
+                D2_CHECK(k == 0);
+                ray_derived_key_two_pass_stats_for_test(st);
+                if (bits) D2_CHECK(st[2] > 0);
+            }
+        }
+    }
+    if (!bad) {
+        ray_derived_key_chunk_set_for_test(7);   /* and many chunks */
+        for (int ki = 0; ki < 3 && !bad; ki++) {
+            D2_CHECK(d2_case("__d2_F", ki, NULL, 900, &k));
+            D2_CHECK(k > 0 && k < all[ki]);
+            D2_CHECK(d2_case("__d2_T", ki, "(!= ref \"\")", 900, &k));
+        }
+    }
+    #undef D2_CHECK
+    ray_derived_key_chunk_set_for_test(0);
+    ray_derived_key_hash_bits_set_for_test(0);
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_d2/\")"));
+    ray_release(cleanup);
+    if (bad) FAILF("check at line %d failed", bad);
+    PASS();
+}
+
 static test_result_t test_builtin_group_empty_and_list(void) {
     /* Empty group */
     ASSERT_EQ("(count (key (group [])))", "0");
@@ -10469,6 +10838,11 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/group_guid_rfl",      test_builtin_group_guid_rfl,      lang_setup, lang_teardown },
     { "lang/builtin/group_empty_list",    test_builtin_group_empty_and_list, lang_setup, lang_teardown },
     { "lang/select/derived_key_file_chunks", test_select_derived_key_file_chunks, lang_setup, lang_teardown },
+    { "lang/select/derived_key_hash_collisions", test_select_derived_key_hash_collisions, lang_setup, lang_teardown },
+    { "lang/select/derived_key_where_on_values", test_select_derived_key_where_on_values, lang_setup, lang_teardown },
+    { "lang/select/derived_key_two_pass_empty_keys", test_select_derived_key_two_pass_empty_keys, lang_setup, lang_teardown },
+    { "lang/select/derived_key_two_pass", test_select_derived_key_two_pass, lang_setup, lang_teardown },
+    { "lang/select/derived_key_gen2_no_decode", test_select_derived_key_gen2_no_decode, lang_setup, lang_teardown },
     { "lang/select/releases_input_table",  test_select_releases_input_table,  lang_setup, lang_teardown },
     { "lang/temporal/extract_builtins_fn",      test_temporal_extract_builtins_fn,      lang_setup, lang_teardown },
     { "lang/temporal/extract_time_atom",        test_temporal_extract_time_atom,        lang_setup, lang_teardown },

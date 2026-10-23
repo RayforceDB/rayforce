@@ -137,7 +137,7 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
 /* Raw vocabulary access for a FILE domain: the bytes of the entries the
  * file holds, read straight from the mapping — no atom, no lock.  Pin
  * takes an atomically published snapshot of (map, block table, count); an
- * entry is found from the checkpoint of its block of 1 << RAY_SYM_INDEX_LOG
+ * entry is found from the checkpoint of its block of RAY_SYM_INDEX_STRIDE
  * entries, once that block is known to match the file (domain.c: a block
  * is checked on its first read, and the table replaced if it does not
  * check).
@@ -160,12 +160,16 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
  * returns NULL (and *len 0) for a position out of range, or when the file
  * is corrupt there — then ray_sym_domain_corruptions grows, and the
  * evaluation reports `corrupt`.  Unpin is a no-op kept for symmetry. */
-#define RAY_SYM_INDEX_LOG 5   /* a block: 1 << this entries */
+#define RAY_SYM_INDEX_STRIDE 28   /* entries in a block of the index: 64 bytes with its offset */
+typedef struct {
+    uint64_t off;                          /* byte offset of the block's first record */
+    uint16_t len[RAY_SYM_INDEX_STRIDE];    /* the entries' string lengths, 65535 = 65535 or longer */
+} ray_sym_ixblk_t;
+_Static_assert(sizeof(ray_sym_ixblk_t) == 64, "an index block is one cache line");
 typedef struct {
     const unsigned char* map;
-    const uint64_t*      ckpt;   /* block k starts at map + ckpt[k] */
+    const ray_sym_ixblk_t* ib;   /* block k: starts at map + ib[k].off; NULL: none */
     const uint64_t*      ok;     /* bit k: block k checked (read atomically) */
-    const unsigned char* len;    /* entry i's length, 255 = 255 or longer (or NULL) */
     const _Atomic(bool)* corrupt; /* the domain's: lengths are then of read records only */
     int64_t              count;
     void*                blk;    /* the domain's block table */
@@ -177,20 +181,20 @@ const char* ray_sym_domain_raw_str_slow(const ray_sym_domain_raw_t* r, int64_t p
 int64_t ray_sym_domain_raw_len_slow(const ray_sym_domain_raw_t* r, int64_t pos);
 static inline const char* ray_sym_domain_raw_str(const ray_sym_domain_raw_t* r,
                                                  int64_t pos, size_t* len) {
-    if (pos >= 0 && pos < r->count && r->len) {
-        int64_t k = pos >> RAY_SYM_INDEX_LOG;
+    if (pos >= 0 && pos < r->count && r->ib) {
+        int64_t k = pos / RAY_SYM_INDEX_STRIDE;
         if ((__atomic_load_n(&r->ok[k >> 6], __ATOMIC_ACQUIRE) >> (k & 63)) & 1) {
             /* a checked block: past the records before the entry by their
              * lengths; the entry's record must say the length its byte does */
-            const unsigned char* p = r->map + r->ckpt[k];
-            for (int64_t i = pos & ~(int64_t)((1 << RAY_SYM_INDEX_LOG) - 1); i < pos; i++) {
-                uint32_t l = r->len[i];
-                if (l == 255) memcpy(&l, p, 4);
+            const unsigned char* p = r->map + r->ib[k].off;
+            for (int64_t i = k * RAY_SYM_INDEX_STRIDE; i < pos; i++) {
+                uint32_t l = r->ib[k].len[i - k * RAY_SYM_INDEX_STRIDE];
+                if (l == 65535) memcpy(&l, p, 4);
                 p += 4 + (size_t)l;
             }
             uint32_t l; memcpy(&l, p, 4);
-            unsigned char e = r->len[pos];
-            if (e < 255 ? l == e : l >= 255) {
+            uint16_t e = r->ib[k].len[pos - k * RAY_SYM_INDEX_STRIDE];
+            if (e < 65535 ? l == e : l >= 65535) {
                 *len = l;
                 return (const char*)p + 4;
             }
@@ -199,26 +203,26 @@ static inline const char* ray_sym_domain_raw_str(const ray_sym_domain_raw_t* r,
     return ray_sym_domain_raw_str_slow(r, pos, len);
 }
 /* The length of entry `pos`'s string (-1 where ray_sym_domain_raw_str would
- * give NULL): from its length byte, without reading the record, unless the
- * string is 255 bytes or longer — then its record header (4 bytes).  For a
+ * give NULL): from its length (2 bytes in the index), without reading the record, unless the
+ * string is 65535 bytes or longer (the escape) — then its record header (4 bytes).  For a
  * function of a string's length per symbol (strlen per code), so that a
  * vocabulary's lengths are read and not its strings.
  *
- * Limit: the length bytes of an index are checked a block at a time, by
+ * Limit: the lengths of an index are checked a block at a time, by
  * their sum against the next checkpoint (and one by one only when a record
  * is read: ray_sym_domain_raw_str).  Errors that cancel out inside a block
- * — one byte too high, another as much too low — pass that check, and this
+ * — one length too high, another as much too low — pass that check, and this
  * then answers the wrong length for both entries without a sign.  It takes
  * an index that does not describe the file it claims to (its identity and
  * the crcs of the file's first records and last block all
  * matching); checking each length against its record would read the
  * records, which is what this is for not doing. */
 static inline int64_t ray_sym_domain_raw_len(const ray_sym_domain_raw_t* r, int64_t pos) {
-    if (pos >= 0 && pos < r->count && r->len) {
-        int64_t k = pos >> RAY_SYM_INDEX_LOG;
+    if (pos >= 0 && pos < r->count && r->ib) {
+        int64_t k = pos / RAY_SYM_INDEX_STRIDE;
         if ((__atomic_load_n(&r->ok[k >> 6], __ATOMIC_ACQUIRE) >> (k & 63)) & 1 &&
-            r->len[pos] < 255 && !atomic_load_explicit(r->corrupt, memory_order_acquire))
-            return r->len[pos];
+            r->ib[k].len[pos - k * RAY_SYM_INDEX_STRIDE] < 65535 && !atomic_load_explicit(r->corrupt, memory_order_acquire))
+            return r->ib[k].len[pos - k * RAY_SYM_INDEX_STRIDE];
     }
     return ray_sym_domain_raw_len_slow(r, pos);
 }
@@ -292,12 +296,12 @@ bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out
 /* The symfile's record index, `<symfile>.ix` (format in domain.c): written
  * by the writers of a symfile so that opening it reads neither the records
  * nor their lengths.  Save: ckpt[k] is the byte offset of the record of
- * entry k << RAY_SYM_INDEX_LOG, n = ceil(count / (1 << RAY_SYM_INDEX_LOG)),
- * lens[i] the length of entry i's string (255: 255 or longer), the first
+ * entry k * RAY_SYM_INDEX_STRIDE, n = ceil(count / RAY_SYM_INDEX_STRIDE),
+ * lens[i] the length of entry i's string (65535: 65535 or longer), the first
  * `count` records ending at byte `end`; best effort, and a no-op for a small
  * file.  Remove: before a new file is made under the name. */
 void ray_sym_domain_index_save(const char* path, const uint64_t* ckpt, int64_t n,
-                               const uint8_t* lens, int64_t count, uint64_t end);
+                               const uint16_t* lens, int64_t count, uint64_t end);
 void ray_sym_domain_index_remove(const char* path);
 
 /* Position of `str` in the domain, or -1 if absent.

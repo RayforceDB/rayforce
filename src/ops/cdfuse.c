@@ -989,6 +989,7 @@ typedef struct {
     const uint32_t* sel_offs;
     const uint16_t* sel_idx;
     int64_t         sel_nsegs;
+    const int64_t*  sel_pre;    /* a row map over the kept rows: rank of each segment's first kept row */
     uint64_t        vmask;
     uint32_t        P, pshift, lo, hi, T, T_c;
     int64_t         S;          /* rows per phase-A task */
@@ -1288,7 +1289,7 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
             }
             const int64_t* gb;
             if (c->row_gid) {
-                gb = c->row_gid + m0;
+                gb = c->sel_pre ? c->row_gid + c->sel_pre[m0 / RAY_MORSEL_ELEMS] : c->row_gid + m0;
             } else {
                 cdb_decode(&c->key, &ksi, m0, mn, kbuf);
                 for (int64_t i = 0; i < mn; i++) {
@@ -1301,7 +1302,7 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
             cdb_decode(&c->val, &xsi, m0, mn, xbuf);
             for (int64_t j = 0; j < ni; j++) {
                 int64_t i = idx ? idx[j] : j;
-                uint64_t g = (uint64_t)gb[i];
+                uint64_t g = (uint64_t)(c->sel_pre ? gb[j] : gb[i]);
                 if (g >= ng) continue;             /* no group (negative too) */
                 g++;
                 int64_t x = (int64_t)((uint64_t)xbuf[i] & vmask);
@@ -1683,7 +1684,7 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
     /* The record buffer and the staging (18 B a row of a task, T and W
      * tasks' worth) within a quarter of the budget: shorter tasks, then
      * fewer of them, down to one a worker. */
-    int64_t budget_cap = (int64_t)((double)nrows * (n_groups <= 50000 ? 16.0 : 24.0));
+    int64_t budget_cap = (int64_t)((double)(sel ? ray_rowsel_meta(sel)->total_pass : nrows) * (n_groups <= 50000 ? 16.0 : 24.0));
     int64_t budget = cdb_budget(budget_cap);
     int64_t S = CDB_TASK_ROWS;
     while ((int64_t)(T + W) * S * 18 > budget / 4 && S > CDB_TASK_ROWS_MIN) S /= 2;
@@ -1700,7 +1701,7 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
     c.S = S;
     c.var = (c.val.narrow ? 2 : 0) + (n_groups < 65535 ? 1 : 0);
     size_t sb = (c.val.narrow ? 4 : 8) + (n_groups < 65535 ? 2 : 4);   /* bytes a slot */
-    if (sel && !row_gid) {
+    if (sel) {
         ray_rowsel_t* sm = ray_rowsel_meta(sel);
         c.sel_flg = ray_rowsel_flags(sel);
         c.sel_offs = ray_rowsel_offsets(sel);
@@ -1712,6 +1713,7 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
     ray_t* err = NULL;
     void *khdr = NULL;
     uint32_t* plist = NULL;
+    int64_t* selpre = NULL;
     uint64_t kcap = 16;
     if (!row_gid) while (kcap < (uint64_t)n_groups * 2) kcap <<= 1;
     bool cnt_shared = (int64_t)W * n_groups > CDB_LOCAL_CNT;
@@ -1731,6 +1733,23 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
         goto done;
     }
     c.plist = plist;
+    if (row_gid && c.sel_flg) {
+        /* a row map over the kept rows: rank of the first kept row of each segment */
+        selpre = (int64_t*)ray_alloc_raw((size_t)(c.sel_nsegs + 1) * sizeof(int64_t));
+        if (!selpre) { err = ray_error("oom", NULL); goto done; }
+        int64_t run = 0;
+        for (int64_t s = 0; s < c.sel_nsegs; s++) {
+            selpre[s] = run;
+            if (c.sel_flg[s] == RAY_SEL_ALL) {
+                int64_t lo = s * RAY_MORSEL_ELEMS;
+                run += nrows - lo < RAY_MORSEL_ELEMS ? nrows - lo : RAY_MORSEL_ELEMS;
+            } else if (c.sel_flg[s] != RAY_SEL_NONE) {
+                run += c.sel_offs[s + 1] - c.sel_offs[s];
+            }
+        }
+        selpre[c.sel_nsegs] = run;
+        c.sel_pre = selpre;
+    }
     if (!row_gid) {
         int64_t* kk = (int64_t*)khdr;
         uint32_t* kt = (uint32_t*)(kk + kcap);
@@ -1906,6 +1925,7 @@ done:
     ray_free_raw(c.toff);
     ray_free_raw(c.cnt);
     ray_free_raw(plist);
+    ray_free_raw(selpre);
     ray_free_raw(khdr);
     cdb_col_close(&c.key);
     cdb_col_close(&c.val);

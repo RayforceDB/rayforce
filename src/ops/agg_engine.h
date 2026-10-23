@@ -131,6 +131,8 @@ typedef struct {
     uint64_t radix_compacted;       /* ...partitions reduced to their top-N candidates */
     uint64_t radix_spill_bytes;     /* ...bytes written to (and read back from) its spill file */
     uint64_t radix_spill_buf;       /* ...bytes of its write and read-back buffers */
+    bool dense_count32;             /* last shared dense run: the slab held u32 counters (count only) */
+    uint64_t dense_emit_slots;      /* last dense finish: slot entries its emit allocated */
     uint8_t radix_phase1;           /* last radix run's phase 1: AGG_RADIX_P1_* */
 } agg_route_stats_t;
 /* Phase 1 of a radix run: plain or staged two passes, the fused pass
@@ -146,6 +148,9 @@ void agg_route_reason(agg_v2_reason_t reason);
  * small hash (their allocation-failure fallback) in place of the table
  * stack and the radix scatter.  Disarmed by ray_test_hooks_off. */
 void agg_test_force_smallhash(bool on);
+/* Test hook: a plan wider than the row count is dropped, so the grouping
+ * takes the radix / table-stack routes.  Disarmed by ray_test_hooks_off. */
+void agg_test_no_wide_dense(bool on);
 /* Test hook: dense plans over a selection that the row probe proved
  * impossible (agg_sel_bounds_impossible) since process start. */
 uint64_t ray_agg_test_sel_probe_hits(void);
@@ -266,6 +271,7 @@ typedef struct {
     int32_t* remap[16];
     int64_t* inverse[16];
     bool     compacted;     /* any remap set: hot loops select the remap form once */
+    bool     wide;          /* one key whose range exceeds the row count: only the shared strategy may run it (agg_dense_wide_slots) */
 } dense_plan_t;
 
 /* Release a plan's compaction tables (no-op for raw-range plans). */

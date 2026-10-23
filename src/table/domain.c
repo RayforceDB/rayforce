@@ -162,36 +162,38 @@ typedef struct dom_retired_map_s {
  *
  * A symfile's records are variable-length, so finding entry `pos` needs the
  * byte offset of a record at or before it.  The domain keeps a block table:
- * for every block of DOM_IX_STRIDE entries the offset of its first record (a
- * checkpoint), and for every entry the length of its string in one byte
- * (255: 255 or longer, the record's own u32 then says).  Entry j of a block
- * is found from the checkpoint by adding up the records before it — from the
- * lengths, a 255 one from its record header — so a lookup reads the record
- * it wants and nothing before it, and a string's length needs no record at
- * all unless it is 255 or longer (ray_sym_domain_raw_len).
+ * blocks of DOM_IX_STRIDE (28) entries, each one cache line (64 bytes): the
+ * offset of its first record (a checkpoint) and the length of each entry's
+ * string in two bytes (65535: 65535 or longer, the record's own u32 then
+ * says).  Entry j of block pos / 28 is found from the checkpoint by adding up
+ * the records before it — from the lengths, a 65535 one from its record
+ * header — so a lookup touches one cache line of the table and reads the
+ * record it wants and nothing before it, and a string's length needs no
+ * record at all unless it is 65535 or longer (ray_sym_domain_raw_len).
  *
  * The table is persisted next to the symfile, in `<symfile>.ix`, so that
- * opening a domain reads neither the records nor the table: only the 80-byte
- * header; the checkpoints (8 bytes per block) and the lengths are mapped and
- * paged in as entries are read.  An index is used only for the very file it
- * was written for: the inode, the modification and status-change times and
- * the size it records match the mapped file's, its header checks, and two
- * crcs of the file itself match — of its first records and of its last
- * block.  Anything else (another file of the name, the file grown or
- * rewritten by a writer that left the index as it was, an earlier format)
- * is not used: the open walks every record once, reading the file in large
- * explicit reads (dom_src_t), and writes the index anew.  A block of an index
- * is checked on its first read: its lengths, those of 255 from the
- * records, add up from its checkpoint to the next; and every read of an entry checks that the
- * record says the length the index says.  A block that does not check means
- * the file is not what the index describes: the domain walks all records as
- * an open without an index does and goes on with that table; if the walk
- * fails the file is corrupt, and every read of an entry it cannot reach says
- * so (ray_sym_domain_corruptions).
+ * opening a domain reads neither the records nor the table: only the 128-byte
+ * header; the blocks are mapped and paged in as entries are read.  An index
+ * is used only for the very file it was written for: the inode, the
+ * modification and status-change times and the size it records match the
+ * mapped file's, its header checks, and two crcs of the file itself match —
+ * of its first records and of its last block.  Anything else (another file
+ * of the name, the file grown or rewritten by a writer that left the index
+ * as it was, an earlier format) is not used: the open walks every record
+ * once, reading the file in large explicit reads (dom_src_t), and writes the
+ * index anew.  A block of an index is checked on its first read: its
+ * lengths, those of 65535 from their record headers, add up from its
+ * checkpoint to the next block's (the last block's to the records' end);
+ * and every read of an entry checks that the record says the length the
+ * index says.  A block that does not check means the file is not what the
+ * index describes: the domain walks all records as an open without an index
+ * does and goes on with that table; if the walk fails the file is corrupt,
+ * and every read of an entry it cannot reach says so
+ * (ray_sym_domain_corruptions).
  *
  * The index file (all integers little-endian):
  *
- *   0  u32 "STRX"   4 u32 version   8 u32 log2(stride)   12 u32 crc32 of [16, 80)
+ *   0  u32 "STRX"   4 u32 version   8 u32 stride (28)   12 u32 crc32 of [16, 128)
  *  16  i64 count: entries covered   24 u64 end: byte offset past their records
  *  32  u64 inode, 40 u64 stamp of the modification and status-change times
  *      of the file it was written for
@@ -199,43 +201,42 @@ typedef struct dom_retired_map_s {
  *  56  u32 crc32 of the file's bytes [ckpt[n - 1], end): the last block
  *  60  u32 crc32 of the file's bytes [12, min(end, 12 + 4 KiB)): its first records
  *  64  u32 0                              68 u32 0
- *  72  u64 cap: checkpoint slots; the lengths start at 80 + 8 * cap
- *  80  n u64 checkpoints, n = ceil(count / stride), then zeros up to cap
- *  80 + 8 * cap: count u8 lengths
+ *  72  u64 cap: block slots               80 .. 127: zeros
+ * 128  n blocks of 64 bytes, n = ceil(count / 28), then zeros up to cap:
+ *      u64 offset of the block's first record, then 28 u16 lengths (those
+ *      past `count` in the last block: 0)
  *
- * No crc covers the checkpoints or the lengths: the open does not read them.
- * They are checked a block at a time on first read (the block's checkpoint
- * and the next one, and its lengths, must account for exactly the records
- * between them), and record by record, as above.  The symfile is append-only,
- * and so are both sections: a writer that appended records writes the
- * checkpoints of the blocks they open into the reserved slots and their lengths at the end,
- * then the header — the cost of what it appended — and writes the index
- * whole (tmp + rename, with room for more blocks) when the slots run out or
- * the index on disk is not the one it last read or wrote.  It is a cache,
- * never the only copy of anything: never synced. */
-#define DOM_IX_LOG     RAY_SYM_INDEX_LOG
-#define DOM_IX_STRIDE  ((int64_t)1 << DOM_IX_LOG)
+ * No crc covers the blocks: the open does not read them.  They are checked
+ * a block at a time on first read (the block's checkpoint and the next one,
+ * and its lengths, must account for exactly the records between them), and
+ * record by record, as above.  The symfile is append-only, and so is the
+ * block array: a writer that appended records writes the block the old
+ * entries ended in and the blocks they open into the reserved slots, then
+ * the header — the cost of what it appended — and writes the index whole
+ * (tmp + rename, with room for more blocks) when the slots run out or the
+ * index on disk is not the one it last read or wrote.  It is a cache, never
+ * the only copy of anything: never synced. */
+#define DOM_IX_STRIDE  ((int64_t)RAY_SYM_INDEX_STRIDE)
+typedef ray_sym_ixblk_t dom_ixb_t;
 #define DOM_IX_MAGIC   0x58525453U   /* "STRX" */
-#define DOM_IX_VERSION 4u
-#define DOM_IX_HDR     80
+#define DOM_IX_VERSION 5u
+#define DOM_IX_HDR     128           /* the blocks start on a cache line */
 #define DOM_IX_HEAD    4096          /* the first records' crc covers this many bytes */
-#define DOM_LEN_LONG   255           /* a length byte of 255: 255 or longer */
+#define DOM_LEN_LONG   65535         /* a length of 65535: the escape, 65535 or longer, its record header says */
 
 /* The block table of an image of `count` entries whose records end at
  * `end`; one allocation.  ok[k >> 6] bit k: block k checked, read and set
  * atomically (lock-free readers check blocks too).  `len`: the entries'
- * length bytes — this allocation's own (a walk), or the mapped index file
+ * lengths — this allocation's own (a walk), or the mapped index file
  * (the domain keeps the mapping until it dies).  `stale`: replaced after a
  * block failed its check — a reader holding it asks the domain. */
 typedef struct dom_blk_s {
     int64_t        n;
     int64_t        count;
     uint64_t       end;
-    const uint64_t* ckpt;      /* block k starts at map + ckpt[k] */
-    uint64_t*      own_ck;     /* ckpt, when this allocation holds it (a walk) */
+    const dom_ixb_t* ib;       /* block k: starts at map + ib[k].off, its entries' lengths */
+    dom_ixb_t*     own_ib;     /* ib, when this allocation holds it (a walk) */
     uint64_t       last_ckpt;  /* where the index says the last block starts */
-    const uint8_t* len;
-    uint8_t*       own_len;
     uint64_t*      ok;
     _Atomic(bool)  stale;
 } dom_blk_t;
@@ -606,32 +607,30 @@ static void dom_ck_free(dom_ck_t* ck) {
 }
 
 static inline int64_t dom_ck_count(int64_t entries) {
-    return (entries + DOM_IX_STRIDE - 1) >> DOM_IX_LOG;
+    return (entries + DOM_IX_STRIDE - 1) / DOM_IX_STRIDE;
 }
 
 static inline uint32_t dom_rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline uint64_t dom_rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
 /* A block table for `count` entries, nothing checked yet; with room for
- * its own checkpoints and length bytes when `own` (else both are the index
+ * its own checkpoints and lengths when `own` (else both are the index
  * file's, set by the caller).  NULL on OOM. */
 static dom_blk_t* dom_blk_new(int64_t count, bool own) {
     int64_t n = dom_ck_count(count), w = (n + 63) >> 6;
     size_t head = (sizeof(dom_blk_t) + 7) & ~(size_t)7;
-    size_t ckb = own ? (size_t)n * 8 : 0;
-    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ckb + (size_t)w * 8 +
-                                             (own ? (size_t)count : 0));
+    size_t ibb = own ? (size_t)n * sizeof(dom_ixb_t) : 0;
+    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ibb + (size_t)w * 8);
     if (!b) return NULL;
     uint8_t* p = (uint8_t*)b + head;
     b->n = n;
     b->count = count;
     b->end = 0;
-    b->own_ck = own ? (uint64_t*)p : NULL;
-    b->ckpt = b->own_ck;
-    b->ok = (uint64_t*)(p + ckb);
-    b->own_len = own ? p + ckb + (size_t)w * 8 : NULL;
-    b->len = b->own_len;
+    b->own_ib = own ? (dom_ixb_t*)p : NULL;
+    b->ib = b->own_ib;
+    b->ok = (uint64_t*)(p + ibb);
     memset(b->ok, 0, (size_t)w * 8);
+    if (own) memset(b->own_ib, 0, ibb);   /* unused lengths of the last block: 0 */
     atomic_init(&b->stale, false);
     return b;
 }
@@ -643,7 +642,7 @@ static inline void dom_blk_set_ok(dom_blk_t* b, int64_t k) {
     __atomic_fetch_or(&b->ok[k >> 6], (uint64_t)1 << (k & 63), __ATOMIC_RELEASE);
 }
 static inline uint64_t dom_blk_lim(const dom_blk_t* b, int64_t k) {
-    return k + 1 < b->n ? b->ckpt[k + 1] : b->end;
+    return k + 1 < b->n ? b->ib[k + 1].off : b->end;
 }
 
 /* Where a walk or a check reads the records: the mapping, or the file read
@@ -750,92 +749,68 @@ static const uint8_t* dom_src_get(dom_src_t* s, uint64_t off, uint64_t len) {
 
 /* Walk entries [from, b->count) of the image, the first at byte *off: the
  * checkpoint of every block that starts on the way and, into the table's own
- * length bytes, the length of every entry; each block it completes is
+ * lengths, the length of every entry; each block it completes is
  * checked (its records were just read).  False when a record runs past the
  * image. */
 static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t* off) {
     uint64_t size = src->size, o = *off;
     for (int64_t i = from; i < b->count; i++) {
-        int64_t k = i >> DOM_IX_LOG;
-        if (!(i & (DOM_IX_STRIDE - 1))) b->own_ck[k] = o;
+        int64_t k = i / DOM_IX_STRIDE, j = i % DOM_IX_STRIDE;
+        if (!j) b->own_ib[k].off = o;
         const uint8_t* h = dom_src_get(src, o, 4);
         if (!h) return false;
         uint32_t l = dom_rd32(h);
         o += 4;
         if ((uint64_t)l > size - o) return false;
         o += l;
-        if (b->own_len) b->own_len[i] = l < DOM_LEN_LONG ? (uint8_t)l : (uint8_t)DOM_LEN_LONG;
-        if ((i & (DOM_IX_STRIDE - 1)) == DOM_IX_STRIDE - 1 || i + 1 == b->count)
+        b->own_ib[k].len[j] = l < DOM_LEN_LONG ? (uint16_t)l : (uint16_t)DOM_LEN_LONG;
+        if (j == DOM_IX_STRIDE - 1 || i + 1 == b->count)
             dom_blk_set_ok(b, k);
     }
     *off = (size_t)o;
     return true;
 }
 
-/* The records of entries [from, to), the first at byte `off`, end exactly
- * at `end` of a `size`-byte image. */
-static bool dom_lands(const uint8_t* map, size_t size, uint64_t off,
-                      int64_t from, int64_t to, uint64_t end) {
-    if (end > size) return false;
-    for (int64_t i = from; i < to; i++) {
-        if (off > end || end - off < 4) return false;
-        uint32_t l = dom_rd32(map + off);
-        off += 4;
-        if ((uint64_t)l > end - off) return false;
-        off += l;
-    }
-    return off == end;
-}
-
 /* Check block k of a table taken from an index: its records, by their
- * length bytes, end exactly where the next block starts (or at the end of
+ * lengths, end exactly where the next block starts (or at the end of
  * the records).  The only bytes of the file it reads are the record headers
- * of the entries whose length byte is 255.  Lock-free. */
+ * of the entries whose length is the escape (65535).  Lock-free. */
 static bool dom_blk_check(const uint8_t* map, dom_blk_t* b, int64_t k) {
     /* a walked table's blocks were checked as walked: one not ok is past
      * where the walk stopped */
-    if (b->own_len) return false;
-    uint64_t at = b->ckpt[k], lim = dom_blk_lim(b, k);
-    int64_t i0 = k << DOM_IX_LOG, i1 = i0 + DOM_IX_STRIDE;
-    if (i1 > b->count) i1 = b->count;
+    if (b->own_ib) return false;
+    uint64_t at = b->ib[k].off, lim = dom_blk_lim(b, k);
+    int64_t n = b->count - k * DOM_IX_STRIDE;
+    if (n > DOM_IX_STRIDE) n = DOM_IX_STRIDE;
     if ((k == 0 && at != 12) || (k == b->n - 1 && at != b->last_ckpt)) return false;
     if (at > lim || lim > b->end) return false;
-    if (!b->len) {
-        if (!dom_lands(map, (size_t)b->end, at, i0, i1, lim)) return false;
-    } else {
-        for (int64_t i = i0; i < i1; i++) {
-            if (lim - at < 4) return false;
-            uint64_t l = b->len[i];
-            if (l == DOM_LEN_LONG && (l = dom_rd32(map + at)) < DOM_LEN_LONG) return false;
-            at += 4;
-            if (l > lim - at) return false;
-            at += l;
-        }
-        if (at != lim) return false;
+    for (int64_t j = 0; j < n; j++) {
+        if (lim - at < 4) return false;
+        uint64_t l = b->ib[k].len[j];
+        if (l == DOM_LEN_LONG && (l = dom_rd32(map + at)) < DOM_LEN_LONG) return false;
+        at += 4;
+        if (l > lim - at) return false;
+        at += l;
     }
+    if (at != lim) return false;
     dom_blk_set_ok(b, k);
     return true;
 }
 
 /* Entry `pos` of a checked block: from the block's checkpoint past the
- * records before it, by their length bytes (a 255 one by its header).  NULL
- * when the entry's record does not say the length its byte does: the table
+ * records before it, by their lengths (a 65535 one by its header).  NULL
+ * when the entry's record does not say the length its entry does: the table
  * does not describe the file. */
 static inline const uint8_t* dom_blk_entry(const uint8_t* map, const dom_blk_t* b,
                                            int64_t pos, uint32_t* len) {
-    const uint8_t* p = map + b->ckpt[pos >> DOM_IX_LOG];
-    int64_t i = pos & ~(DOM_IX_STRIDE - 1);
-    if (!b->len) {
-        for (; i < pos; i++) p += 4 + (size_t)dom_rd32(p);
-        *len = dom_rd32(p);
-        return p + 4;
-    }
-    for (; i < pos; i++) {
-        uint8_t l = b->len[i];
+    int64_t k = pos / DOM_IX_STRIDE, j = pos % DOM_IX_STRIDE;
+    const uint8_t* p = map + b->ib[k].off;
+    for (int64_t i = 0; i < j; i++) {
+        uint16_t l = b->ib[k].len[i];
         p += 4 + (l < DOM_LEN_LONG ? (size_t)l : (size_t)dom_rd32(p));
     }
     uint32_t l = dom_rd32(p);
-    uint8_t e = b->len[pos];
+    uint16_t e = b->ib[k].len[j];
     if (e < DOM_LEN_LONG ? l != e : l < DOM_LEN_LONG) return NULL;
     *len = l;
     return p + 4;
@@ -879,10 +854,8 @@ static inline bool dom_is_corrupt(ray_sym_domain_t* d) {
     return atomic_load_explicit(&d->corrupt, memory_order_acquire);
 }
 
-static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
-                        const uint64_t* ck, int64_t n, const uint8_t* la, int64_t na,
-                        const uint8_t* lb, int64_t count, uint64_t end,
-                        const ray_file_id_t* id);
+static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
+                         const dom_blk_t* b, const ray_file_id_t* id);
 static size_t dom_ix_min(void);
 
 /* Block k of the current table checked (once; counted). */
@@ -925,8 +898,7 @@ static dom_blk_t* dom_rescue_locked(ray_sym_domain_t* d, dom_blk_t* failed) {
     (void)dom_retire(d, failed);   /* lock-free readers may hold it */
     atomic_fetch_add_explicit(&d->ix_rescued, 1, memory_order_relaxed);
     if (d->path && d->map_size >= dom_ix_min()) {
-        dom_ix_save(d->path, map, d->map_size, nb->ckpt, nb->n, nb->own_len, nb->count, NULL,
-                    nb->count, nb->end, &d->map_id);
+        dom_blk_save(d->path, map, d->map_size, nb, &d->map_id);
         d->ix_count = nb->count;
         d->ix_end = nb->end;
     } else if (d->path) {
@@ -943,7 +915,7 @@ static const uint8_t* dom_entry_locked(ray_sym_domain_t* d, int64_t pos, uint32_
     if (pos < 0 || pos >= d->base_count || !d->blk) return NULL;
     const uint8_t* map = (const uint8_t*)d->map;
     dom_blk_t* b = d->blk;
-    const uint8_t* p = dom_blk_checked(d, b, pos >> DOM_IX_LOG) ? dom_blk_entry(map, b, pos, len)
+    const uint8_t* p = dom_blk_checked(d, b, pos / DOM_IX_STRIDE) ? dom_blk_entry(map, b, pos, len)
                                                               : NULL;
     if (!p) {
         b = dom_rescue_locked(d, b);
@@ -968,7 +940,7 @@ static bool dom_next_locked(ray_sym_domain_t* d, int64_t pos, size_t* off,
          * so the comparison below would pass over records that are not */
         if (dom_is_corrupt(d)) { dom_corrupt_hit(d); return false; }
         size_t o = *off;
-        if (!(pos & (DOM_IX_STRIDE - 1)) && d->blk->ckpt[pos >> DOM_IX_LOG] != o &&
+        if (!(pos % DOM_IX_STRIDE) && d->blk->ib[pos / DOM_IX_STRIDE].off != o &&
             !dom_rescue_locked(d, d->blk)) {
             dom_corrupt_hit(d);
             return false;
@@ -1101,16 +1073,16 @@ typedef struct {
     uint64_t last_ckpt;   /* checkpoint of the last block */
     uint32_t last_crc;    /* crc32 of the file's last block */
     uint32_t head_crc;    /* crc32 of the file's first records */
-    uint64_t cap;         /* checkpoint slots */
+    uint64_t cap;         /* block slots */
 } dom_ixh_t;
 
-static inline uint64_t dom_ix_len_off(uint64_t cap) { return DOM_IX_HDR + 8 * cap; }
+
 
 static void dom_ixh_put(uint8_t* h, const dom_ixh_t* x) {
     memset(h, 0, DOM_IX_HDR);
     uint32_t w = DOM_IX_MAGIC;   memcpy(h, &w, 4);
     w = DOM_IX_VERSION;          memcpy(h + 4, &w, 4);
-    w = DOM_IX_LOG;              memcpy(h + 8, &w, 4);
+    w = (uint32_t)DOM_IX_STRIDE; memcpy(h + 8, &w, 4);
     memcpy(h + 16, &x->count, 8);
     memcpy(h + 24, &x->end, 8);
     memcpy(h + 32, &x->ino, 8);
@@ -1125,7 +1097,7 @@ static void dom_ixh_put(uint8_t* h, const dom_ixh_t* x) {
 
 static bool dom_ixh_get(const uint8_t* h, dom_ixh_t* x) {
     if (dom_rd32(h) != DOM_IX_MAGIC || dom_rd32(h + 4) != DOM_IX_VERSION ||
-        dom_rd32(h + 8) != DOM_IX_LOG || dom_rd32(h + 12) != ray_crc32(0, h + 16, DOM_IX_HDR - 16))
+        dom_rd32(h + 8) != (uint32_t)DOM_IX_STRIDE || dom_rd32(h + 12) != ray_crc32(0, h + 16, DOM_IX_HDR - 16))
         return false;
     memcpy(&x->count, h + 16, 8);
     x->end = dom_rd64(h + 24);
@@ -1161,7 +1133,7 @@ static void dom_keep_map(ray_sym_domain_t* d, void* m, size_t sz) {
 
 /* The index of symfile `path` for its mapped image (`size` bytes, `count`
  * entries per its header, identity `id`): a block table pointing at its
- * checkpoints and its length bytes in the index file, mapped (*ixmap /
+ * checkpoints and its lengths in the index file, mapped (*ixmap /
  * *ixsize: for the caller to keep while the table lives).  Taken only when
  * written for this very file — its identity, size and count are the image's
  * — and when it checks: the header, the checkpoint and length sections all
@@ -1193,7 +1165,7 @@ static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size,
     if (b) {
         m = ray_vm_map_file_id(ip, &msz, &iid);
         /* the file mapped is the one read: the same header, every length */
-        ok = m && msz >= dom_ix_len_off(x.cap) + (uint64_t)count &&
+        ok = m && msz >= DOM_IX_HDR + x.cap * sizeof(dom_ixb_t) &&
              memcmp(m, h, DOM_IX_HDR) == 0;
     }
     if (!b || !ok) {
@@ -1202,9 +1174,8 @@ static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size,
         return NULL;
     }
     b->end = size;
-    b->ckpt = (const uint64_t*)((const uint8_t*)m + DOM_IX_HDR);
+    b->ib = (const dom_ixb_t*)((const uint8_t*)m + DOM_IX_HDR);
     b->last_ckpt = x.last_ckpt;
-    b->len = (const uint8_t*)m + dom_ix_len_off(x.cap);
     *ixmap = m;
     *ixsize = msz;
     *hx = x;
@@ -1222,33 +1193,51 @@ static bool dom_write_zeros(FILE* f, uint64_t bytes) {
     return true;
 }
 
-/* The length bytes of entries [from, to): la[i] below na, lb[i - na] from
- * there, written to f. */
-static bool dom_write_lens(FILE* f, const uint8_t* la, int64_t na, const uint8_t* lb,
-                           int64_t from, int64_t to) {
-    if (from < na) {
-        int64_t e = to < na ? to : na;
-        if (fwrite(la + from, 1, (size_t)(e - from), f) != (size_t)(e - from)) return false;
-        from = e;
+/* Where a writer takes the entries' lengths from: those of entries below
+ * `na` from the blocks `pb` (a table's own or mapped ones), the others from
+ * lb[i - na]. */
+typedef struct {
+    const dom_ixb_t* pb;
+    int64_t          na;
+    const uint16_t*  lb;
+} dom_lsrc_t;
+
+static inline uint16_t dom_ls_get(const dom_lsrc_t* s, int64_t i) {
+    return i < s->na ? s->pb[i / DOM_IX_STRIDE].len[i % DOM_IX_STRIDE] : s->lb[i - s->na];
+}
+
+/* Blocks [k0, k1) of an index of `count` entries — checkpoints ck[k], lengths
+ * from ls (0 past the last entry) — written to f. */
+static bool dom_write_blocks(FILE* f, const uint64_t* ck, const dom_lsrc_t* ls, int64_t count,
+                             int64_t k0, int64_t k1) {
+    enum { CHUNK = 64 };
+    dom_ixb_t buf[CHUNK];
+    for (int64_t k = k0; k < k1;) {
+        int64_t c = k1 - k < CHUNK ? k1 - k : CHUNK;
+        memset(buf, 0, sizeof(dom_ixb_t) * (size_t)c);
+        for (int64_t q = 0; q < c; q++) {
+            buf[q].off = ck[k + q];
+            int64_t i0 = (k + q) * DOM_IX_STRIDE;
+            for (int64_t j = 0; j < DOM_IX_STRIDE && i0 + j < count; j++)
+                buf[q].len[j] = dom_ls_get(ls, i0 + j);
+        }
+        if (fwrite(buf, sizeof(dom_ixb_t), (size_t)c, f) != (size_t)c) return false;
+        k += c;
     }
-    if (from < to && fwrite(lb + (from - na), 1, (size_t)(to - from), f) != (size_t)(to - from))
-        return false;
     return true;
 }
 
 /* Write the whole index of symfile `path`, whose `map` holds the records of
  * its first `count` entries, ending at byte `end`, with checkpoints
- * ck[0..n) and the entries' length bytes (la[0..na), then lb: as
- * dom_write_lens); claimed as the index of the file of identity `id` when
- * given (and of the size `end`); with room for a quarter more blocks; to a
- * temporary file renamed over the index.  Best effort: the index is a
- * cache, and a reader checks it before use. */
+ * ck[0..n) and the entries' lengths (ls); claimed as the index of the file
+ * of identity `id` when given (and of the size `end`); with room for a
+ * quarter more blocks; to a temporary file renamed over the index.  Best
+ * effort: the index is a cache, and a reader checks it before use. */
 static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
-                        const uint64_t* ck, int64_t n, const uint8_t* la, int64_t na,
-                        const uint8_t* lb, int64_t count, uint64_t end,
-                        const ray_file_id_t* id) {
+                        const uint64_t* ck, int64_t n, const dom_lsrc_t* ls,
+                        int64_t count, uint64_t end, const ray_file_id_t* id) {
     if (!path || count <= 0 || n != dom_ck_count(count) || end > map_size || ck[0] != 12 ||
-        ck[n - 1] >= end || (na > 0 && !la) || (na < count && !lb))
+        ck[n - 1] >= end || (ls->na > 0 && !ls->pb) || (ls->na < count && !ls->lb))
         return;
     char ip[PATH_MAX], tp[PATH_MAX];
     char sfx[32];
@@ -1271,9 +1260,8 @@ static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
     dom_ix_sweep_tmp(path);
     FILE* f = fopen(tp, "wb");
     bool ok = f && fwrite(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR &&
-              fwrite(ck, 8, (size_t)n, f) == (size_t)n &&
-              dom_write_zeros(f, (x.cap - (uint64_t)n) * 8) &&
-              dom_write_lens(f, la, na, lb, 0, count);
+              dom_write_blocks(f, ck, ls, count, 0, n) &&
+              dom_write_zeros(f, (x.cap - (uint64_t)n) * sizeof(dom_ixb_t));
     if (f && fclose(f) != 0) ok = false;
     if (ok) ok = ray_file_rename(tp, ip) == RAY_OK;
     if (!ok && f) remove(tp);
@@ -1283,16 +1271,14 @@ static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
  * entries, their records ending at `end`; checkpoints ck[0..n), lengths as
  * dom_ix_save's): when the index on disk is the one this process last read
  * or wrote (covering `ix_count` entries ending at `ix_end`) and has slots
- * for the new blocks, their checkpoints go into the slots and the new
- * entries' lengths after the others, then the header — the cost of what
- * was appended; otherwise the index is written whole.  The file is mapped
- * for the crcs of its first records and its last block and for its
- * identity, claimed when `stamp`.  Under the symfile's `.lk` flock.  Best
- * effort. */
+ * for the new blocks, the block the old entries ended in and the new blocks
+ * are written into the slots, then the header — the cost of what was
+ * appended; otherwise the index is written whole.  The file is mapped for
+ * the crcs of its first records and its last block and for its identity,
+ * claimed when `stamp`.  Under the symfile's `.lk` flock.  Best effort. */
 static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
-                           const uint8_t* la, int64_t na, const uint8_t* lb,
-                           int64_t count, uint64_t end, int64_t ix_count, uint64_t ix_end,
-                           bool stamp) {
+                           const dom_lsrc_t* ls, int64_t count, uint64_t end,
+                           int64_t ix_count, uint64_t ix_end, bool stamp) {
     if (end < dom_ix_min() || count <= 0 || n != dom_ck_count(count)) return;
     size_t size = 0;
     ray_file_id_t id;
@@ -1307,7 +1293,7 @@ static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
                x.count == ix_count && x.end == ix_end && x.count <= count &&
                (uint64_t)n <= x.cap && ck[0] == 12 && ck[n - 1] < end;
     if (app) {
-        int64_t n0 = dom_ck_count(x.count);
+        int64_t k0 = dom_ck_count(x.count) - 1;
         x.count = count;
         x.end = end;
         x.ino = x.stamp = 0;
@@ -1315,32 +1301,41 @@ static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
         x.last_ckpt = ck[n - 1];
         x.last_crc = dom_ix_last_crc(map, x.last_ckpt, end);
         x.head_crc = dom_ix_head_crc(map, end);
-        int64_t from = ix_count;
         dom_ixh_put(h, &x);
-        app = (n == n0 || (dom_fseek_ix(f, DOM_IX_HDR + n0 * 8) &&
-                           fwrite(ck + n0, 8, (size_t)(n - n0), f) == (size_t)(n - n0))) &&
-              dom_fseek_ix(f, (int64_t)dom_ix_len_off(x.cap) + from) &&
-              dom_write_lens(f, la, na, lb, from, count) &&
+        app = dom_fseek_ix(f, DOM_IX_HDR + k0 * (int64_t)sizeof(dom_ixb_t)) &&
+              dom_write_blocks(f, ck, ls, count, k0, n) &&
               fflush(f) == 0 && dom_fseek_ix(f, 0) && fwrite(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR;
     }
     if (f && fclose(f) != 0) app = false;
-    if (!app) dom_ix_save(path, map, size, ck, n, la, na, lb, count, end, stamp ? &id : NULL);
+    if (!app) dom_ix_save(path, map, size, ck, n, ls, count, end, stamp ? &id : NULL);
     ray_vm_unmap_file(map, size);
 }
 
 static void dom_ix_save_file(const char* path, const uint64_t* ck, int64_t n,
-                             const uint8_t* lens, int64_t count, uint64_t end) {
+                             const uint16_t* lens, int64_t count, uint64_t end) {
     if (end < dom_ix_min()) return;
     size_t size = 0;
     ray_file_id_t id;
     void* map = ray_vm_map_file_id(path, &size, &id);
     if (!map) return;
-    dom_ix_save(path, (const uint8_t*)map, size, ck, n, lens, count, NULL, count, end, &id);
+    dom_lsrc_t ls = { NULL, 0, lens };
+    dom_ix_save(path, (const uint8_t*)map, size, ck, n, &ls, count, end, &id);
     ray_vm_unmap_file(map, size);
 }
 
+/* The index of the table `b` (its own blocks, from a walk): written whole. */
+static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
+                         const dom_blk_t* b, const ray_file_id_t* id) {
+    uint64_t* ck = (uint64_t*)ray_sys_alloc((size_t)b->n * sizeof(uint64_t));
+    if (!ck) return;
+    for (int64_t k = 0; k < b->n; k++) ck[k] = b->ib[k].off;
+    dom_lsrc_t ls = { b->ib, b->count, NULL };
+    dom_ix_save(path, map, map_size, ck, b->n, &ls, b->count, b->end, id);
+    ray_sys_free(ck);
+}
+
 void ray_sym_domain_index_save(const char* path, const uint64_t* ckpt, int64_t n,
-                               const uint8_t* lens, int64_t count, uint64_t end) {
+                               const uint16_t* lens, int64_t count, uint64_t end) {
     if (path && ckpt && lens) dom_ix_save_file(path, ckpt, n, lens, count, end);
 }
 
@@ -1383,7 +1378,8 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
             memset(b->ok, 0, (size_t)((b->n + 63) >> 6) * 8);
             d->blk = b;
             d->ix_used = false;
-            d->ix_count = d->ix_end = 0;
+            d->ix_count = 0;
+            d->ix_end = 0;
             d->ix_covered = 0;
             atomic_store_explicit(&d->corrupt, true, memory_order_release);
             dom_corrupt_name(d);
@@ -1396,8 +1392,7 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
     d->ix_end = have ? size : 0;
     d->ix_covered = have ? count : 0;
     if (!have && count > 0 && size >= dom_ix_min()) {
-        dom_ix_save(d->path, map, size, b->ckpt, b->n, b->own_len, count, NULL, count, size,
-                    &d->map_id);
+        dom_blk_save(d->path, map, size, b, &d->map_id);
         d->ix_count = count;
         d->ix_end = size;
     } else if (!have && size < dom_ix_min()) {
@@ -1458,7 +1453,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
      * block table comes from the index the writer that grew the file left
      * (when it is that file's, as at open) or from one walk.  The mapped
      * prefix [0, base_count) is compared by its table — the same checkpoints
-     * and the same length bytes, so the old image's records are not read —
+     * and the same lengths, so the old image's records are not read —
      * and by the bytes of its first records and of its last, partial block.
      * A flush of this process wrote the rest, [base_count, count), from
      * appended atoms (never NULL), compared record by record.  A failure
@@ -1490,15 +1485,16 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
         from_ix = pass == 0;
         bool good = true;
         if (d->base_count > 0) {
-            int64_t full = d->base_count >> DOM_IX_LOG;
+            int64_t full = d->base_count / DOM_IX_STRIDE;
             good = map_size >= d->map_size;
             for (int64_t k = 0; good && k < full; k++)
-                good = nb->ckpt[k] == ob->ckpt[k] && dom_blk_lim(nb, k) == dom_blk_lim(ob, k);
-            if (good && ob->len && nb->len)
-                good = memcmp(nb->len, ob->len, (size_t)d->base_count) == 0;
+                good = nb->ib[k].off == ob->ib[k].off && dom_blk_lim(nb, k) == dom_blk_lim(ob, k) &&
+                       memcmp(nb->ib[k].len, ob->ib[k].len, sizeof(nb->ib[k].len)) == 0;
+            for (int64_t i = full * DOM_IX_STRIDE; good && i < d->base_count; i++)
+                good = nb->ib[full].len[i - full * DOM_IX_STRIDE] == ob->ib[full].len[i - full * DOM_IX_STRIDE];
             if (good && full < ob->n) {
-                uint64_t at = ob->ckpt[full];
-                good = at <= d->map_size && at <= map_size && nb->ckpt[full] == at &&
+                uint64_t at = ob->ib[full].off;
+                good = at <= d->map_size && at <= map_size && nb->ib[full].off == at &&
                        memcmp(nbase + at, obase + at, d->map_size - (size_t)at) == 0;
             }
             if (good) {
@@ -1510,7 +1506,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
         size_t ro = d->base_count > 0 ? d->map_size : 12;
         for (int64_t i = d->base_count; good && i < count; i++) {
             ray_t* a = dom_slot_get(cur, i);
-            good = a && (i & (DOM_IX_STRIDE - 1) || nb->ckpt[i >> DOM_IX_LOG] == ro) &&
+            good = a && (i % DOM_IX_STRIDE || nb->ib[i / DOM_IX_STRIDE].off == ro) &&
                    map_size - ro >= 4;
             uint32_t nl = good ? dom_rd32(nbase + ro) : 0;
             good = good && (size_t)nl <= map_size - ro - 4 && nl == ray_str_len(a) &&
@@ -1828,9 +1824,8 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     dom_raw_snap_t* snap = atomic_load_explicit(&dom->raw_snap, memory_order_acquire);
     if (!snap) return false;
     out->map = snap->map;
-    out->ckpt = snap->blk->ckpt;
+    out->ib = snap->blk->ib;
     out->ok = snap->blk->ok;
-    out->len = snap->blk->len;
     out->corrupt = &dom->corrupt;
     out->count = snap->count;
     out->blk = snap->blk;
@@ -1857,7 +1852,7 @@ const char* ray_sym_domain_raw_str_slow(const ray_sym_domain_raw_t* r, int64_t p
     if (!r->blk || pos < 0 || pos >= r->count) return NULL;
     dom_blk_t* b = (dom_blk_t*)r->blk;
     uint32_t l = 0;
-    const uint8_t* p = dom_raw_checked(r, b, pos >> DOM_IX_LOG) ? dom_blk_entry(r->map, b, pos, &l)
+    const uint8_t* p = dom_raw_checked(r, b, pos / DOM_IX_STRIDE) ? dom_blk_entry(r->map, b, pos, &l)
                                                                : NULL;
     if (p) {
         *len = l;
@@ -1874,9 +1869,10 @@ const char* ray_sym_domain_raw_str_slow(const ray_sym_domain_raw_t* r, int64_t p
 int64_t ray_sym_domain_raw_len_slow(const ray_sym_domain_raw_t* r, int64_t pos) {
     if (!r->blk || pos < 0 || pos >= r->count) return -1;
     dom_blk_t* b = (dom_blk_t*)r->blk;
-    if (b->len && b->len[pos] < DOM_LEN_LONG && dom_raw_checked(r, b, pos >> DOM_IX_LOG) &&
+    if (b->ib && b->ib[pos / DOM_IX_STRIDE].len[pos % DOM_IX_STRIDE] < DOM_LEN_LONG &&
+        dom_raw_checked(r, b, pos / DOM_IX_STRIDE) &&
         !(r->dom && atomic_load_explicit(&r->dom->corrupt, memory_order_acquire)))
-        return b->len[pos];
+        return b->ib[pos / DOM_IX_STRIDE].len[pos % DOM_IX_STRIDE];
     size_t l = 0;
     return ray_sym_domain_raw_str_slow(r, pos, &l) ? (int64_t)l : -1;
 }
@@ -1950,7 +1946,7 @@ bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out
     if (!dom || !out || dom->kind != DOM_FILE) return false;
     dom_lock();
     out->from_index = dom->ix_used;
-    out->lens_mapped = dom->blk && dom->blk->len && !dom->blk->own_len;
+    out->lens_mapped = dom->blk && dom->blk->ib && !dom->blk->own_ib;
     out->covered = dom->ix_covered;
     out->checked = atomic_load_explicit(&dom->ix_checked, memory_order_relaxed);
     out->rescued = atomic_load_explicit(&dom->ix_rescued, memory_order_relaxed);
@@ -2734,7 +2730,7 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom) {
 
 /* The index file once a flush left the symfile holding `count` entries
  * whose records end at byte `end`: the mapped prefix's checkpoints and the
- * flushed ones, the prefix's length bytes (its table's) and the flushed
+ * flushed ones, the prefix's lengths (its table's) and the flushed
  * entries' (their atoms'), after every flush of a file large enough —
  * appended to the index on disk, at the cost of the records flushed
  * (dom_ix_refresh), so a reader never finds an index short of the file.
@@ -2744,26 +2740,27 @@ static void dom_flush_index(ray_sym_domain_t* dom, int64_t count, uint64_t end) 
     bool want = end >= dom_ix_min();
     int64_t nb = dom->blk ? dom->blk->n : 0, n = nb + dom->wck.n;
     int64_t base = dom->base_count;
-    const uint8_t* bl = dom->blk ? dom->blk->len : NULL;   /* stays mapped or retired, never freed */
+    const dom_ixb_t* bl = dom->blk ? dom->blk->ib : NULL;   /* stays mapped or retired, never freed */
     uint64_t* all = want && n == dom_ck_count(count) && (base == 0 || bl)
                   ? (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t)) : NULL;
-    uint8_t* tl = all && count > base ? (uint8_t*)ray_sys_alloc((size_t)(count - base)) : NULL;
+    uint16_t* tl = all && count > base ? (uint16_t*)ray_sys_alloc((size_t)(count - base) * 2) : NULL;
     if (all && count > base && !tl) { ray_sys_free(all); all = NULL; }
     if (all) {
-        if (nb) memcpy(all, dom->blk->ckpt, (size_t)nb * sizeof(uint64_t));
+        for (int64_t k = 0; k < nb; k++) all[k] = dom->blk->ib[k].off;
         if (dom->wck.n) memcpy(all + nb, dom->wck.v, (size_t)dom->wck.n * sizeof(uint64_t));
         dom_dir_t* dir = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
         for (int64_t i = base; i < count; i++) {
             ray_t* a = dom_slot_get(dir, i);
             size_t l = a ? ray_str_len(a) : 0;
-            tl[i - base] = l < DOM_LEN_LONG ? (uint8_t)l : (uint8_t)DOM_LEN_LONG;
+            tl[i - base] = l < DOM_LEN_LONG ? (uint16_t)l : (uint16_t)DOM_LEN_LONG;
         }
     }
     int64_t ixc = dom->ix_count;
     uint64_t ixe = dom->ix_end;
     dom_unlock();
     if (!all) return;
-    dom_ix_refresh(dom->path, all, n, bl, base, tl, count, end, ixc, ixe, true);
+    dom_lsrc_t ls = { bl, base, tl };
+    dom_ix_refresh(dom->path, all, n, &ls, count, end, ixc, ixe, true);
     ray_sys_free(all);
     ray_sys_free(tl);
     dom_lock();
@@ -2882,7 +2879,7 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
         for (int64_t i = base_count; err == RAY_OK && i < count; i++) {
             ray_t* s = dom_slot_get(dir, i);
             if (!s) { err = RAY_ERR_CORRUPT; break; }
-            if (!(i & (DOM_IX_STRIDE - 1)) && !dom_ck_push(&tail, written_size)) {
+            if (!(i % DOM_IX_STRIDE) && !dom_ck_push(&tail, written_size)) {
                 err = RAY_ERR_OOM;
                 break;
             }
@@ -3028,7 +3025,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     for (int64_t i = disk_count; err == RAY_OK && i < count; i++) {
         ray_t* s = dom_slot_get(dir, i);
         if (!s) { err = RAY_ERR_CORRUPT; break; }
-        if (!(i & (DOM_IX_STRIDE - 1)) && !dom_ck_push(&tail, size)) { err = RAY_ERR_OOM; break; }
+        if (!(i % DOM_IX_STRIDE) && !dom_ck_push(&tail, size)) { err = RAY_ERR_OOM; break; }
         size_t slen = ray_str_len(s);
         if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
         uint32_t len32 = (uint32_t)slen;

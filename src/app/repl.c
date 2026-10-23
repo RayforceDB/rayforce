@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "store/enccol.h"    /* ray_enccol_cache_trim at the statement boundary */
 #include "lang/format.h"
 #include "table/domain.h"   /* ray_sym_has_file_domain */
 #include "app/repl.h"
@@ -916,6 +917,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
     }
 
     ray_heap_gc();
+    ray_enccol_cache_trim();
     ray_heap_relieve();
     /* Statement boundary.  Check BEFORE stamping: the clock still holds the
      * end of the previous statement, so what we measure is the gap between
@@ -1557,6 +1559,7 @@ int ray_repl_run_file(const char* path) {
      * exists to avoid. */
     ray_heap_note_activity();
     ray_heap_gc();
+    ray_enccol_cache_trim();
     /* The script's own temporaries — a load, say, before it hands over to a
      * server's poll loop — go back here under memory pressure, as after a
      * REPL statement. */

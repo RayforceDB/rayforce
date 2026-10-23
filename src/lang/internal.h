@@ -763,6 +763,14 @@ ray_t* ray_select_fn(ray_t** args, int64_t n);
 /* Chunk length of the per-distinct-symbol key evaluation over a FILE
  * domain (ops/query.c derived_key_str_chunks); 0 restores the default. */
 void ray_derived_key_chunk_set_for_test(int64_t rows);
+/* Bits kept of the derived-key grouping's key hash (ops/query.c dkh_hash),
+ * so distinct keys collide; 0 restores the full 64 bits. */
+void ray_derived_key_hash_bits_set_for_test(int bits);
+/* The two-pass grouping under a having cut (ops/query.c dk2_run): out[0]
+ * its runs; of the last run, out[1] the groups emitted, out[2] the
+ * candidate hashes, out[3] the groups made for colliding keys, out[4]
+ * whether the key slices went into H's counts. */
+void ray_derived_key_two_pass_stats_for_test(int64_t out[5]);
 #endif
 ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);

@@ -952,6 +952,7 @@ void ray_test_hooks_off(void) {
     ray_group_test_scalar_grain(0);
     ray_pool_test_ring_fail(0);
     agg_test_force_smallhash(false);
+    agg_test_no_wide_dense(false);
     ray_clear_interrupt();
 }
 

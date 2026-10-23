@@ -25,6 +25,7 @@
   #define _GNU_SOURCE
 #endif
 
+#include "store/enccol.h"    /* ray_enccol_cache_trim after a request */
 #include "table/domain.h"   /* ray_sym_domain_corruptions */
 #include "core/ipc.h"
 #include "core/mcast.h"
@@ -1212,6 +1213,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * one between two requests.  Stamping on frame arrival instead would
      * make the measured gap the request's own duration. */
     ray_heap_note_activity();
+    ray_enccol_cache_trim();
     ray_heap_relieve();
 
     return NULL;

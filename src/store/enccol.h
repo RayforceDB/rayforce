@@ -92,6 +92,12 @@ typedef struct ray_enccol_s {
     /* materialization (Task 8) */
     ray_enc_once_t  once;
     ray_t*          decoded;
+    /* the statement-boundary trim (ray_enccol_cache_trim): columns whose
+     * whole-column decode is published, linked while it is */
+    struct ray_enccol_s* dec_prev;
+    struct ray_enccol_s* dec_next;
+    _Atomic(bool)   dec_listed;
+    _Atomic(uint64_t) dec_used;     /* the statement that last asked for the decode */
     _Atomic(uint64_t) decoded_bytes;  /* bytes produced by this column's vector decodes */
     /* single file: one byte per chunk, set (release) once the chunk's
      * descriptors passed validation; never set for a chunk that failed */
@@ -313,6 +319,17 @@ ray_t* ray_enccol_materialize(ray_t* encv);
 /* The cached plain column when the materialization has completed, else NULL;
  * never decodes and is safe against a concurrent materialize. */
 ray_t* ray_enccol_decoded_peek(ray_t* encv);
+
+/* At a statement boundary: drop the whole-column decodes, least recently
+ * asked for first, until those still kept fit a quarter of the anonymous
+ * watermark.  A decode something else retains is neither counted nor
+ * dropped (dropping it would free nothing and the next read would decode a
+ * second copy).  Does nothing while an evaluation is on this thread's stack
+ * (a request served from inside a statement's sync send) or a dispatch is in
+ * flight, and without a watermark. */
+void   ray_enccol_cache_trim(void);
+/* Bytes of the whole-column decodes currently kept (test hook). */
+int64_t ray_enccol_cache_bytes(void);
 
 /* Counters (spec "Instrumentation"); reset by tests.  decoded_bytes is
  * the bytes vector decodes produce, plus the bytes an integer RAW vector

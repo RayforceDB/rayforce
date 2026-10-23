@@ -4030,7 +4030,9 @@ static test_result_t test_v2_routes(void) {
     SR_SAME("(select {s: (sum v) c: (count k) from: T by: g})", 0);                     /* dense */
     SR_SAME("(select {s: (sum f) a: (avg v) from: T where: (> k 5000) by: g})", 0);     /* dense, sel */
     SR_SAME("(select {c: (count k) from: T by: {g: g s: s}})", 0);                      /* multi key */
+    agg_test_no_wide_dense(true);   /* a wide dense slab would take it: keep the radix route */
     SR_SAME("(select {c: (count k) mn: (min v) from: T by: h})", 0);                    /* high cardinality: radix */
+    agg_test_no_wide_dense(false);
     SR_SAME("(select {c: (count k) from: T where: (== b true) by: d})", 0);
     SR_SAME("(select {x: (max f) from: T by: {d: d u: u}})", 0);
     agg_route_stats_t rs = agg_route_stats();

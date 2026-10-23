@@ -36,6 +36,9 @@
 #include "vec/str.h"
 #include "ops/hash.h"            /* ray_hash_bytes: the STR_DICT validator's private table */
 #include "core/pool.h"
+#include "mem/heap.h"            /* ray_heap_anon_watermark: the trim budget */
+#include "core/block.h"          /* ray_block_size: what a kept decode occupies */
+#include "lang/eval.h"           /* ray_eval_depth: the trim waits for the statement */
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -50,8 +53,88 @@ ray_enccol_t* ray_enccol_of(ray_t* v) {
 static _Atomic(int64_t) g_enccol_live;          /* test hook, see enccol.h */
 int64_t ray_enccol_test_live(void) { return atomic_load(&g_enccol_live); }
 
+/* Columns whose whole-column decode is published, for the statement-
+ * boundary trim.  A decode may be published from a worker, so the list has
+ * its own lock; only the boundary drops decodes. */
+static atomic_flag    g_dec_lock = ATOMIC_FLAG_INIT;
+static ray_enccol_t*  g_dec_head;
+static _Atomic(uint64_t) g_dec_stmt = 1;
+
+static void dec_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_dec_lock, memory_order_acquire)) ray_enc_yield(); }
+static void dec_unlock(void) { atomic_flag_clear_explicit(&g_dec_lock, memory_order_release); }
+
+static void dec_unlink(ray_enccol_t* e) {   /* under the lock */
+    if (!atomic_load_explicit(&e->dec_listed, memory_order_relaxed)) return;
+    if (e->dec_prev) e->dec_prev->dec_next = e->dec_next; else g_dec_head = e->dec_next;
+    if (e->dec_next) e->dec_next->dec_prev = e->dec_prev;
+    e->dec_prev = e->dec_next = NULL;
+    atomic_store_explicit(&e->dec_listed, false, memory_order_release);
+}
+
+/* Bytes a kept decode frees when dropped: none while something else holds it. */
+static int64_t dec_bytes(ray_t* d) {
+    if (!d || ray_atomic_load(&d->rc) > 1) return 0;
+    return (int64_t)ray_block_size(d);
+}
+
+static void dec_note(ray_enccol_t* e) {
+    atomic_store_explicit(&e->dec_used, atomic_load_explicit(&g_dec_stmt, memory_order_relaxed),
+                          memory_order_relaxed);
+    if (atomic_load_explicit(&e->dec_listed, memory_order_acquire)) return;
+    dec_lock();
+    if (!atomic_load_explicit(&e->dec_listed, memory_order_relaxed) && e->decoded) {
+        e->dec_prev = NULL;
+        e->dec_next = g_dec_head;
+        if (g_dec_head) g_dec_head->dec_prev = e;
+        g_dec_head = e;
+        atomic_store_explicit(&e->dec_listed, true, memory_order_release);
+    }
+    dec_unlock();
+}
+
+int64_t ray_enccol_cache_bytes(void) {
+    int64_t total = 0;
+    dec_lock();
+    for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) total += dec_bytes(e->decoded);
+    dec_unlock();
+    return total;
+}
+
+void ray_enccol_cache_trim(void) {
+    uint64_t stmt = atomic_fetch_add_explicit(&g_dec_stmt, 1, memory_order_relaxed);
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return;
+    if (ray_eval_depth() > 0) return;     /* a statement is still on the stack */
+    if (atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) != 0) return;
+    int64_t cap = wm / 4;
+    dec_lock();
+    int64_t total = 0;
+    for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) total += dec_bytes(e->decoded);
+    while (total > cap) {
+        ray_enccol_t* v = NULL;
+        uint64_t vu = 0; int64_t vb = 0;
+        for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) {
+            int64_t  b = dec_bytes(e->decoded);
+            if (b == 0) continue;
+            uint64_t u = atomic_load_explicit(&e->dec_used, memory_order_relaxed);
+            if (!v || u < vu || (u == vu && b > vb)) { v = e; vu = u; vb = b; }
+        }
+        if (!v) break;
+        ray_t* d = v->decoded;
+        v->decoded = NULL;
+        ray_enc_once_init(&v->once);          /* the next read decodes again */
+        dec_unlink(v);
+        ray_idx_lazy_forget(d);               /* a lazy hash goes with its object */
+        ray_release(d);
+        total -= vb;
+    }
+    dec_unlock();
+    (void)stmt;
+}
+
 static void enccol_free(ray_enccol_t* e) {
     atomic_fetch_sub_explicit(&g_enccol_live, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&e->dec_listed, memory_order_acquire)) { dec_lock(); dec_unlink(e); dec_unlock(); }
     ray_idx_lazy_forget_enc(e);              /* a pending probe count goes with the payload */
     if (e->decoded) {
         ray_idx_lazy_forget(e->decoded);     /* a lazy hash goes with its object */
@@ -3741,8 +3824,10 @@ ray_t* ray_enccol_materialize(ray_t* encv) {
      * permanent property of the file, and workers can have distinct state. */
     if ((e->type == RAY_F32 || e->type == RAY_F64) && !ray_enc_fp_env_ok())
         return ray_error("fpenv", "column %s: " RAY_ENC_FPENV_MSG, e->path);
-    return ray_enc_once_get(&e->once, &e->decoded,
-                            e->kind == RAY_ENCCOL_PARTED ? enc_materialize_parted : enc_materialize_single, e);
+    ray_t* r = ray_enc_once_get(&e->once, &e->decoded,
+                                e->kind == RAY_ENCCOL_PARTED ? enc_materialize_parted : enc_materialize_single, e);
+    if (r && !RAY_IS_ERR(r)) dec_note(e);
+    return r;
 }
 
 void ray_enccol_adopt_domain(ray_t* out, ray_t* encv) {

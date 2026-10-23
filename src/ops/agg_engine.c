@@ -45,7 +45,9 @@ bool ray_agg_tablestack = true;  /* knob; default on */
 int64_t ray_agg_radix_wave_bytes = 0;   /* knob; 0 = heap-derived wave bound, <0 = off */
 int ray_agg_radix_spill = 0;            /* knob; 0 = by bytes, 1 = never, 2 = always, 3..6 = always with a fault */
 static bool agg_force_smallhash;    /* test hook (agg_test_force_smallhash) */
+static bool agg_no_wide_dense;      /* test hook (agg_test_no_wide_dense) */
 void agg_test_force_smallhash(bool on) { agg_force_smallhash = on; }
+void agg_test_no_wide_dense(bool on) { agg_no_wide_dense = on; }
 
 static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
@@ -1362,15 +1364,77 @@ int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows
     return total;
 }
 
+/* The bytes the calling heap can take before the anonymous watermark: the
+ * room under it, with the committed blocks the heap can reuse added back.
+ * 0 when the watermark (the RAM) is unknown. */
+static int64_t agg_dense_wide_room(void) {
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return 0;
+    int64_t room = wm - ray_heap_anon_committed() + ray_heap_anon_reusable();
+    return room > 0 ? room : 0;
+}
+
+/* Whether a shared slab of this plan holds u32 counters (4 bytes a slot): every
+ * aggregate is COUNT, so one counter per slot serves them all, and the input
+ * has at most UINT32_MAX rows, so no slot's count can pass UINT32_MAX.  With
+ * more rows the slab keeps the 8-byte count states. */
+static bool agg_count32_slab(const agg_vtable_t** vts, uint32_t n_aggs, int64_t rows) {
+    if (n_aggs == 0 || rows > (int64_t)UINT32_MAX) return false;
+    const agg_vtable_t* cnt = agg_resolve(OP_COUNT, RAY_I64);
+    for (uint32_t a = 0; a < n_aggs; a++) if (vts[a] != cnt) return false;
+    return true;
+}
+
+/* A wide plan spans at most this many slots per input row: a slab much larger
+ * than the input is mostly empty, and the radix routes answer from the rows. */
+#define AGG_WIDE_RANGE_PER_ROW 16
+
+/* The most slots a wide dense plan (a range past the row count) may span: one
+ * four-byte counter per slot must fit the room, and a slot is a uint32. */
+static int64_t agg_dense_wide_slots(void) {
+    int64_t s = agg_dense_wide_room() / 4;
+    return s < (int64_t)UINT32_MAX ? s : (int64_t)UINT32_MAX;
+}
+
+/* Whether the single key has many groups: of 1024 rows spread over the table,
+ * at least a quarter hold distinct keys.  A wide dense plan pays for its
+ * whole range, so a key with a few groups spread over a wide range (which
+ * the table stack and the hash routes answer from their own few entries)
+ * does not take it.  *err is set on a failed range read. */
+static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows, ray_t** err) {
+    enum { SAMPLES = 1024, CAP = 2048 };
+    *err = NULL;
+    if (nrows < SAMPLES) return false;
+    int64_t seen[CAP];
+    bool used[CAP];
+    memset(used, 0, sizeof used);
+    agg_curs_t cs; cs.cur = NULL;
+    if (rr->staged && !agg_curs_init(&cs, rr)) { *err = ray_error("oom", NULL); return false; }
+    int64_t step = nrows / SAMPLES, distinct = 0;
+    if (!rr->staged && ray_col_cold(key_col))
+        for (int i = 0; i < SAMPLES; i++)
+            ray_col_want_row(key_col, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+    for (int i = 0; i < SAMPLES && !*err; i++) {
+        int64_t v = agg_key_at(rr, &cs, 0, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step), err);
+        if (*err) break;
+        uint32_t at = ray_hash_i64(v) & (CAP - 1);
+        while (used[at] && seen[at] != v) at = (at + 1) & (CAP - 1);
+        if (!used[at]) { used[at] = true; seen[at] = v; distinct++; }
+    }
+    agg_curs_free(&cs, rr);
+    return !*err && distinct * 4 >= SAMPLES;
+}
+
 /* agg_dense_plan over keys bound for range reads: krr's staged keys (their
  * key_cols are stand-ins) take their bounds from the directory or by
  * pieces.  False with *err set: a range error. */
-static bool agg_dense_plan_src(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys,
+static bool agg_dense_plan_src(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys, bool allow_wide,
                                int64_t nrows, dense_plan_t* out, ray_t** err) {
     *err = NULL;
     out->ok = false;
     out->n_keys = n_keys;
     out->compacted = false;
+    out->wide = false;
     memset(out->remap, 0, sizeof(out->remap));
     memset(out->inverse, 0, sizeof(out->inverse));
     /* Dense direct-index routing self-limits to <=16 keys: dense_plan_t's
@@ -1441,6 +1505,17 @@ static bool agg_dense_plan_src(ray_t** key_cols, const agg_rr_t* krr, uint32_t n
         if (total > dense_limit / rng) overflow = true;
         else total *= rng;
     }
+    /* One key whose range passes the row count: a slab the size of the range
+     * is admitted when it is at most AGG_WIDE_RANGE_PER_ROW slots per row and
+     * fits the room under the memory watermark (agg_dense_wide_slots).  Its
+     * answer is the same; only the shared strategy runs it (the caller drops
+     * the plan otherwise). */
+    if (overflow && n_keys == 1 && allow_wide && out->ranges[0] <= AGG_WIDE_RANGE_PER_ROW * nrows &&
+            out->ranges[0] <= agg_dense_wide_slots()) {
+        overflow = false;
+        out->wide = true;
+        total = out->ranges[0];
+    }
     if (overflow || (n_keys >= 2 && total > AGG_COMPACT_TRY_SLOTS)) {
         /* Raw ranges multiply out too far — or far enough past a
          * cache-resident slab that sparse keys would waste it (a W16 SYM key
@@ -1504,7 +1579,7 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
     ray_scan_fail_init(&fail);
     agg_rr_t krr = agg_keys_plain_rr(key_cols, n_keys, &hdr, &fail);
     ray_t* err = NULL;
-    bool ok = krr.n_keys == n_keys && agg_dense_plan_src(key_cols, &krr, n_keys, nrows, out, &err);
+    bool ok = krr.n_keys == n_keys && agg_dense_plan_src(key_cols, &krr, n_keys, false, nrows, out, &err);
     if (err) ray_error_free(err);   /* plain keys read in place: no range errors */
     scratch_free(hdr);
     return ok;
@@ -2123,10 +2198,11 @@ static void agg_sel_scratch_free(agg_sel_scratch_t* sc) {
  * (i.e. states_base + off applied per agg by the kernel via off[a]).  The
  * values come from view v (rows read at rows[i] - v->base: the whole columns,
  * or a run of rows inside the staged sources' views).  Returns 0, or -1 on
- * scratch OOM (sets sc->oom). */
+ * scratch OOM (sets sc->oom).  shared: the kernels' update_shared (atomic) in
+ * place of update_batch, for a slab several tasks update at once. */
 static int agg_sel_accum_chunk(const agg_valdesc_t* vd, const agg_view_t* v, agg_sel_scratch_t* sc,
                                char* states, const uint32_t* gid,
-                               const int64_t* rows, int64_t n) {
+                               const int64_t* rows, int64_t n, bool shared) {
     for (uint32_t a = 0; a < vd->n_aggs; a++) {
         const agg_vtable_t* vt = vd->vts[a];
         if (vt->update_batch2) {                            /* binary agg (pearson) */
@@ -2144,10 +2220,12 @@ static int agg_sel_accum_chunk(const agg_valdesc_t* vd, const agg_view_t* v, agg
             if (!sc->gv[a]) { sc->gv[a] = ray_alloc_raw((size_t)AGG_SEL_CHUNK * (ez ? ez : 1)); if (!sc->gv[a]) { sc->oom = 1; return -1; } }
             agg_sel_gather_vals(sc->gv[a], v->val_data[a], ez, rows, n, v->base);
             ray_valid_t valid = { sc->gv[a], vd->val_types[a], vd->val_hasnull[a] };
-            vt->update_batch(states + vd->off[a], vd->block, gid, sc->gv[a], &valid, n, NULL);
+            if (shared) vt->update_shared(states + vd->off[a], vd->block, gid, sc->gv[a], &valid, n);
+            else vt->update_batch(states + vd->off[a], vd->block, gid, sc->gv[a], &valid, n, NULL);
         } else {                                            /* COUNT (no value gather) */
             ray_valid_t valid = { NULL, vd->val_types[a], false };
-            vt->update_batch(states + vd->off[a], vd->block, gid, NULL, &valid, n, NULL);
+            if (shared) vt->update_shared(states + vd->off[a], vd->block, gid, NULL, &valid, n);
+            else vt->update_batch(states + vd->off[a], vd->block, gid, NULL, &valid, n, NULL);
         }
     }
     return 0;
@@ -2750,6 +2828,7 @@ static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n
     out->ok = false;
     out->n_keys = n_keys;
     out->compacted = false;
+    out->wide = false;
     memset(out->remap, 0, sizeof(out->remap));
     memset(out->inverse, 0, sizeof(out->inverse));
     if (n_keys < 1 || n_keys > 16) return false;
@@ -3227,7 +3306,7 @@ static void agg_dense_sel_rows(void* raw, const agg_view_t* v, uint32_t wid, int
         }
         if (r < fr[slot]) fr[slot] = r;
     }
-    if (agg_sel_accum_chunk(&c->vd, v, t->sc, states, gid, rows + ib, ie - ib) != 0)
+    if (agg_sel_accum_chunk(&c->vd, v, t->sc, states, gid, rows + ib, ie - ib, false) != 0)
         loc->oom = 1;
 }
 
@@ -3729,13 +3808,190 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
     return kept;
 }
 
-/* Shared output stage. Takes ownership of states/first, borrows the
- * prepared aggregate layout and descriptors. */
+/* Lean top-N emit over a shared dense slab.  The slab's occupancy bitmap is
+ * walked in disjoint word ranges, one task each, in chunks of LEAN_CHUNK
+ * slots: a chunk's filter-aggregate values feed a bounded candidate set per
+ * task, the union of the sets gives the N-th value (the threshold), and a
+ * second walk keeps the slots that pass agg_topn_mark.  Only the kept slots
+ * are stored, so the emit allocates O(N) (plus ties) instead of one entry per
+ * group; the kept set and its slot order are those of the generic path
+ * (agg_slots_topn_select over every occupied slot).  The filter aggregate is
+ * read from the states, or from a count-only slab of u32 counters. */
+enum { LEAN_CHUNK = 4096, LEAN_CAND_BUDGET = 8 << 20 };
+typedef struct {
+    const agg_vtable_t* vt;
+    const char* states;
+    size_t block, off;
+    int64_t param;
+    const uint32_t* cnt32;
+} agg_lean_src_t;
+
+typedef struct {
+    const agg_lean_src_t* src;
+    const uint64_t* occ;
+    int64_t words;
+    const ray_group_emit_filter_t* ef;
+    uint32_t tasks;
+    int pass;           /* 0: candidates and group counts; 1: the kept slots */
+    int64_t cap;
+    double* cand;       /* [tasks][3 * cap]: the task's pool (2 * cap), then scratch */
+    int64_t* pool_n;
+    int64_t* groups;
+    bool have_thr;
+    double thr;
+    int64_t** kept;
+    int64_t* kept_n;
+    int64_t* kept_cap;
+    _Atomic(int) fail;
+} agg_lean_ctx_t;
+
+static bool agg_lean_vals(const agg_lean_src_t* s, const int64_t* slots, int64_t n, double* out) {
+    if (s->cnt32) {
+        for (int64_t i = 0; i < n; i++) out[i] = (double)s->cnt32[slots[i]];
+        return true;
+    }
+    return agg_group_values_f64(s->vt, s->states, s->block, s->off, slots, n, s->param, out);
+}
+
+/* The next chunk of occupied slots of words [*w, w1); *bits holds the rest of
+ * word *w (consumed bits cleared). */
+static int64_t agg_lean_chunk(const uint64_t* occ, int64_t* w, uint64_t* bits, int64_t w1, int64_t* slots) {
+    int64_t n = 0;
+    for (;;) {
+        while (*bits) {
+            if (n == LEAN_CHUNK) return n;
+            slots[n++] = *w * 64 + __builtin_ctzll(*bits);
+            *bits &= *bits - 1;
+        }
+        if (++*w >= w1) return n;
+        *bits = occ[*w];
+    }
+}
+
+static void agg_lean_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_lean_ctx_t* c = raw;
+    const ray_group_emit_filter_t* ef = c->ef;
+    int64_t slots[LEAN_CHUNK];
+    double vals[LEAN_CHUNK];
+    uint8_t keep[LEAN_CHUNK];
+    for (int64_t t = start; t < end; t++) {
+        int64_t w0 = c->words / c->tasks * t;
+        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        if (w0 >= w1) continue;
+        int64_t w = w0;
+        uint64_t bits = c->occ[w];
+        for (;;) {
+            int64_t n = agg_lean_chunk(c->occ, &w, &bits, w1, slots);
+            if (n == 0) break;
+            if (!agg_lean_vals(c->src, slots, n, vals)) {
+                atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+                return;
+            }
+            if (c->pass == 0) {
+                c->groups[t] += n;
+                if (c->cap > 0) {
+                    double* pool = c->cand + (size_t)t * 3 * c->cap;
+                    double* tmp = pool + 2 * c->cap;
+                    int64_t hn;
+                    agg_topn_candidates(vals, n, c->cap, ef->desc, tmp, &hn);
+                    memcpy(pool + c->pool_n[t], tmp, (size_t)hn * sizeof(double));
+                    c->pool_n[t] += hn;
+                    if (c->pool_n[t] > c->cap) {
+                        agg_topn_candidates(pool, c->pool_n[t], c->cap, ef->desc, tmp, &hn);
+                        memcpy(pool, tmp, (size_t)hn * sizeof(double));
+                        c->pool_n[t] = hn;
+                    }
+                }
+            } else {
+                int64_t k = agg_topn_mark(vals, n, ef, c->have_thr, c->thr, keep);
+                if (c->kept_n[t] + k > c->kept_cap[t]) {
+                    int64_t nc = c->kept_cap[t] ? c->kept_cap[t] * 2 : 64;
+                    while (nc < c->kept_n[t] + k) nc *= 2;
+                    int64_t* p = ray_realloc_raw(c->kept[t], (size_t)nc * sizeof(int64_t));
+                    if (!p) { atomic_store_explicit(&c->fail, 1, memory_order_relaxed); return; }
+                    c->kept[t] = p; c->kept_cap[t] = nc;
+                }
+                for (int64_t i = 0; i < n; i++)
+                    if (keep[i]) c->kept[t][c->kept_n[t]++] = slots[i];
+            }
+        }
+    }
+}
+
+/* The kept slots among the occupied ones, ascending, in *out (the caller
+ * frees it); their count, or -1 when the filter aggregate has no scalar order
+ * or memory ran out. */
+static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src,
+        const uint64_t* occ, int64_t total_slots, const ray_group_emit_filter_t* ef,
+        int64_t** out, bool* have_thr, double* thr) {
+    *out = NULL; *have_thr = false; *thr = 0;
+    int64_t words = (total_slots + 63) / 64;
+    int64_t cap = ef->top_count_take > 0 ? ef->top_count_take : 0;
+    uint32_t tasks = pool && total_slots >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) * 4 : 1;
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    if ((int64_t)tasks > words) tasks = (uint32_t)words;
+    if (cap > 0 && (int64_t)tasks * 3 * cap > LEAN_CAND_BUDGET) {
+        int64_t fit = LEAN_CAND_BUDGET / (3 * cap);
+        if (fit < tasks) tasks = fit < 1 ? 1 : (uint32_t)fit;
+    }
+    if (tasks < 1) tasks = 1;
+    size_t per = cap > 0 ? (size_t)cap : 1;
+    double* cand = ray_alloc_raw((size_t)tasks * 3 * per * sizeof(double));
+    double* all = ray_alloc_raw((size_t)tasks * per * sizeof(double));
+    int64_t* meta = ray_calloc_raw((size_t)tasks * 4 * sizeof(int64_t));
+    int64_t** kept = ray_calloc_raw((size_t)tasks * sizeof(int64_t*));
+    int64_t result = -1;
+    if (cand && all && meta && kept) {
+        agg_lean_ctx_t c = { .src = src, .occ = occ, .words = words, .ef = ef, .tasks = tasks,
+            .cap = cap, .cand = cand, .pool_n = meta, .groups = meta + tasks,
+            .kept = kept, .kept_n = meta + 2 * tasks, .kept_cap = meta + 3 * tasks };
+        atomic_init(&c.fail, 0);
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
+        else agg_lean_fn(&c, 0, 0, 1);
+        if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
+            int64_t total = 0, nc = 0;
+            for (uint32_t t = 0; t < tasks; t++) {
+                total += c.groups[t];
+                memcpy(all + nc, cand + (size_t)t * 3 * per, (size_t)c.pool_n[t] * sizeof(double));
+                nc += c.pool_n[t];
+            }
+            if (cap > 0) c.have_thr = agg_topn_union_threshold(all, nc, total, ef, &c.thr);
+            *have_thr = c.have_thr; *thr = c.thr;
+            c.pass = 1;
+            if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
+            else agg_lean_fn(&c, 0, 0, 1);
+            if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
+                int64_t n = 0;
+                for (uint32_t t = 0; t < tasks; t++) n += c.kept_n[t];
+                int64_t* o = ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+                if (o) {
+                    int64_t at = 0;
+                    for (uint32_t t = 0; t < tasks; t++) {
+                        if (c.kept_n[t]) memcpy(o + at, c.kept[t], (size_t)c.kept_n[t] * sizeof(int64_t));
+                        at += c.kept_n[t];
+                    }
+                    *out = o;
+                    result = n;
+                }
+            }
+        }
+        for (uint32_t t = 0; t < tasks; t++) ray_free_raw(kept[t]);
+    }
+    ray_free_raw(cand); ray_free_raw(all); ray_free_raw(meta); ray_free_raw(kept);
+    return result;
+}
+
+/* Shared output stage. Takes ownership of states/first/occ (occ: a bitmap of
+ * the occupied slots that stands in for first; first is then NULL), borrows the
+ * prepared aggregate layout and descriptors.  u32c: gstates is a count-only slab
+ * of u32 counters, one per slot, standing for every (COUNT) aggregate. */
 static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
         ray_pool_t* pool, const agg_vo_t* vo, const agg_desc_t* d,
-        int64_t total_slots, char* gstates, int64_t* gfirst,
+        int64_t total_slots, char* gstates, int64_t* gfirst, const uint64_t* occ,
         const dense_plan_t* key_plan, int64_t key_part_slots, uint32_t key_bits,
-        const ray_group_emit_filter_t* ef, int64_t group_limit, const dense_plan_t* slot_plan) {
+        const ray_group_emit_filter_t* ef, int64_t group_limit, const dense_plan_t* slot_plan,
+        bool u32c, int64_t* pre_slots, int64_t pre_n) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     const agg_vtable_t** vts = vo->vts;
     const size_t* off = vo->off;
@@ -3746,20 +4002,47 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
      * (the natural build order) rather than sorting by first_row.  gfirst[s] is
      * still the gather index (any member row) for the key columns. */
     int64_t ng = 0;
-    for (int64_t s = 0; s < total_slots; s++) if (gfirst[s] != INT64_MAX) ng++;
+    int64_t* occupied_slot = NULL;
+    int64_t* first_row_ordered = NULL;
+    /* A slab with an occupancy bitmap under a top-N filter keeps only the
+     * groups the filter keeps (agg_dense_lean_select): no entry per group. */
+    if (occ && ef && key_plan && group_limit <= 0) {
+        agg_lean_src_t src = { .vt = vts[ef->agg_index], .states = gstates, .block = block,
+            .off = off[ef->agg_index], .param = ext->agg_k ? ext->agg_k[ef->agg_index] : 0,
+            .cnt32 = u32c ? (const uint32_t*)gstates : NULL };
+        bool lean_thr; double lean_thrv;
+        int64_t kept = pre_n >= 0 ? pre_n : agg_dense_lean_select(pool, &src, occ, total_slots, ef, &occupied_slot, &lean_thr, &lean_thrv);
+        if (pre_n >= 0) occupied_slot = pre_slots;
+        if (kept >= 0) {
+            ng = kept;
+            route_stats.topn_native = true;
+            route_stats.topn_kept = kept;
+            route_stats.dense_emit_slots = (uint64_t)kept;
+            ray_profile_tick("dense: selected top-N groups from the slab");
+            goto emit;
+        }
+        if (u32c) {
+            agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+            ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+            return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+        }
+    }
+    if (occ) for (int64_t w = 0; w < (total_slots + 63) / 64; w++) ng += __builtin_popcountll(occ[w]);
+    else for (int64_t s = 0; s < total_slots; s++) if (gfirst[s] != INT64_MAX) ng++;
+    route_stats.dense_emit_slots = (uint64_t)ng;
     ray_profile_tick("dense: freed slabs and counted groups");
 
-    int64_t* occupied_slot     = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
-    int64_t* first_row_ordered = key_plan ? NULL : ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
+    occupied_slot     = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
+    first_row_ordered = key_plan ? NULL : ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
     if (!occupied_slot || (!key_plan && !first_row_ordered)) {
         ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
         agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-        ray_free_raw(gstates); ray_free_raw(gfirst);
+        ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
     { int64_t i = 0;
       for (int64_t s = 0; s < total_slots; s++)
-          if (gfirst[s] != INT64_MAX) {
+          if (occ ? (occ[s >> 6] >> (s & 63)) & 1 : gfirst[s] != INT64_MAX) {
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
               occupied_slot[i] = s; i++;
           }
@@ -3778,7 +4061,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             ray_free_raw(hkey); ray_free_raw(hslot);
             ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
             agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-            ray_free_raw(gstates); ray_free_raw(gfirst);
+            ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
             return ray_error("oom", NULL);
         }
         {
@@ -3851,10 +4134,12 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_profile_tick("dense: selected top-N groups");
     }
 
+emit:
+    ;
     ray_t* result = ray_table_new(n_keys + n_aggs);
     if (!result || RAY_IS_ERR(result)) {
         agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return result ? result : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
 
@@ -3867,7 +4152,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
                        : ray_group_gather(key_cols[k], first_row_ordered, ng);
         if (!kc || RAY_IS_ERR(kc)) {
             agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
             ray_release(result); return kc ? kc : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
         }
         if (kp) {
@@ -3884,6 +4169,20 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     }
 
     for (uint32_t a = 0; a < n_aggs; a++) {
+        if (u32c) {   /* the slab's counters are the count column */
+            ray_t* cnt_out = ray_vec_new(RAY_I64, ng);
+            if (!cnt_out || RAY_IS_ERR(cnt_out)) {
+                ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+                ray_release(result); return cnt_out ? cnt_out : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+            }
+            cnt_out->len = ng;
+            const uint32_t* cnt = (const uint32_t*)gstates;
+            int64_t* dst = (int64_t*)ray_data(cnt_out);
+            for (int64_t i = 0; i < ng; i++) dst[i] = cnt[occupied_slot[i]];
+            result = ray_table_add_col(result, agg_result_col_name(agg_syms[a], ext->agg_ops[a]), cnt_out);
+            ray_release(cnt_out);
+            continue;
+        }
         /* Buffered top_n/bot_n produce a LIST cell per group (a native vector);
          * median and all streaming aggs produce a scalar out_type cell. */
         bool is_list = (vts[a]->out_type == RAY_LIST);
@@ -3891,7 +4190,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
                              : ray_vec_new(vts[a]->out_type, ng);
         if (!out || RAY_IS_ERR(out)) {
             agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
             ray_release(result); return out ? out : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
         }
         out->len = ng;
@@ -3916,7 +4215,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     /* Finalize is done reading the global slab → destroy its buffered per-group
      * state exactly once before freeing the slab. */
     agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-    ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+    ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
     if (result && !RAY_IS_ERR(result) && agg_cancelled()) { ray_release(result); return ray_error("cancel", NULL); }
     return result;
 }
@@ -4384,7 +4683,7 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     route_stats.dense_strategy = AGG_DENSE_PARTITIONED;
     route_stats.dense_tasks = c.n_tasks;
     route_stats.dense_local_slots = slots + extra_slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, part_slots, bits, ef, 0, plan);
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, NULL, plan, part_slots, bits, ef, 0, plan, false, NULL, -1);
 failed:
     ray_free_raw(c.counts); ray_free_raw(c.gids); ray_free_raw(c.tasks);
     ray_free_raw(c.payload); ray_free_raw(c.value_offsets); ray_release(c.selection_indices); ray_free_raw(c.states); ray_free_raw(c.first);
@@ -4399,9 +4698,51 @@ typedef struct {
     const agg_desc_t* desc;
     uint32_t n_aggs;
     char* states;
+    uint32_t* cnt32;                /* the count-only slab (agg_count32_slab), else NULL */
+    int64_t slots;
+    /* A probe pass (agg_dense_cut_ties) reads the keys again and records, for
+     * each slot of pslots (ascending) whose bit is set in probe, the first row
+     * that holds it in pfirst; it updates no counter. */
+    const uint64_t* probe;
+    const int64_t* pslots;
+    int64_t pn;
+    int64_t* pfirst;
+    ray_t* sel;                     /* the selection (selected-row space), else NULL */
+    const int64_t* sel_prefix;
+    const agg_valdesc_t* vd;
     _Atomic(uint64_t)* occupied;
-    int64_t* first;
 } agg_dense_shared_ctx_t;
+
+static inline void agg_probe_note(const agg_dense_shared_ctx_t* c, uint32_t slot, int64_t row) {
+    if (!((c->probe[slot >> 6] >> (slot & 63)) & 1)) return;
+    int64_t lo = 0, hi = c->pn - 1;
+    while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (c->pslots[mid] < (int64_t)slot) lo = mid + 1; else hi = mid;
+    }
+    int64_t seen = __atomic_load_n(&c->pfirst[lo], __ATOMIC_RELAXED);
+    while (row < seen &&
+           !__atomic_compare_exchange_n(&c->pfirst[lo], &seen, row, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+static void agg_dense_shared_zero(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_shared_ctx_t* c = raw;
+    memset(c->cnt32 + start, 0, (size_t)(end - start) * sizeof(uint32_t));
+}
+
+/* The count-only slab keeps no bit per row: a slot is occupied when its
+ * counter is not zero. */
+static void agg_dense_shared_cnt_occupied(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_shared_ctx_t* c = raw;
+    for (int64_t w = start; w < end; w++) {
+        uint64_t m = 0;
+        for (int64_t b = 0; b < 64 && w * 64 + b < c->slots; b++)
+            if (c->cnt32[w * 64 + b]) m |= UINT64_C(1) << b;
+        atomic_store_explicit(&c->occupied[w], m, memory_order_relaxed);
+    }
+}
 
 static void agg_dense_shared_init(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
@@ -4422,11 +4763,15 @@ static void agg_dense_shared_block(void* raw, const agg_view_t* v, uint32_t wid,
     const int64_t base = v->base;
     uint32_t gids[8192];
     int64_t n = end - begin;
+    uint32_t* cnt32 = c->cnt32;
+    const uint64_t* probe = c->probe;
     #define SHARED_GIDS(T) do { \
         const T* p = (const T*)data + (begin - base); \
         for (int64_t i = 0; i < n; i++) { \
             uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[i]); \
             gids[i] = slot; \
+            if (probe) { agg_probe_note(c, slot, begin + i); continue; } \
+            if (cnt32) { __atomic_fetch_add(&cnt32[slot], 1, __ATOMIC_RELAXED); continue; } \
             uint64_t bit = UINT64_C(1) << (slot % 64); \
             _Atomic(uint64_t)* word = &c->occupied[slot / 64]; \
             if (!(atomic_load_explicit(word, memory_order_relaxed) & bit)) \
@@ -4448,15 +4793,76 @@ static void agg_dense_shared_block(void* raw, const agg_view_t* v, uint32_t wid,
             break;
     }
     #undef SHARED_GIDS
+    if (cnt32 || probe) return;
     for (uint32_t a = 0; a < c->n_aggs; a++) {
-        const void* vals = (const char*)v->val_data[a] + (size_t)(begin - base) * d->val_esz[a];
+        const void* vals = v->val_data[a]   /* NULL: COUNT reads no input */
+            ? (const char*)v->val_data[a] + (size_t)(begin - base) * d->val_esz[a] : NULL;
         ray_valid_t valid = {vals, d->val_types[a], d->val_hasnull[a]};
         vo->vts[a]->update_shared(c->states + vo->off[a], vo->block, gids, vals, &valid, n);
     }
 }
 
+/* A run of selected rows rows[ib, ie) read through view v: their slots, then
+ * the counters or the shared kernels. */
+typedef struct {
+    agg_dense_shared_ctx_t* c;
+    const int64_t* rows;
+    uint32_t* gid;
+    agg_sel_scratch_t* sc;
+    int oom;
+} agg_dense_shared_sel_t;
+static void agg_dense_shared_sel_run(void* raw, const agg_view_t* v, uint32_t wid, int64_t ib, int64_t ie) {
+    (void)wid;
+    agg_dense_shared_sel_t* t = raw;
+    agg_dense_shared_ctx_t* c = t->c;
+    for (int64_t i = ib; i < ie; i++) {
+        int64_t r = t->rows[i];
+        int64_t k = agg_read_key_i64_raw(c->key->type, v->key_attrs[0], v->key_data[0], r - v->base);
+        uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, k);
+        t->gid[i - ib] = slot;
+        if (c->probe) { agg_probe_note(c, slot, r); continue; }
+        if (c->cnt32) { __atomic_fetch_add(&c->cnt32[slot], 1, __ATOMIC_RELAXED); continue; }
+        uint64_t bit = UINT64_C(1) << (slot % 64);
+        _Atomic(uint64_t)* word = &c->occupied[slot / 64];
+        if (!(atomic_load_explicit(word, memory_order_relaxed) & bit))
+            atomic_fetch_or_explicit(word, bit, memory_order_relaxed);
+    }
+    if (c->cnt32 || c->probe) return;
+    if (agg_sel_accum_chunk(c->vd, v, t->sc, c->states, t->gid, t->rows + ib, ie - ib, true) != 0) t->oom = 1;
+}
+
+/* Selected-row space [start, end): chunks of selected rows are decoded to
+ * their original rows and read through the key sources (R-SPARSE for staged
+ * ones). */
+static void agg_dense_shared_sel_rows(agg_dense_shared_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
+    const agg_desc_t* d = c->desc;
+    int64_t rows[AGG_SEL_CHUNK];
+    uint32_t gid[AGG_SEL_CHUNK];
+    agg_sel_scratch_t sc;
+    if (!agg_sel_scratch_init(&sc, c->n_aggs)) { ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL)); return; }
+    agg_curs_t cs; cs.cur = NULL;
+    if (d->staged && !agg_curs_init(&cs, &d->rr)) {
+        ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL));
+        agg_sel_scratch_free(&sc);
+        return;
+    }
+    agg_sel_cursor_t cur;
+    agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
+    agg_dense_shared_sel_t t = { c, rows, gid, &sc, 0 };
+    int64_t cn;
+    while (!t.oom && !agg_cancelled() && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+        if (!d->staged) { agg_dense_shared_sel_run(&t, &d->whole, wid, 0, cn); continue; }
+        ray_t* err = agg_idx_walk(&d->rr, &cs, rows, 0, cn, &t, agg_dense_shared_sel_run, wid);
+        if (err) { ray_scan_fail_note(d->rr.fail, start, err); break; }
+    }
+    if (t.oom) ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL));
+    agg_curs_free(&cs, &d->rr);
+    agg_sel_scratch_free(&sc);
+}
+
 static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_shared_ctx_t* c = raw;
+    if (c->sel) { agg_dense_shared_sel_rows(c, wid, start, end); return; }
     const agg_desc_t* d = c->desc;
     agg_curs_t cs; cs.cur = NULL;
     if (d->staged && !agg_curs_init(&cs, &d->rr)) { ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL)); return; }
@@ -4468,42 +4874,121 @@ static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_
     agg_curs_free(&cs, &d->rr);
 }
 
-static void agg_dense_shared_occupied(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    agg_dense_shared_ctx_t* c = raw;
-    for (int64_t s = start; s < end; s++)
-        c->first[s] = atomic_load_explicit(&c->occupied[s / 64], memory_order_relaxed)
-            & (UINT64_C(1) << (s % 64)) ? 0 : INT64_MAX;
+typedef struct { int64_t first, slot; bool strict; } agg_tie_t;
+static int agg_tie_cmp(const void* a, const void* b) {
+    int64_t x = ((const agg_tie_t*)a)->first, y = ((const agg_tie_t*)b)->first;
+    return x < y ? -1 : x > y;
+}
+static int agg_dbl_cmp(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The kept groups of a top-N cut (the threshold's ties included) as the radix
+ * route answers it: of the groups tied at the threshold only the ones with the
+ * smallest first rows stay, so N groups remain, and the kept groups come in
+ * first-row order, which the sort downstream keeps for equal values.  The
+ * first rows come from one more pass over the keys (a probe pass) that notes
+ * them for the kept slots only.  Kept values that are all different need
+ * neither, and the slot order stands.  False with *err set on failure. */
+static bool agg_dense_cut_ties(ray_pool_t* pool, agg_dense_shared_ctx_t* c, agg_desc_t* d, const agg_lean_src_t* src,
+        const ray_group_emit_filter_t* ef, bool have_thr, double thr, int64_t rows,
+        int64_t* slots, int64_t* n_io, ray_t** err) {
+    int64_t n = *n_io;
+    *err = NULL;
+    if (n <= 1) return true;
+    double* vals = ray_alloc_raw((size_t)n * sizeof(double));
+    double* sorted = ray_alloc_raw((size_t)n * sizeof(double));
+    uint64_t* bm = ray_calloc_raw(((size_t)c->slots + 63) / 64 * sizeof(uint64_t));
+    int64_t* first = ray_alloc_raw((size_t)n * sizeof(int64_t));
+    agg_tie_t* ties = ray_alloc_raw((size_t)n * sizeof(agg_tie_t));
+    bool ok = false;
+    if (!vals || !sorted || !bm || !first || !ties) { *err = ray_error("oom", NULL); goto done; }
+    ok = true;
+    if (!agg_lean_vals(src, slots, n, vals)) goto done;
+    memcpy(sorted, vals, (size_t)n * sizeof(double));
+    qsort(sorted, (size_t)n, sizeof(double), agg_dbl_cmp);
+    bool distinct = true;
+    for (int64_t i = 1; i < n && distinct; i++) distinct = sorted[i] != sorted[i - 1];
+    if (distinct) goto done;
+    for (int64_t i = 0; i < n; i++) {
+        bm[slots[i] >> 6] |= UINT64_C(1) << (slots[i] & 63);
+        first[i] = INT64_MAX;
+    }
+    c->probe = bm; c->pslots = slots; c->pn = n; c->pfirst = first;
+    ray_pool_dispatch(pool, agg_dense_shared_rows, c, rows);
+    c->probe = NULL;
+    if (d->staged && (*err = ray_scan_fail_finish(&d->fail, pool)) != NULL) { ok = false; goto done; }
+    if (agg_cancelled()) { *err = ray_error("cancel", NULL); ok = false; goto done; }
+    int64_t nstrict = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ties[i].first = first[i]; ties[i].slot = slots[i];
+        ties[i].strict = !have_thr || (ef->desc ? vals[i] > thr : vals[i] < thr);
+        nstrict += ties[i].strict;
+    }
+    int64_t room = have_thr ? ef->top_count_take - nstrict : n;
+    qsort(ties, (size_t)n, sizeof(agg_tie_t), agg_tie_cmp);
+    int64_t w = 0, tied = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (!ties[i].strict && tied++ >= room) continue;
+        slots[w++] = ties[i].slot;
+    }
+    *n_io = w;
+done:
+    ray_free_raw(vals); ray_free_raw(sorted); ray_free_raw(bm); ray_free_raw(first); ray_free_raw(ties);
+    return ok;
 }
 
 static ray_t* agg_dense_shared(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
-        ray_pool_t* pool, const dense_plan_t* plan, int64_t rows,
+        ray_pool_t* pool, const dense_plan_t* plan, int64_t rows, ray_t* sel, const int64_t* sel_prefix,
         const agg_vo_t* vo, agg_desc_t* d, const ray_group_emit_filter_t* ef) {
     ray_t* ferr = NULL;   /* R-FAIL: a range error of a staged source */
     int64_t slots = plan->total_slots;
-    agg_dense_shared_ctx_t c = {.key = key_cols[0], .plan = plan, .layout = vo, .desc = d, .n_aggs = ext->n_aggs};
-    c.states = ray_alloc_raw((size_t)slots * vo->block);
-    c.first = ray_alloc_raw((size_t)slots * sizeof(int64_t));
+    agg_valdesc_t vd = { .n_aggs = ext->n_aggs, .vts = vo->vts, .off = vo->off, .block = vo->block,
+        .val_data = d->val_data, .val_types = d->val_types, .val_hasnull = d->val_hasnull, .val_esz = d->val_esz,
+        .val2_data = d->val2_data, .val2_types = d->val2_types, .val2_hasnull = d->val2_hasnull, .val2_esz = d->val2_esz };
+    agg_dense_shared_ctx_t c = {.key = key_cols[0], .plan = plan, .layout = vo, .desc = d, .n_aggs = ext->n_aggs, .slots = slots,
+        .sel = sel, .sel_prefix = sel_prefix, .vd = &vd};   /* rows: the selected rows with a selection */
+    bool u32c = plan->wide && agg_count32_slab(vo->vts, ext->n_aggs, rows);
+    c.states = ray_alloc_raw((size_t)slots * (u32c ? sizeof(uint32_t) : vo->block));
+    if (u32c) c.cnt32 = (uint32_t*)c.states;
     c.occupied = ray_alloc_raw(((size_t)slots + 63) / 64 * sizeof(*c.occupied));
-    if (!c.states || !c.first || !c.occupied) goto failed;
+    if (!c.states || !c.occupied) goto failed;
     for (int64_t w = 0; w < (slots + 63) / 64; w++) atomic_init(&c.occupied[w], 0);
-    ray_pool_dispatch(pool, agg_dense_shared_init, &c, slots);
+    ray_pool_dispatch(pool, u32c ? agg_dense_shared_zero : agg_dense_shared_init, &c, slots);
     ray_profile_tick("dense shared: initialized states");
     agg_desc_advise(d, rows);
     ray_pool_dispatch(pool, agg_dense_shared_rows, &c, rows);
     if (d->staged && (ferr = ray_scan_fail_finish(&d->fail, pool)) != NULL) goto failed;
     if (agg_cancelled()) goto failed;
     ray_profile_tick("dense shared: reduced rows");
-    ray_pool_dispatch(pool, agg_dense_shared_occupied, &c, slots);
-    if (agg_cancelled()) goto failed;
-    ray_profile_tick("dense shared: collected occupancy");
-    ray_free_raw(c.occupied);
+    if (u32c) ray_pool_dispatch(pool, agg_dense_shared_cnt_occupied, &c, (slots + 63) / 64);
     route_stats.dense_strategy = AGG_DENSE_SHARED;
     route_stats.dense_tasks = ray_pool_total_workers(pool);
     route_stats.dense_local_slots = slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, slots, 0, ef, 0, plan);
+    route_stats.dense_count32 = u32c;
+    int64_t* pre = NULL;
+    int64_t pre_n = -1;
+    if (ef && ef->top_count_take > 0) {
+        agg_lean_src_t src = { .vt = vo->vts[ef->agg_index], .states = c.states, .block = vo->block,
+            .off = vo->off[ef->agg_index], .param = ext->agg_k ? ext->agg_k[ef->agg_index] : 0,
+            .cnt32 = u32c ? c.cnt32 : NULL };
+        bool have_thr;
+        double thr;
+        int64_t k = agg_dense_lean_select(pool, &src, (const uint64_t*)c.occupied, slots, ef, &pre, &have_thr, &thr);
+        if (k >= 0) {
+            if (!agg_dense_cut_ties(pool, &c, d, &src, ef, have_thr, thr, rows, pre, &k, &ferr)) {
+                ray_free_raw(pre);
+                goto failed;
+            }
+            pre_n = k;
+        } else if (u32c) {
+            goto failed;
+        }
+    }
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, NULL, (const uint64_t*)c.occupied, plan, slots, 0, ef, 0, plan, u32c, pre, pre_n);
 failed:
-    ray_free_raw(c.states); ray_free_raw(c.first); ray_free_raw(c.occupied);
+    ray_free_raw(c.states); ray_free_raw(c.occupied);
     return ferr ? ferr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
 }
 
@@ -4552,7 +5037,7 @@ static ray_t* exec_group_v2_parallel_dense(
     const bool* val2_hasnull = d.val2_hasnull; const uint8_t* val2_esz = d.val2_esz;
 
     if (strategy == AGG_DENSE_SHARED) {
-        ray_t* result = agg_dense_shared(key_cols, key_syms, ext, pool, dp, nrows, &vo, &d, efp);
+        ray_t* result = agg_dense_shared(key_cols, key_syms, ext, pool, dp, sel ? n_sel : nrows, sel, sel_prefix, &vo, &d, efp);
         agg_vo_free(&vo); agg_desc_free(&d);
         return result;
     }
@@ -4680,7 +5165,7 @@ static ray_t* exec_group_v2_parallel_dense(
     ray_free_raw(locals);
 
     ray_t* result = agg_dense_finish(key_cols, key_syms, ext, pool, &vo, &d,
-                                      total_slots, gstates, gfirst, NULL, 0, 0, efp, group_limit, dp);
+                                      total_slots, gstates, gfirst, NULL, NULL, 0, 0, efp, group_limit, dp, false, NULL, -1);
     agg_vo_free(&vo); agg_desc_free(&d);
     return result;
 }
@@ -4959,7 +5444,7 @@ static void agg_sh_sel_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_
         if (g < 0) { t->sh->oom = 1; return; }
         t->gid[i - ib] = (uint32_t)g;
     }
-    if (agg_sel_accum_chunk(&t->c->vd, v, t->sc, t->sh->states, t->gid, t->rows + ib, ie - ib) != 0)
+    if (agg_sel_accum_chunk(&t->c->vd, v, t->sc, t->sh->states, t->gid, t->rows + ib, ie - ib, false) != 0)
         t->sh->oom = 1;
 }
 
@@ -8741,7 +9226,7 @@ static void agg_ts_idx_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_
     }
     int64_t n = ie - ib;
     if (rows) {
-        if (agg_sel_accum_chunk(&c->vd, v, run->sc, t->ent, gid, rows + ib, n) != 0) { ts->oom = 1; return; }
+        if (agg_sel_accum_chunk(&c->vd, v, run->sc, t->ent, gid, rows + ib, n, false) != 0) { ts->oom = 1; return; }
     } else {
         int64_t at = pos0 + ib - base;
         for (uint32_t a = 0; a < n_aggs; a++) {
@@ -11413,9 +11898,8 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     dense_plan_t dp;
     ray_t* plan_err = NULL;
     bool dense = sel ? agg_dense_plan_sel(key_cols, &ks->rr, ext->n_keys, n_sel, sel, sel_prefix, &dp, &plan_err)
-                     : agg_dense_plan_src(key_cols, &ks->rr, ext->n_keys, nrows, &dp, &plan_err);
+                     : agg_dense_plan_src(key_cols, &ks->rr, ext->n_keys, true, nrows, &dp, &plan_err);
     if (plan_err) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return plan_err; }
-    route_stats.dense_plan_available = dense;
 
     /* Compact-fallback helper for the non-chunked shapes (hash-fallback keys,
      * and the serial path): gather selected rows into a compact table once and
@@ -11451,6 +11935,42 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (vts[a]->kind != ACC_STREAMING) all_streaming = false;
 
     ray_pool_t* pool = ray_pool_get();
+    /* A single-key plan within the row count whose per-worker slabs could
+     * never fit the dense budget (a quarter of the watermark, or the scatter
+     * payload when that is less) is a wide plan too: only the one shared slab
+     * can run it, and the per-worker budget check below must not be the one
+     * that sends it to the radix route. */
+    if (dp.ok && !dp.wide && ext->n_keys == 1 && pool && eff_n >= RAY_PARALLEL_THRESHOLD) {
+        double budget = (double)eff_n * 2 * (8.0 * (ext->n_keys + ext->n_aggs + 1));
+        int64_t wmb = ray_heap_mem_budget();
+        if (wmb > 0 && budget > (double)wmb / 4) budget = (double)wmb / 4;
+        if ((double)dp.total_slots * (double)(block + sizeof(int64_t) + 1) > budget) dp.wide = true;
+    }
+    /* A wide plan (one key, range past the row count) runs only as the shared
+     * strategy: one state slab of the range plus its occupancy bits, which
+     * must fit three quarters of the room under the anonymous watermark (the
+     * rest is the emit's), and whose key shows many groups in a sample
+     * (agg_wide_populated).  Any other shape, or too little room, drops the
+     * plan and the grouping takes the route it took before. */
+    if (dp.wide) {
+        bool shared = pool && eff_n >= RAY_PARALLEL_THRESHOLD && all_streaming &&
+                      group_limit <= 0 && ext->n_keys == 1;
+        for (uint32_t a = 0; a < ext->n_aggs && shared; a++)
+            shared = vts[a]->update_shared != NULL;
+        size_t slot_bytes = agg_count32_slab(vts, ext->n_aggs, eff_n) ? sizeof(uint32_t) : block;
+        double need = (double)dp.total_slots * (double)slot_bytes + (double)dp.total_slots / 8;
+        bool fits = shared && !agg_no_wide_dense && need <= (double)agg_dense_wide_room() / 4 * 3;
+        ray_t* werr = NULL;
+        if (fits) fits = agg_wide_populated(key_cols[0], &ks->rr, nrows, &werr);
+        if (werr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return werr; }
+        if (!fits) {
+            agg_dense_plan_free(&dp);
+            dp.ok = false;
+            dp.wide = false;
+        }
+    }
+    dense = dense && dp.ok;
+    route_stats.dense_plan_available = dense;
     if (pool && eff_n >= RAY_PARALLEL_THRESHOLD && all_streaming) {
         /* A parallel dense plan owns one slot slab per worker. Admit it only
          * when the aggregate slot count across all workers remains O(input);
@@ -11482,12 +12002,13 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         /* A bounded group emit selects first-seen groups. Dense slot order
          * cannot satisfy that contract; retain radix's bounded selection. */
-        bool shared_plan = dp.ok && group_limit <= 0 && !sel && ext->n_keys == 1 && dp.total_slots >= 4096;
+        bool shared_plan = dp.ok && group_limit <= 0 && (dp.wide || !sel) && ext->n_keys == 1 && dp.total_slots >= 4096;
         for (uint32_t a = 0; a < ext->n_aggs && shared_plan; a++)
-            shared_plan = vts[a]->update_shared != NULL;
+            shared_plan = vts[a]->update_shared != NULL &&
+                          (dp.wide || !vts[a]->shared_add);   /* an atomic add in the shared slab serves wide plans only */
         ray_t* serr = NULL;
-        bool shared_ok = shared_plan && slab_bytes <= dense_budget &&
-                         agg_shared_sample(g, ext, tbl, key_cols, &vo, nrows, &serr);
+        bool shared_ok = shared_plan && (dp.wide || (slab_bytes <= dense_budget &&
+                         agg_shared_sample(g, ext, tbl, key_cols, &vo, nrows, &serr)));
         if (serr) {                       /* a failed column bind */
             agg_vo_free(&vo); agg_dense_plan_free(&dp);
             return serr;
