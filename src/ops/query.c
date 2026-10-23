@@ -27134,11 +27134,12 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("arity", "insert: expects a target and a value, got %lld args", (long long)n);
 
     /* In-place vs functional is decided by the EVALUATED first argument:
-     * a symbol value names a global to amend in place (returning that
+     * a symbol value names a binding to amend in place (returning that
      * symbol); a table/vec value is amended functionally (returning the
      * new value).  Evaluating first means it works however the symbol
      * arrives — literal 'sym, (quote sym), a variable, or a lambda param. */
     int64_t inplace_sym = -1;
+    ray_env_target_t target = {0};
     ray_t* tbl_raw = args[0];
     ray_t* tbl;
 
@@ -27152,11 +27153,13 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         tbl = ray_eval(tbl_raw);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("type", "insert: target evaluation failed");
         if (tbl->type == -RAY_SYM) {
-            /* Symbol value → resolve the named global for in-place insert */
+            /* Resolve once: a local target must never publish into a global. */
             inplace_sym = tbl->i64;
             ray_release(tbl);
-            tbl = ray_env_get(inplace_sym);
-            if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "insert: target symbol is unbound");
+            ray_err_t err = ray_env_target_resolve(inplace_sym, &target, &tbl);
+            if (err != RAY_OK)
+                return ray_error(err == RAY_ERR_NAME ? "domain" : ray_err_code_str(err),
+                                 "insert: cannot resolve target binding");
             ray_retain(tbl);
         }
     }
@@ -27332,9 +27335,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
             /* In-place amend stores the new value and returns the symbol. */
-            ray_env_set(inplace_sym, result);
+            ray_err_t err = ray_env_target_set(&target, result);
             ray_release(result);
-            return ray_sym(inplace_sym);
+            return err == RAY_OK ? ray_sym(inplace_sym)
+                : ray_error(ray_err_code_str(err), "insert: cannot publish target");
         }
         return result;
     }
@@ -27386,7 +27390,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
              * and surface dotted-path OOM/type failures instead of
              * falsely returning the target symbol as success. */
             ray_err_t bind_err = result == tbl ? RAY_OK
-                               : ray_env_set(inplace_sym, result);
+                               : ray_env_target_set(&target, result);
             ray_release(result);
             ray_release(tbl);
             if (bind_err != RAY_OK) {
@@ -27536,8 +27540,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
      * On a mid-batch failure the appended lengths are rolled back, so the
      * table keeps its pre-insert value; unlike the rebuild, already-grown
      * capacity and dropped accelerator indexes are not restored. */
-    bool inplace_ok = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
-                      !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    bool inplace_ok = inplace_sym >= 0 && ray_env_target_sole(&target, tbl, 1);
     ray_t* live_cols = NULL;
     if (inplace_ok) {
         live_cols = ray_table_cols_inplace(tbl);         /* NULL: an encoded slot */
@@ -27855,9 +27858,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
     /* In-place: store the new table in the env and return the symbol. */
     if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
-        ray_env_set(inplace_sym, result);
+        ray_err_t err = ray_env_target_set(&target, result);
         ray_release(result);
-        return ray_sym(inplace_sym);
+        return err == RAY_OK ? ray_sym(inplace_sym)
+            : ray_error(ray_err_code_str(err), "insert: cannot publish target");
     }
     return result;
 }

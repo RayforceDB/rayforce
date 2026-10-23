@@ -22,6 +22,7 @@
  */
 
 #include "lang/eval.h"
+#include "lang/internal.h"   /* quoted mutator entry points */
 #include "lang/env.h"
 #include "lang/nfo.h"
 #include "table/sym.h"   /* ray_read_sym — capture names */
@@ -234,6 +235,7 @@ static void emit_jump_back(compiler_t *c, int32_t target) {
 /* Cached sym IDs for special forms */
 static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_times = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
 static _Thread_local int64_t sf_eval = -1, sf_resolve = -1;
+static _Thread_local int64_t sf_alter = -1, sf_insert = -1;
 
 static void init_sf_syms(void) {
     if (sf_set >= 0) return;
@@ -250,6 +252,8 @@ static void init_sf_syms(void) {
     sf_null   = ray_sym_intern("null", 4);
     sf_eval    = ray_sym_intern("eval", 4);
     sf_resolve = ray_sym_intern("resolve", 7);
+    sf_alter = ray_sym_intern("alter", 5);
+    sf_insert = ray_sym_intern("insert", 6);
 }
 
 /* Does `ast` mention any of the current locals — or `self`, or a
@@ -262,8 +266,11 @@ static void init_sf_syms(void) {
 static bool ast_refs_locals(compiler_t *c, ray_t *ast);
 static bool sym_is_local_ref(compiler_t *c, int64_t id) {
     if (id == sf_self || id == sf_eval || id == sf_resolve) return true;
+    const int64_t* segs = NULL;
+    int nseg = ray_sym_is_dotted(id) ? ray_sym_segs(id, &segs) : 0;
     for (int32_t i = c->n_locals - 1; i >= 0; i--)
-        if (c->locals[i].sym_id == id) return true;   /* params, lets, captures */
+        if (c->locals[i].sym_id == id ||
+            (nseg > 1 && c->locals[i].sym_id == segs[0])) return true;   /* params, lets, captures */
     return false;
 }
 static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
@@ -603,12 +610,12 @@ static void compile_sf_return(compiler_t *c, ray_t *ast, ray_t **elems, int64_t 
  * see this frame's local slots — so materialize the locals known
  * at this point (plus self) into a scope frame around the eval,
  * and sync any let-updates back into the slots afterwards. */
-static void compile_dyn_form(compiler_t *c, ray_t *ast) {
+static void compile_dyn_form(compiler_t *c, ray_t *ast, bool all_locals) {
     /* The window binds the locals the form mentions (none in the
      * common globals-only case) and marks where the text's scope
      * ends: a function the text calls, or a window of whoever called
      * this frame, sees none of them (OP_SCOPE_EVAL). */
-    bool refs = ast_refs_locals(c, ast);
+    bool refs = all_locals || ast_refs_locals(c, ast);
     int32_t nsyms = refs ? c->n_locals : 0;
     ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
     if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
@@ -728,7 +735,13 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     }
 
     /* An unrecognized special form: dynamic eval on the whole form. */
-    if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) { compile_dyn_form(c, ast); return; }
+    if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) {
+        /* A mutator's target may be a computed symbol, not a literal mention
+         * of the local. Its eval window must still expose the current frame. */
+        ray_vary_fn f = fn->type == RAY_VARY ? (ray_vary_fn)(uintptr_t)fn->i64 : NULL;
+        compile_dyn_form(c, ast, f == ray_insert || f == ray_insert_fn || f == ray_alter_fn);
+        return;
+    }
 
     /* `eval` and `resolve` read names from text at run time: the tree
      * walker that serves them resolves through the scope frames, so the
@@ -854,6 +867,10 @@ static void compile_expr_at(compiler_t *c, ray_t *ast) {
                 emit(c, (uint8_t)slot);
                 emit(c, (uint8_t)(idx >> 8));
                 emit(c, (uint8_t)(idx & 0xFF));
+            } else if (ray_sym_is_dotted(ast->i64) && sym_is_local_ref(c, ast->i64)) {
+                /* A member of a local dictionary must resolve through this
+                 * frame, not a same-named global root. */
+                compile_dyn_form(c, ast, true);
             } else if (ast->i64 == sf_self) {
                 /* `self` as a value is the running lambda, as the tree
                  * walker binds it in every call frame. */
@@ -906,8 +923,8 @@ static bool closure_shape_ok(ray_t *closure) {
 
 /* Every symbol id mentioned anywhere in `ast` (atoms, sym vectors, lists,
  * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
- * set when the text mentions `eval` or `resolve`, which can reach a name
- * that is not spelled out. */
+ * set when the text mentions `eval` / `resolve`, or a mutator with a
+ * computed target, which can reach a name that is not spelled out. */
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
                                 bool stop, int64_t *nodes);
 /* The nodes a walk for a closure's names visits at most.  A large constant
@@ -1011,6 +1028,16 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     }
     if (ast->type == RAY_LIST) {
         ray_t **elems = (ray_t**)ray_data(ast);
+        /* A computed mutator target can name any enclosing binding. Keep
+         * those captures before compile_dyn_form exposes the closure's
+         * slots; an eval window cannot recover a discarded capture.
+         * Literal targets already contribute their names below. */
+        if (ast->len >= 2 && elems[0] && elems[0]->type == -RAY_SYM &&
+            !(elems[0]->attrs & ATTR_QUOTED) &&
+            (elems[0]->i64 == sf_alter || elems[0]->i64 == sf_insert) &&
+            !(elems[1] && elems[1]->type == -RAY_SYM &&
+              (elems[1]->attrs & ATTR_QUOTED)))
+            *dynamic = true;
         for (int64_t i = 0; i < ast->len; i++)
             if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop, nodes)) return false;
         return true;
@@ -1026,12 +1053,19 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
 static bool syms_contain(ray_t *syms, int64_t id) {
     if (!syms) return false;
     const int64_t *ids = (const int64_t*)ray_data(syms);
-    for (int64_t i = 0; i < syms->len; i++) if (ids[i] == id) return true;
+    for (int64_t i = 0; i < syms->len; i++) {
+        if (ids[i] == id) return true;
+        if (ray_sym_is_dotted(ids[i])) {
+            const int64_t* segs;
+            int n = ray_sym_segs(ids[i], &segs);
+            if (n > 1 && segs[0] == id) return true;
+        }
+    }
     return false;
 }
 
 /* The capture names a closure body can reach: the closure dict's keys that
- * the body mentions (every key when the body uses eval or resolve), never
+ * the body mentions (every key for dynamic name resolution), never
  * `self`.  A SYM vector the caller releases, or NULL for none.  *failed is
  * set when the body could not be walked (nesting past the walk's guard,
  * more nodes than AST_NAME_NODES, or an allocation failure): NULL
@@ -1066,8 +1100,8 @@ static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
 
 /* A `fn` literal inside a compiled body becomes a template compiled once,
  * here, against the enclosing locals its body mentions (all of them when
- * the body uses eval or resolve); OP_MKCLOSURE then makes each closure
- * share the template's bytecode and capture those slots.  Returns false,
+ * the body uses dynamic name resolution); OP_MKCLOSURE then makes each
+ * closure share the template's bytecode and capture those slots.  Returns false,
  * without emitting, when the literal cannot be compiled this way; the
  * caller then falls back to evaluating the literal through the tree
  * walker. */
@@ -1392,4 +1426,5 @@ ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {
 void ray_compile_reset(void) {
     sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = sf_null = -1;
     sf_eval = sf_resolve = -1;
+    sf_alter = sf_insert = -1;
 }
