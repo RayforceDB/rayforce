@@ -8318,6 +8318,7 @@ static uint32_t agg_radix_spill_run(agg_radix_ctx_t* c, ray_pool_t* pool, uint32
                 bufmem + ((size_t)t * (n_waves - 1) + (w - 1)) * stride;
     sp.wave_base = wave_base;
     sp.wave_blks = wave_blks;
+    // cppcheck-suppress autoVariables // sp outlives every dispatch that reads it; c->spill is reset before return
     c->spill = &sp; c->wave_of = wave_of;
 
     uint32_t next = n_waves;
