@@ -2552,13 +2552,15 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n) {
     bool homogeneous = true;
     bool has_float = (atype == -RAY_F64);
     bool has_int = (atype == -RAY_I64);
+    bool all_numeric = has_float || has_int;
     for (int64_t i = 1; i < n; i++) {
         if (args[i]->type != atype) homogeneous = false;
         if (args[i]->type == -RAY_F64) has_float = true;
-        if (args[i]->type == -RAY_I64) has_int = true;
+        else if (args[i]->type == -RAY_I64) has_int = true;
+        else all_numeric = false;
     }
-    /* Mixed int/float -> promote to f64 */
-    if (!homogeneous && has_float && has_int) {
+    /* Only I64/F64 atoms have the payloads used by this promotion. */
+    if (!homogeneous && has_float && has_int && all_numeric) {
         ray_t* vec = ray_vec_new(RAY_F64, n);
         if (RAY_IS_ERR(vec)) return vec;
         double* d = (double*)ray_data(vec);
