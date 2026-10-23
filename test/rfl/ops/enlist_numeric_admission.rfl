@@ -1,0 +1,30 @@
+;; I64/F64 presence does not authorize interpreting other kinds as numbers.
+(type (enlist 1 'a 1.5)) -- 'LIST
+(at (enlist 1 'a 1.5) 1) -- 'a
+(type (enlist 1 2024.01.01 1.5)) -- 'LIST
+(at (enlist 1 2024.01.01 1.5) 1) -- 2024.01.01
+(type (enlist 1 true 1.5)) -- 'LIST
+(at (enlist 1 true 1.5) 1) -- true
+(type (enlist 1 "s" 1.5)) -- 'LIST
+(at (enlist 1 "s" 1.5) 1) -- "s"
+(type (enlist -1i 2 1.5)) -- 'LIST
+(type (at (enlist -1i 2 1.5) 0)) -- 'i32
+(at (enlist -1i 2 1.5) 0) -- -1i
+(type (enlist -1h 2 1.5)) -- 'LIST
+(type (at (enlist -1h 2 1.5) 0)) -- 'i16
+(at (enlist -1h 2 1.5) 0) -- -1h
+
+;; Containers and typed nulls also stay boxed; preserve the nested value.
+(type (enlist 1 [2 3] 1.5)) -- 'LIST
+(at (enlist 1 [2 3] 1.5) 1) -- [2 3]
+(type (enlist 1 0Ni 1.5)) -- 'LIST
+(type (at (enlist 1 0Ni 1.5) 1)) -- 'i32
+(nil? (at (enlist 1 0Ni 1.5) 1)) -- true
+
+;; Existing numeric promotion, nulls, and homogeneous cases are unchanged.
+(enlist 1 2.5 -3) -- [1.0 2.5 -3.0]
+(type (enlist 1 2.5 -3)) -- 'F64
+(enlist 1 0Nl 3.0) -- [1.0 0Nf 3.0]
+(enlist 1 2 3) -- [1 2 3]
+(enlist -1i 2i) -- [-1i 2i]
+(count (enlist)) -- 0
