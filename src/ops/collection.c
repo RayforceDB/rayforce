@@ -583,6 +583,11 @@ static ray_t* iter_elem_owned(ray_t* coll, int64_t i) {
  * no vector null: a native typed-null atom of either type stays boxed. */
 static bool map_vector_atom(ray_t* value) {
     if (value->type >= 0 || !ray_is_vector_type(-value->type)) return false;
+    /* These I64 atoms own opaque resources. A raw integer cell cannot
+     * carry their tags or finalizers, including after a typed prefix. */
+    if (value->type == -RAY_I64 &&
+        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)))
+        return false;
     return !((value->type == -RAY_BOOL || value->type == -RAY_U8) &&
              RAY_ATOM_IS_NULL(value));
 }

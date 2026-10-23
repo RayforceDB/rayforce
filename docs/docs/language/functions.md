@@ -145,7 +145,9 @@ Functions that take other functions as arguments.
 `map` and `pmap` return a typed vector when every result is an atom of
 exactly the same vector-supported type, including strings, symbols and
 representable typed nulls. Native boolean/byte null atoms remain boxed
-because those vector types are non-nullable. Mixed atom types (including
+because those vector types are non-nullable. Opaque graph, HNSW index and
+Datalog program handles also remain boxed: their integer payload alone cannot
+represent the handle's resource ownership. Mixed atom types (including
 integers mixed with floats), nested results and untyped `null` results
 remain a `LIST`. Empty input returns an empty `LIST`, since there is no
 result type to infer. A binary map with a scalar third argument still calls
