@@ -278,6 +278,7 @@ static FILE* print_begin(ray_t** args, int64_t n, uint64_t* c0) {
     *c0 = ray_sym_domain_corruptions();
     if (!print_args_have_file_syms(args, n)) return stdout;
     FILE* t = tmpfile();
+    // cppcheck-suppress resourceLeak // the caller's print_end closes it (ray_sym_print_commit)
     return t ? t : stdout;
 }
 static ray_t* print_end(FILE* out, uint64_t c0) {
