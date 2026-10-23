@@ -235,7 +235,7 @@ conversion.
 ;; Inclusive signed-integer range: prune disjoint row groups, then filter
 ;; surviving rows exactly. The filter column need not be projected.
 (.parquet.read
-  {columns: [URL] range: {column: CounterID min: 62 max: 62}}
+  {columns: [URL] range: {column: 'CounterID min: 62 max: 62}}
   "hits.parquet")
 
 ;; Process at most 65,536 rows per callback. Returns the number of rows
@@ -253,7 +253,7 @@ conversion.
 
 Both `.parquet.read` and `.parquet.each` accept an optional column symbol
 vector or an options dictionary before the path. Supported options are
-`columns`, `types`, `strict`, and `range: {column: name min: lo max: hi}`. Bounds are I64 atoms;
+`columns`, `types`, `strict`, and `range: {column: 'name min: lo max: hi}`. Bounds are I64 atoms;
 range filtering currently supports signed integer columns only. Missing or
 unusable row-group bounds fall back to decoding. A range is an exact filter,
 not just a pruning hint. A scan with no matching rows may deliver an empty

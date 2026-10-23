@@ -1029,7 +1029,38 @@ static test_result_t test_compile_default_switch_case(void) {
 /* ════════════════════════════════════════════════════════════════════
  * Entry table
  * ════════════════════════════════════════════════════════════════════ */
+/* Literal values must execute as bytecode in this frame, including let
+ * and return. This guards against silently falling back to dynamic eval. */
+static test_result_t test_compile_dict_literal(void) {
+    ray_t* fn = ray_eval_str("(fn [p] {a: (let local (+ p 1)) b: (+ local 1)})");
+    TEST_ASSERT_NOT_NULL(fn); TEST_ASSERT_FALSE(RAY_IS_ERR(fn));
+    ray_compile(fn);
+    TEST_ASSERT_TRUE(LAMBDA_IS_COMPILED(fn));
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("dict_compiled957", 16), fn), RAY_OK);
+    ray_release(fn);
+    EVAL_I64("(at (dict_compiled957 3) 'b)", 5);
+    EVAL_I64("((fn [] {a: (return 7)} 99))", 7);
+    EVAL_I64("((fn [] {a: (let local 8)} local))", 8);
+    /* Runtime C dictionaries are data. A forged literal marker with a
+     * typed value container is rejected rather than read as AST pointers. */
+    ray_t* keys = ray_eval_str("[a]");
+    ray_t* vals = ray_eval_str("[1]");
+    ray_t* data = ray_dict_new(keys, vals); /* consumes both */
+    TEST_ASSERT_NOT_NULL(data); TEST_ASSERT_FALSE(RAY_IS_ERR(data));
+    ray_t* value = ray_eval(data);
+    TEST_ASSERT_EQ_PTR(value, data);
+    ray_release(value);
+    data->attrs |= RAY_DICT_LITERAL;
+    value = ray_eval(data);
+    TEST_ASSERT_NOT_NULL(value); TEST_ASSERT_TRUE(RAY_IS_ERR(value));
+    TEST_ASSERT_STR_EQ(ray_err_code(value), "domain");
+    ray_error_free(value);
+    ray_release(data);
+    PASS();
+}
+
 const test_entry_t compile_entries[] = {
+    { "compile/dict_literal", test_compile_dict_literal, compile_setup, compile_teardown },
     { "compile/set_inside_fn",       test_compile_set_inside_fn,       compile_setup, compile_teardown },
     { "compile/set_forces_lazy_value", test_compile_set_forces_lazy_value, compile_setup, compile_teardown },
     { "compile/set_forces_lazy_chain", test_compile_set_forces_lazy_chain, compile_setup, compile_teardown },

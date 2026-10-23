@@ -81,8 +81,8 @@ While waiting for its response, `.ipc.send` keeps servicing the connection: an a
 ;; String-form query
 (.ipc.send h "(select {from: trades where: (> price 100) take: 10})")
 
-;; Expression form — dict stays unevaluated until the server processes it
-(.ipc.send h (list select {from: trades by: sym total: (sum qty)}))
+;; Quote static query syntax for server-side evaluation
+(.ipc.send h (list select (quote {from: trades by: sym total: (sum qty)})))
 
 ;; Give up (and drop the connection) if no answer within 5 seconds
 (.ipc.send h "(count trades)" 5000)

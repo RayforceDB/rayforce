@@ -761,9 +761,9 @@ boxed_list:
  * Builds a RAY_DICT block holding [keys, vals].
  * Keys are emitted as a RAY_SYM vector when every key is a bareword sym
  * literal, as a RAY_STR vector when every key is a quoted string literal,
- * or as a heterogeneous RAY_LIST otherwise.  Values stay unevaluated in
- * a RAY_LIST so dict literals remain self-evaluating (the (dict ...)
- * builtin evaluates them on demand).
+ * or as a heterogeneous RAY_LIST otherwise. Values remain syntax in a
+ * RAY_LIST. The literal marker makes ordinary eval construct their values;
+ * query special forms still receive this syntax without ordinary eval.
  */
 static ray_t* parse_dict(ray_parser_t *p) {
     advance(p, 1); /* skip { */
@@ -847,7 +847,9 @@ static ray_t* parse_dict(ray_parser_t *p) {
     } else {
         keys = key_list;  /* heterogeneous or empty — use the LIST as-is */
     }
-    return ray_dict_new(keys, vals);
+    ray_t* dict = ray_dict_new(keys, vals);
+    if (dict && !RAY_IS_ERR(dict)) dict->attrs |= RAY_DICT_LITERAL;
+    return dict;
 }
 
 /* ── List (s-expression): (fn arg1 arg2 ...) ── */

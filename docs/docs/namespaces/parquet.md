@@ -44,7 +44,7 @@ Materialize all columns, a projection vector, or a read configured with
 (.parquet.read "events.parquet")
 (.parquet.read [id text] "events.parquet")
 (.parquet.read
-  {columns: [text] range: {column: id min: 10 max: 20}}
+  {columns: [text] range: {column: 'id min: 10 max: 20}}
   "events.parquet")
 ```
 

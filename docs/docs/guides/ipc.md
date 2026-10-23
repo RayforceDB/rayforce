@@ -128,19 +128,19 @@ The server evaluates any valid Rayfall expression sent as a string. This means y
 
 ### Expression payloads
 
-Instead of strings, construct the query as a list. Builtins resolve to function objects — use them directly as the list head. Dict literals are self-evaluating, so column references inside them are preserved for server-side resolution:
+Instead of strings, construct the query as a list. Builtins resolve to function objects — use them directly as the list head. Ordinary dictionary literals evaluate their values, so quote a static query dictionary to preserve its column references for server-side resolution:
 
 ```text
 ;; Arithmetic
 (.ipc.send h (list + 1 2))
 ;; => 3
 
-;; Select with filter — dict is self-evaluating, select resolves columns
-(.ipc.send h (list select {from: trades where: (> price 200)}))
+;; Quoted query syntax is interpreted by select on the server
+(.ipc.send h (list select (quote {from: trades where: (> price 200)})))
 ;; => filtered trades table
 
 ;; Aggregation by group
-(.ipc.send h (list select {from: trades by: sym total: (sum qty)}))
+(.ipc.send h (list select (quote {from: trades by: sym total: (sum qty)})))
 
 ;; Map a lambda over server-side data
 (.ipc.send h (list map (fn [x] (* x 2)) (list til 10)))
@@ -152,18 +152,24 @@ For dynamic queries, substitute runtime values into the expression:
 ```text
 ;; Dynamic filter threshold
 (set threshold 200)
-(.ipc.send h (list select {from: trades where: (list > (quote price) threshold)}))
+(.ipc.send h (list select {from: (list resolve 'trades) where: (list > 'price threshold)}))
 
 ;; Dynamic grouping
 (set group-col 'sym)
-(.ipc.send h (list select {from: trades by: group-col total: (list sum (quote qty))}))
+(.ipc.send h (list select {from: (list resolve 'trades) by: group-col total: (list sum 'qty)}))
 ```
 
 !!! note "How it works"
 
-    Dict literals are self-evaluating — `{from: trades where: (> price 200)}` preserves its contents as data. When the server evaluates the list, `select` resolves `trades` and `price` in the table context. Use `(list ...)` inside the dict when you need to splice runtime values into an expression.
+    The static examples quote the whole dictionary. `select` receives its
+    original clause syntax when the server evaluates the expression payload.
 
-    Because the query is built as data, `(quote price)` and `(quote qty)` evaluate to the literal symbols `'price` and `'qty` as each `(list ...)` is constructed. A literal symbol that names a from-table column resolves to that column during query evaluation, so they resolve to the `price` and `qty` columns. The tick forms `'price`/`'qty`, and bare `price`/`qty`, work the same way.
+    The dynamic examples instead evaluate the dictionary on the client.
+    `threshold` and `group-col` are spliced into its values. The `from:` value
+    is a call expression `(list resolve 'trades)`, which resolves the server's
+    table when the query runs. Predicate and aggregate expressions are also
+    built as lists. Their quoted symbols name columns in query context.
+    A bare `price` or `qty` here would try to read a client-side binding.
 
 ## 5. Async Fire-and-Forget
 

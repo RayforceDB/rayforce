@@ -2973,6 +2973,18 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     return result;
 }
 
+/* Fresh dictionary storage for a literal. Every slot starts as a valid
+ * null value, so normal VM error/return unwinding can release a prefix. */
+static ray_t* dict_literal_new(ray_t* keys) {
+    ray_t* vals = ray_list_new(keys->len);
+    if (RAY_IS_ERR(vals)) return vals;
+    ray_t** out = (ray_t**)ray_data(vals);
+    for (int64_t i = 0; i < keys->len; i++) out[i] = RAY_NULL_OBJ;
+    vals->len = keys->len;
+    ray_retain(keys);
+    return ray_dict_new(keys, vals);
+}
+
 /* `row_args` bit i: parameter i is derived from the rows of the active
  * query.  The flag rides on vm.rows beside every stack slot: loads and
  * stores copy it, a builtin the planner lowers row by row keeps it,
@@ -3024,6 +3036,8 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL1R]        = &&op_call1r,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
+        [OP_DICT_NEW]      = &&op_dict_new,
+        [OP_DICT_PUT]      = &&op_dict_put,
     };
 
     /* Arity check before allocating VM state */
@@ -3869,6 +3883,24 @@ op_loadenvg: {
 op_loadself: {
     ray_retain(vm.fn);
     PUSHR(vm.fn, 0);
+    DISPATCH();
+}
+
+op_dict_new: {
+    ray_t* keys = POP();
+    ray_t* dict = dict_literal_new(keys);
+    ray_release(keys);
+    if (RAY_IS_ERR(dict)) { vm_err_obj = dict; goto vm_error; }
+    PUSHR(dict, 0);
+    DISPATCH();
+}
+
+op_dict_put: {
+    uint16_t slot = (uint16_t)((uint16_t)code[ip] << 8 | code[ip + 1]);
+    ip += 2;
+    ray_t* value = POP();
+    ray_t* dict = vm.ps[vm.sp - 1];
+    ((ray_t**)ray_data(ray_dict_vals(dict)))[slot] = value; /* transfer */
     DISPATCH();
 }
 
@@ -4873,9 +4905,27 @@ ray_t* ray_eval(ray_t* obj) {
         ret = obj; rows = 0; goto out;
     }
 
-    /* Non-list vectors (incl. RAY_DICT/RAY_TABLE): return themselves —
-     * dict literals are self-evaluating; values stay unevaluated.  Use
-     * the (dict ...) builtin for evaluated construction. */
+    if (obj->type == RAY_DICT && (obj->attrs & RAY_DICT_LITERAL)) {
+        ray_t* keys = ray_dict_keys(obj);
+        ray_t* vals = ray_dict_vals(obj);
+        if (!keys || !vals || vals->type != RAY_LIST || keys->len != vals->len) {
+            ret = ray_error("domain", "eval: malformed dictionary literal");
+            goto out;
+        }
+        ray_t* dict = dict_literal_new(keys);
+        if (RAY_IS_ERR(dict)) { ret = dict; goto out; }
+        ray_t** exprs = (ray_t**)ray_data(vals);
+        ray_t** values = (ray_t**)ray_data(ray_dict_vals(dict));
+        for (int64_t i = 0; i < vals->len; i++) {
+            ray_t* value = ray_eval(exprs[i]);
+            if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
+            if (RAY_IS_ERR(value)) { ray_release(dict); ret = value; goto out; }
+            values[i] = value;
+        }
+        ret = dict; rows = 0; goto out;
+    }
+
+    /* Other dictionaries are runtime data, as are vectors and tables. */
     if (obj->type != RAY_LIST) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
     /* Empty list */

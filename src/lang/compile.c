@@ -876,6 +876,26 @@ static void compile_expr_at(compiler_t *c, ray_t *ast) {
         return;
     }
 
+    if (ast->type == RAY_DICT && (ast->attrs & RAY_DICT_LITERAL)) {
+        ray_t* keys = ray_dict_keys(ast);
+        ray_t* vals = ray_dict_vals(ast);
+        if (!keys || !vals || vals->type != RAY_LIST || keys->len != vals->len ||
+            vals->len > UINT16_MAX) { c->error = true; return; }
+        emit_const(c, add_constant(c, keys));
+        emit(c, OP_DICT_NEW);
+        ray_t** values = (ray_t**)ray_data(vals);
+        for (int64_t i = 0; i < vals->len && !c->error; i++) {
+            /* Compile in this frame: let/return, captures and argument
+             * evaluation keep exactly their ordinary expression scope. */
+            compile_expr(c, values[i]);
+            emit(c, OP_FORCE);
+            emit(c, OP_DICT_PUT);
+            emit(c, (uint8_t)(i >> 8));
+            emit(c, (uint8_t)i);
+        }
+        return;
+    }
+
     if (ast->type != RAY_LIST) {
         int32_t idx = add_constant(c, ast);
         emit_const(c, idx);

@@ -217,7 +217,27 @@ Tables are the core data structure in Rayforce. A table is a vector of column na
 
 ## Dictionaries
 
-Dictionaries map keys to values. Created with the `dict` function or with `{key: value}` syntax in query contexts.
+Dictionaries map keys to values. Create them with `dict` or `{key: value}`.
+In ordinary expressions, literal values evaluate left to right in the current
+scope; keys remain data. A bare value name reads its binding, and a literal
+symbol needs a quote:
+
+```lisp
+(set x 5)
+{a: x b: (+ x 1) column: 'CounterID} ; {a:5 b:6 column:CounterID}
+((fn [p] (at {a: p} 'a)) 3)       ; 3
+```
+
+This changes the earlier constants-only literal behavior. Use
+`(quote {a: x})` to retain syntax as data; `at` returns stored values without
+evaluating them again. Nested literals also evaluate. Empty literals stay
+empty dictionaries. Literal construction does not depend on bindings named
+`dict` or `list`.
+
+Query special forms such as `select`, `update` and `window` still receive
+their literal specs unevaluated. A static spec built inside an ordinary
+expression such as `(list select …)` must be quoted; see
+[IPC](../storage/ipc.md#expression-payloads).
 
 ```lisp
 (set d (dict [a b c] [1 2 3]))
