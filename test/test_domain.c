@@ -3571,6 +3571,36 @@ static test_result_t test_domain_index_append_unindexed(void) {
     PASS();
 }
 
+/* A truncated symbol file (a partial copy) does not open, whether its
+ * index is there or not: the index is not this file's (the size moved),
+ * and the walk of its records does not end at its end.  A cut through the
+ * last record, through a middle one and inside the header. */
+static test_result_t test_domain_index_truncated_fails(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 500 };
+    ix_gen(&ix_va, "tf", N);
+    size_t full = ix_strl(&ix_va, N, ix_sym, ix_offs);
+    const long cuts[] = { (long)full - 1, (long)ix_offs[N / 2] + 2, 8 };
+    for (size_t k = 0; k < sizeof cuts / sizeof cuts[0]; k++) {
+        for (int with_ix = 0; with_ix < 2; with_ix++) {
+            ix_unlink_all();
+            TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "write symfile");
+            ray_sym_domain_ix_info_t in;
+            if (with_ix) TEST_ASSERT(ix_open_check(&ix_va, N, &in), "writes the index");
+            TEST_ASSERT_EQ_I(truncate(TMP_DOM_SYM_PATH, cuts[k]), 0);
+            ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+            if (dom) {
+                ray_sym_domain_release(dom);
+                FAILF("cut at %ld of %zu (index %d): opened", cuts[k], full, with_ix);
+            }
+        }
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
 /* The writers' indexes describe the files they wrote: a full flush, appends
  * (some durable) and the import dictionary's final sync each leave an index
  * the next open takes whole — its lengths those of the strings — with no
@@ -3828,6 +3858,7 @@ const test_entry_t domain_entries[] = {
     { "domain/index_cold_long_no_headers", test_domain_index_cold_long_no_headers, domain_setup, domain_teardown },
     { "domain/index_cold_len_no_bytes",  test_domain_index_cold_len_no_bytes,  domain_setup, domain_teardown },
     { "domain/index_append_unindexed",  test_domain_index_append_unindexed,  domain_setup, domain_teardown },
+    { "domain/index_truncated_fails",   test_domain_index_truncated_fails,   domain_setup, domain_teardown },
     { "domain/index_writers",           test_domain_index_writers,           domain_setup, domain_teardown },
     { "domain/index_refresh_in_place",  test_domain_index_refresh_in_place,  domain_setup, domain_teardown },
     { "domain/index_new_file_removes",  test_domain_index_new_file_removes,  domain_setup, domain_teardown },

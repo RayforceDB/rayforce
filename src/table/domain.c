@@ -1265,7 +1265,8 @@ void ray_sym_domain_index_remove(const char* path) {
 /* The block table of the mapped image of `d` (its `count` entries per the
  * header): from the index file when it is this file's, else by one walk of
  * all the records (read with explicit reads, dom_src_t), the index then
- * written for the file.  False when a read of the file fails (or on OOM). */
+ * written for the file.  False when a read of the file fails, when its
+ * records do not end at its end (a truncated file), or on OOM. */
 static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
     const uint8_t* map = (const uint8_t*)d->map;
     size_t size = d->map_size;
@@ -1283,7 +1284,7 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
         size_t o = d->rec0;
         dom_src_t src;
         if (!dom_src_open(&src, d->path, &d->map_id, size)) src = dom_src_map(map, size);
-        bool walked = dom_blk_walk_src(&src, b, 0, &o, d->z);
+        bool walked = dom_blk_walk_src(&src, b, 0, &o, d->z) && o == size;
         dom_src_close(&src);
         if (!walked) { ray_sys_free(b); return false; }
     }
@@ -1379,7 +1380,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             size_t o = 12;
             dom_src_t src;
             if (!dom_src_open(&src, d->path, &nid, map_size)) src = dom_src_map(nbase, map_size);
-            bool walked = dom_blk_walk_src(&src, nb, 0, &o, NULL);
+            bool walked = dom_blk_walk_src(&src, nb, 0, &o, NULL) && o == map_size;
             dom_src_close(&src);
             if (!walked) { ray_sys_free(nb); nb = NULL; ok = false; break; }
         }
@@ -3058,7 +3059,7 @@ ray_err_t ray_sym_domain_compress(const char* path) {
         size_t o = 12;
         dom_src_t src;
         if (b && !dom_src_open(&src, rpath, &id, size)) src = dom_src_map(map, size);
-        bool walked = b && dom_blk_walk_src(&src, b, 0, &o, NULL);
+        bool walked = b && dom_blk_walk_src(&src, b, 0, &o, NULL) && o == size;
         if (b) dom_src_close(&src);
         if (!walked) {
             ray_sys_free(b);

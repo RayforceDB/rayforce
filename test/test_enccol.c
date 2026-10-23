@@ -185,6 +185,48 @@ static test_result_t test_no_mapping_leak(void) {
     PASS();
 }
 
+/* A truncated file (a partial copy, a full disk elsewhere) fails whole at
+ * open, `corrupt`, naming the file, at any cut: inside the headers, the
+ * directory, a chunk or the side data; and leaves nothing mapped. */
+static const int64_t g_tr_dv[4] = { 5, 700000000003ll, 91, 98765432109876ll };
+static test_result_t test_truncated_fails_whole(void) {
+    const char* p = ray_test_tmp(ENCCOL_TMP "/tr");
+    int64_t d[RAY_ENC_VEC];
+    for (int i = 0; i < RAY_ENC_VEC; i++) d[i] = g_tr_dv[(uint32_t)((uint32_t)i * 2654435761u) >> 30];
+    ray_t* v = ray_vec_from_raw(RAY_I64, d, RAY_ENC_VEC);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(p);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    TEST_ASSERT_TRUE(ray_enccol_of(c)->vdict_off != 0);      /* side data: the last section */
+    long full = (long)ray_enccol_of(c)->size;
+    ray_release(c);
+    const long cuts[] = { 40, (long)RAY_ENC_DIR_OFF + 4, full / 2, full - 8, full - 1 };
+    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
+    for (size_t k = 0; k < sizeof cuts / sizeof cuts[0]; k++) {
+        v = ray_vec_from_raw(RAY_I64, d, RAY_ENC_VEC);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
+        ray_release(v);
+        TEST_ASSERT_EQ_I(truncate(p, cuts[k]), 0);
+        ray_t* r = ray_col_mmap(p);
+        if (!r || !RAY_IS_ERR(r)) {
+            if (r) ray_release(r);
+            FAILF("cut at %ld of %ld: opened", cuts[k], full);
+        }
+        const char* msg = ray_error_msg();
+        if (strcmp(ray_err_code(r), "corrupt") != 0 || !msg || !strstr(msg, p)) {
+            char got[512];
+            snprintf(got, sizeof got, "%s: %s", ray_err_code(r), msg ? msg : "(no message)");
+            ray_error_free(r);
+            FAILF("cut at %ld of %ld: %s", cuts[k], full, got);
+        }
+        ray_error_free(r);
+    }
+    ray_mem_stats(&m1);
+    TEST_ASSERT_EQ_U(m1.sys_mapped, m0.sys_mapped);
+    PASS();
+}
+
 /* The big-endian gate (generation 2 answers nyi there, not corrupt) cannot
  * be exercised end to end on a little-endian host: ray_enccol_open's
  * `!ray_enc_gen2_supported()` branch is never taken (the build with
@@ -2429,6 +2471,7 @@ const test_entry_t enccol_entries[] = {
     { "enccol/append_index_gen2",   test_append_index_refuses_gen2, enccol_setup, enccol_teardown },
     { "enccol/load_gen2_plain",      test_load_gen2_plain,       enccol_setup, enccol_teardown },
     { "enccol/no_mapping_leak",     test_no_mapping_leak,     enccol_setup, enccol_teardown },
+    { "enccol/truncated_fails_whole", test_truncated_fails_whole, enccol_setup, enccol_teardown },
     { "enccol/value_dict_side",     test_value_dict_side,     enccol_setup, enccol_teardown },
     { "enccol/sym_domain_rules",    test_sym_domain_rules,    enccol_setup, enccol_teardown },
     { "enccol/consumers_refuse",    test_consumers_refuse,    enccol_setup, enccol_teardown },

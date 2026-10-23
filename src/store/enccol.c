@@ -202,26 +202,39 @@ static bool enc_type_float(int8_t t)     { return t == RAY_F32 || t == RAY_F64; 
 
 static uint64_t rd_u64(const uint8_t* p) { uint64_t x; memcpy(&x, p, 8); return x; }
 
+#define ENC_CORRUPT(...) return ray_error("corrupt", __VA_ARGS__)
+
 /* The side table (spec "Side data"): where each entry starts and how long
- * it is.  The file is ours: its layout is taken as written. */
-static void enc_parse_side_table(ray_enccol_t* e) {
+ * it is.  Its contents are taken as written; only its extents are checked,
+ * once, so a short file fails whole instead of reading past its mapping. */
+static ray_t* enc_parse_side_table(ray_enccol_t* e) {
     const uint8_t* s = e->base + e->hdr.side_off;
+    uint64_t sl = e->hdr.side_len;
     uint32_t ne; memcpy(&ne, s, 4);
+    if (ne == 0 || ne > 3) ENC_CORRUPT("column %s: side table entry count %u", e->path, ne);
+    if (8 + 24ull * ne > sl) ENC_CORRUPT("column %s: side table longer than the side data", e->path);
     for (uint32_t i = 0; i < ne; i++) {
         const uint8_t* t = s + 8 + 24 * i;
         uint16_t kind; memcpy(&kind, t, 2);
         uint64_t off = rd_u64(t + 8), len = rd_u64(t + 16);
+        if (len < 8 || len > sl || off > sl - len)
+            ENC_CORRUPT("column %s: side entry %u overruns the side data", e->path, i);
         if (kind == RAY_ENC_SIDE_VALUE_DICT)    { e->vdict_off = e->hdr.side_off + off; e->vdict_len = len; }
         else if (kind == RAY_ENC_SIDE_STR_DICT) { e->sdict_off = e->hdr.side_off + off; e->sdict_len = len; }
         else                                    { e->fsst_off = e->hdr.side_off + off; e->fsst_len = len; }
     }
+    return NULL;
 }
 
 /* The headers, the chunk count, the directory's null total and the side
- * table.  Only the header version selects a reader; the rest is taken as
- * written (files rayforce wrote are trusted). */
+ * table.  Only the header version selects a reader; the values are taken
+ * as written (files rayforce wrote are trusted).  The extents of every
+ * section are checked against the file's size, once at open: a truncated
+ * or short file fails whole, with its name. */
 static ray_t* enc_parse_load(ray_enccol_t* e, uint32_t* saved_sym) {
     const uint8_t* b = e->base;
+    uint64_t size = e->size;
+    if (size < RAY_ENC_DIR_OFF) ENC_CORRUPT("column %s: generation-2 file shorter than its headers", e->path);
     ray_t h; memcpy(&h, b, 32);
     uint32_t rc; memcpy(&rc, b + offsetof(ray_t, rc), 4);
     *saved_sym = rc;
@@ -230,14 +243,34 @@ static ray_t* enc_parse_load(ray_enccol_t* e, uint32_t* saved_sym) {
     memcpy(eh, b + RAY_ENC_HDR_OFF, sizeof *eh);
     if (eh->header_version != RAY_ENC_HDR_VERSION)
         return ray_error("version", "column %s: generation-2 header version %u", e->path, eh->header_version);
+    if (eh->end_off != size)
+        ENC_CORRUPT("column %s: end offset %llu, file is %llu bytes (truncated?)", e->path,
+                    (unsigned long long)eh->end_off, (unsigned long long)size);
+    /* the directory must fit: bound len before deriving the chunk count */
+    if (h.len < 0 ||
+        (uint64_t)h.len > ((size - RAY_ENC_DIR_OFF) / sizeof(ray_enc_dirent_t)) * (uint64_t)RAY_ENC_CHUNK)
+        ENC_CORRUPT("column %s: length %lld exceeds what the file holds", e->path, (long long)h.len);
     e->n_chunks = ray_enc_nchunks(h.len);
+    if ((uint64_t)e->n_chunks > (size - RAY_ENC_DIR_OFF) / sizeof(ray_enc_dirent_t))
+        ENC_CORRUPT("column %s: directory past the end of the file", e->path);
     e->null_count = 0;
     for (int64_t c = 0; c < e->n_chunks; c++) {
         ray_enc_dirent_t de;
         memcpy(&de, b + RAY_ENC_DIR_OFF + c * sizeof de, sizeof de);
+        if ((de.offset & 7) || de.bytes < RAY_ENC_DESC_AREA || de.offset > size || de.bytes > size - de.offset)
+            ENC_CORRUPT("column %s: chunk %lld at %llu, %llu bytes, overruns the file", e->path, (long long)c,
+                        (unsigned long long)de.offset, (unsigned long long)de.bytes);
         e->null_count += de.null_count;
     }
-    if (eh->side_off) enc_parse_side_table(e);
+    if (eh->side_off) {
+        if (eh->side_len < 8 || eh->side_off > size || eh->side_len > size - eh->side_off)
+            ENC_CORRUPT("column %s: side data overruns the file", e->path);
+        ray_t* serr = enc_parse_side_table(e);
+        if (serr) return serr;
+    }
+    /* the region opens with the 80-byte wire root (spec "Index region") */
+    if (eh->index_off && (eh->index_off >= size || size - eh->index_off < 80))
+        ENC_CORRUPT("column %s: index region overruns the file", e->path);
     return NULL;
 }
 
@@ -1250,8 +1283,8 @@ const void* ray_enccol_raw_view(ray_enccol_t* e, int64_t c, int j, const ray_enc
             const uint64_t* w = (const uint64_t*)(e->base + de.offset + descs[v].payload_off);
             for (uint64_t i = 0; i < descs[v].payload_bytes / 8; i++) acc ^= w[i];
         }
-        static volatile uint64_t sink;
-        sink ^= acc;
+        static _Atomic(uint64_t) sink;   /* keeps the reads; workers fold in at once */
+        atomic_fetch_xor_explicit(&sink, acc, memory_order_relaxed);
         atomic_store_explicit(&e->touch_ok[c], 1, memory_order_release);
     }
     return e->base + de.offset + d->payload_off;      /* no bitmap: n_nulls == 0 */
