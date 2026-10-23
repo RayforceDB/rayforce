@@ -3611,6 +3611,14 @@ static int expr_refs_row_column(ray_t* expr, ray_t* tbl) {
     return 0;
 }
 
+/* min/max overload on arity: only their unary calls reduce rows.  Keep
+ * the name-only resolver for aggregate specifications and other signatures. */
+static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs) {
+    uint16_t op = resolve_agg_opcode(sym_id);
+    if ((op == OP_MIN || op == OP_MAX) && nargs != 1) return 0;
+    return op;
+}
+
 /* Check if an expression is an aggregation call (head is an agg function) */
 static int is_agg_expr(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
@@ -3619,7 +3627,7 @@ static int is_agg_expr(ray_t* expr) {
     if (n < 2) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     if (elems[0]->type != -RAY_SYM) return 0;
-    return resolve_agg_opcode(elems[0]->i64) != 0;
+    return resolve_agg_call_opcode(elems[0]->i64, n - 1) != 0;
 }
 
 /* True iff the expression contains an aggregation call anywhere in
@@ -4539,7 +4547,7 @@ static bool match_group_desc_count_take(ray_t* tbl, ray_t** dict_elems, int64_t 
     return false;
 }
 
-/* True for `(fn arg ...)` where fn resolves to a RAY_UNARY marked
+/* True for an actual unary `(fn arg)` call whose fn is RAY_UNARY marked
  * RAY_FN_AGGR — i.e. a builtin aggregator (sum/avg/min/max/count and
  * the non-whitelisted med/dev/var/stddev/etc).  Used to route these
  * through the streaming-style per-group AGG branch rather than the
@@ -4549,7 +4557,7 @@ static bool match_group_desc_count_take(ray_t* tbl, ray_t** dict_elems, int64_t 
 static int is_aggr_unary_call(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
     int64_t n = ray_len(expr);
-    if (n < 2) return 0;
+    if (n != 2) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     if (elems[0]->type != -RAY_SYM) return 0;
     ray_t* fn_obj = ray_env_get(elems[0]->i64);
@@ -14421,9 +14429,9 @@ static int select_fallback_scalar_proj(ray_t* expr, const int64_t* scalars, int6
            (via || ray_is_atom(expr));
 }
 
-static bool select_alias_head_is_agg(ray_t* head) {
+static bool select_alias_head_is_agg(ray_t* head, int64_t nargs) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
-    if (resolve_agg_opcode(head->i64) != 0) return true;
+    if (resolve_agg_call_opcode(head->i64, nargs) != 0) return true;
     ray_t* s = ray_sym_str(head->i64);
     return s && ray_str_len(s) == 8 && memcmp(ray_str_ptr(s), "distinct", 8) == 0;
 }
@@ -14755,7 +14763,7 @@ static ray_t* select_alias_subst(ray_t* expr, void* vctx) {
         return out;
     }
     select_alias_subst_ctx_t inner = *c;
-    inner.in_agg = c->in_agg || select_alias_head_is_agg(el[0]);
+    inner.in_agg = c->in_agg || select_alias_head_is_agg(el[0], ray_len(expr) - 1);
     /* a call whose head is itself a form — `((fn [x] …) 1)` — is walked
      * from the head, which is where such a lambda's body lives */
     ray_t* out = select_alias_map_list(expr, el[0]->type == RAY_LIST ? 0 : 1,

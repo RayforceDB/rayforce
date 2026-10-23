@@ -82,9 +82,16 @@ aggregate's argument a name that is a source column is always the source
 column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
 sum. An aggregate cannot be aggregated again, through an alias or written
 out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both raise
-`domain`. And an output may not put a source column beside a per-group
-value outside an aggregate: `f: (* price n)` with `n: (count price)` raises
+`domain`. And an output may not mix a source column with a reference to an earlier
+per-group alias outside an aggregate: `f: (* price n)` with `n: (count price)` raises
 `domain`; write `(* (sum price) n)` or whichever aggregate is meant.
+
+The names `min` and `max` reduce only in their **one-argument** forms.
+Their two-argument forms are element-wise expressions, as outside a query:
+`r: (min x y)` preserves the input rows, and in a grouped select produces a
+vector for each group. In contrast, `r: (min (sum x) (sum y))` compares two
+per-group scalars; it is not a nested reduction. Genuine unary nesting such
+as `r: (min (sum x))` still raises `domain` in a grouped select.
 
 A literal symbol inside a select resolves to an earlier alias or a source
 column of that name, in that order; one naming neither stays a constant
@@ -561,4 +568,4 @@ To remove rows matching a predicate, use `select` with the inverse condition:
 | *delete rows* | `(select {from: t where: (not pred)})` | Remove matching rows via inverse filter |
 
 !!! note "Execution model"
-    All `select` and `update` queries compile to a lazy DAG. The optimizer applies predicate pushdown, filter reordering, operator fusion, and dead-code elimination before the fused morsel-driven executor processes data in 1024-element chunks.
+    Supported `select` and `update` expression shapes compile to a lazy DAG. The optimizer applies predicate pushdown, filter reordering, operator fusion, and dead-code elimination before the fused morsel-driven executor processes data in 1024-element chunks. Other expression shapes can use language-evaluator fallbacks to preserve their semantics; not every expression is fused.
