@@ -21,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
 #include <pthread.h>
 #include <sys/wait.h>   /* the skeptic probes' child imports */
@@ -907,7 +908,6 @@ static test_result_t test_pq_small_stack(void) {
 #if defined(__linux__)
 #include <signal.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 /* A row group's chunk ends with a flush of the bytes its stream still
  * buffers (glibc writes whole blocks of a large write at once and keeps the
  * tail).  The file size limit here falls inside that tail of the first

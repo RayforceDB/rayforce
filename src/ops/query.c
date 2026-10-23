@@ -6024,8 +6024,8 @@ static ray_t* select_topk_hh(ray_t* dict, ray_t* tbl) {
 
     /* bind the keys; column keys whose ranges are bounded by their type
      * alone, small enough for a dense plan, are left to it unread */
-    int64_t rng[HH_MAX_KEYS];
-    bool nul[HH_MAX_KEYS];
+    int64_t rng[HH_MAX_KEYS] = {0};
+    bool nul[HH_MAX_KEYS] = {0};
     bool all_bounded = true;
     for (int k = 0; k < nk && ok; k++) {
         hh_key_t* q = &ks[k];
