@@ -43,9 +43,11 @@ sum path is used.
 
 ## Local observations
 
-Measured on 2026-10-23, with both builds using the repository's Clang release
-flags (`-O3 -march=native`), and the defaults above. These are illustrative
+Measured on 2026-10-23 for the initial typed collector (`05c8d953`),
+with both builds using the repository's Clang release flags
+(`-O3 -march=native`), and the defaults above. These are illustrative
 measurements from one machine, not portable performance guarantees.
+
 | Mode | Before ms | After ms | Before peak bytes | After peak bytes |
 |---|---:|---:|---:|---:|
 | typed | 34.681 | 29.622 | 8584384 | 2283904 |
