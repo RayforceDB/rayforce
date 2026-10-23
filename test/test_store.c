@@ -7481,6 +7481,116 @@ static test_result_t test_parted_cache_limit(void) {
     PASS();
 }
 
+static ray_t* parted_cache_seg(ray_t* view) {
+    return ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
+}
+
+/* Remount table i of five, one partition each, replacing its view; whether
+ * the mount reused the partition the old view had. */
+static bool parted_cache_remount(ray_t** views, int i, bool* reused) {
+    char name[8];
+    snprintf(name, sizeof(name), "t%d", i);
+    ray_t* v = ray_read_parted(TMP_PARTED_ROOT, name);
+    if (!v || RAY_IS_ERR(v)) return false;
+    *reused = views[i] && parted_cache_seg(v) == parted_cache_seg(views[i]);
+    if (views[i]) ray_release(views[i]);
+    views[i] = v;
+    return true;
+}
+
+/* A segment's users: its view, and the cache while it keeps the partition. */
+#define PARTED_CACHED(views, i) (ray_atomic_load(&parted_cache_seg((views)[i])->rc) == 2)
+
+/* Under a cap of three, the least recently mounted partition goes first and
+ * a hit makes its partition the newest.  A cyclic pass over more partitions
+ * than the cap misses on every mount, and every mount reads right.  With no
+ * cap all stay.  A cleared, pruned or replaced entry leaves the index
+ * consistent.  Saved as generation 0: the asserts read plain segments'
+ * payloads and reference counts. */
+static test_result_t parted_cache_recency(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    for (int i = 0; i < 5; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "%s/1/t%d", TMP_PARTED_ROOT, i);
+        ray_t* src = parted_remount_part(10 * i);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(src, path, NULL, RAY_COMPRESS_OFF), RAY_OK);
+        ray_release(src);
+    }
+    ray_t* views[5] = { NULL };
+    bool reused;
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+    /* t0 again: a hit, and t0 the newest, so t3 evicts t1, then t4 t2. */
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 0, &reused));
+    TEST_ASSERT_TRUE(reused);
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
+    TEST_ASSERT_FALSE(PARTED_CACHED(views, 1));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 2));
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 4, &reused));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 0));
+    TEST_ASSERT_FALSE(PARTED_CACHED(views, 2));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 3));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 4));
+
+    /* From empty, two cycles over five: each mount a miss, each table its own. */
+    ray_parted_cache_clear();
+    for (int i = 0; i < 5; i++) TEST_ASSERT_FALSE(PARTED_CACHED(views, i));
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 5; i++) {
+            TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+            TEST_ASSERT_FALSE(reused);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(views[i])))[0], 10 * i);
+            TEST_ASSERT_EQ_I(ray_table_nrows(views[i]), 3);
+        }
+    }
+    for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i) == (i >= 2));
+
+    /* No cap: t0 and t1 load once more, then every mount is a hit. */
+    ray_parted_cache_set_max(0);
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 5; i++) {
+            TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+            TEST_ASSERT_TRUE(reused == (round == 1 || i >= 2));
+        }
+    }
+    for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i));
+
+    /* Pruned once its view is gone: the next mount loads, the one after hits. */
+    ray_release(views[1]);
+    views[1] = NULL;
+    ray_heap_gc();
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 1, &reused));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(views[1])))[0], 10);
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 1, &reused));
+    TEST_ASSERT_TRUE(reused);
+
+    /* Replaced on disk: a fresh load takes the entry's place, and is the hit. */
+    ray_t* old3 = views[3];
+    ray_retain(old3);
+    ray_t* c = parted_remount_part(70);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(c, TMP_PARTED_ROOT "/1/t3", NULL, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(c);
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
+    TEST_ASSERT_FALSE(reused);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(views[3])))[0], 70);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(old3)))[0], 30);   /* the old view keeps its rows */
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
+    TEST_ASSERT_TRUE(reused);
+    ray_release(old3);
+
+    for (int i = 0; i < 5; i++) ray_release(views[i]);
+    PASS();
+}
+
+static test_result_t test_parted_cache_recency(void) {
+    int64_t was = ray_parted_cache_set_max(3);
+    test_result_t r = parted_cache_recency();
+    ray_parted_cache_set_max(was);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    return r;
+}
+
 typedef struct { atomic_int* ready; atomic_bool* go; bool ok; } parted_thread_t;
 static void parted_mount_thread(void* arg) {
     parted_thread_t* ctx = arg;
@@ -8217,6 +8327,7 @@ const test_entry_t store_entries[] = {
     { "store/col_str_hash_persisted", test_col_str_hash_persisted, store_setup, store_teardown },
     { "store/stream_str_hash_persisted", test_stream_str_hash_persisted, store_setup, store_teardown },
     { "store/parted_cache_limit", test_parted_cache_limit, store_setup, store_teardown },
+    { "store/parted_cache_recency", test_parted_cache_recency, store_setup, store_teardown },
     { "store/parted_cache_gc", test_parted_cache_gc, store_setup, store_teardown },
     { "store/parted_live_domain_open", test_parted_live_domain_open, store_setup, store_teardown },
     { "store/parted_rebuilt_write_without_gc", test_parted_rebuilt_write_without_gc, store_setup, store_teardown },
