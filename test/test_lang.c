@@ -10028,7 +10028,103 @@ static test_result_t test_exec_capture_is_bounded(void) {
 #endif
 }
 
+/* Index maintenance must preserve externally visible bindings after misses,
+ * compaction, reinsertion, value-cache invalidation and runtime recreation. */
+static test_result_t test_env_write_index_lifecycle(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) { ray_runtime_destroy(__RUNTIME); ray_runtime_create(0, NULL); }
+        enum { NAMES = 96 };
+        int64_t names[NAMES], expected[NAMES] = {0};
+        bool present[NAMES] = {false};
+        char name[64];
+        for (int i = 0; i < NAMES; i++) {
+            snprintf(name, sizeof(name), "write_index_%d_%d", round, i);
+            names[i] = ray_sym_intern(name, strlen(name));
+        }
+        uint64_t rng = UINT64_C(0xd72f409d118af9b3);
+        for (int step = 0; step < 4096; step++) {
+            rng = rng * UINT64_C(6364136223846793005) + 1;
+            int at = (int)((rng >> 32) % NAMES);
+            bool remove = ((rng >> 56) & 3) == 0;
+            ray_t* value = remove ? NULL : ray_i64(step + 1);
+            TEST_ASSERT_EQ_I(ray_env_set(names[at], value), RAY_OK);
+            if (value) ray_release(value);
+            present[at] = !remove;
+            expected[at] = step + 1;
+            for (int i = 0; i < NAMES; i++) {
+                ray_t* got = ray_env_get_global(names[i]);
+                TEST_ASSERT_EQ_I(got != NULL, present[i]);
+                if (got) TEST_ASSERT_EQ_I(got->i64, expected[i]);
+            }
+        }
+        /* Cache value pointers before a write, then require the new value. */
+        int64_t id = names[0];
+        for (int step = 0; step < 3; step++) {
+            ray_t* value = ray_i64(100 + step);
+            TEST_ASSERT_EQ_I(ray_env_set(id, value), RAY_OK);
+            ray_release(value);
+            uint8_t rows = 0;
+            ray_t* resolved = ray_env_resolve_compiled(id, &rows);
+            TEST_ASSERT_NOT_NULL(resolved);
+            TEST_ASSERT_EQ_I(resolved->i64, 100 + step);
+            ray_release(resolved);
+        }
+        /* Exact flat dotted builtin names also have cached value pointers. */
+        id = ray_sym_intern(".write.index.test", 17);
+        for (int step = 0; step < 3; step++) {
+            ray_t* value = ray_i64(200 + step);
+            TEST_ASSERT_EQ_I(ray_env_bind_flat(id, value), RAY_OK);
+            ray_release(value);
+            uint8_t rows = 0;
+            ray_t* resolved = ray_env_resolve_compiled(id, &rows);
+            TEST_ASSERT_NOT_NULL(resolved);
+            TEST_ASSERT_EQ_I(resolved->i64, 200 + step);
+            ray_release(resolved);
+        }
+    }
+    PASS();
+}
+
+static test_result_t test_env_write_index_flags_and_capacity(void) {
+    int64_t plus = ray_sym_intern("+", 1);
+    ray_t* value = ray_i64(99);
+    TEST_ASSERT_EQ_I(ray_env_set(plus, value), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_bind(plus, value), RAY_OK); /* must stay user-defined */
+    ray_release(value);
+    int64_t ids[1024];
+    ray_t* vals[1024];
+    int32_t count = ray_env_list_user(ids, vals, 1024);
+    bool found = false;
+    for (int32_t i = 0; i < count; i++)
+        if (ids[i] == plus) { found = true; TEST_ASSERT_EQ_I(vals[i]->i64, 99); }
+    TEST_ASSERT_TRUE(found);
+    value = ray_i64(7);
+    int64_t first = -1, rejected = -1;
+    for (int i = 0; i < 2048; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "write_index_capacity_%d", i);
+        int64_t id = ray_sym_intern(name, strlen(name));
+        ray_err_t err = ray_env_set(id, value);
+        if (err != RAY_OK) {
+            TEST_ASSERT_EQ_I(err, RAY_ERR_OOM);
+            rejected = id;
+            break;
+        }
+        if (first < 0) first = id;
+    }
+    TEST_ASSERT_TRUE(first >= 0 && rejected >= 0);
+    TEST_ASSERT_EQ_I(ray_env_set(first, value), RAY_OK); /* rebind while full */
+    TEST_ASSERT_EQ_I(ray_env_set(first, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set(rejected, value), RAY_OK); /* reuse after shift */
+    TEST_ASSERT_EQ_I(ray_env_get_global(rejected)->i64, 7);
+    TEST_ASSERT_EQ_I(ray_env_get_global(plus)->i64, 99);
+    ray_release(value);
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
+    { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
+    { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
