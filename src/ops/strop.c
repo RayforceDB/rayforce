@@ -878,8 +878,16 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     ray_t* result = ray_list_new(8);
     if (RAY_IS_ERR(result)) { if (sym_str_s) ray_release(sym_str_s); if (sym_str_d) ray_release(sym_str_d); return result; }
 
-    if (dlen == 0 || slen == 0) {
+    /* A longer delimiter cannot occur in the input.  Guard the unsigned
+     * slen - dlen bound in the search loop below. */
+    if (dlen == 0 || slen < dlen) {
         ray_t* part = ray_str(sp, slen);
+        if (!part || RAY_IS_ERR(part)) {
+            ray_release(result);
+            if (sym_str_s) ray_release(sym_str_s);
+            if (sym_str_d) ray_release(sym_str_d);
+            return part ? part : ray_error("oom", NULL);
+        }
         result = ray_list_append(result, part);
         ray_release(part);
         if (sym_str_s) ray_release(sym_str_s);
