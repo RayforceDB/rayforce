@@ -2409,6 +2409,62 @@ static int64_t store_file_size(const char* path) {
     return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
 }
 
+/* A truncated generation-1 file (a partial copy, a full disk elsewhere)
+ * fails at load and at map, whatever its cut: a vector cut in its header
+ * or its data, a STR column cut in its pool, a LIST cut in an element.  The
+ * extents are checked; the values are taken as written. */
+static ray_t* store_trunc_case(int k) {
+    if (k == 0) {
+        ray_t* v = ray_vec_new(RAY_I64, 1000);
+        v->len = 1000;
+        for (int64_t i = 0; i < 1000; i++) ((int64_t*)ray_data(v))[i] = i * 7;
+        return v;
+    }
+    if (k == 1) {
+        ray_t* v = ray_vec_new(RAY_STR, 64);
+        for (int i = 0; i < 64; i++) {
+            char b[64];
+            int n = snprintf(b, sizeof b, "a pooled string value number %d", i);
+            v = ray_str_vec_append(v, b, (size_t)n);
+        }
+        return v;
+    }
+    ray_t* l = ray_list_new(3);
+    ray_t* a = ray_i64(42);
+    ray_t* s = ray_str("a string in a list, long enough", 31);
+    ray_t* v = store_trunc_case(0);
+    l = ray_list_append(l, a); l = ray_list_append(l, s); l = ray_list_append(l, v);
+    ray_release(a); ray_release(s); ray_release(v);
+    return l;
+}
+static test_result_t test_col_truncated_fails(void) {
+    const char* p = ray_test_tmp(TMP_COL_PATH);
+    for (int k = 0; k < 3; k++) {
+        ray_t* v = store_trunc_case(k);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+        TEST_ASSERT_EQ_I(ray_col_save(v, p), RAY_OK);
+        int64_t full = store_file_size(p);
+        const int64_t cuts[] = { 16, 40, full / 2, full - 1 };
+        for (size_t c = 0; c < sizeof cuts / sizeof cuts[0]; c++) {
+            TEST_ASSERT_EQ_I(ray_col_save(v, p), RAY_OK);
+            TEST_ASSERT_EQ_I(truncate(p, (off_t)cuts[c]), 0);
+            for (int how = 0; how < (k == 2 ? 1 : 2); how++) {   /* a LIST has no map */
+                ray_t* r = how ? ray_col_mmap(p) : ray_col_load(p);
+                if (!r || !RAY_IS_ERR(r)) {
+                    if (r) ray_release(r);
+                    ray_release(v);
+                    FAILF("case %d cut at %lld of %lld: %s opened", k, (long long)cuts[c],
+                          (long long)full, how ? "map" : "load");
+                }
+                ray_error_free(r);
+            }
+        }
+        ray_release(v);
+    }
+    unlink(p);
+    PASS();
+}
+
 /* Does `dir` take the in-place build (Linux, a filesystem whose fallocate
  * holds the blocks)?  Probed with a small column. */
 static bool store_in_place(const char* dir) {
@@ -8218,6 +8274,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_close_all_cancel", test_stream_close_all_cancel, store_setup, store_teardown },
     { "store/splay_save_cancel_late", test_splay_save_cancel_late, store_setup, store_teardown },
     { "store/splay_save_cancel_leaks", test_splay_save_cancel_leaks, store_setup, store_teardown },
+    { "store/col_truncated_fails", test_col_truncated_fails, store_setup, store_teardown },
     { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },

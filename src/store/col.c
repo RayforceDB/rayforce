@@ -66,10 +66,7 @@ _Static_assert(COL_DISK_ATTRS_MASK == (uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED
  *
  * Width-dispatched scan for maximum index. Returns RAY_ERR_CORRUPT if any
  * index >= sym_count. Skipped when sym_count == 0 (allows raw column loads
- * in tests without a sym file).  Not a check of the file: a column whose
- * header carries no saved count (or a bare load's runtime ids of another
- * process) may name ids the dictionary the caller resolves it against does
- * not hold, and an id past it would read outside that dictionary.
+ * in tests without a sym file).
  * -------------------------------------------------------------------------- */
 
 static ray_err_t validate_sym_bounds(const void* data, int64_t len,
@@ -289,25 +286,31 @@ static ray_err_t col_save_str_list(ray_t* list, FILE* f) {
 /* --------------------------------------------------------------------------
  * col_load_str_list -- deserialize a string list from mapped data
  *
- * ptr points past the 4B magic.
+ * ptr points past the 4B magic. remaining = bytes available.
  * -------------------------------------------------------------------------- */
 
-static ray_t* col_load_str_list(const uint8_t* ptr) {
+static ray_t* col_load_str_list(const uint8_t* ptr, size_t remaining) {
+    if (remaining < 8) return ray_error("corrupt", NULL);
     int64_t count;
     memcpy(&count, ptr, 8);
-    ptr += 8;
+    ptr += 8; remaining -= 8;
+
+    if (count < 0 || (uint64_t)count > remaining / 4)
+        return ray_error("corrupt", NULL);
 
     ray_t* list = ray_list_new(count);
     if (!list || RAY_IS_ERR(list)) return list;
 
     for (int64_t i = 0; i < count; i++) {
+        if (remaining < 4) { ray_release(list); return ray_error("corrupt", NULL); }
         uint32_t slen;
         memcpy(&slen, ptr, 4);
-        ptr += 4;
+        ptr += 4; remaining -= 4;
 
+        if (slen > remaining) { ray_release(list); return ray_error("corrupt", NULL); }
         ray_t* s = ray_str((const char*)ptr, (size_t)slen);
         if (!s || RAY_IS_ERR(s)) { ray_release(list); return s; }
-        ptr += slen;
+        ptr += slen; remaining -= slen;
 
         list = ray_list_append(list, s);
         ray_release(s);  /* list_append retains */
@@ -466,41 +469,46 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
 }
 
 /* Read recursive element from mapped buffer */
-static ray_t* col_read_recursive(const uint8_t** pp);
+static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining);
 
-static ray_t* col_read_recursive(const uint8_t** pp) {
+static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
+    if (*remaining < 1) return ray_error("corrupt", NULL);
     int8_t type;
     memcpy(&type, *pp, 1);
-    *pp += 1;
+    *pp += 1; *remaining -= 1;
 
     if (type < 0) {
         /* Atom */
         if (type == -RAY_STR || type == -RAY_SYM) {
+            if (*remaining < 4) return ray_error("corrupt", NULL);
             uint32_t slen;
             memcpy(&slen, *pp, 4);
-            *pp += 4;
+            *pp += 4; *remaining -= 4;
+            if (slen > *remaining) return ray_error("corrupt", NULL);
             if (type == -RAY_SYM) {
                 /* Stored as a string; re-intern → runtime-domain atom. */
                 int64_t id = ray_sym_intern((const char*)*pp, (size_t)slen);
-                *pp += slen;
+                *pp += slen; *remaining -= slen;
                 if (id < 0) return ray_error("oom", NULL);
                 return ray_sym(id);
             }
             ray_t* s = ray_str((const char*)*pp, (size_t)slen);
-            *pp += slen;
+            *pp += slen; *remaining -= slen;
             return s;
         } else if (type == -RAY_GUID) {
             /* GUID atom: its 16-byte value.  Files written before this
              * held a process pointer here and were never readable. */
+            if (*remaining < 16) return ray_error("corrupt", NULL);
             uint8_t gb[16];
             memcpy(gb, *pp, 16);
-            *pp += 16;
+            *pp += 16; *remaining -= 16;
             return ray_guid(gb);
         } else {
             /* Fixed atom: 8 bytes */
+            if (*remaining < 8) return ray_error("corrupt", NULL);
             int64_t val;
             memcpy(&val, *pp, 8);
-            *pp += 8;
+            *pp += 8; *remaining -= 8;
 
             ray_t* atom = ray_alloc(0);
             if (!atom || RAY_IS_ERR(atom)) return atom;
@@ -513,20 +521,25 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
     if (type == RAY_SYM) {
         /* SYM vector stored as per-cell strings: intern each into the
          * global table — runtime-domain output by construction. */
+        if (*remaining < 8) return ray_error("corrupt", NULL);
         int64_t len;
         memcpy(&len, *pp, 8);
-        *pp += 8;
+        *pp += 8; *remaining -= 8;
+        if (len < 0 || (uint64_t)len > *remaining / 4)
+            return ray_error("corrupt", NULL);
 
         ray_t* vec = ray_sym_vec_new(RAY_SYM_W64, len);
         if (!vec || RAY_IS_ERR(vec)) return vec;
         vec->len = len;
         int64_t* out = (int64_t*)ray_data(vec);
         for (int64_t i = 0; i < len; i++) {
+            if (*remaining < 4) { ray_release(vec); return ray_error("corrupt", NULL); }
             uint32_t slen;
             memcpy(&slen, *pp, 4);
-            *pp += 4;
+            *pp += 4; *remaining -= 4;
+            if (slen > *remaining) { ray_release(vec); return ray_error("corrupt", NULL); }
             int64_t id = ray_sym_intern((const char*)*pp, (size_t)slen);
-            *pp += slen;
+            *pp += slen; *remaining -= slen;
             if (id < 0) { ray_release(vec); return ray_error("oom", NULL); }
             out[i] = id;
         }
@@ -535,19 +548,25 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
 
     if (is_serializable_type(type)) {
         /* Fixed-size vector */
+        if (*remaining < 8) return ray_error("corrupt", NULL);
         int64_t len;
         memcpy(&len, *pp, 8);
-        *pp += 8;
+        *pp += 8; *remaining -= 8;
+        if (len < 0) return ray_error("corrupt", NULL);
 
         /* RAY_STR: read attrs byte for nulls/pool layout */
         uint8_t attrs = 0;
         if (type == RAY_STR) {
+            if (*remaining < 1) return ray_error("corrupt", NULL);
             memcpy(&attrs, *pp, 1);
-            *pp += 1;
+            *pp += 1; *remaining -= 1;
         }
 
         uint8_t esz = ray_sym_elem_size(type, attrs);
+        if (esz > 0 && (uint64_t)len > SIZE_MAX / esz)
+            return ray_error("corrupt", NULL);
         size_t data_size = (size_t)len * esz;
+        if (data_size > *remaining) return ray_error("corrupt", NULL);
 
         /* The nested format carries no attrs for fixed-width vectors, so
          * their HAS_NULLS is rebuilt from the sentinels — the source of
@@ -566,7 +585,7 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
             if (!vec) return ray_error("oom", NULL);
             if (RAY_IS_ERR(vec)) return vec;
         }
-        *pp += data_size;
+        *pp += data_size; *remaining -= data_size;
 
         if (type == RAY_STR) {
             /* The nested format carries no hash mark, and files from before
@@ -576,9 +595,14 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
             ray_str_t* elems = (ray_str_t*)ray_data(vec);
             for (int64_t i = 0; i < len; i++)
                 if (!ray_str_is_inline(&elems[i])) elems[i].hash32 = 0;
+            if (*remaining < 8) { ray_release(vec); return ray_error("corrupt", NULL); }
             uint64_t pool_size;
             memcpy(&pool_size, *pp, 8);
-            *pp += 8;
+            *pp += 8; *remaining -= 8;
+            if (pool_size > *remaining || pool_size > (uint64_t)INT64_MAX) {
+                ray_release(vec);
+                return ray_error("corrupt", NULL);
+            }
             if (pool_size > 0) {
                 vec->str_pool = ray_alloc((size_t)pool_size);
                 if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) {
@@ -591,8 +615,9 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
                 vec->str_pool->len = (int64_t)pool_size;
                 memcpy(ray_data(vec->str_pool), *pp, (size_t)pool_size);
             }
-            *pp += pool_size;
-            /* the persisted attrs (COL_DISK_ATTRS_MASK) */
+            *pp += pool_size; *remaining -= (size_t)pool_size;
+            /* Stream attrs byte is untrusted — same allowlist as the
+             * column-file loaders (COL_DISK_ATTRS_MASK). */
             vec->attrs = attrs & COL_DISK_ATTRS_MASK;
         }
 
@@ -600,14 +625,16 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
     }
 
     if (type == RAY_LIST) {
+        if (*remaining < 8) return ray_error("corrupt", NULL);
         int64_t count;
         memcpy(&count, *pp, 8);
-        *pp += 8;
+        *pp += 8; *remaining -= 8;
+        if (count < 0) return ray_error("corrupt", NULL);
 
         ray_t* list = ray_list_new(count);
         if (!list || RAY_IS_ERR(list)) return list;
         for (int64_t i = 0; i < count; i++) {
-            ray_t* elem = col_read_recursive(pp);
+            ray_t* elem = col_read_recursive(pp, remaining);
             if (!elem || RAY_IS_ERR(elem)) { ray_release(list); return elem; }
             list = ray_list_append(list, elem);
             ray_release(elem);
@@ -617,34 +644,42 @@ static ray_t* col_read_recursive(const uint8_t** pp) {
     }
 
     if (type == RAY_TABLE) {
+        if (*remaining < 16) return ray_error("corrupt", NULL);
         int64_t ncols, nrows;
         memcpy(&ncols, *pp, 8);
-        *pp += 8;
+        *pp += 8; *remaining -= 8;
         memcpy(&nrows, *pp, 8);
-        *pp += 8;
+        *pp += 8; *remaining -= 8;
         (void)nrows;  /* nrows is reconstructed from columns */
 
+        if (ncols < 0) return ray_error("corrupt", NULL);
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
         for (int64_t c = 0; c < ncols; c++) {
+            if (*remaining < 8) { ray_release(tbl); return ray_error("corrupt", NULL); }
             int64_t name_sym;
             memcpy(&name_sym, *pp, 8);
-            *pp += 8;
+            *pp += 8; *remaining -= 8;
 
-            ray_t* col = col_read_recursive(pp);
+            ray_t* col = col_read_recursive(pp, remaining);
             if (!col || RAY_IS_ERR(col)) { ray_release(tbl); return col; }
             tbl = ray_table_add_col(tbl, name_sym, col);
             ray_release(col);  /* table_add_col retains */
             if (!tbl || RAY_IS_ERR(tbl)) return tbl;
         }
+        ray_t* shape_err = ray_table_validate_rectangular(tbl, "col load table");
+        if (shape_err) {
+            ray_release(tbl);
+            return shape_err;
+        }
         return tbl;
     }
 
     if (type == RAY_DICT) {
-        ray_t* keys = col_read_recursive(pp);
+        ray_t* keys = col_read_recursive(pp, remaining);
         if (!keys || RAY_IS_ERR(keys)) return keys;
-        ray_t* vals = col_read_recursive(pp);
+        ray_t* vals = col_read_recursive(pp, remaining);
         if (!vals || RAY_IS_ERR(vals)) {
             ray_release(keys);
             return vals;
@@ -1484,10 +1519,9 @@ ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
 }
 
 /* --------------------------------------------------------------------------
- * col_map -- the shared header parse of ray_col_load / ray_col_mmap
+ * col_validate_mapped -- shared validation for ray_col_load / ray_col_mmap
  *
- * Maps the file, selects its layout from the header, and returns parsed
- * metadata.  The file is ours: its sizes are taken as written.
+ * Maps the file, validates header/type/bounds, and returns parsed metadata.
  * On success, the mapping remains open (caller must unmap on error paths).
  * Returns NULL on success, or an error ray_t* on failure (mapping already
  * cleaned up in that case).
@@ -1502,7 +1536,7 @@ typedef struct {
     bool    has_str_pool;
     size_t  str_pool_offset;
     size_t  str_pool_size;
-    size_t  tail_offset;       /* end of payload (an inline index region follows it) */
+    size_t  tail_offset;       /* end of payload — file size must match (unless has_index) */
     uint32_t saved_sym_count;
     bool    has_index;         /* aux marker present → inline index region at tail */
     size_t  index_offset;      /* 32-aligned start of the index region (has_index) */
@@ -1536,11 +1570,21 @@ static ray_t* col_copy_str_pool(const col_mapped_t* cm) {
     return pool;
 }
 
-/* The STR pool that follows the descriptors: where it is and its size. */
-static void col_str_region(ray_t* hdr, const void* ptr, col_mapped_t* out) {
+static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
+                                         size_t mapped_size, col_mapped_t* out) {
     size_t offset = 32 + out->data_size;
+    if (offset > mapped_size || mapped_size - offset < 32)
+        return RAY_ERR_CORRUPT;
+
     ray_t* pool = (ray_t*)((char*)ptr + offset);
+    if (pool->type != RAY_U8 || pool->len < 0)
+        return RAY_ERR_CORRUPT;
+
     size_t pool_size = (size_t)pool->len;
+    if (pool_size > mapped_size - offset - 32)
+        return RAY_ERR_CORRUPT;
+
+    /* the region's extents only: the descriptors are taken as written */
     ray_str_t* elems = (ray_str_t*)((char*)ptr + 32);
     const char* pool_base = (const char*)ptr + offset + 32;
 
@@ -1555,7 +1599,7 @@ static void col_str_region(ray_t* hdr, const void* ptr, col_mapped_t* out) {
      * different join/group slots and silently produce wrong results.
      *
      * ray_vm_map_file is MAP_PRIVATE / copy-on-write, so refreshing the
-     * descriptors repairs both callers: ray_col_load copies these
+     * validated descriptors repairs both callers: ray_col_load copies these
      * values into its buddy block, while ray_col_mmap retains the private
      * repaired mapping without modifying the file.  Only a descriptor whose
      * stored value is wrong is written, so pages that happen to be right
@@ -1576,20 +1620,24 @@ static void col_str_region(ray_t* hdr, const void* ptr, col_mapped_t* out) {
     out->str_pool_offset = offset;
     out->str_pool_size = pool_size;
     out->tail_offset = offset + 32 + pool_size;
+    return RAY_OK;
 }
 
-static ray_t* col_map(const char* path, col_mapped_t* out) {
+static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     size_t mapped_size = 0;
     void* ptr = ray_vm_map_file(path, &mapped_size);
     if (!ptr) return ray_error("io", NULL);
 
     /* Reject extended-format files early.  STRV / STRL / LIST / TABLE
      * encode their payload and cannot satisfy the raw 32-byte ray_t
-     * header contract that the rest of this parse assumes;
+     * header contract that the rest of this validator assumes;
      * ray_col_load handles them via the magic-dispatch fast path
      * higher up.  Returning "nyi" here lets ray_col_mmap callers
-     * fall back to ray_col_load (see splay_load_impl).  0-row STRV
-     * files are 14 bytes: shorter than a ray_t header. */
+     * fall back to ray_col_load (see splay_load_impl).  This must
+     * come before the mapped_size < 32 check: 0-row STRV files are
+     * 14 bytes, 1-row STRV files with content < 10 bytes also fall
+     * under 32, and either would otherwise be rejected as "corrupt"
+     * with no fallback path. */
     if (mapped_size >= 4) {
         uint32_t magic;
         memcpy(&magic, ptr, 4);
@@ -1598,6 +1646,11 @@ static ray_t* col_map(const char* path, col_mapped_t* out) {
             ray_vm_unmap_file(ptr, mapped_size);
             return ray_error("nyi", NULL);
         }
+    }
+
+    if (mapped_size < 32) {
+        ray_vm_unmap_file(ptr, mapped_size);
+        return ray_error("corrupt", NULL);
     }
 
     ray_t* hdr = (ray_t*)ptr;
@@ -1622,14 +1675,18 @@ static ray_t* col_map(const char* path, col_mapped_t* out) {
         out->mapped      = ptr;
         out->mapped_size = mapped_size;
         out->header      = hdr;
-        return NULL;          /* the generation-2 parser reads the rest */
+        return NULL;          /* the generation-2 parser validates the rest */
     }
     out->gen2 = false;
 
-    /* a type this layout stores (the others have their own formats) */
+    /* Validate type from untrusted file data -- allowlist only */
     if (!is_serializable_type(hdr->type)) {
         ray_vm_unmap_file(ptr, mapped_size);
         return ray_error("nyi", NULL);
+    }
+    if (hdr->len < 0) {
+        ray_vm_unmap_file(ptr, mapped_size);
+        return ray_error("corrupt", NULL);
     }
 
     uint8_t esz = ray_sym_elem_size(hdr->type, hdr->attrs);
@@ -1639,11 +1696,24 @@ static ray_t* col_map(const char* path, col_mapped_t* out) {
         return ray_error("type", "col mmap %s: on-disk type %s has no fixed element size for %lld rows",
                          path, ht, (long long)hdr->len);
     }
+    /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
+    if ((uint64_t)hdr->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
+        ray_vm_unmap_file(ptr, mapped_size);
+        return ray_error("io", NULL);
+    }
     size_t data_size = (size_t)hdr->len * esz;
+    if (32 + data_size > mapped_size) {
+        ray_vm_unmap_file(ptr, mapped_size);
+        return ray_error("corrupt", NULL);
+    }
 
     out->data_size = data_size;
     if (hdr->type == RAY_STR) {
-        col_str_region(hdr, ptr, out);
+        ray_err_t se = col_validate_str_region(hdr, ptr, mapped_size, out);
+        if (se != RAY_OK) {
+            ray_vm_unmap_file(ptr, mapped_size);
+            return ray_error(ray_err_code_str(se), NULL);
+        }
     } else {
         out->has_str_pool = false;
         out->str_pool_offset = 0;
@@ -1653,8 +1723,9 @@ static ray_t* col_map(const char* path, col_mapped_t* out) {
 
     /* RAY_SYM: record the saved dictionary count from the header rc
      * field (runtime-domain files: global count at save; domain-encoded
-     * splayed columns: the symfile's count at save).  The loaders check it
-     * against the dictionary the caller named, which they know.  Use memcpy (not atomic_load) since
+     * splayed columns: the symfile's count at save).  The fast-reject
+     * against the live dictionary happens in the loaders, which know
+     * which dictionary applies.  Use memcpy (not atomic_load) since
      * file data is not atomic storage. */
     if (hdr->type == RAY_SYM) {
         uint32_t saved_sc;
@@ -1700,7 +1771,7 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
                             bool require_dom) {
     if (!path) return ray_error("io", NULL);
 
-    /* Read file into temp mmap for the header parse, then copy to buddy block.
+    /* Read file into temp mmap for validation, then copy to buddy block.
      * This avoids the mmap lifecycle problem (mmod=1 blocks are never freed). */
     size_t mapped_size = 0;
     void* ptr = ray_vm_map_file(path, &mapped_size);
@@ -1712,7 +1783,7 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
         memcpy(&magic, ptr, 4);
 
         if (magic == STR_LIST_MAGIC) {
-            ray_t* result = col_load_str_list((const uint8_t*)ptr + 4);
+            ray_t* result = col_load_str_list((const uint8_t*)ptr + 4, mapped_size - 4);
             ray_vm_unmap_file(ptr, mapped_size);
             return result;
         }
@@ -1723,16 +1794,17 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
         }
         if (magic == LIST_MAGIC || magic == TABLE_MAGIC) {
             const uint8_t* p = (const uint8_t*)ptr + 4;
-            ray_t* result = col_read_recursive(&p);
+            size_t rem = mapped_size - 4;
+            ray_t* result = col_read_recursive(&p, &rem);
             ray_vm_unmap_file(ptr, mapped_size);
             return result;
         }
     }
-    /* Unmap the initial mapping; col_map maps it again */
+    /* Unmap the initial mapping; col_validate_mapped will re-map for validation */
     ray_vm_unmap_file(ptr, mapped_size);
 
     col_mapped_t cm = {0};
-    ray_t* err = col_map(path, &cm);
+    ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
     if (cm.gen2) {
         ray_t* enc = ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
@@ -1859,19 +1931,19 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
     if (!path) return ray_error("io", NULL);
 
     col_mapped_t cm = {0};
-    ray_t* err = col_map(path, &cm);
+    ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
     if (cm.gen2)
         return ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
 
     ray_t* vec = cm.header;
 
-    /* RAY_SYM: splayed reads are the trusted local table format, so
-     * opening them only maps files and reads headers; walking every symbol
-     * column would turn mmap open into an eager cold-disk scan.  Files carry
-     * a saved dictionary count for an O(1) check that the symfile the caller
-     * named holds every id — post-flip that is the SYMFILE's count at save
-     * time, checked against the attached FILE domain. */
+    /* RAY_SYM: generic mmap validates indices by scanning the data.  Splayed
+     * reads are the trusted local table format, so opening them must only map
+     * files and validate headers; walking every symbol column would turn mmap
+     * open into an eager cold-disk scan.  Files carry a saved dictionary
+     * count for an O(1) reject — post-flip that is the SYMFILE's count at
+     * save time, checked against the attached FILE domain. */
     if (vec->type == RAY_SYM) {
         if (dom) {
             int64_t dcount = ray_sym_domain_count(dom);
