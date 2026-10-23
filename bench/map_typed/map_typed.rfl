@@ -1,0 +1,24 @@
+;; Reproduction for typed map collection. Run a fresh process per mode.
+;; MODE=typed|postcast|mixed|late|nested|strings N=100000 REPS=5
+(set n (as 'I64 (.os.getenv "N")))
+(set reps (as 'I64 (.os.getenv "REPS")))
+(set mode (.os.getenv "MODE"))
+(set input (til n))
+(set checksum 0)
+(set elapsed
+  (timeit
+    (times [j reps]
+      (set checksum
+        (if (== mode "typed") (sum (map (fn [x] (+ x 1)) input))
+            (== mode "postcast") (sum (as 'I64 (map (fn [x] (+ x 1)) input)))
+            (== mode "mixed") (sum (map (fn [x] (if (== (% x 2) 0) x (as 'F64 x))) input))
+            (== mode "late") (sum (map (fn [x] (if (== x (- n 1)) (as 'F64 x) x)) input))
+            (== mode "nested") (count (map (fn [x] (enlist x)) input))
+            (== mode "strings") (count (map (fn [x] "same string") input))
+            (raise "unknown mode"))))))
+(set expected
+  (if (or (== mode "typed") (== mode "postcast")) (/ (* n (+ n 1)) 2)
+      (or (== mode "mixed") (== mode "late")) (/ (* n (- n 1)) 2)
+      n))
+(if (not (== checksum expected)) (raise "map benchmark checksum mismatch"))
+(println (format "mode=% ms=% peak_bytes=% checksum=%" mode elapsed (at (.sys.mem) 'peak-bytes) checksum))
