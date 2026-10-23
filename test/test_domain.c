@@ -3928,7 +3928,8 @@ static test_result_t test_domain_corrupt_names_file(void) {
     if (lines != 2) FAILF("%d stderr lines for 2 torn files", lines);
     for (int w = 0; w < 2; w++) {
         char tail[128];
-        snprintf(tail, sizeof tail, ": %s\n", P[w]);
+        /* the message names the resolved path (on macOS /tmp is /private/tmp) */
+        snprintf(tail, sizeof tail, "%s\n", P[w]);
         if (!strstr((const char*)ix_buf2, tail)) FAILF("file %d: no line ends with its path", w);
     }
     PASS();
@@ -4014,7 +4015,28 @@ static test_result_t test_domain_index_writers(void) {
         TEST_ASSERT(ix_check_all(re, &ix_va, N), "after the import's sync");
         TEST_ASSERT(ix_check_lens(re, &ix_va, N), "the import's lengths");
         in = ix_info(re);
-        TEST_ASSERT_TRUE(in.from_index);
+        if (!in.from_index) {
+            /* the index's claim against the file it now finds */
+            uint8_t h[48] = {0};
+            FILE* fx = fopen(pix, "rb");
+            size_t got = fx ? fread(h, 1, sizeof h, fx) : 0;
+            if (fx) fclose(fx);
+            int64_t cnt = 0;
+            uint64_t end = 0, ino = 0, stamp = 0;
+            memcpy(&cnt, h + 16, 8); memcpy(&end, h + 24, 8);
+            memcpy(&ino, h + 32, 8); memcpy(&stamp, h + 40, 8);
+            struct stat st;
+            memset(&st, 0, sizeof st);
+            (void)stat(p, &st);
+            uint64_t now = (uint64_t)ix_mtime_ns(&st) ^
+                           ((uint64_t)ix_ctime_ns(&st) * UINT64_C(0x9E3779B97F4A7C15));
+            ray_sym_domain_release(re);
+            FAILF("the import's index is not taken: index (%zu B) count %lld end %llu ino %llu stamp %llx; "
+                  "file size %lld ino %llu stamp %llx; covered %lld rescued %lld",
+                  got, (long long)cnt, (unsigned long long)end, (unsigned long long)ino,
+                  (unsigned long long)stamp, (long long)st.st_size, (unsigned long long)st.st_ino,
+                  (unsigned long long)now, (long long)in.covered, (long long)in.rescued);
+        }
         TEST_ASSERT_EQ_I(in.covered, N);
         TEST_ASSERT_EQ_I(in.rescued, 0);
         ray_sym_domain_release(re);
