@@ -9935,7 +9935,9 @@ static test_result_t test_read_procfs_reports_zero_size(void) {
  * spill file rather than merely exhausting RAM.
  *
  * Drives the bound by moving the watermark to just above what is already
- * committed, which makes the budget small and the error immediate. */
+ * committed, which makes the budget its floor (64 MB) and the error quick;
+ * then below it, as when memory is short: the budget must stay that floor,
+ * not fall to 0 — "no bound" — and an endless stream must still error. */
 static test_result_t test_read_unsized_stream_is_bounded(void) {
 #if defined(RAY_OS_WINDOWS)
     SKIP("no /dev/zero");
@@ -9951,8 +9953,9 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     int64_t saved = ray_heap_anon_watermark();
     ray_heap_set_anon_watermark(0);
     bool was_default = (saved == ray_heap_anon_watermark());
-    /* budget = (watermark - committed) / 4, so this leaves ~1 MB. */
+    /* budget = max((watermark - committed) / 4, 64 MB): here the floor. */
     ray_heap_set_anon_watermark(ray_heap_anon_committed() + 4 * 1024 * 1024);
+    int64_t near_budget = ray_unsized_read_budget();
 
     ray_t* arg = ray_str("/dev/zero", 9);
     ray_t* got = ray_read_file_fn(arg);
@@ -9960,10 +9963,31 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
 
     ray_heap_set_anon_watermark(was_default ? 0 : saved);
 
+    TEST_ASSERT_EQ_I(near_budget, INT64_C(64) << 20);
     TEST_ASSERT_NOT_NULL(got);
     TEST_ASSERT(RAY_IS_ERR(got), "an endless stream must error, not grow without end");
     TEST_ASSERT_STR_EQ(ray_err_code(got), "io");
     ray_error_free(got);
+
+    /* Past the watermark — committed above it, memory short — the bound
+     * must hold all the more.  It used to come back 0, which the readers
+     * take for "no bound": checked before reading, so that a 0 fails here
+     * instead of reading /dev/zero without end. */
+    int64_t committed = ray_heap_anon_committed();
+    ray_heap_set_anon_watermark(committed > 2 ? committed / 2 : 1);
+    int64_t past_budget = ray_unsized_read_budget();
+    ray_t* past = NULL;
+    if (past_budget > 0) {
+        ray_t* parg = ray_str("/dev/zero", 9);
+        past = ray_read_file_fn(parg);
+        ray_release(parg);
+    }
+    ray_heap_set_anon_watermark(was_default ? 0 : saved);
+    TEST_ASSERT_EQ_I(past_budget, INT64_C(64) << 20);
+    TEST_ASSERT_NOT_NULL(past);
+    TEST_ASSERT(RAY_IS_ERR(past), "past the watermark an endless stream must still error");
+    TEST_ASSERT_STR_EQ(ray_err_code(past), "io");
+    ray_error_free(past);
 
     /* A *sized* file larger than the same budget must still read: the
      * ceiling exists to terminate an endless stream, and a reported size is
@@ -9974,7 +9998,7 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     FILE* bf = fopen(big, "wb");
     TEST_ASSERT_NOT_NULL(bf);
     static char chunk[65536];
-    for (int i = 0; i < 32; i++)   /* 2 MB, well over the ~1 MB budget */
+    for (int i = 0; i < 512; i++)  /* 32 MB: unsized, the 64 MB budget would refuse it (3x peak) */
         TEST_ASSERT(fwrite(chunk, 1, sizeof(chunk), bf) == sizeof(chunk), "write big file");
     fclose(bf);
 
@@ -9985,7 +10009,7 @@ static test_result_t test_read_unsized_stream_is_bounded(void) {
     ray_heap_set_anon_watermark(was_default ? 0 : saved);
     remove(big);
     TEST_ASSERT(!RAY_IS_ERR(bread), "a sized file must not be refused by the unsized budget");
-    TEST_ASSERT_EQ_I(ray_str_len(bread), 2 * 1024 * 1024);
+    TEST_ASSERT_EQ_I(ray_str_len(bread), 32 * 1024 * 1024);
     ray_release(bread);
 
     /* The bound must not have disturbed ordinary reads once restored. */

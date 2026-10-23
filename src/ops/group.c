@@ -252,6 +252,7 @@ static inline bool sym_lex_lt(struct ray_sym_domain_s* dom,
         a < raw.count && b < raw.count) {
         pa = ray_sym_domain_raw_str(&raw, a, &la);
         pb = ray_sym_domain_raw_str(&raw, b, &lb);
+        if (!pa || !pb) return a < b;   /* corrupt file: reported by the evaluation */
     } else {
         ray_t* sa = ray_sym_domain_str(dom, a);
         ray_t* sb = ray_sym_domain_str(dom, b);

@@ -647,8 +647,11 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n);
 ray_t* ray_gc_fn(ray_t** args, int64_t n);
 /* Ceiling for growing a read that has no size to go on — an endless stream
  * has no EOF to reach, and growing to meet it takes the process down.  A
- * quarter of the heap's remaining anon headroom; 0 means "no bound known",
- * which callers treat as permissive.  Shared by `read`/`read-bytes` and by
+ * quarter of the heap's remaining anon headroom, and at least 64 MB: at or
+ * past the watermark there is none to take a quarter of.  The callers bound
+ * the peak of a grow (3 x the buffer) by it, so past the watermark what they
+ * read stays within ~32 MB.  0 means "no bound known" — RAM unknown — which
+ * callers treat as permissive.  Shared by `read`/`read-bytes` and by
  * .sys.exec's output capture, which face the same problem. */
 int64_t ray_unsized_read_budget(void);
 

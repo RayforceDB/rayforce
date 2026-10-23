@@ -906,6 +906,8 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
     ray_heap_gc();
+    /* Dead memory the heap keeps for reuse is not kept locked against swap. */
+    ray_heap_unlock_idle();
     /* Same statement-boundary rules as the REPL: under memory pressure what
      * is free goes back now, and an explicit maintenance call is also a
      * chance to notice the process has gone quiet. */
@@ -1320,6 +1322,11 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "anon-committed",  14, ray_heap_anon_committed()     },
         { "anon-peak",        9, ray_heap_anon_peak()          },
         { "anon-watermark",  14, ray_heap_anon_watermark()     },
+        /* the heap's mappings locked against swap-out (bytes mapped, not
+         * resident), the kernel's refusals, and the bytes left unlocked */
+        { "locked-bytes",    12, ray_heap_locked_bytes()       },
+        { "lock-failed",     11, ray_heap_lock_failures()      },
+        { "lock-skipped",    12, ray_heap_lock_skipped()       },
         { "group-perpart-runs", 18, ray_group_perpart_runs()   },
         { "asof-perpart-runs",  17, ray_asof_perpart_runs()    },
         { "sort-perpart-runs",  17, ray_sort_perpart_runs()    },

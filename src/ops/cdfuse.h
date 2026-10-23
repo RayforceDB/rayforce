@@ -63,4 +63,47 @@ bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
                                const int64_t* rows, int64_t nrows, int64_t population,
                                int64_t workers);
 
+/* Grouped count-distinct in bounded memory (the post-group scatter of a
+ * select whose `(count (distinct X))` sits beside a group by K).  One
+ * sequential pass over the K and X columns per round: each row's group id
+ * comes from K through a table of the n_groups result keys `grp_keys`
+ * (rows whose key is not among them are skipped), or from `row_gid` when
+ * the caller has the row map already (then `key_col`, `grp_keys` and `sel`
+ * are unused: the map carries the selection as -1).  The (group, value)
+ * pairs are hash-partitioned and deduplicated chunk by chunk into
+ * partition-local sets; when the sets would outgrow the memory budget (a
+ * share of what the anon watermark leaves), the partitions past it are
+ * dropped and counted by a further pass over the input instead — up to
+ * about CDB_MAX_ROUNDS passes, past which the sets may pass the budget.  No
+ * per-row index, no per-group slices.
+ *
+ * key_col/val_col: flat vectors, parted columns (a missing partition's rows
+ * read as nulls, sized by the partition counts of `tbl`) or MAPCOMMON.  Key
+ * types: BOOL U8 I16 I32 I64 DATE TIME TIMESTAMP SYM; value types the same
+ * and F64.  `sel` is a rowsel over the nrows rows or NULL.  A null value is
+ * one distinct value, as on every other count-distinct path.
+ *
+ * Returns an I64 vector of n_groups counts (group i of grp_keys / row_gid
+ * id i), an error (oom, cancel), or NULL when a column is not served (a type
+ * it does not read, fewer rows than nrows). */
+ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
+                      const int64_t* row_gid, int64_t n_groups,
+                      ray_t* val_col, ray_t* sel, int64_t nrows);
+
+/* Whether ray_cd_bounded serves `col` as a key (is_val false) or a value. */
+bool ray_cd_bounded_col_ok(ray_t* col, bool is_val);
+
+/* Whether the scatter of a count-distinct of `val` over nrows rows of `tbl`
+ * (those `sel` keeps, when given) into n_groups groups of `key` takes
+ * ray_cd_bounded rather than the per-group slices (or the global hash past
+ * 50 K groups): when the slices' row buffers and the flat copies of parted
+ * columns would not fit half of the room under the anon watermark; else,
+ * from CDB_MIN_ROWS rows up to 50 K groups, for a column not resident, and
+ * from 64 M rows for a dominant group or pairs that dedup to a quarter of
+ * the rows (sampled; over one partition of a parted pair).  key/val NULL (a
+ * composite key, a row map built anyway): memory alone. */
+#define CDB_MIN_ROWS 65536
+bool ray_cd_bounded_preferred(ray_t* tbl, ray_t* key, ray_t* val, ray_t* sel,
+                              int64_t nrows, int64_t n_groups);
+
 #endif /* RAY_OPS_CDFUSE_H */

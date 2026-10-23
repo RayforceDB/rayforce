@@ -28,6 +28,7 @@
 #endif
 
 #include "lang/format.h"
+#include "table/domain.h"   /* ray_sym_has_file_domain */
 #include "app/repl.h"
 #include "app/term.h"
 #include "core/ipc.h"
@@ -573,6 +574,21 @@ static void repl_print_result(FILE* fp, ray_t* val, bool use_color) {
             fprintf(fp, "\n");
         }
         return;
+    }
+    /* Symbols of a file domain are resolved as they print: rendered once
+     * into a temporary file and written out only if none went unread, so
+     * a symfile found torn on the way reports `corrupt` instead of
+     * printing its entries as "" (table/domain.h). */
+    if (ray_sym_has_file_domain(val)) {
+        uint64_t c0 = ray_sym_domain_corruptions();
+        FILE* t = tmpfile();
+        if (t) {
+            ray_fmt_pp_print(t, val);
+            fprintf(t, "\n");
+            ray_t* e = ray_sym_print_commit(t, fp, c0);
+            if (e && RAY_IS_ERR(e)) { repl_print_result(fp, e, use_color); ray_error_free(e); }
+            return;
+        }
     }
     ray_fmt_pp_print(fp, val);
     fprintf(fp, "\n");

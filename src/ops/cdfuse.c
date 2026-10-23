@@ -58,6 +58,8 @@
 #include "ops/hll.h"        /* ray_count_distinct_approx — the gate's group count check */
 #include "table/sym.h"     /* RAY_IS_SYM */
 #include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
+#include "ops/rowsel.h"    /* ray_rowsel_* — the bounded kernel's selection */
+#include "core/platform.h" /* ray_vm_advise_willneed */
 
 /* Peak-footprint estimate used by the admission gate below: 32B/row for
  * phase 1's records plus up to 24B per (partition, key) pair in phase 2,
@@ -885,4 +887,1028 @@ bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
                                NULL, NULL, NULL, &t_est))
         return true;
     return t_est < nrows - nrows / 4;
+}
+
+/* ══════════════════════════════════════════
+ * Bounded grouped count-distinct
+ * ══════════════════════════════════════════
+ *
+ * The per-group slices (count_distinct_per_group_buf, query.c) take a row
+ * map (8 B a row), a row index ordered by group (8 B a row) and a hash table
+ * per group sized by its rows, and gather the values through the index: on a
+ * 100M-row table that is 1.6 GB of row-sized scratch read at random, which a
+ * small machine spills to disk and rewrites several times over.  The global
+ * hash past 50 K groups scatters 16 B a row besides the row map.
+ *
+ * Here the K and X columns are read in order, a chunk at a time.  Phase A
+ * (a task per run of CDB_TASK_ROWS rows) maps each row to its group, hashes
+ * the (group, value) pair, drops a pair the task saw a moment ago and sorts
+ * the rest by partition (the hash's top bits) into the chunk's record
+ * buffer.  Phase B (a task per partition) adds the chunk's records of its
+ * partition to that partition's set — open addressing over (value, group+1)
+ * slots, 6 to 12 bytes each.  The sets hold each distinct pair once; the
+ * record buffer, the staging and the per-worker counts are a few tens of MB
+ * whatever the row count.  The input is read once, the sets are written in
+ * place: no structure grows with the rows.
+ *
+ * The sets are what grows with the distinct pairs.  A set grows when phase
+ * B fills it to load 3/4 (its task stops there; the main thread gives it a
+ * block sized by the share of new pairs among the records so far, and phase
+ * B goes on), so a set holds what its pairs need, not its raw records.  The
+ * sets are sized against a budget — three quarters of the room under the
+ * anon watermark, counting the blocks the heap can reuse, and no less than
+ * a sixteenth of the watermark or a quarter of the slices' row buffers —
+ * and when growing them would pass it, the partitions at the top of the
+ * round's range are freed and left to a further round, which reads the
+ * input again and keeps only their pairs.  Partitions are disjoint in
+ * pairs, so a partition is counted in exactly one round; how many
+ * partitions a round takes is set from the bytes per partition the previous
+ * one ended with.  The first trim projects the round's sets over the rows
+ * left: past CDB_MAX_ROUNDS budgets' worth the budget rises to a third of
+ * that (up to the slices' row buffers), rather than re-reading the input
+ * once a partition.
+ *
+ * Every set block is allocated and freed by the calling thread (phase B
+ * only fills blocks the main thread handed it), so nothing is freed into a
+ * worker's foreign list. */
+
+#define CDB_TASK_ROWS   32768   /* rows per phase-A task (at most), a multiple of RAY_MORSEL_ELEMS */
+#define CDB_TASK_ROWS_MIN 4096  /* the fewest, under a small budget */
+#define CDB_MAX_ROUNDS  3       /* passes over the input before the sets may pass the budget */
+#define CDB_CACHE       256     /* recent-pair cache entries per task */
+#define CDB_SET_MIN_BYTES 1024  /* first block of a partition set */
+#define CDB_MAX_PARTS   1024u
+#define CDB_LOCAL_CNT   (INT64_C(4) << 20)  /* per-worker count cells before atomics */
+#define CDB_MIN_BUDGET  (INT64_C(4) << 20)  /* and a sixteenth of the watermark */
+#define CDB_RA_BYTES    (INT64_C(48) << 20) /* input requested ahead of the scan */
+#define CDB_SKEW        4       /* workers' shares of the rows a dominant group holds */
+#define CDB_SAMPLE_ROWS (INT64_C(1) << 26) /* rows from which the route samples */
+
+typedef struct { int64_t x; uint32_t g; uint32_t h; } cdb_rec_t;
+typedef struct { int64_t x; uint64_t g; } cdb_recent_t;
+
+typedef struct {
+    const void* data;   /* NULL: every row reads `fill` */
+    int64_t     lo, n;  /* global rows [lo, lo + n) */
+    int8_t      type;
+    uint8_t     attrs, esz;
+    bool        cold;
+    int64_t     fill;
+} cdb_seg_t;
+
+typedef struct {
+    cdb_seg_t* seg;
+    int64_t    nseg, rows;
+    bool       narrow;  /* every cell is a 32-bit pattern (see cdb_col_open) */
+} cdb_col_t;
+
+typedef struct {
+    void*    blk;       /* cap values, then cap tags (group + 1, 0 = empty) */
+    void*    old;       /* the previous slots, rehashed into blk by phase B */
+    uint64_t cap, ocap;
+    uint64_t bytes;     /* blk's buddy block: a power of two, header included */
+    uint64_t obytes;    /* old's */
+    int64_t  n;
+    /* phase B over one chunk: the records of the partition (inc), those
+     * taken (seen) and the new pairs among them (added), and where it
+     * stopped when the set filled (task rt, record ri) */
+    int64_t  inc, seen, added, ri;
+    uint32_t rt;
+    bool     fresh;     /* blk not initialised yet */
+    bool     full;      /* stopped at load 3/4: to grow and go on */
+} cdb_set_t;
+
+typedef struct {
+    cdb_col_t       key, val;
+    const int64_t*  row_gid;
+    const int64_t*  kkeys;      /* key -> group + 1 */
+    const uint32_t* ktag;
+    uint64_t        kmask;
+    int64_t         n_groups, nrows;
+    const uint8_t*  sel_flg;
+    const uint32_t* sel_offs;
+    const uint16_t* sel_idx;
+    int64_t         sel_nsegs;
+    uint64_t        vmask;
+    uint32_t        P, pshift, lo, hi, T, T_c;
+    int64_t         S;          /* rows per phase-A task */
+    int64_t         chunk_r0;
+    cdb_rec_t*      recs;       /* [T * S] */
+    cdb_rec_t*      stage;      /* [W * S] */
+    uint16_t*       spart;      /* [W * S] */
+    const uint32_t* plist;      /* phase B: the partitions of its tasks */
+    int64_t*        toff;       /* [T * (P + 1)] */
+    cdb_set_t*      sets;       /* [P] */
+    int             var;        /* slot layout, see CDB_SET_FNS */
+    int64_t*        cnt;        /* [W * n_groups], or [n_groups] when shared */
+    bool            cnt_shared;
+    _Atomic(int64_t) done;
+} cdb_ctx_t;
+
+/* A slot of a set of `cap` slots from 32 hash bits (multiply-shift): any
+ * capacity, so a set fills its buddy block (cdb_set_bytes). */
+static inline uint64_t cdb_slot(uint32_t h, uint64_t cap) {
+    return ((uint64_t)h * cap) >> 32;
+}
+
+static inline uint64_t cdb_hash(int64_t x, uint64_t g) {
+    return cdf_fmix64((uint64_t)x * 0x9E3779B97F4A7C15ULL + g * 0xC2B2AE3D27D4EB4FULL);
+}
+
+static bool cdb_type_ok(int8_t t, bool is_val) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
+        return true;
+    case RAY_F64:
+        return is_val;
+    default:
+        return false;
+    }
+}
+
+/* A cell as a key: integers widened with their sign, SYM ids and BOOL/U8
+ * without, F64 through canon_f64_key — what the other count-distinct
+ * kernels key a value by, nulls included (the sentinels are ordinary
+ * integers, a SYM null is id 0, every NaN folds to one). */
+static inline int64_t cdb_cell(const void* d, int64_t r, int8_t t, uint8_t attrs) {
+    if (t == RAY_F64) return canon_f64_key(((const double*)d)[r]);
+    return read_col_i64(d, r, t, attrs);
+}
+
+/* What the rows of a partition without the column read as: the type's
+ * null, keyed as a stored one (BOOL/U8 have none: 0, as parted_fill_nulls
+ * writes). */
+static int64_t cdb_null_cell(int8_t t) {
+    switch (t) {
+    case RAY_I16: return NULL_I16;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return NULL_I32;
+    case RAY_I64: case RAY_TIMESTAMP: return NULL_I64;
+    case RAY_F64: return canon_f64_key(NULL_F64);
+    default: return 0;
+    }
+}
+
+static void cdb_col_close(cdb_col_t* c) {
+    ray_free_raw(c->seg);
+    c->seg = NULL;
+}
+
+/* The segments of a flat, parted or MAPCOMMON column.  `narrow`: the low 32
+ * bits of every cell identify it — the signed family (I16, I32, DATE, TIME)
+ * whose cells are 32-bit integers widened, or the unsigned one (BOOL, U8,
+ * SYM) while every cell is below 2^32 — so a set stores 4 bytes a value.
+ * 1 when served, 0 when not (a type, a segment of another type), -1 when
+ * memory ran out. */
+static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
+    memset(c, 0, sizeof(*c));
+    if (!col || RAY_IS_ERR(col)) return 0;
+    int8_t base;
+    int64_t n;
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t** mp = (ray_t**)ray_data(col);
+        ray_t* kv = mp[0];
+        ray_t* rc = mp[1];
+        if (!kv || !rc || RAY_IS_ERR(kv) || RAY_IS_ERR(rc) || rc->type != RAY_I64 ||
+            !ray_is_vec(kv) || kv->len < rc->len || !cdb_type_ok(kv->type, is_val))
+            return 0;
+        base = kv->type;
+        n = rc->len;
+        c->seg = (cdb_seg_t*)ray_calloc_raw((size_t)(n > 0 ? n : 1) * sizeof(cdb_seg_t));
+        if (!c->seg) return -1;
+        const int64_t* counts = (const int64_t*)ray_data(rc);
+        for (int64_t p = 0; p < n; p++) {
+            c->seg[p].n = counts[p] > 0 ? counts[p] : 0;
+            c->seg[p].type = base;
+            c->seg[p].fill = cdb_cell(ray_data(kv), p, kv->type, kv->attrs);
+        }
+    } else if (RAY_IS_PARTED(col->type)) {
+        base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+        if (!cdb_type_ok(base, is_val)) return 0;
+        ray_t** segs = (ray_t**)ray_data(col);
+        int64_t ncnt = 0;
+        const int64_t* cnt = parted_table_counts(tbl, &ncnt);
+        n = col->len;
+        c->seg = (cdb_seg_t*)ray_calloc_raw((size_t)(n > 0 ? n : 1) * sizeof(cdb_seg_t));
+        if (!c->seg) return -1;
+        for (int64_t s = 0; s < n; s++) {
+            ray_t* sg = segs[s];
+            cdb_seg_t* d = &c->seg[s];
+            d->type = base;
+            if (sg && !RAY_IS_ERR(sg)) {
+                if (sg->type != base || !ray_is_vec(sg)) { cdb_col_close(c); return 0; }
+                d->data = sg->len > 0 ? ray_data(sg) : NULL;
+                d->n = sg->len;
+                d->attrs = sg->attrs;
+                d->esz = ray_sym_elem_size(base, sg->attrs);
+                d->cold = d->data && ray_col_cold(sg);
+                if (!d->data) d->fill = 0;   /* no rows */
+            } else {
+                d->n = parted_seg_rows(segs, s, cnt, ncnt);
+                d->fill = cdb_null_cell(base);
+            }
+        }
+    } else {
+        if (!ray_is_vec(col) || !cdb_type_ok(col->type, is_val)) return 0;
+        base = col->type;
+        n = 1;
+        c->seg = (cdb_seg_t*)ray_calloc_raw(sizeof(cdb_seg_t));
+        if (!c->seg) return -1;
+        c->seg[0].data = col->len > 0 ? ray_data(col) : NULL;
+        c->seg[0].n = col->len;
+        c->seg[0].type = base;
+        c->seg[0].attrs = col->attrs;
+        c->seg[0].esz = ray_sym_elem_size(base, col->attrs);
+        c->seg[0].cold = c->seg[0].data && ray_col_cold(col);
+    }
+    c->nseg = n;
+    int64_t lo = 0;
+    for (int64_t s = 0; s < n; s++) { c->seg[s].lo = lo; lo += c->seg[s].n; }
+    c->rows = lo;
+    switch (base) {
+    case RAY_I16: case RAY_I32: case RAY_DATE: case RAY_TIME:
+        c->narrow = true;
+        break;
+    case RAY_BOOL: case RAY_U8: case RAY_SYM:
+        c->narrow = true;
+        for (int64_t s = 0; s < n && c->narrow; s++) {
+            const cdb_seg_t* d = &c->seg[s];
+            if (d->data ? d->esz > 4 : (uint64_t)d->fill > UINT32_MAX) c->narrow = false;
+        }
+        break;
+    default:
+        c->narrow = false;
+    }
+    return 1;
+}
+
+bool ray_cd_bounded_col_ok(ray_t* col, bool is_val) {
+    if (!col || RAY_IS_ERR(col)) return false;
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* kv = ((ray_t**)ray_data(col))[0];
+        return kv && !RAY_IS_ERR(kv) && ray_is_vec(kv) && cdb_type_ok(kv->type, is_val);
+    }
+    if (RAY_IS_PARTED(col->type))
+        return cdb_type_ok((int8_t)RAY_PARTED_BASETYPE(col->type), is_val);
+    return ray_is_vec(col) && cdb_type_ok(col->type, is_val);
+}
+
+/* The segment holding global row r (r < rows). */
+static int64_t cdb_seek(const cdb_col_t* c, int64_t r) {
+    int64_t a = 0, b = c->nseg - 1;
+    while (a < b) {
+        int64_t m = (a + b + 1) / 2;
+        if (c->seg[m].lo <= r) a = m; else b = m - 1;
+    }
+    return a;
+}
+
+/* Cells of rows [r, r + n) into out[], from segment *si on. */
+static void cdb_decode(const cdb_col_t* c, int64_t* si, int64_t r, int64_t n, int64_t* out) {
+    int64_t s = *si;
+    while (n > 0) {
+        while (r >= c->seg[s].lo + c->seg[s].n) s++;
+        const cdb_seg_t* g = &c->seg[s];
+        int64_t off = r - g->lo, m = g->n - off;
+        if (m > n) m = n;
+        if (!g->data) {
+            for (int64_t i = 0; i < m; i++) out[i] = g->fill;
+        } else if (g->type == RAY_F64) {
+            const double* d = (const double*)g->data + off;
+            for (int64_t i = 0; i < m; i++) out[i] = canon_f64_key(d[i]);
+        } else if (g->esz == 8) {
+            memcpy(out, (const int64_t*)g->data + off, (size_t)m * sizeof(int64_t));
+        } else if (g->esz == 4) {
+            if (g->type == RAY_SYM) {
+                const uint32_t* d = (const uint32_t*)g->data + off;
+                for (int64_t i = 0; i < m; i++) out[i] = d[i];
+            } else {
+                const int32_t* d = (const int32_t*)g->data + off;
+                for (int64_t i = 0; i < m; i++) out[i] = d[i];
+            }
+        } else if (g->esz == 2) {
+            if (g->type == RAY_SYM) {
+                const uint16_t* d = (const uint16_t*)g->data + off;
+                for (int64_t i = 0; i < m; i++) out[i] = d[i];
+            } else {
+                const int16_t* d = (const int16_t*)g->data + off;
+                for (int64_t i = 0; i < m; i++) out[i] = d[i];
+            }
+        } else {
+            const uint8_t* d = (const uint8_t*)g->data + off;
+            for (int64_t i = 0; i < m; i++) out[i] = d[i];
+        }
+        out += m; r += m; n -= m;
+    }
+    *si = s;
+}
+
+/* Ask for the cold segments' bytes of rows [r0, r1). */
+static void cdb_want(const cdb_col_t* c, int64_t r0, int64_t r1) {
+    if (r0 >= r1) return;
+    for (int64_t s = cdb_seek(c, r0); s < c->nseg && c->seg[s].lo < r1; s++) {
+        const cdb_seg_t* g = &c->seg[s];
+        if (!g->cold || !g->data) continue;
+        int64_t a = r0 > g->lo ? r0 - g->lo : 0;
+        int64_t b = r1 < g->lo + g->n ? r1 - g->lo : g->n;
+        if (b > a)
+            ray_vm_advise_willneed((char*)g->data + (size_t)a * g->esz,
+                                   (size_t)(b - a) * g->esz);
+    }
+}
+
+/* Ask for rows [r0, r1) of the columns the kernel reads — with a
+ * selection, only the runs of morsels it keeps rows of. */
+static void cdb_want_rows(const cdb_ctx_t* c, int64_t r0, int64_t r1) {
+    if (!c->sel_flg) {
+        if (!c->row_gid) cdb_want(&c->key, r0, r1);
+        cdb_want(&c->val, r0, r1);
+        return;
+    }
+    int64_t m = r0 / RAY_MORSEL_ELEMS, m_end = (r1 + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    while (m < m_end) {
+        while (m < m_end && (m >= c->sel_nsegs || c->sel_flg[m] == RAY_SEL_NONE)) m++;
+        int64_t run = m;
+        while (m < m_end && m < c->sel_nsegs && c->sel_flg[m] != RAY_SEL_NONE) m++;
+        if (m > run) {
+            int64_t a = run * RAY_MORSEL_ELEMS > r0 ? run * RAY_MORSEL_ELEMS : r0;
+            int64_t b = m * RAY_MORSEL_ELEMS < r1 ? m * RAY_MORSEL_ELEMS : r1;
+            if (!c->row_gid) cdb_want(&c->key, a, b);
+            cdb_want(&c->val, a, b);
+        }
+    }
+}
+
+static inline int64_t cdb_gid(const cdb_ctx_t* c, int64_t k) {
+    uint64_t h = (uint64_t)k * 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 33;
+    uint64_t s = h & c->kmask;
+    for (;;) {
+        uint32_t t = c->ktag[s];
+        if (!t) return -1;
+        if (c->kkeys[s] == k) return (int64_t)t - 1;
+        s = (s + 1) & c->kmask;
+    }
+}
+
+/* Phase A: task t of the chunk takes rows [chunk_r0 + t*S, +S), keeps the
+ * pairs whose partition is in [lo, hi) and lays them out in its region of
+ * the record buffer partition by partition (toff[t][p] .. toff[t][p+1]). */
+static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    cdb_ctx_t* c = (cdb_ctx_t*)vctx;
+    int64_t kbuf[RAY_MORSEL_ELEMS], xbuf[RAY_MORSEL_ELEMS];
+    uint32_t hist[CDB_MAX_PARTS];
+    cdb_recent_t recent[CDB_CACHE];
+    const uint32_t P = c->P, lo = c->lo, hi = c->hi, pshift = c->pshift;
+    const uint64_t vmask = c->vmask, ng = (uint64_t)c->n_groups;
+    for (int64_t t = start; t < end; t++) {
+        int64_t r0 = c->chunk_r0 + t * c->S;
+        int64_t r1 = r0 + c->S;
+        if (r1 > c->nrows) r1 = c->nrows;
+        cdb_rec_t* st = c->stage + (size_t)wid * c->S;
+        uint16_t*  sp = c->spart + (size_t)wid * c->S;
+        memset(hist, 0, (size_t)P * sizeof(uint32_t));
+        memset(recent, 0, sizeof(recent));
+        int64_t ns = 0;
+        int64_t ksi = c->row_gid ? 0 : cdb_seek(&c->key, r0);
+        int64_t xsi = cdb_seek(&c->val, r0);
+        int64_t klast = 0, glast = -2;
+        for (int64_t m0 = r0; m0 < r1; m0 += RAY_MORSEL_ELEMS) {
+            int64_t mn = r1 - m0 < RAY_MORSEL_ELEMS ? r1 - m0 : RAY_MORSEL_ELEMS;
+            const uint16_t* idx = NULL;
+            int64_t ni = mn;
+            if (c->sel_flg) {
+                int64_t seg = m0 / RAY_MORSEL_ELEMS;
+                uint8_t f = seg < c->sel_nsegs ? c->sel_flg[seg] : RAY_SEL_NONE;
+                if (f == RAY_SEL_NONE) continue;
+                if (f != RAY_SEL_ALL) {
+                    idx = c->sel_idx + c->sel_offs[seg];
+                    ni = c->sel_offs[seg + 1] - c->sel_offs[seg];
+                }
+            }
+            const int64_t* gb;
+            if (c->row_gid) {
+                gb = c->row_gid + m0;
+            } else {
+                cdb_decode(&c->key, &ksi, m0, mn, kbuf);
+                for (int64_t i = 0; i < mn; i++) {
+                    int64_t k = kbuf[i];
+                    if (k != klast || glast == -2) { klast = k; glast = cdb_gid(c, k); }
+                    kbuf[i] = glast;
+                }
+                gb = kbuf;
+            }
+            cdb_decode(&c->val, &xsi, m0, mn, xbuf);
+            for (int64_t j = 0; j < ni; j++) {
+                int64_t i = idx ? idx[j] : j;
+                uint64_t g = (uint64_t)gb[i];
+                if (g >= ng) continue;             /* no group (negative too) */
+                g++;
+                int64_t x = (int64_t)((uint64_t)xbuf[i] & vmask);
+                uint64_t h = cdb_hash(x, g);
+                uint32_t p = (uint32_t)(h >> pshift);
+                if (p < lo || p >= hi) continue;
+                cdb_recent_t* e = &recent[(h >> 32) & (CDB_CACHE - 1)];
+                if (e->g == g && e->x == x) continue;
+                e->g = g; e->x = x;
+                st[ns].x = x; st[ns].g = (uint32_t)g; st[ns].h = (uint32_t)h;
+                sp[ns] = (uint16_t)p;
+                hist[p]++;
+                ns++;
+            }
+        }
+        int64_t* to = c->toff + (size_t)t * (P + 1);
+        int64_t base = t * c->S;
+        for (uint32_t p = 0; p < P; p++) {
+            to[p] = base;
+            uint32_t k = hist[p];
+            hist[p] = (uint32_t)(base - t * c->S);
+            base += k;
+        }
+        to[P] = base;
+        cdb_rec_t* region = c->recs + t * c->S;
+        for (int64_t i = 0; i < ns; i++) region[hist[sp[i]]++] = st[i];
+        atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
+    }
+}
+
+/* Slot layouts: values of VT, tags of GT — 4-byte values for a narrow
+ * column, 2-byte tags below 65535 groups.  Rehash fills a fresh block
+ * (from the old one when it grew), insert adds a run of records (the main
+ * thread sized the block for all of them at load <= 3/4), count adds each
+ * occupied slot to its group's count. */
+#define CDB_SET_FNS(SFX, VT, GT)                                               \
+static void cdb_rehash_##SFX(cdb_set_t* s) {                                   \
+    VT* nx = (VT*)s->blk;                                                      \
+    GT* ng = (GT*)((char*)s->blk + s->cap * sizeof(VT));                       \
+    memset(ng, 0, s->cap * sizeof(GT));                                        \
+    if (!s->old) return;                                                       \
+    const VT* ox = (const VT*)s->old;                                          \
+    const GT* og = (const GT*)((const char*)s->old + s->ocap * sizeof(VT));    \
+    uint64_t cap = s->cap;                                                     \
+    for (uint64_t i = 0; i < s->ocap; i++) {                                   \
+        GT g = og[i];                                                          \
+        if (!g) continue;                                                      \
+        uint64_t slot = cdb_slot((uint32_t)cdb_hash((int64_t)ox[i], g), cap);  \
+        while (ng[slot]) if (++slot == cap) slot = 0;                          \
+        ng[slot] = g;                                                          \
+        nx[slot] = ox[i];                                                      \
+    }                                                                          \
+}                                                                              \
+static int64_t cdb_insert_##SFX(cdb_set_t* s, const cdb_rec_t* r, int64_t n) {  \
+    VT* xs = (VT*)s->blk;                                                      \
+    GT* gs = (GT*)((char*)s->blk + s->cap * sizeof(VT));                       \
+    uint64_t cap = s->cap;                                                     \
+    int64_t have = s->n;                                                       \
+    int64_t room = (int64_t)(cap * 3 / 4);  /* load the set may reach */       \
+    int64_t i = 0;                                                             \
+    for (; i < n; i++) {                                                       \
+        if (i + 8 < n) {                                                       \
+            uint64_t ps = cdb_slot(r[i + 8].h, cap);                           \
+            __builtin_prefetch(&gs[ps]);                                       \
+            __builtin_prefetch(&xs[ps]);                                       \
+        }                                                                      \
+        GT g = (GT)r[i].g;                                                     \
+        VT x = (VT)r[i].x;                                                     \
+        uint64_t slot = cdb_slot(r[i].h, cap);                                 \
+        for (;;) {                                                             \
+            GT cur = gs[slot];                                                 \
+            if (!cur) break;                                                   \
+            if (cur == g && xs[slot] == x) break;                              \
+            if (++slot == cap) slot = 0;                                       \
+        }                                                                      \
+        if (gs[slot]) continue;                /* seen before */               \
+        if (have >= room) break;               /* full: grow, then go on */    \
+        gs[slot] = g;                                                          \
+        xs[slot] = x;                                                          \
+        have++;                                                                \
+    }                                                                          \
+    s->n = have;                                                               \
+    return i;                                                                  \
+}                                                                              \
+static void cdb_count_##SFX(const cdb_set_t* s, int64_t* cnt, bool shared) {   \
+    const GT* gs = (const GT*)((const char*)s->blk + s->cap * sizeof(VT));     \
+    if (shared) {                                                              \
+        for (uint64_t i = 0; i < s->cap; i++)                                  \
+            if (gs[i]) __atomic_fetch_add(&cnt[gs[i] - 1], 1, __ATOMIC_RELAXED); \
+    } else {                                                                   \
+        for (uint64_t i = 0; i < s->cap; i++)                                  \
+            if (gs[i]) cnt[gs[i] - 1]++;                                       \
+    }                                                                          \
+}
+
+CDB_SET_FNS(v8g4, int64_t, uint32_t)
+CDB_SET_FNS(v8g2, int64_t, uint16_t)
+CDB_SET_FNS(v4g4, uint32_t, uint32_t)
+CDB_SET_FNS(v4g2, uint32_t, uint16_t)
+#undef CDB_SET_FNS
+
+static void cdb_rehash(int var, cdb_set_t* s) {
+    switch (var) {
+    case 0: cdb_rehash_v8g4(s); break;
+    case 1: cdb_rehash_v8g2(s); break;
+    case 2: cdb_rehash_v4g4(s); break;
+    default: cdb_rehash_v4g2(s); break;
+    }
+}
+static int64_t cdb_insert(int var, cdb_set_t* s, const cdb_rec_t* r, int64_t n) {
+    switch (var) {
+    case 0: return cdb_insert_v8g4(s, r, n);
+    case 1: return cdb_insert_v8g2(s, r, n);
+    case 2: return cdb_insert_v4g4(s, r, n);
+    default: return cdb_insert_v4g2(s, r, n);
+    }
+}
+static void cdb_count(int var, const cdb_set_t* s, int64_t* cnt, bool shared) {
+    switch (var) {
+    case 0: cdb_count_v8g4(s, cnt, shared); break;
+    case 1: cdb_count_v8g2(s, cnt, shared); break;
+    case 2: cdb_count_v4g4(s, cnt, shared); break;
+    default: cdb_count_v4g2(s, cnt, shared); break;
+    }
+}
+
+/* Phase B: task i adds the chunk's records of partition plist[i] to its
+ * set, from where it stopped last, until they are all in or the set reaches
+ * load 3/4 (`full`: the main thread grows it and dispatches it again). */
+static void cdb_insert_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    cdb_ctx_t* c = (cdb_ctx_t*)vctx;
+    for (int64_t i = start; i < end; i++) {
+        uint32_t p = c->plist[i];
+        cdb_set_t* s = &c->sets[p];
+        if (s->fresh) { cdb_rehash(c->var, s); s->fresh = false; }
+        s->full = false;
+        int64_t before = s->n;
+        for (uint32_t t = s->rt; t < c->T_c; t++, s->ri = 0) {
+            const int64_t* to = c->toff + (size_t)t * (c->P + 1);
+            int64_t n = to[p + 1] - to[p] - s->ri;
+            if (n <= 0) continue;
+            int64_t took = cdb_insert(c->var, s, c->recs + to[p] + s->ri, n);
+            s->seen += took;
+            if (took < n) { s->rt = t; s->ri += took; s->full = true; break; }
+        }
+        if (!s->full) { s->rt = c->T_c; s->ri = 0; }
+        s->added += s->n - before;
+        atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
+    }
+}
+
+/* End of a round: each finished partition's pairs, counted per group. */
+static void cdb_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    cdb_ctx_t* c = (cdb_ctx_t*)vctx;
+    int64_t* cnt = c->cnt_shared ? c->cnt : c->cnt + (size_t)wid * (size_t)c->n_groups;
+    for (int64_t i = start; i < end; i++) {
+        const cdb_set_t* s = &c->sets[c->lo + (uint32_t)i];
+        if (s->blk) cdb_count(c->var, s, cnt, c->cnt_shared);
+        atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
+    }
+}
+
+/* Run fn over n tasks: on the pool, or here.  False when tasks were
+ * skipped (a cancel). */
+static bool cdb_run(ray_pool_t* pool, bool par, ray_pool_fn fn, cdb_ctx_t* c, uint32_t n) {
+    if (n == 0) return true;
+    atomic_store_explicit(&c->done, 0, memory_order_relaxed);
+    if (par) ray_pool_dispatch_n(pool, fn, c, n);
+    else     fn(c, 0, 0, n);
+    if (atomic_load_explicit(&c->done, memory_order_relaxed) != (int64_t)n) return false;
+    if (ray_interrupted()) return false;
+    if (pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) return false;
+    return true;
+}
+
+static void cdb_free_set(cdb_set_t* s) {
+    ray_free_raw(s->blk);
+    ray_free_raw(s->old);
+    memset(s, 0, sizeof(*s));
+}
+
+/* What the anon watermark leaves: the room under it, the committed blocks
+ * the calling heap can reuse added back (a heap keeps the pools a query
+ * freed; counted as taken they made a repeat of the same query look short of
+ * memory).  INT64_MAX when the RAM is unknown. */
+static int64_t cdb_room(void) {
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return INT64_MAX;
+    return wm - ray_heap_anon_committed() + ray_heap_anon_reusable();
+}
+
+/* The bytes the kernel may give its sets: three quarters of the room, and
+ * when that is less, a sixteenth of the watermark or a quarter of the
+ * slices' row buffers (`demand`), whichever is less, CDB_MIN_BUDGET at
+ * least — a room used up by other work does not shrink the sets to nothing
+ * (one round a partition). */
+static int64_t cdb_budget(int64_t demand) {
+    int64_t room = cdb_room();
+    if (room == INT64_MAX) return INT64_MAX;
+    int64_t b = room / 4 * 3;
+    int64_t floor = ray_heap_anon_watermark() / 16;
+    if (floor > demand / 4) floor = demand / 4;
+    if (floor < CDB_MIN_BUDGET) floor = CDB_MIN_BUDGET;
+    return b > floor ? b : floor;
+}
+
+/* Up to `cap` row indices spread evenly over the rows `sel` keeps; *pop
+ * receives how many it keeps.  Returns the count. */
+static int64_t cdb_sel_sample(ray_t* sel, int64_t nrows, int64_t* out, int64_t cap, int64_t* pop) {
+    ray_rowsel_t* sm = ray_rowsel_meta(sel);
+    const uint8_t* flg = ray_rowsel_flags(sel);
+    const uint32_t* offs = ray_rowsel_offsets(sel);
+    const uint16_t* idx = ray_rowsel_idx(sel);
+    int64_t total = sm->total_pass;
+    *pop = total;
+    if (total <= 0) return 0;
+    int64_t step = total / cap + (total % cap != 0);
+    int64_t j = 0, next = 0, n = 0;   /* j: kept rows before this morsel */
+    for (int64_t m = 0; m < (int64_t)sm->n_segs && n < cap; m++) {
+        int64_t lo = m * RAY_MORSEL_ELEMS, hi = lo + RAY_MORSEL_ELEMS;
+        if (hi > nrows) hi = nrows;
+        if (flg[m] == RAY_SEL_NONE) continue;
+        int64_t k = flg[m] == RAY_SEL_ALL ? hi - lo : (int64_t)(offs[m + 1] - offs[m]);
+        while (next < j + k && n < cap) {
+            int64_t at = next - j;
+            out[n++] = lo + (flg[m] == RAY_SEL_ALL ? at : idx[offs[m] + at]);
+            next += step;
+        }
+        j += k;
+    }
+    return n;
+}
+
+/* A partition both parted columns have rows in, the largest: the sample the
+ * route reads them through.  -1 when there is none. */
+static int64_t cdb_parted_rep(ray_t* key, ray_t* val) {
+    ray_t** ks = (ray_t**)ray_data(key);
+    ray_t** vs = (ray_t**)ray_data(val);
+    int64_t best = -1, rows = 0;
+    for (int64_t s = 0; s < key->len && s < val->len; s++) {
+        ray_t* a = ks[s];
+        ray_t* b = vs[s];
+        if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b) || a->len != b->len) continue;
+        if (a->len > rows) { rows = a->len; best = s; }
+    }
+    return best;
+}
+
+bool ray_cd_bounded_preferred(ray_t* tbl, ray_t* key, ray_t* val, ray_t* sel,
+                              int64_t nrows, int64_t n_groups) {
+    if (nrows <= 0 || n_groups <= 0) return false;
+    bool kp = key && (RAY_IS_PARTED(key->type) || key->type == RAY_MAPCOMMON);
+    bool vp = val && (RAY_IS_PARTED(val->type) || val->type == RAY_MAPCOMMON);
+    /* Memory first: the slices' row buffers — row map and index, 16 B a
+     * row, or row map and scattered pairs past 50 K groups, 24 — and the
+     * flat copies they make of parted columns, 8 B a row each, against half
+     * of the room under the anon watermark.  Past it they spill, and the
+     * gathers over them and the inputs turn into rewrites of the spill
+     * files: the bounded kernel, whatever the data. */
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm > 0) {
+        double need = (double)nrows * ((n_groups <= 50000 ? 16.0 : 24.0) + (kp ? 8 : 0) + (vp ? 8 : 0));
+        /* the reusable blocks (a freelist walk) only when the room without
+         * them is short */
+        if (need > (double)(wm - ray_heap_anon_committed()) / 2 &&
+            need > (double)cdb_room() / 2) return true;
+    }
+    if (n_groups > 50000 || nrows < CDB_MIN_ROWS || !key || !val) return false;
+    /* In memory both fit; the slices dedup each group in cache but serially
+     * over a group, the bounded kernel spreads every pair over the workers
+     * but holds the distinct pairs in sets read at random.  The bounded
+     * kernel where one group holds more than CDB_SKEW workers' shares of the
+     * rows (1.4x to 4x faster on 48 workers over 100 M rows, 3 groups or
+     * 9 K with one of 18%) or the pairs dedup to a quarter of the rows
+     * (6.5x, 2 K values a group); the slices for even groups of nearly
+     * distinct pairs (1.6x faster there: 100 M rows, 9 K groups, 95 M
+     * pairs).  A column read from storage is read here in order where the
+     * slices gather it at the rows of each group.  Sampled estimates
+     * (agg_group_card_sample) — over the rows a selection keeps, and over
+     * one partition of a parted pair — from CDB_SAMPLE_ROWS rows: the
+     * sample's scattered reads take some 6 ms, a quarter of a 10 M-row count
+     * the slices finish in 25 ms. */
+    ray_t* cols[2] = { key, val };
+    int64_t srows = nrows, scale_num = 1, scale_den = 1;
+    if (kp || vp) {
+        if (!(RAY_IS_PARTED(key->type) && RAY_IS_PARTED(val->type))) return false;
+        int64_t r = cdb_parted_rep(key, val);
+        if (r < 0) return false;
+        cols[0] = ((ray_t**)ray_data(key))[r];
+        cols[1] = ((ray_t**)ray_data(val))[r];
+        srows = cols[0]->len;
+        scale_num = nrows;
+        scale_den = srows > 0 ? srows : 1;
+        sel = NULL;   /* a selection is over the whole table's rows */
+    }
+    if (ray_col_cold(cols[0]) || ray_col_cold(cols[1])) return true;
+    if (nrows < CDB_SAMPLE_ROWS) return false;
+    int64_t kmax = 0, pairs = 0;
+    bool ok;
+    if (sel) {
+        int64_t cap = AGG_EST_SAMPLE_ROWS * 2, pop = 0;
+        int64_t* rows = (int64_t*)ray_alloc_raw((size_t)cap * sizeof(int64_t));
+        if (!rows) return false;
+        int64_t n = cdb_sel_sample(sel, nrows, rows, cap, &pop);
+        ok = n > 0 && agg_group_card_sample(cols, 2, 1, rows, n, pop, NULL, NULL, &kmax, &pairs);
+        ray_free_raw(rows);
+        if (!ok) return false;
+        nrows = pop;
+    } else {
+        ok = agg_group_card_sample(cols, 2, 1, NULL, srows, 0, NULL, NULL, &kmax, &pairs);
+        if (!ok) return false;
+        kmax = (int64_t)((double)kmax * scale_num / scale_den);
+        pairs = (int64_t)((double)pairs * scale_num / scale_den);
+    }
+    ray_pool_t* pool = ray_pool_get();
+    int64_t workers = pool ? ray_pool_total_workers(pool) : 1;
+    if (workers > 1 && kmax > nrows / workers * CDB_SKEW) return true;
+    return pairs <= nrows / 4;
+}
+
+/* The bytes of the buddy block that holds `n` pairs at load 3/4: twice
+ * `prev` at least (a power of two, header included). */
+static uint64_t cdb_block_for(uint64_t prev, uint64_t n, size_t sb) {
+    uint64_t nb = prev ? prev * 2 : CDB_SET_MIN_BYTES;
+    while ((nb - 32) / sb * 3 < n * 4) nb <<= 1;
+    return nb;
+}
+
+/* The pairs to size a full set for: its pairs, and the share of its records
+ * so far that were new over the records it has left (a quarter over); for a
+ * set without a block, the pairs a partition ended the last round with. */
+static uint64_t cdb_want_pairs(const cdb_set_t* s, int64_t expect) {
+    if (!s->blk) return expect > 0 ? (uint64_t)expect : 0;
+    double rate = (double)(s->added + 1) / (double)(s->seen + 1);
+    return (uint64_t)s->n + (uint64_t)(rate * (double)(s->inc - s->seen) * 1.25) + 16;
+}
+
+ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
+                      const int64_t* row_gid, int64_t n_groups,
+                      ray_t* val_col, ray_t* sel, int64_t nrows) {
+    if (n_groups < 0 || nrows < 0) return NULL;
+    if (n_groups >= (int64_t)UINT32_MAX - 1) return NULL;
+    if (!row_gid && (!grp_keys || RAY_IS_ERR(grp_keys) || !ray_is_vec(grp_keys) ||
+                     !cdb_type_ok(grp_keys->type, false) || grp_keys->len < n_groups))
+        return NULL;
+
+    cdb_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    int rc = cdb_col_open(&c.val, val_col, tbl, true);
+    if (rc <= 0) return rc < 0 ? ray_error("oom", NULL) : NULL;
+    if (c.val.rows < nrows) { cdb_col_close(&c.val); return NULL; }
+    if (!row_gid) {
+        rc = cdb_col_open(&c.key, key_col, tbl, false);
+        if (rc <= 0) { cdb_col_close(&c.val); return rc < 0 ? ray_error("oom", NULL) : NULL; }
+        if (c.key.rows < nrows) { cdb_col_close(&c.key); cdb_col_close(&c.val); return NULL; }
+    }
+
+    ray_t* out = ray_vec_new(RAY_I64, n_groups);
+    if (!out || RAY_IS_ERR(out)) {
+        cdb_col_close(&c.key); cdb_col_close(&c.val);
+        return out ? out : ray_error("oom", NULL);
+    }
+    out->len = n_groups;
+    int64_t* odata = (int64_t*)ray_data(out);
+    if (n_groups > 0) memset(odata, 0, (size_t)n_groups * sizeof(int64_t));
+    if (n_groups == 0 || nrows == 0) {
+        cdb_col_close(&c.key); cdb_col_close(&c.val);
+        return out;
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, nrows, 2 * CDB_TASK_ROWS);
+    uint32_t W = par ? ray_pool_total_workers(pool) : 1;
+    uint32_t P = 256;
+    while (P < CDB_MAX_PARTS && P < 8 * W) P <<= 1;
+    uint32_t T = par ? 2 * W : 1;
+    if (T > 512) T = 512;
+    /* The record buffer and the staging (18 B a row of a task, T and W
+     * tasks' worth) within a quarter of the budget: shorter tasks, then
+     * fewer of them, down to one a worker. */
+    int64_t budget_cap = (int64_t)((double)nrows * (n_groups <= 50000 ? 16.0 : 24.0));
+    int64_t budget = cdb_budget(budget_cap);
+    int64_t S = CDB_TASK_ROWS;
+    while ((int64_t)(T + W) * S * 18 > budget / 4 && S > CDB_TASK_ROWS_MIN) S /= 2;
+    while ((int64_t)(T + W) * S * 18 > budget / 4 && T > W) T--;
+    int64_t chunk_rows = (int64_t)T * S;
+
+    c.row_gid = row_gid;
+    c.n_groups = n_groups;
+    c.nrows = nrows;
+    c.vmask = c.val.narrow ? UINT32_MAX : UINT64_MAX;
+    c.P = P;
+    c.pshift = 64 - (uint32_t)__builtin_ctz(P);
+    c.T = T;
+    c.S = S;
+    c.var = (c.val.narrow ? 2 : 0) + (n_groups < 65535 ? 1 : 0);
+    size_t sb = (c.val.narrow ? 4 : 8) + (n_groups < 65535 ? 2 : 4);   /* bytes a slot */
+    if (sel && !row_gid) {
+        ray_rowsel_t* sm = ray_rowsel_meta(sel);
+        c.sel_flg = ray_rowsel_flags(sel);
+        c.sel_offs = ray_rowsel_offsets(sel);
+        c.sel_idx = ray_rowsel_idx(sel);
+        c.sel_nsegs = sm->n_segs;
+    }
+
+    /* Working buffers: all sized by the workers, partitions and groups. */
+    ray_t* err = NULL;
+    void *khdr = NULL;
+    uint32_t* plist = NULL;
+    uint64_t kcap = 16;
+    if (!row_gid) while (kcap < (uint64_t)n_groups * 2) kcap <<= 1;
+    bool cnt_shared = (int64_t)W * n_groups > CDB_LOCAL_CNT;
+    size_t cnt_cells = cnt_shared ? (size_t)n_groups : (size_t)W * (size_t)n_groups;
+    c.cnt_shared = cnt_shared;
+    c.recs  = (cdb_rec_t*)ray_alloc_raw((size_t)chunk_rows * sizeof(cdb_rec_t));
+    c.stage = (cdb_rec_t*)ray_alloc_raw((size_t)W * (size_t)S * sizeof(cdb_rec_t));
+    c.spart = (uint16_t*)ray_alloc_raw((size_t)W * (size_t)S * sizeof(uint16_t));
+    c.toff  = (int64_t*)ray_alloc_raw((size_t)T * (P + 1) * sizeof(int64_t));
+    c.sets  = (cdb_set_t*)ray_calloc_raw((size_t)P * sizeof(cdb_set_t));
+    c.cnt   = (int64_t*)ray_calloc_raw(cnt_cells * sizeof(int64_t));
+    plist   = (uint32_t*)ray_alloc_raw((size_t)P * sizeof(uint32_t));
+    if (!row_gid) khdr = ray_calloc_raw((size_t)kcap * (sizeof(int64_t) + sizeof(uint32_t)));
+    if (!c.recs || !c.stage || !c.spart || !c.toff || !c.sets || !c.cnt || !plist ||
+        (!row_gid && !khdr)) {
+        err = ray_error("oom", NULL);
+        goto done;
+    }
+    c.plist = plist;
+    if (!row_gid) {
+        int64_t* kk = (int64_t*)khdr;
+        uint32_t* kt = (uint32_t*)(kk + kcap);
+        uint64_t kmask = kcap - 1;
+        const void* gd = ray_data(grp_keys);
+        for (int64_t gi = 0; gi < n_groups; gi++) {
+            int64_t k = read_col_i64(gd, gi, grp_keys->type, grp_keys->attrs);
+            uint64_t h = (uint64_t)k * 0x9E3779B97F4A7C15ULL;
+            h ^= h >> 33;
+            uint64_t s = h & kmask;
+            while (kt[s] && kk[s] != k) s = (s + 1) & kmask;
+            if (!kt[s]) { kt[s] = (uint32_t)(gi + 1); kk[s] = k; }   /* a repeat keeps the first */
+        }
+        c.kkeys = kk;
+        c.ktag = kt;
+        c.kmask = kmask;
+    }
+
+    int64_t overhead = (int64_t)chunk_rows * (int64_t)sizeof(cdb_rec_t) +
+                       (int64_t)W * S * (int64_t)(sizeof(cdb_rec_t) + 2) +
+                       (int64_t)cnt_cells * 8 + (int64_t)kcap * 12;
+    if (budget != INT64_MAX) {
+        int64_t floor = budget / 4;   /* the sets keep three quarters at least */
+        budget = budget - overhead > floor ? budget - overhead : floor;
+    }
+    /* Past CDB_MAX_ROUNDS rounds' worth of pairs the sets may pass the
+     * budget, up to what the slices would have taken; the first trim
+     * projects the round's sets over the rows left. */
+    bool projected = budget == INT64_MAX;
+    bool want = ray_pool_scan_on() && nrows > 0;
+    int64_t ra_rows = CDB_RA_BYTES / 12;
+    if (ra_rows < 2 * chunk_rows) ra_rows = 2 * chunk_rows;
+
+    uint32_t lo = 0, hi = P;
+    int64_t expect = 0;   /* pairs a partition ended the last round with */
+    while (lo < P) {
+        c.lo = lo;
+        c.hi = hi;
+        int64_t live = 0;     /* bytes of the round's set blocks */
+        int64_t ra_hi = 0;
+        for (int64_t r0 = 0; r0 < nrows; r0 += chunk_rows) {
+            int64_t r1 = r0 + chunk_rows < nrows ? r0 + chunk_rows : nrows;
+            if (want) {
+                int64_t ra = r1 + ra_rows < nrows ? r1 + ra_rows : nrows;
+                if (ra > ra_hi) {
+                    cdb_want_rows(&c, ra_hi > r0 ? ra_hi : r0, ra);
+                    ra_hi = ra;
+                }
+            }
+            c.chunk_r0 = r0;
+            c.T_c = (uint32_t)((r1 - r0 + S - 1) / S);
+            if (!cdb_run(pool, par, cdb_scatter_fn, &c, c.T_c)) {
+                err = ray_error("cancel", "interrupted");
+                goto done;
+            }
+            /* The partitions with records in this chunk; a set without a
+             * block gets one first. */
+            uint32_t np = 0;
+            for (uint32_t p = lo; p < c.hi; p++) {
+                cdb_set_t* s = &c.sets[p];
+                int64_t inc = 0;
+                for (uint32_t t = 0; t < c.T_c; t++) {
+                    const int64_t* to = c.toff + (size_t)t * (P + 1);
+                    inc += to[p + 1] - to[p];
+                }
+                s->inc = inc; s->seen = s->added = 0; s->rt = 0; s->ri = 0;
+                s->full = inc > 0 && !s->blk;
+                if (inc > 0) plist[np++] = p;
+            }
+            /* Phase B, then the sets that filled grow and go on.  A set grows
+             * to twice its block at least, and to the pairs its records so
+             * far promise for the rest of them.  Growth that would pass the
+             * budget frees the round's top partitions instead (a later round
+             * counts them). */
+            while (np > 0) {
+                int64_t grow = 0;
+                for (uint32_t i = 0; i < np; i++) {
+                    cdb_set_t* s = &c.sets[plist[i]];
+                    if (s->full) grow += (int64_t)cdb_block_for(s->bytes, cdb_want_pairs(s, expect), sb);
+                }
+                if (live + grow > budget && c.hi - lo > 1) {
+                    if (!projected) {
+                        /* the sets this round is heading for, over the rows left */
+                        double rows_in = (double)r1;
+                        double total = (double)(live + grow) * ((double)nrows / rows_in);
+                        if (total > (double)budget * CDB_MAX_ROUNDS) {
+                            int64_t nb = (int64_t)(total / CDB_MAX_ROUNDS);
+                            if (nb > budget_cap) nb = budget_cap;
+                            if (nb > budget) budget = nb;
+                        }
+                        projected = true;
+                    }
+                    bool trimmed = false;
+                    while (live + grow > budget && c.hi - lo > 1) {
+                        uint32_t p = c.hi - 1;
+                        cdb_set_t* s = &c.sets[p];
+                        if (s->full) grow -= (int64_t)cdb_block_for(s->bytes, cdb_want_pairs(s, expect), sb);
+                        live -= (int64_t)s->bytes;
+                        cdb_free_set(s);
+                        c.hi--;
+                        trimmed = true;
+                    }
+                    if (trimmed) {
+                        uint32_t k = 0;
+                        for (uint32_t i = 0; i < np; i++) if (plist[i] < c.hi) plist[k++] = plist[i];
+                        np = k;
+                        ray_profile_tick("count-distinct: partitions left to the next round");
+                    }
+                }
+                for (uint32_t i = 0; i < np; i++) {
+                    cdb_set_t* s = &c.sets[plist[i]];
+                    if (!s->full) continue;
+                    uint64_t nb = cdb_block_for(s->bytes, cdb_want_pairs(s, expect), sb);
+                    uint64_t nc = (nb - 32) / sb;
+                    if (nc > UINT32_MAX) { err = ray_error("oom", NULL); goto done; }
+                    void* blk = ray_alloc_raw((size_t)(nb - 32));
+                    if (!blk) { err = ray_error("oom", NULL); goto done; }
+                    s->old = s->blk; s->ocap = s->cap; s->obytes = s->bytes;
+                    s->blk = blk; s->cap = nc; s->bytes = nb;
+                    s->fresh = true;
+                    live += (int64_t)nb;
+                }
+                if (np == 0) break;
+                bool ok = cdb_run(pool, par, cdb_insert_fn, &c, np);
+                uint32_t k = 0;
+                for (uint32_t i = 0; i < np; i++) {
+                    cdb_set_t* s = &c.sets[plist[i]];
+                    if (s->old) {
+                        ray_free_raw(s->old);
+                        live -= (int64_t)s->obytes;
+                        s->old = NULL; s->ocap = 0; s->obytes = 0;
+                    }
+                    if (s->full) plist[k++] = plist[i];
+                }
+                np = k;
+                if (!ok) { err = ray_error("cancel", "interrupted"); goto done; }
+            }
+        }
+        hi = c.hi;
+        if (!cdb_run(pool, par, cdb_count_fn, &c, hi - lo)) {
+            err = ray_error("cancel", "interrupted");
+            goto done;
+        }
+        int64_t pairs = 0;
+        for (uint32_t p = lo; p < hi; p++) { pairs += c.sets[p].n; cdb_free_set(&c.sets[p]); }
+        ray_profile_tick("count-distinct: bounded round");
+        /* the next round: as many partitions as the budget holds at the
+         * bytes a partition took in this one */
+        int64_t per = live / (int64_t)(hi - lo);
+        expect = pairs / (int64_t)(hi - lo);
+        lo = hi;
+        if (lo >= P) break;
+        int64_t take = per > 0 ? budget / 8 * 7 / per : (int64_t)P;
+        if (take < 1) take = 1;
+        hi = (int64_t)lo + take < (int64_t)P ? lo + (uint32_t)take : P;
+    }
+
+    if (cnt_shared) {
+        memcpy(odata, c.cnt, (size_t)n_groups * sizeof(int64_t));
+    } else {
+        for (uint32_t w = 0; w < W; w++) {
+            const int64_t* wc = c.cnt + (size_t)w * (size_t)n_groups;
+            for (int64_t g = 0; g < n_groups; g++) odata[g] += wc[g];
+        }
+    }
+
+done:
+    if (c.sets) for (uint32_t p = 0; p < P; p++) cdb_free_set(&c.sets[p]);
+    ray_free_raw(c.sets);
+    ray_free_raw(c.recs);
+    ray_free_raw(c.stage);
+    ray_free_raw(c.spart);
+    ray_free_raw(c.toff);
+    ray_free_raw(c.cnt);
+    ray_free_raw(plist);
+    ray_free_raw(khdr);
+    cdb_col_close(&c.key);
+    cdb_col_close(&c.val);
+    if (err) { ray_release(out); return err; }
+    return out;
 }

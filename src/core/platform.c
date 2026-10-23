@@ -65,6 +65,13 @@ uint64_t ray_vm_willneed_bytes(void) {
 #if !defined(RUSAGE_THREAD)
 #define RUSAGE_THREAD 1
 #endif
+#include <sys/syscall.h>  /* SYS_mlock2: ray_vm_lock, past libc's mlock interceptors */
+#if !defined(MLOCK_ONFAULT)
+#define MLOCK_ONFAULT 1
+#endif
+#if !defined(MADV_DONTNEED_LOCKED)
+#define MADV_DONTNEED_LOCKED 24   /* Linux 5.18 */
+#endif
 #endif
 #include "mem/sys.h"
 
@@ -86,6 +93,11 @@ void ray_vm_free(void* ptr, size_t size) {
 }
 
 void* ray_vm_map_file(const char* path, size_t* out_size) {
+    return ray_vm_map_file_id(path, out_size, NULL);
+}
+
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) {
+    if (id) memset(id, 0, sizeof(*id));
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
 
@@ -93,6 +105,18 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
     if (fstat(fd, &st) != 0) {
         close(fd);
         return NULL;
+    }
+    if (id) {
+        id->valid = true;
+        id->ino = (uint64_t)st.st_ino;
+        id->size = (uint64_t)st.st_size;
+#if defined(RAY_OS_MACOS)
+        id->mtime_ns = (int64_t)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+        id->ctime_ns = (int64_t)st.st_ctimespec.tv_sec * 1000000000 + st.st_ctimespec.tv_nsec;
+#else
+        id->mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+        id->ctime_ns = (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec;
+#endif
     }
 
     if (st.st_size <= 0) {
@@ -288,7 +312,9 @@ void ray_vm_release(void* ptr, size_t size) {
 #endif
 }
 
-void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
+/* The range of free block blk whose pages may go: [*s, *e), empty if none. */
+static void vm_block_range(void* blk, size_t bsize, bool hugepage,
+                           uintptr_t* s_out, uintptr_t* e_out) {
     if (!hugepage) {
         /* Release only whole pages strictly INSIDE the block, keeping its
          * first page resident: the buddy free-list links (fl_prev/fl_next
@@ -305,9 +331,8 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
          * NULL link (issue #240).  Rounding inward to page-aligned bounds
          * makes the kernel's own rounding a no-op on every platform. */
         size_t pg = vm_page_size();
-        uintptr_t s = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
-        uintptr_t e = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
-        if (e > s) ray_vm_release((void*)s, e - s);
+        *s_out = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
+        *e_out = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
         return;
     }
     /* THP pool: release only the whole 2MB-aligned interior so a partial
@@ -322,8 +347,60 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
      * still release only whole 2MB regions, so no THP shatter. */
     uintptr_t s = ((uintptr_t)blk + (2u << 20) - 1) & ~((uintptr_t)(2u << 20) - 1);
     if (s == (uintptr_t)blk) s += (2u << 20);
-    uintptr_t e = ((uintptr_t)blk + bsize) & ~((uintptr_t)(2u << 20) - 1);
+    *s_out = s;
+    *e_out = ((uintptr_t)blk + bsize) & ~((uintptr_t)(2u << 20) - 1);
+}
+
+void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
+    uintptr_t s, e;
+    vm_block_range(blk, bsize, hugepage, &s, &e);
     if (e > s) ray_vm_release((void*)s, e - s);
+}
+
+#if defined(RAY_OS_LINUX)
+/* 0 once MADV_DONTNEED_LOCKED (Linux 5.18) is known not to exist here. */
+static _Atomic(int) vm_dontneed_locked = 1;
+#endif
+
+int ray_vm_release_locked(void* ptr, size_t size) {
+#if defined(RAY_OS_LINUX) && defined(SYS_munlock) && defined(SYS_mlock2)
+    if (!ptr || size == 0) return 0;
+    /* MADV_DONTNEED refuses a locked range; MADV_DONTNEED_LOCKED does not,
+     * and the range stays locked. */
+    if (atomic_load_explicit(&vm_dontneed_locked, memory_order_relaxed)) {
+        if (madvise(ptr, size, MADV_DONTNEED_LOCKED) == 0) return 0;
+        if (errno != EINVAL) return -1;
+        atomic_store_explicit(&vm_dontneed_locked, 0, memory_order_relaxed);
+    }
+    /* Before it: unlock, release, lock again — on fault, so nothing comes
+     * back in, and the kernel merges the range into its mapping again. */
+    if (syscall(SYS_munlock, ptr, size) != 0) return -1;
+    madvise(ptr, size, MADV_DONTNEED);
+    return syscall(SYS_mlock2, ptr, size, MLOCK_ONFAULT) == 0 ? 0 : 1;
+#else
+    ray_vm_release(ptr, size);
+    return 0;
+#endif
+}
+
+int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+    uintptr_t s, e;
+    vm_block_range(blk, bsize, hugepage, &s, &e);
+    return e > s ? ray_vm_release_locked((void*)s, e - s) : 0;
+}
+
+int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+    uintptr_t s, e;
+    vm_block_range(blk, bsize, hugepage, &s, &e);
+    if (e <= s) return 0;
+#if defined(RAY_OS_LINUX)
+    if (madvise((void*)s, e - s, MADV_DONTNEED) == 0) return 0;
+    if (errno != EINVAL) return -1;
+    return ray_vm_release_locked((void*)s, e - s);   /* a locked range */
+#else
+    ray_vm_release((void*)s, e - s);
+    return 0;
+#endif
 }
 
 void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
@@ -357,6 +434,67 @@ bool ray_vm_hugepage(void* ptr, size_t size) {
     return madvise(ptr, size, MADV_HUGEPAGE) == 0;
 #else
     (void)ptr; (void)size; return false;
+#endif
+}
+
+/* Linux: mlock2(MLOCK_ONFAULT) — only the pages faulted in are locked, as
+ * they are faulted.  Called as a raw system call: sanitizer runtimes
+ * intercept mlock() and make it a no-op, and an old libc has no mlock2
+ * wrapper.  Elsewhere nothing: plain mlock() would fault in and wire the
+ * whole range at once. */
+bool ray_vm_lock(void* ptr, size_t size) {
+#if defined(RAY_OS_LINUX) && defined(SYS_mlock2)
+    if (!ptr || size == 0) return false;
+    return syscall(SYS_mlock2, ptr, size, MLOCK_ONFAULT) == 0;
+#else
+    (void)ptr; (void)size; return false;
+#endif
+}
+
+void ray_vm_unlock(void* ptr, size_t size) {
+#if defined(RAY_OS_LINUX) && defined(SYS_munlock)
+    if (ptr && size) (void)syscall(SYS_munlock, ptr, size);
+#else
+    (void)ptr; (void)size;
+#endif
+}
+
+bool ray_os_has_ipc_lock(void) {
+#if defined(RAY_OS_LINUX)
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return false;
+    char line[256];
+    unsigned long long eff = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "CapEff:", 7) == 0) { eff = strtoull(line + 7, NULL, 16); break; }
+    fclose(f);
+    return (eff >> 14) & 1;   /* CAP_IPC_LOCK */
+#else
+    return false;
+#endif
+}
+
+int64_t ray_vm_locked_bytes(void) {
+#if defined(RAY_OS_LINUX)
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    int64_t kb = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "VmLck:", 6) == 0) { kb = strtoll(line + 6, NULL, 10); break; }
+    fclose(f);
+    return kb * 1024;
+#else
+    return 0;
+#endif
+}
+
+void ray_os_raise_memlock(void) {
+#if defined(RAY_OS_LINUX)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur >= rl.rlim_max) return;
+    rl.rlim_cur = rl.rlim_max;
+    (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 #endif
 }
 
@@ -774,6 +912,12 @@ void ray_vm_free(void* ptr, size_t size) {
     ray_sys_track_sub((int64_t)size);
 }
 
+/* No file identity here: the record index never takes the shortcut. */
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) {
+    if (id) memset(id, 0, sizeof(*id));
+    return ray_vm_map_file(path, out_size);
+}
+
 void* ray_vm_map_file(const char* path, size_t* out_size) {
     HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -917,6 +1061,20 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
+int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
+int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+bool ray_os_has_ipc_lock(void) { return false; }
+int64_t ray_vm_locked_bytes(void) { return 0; }
+void ray_os_raise_memlock(void) {}
 
 /* --------------------------------------------------------------------------
  * Threading
@@ -1065,6 +1223,12 @@ void ray_vm_free(void* ptr, size_t size) {
     ray_sys_track_sub((int64_t)size);
 }
 
+/* No file identity here: the record index never takes the shortcut. */
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) {
+    if (id) memset(id, 0, sizeof(*id));
+    return ray_vm_map_file(path, out_size);
+}
+
 void* ray_vm_map_file(const char* path, size_t* out_size) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -1142,6 +1306,20 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
+int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
+int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+bool ray_os_has_ipc_lock(void) { return false; }
+int64_t ray_vm_locked_bytes(void) { return 0; }
+void ray_os_raise_memlock(void) {}
 
 /* Threading — return errors / 1.  pool.c with n_workers==0 (the result of
  * thread_count==1 ⇒ ncpu-1 == 0) never invokes thread_create. */

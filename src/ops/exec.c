@@ -25,6 +25,7 @@
 #include "ops/colgather.h"   /* ray_col_gather_slot: the refinement over encoded columns */
 #include "ops/colbind.h"
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
+#include "table/domain.h"   /* ray_sym_domain_corruptions */
 #include "lang/format.h"    /* ray_type_name (error context) */
 #include "ops/rowsel.h"
 #include "store/enccol.h"
@@ -6145,8 +6146,15 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * were that call to reset the flag, a cancel that arrived before it
      * would be dropped and the workers would run the remaining tickets. */
     bool outermost = exec_depth++ == 0;
+    uint64_t sym_corrupt0 = ray_sym_domain_corruptions();
     ray_t* result = ray_execute_inner(g, root, outermost);
     exec_depth--;
+    /* a symbol file found torn while this ran (table/domain.h) */
+    if (outermost && ray_sym_domain_corruptions() != sym_corrupt0) {
+        if (result && RAY_IS_ERR(result)) ray_error_free(result);
+        else if (result) ray_release(result);
+        result = ray_sym_domain_corrupt_error();
+    }
     if (own_scan) ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }

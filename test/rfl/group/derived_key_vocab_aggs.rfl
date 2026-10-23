@@ -43,7 +43,7 @@
 ;; the in-memory one.  The snapshot is taken inside one expression (a line
 ;; of this file interns its own names when it is parsed), and (.sys.mem) is
 ;; called once beforehand (its first call interns its own key names).
-(count (.sys.mem)) -- 18
+(count (.sys.mem)) -- 21
 (set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
 (set NG (nogrow (fn [] (key F))))
 (at NG 0) -- 0

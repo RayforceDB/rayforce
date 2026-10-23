@@ -1,4 +1,9 @@
 /* src/ops/agg_engine.c — v2 aggregation engine. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#elif !defined(_WIN32)
+#  define _GNU_SOURCE       /* pread, pwrite, O_CLOEXEC: the radix spill file */
+#endif
 #include "ops/agg_engine.h"
 #include "ops/agg_registry.h"
 #include "ops/ops.h"
@@ -21,11 +26,24 @@
 #include <math.h>
 #include <string.h>
 
+/* The radix spill file (agg_radix_spill_t) is POSIX pread/pwrite; Windows
+ * keeps the re-scanned waves only, as its heap keeps anonymous pools only. */
+#if defined(RAY_OS_WINDOWS)
+#  define AGG_RADIX_FILE_SPILL 0
+#else
+#  define AGG_RADIX_FILE_SPILL 1
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
+
 /* Radix output address: high 32 bits partition, low 32 bits local group. */
 typedef struct { int64_t idx; } agg_radix_order_t;
 
 bool ray_agg_engine_v2 = true;   /* knob; default on */
 bool ray_agg_tablestack = true;  /* knob; default on */
+int64_t ray_agg_radix_wave_bytes = 0;   /* knob; 0 = heap-derived wave bound, <0 = off */
+int ray_agg_radix_spill = 0;            /* knob; 0 = by bytes, 1 = never, 2 = always, 3..6 = always with a fault */
 static bool agg_force_smallhash;    /* test hook (agg_test_force_smallhash) */
 void agg_test_force_smallhash(bool on) { agg_force_smallhash = on; }
 
@@ -5330,6 +5348,32 @@ typedef struct {
     uint8_t     kind;       /* AGG_CF_* */
 } agg_radix_cf_t;
 
+/* Spill of the later waves of a reduced radix run (agg_radix_spill_*).  One
+ * unlinked file in the heap's spill directory; each worker fills one buffer
+ * per wave and appends it whole when full — a block of n records followed
+ * by their n uint32 payload slots inside the wave — at a file offset taken
+ * from one shared tail, so every write is a large sequential pwrite.  A wave
+ * is read back block by block (pread) straight into the payload slots, then
+ * reduced like any other wave.  Written once, read once, unlinked at once. */
+typedef struct { int64_t off; uint32_t n; uint32_t wave; } agg_radix_blk_t;
+typedef struct { char* buf; uint32_t n; } agg_radix_sbuf_t;
+typedef struct agg_radix_spill_s {
+    int                fd;
+    uint32_t           n_waves;
+    uint32_t           bcap;       /* records per buffer */
+    size_t             rec;
+    const int64_t*     wave_base;  /* [n_waves] first record of each wave */
+    agg_radix_sbuf_t*  bufs;       /* [nw * n_waves]; wave 0's unused */
+    char*              rbuf;       /* [nw] read-back buffers */
+    size_t             rstride;    /* bytes per buffer, 8-aligned */
+    agg_radix_blk_t*   blks;
+    int64_t            blk_cap;
+    const int64_t*     wave_blks;  /* indices into blks of the wave read back */
+    _Atomic(int64_t)   n_blks;
+    _Atomic(int64_t)   tail;
+    _Atomic(int)       err;
+} agg_radix_spill_t;
+
 typedef struct {
     ray_t**             key_cols;
     const void**        key_data;
@@ -5405,6 +5449,27 @@ typedef struct {
     size_t              srec;
     uint32_t            n_cf;
     const agg_radix_cf_t* cf;
+    /* Waves (agg_radix_wave_plan): the payload holds the records of the
+     * partitions [wave_lo, wave_hi) only, partition p's slots starting at
+     * record part_start[p] - pay_base; phase 2 runs partition part_lo + task.
+     * One pass over every partition is wave 0 = [0, n_parts), base 0. */
+    uint32_t            wave_lo, wave_hi;
+    uint32_t            part_lo;
+    int64_t             pay_base;
+    /* Top-N candidates (agg_radix_part_compact): a finished partition with
+     * more than cmp_cap groups keeps only its cmp_cap best by the filter
+     * aggregate, ties to the smaller first row.  0 = keep every group. */
+    int64_t             cmp_cap;
+    const agg_vtable_t* cmp_vt;
+    size_t              cmp_off;
+    int64_t             cmp_param;
+    uint8_t             cmp_desc;
+    _Atomic(int64_t)    cmp_parts;  /* partitions reduced (route stats) */
+    /* Spilled waves (agg_radix_spill_scatter_fn): wave_of[p] is partition
+     * p's wave; wave 0 scatters into the payload, the later waves into
+     * per-(worker, wave) buffers written to the spill file. */
+    const uint16_t*     wave_of;
+    struct agg_radix_spill_s* spill;
 } agg_radix_ctx_t;
 
 /* Avalanche finalizer shared by the radix scatter (partition selection) and
@@ -5420,18 +5485,6 @@ static inline uint64_t agg_radix_fmix64(uint64_t h) {
     return h;
 }
 
-/* Visit one ORIGINAL row r at input position `pos`.
- *
- * Pass 1 (scatter == false) hashes the key tuple, records the partition in
- * pid[pos] and counts the row in its partition's cell of this chunk's count
- * row.  Pass 2 (scatter == true) reads the partition back from pid[pos] and
- * writes the packed record at the chunk's next slot of that partition.
- *
- * Storing the partition id (2 bytes per row, freed after pass 2) instead of
- * re-hashing in pass 2 measured 15-25% faster for phase 1: the destination
- * address no longer waits on the key load -> FNV -> fmix chain, so the
- * scattered stores issue back to back, and the keys go straight from the
- * column into the record with no staging row. */
 /* agg_read_key_i64 for the plain radix loops, the column's attrs read only
  * by a SYM key (agg_read_key_i64 passes them to the raw reader up front,
  * and the scatter loop then loads them for every key of every row). */
@@ -5446,23 +5499,10 @@ RAY_INLINE int64_t agg_radix_key_at(const ray_t* col, const void* data, int64_t 
     }
 }
 
-RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
-                                int64_t r, int64_t pos, bool scatter) {
+/* Pack the payload record of ORIGINAL row r at input position `pos` of a
+ * plain context (whole columns). */
+RAY_INLINE void agg_radix_put(const agg_radix_ctx_t* c, char* rec, int64_t r, int64_t pos) {
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
-    if (!scatter) {
-        uint64_t h = 1469598103934665603ULL;
-        for (uint32_t k = 0; k < n_keys; k++) {
-            int64_t v = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
-            h ^= (uint64_t)v; h *= 1099511628211ULL;
-        }
-        h = agg_radix_fmix64(h);
-        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
-        c->pid[pos] = (uint16_t)p;
-        cur[p]++;
-        return;
-    }
-    uint32_t p = c->pid[pos];
-    char* rec = c->pay + (size_t)(c->part_start[p] + cur[p]++) * c->rec;
     int64_t* kdst = (int64_t*)rec;
     for (uint32_t k = 0; k < n_keys; k++)
         kdst[k] = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
@@ -5481,28 +5521,12 @@ RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
         memcpy(rec + c->row_off, &input_order, sizeof(input_order));
 }
 
-/* agg_radix_visit of a staged context: row r read through view v (keys at
- * r - base with the pieces' SYM widths, inputs from the pieces).  The plain
- * loops keep the column form above (its whole-column pointers are the
- * context's; their loads stay as they were in the hot loop). */
-RAY_INLINE void agg_radix_visit_view(agg_radix_ctx_t* c, const agg_view_t* v, uint32_t* cur,
-                                     int64_t r, int64_t pos, bool scatter) {
+/* agg_radix_put of a staged context: row r read through view v (keys at
+ * r - base with the pieces' SYM widths, inputs from the pieces). */
+RAY_INLINE void agg_radix_put_view(const agg_radix_ctx_t* c, const agg_view_t* v, char* rec,
+                                   int64_t r, int64_t pos) {
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
     const int64_t i = r - v->base;
-    if (!scatter) {
-        uint64_t h = 1469598103934665603ULL;
-        for (uint32_t k = 0; k < n_keys; k++) {
-            int64_t val = agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i);
-            h ^= (uint64_t)val; h *= 1099511628211ULL;
-        }
-        h = agg_radix_fmix64(h);
-        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
-        c->pid[pos] = (uint16_t)p;
-        cur[p]++;
-        return;
-    }
-    uint32_t p = c->pid[pos];
-    char* rec = c->pay + (size_t)(c->part_start[p] + cur[p]++) * c->rec;
     int64_t* kdst = (int64_t*)rec;
     for (uint32_t k = 0; k < n_keys; k++)
         kdst[k] = agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i);
@@ -5519,6 +5543,65 @@ RAY_INLINE void agg_radix_visit_view(agg_radix_ctx_t* c, const agg_view_t* v, ui
     }
     if (c->needs_row)
         memcpy(rec + c->row_off, &input_order, sizeof(input_order));
+}
+
+/* Visit one ORIGINAL row r at input position `pos`.
+ *
+ * Pass 1 (scatter == false) hashes the key tuple, records the partition in
+ * pid[pos] and counts the row in its partition's cell of this chunk's count
+ * row.  Pass 2 (scatter == true) reads the partition back from pid[pos] and
+ * writes the packed record at the chunk's next slot of that partition; in a
+ * wave (`wave`) only a partition of [wave_lo, wave_hi) is written, at its
+ * slot less pay_base.
+ *
+ * Storing the partition id (2 bytes per row, freed after pass 2) instead of
+ * re-hashing in pass 2 measured 15-25% faster for phase 1: the destination
+ * address no longer waits on the key load -> FNV -> fmix chain, so the
+ * scattered stores issue back to back, and the keys go straight from the
+ * column into the record with no staging row. */
+RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
+                                int64_t r, int64_t pos, bool scatter, bool wave) {
+    uint32_t n_keys = c->n_keys;
+    if (!scatter) {
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            int64_t v = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
+            h ^= (uint64_t)v; h *= 1099511628211ULL;
+        }
+        h = agg_radix_fmix64(h);
+        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
+        c->pid[pos] = (uint16_t)p;
+        cur[p]++;
+        return;
+    }
+    uint32_t p = c->pid[pos];
+    if (wave && (p < c->wave_lo || p >= c->wave_hi)) return;
+    agg_radix_put(c, c->pay + (size_t)(c->part_start[p] - c->pay_base + cur[p]++) * c->rec, r, pos);
+}
+
+/* agg_radix_visit of a staged context: row r read through view v (keys at
+ * r - base with the pieces' SYM widths, inputs from the pieces).  The plain
+ * loops keep the column form above (its whole-column pointers are the
+ * context's; their loads stay as they were in the hot loop). */
+RAY_INLINE void agg_radix_visit_view(agg_radix_ctx_t* c, const agg_view_t* v, uint32_t* cur,
+                                     int64_t r, int64_t pos, bool scatter, bool wave) {
+    uint32_t n_keys = c->n_keys;
+    if (!scatter) {
+        const int64_t i = r - v->base;
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            int64_t val = agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i);
+            h ^= (uint64_t)val; h *= 1099511628211ULL;
+        }
+        h = agg_radix_fmix64(h);
+        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
+        c->pid[pos] = (uint16_t)p;
+        cur[p]++;
+        return;
+    }
+    uint32_t p = c->pid[pos];
+    if (wave && (p < c->wave_lo || p >= c->wave_hi)) return;
+    agg_radix_put_view(c, v, c->pay + (size_t)(c->part_start[p] - c->pay_base + cur[p]++) * c->rec, r, pos);
 }
 
 /* The fused pass's visit of row r at position pos through view v: the
@@ -5568,19 +5651,24 @@ typedef struct {
     const int64_t*   rows;      /* sel mode: the chunk's decoded rows */
     int64_t          pos0;
 } agg_radix_run_t;
-RAY_INLINE void agg_radix_run_rows(void* raw, const agg_view_t* v, int64_t b, int64_t e, bool scatter) {
+RAY_INLINE void agg_radix_run_rows(void* raw, const agg_view_t* v, int64_t b, int64_t e,
+                                   bool scatter, bool wave) {
     agg_radix_run_t* t = raw;
     if (t->rows) {
-        for (int64_t i = b; i < e; i++) agg_radix_visit_view(t->c, v, t->cur, t->rows[i], t->pos0 + i, scatter);
+        for (int64_t i = b; i < e; i++)
+            agg_radix_visit_view(t->c, v, t->cur, t->rows[i], t->pos0 + i, scatter, wave);
         return;
     }
-    for (int64_t r = b; r < e; r++) agg_radix_visit_view(t->c, v, t->cur, r, r, scatter);
+    for (int64_t r = b; r < e; r++) agg_radix_visit_view(t->c, v, t->cur, r, r, scatter, wave);
 }
 static void agg_radix_count_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
-    (void)wid; agg_radix_run_rows(raw, v, b, e, false);
+    (void)wid; agg_radix_run_rows(raw, v, b, e, false, false);
 }
 static void agg_radix_scatter_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
-    (void)wid; agg_radix_run_rows(raw, v, b, e, true);
+    (void)wid; agg_radix_run_rows(raw, v, b, e, true, false);
+}
+static void agg_radix_wave_scatter_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid; agg_radix_run_rows(raw, v, b, e, true, true);
 }
 
 /* The fused pass's body: rows [b, e) of a piece (each row its own
@@ -5834,8 +5922,9 @@ static void agg_radix_scatter_compact(const agg_radix_ctx_t* c, char* dst, const
  * below stay as compact as they were): pieces of the chunk's rows (R-WALK),
  * or runs of its selected rows (R-SPARSE), through the task's cursors cs
  * (the chunks of one task are consecutive); a range error is noted keyed
- * by the chunk's first position. */
-static void agg_radix_chunk_staged(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter,
+ * by the chunk's first position.  A wave's scatter (`wave`) writes only the
+ * records of its partitions. */
+static void agg_radix_chunk_staged(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter, bool wave,
                                    agg_curs_t* cs) {
     int64_t start = ch * c->chunk_rows;
     int64_t end = start + c->chunk_rows;
@@ -5843,7 +5932,8 @@ static void agg_radix_chunk_staged(agg_radix_ctx_t* c, int64_t ch, uint32_t wid,
     uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
     if (!scatter) memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
     const agg_rr_t* rr = scatter ? c->rr : c->count_rr;   /* pass 1 hashes the keys only */
-    agg_body_fn body = scatter ? agg_radix_scatter_rows : agg_radix_count_rows;
+    agg_body_fn body = !scatter ? agg_radix_count_rows
+                     : wave ? agg_radix_wave_scatter_rows : agg_radix_scatter_rows;
     if (!c->sel) {
         agg_radix_run_t t = { c, cur, NULL, 0 };
         (void)agg_walk_cs(rr, cs, &t, body, wid, start, end, start);
@@ -5868,7 +5958,7 @@ static void agg_radix_chunk_staged(agg_radix_ctx_t* c, int64_t ch, uint32_t wid,
  * call site, so the count and the scatter loops specialize.  A chunk's
  * count row doubles as its pass-2 write cursors and is touched only by the
  * task running that chunk.  A staged context runs agg_radix_chunk_staged. */
-RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatter) {
+RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatter, bool wave) {
     int64_t start = ch * c->chunk_rows;
     int64_t end = start + c->chunk_rows;
     if (end > c->n_in) end = c->n_in;
@@ -5882,7 +5972,7 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
         int64_t cn;
         while ((cn = agg_sel_cursor_next(&sc, rows)) > 0)
             for (int64_t i = 0; i < cn; i++)
-                agg_radix_visit(c, cur, rows[i], pos++, scatter);
+                agg_radix_visit(c, cur, rows[i], pos++, scatter, wave);
         return;
     }
     /* Keep the next rows requested from storage, block by block (scan
@@ -5892,7 +5982,7 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
         int64_t e = end - b > 8192 ? b + 8192 : end;
         ray_pool_scan_at(c->n_in, b, end);
         for (int64_t r = b; r < e; r++)
-            agg_radix_visit(c, cur, r, r, scatter);
+            agg_radix_visit(c, cur, r, r, scatter, wave);
     }
 }
 
@@ -5913,25 +6003,25 @@ static bool agg_radix_task_curs(agg_radix_ctx_t* c, int64_t ch0, agg_curs_t* cs)
  * context (agg_radix_count_fn or _count_staged_fn, and likewise for the
  * scatter). */
 RAY_INLINE void agg_radix_pass_body(agg_radix_ctx_t* c, uint32_t wid, int64_t start, int64_t end,
-                                    bool scatter, const bool staged) {
+                                    bool scatter, bool wave, const bool staged) {
     if (!staged) {
         for (int64_t ch = start; ch < end; ch++)
-            agg_radix_chunk_pass(c, ch, scatter);
+            agg_radix_chunk_pass(c, ch, scatter, wave);
         return;
     }
     agg_curs_t cs;
     if (!agg_radix_task_curs(c, start, &cs)) return;
     for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_staged(c, ch, wid, scatter, &cs);
+        agg_radix_chunk_staged(c, ch, wid, scatter, wave, &cs);
     agg_curs_free(&cs, c->rr);
 }
 
 /* Phase 1, pass 1: count each chunk's rows per partition. */
 static void agg_radix_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, false);
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, false, false);
 }
 static void agg_radix_count_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, true);
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, false, true);
 }
 
 /* Phase 1, prefix: for a band of partitions, turn every chunk's count into
@@ -5966,10 +6056,21 @@ static void agg_radix_prefix_fn(void* vctx, uint32_t wid, int64_t start, int64_t
 
 /* Phase 1, pass 2: write each chunk's packed records at their exact slots. */
 static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, false);
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, false, false);
 }
 static void agg_radix_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, true);
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, false, true);
+}
+
+/* Pass 2 of one wave: the same walk, writing only the records of the
+ * partitions [wave_lo, wave_hi).  Each partition belongs to one wave, so its
+ * chunk cursors advance exactly as in the one-pass scatter and its records
+ * land in the same order. */
+static void agg_radix_wave_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, true, false);
+}
+static void agg_radix_wave_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, true, true);
 }
 
 /* The fused pass over chunk ch (a staged context, chunk-major payload):
@@ -6074,21 +6175,290 @@ static void agg_radix_fused_totals_fn(void* vctx, uint32_t wid, int64_t start, i
     }
 }
 
+/* Reduce a finished partition to the groups a top-N emit can select.
+ *
+ * agg_radix_select_topn keeps every group strictly beyond the threshold T
+ * (the N-th value, N = take) and, of the groups AT T, the N with the
+ * smallest first row; it emits them in first-row order.  Rank the groups by
+ * (value in the keep direction, then smaller first row) — a total order,
+ * first rows being distinct.  The kept set is a prefix of that order no
+ * longer than 2N - 1: fewer than N groups lie strictly beyond T, then come
+ * the tied ones by first row.  Every group of that prefix ranks below 2N
+ * inside its own partition too (only prefix members rank ahead of it), so a
+ * partition that keeps its 2N best (cmp_cap) loses no kept group, and the
+ * union of the survivors still holds the N best values, so the selection
+ * over the survivors finds the same T, the same strict groups and the same
+ * tied ones: the emitted rows are byte-identical.  States are copied as they
+ * are (streaming accumulators, no destroy hook) and so are their keys and
+ * first rows.  On an allocation failure the partition keeps every group,
+ * which is the unreduced, equally valid input of the same selection. */
+static void agg_radix_part_compact(agg_radix_ctx_t* c, char** states,
+                                   int64_t** first_row, int64_t** gkeys, int64_t* ngp) {
+    int64_t ng = *ngp, cap = c->cmp_cap;
+    if (cap <= 0 || ng <= cap) return;
+    uint32_t n_keys = c->n_keys;
+    size_t kw = (size_t)(n_keys ? n_keys : 1);
+    double*  vals = ray_alloc_raw((size_t)ng * sizeof(double));
+    int64_t* heap = ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    if (!vals || !heap ||
+        !agg_group_values_f64(c->cmp_vt, *states, c->block, c->cmp_off, NULL, ng,
+                              c->cmp_param, vals)) {
+        ray_free_raw(vals); ray_free_raw(heap);
+        return;
+    }
+    const int64_t* fr = *first_row;
+    uint8_t desc = c->cmp_desc;
+    /* i ranks after j: worse value, or the same value seen later. */
+    #define CMP_AFTER(i, j) ((desc ? vals[i] < vals[j] : vals[i] > vals[j]) || \
+                             (vals[i] == vals[j] && fr[i] > fr[j]))
+    int64_t hn = 0;
+    for (int64_t gg = 0; gg < ng; gg++) {        /* root = the last kept */
+        if (hn < cap) {
+            int64_t j = hn++;
+            heap[j] = gg;
+            while (j > 0) {
+                int64_t par = (j - 1) / 2;
+                if (!CMP_AFTER(heap[j], heap[par])) break;
+                int64_t t = heap[par]; heap[par] = heap[j]; heap[j] = t; j = par;
+            }
+        } else if (CMP_AFTER(heap[0], gg)) {
+            heap[0] = gg;
+            for (int64_t j = 0;;) {
+                int64_t l = 2 * j + 1, r = l + 1, m = j;
+                if (l < cap && CMP_AFTER(heap[l], heap[m])) m = l;
+                if (r < cap && CMP_AFTER(heap[r], heap[m])) m = r;
+                if (m == j) break;
+                int64_t t = heap[m]; heap[m] = heap[j]; heap[j] = t; j = m;
+            }
+        }
+    }
+    #undef CMP_AFTER
+    ray_free_raw(vals);
+    char*    ns = ray_alloc_raw((size_t)cap * c->block);
+    int64_t* nk = ray_alloc_raw((size_t)cap * kw * sizeof(int64_t));
+    int64_t* nf = ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    if (!ns || !nk || !nf) {
+        ray_free_raw(ns); ray_free_raw(nk); ray_free_raw(nf); ray_free_raw(heap);
+        return;
+    }
+    for (int64_t i = 0; i < cap; i++) {
+        int64_t gg = heap[i];
+        memcpy(ns + (size_t)i * c->block, *states + (size_t)gg * c->block, c->block);
+        memcpy(nk + (size_t)i * kw, *gkeys + (size_t)gg * kw, kw * sizeof(int64_t));
+        nf[i] = fr[gg];
+    }
+    ray_free_raw(heap);
+    ray_free_raw(*states); ray_free_raw(*gkeys); ray_free_raw(*first_row);
+    *states = ns; *gkeys = nk; *first_row = nf; *ngp = cap;
+    atomic_fetch_add_explicit(&c->cmp_parts, 1, memory_order_relaxed);
+}
+
+#if AGG_RADIX_FILE_SPILL
+static bool agg_spill_pwrite(int fd, const char* p, size_t n, int64_t off) {
+    while (n) {
+        ssize_t w = pwrite(fd, p, n, (off_t)off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        p += w; off += w; n -= (size_t)w;
+    }
+    return true;
+}
+static bool agg_spill_pread(int fd, char* p, size_t n, int64_t off) {
+    while (n) {
+        ssize_t r = pread(fd, p, n, (off_t)off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        p += r; off += r; n -= (size_t)r;
+    }
+    return true;
+}
+#endif
+
+/* The spill file: unlinked as soon as it is open, in the heap's spill
+ * directory (RAY_HEAP_SWAP, else TMPDIR, else /tmp — as heap_swap_dir). */
+static int agg_radix_spill_open(void) {
+#if AGG_RADIX_FILE_SPILL
+    static _Atomic(uint64_t) ctr = 0;
+    const char* d = getenv("RAY_HEAP_SWAP");
+    if (!(d && *d)) d = getenv("TMPDIR");
+    if (!(d && *d) || strlen(d) > 400) d = "/tmp";
+    size_t dl = strlen(d);
+    char path[512];
+    snprintf(path, sizeof path, "%s%sraygroup_%d_%llu.dat", d, d[dl - 1] == '/' ? "" : "/",
+             (int)getpid(),
+             (unsigned long long)atomic_fetch_add_explicit(&ctr, 1, memory_order_relaxed));
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd >= 0) unlink(path);
+    return fd;
+#else
+    return -1;
+#endif
+}
+
+/* Append a full (or the last) buffer of one wave as one block. */
+static void agg_radix_spill_flush(agg_radix_spill_t* s, agg_radix_sbuf_t* b, uint32_t wave) {
+    if (!b->n) return;
+#if AGG_RADIX_FILE_SPILL
+    size_t rb = (size_t)b->n * s->rec, sb = (size_t)b->n * sizeof(uint32_t);
+    int64_t bi = atomic_fetch_add_explicit(&s->n_blks, 1, memory_order_relaxed);
+    int64_t off = atomic_fetch_add_explicit(&s->tail, (int64_t)(rb + sb), memory_order_relaxed);
+    if (bi >= s->blk_cap || ray_agg_radix_spill == 4 ||
+        !agg_spill_pwrite(s->fd, b->buf, rb, off) ||
+        !agg_spill_pwrite(s->fd, b->buf + (size_t)s->bcap * s->rec, sb, off + (int64_t)rb))
+        atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+    else
+        s->blks[bi] = (agg_radix_blk_t){ off, b->n, wave };
+#else
+    (void)wave;
+    atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+#endif
+    b->n = 0;
+}
+
+/* Where a spilled run scatters input position pos: wave 0 to its payload
+ * slot, a later wave to the next record of this worker's buffer, with the
+ * slot it will take when read back stored beside it (a full buffer is
+ * flushed first).  The chunk cursors advance for every partition exactly as
+ * in the one-pass scatter, so every record's slot is the one-pass slot less
+ * its wave base. */
+RAY_INLINE char* agg_radix_spill_dst(agg_radix_ctx_t* c, uint32_t* cur,
+                                     agg_radix_sbuf_t* wb, int64_t pos) {
+    agg_radix_spill_t* s = c->spill;
+    uint32_t p = c->pid[pos];
+    uint32_t w = c->wave_of[p];
+    int64_t slot = c->part_start[p] - s->wave_base[w] + cur[p]++;
+    if (w == 0) return c->pay + (size_t)slot * c->rec;
+    agg_radix_sbuf_t* b = &wb[w];
+    if (b->n == s->bcap) agg_radix_spill_flush(s, b, w);
+    ((uint32_t*)(void*)(b->buf + (size_t)s->bcap * c->rec))[b->n] = (uint32_t)slot;
+    return b->buf + (size_t)b->n++ * c->rec;
+}
+
+/* The spilled scatter of a plain context (whole columns). */
+static void agg_radix_spill_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_radix_sbuf_t* wb = c->spill->bufs + (size_t)wid * c->spill->n_waves;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t cs = ch * c->chunk_rows, ce = cs + c->chunk_rows;
+        if (ce > c->n_in) ce = c->n_in;
+        uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+        if (c->sel) {
+            int64_t rows[AGG_SEL_CHUNK];
+            agg_sel_cursor_t sc;
+            agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, cs, ce);
+            int64_t pos = cs, cn;
+            while ((cn = agg_sel_cursor_next(&sc, rows)) > 0)
+                for (int64_t i = 0; i < cn; i++, pos++)
+                    agg_radix_put(c, agg_radix_spill_dst(c, cur, wb, pos), rows[i], pos);
+            continue;
+        }
+        for (int64_t b = cs; b < ce; b += 8192) {
+            int64_t e = ce - b > 8192 ? b + 8192 : ce;
+            ray_pool_scan_at(c->n_in, b, ce);
+            for (int64_t r = b; r < e; r++)
+                agg_radix_put(c, agg_radix_spill_dst(c, cur, wb, r), r, r);
+        }
+    }
+}
+
+/* The spilled scatter of a staged context: rows read through views, as
+ * agg_radix_chunk_staged reads them; a range error is noted keyed by the
+ * chunk's first position and leaves the chunk unscattered. */
+typedef struct {
+    agg_radix_ctx_t*  c;
+    uint32_t*         cur;
+    const int64_t*    rows;      /* sel mode: the chunk's decoded rows */
+    int64_t           pos0;
+    agg_radix_sbuf_t* wb;
+} agg_radix_spill_rows_t;
+static void agg_radix_spill_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    agg_radix_spill_rows_t* t = raw;
+    if (t->rows) {
+        for (int64_t i = b; i < e; i++) {
+            int64_t pos = t->pos0 + i;
+            agg_radix_put_view(t->c, v, agg_radix_spill_dst(t->c, t->cur, t->wb, pos), t->rows[i], pos);
+        }
+        return;
+    }
+    for (int64_t r = b; r < e; r++)
+        agg_radix_put_view(t->c, v, agg_radix_spill_dst(t->c, t->cur, t->wb, r), r, r);
+}
+static void agg_radix_spill_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    const agg_rr_t* rr = c->rr;
+    agg_radix_sbuf_t* wb = c->spill->bufs + (size_t)wid * c->spill->n_waves;
+    agg_curs_t curs;
+    if (!agg_radix_task_curs(c, start, &curs)) return;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t cs = ch * c->chunk_rows, ce = cs + c->chunk_rows;
+        if (ce > c->n_in) ce = c->n_in;
+        uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+        if (!c->sel) {
+            agg_radix_spill_rows_t t = { c, cur, NULL, 0, wb };
+            (void)agg_walk_cs(rr, &curs, &t, agg_radix_spill_rows, wid, cs, ce, cs);
+            continue;
+        }
+        if (ray_scan_fail_skip(rr->fail, cs)) continue;
+        int64_t rows[AGG_SEL_CHUNK];
+        agg_sel_cursor_t sc;
+        agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, cs, ce);
+        int64_t pos = cs, cn;
+        while ((cn = agg_sel_cursor_next(&sc, rows)) > 0) {
+            agg_radix_spill_rows_t t = { c, cur, rows, pos, wb };
+            ray_t* err = agg_idx_walk(rr, &curs, rows, 0, cn, &t, agg_radix_spill_rows, wid);
+            if (err) { ray_scan_fail_note(rr->fail, cs, err); break; }
+            pos += cn;
+        }
+    }
+    agg_curs_free(&curs, rr);
+}
+
+/* Read the blocks of one wave back into their payload slots. */
+static void agg_radix_readback_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_radix_spill_t* s = c->spill;
+#if AGG_RADIX_FILE_SPILL
+    char* rb = s->rbuf + (size_t)wid * s->rstride;
+    for (int64_t i = start; i < end; i++) {
+        const agg_radix_blk_t* bk = &s->blks[s->wave_blks[i]];
+        size_t rbytes = (size_t)bk->n * c->rec;
+        if (ray_agg_radix_spill == 5)   /* test fault: the pool is cancelled mid read-back */
+            atomic_store_explicit(&ray_pool_get()->cancelled, 1, memory_order_relaxed);
+        if (ray_agg_radix_spill == 3 ||
+            !agg_spill_pread(s->fd, rb, rbytes + (size_t)bk->n * sizeof(uint32_t), bk->off)) {
+            atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+            continue;
+        }
+        const uint32_t* slots = (const uint32_t*)(const void*)(rb + rbytes);
+        for (uint32_t j = 0; j < bk->n; j++)
+            memcpy(c->pay + (size_t)slots[j] * c->rec, rb + (size_t)j * c->rec, c->rec);
+    }
+#else
+    (void)wid; (void)start; (void)end;
+    atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+#endif
+}
+
 /* Phase 2: group + accumulate one partition by walking its packed payload
  * records SEQUENTIALLY.  Keys here are disjoint from every other partition, so
  * a partition-local open-addressing hash suffices.  Hash/equality compare the
  * contiguous packed keys at the head of each record (no scattered key-column
  * re-reads), and each agg's dense value buffer is gathered straight from the
  * records in the same sequential pass.  Keys are disjoint from other
- * partitions so the partition-local open-addressing hash suffices. */
+ * partitions so the partition-local open-addressing hash suffices.  Under a
+ * top-N emit (cmp_cap) the finished partition is cut to its candidates
+ * (agg_radix_part_compact) before it is published. */
 static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
     size_t key_bytes = (size_t)n_keys * 8;
     for (int64_t pi = start; pi < end; pi++) {
-        uint32_t p = (uint32_t)pi;
+        uint32_t p = c->part_lo + (uint32_t)pi;
         agg_radix_part_t* pr = &c->parts[p];
+        if (ray_agg_radix_spill == 6 && c->pay_base > 0)   /* test fault: cancelled in a later wave */
+            atomic_store_explicit(&ray_pool_get()->cancelled, 1, memory_order_relaxed);
 
         /* Rows hashing to p: its contiguous slot range, in input order. */
         int64_t total = c->part_start[p + 1] - c->part_start[p];
@@ -6143,7 +6513,7 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
 
         int64_t ng = 0, ri = 0;
         {
-            const char* rec = c->pay + (size_t)c->part_start[p] * c->rec;
+            const char* rec = c->pay + (size_t)(c->part_start[p] - c->pay_base) * c->rec;
             for (int64_t i = 0; i < total; i++, rec += c->rec) {
                 const int64_t* keys = (const int64_t*)rec;
                 int64_t r = 0;
@@ -6242,6 +6612,7 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
         for (uint32_t a = 0; a < n_aggs; a++) { ray_free_raw(gv[a]); ray_free_raw(gy[a]); }
         ray_free_raw(gv); ray_free_raw(gy);
         ray_free_raw(gid);
+        if (c->cmp_cap > 0) agg_radix_part_compact(c, &states, &first_row, &gkeys, &ng);
         pr->states = states; pr->first_row = first_row; pr->keys = gkeys; pr->ng = ng;
         continue;
     oom:
@@ -6259,7 +6630,8 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
  * measured q16 1.3% slower on generation 0 (73.8 against 72.8 ms) and 3%
  * slower on generation 2.  The two must group the same records in the
  * same order: scanrange/v2_radix_record_order compares their answers
- * byte for byte. */
+ * byte for byte.  Under a top-N emit (cmp_cap) a finished partition is cut to
+ * its candidates, as agg_radix_group_fn cuts it. */
 static void agg_radix_group_fused_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
@@ -6431,6 +6803,7 @@ static void agg_radix_group_fused_fn(void* vctx, uint32_t wid, int64_t start, in
         for (uint32_t a = 0; a < n_aggs; a++) { ray_free_raw(gv[a]); ray_free_raw(gy[a]); }
         ray_free_raw(gv); ray_free_raw(gy);
         ray_free_raw(gid);
+        if (c->cmp_cap > 0) agg_radix_part_compact(c, &states, &first_row, &gkeys, &ng);
         pr->states = states; pr->first_row = first_row; pr->keys = gkeys; pr->ng = ng;
         continue;
     oom:
@@ -7238,6 +7611,292 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
     return result;
 }
 
+/* Survivors per partition for a top-N emit (agg_radix_part_compact), or 0
+ * when the emit keeps every group or selects with semantics the reduction
+ * does not cover: a bounded first-seen emit, a minimum-count bound (it is
+ * applied before the tie cut, so the kept groups are no longer a prefix of
+ * the rank order), an aggregate without a scalar order, accumulators with a
+ * destroy hook, or a take so large that the survivors are no small share of
+ * the input. */
+static int64_t agg_radix_cmp_cap(const ray_group_emit_filter_t* efp, int64_t group_limit,
+                                 const agg_vtable_t** vts, uint32_t n_aggs,
+                                 uint32_t n_parts, int64_t n_in) {
+    if (ray_agg_radix_wave_bytes < 0 ||
+        !efp || group_limit != 0 || efp->top_count_take <= 0 ||
+        efp->min_count_exclusive > 0 || efp->agg_index >= n_aggs)
+        return 0;
+    switch (vts[efp->agg_index]->out_type) {
+        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
+        case RAY_U8: case RAY_BOOL: break;
+        default: return 0;
+    }
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (vts[a]->destroy) return 0;
+    if (efp->top_count_take > INT32_MAX) return 0;
+    int64_t cap = 2 * efp->top_count_take;
+    if ((double)cap * n_parts > (double)n_in / 2) return 0;
+    return cap;
+}
+
+/* Bound on the waves a heap-derived plan may cut: every wave re-reads the
+ * partition ids and the input rows, so past this many the passes cost more
+ * than the memory they save. */
+#define AGG_RADIX_MAX_WAVES 64
+
+/* Cut the partitions into runs of consecutive partitions holding at most
+ * `target` records each (a partition larger than that is a run of its own).
+ * Returns the run count; cut[w] .. cut[w + 1] are run w's partitions and
+ * *max_wave its largest record count. */
+static uint32_t agg_radix_wave_cut(const int64_t* part_start, uint32_t n_parts,
+                                   int64_t target, uint32_t* cut, int64_t* max_wave) {
+    uint32_t k = 0, lo = 0;
+    int64_t mx = 0;
+    while (lo < n_parts) {
+        uint32_t hi = lo + 1;
+        while (hi < n_parts && part_start[hi + 1] - part_start[lo] <= target) hi++;
+        cut[k++] = lo;
+        if (part_start[hi] - part_start[lo] > mx) mx = part_start[hi] - part_start[lo];
+        lo = hi;
+    }
+    cut[k] = n_parts;
+    *max_wave = mx;
+    return k;
+}
+
+/* Split the payload into waves of whole partitions when it would not fit the
+ * memory left under the heap's anonymous watermark.  Only a reduced (top-N)
+ * run benefits: its finished partitions shrink to their candidates, so the
+ * largest wave's payload is what stays resident, not the whole input's.
+ *
+ * The room is what the watermark leaves above the committed memory, less
+ * `reserve`: the candidates' bound, the tables of the partitions in flight
+ * (one per worker, each a few bytes per row of the largest partition) and
+ * the spill buffers when the later waves may go to a file.  The payload of
+ * one wave gets the rest.  Waves are cut greedily on the exact partition
+ * sizes; a heap-derived plan never cuts more than AGG_RADIX_MAX_WAVES (the
+ * target doubles until it fits — a greedy cut can need up to twice the
+ * waves the record count suggests).  The test knob fixes the target and
+ * cuts as many waves as it asks for.  One wave = the one-pass scatter. */
+static uint32_t agg_radix_wave_plan(const int64_t* part_start, uint32_t n_parts,
+                                    size_t rec, int64_t cmp_cap, int64_t reserve,
+                                    uint32_t* cut, int64_t* max_wave) {
+    int64_t total = part_start[n_parts];
+    cut[0] = 0; cut[1] = n_parts;
+    *max_wave = total;
+    if (cmp_cap <= 0 || total <= 0) return 1;
+    if (ray_agg_radix_wave_bytes > 0) {
+        int64_t target = ray_agg_radix_wave_bytes / (int64_t)rec;
+        if (target < 1) target = 1;
+        if (total <= target) return 1;
+        return agg_radix_wave_cut(part_start, n_parts, target, cut, max_wave);
+    }
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return 1;   /* unknown RAM: one pass, as before */
+    int64_t room = wm - ray_heap_anon_committed() - reserve;
+    int64_t target = room > 0 ? room / (int64_t)rec : 0;
+    if (total <= target) return 1;
+    int64_t least = (total + AGG_RADIX_MAX_WAVES - 1) / AGG_RADIX_MAX_WAVES;
+    if (target < least) target = least;
+    for (;;) {
+        uint32_t k = agg_radix_wave_cut(part_start, n_parts, target, cut, max_wave);
+        if (k <= AGG_RADIX_MAX_WAVES) return k;
+        target *= 2;
+    }
+}
+
+/* Before the count pass: whether agg_radix_wave_plan may split a top-N run
+ * of n_in records into waves — the test knob's bound is below the payload,
+ * or the room under the heap's anonymous watermark is, less the plan's
+ * reserve estimated with partitions of even size (the plan has the exact
+ * sizes). */
+static bool agg_radix_may_wave(int64_t n_in, uint32_t n_parts, size_t rec, size_t block,
+                               uint32_t n_keys, uint32_t nw, int64_t cmp_cap) {
+    if (cmp_cap <= 0 || n_in <= 0) return false;
+    if (ray_agg_radix_wave_bytes > 0) {
+        int64_t target = ray_agg_radix_wave_bytes / (int64_t)rec;
+        return n_in > (target < 1 ? 1 : target);
+    }
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return false;
+    size_t kb = 8 * (size_t)(n_keys ? n_keys : 1);
+    double per_row = (double)(20 + 4 + rec + 2 * (block + kb + 24));
+    double reserve = (double)cmp_cap * n_parts * (double)(block + kb + 8)
+                   + (double)nw * ((double)n_in / n_parts) * per_row;
+    double room = (double)(wm - ray_heap_anon_committed()) - reserve;
+    return (double)n_in * (double)rec > room;
+}
+
+/* Whether a radix dispatch must not be followed by the next: the pool was
+ * cancelled, or (a staged context) a range read failed. */
+static bool agg_radix_stopped(const agg_radix_ctx_t* c, ray_pool_t* pool) {
+    return pool_cancelled(pool) || (c->rr->staged && ray_scan_failed(c->rr->fail));
+}
+
+/* Count pass + prefix again: the partition ids and every chunk's write
+ * cursors back to where the first scatter found them (part_start comes out
+ * the same).  A spilled run whose file failed re-scans its remaining waves
+ * from here.  A staged context counts through its key sources (count_rr);
+ * a range error is noted in its failure envelope. */
+static void agg_radix_recount(agg_radix_ctx_t* c, ray_pool_t* pool) {
+    ray_pool_dispatch_n(pool, c->rr->staged ? agg_radix_count_staged_fn : agg_radix_count_fn,
+                        c, c->n_chunks);
+    uint32_t n_bands = (c->n_parts + AGG_RADIX_PREFIX_BAND - 1) / AGG_RADIX_PREFIX_BAND;
+    if (n_bands > 1 && (uint64_t)c->n_chunks * c->n_parts >= ((uint64_t)1 << 16))
+        ray_pool_dispatch_n(pool, agg_radix_prefix_fn, c, n_bands);
+    else
+        agg_radix_prefix_fn(c, 0, 0, n_bands);
+    for (uint32_t p = 0; p < c->n_parts; p++) c->part_start[p + 1] += c->part_start[p];
+}
+
+/* Bytes of a column object that a re-scan would read from its file again:
+ * a mapped plain column's payload, a generation-2 column's encoded file
+ * (none for an in-memory stand-in), a parted column's segments; 0 for an
+ * in-memory column.  Never decodes. */
+static int64_t agg_col_file_bytes(const ray_t* col) {
+    if (!col || RAY_IS_ERR(col)) return 0;
+    if (col->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of((ray_t*)col);
+        if (!e) return 0;
+        if (e->kind == RAY_ENCCOL_SINGLE) return e->synthetic ? 0 : (int64_t)e->size;
+        return agg_col_file_bytes(e->wrapper);
+    }
+    if (RAY_IS_PARTED(col->type)) {
+        int64_t b = 0;
+        ray_t* const* segs = (ray_t* const*)ray_data((ray_t*)col);
+        for (int64_t s = 0; s < col->len; s++) b += agg_col_file_bytes(segs[s]);
+        return b;
+    }
+    if (!ray_is_vec(col)) return 0;
+    const ray_t* base = (col->attrs & RAY_ATTR_SLICE) && col->slice_parent ? col->slice_parent : col;
+    return base->mmod == 1 ? col->len * (int64_t)col_esz(col) : 0;
+}
+
+/* Re-scan or spill the later waves?  A re-scan reads the input columns once
+ * more per extra wave — from the page cache when they stay there, from their
+ * files when they do not; a spill writes the later waves' records (with
+ * their 4-byte slots) once and reads them back once.  With in-memory input
+ * a re-scan moves no bytes to or from a device, so it always wins; with
+ * file-backed input the cheaper of the two worst cases is taken, which caps
+ * the re-scanned waves at about 2 * payload / input (four to five for a
+ * near-unique two-key count). */
+static bool agg_radix_spill_wanted(int64_t file_bytes, uint32_t n_waves,
+                                   int64_t spilled_recs, size_t rec, int64_t max_wave) {
+    if (!AGG_RADIX_FILE_SPILL || n_waves <= 1 || max_wave > (int64_t)UINT32_MAX ||
+        ray_agg_radix_spill == 1)
+        return false;
+    if (ray_agg_radix_spill >= 2) return true;
+    double spill = 2.0 * (double)spilled_recs * (double)(rec + sizeof(uint32_t));
+    double rescan = (double)(n_waves - 1) * (double)file_bytes;
+    return file_bytes > 0 && spill < rescan;
+}
+
+/* Run a split radix with its later waves spilled: one scatter pass writes
+ * wave 0 into the payload and the rest to the file, wave 0 is reduced, then
+ * each later wave is read back into the payload and reduced.  Returns the
+ * first wave still to run by re-scan: n_waves when every wave was served,
+ * 0 when the spill could not be set up (nothing scattered yet), or the wave
+ * at which the file failed (the cursors are restored by agg_radix_recount).
+ * `buf_bytes` is the share of the plan's reserve for the write and read-back
+ * buffers: a buffer is never smaller than AGG_RADIX_SPILL_MIN_BUF (smaller
+ * writes would be small random I/O), so when the workers' buffers of that
+ * size for every wave exceed it, nothing is scattered and the caller
+ * re-scans (returns 0). */
+#define AGG_RADIX_SPILL_MIN_BUF ((int64_t)64 << 10)
+static uint32_t agg_radix_spill_run(agg_radix_ctx_t* c, ray_pool_t* pool, uint32_t nw,
+                                    const uint32_t* cut, uint32_t n_waves, int64_t buf_bytes,
+                                    bool* cancelled, int* oom, uint64_t* bytes) {
+    uint32_t n_parts = c->n_parts;
+    size_t ent = c->rec + sizeof(uint32_t);
+    int64_t per = buf_bytes / ((int64_t)nw * (n_waves + 1));
+    if (per > ((int64_t)1 << 20)) per = (int64_t)1 << 20;
+    if (per < AGG_RADIX_SPILL_MIN_BUF) per = AGG_RADIX_SPILL_MIN_BUF;
+    uint32_t bcap = (uint32_t)(per / (int64_t)ent);
+    if (bcap < 1) bcap = 1;
+    size_t stride = ((size_t)bcap * ent + 7) & ~(size_t)7;   /* records stay 8-aligned */
+    if ((double)nw * n_waves * (double)stride > (double)buf_bytes) return 0;
+    route_stats.radix_spill_buf = (uint64_t)nw * n_waves * stride;
+    int64_t spilled = c->part_start[n_parts] - c->part_start[cut[1]];
+    agg_radix_spill_t sp = { .fd = -1, .n_waves = n_waves, .bcap = bcap, .rec = c->rec };
+    atomic_init(&sp.n_blks, 0); atomic_init(&sp.tail, 0); atomic_init(&sp.err, 0);
+    sp.blk_cap = spilled / bcap + (int64_t)nw * n_waves + 1;
+    uint16_t* wave_of = ray_alloc_raw((size_t)n_parts * sizeof(uint16_t));
+    int64_t* wave_base = ray_alloc_raw((size_t)n_waves * sizeof(int64_t));
+    sp.bufs = ray_calloc_raw((size_t)nw * n_waves * sizeof(agg_radix_sbuf_t));
+    sp.rstride = stride;
+    char* bufmem = ray_alloc_raw((size_t)nw * (n_waves - 1) * stride);
+    sp.rbuf = ray_alloc_raw((size_t)nw * stride);
+    sp.blks = ray_alloc_raw((size_t)sp.blk_cap * sizeof(agg_radix_blk_t));
+    int64_t* wave_blks = ray_alloc_raw((size_t)sp.blk_cap * sizeof(int64_t));
+    sp.fd = (wave_of && wave_base && sp.bufs && bufmem && sp.rbuf && sp.blks && wave_blks)
+          ? agg_radix_spill_open() : -1;
+    if (sp.fd < 0) {
+        ray_free_raw(wave_of); ray_free_raw(wave_base); ray_free_raw(sp.bufs);
+        ray_free_raw(bufmem); ray_free_raw(sp.rbuf); ray_free_raw(sp.blks); ray_free_raw(wave_blks);
+        return 0;
+    }
+    for (uint32_t w = 0; w < n_waves; w++) {
+        wave_base[w] = c->part_start[cut[w]];
+        for (uint32_t p = cut[w]; p < cut[w + 1]; p++) wave_of[p] = (uint16_t)w;
+    }
+    for (uint32_t t = 0; t < nw; t++)
+        for (uint32_t w = 1; w < n_waves; w++)
+            sp.bufs[(size_t)t * n_waves + w].buf =
+                bufmem + ((size_t)t * (n_waves - 1) + (w - 1)) * stride;
+    sp.wave_base = wave_base;
+    sp.wave_blks = wave_blks;
+    c->spill = &sp; c->wave_of = wave_of;
+
+    uint32_t next = n_waves;
+    ray_pool_dispatch_n(pool, c->rr->staged ? agg_radix_spill_scatter_staged_fn
+                                           : agg_radix_spill_scatter_fn, c, c->n_chunks);
+    *cancelled = agg_radix_stopped(c, pool);
+    for (uint32_t t = 0; t < nw && !*cancelled; t++)
+        for (uint32_t w = 1; w < n_waves; w++)
+            agg_radix_spill_flush(&sp, &sp.bufs[(size_t)t * n_waves + w], w);
+    ray_free_raw(bufmem); bufmem = NULL;
+    ray_profile_tick("radix: spilled later waves");
+    for (uint32_t w = 0; w < n_waves && !*cancelled && !*oom; w++) {
+        uint32_t lo = cut[w], hi = cut[w + 1];
+        if (w > 0) {
+            if (atomic_load_explicit(&sp.err, memory_order_relaxed)) {
+                agg_radix_recount(c, pool);   /* the file failed: re-scan from here */
+                *cancelled = agg_radix_stopped(c, pool);
+                next = w;
+                break;
+            }
+            int64_t nb = 0, total = atomic_load_explicit(&sp.n_blks, memory_order_relaxed);
+            for (int64_t i = 0; i < total; i++)
+                if (sp.blks[i].wave == w) wave_blks[nb++] = i;
+            if (nb > 0) ray_pool_dispatch_n(pool, agg_radix_readback_fn, c, (uint32_t)nb);
+            *cancelled = agg_radix_stopped(c, pool);
+            if (*cancelled) break;
+            if (atomic_load_explicit(&sp.err, memory_order_relaxed)) {
+                agg_radix_recount(c, pool);
+                *cancelled = agg_radix_stopped(c, pool);
+                next = w;
+                break;
+            }
+        }
+        if (c->part_start[hi] == c->part_start[lo]) continue;
+        c->part_lo = lo;
+        c->pay_base = c->part_start[lo];
+        ray_pool_dispatch_n(pool, agg_radix_group_fn, c, hi - lo);
+        *cancelled = agg_radix_stopped(c, pool);
+        for (uint32_t p = lo; p < hi && !*cancelled; p++)
+            if (c->parts[p].oom) { *oom = 1; break; }
+        ray_profile_tick("radix: wave reduced");
+    }
+    *bytes = (uint64_t)atomic_load_explicit(&sp.tail, memory_order_relaxed);
+#if AGG_RADIX_FILE_SPILL
+    close(sp.fd);
+#endif
+    c->spill = NULL; c->wave_of = NULL; c->part_lo = 0; c->pay_base = 0;
+    ray_free_raw(wave_of); ray_free_raw(wave_base); ray_free_raw(sp.bufs);
+    ray_free_raw(sp.rbuf); ray_free_raw(sp.blks); ray_free_raw(wave_blks);
+    return next;
+}
+
 static ray_t* exec_group_v2_parallel_radix(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
         ray_t** key_cols, int64_t* key_syms,
@@ -7400,20 +8059,35 @@ static ray_t* exec_group_v2_parallel_radix(
             if (chunk_rows < 1) chunk_rows = 1;
         }
     }
+    /* A top-N emit keeps only its partitions' candidates (cmp_cap).  When
+     * the whole payload may not fit the wave bound (agg_radix_may_wave),
+     * the two passes run instead of the fused pass: their partition-major
+     * payload splits into waves of whole partitions, while the fused pass's
+     * chunk-major payload holds every record at once. */
+    int64_t cmp_cap = needs_row
+        ? agg_radix_cmp_cap(efp, group_limit, vts, n_aggs, n_parts, n_in) : 0;
+    if (fused && agg_radix_may_wave(n_in, n_parts, rec, block, n_keys, nw, cmp_cap)) {
+        fused = false;
+        chunk_rows = (int64_t)(((uint64_t)n_in + want - 1) / want);   /* the two passes' chunks */
+        if (chunk_rows < 1) chunk_rows = 1;
+    }
     uint32_t n_chunks = (uint32_t)((n_in + chunk_rows - 1) / chunk_rows);
 
     /* O(1) allocations whatever the worker count: the count matrix and the
-     * partition ids live until pass 2 ends (fused: no ids; the count matrix
-     * until its runs are transposed, the runs until phase 2 ends), the
-     * payload until phase 2 ends. */
+     * partition ids live until the last scatter pass ends (fused: no ids;
+     * the count matrix until its runs are transposed, the runs until phase
+     * 2 ends), the payload until phase 2 ends.  The fused payload holds the
+     * whole input; the two passes size theirs once the partition sizes are
+     * known: the whole input, or the largest wave. */
     agg_radix_part_t* parts = ray_calloc_raw((size_t)n_parts * sizeof(agg_radix_part_t));
     uint32_t* cnt = ray_alloc_raw((size_t)(n_chunks ? n_chunks : 1) * n_parts * sizeof(uint32_t));
     int64_t* part_start = ray_alloc_raw(((size_t)n_parts + 1) * sizeof(int64_t));
     uint16_t* pid = fused ? NULL : ray_alloc_raw((size_t)(n_in ? n_in : 1) * sizeof(uint16_t));
-    char* pay = ray_alloc_raw((size_t)(n_in ? n_in : 1) * rec);
-    if (!parts || !cnt || !part_start || (!fused && !pid) || !pay) {
+    uint32_t* wave_cut = fused ? NULL : ray_alloc_raw(((size_t)n_parts + 1) * sizeof(uint32_t));
+    char* pay = fused ? ray_alloc_raw((size_t)(n_in ? n_in : 1) * rec) : NULL;
+    if (!parts || !cnt || !part_start || (fused ? !pay : (!pid || !wave_cut))) {
         ray_free_raw(parts); ray_free_raw(cnt); ray_free_raw(part_start);
-        ray_free_raw(pid); ray_free_raw(pay);
+        ray_free_raw(pid); ray_free_raw(wave_cut); ray_free_raw(pay);
         scratch_free(off_hdr); agg_desc_free(&d);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
@@ -7433,15 +8107,22 @@ static ray_t* exec_group_v2_parallel_radix(
         .rec = rec, .row_off = row_off, .needs_row = needs_row,
         .sel = sel, .sel_prefix = sel_prefix,
         .val_off = val_off, .val2_off = val2_off,
+        .wave_lo = 0, .wave_hi = n_parts, .part_lo = 0, .pay_base = 0,
+        .cmp_cap = cmp_cap,
+        .cmp_vt = cmp_cap ? vts[efp->agg_index] : NULL,
+        .cmp_off = cmp_cap ? off[efp->agg_index] : 0,
+        .cmp_param = cmp_cap && ext->agg_k ? ext->agg_k[efp->agg_index] : 0,
+        .cmp_desc = cmp_cap ? efp->desc : 0,
         .rr = &d.rr, .whole = &d.whole,
         .compact = fused && compact, .srec = srec, .n_cf = n_cf, .cf = cf,
     };
     route_stats.radix_phase1 = !fused ? AGG_RADIX_P1_TWO_PASS
                              : ctx.compact ? AGG_RADIX_P1_FUSED_COMPACT : AGG_RADIX_P1_FUSED_RECORDS;
     atomic_init(&ctx.part_overflow, 0);
+    atomic_init(&ctx.cmp_parts, 0);
     agg_desc_advise(&d, nrows);
-    /* Pass 1 of the two passes reads the keys alone: an input is read once,
-     * by the scatter. */
+    /* Pass 1 of the two passes reads the keys alone: an input is read once
+     * by each scatter. */
     agg_rr_t count_rr = d.rr;
     ray_col_src_t** count_srcs = NULL;
     ctx.count_rr = &d.rr;
@@ -7458,6 +8139,7 @@ static ray_t* exec_group_v2_parallel_radix(
         /* One pass: each chunk counted and scattered inside its own record
          * range, then the partition totals. */
         uint32_t n_bands = (n_parts + AGG_RADIX_PREFIX_BAND - 1) / AGG_RADIX_PREFIX_BAND;
+        route_stats.radix_waves = 1;
         ctx.runs = ray_alloc_raw((size_t)n_chunks * n_parts * 2 * sizeof(uint32_t));
         if (!ctx.runs) {
             ray_free_raw(parts); ray_free_raw(cnt); ray_free_raw(part_start); ray_free_raw(pay);
@@ -7490,6 +8172,8 @@ static ray_t* exec_group_v2_parallel_radix(
             for (uint32_t p = 0; p < n_parts; p++)
                 if (parts[p].oom) { oom = 1; break; }
         }
+        route_stats.radix_compacted =
+            (uint64_t)atomic_load_explicit(&ctx.cmp_parts, memory_order_relaxed);
         ray_profile_tick("radix: reduced partitions");
         scratch_free(off_hdr);
         ray_free_raw(ctx.runs); ctx.runs = NULL;
@@ -7524,27 +8208,139 @@ static ray_t* exec_group_v2_parallel_radix(
         cancelled = pool_cancelled(pool);
     }
     int oom = atomic_load_explicit(&ctx.part_overflow, memory_order_relaxed);
+    uint32_t n_waves = 1;
+    bool no_pay = false;
+    int64_t file_bytes = 0, buf_bytes = 0;
+    bool spill_chosen = false;
     if (!cancelled && !oom) {
         for (uint32_t p = 0; p < n_parts; p++) part_start[p + 1] += part_start[p];
+        int64_t max_wave = n_in;
+        /* Held beside one wave's payload: the candidates, the tables of the
+         * partitions in flight (one per worker; per row of the largest
+         * partition its hash slots, gid and value columns, and per group
+         * — at most a row each, doubling capacity — its state, keys, key
+         * pointer, first row and the reduction's value) and, with
+         * file-backed input, the spill buffers. */
+        int64_t max_part = 0;
+        for (uint32_t p = 0; p < n_parts; p++)
+            if (part_start[p + 1] - part_start[p] > max_part)
+                max_part = part_start[p + 1] - part_start[p];
+        size_t kb = 8 * (size_t)(n_keys ? n_keys : 1);
+        int64_t per_row = (int64_t)(20 + 4 + rec + 2 * (block + kb + 24));
+        int64_t reserve = cmp_cap * (int64_t)n_parts * (int64_t)(block + kb + 8)
+                        + (int64_t)nw * max_part * per_row;
+        /* The bytes a re-scan reads again: each key's and input's object as
+         * the scan reads it (a staged source's bound object, else the plain
+         * column read in place; an input read from an in-memory
+         * materialization of an encoded column reads no file).  Never
+         * decodes. */
+        for (uint32_t k = 0; k < n_keys; k++)
+            file_bytes += agg_col_file_bytes(d.key_srcs[k] ? d.key_srcs[k]->obj : key_cols[k]);
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            ray_t* vc = NULL;
+            if (d.val_srcs[a]) {
+                vc = d.val_srcs[a]->obj;
+            } else if (d.val_data[a] && d.agg_syms[a]) {
+                ray_t* slot = ray_table_slot(tbl, d.agg_syms[a]);
+                vc = slot && slot->type != RAY_ENCCOL ? slot : NULL;
+            }
+            bool dup = false;
+            for (uint32_t k = 0; k < n_keys && vc; k++)
+                if ((d.key_srcs[k] ? d.key_srcs[k]->obj : key_cols[k]) == vc) dup = true;
+            if (!dup) file_bytes += agg_col_file_bytes(vc);
+        }
+        n_waves = agg_radix_wave_plan(part_start, n_parts, rec, cmp_cap, reserve,
+                                      wave_cut, &max_wave);
+        /* A split that would spill (by the cost rule, or the test knob) is
+         * planned again with room for the write buffers (at most 1 MB per
+         * worker and wave, at most an eighth of the room, none once the
+         * watermark is passed).  If the larger reserve changes the plan so
+         * that the spill no longer pays, the plan without buffers stands: a
+         * re-scan needs none, and its waves are not multiplied for nothing. */
+        if (n_waves > 1 && (file_bytes > 0 || ray_agg_radix_spill >= 2) &&
+            agg_radix_spill_wanted(file_bytes, n_waves,
+                                   part_start[n_parts] - part_start[wave_cut[1]], rec, max_wave)) {
+            int64_t wm = ray_heap_anon_watermark();
+            int64_t room = wm > 0 ? wm - ray_heap_anon_committed() : -1;
+            int64_t bb = (int64_t)nw * (AGG_RADIX_MAX_WAVES + 1) << 20;
+            if (wm > 0 && bb > (room > 0 ? room / 8 : 0)) bb = room > 0 ? room / 8 : 0;
+            uint32_t w2 = bb > 0
+                ? agg_radix_wave_plan(part_start, n_parts, rec, cmp_cap, reserve + bb,
+                                      wave_cut, &max_wave)
+                : 0;
+            if (w2 > 1 && agg_radix_spill_wanted(file_bytes, w2,
+                                   part_start[n_parts] - part_start[wave_cut[1]], rec, max_wave)) {
+                n_waves = w2; buf_bytes = bb; spill_chosen = true;
+            } else if (w2) {
+                n_waves = agg_radix_wave_plan(part_start, n_parts, rec, cmp_cap, reserve,
+                                              wave_cut, &max_wave);
+            }
+        }
+        pay = ray_alloc_raw((size_t)(max_wave > 0 ? max_wave : 1) * rec);
+        ctx.pay = pay;
+        if (!pay) no_pay = true;
+    }
+    route_stats.radix_waves = n_waves;
+    if (!cancelled && !oom && !no_pay && n_waves == 1) {
         /* Pass 2: every record to its exact slot. */
         ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_scatter_staged_fn : agg_radix_scatter_fn,
                             &ctx, n_chunks);
-        if (d.staged) ferr = ray_scan_fail_finish(&d.fail, pool);
-        cancelled = pool_cancelled(pool) || ferr;
+        cancelled = agg_radix_stopped(&ctx, pool);
+        ray_free_raw(cnt); cnt = ctx.cnt = NULL;
+        ray_free_raw(pid); pid = ctx.pid = NULL;
+        ray_free_raw(count_srcs); count_srcs = NULL; ctx.count_rr = NULL;
+        ray_profile_tick("radix: scattered rows");
+
+        /* Phase 2: per-partition group+accumulate. */
+        if (!cancelled)
+            ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, n_parts);
+        if (!cancelled) {
+            cancelled = pool_cancelled(pool);
+            for (uint32_t p = 0; p < n_parts; p++)
+                if (parts[p].oom) { oom = 1; break; }
+        }
+    } else if (!cancelled && !oom && !no_pay) {
+        /* Waves: scatter the records of a run of partitions, reduce those
+         * partitions to their top-N candidates, reuse the payload for the
+         * next run.  The later waves come from the spill file when that
+         * moves fewer bytes (agg_radix_spill_wanted); otherwise, or from the
+         * wave at which the file failed, every wave re-reads the input (its
+         * rows in place or, staged, by range; the partition ids
+         * sequentially); no wave writes outside its payload. */
+        uint32_t next = 0;
+        if (spill_chosen) {
+            uint64_t sb = 0;
+            next = agg_radix_spill_run(&ctx, pool, nw, wave_cut, n_waves, buf_bytes,
+                                       &cancelled, &oom, &sb);
+            route_stats.radix_spill_bytes = sb;
+        }
+        for (uint32_t w = next; w < n_waves && !cancelled && !oom; w++) {
+            uint32_t lo = wave_cut[w], hi = wave_cut[w + 1];
+            if (part_start[hi] == part_start[lo]) continue;   /* only empty partitions */
+            ctx.wave_lo = lo; ctx.wave_hi = hi; ctx.part_lo = lo;
+            ctx.pay_base = part_start[lo];
+            ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_wave_scatter_staged_fn
+                                                     : agg_radix_wave_scatter_fn, &ctx, n_chunks);
+            cancelled = agg_radix_stopped(&ctx, pool);
+            if (cancelled) break;
+            ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, hi - lo);
+            cancelled = pool_cancelled(pool);
+            for (uint32_t p = lo; p < hi && !cancelled; p++)
+                if (parts[p].oom) { oom = 1; break; }
+            ray_profile_tick("radix: wave reduced");
+        }
+        ctx.wave_lo = 0; ctx.wave_hi = n_parts; ctx.part_lo = 0; ctx.pay_base = 0;
     }
+    /* A range read that failed in a scatter is the query's error. */
+    if (!ferr && d.staged && ray_scan_failed(&d.fail)) ferr = ray_scan_fail_finish(&d.fail, pool);
+    if (ferr) cancelled = true;
     ray_free_raw(cnt); ctx.cnt = NULL;
     ray_free_raw(pid); ctx.pid = NULL;
     ray_free_raw(count_srcs); ctx.count_rr = NULL;
-    ray_profile_tick("radix: scattered rows");
-
-    /* Phase 2: per-partition group+accumulate. */
-    if (!cancelled && !oom)
-        ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, n_parts);
-    if (!cancelled && !oom) {
-        cancelled = pool_cancelled(pool);
-        for (uint32_t p = 0; p < n_parts; p++)
-            if (parts[p].oom) { oom = 1; break; }
-    }
+    ray_free_raw(wave_cut);
+    route_stats.radix_compacted =
+        (uint64_t)atomic_load_explicit(&ctx.cmp_parts, memory_order_relaxed);
+    if (no_pay) oom = 1;
 
     ray_profile_tick("radix: reduced partitions");
 
@@ -10494,6 +11290,10 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.dense_plan_available = false;
     route_stats.dense_worker_budget = false;
     route_stats.dense_tasks = 0;
+    route_stats.radix_waves = 0;
+    route_stats.radix_compacted = 0;
+    route_stats.radix_spill_bytes = 0;
+    route_stats.radix_spill_buf = 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
     /* efp was already gated on this node by exec_group_v2_run; the compact
      * fallback recursion re-enters through that wrapper too. */

@@ -109,7 +109,7 @@
 (type (.sys.mem)) -- 'DICT
 (.sys.mem 1) !- arity
 (.sys.prof 1) !- arity
-(count (.sys.mem)) -- 18
+(count (.sys.mem)) -- 21
 (type (value (.sys.mem))) -- 'LIST
 
 ;; ══════════════════════════════════════════════════════════════════════

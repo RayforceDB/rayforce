@@ -24,6 +24,7 @@
 /**   I/O builtins, type casting, and misc builtins extracted from eval.c.
  */
 
+#include "table/domain.h"   /* symbols a print must resolve */
 #include "core/timespan.h"
 #include <errno.h>
 #include <stdint.h>
@@ -260,6 +261,29 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
     return buf;
 }
 
+/* Printing resolves the strings of a file domain's symbols as it goes: a
+ * symfile found torn on the way would leave entries printed as "".  So
+ * output that holds such symbols is rendered once into a temporary file
+ * and written out only if no symbol went unread (table/domain.h);
+ * otherwise `corrupt`, and nothing is printed.  Only what the output shows
+ * is read, so intact rows of a damaged file still print. */
+static bool print_args_have_file_syms(ray_t** args, int64_t n) {
+    for (int64_t i = 0; i < n; i++)
+        if (ray_sym_has_file_domain(args[i])) return true;
+    return false;
+}
+/* Where to render: a temporary file when the output holds such symbols
+ * (stdout when there is none to be had). */
+static FILE* print_begin(ray_t** args, int64_t n, uint64_t* c0) {
+    *c0 = ray_sym_domain_corruptions();
+    if (!print_args_have_file_syms(args, n)) return stdout;
+    FILE* t = tmpfile();
+    return t ? t : stdout;
+}
+static ray_t* print_end(FILE* out, uint64_t c0) {
+    return ray_sym_print_commit(out, stdout, c0);
+}
+
 /* (println val1 val2 ...) — print values to stdout, newline at end.
  * If first arg is a string with % placeholders, substitutes remaining args. */
 ray_t* ray_println_fn(ray_t** args, int64_t n) {
@@ -273,9 +297,14 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
         const char* fmt = ray_str_ptr(args[0]);
         size_t flen = ray_str_len(args[0]);
         size_t out_len = 0;
+        uint64_t c0 = ray_sym_domain_corruptions();
         ray_t* ferr;
         char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
         if (ferr) return ferr;
+        if (result && ray_sym_domain_corruptions() != c0) {
+            ray_free_raw(result);
+            return ray_sym_domain_corrupt_error();
+        }
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fputc('\n', stdout);
@@ -285,13 +314,14 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
         }
     }
 
+    uint64_t c0;
+    FILE* out = print_begin(args, n, &c0);
     for (int64_t i = 0; i < n; i++) {
-        if (i > 0) fputc(' ', stdout);
-        ray_lang_print(stdout, args[i]);
+        if (i > 0) fputc(' ', out);
+        ray_lang_print(out, args[i]);
     }
-    fputc('\n', stdout);
-    fflush(stdout);
-    return RAY_NULL_OBJ;
+    fputc('\n', out);
+    return print_end(out, c0);
 }
 
 /* (print val1 val2 ...) — like println but without trailing newline */
@@ -303,9 +333,14 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
         const char* fmt = ray_str_ptr(args[0]);
         size_t flen = ray_str_len(args[0]);
         size_t out_len = 0;
+        uint64_t c0 = ray_sym_domain_corruptions();
         ray_t* ferr;
         char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
         if (ferr) return ferr;
+        if (result && ray_sym_domain_corruptions() != c0) {
+            ray_free_raw(result);
+            return ray_sym_domain_corrupt_error();
+        }
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fflush(stdout);
@@ -314,25 +349,29 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
         }
     }
 
+    uint64_t c0;
+    FILE* out = print_begin(args, n, &c0);
     for (int64_t i = 0; i < n; i++) {
-        if (i > 0) fputc(' ', stdout);
-        ray_lang_print(stdout, args[i]);
+        if (i > 0) fputc(' ', out);
+        ray_lang_print(out, args[i]);
     }
-    fflush(stdout);
-    return RAY_NULL_OBJ;
+    return print_end(out, c0);
 }
 
 /* (show val1 val2 ...) — print values to stdout using ray_fmt, newline at end */
 ray_t* ray_show_fn(ray_t** args, int64_t n) {
     /* args are pre-materialized by eval — see ray_println_fn. */
+    uint64_t c0;
+    FILE* out = print_begin(args, n, &c0);
     for (int64_t i = 0; i < n; i++) {
-        if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(stdout, "error"); continue; }
+        if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(out, "error"); continue; }
         /* show prints the whole value, streamed; the display limits belong
          * to the REPL and to print. */
         ray_t* cause;
-        ray_err_t e = ray_fmt_write(stdout, args[i], &cause);
+        ray_err_t e = ray_fmt_write(out, args[i], &cause);
         if (cause) {   /* a column failed to load: report it, output already written stays */
-            fflush(stdout);
+            ray_t* r = print_end(out, c0);
+            if (r && RAY_IS_ERR(r)) { ray_error_free(cause); return r; }
             return cause;
         }
         if (e == RAY_OK || e == RAY_ERR_IO) continue;   /* written, partly written, or stdout failed */
@@ -341,16 +380,15 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
         if (formatted && !RAY_IS_ERR(formatted)) {
             const char* sp = ray_str_ptr(formatted);
             size_t sl = ray_str_len(formatted);
-            fwrite(sp, 1, sl, stdout);
+            fwrite(sp, 1, sl, out);
             ray_release(formatted);
         } else {
             if (formatted) ray_error_free(formatted);
-            ray_lang_print(stdout, args[i]);
+            ray_lang_print(out, args[i]);
         }
     }
-    fputc('\n', stdout);
-    fflush(stdout);
-    return RAY_NULL_OBJ;
+    fputc('\n', out);
+    return print_end(out, c0);
 }
 
 /* (format "hello % world %" a b) — string formatting with % placeholders */
@@ -2210,13 +2248,22 @@ ray_t* ray_type_fn(ray_t* val) {
  * watermark — so ray_heap_set_anon_watermark still steers this and no new
  * knob is introduced.
  *
- * Returns 0 for "no bound known", which callers treat as permissive. */
+ * Never less than RAY_UNSIZED_READ_FLOOR: at or past the watermark there is
+ * no headroom to take a quarter of, and the 0 that used to come back there
+ * meant "no bound" to the callers — the guard was off exactly when memory
+ * was short.  The floor keeps the bound monotonic too: a little headroom
+ * does not bound tighter than none.
+ *
+ * Returns 0 for "no bound known" (RAM unknown), which callers treat as
+ * permissive. */
+#define RAY_UNSIZED_READ_FLOOR (INT64_C(64) << 20)
+
 int64_t ray_unsized_read_budget(void) {
     int64_t wm = ray_heap_anon_watermark();
     if (wm <= 0) return 0;                       /* RAM unknown → permissive */
     int64_t avail = wm - ray_heap_anon_committed();
-    if (avail <= 0) return 0;
-    return avail / 4;
+    int64_t budget = avail > 0 ? avail / 4 : 0;
+    return budget < RAY_UNSIZED_READ_FLOOR ? RAY_UNSIZED_READ_FLOOR : budget;
 }
 
 static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
@@ -2270,11 +2317,13 @@ static ray_t* read_file_bytes(ray_t* path_obj, const char* op) {
      * the hint", so a file that grew is read whole instead of truncated. */
     int64_t cap = hint > 0 ? (int64_t)hint + 1 : 4096;
 
-    /* No ceiling on the hinted path.  A reported size is a finite claim the
-     * filesystem backs, and a large file allocating through the heap and
-     * spilling to disk is the behaviour that was already correct — the
-     * budget below exists to terminate an *endless* stream, which is not a
-     * situation a hint can describe. */
+    /* No ceiling on the hinted allocation.  A reported size is a finite
+     * claim the filesystem backs, and a large file allocating through the
+     * heap and spilling to disk is the behaviour that was already correct —
+     * the budget below exists to terminate an *endless* stream, which is not
+     * a situation a hint can describe.  A file that grows past its hint
+     * while it is read (len reaches cap = hint + 1) does grow through the
+     * loop below, though, and meets the same budget there. */
     const int64_t budget = ray_unsized_read_budget();
 
     ray_t* result = ray_vec_new(RAY_U8, cap);

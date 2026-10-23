@@ -36,6 +36,8 @@
  */
 
 #include "test.h"
+#include "ipc_harness.h"   /* an IPC reply of corrupt symbols */
+#include "app/repl.h"      /* ray_repl_run_file: the REPL display */
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "table/sym.h"
@@ -47,14 +49,17 @@
 #include "core/platform.h"   /* ray_thread_create: lookups against a reservation */
 #include "core/profile.h"    /* ray_profile_now_ns: their bounded wait */
 #include "ops/hash.h"    /* ray_hash_bytes: batch intern takes prehashed entries */
+#include "core/crc32.h"   /* the record index file's checksum */
 #include "mem/sys.h"
 #include "ops/ops.h"   /* RAY_PARTED_BASE (parted-flatten adoption test) */
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>      /* utimensat: a modification time set back */
 #include <sys/stat.h>   /* stat: the symfile size behind the mapping counters */
 #include <stdlib.h>   /* setenv */
 #include <stdatomic.h>
+#include <time.h>       /* nanosleep: a later modification time */
 
 #define TMP_DOM_SYM_PATH "/tmp/rayforce_test_domain_sym"
 #define TMP_DOM_COL_PATH "/tmp/rayforce_test_domain_col"
@@ -66,7 +71,17 @@ static void domain_setup(void) {
     (void)ray_sym_init();
 }
 
+/* What an index test leaves when it fails early (its own cleanup is at its
+ * end): the knob it set and its files, so the next test starts clean. */
+static void domain_ix_cleanup(void) {
+    unsetenv("RAY_SYM_INDEX_MIN");
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(TMP_DOM_SYM_PATH ".ix");
+}
+
 static void domain_teardown(void) {
+    domain_ix_cleanup();
     ray_clear_interrupt();
     ray_sym_domain_batch_cancel_for_test(0);   /* disarm a hook a test left armed */
     ray_sym_destroy();
@@ -973,7 +988,7 @@ static test_result_t test_domain_adopt_domain_refcount(void) {
 /* Pivot needs the full eval runtime, not just heap + sym table. */
 static ray_runtime_t* pvt_rt;
 static void domain_rt_setup(void)    { pvt_rt = ray_runtime_create(0, NULL); }
-static void domain_rt_teardown(void) { ray_runtime_destroy(pvt_rt); }
+static void domain_rt_teardown(void) { domain_ix_cleanup(); ray_runtime_destroy(pvt_rt); }
 
 /* A SYM index column carrying a FILE domain must hand that domain to the
  * pivot output's index column (the output raw-copies cell ids, so it must
@@ -3020,7 +3035,1215 @@ static test_result_t test_domain_sk4_reserve_kept_freed(void) {
     TEST_ASSERT_EQ_I(leaks, 0);
     PASS();
 }
+/* ---- the symfile's record index (<symfile>.ix) --------------------------- */
+
+#define TMP_IX_PATH TMP_DOM_SYM_PATH ".ix"
+#define IX_MAXN 4096
+
+/* A test vocabulary: "" at 0, then strings of varying length, so the
+ * checkpoints fall at irregular offsets; entries may be replaced. */
+typedef struct {
+    int64_t n;
+    char    s[IX_MAXN][48];
+    uint8_t l[IX_MAXN];
+} ix_vocab_t;
+static ix_vocab_t ix_va, ix_vb;
+
+static void ix_gen(ix_vocab_t* v, const char* tag, int64_t n) {
+    v->n = n;
+    for (int64_t i = 0; i < n; i++) {
+        int l = i == 0 ? 0 : snprintf(v->s[i], sizeof v->s[i], "%s_%lld_%.*s", tag,
+                                       (long long)i, (int)(i % 11), "xxxxxxxxxxx");
+        if (i == 0) v->s[i][0] = 0;
+        v->l[i] = (uint8_t)l;
+    }
+}
+static void ix_set(ix_vocab_t* v, int64_t i, const char* s) {
+    size_t l = strlen(s);
+    memcpy(v->s[i], s, l + 1);
+    v->l[i] = (uint8_t)l;
+}
+
+/* The symfile bytes of a vocabulary (the format every writer leaves) and
+ * the offset of each record. */
+static size_t ix_strl(const ix_vocab_t* v, int64_t n, uint8_t* out, uint64_t* offs) {
+    uint32_t magic = 0x4C525453U;
+    memcpy(out, &magic, 4);
+    memcpy(out + 4, &n, 8);
+    size_t o = 12;
+    for (int64_t i = 0; i < n; i++) {
+        if (offs) offs[i] = o;
+        uint32_t l = v->l[i];
+        memcpy(out + o, &l, 4);
+        memcpy(out + o + 4, v->s[i], l);
+        o += 4 + l;
+    }
+    return o;
+}
+
+static bool ix_write(const char* path, const uint8_t* buf, size_t n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(buf, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+static long ix_read(const char* path, uint8_t* buf, size_t cap) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, cap, f);
+    fclose(f);
+    return (long)n;
+}
+static bool ix_exists(const char* path) { struct stat st; return stat(path, &st) == 0; }
+
+static uint8_t ix_sym[1 << 18], ix_sym2[1 << 18], ix_buf[1 << 16], ix_buf2[1 << 16];
+static uint64_t ix_offs[IX_MAXN];
+
+static bool ix_write_vocab(const char* path, const ix_vocab_t* v, int64_t n) {
+    size_t sz = ix_strl(v, n, ix_sym, ix_offs);
+    return ix_write(path, ix_sym, sz);
+}
+
+/* An index (the format of domain.c: an 80-byte header, the checkpoints in
+ * `cap` slots, then a length byte per entry) of `count` entries of the image
+ * `img` (record offsets `offs`) whose records end at `end`; claimed for the
+ * file at `path` as it is now (its inode, modification and status-change
+ * times), or for none (NULL).  Returns its size. */
+#define IXH 80
+static uint8_t ix_sym3[4 << 20];   /* a symfile of long strings */
+static inline int64_t ix_nblk(int64_t count) { return (count + 31) / 32; }
+static inline int64_t ix_cap(int64_t count) { int64_t n = ix_nblk(count); return n + n / 4 + 64; }
+static inline size_t ix_lens_at(int64_t cap) { return IXH + 8 * (size_t)cap; }
+static inline size_t ix_bytes(int64_t count) { return ix_lens_at(ix_cap(count)) + (size_t)count; }
+static void ix_fix(uint8_t* ix) {
+    uint32_t w = ray_crc32(0, ix + 16, IXH - 16);
+    memcpy(ix + 12, &w, 4);
+}
+/* Claim an index for a file's current identity, as one written for that
+ * very file is. */
+static void ix_stamp(uint8_t* ix, const char* path) {
+    struct stat st;
+    uint64_t ino = 0, stamp = 0;
+    if (path && stat(path, &st) == 0) {
+        ino = (uint64_t)st.st_ino;
+        int64_t mt = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+        int64_t ct = (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec;
+        stamp = (uint64_t)mt ^ ((uint64_t)ct * UINT64_C(0x9E3779B97F4A7C15));
+    }
+    memcpy(ix + 32, &ino, 8);
+    memcpy(ix + 40, &stamp, 8);
+    ix_fix(ix);
+}
+static size_t ix_make(uint8_t* out, const uint8_t* img, const uint64_t* offs, int64_t count,
+                      uint64_t end, const char* path) {
+    int64_t n = ix_nblk(count), cap = ix_cap(count);
+    size_t bytes = ix_bytes(count);
+    memset(out, 0, bytes);
+    uint32_t w = 0x58525453U; memcpy(out, &w, 4);
+    w = 4; memcpy(out + 4, &w, 4);
+    w = 5; memcpy(out + 8, &w, 4);
+    memcpy(out + 16, &count, 8);
+    memcpy(out + 24, &end, 8);
+    uint64_t last = offs[32 * (n - 1)];
+    memcpy(out + 48, &last, 8);
+    w = ray_crc32(0, img + last, (size_t)(end - last)); memcpy(out + 56, &w, 4);
+    uint64_t he = end - 12 < 4096 ? end : 12 + 4096;
+    w = ray_crc32(0, img + 12, (size_t)(he - 12)); memcpy(out + 60, &w, 4);
+    uint64_t c64 = (uint64_t)cap; memcpy(out + 72, &c64, 8);
+    for (int64_t k = 0; k < n; k++) memcpy(out + IXH + 8 * (size_t)k, &offs[32 * k], 8);
+    for (int64_t i = 0; i < count; i++) {
+        uint64_t l = (i + 1 < count ? offs[i + 1] : end) - offs[i] - 4;
+        out[ix_lens_at(cap) + (size_t)i] = l < 255 ? (uint8_t)l : 255;
+    }
+    ix_stamp(out, path);
+    return bytes;
+}
+/* The checkpoint of block k, and the length byte of entry i, in an index of
+ * `count` entries. */
+static uint8_t* ix_ck_at(uint8_t* ix, int64_t k) { return ix + IXH + 8 * (size_t)k; }
+static uint8_t* ix_len_at(uint8_t* ix, int64_t count, int64_t i) {
+    return ix + ix_lens_at(ix_cap(count)) + (size_t)i;
+}
+
+/* Wait until the file system's clock is past `path`'s change time: a file
+ * written now gets a later one.  Some kernels move timestamps only by the
+ * scheduler tick, and a rewrite in the same tick keeps them (domain.h). */
+static void ix_wait_fs_tick(const char* path) {
+    struct stat st, pr;
+    if (stat(path, &st) != 0) return;
+    const char* probe = TMP_DOM_SYM_PATH ".tick";
+    for (int i = 0; i < 5000; i++) {
+        FILE* f = fopen(probe, "wb");
+        if (f) { fputc('t', f); fclose(f); }
+        if (stat(probe, &pr) == 0 &&
+            (pr.st_ctim.tv_sec > st.st_ctim.tv_sec ||
+             (pr.st_ctim.tv_sec == st.st_ctim.tv_sec && pr.st_ctim.tv_nsec > st.st_ctim.tv_nsec)))
+            break;
+        struct timespec ts = { 0, 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    unlink(probe);
+}
+
+/* Every entry of `dom` is the vocabulary's: first through the raw snapshot
+ * (the mapped prefix; lock-free, so it checks blocks itself), then the
+ * atoms, then the reverse index (a pass over the whole vocabulary). */
+static bool ix_check_all(ray_sym_domain_t* dom, const ix_vocab_t* v, int64_t n) {
+    if (ray_sym_domain_count(dom) != n) return false;
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(dom, &raw) || raw.count > n) return false;
+    for (int64_t i = 0; i < raw.count; i++) {
+        size_t l = v->l[i], rl = 0;
+        const char* rp = ray_sym_domain_raw_str(&raw, i, &rl);
+        if (!rp || rl != l || (l && memcmp(rp, v->s[i], l) != 0)) return false;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        size_t l = v->l[i];
+        ray_t* s = ray_sym_domain_str(dom, i);
+        if (!s || ray_str_len(s) != l || (l && memcmp(ray_str_ptr(s), v->s[i], l) != 0))
+            return false;
+    }
+    for (int64_t i = 1; i < n; i += 97)
+        if (ray_sym_domain_find(dom, v->s[i], v->l[i]) != i) return false;
+    return true;
+}
+
+static ray_sym_domain_ix_info_t ix_info(ray_sym_domain_t* dom) {
+    ray_sym_domain_ix_info_t in;
+    memset(&in, 0, sizeof in);
+    (void)ray_sym_domain_ix_info(dom, &in);
+    return in;
+}
+
+static void ix_unlink_all(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(TMP_IX_PATH);
+}
+
+/* Open, check every entry, report what the index did, release. */
+static bool ix_open_check(const ix_vocab_t* v, int64_t n, ray_sym_domain_ix_info_t* out) {
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    if (!dom) return false;
+    bool ok = ix_check_all(dom, v, n);
+    *out = ix_info(dom);
+    ray_sym_domain_release(dom);
+    return ok;
+}
+
+/* The length of every entry, through the raw snapshot and the domain. */
+static bool ix_check_lens(ray_sym_domain_t* dom, const ix_vocab_t* v, int64_t n) {
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(dom, &raw)) return false;
+    for (int64_t i = 0; i < n; i++) {
+        if (i < raw.count && ray_sym_domain_raw_len(&raw, i) != v->l[i]) return false;
+        if (ray_sym_domain_strlen(dom, i) != v->l[i]) return false;
+    }
+    return true;
+}
+
+/* An old symfile (no index) opens with one walk and leaves an index; the
+ * next open takes the table from it — the lengths mapped from it — checks
+ * each block on first read, and does not rewrite it. */
+static test_result_t test_domain_index_build_and_use(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 1000 };
+    ix_gen(&ix_va, "ix", N);
+    TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "write symfile");
+    ray_sym_domain_ix_info_t in;
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "old symfile resolves");
+    TEST_ASSERT_FALSE(in.from_index);
+    long n1 = ix_read(TMP_IX_PATH, ix_buf, sizeof ix_buf);
+    TEST_ASSERT_EQ_I(n1, (long)ix_bytes(N));
+    /* what the writer wrote is what the format says, for this very file */
+    size_t ib = ix_make(ix_buf2, ix_sym, ix_offs, N, ix_strl(&ix_va, N, ix_sym, ix_offs),
+                        TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_U(ib, (size_t)n1);
+    TEST_ASSERT_MEM_EQ(ib, ix_buf, ix_buf2);
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "indexed open resolves");
+    TEST_ASSERT_TRUE(in.from_index);
+    TEST_ASSERT_TRUE(in.lens_mapped);
+    TEST_ASSERT_EQ_I(in.covered, N);
+    TEST_ASSERT(in.checked > 0, "blocks checked on first read");
+    TEST_ASSERT_EQ_I(in.rescued, 0);
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT(ix_check_lens(dom, &ix_va, N), "lengths from the index");
+    ray_sym_domain_release(dom);
+    TEST_ASSERT_EQ_I(ix_read(TMP_IX_PATH, ix_buf2, sizeof ix_buf2), n1);
+    TEST_ASSERT_MEM_EQ((size_t)n1, ix_buf2, ix_buf);   /* used, not rewritten */
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* Strings of 255 bytes and longer, before the entries read in their block:
+ * their length byte says 255, the lookup takes their length from the
+ * record, and every entry and every length is the file's. */
+static test_result_t test_domain_index_long_strings(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 200 };
+    static const int64_t lens[] = { 254, 255, 256, 300, 1000, 4095, 70000 };
+    /* the records by hand: the vocabulary type holds short strings only */
+    uint64_t offs[N];
+    int64_t want[N];
+    size_t o = 12;
+    for (int64_t i = 0; i < N; i++) {
+        int64_t l = i == 0 ? 0 : (i % 32 >= 3 && i % 32 < 10) ? lens[(i / 32 + i) % 7] : i % 23;
+        want[i] = l;
+        offs[i] = o;
+        uint32_t l32 = (uint32_t)l;
+        memcpy(ix_sym3 + o, &l32, 4);
+        for (int64_t c = 0; c < l; c++) ix_sym3[o + 4 + c] = (uint8_t)('a' + (i + c) % 26);
+        o += 4 + (size_t)l;
+    }
+    uint32_t magic = 0x4C525453U;
+    int64_t cnt = N;
+    memcpy(ix_sym3, &magic, 4);
+    memcpy(ix_sym3 + 4, &cnt, 8);
+    TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym3, o), "symfile");
+    for (int pass = 0; pass < 2; pass++) {   /* walked, then from the index */
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_EQ_I(ix_info(dom).from_index, pass == 1);
+        ray_sym_domain_raw_t raw;
+        TEST_ASSERT(ray_sym_domain_raw_pin(dom, &raw), "pin");
+        for (int64_t i = N - 1; i >= 0; i--) {   /* the later entries of a block first */
+            size_t rl = 0;
+            const char* rp = ray_sym_domain_raw_str(&raw, i, &rl);
+            if (!rp || (int64_t)rl != want[i] || memcmp(rp, ix_sym3 + offs[i] + 4, rl) != 0)
+                FAILF("pass %d entry %lld", pass, (long long)i);
+            if (ray_sym_domain_raw_len(&raw, i) != want[i] || ray_sym_domain_strlen(dom, i) != want[i])
+                FAILF("pass %d length of %lld", pass, (long long)i);
+        }
+        TEST_ASSERT_EQ_I(ix_info(dom).rescued, 0);
+        ray_sym_domain_release(dom);
+    }
+    long nb = ix_read(TMP_IX_PATH, ix_buf, sizeof ix_buf);
+    TEST_ASSERT_EQ_I(nb, (long)ix_bytes(N));
+    for (int64_t i = 0; i < N; i++)
+        if (*ix_len_at(ix_buf, N, i) != (want[i] < 255 ? want[i] : 255)) FAILF("length byte %lld", (long long)i);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* The index is taken for the very file it was written for only: the same
+ * bytes written again (a new modification and status-change time), a chmod
+ * (the status-change time alone), another vocabulary of the same shape —
+ * each opens by one walk, every entry the file's, and the index is written
+ * again for it, so the open after takes it. */
+static test_result_t test_domain_index_identity(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 900 };
+    ix_gen(&ix_va, "id", N);
+    TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "write symfile");
+    ray_sym_domain_ix_info_t in;
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "first open");
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "indexed open");
+    TEST_ASSERT_TRUE(in.from_index);
+    ix_vb = ix_va;
+    for (int64_t i = 400; i < 420; i++) ix_vb.s[i][0] = 'J';
+    for (int v = 0; v < 3; v++) {
+        ix_wait_fs_tick(TMP_IX_PATH);
+        const ix_vocab_t* now = v == 2 ? &ix_vb : &ix_va;
+        if (v == 0) TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "the same bytes again");
+        if (v == 1) TEST_ASSERT_EQ_I(chmod(TMP_DOM_SYM_PATH, 0640), 0);
+        if (v == 2) TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_vb, N), "same-shape vocabulary");
+        if (!ix_open_check(now, N, &in)) FAILF("case %d: does not resolve", v);
+        if (in.from_index) FAILF("case %d: the index was taken", v);
+        if (!ix_open_check(now, N, &in) || !in.from_index) FAILF("case %d: not rewritten", v);
+        TEST_ASSERT_EQ_I(in.rescued, 0);
+    }
+    TEST_ASSERT_EQ_I(chmod(TMP_DOM_SYM_PATH, 0644), 0);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* An index that fails a check made at open is not used: the records are
+ * walked and the index written again for the file.  One per check. */
+static test_result_t test_domain_index_rejects_bad(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 777, CASES = 13 };
+    ix_gen(&ix_va, "rj", N);
+    size_t sz = ix_strl(&ix_va, N, ix_sym, ix_offs);
+    static uint8_t good[1 << 14];
+    for (int v = 0; v < CASES; v++) {
+        TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym, sz), "write symfile");
+        size_t gb = ix_make(good, ix_sym, ix_offs, N, sz, TMP_DOM_SYM_PATH);
+        size_t len = gb;
+        memcpy(ix_buf, good, gb);
+        uint64_t u;
+        int64_t c;
+        switch (v) {
+        case 0: ix_buf[20] ^= 1; break;                                              /* header crc */
+        case 1: ix_buf[4] = 3; ix_fix(ix_buf); break;                                /* earlier format */
+        case 2: u = ix_offs[32 * 24 + 1]; memcpy(ix_buf + 48, &u, 8); ix_fix(ix_buf); break;     /* last block moved */
+        case 3: ix_buf[56] ^= 1; ix_fix(ix_buf); break;                              /* last block's crc */
+        case 4: ix_buf[60] ^= 1; ix_fix(ix_buf); break;                              /* first records' crc */
+        case 5: len = gb - 5; break;                                                 /* lengths cut short */
+        case 6: c = N - 1; memcpy(ix_buf + 16, &c, 8); ix_fix(ix_buf); break;        /* count */
+        case 7: u = sz - 1; memcpy(ix_buf + 24, &u, 8); ix_fix(ix_buf); break;      /* end */
+        case 8: ix_buf[32] ^= 1; ix_fix(ix_buf); break;                             /* inode */
+        case 9: ix_buf[40] ^= 1; ix_fix(ix_buf); break;                             /* times */
+        case 10: memset(ix_buf + 32, 0, 16); ix_fix(ix_buf); break;                  /* claimed for none */
+        case 11: u = 3; memcpy(ix_buf + 72, &u, 8); ix_fix(ix_buf); break;           /* fewer slots than blocks */
+        case 12: len = 40; break;                                                    /* the header cut short */
+        }
+        TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, len), "write bad index");
+        ray_sym_domain_ix_info_t in;
+        if (!ix_open_check(&ix_va, N, &in)) FAILF("case %d: does not resolve", v);
+        if (in.from_index) FAILF("case %d: the index was used", v);
+        if (ix_read(TMP_IX_PATH, ix_buf2, sizeof ix_buf2) != (long)gb ||
+            memcmp(ix_buf2, good, gb) != 0)
+            FAILF("case %d: not written again", v);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* Damage to the checkpoint section is not looked for at open (it is not
+ * read): the index is taken, a block away from the damage reads as before,
+ * and the first read of a block it touches finds that the block does not
+ * check — the domain walks the records, answers the entry from the file,
+ * and writes the index again.  Every symbol read is the vocabulary's. */
+static test_result_t test_domain_index_checkpoint_damage(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 777, CASES = 5, CLEAN = 321 };
+    static uint8_t good[1 << 14];
+    static const int64_t first_read[CASES] = { 100, 100, 5, 100, 70 };
+    for (int v = 0; v < CASES; v++) {
+        ix_gen(&ix_va, "ck", N);
+        if (v >= 3) {   /* every record the same width: a shifted checkpoint is a record boundary */
+            for (int64_t i = 1; i < N; i++) {
+                char w[8];
+                snprintf(w, sizeof w, "s%05lld", (long long)i);
+                ix_set(&ix_va, i, w);
+            }
+        }
+        size_t sz = ix_strl(&ix_va, N, ix_sym, ix_offs);
+        TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym, sz), "write symfile");
+        size_t gb = ix_make(good, ix_sym, ix_offs, N, sz, TMP_DOM_SYM_PATH);
+        memcpy(ix_buf, good, gb);
+        uint64_t u = 16;
+        switch (v) {
+        case 0: ix_ck_at(ix_buf, 3)[0] ^= 0x10; break;                               /* a byte flipped */
+        case 1: memcpy(ix_ck_at(ix_buf, 3), ix_ck_at(ix_buf, 2), 8); break;         /* not increasing */
+        case 2: memcpy(ix_ck_at(ix_buf, 0), &u, 8); break;                           /* not at the first record */
+        case 3: case 4:   /* one record on: block 3 alone, then blocks 3 and 4 together */
+            for (int k = 3; k <= v; k++) {
+                memcpy(&u, ix_ck_at(ix_buf, k), 8);
+                u += 10;
+                memcpy(ix_ck_at(ix_buf, k), &u, 8);
+            }
+            break;
+        }
+        TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, gb), "write damaged index");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        ray_sym_domain_ix_info_t in = ix_info(dom);
+        if (!in.from_index || in.rescued != 0 || in.checked != 0)
+            FAILF("case %d: not taken as is at open", v);
+        ray_t* s = ray_sym_domain_str(dom, CLEAN);
+        if (!s || ray_str_len(s) != (size_t)ix_va.l[CLEAN] ||
+            memcmp(ray_str_ptr(s), ix_va.s[CLEAN], ix_va.l[CLEAN]) != 0)
+            FAILF("case %d: block away from the damage", v);
+        in = ix_info(dom);
+        if (in.rescued != 0) FAILF("case %d: rescued before the damaged block was read", v);
+        if (ix_read(TMP_IX_PATH, ix_buf2, sizeof ix_buf2) != (long)gb ||
+            memcmp(ix_buf2, ix_buf, gb) != 0)
+            FAILF("case %d: index rewritten early", v);
+        int64_t p = first_read[v];
+        s = ray_sym_domain_str(dom, p);
+        if (!s || ray_str_len(s) != (size_t)ix_va.l[p] ||
+            memcmp(ray_str_ptr(s), ix_va.s[p], ix_va.l[p]) != 0)
+            FAILF("case %d: wrong symbol at the damaged block", v);
+        in = ix_info(dom);
+        if (in.rescued != 1) FAILF("case %d: rescued %lld at first read", v, (long long)in.rescued);
+        TEST_ASSERT_FALSE(in.corrupt);
+        if (ix_read(TMP_IX_PATH, ix_buf2, sizeof ix_buf2) != (long)gb ||
+            memcmp(ix_buf2, good, gb) != 0)
+            FAILF("case %d: index not rewritten", v);
+        if (!ix_check_all(dom, &ix_va, N)) FAILF("case %d: a wrong symbol", v);
+        ray_sym_domain_release(dom);
+        if (!ix_open_check(&ix_va, N, &in) || !in.from_index || in.rescued != 0)
+            FAILF("case %d: rewritten index not used", v);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* An index claimed for the file that nevertheless does not describe it — a
+ * checkpoint moved, a length byte one short, two length bytes changed by +7
+ * and -7 (their block still adds up) — is found out on the first read of a
+ * block or record it gets wrong: the domain walks the records once and
+ * answers every entry correctly; the index is written again. */
+static test_result_t test_domain_index_stale_caught(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 2000 };
+    ix_gen(&ix_va, "st", N);
+    ix_set(&ix_va, 645, "LONGNAME_qqqqqqqqqqqqqqqqqqqq");
+    ix_set(&ix_va, 650, "mmmmm");
+    size_t sz = ix_strl(&ix_va, N, ix_sym, ix_offs);
+    for (int v = 0; v < 3; v++) {
+        TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym, sz), "write symfile");
+        size_t ib = ix_make(ix_buf, ix_sym, ix_offs, N, sz, TMP_DOM_SYM_PATH);
+        if (v == 0) {   /* checkpoint 20 moved to entry 641 */
+            memcpy(ix_ck_at(ix_buf, 20), &ix_offs[641], 8);
+            ix_fix(ix_buf);
+        }
+        if (v == 1) *ix_len_at(ix_buf, N, 645) -= 1;   /* its block falls short of the next */
+        if (v == 2) { *ix_len_at(ix_buf, N, 645) -= 7; *ix_len_at(ix_buf, N, 650) += 7; }
+        TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, ib), "write index");
+        ray_sym_domain_ix_info_t in;
+        if (v == 1) {
+            /* the length of the entry whose byte is off, read first and
+             * without its record: its block does not check, so the length
+             * is the file's */
+            ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+            TEST_ASSERT_NOT_NULL(dom);
+            TEST_ASSERT_EQ_I(ray_sym_domain_strlen(dom, 645), ix_va.l[645]);
+            ray_sym_domain_release(dom);
+            TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, ib), "write index again");
+        }
+        if (!ix_open_check(&ix_va, N, &in)) FAILF("case %d: does not resolve", v);
+        TEST_ASSERT_TRUE(in.from_index);
+        if (in.rescued != 1) FAILF("case %d: rescued %lld", v, (long long)in.rescued);
+        TEST_ASSERT_FALSE(in.corrupt);
+        TEST_ASSERT(ix_read(TMP_IX_PATH, ix_buf2, sizeof ix_buf2) == (long)ib &&
+                    memcmp(ix_buf2, ix_buf, ib) != 0, "index rewritten");
+        TEST_ASSERT(ix_open_check(&ix_va, N, &in), "rewritten index resolves");
+        TEST_ASSERT_TRUE(in.from_index);
+        TEST_ASSERT_EQ_I(in.rescued, 0);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* A page of the file lost behind an index claimed for it (a torn write, a
+ * bad sector): the open does not read it, but the first read of an entry
+ * there finds its record does not say its length and the walk does not fit
+ * — the entry is not answered, the domain is corrupt and the count of such
+ * reads grows; an entry of a block read before still is.  A pass over the
+ * whole vocabulary (the runtime LUT) fails the same way. */
+static test_result_t test_domain_index_torn_file(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 3000 };
+    ix_gen(&ix_va, "tf", N);
+    size_t sz = ix_strl(&ix_va, N, ix_sym, ix_offs);
+    size_t pg = (sz / 2) & ~(size_t)4095;
+    int64_t mid = 0;
+    while (ix_offs[mid] < pg + 100) mid++;
+    for (int pass = 0; pass < 2; pass++) {
+        memcpy(ix_sym2, ix_sym, sz);
+        memset(ix_sym2 + pg, 0, 4096);
+        TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym2, sz), "write torn symfile");
+        /* the index of the intact layout, claimed for the torn file (its first
+         * records and last block are intact) */
+        size_t ib = ix_make(ix_buf, ix_sym2, ix_offs, N, sz, TMP_DOM_SYM_PATH);
+        TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, ib), "write index");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_TRUE(ix_info(dom).from_index);
+        ray_t* s1 = ray_sym_domain_str(dom, 1);
+        TEST_ASSERT_NOT_NULL(s1);
+        uint64_t c0 = ray_sym_domain_corruptions();
+        if (pass == 0) {
+            TEST_ASSERT_NULL(ray_sym_domain_str(dom, mid));
+            ray_sym_domain_raw_t raw;
+            TEST_ASSERT(ray_sym_domain_raw_pin(dom, &raw), "pin");
+            size_t rl = 7;
+            TEST_ASSERT_NULL(ray_sym_domain_raw_str(&raw, mid, &rl));
+            TEST_ASSERT_EQ_U(rl, 0);
+            TEST_ASSERT_EQ_I(ray_sym_domain_strlen(dom, mid), -1);
+        } else {
+            TEST_ASSERT_NULL(ray_sym_domain_runtime_lut(dom));
+        }
+        TEST_ASSERT(ray_sym_domain_corruptions() > c0, "counted");
+        TEST_ASSERT_TRUE(ix_info(dom).corrupt);
+        TEST_ASSERT_EQ_PTR(ray_sym_domain_str(dom, 1), s1);
+        ray_sym_domain_release(dom);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* A file whose records do not fill it, with no index of its own — torn, cut
+ * short, bytes after the last record: the open walks it and opens the
+ * domain corrupt — no entry is read (the walk cannot tell which of the
+ * records before the failure are good: a lost page reads as empty ones),
+ * every read is counted — and writes no index for it; a flush of it is
+ * refused. */
+static test_result_t test_domain_index_torn_open(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 3000 };
+    ix_gen(&ix_va, "to", N + 1);
+    size_t sz = ix_strl(&ix_va, N, ix_sym, ix_offs);
+    size_t pg = (sz / 2) & ~(size_t)4095;
+    int64_t mid = 0;
+    while (ix_offs[mid] < pg + 100) mid++;
+    for (int v = 0; v < 3; v++) {
+        ix_unlink_all();
+        memcpy(ix_sym2, ix_sym, sz);
+        size_t len = sz;
+        if (v == 0) memset(ix_sym2 + pg, 0, 4096);
+        if (v == 1) len = sz - 3;
+        if (v == 2) { memset(ix_sym2 + sz, 0, 5); len = sz + 5; }
+        TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym2, len), "write the file");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        if (!dom) FAILF("case %d: not opened", v);
+        ray_sym_domain_ix_info_t in = ix_info(dom);
+        TEST_ASSERT_FALSE(in.from_index);
+        TEST_ASSERT_TRUE(in.corrupt);
+        uint64_t c0 = ray_sym_domain_corruptions();
+        bool answered = ray_sym_domain_str(dom, 1) || ray_sym_domain_str(dom, v == 0 ? mid : N - 1) ||
+                        ray_sym_domain_strlen(dom, 1) >= 0;
+        TEST_ASSERT(ray_sym_domain_corruptions() >= c0 + 3, "every read counted");
+        ray_sym_domain_release(dom);
+        if (answered) FAILF("case %d: an entry of a torn file answered", v);
+        dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_ERR_CORRUPT);
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(dom, false), RAY_ERR_CORRUPT);
+        ray_sym_domain_release(dom);
+        if (ix_exists(TMP_IX_PATH)) FAILF("case %d: an index written for a torn file", v);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* Two torn symfiles: each is reported on stderr by one line, the first time
+ * a read of it fails, with its path last; every later failed read of either
+ * leaves stderr alone, and the error names the file that read was of. */
+static test_result_t test_domain_corrupt_names_file(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 3000 };
+    static const char* const P[2] = { TMP_DOM_SYM_PATH, "/tmp/rayforce_test_domain_other" };
+    static const char* const ERRF = TMP_DOM_SYM_PATH ".err";
+    ix_gen(&ix_va, "nm", N + 1);
+    size_t sz = ix_strl(&ix_va, N, ix_sym, ix_offs);
+    size_t pg = (sz / 2) & ~(size_t)4095;
+    memset(ix_sym + pg, 0, 4096);
+    ix_unlink_all();
+    unlink(P[1]); unlink(ERRF);
+    TEST_ASSERT(ix_write(P[0], ix_sym, sz), "write torn file a");
+    TEST_ASSERT(ix_write(P[1], ix_sym, sz), "write torn file b");
+    fflush(stderr);
+    int keep = dup(2);
+    int ef = open(ERRF, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    TEST_ASSERT(keep >= 0 && ef >= 0, "capture stderr");
+    dup2(ef, 2);
+    close(ef);
+    ray_sym_domain_t* dom[2] = { ray_sym_domain_open(P[0]), ray_sym_domain_open(P[1]) };
+    bool opened = dom[0] && dom[1];
+    bool named[6] = { false };
+    char msg[6][512];
+    memset(msg, 0, sizeof msg);
+    for (int r = 0; opened && r < 6; r++) {   /* a, b, b, a, a, b */
+        int w = (r == 0 || r == 3 || r == 4) ? 0 : 1;
+        (void)ray_sym_domain_str(dom[w], 1);
+        (void)ray_sym_domain_strlen(dom[w], 2);
+        ray_t* e = ray_sym_domain_corrupt_error();
+        const char* m = ray_error_msg();
+        named[r] = m && strstr(m, P[w]) != NULL && strstr(m, P[1 - w]) == NULL;
+        if (m) snprintf(msg[r], sizeof msg[r], "%s", m);
+        ray_error_free(e);
+    }
+    fflush(stderr);
+    dup2(keep, 2);
+    close(keep);
+    long n = ix_read(ERRF, ix_buf2, sizeof ix_buf2 - 1);
+    if (dom[0]) ray_sym_domain_release(dom[0]);
+    if (dom[1]) ray_sym_domain_release(dom[1]);
+    unlink(P[1]);
+    unlink(ERRF);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    TEST_ASSERT(opened, "both opened");
+    for (int r = 0; r < 6; r++)
+        if (!named[r]) FAILF("read %d: the error names the wrong file (%s)", r, msg[r]);
+    TEST_ASSERT(n > 0, "stderr read");
+    ix_buf2[n] = 0;
+    int lines = 0;
+    for (long i = 0; i < n; i++) lines += ix_buf2[i] == '\n';
+    if (lines != 2) FAILF("%d stderr lines for 2 torn files", lines);
+    for (int w = 0; w < 2; w++) {
+        char tail[128];
+        snprintf(tail, sizeof tail, ": %s\n", P[w]);
+        if (!strstr((const char*)ix_buf2, tail)) FAILF("file %d: no line ends with its path", w);
+    }
+    PASS();
+}
+
+/* Records appended by a writer that left the index as it was (an older
+ * binary, another tool): the file is not the one the index was written for
+ * (its size and times moved), so the open walks it and writes the index
+ * again; the open after takes it whole. */
+static test_result_t test_domain_index_append_unindexed(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 500, M = 300 };
+    ix_gen(&ix_va, "au", N + M);
+    TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "write symfile");
+    ray_sym_domain_ix_info_t in;
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "writes the index");
+    ix_wait_fs_tick(TMP_IX_PATH);
+    TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N + M), "appended behind the index");
+    TEST_ASSERT(ix_open_check(&ix_va, N + M, &in), "walked");
+    TEST_ASSERT_FALSE(in.from_index);
+    TEST_ASSERT(ix_open_check(&ix_va, N + M, &in), "the new index taken");
+    TEST_ASSERT_TRUE(in.from_index);
+    TEST_ASSERT_EQ_I(in.covered, N + M);
+    TEST_ASSERT_EQ_I(in.rescued, 0);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* The writers' indexes describe the files they wrote: a full flush, appends
+ * (some durable) and the import dictionary's final sync each leave an index
+ * the next open takes whole — its lengths those of the strings — with no
+ * block failing its check. */
+static test_result_t test_domain_index_writers(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 700, M = 333 };
+    ix_gen(&ix_va, "wr", N + M);
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    for (int64_t i = 1; i < N; i++)
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]), i);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
+    ray_sym_domain_release(dom);
+    ray_sym_domain_ix_info_t in;
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "after a full flush");
+    TEST_ASSERT_TRUE(in.from_index);
+    TEST_ASSERT_EQ_I(in.covered, N);
+    TEST_ASSERT_EQ_I(in.rescued, 0);
+
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    for (int64_t i = N; i < N + M; i++) {
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]), i);
+        if (i % 50 == 0) TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(dom, false), RAY_OK);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(dom, true), RAY_OK);
+    ray_sym_domain_release(dom);
+    TEST_ASSERT(ix_open_check(&ix_va, N + M, &in), "after appends");
+    TEST_ASSERT_TRUE(in.from_index);
+    TEST_ASSERT_EQ_I(in.covered, N + M);
+    TEST_ASSERT_EQ_I(in.rescued, 0);
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT(ix_check_lens(dom, &ix_va, N + M), "the lengths the appends wrote");
+    ray_sym_domain_release(dom);
+    ix_unlink_all();
+
+    const char* p = TMP_DOM_SYM_PATH "_ixi";
+    char pix[256];
+    snprintf(pix, sizeof pix, "%s.ix", p);
+    unlink(p);
+    unlink(pix);
+    dom = ray_sym_domain_create_import(p);
+    if (dom) {
+        for (int64_t i = 1; i < N; i++)
+            TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]), i);
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
+        ray_sym_domain_release(dom);
+        ray_sym_domain_t* re = ray_sym_domain_open(p);
+        TEST_ASSERT_NOT_NULL(re);
+        TEST_ASSERT(ix_check_all(re, &ix_va, N), "after the import's sync");
+        TEST_ASSERT(ix_check_lens(re, &ix_va, N), "the import's lengths");
+        in = ix_info(re);
+        TEST_ASSERT_TRUE(in.from_index);
+        TEST_ASSERT_EQ_I(in.covered, N);
+        TEST_ASSERT_EQ_I(in.rescued, 0);
+        ray_sym_domain_release(re);
+    }
+    unlink(p);
+    unlink(pix);
+    char plk[256];
+    snprintf(plk, sizeof plk, "%s.lk", p);
+    unlink(plk);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    PASS();
+}
+
+/* Every flush brings the index up to the file, in place while its slots
+ * last: the new blocks' checkpoints and the new entries' lengths are
+ * written into it (the index keeps its inode), so the next open walks
+ * nothing; past its slots it is written whole, with room again. */
+static test_result_t test_domain_index_refresh_in_place(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 1000, M = 100, L = 2990 };   /* 32 blocks, 104 slots; then 128 blocks */
+    ix_gen(&ix_va, "rp", N + M + L);
+    TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "write symfile");
+    ray_sym_domain_ix_info_t in;
+    TEST_ASSERT(ix_open_check(&ix_va, N, &in), "first open writes the index");
+    struct stat s0, s1;
+    TEST_ASSERT_EQ_I(stat(TMP_IX_PATH, &s0), 0);
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    for (int64_t i = N; i < N + M; i++)
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]), i);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(dom, false), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(TMP_IX_PATH, &s1), 0);
+    TEST_ASSERT_EQ_U(s1.st_ino, s0.st_ino);   /* written into, not rewritten */
+    TEST_ASSERT_EQ_I(s1.st_size, (long)(ix_lens_at(ix_cap(N)) + N + M));
+    for (int64_t i = N + M; i < N + M + L; i++)
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]), i);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(dom, false), RAY_OK);
+    ray_sym_domain_release(dom);
+    TEST_ASSERT_EQ_I(stat(TMP_IX_PATH, &s1), 0);
+    TEST_ASSERT_EQ_I(s1.st_size, (long)ix_bytes(N + M + L));   /* past its slots: whole */
+    TEST_ASSERT(ix_open_check(&ix_va, N + M + L, &in), "after the appends");
+    TEST_ASSERT_TRUE(in.from_index);
+    TEST_ASSERT_EQ_I(in.covered, N + M + L);
+    TEST_ASSERT_EQ_I(in.rescued, 0);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* Every writer that makes a new file under a name first removes the index
+ * a file of that name left; and an index write sweeps the temporary files
+ * of writers that no longer run. */
+static test_result_t test_domain_index_new_file_removes(void) {
+    ix_unlink_all();
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    ix_gen(&ix_va, "nf", 64);
+    size_t sz = ix_strl(&ix_va, 64, ix_sym, ix_offs);
+    size_t ib = ix_make(ix_buf, ix_sym, ix_offs, 64, sz, NULL);
+    for (int w = 0; w < 4; w++) {
+        ix_unlink_all();
+        TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, ib), "an index left behind");
+        if (w <= 1) {
+            ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+            TEST_ASSERT_NOT_NULL(dom);
+            TEST_ASSERT(ray_sym_domain_intern(dom, "only", 4) > 0, "intern");
+            TEST_ASSERT_EQ_I(w == 0 ? ray_sym_domain_flush(dom, false)
+                                    : ray_sym_domain_flush_append(dom, false), RAY_OK);
+            ray_sym_domain_release(dom);
+        } else if (w == 2) {
+            ray_sym_domain_t* dom = ray_sym_domain_create_import(TMP_DOM_SYM_PATH);
+            if (!dom) continue;
+            ray_sym_domain_release(dom);
+        } else {
+            TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+        }
+        if (w <= 1) {
+            /* a flush writes the new file's index: never the old one */
+            int64_t cnt = 0;
+            TEST_ASSERT(ix_read(TMP_IX_PATH, ix_buf2, sizeof ix_buf2) >= IXH, "index written");
+            memcpy(&cnt, ix_buf2 + 16, 8);
+            if (cnt != 2) FAILF("writer %d left the old index", w);
+        } else if (ix_exists(TMP_IX_PATH)) FAILF("writer %d left the old index", w);
+    }
+    /* a dead writer's temporary file */
+    ix_unlink_all();
+    const char* tmp = TMP_DOM_SYM_PATH ".ix.999999999.tmp";
+    TEST_ASSERT(ix_write(tmp, ix_buf, 16), "temporary file");
+    TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH, ix_sym, sz), "symfile");
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    ray_sym_domain_release(dom);
+    TEST_ASSERT_TRUE(ix_exists(TMP_IX_PATH));
+    TEST_ASSERT_FALSE(ix_exists(tmp));
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* A reopen after another process changed the file: growth that keeps every
+ * published byte extends the domain — through the new file's index, or by
+ * a walk — and a change inside the old records is refused, with the new
+ * file's index or without: a length that moves the blocks after it, two in
+ * one block that keep them, a byte in the last, partial block or in the
+ * first records. */
+static test_result_t test_domain_index_extend_prefix(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 1000, M = 50 };
+    for (int v = 0; v < 10; v++) {
+        ix_unlink_all();
+        ix_gen(&ix_va, "ex", N + M);
+        TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "symfile");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_NOT_NULL(ray_sym_domain_str(dom, 5 * 32 + 1));
+        /* the grown file, by another process: tmp + rename, as a flush */
+        ix_vb = ix_va;
+        if (v == 2 || v == 3) ix_set(&ix_vb, 5 * 32 + 1, "a_longer_string_in_a_whole_block");
+        if (v == 4 || v == 5) ix_vb.s[N - 2][3] ^= 0x20;
+        if (v == 6 || v == 7) {   /* one block's lengths: +3 and -3, its checkpoints kept */
+            ix_set(&ix_vb, 335, "ex_335_xxxxxabc");
+            ix_set(&ix_vb, 340, "ex_340_xxxxxxx");
+        }
+        if (v == 8 || v == 9) ix_vb.s[2][1] ^= 0x20;   /* a byte of the first records */
+        size_t s2 = ix_strl(&ix_vb, N + M, ix_sym, ix_offs);
+        TEST_ASSERT(ix_write(TMP_DOM_SYM_PATH ".tmpx", ix_sym, s2), "grown file");
+        TEST_ASSERT_EQ_I(rename(TMP_DOM_SYM_PATH ".tmpx", TMP_DOM_SYM_PATH), 0);
+        if (v % 2 == 0) {
+            size_t ib = ix_make(ix_buf, ix_sym, ix_offs, N + M, s2, TMP_DOM_SYM_PATH);
+            TEST_ASSERT(ix_write(TMP_IX_PATH, ix_buf, ib), "its index");
+        } else {
+            unlink(TMP_IX_PATH);
+        }
+        ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        if (v <= 1) {
+            TEST_ASSERT_EQ_PTR(again, dom);
+            TEST_ASSERT(ix_check_all(dom, &ix_va, N + M), "extended");
+            ray_sym_domain_ix_info_t in = ix_info(dom);
+            if (in.from_index != (v == 0)) FAILF("case %d: from_index %d", v, (int)in.from_index);
+            ray_sym_domain_release(again);
+        } else if (again) {
+            ray_sym_domain_release(again);
+            ray_sym_domain_release(dom);
+            FAILF("case %d: a changed prefix was taken for growth", v);
+        }
+        ray_sym_domain_release(dom);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* A query over a symfile found torn reports `corrupt` instead of reading
+ * the lost entries as "". */
+static test_result_t test_domain_index_query_corrupt(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixq\")"));
+    ray_t* r = ray_eval_str(
+        "(.db.splayed.set \"/tmp/rf_ixq/t/\" (table [s] (list (as 'SYM (map (fn [x] "
+        "(concat \"sym_number_\" (as 'STR x))) (til 3000))))) \"/tmp/rf_ixq/sym\")");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    const char* q = "(count (distinct (as 'STR (at (.db.splayed.get \"/tmp/rf_ixq/t/\" "
+                    "\"/tmp/rf_ixq/sym\") 's))))";
+    r = ray_eval_str(q);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE(ix_exists("/tmp/rf_ixq/sym.ix"));
+    long n = ix_read("/tmp/rf_ixq/sym", ix_sym, sizeof ix_sym);
+    TEST_ASSERT(n > 3 * 4096, "symfile read");
+    memset(ix_sym + 8192, 0, 4096);
+    TEST_ASSERT(ix_write("/tmp/rf_ixq/sym", ix_sym, (size_t)n), "torn symfile");
+    r = ray_eval_str(q);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixq\")"));
+    unsetenv("RAY_SYM_INDEX_MIN");
+    PASS();
+}
+
+/* An expression that reads symbols of a torn symfile fails `corrupt` where
+ * it reads them: a `set` of it binds nothing, a .csv.write of it writes no
+ * file, and a graph run through the C API (ray_execute) fails too. */
+static test_result_t test_domain_index_corrupt_stops(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixs\")"));
+    ray_t* r = ray_eval_str(
+        "(.db.splayed.set \"/tmp/rf_ixs/t/\" (table [s] (list (as 'SYM (map (fn [x] "
+        "(concat \"sym_number_\" (as 'STR x))) (til 3000))))) \"/tmp/rf_ixs/sym\")");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    r = ray_eval_str("(count (.db.splayed.get \"/tmp/rf_ixs/t/\" \"/tmp/rf_ixs/sym\"))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    long n = ix_read("/tmp/rf_ixs/sym", ix_sym, sizeof ix_sym);
+    TEST_ASSERT(n > 3 * 4096, "symfile read");
+    memset(ix_sym + 8192, 0, 4096);
+    TEST_ASSERT(ix_write("/tmp/rf_ixs/sym", ix_sym, (size_t)n), "torn symfile");
+
+    r = ray_eval_str("(set ixsU (.db.splayed.get \"/tmp/rf_ixs/t/\" \"/tmp/rf_ixs/sym\"))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    r = ray_eval_str("(set ixsX (select {from: ixsU where: (== s (as 'SYM \"sym_number_1700\"))}))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    r = ray_eval_str("ixsX");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));               /* never bound */
+    ray_error_free(r);
+    r = ray_eval_str("(.csv.write ixsU \"/tmp/rf_ixs/out.csv\")");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_error_free(r);
+    TEST_ASSERT_FALSE(ix_exists("/tmp/rf_ixs/out.csv"));
+
+    /* a print of the column prints nothing: the symbols are read first */
+    fflush(stdout);
+    int keep = dup(1);
+    int fd = open("/tmp/rf_ixs/print.out", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    TEST_ASSERT(keep >= 0 && fd >= 0, "redirect");
+    dup2(fd, 1);
+    close(fd);
+    r = ray_eval_str("(println (at ixsU 's))");
+    fflush(stdout);
+    dup2(keep, 1);
+    close(keep);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_error_free(r);
+    TEST_ASSERT_EQ_I(ix_read("/tmp/rf_ixs/print.out", ix_buf, sizeof ix_buf), 0);
+
+    /* the C API: a LIKE over the column through ray_execute */
+    ray_t* u = ray_eval_str("ixsU");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(u));
+    ray_graph_t* g = ray_graph_new(u);
+    ray_op_t* col = ray_scan(g, "s");
+    ray_op_t* lk = ray_like(g, col, ray_const_str(g, "*1700*", 6));
+    ray_t* res = ray_execute(g, ray_count(g, ray_filter(g, col, lk)));
+    TEST_ASSERT_TRUE(RAY_IS_ERR(res));
+    TEST_ASSERT_STR_EQ(ray_err_code(res), "corrupt");
+    ray_error_free(res);
+    ray_graph_free(g);
+    ray_release(u);
+    ray_release(ray_eval_str("(set ixsU 0)"));
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixs\")"));
+    unsetenv("RAY_SYM_INDEX_MIN");
+    PASS();
+}
+
+static bool ix_has(const uint8_t* b, long n, const char* str) {
+    size_t l = strlen(str);
+    for (long i = 0; i + (long)l <= n; i++)
+        if (memcmp(b + i, str, l) == 0) return true;
+    return false;
+}
+
+/* Run `expr` with stdout (and stderr) captured into files; returns the
+ * result and the bytes each received. */
+static ray_t* ix_eval_captured(const char* expr, long* out_n, long* err_n, bool repl) {
+    fflush(stdout); fflush(stderr);
+    int k1 = dup(1), k2 = dup(2);
+    int f1 = open("/tmp/rf_ixs/cap.out", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    int f2 = open("/tmp/rf_ixs/cap.err", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    dup2(f1, 1); dup2(f2, 2); close(f1); close(f2);
+    ray_t* r = NULL;
+    if (repl) {
+        FILE* f = fopen("/tmp/rf_ixs/cap.rfl", "wb");
+        if (f) { fputs(expr, f); fclose(f); }
+        int rc = ray_repl_run_file("/tmp/rf_ixs/cap.rfl");
+        r = ray_i64(rc);
+    } else {
+        r = ray_eval_str(expr);
+    }
+    fflush(stdout); fflush(stderr);
+    dup2(k1, 1); dup2(k2, 2); close(k1); close(k2);
+    *out_n = ix_read("/tmp/rf_ixs/cap.out", ix_buf, sizeof ix_buf);
+    *err_n = ix_read("/tmp/rf_ixs/cap.err", ix_buf2, sizeof ix_buf2);
+    return r;
+}
+
+/* What prints or replies with symbols of a torn symfile: nothing of them
+ * goes out — a dict, a long list, deep nesting, the REPL's display, an IPC
+ * reply. */
+static test_result_t test_domain_index_corrupt_output(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixs\")"));
+    ray_t* r = ray_eval_str(
+        "(.db.splayed.set \"/tmp/rf_ixs/t/\" (table [s] (list (as 'SYM (map (fn [x] "
+        "(concat \"sym_number_\" (as 'STR x))) (til 3000))))) \"/tmp/rf_ixs/sym\")");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    r = ray_eval_str("(count (.db.splayed.get \"/tmp/rf_ixs/t/\" \"/tmp/rf_ixs/sym\"))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    long n = ix_read("/tmp/rf_ixs/sym", ix_sym, sizeof ix_sym);
+    TEST_ASSERT(n > 3 * 4096, "symfile read");
+    memset(ix_sym + 8192, 0, 4096);
+    TEST_ASSERT(ix_write("/tmp/rf_ixs/sym", ix_sym, (size_t)n), "torn symfile");
+    r = ray_eval_str("(set ixoU (.db.splayed.get \"/tmp/rf_ixs/t/\" \"/tmp/rf_ixs/sym\"))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    r = ray_eval_str("(set ixoV (at ixoU 's))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    const char* bad[] = {
+        "(println \"dict:\" (dict [k] (list ixoV)))",
+        "(println (concat (til 2000) (list ixoV)))",
+        "(println (list (list (list (list (list (list ixoV)))))))",
+        "(show (dict [k] (list ixoV)))",
+    };
+    long on = 0, en = 0;
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        r = ix_eval_captured(bad[i], &on, &en, false);
+        if (!RAY_IS_ERR(r) || strcmp(ray_err_code(r), "corrupt") != 0) FAILF("%s: not corrupt", bad[i]);
+        ray_error_free(r);
+        if (on != 0) FAILF("%s: printed %ld bytes", bad[i], on);
+    }
+    /* the REPL's display of a value holding them (its first rows are in
+     * the lost page) */
+    r = ix_eval_captured("(dict [k] (list (drop ixoV 500)))", &on, &en, true);
+    ray_release(r);
+    TEST_ASSERT(!ix_has(ix_buf, on, "sym_number_"), "no symbol displayed");
+    TEST_ASSERT(ix_has(ix_buf, on, "corrupt") || ix_has(ix_buf2, en, "corrupt"),
+                "the REPL says corrupt");
+    /* ... and of the rows before the lost page: the walk of a torn file
+     * cannot tell them good, so they are not shown either */
+    r = ix_eval_captured("(take ixoU 5)", &on, &en, true);
+    ray_release(r);
+    TEST_ASSERT(!ix_has(ix_buf, on, "sym_number_"), "no symbol displayed");
+    TEST_ASSERT(ix_has(ix_buf, on, "corrupt") || ix_has(ix_buf2, en, "corrupt"),
+                "the REPL says corrupt");
+
+    /* an IPC reply */
+    ray_poll_t* cp = ray_test_client_poll();
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT(h >= 0, "connected");
+    ray_t* msg = ray_str("ixoV", 4);
+    ray_t* resp = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(resp);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(resp));
+    TEST_ASSERT_STR_EQ(ray_err_code(resp), "corrupt");
+    ray_error_free(resp);
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    if (cp) ray_test_client_poll_done();
+
+    ray_release(ray_eval_str("(set ixoV 0)"));
+    ray_release(ray_eval_str("(set ixoU 0)"));
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixs\")"));
+    unsetenv("RAY_SYM_INDEX_MIN");
+    PASS();
+}
+
+/* Zero the bytes of records [from, to) of a symfile in place (a torn write
+ * across them). */
+static bool ix_zero_records(const char* path, int64_t from, int64_t to) {
+    long n = ix_read(path, ix_sym, sizeof ix_sym);
+    if (n < 12) return false;
+    size_t o = 12, a = 0, b = 0;
+    for (int64_t i = 0; o + 4 <= (size_t)n; i++) {
+        if (i == from) a = o;
+        if (i == to) { b = o; break; }
+        uint32_t l;
+        memcpy(&l, ix_sym + o, 4);
+        o += 4 + l;
+    }
+    if (!a || b <= a) return false;
+    memset(ix_sym + a, 0, b - a);
+    return ix_write(path, ix_sym, (size_t)n);
+}
+
+/* A torn symfile (records 101..110 zeroed in place after its index was
+ * written) opens corrupt, and nothing reads its symbols: not a concat with
+ * runtime symbols (the runtime LUT), not a join on them, not a save of
+ * them — each fails `corrupt`, naming the file — and the C API's LUT is
+ * NULL. */
+static test_result_t test_domain_index_torn_readers(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixr\")"));
+    ray_t* r = ray_eval_str(
+        "(.db.splayed.set \"/tmp/rf_ixr/t/\" (table [s] (list (as 'SYM (map (fn [x] "
+        "(concat \"sym_number_\" (as 'STR x))) (til 3000))))) \"/tmp/rf_ixr/sym\")");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    r = ray_eval_str("(count (.db.splayed.get \"/tmp/rf_ixr/t/\" \"/tmp/rf_ixr/sym\"))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE(ix_exists("/tmp/rf_ixr/sym.ix"));
+    /* 10 records of 18 bytes: the zeros read as 45 empty records and the walk
+     * comes back in step at record 111 — every count record is walked, the
+     * records end short of the file's end: the walk's checkpoints all agree
+     * with themselves */
+    TEST_ASSERT(ix_zero_records("/tmp/rf_ixr/sym", 101, 111), "torn symfile");
+    r = ray_eval_str("(set ixrU (.db.splayed.get \"/tmp/rf_ixr/t/\" \"/tmp/rf_ixr/sym\"))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    const char* bad[] = {
+        "(at (concat (at ixrU 's) (as 'SYM [\"zz\"])) [150 2999])",
+        "(inner-join [s] ixrU (table [s v] (list (as 'SYM [\"sym_number_5\" \"sym_number_2000\"]) [1 2])))",
+        "(left-join [s] ixrU (table [s v] (list (as 'SYM [\"sym_number_5\" \"sym_number_2000\"]) [1 2])))",
+        "(.db.splayed.set \"/tmp/rf_ixr/t2/\" (table [s] (list (concat (at ixrU 's) (as 'SYM [\"zz\"])))))",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        r = ray_eval_str(bad[i]);
+        if (!RAY_IS_ERR(r) || strcmp(ray_err_code(r), "corrupt") != 0) {
+            if (!RAY_IS_ERR(r)) ray_release(r); else ray_error_free(r);
+            FAILF("%s: not corrupt", bad[i]);
+        }
+        const char* m = ray_error_msg();
+        if (!m || !strstr(m, "/tmp/rf_ixr/sym")) {
+            ray_error_free(r);
+            FAILF("%s: the error does not name the file (%s)", bad[i], m ? m : "none");
+        }
+        ray_error_free(r);
+    }
+    ray_sym_domain_t* dom = ray_sym_domain_open("/tmp/rf_ixr/sym");
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_TRUE(ix_info(dom).corrupt);
+    uint64_t c0 = ray_sym_domain_corruptions();
+    TEST_ASSERT_NULL(ray_sym_domain_runtime_lut(dom));
+    TEST_ASSERT(ray_sym_domain_corruptions() > c0, "counted");
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, "sym_number_2000", 15), -1);
+    ray_sym_domain_release(dom);
+    ray_release(ray_eval_str("(set ixrU 0)"));
+    ray_release(ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_ixr\")"));
+    unsetenv("RAY_SYM_INDEX_MIN");
+    PASS();
+}
+
+/* The domain scenarios that reopen, extend, flush and build lookups, run
+ * once more with every symfile indexed. */
+static test_result_t test_domain_index_scenarios(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    test_result_t (*const runs[])(void) = {
+        test_domain_open_basic, test_domain_raw_pin, test_domain_extend_reopen_flat,
+        test_domain_extend_after_flush, test_domain_flush_append,
+        test_domain_open_position0_validation, test_domain_intern_batch,
+    };
+    for (size_t k = 0; k < sizeof runs / sizeof runs[0]; k++) {
+        test_result_t r = runs[k]();
+        if (r.status != TEST_PASS) { unsetenv("RAY_SYM_INDEX_MIN"); unlink(TMP_IX_PATH); return r; }
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    unlink(TMP_IX_PATH);
+    PASS();
+}
+
+
 const test_entry_t domain_entries[] = {
+    { "domain/index_build_and_use",     test_domain_index_build_and_use,     domain_setup, domain_teardown },
+    { "domain/index_long_strings",      test_domain_index_long_strings,      domain_setup, domain_teardown },
+    { "domain/index_identity",          test_domain_index_identity,          domain_setup, domain_teardown },
+    { "domain/index_rejects_bad",       test_domain_index_rejects_bad,       domain_setup, domain_teardown },
+    { "domain/index_checkpoint_damage", test_domain_index_checkpoint_damage, domain_setup, domain_teardown },
+    { "domain/index_stale_caught",      test_domain_index_stale_caught,      domain_setup, domain_teardown },
+    { "domain/index_torn_file",         test_domain_index_torn_file,         domain_setup, domain_teardown },
+    { "domain/index_torn_open",         test_domain_index_torn_open,         domain_setup, domain_teardown },
+    { "domain/index_corrupt_names_file", test_domain_corrupt_names_file, domain_setup, domain_teardown },
+    { "domain/index_append_unindexed",  test_domain_index_append_unindexed,  domain_setup, domain_teardown },
+    { "domain/index_writers",           test_domain_index_writers,           domain_setup, domain_teardown },
+    { "domain/index_refresh_in_place",  test_domain_index_refresh_in_place,  domain_setup, domain_teardown },
+    { "domain/index_new_file_removes",  test_domain_index_new_file_removes,  domain_setup, domain_teardown },
+    { "domain/index_extend_prefix",     test_domain_index_extend_prefix,     domain_setup, domain_teardown },
+    { "domain/index_query_corrupt",     test_domain_index_query_corrupt,     domain_rt_setup, domain_rt_teardown },
+    { "domain/index_corrupt_stops",     test_domain_index_corrupt_stops,     domain_rt_setup, domain_rt_teardown },
+    { "domain/index_corrupt_output",    test_domain_index_corrupt_output,    domain_rt_setup, domain_rt_teardown },
+    { "domain/index_torn_readers",      test_domain_index_torn_readers,      domain_rt_setup, domain_rt_teardown },
+    { "domain/index_scenarios",         test_domain_index_scenarios,         domain_setup, domain_teardown },
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
     { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },

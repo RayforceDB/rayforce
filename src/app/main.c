@@ -124,6 +124,11 @@ int main(int argc, char** argv) {
     ray_crash_install();
     ray_expr_stats_init();
     ray_idx_stats_init();
+    /* The heap locks what it maps under the watermark against swap-out
+     * (heap_lock in mem/heap.c), within RLIMIT_MEMLOCK: the binary lets it
+     * have the hard limit, not only the soft one.  Here and not in the
+     * runtime: an embedding's process limits are its host's to set. */
+    ray_os_raise_memlock();
     ray_runtime_t* rt = ray_runtime_create(argc, argv);
     if (!rt) { fprintf(stderr, "failed to create runtime\n"); return 1; }
 

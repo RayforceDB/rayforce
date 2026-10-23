@@ -78,6 +78,9 @@
 
 #include <rayforce.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 typedef struct ray_sym_domain_s ray_sym_domain_t;
@@ -133,37 +136,169 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
 
 /* Raw vocabulary access for a FILE domain: the bytes of the entries the
  * file holds, read straight from the mapping — no atom, no lock.  Pin
- * takes an atomically published snapshot of (map, offsets, count).
+ * takes an atomically published snapshot of (map, block table, count); an
+ * entry is found from the checkpoint of its block of 1 << RAY_SYM_INDEX_LOG
+ * entries, once that block is known to match the file (domain.c: a block
+ * is checked on its first read, and the table replaced if it does not
+ * check).
  *
  * LIFETIME: a snapshot stays readable across in-process appends
  * (ray_sym_domain_intern, _batch, flush) for as long as its holder keeps
  * the domain alive.  It does NOT survive a reopen of the same symfile
  * after another process grew it (ray_sym_domain_open on a cached path:
- * the extend frees the mapping and offsets it replaces).  Nothing counts
- * pins, so this is a rule for callers: never hold a snapshot across a
- * call that may reopen (.db.parted.get, splayed reads, ray_sym_domain_open),
- * and never reopen from a thread while another runs a kernel over the
- * domain.  Today every reopen runs on the calling thread between kernels.
+ * the extend frees the mapping and block table it replaces).  Nothing
+ * counts pins, so this is a rule for callers: never hold a snapshot across
+ * a call that may reopen (.db.parted.get, splayed reads,
+ * ray_sym_domain_open), and never reopen from a thread while another runs
+ * a kernel over the domain.  Today every reopen runs on the calling thread
+ * between kernels.
  *
  * Returns false for the runtime domain or an empty file; the caller then
  * resolves through ray_sym_domain_str as before.  Only positions below
  * `count` (the file prefix) are readable this way; runtime-appended
- * positions keep going through ray_sym_domain_str.  Unpin is a no-op kept
- * for symmetry. */
+ * positions keep going through ray_sym_domain_str.  ray_sym_domain_raw_str
+ * returns NULL (and *len 0) for a position out of range, or when the file
+ * is corrupt there — then ray_sym_domain_corruptions grows, and the
+ * evaluation reports `corrupt`.  Unpin is a no-op kept for symmetry. */
+#define RAY_SYM_INDEX_LOG 5   /* a block: 1 << this entries */
 typedef struct {
     const unsigned char* map;
-    const size_t*        offsets;
+    const uint64_t*      ckpt;   /* block k starts at map + ckpt[k] */
+    const uint64_t*      ok;     /* bit k: block k checked (read atomically) */
+    const unsigned char* len;    /* entry i's length, 255 = 255 or longer (or NULL) */
+    const _Atomic(bool)* corrupt; /* the domain's: lengths are then of read records only */
     int64_t              count;
+    void*                blk;    /* the domain's block table */
+    ray_sym_domain_t*    dom;
 } ray_sym_domain_raw_t;
 bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out);
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom);
+const char* ray_sym_domain_raw_str_slow(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len);
+int64_t ray_sym_domain_raw_len_slow(const ray_sym_domain_raw_t* r, int64_t pos);
 static inline const char* ray_sym_domain_raw_str(const ray_sym_domain_raw_t* r,
                                                  int64_t pos, size_t* len) {
-    const unsigned char* rec = r->map + r->offsets[pos];
-    uint32_t l; memcpy(&l, rec, 4);
-    *len = l;
-    return (const char*)rec + 4;
+    if (pos >= 0 && pos < r->count && r->len) {
+        int64_t k = pos >> RAY_SYM_INDEX_LOG;
+        if ((__atomic_load_n(&r->ok[k >> 6], __ATOMIC_ACQUIRE) >> (k & 63)) & 1) {
+            /* a checked block: past the records before the entry by their
+             * lengths; the entry's record must say the length its byte does */
+            const unsigned char* p = r->map + r->ckpt[k];
+            for (int64_t i = pos & ~(int64_t)((1 << RAY_SYM_INDEX_LOG) - 1); i < pos; i++) {
+                uint32_t l = r->len[i];
+                if (l == 255) memcpy(&l, p, 4);
+                p += 4 + (size_t)l;
+            }
+            uint32_t l; memcpy(&l, p, 4);
+            unsigned char e = r->len[pos];
+            if (e < 255 ? l == e : l >= 255) {
+                *len = l;
+                return (const char*)p + 4;
+            }
+        }
+    }
+    return ray_sym_domain_raw_str_slow(r, pos, len);
 }
+/* The length of entry `pos`'s string (-1 where ray_sym_domain_raw_str would
+ * give NULL): from its length byte, without reading the record, unless the
+ * string is 255 bytes or longer — then its record header (4 bytes).  For a
+ * function of a string's length per symbol (strlen per code), so that a
+ * vocabulary's lengths are read and not its strings.
+ *
+ * Limit: the length bytes of an index are checked a block at a time, by
+ * their sum against the next checkpoint (and one by one only when a record
+ * is read: ray_sym_domain_raw_str).  Errors that cancel out inside a block
+ * — one byte too high, another as much too low — pass that check, and this
+ * then answers the wrong length for both entries without a sign.  It takes
+ * an index that does not describe the file it claims to (its identity and
+ * the crcs of the file's first records and last block all
+ * matching); checking each length against its record would read the
+ * records, which is what this is for not doing. */
+static inline int64_t ray_sym_domain_raw_len(const ray_sym_domain_raw_t* r, int64_t pos) {
+    if (pos >= 0 && pos < r->count && r->len) {
+        int64_t k = pos >> RAY_SYM_INDEX_LOG;
+        if ((__atomic_load_n(&r->ok[k >> 6], __ATOMIC_ACQUIRE) >> (k & 63)) & 1 &&
+            r->len[pos] < 255 && !atomic_load_explicit(r->corrupt, memory_order_acquire))
+            return r->len[pos];
+    }
+    return ray_sym_domain_raw_len_slow(r, pos);
+}
+/* The same for any domain and position (the appended ones from their atom). */
+int64_t ray_sym_domain_strlen(ray_sym_domain_t* dom, int64_t pos);
+
+/* Reads of an entry a symfile could not give (it is torn or overwritten),
+ * process-wide.  Every evaluation during which this grows fails `corrupt`
+ * (ray_eval, at each level, so the expression that read the entry fails
+ * and nothing that consumes its value runs), as does ray_execute; output
+ * paths that resolve symbols themselves (print, .csv.write, an IPC reply)
+ * check it before anything leaves.
+ *
+ * By design `corrupt` cannot be caught by `try`: the level that evaluates
+ * the try sees the count grow too and fails in turn — a handler's value,
+ * computed while symbols of the file went unread, is not to be trusted
+ * either.  The count is process-wide: an evaluation fails when ANY domain
+ * (any thread's) fails a read while it runs, so a damaged symfile can fail
+ * an unrelated query that runs at the same moment.  Not lost either way:
+ * the damaged file fails every later read it cannot give. */
+extern _Atomic(uint64_t) ray_g_dom_corruptions;
+static inline uint64_t ray_sym_domain_corruptions(void) {
+    return atomic_load_explicit(&ray_g_dom_corruptions, memory_order_acquire);
+}
+/* An error for an evaluation that saw ray_sym_domain_corruptions grow. */
+ray_t* ray_sym_domain_corrupt_error(void);
+/* True when `v` (a SYM vector, a table, a list of them) holds symbols of a
+ * file domain, whose strings an output path must resolve. */
+bool ray_sym_has_file_domain(ray_t* v);
+/* Output rendered into the temporary file `tmp` goes to `to` only if no
+ * symbol went unread since `c0`: RAY_NULL_OBJ, or `corrupt` and nothing
+ * written.  Closes `tmp` unless it is `to`. */
+ray_t* ray_sym_print_commit(FILE* tmp, FILE* to, uint64_t c0);
+
+/* What the record index did for a FILE domain, for tests: the open took its
+ * blocks from the index file (covering `covered` entries), whether a block's
+ * bytes are checked against its crc, blocks checked on their first read,
+ * tables replaced by a walk, the file found corrupt. */
+typedef struct {
+    bool    from_index;    /* the open took the table from the index file */
+    bool    lens_mapped;   /* the lengths are read from the index file, as needed */
+    int64_t covered;       /* entries the index covered */
+    int64_t checked;       /* blocks of the index checked on first read */
+    int64_t rescued;       /* tables replaced by a walk */
+    bool    corrupt;
+} ray_sym_domain_ix_info_t;
+bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out);
+
+/* What the record index guarantees, and where it stops (domain.c):
+ *   - An index is taken only for the very file it was written for: the
+ *     inode, the modification and status-change times and the size it
+ *     records match the file mapped, and the crcs it keeps of the file's
+ *     first records and last block match.  The status-change time cannot be
+ *     set back by a writer, so an in-place rewrite, even with its
+ *     modification time restored, is not taken for the same file.  Any other
+ *     index — another file of the name, the file grown or rewritten by a
+ *     writer that left the index as it was, an earlier format — is not
+ *     used: the open walks every record once and writes the index anew.
+ *     Where the platform has no such identity (Windows, WASM) every open
+ *     walks.
+ *   - The index holds no crc of the records: a block is checked on its first
+ *     read by its lengths adding up to the next checkpoint, and a record by
+ *     the length it says; a block or a record that does not check replaces
+ *     the table by one walk of the file.  What this does not see: bytes of a
+ *     string changed in place, its length kept, under an index the file's
+ *     identity still matches — only by setting the clock, or on a file
+ *     system whose timestamps are coarser than the time between the index
+ *     write and the rewrite.  ray_sym_domain_raw_len answers from a length
+ *     byte of a checked block without reading the record. */
+
+/* The symfile's record index, `<symfile>.ix` (format in domain.c): written
+ * by the writers of a symfile so that opening it reads neither the records
+ * nor their lengths.  Save: ckpt[k] is the byte offset of the record of
+ * entry k << RAY_SYM_INDEX_LOG, n = ceil(count / (1 << RAY_SYM_INDEX_LOG)),
+ * lens[i] the length of entry i's string (255: 255 or longer), the first
+ * `count` records ending at byte `end`; best effort, and a no-op for a small
+ * file.  Remove: before a new file is made under the name. */
+void ray_sym_domain_index_save(const char* path, const uint64_t* ckpt, int64_t n,
+                               const uint8_t* lens, int64_t count, uint64_t end);
+void ray_sym_domain_index_remove(const char* path);
 
 /* Position of `str` in the domain, or -1 if absent.
  * FILE: builds the reverse index on first call (O(|vocabulary|)). */

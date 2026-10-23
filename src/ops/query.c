@@ -4670,6 +4670,15 @@ static ray_t* count_distinct_src_col(ray_t* tbl, ray_t* inner) {
     return ray_table_col(tbl, inner->i64);
 }
 
+/* Whether the column count_distinct_src_col resolves suits the bounded
+ * count-distinct kernel; one that fails to decode does not (the path that
+ * reads it reports the error). */
+static bool cd_src_bounded_ok(ray_t* tbl, ray_t* inner) {
+    ray_t* c = count_distinct_src_col(tbl, inner);
+    if (c && RAY_IS_ERR(c)) { ray_error_free(c); return false; }
+    return ray_cd_bounded_col_ok(c, true);
+}
+
 static bool sym_names_col(ray_t* tbl, int64_t s);
 
 /* Does a count(distinct) operand the evaluator resolves read none of the
@@ -8436,6 +8445,32 @@ static ray_t* try_count_distinct_v2_rewrite(
      * but its row order isn't.  apply_sort_take is a no-op when the
      * clauses are absent. */
     return apply_sort_take(result, dict_elems, dict_n, asc_id, desc_id, take_id, NULL);
+}
+
+/* Whether the post-group scatter of a select can count every non-agg in
+ * bounded memory straight from the key column (ray_cd_bounded, cdfuse.c):
+ * each one a `(count (distinct col))` over a column the kernel reads, a
+ * single key it reads whose base type is the result key's, and the route
+ * taking it (ray_cd_bounded_preferred, decided on the first count's column).
+ * Then neither the row map nor the per-group slices are built. */
+static bool cd_bounded_scatter_ok(ray_t** nonagg_exprs, int64_t n_nonaggs, ray_t* tbl,
+                                  ray_t* key, ray_t* grp_key, ray_t* sel, int64_t nrows,
+                                  int64_t n_groups) {
+    if (n_nonaggs <= 0) return false;
+    if (!ray_cd_bounded_col_ok(key, false) || !grp_key || !ray_is_vec(grp_key)) return false;
+    int8_t kb = key->type == RAY_MAPCOMMON ? ((ray_t**)ray_data(key))[0]->type
+              : RAY_IS_PARTED(key->type) ? (int8_t)RAY_PARTED_BASETYPE(key->type)
+              : key->type;
+    if (grp_key->type != kb || grp_key->len < n_groups) return false;
+    for (int64_t ni = 0; ni < n_nonaggs; ni++) {
+        ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+        if (!cd_inner || cd_inner->type != -RAY_SYM || (cd_inner->attrs & ATTR_QUOTED))
+            return false;
+        if (!cd_src_bounded_ok(tbl, cd_inner)) return false;
+    }
+    ray_t* first = count_distinct_src_col(tbl, match_count_distinct(nonagg_exprs[0]));
+    if (first && RAY_IS_ERR(first)) { ray_error_free(first); return false; }
+    return ray_cd_bounded_preferred(tbl, key, first, sel, nrows, n_groups);
 }
 
 /* Per-group count(distinct) using the existing OP_COUNT_DISTINCT kernel.
@@ -19919,6 +19954,32 @@ by_dict_done:
             }
 
             if (n_groups > 0 && nrows > 0) {
+                /* Every non-agg a count(distinct col) over one key: count
+                 * them in bounded memory from the key column itself, with
+                 * no row map, no slices and no flattened parted columns. */
+                if (mk_nk <= 1 &&
+                    cd_bounded_scatter_ok(nonagg_exprs, n_nonaggs, tbl, orig_key,
+                                          grp_key, saved_selection, nrows, n_groups)) {
+                    ray_t* cd_err = NULL;
+                    for (int64_t ni = 0; ni < n_nonaggs && !cd_err; ni++) {
+                        ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+                        ray_t* src = ray_table_col(tbl, cd_inner->i64);
+                        ray_t* col = src && RAY_IS_ERR(src) ? src
+                                   : ray_cd_bounded(tbl, orig_key, grp_key, NULL, n_groups,
+                                                    src, saved_selection, nrows);
+                        if (!col) col = ray_error("domain", "select by: count distinct column does not cover the table's rows");
+                        if (RAY_IS_ERR(col)) { cd_err = col; break; }
+                        result = ray_table_add_col(result, nonagg_names[ni], col);
+                        ray_release(col);
+                        if (RAY_IS_ERR(result)) { cd_err = result; result = NULL; }
+                    }
+                    if (cd_err) {
+                        if (result) ray_release(result);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cd_err;
+                    }
+                    goto nonagg_done;
+                }
                 ray_t* scan_key = orig_key;
                 int scan_key_owned = 0;
                 if (RAY_IS_PARTED(scan_key->type) || scan_key->type == RAY_MAPCOMMON) {
@@ -20368,13 +20429,19 @@ by_dict_done:
                  * non-agg shape — including count(distinct) on small
                  * group counts — falls into count_distinct_per_group_buf
                  * which requires idx_buf+offsets+grp_cnt. */
+                /* The bounded kernel (ray_cd_bounded) counts a plain
+                 * column over the row map without the slices either,
+                 * where the slices' row buffers would not fit. */
+                bool cd_bounded_rows = ray_cd_bounded_preferred(tbl, NULL, NULL, NULL, nrows, n_groups);
                 int needs_slice_idx = 0;
                 for (int64_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
                     ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
-                    int simple_cd_global = (cd_inner &&
-                                            cd_inner->type == -RAY_SYM &&
-                                            !(cd_inner->attrs & ATTR_QUOTED) &&
-                                            n_groups > 50000);
+                    int simple_cd = cd_inner && cd_inner->type == -RAY_SYM &&
+                                    !(cd_inner->attrs & ATTR_QUOTED);
+                    if (simple_cd && cd_bounded_rows &&
+                        cd_src_bounded_ok(tbl, cd_inner))
+                        continue;
+                    int simple_cd_global = simple_cd && n_groups > 50000;
                     if (simple_cd_global) {
                         ray_col_meta_t sm;
                         int8_t type = (!ray_env_get_lexical_local(cd_inner->i64) && ray_table_col_meta(tbl, cd_inner->i64, &sm)) ? sm.type : 0;
@@ -20419,19 +20486,30 @@ by_dict_done:
                          * computed expressions use the per-group fallback. */
                         ray_t* src_for_global = NULL;
                         int    src_owned = 0;
-                        /* The column itself is read only for the global-hash
-                         * kernel; the per-group slice path reads it from tbl. */
+                        /* The column itself is read only for the bounded
+                         * kernel and the global-hash kernel; the per-group
+                         * slice path reads it from tbl. */
                         bool cd_col_ref = cd_inner->type == -RAY_SYM &&
                                           !(cd_inner->attrs & ATTR_QUOTED) &&
                                           !ray_env_get_lexical_local(cd_inner->i64) &&
                                           tbl_has_col(tbl, cd_inner->i64);
-                        if (cd_col_ref && n_groups > 50000) {
+                        if (cd_col_ref && (cd_bounded_rows || n_groups > 50000)) {
                             src_for_global = ray_table_col(tbl, cd_inner->i64);
                             if (src_for_global && RAY_IS_ERR(src_for_global)) {
                                 col = src_for_global;      /* the query's error, below */
                                 src_for_global = NULL;
-                            } else if (src_for_global && (RAY_IS_PARTED(src_for_global->type) ||
-                                src_for_global->type == RAY_MAPCOMMON)) {
+                            }
+                        }
+                        if (src_for_global && cd_bounded_rows &&
+                            ray_cd_bounded_col_ok(src_for_global, true)) {
+                            col = ray_cd_bounded(tbl, NULL, NULL, row_gid, n_groups,
+                                                 src_for_global, NULL, nrows);
+                            if (!col && !idx_buf && n_groups <= 50000)
+                                col = ray_error("domain", "select by: count distinct column does not cover the table's rows");
+                        }
+                        if (!col && src_for_global && n_groups > 50000) {
+                            if (RAY_IS_PARTED(src_for_global->type) ||
+                                src_for_global->type == RAY_MAPCOMMON) {
                                 ray_t* flat = query_materialize_parted_col(src_for_global, tbl);
                                 if (!flat || RAY_IS_ERR(flat)) {
                                     col = flat ? flat : ray_error("oom", NULL);

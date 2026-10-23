@@ -25,6 +25,7 @@
 #  define _GNU_SOURCE
 #endif
 #include "symimp.h"
+#include "domain.h"   /* the record index written at the final sync */
 #include "ops/hash.h"   /* ray_hash_bytes: position 0 is "" */
 
 #if defined(RAY_OS_LINUX) || defined(RAY_OS_MACOS) || defined(__linux__) || defined(__APPLE__)
@@ -448,6 +449,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     m->path = (char*)ray_sys_alloc(pl + 1);
     if (!m->path) goto fail;
     memcpy(m->path, path, pl + 1);
+    ray_sym_domain_index_remove(path);   /* describes the file truncated here */
     m->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (m->fd < 0) goto fail;
     /* Address space for the whole file up front: it only grows by ftruncate. */
@@ -485,6 +487,28 @@ fail:
     return NULL;
 }
 
+/* The file's record index (table/domain.h), once it holds its final
+ * records: the offset of the first of every block of them, which this
+ * dictionary knows. */
+static void si_save_index(ray_symimp_t* m, int64_t count, int64_t tail) {
+    int64_t n = (count + ((int64_t)1 << RAY_SYM_INDEX_LOG) - 1) >> RAY_SYM_INDEX_LOG;
+    if (n <= 0) return;
+    uint64_t* ck = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
+    uint8_t* lens = (uint8_t*)ray_sys_alloc((size_t)count);
+    if (ck && lens) {
+        for (int64_t k = 0; k < n; k++) ck[k] = si_off(m, k << RAY_SYM_INDEX_LOG);
+        /* the lengths, from the offsets this dictionary keeps of every record */
+        for (int64_t i = 0; i < count; i++) {
+            uint64_t a = si_off(m, i), b = i + 1 < count ? si_off(m, i + 1) : (uint64_t)tail;
+            uint64_t l = b - a - 4;
+            lens[i] = l < 255 ? (uint8_t)l : (uint8_t)255;
+        }
+        ray_sym_domain_index_save(m->path, ck, n, lens, count, (uint64_t)tail);
+    }
+    ray_sys_free(ck);
+    ray_sys_free(lens);
+}
+
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) {
     if (!m) return RAY_ERR_TYPE;
     pthread_mutex_lock(&m->alock);
@@ -508,7 +532,9 @@ ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) {
         return RAY_OK;
     }
     if (msync(m->map, (size_t)tail, MS_SYNC) != 0 || fsync(m->fd) != 0) return RAY_ERR_IO;
-    return ray_file_sync_dir(m->path);
+    err = ray_file_sync_dir(m->path);
+    if (err == RAY_OK) si_save_index(m, count, tail);
+    return err;
 }
 
 void ray_symimp_stats(ray_symimp_t* m, ray_symimp_stats_t* out) {

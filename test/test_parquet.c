@@ -320,8 +320,8 @@ static test_result_t test_pq_parallel(void) {
 static void pq_remove_native(const char* dir, const char** columns, int n) {
     char path[512];
     for (int i = 0; i < n; i++) { snprintf(path,sizeof(path),"%s/%s",dir,columns[i]); unlink(path); }
-    const char* special[] = {".d",".sym",".sym.lk"};
-    for (int i = 0; i < 3; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
+    const char* special[] = {".d",".sym",".sym.lk",".sym.ix"};
+    for (int i = 0; i < 4; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
     rmdir(dir);
 }
 /* The direct import picks its pass layout from memory; RAY_PQ_PASS_COLS
@@ -2050,7 +2050,7 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
             i += len; lit = i;
         } else i++;
     }
-    if (lit < n) pqx_lit(o, s + lit, n - lit);
+    if (n > lit) pqx_lit(o, s + lit, n - lit);   /* no literal of no data (s may be NULL) */
 }
 /* pqx_page's checksums (PQX_CRC, PQX_CRCFLIP): 0 none; 1 each page's
  * CRC-32 in its header (PageHeader 4); 2 that, and a dictionary page's
