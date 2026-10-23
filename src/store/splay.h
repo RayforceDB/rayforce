@@ -51,6 +51,7 @@ typedef struct {
     ray_err_t cur_err;      /* resolving cur failed: only an inheriting column fails on it */
     uint8_t* gens;          /* resolved generation per column file (ray_alloc_raw), freed by finish */
     int64_t ngens;
+    bool sym_col;           /* per-column symfiles (RAY_SYMFILE_COLUMN); set after begin */
 } ray_splay_write_t;
 
 ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write);
@@ -94,6 +95,26 @@ ray_err_t ray_splay_save_bulk_mode(ray_t* tbl, const char* dir, const char* sym_
                                    ray_compress_t mode);
 ray_err_t ray_splay_save_staged_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
                                           ray_compress_t mode);
+/* The symfile layout of a save.  SHARED (the default): one symfile,
+ * sym_path, holds the vocabulary of every SYM column.  COLUMN: each SYM
+ * column gets a symfile of its own next to its column file,
+ * `<dir>/.<col>.sym` (ray_splay_col_sym_path; dir is the directory the
+ * columns are written to, the selected generation once the table has one),
+ * holding that column's strings only, so a scan of one column reads none
+ * of another's; sym_path is then not written.  The loaders find a column's
+ * own symfile by that name and resolve the column over it, whatever symfile
+ * they were given; a column without one resolves over the shared domain as
+ * before. */
+typedef enum { RAY_SYMFILE_SHARED = 0, RAY_SYMFILE_COLUMN = 1 } ray_symfile_t;
+ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
+                                ray_compress_t mode, ray_symfile_t layout);
+/* The `symfile` option of an options dict (NULL or no key: SHARED): the
+ * symbol 'shared or 'column, anything else a domain error.  Returns NULL or
+ * an owned error. */
+ray_t*    ray_symfile_opt_parse(ray_t* opts, ray_symfile_t* layout);
+/* `<dir>/.<name>.sym` into out; false when it does not fit. */
+bool      ray_splay_col_sym_path(char* out, size_t cap, const char* dir,
+                                 const char* name, size_t name_len);
 ray_t*    ray_splay_load(const char* dir, const char* sym_path);
 ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
 

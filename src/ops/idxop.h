@@ -700,6 +700,20 @@ bool ray_index_bloom_absent(ray_t* col, int64_t key);
  * Floats are intentionally not supported — equality on F32/F64
  * has NaN / -0 semantics the unfused compare kernel handles. */
 ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
+/* ray_index_hash_eq_rowsel for a single-file generation-2 column whose
+ * recorded HASH region is probed where it is mapped, without materializing
+ * the column or copying the region: the root's layout is checked against
+ * the region, every slot, group and offset the probe reads is bounded, and
+ * the group's rows are checked ascending, inside the column, and holding
+ * `key` (read back by range: a region that disagrees with the column is
+ * `corrupt`, naming it).  `key` as for ray_index_hash_eq_rowsel (a SYM key
+ * a nonzero domain id).  1: *sel the selection (an empty one for an absent
+ * key); 0 declined (no such region, a key or type it does not cover, or a
+ * group dense enough for the scan, as ray_index_hash_eq_rowsel declines);
+ * -1: *err owned. */
+int    ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err);
+/* Test hook: probes ray_enc_hash_eq_rowsel answered since process start. */
+uint64_t ray_enc_hash_test_probes(void);
 
 /* Direct equality selection for a fresh part index.  `key` is a numeric
  * value or a column-domain SYM id.  Dense matches remain eligible because

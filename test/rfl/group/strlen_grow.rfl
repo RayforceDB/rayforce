@@ -325,3 +325,32 @@
 (set Rqym (select {from: (select {c: (count s) m: (avg (strlen s)) from: Yq by: g}) where: (> c 1)}))
 (distinct (at Rqy 'b)) -- [16]
 (distinct (at Rqym 'm)) -- [4.0]
+
+;; FILE-domain SYM column (a splayed table's symbol file with its .sym.ix
+;; index): strlen reads the lengths from the index.  Symbols of 0, 1, 5, 254,
+;; 255, 256, 300 and 1000 bytes and multi-byte UTF-8 ones (6, 254, 256, 258
+;; bytes) must give the lengths the in-memory twin (runtime domain) gives,
+;; through the plain vector strlen, the keyless sum, the direct-array group-by
+;; (the ClickBench #28 shape, with a where: and a second select) and the
+;; sparse one.
+(.os.setenv "RAY_SYM_INDEX_MIN" "0") -- "0"
+(.sys.exec "rm -rf /tmp/rfl_strlen_ix")
+(set LNx [0 1 5 254 255 256 300 1000])
+(set VAx (map (fn [n] (raze (take (list "a") n))) LNx))
+(set VUx (map (fn [n] (raze (take (list "é") n))) [3 127 128 129]))
+(set VSx (concat VAx VUx))
+(set NRx 70000)
+(set SYx (as 'SYM (map (fn [i] (at VSx i)) (% (til NRx) (count VSx)))))
+(set Tix (table [k w s] (list (% (til NRx) 3) (* 1000000 (% (til NRx) 5)) SYx)))
+(count (.db.splayed.set "/tmp/rfl_strlen_ix/" Tix)) -- 70000
+(set Fix (.db.splayed.get "/tmp/rfl_strlen_ix/"))
+(count (.sys.exec "ls /tmp/rfl_strlen_ix/.sym.ix")) -- 1
+(all (== (strlen (at Fix 's)) (strlen SYx))) -- true
+(sum (strlen (at Fix 's))) -- 16595145
+(distinct (strlen (at Fix 's))) -- [0Nl 1 5 6 254 255 256 258 300 1000]
+(sum (at (select {t: (sum (strlen s)) from: Fix}) 't)) -- 16595145
+(at (select {from: (select {l: (avg (strlen s)) c: (count s) by: k from: Fix where: (!= s "")}) where: (> c 100)}) 'l) -- (at (select {from: (select {l: (avg (strlen s)) c: (count s) by: k from: Tix where: (!= s "")}) where: (> c 100)}) 'l)
+(at (select {t: (sum (strlen s)) c: (count s) by: k from: Fix}) 't) -- (at (select {t: (sum (strlen s)) c: (count s) by: k from: Tix}) 't)
+(at (select {l: (avg (strlen s)) by: w from: Fix where: (!= s "")}) 'l) -- (at (select {l: (avg (strlen s)) by: w from: Tix where: (!= s "")}) 'l)
+(.sys.exec "rm -rf /tmp/rfl_strlen_ix")
+(.os.setenv "RAY_SYM_INDEX_MIN" "") -- ""

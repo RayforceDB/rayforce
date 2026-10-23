@@ -123,6 +123,9 @@ watermark, a few diagnostic counters and the symbol-table size, all `i64`:
 | `anon-committed` | **Anonymous RAM** the heap has committed: buddy pools, direct blocks and sys blocks (off-heap tables such as the symbol arenas). Spill-file mappings are not counted. The figure checked against `anon-watermark`. |
 | `anon-peak` | High-watermark of `anon-committed` since process start — the peak RAM the workload demanded, spill excluded. |
 | `anon-watermark` | **Spill threshold** in bytes: a new pool, direct or sys block that would push `anon-committed` past it is mapped over a disk spill file instead of anonymous RAM. Set by `-m SIZE` / `--mem SIZE`; by default the RAM limit (physical RAM, or the cgroup memory limit when smaller) less a quarter of it, at least 3 GiB and at most half, left to the page cache. |
+| `locked-bytes` | Bytes of the heap's mappings locked against swap-out (Linux): the mapped size, which is what `RLIMIT_MEMLOCK` counts, not the resident pages — a page is locked when it is first touched. At most the smaller of `anon-watermark` and half the RAM limit. |
+| `lock-failed` | Times the kernel refused a lock, or a page release could not lock its range again, since start. |
+| `lock-skipped` | Bytes, summed since start, that the heap mapped under the watermark but left unlocked: past the bound, past `RLIMIT_MEMLOCK`, or refused. The heap works on, unlocked. |
 | `group-perpart-runs` | Diagnostic: results served by the streaming parted `by:` (GROUP) kernel — one per query, not per partition; a run that falls back to the flatten path is not counted. |
 | `asof-perpart-runs` | Diagnostic: days processed by the streaming parted asof join — one per day in the union of both sides' partitions. |
 | `sort-perpart-runs` | Diagnostic: partitions processed by the streaming parted `asc:` / `desc:` paths (ordered concat of pre-sorted partitions, or per-partition top-k). |

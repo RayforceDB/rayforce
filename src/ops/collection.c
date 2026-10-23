@@ -23,6 +23,7 @@
 
 /*  Collection / higher-order builtins — extracted from eval.c  */
 
+#include "ops/colgather.h"   /* take_table_enc: a window of an encoded column */
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "core/types.h"
@@ -2144,6 +2145,44 @@ static ray_t* parted_col_window(ray_t* tbl, ray_t* col, int64_t start, int64_t c
  * count selects — the head or tail window, or a range — and, when the
  * count wraps past the row count, all rows, then take from those as for a
  * flat column (#855).  `n_obj` was validated by ray_take_fn. */
+#define TAKE_ENC_WINDOW_MAX (INT64_C(1) << 20)
+
+/* (take tbl n) of an encoded column: only the rows taken are read, by
+ * range, so a window of a compressed column does not decode it whole.  NULL
+ * when the slot is plain, a slice, or the take wraps past the end (the
+ * caller takes the plain column). */
+static ray_t* take_table_enc(ray_t* tbl, int64_t i, ray_t* n_obj) {
+    ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, i));
+    if (!enc) return NULL;
+    int64_t nrows = ray_table_nrows(tbl), start, count;
+    if (ray_is_vec(n_obj)) {
+        const int64_t* r = (const int64_t*)ray_data(n_obj);
+        start = r[0];
+        if (start < 0) start = nrows + start;
+        if (start < 0) start = 0;
+        count = start >= nrows ? 0 : r[1] < nrows - start ? r[1] : nrows - start;
+        if (start >= nrows) start = 0;
+    } else {
+        int64_t n = as_i64(n_obj);
+        int64_t abs_n = n < 0 ? -n : n;
+        if (abs_n > nrows) return NULL;
+        start = n >= 0 ? 0 : nrows - abs_n;
+        count = abs_n;
+    }
+    /* A row gather holds 8 bytes of row id a row: past a window of this
+     * size the take is most of the column anyway, and decoding it is cheaper. */
+    if (count > TAKE_ENC_WINDOW_MAX) return NULL;
+    int64_t one = 0;
+    int64_t* ids = count > 0 ? (int64_t*)ray_alloc_raw((size_t)count * sizeof(int64_t)) : &one;
+    if (!ids) return ray_error("oom", NULL);
+    for (int64_t k = 0; k < count; k++) ids[k] = start + k;
+    ray_t* out = NULL;
+    ray_t* err = ray_col_gather_enc(enc, NULL, true, ids, count, &out);
+    if (ids != &one) ray_free_raw(ids);
+    if (err) return err;
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_t* take_table_col(ray_t* tbl, ray_t* col, ray_t* n_obj) {
     if (!col || !(RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
         return ray_take_fn(col, n_obj);
@@ -2191,10 +2230,13 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             ray_t* result = ray_table_new(ncols);
             if (RAY_IS_ERR(result)) return result;
             for (int64_t i = 0; i < ncols; i++) {
-                ray_t* col = ray_table_col_idx(vec, i);
-                if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
                 int64_t name_id = ray_table_col_name(vec, i);
-                ray_t* taken = take_table_col(vec, col, n_obj);
+                ray_t* taken = take_table_enc(vec, i, n_obj);
+                if (!taken) {
+                    ray_t* col = ray_table_col_idx(vec, i);
+                    if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
+                    taken = take_table_col(vec, col, n_obj);
+                }
                 if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
                 result = ray_table_add_col(result, name_id, taken);
                 ray_release(taken);
@@ -2377,10 +2419,13 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         ray_t* result = ray_table_new(ncols);
         if (RAY_IS_ERR(result)) return result;
         for (int64_t i = 0; i < ncols; i++) {
-            ray_t* col = ray_table_col_idx(vec, i);
-            if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name_id = ray_table_col_name(vec, i);
-            ray_t* taken = take_table_col(vec, col, n_obj);
+            ray_t* taken = take_table_enc(vec, i, n_obj);
+            if (!taken) {
+                ray_t* col = ray_table_col_idx(vec, i);
+                if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
+                taken = take_table_col(vec, col, n_obj);
+            }
             if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
             result = ray_table_add_col(result, name_id, taken);
             ray_release(taken);

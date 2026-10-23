@@ -70,6 +70,21 @@ static void sum_i64_update(void* base, size_t stride, const uint32_t* gids,
     });
 }
 
+#if ATOMIC_LLONG_LOCK_FREE == 2
+/* Concurrent form of sum_i64_update: one relaxed wrapping add per live row. */
+static void sum_i64_shared(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid, int64_t n) {
+    const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        __atomic_fetch_add(&((sum_i64_state*)((char*)base + (size_t)gids[i]*stride))->sum,
+                           d[i], __ATOMIC_RELAXED);
+    });
+}
+#define SUM_I64_SHARED .update_shared = sum_i64_shared, .shared_add = true,
+#else
+#define SUM_I64_SHARED
+#endif
+
 static void sum_i64_merge(void* dst, const void* src, acc_arena_t* a) {
     (void)a;
     ((sum_i64_state*)dst)->sum = (int64_t)((uint64_t)((sum_i64_state*)dst)->sum
@@ -85,6 +100,7 @@ static const agg_vtable_t SUM_I64 = {
     .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
     .init = sum_i64_init, .update_batch = sum_i64_update,
     .merge = sum_i64_merge, .finalize = sum_i64_final, .finalize_value = sum_i64_final_value,
+    SUM_I64_SHARED
 };
 
 /* ---- count (type-agnostic over live rows) ---------------------------- */
@@ -97,6 +113,19 @@ static void count_update(void* base, size_t stride, const uint32_t* gids,
     for (int64_t i = 0; i < n; i++)
         ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++;
 }
+#if ATOMIC_LLONG_LOCK_FREE == 2
+/* Concurrent form of count_update: one relaxed add per row. */
+static void count_shared(void* base, size_t stride, const uint32_t* gids,
+                         const void* vals, const ray_valid_t* valid, int64_t n) {
+    (void)vals; (void)valid;
+    for (int64_t i = 0; i < n; i++)
+        __atomic_fetch_add(&((count_state*)((char*)base + (size_t)gids[i]*stride))->n,
+                           1, __ATOMIC_RELAXED);
+}
+#define COUNT_SHARED .update_shared = count_shared,
+#else
+#define COUNT_SHARED
+#endif
 static void count_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; ((count_state*)d)->n += ((const count_state*)s)->n;
 }
@@ -108,6 +137,8 @@ static const agg_vtable_t COUNT_ANY = {
     .state_size = sizeof(count_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
     .init = count_init, .update_batch = count_update,
     .merge = count_merge, .finalize = count_final, .finalize_value = count_final_value,
+    COUNT_SHARED
+    .shared_add = true,
 };
 
 /* ---- non-null count (internal OP_COUNT_NN) ----------------------------

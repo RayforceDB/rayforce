@@ -252,6 +252,7 @@ static inline bool sym_lex_lt(struct ray_sym_domain_s* dom,
         a < raw.count && b < raw.count) {
         pa = ray_sym_domain_raw_str(&raw, a, &la);
         pb = ray_sym_domain_raw_str(&raw, b, &lb);
+        if (!pa || !pb) return a < b;   /* corrupt file: reported by the evaluation */
     } else {
         ray_t* sa = ray_sym_domain_str(dom, a);
         ray_t* sb = ray_sym_domain_str(dom, b);
@@ -9059,6 +9060,14 @@ static inline void da_read_val(const void* ptr, int8_t type, uint8_t attrs,
     }
 }
 
+/* The length of FILE-domain entry `sid` from the pinned index's length
+ * bytes (the string bytes stay unread below 255 bytes); an entry the symfile
+ * cannot give counts 0, the corrupt flag having been raised by the read. */
+static inline int64_t raw_len_or0(const ray_sym_domain_raw_t* raw, int64_t sid) {
+    int64_t l = ray_sym_domain_raw_len(raw, sid);
+    return l < 0 ? 0 : l;
+}
+
 static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
     if (!col || ray_vec_is_null((ray_t*)col, row)) return 0;
     if (col->type == RAY_STR) {
@@ -9070,8 +9079,8 @@ static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
     }
     /* SYM cell: resolve through the COLUMN's domain (sym-domain Phase 2)
      * — sym_elem resolves via the global table, wrong for FILE-domain
-     * columns.  A FILE domain's entries carry their length as a u32
-     * prefix in the mapping: read it off the published snapshot (one
+     * columns.  A FILE domain's index carries each length as a byte (the
+     * record header past 254): read it off the published snapshot (one
      * acquire load) instead of materialising an atom per symbol under
      * the domain lock; positions past the mapped prefix and other domains
      * resolve as before. */
@@ -9079,8 +9088,8 @@ static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
         int64_t sid = ray_read_sym(ray_data((ray_t*)col), row, col->type, col->attrs);
         ray_sym_domain_raw_t raw;
         if (ray_sym_domain_raw_pin(ray_sym_vec_domain((ray_t*)col), &raw) && sid >= 0 && sid < raw.count) {
-            size_t sl;
-            (void)ray_sym_domain_raw_str(&raw, sid, &sl);
+            int64_t sl;
+            sl = raw_len_or0(&raw, sid);
             return (int64_t)sl;
         }
     }
@@ -9096,8 +9105,8 @@ static inline int64_t sym_strlen_raw(const void* data, int64_t row, uint8_t attr
     if (sid == 0) return 0;
     ray_sym_domain_raw_t raw;
     if (ray_sym_domain_raw_pin(dom, &raw) && sid > 0 && sid < raw.count) {
-        size_t sl;
-        (void)ray_sym_domain_raw_str(&raw, sid, &sl);
+        int64_t sl;
+        sl = raw_len_or0(&raw, sid);
         return (int64_t)sl;
     }
     ray_t* s = ray_sym_domain_str(dom, sid);
@@ -9853,8 +9862,8 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
                         const ray_t* scol = c->agg_cols[a];
                         int64_t sid = ray_read_sym(ray_data((ray_t*)scol), r, RAY_SYM, scol->attrs);
                         if (sid > 0 && sid < c->agg_raw[a].count) {
-                            size_t sl;
-                            (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+                            int64_t sl;
+                            sl = raw_len_or0(&c->agg_raw[a], sid);
                             iv = (int64_t)sl;
                         } else {
                             iv = group_strlen_at_cached(scol, r, c->sym_strings, c->sym_count);
@@ -10126,9 +10135,7 @@ static bool sc_vec_answer(const sc_chunk_ctx_t* cc, da_accum_t* acc, uint32_t a,
     if (cc->rule[a] == SC_RULE_SUM) {
         /* only the encodings with a sum rule build a view: a DICT view would
          * check every code against its dictionary and then decode as well */
-        const ray_enc_desc_t* d;
-        if ((err = ray_enccol_chunk_descs_ref(e, u->chunk, &d)) != NULL) { ray_error_free(err); return false; }
-        d += j;
+        const ray_enc_desc_t* d = &ray_enccol_descs(e, u->chunk)[j];
         if (!(d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_FOR_BP ||
               (d->encoding == RAY_ENC_RLE && d->n_nulls == 0))) return false;
         int rc = ray_col_src_vview(s, v, vv, &err);      /* 0 for a materialized column: read in place */
@@ -10317,7 +10324,7 @@ static void scalar_red_chunk_fn(void* ctx, uint32_t wid, int64_t start, int64_t 
  * across all rows). */
 /* strlen of agg column a at row r.  STR: the descriptor's length (a null
  * is the empty string, length 0).  SYM: null is id 0; a FILE-domain entry's
- * length is the u32 prefix in the pinned mapping; anything else resolves
+ * length is its index length byte in the pinned mapping; anything else resolves
  * as group_strlen_at_cached does. */
 RAY_INLINE int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r, int64_t rr,
                                 const bool staged) {
@@ -10328,8 +10335,8 @@ RAY_INLINE int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r, int64_
         int64_t sid = ray_read_sym(c->agg_ptrs[a], rr, RAY_SYM, da_agg_attrs(c, a, staged));
         if (sid == 0) return 0;
         if (c->agg_raw_ok && c->agg_raw_ok[a] && sid > 0 && sid < c->agg_raw[a].count) {
-            size_t sl;
-            (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+            int64_t sl;
+            sl = raw_len_or0(&c->agg_raw[a], sid);
             return (int64_t)sl;
         }
         return sym_strlen_raw(c->agg_ptrs[a], rr, da_agg_attrs(c, a, staged), ray_sym_vec_domain((ray_t*)col));
@@ -10340,8 +10347,8 @@ RAY_INLINE int64_t da_strlen_at(const da_ctx_t* c, uint32_t a, int64_t r, int64_
         int64_t sid = ray_read_sym(ray_data((ray_t*)col), r, RAY_SYM, col->attrs);
         if (sid == 0) return 0;
         if (c->agg_raw_ok && c->agg_raw_ok[a] && sid > 0 && sid < c->agg_raw[a].count) {
-            size_t sl;
-            (void)ray_sym_domain_raw_str(&c->agg_raw[a], sid, &sl);
+            int64_t sl;
+            sl = raw_len_or0(&c->agg_raw[a], sid);
             return (int64_t)sl;
         }
     }
@@ -10592,8 +10599,8 @@ RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
                               int64_t rr, const bool staged) {
     if (sid == 0) return 0;
     if (raw && sid > 0 && sid < raw->count) {
-        size_t sl;
-        (void)ray_sym_domain_raw_str(raw, sid, &sl);
+        int64_t sl;
+        sl = raw_len_or0(raw, sid);
         return (int64_t)sl;
     }
     if (rt && sid > 0 && (uint64_t)sid < c->sym_count) {
@@ -14853,7 +14860,6 @@ static ray_t* sp_walk_key_range(sp_walk_ctx_t* c, int64_t n_scan) {
         if (!c->have_key || mn < c->min_key) c->min_key = mn;
         if (!c->have_key || mx > c->max_key) c->max_key = mx;
         c->have_key = true;
-        src->stats_guard = true;      /* the range arrays are sized from statistics: guard the key */
     }
     return NULL;
 }
@@ -16575,7 +16581,6 @@ da_path:;
                             if (!st.has_minmax) { scan_chunk[ch] = 1; mm_scan = true; continue; }
                             if (st.min < dmin) dmin = st.min;
                             if (st.max > dmax) dmax = st.max;
-                            key_srcs[k]->stats_guard = true;   /* the arrays are sized from statistics */
                         }
                         mm_mins[0] = dmin;
                         mm_maxs[0] = dmax;

@@ -52,8 +52,8 @@ void* ray_sys_alloc(size_t size);
 void* ray_sys_realloc(void* ptr, size_t new_size);
 void  ray_sys_free(void* ptr);
 char* ray_sys_strdup(const char* s);
-void* ray_heap_sys_map(size_t size, bool* spilled);
-void  ray_heap_sys_unmap(void* p, size_t size, bool spilled);
+void* ray_heap_sys_map(size_t size, bool* spilled, bool* locked);
+void  ray_heap_sys_unmap(void* p, size_t size, bool spilled, bool locked);
 
 /* --------------------------------------------------------------------------
  * Global memory accounting.  Two counters give the true runtime picture:

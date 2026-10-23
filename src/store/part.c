@@ -682,8 +682,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         if (!dom) {
             part_cache_sweep(db_root, table_name, seq);
             return ray_error("corrupt",
-                "symfile %s: unreadable or invalid (bad magic, torn record, "
-                "or missing \"\" at position 0)", sym_path);
+                "symfile %s: unreadable or not a symfile", sym_path);
         }
     }
 

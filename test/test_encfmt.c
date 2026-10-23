@@ -1109,7 +1109,7 @@ static test_result_t test_golden_decode_matches(void) {
         uint8_t out[RAY_ENC_VEC * 16]; char pool[RAY_ENC_VEC * 64];
         const char* spool = (v->type == RAY_STR && v->str_pool) ? (const char*)ray_data(v->str_pool) : NULL;
         for (int64_t vec = 0; vec < ray_enc_nvecs(v->len); vec++) {
-            ray_t* err = ray_enccol_decode_vec(e, vec, out, pool, 0, sizeof pool);
+            ray_t* err = ray_enccol_decode_vec(e, vec, out, pool, 0);
             TEST_ASSERT_FMT(err == NULL, "%s vec %lld: %s", name, (long long)vec, err ? ray_err_code(err) : "");
             int vn = ray_enc_vec_len(v->len, vec);
             if (v->type == RAY_STR) {
@@ -1133,7 +1133,7 @@ static test_result_t test_golden_decode_matches(void) {
     ray_t* c = ray_col_mmap(path);
     TEST_ASSERT_FMT(c && !RAY_IS_ERR(c), "fixture %s does not load", sname);
     uint8_t out[RAY_ENC_VEC * 16];
-    ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, out, NULL, 0, 0);
+    ray_t* err = ray_enccol_decode_vec(ray_enccol_of(c), 0, out, NULL, 0);
     TEST_ASSERT_NULL(err);
     for (int k = 0; k < 1024; k++) TEST_ASSERT_EQ_I(out[k], 100 + (k % 16));
     ray_release(c);

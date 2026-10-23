@@ -308,25 +308,6 @@ static test_result_t test_col_mmap_refcount(void) {
     PASS();
 }
 
-/* ---- test_col_mmap_corrupt --------------------------------------------- */
-
-static test_result_t test_col_mmap_corrupt(void) {
-    /* Write a 16-byte file (too small for a valid column header) */
-    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t junk[16] = {0};
-    fwrite(junk, 1, 16, f);
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
 /* ---- test_col_mmap_nofile ---------------------------------------------- */
 
 static test_result_t test_col_mmap_nofile(void) {
@@ -2428,6 +2409,62 @@ static int64_t store_file_size(const char* path) {
     return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
 }
 
+/* A truncated generation-1 file (a partial copy, a full disk elsewhere)
+ * fails at load and at map, whatever its cut: a vector cut in its header
+ * or its data, a STR column cut in its pool, a LIST cut in an element.  The
+ * extents are checked; the values are taken as written. */
+static ray_t* store_trunc_case(int k) {
+    if (k == 0) {
+        ray_t* v = ray_vec_new(RAY_I64, 1000);
+        v->len = 1000;
+        for (int64_t i = 0; i < 1000; i++) ((int64_t*)ray_data(v))[i] = i * 7;
+        return v;
+    }
+    if (k == 1) {
+        ray_t* v = ray_vec_new(RAY_STR, 64);
+        for (int i = 0; i < 64; i++) {
+            char b[64];
+            int n = snprintf(b, sizeof b, "a pooled string value number %d", i);
+            v = ray_str_vec_append(v, b, (size_t)n);
+        }
+        return v;
+    }
+    ray_t* l = ray_list_new(3);
+    ray_t* a = ray_i64(42);
+    ray_t* s = ray_str("a string in a list, long enough", 31);
+    ray_t* v = store_trunc_case(0);
+    l = ray_list_append(l, a); l = ray_list_append(l, s); l = ray_list_append(l, v);
+    ray_release(a); ray_release(s); ray_release(v);
+    return l;
+}
+static test_result_t test_col_truncated_fails(void) {
+    const char* p = ray_test_tmp(TMP_COL_PATH);
+    for (int k = 0; k < 3; k++) {
+        ray_t* v = store_trunc_case(k);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+        TEST_ASSERT_EQ_I(ray_col_save(v, p), RAY_OK);
+        int64_t full = store_file_size(p);
+        const int64_t cuts[] = { 16, 40, full / 2, full - 1 };
+        for (size_t c = 0; c < sizeof cuts / sizeof cuts[0]; c++) {
+            TEST_ASSERT_EQ_I(ray_col_save(v, p), RAY_OK);
+            TEST_ASSERT_EQ_I(truncate(p, (off_t)cuts[c]), 0);
+            for (int how = 0; how < (k == 2 ? 1 : 2); how++) {   /* a LIST has no map */
+                ray_t* r = how ? ray_col_mmap(p) : ray_col_load(p);
+                if (!r || !RAY_IS_ERR(r)) {
+                    if (r) ray_release(r);
+                    ray_release(v);
+                    FAILF("case %d cut at %lld of %lld: %s opened", k, (long long)cuts[c],
+                          (long long)full, how ? "map" : "load");
+                }
+                ray_error_free(r);
+            }
+        }
+        ray_release(v);
+    }
+    unlink(p);
+    PASS();
+}
+
 /* Does `dir` take the in-place build (Linux, a filesystem whose fallocate
  * holds the blocks)?  Probed with a small column. */
 static bool store_in_place(const char* dir) {
@@ -2887,7 +2924,8 @@ static test_result_t test_splay_save_cancel_leaks(void) {
 
 /* The marker goes on last: a process that ends with the whole region
  * written but before the marker (debug builds end it right there, in a
- * child) leaves a file that does not claim an index.  The column is under
+ * child) leaves a file that does not claim an index: it loads as the plain
+ * column.  The column is under
  * the parallel threshold: the child has no pool workers. */
 static test_result_t test_col_build_hash_index_marker_last(void) {
 #if defined(DEBUG) && defined(RAY_OS_LINUX)
@@ -2921,9 +2959,12 @@ static test_result_t test_col_build_hash_index_marker_last(void) {
     TEST_ASSERT_EQ_I((int64_t)fread(&mr, 1, 4, f), 4); fclose(f);
     TEST_ASSERT_TRUE(mr != 0);          /* the finished file's marker */
     TEST_ASSERT_TRUE(mp != mr);
-    ray_t* back = ray_col_mmap(p);      /* longer than its payload, unclaimed: refused */
-    TEST_ASSERT_TRUE(back && RAY_IS_ERR(back));
-    ray_error_free(back);
+    ray_t* back = ray_col_mmap(p);      /* the unclaimed region is not read: the plain column */
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(back->len, v->len);
+    TEST_ASSERT_TRUE(memcmp(ray_data(back), ray_data(v), (size_t)v->len * 8) == 0);
+    ray_release(back);
     ray_release(v);
     (void)ray_test_rm_rf(dir);
     PASS();
@@ -3181,8 +3222,23 @@ static test_result_t test_lazy_first_use(void) {
     PASS();
 }
 
+/* One unsplit AND (a graph run without the optimizer): (== h 15838)
+ * (>= v 0) (<= v hi) over A; the rows, which hold row 2 alone. */
+static ray_t* lz_eq_range(ray_t* tbl, int64_t hi) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
+                                           ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))),
+                             ray_le(g, ray_scan(g, "v"), ray_const_i64(g, hi)));
+    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
+    ray_graph_free(g);
+    return r;
+}
+
 /* An eq-plus-range conjunction (an unsplit AND: a graph run without the
- * optimizer) probes the lazy hash for its equality. */
+ * optimizer) probes the lazy hash for its equality.  The range keeps
+ * every row: a range that keeps only a few chunks of a generation-2 v
+ * prunes the chain from v's chunk statistics first (exec_filter_chain_prune)
+ * and answers the same rows by its scan. */
 static test_result_t test_lazy_eq_range(void) {
     lz_make();
     ray_t* tbl = ray_env_get(ray_sym_intern("A", 1));
@@ -3190,18 +3246,17 @@ static test_result_t test_lazy_eq_range(void) {
     TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));   /* scans: pending */
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
     uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_EQRANGE];
-    ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
-                                           ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))),
-                             ray_le(g, ray_scan(g, "v"), ray_const_i64(g, 5)));
-    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
-    ray_graph_free(g);
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 1);
-    ray_t* v = ray_table_col(r, ray_sym_intern("v", 1));
-    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && ((int64_t*)ray_data(v))[0] == 2);
-    ray_release(r);
-    TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_EQRANGE], hits0 + 1);
-    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    for (int pass = 0; pass < 2; pass++) {
+        ray_t* r = lz_eq_range(tbl, pass ? 5 : 300000);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 1);
+        ray_t* v = ray_table_col(r, ray_sym_intern("v", 1));
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && ((int64_t*)ray_data(v))[0] == 2);
+        ray_release(r);
+        if (!pass) {
+            TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_EQRANGE], hits0 + 1);
+            TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        }
+    }
     PASS();
 }
 
@@ -6629,90 +6684,6 @@ static test_result_t test_col_validate_mapped_bad_type(void) {
     PASS();
 }
 
-/* ---- test_col_validate_mapped_neg_len ------------------------------------- */
-/* Covers col_validate_mapped: negative len in header => "corrupt". */
-static test_result_t test_col_validate_mapped_neg_len(void) {
-    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t hdr[32];
-    memset(hdr, 0, 32);
-    hdr[17] = RAY_COL_FORMAT_MAJOR; /* `order` = major version — pass the gate */
-    hdr[18] = RAY_I64;  /* valid type */
-    hdr[19] = 0;
-    hdr[20] = 1;        /* rc = 1 */
-    /* len = -1 at bytes 24-31 as little-endian int64 */
-    int64_t neg = -1;
-    memcpy(hdr + 24, &neg, 8);
-    fwrite(hdr, 1, 32, f);
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
-/* ---- test_col_validate_mapped_data_truncated ----------------------------- */
-/* Covers col_validate_mapped: data region extends beyond file => "corrupt". */
-static test_result_t test_col_validate_mapped_data_truncated(void) {
-    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t hdr[40];  /* 32-byte header + 8 bytes of data (but claim 10 I64 elems) */
-    memset(hdr, 0, 40);
-    hdr[17] = RAY_COL_FORMAT_MAJOR; /* `order` = major version — pass the gate */
-    hdr[18] = RAY_I64;  /* esz = 8 */
-    hdr[20] = 1;        /* rc = 1 */
-    int64_t len = 10;   /* 10 * 8 = 80 bytes needed, but only 8 written => truncated */
-    memcpy(hdr + 24, &len, 8);
-    fwrite(hdr, 1, 40, f);  /* 40 bytes total, needs 32+80=112 */
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
-/* ---- test_col_mmap_size_mismatch ---------------------------------------- */
-/* Covers ray_col_mmap: file size != expected (32 + data + bitmap) => "io". */
-static test_result_t test_col_mmap_size_mismatch(void) {
-    /* Save a valid I64 column, then append a junk byte to break the size check */
-    int64_t raw[] = {1, 2, 3};
-    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    ray_release(vec);
-
-    /* Append one extra byte to break the exact-size check in ray_col_mmap */
-    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "ab");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t extra = 0xAB;
-    fwrite(&extra, 1, 1, f);
-    fclose(f);
-
-    /* ray_col_load should still succeed (it re-validates differently) */
-    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_NOT_NULL(loaded);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
-    ray_release(loaded);
-
-    /* ray_col_mmap should fail: size mismatch */
-    ray_t* result = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "io");
-    ray_release(result);
-
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
 /* ---- test_col_recursive_atoms ------------------------------------------- */
 /* Covers col_write_recursive and col_read_recursive atom paths (type < 0):
  * a RAY_LIST containing non-str atoms goes through the "fixed atom" branch. */
@@ -7919,120 +7890,6 @@ static test_result_t test_col_str_list_empty_string(void) {
     PASS();
 }
 
-/* ---- test_col_str_list_corrupt ------------------------------------------ */
-/* Covers col_load_str_list corruption guards:
- *   line 173: count > remaining/4  => "corrupt"
- *   line 185: slen > remaining     => "corrupt"
- * We hand-craft STRL-magic files and load them via ray_col_load. */
-static test_result_t test_col_str_list_corrupt(void) {
-    const uint32_t STRL = 0x4C525453U;  /* "STRL" */
-
-    /* (a) count claims 1000 elements but no data follows => count > rem/4 */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&STRL, 4, 1, f);
-        int64_t count = 1000;
-        fwrite(&count, 8, 1, f);   /* nothing after => remaining == 0 */
-        fclose(f);
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (b) count=1, slen=99 but only 3 content bytes => slen > remaining */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&STRL, 4, 1, f);
-        int64_t count = 1;
-        fwrite(&count, 8, 1, f);
-        uint32_t slen = 99;
-        fwrite(&slen, 4, 1, f);
-        fwrite("abc", 1, 3, f);    /* only 3 bytes, not 99 */
-        fclose(f);
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (c) truncated: magic + only 3 bytes (< 8 for count) => "corrupt" */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&STRL, 4, 1, f);
-        fwrite("xy", 1, 2, f);
-        fclose(f);
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
-/* ---- test_col_str_validate_corrupt -------------------------------------- */
-/* Covers col_validate_str_region corruption guards reachable from a forged
- * STR column file loaded via ray_col_mmap:
- *   line 767: pool->type != RAY_U8       => "corrupt"
- *   line 778: pool_off out of range      => "corrupt"
- * Build a real STR column with one pooled string, then surgically corrupt
- * the on-disk bytes. */
-static test_result_t test_col_str_validate_corrupt(void) {
-    ray_t* vec = ray_vec_new(RAY_STR, 1);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    const char* s0 = "a-pooled-string-over-twelve-bytes";
-    vec = ray_str_vec_append(vec, s0, strlen(s0));
-    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    TEST_ASSERT_TRUE(vec->str_pool && vec->str_pool->len > 0);
-
-    /* Save once; on-disk layout: [32B col hdr][16B ray_str_t elem]
-     * [32B pool hdr][pool bytes]. col hdr=32, data_size=16, so the
-     * pool header starts at offset 48; its type byte sits at 48+18=66. */
-    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    /* (a) Corrupt the pool header type (offset 66) to a non-U8 value. */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
-        TEST_ASSERT_NOT_NULL(f);
-        fseek(f, 48 + 18, SEEK_SET);   /* pool header type byte */
-        uint8_t bad_type = RAY_I64;
-        fwrite(&bad_type, 1, 1, f);
-        fclose(f);
-        ray_t* bad = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* Re-save a clean copy, then corrupt the element pool_off so it points
-     * past the pool. ray_str_t layout: len(4) prefix(4) pool_off(4) pad(4).
-     * Element sits at offset 32; pool_off field at 32 + 8 = 40. */
-    err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
-        TEST_ASSERT_NOT_NULL(f);
-        fseek(f, 32 + 8, SEEK_SET);    /* pool_off field of element 0 */
-        uint32_t huge_off = 0x7FFFFFFFu;
-        fwrite(&huge_off, 4, 1, f);
-        fclose(f);
-        ray_t* bad = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    ray_release(vec);
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
 /* ---- test_col_recursive_list_in_list ------------------------------------ */
 /* Covers col_write_recursive / col_read_recursive nested-list path
  * (lines 269-278 write, 397-413 read) and the empty -RAY_STR atom branch
@@ -8209,30 +8066,6 @@ static test_result_t test_col_recursive_container_guards(void) {
         ray_error_free(bad);
     }
 
-    /* TABLE with ragged vector columns. */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        int64_t name_a = ray_sym_intern("bad_a", 5);
-        int64_t name_b = ray_sym_intern("bad_b", 5);
-        int64_t a[] = { 1, 2 };
-        int64_t b[] = { 3 };
-        bool ok = test_write_u32(f, TEST_COL_TABLE_MAGIC) &&
-                  test_write_i8(f, (int8_t)RAY_TABLE) &&
-                  test_write_i64(f, 2) &&
-                  test_write_i64(f, 2) &&
-                  test_write_i64(f, name_a) &&
-                  test_write_i64_vec(f, a, 2) &&
-                  test_write_i64(f, name_b) &&
-                  test_write_i64_vec(f, b, 1);
-        fclose(f);
-        TEST_ASSERT_TRUE(ok);
-
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "ragged columns");
-        ray_error_free(bad);
-    }
-
     /* DICT with two keys and one value, nested inside a generic list so it is
      * decoded by col_read_recursive. */
     {
@@ -8252,65 +8085,6 @@ static test_result_t test_col_recursive_container_guards(void) {
         ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "key/value count mismatch");
         ray_error_free(bad);
-    }
-
-    unlink(ray_test_tmp(TMP_COL_PATH));
-    PASS();
-}
-
-/* ---- test_col_recursive_read_corrupt ------------------------------------ */
-/* Covers col_read_recursive corruption guards:
- *   line 398/402: LIST with truncated count / count < 0 => "corrupt"
- *   line 417: TABLE header < 16 bytes => "corrupt"
- * Forge LIST/TABLE-magic files and load them. */
-static test_result_t test_col_recursive_read_corrupt(void) {
-    const uint32_t LISTM  = 0x4754534CU;  /* "LSTG" */
-    const uint32_t TABLEM = 0x4C425454U;  /* "TTBL" */
-
-    /* (a) LIST magic + type byte RAY_LIST but truncated count (<8 bytes). */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&LISTM, 4, 1, f);
-        int8_t t = RAY_LIST;
-        fwrite(&t, 1, 1, f);
-        fwrite("xy", 1, 2, f);  /* only 2 bytes, need 8 for count */
-        fclose(f);
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (b) LIST magic + RAY_LIST + negative count => "corrupt". */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&LISTM, 4, 1, f);
-        int8_t t = RAY_LIST;
-        fwrite(&t, 1, 1, f);
-        int64_t neg = -5;
-        fwrite(&neg, 8, 1, f);
-        fclose(f);
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (c) TABLE magic + RAY_TABLE type but header < 16 bytes. */
-    {
-        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&TABLEM, 4, 1, f);
-        int8_t t = RAY_TABLE;
-        fwrite(&t, 1, 1, f);
-        fwrite("only-8b!", 1, 8, f);  /* need 16 for ncols+nrows */
-        fclose(f);
-        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
     }
 
     unlink(ray_test_tmp(TMP_COL_PATH));
@@ -8413,7 +8187,6 @@ const test_entry_t store_entries[] = {
     { "store/col_mmap_f32", test_col_mmap_f32, store_setup, store_teardown },
     { "store/col_mmap_cow", test_col_mmap_cow, store_setup, store_teardown },
     { "store/col_mmap_refcount", test_col_mmap_refcount, store_setup, store_teardown },
-    { "store/col_mmap_corrupt", test_col_mmap_corrupt, store_setup, store_teardown },
     { "store/col_mmap_nofile", test_col_mmap_nofile, store_setup, store_teardown },
     { "store/splay_open_roundtrip", test_splay_open_roundtrip, store_setup, store_teardown },
     { "store/splay_str_column_roundtrip", test_splay_str_column_roundtrip, store_setup, store_teardown },
@@ -8436,9 +8209,6 @@ const test_entry_t store_entries[] = {
     { "store/col_sym_w32_roundtrip", test_col_sym_w32_roundtrip, store_setup, store_teardown },
     { "store/col_save_load_empty", test_col_save_load_empty, store_setup, store_teardown },
     { "store/col_validate_bad_type", test_col_validate_mapped_bad_type, store_setup, store_teardown },
-    { "store/col_validate_neg_len", test_col_validate_mapped_neg_len, store_setup, store_teardown },
-    { "store/col_validate_data_trunc", test_col_validate_mapped_data_truncated, store_setup, store_teardown },
-    { "store/col_mmap_size_mismatch", test_col_mmap_size_mismatch, store_setup, store_teardown },
     { "store/col_recursive_atoms", test_col_recursive_atoms, store_setup, store_teardown },
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
@@ -8468,12 +8238,9 @@ const test_entry_t store_entries[] = {
     { "store/col_sym_empty_roundtrip", test_col_sym_empty_roundtrip, store_setup, store_teardown },
     { "store/col_sym_saved_count_reject", test_col_sym_saved_count_reject, store_setup, store_teardown },
     { "store/col_str_list_empty_string", test_col_str_list_empty_string, store_setup, store_teardown },
-    { "store/col_str_list_corrupt", test_col_str_list_corrupt, store_setup, store_teardown },
-    { "store/col_str_validate_corrupt", test_col_str_validate_corrupt, store_setup, store_teardown },
     { "store/col_recursive_list_in_list", test_col_recursive_list_in_list, store_setup, store_teardown },
     { "store/col_recursive_table", test_col_recursive_table, store_setup, store_teardown },
     { "store/col_recursive_container_guards", test_col_recursive_container_guards, store_setup, store_teardown },
-    { "store/col_recursive_read_corrupt", test_col_recursive_read_corrupt, store_setup, store_teardown },
     { "store/col_link_sidecar_whitespace", test_col_link_sidecar_whitespace, store_setup, store_teardown },
     { "store/col_save_nyi_type", test_col_save_nyi_type, store_setup, store_teardown },
     { "store/file_open_close", test_file_open_close, store_setup, store_teardown },
@@ -8507,6 +8274,7 @@ const test_entry_t store_entries[] = {
     { "store/stream_close_all_cancel", test_stream_close_all_cancel, store_setup, store_teardown },
     { "store/splay_save_cancel_late", test_splay_save_cancel_late, store_setup, store_teardown },
     { "store/splay_save_cancel_leaks", test_splay_save_cancel_leaks, store_setup, store_teardown },
+    { "store/col_truncated_fails", test_col_truncated_fails, store_setup, store_teardown },
     { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },

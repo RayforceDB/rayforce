@@ -344,7 +344,7 @@ int64_t ray_heap_spill_discard_count(void);
 typedef struct {
     size_t map_size;      /* total mmap'd bytes */
     int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
-    int    _pad0;
+    int    locked;        /* locked against swap-out (heap_lock) */
     char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
     char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*)];
 } ray_direct_hdr_t;
@@ -394,16 +394,35 @@ int64_t ray_heap_anon_peak(void);
  * to the default, ray_sys_ram_limit() less the page-cache room). */
 int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
+/* Locking against swap-out (heap_lock in heap.c): the bytes of the heap's
+ * mappings locked now; the times the kernel refused a lock, or a release
+ * could not lock a range again; and the bytes left unlocked — past the
+ * bound, past RLIMIT_MEMLOCK, or refused.  All 0 where nothing is locked
+ * (not Linux, RAY_HEAP_MLOCK=0). */
+/* Locking on or off (RAY_HEAP_MLOCK=0 sets it off at the first lock); the
+ * setter, for tests, returns what it was. */
+bool    ray_heap_set_lock(bool on);
+int64_t ray_heap_locked_bytes(void);
+int64_t ray_heap_lock_failures(void);
+int64_t ray_heap_lock_skipped(void);
 /* The RAM a query may plan for (sizing gates, cache budgets): the watermark
  * when one was set (-m), else ray_sys_ram_limit().  Unlike the default
  * watermark it does not leave the page-cache room, which decides where new
  * memory goes, not how much a query may hold. */
 int64_t ray_heap_mem_budget(void);
+/* Committed anonymous bytes the calling thread's heap can reuse without
+ * committing more (free blocks in its anonymous pools, the direct-block
+ * cache): what a working-set planner adds back to the watermark's room. */
+int64_t ray_heap_anon_reusable(void);
 /* Release every block held by the direct-allocation reuse cache back to
  * the kernel (their committed-RAM accounting drops with them).  The cache
  * self-drains under watermark pressure; this is for tests and explicit
  * memory trimming. */
 void    ray_heap_direct_cache_drain(void);
+/* Unlock what the heap keeps locked but no longer uses: the direct-block
+ * cache's blocks (they stay cached).  (.sys.gc) and the idle decay call it;
+ * an empty pool is unlocked when it is parked. */
+void    ray_heap_unlock_idle(void);
 
 /* --------------------------------------------------------------------------
  * Pool header: first min-block (64B) of each self-aligned pool.
@@ -481,6 +500,9 @@ typedef struct {
     uint8_t  discarded : 1;  /* parked spill pool whose pages were discarded
                               * since it was last in use
                               * (heap_spill_pools_discard) */
+    uint8_t  locked    : 1;  /* locked against swap-out (heap_lock) */
+    uint8_t  relock    : 1;  /* unlocked while parked; to be locked again
+                              * once in service (heap_relock_pools) */
 } ray_pool_entry_t;
 
 /* --------------------------------------------------------------------------

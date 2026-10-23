@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "ops/colgather.h"   /* fmt_enc_window: the shown rows of an encoded column */
 #include "core/timespan.h"
 #include "lang/format.h"
 #include "lang/env.h"
@@ -1065,6 +1066,34 @@ static ray_t* fmt_col_idx(fmt_buf_t* b, ray_t* tbl, int64_t ci) {
     return c;
 }
 
+/* The shown rows of an encoded column ci: the first `half` rows and the
+ * last `height - half`, gathered by range into a vector of `height` rows,
+ * so a display of a compressed table reads what it shows instead of
+ * decoding every column whole.  NULL when the slot is plain or a slice, or
+ * every row is shown (the caller takes the column); NULL with b->err set on
+ * a failed read. */
+static ray_t* fmt_enc_window(fmt_buf_t* b, ray_t* tbl, int64_t ci, int64_t nrows,
+                             int64_t height, int64_t half) {
+    if (height >= nrows) return NULL;
+    ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, ci));
+    if (!enc) return NULL;
+    int64_t ids[FMT_TABLE_MAX_HEIGHT];
+    if (height > FMT_TABLE_MAX_HEIGHT) return NULL;
+    for (int64_t r = 0; r < height; r++) ids[r] = r < half ? r : nrows - height + r;
+    ray_t* out = NULL;
+    ray_t* err = ray_col_gather_enc(enc, NULL, true, ids, height, &out);
+    if (err) {
+        const char* code = ray_err_code(err);
+        const char* msg  = ray_error_msg();
+        snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
+        snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
+        ray_error_free(err);
+        b->err = true; b->err_msg = "column failed to load";
+        return NULL;
+    }
+    return out;
+}
+
 static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
@@ -1305,7 +1334,8 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         }
 
         /* Column type */
-        ray_t* col_vec = fmt_col_idx(b, tbl, ci);
+        ray_t* col_win = fmt_enc_window(b, tbl, ci, nrows, table_height, table_height / 2);
+        ray_t* col_vec = col_win ? col_win : b->err ? NULL : fmt_col_idx(b, tbl, ci);
         if (b->err) {
             for (int64_t k = 0; k <= ci; k++) if (name_refs[k]) ray_release(name_refs[k]);
             if (heap_alloc) {
@@ -1375,6 +1405,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
             if (cell_dw > max_w) max_w = cell_dw;
         }
+        if (col_win) ray_release(col_win);
 
         col_widths[ci] = max_w + 2; /* +2 for padding (1 space each side) */
     }

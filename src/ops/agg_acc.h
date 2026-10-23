@@ -82,6 +82,10 @@ typedef struct {
     /* Release heap state owned by a per-group state slab. NULL for ACC_STREAMING.
      * The engine calls this on every init'd state once it won't be used again. */
     void   (*destroy)(void* state);
+    /* update_shared is an unconditional atomic add: every row writes, so the
+     * extrema sample (agg_shared_sample) cannot favour it, and only a plan too
+     * wide for per-worker slabs (dense_plan_t.wide) runs it. */
+    bool   shared_add;
 } agg_vtable_t;
 
 #endif /* RAY_OPS_AGG_ACC_H */
