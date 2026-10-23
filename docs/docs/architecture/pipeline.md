@@ -169,7 +169,7 @@ Element-wise operation subtrees are compiled to flat bytecode at **execution tim
 - **Registers**: up to 16 slots (`EXPR_MAX_REGS`), each holding a typed lane — `REG_SCAN` (column slice), `REG_CONST` (broadcast scalar), or `REG_SCRATCH` (computed intermediate).
 - **Instructions**: up to 48 opcodes (`EXPR_MAX_INS`) covering arithmetic, comparisons, casts, and logical operations.
 - **Morsel evaluation**: the compiled program is evaluated one morsel at a time (1024 rows) in per-worker, arena-allocated scratch buffers. No full-length intermediate vectors are materialized.
-- **Parallelism**: subtrees covering ≥ 65,536 rows (`RAY_PARALLEL_THRESHOLD`) are dispatched across worker threads, each thread processing its own morsel slice independently.
+- **Parallelism**: eligible compiled subtrees can dispatch data-parallel ranges across worker threads, each processing its own morsel slice. A common minimum is 65,536 rows (`RAY_PARALLEL_THRESHOLD`); the chosen operator, available workers and dispatch-safety guards also determine whether work runs in parallel. This does not parallelize arbitrary Rayfall callbacks.
 - **Parted-segment aware**: for partitioned tables, column pointers are rebound per segment at evaluation time — zero-copy, no gather.
 
 **Null handling.** Nullable integer columns are sentinel-normalized at morsel load: `NULL_I32`/`NULL_I16` are widened to `NULL_I64` in `i64` lanes, or to `NaN` in `f64` lanes. Per-instruction null-aware kernel variants are selected at compile time (sentinel-checking `i64` arithmetic and comparisons, sentinel-mapping casts). F64 `NaN`-nulls propagate through arithmetic natively. Output vectors carry `RAY_ATTR_HAS_NULLS` conservatively. Null-free programs compile to the identical instruction stream as non-nullable inputs — no null checks on the fast path.
@@ -203,9 +203,13 @@ This three-tier scheme means that fully-passing or fully-failing morsels (which 
 
 ### Thread Pool
 
-Rayforce uses a global thread pool (`ray_pool_t`) for parallel execution. Queries with more than `RAY_PARALLEL_THRESHOLD` (64 * 1024 = 65,536) elements are dispatched across worker threads. Each thread processes `RAY_DISPATCH_MORSELS` (8) morsels at a time to amortize scheduling overhead.
+Rayforce uses a global thread pool (`ray_pool_t`) for eligible vector builtins and query operators. Many kernels use `RAY_PARALLEL_THRESHOLD` (64 * 1024 = 65,536) elements as a minimum and batch `RAY_DISPATCH_MORSELS` (8) morsels to amortize scheduling overhead. Eligibility and dispatch geometry are operator-specific; worker availability and safety guards (including avoiding nested dispatch) can keep work serial even above a size threshold.
+
+This is **kernel parallelism**, not automatic parallel evaluation of language functions. `map` and `pmap` currently invoke their callbacks sequentially on the caller's VM; `pmap` is an alias for `map`. A builtin or query inside a callback may itself use eligible parallel kernels. Increasing `-c` does not turn an interpreted parameter sweep into concurrent lambda calls. See [Higher-order functions](../language/math.md#pmap-f-x) and [Multiple Instances](../guides/instances.md).
 
 Each dispatch splits its tasks into one contiguous range per worker (the main thread included); a worker runs its range in order and, once it is empty, steals half of another worker's remaining range from the tail, so an idle thread never waits on a busy one and the rows a worker touches are sequential. Tasks of one dispatch may therefore run in any order and on any worker: operators place results by task index, and any early stop (a `take:` cutoff, a top-N bound) is derived from row positions or values, never from "the earlier tasks have run". The scheduler is selected once at pool creation (`RAY_POOL_STEAL`, default `1`; `0` restores the shared claim cursor for A/B comparison) and `RAY_POOL_TRACE=1` prints the own-versus-stolen task histogram per worker to stderr at pool destroy; see [REPL Reference](../language/repl.md#environment-variables).
+
+The default pool has one thread per CPU of the process affinity mask (Linux; the online CPU count elsewhere), or per CPU of a cgroup CPU quota, rounded up, when that is smaller. Threads are not tied to CPUs: the scheduler places them within the mask.
 
 ### Radix-Partitioned Hash Join
 

@@ -962,6 +962,7 @@ done:
 
 /* ht_heads is accessed atomically from multiple workers during join build.
  * Using _Atomic(uint32_t)* for C11-compliant atomic access. */
+#define JHT_MIN_CAP 256u
 #define JHT_EMPTY UINT32_MAX  /* sentinel for empty HT slot/chain end */
 
 typedef struct {
@@ -1036,7 +1037,7 @@ typedef struct {
 } join_probe_ctx_t;
 
 /* Pass 2a: count matches per morsel */
-static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1059,7 +1060,7 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
             continue;
         }
 
-        if (l + 8 < row_end) {
+        if (prefetch_heads && l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
@@ -1077,8 +1078,16 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
     c->morsel_counts[tid] = count;
 }
 
+/* Compile both modes from one body; select once per pass, not per row. */
+static void join_count_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, true);
+}
+static void join_count_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, false);
+}
+
 /* Pass 2b: fill match pairs using pre-computed offsets */
-static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1108,7 +1117,7 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
             continue;
         }
 
-        if (l + 8 < row_end) {
+        if (prefetch_heads && l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
@@ -1131,6 +1140,14 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
             off++;
         }
     }
+}
+
+/* Compile both modes from one body; select once per pass, not per row. */
+static void join_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, true);
+}
+static void join_fill_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, false);
 }
 
 /* Segment count of a parted table = length of any parted column's segs
@@ -1541,7 +1558,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
 
 chained_ht_fallback:;
     /* ── Chained HT path (small joins / radix OOM fallback) ────────── */
-    uint64_t ht_cap64 = 256;
+    uint64_t ht_cap64 = JHT_MIN_CAP;
     uint64_t target = (uint64_t)right_rows * 2;
     while (ht_cap64 < target) ht_cap64 *= 2;
     if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
@@ -1679,12 +1696,16 @@ chained_ht_fallback:;
         .nullfree    = keys_nullfree,
     };
 
+    /* Minimum heads occupy only 1 KiB: choose no-lookahead callbacks here.
+     * Bodies share their implementation; constant modes remove the row-loop
+     * capacity decision instead of relying on compiler loop unswitching. */
+    const ray_pool_fn count_probe = ht_cap > JHT_MIN_CAP ? join_count_fn : join_count_tiny_fn;
     /* 2a: Count matches per morsel */
     if (pool && n_tasks > 1)
-        ray_pool_dispatch_n(pool, join_count_fn, &probe_ctx, n_tasks);
+        ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
     else
         for (uint32_t t = 0; t < n_tasks; t++)
-            join_count_fn(&probe_ctx, 0, t, t + 1);
+            count_probe(&probe_ctx, 0, t, t + 1);
 
     /* Prefix sum → morsel_offsets (reuse counts array as offsets) */
     pair_count = 0;
@@ -1707,11 +1728,12 @@ chained_ht_fallback:;
     probe_ctx.r_idx = r_idx;
 
     if (pair_count > 0) {
+        const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP ? join_fill_fn : join_fill_tiny_fn;
         if (pool && n_tasks > 1)
-            ray_pool_dispatch_n(pool, join_fill_fn, &probe_ctx, n_tasks);
+            ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
         else
             for (uint32_t t = 0; t < n_tasks; t++)
-                join_fill_fn(&probe_ctx, 0, t, t + 1);
+                fill_probe(&probe_ctx, 0, t, t + 1);
     }
 
     CHECK_CANCEL_GOTO(pool, join_cleanup);
@@ -1761,6 +1783,17 @@ join_gather:;
      * indices), falling back to per-column gather for nullable RIGHT columns. */
     int64_t left_ncols = ray_table_ncols(left_table);
     int64_t right_ncols = ray_table_ncols(right_table);
+    /* Share left columns only when the LEFT join's actual mapping preserves
+     * every left row in order. Cardinality alone is not sufficient: radix
+     * partitioning can reorder even a one-to-one join's output.
+     * Retained columns already carry their nulls, pools and symbol domains;
+     * do not rewrite metadata on these shared objects below. */
+    bool left_identity = join_type == 1 && pair_count == left_rows;
+    if (left_identity) {
+        for (int64_t i = 0; i < pair_count; i++) {
+            if (l_idx[i] != i) { left_identity = false; break; }
+        }
+    }
     result = ray_table_new(left_ncols + right_ncols);
     if (!result || RAY_IS_ERR(result)) goto join_cleanup;
 
@@ -1802,9 +1835,17 @@ join_gather:;
             result = col;
             goto join_cleanup;
         }
-        ray_t* new_col = col->type == RAY_LIST
-            ? join_gather_list_col(col, l_idx, pair_count)
-            : col_vec_new(col, pair_count);
+        ray_t* new_col;
+        /* Slice COW copies only its header, leaving the parent shared.
+         * Preserve the old independent gather for this representation. */
+        if (left_identity && !(col->attrs & RAY_ATTR_SLICE)) {
+            ray_retain(col);
+            new_col = col;
+        } else {
+            new_col = col->type == RAY_LIST
+                ? join_gather_list_col(col, l_idx, pair_count)
+                : col_vec_new(col, pair_count);
+        }
         if (!new_col || RAY_IS_ERR(new_col)) {
             ray_t* err = new_col ? new_col : ray_error("oom", NULL);
             for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
@@ -1813,7 +1854,7 @@ join_gather:;
             goto join_cleanup;
         }
         if (col->type == RAY_LIST) l_has_list = true;
-        else new_col->len = pair_count;
+        else if (new_col != col) new_col->len = pair_count;
         l_out_cols[l_out_count] = new_col;
         l_src_cols[l_out_count] = col;
         l_out_names[l_out_count] = ray_table_col_name(left_table, c);
@@ -1863,7 +1904,7 @@ join_gather:;
     if (pair_count > 0) {
         /* Left columns: multi_gather (non-nullable for INNER/LEFT) */
         bool l_nullable = (join_type == 2);  /* only FULL OUTER */
-        if (!l_nullable && !l_has_list &&
+        if (!left_identity && !l_nullable && !l_has_list &&
             l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
             multi_gather_ctx_t mgctx = { .idx = l_idx, .ncols = l_out_count };
             for (int64_t si = 0; si < l_out_count; si++) {
@@ -1877,10 +1918,11 @@ join_gather:;
             else
                 multi_gather_fn(&mgctx, 0, 0, pair_count);
         } else {
-            /* Fall back to per-column gather for nullable or single column */
+            /* Gather newly allocated columns, including slice fallbacks.
+             * Retained identity outputs already have their source values. */
             for (int64_t si = 0; si < l_out_count; si++) {
                 ray_t* col = l_src_cols[si];
-                if (col->type != RAY_LIST) {
+                if (l_out_cols[si] != col && col->type != RAY_LIST) {
                     gather_ctx_t gctx = {
                         .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
                         .esz = col_esz(col), .nullable = l_nullable,
@@ -1930,6 +1972,7 @@ join_gather:;
     {
         for (int64_t si = 0; si < l_out_count; si++) {
             ray_t* col = l_src_cols[si];
+            if (l_out_cols[si] == col) continue;  /* retained, metadata intact */
             col_propagate_str_pool(l_out_cols[si], col);
             if (col->type != RAY_LIST)
                 col_propagate_nulls_gather(l_out_cols[si], col, l_idx, pair_count);

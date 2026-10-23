@@ -278,12 +278,20 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx, uint32_t n
 
 /* Global pool lifecycle (lazy singleton) */
 ray_pool_t* ray_pool_get(void);
+/* Threads of the global pool, main included: its size when it exists, else
+ * the size a default one would get (nothing is created). */
+uint32_t ray_pool_size(void);
 
 /* Public pool init/destroy (moved from rayforce.h) */
 ray_err_t ray_pool_init(uint32_t n_workers);
 /* Initialize by total execution participants, including the main thread.
  * Pass 0 to auto-detect. Used by the CLI, where -c is a total-core count. */
 ray_err_t ray_pool_init_total(uint32_t total_workers);
+
+/* The default pool size, main included: one thread per CPU the process may
+ * run on (ray_cpu_set_count), or per CPU of a cgroup CPU quota, rounded up,
+ * when that is smaller (docker --cpus, systemd CPUQuota=). */
+uint32_t ray_pool_default_total(void);
 void     ray_pool_destroy(void);
 
 /* Call fn on the heap of every worker of the live singleton pool; nothing

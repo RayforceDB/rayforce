@@ -28,6 +28,12 @@
 (split "" "--") -- (list "")
 (split "--" "--") -- (list "" "")
 (split "--a--" "--") -- (list "" "a" "")
+;; A non-empty input shorter than a multi-character delimiter is no match.
+;; The search bound must not wrap when subtracting unsigned lengths.
+(split "a" "ab") -- (list "a")
+(split "x" "xyz") -- (list "x")
+(split 'a "ab") -- (list "a")
+(split "ab" "ab") -- (list "" "")
 (split 'asasd "d") -- (list "asas" "")
 (split 'asasd 'd') -- (list "asas" "")
 ;; Basic vector splitting with I64 indices

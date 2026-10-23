@@ -117,10 +117,12 @@
 ;; ══════════════════════════════════════════════════════════════════════
 (type (.sys.info)) -- 'DICT
 (.sys.info 1) !- arity
-(count (.sys.info)) -- 5
+(count (.sys.info)) -- 6
 (> (at (.sys.info) 'cores) 0) -- true
+(type (at (.sys.info) 'workers)) -- 'i64
+(> (at (.sys.info) 'workers) 0) -- true
 (> (at (.sys.info) 'total-mem) 0) -- true
-(count (value (.sys.info))) -- 5
+(count (value (.sys.info))) -- 6
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_hopen_fn  (lines 769-825)

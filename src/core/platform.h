@@ -234,6 +234,12 @@ void    ray_os_raise_memlock(void);
 ray_err_t ray_thread_create(ray_thread_t* t, ray_thread_fn fn, void* arg);
 ray_err_t ray_thread_join(ray_thread_t t);
 uint32_t ray_thread_count(void);
+/* The CPUs this process may run on: the affinity mask on Linux (taskset, a
+ * cpuset or docker --cpuset-cpus narrow it), ray_thread_count elsewhere. */
+uint32_t ray_cpu_set_count(void);
+/* Test hook: a mask buffer below n bytes fails as on a kernel with a wider
+ * mask (EINVAL), so the retry with a larger buffer is exercised; 0 = none. */
+void     ray_cpu_set_test_min_bytes(size_t n);
 /* Physical cores (SMT siblings collapsed); falls back to the logical
  * count when topology is unavailable. */
 uint32_t ray_physical_core_count(void);
@@ -246,6 +252,13 @@ uint64_t ray_cache_llc_bytes(void);
  * the process's cgroup and its ancestors.  0 when none is set, or on
  * platforms without cgroups. */
 int64_t ray_os_cgroup_mem_limit(void);
+/* CPU quota of this process's cgroup (docker --cpus, systemd CPUQuota=), in
+ * millicpus: the smallest v2 cpu.max or v1 cfs quota over its period on the
+ * cgroup and its ancestors.  0 when none is set, or without cgroups. */
+int64_t ray_os_cgroup_cpu_quota(void);
+/* Test hook: read /proc/self/{cgroup,mountinfo} and the cgroup files of the
+ * quota from under `dir` (NULL: the real ones). */
+void    ray_os_cgroup_test_root(const char* dir);
 /* The directory of the cgroup that sets that limit, into buf[n]; false when
  * no limit is set, or on platforms without cgroups. */
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n);

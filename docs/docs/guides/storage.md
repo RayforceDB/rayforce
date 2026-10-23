@@ -69,7 +69,7 @@ ray_err_t ray_sym_save(const char* path);
 ray_err_t ray_sym_load(const char* path);
 ```
 
-The symbol file uses an append-only format: new symbols are appended on save, and loading merges them into the running table. File locking (`flock` on POSIX, `LockFileEx` on Windows) ensures safe concurrent access.
+`ray_sym_save` writes the whole runtime table to a temporary file and renames it over the target, so a reader never sees a partial file; there is no merge with another writer's file, so one process writes a given file. Loading merges the file into the running table.
 
 In typical usage, you do not call these directly — the splayed and partitioned table functions handle symbol persistence automatically.
 

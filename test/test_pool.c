@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* CPU_SET / sched_setaffinity: the CPU-set sizing test */
+#endif
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -1792,7 +1795,97 @@ static test_result_t test_auto_all_logical_cpus(void) {
     if (rc == RAY_OK) ray_pool_free(&local);
     if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
     TEST_ASSERT_EQ_I(rc, RAY_OK);
-    TEST_ASSERT_EQ_I(total, ray_thread_count());
+    /* every CPU the process may run on (taskset or a cpuset narrows the
+     * set on Linux), or fewer under a cgroup CPU quota (millicpus) */
+    int expect = (int)ray_cpu_set_count();
+    int64_t quota = ray_os_cgroup_cpu_quota();
+    if (quota > 0 && (quota + 999) / 1000 < expect) expect = (int)((quota + 999) / 1000);
+    TEST_ASSERT_EQ_I(total, expect);
+    PASS();
+}
+#endif
+
+#if defined(__linux__)
+/* "cores workers" from a child rayforce run under `prefix`, or false. */
+static bool cq_child(const char* prefix, const char* script, long* cores, long* workers) {
+    char cmd[512], out[512];
+    snprintf(cmd, sizeof(cmd), "env -u RAYFORCE_CORES %s ./rayforce -f %s 2>/dev/null", prefix, script);
+    FILE* p = popen(cmd, "r");
+    if (!p) return false;
+    size_t n = fread(out, 1, sizeof(out) - 1, p);
+    out[n] = 0;
+    if (pclose(p) != 0) return false;
+    while (n && (out[n - 1] == '\n' || out[n - 1] == ' ')) out[--n] = 0;
+    char* last = strrchr(out, '\n');
+    return sscanf(last ? last + 1 : out, "%ld %ld", cores, workers) == 2;
+}
+#endif
+
+/* A child under a CPU quota of 1.5 CPUs (a systemd user scope, as docker
+ * --cpus would set) sizes its default pool to 2 threads, or fewer when a
+ * quota above the scope is tighter: the same child in a scope without a
+ * quota gives that bound.  cores still counts every allowed CPU.  Skipped
+ * where no systemd user manager makes scopes, and without ./rayforce (the
+ * TSan job builds only the test binary). */
+static test_result_t test_cpu_quota_child(void) {
+#if !defined(__linux__)
+    SKIP("cgroup CPU quotas are Linux-only");
+#else
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    if (system("command -v systemd-run >/dev/null 2>&1 && "
+               "systemd-run --user --scope -q true >/dev/null 2>&1") != 0)
+        SKIP("no systemd user manager to make a scope with a CPU quota");
+    char script[128];
+    snprintf(script, sizeof(script), "/tmp/rayforce_cq_%d.rfl", (int)getpid());
+    FILE* f = fopen(script, "w");
+    TEST_ASSERT_TRUE(f != NULL);
+    fputs("(set i (.sys.info))\n(println (format \"% %\" (at i 'cores) (at i 'workers)))\n", f);
+    fclose(f);
+    long c0 = 0, w0 = 0, c1 = 0, w1 = 0;
+    bool ok0 = cq_child("systemd-run --user --scope -q", script, &c0, &w0);
+    bool ok1 = cq_child("systemd-run --user --scope -q -p CPUQuota=150%", script, &c1, &w1);
+    unlink(script);
+    TEST_ASSERT_TRUE(ok0);
+    TEST_ASSERT_TRUE(ok1);
+    TEST_ASSERT_EQ_I(c1, c0);
+    TEST_ASSERT_EQ_I(w1, w0 < 2 ? w0 : 2);
+    PASS();
+#endif
+}
+
+#if defined(__linux__)
+#include <sched.h>
+/* The default pool follows the CPUs the process may run on: with the
+ * calling thread narrowed to two of them (as taskset does for a process),
+ * a default pool has two threads, main included.  Under a cgroup CPU quota
+ * of less than two CPUs it has fewer. */
+static test_result_t test_auto_follows_cpu_set(void) {
+    cpu_set_t before, two;
+    CPU_ZERO(&before);
+    if (sched_getaffinity(0, sizeof(before), &before) != 0)
+        SKIP("the kernel's CPU mask is wider than a cpu_set_t: no fixed-size snapshot");
+    if (CPU_COUNT(&before) < 3) SKIP("needs at least 3 CPUs");
+    CPU_ZERO(&two);
+    for (int c = 0, k = 0; c < CPU_SETSIZE && k < 2; c++)
+        if (CPU_ISSET(c, &before)) { CPU_SET(c, &two); k++; }
+    const char* current = getenv("RAYFORCE_CORES");
+    char* saved = current ? strdup(current) : NULL;
+    TEST_ASSERT_TRUE(!current || saved);
+    unsetenv("RAYFORCE_CORES");
+    int set_rc = sched_setaffinity(0, sizeof(two), &two);
+    uint32_t seen = ray_cpu_set_count();
+    ray_pool_t local;
+    ray_err_t rc = set_rc == 0 ? ray_pool_create(&local, 0) : RAY_ERR_IO;
+    uint32_t total = rc == RAY_OK ? ray_pool_total_workers(&local) : 0;
+    if (rc == RAY_OK) ray_pool_free(&local);
+    (void)sched_setaffinity(0, sizeof(before), &before);
+    if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
+    TEST_ASSERT_EQ_I(set_rc, 0);
+    TEST_ASSERT_EQ_I(seen, 2);
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    int64_t quota = ray_os_cgroup_cpu_quota();
+    int expect = (quota > 0 && (quota + 999) / 1000 < 2) ? 1 : 2;
+    TEST_ASSERT_EQ_I(total, expect);
     PASS();
 }
 #endif
@@ -2463,6 +2556,10 @@ const test_entry_t pool_entries[] = {
 #if defined(__linux__) || defined(__APPLE__)
     { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
 #endif
+#if defined(__linux__)
+    { "pool/auto_follows_cpu_set",  test_auto_follows_cpu_set,  NULL, NULL },
+#endif
+    { "pool/cpu_quota_child",       test_cpu_quota_child,       NULL, NULL },
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
     { "pool/dispatch_reclaims_worker_blocks", test_dispatch_reclaims_worker_blocks, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },

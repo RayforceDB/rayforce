@@ -1,0 +1,14 @@
+;; @requires: posix
+;; Original #733 shape: grouped parted output holds I64 vectors in a LIST.
+(.db.splayed.set "__cast733/2024.01.01/t/" (table [s v] (list ['b 'a 'c] [10 20 30])))
+(.db.splayed.set "__cast733/2024.01.02/t/" (table [s v] (list ['a 'b 'd] [40 50 60])))
+(set Cast733 (.db.parted.get "__cast733/" 't))
+(set Cast733Vals (at (select {a: v by: s from: Cast733}) 'a))
+(type Cast733Vals) -- 'LIST
+(count Cast733Vals) -- 4
+(type (at Cast733Vals 0)) -- 'I64
+(as 'STR Cast733Vals) !- type
+(count Cast733Vals) -- 4
+(set Cast733Vals 0)
+(set Cast733 0)
+(.sys.exec "rm -rf __cast733")

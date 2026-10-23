@@ -1417,6 +1417,98 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     return vec;
 }
 
+/* STR has already been resolved. Successful scalar formatting produces
+ * atoms by construction; the flat collection kernel needs no kind check. */
+static inline __attribute__((always_inline))
+ray_t* cast_str_atom(ray_t* val) {
+    if (val->type == -RAY_STR) { ray_retain(val); return val; }
+    if (val->type == -RAY_SYM) {
+        ray_t* sym_str = ray_sym_str(val->i64);
+        return sym_str ? sym_str : ray_str("", 0);
+    }
+    if (val->type == -RAY_I64) {
+        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%lld", (long long)val->i64);
+        return ray_str(buf, (size_t)n2);
+    }
+    if (val->type == -RAY_I32) {
+        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%d", (int)val->i32);
+        return ray_str(buf, (size_t)n2);
+    }
+    if (val->type == -RAY_I16) {
+        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%d", (int)val->i16);
+        return ray_str(buf, (size_t)n2);
+    }
+    if (val->type == -RAY_F64) {
+        double fv = val->f64;
+        fv = clear_neg_zero(fv);
+        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%g", fv);
+        return ray_str(buf, (size_t)n2);
+    }
+    if (val->type == -RAY_F32) {
+        /* Data conversion uses plain decimal text, independent of the
+         * literal printer and its configured display precision. */
+        double fv = clear_neg_zero((double)(float)val->f64);
+        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%.9g", fv);
+        return ray_str(buf, (size_t)n2);
+    }
+    if (val->type == -RAY_BOOL) {
+        return val->b8 ? ray_str("true", 4) : ray_str("false", 5);
+    }
+    /* Fallback: use ray_fmt for any other atom type */
+    if (ray_is_atom(val)) {
+        ray_t* formatted = ray_fmt(val, 0);
+        if (formatted && !RAY_IS_ERR(formatted)) return formatted;
+        if (formatted) ray_release(formatted);
+    }
+    return ray_error("type", "as: cannot cast %s to str", ray_type_name(val->type));
+}
+
+/* Choose the collection contract once. A boxed flat-vector element can
+ * only produce a string atom on success; LIST children may recurse to vectors.
+ * Keep the collection loop outside scalar dispatch's register frame. */
+static inline __attribute__((always_inline))
+ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
+    int64_t n2 = val->len;
+    ray_t* vec = ray_vec_new(RAY_STR, n2);
+    if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);
+    for (int64_t i = 0; i < n2; i++) {
+        int alloc = 0;
+        ray_t* elem = collection_elem(val, i, &alloc);
+        if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        ray_t* cast = may_nest ? ray_cast_fn(type_sym, elem)
+                      : RAY_ATOM_IS_NULL(elem) ? ray_str("", 0)
+                      : cast_str_atom(elem);
+        if (alloc) ray_release(elem);
+        if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        if (!cast) { ray_release(vec); return ray_error("oom", NULL); }
+        /* Each output cell needs a string atom. A nested input can
+         * recursively produce a STR vector, not an atom to inspect. */
+        if (may_nest && cast->type != -RAY_STR) {
+            ray_release(cast);
+            ray_release(vec);
+            return ray_error("type", "as: STR vector elements must cast to string atoms");
+        }
+        const char* sp = ray_str_ptr(cast);
+        size_t slen = ray_str_len(cast);
+        vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
+        ray_release(cast);
+        if (RAY_IS_ERR(vec)) return vec;
+    }
+    ray_t* result = cast_vec_copy_nulls(vec, val);
+    if (RAY_IS_ERR(result)) return result;
+    return vec;
+}
+
+static __attribute__((noinline))
+ray_t* cast_str_flat(ray_t* type_sym, ray_t* val) {
+    return cast_str_cells(type_sym, val, false);
+}
+
+static __attribute__((noinline))
+ray_t* cast_str_list(ray_t* type_sym, ray_t* val) {
+    return cast_str_cells(type_sym, val, true);
+}
+
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     if (type_sym->type != -RAY_SYM) return ray_error("type", "as: target type must be sym, got %s", ray_type_name(type_sym->type));
     /* Nullable targets preserve nulls; BOOL/U8 produce ordinary values. */
@@ -1687,68 +1779,9 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     /* Cast to STR/str */
     if (cast_match(tname, tlen, "STR") || cast_match(tname, tlen, "str")) {
         ray_release(s);
-        if (val->type == -RAY_STR) { ray_retain(val); return val; }
-        if (val->type == -RAY_SYM) {
-            ray_t* sym_str = ray_sym_str(val->i64);
-            return sym_str ? sym_str : ray_str("", 0);
-        }
-        if (val->type == -RAY_I64) {
-            char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%lld", (long long)val->i64);
-            return ray_str(buf, (size_t)n2);
-        }
-        if (val->type == -RAY_I32) {
-            char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%d", (int)val->i32);
-            return ray_str(buf, (size_t)n2);
-        }
-        if (val->type == -RAY_I16) {
-            char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%d", (int)val->i16);
-            return ray_str(buf, (size_t)n2);
-        }
-        if (val->type == -RAY_F64) {
-            double fv = val->f64;
-            fv = clear_neg_zero(fv);
-            char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%g", fv);
-            return ray_str(buf, (size_t)n2);
-        }
-        if (val->type == -RAY_F32) {
-            /* Data conversion uses plain decimal text, independent of the
-             * literal printer and its configured display precision. */
-            double fv = clear_neg_zero((double)(float)val->f64);
-            char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%.9g", fv);
-            return ray_str(buf, (size_t)n2);
-        }
-        if (val->type == -RAY_BOOL) {
-            return val->b8 ? ray_str("true", 4) : ray_str("false", 5);
-        }
-        /* Fallback: use ray_fmt for any other atom type */
-        if (ray_is_atom(val)) {
-            ray_t* formatted = ray_fmt(val, 0);
-            if (formatted && !RAY_IS_ERR(formatted)) return formatted;
-            if (formatted) ray_release(formatted);
-        }
-        /* Vector/list -> STR vector: cast each element to string */
-        if (ray_is_vec(val) || val->type == RAY_LIST) {
-            int64_t n2 = val->len;
-            ray_t* vec = ray_vec_new(RAY_STR, n2);
-            if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);
-            for (int64_t i = 0; i < n2; i++) {
-                int alloc = 0;
-                ray_t* elem = collection_elem(val, i, &alloc);
-                if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
-                ray_t* cast = ray_cast_fn(type_sym, elem);
-                if (alloc) ray_release(elem);
-                if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
-                const char* sp = ray_str_ptr(cast);
-                size_t slen = ray_str_len(cast);
-                vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
-                ray_release(cast);
-                if (RAY_IS_ERR(vec)) return vec;
-            }
-            ray_t* result = cast_vec_copy_nulls(vec, val);
-            if (RAY_IS_ERR(result)) return result;
-            return vec;
-        }
-        return ray_error("type", "as: cannot cast %s to str", ray_type_name(val->type));
+        if (val->type == RAY_LIST) return cast_str_list(type_sym, val);
+        if (ray_is_vec(val)) return cast_str_flat(type_sym, val);
+        return cast_str_atom(val);
     }
     /* Cast to SYMBOL/sym */
     if (cast_match(tname, tlen, "SYMBOL") || cast_match(tname, tlen, "sym") || cast_match(tname, tlen, "symbol")) {
