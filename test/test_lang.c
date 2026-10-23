@@ -1009,12 +1009,12 @@ static test_result_t test_eval_map(void) {
     ray_t* result = ray_eval_str("(map + 1 [1 2 3])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 3);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 2);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 3);
-    TEST_ASSERT_EQ_I(elems[2]->i64, 4);
+    int64_t* elems = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(elems[0], 2);
+    TEST_ASSERT_EQ_I(elems[1], 3);
+    TEST_ASSERT_EQ_I(elems[2], 4);
     ray_release(result);
     PASS();
 }
@@ -1024,13 +1024,65 @@ static test_result_t test_eval_pmap(void) {
     ray_t* result = ray_eval_str("(pmap * 2 [1 2 3])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 3);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 2);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 4);
-    TEST_ASSERT_EQ_I(elems[2]->i64, 6);
+    int64_t* elems = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(elems[0], 2);
+    TEST_ASSERT_EQ_I(elems[1], 4);
+    TEST_ASSERT_EQ_I(elems[2], 6);
     ray_release(result);
+    PASS();
+}
+
+/* Private symbol positions must become runtime ids in map's output, and
+ * a native BOOL/U8 typed-null must stay boxed (their vectors have no null). */
+static test_result_t test_map_typed_domains_and_nulls(void) {
+    ray_sym_domain_t* domain = ray_sym_domain_new();
+    TEST_ASSERT_NOT_NULL(domain);
+    ray_t* source = ray_sym_vec_new(RAY_SYM_W8, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(source));
+    source->sym_domain = domain; /* transfer ownership */
+    int64_t a = ray_sym_domain_intern(domain, "map_alpha", 9);
+    int64_t b = ray_sym_domain_intern(domain, "map_beta", 8);
+    TEST_ASSERT_TRUE(a > 0 && b > 0 && a != b);
+    uint8_t* cells = (uint8_t*)ray_data(source);
+    cells[0] = (uint8_t)a; cells[1] = 0; cells[2] = (uint8_t)b;
+    source->len = 3;
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("map_source", 10), source), RAY_OK);
+    ray_release(source);
+    ray_t* result = ray_eval_str("(map (fn [x] x) map_source)");
+    TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(result), ray_sym_runtime_domain());
+    TEST_ASSERT_EQ_I(result->len, 3);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(result), 0, RAY_SYM, result->attrs),
+                     ray_sym_intern("map_alpha", 9));
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(result), 2, RAY_SYM, result->attrs),
+                     ray_sym_intern("map_beta", 8));
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("map_source", 10), NULL), RAY_OK);
+    ray_release(result);
+
+    for (int t = RAY_BOOL; t <= RAY_U8; t++) {
+        ray_t* null = ray_typed_null(-t);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(null));
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("map_null", 8), null), RAY_OK);
+        ray_release(null);
+        result = ray_eval_str("(map (fn [x] map_null) [0 1])");
+        TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(((ray_t**)ray_data(result))[0]));
+        ray_release(result);
+        /* The null arrives after one representable atom: exercise fallback. */
+        result = ray_eval_str(t == RAY_BOOL
+            ? "(map (fn [x] (if (== x 1) map_null true)) [0 1])"
+            : "(map (fn [x] (if (== x 1) map_null (as 'U8 7))) [0 1])");
+        TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(((ray_t**)ray_data(result))[1]));
+        TEST_ASSERT_EQ_I(((ray_t**)ray_data(result))[0]->type, -t);
+        ray_release(result);
+    }
     PASS();
 }
 
@@ -11124,6 +11176,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/avg", test_eval_avg, lang_setup, lang_teardown },
     { "lang/eval/min_max", test_eval_min_max, lang_setup, lang_teardown },
     { "lang/eval/first_last", test_eval_first_last, lang_setup, lang_teardown },
+    { "lang/eval/map_typed_domains_nulls", test_map_typed_domains_and_nulls, lang_setup, lang_teardown },
     { "lang/eval/map", test_eval_map, lang_setup, lang_teardown },
     { "lang/eval/pmap", test_eval_pmap, lang_setup, lang_teardown },
     { "lang/eval/fold", test_eval_fold, lang_setup, lang_teardown },
