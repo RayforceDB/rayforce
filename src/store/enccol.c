@@ -3830,6 +3830,23 @@ ray_t* ray_enccol_materialize(ray_t* encv) {
     return r;
 }
 
+static _Atomic(int64_t) g_kept_limit_test;   /* test hook: the budget, 0 = a quarter of the watermark */
+void ray_enccol_test_kept_limit(int64_t bytes) {
+    atomic_store_explicit(&g_kept_limit_test, bytes > 0 ? bytes : 0, memory_order_relaxed);
+}
+
+bool ray_enccol_decode_kept(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e) return true;
+    int64_t cap = atomic_load_explicit(&g_kept_limit_test, memory_order_relaxed);
+    if (cap <= 0) {
+        int64_t wm = ray_heap_anon_watermark();
+        if (wm <= 0) return true;             /* no watermark keeps everything */
+        cap = wm / 4;                         /* ray_enccol_cache_trim's budget */
+    }
+    return (double)e->len * (double)ray_enccol_esz(e) <= (double)cap;
+}
+
 void ray_enccol_adopt_domain(ray_t* out, ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
     if (!e || !out || out->type != RAY_SYM || e->type != RAY_SYM || !e->dom) return;

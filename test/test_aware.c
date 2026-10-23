@@ -1141,16 +1141,19 @@ static test_result_t test_fused_pred_leaves(void) {
         aw_save(nm[i], tbl, enc[i]);
         uint64_t ran, dec;
         ray_fused_topk_counters_reset();
-        test_result_t r = aw_same(nm[i], "(select {x: x from: T where: (== x 7) desc: x take: 3})", 1);
+        test_result_t r = aw_same(nm[i], "(select {x: x from: T where: (== x 7) desc: x take: 3})", 0);
         if (r.status != TEST_PASS) return r;
         ray_fused_topk_counters(&ran, &dec);
         TEST_ASSERT_EQ_U(ran, 2);                                /* both generations take the fused top-k */
-        TEST_ASSERT_EQ_U(aw_col_decoded("x"), 70000 * 4);        /* the sort key's materialization only */
+        /* the sort key is read by range (fpk_rk_t), never materialized: a
+         * vector with a passing row is decoded by the predicate and by the
+         * key's cursor, at most twice the column */
+        TEST_ASSERT_TRUE(aw_col_decoded("x") <= 2 * 70000 * 4);
 
         aw_save(nk[i], tbk, enc[i]);
         TEST_ASSERT_EQ_I(aw_vec_enc(nk[i], "x", 0), enc[i]);
         ray_fused_topk_counters_reset();
-        r = aw_same(nk[i], "(select {k: k from: T where: (== x 7) desc: k take: 3})", 1);
+        r = aw_same(nk[i], "(select {k: k from: T where: (== x 7) desc: k take: 3})", 0);
         if (r.status != TEST_PASS) return r;
         ray_fused_topk_counters(&ran, &dec);
         TEST_ASSERT_EQ_U(ran, 2);
@@ -2122,14 +2125,14 @@ static test_result_t test_gather_operators(void) {
     aw_save("go", AW_WIDE, -1);
     AW_SAME("go", "(select {from: T where: (< k 100)})", 0);                        /* selection gather, every column */
     AW_SAME("go", "(select {k: k t: t from: T where: (== g 3) take: 7})", 0);         /* take: filter head */
-    AW_SAME("go", "(select {k: k v: v t: t from: T where: (> v 100) desc: k take: 5})", 1);   /* top-k: only the key k */
-    AW_SAME("go", "(select {t: t from: T where: (> v 100) asc: [g k] take: 4})", 2);           /* two sort keys */
+    AW_SAME("go", "(select {k: k v: v t: t from: T where: (> v 100) desc: k take: 5})", 0);   /* top-k: the key read by range */
+    AW_SAME("go", "(select {t: t from: T where: (> v 100) asc: [g k] take: 4})", 0);           /* two sort keys */
     /* the same answers byte for byte through .csv.write */
     const char* t0 = "(.db.splayed.get \"" AW_TMP "/go0/\")";
     const char* t2 = "(.db.splayed.get \"" AW_TMP "/go2/\")";
     AW_CSV_SAME(t0, t2, "(select {from: T where: (< k 100)})", 0);
     AW_CSV_SAME(t0, t2, "(select {k: k t: t from: T where: (== g 3) take: 7})", 0);
-    AW_CSV_SAME(t0, t2, "(select {k: k v: v s: s t: t from: T where: (> v 100) desc: k take: 5})", 1);
+    AW_CSV_SAME(t0, t2, "(select {k: k v: v s: s t: t from: T where: (> v 100) desc: k take: 5})", 0);
     AW_CSV_SAME(t0, t2, "(select {k: k s: s t: t from: T where: (< v 50) take: -6})", 0);
     /* no row passes: the empty table with every column's type */
     AW_CSV_SAME(t0, t2, "(select {from: T where: (< k 0)})", 0);
@@ -2194,14 +2197,15 @@ static test_result_t test_gather_list_cells(void) {
     PASS();
 }
 
-/* An index row list: only the indexed column materializes. */
+/* An index row list: nothing materializes (the HASH region is probed where
+ * it is mapped, ray_enc_hash_eq_rowsel). */
 static test_result_t test_gather_index_rows(void) {
     aw_eval_ok("(set W (table [h v t] (list (.idx.hash (% (* (til 100000) 7919) 1000003)) (til 100000) "
                "(map (fn [j] (format \"r%\" j)) (til 100000)))))");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ix0/\" W {compress: false})");
     aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ix2/\" W {compress: true})");
-    /* the HASH key materializes (the index use); v and t are gathered by rows */
-    AW_SAME("ix", "(select {v: v t: t from: T where: (== h 7919)})", 1);
+    /* the HASH key is probed in place; v and t are gathered by rows */
+    AW_SAME("ix", "(select {v: v t: t from: T where: (== h 7919)})", 0);
     PASS();
 }
 
@@ -4402,7 +4406,7 @@ static bool aw_forge_absent(const char* path, int64_t c) {
 }
 
 /* Review focus 6: every pruning case, results and order equal to
- * generation 0; the key materializes (sort key), nothing else.  kn has a
+ * generation 0; nothing materializes (the sort key is read by range).  kn has a
  * null every 1000 rows and chunk 2 all null; its values climb to 300004
  * at row 299999 and restart at 5. */
 static test_result_t test_topk_prune_cases(void) {
@@ -4418,14 +4422,14 @@ static test_result_t test_topk_prune_cases(void) {
         "(select {kn: kn v: v from: T where: (< v 50) desc: kn take: 7})",
         NULL,
     };
-    static const uint64_t mat[] = { 1, 1, 2, 1, 1, 1, 1 };      /* the sort keys */
+    static const uint64_t mat[] = { 0, 0, 0, 0, 0, 0, 0 };      /* the sort keys are read by range */
     for (int i = 0; q[i]; i++) AW_SAME("tp", q[i], mat[i]);
     /* Ties on the first key at the bound: k1 is constant over 4096 rows, so
      * the first morsel fills the heap and publishes k1 = 0 while the next
      * vectors (minimum 0, equal to the bound) still hold better rows by k2. */
     aw_save("tq", "(table [k1 k2] (list (div (til 200000) 4096) (- 200000 (til 200000))))", -1);
-    AW_SAME("tq", "(select {k1: k1 k2: k2 from: T asc: [k1 k2] take: 3})", 2);
-    AW_SAME("tq", "(select {k1: k1 k2: k2 from: T where: (> k2 0) desc: [k1 k2] take: 3})", 2);
+    AW_SAME("tq", "(select {k1: k1 k2: k2 from: T asc: [k1 k2] take: 3})", 0);
+    AW_SAME("tq", "(select {k1: k1 k2: k2 from: T where: (> k2 0) desc: [k1 k2] take: 3})", 0);
     /* pruning happened at both levels on the generation-2 key */
     aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/tp2/\"))");
     aw_eval_ok("(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})");
@@ -4454,7 +4458,7 @@ static test_result_t test_topk_prune_cases(void) {
         "(select {t: t i: i from: T where: (< v 20) desc: [t i] take: 9})",
         NULL,
     };
-    static const uint64_t matr[] = { 1, 1, 1, 1, 1, 2 };
+    static const uint64_t matr[] = { 0, 0, 0, 0, 0, 0 };
     static const bool descr[] = { false, true, false, true, false, true };
     for (int i = 0; qr[i]; i++) {
         AW_SAME("tr", qr[i], matr[i]);
@@ -4477,10 +4481,58 @@ static test_result_t test_topk_prune_cases(void) {
         TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/tp2/"), dir, sizeof dir), RAY_OK);
         snprintf(path, sizeof path, "%s/kn", dir);
         TEST_ASSERT_TRUE(aw_forge_absent(path, 4));
-        AW_SAME("tp", q[1], 1);
-        AW_SAME("tp", q[3], 1);
-        AW_SAME("tp", "(select {kn: kn v: v from: T where: (< v 500) asc: kn take: 9})", 1);
+        AW_SAME("tp", q[1], 0);
+        AW_SAME("tp", q[3], 0);
+        AW_SAME("tp", "(select {kn: kn v: v from: T where: (< v 500) asc: kn take: 9})", 0);
     }
+    PASS();
+}
+
+/* Range-read sort keys (fpk_rk_t): a generation-2 key is never
+ * materialized for the top-k, its vectors are read by range and the heaps
+ * carry the values; answers, order and ties equal generation 0's.  300000
+ * rows (five chunks): t a TIMESTAMP with every value on three rows and a
+ * null every 5003 rows, s a SYM of 50 words ("" among them), k2 an I32 of
+ * five values, f an F64 of 1000 values with a NaN null every 13 rows, v
+ * the predicate column, u a STR, ts a sorted TIMESTAMP. */
+static test_result_t test_topk_range_keys(void) {
+    aw_eval_ok("(set PH (as 'SYMBOL (concat [\"\"] (map (fn [j] (format \"w%\" (- 60 j))) (til 49)))))");
+    aw_save("tk", "(table [t s k2 f v u ts] (list "
+                  "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 5003)) 0N (* (div (% (* j 7919) 300007) 3) 1000000000))) (til 300000))) "
+                  "(at PH (% (* (til 300000) 7) 50)) (as 'I32 (% (til 300000) 5)) "
+                  "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N (% (* j 31) 1000))) (til 300000))) "
+                  "(% (* (til 300000) 13) 1000) (as 'STR (map (fn [j] (format \"u%\" (% j 97))) (til 300000))) "
+                  "(as 'TIMESTAMP (* (til 300000) 1000000000))))", -1);
+    static const char* const q[] = {
+        "(select {t: t v: v from: T where: (> v 100) asc: t take: 20})",          /* nulls first, by row */
+        "(select {t: t v: v from: T where: (> v 100) desc: t take: 20})",
+        "(select {t: t v: v from: T where: (> v 100) asc: t take: 200})",         /* past the 60 nulls: ties of three */
+        "(select {t: t s: s from: T where: (!= s ') asc: [t s] take: 30})",       /* a SYM second key */
+        "(select {t: t s: s from: T where: (!= s ') desc: [t s] take: 30})",
+        "(select {k2: k2 t: t from: T asc: [k2 t] take: 50})",                    /* five-value first key */
+        "(select {k2: k2 v: v from: T asc: k2 desc: v take: 12})",                /* mixed directions */
+        "(select {f: f v: v from: T where: (< v 500) desc: [f v] take: 15})",     /* a float key */
+        "(select {f: f v: v from: T where: (< v 500) asc: [f v] take: 15})",      /* NaN nulls first */
+        "(select {s: s v: v from: T asc: [s v] take: 10})",                       /* a SYM first key */
+        "(select {s: s v: v from: T desc: [s v] take: 10})",
+        "(select {t: t v: v from: T where: (== v 7) asc: t take: 5000})",         /* every passing row */
+        "(select {t: t k2: k2 from: T where: (> v 998) desc: [k2 t] take: 7})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) AW_SAME("tk", q[i], 0);              /* no key materialized */
+    /* a sorted key (ts, the row's second) is read only where it can win */
+    AW_SAME("tk", "(select {ts: ts v: v from: T where: (> v 100) asc: ts take: 10})", 0);
+    TEST_ASSERT_FMT(g_aw_unaligned || aw_col_decoded("ts") < 300000 * 8 / 2, "ts decoded %llu",
+                    (unsigned long long)aw_col_decoded("ts"));
+    AW_SAME("tk", "(select {ts: ts t: t from: T desc: [ts t] take: 10})", 0);
+    /* the first key's directory still prunes the range-read key */
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/tk2/\"))");
+    aw_eval_ok("(select {t: t v: v from: T where: (> v 100) desc: t take: 20})");
+    uint64_t pc = 0, pv = 0;
+    ray_fused_topk_test_pruned(&pc, &pv);
+    TEST_ASSERT_TRUE(g_aw_unaligned || pv > 0);
+    /* a STR key keeps the materialized path: both keys */
+    AW_SAME("tk", "(select {u: u v: v from: T where: (> v 990) asc: [u v] take: 6})", 2);
     PASS();
 }
 
@@ -5075,7 +5127,7 @@ static test_result_t test_gate_materialization(void) {
         NULL,
     };
     for (int i = 0; q[i]; i++) AW_SAME("gm", q[i], 0);
-    AW_SAME("gm", "(select {t: t from: T where: (> v 10) desc: v take: 3})", 1);   /* top-k: only the sort key */
+    AW_SAME("gm", "(select {t: t from: T where: (> v 10) desc: v take: 3})", 0);   /* top-k: the sort key read by range */
     /* a staged scalar count reads no values: t decodes nothing, and ""
      * (STR null) rows count, as on generation 0 */
     AW_SAME("gm", "(select {c: (count t) from: T where: (< g 3)})", 0);
@@ -5829,6 +5881,7 @@ const test_entry_t aware_entries[] = {
     { "aware/group_count_on_runs", test_group_count_on_runs, aw_setup, aw_teardown },
     { "aware/group_runs_forged",   test_group_runs_forged,   aw_setup, aw_teardown },
     { "aware/topk_prune_cases",    test_topk_prune_cases,    aw_setup, aw_teardown },
+    { "aware/topk_range_keys",     test_topk_range_keys,     aw_setup, aw_teardown },
     { "aware/group_topn_ties",     test_group_topn_ties,     aw_setup, aw_teardown },
     { "aware/group_topn_nulls",    test_group_topn_nulls,    aw_setup, aw_teardown },
     { "aware/group_topn_affine",   test_group_topn_affine,   aw_setup, aw_teardown },

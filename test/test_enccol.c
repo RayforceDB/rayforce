@@ -43,6 +43,8 @@
 #include "core/block.h"
 #include "lang/format.h"
 #include "lang/eval.h"
+#include "ops/colgather.h"     /* ray_col_gather_span */
+#include "ops/cdfuse.h"        /* ray_cd_bounded, ray_cd_bounded_all */
 #include <math.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -3437,8 +3439,155 @@ static test_result_t test_take_show_read_window(void) {
     PASS();
 }
 
+/* Whether a whole decode would stay cached (ray_enccol_decode_kept): its
+ * generation-0 bytes against a quarter of the watermark, or the test
+ * budget; metadata only. */
+static test_result_t test_decode_kept_budget(void) {
+    const int64_t n = 70000;                          /* 560000 bytes decoded */
+    ray_t* v = make_col(RAY_I64, n, 0);
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/kb"), 2), RAY_OK);
+    ray_release(v);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/kb"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);
+    int64_t prev = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(4 * 560000);          /* a quarter holds it exactly */
+    TEST_ASSERT_TRUE(ray_enccol_decode_kept(c));
+    ray_heap_set_anon_watermark(4 * 560000 - 4);
+    TEST_ASSERT_FALSE(ray_enccol_decode_kept(c));
+    ray_enccol_test_kept_limit(560000);               /* the test budget replaces it */
+    TEST_ASSERT_TRUE(ray_enccol_decode_kept(c));
+    ray_enccol_test_kept_limit(559999);
+    TEST_ASSERT_FALSE(ray_enccol_decode_kept(c));
+    ray_enccol_test_kept_limit(0);
+    ray_heap_set_anon_watermark(prev);
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(c));     /* nothing was read */
+    ray_release(c);
+    PASS();
+}
+
+/* Distinct cells of v[0, n) as the count-distinct kernels key them (a null
+ * one value); integer types. */
+static int cmp_i64(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return x < y ? -1 : x > y;
+}
+static int64_t distinct_i64(int64_t* x, int64_t n) {
+    if (n == 0) return 0;
+    qsort(x, (size_t)n, sizeof *x, cmp_i64);
+    int64_t d = 1;
+    for (int64_t i = 1; i < n; i++) d += x[i] != x[i - 1];
+    return d;
+}
+static int64_t cell_i64(ray_t* v, int64_t i) {
+    const void* d = ray_data(v);
+    switch (v->type) {
+    case RAY_I16: return ((const int16_t*)d)[i];
+    case RAY_I32: return ((const int32_t*)d)[i];
+    default:      return ((const int64_t*)d)[i];
+    }
+}
+
+/* ray_col_gather_span reads rows [lo, hi) of a generation-2 column as a
+ * plain vector equal to those rows of the source — nulls (HAS_NULLS where
+ * the rows hold one), STR pools, spans that cross the 64 K-row chunks, end
+ * inside a vector, or hold nothing — and refuses an unaligned start; the
+ * bounded count-distinct kernel reads the column (as a value and as a key)
+ * through range reads and counts as over the plain rows.  Neither leaves
+ * the column decoded whole. */
+static test_result_t test_gather_span_bounded_read_window(void) {
+    const int64_t n = 140000;
+    static const struct { int8_t t; int s; } C[] = {
+        { RAY_I64, 4 }, { RAY_I32, 1 }, { RAY_I16, 4 }, { RAY_STR, 4 }, { RAY_F64, 4 },
+    };
+    const int64_t spans[][2] = {
+        { 0, 140000 }, { 0, 51200 }, { 51200, 102400 }, { 65536, 131072 },
+        { 139264, 140000 }, { 102400, 102400 }, { 51200, 52000 }, { 64512, 66000 },
+    };
+    ray_t* src_v[5] = { 0 };
+    ray_t* enc[5] = { 0 };
+    for (int k = 0; k < 5; k++) {
+        char p[64];
+        snprintf(p, sizeof p, ENCCOL_TMP "/gs%d", k);
+        src_v[k] = make_col(C[k].t, n, C[k].s);
+        TEST_ASSERT_EQ_I(ray_col_save_gen(src_v[k], ray_test_tmp(p), 2), RAY_OK);
+        enc[k] = ray_col_mmap(ray_test_tmp(p));
+        TEST_ASSERT_TRUE(enc[k] && !RAY_IS_ERR(enc[k]) && enc[k]->type == RAY_ENCCOL);
+    }
+    for (int k = 0; k < 5; k++) {
+        ray_t* v = src_v[k];
+        ray_col_src_t s;
+        TEST_ASSERT_NULL(ray_col_src_bind(enc[k], &s));
+        for (size_t q = 0; q < sizeof spans / sizeof spans[0]; q++) {
+            int64_t lo = spans[q][0], hi = spans[q][1];
+            ray_t* out = NULL;
+            ray_t* err = ray_col_gather_span(&s, lo, hi, &out);
+            TEST_ASSERT_FMT(!err, "type %d span [%lld, %lld): %s", C[k].t, (long long)lo, (long long)hi, err ? ray_err_code(err) : "");
+            TEST_ASSERT_TRUE(out && out->type == v->type && out->len == hi - lo);
+            bool nulls = false;
+            for (int64_t i = lo; i < hi; i++) nulls = nulls || ray_vec_is_null(v, i);
+            TEST_ASSERT_EQ_I((out->attrs & RAY_ATTR_HAS_NULLS) != 0, nulls);
+            for (int64_t i = 0; i < hi - lo; i++) {
+                TEST_ASSERT_EQ_I(ray_vec_is_null(out, i), ray_vec_is_null(v, lo + i));
+                if (v->type == RAY_STR) {
+                    size_t la = 0, lb = 0;
+                    const char* a = ray_str_vec_get(out, i, &la);
+                    const char* b = ray_str_vec_get(v, lo + i, &lb);
+                    TEST_ASSERT_TRUE(la == lb && (la == 0 || memcmp(a, b, la) == 0));
+                } else {
+                    uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
+                    TEST_ASSERT_FMT(memcmp((char*)ray_data(out) + i * esz, (char*)ray_data(v) + (lo + i) * esz, esz) == 0,
+                                    "type %d row %lld", C[k].t, (long long)(lo + i));
+                }
+            }
+            ray_release(out);
+        }
+        ray_t* out = NULL;
+        ray_t* err = ray_col_gather_span(&s, 100, 2148, &out);   /* not at a vector start */
+        TEST_ASSERT_TRUE(err && out == NULL);
+        TEST_ASSERT_STR_EQ(ray_err_code(err), "range");
+        ray_error_free(err);
+        ray_col_src_release(&s);
+        TEST_ASSERT_NULL(ray_enccol_decoded_peek(enc[k]));
+    }
+
+    /* the bounded kernel over one group and over the I32 key's groups */
+    int64_t* x = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(x);
+    for (int k = 0; k < 3; k++) {
+        for (int64_t i = 0; i < n; i++) x[i] = cell_i64(src_v[k], i);
+        int64_t want = distinct_i64(x, n);
+        ray_t* got = ray_cd_bounded_all(enc[k], n);
+        TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(got->i64, want);
+        ray_release(got);
+    }
+    TEST_ASSERT_NULL(ray_cd_bounded_all(enc[3], n));          /* STR: not served */
+    ray_t* keys = ray_vec_new(RAY_I32, 64);
+    keys->len = 64;
+    for (int g = 0; g < 64; g++) ((int32_t*)ray_data(keys))[g] = g;
+    ray_t* got = ray_cd_bounded(NULL, enc[1], keys, NULL, 64, enc[0], NULL, n);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_I64 && got->len == 64);
+    for (int g = 0; g < 64; g++) {
+        int64_t m = 0;
+        for (int64_t i = 0; i < n; i++)
+            if (cell_i64(src_v[1], i) == g) x[m++] = cell_i64(src_v[0], i);
+        TEST_ASSERT_FMT(((int64_t*)ray_data(got))[g] == distinct_i64(x, m), "group %d", g);
+    }
+    ray_release(got);
+    ray_release(keys);
+    ray_free_raw(x);
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT_NULL(ray_enccol_decoded_peek(enc[k]));
+        ray_release(enc[k]);
+        ray_release(src_v[k]);
+    }
+    PASS();
+}
+
 const test_entry_t enccol_entries[] = {
     { "enccol/take_show_read_window", test_take_show_read_window, enccol_setup, enccol_teardown },
+    { "enccol/decode_kept_budget",    test_decode_kept_budget,    enccol_setup, enccol_teardown },
+    { "enccol/gather_span_bounded_read_window", test_gather_span_bounded_read_window, enccol_setup, enccol_teardown },
     { "enccol/cache_trim_at_boundary", test_cache_trim_at_boundary, enccol_setup, enccol_teardown },
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_rejects",        test_load_rejects,        enccol_setup, enccol_teardown },

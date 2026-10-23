@@ -92,7 +92,14 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
                       const int64_t* row_gid, int64_t n_groups,
                       ray_t* val_col, ray_t* sel, int64_t nrows);
 
-/* Whether ray_cd_bounded serves `col` as a key (is_val false) or a value. */
+/* The count of distinct values of val_col's first nrows rows, in bounded
+ * memory: ray_cd_bounded over one group (every row in it).  An I64 atom, an
+ * error, or NULL when the column is not served. */
+ray_t* ray_cd_bounded_all(ray_t* val_col, int64_t nrows);
+
+/* Whether ray_cd_bounded serves `col` as a key (is_val false) or a value:
+ * a flat, parted or MAPCOMMON column, or a single-file encoded one (a
+ * RAY_ENCCOL slot, read by range, never decoded whole) from its metadata. */
 bool ray_cd_bounded_col_ok(ray_t* col, bool is_val);
 
 /* Whether the scatter of a count-distinct of `val` over nrows rows of `tbl`

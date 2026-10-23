@@ -5012,8 +5012,8 @@ static test_result_t test_select_decodes_referenced_only(void) {
         { "(select {d: (avg v) e: (dev w) from: u2 where: (< x 1000)})",      0 },  /* P2: x's consult reads the directory; Task 10: v, w by range */
         { "(select {k: k v: v from: u2 take: 5})",                            2 },
         { "(select {k: k v: v from: u2 where: (> w 5) take: 5})",             0 },  /* P2: the take scan range-reads w; P3 Task 6: k, v gathered */
-        { "(select {v: v from: u2 desc: v take: 3})",                         1 },
-        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      1 },  /* P2: the top-k scan range-reads w; the sort key x only (P3 Task 6) */
+        { "(select {v: v from: u2 desc: v take: 3})",                         0 },  /* the sort key read by range (fpk_rk_t) */
+        { "(select {v: v x: x from: u2 where: (> w 5) asc: x take: 4})",      0 },  /* P2: the top-k scan range-reads w; the sort key x by range too */
         { "(select {z: (+ v x) from: u2 where: (> w 5)})",                    0 },  /* P2: a fused side range-reads; w's consult reads the directory */
         { NULL, 0 },
     };

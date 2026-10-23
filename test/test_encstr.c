@@ -1479,8 +1479,11 @@ static test_result_t test_filter_chained(void) {
         { "(count (select {from: T where: (and (== s \"cat 5 x\") (> v 100))}))", false },
         { "(count (select {from: T where: (and (< v 70000) (!= s \"cat 5 x\"))}))", false },
         { "(count (select {from: T where: (and (>= v 60000) (== s \"\"))}))", false },
-        { "(select {v: v from: T where: (and (< v 3000) (== s \"cat 5 x\"))})", false },
         /* the STR conjunct second */
+        /* v < 3000 keeps three vectors of the chunk statistics: the chain
+         * runs over them (exec_filter_chain_prune), the STR equality
+         * refining that selection */
+        { "(select {v: v from: T where: (and (< v 3000) (== s \"cat 5 x\"))})", true },
         { "(count (select {from: T where: (and (== f 1) (!= s \"\"))}))", true },
         { "(count (select {from: T where: (and (!= s \"\") (== f 1))}))", true },
         { "(count (select {from: T where: (and (== f 2) (!= s \"cat 5 x\"))}))", true },
@@ -2937,10 +2940,16 @@ static test_result_t test_idict_filter_forged(void) {
     ST_Q_OK(ST_FF_LOAD2);
     ST_Q_TRUE("(== 997 (count (select {v: v from: T where: (and (== w 1) (!= s \"value 5 of the domain\"))})))");
     /* the brief's (< v 1000): the optimizer ranks the STR conjunct first
-     * (as P6 Task 5 found), so it reads every row's code and fails */
+     * (as P6 Task 5 found), but the chain is pruned first from v's chunk
+     * statistics (exec_filter_chain_prune): only vector 0 is read, row
+     * 60000's code never is, and the answer is generation 0's */
     ST_Q_OK("(set T (.db.splayed.get \"" ST_TMP "/ff2/\"))");
-    TEST_ASSERT_FALSE(st_q_run("(count (select {from: T where: (and (< v 1000) (!= s \"value 5 of the domain\"))}))"));
-    TEST_ASSERT_FMT(strstr(st_msg, want) != NULL, "%s (want %s)", st_msg, want);
+    uint64_t zc0, zs0, zc1, zs1;
+    ray_exec_test_zone_prune(&zc0, &zs0);
+    ST_Q_TRUE("(== 997 (count (select {from: T where: (and (< v 1000) (!= s \"value 5 of the domain\"))})))");
+    ray_exec_test_zone_prune(&zc1, &zs1);
+    TEST_ASSERT_EQ_U(zc1 - zc0, 1);
+    TEST_ASSERT_EQ_U(zs1 - zs0, 68);           /* 69 vectors, vector 0 kept */
     PASS();
 }
 

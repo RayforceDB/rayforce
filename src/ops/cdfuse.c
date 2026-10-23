@@ -58,6 +58,7 @@
 #include "ops/hll.h"        /* ray_count_distinct_approx — the gate's group count check */
 #include "table/sym.h"     /* RAY_IS_SYM */
 #include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
+#include "store/colrange.h" /* an encoded column read by range */
 #include "ops/rowsel.h"    /* ray_rowsel_* — the bounded kernel's selection */
 #include "core/platform.h" /* ray_vm_advise_willneed */
 
@@ -948,18 +949,21 @@ typedef struct { int64_t x; uint32_t g; uint32_t h; } cdb_rec_t;
 typedef struct { int64_t x; uint64_t g; } cdb_recent_t;
 
 typedef struct {
-    const void* data;   /* NULL: every row reads `fill` */
+    const void* data;   /* NULL: every row reads `fill`, unless `src` */
     int64_t     lo, n;  /* global rows [lo, lo + n) */
     int8_t      type;
     uint8_t     attrs, esz;
     bool        cold;
     int64_t     fill;
+    ray_col_src_t* src; /* an encoded column read by range (its cdb_col_t's own) */
 } cdb_seg_t;
 
 typedef struct {
     cdb_seg_t* seg;
     int64_t    nseg, rows;
     bool       narrow;  /* every cell is a 32-bit pattern (see cdb_col_open) */
+    bool       bound;   /* own is bound: a single-file encoded column */
+    ray_col_src_t own;
 } cdb_col_t;
 
 typedef struct {
@@ -1003,6 +1007,8 @@ typedef struct {
     int             var;        /* slot layout, see CDB_SET_FNS */
     int64_t*        cnt;        /* [W * n_groups], or [n_groups] when shared */
     bool            cnt_shared;
+    bool            one_group;  /* no key: every row is group 0 */
+    ray_scan_fail_t fail;       /* a range read's failure (encoded columns) */
     _Atomic(int64_t) done;
 } cdb_ctx_t;
 
@@ -1053,6 +1059,8 @@ static int64_t cdb_null_cell(int8_t t) {
 static void cdb_col_close(cdb_col_t* c) {
     ray_free_raw(c->seg);
     c->seg = NULL;
+    if (c->bound) ray_col_src_release(&c->own);
+    c->bound = false;
 }
 
 /* The segments of a flat, parted or MAPCOMMON column.  `narrow`: the low 32
@@ -1061,12 +1069,30 @@ static void cdb_col_close(cdb_col_t* c) {
  * SYM) while every cell is below 2^32 — so a set stores 4 bytes a value.
  * 1 when served, 0 when not (a type, a segment of another type), -1 when
  * memory ran out. */
-static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
+static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val, ray_t** err) {
     memset(c, 0, sizeof(*c));
+    *err = NULL;
     if (!col || RAY_IS_ERR(col)) return 0;
     int8_t base;
     int64_t n;
-    if (col->type == RAY_MAPCOMMON) {
+    if (col->type == RAY_ENCCOL) {
+        /* a single-file generation-2 column, read a vector at a time by
+         * the tasks (never decoded whole); a parted one is not served */
+        ray_col_meta_t m;
+        if (!ray_col_meta_of(col, &m) || RAY_IS_PARTED(m.type) || !cdb_type_ok(m.type, is_val)) return 0;
+        ray_t* be = ray_col_src_bind(col, &c->own);
+        if (be) { *err = be; return -1; }
+        c->bound = true;
+        base = c->own.type;
+        n = 1;
+        c->seg = (cdb_seg_t*)ray_calloc_raw(sizeof(cdb_seg_t));
+        if (!c->seg) { cdb_col_close(c); *err = ray_error("oom", NULL); return -1; }
+        c->seg[0].n = c->own.len;
+        c->seg[0].type = base;
+        c->seg[0].attrs = c->own.attrs;
+        c->seg[0].esz = ray_col_src_esz(&c->own);
+        c->seg[0].src = &c->own;
+    } else if (col->type == RAY_MAPCOMMON) {
         ray_t** mp = (ray_t**)ray_data(col);
         ray_t* kv = mp[0];
         ray_t* rc = mp[1];
@@ -1076,7 +1102,7 @@ static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
         base = kv->type;
         n = rc->len;
         c->seg = (cdb_seg_t*)ray_calloc_raw((size_t)(n > 0 ? n : 1) * sizeof(cdb_seg_t));
-        if (!c->seg) return -1;
+        if (!c->seg) { *err = ray_error("oom", NULL); return -1; }
         const int64_t* counts = (const int64_t*)ray_data(rc);
         for (int64_t p = 0; p < n; p++) {
             c->seg[p].n = counts[p] > 0 ? counts[p] : 0;
@@ -1091,7 +1117,7 @@ static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
         const int64_t* cnt = parted_table_counts(tbl, &ncnt);
         n = col->len;
         c->seg = (cdb_seg_t*)ray_calloc_raw((size_t)(n > 0 ? n : 1) * sizeof(cdb_seg_t));
-        if (!c->seg) return -1;
+        if (!c->seg) { *err = ray_error("oom", NULL); return -1; }
         for (int64_t s = 0; s < n; s++) {
             ray_t* sg = segs[s];
             cdb_seg_t* d = &c->seg[s];
@@ -1114,7 +1140,7 @@ static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
         base = col->type;
         n = 1;
         c->seg = (cdb_seg_t*)ray_calloc_raw(sizeof(cdb_seg_t));
-        if (!c->seg) return -1;
+        if (!c->seg) { *err = ray_error("oom", NULL); return -1; }
         c->seg[0].data = col->len > 0 ? ray_data(col) : NULL;
         c->seg[0].n = col->len;
         c->seg[0].type = base;
@@ -1134,7 +1160,7 @@ static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
         c->narrow = true;
         for (int64_t s = 0; s < n && c->narrow; s++) {
             const cdb_seg_t* d = &c->seg[s];
-            if (d->data ? d->esz > 4 : (uint64_t)d->fill > UINT32_MAX) c->narrow = false;
+            if (d->data || d->src ? d->esz > 4 : (uint64_t)d->fill > UINT32_MAX) c->narrow = false;
         }
         break;
     default:
@@ -1145,6 +1171,10 @@ static int cdb_col_open(cdb_col_t* c, ray_t* col, ray_t* tbl, bool is_val) {
 
 bool ray_cd_bounded_col_ok(ray_t* col, bool is_val) {
     if (!col || RAY_IS_ERR(col)) return false;
+    if (col->type == RAY_ENCCOL) {   /* from metadata: a single-file encoded column */
+        ray_col_meta_t m;
+        return ray_col_meta_of(col, &m) && !RAY_IS_PARTED(m.type) && cdb_type_ok(m.type, is_val);
+    }
     if (col->type == RAY_MAPCOMMON) {
         ray_t* kv = ((ray_t**)ray_data(col))[0];
         return kv && !RAY_IS_ERR(kv) && ray_is_vec(kv) && cdb_type_ok(kv->type, is_val);
@@ -1164,44 +1194,62 @@ static int64_t cdb_seek(const cdb_col_t* c, int64_t r) {
     return a;
 }
 
-/* Cells of rows [r, r + n) into out[], from segment *si on. */
-static void cdb_decode(const cdb_col_t* c, int64_t* si, int64_t r, int64_t n, int64_t* out) {
+/* Cells [off, off + m) of a plain run of `type` at element size esz. */
+static void cdb_cells(const void* data, int8_t type, uint8_t esz, int64_t off, int64_t m, int64_t* out) {
+    if (type == RAY_F64) {
+        const double* d = (const double*)data + off;
+        for (int64_t i = 0; i < m; i++) out[i] = canon_f64_key(d[i]);
+    } else if (esz == 8) {
+        memcpy(out, (const int64_t*)data + off, (size_t)m * sizeof(int64_t));
+    } else if (esz == 4) {
+        if (type == RAY_SYM) {
+            const uint32_t* d = (const uint32_t*)data + off;
+            for (int64_t i = 0; i < m; i++) out[i] = d[i];
+        } else {
+            const int32_t* d = (const int32_t*)data + off;
+            for (int64_t i = 0; i < m; i++) out[i] = d[i];
+        }
+    } else if (esz == 2) {
+        if (type == RAY_SYM) {
+            const uint16_t* d = (const uint16_t*)data + off;
+            for (int64_t i = 0; i < m; i++) out[i] = d[i];
+        } else {
+            const int16_t* d = (const int16_t*)data + off;
+            for (int64_t i = 0; i < m; i++) out[i] = d[i];
+        }
+    } else {
+        const uint8_t* d = (const uint8_t*)data + off;
+        for (int64_t i = 0; i < m; i++) out[i] = d[i];
+    }
+}
+
+/* Cells of rows [r, r + n) into out[], from segment *si on; an encoded
+ * segment through the caller's cursor (one per task, so a vector is
+ * decoded once a task).  NULL or an owned error (a range read's). */
+static ray_t* cdb_decode(const cdb_col_t* c, int64_t* si, int64_t r, int64_t n, int64_t* out,
+                         ray_col_cursor_t* cur) {
     int64_t s = *si;
     while (n > 0) {
         while (r >= c->seg[s].lo + c->seg[s].n) s++;
         const cdb_seg_t* g = &c->seg[s];
         int64_t off = r - g->lo, m = g->n - off;
         if (m > n) m = n;
-        if (!g->data) {
+        if (g->src) {
+            const ray_col_range_t* v;
+            ray_t* err = ray_col_cursor_at(cur, off, &v);
+            if (err) return err;
+            int64_t vm = v->start + v->n - off;
+            if (vm < m) m = vm;
+            cdb_cells(v->data, v->type, ray_sym_elem_size(v->type, v->attrs), off - v->start, m, out);
+        } else if (!g->data) {
             for (int64_t i = 0; i < m; i++) out[i] = g->fill;
-        } else if (g->type == RAY_F64) {
-            const double* d = (const double*)g->data + off;
-            for (int64_t i = 0; i < m; i++) out[i] = canon_f64_key(d[i]);
-        } else if (g->esz == 8) {
-            memcpy(out, (const int64_t*)g->data + off, (size_t)m * sizeof(int64_t));
-        } else if (g->esz == 4) {
-            if (g->type == RAY_SYM) {
-                const uint32_t* d = (const uint32_t*)g->data + off;
-                for (int64_t i = 0; i < m; i++) out[i] = d[i];
-            } else {
-                const int32_t* d = (const int32_t*)g->data + off;
-                for (int64_t i = 0; i < m; i++) out[i] = d[i];
-            }
-        } else if (g->esz == 2) {
-            if (g->type == RAY_SYM) {
-                const uint16_t* d = (const uint16_t*)g->data + off;
-                for (int64_t i = 0; i < m; i++) out[i] = d[i];
-            } else {
-                const int16_t* d = (const int16_t*)g->data + off;
-                for (int64_t i = 0; i < m; i++) out[i] = d[i];
-            }
         } else {
-            const uint8_t* d = (const uint8_t*)g->data + off;
-            for (int64_t i = 0; i < m; i++) out[i] = d[i];
+            cdb_cells(g->data, g->type, g->esz, off, m, out);
         }
         out += m; r += m; n -= m;
     }
     *si = s;
+    return NULL;
 }
 
 /* Ask for the cold segments' bytes of rows [r0, r1). */
@@ -1222,7 +1270,7 @@ static void cdb_want(const cdb_col_t* c, int64_t r0, int64_t r1) {
  * selection, only the runs of morsels it keeps rows of. */
 static void cdb_want_rows(const cdb_ctx_t* c, int64_t r0, int64_t r1) {
     if (!c->sel_flg) {
-        if (!c->row_gid) cdb_want(&c->key, r0, r1);
+        if (!c->row_gid && !c->one_group) cdb_want(&c->key, r0, r1);
         cdb_want(&c->val, r0, r1);
         return;
     }
@@ -1234,7 +1282,7 @@ static void cdb_want_rows(const cdb_ctx_t* c, int64_t r0, int64_t r1) {
         if (m > run) {
             int64_t a = run * RAY_MORSEL_ELEMS > r0 ? run * RAY_MORSEL_ELEMS : r0;
             int64_t b = m * RAY_MORSEL_ELEMS < r1 ? m * RAY_MORSEL_ELEMS : r1;
-            if (!c->row_gid) cdb_want(&c->key, a, b);
+            if (!c->row_gid && !c->one_group) cdb_want(&c->key, a, b);
             cdb_want(&c->val, a, b);
         }
     }
@@ -1260,21 +1308,33 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
     int64_t kbuf[RAY_MORSEL_ELEMS], xbuf[RAY_MORSEL_ELEMS];
     uint32_t hist[CDB_MAX_PARTS];
     cdb_recent_t recent[CDB_CACHE];
+    static const int64_t zero_gid[RAY_MORSEL_ELEMS];   /* one_group: every row's group */
     const uint32_t P = c->P, lo = c->lo, hi = c->hi, pshift = c->pshift;
     const uint64_t vmask = c->vmask, ng = (uint64_t)c->n_groups;
+    /* the encoded columns' cursors, on this task's stack */
+    ray_col_fixed_t kfix, xfix;
+    ray_col_cursor_t kcur, xcur;
+    const bool kenc = c->key.bound, xenc = c->val.bound;
+    if (kenc) ray_col_cursor_init_lent(&kcur, &c->key.own, &kfix);
+    if (xenc) ray_col_cursor_init_lent(&xcur, &c->val.own, &xfix);
     for (int64_t t = start; t < end; t++) {
         int64_t r0 = c->chunk_r0 + t * c->S;
         int64_t r1 = r0 + c->S;
         if (r1 > c->nrows) r1 = c->nrows;
+        if ((kenc || xenc) && ray_scan_failed(&c->fail)) {   /* the round is abandoned */
+            atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
+            continue;
+        }
+        ray_t* rerr = NULL;
         cdb_rec_t* st = c->stage + (size_t)wid * c->S;
         uint16_t*  sp = c->spart + (size_t)wid * c->S;
         memset(hist, 0, (size_t)P * sizeof(uint32_t));
         memset(recent, 0, sizeof(recent));
         int64_t ns = 0;
-        int64_t ksi = c->row_gid ? 0 : cdb_seek(&c->key, r0);
+        int64_t ksi = c->row_gid || c->one_group ? 0 : cdb_seek(&c->key, r0);
         int64_t xsi = cdb_seek(&c->val, r0);
         int64_t klast = 0, glast = -2;
-        for (int64_t m0 = r0; m0 < r1; m0 += RAY_MORSEL_ELEMS) {
+        for (int64_t m0 = r0; m0 < r1 && !rerr; m0 += RAY_MORSEL_ELEMS) {
             int64_t mn = r1 - m0 < RAY_MORSEL_ELEMS ? r1 - m0 : RAY_MORSEL_ELEMS;
             const uint16_t* idx = NULL;
             int64_t ni = mn;
@@ -1288,10 +1348,12 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
                 }
             }
             const int64_t* gb;
-            if (c->row_gid) {
+            if (c->one_group) {
+                gb = zero_gid;
+            } else if (c->row_gid) {
                 gb = c->sel_pre ? c->row_gid + c->sel_pre[m0 / RAY_MORSEL_ELEMS] : c->row_gid + m0;
             } else {
-                cdb_decode(&c->key, &ksi, m0, mn, kbuf);
+                if ((rerr = cdb_decode(&c->key, &ksi, m0, mn, kbuf, kenc ? &kcur : NULL)) != NULL) break;
                 for (int64_t i = 0; i < mn; i++) {
                     int64_t k = kbuf[i];
                     if (k != klast || glast == -2) { klast = k; glast = cdb_gid(c, k); }
@@ -1299,7 +1361,7 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
                 }
                 gb = kbuf;
             }
-            cdb_decode(&c->val, &xsi, m0, mn, xbuf);
+            if ((rerr = cdb_decode(&c->val, &xsi, m0, mn, xbuf, xenc ? &xcur : NULL)) != NULL) break;
             for (int64_t j = 0; j < ni; j++) {
                 int64_t i = idx ? idx[j] : j;
                 uint64_t g = (uint64_t)(c->sel_pre ? gb[j] : gb[i]);
@@ -1318,6 +1380,11 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
                 ns++;
             }
         }
+        if (rerr) {
+            ray_scan_fail_note(&c->fail, r0, rerr);
+            atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
+            continue;
+        }
         int64_t* to = c->toff + (size_t)t * (P + 1);
         int64_t base = t * c->S;
         for (uint32_t p = 0; p < P; p++) {
@@ -1331,6 +1398,8 @@ static void cdb_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end)
         for (int64_t i = 0; i < ns; i++) region[hist[sp[i]]++] = st[i];
         atomic_fetch_add_explicit(&c->done, 1, memory_order_relaxed);
     }
+    if (kenc) ray_col_cursor_free(&kcur);
+    if (xenc) ray_col_cursor_free(&xcur);
 }
 
 /* Slot layouts: values of VT, tags of GT — 4-byte values for a narrow
@@ -1557,6 +1626,7 @@ bool ray_cd_bounded_preferred(ray_t* tbl, ray_t* key, ray_t* val, ray_t* sel,
     if (nrows <= 0 || n_groups <= 0) return false;
     bool kp = key && (RAY_IS_PARTED(key->type) || key->type == RAY_MAPCOMMON);
     bool vp = val && (RAY_IS_PARTED(val->type) || val->type == RAY_MAPCOMMON);
+    bool ke = key && key->type == RAY_ENCCOL, ve = val && val->type == RAY_ENCCOL;   /* decoded whole by the slices */
     /* Memory first: the slices' row buffers — row map and index, 16 B a
      * row, or row map and scattered pairs past 50 K groups, 24 — and the
      * flat copies they make of parted columns, 8 B a row each, against half
@@ -1565,7 +1635,7 @@ bool ray_cd_bounded_preferred(ray_t* tbl, ray_t* key, ray_t* val, ray_t* sel,
      * files: the bounded kernel, whatever the data. */
     int64_t wm = ray_heap_anon_watermark();
     if (wm > 0) {
-        double need = (double)nrows * ((n_groups <= 50000 ? 16.0 : 24.0) + (kp ? 8 : 0) + (vp ? 8 : 0));
+        double need = (double)nrows * ((n_groups <= 50000 ? 16.0 : 24.0) + (kp || ke ? 8 : 0) + (vp || ve ? 8 : 0));
         /* the reusable blocks (a freelist walk) only when the room without
          * them is short */
         if (need > (double)(wm - ray_heap_anon_committed()) / 2 &&
@@ -1599,6 +1669,9 @@ bool ray_cd_bounded_preferred(ray_t* tbl, ray_t* key, ray_t* val, ray_t* sel,
         scale_den = srows > 0 ? srows : 1;
         sel = NULL;   /* a selection is over the whole table's rows */
     }
+    /* an encoded column is not in memory as values either: it is read in
+     * order, a vector at a time, where the slices would decode it whole */
+    if (cols[0]->type == RAY_ENCCOL || cols[1]->type == RAY_ENCCOL) return true;
     if (ray_col_cold(cols[0]) || ray_col_cold(cols[1])) return true;
     if (nrows < CDB_SAMPLE_ROWS) return false;
     int64_t kmax = 0, pairs = 0;
@@ -1641,23 +1714,45 @@ static uint64_t cdb_want_pairs(const cdb_set_t* s, int64_t expect) {
     return (uint64_t)s->n + (uint64_t)(rate * (double)(s->inc - s->seen) * 1.25) + 16;
 }
 
+/* ray_cd_bounded's body; one_group: no key, every row is group 0 of 1. */
+static ray_t* cdb_bounded_run(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
+                        const int64_t* row_gid, int64_t n_groups,
+                        ray_t* val_col, ray_t* sel, int64_t nrows, bool one_group);
+
 ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
                       const int64_t* row_gid, int64_t n_groups,
                       ray_t* val_col, ray_t* sel, int64_t nrows) {
+    return cdb_bounded_run(tbl, key_col, grp_keys, row_gid, n_groups, val_col, sel, nrows, false);
+}
+
+ray_t* ray_cd_bounded_all(ray_t* val_col, int64_t nrows) {
+    ray_t* r = cdb_bounded_run(NULL, NULL, NULL, NULL, 1, val_col, NULL, nrows, true);
+    if (!r || RAY_IS_ERR(r)) return r;
+    int64_t cnt = r->len > 0 ? ((const int64_t*)ray_data(r))[0] : 0;
+    ray_release(r);
+    return ray_i64(cnt);
+}
+
+static ray_t* cdb_bounded_run(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
+                        const int64_t* row_gid, int64_t n_groups,
+                        ray_t* val_col, ray_t* sel, int64_t nrows, bool one_group) {
     if (n_groups < 0 || nrows < 0) return NULL;
     if (n_groups >= (int64_t)UINT32_MAX - 1) return NULL;
-    if (!row_gid && (!grp_keys || RAY_IS_ERR(grp_keys) || !ray_is_vec(grp_keys) ||
+    if (!row_gid && !one_group && (!grp_keys || RAY_IS_ERR(grp_keys) || !ray_is_vec(grp_keys) ||
                      !cdb_type_ok(grp_keys->type, false) || grp_keys->len < n_groups))
         return NULL;
 
     cdb_ctx_t c;
     memset(&c, 0, sizeof(c));
-    int rc = cdb_col_open(&c.val, val_col, tbl, true);
-    if (rc <= 0) return rc < 0 ? ray_error("oom", NULL) : NULL;
+    ray_scan_fail_init(&c.fail);
+    c.one_group = one_group;
+    ray_t* oerr = NULL;
+    int rc = cdb_col_open(&c.val, val_col, tbl, true, &oerr);
+    if (rc <= 0) return oerr;
     if (c.val.rows < nrows) { cdb_col_close(&c.val); return NULL; }
-    if (!row_gid) {
-        rc = cdb_col_open(&c.key, key_col, tbl, false);
-        if (rc <= 0) { cdb_col_close(&c.val); return rc < 0 ? ray_error("oom", NULL) : NULL; }
+    if (!row_gid && !one_group) {
+        rc = cdb_col_open(&c.key, key_col, tbl, false, &oerr);
+        if (rc <= 0) { cdb_col_close(&c.val); return oerr; }
         if (c.key.rows < nrows) { cdb_col_close(&c.key); cdb_col_close(&c.val); return NULL; }
     }
 
@@ -1715,7 +1810,8 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
     uint32_t* plist = NULL;
     int64_t* selpre = NULL;
     uint64_t kcap = 16;
-    if (!row_gid) while (kcap < (uint64_t)n_groups * 2) kcap <<= 1;
+    bool by_key = !row_gid && !one_group;   /* rows map to groups through the key table */
+    if (by_key) while (kcap < (uint64_t)n_groups * 2) kcap <<= 1;
     bool cnt_shared = (int64_t)W * n_groups > CDB_LOCAL_CNT;
     size_t cnt_cells = cnt_shared ? (size_t)n_groups : (size_t)W * (size_t)n_groups;
     c.cnt_shared = cnt_shared;
@@ -1726,9 +1822,9 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
     c.sets  = (cdb_set_t*)ray_calloc_raw((size_t)P * sizeof(cdb_set_t));
     c.cnt   = (int64_t*)ray_calloc_raw(cnt_cells * sizeof(int64_t));
     plist   = (uint32_t*)ray_alloc_raw((size_t)P * sizeof(uint32_t));
-    if (!row_gid) khdr = ray_calloc_raw((size_t)kcap * (sizeof(int64_t) + sizeof(uint32_t)));
+    if (by_key) khdr = ray_calloc_raw((size_t)kcap * (sizeof(int64_t) + sizeof(uint32_t)));
     if (!c.recs || !c.stage || !c.spart || !c.toff || !c.sets || !c.cnt || !plist ||
-        (!row_gid && !khdr)) {
+        (by_key && !khdr)) {
         err = ray_error("oom", NULL);
         goto done;
     }
@@ -1750,7 +1846,7 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
         selpre[c.sel_nsegs] = run;
         c.sel_pre = selpre;
     }
-    if (!row_gid) {
+    if (by_key) {
         int64_t* kk = (int64_t*)khdr;
         uint32_t* kt = (uint32_t*)(kk + kcap);
         uint64_t kmask = kcap - 1;
@@ -1801,7 +1897,9 @@ ray_t* ray_cd_bounded(ray_t* tbl, ray_t* key_col, ray_t* grp_keys,
             }
             c.chunk_r0 = r0;
             c.T_c = (uint32_t)((r1 - r0 + S - 1) / S);
-            if (!cdb_run(pool, par, cdb_scatter_fn, &c, c.T_c)) {
+            bool ran = cdb_run(pool, par, cdb_scatter_fn, &c, c.T_c);
+            if (ray_scan_failed(&c.fail)) { err = ray_scan_fail_finish(&c.fail, NULL); goto done; }
+            if (!ran) {
                 err = ray_error("cancel", "interrupted");
                 goto done;
             }

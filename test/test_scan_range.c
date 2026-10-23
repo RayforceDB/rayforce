@@ -2720,12 +2720,13 @@ static test_result_t sr_fused_same(const char* q, uint64_t want_mat) {
 }
 #define SR_FUSED_SAME(q, m) do { test_result_t r_ = sr_fused_same((q), (m)); if (r_.status != TEST_PASS) return r_; } while (0)
 
-/* Top-k: results equal generation 0; the materializations are exactly the
- * sort keys: the projected columns are gathered by row list (P3 Task 6). */
+/* Top-k: results equal generation 0; nothing is materialized: the sort
+ * keys are read by range into the heaps (fpk_rk_t) and the projected
+ * columns are gathered by row list (P3 Task 6). */
 static test_result_t test_topk_materializes_keys(void) {
-    SR_FUSED_SAME("(select {k: k from: T where: (> v 1000) desc: k take: 5})", 1);            /* k: key and output */
-    SR_FUSED_SAME("(select {g: g k: k from: T where: (> v 1000) asc: [g k] take: 7})", 2);    /* two keys */
-    SR_FUSED_SAME("(select {f: f from: T where: (== g 3) desc: k take: 3})", 1);              /* key k; f gathered */
+    SR_FUSED_SAME("(select {k: k from: T where: (> v 1000) desc: k take: 5})", 0);            /* k: key and output */
+    SR_FUSED_SAME("(select {g: g k: k from: T where: (> v 1000) asc: [g k] take: 7})", 0);    /* two keys */
+    SR_FUSED_SAME("(select {f: f from: T where: (== g 3) desc: k take: 3})", 0);              /* key k; f gathered */
     SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: 4})", 0);                      /* take scan: k gathered */
     SR_FUSED_SAME("(select {k: k from: T where: (< v 50) take: -4})", 0);                     /* take from the end */
     PASS();
@@ -7078,6 +7079,101 @@ static test_result_t test_vec_stat_decide(void) {
     PASS();
 }
 
+/* Chunk pruning of a conjunctive filter chain over generation 2
+ * (exec_filter_chain_prune): the outermost filter decides each comparison
+ * or `in` conjunct from the chunk directory, then from the vectors'
+ * descriptors, and the chain runs as chained filters over the rows no
+ * conjunct excludes.  200000 rows (three full chunks and a short fourth,
+ * 196 vectors, the last one 320 rows); c is sorted (1000 rows per value),
+ * x is the row, h a scattered I64, n an I64 with a null every 7 rows, f a
+ * sorted F64 with a NaN null every 11 rows, d a DATE and t a TIMESTAMP
+ * that cycle within every 1000 rows, k a HASH-indexed column, m the row
+ * as an I64 with a null every 11 rows.  Every
+ * answer equals generation 0's; `segs` is the exact number of vectors the
+ * pruning dropped (0: the chain is not pruned), and a pruned query decodes
+ * nothing outside the vectors it keeps. */
+static test_result_t test_chain_zone_prune(void) {
+    sr_eval_ok("(set i (til 200000))");
+    sr_eval_ok("(set Z (table [x c d h n f t r k m] (list i (as 'I32 (div i 1000)) (as 'DATE (div (% i 1000) 10)) "
+               "(% (* i 7919) 1000003) (as 'I64 (map (fn [j] (if (== 0 (% j 7)) 0N (% j 50))) i)) "
+               "(as 'F64 (map (fn [j] (if (== 0 (% j 11)) 0N j)) i)) "
+               "(as 'TIMESTAMP (* (div (% i 1000) 10) 86400000000000)) (as 'I16 (% i 3)) "
+               "(.idx.hash (% (* i 31) 100003)) (as 'I64 (map (fn [j] (if (== 0 (% j 11)) 0N j)) i)))))");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/zp0/\" Z {compress: false})");
+    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/zp2/\" Z {compress: true})");
+    static const struct { const char* q; uint64_t segs; } qs[] = {
+        /* c == 70: rows 70000..70999, vectors 68 and 69 */
+        { "(select {x: x h: h from: T where: (and (== c 70) (> h 500000))})", 194 },
+        /* exactly chunk 1: its statistics decide both bounds all-pass */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (>= x 65536) (< x 131072) (> h 500000))})", 132 },
+        /* exactly vector 1, and the short last vector */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (>= x 1024) (< x 2048) (> h 0))})", 195 },
+        { "(select {s: (sum h) c: (count x) from: T where: (and (>= x 199900) (> h 0))})", 195 },
+        /* nothing matches */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (== c 5000) (> h 0))})", 196 },
+        /* everything, and three quarters: not pruned */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (>= c 0) (> h 500000))})", 0 },
+        { "(select {s: (sum x) c: (count x) from: T where: (and (< c 150) (> h 0))})", 0 },
+        /* a null ranks below every value: (< n 10) holds on the nulls */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (== c 70) (< n 10))})", 194 },
+        /* a null literal and a null `in` member select the null rows: no
+         * statistic decides them (only c < 3 prunes, vectors 0..2 kept) */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (== n 0Nl) (< c 3))})", 193 },
+        { "(select {s: (sum x) c: (count x) from: T where: (and (in n [0Nl 500]) (< c 3))})", 193 },
+        { "(select {s: (sum x) c: (count x) from: T where: (and (in c [3 70 150]) (> h 0))})", 190 },
+        /* nulls rank below every value: m and f climb with the row, so every
+         * chunk past the first holds no value below 100 but holds nulls,
+         * which pass `<` (nothing is pruned) */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (< m 100) (> h 0))})", 0 },
+        { "(select {s: (sum x) c: (count x) from: T where: (and (< f 100.5) (> h 0))})", 0 },
+        /* floats: NaN nulls fail >, the vectors below 150000.5 are dropped */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (> f 150000.5) (== r 1))})", 146 },
+        /* a TIMESTAMP literal on a DATE column is converted by the kernel:
+         * never decided on raw values (only c < 3 prunes) */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (> d 2000.01.01D12:00:00.000000000) (< c 3))})", 193 },
+        { "(select {s: (sum x) c: (count x) from: T where: (and (< t 2000.01.03) (< c 3))})", 193 },
+        { "(select {s: (sum x) c: (count x) from: T where: (and (within d [2000.01.05 2000.01.06]) (< c 3))})", 193 },
+        /* grouped, as the Q41 shape */
+        { "(select {v: (count h) from: T where: (and (== c 70) (== r 1) (in d [2000.01.03 2000.01.04])) by: d desc: v})", 194 },
+        /* a conjunct that reads other rows: the chain is left alone */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (== c 70) (> h (avg h)))})", 0 },
+        /* a recorded HASH the index route uses: left to it */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (== k 4242) (< c 3))})", 0 },
+        /* an `or` is no pruning conjunct */
+        { "(select {s: (sum x) c: (count x) from: T where: (and (or (== c 70) (== c 150)) (> h 0))})", 0 },
+        { NULL, 0 },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        ray_t* out[2] = { NULL, NULL };
+        uint64_t dc[2], ds[2];
+        ray_enc_counters_t k;
+        for (int gen = 0; gen < 2; gen++) {
+            sr_eval_ok(gen ? "(set T (.db.splayed.get \"" SR_TMP "/zp2/\"))" : "(set T (.db.splayed.get \"" SR_TMP "/zp0/\"))");
+            uint64_t c0, s0, c1, s1;
+            ray_exec_test_zone_prune(&c0, &s0);
+            ray_enc_counters_reset();
+            out[gen] = sr_eval(qs[i].q);
+            ray_enc_counters_get(&k);
+            ray_exec_test_zone_prune(&c1, &s1);
+            dc[gen] = c1 - c0; ds[gen] = s1 - s0;
+            TEST_ASSERT_FMT(out[gen] && !RAY_IS_ERR(out[gen]), "%s gen %d: %s", qs[i].q, gen * 2,
+                            out[gen] ? ray_error_msg() : "no result");
+        }
+        TEST_ASSERT_FMT(sr_same_text(out[0], out[1]), "%s: generations differ", qs[i].q);
+        TEST_ASSERT_FMT(dc[0] == 0 && ds[0] == 0, "%s: generation 0 pruned", qs[i].q);
+        TEST_ASSERT_FMT(dc[1] == (qs[i].segs ? 1u : 0u) && ds[1] == qs[i].segs,
+                        "%s: %llu chains pruned, %llu vectors dropped, want %llu", qs[i].q,
+                        (unsigned long long)dc[1], (unsigned long long)ds[1], (unsigned long long)qs[i].segs);
+        /* at most four 8-byte columns over the kept vectors and two more */
+        if (qs[i].segs)
+            TEST_ASSERT_FMT(k.materialized == 0 && k.decoded_bytes <= (196 - qs[i].segs + 2) * 4 * 8 * 1024,
+                            "%s: %llu decoded bytes, %llu materialized", qs[i].q,
+                            (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
+        sr_drop(out[0]); sr_drop(out[1]);
+    }
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
@@ -7219,6 +7315,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/ragged_gen0_no_decode", test_ragged_gen0_no_decode, srr_setup, srr_teardown },
     { "scanrange/ragged_fill_bounded",   test_ragged_fill_bounded,   srr_setup, srr_teardown },
     { "scanrange/vec_stat_decide",       test_vec_stat_decide,       sr_rt_setup, sr_rt_teardown },
+    { "scanrange/chain_zone_prune",      test_chain_zone_prune,      sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_sel_bounds_split",   test_v2_sel_bounds_split,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_sel_bounds_boundary", test_v2_sel_bounds_boundary, sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_forged_split",       test_v2_forged_split,       sr_rt_setup, sr_rt_teardown },

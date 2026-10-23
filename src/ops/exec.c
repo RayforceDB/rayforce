@@ -24,6 +24,7 @@
 #include "ops/internal.h"
 #include "ops/colgather.h"   /* ray_col_gather_slot: the refinement over encoded columns */
 #include "ops/colbind.h"
+#include "ops/cdfuse.h"     /* ray_cd_bounded_all: count distinct of an encoded scan */
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "table/domain.h"   /* ray_sym_domain_corruptions */
 #include "lang/format.h"    /* ray_type_name (error context) */
@@ -3481,6 +3482,213 @@ static __attribute__((noinline)) ray_t* exec_filter_refine_enc(ray_graph_t* g, r
     return input;
 }
 
+/* ---- Chunk pruning of a conjunctive row filter over generation 2 ----
+ *
+ * The optimizer splits `where: (and a b c)` into a chain of filters, each
+ * one predicate, and the first to run reads its column over every row:
+ * the per-morsel zone decision of one predicate never sees the others, so
+ * an equality on a hash column decodes the column whole although a
+ * conjunct on the table's sort column (CounterID == 62) excludes almost
+ * every chunk.  Before the chain runs, its outermost filter decides every
+ * comparison or `in` conjunct of the chain on a single-file generation-2
+ * numeric or temporal column from the directory statistics of each 64K-row
+ * chunk, then from the descriptors of the vectors of a chunk some conjunct
+ * left undecided, and installs the rows no conjunct excludes as the
+ * selection: every filter of the chain then runs as a chained filter over
+ * those rows (exec_filter_refine_enc reads only the vectors it keeps).  A
+ * conjunct whose column carries a recorded HASH / SORT / PART / BLOOM index
+ * its shape would use (the index route of the first filter) leaves the
+ * chain alone, as does a pruning that keeps more than half of the rows.
+ * Generation 0 is never pruned here. */
+_Static_assert(RAY_ENC_VEC == RAY_MORSEL_ELEMS, "a selection segment is one encoded vector");
+_Static_assert(RAY_ENC_CHUNK == RAY_ENC_VEC * RAY_ENC_VECS_PER_CHUNK, "chunk geometry");
+
+#define ZP_MAX_CONJ 16
+#define ZP_MAX_SET  64
+
+typedef struct {
+    ray_col_src_t*     src;       /* borrowed from the graph's binds */
+    const ray_enccol_t* e;
+    uint16_t           op;        /* OP_EQ .. OP_GE, or OP_IN */
+    bool               is_f;      /* F32 / F64 column, key_f */
+    int64_t            key_i;
+    double             key_f;
+    int64_t            set[ZP_MAX_SET];
+    int                nset;
+} zp_conj_t;
+
+static _Atomic(uint64_t) g_zp_calls, g_zp_segs;   /* test hook */
+void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs) {
+    *calls = atomic_load_explicit(&g_zp_calls, memory_order_relaxed);
+    *pruned_segs = atomic_load_explicit(&g_zp_segs, memory_order_relaxed);
+}
+
+/* A literal comparable with a column of type ct as its raw logical value:
+ * an integer-family literal for an integer column, the same temporal type
+ * for a temporal column (another temporal literal is converted by the
+ * kernel), any non-null float or integer literal for a float column. */
+static bool zp_lit_ok(int8_t ct, int8_t lt) {
+    bool lint = lt == RAY_BOOL || lt == RAY_U8 || lt == RAY_I16 || lt == RAY_I32 || lt == RAY_I64;
+    switch (ct) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64: return lint;
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:                       return lt == ct;
+    case RAY_F32: case RAY_F64: return lint || lt == RAY_F32 || lt == RAY_F64;
+    default: return false;
+    }
+}
+
+/* One conjunct of the chain as a zp_conj_t: 1 accepted, 0 not a pruning
+ * conjunct (it stays a filter of the chain), -1 a conjunct whose recorded
+ * region index the chain's index route would use (no pruning), -2 an owned
+ * *err (a failed bind). */
+static int zp_conj_of(ray_graph_t* g, ray_op_t* p, zp_conj_t* out, ray_t** err) {
+    *err = NULL;
+    ray_col_meta_t m;
+    uint16_t op = 0; int64_t ki = 0; double kf = 0.0; int isf = 0;
+    ray_t* set = NULL;
+    bool is_in = false;
+    if (idx_filter_decode(g, p, IDXW_NONE, NULL, &op, &ki, &kf, &isf, &m)) {
+        if (m.enc && idx_enc_cmp_uses_index(&m, op, ki, isf) && ray_enc_idx_kind_has_region(m.index_kind))
+            return -1;
+    } else if (idx_filter_in_decode(g, p, IDXW_NONE, NULL, &set, &m)) {
+        if (m.enc && idx_enc_in_uses_index(&m) && ray_enc_idx_kind_has_region(m.index_kind)) return -1;
+        is_in = true;
+    } else return 0;
+    if (!m.enc) return 0;
+    const ray_enccol_t* e = ray_enccol_of(m.enc);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic) return 0;
+    bool is_f = m.type == RAY_F32 || m.type == RAY_F64;
+    if (!zone_dir_type(m.type) && !is_f) return 0;
+    ray_op_t* rhs = op_child(g, p, 1);
+    ray_op_ext_t* rx = rhs ? find_ext(g, rhs->id) : NULL;
+    ray_t* lit = rx ? rx->literal : NULL;
+    if (!lit) return 0;
+    out->op = is_in ? OP_IN : op;
+    out->is_f = is_f;
+    out->key_i = ki; out->key_f = kf; out->nset = 0;
+    if (is_in) {
+        if (is_f || ray_is_atom(lit) || !zp_lit_ok(m.type, lit->type) || lit->len > ZP_MAX_SET) return 0;
+        for (int64_t i = 0; i < lit->len; i++) {
+            if (ray_vec_is_null(lit, i)) return 0;     /* a null member: left to the filter */
+            out->set[out->nset++] = read_col_i64(ray_data(lit), i, lit->type, lit->attrs);
+        }
+    } else {
+        if (!ray_is_atom(lit) || RAY_ATOM_IS_NULL(lit) || !zp_lit_ok(m.type, (int8_t)-lit->type)) return 0;
+        if (is_f && kf != kf) return 0;
+    }
+    int64_t sym = idx_conj_sym(g, p);
+    if (sym < 0) return 0;
+    ray_col_src_t* src = ray_graph_bind_col(g, g->table, sym, err);
+    if (*err) return -2;
+    if (!src || src->obj != m.enc) return 0;
+    out->src = src;
+    out->e = e;
+    return 1;
+}
+
+/* One conjunct over extrema [mn, mx] (has_mm: present) of `rows` rows with
+ * nn nulls: 1 every row passes, 0 none does, -1 undecided. */
+static int zp_decide(const zp_conj_t* c, int64_t mn, int64_t mx, bool has_mm, int64_t nn, int64_t rows) {
+    bool all_null = nn == rows;
+    if (c->op == OP_IN) {
+        if (all_null || !has_mm || mn > mx) return -1;
+        for (int i = 0; i < c->nset; i++)
+            if (c->set[i] >= mn && c->set[i] <= mx) return -1;
+        return 0;                               /* a null row is in no set */
+    }
+    if (c->is_f) {
+        double fmn, fmx;
+        memcpy(&fmn, &mn, 8); memcpy(&fmx, &mx, 8);
+        return zone_cmp_core_f64(fmn, fmx, has_mm, nn > 0, all_null, c->op, c->key_f);
+    }
+    return zone_cmp_core(mn, mx, has_mm, nn > 0, all_null, c->op, c->key_i);
+}
+
+/* The chain under `top` (its outermost filter) prunes its rows: installs
+ * g->selection (NULL return), or leaves it NULL (no pruning); an owned
+ * error otherwise. */
+static __attribute__((noinline)) ray_t* exec_filter_chain_prune(ray_graph_t* g, ray_op_t* top) {
+    if (!g->table || g->table->type != RAY_TABLE || !filter_input_default_domain(g, top->id)) return NULL;
+    ray_op_t* conj[ZP_MAX_CONJ];
+    int ncj = 0;
+    for (ray_op_t* f = top; f && f->opcode == OP_FILTER; f = op_child(g, f, 0)) {
+        if (f->arity != 2 || !ray_expr_subset_invariant(g, f->in_id[1])) return NULL;
+        ray_op_t* p = op_child(g, f, 1);
+        if (!p) return NULL;
+        ray_op_t* parts[ZP_MAX_CONJ];
+        int np = idx_flatten_and(g, p, parts, ZP_MAX_CONJ);
+        if (np == 0) { parts[0] = p; np = 1; }
+        for (int i = 0; i < np; i++) {
+            if (ncj >= ZP_MAX_CONJ) return NULL;
+            conj[ncj++] = parts[i];
+        }
+    }
+    if (ncj < 2) return NULL;                   /* one predicate: its own zone decision prunes it */
+    const int64_t nrows = ray_table_nrows(g->table);
+    if (nrows < RAY_ENC_CHUNK) return NULL;
+    zp_conj_t zc[ZP_MAX_CONJ];
+    int nz = 0;
+    for (int i = 0; i < ncj; i++) {
+        ray_t* err = NULL;
+        int rc = zp_conj_of(g, conj[i], &zc[nz], &err);
+        if (rc == -2) return err;
+        if (rc == -1) return NULL;
+        if (rc == 1 && zc[nz].e->len == nrows) nz++;
+    }
+    if (nz == 0) return NULL;
+    const int64_t n_segs = (nrows + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
+    const int64_t n_chunks = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    ray_t* hdr = NULL;
+    uint8_t* keep = (uint8_t*)scratch_alloc(&hdr, (size_t)n_segs);
+    if (!keep) return NULL;                     /* OOM: the chain runs unpruned */
+    int64_t kept = 0;
+    for (int64_t ch = 0; ch < n_chunks; ch++) {
+        const int64_t s0 = ch * RAY_ENC_VECS_PER_CHUNK;
+        const int64_t s1 = s0 + RAY_ENC_VECS_PER_CHUNK < n_segs ? s0 + RAY_ENC_VECS_PER_CHUNK : n_segs;
+        bool dead = false;
+        int mixed[ZP_MAX_CONJ], nmixed = 0;
+        for (int k = 0; k < nz && !dead; k++) {
+            ray_enc_chunk_stat_t st;
+            ray_enccol_chunk_stat(zc[k].e, ch, &st);
+            int d = zp_decide(&zc[k], st.min, st.max, st.has_minmax, (int64_t)st.null_count, st.rows);
+            if (d == 0) dead = true;
+            else if (d < 0) mixed[nmixed++] = k;
+        }
+        for (int64_t s = s0; s < s1; s++) {
+            bool sdead = dead;
+            const int64_t rows = (s + 1) * RAY_ENC_VEC <= nrows ? RAY_ENC_VEC : nrows - s * RAY_ENC_VEC;
+            for (int j = 0; j < nmixed && !sdead; j++) {
+                int64_t mn, mx; uint32_t nn;
+                if (ray_col_src_vec_stat(zc[mixed[j]].src, s, &mn, &mx, &nn) &&
+                    zp_decide(&zc[mixed[j]], mn, mx, true, (int64_t)nn, rows) == 0)
+                    sdead = true;
+            }
+            keep[s] = !sdead;
+            if (!sdead) kept += rows;
+        }
+    }
+    ray_t* sel = NULL;
+    if (kept * 2 <= nrows) {
+        int64_t pruned = 0;
+        sel = ray_rowsel_new(nrows, kept, 0);
+        if (sel) {
+            uint8_t* fl = ray_rowsel_flags(sel);
+            uint32_t* off = ray_rowsel_offsets(sel);
+            for (int64_t s = 0; s < n_segs; s++) {
+                fl[s] = keep[s] ? RAY_SEL_ALL : RAY_SEL_NONE;
+                off[s] = 0;
+                pruned += !keep[s];
+            }
+            off[n_segs] = 0;
+            atomic_fetch_add_explicit(&g_zp_calls, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_zp_segs, (uint64_t)pruned, memory_order_relaxed);
+        }
+    }
+    scratch_free(hdr);
+    g->selection = sel;
+    return NULL;
+}
+
 /* A whole-vector reader (running, moving, order, distinct) reads every row of
  * its input, rows a lazy selection drops included.  Producers evaluated under a
  * selection may leave those rows unwritten (par_binary_fn skips NONE blocks,
@@ -3650,6 +3858,32 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         case OP_COUNT_DISTINCT: {
+            /* The scan of a single-file encoded column not decoded yet
+             * whose whole decode would not stay cached
+             * (ray_enccol_decode_kept), no selection: counted in bounded
+             * memory reading the column by range (ray_cd_bounded_all)
+             * instead of decoding it whole and scattering every row.
+             * Integer, temporal and SYM columns; any other keeps the plain
+             * path. */
+            ray_op_t* cchild = op_child(g, op, 0);
+            if (cchild && cchild->opcode == OP_SCAN && !g->selection) {
+                ray_op_ext_t* se = find_ext(g, cchild->id);
+                ray_t* scan_tbl = se ? scan_table_of(g, se) : NULL;
+                ray_col_meta_t sm;
+                if (scan_tbl && ray_table_col_meta(scan_tbl, se->sym, &sm) && sm.enc &&
+                    !RAY_IS_PARTED(sm.type) && !ray_enccol_decoded_peek(sm.enc) &&
+                    !ray_enccol_decode_kept(sm.enc) && !ray_col_bind_declines(scan_tbl, se->sym)) {
+                    switch (sm.type) {
+                    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+                    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM: {
+                        ray_t* r = sm.len > 0 ? ray_cd_bounded_all(sm.enc, sm.len) : ray_i64(0);
+                        if (r) return r;            /* NULL: not served, plain path below */
+                        break;
+                    }
+                    default: break;
+                    }
+                }
+            }
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             ray_t* result = exec_count_distinct(g, op, input);
@@ -3779,6 +4013,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 return result;
             }
 
+            /* The outermost filter of a chain prunes the chain's rows from
+             * its conjuncts' chunk statistics (generation 2) before the
+             * first one runs. */
+            if (tl_filter_depth == 1 && !g->selection) {
+                ray_t* perr = exec_filter_chain_prune(g, op);
+                if (perr) return perr;
+            }
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             /* A verified physically-sorted column remains routable even when
@@ -3869,6 +4110,33 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 bool fm_ok = idx_filter_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &cmp_op,
                                                &key_i, &key_f, &is_float, &fm);
                 bool fm_uses = fm_ok && fm.enc && idx_enc_cmp_uses_index(&fm, cmp_op, key_i, is_float);
+                /* An equality on a recorded HASH not yet materialized probes
+                 * the region where it is mapped (ray_enc_hash_eq_rowsel):
+                 * the column is not decoded and the region not copied.  A
+                 * declined probe (a dense key) materializes as below. */
+                if (fm_uses && fm.index_kind == RAY_IDX_HASH && cmp_op == OP_EQ && !is_float &&
+                    !ray_enccol_decoded_peek(fm.enc)) {
+                    int64_t hk = key_i;
+                    bool hk_ok = true;
+                    if (fm.type == RAY_SYM) {      /* global intern id -> the column's domain id */
+                        ray_enccol_t* he = ray_enccol_of(fm.enc);
+                        ray_t* hs = he && he->dom ? ray_sym_str(key_i) : NULL;
+                        hk = hs ? ray_sym_domain_find(he->dom, ray_str_ptr(hs), ray_str_len(hs)) : -1;
+                        hk_ok = hk > 0;
+                    }
+                    if (hk_ok) {
+                        ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+                        ray_t* hsel = NULL; ray_t* herr = NULL;
+                        int hrc = ray_enc_hash_eq_rowsel(fm.enc, hk, &hsel, &herr);
+                        if (hrc < 0) { ray_release(input); return herr; }
+                        if (hrc == 1) {
+                            ray_idx_hits[IDX_SITE_FILTER_HASH]++;
+                            ray_idx_note_use_enc(fm.enc);
+                            g->selection = hsel;
+                            return input;
+                        }
+                    }
+                }
                 if (fm_ok && idx_enc_from_dir(&fm, fm_uses)) {
                     enc_done = true;
                     ray_t* esel = NULL; ray_t* eerr = NULL;

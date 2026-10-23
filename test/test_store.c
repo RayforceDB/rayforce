@@ -3181,8 +3181,23 @@ static test_result_t test_lazy_first_use(void) {
     PASS();
 }
 
+/* One unsplit AND (a graph run without the optimizer): (== h 15838)
+ * (>= v 0) (<= v hi) over A; the rows, which hold row 2 alone. */
+static ray_t* lz_eq_range(ray_t* tbl, int64_t hi) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
+                                           ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))),
+                             ray_le(g, ray_scan(g, "v"), ray_const_i64(g, hi)));
+    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
+    ray_graph_free(g);
+    return r;
+}
+
 /* An eq-plus-range conjunction (an unsplit AND: a graph run without the
- * optimizer) probes the lazy hash for its equality. */
+ * optimizer) probes the lazy hash for its equality.  The range keeps
+ * every row: a range that keeps only a few chunks of a generation-2 v
+ * prunes the chain from v's chunk statistics first (exec_filter_chain_prune)
+ * and answers the same rows by its scan. */
 static test_result_t test_lazy_eq_range(void) {
     lz_make();
     ray_t* tbl = ray_env_get(ray_sym_intern("A", 1));
@@ -3190,18 +3205,17 @@ static test_result_t test_lazy_eq_range(void) {
     TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));   /* scans: pending */
     TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
     uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_EQRANGE];
-    ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
-                                           ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))),
-                             ray_le(g, ray_scan(g, "v"), ray_const_i64(g, 5)));
-    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
-    ray_graph_free(g);
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 1);
-    ray_t* v = ray_table_col(r, ray_sym_intern("v", 1));
-    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && ((int64_t*)ray_data(v))[0] == 2);
-    ray_release(r);
-    TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_EQRANGE], hits0 + 1);
-    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    for (int pass = 0; pass < 2; pass++) {
+        ray_t* r = lz_eq_range(tbl, pass ? 5 : 300000);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 1);
+        ray_t* v = ray_table_col(r, ray_sym_intern("v", 1));
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && ((int64_t*)ray_data(v))[0] == 2);
+        ray_release(r);
+        if (!pass) {
+            TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_EQRANGE], hits0 + 1);
+            TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        }
+    }
     PASS();
 }
 

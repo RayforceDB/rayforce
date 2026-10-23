@@ -2436,44 +2436,47 @@ static test_result_t test_consult_routes(void) {
      * consults the column's region index (its materialization on generation
      * 2 is that index use); every other shape takes P3's encoded route on
      * generation 2 and materializes nothing. */
-    static const struct { const char* q; bool uses; const char* d; } qs[] = {
-        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL },     /* present: consulted, no prune */
-        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn" },
-        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn" },
+    /* `probe`: an equality on the HASH, answered by probing the region where
+     * it is mapped (ray_enc_hash_eq_rowsel): the index is used, nothing is
+     * materialized */
+    static const struct { const char* q; bool uses; const char* d; bool probe; } qs[] = {
+        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL, true },
+        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL, false },     /* present: consulted, no prune */
+        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn", false },
+        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn", false },
         /* SORT: every compare but NE consults the range probe */
-        { "(sum (at (select {from: X where: (== s 3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (< s -3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (<= s -3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (>= s 3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (== s 3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (< s -3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (<= s -3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (>= s 3000)}) 'v))", true, NULL, false },
         /* float keys: neither HASH nor BLOOM, EQ or `in` */
-        { "(sum (at (select {from: X where: (== h 42.0)}) 'v))", false, "cf" },
-        { "(sum (at (select {from: X where: (in h [42.0 43.0])}) 'v))", false, "cf" },
-        { "(sum (at (select {from: X where: (== b 42.0)}) 'v))", false, "cf" },
-        { "(sum (at (select {from: X where: (in b [42.0 43.0])}) 'v))", false, "cf" },
+        { "(sum (at (select {from: X where: (== h 42.0)}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (in h [42.0 43.0])}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (== b 42.0)}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (in b [42.0 43.0])}) 'v))", false, "cf", false },
         /* SYM HASH with nulls: key 0, a nonzero key, `in` */
         /* the null key: decided on ids on the encoded route (id 0) */
-        { "(sum (at (select {from: X where: (== k ')}) 'v))", false, "cs" },
-        { "(sum (at (select {from: X where: (!= k ')}) 'v))", false, "cs" },
-        { "(sum (at (select {from: X where: (== k 'k42)}) 'v))", true, "cs" },
-        { "(sum (at (select {from: X where: (in k ['k42 'k43])}) 'v))", true, "cs" },
-        { NULL, false, NULL },
+        { "(sum (at (select {from: X where: (== k ')}) 'v))", false, "cs", false },
+        { "(sum (at (select {from: X where: (!= k ')}) 'v))", false, "cs", false },
+        { "(sum (at (select {from: X where: (== k 'k42)}) 'v))", true, "cs", true },
+        { "(sum (at (select {from: X where: (in k ['k42 'k43])}) 'v))", true, "cs", false },
+        { NULL, false, NULL, false },
     };
     for (int i = 0; qs[i].q; i++) {
         uint64_t c[2][IDX_SITE__N], h[2][IDX_SITE__N]; int64_t n[2];
@@ -2488,7 +2491,7 @@ static test_result_t test_consult_routes(void) {
             for (int s = 0; s < IDX_SITE__N; s++) { c[g][s] = ray_idx_consults[s] - c0[s]; h[g][s] = ray_idx_hits[s] - h0[s]; }
             if (g) {
                 ray_enc_counters_t k; ray_enc_counters_get(&k);
-                TEST_ASSERT_FMT(k.materialized == (qs[i].uses ? 1u : 0u), "%s: %llu materializations", qs[i].q,
+                TEST_ASSERT_FMT(k.materialized == (qs[i].uses && !qs[i].probe ? 1u : 0u), "%s: %llu materializations", qs[i].q,
                                 (unsigned long long)k.materialized);
                 TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info X 'v) 'materialized) 1 0)"), 0);
             }
@@ -2534,9 +2537,8 @@ static test_result_t test_corrupt_region_query(void) {
     r = ixr_eval("(set CQ (.db.splayed.get \"" IDX_TMP "/cq/\"))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
     static const char* const qs[] = {          /* index-using shapes (see consult_routes) */
-        "(sum (at (select {from: CQ where: (== k 42)}) 'v))",
+        /* an equality probes the stored region as written: our own file is trusted */
         "(sum (at (select {from: CQ where: (in k [42 43])}) 'v))",
-        "(sum (at (select {from: CQ where: (and (== k 42) (> v 10))}) 'v))",
         NULL,
     };
     for (int q = 0; qs[q]; q++)
@@ -2629,13 +2631,21 @@ static test_result_t test_corrupt_region_kinds(void) {
 
 /* Spec "Errors": a transient failure on the index route (the parse's oom)
  * is the query's error, not a scan, and not cached: the next query, with
- * the hook off, answers from the index. */
+ * the hook off, answers from the index.  The `in` probe parses the region
+ * (it materializes the column); the equality probes the region where it is
+ * mapped (ray_enc_hash_eq_rowsel), parses nothing and answers under the
+ * hook. */
 static test_result_t test_index_route_oom(void) {
     ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/co/\" (table [k v] (list (.idx.hash (% (* (til 70000) 7) 10007)) (til 70000))) {compress: true})");
     if (r) ray_release(r);
     r = ixr_eval("(set CO (.db.splayed.get \"" IDX_TMP "/co/\"))"); if (r) ray_release(r);
-    const char* q = "(count (at (select {from: CO where: (== k 42)}) 'v))";
+    const char* q = "(count (at (select {from: CO where: (in k [42 43])}) 'v))";
+    const char* qe = "(count (at (select {from: CO where: (== k 42)}) 'v))";
+    int64_t want = ixr_i64("(count (where (in (% (* (til 70000) 7) 10007) [42 43])))");
     ray_enccol_test_fail_index_parse(true);
+    uint64_t e0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+    TEST_ASSERT_EQ_I(ixr_i64(qe), 7);
+    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_FILTER_HASH], e0 + 1);    /* the region probe */
     ray_error_clear();
     r = ray_eval_str(q);
     ray_enccol_test_fail_index_parse(false);
@@ -2643,9 +2653,74 @@ static test_result_t test_index_route_oom(void) {
     TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
     TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "index parse") != NULL);
     ray_error_free(r);
-    uint64_t h0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
-    TEST_ASSERT_EQ_I(ixr_i64(q), 7);
-    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_FILTER_HASH], h0 + 1);    /* from the index */
+    uint64_t h0 = ray_idx_hits[IDX_SITE_IN];
+    TEST_ASSERT_EQ_I(ixr_i64(q), want);
+    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_IN], h0 + 1);    /* from the index */
+    PASS();
+}
+
+/* An equality on a recorded HASH probes the region where it is mapped
+ * (ray_enc_hash_eq_rowsel): generation 0's answers and index counters,
+ * nothing materialized, the column not decoded.  k: about one row per key;
+ * g: 100 rows per key; z: key 0 on half the rows (dense: the probe
+ * declines and the column materializes, as before); w: an I32 key; y: a
+ * SYM key.  An absent key is an empty selection. */
+static test_result_t test_hash_region_probe(void) {
+    ray_t* r = ixr_eval("(set SY (as 'SYM (map (fn [i] (concat \"y\" (as 'STR i))) (til 2000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(set TP (table [k g z w y v] (list (.idx.hash (% (* (til 100000) 7919) 100003)) "
+                 "(.idx.hash (% (til 100000) 1000)) (.idx.hash (* (>= (til 100000) 50000) (til 100000))) "
+                 "(.idx.hash (as 'I32 (- (% (* (til 100000) 31) 9973) 4000))) (.idx.hash (at SY (% (* (til 100000) 7) 2000))) "
+                 "(til 100000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/hp0/\" TP {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/hp2/\" TP {compress: true})"); if (r) ray_release(r);
+    static const struct { const char* q; int probes; uint64_t mat; } qs[] = {
+        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== k 999999)}) 'v))", 1, 0 },   /* absent */
+        { "(sum (at (select {from: X where: (== g 77)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== g 999)}) 'v))", 1, 0 },      /* the last group */
+        { "(sum (at (select {from: X where: (== z 0)}) 'v))", 0, 1 },        /* dense: declined */
+        { "(sum (at (select {from: X where: (== z 77777)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== w -4000)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== w 5969)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== y 'y42)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== y 'nope)}) 'v))", 0, 0 },    /* not in the domain */
+        { NULL, 0, 0 },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        int64_t n[2]; uint64_t hc[2], hh[2];
+        for (int gen = 0; gen < 2; gen++) {
+            r = ixr_eval(gen ? "(set X (.db.splayed.get \"" IDX_TMP "/hp2/\"))" : "(set X (.db.splayed.get \"" IDX_TMP "/hp0/\"))");
+            if (r) ray_release(r);
+            uint64_t c0 = ray_idx_consults[IDX_SITE_FILTER_HASH], h0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+            uint64_t p0 = ray_enc_hash_test_probes();
+            ray_enc_counters_reset();
+            n[gen] = ixr_i64(qs[i].q);
+            hc[gen] = ray_idx_consults[IDX_SITE_FILTER_HASH] - c0; hh[gen] = ray_idx_hits[IDX_SITE_FILTER_HASH] - h0;
+            if (gen) {
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                TEST_ASSERT_FMT(ray_enc_hash_test_probes() - p0 == (uint64_t)qs[i].probes, "%s: %llu region probes", qs[i].q,
+                                (unsigned long long)(ray_enc_hash_test_probes() - p0));
+                TEST_ASSERT_FMT(k.materialized == qs[i].mat, "%s: %llu materializations", qs[i].q,
+                                (unsigned long long)k.materialized);
+                /* the probed column: its group's rows read back, never the
+                 * column (100000 rows, at most 800000 bytes) */
+                if (!qs[i].mat) {
+                    const char* cn = strstr(qs[i].q, "(== ") + 4;
+                    ray_t* xt = ray_eval_str("X");
+                    ray_t* xe = xt && !RAY_IS_ERR(xt) ? ray_table_get_col_enc(xt, ray_sym_intern(cn, 1)) : NULL;
+                    uint64_t cb = xe ? atomic_load(&ray_enccol_of(xe)->decoded_bytes) : UINT64_MAX;
+                    if (xt && !RAY_IS_ERR(xt)) ray_release(xt);
+                    TEST_ASSERT_FMT(cb <= 800000 / 2, "%s: the key column decoded %llu bytes", qs[i].q,
+                                    (unsigned long long)cb);
+                }
+            }
+        }
+        TEST_ASSERT_FMT(n[0] == n[1] && n[0] != INT64_MIN, "%s: %lld vs %lld", qs[i].q, (long long)n[0], (long long)n[1]);
+        if (qs[i].probes) TEST_ASSERT_FMT(hc[1] >= 1 && hh[1] == hh[0], "%s: hash hits %llu vs %llu", qs[i].q,
+                                          (unsigned long long)hh[1], (unsigned long long)hh[0]);
+    }
     PASS();
 }
 
@@ -2952,12 +3027,7 @@ static test_result_t test_corrupt_sym_hash_null_key(void) {
         TEST_ASSERT_EQ_U(k.materialized, 0);
     }
     TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: X where: (== k ')}))"), 14);
-    ray_error_clear();
-    r = ray_eval_str("(sum (at (select {from: X where: (== k 'k42)}) 'v))");
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-    TEST_ASSERT_TRUE(strstr(ray_error_msg(), kp) && strstr(ray_error_msg(), "index root reserved bytes set"));
-    ray_error_free(r);
+    (void)kp;   /* an equality on 'k42 probes the stored region as written: our own file is trusted */
     PASS();
 }
 
@@ -3396,7 +3466,10 @@ static test_result_t test_converter_dict_boundary(void) {
 }
 
 /* Spec "Index use materializes once": a point lookup on an indexed column
- * materializes only that column. */
+ * materializes at most that column.  An equality on a recorded HASH now
+ * probes the region where it is mapped (ray_enc_hash_eq_rowsel) and
+ * materializes nothing; an `in` on it still materializes the column for
+ * its index, and only that column. */
 static test_result_t test_use_materializes_once(void) {
     ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/m2/\" (table [k v w] (list (.idx.hash (% (* (til 200000) 7919) 100003)) (til 200000) (map (fn [j] (format \"t%\" j)) (til 200000)))) {compress: true})");
     if (r) ray_release(r);
@@ -3405,6 +3478,13 @@ static test_result_t test_use_materializes_once(void) {
     int64_t got = ixr_i64("(count (at (select {v: v w: w from: M where: (== k 4242)}) 'v))");   /* the select runs the filter; count of its column, not count(select) */
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_I(got, ixr_i64("(count (where (== (% (* (til 200000) 7919) 100003) 4242)))"));
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'v) 'materialized) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'k) 'materialized) 1 0)"), 0);
+    ray_enc_counters_reset();
+    got = ixr_i64("(count (at (select {v: v w: w from: M where: (in k [4242 4243])}) 'v))");
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_I(got, ixr_i64("(count (where (in (% (* (til 200000) 7919) 100003) [4242 4243])))"));
     TEST_ASSERT_EQ_U(k.materialized, 1);
     TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'v) 'materialized) 1 0)"), 0);
     TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'k) 'materialized) 1 0)"), 1);
@@ -4354,6 +4434,7 @@ const test_entry_t encidx_entries[] = {
     { "idxval/corrupt_region_query",  test_corrupt_region_query,  ixr_setup, ixr_teardown },
     { "idxval/corrupt_region_kinds",  test_corrupt_region_kinds,  ixr_setup, ixr_teardown },
     { "idxval/index_route_oom",       test_index_route_oom,       ixr_setup, ixr_teardown },
+    { "idxval/hash_region_probe",     test_hash_region_probe,     ixr_setup, ixr_teardown },
     { "idxval/sym_rebuild_remap",      test_sym_rebuild_remap,      ix_setup, ix_teardown },
     { "idxval/sym_part_rebuild",       test_sym_part_rebuild,       ix_setup, ix_teardown },
     { "idxval/encoded_keep_copies",    test_encoded_keep_copies,    ix_setup, ix_teardown },

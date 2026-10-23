@@ -9645,6 +9645,361 @@ static test_result_t test_select_derived_key_gen2_no_decode(void) {
     PASS();
 }
 
+/* A compressed (generation 2) column whose whole decode would not stay
+ * cached (ray_enccol_decode_kept, under a test budget: every column, or for
+ * the composite key, whose keys the row map reads decoded, the two 8-byte
+ * ones) is read by range by the computed keys and the count-distinct paths:
+ * a by-dict value over it is evaluated a range at a time (50 vectors: the
+ * ranges cross the 64 K-row chunks), a renamed one is grouped as its slot, a
+ * computed key beside a distinct output is evaluated by range, the global
+ * count distinct of its scan and the grouped count distincts are counted by
+ * the bounded kernel.  Every query answers as over the plain table — nulls,
+ * SYM keys of three widths, empty results — and none leaves such a column
+ * decoded whole. */
+static test_result_t test_select_gen2_ranged_no_decode(void) {
+    ray_t* r = ray_eval_str(
+        ray_test_tmp("(do (set __gr_i (til 140000)) "
+        "    (set __gr_h (% (* __gr_i 2654435761) 1000003)) "
+        "    (set __gr_nz (at [0N 0 0 0 0 0 0] (% __gr_i 7))) "
+        "    (set __gr_et (+ 2013.07.01D00:00:00.000000000 (+ (at [0 0 0 0 0 0 0 0 0 0 0 0 0N] (% __gr_i 13)) (* 1000000000 (% (* __gr_h 13) 86400))))) "
+        "    (set __gr_u (+ __gr_nz (+ 1000000000 (% (+ (* __gr_h 7919) __gr_i) 9000)))) "
+        "    (set __gr_r (as 'I32 (+ (at [0 0 0 0 0 0 0 0 0 0N] (% __gr_i 10)) (sqrt (as 'F64 (% (* __gr_h __gr_h) 2500)))))) "
+        "    (set __gr_s8 (at (as 'SYMBOL (map (fn [k] (if (< k 3) \"\" (format \"m%\" k))) (til 40))) (% (* (% __gr_h 997) 3) 40))) "
+        "    (set __gr_s16 (at (as 'SYMBOL (map (fn [k] (if (== k 0) \"\" (format \"p%\" k))) (til 3000))) (% (* (% (* __gr_h __gr_h) 1009) 13) 3000))) "
+        "    (set __gr_s32 (as 'SYMBOL (map (fn [k] (format \"w%\" k)) (% __gr_h 70001)))) "
+        "    (set __gr_T (table [u et r s8 s16 s32] (list __gr_u __gr_et __gr_r __gr_s8 __gr_s16 __gr_s32))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_gen2_ranged/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_gen2_ranged/t/\" __gr_T \"/tmp/rf_test_gen2_ranged/t.sym\" {compress: true}) "
+        "    (set __gr_F (.db.splayed.get \"/tmp/rf_test_gen2_ranged/t/\" \"/tmp/rf_test_gen2_ranged/t.sym\")) "
+        "    (set __gr_nv (fn [v] (if (== (type v) 'SYM) (as 'STR v) v))) "
+        "    (set __gr_fp (fn [x] (if (== (type x) 'TABLE) (ser (xasc (table (cols x) (map (fn [c] (__gr_nv (at x c))) (cols x))) (cols x))) x))) "
+        "    0)"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(r), "setup: %s", ray_error_msg() ? ray_error_msg() : "");
+    ray_release(r);
+    ray_t* F = ray_eval_str("__gr_F");
+    TEST_ASSERT_NOT_NULL(F); TEST_ASSERT_FALSE(RAY_IS_ERR(F));
+    static const char* const C[] = { "u", "et", "r", "s8", "s16", "s32" };
+    enum { NC = sizeof C / sizeof C[0] };
+    ray_t* E[NC];
+    for (int c = 0; c < NC; c++) {
+        E[c] = ray_table_get_col_enc(F, ray_sym_intern(C[c], strlen(C[c])));
+        TEST_ASSERT_FMT(E[c] != NULL, "column %s is not stored encoded", C[c]);
+        TEST_ASSERT_NULL(ray_enccol_decoded_peek(E[c]));
+    }
+    static const struct { const char* q; int64_t kept; } Q[] = {
+#define GR_ALL 1
+        { "(select {from: %s by: {u: u m: (minute et) s: s16} c: (count u)})", GR_ALL },
+        { "(select {from: %s by: {m: (minute et) s: s8} c: (count u)})", GR_ALL },
+        { "(select {from: %s by: {s: s32 h: (+ (hour et) r)} c: (count u)})", GR_ALL },
+        { "(select {from: %s by: (minute et) d: (count (distinct u))})", GR_ALL },
+        { "(count (distinct (at %s 'u)))", GR_ALL },
+        { "(count (distinct (at %s 'r)))", GR_ALL },
+        { "(count (distinct (at %s 's16)))", GR_ALL },
+        { "(count (distinct (at %s 's32)))", GR_ALL },
+        { "(select {from: %s by: r d: (count (distinct u))})", GR_ALL },
+        { "(select {from: %s by: r c: (count u) a: (avg u) d: (count (distinct u))})", GR_ALL },
+        { "(select {from: %s by: s8 d: (count (distinct u)) where: (!= s8 \"\")})", GR_ALL },
+        { "(select {from: %s by: s16 d: (count (distinct u)) where: (!= s16 \"\")})", GR_ALL },
+        { "(select {from: %s by: r d: (count (distinct u)) where: (< u -5)})", GR_ALL },
+        { "(select {from: %s by: {u: u m: (minute et)} c: (count u) where: (< u -5)})", GR_ALL },
+        { "(select {from: %s by: [r s8] d: (count (distinct u)) where: (!= s8 \"\")})", 600000 },
+        { "(select {from: %s by: [r s8] d: (count (distinct u))})", 600000 },
+#undef GR_ALL
+    };
+    ray_key_range_rows_set_for_test(50 * RAY_MORSEL_ELEMS);
+    const char* why = NULL;
+    size_t at = 0;
+    int64_t wm = ray_heap_anon_watermark();
+    for (; at < sizeof Q / sizeof Q[0] && !why; at++) {
+        ray_heap_set_anon_watermark(1);         /* no decode kept from the query before */
+        ray_enccol_cache_trim();
+        ray_heap_set_anon_watermark(wm);
+        ray_enccol_test_kept_limit(Q[at].kept);
+        char qf[1024], qt[1024], q[2600];
+        snprintf(qf, sizeof qf, Q[at].q, "__gr_F");
+        snprintf(qt, sizeof qt, Q[at].q, "__gr_T");
+        snprintf(q, sizeof q, "(do (set __gr_a (__gr_fp %s)) (set __gr_b (__gr_fp %s)) (if (== (count __gr_a) (count __gr_b)) (all (== __gr_a __gr_b)) false))", qf, qt);
+        ray_t* same = ray_eval_str(q);
+        if (!same || RAY_IS_ERR(same)) why = "error";
+        else if (same->type != -RAY_BOOL || !same->b8) why = "answers differ";
+        if (same) ray_release(same);
+        for (int c = 0; c < NC && !why; c++)
+            if (!ray_enccol_decode_kept(E[c]) && ray_enccol_decoded_peek(E[c])) why = C[c];
+    }
+    ray_key_range_rows_set_for_test(0);
+    ray_enccol_test_kept_limit(0);
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_gen2_ranged/\")"));
+    ray_release(cleanup);
+    ray_release(F);
+    TEST_ASSERT_FMT(!why, "query %zu %s: %s", at - 1, Q[at - 1].q, why ? why : "");
+    PASS();
+}
+
+/* ---- The exact top-N-by-count grouping (ops/query.c select_topk_hh) ----
+ * 200 K rows over 110 K groups: thirteen heavy ones (800-900 rows, four tied
+ * at 850 and two at 820, so a cut of 4, 6 or 10 falls inside a tie), the
+ * rest of one or two rows; u a wide I64 with null keys, et a timestamp with
+ * nulls (a null minute), s a 3000-symbol column with empty (null) symbols,
+ * s8 / x narrow keys a dense plan takes, v a count input with nulls.  The
+ * rows are permuted so first rows are spread.  __tk_eq: the same columns,
+ * the same values in the same order (symbols as text). */
+static const char* const TK_SETUP =
+    "(do (set __tk_n 200000) (set __tk_i (til __tk_n)) "
+    "    (set __tk_o (% (* __tk_i 7919) __tk_n)) "
+    "    (set __tk_hc [900 880 860 850 850 850 850 840 830 820 820 810 805]) "
+    "    (set __tk_H (sum __tk_hc)) "
+    "    (set __tk_isH (as 'I64 (< __tk_o __tk_H))) "
+    "    (set __tk_g (+ (* __tk_isH (bin (- (sums __tk_hc) __tk_hc) __tk_o)) "
+    "                   (* (- 1 __tk_isH) (+ 1000 (% (* (- __tk_o __tk_H) 13) 110000))))) "
+    "    (set __tk_nul (fn [x m] (at (concat x [0N]) (+ __tk_i (* m (- __tk_n __tk_i)))))) "
+    "    (set __tk_u (__tk_nul (+ 400000000000000000 (* (div __tk_g 3) 1000003)) (as 'I64 (== (% __tk_g 7) 3)))) "
+    "    (set __tk_et (+ 2013.07.01D00:00:00.000000000 (+ (* 60000000000 (__tk_nul (% __tk_g 1440) "
+    "        (as 'I64 (== (% __tk_g 11) 7)))) (* 1000000000 (% __tk_i 60))))) "
+    "    (set __tk_s (at (as 'SYMBOL (map (fn [k] (if (< k 300) \"\" (format \"p%\" k))) (til 3000))) (% __tk_g 3000))) "
+    "    (set __tk_s8 (at (as 'SYMBOL (map (fn [k] (format \"m%\" k)) (til 40))) (% __tk_g 40))) "
+    "    (set __tk_x (as 'I32 (% __tk_g 50))) "
+    "    (set __tk_v (__tk_nul __tk_i (as 'I64 (== (% __tk_i 5) 0)))) "
+    "    (set __tk_T (table [u et s s8 x v] (list __tk_u __tk_et __tk_s __tk_s8 __tk_x __tk_v))) "
+    "    (set __tk_nv (fn [v] (if (== (type v) 'SYM) (as 'STR v) v))) "
+    "    (set __tk_eq (fn [A B] (and (== (count A) (count B)) (== (count (cols A)) (count (cols B))) "
+    "        (all (== (cols A) (cols B))) "
+    "        (all (map (fn [c] (all (== (ser (__tk_nv (at A c))) (ser (__tk_nv (at B c)))))) (cols A)))))) "
+    "    0)";
+
+/* Query q answered with the path armed (from 1000 rows) and with it off:
+ * NULL when both give the same table, else why; *route the path's route
+ * (0: the path did not run). */
+static const char* tk_compare(const char* q, int64_t* route) {
+    char e[2048];
+    int64_t s0[10], s1[10];
+    ray_group_topk_stats_for_test(s0);
+    ray_group_topk_min_rows_set_for_test(1000);
+    snprintf(e, sizeof e, "(set __tk_a %s)", q);
+    ray_t* a = ray_eval_str(e);
+    ray_group_topk_stats_for_test(s1);
+    ray_group_topk_min_rows_set_for_test(INT64_MAX);
+    snprintf(e, sizeof e, "(set __tk_b %s)", q);
+    ray_t* b = ray_eval_str(e);
+    ray_group_topk_min_rows_set_for_test(0);
+    *route = s1[0] + s1[1] + s1[2] + s1[8] != s0[0] + s0[1] + s0[2] + s0[8] ? s1[3] : 0;
+    const char* why = NULL;
+    if (!a || RAY_IS_ERR(a) || !b || RAY_IS_ERR(b)) why = "error";
+    if (a) ray_release(a);
+    if (b) ray_release(b);
+    if (!why) {
+        ray_t* same = ray_eval_str("(and (> (count __tk_a) 0) (__tk_eq __tk_a __tk_b))");
+        if (!same || RAY_IS_ERR(same) || same->type != -RAY_BOOL || !same->b8) why = "answers differ";
+        if (same) ray_release(same);
+    }
+    return why;
+}
+
+/* The top groups by count, taken in two passes, are the grouping's cut —
+ * keys, counts, which tied groups are kept at the N-th count and their
+ * order (first row) — over the table in memory, splayed plain and splayed
+ * compressed (generation 2: read by range), with null keys, a computed
+ * key (minute over a timestamp with nulls, integer arithmetic), several
+ * count outputs, the output written before the clauses; ranges of 64 K
+ * rows, so the passes run on the pool over several ranges.  Narrow keys a
+ * dense plan would take (key order, not first rows) are left to it. */
+static test_result_t test_select_topk_count_exact(void) {
+    ray_t* r = ray_eval_str(TK_SETUP);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(r), "setup: %s", ray_error_msg() ? ray_error_msg() : "");
+    ray_release(r);
+    r = ray_eval_str(ray_test_tmp("(do (.sys.exec \"rm -rf /tmp/rf_test_topk/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_topk/p/\" __tk_T \"/tmp/rf_test_topk/p.sym\" {compress: false}) "
+        "    (.db.splayed.set \"/tmp/rf_test_topk/c/\" __tk_T \"/tmp/rf_test_topk/c.sym\" {compress: true}) "
+        "    (set __tk_P (.db.splayed.get \"/tmp/rf_test_topk/p/\" \"/tmp/rf_test_topk/p.sym\")) "
+        "    (set __tk_C (.db.splayed.get \"/tmp/rf_test_topk/c/\" \"/tmp/rf_test_topk/c.sym\")) "
+        "    (at (.idx.info __tk_C 'u) 'gen))"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(r), "save: %s", ray_error_msg() ? ray_error_msg() : "");
+    TEST_ASSERT_EQ_I(r->i64, 2);
+    ray_release(r);
+    static const struct { const char* q; int route; } Q[] = {
+        { "(select {from: %s by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 4})", 1 },
+        { "(select {from: %s by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 6})", 1 },
+        { "(select {from: %s by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 10})", 1 },
+        { "(select {from: %s by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 1})", 1 },
+        { "(select {from: %s by: u c: (count u) desc: c take: 6})", 1 },
+        { "(select {from: %s by: [u s] c: (count v) d: (count u) desc: d take: 4})", 1 },
+        { "(select {from: %s by: {k: (- u 7) s: s} c: (count s) desc: c take: 5})", 1 },
+        { "(select {from: %s by: {k: (+ (div u 1000003) 1) s: s} c: (count s) desc: c take: 5})", 3 },
+        { "(select {c: (count u) from: %s by: [s u] desc: c take: 3})", 1 },
+        { "(select {from: %s by: {w: u m: (minute et)} n: (count et) desc: n take: 12})", 1 },
+        { "(select {from: %s by: [x s8] c: (count u) desc: c take: 5})", 3 },
+        { "(select {from: %s by: x c: (count u) desc: c take: 5})", 3 },
+        { "(select {from: %s by: s8 c: (count u) desc: c take: 5})", 3 },
+        { "(select {from: %s by: [u s] c: (count u) take: 5})", 0 },
+        { "(select {from: %s by: [u s] c: (count u) asc: c take: 5})", 0 },
+    };
+    static const char* const TB[] = { "__tk_T", "__tk_P", "__tk_C" };
+    ray_key_range_rows_set_for_test(64 * RAY_MORSEL_ELEMS);
+    ray_group_topk_mem_gate_set_for_test(1);   /* past the budget: the path runs */
+    const char* why = NULL;
+    size_t at = 0, tb = 0;
+    int64_t route = 0;
+    for (; at < sizeof Q / sizeof Q[0] && !why; at++)
+        for (tb = 0; tb < (Q[at].route == 1 ? 3u : 1u) && !why; tb++) {   /* the others over memory */
+            char q[1024];
+            snprintf(q, sizeof q, Q[at].q, TB[tb]);
+            why = tk_compare(q, &route);
+            if (!why && route != Q[at].route) why = "route";
+        }
+    ray_key_range_rows_set_for_test(0);
+    ray_group_topk_mem_gate_set_for_test(0);
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_topk/\")"));
+    ray_release(cleanup);
+    TEST_ASSERT_FMT(!why, "query %zu over %s: %s (route %lld)", at - 1, TB[tb - 1], why ? why : "", (long long)route);
+    PASS();
+}
+
+/* The guards of the two-pass path: fewer groups than the take (every group
+ * found: E = 0), every group tied (2000 groups of 100 rows: all candidates,
+ * answered; 100 K groups of 2 rows: the grouping answers), the check
+ * failing (four counters a worker, one
+ * range: T <= E, the grouping answers — the candidates alone would miss the
+ * heavy groups), near-unique keys (pass A stops at an eighth of the rows),
+ * and a hash cut to 3 bits: eight hash values hold every key, so pass B
+ * separates the 2600 groups under them by their key values; cut to 5 bits,
+ * the candidate cut drops hashes holding heavy groups and E_eff sends the
+ * query to the grouping. */
+static test_result_t test_select_topk_count_guards(void) {
+    ray_t* r = ray_eval_str(TK_SETUP);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(r), "setup: %s", ray_error_msg() ? ray_error_msg() : "");
+    ray_release(r);
+    r = ray_eval_str(
+        "(do (set __tk_F (table [u] (list (+ 400000000000000000 (* 1000000007 (% (div __tk_i 7) 5)))))) "
+        "    (set __tk_A2 (table [u w] (list (+ 400000000000000000 (* 1000003 (% (* __tk_i 7919) 2000))) (% __tk_i 3)))) "
+        "    (set __tk_A3 (table [u w] (list (+ 400000000000000000 (* 1000003 (% (* __tk_i 7919) 100000))) (% __tk_i 3)))) "
+        "    (set __tk_U (table [a b] (list (* __tk_i 1000003) (as 'I32 (% (* __tk_i 2654435761) 2147483629))))) "
+        "    (set __tk_W (table [u s] (list (+ 400000000000000000 (* 1000003 (% __tk_g 2600))) "
+        "        (at (as 'SYMBOL (map (fn [k] (format \"w%\" k)) (til 40))) (% (% __tk_g 2600) 40))))) "
+        "    0)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    static const struct { const char* q; int64_t range, counters; int bits; int route; } Q[] = {
+        { "(select {from: __tk_F by: u c: (count u) desc: c take: 10})", 64, 0, 0, 1 },
+        { "(select {from: __tk_A2 by: u c: (count w) desc: c take: 10})", 64, 0, 0, 1 },
+        { "(select {from: __tk_A3 by: u c: (count w) desc: c take: 10})", 256, 0, 0, 2 },
+        { "(select {from: __tk_T by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 10})", 256, 4, 0, 2 },
+        { "(select {from: __tk_T by: u c: (count u) desc: c take: 3})", 256, 4, 0, 2 },
+        { "(select {from: __tk_U by: [a b] c: (count a) desc: c take: 10})", 64, 0, 0, 4 },
+        { "(select {from: __tk_W by: [u s] c: (count u) desc: c take: 10})", 64, 0, 3, 1 },
+        { "(select {from: __tk_W by: [u s] c: (count u) desc: c take: 10})", 64, 0, 5, 2 },
+        { "(select {from: __tk_W by: {s: s u: u} c: (count s) desc: c take: 12})", 64, 0, 3, 1 },
+    };
+    const char* why = NULL;
+    size_t at = 0;
+    int64_t route = 0, st[10] = {0};
+    bool merged = true;
+    ray_group_topk_mem_gate_set_for_test(1);   /* past the budget: the path runs */
+    for (; at < sizeof Q / sizeof Q[0] && !why; at++) {
+        ray_key_range_rows_set_for_test(Q[at].range * RAY_MORSEL_ELEMS);
+        ray_group_topk_counters_set_for_test(Q[at].counters);
+        ray_group_topk_hash_bits_set_for_test(Q[at].bits);
+        why = tk_compare(Q[at].q, &route);
+        ray_group_topk_stats_for_test(st);
+        if (!why && route != Q[at].route) why = "route";
+        if (!why && Q[at].bits == 3) merged &= st[7] > st[6] && st[6] <= 8;
+    }
+    ray_key_range_rows_set_for_test(0);
+    ray_group_topk_counters_set_for_test(0);
+    ray_group_topk_hash_bits_set_for_test(0);
+    ray_group_topk_mem_gate_set_for_test(0);
+    TEST_ASSERT_FMT(!why, "query %zu %s: %s (route %lld)", at - 1, Q[at - 1].q, why ? why : "", (long long)route);
+    TEST_ASSERT_TRUE(merged);    /* keys under one hash, told apart */
+    r = ray_eval_str("(count __tk_a)");   /* the last answer: the 2600 groups' top 12 */
+    TEST_ASSERT_EQ_I(r->i64, 12);
+    ray_release(r);
+    r = ray_eval_str("(count (select {from: __tk_F by: u c: (count u) desc: c take: 10}))");
+    TEST_ASSERT_EQ_I(r->i64, 5);
+    ray_release(r);
+
+    /* the pass B tables within their budget: 2000 candidates of one key
+     * (32-byte slots) fit 4 MB over the workers and are answered, with one
+     * table at most a worker's share; under 64 KB a worker could not hold
+     * them and the grouping answers, pass B not run */
+    ray_pool_t* pool = ray_pool_get();
+    int64_t W = pool ? (int64_t)ray_pool_total_workers(pool) : 1;
+    static const struct { int64_t budget; int route; } XB[] = { { (int64_t)4 << 20, 1 }, { (int64_t)64 << 10, 2 } };
+    int64_t xb[2] = {0};
+    ray_group_topk_mem_gate_set_for_test(1);
+    ray_key_range_rows_set_for_test(64 * RAY_MORSEL_ELEMS);
+    for (at = 0; at < 2 && !why; at++) {
+        ray_group_topk_ex_budget_set_for_test(XB[at].budget);
+        why = tk_compare("(select {from: __tk_A2 by: u c: (count w) desc: c take: 10})", &route);
+        ray_group_topk_stats_for_test(st);
+        xb[at] = st[9];
+        if (!why && route != XB[at].route) why = "route";
+    }
+    ray_group_topk_ex_budget_set_for_test(0);
+
+    /* a by-dict name of an input column other than {x: x} is the grouping's
+     * error ("alias shadows"), so the path does not take it: the same error
+     * either way, the path not run */
+    static const char* const SH[] = {
+        "(select {from: __tk_T by: {u: s} c: (count v) desc: c take: 3})",
+        "(select {from: __tk_T by: {u: (- u 1) m: (minute et)} c: (count v) desc: c take: 3})",
+    };
+    int64_t runs0[10], runs1[10];
+    ray_group_topk_stats_for_test(runs0);
+    ray_group_topk_min_rows_set_for_test(1000);
+    bool shadow_err = true;
+    for (size_t i = 0; i < 2; i++) {
+        ray_t* e = ray_eval_str(SH[i]);
+        shadow_err &= e && RAY_IS_ERR(e);
+        if (e) ray_release(e);
+    }
+    ray_group_topk_stats_for_test(runs1);
+    ray_group_topk_min_rows_set_for_test(0);
+    ray_group_topk_mem_gate_set_for_test(0);
+    ray_key_range_rows_set_for_test(0);
+    TEST_ASSERT_FMT(!why, "pass B budget %zu: %s (route %lld)", at - 1, why ? why : "", (long long)route);
+    TEST_ASSERT_TRUE(xb[0] > 0 && xb[0] * W <= XB[0].budget);
+    TEST_ASSERT_EQ_I(xb[1], 0);
+    TEST_ASSERT_TRUE(shadow_err);
+    TEST_ASSERT_EQ_I(runs1[0] + runs1[1] + runs1[2] + runs1[8], runs0[0] + runs0[1] + runs0[2] + runs0[8]);
+    PASS();
+}
+
+/* The memory gate: the two passes run only when the grouping would outgrow
+ * the memory budget (ray_heap_mem_budget).  200 K rows of an 8-byte key, a
+ * computed one and a 2-byte symbol plus the count, 26 bytes each, are a
+ * grouping of about 5 MB: a 64 GB budget leaves it to the grouping (route
+ * 5), a 16 MB one, under four times that, takes the two passes (route 1);
+ * both answer as the grouping. */
+static test_result_t test_select_topk_count_mem_gate(void) {
+    ray_t* r = ray_eval_str(TK_SETUP);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(r), "setup: %s", ray_error_msg() ? ray_error_msg() : "");
+    ray_release(r);
+    static const struct { int64_t budget; int route; } B[] = {
+        { (int64_t)64 << 30, 5 },
+        { (int64_t)16 << 20, 1 },
+        { (int64_t)64 << 30, 5 },
+    };
+    const char* q = "(select {from: __tk_T by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 6})";
+    int64_t prev = ray_heap_mem_budget() != ray_sys_ram_limit() ? ray_heap_mem_budget() : 0;
+    ray_key_range_rows_set_for_test(64 * RAY_MORSEL_ELEMS);
+    const char* why = NULL;
+    size_t at = 0;
+    int64_t route = 0;
+    for (; at < sizeof B / sizeof B[0] && !why; at++) {
+        ray_heap_set_anon_watermark(B[at].budget);
+        why = tk_compare(q, &route);
+        if (!why && route != B[at].route) why = "route";
+    }
+    ray_heap_set_anon_watermark(prev);
+    ray_key_range_rows_set_for_test(0);
+    TEST_ASSERT_FMT(!why, "budget %zu: %s (route %lld)", at - 1, why ? why : "", (long long)route);
+    PASS();
+}
+
 /* The two-pass grouping with every key empty stores no key bytes: it answers
  * as the unarmed grouping cut afterwards (a sanitizer build checks the
  * pointer arithmetic over the empty key store). */
@@ -10843,6 +11198,10 @@ const test_entry_t lang_entries[] = {
     { "lang/select/derived_key_two_pass_empty_keys", test_select_derived_key_two_pass_empty_keys, lang_setup, lang_teardown },
     { "lang/select/derived_key_two_pass", test_select_derived_key_two_pass, lang_setup, lang_teardown },
     { "lang/select/derived_key_gen2_no_decode", test_select_derived_key_gen2_no_decode, lang_setup, lang_teardown },
+    { "lang/select/gen2_ranged_no_decode", test_select_gen2_ranged_no_decode, lang_setup, lang_teardown },
+    { "lang/select/topk_count_exact", test_select_topk_count_exact, lang_setup, lang_teardown },
+    { "lang/select/topk_count_guards", test_select_topk_count_guards, lang_setup, lang_teardown },
+    { "lang/select/topk_count_mem_gate", test_select_topk_count_mem_gate, lang_setup, lang_teardown },
     { "lang/select/releases_input_table",  test_select_releases_input_table,  lang_setup, lang_teardown },
     { "lang/temporal/extract_builtins_fn",      test_temporal_extract_builtins_fn,      lang_setup, lang_teardown },
     { "lang/temporal/extract_time_atom",        test_temporal_extract_time_atom,        lang_setup, lang_teardown },

@@ -320,6 +320,18 @@ ray_t* ray_enccol_materialize(ray_t* encv);
  * never decodes and is safe against a concurrent materialize. */
 ray_t* ray_enccol_decoded_peek(ray_t* encv);
 
+/* Whether a whole decode of the column would stay cached from one
+ * statement to the next: its generation-0 bytes fit the budget
+ * ray_enccol_cache_trim keeps (a quarter of the anonymous watermark; no
+ * watermark keeps everything).  A consumer that can read the column by
+ * range does so when it would not: such a decode takes the column's whole
+ * size at once and is dropped at the statement's end, so every query pays
+ * it again.  Metadata only. */
+bool   ray_enccol_decode_kept(ray_t* encv);
+/* Test hook: a positive budget replaces the quarter of the watermark in
+ * ray_enccol_decode_kept until reset to 0. */
+void   ray_enccol_test_kept_limit(int64_t bytes);
+
 /* At a statement boundary: drop the whole-column decodes, least recently
  * asked for first, until those still kept fit a quarter of the anonymous
  * watermark.  A decode something else retains is neither counted nor
