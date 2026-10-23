@@ -5243,7 +5243,7 @@ static ray_t* key_eval_by_range(ray_t* v, ray_t* tbl) {
         ray_release(r);
     }
     key_range_unbind(&p, srcs, bound);
-    if (err || declined) {
+    if (err || declined || !out) {
         if (out) ray_release(out);
         return err;
     }
