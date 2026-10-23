@@ -1,0 +1,28 @@
+;; #950: batch append plus indexed amend on global vs local state.
+;; Run an optimized build: rayforce -c 1 -f bench/local_mutation/local_mutation.rfl
+(set N 500)
+(set syms (take [a b c d e f g h i j] N))
+(set mkP (fn [] (table [ts sym qty]
+  (list (as 'I64 []) (as 'SYM []) (as 'I64 [])))))
+(set runG (fn [steps]
+  (set state {}) (set state.P (mkP)) (set state.q (take 0 N)) (set k 0)
+  (while (< k steps)
+    (insert 'state.P (list (take k N) syms state.q))
+    (alter 'state.q set (til 10) (+ (take k 10) 1))
+    (set k (+ k 1)))
+  (list (count state.P) (sum state.q))))
+(set runL (fn [steps]
+  (let P (mkP)) (let q (take 0 N)) (let k 0)
+  (while (< k steps)
+    (insert 'P (list (take k N) syms q))
+    (alter 'q set (til 10) (+ (take k 10) 1))
+    (let k (+ k 1)))
+  (list (count P) (sum q))))
+
+(runG 10)
+(runL 10)
+(map (fn [steps]
+  (println (list steps (runG steps) (runL steps)))
+  (println (list "global-ms" (med (map (fn [i] (timeit (runG steps))) (til 5)))))
+  (println (list "local-ms" (med (map (fn [i] (timeit (runL steps))) (til 5))))))
+  [1000 2000])

@@ -49,6 +49,21 @@ ray_t*    ray_env_get_local(int64_t sym_id);
 /* A dotted name's leaf sits under a global chain of dicts held only once. */
 bool      ray_env_dotted_sole(int64_t sym_id, ray_t* leaf);
 
+/* A quoted mutator resolves once, then publishes into that same binding.
+ * scope is a frame index, or -1 for a global; dotted means dict traversal. */
+typedef struct {
+    int64_t name;
+    int64_t root;
+    int32_t scope;
+    bool dotted;
+} ray_env_target_t;
+ray_err_t ray_env_target_resolve(int64_t name, ray_env_target_t* target,
+                                 ray_t** value);
+ray_err_t ray_env_target_set(const ray_env_target_t* target, ray_t* value);
+/* refs counts the mutator's owning refs, excluding binding/VM mirror refs. */
+bool ray_env_target_sole(const ray_env_target_t* target, ray_t* value,
+                          uint32_t refs);
+
 /* User-facing binder.  Refuses any name starting with `.` — that root is
  * reserved for system namespaces (.sys, .os, .io, .ipc, …) populated by
  * builtin registration.  Returns RAY_ERR_RESERVED in that case. */
@@ -214,7 +229,7 @@ uint32_t  ray_env_query_serial(void);
  * sync: write the frame's (possibly let-updated) values back into the
  * slots, then pop the frame. */
 ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
-                             const uint8_t* rows, ray_t* self_obj);
+                             uint8_t* rows, ray_t* self_obj);
 void      ray_env_scope_sync(const int64_t* syms, int32_t n, ray_t** slots);
 
 #endif /* RAY_ENV_H */

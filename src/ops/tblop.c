@@ -1324,6 +1324,10 @@ static ray_t* alter_store_cell(ray_t* var, int64_t i, ray_t* elem) {
     return r;
 }
 
+static ray_t* alter_target(ray_t** args, int64_t n,
+                           const ray_env_target_t* target, ray_t* var,
+                           ray_t* name_sym);
+
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
     if (n < 3) return ray_error("domain", "alter: expects at least 3 arguments (var, op, ...), got %lld", (long long)n);
     /* First arg: evaluate to get the symbol */
@@ -1331,17 +1335,24 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
     if (!name_sym || RAY_IS_ERR(name_sym)) return name_sym ? name_sym : ray_error("type", "alter: variable name argument evaluated to null");
     if (name_sym->type != -RAY_SYM) { int8_t nt = name_sym->type; ray_release(name_sym); return ray_error("type", "alter: variable name must be a symbol, got %s", ray_type_name(nt)); }
 
-    /* Resolve the variable */
-    ray_t* var = ray_env_get(name_sym->i64);
-    if (!var) { ray_release(name_sym); return ray_error("name", NULL); }
-    /* alter writes through ray_env_set, which binds globally.  Refuse a
-     * local target before any mutation rather than reading the local and
-     * silently replacing a different (global) binding. */
-    if (ray_env_get_local(name_sym->i64)) {
+    ray_env_target_t target;
+    ray_t* var = NULL;
+    ray_err_t err = ray_env_target_resolve(name_sym->i64, &target, &var);
+    if (err != RAY_OK) {
         ray_release(name_sym);
-        return ray_error("domain", "alter: local bindings are not supported");
+        return ray_error(ray_err_code_str(err), "alter: cannot resolve target binding");
     }
+    /* Argument evaluation can rebind the target or grow a scope frame. Keep
+     * the original value alive and publish through the resolved scope. */
+    ray_retain(var);
+    ray_t* result = alter_target(args, n, &target, var, name_sym);
+    ray_release(var);
+    return result;
+}
 
+static ray_t* alter_target(ray_t** args, int64_t n,
+                           const ray_env_target_t* target, ray_t* var,
+                           ray_t* name_sym) {
     /* Second arg: operation name (unevaluated, must be a name) */
     ray_t* op = args[1];
     if (!op || op->type != -RAY_SYM) { ray_release(name_sym); return ray_error("type", "alter: op must be a symbol (set, concat, or remove), got %s", op ? ray_type_name(op->type) : "null"); }
@@ -1385,49 +1396,27 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
                 }
             }
             ray_release(idx); ray_release(val);
-            ray_env_set(name_sym->i64, new_list);
+            ray_err_t bind_err = ray_env_target_set(target, new_list);
             ray_release(new_list);
+            if (bind_err != RAY_OK) {
+                ray_release(name_sym);
+                return ray_error(ray_err_code_str(bind_err), "alter: cannot publish target");
+            }
             /* In-place amend returns the symbol, not the altered value. */
             return name_sym;
         }
 
-        /* `var` came from ray_env_get as a BORROWED ref.  ray_cow's
-         * contract is "I take your owning ref; I give you back a ref"
-         * — so calling it on a borrow over-decrements the env's
-         * binding when the rc>1 copy path fires (releasing v drops
-         * env's count from N to N-1; if some other env binding also
-         * pointed at v, that binding now sees an extra under-retain
-         * and risks UAF when later replaced).
-         *
-         * Retain up-front so the ref we hand to ray_cow is genuinely
-         * ours.  Track the original pointer so the cow-OOM path
-         * (alloc_copy fails before ray_cow's release would have run)
-         * can still release the retain — without that, OOM leaks the
-         * extra ref. */
+        /* The wrapper pins the original across argument evaluation. This
+         * retain is the owning input consumed by ray_cow. The binding plus
+         * these two refs (and a known compiled-slot mirror, if any) are not
+         * aliases. Every other owner, including a slice's parent reference,
+         * forces a copy. For dotted targets the entire dict/values chain
+         * must also be private before any leaf is written. */
         ray_t* original_var = var;
         ray_retain(var);
-        /* `alter` amends in place, and ray_cow only copies what is shared —
-         * but the retain above is unconditional, so ray_cow's own `rc == 1`
-         * test could never be true here and the copy path fired on every
-         * call.  A one-element write copied the whole vector, and the cost
-         * of an alter scaled with the vector's length rather than with the
-         * write.  Sole ownership after our retain is `rc == 2`: the
-         * binding's reference and ours.  The other three exclusions keep the
-         * previous behaviour exactly — ray_cow returns an arena block as-is,
-         * and a slice or a mapped block is not ours to write through. */
-        /* A dotted name is a candidate only when the whole chain is ours.
-         * ray_env_get resolves `d.x` to the leaf living inside the container,
-         * which typically holds the only reference to it — so the leaf passes
-         * an rc test that says nothing about whether the CONTAINER is shared.
-         * Writing through it would be seen by every alias of the dict or
-         * table, and env_set_dotted's COW-rebuild of the chain cannot undo a
-         * write that already happened.  ray_env_dotted_sole checks every dict
-         * on the path (and its vals list) is held once; a table head, a
-         * shadowed head or any shared level keeps the copy. */
         bool dotted = ray_sym_is_dotted(name_sym->i64);
-        bool sole = (!dotted || ray_env_dotted_sole(name_sym->i64, var)) &&
-                    var->rc == 2 && var->mmod == 0 &&
-                    !(var->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+        /* The wrapper's pin and this branch's retain are our two refs. */
+        bool sole = ray_env_target_sole(target, var, 2);
         ray_t* cow_result = sole ? var : ray_cow(var);
         /* ray_cow returns NULL when ray_alloc_copy returned NULL (heap
          * exhaustion past RAY_HEAP_MAX_ORDER) and a RAY_ERROR pointer
@@ -1440,10 +1429,6 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
             return ray_alter_set_cow_fail(original_var, cow_result, idx, val, name_sym);
         }
         var = cow_result;
-        /* A value written in place can break the order a `sorted` marker
-         * promises (consumers trust it without re-checking). */
-        var->attrs &= (uint8_t)~RAY_ATTR_SORTED;
-
         /* Validate idx shape + (for the atom case) bounds BEFORE we
          * touch any state.  The accelerator-index drop below would
          * otherwise outlive a failed write. */
@@ -1463,6 +1448,9 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
                 return ray_error("index", NULL);
             }
         }
+
+        /* Only a validated write invalidates the physical-order promise. */
+        var->attrs &= (uint8_t)~RAY_ATTR_SORTED;
 
         /* alter's set path writes via store_typed_elem, which bypasses
          * ray_vec_set's mutation guard.  Now that we know the write
@@ -1514,11 +1502,17 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
         /* A dotted leaf written in place is already where the chain points;
          * rebinding it would only copy each dict on the way up.  The index
          * drop above may still have copied it, and that copy must be bound. */
-        if (!(dotted && sole && var == original_var)) ray_env_set(name_sym->i64, var);
+        ray_err_t bind_err = RAY_OK;
+        if (!(dotted && sole && var == original_var))
+            bind_err = ray_env_target_set(target, var);
         /* The retain-first at the top of the set path gave us an owning
-         * ref to var; ray_env_set retained its own for the binding, so
+         * ref to var; target_set retained its own for the binding, so
          * drop ours.  In-place amend returns the symbol, not the value. */
         ray_release(var);
+        if (bind_err != RAY_OK) {
+            ray_release(name_sym);
+            return ray_error(ray_err_code_str(bind_err), "alter: cannot publish target");
+        }
         return name_sym;
     }
     if (olen == 6 && memcmp(oname, "concat", 6) == 0) {
@@ -1529,9 +1523,13 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
         if (!val || RAY_IS_ERR(val)) { ray_release(name_sym); return val ? val : ray_error("type", "alter concat: value argument evaluated to null"); }
         ray_t* new_vec = ray_concat_fn(var, val);
         ray_release(val);
-        if (RAY_IS_ERR(new_vec)) { ray_release(name_sym); return new_vec; }
-        ray_env_set(name_sym->i64, new_vec);
+        if (!new_vec || RAY_IS_ERR(new_vec)) { ray_release(name_sym); return new_vec ? new_vec : ray_error("oom", NULL); }
+        ray_err_t bind_err = ray_env_target_set(target, new_vec);
         ray_release(new_vec);
+        if (bind_err != RAY_OK) {
+            ray_release(name_sym);
+            return ray_error(ray_err_code_str(bind_err), "alter: cannot publish target");
+        }
         /* In-place amend returns the symbol, not the altered value. */
         return name_sym;
     }
@@ -1593,8 +1591,12 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
             }
         }
         new_list->len = j;
-        ray_env_set(name_sym->i64, new_list);
+        ray_err_t bind_err = ray_env_target_set(target, new_list);
         ray_release(new_list);
+        if (bind_err != RAY_OK) {
+            ray_release(name_sym);
+            return ray_error(ray_err_code_str(bind_err), "alter: cannot publish target");
+        }
         /* In-place amend returns the symbol, not the altered value. */
         return name_sym;
     }
