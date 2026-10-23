@@ -78,6 +78,9 @@
 
 #include <rayforce.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 typedef struct ray_sym_domain_s ray_sym_domain_t;
@@ -133,37 +136,130 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos);
 
 /* Raw vocabulary access for a FILE domain: the bytes of the entries the
  * file holds, read straight from the mapping — no atom, no lock.  Pin
- * takes an atomically published snapshot of (map, offsets, count).
+ * takes an atomically published snapshot of (map, block table, count); an
+ * entry is found from the checkpoint of its block of RAY_SYM_INDEX_STRIDE
+ * entries.
  *
  * LIFETIME: a snapshot stays readable across in-process appends
  * (ray_sym_domain_intern, _batch, flush) for as long as its holder keeps
  * the domain alive.  It does NOT survive a reopen of the same symfile
  * after another process grew it (ray_sym_domain_open on a cached path:
- * the extend frees the mapping and offsets it replaces).  Nothing counts
- * pins, so this is a rule for callers: never hold a snapshot across a
- * call that may reopen (.db.parted.get, splayed reads, ray_sym_domain_open),
- * and never reopen from a thread while another runs a kernel over the
- * domain.  Today every reopen runs on the calling thread between kernels.
+ * the extend frees the mapping and block table it replaces).  Nothing
+ * counts pins, so this is a rule for callers: never hold a snapshot across
+ * a call that may reopen (.db.parted.get, splayed reads,
+ * ray_sym_domain_open), and never reopen from a thread while another runs
+ * a kernel over the domain.  Today every reopen runs on the calling thread
+ * between kernels.
  *
  * Returns false for the runtime domain or an empty file; the caller then
  * resolves through ray_sym_domain_str as before.  Only positions below
  * `count` (the file prefix) are readable this way; runtime-appended
- * positions keep going through ray_sym_domain_str.  Unpin is a no-op kept
- * for symmetry. */
+ * positions keep going through ray_sym_domain_str.  ray_sym_domain_raw_str
+ * returns NULL (and *len 0) for a position out of range.  Unpin is a no-op
+ * kept for symmetry.
+ *
+ * A compressed symfile (each record FSST-coded, see domain.c) has `z` set:
+ * its strings are decoded into a small ring of buffers of the calling
+ * thread, so a pointer ray_sym_domain_raw_str returns for it stays valid
+ * only until that thread's RAY_SYM_RAW_RING-th next read of a compressed
+ * entry.  Enough for a comparison of two entries; a caller that keeps
+ * pointers longer copies the bytes (or reads their lengths with
+ * ray_sym_domain_raw_len, which decodes nothing). */
+#define RAY_SYM_INDEX_STRIDE 28   /* entries in a block of the index: 64 bytes with its offset */
+typedef struct {
+    uint64_t off;                          /* byte offset of the block's first record */
+    uint16_t len[RAY_SYM_INDEX_STRIDE];    /* the entries' string lengths, 65535 = 65535 or longer */
+} ray_sym_ixblk_t;
+_Static_assert(sizeof(ray_sym_ixblk_t) == 64, "an index block is one cache line");
+#define RAY_SYM_RAW_RING 4   /* decode buffers per thread for compressed entries */
 typedef struct {
     const unsigned char* map;
-    const size_t*        offsets;
+    const ray_sym_ixblk_t* ib;   /* block k: starts at map + ib[k].off; NULL: none */
     int64_t              count;
+    void*                blk;    /* the domain's block table */
+    ray_sym_domain_t*    dom;
+    const void*          z;      /* the symbol table of a compressed file; NULL: plain */
 } ray_sym_domain_raw_t;
 bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out);
+/* Reads the file of a FILE domain whole into the page cache, in parallel,
+ * when the memory left after it (the RAM limit less the committed heap and
+ * the files read so far) is at least `headroom`; else leaves it lazy.  Once
+ * per domain.  RAY_SYM_PRELOAD=0 never reads, =1 always; RAY_SYM_TRACE
+ * prints the decision. */
+void ray_sym_domain_preload(ray_sym_domain_t* dom, int64_t headroom);
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom);
+const char* ray_sym_domain_raw_str_z(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len);
+/* Entry `pos` (below r->count) of a compressed file decoded into `out`, which
+ * holds its length (ray_sym_domain_raw_len) and 8 bytes more: a caller that
+ * keeps the bytes places them itself. */
+void ray_sym_domain_raw_decode(const ray_sym_domain_raw_t* r, int64_t pos, char* out);
 static inline const char* ray_sym_domain_raw_str(const ray_sym_domain_raw_t* r,
                                                  int64_t pos, size_t* len) {
-    const unsigned char* rec = r->map + r->offsets[pos];
-    uint32_t l; memcpy(&l, rec, 4);
+    if (pos < 0 || pos >= r->count || !r->ib) { *len = 0; return NULL; }
+    if (r->z) return ray_sym_domain_raw_str_z(r, pos, len);
+    /* past the records before the entry by their lengths (65535: the
+     * record header's) */
+    const int64_t k = pos / RAY_SYM_INDEX_STRIDE;
+    const unsigned char* p = r->map + r->ib[k].off;
+    for (int64_t i = k * RAY_SYM_INDEX_STRIDE; i < pos; i++) {
+        uint32_t l = r->ib[k].len[i - k * RAY_SYM_INDEX_STRIDE];
+        if (l == 65535) memcpy(&l, p, 4);
+        p += 4 + (size_t)l;
+    }
+    uint32_t l; memcpy(&l, p, 4);
     *len = l;
-    return (const char*)rec + 4;
+    return (const char*)p + 4;
 }
+/* The length of entry `pos`'s string (-1 where ray_sym_domain_raw_str would
+ * give NULL): from its length (2 bytes in the index), without reading the
+ * record, unless the string is 65535 bytes or longer (the escape) — then
+ * its record header (4 bytes).  For a function of a string's length per
+ * symbol (strlen per code), so that a vocabulary's lengths are read and
+ * not its strings. */
+static inline int64_t ray_sym_domain_raw_len(const ray_sym_domain_raw_t* r, int64_t pos) {
+    if (pos < 0 || pos >= r->count || !r->ib) return -1;
+    const uint16_t e = r->ib[pos / RAY_SYM_INDEX_STRIDE].len[pos % RAY_SYM_INDEX_STRIDE];
+    if (e < 65535) return e;
+    size_t l = 0;
+    (void)ray_sym_domain_raw_str(r, pos, &l);
+    return (int64_t)l;
+}
+/* The same for any domain and position (the appended ones from their atom). */
+int64_t ray_sym_domain_strlen(ray_sym_domain_t* dom, int64_t pos);
+
+/* What the record index did for a FILE domain, for tests: the open took
+ * its blocks from the index file (covering `covered` entries), and whether
+ * the lengths are read from the index file. */
+typedef struct {
+    bool    from_index;    /* the open took the table from the index file */
+    bool    lens_mapped;   /* the lengths are read from the index file, as needed */
+    int64_t covered;       /* entries the index covered */
+} ray_sym_domain_ix_info_t;
+bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out);
+
+/* What the record index guarantees, and where it stops (domain.c):
+ *   - An index is taken only for the very file it was written for: the
+ *     inode, the modification and status-change times and the size it
+ *     records match the file mapped.  The status-change time cannot be set
+ *     back by a writer, so an in-place rewrite, even with its modification
+ *     time restored, is not taken for the same file.  Any other index —
+ *     another file of the name, the file grown or rewritten by a writer
+ *     that left the index as it was, an earlier format — is not used: the
+ *     open walks every record once and writes the index anew.  Where the
+ *     platform has no such identity (Windows, WASM) every open walks.
+ *   - The symfile and its index are ours: an index taken is read as
+ *     written, its blocks and the records they name are not checked. */
+
+/* The symfile's record index, `<symfile>.ix` (format in domain.c): written
+ * by the writers of a symfile so that opening it reads neither the records
+ * nor their lengths.  Save: ckpt[k] is the byte offset of the record of
+ * entry k * RAY_SYM_INDEX_STRIDE, n = ceil(count / RAY_SYM_INDEX_STRIDE),
+ * lens[i] the length of entry i's string (65535: 65535 or longer), the first
+ * `count` records ending at byte `end`; best effort, and a no-op for a small
+ * file.  Remove: before a new file is made under the name. */
+void ray_sym_domain_index_save(const char* path, const uint64_t* ckpt, int64_t n,
+                               const uint16_t* lens, int64_t count, uint64_t end);
+void ray_sym_domain_index_remove(const char* path);
 
 /* Position of `str` in the domain, or -1 if absent.
  * FILE: builds the reverse index on first call (O(|vocabulary|)). */
@@ -243,6 +339,16 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable);
  * `durable` also syncs the file and its directory, even when nothing new
  * was interned. */
 ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable);
+
+/* Rewrite the plain symfile at `path` compressed: each string coded with an
+ * FSST symbol table trained on a sample of them (domain.c, "STRZ"), the
+ * positions, lengths and index kept.  For a file written whole and read
+ * after, such as one column's vocabulary: reads of an entry then decode it
+ * (ray_sym_domain_raw_str), and the file and the memory it takes when read
+ * shrink.  No domain may have the file open (RAY_ERR_DOMAIN).  A file with
+ * no entries, one already compressed or one no table helps stays as it is
+ * (RAY_OK). */
+ray_err_t ray_sym_domain_compress(const char* path);
 
 /* RAY_SYM_AUDIT=1 support (cached at ray_sym_init): when set,
  * ray_sym_vec_cell cross-checks every resolution and aborts with full

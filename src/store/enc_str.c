@@ -23,7 +23,7 @@
 
 /* STR codec bodies (spec "Codec bodies", STR_DICT and FSST).  Pure
  * functions over one vector; the STR_DICT entries and the FSST table are
- * side data the caller validates and passes in. */
+ * side data the caller passes in. */
 
 #include "store/enc.h"
 #include "store/fsst.h"
@@ -43,13 +43,8 @@ bool ray_enc_strdict_write(const uint64_t* codes, int n, ray_enc_buf_t* out) {
     return ray_enc_write(codes, n, K_U32, RAY_ENC_SLOT_CODES, 1, NULL, out, &c);
 }
 
-int64_t ray_enc_strdict_read(const uint8_t* p, size_t avail, int n, uint32_t dict_n, uint64_t* codes) {
-    int64_t a = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_CODES, 1, NULL, codes);
-    if (a < 0) return -1;                                       /* the child reader named it */
-    if ((size_t)a != avail) return ray_enc_read_fail("bytes after the STR_DICT body");
-    for (int i = 0; i < n; i++)
-        if (codes[i] >= dict_n) return ray_enc_read_fail("STR_DICT code at or above the entry count");
-    return a;
+void ray_enc_strdict_read(const uint8_t* p, size_t avail, int n, uint64_t* codes) {
+    (void)ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_CODES, 1, NULL, codes);
 }
 
 /* ---- FSST: child `lengths`, u64 total_bytes, compressed bytes padded to 8 ---- */
@@ -88,39 +83,14 @@ bool ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint6
     return false;
 }
 
-int64_t ray_enc_fsst_check(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
-                           uint64_t* clen, uint64_t* xlen, const uint8_t** bytes) {
-    if (n < 0 || n > RAY_ENC_VEC) return ray_enc_read_fail("FSST vector length");
+void ray_enc_fsst_parse(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
+                        uint64_t* clen, uint64_t* xlen, const uint8_t** bytes) {
     int64_t a = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_FSST_LENGTHS, 1, NULL, clen);
-    if (a < 0) return -1;                                       /* the child reader named it */
-    size_t rest = avail - (size_t)a;
-    if (rest < 8) return ray_enc_read_fail("FSST total short");
-    uint64_t total; memcpy(&total, p + a, 8);
-    rest -= 8;
-    uint64_t sum = 0;
-    for (int i = 0; i < n; i++) {
-        /* The U32 kind already bounds each length; the check keeps the
-         * (uint32_t) cast below exact and the sum free of overflow
-         * (n <= 1024). */
-        if (clen[i] > UINT32_MAX) return ray_enc_read_fail("FSST slice length above 4 GiB");
-        sum += clen[i];
-    }
-    if (sum != total) return ray_enc_read_fail("FSST total not the sum of lengths");
-    if (total > rest || p8(total) > rest) return ray_enc_read_fail("FSST compressed bytes short");
-    if (p8(total) != rest) return ray_enc_read_fail("bytes after the FSST body");
-    const uint8_t* b = p + a + 8;
-    for (uint64_t i = total; i < p8(total); i++)
-        if (b[i]) return ray_enc_read_fail("FSST padding");
+    const uint8_t* b = p + a + 8;                               /* past the u64 total */
     uint64_t at = 0;
     for (int i = 0; i < n; i++) {
-        /* -1: a code in [n_symbols, 255) or an escape as the slice's last
-         * byte (its literal would be in the next slice). */
-        int64_t x = ray_fsst_expanded_len(t, b + at, (uint32_t)clen[i]);
-        if (x < 0) return ray_enc_read_fail("FSST slice");
-        if ((uint64_t)x > UINT32_MAX) return ray_enc_read_fail("FSST expansion above 4 GiB");
-        xlen[i] = (uint64_t)x;
+        xlen[i] = (uint64_t)ray_fsst_expanded_len(t, b + at, (uint32_t)clen[i]);
         at += clen[i];
     }
     *bytes = b;
-    return (int64_t)avail;
 }

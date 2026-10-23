@@ -25,6 +25,7 @@
   #define _GNU_SOURCE
 #endif
 
+#include "store/enccol.h"    /* ray_enccol_cache_trim after a request */
 #include "core/ipc.h"
 #include "core/mcast.h"
 #include "core/timer.h"
@@ -508,7 +509,8 @@ static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
     if (!payload) { if (fallback) ray_error_free(fallback); return; }
-    if (ray_ser_raw(payload, result) != ser_size) {
+    int64_t  wrote    = ray_ser_raw(payload, result);
+    if (wrote != ser_size) {
         /* The write phase disagrees with the size phase (an encoded column
          * failed to decode): never send the frame, answer with an error. */
         ray_free_raw(payload);
@@ -1195,6 +1197,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * one between two requests.  Stamping on frame arrival instead would
      * make the measured gap the request's own duration. */
     ray_heap_note_activity();
+    ray_enccol_cache_trim();
     ray_heap_relieve();
 
     return NULL;

@@ -428,9 +428,8 @@ static test_result_t test_write_core_count(void) {
     bool same = ok && r[0] && r[1] && r[2] && n[1] == n[0] && n[2] == n[0] &&
                 memcmp(r[1], r[0], n[0]) == 0 && memcmp(r[2], r[0], n[0]) == 0;
     ray_enc_idx_view_t iv;
-    ray_t* verr = r[0] ? ray_enc_index_validate(r[0], n[0], RAY_IDX_HASH, RAY_I64, 0, N, 0, NULL, "col x", &iv) : NULL;
-    bool valid = r[0] && !verr && iv.order_len == 2;
-    if (verr) ray_error_free(verr);
+    if (r[0]) ray_enc_index_view(r[0], n[0], RAY_IDX_HASH, RAY_I64, 0, N, &iv);
+    bool valid = r[0] && iv.order_len == 2;
     for (int w = 0; w < 3; w++) free(r[w]);
     free(d);
     TEST_ASSERT_EQ_I(back, RAY_OK);
@@ -443,31 +442,16 @@ static test_result_t test_write_core_count(void) {
     PASS();
 }
 
-/* ===== Validation (spec "Index validation") ===== */
+/* ===== Reading a region (ray_enc_index_view) ===== */
 
-/* Validate the region of v's index (sym_bound for SYM columns). */
-static ray_t* ix_validate(const uint8_t* b, size_t n, ray_t* v, uint32_t bound, ray_enc_idx_view_t* out) {
+/* The view of the region of v's index. */
+static void ix_view(const uint8_t* b, size_t n, ray_t* v, ray_enc_idx_view_t* out) {
     ray_index_t* ix = ray_index_payload(v->index);
-    return ray_enc_index_validate(b, n, ix->kind, v->type, v->attrs, v->len, bound,
-                                  ray_data(v), "col x", out);
+    ray_enc_index_view(b, n, ix->kind, v->type, v->attrs, v->len, out);
 }
-/* Expect `corrupt` whose message contains `why`. */
-static test_result_t ix_expect_corrupt(const uint8_t* b, size_t n, ray_t* v, uint32_t bound, const char* why) {
-    ray_enc_idx_view_t iv;
-    ray_error_clear();
-    ray_t* e = ix_validate(b, n, v, bound, &iv);
-    TEST_ASSERT_FMT(e != NULL, "accepted: %s", why);
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), why) != NULL, "message '%s', want '%s'", ray_error_msg(), why);
-    TEST_ASSERT_TRUE(strstr(ray_error_msg(), "col x") != NULL);
-    ray_error_free(e);
-    PASS();
-}
-#define IX_CORRUPT(b, n, v, bound, why) do { test_result_t r_ = ix_expect_corrupt((b), (n), (v), (bound), (why)); \
-    if (r_.status != TEST_PASS) return r_; } while (0)
 
-/* Built indexes of every kind validate. */
-static test_result_t test_validate_accepts(void) {
+/* The view of a written region names its fields. */
+static test_result_t test_view_fields(void) {
     int64_t d[3000];
     for (int i = 0; i < 3000; i++) d[i] = (i * 31) % 997;
     ray_t* (*kinds[3])(ray_t**) = { ray_index_attach_hash, ray_index_attach_sort, ray_index_attach_bloom };
@@ -477,7 +461,7 @@ static test_result_t test_validate_accepts(void) {
         size_t n; ray_t* err; uint8_t* b = ix_region(v, NULL, 0, &n, &err);
         TEST_ASSERT_NOT_NULL(b);
         ray_enc_idx_view_t iv;
-        TEST_ASSERT_NULL(ix_validate(b, n, v, 0, &iv));
+        ix_view(b, n, v, &iv);
         TEST_ASSERT_TRUE(iv.base == b && iv.size == n && iv.len == 3000 && iv.order_name == NULL);
         free(b); ray_release(v);
     }
@@ -487,244 +471,13 @@ static test_result_t test_validate_accepts(void) {
     TEST_ASSERT_NOT_NULL(p);
     size_t n; ray_t* err; uint8_t* b = ix_region(p, "ts", 2, &n, &err);
     ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ix_validate(b, n, p, 0, &iv));
+    ix_view(b, n, p, &iv);
     TEST_ASSERT_EQ_I(iv.order_len, 2);
     TEST_ASSERT_TRUE(memcmp(iv.order_name, "ts", 2) == 0);
     TEST_ASSERT_EQ_I(iv.part.n_parts, 30);
     free(b); ray_release(p);
-    /* SYM HASH and SYM PART against the symbol count */
-    ray_t* sv = ray_sym_vec_new(RAY_SYM_W8, 6);
-    static const uint8_t ids[6] = { 3, 3, 5, 5, 7, 7 };
-    memcpy(ray_data(sv), ids, 6); sv->len = 6;
-    ray_retain(sv);
-    ray_t* sh = with_index(sv, ray_index_attach_hash);
-    ray_t* sp = with_index(sv, ray_index_attach_part);
-    TEST_ASSERT_TRUE(sh && sp);
-    b = ix_region(sh, NULL, 0, &n, &err);
-    TEST_ASSERT_NULL(ix_validate(b, n, sh, 8, &iv));
-    IX_CORRUPT(b, n, sh, 7, "SYM");
-    free(b);
-    b = ix_region(sp, NULL, 0, &n, &err);
-    TEST_ASSERT_NULL(ix_validate(b, n, sp, 8, &iv));
-    IX_CORRUPT(b, n, sp, 7, "SYM");
-    { ray_enc_idx_part_t pp; memcpy(&pp, b + 16, 40);
-      uint8_t* m = malloc(n); memcpy(m, b, n); m[pp.keys + 1] = 3;   /* keys 3, 3, 7 */
-      IX_CORRUPT(m, n, sp, 8, "distinct"); free(m); }
-    free(b); ray_release(sh); ray_release(sp);
     PASS();
 }
-
-/* Common rules: root, offsets, extents, padding, tail. */
-static test_result_t test_reject_common(void) {
-    int64_t d[6] = { 5, 7, 5, 9, 7, 5 };
-    ray_t* v = with_index(i64_vec(d, 6), ray_index_attach_hash);
-    size_t n; ray_t* err; uint8_t* b = ix_region(v, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    uint8_t* m = malloc(n);
-    IX_CORRUPT(b, 40, v, 0, "region shorter");                            /* truncated */
-    IX_CORRUPT(b, 0, v, 0, "region shorter");
-    IX_CORRUPT(b, n - 32, v, 0, "layout");                                /* truncated child */
-    memcpy(m, b, n); m[3] = 1;                       IX_CORRUPT(m, n, v, 0, "reserved");
-    memcpy(m, b, n); m[0] = RAY_I32;                 IX_CORRUPT(m, n, v, 0, "parent type");
-    memcpy(m, b, n); m[8] = 7;                       IX_CORRUPT(m, n, v, 0, "built_for_len");
-    memcpy(m, b, n); m[85] = 1;                      IX_CORRUPT(m, n, v, 0, "padding");
-    memcpy(m, b, n); { int64_t o = 100; memcpy(m + 16, &o, 8); }   IX_CORRUPT(m, n, v, 0, "placement");
-    memcpy(m, b, n); { int64_t o = 128; memcpy(m + 16, &o, 8); }   IX_CORRUPT(m, n, v, 0, "placement");
-    /* gkeys moved onto the table (overlap), and past the region */
-    memcpy(m, b, n); { int64_t o = 96; memcpy(m + 16 + 8, &o, 8); }   IX_CORRUPT(m, n, v, 0, "placement");
-    memcpy(m, b, n); { int64_t o = (int64_t)n; memcpy(m + 16 + 24, &o, 8); } IX_CORRUPT(m, n, v, 0, "placement");
-    memcpy(m, b, n); { int64_t o = -32; memcpy(m + 16 + 24, &o, 8); } IX_CORRUPT(m, n, v, 0, "placement");
-    memcpy(m, b, n); { int64_t g = 1 << 30; memcpy(m + 16 + 48, &g, 8); } IX_CORRUPT(m, n, v, 0, "n_groups");
-    memcpy(m, b, n); { int64_t g = -1; memcpy(m + 16 + 48, &g, 8); } IX_CORRUPT(m, n, v, 0, "n_groups");
-    memcpy(m, b, n); { int64_t g = INT64_MAX; memcpy(m + 16 + 40, &g, 8); memcpy(m + 16 + 48, &g, 8); }
-    IX_CORRUPT(m, n, v, 0, "n_keys");
-    memcpy(m, b, n); { uint64_t k = UINT64_MAX; memcpy(m + 16 + 32, &k, 8); } IX_CORRUPT(m, n, v, 0, "power of two");
-    memcpy(m, b, n); { uint64_t k = ((uint64_t)1 << 40) - 1; memcpy(m + 16 + 32, &k, 8); } IX_CORRUPT(m, n, v, 0, "builder's");
-    /* the builder's table for 3 groups is 8 buckets; 16 is refused */
-    memcpy(m, b, n); { uint64_t k = 15; memcpy(m + 16 + 32, &k, 8); } IX_CORRUPT(m, n, v, 0, "builder's");
-    /* a name block where none fits */
-    memcpy(m, b, n); { int64_t o = (int64_t)n - 32; memcpy(m + 16 + 56, &o, 8); } IX_CORRUPT(m, n, v, 0, "name");
-    memcpy(m, b, n); { int64_t o = 0; memcpy(m + 16 + 56, &o, 8); } IX_CORRUPT(m, n, v, 0, "name");
-    memcpy(m, b, n); m[n - 1] = 1;                   IX_CORRUPT(m, n, v, 0, "padding");
-    /* a kind the matrix refuses: SORT claimed on a SYM column */
-    ray_enc_idx_view_t iv;
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_SORT, RAY_SYM, RAY_SYM_W8, 6, 100, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    e = ray_enc_index_validate(b, n, RAY_IDX_BLOOM, RAY_STR, 0, 6, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    e = ray_enc_index_validate(b, n, RAY_IDX_PART, RAY_STR, 0, 6, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    e = ray_enc_index_validate(b, n, RAY_IDX_ZONE, RAY_I64, 0, 6, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "no region"));
-    ray_error_free(e);
-    /* a region whose parent type matches, under a kind the type refuses */
-    { memcpy(m, b, n); m[0] = (uint8_t)RAY_SYM;
-      e = ray_enc_index_validate(m, n, RAY_IDX_SORT, RAY_SYM, RAY_SYM_W8, 6, 100, NULL, "col x", &iv);
-      TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "not admitted"));
-      ray_error_free(e); }
-    /* the region read as another admitted kind of the same type */
-    e = ray_enc_index_validate(b, n, RAY_IDX_BLOOM, RAY_I64, 0, 6, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    e = ray_enc_index_validate(b, n, RAY_IDX_SORT, RAY_I64, 0, 6, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    e = ray_enc_index_validate(b, n, RAY_IDX_PART, RAY_I64, 0, 6, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    /* a negative row count */
-    e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, -1, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0); ray_error_free(e);
-    free(m); free(b); ray_release(v);
-    PASS();
-}
-
-static test_result_t ix_fab_corrupt(ray_t* root, int8_t type, int64_t len, uint32_t bound, const char* why) {
-    size_t n; uint8_t* b = fab_region(root, type, RAY_SYM_W8, len, &n);
-    ray_release(root);
-    TEST_ASSERT_NOT_NULL(b);
-    uint8_t attrs = type == RAY_SYM ? RAY_SYM_W8 : 0;
-    ray_enc_idx_view_t iv;
-    ray_error_clear();
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, type, attrs, len, bound, NULL, "col x", &iv);
-    free(b);
-    TEST_ASSERT_FMT(e != NULL, "accepted: %s", why);
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), why) != NULL, "message '%s', want '%s'", ray_error_msg(), why);
-    ray_error_free(e);
-    PASS();
-}
-#define FAB_CORRUPT(root, type, len, bound, why) do { test_result_t r_ = ix_fab_corrupt((root), (type), (len), (bound), (why)); \
-    if (r_.status != TEST_PASS) return r_; } while (0)
-
-/* A fabricated region with the HASH kind-area field at byte `at` patched
- * to `val` after writing (roots the writer refuses). */
-static test_result_t ix_patch_corrupt(ray_t* root, int at, uint64_t val, const char* why) {
-    size_t n; uint8_t* b = fab_region(root, RAY_I64, 0, 4, &n);
-    ray_release(root);
-    TEST_ASSERT_NOT_NULL(b);
-    memcpy(b + 16 + at, &val, 8);
-    ray_enc_idx_view_t iv;
-    ray_error_clear();
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, 4, 0, NULL, "col x", &iv);
-    free(b);
-    TEST_ASSERT_FMT(e != NULL, "accepted: %s", why);
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), why) != NULL, "message '%s', want '%s'", ray_error_msg(), why);
-    ray_error_free(e);
-    PASS();
-}
-#define PATCH_CORRUPT(root, at, val, why) do { test_result_t r_ = ix_patch_corrupt((root), (at), (val), (why)); \
-    if (r_.status != TEST_PASS) return r_; } while (0)
-
-/* HASH rules on fabricated roots (4 rows, keys 10 and 20). */
-static test_result_t test_reject_hash(void) {
-    int64_t of[3] = { 0, 2, 4 }, rw[4] = { 0, 2, 1, 3 }, gk[2] = { 10, 20 };
-    int64_t t8[8] = { 0 };
-    t8[slot_of(10, 8)] = 1;
-    { uint64_t s2 = slot_of(20, 8); while (t8[s2]) s2 = (s2 + 1) & 7; t8[s2] = 2; }
-    /* the fabrication itself is valid */
-    { size_t n; uint8_t* b = fab_region(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, rw, 4), RAY_I64, 0, 4, &n);
-      ray_enc_idx_view_t iv;
-      TEST_ASSERT_NOT_NULL(b);
-      TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, 4, 0, NULL, "col x", &iv));
-      TEST_ASSERT_EQ_I(iv.hash.n_groups, 2);
-      free(b); }
-    /* roots the writer refuses, patched after writing */
-    PATCH_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, rw, 4), 32, 1, "empty bucket");     /* 2 buckets */
-    PATCH_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, rw, 4), 32, 5, "power of two");     /* 6 buckets */
-    PATCH_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, rw, 4), 40, 5, "n_keys");           /* n_keys > len */
-    PATCH_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, rw, 4), 40, 1, "n_groups");         /* n_keys < n_groups */
-    { int64_t tb[8]; memcpy(tb, t8, sizeof tb); for (int i = 0; i < 8; i++) if (!tb[i]) { tb[i] = 3; break; }
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, tb, 8, gk, 2, of, rw, 4), RAY_I64, 4, 0, "holds 3"); }
-    { int64_t tb[8]; memcpy(tb, t8, sizeof tb); for (int i = 0; i < 8; i++) if (!tb[i]) { tb[i] = -1; break; }
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, tb, 8, gk, 2, of, rw, 4), RAY_I64, 4, 0, "holds -1"); }
-    { int64_t tb[8]; memcpy(tb, t8, sizeof tb); for (int i = 0; i < 8; i++) if (!tb[i]) { tb[i] = 1; break; }
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, tb, 8, gk, 2, of, rw, 4), RAY_I64, 4, 0, "more than one bucket"); }
-    { int64_t tb[8]; memcpy(tb, t8, sizeof tb); for (int i = 0; i < 8; i++) if (tb[i] == 2) tb[i] = 0;
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, tb, 8, gk, 2, of, rw, 4), RAY_I64, 4, 0, "have a bucket"); }
-    { int64_t dup[2] = { 10, 10 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, dup, 2, of, rw, 4), RAY_I64, 4, 0, "lookup"); }
-    { /* one group placed past the empty bucket its key hashes to */
-      int64_t g1[1] = { 123456789 }, o1[2] = { 0, 4 };
-      int64_t tb[8] = { 0 }; tb[(slot_of(g1[0], 8) + 1) & 7] = 1;
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, tb, 8, g1, 1, o1, rw, 4), RAY_I64, 4, 0, "lookup"); }
-    { int64_t bo[3] = { 1, 2, 4 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, bo, rw, 4), RAY_I64, 4, 0, "offs"); }
-    { int64_t bo[3] = { 0, 2, 3 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, bo, rw, 4), RAY_I64, 4, 0, "offs"); }
-    { int64_t bo[3] = { 0, 4, 4 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, bo, rw, 4), RAY_I64, 4, 0, "offs"); }
-    { int64_t bo[3] = { 0, 9, 4 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, bo, rw, 4), RAY_I64, 4, 0, "offs"); }
-    { int64_t bo[3] = { 0, -5, 4 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, bo, rw, 4), RAY_I64, 4, 0, "offs"); }
-    { int64_t br[4] = { 0, 2, 1, 9 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, br, 4), RAY_I64, 4, 0, "rows"); }
-    { int64_t br[4] = { 0, 2, 1, 4 };          /* = len */
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, br, 4), RAY_I64, 4, 0, "rows entry 4"); }
-    { int64_t br[4] = { 0, 2, 1, -1 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, br, 4), RAY_I64, 4, 0, "rows"); }
-    { int64_t br[4] = { 2, 0, 1, 3 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, br, 4), RAY_I64, 4, 0, "ascending"); }
-    { int64_t br[4] = { 0, 2, 0, 3 };
-      FAB_CORRUPT(fab_hash(RAY_I64, 4, t8, 8, gk, 2, of, br, 4), RAY_I64, 4, 0, "unique"); }
-    /* SYM: gkeys must be in [1, bound) */
-    { int64_t sg[2] = { 0, 20 };
-      int64_t ts[8] = { 0 }; ts[slot_of(0, 8)] = 1; uint64_t s2 = slot_of(20, 8); while (ts[s2]) s2 = (s2 + 1) & 7; ts[s2] = 2;
-      FAB_CORRUPT(fab_hash(RAY_SYM, 4, ts, 8, sg, 2, of, rw, 4), RAY_SYM, 4, 30, "SYM"); }
-    { FAB_CORRUPT(fab_hash(RAY_SYM, 4, t8, 8, gk, 2, of, rw, 4), RAY_SYM, 4, 15, "SYM"); }
-    PASS();
-}
-
-/* Sparse rows over a long column: the uniqueness check is bounded by the
- * region, not the claimed row count. */
-static test_result_t test_validate_sparse_rows(void) {
-    int64_t of[3] = { 0, 2, 4 }, gk[2] = { 10, 20 };
-    int64_t big = (int64_t)1 << 40;
-    int64_t t8[8] = { 0 };
-    t8[slot_of(10, 8)] = 1;
-    { uint64_t s2 = slot_of(20, 8); while (t8[s2]) s2 = (s2 + 1) & 7; t8[s2] = 2; }
-    int64_t rw[4] = { 0, big - 1, 5, big - 2 };
-    size_t n; uint8_t* b = fab_region(fab_hash(RAY_I64, big, t8, 8, gk, 2, of, rw, 4), RAY_I64, 0, big, &n);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, big, 0, NULL, "col x", &iv));
-    ray_enc_idx_hash_t h; memcpy(&h, b + 16, 64);
-    int64_t dup = big - 1; memcpy(b + h.rows + 24, &dup, 8);   /* rows { 0, big-1 }, { 5, big-1 } */
-    ray_error_clear();
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, big, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strstr(ray_error_msg(), "unique") != NULL);
-    ray_error_free(e);
-    free(b);
-    PASS();
-}
-
-/* Spec reject fixture: "a STR group unreachable from its word". */
-static test_result_t test_reject_str_unreachable(void) {
-    int64_t gk[1] = { 123456789 }, of[2] = { 0, 2 }, rw[2] = { 0, 1 };
-    int64_t t8[8] = { 0 };
-    uint64_t h = slot_of(gk[0], 8);
-    t8[(h + 1) & 7] = 1;            /* past the empty bucket at h */
-    FAB_CORRUPT(fab_hash(RAY_STR, 2, t8, 8, gk, 1, of, rw, 2), RAY_STR, 2, 0, "unreachable");
-    /* an empty bucket inside the probe path, not the walk's first: a run
-     * of two (homes hw-1, hw), an empty bucket, then a second group of
-     * word w (legal for STR) at hw+2; slot 0 is empty too */
-    int64_t w = 1;
-    while (slot_of(w, 8) < 2 || slot_of(w, 8) > 4) w++;
-    uint64_t hw = slot_of(w, 8);
-    int64_t w0 = 1;
-    while (slot_of(w0, 8) != hw - 1) w0++;
-    int64_t g3[3] = { w0, w, w }, o3[4] = { 0, 1, 2, 3 }, r3[3] = { 0, 1, 2 };
-    int64_t tb[8] = { 0 };
-    tb[hw - 1] = 1; tb[hw] = 2; tb[hw + 2] = 3;
-    FAB_CORRUPT(fab_hash(RAY_STR, 3, tb, 8, g3, 3, o3, r3, 3), RAY_STR, 3, 0, "unreachable");
-    tb[hw + 1] = 3; tb[hw + 2] = 0;                       /* adjacent: reachable */
-    { size_t n; uint8_t* b = fab_region(fab_hash(RAY_STR, 3, tb, 8, g3, 3, o3, r3, 3), RAY_STR, 0, 3, &n);
-      ray_enc_idx_view_t iv;
-      TEST_ASSERT_NOT_NULL(b);
-      TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_STR, 0, 3, 0, NULL, "col x", &iv));
-      free(b); }
-    PASS();
-}
-
 /* Review focus 1 (spec "STR indexes": forced word collisions).  Real rows
  * "alpha", "beta", "alpha"; a fabricated root gives both groups alpha's word
  * and puts beta's group FIRST on that chain, so a probe for "alpha" meets a
@@ -749,7 +502,7 @@ static test_result_t test_str_word_collision(void) {
     size_t n; uint8_t* b = fab_region(root, RAY_STR, 0, 3, &n);
     TEST_ASSERT_NOT_NULL(b);
     ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_STR, 0, 3, 0, NULL, "col x", &iv));
+    ray_enc_index_view(b, n, RAY_IDX_HASH, RAY_STR, 0, 3, &iv);
     TEST_ASSERT_EQ_I(iv.hash.n_groups, 2);
     /* the parsed root: the source's fields and children, and nothing in
      * it refers to the region (freed before the probes) */
@@ -790,146 +543,8 @@ static test_result_t test_str_word_collision(void) {
     PASS();
 }
 
-/* SORT, BLOOM, PART and name-block rules. */
-static test_result_t test_reject_sort_bloom_part(void) {
-    int64_t d[6] = { 4, 2, 9, 1, 3, 3 };
-    ray_t* s = with_index(i64_vec(d, 6), ray_index_attach_sort);
-    size_t n; ray_t* err; uint8_t* b = ix_region(s, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    uint8_t* m = malloc(n + 64);
-    memcpy(m, b, n); { int64_t x = 0; memcpy(m + 96 + 8, &x, 8); memcpy(m + 96, &x, 8); } IX_CORRUPT(m, n, s, 0, "permutation");
-    memcpy(m, b, n); { int64_t x = 6; memcpy(m + 96, &x, 8); } IX_CORRUPT(m, n, s, 0, "permutation");
-    memcpy(m, b, n); { int64_t x = -1; memcpy(m + 96, &x, 8); } IX_CORRUPT(m, n, s, 0, "permutation");
-    memcpy(m, b, n); m[24] = 1;                      IX_CORRUPT(m, n, s, 0, "reserved");   /* kind-area tail */
-    IX_CORRUPT(b, 96, s, 0, "layout");                                                    /* perm cut off */
-    free(b); ray_release(s);
-    ray_t* bl = with_index(i64_vec(d, 6), ray_index_attach_bloom);
-    b = ix_region(bl, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    memcpy(m, b, n); m[16 + 16] = 0;                 IX_CORRUPT(m, n, bl, 0, "BLOOM k");  /* k = 0 */
-    memcpy(m, b, n); m[16 + 16] = 4;                 IX_CORRUPT(m, n, bl, 0, "BLOOM k");  /* k > 3 */
-    memcpy(m, b, n); { int64_t x = 7; memcpy(m + 16 + 24, &x, 8); } IX_CORRUPT(m, n, bl, 0, "n_keys");
-    memcpy(m, b, n); { int64_t x = -1; memcpy(m + 16 + 24, &x, 8); } IX_CORRUPT(m, n, bl, 0, "n_keys");
-    memcpy(m, b, n); m[16 + 20] = 1;                 IX_CORRUPT(m, n, bl, 0, "reserved");
-    memcpy(m, b, n); { uint64_t x = 5; memcpy(m + 16 + 8, &x, 8); } IX_CORRUPT(m, n, bl, 0, "power of two");
-    memcpy(m, b, n); { uint64_t x = 3; memcpy(m + 16 + 8, &x, 8); } IX_CORRUPT(m, n, bl, 0, "power of two");
-    memcpy(m, b, n); { uint64_t x = 11; memcpy(m + 16 + 8, &x, 8); } IX_CORRUPT(m, n, bl, 0, "power of two");  /* 12 bits */
-    memcpy(m, b, n); { uint64_t x = UINT64_MAX; memcpy(m + 16 + 8, &x, 8); } IX_CORRUPT(m, n, bl, 0, "power of two");
-    memcpy(m, b, n); { uint64_t x = ((uint64_t)1 << 40) - 1; memcpy(m + 16 + 8, &x, 8); } IX_CORRUPT(m, n, bl, 0, "builder's");
-    /* 6 keys: the builder's 64 bits; 128 (the bits child fits either way) */
-    memcpy(m, b, n); { uint64_t x = 127; memcpy(m + 16 + 8, &x, 8); } IX_CORRUPT(m, n, bl, 0, "builder's");
-    memcpy(m, b, n); { int64_t x = 0; memcpy(m + 16 + 24, &x, 8); }
-    TEST_ASSERT_NULL(ix_validate(m, n, bl, 0, &(ray_enc_idx_view_t){ 0 }));        /* 0 keys: 64 bits too */
-    free(b); ray_release(bl);
-    int64_t pd[6] = { 1, 1, 3, 3, 3, 8 };
-    ray_t* p = with_index(i64_vec(pd, 6), ray_index_attach_part);
-    b = ix_region(p, "ts", 2, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_part_t pp; memcpy(&pp, b + 16, 40);
-    memcpy(m, b, n); { int64_t x = 1; memcpy(m + pp.starts, &x, 8); }      IX_CORRUPT(m, n, p, 0, "starts");
-    memcpy(m, b, n); { int64_t x = 0; memcpy(m + pp.lens + 8, &x, 8); }    IX_CORRUPT(m, n, p, 0, "lens");
-    memcpy(m, b, n); { int64_t x = -4; memcpy(m + pp.lens + 8, &x, 8); }   IX_CORRUPT(m, n, p, 0, "lens");
-    memcpy(m, b, n); { int64_t x = 3; memcpy(m + pp.lens + 16, &x, 8); }   IX_CORRUPT(m, n, p, 0, "sum");
-    memcpy(m, b, n); { int64_t x = INT64_MAX; memcpy(m + pp.lens + 16, &x, 8); } IX_CORRUPT(m, n, p, 0, "sum");
-    memcpy(m, b, n); { int64_t x = 0; memcpy(m + pp.lens + 16, &x, 8); }   IX_CORRUPT(m, n, p, 0, "lens");
-    memcpy(m, b, n); { int64_t x = 0; memcpy(m + pp.keys + 8, &x, 8); }    IX_CORRUPT(m, n, p, 0, "ascend");
-    memcpy(m, b, n); { int64_t x = 1; memcpy(m + pp.keys + 8, &x, 8); }    IX_CORRUPT(m, n, p, 0, "ascend");
-    memcpy(m, b, n); { int64_t x = 7; memcpy(m + 16 + 24, &x, 8); }        IX_CORRUPT(m, n, p, 0, "n_parts");
-    memcpy(m, b, n); { int64_t x = 0; memcpy(m + 16 + 24, &x, 8); }        IX_CORRUPT(m, n, p, 0, "n_parts");
-    memcpy(m, b, n); { int64_t x = -1; memcpy(m + 16 + 24, &x, 8); }       IX_CORRUPT(m, n, p, 0, "n_parts");
-    memcpy(m, b, n); { uint32_t x = 0; memcpy(m + pp.order_name, &x, 4); } IX_CORRUPT(m, n, p, 0, "name");
-    memcpy(m, b, n); { uint32_t x = 256; memcpy(m + pp.order_name, &x, 4); } IX_CORRUPT(m, n, p, 0, "name");
-    memcpy(m, b, n); { uint32_t x = 30; memcpy(m + pp.order_name, &x, 4); } IX_CORRUPT(m, n, p, 0, "name");
-    memcpy(m, b, n); { uint32_t x = UINT32_MAX; memcpy(m + pp.order_name, &x, 4); } IX_CORRUPT(m, n, p, 0, "name");
-    memcpy(m, b, n); m[pp.order_name + 4] = 1;                              IX_CORRUPT(m, n, p, 0, "name");
-    memcpy(m, b, n); m[pp.order_name + 12] = 1;                             IX_CORRUPT(m, n, p, 0, "padding");
-    memcpy(m, b, n); m[pp.order_name + 9] = 0;                              IX_CORRUPT(m, n, p, 0, "NUL");
-    { uint8_t* x = malloc(n); memcpy(x, b, n);                            /* exact size: no slack past the end */
-      uint32_t l = 30; memcpy(x + pp.order_name, &l, 4);                  IX_CORRUPT(x, n, p, 0, "name block outside");
-      free(x); }
-    memcpy(m, b, n); { int64_t x = pp.order_name + 32; memcpy(m + 16 + 32, &x, 8); } IX_CORRUPT(m, n, p, 0, "name");
-    memcpy(m, b, n); { int64_t x = pp.lens; memcpy(m + 16 + 32, &x, 8); }  IX_CORRUPT(m, n, p, 0, "name");  /* on a child */
-    memcpy(m, b, n); { int64_t x = -1; memcpy(m + 16 + 32, &x, 8); }       IX_CORRUPT(m, n, p, 0, "layout");
-    IX_CORRUPT(b, (size_t)pp.order_name + 4, p, 0, "name");                /* name block cut off */
-    free(b); ray_release(p);
-    /* lens short of the rows with every start consistent: blocks {2,3,2}, last 1 */
-    int64_t pd7[7] = { 1, 1, 3, 3, 3, 8, 8 };
-    p = with_index(i64_vec(pd7, 7), ray_index_attach_part);
-    TEST_ASSERT_NOT_NULL(p);
-    b = ix_region(p, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    memcpy(&pp, b + 16, 40);
-    memcpy(m, b, n); { int64_t x = 1; memcpy(m + pp.lens + 16, &x, 8); }   IX_CORRUPT(m, n, p, 0, "lens sum 6");
-    free(b); ray_release(p);
-    free(m);
-    PASS();
-}
-
-/* Counts whose byte size would wrap 64 bits (8 * 2^61) over a column that
- * claims that many rows: rejected on the count against the region size,
- * before a child is placed or a byte past the region is read. */
-static test_result_t test_reject_wrapping_counts(void) {
-    int64_t huge = (int64_t)1 << 61;
-    ray_enc_idx_view_t iv;
-    uint8_t* r = calloc(1, 4096);
-    TEST_ASSERT_NOT_NULL(r);
-    /* SORT: perm of 2^61 rows in a 96-byte region */
-    r[0] = (uint8_t)RAY_I64; memcpy(r + 8, &huge, 8); { int64_t o = 96; memcpy(r + 16, &o, 8); }
-    ray_error_clear();
-    ray_t* e = ray_enc_index_validate(r, 96, RAY_IDX_SORT, RAY_I64, 0, huge, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "outside the region"));
-    ray_error_free(e);
-    /* PART: 2^61 parts, keys / starts / lens all at 96 */
-    memset(r, 0, 4096);
-    r[0] = (uint8_t)RAY_I64; memcpy(r + 8, &huge, 8);
-    { ray_enc_idx_part_t pp = { 96, 96, 96, huge, -1 }; memcpy(r + 16, &pp, sizeof pp); }
-    e = ray_enc_index_validate(r, 96, RAY_IDX_PART, RAY_I64, 0, huge, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "outside the region"));
-    ray_error_free(e);
-    /* HASH: n_keys 2^61 (offs ends there too), the region cut where rows starts */
-    int64_t of[3] = { 0, 2, 4 }, gk[2] = { 10, 20 }, rw[4] = { 0, 1, 2, 3 };
-    int64_t t8[8] = { 0 };
-    t8[slot_of(10, 8)] = 1;
-    { uint64_t s2 = slot_of(20, 8); while (t8[s2]) s2 = (s2 + 1) & 7; t8[s2] = 2; }
-    int64_t len = huge * 2;
-    size_t n; uint8_t* b = fab_region(fab_hash(RAY_I64, len, t8, 8, gk, 2, of, rw, 4), RAY_I64, 0, len, &n);
-    TEST_ASSERT_NOT_NULL(b);
-    TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv));
-    ray_enc_idx_hash_t h; memcpy(&h, b + 16, 64);
-    memcpy(b + 16 + 40, &huge, 8); memcpy(b + h.offs + 16, &huge, 8);
-    e = ray_enc_index_validate(b, (uint64_t)h.rows, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "outside the region"));
-    ray_error_free(e);
-    /* canonical sizes for 2^20 groups and keys, the region far smaller */
-    { int64_t g20 = (int64_t)1 << 20; uint64_t m21 = ((uint64_t)1 << 21) - 1;
-      uint8_t* c = malloc(n); memcpy(c, b, n);
-      { int64_t four = 4; memcpy(c + 16 + 40, &four, 8); memcpy(c + h.offs + 16, &four, 8); }
-      memcpy(c + 16 + 32, &m21, 8); memcpy(c + 16 + 40, &g20, 8); memcpy(c + 16 + 48, &g20, 8);
-      e = ray_enc_index_validate(c, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv);
-      TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "HASH table outside the region"));
-      ray_error_free(e); free(c); }
-    { memset(r, 0, 4096);
-      int64_t k40 = (int64_t)1 << 40; uint64_t mm = ((uint64_t)1 << 43) - 1;
-      r[0] = (uint8_t)RAY_I64; memcpy(r + 8, &k40, 8);
-      ray_enc_idx_bloom_t bb = { 96, mm, 3, 0, k40 }; memcpy(r + 16, &bb, sizeof bb);
-      e = ray_enc_index_validate(r, 4096, RAY_IDX_BLOOM, RAY_I64, 0, k40, 0, NULL, "col x", &iv);
-      TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0 && strstr(ray_error_msg(), "BLOOM bits outside the region"));
-      ray_error_free(e); }
-    /* a negative row count claimed by root and column alike, every kind */
-    static const uint8_t ks[4] = { RAY_IDX_HASH, RAY_IDX_SORT, RAY_IDX_BLOOM, RAY_IDX_PART };
-    for (int k = 0; k < 4; k++) {
-        memset(r, 0, 4096);
-        r[0] = (uint8_t)RAY_I64; { int64_t m1 = -1; memcpy(r + 8, &m1, 8); }
-        e = ray_enc_index_validate(r, 4096, ks[k], RAY_I64, 0, -1, 0, NULL, "col x", &iv);
-        TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
-        ray_error_free(e);
-    }
-    free(b); free(r);
-    PASS();
-}
-
-/* Empty columns: every kind's region over zero rows validates. */
-static test_result_t test_validate_empty(void) {
+/* Empty columns: every kind's region over zero rows is written and read. */
+static test_result_t test_view_empty(void) {
     ray_t* (*kinds[4])(ray_t**) = { ray_index_attach_hash, ray_index_attach_sort,
                                     ray_index_attach_bloom, ray_index_attach_part };
     for (int k = 0; k < 4; k++) {
@@ -939,87 +554,9 @@ static test_result_t test_validate_empty(void) {
         TEST_ASSERT_NULL(err);
         TEST_ASSERT_NOT_NULL(b);
         ray_enc_idx_view_t iv;
-        ray_t* e = ix_validate(b, n, v, 0, &iv);
-        TEST_ASSERT_FMT(e == NULL, "kind %d: %s", k, e ? ray_error_msg() : "");
+        ix_view(b, n, v, &iv);
         free(b); ray_release(v);
     }
-    PASS();
-}
-
-/* PART float keys: NaN, two zeros, a zero whose sign is not its block's
- * first row's. */
-static test_result_t test_reject_part_zero_sign(void) {
-    double d[4] = { -1.0, -0.0, 0.0, 2.0 };          /* blocks: [-1], [-0, +0], [2] */
-    ray_t* p = with_index(ray_vec_from_raw(RAY_F64, d, 4), ray_index_attach_part);
-    TEST_ASSERT_NOT_NULL(p);
-    TEST_ASSERT_EQ_I(ray_index_payload(p->index)->u.part.n_parts, 3);
-    size_t n; ray_t* err; uint8_t* b = ix_region(p, NULL, 0, &n, &err);
-    ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ix_validate(b, n, p, 0, &iv));
-    ray_enc_idx_part_t pp; memcpy(&pp, b + 16, 40);
-    uint8_t* m = malloc(n);
-    memcpy(m, b, n); { double z = 0.0; memcpy(m + pp.keys + 8, &z, 8); }   IX_CORRUPT(m, n, p, 0, "sign");
-    /* without the column the sign rule is skipped */
-    TEST_ASSERT_NULL(ray_enc_index_validate(m, n, RAY_IDX_PART, RAY_F64, 0, 4, 0, NULL, "col x", &iv));
-    memcpy(m, b, n); { double z = NAN; memcpy(m + pp.keys + 16, &z, 8); }  IX_CORRUPT(m, n, p, 0, "NaN");
-    memcpy(m, b, n); { double z = -0.0; memcpy(m + pp.keys, &z, 8); }      IX_CORRUPT(m, n, p, 0, "increase");
-    free(m); free(b); ray_release(p);
-    /* infinities are keys, not NaN */
-    { double di[3] = { -INFINITY, 1.0, INFINITY };
-      ray_t* q = with_index(ray_vec_from_raw(RAY_F64, di, 3), ray_index_attach_part);
-      TEST_ASSERT_NOT_NULL(q);
-      b = ix_region(q, NULL, 0, &n, &err);
-      TEST_ASSERT_NOT_NULL(b);
-      ray_t* e = ix_validate(b, n, q, 0, &iv);
-      TEST_ASSERT_FMT(e == NULL, "%s", ray_error_msg());
-      free(b); ray_release(q); }
-    /* F32 */
-    float f[3] = { 1.0f, 2.0f, 2.0f };
-    ray_t* q = with_index(ray_vec_from_raw(RAY_F32, f, 3), ray_index_attach_part);
-    TEST_ASSERT_NOT_NULL(q);
-    b = ix_region(q, NULL, 0, &n, &err);
-    TEST_ASSERT_NULL(ix_validate(b, n, q, 0, &iv));
-    memcpy(&pp, b + 16, 40);
-    m = malloc(n);
-    memcpy(m, b, n); { float z = 0.5f; memcpy(m + pp.keys + 4, &z, 4); }  IX_CORRUPT(m, n, q, 0, "increase");
-    free(m); free(b); ray_release(q);
-    PASS();
-}
-
-/* Signaling NaNs are NaN too: a quiet-only check would accept a positive
- * sNaN as the largest key and a negative sNaN as the smallest. */
-static test_result_t test_reject_part_snan(void) {
-    double d[3] = { -1.0, 1.0, 2.0 };
-    ray_t* p = with_index(ray_vec_from_raw(RAY_F64, d, 3), ray_index_attach_part);
-    TEST_ASSERT_NOT_NULL(p);
-    size_t n; ray_t* err; uint8_t* b = ix_region(p, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ix_validate(b, n, p, 0, &iv));
-    ray_enc_idx_part_t pp; memcpy(&pp, b + 16, 40);
-    uint8_t* m = malloc(n);
-    static const uint64_t s64[2] = { 0x7FF0000000000001ull, 0x7FF4000000000000ull };   /* quiet bit clear */
-    for (int i = 0; i < 2; i++) {
-        uint64_t neg = s64[i] | 0x8000000000000000ull;
-        memcpy(m, b, n); memcpy(m + pp.keys + 16, &s64[i], 8); IX_CORRUPT(m, n, p, 0, "NaN");   /* last */
-        memcpy(m, b, n); memcpy(m + pp.keys, &neg, 8);         IX_CORRUPT(m, n, p, 0, "NaN");   /* first */
-    }
-    free(m); free(b); ray_release(p);
-    float f[3] = { -1.0f, 1.0f, 2.0f };
-    ray_t* q = with_index(ray_vec_from_raw(RAY_F32, f, 3), ray_index_attach_part);
-    TEST_ASSERT_NOT_NULL(q);
-    b = ix_region(q, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    TEST_ASSERT_NULL(ix_validate(b, n, q, 0, &iv));
-    memcpy(&pp, b + 16, 40);
-    m = malloc(n);
-    static const uint32_t s32[2] = { 0x7F800001u, 0x7FA00000u };
-    for (int i = 0; i < 2; i++) {
-        uint32_t neg = s32[i] | 0x80000000u;
-        memcpy(m, b, n); memcpy(m + pp.keys + 8, &s32[i], 4); IX_CORRUPT(m, n, q, 0, "NaN");
-        memcpy(m, b, n); memcpy(m + pp.keys, &neg, 4);        IX_CORRUPT(m, n, q, 0, "NaN");
-    }
-    free(m); free(b); ray_release(q);
     PASS();
 }
 
@@ -1052,19 +589,9 @@ static test_result_t ix_zero_fill(ray_t* v, const char* name, uint32_t nlen) {
         USE(name_at, 4); USE(name_at + 8, nlen);
     }
     #undef USE
-    ray_enc_idx_view_t iv;
-    TEST_ASSERT_NULL(ix_validate(b, n, v, 0, &iv));
-    uint8_t* m = malloc(n);
-    for (size_t i = 0; i < n; i++) {
-        if (used[i]) continue;
-        TEST_ASSERT_FMT(b[i] == 0, "byte %zu of %zu is %u", i, n, b[i]);
-        memcpy(m, b, n); m[i] = 0x40;
-        ray_t* e = ix_validate(m, n, v, 0, &iv);
-        TEST_ASSERT_FMT(e != NULL, "byte %zu of %zu set, accepted", i, n);
-        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-        ray_error_free(e);
-    }
-    free(m); free(used); free(b);
+    for (size_t i = 0; i < n; i++)
+        if (!used[i]) TEST_ASSERT_FMT(b[i] == 0, "byte %zu of %zu is %u", i, n, b[i]);
+    free(used); free(b);
     PASS();
 }
 static test_result_t test_write_zero_fill(void) {
@@ -1199,7 +726,7 @@ static ray_t* mx_col(int8_t t, int64_t n, bool sorted) {
 /* Review probe, recreated: every engine-built HASH / SORT / BLOOM / PART
  * over every admitted type (nulls, both zeros, NaN payloads), SYM at
  * W8 / W16 / W32 and STR with "" validates. */
-static test_result_t test_validate_engine_matrix(void) {
+static test_result_t test_view_engine_matrix(void) {
     static const int8_t types[10] = { RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64,
                                       RAY_DATE, RAY_TIME, RAY_TIMESTAMP };
     static const int64_t lens[5] = { 0, 1, 7, 100, 3000 };
@@ -1214,8 +741,7 @@ static test_result_t test_validate_engine_matrix(void) {
                 if (!v) continue;
                 size_t n; ray_t* err; uint8_t* b = ix_region(v, k == 3 || k == 0 ? "ts" : NULL, 2, &n, &err);
                 TEST_ASSERT_FMT(b != NULL, "type %d len %lld kind %d: not written", types[ti], (long long)lens[li], k);
-                ray_t* e = ix_validate(b, n, v, 0, &iv);
-                TEST_ASSERT_FMT(e == NULL, "type %d len %lld kind %d: %s", types[ti], (long long)lens[li], k, ray_error_msg());
+                ix_view(b, n, v, &iv);
                 PARSE_SAME(v, &iv, k == 3 || k == 0 ? "ts" : NULL, "type %d len %lld kind %d", types[ti], (long long)lens[li], k);
                 free(b); ray_release(v); built++;
             }
@@ -1236,8 +762,7 @@ static test_result_t test_validate_engine_matrix(void) {
                 TEST_ASSERT_FMT(v != NULL, "SYM width %d len %lld kind %d: not built", w, (long long)n, k);
                 size_t rn; ray_t* err; uint8_t* b = ix_region(v, "ts", 2, &rn, &err);
                 TEST_ASSERT_NOT_NULL(b);
-                ray_t* e = ix_validate(b, rn, v, (uint32_t)(base[w] + 20), &iv);
-                TEST_ASSERT_FMT(e == NULL, "SYM width %d len %lld kind %d: %s", w, (long long)n, k, ray_error_msg());
+                ix_view(b, rn, v, &iv);
                 PARSE_SAME(v, &iv, "ts", "SYM width %d len %lld kind %d", w, (long long)n, k);
                 free(b); ray_release(v); built++;
             }
@@ -1249,8 +774,7 @@ static test_result_t test_validate_engine_matrix(void) {
         TEST_ASSERT_NOT_NULL(v);
         size_t n; ray_t* err; uint8_t* b = ix_region(v, NULL, 0, &n, &err);
         TEST_ASSERT_NOT_NULL(b);
-        ray_t* e = ix_validate(b, n, v, 0, &iv);
-        TEST_ASSERT_FMT(e == NULL, "STR len %lld: %s", (long long)lens[li], ray_error_msg());
+        ix_view(b, n, v, &iv);
         PARSE_SAME(v, &iv, NULL, "STR len %lld", (long long)lens[li]);
         free(b); ray_release(v); built++;
     }
@@ -1291,8 +815,7 @@ static test_result_t test_validate_engine_matrix(void) {
         TEST_ASSERT_TRUE(ray_index_payload(v->index)->u.hash.mask + 1 >= 32);
         size_t n; ray_t* err; uint8_t* b = ix_region(v, t == 2 ? NULL : "ts", 2, &n, &err);
         TEST_ASSERT_FMT(b != NULL, "carried HASH type %d: not written", t);
-        ray_t* e = ix_validate(b, n, v, 64, &iv);
-        TEST_ASSERT_FMT(e == NULL, "carried HASH type %d: %s", t, ray_error_msg());
+        ix_view(b, n, v, &iv);
         PARSE_SAME(v, &iv, t == 2 ? NULL : "ts", "carried HASH type %d", t);
         free(b); ray_release(v); built++;
     }
@@ -1300,82 +823,10 @@ static test_result_t test_validate_engine_matrix(void) {
     PASS();
 }
 
-/* A forged HASH of one long cluster: 2^17 distinct keys whose homes lie in
- * the first sixteenth of a 2^18-bucket table, linearly probed in.  A
- * per-group probe walk is quadratic here (about 2^33 bucket reads); the
- * validator's single walk is O(cap + ng log ng). */
-static int lc_cmp_home(const void* a, const void* b) {
-    uint64_t x = ((const uint64_t*)a)[0], y = ((const uint64_t*)b)[0];
-    return (x > y) - (x < y);
-}
-static uint8_t* long_cluster_region(int64_t ng, size_t* n) {
-    uint64_t cap = 1;
-    while (cap < 2 * (uint64_t)ng) cap <<= 1;
-    int64_t* tbl = calloc(cap, 8);
-    int64_t* gk = malloc((size_t)ng * 8);
-    int64_t* of = malloc((size_t)(ng + 1) * 8);
-    int64_t* rw = malloc((size_t)ng * 8);
-    uint64_t* hk = malloc((size_t)ng * 16);              /* (home, key) */
-    int64_t key = 1;
-    for (int64_t g = 0; g < ng; g++) {
-        while (slot_of(key, cap) >= cap / 16) key++;
-        hk[2 * g] = slot_of(key, cap); hk[2 * g + 1] = (uint64_t)key++;
-    }
-    /* inserting in home order makes linear probing a running max */
-    qsort(hk, (size_t)ng, 16, lc_cmp_home);
-    uint64_t next = 0;
-    for (int64_t g = 0; g < ng; g++) {
-        uint64_t s = hk[2 * g] > next ? hk[2 * g] : next;
-        gk[g] = (int64_t)hk[2 * g + 1];
-        tbl[s] = g + 1; next = s + 1;
-        of[g] = g; rw[g] = g;
-    }
-    of[ng] = ng;
-    uint8_t* b = NULL;
-    if (next < cap) {
-        ray_t* root = fab_hash(RAY_I64, ng, tbl, cap, gk, ng, of, rw, ng);
-        b = fab_region(root, RAY_I64, 0, ng, n);
-        ray_release(root);
-    }
-    free(tbl); free(gk); free(of); free(rw); free(hk);
-    return b;
-}
-static test_result_t test_validate_long_cluster(void) {
-    int64_t ng = (int64_t)1 << 17;
-    size_t n; uint8_t* b = long_cluster_region(ng, &n);
-    TEST_ASSERT_NOT_NULL(b);
-    TEST_ASSERT_TRUE(n > ((size_t)4 << 20));
-    ray_enc_idx_view_t iv;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, ng, 0, NULL, "col x", &iv);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double s = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
-    TEST_ASSERT_FMT(e == NULL, "%s", ray_error_msg());
-    TEST_ASSERT_FMT(s < 1.0, "validation took %.3f s", s);
-    /* the same cluster with one group moved before its home: rejected */
-    ray_enc_idx_hash_t h; memcpy(&h, b + 16, 64);
-    uint64_t cap = h.mask + 1, e0 = cap, at = cap;
-    for (uint64_t p = 0; p < cap && e0 == cap; p++) {        /* an empty bucket before a cluster */
-        int64_t t, tp;
-        memcpy(&t, b + h.table + p * 8, 8); memcpy(&tp, b + h.table + ((p - 1) & h.mask) * 8, 8);
-        if (t && !tp) { e0 = (p - 1) & h.mask; at = p; }
-    }
-    TEST_ASSERT_TRUE(e0 < cap);
-    int64_t t; memcpy(&t, b + h.table + at * 8, 8);
-    memcpy(b + h.table + e0 * 8, &t, 8);
-    memset(b + h.table + at * 8, 0, 8);                       /* the group now sits before its home */
-    e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, ng, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e && strstr(ray_error_msg(), "lookup") != NULL);
-    ray_error_free(e);
-    free(b);
-    PASS();
-}
-
 /* ===== Parse round trips ===== */
 
 /* Region of v's index -> validate -> parse -> attach to a fresh copy of v. */
-static ray_t* ix_roundtrip(ray_t* v, const char* name, uint32_t nlen, uint32_t bound) {
+static ray_t* ix_roundtrip(ray_t* v, const char* name, uint32_t nlen) {
     size_t n; ray_t* err; uint8_t* b = ix_region(v, name, nlen, &n, &err);
     if (!b) { if (err) ray_error_free(err); return NULL; }
     ray_enc_idx_view_t iv;
@@ -1383,8 +834,7 @@ static ray_t* ix_roundtrip(ray_t* v, const char* name, uint32_t nlen, uint32_t b
     if (v->type == RAY_SYM) { ray_release(fresh); fresh = ray_sym_vec_new(v->attrs & RAY_SYM_W_MASK, v->len); ray_sym_vec_adopt_domain(fresh, v); }
     fresh->len = v->len;
     memcpy(ray_data(fresh), ray_data(v), (size_t)v->len * ray_sym_elem_size(v->type, v->attrs));
-    ray_t* ve = ix_validate(b, n, v, bound, &iv);
-    if (ve) { ray_error_free(ve); free(b); ray_release(fresh); return NULL; }
+    ix_view(b, n, v, &iv);
     ray_t* root = NULL;
     ray_t* pe = ray_enc_index_parse(&iv, fresh, &root);
     free(b);
@@ -1398,7 +848,7 @@ static test_result_t test_parse_hash_probes(void) {
     int64_t d[5000];
     for (int i = 0; i < 5000; i++) d[i] = (i * 7919) % 1499;
     ray_t* v = with_index(i64_vec(d, 5000), ray_index_attach_hash);
-    ray_t* p = ix_roundtrip(v, NULL, 0, 0);
+    ray_t* p = ix_roundtrip(v, NULL, 0);
     TEST_ASSERT_NOT_NULL(p);
     ray_index_t* a = ray_index_payload(v->index);
     ray_index_t* b = ray_index_payload(p->index);
@@ -1423,7 +873,7 @@ static test_result_t test_parse_hash_probes(void) {
 static test_result_t test_parse_part_order_sym(void) {
     int64_t d[8] = { 1, 1, 1, 4, 4, 9, 9, 9 };
     ray_t* v = with_index(i64_vec(d, 8), ray_index_attach_part);
-    ray_t* p = ix_roundtrip(v, "ordcol_p4", 9, 0);
+    ray_t* p = ix_roundtrip(v, "ordcol_p4", 9);
     TEST_ASSERT_NOT_NULL(p);
     TEST_ASSERT_EQ_I(ray_index_payload(p->index)->u.part.order_sym, ray_sym_intern("ordcol_p4", 9));
     ray_release(p); ray_release(v);
@@ -1434,7 +884,7 @@ static test_result_t test_parse_part_order_sym(void) {
     memcpy(ray_data(s), ids, 6);
     ray_t* sp = with_index(s, ray_index_attach_part);
     TEST_ASSERT_NOT_NULL(sp);
-    ray_t* q = ix_roundtrip(sp, NULL, 0, 21);
+    ray_t* q = ix_roundtrip(sp, NULL, 0);
     TEST_ASSERT_NOT_NULL(q);
     ray_t* keys = ray_index_payload(q->index)->u.part.keys;
     TEST_ASSERT_EQ_I(keys->type, RAY_SYM);
@@ -1455,7 +905,7 @@ static test_result_t test_parse_part_order_sym(void) {
     f->sym_domain = dom;                                        /* the vector holds the reference */
     ray_t* fp = with_index(f, ray_index_attach_part);
     TEST_ASSERT_NOT_NULL(fp);
-    ray_t* fq = ix_roundtrip(fp, NULL, 0, (uint32_t)ray_sym_domain_count(dom));
+    ray_t* fq = ix_roundtrip(fp, NULL, 0);
     TEST_ASSERT_NOT_NULL(fq);
     keys = ray_index_payload(fq->index)->u.part.keys;
     TEST_ASSERT_TRUE(ray_sym_vec_domain(keys) == dom);
@@ -1499,19 +949,18 @@ static test_result_t ix_parse_oom_run(ray_t* v, const ray_enc_idx_view_t* iv) {
     TEST_ASSERT_TRUE(fails >= 2);                    /* the root and at least one child */
     PASS();
 }
-static test_result_t ix_parse_oom(ray_t* v, const char* name, uint32_t bound) {
+static test_result_t ix_parse_oom(ray_t* v, const char* name) {
     size_t n; ray_t* err; uint8_t* b = ix_region(v, name, name ? (uint32_t)strlen(name) : 0, &n, &err);
     if (err) ray_error_free(err);
     TEST_ASSERT_NOT_NULL(b);
     ray_enc_idx_view_t iv;
-    ray_t* ve = ix_validate(b, n, v, bound, &iv);
-    if (ve) { ray_error_free(ve); free(b); FAIL("region not valid"); }
+    ix_view(b, n, v, &iv);
     if (name) (void)ray_sym_intern(name, strlen(name));        /* interned before the baseline */
     test_result_t r = ix_parse_oom_run(v, &iv);
     free(b);
     return r;
 }
-#define PARSE_OOM(v, name, bound) do { test_result_t r_ = ix_parse_oom((v), (name), (bound)); \
+#define PARSE_OOM(v, name) do { test_result_t r_ = ix_parse_oom((v), (name)); \
     if (r_.status != TEST_PASS) return r_; } while (0)
 
 static test_result_t test_parse_oom_frees(void) {
@@ -1521,13 +970,13 @@ static test_result_t test_parse_oom_frees(void) {
     for (int k = 0; k < 3; k++) {
         ray_t* v = with_index(i64_vec(d, 40), kinds[k]);
         TEST_ASSERT_NOT_NULL(v);
-        PARSE_OOM(v, k == 0 ? "ts" : NULL, 0);
+        PARSE_OOM(v, k == 0 ? "ts" : NULL);
         ray_release(v);
     }
     int64_t pd[6] = { 1, 1, 3, 3, 3, 8 };
     ray_t* p = with_index(i64_vec(pd, 6), ray_index_attach_part);
     TEST_ASSERT_NOT_NULL(p);
-    PARSE_OOM(p, "ts", 0);
+    PARSE_OOM(p, "ts");
     ray_release(p);
     ray_t* s = ray_sym_vec_new(RAY_SYM_W16, 5);
     s->len = 5;
@@ -1535,79 +984,8 @@ static test_result_t test_parse_oom_frees(void) {
     memcpy(ray_data(s), ids, sizeof ids);
     ray_t* sp = with_index(s, ray_index_attach_part);
     TEST_ASSERT_NOT_NULL(sp);
-    PARSE_OOM(sp, "ts", 64);
+    PARSE_OOM(sp, "ts");
     ray_release(sp);
-    PASS();
-}
-
-/* A view the region does not hold is refused before any allocation, and
- * a SYM PART needs the decoded SYM column for its domain. */
-static test_result_t test_parse_rejects_view(void) {
-    int64_t d[6] = { 5, 7, 5, 9, 7, 5 };
-    ray_t* v = with_index(i64_vec(d, 6), ray_index_attach_hash);
-    TEST_ASSERT_NOT_NULL(v);
-    size_t n; ray_t* err; uint8_t* b = ix_region(v, "ts", 2, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_view_t iv, w;
-    TEST_ASSERT_NULL(ix_validate(b, n, v, 0, &iv));
-    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    #define VIEW_REFUSED(code, mut) do { w = iv; mut; ray_t* r_ = (ray_t*)1; ray_t* e_ = ray_enc_index_parse(&w, v, &r_); \
-        TEST_ASSERT_TRUE(e_ != NULL); TEST_ASSERT_STR_EQ(ray_err_code(e_), code); TEST_ASSERT_NULL(r_); \
-        ray_error_free(e_); } while (0)
-    VIEW_REFUSED("corrupt", w.hash.rows = (int64_t)n);
-    VIEW_REFUSED("corrupt", w.hash.rows = 64);                              /* inside the root */
-    VIEW_REFUSED("corrupt", w.hash.n_keys = (int64_t)n);
-    VIEW_REFUSED("corrupt", w.hash.n_keys = -1);
-    VIEW_REFUSED("corrupt", w.hash.n_groups = INT64_MAX);
-    VIEW_REFUSED("corrupt", w.hash.mask = UINT64_MAX);
-    VIEW_REFUSED("corrupt", w.hash.mask = ((uint64_t)1 << 40) - 1);
-    VIEW_REFUSED("corrupt", w.size = 64);
-    VIEW_REFUSED("corrupt", w.base = NULL);
-    VIEW_REFUSED("corrupt", w.order_len = (uint32_t)n);
-    VIEW_REFUSED("corrupt", w.order_name = (const char*)b + n);
-    VIEW_REFUSED("corrupt", w.kind = RAY_IDX_ZONE);
-    VIEW_REFUSED("corrupt", (w.kind = RAY_IDX_SORT, w.len = (int64_t)n));
-    VIEW_REFUSED("corrupt", (w.kind = RAY_IDX_BLOOM, w.bloom.bits = 96, w.bloom.m_mask = UINT64_MAX));
-    /* boundaries: one element past the region, a name in the root */
-    VIEW_REFUSED("corrupt", w.hash.n_keys = ((int64_t)n - iv.hash.rows) / 8 + 1);
-    VIEW_REFUSED("corrupt", w.order_name = (const char*)b + 8);
-    VIEW_REFUSED("corrupt", w.order_name = (const char*)b + 95);
-    ray_mem_stats(&m1);
-    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
-    free(b); ray_release(v);
-    /* a 256-byte name inside a region long enough to hold it: refused by
-     * the name limit, not by the span */
-    { int64_t d2[40];
-      for (int i = 0; i < 40; i++) d2[i] = i % 11;
-      ray_t* v2 = with_index(i64_vec(d2, 40), ray_index_attach_hash);
-      TEST_ASSERT_NOT_NULL(v2);
-      b = ix_region(v2, "ts", 2, &n, &err);
-      TEST_ASSERT_NOT_NULL(b);
-      TEST_ASSERT_TRUE(n >= RAY_ENC_IDX_FIRST_CHILD + 256);
-      TEST_ASSERT_NULL(ix_validate(b, n, v2, 0, &iv));
-      ray_t* vsave = v; v = v2;
-      VIEW_REFUSED("corrupt", (w.order_name = (const char*)b + RAY_ENC_IDX_FIRST_CHILD, w.order_len = 256));
-      v = vsave;
-      free(b); ray_release(v2); }
-    ray_t* s = ray_sym_vec_new(RAY_SYM_W8, 4);
-    s->len = 4;
-    uint8_t ids[4] = { 3, 3, 6, 6 };
-    memcpy(ray_data(s), ids, 4);
-    ray_t* sp = with_index(s, ray_index_attach_part);
-    TEST_ASSERT_NOT_NULL(sp);
-    b = ix_region(sp, NULL, 0, &n, &err);
-    TEST_ASSERT_NOT_NULL(b);
-    TEST_ASSERT_NULL(ix_validate(b, n, sp, 64, &iv));
-    ray_t* r = (ray_t*)1;
-    ray_t* e = ray_enc_index_parse(&iv, NULL, &r);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0 && r == NULL);
-    ray_error_free(e);
-    ray_t* i64v = i64_vec(d, 4);
-    e = ray_enc_index_parse(&iv, i64v, &r);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0 && r == NULL);
-    ray_error_free(e); ray_release(i64v);
-    #undef VIEW_REFUSED
-    free(b); ray_release(sp);
     PASS();
 }
 
@@ -1857,9 +1235,6 @@ static test_result_t test_idx_golden_match(void) {
 
 /* ---- materialization attaches the parsed index (Task 6) ---- */
 
-static void ix_patch(const char* path, long off, const void* b, size_t n) {
-    FILE* f = fopen(path, "r+b"); fseek(f, off, SEEK_SET); fwrite(b, 1, n, f); fclose(f);
-}
 static ray_t* ix_hash_col(int64_t n) {
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
     for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 2654435761u) % 10007;
@@ -1914,28 +1289,25 @@ static test_result_t test_idx_golden_read(void) {
         TEST_ASSERT_EQ_I(eh.index_kind, fx[i].kind);
         TEST_ASSERT_EQ_I(h.type, m->type);
         TEST_ASSERT_EQ_I(h.len, m->len);
-        if (fx[i].kind == RAY_IDX_DICT) {      /* Task 1's validator, not ray_enc_index_validate */
+        if (fx[i].kind == RAY_IDX_DICT) {      /* its own reader, not ray_enc_index_view */
             const uint64_t rsz = eh.end_off - eh.index_off;
             uint8_t* rb = aligned_alloc(32, (size_t)((rsz + 31) & ~(uint64_t)31));
             TEST_ASSERT_NOT_NULL(rb);
             memcpy(rb, b + eh.index_off, (size_t)rsz);
             free(b);
             ray_enc_dict_view_t dv;
-            ray_t* de = ray_enc_dict_validate(rb, rsz, 300, path, &dv);
-            if (!de) de = ray_enc_dict_codes_check(&dv, NULL, path);
-            const int64_t nd = de ? -1 : dv.n_distinct;
+            ray_enc_dict_parse(rb, &dv);
+            const int64_t nd = dv.n_distinct, dl = dv.len;
             free(rb);
-            TEST_ASSERT_FMT(de == NULL, "%s: %s", fx[i].name, ray_error_msg() ? ray_error_msg() : "?");
+            TEST_ASSERT_EQ_I(dl, 300);
             TEST_ASSERT_EQ_I(nd, 23);
             TEST_ASSERT_EQ_I(aix->u.dict.n_distinct, 23);
             ray_release(c);
             continue;
         }
         ray_enc_idx_view_t iv; ray_t* root = NULL;
-        ray_t* e = ray_enc_index_validate(b + eh.index_off, n - eh.index_off, eh.index_kind, h.type, h.attrs, h.len,
-                                          h.type == RAY_SYM ? saved : 0, ray_data(m), path, &iv);
-        TEST_ASSERT_FMT(e == NULL, "%s: %s", fx[i].name, ray_error_msg() ? ray_error_msg() : "?");
-        e = ray_enc_index_parse(&iv, m, &root);
+        ray_enc_index_view(b + eh.index_off, n - eh.index_off, eh.index_kind, h.type, h.attrs, h.len, &iv);
+        ray_t* e = ray_enc_index_parse(&iv, m, &root);
         free(b);
         TEST_ASSERT_FMT(e == NULL && root, "%s: parse", fx[i].name);
         ray_index_t* pix = ray_index_payload(root);
@@ -2035,10 +1407,8 @@ static test_result_t test_materialize_unique(void) {
     size_t n; uint8_t* b = ix_slurp(p, &n);
     TEST_ASSERT_NOT_NULL(b);
     ray_enc_idx_view_t iv; ray_t* root = NULL;
-    ray_t* e = ray_enc_index_validate(b + eh.index_off, n - eh.index_off, RAY_IDX_HASH, RAY_I64, v->attrs,
-                                      3000, 0, d, p, &iv);
-    TEST_ASSERT_NULL(e);
-    e = ray_enc_index_parse(&iv, v, &root);
+    ray_enc_index_view(b + eh.index_off, n - eh.index_off, RAY_IDX_HASH, RAY_I64, v->attrs, 3000, &iv);
+    ray_t* e = ray_enc_index_parse(&iv, v, &root);
     free(b);
     TEST_ASSERT_TRUE(!e && root);
     TEST_ASSERT_FALSE(ray_index_payload(root)->markers & RAY_MARK_UNIQUE);
@@ -2051,35 +1421,6 @@ static test_result_t test_materialize_unique(void) {
     TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
     TEST_ASSERT_TRUE(ray_index_payload(m->index)->markers & RAY_MARK_UNIQUE);
     TEST_ASSERT_FALSE(ray_index_payload(m->index)->markers & RAY_MARK_MMAP);
-    ray_release(c); ray_release(v);
-    PASS();
-}
-
-/* Spec "Lazy validation": a malformed region fails materialization (cached,
- * with the path), not the load. */
-static test_result_t test_corrupt_region_cached(void) {
-    const char* p = ray_test_tmp(IDX_TMP "/c");
-    ray_t* v = ix_hash_col(5000);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
-    ray_enc_hdr_t eh = ix_hdr(p);
-    TEST_ASSERT_TRUE(eh.index_off != 0);
-    uint8_t bad = 1;
-    ix_patch(p, (long)eh.index_off + 3, &bad, 1);                    /* root reserved byte */
-    ray_t* c = ray_col_mmap(p);
-    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));                            /* load is fine */
-    ray_enc_counters_reset();
-    for (int i = 0; i < 2; i++) {
-        ray_error_clear();
-        ray_t* m = ray_enccol_materialize(c);
-        TEST_ASSERT_TRUE(m && RAY_IS_ERR(m));
-        TEST_ASSERT_STR_EQ(ray_err_code(m), "corrupt");
-        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), p) != NULL);
-        /* the validator ran: its own verdict, not a parse of the bytes */
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), "index root reserved bytes set") != NULL);
-        ray_error_free(m);
-    }
-    ray_enc_counters_t k; ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.materialized, 0);
     ray_release(c); ray_release(v);
     PASS();
 }
@@ -2240,14 +1581,10 @@ static void ix_thr(void* p) {
     if (e) ray_error_free(e);
     ray_heap_abandon();
 }
-static test_result_t ix_concurrent(bool corrupt) {
+static test_result_t ix_concurrent(void) {
     const char* p = ray_test_tmp(IDX_TMP "/t");
     ray_t* v = ix_hash_col(70000);
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
-    if (corrupt) {
-        ray_enc_hdr_t eh = ix_hdr(p);
-        uint8_t bad = 1; ix_patch(p, (long)eh.index_off + 85, &bad, 1);
-    }
     ray_t* c = ray_col_mmap(p);
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     int64_t sym = ray_sym_intern("k", 1);
@@ -2270,22 +1607,16 @@ static test_result_t ix_concurrent(bool corrupt) {
     ray_sem_destroy(&ready); ray_sem_destroy(&go);
     if (nt < 8) { ray_release(tbl); ray_release(v); FAIL("thread create"); }
     ray_enc_counters_t k; ray_enc_counters_get(&k);
-    TEST_ASSERT_EQ_U(k.materialized, corrupt ? 0 : 1);
+    TEST_ASSERT_EQ_U(k.materialized, 1);
     for (int i = 0; i < 8; i++) {
-        TEST_ASSERT_STR_EQ(a[i].code, corrupt ? "corrupt" : "");
-        /* the validator's own verdict, with the path, on every thread */
-        if (corrupt)
-            TEST_ASSERT_FMT(strstr(a[i].msg, "index root padding set") && strstr(a[i].msg, p),
-                            "thread %d: %s", i, a[i].msg);
-        if (!corrupt) TEST_ASSERT_TRUE(a[i].index == a[0].index && a[i].index != NULL);
+        TEST_ASSERT_STR_EQ(a[i].code, "");
+        TEST_ASSERT_TRUE(a[i].index == a[0].index && a[i].index != NULL);
     }
     ray_release(tbl); ray_release(v);
     PASS();
 }
 static test_result_t test_concurrent_index(void) {
-    test_result_t r = ix_concurrent(false);
-    if (r.status != TEST_PASS) return r;
-    return ix_concurrent(true);
+    return ix_concurrent();
 }
 
 
@@ -2436,44 +1767,47 @@ static test_result_t test_consult_routes(void) {
      * consults the column's region index (its materialization on generation
      * 2 is that index use); every other shape takes P3's encoded route on
      * generation 2 and materializes nothing. */
-    static const struct { const char* q; bool uses; const char* d; } qs[] = {
-        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL },     /* present: consulted, no prune */
-        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL },
-        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn" },
-        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn" },
+    /* `probe`: an equality on the HASH, answered by probing the region where
+     * it is mapped (ray_enc_hash_eq_rowsel): the index is used, nothing is
+     * materialized */
+    static const struct { const char* q; bool uses; const char* d; bool probe; } qs[] = {
+        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", true, NULL, true },
+        { "(sum (at (select {from: X where: (in k [1 2 3 4242])}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (> s 3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (== b 50020)}) 'v))", true, NULL, false },     /* present: consulted, no prune */
+        { "(sum (at (select {from: X where: (== b 3)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (== p 77)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (in p [3 77])}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (!= k 4242)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> k 50000)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (< k 500)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> k 999999)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (in s [1 2 3000])}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (!= b 5)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> b 40000)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (in b [3 50020])}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (!= p 77)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (> p 90)}) 'v))", false, NULL, false },
+        { "(sum (at (select {from: X where: (== k 42)}) 'v))", false, "cn", false },
+        { "(sum (at (select {from: X where: (in k [42 43])}) 'v))", true, "cn", false },
         /* SORT: every compare but NE consults the range probe */
-        { "(sum (at (select {from: X where: (== s 3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (< s -3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (<= s -3000)}) 'v))", true, NULL },
-        { "(sum (at (select {from: X where: (>= s 3000)}) 'v))", true, NULL },
+        { "(sum (at (select {from: X where: (== s 3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (< s -3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (<= s -3000)}) 'v))", true, NULL, false },
+        { "(sum (at (select {from: X where: (>= s 3000)}) 'v))", true, NULL, false },
         /* float keys: neither HASH nor BLOOM, EQ or `in` */
-        { "(sum (at (select {from: X where: (== h 42.0)}) 'v))", false, "cf" },
-        { "(sum (at (select {from: X where: (in h [42.0 43.0])}) 'v))", false, "cf" },
-        { "(sum (at (select {from: X where: (== b 42.0)}) 'v))", false, "cf" },
-        { "(sum (at (select {from: X where: (in b [42.0 43.0])}) 'v))", false, "cf" },
+        { "(sum (at (select {from: X where: (== h 42.0)}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (in h [42.0 43.0])}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (== b 42.0)}) 'v))", false, "cf", false },
+        { "(sum (at (select {from: X where: (in b [42.0 43.0])}) 'v))", false, "cf", false },
         /* SYM HASH with nulls: key 0, a nonzero key, `in` */
         /* the null key: decided on ids on the encoded route (id 0) */
-        { "(sum (at (select {from: X where: (== k ')}) 'v))", false, "cs" },
-        { "(sum (at (select {from: X where: (!= k ')}) 'v))", false, "cs" },
-        { "(sum (at (select {from: X where: (== k 'k42)}) 'v))", true, "cs" },
-        { "(sum (at (select {from: X where: (in k ['k42 'k43])}) 'v))", true, "cs" },
-        { NULL, false, NULL },
+        { "(sum (at (select {from: X where: (== k ')}) 'v))", false, "cs", false },
+        { "(sum (at (select {from: X where: (!= k ')}) 'v))", false, "cs", false },
+        { "(sum (at (select {from: X where: (== k 'k42)}) 'v))", true, "cs", true },
+        { "(sum (at (select {from: X where: (in k ['k42 'k43])}) 'v))", true, "cs", false },
+        { NULL, false, NULL, false },
     };
     for (int i = 0; qs[i].q; i++) {
         uint64_t c[2][IDX_SITE__N], h[2][IDX_SITE__N]; int64_t n[2];
@@ -2488,7 +1822,7 @@ static test_result_t test_consult_routes(void) {
             for (int s = 0; s < IDX_SITE__N; s++) { c[g][s] = ray_idx_consults[s] - c0[s]; h[g][s] = ray_idx_hits[s] - h0[s]; }
             if (g) {
                 ray_enc_counters_t k; ray_enc_counters_get(&k);
-                TEST_ASSERT_FMT(k.materialized == (qs[i].uses ? 1u : 0u), "%s: %llu materializations", qs[i].q,
+                TEST_ASSERT_FMT(k.materialized == (qs[i].uses && !qs[i].probe ? 1u : 0u), "%s: %llu materializations", qs[i].q,
                                 (unsigned long long)k.materialized);
                 TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info X 'v) 'materialized) 1 0)"), 0);
             }
@@ -2517,125 +1851,23 @@ static test_result_t test_consult_dir_unchanged(void) {
     PASS();
 }
 
-/* Spec "Lazy validation" / "Errors": a malformed index region fails the
- * first index-using query with corrupt and the path, and the next one with
- * the same error; the load itself succeeds; an unindexed query on another
- * column still answers.  Single compare, in, and the eq+range conjunction. */
-static test_result_t test_corrupt_region_query(void) {
-    ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/cq/\" (table [k v] (list (.idx.hash (% (* (til 70000) 7) 10007)) (til 70000))) {compress: true})");
-    if (r) ray_release(r);
-    char kpath[1200];
-    TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/cq/", "k", kpath, sizeof kpath));   /* the published generation's file */
-    size_t n; uint8_t* b = ix_slurp(kpath, &n);
-    TEST_ASSERT_TRUE(b && n >= 96);
-    ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64); free(b);
-    TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
-    uint8_t bad = 1; ix_patch(kpath, (long)eh.index_off + 3, &bad, 1);
-    r = ixr_eval("(set CQ (.db.splayed.get \"" IDX_TMP "/cq/\"))");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
-    static const char* const qs[] = {          /* index-using shapes (see consult_routes) */
-        "(sum (at (select {from: CQ where: (== k 42)}) 'v))",
-        "(sum (at (select {from: CQ where: (in k [42 43])}) 'v))",
-        "(sum (at (select {from: CQ where: (and (== k 42) (> v 10))}) 'v))",
-        NULL,
-    };
-    for (int q = 0; qs[q]; q++)
-        for (int i = 0; i < 2; i++) {
-            ray_error_clear();
-            r = ray_eval_str(qs[q]);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s run %d answered", qs[q], i);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), kpath) != NULL);
-            /* the validator's own verdict, not a parse of unvalidated bytes */
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), "index root reserved bytes set") != NULL);
-            ray_error_free(r);
-        }
-    for (int i = 0; i < 2; i++) {                 /* the unsplit eq+range conjunction */
-        ray_error_clear();
-        r = ix_eqrange("CQ", 42, "v");
-        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "eq+range run %d answered", i);
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), kpath) != NULL);
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), "index root reserved bytes set") != NULL);
-        ray_error_free(r);
-    }
-    TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: CQ where: (> v 69990)}))"), 9);
-    /* a shape that uses no index answers from the encoded route: the
-     * region is never read */
-    TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: CQ where: (!= k 42)}))"), 70000 - 7);
-    r = ix_eqrange("CQ", 42, "k");                  /* the declined conjunction: k 42 >= 10, seven rows */
-    TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 7, "declined eq+range: %s",
-                    r && RAY_IS_ERR(r) ? ray_error_msg() : "wrong rows");
-    ray_release(r);
-    PASS();
-}
-
-/* Spec "Lazy validation" for every region kind: a malformed SORT, BLOOM or
- * PART region fails the queries that use that index with corrupt, the
- * column's path and the validator's text; a shape that uses no index on
- * the same column answers as generation 0. */
-static test_result_t test_corrupt_region_kinds(void) {
-    ray_t* r = ixr_eval("(set T (table [s b p v] (list (.idx.sort (as 'I32 (- (% (* (til 70000) 31) 9973) 4000))) "
-                        "(.idx.bloom (% (* (til 70000) 17) 50021)) (.attr.set 'parted (div (til 70000) 1000)) (til 70000))))");
-    if (r) ray_release(r);
-    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/ck0/\" T {compress: false})"); if (r) ray_release(r);
-    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/ck2/\" T {compress: true})"); if (r) ray_release(r);
-    static const struct { const char* col; uint8_t kind; const char* q; bool uses; } qs[] = {
-        { "s", RAY_IDX_SORT,  "(sum (at (select {from: X where: (> s 3000)}) 'v))", true },
-        { "s", RAY_IDX_SORT,  "(sum (at (select {from: X where: (== s 3000)}) 'v))", true },
-        { "s", RAY_IDX_SORT,  "(sum (at (select {from: X where: (!= s 3000)}) 'v))", false },
-        { "b", RAY_IDX_BLOOM, "(sum (at (select {from: X where: (== b 5)}) 'v))", true },
-        { "b", RAY_IDX_BLOOM, "(sum (at (select {from: X where: (> b 40000)}) 'v))", false },
-        { "p", RAY_IDX_PART,  "(sum (at (select {from: X where: (== p 7)}) 'v))", true },
-        { "p", RAY_IDX_PART,  "(sum (at (select {from: X where: (in p [3 7])}) 'v))", true },
-        { "p", RAY_IDX_PART,  "(sum (at (select {from: X where: (!= p 7)}) 'v))", false },
-        { NULL, 0, NULL, false },
-    };
-    static const char* const cols[] = { "s", "b", "p" };
-    char path[3][1200];
-    for (int c = 0; c < 3; c++) {
-        TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/ck2/", cols[c], path[c], sizeof path[c]));
-        size_t n; uint8_t* b = ix_slurp(path[c], &n);
-        TEST_ASSERT_TRUE(b && n >= 96);
-        ray_enc_hdr_t eh; memcpy(&eh, b + 32, 64); free(b);
-        TEST_ASSERT_EQ_I(eh.index_kind, c == 0 ? RAY_IDX_SORT : c == 1 ? RAY_IDX_BLOOM : RAY_IDX_PART);
-        uint8_t bad = 1; ix_patch(path[c], (long)eh.index_off + 3, &bad, 1);
-    }
-    for (int i = 0; qs[i].q; i++) {
-        const char* p = path[qs[i].col[0] == 's' ? 0 : qs[i].col[0] == 'b' ? 1 : 2];
-        r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/ck0/\"))"); if (r) ray_release(r);
-        int64_t want = ixr_i64(qs[i].q);
-        TEST_ASSERT_TRUE(want != INT64_MIN);
-        r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/ck2/\"))");
-        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);          /* the load is fine */
-        for (int run = 0; run < 2; run++) {
-            ray_error_clear();
-            r = ray_eval_str(qs[i].q);
-            if (!qs[i].uses) {
-                TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->i64 == want, "%s: %s", qs[i].q,
-                                r && RAY_IS_ERR(r) ? ray_error_msg() : "wrong answer");
-                ray_release(r);
-                continue;
-            }
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s run %d answered", qs[i].q, run);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_FMT(strstr(ray_error_msg(), p) && strstr(ray_error_msg(), "index root reserved bytes set"),
-                            "%s: %s", qs[i].q, ray_error_msg());
-            ray_error_free(r);
-        }
-    }
-    PASS();
-}
-
 /* Spec "Errors": a transient failure on the index route (the parse's oom)
  * is the query's error, not a scan, and not cached: the next query, with
- * the hook off, answers from the index. */
+ * the hook off, answers from the index.  The `in` probe parses the region
+ * (it materializes the column); the equality probes the region where it is
+ * mapped (ray_enc_hash_eq_rowsel), parses nothing and answers under the
+ * hook. */
 static test_result_t test_index_route_oom(void) {
     ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/co/\" (table [k v] (list (.idx.hash (% (* (til 70000) 7) 10007)) (til 70000))) {compress: true})");
     if (r) ray_release(r);
     r = ixr_eval("(set CO (.db.splayed.get \"" IDX_TMP "/co/\"))"); if (r) ray_release(r);
-    const char* q = "(count (at (select {from: CO where: (== k 42)}) 'v))";
+    const char* q = "(count (at (select {from: CO where: (in k [42 43])}) 'v))";
+    const char* qe = "(count (at (select {from: CO where: (== k 42)}) 'v))";
+    int64_t want = ixr_i64("(count (where (in (% (* (til 70000) 7) 10007) [42 43])))");
     ray_enccol_test_fail_index_parse(true);
+    uint64_t e0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+    TEST_ASSERT_EQ_I(ixr_i64(qe), 7);
+    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_FILTER_HASH], e0 + 1);    /* the region probe */
     ray_error_clear();
     r = ray_eval_str(q);
     ray_enccol_test_fail_index_parse(false);
@@ -2643,9 +1875,74 @@ static test_result_t test_index_route_oom(void) {
     TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
     TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "index parse") != NULL);
     ray_error_free(r);
-    uint64_t h0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
-    TEST_ASSERT_EQ_I(ixr_i64(q), 7);
-    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_FILTER_HASH], h0 + 1);    /* from the index */
+    uint64_t h0 = ray_idx_hits[IDX_SITE_IN];
+    TEST_ASSERT_EQ_I(ixr_i64(q), want);
+    TEST_ASSERT_EQ_U(ray_idx_hits[IDX_SITE_IN], h0 + 1);    /* from the index */
+    PASS();
+}
+
+/* An equality on a recorded HASH probes the region where it is mapped
+ * (ray_enc_hash_eq_rowsel): generation 0's answers and index counters,
+ * nothing materialized, the column not decoded.  k: about one row per key;
+ * g: 100 rows per key; z: key 0 on half the rows (dense: the probe
+ * declines and the column materializes, as before); w: an I32 key; y: a
+ * SYM key.  An absent key is an empty selection. */
+static test_result_t test_hash_region_probe(void) {
+    ray_t* r = ixr_eval("(set SY (as 'SYM (map (fn [i] (concat \"y\" (as 'STR i))) (til 2000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(set TP (table [k g z w y v] (list (.idx.hash (% (* (til 100000) 7919) 100003)) "
+                 "(.idx.hash (% (til 100000) 1000)) (.idx.hash (* (>= (til 100000) 50000) (til 100000))) "
+                 "(.idx.hash (as 'I32 (- (% (* (til 100000) 31) 9973) 4000))) (.idx.hash (at SY (% (* (til 100000) 7) 2000))) "
+                 "(til 100000))))");
+    if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/hp0/\" TP {compress: false})"); if (r) ray_release(r);
+    r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/hp2/\" TP {compress: true})"); if (r) ray_release(r);
+    static const struct { const char* q; int probes; uint64_t mat; } qs[] = {
+        { "(sum (at (select {from: X where: (== k 4242)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== k 999999)}) 'v))", 1, 0 },   /* absent */
+        { "(sum (at (select {from: X where: (== g 77)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== g 999)}) 'v))", 1, 0 },      /* the last group */
+        { "(sum (at (select {from: X where: (== z 0)}) 'v))", 0, 1 },        /* dense: declined */
+        { "(sum (at (select {from: X where: (== z 77777)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== w -4000)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== w 5969)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== y 'y42)}) 'v))", 1, 0 },
+        { "(sum (at (select {from: X where: (== y 'nope)}) 'v))", 0, 0 },    /* not in the domain */
+        { NULL, 0, 0 },
+    };
+    for (int i = 0; qs[i].q; i++) {
+        int64_t n[2]; uint64_t hc[2], hh[2];
+        for (int gen = 0; gen < 2; gen++) {
+            r = ixr_eval(gen ? "(set X (.db.splayed.get \"" IDX_TMP "/hp2/\"))" : "(set X (.db.splayed.get \"" IDX_TMP "/hp0/\"))");
+            if (r) ray_release(r);
+            uint64_t c0 = ray_idx_consults[IDX_SITE_FILTER_HASH], h0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+            uint64_t p0 = ray_enc_hash_test_probes();
+            ray_enc_counters_reset();
+            n[gen] = ixr_i64(qs[i].q);
+            hc[gen] = ray_idx_consults[IDX_SITE_FILTER_HASH] - c0; hh[gen] = ray_idx_hits[IDX_SITE_FILTER_HASH] - h0;
+            if (gen) {
+                ray_enc_counters_t k; ray_enc_counters_get(&k);
+                TEST_ASSERT_FMT(ray_enc_hash_test_probes() - p0 == (uint64_t)qs[i].probes, "%s: %llu region probes", qs[i].q,
+                                (unsigned long long)(ray_enc_hash_test_probes() - p0));
+                TEST_ASSERT_FMT(k.materialized == qs[i].mat, "%s: %llu materializations", qs[i].q,
+                                (unsigned long long)k.materialized);
+                /* the probed column: its group's rows read back, never the
+                 * column (100000 rows, at most 800000 bytes) */
+                if (!qs[i].mat) {
+                    const char* cn = strstr(qs[i].q, "(== ") + 4;
+                    ray_t* xt = ray_eval_str("X");
+                    ray_t* xe = xt && !RAY_IS_ERR(xt) ? ray_table_get_col_enc(xt, ray_sym_intern(cn, 1)) : NULL;
+                    uint64_t cb = xe ? atomic_load(&ray_enccol_of(xe)->decoded_bytes) : UINT64_MAX;
+                    if (xt && !RAY_IS_ERR(xt)) ray_release(xt);
+                    TEST_ASSERT_FMT(cb <= 800000 / 2, "%s: the key column decoded %llu bytes", qs[i].q,
+                                    (unsigned long long)cb);
+                }
+            }
+        }
+        TEST_ASSERT_FMT(n[0] == n[1] && n[0] != INT64_MIN, "%s: %lld vs %lld", qs[i].q, (long long)n[0], (long long)n[1]);
+        if (qs[i].probes) TEST_ASSERT_FMT(hc[1] >= 1 && hh[1] == hh[0], "%s: hash hits %llu vs %llu", qs[i].q,
+                                          (unsigned long long)hh[1], (unsigned long long)hh[0]);
+    }
     PASS();
 }
 
@@ -2803,27 +2100,6 @@ static test_result_t test_encoded_keep_copies(void) {
     TEST_ASSERT_TRUE(same);
     /* an unknown decision is a type error; generation 0 takes KEEP only */
     TEST_ASSERT_EQ_I(ix_save_ctx(v, ray_test_tmp(IDX_TMP "/x"), NULL, RAY_COL_IDX_DROP + 1), RAY_ERR_TYPE);
-    /* a corrupt source region fails closed: KEEP (the copy is validated
-     * first) and REBUILD (the materialization validates) fail with corrupt,
-     * and nothing is published or left behind */
-    const char* pc = ray_test_tmp(IDX_TMP "/ac");
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, pc, 2), RAY_OK);
-    ray_enc_hdr_t ec = ix_hdr(pc);
-    TEST_ASSERT_EQ_I(ec.index_kind, RAY_IDX_HASH);
-    uint8_t bad = 1; ix_patch(pc, (long)ec.index_off + 3, &bad, 1);     /* root reserved bytes */
-    for (int d = 0; d < 2; d++) {
-        c = ray_col_mmap(pc);
-        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);   /* the open does not read the region */
-        const char* out = ray_test_tmp(d ? IDX_TMP "/acr" : IDX_TMP "/ack");
-        ray_error_clear();
-        ray_err_t ce = ix_save_ctx(c, out, NULL, d ? RAY_COL_IDX_REBUILD : RAY_COL_IDX_KEEP);
-        TEST_ASSERT_FMT(ce == RAY_ERR_CORRUPT, "decision %d: %d", d, (int)ce);
-        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "index root reserved bytes set"));
-        FILE* f = fopen(out, "rb");                                         TEST_ASSERT_NULL(f);
-        char tmpp[1200]; snprintf(tmpp, sizeof tmpp, "%s.tmp", out);
-        f = fopen(tmpp, "rb");                                              TEST_ASSERT_NULL(f);
-        ray_release(c);
-    }
     ray_release(v);
     PASS();
 }
@@ -2919,10 +2195,9 @@ static test_result_t test_sym_stale_part_unbuildable(void) {
 }
 
 /* Review important 1: the null-key compare on a SYM HASH uses no index
- * (generation 0 consults none for key 0), so a corrupt region never fails
- * it: generation 2 answers on ids as generation 0 does, while an
- * index-using key fails with the validator's corrupt error. */
-static test_result_t test_corrupt_sym_hash_null_key(void) {
+ * (generation 0 consults none for key 0): generation 2 answers on ids as
+ * generation 0 does, and so does an index-using key. */
+static test_result_t test_sym_hash_null_key(void) {
     ray_t* r = ixr_eval("(set SK (as 'SYM (map (fn [i] (if (== i 0) \"\" (concat \"k\" (as 'STR i)))) (til 5000))))");
     if (r) ray_release(r);
     r = ixr_eval("(set TS (table [k v] (list (.idx.hash (at SK (% (* (til 70000) 7) 5000))) (til 70000))))");
@@ -2933,7 +2208,6 @@ static test_result_t test_corrupt_sym_hash_null_key(void) {
     TEST_ASSERT_TRUE(ix_live_path(IDX_TMP "/zn2/", "k", kp, sizeof kp));
     ray_enc_hdr_t eh = ix_hdr(kp);
     TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_HASH);
-    uint8_t bad = 1; ix_patch(kp, (long)eh.index_off + 3, &bad, 1);
     static const char* const qs[] = {
         "(sum (at (select {from: X where: (== k ')}) 'v))",
         "(sum (at (select {from: X where: (!= k ')}) 'v))",
@@ -2952,12 +2226,11 @@ static test_result_t test_corrupt_sym_hash_null_key(void) {
         TEST_ASSERT_EQ_U(k.materialized, 0);
     }
     TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: X where: (== k ')}))"), 14);
-    ray_error_clear();
-    r = ray_eval_str("(sum (at (select {from: X where: (== k 'k42)}) 'v))");
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-    TEST_ASSERT_TRUE(strstr(ray_error_msg(), kp) && strstr(ray_error_msg(), "index root reserved bytes set"));
-    ray_error_free(r);
+    int64_t got = ixr_i64("(sum (at (select {from: X where: (== k 'k42)}) 'v))");
+    r = ixr_eval("(set X (.db.splayed.get \"" IDX_TMP "/zn0/\"))"); if (r) ray_release(r);
+    int64_t want = ixr_i64("(sum (at (select {from: X where: (== k 'k42)}) 'v))");
+    TEST_ASSERT_TRUE(want != INT64_MIN);
+    TEST_ASSERT_EQ_I(got, want);
     PASS();
 }
 
@@ -3133,7 +2406,7 @@ static test_result_t test_admitted_roundtrip(void) {
             if (!ray_index_kind_admits((ray_idx_kind_t)kinds[k], types[t])) continue;
             ray_t* v = with_index(ix_typed_col(types[t]), att[k]);
             TEST_ASSERT_FMT(v != NULL, "builder kind %u type %d", kinds[k], types[t]);
-            ray_t* p = ix_roundtrip(v, NULL, 0, types[t] == RAY_SYM ? 1u << 20 : 0);
+            ray_t* p = ix_roundtrip(v, NULL, 0);
             TEST_ASSERT_FMT(p != NULL, "round trip kind %u type %d", kinds[k], types[t]);
             ray_index_t* a = ray_index_payload(v->index);
             ray_index_t* b = ray_index_payload(p->index);
@@ -3154,7 +2427,7 @@ static test_result_t test_admitted_roundtrip(void) {
     ray_t* s = ray_vec_new(RAY_STR, 600);
     for (int i = 0; i < 600; i++) { char b[32]; int n = snprintf(b, sizeof b, "string key %d long", i % 23); s = ray_str_vec_append(s, b, (size_t)n); }
     ray_t* sv = with_index(s, ray_index_attach_hash);
-    ray_t* sp = ix_roundtrip(sv, NULL, 0, 0);
+    ray_t* sp = ix_roundtrip(sv, NULL, 0);
     TEST_ASSERT_TRUE(sp && ix_children_equal(ray_index_payload(sv->index), ray_index_payload(sp->index)));
     ray_release(sp); ray_release(sv);
     TEST_ASSERT_EQ_I(done, 10 * 4 + 2);          /* ten numeric types x four kinds, SYM HASH and PART */
@@ -3180,11 +2453,6 @@ static test_result_t test_admission_through_all(void) {
             if (!adm) {
                 rejected++;
                 TEST_ASSERT_FMT(we && strcmp(ray_err_code(we), "nyi") == 0, "writer kind %u type %d", kinds[k], types[t]);
-                uint8_t z[96] = {0}; z[0] = (uint8_t)types[t];
-                ray_enc_idx_view_t iv;
-                ray_t* ve = ray_enc_index_validate(z, 96, kinds[k], types[t], 0, 0, 1, NULL, "c", &iv);
-                TEST_ASSERT_FMT(ve && strcmp(ray_err_code(ve), "corrupt") == 0, "validator kind %u type %d", kinds[k], types[t]);
-                ray_error_free(ve);
                 ray_t* col = types[t] == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W8, 0) : ray_vec_new(types[t], 0);
                 ray_retain(root);
                 ray_t* ae = ray_index_attach_persisted(&col, root);
@@ -3396,7 +2664,10 @@ static test_result_t test_converter_dict_boundary(void) {
 }
 
 /* Spec "Index use materializes once": a point lookup on an indexed column
- * materializes only that column. */
+ * materializes at most that column.  An equality on a recorded HASH now
+ * probes the region where it is mapped (ray_enc_hash_eq_rowsel) and
+ * materializes nothing; an `in` on it still materializes the column for
+ * its index, and only that column. */
 static test_result_t test_use_materializes_once(void) {
     ray_t* r = ixr_eval("(.db.splayed.set \"" IDX_TMP "/m2/\" (table [k v w] (list (.idx.hash (% (* (til 200000) 7919) 100003)) (til 200000) (map (fn [j] (format \"t%\" j)) (til 200000)))) {compress: true})");
     if (r) ray_release(r);
@@ -3405,6 +2676,13 @@ static test_result_t test_use_materializes_once(void) {
     int64_t got = ixr_i64("(count (at (select {v: v w: w from: M where: (== k 4242)}) 'v))");   /* the select runs the filter; count of its column, not count(select) */
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_I(got, ixr_i64("(count (where (== (% (* (til 200000) 7919) 100003) 4242)))"));
+    TEST_ASSERT_EQ_U(k.materialized, 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'v) 'materialized) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'k) 'materialized) 1 0)"), 0);
+    ray_enc_counters_reset();
+    got = ixr_i64("(count (at (select {v: v w: w from: M where: (in k [4242 4243])}) 'v))");
+    ray_enc_counters_get(&k);
+    TEST_ASSERT_EQ_I(got, ixr_i64("(count (where (in (% (* (til 200000) 7919) 100003) [4242 4243])))"));
     TEST_ASSERT_EQ_U(k.materialized, 1);
     TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'v) 'materialized) 1 0)"), 0);
     TEST_ASSERT_EQ_I(ixr_i64("(if (at (.idx.info M 'k) 'materialized) 1 0)"), 1);
@@ -3599,418 +2877,6 @@ static test_result_t test_order_sym_fast_path(void) {
  * does), with a repeated key placed where only that walk, its long-distance
  * re-read, its sorted fallback or the pool pass can find it. */
 
-/* A key whose home is `home` in a cap-bucket table, the next from *k. */
-static int64_t dk_key_at(uint64_t home, uint64_t cap, int64_t* k) {
-    while (slot_of(*k, cap) != home) (*k)++;
-    return (*k)++;
-}
-/* A key whose home lies outside [lo, hi] (a filler), the next from *k. */
-static int64_t dk_key_off(uint64_t lo, uint64_t hi, uint64_t cap, int64_t* k) {
-    for (;; (*k)++) {
-        uint64_t s = slot_of(*k, cap);
-        if (s < lo || s > hi) return (*k)++;
-    }
-}
-/* Groups 0 .. ng-1 inserted in order by linear probing; each group g has
- * the one row g (offs g, rows g). */
-static ray_t* dk_root(int8_t type, const int64_t* gk, int64_t ng, uint64_t cap) {
-    int64_t* tb = calloc(cap, 8);
-    int64_t* of = malloc((size_t)(ng + 1) * 8);
-    int64_t* rw = malloc((size_t)(ng > 0 ? ng : 1) * 8);
-    for (int64_t g = 0; g < ng; g++) {
-        uint64_t s = slot_of(gk[g], cap);
-        while (tb[s]) s = (s + 1) & (cap - 1);
-        tb[s] = g + 1;
-        of[g] = g; rw[g] = g;
-    }
-    of[ng] = ng;
-    ray_t* root = fab_hash(type, ng, tb, cap, gk, ng, of, rw, ng);
-    free(tb); free(of); free(rw);
-    return root;
-}
-/* The fabrication validates (type I64, no SYM bound). */
-static test_result_t dk_accepts(ray_t* root, int64_t len, const char* what) {
-    size_t n; uint8_t* b = fab_region(root, RAY_I64, 0, len, &n);
-    ray_release(root);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_view_t iv;
-    ray_error_clear();
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv);
-    free(b);
-    TEST_ASSERT_FMT(e == NULL, "%s: %s", what, e ? ray_error_msg() : "");
-    PASS();
-}
-#define DK_ACCEPTS(root, len, what) do { test_result_t r_ = dk_accepts((root), (len), (what)); \
-    if (r_.status != TEST_PASS) return r_; } while (0)
-
-/* Serial walk (small tables): a repeated key at the same home two buckets
- * on, the same through the table's wrap, and one displaced past the ring
- * (300 buckets on, read back from gkeys). */
-static test_result_t test_hash_dup_walk(void) {
-    {   /* cap 16: A=k at h, B (home h) at h+1, A's key again at h+2 */
-        uint64_t cap = 16, h = 5;
-        int64_t k = 1;
-        int64_t gk[5];
-        gk[0] = dk_key_at(h, cap, &k); gk[1] = dk_key_at(h, cap, &k); gk[2] = gk[0];
-        gk[3] = dk_key_off(h - 1, h + 4, cap, &k); gk[4] = dk_key_off(h - 1, h + 4, cap, &k);
-        FAB_CORRUPT(dk_root(RAY_I64, gk, 5, cap), RAY_I64, 5, 0, "finds two groups");
-        gk[2] = dk_key_at(h, cap, &k);                           /* distinct: accepted */
-        DK_ACCEPTS(dk_root(RAY_I64, gk, 5, cap), 5, "same home, distinct");
-    }
-    {   /* through the wrap: A=k at cap-1, a filler of home cap-1 at 0, k again at 1 */
-        uint64_t cap = 16;
-        int64_t k = 1;
-        int64_t gk[5];
-        gk[0] = dk_key_at(cap - 1, cap, &k); gk[1] = dk_key_at(cap - 1, cap, &k); gk[2] = gk[0];
-        gk[3] = dk_key_at(6, cap, &k); gk[4] = dk_key_at(8, cap, &k);
-        FAB_CORRUPT(dk_root(RAY_I64, gk, 5, cap), RAY_I64, 5, 0, "finds two groups");
-        /* a home of cap-2 reached at bucket 0 (distance 2 through the wrap) */
-        int64_t g2[5];
-        g2[0] = dk_key_at(cap - 2, cap, &k); g2[1] = dk_key_at(cap - 2, cap, &k); g2[2] = g2[0];
-        g2[3] = dk_key_at(8, cap, &k); g2[4] = dk_key_at(10, cap, &k);
-        FAB_CORRUPT(dk_root(RAY_I64, g2, 5, cap), RAY_I64, 5, 0, "finds two groups");
-        g2[2] = dk_key_at(cap - 2, cap, &k);
-        DK_ACCEPTS(dk_root(RAY_I64, g2, 5, cap), 5, "through the wrap, distinct");
-    }
-    {   /* past the ring: 300 groups of one home, then the first's key again */
-        int64_t ng = 6000;
-        uint64_t cap = 16384, h = 1000;
-        int64_t* gk = malloc((size_t)ng * 8);
-        int64_t k = 1;
-        for (int64_t g = 0; g < 300; g++) gk[g] = dk_key_at(h, cap, &k);
-        gk[300] = gk[0];
-        k = 1;
-        for (int64_t g = 301; g < ng; g++) {
-            int64_t c = dk_key_off(h - 1, h + 400, cap, &k);
-            for (int64_t i = 0; i < 300; i++) if (gk[i] == c) { c = dk_key_off(h - 1, h + 400, cap, &k); i = -1; }
-            gk[g] = c;
-        }
-        FAB_CORRUPT(dk_root(RAY_I64, gk, ng, cap), RAY_I64, ng, 0, "finds two groups");
-        k = gk[299] + 1;
-        gk[300] = dk_key_at(h, cap, &k);
-        for (int64_t g = 301; g < ng; g++) TEST_ASSERT_TRUE(gk[g] != gk[300]);
-        DK_ACCEPTS(dk_root(RAY_I64, gk, ng, cap), ng, "past the ring, distinct");
-        free(gk);
-    }
-    PASS();
-}
-
-/* A cluster whose displacement exceeds the compare budget: the walk stops
- * comparing and the sorted fallback still finds the repeated key, placed
- * at the cluster's last group. */
-static test_result_t test_hash_dup_budget(void) {
-    int64_t ng = (int64_t)1 << 17;
-    size_t n; uint8_t* b = long_cluster_region(ng, &n);
-    TEST_ASSERT_NOT_NULL(b);
-    ray_enc_idx_hash_t h; memcpy(&h, b + 16, 64);
-    uint64_t cap = h.mask + 1;
-    /* the cluster's first and last groups in bucket order */
-    int64_t first = -1, last = -1;
-    for (uint64_t p = 0; p < cap; p++) {
-        int64_t t; memcpy(&t, b + h.table + p * 8, 8);
-        if (t) { if (first < 0) first = t - 1; last = t - 1; }
-    }
-    TEST_ASSERT_TRUE(first >= 0 && last > first);
-    int64_t kf; memcpy(&kf, b + h.gkeys + (uint64_t)first * 8, 8);
-    memcpy(b + h.gkeys + (uint64_t)last * 8, &kf, 8);          /* home of first <= its bucket */
-    ray_enc_idx_view_t iv;
-    ray_error_clear();
-    ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, ng, 0, NULL, "col x", &iv);
-    TEST_ASSERT_TRUE(e != NULL);
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), "finds two groups") != NULL, "message '%s'", ray_error_msg());
-    char want[64]; snprintf(want, sizeof want, "key %lld", (long long)kf);
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), want) != NULL, "message '%s', want '%s'", ray_error_msg(), want);
-    ray_error_free(e);
-    free(b);
-    PASS();
-}
-
-/* Tables of at least 2^17 buckets go through the pool pass first: it
- * accepts the valid ones, and every rule it shares with the serial checks
- * still rejects with the serial message, whatever the core count.  70000
- * groups (cap 2^18), group g has the rows g and g + 70000. */
-#define PH_NG 70000
-static int64_t* ph_keys(void) {
-    int64_t* gk = malloc(PH_NG * 8);
-    for (int64_t g = 0; g < PH_NG; g++) gk[g] = g * 7919 + 13;
-    return gk;
-}
-static ray_t* ph_root(int8_t type, const int64_t* gk, int64_t* tb_out, int64_t* rw_patch, int64_t* of_patch,
-                      void (*tweak)(int64_t* tb, uint64_t cap, const int64_t* gk)) {
-    uint64_t cap = (uint64_t)1 << 18;
-    int64_t* tb = calloc(cap, 8);
-    int64_t* of = malloc((PH_NG + 1) * 8);
-    int64_t* rw = malloc(2 * PH_NG * 8);
-    for (int64_t g = 0; g < PH_NG; g++) {
-        uint64_t s = slot_of(gk[g], cap);
-        while (tb[s]) s = (s + 1) & (cap - 1);
-        tb[s] = g + 1;
-        of[g] = 2 * g; rw[2 * g] = g; rw[2 * g + 1] = g + PH_NG;
-    }
-    of[PH_NG] = 2 * PH_NG;
-    if (tweak) tweak(tb, cap, gk);
-    if (rw_patch) { rw[rw_patch[0]] = rw_patch[1]; }
-    if (of_patch) { of[of_patch[0]] = of_patch[1]; }
-    if (tb_out) memcpy(tb_out, tb, cap * 8);
-    ray_t* root = fab_hash(type, 2 * PH_NG, tb, cap, gk, PH_NG, of, rw, 2 * PH_NG);
-    free(tb); free(of); free(rw);
-    return root;
-}
-/* an empty bucket set to `val` (the first one at or after bucket 100) */
-static int64_t ph_val;
-static void ph_set_empty(int64_t* tb, uint64_t cap, const int64_t* gk) {
-    (void)gk;
-    for (uint64_t s = 100; s < cap; s++) if (!tb[s]) { tb[s] = ph_val; return; }
-}
-/* group ph_val also in the bucket right after its own (reachable) */
-static void ph_group_twice(int64_t* tb, uint64_t cap, const int64_t* gk) {
-    (void)gk;
-    for (uint64_t s = 0; s < cap; s++)
-        if (tb[s] == ph_val) {
-            uint64_t q = (s + 1) & (cap - 1);
-            while (tb[q]) q = (q + 1) & (cap - 1);
-            tb[q] = ph_val;
-            return;
-        }
-}
-/* Scratch of the pool-pass tests, freed by their wrappers whatever the
- * body returns (an assertion returns early). */
-typedef struct { int64_t *gk, *g2, *tb, *of, *rw; } ph_bufs_t;
-#define PH_CAP ((uint64_t)1 << 18)
-static bool ph_bufs_new(ph_bufs_t* B) {
-    B->gk = ph_keys(); B->g2 = malloc(PH_NG * 8); B->tb = malloc(PH_CAP * 8);
-    B->of = malloc((PH_NG + 1) * 8); B->rw = malloc(2 * PH_NG * 8);
-    return B->gk && B->g2 && B->tb && B->of && B->rw;
-}
-static void ph_bufs_free(ph_bufs_t* B) { free(B->gk); free(B->g2); free(B->tb); free(B->of); free(B->rw); }
-/* B's table, offs and rows built from keys gk as ph_root builds them */
-static void ph_build(ph_bufs_t* B, const int64_t* gk) {
-    memset(B->tb, 0, PH_CAP * 8);
-    for (int64_t g = 0; g < PH_NG; g++) {
-        uint64_t s = slot_of(gk[g], PH_CAP);
-        while (B->tb[s]) s = (s + 1) & (PH_CAP - 1);
-        B->tb[s] = g + 1;
-        B->of[g] = 2 * g; B->rw[2 * g] = g; B->rw[2 * g + 1] = g + PH_NG;
-    }
-    B->of[PH_NG] = 2 * PH_NG;
-}
-static ray_t* ph_fab(ph_bufs_t* B, const int64_t* gk) {
-    return fab_hash(RAY_I64, 2 * PH_NG, B->tb, PH_CAP, gk, PH_NG, B->of, B->rw, 2 * PH_NG);
-}
-static test_result_t ph_rejects_body(ph_bufs_t* B) {
-    int64_t* gk = B->gk;
-    int64_t len = 2 * PH_NG;
-    DK_ACCEPTS(ph_root(RAY_I64, gk, NULL, NULL, NULL, NULL), len, "pool pass, valid");
-    /* parse_copy over a pool-validated region gives the root parse gives */
-    {
-        size_t n; uint8_t* b = fab_region(ph_root(RAY_I64, gk, NULL, NULL, NULL, NULL), RAY_I64, 0, len, &n);
-        TEST_ASSERT_NOT_NULL(b);
-        ray_enc_idx_view_t iv, iv2;
-        ray_enc_idx_copies_t cp;
-        TEST_ASSERT_NULL(ray_enc_index_validate_copy(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv, &cp));
-        TEST_ASSERT_NULL(ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv2));
-        ray_pool_t* tp = ray_pool_get();
-        bool pooled = tp && tp->n_workers > 0;
-        TEST_ASSERT_FMT((cp.hash[0] != NULL) == pooled, "copies %p, pool workers %u", (void*)cp.hash[0],
-                        tp ? tp->n_workers : 0);
-        ray_t *r1 = NULL, *r2 = NULL;
-        TEST_ASSERT_NULL(ray_enc_index_parse_copy(&iv, NULL, &r1, &cp));
-        for (int i = 0; i < 4; i++) TEST_ASSERT_NULL(cp.hash[i]);
-        TEST_ASSERT_NULL(ray_enc_index_parse(&iv2, NULL, &r2));
-        const ray_index_t* a = ray_index_payload(r1);
-        const ray_index_t* c = ray_index_payload(r2);
-        bool same = a->u.hash.mask == c->u.hash.mask && a->u.hash.n_groups == c->u.hash.n_groups &&
-                    a->u.hash.n_keys == c->u.hash.n_keys &&
-                    same_child(a->u.hash.table, c->u.hash.table, 8) && same_child(a->u.hash.gkeys, c->u.hash.gkeys, 8) &&
-                    same_child(a->u.hash.offs, c->u.hash.offs, 8) && same_child(a->u.hash.rows, c->u.hash.rows, 8);
-        ray_release(r1); ray_release(r2);
-        free(b);
-        TEST_ASSERT_TRUE(same);
-        /* a rejected region leaves no copies */
-        b = fab_region(ph_root(RAY_I64, gk, NULL, (int64_t[]){ 10, 3 }, NULL, NULL), RAY_I64, 0, len, &n);
-        TEST_ASSERT_NOT_NULL(b);
-        ray_t* e = ray_enc_index_validate_copy(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv, &cp);
-        TEST_ASSERT_TRUE(e != NULL);
-        ray_error_free(e);
-        for (int i = 0; i < 4; i++) TEST_ASSERT_NULL(cp.hash[i]);
-        free(b);
-    }
-    /* a repeated key: two adjacent groups, the second at its own home,
-     * given the first one's key (same home, distance 1) */
-    {
-        uint64_t cap = PH_CAP;
-        int64_t* tb = B->tb;
-        ray_release(ph_root(RAY_I64, gk, tb, NULL, NULL, NULL));
-        int64_t* g2 = B->g2; memcpy(g2, gk, PH_NG * 8);
-        bool placed = false;
-        for (uint64_t s = 0; s + 1 < cap && !placed; s++) {
-            if (!tb[s] || !tb[s + 1]) continue;
-            int64_t ga = tb[s] - 1, gb = tb[s + 1] - 1;
-            if (slot_of(gk[ga], cap) == s && slot_of(gk[gb], cap) == s + 1) { g2[gb] = gk[ga]; placed = true; }
-        }
-        TEST_ASSERT_TRUE(placed);
-        FAB_CORRUPT(ph_root(RAY_I64, g2, NULL, NULL, NULL, NULL), RAY_I64, len, 0, "finds two groups");
-        /* the same through the wrap: the last bucket's group's key given to
-         * a group placed at bucket 0 */
-        memcpy(g2, gk, PH_NG * 8);
-        int64_t k = 1;
-        int64_t kw = dk_key_at(cap - 1, cap, &k), kz = dk_key_at(cap - 1, cap, &k);
-        g2[0] = kw; g2[1] = kz; g2[2] = kw;                      /* at cap-1, 0, 1 */
-        FAB_CORRUPT(ph_root(RAY_I64, g2, NULL, NULL, NULL, NULL), RAY_I64, len, 0, "finds two groups");
-        g2[2] = dk_key_at(cap - 1, cap, &k);
-        bool dist = true;
-        for (int64_t g = 3; g < PH_NG; g++) dist &= g2[g] != g2[0] && g2[g] != g2[1] && g2[g] != g2[2];
-        TEST_ASSERT_TRUE(dist);
-        DK_ACCEPTS(ph_root(RAY_I64, g2, NULL, NULL, NULL, NULL), len, "pool pass through the wrap, distinct");
-    }
-    /* table: a group number out of range; a group in two buckets */
-    ph_val = PH_NG + 1;
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, NULL, NULL, ph_set_empty), RAY_I64, len, 0, "holds 70001");
-    ph_val = 5;
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, NULL, NULL, ph_group_twice), RAY_I64, len, 0, "more than one bucket");
-    ph_val = 5;
-    FAB_CORRUPT(ph_root(RAY_STR, gk, NULL, NULL, NULL, ph_group_twice), RAY_STR, len, 0, "more than one bucket");
-    /* groups: offs, rows range, rows order, a row in two groups (a far
-     * group's, likely another worker's; a near one's) */
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, NULL, (int64_t[]){ 40000, 79998 }, NULL), RAY_I64, len, 0, "offs not strictly");
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, (int64_t[]){ 90001, len }, NULL, NULL), RAY_I64, len, 0, "outside the column");
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, (int64_t[]){ 90001, 1 }, NULL, NULL), RAY_I64, len, 0, "ascending");
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, (int64_t[]){ 2 * 69990, 3 }, NULL, NULL), RAY_I64, len, 0, "rows not unique");
-    FAB_CORRUPT(ph_root(RAY_I64, gk, NULL, (int64_t[]){ 10, 3 }, NULL, NULL), RAY_I64, len, 0, "rows not unique");
-    /* SYM: a key outside the domain (bound PH_NG * 7919 + 14 holds the rest) */
-    {
-        int64_t* g2 = B->g2; memcpy(g2, gk, PH_NG * 8);
-        uint32_t bound = (uint32_t)(PH_NG * 7919 + 14);
-        {   size_t n; uint8_t* b = fab_region(ph_root(RAY_SYM, g2, NULL, NULL, NULL, NULL), RAY_SYM, RAY_SYM_W8, len, &n);
-            TEST_ASSERT_NOT_NULL(b);
-            ray_enc_idx_view_t iv;
-            ray_t* e = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_SYM, RAY_SYM_W8, len, bound, NULL, "col x", &iv);
-            free(b);
-            TEST_ASSERT_FMT(e == NULL, "SYM keys under the bound: %s", e ? ray_error_msg() : ""); }
-        g2[777] = (int64_t)bound;
-        FAB_CORRUPT(ph_root(RAY_SYM, g2, NULL, NULL, NULL, NULL), RAY_SYM, len, bound, "outside the symbol domain");
-    }
-    /* an unreachable group: one moved before its home */
-    {
-        uint64_t cap = PH_CAP;
-        int64_t* tb = B->tb;
-        ph_build(B, gk);
-        uint64_t s = 1;
-        while (!(tb[s] && !tb[s - 1] && slot_of(gk[tb[s] - 1], cap) == s)) s++;
-        tb[s - 1] = tb[s]; tb[s] = 0;
-        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "finds nothing");
-    }
-    PASS();
-}
-static test_result_t test_hash_par_rejects(void) {
-    ph_bufs_t B;
-    test_result_t r = ph_bufs_new(&B) ? ph_rejects_body(&B) : (test_result_t){ TEST_FAIL, "scratch allocation" };
-    bool alloc = B.gk && B.g2 && B.tb && B.of && B.rw;
-    ph_bufs_free(&B);
-    TEST_ASSERT_TRUE(alloc);
-    return r;
-}
-
-/* One forgery per rule of the pool pass, each breaking that rule only, so a
- * pool pass that dropped the rule would accept it (Task 10b review).  And a
- * cluster across a pool span boundary: accepted, copied by the pool pass. */
-static test_result_t ph_rules_body(ph_bufs_t* B) {
-    const int64_t* gk = B->gk;
-    int64_t len = 2 * PH_NG;
-    int64_t* tb = B->tb;
-    /* reachability: a group two buckets past its home, an empty bucket
-     * between (d = 2, run = 0, under the compare budget) */
-    {
-        ph_build(B, gk);
-        uint64_t s = 0;
-        while (s + 3 < PH_CAP && !(tb[s] && slot_of(gk[tb[s] - 1], PH_CAP) == s && !tb[s + 1] && !tb[s + 2] && !tb[s + 3])) s++;
-        TEST_ASSERT_TRUE(s + 3 < PH_CAP);
-        tb[s + 2] = tb[s]; tb[s] = 0;
-        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "finds nothing");
-    }
-    /* rows ascending: one group's two rows swapped (no duplicate, in range) */
-    {
-        ph_build(B, gk);
-        int64_t g = 1234, t = B->rw[2 * g];
-        B->rw[2 * g] = B->rw[2 * g + 1]; B->rw[2 * g + 1] = t;
-        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "ascending");
-    }
-    /* offs strictly increasing: group g's slice empty, its rows moved into
-     * group g+1's slice in ascending order */
-    {
-        ph_build(B, gk);
-        int64_t g = 2000;
-        B->of[g + 1] = B->of[g];
-        B->rw[2 * g] = g; B->rw[2 * g + 1] = g + 1; B->rw[2 * g + 2] = g + PH_NG; B->rw[2 * g + 3] = g + 1 + PH_NG;
-        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "offs not strictly increasing");
-    }
-    /* every group has a bucket: a cluster's last bucket emptied */
-    {
-        ph_build(B, gk);
-        uint64_t s = 1000;
-        while (s + 1 < PH_CAP && !(tb[s] && !tb[s + 1])) s++;
-        TEST_ASSERT_TRUE(s + 1 < PH_CAP);
-        tb[s] = 0;
-        FAB_CORRUPT(ph_fab(B, gk), RAY_I64, len, 0, "groups have a bucket");
-    }
-    /* a cluster across the first pool span (cap 2^18: 4 spans of 2^16 walk
-     * steps from the first empty bucket e0) */
-    {
-        int64_t* g2 = B->g2;
-        memcpy(g2, gk, PH_NG * 8);
-        ph_build(B, g2);
-        uint64_t e0 = 0;
-        while (tb[e0]) e0++;
-        uint64_t home = (e0 + 65536 - 3) & (PH_CAP - 1);
-        int64_t k = 1;
-        for (int i = 0; i < 8; i++) {
-            int64_t c;
-            bool clash;
-            do {                                     /* a key no other group has */
-                c = dk_key_at(home, PH_CAP, &k);
-                clash = c >= 13 && (c - 13) % 7919 == 0 && (c - 13) / 7919 < PH_NG;
-                for (int j = 0; j < i; j++) clash |= g2[j] == c;
-            } while (clash);
-            g2[i] = c;
-        }
-        ph_build(B, g2);
-        uint64_t f0 = 0;
-        while (tb[f0]) f0++;
-        TEST_ASSERT_TRUE(tb[(f0 + 65536) & (PH_CAP - 1)] && tb[(f0 + 65537) & (PH_CAP - 1)]);
-        size_t n; uint8_t* b = fab_region(ph_fab(B, g2), RAY_I64, 0, len, &n);
-        TEST_ASSERT_NOT_NULL(b);
-        ray_enc_idx_view_t iv, iv2;
-        ray_enc_idx_copies_t cp;
-        ray_t* e = ray_enc_index_validate_copy(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv, &cp);
-        ray_t* e2 = ray_enc_index_validate(b, n, RAY_IDX_HASH, RAY_I64, 0, len, 0, NULL, "col x", &iv2);
-        ray_pool_t* tp = ray_pool_get();
-        bool pooled = tp && tp->n_workers > 0, copied = cp.hash[0] != NULL;
-        ray_t *r1 = NULL, *r2 = NULL;
-        ray_t* p1 = e ? NULL : ray_enc_index_parse_copy(&iv, NULL, &r1, &cp);
-        ray_t* p2 = e2 ? NULL : ray_enc_index_parse(&iv2, NULL, &r2);
-        bool same = r1 && r2 && same_child(ray_index_payload(r1)->u.hash.table, ray_index_payload(r2)->u.hash.table, 8) &&
-                    same_child(ray_index_payload(r1)->u.hash.rows, ray_index_payload(r2)->u.hash.rows, 8);
-        if (e) ray_error_free(e);
-        if (e2) ray_error_free(e2);
-        if (p1) ray_error_free(p1);
-        if (p2) ray_error_free(p2);
-        if (r1) ray_release(r1);
-        if (r2) ray_release(r2);
-        free(b);
-        TEST_ASSERT_TRUE(e == NULL && e2 == NULL && same);
-        TEST_ASSERT_FMT(copied == pooled, "span-crossing cluster: copies %d, pool workers %u", copied, tp ? tp->n_workers : 0);
-    }
-    PASS();
-}
-static test_result_t test_hash_par_rules(void) {
-    ph_bufs_t B;
-    test_result_t r = ph_bufs_new(&B) ? ph_rules_body(&B) : (test_result_t){ TEST_FAIL, "scratch allocation" };
-    bool alloc = B.gk && B.g2 && B.tb && B.of && B.rw;
-    ph_bufs_free(&B);
-    TEST_ASSERT_TRUE(alloc);
-    return r;
-}
-
 /* ---- P6b: the DICT region (spec "Index region", "Index validation") ---- */
 
 /* A DICT source over 8 rows: codes 0 1 0 2 1 0 2 3, first_occ 0 1 3 7,
@@ -4039,16 +2905,6 @@ static uint8_t* dx_region(const ray_enc_dict_src_t* s, size_t* n, ray_t** err) {
     *n = got;
     return b;
 }
-static ray_t* dx_check(const uint8_t* b, size_t n, int64_t len, ray_enc_dict_view_t* v) {
-    ray_t* e = ray_enc_dict_validate(b, n, len, "dx", v);
-    return e ? e : ray_enc_dict_codes_check(v, NULL, "dx");
-}
-#define DX_CORRUPT(b, n, len, needle) do { ray_enc_dict_view_t v_; ray_error_clear(); \
-    ray_t* e_ = dx_check((b), (n), (len), &v_); \
-    TEST_ASSERT_FMT(e_ && strcmp(ray_err_code(e_), "corrupt") == 0, "want corrupt for %s", (needle)); \
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), (needle)) != NULL, "message \"%s\", want [%s]", ray_error_msg(), (needle)); \
-    ray_error_free(e_); } while (0)
-
 /* Layout: root fields, children at pad32 offsets from 96, region end. */
 static test_result_t test_dict_write_layout(void) {
     ray_enc_dict_src_t s = dx_src();
@@ -4075,132 +2931,19 @@ static test_result_t test_dict_write_layout(void) {
 }
 
 /* The region validates; the view points at its children. */
-static test_result_t test_dict_validate_accepts(void) {
+static test_result_t test_dict_view_fields(void) {
     ray_enc_dict_src_t s = dx_src();
     size_t n; ray_t* err;
     uint8_t* b = dx_region(&s, &n, &err);
     TEST_ASSERT_NULL(err);
     ray_enc_dict_view_t v;
-    TEST_ASSERT_NULL(ray_enc_dict_validate(b, n, 8, "dx", &v));
+    ray_enc_dict_parse(b, &v);
     TEST_ASSERT_EQ_I(v.n_distinct, 4);
     TEST_ASSERT_EQ_I(v.len, 8);
     TEST_ASSERT_TRUE(memcmp(v.codes, dx_codes, sizeof dx_codes) == 0);
     TEST_ASSERT_TRUE(memcmp(v.first_occ, dx_focc, sizeof dx_focc) == 0);
     TEST_ASSERT_EQ_U(v.offs[4], 7);
-    int32_t copy[8];
-    TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, copy, "dx"));
-    TEST_ASSERT_TRUE(memcmp(copy, dx_codes, sizeof copy) == 0);
-    TEST_ASSERT_STR_EQ(ray_err_code(ray_enc_dict_validate(b, n, 9, "dx", &v)), "corrupt");   /* built_for_len */
     free(b);
-    PASS();
-}
-
-/* Every entry-tier rule, one patch each, against the written region. */
-static test_result_t test_dict_reject_entry_tier(void) {
-    ray_enc_dict_src_t s = dx_src();
-    size_t n; ray_t* err;
-    uint8_t* g = dx_region(&s, &n, &err);
-    TEST_ASSERT_NULL(err);
-    uint8_t* b = aligned_alloc(32, (n + 31) & ~(size_t)31);
-    ray_enc_idx_dict_t d; memcpy(&d, g + 16, sizeof d);
-    #define DX_PATCH(off, T, val, needle) do { memcpy(b, g, n); T x_ = (val); memcpy(b + (off), &x_, sizeof x_); \
-        DX_CORRUPT(b, n, 8, needle); } while (0)
-    DX_PATCH(0, int8_t, RAY_I64, "parent type");
-    DX_PATCH(1, uint8_t, 1, "reserved");
-    DX_PATCH(16 + 32, int64_t, 0, "n_distinct");                    /* 0 */
-    DX_PATCH(16 + 32, int64_t, 9, "n_distinct");                    /* above len */
-    DX_PATCH(16 + 40, uint64_t, 40, "layout");                      /* bytes_len moves the end */
-    DX_PATCH(16 + 48, uint8_t, 1, "kind area");
-    DX_PATCH(16 + 0, int64_t, 128, "placement");                    /* codes not at 96 */
-    DX_PATCH(d.offs, uint64_t, 1, "offsets");                       /* offs[0] != 0 */
-    DX_PATCH(d.offs + 16, uint64_t, 0, "offsets");                  /* decreasing */
-    DX_PATCH(d.offs + 32, uint64_t, 6, "offsets");                  /* terminal != bytes_len */
-    DX_PATCH(d.first_occ, int32_t, 1, "first occurrence");          /* first_occ[0] != 0 */
-    DX_PATCH(d.first_occ + 8, int32_t, 1, "first occurrence");      /* not ascending */
-    DX_PATCH(d.first_occ + 12, int32_t, 8, "first occurrence");     /* past len */
-    DX_PATCH(d.bytes + 7, uint8_t, 1, "padding");                   /* after the bytes */
-    DX_PATCH(d.first_occ + 4 * 4, uint8_t, 1, "padding");           /* between first_occ and offs */
-    #undef DX_PATCH
-    memcpy(b, g, n);
-    DX_CORRUPT(b, n - 32, 8, "layout");                             /* truncated */
-    DX_CORRUPT(b, 64, 8, "root");                                   /* shorter than the root */
-    /* len past INT32_MAX: built_for_len and the column agree, codes do not fit */
-    memcpy(b, g, n); int64_t big = (int64_t)INT32_MAX + 1; memcpy(b + 8, &big, 8);
-    DX_CORRUPT(b, n, big, "INT32_MAX");
-    free(b); free(g);
-    PASS();
-}
-
-/* The code tier: out of range, before its first occurrence, first_occ
- * not the first row of its code, an entry that never occurs. */
-static test_result_t test_dict_reject_code_tier(void) {
-    int32_t c[8];
-    ray_enc_dict_src_t s = dx_src();
-    struct { int row; int32_t code; const char* needle; } cases[] = {
-        { 2, 4, "code" },                 /* 4 >= n_distinct */
-        { 2, -1, "code" },
-        { 2, 2, "first occurrence" },     /* code 2 at row 2, first_occ[2] = 3 */
-        { 3, 0, "first occurrence" },     /* codes[first_occ[2]] != 2, and 2 never occurs first */
-        { 7, 2, "first occurrence" },     /* code 3 never occurs: codes[first_occ[3]] != 3 */
-    };
-    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
-        memcpy(c, dx_codes, sizeof c);
-        c[cases[k].row] = cases[k].code;
-        s.codes = c;
-        size_t n; ray_t* err;
-        uint8_t* b = dx_region(&s, &n, &err);
-        /* the writer persists what it is given; the reader refuses it */
-        TEST_ASSERT_NULL(err);
-        ray_enc_dict_view_t v;
-        TEST_ASSERT_NULL(ray_enc_dict_validate(b, n, 8, "dx", &v));    /* the entry tier passes */
-        ray_error_clear();
-        ray_t* e = ray_enc_dict_codes_check(&v, NULL, "dx");
-        TEST_ASSERT_FMT(e && strcmp(ray_err_code(e), "corrupt") == 0, "case %zu: want corrupt", k);
-        TEST_ASSERT_FMT(strstr(ray_error_msg(), cases[k].needle) != NULL, "case %zu: %s", k, ray_error_msg());
-        ray_error_free(e); free(b);
-    }
-    PASS();
-}
-
-/* The code tier over 300000 rows (parallel above the dispatch threshold)
- * gives the serial verdict, and writes the copy. */
-static test_result_t test_dict_codes_par(void) {
-    const int64_t n = 300000, nd = 1000;
-    int32_t* c = malloc((size_t)n * 4); int32_t* f = malloc((size_t)nd * 4);
-    uint64_t* o = malloc((size_t)nd * 8); char* by = malloc((size_t)nd * 4);
-    for (int64_t i = 0; i < nd; i++) { c[i] = (int32_t)i; f[i] = (int32_t)i; o[i] = (uint64_t)i * 4; memcpy(by + i * 4, &i, 4); }
-    for (int64_t i = nd; i < n; i++) c[i] = (int32_t)((i * 7919) % nd);
-    ray_enc_dict_src_t s = { .len = n, .n_distinct = nd, .codes = c, .first_occ = f, .offs = o,
-                             .bytes = by, .bytes_len = (uint64_t)nd * 4 };
-    size_t rn; ray_t* err;
-    uint8_t* b = dx_region(&s, &rn, &err);
-    TEST_ASSERT_NULL(err);
-    ray_enc_dict_view_t v;
-    TEST_ASSERT_NULL(ray_enc_dict_validate(b, rn, n, "dx", &v));
-    /* the parallel path: the check dispatches exactly when this holds */
-    ray_pool_t* tp = ray_pool_get();
-    if (!ray_pool_par_dispatch_ok(tp, n, RAY_PARALLEL_THRESHOLD)) {
-        free(b); free(c); free(f); free(o); free(by);
-        SKIP("needs pool workers (RAYFORCE_CORES >= 2)");
-    }
-    int32_t* copy = malloc((size_t)n * 4);
-    TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, copy, "dx"));
-    TEST_ASSERT_TRUE(memcmp(copy, c, (size_t)n * 4) == 0);
-    int32_t* cd = (int32_t*)(b + 96);
-    cd[250000] = (int32_t)nd;                       /* one bad code deep in the column */
-    ray_t* e = ray_enc_dict_codes_check(&v, NULL, "dx");
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
-    TEST_ASSERT_TRUE(strstr(ray_error_msg(), "row 250000") != NULL);
-    ray_error_free(e);
-    /* a lower bad row in the first task, of the other kind (before its
-     * first occurrence): the lowest row wins whatever the task order */
-    cd[10] = 500;                                   /* first_occ[500] = 500 > 10 */
-    e = ray_enc_dict_codes_check(&v, NULL, "dx");
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "corrupt") == 0);
-    TEST_ASSERT_FMT(strstr(ray_error_msg(), "row 10 ") && strstr(ray_error_msg(), "before its first occurrence"),
-                    "message \"%s\"", ray_error_msg());
-    ray_error_free(e);
-    free(copy); free(b); free(c); free(f); free(o); free(by);
     PASS();
 }
 
@@ -4226,83 +2969,6 @@ static test_result_t test_dict_write_rejects(void) {
     PASS();
 }
 
-/* The entry-tier clauses the patch list above leaves out: alignment (a
- * programming error, type), the root padding, the count-against-region
- * bounds, the last child's placement and leading padding, no region. */
-static test_result_t test_dict_reject_entry_tier_more(void) {
-    ray_enc_dict_src_t s = dx_src();
-    size_t n; ray_t* err;
-    uint8_t* g = dx_region(&s, &n, &err);
-    TEST_ASSERT_NULL(err);
-    TEST_ASSERT_EQ_U(n, 256);
-    uint8_t* b = aligned_alloc(32, n + 32);
-    ray_enc_idx_dict_t d; memcpy(&d, g + 16, sizeof d);
-    ray_enc_dict_view_t v;
-    memcpy(b + 8, g, n);                                            /* 8-aligned, not 32 */
-    ray_t* e = ray_enc_dict_validate(b + 8, n, 8, "dx", &v);
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0);
-    ray_error_free(e);
-    TEST_ASSERT_TRUE(v.codes == NULL && v.n_distinct == 0);
-    #define DX_PATCH_L(off, T, val, len, needle) do { memcpy(b, g, n); T x_ = (val); memcpy(b + (off), &x_, sizeof x_); \
-        int64_t l_ = (len); memcpy(b + 8, &l_, 8); DX_CORRUPT(b, n, l_, needle); } while (0)
-    DX_PATCH_L(80, uint8_t, 1, 8, "root padding");
-    DX_PATCH_L(95, uint8_t, 1, 8, "root padding");
-    DX_PATCH_L(16 + 32, int64_t, 40, 64, "layout");                 /* n_distinct past size / 8 */
-    DX_PATCH_L(16 + 32, int64_t, 4, 100, "layout");                 /* rows past size / 4 */
-    DX_PATCH_L(16 + 40, uint64_t, 1000, 8, "layout");               /* bytes_len past the region */
-    DX_PATCH_L(16 + 40, uint64_t, UINT64_MAX, 8, "layout");
-    DX_PATCH_L(16 + 24, int64_t, 256, 8, "placement");              /* bytes child moved */
-    DX_PATCH_L(16 + 16, int64_t, 128, 8, "placement");              /* offs child over first_occ */
-    DX_PATCH_L(d.offs + 5 * 8, uint8_t, 1, 8, "padding");           /* between offs and bytes */
-    DX_PATCH_L(d.codes + 7 * 4, int32_t, 0, 8, "first occurrence");  /* code tier: codes[7] 3 -> 0 */
-    #undef DX_PATCH_L
-    DX_CORRUPT(NULL, 0, 8, "root");
-    memcpy(b, g, n);
-    DX_CORRUPT(b, n, 0, "built_for_len");                           /* root 8 rows, column 0: mismatch */
-    /* the len < 1 range rule: built_for_len and the column agree */
-    int64_t zero = 0, neg = -1;
-    memcpy(b + 8, &zero, 8); DX_CORRUPT(b, n, 0, "INT32_MAX");
-    memcpy(b + 8, &neg, 8);  DX_CORRUPT(b, n, -1, "INT32_MAX");
-    /* the code tier refuses the zeroed view a failed validation leaves */
-    TEST_ASSERT_NOT_NULL(e = ray_enc_dict_validate(b, n, -1, "dx", &v));
-    ray_error_free(e);
-    e = ray_enc_dict_codes_check(&v, NULL, "dx");
-    TEST_ASSERT_TRUE(e && strcmp(ray_err_code(e), "type") == 0);
-    ray_error_free(e);
-    free(b); free(g);
-    PASS();
-}
-
-/* A cancelled code check reports cancel, never success, serial or
- * parallel, and passes once the interrupt is cleared. */
-static test_result_t test_dict_codes_cancel(void) {
-    const int64_t n = 300000, nd = 3;
-    int32_t* c = malloc((size_t)n * 4);
-    for (int64_t i = 0; i < n; i++) c[i] = (int32_t)(i < nd ? i : i % nd);
-    const int32_t f[3] = { 0, 1, 2 };
-    const uint64_t o[3] = { 0, 1, 2 };
-    ray_enc_dict_src_t s = { .len = n, .n_distinct = nd, .codes = c, .first_occ = f, .offs = o,
-                             .bytes = "xyz", .bytes_len = 3 };
-    size_t rn; ray_t* err;
-    uint8_t* b = dx_region(&s, &rn, &err);
-    TEST_ASSERT_NULL(err);
-    ray_enc_dict_view_t v;
-    TEST_ASSERT_NULL(ray_enc_dict_validate(b, rn, n, "dx", &v));
-    ray_enc_dict_view_t small = v; small.len = 8;                   /* the serial path */
-    ray_request_interrupt();
-    ray_t* e1 = ray_enc_dict_codes_check(&v, NULL, "dx");
-    ray_t* e2 = ray_enc_dict_codes_check(&small, NULL, "dx");
-    ray_clear_interrupt();
-    bool c1 = e1 && strcmp(ray_err_code(e1), "cancel") == 0, c2 = e2 && strcmp(ray_err_code(e2), "cancel") == 0;
-    if (e1) ray_error_free(e1);
-    if (e2) ray_error_free(e2);
-    TEST_ASSERT_TRUE(c1);
-    TEST_ASSERT_TRUE(c2);
-    TEST_ASSERT_NULL(ray_enc_dict_codes_check(&v, NULL, "dx"));
-    free(b); free(c);
-    PASS();
-}
-
 const test_entry_t encidx_entries[] = {
     { "idxval/write_hash_layout", test_write_hash_layout, ix_setup, ix_teardown },
     { "idxval/write_name_block",  test_write_name_block,  ix_setup, ix_teardown },
@@ -4313,27 +2979,13 @@ const test_entry_t encidx_entries[] = {
     { "idxval/write_sym_part",    test_write_sym_part,    ix_setup, ix_teardown },
     { "idxval/write_core_count",  test_write_core_count,  ix_setup, ix_teardown },
     { "idxval/write_zero_fill",         test_write_zero_fill,         ix_setup, ix_teardown },
-    { "idxval/validate_accepts",        test_validate_accepts,        ix_setup, ix_teardown },
-    { "idxval/reject_common",           test_reject_common,           ix_setup, ix_teardown },
-    { "idxval/reject_hash",             test_reject_hash,             ix_setup, ix_teardown },
-    { "idxval/validate_sparse_rows",    test_validate_sparse_rows,    ix_setup, ix_teardown },
-    { "idxval/reject_str_unreachable",  test_reject_str_unreachable,  ix_setup, ix_teardown },
+    { "idxval/view_fields",        test_view_fields,        ix_setup, ix_teardown },
     { "idxval/str_word_collision",      test_str_word_collision,      ix_setup, ix_teardown },
-    { "idxval/reject_sort_bloom_part",  test_reject_sort_bloom_part,  ix_setup, ix_teardown },
-    { "idxval/reject_part_zero_sign",   test_reject_part_zero_sign,   ix_setup, ix_teardown },
-    { "idxval/reject_wrapping_counts",  test_reject_wrapping_counts,  ix_setup, ix_teardown },
-    { "idxval/validate_empty",          test_validate_empty,          ix_setup, ix_teardown },
-    { "idxval/validate_engine_matrix",  test_validate_engine_matrix,  ix_setup, ix_teardown },
-    { "idxval/validate_long_cluster",   test_validate_long_cluster,   ix_setup, ix_teardown },
-    { "idxval/hash_dup_walk",           test_hash_dup_walk,           ix_setup, ix_teardown },
-    { "idxval/hash_dup_budget",         test_hash_dup_budget,         ix_setup, ix_teardown },
-    { "idxval/hash_par_rejects",        test_hash_par_rejects,        ix_setup, ix_teardown },
-    { "idxval/hash_par_rules",          test_hash_par_rules,          ix_setup, ix_teardown },
-    { "idxval/reject_part_snan",        test_reject_part_snan,        ix_setup, ix_teardown },
+    { "idxval/view_empty",          test_view_empty,          ix_setup, ix_teardown },
+    { "idxval/view_engine_matrix",  test_view_engine_matrix,  ix_setup, ix_teardown },
     { "idxval/parse_hash_probes",       test_parse_hash_probes,       ix_setup, ix_teardown },
     { "idxval/parse_part_order_sym",    test_parse_part_order_sym,    ix_setup, ix_teardown },
     { "idxval/parse_oom_frees",         test_parse_oom_frees,         ix_setup, ix_teardown },
-    { "idxval/parse_rejects_view",      test_parse_rejects_view,      ix_setup, ix_teardown },
     { "idxval/file_has_region",         test_file_has_region,         ix_setup, ix_teardown },
     { "idxval/unique_and_stale",        test_unique_and_stale,        ix_setup, ix_teardown },
     { "idxval/save_nyi_names_kind",     test_save_nyi_names_kind,     ix_setup, ix_teardown },
@@ -4343,7 +2995,6 @@ const test_entry_t encidx_entries[] = {
     { "idxval/materialize_attaches",    test_materialize_attaches,    ix_setup, ix_teardown },
     { "idxval/materialize_all_kinds",   test_materialize_all_kinds,   ix_setup, ix_teardown },
     { "idxval/materialize_unique",      test_materialize_unique,      ix_setup, ix_teardown },
-    { "idxval/corrupt_region_cached",   test_corrupt_region_cached,   ix_setup, ix_teardown },
     { "idxval/parse_oom_retry",         test_parse_oom_retry,         ix_setup, ix_teardown },
     { "idxval/materialize_oom_sweep",   test_materialize_oom_sweep,   ix_setup, ix_teardown },
     { "idxval/retained_index_outlives_table", test_retained_index_outlives_table, ix_setup, ix_teardown },
@@ -4351,9 +3002,8 @@ const test_entry_t encidx_entries[] = {
     { "idxval/golden_read",             test_idx_golden_read,         ix_setup, ix_teardown },
     { "idxval/consult_routes",        test_consult_routes,        ixr_setup, ixr_teardown },
     { "idxval/consult_dir_unchanged", test_consult_dir_unchanged, ixr_setup, ixr_teardown },
-    { "idxval/corrupt_region_query",  test_corrupt_region_query,  ixr_setup, ixr_teardown },
-    { "idxval/corrupt_region_kinds",  test_corrupt_region_kinds,  ixr_setup, ixr_teardown },
     { "idxval/index_route_oom",       test_index_route_oom,       ixr_setup, ixr_teardown },
+    { "idxval/hash_region_probe",     test_hash_region_probe,     ixr_setup, ixr_teardown },
     { "idxval/sym_rebuild_remap",      test_sym_rebuild_remap,      ix_setup, ix_teardown },
     { "idxval/sym_part_rebuild",       test_sym_part_rebuild,       ix_setup, ix_teardown },
     { "idxval/encoded_keep_copies",    test_encoded_keep_copies,    ix_setup, ix_teardown },
@@ -4366,7 +3016,7 @@ const test_entry_t encidx_entries[] = {
     { "idxval/sym_splay_kept",         test_sym_splay_kept,         ixr_setup, ixr_teardown },
     { "idxval/sym_stale_rebuild",      test_sym_stale_rebuild,      ixr_setup, ixr_teardown },
     { "idxval/sym_stale_part_unbuildable", test_sym_stale_part_unbuildable, ix_setup, ix_teardown },
-    { "idxval/corrupt_sym_hash_null_key",  test_corrupt_sym_hash_null_key,  ixr_setup, ixr_teardown },
+    { "idxval/sym_hash_null_key",  test_sym_hash_null_key,  ixr_setup, ixr_teardown },
     { "idxval/converter_parity",      test_converter_parity,      ixr_setup, ixr_teardown },
     { "idxval/converter_dict_boundary", test_converter_dict_boundary, ixr_setup, ixr_teardown },
     { "idxval/use_materializes_once", test_use_materializes_once, ixr_setup, ixr_teardown },
@@ -4375,12 +3025,7 @@ const test_entry_t encidx_entries[] = {
     { "idxval/normalized_domains",    test_normalized_domains,    ixr_setup, ixr_teardown },
     { "idxval/order_sym_fast_path",   test_order_sym_fast_path,   ixr_setup, ixr_teardown },
     { "idxval/dict_write_layout",     test_dict_write_layout,     ix_setup, ix_teardown },
-    { "idxval/dict_validate_accepts", test_dict_validate_accepts, ix_setup, ix_teardown },
-    { "idxval/dict_reject_entry_tier", test_dict_reject_entry_tier, ix_setup, ix_teardown },
-    { "idxval/dict_reject_code_tier", test_dict_reject_code_tier, ix_setup, ix_teardown },
-    { "idxval/dict_codes_par",        test_dict_codes_par,        ix_setup, ix_teardown },
+    { "idxval/dict_view_fields", test_dict_view_fields, ix_setup, ix_teardown },
     { "idxval/dict_write_rejects",    test_dict_write_rejects,    ix_setup, ix_teardown },
-    { "idxval/dict_reject_entry_tier_more", test_dict_reject_entry_tier_more, ix_setup, ix_teardown },
-    { "idxval/dict_codes_cancel",     test_dict_codes_cancel,     ix_setup, ix_teardown },
     { NULL, NULL, NULL, NULL },
 };

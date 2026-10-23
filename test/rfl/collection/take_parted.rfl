@@ -58,3 +58,27 @@
 (take _tp [5 10]) -- (take _tf [5 10])
 (count (take _tp [7 2])) -- 0
 (.sys.exec "rm -rf /tmp/rfl_take_parted")
+
+;; take over a compressed (generation 2) table: an encoded column is read
+;; for the rows taken only, and every form answers exactly as for the same
+;; table saved plain.
+(.sys.exec "rm -rf /tmp/rfl_take_gen2")
+(set _gi (til 70000))
+(set _gt (table [a b s] (list (* (- (% _gi 1000) 500) 7919) (* 0.5 (as 'F64 (% _gi 301))) (as 'SYM (at ["red" "green" "blue" "cyan"] (% _gi 4))))))
+(.db.splayed.set "/tmp/rfl_take_gen2/c/" _gt "/tmp/rfl_take_gen2/c.sym" {compress: true})
+(.db.splayed.set "/tmp/rfl_take_gen2/p/" _gt "/tmp/rfl_take_gen2/p.sym")
+(set _gc (.db.splayed.get "/tmp/rfl_take_gen2/c/" "/tmp/rfl_take_gen2/c.sym"))
+(set _gp (.db.splayed.get "/tmp/rfl_take_gen2/p/" "/tmp/rfl_take_gen2/p.sym"))
+(take _gc 5) -- (take _gp 5)
+(take _gc -5) -- (take _gp -5)
+(take _gc 0) -- (take _gp 0)
+(take _gc 70000) -- (take _gp 70000)
+(take _gc -70000) -- (take _gp -70000)
+(take _gc 70003) -- (take _gp 70003)
+(take _gc [3 4]) -- (take _gp [3 4])
+(take _gc [-3 10]) -- (take _gp [-3 10])
+(take _gc [69998 10]) -- (take _gp [69998 10])
+(take _gc [70000 2]) -- (take _gp [70000 2])
+(take _gc [66000 8000]) -- (take _gp [66000 8000])
+(at (take _gc -2) 'a) -- [3943662 3951581]
+(.sys.exec "rm -rf /tmp/rfl_take_gen2")

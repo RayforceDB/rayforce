@@ -255,6 +255,8 @@ void ray_lang_print(FILE* fp, ray_t* val);
 void ray_eval_request_interrupt(void);
 void ray_eval_clear_interrupt(void);
 int  ray_eval_is_interrupted(void);
+/* Depth of the evaluation in progress on this thread: 0 between statements. */
+int  ray_eval_depth(void);
 
 /* Return the current eval context's nfo (source location) object, or NULL. */
 ray_t* ray_eval_get_nfo(void);

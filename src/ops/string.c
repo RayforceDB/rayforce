@@ -781,9 +781,8 @@ static void strlen_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_t 
         if (ray_vec_is_null(input, i)) { c->dst[i] = NULL_I64; any_null = true; continue; }
         int64_t sid = ray_read_sym(base, i, input->type, input->attrs);
         if (c->raw_ok && sid >= 0 && sid < c->raw.count) {
-            size_t sl;
-            (void)ray_sym_domain_raw_str(&c->raw, sid, &sl);
-            c->dst[i] = (int64_t)sl;
+            int64_t sl = ray_sym_domain_raw_len(&c->raw, sid);
+            c->dst[i] = sl < 0 ? 0 : sl;
         } else {
             const char* sp; size_t sl;
             sym_elem(input, i, &sp, &sl);

@@ -32,6 +32,8 @@
 #include "lang/eval.h"
 #include "ops/ops.h"
 #include "ops/rowsel.h"
+#include "ops/colgather.h"   /* ray_enc_hash_eq_rowsel: the probe's rows read back */
+#include "store/encidx.h"    /* the HASH region layout */
 #include "ops/hash.h"     /* ray_hash_bytes: STR hash-index key word */
 #include "core/pool.h"    /* parallel hash-index build */
 #include "lang/format.h"  /* ray_type_name */
@@ -147,6 +149,15 @@ static void idx_stats_dump(void) {
                     names[i],
                     (unsigned long long)ray_idx_consults[i],
                     (unsigned long long)ray_idx_hits[i]);
+    uint64_t zpc = 0, zps = 0;
+    ray_exec_test_zone_prune(&zpc, &zps);
+    if (zpc)
+        fprintf(stderr, "zone_prune chains=%llu vectors=%llu\n", (unsigned long long)zpc, (unsigned long long)zps);
+    ray_enc_counters_t k;
+    ray_enc_counters_get(&k);
+    if (k.decoded_bytes || k.materialized)
+        fprintf(stderr, "enc_decode decoded_bytes=%llu materialized=%llu\n",
+                (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
 }
 
 void ray_idx_stats_init(void) {
@@ -3132,6 +3143,61 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
         return NULL;   /* dense: fall through to the scan path */
 
     return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
+}
+
+static _Atomic(uint64_t) g_enc_hash_probes;   /* test hook */
+uint64_t ray_enc_hash_test_probes(void) { return atomic_load_explicit(&g_enc_hash_probes, memory_order_relaxed); }
+
+static int64_t ehp_at(const uint8_t* b, int64_t off, int64_t i) {
+    int64_t x;
+    memcpy(&x, b + off + i * 8, 8);
+    return x;
+}
+
+/* An equality on a single-file generation-2 column with a recorded HASH:
+ * the stored region is probed where it is mapped, as the builder laid it
+ * out (ray_enc_index_write), and the group's rows become the selection. The
+ * region is the file we wrote; it is read as written, not re-validated. */
+int ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_HASH) return 0;
+    const int8_t t = e->type;
+    const int64_t len = e->len;
+    if (!hash_key_in_range(t, key) || (t == RAY_SYM && key == 0)) return 0;
+    if (t != RAY_SYM && numeric_elem_size(t) == 0) return 0;
+    const uint8_t* b = e->base + e->hdr.index_off;
+    ray_enc_idx_hash_t h;
+    memcpy(&h, b + 16, sizeof h);                   /* the root's kind arguments */
+    /* the builder's canonical key word and home slot (hash_probe_setup;
+     * a region holds the low-bits home rule, ray_enc_index_write) */
+    const int64_t kw = t == RAY_SYM ? key : (int64_t)hash_key_bits(numeric_elem_size(t), key);
+    uint64_t slot = mix64((uint64_t)kw) & h.mask;
+    int64_t gid = -1;
+    for (;;) {
+        int64_t gp1 = ehp_at(b, h.table, (int64_t)slot);
+        if (gp1 == 0) break;
+        if (ehp_at(b, h.gkeys, gp1 - 1) == kw) { gid = gp1 - 1; break; }
+        slot = (slot + 1) & h.mask;
+    }
+    if (gid < 0) {
+        *sel = rowsel_from_sorted_ids(len, NULL, 0);
+        if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+        atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+        return 1;
+    }
+    const int64_t o0 = ehp_at(b, h.offs, gid), o1 = ehp_at(b, h.offs, gid + 1);
+    const int64_t gsz = o1 - o0;
+    if (gsz > 64 && gsz > (len >> 3)) return 0;     /* dense: the scan answers */
+    ray_t* ids_hdr = NULL;
+    int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)gsz * sizeof(int64_t));
+    if (!ids) { *err = ray_error("oom", NULL); return -1; }
+    memcpy(ids, b + h.rows + o0 * 8, (size_t)gsz * 8);
+    *sel = rowsel_from_sorted_ids(len, ids, gsz);
+    scratch_free(ids_hdr);
+    if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+    atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+    return 1;
 }
 
 /* --------------------------------------------------------------------------

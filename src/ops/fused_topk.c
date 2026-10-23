@@ -133,7 +133,7 @@ typedef struct {
 } fpk_keyspec_t;
 static void fpk_unpin_keys(fpk_keyspec_t* keys, uint32_t n) {
     for (uint32_t i = 0; i < n; i++)
-        if (keys[i].raw_ok) { ray_sym_domain_raw_unpin(ray_sym_vec_domain(keys[i].col)); keys[i].raw_ok = 0; }
+        if (keys[i].raw_ok) { ray_sym_domain_raw_unpin(keys[i].raw.dom); keys[i].raw_ok = 0; }
 }
 
 /* A single-file generation-2 first key: the zone arrays of fpk_par_ctx_t
@@ -207,7 +207,40 @@ typedef struct {
      * the read-only zone pointers above */
     _Alignas(64) _Atomic(int64_t) bound;
     _Atomic(uint8_t) bound_set;
+    /* Range-read keys (fpk_rk_t), NULL when every key is read in place:
+     * last, so the fields above keep their offsets. */
+    const struct fpk_rk_s* rk;
 } fpk_par_ctx_t;
+
+/* ---- Range-read sort keys ----
+ *
+ * A sort key that is a generation-2 column without a published
+ * materialization is not decoded whole for the top-k: each task reads the
+ * key vectors of the morsels whose rows pass the predicate through a
+ * cursor, and the heaps carry the key values of the rows they hold, so a
+ * compare never reads a row outside the vector being scanned.  Entry e
+ * (worker w's slot s is e = w * k + s) holds row rows[e] and key j's value
+ * kv[e * n_keys + j] (integers and SYM ids widened to int64, floats as the
+ * bits of their double) with its null flag kn[e * n_keys + j].  The order
+ * is fpk_cmp's: nulls where sort_nulls_first puts them, then the values,
+ * then the row.  A candidate's later keys are read only when its earlier
+ * ones tie the heap's worst. */
+typedef struct fpk_rk_s {
+    int64_t*  rows;
+    int64_t*  kv;
+    uint8_t*  kn;
+    ray_col_src_t* srcs[FPK_MAX_KEYS];               /* borrowed binds */
+    struct ray_sym_domain_s* dom[FPK_MAX_KEYS];      /* SYM keys */
+} fpk_rk_t;
+
+/* One task's key cursors and the candidate row it compares. */
+typedef struct {
+    ray_col_cursor_t cur[FPK_MAX_KEYS];
+    int64_t  cv[FPK_MAX_KEYS];
+    uint8_t  cn[FPK_MAX_KEYS];
+    uint32_t have;                /* bit j: key j of crow is in cv / cn */
+    int64_t  crow;
+} fpk_rk_task_t;
 
 static inline int64_t fpk_key_i64(const fpk_keyspec_t* ks, int64_t row) {
     switch (ks->esz) {
@@ -283,9 +316,7 @@ static bool fpk_one_vec_pruned(const fpk_par_ctx_t* c, int64_t v) {
     uint32_t nn = 0;
     uint8_t cls = FPK_STATS;
     if (!ray_col_src_vec_stat(c->zdir->src, v, &mn, &mx, &nn)) {
-        const ray_enc_desc_t* d;
-        ray_t* err = ray_enccol_chunk_descs_ref(c->zdir->e, v / RAY_ENC_VECS_PER_CHUNK, &d);
-        if (err) { ray_error_free(err); return false; }       /* the scan reads it */
+        const ray_enc_desc_t* d = ray_enccol_descs(c->zdir->e, v / RAY_ENC_VECS_PER_CHUNK);
         cls = d[v % RAY_ENC_VECS_PER_CHUNK].n_nulls == vrows ? FPK_ALL_NULL : FPK_NO_STATS;
     }
     return fpk_stat_prunes(c, cls, nn > 0, mn, mx);
@@ -493,6 +524,189 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
         fpk_sift_down(c, heap, n, i);
 }
 
+/* fpk_cmp's SYM arm over two ids of a range-read key: 0 when they tie
+ * (or a string cannot be resolved, as fpk_cmp continues past it). */
+static int fpk_rk_sym_cmp(const fpk_par_ctx_t* c, uint32_t j, uint32_t ia, uint32_t ib) {
+    if (ia == ib) return 0;
+    const fpk_keyspec_t* ks = &c->keys[j];
+    if (ks->raw_ok && (int64_t)ia < ks->raw.count && (int64_t)ib < ks->raw.count) {
+        /* off the mapped vocabulary, as fpk_cmp: no atom is made per compare */
+        size_t la, lb;
+        const char* pa = ray_sym_domain_raw_str(&ks->raw, (int64_t)ia, &la);
+        const char* pb = ray_sym_domain_raw_str(&ks->raw, (int64_t)ib, &lb);
+        size_t ml = la < lb ? la : lb;
+        int cmp = ml ? memcmp(pa, pb, ml) : 0;
+        return cmp ? cmp : (la < lb ? -1 : (la > lb ? 1 : 0));
+    }
+    ray_t* sa;
+    ray_t* sb;
+    if (ks->dom_runtime) {
+        if (ia >= c->sym_count || ib >= c->sym_count) return 0;
+        sa = c->sym_strings[ia];
+        sb = c->sym_strings[ib];
+    } else {
+        sa = ray_sym_domain_str(c->rk->dom[j], (int64_t)ia);
+        sb = ray_sym_domain_str(c->rk->dom[j], (int64_t)ib);
+    }
+    if (!sa || !sb) return 0;
+    return ray_str_cmp(sa, sb);
+}
+
+/* Key j of two entries' values: fpk_cmp's sense ("a is worse" > 0). */
+static inline int fpk_rk_key_cmp(const fpk_par_ctx_t* c, uint32_t j, int64_t va, uint8_t na,
+                                 int64_t vb, uint8_t nb) {
+    const fpk_keyspec_t* ks = &c->keys[j];
+    if (ks->has_nulls) {
+        if (na && nb) return 0;
+        if (na) return ks->nulls_first ? -1 : 1;
+        if (nb) return ks->nulls_first ?  1 : -1;
+    }
+    int cmp;
+    if (ks->type == RAY_SYM) {
+        cmp = fpk_rk_sym_cmp(c, j, (uint32_t)va, (uint32_t)vb);
+    } else if (ks->type == RAY_F32 || ks->type == RAY_F64) {
+        double da, db;
+        memcpy(&da, &va, 8); memcpy(&db, &vb, 8);
+        cmp = (da > db) - (da < db);
+    } else {
+        cmp = (va > vb) - (va < vb);
+    }
+    return ks->desc ? -cmp : cmp;
+}
+
+/* Entries ea and eb in fpk_cmp's order. */
+static int fpk_rk_ent_cmp(const fpk_par_ctx_t* c, int64_t ea, int64_t eb) {
+    if (ea == eb) return 0;
+    const fpk_rk_t* rk = c->rk;
+    const uint32_t nk = c->n_keys;
+    for (uint32_t j = 0; j < nk; j++) {
+        int cmp = fpk_rk_key_cmp(c, j, rk->kv[ea * nk + j], rk->kn[ea * nk + j],
+                                 rk->kv[eb * nk + j], rk->kn[eb * nk + j]);
+        if (cmp) return cmp;
+    }
+    int64_t ra = rk->rows[ea], rb = rk->rows[eb];
+    return (ra > rb) - (ra < rb);
+}
+
+/* Key j of the task's candidate row, read through its cursor (the vector
+ * the row lies in; a later key of the same morsel reuses its decode). */
+static ray_t* fpk_rk_load(const fpk_par_ctx_t* c, fpk_rk_task_t* t, uint32_t j) {
+    if ((t->have >> j) & 1u) return NULL;
+    const ray_col_range_t* v = NULL;
+    ray_t* err = ray_col_cursor_at(&t->cur[j], t->crow, &v);
+    if (err) return err;
+    const int64_t i = t->crow - v->start;
+    const fpk_keyspec_t* ks = &c->keys[j];
+    int64_t x;
+    switch (ks->type) {
+    case RAY_SYM:  x = ray_read_sym(v->data, i, RAY_SYM, v->attrs); break;
+    case RAY_BOOL: case RAY_U8: x = ((const uint8_t*)v->data)[i]; break;
+    case RAY_I16:  x = ((const int16_t*)v->data)[i]; break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: x = ((const int32_t*)v->data)[i]; break;
+    case RAY_F32: { double d = ((const float*)v->data)[i]; memcpy(&x, &d, 8); break; }
+    case RAY_F64:  memcpy(&x, (const double*)v->data + i, 8); break;
+    default:       x = ((const int64_t*)v->data)[i]; break;    /* I64, TIMESTAMP */
+    }
+    t->cv[j] = x;
+    t->cn[j] = ks->has_nulls && ray_raw_is_null(ks->type, v->attrs, v->data, i);
+    t->have |= 1u << j;
+    return NULL;
+}
+
+/* The candidate against entry e: *cmp in fpk_cmp's sense, reading the
+ * candidate's keys only as far as they tie. */
+static ray_t* fpk_rk_cand_cmp(const fpk_par_ctx_t* c, fpk_rk_task_t* t, int64_t e, int* cmp) {
+    const fpk_rk_t* rk = c->rk;
+    const uint32_t nk = c->n_keys;
+    for (uint32_t j = 0; j < nk; j++) {
+        ray_t* err = fpk_rk_load(c, t, j);
+        if (err) return err;
+        int d = fpk_rk_key_cmp(c, j, t->cv[j], t->cn[j], rk->kv[e * nk + j], rk->kn[e * nk + j]);
+        if (d) { *cmp = d; return NULL; }
+    }
+    int64_t rb = rk->rows[e];
+    *cmp = (t->crow > rb) - (t->crow < rb);
+    return NULL;
+}
+
+/* The candidate, every key read, into entry e. */
+static ray_t* fpk_rk_store(const fpk_par_ctx_t* c, fpk_rk_task_t* t, int64_t e) {
+    const fpk_rk_t* rk = c->rk;
+    const uint32_t nk = c->n_keys;
+    for (uint32_t j = 0; j < nk; j++) {
+        ray_t* err = fpk_rk_load(c, t, j);
+        if (err) return err;
+        rk->kv[e * nk + j] = t->cv[j];
+        rk->kn[e * nk + j] = t->cn[j];
+    }
+    rk->rows[e] = t->crow;
+    return NULL;
+}
+
+static void fpk_rk_sift_down(const fpk_par_ctx_t* c, int64_t* heap, int32_t n, int32_t i) {
+    for (;;) {
+        int32_t worst = i;
+        int32_t l = 2 * i + 1, r = 2 * i + 2;
+        if (l < n && fpk_rk_ent_cmp(c, heap[l], heap[worst]) > 0) worst = l;
+        if (r < n && fpk_rk_ent_cmp(c, heap[r], heap[worst]) > 0) worst = r;
+        if (worst == i) return;
+        int64_t ti = heap[i]; heap[i] = heap[worst]; heap[worst] = ti;
+        i = worst;
+    }
+}
+
+static void fpk_rk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n) {
+    for (int32_t i = n / 2 - 1; i >= 0; i--)
+        fpk_rk_sift_down(c, heap, n, i);
+}
+
+/* fpk_publish_bound from entry e's stored first key. */
+static void fpk_rk_publish_bound(fpk_par_ctx_t* c, int64_t e) {
+    if (!c->zmin) return;
+    const uint32_t nk = c->n_keys;
+    if (c->rk->kn[e * nk]) return;
+    int64_t v = c->rk->kv[e * nk];
+    int64_t cur = atomic_load_explicit(&c->bound, memory_order_relaxed);
+    bool set = atomic_load_explicit(&c->bound_set, memory_order_relaxed);
+    for (;;) {
+        bool better = !set || (c->zdesc ? v > cur : v < cur);
+        if (!better) return;
+        if (atomic_compare_exchange_weak_explicit(&c->bound, &cur, v,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&c->bound_set, 1, memory_order_release);
+            return;
+        }
+        set = true;
+    }
+}
+
+/* The passing rows of one morsel into the task's heap (entries ebase +
+ * [0, k)): NULL, or an owned error of a key read. */
+static ray_t* fpk_rk_insert(fpk_par_ctx_t* c, fpk_rk_task_t* t, int64_t* hidx, int32_t* hnp, int32_t k,
+                            int64_t ebase, int64_t row, int64_t mlen, const uint8_t* bits) {
+    int32_t hn = *hnp;
+    ray_t* err = NULL;
+    for (int64_t r = 0; r < mlen && !err; r++) {
+        if (!bits[r]) continue;
+        t->crow = row + r;
+        t->have = 0;
+        if (hn < k) {
+            int64_t e = ebase + hn;
+            if ((err = fpk_rk_store(c, t, e)) != NULL) break;
+            hidx[hn++] = e;
+            if (hn == k) fpk_rk_heapify(c, hidx, k);
+        } else {
+            int cmp = 0;
+            if ((err = fpk_rk_cand_cmp(c, t, hidx[0], &cmp)) != NULL) break;
+            if (cmp >= 0) continue;
+            if ((err = fpk_rk_store(c, t, hidx[0])) != NULL) break;
+            fpk_rk_sift_down(c, hidx, k, 0);
+        }
+    }
+    *hnp = hn;
+    return err;
+}
+
 /* Scan physical rows [row, end): eval predicate per morsel, heap-insert
  * the passing rows.  `*hnp` is the worker's heap fill on entry and exit.
  * `chunk` >= 0 is the zone chunk the rows belong to: the bound may tighten
@@ -510,7 +724,7 @@ static inline void fpk_heapify(const fpk_par_ctx_t* c, int64_t* heap, int32_t n)
  * when it cannot beat the bound (counted in *npv). */
 RAY_INLINE void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx, int32_t* hnp,
                               int32_t k, int64_t row, int64_t end, int64_t chunk, const bool rs,
-                              const bool zv, uint64_t* npv) {
+                              const bool zv, uint64_t* npv, fpk_rk_task_t* rt, int64_t ebase) {
     int32_t hn = *hnp;
     while (row < end) {
         if (zv) {
@@ -531,6 +745,13 @@ RAY_INLINE void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx,
             fp_eval_pred(&c->pred, row, mend, bits);   /* no child is read by range */
         }
 
+        if (rt) {                                      /* range-read keys (rs is set) */
+            ray_t* ke = fpk_rk_insert(c, rt, hidx, &hn, k, ebase, row, mlen, bits);
+            if (ke) { ray_scan_fail_note(c->fail, row, ke); break; }
+            if (hn == k) fpk_rk_publish_bound(c, hidx[0]);
+            row = mend;
+            continue;
+        }
         for (int64_t r = 0; r < mlen; r++) {
             if (!bits[r]) continue;
             int64_t src_row = row + r;
@@ -559,7 +780,7 @@ RAY_INLINE void fpk_scan_rows(fpk_par_ctx_t* c, fp_scratch_t* fs, int64_t* hidx,
  * the generation-0 loop, with no scratch and no failure envelope.  `zv`:
  * the directory zone arrays of a generation-2 first key (fpk_scan_rows). */
 RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64_t end,
-                             const bool rs, const bool zv) {
+                             const bool rs, const bool zv, const bool rk) {
     fpk_par_ctx_t* c = (fpk_par_ctx_t*)raw;
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
     int32_t  k    = (int32_t)c->k;
@@ -567,13 +788,20 @@ RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64
     int32_t  hn   = c->heap_n[worker_id];
     fp_scratch_t fs;
     if (rs) fp_scratch_init(&fs);
+    fpk_rk_task_t rkt;
+    fpk_rk_task_t* rt = NULL;
+    const int64_t ebase = (int64_t)worker_id * k;
+    if (rk) {
+        for (uint32_t j = 0; j < c->n_keys; j++) ray_col_cursor_init(&rkt.cur[j], c->rk->srcs[j]);
+        rt = &rkt;
+    }
     /* pruned here (zv), added once per task: npc counts chunk-slot prunes
      * (a chunk split across tasks counts once per task; one abandoned
      * mid-scan is not counted), npv pruned morsels */
     uint64_t npc = 0, npv = 0;
 
     if (!c->zmin) {
-        fpk_scan_rows(c, &fs, hidx, &hn, k, start, end, -1, rs, zv, &npv);
+        fpk_scan_rows(c, &fs, hidx, &hn, k, start, end, -1, rs, zv, &npv, rt, ebase);
     } else {
         int64_t span = (int64_t)1 << c->zlog2;
         int64_t v = start;
@@ -587,7 +815,7 @@ RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64
                 int64_t p0 = (g << c->zlog2) + (v - sbeg);
                 int64_t p1 = (g << c->zlog2) + (send - sbeg);
                 if (p1 > c->nrows) p1 = c->nrows;
-                if (p0 < p1) fpk_scan_rows(c, &fs, hidx, &hn, k, p0, p1, g, rs, zv, &npv);
+                if (p0 < p1) fpk_scan_rows(c, &fs, hidx, &hn, k, p0, p1, g, rs, zv, &npv, rt, ebase);
             } else if (zv) {
                 npc++;
             }
@@ -595,6 +823,7 @@ RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64
         }
     }
     if (rs) fp_scratch_free(&fs);
+    if (rk) for (uint32_t j = 0; j < c->n_keys; j++) ray_col_cursor_free(&rkt.cur[j]);
     if (zv && (npc | npv)) {
         atomic_fetch_add_explicit(&g_fpk_pruned_chunks, npc, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_fpk_pruned_vecs, npv, memory_order_relaxed);
@@ -603,18 +832,27 @@ RAY_INLINE void fpk_par_body(void* raw, uint32_t worker_id, int64_t start, int64
 }
 
 static void fpk_par_fn_plain(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
-    fpk_par_body(raw, worker_id, start, end, false, false);
+    fpk_par_body(raw, worker_id, start, end, false, false, false);
 }
 
 static void fpk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
-    fpk_par_body(raw, worker_id, start, end, true, false);
+    fpk_par_body(raw, worker_id, start, end, true, false, false);
 }
 
 /* A generation-2 first key: its directory and descriptors prune (the
  * predicate may still have no encoded child; fp_eval_pred_rs reads those
  * in place). */
 static void fpk_par_fn_dir(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
-    fpk_par_body(raw, worker_id, start, end, true, true);
+    fpk_par_body(raw, worker_id, start, end, true, true, false);
+}
+
+/* Range-read keys (fpk_rk_t), with or without a generation-2 first key's
+ * directory pruning. */
+static void fpk_par_fn_rk(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    fpk_par_body(raw, worker_id, start, end, true, false, true);
+}
+static void fpk_par_fn_rk_dir(void* raw, uint32_t worker_id, int64_t start, int64_t end) {
+    fpk_par_body(raw, worker_id, start, end, true, true, true);
 }
 
 /* Insertion sort over K entries so output rows match full-sort + take order. */
@@ -667,6 +905,20 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     memset(&ctx, 0, sizeof(ctx));
     int sym_needed = 0;
     ray_col_src_t* ksrc0 = NULL;                 /* the first key's bound source */
+    /* Range-read keys (fpk_rk_t): some key is a generation-2 column whose
+     * materialization is not published, and every key is a fixed-width
+     * scalar (not STR or GUID).  Decided from metadata, before any key is
+     * requested plain. */
+    fpk_rk_t rk;
+    memset(&rk, 0, sizeof(rk));
+    bool use_rk = false, rk_ok = true;
+    for (uint32_t i = 0; i < n_sort_keys; i++) {
+        ray_col_meta_t km;
+        if (!ray_table_col_meta(tbl, sort_key_syms[i], &km)) { rk_ok = false; break; }
+        if (km.type == RAY_STR || km.type == RAY_GUID) rk_ok = false;
+        if (km.enc && !RAY_IS_PARTED(km.type) && !ray_enccol_decoded_peek(km.enc)) use_rk = true;
+    }
+    use_rk = use_rk && rk_ok;
     for (uint32_t i = 0; i < n_sort_keys; i++) {
         ray_col_meta_t km;
         if (!ray_table_col_meta(tbl, sort_key_syms[i], &km)) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
@@ -684,12 +936,17 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             && kt != RAY_F32 && kt != RAY_F64 && kt != RAY_GUID)
             { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
         ray_t* col = NULL;
-        ray_t* perr = ray_col_src_plain(ksrc, &col);   /* random: top-k sort key */
-        if (perr) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return perr; }
+        if (use_rk && (kt == RAY_STR || kt == RAY_GUID)) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return NULL; }
+        if (!use_rk) {
+            ray_t* perr = ray_col_src_plain(ksrc, &col);   /* random: top-k sort key */
+            if (perr) { fpk_unpin_keys(ctx.keys, i); ray_graph_free(g); return perr; }
+        }
         if (i == 0) ksrc0 = ksrc;
+        rk.srcs[i] = ksrc;
+        rk.dom[i]  = ksrc->dom;
         ctx.keys[i].type      = kt;
-        ctx.keys[i].attrs     = col->attrs;
-        ctx.keys[i].esz       = ray_sym_elem_size(kt, col->attrs);
+        ctx.keys[i].attrs     = col ? col->attrs : ksrc->attrs;
+        ctx.keys[i].esz       = ray_sym_elem_size(kt, ctx.keys[i].attrs);
         ctx.keys[i].desc      = sort_descs[i];
         ctx.keys[i].has_nulls = ksrc->may_null ? 1 : 0;
         ctx.keys[i].nulls_first = sort_nulls_first(sort_descs[i]);
@@ -697,7 +954,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             (kt == RAY_SYM &&
              ksrc->dom == ray_sym_runtime_domain()) ? 1 : 0;
         ctx.keys[i].sym       = sort_key_syms[i];
-        ctx.keys[i].base      = ray_data(col);
+        ctx.keys[i].base      = col ? ray_data(col) : NULL;
         ctx.keys[i].col       = col;
         ctx.keys[i].raw_ok    = 0;
         if (ctx.keys[i].dom_runtime) sym_needed = 1;
@@ -718,7 +975,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
             e->n_chunks * RAY_ENC_CHUNK >= nrows)
             kenc = e;
     }
-    if (!kenc) {
+    if (!kenc && ctx.keys[0].col) {
         ray_t* kc = ctx.keys[0].col;
         int8_t kt = ctx.keys[0].type;
         if (fpk_prunable_type(kt) && ray_index_kind(kc) == RAY_IDX_CHUNK_ZONE) {
@@ -773,7 +1030,18 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                                            (size_t)nw * (size_t)k * sizeof(int64_t));
     ctx.heap_n   = (int32_t*)scratch_calloc(&hn_hdr,
                                             (size_t)nw * sizeof(int32_t));
-    if (!ctx.heap_idx || !ctx.heap_n) {
+    ray_t *rkr_hdr = NULL, *rkv_hdr = NULL, *rkn_hdr = NULL;
+    if (use_rk) {
+        size_t ne = (size_t)nw * (size_t)k;
+        rk.rows = (int64_t*)scratch_alloc(&rkr_hdr, ne * sizeof(int64_t));
+        rk.kv   = (int64_t*)scratch_alloc(&rkv_hdr, ne * n_sort_keys * sizeof(int64_t));
+        rk.kn   = (uint8_t*)scratch_alloc(&rkn_hdr, ne * n_sort_keys);
+        ctx.rk  = &rk;
+    }
+    if (!ctx.heap_idx || !ctx.heap_n || (use_rk && (!rk.rows || !rk.kv || !rk.kn))) {
+        if (rkr_hdr) scratch_free(rkr_hdr);
+        if (rkv_hdr) scratch_free(rkv_hdr);
+        if (rkn_hdr) scratch_free(rkn_hdr);
         if (idx_hdr) scratch_free(idx_hdr);
         if (hn_hdr)  scratch_free(hn_hdr);
         fp_pred_cleanup(&ctx.pred);
@@ -788,8 +1056,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     int64_t span_rows = nrows;
     ray_t*  zord_hdr  = NULL;
     /* A generation-2 first key: the zone arrays from its directory, sized
-     * by the chunk count (structure, not statistics: answer-only, no
-     * stats_guard).  An all-null chunk gets its null bit and an empty
+     * by the chunk count (structure, not statistics: answer-only).  An all-null chunk gets its null bit and an empty
      * range, as the chunk-zone builder writes.  On OOM nothing is pruned. */
     ray_t *zmin_hdr = NULL, *zmax_hdr = NULL, *znb_hdr = NULL, *zstat_hdr = NULL;
     fpk_dir_t zdir = { NULL, kenc, ksrc0 };
@@ -837,6 +1104,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     bool rs = false;
     for (uint8_t i = 0; i < ctx.pred.n_children; i++) rs |= ctx.pred.children[i].enc;
     void (*par_fn)(void*, uint32_t, int64_t, int64_t) =
+        use_rk ? (ctx.zdir ? fpk_par_fn_rk_dir : fpk_par_fn_rk) :
         ctx.zdir ? fpk_par_fn_dir : rs ? fpk_par_fn : fpk_par_fn_plain;
     if (pool) ray_pool_dispatch(pool, par_fn, &ctx, span_rows);
     else      par_fn(&ctx, 0, 0, span_rows);
@@ -850,6 +1118,11 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     /* A failed range read (or a cancelled dispatch: skipped tasks noted
      * nothing) is the query's error, never a partial top-k. */
     ray_t* ferr = ray_scan_fail_finish(ctx.fail, pool);
+    if (ferr || atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
+        if (rkr_hdr) scratch_free(rkr_hdr);
+        if (rkv_hdr) scratch_free(rkv_hdr);
+        if (rkn_hdr) scratch_free(rkn_hdr);
+    }
     if (ferr) {
         scratch_free(idx_hdr); scratch_free(hn_hdr);
         fp_pred_cleanup(&ctx.pred);
@@ -871,6 +1144,36 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
      * enforced at function entry. */
     int64_t global_idx[FPK_MAX_K];
     int32_t global_n = 0;
+    if (use_rk) {
+        /* every worker's entries into one K-heap of entry ids, sorted, then
+         * their rows */
+        for (uint32_t w = 0; w < nw; w++) {
+            int32_t  hn   = ctx.heap_n[w];
+            int64_t* hidx = &ctx.heap_idx[(size_t)w * (size_t)k];
+            for (int32_t i = 0; i < hn; i++) {
+                if (global_n < (int32_t)k) {
+                    // cppcheck-suppress objectIndex // heap_idx is an nw*k scratch buffer and hn <= k; cppcheck misreads ray_data's inline payload as a scalar
+                    global_idx[global_n++] = hidx[i];
+                    if (global_n == (int32_t)k) fpk_rk_heapify(&ctx, global_idx, global_n);
+                // cppcheck-suppress objectIndex // same nw*k buffer as above
+                } else if (fpk_rk_ent_cmp(&ctx, hidx[i], global_idx[0]) < 0) {
+                    // cppcheck-suppress objectIndex // same nw*k buffer as above
+                    global_idx[0] = hidx[i];
+                    fpk_rk_sift_down(&ctx, global_idx, global_n, 0);
+                }
+            }
+        }
+        for (int32_t i = 1; i < global_n; i++) {      /* fpk_sort_final over entries */
+            int64_t v = global_idx[i];
+            int32_t j = i - 1;
+            while (j >= 0 && fpk_rk_ent_cmp(&ctx, global_idx[j], v) > 0) { global_idx[j + 1] = global_idx[j]; j--; }
+            global_idx[j + 1] = v;
+        }
+        for (int32_t i = 0; i < global_n; i++) global_idx[i] = rk.rows[global_idx[i]];
+        scratch_free(rkr_hdr); scratch_free(rkv_hdr); scratch_free(rkn_hdr);
+        ctx.rk = NULL;
+        nw = 0;                                         /* the loop below has nothing to merge */
+    }
     for (uint32_t w = 0; w < nw; w++) {
         int32_t  hn   = ctx.heap_n[w];
         int64_t* hidx = &ctx.heap_idx[(size_t)w * (size_t)k];
@@ -893,7 +1196,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     scratch_free(idx_hdr);
     scratch_free(hn_hdr);
 
-    fpk_sort_final(&ctx, global_idx, global_n);
+    if (!use_rk) fpk_sort_final(&ctx, global_idx, global_n);
     fpk_unpin_keys(ctx.keys, n_sort_keys);   /* no more compares past here */
 
     /* Materialize n_out output columns by gathering rows[global_idx]. */

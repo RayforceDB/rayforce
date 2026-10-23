@@ -129,6 +129,7 @@ bool ray_interrupted(void)            { return g_eval_interrupted != 0; }
 void ray_eval_request_interrupt(void) { ray_request_interrupt(); }
 void ray_eval_clear_interrupt(void)   { ray_clear_interrupt(); }
 int  ray_eval_is_interrupted(void)    { return ray_interrupted(); }
+int  ray_eval_depth(void)             { return __VM ? (int)__VM->eval_depth : 0; }
 
 ray_t* ray_eval_get_nfo(void) { return __VM ? __VM->nfo : NULL; }
 void   ray_eval_set_nfo(ray_t* nfo) { if (__VM) __VM->nfo = nfo; }

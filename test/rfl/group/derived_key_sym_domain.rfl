@@ -243,7 +243,7 @@
 ;; inside one expression (a line of this file interns its own names when
 ;; it is parsed), after a first call of each shape (hidden names) and of
 ;; (.sys.mem) itself (its first call interns its own key names).
-(count (.sys.mem)) -- 18
+(count (.sys.mem)) -- 21
 (set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
 (set KV (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")})))
 (set KD (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p (abs 4)) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v)})))

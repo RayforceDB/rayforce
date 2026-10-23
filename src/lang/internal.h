@@ -647,8 +647,11 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n);
 ray_t* ray_gc_fn(ray_t** args, int64_t n);
 /* Ceiling for growing a read that has no size to go on — an endless stream
  * has no EOF to reach, and growing to meet it takes the process down.  A
- * quarter of the heap's remaining anon headroom; 0 means "no bound known",
- * which callers treat as permissive.  Shared by `read`/`read-bytes` and by
+ * quarter of the heap's remaining anon headroom, and at least 64 MB: at or
+ * past the watermark there is none to take a quarter of.  The callers bound
+ * the peak of a grow (3 x the buffer) by it, so past the watermark what they
+ * read stays within ~32 MB.  0 means "no bound known" — RAM unknown — which
+ * callers treat as permissive.  Shared by `read`/`read-bytes` and by
  * .sys.exec's output capture, which face the same problem. */
 int64_t ray_unsized_read_budget(void);
 
@@ -760,6 +763,34 @@ ray_t* ray_select_fn(ray_t** args, int64_t n);
 /* Chunk length of the per-distinct-symbol key evaluation over a FILE
  * domain (ops/query.c derived_key_str_chunks); 0 restores the default. */
 void ray_derived_key_chunk_set_for_test(int64_t rows);
+/* Rows a key over an encoded column is evaluated by at a time (ops/query.c
+ * key_eval_by_range): a positive multiple of RAY_MORSEL_ELEMS; 0 restores
+ * the default. */
+void ray_key_range_rows_set_for_test(int64_t rows);
+/* Bits kept of the derived-key grouping's key hash (ops/query.c dkh_hash),
+ * so distinct keys collide; 0 restores the full 64 bits. */
+void ray_derived_key_hash_bits_set_for_test(int bits);
+/* The two-pass grouping under a having cut (ops/query.c dk2_run): out[0]
+ * its runs; of the last run, out[1] the groups emitted, out[2] the
+ * candidate hashes, out[3] the groups made for colliding keys, out[4]
+ * whether the key slices went into H's counts. */
+void ray_derived_key_two_pass_stats_for_test(int64_t out[5]);
+/* The exact top-N-by-count grouping (ops/query.c select_topk_hh): the row
+ * count it starts at (INT64_MAX: off), the counters of a worker's summary,
+ * the bits of the key hash kept, the memory gate (1 open, -1 shut, 0 the
+ * budget); each 0 restores the default.  The stats:
+ * out[0] answers, out[1] fallbacks after its passes, out[2] shapes left to
+ * a dense plan; of the last run out[3] the route (1 answered, 2 fell back,
+ * 3 dense, 4 saturated), out[4] E_eff, out[5] T, out[6] candidate hashes,
+ * out[7] the groups of pass B; out[8] shapes the memory gate left to the
+ * grouping (route 5); out[9] the bytes of one pass B table (0: no pass B).
+ * The pass B budget hook replaces the tables' budget (all workers). */
+void ray_group_topk_min_rows_set_for_test(int64_t rows);
+void ray_group_topk_counters_set_for_test(int64_t m);
+void ray_group_topk_hash_bits_set_for_test(int bits);
+void ray_group_topk_mem_gate_set_for_test(int mode);
+void ray_group_topk_ex_budget_set_for_test(int64_t bytes);
+void ray_group_topk_stats_for_test(int64_t out[10]);
 #endif
 ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);
