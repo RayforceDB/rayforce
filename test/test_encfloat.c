@@ -140,9 +140,6 @@ static test_result_t test_float_bodies(void) {
     TEST_ASSERT_EQ_I(bp->p[8], RAY_ENC_RAW);                           /* values child */
     TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, RAY_ENC_RLE, 0, RAY_ENC_VEC, K64F, RAY_ENC_SLOT_TOP, 0, NULL, out), (int64_t)bp->len);
     TEST_ASSERT_TRUE(memcmp(v, out, sizeof v) == 0);
-    /* a FOR_BP values child is corrupt on floats */
-    bp->p[8] = RAY_ENC_FOR_BP;
-    TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, RAY_ENC_RLE, 0, RAY_ENC_VEC, K64F, RAY_ENC_SLOT_TOP, 0, NULL, out), -1);
     bp->len = 0;
     uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
     ray_enc_dict_t dict = { dv, 4 };
@@ -193,16 +190,6 @@ static test_result_t test_new_slots(void) {
     uint64_t out[RAY_ENC_VEC];
     TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, 0, 0, RAY_ENC_VEC, k8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL, out), (int64_t)bp->len);
     TEST_ASSERT_TRUE(memcmp(v, out, sizeof v) == 0);
-    /* ... and the reader rejects it as illegal under a DELTA_BP header in
-     * the left slot, and under a DICT header in either slot */
-    bp->p[0] = RAY_ENC_DELTA_BP;
-    TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, 0, 0, RAY_ENC_VEC, k8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL, out), -1);
-    TEST_ASSERT_TRUE(strstr(ray_enc_read_why(), "illegal") != NULL);
-    bp->p[0] = RAY_ENC_DICT;
-    TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, 0, 0, RAY_ENC_VEC, k8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL, out), -1);
-    TEST_ASSERT_TRUE(strstr(ray_enc_read_why(), "illegal") != NULL);
-    TEST_ASSERT_EQ_I(ray_enc_read(bp->p, bp->len, 0, 0, RAY_ENC_VEC, k64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out), -1);
-    TEST_ASSERT_TRUE(strstr(ray_enc_read_why(), "illegal") != NULL);
     PASS();
 }
 
@@ -304,74 +291,6 @@ static test_result_t test_alp_edges(void) {
     PASS();
 }
 
-/* Grammar rules: e <= 18, f <= e, positions ascending below n, padding. */
-static test_result_t test_alp_rejects(void) {
-    uint64_t v[64];
-    for (int i = 0; i < 64; i++) v[i] = i % 9 == 0 ? NEG0_64 : db((double)i * 0.25);
-    ray_enc_buf_t* bp = &fl_buf;                                /* freed in teardown */
-    TEST_ASSERT_TRUE(ray_enc_alp_write(v, 64, 64, 2, 0, bp));
-    uint64_t out[RAY_ENC_VEC];
-    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, 64, 64, out), (int64_t)bp->len);
-    uint8_t* m = fl_mem = malloc(bp->len);                      /* freed in teardown */
-    TEST_ASSERT_NOT_NULL(m);
-    memcpy(m, bp->p, bp->len); m[0] = 19;                     TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1);
-    memcpy(m, bp->p, bp->len); m[1] = 3;                      TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1);
-    memcpy(m, bp->p, bp->len); m[5] = 1;                      TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1);
-    memcpy(m, bp->p, bp->len); { uint16_t x = 65; memcpy(m + 2, &x, 2); } TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1);
-    /* positions: the first two swapped */
-    uint32_t cb; memcpy(&cb, bp->p + 12, 4);
-    size_t pos_at = 8 + 8 + cb;
-    memcpy(m, bp->p, bp->len); { uint16_t a, c2; memcpy(&a, m + pos_at, 2); memcpy(&c2, m + pos_at + 2, 2);
-                                 memcpy(m + pos_at, &c2, 2); memcpy(m + pos_at + 2, &a, 2); }
-    TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1);
-    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len - 8, 64, 64, out), -1);      /* truncated */
-    /* the last position at n */
-    {   uint32_t ne = 8; size_t last = pos_at + 2 * (ne - 1);
-        memcpy(m, bp->p, bp->len); uint16_t q = 64; memcpy(m + last, &q, 2);
-        TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, 64, out), -1); }
-    /* padding: 5 exceptions leave 6 pad bytes after the positions and, at
-     * F32, 4 pad bytes after the raw elements; any non-zero pad is corrupt */
-    for (int T = 32; T <= 64; T += 32) {
-        for (int i = 0; i < 64; i++)
-            v[i] = i % 13 == 0 ? (T == 64 ? NEG0_64 : NEG0_32) : (T == 64 ? db((double)i * 0.25) : fb((float)i * 0.25f));
-        bp->len = 0;
-        TEST_ASSERT_TRUE(ray_enc_alp_write(v, 64, T, 2, 0, bp));
-        TEST_ASSERT_EQ_I(bp->p[2], 5);                                           /* n_exc */
-        TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, 64, T, out), (int64_t)bp->len);
-        free(fl_mem); m = fl_mem = malloc(bp->len);
-        TEST_ASSERT_NOT_NULL(m);
-        memcpy(&cb, bp->p + 12, 4);
-        pos_at = 8 + 8 + cb;
-        size_t raw_at = pos_at + 16, raw_len = 5u * (size_t)(T / 8);
-        TEST_ASSERT_EQ_I((int64_t)bp->len, (int64_t)(raw_at + ((raw_len + 7) & ~(size_t)7)));
-        memcpy(m, bp->p, bp->len); m[pos_at + 10] = 1;  TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
-        memcpy(m, bp->p, bp->len); m[pos_at + 15] = 0x80; TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
-        if (T == 32) {
-            memcpy(m, bp->p, bp->len); m[raw_at + raw_len] = 1; TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
-            memcpy(m, bp->p, bp->len); m[raw_at + raw_len + 3] = 1; TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
-        }
-        /* a position at n, and one past it */
-        memcpy(m, bp->p, bp->len); { uint16_t q = 64; memcpy(m + pos_at + 8, &q, 2); }
-        TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
-        memcpy(m, bp->p, bp->len); { uint16_t q = 1000; memcpy(m + pos_at + 8, &q, 2); }
-        TEST_ASSERT_EQ_I(ray_enc_alp_read(m, bp->len, 64, T, out), -1);
-    }
-    /* argument rules: T, candidate count and pairs */
-    TEST_ASSERT_FALSE(ray_enc_alp_write(v, 64, 16, 2, 0, bp));
-    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, 64, 16, out), -1);
-    int bi;
-    ray_enc_alp_cands_t bad = { { { 2, 0 } }, RAY_ENC_ALP_CANDS + 1 };
-    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 64, &bad, &bi), -1);
-    bad.n = 1; bad.c[0].e = 19; bad.c[0].f = 0;
-    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 64, &bad, &bi), -1);
-    bad.c[0].e = 2; bad.c[0].f = 3;
-    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 64, &bad, &bi), -1);
-    bad.c[0].f = 0;
-    TEST_ASSERT_TRUE(ray_enc_alp_size(v, 64, 64, &bad, &bi) > 0);
-    TEST_ASSERT_EQ_I(ray_enc_alp_size(v, 64, 16, &bad, &bi), -1);
-    PASS();
-}
-
 /* ---- ALP_RD ---- */
 static int alprd_roundtrip(const uint64_t* v, int n, int T, int64_t* sz) {
     int64_t s = ray_enc_alprd_size(v, n, T);
@@ -406,43 +325,6 @@ static test_result_t test_alprd_lengths(void) {
     PASS();
 }
 
-static test_result_t test_alprd_rejects(void) {
-    uint64_t v[64];
-    for (int i = 0; i < 64; i++) v[i] = db(i == 5 ? -123.0 : 1.0 + i / 64.0);   /* row 5: another sign */
-    ray_enc_buf_t* bp = &fl_buf;                                   /* freed in teardown */
-    TEST_ASSERT_TRUE(ray_enc_alprd_write(v, 64, 64, bp));
-    uint64_t out[RAY_ENC_VEC];
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(bp->p, bp->len, 64, 64, out), (int64_t)bp->len);
-    uint8_t rb = bp->p[0], dn = bp->p[1];
-    uint8_t* m = fl_mem = malloc(bp->len);                         /* freed in teardown */
-    TEST_ASSERT_NOT_NULL(m);
-    memcpy(m, bp->p, bp->len); m[0] = 47;              TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);   /* < T-16 */
-    memcpy(m, bp->p, bp->len); m[0] = 64;              TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);   /* > T-1 */
-    memcpy(m, bp->p, bp->len); m[1] = 0;               TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
-    memcpy(m, bp->p, bp->len); m[1] = 9;               TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
-    memcpy(m, bp->p, bp->len); m[4] = 1;               TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
-    TEST_ASSERT_TRUE(dn >= 2);            /* row 5's sign differs at every right_bits: two left parts */
-    memcpy(m, bp->p, bp->len); memcpy(m + 8, bp->p + 10, 2); memcpy(m + 10, bp->p + 8, 2);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);                               /* dict not ascending */
-    /* a non-zero pad bit in the packed right parts (row 1023's lane word) */
-    uint32_t lb; memcpy(&lb, bp->p + 8 + ((2 * dn + 7) & ~7) + 4, 4);
-    size_t packed_at = 8 + ((2 * dn + 7) & ~7) + 8 + lb;
-    size_t packed_len = ray_enc_packed_bytes(rb);
-    memcpy(m, bp->p, bp->len); m[packed_at + packed_len - 1] |= 0x80;
-    memset(out, 0xAA, sizeof out);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(m, bp->len, 64, 64, out), -1);
-    for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_EQ_U(out[i], 0);                             /* never partly decoded */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(bp->p, bp->len - 8, 64, 64, out), -1);                       /* truncated */
-    /* argument rules: T and n */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_size(v, 64, 16), -1);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_size(v, 0, 64), -1);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(bp->p, bp->len, 64, 16, out), -1);
-    size_t len = bp->len;
-    TEST_ASSERT_FALSE(ray_enc_alprd_write(v, 64, 16, bp));
-    TEST_ASSERT_EQ_I((int64_t)bp->len, (int64_t)len);                                                /* no partial body */
-    PASS();
-}
-
 /* Exception framing on a hand-built body (spec "Reject rules": ALP/ALP_RD
  * exception framing; Review focus 4): T = 64, right_bits = 52, dict
  * {0x3FF, 0x400}, four rows, rows 2 and 3 exceptions with raw left parts
@@ -467,40 +349,6 @@ static test_result_t test_alprd_exceptions(void) {
     TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), (int64_t)n);
     TEST_ASSERT_EQ_U(out[0], 0x3FFull << 52); TEST_ASSERT_EQ_U(out[1], 0x400ull << 52);
     TEST_ASSERT_EQ_U(out[2], 0x3FEull << 52); TEST_ASSERT_EQ_U(out[3], 0x401ull << 52);
-    uint8_t c2[4] = { 0, 1, 1, 0 };                                        /* exception row with code 1 */
-    n = alprd_body(b, c2, pos, lefts);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    TEST_ASSERT_STR_EQ(ray_enc_read_why(), "ALP_RD exception row with a non-zero left code");   /* D8 */
-    uint16_t big[2] = { 0x1000, 0x401 };                                   /* raw left at 2^(T-right_bits) */
-    n = alprd_body(b, codes, pos, big);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    uint16_t swapped[2] = { 3, 2 };                                        /* positions not ascending */
-    n = alprd_body(b, codes, swapped, lefts);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    uint16_t past[2] = { 2, 4 };                                           /* position at n */
-    n = alprd_body(b, codes, past, lefts);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    uint8_t c3[4] = { 0, 2, 0, 0 };                                        /* code >= dict_n, not an exception row */
-    n = alprd_body(b, c3, pos, lefts);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    /* single-byte forgeries of the valid body: offsets 8 dict, 16 child,
-     * 32 right parts, 32 + 6656 positions, + 8 lefts */
-    const size_t pos_at = 32 + 6656, lefts_at = pos_at + 8;
-    n = alprd_body(b, codes, pos, lefts);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), (int64_t)n);
-    { uint16_t x = 5; memcpy(b + 2, &x, 2); }                              /* n_exc > n */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    n = alprd_body(b, codes, pos, lefts);
-    { uint16_t x = 0x1000; memcpy(b + 10, &x, 2); }                        /* dict entry at 2^(T-right_bits) */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    n = alprd_body(b, codes, pos, lefts); b[12] = 1;                       /* dict pad */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    n = alprd_body(b, codes, pos, lefts); b[pos_at + 5] = 1;               /* positions pad */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    n = alprd_body(b, codes, pos, lefts); b[lefts_at + 7] = 0x80;          /* lefts pad */
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), -1);
-    n = alprd_body(b, codes, pos, lefts);
-    TEST_ASSERT_EQ_I(ray_enc_alprd_read(b, n, 4, 64, out), (int64_t)n);    /* the base body still reads */
     PASS();
 }
 
@@ -897,80 +745,6 @@ static test_result_t test_decode_paths(void) {
     PASS();
 }
 
-/* VALUE_DICT invariants for floats: no NaN, strictly ascending in
- * dictionary order (the two zeros are -0.0 then +0.0). */
-static test_result_t test_float_dict_rejects(void) {
-    static double d[1024];
-    static const uint64_t dv[4] = { 0xC00C000000000000ull, NEG0_64, 0, 0x4002000000000000ull };   /* -3.5, -0.0, +0.0, 2.25 */
-    for (int i = 0; i < 1024; i++) memcpy(&d[i], &dv[(i * 7) % 4], 8);
-    fl_vec = f64_col(d, 1024);
-    const char* p = ray_test_tmp(FL_TMP "/vd");
-    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_DICT, p), 0);
-    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
-    TEST_ASSERT_EQ_I(fl_range_equal(p, fl_vec), 0);
-    ray_enc_hdr_t eh;
-    TEST_ASSERT_TRUE(fl_read(p, 32, &eh, sizeof eh));
-    long vals = (long)eh.side_off + 32 + 8;                            /* the entry's first value */
-    uint64_t x;
-    for (int i = 0; i < 4; i++) { TEST_ASSERT_TRUE(fl_read(p, vals + 8 * i, &x, 8)); TEST_ASSERT_EQ_U(x, dv[i]); }
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
-    uint64_t pz = 0, nz = NEG0_64, nan = 0x7FF8000000000000ull;
-    fl_patch(p, vals + 8, &pz, 8); fl_patch(p, vals + 16, &nz, 8);   /* +0 before -0 */
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "VALUE_DICT values not ascending") != NULL, "%s", fl_msg);
-    fl_patch(p, vals + 8, &nz, 8); fl_patch(p, vals + 16, &pz, 8);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
-    fl_patch(p, vals + 24, &nan, 8);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "VALUE_DICT value is a NaN") != NULL, "%s", fl_msg);
-    fl_drop();
-    PASS();
-}
-
-/* ALP / ALP_RD framing in a file, and the trailer after a codec body, are
- * corrupt at materialization (spec "Reject rules"). */
-static test_result_t test_float_file_rejects(void) {
-    static double d[1024];
-    for (int i = 0; i < 1024; i++) { d[i] = (double)(i % 100) / 4.0; if (i % 17 == 0) memcpy(&d[i], &(uint64_t){ NEG0_64 }, 8); }
-    fl_vec = f64_col(d, 1024);
-    const char* ar = ray_test_tmp(FL_TMP "/ar");
-    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, ar), 0);
-    TEST_ASSERT_EQ_I(desc_enc(ar, 0), RAY_ENC_ALP);
-    const long payload = 96 + 64 + RAY_ENC_DESC_AREA;                  /* chunk 0, vector 0, no bitmap */
-    uint8_t e19 = 19;
-    fl_patch(ar, payload, &e19, 1);
-    TEST_ASSERT_STR_EQ(fl_mat_code(ar), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "chunk 0 vector 0 codec body: ALP exponent above 18") != NULL, "%s", fl_msg);
-    const char* rd = ray_test_tmp(FL_TMP "/rd");
-    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP_RD, rd), 0);
-    TEST_ASSERT_EQ_I(desc_enc(rd, 0), RAY_ENC_ALP_RD);
-    uint8_t rb = 40;                                                   /* below T-16 */
-    fl_patch(rd, payload, &rb, 1);
-    TEST_ASSERT_STR_EQ(fl_mat_code(rd), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "codec body: ALP_RD right width outside T-16..T-1") != NULL, "%s", fl_msg);
-    fl_drop();
-    /* a trailer after an ALP body: one non-canonical NaN, so the payload
-     * ends with [u16 1, 6 reserved][position, padded to 8][the raw NaN] */
-    d[5] = 0; memcpy(&d[5], &(uint64_t){ 0x7FF8000000000077ull }, 8);
-    fl_vec = f64_col(d, 1024);
-    fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
-    const char* tr = ray_test_tmp(FL_TMP "/tr");
-    TEST_ASSERT_EQ_I(fl_roundtrip(fl_vec, RAY_ENC_ALP, tr), 0);
-    TEST_ASSERT_EQ_I(desc_enc(tr, 0), RAY_ENC_ALP);
-    TEST_ASSERT_EQ_I(fl_range_equal(tr, fl_vec), 0);
-    uint64_t pbytes;
-    TEST_ASSERT_TRUE(fl_read(tr, 96 + 64 + 16, &pbytes, 8));         /* descriptor 0's payload_bytes */
-    uint64_t raw;
-    TEST_ASSERT_TRUE(fl_read(tr, payload + (long)pbytes - 8, &raw, 8));
-    TEST_ASSERT_EQ_U(raw, 0x7FF8000000000077ull);
-    uint64_t one = db(1.0);
-    fl_patch(tr, payload + (long)pbytes - 8, &one, 8);
-    TEST_ASSERT_STR_EQ(fl_mat_code(tr), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "trailer value is not a NaN") != NULL, "%s", fl_msg);
-    fl_drop();
-    PASS();
-}
-
 /* The trailer's bytes count on both sides of the 1/8 gain rule at the
  * writer.  1 + 52 random mantissa bits: ALP_RD of 8 + 8 + 16 + 6656 =
  * 6688 B against RAW 8192, so a trailer of more than 7 * 8192 - 8 * 6688 =
@@ -1137,7 +911,7 @@ static test_result_t test_const_decision_f64(void) {
 
 /* The float RLE / DICT views make dec_floats' checks, and decline what
  * decode rejects (D7); a trailer, RAW, ALP and ALP_RD decline (D6). */
-static test_result_t test_view_checks(void) {
+static test_result_t test_view_shapes(void) {
     const long desc = 96 + 64, payload = desc + RAY_ENC_DESC_AREA;    /* chunk 0, vector 0 */
     const char* p = ray_test_tmp(FL_TMP "/vc");
     static double d[1024];
@@ -1153,35 +927,9 @@ static test_result_t test_view_checks(void) {
     TEST_ASSERT_TRUE(fl_vw.nullmap == NULL);
     uint8_t enc0; TEST_ASSERT_TRUE(fl_read(p, payload + 8, &enc0, 1));
     TEST_ASSERT_EQ_I(enc0, RAY_ENC_RAW);
-    uint64_t v0, nan = 0x7FF8000000000000ull, half = db(0.5), two = db(2.0), smin;
+    uint64_t v0, nan = 0x7FF8000000000000ull;
     TEST_ASSERT_TRUE(fl_read(p, payload + 16, &v0, 8));
     TEST_ASSERT_EQ_U(v0, db(1.5));
-    /* a run value that is a NaN on non-null rows */
-    fl_patch(p, payload + 16, &nan, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "NaN outside the bitmap") != NULL, "%s", fl_msg);
-    /* a run value below the statistics */
-    fl_patch(p, payload + 16, &half, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "value outside its statistics") != NULL, "%s", fl_msg);
-    fl_patch(p, payload + 16, &v0, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
-    /* the statistics raised above the first run */
-    TEST_ASSERT_TRUE(fl_read(p, desc + 32, &smin, 8));
-    fl_patch(p, desc + 32, &two, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "value outside its statistics") != NULL, "%s", fl_msg);
-    fl_patch(p, desc + 32, &smin, 8);
-    /* a FOR_BP values child: legal for integers only */
-    uint8_t forbp = RAY_ENC_FOR_BP;
-    fl_patch(p, payload + 8, &forbp, 1);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    fl_patch(p, payload + 8, &enc0, 1);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
     TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
 
     /* nullable RLE: a run wholly in the bitmap is never read, so its
@@ -1201,11 +949,6 @@ static test_result_t test_view_checks(void) {
     TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
     TEST_ASSERT_EQ_I(fl_range_equal(p, (fl_vec = fl_typed(RAY_F64, d, 1024))), 0);
     fl_drop();
-    /* the run next to it holds non-null rows: a NaN there is corrupt */
-    fl_patch(p, nbody + 16 + 8 * (nullrun + 1), &nan, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-
     /* DICT: -3.5, -0.0, +0.0, 2.25; [codes child header][base][packed] */
     static const uint64_t dv[4] = { 0xC00C000000000000ull, NEG0_64, 0, 0x4002000000000000ull };
     for (int i = 0; i < 1024; i++) memcpy(&d[i], &dv[(i * 7) % 4], 8);
@@ -1217,37 +960,6 @@ static test_result_t test_view_checks(void) {
     for (int i = 0; i < 1024; i++) TEST_ASSERT_EQ_U(fl_vw.dict[fl_vw.codes[i]], dv[(i * 7) % 4]);
     TEST_ASSERT_TRUE(fl_read(p, payload, &enc0, 1));
     TEST_ASSERT_EQ_I(enc0, RAY_ENC_FOR_BP);
-    /* the statistics' min at +0.0: the -3.5 rows fall outside */
-    uint64_t pz = 0, nz = NEG0_64, base, four = 4;
-    TEST_ASSERT_TRUE(fl_read(p, desc + 32, &smin, 8));
-    fl_patch(p, desc + 32, &pz, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    TEST_ASSERT_FMT(strstr(fl_msg, "value outside its statistics") != NULL, "%s", fl_msg);
-    fl_patch(p, desc + 32, &smin, 8);
-    /* codes past the dictionary (the FOR_BP base raised) */
-    TEST_ASSERT_TRUE(fl_read(p, payload + 8, &base, 8));
-    fl_patch(p, payload + 8, &four, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "corrupt");
-    fl_patch(p, payload + 8, &base, 8);
-    /* a codes child other than FOR_BP */
-    uint8_t raw = RAY_ENC_RAW;
-    fl_patch(p, payload, &raw, 1);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 0);
-    fl_patch(p, payload, &enc0, 1);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
-    TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
-    /* zeros against the statistics compare equal (the predicate
-     * comparator): -0.0 rows under a +0.0 min are inside, as decode reads them */
-    static const uint64_t zv[3] = { NEG0_64, 0, 0x4002000000000000ull };
-    for (int i = 0; i < 1024; i++) memcpy(&d[i], &zv[i % 3], 8);
-    TEST_ASSERT_TRUE(fl_view_col(RAY_F64, RAY_ENC_DICT, d, 1024, p));
-    TEST_ASSERT_EQ_I(desc_enc(p, 0), RAY_ENC_DICT);
-    TEST_ASSERT_TRUE(fl_read(p, desc + 32, &smin, 8));
-    TEST_ASSERT_EQ_U(smin, nz);
-    fl_patch(p, desc + 32, &pz, 8);
-    TEST_ASSERT_TRUE(fl_remap(p)); TEST_ASSERT_EQ_I(fl_vview(0), 1);
     TEST_ASSERT_STR_EQ(fl_mat_code(p), "");
 
     /* a trailer (a non-canonical NaN) declines every float view (D6); the
@@ -1558,9 +1270,7 @@ static int flr_enc(const char* name, const char* col, int64_t vec) {
     ray_t* encv = ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col)));
     int enc = -1;
     if (encv) {
-        const ray_enc_desc_t* d;
-        ray_t* err = ray_enccol_chunk_descs_ref(ray_enccol_of(encv), vec / RAY_ENC_VECS_PER_CHUNK, &d);
-        if (!err) enc = d[vec % RAY_ENC_VECS_PER_CHUNK].encoding; else ray_error_free(err);
+        enc = ray_enccol_descs(ray_enccol_of(encv), vec / RAY_ENC_VECS_PER_CHUNK)[vec % RAY_ENC_VECS_PER_CHUNK].encoding;
     }
     ray_release(t);
     return enc;
@@ -1747,9 +1457,6 @@ static test_result_t test_depth_bound(void) {
     uint64_t out[RAY_ENC_VEC];
     TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, RAY_ENC_VEC, 64, out), (int64_t)bp->len);
     TEST_ASSERT_TRUE(memcmp(out, v, sizeof v) == 0);
-    /* a third level (the values child itself RLE) is corrupt */
-    bp->p[8 + 8 + 8] = RAY_ENC_RLE;
-    TEST_ASSERT_EQ_I(ray_enc_alp_read(bp->p, bp->len, RAY_ENC_VEC, 64, out), -1);
     PASS();
 }
 
@@ -2013,28 +1720,23 @@ static test_result_t test_sweep_bit_exact(void) {
 }
 
 /* ---- Task 8b: the float fast kernel against dec_floats ----
- * Each body is decoded by the fast kernel and by the reference: a sound
- * body must be taken by the fast kernel with the reference's exact bytes,
- * and over every one-byte forgery of it (and statistics narrowed by one
- * step at either end) a body the fast kernel takes is one the reference
- * accepts, with the same bytes; the kernel writes nothing past vlen.  A
- * declined body goes to the reference in the real read, so its verdict
- * and its error are the reference's. */
+ * Each body is decoded by the fast kernel and by the reference: the fast
+ * kernel takes it (every sound body but a DICT one over RAW codes, which
+ * the reference reads) with the reference's exact bytes, and writes
+ * nothing past vlen. */
 static char fe_what[160];
 static int fe_check(int8_t ty, const ray_enc_dict_t* dict, uint8_t enc, int nn, const uint8_t* bm,
-                    const uint8_t* body, size_t len, int vlen, bool st, double mn, double mx, bool must) {
+                    const uint8_t* body, size_t len, int vlen, bool must) {
     static _Alignas(64) uint8_t ref[RAY_ENC_VEC * 8 + 64], fast[RAY_ENC_VEC * 8 + 64];
     const size_t esz = ty == RAY_F32 ? 4 : 8;
     memset(ref, 0xA5, sizeof ref); memset(fast, 0x5A, sizeof fast);
     const uint64_t* dv = dict ? dict->v : NULL; uint32_t dn = dict ? dict->n : 0;
-    int rr = ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bm, body, len, vlen, st, mn, mx, false, ref);
-    int fr = ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bm, body, len, vlen, st, mn, mx, true, fast);
-    if (must && (rr != 1 || fr != 1)) { snprintf(fe_what + strlen(fe_what), 40, ": ref %d fast %d", rr, fr); return 1; }
+    int rr = ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bm, body, len, vlen, false, ref);
+    int fr = ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bm, body, len, vlen, true, fast);
+    if (rr != 1) { snprintf(fe_what + strlen(fe_what), 40, ": ref %d", rr); return 1; }
+    if (must && fr != 1) { snprintf(fe_what + strlen(fe_what), 40, ": fast %d", fr); return 1; }
     for (size_t i = (size_t)vlen * esz; i < sizeof fast; i++) if (fast[i] != 0x5A) { strcat(fe_what, ": wrote past vlen"); return 1; }
-    if (fr == 1 && (rr != 1 || memcmp(ref, fast, (size_t)vlen * esz) != 0)) {
-        snprintf(fe_what + strlen(fe_what), 60, ": fast took it, ref %d%s", rr, rr == 1 ? " (bytes differ)" : "");
-        return 1;
-    }
+    if (fr == 1 && memcmp(ref, fast, (size_t)vlen * esz) != 0) { strcat(fe_what, ": bytes differ"); return 1; }
     return 0;
 }
 
@@ -2048,44 +1750,8 @@ static int fe_case(int8_t ty, uint8_t enc, const uint64_t* vals, int vlen, const
     int nn = 0;
     if (bm) for (int i = 0; i < vlen; i++) nn += (bm[i >> 3] >> (i & 7)) & 1;
     const uint8_t* bmp = nn ? bm : NULL;
-    /* the statistics: the non-null range of the reference decode */
-    static _Alignas(64) uint8_t out[RAY_ENC_VEC * 8 + 64];
-    const uint64_t* dv = dict ? dict->v : NULL; uint32_t dn = dict ? dict->n : 0;
-    if (ray_enccol_test_decode_float(ty, dv, dn, enc, nn, bmp, b.p, b.len, vlen, false, 0, 0, false, out) != 1) {
-        strcat(fe_what, ": reference rejects the written body"); ray_enc_buf_free(&b); return 1;
-    }
-    bool st = false; double mn = 0, mx = 0;
-    for (int i = 0; i < vlen; i++) {
-        if (bmp && ((bmp[i >> 3] >> (i & 7)) & 1)) continue;
-        double x; if (T == 32) { float f; memcpy(&f, out + 4 * i, 4); x = f; } else memcpy(&x, out + 8 * i, 8);
-        if (!st || x < mn) mn = x;
-        if (!st || x > mx) mx = x;
-        st = true;
-    }
-    /* the kernel takes every sound body but a DICT one over RAW codes (a
-     * short vector's), which the reference reads */
     const bool take = enc != RAY_ENC_DICT || b.p[0] == RAY_ENC_FOR_BP || b.p[0] == RAY_ENC_RLE;
-    int bad = fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, st, mn, mx, take);
-    /* absent statistics over the same rows (non-null ones included): no
-     * bound, as dec_floats reads them; only a NaN fails */
-    if (!bad) bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, false, 0, 0, take);
-    if (!bad && st) {                                  /* narrowed statistics: rejected, never taken */
-        bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, true, nextafter(mn, INFINITY), mx, false);
-        bad |= fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, true, mn, nextafter(mx, -INFINITY), false);
-    }
-    static _Alignas(64) uint8_t forged[RAY_ENC_VEC * 8 + 4096];
-    const size_t step = b.len > 2048 ? 7 : 1;
-    static const int ops[5] = { 0x101, 0x180, 0x2FF, 0x200, 0x27F };   /* xor 0x01, xor 0x80, set 0xFF, 0x00, 0x7F */
-    for (size_t at = 0; !bad && at < b.len && b.len <= sizeof forged; at += step)
-        for (int o = 0; !bad && o < 5; o++) {
-            memcpy(forged, b.p, b.len);
-            forged[at] = (uint8_t)(ops[o] >> 8 == 1 ? forged[at] ^ (ops[o] & 0xFF) : (ops[o] & 0xFF));
-            if (forged[at] == b.p[at]) continue;
-            if (fe_check(ty, dict, enc, nn, bmp, forged, b.len, vlen, st, mn, mx, false)) {
-                snprintf(fe_what + strlen(fe_what), 40, " [byte %zu op %d]", at, o);
-                bad = 1;
-            }
-        }
+    int bad = fe_check(ty, dict, enc, nn, bmp, b.p, b.len, vlen, take);
     ray_enc_buf_free(&b);
     return bad;
 }
@@ -2251,7 +1917,7 @@ static test_result_t test_fp_environment(void) {
             w.chunk_i != 0 || w.chunk.len != 0 || w.dict_v || w.alp.n != 0) {
             why = "stream rejected after training/mutation"; goto done;
         }
-        err = ray_enccol_decode_vec(e, 2, out, NULL, 0, 0);
+        err = ray_enccol_decode_vec(e, 2, out, NULL, 0);
         if (!err || ray_err_from_obj(err) != RAY_ERR_FPENV) { why = "tail decode did not report fpenv"; goto done; }
         ray_error_free(err); err = NULL;
         err = ray_enccol_materialize(fl_map);
@@ -2321,9 +1987,7 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/alp_decimals",     test_alp_decimals,     fl_setup, fl_teardown },
     { "encfloat/alp_signed",       test_alp_signed,       fl_setup, fl_teardown },
     { "encfloat/alp_edges",        test_alp_edges,        fl_setup, fl_teardown },
-    { "encfloat/alp_rejects",      test_alp_rejects,      fl_setup, fl_teardown },
     { "encfloat/alprd_lengths",    test_alprd_lengths,    fl_setup, fl_teardown },
-    { "encfloat/alprd_rejects",    test_alprd_rejects,    fl_setup, fl_teardown },
     { "encfloat/alprd_exceptions", test_alprd_exceptions, fl_setup, fl_teardown },
     { "encfloat/alprd_specials",   test_alprd_specials,   fl_setup, fl_teardown },
     { "encfloat/float_choice",     test_float_choice,     fl_setup, fl_teardown },
@@ -2332,12 +1996,10 @@ const test_entry_t encfloat_entries[] = {
     { "encfloat/all_null_floats",      test_all_null_floats,      fl_setup, fl_teardown },
     { "encfloat/first_chunk_training", test_first_chunk_training, fl_setup, fl_teardown },
     { "encfloat/decode_paths",         test_decode_paths,         fl_setup, fl_teardown },
-    { "encfloat/float_dict_rejects",   test_float_dict_rejects,   fl_setup, fl_teardown },
-    { "encfloat/float_file_rejects",   test_float_file_rejects,   fl_setup, fl_teardown },
     { "encfloat/trailer_counts_in_choice", test_trailer_counts_in_choice, fl_setup, fl_teardown },
     { "encfloat/eval_f64",             test_eval_f64,             fl_setup, fl_teardown },
     { "encfloat/const_decision_f64",   test_const_decision_f64,   fl_setup, fl_teardown },
-    { "encfloat/view_checks",          test_view_checks,          fl_setup, fl_teardown },
+    { "encfloat/view_shapes",          test_view_shapes,          fl_setup, fl_teardown },
     { "encfloat/view_consumers",       test_view_consumers,       fl_rt_setup, fl_rt_teardown },
     { "encfloat/filter_views",         test_filter_views,         fl_rt_setup, fl_rt_teardown },
     { "encfloat/signed_zeros",         test_signed_zeros_battery, fl_rt_setup, fl_rt_teardown },

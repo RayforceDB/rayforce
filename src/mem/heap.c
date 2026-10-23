@@ -52,6 +52,9 @@
 #include <sys/stat.h>   /* O_*  modes */
 #include <sys/types.h>
 #include <stdatomic.h>
+#if defined(RAY_OS_LINUX)
+#include <sys/resource.h>   /* RLIMIT_MEMLOCK — heap_lock */
+#endif
 
 /* File-backed spill (a pool or direct block mapped over a preallocated temp
  * file when the anonymous mapping is refused) is POSIX-only.  Windows pools
@@ -420,6 +423,237 @@ static bool heap_anon_would_exceed(size_t bytes) {
     return cur + (int64_t)bytes > wm;
 }
 
+/* Locking the heap against swap.  Anonymous memory the heap maps under the
+ * watermark — pools, direct blocks, large sys blocks — is locked against
+ * swap-out (ray_vm_lock: mlock2 MLOCK_ONFAULT, so a page is locked as it is
+ * faulted in and nothing is faulted in ahead): on a machine with swap and
+ * the default swappiness the kernel otherwise moves it to swap to make room
+ * for page cache — the mapped columns a query reads — and the next touch of
+ * that memory waits for a swap-in, at disk speed, wherever it falls in a
+ * query.  Memory past the watermark, spill files, and a process with no
+ * known RAM budget are never locked.
+ *
+ * The bound: the bytes locked (g_locked, the mappings' sizes — what the
+ * kernel charges to RLIMIT_MEMLOCK too) stay within the smaller of the
+ * watermark and half the RAM limit (heap_lock_bound).  The watermark alone
+ * is not enough: it is half the limit on a small machine but three quarters
+ * of it on a large one, and -m may set it past physical RAM — locked, the
+ * OOM killer would replace the swap.  The bound is checked and taken with
+ * one atomic add, so threads mapping at once cannot overshoot it together.
+ * A bound lowered later (ray_heap_set_anon_watermark) is met at the next
+ * boundary, which unlocks pools until the locked bytes fit (heap_lock_trim).
+ *
+ * Dead memory is not kept locked where it would stay: a pool parked at a
+ * boundary is unlocked, and the direct-block cache's blocks are unlocked by
+ * (.sys.gc) and the idle decay (heap_unlock_idle); either is locked again
+ * when it comes back into service — taken from the cache, unparked for an
+ * allocation, or put back by the decay, a release or a merge
+ * (heap_relock_pools).  A free block in a locked pool stays locked until its
+ * pages go (pass 5, the decay), which keeps the pool one locked mapping.
+ *
+ * Best effort: RLIMIT_MEMLOCK — 8 or 64 MB for a user, as little as 64 KB
+ * in a container, unlimited for root outside one (CAP_IPC_LOCK) — bounds it
+ * too, checked here before the system call: a lock refused by the kernel is
+ * not tried again until the locked bytes fall or the limit changes, since
+ * each mlock2 takes the mapping lock and walks every mapping of the process.
+ * What is left unlocked is counted (ray_heap_lock_skipped), refusals too
+ * (ray_heap_lock_failures).  RAY_HEAP_MLOCK=0 turns locking off, read at
+ * the first lock.  The RAM limit is the one read at startup: a cgroup limit
+ * lowered later is not seen.  Linux
+ * only: plain mlock elsewhere would fault in and wire a whole pool at once. */
+#if defined(RAY_OS_LINUX)
+static _Atomic(int64_t) g_locked = 0;
+static _Atomic(int64_t) g_lock_failed = 0;
+static _Atomic(int64_t) g_lock_skipped = 0;
+static _Atomic(int64_t) g_lock_refused_at = -1;   /* g_locked at a refusal, -1: none */
+static _Atomic(int64_t) g_lock_refused_lim = -1;  /* RLIMIT_MEMLOCK then */
+static _Atomic(int)     g_lock_cap = -1;          /* CAP_IPC_LOCK: -1 not asked yet */
+
+/* The most the heap locks: the smaller of the watermark and half the RAM
+ * limit; 0 — nothing — where the RAM limit is not known (no runtime), and
+ * the default watermark with it. */
+/* Whether to lock: RAY_HEAP_MLOCK=0 turns it off, read at the first lock
+ * rather than per mapping (a worker's, racing .sys.setenv). */
+static _Atomic(int) g_lock_on = -1;
+static bool heap_lock_enabled(void) {
+    int on = atomic_load_explicit(&g_lock_on, memory_order_relaxed);
+    if (on < 0) {
+        const char* env = getenv("RAY_HEAP_MLOCK");
+        on = (env && env[0] == '0') ? 0 : 1;
+        int unset = -1;
+        if (!atomic_compare_exchange_strong_explicit(&g_lock_on, &unset, on,
+                                                     memory_order_relaxed,
+                                                     memory_order_relaxed))
+            on = unset;
+    }
+    return on != 0;
+}
+
+static int64_t heap_lock_bound(void) {
+    int64_t lim = ray_sys_ram_limit();
+    if (lim <= 0) return 0;
+    int64_t wm = heap_anon_watermark();
+    return wm < lim / 2 ? wm : lim / 2;
+}
+
+static void heap_lock_skip(size_t size) {
+    atomic_fetch_add_explicit(&g_lock_skipped, (int64_t)size, memory_order_relaxed);
+}
+#endif
+
+/* Lock anonymous mapping [p, p+size), mapped under the watermark; true if
+ * it is locked now (the caller keeps that, for heap_unlocked). */
+static bool heap_lock(void* p, size_t size) {
+#if defined(RAY_OS_LINUX)
+    if (!heap_lock_enabled()) return false;
+    int64_t bound = heap_lock_bound();
+    if (bound <= 0) return false;
+    struct rlimit rl;
+    int64_t soft = INT64_MAX;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+        soft = (int64_t)rl.rlim_cur;
+    int cap = atomic_load_explicit(&g_lock_cap, memory_order_relaxed);
+    if (cap < 0) {
+        cap = ray_os_has_ipc_lock() ? 1 : 0;
+        atomic_store_explicit(&g_lock_cap, cap, memory_order_relaxed);
+    }
+    int64_t cur = atomic_load_explicit(&g_locked, memory_order_relaxed);
+    int64_t refused = atomic_load_explicit(&g_lock_refused_at, memory_order_relaxed);
+    if (refused >= 0 && cur >= refused
+        && atomic_load_explicit(&g_lock_refused_lim, memory_order_relaxed) == soft) {
+        heap_lock_skip(size);
+        return false;
+    }
+    if (!cap && cur + (int64_t)size > soft) { heap_lock_skip(size); return false; }
+    if (atomic_fetch_add_explicit(&g_locked, (int64_t)size, memory_order_relaxed)
+        + (int64_t)size > bound) {
+        atomic_fetch_sub_explicit(&g_locked, (int64_t)size, memory_order_relaxed);
+        heap_lock_skip(size);
+        return false;
+    }
+    if (!ray_vm_lock(p, size)) {
+        int err = errno;
+        int64_t now = atomic_fetch_sub_explicit(&g_locked, (int64_t)size,
+                                                memory_order_relaxed) - (int64_t)size;
+        atomic_fetch_add_explicit(&g_lock_failed, 1, memory_order_relaxed);
+        heap_lock_skip(size);
+        if (err == ENOMEM || err == EPERM || err == EAGAIN || err == ENOSYS) {
+            atomic_store_explicit(&g_lock_refused_lim, soft, memory_order_relaxed);
+            atomic_store_explicit(&g_lock_refused_at, err == ENOSYS ? 0 : now,
+                                  memory_order_relaxed);
+        }
+        return false;
+    }
+    return true;
+#else
+    (void)p; (void)size;
+    return false;
+#endif
+}
+
+/* A mapping heap_lock locked is unmapped (munmap unlocks it) or unlocked:
+ * take it off the books. */
+static void heap_unlocked(size_t size) {
+#if defined(RAY_OS_LINUX)
+    atomic_fetch_sub_explicit(&g_locked, (int64_t)size, memory_order_relaxed);
+#else
+    (void)size;
+#endif
+}
+
+/* Unlock a locked mapping that stays mapped. */
+static void heap_unlock(void* p, size_t size) {
+    ray_vm_unlock(p, size);
+    heap_unlocked(size);
+}
+
+/* Hand back the pages of free block blk (bsize bytes) of h's pool pidx (-1:
+ * a pool h does not track).  A locked pool's go through
+ * ray_vm_release_block_locked, the lock kept; where that fails part way —
+ * the range unlocked, or not released — the pool is unlocked whole, which
+ * merges its mapping back into one rather than leaving it split, counted,
+ * and the pages released plainly. */
+static void heap_release_block(ray_heap_t* h, int pidx, ray_t* blk, size_t bsize) {
+    if (pidx < 0) {   /* a pool h does not track: its lock unknown */
+        (void)ray_vm_release_block_any(blk, bsize, false);
+        return;
+    }
+    ray_pool_entry_t* pe = &h->pools[pidx];
+    bool hp = pe->hugepage != 0;
+    if (!pe->locked) { ray_vm_release_block(blk, bsize, hp); return; }
+    int r = ray_vm_release_block_locked(blk, bsize, hp);
+    if (r == 0) return;
+#if defined(RAY_OS_LINUX)
+    atomic_fetch_add_explicit(&g_lock_failed, 1, memory_order_relaxed);
+#endif
+    heap_unlock(pe->base, BSIZEOF(pe->pool_order));
+    pe->locked = 0;
+    if (r < 0) ray_vm_release_block(blk, bsize, hp);
+}
+
+static void direct_cache_unlock_all(void);
+
+/* A bound lowered under what is locked (a watermark set lower, by -m or an
+ * embedding): unlock h's pools, the last mapped first, until the locked
+ * bytes fit again.  Called at the boundary and by the idle decay. */
+static void heap_lock_trim(ray_heap_t* h) {
+#if defined(RAY_OS_LINUX)
+    /* No known RAM budget: nothing is bound, so nothing is over it (bytes a
+     * gone runtime's leaked heap left locked are not). */
+    if (ray_sys_ram_limit() <= 0) return;
+    int64_t bound = heap_lock_bound();
+    if (atomic_load_explicit(&g_locked, memory_order_relaxed) <= bound) return;
+    /* The cache's blocks first: dead memory.  What live direct and sys
+     * blocks hold stays locked until they are freed — the heap keeps no list
+     * of them to unlock. */
+    direct_cache_unlock_all();
+    for (uint32_t p = h->pool_count; p-- > 0; ) {
+        if (atomic_load_explicit(&g_locked, memory_order_relaxed) <= bound) return;
+        ray_pool_entry_t* pe = &h->pools[p];
+        if (!pe->locked) continue;
+        heap_unlock(pe->base, BSIZEOF(pe->pool_order));
+        pe->locked = 0;
+    }
+#else
+    (void)h;
+#endif
+}
+
+bool ray_heap_set_lock(bool on) {
+#if defined(RAY_OS_LINUX)
+    bool was = heap_lock_enabled();
+    atomic_store_explicit(&g_lock_on, on ? 1 : 0, memory_order_relaxed);
+    return was;
+#else
+    (void)on;
+    return false;
+#endif
+}
+
+int64_t ray_heap_locked_bytes(void) {
+#if defined(RAY_OS_LINUX)
+    return atomic_load_explicit(&g_locked, memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+int64_t ray_heap_lock_failures(void) {
+#if defined(RAY_OS_LINUX)
+    return atomic_load_explicit(&g_lock_failed, memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+int64_t ray_heap_lock_skipped(void) {
+#if defined(RAY_OS_LINUX)
+    return atomic_load_explicit(&g_lock_skipped, memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
 /* A boundary far from the watermark visits the heaps for the spill pools
  * alone (ray_heap_relieve) — to park the empty ones, discard their pages and
  * age them — so at most this often: a stream of small statements (a
@@ -446,6 +680,34 @@ void ray_heap_set_anon_watermark(int64_t bytes) {
     atomic_store_explicit(&g_anon_watermark, bytes < 0 ? 0 : bytes,
                           memory_order_relaxed);
     atomic_store_explicit(&g_far_visit_ms, INT64_MIN / 2, memory_order_relaxed);
+}
+
+static size_t direct_cache_bytes_now(void);
+
+/* Committed anonymous bytes the calling thread can allocate again without
+ * committing more: the free blocks on its heap's freelists that lie in
+ * anonymous pools (a spill pool's are not RAM), and the blocks the direct
+ * cache holds, which it gives up under watermark pressure.  Walks the
+ * freelists: for a planner sizing a working set, not for hot paths. */
+int64_t ray_heap_anon_reusable(void) {
+    int64_t bytes = (int64_t)direct_cache_bytes_now();
+    ray_heap_t* h = ray_tl_heap;
+    if (!h) return bytes;
+    bool backed = false;
+    for (uint32_t i = 0; i < h->pool_count; i++)
+        if (h->pools[i].backed) { backed = true; break; }
+    for (int ord = RAY_ORDER_MIN; ord <= RAY_HEAP_MAX_ORDER; ord++) {
+        if (!(h->avail & (1ULL << ord))) continue;
+        ray_fl_head_t* fh = &h->freelist[ord];
+        for (ray_t* blk = fh->fl_next; blk != (ray_t*)fh; blk = blk->fl_next) {
+            if (backed) {
+                int pi = heap_find_pool(h, blk);
+                if (pi < 0 || h->pools[pi].backed) continue;
+            }
+            bytes += (int64_t)BSIZEOF(ord);
+        }
+    }
+    return bytes;
 }
 
 ray_heap_t* ray_heap_registry[RAY_HEAP_REGISTRY_SIZE];
@@ -532,7 +794,7 @@ uint8_t ray_order_for_size(size_t data_size) {
  * -------------------------------------------------------------------------- */
 
 static bool heap_add_pool(ray_heap_t* h, uint8_t order);
-static bool heap_unpark(ray_heap_t* h, bool spill);
+static bool heap_unpark(ray_heap_t* h, bool spill, bool relock);
 static void heap_unpark_all(ray_heap_t* h);
 static bool heap_make_room(size_t bytes);
 static int64_t heap_decay_threshold_ms(void);
@@ -815,6 +1077,8 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
         .swap_fd    = swap_fd,
         .swap_path  = swap_path,  /* NULL when not backed */
     };
+    if (swap_fd < 0 && !over)   /* under the watermark: locked against swap-out */
+        h->pools[h->pool_count].locked = heap_lock(mem, pool_size) ? 1 : 0;
     h->pool_count++;
 
     if (swap_fd < 0)   /* anonymous pool: counts toward the RAM watermark */
@@ -1424,6 +1688,7 @@ typedef struct ray_direct_cache_node {
     struct ray_direct_cache_node* next;
     struct ray_direct_cache_node* prev;
     size_t map_size;
+    int    locked;     /* the block is locked against swap-out (heap_lock) */
 } ray_direct_cache_node_t;
 _Static_assert(sizeof(ray_direct_cache_node_t) <= RAY_DIRECT_HDR,
                "cached links must fit in the dead direct-allocation prefix");
@@ -1454,6 +1719,13 @@ static size_t direct_cache_budget(void) {
     return b;
 }
 
+static size_t direct_cache_bytes_now(void) {
+    direct_cache_lock();
+    size_t b = g_direct_cache_bytes;
+    direct_cache_unlock();
+    return b;
+}
+
 /* Caller holds the lock. Ownership transfers from the cache to the caller. */
 static void direct_cache_unlink(ray_direct_cache_node_t* node) {
     if (node->prev) node->prev->next = node->next;
@@ -1468,6 +1740,7 @@ static void direct_cache_release(ray_direct_cache_node_t* node) {
     while (node) {
         ray_direct_cache_node_t* next = node->next;
         size_t bytes = node->map_size;
+        if (node->locked) heap_unlocked(bytes);
         atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)bytes, memory_order_relaxed);
         ray_vm_free(node, bytes);
         node = next;
@@ -1476,7 +1749,7 @@ static void direct_cache_release(ray_direct_cache_node_t* node) {
 
 /* Best fitting cached block within the existing waste bound. Exact matches
  * stop the search; similar-sized analytical scratch is the common case. */
-static void* direct_cache_take(size_t need, size_t* out_size) {
+static void* direct_cache_take(size_t need, size_t* out_size, bool* out_locked) {
     direct_cache_lock();
     size_t slack = need / 4;
     if (slack < (2u << 20)) slack = (2u << 20);
@@ -1490,6 +1763,7 @@ static void* direct_cache_take(size_t need, size_t* out_size) {
     }
     if (best) {
         *out_size = best->map_size;
+        *out_locked = best->locked != 0;
         direct_cache_unlink(best);
     }
     direct_cache_unlock();
@@ -1498,7 +1772,7 @@ static void* direct_cache_take(size_t need, size_t* out_size) {
 
 /* Recently freed blocks replace the oldest cached blocks within the unchanged
  * byte budget. The caller has already removed this block from live statistics. */
-static bool direct_cache_put(void* base, size_t map_size) {
+static bool direct_cache_put(void* base, size_t map_size, bool locked) {
     size_t budget = direct_cache_budget();
     if (map_size > budget) return false;
     ray_direct_cache_node_t* evicted = NULL;
@@ -1511,6 +1785,7 @@ static bool direct_cache_put(void* base, size_t map_size) {
     }
     ray_direct_cache_node_t* node = base;
     node->map_size = map_size;
+    node->locked = locked;
     node->next = NULL;
     node->prev = g_direct_cache_tail;
     if (g_direct_cache_tail) g_direct_cache_tail->next = node;
@@ -1537,6 +1812,49 @@ void ray_heap_direct_cache_drain(void) {
     direct_cache_drain();
 }
 
+static void direct_cache_unlock_all(void);
+
+void ray_heap_unlock_idle(void) {
+    direct_cache_unlock_all();
+}
+
+/* Unlock the blocks the direct-block cache keeps: dead memory, kept for its
+ * pages rather than its lock.  They stay cached.  Detached under the lock,
+ * unlocked outside it — an munlock can take milliseconds, as an munmap — and
+ * put back as the oldest; whatever that leaves past the budget (blocks put
+ * meanwhile) is evicted as a put would. */
+static void direct_cache_unlock_all(void) {
+    direct_cache_lock();
+    ray_direct_cache_node_t* head = g_direct_cache_head;
+    ray_direct_cache_node_t* tail = g_direct_cache_tail;
+    size_t bytes = g_direct_cache_bytes;
+    g_direct_cache_head = g_direct_cache_tail = NULL;
+    g_direct_cache_bytes = 0;
+    direct_cache_unlock();
+    if (!head) return;
+    for (ray_direct_cache_node_t* node = head; node; node = node->next)
+        if (node->locked) {
+            heap_unlock(node, node->map_size);
+            node->locked = 0;
+        }
+    size_t budget = direct_cache_budget();
+    ray_direct_cache_node_t* evicted = NULL;
+    direct_cache_lock();
+    tail->next = g_direct_cache_head;
+    if (g_direct_cache_head) g_direct_cache_head->prev = tail;
+    else g_direct_cache_tail = tail;
+    g_direct_cache_head = head;
+    g_direct_cache_bytes += bytes;
+    while (g_direct_cache_bytes > budget && g_direct_cache_head) {
+        ray_direct_cache_node_t* old = g_direct_cache_head;
+        direct_cache_unlink(old);
+        old->next = evicted;
+        evicted = old;
+    }
+    direct_cache_unlock();
+    direct_cache_release(evicted);
+}
+
 /* Bytes a drain would hand back now. */
 static int64_t direct_cache_bytes(void) {
     direct_cache_lock();
@@ -1559,9 +1877,13 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
      * pages — no mmap, no watermark commit (the block never left the
      * committed totals while cached), no kernel page-zeroing on fault. */
     size_t cached_size = 0;
-    base = direct_cache_take(map_size, &cached_size);
+    bool locked = false;
+    base = direct_cache_take(map_size, &cached_size, &locked);
     if (base) {
         map_size = cached_size;
+        /* Unlocked while cached (ray_heap_unlock_idle): back in service it
+         * is locked again, under the watermark and within the bound. */
+        if (!locked && !heap_anon_would_exceed(0)) locked = heap_lock(base, map_size);
     } else {
         /* If keeping this in anonymous RAM would push our footprint past the
          * watermark (default: physical RAM), back it with a disk file from the
@@ -1582,6 +1904,8 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
             if (!base && force_file) base = ray_vm_alloc(map_size);
             if (!base) return NULL;
         }
+        if (swap_fd < 0 && !force_file)   /* under the watermark */
+            locked = heap_lock(base, map_size);
         if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
             heap_anon_commit((int64_t)map_size, true, true);
         if (force_file || swap_fd >= 0)
@@ -1591,6 +1915,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
     hdr->map_size  = map_size;
     hdr->swap_fd   = swap_fd;
+    hdr->locked    = locked;
     hdr->swap_path = swap_path;
 
     ray_t* v = (ray_t*)((char*)base + RAY_DIRECT_HDR);
@@ -1682,7 +2007,7 @@ ray_t* ray_alloc(size_t data_size) {
             /* Then a pool the heap parked (heap_park_empty_pools), an
              * anonymous one first. */
             if (candidates == 0 && h->parked
-                && (heap_unpark(h, false) || heap_unpark(h, true)))
+                && (heap_unpark(h, false, true) || heap_unpark(h, true, true)))
                 candidates = h->avail & (UINT64_MAX << order);
             if (candidates == 0) {
                 if (!heap_add_pool(h, order)) return NULL;
@@ -1820,6 +2145,7 @@ RAY_INLINE void ray_free_block(ray_t* v) {
         ray_direct_hdr_t* hdr  = (ray_direct_hdr_t*)base;
         size_t map_size  = hdr->map_size;
         int    swap_fd   = hdr->swap_fd;
+        bool   locked    = hdr->locked != 0;
         char*  swap_path = hdr->swap_path;
         mem_trace_note_free(map_size);
         if (h) RAY_STAT(h->stats.free_count++);
@@ -1837,12 +2163,13 @@ RAY_INLINE void ray_free_block(ray_t* v) {
 #else
         (void)swap_fd; (void)swap_path;
 #endif
-        if (direct_cache_put(base, map_size)) {
+        if (direct_cache_put(base, map_size, locked)) {
             /* Stashed for reuse: pages stay resident, so the block keeps
              * its committed-RAM and watermark accounting; only the live
              * stats above dropped.  Eviction (direct_cache_drain) performs
              * the deferred un-commit + munmap. */
         } else {
+            if (locked) heap_unlocked(map_size);
             atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)map_size,
                                       memory_order_relaxed);
             ray_vm_free(base, map_size);   /* munmap + committed-RAM counter -= */
@@ -2442,13 +2769,15 @@ static void* heap_sys_map_file(size_t size) {
 }
 #endif
 
-void* ray_heap_sys_map(size_t size, bool* spilled) {
+void* ray_heap_sys_map(size_t size, bool* spilled, bool* locked) {
     *spilled = false;
+    *locked = false;
     void* p = NULL;
     bool big = size >= RAY_SYS_SPILL_MIN;   /* could spill, so ray_heap_relieve counts it */
 #if RAY_HEAP_FILE_SPILL
     bool to_file = big && heap_anon_would_exceed(size) && heap_make_room(size);
     if (!to_file) p = ray_vm_alloc(size);
+    if (p && big) *locked = heap_lock(p, size);   /* under the watermark: to_file is false */
     if (!p && big) {
         p = heap_sys_map_file(size);
         if (p) { *spilled = true; heap_anon_spilled(); return p; }
@@ -2466,8 +2795,9 @@ void* ray_heap_sys_map(size_t size, bool* spilled) {
     return p;
 }
 
-void ray_heap_sys_unmap(void* p, size_t size, bool spilled) {
+void ray_heap_sys_unmap(void* p, size_t size, bool spilled, bool locked) {
     if (!p) return;
+    if (locked) heap_unlocked(size);
 #if RAY_HEAP_FILE_SPILL
     if (spilled) {
         munmap(p, size);
@@ -2646,6 +2976,7 @@ void ray_heap_destroy(void) {
         ray_pool_hdr_t* hdr = (ray_pool_hdr_t*)h->pools[i].base;
         dfd_purge_range((uintptr_t)h->pools[i].base,
                         (uintptr_t)h->pools[i].base + BSIZEOF(h->pools[i].pool_order));
+        if (h->pools[i].locked) heap_unlocked(BSIZEOF(h->pools[i].pool_order));
         ray_vm_free(hdr->vm_base, BSIZEOF(h->pools[i].pool_order));
         if (h->pools[i].backed) {
             atomic_fetch_sub_explicit(&g_spill_pools, 1, memory_order_relaxed);
@@ -2844,6 +3175,7 @@ static int64_t heap_pool_unmap(ray_heap_t* h, uint32_t p) {
     if (pe->parked) h->parked--;
 
     dfd_purge_range(pb, pb + BSIZEOF(po));
+    if (pe->locked) heap_unlocked(BSIZEOF(po));
     ray_vm_free(((ray_pool_hdr_t*)pb)->vm_base, BSIZEOF(po));
     /* File-backed pools also need their fd closed and tempfile
      * unlinked, mirroring the heap_destroy path.  Unmapping drops the
@@ -2916,12 +3248,21 @@ static void heap_park_empty_pools(ray_heap_t* h, unsigned mode, uint32_t now) {
         h->pools[p].parked = 1;
         ((ray_pool_hdr_t*)h->pools[p].base)->parked_ms = now;
         h->parked++;
+        /* An empty pool is dead memory: kept for its pages, not its lock
+         * (heap_lock).  Taken back, it is locked again (heap_unpark). */
+        if (h->pools[p].locked) {
+            heap_unlock(h->pools[p].base, BSIZEOF(h->pools[p].pool_order));
+            h->pools[p].locked = 0;
+            h->pools[p].relock = 1;
+        }
     }
 }
 
 /* Put one parked pool's blocks back on the freelists — a spill one if
- * `spill`, else an anonymous one; false if h has none. */
-static bool heap_unpark(ray_heap_t* h, bool spill) {
+ * `spill`, else an anonymous one; false if h has none.  With `relock` —
+ * taken back for an allocation — an anonymous pool is locked again as it
+ * was before it was parked, if the footprint is under the watermark. */
+static bool heap_unpark(ray_heap_t* h, bool spill, bool relock) {
     for (uint32_t p = h->pool_count; p-- > 0; ) {
         ray_pool_entry_t* pe = &h->pools[p];
         if (!pe->parked || pe->backed != spill) continue;
@@ -2931,13 +3272,31 @@ static bool heap_unpark(ray_heap_t* h, bool spill) {
         pe->parked = 0;
         pe->discarded = 0;   /* its pages are in use again */
         h->parked--;
+        if (relock && pe->relock) {
+            pe->relock = 0;
+            if (!heap_anon_would_exceed(0))
+                pe->locked = heap_lock(pe->base, BSIZEOF(pe->pool_order)) ? 1 : 0;
+        }
         return true;
     }
     return false;
 }
 
 static void heap_unpark_all(ray_heap_t* h) {
-    while (h->parked && (heap_unpark(h, false) || heap_unpark(h, true))) {}
+    while (h->parked && (heap_unpark(h, false, false) || heap_unpark(h, true, false))) {}
+}
+
+/* Lock again the pools heap_unpark_all put back in service unlocked — after
+ * the caller is done handing their pages back, which a locked range makes
+ * dearer before Linux 5.18 — under the watermark, within the bound. */
+static void heap_relock_pools(ray_heap_t* h) {
+    for (uint32_t p = 0; p < h->pool_count; p++) {
+        ray_pool_entry_t* pe = &h->pools[p];
+        if (!pe->relock || pe->parked) continue;
+        pe->relock = 0;
+        if (!pe->backed && !pe->locked && !heap_anon_would_exceed(0))
+            pe->locked = heap_lock(pe->base, BSIZEOF(pe->pool_order)) ? 1 : 0;
+    }
 }
 
 /* An abandoned heap is visited by no boundary (heap_each_quiescent), so its
@@ -3076,9 +3435,7 @@ void ray_heap_gc(void) {
                 } else if (blk->attrs == RAY_FREE_AGE_RELEASE) {
                     size_t bsize = BSIZEOF(ord);
                     int rpidx = heap_find_pool(gh, blk);
-                    bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0)
-                                           : false;
-                    ray_vm_release_block(blk, bsize, hp);
+                    heap_release_block(gh, rpidx, blk, bsize);
                     blk->attrs = RAY_FREE_AGE_RELEASE + 1;  /* released */
                     if (++p5_released >= RAY_P5_RELEASE_BUDGET) break;
                 }
@@ -3105,8 +3462,7 @@ static int64_t heap_release_free_pages(ray_heap_t* h) {
             int pidx = heap_find_pool(h, blk);
             blk->attrs = RAY_FREE_AGE_RELEASE + 1;
             if (pidx >= 0 && h->pools[pidx].backed) continue;
-            bool hp = (pidx >= 0) ? (h->pools[pidx].hugepage != 0) : false;
-            ray_vm_release_block(blk, BSIZEOF(ord), hp);
+            heap_release_block(h, pidx, blk, BSIZEOF(ord));
             released++;
         }
     }
@@ -3236,6 +3592,7 @@ void ray_heap_release_pages(void) {
     if (!h) return;
     heap_unpark_all(h);
     (void)heap_release_free_pages(h);
+    heap_relock_pools(h);
 }
 
 /* --------------------------------------------------------------------------
@@ -3356,7 +3713,9 @@ static void heap_decay_sweep(ray_heap_t* h, void* ctx) {
     heap_flush_slabs(h);
     heap_unpark_all(h);
     (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_SPILL);
+    heap_lock_trim(h);
     *(int64_t*)ctx += heap_release_free_pages(h);
+    heap_relock_pools(h);
 }
 
 int64_t ray_heap_decay(void) {
@@ -3370,6 +3729,7 @@ int64_t ray_heap_decay(void) {
 
     int64_t released = 0;
     heap_each_quiescent(heap_decay_sweep, &released);
+    ray_heap_unlock_idle();
     return released;
 }
 
@@ -3418,6 +3778,7 @@ typedef struct { int64_t released; uint32_t now; bool near, act, dropped; } reli
  * keeps its slab cache. */
 static void heap_relieve_visit(ray_heap_t* h, void* ctx) {
     relieve_visit_t* v = ctx;
+    heap_lock_trim(h);
     if (v->near) {
         heap_drain_foreign(h);
         heap_flush_slabs(h);
@@ -3699,6 +4060,7 @@ void ray_heap_merge(ray_heap_t* src) {
         }
     }
     src->pool_count = 0;
+    heap_relock_pools(dst);   /* src's parked pools, unparked above */
 }
 
 /* --------------------------------------------------------------------------

@@ -46,6 +46,13 @@
  * segments; a failure is the lowest-row one (the scan-fail envelope), a
  * cancelled dispatch `cancel`.  NULL with *out set, or an owned error. */
 ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out);
+/* Rows [lo, hi) of `src` (lo a multiple of RAY_MORSEL_ELEMS), in row
+ * order, as a new plain vector: every vector the span touches is read once,
+ * by pool tasks over consecutive segments for a large span (the lowest-row
+ * failure, a cancelled dispatch `cancel`).  For a consumer that walks a
+ * column in pieces it evaluates whole, so that only one piece is decoded
+ * at a time.  NULL with *out set, or an owned error. */
+ray_t* ray_col_gather_span(ray_col_src_t* src, int64_t lo, int64_t hi, ray_t** out);
 /* The operators' entry for one table slot.  ray_col_gather_slot: the
  * RAY_ENCCOL a row gather reads by range (slot from ray_table_get_col_enc /
  * _idx), or NULL for none or a slice of an encoded column, which a source

@@ -199,12 +199,11 @@ static ray_t* sd_seg(sd_build_t* b, int64_t r) {
 
 /* Is segment-local vector v of the current segment a STR_DICT view (vv)?
  * 1 yes, 0 no (read it by range: another encoding, or a declined view,
- * which the range read decodes or reports), -1 an owned *err. */
+ * which the range read decodes), -1 an owned *err. */
 static int sd_view(sd_build_t* b, int64_t v, int64_t vrows, ray_t** err) {
     if (b->vv_at == v) return b->vv_codes;
     b->vv_at = -1;
-    const ray_enc_desc_t* d;
-    if ((*err = ray_enccol_chunk_descs_ref(b->se, v / RAY_ENC_VECS_PER_CHUNK, &d)) != NULL) return -1;
+    const ray_enc_desc_t* d = ray_enccol_descs(b->se, v / RAY_ENC_VECS_PER_CHUNK);
     int got = 0;
     if (d[v % RAY_ENC_VECS_PER_CHUNK].encoding == RAY_ENC_STR_DICT) {
         got = ray_enccol_vview(b->se, v, b->vv, err);

@@ -134,3 +134,26 @@
 ;; ascending: the smallest counts, again first-seen among the ties
 (set r9a (select {from: t9 by: [a b] c: (count v) asc: c take: 10}))
 (all (== (at r9a 'a) (take (at (select {from: f9 where: (== c (min c))}) 'a) 10))) -- true
+
+;; over a million rows, the top groups by count: the grouping cut, whichever
+;; route answers (the grouping when it fits the memory budget, else two
+;; passes: heavy hitters of the key hash, then the candidates' rows counted
+;; by key), the same groups, counts and order, the tied ones by first row.
+;; 1.2 M rows, about 700 K groups of one or two rows and
+;; seven heavy ones, three of them tied at 850 around the 5th place; a
+;; computed key (the minute) and a symbol key.
+(set n10 1200000)
+(set i10 (til n10))
+(set o10 (% (* i10 7919) n10))
+(set hc10 [900 880 860 850 850 850 840])
+(set h10 (as 'I64 (< o10 (sum hc10))))
+(set g10 (+ (* h10 (bin (- (sums hc10) hc10) o10)) (* (- 1 h10) (+ 100 (% (* (- o10 (sum hc10)) 13) 700000)))))
+(set t10 (table [u et s] (list (+ 400000000000000000 (* (div g10 3) 1000003)) (+ 2013.07.01D00:00:00.000000000 (* 60000000000 (% g10 1440))) (at ['a 'b 'c 'd] (% g10 4)))))
+(set f10 (xdesc (select {from: t10 by: {u: u m: (minute et) s: s} c: (count u)}) 'c))
+(set r10 (select {from: t10 by: {u: u m: (minute et) s: s} c: (count u) desc: c take: 5}))
+(at r10 'c) -- [900 880 860 850 850]
+(all (== (at r10 'u) (take (at f10 'u) 5))) -- true
+(all (== (at r10 'm) (take (at f10 'm) 5))) -- true
+(all (== (as 'STR (at r10 's)) (as 'STR (take (at f10 's) 5)))) -- true
+(set r10u (select {from: t10 by: u c: (count u) desc: c take: 2}))
+(at r10u 'c) -- [2640 2550]

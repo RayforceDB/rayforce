@@ -120,3 +120,16 @@ For example:
 (.parquet.splayed {compress: true} "events.parquet" "/tmp/events-native")
 (.parquet.parted {compress: true rows: 262144} "events.parquet" "/tmp/events-db" 'events)
 ```
+
+`.parquet.splayed` also takes `symfile`: `'shared` (the default) writes one
+`.sym` for every `SYM` column; `'column` gives each `SYM` column a symbol file
+of its own, `.<column>.sym` next to the column file, so a scan of one column
+(`like`, a grouping that resolves its strings) reads that column's strings
+only. A string that several columns hold is then stored once per column.
+`.db.splayed.get` finds the per-column files by themselves. Any other value is
+a `domain` error, and `.parquet.parted` refuses `'column`: every partition of a
+parted table resolves over the one root `.sym`.
+
+```lisp
+(.parquet.splayed {types: [I64 SYM SYM] symfile: 'column} "hits.parquet" "/tmp/hits")
+```

@@ -1,0 +1,71 @@
+;; A grouping by one FILE-domain symbol column whose ids are spread over a
+;; range wider than the row count (here 600k rows, ids across 0..600100 in
+;; the shared symbol file) counts into one array of the id range when that
+;; array fits the memory budget, instead of the radix scatter.  The answers
+;; are those of the same grouping over a selection that keeps every row but is
+;; not trivially true, which takes the radix route.  Plain, gen-2 compressed,
+;; parted and desc/asc take: N tables.
+(.sys.exec "rm -rf /tmp/rfl_dwsr/") -- 0
+(set N 600000)
+(set i (til N))
+(set pad (as 'SYMBOL (as 'STR i)))
+(set both (concat pad (as 'SYMBOL (as 'STR (+ N (til 100))))))
+(set m (as 'I64 (== 0 (% i 5))))
+(set key (at both (+ (* m (+ N (% i 100))) (* (- 1 m) (* 16 (% (* i 31) 40000))))))
+(set v (% i 97))
+(set T (table [pad key v] (list pad key v)))
+(.db.splayed.set "/tmp/rfl_dwsr/plain/" T)
+(.db.splayed.set "/tmp/rfl_dwsr/gen2/" T "/tmp/rfl_dwsr/gen2.sym" {compress: true})
+(set same (fn [A B] (and (== (count A) (count B)) (all (== (at (select {from: A asc: key}) 'c) (at (select {from: B asc: key}) 'c))) (all (== (as 'STR (at (select {from: A asc: key}) 'key)) (as 'STR (at (select {from: B asc: key}) 'key)))))))
+(set check (fn [F] (do (let A (select {from: F by: key c: (count key)})) (let B (select {from: F by: key c: (count key) where: (!= (% v 1000) 999)})) (let AS (select {from: F by: key c: (count key) s: (sum v)})) (let BS (select {from: F by: key c: (count key) s: (sum v) where: (!= (% v 1000) 999)})) (list (same A B) (all (== (at (select {from: AS asc: key}) 's) (at (select {from: BS asc: key}) 's))) (== (sum (at A 'c)) N) (count A)))))
+(set RP (check (.db.splayed.get "/tmp/rfl_dwsr/plain/")))
+(set RG (check (.db.splayed.get "/tmp/rfl_dwsr/gen2/" "/tmp/rfl_dwsr/gen2.sym")))
+(at RP 0) -- true
+(at RP 1) -- true
+(at RP 2) -- true
+(at RG 0) -- true
+(at RG 1) -- true
+(at RG 2) -- true
+(== (at RP 3) (at RG 3)) -- true
+(at RP 3) -- 30026
+;; top-N: counts equal the full grouping's largest / smallest
+(set F (.db.splayed.get "/tmp/rfl_dwsr/plain/"))
+(set O (select {from: F by: key c: (count key) where: (!= (% v 1000) 999)}))
+(set top (select {from: F by: key c: (count key) desc: c take: 10}))
+(count top) -- 10
+(all (== (at top 'c) (at (take (xdesc O 'c) 10) 'c))) -- true
+(set bot (select {from: F by: key c: (count key) asc: c take: 10}))
+(all (== (at bot 'c) (at (take (xasc O 'c) 10) 'c))) -- true
+;; ties at the boundary are cut by first row, as the radix route cuts them:
+;; the same groups, not only the same counts
+(set topr (select {from: F by: key c: (count key) desc: c take: 10 where: (!= (% v 1000) 999)}))
+(set botr (select {from: F by: key c: (count key) asc: c take: 10 where: (!= (% v 1000) 999)}))
+(all (== (as 'STR (at top 'key)) (as 'STR (at topr 'key)))) -- true
+(all (== (as 'STR (at bot 'key)) (as 'STR (at botr 'key)))) -- true
+(set O2 (select {from: F by: key c: (count key) s: (sum v) where: (!= (% v 1000) 999)}))
+(set top2 (select {from: F by: key c: (count key) s: (sum v) desc: c take: 10}))
+(all (== (as 'STR (at top2 'key)) (as 'STR (at (take (xdesc O2 'c) 10) 'key)))) -- true
+(all (== (at top2 's) (at (take (xdesc O2 'c) 10) 's))) -- true
+(set F2 (.db.splayed.get "/tmp/rfl_dwsr/gen2/" "/tmp/rfl_dwsr/gen2.sym"))
+(all (== (as 'STR (at (select {from: F2 by: key c: (count key) desc: c take: 10}) 'key)) (as 'STR (at top 'key)))) -- true
+(all (== (as 'STR (at (select {from: F2 by: key c: (count key) asc: c take: 10}) 'key)) (as 'STR (at bot 'key)))) -- true
+;; an unordered take: N is the first N groups in first-seen order
+(set first5 (select {from: F by: key c: (count key) take: 5}))
+(count first5) -- 5
+(all (== (as 'STR (at first5 'key)) (as 'STR (take (distinct (at F 'key)) 5)))) -- true
+(== (sum (at first5 'c)) (count (where (in (at F 'key) (at first5 'key))))) -- true
+;; the nested form: the top-N result as the source of another select
+(set nested (select {from: (select {from: F by: key c: (count key) desc: c take: 10}) one: 1 key: key c: c}))
+(all (== (at nested 'c) (at top 'c))) -- true
+;; the same rows as three partitions of one parted table
+(set wr (fn [k] (.db.splayed.set (format "/tmp/rfl_dwsr/parted/%/t/" (+ k 1)) (table [pad key v] (list (at pad (+ (* k 200000) (til 200000))) (at key (+ (* k 200000) (til 200000))) (at v (+ (* k 200000) (til 200000))))) "/tmp/rfl_dwsr/parted/.sym" {compress: false})))
+(count (map wr (til 3))) -- 3
+(set PT (.db.parted.get "/tmp/rfl_dwsr/parted/" 't))
+(count PT) -- 600000
+(set RT (check PT))
+(at RT 0) -- true
+(at RT 1) -- true
+(at RT 2) -- true
+(at RT 3) -- 30026
+(all (== (at (select {from: PT by: key c: (count key) desc: c take: 10}) 'c) (at top 'c))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dwsr/") -- 0

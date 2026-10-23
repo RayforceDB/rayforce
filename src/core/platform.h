@@ -153,6 +153,12 @@ typedef void (*ray_thread_fn)(void* arg);
 void* ray_vm_alloc(size_t size);
 void  ray_vm_free(void* ptr, size_t size);
 void* ray_vm_map_file(const char* path, size_t* out_size);
+/* The identity of a mapped file, read from the descriptor the mapping was
+ * made from (not the path, which may name another file by now): inode,
+ * size, modification and status-change times in ns.  valid is false where
+ * the platform gives none (Windows, WASM). */
+typedef struct { bool valid; uint64_t ino, size; int64_t mtime_ns, ctime_ns; } ray_file_id_t;
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id);
 void* ray_vm_map_fd_ro(int fd, size_t size);
 void  ray_vm_unmap_file(void* ptr, size_t size);
 /* Zeroed writable memory released by ray_vm_unmap_file (a generated file image). */
@@ -198,6 +204,29 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment);
  * if the hint was issued (Linux THP); false where unsupported (macOS, WASM,
  * Windows). */
 bool ray_vm_hugepage(void* ptr, size_t size);
+/* Lock [ptr, ptr+size) of an anonymous mapping against swap-out, page by
+ * page as each is faulted in (Linux: mlock2 MLOCK_ONFAULT); munmap unlocks
+ * it.  False where it cannot be — RLIMIT_MEMLOCK, a kernel before 4.4, a
+ * platform other than Linux — and nothing is locked then (errno says why). */
+bool    ray_vm_lock(void* ptr, size_t size);
+/* Unlock a range ray_vm_lock locked; its pages stay. */
+void    ray_vm_unlock(void* ptr, size_t size);
+/* ray_vm_release / ray_vm_release_block for a locked range, which
+ * MADV_DONTNEED refuses: MADV_DONTNEED_LOCKED (Linux 5.18), else unlock,
+ * release and lock again.  0: released, still locked; 1: released, left
+ * unlocked (the lock again failed); -1: nothing released. */
+int     ray_vm_release_locked(void* ptr, size_t size);
+int     ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage);
+/* For a block whose lock is not known: MADV_DONTNEED, and where that is
+ * refused for a lock, as ray_vm_release_block_locked.  Same returns. */
+int     ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage);
+/* Whether this process holds CAP_IPC_LOCK, past RLIMIT_MEMLOCK (Linux). */
+bool    ray_os_has_ipc_lock(void);
+/* Bytes of this process's locked mappings (VmLck); 0 where unknown. */
+int64_t ray_vm_locked_bytes(void);
+/* Raise RLIMIT_MEMLOCK's soft limit to its hard limit (Linux; a no-op
+ * elsewhere, and where it already is). */
+void    ray_os_raise_memlock(void);
 
 /* --------------------------------------------------------------------------
  * Threading API

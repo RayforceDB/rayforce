@@ -85,6 +85,10 @@ static int munmap(void* p, size_t len) {
 #endif
 #if defined(__linux__)
 #include <sys/inotify.h>  /* IN_ACCESS: when the cgroup files are read */
+#include <sys/resource.h> /* RLIMIT_MEMLOCK: the heap's lock fallback */
+#include <sys/wait.h>     /* waitpid: its child */
+#include <sys/syscall.h>  /* SYS_mlock2: memory locked outside the heap */
+#include <errno.h>
 #endif
 #include <fcntl.h>
 #include <unistd.h>
@@ -2875,6 +2879,7 @@ static void relieve_env_begin(relieve_env_t* e) {
     e->base = ray_tl_heap;
     e->n = 0;
     e->wm = ray_heap_anon_watermark();
+    ray_heap_note_activity();                  /* an idle stamp left by an earlier test would let (.sys.gc) decay this one's pools */
     static ray_runtime_t bare;                 /* no cgroup directory */
     e->rt = __RUNTIME;
     if (!__RUNTIME) __RUNTIME = &bare;
@@ -5195,6 +5200,640 @@ static test_result_t test_anon_watermark_spill(void) {
     PASS();
 }
 
+/* ---- Locking the heap against swap (heap_lock) ------------------------- *
+ *
+ * The heap locks only where the RAM limit is known — heap tests run with no
+ * runtime of their own (relieve_env_begin's bare one) — and within the
+ * smaller of the watermark and half the limit: lock_env_begin sets a limit
+ * large enough for what the tests lock, and puts the old one back. */
+
+#if defined(RAY_OS_LINUX)
+typedef struct { int64_t locked, vmlck, failed, skipped; } lock_mark_t;
+static lock_mark_t lock_mark(void) {
+    return (lock_mark_t){ ray_heap_locked_bytes(), ray_vm_locked_bytes(),
+                          ray_heap_lock_failures(), ray_heap_lock_skipped() };
+}
+
+/* Whether `bytes` more can be locked here: the switch on, and
+ * RLIMIT_MEMLOCK — raised to its hard limit, as the binary does at startup
+ * (ray_os_raise_memlock) — leaving room, or CAP_IPC_LOCK past it. */
+static bool lock_room(int64_t bytes) {
+    bool on = ray_heap_set_lock(true);
+    ray_heap_set_lock(on);
+    if (!on) return false;                       /* RAY_HEAP_MLOCK=0 */
+    ray_os_raise_memlock();
+    if (ray_os_has_ipc_lock()) return true;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) return false;
+    if (rl.rlim_cur == RLIM_INFINITY) return true;
+    return ray_vm_locked_bytes() + bytes + RELIEVE_POOL <= (int64_t)rl.rlim_cur;
+}
+
+static int64_t g_lock_saved_lim;
+static void lock_env_begin(relieve_env_t* e) {
+    relieve_env_begin(e);                        /* the watermark far away */
+    g_lock_saved_lim = __RUNTIME->ram_limit;
+    __RUNTIME->ram_limit = INT64_C(1) << 40;     /* the bound: half of it */
+}
+static void lock_env_end(relieve_env_t* e, ray_heap_t* h) {
+    __RUNTIME->ram_limit = g_lock_saved_lim;
+    relieve_env_end(e, h, NULL);
+}
+#endif
+
+/* A pool mapped under the watermark is locked against swap-out — the whole
+ * mapping, in the heap's count and in VmLck — but nothing is faulted in for
+ * it (MLOCK_ONFAULT: a page never touched is not resident), and unmapping
+ * the pool unlocks it. */
+static test_result_t test_lock_pool_under_watermark(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    if (!lock_room(RELIEVE_POOL)) SKIP("RLIMIT_MEMLOCK leaves no room for a pool");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    lock_mark_t m0 = lock_mark();
+    ray_t* a = ray_alloc(RELIEVE_HALF);          /* a pool of its own */
+    lock_mark_t m1 = lock_mark();
+    const char* untouched = a ? (const char*)a + (8u << 20) : NULL;
+    int res = untouched ? relieve_resident(untouched) : -1;
+    if (a) {
+        memset(ray_data(a), 0x5A, 1u << 20);
+        ray_free(a);
+    }
+    lock_env_end(&e, h);                         /* the pool unmapped */
+    lock_mark_t m2 = lock_mark();
+    if (!a) SKIP("block unavailable");
+    TEST_ASSERT_EQ_I(m1.locked - m0.locked, RELIEVE_POOL);
+    TEST_ASSERT_EQ_I(m1.vmlck - m0.vmlck, RELIEVE_POOL);
+    if (relieve_mincore()) TEST_ASSERT(res == 0, "locking faulted nothing in (MLOCK_ONFAULT)");
+    TEST_ASSERT_EQ_I(m2.locked, m0.locked);
+    TEST_ASSERT_EQ_I(m2.vmlck, m0.vmlck);
+    PASS();
+#endif
+}
+
+/* Only what fits under the watermark is locked: past it, a pool or a direct
+ * block over a spill file, and a pool, a direct block or a large sys block
+ * taken from RAM because no spill file can be made, are all left unlocked.
+ * Under it a direct block and a sys block of a megabyte or more are locked
+ * as a pool is. */
+static test_result_t test_lock_not_past_watermark(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    const size_t dsz = 40u * 1024 * 1024 - 128;
+    const size_t big = 2u * 1024 * 1024;
+    if (!lock_room(2 * RELIEVE_POOL + (int64_t)dsz + (int64_t)big))
+        SKIP("RLIMIT_MEMLOCK leaves no room for the blocks");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    /* Unlocked memory first, a pool and a large block, so that the bound
+     * alone (the locked bytes within the watermark) would leave room to lock
+     * past the watermark: only the watermark's own check stands then. */
+    bool was = ray_heap_set_lock(false);
+    ray_t* pad1 = ray_alloc(RELIEVE_HALF);
+    ray_t* pad2 = ray_alloc(4 * dsz);
+    ray_heap_set_lock(was);
+    ray_t* a1 = ray_alloc(RELIEVE_HALF);
+    ray_heap_set_anon_watermark(ray_heap_anon_committed());
+    lock_mark_t m0 = lock_mark();
+    ray_t* s1 = ray_alloc(RELIEVE_HALF);         /* a pool over a spill file */
+    ray_t* d1 = ray_alloc(dsz);                  /* a direct block over one */
+    bool filed = s1 && relieve_pool_is_backed(h, s1) && d1 && ray_direct_file_backed(d1);
+    lock_mark_t m1 = lock_mark();
+    /* A heap with no spill directory takes its next pool from RAM, and a
+     * large block; a sys block past the watermark too, with none. */
+    const char* saved_dir = getenv("RAY_HEAP_SWAP");
+    char saved[256] = "";
+    if (saved_dir) snprintf(saved, sizeof(saved), "%s", saved_dir);
+    setenv("RAY_HEAP_SWAP", "/nonexistent-rayforce-spill", 1);
+    ray_heap_t* r = relieve_heap_new(&e);
+    bool ram = false;
+    lock_mark_t m2 = m1;
+    if (r) {
+        ray_t* b = ray_alloc(RELIEVE_HALF);
+        ray_t* d = ray_alloc(dsz);
+        int64_t c0 = ray_heap_anon_committed();
+        void* sb = ray_sys_alloc(big);
+        ram = b && heap_find_pool(r, b) >= 0 && !relieve_pool_is_backed(r, b)
+           && d && !ray_direct_file_backed(d)
+           && sb && ray_heap_anon_committed() > c0;   /* the sys block in RAM */
+        m2 = lock_mark();
+        if (sb) ray_sys_free(sb);
+        if (d) ray_free(d);
+        ray_heap_direct_cache_drain();
+        ray_heap_destroy();
+    }
+    if (saved_dir) setenv("RAY_HEAP_SWAP", saved, 1);
+    else unsetenv("RAY_HEAP_SWAP");
+    ray_tl_heap = h;
+    if (d1) ray_free(d1);
+    if (s1) ray_free(s1);
+    /* Under the watermark: a direct block, a sys block. */
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_heap_direct_cache_drain();
+    lock_mark_t m3 = lock_mark();
+    ray_t* d2 = ray_alloc(dsz);
+    lock_mark_t m4 = lock_mark();
+    int64_t dmap = d2 ? (int64_t)ray_direct_map_size(d2) : 0;
+    void* sys = ray_sys_alloc(big);
+    lock_mark_t m5 = lock_mark();
+    if (sys) ray_sys_free(sys);
+    lock_mark_t m6 = lock_mark();
+    if (d2) ray_free(d2);
+    ray_heap_direct_cache_drain();
+    lock_mark_t m7 = lock_mark();
+    if (a1) ray_free(a1);
+    if (pad2) ray_free(pad2);
+    if (pad1) ray_free(pad1);
+    ray_heap_direct_cache_drain();
+    lock_env_end(&e, h);
+    if (!pad1 || !pad2 || !a1 || !filed || !d2 || !sys) SKIP("blocks or spill files unavailable");
+    TEST_ASSERT(m1.locked == m0.locked && m1.vmlck == m0.vmlck,
+                "past the watermark, spill files were not locked");
+    TEST_ASSERT(ram, "no spill directory: the pool, the large block and the sys block came from RAM");
+    TEST_ASSERT(m2.locked == m1.locked && m2.vmlck == m1.vmlck,
+                "past the watermark, a pool, a direct block and a sys block from RAM were not locked");
+    TEST_ASSERT_EQ_I(m4.locked - m3.locked, dmap);
+    TEST_ASSERT_EQ_I(m5.locked - m4.locked, (int64_t)(big + 4096));
+    TEST_ASSERT_EQ_I(m5.vmlck - m3.vmlck, dmap + (int64_t)(big + 4096));
+    TEST_ASSERT_EQ_I(m6.locked, m4.locked);
+    TEST_ASSERT_EQ_I(m7.locked, m3.locked);
+    PASS();
+#endif
+}
+
+/* The bound: nothing is locked where the RAM limit is not known, nor with
+ * locking off (RAY_HEAP_MLOCK=0, run through the binary in
+ * lock_rlimit_fallback); and no more than half the RAM limit (or the watermark,
+ * the smaller) — a pool past it is mapped unlocked, its bytes counted as
+ * skipped. */
+static test_result_t test_lock_bound(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    if (!lock_room(2 * RELIEVE_POOL)) SKIP("RLIMIT_MEMLOCK leaves no room for two pools");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    int64_t got[4] = { -1, -1, -1, -1 }, skip[4] = { -1, -1, -1, -1 };
+    bool missing = false;
+    /* 0: no RAM limit; 1: locking off; 2: room for one pool; 3: none */
+    for (int pass = 0; pass < 4; pass++) {
+        ray_heap_t* h = relieve_heap_new(&e);
+        if (!h) { missing = true; break; }
+        int64_t base = ray_heap_locked_bytes();
+        __RUNTIME->ram_limit = pass == 0 ? 0
+                             : pass == 3 ? 2 * (base + RELIEVE_MB)
+                             : 2 * (base + RELIEVE_POOL + RELIEVE_MB);
+        bool was = pass == 1 ? ray_heap_set_lock(false) : true;
+        lock_mark_t m0 = lock_mark();
+        ray_t* a = ray_alloc(RELIEVE_HALF);
+        lock_mark_t m1 = lock_mark();
+        if (pass == 1) ray_heap_set_lock(was);
+        if (!a) missing = true;
+        got[pass] = m1.locked - m0.locked;
+        skip[pass] = m1.skipped - m0.skipped;
+        if (a) ray_free(a);
+        __RUNTIME->ram_limit = INT64_C(1) << 40;
+        ray_heap_destroy();
+        ray_tl_heap = e.base;
+    }
+    lock_env_end(&e, NULL);
+    if (missing) SKIP("no fresh heap, or its block unavailable");
+    TEST_ASSERT(got[0] == 0, "no RAM limit known: nothing locked");
+    TEST_ASSERT(got[1] == 0, "locking off: nothing locked");
+    TEST_ASSERT_EQ_I(got[2], RELIEVE_POOL);
+    TEST_ASSERT(got[3] == 0 && skip[3] == RELIEVE_POOL,
+                "past half the RAM limit the pool was left unlocked, its bytes skipped");
+    PASS();
+#endif
+}
+
+/* A locked pool still hands back the pages of its free blocks when asked
+ * (ray_heap_release_pages; pass 5 and the idle decay alike): MADV_DONTNEED
+ * refuses a locked range, so the release takes MADV_DONTNEED_LOCKED, or
+ * before Linux 5.18 unlocks, releases and locks the range again — locked as
+ * before.  The next block cut there holds data. */
+static test_result_t test_lock_release_pages(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    if (!lock_room(RELIEVE_POOL)) SKIP("RLIMIT_MEMLOCK leaves no room for a pool");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    lock_mark_t m0 = lock_mark();
+    ray_t* a1 = ray_alloc(RELIEVE_HALF);         /* the pool, locked */
+    ray_t* b = ray_alloc((8u << 20) - 4096);     /* order 23, from its cascade */
+    lock_mark_t m1 = lock_mark();
+    const char* probe = b ? (const char*)b + (4u << 20) : NULL;
+    int res0 = -1, res1 = -1;
+    if (b) {
+        memset(ray_data(b), 0x5A, (8u << 20) - 4096);
+        res0 = relieve_resident(probe);
+        ray_free(b);
+        ray_heap_release_pages();
+        res1 = relieve_resident(probe);
+    }
+    lock_mark_t m2 = lock_mark();
+    ray_t* c = ray_alloc((8u << 20) - 4096);
+    bool reused = c && (const char*)c == (const char*)b;
+    if (c) {
+        memset(ray_data(c), 0x3C, (8u << 20) - 4096);
+        reused = reused && ((const unsigned char*)ray_data(c))[4u << 20] == 0x3C;
+        ray_free(c);
+    }
+    if (a1) ray_free(a1);
+    lock_env_end(&e, h);
+    if (!a1 || !b) SKIP("blocks unavailable");
+    TEST_ASSERT_EQ_I(m1.locked - m0.locked, RELIEVE_POOL);
+    if (relieve_mincore()) {
+        TEST_ASSERT(res0 == 1, "the written block was resident");
+        TEST_ASSERT(res1 == 0, "the locked pool's free block handed its pages back");
+    }
+    TEST_ASSERT(m2.locked == m1.locked && m2.vmlck == m1.vmlck && m2.failed == m1.failed,
+                "the pool stayed locked, nothing failed");
+    TEST_ASSERT(reused, "the next block cut there holds data");
+    PASS();
+#endif
+}
+
+/* Dead memory is not kept locked: a pool parked at a boundary is unlocked —
+ * and locked again when an allocation takes it back — and (.sys.gc)
+ * unlocks the direct-block cache's blocks, which stay cached. */
+static test_result_t test_lock_dead_memory(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    const size_t dsz = 40u * 1024 * 1024 - 128;
+    if (!lock_room(2 * RELIEVE_POOL + (int64_t)dsz)) SKIP("RLIMIT_MEMLOCK leaves no room");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    ray_t* a1 = ray_alloc(RELIEVE_HALF);
+    ray_t* a2 = ray_alloc(RELIEVE_HALF);         /* a second pool */
+    lock_mark_t m0 = lock_mark();
+    if (a2) ray_free(a2);                         /* its pool empty */
+    relieve_pressure(RELIEVE_MB);                 /* near the watermark: it parks */
+    ray_heap_relieve();
+    lock_mark_t m1 = lock_mark();
+    int parked = relieve_parked(h);
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_t* a3 = ray_alloc(RELIEVE_HALF);         /* takes the parked pool back */
+    lock_mark_t m2 = lock_mark();
+    bool back = a3 && h->pool_count == 2 && relieve_parked(h) == 0;
+    /* A direct block freed into the cache stays locked until (.sys.gc). */
+    ray_heap_direct_cache_drain();
+    ray_t* d = ray_alloc(dsz);
+    int64_t dmap = d ? (int64_t)ray_direct_map_size(d) : 0;
+    if (d) ray_free(d);
+    lock_mark_t m3 = lock_mark();
+    int64_t committed = ray_heap_anon_committed();
+    ray_t* rc = ray_gc_fn(NULL, 0);
+    if (rc) ray_release(rc);
+    lock_mark_t m4 = lock_mark();
+    bool cached = ray_heap_anon_committed() == committed;
+    ray_heap_direct_cache_drain();
+    lock_mark_t m5 = lock_mark();
+    if (a3) ray_free(a3);
+    if (a1) ray_free(a1);
+    lock_env_end(&e, h);
+    if (!a1 || !a2 || !d) SKIP("blocks unavailable");
+    TEST_ASSERT(parked == 1, "the empty pool was parked");
+    TEST_ASSERT_EQ_I(m0.locked - m1.locked, RELIEVE_POOL);
+    TEST_ASSERT_EQ_I(m0.vmlck - m1.vmlck, RELIEVE_POOL);
+    TEST_ASSERT(back, "an allocation took the parked pool back");
+    TEST_ASSERT_EQ_I(m2.locked, m0.locked);
+    TEST_ASSERT_EQ_I(m3.locked - m2.locked, dmap);
+    TEST_ASSERT_EQ_I(m4.locked, m2.locked);
+    TEST_ASSERT_EQ_I(m4.vmlck, m2.vmlck);
+    TEST_ASSERT(cached, "(.sys.gc) left the block cached");
+    TEST_ASSERT_EQ_I(m5.locked, m2.locked);
+    PASS();
+#endif
+}
+
+/* A locked pool unmapped — an empty one handed back before a large block
+ * crosses the watermark (heap_make_room) — comes off the locked bytes. */
+static test_result_t test_lock_unmap(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    const size_t dsz = 40u * 1024 * 1024 - 128;
+    if (!lock_room(2 * RELIEVE_POOL)) SKIP("RLIMIT_MEMLOCK leaves no room for two pools");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    ray_t* a1 = ray_alloc(RELIEVE_HALF);
+    ray_t* a2 = ray_alloc(RELIEVE_HALF);
+    if (a2) ray_free(a2);                         /* its pool empty, still mapped */
+    lock_mark_t m0 = lock_mark();
+    uint32_t pools0 = h->pool_count;
+    ray_heap_set_anon_watermark(ray_heap_anon_committed());
+    ray_t* d = ray_alloc(dsz);                   /* past it: the empty pool goes first */
+    lock_mark_t m1 = lock_mark();
+    uint32_t pools1 = h->pool_count;
+    if (d) ray_free(d);
+    if (a1) ray_free(a1);
+    lock_env_end(&e, h);
+    if (!a1 || !a2 || !d) SKIP("blocks unavailable");
+    TEST_ASSERT(pools0 == 2 && pools1 == 1, "the empty pool was unmapped");
+    TEST_ASSERT_EQ_I(m0.locked - m1.locked, RELIEVE_POOL);
+    TEST_ASSERT_EQ_I(m0.vmlck - m1.vmlck, RELIEVE_POOL);
+    PASS();
+#endif
+}
+
+/* What was unlocked while out of service is locked again when it comes
+ * back: a direct block the cache kept through (.sys.gc), taken again; and a
+ * parked pool put back by ray_heap_release_pages (the idle decay and a
+ * heap merge alike), locked after its pages went. */
+static test_result_t test_lock_back_in_service(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    const size_t dsz = 40u * 1024 * 1024 - 128;
+    if (!lock_room(2 * RELIEVE_POOL + (int64_t)dsz)) SKIP("RLIMIT_MEMLOCK leaves no room");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    ray_t* a1 = ray_alloc(RELIEVE_HALF);         /* the heap's first pool, for (.sys.gc)'s result */
+    ray_heap_direct_cache_drain();
+    ray_t* d = ray_alloc(dsz);
+    int64_t dmap = d ? (int64_t)ray_direct_map_size(d) : 0;
+    const void* dbase = d;
+    if (d) ray_free(d);                          /* cached, locked */
+    lock_mark_t m0 = lock_mark();
+    ray_t* rc = ray_gc_fn(NULL, 0);              /* unlocked, still cached */
+    if (rc) ray_release(rc);
+    lock_mark_t m1 = lock_mark();
+    ray_t* d2 = ray_alloc(dsz);                  /* the same block, back in service */
+    lock_mark_t m2 = lock_mark();
+    bool same = d2 && (const void*)d2 == dbase;
+    if (d2) ray_free(d2);
+    ray_heap_direct_cache_drain();
+    /* A parked pool, unlocked; put back by ray_heap_release_pages. */
+    ray_t* a2 = ray_alloc(RELIEVE_HALF);
+    if (a2) ray_free(a2);
+    relieve_pressure(RELIEVE_MB);
+    ray_heap_relieve();
+    lock_mark_t m3 = lock_mark();
+    int parked = relieve_parked(h);
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_heap_release_pages();
+    lock_mark_t m4 = lock_mark();
+    int parked_after = relieve_parked(h);
+    /* Parked again, then put back by the idle decay. */
+    relieve_pressure(RELIEVE_MB);
+    ray_heap_relieve();
+    lock_mark_t m5 = lock_mark();
+    int parked2 = relieve_parked(h);
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_heap_set_decay_ms(0);
+    ray_heap_note_activity();
+    int64_t swept = ray_heap_decay();
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
+    lock_mark_t m6 = lock_mark();
+    if (a1) ray_free(a1);
+    lock_env_end(&e, h);
+    if (!d || !a1 || !a2) SKIP("blocks unavailable");
+    TEST_ASSERT_EQ_I(m0.locked - m1.locked, dmap);
+    TEST_ASSERT(same, "the cached block was taken again");
+    TEST_ASSERT_EQ_I(m2.locked - m1.locked, dmap);
+    TEST_ASSERT_EQ_I(m2.vmlck - m1.vmlck, dmap);
+    TEST_ASSERT(parked == 1 && parked_after == 0, "the pool was parked, then put back");
+    TEST_ASSERT_EQ_I(m4.locked - m3.locked, RELIEVE_POOL);
+    TEST_ASSERT_EQ_I(m4.vmlck - m3.vmlck, RELIEVE_POOL);
+    TEST_ASSERT(parked2 == 1 && m4.locked - m5.locked == RELIEVE_POOL, "parked again, unlocked");
+    TEST_ASSERT(swept >= 0, "the decay ran");
+    TEST_ASSERT_EQ_I(m6.locked - m5.locked, RELIEVE_POOL);
+    TEST_ASSERT_EQ_I(m6.vmlck - m5.vmlck, RELIEVE_POOL);
+    PASS();
+#endif
+}
+
+/* A direct block too large for the cache (more than a sixteenth of the
+ * budget: the path of the GB-scale scratch blocks) is unmapped when freed,
+ * and comes off the locked bytes. */
+static test_result_t test_lock_big_direct(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    const size_t big = (size_t)1 << 30;         /* never written: address space only */
+    if (!lock_room((int64_t)big)) SKIP("RLIMIT_MEMLOCK leaves no room for 1 GB");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_direct_cache_drain();
+    /* The watermark past the block, its sixteenth (the cache's budget) short of it. */
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + (INT64_C(3) << 30));
+    lock_mark_t m0 = lock_mark();
+    int64_t c0 = ray_heap_anon_committed();
+    ray_t* d = ray_alloc(big);
+    lock_mark_t m1 = lock_mark();
+    int64_t dmap = d ? (int64_t)ray_direct_map_size(d) : 0;
+    bool fits = d && (int64_t)ray_direct_map_size(d) > ray_heap_anon_watermark() / 16;
+    if (d) ray_free(d);
+    lock_mark_t m2 = lock_mark();
+    int64_t c2 = ray_heap_anon_committed();
+    lock_env_end(&e, NULL);
+    if (!d) SKIP("1 GB block unavailable");
+    TEST_ASSERT(fits, "the block is larger than the cache's budget");
+    TEST_ASSERT_EQ_I(m1.locked - m0.locked, dmap);
+    TEST_ASSERT_EQ_I(c2, c0);
+    TEST_ASSERT_EQ_I(m2.locked, m0.locked);
+    TEST_ASSERT_EQ_I(m2.vmlck, m0.vmlck);
+    PASS();
+#endif
+}
+
+/* A lock the pre-check lets through but the kernel refuses — the limit
+ * taken by memory locked outside the heap — is counted once; the next
+ * mappings are not tried again (each try takes the mapping lock and walks
+ * every mapping), only counted as skipped, until the locked bytes fall or
+ * the limit changes. */
+static test_result_t test_lock_refusal_remembered(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    if (geteuid() == 0 || ray_os_has_ipc_lock()) SKIP("CAP_IPC_LOCK: past any RLIMIT_MEMLOCK");
+    if (!lock_room(4 * RELIEVE_POOL)) SKIP("RLIMIT_MEMLOCK leaves no room");
+    struct rlimit saved;
+    if (getrlimit(RLIMIT_MEMLOCK, &saved) != 0) SKIP("RLIMIT_MEMLOCK unreadable");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    /* The soft limit two pools above what is locked now, and memory locked
+     * outside the heap — invisible to its count — taking all but a megabyte
+     * of that. */
+    int64_t now = ray_vm_locked_bytes();
+    struct rlimit low = saved;
+    low.rlim_cur = (rlim_t)(now + 2 * RELIEVE_POOL);
+    size_t eat = (size_t)(2 * RELIEVE_POOL - RELIEVE_MB);
+    void* outside = mmap(NULL, eat, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    bool set = outside != MAP_FAILED && setrlimit(RLIMIT_MEMLOCK, &low) == 0;
+    bool ate = set && syscall(SYS_mlock2, outside, eat, 1 /* MLOCK_ONFAULT */) == 0;
+    lock_mark_t m0 = lock_mark();
+    ray_t* a1 = ate ? ray_alloc(RELIEVE_HALF) : NULL;   /* refused by the kernel */
+    lock_mark_t m1 = lock_mark();
+    ray_t* a2 = ate ? ray_alloc(RELIEVE_HALF) : NULL;   /* not tried */
+    lock_mark_t m2 = lock_mark();
+    if (outside != MAP_FAILED) munmap(outside, eat);
+    if (set) setrlimit(RLIMIT_MEMLOCK, &saved);
+    if (a2) ray_free(a2);
+    if (a1) ray_free(a1);
+    lock_env_end(&e, h);
+    if (!ate) SKIP("could not take the limit from outside the heap");
+    TEST_ASSERT(a1 && a2, "the pools were mapped, unlocked");
+    TEST_ASSERT(m1.failed == m0.failed + 1 && m1.locked == m0.locked,
+                "the kernel's refusal was counted, nothing locked");
+    TEST_ASSERT(m2.failed == m1.failed && m2.skipped - m1.skipped == RELIEVE_POOL,
+                "the next pool was not tried again, its bytes skipped");
+    PASS();
+#endif
+}
+
+/* A watermark lowered under what is locked — by an embedding, say — is met
+ * at the next boundary: the cached direct blocks are unlocked first (dead
+ * memory), then pools, until the locked bytes fit. */
+static test_result_t test_lock_trim(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    const size_t dsz = 40u * 1024 * 1024 - 128;
+    if (!lock_room(2 * RELIEVE_POOL + (int64_t)dsz)) SKIP("RLIMIT_MEMLOCK leaves no room");
+    relieve_env_t e;
+    lock_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { lock_env_end(&e, NULL); SKIP("no fresh heap"); }
+    ray_heap_direct_cache_drain();
+    int64_t base = ray_heap_locked_bytes();
+    ray_t* a1 = ray_alloc(RELIEVE_HALF);
+    ray_t* a2 = ray_alloc(RELIEVE_HALF);
+    ray_t* d = ray_alloc(dsz);
+    int64_t dmap = d ? (int64_t)ray_direct_map_size(d) : 0;
+    if (d) ray_free(d);                          /* cached, locked */
+    lock_mark_t m1 = lock_mark();
+    ray_heap_set_anon_watermark(base + RELIEVE_POOL + RELIEVE_MB);   /* room for one */
+    ray_heap_relieve();
+    lock_mark_t m2 = lock_mark();
+    bool live = a1 && a2 && d;
+    if (a2) ray_free(a2);
+    if (a1) ray_free(a1);
+    ray_heap_direct_cache_drain();
+    lock_env_end(&e, h);
+    if (!live) SKIP("blocks unavailable");
+    TEST_ASSERT_EQ_I(m1.locked - base, 2 * RELIEVE_POOL + dmap);
+    TEST_ASSERT_EQ_I(m2.locked - base, RELIEVE_POOL);
+    TEST_ASSERT_EQ_I(m1.vmlck - m2.vmlck, RELIEVE_POOL + dmap);
+    PASS();
+#endif
+}
+
+/* The binary raises RLIMIT_MEMLOCK's soft limit to its hard one at startup
+ * (ray_os_raise_memlock), and where the limit leaves no room the heap works
+ * on unlocked, the bytes counted as skipped — no system call made for them.
+ * Run through ./rayforce with the limit set before exec, so the lowered
+ * limit dies with the child and no thread of this process is forked with a
+ * heap.  Root, or CAP_IPC_LOCK, is past any limit: nothing to check then. */
+#if defined(RAY_OS_LINUX)
+/* ./rayforce with RLIMIT_MEMLOCK soft/hard set, running `script`; its first
+ * output line into out[]; false if it did not run. */
+static bool lock_cli_run(const char* script, rlim_t soft, rlim_t hard, bool off,
+                         char* out, size_t n) {
+    int fd[2];
+    if (pipe(fd) != 0) return false;
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return false; }
+    if (pid == 0) {
+        struct rlimit rl = { soft, hard };
+        dup2(fd[1], 1);
+        close(fd[0]);
+        close(fd[1]);
+        if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) _exit(64);
+        if (off) {
+            char* envp[] = { (char*)"RAY_HEAP_MLOCK=0", NULL };
+            execle("./rayforce", "./rayforce", "-c", "1", script, (char*)NULL, envp);
+        } else {
+            unsetenv("RAY_HEAP_MLOCK");          /* whatever the suite runs under */
+            execl("./rayforce", "./rayforce", "-c", "1", script, (char*)NULL);
+        }
+        _exit(65);
+    }
+    close(fd[1]);
+    size_t len = 0;
+    ssize_t r;
+    while (len + 1 < n && (r = read(fd[0], out + len, n - 1 - len)) != 0) {
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        len += (size_t)r;
+    }
+    out[len] = 0;
+    close(fd[0]);
+    int status = 0;
+    pid_t w;
+    do w = waitpid(pid, &status, 0); while (w < 0 && errno == EINTR);
+    return w == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif
+
+static test_result_t test_lock_rlimit_fallback(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("the heap locks against swap on Linux only");
+#else
+    if (geteuid() == 0 || ray_os_has_ipc_lock()) SKIP("CAP_IPC_LOCK: past any RLIMIT_MEMLOCK");
+    if (access("./rayforce", X_OK) != 0) SKIP("no ./rayforce to run");
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) SKIP("RLIMIT_MEMLOCK unreadable");
+    char script[64];
+    snprintf(script, sizeof(script), "/tmp/rf_lock_fallback_%d.rfl", (int)getpid());
+    int sf = open(script, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (sf < 0) SKIP("cannot write the script");
+    const char* text =
+        "(set x (til 1000000))\n"
+        "(set m (.sys.mem))\n"
+        "(println (format \"% % % %\" (get m 'locked-bytes) (get m 'lock-failed)"
+        " (get m 'lock-skipped) (sum x)))\n";
+    ssize_t wr = write(sf, text, strlen(text));
+    close(sf);
+    if (wr != (ssize_t)strlen(text)) { unlink(script); SKIP("cannot write the script"); }
+    char out0[256], out1[256];
+    /* No room at all: hard and soft 0. */
+    bool ran0 = lock_cli_run(script, 0, 0, false, out0, sizeof(out0));
+    /* Soft 0 under the hard limit: the binary raises it. */
+    bool room = rl.rlim_max == RLIM_INFINITY || rl.rlim_max >= (rlim_t)(4 * RELIEVE_POOL);
+    bool ran1 = room && lock_cli_run(script, 0, rl.rlim_max, false, out1, sizeof(out1));
+    /* The same with RAY_HEAP_MLOCK=0: nothing locked, nothing skipped. */
+    char out2[256];
+    bool ran2 = room && lock_cli_run(script, 0, rl.rlim_max, true, out2, sizeof(out2));
+    unlink(script);
+    long long l2 = -1, f2 = -1, s2 = -1, x2 = -1;
+    if (ran2) sscanf(out2, "%lld %lld %lld %lld", &l2, &f2, &s2, &x2);
+    long long l0 = -1, f0 = -1, s0 = -1, x0 = -1, l1 = -1, f1 = -1, s1 = -1, x1 = -1;
+    if (ran0) sscanf(out0, "%lld %lld %lld %lld", &l0, &f0, &s0, &x0);
+    if (ran1) sscanf(out1, "%lld %lld %lld %lld", &l1, &f1, &s1, &x1);
+    TEST_ASSERT(ran0, "./rayforce ran with RLIMIT_MEMLOCK 0");
+    TEST_ASSERT(x0 == 499999500000LL, "unlocked, the heap worked as ever");
+    TEST_ASSERT(l0 == 0 && s0 > 0, "nothing locked, the bytes counted as skipped");
+    TEST_ASSERT(f0 == 0, "no lock tried past the limit");
+    if (!room) SKIP("the hard RLIMIT_MEMLOCK leaves no room: the raise not checked");
+    TEST_ASSERT(ran1, "./rayforce ran with the soft limit at 0");
+    TEST_ASSERT(x1 == 499999500000LL && l1 > 0,
+                "the soft limit raised to the hard one, the heap locked");
+    TEST_ASSERT(ran2 && x2 == 499999500000LL && l2 == 0 && f2 == 0 && s2 == 0,
+                "RAY_HEAP_MLOCK=0: nothing locked, nothing tried");
+    PASS();
+#endif
+}
+
 /* ---- Slab byte-budget caps -------------------------------------------- *
  *
  * Verify that ray_heap_init computes slab_cap[] correctly from the default
@@ -5627,6 +6266,17 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_park",             test_relieve_park,                heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
+    { "heap/lock_pool_under_watermark", test_lock_pool_under_watermark, heap_setup, heap_teardown },
+    { "heap/lock_not_past_watermark",  test_lock_not_past_watermark,      heap_setup, heap_teardown },
+    { "heap/lock_release_pages",       test_lock_release_pages,           heap_setup, heap_teardown },
+    { "heap/lock_bound",               test_lock_bound,                   heap_setup, heap_teardown },
+    { "heap/lock_dead_memory",         test_lock_dead_memory,             heap_setup, heap_teardown },
+    { "heap/lock_trim",                test_lock_trim,                    heap_setup, heap_teardown },
+    { "heap/lock_unmap",               test_lock_unmap,                   heap_setup, heap_teardown },
+    { "heap/lock_back_in_service",     test_lock_back_in_service,         heap_setup, heap_teardown },
+    { "heap/lock_big_direct",          test_lock_big_direct,              heap_setup, heap_teardown },
+    { "heap/lock_refusal_remembered",  test_lock_refusal_remembered,      heap_setup, heap_teardown },
+    { "heap/lock_rlimit_fallback",     test_lock_rlimit_fallback,         heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },
     { "heap/slab_gc_drains_wide",      test_slab_gc_drains_wide,         heap_setup, heap_teardown },
     { "heap/retain_atom_obj",          test_retain_owned_refs_atom_obj,  heap_setup, heap_teardown },

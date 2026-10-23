@@ -218,19 +218,13 @@ static ray_t* acc_put_list(gather_acc_t* a, const ray_col_range_t* v, int64_t ba
  * ray_col_src_gather_points (the body read once, then one lane unpacked,
  * one code looked up or one run found per row) instead of being decoded
  * whole; callers hand it at most RAY_COL_POINT_ROWS rows and it declines
- * past the codec's limit.  SYM ids come back as ids (checked against the
- * domain bound), bitmap nulls as flags.  A declined read (DELTA_BP, a
- * viewed RAW vector, a plain or materialized source) leaves the vector to
- * the cursor, which decodes or reports it.  A point-served value lies
- * inside its vector's statistics (`corrupt` otherwise), and those nest
- * inside the chunk's directory statistics (descriptor validation), so a
- * guarded source (stats_guard) needs no further check:
- * ray_enccol_check_dir's rule holds for every value served. */
+ * past the codec's limit.  SYM ids come back as ids, bitmap nulls as
+ * flags.  A declined read (DELTA_BP, a viewed RAW vector, a plain or
+ * materialized source) leaves the vector to the cursor, which decodes it. */
 #define GATHER_POINT_ROWS RAY_COL_POINT_ROWS
 
 /* The source's values can be point-read: an encoded integer, temporal or
- * SYM column (ray_col_src_gather_points checks each id against the domain
- * bound, as the decode does). */
+ * SYM column. */
 static bool gather_point_src(const ray_col_src_t* src) {
     if (!ray_col_src_encoded(src)) return false;
     switch (src->type) {
@@ -399,6 +393,7 @@ typedef struct {
     const uint32_t* offs;
     const uint16_t* idx;
     bool            point;    /* gather_point_src: few-row segments are point-read */
+    int64_t         end;      /* the last segment ends here: the source end, or a span's */
 } gsel_in_t;
 
 /* The first segment in [s, s1) whose flag is not RAY_SEL_NONE (0), else
@@ -425,7 +420,7 @@ static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t*
         if (in->flags && (s = gsel_next(in->flags, s, s1)) >= s1) break;   /* the vectors are never read */
         uint8_t f = in->flags ? in->flags[s] : RAY_SEL_ALL;
         int64_t lo = s * RAY_MORSEL_ELEMS;
-        int64_t hi = lo + RAY_MORSEL_ELEMS < src->len ? lo + RAY_MORSEL_ELEMS : src->len;
+        int64_t hi = lo + RAY_MORSEL_ELEMS < in->end ? lo + RAY_MORSEL_ELEMS : in->end;
         if (f == RAY_SEL_ALL) {
             /* a segment may span two views (a parted segment boundary) */
             for (int64_t r = lo; r < hi && !err; ) {
@@ -483,6 +478,7 @@ static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t*
  * to the envelope keyed by the task's first row. */
 typedef struct {
     gsel_in_t        in;
+    int64_t          s_base;   /* task t starts at segment s_base + t * spt */
     int64_t          nseg, spt;
     const int64_t*   pos0;
     gather_acc_t*    acc;
@@ -493,7 +489,7 @@ static void gsel_task(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     gsel_par_t* c = (gsel_par_t*)ctxp;
     for (int64_t t = start; t < end; t++) {
-        int64_t s0 = t * c->spt, s1 = s0 + c->spt < c->nseg ? s0 + c->spt : c->nseg;
+        int64_t s0 = c->s_base + t * c->spt, s1 = s0 + c->spt < c->nseg ? s0 + c->spt : c->nseg;
         int64_t key = s0 * RAY_MORSEL_ELEMS;
         if (ray_scan_fail_skip(&c->fail, key)) continue;
         ray_col_fixed_t fixed;                   /* the task's decode vector on its stack */
@@ -598,7 +594,7 @@ ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
     int64_t nseg = m ? (int64_t)m->n_segs : (src->len + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
     gsel_in_t in = { .src = src, .flags = sel ? ray_rowsel_flags(sel) : NULL,
                      .offs = sel ? ray_rowsel_offsets(sel) : NULL, .idx = sel ? ray_rowsel_idx(sel) : NULL,
-                     .point = gather_point_src(src) };
+                     .point = gather_point_src(src), .end = src->len };
     /* the tasks: the pool's grain of segments each, at most the ring's
      * initial capacity of them; one runs here when the pool cannot help */
     ray_pool_t* pool = ray_pool_get();
@@ -659,6 +655,56 @@ ray_t* ray_col_gather_sel(ray_col_src_t* src, ray_t* sel, ray_t** out) {
     }
     if (pos0 != pos0_one) ray_free_raw(pos0);
     ray_free_raw(acc);
+    if (err) { acc_abort(&a); return err; }
+    return acc_finish(&a, src, out);
+}
+
+ray_t* ray_col_gather_span(ray_col_src_t* src, int64_t lo, int64_t hi, ray_t** out) {
+    *out = NULL;
+    if (lo < 0 || hi < lo || hi > src->len || lo % RAY_MORSEL_ELEMS)
+        return ray_error("range", "gather: rows [%lld, %lld) of %lld", (long long)lo, (long long)hi, (long long)src->len);
+    const int64_t n = hi - lo;
+    gather_acc_t a;
+    ray_t* err = acc_open(&a, src, n);
+    if (err) return err;
+    /* every row of every vector is read: no point reads */
+    gsel_in_t in = { .src = src, .end = hi };
+    const int64_t s_lo = lo / RAY_MORSEL_ELEMS, s_hi = (hi + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    const int64_t nseg = s_hi - s_lo;
+    ray_pool_t* pool = ray_pool_get();
+    int64_t spt = RAY_DISPATCH_MORSELS;
+    while ((nseg + spt - 1) / spt > (int64_t)RAY_POOL_INIT_TASKS) spt *= 2;
+    int64_t ntask = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD) ? (nseg + spt - 1) / spt : 1;
+    if (ntask <= 1) {
+        ray_col_fixed_t fixed;                   /* the decode vector on the stack */
+        ray_col_cursor_t cur;
+        ray_col_cursor_init_lent(&cur, src, &fixed);
+        err = gsel_range(&in, &a, &cur, s_lo, s_hi, 0);
+        ray_col_cursor_free(&cur);
+    } else {
+        /* task t: segments [s_lo + t * spt, + spt), at output position
+         * their first row less lo */
+        int64_t* pos0 = (int64_t*)ray_alloc_raw((size_t)(ntask + 1) * sizeof(int64_t));
+        gather_acc_t* acc = (gather_acc_t*)ray_calloc_raw((size_t)ntask * sizeof(gather_acc_t));
+        if (!pos0 || !acc) {
+            ray_free_raw(pos0);
+            ray_free_raw(acc);
+            acc_abort(&a);
+            return ray_error("oom", "gather tasks");
+        }
+        for (int64_t t = 0; t < ntask; t++) pos0[t] = (s_lo + t * spt) * RAY_MORSEL_ELEMS - lo;
+        pos0[ntask] = n;
+        gsel_par_t c = { .in = in, .s_base = s_lo, .nseg = s_hi, .spt = spt, .pos0 = pos0, .acc = acc };
+        for (int64_t t = 0; t < ntask; t++) { acc[t].out = a.out; acc[t].ow = a.ow; }
+        ray_scan_fail_init(&c.fail);
+        ray_pool_dispatch_n(pool, gsel_task, &c, (uint32_t)ntask);
+        err = ray_scan_fail_finish(&c.fail, pool);
+        for (int64_t t = 0; t < ntask; t++) a.nulls |= acc[t].nulls;
+        if (!err) err = gsel_merge_pools(acc, ntask, pos0, &a);
+        for (int64_t t = 0; t < ntask; t++) if (acc[t].pool) ray_release(acc[t].pool);
+        ray_free_raw(pos0);
+        ray_free_raw(acc);
+    }
     if (err) { acc_abort(&a); return err; }
     return acc_finish(&a, src, out);
 }

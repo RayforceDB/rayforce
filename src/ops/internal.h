@@ -1397,6 +1397,10 @@ int64_t ray_expr_test_leaf_runs(void);
 /* exec.c test hook: membership tests the sparse filter refinement took
  * (refine_in_keep) since process start. */
 uint64_t ray_exec_test_refine_in(void);
+/* exec.c test hook: filter chains pruned from their conjuncts' chunk
+ * statistics before running (exec_filter_chain_prune), and the selection
+ * segments (vectors) they dropped, since process start. */
+void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
 /* exec.c test hook: later `in` conjuncts over a single-file generation-2
  * column answered by range (in_sel_single_within) since process start. */
 uint64_t ray_exec_test_in_single_within(void);

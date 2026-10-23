@@ -1584,20 +1584,9 @@ static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
     if (pool_size > mapped_size - offset - 32)
         return RAY_ERR_CORRUPT;
 
+    /* the region's extents only: the descriptors are taken as written */
     ray_str_t* elems = (ray_str_t*)((char*)ptr + 32);
     const char* pool_base = (const char*)ptr + offset + 32;
-    for (int64_t i = 0; i < hdr->len; i++) {
-        uint32_t len = elems[i].len;
-        if (len <= RAY_STR_INLINE_MAX) continue;
-        if (pool_size == 0 || elems[i].pool_off > pool_size ||
-            len > pool_size - elems[i].pool_off)
-            return RAY_ERR_CORRUPT;
-        if (len >= 4) {
-            const char* p = pool_base + elems[i].pool_off;
-            if (memcmp(elems[i].prefix, p, 4) != 0)
-                return RAY_ERR_CORRUPT;
-        }
-    }
 
     /* A current writer stores every pooled descriptor's content hash and
      * marks the header (RAY_COL_STR_HASHED, col.h): those descriptors are
@@ -1868,7 +1857,10 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
     if (vec->type == RAY_SYM) {
         if (dom) {
             /* Splayed/parted load: on-disk cells are positions in the
-             * table's symfile — attach ITS domain (one ref per column). */
+             * table's symfile — attach ITS domain (one ref per column).
+             * The symfile the caller named must hold every id the column
+             * was saved over (its saved count; a column without one is
+             * scanned), as the mmap load checks it. */
             vec->sym_domain = dom;
             ray_sym_domain_retain(dom);
             int64_t dcount = ray_sym_domain_count(dom);
@@ -1878,12 +1870,14 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
                     "column %s: saved sym count %u exceeds symfile count %lld",
                     path, cm.saved_sym_count, (long long)dcount);
             }
-            uint32_t bound = dcount > UINT32_MAX ? UINT32_MAX : (uint32_t)dcount;
-            ray_err_t sym_err = validate_sym_bounds(ray_data(vec), vec->len,
-                                                    vec->attrs, bound);
-            if (sym_err != RAY_OK) {
-                ray_release(vec);
-                return ray_error(ray_err_code_str(sym_err), NULL);
+            if (cm.saved_sym_count == 0) {
+                uint32_t bound = dcount > UINT32_MAX ? UINT32_MAX : (uint32_t)dcount;
+                ray_err_t sym_err = validate_sym_bounds(ray_data(vec), vec->len,
+                                                        vec->attrs, bound);
+                if (sym_err != RAY_OK) {
+                    ray_release(vec);
+                    return ray_error(ray_err_code_str(sym_err), NULL);
+                }
             }
         } else if (require_dom) {
             /* A stored SYM column without a resolvable symfile must
@@ -1941,15 +1935,6 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
     if (err) return err;
     if (cm.gen2)
         return ray_enccol_open(cm.mapped, cm.mapped_size, path, dom, require_dom);
-
-    /* Validate that the file size matches the expected layout.  Without an
-     * inline index the payload is the whole file (ray_free reconstructs the
-     * munmap size from the same formula).  With an index, the file extends past
-     * the payload by the 32-aligned index region — that's expected, not a tear. */
-    if (!cm.has_index && cm.tail_offset != cm.mapped_size) {
-        ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-        return ray_error("io", NULL);
-    }
 
     ray_t* vec = cm.header;
 

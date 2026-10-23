@@ -9,6 +9,7 @@
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "table/table.h"
+#include "table/domain.h"   /* ray_sym_domain_path: a column's own symbol file */
 #include "store/part.h"
 #include "store/splay.h"
 #include "ops/idxop.h"
@@ -20,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
 #include <pthread.h>
 #include <sys/wait.h>   /* the skeptic probes' child imports */
@@ -320,8 +322,8 @@ static test_result_t test_pq_parallel(void) {
 static void pq_remove_native(const char* dir, const char** columns, int n) {
     char path[512];
     for (int i = 0; i < n; i++) { snprintf(path,sizeof(path),"%s/%s",dir,columns[i]); unlink(path); }
-    const char* special[] = {".d",".sym",".sym.lk"};
-    for (int i = 0; i < 3; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
+    const char* special[] = {".d",".sym",".sym.lk",".sym.ix"};
+    for (int i = 0; i < 4; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
     rmdir(dir);
 }
 /* The direct import picks its pass layout from memory; RAY_PQ_PASS_COLS
@@ -906,7 +908,6 @@ static test_result_t test_pq_small_stack(void) {
 #if defined(__linux__)
 #include <signal.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 /* A row group's chunk ends with a flush of the bytes its stream still
  * buffers (glibc writes whole blocks of a large write at once and keeps the
  * tail).  The file size limit here falls inside that tail of the first
@@ -2050,7 +2051,7 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
             i += len; lit = i;
         } else i++;
     }
-    if (lit < n) pqx_lit(o, s + lit, n - lit);
+    if (n > lit) pqx_lit(o, s + lit, n - lit);   /* no literal of no data (s may be NULL) */
 }
 /* pqx_page's checksums (PQX_CRC, PQX_CRCFLIP): 0 none; 1 each page's
  * CRC-32 in its header (PageHeader 4); 2 that, and a dictionary page's
@@ -3667,6 +3668,202 @@ static test_result_t test_pq_worker_messages(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* The entries of a symbol file (its header count), -1 if it cannot be read. */
+static int64_t pq_symfile_count(const char* path) {
+    FILE* f = fopen(path, "rb");
+    uint8_t head[12];
+    int64_t count = -1;
+    if (f && fread(head, 1, 12, f) == 12) memcpy(&count, head + 4, 8);
+    if (f) fclose(f);
+    return count;
+}
+/* An import under symfile 'column: its column symbol files too. */
+static void pq_remove_symcol(const char* dir, const char** columns, int n) {
+    char path[512];
+    const char* sfx[] = {"", ".ix", ".lk"};
+    for (int i = 0; i < n; i++)
+        for (int k = 0; k < 3; k++) { snprintf(path, sizeof(path), "%s/.%s.sym%s", dir, columns[i], sfx[k]); unlink(path); }
+    pq_remove_native(dir, columns, n);
+}
+/* {types: [...] symfile: 'column}, with compress: true when asked. */
+static ray_t* pq_symcol_opts(ray_t* types, const char* layout, bool compress) {
+    int64_t keys[3] = {ray_sym_intern("types",5), ray_sym_intern("symfile",7), ray_sym_intern("compress",8)};
+    int n = compress ? 3 : 2;
+    ray_t* values = ray_list_new(n);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_sym(ray_sym_intern(layout, strlen(layout)));
+    if (compress) ((ray_t**)ray_data(values))[2] = ray_bool(true);
+    values->len = n;
+    return ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, n), values);
+}
+/* The distinct strings of column c of the shared import at `dir` (its
+ * positions in the one .sym), with "" counted once: what that column's own
+ * symbol file holds. */
+static int64_t pq_col_distinct(const char* dir, int c) {
+    char sym[200]; snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    int64_t words = pq_symfile_count(sym);
+    ray_t* t = ray_read_splayed(dir, sym);
+    if (words <= 0 || !t || RAY_IS_ERR(t)) { if (t && RAY_IS_ERR(t)) ray_error_free(t); else if (t) ray_release(t); return -1; }
+    uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)words);
+    int64_t n = 1;   /* "" at position 0 */
+    ray_t* col = ray_table_get_col_idx(t, c);
+    if (seen && col) {
+        memset(seen, 0, (size_t)words);
+        seen[0] = 1;
+        for (int64_t r = 0; r < col->len; r++) {
+            int64_t pos = ray_read_sym(ray_data(col), r, RAY_SYM, col->attrs);
+            if (pos >= 0 && pos < words && !seen[pos]) { seen[pos] = 1; n++; }
+        }
+    } else n = -1;
+    if (seen) ray_sys_free(seen);
+    ray_release(t);
+    return n;
+}
+/* symfile 'column: each symbol column its own symbol file, `.s.sym` and
+ * `.t.sym`, and no `.sym`.  Every row's string is the shared import's; each
+ * file holds its column's distinct strings and "" (t's vocabulary meets
+ * s's: the shared file holds the common strings once, the column files once
+ * each); in every way the import runs: direct in one pass and column by
+ * column, grouped (a grouped import over each column's own dictionary), on
+ * one worker and four, generation 2 too, and (debug builds) mixed: s direct
+ * from its seeded dictionaries, t grouped.  'shared is the default's
+ * layout; any other value is refused, and so is 'column for .parquet.parted. */
+static test_result_t test_pq_symfile_column(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], ref[160], path[220];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-symcol-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-symcol-%d", (int)getpid());
+    snprintf(ref, sizeof(ref), "/tmp/rayforce-pq-symcol-%d-ref", (int)getpid());
+    const char* names[] = {"x","s","t"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int bad = 0;
+    for (int data = 0; data < 2; data++) {
+        /* data 1: s dictionary-encoded and low-cardinality (pq_sym_mixed_modes'
+         * file), for the mixed import */
+        pq_synth_t = data ? pq_synth_highcard : NULL; pq_synth_dict = data ? 1u << 1 : 0;
+        pq_synth_fn fn = data ? pq_synth_lowcard : pq_synth_mixed;
+        int64_t rows = 20000;
+        TEST_ASSERT_TRUE(pq_synth(src, rows, data ? 4 : 9, fn));
+        TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+        ray_t* res = ray_parquet_splayed_typed(src, ref, types);   /* the shared layout */
+        TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+        int64_t want_s = pq_col_distinct(ref, 1), want_t = pq_col_distinct(ref, 2);
+        int64_t words = pq_sym_count(ref);
+        TEST_ASSERT_TRUE(want_s > 1 && want_t > 1 && words > 1);
+        if (!data) TEST_ASSERT_TRUE(want_s + want_t - 1 > words);   /* the columns share strings */
+        char ramv[32] = "";
+#if defined(DEBUG)
+        if (data) {
+            /* the memory that mixes them, as pq_sym_mixed_modes finds it */
+            size_t cap = (size_t)1 << 16;
+            char* trace = (char*)ray_sys_alloc(cap);
+            TEST_ASSERT_TRUE(trace != NULL);
+            pq_set_symmode("direct");
+            res = pq_traced_import(src, dir, types, trace, cap);
+            pq_set_symmode(NULL);
+            TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+            pq_remove_native(dir, names, 3);
+            double bs = pq_trace_line_num(trace, "parquet symcol: col=s ", "vocab_bytes");
+            snprintf(ramv, sizeof(ramv), "%lld", (long long)((int64_t)bs * 64));
+            ray_sys_free(trace);
+        }
+#endif
+        for (int run = 0; run < 6; run++) {
+            /* 0 one pass, 1 column by column, 2 grouped, 3 grouped on four
+             * workers, 4 generation 2, 5 mixed (debug builds, data 1) */
+            if (run == 5 && !ramv[0]) continue;
+            TEST_ASSERT_EQ_I(pq_pool(run == 3 ? 4 : 1), RAY_OK);
+            if (run == 1) pq_set_layout("1");
+            if (run == 2 || run == 3) pq_set_symmode("grouped");
+            if (run == 5) pq_set_env("RAY_PQ_SYM_RAM", ramv);
+            ray_t* opts = pq_symcol_opts(types, "column", run == 4);
+            size_t cap = (size_t)1 << 16;
+            char* trace = (char*)ray_sys_alloc(cap);
+            TEST_ASSERT_TRUE(trace != NULL);
+            res = pq_traced_import(src, dir, opts, trace, cap);
+            pq_sym_env_clear();
+            ray_release(opts);
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  %d/%d: import failed: %s\n", data, run, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                snprintf(path, sizeof(path), "%s.parquet-partial", dir);
+                pq_remove_symcol(path, names, 3);
+                ray_sys_free(trace);
+                bad++; continue;
+            }
+            TEST_ASSERT_EQ_I(res->i64, rows); ray_release(res);
+            if (run == 5 && !(pq_trace_line_has(trace, "parquet symcol: col=s ", " mode=direct") &&
+                              pq_trace_line_has(trace, "parquet symcol: col=t ", " mode=grouped") &&
+                              strstr(trace, "parquet symseed:"))) {
+                fprintf(stderr, "  %d/%d: not mixed\n", data, run); bad++;
+            }
+            if ((run == 2 || run == 3) && !pq_trace_line_has(trace, "parquet symcol: col=s ", " mode=grouped")) bad++;
+            ray_sys_free(trace);
+            struct stat st;
+            snprintf(path, sizeof(path), "%s/.sym", dir);
+            if (stat(path, &st) == 0) { fprintf(stderr, "  %d/%d: a shared .sym\n", data, run); bad++; }
+            snprintf(path, sizeof(path), "%s/.s.sym", dir);
+            int64_t ns = pq_symfile_count(path);
+            snprintf(path, sizeof(path), "%s/.t.sym", dir);
+            int64_t nt = pq_symfile_count(path);
+            if (ns != want_s || nt != want_t) {
+                fprintf(stderr, "  %d/%d: s %lld (want %lld), t %lld (want %lld)\n", data, run,
+                        (long long)ns, (long long)want_s, (long long)nt, (long long)want_t);
+                bad++;
+            }
+            if (!pq_synth_check(dir, rows, fn)) { fprintf(stderr, "  %d/%d: rows differ\n", data, run); bad++; }
+            /* the two columns over two domains, each its own file */
+            ray_t* t = ray_read_splayed(dir, NULL);
+            if (t && !RAY_IS_ERR(t)) {
+                ray_t* a = ray_table_get_col_idx(t, 1);
+                ray_t* b = ray_table_get_col_idx(t, 2);
+                const char* pa = a ? ray_sym_domain_path(ray_sym_vec_domain(a)) : NULL;
+                const char* pb = b ? ray_sym_domain_path(ray_sym_vec_domain(b)) : NULL;
+                if (!pa || !pb || !strstr(pa, "/.s.sym") || !strstr(pb, "/.t.sym")) bad++;
+                ray_release(t);
+            } else { if (t) ray_error_free(t); bad++; }
+            pq_remove_symcol(dir, names, 3);
+        }
+        pq_remove_native(ref, names, 3);
+        unlink(src);
+    }
+    pq_synth_t = NULL; pq_synth_dict = 0;
+    /* 'shared: the default's single file */
+    TEST_ASSERT_TRUE(pq_synth(src, 2000, 2, pq_synth_mixed));
+    ray_t* opts = pq_symcol_opts(types, "shared", false);
+    ray_t* res = ray_parquet_splayed_typed(src, dir, opts);
+    ray_release(opts);
+    TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+    TEST_ASSERT_TRUE(pq_sym_count(dir) > 1);
+    snprintf(path, sizeof(path), "%s/.s.sym", dir);
+    struct stat st;
+    TEST_ASSERT_TRUE(stat(path, &st) != 0);
+    pq_remove_native(dir, names, 3);
+    /* any other value, and 'column for a parted import */
+    opts = pq_symcol_opts(types, "bogus", false);
+    res = ray_parquet_splayed_typed(src, dir, opts);
+    ray_release(opts);
+    TEST_ASSERT_TRUE(res && RAY_IS_ERR(res));
+    TEST_ASSERT_STR_EQ(ray_err_code(res), "domain");
+    ray_error_free(res);
+    TEST_ASSERT_TRUE(stat(dir, &st) != 0);
+    opts = pq_symcol_opts(types, "column", false);
+    res = ray_parquet_parted_typed(src, dir, "hits", opts);
+    ray_release(opts);
+    TEST_ASSERT_TRUE(res && RAY_IS_ERR(res));
+    TEST_ASSERT_STR_EQ(ray_err_code(res), "domain");
+    ray_error_free(res);
+    snprintf(path, sizeof(path), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(stat(dir, &st) != 0 && stat(path, &st) != 0);
+    unlink(src);
+    ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
 const test_entry_t parquet_entries[] = {
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
@@ -3695,6 +3892,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
     {"parquet/sym_grouped_layout",test_pq_sym_grouped_layout,pq_setup,pq_teardown},
     {"parquet/sym_mixed_modes",test_pq_sym_mixed_modes,pq_setup,pq_teardown},
+    {"parquet/symfile_column",test_pq_symfile_column,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},

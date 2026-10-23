@@ -167,7 +167,7 @@ static void range_plain(ray_t* v, int64_t start, int64_t n, ray_col_range_t* out
     out->dom = v->type == RAY_SYM ? ray_sym_vec_domain(v) : NULL;
 }
 
-static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n, bool guard,
+static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n,
                         ray_col_scratch_t* sc, ray_col_range_t* out) {
     int64_t vec = start / RAY_ENC_VEC;
     int64_t off = start % RAY_ENC_VEC;
@@ -180,18 +180,15 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n, bool guard,
     }
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
-    const ray_enc_desc_t* descs;
-    ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);  /* in place; validated once per column */
-    if (err) return err;
+    const ray_enc_desc_t* descs = ray_enccol_descs(e, c);
+    ray_t* err;
     if (e->type != RAY_STR && e->type != RAY_GUID) {
-        /* a RAW vector without nulls is its own decode: read it in place
-         * (the consumer guard checks it as it checks a decode).  An
-         * integer one counts its bytes as delivered, so the read-once
+        /* a RAW vector without nulls is its own decode: read it in place.
+         * An integer one counts its bytes as delivered, so the read-once
          * counts of a key hold whatever its vectors' encodings; a float
          * one counts none (Task 9). */
         const void* pv = ray_enccol_raw_view(e, c, j, &descs[j]);
         if (pv) {
-            if (guard && (err = ray_enccol_check_dir(e, c, j, pv, (int)vlen, false)) != NULL) return err;
             if (e->type != RAY_F64 && e->type != RAY_F32) scratch_count(sc, e, (uint64_t)vlen * ray_enccol_esz(e));
             out->data = (const uint8_t*)pv + (size_t)off * ray_enccol_esz(e);
             out->n = n;
@@ -217,10 +214,8 @@ static ray_t* range_enc(ray_enccol_t* e, int64_t start, int64_t n, bool guard,
         }
     }
     uint64_t nb = 0;
-    err = ray_enccol_decode_into(e, c, j, &descs[j], sc->fixed, sc->pool, 0, sc->pool_cap, &nb);
+    err = ray_enccol_decode_into(e, c, j, &descs[j], sc->fixed, sc->pool, 0, &nb);
     if (err) return err;                                    /* the view is never returned */
-    /* the consumer guard: its memory was sized from the chunk's statistics */
-    if (guard && (err = ray_enccol_check_dir(e, c, j, sc->fixed, (int)vlen, descs[j].n_nulls > 0)) != NULL) return err;
     scratch_count(sc, e, nb);
     out->data = sc->fixed + (size_t)off * ray_enccol_esz(e);
     out->n = n;
@@ -266,11 +261,11 @@ static ray_t* src_seg_off(ray_col_src_t* s, ray_t* w, const int64_t** out) {
 }
 
 /* off: the parted wrapper's segment offsets (src_seg_off), NULL otherwise. */
-static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off, bool guard,
+static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off,
                         ray_col_scratch_t* sc, ray_col_range_t* out) {
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
-        if (e->kind == RAY_ENCCOL_SINGLE) return range_enc(e, start, n, guard, sc, out);
+        if (e->kind == RAY_ENCCOL_SINGLE) return range_enc(e, start, n, sc, out);
         obj = e->wrapper;
     }
     if (RAY_IS_PARTED(obj->type)) {
@@ -286,9 +281,7 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off
         int64_t sl = off[lo + 1] - off[lo];              /* > 0: start < off[lo + 1] */
         int64_t local = start - off[lo];
         if (n > sl - local) n = sl - local;              /* never cross a segment */
-        /* the guard of a parted source checks each segment against its
-         * own statistics (ray_col_src_parted_chunks serves them) */
-        return range_obj(segs[lo], local, n, NULL, guard, sc, out);
+        return range_obj(segs[lo], local, n, NULL, sc, out);
     }
     range_plain(obj, start, n, out);
     return NULL;
@@ -304,7 +297,7 @@ static ray_t* range_src(ray_col_src_t* s, ray_t* obj, int64_t start, int64_t n,
         ray_t* err = src_seg_off(s, w, &off);
         if (err) return err;
     }
-    return range_obj(obj, start, n, off, s->stats_guard, sc, out);
+    return range_obj(obj, start, n, off, sc, out);
 }
 
 ray_t* ray_col_range(ray_col_src_t* src, int64_t start, int64_t n,
@@ -330,15 +323,9 @@ ray_t* ray_col_range_wide(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
     ray_enccol_t* e = ray_enccol_of(src->obj);
     if (e->kind != RAY_ENCCOL_SINGLE || start >= e->len) return NULL;
     int64_t vec = start / RAY_ENC_VEC;
-    /* under the consumer guard only a vector already found inside its
-     * chunk's statistics; otherwise the range read checks it */
-    if (src->stats_guard && !ray_enccol_dir_vec_ok(e, vec / RAY_ENC_VECS_PER_CHUNK, (int)(vec % RAY_ENC_VECS_PER_CHUNK)))
-        return NULL;
     if (n != ray_enc_vec_len(e->len, vec)) return NULL;
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
-    const ray_enc_desc_t* descs;
-    ray_t* err = ray_enccol_chunk_descs_ref(e, c, &descs);
-    if (err) return err;
+    const ray_enc_desc_t* descs = ray_enccol_descs(e, c);
     uint64_t nb = 0;
     if (ray_enccol_decode_wide(e, c, (int)(vec % RAY_ENC_VECS_PER_CHUNK), &descs[vec % RAY_ENC_VECS_PER_CHUNK],
                                wide, dst, &nb)) {
@@ -390,7 +377,6 @@ ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
                           uint8_t attrs, void* dst, int64_t* got) {
     *got = 0;
     if (!src || start < 0 || n <= 0 || start >= src->len) return NULL;
-    if (src->stats_guard) return NULL;             /* guarded: the range read checks each vector */
     ray_enccol_t* e;
     int64_t local;
     ray_t* err;
@@ -402,13 +388,12 @@ ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
     if (vlen > n) return NULL;
     int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
     int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
-    const ray_enc_desc_t* descs;
-    if ((err = ray_enccol_chunk_descs_ref(e, c, &descs)) != NULL) return err;
+    const ray_enc_desc_t* descs = ray_enccol_descs(e, c);
     const size_t esz = ray_enccol_esz(e);
     const char* pv = ray_enccol_raw_view(e, c, j, &descs[j]);
     if (!pv) {
         uint64_t nb = 0;
-        if ((err = ray_enccol_decode_into(e, c, j, &descs[j], dst, NULL, 0, 0, &nb)) != NULL) return err;
+        if ((err = ray_enccol_decode_into(e, c, j, &descs[j], dst, NULL, 0, &nb)) != NULL) return err;
         scratch_count(sc, e, nb);
         *got = vlen;
         atomic_fetch_add_explicit(&g_into_calls, 1, memory_order_relaxed);
@@ -425,9 +410,7 @@ ray_t* ray_col_range_into(ray_col_src_t* src, int64_t start, int64_t n, ray_col_
         if (rows + l2 > n) break;
         int64_t c2 = v2 / RAY_ENC_VECS_PER_CHUNK;
         int j2 = (int)(v2 % RAY_ENC_VECS_PER_CHUNK);
-        const ray_enc_desc_t* d2;
-        ray_t* e2 = ray_enccol_chunk_descs_ref(e, c2, &d2);
-        if (e2) { ray_error_free(e2); break; }          /* the vector's own read reports it */
+        const ray_enc_desc_t* d2 = ray_enccol_descs(e, c2);
         if (ray_enccol_raw_view(e, c2, j2, &d2[j2]) != pv + (size_t)rows * esz) break;
         rows += l2;
     }
@@ -445,9 +428,6 @@ ray_t* ray_col_src_plain(ray_col_src_t* s, ray_t** out) {
     if (s->obj->type != RAY_ENCCOL) { *out = s->obj; return NULL; }
     ray_t* p = ray_enccol_materialize(s->obj);     /* the object's once-state, cached */
     if (RAY_IS_ERR(p)) return p;
-    /* the consumer guard over the whole materialization: once per column */
-    ray_t* gerr = s->stats_guard ? ray_enccol_check_dir_all(s->obj) : NULL;
-    if (gerr) return gerr;
     *out = p;
     return NULL;
 }
@@ -483,15 +463,7 @@ uint8_t ray_col_src_esz(const ray_col_src_t* s) { return ray_sym_elem_size(s->ty
 ray_t* ray_col_src_ready(const ray_col_src_t* s) {
     if (!s || !s->obj) return NULL;
     if (s->obj->type != RAY_ENCCOL) return s->obj;
-    ray_t* pk = ray_enccol_decoded_peek(s->obj);   /* published materialization, or NULL */
-    if (pk && s->stats_guard) {
-        /* the consumer guard: in place only once the materialization is
-         * inside its statistics (cached per column); otherwise not ready,
-         * and the range reads or ray_col_src_plain report the failure */
-        ray_t* gerr = ray_enccol_check_dir_all(s->obj);
-        if (gerr) { ray_error_free(gerr); return NULL; }
-    }
-    return pk;
+    return ray_enccol_decoded_peek(s->obj);        /* published materialization, or NULL */
 }
 
 const void* ray_col_src_base(const ray_col_src_t* s) {
@@ -526,12 +498,7 @@ ray_t* ray_col_cursor_at(ray_col_cursor_t* c, int64_t r, const ray_col_range_t**
     ray_t* obj = s->obj;
     if (obj->type == RAY_ENCCOL) {
         ray_t* pk = ray_enccol_decoded_peek(obj);
-        if (pk) {
-            /* the guard over a published materialization: once per column */
-            ray_t* gerr = s->stats_guard ? ray_enccol_check_dir_all(obj) : NULL;
-            if (gerr) return gerr;
-            obj = pk;
-        }
+        if (pk) obj = pk;
     }
     memset(&c->v, 0, sizeof c->v);
     c->v.start = r;
@@ -732,10 +699,7 @@ bool ray_col_src_vec_stat(const ray_col_src_t* s, int64_t v, int64_t* min, int64
     if (!ray_col_src_encoded(s)) return false;
     ray_enccol_t* e = ray_enccol_of(s->obj);
     if (e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->type == RAY_STR || v < 0 || v * RAY_ENC_VEC >= e->len) return false;
-    const ray_enc_desc_t* d;
-    ray_t* err = ray_enccol_chunk_descs_ref(e, v / RAY_ENC_VECS_PER_CHUNK, &d);
-    if (err) { ray_error_free(err); return false; }
-    d += v % RAY_ENC_VECS_PER_CHUNK;
+    const ray_enc_desc_t* d = &ray_enccol_descs(e, v / RAY_ENC_VECS_PER_CHUNK)[v % RAY_ENC_VECS_PER_CHUNK];
     if (d->flags & RAY_ENC_STAT_ABSENT) return false;
     *min = d->min; *max = d->max; *n_nulls = d->n_nulls;
     return true;
@@ -872,22 +836,12 @@ int ray_col_src_runview(ray_col_src_t* s, int64_t row, ray_enc_vview_t* out, int
     const int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
     *lo = s0 + vec * RAY_ENC_VEC;
     *hi = *lo + RAY_ENC_VEC < s1 ? *lo + RAY_ENC_VEC : s1;
-    const ray_enc_desc_t* d;
-    if ((*err = ray_enccol_chunk_descs_ref(e, c, &d)) != NULL) return -1;   /* validated once per chunk */
-    const uint8_t enc = d[j].encoding;
+    const uint8_t enc = ray_enccol_descs(e, c)[j].encoding;
     if ((enc != RAY_ENC_RLE && enc != RAY_ENC_CONST) || e->type == RAY_F32 || e->type == RAY_F64)
         return 0;                                             /* no other codec builds a view */
     int r = ray_enccol_vview(e, vec, out, err);
     if (r <= 0) return r;
     if (out->enc != enc || out->nullmap || out->n != *hi - *lo) return 0;
-    if (s->stats_guard && e->type != RAY_SYM && e->type != RAY_STR && !ray_enccol_dir_vec_ok(e, c, j)) {
-        /* the range read's guard on the vector's values, which are its run
-         * values: their [min, max] inside the chunk's directory statistics
-         * (a vector that passed is recorded, as a range read records it) */
-        int64_t mn, mx;
-        ray_enc_view_range(out, &mn, &mx);
-        if ((*err = ray_enccol_check_dir_range(e, c, j, mn, mx)) != NULL) return -1;
-    }
     return 1;
 }
 

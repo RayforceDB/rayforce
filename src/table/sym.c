@@ -22,6 +22,7 @@
  */
 
 #include "sym.h"
+#include "domain.h"   /* ray_sym_domain_index_remove */
 #include "core/platform.h"
 #include "store/fileio.h"
 #include "mem/heap.h"
@@ -1215,7 +1216,10 @@ ray_err_t ray_sym_save(const char* path) {
         return err;
     }
 
-    /* Atomic rename: tmp -> final path */
+    /* Atomic rename: tmp -> final path.  Whatever was there goes, and
+     * with it the record index of a symfile of that name (domain.h): this
+     * writer keeps none, and the new file need not extend the old one. */
+    ray_sym_domain_index_remove(path);
     err = ray_file_rename(tmp_path, path);
     if (err != RAY_OK) {
         remove(tmp_path);

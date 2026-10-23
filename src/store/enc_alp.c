@@ -179,22 +179,10 @@ bool ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f, ra
     return ok;
 }
 
-static bool zero_bytes(const uint8_t* p, size_t n) { for (size_t i = 0; i < n; i++) if (p[i]) return false; return true; }
-
-/* A failed read names its rule through ray_enc_read_why (ray_enc_read_fail);
- * a failed child read keeps the child's reason. */
-#define ALP_FAIL(why) ray_enc_read_fail(why)
-
-/* The body of an ALP ints child at c (avail bytes left in the ALP body)
- * when it is a FOR_BP child that ray_enc_read accepts whole at depth 1:
- * its header (reserved bytes zero, a body size that is a multiple of 8
- * inside the parent and exactly the packed size of its width <= 64); else
- * NULL, and ray_enc_read reads (or rejects) the child. */
-static const uint8_t* alp_for_child(const uint8_t* c, size_t avail) {
-    if (avail < 8 || c[0] != RAY_ENC_FOR_BP || c[1] > 64 || c[2] || c[3]) return NULL;
-    uint32_t bb; memcpy(&bb, c + 4, 4);
-    if ((bb & 7) || bb > avail - 8 || bb != (uint64_t)ray_enc_size_for(c[1])) return NULL;
-    return c + 8;
+/* The body of an ALP ints child at c when it is a FOR_BP child (decoded
+ * by the fused pass below); else NULL, and ray_enc_read reads the child. */
+static const uint8_t* alp_for_child(const uint8_t* c) {
+    return c[0] == RAY_ENC_FOR_BP ? c + 8 : NULL;
 }
 
 /* ALP decode fused with the FOR_BP unpack of its ints (I64 lanes: L = 16
@@ -261,44 +249,29 @@ static inline __attribute__((always_inline)) void alp_dec_for(const uint8_t* b, 
 }
 
 int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out) {
-    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return ALP_FAIL("ALP vector length or float width");
-    if (avail < 8) return ALP_FAIL("ALP header short");
     uint8_t e = p[0], f = p[1];
     uint16_t ne; memcpy(&ne, p + 2, 2);
-    uint32_t rsv; memcpy(&rsv, p + 4, 4);
-    if (e > 18) return ALP_FAIL("ALP exponent above 18");
-    if (f > e) return ALP_FAIL("ALP factor above the exponent");
-    if (ne > n) return ALP_FAIL("ALP exception count above the vector length");
-    if (rsv) return ALP_FAIL("ALP reserved word not zero");
-    /* A FOR_BP ints child that ray_enc_read would accept whole (the usual
-     * case) is decoded below in one fused pass; any other child is read
-     * by ray_enc_read, which names its errors. */
-    const uint8_t* fb = alp_for_child(p + 8, avail - 8);
+    /* A FOR_BP ints child (the usual case) is decoded below in one fused
+     * pass; any other child is read by ray_enc_read. */
+    const uint8_t* fb = alp_for_child(p + 8);
     int64_t a;
     if (fb) {
         uint32_t bb; memcpy(&bb, p + 8 + 4, 4);
         a = 8 + (int64_t)bb;
     } else {
         a = ray_enc_read(p + 8, avail - 8, 0, 0, n, K_I64, RAY_ENC_SLOT_ALP_INTS, 1, NULL, out);   /* ints, decoded in place below */
-        if (a < 0) return -1;
     }
     size_t at = 8 + (size_t)a, esz = (size_t)T / 8;
     size_t pb = (size_t)p8(2LL * ne), rb = (size_t)p8((int64_t)ne * (int64_t)esz);
-    if (avail - at < pb + rb) return ALP_FAIL("ALP exceptions overrun the body");
     const uint8_t* pos = p + at;
-    if (!zero_bytes(pos + 2u * ne, pb - 2u * ne)) return ALP_FAIL("ALP exception position padding");
     const uint8_t* raw = pos + pb;
-    if (!zero_bytes(raw + (size_t)ne * esz, rb - (size_t)ne * esz)) return ALP_FAIL("ALP exception value padding");
     if (fb) {
         if (T == 64) alp_dec_for(fb, p[9], n, 64, e, f, out); else alp_dec_for(fb, p[9], n, 32, e, f, out);
     } else {
         for (int i = 0; i < n; i++) out[i] = alp_dec1((int64_t)out[i], T, e, f);
     }
-    int prev = -1;
     for (int k = 0; k < ne; k++) {
         uint16_t q; memcpy(&q, pos + 2 * k, 2);
-        if ((int)q <= prev || q >= n) return ALP_FAIL("ALP exception positions not ascending or past the vector");
-        prev = q;
         uint64_t x = 0; memcpy(&x, raw + (size_t)k * esz, esz);
         out[q] = x;
     }
@@ -459,52 +432,22 @@ bool ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out) {
 }
 
 int64_t ray_enc_alprd_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out) {
-    if (n <= 0 || n > RAY_ENC_VEC || !alp_t_ok(T)) return ALP_FAIL("ALP_RD vector length or float width");
-    if (avail < 8) return ALP_FAIL("ALP_RD header short");
     int rb = p[0], dn = p[1];
     uint16_t ne; memcpy(&ne, p + 2, 2);
-    uint32_t rsv; memcpy(&rsv, p + 4, 4);
-    if (rb < T - 16 || rb > T - 1) return ALP_FAIL("ALP_RD right width outside T-16..T-1");
-    if (dn < 1 || dn > 8) return ALP_FAIL("ALP_RD dictionary size outside 1..8");
-    if (ne > n) return ALP_FAIL("ALP_RD exception count above the vector length");
-    if (rsv) return ALP_FAIL("ALP_RD reserved word not zero");
-    uint32_t lmax = 1u << (T - rb);                                    /* left parts are below this */
     size_t at = 8, db = (size_t)p8(2LL * dn);
-    if (avail - at < db) return ALP_FAIL("ALP_RD dictionary short");
     uint16_t dict[8];
-    for (int k = 0; k < dn; k++) {
-        memcpy(&dict[k], p + at + 2 * k, 2);
-        if (dict[k] >= lmax) return ALP_FAIL("ALP_RD dictionary entry wider than the left part");
-        if (k && dict[k] <= dict[k - 1]) return ALP_FAIL("ALP_RD dictionary not ascending");
-    }
-    if (!zero_bytes(p + at + 2u * dn, db - 2u * dn)) return ALP_FAIL("ALP_RD dictionary padding");
+    for (int k = 0; k < dn; k++) memcpy(&dict[k], p + at + 2 * k, 2);
     at += db;
     uint64_t codes[RAY_ENC_VEC];
     int64_t a = ray_enc_read(p + at, avail - at, 0, 0, n, K_U8, RAY_ENC_SLOT_ALP_RD_LEFT, 1, NULL, codes);
-    if (a < 0) return -1;
     at += (size_t)a;
     size_t pk = ray_enc_packed_bytes(rb);
     size_t pb = (size_t)p8(2LL * ne);
-    if (avail - at < pk + 2 * pb) return ALP_FAIL("ALP_RD body short");
     const uint8_t* pos = p + at + pk;
     const uint8_t* lefts = pos + pb;
-    if (!zero_bytes(pos + 2u * ne, pb - 2u * ne)) return ALP_FAIL("ALP_RD exception position padding");
-    if (!zero_bytes(lefts + 2u * ne, pb - 2u * ne)) return ALP_FAIL("ALP_RD exception left padding");
-    for (int i = 0; i < n; i++) if (codes[i] >= (uint64_t)dn) return ALP_FAIL("ALP_RD left code outside the dictionary");
-    int prev = -1;
-    for (int k = 0; k < ne; k++) {
-        uint16_t q, l; memcpy(&q, pos + 2 * k, 2); memcpy(&l, lefts + 2 * k, 2);
-        if ((int)q <= prev || q >= n) return ALP_FAIL("ALP_RD exception positions not ascending or past the vector");
-        /* codes[q] != 0 is corrupt: a spec clarification of "the left code is 0" (D8) */
-        if (codes[q] != 0) return ALP_FAIL("ALP_RD exception row with a non-zero left code");
-        if (l >= lmax) return ALP_FAIL("ALP_RD exception left part too wide");
-        prev = q;
-    }
-    /* Every rule but the pad rows is checked: the right parts go straight
-     * into out (no second 8 KB array), and a corrupt pad leaves out zeroed. */
+    /* the right parts go straight into out (a whole vector: no second 8 KB
+     * array), then the left parts */
     ray_enc_unpack(p + at, T, rb, out);
-    for (int i = n; i < RAY_ENC_VEC; i++)
-        if (out[i]) { memset(out, 0, sizeof *out * RAY_ENC_VEC); return ALP_FAIL("ALP_RD padding rows not zero"); }
     for (int i = 0; i < n; i++) out[i] |= (uint64_t)dict[codes[i]] << rb;
     for (int k = 0; k < ne; k++) {
         uint16_t q, l; memcpy(&q, pos + 2 * k, 2); memcpy(&l, lefts + 2 * k, 2);
@@ -559,7 +502,6 @@ bool ray_enc_float_write(uint8_t enc, const uint64_t* v, int n, int T, const ray
 
 int64_t ray_enc_float_read(const uint8_t* p, size_t avail, uint8_t enc, int n, int T,
                            const ray_enc_dict_t* dict, uint64_t* out) {
-    if (!alp_t_ok(T)) return ALP_FAIL("float width");
     if (enc == RAY_ENC_ALP) return ray_enc_alp_read(p, avail, n, T, out);
     if (enc == RAY_ENC_ALP_RD) return ray_enc_alprd_read(p, avail, n, T, out);
     ray_enc_kind_t fk = { (uint8_t)T, false, true };

@@ -42,7 +42,7 @@
  * hot read paths are LOCK-FREE: ray_sym_domain_str reads the
  * atomically published (count, atoms) pair — appends publish a slot
  * write with a release store of the count, growth REPLACES the array —
- * ray_sym_domain_raw_pin copies the published (map, offsets, count)
+ * ray_sym_domain_raw_pin copies the published (map, checkpoints, count)
  * record, and ray_sym_domain_runtime_lut reads an atomically published
  * array (invalidated and rebuilt across appends).  The runtime singleton
  * never touches the lock (immortal, delegates to sym.c's own locking).
@@ -91,6 +91,8 @@
 #include "core/pool.h"      /* batch intern: parallel read-only probe */
 #include "sym.h"            /* ray_sym_intern_prehashed (runtime fallback) */
 #include "symimp.h"         /* DOM_IMPORT */
+#include "store/enccol.h"   /* ray_enccol_of: a generation-2 SYM column's domain */
+#include "store/fsst.h"     /* compressed symfiles: each record FSST-coded */
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -104,12 +106,34 @@
 #elif !defined(RAY_OS_WASM)
 #include <pthread.h>
 #endif
+#include <errno.h>
+#if defined(RAY_OS_WINDOWS)
+#include <process.h>
+#define dom_pid() ((unsigned long long)_getpid())
+#else
+#include <unistd.h>
+#include <fcntl.h>                 /* dom_src_open: explicit reads */
+#include <dirent.h>
+#include <signal.h>                /* kill(pid, 0): a temporary file's writer still runs */
+#define dom_pid() ((unsigned long long)getpid())
+#endif
 #ifndef PATH_MAX
 #  define PATH_MAX 4096
 #endif
 
 /* Same on-disk format constant as src/table/sym.c (private there). */
 #define DOMAIN_STRL_MAGIC 0x4C525453U /* "STRL" */
+
+/* A compressed symfile, "STRZ": the STRL header, then the FSST symbol table
+ * the records are coded with (fixed size: the symbol count, 255 lengths,
+ * 255 symbols of 8 bytes), then one record per entry, [u32 coded length |
+ * coded bytes].  Its index (.ix) gives each entry's string length decoded,
+ * as for a plain file, so a length is still read without its record; the
+ * records of a block are walked by their own headers.  Written by
+ * ray_sym_domain_compress; appends to it are coded with its table. */
+#define DOMAIN_STRZ_MAGIC 0x5A525453U /* "STRZ" */
+#define DOM_Z_TAB  (1 + 255 + 255 * 8)
+#define DOM_Z_REC0 ((size_t)12 + DOM_Z_TAB)   /* byte offset of a compressed file's first record */
 
 typedef enum {
     DOM_RUNTIME = 0,
@@ -145,11 +169,98 @@ typedef struct dom_retired_map_s {
     size_t size;
     struct dom_retired_map_s* next;
 } dom_retired_map_t;
+/* ---- sparse record index ---------------------------------------------------
+ *
+ * A symfile's records are variable-length, so finding entry `pos` needs the
+ * byte offset of a record at or before it.  The domain keeps a block table:
+ * blocks of DOM_IX_STRIDE (28) entries, each one cache line (64 bytes): the
+ * offset of its first record (a checkpoint) and the length of each entry's
+ * string in two bytes (65535: 65535 or longer, the record's own u32 then
+ * says).  Entry j of block pos / 28 is found from the checkpoint by adding up
+ * the records before it — from the lengths, a 65535 one from its record
+ * header — so a lookup touches one cache line of the table and reads the
+ * record it wants and nothing before it, and a string's length needs no
+ * record at all unless it is 65535 or longer (ray_sym_domain_raw_len).
+ *
+ * The table is persisted next to the symfile, in `<symfile>.ix`, so that
+ * opening a domain reads neither the records nor the table: only the 128-byte
+ * header; the blocks are mapped and paged in as entries are read.  An index
+ * is used only for the very file it was written for: the inode, the
+ * modification and status-change times and the size it records match the
+ * mapped file's.  Anything else (another file of the name, the file grown
+ * or rewritten by a writer that left the index as it was, an earlier
+ * format) is not used: the open walks every record once, reading the file
+ * in large explicit reads (dom_src_t), and writes the index anew.  The
+ * symfile and its index are ours: an index that names the file is read as
+ * written, with no check of its blocks or of the records.
+ *
+ * The index file (all integers little-endian):
+ *
+ *   0  u32 "STRX"   4 u32 version   8 u32 stride (28)   12 u32 0
+ *  16  i64 count: entries covered   24 u64 end: byte offset past their records
+ *  32  u64 inode, 40 u64 stamp of the modification and status-change times
+ *      of the file it was written for
+ *  48  u64 checkpoint of the last block (n - 1)
+ *  56  u32 0   60 u32 0   64 u32 0   68 u32 0
+ *  72  u64 cap: block slots               80 .. 127: zeros
+ * 128  n blocks of 64 bytes, n = ceil(count / 28), then zeros up to cap:
+ *      u64 offset of the block's first record, then 28 u16 lengths (those
+ *      past `count` in the last block: 0)
+ *
+ * The symfile is append-only, and so is the block array: a writer that
+ * appended records writes the block the old entries ended in and the
+ * blocks they open into the reserved slots, then the header — the cost of
+ * what it appended — and writes the index whole (tmp + rename, with room
+ * for more blocks) when the slots run out or the index on disk is not the
+ * one it last read or wrote.  It is a cache, never the only copy of
+ * anything: never synced. */
+#define DOM_IX_STRIDE  ((int64_t)RAY_SYM_INDEX_STRIDE)
+typedef ray_sym_ixblk_t dom_ixb_t;
+#define DOM_IX_MAGIC   0x58525453U   /* "STRX" */
+#define DOM_IX_VERSION 5u
+#define DOM_IX_HDR     128           /* the blocks start on a cache line */
+#define DOM_IX_HEAD    4096          /* an extend compares this many bytes of the first records */
+#define DOM_LEN_LONG   65535         /* a length of 65535: the escape, 65535 or longer, its record header says */
+
+/* The block table of an image of `count` entries whose records end at
+ * `end`; one allocation.  The entries' lengths: this allocation's own (a
+ * walk), or the mapped index file (the domain keeps the mapping until it
+ * dies). */
+typedef struct dom_blk_s {
+    int64_t        n;
+    int64_t        count;
+    uint64_t       end;
+    const dom_ixb_t* ib;       /* block k: starts at map + ib[k].off, its entries' lengths */
+    dom_ixb_t*     own_ib;     /* ib, when this allocation holds it (a walk) */
+} dom_blk_t;
+
 typedef struct dom_raw_snap_s {
     const unsigned char* map;
-    const size_t*        offsets;
+    dom_blk_t*           blk;
     int64_t              count;
 } dom_raw_snap_t;
+
+/* Growable checkpoint list (sys memory: process-global, like the domain). */
+typedef struct {
+    uint64_t* v;
+    int64_t   n, cap;
+} dom_ck_t;
+
+/* ---- atom slots --------------------------------------------------------------
+ *
+ * atoms[pos] is reached through a directory of fixed-size slot chunks, a
+ * chunk allocated (zeroed, from the domain arena) the first time a slot in
+ * it is set.  A flat array of one pointer per entry would commit 8 bytes per
+ * entry of the vocabulary at open, materialized or not. */
+#define DOM_SLOT_LOG 11
+#define DOM_SLOTS    ((int64_t)1 << DOM_SLOT_LOG)
+typedef struct {
+    _Atomic(ray_t*) a[DOM_SLOTS];
+} dom_slots_t;
+typedef struct {
+    int64_t                n;     /* chunk pointers: covers n * DOM_SLOTS slots */
+    _Atomic(dom_slots_t*)  c[];
+} dom_dir_t;
 
 struct ray_sym_domain_s {
     uint8_t   kind;        /* dom_kind_t */
@@ -161,6 +272,7 @@ struct ray_sym_domain_s {
      * created domain with no file yet). */
     void*     map;
     size_t    map_size;
+    ray_file_id_t map_id;  /* the mapped file's identity (from its descriptor) */
     int64_t   base_count;  /* entries that came from the mapping */
 
     /* FILE: persisted state — how much of the vocabulary the file holds
@@ -178,8 +290,8 @@ struct ray_sym_domain_s {
      * extend frees it (see the concurrency note above).  Lock-free readers
      * load count (acquire) then atoms (acquire) then the slot (acquire). */
     _Atomic(int64_t)  count;
-    _Atomic(ray_t**)  atoms;
-    int64_t   atoms_cap;   /* guarded by g_dom_lock */
+    _Atomic(dom_dir_t*) atoms;
+    int64_t   atoms_cap;   /* slots the directory covers; guarded by g_dom_lock */
 
     /* FILE: per-domain ray_arena_t backing every materialized string atom
      * (lazy file slots + runtime-appended interns).  Atoms carry
@@ -187,15 +299,26 @@ struct ray_sym_domain_s {
      * Guarded by g_dom_lock (only ever touched under it). */
     ray_arena_t* arena;
 
-    /* FILE: byte offset within `map` of each file entry's record (the u32
-     * length prefix).  base_count entries, covering the file prefix
-     * [0, base_count) only.  Built in one pass at open (no per-entry alloc);
-     * used to materialize atoms[pos] on demand from the mmap bytes.
-     * malloc'd; NULL when base_count == 0. */
-    size_t*   offsets;
-    /* Published raw snapshot (see ray_sym_domain_raw_pin): map, offsets and
-     * the file-prefix count as one immutable record.  Replaced whole on
-     * extend; the previous record, its offsets and its mapping are freed
+    /* FILE: block table of the mapped records, the file prefix
+     * [0, base_count) (see the sparse record index above): from the index
+     * file or one walk at open.  Read under g_dom_lock; lock-free readers
+     * take it from the raw snapshot.  NULL when base_count == 0. */
+    dom_blk_t* blk;
+    /* FILE: what the index did for this domain (ray_sym_domain_ix_info). */
+    bool      ix_used;          /* the open took its blocks from the index */
+    /* FILE: checkpoints of the entries this process flushed past the
+     * mapping, positions in [base_count, disk_count) that are multiples of
+     * the stride, offsets in the file as written.  Guarded by the symfile's
+     * `.lk` flock (the flush paths), published under g_dom_lock. */
+    dom_ck_t  wck;
+    /* FILE: entries, and the byte offset past their records, the index
+     * file covered when this process last read or wrote it. */
+    _Atomic(int64_t)  ix_count;
+    _Atomic(uint64_t) ix_end;
+    int64_t   ix_covered;   /* entries the open (or extend) took from the index */
+    /* Published raw snapshot (see ray_sym_domain_raw_pin): map, checkpoints
+     * and the file-prefix count as one immutable record.  Replaced whole on
+     * extend; the previous record, its checkpoints and its mapping are freed
      * then, or retired (retired / retired_maps) while a batch intern is
      * probing outside the lock — see the concurrency note above. */
     _Atomic(struct dom_raw_snap_s*) raw_snap;
@@ -219,9 +342,21 @@ struct ray_sym_domain_s {
      * or an index rebuild replaces is retired instead of freed. */
     int32_t   batch_inflight;
 
-    dom_retired_t* retired; /* replaced atom arrays, offsets, snapshot records, LUTs */
+    dom_retired_t* retired; /* replaced directories, checkpoints, snapshot records, LUTs */
 
     struct ray_symimp_s* imp; /* DOM_IMPORT: the import dictionary */
+
+    /* FILE, compressed symfile: its symbol table and the encoder's index
+     * (immutable after open), the byte offset of its first record (12 for
+     * a plain file), and a decode buffer for the paths under g_dom_lock. */
+    ray_fsst_table_t* z;
+    ray_fsst_index_t* zix;
+    size_t    rec0;
+    uint8_t*  zbuf;
+    size_t    zcap;
+
+    /* FILE: the bytes of the file read whole at open (ray_sym_domain_preload); 0: lazy */
+    size_t    preloaded;
 
     struct ray_sym_domain_s* next; /* cache chain */
 };
@@ -361,16 +496,16 @@ static bool dom_drop_buckets_locked(ray_sym_domain_t* d, uint64_t* old) {
     return dom_drop_locked(d, old);
 }
 
-/* Publish (map, offsets, count) as the domain's raw snapshot.  The previous
- * record is dropped (external extend: no reader holds it) or retired.
- * Called with the file's current image in place. */
+/* Publish (map, block table, count) as the domain's raw snapshot.  The
+ * previous record is dropped (external extend: no reader holds it) or
+ * retired.  Called with the file's current image in place. */
 static bool dom_publish_raw_snap(ray_sym_domain_t* d, bool drop_old) {
     dom_raw_snap_t* snap = NULL;
-    if (d->map && d->offsets && d->base_count > 0) {
+    if (d->map && d->blk && d->base_count > 0) {
         snap = (dom_raw_snap_t*)ray_sys_alloc(sizeof(*snap));
         if (!snap) return false;
         snap->map = (const unsigned char*)d->map;
-        snap->offsets = d->offsets;
+        snap->blk = d->blk;
         snap->count = d->base_count;
     }
     dom_raw_snap_t* old = atomic_exchange_explicit(&d->raw_snap, snap, memory_order_acq_rel);
@@ -378,16 +513,418 @@ static bool dom_publish_raw_snap(ray_sym_domain_t* d, bool drop_old) {
     return true;
 }
 
+/* ---- atom slots ---------------------------------------------------------- */
+
+/* A directory covering `slots` slots (whole chunks), carrying the chunks of
+ * `old`.  NULL on OOM.  Fresh pointers are NULL (sys memory is zeroed). */
+static dom_dir_t* dom_dir_new(int64_t slots, dom_dir_t* old) {
+    int64_t n = (slots + DOM_SLOTS - 1) >> DOM_SLOT_LOG;
+    if (n < 1) n = 1;
+    dom_dir_t* dir = (dom_dir_t*)ray_sys_alloc(sizeof(dom_dir_t) +
+                                               (size_t)n * sizeof(dom_slots_t*));
+    if (!dir) return NULL;
+    dir->n = n;
+    int64_t keep = old ? (old->n < n ? old->n : n) : 0;
+    for (int64_t k = 0; k < keep; k++)
+        atomic_store_explicit(&dir->c[k],
+                              atomic_load_explicit(&old->c[k], memory_order_relaxed),
+                              memory_order_relaxed);
+    return dir;
+}
+
+/* Slot `pos` of `dir`: the atom, or NULL (not materialized, or a chunk this
+ * directory has not seen).  Lock-free. */
+static inline ray_t* dom_slot_get(dom_dir_t* dir, int64_t pos) {
+    if (!dir || pos < 0 || (pos >> DOM_SLOT_LOG) >= dir->n) return NULL;
+    dom_slots_t* c = atomic_load_explicit(&dir->c[pos >> DOM_SLOT_LOG], memory_order_acquire);
+    return c ? atomic_load_explicit(&c->a[pos & (DOM_SLOTS - 1)], memory_order_acquire)
+             : NULL;
+}
+
+/* The current directory's chunk holding slot `pos` (< atoms_cap), made in
+ * the arena when absent.  Under g_dom_lock.  NULL on OOM. */
+static dom_slots_t* dom_chunk_locked(ray_sym_domain_t* d, int64_t pos) {
+    dom_dir_t* dir = atomic_load_explicit(&d->atoms, memory_order_relaxed);
+    _Atomic(dom_slots_t*)* cp = &dir->c[pos >> DOM_SLOT_LOG];
+    dom_slots_t* c = atomic_load_explicit(cp, memory_order_relaxed);
+    if (c) return c;
+    c = (dom_slots_t*)ray_arena_alloc_raw(d->arena, sizeof(dom_slots_t));
+    if (!c) return NULL;
+    for (int64_t i = 0; i < DOM_SLOTS; i++)
+        atomic_store_explicit(&c->a[i], NULL, memory_order_relaxed);
+    atomic_store_explicit(cp, c, memory_order_release);
+    return c;
+}
+
+static bool dom_slot_set_locked(ray_sym_domain_t* d, int64_t pos, ray_t* a) {
+    dom_slots_t* c = dom_chunk_locked(d, pos);
+    if (!c) return false;
+    atomic_store_explicit(&c->a[pos & (DOM_SLOTS - 1)], a, memory_order_release);
+    return true;
+}
+
+/* Cover `need` slots: a grown directory REPLACES the current one (lock-free
+ * readers may hold it, so it is retired).  Under g_dom_lock. */
+static bool dom_grow_locked(ray_sym_domain_t* d, int64_t need) {
+    if (need <= d->atoms_cap) return true;
+    int64_t ncap = d->atoms_cap < DOM_SLOTS ? DOM_SLOTS : d->atoms_cap;
+    while (ncap < need) ncap *= 2;
+    dom_dir_t* old = atomic_load_explicit(&d->atoms, memory_order_relaxed);
+    dom_dir_t* dir = dom_dir_new(ncap, old);
+    if (!dir) return false;
+    if (!dom_retire(d, old)) { ray_sys_free(dir); return false; }
+    atomic_store_explicit(&d->atoms, dir, memory_order_release);
+    d->atoms_cap = dir->n << DOM_SLOT_LOG;
+    return true;
+}
+
+/* ---- records and blocks ------------------------------------------------------ */
+
+static bool dom_ck_reserve(dom_ck_t* ck, int64_t want) {
+    if (want <= ck->cap) return true;
+    uint64_t* nv = (uint64_t*)ray_sys_alloc((size_t)want * sizeof(uint64_t));
+    if (!nv) return false;
+    if (ck->n) memcpy(nv, ck->v, (size_t)ck->n * sizeof(uint64_t));
+    ray_sys_free(ck->v);
+    ck->v = nv;
+    ck->cap = want;
+    return true;
+}
+
+static bool dom_ck_push(dom_ck_t* ck, uint64_t off) {
+    if (ck->n == ck->cap && !dom_ck_reserve(ck, ck->cap < 64 ? 64 : ck->cap * 2))
+        return false;
+    ck->v[ck->n++] = off;
+    return true;
+}
+
+static void dom_ck_free(dom_ck_t* ck) {
+    ray_sys_free(ck->v);
+    ck->v = NULL;
+    ck->n = ck->cap = 0;
+}
+
+static inline int64_t dom_ck_count(int64_t entries) {
+    return (entries + DOM_IX_STRIDE - 1) / DOM_IX_STRIDE;
+}
+
+static inline uint32_t dom_rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static inline uint64_t dom_rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+_Static_assert(sizeof(ray_fsst_table_t) == DOM_Z_TAB, "a symbol table is stored as laid out");
+
+/* The byte offset of the first record of a symfile image (by its magic). */
+static inline size_t dom_rec0_of(const uint8_t* map) {
+    return dom_rd32(map) == DOMAIN_STRZ_MAGIC ? DOM_Z_REC0 : 12;
+}
+
+/* Buffer `*buf` of at least `need` bytes (sys memory, grown by doubling). */
+static uint8_t* dom_buf_need(uint8_t** buf, size_t* cap, size_t need) {
+    if (need <= *cap) return *buf;
+    size_t c = *cap ? *cap : 256;
+    while (c < need) c *= 2;
+    uint8_t* nb = (uint8_t*)ray_sys_alloc(c);
+    if (!nb) return NULL;
+    ray_sys_free(*buf);
+    *buf = nb;
+    *cap = c;
+    return nb;
+}
+
+/* The coded record of entry `pos` of a compressed image: past the records
+ * before it in its block by their own headers. */
+static inline const uint8_t* dom_z_rec(const uint8_t* map, const dom_ixb_t* ib, int64_t pos,
+                                       uint32_t* clen) {
+    int64_t k = pos / DOM_IX_STRIDE, j = pos % DOM_IX_STRIDE;
+    const uint8_t* p = map + ib[k].off;
+    for (int64_t i = 0; i < j; i++) p += 4 + (size_t)dom_rd32(p);
+    *clen = dom_rd32(p);
+    return p + 4;
+}
+
+/* Entry `pos`'s decoded length: from the index, the escape's from its record. */
+static inline size_t dom_z_len(const ray_fsst_table_t* z, const dom_ixb_t* ib, int64_t pos,
+                               const uint8_t* rec, uint32_t clen) {
+    uint16_t e = ib[pos / DOM_IX_STRIDE].len[pos % DOM_IX_STRIDE];
+    return e < DOM_LEN_LONG ? e : (size_t)ray_fsst_expanded_len(z, rec, clen);
+}
+
+/* The decode buffers of the calling thread, used in turn (domain.h). */
+typedef struct {
+    uint8_t* b[RAY_SYM_RAW_RING];
+    size_t   cap[RAY_SYM_RAW_RING];
+    unsigned at;
+} dom_zring_t;
+static _Thread_local dom_zring_t g_zring;
+
+void ray_sym_domain_raw_decode(const ray_sym_domain_raw_t* r, int64_t pos, char* out) {
+    uint32_t clen;
+    const uint8_t* rec = dom_z_rec(r->map, r->ib, pos, &clen);
+    ray_fsst_decode_fast((const ray_fsst_table_t*)r->z, rec, clen, (uint8_t*)out);
+}
+
+const char* ray_sym_domain_raw_str_z(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len) {
+    const ray_fsst_table_t* z = (const ray_fsst_table_t*)r->z;
+    uint32_t clen;
+    const uint8_t* rec = dom_z_rec(r->map, r->ib, pos, &clen);
+    size_t dl = dom_z_len(z, r->ib, pos, rec, clen);
+    unsigned k = g_zring.at++ % RAY_SYM_RAW_RING;
+    uint8_t* out = dom_buf_need(&g_zring.b[k], &g_zring.cap[k], dl + 8);
+    if (!out) { *len = 0; return NULL; }
+    ray_fsst_decode_fast(z, rec, clen, out);
+    *len = dl;
+    return (const char*)out;
+}
+
+/* A block table for `count` entries; with room for its own checkpoints
+ * and lengths when `own` (else both are the index file's, set by the
+ * caller).  NULL on OOM. */
+static dom_blk_t* dom_blk_new(int64_t count, bool own) {
+    int64_t n = dom_ck_count(count);
+    size_t head = (sizeof(dom_blk_t) + 7) & ~(size_t)7;
+    size_t ibb = own ? (size_t)n * sizeof(dom_ixb_t) : 0;
+    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ibb);
+    if (!b) return NULL;
+    uint8_t* p = (uint8_t*)b + head;
+    b->n = n;
+    b->count = count;
+    b->end = 0;
+    b->own_ib = own ? (dom_ixb_t*)p : NULL;
+    b->ib = b->own_ib;
+    if (own) memset(b->own_ib, 0, ibb);   /* unused lengths of the last block: 0 */
+    return b;
+}
+
+static inline uint64_t dom_blk_lim(const dom_blk_t* b, int64_t k) {
+    return k + 1 < b->n ? b->ib[k + 1].off : b->end;
+}
+
+/* Where a walk reads the records: the mapping, or the file read
+ * with explicit, large reads into a buffer (dom_src_open).  A walk over
+ * much of the file through the mapping faults it in a page cluster at a
+ * time (some 128 KiB a request) and leaves the pages mapped — kept by the
+ * reclaim as referenced, so a walk over a file larger than the memory
+ * thrashes its own read-ahead; read() into a buffer takes it in 4 MiB
+ * requests, each page read once. */
+#define DOM_RD_CHUNK ((size_t)4 << 20)
+typedef struct {
+    const uint8_t* map;      /* the mapping (no reads), or NULL */
+    int            fd;
+    uint8_t*       buf;
+    size_t         cap;
+    uint64_t       lo, hi;   /* the file bytes buf holds */
+    uint64_t       size;     /* the image's bytes */
+} dom_src_t;
+
+static inline dom_src_t dom_src_map(const uint8_t* map, uint64_t size) {
+    dom_src_t s;
+    memset(&s, 0, sizeof(s));
+    s.map = map;
+    s.fd = -1;
+    s.size = size;
+    return s;
+}
+
+/* Explicit reads of the file `path` — only if it is still the file of
+ * identity `id` that is mapped (size `size`).  False where it cannot be:
+ * the caller reads through the mapping. */
+static bool dom_src_open(dom_src_t* s, const char* path, const ray_file_id_t* id, uint64_t size) {
+    memset(s, 0, sizeof(*s));
+    s->fd = -1;
+    s->size = size;
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    if (!path || !id || !id->valid) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (uint64_t)st.st_ino != id->ino || (uint64_t)st.st_size != size) {
+        close(fd);
+        return false;
+    }
+#if defined(POSIX_FADV_SEQUENTIAL)
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    s->fd = fd;
+    return true;
+#else
+    (void)path; (void)id;
+    return false;
+#endif
+}
+
+static void dom_src_close(dom_src_t* s) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    if (s->fd >= 0) close(s->fd);
+#endif
+    ray_sys_free(s->buf);
+    s->buf = NULL;
+    s->fd = -1;
+}
+
+/* Bytes [off, off + len) of the image: in the mapping, or read into the
+ * buffer (from `off`, at least a chunk).  NULL past the image or on a read
+ * error. */
+static const uint8_t* dom_src_get(dom_src_t* s, uint64_t off, uint64_t len) {
+    if (off > s->size || len > s->size - off) return NULL;
+    if (s->map) return s->map + off;
+    if (off >= s->lo && off + len <= s->hi) return s->buf + (off - s->lo);
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    uint64_t n = len > DOM_RD_CHUNK ? len : DOM_RD_CHUNK;
+    if (n > s->size - off) n = s->size - off;
+    if (n > s->cap) {
+        uint8_t* nb = (uint8_t*)ray_sys_alloc((size_t)n);
+        if (!nb) return NULL;
+        ray_sys_free(s->buf);
+        s->buf = nb;
+        s->cap = (size_t)n;
+    }
+    uint64_t got = 0;
+    while (got < n) {
+        ssize_t r = pread(s->fd, s->buf + got, (size_t)(n - got), (off_t)(off + got));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { s->lo = s->hi = 0; return NULL; }
+        got += (uint64_t)r;
+    }
+#if defined(POSIX_FADV_WILLNEED)
+    /* the next chunk is read while this one is checked; the one just
+     * read is not needed again (pages the mapping holds stay) */
+    if (off + n < s->size)
+        (void)posix_fadvise(s->fd, (off_t)(off + n), (off_t)DOM_RD_CHUNK, POSIX_FADV_WILLNEED);
+    if (s->hi > s->lo)
+        (void)posix_fadvise(s->fd, (off_t)s->lo, (off_t)(s->hi - s->lo), POSIX_FADV_DONTNEED);
+#endif
+    s->lo = off;
+    s->hi = off + n;
+    return s->buf;
+#else
+    return NULL;
+#endif
+}
+
+/* Walk entries [from, b->count) of the image, the first at byte *off: the
+ * checkpoint of every block that starts on the way and, into the table's own
+ * lengths, the length of every entry (of a compressed image `z`, decoded
+ * from its record).  False when a read of the file fails. */
+static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t* off,
+                             const ray_fsst_table_t* z) {
+    uint64_t o = *off;
+    for (int64_t i = from; i < b->count; i++) {
+        int64_t k = i / DOM_IX_STRIDE, j = i % DOM_IX_STRIDE;
+        if (!j) b->own_ib[k].off = o;
+        const uint8_t* h = dom_src_get(src, o, 4);
+        if (!h) return false;
+        uint32_t l = dom_rd32(h), sl = l;
+        if (z) {
+            const uint8_t* rec = dom_src_get(src, o + 4, l);
+            if (!rec) return false;
+            sl = (uint32_t)ray_fsst_expanded_len(z, rec, l);
+        }
+        o += 4 + (uint64_t)l;
+        b->own_ib[k].len[j] = sl < DOM_LEN_LONG ? (uint16_t)sl : (uint16_t)DOM_LEN_LONG;
+    }
+    *off = (size_t)o;
+    return true;
+}
+
+/* Entry `pos`: from its block's checkpoint past the records before it, by
+ * their lengths (a 65535 one by its header). */
+static inline const uint8_t* dom_blk_entry(const uint8_t* map, const dom_blk_t* b,
+                                           int64_t pos, uint32_t* len) {
+    int64_t k = pos / DOM_IX_STRIDE, j = pos % DOM_IX_STRIDE;
+    const uint8_t* p = map + b->ib[k].off;
+    for (int64_t i = 0; i < j; i++) {
+        uint16_t l = b->ib[k].len[i];
+        p += 4 + (l < DOM_LEN_LONG ? (size_t)l : (size_t)dom_rd32(p));
+    }
+    *len = dom_rd32(p);
+    return p + 4;
+}
+
+static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
+                         const dom_blk_t* b, const ray_file_id_t* id);
+static size_t dom_ix_min(void);
+
+/* The string of a compressed record [rec, rec + clen) of length `dl`,
+ * decoded into the domain's buffer.  Under g_dom_lock. */
+static const uint8_t* dom_z_decode_locked(ray_sym_domain_t* d, const uint8_t* rec, uint32_t clen,
+                                          size_t dl) {
+    uint8_t* out = dom_buf_need(&d->zbuf, &d->zcap, dl + 8);
+    if (!out) return NULL;
+    ray_fsst_decode_fast(d->z, rec, clen, out);
+    return out;
+}
+
+/* Entry `pos` of the mapped prefix (of a compressed file decoded, valid
+ * until the next such read).  Under g_dom_lock.  NULL when out of range. */
+static const uint8_t* dom_entry_locked(ray_sym_domain_t* d, int64_t pos, uint32_t* len) {
+    if (pos < 0 || pos >= d->base_count || !d->blk) return NULL;
+    if (d->z) {
+        uint32_t clen;
+        const uint8_t* rec = dom_z_rec((const uint8_t*)d->map, d->blk->ib, pos, &clen);
+        size_t dl = dom_z_len(d->z, d->blk->ib, pos, rec, clen);
+        *len = (uint32_t)dl;
+        return dom_z_decode_locked(d, rec, clen, dl);
+    }
+    return dom_blk_entry((const uint8_t*)d->map, d->blk, pos, len);
+}
+
+/* Bytes of entry `pos` in order, for a pass over the whole vocabulary
+ * (pos = 0, 1, ..., *off starting at d->rec0): the mapped records read in
+ * turn (a compressed one decoded, valid until the next call), then the
+ * appended atoms.  Under g_dom_lock. */
+static bool dom_next_locked(ray_sym_domain_t* d, int64_t pos, size_t* off,
+                            const char** p, size_t* len) {
+    if (pos < d->base_count) {
+        size_t o = *off;
+        uint32_t l = dom_rd32((const uint8_t*)d->map + o);
+        const uint8_t* rec = (const uint8_t*)d->map + o + 4;
+        *off = o + 4 + l;
+        if (d->z) {
+            size_t dl = dom_z_len(d->z, d->blk->ib, pos, rec, l);
+            const uint8_t* out = dom_z_decode_locked(d, rec, l, dl);
+            if (!out) return false;
+            *p = (const char*)out;
+            *len = dl;
+            return true;
+        }
+        *p = (const char*)rec;
+        *len = l;
+        return true;
+    }
+    ray_t* a = dom_slot_get(atomic_load_explicit(&d->atoms, memory_order_relaxed), pos);
+    if (!a) return false;
+    *p = ray_str_ptr(a);
+    *len = ray_str_len(a);
+    return true;
+}
+
+/* Bytes of entry `pos`: its atom when there is one, else its record in the
+ * mapping — nothing materialized.  Under g_dom_lock.  NULL if unresolvable. */
+static const char* dom_bytes_locked(ray_sym_domain_t* d, int64_t pos, size_t* len) {
+    ray_t* a = dom_slot_get(atomic_load_explicit(&d->atoms, memory_order_relaxed), pos);
+    if (a) { *len = ray_str_len(a); return ray_str_ptr(a); }
+    uint32_t l = 0;
+    const uint8_t* p = dom_entry_locked(d, pos, &l);
+    *len = l;
+    return (const char*)p;
+}
+
 /* Free a FILE domain after the last reference dropped.  Caller has
  * already unlinked it from the cache. */
+static void dom_preload_release(ray_sym_domain_t* d);
+
 static void dom_destroy(ray_sym_domain_t* d) {
+    dom_preload_release(d);
     if (d->imp) ray_symimp_free(d->imp);
-    /* Atoms are RAY_ATTR_ARENA — never refcounted, never individually freed.
-     * The arena bulk-frees them; we only free the pointer ARRAY here. */
-    ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
-    ray_sys_free(atoms);
+    ray_sys_free(d->z);
+    ray_sys_free(d->zix);
+    ray_sys_free(d->zbuf);
+    /* Atoms and slot chunks are arena memory — never individually freed.
+     * The arena bulk-frees them; only the directory is freed here. */
+    ray_sys_free(atomic_load_explicit(&d->atoms, memory_order_relaxed));
     if (d->arena) ray_arena_destroy(d->arena);
-    ray_sys_free(d->offsets);
+    ray_sys_free(d->blk);
+    dom_ck_free(&d->wck);
     ray_sys_free(atomic_load_explicit(&d->runtime_lut, memory_order_relaxed));
     for (dom_retired_t* r = d->retired; r;) {
         dom_retired_t* nxt = r->next;
@@ -408,80 +945,378 @@ static void dom_destroy(ray_sym_domain_t* d) {
     ray_sys_free(d);
 }
 
-/* Index a mapped STRL image in one pass WITHOUT materializing any atom:
- * validate magic + count, then record each record's byte offset (the start
- * of its u32 length prefix) into a fresh offsets array.  atoms[] are all
- * NULL — every slot is materialized lazily on first access.  Returns false
- * on structural inconsistency (bad magic, truncated record, trailing bytes)
- * or OOM.  On success *out_atoms (calloc'd NULLs) and *out_offsets (malloc'd
- * byte offsets), each exactly *out_count entries; both NULL when empty. */
-static bool dom_parse_strl_atoms(const void* map, size_t map_size,
-                                 ray_t*** out_atoms, size_t** out_offsets,
-                                 int64_t* out_count) {
-    const uint8_t* base = (const uint8_t*)map;
-    if (map_size < 12) return false;
+/* ---- the index file ------------------------------------------------------- */
 
-    uint32_t magic;
-    memcpy(&magic, base, 4);
-    if (magic != DOMAIN_STRL_MAGIC) return false;
-
-    int64_t count;
-    memcpy(&count, base + 4, 8);
-    if (count < 0 || count > UINT32_MAX) return false;
-
-    ray_t** atoms = NULL;
-    size_t* offsets = NULL;
-    if (count > 0) {
-        atoms = (ray_t**)ray_sys_alloc((size_t)((size_t)count) * (sizeof(ray_t*)));
-        if (!atoms) return false;
-        offsets = (size_t*)ray_sys_alloc((size_t)count * sizeof(size_t));
-        if (!offsets) { ray_sys_free(atoms); return false; }
-    }
-
-    size_t off = 12;
-    size_t remaining = map_size - 12;
-    for (int64_t i = 0; i < count; i++) {
-        offsets[i] = off;          /* start of this record's u32 len prefix */
-        uint32_t slen;
-        if (remaining < 4) goto fail;
-        memcpy(&slen, base + off, 4);
-        off += 4; remaining -= 4;
-        if ((size_t)slen > remaining) goto fail;
-        off += slen; remaining -= slen;
-    }
-    if (remaining != 0) goto fail;
-
-    *out_atoms = atoms;
-    *out_offsets = offsets;
-    *out_count = count;
-    return true;
-
-fail:
-    ray_sys_free(atoms);
-    ray_sys_free(offsets);
-    return false;
+/* Symfiles smaller than this get no index file: walking them at open costs
+ * less than reading one.  RAY_SYM_INDEX_MIN overrides it (bytes). */
+static size_t dom_ix_min(void) {
+    const char* e = getenv("RAY_SYM_INDEX_MIN");
+    if (e && *e) return (size_t)strtoull(e, NULL, 10);
+    return (size_t)1 << 20;
 }
 
-/* Materialize atoms[pos] from the file bytes at offsets[pos] into the arena
- * and publish it.  CALLER MUST HOLD g_dom_lock.  Idempotent: returns an
- * already-published slot without re-materializing.  pos must be a valid file
- * position (0 <= pos < base_count); runtime-appended slots (pos >=
- * base_count) are materialized at append time and are never NULL.  Returns
- * NULL on arena OOM. */
-static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
-    ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
-    ray_t* a = atomic_load_explicit((_Atomic(ray_t*)*)&atoms[pos],
-                                    memory_order_relaxed);
-    if (a) return a;
+static bool dom_ix_name(char* out, size_t cap, const char* sym, const char* suffix) {
+    int n = snprintf(out, cap, "%s.ix%s", sym, suffix);
+    return n > 0 && (size_t)n < cap;
+}
 
-    /* Lazy file slot: read [u32 len | bytes] at offsets[pos] from the map. */
-    const uint8_t* base = (const uint8_t*)d->map;
-    size_t off = d->offsets[pos];
-    uint32_t slen;
-    memcpy(&slen, base + off, 4);
-    a = ray_arena_str(d->arena, (const char*)base + off + 4, slen);
-    if (!a) return NULL;
-    atomic_store_explicit((_Atomic(ray_t*)*)&atoms[pos], a, memory_order_release);
+static bool dom_fseek_ix(FILE* f, int64_t off) {
+#ifdef RAY_OS_WINDOWS
+    return _fseeki64(f, off, SEEK_SET) == 0;
+#else
+    return fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+}
+
+/* Remove the temporary index files (`<sym>.ix.<pid>.tmp`) a process that
+ * no longer runs left behind. */
+static void dom_ix_sweep_tmp(const char* path) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    char dir[PATH_MAX], pre[PATH_MAX];
+    const char* slash = strrchr(path, '/');
+    const char* base = slash ? slash + 1 : path;
+    size_t dl = slash ? (size_t)(slash - path) : 0;
+    if (dl >= sizeof(dir)) return;
+    if (slash) { memcpy(dir, path, dl); dir[dl] = 0; } else { dir[0] = '.'; dir[1] = 0; }
+    int prl = snprintf(pre, sizeof(pre), "%s.ix.", base);
+    if (prl <= 0 || (size_t)prl >= sizeof(pre)) return;
+    DIR* dh = opendir(dir);
+    if (!dh) return;
+    struct dirent* e;
+    while ((e = readdir(dh))) {
+        size_t el = strlen(e->d_name);
+        if (el <= (size_t)prl + 4 || strncmp(e->d_name, pre, (size_t)prl) != 0 ||
+            strcmp(e->d_name + el - 4, ".tmp") != 0) continue;
+        char* stop = NULL;
+        long long pid = strtoll(e->d_name + prl, &stop, 10);
+        if (pid <= 0 || stop != e->d_name + el - 4) continue;
+        if ((unsigned long long)pid == dom_pid()) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s/%s", dir, e->d_name) < (int)sizeof(full))
+            (void)unlink(full);
+    }
+    closedir(dh);
+#else
+    (void)path;
+#endif
+}
+
+/* The identity an index records for the file it was written for: the inode
+ * and one value of the modification and status-change times (the latter
+ * cannot be set back by a writer: an in-place rewrite always moves it). */
+static inline uint64_t dom_id_stamp(const ray_file_id_t* id) {
+    return (uint64_t)id->mtime_ns ^ ((uint64_t)id->ctime_ns * UINT64_C(0x9E3779B97F4A7C15));
+}
+
+/* The index file's header, parsed. */
+typedef struct {
+    int64_t  count;       /* entries covered */
+    uint64_t end;         /* byte offset past their records */
+    uint64_t ino, stamp;  /* the file it was written for (both 0: none claimed) */
+    uint64_t last_ckpt;   /* checkpoint of the last block */
+    uint64_t cap;         /* block slots */
+} dom_ixh_t;
+
+
+
+static void dom_ixh_put(uint8_t* h, const dom_ixh_t* x) {
+    memset(h, 0, DOM_IX_HDR);
+    uint32_t w = DOM_IX_MAGIC;   memcpy(h, &w, 4);
+    w = DOM_IX_VERSION;          memcpy(h + 4, &w, 4);
+    w = (uint32_t)DOM_IX_STRIDE; memcpy(h + 8, &w, 4);
+    memcpy(h + 16, &x->count, 8);
+    memcpy(h + 24, &x->end, 8);
+    memcpy(h + 32, &x->ino, 8);
+    memcpy(h + 40, &x->stamp, 8);
+    memcpy(h + 48, &x->last_ckpt, 8);
+    memcpy(h + 72, &x->cap, 8);
+}
+
+static bool dom_ixh_get(const uint8_t* h, dom_ixh_t* x) {
+    if (dom_rd32(h) != DOM_IX_MAGIC || dom_rd32(h + 4) != DOM_IX_VERSION ||
+        dom_rd32(h + 8) != (uint32_t)DOM_IX_STRIDE)
+        return false;
+    memcpy(&x->count, h + 16, 8);
+    x->end = dom_rd64(h + 24);
+    x->ino = dom_rd64(h + 32);
+    x->stamp = dom_rd64(h + 40);
+    x->last_ckpt = dom_rd64(h + 48);
+    x->cap = dom_rd64(h + 72);
+    return x->count > 0 && x->end > 12 && x->cap >= (uint64_t)dom_ck_count(x->count) &&
+           x->cap <= (uint64_t)dom_ck_count(x->count) * 2 + 4096;
+}
+
+/* Keep a mapping until the domain dies (the index a table points into). */
+static void dom_keep_map(ray_sym_domain_t* d, void* m, size_t sz) {
+    dom_retired_map_t* rm = (dom_retired_map_t*)ray_sys_alloc(sizeof(*rm));
+    if (!rm) return;   /* stays mapped for the process lifetime */
+    rm->map = m;
+    rm->size = sz;
+    rm->next = d->retired_maps;
+    d->retired_maps = rm;
+}
+
+/* The index of symfile `path` for its mapped image (`size` bytes, `count`
+ * entries per its header, identity `id`): a block table pointing at its
+ * checkpoints and its lengths in the index file, mapped (*ixmap /
+ * *ixsize: for the caller to keep while the table lives).  Taken only when
+ * written for this very file — its identity, size and count are the
+ * image's — in this format, with its block sections all there.  Reads the
+ * header only; the checkpoints and the lengths are paged in as entries are
+ * read.  NULL otherwise (or on OOM). */
+static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size, int64_t count,
+                              const ray_file_id_t* id, void** ixmap, size_t* ixsize,
+                              dom_ixh_t* hx) {
+    char ip[PATH_MAX];
+    if (count <= 0 || !path || !id || !id->valid || id->size != size ||
+        !dom_ix_name(ip, sizeof(ip), path, ""))
+        return NULL;
+    FILE* f = fopen(ip, "rb");
+    if (!f) return NULL;
+    uint8_t h[DOM_IX_HDR];
+    dom_ixh_t x;
+    bool ok = fread(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR && dom_ixh_get(h, &x) &&
+              x.count == count && x.end == size && (x.ino | x.stamp) != 0 &&
+              x.ino == id->ino && x.stamp == dom_id_stamp(id);
+    fclose(f);
+    (void)map;
+    dom_blk_t* b = ok ? dom_blk_new(count, false) : NULL;
+    void* m = NULL;
+    size_t msz = 0;
+    ray_file_id_t iid;
+    if (b) {
+        m = ray_vm_map_file_id(ip, &msz, &iid);
+        /* the file mapped is the one read: the same header, every length */
+        ok = m && msz >= DOM_IX_HDR + x.cap * sizeof(dom_ixb_t) &&
+             memcmp(m, h, DOM_IX_HDR) == 0;
+    }
+    if (!b || !ok) {
+        if (m) ray_vm_unmap_file(m, msz);
+        ray_sys_free(b);
+        return NULL;
+    }
+    b->end = size;
+    b->ib = (const dom_ixb_t*)((const uint8_t*)m + DOM_IX_HDR);
+    *ixmap = m;
+    *ixsize = msz;
+    *hx = x;
+    return b;
+}
+
+/* Write `bytes` zero bytes to f. */
+static bool dom_write_zeros(FILE* f, uint64_t bytes) {
+    static const uint8_t z[4096];
+    while (bytes) {
+        size_t c = bytes < sizeof(z) ? (size_t)bytes : sizeof(z);
+        if (fwrite(z, 1, c, f) != c) return false;
+        bytes -= c;
+    }
+    return true;
+}
+
+/* Where a writer takes the entries' lengths from: those of entries below
+ * `na` from the blocks `pb` (a table's own or mapped ones), the others from
+ * lb[i - na]. */
+typedef struct {
+    const dom_ixb_t* pb;
+    int64_t          na;
+    const uint16_t*  lb;
+} dom_lsrc_t;
+
+static inline uint16_t dom_ls_get(const dom_lsrc_t* s, int64_t i) {
+    return i < s->na ? s->pb[i / DOM_IX_STRIDE].len[i % DOM_IX_STRIDE] : s->lb[i - s->na];
+}
+
+/* Blocks [k0, k1) of an index of `count` entries — checkpoints ck[k], lengths
+ * from ls (0 past the last entry) — written to f. */
+static bool dom_write_blocks(FILE* f, const uint64_t* ck, const dom_lsrc_t* ls, int64_t count,
+                             int64_t k0, int64_t k1) {
+    enum { CHUNK = 64 };
+    dom_ixb_t buf[CHUNK];
+    for (int64_t k = k0; k < k1;) {
+        int64_t c = k1 - k < CHUNK ? k1 - k : CHUNK;
+        memset(buf, 0, sizeof(dom_ixb_t) * (size_t)c);
+        for (int64_t q = 0; q < c; q++) {
+            buf[q].off = ck[k + q];
+            int64_t i0 = (k + q) * DOM_IX_STRIDE;
+            for (int64_t j = 0; j < DOM_IX_STRIDE && i0 + j < count; j++)
+                buf[q].len[j] = dom_ls_get(ls, i0 + j);
+        }
+        if (fwrite(buf, sizeof(dom_ixb_t), (size_t)c, f) != (size_t)c) return false;
+        k += c;
+    }
+    return true;
+}
+
+/* Write the whole index of symfile `path`, whose `map` holds the records of
+ * its first `count` entries, ending at byte `end`, with checkpoints
+ * ck[0..n) and the entries' lengths (ls); claimed as the index of the file
+ * of identity `id` when given (and of the size `end`); with room for a
+ * quarter more blocks; to a temporary file renamed over the index.  Best
+ * effort: the index is a cache. */
+static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
+                        const uint64_t* ck, int64_t n, const dom_lsrc_t* ls,
+                        int64_t count, uint64_t end, const ray_file_id_t* id) {
+    if (!path || count <= 0 || n != dom_ck_count(count) || end > map_size || map_size < 12 ||
+        ck[0] != dom_rec0_of(map) ||
+        ck[n - 1] >= end || (ls->na > 0 && !ls->pb) || (ls->na < count && !ls->lb))
+        return;
+    char ip[PATH_MAX], tp[PATH_MAX];
+    char sfx[32];
+    snprintf(sfx, sizeof(sfx), ".%llu.tmp", dom_pid());
+    if (!dom_ix_name(ip, sizeof(ip), path, "") || !dom_ix_name(tp, sizeof(tp), path, sfx)) return;
+    dom_ixh_t x;
+    memset(&x, 0, sizeof(x));
+    x.count = count;
+    x.end = end;
+    if (id && id->valid && id->size == end) {
+        x.ino = id->ino;
+        x.stamp = dom_id_stamp(id);
+    }
+    x.last_ckpt = ck[n - 1];
+    x.cap = (uint64_t)n + (uint64_t)n / 4 + 64;
+    uint8_t h[DOM_IX_HDR];
+    dom_ixh_put(h, &x);
+    dom_ix_sweep_tmp(path);
+    FILE* f = fopen(tp, "wb");
+    bool ok = f && fwrite(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR &&
+              dom_write_blocks(f, ck, ls, count, 0, n) &&
+              dom_write_zeros(f, (x.cap - (uint64_t)n) * sizeof(dom_ixb_t));
+    if (f && fclose(f) != 0) ok = false;
+    if (ok) ok = ray_file_rename(tp, ip) == RAY_OK;
+    if (!ok && f) remove(tp);
+}
+
+/* A writer's refresh of the index of `path` after it appended (`count`
+ * entries, their records ending at `end`; checkpoints ck[0..n), lengths as
+ * dom_ix_save's): when the index on disk is the one this process last read
+ * or wrote (covering `ix_count` entries ending at `ix_end`) and has slots
+ * for the new blocks, the block the old entries ended in and the new blocks
+ * are written into the slots, then the header — the cost of what was
+ * appended; otherwise the index is written whole.  The file is mapped for
+ * its identity, claimed when `stamp`.  Under the symfile's `.lk` flock.  Best effort. */
+static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
+                           const dom_lsrc_t* ls, int64_t count, uint64_t end,
+                           int64_t ix_count, uint64_t ix_end, bool stamp) {
+    if (end < dom_ix_min() || count <= 0 || n != dom_ck_count(count)) return;
+    size_t size = 0;
+    ray_file_id_t id;
+    uint8_t* map = (uint8_t*)ray_vm_map_file_id(path, &size, &id);
+    if (!map) return;
+    char ip[PATH_MAX];
+    FILE* f = ix_count > 0 && end <= size && dom_ix_name(ip, sizeof(ip), path, "")
+            ? fopen(ip, "r+b") : NULL;
+    uint8_t h[DOM_IX_HDR];
+    dom_ixh_t x;
+    bool app = f && fread(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR && dom_ixh_get(h, &x) &&
+               x.count == ix_count && x.end == ix_end && x.count <= count &&
+               (uint64_t)n <= x.cap && size >= 12 && ck[0] == dom_rec0_of(map) && ck[n - 1] < end;
+    if (app) {
+        int64_t k0 = dom_ck_count(x.count) - 1;
+        x.count = count;
+        x.end = end;
+        x.ino = x.stamp = 0;
+        if (stamp && id.valid && id.size == end) { x.ino = id.ino; x.stamp = dom_id_stamp(&id); }
+        x.last_ckpt = ck[n - 1];
+        dom_ixh_put(h, &x);
+        app = dom_fseek_ix(f, DOM_IX_HDR + k0 * (int64_t)sizeof(dom_ixb_t)) &&
+              dom_write_blocks(f, ck, ls, count, k0, n) &&
+              fflush(f) == 0 && dom_fseek_ix(f, 0) && fwrite(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR;
+    }
+    if (f && fclose(f) != 0) app = false;
+    if (!app) dom_ix_save(path, map, size, ck, n, ls, count, end, stamp ? &id : NULL);
+    ray_vm_unmap_file(map, size);
+}
+
+static void dom_ix_save_file(const char* path, const uint64_t* ck, int64_t n,
+                             const uint16_t* lens, int64_t count, uint64_t end) {
+    if (end < dom_ix_min()) return;
+    size_t size = 0;
+    ray_file_id_t id;
+    void* map = ray_vm_map_file_id(path, &size, &id);
+    if (!map) return;
+    dom_lsrc_t ls = { NULL, 0, lens };
+    dom_ix_save(path, (const uint8_t*)map, size, ck, n, &ls, count, end, &id);
+    ray_vm_unmap_file(map, size);
+}
+
+/* The index of the table `b` (its own blocks, from a walk): written whole. */
+static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
+                         const dom_blk_t* b, const ray_file_id_t* id) {
+    uint64_t* ck = (uint64_t*)ray_sys_alloc((size_t)b->n * sizeof(uint64_t));
+    if (!ck) return;
+    for (int64_t k = 0; k < b->n; k++) ck[k] = b->ib[k].off;
+    dom_lsrc_t ls = { b->ib, b->count, NULL };
+    dom_ix_save(path, map, map_size, ck, b->n, &ls, b->count, b->end, id);
+    ray_sys_free(ck);
+}
+
+void ray_sym_domain_index_save(const char* path, const uint64_t* ckpt, int64_t n,
+                               const uint16_t* lens, int64_t count, uint64_t end) {
+    if (path && ckpt && lens) dom_ix_save_file(path, ckpt, n, lens, count, end);
+}
+
+void ray_sym_domain_index_remove(const char* path) {
+    char ip[PATH_MAX];
+    if (path && dom_ix_name(ip, sizeof(ip), path, "")) (void)remove(ip);
+}
+
+/* The block table of the mapped image of `d` (its `count` entries per the
+ * header): from the index file when it is this file's, else by one walk of
+ * all the records (read with explicit reads, dom_src_t), the index then
+ * written for the file.  False when a read of the file fails, when its
+ * records do not end at its end (a truncated file), or on OOM. */
+static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
+    const uint8_t* map = (const uint8_t*)d->map;
+    size_t size = d->map_size;
+    dom_ixh_t hx;
+    void* ixm = NULL;
+    size_t ixs = 0;
+    dom_blk_t* b = dom_ix_load(d->path, map, size, count, &d->map_id, &ixm, &ixs, &hx);
+    bool have = b != NULL;
+    if (have) {
+        dom_keep_map(d, ixm, ixs);
+    } else {
+        b = dom_blk_new(count, true);
+        if (!b) return false;
+        b->end = size;
+        size_t o = d->rec0;
+        dom_src_t src;
+        if (!dom_src_open(&src, d->path, &d->map_id, size)) src = dom_src_map(map, size);
+        bool walked = dom_blk_walk_src(&src, b, 0, &o, d->z) && o == size;
+        dom_src_close(&src);
+        if (!walked) { ray_sys_free(b); return false; }
+    }
+    d->blk = b;
+    d->ix_used = have;
+    d->ix_count = have ? count : 0;
+    d->ix_end = have ? size : 0;
+    d->ix_covered = have ? count : 0;
+    if (!have && count > 0 && size >= dom_ix_min()) {
+        dom_blk_save(d->path, map, size, b, &d->map_id);
+        d->ix_count = count;
+        d->ix_end = size;
+    } else if (!have && size < dom_ix_min()) {
+        ray_sym_domain_index_remove(d->path);   /* one left by a larger file of the name */
+    }
+    return true;
+}
+
+/* Materialize slot `pos` of the file prefix from its record into the arena
+ * and publish it.  CALLER MUST HOLD g_dom_lock.  Idempotent: returns an
+ * already-published slot without re-materializing.  Runtime-appended slots
+ * (pos >= base_count) are set at append time and never NULL.  Returns NULL
+ * on arena OOM. */
+static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
+    ray_t* a = dom_slot_get(atomic_load_explicit(&d->atoms, memory_order_relaxed), pos);
+    if (a) return a;
+    if (pos < 0 || pos >= d->base_count) return NULL;
+    uint32_t slen = 0;
+    const uint8_t* p = dom_entry_locked(d, pos, &slen);
+    if (!p) return NULL;
+    a = ray_arena_str(d->arena, (const char*)p, slen);
+    if (!a || !dom_slot_set_locked(d, pos, a)) return NULL;
     return a;
 }
 
@@ -492,108 +1327,151 @@ static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
  * appends (a second writer) — fails.  Called under g_dom_lock with the
  * file's current size in st_size. */
 static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
+    if (d->z) return false;   /* a compressed file grows only by this process's flushes */
     int64_t count = atomic_load_explicit(&d->count, memory_order_relaxed);
     if (st_size < d->disk_size) return false;       /* shrunk: rewritten */
     if (count != d->disk_count) return false;       /* our tail is dirty */
 
     size_t map_size = 0;
-    void* map = ray_vm_map_file(d->path, &map_size);
+    ray_file_id_t nid;
+    void* map = ray_vm_map_file_id(d->path, &map_size, &nid);
     if (!map) return false;
-
-    ray_t** fresh = NULL;       /* all-NULL (lazy) slot array for the new image */
-    size_t* fresh_offsets = NULL;
-    int64_t fresh_count = 0;
-    if (!dom_parse_strl_atoms(map, map_size, &fresh, &fresh_offsets,
-                              &fresh_count)) {
-        ray_vm_unmap_file(map, map_size);
-        return false;
-    }
-
-    bool ok = fresh_count >= count;
-
     const uint8_t* nbase = (const uint8_t*)map;     /* new image bytes */
-    const uint8_t* obase = (const uint8_t*)d->map;  /* old image bytes (count > 0) */
 
-    /* Read a file record's [len, ptr] at byte offset `off` within `b`. */
-    #define DOM_REC(b, off, lp, pp) do {                       \
-        uint32_t _l; memcpy(&_l, (b) + (off), 4);              \
-        (lp) = _l; (pp) = (const char*)((b) + (off) + 4);      \
-    } while (0)
+    int64_t fresh_count = -1;
+    bool ok = map_size >= 12 && dom_rd32(nbase) == DOMAIN_STRL_MAGIC;
+    if (ok) {
+        memcpy(&fresh_count, nbase + 4, 8);
+        ok = fresh_count >= count && fresh_count <= (int64_t)UINT32_MAX;
+    }
 
     /* Position-0 reservation also holds for externally grown files: the
      * first record of a non-empty file must be the empty string. */
-    if (ok && count == 0 && fresh_count > 0) {
-        uint32_t l0; const char* p0; (void)p0;
-        DOM_REC(nbase, fresh_offsets[0], l0, p0);
-        if (l0 != 0) ok = false;
-    }
+    if (ok && count == 0 && fresh_count > 0)
+        ok = map_size >= 16 && dom_rd32(nbase + 12) == 0;
 
     /* Append-only prefix check: every position we already published must be
-     * byte-identical between the old and new file images.  The old image
-     * indexes [0, base_count): compare mmap bytes directly via the old/new
-     * offsets — no materialization needed.  A flush of this process wrote
-     * the rest, [base_count, count), from appended atoms (never NULL). */
-    ray_t** cur_atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
-    for (int64_t i = 0; ok && i < count; i++) {
-        uint32_t ol, nl; const char *op, *np;
-        if (i < d->base_count) {
-            DOM_REC(obase, d->offsets[i], ol, op);
-        } else {
-            ray_t* a = cur_atoms[i];
-            ol = (uint32_t)ray_str_len(a);
-            op = ray_str_ptr(a);
+     * the same between the old and the new file images.  The new image's
+     * block table comes from the index the writer that grew the file left
+     * (when it is that file's, as at open) or from one walk.  The mapped
+     * prefix [0, base_count) is compared by its table — the same checkpoints
+     * and the same lengths, so the old image's records are not read —
+     * and by the bytes of its first records and of its last, partial block.
+     * A flush of this process wrote the rest, [base_count, count), from
+     * appended atoms (never NULL), compared record by record.  A failure
+     * with the index is tried once more with a walk. */
+    dom_blk_t* ob = d->blk;
+    const uint8_t* obase = (const uint8_t*)d->map;
+    dom_dir_t* cur = atomic_load_explicit(&d->atoms, memory_order_relaxed);
+    dom_blk_t* nb = NULL;
+    bool from_ix = false;
+    void* nixm = NULL;
+    size_t nixs = 0;
+    dom_ixh_t nhx;
+    memset(&nhx, 0, sizeof(nhx));
+    for (int pass = 0; ok && pass < 2; pass++) {
+        nb = pass == 0 ? dom_ix_load(d->path, nbase, map_size, fresh_count, &nid, &nixm, &nixs, &nhx)
+                       : NULL;
+        if (pass == 0 && !nb) pass = 1;
+        if (!nb) {
+            nb = dom_blk_new(fresh_count, true);
+            if (!nb) { ok = false; break; }
+            nb->end = map_size;
+            size_t o = 12;
+            dom_src_t src;
+            if (!dom_src_open(&src, d->path, &nid, map_size)) src = dom_src_map(nbase, map_size);
+            bool walked = dom_blk_walk_src(&src, nb, 0, &o, NULL) && o == map_size;
+            dom_src_close(&src);
+            if (!walked) { ray_sys_free(nb); nb = NULL; ok = false; break; }
         }
-        DOM_REC(nbase, fresh_offsets[i], nl, np);
-        if (ol != nl || (ol > 0 && memcmp(op, np, ol) != 0)) ok = false;
+        from_ix = pass == 0;
+        bool good = true;
+        if (d->base_count > 0) {
+            int64_t full = d->base_count / DOM_IX_STRIDE;
+            good = map_size >= d->map_size;
+            for (int64_t k = 0; good && k < full; k++)
+                good = nb->ib[k].off == ob->ib[k].off && dom_blk_lim(nb, k) == dom_blk_lim(ob, k) &&
+                       memcmp(nb->ib[k].len, ob->ib[k].len, sizeof(nb->ib[k].len)) == 0;
+            for (int64_t i = full * DOM_IX_STRIDE; good && i < d->base_count; i++)
+                good = nb->ib[full].len[i - full * DOM_IX_STRIDE] == ob->ib[full].len[i - full * DOM_IX_STRIDE];
+            if (good && full < ob->n) {
+                uint64_t at = ob->ib[full].off;
+                good = at <= d->map_size && at <= map_size && nb->ib[full].off == at &&
+                       memcmp(nbase + at, obase + at, d->map_size - (size_t)at) == 0;
+            }
+            if (good) {
+                size_t hb = d->map_size - 12 < DOM_IX_HEAD ? d->map_size - 12 : DOM_IX_HEAD;
+                good = memcmp(nbase + 12, obase + 12, hb) == 0;
+            }
+        }
+        /* the entries this process flushed past the mapping, in order */
+        size_t ro = d->base_count > 0 ? d->map_size : 12;
+        for (int64_t i = d->base_count; good && i < count; i++) {
+            ray_t* a = dom_slot_get(cur, i);
+            good = a && (i % DOM_IX_STRIDE || nb->ib[i / DOM_IX_STRIDE].off == ro) &&
+                   map_size - ro >= 4;
+            uint32_t nl = good ? dom_rd32(nbase + ro) : 0;
+            good = good && (size_t)nl <= map_size - ro - 4 && nl == ray_str_len(a) &&
+                   (nl == 0 || memcmp(nbase + ro + 4, ray_str_ptr(a), nl) == 0);
+            ro += 4 + (size_t)nl;
+        }
+        if (good) break;
+        ray_sys_free(nb);
+        nb = NULL;
+        if (nixm) { ray_vm_unmap_file(nixm, nixs); nixm = NULL; }
+        if (pass == 1) ok = false;
     }
-    #undef DOM_REC
 
     if (ok && fresh_count > count) {
-        /* Publish the grown vocabulary.  Build a NEW slot array (replace,
-         * never realloc, so a batch intern probing outside the lock keeps a
-         * valid one): carry the already-materialized prefix atoms
+        /* Publish the grown vocabulary.  A NEW directory (replace, never
+         * grow in place, so a batch intern probing outside the lock keeps a
+         * valid one) carries the already-materialized prefix atoms
          * (arena-owned, still valid; long atoms hold their own copy, so
-         * swapping the map is safe), new file slots start NULL (lazy). */
-        ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
-        ray_t** narr = (ray_t**)ray_sys_alloc((size_t)fresh_count * sizeof(ray_t*));
+         * swapping the map is safe); new file slots start NULL (lazy). */
+        dom_dir_t* narr = dom_dir_new(fresh_count, cur);
         if (!narr) {
             ok = false;
         } else {
-            if (count > 0) memcpy(narr, atoms, (size_t)count * sizeof(ray_t*));
-            for (int64_t i = count; i < fresh_count; i++) narr[i] = NULL;
-            ray_sys_free(fresh);  /* fresh slot array unused — narr carries the prefix */
-
-            /* Swap in the new offsets + map, publish, then let go of the
-             * superseded generation.  Nothing holds it: a reopen runs on
-             * the calling thread between kernels, and a raw snapshot does
-             * not survive one (domain.h) -- unless a batch intern is
+            /* Swap in the new checkpoints + map, publish, then let go of
+             * the superseded generation.  Nothing holds it: a reopen runs
+             * on the calling thread between kernels, and a raw snapshot
+             * does not survive one (domain.h) -- unless a batch intern is
              * probing outside the lock, in which case dom_drop_locked
              * retires instead.  Retiring until the domain dies here was
              * #717: a replica never lets its domain die. */
-            size_t* old_offsets = d->offsets;
-            d->offsets = fresh_offsets;
+            dom_blk_t* old_blk = d->blk;
+            d->blk = nb;
+            d->map_id = nid;
+            nb = NULL;
+            d->ix_used = from_ix;
+            d->ix_count = from_ix ? nhx.count : 0;
+            d->ix_end = from_ix ? nhx.end : 0;
+            d->ix_covered = from_ix ? fresh_count : 0;
+            if (nixm) { dom_keep_map(d, nixm, nixs); nixm = NULL; }
             void* old_map = d->map;
             size_t old_map_size = d->map_size;
             d->map = map;
             d->map_size = map_size;
             d->base_count = fresh_count;
+            /* every flushed entry is in the mapping now */
+            dom_ck_free(&d->wck);
 
             atomic_store_explicit(&d->atoms, narr, memory_order_release);
-            d->atoms_cap = fresh_count;
+            d->atoms_cap = narr->n << DOM_SLOT_LOG;
             atomic_store_explicit(&d->count, fresh_count, memory_order_release);
             d->disk_count = fresh_count;
             d->disk_size = st_size;
             /* The new snapshot record must be published before the old
              * generation goes.  When its allocation fails the old record
-             * stays published and still points at the old offsets and
+             * stays published and still points at the old checkpoints and
              * mapping, so those are retired (valid memory, covering fewer
-             * positions, as before) rather than freed; the atoms array is
+             * positions, as before) rather than freed; the directory is
              * referenced by no record and goes either way. */
             bool snap_ok = dom_publish_raw_snap(d, true);
 
-            (void)dom_drop_locked(d, atoms);
-            if (snap_ok) (void)dom_drop_locked(d, old_offsets);
-            else         (void)dom_retire(d, old_offsets);
+            (void)dom_drop_locked(d, cur);
+            if (snap_ok) (void)dom_drop_locked(d, old_blk);
+            else         (void)dom_retire(d, old_blk);
             if (old_map) {
                 if (snap_ok && d->batch_inflight == 0) {
                     ray_vm_unmap_file(old_map, old_map_size);
@@ -636,12 +1514,99 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     }
 
     /* Failure, or nothing actually new (size-only change): drop the fresh
-     * parse and the new mapping; keep the existing image. */
+     * table and the new mapping; keep the existing image. */
     if (ok && fresh_count == count) d->disk_size = st_size;
-    ray_sys_free(fresh);
-    ray_sys_free(fresh_offsets);
+    ray_sys_free(nb);
+    if (nixm) ray_vm_unmap_file(nixm, nixs);
     ray_vm_unmap_file(map, map_size);
     return ok;
+}
+
+/* ---- preload ----
+ * A symbol file the memory holds with room to spare is read whole when its
+ * table opens (ray_sym_domain_preload): the pool's workers read it in
+ * DOM_PL_CHUNK pieces, many requests in flight, so the page cache holds it
+ * before the first query and the query's reads of the mapping are minor
+ * faults.  A storage request takes its latency however fast the device is,
+ * so one sequential stream reads at a fraction of its throughput.  A file
+ * left out stays lazy (read by the faults of the queries that touch it).
+ * The kernel still evicts these pages under pressure; the lazy path then
+ * reads them again. */
+#define DOM_PL_CHUNK    ((size_t)8 << 20)
+#define DOM_PL_MIN      ((size_t)1 << 20)   /* smaller files: their faults are cheap */
+static _Atomic(int64_t) g_dom_preloaded;   /* bytes of the open domains read at open */
+
+typedef struct {
+    int    fd;
+    size_t size;
+} dom_pl_ctx_t;
+
+static void dom_preload_fn(void* raw, uint32_t wid, int64_t c0, int64_t c1) {
+    (void)wid;
+    const dom_pl_ctx_t* x = (const dom_pl_ctx_t*)raw;
+    uint8_t* buf = (uint8_t*)ray_sys_alloc(DOM_PL_CHUNK);
+    if (!buf) return;   /* the pages stay lazy */
+    for (int64_t c = c0; c < c1; c++) {
+        size_t off = (size_t)c * DOM_PL_CHUNK;
+        size_t n = x->size - off < DOM_PL_CHUNK ? x->size - off : DOM_PL_CHUNK;
+        for (size_t got = 0; got < n;) {
+            ssize_t r = pread(x->fd, buf + got, n - got, (off_t)(off + got));
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+    }
+    ray_sys_free(buf);
+}
+
+void ray_sym_domain_preload(ray_sym_domain_t* d, int64_t headroom) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    if (!d || d->kind != DOM_FILE || d->preloaded) return;
+    size_t size = d->map_size;
+    if (!d->map || size < DOM_PL_MIN) return;
+    const char* e = getenv("RAY_SYM_PRELOAD");
+    int mode = (e && *e) ? atoi(e) : -1;   /* -1: by the memory left; 0 never; 1 always */
+    if (mode == 0) return;
+    bool trace = getenv("RAY_SYM_TRACE") != NULL;
+    int64_t lim = ray_sys_ram_limit();
+    int64_t anon = ray_heap_anon_committed();
+    int64_t had = atomic_fetch_add_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);
+    int64_t left = lim - anon - had - (int64_t)size;
+    if (mode < 0 && (lim <= 0 || left < headroom)) {
+        atomic_fetch_sub_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);
+        if (trace)
+            fprintf(stderr, "sym preload %s: lazy (%zu B; would leave %lld B, needs %lld B)\n",
+                    d->path, size, (long long)left, (long long)headroom);
+        return;
+    }
+    int fd = open(d->path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        atomic_fetch_sub_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);
+        return;
+    }
+    d->preloaded = size;
+    int64_t t0 = trace ? ray_profile_now_ns() : 0;
+    dom_pl_ctx_t x = { fd, size };
+    int64_t nc = (int64_t)((size + DOM_PL_CHUNK - 1) / DOM_PL_CHUNK);
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, nc, 2))
+        ray_pool_dispatch_n(pool, dom_preload_fn, &x, (uint32_t)nc);
+    else
+        dom_preload_fn(&x, 0, 0, nc);
+    close(fd);
+    if (trace)
+        fprintf(stderr, "sym preload %s: read %zu B in %.2f s (leaves %lld B, needs %lld B)\n",
+                d->path, size, (double)(ray_profile_now_ns() - t0) / 1e9,
+                (long long)left, (long long)headroom);
+#else
+    (void)d; (void)headroom;
+#endif
+}
+
+static void dom_preload_release(ray_sym_domain_t* d) {
+    if (d->preloaded)
+        atomic_fetch_sub_explicit(&g_dom_preloaded, (int64_t)d->preloaded, memory_order_relaxed);
+    d->preloaded = 0;
 }
 
 static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
@@ -688,44 +1653,46 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     atomic_store_explicit(&d->raw_snap, NULL, memory_order_relaxed);
     d->retired_maps = NULL;
     d->path = rpath;
+    d->rec0 = 12;
     /* String atoms (lazy file slots + runtime-appended interns) live here,
      * off the per-thread buddy heap.  64 KB chunks. */
     d->arena = ray_arena_new(64 * 1024);
     if (!d->arena) { ray_sys_free(d); ray_sys_free(rpath); return NULL; }
 
     if (exists) {
-        d->map = ray_vm_map_file(rpath, &d->map_size);
-        ray_t** atoms = NULL;
-        size_t* offsets = NULL;
-        int64_t count = 0;
-        if (!d->map ||
-            !dom_parse_strl_atoms(d->map, d->map_size, &atoms, &offsets, &count)) {
+        /* Mapped, not read: the records are reached through checkpoints
+         * (the sparse record index above), from the index file when it is
+         * valid, so opening reads only the index and the records after it. */
+        d->map = ray_vm_map_file_id(rpath, &d->map_size, &d->map_id);
+        int64_t count = -1;
+        const uint8_t* m = (const uint8_t*)d->map;
+        if (m && d->map_size >= 12 && dom_rd32(m) == DOMAIN_STRL_MAGIC)
+            memcpy(&count, m + 4, 8);
+        if (m && d->map_size >= DOM_Z_REC0 && dom_rd32(m) == DOMAIN_STRZ_MAGIC) {
+            /* a compressed file: its symbol table (and the encoder's index,
+             * for appends) is copied out of the header */
+            d->z = (ray_fsst_table_t*)ray_sys_alloc(sizeof(ray_fsst_table_t));
+            d->zix = (ray_fsst_index_t*)ray_sys_alloc(sizeof(ray_fsst_index_t));
+            if (d->z && d->zix) {
+                memcpy(d->z, m + 12, DOM_Z_TAB);
+                ray_fsst_index_build(d->z, d->zix);
+                d->rec0 = DOM_Z_REC0;
+                memcpy(&count, m + 4, 8);
+            }
+        }
+        if (count < 0 || count > (int64_t)UINT32_MAX || !dom_index_image(d, count)) {
             dom_destroy(d);
             return NULL;
         }
-        atomic_store_explicit(&d->atoms, atoms, memory_order_relaxed);
+        dom_dir_t* dir = count > 0 ? dom_dir_new(count, NULL) : NULL;
+        if (count > 0 && !dir) { dom_destroy(d); return NULL; }
+        atomic_store_explicit(&d->atoms, dir, memory_order_relaxed);
         atomic_store_explicit(&d->count, count, memory_order_relaxed);
-        d->offsets = offsets;
-        d->atoms_cap = count;
+        d->atoms_cap = dir ? dir->n << DOM_SLOT_LOG : 0;
         d->base_count = count;
         (void)dom_publish_raw_snap(d, false);
         d->disk_count = count;
         d->disk_size = d->map_size;
-        /* Position-0 reservation: every non-empty symfile must carry the
-         * empty string at position 0 (mirrors global id 0 — the SYM
-         * null; group kernels and null conventions treat id 0 as "" /
-         * null).  A vocabulary that starts with anything else is
-         * structurally corrupt for domain use.  Empty files are fine.
-         * Check the file bytes directly (slen at offsets[0] must be 0) —
-         * no atom materialization needed. */
-        if (count > 0) {
-            uint32_t l0;
-            memcpy(&l0, (const uint8_t*)d->map + offsets[0], 4);
-            if (l0 != 0) {
-                dom_destroy(d);
-                return NULL;
-            }
-        }
     }
     /* create && !exists: empty domain — vocabulary appears via intern
      * ("" seeded at position 0) and reaches disk on first flush. */
@@ -785,6 +1752,7 @@ ray_sym_domain_t* ray_sym_domain_new(void) {
     if (!d) return NULL;
     d->kind = DOM_FILE;
     d->rc = 1;
+    d->rec0 = 12;
     atomic_store_explicit(&d->raw_snap, NULL, memory_order_relaxed);
     d->arena = ray_arena_new(64 * 1024);
     if (!d->arena) { ray_sys_free(d); return NULL; }
@@ -821,19 +1789,19 @@ ray_t* ray_sym_domain_str(ray_sym_domain_t* dom, int64_t pos) {
     if (dom->kind == DOM_RUNTIME) return ray_sym_str(pos);
     if (dom->kind == DOM_IMPORT) return NULL;
 
-    /* Lock-free fast path: acquire the published count, then the array, then
-     * the slot.  Appends release-publish the count after the slot write;
-     * array replacements are release-published before the count bump, and an
-     * append retires the old array (valid memory) — a reader can never index
-     * a published position into memory that lacks it.  An external extend
-     * frees the old array instead: no reader runs during a reopen (see the
-     * concurrency note at the top of the file).  A NULL slot is an
-     * unmaterialized lazy file entry: fall to the lock-held materialize. */
+    /* Lock-free fast path: acquire the published count, then the directory,
+     * then the chunk and the slot.  Appends release-publish the count after
+     * the slot write; directory replacements are release-published before
+     * the count bump, and an append retires the old directory (valid memory)
+     * — a reader can never index a published position into memory that
+     * lacks it.  An external extend frees the old directory instead: no
+     * reader runs during a reopen (see the concurrency note at the top of
+     * the file).  A NULL slot is an unmaterialized lazy file entry (or one
+     * whose chunk this directory has not seen): fall to the lock-held
+     * materialize. */
     int64_t count = atomic_load_explicit(&dom->count, memory_order_acquire);
     if (pos < 0 || pos >= count) return NULL;
-    ray_t** atoms = atomic_load_explicit(&dom->atoms, memory_order_acquire);
-    ray_t* a = atomic_load_explicit((_Atomic(ray_t*)*)&atoms[pos],
-                                    memory_order_acquire);
+    ray_t* a = dom_slot_get(atomic_load_explicit(&dom->atoms, memory_order_acquire), pos);
     if (a) return a;
 
     dom_lock();
@@ -847,10 +1815,33 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     dom_raw_snap_t* snap = atomic_load_explicit(&dom->raw_snap, memory_order_acquire);
     if (!snap) return false;
     out->map = snap->map;
-    out->offsets = snap->offsets;
+    out->ib = snap->blk->ib;
     out->count = snap->count;
+    out->blk = snap->blk;
+    out->dom = dom;
+    out->z = dom->z;
     return true;
 }
+
+int64_t ray_sym_domain_strlen(ray_sym_domain_t* dom, int64_t pos) {
+    if (!dom || pos < 0) return -1;
+    ray_sym_domain_raw_t r;
+    if (dom->kind == DOM_FILE && ray_sym_domain_raw_pin(dom, &r) && pos < r.count)
+        return ray_sym_domain_raw_len(&r, pos);
+    ray_t* s = ray_sym_domain_str(dom, pos);
+    return s ? (int64_t)ray_str_len(s) : -1;
+}
+
+bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out) {
+    if (!dom || !out || dom->kind != DOM_FILE) return false;
+    dom_lock();
+    out->from_index = dom->ix_used;
+    out->lens_mapped = dom->blk && dom->blk->ib && !dom->blk->own_ib;
+    out->covered = dom->ix_covered;
+    dom_unlock();
+    return true;
+}
+
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
     (void)dom;   /* the snapshot outlives its readers by contract: no pin
                   * across a reopen (domain.h, ray_sym_domain_raw_pin) */
@@ -879,13 +1870,18 @@ const int64_t* ray_sym_domain_runtime_lut(ray_sym_domain_t* dom) {
         if (!lut) { dom_unlock(); return NULL; }
         /* THE sanctioned interning of a file vocabulary into the global
          * table: one sequential pass over the VOCABULARY (never the
-         * rows).  Callers that hand ids to ray_pool_dispatch workers
+         * rows), straight from the records — no domain atom is made for
+         * it.  Callers that hand ids to ray_pool_dispatch workers
          * must request this LUT during sequential setup — interning
          * inside a worker violates sym.c's frozen-table rule. */
+        size_t off = dom->rec0;
         for (int64_t i = 0; i < count; i++) {
-            ray_t* a = dom_atom_at_locked(dom, i);
-            if (!a) { ray_sys_free(lut); dom_unlock(); return NULL; }
-            lut[i] = ray_sym_intern(ray_str_ptr(a), ray_str_len(a));
+            const char* p = NULL;
+            size_t l = 0;
+            if (!dom_next_locked(dom, i, &off, &p, &l)) {
+                ray_sys_free(lut); dom_unlock(); return NULL;
+            }
+            lut[i] = ray_sym_intern(p, l);
             if (lut[i] < 0) {
                 /* 7a-review hardening: never publish a LUT carrying -1
                  * intern failures — a silent -1 makes cross-domain keys
@@ -927,10 +1923,13 @@ static bool dom_build_index_locked(ray_sym_domain_t* d, int64_t extra) {
             buckets[slot] = e;
         }
     } else {
+        /* One pass over the records, hashed where they lie: no atom. */
+        size_t off = d->rec0;
         for (int64_t i = 0; i < count; i++) {
-            ray_t* a = dom_atom_at_locked(d, i);
-            if (!a) { ray_sys_free(buckets); return false; }
-            uint32_t h = (uint32_t)ray_hash_bytes(ray_str_ptr(a), ray_str_len(a));
+            const char* p = NULL;
+            size_t l = 0;
+            if (!dom_next_locked(d, i, &off, &p, &l)) { ray_sys_free(buckets); return false; }
+            uint32_t h = (uint32_t)ray_hash_bytes(p, l);
             uint64_t slot = h & mask;
             while (buckets[slot] != 0) slot = (slot + 1) & mask;
             buckets[slot] = ((uint64_t)h << 32) | ((uint64_t)(uint32_t)i + 1);
@@ -956,9 +1955,9 @@ static int64_t dom_probe_locked(ray_sym_domain_t* d, uint32_t h,
         uint64_t e = d->buckets[slot];
         if ((uint32_t)(e >> 32) == h) {
             int64_t pos = (int64_t)(uint32_t)e - 1;
-            ray_t* a = dom_atom_at_locked(d, pos);
-            if (a && ray_str_len(a) == len &&
-                (len == 0 || memcmp(ray_str_ptr(a), str, len) == 0))
+            size_t l = 0;
+            const char* p = dom_bytes_locked(d, pos, &l);
+            if (p && l == len && (len == 0 || memcmp(p, str, len) == 0))
                 return pos;
         }
         slot = (slot + 1) & mask;
@@ -1004,18 +2003,10 @@ static int64_t dom_append_locked(ray_sym_domain_t* d, uint32_t h,
     int64_t count = atomic_load_explicit(&d->count, memory_order_relaxed);
     if (count >= (int64_t)UINT32_MAX) return -1;
 
-    /* Grow the published array by REPLACING it — never realloc in place:
+    /* Grow the published directory by REPLACING it — never in place:
      * lock-free readers may hold the old pointer. */
-    if (count >= d->atoms_cap) {
-        int64_t ncap = d->atoms_cap < 8 ? 8 : d->atoms_cap * 2;
-        ray_t** narr = (ray_t**)ray_sys_alloc((size_t)ncap * sizeof(ray_t*));
-        if (!narr) return -1;
-        ray_t** old = atomic_load_explicit(&d->atoms, memory_order_relaxed);
-        if (count > 0) memcpy(narr, old, (size_t)count * sizeof(ray_t*));
-        if (!dom_retire(d, old)) { ray_sys_free(narr); return -1; }
-        atomic_store_explicit(&d->atoms, narr, memory_order_release);
-        d->atoms_cap = ncap;
-    }
+    if (!dom_grow_locked(d, count + 1)) return -1;
+    if (!dom_chunk_locked(d, count)) return -1;
 
     /* Bucket headroom (rebuild covers everything published so far). */
     uint64_t cap = d->bucket_mask + 1;
@@ -1029,8 +2020,7 @@ static int64_t dom_append_locked(ray_sym_domain_t* d, uint32_t h,
     ray_t* s = ray_arena_str(d->arena, str, len);
     if (!s) return -1;
 
-    ray_t** atoms = atomic_load_explicit(&d->atoms, memory_order_relaxed);
-    atoms[count] = s;
+    (void)dom_slot_set_locked(d, count, s);   /* its chunk exists (above) */
     atomic_store_explicit(&d->count, count + 1, memory_order_release);
 
     uint64_t mask = d->bucket_mask;
@@ -1105,7 +2095,7 @@ int64_t ray_sym_domain_intern(ray_sym_domain_t* dom, const char* str, size_t len
 typedef struct {
     const uint64_t*      buckets;
     uint64_t             mask;
-    ray_t* const*        atoms;
+    dom_dir_t*           atoms;
     int64_t              count;
     ray_sym_domain_raw_t raw;      /* raw.count == 0: no file prefix */
     const char* const*   strs;
@@ -1124,7 +2114,7 @@ typedef struct {
     int64_t*             uoff;       /* [total] its byte offset in region */
     char*                region;     /* one arena region for the whole batch */
     int64_t              base;       /* position of new string 0 */
-    ray_t**              atoms_w;    /* current atom array (fill target) */
+    dom_dir_t*           atoms_w;    /* current directory (fill target; chunks made) */
     _Atomic(uint8_t)*    done;       /* [n_tasks] insert task t finished (parallel commit) */
     int64_t              insert_total;
     /* Set when a probe met an entry it could not compare (no atom, no
@@ -1151,8 +2141,7 @@ static void dom_batch_probe_fn(void* raw, uint32_t wid, int64_t start, int64_t e
                 if (pos < b->count) {
                     const char* p = NULL;
                     size_t l = 0;
-                    ray_t* a = atomic_load_explicit((_Atomic(ray_t*)*)&b->atoms[pos],
-                                                    memory_order_acquire);
+                    ray_t* a = dom_slot_get(b->atoms, pos);
                     if (a) { p = ray_str_ptr(a); l = ray_str_len(a); }
                     else if (pos < b->raw.count) p = ray_sym_domain_raw_str(&b->raw, pos, &l);
                     else atomic_store_explicit((_Atomic(bool)*)&b->unsure, true, memory_order_relaxed);
@@ -1225,7 +2214,9 @@ static void dom_batch_insert_fn(void* raw, uint32_t wid, int64_t k0, int64_t k1)
         int64_t i = b->ui[k];
         int64_t pos = b->base + k;
         ray_t* s = ray_arena_str_at(b->region + b->uoff[k], b->strs[i], b->lens[i]);
-        b->atoms_w[pos] = s;
+        dom_slots_t* c = atomic_load_explicit(&b->atoms_w->c[pos >> DOM_SLOT_LOG],
+                                              memory_order_relaxed);
+        atomic_store_explicit(&c->a[pos & (DOM_SLOTS - 1)], s, memory_order_relaxed);
         uint32_t h = b->hashes[i];
         uint64_t e = ((uint64_t)h << 32) | ((uint64_t)(uint32_t)pos + 1);
         uint64_t slot = h & b->mask;
@@ -1486,23 +2477,13 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
         for (int p = 0; p < n_part; p++) total += b.uniq_n[p];
         int64_t base = b.count;
         ok = base + total < (int64_t)UINT32_MAX;
-        /* Atom array: grow once by replacement (lock-free readers may hold
-         * the old pointer). */
-        if (ok && base + total > dom->atoms_cap) {
-            int64_t ncap = dom->atoms_cap < 8 ? 8 : dom->atoms_cap;
-            while (ncap < base + total) ncap *= 2;
-            ray_t** narr = (ray_t**)ray_sys_alloc((size_t)ncap * sizeof(ray_t*));
-            if (!narr) ok = false;
-            else {
-                ray_t** old = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
-                if (base > 0) memcpy(narr, old, (size_t)base * sizeof(ray_t*));
-                if (!dom_retire(dom, old)) { ray_sys_free(narr); ok = false; }
-                else {
-                    atomic_store_explicit(&dom->atoms, narr, memory_order_release);
-                    dom->atoms_cap = ncap;
-                }
-            }
-        }
+        /* Directory: grow once by replacement (lock-free readers may hold
+         * the old pointer), and make the chunks the new slots fall in, so
+         * the insert tasks only store into them. */
+        if (ok) ok = dom_grow_locked(dom, base + total);
+        for (int64_t k = base >> DOM_SLOT_LOG;
+             ok && total > 0 && k <= (base + total - 1) >> DOM_SLOT_LOG; k++)
+            ok = dom_chunk_locked(dom, k << DOM_SLOT_LOG) != NULL;
         if (ok && total > 0) {
             b.ui = (int64_t*)ray_sys_alloc((size_t)total * 2 * sizeof(int64_t));
             if (!b.ui) ok = false;
@@ -1634,6 +2615,58 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom) {
 
 /* ---- flush ------------------------------------------------------------------ */
 
+/* The index file once a flush left the symfile holding `count` entries
+ * whose records end at byte `end`: the mapped prefix's checkpoints and the
+ * flushed ones, the prefix's lengths (its table's) and the flushed
+ * entries' (their atoms'), after every flush of a file large enough —
+ * appended to the index on disk, at the cost of the records flushed
+ * (dom_ix_refresh), so a reader never finds an index short of the file.
+ * Called under the symfile's `.lk` flock. */
+/* The record bytes of an appended string `s`: itself, or of a compressed
+ * file coded with its table into *buf.  NULL on OOM. */
+static const uint8_t* dom_rec_bytes(const ray_sym_domain_t* dom, const char* s, size_t slen,
+                                    uint8_t** buf, size_t* cap, size_t* rlen) {
+    if (!dom->z) { *rlen = slen; return (const uint8_t*)s; }
+    uint8_t* out = dom_buf_need(buf, cap, 2 * slen + 8);
+    if (!out) return NULL;
+    *rlen = (size_t)ray_fsst_encode_ix(dom->z, dom->zix, (const uint8_t*)s, (uint32_t)slen, out);
+    return out;
+}
+
+static void dom_flush_index(ray_sym_domain_t* dom, int64_t count, uint64_t end) {
+    dom_lock();
+    bool want = end >= dom_ix_min();
+    int64_t nb = dom->blk ? dom->blk->n : 0, n = nb + dom->wck.n;
+    int64_t base = dom->base_count;
+    const dom_ixb_t* bl = dom->blk ? dom->blk->ib : NULL;   /* stays mapped or retired, never freed */
+    uint64_t* all = want && n == dom_ck_count(count) && (base == 0 || bl)
+                  ? (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t)) : NULL;
+    uint16_t* tl = all && count > base ? (uint16_t*)ray_sys_alloc((size_t)(count - base) * 2) : NULL;
+    if (all && count > base && !tl) { ray_sys_free(all); all = NULL; }
+    if (all) {
+        for (int64_t k = 0; k < nb; k++) all[k] = dom->blk->ib[k].off;
+        if (dom->wck.n) memcpy(all + nb, dom->wck.v, (size_t)dom->wck.n * sizeof(uint64_t));
+        dom_dir_t* dir = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+        for (int64_t i = base; i < count; i++) {
+            ray_t* a = dom_slot_get(dir, i);
+            size_t l = a ? ray_str_len(a) : 0;
+            tl[i - base] = l < DOM_LEN_LONG ? (uint16_t)l : (uint16_t)DOM_LEN_LONG;
+        }
+    }
+    int64_t ixc = dom->ix_count;
+    uint64_t ixe = dom->ix_end;
+    dom_unlock();
+    if (!all) return;
+    dom_lsrc_t ls = { bl, base, tl };
+    dom_ix_refresh(dom->path, all, n, &ls, count, end, ixc, ixe, true);
+    ray_sys_free(all);
+    ray_sys_free(tl);
+    dom_lock();
+    dom->ix_count = count;
+    dom->ix_end = end;
+    dom_unlock();
+}
+
 ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     if (!dom) return RAY_ERR_TYPE;
     if (dom->kind == DOM_RUNTIME) return RAY_OK; /* sym.c owns its own files */
@@ -1641,21 +2674,9 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     if (!dom->path) return RAY_ERR_DOMAIN;
 
     dom_lock();
-    int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
-    int64_t disk_count = dom->disk_count;
-    size_t  disk_size  = dom->disk_size;
-    /* Materialize every slot under the lock so the lock-free snapshot below
-     * has no NULL (lazy) entries to write.  The atoms are arena-owned, so
-     * once materialized they stay valid for the rest of this call. */
-    if (count != disk_count) {
-        for (int64_t i = 0; i < count; i++) {
-            if (!dom_atom_at_locked(dom, i)) { dom_unlock(); return RAY_ERR_OOM; }
-        }
-    }
-    ray_t** atoms = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+    bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count;
     dom_unlock();
-
-    if (count == disk_count) return RAY_OK; /* nothing new */
+    if (!dirty) return RAY_OK; /* nothing new */
 
     char lock_path[1024];
     char tmp_path[1024];
@@ -1670,6 +2691,26 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     ray_err_t err = ray_file_lock_ex(lock_fd);
     if (err != RAY_OK) { ray_file_close(lock_fd); return err; }
 
+    /* What to write, read under the flock: no other flush of this file runs
+     * now, and while this process holds unflushed entries no reopen
+     * replaces the mapping (dom_extend_from_file_locked refuses a dirty
+     * domain).  The mapped prefix is written from its records, the rest
+     * from the appended atoms (never NULL). */
+    dom_lock();
+    int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
+    int64_t disk_count = dom->disk_count;
+    size_t  disk_size  = dom->disk_size;
+    int64_t base_count = dom->base_count;
+    const uint8_t* bmap = (const uint8_t*)dom->map;
+    size_t  bsize = dom->map_size;
+    dom_dir_t* dir = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+    dom_unlock();
+    if (count == disk_count) {
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_OK;
+    }
+
     /* Verify-base-unchanged: the file on disk must be EXACTLY what this
      * object last persisted (size + header count).  In-memory interning
      * assigns positions speculatively, so any divergence means a second
@@ -1683,6 +2724,9 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
                 ray_file_close(lock_fd);
                 return RAY_ERR_CORRUPT; /* concurrent writer created it */
             }
+            /* a new file: an index left by an earlier one under this name
+             * describes nothing in it */
+            ray_sym_domain_index_remove(dom->path);
         } else {
             bool ok = exists && (size_t)st.st_size == disk_size;
             if (ok) {
@@ -1691,7 +2735,8 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
                 int64_t fcount = -1;
                 if (!vf || fread(&magic, 4, 1, vf) != 1 ||
                     fread(&fcount, 8, 1, vf) != 1 ||
-                    magic != DOMAIN_STRL_MAGIC || fcount != disk_count)
+                    magic != (dom->z ? DOMAIN_STRZ_MAGIC : DOMAIN_STRL_MAGIC) ||
+                    fcount != disk_count)
                     ok = false;
                 if (vf) fclose(vf);
             }
@@ -1703,8 +2748,9 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
         }
     }
 
-    /* Write base + tail to tmp. */
+    /* Write base + tail to tmp, noting the checkpoints of the tail. */
     size_t written_size = 0;
+    dom_ck_t tail = {0};
     {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) {
@@ -1712,21 +2758,35 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
             ray_file_close(lock_fd);
             return RAY_ERR_IO;
         }
-        uint32_t magic = DOMAIN_STRL_MAGIC;
+        /* a compressed file keeps its header (the symbol table) and codes
+         * the new records with it */
+        uint32_t magic = dom->z && base_count > 0 ? DOMAIN_STRZ_MAGIC : DOMAIN_STRL_MAGIC;
         err = RAY_OK;
         if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&count, 8, 1, f) != 1)
             err = RAY_ERR_IO;
         written_size = 12;
+        if (err == RAY_OK && base_count > 0) {
+            if (fwrite(bmap + 12, 1, bsize - 12, f) != bsize - 12) err = RAY_ERR_IO;
+            written_size = bsize;
+        }
         /* Records are packed into a large buffer first: two stdio calls per
          * entry dominated the flush of a big vocabulary. */
         enum { FLUSH_BUF = 1u << 20 };
         uint8_t* wb = (uint8_t*)ray_sys_alloc(FLUSH_BUF);
-        size_t wn = 0;
+        uint8_t* zb = NULL;
+        size_t zc = 0, wn = 0;
         if (!wb) err = RAY_ERR_OOM;
-        for (int64_t i = 0; err == RAY_OK && i < count; i++) {
-            ray_t* s = atoms[i];
+        for (int64_t i = base_count; err == RAY_OK && i < count; i++) {
+            ray_t* s = dom_slot_get(dir, i);
+            if (!s) { err = RAY_ERR_CORRUPT; break; }
+            if (!(i % DOM_IX_STRIDE) && !dom_ck_push(&tail, written_size)) {
+                err = RAY_ERR_OOM;
+                break;
+            }
             size_t slen = ray_str_len(s);
             if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+            const uint8_t* rb = dom_rec_bytes(dom, ray_str_ptr(s), slen, &zb, &zc, &slen);
+            if (!rb) { err = RAY_ERR_OOM; break; }
             uint32_t len32 = (uint32_t)slen;
             if (wn + 4 + slen > FLUSH_BUF) {
                 if (wn && fwrite(wb, 1, wn, f) != wn) { err = RAY_ERR_IO; break; }
@@ -1735,19 +2795,20 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
             if (4 + slen > FLUSH_BUF) {
                 /* Oversized record: straight through. */
                 if (fwrite(&len32, 4, 1, f) != 1 ||
-                    fwrite(ray_str_ptr(s), 1, slen, f) != slen) {
+                    fwrite(rb, 1, slen, f) != slen) {
                     err = RAY_ERR_IO;
                     break;
                 }
             } else {
                 memcpy(wb + wn, &len32, 4);
-                if (slen) memcpy(wb + wn + 4, ray_str_ptr(s), slen);
+                if (slen) memcpy(wb + wn + 4, rb, slen);
                 wn += 4 + slen;
             }
             written_size += 4 + slen;
         }
         if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
         ray_sys_free(wb);
+        ray_sys_free(zb);
         if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
     }
     if (err != RAY_OK) goto fail_tmp;
@@ -1763,6 +2824,14 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     err = ray_file_rename(tmp_path, dom->path);
     if (err != RAY_OK) goto fail_tmp;
 
+    dom_lock();
+    dom->disk_count = count;
+    dom->disk_size = written_size;
+    dom_ck_free(&dom->wck);
+    dom->wck = tail;
+    dom_unlock();
+    tail.v = NULL;
+
     if (durable) {
         err = ray_file_sync_dir(dom->path);
         if (err != RAY_OK) {
@@ -1772,16 +2841,13 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
         }
     }
 
-    dom_lock();
-    dom->disk_count = count;
-    dom->disk_size = written_size;
-    dom_unlock();
-
+    dom_flush_index(dom, count, written_size);
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
     return RAY_OK;
 
 fail_tmp:
+    dom_ck_free(&tail);
     remove(tmp_path);
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
@@ -1803,17 +2869,9 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     if (!dom->path) return RAY_ERR_DOMAIN;
 
     dom_lock();
-    int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
-    int64_t disk_count = dom->disk_count;
-    size_t  disk_size  = dom->disk_size;
-    /* Only the entries past the persisted prefix are written: materialize
-     * those under the lock (arena-owned, they stay valid after it). */
-    for (int64_t i = disk_count; i < count; i++) {
-        if (!dom_atom_at_locked(dom, i)) { dom_unlock(); return RAY_ERR_OOM; }
-    }
-    ray_t** atoms = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+    bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count;
     dom_unlock();
-    if (count == disk_count && !durable) return RAY_OK;
+    if (!dirty && !durable) return RAY_OK;
 
     char lock_path[1024];
     if (snprintf(lock_path, sizeof(lock_path), "%s.lk", dom->path) >= (int)sizeof(lock_path))
@@ -1823,6 +2881,20 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     if (lock_fd == RAY_FD_INVALID) return RAY_ERR_IO;
     ray_err_t err = ray_file_lock_ex(lock_fd);
     if (err != RAY_OK) { ray_file_close(lock_fd); return err; }
+
+    /* Only the entries past the persisted prefix are written: appended
+     * atoms (never NULL), read under the flock as in ray_sym_domain_flush. */
+    dom_lock();
+    int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
+    int64_t disk_count = dom->disk_count;
+    size_t  disk_size  = dom->disk_size;
+    dom_dir_t* dir = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
+    dom_unlock();
+    if (count == disk_count && !durable) {
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_OK;
+    }
 
     /* The file must still be the persisted size: anything else is another
      * writer. */
@@ -1834,6 +2906,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         ray_file_close(lock_fd);
         return RAY_ERR_CORRUPT;
     }
+    if (disk_count == 0) ray_sym_domain_index_remove(dom->path);   /* a new file */
     FILE* f = fopen(dom->path, disk_count == 0 ? "wb+" : "rb+");
     if (!f) { ray_file_unlock(lock_fd); ray_file_close(lock_fd); return RAY_ERR_IO; }
     size_t size = disk_size;
@@ -1845,33 +2918,41 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     } else if (!dom_fseek(f, (int64_t)disk_size)) {
         err = RAY_ERR_IO;
     }
+    dom_ck_t tail = {0};
     enum { FLUSH_BUF = 1u << 20 };
     uint8_t* wb = err == RAY_OK ? (uint8_t*)ray_sys_alloc(FLUSH_BUF) : NULL;
-    size_t wn = 0;
+    uint8_t* zb = NULL;
+    size_t zc = 0, wn = 0;
     if (err == RAY_OK && !wb) err = RAY_ERR_OOM;
     for (int64_t i = disk_count; err == RAY_OK && i < count; i++) {
-        ray_t* s = atoms[i];
+        ray_t* s = dom_slot_get(dir, i);
+        if (!s) { err = RAY_ERR_CORRUPT; break; }
+        if (!(i % DOM_IX_STRIDE) && !dom_ck_push(&tail, size)) { err = RAY_ERR_OOM; break; }
         size_t slen = ray_str_len(s);
         if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+        /* appended to a compressed file: coded with its table */
+        const uint8_t* rb = dom_rec_bytes(dom, ray_str_ptr(s), slen, &zb, &zc, &slen);
+        if (!rb) { err = RAY_ERR_OOM; break; }
         uint32_t len32 = (uint32_t)slen;
         if (wn + 4 + slen > FLUSH_BUF) {
             if (wn && fwrite(wb, 1, wn, f) != wn) { err = RAY_ERR_IO; break; }
             wn = 0;
         }
         if (4 + slen > FLUSH_BUF) {
-            if (fwrite(&len32, 4, 1, f) != 1 || fwrite(ray_str_ptr(s), 1, slen, f) != slen) {
+            if (fwrite(&len32, 4, 1, f) != 1 || fwrite(rb, 1, slen, f) != slen) {
                 err = RAY_ERR_IO;
                 break;
             }
         } else {
             memcpy(wb + wn, &len32, 4);
-            if (slen) memcpy(wb + wn + 4, ray_str_ptr(s), slen);
+            if (slen) memcpy(wb + wn + 4, rb, slen);
             wn += 4 + slen;
         }
         size += 4 + slen;
     }
     if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
     ray_sys_free(wb);
+    ray_sys_free(zb);
     /* the count goes in last, once the records it covers are written */
     if (err == RAY_OK && (fflush(f) != 0 || !dom_fseek(f, 4) ||
                           fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0))
@@ -1891,10 +2972,202 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         dom_lock();
         dom->disk_count = count;
         dom->disk_size = size;
+        for (int64_t k = 0; err == RAY_OK && k < tail.n; k++)
+            if (!dom_ck_push(&dom->wck, tail.v[k])) err = RAY_ERR_OOM;
+        if (err != RAY_OK) dom_ck_free(&dom->wck);   /* no index from here on */
         dom_unlock();
+        if (err == RAY_OK) dom_flush_index(dom, count, size);
+        err = RAY_OK;   /* the symfile is written; the index is a cache */
     }
+    dom_ck_free(&tail);
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
+    return err;
+}
+
+/* ---- compressing a symfile -------------------------------------------------- */
+
+/* One window of the coding pass: chunk c holds the records of blocks
+ * [k0 + c * cb, k0 + (c + 1) * cb), coded into out[c] (olen[c] bytes), the
+ * offset of each of its blocks' first record in rel[c][]. */
+typedef struct {
+    const uint8_t*          map;
+    const dom_ixb_t*        ib;
+    int64_t                 n, count, k0, cb;
+    uint64_t                end;
+    const ray_fsst_table_t* t;
+    const ray_fsst_index_t* ix;
+    uint8_t**               out;
+    size_t*                 cap;
+    size_t*                 olen;
+    uint64_t**              rel;
+    _Atomic(bool)           oom;
+} dom_zc_ctx_t;
+
+static void dom_zc_chunk_fn(void* vctx, uint32_t wid, int64_t c0, int64_t c1) {
+    (void)wid;
+    dom_zc_ctx_t* x = (dom_zc_ctx_t*)vctx;
+    for (int64_t c = c0; c < c1; c++) {
+        int64_t ka = x->k0 + c * x->cb, kb = ka + x->cb < x->n ? ka + x->cb : x->n;
+        uint64_t lo = x->ib[ka].off, hi = kb < x->n ? x->ib[kb].off : x->end;
+        uint8_t* out = dom_buf_need(&x->out[c], &x->cap[c], 2 * (size_t)(hi - lo) + 16);
+        if (!out) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); return; }
+        const uint8_t* p = x->map + lo;
+        size_t o = 0;
+        int64_t ie = kb * DOM_IX_STRIDE < x->count ? kb * DOM_IX_STRIDE : x->count;
+        for (int64_t i = ka * DOM_IX_STRIDE; i < ie; i++) {
+            if (!(i % DOM_IX_STRIDE)) x->rel[c][i / DOM_IX_STRIDE - ka] = o;
+            uint32_t l = dom_rd32(p);
+            uint32_t cl = (uint32_t)ray_fsst_encode_ix(x->t, x->ix, p + 4, l, out + o + 4);
+            memcpy(out + o, &cl, 4);
+            o += 4 + cl;
+            p += 4 + l;
+        }
+        x->olen[c] = o;
+    }
+}
+
+ray_err_t ray_sym_domain_compress(const char* path) {
+    if (!path) return RAY_ERR_TYPE;
+    char* rpath = dom_resolve_path(path);
+    if (!rpath) return RAY_ERR_IO;
+    /* the file is replaced under its name: no domain may have it open */
+    dom_lock();
+    for (ray_sym_domain_t* d = g_domains; d; d = d->next)
+        if (dom_path_eq(d->path, rpath)) { dom_unlock(); ray_sys_free(rpath); return RAY_ERR_DOMAIN; }
+    dom_unlock();
+
+    size_t size = 0;
+    ray_file_id_t id;
+    const uint8_t* map = (const uint8_t*)ray_vm_map_file_id(rpath, &size, &id);
+    int64_t count = -1;
+    if (map && size >= 12 && dom_rd32(map) == DOMAIN_STRL_MAGIC) memcpy(&count, map + 4, 8);
+    if (count <= 0 || count > (int64_t)UINT32_MAX) {
+        /* not a plain symfile with entries (a compressed one stays as it is) */
+        if (map) ray_vm_unmap_file((void*)map, size);
+        ray_sys_free(rpath);
+        return RAY_OK;
+    }
+    ray_vm_advise_seq((void*)map, size);
+    /* the block table: from the file's index, else one walk */
+    dom_ixh_t hx;
+    void* ixm = NULL;
+    size_t ixs = 0;
+    dom_blk_t* b = dom_ix_load(rpath, map, size, count, &id, &ixm, &ixs, &hx);
+    if (!b) {
+        b = dom_blk_new(count, true);
+        size_t o = 12;
+        dom_src_t src;
+        if (b && !dom_src_open(&src, rpath, &id, size)) src = dom_src_map(map, size);
+        bool walked = b && dom_blk_walk_src(&src, b, 0, &o, NULL) && o == size;
+        if (b) dom_src_close(&src);
+        if (!walked) {
+            ray_sys_free(b);
+            ray_vm_unmap_file((void*)map, size);
+            ray_sys_free(rpath);
+            return b ? RAY_ERR_IO : RAY_ERR_OOM;
+        }
+        b->end = size;
+    }
+    ray_err_t err = RAY_OK;
+    int64_t n = b->n;
+
+    /* the training sample: every record of every sb-th block, some 1 MiB */
+    int64_t sb = (int64_t)((size - 12) >> 20);
+    if (sb < 1) sb = 1;
+    int64_t sn = 0, scap = ((n + sb - 1) / sb) * DOM_IX_STRIDE;
+    const uint8_t** sp = (const uint8_t**)ray_sys_alloc((size_t)scap * sizeof(*sp));
+    uint32_t* sl = (uint32_t*)ray_sys_alloc((size_t)scap * sizeof(*sl));
+    ray_fsst_table_t* t = (ray_fsst_table_t*)ray_sys_alloc(sizeof(*t));
+    ray_fsst_index_t* tix = (ray_fsst_index_t*)ray_sys_alloc(sizeof(*tix));
+    if (!sp || !sl || !t || !tix) err = RAY_ERR_OOM;
+    for (int64_t k = 0; err == RAY_OK && k < n; k += sb) {
+        const uint8_t* p = map + b->ib[k].off;
+        int64_t ie = (k + 1) * DOM_IX_STRIDE < count ? (k + 1) * DOM_IX_STRIDE : count;
+        for (int64_t i = k * DOM_IX_STRIDE; i < ie; i++) {
+            sl[sn] = dom_rd32(p);
+            sp[sn++] = p + 4;
+            p += 4 + (size_t)dom_rd32(p);
+        }
+    }
+    int tr = err == RAY_OK ? ray_fsst_train(sp, sl, sn, t) : 0;
+    ray_sys_free(sp);
+    ray_sys_free(sl);
+    if (err == RAY_OK && tr < 0) err = RAY_ERR_OOM;
+    bool code = err == RAY_OK && tr > 0;   /* no table: the file stays plain */
+
+    char tp[PATH_MAX];
+    uint64_t* ck = code ? (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t)) : NULL;
+    if (code && (!ck || snprintf(tp, sizeof(tp), "%s.z.%llu.tmp", rpath, dom_pid()) >= (int)sizeof(tp)))
+        err = ck ? RAY_ERR_IO : RAY_ERR_OOM;
+    FILE* f = code && err == RAY_OK ? fopen(tp, "wb") : NULL;
+    if (code && err == RAY_OK && !f) err = RAY_ERR_IO;
+    uint64_t pos = DOM_Z_REC0;
+    if (f) {
+        ray_fsst_index_build(t, tix);
+        uint32_t magic = DOMAIN_STRZ_MAGIC;
+        if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&count, 8, 1, f) != 1 ||
+            fwrite(t, 1, DOM_Z_TAB, f) != DOM_Z_TAB)
+            err = RAY_ERR_IO;
+        /* windows of chunks of some 2 MiB of records, coded in parallel and
+         * written in order */
+        ray_pool_t* pool = ray_pool_get();
+        uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+        int64_t cb = (int64_t)(((uint64_t)(2u << 20) * (uint64_t)n) / (size - 12));
+        if (cb < 1) cb = 1;
+        int64_t wn = 2 * (int64_t)nw < 64 ? 2 * (int64_t)nw : 64;
+        dom_zc_ctx_t x;
+        memset(&x, 0, sizeof(x));
+        x.map = map; x.ib = b->ib; x.n = n; x.count = count; x.cb = cb; x.end = size;
+        x.t = t; x.ix = tix;
+        x.out = (uint8_t**)ray_sys_alloc((size_t)wn * sizeof(uint8_t*));
+        x.cap = (size_t*)ray_sys_alloc((size_t)wn * sizeof(size_t));
+        x.olen = (size_t*)ray_sys_alloc((size_t)wn * sizeof(size_t));
+        x.rel = (uint64_t**)ray_sys_alloc((size_t)wn * sizeof(uint64_t*));
+        if (!x.out || !x.cap || !x.olen || !x.rel) err = RAY_ERR_OOM;
+        for (int64_t c = 0; err == RAY_OK && c < wn; c++)
+            if (!(x.rel[c] = (uint64_t*)ray_sys_alloc((size_t)cb * sizeof(uint64_t)))) err = RAY_ERR_OOM;
+        for (int64_t k0 = 0; err == RAY_OK && k0 < n; k0 += wn * cb) {
+            int64_t nc = (n - k0 + cb - 1) / cb;
+            if (nc > wn) nc = wn;
+            x.k0 = k0;
+            if (pool && nc > 1) ray_pool_dispatch_n(pool, dom_zc_chunk_fn, &x, (uint32_t)nc);
+            else dom_zc_chunk_fn(&x, 0, 0, nc);
+            if (atomic_load_explicit(&x.oom, memory_order_relaxed)) { err = RAY_ERR_OOM; break; }
+            for (int64_t c = 0; c < nc; c++) {
+                int64_t ka = k0 + c * cb, kb = ka + cb < n ? ka + cb : n;
+                for (int64_t k = ka; k < kb; k++) ck[k] = pos + x.rel[c][k - ka];
+                if (fwrite(x.out[c], 1, x.olen[c], f) != x.olen[c]) { err = RAY_ERR_IO; break; }
+                pos += x.olen[c];
+            }
+        }
+        for (int64_t c = 0; x.out && c < wn; c++) ray_sys_free(x.out[c]);
+        for (int64_t c = 0; x.rel && c < wn; c++) ray_sys_free(x.rel[c]);
+        ray_sys_free(x.out); ray_sys_free(x.cap); ray_sys_free(x.olen); ray_sys_free(x.rel);
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+        /* the index describes the old file until it is written anew */
+        if (err == RAY_OK) ray_sym_domain_index_remove(rpath);
+        if (err == RAY_OK) err = ray_file_rename(tp, rpath);
+        if (err != RAY_OK) remove(tp);
+    }
+    if (code && err == RAY_OK && pos >= dom_ix_min()) {
+        size_t zsize = 0;
+        ray_file_id_t zid;
+        const uint8_t* zmap = (const uint8_t*)ray_vm_map_file_id(rpath, &zsize, &zid);
+        if (zmap) {
+            /* the lengths are the strings', as before: the old table's */
+            dom_lsrc_t ls = { b->ib, count, NULL };
+            dom_ix_save(rpath, zmap, zsize, ck, n, &ls, count, zsize, &zid);
+            ray_vm_unmap_file((void*)zmap, zsize);
+        }
+    }
+    ray_sys_free(ck);
+    ray_sys_free(t);
+    ray_sys_free(tix);
+    ray_sys_free(b);
+    if (ixm) ray_vm_unmap_file(ixm, ixs);
+    ray_vm_unmap_file((void*)map, size);
+    ray_sys_free(rpath);
     return err;
 }
 
