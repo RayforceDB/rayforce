@@ -229,7 +229,7 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
         if (both_f32_atoms(a, b)) return ray_f32((float)r);
         return make_f64(r);
     }
-    int8_t rt = promote_int_type_right(a, b);
+    int8_t rt = promote_int_type(a, b);
     /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
     int64_t la = as_i64(a), lb = as_i64(b);
     return make_typed_int(rt, (int64_t)((uint64_t)la - (uint64_t)lb));

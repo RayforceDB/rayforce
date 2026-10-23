@@ -203,18 +203,6 @@ static inline int8_t promote_int_type(ray_t* a, ray_t* b) {
     return -RAY_I64;
 }
 
-/* Promote integer type following right-operand's type (integer-promotion convention for sub) */
-static inline int8_t promote_int_type_right(ray_t* a, ray_t* b) {
-    (void)a;
-    int8_t bt = b->type;
-    if (bt == -RAY_I32 || bt == -RAY_I16 || bt == -RAY_U8 || bt == -RAY_I64)
-        return bt;
-    int8_t at = a->type;
-    if (at == -RAY_I32 || at == -RAY_I16 || at == -RAY_U8 || at == -RAY_I64)
-        return at;
-    return -RAY_I64;
-}
-
 /* Create a result atom of the given type from an int64_t value */
 static inline ray_t* make_typed_int(int8_t atom_type, int64_t val) {
     switch (atom_type) {
