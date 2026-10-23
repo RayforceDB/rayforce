@@ -4010,32 +4010,49 @@ static test_result_t test_domain_index_writers(void) {
             TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]), i);
         TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
         ray_sym_domain_release(dom);
+        /* the import's index as it left it (an open that does not take it
+         * writes its own) */
+        memset(ix_buf, 0, sizeof ix_buf);
+        FILE* fx = fopen(pix, "rb");
+        size_t got = fx ? fread(ix_buf, 1, sizeof ix_buf, fx) : 0;
+        if (fx) fclose(fx);
         ray_sym_domain_t* re = ray_sym_domain_open(p);
         TEST_ASSERT_NOT_NULL(re);
         TEST_ASSERT(ix_check_all(re, &ix_va, N), "after the import's sync");
         TEST_ASSERT(ix_check_lens(re, &ix_va, N), "the import's lengths");
         in = ix_info(re);
         if (!in.from_index) {
-            /* the index's claim against the file it now finds */
-            uint8_t h[48] = {0};
-            FILE* fx = fopen(pix, "rb");
-            size_t got = fx ? fread(h, 1, sizeof h, fx) : 0;
-            if (fx) fclose(fx);
+            /* its claim against the file, each check of the open */
+            FILE* fs = fopen(p, "rb");
+            size_t fsz = fs ? fread(ix_sym, 1, sizeof ix_sym, fs) : 0;
+            if (fs) fclose(fs);
+            const uint8_t* h = ix_buf;
             int64_t cnt = 0;
-            uint64_t end = 0, ino = 0, stamp = 0;
+            uint64_t end = 0, ino = 0, stamp = 0, last = 0, cap = 0;
+            uint32_t hcrc = 0, lcrc = 0, headc = 0;
+            memcpy(&hcrc, h + 12, 4);
             memcpy(&cnt, h + 16, 8); memcpy(&end, h + 24, 8);
             memcpy(&ino, h + 32, 8); memcpy(&stamp, h + 40, 8);
+            memcpy(&last, h + 48, 8); memcpy(&lcrc, h + 56, 4);
+            memcpy(&headc, h + 60, 4); memcpy(&cap, h + 72, 8);
+            uint64_t he = fsz - 12 < 4096 ? fsz : 12 + 4096;
+            uint32_t f_head = fsz > 12 ? ray_crc32(0, ix_sym + 12, (size_t)(he - 12)) : 0;
+            uint32_t f_last = last < fsz ? ray_crc32(0, ix_sym + last, (size_t)(fsz - last)) : 0;
             struct stat st;
             memset(&st, 0, sizeof st);
             (void)stat(p, &st);
             uint64_t now = (uint64_t)ix_mtime_ns(&st) ^
                            ((uint64_t)ix_ctime_ns(&st) * UINT64_C(0x9E3779B97F4A7C15));
             ray_sym_domain_release(re);
-            FAILF("the import's index is not taken: index (%zu B) count %lld end %llu ino %llu stamp %llx; "
-                  "file size %lld ino %llu stamp %llx; covered %lld rescued %lld",
-                  got, (long long)cnt, (unsigned long long)end, (unsigned long long)ino,
-                  (unsigned long long)stamp, (long long)st.st_size, (unsigned long long)st.st_ino,
-                  (unsigned long long)now, (long long)in.covered, (long long)in.rescued);
+            FAILF("the import's index is not taken: index (%zu B, needs %llu) hdr crc %s count %lld "
+                  "end %llu ino %llu stamp %llx; file (%zu B read) size %lld ino %llu stamp %llx; "
+                  "head crc %s, last crc %s; covered %lld rescued %lld",
+                  got, (unsigned long long)(IXH + 8 * cap + (uint64_t)cnt),
+                  hcrc == ray_crc32(0, h + 16, IXH - 16) ? "ok" : "BAD", (long long)cnt,
+                  (unsigned long long)end, (unsigned long long)ino, (unsigned long long)stamp,
+                  fsz, (long long)st.st_size, (unsigned long long)st.st_ino, (unsigned long long)now,
+                  f_head == headc ? "ok" : "BAD", f_last == lcrc ? "ok" : "BAD",
+                  (long long)in.covered, (long long)in.rescued);
         }
         TEST_ASSERT_EQ_I(in.covered, N);
         TEST_ASSERT_EQ_I(in.rescued, 0);
