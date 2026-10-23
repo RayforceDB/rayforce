@@ -738,16 +738,18 @@ static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
 /* (prior fn vec) — pairwise combinator over adjacent elements:
  * out[i] = (fn v[i] v[i-1]) for i >= 1, out[0] = (fn v[0] v[0]) — the
  * self-pair start matches the concat/take shift idiom it replaces
- * (prev[0] = v[0]), so a comparison's first slot compares equal → false.
+ * (prev[0] = v[0]).
  * The six comparison operators over null-free
  * numeric/temporal typed vectors (plus ==//= over SYM, where adjacent
- * same-vector ids compare directly) run one fused pass returning a BOOL
+ * same-vector ids, including null id0, compare directly) run one fused pass returning a BOOL
  * vector — no shifted copy, no boxing.  Everything else falls to the
  * generic per-pair application returning a LIST, mirroring scan. */
 static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
     if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
         return NULL;
-    if (ray_vec_may_have_nulls(vec)) return NULL;
+    /* SYM EQ/NE compare canonical same-vector ids, including null id0;
+     * nullable numeric comparisons still need the generic atom path. */
+    if (vec->type != RAY_SYM && ray_vec_may_have_nulls(vec)) return NULL;
     ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
     int op;                                   /* 0:< 1:> 2:<= 3:>= 4:== 5:!= */
     if      (bf == ray_lt_fn)  op = 0;
@@ -768,7 +770,8 @@ static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
     }
     int64_t n = vec->len;
     ray_t* out = ray_vec_new(RAY_BOOL, n);
-    if (!out || RAY_IS_ERR(out)) { if (out) ray_release(out); return NULL; }
+    /* Allocation failure after admission must not switch BOOL to LIST. */
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
     uint8_t* restrict o = (uint8_t*)ray_data(out);
     #define PRIOR_CMP_LOOP(READ)                                          \
