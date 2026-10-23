@@ -87,6 +87,8 @@ struct ray_symimp_s {
     int64_t  tail;                 /* bytes of records + header */
     int64_t  fsize;                /* the file's current length */
     int64_t  synced;               /* bytes whose writeback was started */
+    int64_t  ix_count, ix_tail;    /* the last durable sync's: its index is
+                                    * written at free when nothing came after */
     _Atomic(int64_t)* count_out;
     /* A replaced shard table may still be read by a lock-free lookup that
      * loaded it.  Lookups register in the parity of the epoch they start
@@ -533,7 +535,10 @@ ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) {
     }
     if (msync(m->map, (size_t)tail, MS_SYNC) != 0 || fsync(m->fd) != 0) return RAY_ERR_IO;
     err = ray_file_sync_dir(m->path);
-    if (err == RAY_OK) si_save_index(m, count, tail);
+    /* The index claims the file's identity, which on macOS the unmap of a
+     * written shared mapping still moves (its modification time): it is
+     * written at free, once the mapping is gone. */
+    if (err == RAY_OK) { m->ix_count = count; m->ix_tail = tail; }
     return err;
 }
 
@@ -577,9 +582,10 @@ void ray_symimp_free(ray_symimp_t* m) {
     }
     for (int k = 0; k < 2; k++)
         for (si_tab_t* t = m->retired[k]; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
-    for (int c = 0; c < SI_OFF_CHUNKS; c++) ray_sys_free(m->offc[c]);
     if (m->map) munmap(m->map, m->reserve);
     if (m->fd >= 0) close(m->fd);
+    if (m->ix_count > 0 && m->tail == m->ix_tail) si_save_index(m, m->ix_count, m->ix_tail);
+    for (int c = 0; c < SI_OFF_CHUNKS; c++) ray_sys_free(m->offc[c]);
     ray_sys_free(m->path);
     ray_sys_free(m);
 }
