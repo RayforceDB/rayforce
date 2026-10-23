@@ -22,6 +22,7 @@
  */
 
 #include "lang/eval.h"
+#include "lang/internal.h"   /* quoted mutator entry points */
 #include "lang/env.h"
 #include "lang/nfo.h"
 #include "table/sym.h"   /* ray_read_sym — capture names */
@@ -262,8 +263,11 @@ static void init_sf_syms(void) {
 static bool ast_refs_locals(compiler_t *c, ray_t *ast);
 static bool sym_is_local_ref(compiler_t *c, int64_t id) {
     if (id == sf_self || id == sf_eval || id == sf_resolve) return true;
+    const int64_t* segs = NULL;
+    int nseg = ray_sym_is_dotted(id) ? ray_sym_segs(id, &segs) : 0;
     for (int32_t i = c->n_locals - 1; i >= 0; i--)
-        if (c->locals[i].sym_id == id) return true;   /* params, lets, captures */
+        if (c->locals[i].sym_id == id ||
+            (nseg > 1 && c->locals[i].sym_id == segs[0])) return true;   /* params, lets, captures */
     return false;
 }
 static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
@@ -603,12 +607,12 @@ static void compile_sf_return(compiler_t *c, ray_t *ast, ray_t **elems, int64_t 
  * see this frame's local slots — so materialize the locals known
  * at this point (plus self) into a scope frame around the eval,
  * and sync any let-updates back into the slots afterwards. */
-static void compile_dyn_form(compiler_t *c, ray_t *ast) {
+static void compile_dyn_form(compiler_t *c, ray_t *ast, bool all_locals) {
     /* The window binds the locals the form mentions (none in the
      * common globals-only case) and marks where the text's scope
      * ends: a function the text calls, or a window of whoever called
      * this frame, sees none of them (OP_SCOPE_EVAL). */
-    bool refs = ast_refs_locals(c, ast);
+    bool refs = all_locals || ast_refs_locals(c, ast);
     int32_t nsyms = refs ? c->n_locals : 0;
     ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
     if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
@@ -728,7 +732,13 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     }
 
     /* An unrecognized special form: dynamic eval on the whole form. */
-    if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) { compile_dyn_form(c, ast); return; }
+    if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) {
+        /* A mutator's target may be a computed symbol, not a literal mention
+         * of the local. Its eval window must still expose the current frame. */
+        ray_vary_fn f = fn->type == RAY_VARY ? (ray_vary_fn)(uintptr_t)fn->i64 : NULL;
+        compile_dyn_form(c, ast, f == ray_insert || f == ray_insert_fn || f == ray_alter_fn);
+        return;
+    }
 
     /* `eval` and `resolve` read names from text at run time: the tree
      * walker that serves them resolves through the scope frames, so the
@@ -854,6 +864,10 @@ static void compile_expr_at(compiler_t *c, ray_t *ast) {
                 emit(c, (uint8_t)slot);
                 emit(c, (uint8_t)(idx >> 8));
                 emit(c, (uint8_t)(idx & 0xFF));
+            } else if (ray_sym_is_dotted(ast->i64) && sym_is_local_ref(c, ast->i64)) {
+                /* A member of a local dictionary must resolve through this
+                 * frame, not a same-named global root. */
+                compile_dyn_form(c, ast, true);
             } else if (ast->i64 == sf_self) {
                 /* `self` as a value is the running lambda, as the tree
                  * walker binds it in every call frame. */
@@ -1026,7 +1040,14 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
 static bool syms_contain(ray_t *syms, int64_t id) {
     if (!syms) return false;
     const int64_t *ids = (const int64_t*)ray_data(syms);
-    for (int64_t i = 0; i < syms->len; i++) if (ids[i] == id) return true;
+    for (int64_t i = 0; i < syms->len; i++) {
+        if (ids[i] == id) return true;
+        if (ray_sym_is_dotted(ids[i])) {
+            const int64_t* segs;
+            int n = ray_sym_segs(ids[i], &segs);
+            if (n > 1 && segs[0] == id) return true;
+        }
+    }
     return false;
 }
 

@@ -65,6 +65,12 @@ typedef struct {
      * text calls.  A lookup made by compiled code, or from inside a lambda
      * called under the window, passes it by. */
     uint8_t  eval_window;
+    /* A dynamic-eval window mirrors these bytecode locals. The slots remain
+     * owning refs; named mutation may discount only the matching mirror. */
+    ray_t** slot_values;
+    const int64_t* slot_names;
+    uint8_t* slot_rows;
+    int32_t slot_count;
     /* RAY_SCOPE_CALL only: the call was made by name, so the body's text
      * was written outside the query and its literal symbols are literals. */
     uint8_t  named;

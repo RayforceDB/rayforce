@@ -1,0 +1,63 @@
+;; Quoted insert and alter target the same lexical binding that is read.
+(set vg [50 60])
+(set vf (fn [] (let vg (til 2)) (insert 'vg 9) vg))
+(list (vf) vg) -- (list [0 1 9] [50 60])
+
+((fn [] (let v (til 3)) (alter 'v set 1 9) v)) -- [0 9 2]
+((fn [] (let v (til 3)) (alter 'v concat [3 4]) v)) -- [0 1 2 3 4]
+((fn [] (let v (list 1 2 3)) (alter 'v remove 1) v)) -- (list 1 3)
+((fn [] (let v (list 1 2)) (alter 'v set 0 'x) v)) -- (list 'x 2)
+
+;; Parameters retain copy-on-write isolation from the caller.
+(set arg [1 2 3])
+((fn [v] (alter 'v set 0 9) v) arg) -- [9 2 3]
+arg -- [1 2 3]
+((fn [v] (insert 'v 4) v) arg) -- [1 2 3 4]
+arg -- [1 2 3]
+
+;; A real alias or captured value must not observe the write.
+((fn [] (let v (til 3)) (let alias v) (alter 'v set 0 9) (list v alias))) -- (list [9 1 2] [0 1 2])
+((fn [] (let v (til 3)) (let saved (fn [] v)) (alter 'v set 0 9) (list v (saved)))) -- (list [9 1 2] [0 1 2])
+((fn [] (let v (til 5)) (let sliced (drop v 2)) (alter 'v set 2 9) (list v sliced))) -- (list [0 1 9 3 4] [2 3 4])
+((fn [] (let v (til 5)) (let sliced (drop v 2)) (alter 'sliced set 0 9) (list v sliced))) -- (list [0 1 2 3 4] [9 3 4])
+
+;; Errors leave the target bound and do not write a same-named global.
+(set v [50 60])
+((fn [] (let v (til 3)) (try (alter 'v set 99 9) (fn [e] 0)) v)) -- [0 1 2]
+v -- [50 60]
+((fn [] (let v (til 3)) (try (insert 'v 'bad) (fn [e] 0)) v)) -- [0 1 2]
+v -- [50 60]
+((fn [] (let v (til 3)) (try (alter 'v set (raise "bad") 9) (fn [e] 0)) v)) -- [0 1 2]
+
+;; A successfully published write survives a later caught error.
+((fn [] (let v (til 3)) (try (do (alter 'v set 0 9) (raise "bad")) (fn [e] 0)) v)) -- [9 1 2]
+
+;; A symbol constructed at runtime still targets the enclosing local.
+((fn [] (let v (til 3)) (alter (as 'SYM "v") set 0 9) v)) -- [9 1 2]
+((fn [] (let v (til 3)) (insert (as 'SYM "v") 9) v)) -- [0 1 2 9]
+v -- [50 60]
+
+;; Dotted locals use their own dictionary chain, never the global root.
+(set state (dict [v] (list [50 60])))
+((fn [] (let state (dict [v] (list (til 3)))) (alter 'state.v set 0 9) state.v)) -- [9 1 2]
+state.v -- [50 60]
+((fn [] (let state (dict [v] (list (til 3)))) (let alias state) (alter 'state.v set 0 9) (list state.v alias.v))) -- (list [9 1 2] [0 1 2])
+
+;; Local tables append without rebinding an unrelated global table.
+(set P (table [x] (list [50 60])))
+((fn [] (let P (table [x] (list (til 2)))) (insert 'P (list 9)) (at P 'x))) -- [0 1 9]
+(at P 'x) -- [50 60]
+((fn [] (let P (table [x] (list (til 2)))) (let alias P) (insert 'P (list 9)) (list (at P 'x) (at alias 'x)))) -- (list [0 1 9] [0 1])
+((fn [] (let P (table [x] (list (til 2)))) (let saved (fn [] P)) (insert 'P (list 9)) (list (count P) (count (saved))))) -- (list 3 2)
+((fn [] (let P (table [x] (list (til 2)))) (try (insert 'P (list 1 2)) (fn [e] 0)) (at P 'x))) -- [0 1]
+
+;; The whole dictionary path, not just its leaf's refcount, must be private.
+((fn [] (let s (dict [P] (list (table [x] (list (til 2)))))) (let alias s) (insert 's.P (list 9)) (list (count s.P) (count alias.P)))) -- (list 3 2)
+
+;; A separately defined function cannot mutate its caller's unrelated local.
+(set append_global (fn [] (insert 'vg 9)))
+((fn [] (let vg [1 2]) (append_global) vg)) -- [1 2]
+vg -- [50 60 9]
+
+(alter 'unknown_950 set 0 1) !- name
+(insert 'unknown_950 1) !- domain

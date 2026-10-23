@@ -455,8 +455,33 @@ combined table (the two-argument form does not mutate its argument):
                (list [TSLA] [250.0] [300])))
 ```
 
-To mutate a named global in place, pass the target as a quoted symbol —
-`(insert 'trades newrows)` — or use `upsert` with an explicit key count,
+For named mutation, `(insert 'trades newrows)` appends to the innermost
+visible local or parameter named `trades`, falling back to a global only
+when no such local exists. It returns the target symbol. An error never
+redirects a local write into a same-named global. The same resolution applies
+to `alter`, including dictionary paths rooted in a local:
+
+```lisp
+(set collect (fn [rows]
+  (let records (table [ts qty] (list (as 'I64 []) (as 'I64 []))))
+  (let weights (til 3))
+  (insert 'records rows)
+  (alter 'weights set 0 99)
+  records))
+```
+
+A unique ordinary local table can use the same amortized append path as a
+unique global table. Unique writable vectors can be amended by `alter set`
+without copying. Actual aliases, captured values, slices, mapped storage,
+and shared dictionary paths retain copy-on-write isolation. Other operations
+retain their existing allocation behavior; named mutation does not promise
+that every operation or representation avoids allocation.
+
+A separately defined function does not gain access to its caller's locals.
+Query source columns/aliases are not writable named targets, and a dotted
+mutation path must traverse dictionaries rather than table columns or methods.
+An unbound target is an error. These rules do not change `upsert`'s existing
+contract; for a global target it takes an explicit key count:
 `(upsert 'trades 1 newrows)`.
 
 ## C API
