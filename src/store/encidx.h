@@ -129,7 +129,7 @@ static inline int ray_enc_idx_kind_has_region(uint8_t k) {
 
 /* The kinds whose file carries a region after the side data: the
  * root-parsed kinds, and DICT (P6b), whose region the column writer builds
- * and the reader validates on its own (ray_enc_dict_validate). */
+ * and the reader parses on its own (ray_enc_dict_parse). */
 static inline int ray_enc_idx_kind_in_file(uint8_t k) {   /* a region follows the side data */
     return ray_enc_idx_kind_has_region(k) || k == 7;
 }
@@ -153,7 +153,7 @@ typedef struct {
  * or length (naming the kind), io on a short write. */
 ray_t*  ray_enc_index_write(FILE* f, const ray_enc_idx_src_t* s, uint64_t* bytes);
 
-/* A validated region: the root's fields by kind, the name into the region. */
+/* A region's root fields by kind, the name into the region. */
 typedef struct {
     uint8_t        kind;
     int8_t         parent_type;
@@ -169,43 +169,19 @@ typedef struct {
     uint32_t       order_len;
 } ray_enc_idx_view_t;
 
-/* Validate `size` bytes at `region` as an index of `kind` for a column of
- * (parent_type, attrs, len); SYM ids must be below sym_bound.  col_data is
- * the decoded column (PART float zero-sign rule) or NULL to skip that one
- * rule (writers re-checking a source).  NULL with *out filled, or an owned
- * corrupt error naming `path`. */
-ray_t* ray_enc_index_validate(const uint8_t* region, uint64_t size, uint8_t kind,
-                              int8_t parent_type, uint8_t attrs, int64_t len,
-                              uint32_t sym_bound, const void* col_data,
-                              const char* path, ray_enc_idx_view_t* out);
+/* `size` bytes at `region`, an index of `kind` for a column of
+ * (parent_type, attrs, len) that rayforce wrote, as a view: the kind's
+ * fields and the order name, read as written. */
+void   ray_enc_index_view(const uint8_t* region, uint64_t size, uint8_t kind,
+                          int8_t parent_type, uint8_t attrs, int64_t len, ray_enc_idx_view_t* out);
 
-/* Children copied out of the region by the validation itself (a large
- * HASH: table, gkeys, offs, rows), for ray_enc_index_parse_copy; owned
- * heap vectors or NULL.  Every slot is NULL after a validation error. */
-typedef struct { ray_t* hash[4]; } ray_enc_idx_copies_t;
-
-/* ray_enc_index_validate, filling *copies when the checks copied the
- * children as they read them (the same verdict and errors either way). */
-ray_t* ray_enc_index_validate_copy(const uint8_t* region, uint64_t size, uint8_t kind,
-                                   int8_t parent_type, uint8_t attrs, int64_t len,
-                                   uint32_t sym_bound, const void* col_data,
-                                   const char* path, ray_enc_idx_view_t* out,
-                                   ray_enc_idx_copies_t* copies);
-
-/* A fresh heap RAY_INDEX root from a validated view, every child copied
- * into a heap vector of its slot's type.  SYM PART keys adopt the domain
- * of `vec` (the decoded column); order_name is interned in this process.
- * NULL with *root_out set (owned), or an owned oom error.  Nothing in the
- * root refers to the region, so it outlives the mapping.  A view whose
- * fields do not lie inside its region is corrupt, and a SYM PART without
- * a SYM `vec` is a type error: the view is re-tied to the region before
- * any count sizes an allocation. */
+/* A fresh heap RAY_INDEX root from a view, every child copied into a heap
+ * vector of its slot's type.  SYM PART keys adopt the domain of `vec` (the
+ * decoded column); order_name is interned in this process.  NULL with
+ * *root_out set (owned), or an owned oom error (a SYM PART without a SYM
+ * `vec` is a type error).  Nothing in the root refers to the region, so it
+ * outlives the mapping. */
 ray_t* ray_enc_index_parse(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out);
-/* ray_enc_index_parse taking the children *copies holds for the view's
- * kind and counts in place of copying them; consumes *copies (every slot
- * is NULL on return, on any path). */
-ray_t* ray_enc_index_parse_copy(const ray_enc_idx_view_t* v, ray_t* vec, ray_t** root_out,
-                                ray_enc_idx_copies_t* copies);
 
 /* order_sym a writer may convert to a name (spec "Writing the index"):
  * the root's HASH / PART order_sym when RAY_MARK_MMAP is clear, else -1. */
@@ -222,7 +198,7 @@ typedef struct {               /* what the writer persists (no ownership) */
     uint64_t        bytes_len;
 } ray_enc_dict_src_t;
 
-typedef struct {               /* a region past the entry tier: pointers into it */
+typedef struct {               /* a region's children: pointers into it */
     int64_t         len, n_distinct;
     const int32_t*  codes;      /* len */
     const int32_t*  first_occ;  /* n_distinct */
@@ -232,31 +208,19 @@ typedef struct {               /* a region past the entry tier: pointers into it
 
 /* Stream the DICT region of s to f at its position (spec "Index region",
  * DICT); *bytes its size, a multiple of 32.  nyi naming DICT for a source
- * the validator would refuse on its counts or offsets (the one predicate
- * both use: n_distinct outside 1..len, len outside 1..INT32_MAX, offsets
- * not starting at 0, decreasing, an entry over UINT32_MAX bytes or past
- * bytes_len) or a child too large for this host's size_t; io on a short
+ * breaking the count or offset rules (n_distinct outside 1..len, len
+ * outside 1..INT32_MAX, offsets not starting at 0, decreasing, an entry
+ * over UINT32_MAX bytes or past bytes_len) or a child too large for this
+ * host's size_t; io on a short
  * write.  The first-occurrence rules (first_occ[0] == 0, strictly
  * ascending, below len) and the codes' rules are not checked here: the
  * writer's caller (ray_encw) gives ray_dict_acc_t's arrays, which hold them
- * by construction, and the validator rejects a region breaking them. */
+ * by construction. */
 ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes);
 
-/* The entry tier of spec "Index validation" (DICT), except distinctness:
- * the root, the counts, the layout, the offsets, the padding and the first
- * occurrences.  `region` 32-aligned.  NULL with *out filled, or an owned
- * corrupt error naming `path`. */
-ray_t* ray_enc_dict_validate(const uint8_t* region, uint64_t size, int64_t len,
-                             const char* path, ray_enc_dict_view_t* out);
-
-/* The code tier, on a view ray_enc_dict_validate filled (a zeroed or
- * unvalidated view is a type error): every code in [0, n_distinct),
- * codes[first_occ[c]] == c, first_occ[codes[i]] <= i.  Parallel above RAY_PARALLEL_THRESHOLD rows;
- * writes copy[0 .. len) when copy is not NULL.  NULL, an owned corrupt
- * error naming `path` and the lowest failing row, or cancel (a dispatch
- * that skipped rows, or a pending interrupt: never a verdict on part of
- * the rows). */
-ray_t* ray_enc_dict_codes_check(const ray_enc_dict_view_t* v, int32_t* copy, const char* path);
+/* The DICT region at `region` (32-aligned) that rayforce wrote: its root
+ * fields and its children's places, read as written. */
+void   ray_enc_dict_parse(const uint8_t* region, ray_enc_dict_view_t* out);
 #endif /* RAY_ENC_IDX_WIRE_ONLY */
 
 #endif /* RAY_ENCIDX_H */

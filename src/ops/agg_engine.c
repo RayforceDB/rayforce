@@ -743,7 +743,6 @@ static void agg_key_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
 typedef struct {
     int8_t   type;
     int64_t  mn, mx;
-    bool     from_stats;
     int64_t* spans;
     int64_t  n;
 } agg_bounds_fold_t;
@@ -755,7 +754,6 @@ static void agg_bounds_chunk(void* raw, int64_t lo, int64_t hi, const ray_enc_ch
         if (st->has_minmax) {
             if (st->min < f->mn) f->mn = st->min;
             if (st->max > f->mx) f->mx = st->max;
-            f->from_stats = true;
             return;
         }
     }
@@ -776,12 +774,11 @@ static ray_t* agg_key_bounds_staged(const agg_rr_t* krr, uint32_t k, int64_t row
     int64_t nch = (rows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
     ray_enc_chunk_stat_t st;
     bool dir = nch > 0 && ray_col_src_chunk_stat(src, 0, &st);
-    bool from_stats = false;
     ray_t* hdr = NULL;
     int64_t* spans;
     int64_t* bounds;
     int64_t n = 0;
-    agg_bounds_fold_t pf = { krr->key_types[k], INT64_MAX, INT64_MIN, false, NULL, 0 };
+    agg_bounds_fold_t pf = { krr->key_types[k], INT64_MAX, INT64_MIN, NULL, 0 };
     ray_t* perr = NULL;
     if (src->parted && ray_col_src_encoded(src) && ray_col_src_parted_chunks(src, &pf, agg_bounds_chunk, &perr)) {
         /* the parted directory: count the chunks to scan, then list them */
@@ -789,9 +786,9 @@ static ray_t* agg_key_bounds_staged(const agg_rr_t* krr, uint32_t k, int64_t row
         spans = (int64_t*)scratch_alloc(&hdr, (size_t)(ns > 0 ? ns : 1) * 4 * sizeof(int64_t));
         if (!spans) return ray_error("oom", NULL);
         bounds = spans + (ns > 0 ? ns : 1) * 2;
-        pf = (agg_bounds_fold_t){ krr->key_types[k], INT64_MAX, INT64_MIN, false, spans, 0 };
+        pf = (agg_bounds_fold_t){ krr->key_types[k], INT64_MAX, INT64_MIN, spans, 0 };
         (void)ray_col_src_parted_chunks(src, &pf, agg_bounds_chunk, &perr);
-        mn = pf.mn; mx = pf.mx; from_stats = pf.from_stats; n = pf.n;
+        mn = pf.mn; mx = pf.mx; n = pf.n;
         nch = 0;
     } else {
         if (perr) return perr;
@@ -808,16 +805,11 @@ static ray_t* agg_key_bounds_staged(const agg_rr_t* krr, uint32_t k, int64_t row
             if (st.has_minmax) {
                 if (st.min < mn) mn = st.min;
                 if (st.max > mx) mx = st.max;
-                from_stats = true;
                 continue;
             }
         }
         spans[n * 2] = b; spans[n * 2 + 1] = e; n++;
     }
-    /* Memory is about to be sized from the statistics: the passes that
-     * read this key check its values against them (a forged statistic is
-     * `corrupt`, never a write past the plan). */
-    if (from_stats) src->stats_guard = true;
     ray_t* err = NULL;
     if (n > 0) {
         ray_col_src_t* one_src[1] = { src };
@@ -2556,9 +2548,6 @@ static bool agg_sel_bounds_dir(const agg_sel_bounds_ctx_t* bc, int64_t* mins, in
     }
     if (ok) ok = agg_sel_bounds_round(bc, state, nch, spc, spans, tb, mins, maxs);
     scratch_free(hdr);
-    /* the bounds rest on the statistics of the chunks not scanned: the
-     * passes that read the keys check their values against them */
-    if (ok) for (uint32_t k = 0; k < nk; k++) krr->srcs[k]->stats_guard = true;
     return ok;
 }
 
@@ -3463,9 +3452,8 @@ static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, i
  * run; the slot is the per-row body's (agg_dense_component_raw: one key,
  * never compacted), the first row the run's first counted row.  Every
  * other vector is read and counted per row by the bodies above, as before
- * (D6).  Under stats_guard the run view checks the run values against
- * their chunk's statistics as a range read does; a slot outside the slab
- * is `corrupt` all the same.  Exact for any rows a task holds: nothing
+ * (D6).  A slot outside the slab is `corrupt` (an internal plan check).
+ * Exact for any rows a task holds: nothing
  * depends on the task cut. */
 typedef struct {
     agg_dense_ctx_t*   c;
@@ -11249,9 +11237,7 @@ static int agg_firstn_runview(const agg_rr_t* rr, uint32_t k, int64_t seg, int64
     /* a float view's run values are bit patterns: compared as integers they
      * would split -0.0 from +0.0, so a float key is read by its values */
     if (e->type == RAY_F32 || e->type == RAY_F64) return 0;
-    const ray_enc_desc_t* d;
-    if ((*err = ray_enccol_chunk_descs_ref(e, seg / RAY_ENC_VECS_PER_CHUNK, &d)) != NULL) return -1;
-    uint8_t enc = d[seg % RAY_ENC_VECS_PER_CHUNK].encoding;
+    uint8_t enc = ray_enccol_descs(e, seg / RAY_ENC_VECS_PER_CHUNK)[seg % RAY_ENC_VECS_PER_CHUNK].encoding;
     if (enc != RAY_ENC_RLE && enc != RAY_ENC_CONST) return 0;
     int r = ray_col_src_vview(src, seg, vv, err);
     if (r <= 0) return r;

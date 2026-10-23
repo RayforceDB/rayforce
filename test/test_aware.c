@@ -106,9 +106,7 @@ __attribute__((unused)) static int aw_vec_enc(const char* name, const char* col,
     ray_t* encv = t ? ray_table_get_col_enc(t, ray_sym_intern(col, strlen(col))) : NULL;
     int enc = -1;
     if (encv) {
-        const ray_enc_desc_t* d;
-        ray_t* err = ray_enccol_chunk_descs_ref(ray_enccol_of(encv), vec / RAY_ENC_VECS_PER_CHUNK, &d);
-        if (!err) enc = d[vec % RAY_ENC_VECS_PER_CHUNK].encoding; else ray_error_free(err);
+        enc = ray_enccol_descs(ray_enccol_of(encv), vec / RAY_ENC_VECS_PER_CHUNK)[vec % RAY_ENC_VECS_PER_CHUNK].encoding;
     }
     if (t) ray_release(t);
     return enc;
@@ -314,15 +312,9 @@ static bool img_store(const char* p) {
     return fclose(f) == 0 && ok;
 }
 static uint64_t rd64(size_t off) { uint64_t x; memcpy(&x, g_img + off, 8); return x; }
-static void W8(size_t off, uint8_t v)   { memcpy(g_img + off, &v, 1); }
-static void W16(size_t off, uint16_t v) { memcpy(g_img + off, &v, 2); }
-static void W32(size_t off, uint32_t v) { memcpy(g_img + off, &v, 4); }
-static void W64(size_t off, uint64_t v) { memcpy(g_img + off, &v, 8); }
 #define DIR(c) (96 + 64 * (size_t)(c))
 #define EH 32
 static size_t desc_at(int j)    { return (size_t)rd64(DIR(0)) + 48 * (size_t)j; }
-static size_t payload_at(int j) { return (size_t)rd64(DIR(0)) + (size_t)rd64(desc_at(j) + 8); }
-
 /* Save v (owned) as one generation-2 column file, top-level encoding forced
  * to `enc` (-1: the encoder's choice), and load its image. */
 static bool dv_save(ray_t* v, int enc, const char* p) {
@@ -444,36 +436,6 @@ static ray_t* dv_f64(bool constant) {
     return v;
 }
 
-/* RLE body at `at`: [u32 runs][u32 0], the values child, the ends child
- * (8-byte header each: encoding, width, reserved, body bytes).  Moves every
- * run end up by one (the last past n), whatever the ends child's codec. */
-static bool dv_rle_ends_up(size_t at) {
-    uint32_t nr; memcpy(&nr, g_img + at, 4);
-    size_t vc = at + 8;
-    uint32_t vbb; memcpy(&vbb, g_img + vc + 4, 4);
-    size_t ec = vc + 8 + vbb;
-    uint8_t enc = g_img[ec];
-    if (enc == RAY_ENC_RAW) {
-        for (uint32_t r = 0; r < nr; r++) { uint16_t x; memcpy(&x, g_img + ec + 8 + 2 * r, 2); W16(ec + 8 + 2 * r, (uint16_t)(x + 1)); }
-    } else if (enc == RAY_ENC_FOR_BP) {
-        W64(ec + 8, rd64(ec + 8) + 1);
-    } else if (enc == RAY_ENC_DELTA_BP) {
-        for (int l = 0; l < 64; l++) W64(ec + 16 + 8 * (size_t)l, rd64(ec + 16 + 8 * (size_t)l) + 1);
-    } else {
-        return false;
-    }
-    return true;
-}
-/* Puts the T-bit pattern x on run 0's value of the RLE body at `at` (a RAW
- * values child: the first value; FOR_BP: its base, so run 0's value is x
- * when its residual is 0, as the minimum's is). */
-static bool dv_rle_run0(size_t at, int T, uint64_t x) {
-    size_t vc = at + 8;
-    if (g_img[vc] == RAY_ENC_RAW) { memcpy(g_img + vc + 8, &x, (size_t)T / 8); return true; }
-    if (g_img[vc] == RAY_ENC_FOR_BP) { W64(vc + 8, x); return true; }
-    return false;
-}
-
 /* RAW and DELTA_BP have no view; a view never vouches for a vector its
  * decode rejects.  One sub-case per rule of the view's validation: each
  * declines (0) or reports what the decode reports (-1), and the range read
@@ -481,7 +443,6 @@ static bool dv_rle_run0(size_t at, int T, uint64_t x) {
 static test_result_t test_vview_declines(void) {
     const char* p = ray_test_tmp(AW_TMP "/dv");
     for (int i = 0; i < 256; i++) { char b[8]; int n = snprintf(b, sizeof b, "s%d", i); (void)ray_sym_intern(b, (size_t)n); }
-    size_t at;
     /* no view: RAW, DELTA_BP, a float other than CONST */
     DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_RAW, p); NEED_ENC(0, RAY_ENC_RAW);   DV(p, 0, NULL);
     {
@@ -490,131 +451,25 @@ static test_result_t test_vview_declines(void) {
         DV_SAVE(v, RAY_ENC_DELTA_BP, p); NEED_ENC(0, RAY_ENC_DELTA_BP); DV(p, 0, NULL);
     }
     DV_SAVE(dv_f64(false), RAY_ENC_RAW, p); NEED_ENC(0, RAY_ENC_RAW); DV(p, 0, NULL);
-    /* descriptors failing validation: -1, as the decode reports them */
+    /* a view: FOR_BP (with nulls too), CONST, RLE, SYM, DICT, float CONST */
     DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-    W8(desc_at(0) + 1, 33);                                       DV(p, -1, "width");
-
-    /* payload split: the bitmap count (payload_parts' corrupt is -1) */
     DV_SAVE(dv_hash(RAY_I32, 5000, 10), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-    at = payload_at(0); W8(at, g_img[at] ^ 0x02);                 DV(p, -1, "null bitmap count");
-    {   /* 100 rows: bit 100 lies past them */
-        ray_t* v = dv_hash(RAY_I32, 5000, 10); v->len = 100;
-        DV_SAVE(v, RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-        at = payload_at(0); g_img[at + 12] |= 0x10;               DV(p, -1, "null bitmap tail bits set");
-    }
-
-    /* FOR_BP: base above the type width; a non-null residual on the
-     * sentinel (bitmap and none); a body that could wrap (U8: the decode
-     * gives the modular values, so the read succeeds) */
-    DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_FOR_BP, p);
-    W64(payload_at(0), 1ull << 32);                               DV(p, 0, "FOR_BP base above the type width");
-    DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_FOR_BP, p);
-    W64(payload_at(0), 1ull << 31);                               DV(p, 0, "sentinel outside the bitmap");
-    /* the body size against the width: the descriptor's width one lower */
-    DV_SAVE(dv_hash(RAY_I32, 5000, 0), RAY_ENC_FOR_BP, p);
-    TEST_ASSERT_EQ_I(g_img[desc_at(0) + 1], 6);
-    W8(desc_at(0) + 1, 5);                                        DV(p, 0, "bytes after the codec body");
     DV_SAVE(dv_hash(RAY_I16, 5000, 10), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-    W64(payload_at(0) + 128, 1ull << 15);                         DV(p, 0, "sentinel outside the bitmap");
     DV_SAVE(dv_hash(RAY_U8, 0, 0), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-    TEST_ASSERT_EQ_I(g_img[desc_at(0) + 1], 6);
-    W64(payload_at(0), 250);                                      DV(p, 0, NULL);
-    /* the edge itself is no wrap: 192 + 63 = 255 */
-    DV_SAVE(dv_hash(RAY_U8, 0, 0), RAY_ENC_FOR_BP, p); W64(payload_at(0), 192); DV(p, 1, NULL);
-    DV_SAVE(dv_hash(RAY_I16, 0, 0), RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP);
-    /* 32705 + 63 > 32767: wraps, through the sentinel (residual 63) */
-    W64(payload_at(0), 32767 - 62);                               DV(p, 0, "sentinel outside the bitmap");
-
-    /* CONST / RLE: a run on the sentinel outside the bitmap */
     DV_SAVE(dv_runs(0, true), RAY_ENC_CONST, p); NEED_ENC(0, RAY_ENC_CONST); DV(p, 1, NULL);
-    W32(payload_at(0), 0x80000000u);                              DV(p, 0, "sentinel outside the bitmap");
     DV_SAVE(dv_runs(10, true), RAY_ENC_CONST, p); NEED_ENC(0, RAY_ENC_CONST); DV(p, 1, NULL);
-    W32(payload_at(0) + 128, 0x80000000u);                        DV(p, 0, "sentinel outside the bitmap");
     DV_SAVE(dv_runs(0, false), RAY_ENC_RLE, p); NEED_ENC(0, RAY_ENC_RLE); DV(p, 1, NULL);
-    TEST_ASSERT_TRUE(dv_rle_run0(payload_at(0), 32, 0x80000000u)); DV(p, 0, "sentinel outside the bitmap");
-    /* RLE runs: a run end past n, a run count of zero, CONST padding */
-    DV_SAVE(dv_runs(0, false), RAY_ENC_RLE, p);
-    TEST_ASSERT_TRUE(dv_rle_ends_up(payload_at(0)));              DV(p, 0, "codec body");
-    DV_SAVE(dv_runs(0, false), RAY_ENC_RLE, p); W32(payload_at(0), 0); DV(p, 0, "codec body");
-    DV_SAVE(dv_runs(0, true), RAY_ENC_CONST, p); W8(payload_at(0) + 5, 1); DV(p, 0, "codec body");
-
-    /* SYM in every encoding: an id at the bound, the null count, an id
-     * outside the vector's statistics */
     {
         uint8_t ids[1024];
         for (int i = 0; i < 1024; i++) ids[i] = 5;
         DV_SAVE_SYM(ids, 1024, RAY_ENC_CONST, p); NEED_ENC(0, RAY_ENC_CONST); DV(p, 1, NULL);
-        W8(payload_at(0), 200);                                   DV(p, 0, "SYM id outside the symbol domain");
         for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(1 + i / 100);
         DV_SAVE_SYM(ids, 1024, RAY_ENC_RLE, p); NEED_ENC(0, RAY_ENC_RLE); DV(p, 1, NULL);
-        TEST_ASSERT_TRUE(dv_rle_run0(payload_at(0), 8, 200));     DV(p, 0, "SYM id outside the symbol domain");
-        DV_SAVE_SYM(ids, 1024, RAY_ENC_RLE, p);
-        W16(desc_at(0) + 2, 1); W32(DIR(0) + 52, 1);              DV(p, 0, "SYM null count");
-        DV_SAVE_SYM(ids, 1024, RAY_ENC_RLE, p);
-        TEST_ASSERT_EQ_I((int64_t)rd64(desc_at(0) + 40), 11);
-        W64(desc_at(0) + 40, 10);                                 DV(p, 0, "value outside its statistics");
         for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(100 + i % 16);
         DV_SAVE_SYM(ids, 1024, RAY_ENC_FOR_BP, p); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-        W64(payload_at(0), 199);                                  DV(p, 0, "SYM id outside the symbol domain");
-        DV_SAVE_SYM(ids, 1024, RAY_ENC_FOR_BP, p); W64(payload_at(0), 0); DV(p, 0, "SYM null count");
-        DV_SAVE_SYM(ids, 1024, RAY_ENC_FOR_BP, p);
-        W64(desc_at(0) + 40, 114);                                DV(p, 0, "value outside its statistics");
-        /* a wrapping SYM body every other rule accepts: ids 1 and 51 (base
-         * 1, w 6) with the base forged to 230 decode to 230 and 24 (mod
-         * 256), inside a domain of 250 and statistics widened to [24, 230];
-         * the decode gives them, the view declines */
-        for (int i = 0; i < 1024; i++) ids[i] = (uint8_t)(i % 2 ? 51 : 1);
-        TEST_ASSERT_TRUE(dv_save_sym_n(ids, 1024, RAY_ENC_FOR_BP, 250, p)); NEED_ENC(0, RAY_ENC_FOR_BP); DV(p, 1, NULL);
-        TEST_ASSERT_EQ_I(g_img[desc_at(0) + 1], 6);
-        W64(payload_at(0), 230);
-        W64(desc_at(0) + 32, 24); W64(desc_at(0) + 40, 230); W64(DIR(0) + 16, 24); W64(DIR(0) + 24, 230);
-        DV(p, 0, NULL);
     }
-
-    /* DICT: a code past the dictionary, a value outside the statistics, a
-     * non-null row on the sentinel's code, the VALUE_DICT's own validation (-1) */
     DV_SAVE(dv_dict(), RAY_ENC_DICT, p); NEED_ENC(0, RAY_ENC_DICT); DV(p, 1, NULL);
-    TEST_ASSERT_EQ_I(g_img[payload_at(0)], RAY_ENC_FOR_BP);
-    W64(payload_at(0) + 8, 4);                                    DV(p, 0, "DICT code outside the dictionary");
-    {   /* a null row's code past the dictionary: three I32 values, a null
-         * every 10th row (filled with the minimum's code 0); row 0's 2-bit
-         * field (lane 0, bits 0-1 of the first packed word) set to 3 */
-        static const int32_t vals[3] = { 11, 900000001, 77 };
-        ray_t* v = ray_vec_new(RAY_I32, 1024); v->len = 1024;
-        for (int i = 0; i < 1024; i++)
-            ((int32_t*)ray_data(v))[i] = i % 10 ? vals[((uint32_t)((uint32_t)i * 2654435761u) >> 30) % 3] : NULL_I32;
-        v->attrs |= RAY_ATTR_HAS_NULLS;
-        DV_SAVE(v, RAY_ENC_DICT, p); NEED_ENC(0, RAY_ENC_DICT); DV(p, 1, NULL);
-        at = payload_at(0) + 128;
-        TEST_ASSERT_EQ_I(g_img[at], RAY_ENC_FOR_BP); TEST_ASSERT_EQ_I(g_img[at + 1], 2); TEST_ASSERT_EQ_I(rd64(at + 8), 0);
-        TEST_ASSERT_EQ_I(g_img[at + 16] & 3, 0);
-        g_img[at + 16] |= 3;                                      DV(p, 0, "DICT code outside the dictionary");
-    }
-    /* the code child's header: reserved bits, width above 32, body size, base above 32 bits */
-    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W16(payload_at(0) + 2, 1);           DV(p, 0, "child header reserved bytes not zero");
-    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W8(payload_at(0) + 1, 33);           DV(p, 0, "FOR_BP width above the type width");
-    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W32(payload_at(0) + 4, (uint32_t)rd64(payload_at(0) + 4) + 8); DV(p, 0, "child body overruns its parent");
-    DV_SAVE(dv_dict(), RAY_ENC_DICT, p); W64(payload_at(0) + 8, 1ull << 32);  DV(p, 0, "FOR_BP base above the type width");
-    DV_SAVE(dv_dict(), RAY_ENC_DICT, p);
-    W64(desc_at(0) + 32, 12);                                     DV(p, 0, "value outside its statistics");
-    DV_SAVE(dv_dict(), RAY_ENC_DICT, p);
-    W64(desc_at(0) + 40, 123456789012344ll);                      DV(p, 0, "value outside its statistics");
-    {
-        DV_SAVE(dv_dict(), RAY_ENC_DICT, p);
-        size_t entry = (size_t)rd64(EH + 16) + 32;                /* side table of one entry, then VALUE_DICT */
-        TEST_ASSERT_EQ_I((int64_t)rd64(entry + 8), 11);
-        W64(entry + 8, (uint64_t)INT64_MIN); W64(desc_at(0) + 32, (uint64_t)INT64_MIN); W64(DIR(0) + 16, (uint64_t)INT64_MIN);
-        DV(p, 0, "sentinel outside the bitmap");
-        DV_SAVE(dv_dict(), RAY_ENC_DICT, p);
-        entry = (size_t)rd64(EH + 16) + 32;
-        W64(entry + 8, rd64(entry + 16));                         DV(p, -1, "VALUE_DICT values not ascending");
-    }
-
-    /* floats: CONST only, NaN outside the bitmap, outside the statistics */
     DV_SAVE(dv_f64(true), RAY_ENC_CONST, p); NEED_ENC(0, RAY_ENC_CONST); DV(p, 1, NULL);
-    W64(payload_at(0), 0x7FF8000000000001ull);                    DV(p, 0, "NaN outside the bitmap");
-    DV_SAVE(dv_f64(true), RAY_ENC_CONST, p);
-    { double x = 3.5; memcpy(g_img + payload_at(0), &x, 8); }     DV(p, 0, "value outside its statistics");
     PASS();
 }
 
@@ -885,7 +740,7 @@ static test_result_t test_eval_sym(void) {
             for (int o = 0; o < 4; o++) TEST_ASSERT_FALSE(ray_enc_eval_cmp(v, ord[o], vals[0], 0, bits));
             /* constants: every id of the vector, "" (id 0) and an id past the bound */
             int64_t cs[RAY_ENC_VEC + 2]; int nc = 0;
-            cs[nc++] = 0; cs[nc++] = (int64_t)e->sym_bound + 5;
+            cs[nc++] = 0; cs[nc++] = ray_sym_domain_count(e->dom) + 5;
             for (int i = 0; i < v->n && nc < 8; i++) { bool dup = false; for (int q = 0; q < nc; q++) dup |= cs[q] == vals[i]; if (!dup) cs[nc++] = vals[i]; }
             for (int ci = 0; ci < nc; ci++) for (int o = 0; o < 2; o++) {
                 const uint16_t op = o ? OP_NE : OP_EQ;
@@ -1660,8 +1515,7 @@ static test_result_t test_gather_rows_contract(void) {
     TEST_ASSERT_NOT_NULL(venc);
     ray_t* vseg0 = ray_enccol_seg(venc, 0);
     TEST_ASSERT_TRUE(vseg0 && vseg0->type == RAY_ENCCOL);
-    const ray_enc_desc_t* vd;
-    TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(vseg0), 0, &vd));
+    const ray_enc_desc_t* vd = ray_enccol_descs(ray_enccol_of(vseg0), 0);
     for (int j = 0; j < 3; j++) TEST_ASSERT_EQ_I(vd[j].encoding, RAY_ENC_DELTA_BP);
     TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(vseg0)->decoded_bytes), (1024 + 1024 + 952) * 8);
     ray_release(t);                                       /* sources gone: results must stand alone */
@@ -1712,8 +1566,7 @@ static test_result_t test_gather_sel_parted(void) {
     /* DELTA_BP vectors (as in gather_rows_contract): declined point reads,
      * each touched vector decoded once */
     ray_t* venc = ray_table_get_col_enc(t, ray_sym_intern("v", 1));
-    const ray_enc_desc_t* vd;
-    TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ray_enccol_seg(venc, 0)), 0, &vd));
+    const ray_enc_desc_t* vd = ray_enccol_descs(ray_enccol_of(ray_enccol_seg(venc, 0)), 0);
     for (int j = 0; j < 3; j++) TEST_ASSERT_EQ_I(vd[j].encoding, RAY_ENC_DELTA_BP);
     TEST_ASSERT_EQ_U(atomic_load(&ray_enccol_of(ray_enccol_seg(venc, 0))->decoded_bytes), (1024 + 1024 + 952) * 8);
     ray_release(t); ray_rowsel_release(sel); ray_release(pred);
@@ -2178,22 +2031,6 @@ static test_result_t test_gather_list_cells(void) {
     ray_t* fw = ray_fmt(want, 0);
     TEST_ASSERT_TRUE(ray_str_len(fr) == ray_str_len(fw) && memcmp(ray_str_ptr(fr), ray_str_ptr(fw), ray_str_len(fr)) == 0);
     ray_release(fr); ray_release(fw); ray_release(r); ray_release(want);
-    /* corrupt k: reserved byte 6 of chunk 0's first descriptor */
-    char dir[512], kpath[600];
-    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/li2"), dir, sizeof dir), RAY_OK);
-    snprintf(kpath, sizeof kpath, "%s/k", dir);
-    uint64_t off = 0;
-    FILE* fh = fopen(kpath, "r+b"); TEST_ASSERT_NOT_NULL(fh);
-    fseek(fh, 96, SEEK_SET); TEST_ASSERT_EQ_I(fread(&off, 8, 1, fh), 1);
-    fseek(fh, (long)off + 6, SEEK_SET); fputc(1, fh); fclose(fh);
-    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/li2/\"))");
-    ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-    ray_t* e = aw_eval("(select {p: p l: l k: k from: T where: (< p 10)})");
-    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-    ray_error_free(e);
-    ray_mem_stats(&m1);
-    TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);   /* partial result released */
     PASS();
 }
 
@@ -2337,92 +2174,6 @@ static test_result_t test_gather_rows_parallel(void) {
         ray_release(out[0]); ray_release(out[1]);
     }
     ray_release(idv); ray_release(t0); ray_release(t2);
-    PASS();
-}
-
-/* Fix round 1: tasks in the middle of a parallel selection gather fail.
- * Chunks 2 and 4 of i (five chunks) have a corrupted descriptor; every
- * row is selected.  The answer is chunk 2's error whatever the schedule
- * (the envelope keeps the lowest row), equal to the error a serial read
- * of chunk 2 reports, and the partial output and every task's pool are
- * released (STR column t, whose own chunks are intact, beside it). */
-static test_result_t test_gather_sel_task_error(void) {
-    aw_eval_ok("(set W (table [i t] (list (til 300000) (map (fn [j] (format \"a pooled string of row %\" j)) (til 300000)))))");
-    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/ge2/\" W {compress: true})");
-    char dir[512], ipath[600];
-    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/ge2"), dir, sizeof dir), RAY_OK);
-    snprintf(ipath, sizeof ipath, "%s/i", dir);
-    for (int c = 2; c <= 4; c += 2) {
-        ray_enc_dirent_t de; memset(&de, 0, sizeof de);
-        FILE* fh = fopen(ipath, "r+b"); TEST_ASSERT_NOT_NULL(fh);
-        fseek(fh, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET);
-        TEST_ASSERT_EQ_I(fread(&de, sizeof de, 1, fh), 1);
-        fseek(fh, (long)de.offset + 6, SEEK_SET); fputc(1, fh); fclose(fh);
-    }
-    /* the reference message: the serial read of chunk 2's first rows */
-    char want[512] = "";
-    {
-        ray_t* t = aw_load("ge", 2);
-        TEST_ASSERT_NOT_NULL(t);
-        ray_col_src_t s; TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("i", 1), &s));
-        static const int64_t ids[] = { 2 * 65536 };
-        ray_t* g = NULL;
-        ray_error_clear();
-        ray_t* e = ray_col_gather_rows(&s, ids, 1, &g);
-        TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && !g);
-        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-        snprintf(want, sizeof want, "%s", ray_error_msg());
-        ray_error_free(e); ray_col_src_release(&s); ray_release(t);
-    }
-    for (int round = 0; round < 3; round++) {
-        ray_t* t = aw_load("ge", 2);
-        TEST_ASSERT_NOT_NULL(t);
-        ray_t* pred = ray_vec_new(RAY_BOOL, 300000); pred->len = 300000;
-        for (int64_t r = 0; r < 300000; r++) ((uint8_t*)ray_data(pred))[r] = r % 3 != 1;
-        ray_t* sel = ray_rowsel_from_pred(pred);
-        TEST_ASSERT_NOT_NULL(sel);
-        ray_col_src_t si, st;
-        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("i", 1), &si));
-        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern("t", 1), &st));
-        ray_t* ok = NULL;
-        TEST_ASSERT_NULL(ray_col_gather_sel(&st, sel, &ok));             /* intact: many task pools, merged */
-        TEST_ASSERT_EQ_I(ok->len, ray_rowsel_meta(sel)->total_pass);
-        ray_release(ok);
-        ray_mem_stats_t m0, m1; ray_mem_stats(&m0);
-        uint64_t p0 = ray_col_test_gather_par();
-        ray_t* g = NULL;
-        ray_error_clear();
-        ray_t* e = ray_col_gather_sel(&si, sel, &g);
-        TEST_ASSERT_EQ_U(ray_col_test_gather_par(), p0 + 1);
-        TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && !g);
-        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-        TEST_ASSERT_FMT(strcmp(ray_error_msg(), want) == 0, "round %d: %s, want %s", round, ray_error_msg(), want);
-        ray_error_free(e);
-        ray_mem_stats(&m1);
-        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);       /* nothing left behind */
-        /* the same rows as an ascending row list (P3 Task 6b: pool tasks
-         * over position ranges, grows_par): t merges, i fails at chunk 2 */
-        int64_t* ids = (int64_t*)ray_alloc_raw(200000 * sizeof(int64_t));
-        TEST_ASSERT_NOT_NULL(ids);
-        int64_t nid = 0;
-        for (int64_t r = 0; r < 300000; r++) if (r % 3 != 1) ids[nid++] = r;
-        TEST_ASSERT_NULL(ray_col_gather_rows(&st, ids, nid, &ok));
-        TEST_ASSERT_EQ_I(ok->len, nid);
-        ray_release(ok);
-        ray_mem_stats(&m0);
-        g = NULL;
-        ray_error_clear();
-        e = ray_col_gather_rows(&si, ids, nid, &g);
-        TEST_ASSERT_TRUE(e && RAY_IS_ERR(e) && !g);
-        TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-        TEST_ASSERT_FMT(strcmp(ray_error_msg(), want) == 0, "rows round %d: %s, want %s", round, ray_error_msg(), want);
-        ray_error_free(e);
-        ray_mem_stats(&m1);
-        TEST_ASSERT_EQ_U(m1.bytes_allocated, m0.bytes_allocated);
-        ray_free_raw(ids);
-        ray_col_src_release(&si); ray_col_src_release(&st);
-        ray_rowsel_release(sel); ray_release(pred); ray_release(t);
-    }
     PASS();
 }
 
@@ -2961,8 +2712,7 @@ static test_result_t test_gather_points(void) {
     ray_t* penc = ray_table_get_col_enc(tp, ray_sym_intern("x", 1));
     TEST_ASSERT_NOT_NULL(penc);
     for (int sg = 0; sg < 2; sg++) {
-        const ray_enc_desc_t* d;
-        TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ray_enccol_seg(penc, sg)), 0, &d));
+        const ray_enc_desc_t* d = ray_enccol_descs(ray_enccol_of(ray_enccol_seg(penc, sg)), 0);
         for (int j = 0; j < 3; j++) TEST_ASSERT_EQ_I(d[j].encoding, RAY_ENC_FOR_BP);
     }
     ray_t* ppred = ray_vec_new(RAY_BOOL, 6000); ppred->len = 6000;
@@ -3007,8 +2757,7 @@ static test_result_t test_gather_points(void) {
         ray_t* denc = ray_table_get_col_enc(td, ray_sym_intern("x", 1));
         TEST_ASSERT_NOT_NULL(denc);
         for (int sg = 0; sg < 2; sg++) {
-            const ray_enc_desc_t* d;
-            TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ray_enccol_seg(denc, sg)), 0, &d));
+            const ray_enc_desc_t* d = ray_enccol_descs(ray_enccol_of(ray_enccol_seg(denc, sg)), 0);
             TEST_ASSERT_TRUE(d[2].encoding == RAY_ENC_DICT && d[2].n_nulls > 0);
             TEST_ASSERT_TRUE(d[0].encoding == RAY_ENC_DICT && d[0].n_nulls > 0);
         }
@@ -3038,14 +2787,10 @@ static test_result_t test_gather_points(void) {
     PASS();
 }
 
-static bool aw_forge_cap(const char* path, int64_t c, int64_t x);
 static bool aw_forge_absent(const char* path, int64_t c);
 
-/* Task 10b: a RAW vector without nulls.  While its chunk's views are not
- * validated (raw_ok), a few rows are point-read: the view's first read
- * checks every RAW vector of the chunk.  A read past the limit takes the
- * view, which validates the chunk and counts the vector's bytes; from then
- * on the view is the cheaper read and the few rows take it too. */
+/* Task 10b: a RAW vector without nulls is read in place (the view, which
+ * counts the vector's bytes), however few of its rows a gather asks for. */
 static test_result_t test_gather_raw_points(void) {
     aw_save("pv", "(table [x] (list (* (til 70000) 7919)))", RAY_ENC_RAW);
     for (int64_t v = 0; v <= 5; v++) TEST_ASSERT_EQ_I(aw_vec_enc("pv", "x", v), RAY_ENC_RAW);
@@ -3055,11 +2800,10 @@ static test_result_t test_gather_raw_points(void) {
     ray_t* encv = ray_table_get_col_enc(t2, ray_sym_intern("x", 1));
     TEST_ASSERT_NOT_NULL(encv);
     ray_enccol_t* e = ray_enccol_of(encv);
-    TEST_ASSERT_NOT_NULL(e->raw_ok);
-    static const struct { int64_t v, n; uint64_t want; uint8_t ok_after; } rd[] = {
-        { 5, RAY_ENC_VEC / 128, 0, 0 },                    /* point-read: chunk 0 stays unvalidated */
-        { 1, RAY_ENC_VEC / 128 + 1, 1024 * 8, 1 },         /* past the limit: the view validates chunk 0 */
-        { 5, RAY_ENC_VEC / 128, 1024 * 8, 1 },             /* validated: the view */
+    static const struct { int64_t v, n; uint64_t want; } rd[] = {
+        { 5, RAY_ENC_VEC / 128, 1024 * 8 },
+        { 1, RAY_ENC_VEC / 128 + 1, 1024 * 8 },
+        { 5, 1, 1024 * 8 },
     };
     for (int r = 0; r < 3; r++) {
         int64_t ids[RAY_ENC_VEC / 128 + 1];
@@ -3073,7 +2817,6 @@ static test_result_t test_gather_raw_points(void) {
         uint64_t got = atomic_load(&e->decoded_bytes) - d0;
         TEST_ASSERT_FMT(got == rd[r].want, "read %d: decoded %llu, want %llu", r, (unsigned long long)got,
                         (unsigned long long)rd[r].want);
-        TEST_ASSERT_EQ_I(atomic_load(&e->raw_ok[0]), rd[r].ok_after);
         for (int64_t q = 0; q < rd[r].n; q++) TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[q], rv[ids[q]]);
         ray_release(out);
     }
@@ -3093,9 +2836,7 @@ static void aw_parted_encs(ray_t* t, const char* col, int64_t cnt[8]) {
         ray_enccol_t* e = ray_enccol_of(seg);
         if (!e || e->kind != RAY_ENCCOL_SINGLE) continue;
         for (int64_t v = 0; v * RAY_ENC_VEC < e->len; v++) {
-            const ray_enc_desc_t* d;
-            ray_t* err = ray_enccol_chunk_descs_ref(e, v / RAY_ENC_VECS_PER_CHUNK, &d);
-            if (err) { ray_error_free(err); return; }
+            const ray_enc_desc_t* d = ray_enccol_descs(e, v / RAY_ENC_VECS_PER_CHUNK);
             int enc = d[v % RAY_ENC_VECS_PER_CHUNK].encoding;
             if (enc >= 0 && enc < 8) cnt[enc]++;
         }
@@ -3108,8 +2849,9 @@ static void aw_parted_encs(ray_t* t, const char* col, int64_t cnt[8]) {
  * with every 13th run "" (the in-band null), c cycling over 300 symbols,
  * so CONST, RLE and packed vectors all occur.  A few rows per vector
  * (every 997th row and the rows at the partition boundary), sorted and
- * unsorted: nothing decoded, and the result equals generation 0's own
- * gather and `at` (width, domain, nulls and symbols). */
+ * unsorted: nothing decoded (a RAW vector is read in place), and the
+ * result equals generation 0's own gather and `at` (width, domain, nulls
+ * and symbols). */
 static test_result_t test_gather_sym_points(void) {
     static const int64_t np[2] = { 3000, 67000 };
     for (int gen = 0; gen <= 2; gen += 2)
@@ -3155,8 +2897,11 @@ static test_result_t test_gather_sym_points(void) {
             TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, ni, &out[g][1]));
             ray_col_src_release(&s);
             ray_enc_counters_t k; ray_enc_counters_get(&k);
+            /* a RAW vector without nulls is read in place, its bytes
+             * counted as delivered (a view, not a decode) */
+            const bool raw = (c == 0 ? ca : c == 1 ? cb : cc)[RAY_ENC_RAW] > 0;
             if (g && !g_aw_unaligned)
-                TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s: decoded %llu", cols[c],
+                TEST_ASSERT_FMT((raw || k.decoded_bytes == 0) && k.materialized == 0, "%s: decoded %llu", cols[c],
                                 (unsigned long long)k.decoded_bytes);
         }
         for (int w = 0; w < 2; w++) {
@@ -3184,109 +2929,6 @@ static test_result_t test_gather_sym_points(void) {
     }
     ray_rowsel_release(sel); ray_release(pred);
     ray_release(tp[0]); ray_release(tp[1]);
-    PASS();
-}
-
-/* The column file `col` of the generation-2 table <name>2 (its path in
- * *path) and chunk c's directory entry and vector j's descriptor. */
-static bool aw_col_file(const char* name, const char* col, char* path, size_t cap) {
-    char dir[512], q[600];
-    snprintf(q, sizeof q, AW_TMP "/%s2/", name);
-    if (ray_splay_resolve_dir(ray_test_tmp(q), dir, sizeof dir) != RAY_OK) return false;
-    snprintf(path, cap, "%s/%s", dir, col);
-    return true;
-}
-/* Overwrite `len` bytes at byte `off` of vector j (chunk 0) of the column
- * file `path`'s payload. */
-static bool aw_forge_payload(const char* path, int j, uint64_t off, const void* bytes, size_t len) {
-    FILE* f = fopen(path, "r+b"); if (!f) return false;
-    ray_enc_dirent_t de; ray_enc_desc_t d;
-    bool ok = fseek(f, (long)RAY_ENC_DIR_OFF, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 &&
-              fseek(f, (long)(de.offset + (uint64_t)j * sizeof d), SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1 &&
-              off + len <= d.payload_bytes &&
-              fseek(f, (long)(de.offset + d.payload_off + off), SEEK_SET) == 0 && fwrite(bytes, len, 1, f) == 1;
-    return fclose(f) == 0 && ok;
-}
-
-/* `rows` gathered from column `col` of <name>2 by a row list and by a
- * rowsel: both fail `corrupt`, naming `path` (no sanitizer report); the
- * point read's own statistics error exactly when `stats` (else the
- * decode's report: the read declined). */
-static test_result_t aw_gather_corrupt(const char* name, const char* col, const int64_t* rows, int64_t n,
-                                       int64_t nrows, const char* path, bool stats, const char* what) {
-    ray_t* t = aw_load(name, 2);
-    TEST_ASSERT_NOT_NULL(t);
-    ray_t* pred = ray_vec_new(RAY_BOOL, nrows); pred->len = nrows;
-    memset(ray_data(pred), 0, (size_t)nrows);
-    for (int64_t i = 0; i < n; i++) ((uint8_t*)ray_data(pred))[rows[i]] = 1;
-    ray_t* sel = ray_rowsel_from_pred(pred);
-    TEST_ASSERT_NOT_NULL(sel);
-    for (int w = 0; w < 2; w++) {
-        ray_col_src_t s;
-        TEST_ASSERT_NULL(ray_table_col_src(t, ray_sym_intern(col, strlen(col)), &s));
-        ray_t* out = NULL;
-        ray_error_clear();
-        ray_t* err = w ? ray_col_gather_sel(&s, sel, &out) : ray_col_gather_rows(&s, rows, n, &out);
-        ray_col_src_release(&s);
-        TEST_ASSERT_FMT(err && RAY_IS_ERR(err) && !out, "%s (%s): answered", what, w ? "rowsel" : "rows");
-        TEST_ASSERT_FMT(strcmp(ray_err_code(err), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
-                        "%s: %s \"%s\"", what, ray_err_code(err), ray_error_msg() ? ray_error_msg() : "");
-        TEST_ASSERT_FMT(!strstr(ray_error_msg(), "value outside its statistics") == !stats, "%s: \"%s\"", what, ray_error_msg());
-        ray_error_free(err);
-    }
-    ray_rowsel_release(sel); ray_release(pred); ray_release(t);
-    PASS();
-}
-#define AW_GATHER_CORRUPT(...) do { test_result_t r_ = aw_gather_corrupt(__VA_ARGS__); if (r_.status != TEST_PASS) return r_; } while (0)
-
-/* Task 10b: forged vectors under the new point reads.  Each read either
- * declines, so the decode reports the vector, or reports a value outside
- * its statistics itself; never an answer and never a sanitizer report:
- * - a DICT code past the dictionary (the code child's base moved up);
- * - a null bitmap whose count disagrees with the descriptor;
- * - a SYM id at the domain bound in a chunk without statistics (present
- *   SYM statistics lie below the bound, so only then is the bound the
- *   check);
- * - a DICT value outside its (capped) statistics, the memory-safety
- *   erratum's case: the point read's own `corrupt`. */
-static test_result_t test_gather_points_forged(void) {
-    char path[700];
-    static const int64_t rows[] = { 4, 9, 14 };
-    /* the DICT code: the child's 8-byte header, then its base */
-    aw_save("fd", "(table [x] (list (* 1000003 (% (til 70000) 5))))", RAY_ENC_DICT);
-    TEST_ASSERT_EQ_I(aw_vec_enc("fd", "x", 0), RAY_ENC_DICT);
-    TEST_ASSERT_TRUE(aw_col_file("fd", "x", path, sizeof path));
-    const uint64_t base = 1000;
-    TEST_ASSERT_TRUE(aw_forge_payload(path, 0, 8, &base, 8));
-    AW_GATHER_CORRUPT("fd", "x", rows, 3, 70000, path, false, "DICT code past the dictionary");
-    /* the bitmap: row 1 (not null) set in it */
-    aw_save("fb", "(table [x] (list (map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7919) 1000))) (til 70000))))", RAY_ENC_FOR_BP);
-    TEST_ASSERT_TRUE(aw_col_file("fb", "x", path, sizeof path));
-    const uint8_t bm0 = 0x03;                             /* rows 0 (null) and 1 */
-    TEST_ASSERT_TRUE(aw_forge_payload(path, 0, 0, &bm0, 1));
-    AW_GATHER_CORRUPT("fb", "x", rows, 3, 70000, path, false, "null bitmap count");
-    /* the SYM id: chunk 0 without statistics, vector 0's constant at 250
-     * (the file domain holds 18 symbols: ids below 19, one byte wide) */
-    aw_save("fs", "(table [s] (list (as 'SYMBOL (map (fn [j] (format \"c%\" (div j 4096))) (til 70000)))))", RAY_ENC_CONST);
-    TEST_ASSERT_EQ_I(aw_vec_enc("fs", "s", 0), RAY_ENC_CONST);
-    TEST_ASSERT_TRUE(aw_col_file("fs", "s", path, sizeof path));
-    TEST_ASSERT_TRUE(aw_forge_absent(path, 0));
-    const uint8_t id = 250;
-    TEST_ASSERT_TRUE(aw_forge_payload(path, 0, 0, &id, 1));
-    {
-        ray_t* t = aw_load("fs", 2);
-        TEST_ASSERT_NOT_NULL(t);
-        ray_enccol_t* e = ray_enccol_of(ray_table_get_col_enc(t, ray_sym_intern("s", 1)));
-        TEST_ASSERT_TRUE(e && e->sym_bound > 1 && e->sym_bound <= id && (e->attrs & RAY_SYM_W_MASK) == RAY_SYM_W8);
-        ray_release(t);
-    }
-    AW_GATHER_CORRUPT("fs", "s", rows, 3, 70000, path, false, "SYM id at the domain bound");
-    /* the DICT value: chunk 0's statistics capped at 2000006, so the rows
-     * holding 3000009 and 4000012 lie outside them */
-    aw_save("fc", "(table [x] (list (* 1000003 (% (til 70000) 5))))", RAY_ENC_DICT);
-    TEST_ASSERT_TRUE(aw_col_file("fc", "x", path, sizeof path));
-    TEST_ASSERT_TRUE(aw_forge_cap(path, 0, 2000006));
-    AW_GATHER_CORRUPT("fc", "x", rows, 3, 70000, path, true, "DICT value outside its statistics");
     PASS();
 }
 
@@ -4281,83 +3923,6 @@ static test_result_t test_group_count_on_runs(void) {
     PASS();
 }
 
-/* Chunk c's directory maximum and every vector descriptor's statistics
- * above x capped at x (test_scan_range.c's sr_forge_cap): the statistics
- * still nest and validate, and the values above x lie outside them. */
-static bool aw_forge_cap(const char* path, int64_t c, int64_t x) {
-    FILE* f = fopen(path, "r+b"); if (!f) return false;
-    ray_enc_dirent_t de;
-    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
-    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
-    if (ok) {
-        de.max = x;
-        if (de.min > x) de.min = x;
-        ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
-    }
-    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
-        ray_enc_desc_t d;
-        long off = (long)(de.offset + (uint64_t)j * sizeof d);
-        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
-        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
-        if (d.flags & RAY_ENC_STAT_ABSENT || d.max <= x) continue;
-        d.max = x;
-        if (d.min > x) d.min = x;
-        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
-    }
-    return fclose(f) == 0 && ok;
-}
-
-/* A forged dirent maximum under a guarded dense slab: corrupt, no
- * sanitizer report (P2 13b pattern: lower chunk 3's directory and
- * descriptor max below the run values).  a holds runs of 64 rows over
- * 100..500 (step 100), in chunk 3 over 100..900; chunk 3's statistics
- * are capped at 500, so the dense plan (the selection bounds, which skip
- * chunks inside the bounds found, and the directory prescan) ends at 500
- * and the runs of 600..900 lie outside it.  Each query reports `corrupt`
- * naming a, twice; unforged, the answers are generation 0's and the RLE
- * a decodes nothing. */
-static test_result_t test_group_runs_forged(void) {
-    const char* tbl = "(table [a v] (list (as 'I32 (map (fn [j] (* 100 (+ 1 (% (div j 64) (if (== 3 (div j 65536)) 9 5))))) (til 327680))) (% (til 327680) 7)))";
-    /* the runs (the encoder's RLE), then the same values FOR_BP, read and
-     * counted per row under the range read's own guard */
-    static const int encs[] = { -1, RAY_ENC_FOR_BP };
-    for (int e = 0; e < 2; e++) {
-    aw_eval_ok("(set T 0)");                            /* the last round's table, released */
-    (void)ray_test_rm_rf(aw_root()); (void)ray_test_mkdir_p(aw_root());
-    aw_save("gf", tbl, encs[e]);
-    static const char* const qs[] = {
-        "(select {a: a c: (count a) from: T where: (> v 0) by: a})",
-        "(select {c: (count a) from: T by: a})",
-        NULL,
-    };
-    for (int i = 0; qs[i]; i++) {
-        test_result_t r = aw_reduce("gf", qs[i], -1);
-        if (r.status != TEST_PASS) return r;
-        if (!g_aw_unaligned && e == 0) TEST_ASSERT_FMT(aw_col_decoded("a") == 0, "%s: a decoded %llu", qs[i], (unsigned long long)aw_col_decoded("a"));
-    }
-    TEST_ASSERT_EQ_I(aw_vec_enc("gf", "a", 3 * RAY_ENC_VECS_PER_CHUNK + 5), e ? encs[e] : RAY_ENC_RLE);
-    char q[1024], dir[512], path[600];
-    snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/gfb/\" %s {compress: true})", tbl);
-    ray_encw_test_force(encs[e]);
-    aw_eval_ok(q);
-    ray_encw_test_force(-1);
-    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(AW_TMP "/gfb/"), dir, sizeof dir), RAY_OK);
-    snprintf(path, sizeof path, "%s/a", dir);
-    TEST_ASSERT_TRUE(aw_forge_cap(path, 3, 500));
-    for (int i = 0; qs[i]; i++)
-        for (int rep = 0; rep < 2; rep++) {
-            aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/gfb/\"))");
-            ray_error_clear();
-            ray_t* res = ray_eval_str(qs[i]);
-            TEST_ASSERT_FMT(res && RAY_IS_ERR(res), "%s (read %d): answered", qs[i], rep + 1);
-            TEST_ASSERT_FMT(strcmp(ray_err_code(res), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
-                            "%s (read %d): %s \"%s\"", qs[i], rep + 1, ray_err_code(res), ray_error_msg() ? ray_error_msg() : "");
-            ray_error_free(res);
-        }
-    }
-    PASS();
-}
-
 /* The scalar chunk route cut into tasks that are no multiple of a vector or
  * a chunk (the grain ray_pool_dispatch re-derives when it clamps to its
  * ring): every answer still equals generation 0's. */
@@ -5053,7 +4618,7 @@ static const aw_sk_q_t* aw_str_key_queries(void) {
 static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
-        test_count_on_runs, test_group_count_on_runs, test_group_runs_forged, test_topk_prune_cases,
+        test_count_on_runs, test_group_count_on_runs, test_topk_prune_cases,
         test_gather_sym_points, test_sort_head_late, test_group_topn_ties, test_group_topn_nulls,
         test_group_topn_affine, test_group_affine_nulls,
     };
@@ -5842,7 +5407,6 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_parted_sym", test_gather_parted_sym, aw_setup, aw_teardown },
     { "aware/gather_filter_ops", test_gather_filter_ops, aw_setup, aw_teardown },
     { "aware/gather_sel_parallel", test_gather_sel_parallel, aw_setup, aw_teardown },
-    { "aware/gather_sel_task_error", test_gather_sel_task_error, aw_setup, aw_teardown },
     { "aware/refine_in",         test_refine_in,         aw_setup, aw_teardown },
     { "aware/gather_sel_late_null_cancel", test_gather_sel_late_null_cancel, aw_setup, aw_teardown },
     { "aware/firstn_by_range",    test_firstn_by_range,    aw_setup, aw_teardown },
@@ -5851,7 +5415,6 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_points",      test_gather_points,      aw_setup, aw_teardown },
     { "aware/gather_raw_points",  test_gather_raw_points,  aw_setup, aw_teardown },
     { "aware/gather_sym_points",  test_gather_sym_points,  aw_setup, aw_teardown },
-    { "aware/gather_points_forged", test_gather_points_forged, aw_setup, aw_teardown },
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
@@ -5879,7 +5442,6 @@ const test_entry_t aware_entries[] = {
     { "aware/pool_clamp",          test_pool_clamp,          aw_setup, aw_teardown },
     { "aware/count_on_runs",       test_count_on_runs,       aw_setup, aw_teardown },
     { "aware/group_count_on_runs", test_group_count_on_runs, aw_setup, aw_teardown },
-    { "aware/group_runs_forged",   test_group_runs_forged,   aw_setup, aw_teardown },
     { "aware/topk_prune_cases",    test_topk_prune_cases,    aw_setup, aw_teardown },
     { "aware/topk_range_keys",     test_topk_range_keys,     aw_setup, aw_teardown },
     { "aware/group_topn_ties",     test_group_topn_ties,     aw_setup, aw_teardown },

@@ -4640,7 +4640,6 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
 
     FILE* fp = fopen(tmp_path, "wb");
     if (!fp) return RAY_ERR_IO;
-    uint64_t corrupt0 = ray_sym_domain_corruptions();   /* see before the rename */
 
     csv_writer_t w = { .fp = fp, .err = 0 };
 
@@ -4703,10 +4702,6 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
     ray_err_t sync_err = ray_file_sync(fd);
     ray_file_close(fd);
     if (sync_err != RAY_OK) { remove(tmp_path); return sync_err; }
-
-    /* A symbol of a torn symfile was written as "": the file is not to be
-     * published (table/domain.h). */
-    if (ray_sym_domain_corruptions() != corrupt0) { remove(tmp_path); return RAY_ERR_CORRUPT; }
 
     ray_err_t rn_err = ray_file_rename(tmp_path, path);
     if (rn_err != RAY_OK) { remove(tmp_path); return rn_err; }

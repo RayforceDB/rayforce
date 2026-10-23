@@ -10135,9 +10135,7 @@ static bool sc_vec_answer(const sc_chunk_ctx_t* cc, da_accum_t* acc, uint32_t a,
     if (cc->rule[a] == SC_RULE_SUM) {
         /* only the encodings with a sum rule build a view: a DICT view would
          * check every code against its dictionary and then decode as well */
-        const ray_enc_desc_t* d;
-        if ((err = ray_enccol_chunk_descs_ref(e, u->chunk, &d)) != NULL) { ray_error_free(err); return false; }
-        d += j;
+        const ray_enc_desc_t* d = &ray_enccol_descs(e, u->chunk)[j];
         if (!(d->encoding == RAY_ENC_CONST || d->encoding == RAY_ENC_FOR_BP ||
               (d->encoding == RAY_ENC_RLE && d->n_nulls == 0))) return false;
         int rc = ray_col_src_vview(s, v, vv, &err);      /* 0 for a materialized column: read in place */
@@ -14862,7 +14860,6 @@ static ray_t* sp_walk_key_range(sp_walk_ctx_t* c, int64_t n_scan) {
         if (!c->have_key || mn < c->min_key) c->min_key = mn;
         if (!c->have_key || mx > c->max_key) c->max_key = mx;
         c->have_key = true;
-        src->stats_guard = true;      /* the range arrays are sized from statistics: guard the key */
     }
     return NULL;
 }
@@ -16584,7 +16581,6 @@ da_path:;
                             if (!st.has_minmax) { scan_chunk[ch] = 1; mm_scan = true; continue; }
                             if (st.min < dmin) dmin = st.min;
                             if (st.max > dmax) dmax = st.max;
-                            key_srcs[k]->stats_guard = true;   /* the arrays are sized from statistics */
                         }
                         mm_mins[0] = dmin;
                         mm_maxs[0] = dmax;

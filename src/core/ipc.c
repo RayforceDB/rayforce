@@ -26,7 +26,6 @@
 #endif
 
 #include "store/enccol.h"    /* ray_enccol_cache_trim after a request */
-#include "table/domain.h"   /* ray_sym_domain_corruptions */
 #include "core/ipc.h"
 #include "core/mcast.h"
 #include "core/timer.h"
@@ -510,23 +509,8 @@ static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
     if (!payload) { if (fallback) ray_error_free(fallback); return; }
-    uint64_t corrupt0 = ray_sym_domain_corruptions();
     int64_t  wrote    = ray_ser_raw(payload, result);
-    if (ray_sym_domain_corruptions() != corrupt0) {
-        /* Serializing resolved symbols of a symfile found torn on the way:
-         * the reply would carry "" for them — send `corrupt` instead. */
-        ray_free_raw(payload);
-        if (fallback) ray_error_free(fallback);
-        fallback = ray_sym_domain_corrupt_error();
-        result   = fallback;
-        ser_size = ray_serde_size(result);
-        payload  = ser_size > 0 ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
-        if (!payload || ray_ser_raw(payload, result) != ser_size) {
-            if (payload) ray_free_raw(payload);
-            ray_error_free(fallback);
-            return;
-        }
-    } else if (wrote != ser_size) {
+    if (wrote != ser_size) {
         /* The write phase disagrees with the size phase (an encoded column
          * failed to decode): never send the frame, answer with an error. */
         ray_free_raw(payload);

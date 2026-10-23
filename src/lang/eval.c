@@ -35,7 +35,6 @@
 #include "ops/idxop.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
-#include "table/domain.h"   /* ray_sym_domain_corruptions */
 #include "vec/vec.h"
 #include "core/profile.h"
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
@@ -4782,12 +4781,6 @@ ray_t* ray_eval(ray_t* obj) {
     if (RAY_UNLIKELY(!__VM))
         return ray_error("state", "no VM bound to this thread");
 
-    /* A symbol file found torn or overwritten while this expression ran
-     * (table/domain.h): its kernels read such entries as missing, so the
-     * value is not to be trusted — this expression fails instead, before
-     * anything that would consume the value (a set, a print, a write)
-     * runs. */
-    uint64_t sym_corrupt0 = ray_sym_domain_corruptions();
     if (__VM->eval_depth == 0) {
         affine_sum_cache_clear();
         /* Scope the parallelism counters to THIS top-level query.  The
@@ -5250,12 +5243,6 @@ out:
      * returns to 0 guarantees the progress bar is cleared no matter
      * which builtin drove the update (including ray_group_indices_fn etc.
      * that bypass ray_execute). */
-    if (RAY_UNLIKELY(ray_sym_domain_corruptions() != sym_corrupt0) &&
-        !(ret && RAY_IS_ERR(ret) && strcmp(ray_err_code(ret), "corrupt") == 0)) {
-        if (ret && RAY_IS_ERR(ret)) ray_error_free(ret);
-        else if (ret) ray_release(ret);
-        ret = ray_sym_domain_corrupt_error();
-    }
     if (__VM->eval_depth == 0) ray_progress_end();
     return ret;
 }

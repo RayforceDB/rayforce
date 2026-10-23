@@ -2551,22 +2551,6 @@ static test_result_t test_radix_fused_capped_below_half(void) {
     PASS();
 }
 
-/* Chunk c's directory entry of column col in partition part of a parted
- * store: a reserved byte set (the read is `corrupt`); *path: the column. */
-static void ae_parted_bad(const char* root, int part, const char* col, int64_t c, char* path, size_t cap) {
-    char rel[512], dir[512];
-    snprintf(rel, sizeof rel, "%s/2024.01.0%d/t/", root, part);
-    if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) abort();
-    size_t dl = strlen(dir);
-    snprintf(path, cap, "%s%s%s", dir, (dl && dir[dl - 1] == '/') ? "" : "/", col);
-    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
-    FILE* f = fopen(path, "r+b");
-    if (!f) abort();
-    if (fseek(f, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET) != 0 ||
-        fread(&de, sizeof de, 1, f) != 1 || !de.offset) abort();
-    if (fseek(f, (long)de.offset + 6, SEEK_SET) == 0) fputc(1, f);
-    fclose(f);
-}
 static ray_t* ae_flatten(ray_t* t, const char* col, int64_t total) {
     return parted_flatten_fixed(ray_table_slot(t, ray_sym_intern(col, strlen(col))), total);
 }
@@ -2580,8 +2564,7 @@ static ray_t* ae_flatten(ray_t* t, const char* col, int64_t total) {
  * decodes runs on the pool: a cancelled generation-2 flatten is `cancel`,
  * while generation 0 (plain segments) and a generation-2 column whose
  * materialization is published are one serial copy, which completes under
- * ray_cancel() (it does not poll) and decodes nothing.  Failures:
- * test_parted_flatten_lowest_failure. */
+ * ray_cancel() (it does not poll) and decodes nothing. */
 static test_result_t test_parted_flatten_parallel(void) {
     ae_eval_ok("(set j (til 600000))");
     ae_eval_ok("(set P (table [u s f] (list (* (% (* j 7919) 50021) 1000003) "
@@ -2785,39 +2768,6 @@ static test_result_t test_parted_flatten_into_bounds(void) {
     PASS();
 }
 
-/* The lowest failure of a parallel flatten, by global row, when time
- * order says otherwise.  4 workers over 2^20 rows of u: slices of 65536
- * rows.  Partition 2 (rows 61440..131071) is corrupt in chunk 1, its last
- * 4096 rows, which lie at the end of slice 1 (after 61440 good rows);
- * partition 3 (rows 131072..) is corrupt in chunk 0, so slice 2 fails at
- * its first read, well before slice 1 gets there.  Every run answers
- * partition 2's: failures are keyed by the slice's first row, not taken
- * in the order they happen. */
-static test_result_t test_parted_flatten_lowest_failure(void) {
-    static const int64_t rows[3] = { 61440, 69632, 917504 };
-    ae_eval_ok("(set j (til 1048576))");
-    ae_eval_ok("(set P (table [u] (list (* (% (* j 7919) 50021) 1000003))))");
-    for (int p = 0, at = 0; p < 3; at += (int)rows[p], p++)
-        ae_evalf_ok("(.db.splayed.set \"" AE_TMP "/q/2024.01.0%d/t/\" (take (drop P %d) %lld) {compress: true})",
-                    p + 1, at, (long long)rows[p]);
-    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    char p2[600], p3[600];
-    ae_parted_bad(AE_TMP "/q", 2, "u", 1, p2, sizeof p2);
-    ae_parted_bad(AE_TMP "/q", 3, "u", 0, p3, sizeof p3);
-    for (int i = 0; i < 8; i++) {
-        ray_t* t = ae_eval("(.db.parted.get \"" AE_TMP "/q\" 't)");
-        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-        ray_error_clear();
-        ray_t* v = ae_flatten(t, "u", 1048576);
-        bool corrupt = v && RAY_IS_ERR(v) && strcmp(ray_err_code(v), "corrupt") == 0;
-        bool first = corrupt && strstr(ray_error_msg(), p2) != NULL;
-        ae_drop(v); ae_drop(t);
-        TEST_ASSERT_FMT(corrupt, "run %d: not corrupt", i);
-        TEST_ASSERT_FMT(first, "run %d: not %s: %s", i, p2, ray_error_msg());
-    }
-    PASS();
-}
-
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2899,7 +2849,6 @@ const test_entry_t agg_engine_entries[] = {
     { "radix_fused_capped_decode_once", test_radix_fused_capped_decode_once, ae_rt_setup, ae_rt_teardown },
     { "radix_fused_capped_below_half", test_radix_fused_capped_below_half, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
-    { "parted_flatten_lowest_failure", test_parted_flatten_lowest_failure, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },

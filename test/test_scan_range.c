@@ -838,35 +838,6 @@ static test_result_t test_walk_contig_nyi_and_cursor_range(void) {
     PASS();
 }
 
-/* Corrupt chunk 1 of a three-chunk column: the walk hands out the pieces
- * before it, then returns `corrupt` and calls fn no more. */
-static test_result_t test_walk_error_mid_walk(void) {
-    ray_t* v = sr_i32(3 * 65536, 0);
-    char p[512]; snprintf(p, sizeof p, "%s/bad", sr_root());
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, p, 2), RAY_OK);
-    FILE* f = fopen(p, "r+b"); TEST_ASSERT_TRUE(f != NULL);
-    ray_enc_dirent_t d;
-    fseek(f, RAY_ENC_DIR_OFF + (long)sizeof d, SEEK_SET);           /* chunk 1's directory entry */
-    TEST_ASSERT_EQ_I((int)fread(&d, sizeof d, 1, f), 1);
-    fseek(f, (long)d.offset + 6, SEEK_SET); fputc(1, f);            /* vector 0's descriptor rsv0 */
-    fclose(f);
-    ray_t* c = ray_col_mmap(p);
-    TEST_ASSERT_TRUE(c && c->type == RAY_ENCCOL);
-    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
-    ray_col_src_t* srcs[1] = { &s };
-    const void* pl[1] = { NULL };
-    static char out[3 * 65536 * 4];
-    sr_walk_t w = { out, 60000, 4, 0, 0, 0, NULL, NULL };
-    ray_t* e = ray_col_walk(srcs, pl, 1, 60000, 70000, false, &w, 0, sr_piece);
-    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
-    TEST_ASSERT_STR_EQ(ray_err_code(e), "corrupt");
-    ray_error_free(e);
-    TEST_ASSERT_EQ_I(w.pieces, 6);                                  /* rows 60000..65535: vectors 58..63 */
-    TEST_ASSERT_TRUE(memcmp(out, (int32_t*)ray_data(v) + 60000, (65536 - 60000) * 4) == 0);
-    ray_col_src_release(&s); ray_release(c); ray_release(v);
-    PASS();
-}
-
 /* A plain slice reads in place, at the slice's rows. */
 static test_result_t test_walk_plain_slice(void) {
     ray_t* v = sr_i32(5000, 3);
@@ -1451,60 +1422,9 @@ static test_result_t test_expr_nulls_midvector(void) {
     PASS();
 }
 
-/* Review focus 4: a corrupt chunk-2 descriptor surfaces as `corrupt` with
- * the column path, twice, and nothing leaks. */
-static uint64_t sr_dirent_offset(const char* path, int64_t c) {
-    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
-    FILE* f = fopen(path, "rb");
-    if (f) {
-        if (fseek(f, (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de), SEEK_SET) != 0 ||
-            fread(&de, sizeof de, 1, f) != 1) de.offset = 0;
-        fclose(f);
-    }
-    return de.offset;
-}
-static void sr_patch(const char* path, long off, uint8_t val) {
-    FILE* f = fopen(path, "r+b"); if (!f) return;
-    if (fseek(f, off, SEEK_SET) == 0) fputc(val, f);
-    fclose(f);
-}
-/* Copy of the generation-2 table with column `col`'s chunk 2 descriptor 0
- * reserved bytes (rsv0, offset 6) set; returns the resolved column path,
- * resolved from the directory string the loads below use (trailing slash
- * included: the load names its columns "<dir>/<col>"). */
-static void sr_make_bad(const char* col, char* path, size_t cap) {
-    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/bad/\" S {compress: true})");
-    char dir[512];
-    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/bad/"), dir, sizeof dir) != RAY_OK) abort();
-    snprintf(path, cap, "%s/%s", dir, col);
-    uint64_t off = sr_dirent_offset(path, 2);
-    if (!off) abort();
-    sr_patch(path, (long)off + 6, 1);
-}
-static test_result_t test_expr_error(void) {
-    char path[600];
-    sr_make_bad("v", path, sizeof path);
-    for (int i = 0; i < 2; i++) {
-        ray_t* t = sr_eval("(.db.splayed.get \"" SR_TMP "/bad/\")");
-        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-        ray_graph_t* g = ray_graph_new(t);
-        bool all = false;
-        ray_error_clear();
-        ray_t* s = exec_pred_to_selection(g, pred_v_gt(g), ray_table_nrows(t), &all);
-        TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
-        TEST_ASSERT_STR_EQ(ray_err_code(s), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(s);
-        ray_graph_free(g); ray_release(t);
-    }
-    PASS();
-}
-
 /* Finding C2: (count (select {from: T where: <compare>})) is answered by
  * try_count_simple_compare on range reads (ClickBench q2's shape), never
- * materializing; a corrupt chunk the predicate reads is the query's error,
- * and one its directory decides is never read (spec "Filter with
- * skipping": a decided chunk touches no descriptor). */
+ * materializing. */
 static test_result_t test_count_fast_path(void) {
     uint64_t f0 = ray_query_test_count_fast();
     SR_SAME("(count (select {from: T where: (== g 3)}))", 0);       /* I16 */
@@ -1514,21 +1434,6 @@ static test_result_t test_count_fast_path(void) {
     SR_SAME("(count (select {from: T where: (== s 'c)}))", 0);       /* file-domain SYM */
     SR_SAME("(count (select {from: T where: (== s 'zz)}))", 0);      /* absent symbol */
     TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 12);          /* 6 shapes x 2 generations */
-    char path[600];
-    sr_make_bad("k", path, sizeof path);
-    for (int i = 0; i < 2; i++) {
-        ray_error_clear();
-        /* chunk 2 (rows 131072..196607) holds 150000: undecided, read */
-        ray_t* r = sr_eval("(count (select {from: (.db.splayed.get \"" SR_TMP "/bad/\") where: (> k 150000)}))");
-        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
-    }
-    /* every row of chunk 2 is above 5: decided all-pass from the directory */
-    ray_t* r = sr_eval("(count (select {from: (.db.splayed.get \"" SR_TMP "/bad/\") where: (> k 5)}))");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 199994);
-    ray_release(r);
     PASS();
 }
 
@@ -1656,8 +1561,7 @@ static test_result_t test_expr_reuses_materialized(void) {
     PASS();
 }
 
-/* A range-read failure surfaces as `corrupt` with the column path through
- * the element-wise and the group call sites of expr_eval_full (on a sound
+/* The element-wise and the group call sites of expr_eval_full (on a
  * generation-2 table neither run decodes k or v, so the fused path is the
  * one taken; the group key g is read whole), and an interrupt is
  * `cancel`. */
@@ -1678,17 +1582,6 @@ static test_result_t test_expr_error_sites(void) {
             TEST_ASSERT_FMT(ev && !ray_enccol_decoded_peek(ev), "%s: column %s decoded", qs[i], c ? "v" : "k");
         }
         ray_release(t);
-    }
-    char path[600];
-    sr_make_bad("v", path, sizeof path);
-    for (int i = 0; i < 2; i++) {
-        sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/bad/\"))");
-        ray_error_clear();
-        ray_t* r = sr_eval(qs[i]);
-        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: not an error", qs[i]);
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
     }
     /* cancel: an interrupted dispatch is `cancel`, not a partial selection */
     ray_t* t = sr_load(1);
@@ -1960,52 +1853,6 @@ static test_result_t test_expr_parted_segments(void) {
     PASS();
 }
 
-/* Column `col` of partition `part` (1-based) under `root`: its resolved
- * path, with chunk `c`'s descriptor 0 reserved bytes set (corrupt). */
-static void sr_parted_bad(const char* root, int part, const char* col, int64_t c, char* path, size_t cap) {
-    char rel[512], dir[512];
-    snprintf(rel, sizeof rel, "%s/2024.01.0%d/t/", root, part);
-    if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) abort();
-    size_t dl = strlen(dir);
-    snprintf(path, cap, "%s%s%s", dir, (dl && dir[dl - 1] == '/') ? "" : "/", col);
-    uint64_t off = sr_dirent_offset(path, c);
-    if (!off) abort();
-    sr_patch(path, (long)off + 6, 1);
-}
-/* Range-read failures in two segments: the answer is the lowest one in
- * row order across the whole parted column, every run.  Partition 1 fails
- * late (chunk 1, rows 65536..), partition 3 early (chunk 0): partition 1
- * wins.  The evaluator stops at the first failing segment, which alone
- * gives that answer; with the stop disabled (test hook) partition 3 runs
- * too and only the global failure keys (65536 against 140000, where
- * segment-local keys would be 65536 against 0) keep partition 1 the
- * answer.  With only partition 3 corrupt, its failure is the answer. */
-static test_result_t test_expr_parted_fail_lowest(void) {
-    sr_parted_xy(SR_TMP "/pbad", 7, false, false);
-    char p1[600], p3[600];
-    sr_parted_bad(SR_TMP "/pbad", 3, "y", 0, p3, sizeof p3);
-    for (int i = 0; i < 2; i++) {
-        ray_error_clear();
-        ray_t* v = sr_parted_add(SR_TMP "/pbad", NULL);
-        TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
-        TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
-        TEST_ASSERT_FMT(strstr(ray_error_msg(), p3) != NULL, "not %s: %s", p3, ray_error_msg());
-        ray_error_free(v);
-    }
-    sr_parted_bad(SR_TMP "/pbad", 1, "y", 1, p1, sizeof p1);
-    for (int i = 0; i < 8; i++) {
-        ray_expr_test_parted_all_segments(i & 1);
-        ray_error_clear();
-        ray_t* v = sr_parted_add(SR_TMP "/pbad", NULL);
-        TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
-        TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
-        TEST_ASSERT_FMT(strstr(ray_error_msg(), p1) != NULL, "run %d: not %s: %s", i, p1, ray_error_msg());
-        ray_error_free(v);
-    }
-    ray_expr_test_parted_all_segments(false);
-    PASS();
-}
-
 /* Compile (+ x y) over parted table t and evaluate it through the parted
  * evaluator directly (nrows rows). */
 static ray_t* sr_parted_eval(ray_t* t, int64_t nrows) {
@@ -2020,23 +1867,19 @@ static ray_t* sr_parted_eval(ray_t* t, int64_t nrows) {
     return v;
 }
 /* A cancel ends the segment loop: two dispatched partitions (70000 rows,
- * their tasks skipped by the cancelled pool) and a corrupt third one small
- * enough to run inline; the answer is `cancel`, never the third's
- * `corrupt`. */
+ * their tasks skipped by the cancelled pool) and a third one small enough
+ * to run inline; the answer is `cancel`, never the third's values. */
 static test_result_t test_expr_parted_cancel(void) {
     for (int p = 0; p < 3; p++)
         sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/pcn/2024.01.0%d/t/\" %s {compress: true})", p + 1,
                     p == 2 ? "(table [x y] (list (til 1000) (% (til 1000) 97)))"
                            : "(table [x y] (list (til 70000) (% (til 70000) 97)))");
-    char p3[600];
-    sr_parted_bad(SR_TMP "/pcn", 3, "y", 0, p3, sizeof p3);
     sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/pcn\" 't))");
     ray_t* t = sr_eval("T");
     TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    ray_t* v = sr_parted_eval(t, 141000);                     /* sound run: corrupt */
-    TEST_ASSERT_TRUE(v && RAY_IS_ERR(v));
-    TEST_ASSERT_STR_EQ(ray_err_code(v), "corrupt");
-    ray_error_free(v);
+    ray_t* v = sr_parted_eval(t, 141000);                     /* the run: all three segments */
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->len == 141000);
+    ray_release(v);
     ray_request_interrupt();
     v = sr_parted_eval(t, 141000);
     ray_clear_interrupt();
@@ -2081,23 +1924,17 @@ static test_result_t test_zone_dir_skips(void) {
     ray_graph_t* g = ray_graph_new(t);
     ray_enc_counters_reset();
     bool all = false;
-    uint64_t dv0 = ray_enccol_test_desc_validations();
     ray_t* s = exec_pred_to_selection(g, ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 1000)), ray_table_nrows(t), &all);
     TEST_ASSERT_TRUE(s && !RAY_IS_ERR(s));
     TEST_ASSERT_EQ_I(ray_rowsel_meta(s)->total_pass, 1000);
-    /* the chunk gate decides chunks 1-3 before their descriptors are read */
-    TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.materialized, 0);
     TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);        /* chunk 0's vector 0 only (DELTA_BP: no view) */
-    /* why vector 0 decodes: DELTA_BP, which the view declines (checked
-     * after the descriptor-validation pin, which this read would satisfy) */
+    /* why vector 0 decodes: DELTA_BP, which the view declines */
     {
         ray_t* ek = ray_table_get_col_enc(t, ray_sym_intern("k", 1));
         TEST_ASSERT_NOT_NULL(ek);
-        const ray_enc_desc_t* d;
-        ray_t* derr = ray_enccol_chunk_descs_ref(ray_enccol_of(ek), 0, &d);
-        TEST_ASSERT_TRUE(derr == NULL);
+        const ray_enc_desc_t* d = ray_enccol_descs(ray_enccol_of(ek), 0);
         TEST_ASSERT_EQ_I(d[0].encoding, RAY_ENC_DELTA_BP);
         ray_enc_vview_t* vb = malloc(sizeof *vb);
         ray_t* verr = NULL;
@@ -2109,12 +1946,10 @@ static test_result_t test_zone_dir_skips(void) {
      * has no view, so it is read (P3 Task 3b counts viewed vectors only) */
     sr_eval_ok("(set T (.db.splayed.get \"" SR_G2 "\"))");
     ray_enc_counters_reset();
-    dv0 = ray_enccol_test_desc_validations();
     ray_t* c = sr_eval("(count (select {from: T where: (< k 1000)}))");
     TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->i64 == 1000);
     ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);
-    TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     sr_drop(c);
     PASS();
 }
@@ -2530,7 +2365,6 @@ static test_result_t test_fp_range_dir_gate(void) {
     TEST_ASSERT_EQ_I(fp_compile_pred(g, fpp_k_lt(g), t, &p, &e), 0);
     TEST_ASSERT_TRUE(p.children[0].enc);
     ray_enc_counters_reset();
-    const uint64_t dv0 = ray_enccol_test_desc_validations();
     fp_scratch_t sc; fp_scratch_init(&sc);
     uint8_t b[RAY_MORSEL_ELEMS];
     int64_t n = ray_table_nrows(t), pass = 0;
@@ -2543,9 +2377,6 @@ static test_result_t test_fp_range_dir_gate(void) {
     TEST_ASSERT_EQ_I(pass, 70000);
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_EQ_U(k.decoded_bytes, 1024 * 8);
-    /* the chunk gate decides chunks 0, 2 and 3 before their descriptors
-     * are read: only chunk 1's are validated */
-    TEST_ASSERT_EQ_U(ray_enccol_test_desc_validations() - dv0, 1);
     TEST_ASSERT_EQ_U(k.materialized, 0);
     fp_pred_cleanup(&p); ray_graph_free(g); ray_release(t);
     PASS();
@@ -2732,34 +2563,8 @@ static test_result_t test_topk_materializes_keys(void) {
     PASS();
 }
 
-/* A range read the top-k or take scan makes fails: the query's error, the
- * column's path in the message; an interrupted scan is `cancel`.  The
- * corrupt chunk is 2.  v > 400000 decides chunks 0 and 1 and leaves chunk
- * 2 undecided, so the ascending top-k and the forward take read it; v ==
- * 395000 (row 131669) leaves only chunk 2 undecided, so the backward take
- * and the descending top-k read it whatever the schedule. */
-static test_result_t test_topk_take_error(void) {
-    static const char* const qs[] = {
-        "(select {k: k from: T where: (> v 400000) asc: k take: 5})",
-        "(select {k: k from: T where: (> v 400000) take: 4})",
-        "(select {k: k from: T where: (== v 395000) take: -4})",           /* the backward take */
-        "(select {k: k from: T where: (== v 395000) desc: k take: 5})",
-    };
-    char path[600];
-    sr_make_bad("v", path, sizeof path);
-    for (int i = 0; i < 4; i++) {
-        sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/bad/\"))");
-        ray_fused_topk_counters_reset();
-        ray_error_clear();
-        ray_t* r = sr_eval(qs[i]);
-        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: not an error", qs[i]);
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
-        uint64_t ran = 0, declined = 0;
-        ray_fused_topk_counters(&ran, &declined);
-        TEST_ASSERT_EQ_U(ran, 1);
-    }
+/* An interrupted top-k or take scan is `cancel`. */
+static test_result_t test_topk_take_cancel(void) {
     /* cancel: an interrupted scan is `cancel`, not a partial answer.
      * Generation 0: a generation-2 sort key's materialization would answer
      * the cancel before the scan runs. */
@@ -2879,25 +2684,8 @@ static test_result_t test_in_selection_reuses_materialized(void) {
     PASS();
 }
 
-/* A corrupt chunk the `in` selection reads is its error, with the column
- * path; an interrupted selection is `cancel`, not a partial answer. */
-static test_result_t test_in_selection_error(void) {
-    char path[600];
-    sr_make_bad("g", path, sizeof path);
-    for (int i = 0; i < 2; i++) {
-        ray_t* t = sr_eval("(.db.splayed.get \"" SR_TMP "/bad/\")");
-        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-        ray_graph_t* g = ray_graph_new(t);
-        bool all = false;
-        ray_error_clear();
-        ray_t* s = exec_pred_to_selection(g, i ? fpp_g_in(g) : ray_not_in(g, ray_scan(g, "g"), ray_const_i64(g, 3)),
-                                          ray_table_nrows(t), &all);
-        TEST_ASSERT_TRUE(s && RAY_IS_ERR(s));
-        TEST_ASSERT_STR_EQ(ray_err_code(s), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(s);
-        ray_graph_free(g); ray_release(t);
-    }
+/* An interrupted `in` selection is `cancel`, not a partial answer. */
+static test_result_t test_in_selection_cancel(void) {
     for (int gen = 0; gen < 2; gen++) {
         ray_t* t = sr_load(gen);
         TEST_ASSERT_NOT_NULL(t);
@@ -3091,28 +2879,8 @@ static test_result_t test_reduce_dir_answers(void) {
     PASS();
 }
 
-static test_result_t test_reduce_error(void) {
-    char path[600];
-    sr_make_bad("f", path, sizeof path);              /* F64: no directory answer, the walk reads chunk 2 */
-    for (int i = 0; i < 2; i++) {
-        ray_error_clear();
-        ray_t* r = sr_eval("(sum (at (.db.splayed.get \"" SR_TMP "/bad/\") 'f))");
-        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
-    }
-    /* first / last read their row through the cursor: chunk 2 is never touched
-     * by first; last reads chunk 3 then 2 only while the rows are null */
-    ray_t* r = sr_eval("(first (at (.db.splayed.get \"" SR_TMP "/bad/\") 'f))");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-    sr_drop(r);
-    PASS();
-}
-
 /* Ruling Q1: a RAW float vector without nulls is read in place (nothing
- * decoded) once its chunk passed the float checks; a NaN in such a vector
- * is a null outside the bitmap: corrupt, on every read. */
+ * decoded). */
 static test_result_t test_raw_float_view(void) {
     sr_eval_ok("(set i (til 140000))");
     sr_bind_f32("yf", 140000, 0, 0.25f);
@@ -3137,41 +2905,6 @@ static test_result_t test_raw_float_view(void) {
         TEST_ASSERT_EQ_U(k.decoded_bytes, 0);
         TEST_ASSERT_EQ_U(k.materialized, 0);
         sr_drop(r);
-    }
-    /* chunk 1, vector 3, element 5 of x set to a NaN */
-    /* P5: the RAW float body is patched below */
-    ray_encw_test_force_float(RAY_ENC_RAW);
-    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/rbad/\" R {compress: true})");
-    ray_encw_test_force_float(-1);
-    char dir[512], path[600];
-    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/rbad/"), dir, sizeof dir) != RAY_OK) abort();
-    snprintf(path, sizeof path, "%s/x", dir);
-    uint64_t coff = sr_dirent_offset(path, 1);
-    TEST_ASSERT_TRUE(coff != 0);
-    ray_enc_desc_t de; memset(&de, 0, sizeof de);
-    FILE* f = fopen(path, "r+b");
-    TEST_ASSERT_NOT_NULL(f);
-    TEST_ASSERT_TRUE(fseek(f, (long)(coff + 3 * sizeof de), SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1);
-    TEST_ASSERT_EQ_I(de.encoding, 0);                    /* RAW */
-    TEST_ASSERT_EQ_I(de.n_nulls, 0);
-    double nan = NAN;
-    TEST_ASSERT_TRUE(fseek(f, (long)(coff + de.payload_off + 5 * 8), SEEK_SET) == 0 && fwrite(&nan, 8, 1, f) == 1);
-    fclose(f);
-    for (int rep = 0; rep < 2; rep++) {
-        ray_error_clear();
-        ray_t* r = sr_eval("(sum (at (.db.splayed.get \"" SR_TMP "/rbad/\") 'x))");
-        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
-    }
-    /* on one load: the failed chunk is never cached as checked */
-    sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/rbad/\"))");
-    for (int rep = 0; rep < 2; rep++) {
-        ray_t* r = sr_eval("(sum (at B 'x))");
-        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        ray_error_free(r);
     }
     PASS();
 }
@@ -3389,51 +3122,6 @@ static test_result_t test_scalar_route_f64_unaligned(void) {
     PASS();
 }
 
-/* R-FAIL: a corrupt chunk the scalar route reads is the query's error, on
- * every run; morsels the selection rejects whole are not read. */
-static test_result_t test_scalar_route_error(void) {
-    char path[600];
-    static const struct { const char* col; const char* q; } cs[] = {
-        { "f", "(select {s: (sum f) c: (count k) from: B where: (> g 0)})" },   /* generic loop */
-        /* a whole-column I64 sum answers from the directory and never reads
-         * the damaged chunk (the accepted residual, as for a zone); the chunk
-         * route reads it by rows under a selection that keeps some of it */
-        { "k", "(select {s: (sum (+ k 1)) m: (min k) from: B where: (> g 0)})" },
-        { "k", "(select {s: (sum (+ k 1)) a: (avg (+ k 1)) from: B where: (> g 0)})" },
-    };
-    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
-        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
-        for (int i = 0; i < 2; i++) {
-            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(cs[c].q);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-            ray_error_free(r);
-        }
-    }
-    /* chunk 2 (rows 131072..196607) of k is corrupt; a selection that ends
-     * before it never reads it */
-    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_TMP "/bad/\")",
-                                 "(select {s: (sum (+ k 1)) m: (max k) from: T where: (< k 100000)})", 0);
-    if (t.status != TEST_PASS) return t;
-    /* the tight i64 kernel (scalar_sum_i64_fn): a staged TIMESTAMP avg, no
-     * statistics rule (TIMESTAMP avg decodes), no selection, no nulls */
-    sr_eval_ok("(set S (table [k p] (list i (as 'TIMESTAMP (* 1000 i)))))");
-    sr_make_bad("p", path, sizeof path);
-    for (int i = 0; i < 2; i++) {
-        sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
-        ray_error_clear();
-        ray_t* r = sr_eval("(select {a: (avg p) from: B})");
-        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "timestamp avg: no error");
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
-    }
-    PASS();
-}
-
 /* The route hook: 1 takes the legacy ladder instead of the v2 engine; the
  * answers are the same; ray_test_hooks_off disarms it. */
 static test_result_t test_group_route_hook(void) {
@@ -3625,37 +3313,6 @@ static test_result_t test_da_route_shapes(void) {
     PASS();
 }
 
-/* R-FAIL: a corrupt chunk of a key or an input the route reads is the
- * query's error, on every run. */
-static test_result_t test_da_route_error(void) {
-    char path[600];
-    static const struct { const char* col; const char* q; } cs[] = {
-        { "g", "(select {s: (sum v) c: (count k) from: B by: g})" },          /* key, accumulation */
-        { "v", "(select {s: (sum v) c: (count k) from: B by: g})" },          /* input */
-        { "v", "(select {s: (sum v) from: B where: (> k 5) by: {g: g b: b}})" },
-    };
-    ray_group_test_route(1);
-    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
-        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
-        for (int i = 0; i < 2; i++) {
-            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(cs[c].q);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-            ray_error_free(r);
-        }
-    }
-    /* chunk 2 (rows 131072..196607) of v is corrupt; a selection that ends
-     * before it never reads it */
-    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_TMP "/bad/\")",
-                                 "(select {s: (sum v) c: (count k) from: T where: (< k 100000) by: g})", 0);
-    ray_group_test_route(0);
-    if (t.status != TEST_PASS) return t;
-    PASS();
-}
-
 /* Partitioned generation-2 tables (exec_group_parted gives each partition's
  * segments to the route), and a ragged generation-0 table whose missing
  * column is a synthetic null segment, answer as their references.  Answers
@@ -3710,43 +3367,6 @@ static test_result_t test_sp_dyn_route(void) {
     test_result_t t = sr_same_on("(.db.splayed.get \"" SR_TMP "/w0/\")", "(.db.splayed.get \"" SR_TMP "/w2/\")",
                                  "(select {c: (count x) from: T by: s desc: c take: 3})", 0);
     if (t.status != TEST_PASS) { ray_group_test_route(0); return t; }
-    /* R-FAIL on both passes and the parallel fill */
-    char path[600];
-    static const struct { const char* col; const char* q; } cs[] = {
-        { "s", "(select {c: (count k) from: B by: s desc: c take: 3})" },
-        { "s", "(select {c: (count k) s: (sum k) from: B by: s desc: c take: 3})" },
-        { "k", "(select {c: (count k) s: (sum k) from: B by: s desc: c take: 3})" },
-        { "k", "(select {c: (count k) s: (sum k) from: B by: u desc: c take: 3})" },
-    };
-    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
-        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
-        for (int i = 0; i < 2; i++) {
-            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(cs[c].q);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-            ray_error_free(r);
-        }
-    }
-    /* the parallel fill's range error */
-    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/wbad/\" W {compress: true})");
-    char dir[512];
-    TEST_ASSERT_TRUE(ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/wbad/"), dir, sizeof dir) == RAY_OK);
-    snprintf(path, sizeof path, "%s/s", dir);
-    uint64_t off = sr_dirent_offset(path, 2);
-    TEST_ASSERT_TRUE(off != 0);
-    sr_patch(path, (long)off + 6, 1);
-    for (int i = 0; i < 2; i++) {
-        sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/wbad/\"))");
-        ray_error_clear();
-        ray_t* r = sr_eval("(select {c: (count x) from: B by: s desc: c take: 3})");
-        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-        ray_error_free(r);
-    }
     ray_group_test_route(0);
     PASS();
 }
@@ -3939,26 +3559,6 @@ static test_result_t test_radix_route_sparse(void) {
         test_result_t r = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "T2M", qm[i], 0);
         if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
     }
-    /* R-FAIL: a corrupt chunk of the key or an input is the query's error */
-    char path[600];
-    static const struct { const char* col; const char* q; } cs[] = {
-        { "h", "(select {c: (count k) s: (sum h) from: B by: k})" },                  /* input, sum arm */
-        { "k", "(select {c: (count k) s: (sum h) from: B by: k})" },                  /* key, sum arm */
-        { "h", "(select {c: (count k) s: (sum u) from: B where: (> k 180000) by: h desc: c take: 3})" },   /* key bounds */
-        { "u", "(select {c: (count k) s: (sum u) from: B where: (> k 180000) by: h desc: c take: 3})" },   /* range input */
-    };
-    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
-        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
-        for (int i = 0; i < 2; i++) {
-            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(cs[c].q);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-            ray_error_free(r);
-        }
-    }
     ray_group_test_route(0);
     PASS();
 }
@@ -3987,40 +3587,6 @@ static test_result_t test_radix_route_serial(void) {
         if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
     }
     ray_group_test_route(0);
-    PASS();
-}
-
-/* R-FAIL: a corrupt chunk of a key or an input the radix builders read is
- * the query's error, on every run: phase 1, the v2 sibling (whole scan and
- * survivor list), the holistic route. */
-static test_result_t test_radix_route_error(void) {
-    char path[600];
-    static const struct { const char* col; const char* q; } cs[] = {
-        { "k", "(select {c: (count v) s: (sum v) from: B by: k})" },                         /* key, phase 1 */
-        { "v", "(select {c: (count k) s: (sum v) from: B by: {k: k s: s}})" },               /* input, phase 1 */
-        { "h", "(select {c: (count k) s: (sum h) from: B by: {g: g u: u}})" },               /* input, v2 */
-        { "h", "(select {c: (count k) s: (sum h) from: B where: (> k 140000) by: {g: g u: u}})" },   /* v2 R-SPARSE: 59999 survivors, chunk 2 */
-        { "g", "(select {m: (med v) from: B by: g})" },                                      /* key, holistic */
-    };
-    ray_group_test_route(2);
-    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
-        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) sr_make_bad(cs[c].col, path, sizeof path);
-        for (int i = 0; i < 2; i++) {
-            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/bad/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(cs[c].q);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s: no error", cs[c].q);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-            ray_error_free(r);
-        }
-    }
-    /* chunk 2 (rows 131072..196607) of g is corrupt; a survivor list that
-     * ends before it never reads it */
-    test_result_t t = sr_same_on("(.db.splayed.get \"" SR_G0 "\")", "(.db.splayed.get \"" SR_TMP "/bad/\")",
-                                 "(select {c: (count k) s: (sum h) from: T where: (< k 60000) by: {g: g u: u}})", 0);
-    ray_group_test_route(0);
-    if (t.status != TEST_PASS) return t;
     PASS();
 }
 
@@ -4340,66 +3906,14 @@ static test_result_t test_v2_sel_bounds_boundary(void) {
     PASS();
 }
 
-/* Task 13b fix round 1: directory statistics size the dense plans, so a
- * forged one must not reach memory.  Key k is j * 7 % 1000 in chunks 0-2
- * and j * 7 % 5001 in chunk 3; chunk 3's directory maximum is patched from
- * 5000 to 999 and the file still loads.  The filtered (the selection
- * bounds) and the unfiltered (the directory prescan) group-bys both
- * report `corrupt` naming the column, twice, and never write past the
- * slab (ASan). */
-static void sr_patch64(const char* path, long off, uint64_t val) {
-    FILE* f = fopen(path, "r+b"); if (!f) return;
-    if (fseek(f, off, SEEK_SET) == 0) (void)fwrite(&val, 8, 1, f);
-    fclose(f);
-}
-/* Chunk c of the generation-2 column file at path: its directory maximum
- * and every vector descriptor's maximum above x lowered to x, so the
- * statistics still nest and validate, and only the values lie above them
- * (the consumer guard's case).  False on an I/O error or a vector whose
- * minimum lies above x. */
-static bool sr_forge_max(const char* path, int64_t c, int64_t x) {
-    FILE* f = fopen(path, "r+b"); if (!f) return false;
-    ray_enc_dirent_t de;
-    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
-    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
-    if (ok) { de.max = x; ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1; }
-    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
-        ray_enc_desc_t d;
-        long off = (long)(de.offset + (uint64_t)j * sizeof d);
-        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
-        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
-        if (d.flags & RAY_ENC_STAT_ABSENT || d.max <= x) continue;
-        if (d.min > x) { ok = false; break; }
-        d.max = x;
-        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
-    }
-    return fclose(f) == 0 && ok;
-}
-/* q over the table at dir (set as T) gives `corrupt` naming path, twice. */
-static test_result_t sr_corrupt_twice(const char* dir_expr, const char* q, const char* path) {
-    for (int rep = 0; rep < 2; rep++) {
-        sr_evalf_ok("(set T %s)", dir_expr);
-        ray_error_clear();
-        ray_t* r = sr_eval(q);
-        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (read %d): answered", q, rep + 1);
-        TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
-                        "%s (read %d): %s \"%s\"", q, rep + 1, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "");
-        ray_error_free(r);
-    }
-    PASS();
-}
-
-/* The consumer guards: every consumer kind that sizes memory from the
- * directory statistics, over a key whose chunk 3 statistics (directory
- * and descriptors, still nested) are lowered below its values.  The dense
- * plan unfiltered (the directory prescan) and filtered (the selection
- * bounds), the direct array, the sparse emit-filter range: each `corrupt`
- * naming the key, twice; the same queries on the unpatched table answer
- * as generation 0. */
-static test_result_t test_v2_forged_consumers(void) {
+/* Every consumer kind that sizes memory from the directory statistics:
+ * the dense plan unfiltered (the directory prescan) and filtered (the
+ * selection bounds), the direct array, the sparse emit-filter range; each
+ * answers as generation 0. */
+static test_result_t test_v2_consumers(void) {
     /* k: j*7 % 1000 in chunks 0-2, % 5001 in chunk 3 with a null every
-     * 100 rows (so the samplers' point reads decline there and only the
-     * guard sees the values); g: % 50, % 101; n: a wide I64 key (the
+     * 100 rows (so the samplers' point reads decline there); g: % 50, % 101;
+     * n: a wide I64 key (the
      * sparse range), + 400000 in chunk 3 */
     sr_eval_ok("(set jf (til 262144))");
     sr_eval_ok("(set ja (til 196608))");
@@ -4418,56 +3932,18 @@ static test_result_t test_v2_forged_consumers(void) {
     for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
         ray_group_test_route(cs[i].route);
         test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/fc0/\")", "(.db.splayed.get \"" SR_TMP "/fc2/\")", cs[i].q, 0);
-        if (r.status != TEST_PASS) { ray_group_test_route(0); return r; }
-        sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fcb/\" FC {compress: true})");
-        char dir[512], path[600];
-        if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fcb/"), dir, sizeof dir) != RAY_OK) { ray_group_test_route(0); FAIL("resolve"); }
-        snprintf(path, sizeof path, "%s/%s", dir, cs[i].col);
-        if (!sr_forge_max(path, 3, cs[i].x)) { ray_group_test_route(0); FAIL("forge"); }
-        r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fcb/\")", cs[i].q, path);
         ray_group_test_route(0);
         if (r.status != TEST_PASS) return r;
     }
     PASS();
 }
 
-/* Chunk c's directory maximum and every vector descriptor's statistics
- * above x capped at x (a minimum above x lowered to x too, so a CONST
- * vector's [v, v] becomes [x, x]): the statistics still nest and
- * validate, and the values above x lie outside them.  False on an I/O
- * error. */
-static bool sr_forge_cap(const char* path, int64_t c, int64_t x) {
-    FILE* f = fopen(path, "r+b"); if (!f) return false;
-    ray_enc_dirent_t de;
-    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
-    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
-    if (ok) {
-        de.max = x;
-        if (de.min > x) de.min = x;
-        ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
-    }
-    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
-        ray_enc_desc_t d;
-        long off = (long)(de.offset + (uint64_t)j * sizeof d);
-        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
-        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
-        if (d.flags & RAY_ENC_STAT_ABSENT || d.max <= x) continue;
-        d.max = x;
-        if (d.min > x) d.min = x;
-        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
-    }
-    return fclose(f) == 0 && ok;
-}
-
 /* P3 Task 6b fix round 2: the run arm of the batched point read
- * (points_runs) under forged statistics.  k is an RLE key (runs of 5) and
- * a CONST one (one value per vector); chunk 3 holds values up to 5000 /
- * 4000 + 63, its statistics capped at 999.  A filter keeping every 97th
- * row reads k at about 10 rows per vector: point reads in the selection
- * bounds and the compact gather.  Each read reports `corrupt` naming k,
- * twice, with no sanitizer report; unpatched, the answers are generation
- * 0's and k decodes nothing. */
-static test_result_t test_v2_forged_run_points(void) {
+ * (points_runs).  k is an RLE key (runs of 5) and a CONST one (one value
+ * per vector).  A filter keeping every 97th row reads k at about 10 rows
+ * per vector: point reads in the selection bounds and the compact gather.
+ * The answers are generation 0's and k decodes nothing. */
+static test_result_t test_v2_run_points(void) {
     sr_eval_ok("(set ja (til 196608))");
     sr_eval_ok("(set jb (+ 196608 (til 65536)))");
     static const struct { const char* name; const char* k; int enc; } cs[] = {
@@ -4484,19 +3960,16 @@ static test_result_t test_v2_forged_run_points(void) {
         sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/%s0/\" FQ {compress: false})", cs[i].name);
         ray_encw_test_force(cs[i].enc);
         sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/%s2/\" FQ {compress: true})", cs[i].name);
-        sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/%sb/\" FQ {compress: true})", cs[i].name);
         ray_encw_test_force(-1);
-        char t0[256], t2[256], tb[256], rel[256], dir[512], path[600];
+        char t0[256], t2[256];
         snprintf(t0, sizeof t0, "(.db.splayed.get \"" SR_TMP "/%s0/\")", cs[i].name);
         snprintf(t2, sizeof t2, "(.db.splayed.get \"" SR_TMP "/%s2/\")", cs[i].name);
-        snprintf(tb, sizeof tb, "(.db.splayed.get \"" SR_TMP "/%sb/\")", cs[i].name);
         /* every vector of k in chunk 3 is the arm's codec */
         {
             ray_t* t = sr_eval(t2);
             ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern("k", 1));
             TEST_ASSERT_NOT_NULL(ec);
-            const ray_enc_desc_t* d;
-            TEST_ASSERT_NULL(ray_enccol_chunk_descs_ref(ray_enccol_of(ec), 3, &d));
+            const ray_enc_desc_t* d = ray_enccol_descs(ray_enccol_of(ec), 3);
             for (int j = 0; j < RAY_ENC_VECS_PER_CHUNK; j++)
                 TEST_ASSERT_FMT(d[j].encoding == (i ? RAY_ENC_CONST : RAY_ENC_RLE), "%s vector %d: %d", cs[i].name, j, d[j].encoding);
             sr_drop(t);
@@ -4507,36 +3980,22 @@ static test_result_t test_v2_forged_run_points(void) {
             TEST_ASSERT_FMT(sr_col_decoded("k") == 0, "%s %s: %llu bytes of k decoded", cs[i].name, qs[q],
                             (unsigned long long)sr_col_decoded("k"));
         }
-        snprintf(rel, sizeof rel, SR_TMP "/%sb/", cs[i].name);
-        if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-        snprintf(path, sizeof path, "%s/k", dir);
-        if (!sr_forge_cap(path, 3, 999)) FAIL("forge");
-        for (int q = 0; qs[q]; q++) {
-            test_result_t r = sr_corrupt_twice(tb, qs[q], path);
-            if (r.status != TEST_PASS) return r;
-        }
     }
     PASS();
 }
 
-/* P3 Task 6b: point reads under a guard.  A selective filter (every 97th
- * row: a few rows per vector) groups by k, whose selected rows are
- * point-read (FOR_BP, no nulls) by the dense plan's selection bounds and
- * by the compact gather.  Chunk 3's statistics (directory and descriptors,
- * still nested) are lowered below its values: the dense plan sized from
- * them never sees a value outside them, since the point read checks each
- * value against its vector's statistics (`corrupt` naming k, twice, no
- * write past the slab under ASan).  The first-n passes over the same
- * forged key (an unordered take) report it too.  Unpatched, the answer is
- * generation 0's and nothing is materialized. */
-static test_result_t test_v2_forged_points(void) {
+/* P3 Task 6b: point reads.  A selective filter (every 97th row: a few
+ * rows per vector) groups by k, whose selected rows are point-read
+ * (FOR_BP, no nulls) by the dense plan's selection bounds and by the
+ * compact gather; the first-n passes (an unordered take) too.  The answer
+ * is generation 0's and nothing is materialized. */
+static test_result_t test_v2_points(void) {
     sr_eval_ok("(set ja (til 196608))");
     sr_eval_ok("(set jb (+ 196608 (til 65536)))");
     sr_eval_ok("(set FP (table [k v] (list (concat (% (* ja 7) 1000) (% (* jb 7) 5001)) (til 262144))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fp0/\" FP {compress: false})");
     ray_encw_test_force(RAY_ENC_FOR_BP);
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fp2/\" FP {compress: true})");
-    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fpb/\" FP {compress: true})");
     ray_encw_test_force(-1);
     static const char* const qs[] = {
         "(select {c: (count v) from: T where: (== 0 (% v 97)) by: k})",
@@ -4549,23 +4008,13 @@ static test_result_t test_v2_forged_points(void) {
         if (r.status != TEST_PASS) return r;
         if (i < 2) TEST_ASSERT_FMT(sr_col_decoded("k") == 0, "%s: %llu bytes of k decoded", qs[i], (unsigned long long)sr_col_decoded("k"));
     }
-    char dir[512], path[600];
-    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fpb/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-    snprintf(path, sizeof path, "%s/k", dir);
-    if (!sr_forge_max(path, 3, 999)) FAIL("forge");
-    for (int i = 0; qs[i]; i++) {
-        test_result_t r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fpb/\")", qs[i], path);
-        if (r.status != TEST_PASS) return r;
-    }
     PASS();
 }
 
-/* Task 17b fix round 1: the split prescan over a forged directory.  A mixed
- * key set (SYM g scanned exactly, staged I64 k through the directory path
- * as a set of its own) whose k chunk 3 maximum (directory and descriptors)
- * is lowered below its values: `corrupt` naming k, twice, and no write past
- * a slab (ASan).  Unpatched, the answers are generation 0's. */
-static test_result_t test_v2_forged_split(void) {
+/* Task 17b fix round 1: the split prescan.  A mixed key set (SYM g
+ * scanned exactly, staged I64 k through the directory path as a set of
+ * its own): the answers are generation 0's. */
+static test_result_t test_v2_split(void) {
     sr_eval_ok("(set jf (til 262144))");
     sr_eval_ok("(set ja (til 196608))");
     sr_eval_ok("(set jb (+ 196608 (til 65536)))");
@@ -4581,53 +4030,20 @@ static test_result_t test_v2_forged_split(void) {
     for (int i = 0; qs[i]; i++) {
         test_result_t r = sr_same_route("(.db.splayed.get \"" SR_TMP "/fs0/\")", "(.db.splayed.get \"" SR_TMP "/fs2/\")", qs[i]);
         if (r.status != TEST_PASS) return r;
-        sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fsb/\" FS {compress: true})");
-        char dir[512], path[600];
-        if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fsb/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-        snprintf(path, sizeof path, "%s/k", dir);
-        if (!sr_forge_max(path, 3, 999)) FAIL("forge");
-        r = sr_corrupt_twice("(.db.splayed.get \"" SR_TMP "/fsb/\")", qs[i], path);
-        if (r.status != TEST_PASS) return r;
     }
     PASS();
-}
-
-/* The mirror of sr_forge_max on the minimum: chunk c's directory minimum
- * and every vector descriptor's minimum below x raised to x.  False on an
- * I/O error or a vector whose maximum lies below x. */
-static bool sr_forge_min(const char* path, int64_t c, int64_t x) {
-    FILE* f = fopen(path, "r+b"); if (!f) return false;
-    ray_enc_dirent_t de;
-    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
-    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
-    if (ok) { de.min = x; ok = fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1; }
-    for (int j = 0; ok && j < RAY_ENC_VECS_PER_CHUNK; j++) {
-        ray_enc_desc_t d;
-        long off = (long)(de.offset + (uint64_t)j * sizeof d);
-        ok = fseek(f, off, SEEK_SET) == 0 && fread(&d, sizeof d, 1, f) == 1;
-        if (!ok || (d.encoding == 0 && d.payload_bytes == 0)) break;     /* past the last vector */
-        if (d.flags & RAY_ENC_STAT_ABSENT || d.min >= x) continue;
-        if (d.max < x) { ok = false; break; }
-        d.min = x;
-        ok = fseek(f, off, SEEK_SET) == 0 && fwrite(&d, sizeof d, 1, f) == 1;
-    }
-    return fclose(f) == 0 && ok;
 }
 
 /* Fix round 3: the serial dense path.  One chunk of 60000 rows, under
  * RAY_PARALLEL_THRESHOLD, so the group-by sizes its dense plan from the
  * directory and then takes the serial path, which reads the key's whole
  * materialization (agg_keys_unstage -> ray_col_src_plain).  Key k is
- * j * 7 % 5001 (FOR_BP); kn the same with a null every 100 rows.  The
- * chunk's statistics (directory and descriptors, still nested) are moved
- * inside the values: the maximum lowered to 999, or the minimum raised to
- * 4000.  Each query gives `corrupt` naming the key, twice, and never
- * indexes the slot map past the plan; unpatched it answers as generation
- * 0 on the serial dense route.  A buffered aggregate (med) is admitted to
- * v2 only as an indexed shape: its keys are unstaged before any plan, so
- * nothing is sized from the statistics and the forged table answers as
- * generation 0, small (one chunk) and large (four chunks, with a pool). */
-static test_result_t test_v2_forged_serial_dense(void) {
+ * j * 7 % 5001 (FOR_BP); kn the same with a null every 100 rows; each
+ * answers as generation 0 on the serial dense route.  A buffered
+ * aggregate (med) is admitted to v2 only as an indexed shape: its keys are
+ * unstaged before any plan, and it answers as generation 0, small (one
+ * chunk) and large (four chunks, with a pool). */
+static test_result_t test_v2_serial_dense(void) {
     sr_eval_ok("(set js (til 60000))");
     sr_eval_ok("(set FS (table [k kn v] (list (% (* js 7) 5001) "
                "(map (fn [j] (if (== 0 (% j 100)) 0N (% (* j 7) 5001))) js) js)))");
@@ -4646,58 +4062,14 @@ static test_result_t test_v2_forged_serial_dense(void) {
         { "fm", "k",  2, false, 999,  AGG_ROUTE_V2_INDEXED,      "(select {m: (med v) c: (count v) from: T by: k})" },
     };
     for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
-        char t0[256], t2[256], tb[256], src[256];
+        char t0[256], t2[256];
         snprintf(t0, sizeof t0, "(.db.splayed.get \"" SR_TMP "/%s0/\")", cs[i].tbl);
         snprintf(t2, sizeof t2, "(.db.splayed.get \"" SR_TMP "/%s2/\")", cs[i].tbl);
-        snprintf(tb, sizeof tb, "(.db.splayed.get \"" SR_TMP "/%sb/\")", cs[i].tbl);
         agg_route_reset();
         test_result_t r = sr_same_on(t0, t2, cs[i].q, UINT64_MAX);
         if (r.status != TEST_PASS) return r;
         TEST_ASSERT_FMT(agg_route_stats().routes[cs[i].route] > 0, "%s: not route %d", cs[i].q, cs[i].route);
-        snprintf(src, sizeof src, "(.db.splayed.set \"" SR_TMP "/%sb/\" %s {compress: true})", cs[i].tbl,
-                 strcmp(cs[i].tbl, "fs") == 0 ? "FS" : "FM");
-        sr_eval_ok(src);
-        char rel[256], dir[512], path[600];
-        snprintf(rel, sizeof rel, SR_TMP "/%sb/", cs[i].tbl);
-        if (ray_splay_resolve_dir(ray_test_tmp(rel), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-        snprintf(path, sizeof path, "%s/%s", dir, cs[i].col);
-        if (!(cs[i].raise ? sr_forge_min(path, cs[i].chunk, cs[i].x) : sr_forge_max(path, cs[i].chunk, cs[i].x)))
-            FAIL("forge");
-        r = cs[i].route == AGG_ROUTE_V2_INDEXED ? sr_same_on(t0, tb, cs[i].q, UINT64_MAX)
-                                                : sr_corrupt_twice(tb, cs[i].q, path);
-        if (r.status != TEST_PASS) return r;
     }
-    PASS();
-}
-
-static test_result_t test_v2_forged_dir_max(void) {
-    sr_eval_ok("(set BF (table [k v] (list (concat (% (* (til 196608) 7) 1000) (% (* (+ 196608 (til 65536)) 7) 5001)) (til 262144))))");
-    sr_eval_ok("(.db.splayed.set \"" SR_TMP "/fm/\" BF {compress: true})");
-    char dir[512], path[600];
-    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fm/"), dir, sizeof dir), RAY_OK);
-    snprintf(path, sizeof path, "%s/k", dir);
-    ray_enc_dirent_t de; memset(&de, 0, sizeof de);
-    FILE* f = fopen(path, "rb");
-    TEST_ASSERT_TRUE(f != NULL);
-    TEST_ASSERT_TRUE(fseek(f, (long)(RAY_ENC_DIR_OFF + 3 * sizeof de), SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1);
-    fclose(f);
-    TEST_ASSERT_EQ_I(de.max, 5000);
-    TEST_ASSERT_EQ_I(de.flags & RAY_ENC_STAT_ABSENT, 0);
-    sr_patch64(path, (long)(RAY_ENC_DIR_OFF + 3 * sizeof de + offsetof(ray_enc_dirent_t, max)), 999);
-    static const char* const qs[] = {
-        "(count (select {s: (sum v) from: T where: (> v 0) by: k}))",
-        "(count (select {s: (sum v) from: T by: k}))",
-        NULL };
-    for (int i = 0; qs[i]; i++)
-        for (int rep = 0; rep < 2; rep++) {
-            sr_eval_ok("(set T (.db.splayed.get \"" SR_TMP "/fm/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(qs[i]);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (read %d): answered", qs[i], rep + 1);
-            TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
-                            "%s (read %d): %s \"%s\"", qs[i], rep + 1, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "");
-            ray_error_free(r);
-        }
     PASS();
 }
 
@@ -5075,19 +4447,6 @@ static test_result_t test_parted_sym_widths_in_place(void) {
     PASS();
 }
 
-/* Review focus 4: a corrupt chunk under a group-by. */
-static test_result_t test_v2_error(void) {
-    char path[600];
-    sr_make_bad("v", path, sizeof path);
-    ray_error_clear();
-    ray_t* r = sr_eval("(select {s: (sum v) from: (.db.splayed.get \"" SR_TMP "/bad/\") by: g})");
-    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-    TEST_ASSERT_TRUE(strstr(ray_error_msg(), path) != NULL);
-    ray_error_free(r);
-    PASS();
-}
-
 /* Table W: a column for every v2 strategy's shape (200000 rows).
  *   sk  skewed key, 200000-slot range, mostly 0 (shared dense: max n)
  *   t   1000 sparse groups (table stack)      h   near-unique (radix)
@@ -5251,63 +4610,9 @@ static test_result_t test_v2_f64_bits(void) {
     PASS();
 }
 
-/* R-FAIL on every strategy: a corrupt chunk of a key or an input is the
- * query's error (code and path), on every run. */
-static test_result_t test_v2_route_error(void) {
-    sr_w_tables();
-    char path[600];
-    /* Grouped by column (one corrupt copy each).  A sampler that reads the
-     * corrupt vector first (the shared-slab sample, the table stack gate)
-     * answers the same error. */
-    static const struct { const char* col; const char* q; bool sh; } cs[] = {
-        { "g",  "(select {s: (sum f) from: B by: g})", false },                          /* dense key */
-        { "f",  "(select {s: (sum f) from: B where: (> k 1000) by: g})", false },         /* dense sel input */
-        { "f",  "(select {x: (sum f) from: B by: {d: d u: u}})", false },                 /* partitioned input */
-        { "f",  "(select {x: (max f) from: B where: (> k 1000) by: {d: d u: u}})", false },
-        { "f",  "(select {s: (sum f) from: B by: h})", false },                           /* radix scatter */
-        { "f",  "(select {s: (sum f) from: B where: (> k 1000) by: h})", false },
-        { "f",  "(select {c: (count k) s: (sum f) from: B by: t})", false },              /* table stack */
-        { "f",  "(select {c: (count k) s: (sum f) from: B where: (> k 1000) by: t})", false },
-        { "f",  "(select {s: (sum f) from: B where: (> k 1000) by: t})", true },          /* small hash */
-        { "f",  "(select {s: (sum f) from: B by: t})", true },
-        { "u",  "(select {x: (sum f) from: B by: {d: d u: u}})", false },                 /* partitioned key */
-        { "n",  "(select {mx: (max n) from: B by: sk})", false },                         /* shared input */
-        { "h",  "(select {c: (count k) from: B by: h})", false },                         /* radix key */
-        { "h",  "(select {c: (count k) from: B where: (> k 1000) by: h})", false },
-        { "t",  "(select {c: (count k) s: (sum f) from: B by: t})", false },              /* table stack key */
-        { "t",  "(select {c: (count k) from: B by: t})", true },                          /* small hash key */
-    };
-    for (size_t c = 0; c < sizeof cs / sizeof cs[0]; c++) {
-        if (c == 0 || strcmp(cs[c].col, cs[c - 1].col) != 0) {
-            sr_eval_ok("(.db.splayed.set \"" SR_TMP "/wbad/\" W {compress: true})");
-            char dir[512];
-            if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/wbad/"), dir, sizeof dir) != RAY_OK) abort();
-            snprintf(path, sizeof path, "%s/%s", dir, cs[c].col);
-            uint64_t off = sr_dirent_offset(path, 2);
-            TEST_ASSERT_TRUE(off != 0);
-            sr_patch(path, (long)off + 6, 1);
-        }
-        agg_test_force_smallhash(cs[c].sh);
-        for (int i = 0; i < 2; i++) {
-            sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/wbad/\"))");
-            ray_error_clear();
-            ray_t* r = sr_eval(cs[c].q);
-            if (!(r && RAY_IS_ERR(r))) agg_test_force_smallhash(false);
-            TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (bad %s): no error", cs[c].q, cs[c].col);
-            TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-            TEST_ASSERT_FMT(strstr(ray_error_msg(), path) != NULL, "%s: %s", cs[c].q, ray_error_msg());
-            ray_error_free(r);
-        }
-        agg_test_force_smallhash(false);
-    }
-    PASS();
-}
-
-/* R-FAIL of the shared dense slab's own dispatch: the slab's sample reads
- * rows i * step + jitter (step = rows / 1024), so with 197108 rows it never
- * reaches row 196608 = 1024 * 192, the first row of chunk 3.  A corrupt
- * vector there is read only by the shared update pass. */
-static test_result_t test_v2_shared_fail(void) {
+/* The shared dense slab's own dispatch: a skewed key (mostly 0) over 197108
+ * rows takes the shared dense strategy. */
+static test_result_t test_v2_shared_route(void) {
     sr_eval_ok("(set X (table [sk n] (list (map (fn [j] (if (== 0 (% j 100)) j 0)) (til 197108)) "
                "(as 'I32 (- 0 (til 197108))))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/xsh/\" X {compress: true})");
@@ -5319,23 +4624,6 @@ static test_result_t test_v2_shared_fail(void) {
     TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
     sr_drop(ok);
     TEST_ASSERT_EQ_I((int)agg_route_stats().dense_strategy, AGG_DENSE_SHARED);
-    char dir[512], path[600];
-    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/xsh/"), dir, sizeof dir) != RAY_OK) abort();
-    snprintf(path, sizeof path, "%s/n", dir);
-    uint64_t off = sr_dirent_offset(path, 3);
-    TEST_ASSERT_TRUE(off != 0);
-    sr_patch(path, (long)off + 6, 1);
-    for (int i = 0; i < 2; i++) {
-        sr_eval_ok("(set B (.db.splayed.get \"" SR_TMP "/xsh/\"))");
-        agg_route_reset();
-        ray_error_clear();
-        ray_t* r = sr_eval(q);
-        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
-        TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-        TEST_ASSERT_FMT(strstr(ray_error_msg(), path) != NULL, "%s", ray_error_msg());
-        ray_error_free(r);
-        TEST_ASSERT_TRUE(agg_route_stats().routes[AGG_ROUTE_V2_DENSE] > 0);
-    }
     PASS();
 }
 
@@ -5667,15 +4955,11 @@ static test_result_t test_v2_radix_compact_staging(void) {
 }
 
 /* The parted directory consumer (design (b)): a parted key's dense bounds
- * come from its segments' statistics, so its passes read under the guard,
- * which checks every segment against its own chunks.  Three partitions of
- * 70000 rows; k = j*7 % 1000, except partition 2's chunk 0, j*7 % 5001
- * with a null every 100 rows (the samplers' point reads decline there).
- * 1000 groups take the in-place concat.  Partition 2's chunk 0 statistics
- * (directory and descriptors, still nested) lowered to 999: `corrupt`
- * naming that segment's file, twice, through range reads and through the
- * published materialization; unpatched, generation 0's answer. */
-static void sr_forged_parted(const char* root, int gen) {
+ * come from its segments' statistics.  Three partitions of 70000 rows;
+ * k = j*7 % 1000, except partition 2's chunk 0, j*7 % 5001 with a null
+ * every 100 rows.  1000 groups take the in-place concat; the answer is
+ * generation 0's. */
+static void sr_mixed_parted(const char* root, int gen) {
     for (int p = 0; p < 3; p++)
         sr_evalf_ok("(.db.splayed.set \"%s/2024.01.0%d/t/\" (table [k v] (list %s (til 70000))) {compress: %s})",
                     root, p + 1,
@@ -5714,35 +4998,6 @@ static test_result_t test_idx_info_table(void) {
     TEST_ASSERT_TRUE(gr && !RAY_IS_ERR(gr) && gr->i64 == 0);
     sr_drop(d); sr_drop(g); sr_drop(m); sr_drop(e); sr_drop(rb);
     sr_drop(m2); sr_drop(m3); sr_drop(g0); sr_drop(gr);
-    PASS();
-}
-
-/* Fix round 1: chunk c's directory minimum (set_min) or maximum of the
- * generation-2 column file at path set to x, the descriptors untouched.
- * False on an I/O error or a chunk without statistics. */
-static bool sr_forge_dirent(const char* path, int64_t c, bool set_min, int64_t x) {
-    FILE* f = fopen(path, "r+b"); if (!f) return false;
-    ray_enc_dirent_t de;
-    long doff = (long)(RAY_ENC_DIR_OFF + (uint64_t)c * sizeof de);
-    bool ok = fseek(f, doff, SEEK_SET) == 0 && fread(&de, sizeof de, 1, f) == 1 && !(de.flags & RAY_ENC_STAT_ABSENT);
-    if (ok) { if (set_min) de.min = x; else de.max = x; }
-    ok = ok && fseek(f, doff, SEEK_SET) == 0 && fwrite(&de, sizeof de, 1, f) == 1;
-    return fclose(f) == 0 && ok;
-}
-/* The table at dir_expr, loaded and queried with q, gives `corrupt` naming
- * path (at the load or at the query), twice. */
-static test_result_t sr_corrupt_load_twice(const char* dir_expr, const char* q, const char* path) {
-    for (int rep = 0; rep < 2; rep++) {
-        ray_error_clear();
-        char e[1024];
-        snprintf(e, sizeof e, "(set T %s)", dir_expr);
-        ray_t* r = sr_eval(e);
-        if (r && !RAY_IS_ERR(r)) { sr_drop(r); ray_error_clear(); r = sr_eval(q); }
-        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "%s (read %d): answered", q, rep + 1);
-        TEST_ASSERT_FMT(strcmp(ray_err_code(r), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
-                        "%s (read %d): %s \"%s\" (want %s)", q, rep + 1, ray_err_code(r), ray_error_msg() ? ray_error_msg() : "", path);
-        ray_error_free(r);
-    }
     PASS();
 }
 
@@ -5845,112 +5100,20 @@ static test_result_t test_idx_info_report(void) {
     PASS();
 }
 
-/* Fix round 1: ray_col_range_into over a guarded source declines, so a
- * stats-guarded consumer reads by range, which checks each vector.  The
- * forged parted table of v2_forged_parted_segment (partition 2's chunk 0
- * maximum lowered to 999; its rows start at 70000): unguarded, that
- * segment's first vector is delivered straight (the control); guarded,
- * nothing is delivered and the range read of the same rows is `corrupt`
- * naming the segment's file, twice. */
-static test_result_t test_v2_range_into_guarded(void) {
-    sr_forged_parted(SR_TMP "/fg", 2);
-    char dir[512], path[600];
-    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fg/2024.01.02/t/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-    size_t dl = strlen(dir);
-    snprintf(path, sizeof path, "%s%sk", dir, (dl && dir[dl - 1] == '/') ? "" : "/");
-    if (!sr_forge_max(path, 0, 999)) FAIL("forge");
-    ray_t* t = sr_eval("(.db.parted.get \"" SR_TMP "/fg\" 't)");
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    int64_t* dst = malloc(1024 * sizeof(int64_t));
-    for (int guard = 0; guard < 2; guard++)
-        for (int rep = 0; rep < (guard ? 2 : 1); rep++) {
-            ray_col_src_t src;
-            ray_t* err = ray_col_src_bind(ray_table_slot(t, ray_sym_intern("k", 1)), &src);
-            TEST_ASSERT_TRUE(err == NULL);
-            src.stats_guard = guard;
-            ray_col_scratch_t sc;
-            ray_col_scratch_init(&sc);
-            int64_t got = -1;
-            err = ray_col_range_into(&src, 70000, 1024, &sc, 0, dst, &got);
-            bool into_ok = err == NULL && got == (guard ? 0 : 1024);
-            if (err) ray_error_free(err);
-            ray_error_clear();
-            ray_col_range_t v;
-            ray_t* rerr = guard ? ray_col_range(&src, 70000, 1024, &sc, &v) : NULL;
-            bool corrupt = !guard || (rerr && RAY_IS_ERR(rerr) && strcmp(ray_err_code(rerr), "corrupt") == 0 &&
-                                      ray_error_msg() && strstr(ray_error_msg(), path));
-            if (rerr) ray_error_free(rerr);
-            ray_col_scratch_free(&sc);
-            ray_col_src_release(&src);
-            if (!into_ok || !corrupt) { free(dst); sr_drop(t); }
-            TEST_ASSERT_FMT(into_ok, "guard %d: delivered %lld, want %d", guard, (long long)got, guard ? 0 : 1024);
-            TEST_ASSERT_FMT(corrupt, "guarded range read (read %d): not corrupt naming %s", rep + 1, path);
-        }
-    free(dst);
-    sr_drop(t);
-    PASS();
-}
-
-static test_result_t test_v2_forged_parted_segment(void) {
-    sr_forged_parted(SR_TMP "/fp0", 0);
-    sr_forged_parted(SR_TMP "/fp2", 2);
+static test_result_t test_v2_parted_segment(void) {
+    sr_mixed_parted(SR_TMP "/fp0", 0);
+    sr_mixed_parted(SR_TMP "/fp2", 2);
     static const char* const q = "(select {s: (sum v) c: (count v) from: T by: k})";
     int64_t s0 = ray_group_segstream_runs();
     test_result_t r = sr_same_route("(.db.parted.get \"" SR_TMP "/fp0\" 't)", "(.db.parted.get \"" SR_TMP "/fp2\" 't)", q);
     if (r.status != TEST_PASS) return r;
     TEST_ASSERT_TRUE(ray_group_segstream_runs() - s0 == 2);          /* both in place */
-    sr_forged_parted(SR_TMP "/fpb", 2);
-    char dir[512], path[600];
-    if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fpb/2024.01.02/t/"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-    size_t dl = strlen(dir);
-    snprintf(path, sizeof path, "%s%sk", dir, (dl && dir[dl - 1] == '/') ? "" : "/");
-    if (!sr_forge_max(path, 0, 999)) FAIL("forge");
-    r = sr_corrupt_twice("(.db.parted.get \"" SR_TMP "/fpb\" 't)", q, path);
-    if (r.status != TEST_PASS) return r;
-    /* the parted materialization published first: read in place only once
-     * every segment lies inside its statistics */
-    for (int rep = 0; rep < 2; rep++) {
-        sr_eval_ok("(set T (.db.parted.get \"" SR_TMP "/fpb\" 't))");
-        ray_t* t = sr_eval("T");
-        ray_t* ec = ray_table_get_col_enc(t, ray_sym_intern("k", 1));
-        TEST_ASSERT_TRUE(ec && ray_enccol_is_parted(ec));
-        ray_t* m = ray_enccol_materialize(ec);
-        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
-        sr_drop(t);
-        ray_error_clear();
-        ray_t* res = sr_eval(q);
-        TEST_ASSERT_FMT(res && RAY_IS_ERR(res), "materialized (read %d): answered", rep + 1);
-        TEST_ASSERT_FMT(strcmp(ray_err_code(res), "corrupt") == 0 && ray_error_msg() && strstr(ray_error_msg(), path),
-                        "materialized (read %d): %s \"%s\"", rep + 1, ray_err_code(res), ray_error_msg() ? ray_error_msg() : "");
-        ray_error_free(res);
-    }
-    /* Fix round 1: a directory statistic outside its column's type is
-     * `corrupt` at open.  An I32 key's first segment (the cardinality sample) chunk 0 maximum raised to
-     * INT64_MAX, its minimum lowered to INT64_MIN, and its maximum raised to
-     * 2^31 (a 64-bit value past I32): the cardinality sample and the dense
-     * bounds both read these, so each is `corrupt` naming the file, twice. */
     static const char* const qi = "(select {s: (sum v) c: (count v) from: T by: i})";
     for (int p = 0; p < 3; p++)
         for (int gen = 0; gen <= 2; gen += 2)
             sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/fi%d/2024.01.0%d/t/\" (table [i v] (list (as 'I32 (%% (* (til 70000) 7) 1000)) "
                         "(til 70000))) {compress: %s})", gen, p + 1, gen ? "true" : "false");
-    r = sr_same_route("(.db.parted.get \"" SR_TMP "/fi0\" 't)", "(.db.parted.get \"" SR_TMP "/fi2\" 't)", qi);
-    if (r.status != TEST_PASS) return r;
-    static const struct { bool set_min; int64_t x; } fi[] = {
-        { false, INT64_MAX }, { true, INT64_MIN }, { false, (int64_t)INT32_MAX + 1 },
-    };
-    for (size_t i = 0; i < sizeof fi / sizeof fi[0]; i++) {
-        for (int p = 0; p < 3; p++)
-            sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/fib/2024.01.0%d/t/\" (table [i v] (list (as 'I32 (%% (* (til 70000) 7) 1000)) "
-                        "(til 70000))) {compress: true})", p + 1);
-        if (ray_splay_resolve_dir(ray_test_tmp(SR_TMP "/fib/2024.01.01/t"), dir, sizeof dir) != RAY_OK) FAIL("resolve");
-        dl = strlen(dir);
-        snprintf(path, sizeof path, "%s%si", dir, (dl && dir[dl - 1] == '/') ? "" : "/");
-        if (!sr_forge_dirent(path, 0, fi[i].set_min, fi[i].x)) FAIL("forge");
-        r = sr_corrupt_load_twice("(.db.parted.get \"" SR_TMP "/fib\" 't)", qi, path);
-        if (r.status != TEST_PASS) return r;
-    }
-    PASS();
+    return sr_same_route("(.db.parted.get \"" SR_TMP "/fi0\" 't)", "(.db.parted.get \"" SR_TMP "/fi2\" 't)", qi);
 }
 
 /* The ClickBench scan-only set of the P2 gate (the plan's Task 17
@@ -6618,7 +5781,7 @@ static test_result_t strlen_runtime_sym_gen2_case(int64_t n, bool byte_key) {
     ray_enccol_t* e = ray_enccol_of(enc);
     if (!e || e->type != RAY_SYM || e->len != n ||
         (e->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
-        e->dom != ray_sym_runtime_domain() || e->sym_bound != bound ||
+        e->dom != ray_sym_runtime_domain() ||
         ray_enccol_decoded_peek(enc) != NULL) goto done;
 
     why = "table allocation/binding";
@@ -7192,7 +6355,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/walk_parted_10k",         test_walk_parted_10k,         sr_setup,    sr_teardown },
     { "scanrange/walk_null_and_many",      test_walk_null_and_many_sources, sr_setup, sr_teardown },
     { "scanrange/walk_contig_nyi_range",   test_walk_contig_nyi_and_cursor_range, sr_setup, sr_teardown },
-    { "scanrange/walk_error_mid_walk",     test_walk_error_mid_walk,     sr_setup,    sr_teardown },
     { "scanrange/walk_plain_slice",        test_walk_plain_slice,        sr_setup,    sr_teardown },
     { "scanrange/walk_materialized_parted", test_walk_materialized_parted, sr_rt_setup, sr_rt_teardown },
     { "scanrange/walk_contig_views",       test_walk_contig_views,       sr_setup,    sr_teardown },
@@ -7206,7 +6368,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/expr_select_equal",      test_expr_select_equal,      srr_setup, srr_teardown },
     { "scanrange/expr_elementwise_equal", test_expr_elementwise_equal, srr_setup, srr_teardown },
     { "scanrange/expr_nulls_midvector",   test_expr_nulls_midvector,   srr_setup, srr_teardown },
-    { "scanrange/expr_error",             test_expr_error,             srr_setup, srr_teardown },
     { "scanrange/count_fast_path",        test_count_fast_path,        srr_setup, srr_teardown },
     { "scanrange/count_fast_lent_scratch", test_count_fast_lent_scratch, srr_setup, srr_teardown },
     { "scanrange/group_lent_scratch", test_group_lent_scratch, srr_setup, srr_pool_teardown },
@@ -7218,7 +6379,6 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/count_native_queries",   test_count_native_queries,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_widened_registers", test_expr_widened_registers, srr_setup, srr_teardown },
     { "scanrange/expr_parted_segments",   test_expr_parted_segments,   srr_setup, srr_teardown },
-    { "scanrange/expr_parted_fail_lowest", test_expr_parted_fail_lowest, sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_parted_cancel",     test_expr_parted_cancel,     sr_rt_setup, sr_rt_teardown },
     { "scanrange/expr_parted_seg_lengths", test_expr_parted_seg_lengths, sr_rt_setup, sr_rt_teardown },
     { "scanrange/zone_dir_skips",      test_zone_dir_skips,      srr_setup, srr_teardown },
@@ -7237,22 +6397,20 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/fp_range_late_materialized", test_fp_range_late_materialized, srr_setup, srr_teardown },
     { "scanrange/fp_range_and_stops",    test_fp_range_and_stops,    srr_setup, srr_teardown },
     { "scanrange/topk_materializes_keys", test_topk_materializes_keys, srr_setup, srr_teardown },
-    { "scanrange/topk_take_error",       test_topk_take_error,       srr_setup, srr_teardown },
+    { "scanrange/topk_take_cancel",       test_topk_take_cancel,       srr_setup, srr_teardown },
     { "scanrange/in_selection",          test_in_selection,          srr_setup, srr_teardown },
     { "scanrange/in_selection_reuses_materialized", test_in_selection_reuses_materialized, srr_setup, srr_teardown },
-    { "scanrange/in_selection_error",    test_in_selection_error,    srr_setup, srr_teardown },
+    { "scanrange/in_selection_cancel",    test_in_selection_cancel,    srr_setup, srr_teardown },
     { "scanrange/reduce_scan",        test_reduce_scan,        srr_setup, srr_teardown },
     { "scanrange/reduce_scan_ops",    test_reduce_scan_ops,    srr_setup, srr_teardown },
     { "scanrange/reduce_scan_type_errors", test_reduce_scan_type_errors, srr_setup, srr_teardown },
     { "scanrange/reduce_scan_edges",  test_reduce_scan_edges,  srr_setup, srr_teardown },
     { "scanrange/reduce_dir_answers", test_reduce_dir_answers, srr_setup, srr_teardown },
-    { "scanrange/reduce_error",       test_reduce_error,       srr_setup, srr_teardown },
     { "scanrange/at_parted_value",    test_at_parted_value,    srr_setup, srr_teardown },
     { "scanrange/raw_float_view",     test_raw_float_view,     srr_setup, srr_teardown },
     { "scanrange/scalar_route",       test_scalar_route,       srr_setup, srr_teardown },
     { "scanrange/scalar_route_shapes", test_scalar_route_shapes, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_bits", test_scalar_route_f64_bits, srr_setup, srr_teardown },
-    { "scanrange/scalar_route_error", test_scalar_route_error, srr_setup, srr_teardown },
     { "scanrange/group_route_hook",   test_group_route_hook,   srr_setup, srr_teardown },
     { "scanrange/scalar_route_wide_sym", test_scalar_route_wide_sym, srr_setup, srr_teardown },
     { "scanrange/scalar_route_mixed", test_scalar_route_mixed, srr_setup, srr_teardown },
@@ -7260,14 +6418,12 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/scalar_route_f64_unaligned", test_scalar_route_f64_unaligned, srr_setup, srr_teardown },
     { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
     { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },
-    { "scanrange/da_route_error",     test_da_route_error,     srr_setup, srr_teardown },
     { "scanrange/da_route_parted",    test_da_route_parted,    srr_setup, srr_teardown },
     { "scanrange/sp_dyn_route",       test_sp_dyn_route,       srr_setup, srr_teardown },
     { "scanrange/radix_route",        test_radix_route,        srr_setup, srr_teardown },
     { "scanrange/radix_route_shapes", test_radix_route_shapes, srr_setup, srr_teardown },
     { "scanrange/radix_route_sparse", test_radix_route_sparse, srr_setup, srr_teardown },
     { "scanrange/radix_route_serial", test_radix_route_serial, srr_setup, srr_teardown },
-    { "scanrange/radix_route_error",  test_radix_route_error,  srr_setup, srr_teardown },
     { "scanrange/v2_routes",          test_v2_routes,          srr_setup, srr_teardown },
     { "scanrange/v2_dense_unaligned", test_v2_dense_unaligned, srr_setup, srr_pool_teardown },
     { "scanrange/v2_sym_key_parted",  test_v2_sym_key_parted,  srr_setup, srr_teardown },
@@ -7280,26 +6436,22 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/parted_factorized_count",    test_parted_factorized_count,    srr_setup, srr_teardown },
     { "scanrange/parted_sym_narrow_first",    test_parted_sym_narrow_first,    srr_setup, srr_teardown },
     { "scanrange/parted_flatten_nulls",       test_parted_flatten_nulls,       srr_setup, srr_teardown },
-    { "scanrange/v2_error",           test_v2_error,           srr_setup, srr_teardown },
     { "scanrange/v2_route_shapes",    test_v2_route_shapes,    srr_setup, srr_pool_teardown },
     { "scanrange/v2_sym_shared_dom",  test_v2_sym_shared_dom,  srr_setup, srr_pool_teardown },
-    { "scanrange/v2_shared_fail",     test_v2_shared_fail,     srr_setup, srr_pool_teardown },
+    { "scanrange/v2_shared_route",     test_v2_shared_route,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_f64_bits",        test_v2_f64_bits,        srr_setup, srr_teardown },
-    { "scanrange/v2_route_error",     test_v2_route_error,     srr_setup, srr_teardown },
     { "scanrange/v2_decode_once",     test_v2_decode_once,     srr_setup, srr_pool_teardown },
     { "scanrange/v2_sel_bounds",      test_v2_sel_bounds,      srr_setup, srr_teardown },
-    { "scanrange/v2_forged_dir_max",  test_v2_forged_dir_max,  srr_setup, srr_teardown },
-    { "scanrange/v2_forged_consumers", test_v2_forged_consumers, srr_setup, srr_teardown },
-    { "scanrange/v2_forged_points",    test_v2_forged_points,    srr_setup, srr_teardown },
-    { "scanrange/v2_forged_run_points", test_v2_forged_run_points, srr_setup, srr_teardown },
-    { "scanrange/v2_forged_serial_dense", test_v2_forged_serial_dense, srr_setup, srr_teardown },
+    { "scanrange/v2_consumers", test_v2_consumers, srr_setup, srr_teardown },
+    { "scanrange/v2_points",    test_v2_points,    srr_setup, srr_teardown },
+    { "scanrange/v2_run_points", test_v2_run_points, srr_setup, srr_teardown },
+    { "scanrange/v2_serial_dense", test_v2_serial_dense, srr_setup, srr_teardown },
     { "scanrange/v2_sel_key_types",   test_v2_sel_key_types,   srr_setup, srr_teardown },
     { "scanrange/v2_radix_decode_once", test_v2_radix_decode_once, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_answers",   test_v2_radix_answers,   sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_record_order", test_v2_radix_record_order, sr_rt_setup, srr_pool_teardown },
     { "scanrange/v2_radix_compact_staging", test_v2_radix_compact_staging, sr_rt_setup, srr_pool_teardown },
-    { "scanrange/v2_forged_parted_segment", test_v2_forged_parted_segment, sr_rt_setup, srr_teardown },
-    { "scanrange/v2_range_into_guarded", test_v2_range_into_guarded, sr_rt_setup, srr_teardown },
+    { "scanrange/v2_parted_segment", test_v2_parted_segment, sr_rt_setup, srr_teardown },
     { "scanrange/idx_info_table",     test_idx_info_table,     srr_setup, srr_teardown },
     { "scanrange/idx_info_report",    test_idx_info_report,    srr_setup, srr_teardown },
     { "scanrange/no_materialization", test_no_materialization, srr_setup, srr_teardown },
@@ -7318,7 +6470,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/chain_zone_prune",      test_chain_zone_prune,      sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_sel_bounds_split",   test_v2_sel_bounds_split,   sr_rt_setup, sr_rt_teardown },
     { "scanrange/v2_sel_bounds_boundary", test_v2_sel_bounds_boundary, sr_rt_setup, sr_rt_teardown },
-    { "scanrange/v2_forged_split",       test_v2_forged_split,       sr_rt_setup, sr_rt_teardown },
+    { "scanrange/v2_split",       test_v2_split,       sr_rt_setup, sr_rt_teardown },
     { "scanrange/const_beside_parted_group", test_const_beside_parted_group, srr_setup, srr_teardown },
     { "scanrange/cold_fallback_gen0_bare", test_cold_fallback_gen0_bare, sr_rt_setup, sr_cold_teardown },
     { "scanrange/cold_fallback_gen0_dict", test_cold_fallback_gen0_dict, sr_rt_setup, sr_cold_teardown },

@@ -261,27 +261,9 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
     return buf;
 }
 
-/* Printing resolves the strings of a file domain's symbols as it goes: a
- * symfile found torn on the way would leave entries printed as "".  So
- * output that holds such symbols is rendered once into a temporary file
- * and written out only if no symbol went unread (table/domain.h);
- * otherwise `corrupt`, and nothing is printed.  Only what the output shows
- * is read, so intact rows of a damaged file still print. */
-static bool print_args_have_file_syms(ray_t** args, int64_t n) {
-    for (int64_t i = 0; i < n; i++)
-        if (ray_sym_has_file_domain(args[i])) return true;
-    return false;
-}
-/* Where to render: a temporary file when the output holds such symbols
- * (stdout when there is none to be had). */
-static FILE* print_begin(ray_t** args, int64_t n, uint64_t* c0) {
-    *c0 = ray_sym_domain_corruptions();
-    if (!print_args_have_file_syms(args, n)) return stdout;
-    FILE* t = tmpfile();
-    return t ? t : stdout;
-}
-static ray_t* print_end(FILE* out, uint64_t c0) {
-    return ray_sym_print_commit(out, stdout, c0);
+static ray_t* print_end(FILE* out) {
+    fflush(out);
+    return RAY_NULL_OBJ;
 }
 
 /* (println val1 val2 ...) — print values to stdout, newline at end.
@@ -297,14 +279,9 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
         const char* fmt = ray_str_ptr(args[0]);
         size_t flen = ray_str_len(args[0]);
         size_t out_len = 0;
-        uint64_t c0 = ray_sym_domain_corruptions();
         ray_t* ferr;
         char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
         if (ferr) return ferr;
-        if (result && ray_sym_domain_corruptions() != c0) {
-            ray_free_raw(result);
-            return ray_sym_domain_corrupt_error();
-        }
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fputc('\n', stdout);
@@ -314,14 +291,13 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
         }
     }
 
-    uint64_t c0;
-    FILE* out = print_begin(args, n, &c0);
+    FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
         if (i > 0) fputc(' ', out);
         ray_lang_print(out, args[i]);
     }
     fputc('\n', out);
-    return print_end(out, c0);
+    return print_end(out);
 }
 
 /* (print val1 val2 ...) — like println but without trailing newline */
@@ -333,14 +309,9 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
         const char* fmt = ray_str_ptr(args[0]);
         size_t flen = ray_str_len(args[0]);
         size_t out_len = 0;
-        uint64_t c0 = ray_sym_domain_corruptions();
         ray_t* ferr;
         char* result = fmt_interpolate(fmt, flen, args, n, 1, &out_len, &ferr);
         if (ferr) return ferr;
-        if (result && ray_sym_domain_corruptions() != c0) {
-            ray_free_raw(result);
-            return ray_sym_domain_corrupt_error();
-        }
         if (result) {
             fwrite(result, 1, out_len, stdout);
             fflush(stdout);
@@ -349,20 +320,18 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
         }
     }
 
-    uint64_t c0;
-    FILE* out = print_begin(args, n, &c0);
+    FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
         if (i > 0) fputc(' ', out);
         ray_lang_print(out, args[i]);
     }
-    return print_end(out, c0);
+    return print_end(out);
 }
 
 /* (show val1 val2 ...) — print values to stdout using ray_fmt, newline at end */
 ray_t* ray_show_fn(ray_t** args, int64_t n) {
     /* args are pre-materialized by eval — see ray_println_fn. */
-    uint64_t c0;
-    FILE* out = print_begin(args, n, &c0);
+    FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
         if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(out, "error"); continue; }
         /* show prints the whole value, streamed; the display limits belong
@@ -370,7 +339,7 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
         ray_t* cause;
         ray_err_t e = ray_fmt_write(out, args[i], &cause);
         if (cause) {   /* a column failed to load: report it, output already written stays */
-            ray_t* r = print_end(out, c0);
+            ray_t* r = print_end(out);
             if (r && RAY_IS_ERR(r)) { ray_error_free(cause); return r; }
             return cause;
         }
@@ -388,7 +357,7 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
         }
     }
     fputc('\n', out);
-    return print_end(out, c0);
+    return print_end(out);
 }
 
 /* (format "hello % world %" a b) — string formatting with % placeholders */

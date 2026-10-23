@@ -337,24 +337,6 @@ static test_result_t test_range_slice_and_long_strings(void) {
     PASS();
 }
 
-static test_result_t test_range_error_propagates(void) {
-    ray_t* v = i32_nulls(3000);
-    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(CR_TMP "/bad"), 2), RAY_OK);
-    ray_release(v);
-    FILE* f = fopen(ray_test_tmp(CR_TMP "/bad"), "r+b"); TEST_ASSERT_TRUE(f != NULL); fseek(f, 160 + 6, SEEK_SET); fputc(1, f); fclose(f);
-    ray_t* c = ray_col_mmap(ray_test_tmp(CR_TMP "/bad"));
-    ray_col_src_t s; TEST_ASSERT_NULL(ray_col_src_bind(c, &s));
-    ray_col_scratch_t sc; ray_col_scratch_init(&sc);
-    ray_col_range_t r;
-    ray_t* err = ray_col_range(&s, 0, 10, &sc, &r);
-    TEST_ASSERT_TRUE(err && RAY_IS_ERR(err));
-    TEST_ASSERT_STR_EQ(ray_err_code(err), "corrupt");
-    ray_error_free(err);
-    TEST_ASSERT_TRUE(r.data == NULL && r.n == 0);            /* nothing is handed out on an error */
-    ray_col_scratch_free(&sc); ray_col_src_release(&s); ray_release(c);
-    PASS();
-}
-
 /* Bounds, scratch size and the memory of a released source. */
 static test_result_t test_range_bounds_and_scratch(void) {
     ray_t* v = gen_col(RAY_GUID, 3000, true, 0);
@@ -641,7 +623,6 @@ const test_entry_t colrange_entries[] = {
     { "colrange/gen2_vector_clip_nulls",  test_range_gen2_vector_clip_and_nulls, cr_setup, cr_teardown },
     { "colrange/two_str_views",           test_range_two_str_views,             cr_setup, cr_teardown },
     { "colrange/slice_and_long_strings",  test_range_slice_and_long_strings,    cr_setup, cr_teardown },
-    { "colrange/error_propagates",        test_range_error_propagates,          cr_setup, cr_teardown },
     { "colrange/bounds_and_scratch",      test_range_bounds_and_scratch,        cr_setup, cr_teardown },
     { "colrange/matches_materialized",    test_range_matches_materialized,      cr_setup, cr_teardown },
     { "colrange/parted_mixed",            test_range_parted_mixed,              cr_setup, cr_teardown },

@@ -316,9 +316,7 @@ static bool fpk_one_vec_pruned(const fpk_par_ctx_t* c, int64_t v) {
     uint32_t nn = 0;
     uint8_t cls = FPK_STATS;
     if (!ray_col_src_vec_stat(c->zdir->src, v, &mn, &mx, &nn)) {
-        const ray_enc_desc_t* d;
-        ray_t* err = ray_enccol_chunk_descs_ref(c->zdir->e, v / RAY_ENC_VECS_PER_CHUNK, &d);
-        if (err) { ray_error_free(err); return false; }       /* the scan reads it */
+        const ray_enc_desc_t* d = ray_enccol_descs(c->zdir->e, v / RAY_ENC_VECS_PER_CHUNK);
         cls = d[v % RAY_ENC_VECS_PER_CHUNK].n_nulls == vrows ? FPK_ALL_NULL : FPK_NO_STATS;
     }
     return fpk_stat_prunes(c, cls, nn > 0, mn, mx);
@@ -1058,8 +1056,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     int64_t span_rows = nrows;
     ray_t*  zord_hdr  = NULL;
     /* A generation-2 first key: the zone arrays from its directory, sized
-     * by the chunk count (structure, not statistics: answer-only, no
-     * stats_guard).  An all-null chunk gets its null bit and an empty
+     * by the chunk count (structure, not statistics: answer-only).  An all-null chunk gets its null bit and an empty
      * range, as the chunk-zone builder writes.  On OOM nothing is pruned. */
     ray_t *zmin_hdr = NULL, *zmax_hdr = NULL, *znb_hdr = NULL, *zstat_hdr = NULL;
     fpk_dir_t zdir = { NULL, kenc, ksrc0 };

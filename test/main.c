@@ -176,7 +176,6 @@ extern const test_entry_t encfloat_entries[];
 extern const test_entry_t encstr_entries[];
 extern const test_entry_t enconce_entries[];
 extern const test_entry_t enccol_entries[];
-extern const test_entry_t enccorrupt_entries[];
 extern const test_entry_t large_entries[];
 extern const test_entry_t colrange_entries[];
 extern const test_entry_t scanrange_entries[];
@@ -228,7 +227,7 @@ static const test_entry_t* const compiled_groups[] = {
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries, select_merge_entries,
     sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
-    encfmt_entries,   encidx_entries,   encfloat_entries, encstr_entries, enconce_entries,   enccol_entries, enccorrupt_entries,
+    encfmt_entries,   encidx_entries,   encfloat_entries, encstr_entries, enconce_entries,   enccol_entries,
     large_entries,
     colrange_entries,
     scanrange_entries,
@@ -936,7 +935,6 @@ void ray_test_hooks_off(void) {
     ray_enccol_test_fail_path(NULL);
     ray_enccol_test_interrupt_after(0);
     ray_enccol_test_parted_mode(0);
-    ray_enccol_test_refuse_attach(0);
     ray_enccol_test_fail_index_parse(false);
     ray_col_test_fail_alloc(0);
     ray_col_test_no_dict(false);

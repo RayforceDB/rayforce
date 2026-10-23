@@ -105,7 +105,6 @@
 #elif !defined(RAY_OS_WASM)
 #include <pthread.h>
 #endif
-#include "core/crc32.h"         /* the index file's checks */
 #include <errno.h>
 #if defined(RAY_OS_WINDOWS)
 #include <process.h>
@@ -176,69 +175,51 @@ typedef struct dom_retired_map_s {
  * header; the blocks are mapped and paged in as entries are read.  An index
  * is used only for the very file it was written for: the inode, the
  * modification and status-change times and the size it records match the
- * mapped file's, its header checks, and two crcs of the file itself match —
- * of its first records and of its last block.  Anything else (another file
- * of the name, the file grown or rewritten by a writer that left the index
- * as it was, an earlier format) is not used: the open walks every record
- * once, reading the file in large explicit reads (dom_src_t), and writes the
- * index anew.  A block of an index is checked on its first read: its
- * lengths, those of 65535 from their record headers, add up from its
- * checkpoint to the next block's (the last block's to the records' end);
- * and every read of an entry checks that the record says the length the
- * index says.  A block that does not check means the file is not what the
- * index describes: the domain walks all records as an open without an index
- * does and goes on with that table; if the walk fails the file is corrupt,
- * and every read of an entry it cannot reach says so
- * (ray_sym_domain_corruptions).
+ * mapped file's.  Anything else (another file of the name, the file grown
+ * or rewritten by a writer that left the index as it was, an earlier
+ * format) is not used: the open walks every record once, reading the file
+ * in large explicit reads (dom_src_t), and writes the index anew.  The
+ * symfile and its index are ours: an index that names the file is read as
+ * written, with no check of its blocks or of the records.
  *
  * The index file (all integers little-endian):
  *
- *   0  u32 "STRX"   4 u32 version   8 u32 stride (28)   12 u32 crc32 of [16, 128)
+ *   0  u32 "STRX"   4 u32 version   8 u32 stride (28)   12 u32 0
  *  16  i64 count: entries covered   24 u64 end: byte offset past their records
  *  32  u64 inode, 40 u64 stamp of the modification and status-change times
  *      of the file it was written for
  *  48  u64 checkpoint of the last block (n - 1)
- *  56  u32 crc32 of the file's bytes [ckpt[n - 1], end): the last block
- *  60  u32 crc32 of the file's bytes [12, min(end, 12 + 4 KiB)): its first records
- *  64  u32 0                              68 u32 0
+ *  56  u32 0   60 u32 0   64 u32 0   68 u32 0
  *  72  u64 cap: block slots               80 .. 127: zeros
  * 128  n blocks of 64 bytes, n = ceil(count / 28), then zeros up to cap:
  *      u64 offset of the block's first record, then 28 u16 lengths (those
  *      past `count` in the last block: 0)
  *
- * No crc covers the blocks: the open does not read them.  They are checked
- * a block at a time on first read (the block's checkpoint and the next one,
- * and its lengths, must account for exactly the records between them), and
- * record by record, as above.  The symfile is append-only, and so is the
- * block array: a writer that appended records writes the block the old
- * entries ended in and the blocks they open into the reserved slots, then
- * the header — the cost of what it appended — and writes the index whole
- * (tmp + rename, with room for more blocks) when the slots run out or the
- * index on disk is not the one it last read or wrote.  It is a cache, never
- * the only copy of anything: never synced. */
+ * The symfile is append-only, and so is the block array: a writer that
+ * appended records writes the block the old entries ended in and the
+ * blocks they open into the reserved slots, then the header — the cost of
+ * what it appended — and writes the index whole (tmp + rename, with room
+ * for more blocks) when the slots run out or the index on disk is not the
+ * one it last read or wrote.  It is a cache, never the only copy of
+ * anything: never synced. */
 #define DOM_IX_STRIDE  ((int64_t)RAY_SYM_INDEX_STRIDE)
 typedef ray_sym_ixblk_t dom_ixb_t;
 #define DOM_IX_MAGIC   0x58525453U   /* "STRX" */
 #define DOM_IX_VERSION 5u
 #define DOM_IX_HDR     128           /* the blocks start on a cache line */
-#define DOM_IX_HEAD    4096          /* the first records' crc covers this many bytes */
+#define DOM_IX_HEAD    4096          /* an extend compares this many bytes of the first records */
 #define DOM_LEN_LONG   65535         /* a length of 65535: the escape, 65535 or longer, its record header says */
 
 /* The block table of an image of `count` entries whose records end at
- * `end`; one allocation.  ok[k >> 6] bit k: block k checked, read and set
- * atomically (lock-free readers check blocks too).  `len`: the entries'
- * lengths — this allocation's own (a walk), or the mapped index file
- * (the domain keeps the mapping until it dies).  `stale`: replaced after a
- * block failed its check — a reader holding it asks the domain. */
+ * `end`; one allocation.  The entries' lengths: this allocation's own (a
+ * walk), or the mapped index file (the domain keeps the mapping until it
+ * dies). */
 typedef struct dom_blk_s {
     int64_t        n;
     int64_t        count;
     uint64_t       end;
     const dom_ixb_t* ib;       /* block k: starts at map + ib[k].off, its entries' lengths */
     dom_ixb_t*     own_ib;     /* ib, when this allocation holds it (a walk) */
-    uint64_t       last_ckpt;  /* where the index says the last block starts */
-    uint64_t*      ok;
-    _Atomic(bool)  stale;
 } dom_blk_t;
 
 typedef struct dom_raw_snap_s {
@@ -308,18 +289,11 @@ struct ray_sym_domain_s {
 
     /* FILE: block table of the mapped records, the file prefix
      * [0, base_count) (see the sparse record index above): from the index
-     * file or one walk at open, replaced (the old one retired) when a block
-     * fails its check.  Read under g_dom_lock; lock-free readers take it
-     * from the raw snapshot.  NULL when base_count == 0. */
+     * file or one walk at open.  Read under g_dom_lock; lock-free readers
+     * take it from the raw snapshot.  NULL when base_count == 0. */
     dom_blk_t* blk;
-    /* FILE: the file failed a walk of its records: entries outside the
-     * blocks already checked cannot be read. */
-    _Atomic(bool) corrupt;
-    _Atomic(const char*) corrupt_path;   /* copy of path, once found corrupt (dom_corrupt_name) */
     /* FILE: what the index did for this domain (ray_sym_domain_ix_info). */
     bool      ix_used;          /* the open took its blocks from the index */
-    _Atomic(int64_t) ix_checked;   /* blocks checked on first read */
-    _Atomic(int64_t) ix_rescued;   /* tables replaced by a walk */
     /* FILE: checkpoints of the entries this process flushed past the
      * mapping, positions in [base_count, disk_count) that are multiples of
      * the stride, offsets in the file as written.  Guarded by the symfile's
@@ -613,14 +587,14 @@ static inline int64_t dom_ck_count(int64_t entries) {
 static inline uint32_t dom_rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline uint64_t dom_rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
-/* A block table for `count` entries, nothing checked yet; with room for
- * its own checkpoints and lengths when `own` (else both are the index
- * file's, set by the caller).  NULL on OOM. */
+/* A block table for `count` entries; with room for its own checkpoints
+ * and lengths when `own` (else both are the index file's, set by the
+ * caller).  NULL on OOM. */
 static dom_blk_t* dom_blk_new(int64_t count, bool own) {
-    int64_t n = dom_ck_count(count), w = (n + 63) >> 6;
+    int64_t n = dom_ck_count(count);
     size_t head = (sizeof(dom_blk_t) + 7) & ~(size_t)7;
     size_t ibb = own ? (size_t)n * sizeof(dom_ixb_t) : 0;
-    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ibb + (size_t)w * 8);
+    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ibb);
     if (!b) return NULL;
     uint8_t* p = (uint8_t*)b + head;
     b->n = n;
@@ -628,24 +602,15 @@ static dom_blk_t* dom_blk_new(int64_t count, bool own) {
     b->end = 0;
     b->own_ib = own ? (dom_ixb_t*)p : NULL;
     b->ib = b->own_ib;
-    b->ok = (uint64_t*)(p + ibb);
-    memset(b->ok, 0, (size_t)w * 8);
     if (own) memset(b->own_ib, 0, ibb);   /* unused lengths of the last block: 0 */
-    atomic_init(&b->stale, false);
     return b;
 }
 
-static inline bool dom_blk_ok(const dom_blk_t* b, int64_t k) {
-    return (__atomic_load_n(&b->ok[k >> 6], __ATOMIC_ACQUIRE) >> (k & 63)) & 1;
-}
-static inline void dom_blk_set_ok(dom_blk_t* b, int64_t k) {
-    __atomic_fetch_or(&b->ok[k >> 6], (uint64_t)1 << (k & 63), __ATOMIC_RELEASE);
-}
 static inline uint64_t dom_blk_lim(const dom_blk_t* b, int64_t k) {
     return k + 1 < b->n ? b->ib[k + 1].off : b->end;
 }
 
-/* Where a walk or a check reads the records: the mapping, or the file read
+/* Where a walk reads the records: the mapping, or the file read
  * with explicit, large reads into a buffer (dom_src_open).  A walk over
  * much of the file through the mapping faults it in a page cluster at a
  * time (some 128 KiB a request) and leaves the pages mapped — kept by the
@@ -749,58 +714,24 @@ static const uint8_t* dom_src_get(dom_src_t* s, uint64_t off, uint64_t len) {
 
 /* Walk entries [from, b->count) of the image, the first at byte *off: the
  * checkpoint of every block that starts on the way and, into the table's own
- * lengths, the length of every entry; each block it completes is
- * checked (its records were just read).  False when a record runs past the
- * image. */
+ * lengths, the length of every entry.  False when a read of the file fails. */
 static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t* off) {
-    uint64_t size = src->size, o = *off;
+    uint64_t o = *off;
     for (int64_t i = from; i < b->count; i++) {
         int64_t k = i / DOM_IX_STRIDE, j = i % DOM_IX_STRIDE;
         if (!j) b->own_ib[k].off = o;
         const uint8_t* h = dom_src_get(src, o, 4);
         if (!h) return false;
         uint32_t l = dom_rd32(h);
-        o += 4;
-        if ((uint64_t)l > size - o) return false;
-        o += l;
+        o += 4 + (uint64_t)l;
         b->own_ib[k].len[j] = l < DOM_LEN_LONG ? (uint16_t)l : (uint16_t)DOM_LEN_LONG;
-        if (j == DOM_IX_STRIDE - 1 || i + 1 == b->count)
-            dom_blk_set_ok(b, k);
     }
     *off = (size_t)o;
     return true;
 }
 
-/* Check block k of a table taken from an index: its records, by their
- * lengths, end exactly where the next block starts (or at the end of
- * the records).  The only bytes of the file it reads are the record headers
- * of the entries whose length is the escape (65535).  Lock-free. */
-static bool dom_blk_check(const uint8_t* map, dom_blk_t* b, int64_t k) {
-    /* a walked table's blocks were checked as walked: one not ok is past
-     * where the walk stopped */
-    if (b->own_ib) return false;
-    uint64_t at = b->ib[k].off, lim = dom_blk_lim(b, k);
-    int64_t n = b->count - k * DOM_IX_STRIDE;
-    if (n > DOM_IX_STRIDE) n = DOM_IX_STRIDE;
-    if ((k == 0 && at != 12) || (k == b->n - 1 && at != b->last_ckpt)) return false;
-    if (at > lim || lim > b->end) return false;
-    for (int64_t j = 0; j < n; j++) {
-        if (lim - at < 4) return false;
-        uint64_t l = b->ib[k].len[j];
-        if (l == DOM_LEN_LONG && (l = dom_rd32(map + at)) < DOM_LEN_LONG) return false;
-        at += 4;
-        if (l > lim - at) return false;
-        at += l;
-    }
-    if (at != lim) return false;
-    dom_blk_set_ok(b, k);
-    return true;
-}
-
-/* Entry `pos` of a checked block: from the block's checkpoint past the
- * records before it, by their lengths (a 65535 one by its header).  NULL
- * when the entry's record does not say the length its entry does: the table
- * does not describe the file. */
+/* Entry `pos`: from its block's checkpoint past the records before it, by
+ * their lengths (a 65535 one by its header). */
 static inline const uint8_t* dom_blk_entry(const uint8_t* map, const dom_blk_t* b,
                                            int64_t pos, uint32_t* len) {
     int64_t k = pos / DOM_IX_STRIDE, j = pos % DOM_IX_STRIDE;
@@ -809,145 +740,29 @@ static inline const uint8_t* dom_blk_entry(const uint8_t* map, const dom_blk_t* 
         uint16_t l = b->ib[k].len[i];
         p += 4 + (l < DOM_LEN_LONG ? (size_t)l : (size_t)dom_rd32(p));
     }
-    uint32_t l = dom_rd32(p);
-    uint16_t e = b->ib[k].len[j];
-    if (e < DOM_LEN_LONG ? l != e : l < DOM_LEN_LONG) return NULL;
-    *len = l;
+    *len = dom_rd32(p);
     return p + 4;
-}
-
-/* Reads of an entry the file could not give, process-wide: an evaluation
- * that saw this grow reports `corrupt` (ray_sym_domain_corruptions). */
-_Atomic(uint64_t) ray_g_dom_corruptions;
-/* The path of the symfile the last failed read was of, for the error: the
- * domain's own copy (made when it was first found corrupt, never freed), so
- * it outlives the domain; published again by every failed read. */
-static _Atomic(const char*) g_dom_corrupt_path;
-/* The domain `d` found corrupt: its path copy is made and one line goes to
- * stderr, the first time only; the copy is what the error names from now. */
-static void dom_corrupt_name(ray_sym_domain_t* d) {
-    if (!d || !d->path) return;
-    const char* c = atomic_load_explicit(&d->corrupt_path, memory_order_acquire);
-    if (!c) {
-        size_t l = strlen(d->path);
-        char* n = (char*)ray_sys_alloc(l + 1);
-        if (!n) return;
-        memcpy(n, d->path, l + 1);
-        const char* none = NULL;
-        if (atomic_compare_exchange_strong_explicit(&d->corrupt_path, &none, n,
-                                                    memory_order_acq_rel, memory_order_acquire)) {
-            c = n;
-            fprintf(stderr, "rayforce: symbols of a torn or overwritten symfile cannot be "
-                            "read: %s\n", c);
-        } else {
-            ray_sys_free(n);
-            c = none;
-        }
-    }
-    atomic_store_explicit(&g_dom_corrupt_path, c, memory_order_release);
-}
-static void dom_corrupt_hit(ray_sym_domain_t* d) {
-    atomic_fetch_add_explicit(&ray_g_dom_corruptions, 1, memory_order_acq_rel);
-    dom_corrupt_name(d);
-}
-static inline bool dom_is_corrupt(ray_sym_domain_t* d) {
-    return atomic_load_explicit(&d->corrupt, memory_order_acquire);
 }
 
 static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
                          const dom_blk_t* b, const ray_file_id_t* id);
 static size_t dom_ix_min(void);
 
-/* Block k of the current table checked (once; counted). */
-static bool dom_blk_checked(ray_sym_domain_t* d, dom_blk_t* b, int64_t k) {
-    if (dom_blk_ok(b, k)) return true;
-    if (!dom_blk_check((const uint8_t*)d->map, b, k)) return false;
-    atomic_fetch_add_explicit(&d->ix_checked, 1, memory_order_relaxed);
-    return true;
-}
-
-/* The current block table, once `failed` — which had a block that did not
- * check — is replaced: by one walk of the records, as an open without an
- * index does, the index file rewritten from it.  If that walk fails the file
- * is corrupt: the domain is marked so and NULL.  NULL on OOM too (the table
- * stays).  Under g_dom_lock. */
-static dom_blk_t* dom_rescue_locked(ray_sym_domain_t* d, dom_blk_t* failed) {
-    if (d->blk != failed)
-        return atomic_load_explicit(&d->corrupt, memory_order_relaxed) ? NULL : d->blk;
-    if (atomic_load_explicit(&d->corrupt, memory_order_relaxed)) return NULL;
-    const uint8_t* map = (const uint8_t*)d->map;
-    dom_blk_t* nb = dom_blk_new(d->base_count, true);
-    if (!nb) return NULL;
-    nb->end = d->map_size;
-    size_t off = 12;
-    dom_src_t src;
-    if (!dom_src_open(&src, d->path, &d->map_id, d->map_size))
-        src = dom_src_map(map, d->map_size);
-    bool walked = dom_blk_walk_src(&src, nb, 0, &off) && off == d->map_size;
-    dom_src_close(&src);
-    if (!walked) {
-        ray_sys_free(nb);
-        atomic_store_explicit(&failed->stale, true, memory_order_release);
-        atomic_store_explicit(&d->corrupt, true, memory_order_release);
-        dom_corrupt_name(d);
-        return NULL;
-    }
-    d->blk = nb;
-    if (!dom_publish_raw_snap(d, false)) { d->blk = failed; ray_sys_free(nb); return NULL; }
-    atomic_store_explicit(&failed->stale, true, memory_order_release);
-    (void)dom_retire(d, failed);   /* lock-free readers may hold it */
-    atomic_fetch_add_explicit(&d->ix_rescued, 1, memory_order_relaxed);
-    if (d->path && d->map_size >= dom_ix_min()) {
-        dom_blk_save(d->path, map, d->map_size, nb, &d->map_id);
-        d->ix_count = nb->count;
-        d->ix_end = nb->end;
-    } else if (d->path) {
-        ray_sym_domain_index_remove(d->path);   /* a small file keeps none */
-    }
-    return nb;
-}
-
-/* Entry `pos` of the mapped prefix, its block checked first (and the table
- * replaced if it, or the entry's record, does not check).  Under g_dom_lock.
- * NULL when out of range or when the file cannot give it (counted:
- * ray_sym_domain_corruptions). */
+/* Entry `pos` of the mapped prefix.  Under g_dom_lock.  NULL when out of
+ * range. */
 static const uint8_t* dom_entry_locked(ray_sym_domain_t* d, int64_t pos, uint32_t* len) {
     if (pos < 0 || pos >= d->base_count || !d->blk) return NULL;
-    const uint8_t* map = (const uint8_t*)d->map;
-    dom_blk_t* b = d->blk;
-    const uint8_t* p = dom_blk_checked(d, b, pos / DOM_IX_STRIDE) ? dom_blk_entry(map, b, pos, len)
-                                                              : NULL;
-    if (!p) {
-        b = dom_rescue_locked(d, b);
-        if (!b || !(p = dom_blk_entry(map, b, pos, len))) {
-            dom_corrupt_hit(d);
-            return NULL;
-        }
-    }
-    return p;
+    return dom_blk_entry((const uint8_t*)d->map, d->blk, pos, len);
 }
 
 /* Bytes of entry `pos` in order, for a pass over the whole vocabulary
- * (pos = 0, 1, ..., *off starting at 12): the mapped records read in turn —
- * the order itself checks them — then the appended atoms.  A checkpoint the
- * records disagree with means the table does not describe this file: it is
- * replaced by a walk.  Under g_dom_lock.  False when the file cannot give
- * the entry (counted). */
+ * (pos = 0, 1, ..., *off starting at 12): the mapped records read in turn,
+ * then the appended atoms.  Under g_dom_lock. */
 static bool dom_next_locked(ray_sym_domain_t* d, int64_t pos, size_t* off,
                             const char** p, size_t* len) {
     if (pos < d->base_count) {
-        /* a file whose walk failed at open: its checkpoints are that walk's,
-         * so the comparison below would pass over records that are not */
-        if (dom_is_corrupt(d)) { dom_corrupt_hit(d); return false; }
         size_t o = *off;
-        if (!(pos % DOM_IX_STRIDE) && d->blk->ib[pos / DOM_IX_STRIDE].off != o &&
-            !dom_rescue_locked(d, d->blk)) {
-            dom_corrupt_hit(d);
-            return false;
-        }
-        if (o > d->map_size || d->map_size - o < 4) { dom_corrupt_hit(d); return false; }
         uint32_t l = dom_rd32((const uint8_t*)d->map + o);
-        if ((size_t)l > d->map_size - o - 4) { dom_corrupt_hit(d); return false; }
         *p = (const char*)d->map + o + 4;
         *len = l;
         *off = o + 4 + l;
@@ -1071,8 +886,6 @@ typedef struct {
     uint64_t end;         /* byte offset past their records */
     uint64_t ino, stamp;  /* the file it was written for (both 0: none claimed) */
     uint64_t last_ckpt;   /* checkpoint of the last block */
-    uint32_t last_crc;    /* crc32 of the file's last block */
-    uint32_t head_crc;    /* crc32 of the file's first records */
     uint64_t cap;         /* block slots */
 } dom_ixh_t;
 
@@ -1088,37 +901,21 @@ static void dom_ixh_put(uint8_t* h, const dom_ixh_t* x) {
     memcpy(h + 32, &x->ino, 8);
     memcpy(h + 40, &x->stamp, 8);
     memcpy(h + 48, &x->last_ckpt, 8);
-    memcpy(h + 56, &x->last_crc, 4);
-    memcpy(h + 60, &x->head_crc, 4);
     memcpy(h + 72, &x->cap, 8);
-    w = ray_crc32(0, h + 16, DOM_IX_HDR - 16);
-    memcpy(h + 12, &w, 4);
 }
 
 static bool dom_ixh_get(const uint8_t* h, dom_ixh_t* x) {
     if (dom_rd32(h) != DOM_IX_MAGIC || dom_rd32(h + 4) != DOM_IX_VERSION ||
-        dom_rd32(h + 8) != (uint32_t)DOM_IX_STRIDE || dom_rd32(h + 12) != ray_crc32(0, h + 16, DOM_IX_HDR - 16))
+        dom_rd32(h + 8) != (uint32_t)DOM_IX_STRIDE)
         return false;
     memcpy(&x->count, h + 16, 8);
     x->end = dom_rd64(h + 24);
     x->ino = dom_rd64(h + 32);
     x->stamp = dom_rd64(h + 40);
     x->last_ckpt = dom_rd64(h + 48);
-    x->last_crc = dom_rd32(h + 56);
-    x->head_crc = dom_rd32(h + 60);
     x->cap = dom_rd64(h + 72);
     return x->count > 0 && x->end > 12 && x->cap >= (uint64_t)dom_ck_count(x->count) &&
            x->cap <= (uint64_t)dom_ck_count(x->count) * 2 + 4096;
-}
-
-/* The crcs an index keeps of the file it describes: its first records and
- * its last block. */
-static inline uint32_t dom_ix_head_crc(const uint8_t* map, uint64_t end) {
-    uint64_t e = end - 12 < DOM_IX_HEAD ? end : 12 + DOM_IX_HEAD;
-    return ray_crc32(0, map + 12, (size_t)(e - 12));
-}
-static inline uint32_t dom_ix_last_crc(const uint8_t* map, uint64_t last_ckpt, uint64_t end) {
-    return ray_crc32(0, map + last_ckpt, (size_t)(end - last_ckpt));
 }
 
 /* Keep a mapping until the domain dies (the index a table points into). */
@@ -1135,12 +932,10 @@ static void dom_keep_map(ray_sym_domain_t* d, void* m, size_t sz) {
  * entries per its header, identity `id`): a block table pointing at its
  * checkpoints and its lengths in the index file, mapped (*ixmap /
  * *ixsize: for the caller to keep while the table lives).  Taken only when
- * written for this very file — its identity, size and count are the image's
- * — and when it checks: the header, the checkpoint and length sections all
- * there, the image's first records and last block matching their crcs.
- * Reads the header only; the checkpoints and the lengths are paged in as
- * entries are read, and each block is checked on its first read
- * (dom_blk_check).  NULL otherwise (or on OOM). */
+ * written for this very file — its identity, size and count are the
+ * image's — in this format, with its block sections all there.  Reads the
+ * header only; the checkpoints and the lengths are paged in as entries are
+ * read.  NULL otherwise (or on OOM). */
 static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size, int64_t count,
                               const ray_file_id_t* id, void** ixmap, size_t* ixsize,
                               dom_ixh_t* hx) {
@@ -1156,8 +951,7 @@ static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size,
               x.count == count && x.end == size && (x.ino | x.stamp) != 0 &&
               x.ino == id->ino && x.stamp == dom_id_stamp(id);
     fclose(f);
-    ok = ok && x.last_ckpt < size && dom_ix_head_crc(map, size) == x.head_crc &&
-         dom_ix_last_crc(map, x.last_ckpt, size) == x.last_crc;
+    (void)map;
     dom_blk_t* b = ok ? dom_blk_new(count, false) : NULL;
     void* m = NULL;
     size_t msz = 0;
@@ -1175,7 +969,6 @@ static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size,
     }
     b->end = size;
     b->ib = (const dom_ixb_t*)((const uint8_t*)m + DOM_IX_HDR);
-    b->last_ckpt = x.last_ckpt;
     *ixmap = m;
     *ixsize = msz;
     *hx = x;
@@ -1232,7 +1025,7 @@ static bool dom_write_blocks(FILE* f, const uint64_t* ck, const dom_lsrc_t* ls, 
  * ck[0..n) and the entries' lengths (ls); claimed as the index of the file
  * of identity `id` when given (and of the size `end`); with room for a
  * quarter more blocks; to a temporary file renamed over the index.  Best
- * effort: the index is a cache, and a reader checks it before use. */
+ * effort: the index is a cache. */
 static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
                         const uint64_t* ck, int64_t n, const dom_lsrc_t* ls,
                         int64_t count, uint64_t end, const ray_file_id_t* id) {
@@ -1252,8 +1045,6 @@ static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
         x.stamp = dom_id_stamp(id);
     }
     x.last_ckpt = ck[n - 1];
-    x.last_crc = dom_ix_last_crc(map, x.last_ckpt, end);
-    x.head_crc = dom_ix_head_crc(map, end);
     x.cap = (uint64_t)n + (uint64_t)n / 4 + 64;
     uint8_t h[DOM_IX_HDR];
     dom_ixh_put(h, &x);
@@ -1274,8 +1065,7 @@ static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
  * for the new blocks, the block the old entries ended in and the new blocks
  * are written into the slots, then the header — the cost of what was
  * appended; otherwise the index is written whole.  The file is mapped for
- * the crcs of its first records and its last block and for its identity,
- * claimed when `stamp`.  Under the symfile's `.lk` flock.  Best effort. */
+ * its identity, claimed when `stamp`.  Under the symfile's `.lk` flock.  Best effort. */
 static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
                            const dom_lsrc_t* ls, int64_t count, uint64_t end,
                            int64_t ix_count, uint64_t ix_end, bool stamp) {
@@ -1299,8 +1089,6 @@ static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
         x.ino = x.stamp = 0;
         if (stamp && id.valid && id.size == end) { x.ino = id.ino; x.stamp = dom_id_stamp(&id); }
         x.last_ckpt = ck[n - 1];
-        x.last_crc = dom_ix_last_crc(map, x.last_ckpt, end);
-        x.head_crc = dom_ix_head_crc(map, end);
         dom_ixh_put(h, &x);
         app = dom_fseek_ix(f, DOM_IX_HDR + k0 * (int64_t)sizeof(dom_ixb_t)) &&
               dom_write_blocks(f, ck, ls, count, k0, n) &&
@@ -1347,8 +1135,7 @@ void ray_sym_domain_index_remove(const char* path) {
 /* The block table of the mapped image of `d` (its `count` entries per the
  * header): from the index file when it is this file's, else by one walk of
  * all the records (read with explicit reads, dom_src_t), the index then
- * written for the file.  False when the records do not fill the image
- * exactly. */
+ * written for the file.  False when a read of the file fails (or on OOM). */
 static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
     const uint8_t* map = (const uint8_t*)d->map;
     size_t size = d->map_size;
@@ -1366,25 +1153,9 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
         size_t o = 12;
         dom_src_t src;
         if (!dom_src_open(&src, d->path, &d->map_id, size)) src = dom_src_map(map, size);
-        bool walked = dom_blk_walk_src(&src, b, 0, &o) && o == size;
+        bool walked = dom_blk_walk_src(&src, b, 0, &o);
         dom_src_close(&src);
-        if (!walked) {
-            /* The records do not fill the file (torn or overwritten).  The
-             * blocks the walk got through cannot be told good either — a
-             * lost page reads as records of empty strings, and the walk
-             * goes on through them — so the domain opens corrupt with no
-             * entry readable: every read says so (counted), and no index
-             * is written for it. */
-            memset(b->ok, 0, (size_t)((b->n + 63) >> 6) * 8);
-            d->blk = b;
-            d->ix_used = false;
-            d->ix_count = 0;
-            d->ix_end = 0;
-            d->ix_covered = 0;
-            atomic_store_explicit(&d->corrupt, true, memory_order_release);
-            dom_corrupt_name(d);
-            return true;
-        }
+        if (!walked) { ray_sys_free(b); return false; }
     }
     d->blk = b;
     d->ix_used = have;
@@ -1405,7 +1176,7 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
  * and publish it.  CALLER MUST HOLD g_dom_lock.  Idempotent: returns an
  * already-published slot without re-materializing.  Runtime-appended slots
  * (pos >= base_count) are set at append time and never NULL.  Returns NULL
- * on arena OOM, or when the file cannot give the entry. */
+ * on arena OOM. */
 static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
     ray_t* a = dom_slot_get(atomic_load_explicit(&d->atoms, memory_order_relaxed), pos);
     if (a) return a;
@@ -1428,7 +1199,6 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     int64_t count = atomic_load_explicit(&d->count, memory_order_relaxed);
     if (st_size < d->disk_size) return false;       /* shrunk: rewritten */
     if (count != d->disk_count) return false;       /* our tail is dirty */
-    if (dom_is_corrupt(d)) return false;             /* stays corrupt: read nothing */
 
     size_t map_size = 0;
     ray_file_id_t nid;
@@ -1478,7 +1248,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             size_t o = 12;
             dom_src_t src;
             if (!dom_src_open(&src, d->path, &nid, map_size)) src = dom_src_map(nbase, map_size);
-            bool walked = dom_blk_walk_src(&src, nb, 0, &o) && o == map_size;
+            bool walked = dom_blk_walk_src(&src, nb, 0, &o);
             dom_src_close(&src);
             if (!walked) { ray_sys_free(nb); nb = NULL; ok = false; break; }
         }
@@ -1568,7 +1338,6 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             bool snap_ok = dom_publish_raw_snap(d, true);
 
             (void)dom_drop_locked(d, cur);
-            if (old_blk) atomic_store_explicit(&old_blk->stale, true, memory_order_release);
             if (snap_ok) (void)dom_drop_locked(d, old_blk);
             else         (void)dom_retire(d, old_blk);
             if (old_map) {
@@ -1692,17 +1461,6 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         (void)dom_publish_raw_snap(d, false);
         d->disk_count = count;
         d->disk_size = d->map_size;
-        /* Position-0 reservation: every non-empty symfile must carry the
-         * empty string at position 0 (mirrors global id 0 — the SYM
-         * null; group kernels and null conventions treat id 0 as "" /
-         * null).  A vocabulary that starts with anything else is
-         * structurally corrupt for domain use.  Empty files are fine.
-         * Check the file bytes directly (the first record's length must
-         * be 0) — no atom materialization needed. */
-        if (count > 0 && dom_rd32(m + 12) != 0) {
-            dom_destroy(d);
-            return NULL;
-        }
     }
     /* create && !exists: empty domain — vocabulary appears via intern
      * ("" seeded at position 0) and reaches disk on first flush. */
@@ -1825,56 +1583,10 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out) {
     if (!snap) return false;
     out->map = snap->map;
     out->ib = snap->blk->ib;
-    out->ok = snap->blk->ok;
-    out->corrupt = &dom->corrupt;
     out->count = snap->count;
     out->blk = snap->blk;
     out->dom = dom;
     return true;
-}
-
-/* Block k of a pinned table checked, lock-free (once; counted).  False for
- * a table replaced since the pin, or a block that does not check. */
-static bool dom_raw_checked(const ray_sym_domain_raw_t* r, dom_blk_t* b, int64_t k) {
-    if (atomic_load_explicit(&b->stale, memory_order_acquire)) return false;
-    if (dom_blk_ok(b, k)) return true;
-    if (!dom_blk_check(r->map, b, k)) return false;
-    if (r->dom) atomic_fetch_add_explicit(&r->dom->ix_checked, 1, memory_order_relaxed);
-    return true;
-}
-
-/* The entry of a block not yet known to check: checked here, lock-free; a
- * block or a record that does not (or a table replaced since the pin) is
- * read through the domain, under its lock, which replaces the table if need
- * be. */
-const char* ray_sym_domain_raw_str_slow(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len) {
-    *len = 0;
-    if (!r->blk || pos < 0 || pos >= r->count) return NULL;
-    dom_blk_t* b = (dom_blk_t*)r->blk;
-    uint32_t l = 0;
-    const uint8_t* p = dom_raw_checked(r, b, pos / DOM_IX_STRIDE) ? dom_blk_entry(r->map, b, pos, &l)
-                                                               : NULL;
-    if (p) {
-        *len = l;
-        return (const char*)p;
-    }
-    if (!r->dom) { dom_corrupt_hit(NULL); return NULL; }
-    dom_lock();
-    p = dom_entry_locked(r->dom, pos, &l);
-    dom_unlock();
-    *len = p ? l : 0;
-    return (const char*)p;
-}
-
-int64_t ray_sym_domain_raw_len_slow(const ray_sym_domain_raw_t* r, int64_t pos) {
-    if (!r->blk || pos < 0 || pos >= r->count) return -1;
-    dom_blk_t* b = (dom_blk_t*)r->blk;
-    if (b->ib && b->ib[pos / DOM_IX_STRIDE].len[pos % DOM_IX_STRIDE] < DOM_LEN_LONG &&
-        dom_raw_checked(r, b, pos / DOM_IX_STRIDE) &&
-        !(r->dom && atomic_load_explicit(&r->dom->corrupt, memory_order_acquire)))
-        return b->ib[pos / DOM_IX_STRIDE].len[pos % DOM_IX_STRIDE];
-    size_t l = 0;
-    return ray_sym_domain_raw_str_slow(r, pos, &l) ? (int64_t)l : -1;
 }
 
 int64_t ray_sym_domain_strlen(ray_sym_domain_t* dom, int64_t pos) {
@@ -1886,71 +1598,12 @@ int64_t ray_sym_domain_strlen(ray_sym_domain_t* dom, int64_t pos) {
     return s ? (int64_t)ray_str_len(s) : -1;
 }
 
-ray_t* ray_sym_domain_corrupt_error(void) {
-    const char* p = atomic_load_explicit(&g_dom_corrupt_path, memory_order_acquire);
-    return ray_error("corrupt", "a symbol file holds a torn or overwritten record, "
-                                "its symbols cannot be read: %s", p ? p : "?");
-}
-
-static bool dom_has_file(ray_t* v, int depth) {
-    if (!v || RAY_IS_ERR(v) || depth > 64) return false;
-    int8_t t = v->type;
-    if (t == RAY_SYM) {
-        ray_sym_domain_t* d = ray_sym_vec_domain(v);
-        return d && d->kind == DOM_FILE;
-    }
-    if (t == RAY_TABLE) {
-        /* the slots as they are: an encoded column is not decoded to be checked */
-        int64_t nc = ray_table_ncols(v);
-        for (int64_t c = 0; c < nc; c++)
-            if (dom_has_file(ray_table_slot_idx(v, c), depth + 1)) return true;
-        return false;
-    }
-    if (t == RAY_ENCCOL) {   /* generation 2: its ids' domain, or its segments' */
-        ray_enccol_t* e = ray_enccol_of(v);
-        if (!e) return false;
-        if (e->kind == RAY_ENCCOL_PARTED) return dom_has_file(e->wrapper, depth + 1);
-        return e->type == RAY_SYM && e->dom && e->dom->kind == DOM_FILE;
-    }
-    /* lists, dicts (keys, values) and the segments of a parted column: any
-     * item holds what the whole holds */
-    if (t == RAY_LIST || t == RAY_DICT || (t >= RAY_PARTED_BASE && t < RAY_MAPCOMMON)) {
-        ray_t** items = (ray_t**)ray_data(v);
-        for (int64_t i = 0; i < v->len; i++)
-            if (dom_has_file(items[i], depth + 1)) return true;
-    }
-    return false;
-}
-bool ray_sym_has_file_domain(ray_t* v) { return dom_has_file(v, 0); }
-
-/* Output rendered into `tmp` goes to `to` only if no symbol went unread
- * since `c0` (ray_sym_domain_corruptions): else `corrupt`, nothing written.
- * `tmp` is closed — unless it is `to` itself (rendered straight there). */
-ray_t* ray_sym_print_commit(FILE* tmp, FILE* to, uint64_t c0) {
-    bool bad = ray_sym_domain_corruptions() != c0;
-    if (tmp != to) {
-        if (!bad) {
-            char buf[1 << 15];
-            size_t got;
-            rewind(tmp);
-            while ((got = fread(buf, 1, sizeof(buf), tmp)) > 0)
-                if (fwrite(buf, 1, got, to) != got) break;
-        }
-        fclose(tmp);
-    }
-    fflush(to);
-    return bad ? ray_sym_domain_corrupt_error() : RAY_NULL_OBJ;
-}
-
 bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out) {
     if (!dom || !out || dom->kind != DOM_FILE) return false;
     dom_lock();
     out->from_index = dom->ix_used;
     out->lens_mapped = dom->blk && dom->blk->ib && !dom->blk->own_ib;
     out->covered = dom->ix_covered;
-    out->checked = atomic_load_explicit(&dom->ix_checked, memory_order_relaxed);
-    out->rescued = atomic_load_explicit(&dom->ix_rescued, memory_order_relaxed);
-    out->corrupt = atomic_load_explicit(&dom->corrupt, memory_order_relaxed);
     dom_unlock();
     return true;
 }
@@ -2774,8 +2427,6 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     if (dom->kind == DOM_RUNTIME) return RAY_OK; /* sym.c owns its own files */
     if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
     if (!dom->path) return RAY_ERR_DOMAIN;
-    /* a corrupt file is not written again from what of it was read */
-    if (atomic_load_explicit(&dom->corrupt, memory_order_acquire)) return RAY_ERR_CORRUPT;
 
     dom_lock();
     bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count;
@@ -2964,8 +2615,6 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     if (dom->kind == DOM_RUNTIME) return RAY_OK;
     if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
     if (!dom->path) return RAY_ERR_DOMAIN;
-    /* a corrupt file is not written again from what of it was read */
-    if (atomic_load_explicit(&dom->corrupt, memory_order_acquire)) return RAY_ERR_CORRUPT;
 
     dom_lock();
     bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count;

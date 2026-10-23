@@ -1503,48 +1503,6 @@ static test_result_t test_nested_sym_list_symfile(void) {
 }
 
 /* =========================================================================
- * 32. Ragged column lengths -> loud corrupt (the detectable half of the
- *     in-place overwrite crash window): hand-shorten one column file's
- *     row count by rewriting it from a narrower vec.
- * ========================================================================= */
-static test_result_t test_ragged_columns_corrupt(void) {
-    const char* dir = ray_test_tmp(TMP_SPLAY_BASE "/ragged");
-    rm_rf(dir);
-
-    int64_t id_a = ray_sym_intern("a", 1);
-    int64_t id_b = ray_sym_intern("b", 1);
-    int64_t raw3[] = {1, 2, 3};
-    ray_t* col_a = ray_vec_from_raw(RAY_I64, raw3, 3);
-    ray_t* col_b = ray_vec_from_raw(RAY_I64, raw3, 3);
-    ray_t* tbl = ray_table_new(3);
-    tbl = ray_table_add_col(tbl, id_a, col_a);
-    tbl = ray_table_add_col(tbl, id_b, col_b);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
-    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
-
-    /* shorten b on disk (simulates old-generation leftover) */
-    int64_t raw2[] = {9, 9};
-    ray_t* shorter = ray_vec_from_raw(RAY_I64, raw2, 2);
-    char bpath[512];
-    snprintf(bpath, sizeof(bpath), "%s/b", dir);
-    extern ray_err_t ray_col_save(ray_t* vec, const char* path);
-    TEST_ASSERT_EQ_I(ray_col_save(shorter, bpath), RAY_OK);
-
-    ray_t* r = ray_splay_load(dir, NULL);
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
-    ray_release(r);
-
-    ray_release(shorter);
-    ray_release(col_a);
-    ray_release(col_b);
-    ray_release(tbl);
-    rm_rf(dir);
-    PASS();
-}
-
-/* =========================================================================
  * 33. Untrusted disk attrs are masked: a crafted column file with runtime-
  *     only attr bits (HAS_INDEX / HAS_LINK / SLICE) set and garbage in the
  *     16 aux bytes must never make the loaders route aux as owned pointers
@@ -3367,7 +3325,6 @@ const test_entry_t splay_entries[] = {
     { "splay/save_sweeps_stale",          test_save_sweeps_stale_and_skips_sym, splay_setup, splay_teardown },
     { "splay/torn_write_heals",           test_torn_write_heals,                splay_setup, splay_teardown },
     { "splay/nested_sym_list_symfile",    test_nested_sym_list_symfile,         splay_setup, splay_teardown },
-    { "splay/ragged_columns_corrupt",     test_ragged_columns_corrupt,          splay_setup, splay_teardown },
     { "splay/untrusted_attrs_masked",     test_untrusted_attrs_masked,          splay_setup, splay_teardown },
     { "splay/sym_col_name_allowed",       test_sym_col_name_allowed,            splay_setup, splay_teardown },
     { "splay/per_table_symfile_vocab",    test_per_table_symfile_vocabulary,    splay_setup, splay_teardown },

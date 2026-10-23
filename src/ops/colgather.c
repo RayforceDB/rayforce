@@ -218,19 +218,13 @@ static ray_t* acc_put_list(gather_acc_t* a, const ray_col_range_t* v, int64_t ba
  * ray_col_src_gather_points (the body read once, then one lane unpacked,
  * one code looked up or one run found per row) instead of being decoded
  * whole; callers hand it at most RAY_COL_POINT_ROWS rows and it declines
- * past the codec's limit.  SYM ids come back as ids (checked against the
- * domain bound), bitmap nulls as flags.  A declined read (DELTA_BP, a
- * viewed RAW vector, a plain or materialized source) leaves the vector to
- * the cursor, which decodes or reports it.  A point-served value lies
- * inside its vector's statistics (`corrupt` otherwise), and those nest
- * inside the chunk's directory statistics (descriptor validation), so a
- * guarded source (stats_guard) needs no further check:
- * ray_enccol_check_dir's rule holds for every value served. */
+ * past the codec's limit.  SYM ids come back as ids, bitmap nulls as
+ * flags.  A declined read (DELTA_BP, a viewed RAW vector, a plain or
+ * materialized source) leaves the vector to the cursor, which decodes it. */
 #define GATHER_POINT_ROWS RAY_COL_POINT_ROWS
 
 /* The source's values can be point-read: an encoded integer, temporal or
- * SYM column (ray_col_src_gather_points checks each id against the domain
- * bound, as the decode does). */
+ * SYM column. */
 static bool gather_point_src(const ray_col_src_t* src) {
     if (!ray_col_src_encoded(src)) return false;
     switch (src->type) {

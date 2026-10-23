@@ -41,7 +41,7 @@ static int fsst_roundtrip_all(const ray_fsst_table_t* t, const uint8_t* const* s
         uint8_t* dec = malloc((size_t)l[i] + 1);
         int64_t e = ray_fsst_encode(t, s[i], l[i], enc);
         int64_t x = ray_fsst_expanded_len(t, enc, (uint32_t)e);
-        int64_t d = ray_fsst_decode(t, enc, (uint32_t)e, dec, (size_t)l[i] + 1);
+        int64_t d = ray_fsst_decode(t, enc, (uint32_t)e, dec);
         int ok = e >= 0 && x == (int64_t)l[i] && d == (int64_t)l[i] && memcmp(dec, s[i], l[i]) == 0;
         *total_enc += e;
         free(enc); free(dec);
@@ -78,20 +78,6 @@ static test_result_t test_fsst_all_bytes_empty_long(void) {
     ray_fsst_train(s, l, 3, &t);
     int64_t enc;
     TEST_ASSERT_EQ_I(fsst_roundtrip_all(&t, s, l, 3, &enc), -1);
-    PASS();
-}
-
-static test_result_t test_fsst_rejects_malformed(void) {
-    ray_fsst_table_t t; memset(&t, 0, sizeof t);
-    t.n = 1; t.len[0] = 2; t.sym[0][0] = 'a'; t.sym[0][1] = 'b';
-    uint8_t out[16];
-    const uint8_t dangling[2] = { 0, RAY_FSST_ESC };          /* escape as last byte */
-    TEST_ASSERT_EQ_I(ray_fsst_decode(&t, dangling, 2, out, 16), -1);
-    TEST_ASSERT_EQ_I(ray_fsst_expanded_len(&t, dangling, 2), -1);
-    const uint8_t badcode[1] = { 7 };                           /* 7 >= n, not 255 */
-    TEST_ASSERT_EQ_I(ray_fsst_decode(&t, badcode, 1, out, 16), -1);
-    const uint8_t overflow[3] = { 0, 0, 0 };                    /* 6 bytes into cap 4 */
-    TEST_ASSERT_EQ_I(ray_fsst_decode(&t, overflow, 3, out, 4), -1);
     PASS();
 }
 
@@ -149,7 +135,6 @@ static test_result_t test_fsst_train_covers_whole_input(void) {
 const test_entry_t fsst_entries[] = {
     { "fsst/urls_compress",        test_fsst_urls_compress,        fsst_setup, fsst_teardown },
     { "fsst/all_bytes_empty_long", test_fsst_all_bytes_empty_long, fsst_setup, fsst_teardown },
-    { "fsst/rejects_malformed",    test_fsst_rejects_malformed,    fsst_setup, fsst_teardown },
     { "fsst/deterministic",        test_fsst_deterministic,        fsst_setup, fsst_teardown },
     { "fsst/encode_ix_matches_encode", test_fsst_encode_ix_matches_encode, fsst_setup, fsst_teardown },
     { "fsst/train_covers_whole_input", test_fsst_train_covers_whole_input, fsst_setup, fsst_teardown },

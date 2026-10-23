@@ -243,13 +243,10 @@ static ray_t* colw_sym_rebuild(ray_col_write_t* w, ray_t* plain, uint8_t attrs, 
  * file exists: a root to serialize (*root, owned: a SYM HASH / PART
  * rebuilt over the target ids, or any kind on REBUILD, built from the
  * materialized column), or an encoded non-SYM source's region to copy
- * after validation (*copy, into the source's mapping).  The order name of
- * a rebuilt root is the source root's trustworthy one (none for a stale
+ * verbatim (*copy, into the source's mapping).  The order name of a
+ * rebuilt root is the source root's trustworthy one (none for a stale
  * root), which a materialization of generation 2 carries (its parsed
- * root).  Fails closed: a copy of a region the validator refuses, and a
- * REBUILD (or SYM rebuild) of an encoded source whose region is corrupt
- * (its materialization validates and attaches the region first), both
- * fail the save with the validator's corrupt error; nothing is written. */
+ * root). */
 static ray_t* colw_region_prepare(ray_col_write_t* w, uint8_t ik, uint8_t attrs, const int64_t* lut, bool stale,
                                   ray_t** root, const uint8_t** copy, uint64_t* copy_len,
                                   const char** order, uint32_t* order_len) {
@@ -257,10 +254,6 @@ static ray_t* colw_region_prepare(ray_col_write_t* w, uint8_t ik, uint8_t attrs,
     bool enc = src->type == RAY_ENCCOL;
     if (enc && w->src.type != RAY_SYM && w->index_decision == RAY_COL_IDX_KEEP) {
         ray_enccol_t* se = ray_enccol_of(src);
-        ray_enc_idx_view_t sv;
-        ray_t* verr = ray_enc_index_validate(se->base + se->hdr.index_off, se->hdr.end_off - se->hdr.index_off,
-                                             ik, se->type, se->attrs, se->len, 0, NULL, se->path, &sv);
-        if (verr) return verr;
         *copy = se->base + se->hdr.index_off;
         *copy_len = se->hdr.end_off - se->hdr.index_off;
         return NULL;

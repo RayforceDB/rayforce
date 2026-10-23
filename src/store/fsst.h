@@ -51,8 +51,9 @@ int     ray_fsst_train(const uint8_t* const* strs, const uint32_t* lens, int64_t
                        ray_fsst_table_t* t);
 /* out must hold 2*len bytes.  Builds an index per call; use ray_fsst_encode_ix in loops. */
 int64_t ray_fsst_encode(const ray_fsst_table_t* t, const uint8_t* s, uint32_t len, uint8_t* out);
-int64_t ray_fsst_decode(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len,
-                        uint8_t* out, size_t cap);
+/* Expand the codes in[0, len) of a string ray_fsst_encode wrote: out
+ * receives ray_fsst_expanded_len bytes; returns that length. */
+int64_t ray_fsst_decode(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len, uint8_t* out);
 int64_t ray_fsst_expanded_len(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len);
 int64_t ray_fsst_table_bytes(const ray_fsst_table_t* t);
 

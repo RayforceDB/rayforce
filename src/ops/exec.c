@@ -26,7 +26,6 @@
 #include "ops/colbind.h"
 #include "ops/cdfuse.h"     /* ray_cd_bounded_all: count distinct of an encoded scan */
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
-#include "table/domain.h"   /* ray_sym_domain_corruptions */
 #include "lang/format.h"    /* ray_type_name (error context) */
 #include "ops/rowsel.h"
 #include "store/enccol.h"
@@ -1676,18 +1675,14 @@ static bool str_seg_fill(const str_sel_ctx_t* x, str_seg_sel_t* s, ray_col_scrat
             int64_t lo, hi;
             bool decided = false;
             if (x->clen > 0 && s->code >= -1) {     /* "" is never inside the bounds */
-                if (ray_enccol_code_bounds(s->e, c, -1, &lo, &hi, &err))
+                if (ray_enccol_code_bounds(s->e, c, -1, &lo, &hi))
                     decided = s->code < lo || s->code > hi;
-                if (!decided && !err && ray_enccol_code_bounds(s->e, c, j, &lo, &hi, &err))
+                if (!decided && ray_enccol_code_bounds(s->e, c, j, &lo, &hi))
                     decided = s->code < lo || s->code > hi;
-                if (err) { ray_scan_fail_note(x->fail, key, err); return false; }
             }
             if (decided) { memset(o, miss, (size_t)piece); at += piece; continue; }
             if (s->code >= -1) {
-                const ray_enc_desc_t* d;
-                if ((err = ray_enccol_chunk_descs_ref(s->e, c, &d)) != NULL) {
-                    ray_scan_fail_note(x->fail, key, err); return false;
-                }
+                const ray_enc_desc_t* d = ray_enccol_descs(s->e, c);
                 if (d[j].encoding == RAY_ENC_STR_DICT) {
                     ray_enc_vview_t vv;                 /* on this task's stack */
                     int vr = ray_enccol_vview(s->e, v, &vv, &err);
@@ -6414,15 +6409,8 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * were that call to reset the flag, a cancel that arrived before it
      * would be dropped and the workers would run the remaining tickets. */
     bool outermost = exec_depth++ == 0;
-    uint64_t sym_corrupt0 = ray_sym_domain_corruptions();
     ray_t* result = ray_execute_inner(g, root, outermost);
     exec_depth--;
-    /* a symbol file found torn while this ran (table/domain.h) */
-    if (outermost && ray_sym_domain_corruptions() != sym_corrupt0) {
-        if (result && RAY_IS_ERR(result)) ray_error_free(result);
-        else if (result) ray_release(result);
-        result = ray_sym_domain_corrupt_error();
-    }
     if (own_scan) ray_pool_scan_set(prev_scan);
     return result ? result : ray_error("oom", NULL);
 }

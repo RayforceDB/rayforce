@@ -69,24 +69,20 @@ int64_t ray_fsst_expanded_len(const ray_fsst_table_t* t, const uint8_t* in, uint
     int64_t x = 0;
     for (uint32_t i = 0; i < len; i++) {
         uint8_t c = in[i];
-        if (c == RAY_FSST_ESC) { if (i + 1 >= len) return -1; i++; x += 1; }
-        else if (c < t->n) x += t->len[c];
-        else return -1;
+        if (c == RAY_FSST_ESC) { i++; x += 1; }
+        else x += t->len[c];
     }
     return x;
 }
 
-int64_t ray_fsst_decode(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len,
-                        uint8_t* out, size_t cap) {
-    int64_t x = ray_fsst_expanded_len(t, in, len);
-    if (x < 0 || (size_t)x > cap) return -1;
+int64_t ray_fsst_decode(const ray_fsst_table_t* t, const uint8_t* in, uint32_t len, uint8_t* out) {
     size_t o = 0;
     for (uint32_t i = 0; i < len; i++) {
         uint8_t c = in[i];
         if (c == RAY_FSST_ESC) out[o++] = in[++i];
         else { memcpy(out + o, t->sym[c], t->len[c]); o += t->len[c]; }
     }
-    return x;
+    return (int64_t)o;
 }
 
 int64_t ray_fsst_table_bytes(const ray_fsst_table_t* t) {

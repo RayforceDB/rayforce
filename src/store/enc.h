@@ -150,14 +150,11 @@ bool    ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k
  * DICT), or -1 when not legal or not applicable. */
 int64_t ray_enc_body_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
                           const ray_enc_dict_t* dict);
+/* Decode a body ray_enc_write wrote (depth 0: the body at p; depth > 0: a
+ * child, its 8-byte header first) into n values; the bytes it spans. */
 int64_t ray_enc_read(const uint8_t* p, size_t avail, uint8_t enc, uint8_t width,
                      int n, ray_enc_kind_t k, ray_enc_slot_t slot, int depth,
                      const ray_enc_dict_t* dict, uint64_t* out);
-/* Why the last ray_enc_read on this thread failed (diagnostics only). */
-const char* ray_enc_read_why(void);
-/* Sets the reason ray_enc_read_why reports and returns -1: for readers
- * outside enc_codec.c (ALP, ALP_RD). */
-int64_t ray_enc_read_fail(const char* why);
 /* Distinct sorted values of v in the logical order of k (ray_enc_lt; on a
  * float kind v must hold no NaN, see ray_enc_lt).  Returns 1 =
  * trained (*out holds *out_n values; free with ray_free_raw), 0 = no
@@ -183,8 +180,7 @@ void    ray_enc_alp_train(const uint64_t* bits, int64_t n, int T, ray_enc_alp_ca
  * are none. */
 int64_t ray_enc_alp_size(const uint64_t* v, int n, int T, const ray_enc_alp_cands_t* c, int* best);
 bool    ray_enc_alp_write(const uint64_t* v, int n, int T, uint8_t e, uint8_t f, ray_enc_buf_t* out);
-/* Validates and decodes an ALP body into T-bit patterns; returns the body
- * bytes or -1 (corrupt). */
+/* Decodes an ALP body into T-bit patterns; returns the body bytes. */
 int64_t ray_enc_alp_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out);
 
 /* ---- ALP_RD (src/store/enc_alp.c): each value split into a left part
@@ -197,9 +193,8 @@ int64_t ray_enc_alprd_size(const uint64_t* v, int n, int T);
 /* Appends the body; false on bad arguments (n outside 1..1024, T not 32
  * or 64) or OOM (out->oom), with no partial body left in out. */
 bool    ray_enc_alprd_write(const uint64_t* v, int n, int T, ray_enc_buf_t* out);
-/* Validates and decodes an ALP_RD body into T-bit patterns (out holds
- * RAY_ENC_VEC values); returns the body bytes or -1 (corrupt: out is
- * then untouched or all zero, never partly decoded). */
+/* Decodes an ALP_RD body into T-bit patterns (out holds RAY_ENC_VEC
+ * values); returns the body bytes. */
 int64_t ray_enc_alprd_read(const uint8_t* p, size_t avail, int n, int T, uint64_t* out);
 
 /* ---- the float top level ---- */
@@ -211,19 +206,18 @@ ray_enc_choice_t ray_enc_float_choose(const uint64_t* v, int n, int T, const ray
 /* Write `enc`'s body (false: not applicable, illegal or OOM; out->oom tells). */
 bool    ray_enc_float_write(uint8_t enc, const uint64_t* v, int n, int T, const ray_enc_dict_t* dict,
                             const ray_enc_alp_cands_t* c, ray_enc_buf_t* out, ray_enc_choice_t* chosen);
-/* Validate and decode any float body; bytes used or -1. */
+/* Decode any float body; the bytes used. */
 int64_t ray_enc_float_read(const uint8_t* p, size_t avail, uint8_t enc, int n, int T,
                            const ray_enc_dict_t* dict, uint64_t* out);
 
 /* ---- STR bodies (src/store/enc_str.c), n in 0..1024 ----
  * STR_DICT: child `codes` (U32), each below the STR_DICT entry count.
  * FSST: child `lengths` (U32, RAW or FOR_BP), u64 total_bytes (the sum of
- * the lengths), the compressed bytes padded to 8 with zeros.  Readers name
- * their reject rule through ray_enc_read_fail. */
+ * the lengths), the compressed bytes padded to 8 with zeros. */
 int64_t ray_enc_strdict_size(const uint64_t* codes, int n);
 bool    ray_enc_strdict_write(const uint64_t* codes, int n, ray_enc_buf_t* out);
-/* codes (each below dict_n); the body must fill avail.  Bytes used, or -1. */
-int64_t ray_enc_strdict_read(const uint8_t* p, size_t avail, int n, uint32_t dict_n, uint64_t* codes);
+/* The n codes of a STR_DICT body. */
+void    ray_enc_strdict_read(const uint8_t* p, size_t avail, int n, uint64_t* codes);
 /* Compress n strings: buf receives the concatenated codes (capacity at
  * least 2 x the strings' bytes), clen[i] each string's compressed length.
  * Returns the total compressed bytes. */
@@ -236,12 +230,9 @@ int64_t ray_enc_fsst_size(const uint64_t* clen, int n, uint64_t total);
  * partial body left in out. */
 bool    ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint64_t total,
                            ray_enc_buf_t* out);
-/* Validate an FSST body against table t (spec "FSST validation", vector
- * scope): every slice self-contained, codes below n_symbols or 255, each
- * expansion at most UINT32_MAX.  Fills clen[] and xlen[] (expanded
- * lengths) and *bytes (the compressed area).  The body must fill avail.
- * Body bytes, or -1. */
-int64_t ray_enc_fsst_check(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
+/* An FSST body against table t: clen[] (compressed lengths), xlen[]
+ * (expanded lengths) and *bytes (the compressed area). */
+void    ray_enc_fsst_parse(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
                            uint64_t* clen, uint64_t* xlen, const uint8_t** bytes);
 
 #endif /* RAY_ENC_H */

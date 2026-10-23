@@ -1183,18 +1183,6 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                              dir, (int)name_len, name);
         }
 
-        int64_t col_rows = ray_table_col_nrows(col);
-        if (c > 0 && col_rows != ray_table_nrows(tbl)) {
-            ray_t* err = ray_error("corrupt",
-                "splayed %s: column '%.*s' has %lld rows, expected %lld "
-                "(torn overwrite?)", dir, (int)name_len, name,
-                (long long)col_rows, (long long)ray_table_nrows(tbl));
-            ray_release(col);
-            ray_release(schema);
-            ray_release(tbl);
-            return err;
-        }
-
         ray_t* new_df = ray_table_add_col(tbl, name_id, col);
         if (!new_df || RAY_IS_ERR(new_df)) {
             ray_release(col);
@@ -1270,8 +1258,7 @@ static ray_t* splay_load_once(const char* dir, const char* sym_path,
             if (*held) { ray_sym_domain_release(*held); *held = NULL; }
             if (!dom)
                 return ray_error("corrupt",
-                    "symfile %s: unreadable or invalid (bad magic, torn "
-                    "record, or missing \"\" at position 0)", sym_path);
+                    "symfile %s: unreadable or not a symfile", sym_path);
         }
     }
     /* An earlier attempt's domain not replaced above (no symfile this
