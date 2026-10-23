@@ -1,0 +1,12 @@
+;; Same loop shapes as #951, with five interleaved samples.
+(set n 1000000)
+(set x 0)
+(set l_loop (fn [] (let i 0) (while (< i n) (let i (+ i 1))) i))
+(set g_loop (fn [] (set i 0) (while (< i n) (set i (+ i 1))) i))
+(set mix (fn [] (let i 0) (while (< i n) (set x i) (let i (+ i 1))) i))
+(l_loop) (g_loop) (mix)
+(times [sample 5]
+  (println (list "local" (timeit (l_loop))))
+  (println (list "global" (timeit (g_loop))))
+  (println (list "mixed" (timeit (mix)))))
+(println (list "checksums" (l_loop) (g_loop) (mix) x))
