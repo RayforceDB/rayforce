@@ -3641,10 +3641,10 @@ static test_result_t test_domain_index_writers(void) {
                            ((uint64_t)ix_ctime_ns(&st) * UINT64_C(0x9E3779B97F4A7C15));
             ray_sym_domain_release(re);
             FAILF("the import's index is not taken: index (%zu B) count %lld end %llu ino %llu stamp %llx; "
-                  "file size %lld ino %llu stamp %llx; covered %lld rescued %lld",
+                  "file size %lld ino %llu stamp %llx; covered %lld",
                   got, (long long)cnt, (unsigned long long)end, (unsigned long long)ino,
                   (unsigned long long)stamp, (long long)st.st_size, (unsigned long long)st.st_ino,
-                  (unsigned long long)now, (long long)in.covered, (long long)in.rescued);
+                  (unsigned long long)now, (long long)in.covered);
         }
         TEST_ASSERT_EQ_I(in.covered, N);
         ray_sym_domain_release(re);
