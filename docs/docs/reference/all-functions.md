@@ -217,8 +217,8 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `map` | variadic | — | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
-| `pmap` | variadic | — | Currently a sequential alias for `map` (returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
+| `map` | variadic | — | Apply function to each element; same-type atom results form a typed vector, otherwise a list | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
+| `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
@@ -234,7 +234,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 ```lisp
 ; Transform each row with map
-(map (fn [x] (* x x)) [1 2 3 4])  ; (1 4 9 16)
+(map (fn [x] (* x x)) [1 2 3 4])  ; [1 4 9 16]
 
 ; pmap currently uses the same sequential callback loop as map
 (pmap (fn [t] (sum (til t))) [100 200 300])
@@ -242,6 +242,24 @@ Functions that take other functions as arguments for mapping, folding, and filte
 ; Running sum with scan
 (scan + (enlist 1 2 3 4))  ; [1 3 6 10]
 ```
+
+`map` and `pmap` return a typed vector when every result is an atom of
+exactly the same vector-supported type, including strings, symbols and
+representable typed nulls. Native boolean/byte null atoms remain boxed
+because those vector types are non-nullable. Opaque graph, HNSW index and
+Datalog program handles also remain boxed: their integer payload alone cannot
+represent the handle's resource ownership. Mixed atom types (including
+integers mixed with floats), nested results and untyped `null` results
+remain a `LIST`. Empty input returns an empty `LIST`, since there is no
+result type to infer. A binary map with a scalar third argument still calls
+the function once and returns its result directly. Callbacks run left to
+right, exactly once per input element; an error stops the walk. A later type
+mismatch converts the collected prefix to a list without repeating
+callbacks. `scan` and the other iterators keep their existing result-type
+rules. This changes callers that relied on every map result being a `LIST`.
+Use `(concat (list) result)` to explicitly box a result for a list-only
+consumer, such as a positional row payload or `raze` joining string fragments.
+`raze` leaves an already typed vector unchanged.
 
 ## Collection Operations { #collection }
 

@@ -579,6 +579,33 @@ static ray_t* iter_elem_owned(ray_t* coll, int64_t i) {
     return e;
 }
 
+/* An exact-type atom that can be represented in a vector. BOOL/U8 have
+ * no vector null: a native typed-null atom of either type stays boxed. */
+static bool map_vector_atom(ray_t* value) {
+    if (value->type >= 0 || !ray_is_vector_type(-value->type)) return false;
+    /* These I64 atoms own opaque resources. A raw integer cell cannot
+     * carry their tags or finalizers, including after a typed prefix. */
+    if (value->type == -RAY_I64 &&
+        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)))
+        return false;
+    return !((value->type == -RAY_BOOL || value->type == -RAY_U8) &&
+             RAY_ATOM_IS_NULL(value));
+}
+
+/* Rebox only the completed prefix, without invoking the callback again.
+ * Reserve the full result length so fallback needs no further list growth.
+ * On failure the caller still owns prefix. */
+static ray_t* map_box_prefix(ray_t* prefix, int64_t capacity) {
+    ray_t* list = ray_list_new(capacity);
+    if (RAY_IS_ERR(list)) return list;
+    for (int64_t i = 0; i < prefix->len; i++) {
+        ray_t* value = iter_elem_owned(prefix, i);
+        if (RAY_IS_ERR(value)) { ray_release(list); return value; }
+        ((ray_t**)ray_data(list))[list->len++] = value;
+    }
+    return list;
+}
+
 /* (map fn val vec) — apply binary fn(val, elem) to each element of vec.
  * Also supports (map fn vec) for unary mapping. */
 ray_t* ray_map_fn(ray_t** args, int64_t n) {
@@ -605,28 +632,56 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     }
 
     int64_t len = ray_len(coll);
-    ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) return ray_error("oom", NULL);
-    result->type = RAY_LIST;
-    result->len = len;
-    ray_t** out = (ray_t**)ray_data(result);
+    if (len == 0) return ray_list_new(0);  /* no callback result to infer */
+    ray_t* result = NULL;
     for (int64_t i = 0; i < len; i++) {
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
-        if (RAY_IS_ERR(elem))  out[i] = elem;
-        else if (n == 2)       out[i] = call_fn1(fn, elem);
-        else                   out[i] = call_fn2(fn, val, elem);
+        ray_t* value;
+        if (RAY_IS_ERR(elem))  value = elem;
+        else if (n == 2)      value = call_fn1(fn, elem);
+        else                  value = call_fn2(fn, val, elem);
         if (owned) ray_release(elem);
-        /* Materialise a lazy result (e.g. the lambda returned
-         * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
-         * of unforced lazy nodes breaks every downstream consumer that
-         * doesn't force per element (sum, ==, +). */
-        if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
-        if (RAY_IS_ERR(out[i])) {
-            ray_t* err = out[i];
-            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result);
-            return err;
+        /* Force each result before choosing its representation, as the
+         * previous list collector did for lazy callback results. */
+        if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
+        if (RAY_IS_ERR(value)) { ray_release(result); return value; }
+
+        /* Once heterogeneous, stay boxed without rechecking atom types. */
+        if (result && result->type == RAY_LIST) {
+            ((ray_t**)ray_data(result))[result->len++] = value;
+            continue;
+        }
+        bool atom = map_vector_atom(value);
+        if (!result) {
+            result = atom ? ray_vec_new(-value->type, len) : ray_list_new(len);
+            if (RAY_IS_ERR(result)) { ray_release(value); return result; }
+        } else if (result->type != RAY_LIST &&
+                   (!atom || value->type != -result->type)) {
+            ray_t* list = map_box_prefix(result, len);
+            ray_release(result);
+            if (RAY_IS_ERR(list)) { ray_release(value); return list; }
+            result = list;
+        }
+
+        if (result->type == RAY_LIST) {
+            ((ray_t**)ray_data(result))[result->len++] = value; /* transfer */
+        } else if (result->type == RAY_STR) {
+            ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), ray_str_len(value));
+            ray_release(value);
+            if (RAY_IS_ERR(next)) { ray_release(result); return next; }
+            result = next;
+        } else {
+            /* Capacity is reserved, SYM atoms have runtime ids and the
+             * destination is a fresh runtime-domain vector. Exact type
+             * agreement above prevents any numeric promotion. */
+            result->len++;
+            int status = store_typed_elem(result, i, value);
+            ray_release(value);
+            if (status != 0) {
+                ray_release(result);
+                return ray_error("type", "map: cannot store callback result");
+            }
         }
     }
     return result;
