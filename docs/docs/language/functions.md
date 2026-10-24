@@ -512,7 +512,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `eval` | unary | Evaluate a parsed expression | `(eval (parse "(+ 1 2)"))` → `3` |
 | `parse` | unary | Parse string into Rayfall expression | `(parse "(+ 1 2)")` |
-| `.sys.gc` | variadic | Trigger garbage collection, returns `0` | `(.sys.gc)` |
+| `.sys.gc` | variadic (0–1) | Trigger garbage collection, returns `0`; mode `1` also hands every free page back now | `(.sys.gc)`, `(.sys.gc 1)` |
 | `.sys.exec` | unary | Execute shell command, return exit code | `(.sys.exec "ls -la")` |
 | `.os.getenv` | unary | Get environment variable | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | Set environment variable | `(.os.setenv "KEY" "value")` |

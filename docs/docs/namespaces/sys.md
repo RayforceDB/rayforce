@@ -16,7 +16,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
-| [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
+| [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Run allocator maintenance and return `0`; `(.sys.gc 1)` also hands every free page back now. |
 | [`.sys.env`](#sys-env) | variadic (0–1) | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
@@ -266,11 +266,26 @@ The `-Q` startup flag is the equivalent for enabling logging from launch.
 
 ## `.sys.gc` { #sys-gc }
 
-Signature: `(.sys.gc)`. Runs allocator maintenance: drains cross-thread frees,
+Signature: `(.sys.gc [mode])`. Runs allocator maintenance: drains cross-thread frees,
 flushes slab caches, coalesces free buddy blocks, reclaims empty oversized
 pools, and incrementally returns aged free pages to the operating system.
 Rayforce values remain deterministically reference-counted—this is allocator
 GC, not a tracing object collector. Returns `0`.
+
+`mode` is `0` (the same as no argument) or `1`. `(.sys.gc 1)` also hands
+every free page back to the operating system now, as the ten-second idle
+decay would once the process went quiet: the free blocks' pages, empty spill
+pools and the cached large blocks. A server that a timer or a client keeps
+busy never goes quiet for that long, so this is how it gives back a peak it
+has finished with; the next use of that memory faults its pages in again.
+It returns `0`, as `(.sys.gc)` does. Another mode is a `domain` error, a
+non-`i64` a `type` error, and more than one argument an `arity` error. See
+[Giving a peak back](../guides/memory.md#giving-a-peak-back).
+
+```lisp
+(.sys.gc)    ; 0
+(.sys.gc 1)  ; 0 — every free page handed back now
+```
 
 ## `.sys.env` { #sys-env }
 

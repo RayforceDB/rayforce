@@ -3733,6 +3733,23 @@ int64_t ray_heap_decay(void) {
     return released;
 }
 
+/* The decay's sweep on request, due or not, and the direct-block cache with
+ * it: the caller says the memory it freed will not be reused soon.  A server
+ * that a timer or a client keeps busy is never idle for the threshold, so
+ * without this it keeps its largest working set for the rest of its life.
+ * Disarms the decay as a sweep does: until new work, there is nothing more
+ * to give back. */
+int64_t ray_heap_release_now(void) {
+    if (atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) != 0)
+        return -1;
+    atomic_store_explicit(&g_heap_decay_armed, false, memory_order_relaxed);
+
+    direct_cache_drain();
+    int64_t released = 0;
+    heap_each_quiescent(heap_decay_sweep, &released);
+    return released;
+}
+
 /* What a relief would hand back, as far as the candidate filter can tell:
  * the anonymous bytes of the heaps that did not spill a pool (room; of other
  * threads' heaps, room_other). */

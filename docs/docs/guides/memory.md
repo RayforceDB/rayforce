@@ -90,6 +90,34 @@ tracing collector.
     reclaimable immediately when their last reference is released. `(.sys.gc)`
     performs the allocator-side consolidation and page-return pass.
 
+### Giving a peak back: `(.sys.gc 1)` { #giving-a-peak-back }
+
+A free block keeps its pages, so the next query of the same shape reuses
+them without faulting them in again. Short of memory pressure, the process
+hands most of them back to the operating system only once it has been idle
+for ten seconds (the idle decay). Every fired timer and every served request counts as activity, so
+a server that polls on a timer, or that a client polls, is never idle for
+that long. It keeps its largest working set for the rest of its life, even
+when that memory is free.
+
+`(.sys.gc 1)` does what the idle decay would do, now: it drains every heap's
+cross-thread frees and slab caches, unmaps empty spill pools and the cached
+large blocks, and releases the pages of every other free block. Like
+`(.sys.gc)` it returns `0`; the drop shows in the process's resident memory
+(`VmRSS` in `/proc/<pid>/status` on Linux). `(.sys.gc 0)` is the same as
+`(.sys.gc)`.
+
+```lisp
+(set v (til 100000000))  ; an 800 MB peak
+(set v 0)                ; finished with it
+(.sys.gc 1)              ; 0 — its pages are back with the operating system
+```
+
+Call it where a program knows it has finished with a peak and will not
+need that memory again soon: after a nightly batch, after closing a day.
+The cost is paid on reuse: the next query that needs the memory faults its
+pages in again, zeroed, as a fresh process would.
+
 ## 4. The `.sys.info` Function
 
 Call `(.sys.info)` to see system-level information about the Rayforce runtime:
@@ -428,6 +456,7 @@ This tells you the join needed about 1 GB of temporary memory beyond what was al
 |---|---|---|
 | `(.sys.mem)` | Returns heap allocation statistics | Monitor memory usage, detect leaks |
 | `(.sys.gc)` | Flushes caches, releases pages | Between heavy queries, before benchmarks |
+| `(.sys.gc 1)` | Hands every free page back to the OS now | A server finished with a peak |
 | `(.sys.info)` | Shows system and runtime info | Check total RAM, CPU count, OS details |
 | `(timeit expr)` | Measures execution time of one expression | Benchmark a specific operation |
 | `:timeit` | Toggles profiling for all REPL expressions | Interactive performance exploration |

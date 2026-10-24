@@ -1,0 +1,21 @@
+;; (.sys.gc 1): the idle decay's sweep on request, due or not, and the
+;; direct-block cache drained.  A server that a timer or a client keeps
+;; busy is never idle for the decay; this is how it says it has finished
+;; with a peak.  Like (.sys.gc) and (.sys.gc 0) it returns 0 (the drop
+;; shows in the resident set; test_heap.c heap/release_now_* checks it).
+
+(.sys.gc) -- 0
+(.sys.gc 0) -- 0
+
+;; Four 16 MB vectors, freed, handed back; again with nothing freed since.
+(set _gc_v (map (fn [i] (til 2000000)) (til 4)))
+(set _gc_v 0)
+(.sys.gc 1) -- 0
+(.sys.gc 1) -- 0
+
+;; A mode is 0 or 1, an i64.
+(.sys.gc 2) !- domain
+(.sys.gc -1) !- domain
+(.sys.gc 1.0) !- type
+(.sys.gc 'now) !- type
+(.sys.gc 0 1) !- arity

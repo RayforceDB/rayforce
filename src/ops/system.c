@@ -933,13 +933,25 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
-/* (.sys.gc) -- perform the allocator maintenance pass used by v1: drain
- * foreign frees, flush slab caches, coalesce blocks and release reclaimable
- * pages/pools.  Rayforce values are reference-counted, so this is allocator
- * GC rather than a tracing collector.  Variadic to allow `(.sys.gc)`. */
+/* (.sys.gc [mode]) -- perform the allocator maintenance pass used by v1:
+ * drain foreign frees, flush slab caches, coalesce blocks and release
+ * reclaimable pages/pools.  Rayforce values are reference-counted, so this
+ * is allocator GC rather than a tracing collector.  Mode 1 also hands back
+ * every page the heap holds free, now, as the idle decay would once due
+ * (ray_heap_release_now); mode 0 is the same as none.  Returns 0: a count
+ * of what went back would mislead, since a block the heap splits, merges or
+ * takes back from a parked pool is released anew.  Variadic to allow
+ * `(.sys.gc)`. */
 ray_t* ray_gc_fn(ray_t** args, int64_t n) {
-    (void)args;
-    if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
+    if (n > 1) return ray_error("arity", ".sys.gc takes no argument or a mode, 0 or 1");
+    bool now = false;
+    if (n == 1) {
+        if (args[0]->type != -RAY_I64)
+            return ray_error("type", ".sys.gc: mode must be i64, got %s", ray_type_name(args[0]->type));
+        if (args[0]->i64 != 0 && args[0]->i64 != 1)
+            return ray_error("domain", ".sys.gc: mode must be 0 or 1, got %lld", (long long)args[0]->i64);
+        now = args[0]->i64 == 1;
+    }
     ray_heap_gc();
     /* Dead memory the heap keeps for reuse is not kept locked against swap. */
     ray_heap_unlock_idle();
@@ -947,7 +959,8 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
      * is free goes back now, and an explicit maintenance call is also a
      * chance to notice the process has gone quiet. */
     ray_heap_relieve();
-    ray_heap_decay();
+    if (now) (void)ray_heap_release_now();
+    else ray_heap_decay();
     return ray_i64(0);
 }
 
