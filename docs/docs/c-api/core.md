@@ -129,17 +129,17 @@ caml_alloc_custom_mem(&ops, sizeof(ray_t*), ray_shallow_bytes(col));  /* OCaml: 
 
 ### ray_heap_set_anon_watermark / ray_heap_anon_watermark / ray_heap_anon_peak
 
-The memory budget the engine's `-m SIZE` sets, for a program that embeds the library. Past the anon watermark the heap backs new allocations with spill files (under `RAY_HEAP_SWAP`, else `TMPDIR`) instead of anonymous RAM, so the process spills to disk rather than meeting the OOM killer (see [Memory](../guides/memory.md)). The default is `ray_sys_ram_limit()` — physical RAM, or a smaller container/cgroup limit — less a quarter of it, at least 3 GiB and at most half, left to the page cache.
+The spill threshold the engine's `-m SIZE` sets, for a program that embeds the library. The heap counts the anonymous memory it maps itself: pools, direct blocks and sys blocks. A new pool, direct block or large sys block that would push the count past the anon watermark is backed by a spill file (under `RAY_HEAP_SWAP`, else `TMPDIR`) instead; where no spill file can be made it stays in anonymous RAM rather than fail. It is a threshold the engine manages, not a cap on the process's RAM nor a guarantee against the OOM killer: mapped inputs and the page cache, and what the host allocates itself, are outside the count (see [Memory](../guides/memory.md)). The default is `ray_sys_ram_limit()` — physical RAM, or a smaller container/cgroup limit — less a quarter of it, at least 3 GiB and at most half, left to the page cache.
 
 ```c
 void    ray_heap_set_anon_watermark(int64_t bytes);  /* 0 restores the default */
 int64_t ray_heap_anon_watermark(void);               /* the threshold in force */
-int64_t ray_heap_anon_peak(void);                    /* peak anonymous bytes committed */
+int64_t ray_heap_anon_peak(void);                    /* peak of the heap's anonymous mappings */
 ```
 
-`ray_heap_anon_watermark` resolves 0 to the default. `ray_heap_anon_peak` is the high-water mark of committed anonymous bytes since process start, spill excluded: the peak RAM the process demanded. They are what `.sys.mem` reports as `anon-watermark` and `anon-peak`.
+`ray_heap_anon_watermark` resolves 0 to the default. `ray_heap_anon_peak` is the high-water mark, since process start, of the anonymous mappings the heap tracks, counted at their mapped size, spill excluded. It is not the process's RSS, nor all the RAM the embedding process uses. They are what `.sys.mem` reports as `anon-watermark` and `anon-peak`.
 
-On Linux the watermark also bounds, with half the RAM limit, the memory the heap locks against swap-out. An embedding keeps its host's `RLIMIT_MEMLOCK`, and what does not fit stays unlocked (see [Memory](../guides/memory.md#8-total-ram-and-out-of-core-spill)); `RAY_HEAP_MLOCK=0` turns locking off.
+On Linux the heap also locks the anonymous memory it maps under the watermark against swap-out, a page at a time as it is faulted in (`MLOCK_ONFAULT`), and best effort: the bytes locked stay within the smaller of the watermark and half the RAM limit. An embedding keeps its host's `RLIMIT_MEMLOCK`, and what does not fit stays unlocked (see [Memory](../guides/memory.md#8-total-ram-and-out-of-core-spill)); `RAY_HEAP_MLOCK=0` turns locking off.
 
 ```c
 ray_heap_set_anon_watermark(INT64_C(6) << 30);   /* as -m 6G */

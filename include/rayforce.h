@@ -376,17 +376,21 @@ int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informationa
 int64_t  ray_sys_ram_limit(void);   /* RAM this process may use: min(physical RAM,
                                      * container/cgroup limit); the default anon watermark */
 
-/* The anon watermark: anonymous (RAM-resident) bytes the heap may commit
- * before new allocations are backed by spill files under RAY_HEAP_SWAP
- * (else TMPDIR) instead.  The default is ray_sys_ram_limit() less a quarter
- * of it, at least 3 GiB and at most half, left to the page cache.
+/* The anon watermark: the spill threshold for the anonymous memory the
+ * heap maps itself (pools, direct and sys blocks).  A new mapping that
+ * would cross it is backed by a spill file under RAY_HEAP_SWAP (else
+ * TMPDIR) instead, or stays in RAM where no spill file can be made.  Not a
+ * cap on the process's RAM: mapped inputs, the page cache and the host's
+ * own allocations are outside it.  The default is ray_sys_ram_limit() less
+ * a quarter of it, at least 3 GiB and at most half, left to the page cache.
  * ray_heap_set_anon_watermark sets the threshold, as the engine's -m/--mem
  * does; 0 restores the default.  ray_heap_anon_watermark is the threshold
  * in force (0 resolved to the default), and ray_heap_anon_peak the
- * high-water mark of committed anonymous bytes since process start (the
- * peak RAM demanded; spill excluded), as .sys.mem reports them.  On Linux
- * the threshold also bounds, with half the RAM limit, the heap memory
- * locked against swap-out (RAY_HEAP_MLOCK=0 turns locking off). */
+ * high-water mark since process start of the heap's anonymous mappings at
+ * their mapped size (not RSS; spill excluded), as .sys.mem reports them.
+ * On Linux the threshold also bounds, with half the RAM limit, the heap
+ * memory locked against swap-out, on fault and best effort
+ * (RAY_HEAP_MLOCK=0 turns locking off). */
 void     ray_heap_set_anon_watermark(int64_t bytes);
 int64_t  ray_heap_anon_watermark(void);
 int64_t  ray_heap_anon_peak(void);

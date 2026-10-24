@@ -506,17 +506,21 @@ static test_result_t test_public_runtime_destroy_null_is_noop(void) {
 static test_result_t test_public_anon_watermark_setget(void) {
     int64_t previous = ray_heap_anon_watermark();
     ray_heap_set_anon_watermark(INT64_C(1) << 30);
-    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), INT64_C(1) << 30);
+    int64_t set = ray_heap_anon_watermark();
 
     ray_heap_set_anon_watermark(0);                /* 0 = default */
+    int64_t dflt = ray_heap_anon_watermark();
     int64_t limit = ray_sys_ram_limit();
     int64_t room = limit / 4;
     if (room < (INT64_C(3) << 30)) room = INT64_C(3) << 30;
     if (room > limit / 2) room = limit / 2;
     int64_t want = limit - room;
-    TEST_ASSERT_EQ_I(ray_heap_anon_watermark(), want);
 
+    /* Restored before asserting: a failed assert returns early, and the
+     * watermark is process-global, outliving this runtime. */
     ray_heap_set_anon_watermark(previous == want ? 0 : previous);
+    TEST_ASSERT_EQ_I(set, INT64_C(1) << 30);
+    TEST_ASSERT_EQ_I(dflt, want);
     PASS();
 }
 
@@ -524,10 +528,12 @@ static test_result_t test_public_anon_peak(void) {
     int64_t before = ray_heap_anon_peak();
     TEST_ASSERT(before > 0, "a live runtime has committed RAM");
     ray_t* v = ray_vec_new(RAY_I64, 1 << 20);
-    TEST_ASSERT_NOT_NULL(v);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
-    ray_release(v);
-    TEST_ASSERT(ray_heap_anon_peak() >= before, "the peak never falls");
+    bool ok = v && !RAY_IS_ERR(v);
+    if (ok) ray_release(v);
+    else if (v) ray_error_free(v);   /* the caller owns the error */
+    int64_t after = ray_heap_anon_peak();
+    TEST_ASSERT(ok, "an 8 MiB vector allocates");
+    TEST_ASSERT(after >= before, "the peak never falls");
     PASS();
 }
 
