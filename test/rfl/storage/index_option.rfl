@@ -1,8 +1,9 @@
 ;; @requires: posix  (cleanup and byte counts run through a POSIX shell via .sys.exec)
-;; .db.splayed.set {index: false} writes none of the indexes a save builds
+;; .db.splayed.set {index: false} builds none of the indexes a save builds
 ;; on its own (a STR column's dictionary, a numeric column's chunk zone), in
-;; generation 0 or 2; an index the caller attached (.idx.hash) is persisted
-;; either way, and the values read back are the same.
+;; generation 0 or 2.  An index the column already carries — one the caller
+;; attached (.idx.hash), or a chunk zone a loaded column brought from its
+;; file — is persisted either way, and the values read back are the same.
 (.sys.exec "rm -rf /tmp/rf_test_idx_opt") -- 0
 (set n 70000)
 (set i (til n))
@@ -42,6 +43,22 @@
 (.db.splayed.set "/tmp/rf_test_idx_opt/p/2026.01.01/t/" t "/tmp/rf_test_idx_opt/p/.sym" {index: false})
 (count (.db.parted.get "/tmp/rf_test_idx_opt/p" 't)) -- 70000
 (nil? (.idx.info (at (.db.splayed.get "/tmp/rf_test_idx_opt/p/2026.01.01/t/" "/tmp/rf_test_idx_opt/p/.sym") 's))) -- true
+
+;; a loaded column keeps what it brought from its file: the chunk zone and the
+;; hash are written again, in either generation; a dictionary is only ever
+;; built, never carried over, so the loaded STR column is written without one
+(.db.splayed.set "/tmp/rf_test_idx_opt/r0/" A {compress: false index: false})
+(.db.splayed.set "/tmp/rf_test_idx_opt/r2/" C {compress: true index: false})
+(set R0 (.db.splayed.get "/tmp/rf_test_idx_opt/r0/"))
+(set R2 (.db.splayed.get "/tmp/rf_test_idx_opt/r2/"))
+(nil? (.idx.info (at R0 's))) -- true
+(at (.idx.info (at R0 'v)) 'kind) -- 'chunk_zone
+(at (.idx.info (at R0 'h)) 'kind) -- 'hash
+(nil? (.idx.info (at R2 's))) -- true
+(at (.idx.info (at R2 'v)) 'kind) -- 'chunk_zone
+(at (.idx.info (at R2 'h)) 'kind) -- 'hash
+(all (== (at A 'v) (at R2 'v))) -- true
+(all (== (at A 's) (at R0 's))) -- true
 
 ;; true is the default; anything but a bool is refused, as an unknown key is
 (.db.splayed.set "/tmp/rf_test_idx_opt/e/" t {index: true})

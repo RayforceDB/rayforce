@@ -213,7 +213,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
         }
     }
     /* options: compress (true/false), symfile ('shared/'column) and index
-     * (true/false: false writes no automatic dictionary or chunk zone) */
+     * (true/false: false builds no automatic dictionary or chunk zone; an
+     * index the column already carries is written as usual) */
     ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
     for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
         ray_t* k = ray_sym_vec_cell(okeys, i);

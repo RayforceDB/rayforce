@@ -568,8 +568,8 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
                                         bool sym_col) {
     ray_err_t validation = splay_validate_save(tbl, dir, sym_col ? NULL : sym_path);
     if (validation != RAY_OK) return validation;
-    /* the size-gated dictionary and chunk zone; explicit indexes follow
-     * build_indexes alone */
+    /* the size-gated dictionary and chunk zone this save would build; an
+     * index the column already carries follows build_indexes alone */
     bool auto_index = build_indexes && !(write && write->no_auto_index);
     /* Create directory and any missing parents (mkdir -p semantics).
      * Required for partitioned layouts like "/db/2024.01.01/t/" where the
@@ -1531,8 +1531,9 @@ static ray_err_t splay_hash_append(const char* path, ray_t* col) {
  * appends to its own file — so the caller runs one task per column. */
 /* gens: the resolved generation per column, or NULL (all generation 0); a
  * generation-2 file records its index in the enc header and is skipped.
- * auto_index false (the save's index option) builds only the explicit
- * indexes, not the size-gated dictionary or chunk zone. */
+ * auto_index false (the save's index option) builds no size-gated dictionary
+ * or chunk zone; the explicit paths below still run, and a chunk zone the
+ * source column carried was written with its data (ray_col_save). */
 static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                                   const uint8_t* gens, bool auto_index) {
     /* Index policy (compressed-columns PI): no heuristic HASH is persisted
