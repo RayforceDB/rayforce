@@ -92,7 +92,8 @@
 (count (select {from:I394NestedOuter where:(== (last (I394NestedGrouped)) 20)})) -- 2
 
 ;; These issue claims conflict with established Rayfall semantics: `%` is
-;; modulo, dict literals preserve query ASTs, and key(table) returns its schema.
+;; modulo, quoting preserves query ASTs, and key(table) returns its schema.
 (% 7 3) -- 1
-(first (at {a:(list 1 2)} 'a)) -- 'list
+(first (at (quote {a:(list 1 2)}) 'a)) -- 'list
+(first (at {a:(list 1 2)} 'a)) -- 1
 (key (select {s:(sum v) by:x from:I394Q})) -- [x s]
