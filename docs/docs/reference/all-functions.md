@@ -256,7 +256,10 @@ the function once and returns its result directly. Callbacks run left to
 right, exactly once per input element; an error stops the walk. A later type
 mismatch converts the collected prefix to a list without repeating
 callbacks. `scan` and the other iterators keep their existing result-type
-rules.
+rules. This changes callers that relied on every map result being a `LIST`.
+Use `(concat (list) result)` to explicitly box a result for a list-only
+consumer, such as a positional row payload or `raze` joining string fragments.
+`raze` leaves an already typed vector unchanged.
 
 ## Collection Operations { #collection }
 

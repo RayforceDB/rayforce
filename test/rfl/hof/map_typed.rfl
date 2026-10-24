@@ -77,3 +77,8 @@ calls -- (list 0 1 2)
 (set calls (list))
 (map (fn [x] (set calls (concat calls (list x))) (if (== x 1) 'mixed (if (== x 2) (raise "stop") x))) [0 1 2 3]) !- domain
 calls -- (list 0 1 2)
+
+;; Consumers requiring a boxed list must request that representation.
+(type (concat (list) (map (fn [x] (+ x 1)) [1 2]))) -- 'LIST
+(concat (list) (map (fn [x] (+ x 1)) [1 2])) -- (list 2 3)
+(raze (concat (list) (map (fn [x] (format "x%" x)) [1 2]))) -- "x1x2"
