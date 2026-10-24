@@ -10645,6 +10645,39 @@ static test_result_t test_temporal_date_trunc_month_case(void) {
 }
 
 
+/* Private compiler slots keep their positions but are not named bindings.
+ * A named slot between two holes must still receive dynamic LET updates. */
+static test_result_t test_env_scope_private_slots(void) {
+    int64_t named = ray_sym_intern("scope_private_slots_987", 23);
+    int64_t syms[] = { -1, named, -1 };
+    ray_t* slots[] = { ray_i64(17), ray_i64(3), ray_i64(29) };
+    ray_t* first = slots[0];
+    ray_t* last = slots[2];
+    ray_t* update = ray_i64(41);
+    int32_t depth = ray_env_scope_depth();
+    ray_err_t bound = ray_env_scope_bind(syms, 3, slots, NULL, NULL);
+    bool private_hidden = false, named_mapped = false;
+    ray_err_t changed = RAY_ERR_DOMAIN;
+    if (bound == RAY_OK) {
+        private_hidden = ray_env_get_local(-1) == NULL;
+        named_mapped = ray_env_get_local(named) == slots[1];
+        changed = ray_env_set_local(named, update);
+        ray_env_scope_sync(syms, 3, slots);
+    }
+    bool private_unchanged = slots[0] == first && slots[2] == last;
+    bool named_updated = slots[1] == update;
+    bool depth_restored = ray_env_scope_depth() == depth;
+    for (int i = 0; i < 3; i++) ray_release(slots[i]);
+    ray_release(update);
+    /* Assert after cleanup so external counterfactuals leave no live frame. */
+    TEST_ASSERT_EQ_I(bound, RAY_OK);
+    TEST_ASSERT_EQ_I(changed, RAY_OK);
+    TEST_ASSERT_TRUE(private_hidden);
+    TEST_ASSERT_TRUE(named_mapped && named_updated);
+    TEST_ASSERT_TRUE(private_unchanged && depth_restored);
+    PASS();
+}
+
 /* Binding well past the old fixed 64-slot frame in a single scope must
  * still resolve every entry — proves the scope frame grows. */
 static test_result_t test_env_scope_frame_grows(void) {
@@ -10998,6 +11031,7 @@ static test_result_t test_env_write_index_flags_and_capacity(void) {
 const test_entry_t lang_entries[] = {
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
+    { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },

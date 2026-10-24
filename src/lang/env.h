@@ -208,7 +208,9 @@ uint32_t  ray_env_query_serial(void);
  * bind: push a fresh frame and bind syms[i] -> slots[i] (NULL slots —
  * let-locals whose initializer hasn't run yet — are skipped) plus
  * `self` -> self_obj, so a dynamic tree-walk eval inside bytecode
- * resolves the same names the tree-walk fallback would.
+ * resolves the same names the tree-walk fallback would. Negative syms
+ * are private compiler slots: skip them in bind/sync without compacting
+ * the slot-indexed symbol array.
  * sync: write the frame's (possibly let-updated) values back into the
  * slots, then pop the frame. */
 ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,

@@ -1247,7 +1247,8 @@ ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
         (void)ray_env_set_local(g_self_sym, self_obj);
     }
     for (int32_t i = 0; i < n; i++) {
-        if (!slots[i]) continue;
+        /* Keep slot positions, but never name private compiler spills. */
+        if (syms[i] < 0 || !slots[i]) continue;
         ray_err_t e = ray_env_set_local_rows(syms[i], slots[i], rows ? rows[i] : 0);
         if (e != RAY_OK && e != RAY_ERR_RESERVED) {
             ray_env_pop_scope();
@@ -1267,6 +1268,7 @@ void ray_env_scope_sync(const int64_t* syms, int32_t n, ray_t** slots) {
     if (__VM->scope_depth > 0) {
         ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
         for (int32_t i = 0; i < n; i++) {
+            if (syms[i] < 0) continue;
             for (int32_t k = 0; k < f->count; k++) {
                 if (f->keys[k] != syms[i]) continue;
                 if (f->vals[k] != slots[i]) {

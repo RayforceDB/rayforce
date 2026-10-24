@@ -436,10 +436,10 @@ static void compile_sf_while(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n
  *
  * Both helpers are pushed as constant-pool objects rather than
  * resolved by name, so the loop's own arithmetic is invisible to
- * user code and immune to an override of `-` or `>`.  The counter's
- * slot is likewise addressed by index, never by name, and its
- * sym contains a space so no source token can collide with it —
- * which is what keeps nested `times` counters apart.
+ * user code and immune to an override of `-` or `>`.  Private loop
+ * slots are anonymous (-1), addressed only by index and never exported
+ * into a name-keyed eval window.  Distinct slots must not collapse into
+ * one binding when nested loops enter a dynamic special form.
  *
  * As with `while`, compiling the body inline is what keeps
  * `return` unwinding the enclosing lambda from inside the loop.
@@ -463,7 +463,7 @@ static void compile_sf_times(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n
         ray_release(idx_fn);
         islot = find_local(c, iname);
         if (islot < 0) islot = add_local(c, iname);
-        lslot = add_local(c, ray_sym_intern("times lim", 9));
+        lslot = add_local(c, -1);
         if (islot < 0 || lslot < 0 || c->error) { c->error = true; return; }
     }
     ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
@@ -478,7 +478,7 @@ static void compile_sf_times(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n
     int32_t dec_idx  = add_constant(c, dec_fn);
     ray_release(norm_fn);
     ray_release(dec_fn);
-    int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
+    int32_t cslot = add_local(c, -1);
     if (cslot < 0 || c->error) { c->error = true; return; }
 
     /* counter = normalize(<count>), and bound = counter if indexed */
