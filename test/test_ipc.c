@@ -432,7 +432,7 @@ static test_result_t test_ipc_send_list_select_msg(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
     ray_release(setup);
 
-    ray_t* msg = ray_eval_str("(list select {from: t})");
+    ray_t* msg = ray_eval_str("(list select (quote {from: t}))");
     TEST_ASSERT_NOT_NULL(msg);
     TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
 
@@ -480,6 +480,23 @@ static test_result_t test_ipc_send_compiled_lambda_msg(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, -RAY_I64);
     TEST_ASSERT_EQ_I(result->i64, 45);
+    ray_release(result);
+
+    /* A literal in a serialized lambda body must still execute remotely,
+     * rather than becoming a data dict with an unevaluated value list. */
+    msg = ray_eval_str("(list (fn [p] {a: (+ p 1)}) 8)");
+    TEST_ASSERT_NOT_NULL(msg); TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+    result = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_DICT);
+    TEST_ASSERT_FALSE(result->attrs & RAY_DICT_LITERAL);
+    ray_t* key = ray_sym(ray_sym_intern("a", 1));
+    ray_t* value = ray_dict_get(result, key);
+    TEST_ASSERT_NOT_NULL(value);
+    TEST_ASSERT_EQ_I(value->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(value->i64, 9);
+    ray_release(key);
     ray_release(result);
 
     ray_ipc_close(h);

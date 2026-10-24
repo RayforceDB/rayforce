@@ -1,0 +1,96 @@
+;; Ordinary literals evaluate every value, while keeping keys as data.
+(set x 5)
+(at {a: x b: (+ x 1)} 'a) -- 5
+(at {a: x b: (+ x 1)} 'b) -- 6
+(at {x: 'x} 'x) -- 'x
+(at {"x": (+ x 2)} "x") -- 7
+(at {a: 1 "b": (+ x 3)} "b") -- 8
+(count {}) -- 0
+(at (at {a: {b: (+ x 1)}} 'a) 'b) -- 6
+(at {a: missing_literal_name_957} 'a) !- name
+
+;; Locals, parameters, nested closures and repeated calls use live bindings.
+((fn [p] (+ (at {a: p} 'a) 1)) 3) -- 4
+((fn [p] (let x (+ p 1)) (at {a: (+ x p)} 'a)) 3) -- 7
+((fn [p] ((fn [] (at {a: p} 'a)))) 9) -- 9
+(set make_dict (fn [p] {a: p nested: {b: (+ p 1)}}))
+(at (make_dict 1) 'a) -- 1
+(at (make_dict 8) 'a) -- 8
+(at (at (make_dict 8) 'nested) 'b) -- 9
+(set global_dict_value 10)
+(set read_global_dict (fn [] {a: global_dict_value}))
+(at (read_global_dict) 'a) -- 10
+(set global_dict_value 20)
+(at (read_global_dict) 'a) -- 20
+
+;; Explicit eval exercises the interpreter against live lexical bindings.
+((fn [p] (at (eval (quote {a: p b: (+ p 1)})) 'b)) 3) -- 4
+((fn [p] (let d {f: (fn [] p)}) ((at d 'f))) 9) -- 9
+;; Each evaluation gets fresh construction storage and computed values.
+(set make_fresh957 (fn [] {a: (til 3)}))
+(set first957 (make_fresh957))
+(set second957 (make_fresh957))
+(alter 'first957.a set 0 9)
+first957.a -- [9 1 2]
+second957.a -- [0 1 2]
+(at (make_fresh957) 'a) -- [0 1 2]
+
+;; Value forms run in the enclosing function, not an extra eval scope.
+((fn [] {a: (let inside 7) b: (+ inside 1)} inside)) -- 7
+((fn [] (at {a: (let inside 7) b: (+ inside 1)} 'b))) -- 8
+((fn [] {a: (return 7) b: (raise "unreachable")} 99)) -- 7
+((fn [] (try {a: 1 b: (raise "stop")} (fn [e] 12)))) -- 12
+;; Constructor names can be shadowed without changing literal syntax.
+((fn [dict list] (at {a: (+ dict list)} 'a)) 3 4) -- 7
+
+;; Evaluation order is left to right, once, stopping at the first error.
+(set seen (list))
+{a: (set seen (concat seen (list 1))) b: (set seen (concat seen (list 2)))}
+seen -- (list 1 2)
+(set seen (list))
+{a: (set seen (concat seen (list 1))) b: (raise "stop") c: (set seen (concat seen (list 3)))} !- domain
+seen -- (list 1)
+(set seen (list))
+{a: (set seen (concat seen (list 1))) a: (set seen (concat seen (list 2)))}
+seen -- (list 1 2)
+
+;; Quote preserves syntax. Evaluating a runtime data dict does not run lists.
+(at (quote {a: never_bound_957}) 'a) -- 'never_bound_957
+(at (eval (quote {a: (+ x 1)})) 'a) -- 6
+(set data_dict (dict [a] (list (list '+ 1 2))))
+(at (eval data_dict) 'a) -- (list '+ 1 2)
+(at {a: (quote (+ 1 2))} 'a) -- (list '+ 1 2)
+(set literal_dict {a: (quote (+ 1 2))})
+(at (eval literal_dict) 'a) -- (list '+ 1 2)
+;; Lazy values are concrete and reusable after construction.
+(set lazy_dict {a: (first [3 4])})
+(+ lazy_dict.a lazy_dict.a) -- 6
+
+;; Raw query dictionaries and nested specs retain query-context evaluation.
+(set T957 (table [g v] (list [A A B] [1 2 3])))
+(at (select {from: T957 where: (> v 1) out: (+ v 10)}) 'out) -- [12 13]
+(at (select {from: T957 by: {group: g} total: (sum v)}) 'total) -- [3 3]
+(at (update {from: T957 out: (+ v 10)}) 'out) -- [11 12 13]
+(at (window {from: T957 part: [g] funcs: {total: (sum v)}}) 'total) -- [3 3 3]
+((fn [p] (at (select {from: T957 out: (+ v p)}) 'out)) 10) -- [11 12 13]
+(set query957 (quote {from: T957 where: (> v 1) out: (+ v 10)}))
+(at (eval (list select query957)) 'out) -- [12 13]
+
+;; Literal/data distinction survives serialization, including lambda bodies.
+(at (eval (de (ser (quote {a: (+ x 1)})))) 'a) -- 6
+(at (eval (de (ser data_dict))) 'a) -- (list '+ 1 2)
+(at ((de (ser (fn [p] {a: (+ p 1)}))) 8) 'a) -- 9
+(at (eval (de (ser (list select (quote {from: T957 out: (+ v 1)}))))) 'out) -- [2 3 4]
+
+;; Dynamic specs evaluate the client-side splices and defer the source.
+(set threshold957 1)
+(set dynamic957 {from: (list resolve 'T957) where: (list > 'v threshold957) out: (list + 'v 10)})
+(at (eval (de (ser (list select dynamic957)))) 'out) -- [12 13]
+
+;; Construction is not limited by the 64 ordinary-call arguments.
+(set wide_text957 "(fn [p] {")
+(times [i 80] (set wide_text957 (concat wide_text957 (format "k%: (+ p %) " i i))))
+(set wide_text957 (concat wide_text957 "})"))
+(set wide957 (eval (parse wide_text957)))
+(at (wide957 3) 'k79) -- 82
+(count (wide957 3)) -- 80

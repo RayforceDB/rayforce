@@ -165,7 +165,25 @@ Supported *keys* shapes:
 Supported *vals* shapes:
 
 - A typed vector when every value shares one atom type (the form `group` emits — its index columns happen to all be `RAY_I64` vectors held inside a `RAY_LIST`; see below).
-- A `RAY_LIST` when values are heterogeneous, are themselves containers (vectors / dicts / tables / functions), or need to stay unevaluated.  Dict literals always use this shape because the parser leaves expression values unevaluated until probed.
+- A `RAY_LIST` when values are heterogeneous, are themselves containers (vectors / dicts / tables / functions), or need to stay unevaluated.  Parsed dictionary literals hold value syntax in this shape. Ordinary evaluation constructs a fresh dictionary by evaluating each value; querying a dictionary with `at` does not evaluate its stored contents.
+
+In an ordinary expression, literal values evaluate left to right, once, in
+the enclosing scope. `{a: x b: (+ x 1)}` reads `x` and computes the second
+value. Nested literals evaluate recursively; keys remain data. Write a
+literal symbol value quoted, such as `{column: 'CounterID}`. Bare unresolved
+names raise a name error. Empty literals remain empty dictionaries.
+
+`quote` preserves the literal as syntax: `(quote {a: x})` stores the name,
+and `(eval (quote {a: x}))` constructs the dictionary. Dictionaries built as
+runtime data by `dict` or the C API remain self-evaluating, so `eval` does not
+execute arbitrary lists stored in them. Completed literal results are also
+runtime data. Repeated evaluation of the syntax constructs fresh values.
+
+Query special forms receive their arguments unevaluated: `select`, `update`
+and `window` still interpret their literal dictionaries in query context.
+When building an expression payload with an ordinary `list` call, quote a
+static query dictionary to preserve it for that later query evaluation.
+See [IPC expression payloads](../storage/ipc.md#expression-payloads).
 
 The `{…}` literal is the convenient surface but is narrower than the API.  The parser only emits two key shapes:
 

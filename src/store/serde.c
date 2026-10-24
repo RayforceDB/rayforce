@@ -88,7 +88,9 @@
  * down to HAS_NULLS; this covers the aggregate types (LIST/TABLE/DICT/
  * LAMBDA) which historically copied the raw byte.  SORTED is a pure,
  * self-describing marker and is safe to carry.  Applied on BOTH ends so
- * we never emit a dangerous bit and never trust one on input. */
+ * we never emit a dangerous bit and never trust one on input. DICT also
+ * preserves its pointer-free RAY_DICT_LITERAL syntax bit below; no other
+ * type admits that bit through this exception. */
 #define RAY_SERDE_ATTR_WIRE_MASK ((uint8_t)(RAY_ATTR_HAS_NULLS | RAY_ATTR_SORTED))
 /* Lambdas reuse the attr byte for function-internal flags: 0x40 is
  * RAY_FN_COMPILED, not "has nulls".  Only params/body cross the wire, so
@@ -1017,7 +1019,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_DICT: {
-        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        /* Preserve syntax when a quoted query or lambda body crosses IPC. */
+        buf[0] = obj->attrs & (RAY_SERDE_ATTR_WIRE_MASK | RAY_DICT_LITERAL);
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);
@@ -1515,7 +1518,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return dict;
         }
         dict->type = RAY_DICT;
-        dict->attrs = dict_attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        dict->attrs = dict_attrs & (RAY_SERDE_ATTR_WIRE_MASK | RAY_DICT_LITERAL);
         dict->len = 2;
         ((ray_t**)ray_data(dict))[0] = keys;
         ((ray_t**)ray_data(dict))[1] = vals;   /* not-a-table */

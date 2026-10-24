@@ -42,6 +42,10 @@
                                       args. Without this flag, dispatcher
                                       forces concrete args. */
 
+/* RAY_DICT syntax node: ordinary evaluation constructs its values. Runtime
+ * dicts have this bit clear. Pointer-free and safe to preserve over IPC. */
+#define RAY_DICT_LITERAL 0x01
+
 /* AST name flag (distinguishes symbol literal from variable reference) */
 #define ATTR_QUOTED  0x20  /* -RAY_SYM atom with this flag SET = quoted/literal symbol;
                               CLEAR (default) = name reference, resolved at eval. */
@@ -123,6 +127,8 @@ enum {
     OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
     OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
                        * of that kind, OP_CALLF's general call otherwise */
+    OP_DICT_NEW,      /* pop literal keys; push a fresh dict with null slots */
+    OP_DICT_PUT,      /* pop value into TOS dict's slot (2-byte index) */
     OP__COUNT
 };
 

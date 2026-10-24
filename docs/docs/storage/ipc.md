@@ -138,19 +138,19 @@ An optional third argument sets a deadline in milliseconds: `(.ipc.send h "(+ 1 
 
 #### Expression payloads
 
-Non-string values are evaluated directly on the server via `ray_eval`. Construct executable expressions as lists with builtin function objects as heads. Dict literals are self-evaluating, so column references and expressions inside them are preserved unevaluated until the server processes them:
+Non-string values are evaluated directly on the server via `ray_eval`. Construct executable expressions as lists with builtin function objects as heads. Ordinary dictionary literals evaluate their values, so quote static query dictionaries to preserve their names and expressions for server-side resolution:
 
 ```text
 ;; Arithmetic
 (.ipc.send h (list + 1 2))
 ;; => 3
 
-;; Select with filter — dict stays unevaluated, select resolves columns
-(.ipc.send h (list select {from: trades where: (> price 200)}))
+;; Quoted query syntax is interpreted by select on the server
+(.ipc.send h (list select (quote {from: trades where: (> price 200)})))
 ;; => filtered trades table
 
 ;; Aggregation by group
-(.ipc.send h (list select {from: trades by: sym total: (sum qty)}))
+(.ipc.send h (list select (quote {from: trades by: sym total: (sum qty)})))
 
 ;; Map a lambda over server-side data
 (.ipc.send h (list map (fn [x] (* x 2)) (list til 10)))
@@ -161,11 +161,16 @@ For dynamic queries, substitute values into the dict at construction time:
 
 ```text
 (set threshold 200)
-(.ipc.send h (list select {from: trades where: (list > (quote price) threshold)}))
+(.ipc.send h (list select {from: (list resolve 'trades) where: (list > 'price threshold)}))
 ;; => trades where price > 200
 ```
 
-The query is assembled as data: while the `(list ...)` is built, `(quote price)` evaluates to the literal symbol `'price`, so the predicate becomes `(> 'price threshold)`. A literal symbol that names a from-table column resolves to that column during query evaluation, so `'price` resolves to the `price` column. Writing the tick form `'price`, or a bare `price`, works the same way.
+The dynamic dictionary evaluates on the client, splicing `threshold` into
+its predicate expression. Its `from:` value is an expression that resolves
+`trades` on the server. Quoted `'price` names a column when that predicate
+runs in query context; bare `price` here would read a client-side binding.
+The static examples quote the entire dictionary instead of constructing
+its values locally.
 
 ### .ipc.close
 

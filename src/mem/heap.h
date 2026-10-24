@@ -52,6 +52,7 @@
  *
  *   Bits 0x01-0x03  RAY_SYM vectors:  sym index width (RAY_SYM_W8/W16/W32/W64)
  *   Bits 0x01-0x10  function objects (RAY_UNARY/BINARY/VARY): RAY_FN_* flags
+ *   Bit  0x01       RAY_DICT:        RAY_DICT_LITERAL (parsed value syntax, not runtime data)
  *   Bit  0x01       -RAY_STR atoms:  RAY_ATTR_STR_CELL (a string column's cell bound for a row)
  *   Bit  0x02       -RAY_I64 atoms:  RAY_ATTR_GRAPH (ray_rel_t* CSR handle in .i64)
  *   Bit  0x04       -RAY_I64 atoms:  RAY_ATTR_HNSW (HNSW handle in .i64)
