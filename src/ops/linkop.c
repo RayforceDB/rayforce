@@ -64,8 +64,8 @@ ray_t* ray_link_attach(ray_t** vp, int64_t target_sym_id) {
      * non-parted dim). */
     int64_t tcols = ray_table_ncols(target);
     for (int64_t c = 0; c < tcols; c++) {
-        ray_t* tcol = ray_table_get_col_idx(target, c);
-        if (tcol && RAY_IS_PARTED(tcol->type))
+        ray_col_meta_t tm;
+        if (ray_table_col_meta_idx(target, c, &tm) && RAY_IS_PARTED(tm.type))
             return ray_error("nyi",
                 "link: target table has a parted column (%d); "
                 "link targets must be non-parted (in-memory or splayed) tables",
@@ -151,15 +151,16 @@ ray_t* ray_link_deref(ray_t* v, int64_t sym_id) {
      * list of segment pointers — straight-byte indexing is meaningless). */
     int64_t tcols = ray_table_ncols(target_tab);
     for (int64_t c = 0; c < tcols; c++) {
-        ray_t* tcol = ray_table_get_col_idx(target_tab, c);
-        if (tcol && RAY_IS_PARTED(tcol->type))
+        ray_col_meta_t tm;
+        if (ray_table_col_meta_idx(target_tab, c, &tm) && RAY_IS_PARTED(tm.type))
             return ray_error("nyi",
                 "link deref: target table has a parted column (%d); "
                 "links to parted dim tables are not supported in v1",
                 (int)c);
     }
 
-    ray_t* target_col = ray_table_get_col(target_tab, sym_id);
+    ray_t* target_col = ray_table_col(target_tab, sym_id);
+    if (target_col && RAY_IS_ERR(target_col)) return target_col;
     if (!target_col) return NULL;
 
     int64_t n = v->len;
@@ -246,7 +247,7 @@ ray_t* ray_link_deref(ray_t* v, int64_t sym_id) {
                 if (ray_vec_is_null(result, i)) d[i] = NULL_F64;
             break;
         }
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
             int64_t* d = (int64_t*)ray_data(result);
             for (int64_t i = 0; i < n; i++)
                 if (ray_vec_is_null(result, i)) d[i] = NULL_I64;

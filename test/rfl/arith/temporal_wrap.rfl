@@ -1,0 +1,29 @@
+;; DATE and TIME are 32-bit, in vectors and atoms alike.  A result past that
+;; range keeps its low 32 bits, as a vector cell does, so an atom prints,
+;; compares, converts and adds with the same value it would hold in a vector
+;; (#876).
+
+;; TIME: 25 days of milliseconds is past 2^31
+(set p (* 25 24:00:00.000))
+(type p) -- 'time
+(as 'I64 p) -- -2134967296
+(+ 2024.01.01D00:00:00.000 p) -- 2023.12.07D06:57:12.704000000
+(== (+ 2024.01.01D00:00:00.000 p) (at (+ 2024.01.01D00:00:00.000 (enlist p)) 0)) -- true
+(== p (at (enlist p) 0)) -- true
+(> p 24:00:00.000) -- false
+(* 100 24:00:00.000) -- 13:54:25.408
+(== (as 'TIME 5000000000) (at (as 'TIME [5000000000]) 0)) -- true
+
+;; (A wrap onto the null sentinel is left out: whether a vector cell holding it
+;; reads as null depends on HAS_NULLS, the question of #841.)
+
+;; DATE: 3e9 days is past 2^31.  Only atom-vector agreement is pinned: what
+;; an operand or cast out of range should become is a separate question.
+(set d (+ 2000.01.01 3000000000))
+(== d (at (+ (enlist 2000.01.01) 3000000000) 0)) -- true
+
+;; in range, nothing changes
+(* 2 12:00:00.000) -- 24:00:00.000
+(+ 2024.01.01D00:00:00.000 48:00:00.000) -- 2024.01.03D00:00:00.000000000
+(as 'TIME 2147483647) -- (at (as 'TIME [2147483647]) 0)
+(+ 2024.01.31 1) -- 2024.02.01

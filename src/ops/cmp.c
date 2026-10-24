@@ -84,6 +84,7 @@ static inline int both_int_atoms(const ray_t* a, const ray_t* b) {
 
 /* Comparison */
 ray_t* ray_gt_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_GT, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c > 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) > 0 ? 1 : 0);
@@ -107,6 +108,7 @@ ray_t* ray_gt_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_lt_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_LT, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c < 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) < 0 ? 1 : 0);
@@ -129,6 +131,7 @@ ray_t* ray_lt_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_gte_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_GE, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c >= 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) >= 0 ? 1 : 0);
@@ -152,6 +155,7 @@ ray_t* ray_gte_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_LE, a, b);
     { int c; if (char_str_cmp(a, b, &c) == 0) return make_bool(c <= 0 ? 1 : 0); }
     if (a->type == -RAY_SYM && b->type == -RAY_SYM)
         return make_bool(sym_atom_cmp(a, b) <= 0 ? 1 : 0);
@@ -174,28 +178,65 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
     return make_bool(as_f64(a) <= as_f64(b) ? 1 : 0);
 }
 
+/* Rank of a numeric atom type in the promotion order min/max use, or -1. */
+static int minmax_rank(int8_t t) {
+    switch (t) {
+    case -RAY_BOOL: return 0;
+    case -RAY_U8:   return 1;
+    case -RAY_I16:  return 2;
+    case -RAY_I32:  return 3;
+    case -RAY_I64:  return 4;
+    case -RAY_F32:  return 5;
+    case -RAY_F64:  return 6;
+    default:        return -1;
+    }
+}
+
+/* The atom type the result of (min a b) / (max a b) takes: the wider of
+ * two numeric types (BOOL < U8 < I16 < I32 < I64 < F32 < F64), or
+ * TIMESTAMP for a DATE against a TIMESTAMP, so an integer against a float
+ * is a float and a boolean against an integer an integer.  0 when the
+ * types already agree or no promotion applies. */
+static int8_t minmax_type(ray_t* a, ray_t* b) {
+    if (a->type == b->type) return 0;
+    int ra = minmax_rank(a->type), rb = minmax_rank(b->type);
+    if (ra >= 0 && rb >= 0) return ra > rb ? a->type : b->type;
+    if ((a->type == -RAY_DATE && b->type == -RAY_TIMESTAMP) ||
+        (a->type == -RAY_TIMESTAMP && b->type == -RAY_DATE))
+        return -RAY_TIMESTAMP;
+    return 0;
+}
+
+/* `x` as an atom of type `t` (from minmax_type); a null stays null. */
+static ray_t* minmax_promote(ray_t* x, int8_t t) {
+    if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(t);
+    if (t == -RAY_TIMESTAMP) return ray_timestamp(temporal_as_ns(x));
+    if (t == -RAY_F64) return make_f64(as_f64(x));
+    if (t == -RAY_F32) return ray_f32((float)as_f64(x));
+    int64_t v = x->type == -RAY_BOOL ? (int64_t)(x->b8 != 0) : as_i64(x);
+    return make_typed_int(t, v);
+}
+
 /* Elementwise dyadic overloads for the aggregate names `min` and `max`.
- * Their vectorization is supplied by the evaluator, just like comparisons. */
-ray_t* ray_min2_fn(ray_t* a, ray_t* b) {
-    ray_t* cmp = ray_lte_fn(a, b);
+ * Their vectorization is supplied by the evaluator, just like comparisons.
+ * The result takes the promoted type of the two operands (minmax_type),
+ * whichever of them is chosen. */
+static ray_t* minmax_pick(ray_t* a, ray_t* b, ray_t* cmp) {
     if (!cmp || RAY_IS_ERR(cmp)) return cmp ? cmp : ray_error("oom", NULL);
     ray_t* out = cmp->b8 ? a : b;
-    ray_retain(out);
     ray_release(cmp);
+    int8_t t = minmax_type(a, b);
+    if (t && out->type != t) return minmax_promote(out, t);
+    ray_retain(out);
     return out;
 }
 
-ray_t* ray_max2_fn(ray_t* a, ray_t* b) {
-    ray_t* cmp = ray_gte_fn(a, b);
-    if (!cmp || RAY_IS_ERR(cmp)) return cmp ? cmp : ray_error("oom", NULL);
-    ray_t* out = cmp->b8 ? a : b;
-    ray_retain(out);
-    ray_release(cmp);
-    return out;
-}
+ray_t* ray_min2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_lte_fn(a, b)); }
+ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, b)); }
 
 
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_EQ, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
     int na = RAY_ATOM_IS_NULL(a), nb = RAY_ATOM_IS_NULL(b);
@@ -218,6 +259,7 @@ ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_NE, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
     int na = RAY_ATOM_IS_NULL(a), nb = RAY_ATOM_IS_NULL(b);
@@ -267,27 +309,74 @@ ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
     return r;                                              \
 } while(0)
 
+/* and/or with a collection operand that is not a BOOL vector — a LIST, or
+ * a numeric or temporal vector: element by element, never one truth value
+ * for the whole collection.  Each pair goes back
+ * through `fn`, so a nested list recurses, and a result whose elements
+ * are all booleans is a B8 vector.  An atom broadcasts; two collections
+ * must have the same length. */
+static ray_t* logic_map(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b) {
+    int ac = is_collection(a), bc = is_collection(b);
+    if (ac && bc && ray_len(a) != ray_len(b))
+        return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
+                         name, (long long)ray_len(a), (long long)ray_len(b));
+    int64_t n = ac ? ray_len(a) : ray_len(b);
+    ray_t* out = ray_list_new(n > 0 ? n : 1);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < n; i++) {
+        int la = 0, lb = 0;
+        ray_t* ea = ac ? collection_elem(a, i, &la) : a;
+        ray_t* eb = bc ? collection_elem(b, i, &lb) : b;
+        ray_t* r = (RAY_IS_ERR(ea) || RAY_IS_ERR(eb))
+                 ? ray_error("type", NULL) : fn(ea, eb);
+        if (la) ray_release(ea);
+        if (lb) ray_release(eb);
+        if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
+        out = ray_list_append(out, r);
+        ray_release(r);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    if (n == 0) { ray_release(out); return ray_vec_new(RAY_BOOL, 0); }
+    return ray_list_collapse_bool(out);
+}
+
+static inline bool is_bool_vec(ray_t* x) {
+    return ray_is_vec(x) && x->type == RAY_BOOL;
+}
+
 ray_t* ray_and_fn(ray_t* a, ray_t* b) {
     /* Element-wise for bool vectors */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (is_bool_vec(a) && is_bool_vec(b)) {
+        if (a->len != b->len)
+            return ray_error("length", "and: operand lengths must match, got %lld and %lld",
+                             (long long)a->len, (long long)b->len);
         BOOL_VEC_BINOP(a, b, &);
+    }
     /* Scalar broadcast: vec and scalar */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_atom(b))
+    if (is_bool_vec(a) && ray_is_atom(b))
         BOOL_VEC_SCALAR_L(a, is_truthy(b), &&);
-    if (ray_is_atom(a) && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (ray_is_atom(a) && is_bool_vec(b))
         BOOL_VEC_SCALAR_L(b, is_truthy(a), &&);
+    if (is_collection(a) || is_collection(b))
+        return logic_map(ray_and_fn, "and", a, b);
     return make_bool((is_truthy(a) && is_truthy(b)) ? 1 : 0);
 }
 
 ray_t* ray_or_fn(ray_t* a, ray_t* b) {
     /* Element-wise for bool vectors */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (is_bool_vec(a) && is_bool_vec(b)) {
+        if (a->len != b->len)
+            return ray_error("length", "or: operand lengths must match, got %lld and %lld",
+                             (long long)a->len, (long long)b->len);
         BOOL_VEC_BINOP(a, b, |);
+    }
     /* Scalar broadcast */
-    if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_atom(b))
+    if (is_bool_vec(a) && ray_is_atom(b))
         BOOL_VEC_SCALAR_L(a, is_truthy(b), ||);
-    if (ray_is_atom(a) && ray_is_vec(b) && b->type == RAY_BOOL)
+    if (ray_is_atom(a) && is_bool_vec(b))
         BOOL_VEC_SCALAR_L(b, is_truthy(a), ||);
+    if (is_collection(a) || is_collection(b))
+        return logic_map(ray_or_fn, "or", a, b);
     return make_bool((is_truthy(a) || is_truthy(b)) ? 1 : 0);
 }
 
@@ -400,6 +489,23 @@ ray_t* ray_not_fn(ray_t* x) {
         }
         r->len = n;
         return r;
+    }
+    /* A LIST, element by element: a nested list recurses, and all-boolean
+     * results make a B8 vector. */
+    if (is_list(x)) {
+        int64_t n = ray_len(x);
+        if (n == 0) return ray_vec_new(RAY_BOOL, 0);
+        ray_t* out = ray_list_new(n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        ray_t** e = (ray_t**)ray_data(x);
+        for (int64_t i = 0; i < n; i++) {
+            ray_t* r = ray_not_fn(e[i]);
+            if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
+            out = ray_list_append(out, r);
+            ray_release(r);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        }
+        return ray_list_collapse_bool(out);
     }
     return make_bool(is_truthy(x) ? 0 : 1);
 }

@@ -1,0 +1,86 @@
+;; Dyadic min/max remain row expressions; only unary calls reduce.
+(set M971 (table [k x y] (list ['A 'A 'B 'B 'C] [1 5 3 8 9] [4 2 6 7 0])))
+(min (at M971 'x) (at M971 'y)) -- [1 2 3 7 0]
+(max (at M971 'x) (at M971 'y)) -- [4 5 6 8 9]
+(at (select {r: (min x y) from: M971}) 'r) -- [1 2 3 7 0]
+(at (select {r: (max x y) from: M971}) 'r) -- [4 5 6 8 9]
+(count (select {r: (min x y) from: M971})) -- 5
+(type (at (select {r: (min x y) from: M971}) 'r)) -- 'I64
+(at (select {r: (min x) from: M971}) 'r) -- [1]
+(at (select {r: (max x) from: M971}) 'r) -- [9]
+(at (select {r: (min x 2) from: M971}) 'r) -- [1 2 2 2 2]
+(at (select {r: (min 2 x) from: M971}) 'r) -- [1 2 2 2 2]
+(at (select {r: (max x 2) from: M971}) 'r) -- [2 5 3 8 9]
+(at (select {r: (max 2 x) from: M971}) 'r) -- [2 5 3 8 9]
+(at (select {r: (+ 10 (min x y)) from: M971}) 'r) -- [11 12 13 17 10]
+(at (select {r: (sum (min x y)) from: M971}) 'r) -- [13]
+(at (select {r: (sum (max x y)) from: M971}) 'r) -- [32]
+(at (select {r: (min (sum x) (sum y)) from: M971}) 'r) -- [19]
+(at (select {r: (max (sum x) (sum y)) from: M971}) 'r) -- [26]
+;; Multi-row groups distinguish pointwise LIST cells from reducing atoms.
+(set G971 (select {r: (min x y) from: M971 by: k asc: k}))
+(at G971 'r) -- (list [1 2] [3 7] [0])
+(type (at G971 'r)) -- 'LIST
+(type (at (at G971 'r) 0)) -- 'I64
+(at (select {r: (max x y) from: M971 by: k asc: k}) 'r) -- (list [4 5] [6 8] [9])
+(at (select {r: (sum (min x y)) from: M971 by: k asc: k}) 'r) -- [3 10 0]
+(at (select {r: (sum (max x y)) from: M971 by: k asc: k}) 'r) -- [9 14 9]
+(at (select {r: (min (sum x) (sum y)) from: M971 by: k asc: k}) 'r) -- [6 11 0]
+(at (select {r: (max (sum x) (sum y)) from: M971 by: k asc: k}) 'r) -- [6 13 9]
+;; Selection/order/take do not silently turn a dyadic call into a reduction.
+(at (select {r: (min x y) from: M971 where: (> x 3)}) 'r) -- [2 7 0]
+(at (select {r: (sum (min x y)) from: M971 where: (> x 3)}) 'r) -- [9]
+(at (select {r: (min x y) from: M971 desc: x take: 2}) 'r) -- [0 7]
+;; Binary calls use row-output aliases; unary aggregates retain source scope.
+(at (select {x: (+ x 100) r: (min x y) from: M971}) 'r) -- [4 2 6 7 0]
+;; Preserve language null-low ordering, notably max(null,1)=1.
+(set N971 (table [x y] (list [0Nl 3 0Nl 2] [1 0Nl 0Nl 5])))
+(at (select {r: (min x y) from: N971}) 'r) -- [0Nl 0Nl 0Nl 2]
+(at (select {r: (max x y) from: N971}) 'r) -- [1 3 0Nl 5]
+(at (select {r: (min x 1.5) from: M971}) 'r) -- [1.0 1.5 1.5 1.5 1.5]
+(count (select {r: (min x y) from: M971 where: (< x 0)})) -- 0
+
+;; Mixed reducing/row outputs and an alias also exercise unary fallback admission.
+(set Q971 (select {n: (count x) r: (min x y) from: M971 by: k asc: k}))
+(at Q971 'n) -- [2 2 1]
+(at Q971 'r) -- (list [1 2] [3 7] [0])
+(set FMIN971 min)
+(at (select {n: (count x) r: (FMIN971 x y) from: M971 by: k asc: k}) 'r) -- (list [1 2] [3 7] [0])
+
+;; Arithmetic over earlier group scalars is not reducer nesting.
+(at (select {a: (sum x) b: (sum y) r: (min a b) from: M971 by: k asc: k}) 'r) -- [6 11 0]
+(at (select {a: (sum x) b: (sum y) r: (max a b) from: M971 by: k asc: k}) 'r) -- [6 13 9]
+
+;; Repeated compiled caller and existing UPDATE path retain dyadic semantics.
+(set MF971 (fn [t] (select {r: (min x y) from: t})))
+(at (MF971 M971) 'r) -- [1 2 3 7 0]
+(at (MF971 M971) 'r) -- [1 2 3 7 0]
+(at (update {r: (max x y) from: M971}) 'r) -- [4 5 6 8 9]
+;; Invalid arities must not manufacture a reduction from the first argument.
+(select {r: (min) from: M971}) !- arity
+(select {r: (max) from: M971}) !- arity
+(select {r: (min x y 0) from: M971}) !- arity
+(select {r: (max x y 0) from: M971 by: k}) !- arity
+;; These really are nested reductions and remain errors.
+(select {r: (sum (min x)) from: M971 by: k}) !- domain
+(select {a: (sum x) r: (min a) from: M971 by: k}) !- domain
+
+;; An earlier group alias still cannot mix with source rows.
+(select {n: (count x) r: (min y n) from: M971 by: k}) !- domain
+;; A literal reducer can broadcast inside its group, like existing +/lambda calls.
+(at (select {r: (min (sum x) y) from: M971 by: k asc: k}) 'r) -- (list [4 2] [6 7] [0])
+(at (select {r: (max (sum x) y) from: M971 by: k asc: k}) 'r) -- (list [6 6] [11 11] [9])
+
+;; Scalar-only and lexical vectors retain their original row/rank contracts.
+(at (select {r: (min 1 2) from: M971}) 'r) -- [1 1 1 1 1]
+(set LOCAL971 (fn [x] (at (select {r: (min x y) from: M971}) 'r)))
+(LOCAL971 [1 2]) -- (list [1 2] [1 2] [1 2] [1 2] [0 0])
+(set CAPTURE971 ((fn [x] (fn [] (at (select {r: (max x y) from: M971}) 'r))) [1 2]))
+(CAPTURE971) -- (list [4 4] [2 2] [6 6] [7 7] [1 2])
+(set HEAD971 (fn [min] (at (select {r: (min x y) from: M971}) 'r)))
+(HEAD971 (fn [a b] (list a b))) -- (list (list 1 4) (list 5 2) (list 3 6) (list 8 7) (list 9 0))
+
+;; Result null metadata must remain usable by downstream consumers.
+(where (nil? (at (select {r: (min x y) from: N971}) 'r))) -- [0 1 2]
+(where (nil? (at (select {r: (max x y) from: N971}) 'r))) -- [2]
+(count (where (nil? (at (select {r: (min 0Nl x) from: M971}) 'r)))) -- 5

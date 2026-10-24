@@ -3,7 +3,7 @@
 ;; path (review of #690, second pass).
 ;;
 ;; The eval fallback evaluated the expression once with whole columns bound.
-;; The interpreter's `if` tests one truth value, so `(if (> i 2) 1 (- ts ts))`
+;; The interpreter's `if` tests one truth value, so `(if (> i 2) 1 (as 'I64 (- ts ts)))`
 ;; wrote the then-branch to every row; a column of the wrong length was added
 ;; unchecked (ragged table); `update by:` took the column type from the first
 ;; group and cast the rest; and a misspelt column reported `name` instead of
@@ -24,38 +24,38 @@
 (update {i: (list 1 2) from: t where: (> i 1)}) !- length
 ;; a constant / reduced expression still broadcasts
 (at (update {n: 7 from: t}) 'n) -- [7 7 7 7 7]
-(at (update {n: (max (- ts ts)) from: t}) 'n) -- [0 0 0 0 0]
+(at (update {n: (max (as 'I64 (- ts ts))) from: t}) 'n) -- [0 0 0 0 0]
 (at (update {n: (max (+ i 1)) from: t}) 'n) -- [6 6 6 6 6]
 
 ;; ─── 2. `if` over a temporal expression is per row, as in select ────────────
-(at (select {x: (if (> i 2) 1 (- ts ts)) from: t}) 'x) -- [0 0 1 1 1]
-(at (update {x: (if (> i 2) 1 (- ts ts)) from: t}) 'x) -- [0 0 1 1 1]
-(at (update {i: (if (> i 2) 1 (- ts ts)) from: t}) 'i) -- [0 0 1 1 1]
-(at (update {x: (if (> i 2) 1 (- ts ts)) from: t where: (> i 1)}) 'x) -- [0Nl 0 1 1 1]
-(at (update {i: (if (> i 2) 1 (- ts ts)) from: t where: (> i 1)}) 'i) -- [1 0 1 1 1]
+(at (select {x: (if (> i 2) 1 (as 'I64 (- ts ts))) from: t}) 'x) -- [0 0 1 1 1]
+(at (update {x: (if (> i 2) 1 (as 'I64 (- ts ts))) from: t}) 'x) -- [0 0 1 1 1]
+(at (update {i: (if (> i 2) 1 (as 'I64 (- ts ts))) from: t}) 'i) -- [0 0 1 1 1]
+(at (update {x: (if (> i 2) 1 (as 'I64 (- ts ts))) from: t where: (> i 1)}) 'x) -- [0Nl 0 1 1 1]
+(at (update {i: (if (> i 2) 1 (as 'I64 (- ts ts))) from: t where: (> i 1)}) 'i) -- [1 0 1 1 1]
 ;; under by: the compiled path is per row within the group; the fallback too
 (at (update {x: (if (> i 2) 1 (- i i)) by: k from: t}) 'x) -- [0 0 1 1 1]
-(at (update {x: (if (> i 2) 1 (- ts ts)) by: k from: t}) 'x) -- [0 0 1 1 1]
+(at (update {x: (if (> i 2) 1 (as 'I64 (- ts ts))) by: k from: t}) 'x) -- [0 0 1 1 1]
 ;; a reduced expression under by: is still one value per group
-(at (update {m: (max (- ts ts)) by: k from: t}) 'm) -- [0 0 0 0 0]
+(at (update {m: (max (as 'I64 (- ts ts))) by: k from: t}) 'm) -- [0 0 0 0 0]
 (at (update {m: (max (+ i 1)) by: k from: t}) 'm) -- [3 3 6 6 6]
 
 ;; an `if` whose condition mixes a row column with an aggregate cannot be
 ;; evaluated per row (the aggregate would see one cell); it stays an error
 ;; until the fallback can reduce aggregates first (#692)
 (update {x: (if (> i (avg i)) (+ ts 1) ts) from: t}) !- nyi
-(update {i: (if (> i (avg i)) 1 (- ts ts)) from: t where: (> i 1)}) !- nyi
+(update {i: (if (> i (avg i)) 1 (as 'I64 (- ts ts))) from: t where: (> i 1)}) !- nyi
 (update {x: (if (> i (avg i)) (+ ts 1) ts) by: k from: t}) !- nyi
 ;; an aggregate over a literal or a global is the same on every row: fine
-(at (update {x: (if (> i 2) (count [1 2 3]) (- ts ts)) from: t}) 'x) -- [0 0 3 3 3]
+(at (update {x: (if (> i 2) (count [1 2 3]) (as 'I64 (- ts ts))) from: t}) 'x) -- [0 0 3 3 3]
 (set GL [1 2 3 4])
-(at (update {x: (if (> i 2) (count GL) (- ts ts)) from: t}) 'x) -- [0 0 4 4 4]
+(at (update {x: (if (> i 2) (count GL) (as 'I64 (- ts ts))) from: t}) 'x) -- [0 0 4 4 4]
 
 ;; ─── 3. update by: with group results of differing types ────────────────────
 (set g (table [k ts tm i] (list [a a b c c c] (+ 2024.01.01D00:00:00.000000000 (* 10 (til 6))) (as 'TIME (* 1000 (til 6))) [1 2 3 4 5 6])))
 (at (update {m: (if (> (count i) 1) (max (- i i)) 2.5) by: k from: g}) 'm) -- [0.0 0.0 2.5 0.0 0.0 0.0]
-(at (update {m: (if (> (count i) 1) (max (- ts ts)) 2.5) by: k from: g}) 'm) -- [0.0 0.0 2.5 0.0 0.0 0.0]
-(type (at (update {m: (if (> (count i) 1) (max (- ts ts)) 2.5) by: k from: g}) 'm)) -- 'F64
+(at (update {m: (if (> (count i) 1) (max (as 'I64 (- ts ts))) 2.5) by: k from: g}) 'm) -- [0.0 0.0 2.5 0.0 0.0 0.0]
+(type (at (update {m: (if (> (count i) 1) (max (as 'I64 (- ts ts))) 2.5) by: k from: g}) 'm)) -- 'F64
 ;; a TIMESTAMP cannot be written into a TIME column: reject, do not cast
 (update {m: (if (> (count i) 1) (max (+ tm 0)) (max (+ ts 0))) by: k from: g}) !- type
 

@@ -1,0 +1,16 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; reverse and row selection by index vector over a parted table: the
+;; parted columns are flattened and the MAPCOMMON partition key expanded
+;; before the gather, so rows come back reversed instead of failing in
+;; the allocator.
+(.sys.exec "rm -rf /tmp/rfl_reverse_parted")
+(.db.splayed.set "/tmp/rfl_reverse_parted/2024.01.01/t/" (table [a s] (list [1 2] [x y])) "/tmp/rfl_reverse_parted/.sym")
+(.db.splayed.set "/tmp/rfl_reverse_parted/2024.01.02/t/" (table [a s] (list [3 4 5] [z w v])) "/tmp/rfl_reverse_parted/.sym")
+(set _rp (.db.parted.get "/tmp/rfl_reverse_parted/" 't))
+(count (reverse _rp)) -- 5
+(at (reverse _rp) 'a) -- [5 4 3 2 1]
+(at (reverse _rp) 's) -- ['v 'w 'z 'y 'x]
+(at (reverse _rp) 'date) -- [2024.01.02 2024.01.02 2024.01.02 2024.01.01 2024.01.01]
+(at (reverse (reverse _rp)) 'a) -- [1 2 3 4 5]
+(at (at _rp [4 0 2]) 'a) -- [5 1 3]
+(at (at _rp [4 0 2]) 'date) -- [2024.01.02 2024.01.01 2024.01.02]

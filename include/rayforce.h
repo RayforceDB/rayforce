@@ -87,6 +87,8 @@ const char* ray_git_commit(void);
 #define RAY_SYM       12
 /* Variable-length string column (inline + pool) */
 #define RAY_STR       13
+/* Signed nanosecond duration; 14/15 belong to internal selection/encoded columns. */
+#define RAY_TIMESPAN  16
 
 /* Compound types */
 #define RAY_INDEX     97   /* Accelerator index attached to a vector (see ops/idxop.h) */
@@ -120,7 +122,8 @@ typedef enum {
     RAY_ERR_NAME,
     RAY_ERR_LIMIT,
     RAY_ERR_RESERVED,
-    RAY_ERR_VERSION
+    RAY_ERR_VERSION,
+    RAY_ERR_FPENV                 /* unsupported floating-point controls */
 } ray_err_t;
 
 #define RAY_IS_ERR(p)    ((p) != NULL && (uintptr_t)(p) > 31 && ((ray_t*)(p))->type == RAY_ERROR)
@@ -254,7 +257,8 @@ extern ray_t __ray_null;
 extern ray_t __ray_oom;
 #define RAY_OOM_OBJ   (&__ray_oom)
 
-/* Error object creation (defined in core/runtime.c) */
+/* Error object creation (defined in core/runtime.c). With fmt == NULL,
+ * "fpenv" supplies a default explanatory message; other codes clear it. */
 ray_t* ray_error(const char* code, const char* fmt, ...);
 const char* ray_err_code_str(ray_err_t e);
 ray_err_t ray_err_from_obj(ray_t* err);
@@ -264,6 +268,10 @@ const char* ray_err_code(ray_t* err);
  * reference and want the block reclaimed must use this helper instead —
  * otherwise the error leaks until heap teardown. */
 void ray_error_free(ray_t* err);
+/* Thread-local message of the last error made on this thread (NULL when
+ * empty), and clearing it. */
+const char* ray_error_msg(void);
+void        ray_error_clear(void);
 
 /* ===== Accessor Macros ===== */
 
@@ -271,11 +279,14 @@ void ray_error_free(ray_t* err);
 
 #define ray_type(v)       ((v)->type)
 #define ray_is_atom(v)    ((v)->type < 0 || (v)->type >= RAY_LAMBDA)
-#define ray_is_vec(v)     ((v)->type >= RAY_BOOL && (v)->type <= RAY_STR)
+static inline bool ray_is_vector_type(int8_t type) {
+    return (type >= RAY_BOOL && type <= RAY_STR) || type == RAY_TIMESPAN;
+}
+#define ray_is_vec(v)     ray_is_vector_type((v)->type)
 #define ray_len(v)        ((v)->len)
 
 /* Element type sizes indexed by type tag — covers all uint8_t values.
- * Only types 1-14 (vectors) have non-zero entries. */
+ * Only concrete vector types and LIST have non-zero entries. */
 extern const uint8_t ray_type_sizes[256];
 
 /* Out-of-line slice deref: keeps the hot path of ray_data_fn (a single
@@ -519,6 +530,7 @@ ray_t* ray_sym(int64_t id);
 ray_t* ray_date(int64_t val);
 ray_t* ray_time(int64_t val);
 ray_t* ray_timestamp(int64_t val);
+ray_t* ray_timespan(int64_t nanoseconds);
 /* Current UTC wall-clock time as a RAY_TIMESTAMP value (ns since 2000-01-01).
  * Shared "now as a timestamp" primitive — the single owner of the epoch
  * conversion; callers must not re-derive it. */
@@ -566,7 +578,8 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
             return f != f;
         }
         case RAY_I64:
-        case RAY_TIMESTAMP: return x->i64 == NULL_I64;
+        case RAY_TIMESTAMP:
+        case RAY_TIMESPAN:  return x->i64 == NULL_I64;
         case RAY_I32:
         case RAY_DATE:
         case RAY_TIME:      return x->i32 == NULL_I32;
@@ -696,6 +709,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
  *   ray_table_ncols / ray_table_nrows          -> 0
  *   ray_table_col_name                         -> -1
  *   ray_table_schema / ray_table_get_col*      -> NULL
+ *   ray_table_col / ray_table_col_idx          -> NULL
  *   ray_table_set_col_name / ray_table_set_col_idx -> no-op
  *   ray_table_add_col                          -> typed "type" error
  *   ray_table_validate_rectangular             -> typed "type" error
@@ -711,8 +725,19 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val);
 ray_t*       ray_table_new(int64_t ncols);
 ray_t*       ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec);
 ray_t*       ray_table_validate_rectangular(ray_t* tbl, const char* context);
+/* Borrowed column, or NULL.  NULL also covers an encoded column that fails
+ * to decode (corruption, OOM, cancel, fpenv): these two getters have no error
+ * channel, so a failed load reads as "no such column".  Use ray_table_col /
+ * ray_table_col_idx below when the reason matters. */
 ray_t*       ray_table_get_col(ray_t* tbl, int64_t name_id);
 ray_t*       ray_table_get_col_idx(ray_t* tbl, int64_t idx);
+/* Plain column (borrowed; valid for the table's lifetime; retain to keep it
+ * longer), NULL when absent or `tbl` is not a table, or an owned RAY_ERROR
+ * when an encoded column fails to materialize (corruption, OOM, cancel, fpenv).
+ * Compressed float access requires the FP controls documented below under
+ * Runtime + Rayfall Eval API, including when a decoded cache exists. */
+ray_t*       ray_table_col(ray_t* tbl, int64_t name_id);
+ray_t*       ray_table_col_idx(ray_t* tbl, int64_t idx);
 int64_t     ray_table_col_name(ray_t* tbl, int64_t idx);
 void        ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id);
 void        ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec);
@@ -762,6 +787,22 @@ ray_t*  ray_dict_remove(ray_t* d, ray_t* key_atom);             /* COW; consumes
  *   ray_t* result = ray_eval_str("select count from t");
  *   if (RAY_IS_ERR(result)) { ... } else { ...; ray_release(result); }
  *   ray_runtime_destroy(rt);
+ *
+ * Floating-point controls: generation-2 compressed F32/F64 I/O requires
+ * default FP controls on every calling/executing thread: round-to-nearest
+ * (FE_TONEAREST), masked FP exceptions, and gradual underflow (no FTZ/DAZ).
+ * Embedders must maintain these controls during calls; Rayforce never
+ * silently normalizes them. Sticky exception status flags need not be clear
+ * and computations may set them. Detected unsupported controls return
+ * RAY_ERR_FPENV ("fpenv"), not file corruption; retry is allowed after the
+ * controls are restored. Checks cover standard rounding, plus SSE rounding,
+ * FTZ/DAZ and exception masks on supported x86 SSE builds. They are not a
+ * complete portable FP-environment validator (notably, x87 trap masks are
+ * not checked). Elsewhere only standard rounding is checked; WebAssembly
+ * has fixed nearest rounding. Other controls remain the embedder's
+ * responsibility. This applies to compressed float writes and whole-column
+ * materialization even if a particular file uses a non-ALP encoding or has
+ * already been decoded; ALP range decoding also checks executing threads.
  *
  * Single-runtime: only one ray_runtime_t may be live at a time in the
  * same process. Creating a second without destroying the first is

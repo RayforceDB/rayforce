@@ -77,13 +77,17 @@
 
 ;; the derived name yields to an aggregate of the same name
 (== (cols (select {from: T by: (substr ref 0 2) ref: (min ref) c: (count v)})) ['key 'ref 'c]) -- [true true true]
-;; a quoted symbol that names a column of the table resolves to that column
-;; in the compiled key — such a key is not a function of the symbol alone
-(set RQ (select {from: T by: (if (== 'v ref) "same" "diff") c: (count v)}))
-(set OQ (select {from: (select {from: T k: (if (== 'v ref) "same" "diff") v: v}) by: k c: (count v)}))
-(count RQ) -- 1
-(== (at (value RQ) 0) (at (value OQ) 0)) -- [true]
-(== (at RQ 'c) (at OQ 'c)) -- [true]
+;; A quoted symbol naming a column resolves to that column. Equality
+;; between F64 column v and SYM ref is incompatible, not a raw-ID false value.
+(select {from: T by: (if (== 'v ref) "same" "diff") c: (count v)}) !- type
+(select {from: (select {from: T k: (if (== 'v ref) "same" "diff") v: v}) by: k c: (count v)}) !- type
+;; Preserve a supported two-column derived key with the same quoted-column
+;; resolution. It must not be evaluated once per distinct symbol. Compare
+;; against unquoted column reads and the earlier independently materialised key.
+(set RQ (select {from: T by: (if (> 'v 50) (substr ref 0 4) ref) c: (count ref)}))
+(set OQ (select {from: (select {from: T k: (if (> v 50) (substr ref 0 4) ref) ref: ref}) by: k c: (count ref)}))
+(all (== (FP2 RQ) (FP2 OQ))) -- true
+(all (== (FP2 RQ) (FP2 R3))) -- true
 
 ;; ── the column's ids in a FILE domain (a splayed table read back) ──────
 ;; The per-symbol evaluation then runs over the vocabulary's bytes, a
@@ -239,7 +243,7 @@
 ;; inside one expression (a line of this file interns its own names when
 ;; it is parsed), after a first call of each shape (hidden names) and of
 ;; (.sys.mem) itself (its first call interns its own key names).
-(count (.sys.mem)) -- 18
+(count (.sys.mem)) -- 21
 (set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
 (set KV (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) l: (avg (strlen ref)) mn: (min ref) where: (!= ref "")})))
 (set KD (fn [t] (select {from: t by: (let p (str-find ref "://") (let s (substr ref (+ p (abs 4)) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) sv: (sum v)})))

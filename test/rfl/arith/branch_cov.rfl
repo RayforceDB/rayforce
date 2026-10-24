@@ -219,13 +219,13 @@
 (nil? (- (as 'TIMESTAMP 5000) 0Nt)) -- true
 (type (- (as 'TIMESTAMP 5000) 0Nt)) -- 'timestamp
 
-;; ── L146-148: TIMESTAMP - TIMESTAMP null → null I64 ──
+;; ── L146-148: TIMESTAMP - TIMESTAMP null → null TIMESPAN ──
 
 (nil? (- 0Np (as 'TIMESTAMP 2000))) -- true
-(type (- 0Np (as 'TIMESTAMP 2000))) -- 'i64
+(type (- 0Np (as 'TIMESTAMP 2000))) -- 'timespan
 
 (nil? (- (as 'TIMESTAMP 5000) 0Np)) -- true
-(type (- (as 'TIMESTAMP 5000) 0Np)) -- 'i64
+(type (- (as 'TIMESTAMP 5000) 0Np)) -- 'timespan
 
 ;; ── L158: numeric null sub propagation (I16 null) ──
 
@@ -717,16 +717,15 @@
 (type (+ 5i 0Nl)) -- 'i64
 
 ;; ══════════════════════════════════════════════════════════════════════
-;; Additional sub branches — promote_int_type_right paths
+;; Additional sub branches — promote_int_type paths
 ;; ══════════════════════════════════════════════════════════════════════
 
-;; sub result type follows RIGHT operand's width (promote_int_type_right)
-(type (- 10 5i)) -- 'i32
-(type (- 10 5h)) -- 'i16
-(type (- 10 (as 'U8 3))) -- 'u8
+;; Like add/mul, subtraction promotes both integer operand widths.
+(type (- 10 5i)) -- 'i64
+(type (- 10 5h)) -- 'i64
+(type (- 10 (as 'U8 3))) -- 'i64
 
-;; When right is not a recognized int type, fall through to left
-;; (but all numeric types are recognized, so just test coverage of each)
+;; The reverse operand order retains the same wider result.
 (type (- 10h 5)) -- 'i64
 (type (- 10i 5)) -- 'i64
 

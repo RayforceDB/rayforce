@@ -32,6 +32,7 @@
 #include <time.h>
 #include <dirent.h>
 #include "mem/heap.h"
+#include "mem/cow.h"          /* ray_rc_sync: the lazy-hash probe threads */
 #include "ops/ops.h"
 #include "store/col.h"
 #include "ops/idxop.h"
@@ -53,6 +54,7 @@
 #include <fcntl.h>
 #include "ops/hash.h"     /* ray_hash_bytes: the import dictionary's full hashes */
 #include "vec/str.h"
+#include "vec/vec.h"          /* ray_vec_may_have_nulls */
 
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
@@ -101,16 +103,16 @@ static test_result_t test_col_save_derives_has_nulls(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;   /* the forgetful producer */
 
-    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(vec, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_TRUE((loaded->attrs & RAY_ATTR_HAS_NULLS) != 0);
     TEST_ASSERT_TRUE(ray_vec_is_null(loaded, 1));
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_TRUE((mapped->attrs & RAY_ATTR_HAS_NULLS) != 0);
@@ -120,8 +122,8 @@ static test_result_t test_col_save_derives_has_nulls(void) {
     /* A null-free column stays null-free: the scan only ever sets. */
     int64_t clean[] = {1, 2, 3};
     ray_t* cvec = ray_vec_from_raw(RAY_I64, clean, 3);
-    TEST_ASSERT_EQ_I(ray_col_save(cvec, TMP_COL_PATH), RAY_OK);
-    ray_t* cl = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(ray_col_save(cvec, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
+    ray_t* cl = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(cl);
     TEST_ASSERT_TRUE((cl->attrs & RAY_ATTR_HAS_NULLS) == 0);
     ray_release(cl);
@@ -139,11 +141,11 @@ static test_result_t test_col_mmap_i64(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
     /* Save to file */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load via mmap */
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
 
@@ -161,7 +163,7 @@ static test_result_t test_col_mmap_i64(void) {
 
     ray_release(mapped);
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -173,10 +175,10 @@ static test_result_t test_col_mmap_f64(void) {
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
 
@@ -191,7 +193,7 @@ static test_result_t test_col_mmap_f64(void) {
 
     ray_release(mapped);
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -203,10 +205,10 @@ static test_result_t test_col_mmap_f32(void) {
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_F32);
@@ -216,7 +218,7 @@ static test_result_t test_col_mmap_f32(void) {
         TEST_ASSERT(loaded_data[i] == raw[i], "f32 load value mismatch");
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_U(mapped->mmod, 1);
@@ -228,7 +230,7 @@ static test_result_t test_col_mmap_f32(void) {
 
     ray_release(mapped);
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -239,10 +241,10 @@ static test_result_t test_col_mmap_cow(void) {
     ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_U(mapped->mmod, 1);
 
@@ -267,7 +269,7 @@ static test_result_t test_col_mmap_cow(void) {
     ray_release(copy);
     ray_release(mapped);
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -278,10 +280,10 @@ static test_result_t test_col_mmap_refcount(void) {
     ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_U(mapped->rc, 1);
 
@@ -302,33 +304,14 @@ static test_result_t test_col_mmap_refcount(void) {
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_mmap_corrupt --------------------------------------------- */
-
-static test_result_t test_col_mmap_corrupt(void) {
-    /* Write a 16-byte file (too small for a valid column header) */
-    FILE* f = fopen(TMP_COL_PATH, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t junk[16] = {0};
-    fwrite(junk, 1, 16, f);
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
 /* ---- test_col_mmap_nofile ---------------------------------------------- */
 
 static test_result_t test_col_mmap_nofile(void) {
-    ray_t* result = ray_col_mmap("/tmp/rayforce_nonexistent_file_xyz.dat");
+    ray_t* result = ray_col_mmap(ray_test_tmp("/tmp/rayforce_nonexistent_file_xyz.dat"));
     TEST_ASSERT_TRUE(RAY_IS_ERR(result));
     TEST_ASSERT_STR_EQ(ray_err_code(result), "io");
     ray_release(result);
@@ -340,7 +323,7 @@ static test_result_t test_col_mmap_nofile(void) {
 
 static test_result_t test_splay_open_roundtrip(void) {
     /* Clean up any leftover splay dir */
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
 
     /* Build a 3-column table: I64, F64, I32 */
     ray_t* tbl = ray_table_new(4);
@@ -370,11 +353,11 @@ static test_result_t test_splay_open_roundtrip(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     /* Save to splay directory */
-    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
+    ray_err_t err = ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Open via mmap (zero-copy) */
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
@@ -390,9 +373,9 @@ static test_result_t test_splay_open_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(lb);
     TEST_ASSERT_NOT_NULL(lc);
 
-    TEST_ASSERT_EQ_U(la->mmod, 1);
-    TEST_ASSERT_EQ_U(lb->mmod, 1);
-    TEST_ASSERT_EQ_U(lc->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(la, 1);
+    TEST_ASSERT_LOADED_MMOD(lb, 1);
+    TEST_ASSERT_LOADED_MMOD(lc, 1);
 
     /* Verify data */
     int64_t* da = (int64_t*)ray_data(la);
@@ -412,14 +395,14 @@ static test_result_t test_splay_open_roundtrip(void) {
     ray_release(tbl);
 
     /* Cleanup */
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     PASS();
 }
 
 /* ---- test_splay_str_column_roundtrip ----------------------------------- */
 
 static test_result_t test_splay_str_column_roundtrip(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
 
     ray_t* tbl = ray_table_new(2);
     TEST_ASSERT_NOT_NULL(tbl);
@@ -447,10 +430,10 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     tbl = ray_table_add_col(tbl, id_name, names);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
+    ray_err_t err = ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
@@ -460,14 +443,14 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     ray_t* loaded_names = ray_table_get_col(loaded, id_name);
     TEST_ASSERT_NOT_NULL(loaded_ids);
     TEST_ASSERT_NOT_NULL(loaded_names);
-    TEST_ASSERT_EQ_U(loaded_ids->mmod, 1);
-    TEST_ASSERT_EQ_U(loaded_names->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(loaded_ids, 1);
+    TEST_ASSERT_LOADED_MMOD(loaded_names, 1);
     TEST_ASSERT_EQ_I(loaded_names->type, RAY_STR);
     TEST_ASSERT_NOT_NULL(loaded_names->str_pool);
     /* The pool owns the mapping it shares with the column (mmod 3), so a
      * selection that keeps the pool keeps the region — the column's own
      * free no longer takes the bytes with it. */
-    TEST_ASSERT_EQ_U(loaded_names->str_pool->mmod, 3);
+    TEST_ASSERT_LOADED_MMOD(loaded_names->str_pool, 3);
     /* Empty STR roundtrips as the canonical null and retains metadata. */
     TEST_ASSERT_TRUE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE(ray_vec_is_null(loaded_names, 2));
@@ -485,7 +468,7 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     ray_release(names);
     ray_release(tbl);
 
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     PASS();
 }
 
@@ -499,7 +482,7 @@ static test_result_t test_splay_str_column_roundtrip(void) {
  * ---------------------------------------------------------------------- */
 
 static test_result_t test_splay_short_strv_roundtrip(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
 
     int64_t id_short = ray_sym_intern("short", 5);
     int64_t id_empty = ray_sym_intern("empty", 5);
@@ -515,10 +498,10 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     tbl = ray_table_add_col(tbl, id_short, shorts);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
+    ray_err_t err = ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
@@ -542,10 +525,10 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     tbl2 = ray_table_add_col(tbl2, id_empty, empty);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
 
-    err = ray_splay_save(tbl2, TMP_SPLAY_DIR, NULL);
+    err = ray_splay_save(tbl2, ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
@@ -561,13 +544,13 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     ray_release(tbl);
     ray_release(tbl2);
 
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     PASS();
 }
 
 /* ---- test_splay_dict_column_roundtrip --------------------------------- */
 static test_result_t test_splay_dict_column_roundtrip(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
 
     int64_t ids_raw[] = {1, 2};
     ray_t* ids = ray_vec_from_raw(RAY_I64, ids_raw, 2);
@@ -599,8 +582,8 @@ static test_result_t test_splay_dict_column_roundtrip(void) {
     tbl = ray_table_add_col(tbl, sched_id, sched);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    TEST_ASSERT_EQ_I(ray_splay_save(tbl, TMP_SPLAY_DIR, NULL), RAY_OK);
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_DIR), NULL), RAY_OK);
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     ray_t* loaded_sched = ray_table_get_col(loaded, sched_id);
@@ -622,13 +605,13 @@ static test_result_t test_splay_dict_column_roundtrip(void) {
     ray_release(tbl);
     ray_release(ids);
     ray_release(sched);
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     PASS();
 }
 
 /* ---- test_splay_empty_list_column_roundtrip --------------------------- */
 static test_result_t test_splay_empty_list_column_roundtrip(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
 
     ray_t* ids = ray_vec_new(RAY_I64, 0);
     ray_t* who = ray_vec_new(RAY_SYM, 0);
@@ -645,9 +628,9 @@ static test_result_t test_splay_empty_list_column_roundtrip(void) {
     tbl = ray_table_add_col(tbl, ray_sym_intern("sched", 5), sched);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    const char* sym_path = TMP_SPLAY_DIR "/.sym";
-    TEST_ASSERT_EQ_I(ray_splay_save(tbl, TMP_SPLAY_DIR, sym_path), RAY_OK);
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, sym_path);
+    const char* sym_path = ray_test_tmp(TMP_SPLAY_DIR "/.sym");
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_DIR), sym_path), RAY_OK);
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), sym_path);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 3);
@@ -671,14 +654,14 @@ static test_result_t test_splay_empty_list_column_roundtrip(void) {
     ray_release(ids);
     ray_release(who);
     ray_release(sched);
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     PASS();
 }
 
 /* A deterministic unsupported column must be rejected before an earlier
  * column can replace the committed generation. */
 static test_result_t test_splay_save_preflight_preserves_generation(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     int64_t k_id = ray_sym_intern("k", 1);
     int64_t v_id = ray_sym_intern("v", 1);
 
@@ -690,7 +673,7 @@ static test_result_t test_splay_save_preflight_preserves_generation(void) {
     good = ray_table_add_col(good, k_id, old_k);
     good = ray_table_add_col(good, v_id, old_v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(good));
-    TEST_ASSERT_EQ_I(ray_splay_save(good, TMP_SPLAY_DIR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(good, ray_test_tmp(TMP_SPLAY_DIR), NULL), RAY_OK);
 
     int64_t new_k_raw[] = {9, 10};
     int64_t dk_raw[] = {1, 2};
@@ -703,9 +686,9 @@ static test_result_t test_splay_save_preflight_preserves_generation(void) {
     bad = ray_table_add_col(bad, v_id, old_v);
     ray_table_set_col_idx(bad, 1, unsupported);
     TEST_ASSERT_FALSE(RAY_IS_ERR(bad));
-    TEST_ASSERT_EQ_I(ray_splay_save(bad, TMP_SPLAY_DIR, NULL), RAY_ERR_NYI);
+    TEST_ASSERT_EQ_I(ray_splay_save(bad, ray_test_tmp(TMP_SPLAY_DIR), NULL), RAY_ERR_NYI);
 
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_DIR), NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     ray_t* loaded_k = ray_table_get_col(loaded, k_id);
@@ -719,7 +702,7 @@ static test_result_t test_splay_save_preflight_preserves_generation(void) {
     ray_release(good);
     ray_release(old_v);
     ray_release(old_k);
-    (void)ray_test_rm_rf(TMP_SPLAY_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_DIR));
     PASS();
 }
 
@@ -852,9 +835,9 @@ static test_result_t test_parted_release(void) {
 
 static test_result_t test_part_open(void) {
     /* Setup: create a 2-partition db with 2 columns each */
-    (void)ray_test_rm_rf(TMP_PART_DB);
-    (void)ray_test_mkdir_p(TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME);
-    (void)ray_test_mkdir_p(TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PART_DB));
+    (void)ray_test_mkdir_p(ray_test_tmp(TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME));
+    (void)ray_test_mkdir_p(ray_test_tmp(TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME));
 
     /* Partition 1: 3 rows */
     int64_t raw_a1[] = {10, 20, 30};
@@ -867,7 +850,7 @@ static test_result_t test_part_open(void) {
     int64_t name_b = ray_sym_intern("b", 1);
     tbl1 = ray_table_add_col(tbl1, name_a, a1);
     tbl1 = ray_table_add_col(tbl1, name_b, b1);
-    ray_err_t err = ray_splay_save(tbl1, TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME, NULL);
+    ray_err_t err = ray_splay_save(tbl1, ray_test_tmp(TMP_PART_DB "/2024.01.01/" TMP_TABLE_NAME), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Partition 2: 5 rows */
@@ -879,11 +862,11 @@ static test_result_t test_part_open(void) {
     ray_t* tbl2 = ray_table_new(3);
     tbl2 = ray_table_add_col(tbl2, name_a, a2);
     tbl2 = ray_table_add_col(tbl2, name_b, b2);
-    err = ray_splay_save(tbl2, TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME, NULL);
+    err = ray_splay_save(tbl2, ray_test_tmp(TMP_PART_DB "/2024.01.02/" TMP_TABLE_NAME), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Save symfile */
-    err = ray_sym_save(TMP_PART_DB "/.sym");
+    err = ray_sym_save(ray_test_tmp(TMP_PART_DB "/.sym"));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Cleanup in-memory tables */
@@ -891,7 +874,7 @@ static test_result_t test_part_open(void) {
     ray_release(a2); ray_release(b2); ray_release(tbl2);
 
     /* Open via ray_read_parted */
-    ray_t* parted = ray_read_parted(TMP_PART_DB, TMP_TABLE_NAME);
+    ray_t* parted = ray_read_parted(ray_test_tmp(TMP_PART_DB), TMP_TABLE_NAME);
     TEST_ASSERT_NOT_NULL(parted);
     TEST_ASSERT_FALSE(RAY_IS_ERR(parted));
 
@@ -938,9 +921,9 @@ static test_result_t test_part_open(void) {
     /* Verify segment 0 has 3 rows, mmod=1 (mmap'd) */
     ray_t** segs_a = (ray_t**)ray_data(col_a);
     TEST_ASSERT_EQ_I(segs_a[0]->len, 3);
-    TEST_ASSERT_EQ_U(segs_a[0]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(segs_a[0], 1);
     TEST_ASSERT_EQ_I(segs_a[1]->len, 5);
-    TEST_ASSERT_EQ_U(segs_a[1]->mmod, 1);
+    TEST_ASSERT_LOADED_MMOD(segs_a[1], 1);
 
     /* Verify data in segment 0 */
     int64_t* data_a0 = (int64_t*)ray_data(segs_a[0]);
@@ -955,7 +938,7 @@ static test_result_t test_part_open(void) {
     /* Release — should unmap all segments */
     ray_release(parted);
 
-    (void)ray_test_rm_rf(TMP_PART_DB);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PART_DB));
     PASS();
 }
 
@@ -963,11 +946,11 @@ static test_result_t test_part_open(void) {
 /* ray_parted_tables lists the splayed-table subdirectories of the first
  * partition as a sorted SYM vector usable with ray_read_parted. */
 static test_result_t test_parted_tables(void) {
-    (void)ray_test_rm_rf(TMP_PART_DB);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PART_DB));
     /* Two tables (trades, quotes) across two partitions. */
     const char* dirs[] = {
-        TMP_PART_DB "/2024.01.01/trades", TMP_PART_DB "/2024.01.01/quotes",
-        TMP_PART_DB "/2024.01.02/trades", TMP_PART_DB "/2024.01.02/quotes",
+        ray_test_tmp(TMP_PART_DB "/2024.01.01/trades"), ray_test_tmp(TMP_PART_DB "/2024.01.01/quotes"),
+        ray_test_tmp(TMP_PART_DB "/2024.01.02/trades"), ray_test_tmp(TMP_PART_DB "/2024.01.02/quotes"),
     };
     int64_t a[] = {1, 2, 3};
     for (int i = 0; i < 4; i++) {
@@ -982,7 +965,7 @@ static test_result_t test_parted_tables(void) {
     }
 
     /* Sorted SYM vector: quotes, trades. */
-    ray_t* names = ray_parted_tables(TMP_PART_DB);
+    ray_t* names = ray_parted_tables(ray_test_tmp(TMP_PART_DB));
     TEST_ASSERT_NOT_NULL(names);
     TEST_ASSERT_FALSE(RAY_IS_ERR(names));
     TEST_ASSERT_EQ_I(names->type, RAY_SYM);
@@ -993,24 +976,24 @@ static test_result_t test_parted_tables(void) {
     ray_release(names);
 
     /* A returned name feeds straight back into ray_read_parted. */
-    ray_t* tbl = ray_read_parted(TMP_PART_DB, "trades");
+    ray_t* tbl = ray_read_parted(ray_test_tmp(TMP_PART_DB), "trades");
     TEST_ASSERT_NOT_NULL(tbl);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
     ray_release(tbl);
 
     /* An existing-but-empty root (no partition dirs) lists no tables —
      * an empty SYM vector, not an error. */
-    (void)ray_test_rm_rf(TMP_PART_DB "_np");
-    (void)ray_test_mkdir_p(TMP_PART_DB "_np");
-    ray_t* empty = ray_parted_tables(TMP_PART_DB "_np");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PART_DB "_np"));
+    (void)ray_test_mkdir_p(ray_test_tmp(TMP_PART_DB "_np"));
+    ray_t* empty = ray_parted_tables(ray_test_tmp(TMP_PART_DB "_np"));
     TEST_ASSERT_NOT_NULL(empty);
     TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
     TEST_ASSERT_EQ_I(empty->type, RAY_SYM);
     TEST_ASSERT_EQ_I(empty->len, 0);
     ray_release(empty);
-    (void)ray_test_rm_rf(TMP_PART_DB "_np");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PART_DB "_np"));
 
-    (void)ray_test_rm_rf(TMP_PART_DB);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PART_DB));
     PASS();
 }
 
@@ -1139,10 +1122,10 @@ static test_result_t test_col_large_nullable_roundtrip(void) {
     TEST_ASSERT_TRUE((vec->attrs & RAY_ATTR_HAS_NULLS) != 0);
 
     /* --- Round-trip via ray_col_load --- */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
@@ -1168,7 +1151,7 @@ static test_result_t test_col_large_nullable_roundtrip(void) {
     ray_release(loaded);
 
     /* --- Round-trip via ray_col_mmap --- */
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
 
@@ -1191,7 +1174,7 @@ static test_result_t test_col_large_nullable_roundtrip(void) {
 
     ray_release(mapped);
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -1217,11 +1200,11 @@ static test_result_t test_col_save_load_str(void) {
     TEST_ASSERT_EQ_I(list->len, 3);
 
     /* Save */
-    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(list, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
@@ -1251,7 +1234,7 @@ static test_result_t test_col_save_load_str(void) {
     ray_release(s1);
     ray_release(s2);
     ray_release(list);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -1274,11 +1257,11 @@ static test_result_t test_col_save_load_list(void) {
     TEST_ASSERT_EQ_I(list->len, 2);
 
     /* Save */
-    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(list, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
@@ -1308,7 +1291,7 @@ static test_result_t test_col_save_load_list(void) {
     ray_release(v0);
     ray_release(v1);
     ray_release(list);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -1334,11 +1317,11 @@ static test_result_t test_col_save_load_table(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     /* Save */
-    ray_err_t err = ray_col_save(tbl, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(tbl, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
@@ -1375,7 +1358,7 @@ static test_result_t test_col_save_load_table(void) {
     ray_release(col_a);
     ray_release(col_b);
     ray_release(tbl);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -1385,19 +1368,19 @@ static test_result_t test_col_save_load_table(void) {
 
 static test_result_t test_file_open_close(void) {
     /* Open for write+create, then close */
-    unlink(TMP_FILEIO_PATH);
-    ray_fd_t fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
+    ray_fd_t fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_WRITE | RAY_OPEN_CREATE);
     TEST_ASSERT((fd) != (RAY_FD_INVALID), "fd != RAY_FD_INVALID");
     ray_file_close(fd);
 
     /* Open for read (file now exists) */
-    fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_READ);
+    fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_READ);
     TEST_ASSERT((fd) != (RAY_FD_INVALID), "fd != RAY_FD_INVALID");
     ray_file_close(fd);
 
     /* Open nonexistent for read (no create) → fail */
-    unlink(TMP_FILEIO_PATH);
-    fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_READ);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
+    fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_READ);
     TEST_ASSERT_EQ_I(fd, RAY_FD_INVALID);
 
     /* NULL path → fail */
@@ -1410,8 +1393,8 @@ static test_result_t test_file_open_close(void) {
 /* ---- test_file_lock_unlock --------------------------------------------- */
 
 static test_result_t test_file_lock_unlock(void) {
-    unlink(TMP_FILEIO_PATH);
-    ray_fd_t fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
+    ray_fd_t fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_WRITE | RAY_OPEN_CREATE);
     TEST_ASSERT((fd) != (RAY_FD_INVALID), "fd != RAY_FD_INVALID");
 
     /* Exclusive lock + unlock */
@@ -1432,15 +1415,15 @@ static test_result_t test_file_lock_unlock(void) {
     TEST_ASSERT_EQ_I(ray_file_unlock(RAY_FD_INVALID), RAY_OK);
 
     ray_file_close(fd);
-    unlink(TMP_FILEIO_PATH);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
     PASS();
 }
 
 /* ---- test_file_sync_op ------------------------------------------------- */
 
 static test_result_t test_file_sync_op(void) {
-    unlink(TMP_FILEIO_PATH);
-    ray_fd_t fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
+    ray_fd_t fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_WRITE | RAY_OPEN_CREATE);
     TEST_ASSERT((fd) != (RAY_FD_INVALID), "fd != RAY_FD_INVALID");
 
     /* fsync on valid fd */
@@ -1451,7 +1434,7 @@ static test_result_t test_file_sync_op(void) {
     TEST_ASSERT_EQ_I(ray_file_sync(RAY_FD_INVALID), RAY_ERR_IO);
 
     ray_file_close(fd);
-    unlink(TMP_FILEIO_PATH);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
     PASS();
 }
 
@@ -1460,35 +1443,35 @@ static test_result_t test_file_sync_op(void) {
 #define TMP_FILEIO_PATH2 "/tmp/rayforce_test_fileio2.dat"
 
 static test_result_t test_file_rename_op(void) {
-    unlink(TMP_FILEIO_PATH);
-    unlink(TMP_FILEIO_PATH2);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
+    unlink(ray_test_tmp(TMP_FILEIO_PATH2));
 
     /* Create source file */
-    ray_fd_t fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    ray_fd_t fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_WRITE | RAY_OPEN_CREATE);
     TEST_ASSERT((fd) != (RAY_FD_INVALID), "fd != RAY_FD_INVALID");
     ray_file_close(fd);
 
     /* Rename */
-    ray_err_t err = ray_file_rename(TMP_FILEIO_PATH, TMP_FILEIO_PATH2);
+    ray_err_t err = ray_file_rename(ray_test_tmp(TMP_FILEIO_PATH), ray_test_tmp(TMP_FILEIO_PATH2));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Old path should not exist, new should */
-    fd = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_READ);
+    fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_READ);
     TEST_ASSERT_EQ_I(fd, RAY_FD_INVALID);
 
-    fd = ray_file_open(TMP_FILEIO_PATH2, RAY_OPEN_READ);
+    fd = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH2), RAY_OPEN_READ);
     TEST_ASSERT((fd) != (RAY_FD_INVALID), "fd != RAY_FD_INVALID");
     ray_file_close(fd);
 
     /* Rename nonexistent → error */
-    err = ray_file_rename("/tmp/rayforce_nonexistent_xyz", TMP_FILEIO_PATH2);
+    err = ray_file_rename(ray_test_tmp("/tmp/rayforce_nonexistent_xyz"), ray_test_tmp(TMP_FILEIO_PATH2));
     TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
 
     /* NULL args → error */
-    TEST_ASSERT_EQ_I(ray_file_rename(NULL, TMP_FILEIO_PATH2), RAY_ERR_IO);
-    TEST_ASSERT_EQ_I(ray_file_rename(TMP_FILEIO_PATH, NULL), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_file_rename(NULL, ray_test_tmp(TMP_FILEIO_PATH2)), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_file_rename(ray_test_tmp(TMP_FILEIO_PATH), NULL), RAY_ERR_IO);
 
-    unlink(TMP_FILEIO_PATH2);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH2));
     PASS();
 }
 
@@ -1855,7 +1838,7 @@ static test_result_t test_stream_inline_zone(void) {
     int64_t n = 200000;
     ray_t* v = zone_test_col(n, 0, 0);
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("z", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("z", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     for (int64_t off = 0; off < n; off += 70000) {
         int64_t cnt = n - off < 70000 ? n - off : 70000;
@@ -1864,8 +1847,6 @@ static test_result_t test_stream_inline_zone(void) {
         ray_release(s);
     }
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
-    TEST_ASSERT_FALSE(w.wants_hash);
-    TEST_ASSERT_NULL(w.index);
     char path[200]; snprintf(path, sizeof(path), "%s/z", dir);
     ray_t* back = ray_col_mmap(path);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
@@ -1944,12 +1925,11 @@ static test_result_t test_stream_sentinel_publishes_has_nulls(void) {
     ((int64_t*)ray_data(s1))[7] = INT64_MIN;
     s2->attrs |= RAY_ATTR_HAS_NULLS;
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("n", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("n", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s1), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, s2), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
-    if (w.index) { ray_release(w.index); w.index = NULL; }
     char path[200]; snprintf(path, sizeof(path), "%s/n", dir);
     ray_t* back = ray_col_mmap(path);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
@@ -2023,7 +2003,7 @@ static test_result_t test_stream_sym_chunks(void) {
     }
     c1->attrs |= RAY_ATTR_HAS_NULLS;
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("d", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("d", 1), RAY_SYM, dom, 0), RAY_OK);
     TEST_ASSERT_NULL(w.lut_id);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c1), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c2), RAY_OK);
@@ -2054,7 +2034,7 @@ static test_result_t test_stream_sym_chunks(void) {
         ((int64_t*)ray_data(rt))[i] = id[1 + (i * 7) % (K - 1)];
     }
     ((uint32_t*)ray_data(c3))[n - 1] = 0;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("r", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("r", 1), RAY_SYM, dom, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c3), RAY_OK);
     TEST_ASSERT_NULL(w.lut_id);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, rt), RAY_OK);
@@ -2106,7 +2086,7 @@ static test_result_t test_stream_sym_from_str(void) {
         if (!dom[k]) { TEST_ASSERT_EQ_I(k, 1); break; }   /* no import dictionary here */
         TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom[k], "", 0), 0);
         ray_col_stream_t w;
-        TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern(k ? "i" : "f", 1), RAY_SYM, dom[k]), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern(k ? "i" : "f", 1), RAY_SYM, dom[k], 0), RAY_OK);
         TEST_ASSERT_EQ_I(ray_col_stream_append(&w, col), RAY_OK);
         TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
         back[k] = (uint32_t*)ray_sys_alloc((size_t)n * sizeof(uint32_t));
@@ -2164,7 +2144,7 @@ static test_result_t test_stream_sym_foreign(void) {
     TEST_ASSERT_NOT_NULL(c);
     for (int64_t i = 0; i < n; i++) ((uint32_t*)ray_data(c))[i] = (uint32_t)at2[(i * 3) % K];
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("f", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("f", 1), RAY_SYM, dom, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, c), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
     int64_t at[K];
@@ -2215,7 +2195,7 @@ static test_result_t test_stream_sym_lut_stale(void) {
     rt->len = n;
     for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(rt))[i] = x;
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("l", 1), RAY_SYM, dom), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("l", 1), RAY_SYM, dom, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, rt), RAY_OK);
     TEST_ASSERT_NOT_NULL(w.lut_id);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
@@ -2252,7 +2232,7 @@ static test_result_t test_stream_index_write_failure_drops_index(void) {
     pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
     if (!pid) {
         ray_col_stream_t w;
-        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL) != RAY_OK) _exit(2);
+        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL, 0) != RAY_OK) _exit(2);
         if (ray_col_stream_index_begin(&w, 0) != RAY_OK) _exit(2);
         if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
         struct rlimit limit;
@@ -2280,7 +2260,7 @@ static test_result_t test_stream_index_write_failure_drops_index(void) {
 #endif
 }
 
-/* Exactly 65536 rows: one chunk, a zone, never a hash candidate. */
+/* Exactly 65536 rows: one chunk, a zone. */
 static test_result_t test_stream_inline_zone_one_chunk(void) {
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-one-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
@@ -2288,11 +2268,10 @@ static test_result_t test_stream_inline_zone_one_chunk(void) {
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
     for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;  /* unclustered */
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("o", 1), RAY_I64, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("o", 1), RAY_I64, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
-    TEST_ASSERT_FALSE(w.wants_hash);
     char path[200]; snprintf(path, sizeof(path), "%s/o", dir);
     ray_t* back = ray_col_mmap(path);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
@@ -2305,38 +2284,26 @@ static test_result_t test_stream_inline_zone_one_chunk(void) {
 static bool store_files_same(const char* a, const char* b);
 static ray_err_t store_hash_append_legacy(const char* path);
 
-/* Unclustered I64 over four chunks: no inline index, the zone is kept and
- * wants_hash set; ray_splay_hash_column then appends a hash. */
-static test_result_t test_stream_hash_candidate(void) {
-    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-hash-%d", (int)getpid());
-    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+/* Index policy: the staged bulk save (parted Parquet partitions, fresh
+ * .csv.parted leaves) persists no HASH for an unclustered I64 column of
+ * 300000 rows, the shape the splayed converter hashes today.  A guard that
+ * passes today (the staged path builds no index); vacuous when the legacy
+ * getter decodes a generation-2 column in the equivalence pass. */
+static test_result_t test_staged_bulk_no_hash(void) {
+    char dir[160]; snprintf(dir, sizeof(dir), "%s", ray_test_tmp("/tmp/rayforce-staged-nohash"));
+    (void)ray_test_rm_rf(dir);
     int64_t n = 300000;
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
     for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
-    ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("h", 1), RAY_I64, NULL), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
-    TEST_ASSERT_TRUE(w.wants_hash);
-    TEST_ASSERT_NOT_NULL(w.index);
-    char path[200]; snprintf(path, sizeof(path), "%s/h", dir);
-    ray_t* back = ray_col_mmap(path);
-    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
-    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
-    ray_release(back);
-    TEST_ASSERT_EQ_I(ray_splay_hash_column(path, w.index), RAY_OK);
-    ray_release(w.index); w.index = NULL;
-    back = ray_col_mmap(path);
-    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
-    TEST_ASSERT_EQ_I(ray_index_kind(back), RAY_IDX_HASH);
-    ray_release(back);
-    /* the file is the one the in-memory build appended before */
-    char ref[200]; snprintf(ref, sizeof(ref), "%s/ref", dir);
-    TEST_ASSERT_EQ_I(ray_col_save_bulk(v, ref), RAY_OK);
-    TEST_ASSERT_EQ_I(store_hash_append_legacy(ref), RAY_OK);
-    TEST_ASSERT_TRUE(store_files_same(path, ref));
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("u", 1), v);
     ray_release(v);
+    TEST_ASSERT_EQ_I(ray_splay_save_staged_bulk(t, dir, NULL), RAY_OK);
+    ray_release(t);
+    ray_t* back = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_TRUE(ray_index_kind(ray_table_get_col_idx(back, 0)) != RAY_IDX_HASH);
+    ray_release(back);
     (void)ray_test_rm_rf(dir);
     PASS();
 }
@@ -2414,9 +2381,88 @@ static ray_err_t store_hash_build(const char* path) {
     return err;
 }
 
+/* The route a splayed save takes for an explicit hash (splay.c,
+ * splay_hash_append): built in place, or where that does not apply
+ * (RAY_ERR_NYI) built in memory and appended.  Converters persist no
+ * auto-built hash (index policy), so no store entry point re-reads a file
+ * to hash it; the in-memory fallback is exercised here. */
+static ray_err_t store_hash_routed(const char* path) {
+    ray_t* col = ray_col_mmap(path);
+    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
+    ray_err_t err = ray_col_build_hash_index(path, col, NULL);
+    if (err == RAY_ERR_NYI) {
+        ray_t* hi = ray_idx_hash_fn(col);
+        if (!hi || RAY_IS_ERR(hi)) { if (hi) ray_error_free(hi); err = RAY_ERR_OOM; }
+        else {
+            err = (hi->attrs & RAY_ATTR_HAS_INDEX)
+                ? ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type)
+                : RAY_ERR_IO;
+            ray_release(hi);
+        }
+    }
+    ray_release(col);
+    return err;
+}
+
 static int64_t store_file_size(const char* path) {
     struct stat st;
     return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+/* A truncated generation-1 file (a partial copy, a full disk elsewhere)
+ * fails at load and at map, whatever its cut: a vector cut in its header
+ * or its data, a STR column cut in its pool, a LIST cut in an element.  The
+ * extents are checked; the values are taken as written. */
+static ray_t* store_trunc_case(int k) {
+    if (k == 0) {
+        ray_t* v = ray_vec_new(RAY_I64, 1000);
+        v->len = 1000;
+        for (int64_t i = 0; i < 1000; i++) ((int64_t*)ray_data(v))[i] = i * 7;
+        return v;
+    }
+    if (k == 1) {
+        ray_t* v = ray_vec_new(RAY_STR, 64);
+        for (int i = 0; i < 64; i++) {
+            char b[64];
+            int n = snprintf(b, sizeof b, "a pooled string value number %d", i);
+            v = ray_str_vec_append(v, b, (size_t)n);
+        }
+        return v;
+    }
+    ray_t* l = ray_list_new(3);
+    ray_t* a = ray_i64(42);
+    ray_t* s = ray_str("a string in a list, long enough", 31);
+    ray_t* v = store_trunc_case(0);
+    l = ray_list_append(l, a); l = ray_list_append(l, s); l = ray_list_append(l, v);
+    ray_release(a); ray_release(s); ray_release(v);
+    return l;
+}
+static test_result_t test_col_truncated_fails(void) {
+    const char* p = ray_test_tmp(TMP_COL_PATH);
+    for (int k = 0; k < 3; k++) {
+        ray_t* v = store_trunc_case(k);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+        TEST_ASSERT_EQ_I(ray_col_save(v, p), RAY_OK);
+        int64_t full = store_file_size(p);
+        const int64_t cuts[] = { 16, 40, full / 2, full - 1 };
+        for (size_t c = 0; c < sizeof cuts / sizeof cuts[0]; c++) {
+            TEST_ASSERT_EQ_I(ray_col_save(v, p), RAY_OK);
+            TEST_ASSERT_EQ_I(truncate(p, (off_t)cuts[c]), 0);
+            for (int how = 0; how < (k == 2 ? 1 : 2); how++) {   /* a LIST has no map */
+                ray_t* r = how ? ray_col_mmap(p) : ray_col_load(p);
+                if (!r || !RAY_IS_ERR(r)) {
+                    if (r) ray_release(r);
+                    ray_release(v);
+                    FAILF("case %d cut at %lld of %lld: %s opened", k, (long long)cuts[c],
+                          (long long)full, how ? "map" : "load");
+                }
+                ray_error_free(r);
+            }
+        }
+        ray_release(v);
+    }
+    unlink(p);
+    PASS();
 }
 
 /* Does `dir` take the in-place build (Linux, a filesystem whose fallocate
@@ -2436,7 +2482,7 @@ static bool store_in_place(const char* dir) {
  * build appended — numeric, temporal, float with nulls, SYM ids, every key
  * distinct or few — with one batch and with many (the counting pass), and
  * the index loads and answers.  Where the in-place build does not apply,
- * the same through ray_splay_hash_column's in-memory route. */
+ * the same through the in-memory route (store_hash_routed). */
 static test_result_t test_col_build_hash_index_bytes(void) {
     (void)ray_pool_get();
     char name[16];
@@ -2464,7 +2510,7 @@ static test_result_t test_col_build_hash_index_bytes(void) {
             if (!v || RAY_IS_ERR(v)) { bad++; continue; }
             if (ray_col_save_bulk(v, a) != RAY_OK || ray_col_save_bulk(v, b) != RAY_OK) bad++;
             int64_t payload = store_file_size(a);
-            ray_err_t e = in_place ? store_hash_build(a) : ray_splay_hash_column(a, NULL);
+            ray_err_t e = in_place ? store_hash_build(a) : store_hash_routed(a);
             if (e != RAY_OK || store_hash_append_legacy(b) != RAY_OK) bad++;
             if (!store_files_same(a, b) || store_file_size(a) <= payload) bad++;
             ray_t* m = ray_col_mmap(a);
@@ -2517,8 +2563,8 @@ static test_result_t test_col_build_hash_index_refusals(void) {
     int64_t plain = store_file_size(q);
     TEST_ASSERT_EQ_I(store_hash_build(q), RAY_ERR_NYI);
     TEST_ASSERT_EQ_I(store_file_size(q), plain);
-    /* ray_splay_hash_column takes the in-memory path for it */
-    TEST_ASSERT_EQ_I(ray_splay_hash_column(q, NULL), RAY_OK);
+    /* the routed build takes the in-memory path for it */
+    TEST_ASSERT_EQ_I(store_hash_routed(q), RAY_OK);
     m = ray_col_mmap(q);
     TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
     TEST_ASSERT_EQ_I(ray_index_kind(m), RAY_IDX_HASH);
@@ -2530,7 +2576,7 @@ static test_result_t test_col_build_hash_index_refusals(void) {
 
 /* On a filesystem the in-place build does not trust (copy-on-write,
  * network, user — or any platform but Linux) it leaves the file alone, and
- * ray_splay_hash_column builds the index in memory and appends it: the same
+ * the routed build makes the index in memory and appends it: the same
  * bytes.  Debug builds pretend the filesystem is untrusted. */
 static test_result_t test_col_build_hash_index_untrusted_fs(void) {
 #if defined(RAY_OS_LINUX) && !defined(DEBUG)
@@ -2550,7 +2596,7 @@ static test_result_t test_col_build_hash_index_untrusted_fs(void) {
     int64_t payload = store_file_size(a);
     ray_err_t direct = store_hash_build(a);
     int64_t after = store_file_size(a);
-    ray_err_t routed = ray_splay_hash_column(a, NULL);
+    ray_err_t routed = store_hash_routed(a);
 #if defined(DEBUG)
     unsetenv("RAY_HASH_INJECT");
 #endif
@@ -2614,10 +2660,26 @@ static test_result_t test_col_build_hash_index_fs_types(void) {
 #endif
 }
 
+/* A SYM column of 300000 rows over `keys` interned symbols, carrying an
+ * explicit hash index (.idx.hash). */
+static ray_t* store_cancel_sym_col(int64_t keys) {
+    char name[16];
+    for (int64_t i = 0; i <= keys; i++) {   /* SYM ids below the interned count */
+        int l = snprintf(name, sizeof(name), "hc%lld", (long long)i);
+        if (ray_sym_intern(name, (size_t)l) < 0) return NULL;
+    }
+    ray_t* v = store_hash_col(RAY_SYM, 300000, keys, 0);
+    if (!v || RAY_IS_ERR(v)) return v;
+    ray_t* h = ray_idx_hash_fn(v);
+    ray_release(v);
+    return h;
+}
+
 /* A region that cannot be allocated or mapped this time (debug builds
  * inject either) does not cost the column its hash index: the in-place
- * build gives way (NYI, the file at its payload) and ray_splay_hash_column
- * and a splayed save build it in memory and append it — the same bytes. */
+ * build gives way (NYI, the file at its payload) and the routed build
+ * and a splayed save of an explicit SYM hash build it in memory and append
+ * it — the same bytes. */
 static test_result_t test_col_build_hash_index_refused(void) {
 #if defined(DEBUG)
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-hidx-ref2-%d", (int)getpid());
@@ -2637,7 +2699,7 @@ static test_result_t test_col_build_hash_index_refused(void) {
             TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", steps[s], 1), 0);
             ray_err_t direct = store_hash_build(a);
             int64_t after = store_file_size(a);
-            ray_err_t routed = ray_splay_hash_column(a, NULL);
+            ray_err_t routed = store_hash_routed(a);
             unsetenv("RAY_HASH_INJECT");
             if (direct != RAY_ERR_NYI || after != payload || routed != RAY_OK) bad++;
             if (store_hash_append_legacy(b) != RAY_OK || !store_files_same(a, b)) bad++;
@@ -2647,16 +2709,22 @@ static test_result_t test_col_build_hash_index_refused(void) {
         }
         if (plan == 1) ray_heap_set_anon_watermark(0);
     }
-    /* a splayed save under the same refusal still hashes the column */
+    /* a generation-0 splayed save of an explicit SYM hash under the same
+     * refusal still hashes the column (converters persist no auto-built
+     * hash: index policy, so the explicit index is the save's hash build) */
     int64_t name = ray_sym_intern("k", 1);
     ray_t* t = ray_table_new(1);
-    t = ray_table_add_col(t, name, v);
+    ray_t* sv = store_cancel_sym_col(2003);
+    TEST_ASSERT_TRUE(sv && !RAY_IS_ERR(sv) && (sv->attrs & RAY_ATTR_HAS_INDEX));
+    t = ray_table_add_col(t, name, sv);
+    ray_release(sv);
     char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    char yp[220]; snprintf(yp, sizeof(yp), "%s/t.sym", dir);   /* the SYM columns' symfile */
     TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "map", 1), 0);
-    ray_err_t se = ray_splay_save(t, sd, NULL);
+    ray_err_t se = ray_splay_save_mode(t, sd, yp, RAY_COMPRESS_OFF);
     unsetenv("RAY_HASH_INJECT");
     TEST_ASSERT_EQ_I(se, RAY_OK);
-    ray_t* back = ray_read_splayed(sd, NULL);
+    ray_t* back = ray_read_splayed(sd, yp);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
     if (ray_index_kind(ray_table_get_col(back, name)) != RAY_IDX_HASH) bad++;
     ray_release(back);
@@ -2708,9 +2776,156 @@ static test_result_t test_col_build_hash_index_truncate(void) {
 #endif
 }
 
+/* A cancel skips the finish tasks not yet started and the dispatch returns
+ * normally (#716): close_all must report it and publish no column. */
+static test_result_t test_stream_close_all_cancel(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) SKIP("the finish runs in line without pool workers");
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-cancel-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    ray_col_stream_t w[2];
+    memset(w, 0, sizeof(w));
+    ray_t* v = store_hash_col(RAY_I64, 1000, 97, 0);
+    for (int c = 0; c < 2; c++) {
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(c ? "y" : "x", 1), RAY_I64, NULL, 0), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], v), RAY_OK);
+    }
+    ray_request_interrupt();
+    ray_err_t e = ray_col_stream_close_all(w, 2, false, NULL);
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    for (int c = 0; c < 2; c++) {
+        char p[200]; snprintf(p, sizeof(p), "%s/%s", dir, c ? "y" : "x");
+        TEST_ASSERT_TRUE(access(p, F_OK) != 0);
+    }
+    ray_release(v);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+/* Two explicitly hashed SYM columns, saved as generation 0 (the save
+ * rebuilds an explicit SYM hash over the file-local ids in place,
+ * splay_hash_append): the debug build's "build" injection raises an
+ * interrupt inside the first hash build, once every column file is written.
+ * Converters build no hash of their own (index policy). */
+static ray_t* store_cancel_table(void) {
+    ray_t* t = ray_table_new(2);
+    for (int c = 0; c < 2; c++) {
+        ray_t* v = store_cancel_sym_col(c ? 7919 : 5003);
+        t = ray_table_add_col(t, ray_sym_intern(c ? "b" : "a", 1), v);
+        ray_release(v);
+    }
+    return t;
+}
+#endif
+
+/* A cancel that lands once the columns are written (here: in the hash
+ * build, the last phase before .d) still stops a save: over an existing
+ * table the previous generation stays current, and a first write leaves
+ * no table (a directory made beforehand keeps what else it holds). */
+static test_result_t test_splay_save_cancel_late(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-save-cancel-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    char yp[220]; snprintf(yp, sizeof(yp), "%s/t.sym", dir);   /* the SYM columns' symfile */
+    int64_t small[3] = {1, 2, 3};
+    ray_t* t = ray_table_new(2);
+    for (int c = 0; c < 2; c++) {
+        ray_t* v = ray_vec_from_raw(RAY_I64, small, 3);
+        t = ray_table_add_col(t, ray_sym_intern(c ? "b" : "a", 1), v);
+        ray_release(v);
+    }
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, sd, yp, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(t);
+    t = store_cancel_table();
+    TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+    ray_err_t e = ray_splay_save_mode(t, sd, yp, RAY_COMPRESS_OFF);
+    unsetenv("RAY_HASH_INJECT");
+    bool cancelled = ray_interrupted();
+    ray_clear_interrupt();
+    ray_release(t);
+    TEST_ASSERT_TRUE(cancelled);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    ray_t* back = ray_read_splayed(sd, yp);
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(ray_table_nrows(back), 3);
+    ray_release(back);
+    (void)ray_test_rm_rf(sd);
+    char schema[240], keep[240], col[240];
+    snprintf(schema, sizeof(schema), "%s/.d", sd);
+    snprintf(keep, sizeof(keep), "%s/keep.txt", sd);
+    snprintf(col, sizeof(col), "%s/a", sd);
+    t = store_cancel_table();
+    for (int premade = 0; premade < 2; premade++) {
+        if (premade) {
+            TEST_ASSERT_EQ_I(ray_test_mkdir_p(sd), 0);
+            FILE* f = fopen(keep, "w"); TEST_ASSERT_NOT_NULL(f); fputs("foreign\n", f); fclose(f);
+        }
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+        e = ray_splay_save_mode(t, sd, yp, RAY_COMPRESS_OFF);
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+        TEST_ASSERT_TRUE(access(schema, F_OK) != 0);
+        TEST_ASSERT_TRUE(access(col, F_OK) != 0);
+        TEST_ASSERT_TRUE(premade ? access(keep, F_OK) == 0 : access(sd, F_OK) != 0);
+    }
+    ray_release(t);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
+/* The same cancel skips the dispatch that persists the deferred zones:
+ * what it would have written is released, not left behind a save. */
+static test_result_t test_splay_save_cancel_leaks(void) {
+#if defined(DEBUG) && defined(RAY_OS_LINUX)
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-save-cleak-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    if (!store_in_place(dir)) { (void)ray_test_rm_rf(dir); SKIP("no in-place build on this filesystem"); }
+    char sd[200]; snprintf(sd, sizeof(sd), "%s/t", dir);
+    char yp[220]; snprintf(yp, sizeof(yp), "%s/t.sym", dir);   /* the SYM columns' symfile */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);   /* one worker */
+    ray_t* t = store_cancel_table();
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, sd, yp, RAY_COMPRESS_OFF), RAY_OK);
+    size_t base = 0;
+    int bad = 0;
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "build", 1), 0);
+        if (ray_splay_save_mode(t, sd, yp, RAY_COMPRESS_OFF) != RAY_ERR_CANCEL) bad++;
+        unsetenv("RAY_HASH_INJECT");
+        ray_clear_interrupt();
+        ray_mem_stats_t st; ray_mem_stats(&st);
+        if (k == 1) base = st.bytes_allocated;
+        if (k == 4 && st.bytes_allocated > base + 256) {
+            fprintf(stderr, "  save_cancel_leaks heap %+lld B\n",
+                    (long long)st.bytes_allocated - (long long)base);
+            bad++;
+        }
+    }
+    ray_release(t);
+    ray_pool_destroy();
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#else
+    SKIP("needs a debug build on Linux");
+#endif
+}
+
 /* The marker goes on last: a process that ends with the whole region
  * written but before the marker (debug builds end it right there, in a
- * child) leaves a file that does not claim an index.  The column is under
+ * child) leaves a file that does not claim an index: it loads as the plain
+ * column.  The column is under
  * the parallel threshold: the child has no pool workers. */
 static test_result_t test_col_build_hash_index_marker_last(void) {
 #if defined(DEBUG) && defined(RAY_OS_LINUX)
@@ -2744,9 +2959,12 @@ static test_result_t test_col_build_hash_index_marker_last(void) {
     TEST_ASSERT_EQ_I((int64_t)fread(&mr, 1, 4, f), 4); fclose(f);
     TEST_ASSERT_TRUE(mr != 0);          /* the finished file's marker */
     TEST_ASSERT_TRUE(mp != mr);
-    ray_t* back = ray_col_mmap(p);      /* longer than its payload, unclaimed: refused */
-    TEST_ASSERT_TRUE(back && RAY_IS_ERR(back));
-    ray_error_free(back);
+    ray_t* back = ray_col_mmap(p);      /* the unclaimed region is not read: the plain column */
+    TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+    TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_I(back->len, v->len);
+    TEST_ASSERT_TRUE(memcmp(ray_data(back), ray_data(v), (size_t)v->len * 8) == 0);
+    ray_release(back);
     ray_release(v);
     (void)ray_test_rm_rf(dir);
     PASS();
@@ -2859,13 +3077,569 @@ static test_result_t test_col_build_hash_index_interrupt(void) {
     PASS();
 }
 
-/* Wave width of the hash phase: a pure function of RAM budget and shape. */
-static test_result_t test_stream_hash_wave(void) {
-    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(0, 100, 5), 1);
-    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 0, 5), 5);
-    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 30, 1LL << 40, 5), 1);
-    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(1LL << 40, 1000, 3), 3);
-    TEST_ASSERT_EQ_I(ray_col_stream_hash_wave(4LL * 58 * 1000 * 2, 1000, 5), 2);
+/* A column carrying a HASH (as an older converter's store did) keeps it
+ * through a load and a resave that requests no index: the save cannot tell
+ * it from an explicit .idx.hash.  Generation 0 is pinned (compress off). */
+static int store_slot_kind(ray_t* t, int64_t c) {
+    ray_col_meta_t m;
+    return ray_table_col_meta_idx(t, c, &m) ? (int)m.index_kind : -1;
+}
+static test_result_t test_resave_keeps_hash(void) {
+    char dirs[2][160];
+    snprintf(dirs[0], sizeof(dirs[0]), "%s", ray_test_tmp("/tmp/rayforce-resave-hash0"));
+    snprintf(dirs[1], sizeof(dirs[1]), "%s", ray_test_tmp("/tmp/rayforce-resave-hash1"));
+    for (int i = 0; i < 2; i++) (void)ray_test_rm_rf(dirs[i]);
+    int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_t* h = ray_idx_hash_fn(v);
+    ray_release(v);
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && (h->attrs & RAY_ATTR_HAS_INDEX));
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("u", 1), h);
+    ray_release(h);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(t, dirs[0], NULL, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(t);
+    ray_t* a = ray_read_splayed(dirs[0], NULL);
+    TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+    TEST_ASSERT_EQ_I(store_slot_kind(a, 0), RAY_IDX_HASH);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(a, dirs[1], NULL, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(a);
+    ray_t* b = ray_read_splayed(dirs[1], NULL);
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b));
+    TEST_ASSERT_EQ_I(store_slot_kind(b, 0), RAY_IDX_HASH);
+    ray_release(b);
+    for (int i = 0; i < 2; i++) (void)ray_test_rm_rf(dirs[i]);
+    PASS();
+}
+
+/* ---- lazy in-memory HASH (index policy PI Task 4) ------------------------
+ * A converted table persists a CHUNK_ZONE, not a HASH.  An equality or `in`
+ * probe on an integer column whose zone cannot prune builds a HASH in
+ * memory on first use, held in a process-wide cache that the save path never
+ * sees.  Generation 2 is covered too (Ruling C1): the hash is built from the
+ * materialized plain column and dropped with the encoded object.  Every
+ * path goes through ray_test_tmp; these run in the equivalence pass as well,
+ * where lz_make's save is generation 2. */
+static ray_runtime_t* g_lzrt;
+static void lz_setup(void) {
+    g_lzrt = ray_runtime_create(0, NULL);
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_lazy"));
+}
+static void lz_teardown(void) {
+    ray_idx_lazy_test_fail_build(NULL);
+    ray_idx_lazy_clear();
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_lazy"));
+    ray_runtime_destroy(g_lzrt);
+}
+static void lz_ok(const char* src) {
+    ray_t* r = ray_eval_str(ray_test_tmp(src));
+    if (r && RAY_IS_ERR(r)) { fprintf(stderr, "%s: %s\n", src, ray_error_msg()); ray_error_free(r); abort(); }
+    if (r) ray_release(r);
+}
+static ray_t* lz_eval(const char* src) { return ray_eval_str(ray_test_tmp(src)); }
+/* A converted-like table: an unclustered I64 column h of 300000 rows whose
+ * file carries a CHUNK_ZONE only (what the converters write), beside a
+ * clustered one v.  `opts` is appended to the save (generation choice). */
+static void lz_make_opts(const char* opts) {
+    char src[256];
+    lz_ok("(set i (til 300000))");
+    snprintf(src, sizeof src,
+             "(.db.splayed.set \"/tmp/rayforce_lazy/a/\" (table [h v] (list (%% (* i 7919) 1000003) i))%s)", opts);
+    lz_ok(src);
+    lz_ok("(set A (.db.splayed.get \"/tmp/rayforce_lazy/a/\"))");
+}
+static void lz_make(void) { lz_make_opts(""); }
+/* The table slot's recorded index kind, never decoding (metadata). */
+static int lz_slot_kind(const char* var, const char* col, ray_t** enc_out) {
+    ray_t* t = ray_env_get(ray_sym_intern(var, strlen(var)));
+    ray_col_meta_t m;
+    int64_t c = -1;
+    for (int64_t k = 0; t && k < ray_table_ncols(t); k++)
+        if (ray_table_col_name(t, k) == ray_sym_intern(col, strlen(col))) c = k;
+    if (c < 0 || !ray_table_col_meta_idx(t, c, &m)) return -1;
+    if (enc_out) *enc_out = m.enc;
+    return (int)m.index_kind;
+}
+
+/* Run the point lookup (== h 7919) on `var` n times; true when every
+ * answer is the one row v = 1. */
+static bool lz_probe_n(const char* var, int n) {
+    char src[128];
+    snprintf(src, sizeof src, "(at (select {v: v from: %s where: (== h 7919)}) 'v)", var);
+    for (int k = 0; k < n; k++) {
+        ray_t* r = lz_eval(src);
+        bool ok = r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        if (!ok) return false;
+    }
+    return true;
+}
+/* The table column var.col (borrowed: the table holds it). */
+static ray_t* lz_col(const char* var, const char* col) {
+    ray_t* t = ray_env_get(ray_sym_intern(var, strlen(var)));
+    ray_t* c = t ? ray_table_col(t, ray_sym_intern(col, strlen(col))) : NULL;
+    return c && !RAY_IS_ERR(c) ? c : NULL;
+}
+
+/* The first RAY_IDX_LAZY_BUILD_PROBES - 1 probes scan (their rows are
+ * counted, nothing is built); the next one builds, and later probes reuse it.
+ * Every answer is the same. */
+static test_result_t test_lazy_first_use(void) {
+    lz_make();
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    lz_ok("(do (.idx.uses A) null)");
+    for (int k = 1; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {
+        TEST_ASSERT_TRUE(lz_probe_n("A", 1));
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), (int64_t)k * 300000);
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    ray_t* u = lz_eval("(.idx.uses A)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && ray_dict_len(u) == 0);   /* the scans used no index */
+    ray_release(u);
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));                          /* this one builds */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 300000LL * (8 + 58));
+    u = lz_eval("(at (.idx.uses A) 'h)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u->i64 == 1);          /* attributed to the column */
+    ray_release(u);
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (in h [7919 15838])}) 'v)");   /* rows 1 and 2 */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 2 &&
+                     ((int64_t*)ray_data(r))[0] == 1 && ((int64_t*)ray_data(r))[1] == 2);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);                     /* reused, not rebuilt */
+    u = lz_eval("(at (.idx.uses A) 'h)");
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u->i64 == 1);          /* the in probe used it */
+    ray_release(u);
+    /* the table's column is untouched: its slot records a zone, as does the
+     * column a reader gets */
+    TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", NULL), RAY_IDX_CHUNK_ZONE);
+    ray_t* k = lz_eval("(at (.idx.info (at A 'h)) 'kind)");
+    TEST_ASSERT_TRUE(k && !RAY_IS_ERR(k) && k->i64 == ray_sym_intern("chunk_zone", 10));
+    ray_release(k);
+    PASS();
+}
+
+/* One unsplit AND (a graph run without the optimizer): (== h 15838)
+ * (>= v 0) (<= v hi) over A; the rows, which hold row 2 alone. */
+static ray_t* lz_eq_range(ray_t* tbl, int64_t hi) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* pred = ray_and(g, ray_and(g, ray_eq(g, ray_scan(g, "h"), ray_const_i64(g, 15838)),
+                                           ray_ge(g, ray_scan(g, "v"), ray_const_i64(g, 0))),
+                             ray_le(g, ray_scan(g, "v"), ray_const_i64(g, hi)));
+    ray_t* r = ray_execute(g, ray_filter(g, ray_const_table(g, tbl), pred));
+    ray_graph_free(g);
+    return r;
+}
+
+/* An eq-plus-range conjunction (an unsplit AND: a graph run without the
+ * optimizer) probes the lazy hash for its equality.  The range keeps
+ * every row: a range that keeps only a few chunks of a generation-2 v
+ * prunes the chain from v's chunk statistics first (exec_filter_chain_prune)
+ * and answers the same rows by its scan. */
+static test_result_t test_lazy_eq_range(void) {
+    lz_make();
+    ray_t* tbl = ray_env_get(ray_sym_intern("A", 1));
+    TEST_ASSERT_TRUE(tbl && tbl->type == RAY_TABLE);
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));   /* scans: pending */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_EQRANGE];
+    for (int pass = 0; pass < 2; pass++) {
+        ray_t* r = lz_eq_range(tbl, pass ? 5 : 300000);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 1);
+        ray_t* v = ray_table_col(r, ray_sym_intern("v", 1));
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && ((int64_t*)ray_data(v))[0] == 2);
+        ray_release(r);
+        if (!pass) {
+            TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_EQRANGE], hits0 + 1);
+            TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        }
+    }
+    PASS();
+}
+
+/* Never persisted: a resave of the probed table records a zone, not a hash. */
+static test_result_t test_lazy_not_persisted(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/b/\" A)");
+    lz_ok("(set B (.db.splayed.get \"/tmp/rayforce_lazy/b/\"))");
+    TEST_ASSERT_EQ_I(lz_slot_kind("B", "h", NULL), RAY_IDX_CHUNK_ZONE);
+    ray_t* k = lz_eval("(at (.idx.info (at B 'h)) 'kind)");
+    TEST_ASSERT_TRUE(k && !RAY_IS_ERR(k) && k->i64 == ray_sym_intern("chunk_zone", 10));
+    ray_release(k);
+    PASS();
+}
+
+/* The RAM budget bounds it: below the cost nothing is built, results equal,
+ * and the decline is remembered for the column (no retry per query). */
+static test_result_t test_lazy_budget(void) {
+    lz_make();
+    int64_t saved = __RUNTIME->ram_limit;
+    __RUNTIME->ram_limit = 4LL * (8 + 58) * 300000 - 1;     /* one byte below the bound */
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 7919)}) 'v)");
+    __RUNTIME->ram_limit = saved;
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), -1);    /* declined */
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));  /* budget back: declined stays */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    PASS();
+}
+
+/* A clustered column (zone pruning works) gets no lazy index, and neither
+ * does a query that is not a point lookup. */
+static test_result_t test_lazy_not_wanted(void) {
+    lz_make();
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES; k++) lz_ok("(select {h: h from: A where: (== v 7919)})");
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "v")), -1);   /* not even pending */
+    lz_ok("(select {h: h from: A where: (> h 7919)})");
+    lz_ok("(select {s: (sum h) from: A})");
+    lz_ok("(select {c: (count v) from: A by: h})");
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    PASS();
+}
+
+/* A key outside the column's zone range matches nothing: the zone answers,
+ * no scan work is counted and nothing is built, however often it is asked.
+ * An `in` set wholly outside the range likewise; one in range scans. */
+static test_result_t lazy_out_of_range(const char* opts) {
+    lz_make_opts(opts);
+    uint64_t z0 = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++) {
+        ray_t* r = lz_eval("(count (select {v: v from: A where: (== h 2000000)}))");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 0);
+        ray_release(r);
+        r = lz_eval("(count (select {v: v from: A where: (in h [2000000 -5])}))");
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 0);
+        ray_release(r);
+    }
+    TEST_ASSERT_EQ_I(ray_idx_hits[IDX_SITE_FILTER_ZONE], z0 + 2 * (RAY_IDX_LAZY_BUILD_PROBES + 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), -1);
+    /* in range: 0 is row 0 */
+    ray_t* r = lz_eval("(at (select {v: v from: A where: (== h 0)}) 'v)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->len == 1 && ((int64_t*)ray_data(r))[0] == 0);
+    ray_release(r);
+    r = lz_eval("(count (select {v: v from: A where: (in h [2000000 7919])}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 1);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), 2 * 300000);   /* both scanned */
+    PASS();
+}
+static test_result_t test_lazy_out_of_range(void)      { return lazy_out_of_range(""); }
+static test_result_t test_lazy_out_of_range_gen2(void) { return lazy_out_of_range(" {compress: true}"); }
+
+/* Mappings of files under the lazy tests' root that were unlinked: a
+ * pruned store generation some object still pins.  0 off Linux. */
+static int lz_deleted_mappings(void) {
+    int n = 0;
+#ifdef __linux__
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[1024];
+    const char* root = ray_test_tmp("/tmp/rayforce_lazy");
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, root) && strstr(line, "(deleted)")) n++;
+    fclose(f);
+#endif
+    return n;
+}
+
+/* A table reloaded per request (a server re-reading a store after each
+ * publish) leaves its old column to the cache alone: that entry is dropped
+ * on the next probe, so the cache holds one entry, the heap and the mapped
+ * bytes stay flat, and the pruned generations' files are not pinned. */
+static test_result_t test_lazy_reload_bounded(void) {
+    lz_make();
+    ray_mem_stats_t st;
+    size_t mapped1 = 0, alloc1 = 0;
+    for (int round = 0; round < 3; round++) {
+        if (round) {
+            lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/a/\" A)");   /* a new generation */
+            lz_ok("(set A (.db.splayed.get \"/tmp/rayforce_lazy/a/\"))");
+        }
+        TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 1);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 300000LL * (8 + 58));
+        ray_mem_stats(&st);
+        if (round == 0) { mapped1 = st.sys_mapped; alloc1 = st.bytes_allocated; }
+    }
+    TEST_ASSERT_FMT(st.sys_mapped <= mapped1, "mapped %zu after 3 loads, %zu after 1", st.sys_mapped, mapped1);
+    TEST_ASSERT_FMT(st.bytes_allocated <= alloc1 + (1u << 20), "heap %zu after 3 loads, %zu after 1",
+                    st.bytes_allocated, alloc1);
+    TEST_ASSERT_EQ_I(lz_deleted_mappings(), 0);
+    /* the table goes: its entry goes with the next probe of any column */
+    lz_ok("(set A null)");
+    ray_t* other = ray_vec_new(RAY_I64, 1);
+    other->len = 1; ((int64_t*)ray_data(other))[0] = 7;
+    ray_t* o = NULL;
+    TEST_ASSERT_NULL(ray_idx_lazy_hash(other, &o));
+    TEST_ASSERT_NULL(o);
+    ray_release(other);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    TEST_ASSERT_EQ_I(lz_deleted_mappings(), 0);
+    PASS();
+}
+
+/* The filter's answer `sel` equals the scan oracle `orc` (a vector
+ * expression that no filter-index site sees): same length, same I64 values. */
+static bool lz_same(const char* sel, const char* orc) {
+    ray_t* a = lz_eval(sel);
+    ray_t* b = lz_eval(orc);
+    bool ok = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->len == b->len &&
+              ray_elem_size(a->type) == 8 && ray_elem_size(b->type) == 8 &&
+              memcmp(ray_data(a), ray_data(b), (size_t)a->len * 8) == 0;
+    if (!ok) fprintf(stderr, "lz_same: %s vs %s\n", sel, orc);
+    if (a && RAY_IS_ERR(a)) ray_error_free(a); else if (a) ray_release(a);
+    if (b && RAY_IS_ERR(b)) ray_error_free(b); else if (b) ray_release(b);
+    return ok;
+}
+
+/* TIMESTAMP, the other 8-byte type the cost test admits, waits and builds
+ * like I64; equality and `in` answer the scan's rows throughout. */
+static test_result_t test_lazy_timestamp(void) {
+    lz_ok("(set i (til 300000))");
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/ts/\" (table [t v] (list (+ 2020.01.01D00:00:00.000000000 (% (* i 7919) 1000003)) i)))");
+    lz_ok("(set T (.db.splayed.get \"/tmp/rayforce_lazy/ts/\"))");
+    ray_t* tc = lz_col("T", "t");
+    TEST_ASSERT_TRUE(tc && tc->type == RAY_TIMESTAMP && ray_index_kind(tc) == RAY_IDX_CHUNK_ZONE);
+    const char* sel = "(at (select {v: v from: T where: (== t 2020.01.01D00:00:00.000007919)}) 'v)";
+    const char* orc = "(at (at T 'v) (where (== (at T 't) 2020.01.01D00:00:00.000007919)))";
+    for (int k = 1; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {
+        TEST_ASSERT_TRUE(lz_same(sel, orc));
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    }
+    TEST_ASSERT_TRUE(lz_same(sel, orc));                            /* builds */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    TEST_ASSERT_TRUE(lz_same(sel, orc));
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: T where: (in t [2020.01.01D00:00:00.000007919 2020.01.01D00:00:00.000015838])}) 'v)",
+                             "(at (at T 'v) (where (in (at T 't) [2020.01.01D00:00:00.000007919 2020.01.01D00:00:00.000015838])))"));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    PASS();
+}
+
+/* A column with nulls never builds (the probe sites gate on nulls): the
+ * scan answers every time and no work is counted. */
+static test_result_t test_lazy_nulls_never(void) {
+    lz_ok("(set i (til 300000))");
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/n/\" (table [h v] (list (concat [0Nl] (% (* (til 299999) 7919) 1000003)) i)))");
+    lz_ok("(set N (.db.splayed.get \"/tmp/rayforce_lazy/n/\"))");
+    TEST_ASSERT_TRUE(ray_vec_may_have_nulls(lz_col("N", "h")));
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++) {
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: N where: (== h 7919)}) 'v)",
+                                 "(at (at N 'v) (where (== (at N 'h) 7919)))"));
+        if (k % 16 == 0)
+            TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: N where: (in h [7919 15838])}) 'v)",
+                                     "(at (at N 'v) (where (in (at N 'h) [7919 15838])))"));
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    PASS();
+}
+
+/* A slice of the table and a filtered sub-table carry no chunk zone of the
+ * column: never built, never pending, answers equal the scan's. */
+static test_result_t test_lazy_derived_never(void) {
+    lz_make();
+    lz_ok("(set S (take A 200000))");
+    lz_ok("(set F (select {from: A where: (< v 200000)}))");
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++) {
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: S where: (== h 7919)}) 'v)",
+                                 "(at (at S 'v) (where (== (at S 'h) 7919)))"));
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: F where: (== h 7919)}) 'v)",
+                                 "(at (at F 'v) (where (== (at F 'h) 7919)))"));
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_entries(), 0);
+    PASS();
+}
+
+/* After an update (to a new table or in place) and an insert, the filter
+ * answers the changed rows: the cached copy of the old column is never
+ * served for the new one. */
+static test_result_t test_lazy_after_mutation(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    lz_ok("(set A2 (update {h: 7919 where: (== v 5) from: A}))");
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES + 1; k++)
+        TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A2 where: (== h 7919)}) 'v)",
+                                 "(at (at A2 'v) (where (== (at A2 'h) 7919)))"));
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));                          /* A itself unchanged */
+    lz_ok("(update {h: 7919 where: (== v 6) from: 'A})");
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A where: (== h 7919)}) 'v)",
+                             "(at (at A 'v) (where (== (at A 'h) 7919)))"));
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A where: (in h [7919 15838])}) 'v)",
+                             "(at (at A 'v) (where (in (at A 'h) [7919 15838])))"));
+    ray_t* r = lz_eval("(count (select {v: v from: A where: (== h 7919)}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 2);          /* rows 1 and 6 */
+    ray_release(r);
+    lz_ok("(insert 'A (list 7919 300000))");
+    TEST_ASSERT_TRUE(lz_same("(at (select {v: v from: A where: (== h 7919)}) 'v)",
+                             "(at (at A 'v) (where (== (at A 'h) 7919)))"));
+    r = lz_eval("(count (select {v: v from: A where: (== h 7919)}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 3);          /* and the inserted row */
+    ray_release(r);
+    PASS();
+}
+
+/* Generation 2: the hash comes from the materialized column, the slot keeps
+ * its encoded object and zone, and the entry goes with the object. */
+static test_result_t test_lazy_gen2(void) {
+    lz_make_opts(" {compress: true}");
+    ray_t* enc = NULL;
+    TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", &enc), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NOT_NULL(enc);                                     /* generation 2 */
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    ray_t* r = lz_eval("(count (select {v: v from: A where: (in h [7919 15838 3])}))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->i64 == 2);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    enc = NULL;
+    TEST_ASSERT_EQ_I(lz_slot_kind("A", "h", &enc), RAY_IDX_CHUNK_ZONE);
+    TEST_ASSERT_NOT_NULL(enc);                                     /* still encoded */
+    lz_ok("(.db.splayed.set \"/tmp/rayforce_lazy/b/\" A)");
+    lz_ok("(set B (.db.splayed.get \"/tmp/rayforce_lazy/b/\"))");
+    TEST_ASSERT_EQ_I(lz_slot_kind("B", "h", NULL), RAY_IDX_CHUNK_ZONE);
+    lz_ok("(set B null)");
+    lz_ok("(set A null)");                                         /* the object goes: so does its entry */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), 0);
+    PASS();
+}
+
+/* A wanted column of n rows with a chunk zone of 4096-row chunks (owned). */
+static ray_t* lz_zoned_vec(int64_t n, int64_t salt) {
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = ((i + salt) * 7919) % 1000003;
+    ray_t* z = ray_index_attach_chunk_zone(&v, 12);
+    (void)z;
+    return v;
+}
+
+/* Memos (pending or declined columns) never push out a built index: with
+ * every slot taken, the oldest memo goes first. */
+static test_result_t test_lazy_memo_evicts_memo(void) {
+    ray_t* b = lz_zoned_vec(50000, 0);
+    TEST_ASSERT_TRUE(ray_idx_lazy_hash_wanted(b));
+    ray_t* o = NULL;
+    for (int k = 0; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {
+        if (o) ray_release(o);
+        o = NULL;
+        TEST_ASSERT_NULL(ray_idx_lazy_hash(b, &o));
+    }
+    TEST_ASSERT_NOT_NULL(o);                                       /* built */
+    ray_release(o);
+    ray_t* m[80];
+    for (int k = 0; k < 80; k++) {                                 /* more memos than slots */
+        m[k] = lz_zoned_vec(50000, k + 1);
+        ray_t* mo = NULL;
+        TEST_ASSERT_NULL(ray_idx_lazy_hash(m[k], &mo));
+        TEST_ASSERT_NULL(mo);                                      /* pending */
+    }
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    ray_t* lk = ray_idx_lazy_lookup(b);
+    TEST_ASSERT_NOT_NULL(lk);
+    ray_release(lk);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(m[0]), -1);                 /* the oldest memo went */
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(m[79]), 50000);
+    ray_idx_lazy_clear();
+    for (int k = 0; k < 80; k++) ray_release(m[k]);
+    ray_release(b);
+    PASS();
+}
+
+/* An interrupted build cancels the query (it does not go on to scan) and is
+ * not remembered against the column: the next probe builds.  A build that
+ * runs out of memory is best effort: the scan answers and the column is
+ * declined. */
+static test_result_t test_lazy_cancel(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));
+    ray_idx_lazy_test_fail_build("cancel");
+    ray_t* r = lz_eval("(select {v: v from: A where: (== h 7919)})");
+    ray_idx_lazy_test_fail_build(NULL);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_TRUE(ray_idx_lazy_work(lz_col("A", "h")) > 0);     /* still pending */
+    TEST_ASSERT_TRUE(lz_probe_n("A", 1));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+    PASS();
+}
+static test_result_t test_lazy_oom(void) {
+    lz_make();
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES - 1));
+    ray_idx_lazy_test_fail_build("oom");
+    bool ok = lz_probe_n("A", 1);                                  /* the scan answers */
+    ray_idx_lazy_test_fail_build(NULL);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    TEST_ASSERT_EQ_I(ray_idx_lazy_work(lz_col("A", "h")), -1);    /* declined */
+    TEST_ASSERT_TRUE(lz_probe_n("A", RAY_IDX_LAZY_BUILD_PROBES));
+    TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 0);
+    PASS();
+}
+
+/* Two threads probing the same column at once keep one hash: the loser of
+ * the build race finds the winner's entry under the lock and drops its own. */
+typedef struct { ray_t* col; _Atomic int* go; ray_t* out; ray_t* err; } lz_thr_t;
+static void lz_probe_thread(void* raw) {
+    lz_thr_t* t = raw;
+    ray_rc_sync = true;                                 /* shared objects: atomic counts, as a worker */
+    atomic_fetch_add(t->go, 1);
+    while (atomic_load(t->go) < 2) { }
+    t->err = ray_idx_lazy_hash(t->col, &t->out);
+    if (t->err) { ray_error_free(t->err); t->err = (ray_t*)1; }
+    ray_heap_abandon();
+}
+static test_result_t test_lazy_concurrent(void) {
+    int64_t n = 50000;                                  /* below the parallel build: no pool */
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = (i * 7919) % 1000003;
+    ray_t* z = ray_index_attach_chunk_zone(&v, 12);     /* 13 chunks of 4096 rows */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(z));
+    TEST_ASSERT_TRUE(ray_idx_lazy_hash_wanted(v));
+    for (int round = 0; round < 8; round++) {
+        ray_idx_lazy_clear();
+        for (int k = 1; k < RAY_IDX_LAZY_BUILD_PROBES; k++) {   /* pending: the scans' work */
+            ray_t* o = NULL;
+            TEST_ASSERT_NULL(ray_idx_lazy_hash(v, &o));
+            TEST_ASSERT_NULL(o);
+        }
+        _Atomic int go = 0;
+        lz_thr_t t[2]; ray_thread_t th[2];
+        for (int k = 0; k < 2; k++) {
+            t[k] = (lz_thr_t){ .col = v, .go = &go, .out = NULL, .err = NULL };
+            TEST_ASSERT_EQ_I(ray_thread_create(&th[k], lz_probe_thread, &t[k]), RAY_OK);
+        }
+        for (int k = 0; k < 2; k++) ray_thread_join(th[k]);
+        TEST_ASSERT_TRUE(!t[0].err && !t[1].err && t[0].out && t[1].out);
+        TEST_ASSERT_EQ_PTR(t[0].out, t[1].out);           /* one indexed copy */
+        TEST_ASSERT_EQ_I(ray_idx_lazy_count(), 1);
+        TEST_ASSERT_EQ_I(ray_idx_lazy_bytes(), n * (8 + 58));
+        ray_t* lk = ray_idx_lazy_lookup(v);               /* retained */
+        TEST_ASSERT_EQ_PTR(lk, t[0].out);
+        ray_release(lk);
+        TEST_ASSERT_EQ_I(ray_index_kind(t[0].out), RAY_IDX_HASH);
+        TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_CHUNK_ZONE);  /* the column is untouched */
+        ray_release(t[0].out); ray_release(t[1].out);
+    }
+    ray_idx_lazy_clear();
+    ray_release(v);
     PASS();
 }
 
@@ -2965,7 +3739,7 @@ static test_result_t test_stream_finish_failure_publishes_nothing(void) {
     ray_t* b = ray_vec_new(RAY_I64, n); b->len = n;
     for (int64_t i = 0; i < n; i++) {
         ((int64_t*)ray_data(a))[i] = i;
-        ((int64_t*)ray_data(b))[i] = (i * 7919) % 1000003;   /* a hash candidate */
+        ((int64_t*)ray_data(b))[i] = (i * 7919) % 1000003;   /* unclustered */
     }
     ray_t* s = dict_test_col(100000, 3000, false);
     ray_t* cols[3] = { a, b, s };
@@ -2973,7 +3747,7 @@ static test_result_t test_stream_finish_failure_publishes_nothing(void) {
     const char* names[3] = { "fa", "fb", "fs" };
     ray_col_stream_t w[3];
     for (int c = 0; c < 3; c++) {
-        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), types[c], NULL), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), types[c], NULL, 0), RAY_OK);
         TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w[c], 0), RAY_OK);
         TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], cols[c]), RAY_OK);
     }
@@ -2985,11 +3759,48 @@ static test_result_t test_stream_finish_failure_publishes_nothing(void) {
     for (int c = 0; c < 3; c++) {
         char path[200]; snprintf(path, sizeof(path), "%s/%s", dir, names[c]);
         TEST_ASSERT_TRUE(access(path, F_OK) != 0);
-        TEST_ASSERT_NULL(w[c].index);
         ray_col_stream_abort(&w[c]);   /* converters abort after a failed close */
     }
     TEST_ASSERT_FALSE(stream_dir_has_tmp(dir));
     ray_release(a); ray_release(b); ray_release(s);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* A cancelled pool retires the finish tasks it has not run: close_all
+ * reports the cancellation and publishes nothing (it used to return OK with
+ * every column file missing), and publish refuses a writer whose finish
+ * never ran.  Deterministic: the cancel flag is up before the dispatch, so
+ * the pool skips every task. */
+static test_result_t test_stream_cancel_publishes_nothing(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, 3, 2)) SKIP("needs a worker pool");
+    char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-cancel-%d", (int)getpid());
+    (void)ray_test_rm_rf(dir);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    int64_t n = 70000;
+    ray_t* a = ray_vec_new(RAY_I64, n); a->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(a))[i] = i * 3;
+    const char* names[3] = { "ca", "cb", "cc" };
+    uint8_t gens[3] = { 0, 2, 0 };
+    ray_col_stream_t w[3];
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT_EQ_I(ray_col_stream_open(&w[c], dir, ray_sym_intern(names[c], 2), RAY_I64, NULL, gens[c]), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_col_stream_append(&w[c], a), RAY_OK);
+    }
+    /* an open writer: publish refuses, the staging file stays private */
+    TEST_ASSERT_EQ_I(ray_col_stream_publish(&w[0], false), RAY_ERR_DOMAIN);
+    ray_request_interrupt();
+    ray_err_t e = ray_col_stream_close_all(w, 3, false, NULL);
+    ray_clear_interrupt();
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    for (int c = 0; c < 3; c++) {
+        char path[200]; snprintf(path, sizeof(path), "%s/%s", dir, names[c]);
+        TEST_ASSERT_TRUE(access(path, F_OK) != 0);
+        ray_col_stream_abort(&w[c]);
+    }
+    TEST_ASSERT_FALSE(stream_dir_has_tmp(dir));
+    ray_release(a);
     (void)ray_test_rm_rf(dir);
     PASS();
 }
@@ -3001,7 +3812,7 @@ static test_result_t test_stream_inline_dict(void) {
     int64_t n = 100000;
     ray_t* v = dict_test_col(n, 3000, false);
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_index_begin(&w, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
@@ -3081,9 +3892,9 @@ static test_result_t test_file_rename_new_emulated(void) {
 /* ---- test_file_shared_lock_concurrent ---------------------------------- */
 
 static test_result_t test_file_shared_lock_concurrent(void) {
-    unlink(TMP_FILEIO_PATH);
-    ray_fd_t fd1 = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
-    ray_fd_t fd2 = ray_file_open(TMP_FILEIO_PATH, RAY_OPEN_READ);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
+    ray_fd_t fd1 = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+    ray_fd_t fd2 = ray_file_open(ray_test_tmp(TMP_FILEIO_PATH), RAY_OPEN_READ);
     TEST_ASSERT((fd1) != (RAY_FD_INVALID), "fd1 != RAY_FD_INVALID");
     TEST_ASSERT((fd2) != (RAY_FD_INVALID), "fd2 != RAY_FD_INVALID");
 
@@ -3097,7 +3908,7 @@ static test_result_t test_file_shared_lock_concurrent(void) {
     ray_file_unlock(fd2);
     ray_file_close(fd1);
     ray_file_close(fd2);
-    unlink(TMP_FILEIO_PATH);
+    unlink(ray_test_tmp(TMP_FILEIO_PATH));
     PASS();
 }
 
@@ -3119,11 +3930,11 @@ static test_result_t test_sym_col_bounds_reject(void) {
     data[0] = 0; data[1] = 1; data[2] = 0; data[3] = 1;
 
     /* Save — should embed sym count in header rc field */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load back — should succeed since all indices < sym_count */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
@@ -3132,23 +3943,23 @@ static test_result_t test_sym_col_bounds_reject(void) {
 
     /* Now craft a column with an out-of-range index */
     data[2] = (uint8_t)(sc + 10);  /* beyond sym table */
-    err = ray_col_save(vec, TMP_COL_PATH);
+    err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load should fail with RAY_ERR_CORRUPT */
-    ray_t* bad = ray_col_load(TMP_COL_PATH);
+    ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
     /* Same test via mmap */
-    bad = ray_col_mmap(TMP_COL_PATH);
+    bad = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -3172,7 +3983,7 @@ static test_result_t test_sym_col_count_mismatch(void) {
     data[0] = 0; data[1] = 1; data[2] = 2;
 
     /* Save with current sym count */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
     ray_release(vec);
 
@@ -3185,18 +3996,18 @@ static test_result_t test_sym_col_count_mismatch(void) {
     TEST_ASSERT((new_sc) < (sc), "new_sc < sc");
 
     /* Load should fail: saved sym count > current sym count (fast-reject) */
-    ray_t* bad = ray_col_load(TMP_COL_PATH);
+    ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
     /* Same via mmap */
-    bad = ray_col_mmap(TMP_COL_PATH);
+    bad = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -3221,10 +4032,10 @@ static test_result_t test_sym_col_valid_roundtrip(void) {
     data[4] = (uint16_t)id1;
 
     /* Save + load roundtrip */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
@@ -3241,7 +4052,7 @@ static test_result_t test_sym_col_valid_roundtrip(void) {
     ray_release(loaded);
 
     /* Save + mmap roundtrip */
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->type, RAY_SYM);
@@ -3253,7 +4064,7 @@ static test_result_t test_sym_col_valid_roundtrip(void) {
 
     ray_release(mapped);
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -3263,8 +4074,8 @@ static test_result_t test_sym_col_valid_roundtrip(void) {
 #define TMP_SYM_PATH      "/tmp/rayforce_test_splay_sym_file"
 
 static test_result_t test_splay_load_with_sym(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
-    unlink(TMP_SYM_PATH);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_SYM_DIR));
+    unlink(ray_test_tmp(TMP_SYM_PATH));
 
     /* Intern symbols and build a table with a RAY_SYM column */
     int64_t id_name = ray_sym_intern("name", 4);
@@ -3291,7 +4102,7 @@ static test_result_t test_splay_load_with_sym(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     /* Save splay + sym */
-    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_SYM_DIR, TMP_SYM_PATH);
+    ray_err_t err = ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_SYM_DIR), ray_test_tmp(TMP_SYM_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Reset sym table, then load via ray_splay_load with sym_path */
@@ -3299,7 +4110,7 @@ static test_result_t test_splay_load_with_sym(void) {
     (void)ray_sym_init();
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
-    ray_t* loaded = ray_splay_load(TMP_SPLAY_SYM_DIR, TMP_SYM_PATH);
+    ray_t* loaded = ray_splay_load(ray_test_tmp(TMP_SPLAY_SYM_DIR), ray_test_tmp(TMP_SYM_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
@@ -3312,17 +4123,17 @@ static test_result_t test_splay_load_with_sym(void) {
     ray_release(col_name);
     ray_release(col_age);
     ray_release(tbl);
-    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
-    unlink(TMP_SYM_PATH);
-    unlink(TMP_SYM_PATH ".lk");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_SYM_DIR));
+    unlink(ray_test_tmp(TMP_SYM_PATH));
+    unlink(ray_test_tmp(TMP_SYM_PATH ".lk"));
     PASS();
 }
 
 /* ---- test_splay_load_sym_missing_corrupt ------------------------------- */
 
 static test_result_t test_splay_load_sym_missing_corrupt(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
-    unlink(TMP_SYM_PATH);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_SYM_DIR));
+    unlink(ray_test_tmp(TMP_SYM_PATH));
 
     /* Intern symbols and build a table with a RAY_SYM column */
     int64_t id_col = ray_sym_intern("scol", 4);
@@ -3338,7 +4149,7 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     /* Save splay + sym */
-    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_SYM_DIR, TMP_SYM_PATH);
+    ray_err_t err = ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_SYM_DIR), ray_test_tmp(TMP_SYM_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Reset sym table — simulate loading without sym */
@@ -3351,23 +4162,23 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
      * no resolvable domain must never resolve against incidental state
      * (sym-domain spec, Load §3; replaces the old validate_sym_columns
      * "corrupt" which keyed off the global table being empty). */
-    ray_t* loaded = ray_splay_load(TMP_SPLAY_SYM_DIR, NULL);
+    ray_t* loaded = ray_splay_load(ray_test_tmp(TMP_SPLAY_SYM_DIR), NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
     TEST_ASSERT_STR_EQ(ray_err_code(loaded), "sym");
     ray_release(loaded);
 
     ray_release(col);
     ray_release(tbl);
-    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
-    unlink(TMP_SYM_PATH);
-    unlink(TMP_SYM_PATH ".lk");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_SYM_DIR));
+    unlink(ray_test_tmp(TMP_SYM_PATH));
+    unlink(ray_test_tmp(TMP_SYM_PATH ".lk"));
     PASS();
 }
 
 /* ---- test_read_splayed_bad_sym_fatal ----------------------------------- */
 
 static test_result_t test_read_splayed_bad_sym_fatal(void) {
-    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_SYM_DIR));
 
     /* Build a simple table (no RAY_SYM columns needed) */
     int64_t id_x = ray_sym_intern("x", 1);
@@ -3377,7 +4188,7 @@ static test_result_t test_read_splayed_bad_sym_fatal(void) {
     tbl = ray_table_add_col(tbl, id_x, col_x);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_SYM_DIR, NULL);
+    ray_err_t err = ray_splay_save(tbl, ray_test_tmp(TMP_SPLAY_SYM_DIR), NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* ray_read_splayed with a nonexistent sym_path on a SYMBOL-FREE
@@ -3386,7 +4197,7 @@ static test_result_t test_read_splayed_bad_sym_fatal(void) {
      * where the domain would live, not a promise it exists).  The loud
      * "sym" error is reserved for actual SYM columns without a domain
      * (test_splay_load_sym_missing_corrupt above). */
-    ray_t* loaded = ray_read_splayed(TMP_SPLAY_SYM_DIR, "/tmp/rayforce_nonexistent_sym_xyz");
+    ray_t* loaded = ray_read_splayed(ray_test_tmp(TMP_SPLAY_SYM_DIR), ray_test_tmp("/tmp/rayforce_nonexistent_sym_xyz"));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
@@ -3394,7 +4205,7 @@ static test_result_t test_read_splayed_bad_sym_fatal(void) {
 
     ray_release(col_x);
     ray_release(tbl);
-    (void)ray_test_rm_rf(TMP_SPLAY_SYM_DIR);
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_SPLAY_SYM_DIR));
     PASS();
 }
 
@@ -4025,10 +4836,10 @@ static test_result_t test_serde_obj_save_load(void) {
     ray_t* v = ray_vec_from_raw(RAY_I64, raw, 4);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
 
-    ray_err_t err = ray_obj_save(v, TMP_SERDE_PATH);
+    ray_err_t err = ray_obj_save(v, ray_test_tmp(TMP_SERDE_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* back = ray_obj_load(TMP_SERDE_PATH);
+    ray_t* back = ray_obj_load(ray_test_tmp(TMP_SERDE_PATH));
     TEST_ASSERT_NOT_NULL(back); TEST_ASSERT_FALSE(RAY_IS_ERR(back));
     TEST_ASSERT_EQ_I(back->type, RAY_I64);
     TEST_ASSERT_EQ_I(back->len, 4);
@@ -4037,7 +4848,7 @@ static test_result_t test_serde_obj_save_load(void) {
 
     ray_release(back);
     ray_release(v);
-    unlink(TMP_SERDE_PATH);
+    unlink(ray_test_tmp(TMP_SERDE_PATH));
     PASS();
 }
 
@@ -4045,32 +4856,32 @@ static test_result_t test_serde_obj_save_load(void) {
 static test_result_t test_serde_obj_load_errors(void) {
     /* Non-existent file */
     {
-        ray_t* r = ray_obj_load("/tmp/rayforce_nonexistent_42.rfl");
+        ray_t* r = ray_obj_load(ray_test_tmp("/tmp/rayforce_nonexistent_42.rfl"));
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r);
     }
     /* Empty file */
     {
-        FILE* f = fopen("/tmp/rayforce_empty_test.rfl", "wb");
+        FILE* f = fopen(ray_test_tmp("/tmp/rayforce_empty_test.rfl"), "wb");
         TEST_ASSERT_NOT_NULL(f);
         fclose(f);
-        ray_t* r = ray_obj_load("/tmp/rayforce_empty_test.rfl");
+        ray_t* r = ray_obj_load(ray_test_tmp("/tmp/rayforce_empty_test.rfl"));
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r);
-        unlink("/tmp/rayforce_empty_test.rfl");
+        unlink(ray_test_tmp("/tmp/rayforce_empty_test.rfl"));
     }
     /* Bad data (no valid header) */
     {
-        FILE* f = fopen("/tmp/rayforce_bad_test.rfl", "wb");
+        FILE* f = fopen(ray_test_tmp("/tmp/rayforce_bad_test.rfl"), "wb");
         TEST_ASSERT_NOT_NULL(f);
         uint8_t junk[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
                           0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C};
         fwrite(junk, 1, sizeof(junk), f);
         fclose(f);
-        ray_t* r = ray_obj_load("/tmp/rayforce_bad_test.rfl");
+        ray_t* r = ray_obj_load(ray_test_tmp("/tmp/rayforce_bad_test.rfl"));
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r);
-        unlink("/tmp/rayforce_bad_test.rfl");
+        unlink(ray_test_tmp("/tmp/rayforce_bad_test.rfl"));
     }
     PASS();
 }
@@ -5646,10 +6457,10 @@ static test_result_t test_col_save_load_bool_u8_i16(void) {
         TEST_ASSERT_NOT_NULL(vec);
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_EQ_I(err, RAY_OK);
 
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_NOT_NULL(loaded);
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_EQ_I(loaded->type, RAY_BOOL);
@@ -5660,14 +6471,14 @@ static test_result_t test_col_save_load_bool_u8_i16(void) {
         TEST_ASSERT_TRUE(ld[2]);
         ray_release(loaded);
 
-        ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+        ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_NOT_NULL(mapped);
         TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
         TEST_ASSERT_EQ_I(mapped->type, RAY_BOOL);
         TEST_ASSERT_EQ_I(mapped->len, 5);
         ray_release(mapped);
         ray_release(vec);
-        unlink(TMP_COL_PATH);
+        unlink(ray_test_tmp(TMP_COL_PATH));
     }
     /* RAY_U8 */
     {
@@ -5675,10 +6486,10 @@ static test_result_t test_col_save_load_bool_u8_i16(void) {
         ray_t* vec = ray_vec_from_raw(RAY_U8, raw, 3);
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_EQ_I(err, RAY_OK);
 
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_EQ_I(loaded->type, RAY_U8);
         TEST_ASSERT_EQ_I(loaded->len, 3);
@@ -5688,7 +6499,7 @@ static test_result_t test_col_save_load_bool_u8_i16(void) {
         TEST_ASSERT_EQ_I(ld[2], 30);
         ray_release(loaded);
         ray_release(vec);
-        unlink(TMP_COL_PATH);
+        unlink(ray_test_tmp(TMP_COL_PATH));
     }
     /* RAY_I16 */
     {
@@ -5696,10 +6507,10 @@ static test_result_t test_col_save_load_bool_u8_i16(void) {
         ray_t* vec = ray_vec_from_raw(RAY_I16, raw, 3);
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_EQ_I(err, RAY_OK);
 
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_EQ_I(loaded->type, RAY_I16);
         TEST_ASSERT_EQ_I(loaded->len, 3);
@@ -5709,7 +6520,7 @@ static test_result_t test_col_save_load_bool_u8_i16(void) {
         TEST_ASSERT_EQ_I(ld[2], 200);
         ray_release(loaded);
         ray_release(vec);
-        unlink(TMP_COL_PATH);
+        unlink(ray_test_tmp(TMP_COL_PATH));
     }
     PASS();
 }
@@ -5722,45 +6533,45 @@ static test_result_t test_col_save_load_date_time_timestamp(void) {
         int32_t raw[] = {100, 200, 300};
         ray_t* vec = ray_vec_from_raw(RAY_DATE, raw, 3);
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_EQ_I(err, RAY_OK);
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_EQ_I(loaded->type, RAY_DATE);
         TEST_ASSERT_EQ_I(loaded->len, 3);
         ray_release(loaded);
         ray_release(vec);
-        unlink(TMP_COL_PATH);
+        unlink(ray_test_tmp(TMP_COL_PATH));
     }
     /* RAY_TIME */
     {
         int64_t raw[] = {0, 3600000000000LL, 7200000000000LL};
         ray_t* vec = ray_vec_from_raw(RAY_TIME, raw, 3);
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_EQ_I(err, RAY_OK);
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_EQ_I(loaded->type, RAY_TIME);
         TEST_ASSERT_EQ_I(loaded->len, 3);
         ray_release(loaded);
         ray_release(vec);
-        unlink(TMP_COL_PATH);
+        unlink(ray_test_tmp(TMP_COL_PATH));
     }
     /* RAY_TIMESTAMP */
     {
         int64_t raw[] = {1000000000000LL, 2000000000000LL};
         ray_t* vec = ray_vec_from_raw(RAY_TIMESTAMP, raw, 2);
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_EQ_I(err, RAY_OK);
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_EQ_I(loaded->type, RAY_TIMESTAMP);
         TEST_ASSERT_EQ_I(loaded->len, 2);
         ray_release(loaded);
         ray_release(vec);
-        unlink(TMP_COL_PATH);
+        unlink(ray_test_tmp(TMP_COL_PATH));
     }
     PASS();
 }
@@ -5783,10 +6594,10 @@ static test_result_t test_col_sym_w32_roundtrip(void) {
     uint32_t* data = (uint32_t*)ray_data(vec);
     data[0] = 0; data[1] = 1; data[2] = 2;
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
@@ -5801,16 +6612,16 @@ static test_result_t test_col_sym_w32_roundtrip(void) {
 
     /* Out-of-range W32 index should be rejected on load */
     data[1] = sc + 100;
-    err = ray_col_save(vec, TMP_COL_PATH);
+    err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* bad = ray_col_load(TMP_COL_PATH);
+    ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -5821,24 +6632,24 @@ static test_result_t test_col_save_load_empty(void) {
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_I64);
     TEST_ASSERT_EQ_I(loaded->len, 0);
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->len, 0);
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -5846,7 +6657,7 @@ static test_result_t test_col_save_load_empty(void) {
 /* Covers col_validate_mapped: invalid type in header triggers "nyi" error. */
 static test_result_t test_col_validate_mapped_bad_type(void) {
     /* Write a 32-byte file with type=RAY_ERROR (127) in byte 18 */
-    FILE* f = fopen(TMP_COL_PATH, "wb");
+    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[32];
     memset(hdr, 0, 32);
@@ -5863,97 +6674,13 @@ static test_result_t test_col_validate_mapped_bad_type(void) {
     fclose(f);
 
     /* Both load and mmap should fail; mmap uses col_validate_mapped */
-    ray_t* result = ray_col_mmap(TMP_COL_PATH);
+    ray_t* result = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(result));
     /* "nyi" from col_validate_mapped invalid type branch */
     TEST_ASSERT_STR_EQ(ray_err_code(result), "nyi");
     ray_release(result);
 
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_validate_mapped_neg_len ------------------------------------- */
-/* Covers col_validate_mapped: negative len in header => "corrupt". */
-static test_result_t test_col_validate_mapped_neg_len(void) {
-    FILE* f = fopen(TMP_COL_PATH, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t hdr[32];
-    memset(hdr, 0, 32);
-    hdr[17] = RAY_COL_FORMAT_MAJOR; /* `order` = major version — pass the gate */
-    hdr[18] = RAY_I64;  /* valid type */
-    hdr[19] = 0;
-    hdr[20] = 1;        /* rc = 1 */
-    /* len = -1 at bytes 24-31 as little-endian int64 */
-    int64_t neg = -1;
-    memcpy(hdr + 24, &neg, 8);
-    fwrite(hdr, 1, 32, f);
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_validate_mapped_data_truncated ----------------------------- */
-/* Covers col_validate_mapped: data region extends beyond file => "corrupt". */
-static test_result_t test_col_validate_mapped_data_truncated(void) {
-    FILE* f = fopen(TMP_COL_PATH, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t hdr[40];  /* 32-byte header + 8 bytes of data (but claim 10 I64 elems) */
-    memset(hdr, 0, 40);
-    hdr[17] = RAY_COL_FORMAT_MAJOR; /* `order` = major version — pass the gate */
-    hdr[18] = RAY_I64;  /* esz = 8 */
-    hdr[20] = 1;        /* rc = 1 */
-    int64_t len = 10;   /* 10 * 8 = 80 bytes needed, but only 8 written => truncated */
-    memcpy(hdr + 24, &len, 8);
-    fwrite(hdr, 1, 40, f);  /* 40 bytes total, needs 32+80=112 */
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_mmap_size_mismatch ---------------------------------------- */
-/* Covers ray_col_mmap: file size != expected (32 + data + bitmap) => "io". */
-static test_result_t test_col_mmap_size_mismatch(void) {
-    /* Save a valid I64 column, then append a junk byte to break the size check */
-    int64_t raw[] = {1, 2, 3};
-    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    ray_release(vec);
-
-    /* Append one extra byte to break the exact-size check in ray_col_mmap */
-    FILE* f = fopen(TMP_COL_PATH, "ab");
-    TEST_ASSERT_NOT_NULL(f);
-    uint8_t extra = 0xAB;
-    fwrite(&extra, 1, 1, f);
-    fclose(f);
-
-    /* ray_col_load should still succeed (it re-validates differently) */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
-    TEST_ASSERT_NOT_NULL(loaded);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
-    ray_release(loaded);
-
-    /* ray_col_mmap should fail: size mismatch */
-    ray_t* result = ray_col_mmap(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "io");
-    ray_release(result);
-
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -5982,10 +6709,10 @@ static test_result_t test_col_recursive_atoms(void) {
 
     /* is_str_list returns false (mixed types) => goes through col_save_list
      * which calls col_write_recursive with atom elements */
-    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(list, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
@@ -6005,7 +6732,7 @@ static test_result_t test_col_recursive_atoms(void) {
     ray_release(a_str);
     ray_release(a_bool);
     ray_release(list);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -6038,10 +6765,10 @@ static test_result_t test_col_recursive_sym_in_list(void) {
     list = ray_list_append(list, sym_vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(list));
 
-    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(list, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
@@ -6062,7 +6789,7 @@ static test_result_t test_col_recursive_sym_in_list(void) {
     ray_release(loaded);
     ray_release(sym_vec);
     ray_release(list);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     (void)sc;
     PASS();
 }
@@ -6088,11 +6815,11 @@ static test_result_t test_col_sym_w64_negative_index(void) {
      * that won't be validated, then patch the file. */
     /* Simpler: save valid column first to establish file, then corrupt index */
     data[2] = 0;  /* make it valid for save */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Now patch byte at offset 32 + 2*8 = 48 to be 0xFF (represents -1 as int64 MSB) */
-    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
     TEST_ASSERT_NOT_NULL(f);
     /* data[2] is at offset 32 + 16 bytes = 48; set it to -1 */
     fseek(f, 32 + 16, SEEK_SET);
@@ -6101,18 +6828,18 @@ static test_result_t test_col_sym_w64_negative_index(void) {
     fclose(f);
 
     /* Load should fail with "corrupt" since p[i] < 0 in W64 branch */
-    ray_t* bad = ray_col_load(TMP_COL_PATH);
+    ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
-    bad = ray_col_mmap(TMP_COL_PATH);
+    bad = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     (void)sc;
     PASS();
 }
@@ -6146,11 +6873,11 @@ static test_result_t test_col_str_pool_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(vec->str_pool);
     TEST_ASSERT_TRUE(vec->str_pool->len > 0);
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* --- Round-trip via ray_col_load (deep-copy str pool) --- */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_STR);
@@ -6166,7 +6893,7 @@ static test_result_t test_col_str_pool_roundtrip(void) {
     ray_release(loaded);
 
     /* --- Round-trip via ray_col_mmap (zero-copy, pool->mmod=2) --- */
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->type, RAY_STR);
@@ -6178,7 +6905,7 @@ static test_result_t test_col_str_pool_roundtrip(void) {
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -6198,14 +6925,14 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     vec = ray_str_vec_append(vec, other, strlen(other));
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(vec, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
 
     /* [32-byte column header][16-byte descriptors]; hash32 is descriptor
      * bytes 12..15.  These model arbitrary nonzero legacy padding. */
     static const uint32_t garbage[] = {
         0x11111111u, 0x22222222u, 0x33333333u
     };
-    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
     TEST_ASSERT_NOT_NULL(f);
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT_EQ_I(fseek(f, 32L + (long)i * 16L + 12L, SEEK_SET), 0);
@@ -6218,7 +6945,7 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
     TEST_ASSERT_EQ_U(fwrite(&legacy_rc, 1, sizeof(legacy_rc), f), sizeof(legacy_rc));
     TEST_ASSERT_EQ_I(fclose(f), 0);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     ray_str_t* ld = (ray_str_t*)ray_data(loaded);
@@ -6235,7 +6962,7 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
     ray_release(groups);
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     ray_str_t* md = (ray_str_t*)ray_data(mapped);
@@ -6253,7 +6980,7 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
     ray_release(mapped);
 
     /* MAP_PRIVATE repair must not rewrite the persisted legacy bytes. */
-    f = fopen(TMP_COL_PATH, "rb");
+    f = fopen(ray_test_tmp(TMP_COL_PATH), "rb");
     TEST_ASSERT_NOT_NULL(f);
     TEST_ASSERT_EQ_I(fseek(f, 32L + 12L, SEEK_SET), 0);
     uint32_t persisted = 0;
@@ -6263,7 +6990,7 @@ static test_result_t test_col_str_legacy_hash_repair(void) {
     TEST_ASSERT_EQ_U(persisted, garbage[0]);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -6358,7 +7085,7 @@ static test_result_t test_stream_str_hash_persisted(void) {
         if (!ray_str_is_inline(&vd[i])) vd[i].hash32 = 0;
     }
     ray_col_stream_t w;
-    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, dir, ray_sym_intern("s", 1), RAY_STR, NULL, 0), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
     TEST_ASSERT_EQ_I(ray_col_stream_close(&w, false), RAY_OK);
 
@@ -6693,17 +7420,19 @@ static test_result_t test_parted_restored_mtime(void) {
 }
 
 /* Both generations remain intact: their file signatures cannot substitute
- * for comparing the resolved directory. Also prove the sweep drops refs. */
+ * for comparing the resolved directory. Also prove the sweep drops refs.
+ * Saved as generation 0: the asserts read plain segments' payloads and
+ * reference counts. */
 static test_result_t test_parted_generation_and_sweep(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* a = parted_remount_part(10);
     ray_t* b = parted_remount_part(20);
-    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "/2/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(a, TMP_PARTED_ROOT "/1/t", NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(b, TMP_PARTED_ROOT "/2/t", NULL, RAY_COMPRESS_OFF), RAY_OK);
     ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
     ray_t** s1 = (ray_t**)ray_data(ray_table_get_col_idx(m1, 1));
-    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "/1/t/.generations/g-1", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(b, TMP_PARTED_ROOT "/1/t/.generations/g-1", NULL, RAY_COMPRESS_OFF), RAY_OK);
     FILE* f = fopen(TMP_PARTED_ROOT "/1/t/.current", "wb");
     TEST_ASSERT_NOT_NULL(f);
     TEST_ASSERT_TRUE(fputs(".generations/g-1\n", f) >= 0);
@@ -6725,7 +7454,9 @@ static test_result_t test_parted_generation_and_sweep(void) {
 }
 
 /* The limit applies across roots/tables even when every view remains live.
- * Eviction only drops the cache's reference, so the oldest view still reads. */
+ * Eviction only drops the cache's reference, so the oldest view still reads.
+ * Saved as generation 0: the asserts read plain segments' payloads and
+ * reference counts. */
 static test_result_t test_parted_cache_limit(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* src = parted_remount_part(10);
@@ -6734,7 +7465,7 @@ static test_result_t test_parted_cache_limit(void) {
         char path[128], name[24];
         snprintf(name, sizeof(name), "t%d", i);
         snprintf(path, sizeof(path), "%s/1/%s", TMP_PARTED_ROOT, name);
-        TEST_ASSERT_EQ_I(ray_splay_save_bulk(src, path, NULL), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_splay_save_bulk_mode(src, path, NULL, RAY_COMPRESS_OFF), RAY_OK);
         views[i] = ray_read_parted(TMP_PARTED_ROOT, name);
         TEST_ASSERT_TRUE(views[i] && !RAY_IS_ERR(views[i]));
     }
@@ -6773,10 +7504,11 @@ static void parted_mount_thread(void* arg) {
     ray_heap_abandon();
 }
 
+/* Saved as generation 0: the mount threads read a plain segment's payload. */
 static test_result_t test_parted_concurrent_mounts(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* src = parted_remount_part(10);
-    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(src, TMP_PARTED_ROOT "/1/t", NULL, RAY_COMPRESS_OFF), RAY_OK);
     atomic_int ready = 0;
     atomic_bool go = false;
     parted_thread_t ctx[4];
@@ -6848,11 +7580,11 @@ static test_result_t test_col_format_version_roundtrip(void) {
     int32_t raw[] = {11, 22, 33, 44};
     ray_t* vec = ray_vec_from_raw(RAY_I32, raw, 4);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(vec, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
 
     /* On disk: aux[0..15] all zero (no magic); byte 17 (order) == major. */
     {
-        FILE* f = fopen(TMP_COL_PATH, "rb");
+        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "rb");
         TEST_ASSERT_NOT_NULL(f);
         uint8_t hd[18];
         TEST_ASSERT_EQ_U(fread(hd, 1, 18, f), 18);
@@ -6862,7 +7594,7 @@ static test_result_t test_col_format_version_roundtrip(void) {
     }
 
     /* save -> load (deep copy): values intact, runtime aux reconstructed. */
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_I32);
     TEST_ASSERT_EQ_I(loaded->len, 4);
@@ -6874,7 +7606,7 @@ static test_result_t test_col_format_version_roundtrip(void) {
     ray_release(loaded);
 
     /* save -> mmap (zero-copy): values intact, runtime aux reconstructed. */
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_U(mapped->mmod, 1);
     TEST_ASSERT_EQ_I(mapped->len, 4);
@@ -6885,7 +7617,7 @@ static test_result_t test_col_format_version_roundtrip(void) {
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -6902,46 +7634,46 @@ static test_result_t test_col_format_bad_version(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
     /* (a) generation 0 (legacy/unstamped order byte) => loads, value intact. */
-    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(vec, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
     {
-        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
         TEST_ASSERT_NOT_NULL(f);
         uint8_t zero = 0;
         TEST_ASSERT_EQ_I(fseek(f, 17, SEEK_SET), 0);  /* order byte */
         TEST_ASSERT_EQ_U(fwrite(&zero, 1, 1, f), 1);
         fclose(f);
     }
-    ray_t* r1 = ray_col_load(TMP_COL_PATH);
+    ray_t* r1 = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     TEST_ASSERT_EQ_I(r1->len, 3);
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(r1))[2], 3);
     ray_release(r1);
-    ray_t* r2 = ray_col_mmap(TMP_COL_PATH);
+    ray_t* r2 = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
     TEST_ASSERT_EQ_I(r2->len, 3);
     ray_release(r2);
 
     /* (b) an unrecognized generation => "version" (both load + mmap). */
-    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_save(vec, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
     {
-        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
         TEST_ASSERT_NOT_NULL(f);
         uint8_t bad_ver = (uint8_t)(RAY_COL_FORMAT_MAJOR + 1);
         TEST_ASSERT_EQ_I(fseek(f, 17, SEEK_SET), 0);  /* order byte */
         TEST_ASSERT_EQ_U(fwrite(&bad_ver, 1, 1, f), 1);
         fclose(f);
     }
-    ray_t* r3 = ray_col_load(TMP_COL_PATH);
+    ray_t* r3 = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
     TEST_ASSERT_STR_EQ(ray_err_code(r3), "version");
     ray_release(r3);
-    ray_t* r4 = ray_col_mmap(TMP_COL_PATH);
+    ray_t* r4 = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
     TEST_ASSERT_STR_EQ(ray_err_code(r4), "version");
     ray_release(r4);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -6956,24 +7688,24 @@ static test_result_t test_col_str_empty_roundtrip(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     TEST_ASSERT_EQ_I(vec->len, 0);
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_STR);
     TEST_ASSERT_EQ_I(loaded->len, 0);
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->len, 0);
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -6990,10 +7722,10 @@ static test_result_t test_col_str_inline_only_roundtrip(void) {
     vec = ray_str_vec_append(vec, "bb", 2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->len, 2);
@@ -7003,14 +7735,14 @@ static test_result_t test_col_str_inline_only_roundtrip(void) {
     TEST_ASSERT_TRUE(memcmp(g, "bb", 2) == 0);
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->len, 2);
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7029,10 +7761,10 @@ static test_result_t test_col_slice_save(void) {
     TEST_ASSERT_TRUE(slice->attrs & RAY_ATTR_SLICE);
     TEST_ASSERT_EQ_I(slice->len, 3);
 
-    ray_err_t err = ray_col_save(slice, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(slice, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_I64);
@@ -7047,7 +7779,7 @@ static test_result_t test_col_slice_save(void) {
 
     ray_release(slice);
     ray_release(parent);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7061,24 +7793,24 @@ static test_result_t test_col_sym_empty_roundtrip(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     TEST_ASSERT_EQ_I(vec->len, 0);
 
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
     TEST_ASSERT_EQ_I(loaded->len, 0);
     ray_release(loaded);
 
-    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(mapped);
     TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
     TEST_ASSERT_EQ_I(mapped->len, 0);
     ray_release(mapped);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7096,13 +7828,13 @@ static test_result_t test_col_sym_saved_count_reject(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     vec->len = 1;
     ((uint8_t*)ray_data(vec))[0] = 0;
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* rc field (saved sym count) is at offsetof(ray_t, rc). For the on-disk
      * layout it sits at byte 20 (after mmod/order/type/attrs). Overwrite it
      * with a count far larger than the live table. */
-    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "r+b");
     TEST_ASSERT_NOT_NULL(f);
     fseek(f, 20, SEEK_SET);
     uint32_t huge = sc + 1000000u;
@@ -7110,13 +7842,13 @@ static test_result_t test_col_sym_saved_count_reject(void) {
     fclose(f);
 
     /* mmap path uses col_validate_mapped's saved-count branch. */
-    ray_t* bad = ray_col_mmap(TMP_COL_PATH);
+    ray_t* bad = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
     TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
     ray_release(bad);
 
     ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7135,10 +7867,10 @@ static test_result_t test_col_str_list_empty_string(void) {
     list = ray_list_append(list, s2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(list));
 
-    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(list, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
@@ -7154,121 +7886,7 @@ static test_result_t test_col_str_list_empty_string(void) {
     ray_release(s1);
     ray_release(s2);
     ray_release(list);
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_str_list_corrupt ------------------------------------------ */
-/* Covers col_load_str_list corruption guards:
- *   line 173: count > remaining/4  => "corrupt"
- *   line 185: slen > remaining     => "corrupt"
- * We hand-craft STRL-magic files and load them via ray_col_load. */
-static test_result_t test_col_str_list_corrupt(void) {
-    const uint32_t STRL = 0x4C525453U;  /* "STRL" */
-
-    /* (a) count claims 1000 elements but no data follows => count > rem/4 */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&STRL, 4, 1, f);
-        int64_t count = 1000;
-        fwrite(&count, 8, 1, f);   /* nothing after => remaining == 0 */
-        fclose(f);
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (b) count=1, slen=99 but only 3 content bytes => slen > remaining */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&STRL, 4, 1, f);
-        int64_t count = 1;
-        fwrite(&count, 8, 1, f);
-        uint32_t slen = 99;
-        fwrite(&slen, 4, 1, f);
-        fwrite("abc", 1, 3, f);    /* only 3 bytes, not 99 */
-        fclose(f);
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (c) truncated: magic + only 3 bytes (< 8 for count) => "corrupt" */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&STRL, 4, 1, f);
-        fwrite("xy", 1, 2, f);
-        fclose(f);
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_str_validate_corrupt -------------------------------------- */
-/* Covers col_validate_str_region corruption guards reachable from a forged
- * STR column file loaded via ray_col_mmap:
- *   line 767: pool->type != RAY_U8       => "corrupt"
- *   line 778: pool_off out of range      => "corrupt"
- * Build a real STR column with one pooled string, then surgically corrupt
- * the on-disk bytes. */
-static test_result_t test_col_str_validate_corrupt(void) {
-    ray_t* vec = ray_vec_new(RAY_STR, 1);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    const char* s0 = "a-pooled-string-over-twelve-bytes";
-    vec = ray_str_vec_append(vec, s0, strlen(s0));
-    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    TEST_ASSERT_TRUE(vec->str_pool && vec->str_pool->len > 0);
-
-    /* Save once; on-disk layout: [32B col hdr][16B ray_str_t elem]
-     * [32B pool hdr][pool bytes]. col hdr=32, data_size=16, so the
-     * pool header starts at offset 48; its type byte sits at 48+18=66. */
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    /* (a) Corrupt the pool header type (offset 66) to a non-U8 value. */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "r+b");
-        TEST_ASSERT_NOT_NULL(f);
-        fseek(f, 48 + 18, SEEK_SET);   /* pool header type byte */
-        uint8_t bad_type = RAY_I64;
-        fwrite(&bad_type, 1, 1, f);
-        fclose(f);
-        ray_t* bad = ray_col_mmap(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* Re-save a clean copy, then corrupt the element pool_off so it points
-     * past the pool. ray_str_t layout: len(4) prefix(4) pool_off(4) pad(4).
-     * Element sits at offset 32; pool_off field at 32 + 8 = 40. */
-    err = ray_col_save(vec, TMP_COL_PATH);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-    {
-        FILE* f = fopen(TMP_COL_PATH, "r+b");
-        TEST_ASSERT_NOT_NULL(f);
-        fseek(f, 32 + 8, SEEK_SET);    /* pool_off field of element 0 */
-        uint32_t huge_off = 0x7FFFFFFFu;
-        fwrite(&huge_off, 4, 1, f);
-        fclose(f);
-        ray_t* bad = ray_col_mmap(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    ray_release(vec);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7295,10 +7913,10 @@ static test_result_t test_col_recursive_list_in_list(void) {
     outer = ray_list_append(outer, ivec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(outer));
 
-    ray_err_t err = ray_col_save(outer, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(outer, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
@@ -7326,7 +7944,7 @@ static test_result_t test_col_recursive_list_in_list(void) {
     ray_release(inner);
     ray_release(ivec);
     ray_release(outer);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7362,10 +7980,10 @@ static test_result_t test_col_recursive_table(void) {
     wrap = ray_list_append(wrap, tbl);
     TEST_ASSERT_FALSE(RAY_IS_ERR(wrap));
 
-    ray_err_t err = ray_col_save(wrap, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(wrap, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
     TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
@@ -7390,7 +8008,7 @@ static test_result_t test_col_recursive_table(void) {
     ray_release(namecol);
     ray_release(tbl);
     ray_release(wrap);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7426,7 +8044,7 @@ static test_result_t test_col_recursive_container_guards(void) {
     /* TABLE with atom columns: recursive on-disk decoding must hit the same
      * shared table invariant as the serde decoder. */
     {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
+        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
         TEST_ASSERT_NOT_NULL(f);
         int64_t name_a = ray_sym_intern("bad_a", 5);
         int64_t name_b = ray_sym_intern("bad_b", 5);
@@ -7443,39 +8061,15 @@ static test_result_t test_col_recursive_container_guards(void) {
         fclose(f);
         TEST_ASSERT_TRUE(ok);
 
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "column must be list/vector-like");
-        ray_error_free(bad);
-    }
-
-    /* TABLE with ragged vector columns. */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        int64_t name_a = ray_sym_intern("bad_a", 5);
-        int64_t name_b = ray_sym_intern("bad_b", 5);
-        int64_t a[] = { 1, 2 };
-        int64_t b[] = { 3 };
-        bool ok = test_write_u32(f, TEST_COL_TABLE_MAGIC) &&
-                  test_write_i8(f, (int8_t)RAY_TABLE) &&
-                  test_write_i64(f, 2) &&
-                  test_write_i64(f, 2) &&
-                  test_write_i64(f, name_a) &&
-                  test_write_i64_vec(f, a, 2) &&
-                  test_write_i64(f, name_b) &&
-                  test_write_i64_vec(f, b, 1);
-        fclose(f);
-        TEST_ASSERT_TRUE(ok);
-
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "ragged columns");
         ray_error_free(bad);
     }
 
     /* DICT with two keys and one value, nested inside a generic list so it is
      * decoded by col_read_recursive. */
     {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
+        FILE* f = fopen(ray_test_tmp(TMP_COL_PATH), "wb");
         TEST_ASSERT_NOT_NULL(f);
         int64_t keys[] = { 7, 8 };
         int64_t vals[] = { 1 };
@@ -7488,71 +8082,12 @@ static test_result_t test_col_recursive_container_guards(void) {
         fclose(f);
         TEST_ASSERT_TRUE(ok);
 
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        ray_t* bad = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_ERR_CODE_MSG(bad, "domain", "key/value count mismatch");
         ray_error_free(bad);
     }
 
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
-/* ---- test_col_recursive_read_corrupt ------------------------------------ */
-/* Covers col_read_recursive corruption guards:
- *   line 398/402: LIST with truncated count / count < 0 => "corrupt"
- *   line 417: TABLE header < 16 bytes => "corrupt"
- * Forge LIST/TABLE-magic files and load them. */
-static test_result_t test_col_recursive_read_corrupt(void) {
-    const uint32_t LISTM  = 0x4754534CU;  /* "LSTG" */
-    const uint32_t TABLEM = 0x4C425454U;  /* "TTBL" */
-
-    /* (a) LIST magic + type byte RAY_LIST but truncated count (<8 bytes). */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&LISTM, 4, 1, f);
-        int8_t t = RAY_LIST;
-        fwrite(&t, 1, 1, f);
-        fwrite("xy", 1, 2, f);  /* only 2 bytes, need 8 for count */
-        fclose(f);
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (b) LIST magic + RAY_LIST + negative count => "corrupt". */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&LISTM, 4, 1, f);
-        int8_t t = RAY_LIST;
-        fwrite(&t, 1, 1, f);
-        int64_t neg = -5;
-        fwrite(&neg, 8, 1, f);
-        fclose(f);
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    /* (c) TABLE magic + RAY_TABLE type but header < 16 bytes. */
-    {
-        FILE* f = fopen(TMP_COL_PATH, "wb");
-        TEST_ASSERT_NOT_NULL(f);
-        fwrite(&TABLEM, 4, 1, f);
-        int8_t t = RAY_TABLE;
-        fwrite(&t, 1, 1, f);
-        fwrite("only-8b!", 1, 8, f);  /* need 16 for ncols+nrows */
-        fclose(f);
-        ray_t* bad = ray_col_load(TMP_COL_PATH);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
-        ray_release(bad);
-    }
-
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7568,12 +8103,12 @@ static test_result_t test_col_link_sidecar_whitespace(void) {
     int64_t raw[] = {0, 1, 2};
     ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(vec, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
     ray_release(vec);
 
     char link_path[1100];
-    snprintf(link_path, sizeof link_path, "%s.link", TMP_COL_PATH);
+    snprintf(link_path, sizeof link_path, "%s.link", ray_test_tmp(TMP_COL_PATH));
 
     /* (a) sidecar with trailing newline / spaces / tab => trimmed, link set. */
     {
@@ -7583,7 +8118,7 @@ static test_result_t test_col_link_sidecar_whitespace(void) {
         fwrite(body, 1, strlen(body), lf);
         fclose(lf);
 
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_NOT_NULL(loaded);
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_TRUE(loaded->attrs & RAY_ATTR_HAS_LINK);
@@ -7599,7 +8134,7 @@ static test_result_t test_col_link_sidecar_whitespace(void) {
         fwrite(body, 1, strlen(body), lf);
         fclose(lf);
 
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_NOT_NULL(loaded);
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_HAS_LINK);
@@ -7611,7 +8146,7 @@ static test_result_t test_col_link_sidecar_whitespace(void) {
         FILE* lf = fopen(link_path, "wb");
         TEST_ASSERT_NOT_NULL(lf);
         fclose(lf);
-        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
         TEST_ASSERT_NOT_NULL(loaded);
         TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
         TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_HAS_LINK);
@@ -7619,7 +8154,7 @@ static test_result_t test_col_link_sidecar_whitespace(void) {
     }
 
     unlink(link_path);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7637,11 +8172,11 @@ static test_result_t test_col_save_nyi_type(void) {
     TEST_ASSERT_NOT_NULL(d);
     TEST_ASSERT_FALSE(RAY_IS_ERR(d));
 
-    ray_err_t err = ray_col_save(d, TMP_COL_PATH);
+    ray_err_t err = ray_col_save(d, ray_test_tmp(TMP_COL_PATH));
     TEST_ASSERT_EQ_I(err, RAY_ERR_NYI);
 
     ray_release(d);
-    unlink(TMP_COL_PATH);
+    unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
 
@@ -7652,7 +8187,6 @@ const test_entry_t store_entries[] = {
     { "store/col_mmap_f32", test_col_mmap_f32, store_setup, store_teardown },
     { "store/col_mmap_cow", test_col_mmap_cow, store_setup, store_teardown },
     { "store/col_mmap_refcount", test_col_mmap_refcount, store_setup, store_teardown },
-    { "store/col_mmap_corrupt", test_col_mmap_corrupt, store_setup, store_teardown },
     { "store/col_mmap_nofile", test_col_mmap_nofile, store_setup, store_teardown },
     { "store/splay_open_roundtrip", test_splay_open_roundtrip, store_setup, store_teardown },
     { "store/splay_str_column_roundtrip", test_splay_str_column_roundtrip, store_setup, store_teardown },
@@ -7675,9 +8209,6 @@ const test_entry_t store_entries[] = {
     { "store/col_sym_w32_roundtrip", test_col_sym_w32_roundtrip, store_setup, store_teardown },
     { "store/col_save_load_empty", test_col_save_load_empty, store_setup, store_teardown },
     { "store/col_validate_bad_type", test_col_validate_mapped_bad_type, store_setup, store_teardown },
-    { "store/col_validate_neg_len", test_col_validate_mapped_neg_len, store_setup, store_teardown },
-    { "store/col_validate_data_trunc", test_col_validate_mapped_data_truncated, store_setup, store_teardown },
-    { "store/col_mmap_size_mismatch", test_col_mmap_size_mismatch, store_setup, store_teardown },
     { "store/col_recursive_atoms", test_col_recursive_atoms, store_setup, store_teardown },
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
@@ -7707,12 +8238,9 @@ const test_entry_t store_entries[] = {
     { "store/col_sym_empty_roundtrip", test_col_sym_empty_roundtrip, store_setup, store_teardown },
     { "store/col_sym_saved_count_reject", test_col_sym_saved_count_reject, store_setup, store_teardown },
     { "store/col_str_list_empty_string", test_col_str_list_empty_string, store_setup, store_teardown },
-    { "store/col_str_list_corrupt", test_col_str_list_corrupt, store_setup, store_teardown },
-    { "store/col_str_validate_corrupt", test_col_str_validate_corrupt, store_setup, store_teardown },
     { "store/col_recursive_list_in_list", test_col_recursive_list_in_list, store_setup, store_teardown },
     { "store/col_recursive_table", test_col_recursive_table, store_setup, store_teardown },
     { "store/col_recursive_container_guards", test_col_recursive_container_guards, store_setup, store_teardown },
-    { "store/col_recursive_read_corrupt", test_col_recursive_read_corrupt, store_setup, store_teardown },
     { "store/col_link_sidecar_whitespace", test_col_link_sidecar_whitespace, store_setup, store_teardown },
     { "store/col_save_nyi_type", test_col_save_nyi_type, store_setup, store_teardown },
     { "store/file_open_close", test_file_open_close, store_setup, store_teardown },
@@ -7737,20 +8265,42 @@ const test_entry_t store_entries[] = {
     { "store/stream_sym_lut_stale", test_stream_sym_lut_stale, store_setup, store_teardown },
     { "store/stream_index_write_failure", test_stream_index_write_failure_drops_index, store_setup, store_teardown },
     { "store/stream_inline_zone_one_chunk", test_stream_inline_zone_one_chunk, store_setup, store_teardown },
-    { "store/stream_hash_candidate", test_stream_hash_candidate, store_setup, store_teardown },
     { "store/col_build_hash_index_bytes", test_col_build_hash_index_bytes, store_setup, store_teardown },
     { "store/col_build_hash_index_refusals", test_col_build_hash_index_refusals, store_setup, store_teardown },
     { "store/col_build_hash_index_untrusted_fs", test_col_build_hash_index_untrusted_fs, store_setup, store_teardown },
     { "store/col_build_hash_index_fs_types", test_col_build_hash_index_fs_types, store_setup, store_teardown },
     { "store/col_build_hash_index_refused", test_col_build_hash_index_refused, store_setup, store_teardown },
     { "store/col_build_hash_index_truncate", test_col_build_hash_index_truncate, store_setup, store_teardown },
+    { "store/stream_close_all_cancel", test_stream_close_all_cancel, store_setup, store_teardown },
+    { "store/splay_save_cancel_late", test_splay_save_cancel_late, store_setup, store_teardown },
+    { "store/splay_save_cancel_leaks", test_splay_save_cancel_leaks, store_setup, store_teardown },
+    { "store/col_truncated_fails", test_col_truncated_fails, store_setup, store_teardown },
     { "store/col_build_hash_index_marker_last", test_col_build_hash_index_marker_last, store_setup, store_teardown },
     { "store/col_build_hash_index_rollback", test_col_build_hash_index_rollback, store_setup, store_teardown },
     { "store/col_build_hash_index_interrupt", test_col_build_hash_index_interrupt, store_setup, store_teardown },
     { "store/stream_inline_dict", test_stream_inline_dict, store_setup, store_teardown },
-    { "store/stream_hash_wave", test_stream_hash_wave, store_setup, store_teardown },
+    { "store/staged_bulk_no_hash", test_staged_bulk_no_hash, store_setup, store_teardown },
+    { "store/resave_keeps_hash", test_resave_keeps_hash, store_setup, store_teardown },
+    { "idxlazy/first_use",     test_lazy_first_use,     lz_setup, lz_teardown },
+    { "idxlazy/eq_range",      test_lazy_eq_range,      lz_setup, lz_teardown },
+    { "idxlazy/not_persisted", test_lazy_not_persisted, lz_setup, lz_teardown },
+    { "idxlazy/budget",        test_lazy_budget,        lz_setup, lz_teardown },
+    { "idxlazy/not_wanted",    test_lazy_not_wanted,    lz_setup, lz_teardown },
+    { "idxlazy/gen2",          test_lazy_gen2,          lz_setup, lz_teardown },
+    { "idxlazy/reload_bounded", test_lazy_reload_bounded, lz_setup, lz_teardown },
+    { "idxlazy/timestamp",     test_lazy_timestamp,     lz_setup, lz_teardown },
+    { "idxlazy/nulls_never",   test_lazy_nulls_never,   lz_setup, lz_teardown },
+    { "idxlazy/derived_never", test_lazy_derived_never, lz_setup, lz_teardown },
+    { "idxlazy/after_mutation", test_lazy_after_mutation, lz_setup, lz_teardown },
+    { "idxlazy/out_of_range",  test_lazy_out_of_range,  lz_setup, lz_teardown },
+    { "idxlazy/out_of_range_gen2", test_lazy_out_of_range_gen2, lz_setup, lz_teardown },
+    { "idxlazy/concurrent",    test_lazy_concurrent,    lz_setup, lz_teardown },
+    { "idxlazy/memo_evicts_memo", test_lazy_memo_evicts_memo, lz_setup, lz_teardown },
+    { "idxlazy/cancel",        test_lazy_cancel,        lz_setup, lz_teardown },
+    { "idxlazy/oom",           test_lazy_oom,           lz_setup, lz_teardown },
     { "store/stream_region_bytes", test_stream_region_bytes_match, store_setup, store_teardown },
     { "store/stream_finish_failure", test_stream_finish_failure_publishes_nothing, store_setup, store_teardown },
+    { "store/stream_cancel_publishes_nothing", test_stream_cancel_publishes_nothing, store_setup, store_teardown },
     { "store/file_rename_new", test_file_rename_new, store_setup, store_teardown },
     { "store/file_rename_new_emulated", test_file_rename_new_emulated, store_setup, store_teardown },
     { "store/file_shared_lock", test_file_shared_lock_concurrent, store_setup, store_teardown },

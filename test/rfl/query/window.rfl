@@ -65,6 +65,53 @@
 (at FV 'l) -- [3.5 3.5 20.0 3.5 20.0]
 (.sys.exec "rm -f /tmp/rfl_window_f32.csv")
 
+;; ── composite radix prescan over full-span, nullable or F64 keys ────────────
+;; The per-key span kmax - kmin overflowed i64 (UBSan abort) when a key spans
+;; more than INT64_MAX, or when the 0N sentinel sits next to a positive key.
+;; Checked against the same running window over a small-span key with the same
+;; partitions.  200 rows take the serial prescan, 10000 rows the pooled one.
+;; The same blocks cover an F64 order key: the serial prescan had no F64 arm,
+;; so the key got a 1-bit span and the composite OR-ed raw float bits into the
+;; partition bits.  A mixed-sign F64 key of large magnitude (±1e300) checks
+;; that both prescans take min/max in the encoded order (positives used to
+;; sort before negatives), against an I64 surrogate o of the same order.  A
+;; nullable F64 order key must place its null first, as the single-key window
+;; and xasc do, at every row count (it went last on the composite path).
+(set WR (fn [t] (at (window {from: t part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs)))
+(set W1 (fn [t] (at (window {from: t order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs)))
+(set WP (fn [n] (take [0 0 0 0 1 1 1 1] n)))
+(set WF (fn [n] (concat (as 'F64 (til (- n 1))) [0Nf])))
+(set WT (WF 60))
+(WR (table [k o v] (list (take [0] 60) WT (til 60)))) -- (W1 (table [o v] (list WT (til 60))))
+(last (WR (table [k o v] (list (take [0] 60) WT (til 60))))) -- 59
+(set WN 200)
+(set WV (til WN))
+(set WO (- WN WV))
+(set WS (at (window {from: (table [k o v] (list (% WV 2) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs))
+(first WS) -- 9900
+(at (window {from: (table [k o v] (list (take [-9000000000000000000 9000000000000000000] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(at (window {from: (table [k o v] (list (take [0N 5] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(WR (table [k o v] (list (% WV 2) (* 0.5 (as 'F64 WO)) WV))) -- WS
+(WR (table [k o v] (list (WP WN) (take [1e300 -1e300 2e300 -2e300] WN) WV))) -- (WR (table [k o v] (list (WP WN) (take [1 -1 2 -2] WN) WV)))
+(set WT (WF WN))
+(WR (table [k o v] (list (take [0] WN) WT WV))) -- (W1 (table [o v] (list WT WV)))
+(last (WR (table [k o v] (list (take [0] WN) WT WV)))) -- (- WN 1)
+(set WN 10000)
+(set WV (til WN))
+(set WO (- WN WV))
+(set WS (at (window {from: (table [k o v] (list (% WV 2) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs))
+(first WS) -- 24995000
+(at (window {from: (table [k o v] (list (take [-9000000000000000000 9000000000000000000] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(at (window {from: (table [k o v] (list (take [0N 5] WN) WO WV)) part: [k] order: [o] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- WS
+(WR (table [k o v] (list (% WV 2) (* 0.5 (as 'F64 WO)) WV))) -- WS
+(WR (table [k o v] (list (WP WN) (take [1e300 -1e300 2e300 -2e300] WN) WV))) -- (WR (table [k o v] (list (WP WN) (take [1 -1 2 -2] WN) WV)))
+(set WT (WF WN))
+(WR (table [k o v] (list (take [0] WN) WT WV))) -- (W1 (table [o v] (list WT WV)))
+(last (WR (table [k o v] (list (take [0] WN) WT WV)))) -- (- WN 1)
+(set WN 20000)
+(set WV (til WN))
+(WR (table [k o v] (list (WP WN) (take [1e300 -1e300 2e300 -2e300] WN) WV))) -- (WR (table [k o v] (list (WP WN) (take [1 -1 2 -2] WN) WV)))
+
 ;; ── fby shape: rows equal to their group's min (keeps ties) ─────────────────
 ;; min over k: a→2 (only row v=2), b→4 (rows v=4,4 both) → 3 rows total
 (count (select {from: (window {from: T part: [k] funcs: {mn: (min v)}}) where: (== v mn)})) -- 3

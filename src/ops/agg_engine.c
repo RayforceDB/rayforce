@@ -1,25 +1,53 @@
 /* src/ops/agg_engine.c — v2 aggregation engine. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#elif !defined(_WIN32)
+#  define _GNU_SOURCE       /* pread, pwrite, O_CLOEXEC: the radix spill file */
+#endif
 #include "ops/agg_engine.h"
 #include "ops/agg_registry.h"
 #include "ops/ops.h"
 #include "ops/hash.h"     /* ray_hash_bytes — wide (STR) group-key hashing */
 #include "ops/internal.h"  /* col_vec_new, col_esz */
+#include "ops/colbind.h"
+#include "ops/colgather.h"  /* generation-2 compact gathers */
 #include "ops/rowsel.h"    /* ray_rowsel_meta, ray_rowsel_to_indices */
 #include "lang/internal.h" /* sym_domain_rep */
 #include "table/domain.h"
+#include "table/table.h"
 #include "table/sym.h"    /* ray_read_sym */
 #include "store/col.h"    /* ray_col_cold — sampled-row read-ahead */
 #include "core/pool.h"     /* ray_pool_want — a column asked for whole */
 #include "core/platform.h" /* ray_cache_llc_bytes — replicated slab bound */
+#include "store/enc.h"      /* RAY_ENC_CHUNK: directory statistics per chunk */
+#include "store/enccol.h"   /* ray_enc_chunk_stat_t */
+#include "store/enceval.h"  /* ray_enc_runs: COUNT groups on key runs */
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+
+/* The radix spill file (agg_radix_spill_t) is POSIX pread/pwrite; Windows
+ * keeps the re-scanned waves only, as its heap keeps anonymous pools only. */
+#if defined(RAY_OS_WINDOWS)
+#  define AGG_RADIX_FILE_SPILL 0
+#else
+#  define AGG_RADIX_FILE_SPILL 1
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 
 /* Radix output address: high 32 bits partition, low 32 bits local group. */
 typedef struct { int64_t idx; } agg_radix_order_t;
 
 bool ray_agg_engine_v2 = true;   /* knob; default on */
 bool ray_agg_tablestack = true;  /* knob; default on */
+int64_t ray_agg_radix_wave_bytes = 0;   /* knob; 0 = heap-derived wave bound, <0 = off */
+int ray_agg_radix_spill = 0;            /* knob; 0 = by bytes, 1 = never, 2 = always, 3..6 = always with a fault */
+static bool agg_force_smallhash;    /* test hook (agg_test_force_smallhash) */
+static bool agg_no_wide_dense;      /* test hook (agg_test_no_wide_dense) */
+void agg_test_force_smallhash(bool on) { agg_force_smallhash = on; }
+void agg_test_no_wide_dense(bool on) { agg_no_wide_dense = on; }
 
 static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
@@ -48,7 +76,6 @@ void agg_route_reason(agg_v2_reason_t reason) {
 }
 
 /* Read element `row` of an integer/temporal/SYM column widened to int64. */
-static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row);
 /* Dense direct-index serial grouping; defined below agg_run_one. */
 static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
                                 const dense_plan_t* dp, agg_groups_t* out);
@@ -66,9 +93,18 @@ static bool agg_indexed_supported(uint16_t op, int8_t t) {
     bool scalar = number || t == RAY_GUID || t == RAY_SYM || t == RAY_STR;
     if (op == OP_FIRST || op == OP_LAST) return scalar || t == RAY_LIST;
     if (op == OP_MIN || op == OP_MAX) return t == RAY_GUID || t == RAY_STR || t == RAY_SYM;
-    if (op == OP_MEDIAN || op == OP_QUANTILE) return number;
+    if (op == OP_MEDIAN || op == OP_QUANTILE) return number || t == RAY_TIMESPAN;
     if (op == OP_MODE || op == OP_TOP_N || op == OP_BOT_N) return scalar;
     return false;
+}
+
+/* A column's metadata as the v2 engine routes it: under an in-place concat
+ * group (g->grp_seg_stream) a parted column reads as its base type, since
+ * its sources are read from the segments; otherwise unchanged. */
+static bool agg_col_meta(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_col_meta_t* m) {
+    if (!ray_table_col_meta(tbl, sym, m)) return false;
+    if (g->grp_seg_stream && RAY_IS_PARTED(m->type)) m->type = (int8_t)RAY_PARTED_BASETYPE(m->type);
+    return true;
 }
 
 agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
@@ -103,8 +139,10 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (ext->n_keys == 1 && op_node(g, ext->keys[0]) && op_node(g, ext->keys[0])->opcode == OP_SCAN) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
         if (ke && ke->sym == ray_sym_intern("_src", 4)) {
-            ray_t* cnt = ray_table_get_col(tbl, ray_sym_intern("_count", 6));
-            if (cnt && cnt->type == RAY_I64) return AGG_V2_SHAPE;
+            ray_col_meta_t cm;
+            /* agg_col_meta: a parted _count (an in-place concat's probe) is
+             * its base I64, so the shortcut keeps the group as over the flatten */
+            if (agg_col_meta(g, tbl, ray_sym_intern("_count", 6), &cm) && cm.type == RAY_I64) return AGG_V2_SHAPE;
         }
     }
 
@@ -113,9 +151,9 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_op_t* key = op_node(g, ext->keys[k]);
         if (!key || key->opcode != OP_SCAN) return AGG_V2_KEY_EXPRESSION;
         ray_op_ext_t* kext = find_ext(g, key->id);
-        ray_t* kc = kext ? ray_table_get_col(tbl, kext->sym) : NULL;
-        if (!kc) return AGG_V2_SHAPE;
-        switch (kc->type) {
+        ray_col_meta_t km;
+        if (!kext || !agg_col_meta(g, tbl, kext->sym, &km)) return AGG_V2_SHAPE;
+        switch (km.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
             case RAY_TIMESTAMP: case RAY_SYM:
@@ -135,14 +173,15 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         bool floating = false, indexed = false;
         for (uint32_t k = 0; k < ext->n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
-            ray_t* col = ray_table_get_col(tbl, ke->sym);
-            if (col->type == RAY_F32 || col->type == RAY_F64) floating = true;
-            if (col->type == RAY_STR || col->type == RAY_GUID || col->type == RAY_LIST) indexed = true;
+            ray_col_meta_t cm;
+            if (!agg_col_meta(g, tbl, ke->sym, &cm)) continue;   /* present: the key loop above checked */
+            if (cm.type == RAY_F32 || cm.type == RAY_F64) floating = true;
+            if (cm.type == RAY_STR || cm.type == RAY_GUID || cm.type == RAY_LIST) indexed = true;
         }
         for (uint32_t a = 0; a < ext->n_aggs; a++) {
             ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-            ray_t* col = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
-            if (col && agg_indexed_supported(ext->agg_ops[a], col->type)) indexed = true;
+            ray_col_meta_t cm;
+            if (ie && agg_col_meta(g, tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
         }
         if (floating && !indexed) return AGG_V2_PARALLEL_WIDE;
     }
@@ -155,9 +194,10 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             ray_op_t* in = op_node(g, ext->agg_ins[a]);
             if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* ie = find_ext(g, in->id);
-            ray_t* ic = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
-            if (ic && agg_indexed_supported(ext->agg_ops[a], ic->type)) continue;
-            const agg_vtable_t* vt = ic ? agg_resolve(ext->agg_ops[a], ic->type) : NULL;
+            ray_col_meta_t im;
+            bool ih = ie && agg_col_meta(g, tbl, ie->sym, &im);
+            if (ih && agg_indexed_supported(ext->agg_ops[a], im.type)) continue;
+            const agg_vtable_t* vt = ih ? agg_resolve(ext->agg_ops[a], im.type) : NULL;
             if (!vt) return AGG_V2_AGG_TYPE;
             if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
             continue;  /* admitted */
@@ -167,11 +207,11 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             ray_op_t* xin = op_node(g, ext->agg_ins[a]); ray_op_t* yin = op_node(g, ext->agg_ins2[a]);
             if (!xin || xin->opcode != OP_SCAN || !yin || yin->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
             ray_op_ext_t* xe = find_ext(g, xin->id); ray_op_ext_t* ye = find_ext(g, yin->id);
-            ray_t* xc = xe ? ray_table_get_col(tbl, xe->sym) : NULL;
-            ray_t* yc = ye ? ray_table_get_col(tbl, ye->sym) : NULL;
-            if (!xc || !yc) return AGG_V2_SHAPE;
-            if (!agg_resolve(ext->agg_ops[a], xc->type)) return AGG_V2_AGG_TYPE;
-            if (!agg_resolve(ext->agg_ops[a], yc->type)) return AGG_V2_AGG_TYPE;
+            ray_col_meta_t xm, ym;
+            if (!xe || !ye || !agg_col_meta(g, tbl, xe->sym, &xm)
+                || !agg_col_meta(g, tbl, ye->sym, &ym)) return AGG_V2_SHAPE;
+            if (!agg_resolve(ext->agg_ops[a], xm.type)) return AGG_V2_AGG_TYPE;
+            if (!agg_resolve(ext->agg_ops[a], ym.type)) return AGG_V2_AGG_TYPE;
             continue;  /* admitted */
         }
         if (ext->agg_ops[a] == OP_COUNT) {
@@ -182,10 +222,10 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in || in->opcode != OP_SCAN) return AGG_V2_AGG_EXPRESSION;
         ray_op_ext_t* ie = find_ext(g, in->id);
-        ray_t* ic = (ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
-        if (!ic) return AGG_V2_SHAPE;
-        if (agg_indexed_supported(ext->agg_ops[a], ic->type)) continue;
-        const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], ic->type);
+        ray_col_meta_t im;
+        if (!ie || !agg_col_meta(g, tbl, ie->sym, &im)) return AGG_V2_SHAPE;
+        if (agg_indexed_supported(ext->agg_ops[a], im.type)) continue;
+        const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], im.type);
         if (!vt) return AGG_V2_AGG_TYPE;
         if (vt->kind != ACC_STREAMING) return AGG_V2_BUFFERED;
         /* The streaming 64-bit integer avg packs its 128-bit high word with
@@ -193,8 +233,8 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * group has fewer than 2^32 rows; the narrower kernels keep a plain
          * int64 sum, exact below 2^31 rows.  A table that large keeps the
          * legacy engines, whose accumulators carry a full high word. */
-        if (ext->agg_ops[a] == OP_AVG && ic->type != RAY_F64 && ic->type != RAY_F32 &&
-            ray_table_nrows(tbl) >= ((int64_t)1 << ((ic->type == RAY_I64 || ic->type == RAY_TIMESTAMP) ? 32 : 31)))
+        if (ext->agg_ops[a] == OP_AVG && im.type != RAY_F64 && im.type != RAY_F32 &&
+            ray_table_nrows(tbl) >= ((int64_t)1 << ((im.type == RAY_I64 || im.type == RAY_TIMESTAMP) ? 32 : 31)))
             return AGG_V2_AGG_TYPE;
     }
     return AGG_V2_ADMITTED;
@@ -263,12 +303,341 @@ static bool agg_dense_range(dense_plan_t* dp, uint32_t k, int64_t mn, int64_t mx
     return true;
 }
 
+/* ── Range reads: generation-2 sources ───────────────────────────────────
+ * A strategy's sources are its keys, then its aggregate inputs, then the
+ * y-sides of binary aggregates (n_keys + 2 * n_aggs).  A plain source (a
+ * generation-0 column, a published materialization) is read in place
+ * through its row-0 pointer.  A staged source (generation 2) is read by
+ * range: the task body runs over pieces of its rows (R-WALK) or over runs
+ * of ascending rows (R-SPARSE), and reads every column at row - base
+ * through a view.  A plain context runs today's loop over its whole-column
+ * view (base 0) and never calls the walk. */
+typedef struct {
+    ray_col_src_t* const* srcs;      /* [n_src] staged sources; NULL: read in place (or COUNT) */
+    const void* const*    plain;     /* [n_src] row-0 pointers; NULL for staged sources and COUNT */
+    const uint8_t*        esz;       /* [n_src] element widths (keys: the column's SYM width) */
+    const int8_t*         key_types; /* [n_keys] */
+    const uint8_t*        key_attrs; /* [n_keys] the plain columns' (stand-ins') attrs */
+    uint32_t              n_src, n_keys, n_aggs;
+    ray_scan_fail_t*      fail;
+    bool                  staged;    /* some source is staged */
+} agg_rr_t;
+
+/* What a task body reads rows through: element 0 of every pointer is row
+ * `base`.  The whole-column view has base 0; a piece's view is positioned
+ * at the piece's first row and carries the pieces' SYM widths. */
+typedef struct {
+    const void* const* key_data;    /* [n_keys] */
+    const uint8_t*     key_attrs;   /* [n_keys] SYM widths of key_data */
+    const void* const* val_data;    /* [n_aggs]; NULL: no input (COUNT) */
+    const void* const* val2_data;   /* [n_aggs] y-sides of binary aggregates */
+    int64_t            base;
+} agg_view_t;
+
+static inline agg_view_t agg_view_whole(const agg_rr_t* rr) {
+    return (agg_view_t){ .key_data = rr->plain, .key_attrs = rr->key_attrs,
+                         .val_data = rr->plain + rr->n_keys,
+                         .val2_data = rr->plain + rr->n_keys + rr->n_aggs, .base = 0 };
+}
+
+/* Key k of view v at absolute row r. */
+static inline int64_t agg_vkey(const agg_view_t* v, const int8_t* key_types, uint32_t k, int64_t r) {
+    return agg_read_key_i64_raw(key_types[k], v->key_attrs[k], v->key_data[k], r - v->base);
+}
+
+/* A body over rows [start, end) (or over indices [start, end) of an index
+ * list, for the R-SPARSE driver) read through view v. */
+typedef void (*agg_body_fn)(void* ctx, const agg_view_t* v, uint32_t wid, int64_t start, int64_t end);
+
+/* The view of row b: staged sources from their pieces or views (ptr/kat
+ * already filled for them), the others offset from their row-0 pointers. */
+static void agg_view_set(const agg_rr_t* rr, int64_t b, const void** ptr, uint8_t* kat,
+                         agg_view_t* v) {
+    for (uint32_t i = 0; i < rr->n_src; i++)
+        if (!rr->srcs[i]) ptr[i] = rr->plain[i] ? (const char*)rr->plain[i] + (size_t)b * rr->esz[i] : NULL;
+    for (uint32_t k = 0; k < rr->n_keys; k++)
+        if (!rr->srcs[k] || rr->key_types[k] != RAY_SYM) kat[k] = rr->key_attrs[k];
+    v->key_data = ptr;
+    v->key_attrs = kat;
+    v->val_data = ptr + rr->n_keys;
+    v->val2_data = ptr + rr->n_keys + rr->n_aggs;
+    v->base = b;
+}
+
+typedef struct {
+    void*           ctx;
+    agg_body_fn     body;
+    const agg_rr_t* rr;
+} agg_piece_ctx_t;
+
+static void agg_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    agg_piece_ctx_t* pc = (agg_piece_ctx_t*)ctx;
+    const agg_rr_t* rr = pc->rr;
+    uint32_t ns = rr->n_src ? rr->n_src : 1, nk = rr->n_keys ? rr->n_keys : 1;
+    const void* ptr[ns];
+    uint8_t kat[nk];
+    for (uint32_t i = 0; i < rr->n_src; i++)
+        if (rr->srcs[i]) ptr[i] = p[i].data;
+    for (uint32_t k = 0; k < rr->n_keys; k++)
+        if (rr->srcs[k]) kat[k] = p[k].attrs;
+    agg_view_t v;
+    agg_view_set(rr, b, ptr, kat, &v);
+    pc->body(pc->ctx, &v, wid, b, e);
+}
+
+/* R-WALK of rows [start, end) of a staged context.  A range error is noted
+ * keyed by `key` (the task's first row or position) and false returned; a
+ * task below a noted failure still runs (it may fail lower). */
+static bool agg_walk(const agg_rr_t* rr, void* ctx, agg_body_fn body,
+                     uint32_t wid, int64_t start, int64_t end, int64_t key) {
+    if (ray_scan_fail_skip(rr->fail, key)) return false;
+    agg_piece_ctx_t pc = { ctx, body, rr };
+    ray_t* err = ray_col_walk(rr->srcs, rr->plain, rr->n_src, start, end, false, &pc, wid, agg_piece);
+    if (!err) return true;
+    ray_scan_fail_note(rr->fail, key, err);
+    return false;
+}
+
+/* One cursor per staged source, created by a task at its start and freed
+ * at its end (R-SPARSE: each touched vector is decoded once per task).  Up
+ * to AGG_CURS_STACK cursors live in the set, on the task's stack, and the
+ * first AGG_CURS_LENT encoded sources decode into fixed vectors lent from
+ * the set, so a worker's first decode takes nothing from its heap (a fresh
+ * worker heap maps and faults in a whole pool on its first allocation:
+ * ClickBench q8 on partitions, first run).  Two, not one per cursor: the
+ * set's frame is probed page by page on every task's first entry, and
+ * eight lent vectors (128 KB) measured q8's generation-0 first run 3%
+ * slower.  Declared without an initializer (the fixed vectors are not to
+ * be zeroed): set cur = NULL before any path that may free it. */
+enum { AGG_CURS_STACK = 8, AGG_CURS_LENT = 2 };
+typedef struct {
+    ray_col_cursor_t  st[AGG_CURS_STACK];
+    ray_col_fixed_t   fx[AGG_CURS_LENT];
+    ray_col_cursor_t* cur;
+} agg_curs_t;
+
+static bool agg_curs_init(agg_curs_t* cs, const agg_rr_t* rr) {
+    cs->cur = rr->n_src <= AGG_CURS_STACK ? cs->st
+            : ray_calloc_raw((size_t)rr->n_src * sizeof(ray_col_cursor_t));
+    if (!cs->cur) return false;
+    uint32_t lent = 0;
+    for (uint32_t i = 0; i < rr->n_src; i++) {
+        if (!rr->srcs[i]) continue;
+        if (lent < AGG_CURS_LENT && ray_col_src_encoded(rr->srcs[i]))
+            ray_col_cursor_init_lent(&cs->cur[i], rr->srcs[i], &cs->fx[lent++]);
+        else
+            ray_col_cursor_init(&cs->cur[i], rr->srcs[i]);
+    }
+    return true;
+}
+
+static void agg_curs_free(agg_curs_t* cs, const agg_rr_t* rr) {
+    if (!cs->cur) return;
+    for (uint32_t i = 0; i < rr->n_src; i++)
+        if (rr->srcs[i]) ray_col_cursor_free(&cs->cur[i]);
+    if (cs->cur != cs->st) ray_free_raw(cs->cur);
+    cs->cur = NULL;
+}
+
+/* agg_walk through the task's cursors cs (agg_curs_init), which persist
+ * across its calls: a task walking consecutive blocks decodes the vector
+ * one block ends inside once, not once per block. */
+static bool agg_walk_cs(const agg_rr_t* rr, agg_curs_t* cs, void* ctx, agg_body_fn body,
+                        uint32_t wid, int64_t start, int64_t end, int64_t key) {
+    if (ray_scan_fail_skip(rr->fail, key)) return false;
+    agg_piece_ctx_t pc = { ctx, body, rr };
+    ray_t* err = ray_col_walk_cur(rr->srcs, rr->plain, rr->n_src, cs->cur, start, end, &pc, wid, agg_piece);
+    if (!err) return true;
+    ray_scan_fail_note(rr->fail, key, err);
+    return false;
+}
+
+/* Point reads of a staged key or input (ray_col_src_points_i64's
+ * contract: the ascending rows[0, n) of one vector, 1 / 0 / -1).  A SYM
+ * source's rows are its ids (ray_col_src_gather_points: each checked
+ * against the domain bound, id 0 the in-band null served as itself), so
+ * an id key costs no vector decode either.  SYM has no null bitmap; a
+ * flagged row would be one, and declines (the cursor reads it). */
+static inline int agg_src_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, ray_t** err) {
+    if (s->type != RAY_SYM) return ray_col_src_points_i64(s, rows, n, out, err);
+    *err = NULL;
+    if (n < 1 || n > RAY_COL_POINT_ROWS) return 0;
+    uint8_t nul[RAY_COL_POINT_ROWS];
+    int pr = ray_col_src_gather_points(s, rows, n, out, nul, err);
+    if (pr > 0) for (int64_t q = 0; q < n; q++) if (nul[q]) return 0;
+    return pr;
+}
+
+/* R-SPARSE over the ascending rows idx[i0, i1) through the task's cursors:
+ * the rows every staged source's current view covers form one run, handed
+ * to body as the index range [ib, ie) with a view positioned at idx[ib].
+ * Point reads (open decision D2): the first AGG_CURS_LENT integer and SYM sources
+ * read a vector holding few of the rows (D2, per codec; none
+ * decoded yet) by point reads into a vector-sized buffer of the walk, at
+ * the rows' own offsets: a sparse view, valid for exactly those rows,
+ * which are every row of idx[i0, i1) inside the vector, so no run reads
+ * another.  A declined vector is read through the cursor.
+ * NULL or an owned error (body is not called again after an error). */
+static ray_t* agg_idx_walk(const agg_rr_t* rr, agg_curs_t* cs, const int64_t* idx,
+                           int64_t i0, int64_t i1, void* ctx, agg_body_fn body, uint32_t wid) {
+    uint32_t ns = rr->n_src ? rr->n_src : 1, nk = rr->n_keys ? rr->n_keys : 1;
+    const void* ptr[ns];
+    uint8_t kat[nk];
+    /* the sparse views: their sources, vectors [lo, hi) and buffers */
+    _Alignas(64) int64_t spb[AGG_CURS_LENT][RAY_MORSEL_ELEMS];
+    int64_t sp_lo[AGG_CURS_LENT], sp_hi[AGG_CURS_LENT];
+    uint32_t sp_src[AGG_CURS_LENT], nsp = 0;
+    for (uint32_t s = 0; s < rr->n_src && nsp < AGG_CURS_LENT; s++) {
+        ray_col_src_t* src = rr->srcs[s];
+        if (!src || !ray_col_src_encoded(src)) continue;
+        switch (src->type) {
+        case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
+            sp_src[nsp] = s; sp_lo[nsp] = sp_hi[nsp] = -1; nsp++; break;
+        default: break;
+        }
+    }
+    for (int64_t i = i0; i < i1; ) {
+        int64_t b = idx[i], e = INT64_MAX;
+        for (uint32_t s = 0, sp = 0; s < rr->n_src; s++) {
+            if (!rr->srcs[s]) continue;
+            int slot = -1;
+            if (sp < nsp && sp_src[sp] == s) slot = (int)sp++;
+            if (slot >= 0) {
+                ray_col_cursor_t* c = &cs->cur[s];
+                bool covered = c->have && b >= c->v.start && b < c->v.start + c->v.n;
+                int64_t vlo, vhi;
+                if (!covered && !(b >= sp_lo[slot] && b < sp_hi[slot]) &&
+                    ray_col_src_vec_span(rr->srcs[s], b, &vlo, &vhi)) {
+                    int64_t j = i + 1;
+                    while (j < i1 && j - i <= RAY_COL_POINT_ROWS && idx[j] < vhi) j++;
+                    if (j - i <= RAY_COL_POINT_ROWS) {
+                        int64_t x[RAY_COL_POINT_ROWS];
+                        ray_t* err = NULL;
+                        int pr = agg_src_points(rr->srcs[s], idx + i, j - i, x, &err);
+                        if (pr < 0) return err;
+                        if (pr > 0) {
+                            uint8_t esz = ray_sym_elem_size(rr->srcs[s]->type, rr->srcs[s]->attrs);
+                            char* d = (char*)spb[slot];
+                            for (int64_t q = 0; q < j - i; q++) {
+                                size_t at = (size_t)(idx[i + q] - vlo) * esz;
+                                switch (esz) {
+                                case 1:  d[at] = (char)x[q]; break;
+                                case 2:  { int16_t y = (int16_t)x[q]; memcpy(d + at, &y, 2); break; }
+                                case 4:  { int32_t y = (int32_t)x[q]; memcpy(d + at, &y, 4); break; }
+                                default: memcpy(d + at, &x[q], 8); break;
+                                }
+                            }
+                            sp_lo[slot] = vlo; sp_hi[slot] = vhi;
+                        }
+                    }
+                }
+                if (!covered && b >= sp_lo[slot] && b < sp_hi[slot]) {
+                    uint8_t esz = ray_sym_elem_size(rr->srcs[s]->type, rr->srcs[s]->attrs);
+                    ptr[s] = (const char*)spb[slot] + (size_t)(b - sp_lo[slot]) * esz;
+                    if (s < rr->n_keys) kat[s] = rr->srcs[s]->attrs;
+                    if (sp_hi[slot] < e) e = sp_hi[slot];
+                    continue;
+                }
+            }
+            const ray_col_range_t* v;
+            ray_t* err = ray_col_cursor_at(&cs->cur[s], b, &v);
+            if (err) return err;
+            ptr[s] = (const char*)v->data + (size_t)(b - v->start) * ray_sym_elem_size(v->type, v->attrs);
+            if (s < rr->n_keys) kat[s] = v->attrs;
+            if (v->start + v->n < e) e = v->start + v->n;
+        }
+        int64_t j = i + 1;
+        while (j < i1 && idx[j] < e) j++;
+        agg_view_t view;
+        agg_view_set(rr, b, ptr, kat, &view);
+        body(ctx, &view, wid, i, j);
+        i = j;
+    }
+    return NULL;
+}
+
+/* Single-row reads for the samplers (strided, sparse): in place, or
+ * from a staged source's packed vector (a point read, no vector decode),
+ * else through its cursor.  *err is set on a range error. */
+static inline int64_t agg_key_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k, int64_t r, ray_t** err) {
+    if (!rr->srcs[k]) return agg_read_key_i64_raw(rr->key_types[k], rr->key_attrs[k], rr->plain[k], r);
+    int64_t x;
+    int pr = rr->srcs[k]->type == RAY_SYM ? agg_src_points(rr->srcs[k], &r, 1, &x, err)
+                                          : ray_col_src_point_i64(rr->srcs[k], r, &x, err);
+    if (pr) return pr > 0 ? x : 0;
+    const ray_col_range_t* v;
+    if ((*err = ray_col_cursor_at(&cs->cur[k], r, &v)) != NULL) return 0;
+    return agg_read_key_i64_raw(rr->key_types[k], v->attrs, v->data, r - v->start);
+}
+static inline const void* agg_elem_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t i, int64_t r, ray_t** err) {
+    if (!rr->srcs[i]) return rr->plain[i] ? (const char*)rr->plain[i] + (size_t)r * rr->esz[i] : NULL;
+    const ray_col_range_t* v;
+    if ((*err = ray_col_cursor_at(&cs->cur[i], r, &v)) != NULL) return NULL;
+    return (const char*)v->data + (size_t)(r - v->start) * rr->esz[i];
+}
+
+/* A zero-length column of a staged source's type standing in for it where
+ * a strategy reads the column's type, SYM width, domain and nullability
+ * (plans, layouts, emits); NULL on OOM.  Its data is never read. */
+static ray_t* agg_src_standin(const ray_col_src_t* s) {
+    /* a parted SYM source's own width is not authoritative (segments may
+     * differ): the stand-in takes the widest segment's, which plans and
+     * emits size their slots and output by */
+    uint8_t w = s->parted ? parted_sym_width(s->obj) : (s->attrs & RAY_SYM_W_MASK);
+    ray_t* v = s->type == RAY_SYM ? ray_sym_vec_new(w, 0)
+                                  : ray_vec_new(s->type, 0);
+    if (!v || RAY_IS_ERR(v)) {
+        if (v) ray_error_free(v);
+        return NULL;
+    }
+    if (s->type == RAY_SYM && s->dom && s->dom != ray_sym_runtime_domain()) {
+        ray_sym_domain_retain(s->dom);
+        v->sym_domain = s->dom;
+    }
+    if (s->may_null && s->type != RAY_SYM) v->attrs |= RAY_ATTR_HAS_NULLS;
+    v->len = 0;
+    return v;
+}
+
+/* The keys of one group run: bound once by exec_group_v2_run_inner.  A
+ * staged key's column is a stand-in (agg_src_standin). */
+typedef struct {
+    agg_rr_t        rr;          /* keys only (n_aggs 0) */
+    ray_col_src_t** srcs;        /* [n] staged keys' sources */
+    const void**    plain;       /* [n] */
+    int8_t*         types;
+    uint8_t*        attrs;
+    uint8_t*        esz;
+    ray_scan_fail_t fail;
+} agg_keyset_t;
+
+/* R-RANDOM: every staged key takes its plain column (a generation-2 key
+ * decodes once, through its once-state), for a strategy that reads keys at
+ * stored rows or whole.  NULL or an owned error. */
+static ray_t* agg_keys_unstage(ray_t** key_cols, agg_keyset_t* ks) {
+    for (uint32_t k = 0; k < ks->rr.n_keys; k++) {
+        if (!ks->srcs[k]) continue;
+        ray_t* plain = NULL;
+        ray_t* err = ray_col_src_plain(ks->srcs[k], &plain);   /* random: unstage: v2 whole-column strategy */
+        if (err) return err;
+        if (!plain) return ray_error("domain", "group key: no column");
+        key_cols[k] = plain;               /* borrowed: valid while the source is bound */
+        ks->plain[k] = ray_data(plain);
+        ks->attrs[k] = plain->attrs;
+        ks->esz[k] = ray_sym_elem_size(plain->type, plain->attrs);
+        ks->srcs[k] = NULL;
+    }
+    ks->rr.staged = false;
+    return NULL;
+}
+
 /* Hoist type and null handling out of range scans so native integer
  * reductions can vectorize, including nullable temporal keys. */
-static void agg_key_bounds(ray_t* key, int64_t start, int64_t end, bool nullable,
-                           int64_t null, int64_t* lo, int64_t* hi) {
+static void agg_key_bounds_raw(int8_t type, uint8_t attrs, const void* data,
+                               int64_t start, int64_t end, bool nullable,
+                               int64_t null, int64_t* lo, int64_t* hi) {
     int64_t mn = INT64_MAX, mx = INT64_MIN;
-    const void* data = ray_data(key);
     #define KEY_BOUNDS(T) do { \
         const T* p = data; \
         if (nullable) { \
@@ -287,13 +656,13 @@ static void agg_key_bounds(ray_t* key, int64_t start, int64_t end, bool nullable
             } \
         } \
     } while (0)
-    switch (key->type) {
-        case RAY_I64: case RAY_TIMESTAMP: KEY_BOUNDS(int64_t); break;
+    switch (type) {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: KEY_BOUNDS(int64_t); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: KEY_BOUNDS(int32_t); break;
         case RAY_I16: KEY_BOUNDS(int16_t); break;
         case RAY_U8: case RAY_BOOL: KEY_BOUNDS(uint8_t); break;
         case RAY_SYM:
-            switch (key->attrs & RAY_SYM_W_MASK) {
+            switch (attrs & RAY_SYM_W_MASK) {
                 case RAY_SYM_W8: KEY_BOUNDS(uint8_t); break;
                 case RAY_SYM_W16: KEY_BOUNDS(uint16_t); break;
                 case RAY_SYM_W32: KEY_BOUNDS(uint32_t); break;
@@ -303,6 +672,10 @@ static void agg_key_bounds(ray_t* key, int64_t start, int64_t end, bool nullable
     }
     #undef KEY_BOUNDS
     *lo = mn; *hi = mx;
+}
+static void agg_key_bounds(ray_t* key, int64_t start, int64_t end, bool nullable,
+                           int64_t null, int64_t* lo, int64_t* hi) {
+    agg_key_bounds_raw(key->type, key->attrs, ray_data(key), start, end, nullable, null, lo, hi);
 }
 
 typedef struct {
@@ -333,6 +706,137 @@ static void agg_key_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         c->bounds[task * 2 + 1] = hi;
     }
 }
+
+/* A staged key's prescan: one task per scanned span (a chunk without
+ * directory statistics, or the whole key when it has no directory), each
+ * span read by pieces (R-WALK) into its task's bounds. */
+typedef struct {
+    const agg_rr_t* rr;          /* the key alone */
+    bool nullable;
+    int64_t null;
+    const int64_t* spans;        /* [tasks][2] row ranges */
+    int64_t* bounds;             /* [tasks][2] */
+} agg_key_scan_ctx_t;
+typedef struct { const agg_key_scan_ctx_t* c; int64_t lo, hi; } agg_key_scan_task_t;
+static void agg_key_scan_piece(void* raw, const agg_view_t* v, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_key_scan_task_t* t = raw;
+    int64_t lo, hi;
+    agg_key_bounds_raw(t->c->rr->key_types[0], v->key_attrs[0], v->key_data[0],
+                       0, end - start, t->c->nullable, t->c->null, &lo, &hi);
+    if (lo < t->lo) t->lo = lo;
+    if (hi > t->hi) t->hi = hi;
+}
+static void agg_key_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    agg_key_scan_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        agg_key_scan_task_t t = { c, INT64_MAX, INT64_MIN };
+        (void)agg_walk(c->rr, &t, agg_key_scan_piece, wid, c->spans[task * 2], c->spans[task * 2 + 1],
+                       c->spans[task * 2]);
+        c->bounds[task * 2] = t.lo; c->bounds[task * 2 + 1] = t.hi;
+    }
+}
+
+/* One chunk of a parted key (ray_col_src_parted_chunks): folded from its
+ * segment's statistics as agg_key_bounds_staged folds a directory's, or
+ * appended to the spans to scan (counted only while spans is NULL). */
+typedef struct {
+    int8_t   type;
+    int64_t  mn, mx;
+    int64_t* spans;
+    int64_t  n;
+} agg_bounds_fold_t;
+static void agg_bounds_chunk(void* raw, int64_t lo, int64_t hi, const ray_enc_chunk_stat_t* st) {
+    agg_bounds_fold_t* f = raw;
+    if (st) {
+        if (f->type == RAY_SYM && st->null_count > 0 && f->mn > 0) f->mn = 0;
+        if ((int64_t)st->null_count >= st->rows) return;   /* all null */
+        if (st->has_minmax) {
+            if (st->min < f->mn) f->mn = st->min;
+            if (st->max > f->mx) f->mx = st->max;
+            return;
+        }
+    }
+    if (f->spans) { f->spans[f->n * 2] = lo; f->spans[f->n * 2 + 1] = hi; }
+    f->n++;
+}
+
+/* Bounds of a staged key from its directory: per chunk min / max, all-null
+ * chunks skipped (a SYM chunk with nulls also spans id 0, the null symbol);
+ * chunks without statistics, and keys without a directory, are scanned by
+ * pieces.  A parted key folds its encoded segments' chunks the same way
+ * (ray_col_src_parted_chunks) and scans its plain ones.  NULL or an owned
+ * error. */
+static ray_t* agg_key_bounds_staged(const agg_rr_t* krr, uint32_t k, int64_t rows, bool nullable,
+                                    int64_t null, int64_t* lo, int64_t* hi) {
+    ray_col_src_t* src = krr->srcs[k];
+    int64_t mn = INT64_MAX, mx = INT64_MIN;
+    int64_t nch = (rows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    ray_enc_chunk_stat_t st;
+    bool dir = nch > 0 && ray_col_src_chunk_stat(src, 0, &st);
+    ray_t* hdr = NULL;
+    int64_t* spans;
+    int64_t* bounds;
+    int64_t n = 0;
+    agg_bounds_fold_t pf = { krr->key_types[k], INT64_MAX, INT64_MIN, NULL, 0 };
+    ray_t* perr = NULL;
+    if (src->parted && ray_col_src_encoded(src) && ray_col_src_parted_chunks(src, &pf, agg_bounds_chunk, &perr)) {
+        /* the parted directory: count the chunks to scan, then list them */
+        int64_t ns = pf.n;
+        spans = (int64_t*)scratch_alloc(&hdr, (size_t)(ns > 0 ? ns : 1) * 4 * sizeof(int64_t));
+        if (!spans) return ray_error("oom", NULL);
+        bounds = spans + (ns > 0 ? ns : 1) * 2;
+        pf = (agg_bounds_fold_t){ krr->key_types[k], INT64_MAX, INT64_MIN, spans, 0 };
+        (void)ray_col_src_parted_chunks(src, &pf, agg_bounds_chunk, &perr);
+        mn = pf.mn; mx = pf.mx; n = pf.n;
+        nch = 0;
+    } else {
+        if (perr) return perr;
+        spans = (int64_t*)scratch_alloc(&hdr, (size_t)(nch > 0 ? nch : 1) * 4 * sizeof(int64_t));
+        if (!spans) return ray_error("oom", NULL);
+        bounds = spans + (nch > 0 ? nch : 1) * 2;
+    }
+    for (int64_t ch = 0; ch < nch; ch++) {
+        int64_t b = ch * RAY_ENC_CHUNK, e = b + RAY_ENC_CHUNK < rows ? b + RAY_ENC_CHUNK : rows;
+        if (dir) {
+            (void)ray_col_src_chunk_stat(src, ch, &st);
+            if (krr->key_types[k] == RAY_SYM && st.null_count > 0 && mn > 0) mn = 0;
+            if ((int64_t)st.null_count >= st.rows) continue;   /* all null */
+            if (st.has_minmax) {
+                if (st.min < mn) mn = st.min;
+                if (st.max > mx) mx = st.max;
+                continue;
+            }
+        }
+        spans[n * 2] = b; spans[n * 2 + 1] = e; n++;
+    }
+    ray_t* err = NULL;
+    if (n > 0) {
+        ray_col_src_t* one_src[1] = { src };
+        const void* one_plain[1] = { NULL };
+        uint8_t one_esz[1] = { krr->esz[k] };
+        ray_scan_fail_t fail;
+        ray_scan_fail_init(&fail);
+        agg_rr_t rr = { .srcs = one_src, .plain = one_plain, .esz = one_esz,
+            .key_types = krr->key_types + k, .key_attrs = krr->key_attrs + k,
+            .n_src = 1, .n_keys = 1, .n_aggs = 0, .fail = &fail, .staged = true };
+        agg_key_scan_ctx_t c = { &rr, nullable, null, spans, bounds };
+        ray_col_src_advise(src, 0, rows);
+        ray_pool_t* pool = ray_pool_get();
+        bool par = pool && n > 1 && rows >= RAY_PARALLEL_THRESHOLD;
+        if (par) ray_pool_dispatch_n(pool, agg_key_scan_fn, &c, (uint32_t)n);
+        else agg_key_scan_fn(&c, 0, 0, n);
+        err = ray_scan_fail_finish(&fail, par ? pool : NULL);
+        for (int64_t t = 0; !err && t < n; t++) {
+            if (bounds[t * 2] < mn) mn = bounds[t * 2];
+            if (bounds[t * 2 + 1] > mx) mx = bounds[t * 2 + 1];
+        }
+    }
+    scratch_free(hdr);
+    *lo = mn; *hi = mx;
+    return err;
+}
+
 static void agg_key_bounds_parallel(ray_t* key, int64_t rows, bool nullable,
                                     int64_t null, int64_t* lo, int64_t* hi) {
     ray_pool_t* pool = ray_pool_get();
@@ -369,44 +873,56 @@ static void agg_key_bounds_parallel(ray_t* key, int64_t rows, bool nullable,
  * bounded (AGG_COMPACT_MAX_RANGE codes) are compacted. */
 enum { AGG_COMPACT_MAX_RANGE = 1 << 22,   /* largest per-key remap table (codes) */
        AGG_COMPACT_TRY_SLOTS = 1 << 16 };  /* raw products above this try compaction */
-#define AGG_COMPACT_BITMAP_BUDGET ((size_t)32 << 20)   /* transient per-task bitmaps */
 
 typedef struct {
-    ray_t** key_cols;
+    const agg_rr_t* krr;     /* the keys; staged ones are read by pieces */
     const dense_plan_t* dp;
     const bool* candidate;
     uint32_t n_keys;
     int64_t rows;
     uint32_t tasks;
     uint64_t** task_bits;    /* [tasks][n_keys] private bitmaps, NULL when not a candidate */
+    int64_t task;            /* the task its pieces belong to (agg_compact_mark_fn) */
 } agg_compact_ctx_t;
 
-static void agg_compact_mark_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+static void agg_compact_mark_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t begin, int64_t limit) {
     (void)wid;
     agg_compact_ctx_t* c = raw;
-    for (int64_t task = start; task < end; task++) {
-        int64_t begin = c->rows / c->tasks * task;
-        int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1);
-        for (uint32_t k = 0; k < c->n_keys; k++) {
-            if (!c->candidate[k]) continue;
-            uint64_t* bits = c->task_bits[(size_t)task * c->n_keys + k];
-            ray_t* kc = c->key_cols[k];
-            const void* d = ray_data(kc);
-            int64_t mn = c->dp->mins[k];
-            bool nullable = c->dp->nullable[k];
-            int64_t null = c->dp->nulls[k];
-            for (int64_t r = begin; r < limit; r++) {
-                int64_t v = agg_read_key_i64(kc, d, r);
-                if (nullable && v == null) continue;
-                uint64_t code = (uint64_t)(v - mn);
-                bits[code >> 6] |= UINT64_C(1) << (code & 63);
-            }
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        if (!c->candidate[k]) continue;
+        uint64_t* bits = c->task_bits[(size_t)c->task * c->n_keys + k];
+        int64_t mn = c->dp->mins[k];
+        bool nullable = c->dp->nullable[k];
+        int64_t null = c->dp->nulls[k];
+        const int8_t kt = c->krr->key_types[k];       /* hoisted: the bitmap stores */
+        const uint8_t ka = v->key_attrs[k];           /* would reload them per row */
+        const void* kd = v->key_data[k];
+        const int64_t base = v->base;
+        for (int64_t r = begin; r < limit; r++) {
+            int64_t val = agg_read_key_i64_raw(kt, ka, kd, r - base);
+            if (nullable && val == null) continue;
+            uint64_t code = (uint64_t)(val - mn);
+            bits[code >> 6] |= UINT64_C(1) << (code & 63);
         }
     }
 }
 
-static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
-                                   int64_t dense_limit, dense_plan_t* out) {
+static void agg_compact_mark_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    agg_compact_ctx_t* c = raw;
+    for (int64_t task = start; task < end; task++) {
+        int64_t begin = c->rows / c->tasks * task;
+        int64_t limit = task + 1 == c->tasks ? c->rows : c->rows / c->tasks * (task + 1);
+        agg_compact_ctx_t tc = *c;   /* no atomics: a per-task copy names the task */
+        tc.task = task;
+        if (!c->krr->staged) {
+            agg_view_t whole = agg_view_whole(c->krr);
+            agg_compact_mark_rows(&tc, &whole, wid, begin, limit);
+        } else (void)agg_walk(c->krr, &tc, agg_compact_mark_rows, wid, begin, limit, begin);
+    }
+}
+
+static bool agg_dense_plan_compact(const agg_rr_t* krr, uint32_t n_keys, int64_t nrows,
+                                   int64_t dense_limit, dense_plan_t* out, ray_t** err) {
     bool candidate[16];
     bool any = false;
     for (uint32_t k = 0; k < n_keys; k++) {
@@ -415,6 +931,27 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
         any |= candidate[k];
     }
     if (!any) return false;
+    /* The keys that are not candidates keep their ranges, and a candidate
+     * compacts to at least one slot: when those ranges alone overflow the
+     * limit no marking can make the plan fit (the check below would
+     * fail), so the keys are not read. */
+    {
+        int64_t fixed = 1;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            if (candidate[k]) continue;
+            if (out->ranges[k] <= 0 || fixed > dense_limit / out->ranges[k]) return false;
+            fixed *= out->ranges[k];
+        }
+    }
+    /* Only the candidates are read: the others' staged sources leave the
+     * walk (agg_compact_mark_rows never reads them). */
+    ray_col_src_t* msrc[16];
+    agg_rr_t mrr = *krr;
+    if (krr->staged && krr->n_src <= 16) {
+        for (uint32_t i = 0; i < krr->n_src; i++) msrc[i] = i < n_keys && !candidate[i] ? NULL : krr->srcs[i];
+        mrr.srcs = msrc;
+        krr = &mrr;
+    }
     ray_pool_t* pool = ray_pool_get();
     uint32_t tasks = pool && nrows >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) : 1;
     if ((int64_t)tasks > nrows) tasks = (uint32_t)nrows;
@@ -436,10 +973,15 @@ static bool agg_dense_plan_compact(ray_t** key_cols, uint32_t n_keys, int64_t nr
                 cursor += (out->ranges[k] - out->nullable[k] + 63) / 64;
             }
     }
-    agg_compact_ctx_t c = { .key_cols = key_cols, .dp = out, .candidate = candidate,
+    agg_compact_ctx_t c = { .krr = krr, .dp = out, .candidate = candidate,
         .n_keys = n_keys, .rows = nrows, .tasks = tasks, .task_bits = task_bits };
+    if (krr->staged) ray_scan_fail_init(krr->fail);
     if (tasks > 1) ray_pool_dispatch_n(pool, agg_compact_mark_fn, &c, tasks);
     else agg_compact_mark_fn(&c, 0, 0, 1);
+    if (krr->staged && (*err = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) {
+        ray_free_raw(bits); ray_free_raw(task_bits);
+        return false;
+    }
     /* Reduce task bitmaps into task 0, count used codes, re-check the product. */
     int64_t used[16];
     int64_t total = 1;
@@ -546,7 +1088,7 @@ enum { AGG_EST_SAMPLE = AGG_EST_SAMPLE_ROWS, AGG_EST_PREFETCH = 16,
  * one more value), a SYM's code. */
 static inline int64_t agg_est_read(const void* d, int8_t t, uint8_t attrs, int64_t r) {
     switch (t) {
-    case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[r];
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[r];
     case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[r];
     case RAY_I16: return ((const int16_t*)d)[r];
     case RAY_U8: case RAY_BOOL: return ((const uint8_t*)d)[r];
@@ -814,13 +1356,96 @@ int64_t agg_group_card_estimate(ray_t** key_cols, uint32_t n_keys, int64_t nrows
     return total;
 }
 
-bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
-                    const agg_vtable_t** vts, uint32_t n_aggs,
-                    int64_t nrows, dense_plan_t* out) {
-    (void)vts; (void)n_aggs;   /* agg kind no longer gates dense eligibility */
+/* The bytes the calling heap can take before the anonymous watermark: the
+ * room under it, with the committed blocks the heap can reuse added back.
+ * 0 when the watermark (the RAM) is unknown. */
+static int64_t agg_dense_wide_room(void) {
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return 0;
+    int64_t room = wm - ray_heap_anon_committed() + ray_heap_anon_reusable();
+    return room > 0 ? room : 0;
+}
+
+/* Whether a shared slab of this plan holds u32 counters (4 bytes a slot): every
+ * aggregate is COUNT, so one counter per slot serves them all, and the input
+ * has at most UINT32_MAX rows, so no slot's count can pass UINT32_MAX.  With
+ * more rows the slab keeps the 8-byte count states. */
+static bool agg_count32_slab(const agg_vtable_t** vts, uint32_t n_aggs, int64_t rows) {
+    if (n_aggs == 0 || rows > (int64_t)UINT32_MAX) return false;
+    const agg_vtable_t* cnt = agg_resolve(OP_COUNT, RAY_I64);
+    for (uint32_t a = 0; a < n_aggs; a++) if (vts[a] != cnt) return false;
+    return true;
+}
+
+/* A wide plan spans at most this many slots per input row: a slab much larger
+ * than the input is mostly empty, and the radix routes answer from the rows. */
+#define AGG_WIDE_RANGE_PER_ROW 16
+
+/* The most slots a wide dense plan (a range past the row count) may span: one
+ * four-byte counter per slot must fit the room, and a slot is a uint32. */
+static int64_t agg_dense_wide_slots(void) {
+    int64_t s = agg_dense_wide_room() / 4;
+    return s < (int64_t)UINT32_MAX ? s : (int64_t)UINT32_MAX;
+}
+
+/* Whether the single key has many groups: of 1024 rows spread over the table,
+ * at least a quarter hold distinct keys.  A wide dense plan pays for its
+ * whole range, so a key with a few groups spread over a wide range (which
+ * the table stack and the hash routes answer from their own few entries)
+ * does not take it.  *err is set on a failed range read. */
+static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows, ray_t** err) {
+    enum { SAMPLES = 1024, CAP = 2048 };
+    *err = NULL;
+    if (nrows < SAMPLES) return false;
+    int64_t seen[CAP];
+    bool used[CAP];
+    memset(used, 0, sizeof used);
+    agg_curs_t cs; cs.cur = NULL;
+    if (rr->staged && !agg_curs_init(&cs, rr)) { *err = ray_error("oom", NULL); return false; }
+    int64_t step = nrows / SAMPLES, distinct = 0;
+    if (!rr->staged && ray_col_cold(key_col))
+        for (int i = 0; i < SAMPLES; i++)
+            ray_col_want_row(key_col, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+    for (int i = 0; i < SAMPLES && !*err; i++) {
+        int64_t v = agg_key_at(rr, &cs, 0, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step), err);
+        if (*err) break;
+        uint32_t at = ray_hash_i64(v) & (CAP - 1);
+        while (used[at] && seen[at] != v) at = (at + 1) & (CAP - 1);
+        if (!used[at]) { used[at] = true; seen[at] = v; distinct++; }
+    }
+    agg_curs_free(&cs, rr);
+    return !*err && distinct * 4 >= SAMPLES;
+}
+
+/* Whether a single-key plan of total_slots runs as the one shared slab of a
+ * wide plan: every aggregate updates a shared state, the slab and its
+ * occupancy bits fit three quarters of the room under the anonymous
+ * watermark, and the key shows many groups (agg_wide_populated).  The
+ * caller checks the plan's shape (pool, rows, streaming states, no group
+ * limit, one key).  *err is set on a failed range read. */
+static bool agg_wide_shared_fits(const agg_vtable_t** vts, uint32_t n_aggs, size_t block,
+                                 int64_t total_slots, int64_t eff_n, ray_t* key_col,
+                                 const agg_rr_t* rr, int64_t nrows, ray_t** err) {
+    *err = NULL;
+    if (agg_no_wide_dense) return false;
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (vts[a]->update_shared == NULL) return false;
+    size_t slot_bytes = agg_count32_slab(vts, n_aggs, eff_n) ? sizeof(uint32_t) : block;
+    double need = (double)total_slots * (double)slot_bytes + (double)total_slots / 8;
+    if (need > (double)agg_dense_wide_room() / 4 * 3) return false;
+    return agg_wide_populated(key_col, rr, nrows, err);
+}
+
+/* agg_dense_plan over keys bound for range reads: krr's staged keys (their
+ * key_cols are stand-ins) take their bounds from the directory or by
+ * pieces.  False with *err set: a range error. */
+static bool agg_dense_plan_src(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys, bool allow_wide,
+                               int64_t nrows, dense_plan_t* out, ray_t** err) {
+    *err = NULL;
     out->ok = false;
     out->n_keys = n_keys;
     out->compacted = false;
+    out->wide = false;
     memset(out->remap, 0, sizeof(out->remap));
     memset(out->inverse, 0, sizeof(out->inverse));
     /* Dense direct-index routing self-limits to <=16 keys: dense_plan_t's
@@ -873,7 +1498,10 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
         }
 
         int64_t mn, mx;
-        agg_key_bounds_parallel(kc, nrows, out->nullable[k], out->nulls[k], &mn, &mx);
+        if (krr && krr->srcs[k]) {
+            if ((*err = agg_key_bounds_staged(krr, k, nrows, out->nullable[k], out->nulls[k], &mn, &mx)) != NULL)
+                return false;
+        } else agg_key_bounds_parallel(kc, nrows, out->nullable[k], out->nulls[k], &mn, &mx);
         if (!agg_dense_range(out, k, mn, mx)) return false;
     }
 
@@ -888,6 +1516,17 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
         if (total > dense_limit / rng) overflow = true;
         else total *= rng;
     }
+    /* One key whose range passes the row count: a slab the size of the range
+     * is admitted when it is at most AGG_WIDE_RANGE_PER_ROW slots per row and
+     * fits the room under the memory watermark (agg_dense_wide_slots).  Its
+     * answer is the same; only the shared strategy runs it (the caller drops
+     * the plan otherwise). */
+    if (overflow && n_keys == 1 && allow_wide && out->ranges[0] <= AGG_WIDE_RANGE_PER_ROW * nrows &&
+            out->ranges[0] <= agg_dense_wide_slots()) {
+        overflow = false;
+        out->wide = true;
+        total = out->ranges[0];
+    }
     if (overflow || (n_keys >= 2 && total > AGG_COMPACT_TRY_SLOTS)) {
         /* Raw ranges multiply out too far — or far enough past a
          * cache-resident slab that sparse keys would waste it (a W16 SYM key
@@ -895,7 +1534,8 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
          * they use and retry the packing over the compacted ranges.  Keys
          * whose every code is used keep their raw range. */
         bool compacted_ok = n_keys >= 2 &&
-            agg_dense_plan_compact(key_cols, n_keys, nrows, dense_limit, out);
+            agg_dense_plan_compact(krr, n_keys, nrows, dense_limit, out, err);
+        if (*err) return false;
         if (overflow && !compacted_ok) return false;
         total = 1;
         for (uint32_t k = 0; k < n_keys; k++) {
@@ -913,6 +1553,47 @@ bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
     out->total_slots = total;
     out->ok = true;
     return true;
+}
+
+/* The keys of plain columns, as a keys-only source set (nothing staged). */
+static agg_rr_t agg_keys_plain_rr(ray_t** key_cols, uint32_t n_keys, ray_t** hdr,
+                                  ray_scan_fail_t* fail) {
+    agg_rr_t rr = { .n_src = n_keys, .n_keys = n_keys, .fail = fail };
+    size_t nk = n_keys ? n_keys : 1;
+    void* blk = scratch_calloc(hdr, nk * (2 * sizeof(void*) + 3));
+    if (!blk) { rr.n_src = rr.n_keys = 0; return rr; }
+    ray_col_src_t** srcs = (ray_col_src_t**)blk;
+    const void** plain = (const void**)(srcs + nk);
+    uint8_t* esz = (uint8_t*)(plain + nk);
+    int8_t* types = (int8_t*)(esz + nk);
+    uint8_t* attrs = (uint8_t*)(types + nk);
+    for (uint32_t k = 0; k < n_keys; k++) {
+        plain[k] = ray_data(key_cols[k]);
+        types[k] = key_cols[k]->type;
+        attrs[k] = key_cols[k]->attrs;
+        esz[k] = ray_sym_elem_size(key_cols[k]->type, key_cols[k]->attrs);
+    }
+    rr.srcs = srcs; rr.plain = plain; rr.esz = esz; rr.key_types = types; rr.key_attrs = attrs;
+    return rr;
+}
+
+bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
+                    const agg_vtable_t** vts, uint32_t n_aggs,
+                    int64_t nrows, dense_plan_t* out) {
+    (void)vts; (void)n_aggs;   /* agg kind no longer gates dense eligibility */
+    out->ok = false;           /* a failed carve leaves a plan agg_dense_plan_free takes */
+    out->compacted = false;
+    memset(out->remap, 0, sizeof(out->remap));
+    memset(out->inverse, 0, sizeof(out->inverse));
+    ray_t* hdr = NULL;
+    ray_scan_fail_t fail;
+    ray_scan_fail_init(&fail);
+    agg_rr_t krr = agg_keys_plain_rr(key_cols, n_keys, &hdr, &fail);
+    ray_t* err = NULL;
+    bool ok = krr.n_keys == n_keys && agg_dense_plan_src(key_cols, &krr, n_keys, false, nrows, out, &err);
+    if (err) ray_error_free(err);   /* plain keys read in place: no range errors */
+    scratch_free(hdr);
+    return ok;
 }
 
 /* Per-op result-column-name suffix, mirroring emit_agg_columns (group.c).
@@ -1017,7 +1698,7 @@ static bool key_null_in_range(const ray_t* v, int64_t start, int64_t end) {
         switch (v->type) {
             case RAY_F64: { const double* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
             case RAY_F32: { const float* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] != d[i]); break; }
-            case RAY_I64: case RAY_TIMESTAMP: { const int64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I64); break; }
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: { const int64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I64); break; }
             case RAY_I32: case RAY_DATE: case RAY_TIME: { const int32_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I32); break; }
             case RAY_I16: { const int16_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[i] == NULL_I16); break; }
             case RAY_GUID: { const uint64_t* d = p; for (int64_t i = s; i < e; i++) any |= (d[2 * i] == 0 && d[2 * i + 1] == 0); break; }
@@ -1044,7 +1725,7 @@ static void key_null_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end
 void ray_group_key_settle_nulls(ray_t* kc) {
     if (!kc || RAY_IS_ERR(kc) || !(kc->attrs & RAY_ATTR_HAS_NULLS)) return;
     switch (kc->type) {
-        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_F32: case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16: case RAY_GUID: break;
         default: return;
     }
@@ -1101,7 +1782,7 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
     switch (src_col->type) {
         case RAY_F64: GATHER_NULL(double, NULL_F64); break;
         case RAY_F32: GATHER_NULL(float, NULL_F32); break;
-        case RAY_I64: case RAY_TIMESTAMP: GATHER_NULL(int64_t, NULL_I64); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: GATHER_NULL(int64_t, NULL_I64); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: GATHER_NULL(int32_t, NULL_I32); break;
         case RAY_I16: GATHER_NULL(int16_t, NULL_I16); break;
         default: break; /* SYM/GUID use zero payloads; BOOL/U8 have no null. */
@@ -1273,36 +1954,37 @@ static int64_t agg_sel_cursor_next(agg_sel_cursor_t* c, int64_t* rows) {
     return n;
 }
 
-/* Gather one chunk's value column (native esz) into a small dense buffer.
+/* Gather one chunk's value column (native esz) into a small dense buffer:
+ * rows[i] read at rows[i] - base (src is the view's pointer at row base).
  * COUNT (val_data == NULL) needs no gather — returns without touching dst. */
 static inline void agg_sel_gather_vals(void* dst, const void* src, uint8_t esz,
-                                       const int64_t* rows, int64_t n) {
+                                       const int64_t* rows, int64_t n, int64_t base) {
     if (!src || esz == 0) return;
     const char* s = (const char*)src;
     switch (esz) {
         case 8: {
             int64_t* dd = (int64_t*)dst; const int64_t* ss = (const int64_t*)s;
-            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i]];
+            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i] - base];
             break;
         }
         case 4: {
             int32_t* dd = (int32_t*)dst; const int32_t* ss = (const int32_t*)s;
-            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i]];
+            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i] - base];
             break;
         }
         case 2: {
             int16_t* dd = (int16_t*)dst; const int16_t* ss = (const int16_t*)s;
-            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i]];
+            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i] - base];
             break;
         }
         case 1: {
             uint8_t* dd = (uint8_t*)dst; const uint8_t* ss = (const uint8_t*)s;
-            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i]];
+            for (int64_t i = 0; i < n; i++) dd[i] = ss[rows[i] - base];
             break;
         }
         default: {  /* general gather, correct for any element width */
             char* dd = (char*)dst;
-            for (int64_t i = 0; i < n; i++) memcpy(dd + i * esz, s + rows[i] * esz, esz);
+            for (int64_t i = 0; i < n; i++) memcpy(dd + i * esz, s + (rows[i] - base) * esz, esz);
             break;
         }
     }
@@ -1310,51 +1992,144 @@ static inline void agg_sel_gather_vals(void* dst, const void* src, uint8_t esz,
 
 /* Per-dispatch descriptor tables, sized from ext->n_keys / ext->n_aggs.
  * One carve; 8-byte arrays first, then narrower.  Replaces the fixed
- * [16] blocks that used to cap the engine at 16 keys/aggs. */
+ * [16] blocks that used to cap the engine at 16 keys/aggs.
+ *
+ * key_data, val_data and val2_data are one array (the sources' row-0
+ * pointers, NULL for a staged source and for COUNT), key_srcs, val_srcs
+ * and val2_srcs another (the staged sources), key_esz, val_esz and
+ * val2_esz a third: rr reads them as flat [n_keys + 2 * n_aggs] arrays.
+ * val_id / val2_id name each input whether staged or plain (its row-0
+ * pointer, or its source; NULL: no input): the layouts and the phases that
+ * read no column test presence and identity on them. */
 typedef struct {
-    ray_t*        hdr;
-    const void**  key_data;
-    const void**  val_data;  const void** val2_data;
-    int64_t*      agg_syms;
-    int8_t*       val_types; int8_t*  val2_types;
-    bool*         val_hasnull; bool*  val2_hasnull;
-    uint8_t*      val_esz;   uint8_t* val2_esz;
+    ray_t*          hdr;
+    const void**    key_data;
+    const void**    val_data;  const void** val2_data;
+    ray_col_src_t** key_srcs;
+    ray_col_src_t** val_srcs;  ray_col_src_t** val2_srcs;
+    const void**    val_id;    const void** val2_id;
+    int64_t*        agg_syms;
+    uint8_t*        key_esz;
+    int8_t*         key_types; uint8_t* key_attrs;
+    int8_t*         val_types; int8_t*  val2_types;
+    bool*           val_hasnull; bool*  val2_hasnull;
+    uint8_t*        val_esz;   uint8_t* val2_esz;
+    bool            staged;    /* some key or input is read by range */
+    agg_rr_t        rr;
+    agg_view_t      whole;
+    ray_scan_fail_t fail;      /* the strategy's dispatches (R-FAIL) */
 } agg_desc_t;
 
+/* A value column: bound, decisions from the source; the payload pointer is
+ * captured only when the column can be read in place (ray_col_src_ready:
+ * generation 0, or a published materialization).  Otherwise *plain stays
+ * NULL and the strategies read the source by range.  Absent leaves *src
+ * NULL; a failed bind sets *err.  The agg shapes admitted before this
+ * point never name a partition key or a sliced parted column, so a source
+ * that does not bind is an error here, not a fall back to raw reads. */
+static bool agg_desc_value(ray_graph_t* g, ray_t* tbl, int64_t sym, const void** plain,
+                           ray_col_src_t** src, ray_t** err) {
+    *plain = NULL; *src = NULL;
+    if (ray_col_bind_declines(tbl, sym)) {
+        *err = ray_error("nyi", "aggregate input is not a bindable column");
+        return false;
+    }
+    *src = ray_graph_bind_col(g, tbl, sym, err);
+    if (!*src) return *err == NULL;
+    ray_t* ready = ray_col_src_ready(*src);   /* ready-only: never decodes */
+    if (ready && !RAY_IS_PARTED(ready->type)) *plain = ray_data(ready);
+    return true;
+}
+
+/* False with *err NULL: out of memory; false with an owned *err: a column
+ * bind failed (the caller returns it).  A key whose column is a stand-in
+ * (its source is bound and not ready as that column: exec_group_v2_run_inner)
+ * and an input that is not ready are staged: read by range. */
 static bool agg_desc_init(agg_desc_t* d, ray_graph_t* g, ray_op_ext_t* ext,
-                          ray_t* tbl, ray_t** key_cols) {
+                          ray_t* tbl, ray_t** key_cols, ray_t** err) {
+    *err = NULL;
     uint32_t nk = ext->n_keys, na = ext->n_aggs;
-    size_t n8 = (size_t)nk + 3u * na;              /* key_data,val_data,val2_data,agg_syms */
-    size_t n1 = 6u * na;                           /* types/hasnull/esz pairs */
-    d->key_data = (const void**)scratch_alloc(&d->hdr, n8 * 8 + n1);
+    uint32_t ns = nk + 2u * na;
+    size_t n8 = 2u * (size_t)ns + 3u * na;         /* plain, srcs, ids, agg_syms */
+    size_t n1 = 3u * (size_t)nk + 6u * na;         /* esz, key types/attrs, val types/hasnull */
+    d->key_data = (const void**)scratch_calloc(&d->hdr, n8 * 8 + n1 + 1);
     if (!d->key_data) return false;
     d->val_data   = d->key_data + nk;
     d->val2_data  = d->val_data + na;
-    d->agg_syms   = (int64_t*)(d->val2_data + na);
-    d->val_types  = (int8_t*)(d->agg_syms + na);
+    d->key_srcs   = (ray_col_src_t**)(d->val2_data + na);
+    d->val_srcs   = d->key_srcs + nk;
+    d->val2_srcs  = d->val_srcs + na;
+    d->val_id     = (const void**)(d->val2_srcs + na);
+    d->val2_id    = d->val_id + na;
+    d->agg_syms   = (int64_t*)(d->val2_id + na);
+    d->key_esz    = (uint8_t*)(d->agg_syms + na);
+    d->val_esz    = d->key_esz + nk;
+    d->val2_esz   = d->val_esz + na;
+    d->key_types  = (int8_t*)(d->val2_esz + na);
+    d->key_attrs  = (uint8_t*)(d->key_types + nk);
+    d->val_types  = (int8_t*)(d->key_attrs + nk);
     d->val2_types = d->val_types + na;
     d->val_hasnull  = (bool*)(d->val2_types + na);
     d->val2_hasnull = d->val_hasnull + na;
-    d->val_esz  = (uint8_t*)(d->val2_hasnull + na);
-    d->val2_esz = d->val_esz + na;
-    for (uint32_t k = 0; k < nk; k++) d->key_data[k] = ray_data(key_cols[k]);
+    d->staged = false;
+    for (uint32_t k = 0; k < nk; k++) {
+        ray_t* kc = key_cols[k];
+        d->key_types[k] = kc->type;
+        d->key_attrs[k] = kc->attrs;
+        d->key_esz[k] = ray_sym_elem_size(kc->type, kc->attrs);
+        d->key_data[k] = ray_data(kc);
+        ray_op_ext_t* kext = find_ext(g, ext->keys[k]);
+        if (!kext || ray_col_bind_declines(tbl, kext->sym)) continue;   /* today's column */
+        ray_col_src_t* ks = ray_graph_bind_col(g, tbl, kext->sym, err);
+        if (*err) goto fail;
+        if (ks && ray_col_src_ready(ks) != kc) {   /* kc is the stand-in */
+            d->key_srcs[k] = ks;
+            d->key_data[k] = NULL;
+            d->staged = true;
+        }
+    }
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         d->agg_syms[a] = ie ? ie->sym : 0;
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
-        d->val_data[a]    = vc ? ray_data(vc) : NULL;
-        d->val_types[a]   = vc ? vc->type : RAY_I64;
-        d->val_hasnull[a] = vc ? ray_vec_may_have_nulls(vc) : false;
-        d->val_esz[a]     = vc ? col_esz(vc) : 0;
+        const void* vp = NULL;
+        ray_col_src_t* vs = NULL;
+        if (ext->agg_ops[a] != OP_COUNT && ie &&
+            !agg_desc_value(g, tbl, ie->sym, &vp, &vs, err)) goto fail;
+        d->val_data[a]    = vp;
+        d->val_srcs[a]    = vs && !vp ? vs : NULL;
+        d->val_types[a]   = vs ? vs->type : RAY_I64;
+        d->val_hasnull[a] = vs ? vs->may_null : false;
+        d->val_esz[a]     = vs ? ray_col_src_esz(vs) : 0;
+        d->val_id[a]      = vp ? vp : (const void*)vs;
+        d->staged |= d->val_srcs[a] != NULL;
         /* Binary agg (pearson): resolve the y-side column from agg_ins2[a]. */
-        ray_t* vc2 = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
-            ? ray_table_get_col(tbl, find_ext(g, ext->agg_ins2[a])->sym) : NULL;
-        d->val2_data[a]    = vc2 ? ray_data(vc2) : NULL;
-        d->val2_types[a]   = vc2 ? vc2->type : RAY_I64;
-        d->val2_hasnull[a] = vc2 ? ray_vec_may_have_nulls(vc2) : false;
-        d->val2_esz[a]     = vc2 ? col_esz(vc2) : 0;
+        const void* vp2 = NULL;
+        ray_col_src_t* vs2 = NULL;
+        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE &&
+            !agg_desc_value(g, tbl, find_ext(g, ext->agg_ins2[a])->sym, &vp2, &vs2, err)) goto fail;
+        d->val2_data[a]    = vp2;
+        d->val2_srcs[a]    = vs2 && !vp2 ? vs2 : NULL;
+        d->val2_types[a]   = vs2 ? vs2->type : RAY_I64;
+        d->val2_hasnull[a] = vs2 ? vs2->may_null : false;
+        d->val2_esz[a]     = vs2 ? ray_col_src_esz(vs2) : 0;
+        d->val2_id[a]      = vp2 ? vp2 : (const void*)vs2;
+        d->staged |= d->val2_srcs[a] != NULL;
     }
+    ray_scan_fail_init(&d->fail);
+    d->rr = (agg_rr_t){ .srcs = d->key_srcs, .plain = d->key_data, .esz = d->key_esz,
+        .key_types = d->key_types, .key_attrs = d->key_attrs,
+        .n_src = ns, .n_keys = nk, .n_aggs = na, .fail = &d->fail, .staged = d->staged };
+    d->whole = agg_view_whole(&d->rr);
     return true;
+fail:
+    scratch_free(d->hdr); d->hdr = NULL;
+    return false;
+}
+
+/* One read-ahead hint per staged source over the rows a strategy reads. */
+static void agg_desc_advise(const agg_desc_t* d, int64_t nrows) {
+    for (uint32_t i = 0; d->staged && i < d->rr.n_src; i++)
+        if (d->rr.srcs[i]) ray_col_src_advise(d->rr.srcs[i], 0, nrows);
 }
 
 static void agg_desc_free(agg_desc_t* d) { scratch_free(d->hdr); d->hdr = NULL; }
@@ -1378,8 +2153,9 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
     vo->block = 0;
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* vc = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
-        int8_t in_type = vc ? vc->type : RAY_I64;
+        ray_col_meta_t vm;
+        bool vh = ext->agg_ops[a] != OP_COUNT && ie && agg_col_meta(g, tbl, ie->sym, &vm);
+        int8_t in_type = vh ? vm.type : RAY_I64;
         vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
         vo->off[a] = vo->block;
         vo->block += vo->vts[a]->state_size;
@@ -1430,32 +2206,37 @@ static void agg_sel_scratch_free(agg_sel_scratch_t* sc) {
 /* Accumulate one decoded chunk (rows[], gid[] indexed [0,n)) into `states` for
  * every aggregate, gathering each agg's input values for this chunk's ORIGINAL
  * rows into the reused scratch buffers first.  `states` points at agg 0's slot 0
- * (i.e. states_base + off applied per agg by the kernel via off[a]).  Returns 0,
- * or -1 on scratch OOM (sets sc->oom). */
-static int agg_sel_accum_chunk(const agg_valdesc_t* vd, agg_sel_scratch_t* sc,
+ * (i.e. states_base + off applied per agg by the kernel via off[a]).  The
+ * values come from view v (rows read at rows[i] - v->base: the whole columns,
+ * or a run of rows inside the staged sources' views).  Returns 0, or -1 on
+ * scratch OOM (sets sc->oom).  shared: the kernels' update_shared (atomic) in
+ * place of update_batch, for a slab several tasks update at once. */
+static int agg_sel_accum_chunk(const agg_valdesc_t* vd, const agg_view_t* v, agg_sel_scratch_t* sc,
                                char* states, const uint32_t* gid,
-                               const int64_t* rows, int64_t n) {
+                               const int64_t* rows, int64_t n, bool shared) {
     for (uint32_t a = 0; a < vd->n_aggs; a++) {
         const agg_vtable_t* vt = vd->vts[a];
         if (vt->update_batch2) {                            /* binary agg (pearson) */
             uint8_t ez = vd->val_esz[a], ez2 = vd->val2_esz[a];
             if (!sc->gv[a]) { sc->gv[a] = ray_alloc_raw((size_t)AGG_SEL_CHUNK * (ez ? ez : 1)); if (!sc->gv[a]) { sc->oom = 1; return -1; } }
             if (!sc->gy[a]) { sc->gy[a] = ray_alloc_raw((size_t)AGG_SEL_CHUNK * (ez2 ? ez2 : 1)); if (!sc->gy[a]) { sc->oom = 1; return -1; } }
-            agg_sel_gather_vals(sc->gv[a], vd->val_data[a],  ez,  rows, n);
-            agg_sel_gather_vals(sc->gy[a], vd->val2_data[a], ez2, rows, n);
+            agg_sel_gather_vals(sc->gv[a], v->val_data[a],  ez,  rows, n, v->base);
+            agg_sel_gather_vals(sc->gy[a], v->val2_data[a], ez2, rows, n, v->base);
             ray_valid_t vx = { sc->gv[a], vd->val_types[a],  vd->val_hasnull[a] };
             ray_valid_t vy = { sc->gy[a], vd->val2_types[a], vd->val2_hasnull[a] };
             vt->update_batch2(states + vd->off[a], vd->block, gid,
                               sc->gv[a], sc->gy[a], &vx, &vy, n, NULL);
-        } else if (vd->val_data[a]) {                       /* unary agg over a column */
+        } else if (v->val_data[a]) {                        /* unary agg over a column */
             uint8_t ez = vd->val_esz[a];
             if (!sc->gv[a]) { sc->gv[a] = ray_alloc_raw((size_t)AGG_SEL_CHUNK * (ez ? ez : 1)); if (!sc->gv[a]) { sc->oom = 1; return -1; } }
-            agg_sel_gather_vals(sc->gv[a], vd->val_data[a], ez, rows, n);
+            agg_sel_gather_vals(sc->gv[a], v->val_data[a], ez, rows, n, v->base);
             ray_valid_t valid = { sc->gv[a], vd->val_types[a], vd->val_hasnull[a] };
-            vt->update_batch(states + vd->off[a], vd->block, gid, sc->gv[a], &valid, n, NULL);
+            if (shared) vt->update_shared(states + vd->off[a], vd->block, gid, sc->gv[a], &valid, n);
+            else vt->update_batch(states + vd->off[a], vd->block, gid, sc->gv[a], &valid, n, NULL);
         } else {                                            /* COUNT (no value gather) */
             ray_valid_t valid = { NULL, vd->val_types[a], false };
-            vt->update_batch(states + vd->off[a], vd->block, gid, NULL, &valid, n, NULL);
+            if (shared) vt->update_shared(states + vd->off[a], vd->block, gid, NULL, &valid, n);
+            else vt->update_batch(states + vd->off[a], vd->block, gid, NULL, &valid, n, NULL);
         }
     }
     return 0;
@@ -1472,8 +2253,7 @@ static int agg_sel_accum_chunk(const agg_valdesc_t* vd, agg_sel_scratch_t* sc,
  * the same dense direct-index bound as agg_dense_plan and take v2's unbounded
  * hash/radix path; the fixed [16] mins/ranges/strides are only read at <=16. */
 typedef struct {
-    ray_t** key_cols;
-    const void** key_data;
+    const agg_rr_t* krr;     /* the keys: plain ones read in place, staged by R-SPARSE */
     const bool* nullable;
     const int64_t* nulls;
     uint32_t n_keys;
@@ -1481,45 +2261,582 @@ typedef struct {
     const int64_t* sel_prefix;
     int64_t n_sel;
     uint32_t tasks;
+    const int64_t* spans;   /* [tasks][2] selected-ordinal ranges; NULL: n_sel split evenly */
     int64_t* task_bounds;   /* [tasks][2][n_keys]: min row, max row per key */
 } agg_sel_bounds_ctx_t;
 
+/* The min/max of every key over rows[ib, ie) of a chunk. */
+typedef struct { const agg_sel_bounds_ctx_t* c; const int64_t* rows; int64_t* mins; int64_t* maxs; } agg_sel_bounds_run_t;
+/* One out-of-line copy, compiled as before, when it was also the staged
+ * walk's body (address taken): the plain pass keeps its instance (the
+ * staged pass reads key by key, agg_sel_bounds_staged).  noipa is
+ * GCC-only (clang rejects the attribute). */
+#if defined(__GNUC__) && !defined(__clang__)
+#define AGG_ONE_COPY __attribute__((noipa))
+#else
+#define AGG_ONE_COPY __attribute__((noinline))
+#endif
+AGG_ONE_COPY static void agg_sel_bounds_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t ib, int64_t ie) {
+    (void)wid;
+    agg_sel_bounds_run_t* t = raw;
+    const agg_sel_bounds_ctx_t* c = t->c;
+    const int64_t* rows = t->rows;
+    const int64_t base = v->base;
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        int64_t mn = t->mins[k], mx = t->maxs[k];
+        const bool nullable = c->nullable[k];
+        const int64_t null = c->nulls[k];
+        const void* kd = v->key_data[k];
+        /* the key's width switched once per run, not per row */
+#define SEL_BOUNDS_LOOP(LD) for (int64_t i = ib; i < ie; i++) {               \
+            int64_t val = (LD);                                                 \
+            if (nullable && val == null) continue;                              \
+            if (val < mn) mn = val;                                             \
+            if (val > mx) mx = val;                                             \
+        }
+        switch (c->krr->key_types[k]) {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: SEL_BOUNDS_LOOP(((const int32_t*)kd)[rows[i] - base]); break;
+        case RAY_I16:                            SEL_BOUNDS_LOOP(((const int16_t*)kd)[rows[i] - base]); break;
+        case RAY_U8: case RAY_BOOL:              SEL_BOUNDS_LOOP(((const uint8_t*)kd)[rows[i] - base]); break;
+        default:                                 SEL_BOUNDS_LOOP(agg_vkey(v, c->krr->key_types, k, rows[i])); break;
+        }
+#undef SEL_BOUNDS_LOOP
+        t->mins[k] = mn; t->maxs[k] = mx;
+    }
+}
+
+/* The min/max of key k over rows[ib, ie), element 0 of data being row
+ * `base` (the SEL_BOUNDS_LOOP fold of agg_sel_bounds_rows, for one key). */
+static void agg_sel_bounds_fold(const agg_sel_bounds_ctx_t* c, uint32_t k, uint8_t attrs, const void* kd,
+                                int64_t base, const int64_t* rows, int64_t ib, int64_t ie,
+                                int64_t* mnp, int64_t* mxp) {
+    int64_t mn = *mnp, mx = *mxp;
+    const bool nullable = c->nullable[k];
+    const int64_t null = c->nulls[k];
+#define SEL_BOUNDS_LOOP(LD) for (int64_t i = ib; i < ie; i++) {               \
+            int64_t val = (LD);                                                 \
+            if (nullable && val == null) continue;                              \
+            if (val < mn) mn = val;                                             \
+            if (val > mx) mx = val;                                             \
+        }
+    switch (c->krr->key_types[k]) {
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:        SEL_BOUNDS_LOOP(((const int64_t*)kd)[rows[i] - base]); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: SEL_BOUNDS_LOOP(((const int32_t*)kd)[rows[i] - base]); break;
+    case RAY_I16:                            SEL_BOUNDS_LOOP(((const int16_t*)kd)[rows[i] - base]); break;
+    case RAY_U8: case RAY_BOOL:              SEL_BOUNDS_LOOP(((const uint8_t*)kd)[rows[i] - base]); break;
+    default: SEL_BOUNDS_LOOP(agg_read_key_i64_raw(c->krr->key_types[k], attrs, kd, rows[i] - base)); break;
+    }
+#undef SEL_BOUNDS_LOOP
+    *mnp = mn; *mxp = mx;
+}
+
+/* Run r's logical value of a CONST / RLE view (ray_enc_runs' value),
+ * inlined for the merges below, which walk a view's runs against sorted
+ * rows directly (one compare per run that holds none of them). */
+static inline int64_t agg_run_value(const ray_enc_vview_t* v, uint32_t r) {
+    const ray_enc_kind_t k = v->k;
+    uint64_t b;
+    switch (k.T) {
+    case 8:  b = v->run_vals.b[r]; break;
+    case 16: b = v->run_vals.h[r]; break;
+    case 32: b = v->run_vals.s[r]; break;
+    default: return (int64_t)v->run_vals.q[r];
+    }
+    const uint64_t m = (1ull << k.T) - 1;
+    return k.is_signed && (b >> (k.T - 1)) & 1 ? (int64_t)(b | ~m) : (int64_t)b;
+}
+/* The first run of v ending after local row x. */
+static inline uint32_t agg_run_at(const ray_enc_vview_t* v, int64_t x) {
+    uint32_t l = 0, h = v->n_runs;
+    while (l < h) { uint32_t mid = l + (h - l) / 2; if ((int64_t)v->run_ends.h[mid] <= x) l = mid + 1; else h = mid; }
+    return l;
+}
+
+/* The bounds over a run view: the runs holding some of the ascending rows
+ * rows[i, j) (inside the view's vector, row 0 at vlo) fold their value, a
+ * null skipped as the per-row fold skips it. */
+static void agg_sel_bounds_runs(const ray_enc_vview_t* v, const int64_t* rows, int64_t i, int64_t j, int64_t vlo,
+                                bool nullable, int64_t null, int64_t* mnp, int64_t* mxp) {
+    int64_t mn = *mnp, mx = *mxp;
+    for (uint32_t r = agg_run_at(v, rows[i] - vlo); r < v->n_runs && i < j; r++) {
+        const int64_t e = vlo + v->run_ends.h[r];
+        if (rows[i] >= e) continue;                     /* none of the rows in this run */
+        const int64_t x = agg_run_value(v, r);
+        if (!(nullable && x == null)) { if (x < mn) mn = x; if (x > mx) mx = x; }
+        int64_t h = j;                                  /* past the run's rows */
+        while (i < h) { int64_t mid = i + (h - i) / 2; if (rows[mid] < e) i = mid + 1; else h = mid; }
+    }
+    *mnp = mn; *mxp = mx;
+}
+
+/* agg_sel_bounds_rows of a staged context over the ascending rows[0, cn),
+ * key by key: a plain key in place; a staged key's CONST / RLE vector
+ * (ray_col_src_runview) on its runs (P3 Task 3b: no vector decoded); a
+ * vector holding at most RAY_COL_POINT_ROWS of the rows point-read (open
+ * decision D2: no vector decoded), any other vector, or one whose read
+ * declines, through the key's cursor view.  A point-served value is never
+ * null and lies inside its vector's statistics, so nests inside its
+ * chunk's (the guard's rule); a run view under the guard checks its run
+ * values against the chunk's statistics.  NULL or an owned error. */
+static __attribute__((noinline)) ray_t* agg_sel_bounds_staged(agg_sel_bounds_run_t* t, agg_curs_t* cs, int64_t cn) {
+    const agg_sel_bounds_ctx_t* c = t->c;
+    const agg_rr_t* krr = c->krr;
+    const int64_t* rows = t->rows;
+    ray_enc_vview_t view;                               /* a key vector's runs: on the task's stack */
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        ray_col_src_t* src = krr->srcs[k];
+        if (!src) {
+            agg_sel_bounds_fold(c, k, krr->key_attrs[k], krr->plain[k], 0, rows, 0, cn, &t->mins[k], &t->maxs[k]);
+            continue;
+        }
+        const bool point = krr->key_types[k] != RAY_SYM && ray_col_src_encoded(src);
+        const bool runs = ray_col_src_encoded(src) && krr->key_types[k] != RAY_F32 && krr->key_types[k] != RAY_F64;
+        for (int64_t i = 0; i < cn; ) {
+            int64_t vlo, vhi;
+            if (runs) {
+                /* a CONST / RLE vector: the runs holding the rows fold their
+                 * values, nothing decoded */
+                ray_t* err = NULL;
+                int vr = ray_col_src_runview(src, rows[i], &view, &vlo, &vhi, &err);
+                if (vr < 0) return err;
+                if (vr > 0) {
+                    int64_t j = i + 1;
+                    while (j < cn && rows[j] < vhi) j++;
+                    agg_sel_bounds_runs(&view, rows, i, j, vlo, c->nullable[k], c->nulls[k], &t->mins[k], &t->maxs[k]);
+                    i = j;
+                    continue;
+                }
+            }
+            if (point && ray_col_src_vec_span(src, rows[i], &vlo, &vhi)) {
+                int64_t j = i + 1;
+                while (j < cn && j - i <= RAY_COL_POINT_ROWS && rows[j] < vhi) j++;
+                if (j - i <= RAY_COL_POINT_ROWS) {
+                    int64_t x[RAY_COL_POINT_ROWS];
+                    ray_t* err = NULL;
+                    int pr = ray_col_src_points_i64(src, rows + i, j - i, x, &err);
+                    if (pr < 0) return err;
+                    if (pr > 0) {                    /* else declined: the cursor reads the vector */
+                        for (int64_t q = 0; q < j - i; q++) {
+                            if (x[q] < t->mins[k]) t->mins[k] = x[q];
+                            if (x[q] > t->maxs[k]) t->maxs[k] = x[q];
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            const ray_col_range_t* v;
+            ray_t* err = ray_col_cursor_at(&cs->cur[k], rows[i], &v);
+            if (err) return err;
+            int64_t end = v->start + v->n, j = i + 1;
+            while (j < cn && rows[j] < end) j++;
+            agg_sel_bounds_fold(c, k, v->attrs, v->data, v->start, rows, i, j, &t->mins[k], &t->maxs[k]);
+            i = j;
+        }
+    }
+    return NULL;
+}
+
 /* One task's min/max over its slice of selected-row space. */
 static void agg_sel_bounds_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
     agg_sel_bounds_ctx_t* c = raw;
+    const agg_rr_t* krr = c->krr;
     int64_t rows[AGG_SEL_CHUNK];
+    agg_view_t whole = agg_view_whole(krr);
     for (int64_t task = start; task < end; task++) {
         int64_t* mins = c->task_bounds + (2 * (size_t)task) * c->n_keys;
         int64_t* maxs = mins + c->n_keys;
         for (uint32_t k = 0; k < c->n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
-        int64_t begin = c->n_sel / c->tasks * task;
-        int64_t limit = task + 1 == c->tasks ? c->n_sel : c->n_sel / c->tasks * (task + 1);
+        int64_t begin = c->spans ? c->spans[2 * task] : c->n_sel / c->tasks * task;
+        int64_t limit = c->spans ? c->spans[2 * task + 1]
+                      : task + 1 == c->tasks ? c->n_sel : c->n_sel / c->tasks * (task + 1);
         agg_sel_cursor_t cur;
         agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, begin, limit);
+        agg_sel_bounds_run_t t = { c, rows, mins, maxs };
+        agg_curs_t cs; cs.cur = NULL;
+        if (krr->staged) {
+            if (ray_scan_fail_skip(krr->fail, begin)) continue;
+            if (!agg_curs_init(&cs, krr)) { ray_scan_fail_note(krr->fail, begin, ray_error("oom", NULL)); continue; }
+        }
         int64_t cn;
         while ((cn = agg_sel_cursor_next(&cur, rows)) > 0) {
-            for (uint32_t k = 0; k < c->n_keys; k++) {
-                ray_t* kc = c->key_cols[k]; const void* d = c->key_data[k];
-                int64_t mn = mins[k], mx = maxs[k];
-                for (int64_t i = 0; i < cn; i++) {
-                    int64_t v = agg_read_key_i64(kc, d, rows[i]);
-                    if (c->nullable[k] && v == c->nulls[k]) continue;
-                    if (v < mn) mn = v;
-                    if (v > mx) mx = v;
-                }
-                mins[k] = mn; maxs[k] = mx;
-            }
+            if (!krr->staged) { agg_sel_bounds_rows(&t, &whole, wid, 0, cn); continue; }
+            ray_t* err = agg_sel_bounds_staged(&t, &cs, cn);
+            if (err) { ray_scan_fail_note(krr->fail, begin, err); break; }
         }
+        agg_curs_free(&cs, krr);
     }
 }
 
-static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
+/* The chunks of state 2 scanned by their selected rows (one task each),
+ * folded into mins / maxs and marked 3.  False on a range error or cancel. */
+static bool agg_sel_bounds_round(const agg_sel_bounds_ctx_t* bc, uint8_t* state, int64_t nch, int64_t spc,
+                                 int64_t* spans, int64_t* tb, int64_t* mins, int64_t* maxs) {
+    const uint32_t nsegs = ray_rowsel_meta(bc->sel)->n_segs;
+    int64_t n = 0, rows = 0;
+    for (int64_t ch = 0; ch < nch; ch++) {
+        if (state[ch] != 2) continue;
+        int64_t se = (ch + 1) * spc < (int64_t)nsegs ? (ch + 1) * spc : (int64_t)nsegs;
+        spans[2 * n] = bc->sel_prefix[ch * spc];
+        spans[2 * n + 1] = bc->sel_prefix[se];
+        rows += spans[2 * n + 1] - spans[2 * n];
+        state[ch] = 3;
+        n++;
+        for (uint32_t k = 0; k < bc->n_keys; k++)       /* clipped to the source's rows */
+            ray_col_src_advise(bc->krr->srcs[k], ch * RAY_ENC_CHUNK, (ch + 1) * RAY_ENC_CHUNK);
+    }
+    if (n == 0) return true;
+    agg_sel_bounds_ctx_t c = *bc;
+    c.tasks = (uint32_t)n; c.spans = spans; c.task_bounds = tb;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && n > 1 && rows >= RAY_PARALLEL_THRESHOLD;
+    ray_scan_fail_init(bc->krr->fail);
+    if (par) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &c, (uint32_t)n);
+    else agg_sel_bounds_fn(&c, 0, 0, n);
+    ray_t* err = ray_scan_fail_finish(bc->krr->fail, par ? pool : NULL);
+    if (err) { ray_error_free(err); return false; }
+    for (int64_t t = 0; t < n; t++)
+        for (uint32_t k = 0; k < bc->n_keys; k++) {
+            int64_t mn = tb[(2 * (size_t)t) * bc->n_keys + k], mx = tb[(2 * (size_t)t + 1) * bc->n_keys + k];
+            if (mn < mins[k]) mins[k] = mn;
+            if (mx > maxs[k]) maxs[k] = mx;
+        }
+    return true;
+}
+
+/* The selected rows' key bounds of staged keys, exactly the full scan's
+ * (so the plan, its route and its emit order are generation 0's), reading
+ * only the chunks that can move them.  A chunk's directory min / max bound
+ * its rows, so a chunk with no nulls whose statistics lie inside the bounds
+ * found so far cannot change them: round 1 scans the selected rows of each
+ * key's chunks holding the lowest minimum and the highest maximum and of
+ * every chunk without statistics or with nulls; round 2 the chunks whose
+ * statistics still reach outside.  Bounds only widen as chunks are read, so
+ * no chunk skipped after round 2 could move them.  False (the caller scans
+ * every selected row) unless every key is a single-file staged non-SYM
+ * source with a directory; also on a scan error or cancel, so that the full
+ * scan reports the lowest failure. */
+static bool agg_sel_bounds_dir(const agg_sel_bounds_ctx_t* bc, int64_t* mins, int64_t* maxs) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys;
+    const ray_rowsel_t* m = ray_rowsel_meta(bc->sel);
+    const int64_t nrows = m->nrows, nch = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    const int64_t spc = RAY_ENC_CHUNK / RAY_MORSEL_ELEMS;      /* selection segments per chunk */
+    ray_enc_chunk_stat_t st;
+    if (nch < 1) return false;
+    for (uint32_t k = 0; k < nk; k++)
+        if (!krr->srcs[k] || krr->key_types[k] == RAY_SYM || krr->srcs[k]->len != nrows ||
+            !ray_col_src_chunk_stat(krr->srcs[k], 0, &st))
+            return false;
+    ray_t* hdr;
+    int64_t* spans = (int64_t*)scratch_alloc(&hdr, (size_t)nch * (2 + 2 * nk) * sizeof(int64_t) + (size_t)nch);
+    if (!spans) return false;
+    int64_t* tb = spans + 2 * nch;
+    uint8_t* state = (uint8_t*)(tb + 2 * (size_t)nch * nk);   /* 0 no selected row, 1 skippable, 2 to scan, 3 scanned */
+    int64_t lo_ch[16], hi_ch[16], lo_v[16], hi_v[16];
+    for (uint32_t k = 0; k < nk; k++) { lo_ch[k] = hi_ch[k] = -1; lo_v[k] = INT64_MAX; hi_v[k] = INT64_MIN; }
+    for (int64_t ch = 0; ch < nch; ch++) {
+        int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
+        state[ch] = bc->sel_prefix[se] > bc->sel_prefix[ch * spc];
+        for (uint32_t k = 0; k < nk && state[ch]; k++) {
+            (void)ray_col_src_chunk_stat(krr->srcs[k], ch, &st);
+            /* Conservative: a chunk with nulls is always scanned.  Its
+             * statistics bound only its non-null rows, which is all the
+             * scan folds when the plan holds the key nullable (the usual
+             * case: the column's null count makes it so); scanning keeps
+             * the bounds exact without relying on that, and such chunks
+             * are few. */
+            if (!st.has_minmax || st.null_count) { state[ch] = 2; continue; }
+            if (st.min < lo_v[k]) { lo_v[k] = st.min; lo_ch[k] = ch; }
+            if (st.max > hi_v[k]) { hi_v[k] = st.max; hi_ch[k] = ch; }
+        }
+    }
+    for (uint32_t k = 0; k < nk; k++) {
+        if (lo_ch[k] >= 0) state[lo_ch[k]] = 2;
+        if (hi_ch[k] >= 0) state[hi_ch[k]] = 2;
+        mins[k] = INT64_MAX; maxs[k] = INT64_MIN;
+    }
+    bool ok = agg_sel_bounds_round(bc, state, nch, spc, spans, tb, mins, maxs);
+    for (int64_t ch = 0; ok && ch < nch; ch++) {
+        if (state[ch] != 1) continue;
+        for (uint32_t k = 0; k < nk; k++) {
+            (void)ray_col_src_chunk_stat(krr->srcs[k], ch, &st);
+            if (st.min < mins[k] || st.max > maxs[k]) { state[ch] = 2; break; }
+        }
+    }
+    if (ok) ok = agg_sel_bounds_round(bc, state, nch, spc, spans, tb, mins, maxs);
+    scratch_free(hdr);
+    return ok;
+}
+
+/* Every selected row's key bounds, scanned (bc->tasks tasks over the
+ * selection).  False on OOM (no *err) or a range error (*err owned, the
+ * lowest failure). */
+static bool agg_sel_bounds_scan(agg_sel_bounds_ctx_t* bc, int64_t* mins, int64_t* maxs, ray_t** err) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys, tasks = bc->tasks;
+    for (uint32_t k = 0; k < nk; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
+    ray_t* tb_hdr;
+    bc->task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * nk * sizeof(int64_t));
+    if (!bc->task_bounds) return false;
+    if (krr->staged) {
+        ray_scan_fail_init(krr->fail);
+        for (uint32_t k = 0; k < nk; k++)
+            if (krr->srcs[k]) ray_col_src_advise(krr->srcs[k], 0, ray_rowsel_meta(bc->sel)->nrows);
+    }
+    ray_pool_t* pool = ray_pool_get();
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, bc, tasks);
+    else agg_sel_bounds_fn(bc, 0, 0, 1);
+    if (krr->staged && (*err = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) {
+        scratch_free(tb_hdr);
+        bc->task_bounds = NULL;
+        return false;
+    }
+    for (uint32_t t = 0; t < tasks; t++)
+        for (uint32_t k = 0; k < nk; k++) {
+            int64_t mn = bc->task_bounds[(2 * (size_t)t) * nk + k];
+            int64_t mx = bc->task_bounds[(2 * (size_t)t + 1) * nk + k];
+            if (mn < mins[k]) mins[k] = mn;
+            if (mx > maxs[k]) maxs[k] = mx;
+        }
+    scratch_free(tb_hdr);
+    bc->task_bounds = NULL;
+    return true;
+}
+
+/* A subset of a bounds context's keys as a context of its own: the same
+ * selection, the keys' sources (pointers, never copies) and plain
+ * pointers, no aggregate input. */
+typedef struct {
+    agg_rr_t       rr;
+    ray_col_src_t* srcs[16];
+    const void*    plain[16];
+    uint8_t        esz[16], attrs[16];
+    int8_t         types[16];
+    bool           nullable[16];
+    int64_t        nulls[16];
+} agg_sel_keys_t;
+static void agg_sel_keys(const agg_sel_bounds_ctx_t* bc, const uint32_t* ks, uint32_t n,
+                         agg_sel_keys_t* o, agg_sel_bounds_ctx_t* sub) {
+    const agg_rr_t* krr = bc->krr;
+    bool staged = false;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t k = ks[i];
+        o->srcs[i] = krr->srcs[k];
+        o->plain[i] = krr->plain[k];
+        o->esz[i] = krr->esz[k];
+        o->attrs[i] = krr->key_attrs[k];
+        o->types[i] = krr->key_types[k];
+        o->nullable[i] = bc->nullable[k];
+        o->nulls[i] = bc->nulls[k];
+        staged |= o->srcs[i] != NULL;
+    }
+    o->rr = (agg_rr_t){ .srcs = o->srcs, .plain = o->plain, .esz = o->esz, .key_types = o->types,
+                        .key_attrs = o->attrs, .n_src = n, .n_keys = n, .n_aggs = 0,
+                        .fail = krr->fail, .staged = staged };
+    *sub = *bc;
+    sub->krr = &o->rr; sub->nullable = o->nullable; sub->nulls = o->nulls; sub->n_keys = n;
+    sub->spans = NULL; sub->task_bounds = NULL;
+}
+
+/* The selected rows' exact key bounds of a staged context whose keys are
+ * read two ways, without scanning what cannot change the plan.  The keys
+ * agg_sel_bounds_dir cannot prune (plain, SYM, parted, without a
+ * directory) are scanned first.  When their ranges alone exceed the dense
+ * limit (or one has no range), the plan is impossible whatever the other
+ * keys hold (every range is at least 1): 2, nothing more read.  Otherwise
+ * the single-file generation-2 non-SYM keys take the directory path, as a
+ * key set of their own: 1, mins / maxs exact for every key, so the plan,
+ * its route and its emit order are the full scan's.  0: not such a key
+ * set (every key one way), or a scan error or cancel (the caller's full
+ * scan then reports the lowest failure). */
+static int agg_sel_bounds_split(const agg_sel_bounds_ctx_t* bc, int64_t* mins, int64_t* maxs) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys;
+    const int64_t nrows = ray_rowsel_meta(bc->sel)->nrows;
+    uint32_t dk[16], ok[16], nd = 0, no = 0;
+    ray_enc_chunk_stat_t st;
+    for (uint32_t k = 0; k < nk; k++) {
+        if (krr->srcs[k] && krr->key_types[k] != RAY_SYM && krr->srcs[k]->len == nrows &&
+            ray_col_src_chunk_stat(krr->srcs[k], 0, &st)) dk[nd++] = k;
+        else ok[no++] = k;
+    }
+    if (nd == 0 || no == 0) return 0;
+    agg_sel_keys_t ko, kd;
+    agg_sel_bounds_ctx_t co, cd;
+    int64_t mn[16], mx[16];
+    agg_sel_keys(bc, ok, no, &ko, &co);
+    ray_t* err = NULL;
+    if (!agg_sel_bounds_scan(&co, mn, mx, &err)) { if (err) ray_error_free(err); return 0; }
+    const int64_t limit = bc->n_sel < (int64_t)UINT32_MAX ? bc->n_sel : (int64_t)UINT32_MAX;
+    int64_t total = 1;
+    for (uint32_t i = 0; i < no; i++) {                 /* agg_dense_range's ranges */
+        int64_t rng;
+        if (mx[i] < mn[i]) {
+            if (!co.nullable[i]) return 2;
+            rng = 1;
+        } else {
+            uint64_t span = (uint64_t)mx[i] - (uint64_t)mn[i];
+            if (span >= (uint64_t)INT64_MAX - (uint64_t)co.nullable[i]) return 2;
+            rng = (int64_t)span + 1 + co.nullable[i];
+        }
+        if (total > limit / rng) return 2;
+        total *= rng;
+    }
+    for (uint32_t i = 0; i < no; i++) { mins[ok[i]] = mn[i]; maxs[ok[i]] = mx[i]; }
+    agg_sel_keys(bc, dk, nd, &kd, &cd);
+    if (!agg_sel_bounds_dir(&cd, mn, mx)) return 0;
+    for (uint32_t i = 0; i < nd; i++) { mins[dk[i]] = mn[i]; maxs[dk[i]] = mx[i]; }
+    return 1;
+}
+
+/* A probe that can only prove the dense plan impossible, for staged keys:
+ * the key values of AGG_SEL_PROBE_ROWS evenly spaced selected rows (in
+ * place or by point reads; a declined read skips its row, so nothing is
+ * decoded) bound the selected rows' exact ranges from
+ * below, so when their ranges already exceed the dense limit (as
+ * agg_sel_bounds_split judges them, nullability included) the exact
+ * bounds do too, and the scan of every selected row is skipped: the
+ * plan, the route and the emit order stay those of the exact bounds.
+ * True: impossible.  False: undecided (a read error or OOM included; the
+ * exact scan reports it). */
+#define AGG_SEL_PROBE_ROWS (RAY_MORSEL_ELEMS / 16)
+/* True when the key ranges mn / mx (a subset of the selected rows' values)
+ * already exceed the dense limit, as agg_sel_bounds_split judges them
+ * (agg_dense_range's ranges, nullability included). */
+static bool agg_sel_ranges_exceed(const agg_sel_bounds_ctx_t* bc, const int64_t* mn, const int64_t* mx) {
+    const int64_t limit = bc->n_sel < (int64_t)UINT32_MAX ? bc->n_sel : (int64_t)UINT32_MAX;
+    int64_t total = 1;
+    for (uint32_t k = 0; k < bc->n_keys; k++) {
+        if (mx[k] < mn[k]) continue;                   /* no value seen: at least 1 */
+        uint64_t span = (uint64_t)mx[k] - (uint64_t)mn[k];
+        if (span >= (uint64_t)INT64_MAX - (uint64_t)bc->nullable[k]) return true;
+        int64_t rng = (int64_t)span + 1 + bc->nullable[k];
+        if (total > limit / rng) return true;
+        total *= rng;
+    }
+    return false;
+}
+static _Atomic(uint64_t) g_sel_probe_hits;   /* test hook: plans the probe proved impossible */
+uint64_t ray_agg_test_sel_probe_hits(void) { return atomic_load_explicit(&g_sel_probe_hits, memory_order_relaxed); }
+static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
+    const agg_rr_t* krr = bc->krr;
+    const uint32_t nk = bc->n_keys;
+    if (nk < 1 || nk > 16 || bc->n_sel < 2) return false;
+    int64_t mn[16], mx[16];
+    for (uint32_t k = 0; k < nk; k++) { mn[k] = INT64_MAX; mx[k] = INT64_MIN; }
+    const int64_t np = bc->n_sel < AGG_SEL_PROBE_ROWS ? bc->n_sel : AGG_SEL_PROBE_ROWS;
+    bool ok = true;
+    for (int64_t i = 0; i < np && ok; i++) {
+        int64_t o = bc->n_sel / np * i, row;
+        agg_sel_cursor_t cur;
+        agg_sel_cursor_init(&cur, bc->sel, bc->sel_prefix, o, o + 1);
+        if (agg_sel_cursor_next(&cur, &row) != 1) { ok = false; break; }
+        for (uint32_t k = 0; k < nk; k++) {
+            /* in place, or a point read; a declined one skips the row for
+             * this key (fewer rows only weaken the bound: nothing decodes) */
+            int64_t x;
+            if (!krr->srcs[k]) x = agg_read_key_i64_raw(krr->key_types[k], krr->key_attrs[k], krr->plain[k], row);
+            else {
+                ray_t* err = NULL;
+                int pr = krr->srcs[k]->type == RAY_SYM ? agg_src_points(krr->srcs[k], &row, 1, &x, &err)
+                                                       : ray_col_src_point_i64(krr->srcs[k], row, &x, &err);
+                if (pr < 0) { ray_error_free(err); ok = false; break; }
+                if (pr == 0) continue;
+            }
+            if (bc->nullable[k] && x == bc->nulls[k]) continue;
+            if (x < mn[k]) mn[k] = x;
+            if (x > mx[k]) mx[k] = x;
+        }
+    }
+    if (!ok) return false;
+    if (agg_sel_ranges_exceed(bc, mn, mx)) return true;
+    /* Undecided: the selected rows of the chunks holding each SYM key's
+     * lowest minimum and highest maximum in the directory (its membership
+     * bounds; a SYM key has no directory route to its exact bounds) are
+     * scanned too.  The statistics only choose the chunks; the bound is
+     * still the values read, so it stays a subset of the exact scan's
+     * whatever they say.  A key whose extremes are a few rare values (SYM
+     * ids interned early) is proved here, where evenly spaced rows miss
+     * them. */
+    const ray_rowsel_t* m = ray_rowsel_meta(bc->sel);
+    const int64_t nrows = m->nrows, nch = (nrows + RAY_ENC_CHUNK - 1) / RAY_ENC_CHUNK;
+    const int64_t spc = RAY_ENC_CHUNK / RAY_MORSEL_ELEMS;      /* selection segments per chunk */
+    if (nch < 2) return false;                                 /* one chunk: the exact scan */
+    /* the SYM keys with a directory (the others' exact bounds take the
+     * directory, agg_sel_bounds_dir / _split, which reads these chunks
+     * anyway); none (every generation-0 key): nothing allocated */
+    uint32_t sk[16], nsk = 0;
+    ray_enc_chunk_stat_t st;
+    for (uint32_t k = 0; k < nk; k++)
+        if (krr->srcs[k] && krr->key_types[k] == RAY_SYM && krr->srcs[k]->len == nrows &&
+            ray_col_src_chunk_stat(krr->srcs[k], 0, &st)) sk[nsk++] = k;
+    if (nsk == 0) return false;
+    ray_t* hdr;
+    int64_t* spans = (int64_t*)scratch_alloc(&hdr, (size_t)nch * (2 + 2 * nk) * sizeof(int64_t) + (size_t)nch);
+    if (!spans) return false;
+    int64_t* tb = spans + 2 * nch;
+    uint8_t* state = (uint8_t*)(tb + 2 * (size_t)nch * nk);
+    memset(state, 0, (size_t)nch);
+    int64_t probe_rows = 0;                                    /* selected rows of the marked chunks */
+    uint32_t nread = 0;
+    for (uint32_t i = 0; i < nsk; i++) {
+        const uint32_t k = sk[i];
+        int64_t lo_ch = -1, hi_ch = -1, lo_v = INT64_MAX, hi_v = INT64_MIN;
+        for (int64_t ch = 0; ch < nch; ch++) {
+            int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
+            if (bc->sel_prefix[se] == bc->sel_prefix[ch * spc]) continue;     /* no selected row */
+            if (!ray_col_src_chunk_stat(krr->srcs[k], ch, &st) || !st.has_minmax) continue;
+            if (st.min < lo_v) { lo_v = st.min; lo_ch = ch; }
+            if (st.max > hi_v) { hi_v = st.max; hi_ch = ch; }
+        }
+        if (lo_ch < 0) continue;
+        sk[nread++] = k;
+        const int64_t mk[2] = { lo_ch, hi_ch };
+        for (int e = 0; e < 2; e++) {
+            const int64_t ch = mk[e];
+            if (state[ch] == 2) continue;
+            state[ch] = 2;
+            int64_t se = (ch + 1) * spc < (int64_t)m->n_segs ? (ch + 1) * spc : (int64_t)m->n_segs;
+            probe_rows += bc->sel_prefix[se] - bc->sel_prefix[ch * spc];
+        }
+    }
+    /* The probe reads the marked chunks' selected rows; undecided, the
+     * exact scan then reads every selected row again, so a miss costs
+     * probe_rows / n_sel more.  At most a quarter of the selected rows
+     * keeps a miss under a quarter of the exact scan, while a hit saves
+     * the other three quarters and more (q13: 2 of 153 chunks).  Those
+     * keys alone are read (a key set of their own, agg_sel_keys). */
+    bool proved = false;
+    if (nread > 0 && probe_rows * 4 <= bc->n_sel) {
+        agg_sel_keys_t ko;
+        agg_sel_bounds_ctx_t co;
+        agg_sel_keys(bc, sk, nread, &ko, &co);
+        int64_t cm[16], cx[16];
+        for (uint32_t i = 0; i < nread; i++) { cm[i] = INT64_MAX; cx[i] = INT64_MIN; }
+        if (agg_sel_bounds_round(&co, state, nch, spc, spans, tb, cm, cx)) {
+            int64_t am[16], ax[16];
+            for (uint32_t k = 0; k < nk; k++) { am[k] = mn[k]; ax[k] = mx[k]; }
+            for (uint32_t i = 0; i < nread; i++) {
+                if (cm[i] < am[sk[i]]) am[sk[i]] = cm[i];
+                if (cx[i] > ax[sk[i]]) ax[sk[i]] = cx[i];
+            }
+            proved = agg_sel_ranges_exceed(bc, am, ax);
+        }
+    }
+    scratch_free(hdr);
+    return proved;
+}
+
+static bool agg_dense_plan_sel(ray_t** key_cols, const agg_rr_t* krr, uint32_t n_keys, int64_t n_sel,
                                ray_t* sel, const int64_t* sel_prefix,
-                               dense_plan_t* out) {
+                               dense_plan_t* out, ray_t** err) {
+    *err = NULL;
     out->ok = false;
     out->n_keys = n_keys;
     out->compacted = false;
+    out->wide = false;
     memset(out->remap, 0, sizeof(out->remap));
     memset(out->inverse, 0, sizeof(out->inverse));
     if (n_keys < 1 || n_keys > 16) return false;
@@ -1542,34 +2859,34 @@ static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
      * The pass is split across the pool: a serial walk of a 10M-row selection
      * cost ~13 ms on every filtered group-by regardless of core count. */
     ray_t* pre_hdr;
-    void* pre = scratch_alloc(&pre_hdr, 3u * (size_t)n_keys * 8);   /* mins,maxs,key_data */
+    void* pre = scratch_alloc(&pre_hdr, 2u * (size_t)n_keys * 8);   /* mins,maxs */
     if (!pre) return false;
     int64_t* mins = (int64_t*)pre;
     int64_t* maxs = mins + n_keys;
-    const void** key_data = (const void**)(maxs + n_keys);
     for (uint32_t k = 0; k < n_keys; k++) { mins[k] = INT64_MAX; maxs[k] = INT64_MIN; }
-    for (uint32_t k = 0; k < n_keys; k++) key_data[k] = ray_data(key_cols[k]);
 
     ray_pool_t* pool = ray_pool_get();
     uint32_t tasks = pool && n_sel >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) * 4 : 1;
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     if ((int64_t)tasks > n_sel) tasks = (uint32_t)n_sel;
-    agg_sel_bounds_ctx_t bc = { .key_cols = key_cols, .key_data = key_data,
+    agg_sel_bounds_ctx_t bc = { .krr = krr,
         .nullable = out->nullable, .nulls = out->nulls, .n_keys = n_keys,
         .sel = sel, .sel_prefix = sel_prefix, .n_sel = n_sel, .tasks = tasks };
-    ray_t* tb_hdr;
-    bc.task_bounds = (int64_t*)scratch_alloc(&tb_hdr, 2u * (size_t)tasks * n_keys * sizeof(int64_t));
-    if (!bc.task_bounds) { scratch_free(pre_hdr); return false; }
-    if (tasks > 1) ray_pool_dispatch_n(pool, agg_sel_bounds_fn, &bc, tasks);
-    else agg_sel_bounds_fn(&bc, 0, 0, 1);
-    for (uint32_t t = 0; t < tasks; t++)
-        for (uint32_t k = 0; k < n_keys; k++) {
-            int64_t mn = bc.task_bounds[(2 * (size_t)t) * n_keys + k];
-            int64_t mx = bc.task_bounds[(2 * (size_t)t + 1) * n_keys + k];
-            if (mn < mins[k]) mins[k] = mn;
-            if (mx > maxs[k]) maxs[k] = mx;
-        }
-    scratch_free(tb_hdr);
+    /* staged: the directory prunes what it can (every key, or the keys it
+     * serves after the others, agg_sel_bounds_split); else every selected
+     * row is scanned */
+    if (krr->staged && agg_sel_bounds_impossible(&bc)) {
+        atomic_fetch_add_explicit(&g_sel_probe_hits, 1, memory_order_relaxed);
+        scratch_free(pre_hdr);
+        return false;
+    }
+    int split = krr->staged ? agg_sel_bounds_split(&bc, mins, maxs) : 0;
+    if (split == 2) { scratch_free(pre_hdr); return false; }     /* dense is impossible */
+    if (split == 0 && (!krr->staged || !agg_sel_bounds_dir(&bc, mins, maxs)) &&
+        !agg_sel_bounds_scan(&bc, mins, maxs, err)) {
+        scratch_free(pre_hdr);
+        return false;
+    }
     for (uint32_t k = 0; k < n_keys; k++) {
         if (!agg_dense_range(out, k, mins[k], maxs[k])) { scratch_free(pre_hdr); return false; }
     }
@@ -1612,6 +2929,17 @@ static inline uint64_t agg_tuple_hash(ray_t** key_cols, const void** key_data,
      * probing degrades to O(n²).  Finalize so every output bit depends on every
      * input bit; correctness is unaffected (the eq-check resolves collisions),
      * only the slot distribution. */
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
+
+/* agg_tuple_hash of a group's stored key words (the same FNV-1a + fmix64):
+ * a staged small hash keys its groups by words, never by first rows. */
+static inline uint64_t agg_words_hash(const int64_t* w, uint32_t n_keys) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t k = 0; k < n_keys; k++) { h ^= (uint64_t)w[k]; h *= 1099511628211ULL; }
     h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
     h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
     h ^= h >> 33;
@@ -1664,6 +2992,9 @@ typedef struct {
     agg_valdesc_t       vd;
     int64_t             task_rows;
     uint32_t            n_tasks;
+    const agg_rr_t*     rr;       /* sources; staged ones are read by range */
+    const agg_view_t*   whole;
+    bool                runs;     /* COUNT only over one staged key: its run views add to the slots */
 } agg_dense_ctx_t;
 
 /* Each task owns a slice of one query allocation. Only the bitmap is
@@ -1876,7 +3207,7 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
                           int64_t n, int64_t param, double* out) {
     int8_t t = vt->out_type;
     switch (t) {
-        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_F32: case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
         case RAY_U8: case RAY_BOOL: break;
         default: return false;
@@ -1897,7 +3228,7 @@ bool agg_group_values_f64(const agg_vtable_t* vt, const char* states,
         switch (t) {
             case RAY_F64: v = ((const double*)ray_data(cell))[0]; break;
             case RAY_F32: v = ((const float*)ray_data(cell))[0]; break;
-            case RAY_I64: case RAY_TIMESTAMP: v = (double)((const int64_t*)ray_data(cell))[0]; break;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: v = (double)((const int64_t*)ray_data(cell))[0]; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: v = (double)((const int32_t*)ray_data(cell))[0]; break;
             case RAY_I16: v = (double)((const int16_t*)ray_data(cell))[0]; break;
             default: v = (double)((const uint8_t*)ray_data(cell))[0]; break;
@@ -1930,14 +3261,15 @@ static void agg_dense_emit_fn(void* raw, uint32_t wid, int64_t start, int64_t en
 /* Compute the dense slot for row r via mixed-radix packing.  `compacted`
  * is loop-invariant (dp->compacted); callers pass it from a local so the
  * raw form stays branch-free. */
-static inline int64_t agg_dense_slot(const agg_dense_ctx_t* c, int64_t r, bool compacted) {
+static inline int64_t agg_dense_slot(const agg_dense_ctx_t* c, const agg_view_t* v, int64_t r, bool compacted) {
     int64_t slot = 0;
+    const int64_t i = r - v->base;
     if (compacted) {
         for (uint32_t k = 0; k < c->n_keys; k++)
-            slot += agg_dense_component(c->dp, k, agg_read_key_i64(c->key_cols[k], c->key_data[k], r)) * c->dp->strides[k];
+            slot += agg_dense_component(c->dp, k, agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i)) * c->dp->strides[k];
     } else {
         for (uint32_t k = 0; k < c->n_keys; k++)
-            slot += agg_dense_component_raw(c->dp, k, agg_read_key_i64(c->key_cols[k], c->key_data[k], r)) * c->dp->strides[k];
+            slot += agg_dense_component_raw(c->dp, k, agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i)) * c->dp->strides[k];
     }
     return slot;
 }
@@ -1950,46 +3282,82 @@ static inline bool agg_dense_first(agg_dense_local_t* loc, int64_t slot) {
     return true;
 }
 
-/* Phase A: per-worker dense accumulate over chunk [start,end). */
-static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+/* Phase A, sel mode: the slots and the accumulation of one run of selected
+ * rows rows[ib, ie) read through view v. */
+typedef struct {
+    agg_dense_ctx_t*   c;
+    agg_dense_local_t* loc;
+    const int64_t*     rows;
+    uint32_t*          gid;
+    agg_sel_scratch_t* sc;
+} agg_dense_sel_run_t;
+static void agg_dense_sel_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t ib, int64_t ie) {
+    (void)wid;
+    agg_dense_sel_run_t* t = raw;
+    agg_dense_ctx_t* c = t->c;
+    agg_dense_local_t* loc = t->loc;
+    if (loc->oom) return;
+    /* Locals: the init calls below would otherwise reload every field. */
+    const int64_t* rows = t->rows;
+    uint32_t* gid = t->gid;
+    int64_t* fr = loc->first_row;
+    char* states = loc->states;
+    const bool compacted = c->dp->compacted;
+    for (int64_t i = ib; i < ie; i++) {
+        int64_t r = rows[i];
+        int64_t slot = agg_dense_slot(c, v, r, compacted);   /* provably in [0,total_slots) */
+        gid[i - ib] = (uint32_t)slot;
+        if (agg_dense_first(loc, slot)) {
+            for (uint32_t a = 0; a < c->n_aggs; a++)
+                c->vts[a]->init(states + (size_t)slot * c->block + c->off[a]);
+            fr[slot] = r;
+        }
+        if (r < fr[slot]) fr[slot] = r;
+    }
+    if (agg_sel_accum_chunk(&c->vd, v, t->sc, states, gid, rows + ib, ie - ib, false) != 0)
+        loc->oom = 1;
+}
+
+/* Phase A, sel mode: chunk-iterate the SELECTED rows in [start,end)
+ * (selected-row space).  Decode each chunk's ORIGINAL rows, compute dense
+ * slots, gather agg values per chunk into reused scratch, and batch-update.
+ * No full index array, no full compact column.  Staged sources are read by
+ * R-SPARSE through this task's cursors. */
+static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
+    agg_dense_local_t* loc = &c->locals[wid];
+    if (loc->oom || end <= start) return;
+    int64_t rows[AGG_SEL_CHUNK];
+    uint32_t gid[AGG_SEL_CHUNK];
+    agg_sel_scratch_t sc;
+    if (!agg_sel_scratch_init(&sc, c->n_aggs)) { loc->oom = 1; return; }
+    const agg_rr_t* rr = c->rr;
+    agg_curs_t cs; cs.cur = NULL;
+    if (rr->staged) {
+        if (ray_scan_fail_skip(rr->fail, start)) { agg_sel_scratch_free(&sc); return; }
+        if (!agg_curs_init(&cs, rr)) { loc->oom = 1; agg_sel_scratch_free(&sc); return; }
+    }
+    agg_sel_cursor_t cur;
+    agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
+    agg_dense_sel_run_t t = { c, loc, rows, gid, &sc };
+    int64_t cn;
+    while (!loc->oom && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+        if (!rr->staged) { agg_dense_sel_rows(&t, c->whole, wid, 0, cn); continue; }
+        ray_t* err = agg_idx_walk(rr, &cs, rows, 0, cn, &t, agg_dense_sel_rows, wid);
+        if (err) { ray_scan_fail_note(rr->fail, start, err); break; }
+    }
+    agg_curs_free(&cs, rr);
+    agg_sel_scratch_free(&sc);
+}
+
+/* Phase A: per-worker dense accumulate over chunk [start,end) (at most
+ * 8192 rows) read through view v: the whole columns, or one piece. */
+static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_ctx_t* c = vctx;
     agg_dense_local_t* loc = &c->locals[wid];
     if (loc->oom) return;
     int64_t n = end - start;
     if (n <= 0) return;
-
-    /* ── Sel mode: chunk-iterate the SELECTED rows in [start,end) (selected-row
-     * space).  Decode each chunk's ORIGINAL rows, compute dense slots, gather
-     * agg values per chunk into reused scratch, and batch-update.  No full
-     * index array, no full compact column. */
-    if (c->sel) {
-        int64_t rows[AGG_SEL_CHUNK];
-        uint32_t gid[AGG_SEL_CHUNK];
-        agg_sel_scratch_t sc;
-        if (!agg_sel_scratch_init(&sc, c->n_aggs)) { loc->oom = 1; return; }
-        agg_sel_cursor_t cur;
-        agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
-        int64_t cn;
-        const bool compacted = c->dp->compacted;
-        while ((cn = agg_sel_cursor_next(&cur, rows)) > 0) {
-            for (int64_t i = 0; i < cn; i++) {
-                int64_t r = rows[i];
-                int64_t slot = agg_dense_slot(c, r, compacted);   /* provably in [0,total_slots) */
-                gid[i] = (uint32_t)slot;
-                if (agg_dense_first(loc, slot)) {
-                    for (uint32_t a = 0; a < c->n_aggs; a++)
-                        c->vts[a]->init(loc->states + (size_t)slot * c->block + c->off[a]);
-                    loc->first_row[slot] = r;
-                }
-                if (r < loc->first_row[slot]) loc->first_row[slot] = r;
-            }
-            if (agg_sel_accum_chunk(&c->vd, &sc, loc->states, gid, rows, cn) != 0) {
-                loc->oom = 1; agg_sel_scratch_free(&sc); return;
-            }
-        }
-        agg_sel_scratch_free(&sc);
-        return;
-    }
+    const int64_t kbase = v->base;
 
     uint32_t cgid[8192];
 
@@ -2001,18 +3369,19 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
      * this is the dominant cost of a low-card group-by (a 7-group count was
      * ~70% here).  Multi-key keeps the generic composite path. */
     if (c->n_keys == 1) {
-        const void* kd = c->key_data[0];
+        const void* kd = v->key_data[0];
         int64_t  kmin = c->dp->mins[0];
-        int64_t  kstride = c->dp->strides[0];
-        bool nullable = c->dp->nullable[0];
+        bool nullable = c->dp->nullable[0];   /* one key: its stride is 1 */
         int64_t null = c->dp->nulls[0], null_slot = c->dp->ranges[0] - 1;
         int64_t* fr = loc->first_row;
         uint32_t* cg = cgid;
-        #define DENSE_SLOT1_LAZY(LD)                                            \
+        /* Only the nullable instance tests for the null (a ragged
+         * partition's null segment makes the key nullable); the slot is
+         * v - kmin, a single key's stride being 1. */
+        #define DENSE_SLOT1_LAZY(LD, SLOT)                                      \
             for (int64_t r = start; r < end; r++) {                        \
                 int64_t v = (int64_t)(LD);                               \
-                int64_t slot = nullable && v == null ? null_slot          \
-                    : (v - kmin) * kstride;                               \
+                int64_t slot = (SLOT);                                    \
                 cg[r - start] = (uint32_t)slot;                            \
                 if (agg_dense_first(loc, slot)) {                              \
                     for (uint32_t a = 0; a < c->n_aggs; a++)               \
@@ -2033,24 +3402,25 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
             if (loc->eager) {                                            \
                 if (!nullable) { DENSE_SLOT1_EAGER(LD, v - kmin); }        \
                 else { DENSE_SLOT1_EAGER(LD, v == null ? null_slot : v - kmin); } \
-            } else { DENSE_SLOT1_LAZY(LD); }                              \
+            } else if (!nullable) { DENSE_SLOT1_LAZY(LD, v - kmin); }     \
+            else { DENSE_SLOT1_LAZY(LD, v == null ? null_slot : v - kmin); } \
         } while (0)
         switch (c->key_cols[0]->type) {
-            case RAY_I64: case RAY_TIMESTAMP: DENSE_SLOT1(((const int64_t*)kd)[r]); break;
-            case RAY_I32: case RAY_DATE: case RAY_TIME: DENSE_SLOT1(((const int32_t*)kd)[r]); break;
-            case RAY_I16: DENSE_SLOT1(((const int16_t*)kd)[r]); break;
-            case RAY_U8: case RAY_BOOL: DENSE_SLOT1(((const uint8_t*)kd)[r]); break;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: DENSE_SLOT1(((const int64_t*)kd)[r - kbase]); break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: DENSE_SLOT1(((const int32_t*)kd)[r - kbase]); break;
+            case RAY_I16: DENSE_SLOT1(((const int16_t*)kd)[r - kbase]); break;
+            case RAY_U8: case RAY_BOOL: DENSE_SLOT1(((const uint8_t*)kd)[r - kbase]); break;
             case RAY_SYM:
-                switch (c->key_cols[0]->attrs & RAY_SYM_W_MASK) {
-                    case RAY_SYM_W8:  DENSE_SLOT1(((const uint8_t*)kd)[r]);  break;
-                    case RAY_SYM_W16: DENSE_SLOT1(((const uint16_t*)kd)[r]); break;
-                    case RAY_SYM_W32: DENSE_SLOT1(((const uint32_t*)kd)[r]); break;
-                    default:          DENSE_SLOT1(((const int64_t*)kd)[r]);  break; /* W64 */
+                switch (v->key_attrs[0] & RAY_SYM_W_MASK) {
+                    case RAY_SYM_W8:  DENSE_SLOT1(((const uint8_t*)kd)[r - kbase]);  break;
+                    case RAY_SYM_W16: DENSE_SLOT1(((const uint16_t*)kd)[r - kbase]); break;
+                    case RAY_SYM_W32: DENSE_SLOT1(((const uint32_t*)kd)[r - kbase]); break;
+                    default:          DENSE_SLOT1(((const int64_t*)kd)[r - kbase]);  break; /* W64 */
                 }
                 break;
             default:
                 for (int64_t r = start; r < end; r++) {
-                    int64_t slot = agg_dense_slot(c, r, false);   /* single key: never compacted */
+                    int64_t slot = agg_dense_slot(c, v, r, false);   /* single key: never compacted */
                     cg[r - start] = (uint32_t)slot;
                     if (r < fr[slot]) fr[slot] = r;
                 }
@@ -2061,7 +3431,7 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
     } else {
         #define DENSE_SLOT_MULTI(COMPACTED)                                    \
             for (int64_t r = start; r < end; r++) {                          \
-                int64_t slot = agg_dense_slot(c, r, COMPACTED);   /* provably in [0,total_slots) */ \
+                int64_t slot = agg_dense_slot(c, v, r, COMPACTED);   /* provably in [0,total_slots) */ \
                 cgid[r - start] = (uint32_t)slot;                            \
                 if (agg_dense_first(loc, slot)) {                            \
                     for (uint32_t a = 0; a < c->n_aggs; a++)                 \
@@ -2076,26 +3446,196 @@ static void agg_dense_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t
 
     for (uint32_t a = 0; a < c->n_aggs; a++) {
         if (c->vts[a]->update_batch2) {                 /* binary agg (pearson) */
-            const void* vx = (const char*)c->val_data[a]  + (size_t)start * c->val_esz[a];
-            const void* vy = (const char*)c->val2_data[a] + (size_t)start * c->val2_esz[a];
+            const void* vx = (const char*)v->val_data[a]  + (size_t)(start - kbase) * c->val_esz[a];
+            const void* vy = (const char*)v->val2_data[a] + (size_t)(start - kbase) * c->val2_esz[a];
             ray_valid_t valid_x = { vx, c->val_types[a],  c->val_hasnull[a] };
             ray_valid_t valid_y = { vy, c->val2_types[a], c->val2_hasnull[a] };
             c->vts[a]->update_batch2(loc->states + c->off[a], c->block, cgid,
                                      vx, vy, &valid_x, &valid_y, n, NULL);
         } else {
-            const void* vals = (c->val_data[a])
-                ? (const void*)((const char*)c->val_data[a] + (size_t)start * c->val_esz[a])
+            const void* vals = (v->val_data[a])
+                ? (const void*)((const char*)v->val_data[a] + (size_t)(start - kbase) * c->val_esz[a])
                 : NULL;
             ray_valid_t valid = { vals, c->val_types[a],
-                                  c->val_data[a] ? c->val_hasnull[a] : false };
+                                  v->val_data[a] ? c->val_hasnull[a] : false };
             c->vts[a]->update_batch(loc->states + c->off[a], c->block,
                                     cgid, vals, &valid, n, NULL);
         }
     }
 }
 
+/* Phase A on the key's runs (ctx->runs: every aggregate COUNT, one
+ * staged key).  A CONST / RLE key vector without bitmap nulls
+ * (ray_col_src_runview) adds each run's rows to its slot: the run's length
+ * inside the task's rows, or the number of the selection's rows inside the
+ * run; the slot is the per-row body's (agg_dense_component_raw: one key,
+ * never compacted), the first row the run's first counted row.  Every
+ * other vector is read and counted per row by the bodies above, as before
+ * (D6).  A slot outside the slab is `corrupt` (an internal plan check).
+ * Exact for any rows a task holds: nothing
+ * depends on the task cut. */
+typedef struct {
+    agg_dense_ctx_t*   c;
+    agg_dense_local_t* loc;
+    int64_t            vlo;          /* source row of the view's row 0 */
+    int64_t            r0, r1;       /* dense rows [r0, r1); idx == NULL */
+    const uint16_t*    idx;          /* else rows ibase + idx[ii, ni), ascending */
+    int64_t            ibase, ii, ni;
+    bool               bad;          /* a run value outside the plan */
+} agg_dense_runs_t;
+
+static inline void agg_dense_run_add(agg_dense_runs_t* t, int64_t value, int64_t first, int64_t cnt) {
+    const agg_dense_ctx_t* c = t->c;
+    agg_dense_local_t* loc = t->loc;
+    const int64_t slot = agg_dense_component_raw(c->dp, 0, value);
+    if (slot < 0 || slot >= loc->slots) { t->bad = true; return; }
+    int64_t* fr = loc->first_row;
+    char* st = loc->states + (size_t)slot * c->block;
+    if (loc->eager) { if (first < fr[slot]) fr[slot] = first; }
+    else if (agg_dense_first(loc, slot)) {
+        for (uint32_t a = 0; a < c->n_aggs; a++) c->vts[a]->init(st + c->off[a]);
+        fr[slot] = first;
+    } else if (first < fr[slot]) fr[slot] = first;
+    for (uint32_t a = 0; a < c->n_aggs; a++) {          /* COUNT's state: one int64_t count */
+        int64_t n; memcpy(&n, st + c->off[a], sizeof n);
+        n += cnt;
+        memcpy(st + c->off[a], &n, sizeof n);
+    }
+}
+/* ray_enc_runs callback: the run's rows inside dense rows [r0, r1) */
+static void agg_dense_run_rows(void* raw, int64_t value, int32_t lo, int32_t hi) {
+    agg_dense_runs_t* t = raw;
+    int64_t a = t->vlo + lo, b = t->vlo + hi;
+    if (a < t->r0) a = t->r0;
+    if (b > t->r1) b = t->r1;
+    if (a < b) agg_dense_run_add(t, value, a, b - a);
+}
+/* The selection's rows ibase + idx[ii, ni) inside the view's vector,
+ * merged with its runs: each run holding some adds their count. */
+static void agg_dense_runs_idx(agg_dense_runs_t* t, const ray_enc_vview_t* v) {
+    const uint16_t* idx = t->idx;
+    const int64_t ni = t->ni, off = t->vlo - t->ibase;  /* local run end e <=> index e + off */
+    int64_t i = t->ii;
+    for (uint32_t r = agg_run_at(v, idx[i] - off); r < v->n_runs && i < ni && !t->bad; r++) {
+        const int64_t e = (int64_t)v->run_ends.h[r] + off;
+        if (idx[i] >= e) continue;                       /* none of the rows in this run */
+        const int64_t f = i;
+        while (i < ni && idx[i] < e) i++;
+        agg_dense_run_add(t, agg_run_value(v, r), t->ibase + idx[f], i - f);
+    }
+    t->ii = i;
+}
+static ray_t* agg_dense_runs_bad(void) {
+    return ray_error("corrupt", "group: a key run outside its dense plan");
+}
+
+/* Sel mode on runs: the task's selected rows [start, end) segment by
+ * segment (ALL: a dense row range; MIX: the segment's indices). */
+static __attribute__((noinline)) void agg_dense_runs_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
+    agg_dense_local_t* loc = &c->locals[wid];
+    if (loc->oom || end <= start) return;
+    const agg_rr_t* rr = c->rr;
+    ray_col_src_t* src = rr->srcs[0];
+    if (ray_scan_fail_skip(rr->fail, start)) return;
+    int64_t rows[AGG_SEL_CHUNK];
+    uint32_t gid[AGG_SEL_CHUNK];
+    agg_sel_scratch_t sc;
+    if (!agg_sel_scratch_init(&sc, c->n_aggs)) { loc->oom = 1; return; }
+    agg_curs_t cs; cs.cur = NULL;
+    if (!agg_curs_init(&cs, rr)) { loc->oom = 1; agg_sel_scratch_free(&sc); return; }
+    agg_dense_sel_run_t pr = { c, loc, rows, gid, &sc };
+    agg_dense_runs_t t = { .c = c, .loc = loc };
+    ray_enc_vview_t view;                               /* the task's key view: on its stack */
+    int64_t vlo = -1, vhi = -1, nb = 0;                 /* the view's (or declined) rows; buffered rows */
+    int vr = 0;
+    bool stop = false;                                  /* cancelled */
+    ray_t* err = NULL;
+    const ray_rowsel_t* m = ray_rowsel_meta(c->sel);
+    const uint8_t* flags = ray_rowsel_flags(c->sel);
+    const uint32_t* offs = ray_rowsel_offsets(c->sel);
+    const uint16_t* idx = ray_rowsel_idx(c->sel);
+    const int64_t* pre = c->sel_prefix;
+    uint32_t s = 0, hs = m->n_segs;                     /* the segment holding selected row `start` */
+    while (s < hs) { uint32_t mid = s + (hs - s) / 2; if (pre[mid + 1] <= start) s = mid + 1; else hs = mid; }
+    for (; s < m->n_segs && pre[s] < end && !err && !stop && !loc->oom; s++) {
+        if (flags[s] == RAY_SEL_NONE) continue;
+        const int64_t seg_sel = pre[s + 1] - pre[s];
+        const int64_t p0 = start > pre[s] ? start - pre[s] : 0;
+        const int64_t p1 = end - pre[s] < seg_sel ? end - pre[s] : seg_sel;
+        const int64_t base = (int64_t)s * RAY_MORSEL_ELEMS;
+        const bool all = flags[s] == RAY_SEL_ALL;
+        const uint16_t* si = idx + offs[s];
+        for (int64_t q = p0; q < p1 && !err; ) {
+            const int64_t r = all ? base + q : base + si[q];
+            if (r < vlo || r >= vhi) {
+                if ((stop = agg_cancelled())) break;
+                vr = ray_col_src_runview(src, r, &view, &vlo, &vhi, &err);
+                if (vr < 0) break;
+            }
+            /* the positions [q, qe) of this segment inside [vlo, vhi) */
+            int64_t qe;
+            if (all) qe = vhi - base < p1 ? vhi - base : p1;
+            else { qe = q + 1; while (qe < p1 && base + si[qe] < vhi) qe++; }
+            if (vr > 0) {
+                t.vlo = vlo;
+                if (all) { t.idx = NULL; t.r0 = base + q; t.r1 = base + qe; }
+                else { t.idx = si; t.ibase = base; t.ii = q; t.ni = qe; }
+                if (all) (void)ray_enc_runs(&view, &t, agg_dense_run_rows);
+                else agg_dense_runs_idx(&t, &view);
+                if (t.bad) { err = agg_dense_runs_bad(); break; }
+            } else {
+                for (int64_t i = q; i < qe && !err; i++) {
+                    rows[nb++] = all ? base + i : base + si[i];
+                    if (nb == AGG_SEL_CHUNK) { err = agg_idx_walk(rr, &cs, rows, 0, nb, &pr, agg_dense_sel_rows, wid); nb = 0; }
+                }
+            }
+            q = qe;
+        }
+    }
+    if (nb > 0) {                                       /* the lower rows' read reports first */
+        ray_t* ferr = loc->oom ? NULL : agg_idx_walk(rr, &cs, rows, 0, nb, &pr, agg_dense_sel_rows, wid);
+        if (ferr) { if (err) ray_error_free(err); err = ferr; }
+    }
+    if (err) ray_scan_fail_note(rr->fail, start, err);
+    agg_curs_free(&cs, rr);
+    agg_sel_scratch_free(&sc);
+}
+
+/* Row mode on runs: rows [begin, limit), a key run view at a time; a
+ * declined vector (or plain segment) is walked by the per-row body. */
+static __attribute__((noinline)) void agg_dense_runs_rows(agg_dense_ctx_t* c, uint32_t task, int64_t begin, int64_t limit) {
+    const agg_rr_t* rr = c->rr;
+    if (ray_scan_fail_skip(rr->fail, begin)) return;
+    agg_curs_t cs;
+    if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, begin, ray_error("oom", NULL)); return; }
+    agg_dense_runs_t t = { .c = c, .loc = &c->locals[task] };
+    ray_enc_vview_t view;                               /* the task's key view: on its stack */
+    for (int64_t r = begin; r < limit && !agg_cancelled() && !c->locals[task].oom; ) {
+        int64_t vlo, vhi;
+        ray_t* err = NULL;
+        int vr = ray_col_src_runview(rr->srcs[0], r, &view, &vlo, &vhi, &err);
+        if (vr < 0) { ray_scan_fail_note(rr->fail, begin, err); break; }
+        const int64_t re = vhi < limit ? vhi : limit;
+        if (vr > 0) {
+            t.vlo = vlo; t.idx = NULL; t.r0 = r; t.r1 = re;
+            (void)ray_enc_runs(&view, &t, agg_dense_run_rows);
+            if (t.bad) { ray_scan_fail_note(rr->fail, begin, agg_dense_runs_bad()); break; }
+        } else {
+            bool ok = true;
+            for (int64_t b = r; b < re && ok; b += 8192)
+                ok = agg_walk_cs(rr, &cs, c, agg_dense_phaseA_fn, task, b, re - b < 8192 ? re : b + 8192, begin);
+            if (!ok) break;
+        }
+        r = re;
+    }
+    agg_curs_free(&cs, rr);
+}
+
 /* One slab per logical task, independent of the physical worker executing it.
- * A large pool can run a memory-bounded number of dense tasks safely. */
+ * A large pool can run a memory-bounded number of dense tasks safely.  Each
+ * 8192-row sub-block runs over the whole columns, or by pieces when a source
+ * is staged (whatever the block's alignment, through the task's cursors; a
+ * range error stops the task). */
 static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_dense_ctx_t* c = raw;
@@ -2112,11 +3652,46 @@ static void agg_dense_task_fn(void* raw, uint32_t wid, int64_t start, int64_t en
         }
         int64_t begin = chunk * task;
         int64_t limit = task + 1 == c->n_tasks ? c->task_rows : chunk * (task + 1);
-        if (c->sel) agg_dense_phaseA_fn(c, (uint32_t)task, begin, limit);
-        else for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192) {
-            ray_pool_scan_at(c->task_rows, row, limit);
-            agg_dense_phaseA_fn(c, (uint32_t)task, row, limit - row < 8192 ? limit : row + 8192);
+        if (c->sel) agg_dense_phaseA_sel(c, (uint32_t)task, begin, limit);
+        else if (!c->rr->staged)
+            for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192) {
+                ray_pool_scan_at(c->task_rows, row, limit);
+                agg_dense_phaseA_fn(c, c->whole, (uint32_t)task, row, limit - row < 8192 ? limit : row + 8192);
+            }
+        else {
+            agg_curs_t cs;
+            if (!agg_curs_init(&cs, c->rr)) ray_scan_fail_note(c->rr->fail, begin, ray_error("oom", NULL));
+            else {
+                for (int64_t row = begin; row < limit && !agg_cancelled(); row += 8192)
+                    if (!agg_walk_cs(c->rr, &cs, c, agg_dense_phaseA_fn, (uint32_t)task, row,
+                                     limit - row < 8192 ? limit : row + 8192, begin)) break;
+                agg_curs_free(&cs, c->rr);
+            }
         }
+        if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
+            if (loc->first_row[s] != INT64_MAX)
+                loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
+    }
+}
+
+/* agg_dense_task_fn for ctx->runs (the slab's set-up and occupancy as
+ * there), its own instance so the plain one keeps its code. */
+static void agg_dense_task_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_ctx_t* c = raw;
+    int64_t chunk = c->task_rows / c->n_tasks;
+    for (int64_t task = start; task < end; task++) {
+        agg_dense_local_t* loc = &c->locals[task];
+        agg_dense_local_init(loc, loc->slots, c->block);
+        if (loc->eager) for (int64_t s = 0; s < loc->slots; s++) {
+            loc->first_row[s] = INT64_MAX;
+            for (uint32_t a = 0; a < c->n_aggs; a++)
+                c->vts[a]->init(loc->states + (size_t)s * c->block + c->off[a]);
+        }
+        int64_t begin = chunk * task;
+        int64_t limit = task + 1 == c->n_tasks ? c->task_rows : chunk * (task + 1);
+        if (c->sel) agg_dense_runs_sel(c, (uint32_t)task, begin, limit);
+        else agg_dense_runs_rows(c, (uint32_t)task, begin, limit);
         if (loc->eager) for (int64_t s = 0; s < loc->slots; s++)
             if (loc->first_row[s] != INT64_MAX)
                 loc->occupied[s / 64] |= UINT64_C(1) << (s % 64);
@@ -2240,13 +3815,190 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
     return kept;
 }
 
-/* Shared output stage. Takes ownership of states/first, borrows the
- * prepared aggregate layout and descriptors. */
+/* Lean top-N emit over a shared dense slab.  The slab's occupancy bitmap is
+ * walked in disjoint word ranges, one task each, in chunks of LEAN_CHUNK
+ * slots: a chunk's filter-aggregate values feed a bounded candidate set per
+ * task, the union of the sets gives the N-th value (the threshold), and a
+ * second walk keeps the slots that pass agg_topn_mark.  Only the kept slots
+ * are stored, so the emit allocates O(N) (plus ties) instead of one entry per
+ * group; the kept set and its slot order are those of the generic path
+ * (agg_slots_topn_select over every occupied slot).  The filter aggregate is
+ * read from the states, or from a count-only slab of u32 counters. */
+enum { LEAN_CHUNK = 4096, LEAN_CAND_BUDGET = 8 << 20 };
+typedef struct {
+    const agg_vtable_t* vt;
+    const char* states;
+    size_t block, off;
+    int64_t param;
+    const uint32_t* cnt32;
+} agg_lean_src_t;
+
+typedef struct {
+    const agg_lean_src_t* src;
+    const uint64_t* occ;
+    int64_t words;
+    const ray_group_emit_filter_t* ef;
+    uint32_t tasks;
+    int pass;           /* 0: candidates and group counts; 1: the kept slots */
+    int64_t cap;
+    double* cand;       /* [tasks][3 * cap]: the task's pool (2 * cap), then scratch */
+    int64_t* pool_n;
+    int64_t* groups;
+    bool have_thr;
+    double thr;
+    int64_t** kept;
+    int64_t* kept_n;
+    int64_t* kept_cap;
+    _Atomic(int) fail;
+} agg_lean_ctx_t;
+
+static bool agg_lean_vals(const agg_lean_src_t* s, const int64_t* slots, int64_t n, double* out) {
+    if (s->cnt32) {
+        for (int64_t i = 0; i < n; i++) out[i] = (double)s->cnt32[slots[i]];
+        return true;
+    }
+    return agg_group_values_f64(s->vt, s->states, s->block, s->off, slots, n, s->param, out);
+}
+
+/* The next chunk of occupied slots of words [*w, w1); *bits holds the rest of
+ * word *w (consumed bits cleared). */
+static int64_t agg_lean_chunk(const uint64_t* occ, int64_t* w, uint64_t* bits, int64_t w1, int64_t* slots) {
+    int64_t n = 0;
+    for (;;) {
+        while (*bits) {
+            if (n == LEAN_CHUNK) return n;
+            slots[n++] = *w * 64 + __builtin_ctzll(*bits);
+            *bits &= *bits - 1;
+        }
+        if (++*w >= w1) return n;
+        *bits = occ[*w];
+    }
+}
+
+static void agg_lean_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_lean_ctx_t* c = raw;
+    const ray_group_emit_filter_t* ef = c->ef;
+    int64_t slots[LEAN_CHUNK];
+    double vals[LEAN_CHUNK];
+    uint8_t keep[LEAN_CHUNK];
+    for (int64_t t = start; t < end; t++) {
+        int64_t w0 = c->words / c->tasks * t;
+        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        if (w0 >= w1) continue;
+        int64_t w = w0;
+        uint64_t bits = c->occ[w];
+        for (;;) {
+            int64_t n = agg_lean_chunk(c->occ, &w, &bits, w1, slots);
+            if (n == 0) break;
+            if (!agg_lean_vals(c->src, slots, n, vals)) {
+                atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+                return;
+            }
+            if (c->pass == 0) {
+                c->groups[t] += n;
+                if (c->cap > 0) {
+                    double* pool = c->cand + (size_t)t * 3 * c->cap;
+                    double* tmp = pool + 2 * c->cap;
+                    int64_t hn;
+                    agg_topn_candidates(vals, n, c->cap, ef->desc, tmp, &hn);
+                    memcpy(pool + c->pool_n[t], tmp, (size_t)hn * sizeof(double));
+                    c->pool_n[t] += hn;
+                    if (c->pool_n[t] > c->cap) {
+                        agg_topn_candidates(pool, c->pool_n[t], c->cap, ef->desc, tmp, &hn);
+                        memcpy(pool, tmp, (size_t)hn * sizeof(double));
+                        c->pool_n[t] = hn;
+                    }
+                }
+            } else {
+                int64_t k = agg_topn_mark(vals, n, ef, c->have_thr, c->thr, keep);
+                if (c->kept_n[t] + k > c->kept_cap[t]) {
+                    int64_t nc = c->kept_cap[t] ? c->kept_cap[t] * 2 : 64;
+                    while (nc < c->kept_n[t] + k) nc *= 2;
+                    int64_t* p = ray_realloc_raw(c->kept[t], (size_t)nc * sizeof(int64_t));
+                    if (!p) { atomic_store_explicit(&c->fail, 1, memory_order_relaxed); return; }
+                    c->kept[t] = p; c->kept_cap[t] = nc;
+                }
+                for (int64_t i = 0; i < n; i++)
+                    if (keep[i]) c->kept[t][c->kept_n[t]++] = slots[i];
+            }
+        }
+    }
+}
+
+/* The kept slots among the occupied ones, ascending, in *out (the caller
+ * frees it); their count, or -1 when the filter aggregate has no scalar order
+ * or memory ran out. */
+static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src,
+        const uint64_t* occ, int64_t total_slots, const ray_group_emit_filter_t* ef,
+        int64_t** out, bool* have_thr, double* thr) {
+    *out = NULL; *have_thr = false; *thr = 0;
+    int64_t words = (total_slots + 63) / 64;
+    int64_t cap = ef->top_count_take > 0 ? ef->top_count_take : 0;
+    uint32_t tasks = pool && total_slots >= RAY_PARALLEL_THRESHOLD ? ray_pool_total_workers(pool) * 4 : 1;
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    if ((int64_t)tasks > words) tasks = (uint32_t)words;
+    if (cap > 0 && (int64_t)tasks * 3 * cap > LEAN_CAND_BUDGET) {
+        int64_t fit = LEAN_CAND_BUDGET / (3 * cap);
+        if (fit < tasks) tasks = fit < 1 ? 1 : (uint32_t)fit;
+    }
+    if (tasks < 1) tasks = 1;
+    size_t per = cap > 0 ? (size_t)cap : 1;
+    double* cand = ray_alloc_raw((size_t)tasks * 3 * per * sizeof(double));
+    double* all = ray_alloc_raw((size_t)tasks * per * sizeof(double));
+    int64_t* meta = ray_calloc_raw((size_t)tasks * 4 * sizeof(int64_t));
+    int64_t** kept = ray_calloc_raw((size_t)tasks * sizeof(int64_t*));
+    int64_t result = -1;
+    if (cand && all && meta && kept) {
+        agg_lean_ctx_t c = { .src = src, .occ = occ, .words = words, .ef = ef, .tasks = tasks,
+            .cap = cap, .cand = cand, .pool_n = meta, .groups = meta + tasks,
+            .kept = kept, .kept_n = meta + 2 * tasks, .kept_cap = meta + 3 * tasks };
+        atomic_init(&c.fail, 0);
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
+        else agg_lean_fn(&c, 0, 0, 1);
+        if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
+            int64_t total = 0, nc = 0;
+            for (uint32_t t = 0; t < tasks; t++) {
+                total += c.groups[t];
+                memcpy(all + nc, cand + (size_t)t * 3 * per, (size_t)c.pool_n[t] * sizeof(double));
+                nc += c.pool_n[t];
+            }
+            if (cap > 0) c.have_thr = agg_topn_union_threshold(all, nc, total, ef, &c.thr);
+            *have_thr = c.have_thr; *thr = c.thr;
+            c.pass = 1;
+            if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
+            else agg_lean_fn(&c, 0, 0, 1);
+            if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
+                int64_t n = 0;
+                for (uint32_t t = 0; t < tasks; t++) n += c.kept_n[t];
+                int64_t* o = ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+                if (o) {
+                    int64_t at = 0;
+                    for (uint32_t t = 0; t < tasks; t++) {
+                        if (c.kept_n[t]) memcpy(o + at, c.kept[t], (size_t)c.kept_n[t] * sizeof(int64_t));
+                        at += c.kept_n[t];
+                    }
+                    *out = o;
+                    result = n;
+                }
+            }
+        }
+        for (uint32_t t = 0; t < tasks; t++) ray_free_raw(kept[t]);
+    }
+    ray_free_raw(cand); ray_free_raw(all); ray_free_raw(meta); ray_free_raw(kept);
+    return result;
+}
+
+/* Shared output stage. Takes ownership of states/first/occ (occ: a bitmap of
+ * the occupied slots that stands in for first; first is then NULL), borrows the
+ * prepared aggregate layout and descriptors.  u32c: gstates is a count-only slab
+ * of u32 counters, one per slot, standing for every (COUNT) aggregate. */
 static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
         ray_pool_t* pool, const agg_vo_t* vo, const agg_desc_t* d,
-        int64_t total_slots, char* gstates, int64_t* gfirst,
+        int64_t total_slots, char* gstates, int64_t* gfirst, const uint64_t* occ,
         const dense_plan_t* key_plan, int64_t key_part_slots, uint32_t key_bits,
-        const ray_group_emit_filter_t* ef, int64_t group_limit) {
+        const ray_group_emit_filter_t* ef, int64_t group_limit, const dense_plan_t* slot_plan,
+        bool u32c, int64_t* pre_slots, int64_t pre_n) {
     uint32_t n_keys = ext->n_keys, n_aggs = ext->n_aggs;
     const agg_vtable_t** vts = vo->vts;
     const size_t* off = vo->off;
@@ -2257,20 +4009,47 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
      * (the natural build order) rather than sorting by first_row.  gfirst[s] is
      * still the gather index (any member row) for the key columns. */
     int64_t ng = 0;
-    for (int64_t s = 0; s < total_slots; s++) if (gfirst[s] != INT64_MAX) ng++;
+    int64_t* occupied_slot = NULL;
+    int64_t* first_row_ordered = NULL;
+    /* A slab with an occupancy bitmap under a top-N filter keeps only the
+     * groups the filter keeps (agg_dense_lean_select): no entry per group. */
+    if (occ && ef && key_plan && group_limit <= 0) {
+        agg_lean_src_t src = { .vt = vts[ef->agg_index], .states = gstates, .block = block,
+            .off = off[ef->agg_index], .param = ext->agg_k ? ext->agg_k[ef->agg_index] : 0,
+            .cnt32 = u32c ? (const uint32_t*)gstates : NULL };
+        bool lean_thr; double lean_thrv;
+        int64_t kept = pre_n >= 0 ? pre_n : agg_dense_lean_select(pool, &src, occ, total_slots, ef, &occupied_slot, &lean_thr, &lean_thrv);
+        if (pre_n >= 0) occupied_slot = pre_slots;
+        if (kept >= 0) {
+            ng = kept;
+            route_stats.topn_native = true;
+            route_stats.topn_kept = kept;
+            route_stats.dense_emit_slots = (uint64_t)kept;
+            ray_profile_tick("dense: selected top-N groups from the slab");
+            goto emit;
+        }
+        if (u32c) {
+            agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+            ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+            return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+        }
+    }
+    if (occ) for (int64_t w = 0; w < (total_slots + 63) / 64; w++) ng += __builtin_popcountll(occ[w]);
+    else for (int64_t s = 0; s < total_slots; s++) if (gfirst[s] != INT64_MAX) ng++;
+    route_stats.dense_emit_slots = (uint64_t)ng;
     ray_profile_tick("dense: freed slabs and counted groups");
 
-    int64_t* occupied_slot     = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
-    int64_t* first_row_ordered = key_plan ? NULL : ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
+    occupied_slot     = ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
+    first_row_ordered = key_plan ? NULL : ray_alloc_raw((size_t)(ng > 0 ? ng : 1) * sizeof(int64_t));
     if (!occupied_slot || (!key_plan && !first_row_ordered)) {
         ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
         agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-        ray_free_raw(gstates); ray_free_raw(gfirst);
+        ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
     { int64_t i = 0;
       for (int64_t s = 0; s < total_slots; s++)
-          if (gfirst[s] != INT64_MAX) {
+          if (occ ? (occ[s >> 6] >> (s & 63)) & 1 : gfirst[s] != INT64_MAX) {
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
               occupied_slot[i] = s; i++;
           }
@@ -2289,7 +4068,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             ray_free_raw(hkey); ray_free_raw(hslot);
             ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
             agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-            ray_free_raw(gstates); ray_free_raw(gfirst);
+            ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
             return ray_error("oom", NULL);
         }
         {
@@ -2362,26 +4141,33 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_profile_tick("dense: selected top-N groups");
     }
 
+emit:
+    ;
     ray_t* result = ray_table_new(n_keys + n_aggs);
     if (!result || RAY_IS_ERR(result)) {
         agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return result ? result : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
 
     for (uint32_t k = 0; k < n_keys; k++) {
-        ray_t* kc = key_plan ? col_vec_new(key_cols[k], ng)
-                            : ray_group_gather(key_cols[k], first_row_ordered, ng);
+        /* A staged key is never gathered at first rows (random reads): its
+         * value is rebuilt from the group's slot, the inverse of
+         * agg_dense_slot (agg_dense_code: null slot, compaction). */
+        const dense_plan_t* kp = key_plan ? key_plan : d->key_srcs[k] ? slot_plan : NULL;
+        ray_t* kc = kp ? col_vec_new(key_cols[k], ng)
+                       : ray_group_gather(key_cols[k], first_row_ordered, ng);
         if (!kc || RAY_IS_ERR(kc)) {
             agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
             ray_release(result); return kc ? kc : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
         }
-        if (key_plan) {
+        if (kp) {
             kc->len = ng;
             if (ray_vec_may_have_nulls(key_cols[k])) kc->attrs |= RAY_ATTR_HAS_NULLS;
             if (kc->type == RAY_SYM) ray_sym_vec_adopt_domain(kc, sym_domain_rep(key_cols[k]));
-            agg_dense_key_emit_t emit = {key_plan, occupied_slot, key_part_slots, key_bits, kc, k};
+            agg_dense_key_emit_t emit = {kp, occupied_slot, key_plan ? key_part_slots : 0,
+                                         key_plan ? key_bits : 0, kc, k};
             ray_pool_dispatch(pool, agg_dense_key_emit, &emit, ng);
             ray_group_key_settle_nulls(kc);
         }
@@ -2390,6 +4176,20 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     }
 
     for (uint32_t a = 0; a < n_aggs; a++) {
+        if (u32c) {   /* the slab's counters are the count column */
+            ray_t* cnt_out = ray_vec_new(RAY_I64, ng);
+            if (!cnt_out || RAY_IS_ERR(cnt_out)) {
+                ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+                ray_release(result); return cnt_out ? cnt_out : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+            }
+            cnt_out->len = ng;
+            const uint32_t* cnt = (const uint32_t*)gstates;
+            int64_t* dst = (int64_t*)ray_data(cnt_out);
+            for (int64_t i = 0; i < ng; i++) dst[i] = cnt[occupied_slot[i]];
+            result = ray_table_add_col(result, agg_result_col_name(agg_syms[a], ext->agg_ops[a]), cnt_out);
+            ray_release(cnt_out);
+            continue;
+        }
         /* Buffered top_n/bot_n produce a LIST cell per group (a native vector);
          * median and all streaming aggs produce a scalar out_type cell. */
         bool is_list = (vts[a]->out_type == RAY_LIST);
@@ -2397,7 +4197,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
                              : ray_vec_new(vts[a]->out_type, ng);
         if (!out || RAY_IS_ERR(out)) {
             agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+            ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
             ray_release(result); return out ? out : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
         }
         out->len = ng;
@@ -2422,7 +4222,7 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     /* Finalize is done reading the global slab → destroy its buffered per-group
      * state exactly once before freeing the slab. */
     agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
-    ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst);
+    ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered); ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
     if (result && !RAY_IS_ERR(result) && agg_cancelled()) { ray_release(result); return ray_error("cancel", NULL); }
     return result;
 }
@@ -2458,19 +4258,65 @@ typedef struct {
     char* states;
     int64_t* first;
     _Atomic(bool) failed;
+    const agg_rr_t* rr;          /* sources; staged ones are read by range */
+    const agg_view_t* whole;
+    /* The staged sources each pass reads (rr's otherwise): the histogram
+     * the keys, the scatter the inputs, so each decodes once. */
+    const agg_rr_t* count_rr;
+    const agg_rr_t* scatter_rr;
 } agg_dense_partition_ctx_t;
 
-/* Slots and partition counts of input positions [begin, limit). */
-static void agg_dense_partition_count_rows(agg_dense_partition_ctx_t* c, uint64_t* count,
+/* One source task of the histogram / scatter passes: its count row, and
+ * its write cursors (persisting across the pieces of the task). */
+typedef struct {
+    agg_dense_partition_ctx_t* c;
+    uint64_t* count;
+    uint64_t* cursor;
+} agg_part_task_t;
+
+/* Run body over input positions [begin, limit) of a source task: the
+ * whole columns, pieces of the rows (R-WALK), or runs of the selected rows
+ * (R-SPARSE through the task's cursors). */
+static void agg_dense_partition_run(agg_dense_partition_ctx_t* c, const agg_rr_t* rr, agg_part_task_t* t,
+                                    agg_body_fn body, uint32_t wid, int64_t begin, int64_t limit) {
+    if (!rr->staged) {
+        if (begin >= limit) return;
+        /* These passes are the first reads of the keys and the aggregate
+         * inputs: keep the rows past each block requested from storage
+         * (scan read-ahead), from the input row the block starts at —
+         * selected rows come in order. */
+        const int64_t* sel = c->selected_rows;
+        int64_t stop = sel ? sel[limit - 1] + 1 : limit;
+        for (int64_t b = begin; b < limit; b += 8192) {
+            ray_pool_scan_at(c->in_rows, sel ? sel[b] : b, stop);
+            body(t, c->whole, wid, b, limit - b > 8192 ? b + 8192 : limit);
+        }
+        return;
+    }
+    if (!c->selected_rows) { (void)agg_walk(rr, t, body, wid, begin, limit, begin); return; }
+    if (ray_scan_fail_skip(rr->fail, begin)) return;
+    agg_curs_t cs;
+    if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, begin, ray_error("oom", NULL)); return; }
+    ray_t* err = agg_idx_walk(rr, &cs, c->selected_rows, begin, limit, t, body, wid);
+    agg_curs_free(&cs, rr);
+    if (err) ray_scan_fail_note(rr->fail, begin, err);
+}
+
+static void agg_dense_partition_count_rows(void* raw, const agg_view_t* v, uint32_t wid,
                                            int64_t begin, int64_t limit) {
-    const void* data = ray_data(c->key);
+    (void)wid;
+    agg_part_task_t* t = raw;
+    agg_dense_partition_ctx_t* c = t->c;
+    uint64_t* count = t->count;
+    const int64_t kbase = v->base;
+    const void* data = v->key_data[0];
     if (c->plan->n_keys > 1) {
         #define PART_SLOT_MULTI(COMPONENT)                                 \
             for (int64_t r = begin; r < limit; r++) {                    \
-                int64_t source = c->selected_rows ? c->selected_rows[r] : r; \
+                int64_t source = (c->selected_rows ? c->selected_rows[r] : r) - kbase; \
                 int64_t slot = 0;                                        \
                 for (uint32_t k = 0; k < c->plan->n_keys; k++)           \
-                    slot += COMPONENT(c->plan, k, agg_read_key_i64(c->keys[k], c->key_data[k], source)) * c->plan->strides[k]; \
+                    slot += COMPONENT(c->plan, k, agg_read_key_i64_raw(c->keys[k]->type, v->key_attrs[k], v->key_data[k], source)) * c->plan->strides[k]; \
                 c->gids[r] = (uint32_t)slot;                             \
                 count[slot & (c->parts - 1)]++;                          \
             }
@@ -2482,18 +4328,18 @@ static void agg_dense_partition_count_rows(agg_dense_partition_ctx_t* c, uint64_
     #define PART_COUNT(T) do { \
         const T* p = data; \
         for (int64_t r = begin; r < limit; r++) { \
-            uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[c->selected_rows ? c->selected_rows[r] : r]); \
+            uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[(c->selected_rows ? c->selected_rows[r] : r) - kbase]); \
             c->gids[r] = slot; \
             count[slot & (c->parts - 1)]++; \
         } \
     } while (0)
     switch (c->key->type) {
-        case RAY_I64: case RAY_TIMESTAMP: PART_COUNT(int64_t); break;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: PART_COUNT(int64_t); break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: PART_COUNT(int32_t); break;
         case RAY_I16: PART_COUNT(int16_t); break;
         case RAY_U8: case RAY_BOOL: PART_COUNT(uint8_t); break;
         case RAY_SYM:
-            switch (c->key->attrs & RAY_SYM_W_MASK) {
+            switch (v->key_attrs[0] & RAY_SYM_W_MASK) {
                 case RAY_SYM_W8: PART_COUNT(uint8_t); break;
                 case RAY_SYM_W16: PART_COUNT(uint16_t); break;
                 case RAY_SYM_W32: PART_COUNT(uint32_t); break;
@@ -2505,28 +4351,19 @@ static void agg_dense_partition_count_rows(agg_dense_partition_ctx_t* c, uint64_
 }
 
 static void agg_dense_partition_count(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
     agg_dense_partition_ctx_t* c = raw;
     for (int64_t task = start; task < end; task++) {
         int64_t begin = c->rows / c->sources * task;
         int64_t limit = task + 1 == c->sources ? c->rows : c->rows / c->sources * (task + 1);
-        uint64_t* count = c->counts + task * c->parts;
-        if (begin >= limit) continue;
-        /* This pass is the first read of the keys: keep the rows past each
-         * block requested from storage (scan read-ahead), from the input
-         * row the block starts at — selected rows come in order. */
-        const int64_t* sel = c->selected_rows;
-        int64_t stop = sel ? sel[limit - 1] + 1 : limit;
-        for (int64_t b = begin; b < limit; b += 8192) {
-            ray_pool_scan_at(c->in_rows, sel ? sel[b] : b, stop);
-            agg_dense_partition_count_rows(c, count, b, limit - b > 8192 ? b + 8192 : limit);
-        }
+        agg_part_task_t t = { c, c->counts + task * c->parts, NULL };
+        agg_dense_partition_run(c, c->count_rr, &t, agg_dense_partition_count_rows, wid, begin, limit);
     }
 }
 
 /* Resolve native widths outside the row loop. A runtime-sized memcpy per
- * value dominated scatter for eight-byte inputs and mixed aggregates. */
-static void agg_dense_partition_field(agg_dense_partition_ctx_t* c, const void* data,
+ * value dominated scatter for eight-byte inputs and mixed aggregates.
+ * `data` is the view's pointer at row `base`. */
+static void agg_dense_partition_field(agg_dense_partition_ctx_t* c, const void* data, int64_t base,
         uint8_t width, size_t field, const uint64_t* starts, int64_t begin, int64_t end) {
     uint64_t cursor[RAY_POOL_INIT_TASKS / 2];
     assert(c->parts <= RAY_POOL_INIT_TASKS / 2);
@@ -2535,7 +4372,7 @@ static void agg_dense_partition_field(agg_dense_partition_ctx_t* c, const void* 
         for (int64_t r = begin; r < end; r++) { \
             uint32_t part = c->gids[r] & (c->parts - 1); \
             memcpy(c->payload + cursor[part]++ * c->record_size + field, \
-                   (const char*)data + (size_t)(c->selected_rows ? c->selected_rows[r] : r) * (W), (W)); \
+                   (const char*)data + (size_t)((c->selected_rows ? c->selected_rows[r] : r) - base) * (W), (W)); \
         } \
     } while (0)
     switch (width) {
@@ -2547,18 +4384,23 @@ static void agg_dense_partition_field(agg_dense_partition_ctx_t* c, const void* 
     #undef SCATTER_FIELD
 }
 
-/* Records of input positions [begin, limit), written at `cursor`. */
-static void agg_dense_partition_scatter_rows(agg_dense_partition_ctx_t* c, uint64_t* cursor,
+static void agg_dense_partition_scatter_rows(void* raw, const agg_view_t* v, uint32_t wid,
                                              int64_t begin, int64_t limit) {
+    (void)wid;
+    agg_part_task_t* t = raw;
+    agg_dense_partition_ctx_t* c = t->c;
+    uint64_t* cursor = t->cursor;
+    const int64_t base = v->base;
     const agg_valdesc_t* vd = &c->values;
     if (vd->n_aggs == 1 && vd->val_data[0] && !vd->val2_data[0]) {
+        const char* vals = v->val_data[0];
         #define SCATTER_UNARY(W) do { \
             for (int64_t r = begin; r < limit; r++) { \
                 uint32_t slot = c->gids[r]; \
                 uint32_t gid = slot >> c->bits, part = slot & (c->parts - 1); \
                 char* dst = c->payload + cursor[part]++ * (4 + (W)); \
                 memcpy(dst, &gid, 4); \
-                memcpy(dst + 4, (const char*)vd->val_data[0] + (size_t)(c->selected_rows ? c->selected_rows[r] : r) * (W), (W)); \
+                memcpy(dst + 4, vals + (size_t)((c->selected_rows ? c->selected_rows[r] : r) - base) * (W), (W)); \
             } \
         } while (0)
         switch (vd->val_esz[0]) {
@@ -2587,12 +4429,12 @@ static void agg_dense_partition_scatter_rows(agg_dense_partition_ctx_t* c, uint6
         }
         size_t emitted = sizeof(uint32_t);
         for (uint32_t a = 0; a < vd->n_aggs; a++) {
-            if (vd->val_data[a] && c->value_offsets[a] >= emitted) {
-                agg_dense_partition_field(c, vd->val_data[a], vd->val_esz[a], c->value_offsets[a], chunk_starts, chunk, chunk_end);
+            if (v->val_data[a] && c->value_offsets[a] >= emitted) {
+                agg_dense_partition_field(c, v->val_data[a], base, vd->val_esz[a], c->value_offsets[a], chunk_starts, chunk, chunk_end);
                 emitted = c->value_offsets[a] + vd->val_esz[a];
             }
-            if (vd->val2_data[a] && c->value2_offsets[a] >= emitted) {
-                agg_dense_partition_field(c, vd->val2_data[a], vd->val2_esz[a], c->value2_offsets[a], chunk_starts, chunk, chunk_end);
+            if (v->val2_data[a] && c->value2_offsets[a] >= emitted) {
+                agg_dense_partition_field(c, v->val2_data[a], base, vd->val2_esz[a], c->value2_offsets[a], chunk_starts, chunk, chunk_end);
                 emitted = c->value2_offsets[a] + vd->val2_esz[a];
             }
         }
@@ -2600,7 +4442,6 @@ static void agg_dense_partition_scatter_rows(agg_dense_partition_ctx_t* c, uint6
 }
 
 static void agg_dense_partition_scatter(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
     agg_dense_partition_ctx_t* c = raw;
     for (int64_t task = start; task < end; task++) {
         int64_t begin = c->rows / c->sources * task;
@@ -2609,15 +4450,8 @@ static void agg_dense_partition_scatter(void* raw, uint32_t wid, int64_t start, 
         uint64_t cursor[RAY_POOL_INIT_TASKS / 2];
         assert(c->parts <= RAY_POOL_INIT_TASKS / 2);
         memcpy(cursor, starts, c->parts * sizeof(*cursor));
-        if (begin >= limit) continue;
-        /* The first read of the aggregate inputs: keep the rows past each
-         * block requested, as in the count pass. */
-        const int64_t* sel = c->selected_rows;
-        int64_t stop = sel ? sel[limit - 1] + 1 : limit;
-        for (int64_t b = begin; b < limit; b += 8192) {
-            ray_pool_scan_at(c->in_rows, sel ? sel[b] : b, stop);
-            agg_dense_partition_scatter_rows(c, cursor, b, limit - b > 8192 ? b + 8192 : limit);
-        }
+        agg_part_task_t t = { c, NULL, cursor };
+        agg_dense_partition_run(c, c->scatter_rr, &t, agg_dense_partition_scatter_rows, wid, begin, limit);
     }
 }
 
@@ -2720,15 +4554,17 @@ static void agg_dense_partition_merge(void* raw, uint32_t wid, int64_t start, in
 static size_t agg_partition_record(const agg_desc_t* d, uint32_t n,
         size_t* x_offsets, size_t* y_offsets) {
     size_t bytes = sizeof(uint32_t);
+    /* An input's identity: its plain pointer, or its staged source (one
+     * source per column and table: ray_graph_bind_col deduplicates). */
     for (uint32_t f = 0; f < 2 * n; f++) {
         uint32_t a = f / 2;
-        const void* data = f % 2 ? d->val2_data[a] : d->val_data[a];
+        const void* data = f % 2 ? d->val2_id[a] : d->val_id[a];
         uint8_t width = f % 2 ? d->val2_esz[a] : d->val_esz[a];
         size_t offset = bytes;
         bool found = false;
         for (uint32_t prev = 0; data && prev < f; prev++) {
             uint32_t b = prev / 2;
-            const void* other = prev % 2 ? d->val2_data[b] : d->val_data[b];
+            const void* other = prev % 2 ? d->val2_id[b] : d->val_id[b];
             uint8_t size = prev % 2 ? d->val2_esz[b] : d->val_esz[b];
             if (other == data && size == width) {
                 if (x_offsets) offset = prev % 2 ? y_offsets[b] : x_offsets[b];
@@ -2754,8 +4590,9 @@ static uint32_t agg_dense_partition_parts(uint32_t sources, int64_t slots) {
 
 static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
         ray_pool_t* pool, const dense_plan_t* plan, int64_t rows,
-        const agg_vo_t* vo, const agg_desc_t* d, ray_t* selection,
+        const agg_vo_t* vo, agg_desc_t* d, ray_t* selection,
         const ray_group_emit_filter_t* ef) {
+    ray_t* ferr = NULL;   /* R-FAIL: a range error of a staged source */
     uint32_t workers = ray_pool_total_workers(pool);
     uint32_t sources = workers;
     if (sources > RAY_POOL_INIT_TASKS / 2) sources = RAY_POOL_INIT_TASKS / 2;
@@ -2766,13 +4603,32 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     int64_t slots = part_slots * parts;
     agg_dense_partition_ctx_t c = {
         .key = key_cols[0], .keys = key_cols, .key_data = d->key_data,
+        .rr = &d->rr, .whole = &d->whole,
         .plan = plan, .rows = rows, .part_slots = part_slots,
         .in_rows = selection ? ray_rowsel_meta(selection)->nrows : rows,
         .sources = sources, .parts = parts, .bits = bits, .failed = false,
         .values = { .n_aggs = ext->n_aggs, .vts = vo->vts, .off = vo->off, .block = vo->block,
-            .val_data = d->val_data, .val_types = d->val_types, .val_hasnull = d->val_hasnull, .val_esz = d->val_esz,
-            .val2_data = d->val2_data, .val2_types = d->val2_types, .val2_hasnull = d->val2_hasnull, .val2_esz = d->val2_esz }
+            .val_data = d->val_id, .val_types = d->val_types, .val_hasnull = d->val_hasnull, .val_esz = d->val_esz,
+            .val2_data = d->val2_id, .val2_types = d->val2_types, .val2_hasnull = d->val2_hasnull, .val2_esz = d->val2_esz }
     };
+    /* Per-pass source sets: a staged source leaves the pass that does not
+     * read it (its slot then reads as an absent input). */
+    ray_col_src_t** pass_srcs = NULL;
+    agg_rr_t count_rr = d->rr, scatter_rr = d->rr;
+    c.count_rr = c.scatter_rr = &d->rr;
+    if (d->staged) {
+        uint32_t ns = d->rr.n_src, nk = d->rr.n_keys;
+        pass_srcs = ray_alloc_raw((size_t)2 * (ns ? ns : 1) * sizeof(*pass_srcs));
+        if (!pass_srcs) goto failed;
+        for (uint32_t i = 0; i < ns; i++) {
+            pass_srcs[i] = i < nk ? d->rr.srcs[i] : NULL;
+            pass_srcs[ns + i] = i < nk ? NULL : d->rr.srcs[i];
+        }
+        count_rr.srcs = pass_srcs;
+        scatter_rr.srcs = pass_srcs + ns;
+        c.count_rr = &count_rr;
+        c.scatter_rr = &scatter_rr;
+    }
     if (selection) {
         c.selection_indices = ray_rowsel_to_indices(selection);
         if (!c.selection_indices || RAY_IS_ERR(c.selection_indices)) goto failed;
@@ -2788,7 +4644,9 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     c.tasks = ray_alloc_raw((size_t)(parts + split_budget) * sizeof(*c.tasks));
     if (!c.counts || !c.gids || !c.tasks || !c.payload) goto failed;
     c.starts = c.counts + (size_t)sources * parts;
+    agg_desc_advise(d, selection ? ray_rowsel_meta(selection)->nrows : rows);
     ray_pool_dispatch_n(pool, agg_dense_partition_count, &c, sources);
+    if (d->staged && (ferr = ray_scan_fail_finish(&d->fail, pool)) != NULL) goto failed;
     if (agg_cancelled()) goto failed;
     uint64_t offset = 0;
     for (uint32_t part = 0; part < parts; part++) {
@@ -2817,6 +4675,7 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     if (!c.states || !c.first) goto failed;
     ray_profile_tick("dense partition: histogram");
     ray_pool_dispatch_n(pool, agg_dense_partition_scatter, &c, sources);
+    if (d->staged && (ferr = ray_scan_fail_finish(&d->fail, pool)) != NULL) goto failed;
     if (agg_cancelled()) goto failed;
     ray_profile_tick("dense partition: scattered rows");
     ray_pool_dispatch_n(pool, agg_dense_partition_reduce, &c, c.n_tasks);
@@ -2827,14 +4686,16 @@ static ray_t* agg_dense_partitioned(ray_t** key_cols, int64_t* key_syms, ray_op_
     ray_profile_tick("dense partition: merged split partitions");
     ray_free_raw(c.counts); ray_free_raw(c.gids); ray_free_raw(c.tasks);
     ray_free_raw(c.payload); ray_free_raw(c.value_offsets); ray_release(c.selection_indices);
+    ray_free_raw(pass_srcs);
     route_stats.dense_strategy = AGG_DENSE_PARTITIONED;
     route_stats.dense_tasks = c.n_tasks;
     route_stats.dense_local_slots = slots + extra_slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, part_slots, bits, ef, 0);
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, NULL, plan, part_slots, bits, ef, 0, plan, false, NULL, -1);
 failed:
     ray_free_raw(c.counts); ray_free_raw(c.gids); ray_free_raw(c.tasks);
     ray_free_raw(c.payload); ray_free_raw(c.value_offsets); ray_release(c.selection_indices); ray_free_raw(c.states); ray_free_raw(c.first);
-    return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+    ray_free_raw(pass_srcs);
+    return ferr ? ferr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
 }
 
 typedef struct {
@@ -2844,9 +4705,51 @@ typedef struct {
     const agg_desc_t* desc;
     uint32_t n_aggs;
     char* states;
+    uint32_t* cnt32;                /* the count-only slab (agg_count32_slab), else NULL */
+    int64_t slots;
+    /* A probe pass (agg_dense_cut_ties) reads the keys again and records, for
+     * each slot of pslots (ascending) whose bit is set in probe, the first row
+     * that holds it in pfirst; it updates no counter. */
+    const uint64_t* probe;
+    const int64_t* pslots;
+    int64_t pn;
+    int64_t* pfirst;
+    ray_t* sel;                     /* the selection (selected-row space), else NULL */
+    const int64_t* sel_prefix;
+    const agg_valdesc_t* vd;
     _Atomic(uint64_t)* occupied;
-    int64_t* first;
 } agg_dense_shared_ctx_t;
+
+static inline void agg_probe_note(const agg_dense_shared_ctx_t* c, uint32_t slot, int64_t row) {
+    if (!((c->probe[slot >> 6] >> (slot & 63)) & 1)) return;
+    int64_t lo = 0, hi = c->pn - 1;
+    while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (c->pslots[mid] < (int64_t)slot) lo = mid + 1; else hi = mid;
+    }
+    int64_t seen = __atomic_load_n(&c->pfirst[lo], __ATOMIC_RELAXED);
+    while (row < seen &&
+           !__atomic_compare_exchange_n(&c->pfirst[lo], &seen, row, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+static void agg_dense_shared_zero(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_shared_ctx_t* c = raw;
+    memset(c->cnt32 + start, 0, (size_t)(end - start) * sizeof(uint32_t));
+}
+
+/* The count-only slab keeps no bit per row: a slot is occupied when its
+ * counter is not zero. */
+static void agg_dense_shared_cnt_occupied(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_shared_ctx_t* c = raw;
+    for (int64_t w = start; w < end; w++) {
+        uint64_t m = 0;
+        for (int64_t b = 0; b < 64 && w * 64 + b < c->slots; b++)
+            if (c->cnt32[w * 64 + b]) m |= UINT64_C(1) << b;
+        atomic_store_explicit(&c->occupied[w], m, memory_order_relaxed);
+    }
+}
 
 static void agg_dense_shared_init(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
@@ -2857,83 +4760,261 @@ static void agg_dense_shared_init(void* raw, uint32_t wid, int64_t start, int64_
             vo->vts[a]->init(c->states + (size_t)s * vo->block + vo->off[a]);
 }
 
-static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_t end) {
+/* Rows [start, end) (at most 8192) read through view v. */
+static void agg_dense_shared_block(void* raw, const agg_view_t* v, uint32_t wid, int64_t begin, int64_t end) {
     (void)wid;
     agg_dense_shared_ctx_t* c = raw;
     const agg_vo_t* vo = c->layout;
     const agg_desc_t* d = c->desc;
-    const void* data = ray_data(c->key);
+    const void* data = v->key_data[0];
+    const int64_t base = v->base;
     uint32_t gids[8192];
-    for (int64_t begin = start; begin < end && !agg_cancelled(); begin += 8192) {
-        int64_t n = end - begin < 8192 ? end - begin : 8192;
-        #define SHARED_GIDS(T) do { \
-            const T* p = data; \
-            for (int64_t i = 0; i < n; i++) { \
-                uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[begin + i]); \
-                gids[i] = slot; \
-                uint64_t bit = UINT64_C(1) << (slot % 64); \
-                _Atomic(uint64_t)* word = &c->occupied[slot / 64]; \
-                if (!(atomic_load_explicit(word, memory_order_relaxed) & bit)) \
-                    atomic_fetch_or_explicit(word, bit, memory_order_relaxed); \
-            } \
-        } while (0)
-        switch (c->key->type) {
-            case RAY_I64: case RAY_TIMESTAMP: SHARED_GIDS(int64_t); break;
-            case RAY_I32: case RAY_DATE: case RAY_TIME: SHARED_GIDS(int32_t); break;
-            case RAY_I16: SHARED_GIDS(int16_t); break;
-            case RAY_U8: case RAY_BOOL: SHARED_GIDS(uint8_t); break;
-            case RAY_SYM:
-                switch (c->key->attrs & RAY_SYM_W_MASK) {
-                    case RAY_SYM_W8: SHARED_GIDS(uint8_t); break;
-                    case RAY_SYM_W16: SHARED_GIDS(uint16_t); break;
-                    case RAY_SYM_W32: SHARED_GIDS(uint32_t); break;
-                    default: SHARED_GIDS(int64_t); break;
-                }
-                break;
-        }
-        #undef SHARED_GIDS
-        for (uint32_t a = 0; a < c->n_aggs; a++) {
-            const void* vals = (const char*)d->val_data[a] + (size_t)begin * d->val_esz[a];
-            ray_valid_t valid = {vals, d->val_types[a], d->val_hasnull[a]};
-            vo->vts[a]->update_shared(c->states + vo->off[a], vo->block, gids, vals, &valid, n);
-        }
+    int64_t n = end - begin;
+    uint32_t* cnt32 = c->cnt32;
+    const uint64_t* probe = c->probe;
+    #define SHARED_GIDS(T) do { \
+        const T* p = (const T*)data + (begin - base); \
+        for (int64_t i = 0; i < n; i++) { \
+            uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, (int64_t)p[i]); \
+            gids[i] = slot; \
+            if (probe) { agg_probe_note(c, slot, begin + i); continue; } \
+            if (cnt32) { __atomic_fetch_add(&cnt32[slot], 1, __ATOMIC_RELAXED); continue; } \
+            uint64_t bit = UINT64_C(1) << (slot % 64); \
+            _Atomic(uint64_t)* word = &c->occupied[slot / 64]; \
+            if (!(atomic_load_explicit(word, memory_order_relaxed) & bit)) \
+                atomic_fetch_or_explicit(word, bit, memory_order_relaxed); \
+        } \
+    } while (0)
+    switch (c->key->type) {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: SHARED_GIDS(int64_t); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: SHARED_GIDS(int32_t); break;
+        case RAY_I16: SHARED_GIDS(int16_t); break;
+        case RAY_U8: case RAY_BOOL: SHARED_GIDS(uint8_t); break;
+        case RAY_SYM:
+            switch (v->key_attrs[0] & RAY_SYM_W_MASK) {
+                case RAY_SYM_W8: SHARED_GIDS(uint8_t); break;
+                case RAY_SYM_W16: SHARED_GIDS(uint16_t); break;
+                case RAY_SYM_W32: SHARED_GIDS(uint32_t); break;
+                default: SHARED_GIDS(int64_t); break;
+            }
+            break;
+    }
+    #undef SHARED_GIDS
+    if (cnt32 || probe) return;
+    for (uint32_t a = 0; a < c->n_aggs; a++) {
+        const void* vals = v->val_data[a]   /* NULL: COUNT reads no input */
+            ? (const char*)v->val_data[a] + (size_t)(begin - base) * d->val_esz[a] : NULL;
+        ray_valid_t valid = {vals, d->val_types[a], d->val_hasnull[a]};
+        vo->vts[a]->update_shared(c->states + vo->off[a], vo->block, gids, vals, &valid, n);
     }
 }
 
-static void agg_dense_shared_occupied(void* raw, uint32_t wid, int64_t start, int64_t end) {
+/* A run of selected rows rows[ib, ie) read through view v: their slots, then
+ * the counters or the shared kernels. */
+typedef struct {
+    agg_dense_shared_ctx_t* c;
+    const int64_t* rows;
+    uint32_t* gid;
+    agg_sel_scratch_t* sc;
+    int oom;
+} agg_dense_shared_sel_t;
+static void agg_dense_shared_sel_run(void* raw, const agg_view_t* v, uint32_t wid, int64_t ib, int64_t ie) {
     (void)wid;
+    agg_dense_shared_sel_t* t = raw;
+    agg_dense_shared_ctx_t* c = t->c;
+    for (int64_t i = ib; i < ie; i++) {
+        int64_t r = t->rows[i];
+        int64_t k = agg_read_key_i64_raw(c->key->type, v->key_attrs[0], v->key_data[0], r - v->base);
+        uint32_t slot = (uint32_t)agg_dense_component_raw(c->plan, 0, k);
+        t->gid[i - ib] = slot;
+        if (c->probe) { agg_probe_note(c, slot, r); continue; }
+        if (c->cnt32) { __atomic_fetch_add(&c->cnt32[slot], 1, __ATOMIC_RELAXED); continue; }
+        uint64_t bit = UINT64_C(1) << (slot % 64);
+        _Atomic(uint64_t)* word = &c->occupied[slot / 64];
+        if (!(atomic_load_explicit(word, memory_order_relaxed) & bit))
+            atomic_fetch_or_explicit(word, bit, memory_order_relaxed);
+    }
+    if (c->cnt32 || c->probe) return;
+    if (agg_sel_accum_chunk(c->vd, v, t->sc, c->states, t->gid, t->rows + ib, ie - ib, true) != 0) t->oom = 1;
+}
+
+/* Selected-row space [start, end): chunks of selected rows are decoded to
+ * their original rows and read through the key sources (R-SPARSE for staged
+ * ones). */
+static void agg_dense_shared_sel_rows(agg_dense_shared_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
+    const agg_desc_t* d = c->desc;
+    int64_t rows[AGG_SEL_CHUNK];
+    uint32_t gid[AGG_SEL_CHUNK];
+    agg_sel_scratch_t sc;
+    if (!agg_sel_scratch_init(&sc, c->n_aggs)) { ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL)); return; }
+    agg_curs_t cs; cs.cur = NULL;
+    if (d->staged && !agg_curs_init(&cs, &d->rr)) {
+        ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL));
+        agg_sel_scratch_free(&sc);
+        return;
+    }
+    agg_sel_cursor_t cur;
+    agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
+    agg_dense_shared_sel_t t = { c, rows, gid, &sc, 0 };
+    int64_t cn;
+    while (!t.oom && !agg_cancelled() && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+        if (!d->staged) { agg_dense_shared_sel_run(&t, &d->whole, wid, 0, cn); continue; }
+        ray_t* err = agg_idx_walk(&d->rr, &cs, rows, 0, cn, &t, agg_dense_shared_sel_run, wid);
+        if (err) { ray_scan_fail_note(d->rr.fail, start, err); break; }
+    }
+    if (t.oom) ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL));
+    agg_curs_free(&cs, &d->rr);
+    agg_sel_scratch_free(&sc);
+}
+
+static void agg_dense_shared_rows(void* raw, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_shared_ctx_t* c = raw;
-    for (int64_t s = start; s < end; s++)
-        c->first[s] = atomic_load_explicit(&c->occupied[s / 64], memory_order_relaxed)
-            & (UINT64_C(1) << (s % 64)) ? 0 : INT64_MAX;
+    if (c->sel) { agg_dense_shared_sel_rows(c, wid, start, end); return; }
+    const agg_desc_t* d = c->desc;
+    agg_curs_t cs; cs.cur = NULL;
+    if (d->staged && !agg_curs_init(&cs, &d->rr)) { ray_scan_fail_note(d->rr.fail, start, ray_error("oom", NULL)); return; }
+    for (int64_t begin = start; begin < end && !agg_cancelled(); begin += 8192) {
+        int64_t limit = end - begin < 8192 ? end : begin + 8192;
+        if (!d->staged) agg_dense_shared_block(c, &d->whole, wid, begin, limit);
+        else if (!agg_walk_cs(&d->rr, &cs, c, agg_dense_shared_block, wid, begin, limit, start)) break;
+    }
+    agg_curs_free(&cs, &d->rr);
+}
+
+typedef struct { int64_t first, slot; bool strict; } agg_tie_t;
+static int agg_tie_cmp(const void* a, const void* b) {
+    int64_t x = ((const agg_tie_t*)a)->first, y = ((const agg_tie_t*)b)->first;
+    return x < y ? -1 : x > y;
+}
+static int agg_dbl_cmp(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The kept groups of a top-N cut (the threshold's ties included) as the radix
+ * route answers it: of the groups tied at the threshold only the ones with the
+ * smallest first rows stay, so N groups remain, and the kept groups come in
+ * first-row order, which the sort downstream keeps for equal values.  The
+ * first rows come from one more pass over the keys (a probe pass) that notes
+ * them for the kept slots only.  Kept values that are all different need
+ * neither, and the slot order stands.  False with *err set on failure. */
+static bool agg_dense_cut_ties(ray_pool_t* pool, agg_dense_shared_ctx_t* c, agg_desc_t* d, const agg_lean_src_t* src,
+        const ray_group_emit_filter_t* ef, bool have_thr, double thr, int64_t rows,
+        int64_t* slots, int64_t* n_io, ray_t** err) {
+    int64_t n = *n_io;
+    *err = NULL;
+    if (n <= 1) return true;
+    double* vals = ray_alloc_raw((size_t)n * sizeof(double));
+    double* sorted = ray_alloc_raw((size_t)n * sizeof(double));
+    uint64_t* bm = ray_calloc_raw(((size_t)c->slots + 63) / 64 * sizeof(uint64_t));
+    int64_t* first = ray_alloc_raw((size_t)n * sizeof(int64_t));
+    agg_tie_t* ties = ray_alloc_raw((size_t)n * sizeof(agg_tie_t));
+    bool ok = false;
+    if (!vals || !sorted || !bm || !first || !ties) { *err = ray_error("oom", NULL); goto done; }
+    ok = true;
+    if (!agg_lean_vals(src, slots, n, vals)) goto done;
+    memcpy(sorted, vals, (size_t)n * sizeof(double));
+    qsort(sorted, (size_t)n, sizeof(double), agg_dbl_cmp);
+    bool distinct = true;
+    for (int64_t i = 1; i < n && distinct; i++) distinct = sorted[i] != sorted[i - 1];
+    if (distinct) goto done;
+    for (int64_t i = 0; i < n; i++) {
+        bm[slots[i] >> 6] |= UINT64_C(1) << (slots[i] & 63);
+        first[i] = INT64_MAX;
+    }
+    c->probe = bm; c->pslots = slots; c->pn = n; c->pfirst = first;
+    ray_pool_dispatch(pool, agg_dense_shared_rows, c, rows);
+    c->probe = NULL;
+    if (d->staged && (*err = ray_scan_fail_finish(&d->fail, pool)) != NULL) { ok = false; goto done; }
+    if (agg_cancelled()) { *err = ray_error("cancel", NULL); ok = false; goto done; }
+    int64_t nstrict = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ties[i].first = first[i]; ties[i].slot = slots[i];
+        ties[i].strict = !have_thr || (ef->desc ? vals[i] > thr : vals[i] < thr);
+        nstrict += ties[i].strict;
+    }
+    int64_t room = have_thr ? ef->top_count_take - nstrict : n;
+    qsort(ties, (size_t)n, sizeof(agg_tie_t), agg_tie_cmp);
+    int64_t w = 0, tied = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (!ties[i].strict && tied++ >= room) continue;
+        slots[w++] = ties[i].slot;
+    }
+    *n_io = w;
+done:
+    ray_free_raw(vals); ray_free_raw(sorted); ray_free_raw(bm); ray_free_raw(first); ray_free_raw(ties);
+    return ok;
 }
 
 static ray_t* agg_dense_shared(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t* ext,
-        ray_pool_t* pool, const dense_plan_t* plan, int64_t rows,
-        const agg_vo_t* vo, const agg_desc_t* d, const ray_group_emit_filter_t* ef) {
+        ray_pool_t* pool, const dense_plan_t* plan, int64_t rows, ray_t* sel, const int64_t* sel_prefix,
+        const agg_vo_t* vo, agg_desc_t* d, const ray_group_emit_filter_t* ef) {
+    ray_t* ferr = NULL;   /* R-FAIL: a range error of a staged source */
     int64_t slots = plan->total_slots;
-    agg_dense_shared_ctx_t c = {.key = key_cols[0], .plan = plan, .layout = vo, .desc = d, .n_aggs = ext->n_aggs};
-    c.states = ray_alloc_raw((size_t)slots * vo->block);
-    c.first = ray_alloc_raw((size_t)slots * sizeof(int64_t));
+    agg_valdesc_t vd = { .n_aggs = ext->n_aggs, .vts = vo->vts, .off = vo->off, .block = vo->block,
+        .val_data = d->val_data, .val_types = d->val_types, .val_hasnull = d->val_hasnull, .val_esz = d->val_esz,
+        .val2_data = d->val2_data, .val2_types = d->val2_types, .val2_hasnull = d->val2_hasnull, .val2_esz = d->val2_esz };
+    agg_dense_shared_ctx_t c = {.key = key_cols[0], .plan = plan, .layout = vo, .desc = d, .n_aggs = ext->n_aggs, .slots = slots,
+        .sel = sel, .sel_prefix = sel_prefix, .vd = &vd};   /* rows: the selected rows with a selection */
+    bool u32c = plan->wide && agg_count32_slab(vo->vts, ext->n_aggs, rows);
+    c.states = ray_alloc_raw((size_t)slots * (u32c ? sizeof(uint32_t) : vo->block));
+    if (u32c) c.cnt32 = (uint32_t*)c.states;
     c.occupied = ray_alloc_raw(((size_t)slots + 63) / 64 * sizeof(*c.occupied));
-    if (!c.states || !c.first || !c.occupied) goto failed;
+    if (!c.states || !c.occupied) goto failed;
     for (int64_t w = 0; w < (slots + 63) / 64; w++) atomic_init(&c.occupied[w], 0);
-    ray_pool_dispatch(pool, agg_dense_shared_init, &c, slots);
+    ray_pool_dispatch(pool, u32c ? agg_dense_shared_zero : agg_dense_shared_init, &c, slots);
     ray_profile_tick("dense shared: initialized states");
+    agg_desc_advise(d, rows);
     ray_pool_dispatch(pool, agg_dense_shared_rows, &c, rows);
+    if (d->staged && (ferr = ray_scan_fail_finish(&d->fail, pool)) != NULL) goto failed;
     if (agg_cancelled()) goto failed;
     ray_profile_tick("dense shared: reduced rows");
-    ray_pool_dispatch(pool, agg_dense_shared_occupied, &c, slots);
-    if (agg_cancelled()) goto failed;
-    ray_profile_tick("dense shared: collected occupancy");
-    ray_free_raw(c.occupied);
+    if (u32c) ray_pool_dispatch(pool, agg_dense_shared_cnt_occupied, &c, (slots + 63) / 64);
     route_stats.dense_strategy = AGG_DENSE_SHARED;
     route_stats.dense_tasks = ray_pool_total_workers(pool);
     route_stats.dense_local_slots = slots;
-    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, c.first, plan, slots, 0, ef, 0);
+    route_stats.dense_count32 = u32c;
+    int64_t* pre = NULL;
+    int64_t pre_n = -1;
+    if (ef && ef->top_count_take > 0) {
+        agg_lean_src_t src = { .vt = vo->vts[ef->agg_index], .states = c.states, .block = vo->block,
+            .off = vo->off[ef->agg_index], .param = ext->agg_k ? ext->agg_k[ef->agg_index] : 0,
+            .cnt32 = u32c ? c.cnt32 : NULL };
+        bool have_thr;
+        double thr;
+        int64_t k = agg_dense_lean_select(pool, &src, (const uint64_t*)c.occupied, slots, ef, &pre, &have_thr, &thr);
+        if (k >= 0) {
+            if (!agg_dense_cut_ties(pool, &c, d, &src, ef, have_thr, thr, rows, pre, &k, &ferr)) {
+                ray_free_raw(pre);
+                goto failed;
+            }
+            pre_n = k;
+        } else if (u32c) {
+            goto failed;
+        }
+    }
+    return agg_dense_finish(key_cols, key_syms, ext, pool, vo, d, slots, c.states, NULL, (const uint64_t*)c.occupied, plan, slots, 0, ef, 0, plan, u32c, pre, pre_n);
 failed:
-    ray_free_raw(c.states); ray_free_raw(c.first); ray_free_raw(c.occupied);
-    return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+    ray_free_raw(c.states); ray_free_raw(c.occupied);
+    return ferr ? ferr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+}
+
+/* The dense phase A may count on the key's runs (agg_dense_runs_*): one
+ * staged generation-2 integer or SYM key, a raw-range plan, every
+ * aggregate COUNT (D6: the count adds a run's rows; any other aggregate
+ * needs its rows' values). */
+static bool agg_dense_runs_ok(const agg_rr_t* rr, const dense_plan_t* dp, const agg_vtable_t** vts,
+                              uint32_t n_keys, uint32_t n_aggs) {
+    if (n_keys != 1 || !rr->staged || !rr->srcs[0] || !ray_col_src_encoded(rr->srcs[0]) || dp->compacted) return false;
+    switch (rr->key_types[0]) {
+    case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM: break;
+    default: return false;
+    }
+    const agg_vtable_t* cnt = agg_resolve(OP_COUNT, RAY_I64);
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (vts[a] != cnt || vts[a]->state_size != sizeof(int64_t)) return false;
+    return true;
 }
 
 static ray_t* exec_group_v2_parallel_dense(
@@ -2951,7 +5032,11 @@ static ray_t* exec_group_v2_parallel_dense(
     const agg_vtable_t** vts = vo.vts; size_t* off = vo.off; size_t block = vo.block;
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) { agg_vo_free(&vo); return ray_error(agg_cancelled() ? "cancel" : "oom", NULL); }
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) {
+        agg_vo_free(&vo);
+        return derr ? derr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+    }
     const void** key_data = d.key_data;
     const void** val_data = d.val_data; const int8_t* val_types = d.val_types;
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
@@ -2959,7 +5044,7 @@ static ray_t* exec_group_v2_parallel_dense(
     const bool* val2_hasnull = d.val2_hasnull; const uint8_t* val2_esz = d.val2_esz;
 
     if (strategy == AGG_DENSE_SHARED) {
-        ray_t* result = agg_dense_shared(key_cols, key_syms, ext, pool, dp, nrows, &vo, &d, efp);
+        ray_t* result = agg_dense_shared(key_cols, key_syms, ext, pool, dp, sel ? n_sel : nrows, sel, sel_prefix, &vo, &d, efp);
         agg_vo_free(&vo); agg_desc_free(&d);
         return result;
     }
@@ -2983,7 +5068,12 @@ static ray_t* exec_group_v2_parallel_dense(
     if (!locals) { agg_vo_free(&vo); agg_desc_free(&d); return ray_error(agg_cancelled() ? "cancel" : "oom", NULL); }
     memset(locals, 0, metadata_bytes);
     char* cursor = (char*)(((uintptr_t)locals + metadata_bytes + 63) & ~(uintptr_t)63);
-    for (uint32_t w = 0; w < nw; w++) {
+    /* The eager-initialization samples read a staged key through cursors
+     * (R-SPARSE: strided single rows, ascending). */
+    agg_curs_t scs; scs.cur = NULL;
+    ray_t* serr = NULL;
+    if (d.staged && !sel && n_keys == 1 && !agg_curs_init(&scs, &d.rr)) serr = ray_error("oom", NULL);
+    for (uint32_t w = 0; w < nw && !serr; w++) {
         locals[w].slots = total_slots;
         /* Eager initialization amortizes when a task processes at least
          * two rows per possible slot. It preserves a tight row loop for
@@ -2996,9 +5086,12 @@ static ray_t* exec_group_v2_parallel_dense(
             int64_t begin = nrows / nw * w;
             int64_t end = w + 1 == nw ? nrows : nrows / nw * (w + 1);
             int64_t low = total_slots, high = 0;
-            for (int64_t sample = 0; sample < 64; sample++) {
+            for (int64_t sample = 0; sample < 64 && !serr; sample++) {
                 int64_t row = begin + (end - begin - 1) * sample / 63;
-                int64_t slot = agg_dense_component(dp, 0, agg_read_key_i64(key_cols[0], key_data[0], row));
+                int64_t key = d.key_srcs[0] ? agg_key_at(&d.rr, &scs, 0, row, &serr)
+                                            : agg_read_key_i64(key_cols[0], key_data[0], row);
+                if (serr) break;                 /* key is 0: never a slot (a remap would read past it) */
+                int64_t slot = agg_dense_component(dp, 0, key);
                 if (slot < low) low = slot;
                 if (slot > high) high = slot;
             }
@@ -3009,6 +5102,8 @@ static ray_t* exec_group_v2_parallel_dense(
         locals[w].states = cursor;
         cursor += (bytes + 63) & ~(size_t)63;
     }
+    agg_curs_free(&scs, &d.rr);
+    if (serr) { ray_free_raw(locals); agg_vo_free(&vo); agg_desc_free(&d); return serr; }
     agg_dense_merge_ctx_t merge_ctx = { .locals = locals, .slots = total_slots,
         .vts = vts, .off = off, .block = block, .n_aggs = n_aggs, .nw = nw };
     ray_profile_tick("dense: allocated slabs");
@@ -3024,19 +5119,23 @@ static ray_t* exec_group_v2_parallel_dense(
         .vd = { .n_aggs = n_aggs, .vts = vts, .off = off, .block = block,
                 .val_data = val_data, .val_types = val_types, .val_hasnull = val_hasnull, .val_esz = val_esz,
                 .val2_data = val2_data, .val2_types = val2_types, .val2_hasnull = val2_hasnull, .val2_esz = val2_esz },
+        .rr = &d.rr, .whole = &d.whole,
+        .runs = agg_dense_runs_ok(&d.rr, dp, vts, n_keys, n_aggs),
     };
     /* Sel mode dispatches over the SELECTED-row space [0,n_sel); each worker
      * range maps to a segment span via sel_prefix.  Non-sel dispatches over rows. */
-    ray_pool_dispatch_n(pool, agg_dense_task_fn, &ctx, nw);
+    agg_desc_advise(&d, nrows);
+    ray_pool_dispatch_n(pool, ctx.runs ? agg_dense_task_runs_fn : agg_dense_task_fn, &ctx, nw);
     ray_profile_tick("dense: accumulated rows");
 
+    ray_t* ferr = d.staged ? ray_scan_fail_finish(&d.fail, pool) : NULL;
     for (uint32_t w = 0; w < nw; w++)
-        if (locals[w].oom || agg_cancelled()) {
+        if (ferr || locals[w].oom || agg_cancelled()) {
             for (uint32_t i = 0; i < nw; i++)
                 agg_dense_local_destroy_states(&locals[i], vts, off, block, n_aggs);
             ray_free_raw(locals);
             agg_vo_free(&vo); agg_desc_free(&d);
-            return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+            return ferr ? ferr : ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
         }
 
     /* dispatch_n has joined every task. If cancellation skipped a task, the
@@ -3073,7 +5172,7 @@ static ray_t* exec_group_v2_parallel_dense(
     ray_free_raw(locals);
 
     ray_t* result = agg_dense_finish(key_cols, key_syms, ext, pool, &vo, &d,
-                                      total_slots, gstates, gfirst, NULL, 0, 0, efp, group_limit);
+                                      total_slots, gstates, gfirst, NULL, NULL, 0, 0, efp, group_limit, dp, false, NULL, -1);
     agg_vo_free(&vo); agg_desc_free(&d);
     return result;
 }
@@ -3099,37 +5198,67 @@ static ray_t* exec_group_v2_parallel_dense(
 /* Per-worker (and global merge) GROWABLE small-hash group table: open-addressing
  * hash on the tuple-hash → local gid; AoS per-group state blocks of `block`
  * bytes.  Sized to cardinality (not N) and grown by rehash on load-factor. */
+/* A key column of `ng` rows from key words at w[g * stride]: the type, SYM
+ * width and domain of `like` (the key column or its stand-in).  A word
+ * equal to the type's null sentinel is a null row and sets HAS_NULLS (so
+ * does a nullable `like`, as ray_group_gather would); BOOL and U8 are never
+ * null.  Caller owns the column. */
+static ray_t* agg_keycol_from_words(ray_t* like, const int64_t* w, size_t stride, int64_t ng) {
+    ray_t* out = col_vec_new(like, ng);
+    if (!out || RAY_IS_ERR(out)) return out;
+    if (out->type == RAY_SYM) ray_sym_vec_adopt_domain(out, sym_domain_rep(like));
+    out->len = ng;
+    bool nulls = ray_vec_may_have_nulls(like);
+    int64_t null = like->type == RAY_SYM ? 0 : agg_key_null(like->type);
+    bool nullable_type = like->type != RAY_BOOL && like->type != RAY_U8;
+    void* dst = ray_data(out);
+    for (int64_t g = 0; g < ng; g++) {
+        int64_t v = w[(size_t)g * stride];
+        if (nullable_type && v == null) nulls = true;
+        write_col_i64(dst, g, v, out->type, out->attrs);
+    }
+    if (nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 typedef struct {
     int32_t* ht;          /* [htcap] slot -> local gid, -1 empty */
     int64_t  htcap;
     uint64_t htmask;
     int64_t* first_row;   /* [cap] representative (MIN) row idx per local group */
     char*    states;      /* [cap*block] AoS group state */
+    int64_t* gkey;        /* staged keys: [cap * n_keys] key words per group; else NULL */
+    uint32_t n_keys;      /* words per gkey entry (0: first-row compares) */
     int64_t  ng, cap;
     size_t   block;
     int      oom;
 } agg_sh_t;
 
-static int agg_sh_init(agg_sh_t* sh, int64_t cap, size_t block) {
+/* n_words > 0: the table keys its groups by stored key words (staged keys,
+ * read by range, have no row to compare at later). */
+static int agg_sh_init(agg_sh_t* sh, int64_t cap, size_t block, uint32_t n_words) {
     if (cap < 1) cap = 1;
     int64_t htcap = 2;
     while (htcap < cap * 2) htcap <<= 1;   /* <0.5 load at full cap */
     sh->ng = 0; sh->cap = cap; sh->block = block; sh->oom = 0;
     sh->htcap = htcap; sh->htmask = (uint64_t)htcap - 1;
+    sh->n_keys = n_words;
     sh->ht        = ray_alloc_raw((size_t)htcap * sizeof(int32_t));
     sh->first_row = ray_alloc_raw((size_t)cap * sizeof(int64_t));
     sh->states    = ray_alloc_raw((size_t)cap * block);
-    if (!sh->ht || !sh->first_row || !sh->states) { sh->oom = 1; return -1; }
+    sh->gkey      = n_words ? ray_alloc_raw((size_t)cap * n_words * sizeof(int64_t)) : NULL;
+    if (!sh->ht || !sh->first_row || !sh->states || (n_words && !sh->gkey)) { sh->oom = 1; return -1; }
     for (int64_t i = 0; i < htcap; i++) sh->ht[i] = -1;
     return 0;
 }
 
 static void agg_sh_destroy(agg_sh_t* sh) {
-    ray_free_raw(sh->ht); ray_free_raw(sh->first_row); ray_free_raw(sh->states);
-    sh->ht = NULL; sh->first_row = NULL; sh->states = NULL;
+    ray_free_raw(sh->ht); ray_free_raw(sh->first_row); ray_free_raw(sh->states); ray_free_raw(sh->gkey);
+    sh->ht = NULL; sh->first_row = NULL; sh->states = NULL; sh->gkey = NULL;
 }
 
-/* Grow capacity (states + first_row) when ng would exceed cap.  Doubles cap. */
+/* Grow capacity (states + first_row, and the key words) when ng would exceed
+ * cap.  Doubles cap. */
 static int agg_sh_grow_cap(agg_sh_t* sh) {
     int64_t nc = sh->cap * 2;
     int64_t* nfr = ray_realloc_raw(sh->first_row, (size_t)nc * sizeof(int64_t));
@@ -3138,14 +5267,19 @@ static int agg_sh_grow_cap(agg_sh_t* sh) {
     char* nst = ray_realloc_raw(sh->states, (size_t)nc * sh->block);
     if (!nst) { sh->oom = 1; return -1; }
     sh->states = nst;
+    if (sh->n_keys) {
+        int64_t* ngk = ray_realloc_raw(sh->gkey, (size_t)nc * sh->n_keys * sizeof(int64_t));
+        if (!ngk) { sh->oom = 1; return -1; }
+        sh->gkey = ngk;
+    }
     sh->cap = nc;
     return 0;
 }
 
 /* Rehash the hash table to a larger htcap (keeps load factor low).  The gid set
  * is unchanged; we recompute each group's slot from its representative row's
- * tuple hash.  n_keys is uint32_t (unbounded), same contract as
- * agg_tuple_hash. */
+ * tuple hash, or from its stored key words (never reading a column).
+ * n_keys is uint32_t (unbounded), same contract as agg_tuple_hash. */
 static int agg_sh_grow_ht(agg_sh_t* sh, ray_t** key_cols, const void** key_data,
                           uint32_t n_keys) {
     int64_t nc = sh->htcap * 2;
@@ -3154,7 +5288,8 @@ static int agg_sh_grow_ht(agg_sh_t* sh, ray_t** key_cols, const void** key_data,
     uint64_t nmask = (uint64_t)nc - 1;
     for (int64_t i = 0; i < nc; i++) nht[i] = -1;
     for (int64_t g = 0; g < sh->ng; g++) {
-        uint64_t h = agg_tuple_hash(key_cols, key_data, n_keys, sh->first_row[g]);
+        uint64_t h = sh->n_keys ? agg_words_hash(&sh->gkey[(size_t)g * sh->n_keys], sh->n_keys)
+                                : agg_tuple_hash(key_cols, key_data, n_keys, sh->first_row[g]);
         uint64_t slot = h & nmask;
         while (nht[slot] >= 0) slot = (slot + 1) & nmask;
         nht[slot] = (int32_t)g;
@@ -3187,6 +5322,8 @@ typedef struct {
     ray_t*             sel;
     const int64_t*     sel_prefix;
     agg_valdesc_t      vd;
+    const agg_rr_t*    rr;         /* sources; staged ones are read by range */
+    const agg_view_t*  whole;
 } agg_sh_ctx_t;
 
 /* Probe-or-insert key tuple at row r in sh; returns gid (>=0) or -1 on oom.
@@ -3222,13 +5359,109 @@ static inline int32_t agg_sh_find_or_insert(
     }
 }
 
+/* Probe-or-insert by key words w[0, sh->n_keys) (a staged table; `r` the
+ * candidate's first row, kept as the MIN).  Keys reaching the small hash
+ * are integer, temporal, BOOL, U8 or SYM, so a widened word identifies its
+ * value exactly.  Returns gid (>=0) or -1 on oom. */
+static int32_t agg_sh_find_or_insert_words(
+        agg_sh_t* sh, const int64_t* w, const agg_vtable_t** vts, const size_t* off,
+        uint32_t n_aggs, int64_t r) {
+    uint32_t nk = sh->n_keys;
+    uint64_t h = agg_words_hash(w, nk);
+    uint64_t slot = h & sh->htmask;
+    for (;;) {
+        int32_t gp = sh->ht[slot];
+        if (gp < 0) {                       /* new group */
+            if (sh->ng == sh->cap && agg_sh_grow_cap(sh) != 0) return -1;
+            if ((sh->ng + 1) * 2 > sh->htcap) {
+                if (agg_sh_grow_ht(sh, NULL, NULL, 0) != 0) return -1;
+                slot = h & sh->htmask;
+                while (sh->ht[slot] >= 0) slot = (slot + 1) & sh->htmask;
+            }
+            int32_t g = (int32_t)sh->ng;
+            sh->ht[slot] = g;
+            sh->first_row[g] = r;
+            memcpy(&sh->gkey[(size_t)g * nk], w, (size_t)nk * sizeof(int64_t));
+            for (uint32_t a = 0; a < n_aggs; a++)
+                vts[a]->init(sh->states + (size_t)g * sh->block + off[a]);
+            sh->ng++;
+            return g;
+        }
+        if (memcmp(&sh->gkey[(size_t)gp * nk], w, (size_t)nk * sizeof(int64_t)) == 0) {
+            if (r < sh->first_row[gp]) sh->first_row[gp] = r;   /* MIN representative */
+            return gp;
+        }
+        slot = (slot + 1) & sh->htmask;
+    }
+}
+
+/* Group id of row r read through view v: by first-row compares over whole
+ * columns, by key words over pieces. */
+static inline int32_t agg_sh_gid(agg_sh_ctx_t* c, agg_sh_t* sh, const agg_view_t* v, int64_t r) {
+    if (!sh->n_keys)
+        return agg_sh_find_or_insert(sh, c->key_cols, c->key_data, c->n_keys,
+                                     c->vts, c->off, c->n_aggs, r);
+    uint32_t nk = c->n_keys;
+    int64_t w[nk];
+    for (uint32_t k = 0; k < nk; k++) w[k] = agg_vkey(v, c->rr->key_types, k, r);
+    return agg_sh_find_or_insert_words(sh, w, c->vts, c->off, c->n_aggs, r);
+}
+
+/* Phase A body: rows [start, end) (at most AGG_SH_CHUNK) through view v. */
+static void agg_sh_rows(void* vctx, const agg_view_t* v, uint32_t wid, int64_t cs, int64_t ce) {
+    agg_sh_ctx_t* c = (agg_sh_ctx_t*)vctx;
+    agg_sh_t* sh = &c->locals[wid];
+    if (sh->oom) return;
+    uint32_t gid[AGG_SH_CHUNK];
+    int64_t n = ce - cs;
+    const int64_t base = v->base;
+    for (int64_t r = cs; r < ce; r++) {
+        int32_t g = agg_sh_gid(c, sh, v, r);
+        if (g < 0) { sh->oom = 1; return; }
+        gid[r - cs] = (uint32_t)g;
+    }
+    for (uint32_t a = 0; a < c->n_aggs; a++) {
+        if (c->vts[a]->update_batch2) {             /* binary agg (pearson) */
+            const void* vx = (const char*)v->val_data[a]  + (size_t)(cs - base) * c->val_esz[a];
+            const void* vy = (const char*)v->val2_data[a] + (size_t)(cs - base) * c->val2_esz[a];
+            ray_valid_t valid_x = { vx, c->val_types[a],  c->val_hasnull[a] };
+            ray_valid_t valid_y = { vy, c->val2_types[a], c->val2_hasnull[a] };
+            c->vts[a]->update_batch2(sh->states + c->off[a], c->block, gid,
+                                     vx, vy, &valid_x, &valid_y, n, NULL);
+        } else {
+            const void* vals = (v->val_data[a])
+                ? (const void*)((const char*)v->val_data[a] + (size_t)(cs - base) * c->val_esz[a])
+                : NULL;
+            ray_valid_t valid = { vals, c->val_types[a],
+                                  v->val_data[a] ? c->val_hasnull[a] : false };
+            c->vts[a]->update_batch(sh->states + c->off[a], c->block,
+                                    gid, vals, &valid, n, NULL);
+        }
+    }
+}
+
+/* Phase A, sel mode: one run rows[ib, ie) of a selected chunk. */
+typedef struct { agg_sh_ctx_t* c; agg_sh_t* sh; const int64_t* rows; uint32_t* gid; agg_sel_scratch_t* sc; } agg_sh_sel_run_t;
+static void agg_sh_sel_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t ib, int64_t ie) {
+    (void)wid;
+    agg_sh_sel_run_t* t = raw;
+    if (t->sh->oom) return;
+    for (int64_t i = ib; i < ie; i++) {
+        int32_t g = agg_sh_gid(t->c, t->sh, v, t->rows[i]);
+        if (g < 0) { t->sh->oom = 1; return; }
+        t->gid[i - ib] = (uint32_t)g;
+    }
+    if (agg_sel_accum_chunk(&t->c->vd, v, t->sc, t->sh->states, t->gid, t->rows + ib, ie - ib, false) != 0)
+        t->sh->oom = 1;
+}
+
 /* Phase A: per-worker small-hash group + accumulate over chunk [start,end),
  * processed in fixed-size sub-chunks so the gid buffer is O(CHUNK), not O(N). */
 static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     agg_sh_ctx_t* c = (agg_sh_ctx_t*)vctx;
     agg_sh_t* sh = &c->locals[wid];
     if (sh->oom) return;
-    uint32_t gid[AGG_SH_CHUNK];
+    const agg_rr_t* rr = c->rr;
 
     /* ── Sel mode: chunk-iterate the SELECTED rows in [start,end) (selected-row
      * space), decoding ORIGINAL rows, probing the per-worker hash, gathering
@@ -3238,56 +5471,40 @@ static void agg_sh_phaseA_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         uint32_t sgid[AGG_SEL_CHUNK];
         agg_sel_scratch_t sc;
         if (!agg_sel_scratch_init(&sc, c->n_aggs)) { sh->oom = 1; return; }
+        agg_curs_t cs; cs.cur = NULL;
+        if (rr->staged) {
+            if (ray_scan_fail_skip(rr->fail, start)) { agg_sel_scratch_free(&sc); return; }
+            if (!agg_curs_init(&cs, rr)) { sh->oom = 1; agg_sel_scratch_free(&sc); return; }
+        }
         agg_sel_cursor_t cur;
         agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
+        agg_sh_sel_run_t t = { c, sh, rows, sgid, &sc };
         int64_t cn;
-        while ((cn = agg_sel_cursor_next(&cur, rows)) > 0) {
-            for (int64_t i = 0; i < cn; i++) {
-                int32_t g = agg_sh_find_or_insert(sh, c->key_cols, c->key_data, c->n_keys,
-                                                  c->vts, c->off, c->n_aggs, rows[i]);
-                if (g < 0) { sh->oom = 1; agg_sel_scratch_free(&sc); return; }
-                sgid[i] = (uint32_t)g;
-            }
-            if (agg_sel_accum_chunk(&c->vd, &sc, sh->states, sgid, rows, cn) != 0) {
-                sh->oom = 1; agg_sel_scratch_free(&sc); return;
-            }
+        while (!sh->oom && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
+            if (!rr->staged) { agg_sh_sel_rows(&t, c->whole, wid, 0, cn); continue; }
+            ray_t* err = agg_idx_walk(rr, &cs, rows, 0, cn, &t, agg_sh_sel_rows, wid);
+            if (err) { ray_scan_fail_note(rr->fail, start, err); break; }
         }
+        agg_curs_free(&cs, rr);
         agg_sel_scratch_free(&sc);
         return;
     }
 
-    for (int64_t cs = start; cs < end; cs += AGG_SH_CHUNK) {
+    agg_curs_t tc; tc.cur = NULL;
+    if (rr->staged && !agg_curs_init(&tc, rr)) { sh->oom = 1; return; }
+    for (int64_t cs = start; cs < end && !sh->oom; cs += AGG_SH_CHUNK) {
         int64_t ce = cs + AGG_SH_CHUNK; if (ce > end) ce = end;
-        int64_t n = ce - cs;
-        for (int64_t r = cs; r < ce; r++) {
-            int32_t g = agg_sh_find_or_insert(sh, c->key_cols, c->key_data, c->n_keys,
-                                              c->vts, c->off, c->n_aggs, r);
-            if (g < 0) { sh->oom = 1; return; }
-            gid[r - cs] = (uint32_t)g;
-        }
-        for (uint32_t a = 0; a < c->n_aggs; a++) {
-            if (c->vts[a]->update_batch2) {             /* binary agg (pearson) */
-                const void* vx = (const char*)c->val_data[a]  + (size_t)cs * c->val_esz[a];
-                const void* vy = (const char*)c->val2_data[a] + (size_t)cs * c->val2_esz[a];
-                ray_valid_t valid_x = { vx, c->val_types[a],  c->val_hasnull[a] };
-                ray_valid_t valid_y = { vy, c->val2_types[a], c->val2_hasnull[a] };
-                c->vts[a]->update_batch2(sh->states + c->off[a], c->block, gid,
-                                         vx, vy, &valid_x, &valid_y, n, NULL);
-            } else {
-                const void* vals = (c->val_data[a])
-                    ? (const void*)((const char*)c->val_data[a] + (size_t)cs * c->val_esz[a])
-                    : NULL;
-                ray_valid_t valid = { vals, c->val_types[a],
-                                      c->val_data[a] ? c->val_hasnull[a] : false };
-                c->vts[a]->update_batch(sh->states + c->off[a], c->block,
-                                        gid, vals, &valid, n, NULL);
-            }
-        }
+        if (!rr->staged) agg_sh_rows(c, c->whole, wid, cs, ce);
+        else if (!agg_walk_cs(rr, &tc, c, agg_sh_rows, wid, cs, ce, start)) break;
     }
+    agg_curs_free(&tc, rr);
 }
 
 /* Parallel small-hash fallback.  Precondition: int/SYM keys and streaming
- * accumulators. Hashes start at one group and grow from observed cardinality. */
+ * accumulators. Hashes start at one group and grow from observed cardinality.
+ * With staged keys every table keys its groups by key words: the merge
+ * inserts a local group by its words and the emit writes the keys from
+ * them, so no column is read at a stored row. */
 static ray_t* exec_group_v2_parallel_smallhash(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
         ray_t** key_cols, int64_t* key_syms,
@@ -3300,19 +5517,23 @@ static ray_t* exec_group_v2_parallel_smallhash(
     uint32_t nw = ray_pool_total_workers(pool);
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr ? derr : ray_error("oom", NULL);
     const void** key_data = d.key_data;
     const void** val_data = d.val_data; const int8_t* val_types = d.val_types;
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
     const void** val2_data = d.val2_data; const int8_t* val2_types = d.val2_types;
     const bool* val2_hasnull = d.val2_hasnull; const uint8_t* val2_esz = d.val2_esz;
     const int64_t* agg_syms = d.agg_syms;
+    bool words = false;
+    for (uint32_t k = 0; k < n_keys; k++) words |= d.key_srcs[k] != NULL;
+    uint32_t n_words = words ? n_keys : 0;
 
     agg_sh_t* locals = ray_calloc_raw((size_t)((size_t)nw) * (sizeof(agg_sh_t)));
     if (!locals) { agg_desc_free(&d); return ray_error("oom", NULL); }
     int alloc_oom = 0;
     for (uint32_t w = 0; w < nw; w++)
-        if (agg_sh_init(&locals[w], 1, block) != 0) { alloc_oom = 1; break; }
+        if (agg_sh_init(&locals[w], 1, block, n_words) != 0) { alloc_oom = 1; break; }
     if (alloc_oom) {
         for (uint32_t w = 0; w < nw; w++) agg_sh_destroy(&locals[w]);
         ray_free_raw(locals);
@@ -3332,15 +5553,18 @@ static ray_t* exec_group_v2_parallel_smallhash(
         .vd = { .n_aggs = n_aggs, .vts = vts, .off = off, .block = block,
                 .val_data = val_data, .val_types = val_types, .val_hasnull = val_hasnull, .val_esz = val_esz,
                 .val2_data = val2_data, .val2_types = val2_types, .val2_hasnull = val2_hasnull, .val2_esz = val2_esz },
+        .rr = &d.rr, .whole = &d.whole,
     };
+    agg_desc_advise(&d, nrows);
     ray_pool_dispatch(pool, agg_sh_phaseA_fn, &ctx, sel ? n_sel : nrows);
+    ray_t* ferr = d.staged ? ray_scan_fail_finish(&d.fail, pool) : NULL;
 
     for (uint32_t w = 0; w < nw; w++)
-        if (locals[w].oom) {
+        if (ferr || locals[w].oom) {
             for (uint32_t i = 0; i < nw; i++) agg_sh_destroy(&locals[i]);
             ray_free_raw(locals);
             agg_desc_free(&d);
-            return ray_error("oom", NULL);
+            return ferr ? ferr : ray_error("oom", NULL);
         }
 
     /* ── Phase B: merge per-worker hashes into a global hash (serial). ──
@@ -3348,7 +5572,7 @@ static ray_t* exec_group_v2_parallel_smallhash(
     int64_t gcap = 0;
     for (uint32_t w = 0; w < nw; w++) gcap += locals[w].ng;
     agg_sh_t gt = {0};
-    if (agg_sh_init(&gt, gcap, block) != 0) {
+    if (agg_sh_init(&gt, gcap, block, n_words) != 0) {
         agg_sh_destroy(&gt);
         for (uint32_t i = 0; i < nw; i++) agg_sh_destroy(&locals[i]);
         ray_free_raw(locals);
@@ -3359,8 +5583,9 @@ static ray_t* exec_group_v2_parallel_smallhash(
         agg_sh_t* loc = &locals[w];
         for (int64_t lg = 0; lg < loc->ng; lg++) {
             int64_t fr = loc->first_row[lg];
-            int32_t gg = agg_sh_find_or_insert(&gt, key_cols, key_data, n_keys,
-                                               vts, off, n_aggs, fr);
+            int32_t gg = n_words
+                ? agg_sh_find_or_insert_words(&gt, &loc->gkey[(size_t)lg * n_words], vts, off, n_aggs, fr)
+                : agg_sh_find_or_insert(&gt, key_cols, key_data, n_keys, vts, off, n_aggs, fr);
             if (gg < 0) {
                 agg_sh_destroy(&gt);
                 for (uint32_t i = 0; i < nw; i++) agg_sh_destroy(&locals[i]);
@@ -3379,14 +5604,16 @@ static ray_t* exec_group_v2_parallel_smallhash(
 
     /* ── Phase C: emit key + agg columns in build order (unspecified order). ──
      * gt.first_row[g] is the representative row for the scattered key gather —
-     * trivially cheap for the few groups this path handles. */
+     * trivially cheap for the few groups this path handles; a word-keyed
+     * table writes its keys from the words. */
     ray_t* result = ray_table_new(n_keys + n_aggs);
     if (!result || RAY_IS_ERR(result)) {
         agg_sh_destroy(&gt); agg_desc_free(&d);
         return result ? result : ray_error("oom", NULL);
     }
     for (uint32_t k = 0; k < n_keys; k++) {
-        ray_t* kc = ray_group_gather(key_cols[k], gt.first_row, ng);
+        ray_t* kc = n_words ? agg_keycol_from_words(key_cols[k], gt.gkey + k, n_words, ng)
+                            : ray_group_gather(key_cols[k], gt.first_row, ng);
         if (!kc || RAY_IS_ERR(kc)) {
             agg_sh_destroy(&gt); agg_desc_free(&d); ray_release(result);
             return kc ? kc : ray_error("oom", NULL);
@@ -3482,6 +5709,12 @@ static uint32_t agg_radix_part_count(uint32_t nworkers, int64_t nrows) {
  * worker a chunk, so mid-size inputs count and scatter on the whole pool. */
 #define AGG_RADIX_CHUNK_FLOOR_ROWS 4096
 #define AGG_RADIX_CHUNKS_PER_WORKER 4
+/* The fused pass's chunks (generation 2) hold this many records per
+ * partition on average: smaller chunks keep the staged records in cache,
+ * fewer records per (chunk, partition) run make phase 2's reads scatter. */
+#define AGG_RADIX_RUN_ROWS 8
+/* Phase 2 of a fused context prefetches the run this many chunks ahead. */
+#define AGG_RADIX_RUN_AHEAD 4
 /* Count-matrix budget: chunks are reduced (never below one per worker) so
  * n_chunks × n_parts × 4 bytes stays under this. */
 #define AGG_RADIX_COUNT_BUDGET  ((size_t)64 << 20)
@@ -3590,6 +5823,49 @@ static void agg_key_emit_fn(void* vctx, uint32_t wid, int64_t start, int64_t end
     agg_key_emit_range((const agg_key_emit_ctx_t*)vctx, start, end);
 }
 
+/* A record field of a compact fused context (agg_radix_ctx_t.cf): where
+ * the scatter takes it from.  A staged source's field is copied into the
+ * task's staged row at soff; a plain source's (a column read in place) is
+ * read by the scatter at its row, as the two passes' scatter reads it. */
+enum { AGG_CF_STAGED, AGG_CF_KEY_I64, AGG_CF_KEY_I32, AGG_CF_KEY_I16, AGG_CF_KEY_U8,
+       AGG_CF_KEY_U16, AGG_CF_KEY_U32, AGG_CF_VAL };
+typedef struct {
+    const char* plain;      /* plain fields: the column's row 0 */
+    uint32_t    off;        /* the field's offset in the record */
+    uint32_t    soff;       /* staged fields: the offset in the staged row */
+    uint32_t    agg;        /* inputs: the aggregate whose input this is */
+    uint8_t     y;          /* inputs: 1 for the y side of a binary aggregate */
+    uint8_t     w;          /* bytes in the record (keys: 8) */
+    uint8_t     esz;        /* plain fields: the column's element width */
+    uint8_t     kind;       /* AGG_CF_* */
+} agg_radix_cf_t;
+
+/* Spill of the later waves of a reduced radix run (agg_radix_spill_*).  One
+ * unlinked file in the heap's spill directory; each worker fills one buffer
+ * per wave and appends it whole when full — a block of n records followed
+ * by their n uint32 payload slots inside the wave — at a file offset taken
+ * from one shared tail, so every write is a large sequential pwrite.  A wave
+ * is read back block by block (pread) straight into the payload slots, then
+ * reduced like any other wave.  Written once, read once, unlinked at once. */
+typedef struct { int64_t off; uint32_t n; uint32_t wave; } agg_radix_blk_t;
+typedef struct { char* buf; uint32_t n; } agg_radix_sbuf_t;
+typedef struct agg_radix_spill_s {
+    int                fd;
+    uint32_t           n_waves;
+    uint32_t           bcap;       /* records per buffer */
+    size_t             rec;
+    const int64_t*     wave_base;  /* [n_waves] first record of each wave */
+    agg_radix_sbuf_t*  bufs;       /* [nw * n_waves]; wave 0's unused */
+    char*              rbuf;       /* [nw] read-back buffers */
+    size_t             rstride;    /* bytes per buffer, 8-aligned */
+    agg_radix_blk_t*   blks;
+    int64_t            blk_cap;
+    const int64_t*     wave_blks;  /* indices into blks of the wave read back */
+    _Atomic(int64_t)   n_blks;
+    _Atomic(int64_t)   tail;
+    _Atomic(int)       err;
+} agg_radix_spill_t;
+
 typedef struct {
     ray_t**             key_cols;
     const void**        key_data;
@@ -3637,6 +5913,55 @@ typedef struct {
      * the decoded original row. */
     ray_t*              sel;
     const int64_t*      sel_prefix;
+    const agg_rr_t*     rr;         /* sources; staged ones are read by range */
+    const agg_view_t*   whole;
+    /* Chunk-major payload (a staged context whose sources decode; chunks
+     * sized by exec_group_v2_parallel_radix): a task reads its chunk once,
+     * staging its records, and scatters them inside the chunk's own record
+     * range [chunk start, chunk end).  cnt then holds each (chunk,
+     * partition)'s offset inside that range, runs the same transposed with
+     * the lengths, part_start the partition totals' prefix; pid is unused.
+     * A partition's records are its chunks' runs in chunk order: the global
+     * layout's sequence, so phase 2 groups the same records in the same
+     * order (agg_radix_group_fused_fn). */
+    uint32_t            fused_tasks; /* fused: tasks of consecutive chunks */
+    const agg_rr_t*     count_rr;   /* two passes: the sources pass 1 reads (the
+                                     * keys; rr's other staged sources dropped) */
+    uint32_t*           runs;       /* fused: [n_parts][n_chunks] (offset inside the
+                                     * chunk, length) of each partition's run, the
+                                     * count matrix transposed for phase 2 */
+    /* Compact staging (fused, not sel mode): a task stages only the staged
+     * sources' fields (srec bytes a row: keys widened, inputs at their
+     * widths) and the scatter builds each record from them, the plain
+     * columns read in place and the position.  cf[f] is field f in the
+     * record's order: the keys (cf[k] is key k's), then the inputs present,
+     * each aggregate's x then its y (n_cf in all).  Not compact: a task
+     * stages whole records. */
+    bool                compact;
+    size_t              srec;
+    uint32_t            n_cf;
+    const agg_radix_cf_t* cf;
+    /* Waves (agg_radix_wave_plan): the payload holds the records of the
+     * partitions [wave_lo, wave_hi) only, partition p's slots starting at
+     * record part_start[p] - pay_base; phase 2 runs partition part_lo + task.
+     * One pass over every partition is wave 0 = [0, n_parts), base 0. */
+    uint32_t            wave_lo, wave_hi;
+    uint32_t            part_lo;
+    int64_t             pay_base;
+    /* Top-N candidates (agg_radix_part_compact): a finished partition with
+     * more than cmp_cap groups keeps only its cmp_cap best by the filter
+     * aggregate, ties to the smaller first row.  0 = keep every group. */
+    int64_t             cmp_cap;
+    const agg_vtable_t* cmp_vt;
+    size_t              cmp_off;
+    int64_t             cmp_param;
+    uint8_t             cmp_desc;
+    _Atomic(int64_t)    cmp_parts;  /* partitions reduced (route stats) */
+    /* Spilled waves (agg_radix_spill_scatter_fn): wave_of[p] is partition
+     * p's wave; wave 0 scatters into the payload, the later waves into
+     * per-(worker, wave) buffers written to the spill file. */
+    const uint16_t*     wave_of;
+    struct agg_radix_spill_s* spill;
 } agg_radix_ctx_t;
 
 /* Avalanche finalizer shared by the radix scatter (partition selection) and
@@ -3652,38 +5977,27 @@ static inline uint64_t agg_radix_fmix64(uint64_t h) {
     return h;
 }
 
-/* Visit one ORIGINAL row r at input position `pos`.
- *
- * Pass 1 (scatter == false) hashes the key tuple, records the partition in
- * pid[pos] and counts the row in its partition's cell of this chunk's count
- * row.  Pass 2 (scatter == true) reads the partition back from pid[pos] and
- * writes the packed record at the chunk's next slot of that partition.
- *
- * Storing the partition id (2 bytes per row, freed after pass 2) instead of
- * re-hashing in pass 2 measured 15-25% faster for phase 1: the destination
- * address no longer waits on the key load -> FNV -> fmix chain, so the
- * scattered stores issue back to back, and the keys go straight from the
- * column into the record with no staging row. */
-RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
-                                int64_t r, int64_t pos, bool scatter) {
-    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
-    if (!scatter) {
-        uint64_t h = 1469598103934665603ULL;
-        for (uint32_t k = 0; k < n_keys; k++) {
-            int64_t v = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
-            h ^= (uint64_t)v; h *= 1099511628211ULL;
-        }
-        h = agg_radix_fmix64(h);
-        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
-        c->pid[pos] = (uint16_t)p;
-        cur[p]++;
-        return;
+/* agg_read_key_i64 for the plain radix loops, the column's attrs read only
+ * by a SYM key (agg_read_key_i64 passes them to the raw reader up front,
+ * and the scatter loop then loads them for every key of every row). */
+RAY_INLINE int64_t agg_radix_key_at(const ray_t* col, const void* data, int64_t row) {
+    switch (col->type) {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
+        case RAY_I16: return ((const int16_t*)data)[row];
+        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
+        case RAY_SYM: return (int64_t)ray_read_sym(data, row, RAY_SYM, col->attrs);
+        default: return 0;  /* the gate admits only the above */
     }
-    uint32_t p = c->pid[pos];
-    char* rec = c->pay + (size_t)(c->part_start[p] + cur[p]++) * c->rec;
+}
+
+/* Pack the payload record of ORIGINAL row r at input position `pos` of a
+ * plain context (whole columns). */
+RAY_INLINE void agg_radix_put(const agg_radix_ctx_t* c, char* rec, int64_t r, int64_t pos) {
+    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
     int64_t* kdst = (int64_t*)rec;
     for (uint32_t k = 0; k < n_keys; k++)
-        kdst[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+        kdst[k] = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
     int64_t input_order = pos;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (c->val_data[a]) {
@@ -3699,12 +6013,444 @@ RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
         memcpy(rec + c->row_off, &input_order, sizeof(input_order));
 }
 
-/* Run one pass over chunk `ch`: input positions [start,end) in chunk order
- * (selected-row ordinals in sel mode, decoded to original rows).  RAY_INLINE
- * and `scatter` constant at both call sites, so the count and the scatter
- * loops specialize.  A chunk's count row doubles as its pass-2 write cursors
- * and is touched only by the task running that chunk. */
-RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatter) {
+/* agg_radix_put of a staged context: row r read through view v (keys at
+ * r - base with the pieces' SYM widths, inputs from the pieces). */
+RAY_INLINE void agg_radix_put_view(const agg_radix_ctx_t* c, const agg_view_t* v, char* rec,
+                                   int64_t r, int64_t pos) {
+    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
+    const int64_t i = r - v->base;
+    int64_t* kdst = (int64_t*)rec;
+    for (uint32_t k = 0; k < n_keys; k++)
+        kdst[k] = agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i);
+    int64_t input_order = pos;
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        if (v->val_data[a]) {
+            uint8_t ez = c->val_esz[a];
+            memcpy(rec + c->val_off[a], (const char*)v->val_data[a] + (size_t)i * ez, ez);
+        }
+        if (v->val2_data[a]) {
+            uint8_t ez2 = c->val2_esz[a];
+            memcpy(rec + c->val2_off[a], (const char*)v->val2_data[a] + (size_t)i * ez2, ez2);
+        }
+    }
+    if (c->needs_row)
+        memcpy(rec + c->row_off, &input_order, sizeof(input_order));
+}
+
+/* Visit one ORIGINAL row r at input position `pos`.
+ *
+ * Pass 1 (scatter == false) hashes the key tuple, records the partition in
+ * pid[pos] and counts the row in its partition's cell of this chunk's count
+ * row.  Pass 2 (scatter == true) reads the partition back from pid[pos] and
+ * writes the packed record at the chunk's next slot of that partition; in a
+ * wave (`wave`) only a partition of [wave_lo, wave_hi) is written, at its
+ * slot less pay_base.
+ *
+ * Storing the partition id (2 bytes per row, freed after pass 2) instead of
+ * re-hashing in pass 2 measured 15-25% faster for phase 1: the destination
+ * address no longer waits on the key load -> FNV -> fmix chain, so the
+ * scattered stores issue back to back, and the keys go straight from the
+ * column into the record with no staging row. */
+RAY_INLINE void agg_radix_visit(agg_radix_ctx_t* c, uint32_t* cur,
+                                int64_t r, int64_t pos, bool scatter, bool wave) {
+    uint32_t n_keys = c->n_keys;
+    if (!scatter) {
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            int64_t v = agg_radix_key_at(c->key_cols[k], c->key_data[k], r);
+            h ^= (uint64_t)v; h *= 1099511628211ULL;
+        }
+        h = agg_radix_fmix64(h);
+        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
+        c->pid[pos] = (uint16_t)p;
+        cur[p]++;
+        return;
+    }
+    uint32_t p = c->pid[pos];
+    if (wave && (p < c->wave_lo || p >= c->wave_hi)) return;
+    agg_radix_put(c, c->pay + (size_t)(c->part_start[p] - c->pay_base + cur[p]++) * c->rec, r, pos);
+}
+
+/* agg_radix_visit of a staged context: row r read through view v (keys at
+ * r - base with the pieces' SYM widths, inputs from the pieces).  The plain
+ * loops keep the column form above (its whole-column pointers are the
+ * context's; their loads stay as they were in the hot loop). */
+RAY_INLINE void agg_radix_visit_view(agg_radix_ctx_t* c, const agg_view_t* v, uint32_t* cur,
+                                     int64_t r, int64_t pos, bool scatter, bool wave) {
+    uint32_t n_keys = c->n_keys;
+    if (!scatter) {
+        const int64_t i = r - v->base;
+        uint64_t h = 1469598103934665603ULL;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            int64_t val = agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i);
+            h ^= (uint64_t)val; h *= 1099511628211ULL;
+        }
+        h = agg_radix_fmix64(h);
+        uint32_t p = (uint32_t)(h & (c->n_parts - 1));
+        c->pid[pos] = (uint16_t)p;
+        cur[p]++;
+        return;
+    }
+    uint32_t p = c->pid[pos];
+    if (wave && (p < c->wave_lo || p >= c->wave_hi)) return;
+    agg_radix_put_view(c, v, c->pay + (size_t)(c->part_start[p] - c->pay_base + cur[p]++) * c->rec, r, pos);
+}
+
+/* The fused pass's visit of row r at position pos through view v: the
+ * hash picks the partition (recorded in the task's pid and counted, as
+ * pass 1 does) and the packed record is written at the position's slot of
+ * the task's staging buffer (as pass 2 writes it), so every source is read
+ * once.  stage and spid are indexed by pos - pos0, the chunk's first
+ * position. */
+RAY_INLINE void agg_radix_stage_view(agg_radix_ctx_t* c, const agg_view_t* v, uint32_t* cur,
+                                     char* stage, uint16_t* spid, int64_t pos0, int64_t r, int64_t pos) {
+    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
+    const int64_t i = r - v->base;
+    char* rec = stage + (size_t)(pos - pos0) * c->rec;
+    int64_t* kdst = (int64_t*)rec;
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        int64_t val = agg_read_key_i64_raw(c->key_cols[k]->type, v->key_attrs[k], v->key_data[k], i);
+        kdst[k] = val;
+        h ^= (uint64_t)val; h *= 1099511628211ULL;
+    }
+    h = agg_radix_fmix64(h);
+    uint32_t p = (uint32_t)(h & (c->n_parts - 1));
+    spid[pos - pos0] = (uint16_t)p;
+    cur[p]++;
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        if (v->val_data[a]) {
+            uint8_t ez = c->val_esz[a];
+            memcpy(rec + c->val_off[a], (const char*)v->val_data[a] + (size_t)i * ez, ez);
+        }
+        if (v->val2_data[a]) {
+            uint8_t ez2 = c->val2_esz[a];
+            memcpy(rec + c->val2_off[a], (const char*)v->val2_data[a] + (size_t)i * ez2, ez2);
+        }
+    }
+    if (c->needs_row) {
+        int64_t input_order = pos;
+        memcpy(rec + c->row_off, &input_order, sizeof(input_order));
+    }
+}
+
+/* One chunk's pass over a piece or a run, through view v: rows [b, e)
+ * (positions pos0 + (r - b)), or the selected rows rows[ib, ie) at
+ * positions pos0 + ib. */
+typedef struct {
+    agg_radix_ctx_t* c;
+    uint32_t*        cur;
+    const int64_t*   rows;      /* sel mode: the chunk's decoded rows */
+    int64_t          pos0;
+} agg_radix_run_t;
+RAY_INLINE void agg_radix_run_rows(void* raw, const agg_view_t* v, int64_t b, int64_t e,
+                                   bool scatter, bool wave) {
+    agg_radix_run_t* t = raw;
+    if (t->rows) {
+        for (int64_t i = b; i < e; i++)
+            agg_radix_visit_view(t->c, v, t->cur, t->rows[i], t->pos0 + i, scatter, wave);
+        return;
+    }
+    for (int64_t r = b; r < e; r++) agg_radix_visit_view(t->c, v, t->cur, r, r, scatter, wave);
+}
+static void agg_radix_count_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid; agg_radix_run_rows(raw, v, b, e, false, false);
+}
+static void agg_radix_scatter_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid; agg_radix_run_rows(raw, v, b, e, true, false);
+}
+static void agg_radix_wave_scatter_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid; agg_radix_run_rows(raw, v, b, e, true, true);
+}
+
+/* The fused pass's body: rows [b, e) of a piece (each row its own
+ * position), or the selected rows rows[b, e) at positions pos0 + i, staged
+ * into the task's buffers. */
+typedef struct {
+    agg_radix_ctx_t* c;
+    uint32_t*        cur;
+    const int64_t*   rows;      /* sel mode: the run's decoded rows */
+    int64_t          pos0;      /* sel mode: position of rows[0]; else 0 */
+    int64_t          chunk0;    /* the chunk's first position */
+    char*            stage;
+    uint16_t*        spid;
+} agg_radix_stage_t;
+/* Rows [b, e) of a piece staged a field at a time (the type switches out
+ * of the row loops), in blocks of at most RAY_ENC_VEC rows: each key into
+ * its record slot and the running hash, then the partitions and counts,
+ * the inputs at their widths, the positions.  The same records, ids and
+ * counts as agg_radix_stage_view row by row. */
+static void agg_radix_stage_block(agg_radix_stage_t* t, const agg_view_t* v, int64_t b, int64_t e) {
+    agg_radix_ctx_t* c = t->c;
+    const size_t rec = c->rec;
+    const int64_t i0 = b - v->base;
+    const int64_t n = e - b;
+    char* out = t->stage + (size_t)(b - t->chunk0) * rec;
+    uint16_t* spid = t->spid + (b - t->chunk0);
+    uint64_t h[RAY_ENC_VEC];
+    for (int64_t i = 0; i < n; i++) h[i] = 1469598103934665603ULL;
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        const void* kd = v->key_data[k];
+        char* kp = out + (size_t)k * 8;
+        #define STAGE_KEY(T) do { const T* src = (const T*)kd + i0;                    \
+            for (int64_t i = 0; i < n; i++) {                                          \
+                int64_t val = (int64_t)src[i];                                         \
+                memcpy(kp + (size_t)i * rec, &val, 8);                                 \
+                h[i] = (h[i] ^ (uint64_t)val) * 1099511628211ULL;                      \
+            } } while (0)
+        switch (c->key_cols[k]->type) {
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: STAGE_KEY(int32_t); break;
+            case RAY_I16: STAGE_KEY(int16_t); break;
+            case RAY_U8: case RAY_BOOL: STAGE_KEY(uint8_t); break;
+            case RAY_SYM:
+                switch (v->key_attrs[k] & RAY_SYM_W_MASK) {
+                    case RAY_SYM_W8: STAGE_KEY(uint8_t); break;
+                    case RAY_SYM_W16: STAGE_KEY(uint16_t); break;
+                    case RAY_SYM_W32: STAGE_KEY(uint32_t); break;
+                    default: STAGE_KEY(int64_t); break;
+                }
+                break;
+            default: for (int64_t i = 0; i < n; i++) { memset(kp + (size_t)i * rec, 0, 8); h[i] *= 1099511628211ULL; }
+        }
+        #undef STAGE_KEY
+    }
+    const uint32_t mask = c->n_parts - 1;
+    uint32_t* cur = t->cur;
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t p = (uint32_t)(agg_radix_fmix64(h[i]) & mask);
+        spid[i] = (uint16_t)p;
+        cur[p]++;
+    }
+    #define STAGE_FIELD(src, off, ez) do {                                             \
+        const char* sp = (const char*)(src) + (size_t)i0 * (ez);                       \
+        char* dp = out + (off);                                                        \
+        switch (ez) {                                                                  \
+            case 1: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * rec, sp + i, 1); break;     \
+            case 2: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * rec, sp + 2 * i, 2); break; \
+            case 4: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * rec, sp + 4 * i, 4); break; \
+            case 8: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * rec, sp + 8 * i, 8); break; \
+            default: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * rec, sp + (size_t)i * (ez), (ez)); \
+        } } while (0)
+    for (uint32_t a = 0; a < c->n_aggs; a++) {
+        if (v->val_data[a]) STAGE_FIELD(v->val_data[a], c->val_off[a], c->val_esz[a]);
+        if (v->val2_data[a]) STAGE_FIELD(v->val2_data[a], c->val2_off[a], c->val2_esz[a]);
+    }
+    #undef STAGE_FIELD
+    if (c->needs_row) {
+        char* rp = out + c->row_off;
+        for (int64_t i = 0; i < n; i++) { int64_t pos = b + i; memcpy(rp + (size_t)i * rec, &pos, 8); }
+    }
+}
+static void agg_radix_stage_block_c(agg_radix_stage_t* t, const agg_view_t* v, int64_t b, int64_t e);
+static void agg_radix_stage_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    agg_radix_stage_t* t = raw;
+    if (t->rows) {
+        for (int64_t i = b; i < e; i++)
+            agg_radix_stage_view(t->c, v, t->cur, t->stage, t->spid, t->chunk0, t->rows[i], t->pos0 + i);
+        return;
+    }
+    if (t->c->compact) {
+        for (int64_t r = b; r < e; r += RAY_ENC_VEC)
+            agg_radix_stage_block_c(t, v, r, e - r < RAY_ENC_VEC ? e : r + RAY_ENC_VEC);
+        return;
+    }
+    for (int64_t r = b; r < e; r += RAY_ENC_VEC)
+        agg_radix_stage_block(t, v, r, e - r < RAY_ENC_VEC ? e : r + RAY_ENC_VEC);
+}
+
+/* Copy n records of `rec` bytes from the staging buffer to their slots:
+ * the chunk's partition runs, starting at wcur (offsets inside the chunk's
+ * record range at dst).  Fixed record sizes copy with constant widths. */
+static void agg_radix_stage_scatter(char* dst, const char* stage, const uint16_t* spid,
+                                    uint32_t* wcur, int64_t n, size_t rec) {
+    #define STAGE_COPY(W) for (int64_t i = 0; i < n; i++) \
+        memcpy(dst + (size_t)wcur[spid[i]]++ * (W), stage + (size_t)i * (W), (W))
+    switch (rec) {
+        case 16: STAGE_COPY(16); break;
+        case 24: STAGE_COPY(24); break;
+        case 32: STAGE_COPY(32); break;
+        case 40: STAGE_COPY(40); break;
+        case 48: STAGE_COPY(48); break;
+        default:                                /* records are 8-aligned: word copies, no call */
+            for (int64_t i = 0; i < n; i++) {
+                char* d = dst + (size_t)wcur[spid[i]]++ * rec;
+                const char* s = stage + (size_t)i * rec;
+                for (size_t w = 0; w < rec; w += 8) memcpy(d + w, s + w, 8);
+            }
+            break;
+    }
+    #undef STAGE_COPY
+}
+
+/* agg_radix_stage_block of a compact context: rows [b, e) of a piece,
+ * hashed over every key (plain ones read in place through the view), the
+ * staged sources' fields copied into the staged rows (srec bytes each),
+ * the partitions and counts recorded.  The plain fields and the positions
+ * are left to agg_radix_scatter_compact. */
+static void agg_radix_stage_block_c(agg_radix_stage_t* t, const agg_view_t* v, int64_t b, int64_t e) {
+    agg_radix_ctx_t* c = t->c;
+    const size_t srec = c->srec;
+    const int64_t i0 = b - v->base;
+    const int64_t n = e - b;
+    char* out = t->stage + (size_t)(b - t->chunk0) * srec;
+    uint16_t* spid = t->spid + (b - t->chunk0);
+    uint64_t h[RAY_ENC_VEC];
+    for (int64_t i = 0; i < n; i++) h[i] = 1469598103934665603ULL;
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        const void* kd = v->key_data[k];
+        const agg_radix_cf_t* f = &c->cf[k];
+        char* kp = out + f->soff;
+        if (f->kind == AGG_CF_STAGED) {
+            #define STAGE_KEY(T) do { const T* src = (const T*)kd + i0;                \
+                for (int64_t i = 0; i < n; i++) {                                      \
+                    int64_t val = (int64_t)src[i];                                     \
+                    memcpy(kp + (size_t)i * srec, &val, 8);                            \
+                    h[i] = (h[i] ^ (uint64_t)val) * 1099511628211ULL;                  \
+                } } while (0)
+            switch (c->key_cols[k]->type) {
+                case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: STAGE_KEY(int64_t); break;
+                case RAY_I32: case RAY_DATE: case RAY_TIME: STAGE_KEY(int32_t); break;
+                case RAY_I16: STAGE_KEY(int16_t); break;
+                case RAY_U8: case RAY_BOOL: STAGE_KEY(uint8_t); break;
+                case RAY_SYM:
+                    switch (v->key_attrs[k] & RAY_SYM_W_MASK) {
+                        case RAY_SYM_W8: STAGE_KEY(uint8_t); break;
+                        case RAY_SYM_W16: STAGE_KEY(uint16_t); break;
+                        case RAY_SYM_W32: STAGE_KEY(uint32_t); break;
+                        default: STAGE_KEY(int64_t); break;
+                    }
+                    break;
+                default: for (int64_t i = 0; i < n; i++) { memset(kp + (size_t)i * srec, 0, 8); h[i] *= 1099511628211ULL; }
+            }
+            #undef STAGE_KEY
+            continue;
+        }
+        #define HASH_KEY(T) do { const T* src = (const T*)kd + i0;                     \
+            for (int64_t i = 0; i < n; i++)                                            \
+                h[i] = (h[i] ^ (uint64_t)(int64_t)src[i]) * 1099511628211ULL; } while (0)
+        switch (f->kind) {
+            case AGG_CF_KEY_I64: HASH_KEY(int64_t); break;
+            case AGG_CF_KEY_I32: HASH_KEY(int32_t); break;
+            case AGG_CF_KEY_I16: HASH_KEY(int16_t); break;
+            case AGG_CF_KEY_U8:  HASH_KEY(uint8_t); break;
+            case AGG_CF_KEY_U16: HASH_KEY(uint16_t); break;
+            case AGG_CF_KEY_U32: HASH_KEY(uint32_t); break;
+            default: for (int64_t i = 0; i < n; i++) h[i] *= 1099511628211ULL;
+        }
+        #undef HASH_KEY
+    }
+    const uint32_t mask = c->n_parts - 1;
+    uint32_t* cur = t->cur;
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t p = (uint32_t)(agg_radix_fmix64(h[i]) & mask);
+        spid[i] = (uint16_t)p;
+        cur[p]++;
+    }
+    /* the staged inputs: each field names its aggregate and side */
+    for (uint32_t fi = c->n_keys; fi < c->n_cf; fi++) {
+        const agg_radix_cf_t* f = &c->cf[fi];
+        if (f->kind != AGG_CF_STAGED) continue;
+        const void* vd = f->y ? v->val2_data[f->agg] : v->val_data[f->agg];
+        const char* sp = (const char*)vd + (size_t)i0 * f->w;
+        char* dp = out + f->soff;
+        switch (f->w) {
+            case 1: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + i, 1); break;
+            case 2: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 2 * i, 2); break;
+            case 4: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 4 * i, 4); break;
+            case 8: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + 8 * i, 8); break;
+            default: for (int64_t i = 0; i < n; i++) memcpy(dp + (size_t)i * srec, sp + (size_t)i * f->w, f->w);
+        }
+    }
+}
+
+/* The scatter of a compact chunk: n staged rows (positions pos0 ..) to
+ * their slots at wcur (offsets inside the chunk's record range at dst),
+ * each record built as the two passes' scatter builds it: the staged
+ * fields from the staged row, the plain ones read in place at the row,
+ * the position. */
+static void agg_radix_scatter_compact(const agg_radix_ctx_t* c, char* dst, const char* stage,
+                                      const uint16_t* spid, uint32_t* wcur, int64_t pos0, int64_t n) {
+    const size_t rec = c->rec, srec = c->srec;
+    const uint32_t nf = c->n_cf;
+    const agg_radix_cf_t* cf = c->cf;
+    const size_t row_off = c->row_off;
+    const bool needs_row = c->needs_row;
+    for (int64_t i = 0; i < n; i++) {
+        char* d = dst + (size_t)wcur[spid[i]]++ * rec;
+        const char* sr = stage + (size_t)i * srec;
+        const int64_t r = pos0 + i;
+        for (uint32_t fi = 0; fi < nf; fi++) {
+            const agg_radix_cf_t* f = &cf[fi];
+            int64_t kv;
+            switch (f->kind) {
+                case AGG_CF_STAGED:
+                    switch (f->w) {
+                        case 1: memcpy(d + f->off, sr + f->soff, 1); break;
+                        case 2: memcpy(d + f->off, sr + f->soff, 2); break;
+                        case 4: memcpy(d + f->off, sr + f->soff, 4); break;
+                        case 8: memcpy(d + f->off, sr + f->soff, 8); break;
+                        default: memcpy(d + f->off, sr + f->soff, f->w);
+                    }
+                    continue;
+                case AGG_CF_KEY_I64: kv = ((const int64_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_I32: kv = ((const int32_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_I16: kv = ((const int16_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_U8:  kv = ((const uint8_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_U16: kv = ((const uint16_t*)f->plain)[r]; break;
+                case AGG_CF_KEY_U32: kv = ((const uint32_t*)f->plain)[r]; break;
+                default:
+                    memcpy(d + f->off, f->plain + (size_t)r * f->esz, f->esz);
+                    continue;
+            }
+            memcpy(d + f->off, &kv, 8);
+        }
+        if (needs_row) memcpy(d + row_off, &r, sizeof r);
+    }
+}
+
+/* The staged form of one pass over chunk ch (out of line: the plain loops
+ * below stay as compact as they were): pieces of the chunk's rows (R-WALK),
+ * or runs of its selected rows (R-SPARSE), through the task's cursors cs
+ * (the chunks of one task are consecutive); a range error is noted keyed
+ * by the chunk's first position.  A wave's scatter (`wave`) writes only the
+ * records of its partitions. */
+static void agg_radix_chunk_staged(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, bool scatter, bool wave,
+                                   agg_curs_t* cs) {
+    int64_t start = ch * c->chunk_rows;
+    int64_t end = start + c->chunk_rows;
+    if (end > c->n_in) end = c->n_in;
+    uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+    if (!scatter) memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
+    const agg_rr_t* rr = scatter ? c->rr : c->count_rr;   /* pass 1 hashes the keys only */
+    agg_body_fn body = !scatter ? agg_radix_count_rows
+                     : wave ? agg_radix_wave_scatter_rows : agg_radix_scatter_rows;
+    if (!c->sel) {
+        agg_radix_run_t t = { c, cur, NULL, 0 };
+        (void)agg_walk_cs(rr, cs, &t, body, wid, start, end, start);
+        return;
+    }
+    if (ray_scan_fail_skip(rr->fail, start)) return;
+    int64_t rows[AGG_SEL_CHUNK];
+    agg_sel_cursor_t sc;
+    agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, start, end);
+    int64_t pos = start, cn;
+    while ((cn = agg_sel_cursor_next(&sc, rows)) > 0) {
+        agg_radix_run_t t = { c, cur, rows, pos };
+        ray_t* err = agg_idx_walk(rr, cs, rows, 0, cn, &t, body, wid);
+        if (err) { ray_scan_fail_note(rr->fail, start, err); break; }
+        pos += cn;
+    }
+}
+
+/* Run one pass over chunk `ch` of a plain context (whole columns): input
+ * positions [start,end) in chunk order (selected-row ordinals in sel mode,
+ * decoded to original rows).  RAY_INLINE and `scatter` constant at every
+ * call site, so the count and the scatter loops specialize.  A chunk's
+ * count row doubles as its pass-2 write cursors and is touched only by the
+ * task running that chunk.  A staged context runs agg_radix_chunk_staged. */
+RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatter, bool wave) {
     int64_t start = ch * c->chunk_rows;
     int64_t end = start + c->chunk_rows;
     if (end > c->n_in) end = c->n_in;
@@ -3718,7 +6464,7 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
         int64_t cn;
         while ((cn = agg_sel_cursor_next(&sc, rows)) > 0)
             for (int64_t i = 0; i < cn; i++)
-                agg_radix_visit(c, cur, rows[i], pos++, scatter);
+                agg_radix_visit(c, cur, rows[i], pos++, scatter, wave);
         return;
     }
     /* Keep the next rows requested from storage, block by block (scan
@@ -3728,15 +6474,46 @@ RAY_INLINE void agg_radix_chunk_pass(agg_radix_ctx_t* c, int64_t ch, bool scatte
         int64_t e = end - b > 8192 ? b + 8192 : end;
         ray_pool_scan_at(c->n_in, b, end);
         for (int64_t r = b; r < e; r++)
-            agg_radix_visit(c, cur, r, r, scatter);
+            agg_radix_visit(c, cur, r, r, scatter, wave);
     }
+}
+
+/* One cursor set per task call (staged sources), over its consecutive chunks;
+ * on OOM the first chunk's failure is noted and the call does nothing. */
+static bool agg_radix_task_curs(agg_radix_ctx_t* c, int64_t ch0, agg_curs_t* cs) {
+    cs->cur = NULL;
+    if (!c->rr->staged || agg_curs_init(cs, c->rr)) return true;
+    ray_scan_fail_note(c->rr->fail, ch0 * c->chunk_rows, ray_error("oom", NULL));
+    return false;
+}
+
+/* One task call of a pass over its consecutive chunks [start,end).  One
+ * body, two instances per pass (`staged` constant): the plain instance is
+ * the whole-column chunk loop and never builds or touches a cursor set, so
+ * its codegen is the pre-range-read one; the staged instance holds one
+ * cursor set across its chunks.  The dispatch picks the instance from the
+ * context (agg_radix_count_fn or _count_staged_fn, and likewise for the
+ * scatter). */
+RAY_INLINE void agg_radix_pass_body(agg_radix_ctx_t* c, uint32_t wid, int64_t start, int64_t end,
+                                    bool scatter, bool wave, const bool staged) {
+    if (!staged) {
+        for (int64_t ch = start; ch < end; ch++)
+            agg_radix_chunk_pass(c, ch, scatter, wave);
+        return;
+    }
+    agg_curs_t cs;
+    if (!agg_radix_task_curs(c, start, &cs)) return;
+    for (int64_t ch = start; ch < end; ch++)
+        agg_radix_chunk_staged(c, ch, wid, scatter, wave, &cs);
+    agg_curs_free(&cs, c->rr);
 }
 
 /* Phase 1, pass 1: count each chunk's rows per partition. */
 static void agg_radix_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_pass((agg_radix_ctx_t*)vctx, ch, false);
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, false, false);
+}
+static void agg_radix_count_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, false, false, true);
 }
 
 /* Phase 1, prefix: for a band of partitions, turn every chunk's count into
@@ -3771,9 +6548,388 @@ static void agg_radix_prefix_fn(void* vctx, uint32_t wid, int64_t start, int64_t
 
 /* Phase 1, pass 2: write each chunk's packed records at their exact slots. */
 static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, false, false);
+}
+static void agg_radix_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, false, true);
+}
+
+/* Pass 2 of one wave: the same walk, writing only the records of the
+ * partitions [wave_lo, wave_hi).  Each partition belongs to one wave, so its
+ * chunk cursors advance exactly as in the one-pass scatter and its records
+ * land in the same order. */
+static void agg_radix_wave_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, true, false);
+}
+static void agg_radix_wave_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_pass_body((agg_radix_ctx_t*)vctx, wid, start, end, true, true, true);
+}
+
+/* The fused pass over chunk ch (a staged context, chunk-major payload):
+ * the chunk is read once (pieces, or runs of its selected rows) into the
+ * task's staging buffers, its count row becomes the chunk-local exclusive
+ * prefix (each partition's offset inside the chunk's record range), and
+ * the staged records are scattered there.  A range error is noted keyed by
+ * the chunk's first position, and the chunk is not scattered. */
+static void agg_radix_chunk_fused(agg_radix_ctx_t* c, int64_t ch, uint32_t wid, agg_curs_t* cs,
+                                  char* stage, uint16_t* spid, uint32_t* wcur) {
+    const agg_rr_t* rr = c->rr;
+    int64_t start = ch * c->chunk_rows;
+    int64_t end = start + c->chunk_rows;
+    if (end > c->n_in) end = c->n_in;
+    uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+    memset(cur, 0, (size_t)c->n_parts * sizeof(uint32_t));
+    agg_radix_stage_t t = { c, cur, NULL, 0, start, stage, spid };
+    if (!c->sel) {
+        if (!agg_walk_cs(rr, cs, &t, agg_radix_stage_rows, wid, start, end, start)) return;
+    } else {
+        if (ray_scan_fail_skip(rr->fail, start)) return;
+        int64_t rows[AGG_SEL_CHUNK];
+        agg_sel_cursor_t sc;
+        agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, start, end);
+        int64_t pos = start, cn;
+        while ((cn = agg_sel_cursor_next(&sc, rows)) > 0) {
+            t.rows = rows; t.pos0 = pos;
+            ray_t* err = agg_idx_walk(rr, cs, rows, 0, cn, &t, agg_radix_stage_rows, wid);
+            if (err) { ray_scan_fail_note(rr->fail, start, err); return; }
+            pos += cn;
+        }
+    }
+    uint32_t run = 0;
+    for (uint32_t p = 0; p < c->n_parts; p++) {
+        uint32_t n = cur[p];
+        cur[p] = wcur[p] = run;
+        run += n;
+    }
+    if (c->compact)
+        agg_radix_scatter_compact(c, c->pay + (size_t)start * c->rec, stage, spid, wcur, start, end - start);
+    else
+        agg_radix_stage_scatter(c->pay + (size_t)start * c->rec, stage, spid, wcur, end - start, c->rec);
+}
+
+/* Phase 1 of a fused context: one task call's consecutive chunks (a few
+ * tasks per worker, so a vector a chunk boundary cuts is decoded once per
+ * task, not per chunk) through one cursor set and one set of staging
+ * buffers (a chunk's records, its
+ * partition ids, the partitions' write cursors), allocated by the call
+ * and freed by it; on OOM the first chunk's failure is noted. */
+static void agg_radix_fused_fn(void* vctx, uint32_t wid, int64_t g0, int64_t g1) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    /* tasks g0..g1 of fused_tasks, each a run of consecutive chunks */
+    int64_t start = (int64_t)((uint64_t)g0 * c->n_chunks / c->fused_tasks);
+    int64_t end = (int64_t)((uint64_t)g1 * c->n_chunks / c->fused_tasks);
+    if (start >= end) return;
+    agg_curs_t cs;
+    if (!agg_radix_task_curs(c, start, &cs)) return;
+    char* stage = ray_alloc_raw((size_t)c->chunk_rows * (c->compact ? (c->srec ? c->srec : 1) : c->rec));
+    uint16_t* spid = ray_alloc_raw((size_t)c->chunk_rows * sizeof(uint16_t));
+    uint32_t* wcur = ray_alloc_raw((size_t)c->n_parts * sizeof(uint32_t));
+    if (!stage || !spid || !wcur)
+        ray_scan_fail_note(c->rr->fail, start * c->chunk_rows, ray_error("oom", NULL));
+    else
+        for (int64_t ch = start; ch < end; ch++)
+            agg_radix_chunk_fused(c, ch, wid, &cs, stage, spid, wcur);
+    ray_free_raw(stage); ray_free_raw(spid); ray_free_raw(wcur);
+    agg_curs_free(&cs, c->rr);
+}
+
+/* A fused context's partition totals, for a band of partitions: the sum of
+ * every chunk's run length (the next partition's offset, or the chunk's
+ * row count for the last), stored in part_start[p + 1] for the caller's
+ * scan (as agg_radix_prefix_fn stores them); each run's offset and length
+ * also go to the partition's row of runs, which phase 2 reads in order. */
+static void agg_radix_fused_totals_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
-    for (int64_t ch = start; ch < end; ch++)
-        agg_radix_chunk_pass((agg_radix_ctx_t*)vctx, ch, true);
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    for (int64_t band = start; band < end; band++) {
+        uint32_t p0 = (uint32_t)band * AGG_RADIX_PREFIX_BAND;
+        uint32_t np = c->n_parts - p0;
+        if (np > AGG_RADIX_PREFIX_BAND) np = AGG_RADIX_PREFIX_BAND;
+        uint64_t run[AGG_RADIX_PREFIX_BAND] = {0};
+        for (uint32_t ch = 0; ch < c->n_chunks; ch++) {
+            const uint32_t* row = c->cnt + (size_t)ch * c->n_parts;
+            int64_t cs = (int64_t)ch * c->chunk_rows;
+            int64_t clen = (cs + c->chunk_rows < c->n_in ? cs + c->chunk_rows : c->n_in) - cs;
+            for (uint32_t j = 0; j < np; j++) {
+                uint32_t p = p0 + j;
+                uint64_t next = p + 1 < c->n_parts ? row[p + 1] : (uint64_t)clen;
+                uint32_t* rp = c->runs + ((size_t)p * c->n_chunks + ch) * 2;
+                rp[0] = row[p];
+                rp[1] = (uint32_t)(next - row[p]);
+                run[j] += next - row[p];
+            }
+        }
+        for (uint32_t j = 0; j < np; j++) {
+            if (run[j] > UINT32_MAX)
+                atomic_store_explicit(&c->part_overflow, 1, memory_order_relaxed);
+            c->part_start[p0 + j + 1] = (int64_t)run[j];
+        }
+    }
+}
+
+/* Reduce a finished partition to the groups a top-N emit can select.
+ *
+ * agg_radix_select_topn keeps every group strictly beyond the threshold T
+ * (the N-th value, N = take) and, of the groups AT T, the N with the
+ * smallest first row; it emits them in first-row order.  Rank the groups by
+ * (value in the keep direction, then smaller first row) — a total order,
+ * first rows being distinct.  The kept set is a prefix of that order no
+ * longer than 2N - 1: fewer than N groups lie strictly beyond T, then come
+ * the tied ones by first row.  Every group of that prefix ranks below 2N
+ * inside its own partition too (only prefix members rank ahead of it), so a
+ * partition that keeps its 2N best (cmp_cap) loses no kept group, and the
+ * union of the survivors still holds the N best values, so the selection
+ * over the survivors finds the same T, the same strict groups and the same
+ * tied ones: the emitted rows are byte-identical.  States are copied as they
+ * are (streaming accumulators, no destroy hook) and so are their keys and
+ * first rows.  On an allocation failure the partition keeps every group,
+ * which is the unreduced, equally valid input of the same selection. */
+static void agg_radix_part_compact(agg_radix_ctx_t* c, char** states,
+                                   int64_t** first_row, int64_t** gkeys, int64_t* ngp) {
+    int64_t ng = *ngp, cap = c->cmp_cap;
+    if (cap <= 0 || ng <= cap) return;
+    uint32_t n_keys = c->n_keys;
+    size_t kw = (size_t)(n_keys ? n_keys : 1);
+    double*  vals = ray_alloc_raw((size_t)ng * sizeof(double));
+    int64_t* heap = ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    if (!vals || !heap ||
+        !agg_group_values_f64(c->cmp_vt, *states, c->block, c->cmp_off, NULL, ng,
+                              c->cmp_param, vals)) {
+        ray_free_raw(vals); ray_free_raw(heap);
+        return;
+    }
+    const int64_t* fr = *first_row;
+    uint8_t desc = c->cmp_desc;
+    /* i ranks after j: worse value, or the same value seen later. */
+    #define CMP_AFTER(i, j) ((desc ? vals[i] < vals[j] : vals[i] > vals[j]) || \
+                             (vals[i] == vals[j] && fr[i] > fr[j]))
+    int64_t hn = 0;
+    for (int64_t gg = 0; gg < ng; gg++) {        /* root = the last kept */
+        if (hn < cap) {
+            int64_t j = hn++;
+            heap[j] = gg;
+            while (j > 0) {
+                int64_t par = (j - 1) / 2;
+                if (!CMP_AFTER(heap[j], heap[par])) break;
+                int64_t t = heap[par]; heap[par] = heap[j]; heap[j] = t; j = par;
+            }
+        } else if (CMP_AFTER(heap[0], gg)) {
+            heap[0] = gg;
+            for (int64_t j = 0;;) {
+                int64_t l = 2 * j + 1, r = l + 1, m = j;
+                if (l < cap && CMP_AFTER(heap[l], heap[m])) m = l;
+                if (r < cap && CMP_AFTER(heap[r], heap[m])) m = r;
+                if (m == j) break;
+                int64_t t = heap[m]; heap[m] = heap[j]; heap[j] = t; j = m;
+            }
+        }
+    }
+    #undef CMP_AFTER
+    ray_free_raw(vals);
+    char*    ns = ray_alloc_raw((size_t)cap * c->block);
+    int64_t* nk = ray_alloc_raw((size_t)cap * kw * sizeof(int64_t));
+    int64_t* nf = ray_alloc_raw((size_t)cap * sizeof(int64_t));
+    if (!ns || !nk || !nf) {
+        ray_free_raw(ns); ray_free_raw(nk); ray_free_raw(nf); ray_free_raw(heap);
+        return;
+    }
+    for (int64_t i = 0; i < cap; i++) {
+        int64_t gg = heap[i];
+        memcpy(ns + (size_t)i * c->block, *states + (size_t)gg * c->block, c->block);
+        memcpy(nk + (size_t)i * kw, *gkeys + (size_t)gg * kw, kw * sizeof(int64_t));
+        nf[i] = fr[gg];
+    }
+    ray_free_raw(heap);
+    ray_free_raw(*states); ray_free_raw(*gkeys); ray_free_raw(*first_row);
+    *states = ns; *gkeys = nk; *first_row = nf; *ngp = cap;
+    atomic_fetch_add_explicit(&c->cmp_parts, 1, memory_order_relaxed);
+}
+
+#if AGG_RADIX_FILE_SPILL
+static bool agg_spill_pwrite(int fd, const char* p, size_t n, int64_t off) {
+    while (n) {
+        ssize_t w = pwrite(fd, p, n, (off_t)off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        p += w; off += w; n -= (size_t)w;
+    }
+    return true;
+}
+static bool agg_spill_pread(int fd, char* p, size_t n, int64_t off) {
+    while (n) {
+        ssize_t r = pread(fd, p, n, (off_t)off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        p += r; off += r; n -= (size_t)r;
+    }
+    return true;
+}
+#endif
+
+/* The spill file: unlinked as soon as it is open, in the heap's spill
+ * directory (RAY_HEAP_SWAP, else TMPDIR, else /tmp — as heap_swap_dir). */
+static int agg_radix_spill_open(void) {
+#if AGG_RADIX_FILE_SPILL
+    static _Atomic(uint64_t) ctr = 0;
+    const char* d = getenv("RAY_HEAP_SWAP");
+    if (!(d && *d)) d = getenv("TMPDIR");
+    if (!(d && *d) || strlen(d) > 400) d = "/tmp";
+    size_t dl = strlen(d);
+    char path[512];
+    snprintf(path, sizeof path, "%s%sraygroup_%d_%llu.dat", d, d[dl - 1] == '/' ? "" : "/",
+             (int)getpid(),
+             (unsigned long long)atomic_fetch_add_explicit(&ctr, 1, memory_order_relaxed));
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd >= 0) unlink(path);
+    return fd;
+#else
+    return -1;
+#endif
+}
+
+/* Append a full (or the last) buffer of one wave as one block. */
+static void agg_radix_spill_flush(agg_radix_spill_t* s, agg_radix_sbuf_t* b, uint32_t wave) {
+    if (!b->n) return;
+#if AGG_RADIX_FILE_SPILL
+    size_t rb = (size_t)b->n * s->rec, sb = (size_t)b->n * sizeof(uint32_t);
+    int64_t bi = atomic_fetch_add_explicit(&s->n_blks, 1, memory_order_relaxed);
+    int64_t off = atomic_fetch_add_explicit(&s->tail, (int64_t)(rb + sb), memory_order_relaxed);
+    if (bi >= s->blk_cap || ray_agg_radix_spill == 4 ||
+        !agg_spill_pwrite(s->fd, b->buf, rb, off) ||
+        !agg_spill_pwrite(s->fd, b->buf + (size_t)s->bcap * s->rec, sb, off + (int64_t)rb))
+        atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+    else
+        s->blks[bi] = (agg_radix_blk_t){ off, b->n, wave };
+#else
+    (void)wave;
+    atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+#endif
+    b->n = 0;
+}
+
+/* Where a spilled run scatters input position pos: wave 0 to its payload
+ * slot, a later wave to the next record of this worker's buffer, with the
+ * slot it will take when read back stored beside it (a full buffer is
+ * flushed first).  The chunk cursors advance for every partition exactly as
+ * in the one-pass scatter, so every record's slot is the one-pass slot less
+ * its wave base. */
+RAY_INLINE char* agg_radix_spill_dst(agg_radix_ctx_t* c, uint32_t* cur,
+                                     agg_radix_sbuf_t* wb, int64_t pos) {
+    agg_radix_spill_t* s = c->spill;
+    uint32_t p = c->pid[pos];
+    uint32_t w = c->wave_of[p];
+    int64_t slot = c->part_start[p] - s->wave_base[w] + cur[p]++;
+    if (w == 0) return c->pay + (size_t)slot * c->rec;
+    agg_radix_sbuf_t* b = &wb[w];
+    if (b->n == s->bcap) agg_radix_spill_flush(s, b, w);
+    ((uint32_t*)(void*)(b->buf + (size_t)s->bcap * c->rec))[b->n] = (uint32_t)slot;
+    return b->buf + (size_t)b->n++ * c->rec;
+}
+
+/* The spilled scatter of a plain context (whole columns). */
+static void agg_radix_spill_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_radix_sbuf_t* wb = c->spill->bufs + (size_t)wid * c->spill->n_waves;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t cs = ch * c->chunk_rows, ce = cs + c->chunk_rows;
+        if (ce > c->n_in) ce = c->n_in;
+        uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+        if (c->sel) {
+            int64_t rows[AGG_SEL_CHUNK];
+            agg_sel_cursor_t sc;
+            agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, cs, ce);
+            int64_t pos = cs, cn;
+            while ((cn = agg_sel_cursor_next(&sc, rows)) > 0)
+                for (int64_t i = 0; i < cn; i++, pos++)
+                    agg_radix_put(c, agg_radix_spill_dst(c, cur, wb, pos), rows[i], pos);
+            continue;
+        }
+        for (int64_t b = cs; b < ce; b += 8192) {
+            int64_t e = ce - b > 8192 ? b + 8192 : ce;
+            ray_pool_scan_at(c->n_in, b, ce);
+            for (int64_t r = b; r < e; r++)
+                agg_radix_put(c, agg_radix_spill_dst(c, cur, wb, r), r, r);
+        }
+    }
+}
+
+/* The spilled scatter of a staged context: rows read through views, as
+ * agg_radix_chunk_staged reads them; a range error is noted keyed by the
+ * chunk's first position and leaves the chunk unscattered. */
+typedef struct {
+    agg_radix_ctx_t*  c;
+    uint32_t*         cur;
+    const int64_t*    rows;      /* sel mode: the chunk's decoded rows */
+    int64_t           pos0;
+    agg_radix_sbuf_t* wb;
+} agg_radix_spill_rows_t;
+static void agg_radix_spill_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    agg_radix_spill_rows_t* t = raw;
+    if (t->rows) {
+        for (int64_t i = b; i < e; i++) {
+            int64_t pos = t->pos0 + i;
+            agg_radix_put_view(t->c, v, agg_radix_spill_dst(t->c, t->cur, t->wb, pos), t->rows[i], pos);
+        }
+        return;
+    }
+    for (int64_t r = b; r < e; r++)
+        agg_radix_put_view(t->c, v, agg_radix_spill_dst(t->c, t->cur, t->wb, r), r, r);
+}
+static void agg_radix_spill_scatter_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    const agg_rr_t* rr = c->rr;
+    agg_radix_sbuf_t* wb = c->spill->bufs + (size_t)wid * c->spill->n_waves;
+    agg_curs_t curs;
+    if (!agg_radix_task_curs(c, start, &curs)) return;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t cs = ch * c->chunk_rows, ce = cs + c->chunk_rows;
+        if (ce > c->n_in) ce = c->n_in;
+        uint32_t* cur = c->cnt + (size_t)ch * c->n_parts;
+        if (!c->sel) {
+            agg_radix_spill_rows_t t = { c, cur, NULL, 0, wb };
+            (void)agg_walk_cs(rr, &curs, &t, agg_radix_spill_rows, wid, cs, ce, cs);
+            continue;
+        }
+        if (ray_scan_fail_skip(rr->fail, cs)) continue;
+        int64_t rows[AGG_SEL_CHUNK];
+        agg_sel_cursor_t sc;
+        agg_sel_cursor_init(&sc, c->sel, c->sel_prefix, cs, ce);
+        int64_t pos = cs, cn;
+        while ((cn = agg_sel_cursor_next(&sc, rows)) > 0) {
+            agg_radix_spill_rows_t t = { c, cur, rows, pos, wb };
+            ray_t* err = agg_idx_walk(rr, &curs, rows, 0, cn, &t, agg_radix_spill_rows, wid);
+            if (err) { ray_scan_fail_note(rr->fail, cs, err); break; }
+            pos += cn;
+        }
+    }
+    agg_curs_free(&curs, rr);
+}
+
+/* Read the blocks of one wave back into their payload slots. */
+static void agg_radix_readback_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_radix_spill_t* s = c->spill;
+#if AGG_RADIX_FILE_SPILL
+    char* rb = s->rbuf + (size_t)wid * s->rstride;
+    for (int64_t i = start; i < end; i++) {
+        const agg_radix_blk_t* bk = &s->blks[s->wave_blks[i]];
+        size_t rbytes = (size_t)bk->n * c->rec;
+        if (ray_agg_radix_spill == 5)   /* test fault: the pool is cancelled mid read-back */
+            atomic_store_explicit(&ray_pool_get()->cancelled, 1, memory_order_relaxed);
+        if (ray_agg_radix_spill == 3 ||
+            !agg_spill_pread(s->fd, rb, rbytes + (size_t)bk->n * sizeof(uint32_t), bk->off)) {
+            atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+            continue;
+        }
+        const uint32_t* slots = (const uint32_t*)(const void*)(rb + rbytes);
+        for (uint32_t j = 0; j < bk->n; j++)
+            memcpy(c->pay + (size_t)slots[j] * c->rec, rb + (size_t)j * c->rec, c->rec);
+    }
+#else
+    (void)wid; (void)start; (void)end;
+    atomic_store_explicit(&s->err, 1, memory_order_relaxed);
+#endif
 }
 
 /* Phase 2: group + accumulate one partition by walking its packed payload
@@ -3782,15 +6938,19 @@ static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_
  * contiguous packed keys at the head of each record (no scattered key-column
  * re-reads), and each agg's dense value buffer is gathered straight from the
  * records in the same sequential pass.  Keys are disjoint from other
- * partitions so the partition-local open-addressing hash suffices. */
+ * partitions so the partition-local open-addressing hash suffices.  Under a
+ * top-N emit (cmp_cap) the finished partition is cut to its candidates
+ * (agg_radix_part_compact) before it is published. */
 static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
     size_t key_bytes = (size_t)n_keys * 8;
     for (int64_t pi = start; pi < end; pi++) {
-        uint32_t p = (uint32_t)pi;
+        uint32_t p = c->part_lo + (uint32_t)pi;
         agg_radix_part_t* pr = &c->parts[p];
+        if (ray_agg_radix_spill == 6 && c->pay_base > 0)   /* test fault: cancelled in a later wave */
+            atomic_store_explicit(&ray_pool_get()->cancelled, 1, memory_order_relaxed);
 
         /* Rows hashing to p: its contiguous slot range, in input order. */
         int64_t total = c->part_start[p + 1] - c->part_start[p];
@@ -3845,7 +7005,7 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
 
         int64_t ng = 0, ri = 0;
         {
-            const char* rec = c->pay + (size_t)c->part_start[p] * c->rec;
+            const char* rec = c->pay + (size_t)(c->part_start[p] - c->pay_base) * c->rec;
             for (int64_t i = 0; i < total; i++, rec += c->rec) {
                 const int64_t* keys = (const int64_t*)rec;
                 int64_t r = 0;
@@ -3944,6 +7104,198 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
         for (uint32_t a = 0; a < n_aggs; a++) { ray_free_raw(gv[a]); ray_free_raw(gy[a]); }
         ray_free_raw(gv); ray_free_raw(gy);
         ray_free_raw(gid);
+        if (c->cmp_cap > 0) agg_radix_part_compact(c, &states, &first_row, &gkeys, &ng);
+        pr->states = states; pr->first_row = first_row; pr->keys = gkeys; pr->ng = ng;
+        continue;
+    oom:
+        ray_free_raw(ht); ray_free_raw(ht_salt); ray_free_raw(first_row); ray_free_raw(states); ray_free_raw(keyp); ray_free_raw(gid); ray_free_raw(gkeys);
+        for (uint32_t a = 0; a < n_aggs; a++) { ray_free_raw(gv[a]); ray_free_raw(gy[a]); }
+        ray_free_raw(gv); ray_free_raw(gy);
+        pr->oom = 1; return;
+    }
+}
+
+/* Phase 2 of a fused context: agg_radix_group_fn over each partition's
+ * chunk runs in chunk order (the same records in the same order as the
+ * global layout).  A copy rather than a shared body: one always-inline
+ * body over a run table (the global layout one run per partition)
+ * measured q16 1.3% slower on generation 0 (73.8 against 72.8 ms) and 3%
+ * slower on generation 2.  The two must group the same records in the
+ * same order: scanrange/v2_radix_record_order compares their answers
+ * byte for byte.  Under a top-N emit (cmp_cap) a finished partition is cut to
+ * its candidates, as agg_radix_group_fn cuts it. */
+static void agg_radix_group_fused_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
+    size_t key_bytes = (size_t)n_keys * 8;
+    for (int64_t pi = start; pi < end; pi++) {
+        uint32_t p = (uint32_t)pi;
+        agg_radix_part_t* pr = &c->parts[p];
+
+        /* Rows hashing to p: its contiguous slot range, in input order. */
+        int64_t total = c->part_start[p + 1] - c->part_start[p];
+        if (total == 0) continue;
+
+        /* Open-addressing hash sized to next_pow2(2*total). */
+        int64_t htcap = 16;
+        while (htcap < total * 2) htcap <<= 1;
+        uint64_t htmask = (uint64_t)htcap - 1;
+        int32_t* ht        = ray_alloc_raw((size_t)htcap * sizeof(int32_t));
+        uint8_t* ht_salt   = ray_alloc_raw((size_t)htcap);  /* parallel salt fingerprint per slot */
+        /* Group-state arrays sized to the distinct-group count (grow-on-
+         * demand) instead of `total` rows. gid/gv/gy stay row-sized. */
+        int64_t gcap = total < 256 ? total : 256;
+        if (gcap < 16) gcap = 16;
+        /* first_row is only populated when a row-dependent agg needs it. */
+        int64_t* first_row = c->needs_row ? ray_alloc_raw((size_t)gcap * sizeof(int64_t)) : NULL;
+        char*    states    = ray_alloc_raw((size_t)gcap * c->block);
+        const int64_t** keyp = ray_alloc_raw((size_t)gcap * sizeof(int64_t*)); /* gid -> packed keys */
+        uint32_t* gid      = ray_alloc_raw((size_t)total * sizeof(uint32_t));/* row i -> local gid */
+        /* Persist each group's packed keys (build order) so Phase 3 emits the
+         * key columns by sequential un-pack rather than scattered gather. */
+        int64_t* gkeys     = ray_alloc_raw((size_t)gcap * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
+        if (!ht || !ht_salt || (c->needs_row && !first_row) || !states || !keyp || !gid || !gkeys) {
+            ray_free_raw(ht); ray_free_raw(ht_salt); ray_free_raw(first_row); ray_free_raw(states); ray_free_raw(keyp); ray_free_raw(gid); ray_free_raw(gkeys);
+            pr->oom = 1; return;
+        }
+        for (int64_t i = 0; i < htcap; i++) ht[i] = -1;
+
+        /* Per-agg dense value buffers, gathered contiguously from the records.
+         * gv/gy are per-partition scratch (this worker only) — carved here, not
+         * the shared descriptor, so per-invocation allocation is correct. */
+        char** gv = ray_calloc_raw((size_t)(n_aggs ? n_aggs : 1) * sizeof(char*));
+        char** gy = ray_calloc_raw((size_t)(n_aggs ? n_aggs : 1) * sizeof(char*));
+        if (!gv || !gy) {
+            ray_free_raw(gv); ray_free_raw(gy);
+            ray_free_raw(ht); ray_free_raw(ht_salt); ray_free_raw(first_row); ray_free_raw(states); ray_free_raw(keyp); ray_free_raw(gid); ray_free_raw(gkeys);
+            pr->oom = 1; return;
+        }
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            if (c->val_data[a]) {
+                uint8_t ez = c->val_esz[a];
+                gv[a] = ray_alloc_raw((size_t)total * (ez ? ez : 1));
+                if (!gv[a]) goto oom;
+            }
+            if (c->val2_data[a]) {
+                uint8_t ez2 = c->val2_esz[a];
+                gy[a] = ray_alloc_raw((size_t)total * (ez2 ? ez2 : 1));
+                if (!gy[a]) goto oom;
+            }
+        }
+
+        int64_t ng = 0, ri = 0;
+        /* The records of p: one run per chunk, in chunk order. */
+        for (uint32_t seg = 0; seg < c->n_chunks; seg++) {
+            const uint32_t* rp = c->runs + ((size_t)p * c->n_chunks + seg) * 2;
+            const char* rec = c->pay + (size_t)((int64_t)seg * c->chunk_rows + rp[0]) * c->rec;
+            const int64_t run_ = rp[1];
+            /* the runs lie in different chunks: fetch a few runs ahead */
+            if (seg + AGG_RADIX_RUN_AHEAD < c->n_chunks) {
+                const uint32_t* np = rp + 2 * AGG_RADIX_RUN_AHEAD;
+                const char* nr = c->pay + (size_t)((int64_t)(seg + AGG_RADIX_RUN_AHEAD) * c->chunk_rows + np[0]) * c->rec;
+                __builtin_prefetch(nr);
+                __builtin_prefetch(nr + 64);
+            }
+            for (int64_t i = 0; i < run_; i++, rec += c->rec) {
+                const int64_t* keys = (const int64_t*)rec;
+                int64_t r = 0;
+                if (c->needs_row) memcpy(&r, rec + c->row_off, sizeof(r));
+                /* Gather this row's agg values into the dense per-agg buffers
+                 * (sequential record read → sequential dense write). */
+                for (uint32_t a = 0; a < n_aggs; a++) {
+                    if (gv[a]) { uint8_t ez = c->val_esz[a];
+                        memcpy(gv[a] + (size_t)ri * ez, rec + c->val_off[a], ez); }
+                    if (gy[a]) { uint8_t ez2 = c->val2_esz[a];
+                        memcpy(gy[a] + (size_t)ri * ez2, rec + c->val2_off[a], ez2); }
+                }
+                /* Hash the contiguous packed keys (same FNV-1a as the scatter).
+                 * The scatter consumed the LOW log2(n_parts) bits of this hash
+                 * to pick the partition, so within this partition those bits
+                 * are constant across every record — the slot index must come
+                 * from the bits above them or the open-addressing table
+                 * collapses to 2^(htbits - partbits) usable slots and probing
+                 * degrades to O(ng^2) linear chains (ClickBench q17: 65% of
+                 * the query inside this probe loop at 4096 partitions). */
+                uint64_t h = 1469598103934665603ULL;
+                for (uint32_t k = 0; k < n_keys; k++) { h ^= (uint64_t)keys[k]; h *= 1099511628211ULL; }
+                h = agg_radix_fmix64(h);
+                uint64_t slot = (h >> c->part_bits) & htmask;
+                /* Salt = top 8 bits of the hash (independent of the low-bit slot
+                 * index). Compared first on probe to skip ~255/256 full memcmps. */
+                uint8_t salt = (uint8_t)(h >> 56);
+                int32_t gg;
+                for (;;) {
+                    int32_t gp = ht[slot];
+                    if (gp < 0) {                       /* new group */
+                        if ((int64_t)ng >= gcap) {      /* grow group-state arrays (sized to distinct groups, not rows) */
+                            int64_t ncap = gcap * 2;
+                            /* Assign each realloc result back before the next so
+                             * a mid-sequence failure leaves only valid pointers
+                             * for the oom: cleanup (realloc frees the old block
+                             * on success, so the pre-realloc pointer must never
+                             * survive into cleanup). */
+                            void* ns = ray_realloc_raw(states, (size_t)ncap * c->block);
+                            if (!ns) goto oom;
+                            states = ns;
+                            void* nk = ray_realloc_raw((void*)keyp, (size_t)ncap * sizeof(int64_t*));
+                            if (!nk) goto oom;
+                            keyp = nk;
+                            void* ngk = ray_realloc_raw(gkeys, (size_t)ncap * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
+                            if (!ngk) goto oom;
+                            gkeys = ngk;
+                            if (c->needs_row) {
+                                void* nf = ray_realloc_raw(first_row, (size_t)ncap * sizeof(int64_t));
+                                if (!nf) goto oom;
+                                first_row = nf;
+                            }
+                            gcap = ncap;
+                        }
+                        gg = (int32_t)ng;
+                        ht[slot] = gg;
+                        ht_salt[slot] = salt;
+                        if (c->needs_row) first_row[gg] = r;
+                        keyp[gg] = keys;
+                        for (uint32_t k = 0; k < n_keys; k++)
+                            gkeys[(size_t)gg * n_keys + k] = keys[k];
+                        for (uint32_t a = 0; a < n_aggs; a++)
+                            c->vts[a]->init(states + (size_t)gg * c->block + c->off[a]);
+                        ng++;
+                        break;
+                    }
+                    if (ht_salt[slot] == salt && memcmp(keys, keyp[gp], key_bytes) == 0) {
+                        gg = gp;                                     /* salt-gated key compare */
+                        if (c->needs_row && r < first_row[gg]) first_row[gg] = r;   /* MIN */
+                        break;
+                    }
+                    slot = (slot + 1) & htmask;
+                }
+                gid[ri] = (uint32_t)gg;
+                ri++;
+            }
+        }
+        ray_free_raw(ht); ray_free_raw(ht_salt); ray_free_raw(keyp);
+
+        /* Batch-accumulate each agg over the partition's dense value buffers. */
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            if (c->vts[a]->update_batch2) {             /* binary agg (pearson) */
+                ray_valid_t vx = { gv[a], c->val_types[a],  c->val_hasnull[a] };
+                ray_valid_t vy = { gy[a], c->val2_types[a], c->val2_hasnull[a] };
+                c->vts[a]->update_batch2(states + c->off[a], c->block, gid,
+                                         gv[a], gy[a], &vx, &vy, total, NULL);
+            } else if (c->val_data[a]) {                /* unary agg over a column */
+                ray_valid_t valid = { gv[a], c->val_types[a], c->val_hasnull[a] };
+                c->vts[a]->update_batch(states + c->off[a], c->block, gid, gv[a], &valid, total, NULL);
+            } else {                                    /* COUNT (no value column) */
+                ray_valid_t valid = { NULL, c->val_types[a], false };
+                c->vts[a]->update_batch(states + c->off[a], c->block, gid, NULL, &valid, total, NULL);
+            }
+        }
+
+        for (uint32_t a = 0; a < n_aggs; a++) { ray_free_raw(gv[a]); ray_free_raw(gy[a]); }
+        ray_free_raw(gv); ray_free_raw(gy);
+        ray_free_raw(gid);
+        if (c->cmp_cap > 0) agg_radix_part_compact(c, &states, &first_row, &gkeys, &ng);
         pr->states = states; pr->first_row = first_row; pr->keys = gkeys; pr->ng = ng;
         continue;
     oom:
@@ -4751,6 +8103,293 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
     return result;
 }
 
+/* Survivors per partition for a top-N emit (agg_radix_part_compact), or 0
+ * when the emit keeps every group or selects with semantics the reduction
+ * does not cover: a bounded first-seen emit, a minimum-count bound (it is
+ * applied before the tie cut, so the kept groups are no longer a prefix of
+ * the rank order), an aggregate without a scalar order, accumulators with a
+ * destroy hook, or a take so large that the survivors are no small share of
+ * the input. */
+static int64_t agg_radix_cmp_cap(const ray_group_emit_filter_t* efp, int64_t group_limit,
+                                 const agg_vtable_t** vts, uint32_t n_aggs,
+                                 uint32_t n_parts, int64_t n_in) {
+    if (ray_agg_radix_wave_bytes < 0 ||
+        !efp || group_limit != 0 || efp->top_count_take <= 0 ||
+        efp->min_count_exclusive > 0 || efp->agg_index >= n_aggs)
+        return 0;
+    switch (vts[efp->agg_index]->out_type) {
+        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
+        case RAY_U8: case RAY_BOOL: break;
+        default: return 0;
+    }
+    for (uint32_t a = 0; a < n_aggs; a++)
+        if (vts[a]->destroy) return 0;
+    if (efp->top_count_take > INT32_MAX) return 0;
+    int64_t cap = 2 * efp->top_count_take;
+    if ((double)cap * n_parts > (double)n_in / 2) return 0;
+    return cap;
+}
+
+/* Bound on the waves a heap-derived plan may cut: every wave re-reads the
+ * partition ids and the input rows, so past this many the passes cost more
+ * than the memory they save. */
+#define AGG_RADIX_MAX_WAVES 64
+
+/* Cut the partitions into runs of consecutive partitions holding at most
+ * `target` records each (a partition larger than that is a run of its own).
+ * Returns the run count; cut[w] .. cut[w + 1] are run w's partitions and
+ * *max_wave its largest record count. */
+static uint32_t agg_radix_wave_cut(const int64_t* part_start, uint32_t n_parts,
+                                   int64_t target, uint32_t* cut, int64_t* max_wave) {
+    uint32_t k = 0, lo = 0;
+    int64_t mx = 0;
+    while (lo < n_parts) {
+        uint32_t hi = lo + 1;
+        while (hi < n_parts && part_start[hi + 1] - part_start[lo] <= target) hi++;
+        cut[k++] = lo;
+        if (part_start[hi] - part_start[lo] > mx) mx = part_start[hi] - part_start[lo];
+        lo = hi;
+    }
+    cut[k] = n_parts;
+    *max_wave = mx;
+    return k;
+}
+
+/* Split the payload into waves of whole partitions when it would not fit the
+ * memory left under the heap's anonymous watermark.  Only a reduced (top-N)
+ * run benefits: its finished partitions shrink to their candidates, so the
+ * largest wave's payload is what stays resident, not the whole input's.
+ *
+ * The room is what the watermark leaves above the committed memory, less
+ * `reserve`: the candidates' bound, the tables of the partitions in flight
+ * (one per worker, each a few bytes per row of the largest partition) and
+ * the spill buffers when the later waves may go to a file.  The payload of
+ * one wave gets the rest.  Waves are cut greedily on the exact partition
+ * sizes; a heap-derived plan never cuts more than AGG_RADIX_MAX_WAVES (the
+ * target doubles until it fits — a greedy cut can need up to twice the
+ * waves the record count suggests).  The test knob fixes the target and
+ * cuts as many waves as it asks for.  One wave = the one-pass scatter. */
+static uint32_t agg_radix_wave_plan(const int64_t* part_start, uint32_t n_parts,
+                                    size_t rec, int64_t cmp_cap, int64_t reserve,
+                                    uint32_t* cut, int64_t* max_wave) {
+    int64_t total = part_start[n_parts];
+    cut[0] = 0; cut[1] = n_parts;
+    *max_wave = total;
+    if (cmp_cap <= 0 || total <= 0) return 1;
+    if (ray_agg_radix_wave_bytes > 0) {
+        int64_t target = ray_agg_radix_wave_bytes / (int64_t)rec;
+        if (target < 1) target = 1;
+        if (total <= target) return 1;
+        return agg_radix_wave_cut(part_start, n_parts, target, cut, max_wave);
+    }
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return 1;   /* unknown RAM: one pass, as before */
+    int64_t room = wm - ray_heap_anon_committed() - reserve;
+    int64_t target = room > 0 ? room / (int64_t)rec : 0;
+    if (total <= target) return 1;
+    int64_t least = (total + AGG_RADIX_MAX_WAVES - 1) / AGG_RADIX_MAX_WAVES;
+    if (target < least) target = least;
+    for (;;) {
+        uint32_t k = agg_radix_wave_cut(part_start, n_parts, target, cut, max_wave);
+        if (k <= AGG_RADIX_MAX_WAVES) return k;
+        target *= 2;
+    }
+}
+
+/* Before the count pass: whether agg_radix_wave_plan may split a top-N run
+ * of n_in records into waves — the test knob's bound is below the payload,
+ * or the room under the heap's anonymous watermark is, less the plan's
+ * reserve estimated with partitions of even size (the plan has the exact
+ * sizes). */
+static bool agg_radix_may_wave(int64_t n_in, uint32_t n_parts, size_t rec, size_t block,
+                               uint32_t n_keys, uint32_t nw, int64_t cmp_cap) {
+    if (cmp_cap <= 0 || n_in <= 0) return false;
+    if (ray_agg_radix_wave_bytes > 0) {
+        int64_t target = ray_agg_radix_wave_bytes / (int64_t)rec;
+        return n_in > (target < 1 ? 1 : target);
+    }
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm <= 0) return false;
+    size_t kb = 8 * (size_t)(n_keys ? n_keys : 1);
+    double per_row = (double)(20 + 4 + rec + 2 * (block + kb + 24));
+    double reserve = (double)cmp_cap * n_parts * (double)(block + kb + 8)
+                   + (double)nw * ((double)n_in / n_parts) * per_row;
+    double room = (double)(wm - ray_heap_anon_committed()) - reserve;
+    return (double)n_in * (double)rec > room;
+}
+
+/* Whether a radix dispatch must not be followed by the next: the pool was
+ * cancelled, or (a staged context) a range read failed. */
+static bool agg_radix_stopped(const agg_radix_ctx_t* c, ray_pool_t* pool) {
+    return pool_cancelled(pool) || (c->rr->staged && ray_scan_failed(c->rr->fail));
+}
+
+/* Count pass + prefix again: the partition ids and every chunk's write
+ * cursors back to where the first scatter found them (part_start comes out
+ * the same).  A spilled run whose file failed re-scans its remaining waves
+ * from here.  A staged context counts through its key sources (count_rr);
+ * a range error is noted in its failure envelope. */
+static void agg_radix_recount(agg_radix_ctx_t* c, ray_pool_t* pool) {
+    ray_pool_dispatch_n(pool, c->rr->staged ? agg_radix_count_staged_fn : agg_radix_count_fn,
+                        c, c->n_chunks);
+    uint32_t n_bands = (c->n_parts + AGG_RADIX_PREFIX_BAND - 1) / AGG_RADIX_PREFIX_BAND;
+    if (n_bands > 1 && (uint64_t)c->n_chunks * c->n_parts >= ((uint64_t)1 << 16))
+        ray_pool_dispatch_n(pool, agg_radix_prefix_fn, c, n_bands);
+    else
+        agg_radix_prefix_fn(c, 0, 0, n_bands);
+    for (uint32_t p = 0; p < c->n_parts; p++) c->part_start[p + 1] += c->part_start[p];
+}
+
+/* Bytes of a column object that a re-scan would read from its file again:
+ * a mapped plain column's payload, a generation-2 column's encoded file
+ * (none for an in-memory stand-in), a parted column's segments; 0 for an
+ * in-memory column.  Never decodes. */
+static int64_t agg_col_file_bytes(const ray_t* col) {
+    if (!col || RAY_IS_ERR(col)) return 0;
+    if (col->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of((ray_t*)col);
+        if (!e) return 0;
+        if (e->kind == RAY_ENCCOL_SINGLE) return e->synthetic ? 0 : (int64_t)e->size;
+        return agg_col_file_bytes(e->wrapper);
+    }
+    if (RAY_IS_PARTED(col->type)) {
+        int64_t b = 0;
+        ray_t* const* segs = (ray_t* const*)ray_data((ray_t*)col);
+        for (int64_t s = 0; s < col->len; s++) b += agg_col_file_bytes(segs[s]);
+        return b;
+    }
+    if (!ray_is_vec(col)) return 0;
+    const ray_t* base = (col->attrs & RAY_ATTR_SLICE) && col->slice_parent ? col->slice_parent : col;
+    return base->mmod == 1 ? col->len * (int64_t)col_esz(col) : 0;
+}
+
+/* Re-scan or spill the later waves?  A re-scan reads the input columns once
+ * more per extra wave — from the page cache when they stay there, from their
+ * files when they do not; a spill writes the later waves' records (with
+ * their 4-byte slots) once and reads them back once.  With in-memory input
+ * a re-scan moves no bytes to or from a device, so it always wins; with
+ * file-backed input the cheaper of the two worst cases is taken, which caps
+ * the re-scanned waves at about 2 * payload / input (four to five for a
+ * near-unique two-key count). */
+static bool agg_radix_spill_wanted(int64_t file_bytes, uint32_t n_waves,
+                                   int64_t spilled_recs, size_t rec, int64_t max_wave) {
+    if (!AGG_RADIX_FILE_SPILL || n_waves <= 1 || max_wave > (int64_t)UINT32_MAX ||
+        ray_agg_radix_spill == 1)
+        return false;
+    if (ray_agg_radix_spill >= 2) return true;
+    double spill = 2.0 * (double)spilled_recs * (double)(rec + sizeof(uint32_t));
+    double rescan = (double)(n_waves - 1) * (double)file_bytes;
+    return file_bytes > 0 && spill < rescan;
+}
+
+/* Run a split radix with its later waves spilled: one scatter pass writes
+ * wave 0 into the payload and the rest to the file, wave 0 is reduced, then
+ * each later wave is read back into the payload and reduced.  Returns the
+ * first wave still to run by re-scan: n_waves when every wave was served,
+ * 0 when the spill could not be set up (nothing scattered yet), or the wave
+ * at which the file failed (the cursors are restored by agg_radix_recount).
+ * `buf_bytes` is the share of the plan's reserve for the write and read-back
+ * buffers: a buffer is never smaller than AGG_RADIX_SPILL_MIN_BUF (smaller
+ * writes would be small random I/O), so when the workers' buffers of that
+ * size for every wave exceed it, nothing is scattered and the caller
+ * re-scans (returns 0). */
+#define AGG_RADIX_SPILL_MIN_BUF ((int64_t)64 << 10)
+static uint32_t agg_radix_spill_run(agg_radix_ctx_t* c, ray_pool_t* pool, uint32_t nw,
+                                    const uint32_t* cut, uint32_t n_waves, int64_t buf_bytes,
+                                    bool* cancelled, int* oom, uint64_t* bytes) {
+    uint32_t n_parts = c->n_parts;
+    size_t ent = c->rec + sizeof(uint32_t);
+    int64_t per = buf_bytes / ((int64_t)nw * (n_waves + 1));
+    if (per > ((int64_t)1 << 20)) per = (int64_t)1 << 20;
+    if (per < AGG_RADIX_SPILL_MIN_BUF) per = AGG_RADIX_SPILL_MIN_BUF;
+    uint32_t bcap = (uint32_t)(per / (int64_t)ent);
+    if (bcap < 1) bcap = 1;
+    size_t stride = ((size_t)bcap * ent + 7) & ~(size_t)7;   /* records stay 8-aligned */
+    if ((double)nw * n_waves * (double)stride > (double)buf_bytes) return 0;
+    route_stats.radix_spill_buf = (uint64_t)nw * n_waves * stride;
+    int64_t spilled = c->part_start[n_parts] - c->part_start[cut[1]];
+    agg_radix_spill_t sp = { .fd = -1, .n_waves = n_waves, .bcap = bcap, .rec = c->rec };
+    atomic_init(&sp.n_blks, 0); atomic_init(&sp.tail, 0); atomic_init(&sp.err, 0);
+    sp.blk_cap = spilled / bcap + (int64_t)nw * n_waves + 1;
+    uint16_t* wave_of = ray_alloc_raw((size_t)n_parts * sizeof(uint16_t));
+    int64_t* wave_base = ray_alloc_raw((size_t)n_waves * sizeof(int64_t));
+    sp.bufs = ray_calloc_raw((size_t)nw * n_waves * sizeof(agg_radix_sbuf_t));
+    sp.rstride = stride;
+    char* bufmem = ray_alloc_raw((size_t)nw * (n_waves - 1) * stride);
+    sp.rbuf = ray_alloc_raw((size_t)nw * stride);
+    sp.blks = ray_alloc_raw((size_t)sp.blk_cap * sizeof(agg_radix_blk_t));
+    int64_t* wave_blks = ray_alloc_raw((size_t)sp.blk_cap * sizeof(int64_t));
+    sp.fd = (wave_of && wave_base && sp.bufs && bufmem && sp.rbuf && sp.blks && wave_blks)
+          ? agg_radix_spill_open() : -1;
+    if (sp.fd < 0) {
+        ray_free_raw(wave_of); ray_free_raw(wave_base); ray_free_raw(sp.bufs);
+        ray_free_raw(bufmem); ray_free_raw(sp.rbuf); ray_free_raw(sp.blks); ray_free_raw(wave_blks);
+        return 0;
+    }
+    for (uint32_t w = 0; w < n_waves; w++) {
+        wave_base[w] = c->part_start[cut[w]];
+        for (uint32_t p = cut[w]; p < cut[w + 1]; p++) wave_of[p] = (uint16_t)w;
+    }
+    for (uint32_t t = 0; t < nw; t++)
+        for (uint32_t w = 1; w < n_waves; w++)
+            sp.bufs[(size_t)t * n_waves + w].buf =
+                bufmem + ((size_t)t * (n_waves - 1) + (w - 1)) * stride;
+    sp.wave_base = wave_base;
+    sp.wave_blks = wave_blks;
+    // cppcheck-suppress autoVariables // sp outlives every dispatch that reads it; c->spill is reset before return
+    c->spill = &sp; c->wave_of = wave_of;
+
+    uint32_t next = n_waves;
+    ray_pool_dispatch_n(pool, c->rr->staged ? agg_radix_spill_scatter_staged_fn
+                                           : agg_radix_spill_scatter_fn, c, c->n_chunks);
+    *cancelled = agg_radix_stopped(c, pool);
+    for (uint32_t t = 0; t < nw && !*cancelled; t++)
+        for (uint32_t w = 1; w < n_waves; w++)
+            agg_radix_spill_flush(&sp, &sp.bufs[(size_t)t * n_waves + w], w);
+    ray_free_raw(bufmem); bufmem = NULL;
+    ray_profile_tick("radix: spilled later waves");
+    for (uint32_t w = 0; w < n_waves && !*cancelled && !*oom; w++) {
+        uint32_t lo = cut[w], hi = cut[w + 1];
+        if (w > 0) {
+            if (atomic_load_explicit(&sp.err, memory_order_relaxed)) {
+                agg_radix_recount(c, pool);   /* the file failed: re-scan from here */
+                *cancelled = agg_radix_stopped(c, pool);
+                next = w;
+                break;
+            }
+            int64_t nb = 0, total = atomic_load_explicit(&sp.n_blks, memory_order_relaxed);
+            for (int64_t i = 0; i < total; i++)
+                if (sp.blks[i].wave == w) wave_blks[nb++] = i;
+            if (nb > 0) ray_pool_dispatch_n(pool, agg_radix_readback_fn, c, (uint32_t)nb);
+            *cancelled = agg_radix_stopped(c, pool);
+            if (*cancelled) break;
+            if (atomic_load_explicit(&sp.err, memory_order_relaxed)) {
+                agg_radix_recount(c, pool);
+                *cancelled = agg_radix_stopped(c, pool);
+                next = w;
+                break;
+            }
+        }
+        if (c->part_start[hi] == c->part_start[lo]) continue;
+        c->part_lo = lo;
+        c->pay_base = c->part_start[lo];
+        ray_pool_dispatch_n(pool, agg_radix_group_fn, c, hi - lo);
+        *cancelled = agg_radix_stopped(c, pool);
+        for (uint32_t p = lo; p < hi && !*cancelled; p++)
+            if (c->parts[p].oom) { *oom = 1; break; }
+        ray_profile_tick("radix: wave reduced");
+    }
+    *bytes = (uint64_t)atomic_load_explicit(&sp.tail, memory_order_relaxed);
+#if AGG_RADIX_FILE_SPILL
+    close(sp.fd);
+#endif
+    c->spill = NULL; c->wave_of = NULL; c->part_lo = 0; c->pay_base = 0;
+    ray_free_raw(wave_of); ray_free_raw(wave_base); ray_free_raw(sp.bufs);
+    ray_free_raw(sp.rbuf); ray_free_raw(sp.blks); ray_free_raw(wave_blks);
+    return next;
+}
+
 static ray_t* exec_group_v2_parallel_radix(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
         ray_t** key_cols, int64_t* key_syms,
@@ -4763,11 +8402,14 @@ static ray_t* exec_group_v2_parallel_radix(
     uint32_t nw = ray_pool_total_workers(pool);
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr ? derr : ray_error("oom", NULL);
     const void** key_data = d.key_data;
-    const void** val_data = d.val_data; const int8_t* val_types = d.val_types;
+    /* Phase 1 reads the inputs through views; the layout and phase 2 test
+     * their presence on the identities (staged or plain). */
+    const void** val_data = d.val_id; const int8_t* val_types = d.val_types;
     const bool* val_hasnull = d.val_hasnull; const uint8_t* val_esz = d.val_esz;
-    const void** val2_data = d.val2_data; const int8_t* val2_types = d.val2_types;
+    const void** val2_data = d.val2_id; const int8_t* val2_types = d.val2_types;
     const bool* val2_hasnull = d.val2_hasnull; const uint8_t* val2_esz = d.val2_esz;
 
     /* Every group records its earliest source row so emitted order does not
@@ -4779,9 +8421,11 @@ static ray_t* exec_group_v2_parallel_radix(
      * only phases 1-2 read them, freed once phase 2 joins. */
     ray_t* off_hdr;
     size_t* val_off = (size_t*)scratch_calloc(&off_hdr,
-        2u * (size_t)(n_aggs ? n_aggs : 1) * sizeof(size_t));
+        2u * (size_t)(n_aggs ? n_aggs : 1) * sizeof(size_t) +
+        ((size_t)n_keys + 2u * n_aggs) * sizeof(agg_radix_cf_t));
     if (!val_off) { agg_desc_free(&d); return ray_error("oom", NULL); }
     size_t* val2_off = val_off + n_aggs;
+    agg_radix_cf_t* cf = (agg_radix_cf_t*)(val_off + 2u * (n_aggs ? n_aggs : 1));
     size_t rec_cur = (size_t)n_keys * 8;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (val_data[a])  { val_off[a]  = rec_cur; rec_cur += val_esz[a]; }
@@ -4789,6 +8433,54 @@ static ray_t* exec_group_v2_parallel_radix(
     }
     size_t row_off = rec_cur; if (needs_row) rec_cur += 8;
     size_t rec = (rec_cur + 7u) & ~(size_t)7u;   /* 8-align records */
+    /* The compact staging of a fused pass (not sel mode: the scatter reads
+     * the plain columns at the chunk's own rows): the record's fields in
+     * the record's order (the keys, then each aggregate's x and y, as
+     * val_off / val2_off lay them out), a staged source's in the staged
+     * row, a plain one read in place.  Field j walks source i: the keys
+     * are sources 0 .. n_keys, aggregate a's x n_keys + a, its y
+     * n_keys + n_aggs + a. */
+    bool compact = d.staged && !sel;
+    size_t srec = 0;
+    uint32_t n_cf = 0;
+    for (uint32_t j = 0; compact && j < n_keys + 2u * n_aggs; j++) {
+        bool key = j < n_keys;
+        uint32_t a = key ? 0 : (j - n_keys) / 2;
+        bool y = !key && ((j - n_keys) & 1);
+        uint32_t i = key ? j : y ? n_keys + n_aggs + a : n_keys + a;
+        if (!key && !(y ? val2_data[a] : val_data[a])) continue;     /* no input (COUNT) */
+        agg_radix_cf_t* f = &cf[n_cf++];
+        memset(f, 0, sizeof *f);
+        f->agg = a;
+        f->y = y;
+        f->off = (uint32_t)(key ? (size_t)i * 8 : y ? val2_off[a] : val_off[a]);
+        f->w = key ? 8 : y ? val2_esz[a] : val_esz[a];
+        if (d.rr.srcs[i]) {
+            f->kind = AGG_CF_STAGED;
+            f->soff = (uint32_t)srec;
+            srec += f->w;
+            continue;
+        }
+        f->plain = d.rr.plain[i];
+        f->esz = d.rr.esz[i];
+        if (!f->plain) { compact = false; break; }
+        if (!key) { f->kind = AGG_CF_VAL; continue; }
+        switch (d.rr.key_types[i]) {
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: f->kind = AGG_CF_KEY_I64; break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: f->kind = AGG_CF_KEY_I32; break;
+            case RAY_I16: f->kind = AGG_CF_KEY_I16; break;
+            case RAY_U8: case RAY_BOOL: f->kind = AGG_CF_KEY_U8; break;
+            case RAY_SYM:
+                switch (d.rr.key_attrs[i] & RAY_SYM_W_MASK) {
+                    case RAY_SYM_W8:  f->kind = AGG_CF_KEY_U8; break;
+                    case RAY_SYM_W16: f->kind = AGG_CF_KEY_U16; break;
+                    case RAY_SYM_W32: f->kind = AGG_CF_KEY_U32; break;
+                    default:          f->kind = AGG_CF_KEY_I64; break;
+                }
+                break;
+            default: compact = false; break;                         /* the gate admits only the above */
+        }
+    }
 
     int64_t n_in = sel ? n_sel : nrows;
     if (n_in < 0) n_in = 0;
@@ -4813,18 +8505,82 @@ static ray_t* exec_group_v2_parallel_radix(
     if (want < 1) want = 1;
     int64_t chunk_rows = (int64_t)(((uint64_t)n_in + want - 1) / want);
     if (chunk_rows < 1) chunk_rows = 1;
+    /* Sources that decode (generation 2) are read once: the fused pass
+     * stages each chunk in its task (agg_radix_fused_fn).  Its chunks are
+     * small, so the staged records stay in the task's cache while they are
+     * scattered: AGG_RADIX_RUN_ROWS records per partition on average (a
+     * partition's runs, one per chunk, stay worth reading in phase 2), at
+     * least one block.  The workers' staging buffers must fit the
+     * last-level cache together (the table stack's bound), and the chunks
+     * the count matrix; otherwise the two passes read the sources twice
+     * (staging that spills costs more than the second decode). */
+    bool fused = false;
+    if (d.staged) {
+        for (uint32_t i = 0; i < d.rr.n_src && !fused; i++)
+            fused = d.rr.srcs[i] && ray_col_src_encoded(d.rr.srcs[i]);
+        int64_t want_rows = (int64_t)n_parts * AGG_RADIX_RUN_ROWS;
+        if (want_rows < RAY_COL_BLOCK_ROWS) want_rows = RAY_COL_BLOCK_ROWS;
+        uint64_t llc_bytes = ray_cache_llc_bytes();
+        double cache_budget = (llc_bytes ? (double)llc_bytes : 32.0 * 1048576.0) * 0.75;
+        /* a worker's staging: a chunk's staged rows (compact: the staged
+         * sources' fields, srec bytes; else whole records, rec) and
+         * partition ids (2 bytes a row), and the partitions' write cursors */
+        double per_worker = cache_budget / (double)nw - (double)n_parts * sizeof(uint32_t);
+        double staged_row = (double)(compact ? srec : rec) + sizeof(uint16_t);
+        int64_t cap = per_worker > 0 ? (int64_t)(per_worker / staged_row) : 0;
+        /* Staging over its share keeps the fused pass on smaller chunks:
+         * the largest block multiple under the cap, while that still holds
+         * half the records a run wants (4 a partition on average; q17's
+         * two keys: 3 of 4 blocks, decoded once).  Below half the short
+         * runs cost more than the second decode (TS2m: 40-byte records
+         * over 8192 partitions, a quarter). */
+        if (fused) {
+            int64_t target = chunk_rows > want_rows ? want_rows : chunk_rows;
+            if (target > cap) {
+                int64_t capped = cap / RAY_COL_BLOCK_ROWS * RAY_COL_BLOCK_ROWS;
+                if (capped >= RAY_COL_BLOCK_ROWS && 2 * capped >= want_rows) target = capped;
+                else fused = false;
+            }
+            if (fused) chunk_rows = target;
+        }
+        /* the count matrix and the runs (twice its size) live together
+         * until the runs are written */
+        uint64_t nch = ((uint64_t)n_in + (uint64_t)chunk_rows - 1) / (uint64_t)chunk_rows;
+        if (fused && nch * n_parts * 3 * sizeof(uint32_t) > AGG_RADIX_COUNT_BUDGET) {
+            fused = false;
+            chunk_rows = (int64_t)(((uint64_t)n_in + want - 1) / want);   /* the two passes' chunks */
+            if (chunk_rows < 1) chunk_rows = 1;
+        }
+    }
+    /* A top-N emit keeps only its partitions' candidates (cmp_cap).  When
+     * the whole payload may not fit the wave bound (agg_radix_may_wave),
+     * the two passes run instead of the fused pass: their partition-major
+     * payload splits into waves of whole partitions, while the fused pass's
+     * chunk-major payload holds every record at once. */
+    int64_t cmp_cap = needs_row
+        ? agg_radix_cmp_cap(efp, group_limit, vts, n_aggs, n_parts, n_in) : 0;
+    if (fused && agg_radix_may_wave(n_in, n_parts, rec, block, n_keys, nw, cmp_cap)) {
+        fused = false;
+        chunk_rows = (int64_t)(((uint64_t)n_in + want - 1) / want);   /* the two passes' chunks */
+        if (chunk_rows < 1) chunk_rows = 1;
+    }
     uint32_t n_chunks = (uint32_t)((n_in + chunk_rows - 1) / chunk_rows);
 
     /* O(1) allocations whatever the worker count: the count matrix and the
-     * partition ids live until pass 2 ends, the payload until phase 2 ends. */
+     * partition ids live until the last scatter pass ends (fused: no ids;
+     * the count matrix until its runs are transposed, the runs until phase
+     * 2 ends), the payload until phase 2 ends.  The fused payload holds the
+     * whole input; the two passes size theirs once the partition sizes are
+     * known: the whole input, or the largest wave. */
     agg_radix_part_t* parts = ray_calloc_raw((size_t)n_parts * sizeof(agg_radix_part_t));
     uint32_t* cnt = ray_alloc_raw((size_t)(n_chunks ? n_chunks : 1) * n_parts * sizeof(uint32_t));
     int64_t* part_start = ray_alloc_raw(((size_t)n_parts + 1) * sizeof(int64_t));
-    uint16_t* pid = ray_alloc_raw((size_t)(n_in ? n_in : 1) * sizeof(uint16_t));
-    char* pay = ray_alloc_raw((size_t)(n_in ? n_in : 1) * rec);
-    if (!parts || !cnt || !part_start || !pid || !pay) {
+    uint16_t* pid = fused ? NULL : ray_alloc_raw((size_t)(n_in ? n_in : 1) * sizeof(uint16_t));
+    uint32_t* wave_cut = fused ? NULL : ray_alloc_raw(((size_t)n_parts + 1) * sizeof(uint32_t));
+    char* pay = fused ? ray_alloc_raw((size_t)(n_in ? n_in : 1) * rec) : NULL;
+    if (!parts || !cnt || !part_start || (fused ? !pay : (!pid || !wave_cut))) {
         ray_free_raw(parts); ray_free_raw(cnt); ray_free_raw(part_start);
-        ray_free_raw(pid); ray_free_raw(pay);
+        ray_free_raw(pid); ray_free_raw(wave_cut); ray_free_raw(pay);
         scratch_free(off_hdr); agg_desc_free(&d);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
@@ -4844,15 +8600,98 @@ static ray_t* exec_group_v2_parallel_radix(
         .rec = rec, .row_off = row_off, .needs_row = needs_row,
         .sel = sel, .sel_prefix = sel_prefix,
         .val_off = val_off, .val2_off = val2_off,
+        .wave_lo = 0, .wave_hi = n_parts, .part_lo = 0, .pay_base = 0,
+        .cmp_cap = cmp_cap,
+        .cmp_vt = cmp_cap ? vts[efp->agg_index] : NULL,
+        .cmp_off = cmp_cap ? off[efp->agg_index] : 0,
+        .cmp_param = cmp_cap && ext->agg_k ? ext->agg_k[efp->agg_index] : 0,
+        .cmp_desc = cmp_cap ? efp->desc : 0,
+        .rr = &d.rr, .whole = &d.whole,
+        .compact = fused && compact, .srec = srec, .n_cf = n_cf, .cf = cf,
     };
+    route_stats.radix_phase1 = !fused ? AGG_RADIX_P1_TWO_PASS
+                             : ctx.compact ? AGG_RADIX_P1_FUSED_COMPACT : AGG_RADIX_P1_FUSED_RECORDS;
     atomic_init(&ctx.part_overflow, 0);
+    atomic_init(&ctx.cmp_parts, 0);
+    agg_desc_advise(&d, nrows);
+    /* Pass 1 of the two passes reads the keys alone: an input is read once
+     * by each scatter. */
+    agg_rr_t count_rr = d.rr;
+    ray_col_src_t** count_srcs = NULL;
+    ctx.count_rr = &d.rr;
+    if (d.staged && !fused) {
+        count_srcs = ray_alloc_raw((size_t)(d.rr.n_src ? d.rr.n_src : 1) * sizeof(*count_srcs));
+        if (count_srcs) {
+            for (uint32_t i = 0; i < d.rr.n_src; i++) count_srcs[i] = i < n_keys ? d.rr.srcs[i] : NULL;
+            count_rr.srcs = count_srcs;
+            ctx.count_rr = &count_rr;
+        }
+    }
+
+    if (fused) {
+        /* One pass: each chunk counted and scattered inside its own record
+         * range, then the partition totals. */
+        uint32_t n_bands = (n_parts + AGG_RADIX_PREFIX_BAND - 1) / AGG_RADIX_PREFIX_BAND;
+        route_stats.radix_waves = 1;
+        ctx.runs = ray_alloc_raw((size_t)n_chunks * n_parts * 2 * sizeof(uint32_t));
+        if (!ctx.runs) {
+            ray_free_raw(parts); ray_free_raw(cnt); ray_free_raw(part_start); ray_free_raw(pay);
+            scratch_free(off_hdr); agg_desc_free(&d);
+            return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
+                    key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+        }
+        ctx.fused_tasks = nw * AGG_RADIX_CHUNKS_PER_WORKER;
+        if (ctx.fused_tasks > n_chunks) ctx.fused_tasks = n_chunks;
+        if (ctx.fused_tasks < 1) ctx.fused_tasks = 1;
+        ray_pool_dispatch_n(pool, agg_radix_fused_fn, &ctx, ctx.fused_tasks);
+        ray_t* ferr = ray_scan_fail_finish(&d.fail, pool);
+        bool cancelled = pool_cancelled(pool) || ferr;
+        if (!cancelled) {
+            if (n_bands > 1 && (uint64_t)n_chunks * n_parts >= ((uint64_t)1 << 16))
+                ray_pool_dispatch_n(pool, agg_radix_fused_totals_fn, &ctx, n_bands);
+            else
+                agg_radix_fused_totals_fn(&ctx, 0, 0, n_bands);
+            cancelled = pool_cancelled(pool);
+        }
+        ray_free_raw(cnt); ctx.cnt = cnt = NULL;     /* phase 2 reads the runs */
+        int oom = atomic_load_explicit(&ctx.part_overflow, memory_order_relaxed);
+        if (!cancelled && !oom)
+            for (uint32_t p = 0; p < n_parts; p++) part_start[p + 1] += part_start[p];
+        ray_profile_tick("radix: scattered rows");
+        if (!cancelled && !oom)
+            ray_pool_dispatch_n(pool, agg_radix_group_fused_fn, &ctx, n_parts);
+        if (!cancelled && !oom) {
+            cancelled = pool_cancelled(pool);
+            for (uint32_t p = 0; p < n_parts; p++)
+                if (parts[p].oom) { oom = 1; break; }
+        }
+        route_stats.radix_compacted =
+            (uint64_t)atomic_load_explicit(&ctx.cmp_parts, memory_order_relaxed);
+        ray_profile_tick("radix: reduced partitions");
+        scratch_free(off_hdr);
+        ray_free_raw(ctx.runs); ctx.runs = NULL;
+        ray_free_raw(pay); ctx.pay = NULL;
+        ray_free_raw(part_start); ctx.part_start = NULL;
+        if (cancelled || oom) {
+            agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
+            ray_free_raw(parts);
+            agg_desc_free(&d);
+            if (ferr) return ferr;
+            if (cancelled) return ray_error("cancel", NULL);
+            return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
+                    key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+        }
+        return agg_parts_emit(ext, &d, parts, n_parts, pool, nw, key_cols, key_syms,
+                              vts, off, block, sel ? n_sel : nrows, group_limit, efp);
+    }
 
     /* Phase 1, pass 1: per-(chunk, partition) counts.  Sel mode chunks the
      * selected-row space [0,n_sel); each chunk decodes its selected rows to
      * ORIGINAL indices.  A cancelled dispatch skips chunks and leaves their
      * count rows and ids unset, so nothing past it may run. */
-    ray_pool_dispatch_n(pool, agg_radix_count_fn, &ctx, n_chunks);
-    bool cancelled = pool_cancelled(pool);
+    ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_count_staged_fn : agg_radix_count_fn, &ctx, n_chunks);
+    ray_t* ferr = d.staged ? ray_scan_fail_finish(&d.fail, pool) : NULL;
+    bool cancelled = pool_cancelled(pool) || ferr;
     if (!cancelled) {
         uint32_t n_bands = (n_parts + AGG_RADIX_PREFIX_BAND - 1) / AGG_RADIX_PREFIX_BAND;
         if (n_bands > 1 && (uint64_t)n_chunks * n_parts >= ((uint64_t)1 << 16))
@@ -4862,24 +8701,139 @@ static ray_t* exec_group_v2_parallel_radix(
         cancelled = pool_cancelled(pool);
     }
     int oom = atomic_load_explicit(&ctx.part_overflow, memory_order_relaxed);
+    uint32_t n_waves = 1;
+    bool no_pay = false;
+    int64_t file_bytes = 0, buf_bytes = 0;
+    bool spill_chosen = false;
     if (!cancelled && !oom) {
         for (uint32_t p = 0; p < n_parts; p++) part_start[p + 1] += part_start[p];
-        /* Pass 2: every record to its exact slot. */
-        ray_pool_dispatch_n(pool, agg_radix_scatter_fn, &ctx, n_chunks);
-        cancelled = pool_cancelled(pool);
+        int64_t max_wave = n_in;
+        /* Held beside one wave's payload: the candidates, the tables of the
+         * partitions in flight (one per worker; per row of the largest
+         * partition its hash slots, gid and value columns, and per group
+         * — at most a row each, doubling capacity — its state, keys, key
+         * pointer, first row and the reduction's value) and, with
+         * file-backed input, the spill buffers. */
+        int64_t max_part = 0;
+        for (uint32_t p = 0; p < n_parts; p++)
+            if (part_start[p + 1] - part_start[p] > max_part)
+                max_part = part_start[p + 1] - part_start[p];
+        size_t kb = 8 * (size_t)(n_keys ? n_keys : 1);
+        int64_t per_row = (int64_t)(20 + 4 + rec + 2 * (block + kb + 24));
+        int64_t reserve = cmp_cap * (int64_t)n_parts * (int64_t)(block + kb + 8)
+                        + (int64_t)nw * max_part * per_row;
+        /* The bytes a re-scan reads again: each key's and input's object as
+         * the scan reads it (a staged source's bound object, else the plain
+         * column read in place; an input read from an in-memory
+         * materialization of an encoded column reads no file).  Never
+         * decodes. */
+        for (uint32_t k = 0; k < n_keys; k++)
+            file_bytes += agg_col_file_bytes(d.key_srcs[k] ? d.key_srcs[k]->obj : key_cols[k]);
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            ray_t* vc = NULL;
+            if (d.val_srcs[a]) {
+                vc = d.val_srcs[a]->obj;
+            } else if (d.val_data[a] && d.agg_syms[a]) {
+                ray_t* slot = ray_table_slot(tbl, d.agg_syms[a]);
+                vc = slot && slot->type != RAY_ENCCOL ? slot : NULL;
+            }
+            bool dup = false;
+            for (uint32_t k = 0; k < n_keys && vc; k++)
+                if ((d.key_srcs[k] ? d.key_srcs[k]->obj : key_cols[k]) == vc) dup = true;
+            if (!dup) file_bytes += agg_col_file_bytes(vc);
+        }
+        n_waves = agg_radix_wave_plan(part_start, n_parts, rec, cmp_cap, reserve,
+                                      wave_cut, &max_wave);
+        /* A split that would spill (by the cost rule, or the test knob) is
+         * planned again with room for the write buffers (at most 1 MB per
+         * worker and wave, at most an eighth of the room, none once the
+         * watermark is passed).  If the larger reserve changes the plan so
+         * that the spill no longer pays, the plan without buffers stands: a
+         * re-scan needs none, and its waves are not multiplied for nothing. */
+        if (n_waves > 1 && (file_bytes > 0 || ray_agg_radix_spill >= 2) &&
+            agg_radix_spill_wanted(file_bytes, n_waves,
+                                   part_start[n_parts] - part_start[wave_cut[1]], rec, max_wave)) {
+            int64_t wm = ray_heap_anon_watermark();
+            int64_t room = wm > 0 ? wm - ray_heap_anon_committed() : -1;
+            int64_t bb = (int64_t)nw * (AGG_RADIX_MAX_WAVES + 1) << 20;
+            if (wm > 0 && bb > (room > 0 ? room / 8 : 0)) bb = room > 0 ? room / 8 : 0;
+            uint32_t w2 = bb > 0
+                ? agg_radix_wave_plan(part_start, n_parts, rec, cmp_cap, reserve + bb,
+                                      wave_cut, &max_wave)
+                : 0;
+            if (w2 > 1 && agg_radix_spill_wanted(file_bytes, w2,
+                                   part_start[n_parts] - part_start[wave_cut[1]], rec, max_wave)) {
+                n_waves = w2; buf_bytes = bb; spill_chosen = true;
+            } else if (w2) {
+                n_waves = agg_radix_wave_plan(part_start, n_parts, rec, cmp_cap, reserve,
+                                              wave_cut, &max_wave);
+            }
+        }
+        pay = ray_alloc_raw((size_t)(max_wave > 0 ? max_wave : 1) * rec);
+        ctx.pay = pay;
+        if (!pay) no_pay = true;
     }
+    route_stats.radix_waves = n_waves;
+    if (!cancelled && !oom && !no_pay && n_waves == 1) {
+        /* Pass 2: every record to its exact slot. */
+        ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_scatter_staged_fn : agg_radix_scatter_fn,
+                            &ctx, n_chunks);
+        cancelled = agg_radix_stopped(&ctx, pool);
+        ray_free_raw(cnt); cnt = ctx.cnt = NULL;
+        ray_free_raw(pid); pid = ctx.pid = NULL;
+        ray_free_raw(count_srcs); count_srcs = NULL; ctx.count_rr = NULL;
+        ray_profile_tick("radix: scattered rows");
+
+        /* Phase 2: per-partition group+accumulate. */
+        if (!cancelled)
+            ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, n_parts);
+        if (!cancelled) {
+            cancelled = pool_cancelled(pool);
+            for (uint32_t p = 0; p < n_parts; p++)
+                if (parts[p].oom) { oom = 1; break; }
+        }
+    } else if (!cancelled && !oom && !no_pay) {
+        /* Waves: scatter the records of a run of partitions, reduce those
+         * partitions to their top-N candidates, reuse the payload for the
+         * next run.  The later waves come from the spill file when that
+         * moves fewer bytes (agg_radix_spill_wanted); otherwise, or from the
+         * wave at which the file failed, every wave re-reads the input (its
+         * rows in place or, staged, by range; the partition ids
+         * sequentially); no wave writes outside its payload. */
+        uint32_t next = 0;
+        if (spill_chosen) {
+            uint64_t sb = 0;
+            next = agg_radix_spill_run(&ctx, pool, nw, wave_cut, n_waves, buf_bytes,
+                                       &cancelled, &oom, &sb);
+            route_stats.radix_spill_bytes = sb;
+        }
+        for (uint32_t w = next; w < n_waves && !cancelled && !oom; w++) {
+            uint32_t lo = wave_cut[w], hi = wave_cut[w + 1];
+            if (part_start[hi] == part_start[lo]) continue;   /* only empty partitions */
+            ctx.wave_lo = lo; ctx.wave_hi = hi; ctx.part_lo = lo;
+            ctx.pay_base = part_start[lo];
+            ray_pool_dispatch_n(pool, ctx.rr->staged ? agg_radix_wave_scatter_staged_fn
+                                                     : agg_radix_wave_scatter_fn, &ctx, n_chunks);
+            cancelled = agg_radix_stopped(&ctx, pool);
+            if (cancelled) break;
+            ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, hi - lo);
+            cancelled = pool_cancelled(pool);
+            for (uint32_t p = lo; p < hi && !cancelled; p++)
+                if (parts[p].oom) { oom = 1; break; }
+            ray_profile_tick("radix: wave reduced");
+        }
+        ctx.wave_lo = 0; ctx.wave_hi = n_parts; ctx.part_lo = 0; ctx.pay_base = 0;
+    }
+    /* A range read that failed in a scatter is the query's error. */
+    if (!ferr && d.staged && ray_scan_failed(&d.fail)) ferr = ray_scan_fail_finish(&d.fail, pool);
+    if (ferr) cancelled = true;
     ray_free_raw(cnt); ctx.cnt = NULL;
     ray_free_raw(pid); ctx.pid = NULL;
-    ray_profile_tick("radix: scattered rows");
-
-    /* Phase 2: per-partition group+accumulate. */
-    if (!cancelled && !oom)
-        ray_pool_dispatch_n(pool, agg_radix_group_fn, &ctx, n_parts);
-    if (!cancelled && !oom) {
-        cancelled = pool_cancelled(pool);
-        for (uint32_t p = 0; p < n_parts; p++)
-            if (parts[p].oom) { oom = 1; break; }
-    }
+    ray_free_raw(count_srcs); ctx.count_rr = NULL;
+    ray_free_raw(wave_cut);
+    route_stats.radix_compacted =
+        (uint64_t)atomic_load_explicit(&ctx.cmp_parts, memory_order_relaxed);
+    if (no_pay) oom = 1;
 
     ray_profile_tick("radix: reduced partitions");
 
@@ -4893,6 +8847,7 @@ static ray_t* exec_group_v2_parallel_radix(
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
         ray_free_raw(parts);
         agg_desc_free(&d);
+        if (ferr) return ferr;
         if (cancelled) return ray_error("cancel", NULL);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
@@ -5046,6 +9001,8 @@ typedef struct {
     int64_t              merge_cand; /* total entries + scattered rows (phase 2 sizing) */
     ray_t*               sel;
     const int64_t*       sel_prefix;
+    const agg_rr_t*      rr;        /* sources; staged ones are read by range */
+    const agg_view_t*    whole;
 } agg_ts_ctx_t;
 
 /* Same FNV-1a + fmix64 as the radix scatter; bit 0 forced on so 0 can mark
@@ -5173,42 +9130,71 @@ static bool agg_ts_reserve(agg_ts_ctx_t* c, agg_ts_task_t* ts, int64_t n) {
     return true;
 }
 
-/* Visit one chunk of rows of a task: original rows `rows[i]` (or pos0 + i
- * when rows == NULL) at logical input positions pos0 + i. */
-static void agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
-                         const int64_t* rows, int64_t pos0, int64_t n,
-                         agg_sel_scratch_t* sc, uint32_t* gid, int64_t* keys) {
+/* One chunk of a task, probed and accumulated through a view: indices
+ * [ib, ie) of the chunk, original rows rows[i] (or pos0 + i when rows ==
+ * NULL) at logical input positions pos0 + i.  The chunk's table room was
+ * reserved (or the task switched to scatter) for the whole chunk first, so
+ * its pieces see the same table and the same switch point as one call. */
+typedef struct {
+    agg_ts_ctx_t*      c;
+    agg_ts_task_t*     ts;
+    const int64_t*     rows;
+    int64_t            pos0;
+    agg_sel_scratch_t* sc;
+    uint32_t*          gid;
+    int64_t*           keys;
+} agg_ts_run_t;
+
+static void agg_ts_idx_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t ib, int64_t ie) {
+    (void)wid;
+    agg_ts_run_t* run = raw;
+    agg_ts_ctx_t* c = run->c;
+    agg_ts_task_t* ts = run->ts;
+    const int64_t* rows = run->rows;
+    const int64_t pos0 = run->pos0, base = v->base;
+    int64_t* keys = run->keys;
+    uint32_t* gid = run->gid;
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
-    if (!ts->scatter && !agg_ts_reserve(c, ts, n)) { ts->oom = 1; return; }
+    if (ts->oom) return;
+    /* The entry and record stores below are byte copies, which may alias
+     * any field: the keys' read parameters are hoisted into locals (a
+     * single key's into registers). */
+    uint32_t nkv = n_keys ? n_keys : 1;
+    int8_t kt[nkv]; uint8_t ka[nkv]; const void* kd[nkv];
+    for (uint32_t k = 0; k < n_keys; k++) {
+        kt[k] = c->key_cols[k]->type; ka[k] = v->key_attrs[k]; kd[k] = v->key_data[k];
+    }
+    const int8_t kt0 = kt[0];
+    const uint8_t ka0 = ka[0];
+    const void* kd0 = kd[0];
+    #define AGG_TS_KEYS(r) do {                                                       \
+        if (n_keys == 1) keys[0] = agg_read_key_i64_raw(kt0, ka0, kd0, (r) - base);   \
+        else for (uint32_t k = 0; k < n_keys; k++)                                    \
+            keys[k] = agg_read_key_i64_raw(kt[k], ka[k], kd[k], (r) - base);         \
+    } while (0)
 
     if (ts->scatter) {
-        if (!ts->buckets) {
-            ts->buckets = ray_calloc_raw((size_t)c->n_parts * sizeof(agg_ts_bucket_t));
-            if (!ts->buckets) { ts->oom = 1; return; }
-        }
         uint32_t pshift = 64 - c->part_bits;
-        for (int64_t i = 0; i < n; i++) {
+        for (int64_t i = ib; i < ie; i++) {
             int64_t r = rows ? rows[i] : pos0 + i;
-            for (uint32_t k = 0; k < n_keys; k++)
-                keys[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+            AGG_TS_KEYS(r);
             uint64_t h = agg_ts_hash(keys, n_keys);
             char* rec = agg_ts_bucket_push(&ts->buckets[h >> pshift], c->rec);
             if (!rec) { ts->oom = 1; return; }
             memcpy(rec, keys, (size_t)n_keys * sizeof(int64_t));
             for (uint32_t a = 0; a < n_aggs; a++) {
-                if (c->val_data[a]) {
+                if (v->val_data[a]) {
                     uint8_t ez = c->val_esz[a];
-                    memcpy(rec + c->val_off[a], (const char*)c->val_data[a] + (size_t)r * ez, ez);
+                    memcpy(rec + c->val_off[a], (const char*)v->val_data[a] + (size_t)(r - base) * ez, ez);
                 }
-                if (c->val2_data[a]) {
+                if (v->val2_data[a]) {
                     uint8_t ez2 = c->val2_esz[a];
-                    memcpy(rec + c->val2_off[a], (const char*)c->val2_data[a] + (size_t)r * ez2, ez2);
+                    memcpy(rec + c->val2_off[a], (const char*)v->val2_data[a] + (size_t)(r - base) * ez2, ez2);
                 }
             }
             int64_t pos = pos0 + i;
             memcpy(rec + c->row_off, &pos, sizeof(pos));
         }
-        ts->rows += n; ts->scattered += n;
         return;
     }
 
@@ -5216,10 +9202,9 @@ static void agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
     uint64_t mask = (uint64_t)t->cap - 1;
     uint32_t shift = 64 - t->bits;
     size_t estride = c->estride, key_bytes = (size_t)n_keys * sizeof(int64_t);
-    for (int64_t i = 0; i < n; i++) {
+    for (int64_t i = ib; i < ie; i++) {
         int64_t r = rows ? rows[i] : pos0 + i;
-        for (uint32_t k = 0; k < n_keys; k++)
-            keys[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+        AGG_TS_KEYS(r);
         uint64_t h = agg_ts_hash(keys, n_keys);
         uint8_t tag = agg_ts_tag(h);
         uint64_t slot = h >> shift;
@@ -5245,21 +9230,23 @@ static void agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
             }
             slot = (slot + 1) & mask;
         }
-        gid[i] = (uint32_t)slot;
+        gid[i - ib] = (uint32_t)slot;
     }
+    int64_t n = ie - ib;
     if (rows) {
-        if (agg_sel_accum_chunk(&c->vd, sc, t->ent, gid, rows, n) != 0) { ts->oom = 1; return; }
+        if (agg_sel_accum_chunk(&c->vd, v, run->sc, t->ent, gid, rows + ib, n, false) != 0) { ts->oom = 1; return; }
     } else {
+        int64_t at = pos0 + ib - base;
         for (uint32_t a = 0; a < n_aggs; a++) {
             char* states = t->ent + c->ent_off[a];
             if (c->vts[a]->update_batch2) {
-                const void* vx = (const char*)c->val_data[a]  + (size_t)pos0 * c->val_esz[a];
-                const void* vy = (const char*)c->val2_data[a] + (size_t)pos0 * c->val2_esz[a];
+                const void* vx = (const char*)v->val_data[a]  + (size_t)at * c->val_esz[a];
+                const void* vy = (const char*)v->val2_data[a] + (size_t)at * c->val2_esz[a];
                 ray_valid_t valid_x = { vx, c->val_types[a],  c->val_hasnull[a] };
                 ray_valid_t valid_y = { vy, c->val2_types[a], c->val2_hasnull[a] };
                 c->vts[a]->update_batch2(states, estride, gid, vx, vy, &valid_x, &valid_y, n, NULL);
-            } else if (c->val_data[a]) {
-                const void* vals = (const char*)c->val_data[a] + (size_t)pos0 * c->val_esz[a];
+            } else if (v->val_data[a]) {
+                const void* vals = (const char*)v->val_data[a] + (size_t)at * c->val_esz[a];
                 ray_valid_t valid = { vals, c->val_types[a], c->val_hasnull[a] };
                 c->vts[a]->update_batch(states, estride, gid, vals, &valid, n, NULL);
             } else {
@@ -5268,13 +9255,47 @@ static void agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
             }
         }
     }
-    t->rows += n; ts->rows += n;
+    #undef AGG_TS_KEYS
+}
+
+/* A piece of rows [b, e) of a contiguous chunk, as chunk indices. */
+static void agg_ts_range_rows(void* raw, const agg_view_t* v, uint32_t wid, int64_t b, int64_t e) {
+    agg_ts_run_t* run = raw;
+    agg_ts_idx_rows(raw, v, wid, b - run->pos0, e - run->pos0);
+}
+
+/* Visit one chunk of rows of a task: original rows `rows[i]` (or pos0 + i
+ * when rows == NULL) at logical input positions pos0 + i.  Staged sources
+ * are read by pieces of the chunk (through the task's cursors `cs` when
+ * given), or by runs of its selected rows through them.  False on a range
+ * error (noted keyed by `key`). */
+static bool agg_ts_chunk(agg_ts_ctx_t* c, agg_ts_task_t* ts,
+                         const int64_t* rows, int64_t pos0, int64_t n,
+                         agg_sel_scratch_t* sc, uint32_t* gid, int64_t* keys,
+                         uint32_t wid, agg_curs_t* cs, int64_t key) {
+    const agg_rr_t* rr = c->rr;
+    if (!ts->scatter && !agg_ts_reserve(c, ts, n)) { ts->oom = 1; return true; }
+    if (ts->scatter && !ts->buckets) {
+        ts->buckets = ray_calloc_raw((size_t)c->n_parts * sizeof(agg_ts_bucket_t));
+        if (!ts->buckets) { ts->oom = 1; return true; }
+    }
+    agg_ts_run_t run = { c, ts, rows, pos0, sc, gid, keys };
+    if (!rr->staged) agg_ts_idx_rows(&run, c->whole, wid, 0, n);
+    else if (rows) {
+        ray_t* err = agg_idx_walk(rr, cs, rows, 0, n, &run, agg_ts_idx_rows, wid);
+        if (err) { ray_scan_fail_note(rr->fail, key, err); return false; }
+    } else if (cs ? !agg_walk_cs(rr, cs, &run, agg_ts_range_rows, wid, pos0, pos0 + n, key)
+                  : !agg_walk(rr, &run, agg_ts_range_rows, wid, pos0, pos0 + n, key)) return false;
+    if (ts->oom) return true;
+    if (ts->scatter) { ts->rows += n; ts->scattered += n; }
+    else { ts->top->rows += n; ts->rows += n; }
+    return true;
 }
 
 /* Phase 1: one task = one contiguous range of logical input positions. */
 static void agg_ts_phase1_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
     agg_ts_ctx_t* c = (agg_ts_ctx_t*)vctx;
+    const agg_rr_t* rr = c->rr;
     ray_t* kb_hdr = NULL;
     int64_t* keys = (int64_t*)scratch_alloc(&kb_hdr,
         (size_t)(c->n_keys ? c->n_keys : 1) * sizeof(int64_t));
@@ -5289,23 +9310,30 @@ static void agg_ts_phase1_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         int64_t lo = ti * c->task_rows;
         int64_t hi = lo + c->task_rows;
         if (hi > c->n_in) hi = c->n_in;
+        if (rr->staged && ray_scan_fail_skip(rr->fail, lo)) continue;
         if (c->sel) {
             int64_t rows[AGG_SEL_CHUNK];
             agg_sel_scratch_t sc;
             if (!agg_sel_scratch_init(&sc, c->n_aggs)) { ts->oom = 1; continue; }
+            agg_curs_t cs; cs.cur = NULL;
+            if (rr->staged && !agg_curs_init(&cs, rr)) { ts->oom = 1; agg_sel_scratch_free(&sc); continue; }
             agg_sel_cursor_t cur;
             agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, lo, hi);
             int64_t pos = lo, cn;
             while (!ts->oom && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
-                agg_ts_chunk(c, ts, rows, pos, cn, &sc, gid, keys);
+                if (!agg_ts_chunk(c, ts, rows, pos, cn, &sc, gid, keys, wid, &cs, lo)) break;
                 pos += cn;
             }
+            agg_curs_free(&cs, rr);
             agg_sel_scratch_free(&sc);
         } else {
+            agg_curs_t tc; tc.cur = NULL;
+            if (rr->staged && !agg_curs_init(&tc, rr)) { ts->oom = 1; continue; }
             for (int64_t cs = lo; cs < hi && !ts->oom; cs += AGG_TS_CHUNK) {
                 int64_t ce = cs + AGG_TS_CHUNK; if (ce > hi) ce = hi;
-                agg_ts_chunk(c, ts, NULL, cs, ce - cs, NULL, gid, keys);
+                if (!agg_ts_chunk(c, ts, NULL, cs, ce - cs, NULL, gid, keys, wid, rr->staged ? &tc : NULL, lo)) break;
             }
+            agg_curs_free(&tc, rr);
         }
         for (agg_ts_table_t* tab = ts->top; tab; tab = tab->prev) ts->entries += tab->ng;
     }
@@ -5574,8 +9602,7 @@ static void agg_ts_merge_fn(void* vctx, uint32_t wid, int64_t start, int64_t end
 #define AGG_TS_PRE_SAMPLE2    1024
 #define AGG_TS_PRE_DECLINE_X  1.5
 typedef struct {
-    ray_t**        key_cols;
-    const void**   key_data;
+    const agg_rr_t* rr;    /* the keys are its first n_keys sources */
     uint32_t       n_keys;
     int64_t        n_in;
     int64_t        step;
@@ -5590,6 +9617,7 @@ typedef struct {
 static void agg_ts_sample_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_ts_sample_ctx_t* c = (agg_ts_sample_ctx_t*)vctx;
+    const agg_rr_t* rr = c->rr;
     uint32_t n_keys = c->n_keys;
     for (int64_t t = start; t < end; t++) {
         uint64_t* hs = c->hs + (size_t)t * AGG_TS_SAMPLE_SETCAP;
@@ -5597,7 +9625,12 @@ static void agg_ts_sample_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
         int64_t* keys = c->keys + (size_t)t * (n_keys ? n_keys : 1);
         int64_t rows[AGG_SEL_CHUNK];
         int64_t n = 0;
-        for (int64_t j = 0; j < AGG_TS_SAMPLE_PER; j++) {
+        /* staged keys: strided single rows, ascending, through this task's
+         * cursors (R-SPARSE) */
+        agg_curs_t cs; cs.cur = NULL;
+        ray_t* err = NULL;
+        if (rr->staged && !agg_curs_init(&cs, rr)) err = ray_error("oom", NULL);
+        for (int64_t j = 0; j < AGG_TS_SAMPLE_PER && !err; j++) {
             int64_t i = t * AGG_TS_SAMPLE_PER + j;
             int64_t pos = i * c->step + (int64_t)(ray_hash_i64(i) % (uint64_t)c->step);
             int64_t r = pos;
@@ -5607,8 +9640,9 @@ static void agg_ts_sample_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
                 if (agg_sel_cursor_next(&cur, rows) != 1) continue;
                 r = rows[0];
             }
-            for (uint32_t k = 0; k < n_keys; k++)
-                keys[k] = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
+            for (uint32_t k = 0; k < n_keys && !err; k++)
+                keys[k] = agg_key_at(rr, &cs, k, r, &err);
+            if (err) break;
             uint64_t h = agg_ts_hash(keys, n_keys);
             uint64_t at = h & (AGG_TS_SAMPLE_SETCAP - 1);
             while (hs[at] && hs[at] != h) at = (at + 1) & (AGG_TS_SAMPLE_SETCAP - 1);
@@ -5616,6 +9650,73 @@ static void agg_ts_sample_fn(void* vctx, uint32_t wid, int64_t start, int64_t en
             cnt[at]++;
             n++;
         }
+        agg_curs_free(&cs, rr);
+        if (err) ray_scan_fail_note(rr->fail, t, err);
+        c->n[t] = n;
+    }
+}
+
+/* agg_ts_sample_fn over staged keys: the same rows (the slice's selected
+ * rows ascending), each key read a vector at a time: the slice's rows in
+ * one vector point-read together (ray_col_src_points_i64: the body read
+ * once, not once per row), a declined vector through the cursor.  Its own
+ * instance: the plain sampler keeps its code. */
+static void agg_ts_sample_staged_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_ts_sample_ctx_t* c = (agg_ts_sample_ctx_t*)vctx;
+    const agg_rr_t* rr = c->rr;
+    const uint32_t n_keys = c->n_keys;
+    for (int64_t t = start; t < end; t++) {
+        uint64_t* hs = c->hs + (size_t)t * AGG_TS_SAMPLE_SETCAP;
+        uint16_t* cnt = c->cnt + (size_t)t * AGG_TS_SAMPLE_SETCAP;
+        int64_t rows[AGG_TS_SAMPLE_PER], one[AGG_SEL_CHUNK];
+        int64_t nr = 0;
+        for (int64_t j = 0; j < AGG_TS_SAMPLE_PER; j++) {
+            int64_t i = t * AGG_TS_SAMPLE_PER + j;
+            int64_t pos = i * c->step + (int64_t)(ray_hash_i64(i) % (uint64_t)c->step);
+            int64_t r = pos;
+            if (c->sel) {
+                agg_sel_cursor_t cur;
+                agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, pos, pos + 1);
+                if (agg_sel_cursor_next(&cur, one) != 1) continue;
+                r = one[0];
+            }
+            rows[nr++] = r;
+        }
+        agg_curs_t cs; cs.cur = NULL;
+        ray_t* err = NULL;
+        /* the slice's tuples, key-major: kv[k * nr + a] (the task's one scratch) */
+        int64_t* kv = (int64_t*)ray_alloc_raw((size_t)(nr ? nr : 1) * (n_keys ? n_keys : 1) * sizeof(int64_t));
+        if (!kv || !agg_curs_init(&cs, rr)) err = ray_error("oom", NULL);
+        for (uint32_t k = 0; k < n_keys && !err; k++) {
+            int64_t* vals = kv + (size_t)k * nr;
+            ray_col_src_t* src = rr->srcs[k];
+            for (int64_t a = 0; a < nr && !err; ) {
+                int64_t vlo, vhi, b = a + 1;
+                if (src && ray_col_src_vec_span(src, rows[a], &vlo, &vhi)) {
+                    while (b < nr && b - a < RAY_COL_POINT_ROWS && rows[b] < vhi) b++;
+                    int pr = agg_src_points(src, rows + a, b - a, vals + a, &err);
+                    if (pr < 0) break;
+                    if (pr > 0) { a = b; continue; }
+                }
+                vals[a] = agg_key_at(rr, &cs, k, rows[a], &err);   /* in place, or the cursor */
+                a++;
+            }
+        }
+        agg_curs_free(&cs, rr);
+        int64_t n = 0;
+        int64_t* keys = c->keys + (size_t)t * (n_keys ? n_keys : 1);
+        for (int64_t a = 0; a < nr && !err; a++) {
+            for (uint32_t k = 0; k < n_keys; k++) keys[k] = kv[(size_t)k * nr + a];
+            uint64_t h = agg_ts_hash(keys, n_keys);
+            uint64_t at = h & (AGG_TS_SAMPLE_SETCAP - 1);
+            while (hs[at] && hs[at] != h) at = (at + 1) & (AGG_TS_SAMPLE_SETCAP - 1);
+            if (!hs[at]) hs[at] = h;
+            cnt[at]++;
+            n++;
+        }
+        ray_free_raw(kv);
+        if (err) ray_scan_fail_note(rr->fail, t, err);
         c->n[t] = n;
     }
 }
@@ -5644,9 +9745,13 @@ static inline bool agg_ts_sel_row_at(const uint8_t* flags, const uint32_t* offse
     return true;
 }
 
-static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
-                                     ray_t* sel, const int64_t* sel_prefix, int64_t n_sel) {
+/* krr: the keys (staged ones read through cursors, scattered single rows);
+ * a range error sets *err (the caller returns it). */
+static bool agg_ts_precheck_declines(const agg_rr_t* krr, ray_t** key_cols, uint32_t n_keys, int64_t nrows,
+                                     ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
+                                     ray_t** err) {
     (void)sel_prefix;
+    *err = NULL;
     enum { PRECAP = AGG_TS_PRE_SAMPLE2 * 4 };
     int64_t n_in = sel ? n_sel : nrows;
     if (n_in < AGG_TS_SAMPLE) return false;
@@ -5656,16 +9761,14 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
     size_t nk = n_keys ? n_keys : 1;
     uint64_t phs[PRECAP];
     int64_t pkeys[16];
-    const void* pdata[16];
     ray_t* pk_hdr = NULL;
     int64_t* keys = pkeys;
-    const void** key_data = pdata;
     if (nk > 16) {
-        keys = (int64_t*)scratch_alloc(&pk_hdr, nk * (sizeof(int64_t) + sizeof(void*)));
+        keys = (int64_t*)scratch_alloc(&pk_hdr, nk * sizeof(int64_t));
         if (!keys) return false;
-        key_data = (const void**)(keys + nk);
     }
-    for (uint32_t k = 0; k < n_keys; k++) key_data[k] = ray_data(key_cols[k]);
+    agg_curs_t cs; cs.cur = NULL;
+    if (krr->staged && !agg_curs_init(&cs, krr)) { scratch_free(pk_hdr); return false; }
     memset(phs, 0, sizeof(phs));
     /* Stride AGG_TS_PRE_SAMPLE2 positions over the ORIGINAL rows (a selected
      * row is taken at or after each position); stage 1 visits every other
@@ -5676,7 +9779,7 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
     const int64_t ratio = AGG_TS_PRE_SAMPLE2 / AGG_TS_PRE_SAMPLE;
     int64_t pstep = nrows / AGG_TS_PRE_SAMPLE2;
     if (pstep < 1) pstep = 1;
-    if (!sel)
+    if (!sel && !krr->staged)    /* staged keys are read by range instead */
         for (uint32_t k = 0; k < n_keys; k++)
             if (ray_col_cold(key_cols[k]))
                 for (int64_t i = 0; i < AGG_TS_PRE_SAMPLE2; i++) {
@@ -5693,8 +9796,9 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
             if (pos >= nrows) break;
             int64_t r = pos;
             if (sel && !agg_ts_sel_row_at(sflags, soffsets, sidx, pos, jit >> 32, &r)) continue;
-            for (uint32_t k = 0; k < n_keys; k++)
-                keys[k] = agg_read_key_i64(key_cols[k], key_data[k], r);
+            for (uint32_t k = 0; k < n_keys && !*err; k++)
+                keys[k] = agg_key_at(krr, &cs, k, r, err);
+            if (*err) { agg_curs_free(&cs, krr); scratch_free(pk_hdr); return false; }
             uint64_t h = agg_ts_hash(keys, n_keys);
             uint64_t at = h & (PRECAP - 1);
             while (phs[at] && phs[at] != h) at = (at + 1) & (PRECAP - 1);
@@ -5713,6 +9817,7 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
         double birthday = repeats > 0 ? (double)n * (double)n / (2.0 * (double)repeats) : 9.2e18;
         declined = birthday >= AGG_TS_PRE_DECLINE_X * (double)AGG_TS_GATE_GROUPS;
     }
+    agg_curs_free(&cs, krr);
     scratch_free(pk_hdr);
     return declined;
 }
@@ -5734,10 +9839,11 @@ static bool agg_ts_precheck_declines(ray_t** key_cols, uint32_t n_keys, int64_t 
  * whose key was seen once — the mass of keys the sample never saw — for
  * the caller's gate.  Returns a value past INT64_MAX/2 when the sample is
  * all-distinct. */
-static double agg_ts_estimate(ray_pool_t* pool, ray_t** key_cols, const void** key_data,
+static double agg_ts_estimate(ray_pool_t* pool, const agg_rr_t* rr, ray_t** key_cols,
                               uint32_t n_keys, int64_t nrows,
                               ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
-                              int* unseen_pct) {
+                              int* unseen_pct, ray_t** err) {
+    *err = NULL;
     enum { CAP = 16384, PRECAP = AGG_TS_PRE_SAMPLE * 4 };
     int64_t n_in = sel ? n_sel : nrows;
     *unseen_pct = 0;
@@ -5757,21 +9863,28 @@ static double agg_ts_estimate(ray_pool_t* pool, ray_t** key_cols, const void** k
     uint64_t* ghs = (uint64_t*)(ns + AGG_TS_SAMPLE_TASKS);
     uint16_t* gcnt = (uint16_t*)(ghs + CAP);
     agg_ts_sample_ctx_t ctx = {
-        .key_cols = key_cols, .key_data = key_data, .n_keys = n_keys,
+        .rr = rr, .n_keys = n_keys,
         .n_in = n_in, .step = n_in / AGG_TS_SAMPLE,
         .sel = sel, .sel_prefix = sel_prefix,
         .hs = hs, .cnt = cnt, .keys = keys, .n = ns,
     };
-    if (!sel)
+    /* A cold mapped key: ask for the sampled rows' pages first (the
+     * staged sources of generation 2 are read by range instead). */
+    if (!sel && !rr->staged)
         for (uint32_t k = 0; k < n_keys; k++)
             if (ray_col_cold(key_cols[k]))
                 for (int64_t i = 0; i < AGG_TS_SAMPLE; i++)
                     ray_col_want_row(key_cols[k],
                         i * ctx.step + (int64_t)(ray_hash_i64(i) % (uint64_t)ctx.step));
-    if (ray_pool_par_dispatch_ok(pool, AGG_TS_SAMPLE, 1))
-        ray_pool_dispatch_n(pool, agg_ts_sample_fn, &ctx, AGG_TS_SAMPLE_TASKS);
+    bool par = ray_pool_par_dispatch_ok(pool, AGG_TS_SAMPLE, 1);
+    if (par)
+        ray_pool_dispatch_n(pool, rr->staged ? agg_ts_sample_staged_fn : agg_ts_sample_fn, &ctx, AGG_TS_SAMPLE_TASKS);
     else
-        agg_ts_sample_fn(&ctx, 0, 0, AGG_TS_SAMPLE_TASKS);
+        (rr->staged ? agg_ts_sample_staged_fn : agg_ts_sample_fn)(&ctx, 0, 0, AGG_TS_SAMPLE_TASKS);
+    if (rr->staged && (*err = ray_scan_fail_finish(rr->fail, par ? pool : NULL)) != NULL) {
+        scratch_free(hdr);
+        return (double)n_in;
+    }
     /* Merge the slices' counts into one set. */
     int64_t d = 0, n = 0;
     for (int t = 0; t < AGG_TS_SAMPLE_TASKS; t++) {
@@ -5803,7 +9916,7 @@ static double agg_ts_estimate(ray_pool_t* pool, ray_t** key_cols, const void** k
  * estimate says the radix scatter is the better fit; see the header. */
 static ray_t* exec_group_v2_parallel_tablestack(
         ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
-        ray_t** key_cols, int64_t* key_syms,
+        ray_t** key_cols, int64_t* key_syms, const agg_rr_t* krr,
         const agg_vtable_t** vts, const size_t* off, size_t block,
         ray_t* sel, const int64_t* sel_prefix, int64_t n_sel,
         int64_t group_limit, const ray_group_emit_filter_t* efp) {
@@ -5814,13 +9927,16 @@ static ray_t* exec_group_v2_parallel_tablestack(
 
     /* Near-unique keys (the common radix shape) decline here, before any
      * allocation: the radix path then runs exactly as it always has. */
-    if (agg_ts_precheck_declines(key_cols, n_keys, nrows, sel, sel_prefix, n_sel)) {
+    ray_t* perr = NULL;
+    if (agg_ts_precheck_declines(krr, key_cols, n_keys, nrows, sel, sel_prefix, n_sel, &perr)) {
         ray_profile_tick("tablestack: gate declined");
         return NULL;
     }
+    if (perr) return perr;
 
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, key_cols)) return ray_error("oom", NULL);
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr ? derr : ray_error("oom", NULL);
 
     int64_t n_in = sel ? n_sel : nrows;
     if (n_in < 0) n_in = 0;
@@ -5839,8 +9955,9 @@ static ray_t* exec_group_v2_parallel_tablestack(
     size_t state_off = AGG_TS_KEY_OFF + (size_t)n_keys * sizeof(int64_t);
     size_t estride = (state_off + block + 7u) & ~(size_t)7u;
     int unseen_pct = 0;
-    double est = agg_ts_estimate(pool, key_cols, d.key_data, n_keys, nrows,
-                                 sel, sel_prefix, n_sel, &unseen_pct);
+    double est = agg_ts_estimate(pool, &d.rr, key_cols, n_keys, nrows,
+                                 sel, sel_prefix, n_sel, &unseen_pct, &derr);
+    if (derr) { agg_desc_free(&d); return derr; }
     uint32_t init_bits = AGG_TS_MIN_BITS;
     while (init_bits < AGG_TS_MAX_BITS &&
            (double)((int64_t)1 << init_bits) * 0.75 < est * 1.25) init_bits++;
@@ -5875,8 +9992,8 @@ static ray_t* exec_group_v2_parallel_tablestack(
     size_t* ent_off  = val2_off + (n_aggs ? n_aggs : 1);
     size_t rec_cur = (size_t)n_keys * 8;
     for (uint32_t a = 0; a < n_aggs; a++) {
-        if (d.val_data[a])  { val_off[a]  = rec_cur; rec_cur += d.val_esz[a]; }
-        if (d.val2_data[a]) { val2_off[a] = rec_cur; rec_cur += d.val2_esz[a]; }
+        if (d.val_id[a])  { val_off[a]  = rec_cur; rec_cur += d.val_esz[a]; }
+        if (d.val2_id[a]) { val2_off[a] = rec_cur; rec_cur += d.val2_esz[a]; }
     }
     size_t row_off = rec_cur; rec_cur += 8;
     size_t rec = (rec_cur + 7u) & ~(size_t)7u;
@@ -5910,11 +10027,11 @@ static ray_t* exec_group_v2_parallel_tablestack(
     agg_ts_ctx_t ctx = {
         .key_cols = key_cols, .key_data = d.key_data, .n_keys = n_keys,
         .vts = vts, .off = off, .block = block, .n_aggs = n_aggs,
-        .val_data = d.val_data, .val_types = d.val_types, .val_hasnull = d.val_hasnull, .val_esz = d.val_esz,
-        .val2_data = d.val2_data, .val2_types = d.val2_types, .val2_hasnull = d.val2_hasnull, .val2_esz = d.val2_esz,
+        .val_data = d.val_id, .val_types = d.val_types, .val_hasnull = d.val_hasnull, .val_esz = d.val_esz,
+        .val2_data = d.val2_id, .val2_types = d.val2_types, .val2_hasnull = d.val2_hasnull, .val2_esz = d.val2_esz,
         .vd = { .n_aggs = n_aggs, .vts = vts, .off = ent_off, .block = estride,
-                .val_data = d.val_data, .val_types = d.val_types, .val_hasnull = d.val_hasnull, .val_esz = d.val_esz,
-                .val2_data = d.val2_data, .val2_types = d.val2_types, .val2_hasnull = d.val2_hasnull, .val2_esz = d.val2_esz },
+                .val_data = d.val_id, .val_types = d.val_types, .val_hasnull = d.val_hasnull, .val_esz = d.val_esz,
+                .val2_data = d.val2_id, .val2_types = d.val2_types, .val2_hasnull = d.val2_hasnull, .val2_esz = d.val2_esz },
         .ent_off = ent_off, .estride = estride, .state_off = state_off,
         .rec = rec, .row_off = row_off, .val_off = val_off, .val2_off = val2_off,
         .n_parts = n_parts, .part_bits = (uint32_t)__builtin_ctz(n_parts),
@@ -5922,10 +10039,13 @@ static ray_t* exec_group_v2_parallel_tablestack(
         .n_in = n_in, .task_rows = task_rows, .n_tasks = n_tasks,
         .tasks = tasks, .parts = parts,
         .sel = sel, .sel_prefix = sel_prefix,
+        .rr = &d.rr, .whole = &d.whole,
     };
 
+    agg_desc_advise(&d, nrows);
     ray_pool_dispatch_n(pool, agg_ts_phase1_fn, &ctx, n_tasks);
-    bool cancelled = pool_cancelled(pool);
+    ray_t* ferr = d.staged ? ray_scan_fail_finish(&d.fail, pool) : NULL;
+    bool cancelled = pool_cancelled(pool) || ferr;
     int oom = 0;
     uint32_t scatter_tasks = 0; uint64_t tables = 0; int64_t cand = 0;
     for (uint32_t t = 0; t < n_tasks; t++) {
@@ -5954,6 +10074,7 @@ static ray_t* exec_group_v2_parallel_tablestack(
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
         ray_free_raw(parts);
         agg_desc_free(&d);
+        if (ferr) return ferr;
         if (cancelled) return ray_error("cancel", NULL);
         return exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                 key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
@@ -6209,8 +10330,8 @@ static void agg_index_stream_reduce(void* raw, uint32_t wid, int64_t start, int6
             }
             while (at < stop) {
                 int64_t n = stop - at < AGG_SEL_CHUNK ? stop - at : AGG_SEL_CHUNK;
-                if (ex) agg_sel_gather_vals(x, ray_data(c->x), ex, c->rows + at, n);
-                if (ey) agg_sel_gather_vals(y, ray_data(c->y), ey, c->rows + at, n);
+                if (ex) agg_sel_gather_vals(x, ray_data(c->x), ex, c->rows + at, n, 0);
+                if (ey) agg_sel_gather_vals(y, ray_data(c->y), ey, c->rows + at, n, 0);
                 if (c->y) c->vt->update_batch2(state, c->vt->state_size, gids, x, y, &vx, &vy, n, NULL);
                 else c->vt->update_batch(state, c->vt->state_size, gids, x, &vx, n, NULL);
                 at += n;
@@ -6282,7 +10403,7 @@ static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
             case RAY_I16: INDEX_FIRST_VALID(int16_t, value != NULL_I16);
             case RAY_I32: case RAY_DATE: case RAY_TIME:
                 INDEX_FIRST_VALID(int32_t, value != NULL_I32);
-            case RAY_I64: case RAY_TIMESTAMP:
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:
                 INDEX_FIRST_VALID(int64_t, value != NULL_I64);
             case RAY_F32: INDEX_FIRST_VALID(float, value == value);
             case RAY_F64: INDEX_FIRST_VALID(double, value == value);
@@ -6432,7 +10553,8 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
         uint16_t kind = ext->agg_ops[a];
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* src = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
+        ray_t* src = ie ? ray_table_col(tbl, ie->sym) : NULL;
+        if (src && RAY_IS_ERR(src)) { ray_release(result); result = src; goto done; }
         int64_t param = ext->agg_k ? ext->agg_k[a] : 0;
         ray_t* col = NULL;
         /* The kernels below read src at every row, group by group, so at
@@ -6472,8 +10594,10 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
+            ray_t* ycol = ray_table_col(tbl, ye->sym);
+            if (ycol && RAY_IS_ERR(ycol)) { ray_release(result); result = ycol; goto done; }
             col = agg_index_streaming(agg_resolve(kind, src->type), src,
-                ray_table_get_col(tbl, ye->sym), &groups, rows, offsets, nrows, param);
+                ycol, &groups, rows, offsets, nrows, param);
         } else if (kind == OP_COUNT) {
             col = ray_vec_new(RAY_I64, ng);
             if (col && !RAY_IS_ERR(col)) { col->len = ng; memcpy(ray_data(col), counts, (size_t)ng * sizeof(int64_t)); }
@@ -6498,27 +10622,33 @@ done:
  * Predominantly changing states use owned partitions instead of contended CAS.
  * The sample is query-local and never supplies an answer to execution. */
 static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
-        ray_t** keys, const agg_vo_t* vo, int64_t rows) {
+        ray_t** keys, const agg_vo_t* vo, int64_t rows, ray_t** err) {
+    *err = NULL;
     if (!ext->n_aggs) return true;
     if (rows < 1024) return false;
     enum { SAMPLES = 1024, CAP = 2048 };
     agg_desc_t d;
-    if (!agg_desc_init(&d, g, ext, tbl, keys)) return false;
+    if (!agg_desc_init(&d, g, ext, tbl, keys, err)) return false;   /* *err: failed bind; else OOM = not shared */
     char* states = ray_alloc_raw((SAMPLES + 1) * vo->block);
     if (!states) { agg_desc_free(&d); return false; }
+    /* Staged sources: strided single rows, ascending, through cursors
+     * (R-SPARSE). */
+    agg_curs_t cs; cs.cur = NULL;
+    if (d.staged && !agg_curs_init(&cs, &d.rr)) { ray_free_raw(states); agg_desc_free(&d); return false; }
     char* previous = states + SAMPLES * vo->block;
     int16_t map[CAP]; int64_t values[SAMPLES];
     memset(map, -1, sizeof(map));
     uint32_t gid = 0;
     int groups = 0, unchanged = 0;
     int64_t step = rows / SAMPLES;
-    if (ray_col_cold(keys[0]))
+    if (!d.staged && ray_col_cold(keys[0]))
         for (int i = 0; i < SAMPLES; i++)
             ray_col_want_row(keys[0], i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
-    for (int i = 0; i < SAMPLES; i++) {
+    for (int i = 0; i < SAMPLES && !*err; i++) {
         uint64_t jitter = ray_hash_i64(i);
         int64_t row = i * step + jitter % step;
-        int64_t value = agg_read_key_i64(keys[0], ray_data(keys[0]), row);
+        int64_t value = agg_key_at(&d.rr, &cs, 0, row, err);
+        if (*err) break;
         uint32_t at = ray_hash_i64(value) & (CAP - 1);
         while (map[at] >= 0 && values[map[at]] != value) at = (at + 1) & (CAP - 1);
         if (map[at] < 0) {
@@ -6528,15 +10658,16 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         }
         char* state = states + map[at] * vo->block;
         memcpy(previous, state, vo->block);
-        for (uint32_t a = 0; a < ext->n_aggs; a++) {
-            const void* input = d.val_data[a] ? (const char*)d.val_data[a] + (size_t)row * d.val_esz[a] : NULL;
+        for (uint32_t a = 0; a < ext->n_aggs && !*err; a++) {
+            const void* input = agg_elem_at(&d.rr, &cs, ext->n_keys + a, row, err);
             ray_valid_t valid = {input, d.val_types[a], d.val_hasnull[a]};
-            vo->vts[a]->update_shared(state + vo->off[a], vo->block, &gid, input, &valid, 1);
+            if (!*err) vo->vts[a]->update_shared(state + vo->off[a], vo->block, &gid, input, &valid, 1);
         }
         unchanged += memcmp(previous, state, vo->block) == 0;
     }
+    agg_curs_free(&cs, &d.rr);
     ray_free_raw(states); agg_desc_free(&d);
-    return unchanged >= SAMPLES / 4;
+    return !*err && unchanged >= SAMPLES / 4;
 }
 
 /* Core of exec_group_v2: resolution + strategy dispatch over (tbl, nrows).
@@ -6563,6 +10694,45 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t group_limit,
                                 const ray_group_emit_filter_t* efp);
 
+/* A segment-streamed table (g->grp_seg_stream) holding a parted column. */
+static bool agg_seg_parted(ray_graph_t* g, ray_t* tbl) {
+    if (!g->grp_seg_stream) return false;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) return true;
+    }
+    return false;
+}
+
+/* R-RANDOM over a segment-streamed table: a strategy that reads keys or
+ * inputs at stored rows or whole runs over a flat copy of the table, each
+ * parted column copied from its segments by range (parted_flatten_fixed,
+ * the concat fallback's own copy), released when the run returns. */
+static ray_t* agg_seg_flat_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                               int64_t nrows, ray_t* sel,
+                               const int64_t* sel_prefix, int64_t n_sel,
+                               int64_t group_limit,
+                               const ray_group_emit_filter_t* efp) {
+    int64_t nc = ray_table_ncols(tbl);
+    int64_t fx_ncnt = 0;
+    const int64_t* fx_cnt = parted_table_counts(tbl, &fx_ncnt);
+    ray_t* flat = ray_table_new(nc > 0 ? nc : 1);
+    for (int64_t c = 0; c < nc && flat && !RAY_IS_ERR(flat); c++) {
+        ray_t* slot = ray_table_slot_idx(tbl, c);
+        ray_col_meta_t m;
+        ray_t* v = ray_col_meta_of(slot, &m) && RAY_IS_PARTED(m.type) ? parted_flatten_fixed_c(slot, nrows, fx_cnt, fx_ncnt) : slot;
+        if (!v || RAY_IS_ERR(v)) { ray_release(flat); return v ? v : ray_error("oom", NULL); }
+        flat = ray_table_add_col(flat, ray_table_col_name(tbl, c), v);
+        if (v != slot) ray_release(v);
+    }
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+    ray_t* r = exec_group_v2_run_inner(g, op, flat, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+    ray_graph_unbind_table(g, flat);
+    ray_release(flat);
+    return r;
+}
+
 /* Trim a full group result to the emit filter's keep set (the same decision
  * the native selections make, over the finished aggregate column).  Row
  * order is preserved.  Consumes `result`; a failure keeps the full result,
@@ -6575,7 +10745,8 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
     if (agg_ops && (ef->agg_op ? ef->agg_op : OP_COUNT) != agg_ops[ef->agg_index]) return result;
     int64_t nrows = ray_table_nrows(result);
     if (nrows <= 0) return result;
-    ray_t* vcol = ray_table_get_col_idx(result, (int64_t)n_keys + ef->agg_index);
+    ray_t* vcol = ray_table_col_idx(result, (int64_t)n_keys + ef->agg_index);
+    if (vcol && RAY_IS_ERR(vcol)) { ray_error_free(vcol); return result; }   /* the sort+take downstream re-reads it */
     if (!vcol || (vcol->type != RAY_I64 && vcol->type != RAY_F64)) return result;
     double* vals = ray_alloc_raw((size_t)nrows * sizeof(double));
     uint8_t* keep = ray_alloc_raw((size_t)nrows);
@@ -6614,7 +10785,7 @@ ray_t* agg_emit_filter_trim(ray_t* result, uint32_t n_keys, uint32_t n_aggs,
  * exists and holds the operation the filter names (count when unset).  The
  * filter stays armed while the matched select's whole `from:` evaluates, so
  * grouped selects nested inside see it too; for them this is false. */
-static bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext) {
+bool agg_emit_filter_targets(const ray_group_emit_filter_t* ef, const ray_op_ext_t* ext) {
     return ef && ef->enabled && ext && ef->agg_index < ext->n_aggs &&
            (ef->agg_op ? ef->agg_op : OP_COUNT) == ext->agg_ops[ef->agg_index];
 }
@@ -6662,8 +10833,6 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
  * spent — when the N keys are not found within a bounded prefix, or when the
  * N groups hold a large share of the rows (sampled before the parallel pass,
  * counted exactly in it), where aggregating everything costs about the same. */
-#define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
-#define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
 #define AGG_FIRSTN_SAMPLES    4096     /* evenly spaced rows for the share estimate */
 #define AGG_FIRSTN_SHARE      64       /* full run once the N groups hold 1/64 of the rows */
 
@@ -6717,10 +10886,12 @@ static inline int64_t agg_firstn_probe(agg_firstn_set_t* s, const int64_t* kv,
 /* Fold key column `col` rows [b, b+n) into the running hashes h[0..n). The
  * widening matches agg_read_key_i64 (signed types sign-extend, SYM and U8/BOOL
  * zero-extend), so the folded hash equals agg_firstn_hash of the read tuple. */
-static void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
+/* Always inlined: the per-task hash pass is the pre-pass's hot loop, and a
+ * second caller (the pick) must not turn it into a call. */
+static inline __attribute__((always_inline)) void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
                                   int64_t b, int64_t n) {
     switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)data + b;
             for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
             break;
@@ -6769,6 +10940,61 @@ static void agg_firstn_hash_block(uint64_t* h, ray_t* col, const void* data,
             break;
     }
 }
+/* agg_firstn_hash_block over a type and SYM width instead of a column:
+ * the staged passes' instance (a view's width is per piece), kept apart so
+ * the plain passes keep their code. */
+static inline __attribute__((always_inline)) void agg_firstn_hash_raw(uint64_t* h, int8_t type, uint8_t attrs,
+                                  const void* data, int64_t b, int64_t n) {
+    switch (type) {
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
+            const int64_t* d = (const int64_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
+            break;
+        }
+        case RAY_I32: case RAY_DATE: case RAY_TIME: {
+            const int32_t* d = (const int32_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+            break;
+        }
+        case RAY_I16: {
+            const int16_t* d = (const int16_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+            break;
+        }
+        case RAY_U8: case RAY_BOOL: {
+            const uint8_t* d = (const uint8_t*)data + b;
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+            break;
+        }
+        case RAY_SYM:
+            switch (attrs & RAY_SYM_W_MASK) {
+                case RAY_SYM_W8: {
+                    const uint8_t* d = (const uint8_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+                    break;
+                }
+                case RAY_SYM_W16: {
+                    const uint16_t* d = (const uint16_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+                    break;
+                }
+                case RAY_SYM_W32: {
+                    const uint32_t* d = (const uint32_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], (int64_t)d[i]);
+                    break;
+                }
+                default: {
+                    const int64_t* d = (const int64_t*)data + b;
+                    for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], d[i]);
+                    break;
+                }
+            }
+            break;
+        default:   /* admission keeps every other type out */
+            for (int64_t i = 0; i < n; i++) AGG_FIRSTN_MIX(h[i], agg_read_key_i64_raw(type, attrs, data, b + i));
+            break;
+    }
+}
 
 #define AGG_FIRSTN_LOCAL 1024          /* matches a task keeps before spilling */
 
@@ -6784,6 +11010,10 @@ typedef struct {
     int64_t*     local;        /* tasks * AGG_FIRSTN_LOCAL: the first matches */
     int64_t*     out;          /* write pass: the final row list */
     int64_t*     kvs;          /* tasks * n_keys: each task's probe tuple */
+    const agg_rr_t* rr;        /* staged keys (agg_firstn_task_staged); NULL: plain */
+    const int64_t*  mem_v;     /* staged: n_keys member sets of 1 << mem_bits slots */
+    const uint8_t*  mem_used;
+    uint32_t        mem_bits;
 } agg_firstn_ctx_t;
 
 /* One task: the selected rows of its morsel segments whose key tuple is in
@@ -6833,6 +11063,381 @@ static void agg_firstn_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t t = start; t < end; t++) agg_firstn_task((agg_firstn_ctx_t*)raw, (uint32_t)t);
 }
 
+/* ---- The passes over staged keys (generation 2, single file or parted):
+ * the keys are read through the key set's sources, never unstaged.  Rows
+ * are read in order through task-held cursors (each touched vector decoded
+ * once per task); the share sample point-reads its rows.  Separate
+ * instances: the plain passes above keep their code. ---- */
+
+/* Key k at row r through the cursor set: in place for a plain key, else
+ * from its cursor's view.  *err set on a range error. */
+static inline int64_t agg_firstn_key_cur(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k, int64_t r, ray_t** err) {
+    if (!rr->srcs[k]) return agg_read_key_i64_raw(rr->key_types[k], rr->key_attrs[k], rr->plain[k], r);
+    const ray_col_range_t* v;
+    if ((*err = ray_col_cursor_at(&cs->cur[k], r, &v)) != NULL) return 0;
+    return agg_read_key_i64_raw(rr->key_types[k], v->attrs, v->data, r - v->start);
+}
+
+/* Pass 1 over staged keys: the first group_limit distinct tuples from the
+ * first selected row, within the row budget, through one cursor set.  NULL
+ * or an owned error. */
+static ray_t* agg_firstn_seen_staged(const agg_rr_t* rr, agg_firstn_set_t* set, ray_t* sel,
+                                     int64_t nrows, int64_t n_segs, int64_t group_limit, int64_t* kv) {
+    agg_curs_t cs;
+    if (!agg_curs_init(&cs, rr)) return ray_error("oom", NULL);
+    const uint8_t*  fl = sel ? ray_rowsel_flags(sel) : NULL;
+    const uint32_t* of = sel ? ray_rowsel_offsets(sel) : NULL;
+    const uint16_t* ix = sel ? ray_rowsel_idx(sel) : NULL;
+    int64_t budget = group_limit * 64 > AGG_FIRSTN_PROBE_ROWS ? group_limit * 64 : AGG_FIRSTN_PROBE_ROWS;
+    int64_t scanned = 0;
+    ray_t* err = NULL;
+    for (int64_t seg = 0; seg < n_segs && set->n < group_limit && scanned < budget && !err; seg++) {
+        if (fl && fl[seg] == RAY_SEL_NONE) continue;
+        int64_t b = seg * RAY_MORSEL_ELEMS;
+        int64_t len = nrows - b < RAY_MORSEL_ELEMS ? nrows - b : RAY_MORSEL_ELEMS;
+        bool mix = fl && fl[seg] == RAY_SEL_MIX;
+        int64_t j_end = mix ? (int64_t)of[seg + 1] : len;
+        for (int64_t j = mix ? (int64_t)of[seg] : 0;
+             j < j_end && set->n < group_limit && scanned < budget; j++, scanned++) {
+            int64_t row = b + (mix ? (int64_t)ix[j] : j);
+            for (uint32_t k = 0; k < rr->n_keys && !err; k++) kv[k] = agg_firstn_key_cur(rr, &cs, k, row, &err);
+            if (err) break;
+            agg_firstn_probe(set, kv, agg_firstn_hash(kv, rr->n_keys), true);
+        }
+    }
+    agg_curs_free(&cs, rr);
+    return err;
+}
+
+/* The share sample over staged keys: the plain sample's rows, each key
+ * point-read (agg_key_at: no vector decoded; SYM ids too) or, declined (RAW,
+ * DELTA_BP, nulls), read through a cursor, which decodes the sampled
+ * vector.  The rows are split across pool tasks when the pass-2 dispatch
+ * is (each task its own cursors), so declined reads do not decode serially;
+ * a range error is noted keyed by the task's first sample row. */
+typedef struct {
+    const agg_rr_t*   rr;
+    agg_firstn_set_t* set;
+    int64_t           step, samples;
+    uint32_t          tasks;
+    int64_t*          hits;      /* [tasks] */
+    int64_t*          kvs;       /* [tasks * n_keys] */
+} agg_firstn_share_t;
+
+static void agg_firstn_share_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_firstn_share_t* c = (agg_firstn_share_t*)raw;
+    const agg_rr_t* rr = c->rr;
+    for (int64_t t = start; t < end; t++) {
+        int64_t i0 = c->samples * t / c->tasks, i1 = c->samples * (t + 1) / c->tasks;
+        int64_t key = i0 * c->step, hits = 0;
+        int64_t* kv = c->kvs + t * rr->n_keys;
+        c->hits[t] = 0;
+        if (i0 >= i1 || ray_scan_fail_skip(rr->fail, key)) continue;
+        agg_curs_t cs;
+        if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, key, ray_error("oom", NULL)); continue; }
+        ray_t* err = NULL;
+        for (int64_t i = i0; i < i1 && !err; i++) {
+            for (uint32_t k = 0; k < rr->n_keys && !err; k++) kv[k] = agg_key_at(rr, &cs, k, i * c->step, &err);
+            if (!err && agg_firstn_probe(c->set, kv, agg_firstn_hash(kv, rr->n_keys), false) >= 0) hits++;
+        }
+        agg_curs_free(&cs, rr);
+        if (err) ray_scan_fail_note(rr->fail, key, err);
+        c->hits[t] = hits;
+    }
+}
+
+/* NULL or an owned error; *hits the sampled rows in the set. */
+static ray_t* agg_firstn_share_staged(const agg_rr_t* rr, agg_firstn_set_t* set, int64_t nrows,
+                                      int64_t samples, ray_pool_t* pool, bool par, int64_t* hits) {
+    uint32_t tasks = par ? ray_pool_total_workers(pool) : 1;
+    if ((int64_t)tasks > samples) tasks = (uint32_t)(samples > 0 ? samples : 1);
+    ray_t* hdr = NULL;
+    int64_t* buf = (int64_t*)scratch_alloc(&hdr, (size_t)tasks * (1 + rr->n_keys) * sizeof(int64_t));
+    if (!buf) return ray_error("oom", NULL);
+    agg_firstn_share_t c = { .rr = rr, .set = set, .step = nrows / samples, .samples = samples,
+                             .tasks = tasks, .hits = buf, .kvs = buf + tasks };
+    ray_scan_fail_init(rr->fail);
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_firstn_share_fn, &c, tasks);
+    else agg_firstn_share_fn(&c, 0, 0, 1);
+    ray_t* err = ray_scan_fail_finish(rr->fail, tasks > 1 ? pool : NULL);
+    *hits = 0;
+    for (uint32_t t = 0; t < tasks; t++) *hits += buf[t];
+    scratch_free(hdr);
+    return err;
+}
+
+/* One piece of a staged pass-2 segment: rows [b, e) of every key (a piece
+ * ends at the nearest view end), hashed a key at a time, then the
+ * segment's selected rows inside it probed. */
+typedef struct {
+    agg_firstn_ctx_t* c;
+    uint64_t*         hb;       /* RAY_MORSEL_ELEMS */
+    int64_t*          kv;
+    int64_t*          out;
+    int64_t           out_cap, n;
+    int64_t           seg_b;    /* the segment's first row */
+    const uint16_t*   ix;       /* MIX: selected indices [j, j_end) of the segment */
+    int64_t           j, j_end;
+} agg_firstn_piece_t;
+
+static void agg_firstn_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    (void)wid;
+    agg_firstn_piece_t* t = (agg_firstn_piece_t*)ctx;
+    const agg_rr_t* rr = t->c->rr;
+    agg_firstn_set_t* set = t->c->set;
+    const uint32_t nk = rr->n_keys;
+    const void* kd[nk];
+    uint8_t ka[nk];
+    const int64_t n = e - b;
+    for (int64_t i = 0; i < n; i++) t->hb[i] = AGG_FIRSTN_SEED;
+    for (uint32_t k = 0; k < nk; k++) {
+        kd[k] = rr->srcs[k] ? p[k].data : (const char*)rr->plain[k] + (size_t)b * rr->esz[k];
+        ka[k] = rr->srcs[k] ? p[k].attrs : rr->key_attrs[k];
+        agg_firstn_hash_raw(t->hb, rr->key_types[k], ka[k], kd[k], 0, n);
+    }
+    const uint32_t bshift = 64 - set->bbits;
+    for (int64_t q = t->ix ? t->j : 0; q < (t->ix ? t->j_end : n); q++) {
+        int64_t i;
+        if (t->ix) {
+            int64_t r = t->seg_b + (int64_t)t->ix[q];
+            if (r >= e) break;                 /* the next piece's */
+            i = r - b;
+            t->j = q + 1;
+        } else {
+            i = q;
+        }
+        uint64_t hv = AGG_FIRSTN_FINAL(t->hb[i]);
+        uint64_t bit = hv >> bshift;
+        if (!((set->bloom[bit >> 6] >> (bit & 63)) & 1)) continue;
+        for (uint32_t k = 0; k < nk; k++) t->kv[k] = agg_read_key_i64_raw(rr->key_types[k], ka[k], kd[k], i);
+        if (agg_firstn_probe(set, t->kv, hv, false) < 0) continue;
+        if (t->n < t->out_cap) t->out[t->n] = b + i;
+        t->n++;
+    }
+}
+
+/* Lane i of a view's run lanes at width T. */
+static inline uint64_t agg_vv_lane(const ray_enc_lanes_t* l, int T, uint32_t i) {
+    switch (T) {
+    case 8:  return l->b[i];
+    case 16: return l->h[i];
+    case 32: return l->s[i];
+    default: return l->q[i];
+    }
+}
+
+/* Each key's member values (the distinct values key k takes among the N
+ * groups' tuples), an exact open-addressing set: pass 2 on runs skips a
+ * run whose value no group holds without reading the other key. */
+static inline uint32_t agg_firstn_mslot(int64_t x, uint32_t bits) {
+    return (uint32_t)(((uint64_t)x * 0x9E3779B97F4A7C15ULL) >> (64 - bits));
+}
+static inline bool agg_firstn_member(const agg_firstn_ctx_t* c, uint32_t k, int64_t x) {
+    const uint32_t cap = 1u << c->mem_bits, mask = cap - 1;
+    const int64_t* v = c->mem_v + (size_t)k * cap;
+    const uint8_t* u = c->mem_used + (size_t)k * cap;
+    for (uint32_t i = agg_firstn_mslot(x, c->mem_bits);; i = (i + 1) & mask) {
+        if (!u[i]) return false;
+        if (v[i] == x) return true;
+    }
+}
+
+/* Key k's vector at segment `seg` when it is a run view (RLE or CONST, not a float,
+ * without a null bitmap: SYM nulls are in-band ids), read by
+ * ray_col_src_vview, which makes every check the decode would: 1, 0 not
+ * one (read the vector otherwise), -1 with *err.  The descriptor's
+ * encoding is looked at first, so no other codec builds a view. */
+static int agg_firstn_runview(const agg_rr_t* rr, uint32_t k, int64_t seg, int64_t len,
+                              ray_enc_vview_t* vv, ray_t** err) {
+    ray_col_src_t* src = rr->srcs[k];
+    if (!src || !ray_col_src_encoded(src) || ray_enccol_decoded_peek(src->obj)) return 0;
+    ray_enccol_t* e = ray_enccol_of(src->obj);
+    if (e->kind != RAY_ENCCOL_SINGLE) return 0;
+    /* a float view's run values are bit patterns: compared as integers they
+     * would split -0.0 from +0.0, so a float key is read by its values */
+    if (e->type == RAY_F32 || e->type == RAY_F64) return 0;
+    uint8_t enc = ray_enccol_descs(e, seg / RAY_ENC_VECS_PER_CHUNK)[seg % RAY_ENC_VECS_PER_CHUNK].encoding;
+    if (enc != RAY_ENC_RLE && enc != RAY_ENC_CONST) return 0;
+    int r = ray_col_src_vview(src, seg, vv, err);
+    if (r <= 0) return r;
+    if ((vv->enc != RAY_ENC_RLE && vv->enc != RAY_ENC_CONST) || vv->n != len ||
+        vv->nullmap || (vv->n_nulls && rr->key_types[k] != RAY_SYM)) return 0;
+    return 1;
+}
+
+/* A key's reader inside one segment: its runs (a run view, the current
+ * run tracked) or its values (the cursor's decoded view, or in place). */
+typedef struct {
+    bool            runs;
+    ray_enc_vview_t* vv;
+    uint32_t        ri;          /* runs: the current run */
+    const void*     data;        /* values: element 0 is the segment's row 0 */
+    uint8_t         attrs;
+} agg_firstn_kr_t;
+
+static inline int64_t agg_firstn_run_val(const ray_enc_vview_t* vv, uint32_t r) {
+    return ray_enc_logical(agg_vv_lane(&vv->run_vals, vv->k.T, r), vv->k);
+}
+
+/* The other key's reader at segment row 0, made on first use. */
+static ray_t* agg_firstn_kr_open(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k, int64_t seg, int64_t len,
+                                 ray_enc_vview_t* vv, agg_firstn_kr_t* kr) {
+    const int64_t b = seg * RAY_MORSEL_ELEMS;
+    ray_t* err = NULL;
+    kr->vv = vv; kr->ri = 0;
+    int r = agg_firstn_runview(rr, k, seg, len, vv, &err);
+    if (r < 0) return err;
+    kr->runs = r > 0;
+    if (kr->runs) return NULL;
+    if (!rr->srcs[k]) {
+        kr->data = (const char*)rr->plain[k] + (size_t)b * rr->esz[k];
+        kr->attrs = rr->key_attrs[k];
+        return NULL;
+    }
+    const ray_col_range_t* v;
+    if ((err = ray_col_cursor_at(&cs->cur[k], b, &v)) != NULL) return err;
+    kr->data = NULL;                   /* the segment across views (a published materialization
+                                        * read from an earlier row): the caller walks it */
+    if (v->start > b || v->start + v->n < b + len) return NULL;
+    kr->data = (const char*)v->data + (size_t)(b - v->start) * ray_sym_elem_size(v->type, v->attrs);
+    kr->attrs = v->attrs;
+    return NULL;
+}
+
+/* Pass 2 of segment `seg` (one vector: single-file vectors are morsel
+ * aligned) driven by a key whose vector is a run view: a run whose value
+ * no group holds (agg_firstn_member) is skipped whole, and only a member
+ * run reads the other key, by its runs (a member sub-span probed once)
+ * or by its values (each row probed).  Nothing is decoded but the other
+ * key's vector, and only when a member run needs it.  A row matches when
+ * its whole tuple is in the set (agg_firstn_probe), as in the plain pass;
+ * matches go out in row order.  1 served, 0 no key is a run view (the
+ * caller walks the segment), -1 with *err. */
+/* One or two keys (the driving key and the other one), their views on
+ * the task's stack (vv[AGG_CURS_LENT]). */
+_Static_assert(AGG_CURS_LENT >= 2, "agg_firstn_runs keeps two run views");
+static int agg_firstn_runs(agg_firstn_piece_t* t, agg_curs_t* cs, ray_enc_vview_t* vv, int64_t seg, int64_t len,
+                           ray_t** err) {
+    const agg_firstn_ctx_t* c = t->c;
+    const agg_rr_t* rr = c->rr;
+    agg_firstn_set_t* set = c->set;
+    const uint32_t nk = rr->n_keys;
+    uint32_t dk = 0;
+    int r = 0;
+    for (; dk < nk; dk++) {
+        r = agg_firstn_runview(rr, dk, seg, len, &vv[0], err);
+        if (r != 0) break;
+    }
+    if (r <= 0) return r;                  /* -1, or no key on runs */
+    const uint32_t ok = nk == 2 ? 1 - dk : 0;   /* the other key */
+    agg_firstn_kr_t o = { .runs = false };
+    bool o_open = false;
+    const ray_enc_vview_t* dv = &vv[0];
+    const int64_t b = seg * RAY_MORSEL_ELEMS;
+    int64_t q = t->ix ? t->j : 0;
+    int64_t p = 0;
+    for (uint32_t ri = 0; ri < dv->n_runs && p < len; ri++) {
+        const int64_t e = dv->run_ends.h[ri];
+        const int64_t dval = agg_firstn_run_val(dv, ri);
+        /* the run's rows of interest: [p, e), or its selected rows */
+        int64_t q1 = q;
+        if (t->ix) while (q1 < t->j_end && t->ix[q1] < e) q1++;
+        bool any = t->ix ? q1 > q : true;
+        if (!any || !agg_firstn_member(c, dk, dval)) { p = e; q = q1; continue; }
+        t->kv[dk] = dval;
+        if (nk == 1) {
+            if (agg_firstn_probe(set, t->kv, agg_firstn_hash(t->kv, 1), false) >= 0) {
+                if (t->ix) for (int64_t z = q; z < q1; z++) { if (t->n < t->out_cap) t->out[t->n] = b + t->ix[z]; t->n++; }
+                else for (int64_t z = p; z < e; z++) { if (t->n < t->out_cap) t->out[t->n] = b + z; t->n++; }
+            }
+            p = e; q = q1;
+            continue;
+        }
+        if (!o_open) {
+            if ((*err = agg_firstn_kr_open(rr, cs, ok, seg, len, &vv[1], &o)) != NULL) return -1;
+            if (!o.runs && !o.data) return 0;   /* nothing emitted yet: the caller walks the segment */
+            o_open = true;
+        }
+        /* the run's rows, in order: every row, or the selected ones */
+        for (int64_t z = t->ix ? q : p; z < (t->ix ? q1 : e); ) {
+            const int64_t row = t->ix ? t->ix[z] : z;
+            int64_t span_end;          /* rows [row, span_end) share the other key's value */
+            int64_t oval;
+            if (o.runs) {
+                while (o.vv->run_ends.h[o.ri] <= row) o.ri++;
+                oval = agg_firstn_run_val(o.vv, o.ri);
+                span_end = o.vv->run_ends.h[o.ri] < e ? o.vv->run_ends.h[o.ri] : e;
+            } else {
+                oval = agg_read_key_i64_raw(rr->key_types[ok], o.attrs, o.data, row);
+                span_end = row + 1;
+            }
+            int64_t z1 = z + 1;        /* the indices the span covers */
+            if (t->ix) while (z1 < q1 && t->ix[z1] < span_end) z1++;
+            else z1 = span_end;
+            if (agg_firstn_member(c, ok, oval)) {
+                t->kv[ok] = oval;
+                if (agg_firstn_probe(set, t->kv, agg_firstn_hash(t->kv, 2), false) >= 0)
+                    for (int64_t w = z; w < z1; w++) {
+                        if (t->n < t->out_cap) t->out[t->n] = b + (t->ix ? t->ix[w] : w);
+                        t->n++;
+                    }
+            }
+            z = z1;
+        }
+        p = e; q = q1;
+    }
+    if (t->ix && q < t->j_end)         /* a selected row past the segment */
+        { *err = ray_error("corrupt", "first-n: selection row %lld past its segment", (long long)(b + t->ix[q])); return -1; }
+    if (t->ix) t->j = t->j_end;
+    return 1;
+}
+
+/* agg_firstn_task over staged keys: its segments walked through one cursor
+ * set (ray_col_walk_cur), a range error noted keyed by its first row.  With
+ * one or two keys, a segment driven by a key on runs is served on runs
+ * (agg_firstn_runs, the views on the task's stack). */
+static void agg_firstn_task_staged(agg_firstn_ctx_t* c, uint32_t t) {
+    int64_t s0 = (int64_t)c->n_segs * t / c->tasks;
+    int64_t s1 = (int64_t)c->n_segs * (t + 1) / c->tasks;
+    const agg_rr_t* rr = c->rr;
+    const uint8_t*  fl = c->sel ? ray_rowsel_flags(c->sel) : NULL;
+    const uint32_t* of = c->sel ? ray_rowsel_offsets(c->sel) : NULL;
+    uint64_t hb[RAY_MORSEL_ELEMS];
+    ray_enc_vview_t vv[AGG_CURS_LENT];     /* agg_firstn_runs' views, never zeroed */
+    agg_firstn_piece_t pc = { .c = c, .hb = hb, .kv = c->kvs + (int64_t)t * c->n_keys,
+        .out = c->out ? c->out + c->counts[t] : c->local + (int64_t)t * AGG_FIRSTN_LOCAL,
+        .out_cap = c->out ? INT64_MAX : AGG_FIRSTN_LOCAL, .n = 0 };
+    const int64_t key = s0 * RAY_MORSEL_ELEMS;
+    agg_curs_t cs; cs.cur = NULL;
+    if (s0 < s1 && !ray_scan_fail_skip(rr->fail, key)) {
+        if (!agg_curs_init(&cs, rr)) ray_scan_fail_note(rr->fail, key, ray_error("oom", NULL));
+        for (int64_t seg = s0; cs.cur && seg < s1; seg++) {
+            if (fl && fl[seg] == RAY_SEL_NONE) continue;
+            int64_t b = seg * RAY_MORSEL_ELEMS;
+            int64_t len = c->nrows - b < RAY_MORSEL_ELEMS ? c->nrows - b : RAY_MORSEL_ELEMS;
+            bool mix = fl && fl[seg] == RAY_SEL_MIX;
+            pc.seg_b = b;
+            pc.ix = mix ? ray_rowsel_idx(c->sel) : NULL;
+            pc.j = mix ? (int64_t)of[seg] : 0;
+            pc.j_end = mix ? (int64_t)of[seg + 1] : 0;
+            ray_t* err = NULL;
+            int ru = rr->n_keys <= 2 ? agg_firstn_runs(&pc, &cs, vv, seg, len, &err) : 0;
+            if (ru < 0) { ray_scan_fail_note(rr->fail, key, err); break; }
+            if (ru > 0) continue;
+            err = ray_col_walk_cur(rr->srcs, rr->plain, rr->n_src, cs.cur, b, b + len, &pc, 0, agg_firstn_piece);
+            if (err) { ray_scan_fail_note(rr->fail, key, err); break; }
+        }
+        agg_curs_free(&cs, rr);
+    }
+    if (!c->out) c->counts[t] = pc.n;
+}
+
+static void agg_firstn_fn_staged(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    for (int64_t t = start; t < end; t++) agg_firstn_task_staged((agg_firstn_ctx_t*)raw, (uint32_t)t);
+}
+
 static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
                                 ray_t** key_cols) {
     for (uint32_t k = 0; k < ext->n_keys; k++)
@@ -6851,10 +11456,10 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         if (!has_in) { if (aop == OP_COUNT) continue; return false; }
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         if (!ie || ie->base.opcode != OP_SCAN) return false;
-        ray_t* col = ray_table_get_col(tbl, ie->sym);
-        if (!col) return false;
+        ray_col_meta_t cm;
+        if (!agg_col_meta(g, tbl, ie->sym, &cm)) return false;
         if (aop == OP_COUNT) continue;
-        switch (col->type) {
+        switch (cm.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: break;
             default: return false;   /* floats: the fold order shows in the value */
@@ -6863,21 +11468,67 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     return true;
 }
 
+/* Map the rows of a group result (key columns okc, sub_rows rows) to the
+ * set's ranks: perm[rank] = row.  Rows of groups outside the set are skipped,
+ * or fail the pick (-1) when `strict` (every row must be a set group).  The
+ * key columns are hashed a block at a time; only bloom hits read the tuple
+ * and probe.  Returns the number of set groups found, -1 on a mismatch.  Kept
+ * out of line: the pre-pass's serial probe loop stays small. */
+static __attribute__((noinline)) int64_t agg_firstn_pick(
+        agg_firstn_set_t* set, ray_t** okc, uint32_t n_keys, int64_t sub_rows,
+        uint32_t bbits, bool strict, int64_t* perm, int64_t* kv, bool* identity) {
+    uint64_t hb[1024];
+    const void* okd[16];
+    for (uint32_t k = 0; k < n_keys; k++) okd[k] = ray_data(okc[k]);
+    uint32_t bshift = 64 - bbits;
+    int64_t found = 0;
+    for (int64_t b0 = 0; b0 < sub_rows; b0 += 1024) {
+        int64_t len = sub_rows - b0 < 1024 ? sub_rows - b0 : 1024;
+        for (int64_t i = 0; i < len; i++) hb[i] = AGG_FIRSTN_SEED;
+        for (uint32_t k = 0; k < n_keys; k++) agg_firstn_hash_block(hb, okc[k], okd[k], b0, len);
+        for (int64_t i = 0; i < len; i++) {
+            int64_t r = b0 + i;
+            uint64_t hv = AGG_FIRSTN_FINAL(hb[i]);
+            uint64_t bit = hv >> bshift;
+            int64_t rk = -1;
+            if ((set->bloom[bit >> 6] >> (bit & 63)) & 1) {
+                for (uint32_t k = 0; k < n_keys; k++) kv[k] = agg_read_key_i64(okc[k], okd[k], r);
+                rk = agg_firstn_probe(set, kv, hv, false);
+            }
+            if (rk < 0) { if (strict) return -1; continue; }
+            if (perm[rk] >= 0) return -1;
+            perm[rk] = r;
+            found++;
+            if (rk != r) *identity = false;
+        }
+    }
+    return found;
+}
+
 /* The first `group_limit` groups in first-seen order, an error, or NULL when
  * the shape or the data is not one the pre-pass serves (the caller then runs
  * the full aggregation). */
 static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
-                              ray_t** key_cols, ray_t* sel, int64_t n_sel,
-                              int64_t group_limit) {
+                              ray_t** key_cols, agg_keyset_t* ks, ray_t* sel, const int64_t* sel_prefix,
+                              int64_t n_sel, int64_t group_limit,
+                              bool allow_heavy, bool* heavy_out) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_pool_t* pool = ray_pool_get();
     int64_t eff_n = sel ? n_sel : nrows;
+    /* A segment-streamed table (an unordered take over generation-2 parted
+     * keys, group_seg_stream_ok) runs the passes over its parted sources;
+     * every decline then runs the whole group over its flat copy, the only
+     * full run its unordered take has. */
+    const bool seg = group_limit > 0 && agg_seg_parted(g, tbl);
     /* Only where the full run would take the parallel first-seen routes. */
     if (!ray_agg_first_n || firstn_nested || !pool || eff_n < RAY_PARALLEL_THRESHOLD ||
-        group_limit <= 0 || group_limit > AGG_FIRSTN_MAX || !ext)
-        return NULL;
-    if (sel && ray_rowsel_meta(sel)->nrows != nrows) return NULL;
-    if (!agg_firstn_admitted(g, ext, tbl, key_cols)) return NULL;
+        group_limit <= 0 || group_limit > AGG_FIRSTN_MAX || !ext ||
+        (sel && ray_rowsel_meta(sel)->nrows != nrows) || !agg_firstn_admitted(g, ext, tbl, key_cols))
+        return seg ? agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, NULL) : NULL;
+    /* Staged keys (generation 2) are read through their sources at rows, by
+     * the staged instances of the passes; nothing is unstaged.  A declined
+     * pre-pass leaves the full run on the staged keys. */
+    const agg_rr_t* krr = ks->rr.staged ? &ks->rr : NULL;
 
     uint32_t n_keys = ext->n_keys;
     uint32_t bits = 4;
@@ -6899,6 +11550,8 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     int64_t* perm = NULL;
     ray_t* compact = NULL;
     ray_t* sub = NULL;
+    int64_t* mem_v = NULL;
+    uint8_t* mem_used = NULL;
     if (!kv || !set.keys || !set.rank || !set.bloom) { res = ray_error("oom", NULL); goto done; }
     memset(set.rank, 0xFF, (size_t)cap * sizeof(int32_t));
     const void** key_data = (const void**)(kv + n_keys);
@@ -6906,7 +11559,11 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     uint32_t n_segs = (uint32_t)((nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS);
 
     /* 1. the first N distinct tuples, serially from the first selected row */
-    {
+    if (krr) {
+        ray_t* e1 = agg_firstn_seen_staged(krr, &set, sel, nrows, n_segs, group_limit, kv);
+        if (e1) { res = e1; goto done; }
+        if (set.n < group_limit) goto done;   /* few groups or long runs: full run */
+    } else {
         const uint8_t*  fl = sel ? ray_rowsel_flags(sel) : NULL;
         const uint32_t* of = sel ? ray_rowsel_offsets(sel) : NULL;
         const uint16_t* ix = sel ? ray_rowsel_idx(sel) : NULL;
@@ -6934,9 +11591,33 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
         uint64_t bit = agg_firstn_hash(set.keys + i * n_keys, n_keys) >> (64 - bbits);
         set.bloom[bit >> 6] |= (uint64_t)1 << (bit & 63);
     }
+    if (krr) {
+        /* the staged pass's per-key member sets (agg_firstn_member): at
+         * most N values each, in as many slots as the set has */
+        mem_v = ray_alloc_raw((size_t)cap * n_keys * sizeof(int64_t));
+        mem_used = ray_calloc_raw((size_t)cap * n_keys);
+        if (!mem_v || !mem_used) { res = ray_error("oom", NULL); goto done; }
+        for (int64_t i = 0; i < cap; i++) {
+            if (set.rank[i] < 0) continue;
+            for (uint32_t k = 0; k < n_keys; k++) {
+                int64_t x = set.keys[i * n_keys + k];
+                int64_t* v = mem_v + (size_t)k * cap;
+                uint8_t* u = mem_used + (size_t)k * cap;
+                uint32_t h = agg_firstn_mslot(x, bits);
+                while (u[h] && v[h] != x) h = (h + 1) & (uint32_t)(cap - 1);
+                u[h] = 1; v[h] = x;
+            }
+        }
+    }
 
     /* the share of rows the N groups hold, from evenly spaced source rows */
-    {
+    if (krr) {
+        int64_t samples = nrows < AGG_FIRSTN_SAMPLES ? nrows : AGG_FIRSTN_SAMPLES, hits = 0;
+        ray_t* e1 = agg_firstn_share_staged(krr, &set, nrows, samples, pool,
+                                            ray_pool_par_dispatch_ok(pool, eff_n, RAY_PARALLEL_THRESHOLD), &hits);
+        if (e1) { res = e1; goto done; }
+        if (hits * AGG_FIRSTN_SHARE > samples) goto heavy;
+    } else {
         int64_t samples = nrows < AGG_FIRSTN_SAMPLES ? nrows : AGG_FIRSTN_SAMPLES;
         int64_t step = nrows / samples, hits = 0;
         for (uint32_t k = 0; k < n_keys; k++)
@@ -6947,7 +11628,7 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
                 kv[k] = agg_read_key_i64(key_cols[k], key_data[k], i * step);
             if (agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), false) >= 0) hits++;
         }
-        if (hits * AGG_FIRSTN_SHARE > samples) goto done;
+        if (hits * AGG_FIRSTN_SHARE > samples) goto heavy;
     }
 
     /* 2. the selected rows of those groups, in row order: each task keeps its
@@ -6966,9 +11647,14 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     if (!counts || !local || !kvs) { res = ray_error("oom", NULL); goto done; }
     agg_firstn_ctx_t c = { .set = &set, .key_cols = key_cols, .key_data = key_data,
         .n_keys = n_keys, .nrows = nrows, .sel = sel, .n_segs = n_segs,
-        .tasks = tasks, .counts = counts, .local = local, .out = NULL, .kvs = kvs };
-    if (tasks > 1) ray_pool_dispatch_n(pool, agg_firstn_fn, &c, tasks);
+        .tasks = tasks, .counts = counts, .local = local, .out = NULL, .kvs = kvs, .rr = krr,
+        .mem_v = mem_v, .mem_used = mem_used, .mem_bits = bits };
+    ray_pool_fn pass2 = krr ? agg_firstn_fn_staged : agg_firstn_fn;
+    if (krr) ray_scan_fail_init(krr->fail);
+    if (tasks > 1) ray_pool_dispatch_n(pool, pass2, &c, tasks);
+    else if (krr) agg_firstn_fn_staged(&c, 0, 0, 1);
     else agg_firstn_fn(&c, 0, 0, 1);
+    if (krr && (res = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) goto done;
     if (agg_cancelled()) { res = ray_error("cancel", NULL); goto done; }
     int64_t m = 0;
     bool spilled = false;
@@ -6976,15 +11662,18 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
         if (counts[t] > AGG_FIRSTN_LOCAL) spilled = true;
         m += counts[t];
     }
-    if (m * (AGG_FIRSTN_SHARE / 2) > eff_n) goto done;   /* the sample missed a heavy group */
+    if (m * (AGG_FIRSTN_SHARE / 2) > eff_n) goto heavy;  /* the sample missed a heavy group */
     idx = ray_alloc_raw((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
     if (!idx) { res = ray_error("oom", NULL); goto done; }
     if (spilled) {
         int64_t off = 0;
         for (uint32_t t = 0; t < tasks; t++) { int64_t ct = counts[t]; counts[t] = off; off += ct; }
         c.out = idx;
-        if (tasks > 1) ray_pool_dispatch_n(pool, agg_firstn_fn, &c, tasks);
+        if (krr) ray_scan_fail_init(krr->fail);
+        if (tasks > 1) ray_pool_dispatch_n(pool, pass2, &c, tasks);
+        else if (krr) agg_firstn_fn_staged(&c, 0, 0, 1);
         else agg_firstn_fn(&c, 0, 0, 1);
+        if (krr && (res = ray_scan_fail_finish(krr->fail, tasks > 1 ? pool : NULL)) != NULL) goto done;
         if (agg_cancelled()) { res = ray_error("cancel", NULL); goto done; }
     } else {
         int64_t off = 0;
@@ -7004,28 +11693,45 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     firstn_nested = true;
     sub = exec_group_v2_run(g, op, compact, m, NULL, NULL, 0, set.n, NULL);
     firstn_nested = false;
+    goto pick;
+
+heavy:
+    /* The N groups hold a large share of the rows: aggregating only them
+     * costs about what aggregating everything does.  The bounded full run
+     * is the answer when it stays on a dense route (the task-local slabs
+     * select the N smallest first rows); the caller asks again with
+     * allow_heavy only when it would leave them for radix.  Then run the
+     * unbounded group (dense routes allowed) and pick the N groups of the
+     * set from its result. */
+    if (!allow_heavy) { if (heavy_out) *heavy_out = true; goto done; }
+    firstn_nested = true;
+    sub = exec_group_v2_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, 0, NULL);
+    firstn_nested = false;
+
+pick:
     if (!sub || RAY_IS_ERR(sub)) { res = sub ? sub : ray_error("oom", NULL); sub = NULL; goto done; }
 
     /* 3. first-seen order: the rank of every emitted group in the set.  The
-     * bounded emit already yields it; any other order is put right here. */
-    if (sub->type != RAY_TABLE || ray_table_nrows(sub) != set.n ||
+     * bounded emit already yields it; any other order is put right here;
+     * the unbounded run's other groups are dropped. */
+    int64_t sub_rows = sub->type == RAY_TABLE ? ray_table_nrows(sub) : -1;
+    if (sub->type != RAY_TABLE || sub_rows < set.n || (compact && sub_rows != set.n) ||
         ray_table_ncols(sub) < (int64_t)n_keys)
         goto done;                             /* unexpected shape: full run */
     perm = ray_alloc_raw((size_t)set.n * sizeof(int64_t));
     if (!perm) { res = ray_error("oom", NULL); goto done; }
     for (int64_t r = 0; r < set.n; r++) perm[r] = -1;
-    bool identity = true;
-    for (int64_t r = 0; r < set.n; r++) {
-        for (uint32_t k = 0; k < n_keys; k++) {
-            ray_t* oc = ray_table_get_col_idx(sub, k);
-            if (!oc || oc->type != key_cols[k]->type) goto done;
-            kv[k] = agg_read_key_i64(oc, ray_data(oc), r);
-        }
-        int64_t rk = agg_firstn_probe(&set, kv, agg_firstn_hash(kv, n_keys), false);
-        if (rk < 0 || perm[rk] >= 0) goto done;
-        perm[rk] = r;
-        if (rk != r) identity = false;
+    bool identity = sub_rows == set.n;
+    ray_t* okc[16];
+    if (n_keys > 16) goto done;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        okc[k] = ray_table_col_idx(sub, k);
+        if (okc[k] && RAY_IS_ERR(okc[k])) { res = okc[k]; goto done; }
+        if (!okc[k] || okc[k]->type != key_cols[k]->type) goto done;
     }
+    int64_t found = agg_firstn_pick(&set, okc, n_keys, sub_rows, bbits, compact != NULL,
+                                    perm, kv, &identity);
+    if (found != set.n) goto done;
     if (identity) { res = sub; sub = NULL; }
     else {
         ray_t* pv = ray_vec_new(RAY_I64, set.n);
@@ -7042,13 +11748,27 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     }
 
 done:
-    if (sub) ray_release(sub);
-    if (compact) ray_release(compact);
+    if (sub) { ray_graph_unbind_table(g, sub); ray_release(sub); }
+    if (compact) { ray_graph_unbind_table(g, compact); ray_release(compact); }
     ray_free_raw(perm); ray_free_raw(idx); ray_free_raw(local); ray_free_raw(kvs); ray_free_raw(counts);
     ray_free_raw(set.keys); ray_free_raw(set.rank); ray_free_raw(set.bloom);
+    ray_free_raw(mem_v); ray_free_raw(mem_used);
     if (kv_hdr) scratch_free(kv_hdr);
+    if (!res && seg) return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, NULL);
     return res;
 }
+
+/* Bind the group keys (R-BIND) and run the strategies over them.  A key
+ * that is a partition key or a slice keeps ray_table_col; a bound key that
+ * is not ready (generation 2, not materialized) is staged: its column is a
+ * stand-in carrying the type, SYM width, domain and nullability, and the
+ * strategies read it by range. */
+static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                int64_t nrows, ray_t* sel,
+                                const int64_t* sel_prefix, int64_t n_sel,
+                                int64_t group_limit,
+                                const ray_group_emit_filter_t* efp, ray_op_ext_t* ext,
+                                ray_t** key_cols, int64_t* key_syms, agg_keyset_t* ks);
 
 static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t nrows, ray_t* sel,
@@ -7061,27 +11781,77 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     route_stats.dense_plan_available = false;
     route_stats.dense_worker_budget = false;
     route_stats.dense_tasks = 0;
+    route_stats.radix_waves = 0;
+    route_stats.radix_compacted = 0;
+    route_stats.radix_spill_bytes = 0;
+    route_stats.radix_spill_buf = 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
     /* efp was already gated on this node by exec_group_v2_run; the compact
      * fallback recursion re-enters through that wrapper too. */
 
-    /* Exact-size carve for the per-key column pointers + syms (one block, both
-     * 8-byte): unbounded key count, freed at every exit of this function
-     * (parallel branches free it beside agg_vo_free; the serial tail frees it
-     * after the key-emit loop; the compact-fallback macro frees it too). */
+    /* Exact-size carve for the per-key columns, syms, sources and read
+     * tables: unbounded key count, freed (with the stand-ins) when the
+     * strategies return. */
+    uint32_t nk = ext->n_keys;
+    size_t nkc = nk ? nk : 1;
     ray_t* kc_hdr;
-    ray_t** key_cols = (ray_t**)scratch_alloc(&kc_hdr,
-        (size_t)ext->n_keys * (sizeof(ray_t*) + sizeof(int64_t)));
+    ray_t** key_cols = (ray_t**)scratch_calloc(&kc_hdr, nkc * (5 * sizeof(void*) + 3));
     if (!key_cols) return ray_error("oom", NULL);
-    int64_t* key_syms = (int64_t*)(key_cols + ext->n_keys);
-    for (uint32_t k = 0; k < ext->n_keys; k++) {
+    int64_t* key_syms = (int64_t*)(key_cols + nkc);
+    ray_t** standins = (ray_t**)(key_syms + nkc);
+    agg_keyset_t ks;
+    ks.srcs  = (ray_col_src_t**)(standins + nkc);
+    ks.plain = (const void**)(ks.srcs + nkc);
+    ks.esz   = (uint8_t*)(ks.plain + nkc);
+    ks.types = (int8_t*)(ks.esz + nkc);
+    ks.attrs = (uint8_t*)(ks.types + nkc);
+    ray_t* result = NULL;
+    bool staged = false;
+    for (uint32_t k = 0; k < nk; k++) {
         ray_op_ext_t* kext = find_ext(g, ext->keys[k]);
-        key_cols[k] = ray_table_get_col(tbl, kext->sym);
         key_syms[k] = kext->sym;
+        ray_col_src_t* src = NULL;
+        if (!ray_col_bind_declines(tbl, kext->sym)) {
+            ray_t* berr = NULL;
+            src = ray_graph_bind_col(g, tbl, kext->sym, &berr);   /* no decode */
+            if (berr) { result = berr; goto out; }
+        }
+        ray_t* ready = src ? ray_col_src_ready(src) : NULL;      /* never decodes */
+        if (ready && !RAY_IS_PARTED(ready->type)) key_cols[k] = ready;
+        else if (src) {
+            if (!(standins[k] = agg_src_standin(src))) { result = ray_error("oom", NULL); goto out; }
+            key_cols[k] = standins[k];
+            ks.srcs[k] = src;
+            staged = true;
+        } else {
+            key_cols[k] = ray_table_col(tbl, kext->sym);   /* today's column */
+            if (key_cols[k] && RAY_IS_ERR(key_cols[k])) { result = key_cols[k]; key_cols[k] = NULL; goto out; }
+        }
+        ks.types[k] = key_cols[k]->type;
+        ks.attrs[k] = key_cols[k]->attrs;
+        ks.esz[k] = ray_sym_elem_size(key_cols[k]->type, key_cols[k]->attrs);
+        ks.plain[k] = ks.srcs[k] ? NULL : ray_data(key_cols[k]);
         if (key_cols[k]->type != RAY_SYM && ray_vec_may_have_nulls(key_cols[k]))
             route_stats.nullable_key = true;
     }
+    ray_scan_fail_init(&ks.fail);
+    ks.rr = (agg_rr_t){ .srcs = ks.srcs, .plain = ks.plain, .esz = ks.esz,
+        .key_types = ks.types, .key_attrs = ks.attrs,
+        .n_src = nk, .n_keys = nk, .n_aggs = 0, .fail = &ks.fail, .staged = staged };
+    result = exec_group_v2_run_keys(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp,
+                                    ext, key_cols, key_syms, &ks);
+out:
+    for (uint32_t k = 0; k < nk; k++) if (standins[k]) ray_release(standins[k]);
+    scratch_free(kc_hdr);
+    return result;
+}
 
+static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                int64_t nrows, ray_t* sel,
+                                const int64_t* sel_prefix, int64_t n_sel,
+                                int64_t group_limit,
+                                const ray_group_emit_filter_t* efp, ray_op_ext_t* ext,
+                                ray_t** key_cols, int64_t* key_syms, agg_keyset_t* ks) {
     bool indexed = false;
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         int8_t t = key_cols[k]->type;
@@ -7089,33 +11859,40 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-        ray_t* col = ie ? ray_table_get_col(tbl, ie->sym) : NULL;
-        if (col && agg_indexed_supported(ext->agg_ops[a], col->type)) indexed = true;
+        ray_col_meta_t cm;
+        if (ie && agg_col_meta(g, tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
     }
     if (indexed) {
         if (sel) {
             ray_t* idx = ray_rowsel_to_indices(sel);
-            if (!idx || RAY_IS_ERR(idx)) { scratch_free(kc_hdr); return idx ? idx : ray_error("oom", NULL); }
+            if (!idx || RAY_IS_ERR(idx)) { return idx ? idx : ray_error("oom", NULL); }
             ray_t* compact = agg_build_compact(g, op, tbl, ray_data(idx), n_sel);
             ray_t* result = compact && !RAY_IS_ERR(compact)
                 ? exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0, group_limit, efp) : compact;
-            if (compact && !RAY_IS_ERR(compact)) ray_release(compact);
-            ray_release(idx); scratch_free(kc_hdr); return result;
+            if (compact && !RAY_IS_ERR(compact)) { ray_graph_unbind_table(g, compact); ray_release(compact); }
+            ray_release(idx); return result;
         }
+        /* random: indexed / serial whole-column strategy */
+        if (agg_seg_parted(g, tbl))
+            return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp);
         agg_route_record(AGG_ROUTE_V2_INDEXED);
+        ray_t* uerr = agg_keys_unstage(key_cols, ks);
+        if (uerr) return uerr;
         ray_t* result = agg_indexed_run(g, op, tbl, key_cols, key_syms, nrows);
-        scratch_free(kc_hdr); return result;
+        return result;
     }
 
     /* Unordered take: N — find the N groups first, aggregate only them. */
+    bool firstn_heavy = false;   /* the N groups hold a large share: see agg_first_n_run */
     if (group_limit > 0 && !efp) {
-        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, sel, n_sel, group_limit);
-        if (fr) { scratch_free(kc_hdr); return fr; }
+        ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, ks, sel, sel_prefix, n_sel,
+                                    group_limit, false, &firstn_heavy);
+        if (fr) { return fr; }
     }
 
     /* Precompute AoS state layout for the admitted aggregates. */
     agg_vo_t vo;
-    if (!agg_vo_init(&vo, g, ext, tbl)) { scratch_free(kc_hdr); return ray_error("oom", NULL); }
+    if (!agg_vo_init(&vo, g, ext, tbl)) { return ray_error("oom", NULL); }
     const agg_vtable_t** vts = vo.vts; size_t* off = vo.off; size_t block = vo.block;
 
     /* Dense plan (low-card int/SYM keys + streaming aggs → direct index, no
@@ -7125,9 +11902,10 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * for high-selectivity filters, and it can pull a sparse-but-low-card selected
      * key set into the dense path that the full-table range would have rejected. */
     dense_plan_t dp;
-    bool dense = sel ? agg_dense_plan_sel(key_cols, ext->n_keys, n_sel, sel, sel_prefix, &dp)
-                     : agg_dense_plan(key_cols, ext->n_keys, vts, ext->n_aggs, nrows, &dp);
-    route_stats.dense_plan_available = dense;
+    ray_t* plan_err = NULL;
+    bool dense = sel ? agg_dense_plan_sel(key_cols, &ks->rr, ext->n_keys, n_sel, sel, sel_prefix, &dp, &plan_err)
+                     : agg_dense_plan_src(key_cols, &ks->rr, ext->n_keys, true, nrows, &dp, &plan_err);
+    if (plan_err) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return plan_err; }
 
     /* Compact-fallback helper for the non-chunked shapes (hash-fallback keys,
      * and the serial path): gather selected rows into a compact table once and
@@ -7135,7 +11913,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     #define AGG_RUN_COMPACT_FALLBACK()                                          \
         do {                                                                    \
             agg_vo_free(&vo);   /* not needed by the compact recursion */       \
-            agg_dense_plan_free(&dp); scratch_free(kc_hdr);  /* key_cols dead: the recursion rebuilds them */ \
+            agg_dense_plan_free(&dp);  /* the recursion binds its own keys */ \
             ray_t* idxb = ray_rowsel_to_indices(sel);                           \
             if (!idxb) return ray_error("oom", NULL);                           \
             ray_t* compact = agg_build_compact(g, op, tbl, (int64_t*)ray_data(idxb), n_sel); \
@@ -7145,7 +11923,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }                                                                   \
             ray_t* r = exec_group_v2_run(g, op, compact, n_sel, NULL, NULL, 0,   \
                                          group_limit, efp);                     \
-            ray_release(compact); ray_release(idxb);                            \
+            ray_graph_unbind_table(g, compact); ray_release(compact); ray_release(idxb); \
             return r;                                                           \
         } while (0)
 
@@ -7163,6 +11941,38 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (vts[a]->kind != ACC_STREAMING) all_streaming = false;
 
     ray_pool_t* pool = ray_pool_get();
+    /* A single-key plan within the row count whose per-worker slabs could
+     * never fit the dense budget (a quarter of the watermark, or the scatter
+     * payload when that is less) is a wide plan too: only the one shared slab
+     * can run it, and the per-worker budget check below must not be the one
+     * that sends it to the radix route. */
+    if (dp.ok && !dp.wide && ext->n_keys == 1 && pool && eff_n >= RAY_PARALLEL_THRESHOLD) {
+        double budget = (double)eff_n * 2 * (8.0 * (ext->n_keys + ext->n_aggs + 1));
+        int64_t wmb = ray_heap_mem_budget();
+        if (wmb > 0 && budget > (double)wmb / 4) budget = (double)wmb / 4;
+        if ((double)dp.total_slots * (double)(block + sizeof(int64_t) + 1) > budget) dp.wide = true;
+    }
+    /* A wide plan (one key, range past the row count) runs only as the shared
+     * strategy: one state slab of the range plus its occupancy bits, which
+     * must fit three quarters of the room under the anonymous watermark (the
+     * rest is the emit's), and whose key shows many groups in a sample
+     * (agg_wide_populated).  Any other shape, or too little room, drops the
+     * plan and the grouping takes the route it took before. */
+    if (dp.wide) {
+        bool shared = pool && eff_n >= RAY_PARALLEL_THRESHOLD && all_streaming &&
+                      group_limit <= 0 && ext->n_keys == 1;
+        ray_t* werr = NULL;
+        bool fits = shared && agg_wide_shared_fits(vts, ext->n_aggs, block, dp.total_slots, eff_n,
+                                                   key_cols[0], &ks->rr, nrows, &werr);
+        if (werr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return werr; }
+        if (!fits) {
+            agg_dense_plan_free(&dp);
+            dp.ok = false;
+            dp.wide = false;
+        }
+    }
+    dense = dense && dp.ok;
+    route_stats.dense_plan_available = dense;
     if (pool && eff_n >= RAY_PARALLEL_THRESHOLD && all_streaming) {
         /* A parallel dense plan owns one slot slab per worker. Admit it only
          * when the aggregate slot count across all workers remains O(input);
@@ -7194,15 +12004,23 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         /* A bounded group emit selects first-seen groups. Dense slot order
          * cannot satisfy that contract; retain radix's bounded selection. */
-        bool shared_plan = dp.ok && group_limit <= 0 && !sel && ext->n_keys == 1 && dp.total_slots >= 4096;
+        bool shared_plan = dp.ok && group_limit <= 0 && (dp.wide || !sel) && ext->n_keys == 1 && dp.total_slots >= 4096;
         for (uint32_t a = 0; a < ext->n_aggs && shared_plan; a++)
-            shared_plan = vts[a]->update_shared != NULL;
-        if (shared_plan && slab_bytes <= dense_budget && agg_shared_sample(g, ext, tbl, key_cols, &vo, nrows)) {
+            shared_plan = vts[a]->update_shared != NULL &&
+                          (dp.wide || !vts[a]->shared_add);   /* an atomic add in the shared slab serves wide plans only */
+        ray_t* serr = NULL;
+        bool shared_ok = shared_plan && (dp.wide || (slab_bytes <= dense_budget &&
+                         agg_shared_sample(g, ext, tbl, key_cols, &vo, nrows, &serr)));
+        if (serr) {                       /* a failed column bind */
+            agg_vo_free(&vo); agg_dense_plan_free(&dp);
+            return serr;
+        }
+        if (shared_ok) {
             route_stats.dense_worker_budget = false;
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
                 nrows, pool, &dp, dense_workers, AGG_DENSE_SHARED, sel, sel_prefix, n_sel, efp, 0);
-            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
+            agg_vo_free(&vo); agg_dense_plan_free(&dp);
             return result;
         }
         /* Partition ownership amortizes scatter through concurrent reducers.
@@ -7217,9 +12035,13 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * occupy one field in the payload, including mixed binary uses. */
             agg_desc_t payload;
             double record_size = (double)SIZE_MAX;
-            if (agg_desc_init(&payload, g, ext, tbl, key_cols)) {
+            ray_t* perr = NULL;
+            if (agg_desc_init(&payload, g, ext, tbl, key_cols, &perr)) {
                 record_size = agg_partition_record(&payload, ext->n_aggs, NULL, NULL);
                 agg_desc_free(&payload);
+            } else if (perr) {            /* a failed column bind */
+                agg_vo_free(&vo); agg_dense_plan_free(&dp);
+                return perr;
             }
             double bytes = 2.0 * part_slots * parts * (block + sizeof(int64_t))
                 + (double)eff_n * (sizeof(uint32_t) + record_size + (sel ? sizeof(int64_t) : 0))
@@ -7251,7 +12073,7 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 agg_route_record(AGG_ROUTE_V2_DENSE);
                 ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
                     nrows, pool, &dp, dense_workers, AGG_DENSE_PARTITIONED, sel, sel_prefix, n_sel, efp, 0);
-                agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr);
+                agg_vo_free(&vo); agg_dense_plan_free(&dp);
                 return result;
             }
         }
@@ -7271,9 +12093,12 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * exceeds one scatter payload. This affects strategy only, never values;
          * selections keep their existing exact selected-range planning. */
         if (dense_par_ok && !sel && ext->n_keys == 1) {
-            const void* data = ray_data(key_cols[0]);
+            /* a staged key: strided single rows through a cursor (R-SPARSE) */
+            agg_curs_t tcs; tcs.cur = NULL;
+            ray_t* terr = NULL;
+            if (ks->rr.staged && !agg_curs_init(&tcs, &ks->rr)) terr = ray_error("oom", NULL);
             double touched_slots = 0;
-            if (ray_col_cold(key_cols[0]))
+            if (!ks->rr.staged && ray_col_cold(key_cols[0]))
                 for (uint32_t w = 0; w < dense_workers; w++) {
                     int64_t start = nrows / dense_workers * w;
                     int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
@@ -7282,22 +12107,43 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         ray_col_want_row(key_cols[0],
                             start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1)));
                 }
-            for (uint32_t w = 0; w < dense_workers; w++) {
+            for (uint32_t w = 0; w < dense_workers && !terr; w++) {
                 int64_t start = nrows / dense_workers * w;
                 int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
                 int64_t samples = end - start < 1024 ? end - start : 1024;
                 int64_t lo = INT64_MAX, hi = INT64_MIN;
-                for (int64_t i = 0; i < samples; i++) {
+                for (int64_t i = 0; i < samples && !terr; i++) {
                     int64_t r = start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1));
-                    int64_t v = agg_read_key_i64(key_cols[0], data, r);
+                    int64_t v = agg_key_at(&ks->rr, &tcs, 0, r, &terr);
                     if (dp.nullable[0] && v == dp.nulls[0]) continue;
                     if (v < lo) lo = v;
                     if (v > hi) hi = v;
                 }
                 if (lo <= hi) touched_slots += (double)((uint64_t)hi - (uint64_t)lo) + 1;
             }
+            agg_curs_free(&tcs, &ks->rr);
+            if (terr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return terr; }
             if (touched_slots * (block + sizeof(int64_t) + 1) > scatter_budget / 2)
                 dense_par_ok = false;
+        }
+        /* No per-worker or partitioned dense plan fits the budget: a single
+         * key still runs as the one shared slab of a wide plan, as when its
+         * slab alone passes the budget, rather than scattered by radix. */
+        if (dp.ok && !dp.wide && !dense_par_ok && ext->n_keys == 1 && group_limit <= 0) {
+            ray_t* werr = NULL;
+            bool fits = agg_wide_shared_fits(vts, ext->n_aggs, block, dp.total_slots, eff_n,
+                                             key_cols[0], &ks->rr, nrows, &werr);
+            if (werr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return werr; }
+            if (fits) {
+                dp.wide = true;
+                route_stats.dense_worker_budget = false;
+                ray_profile_tick("group: wide shared after the worker budget");
+                agg_route_record(AGG_ROUTE_V2_DENSE);
+                ray_t* result = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext,
+                    nrows, pool, &dp, ray_pool_total_workers(pool), AGG_DENSE_SHARED, sel, sel_prefix, n_sel, efp, 0);
+                agg_vo_free(&vo); agg_dense_plan_free(&dp);
+                return result;
+            }
         }
         route_stats.dense_worker_budget = dp.ok && !dense_par_ok;
         if (route_stats.nullable_key) ray_profile_tick("group: nullable key");
@@ -7336,15 +12182,30 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             agg_route_record(AGG_ROUTE_V2_DENSE);
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp, dense_workers, AGG_DENSE_TASK_LOCAL,
                                                     sel, sel_prefix, n_sel, efp, group_limit);
-            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
+            agg_vo_free(&vo); agg_dense_plan_free(&dp); return r;
+        }
+        if (keys_intsym && firstn_heavy && dp.ok) {
+            /* A dense plan exists but the bounded emit leaves the dense
+             * routes here (partition ownership and the shared slab take no
+             * limit): the unbounded group keeps them, and the N groups are
+             * picked from it.  Without a dense plan both runs are radix and
+             * the bounded one selects the N groups itself. */
+            ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, ks, sel, sel_prefix, n_sel,
+                                        group_limit, true, NULL);
+            if (fr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return fr; }
         }
         if (keys_intsym) {
             /* Sparse ranges and excessive dense worker traffic: pre-aggregate
              * per task and scatter only the all-distinct tails (table stack);
              * the radix scatter remains available behind the knob. */
+            if (agg_force_smallhash) {
+                ray_t* r = exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
+                        key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel);
+                agg_vo_free(&vo); agg_dense_plan_free(&dp); return r;
+            }
             ray_t* r = ray_agg_tablestack
                 ? exec_group_v2_parallel_tablestack(g, op, tbl, nrows,
-                        key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
+                        key_cols, key_syms, &ks->rr, vts, off, block, sel, sel_prefix, n_sel,
                         group_limit, efp)
                 : NULL;
             if (!r) {   /* declined by its sample gate (or disabled) */
@@ -7353,13 +12214,20 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         key_cols, key_syms, vts, off, block, sel, sel_prefix, n_sel,
                         group_limit, efp);
             }
-            agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r;
+            agg_vo_free(&vo); agg_dense_plan_free(&dp); return r;
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */
         if (sel) AGG_RUN_COMPACT_FALLBACK();
+        /* random: indexed / serial whole-column strategy */
+        if (agg_seg_parted(g, tbl)) {
+            agg_vo_free(&vo); agg_dense_plan_free(&dp);
+            return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+        }
         agg_route_record(AGG_ROUTE_V2_INDEXED);
+        ray_t* uerr = agg_keys_unstage(key_cols, ks);
+        if (uerr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return uerr; }
         { ray_t* r = agg_indexed_run(g, op, tbl, key_cols, key_syms, nrows);
-          agg_vo_free(&vo); agg_dense_plan_free(&dp); scratch_free(kc_hdr); return r; }
+          agg_vo_free(&vo); agg_dense_plan_free(&dp); return r; }
     }
 
     /* Serial path does not consult the vts/off tables (per-agg vt is re-resolved
@@ -7370,22 +12238,29 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * count is below the parallel threshold here → small; not a perf blocker). */
     if (sel) AGG_RUN_COMPACT_FALLBACK();
 
+    /* random: indexed / serial whole-column strategy */
+    if (agg_seg_parted(g, tbl)) {
+        agg_dense_plan_free(&dp);
+        return agg_seg_flat_run(g, op, tbl, nrows, sel, sel_prefix, n_sel, group_limit, efp);
+    }
     agg_route_record(dense ? AGG_ROUTE_V2_SERIAL_DENSE : AGG_ROUTE_V2_SERIAL_HASH);
+    ray_t* uerr = agg_keys_unstage(key_cols, ks);
+    if (uerr) { agg_dense_plan_free(&dp); return uerr; }
     agg_groups_t groups = {0};
     int grp_rc = dense ? agg_group_keys_dense(key_cols, nrows, &dp, &groups)
                        : agg_group_keys(key_cols, ext->n_keys, nrows, &groups);
-    if (grp_rc != 0) { agg_dense_plan_free(&dp); scratch_free(kc_hdr); return ray_error("oom", NULL); }
+    if (grp_rc != 0) { agg_dense_plan_free(&dp); return ray_error("oom", NULL); }
 
     ray_t* result = ray_table_new(ext->n_keys + ext->n_aggs);
-    if (!result || RAY_IS_ERR(result)) { agg_dense_plan_free(&dp); scratch_free(kc_hdr); agg_groups_free(&groups); return ray_error("oom", NULL); }
+    if (!result || RAY_IS_ERR(result)) { agg_dense_plan_free(&dp); agg_groups_free(&groups); return ray_error("oom", NULL); }
 
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_t* kc = ray_group_gather(key_cols[k], groups.first_row, groups.ngroups);
-        if (!kc || RAY_IS_ERR(kc)) { agg_dense_plan_free(&dp); scratch_free(kc_hdr); agg_groups_free(&groups); ray_release(result); return kc ? kc : ray_error("oom", NULL); }
+        if (!kc || RAY_IS_ERR(kc)) { agg_dense_plan_free(&dp); agg_groups_free(&groups); ray_release(result); return kc ? kc : ray_error("oom", NULL); }
         result = ray_table_add_col(result, key_syms[k], kc);
         ray_release(kc);
     }
-    agg_dense_plan_free(&dp); scratch_free(kc_hdr);   /* key_cols/key_syms done — agg loop below reads neither */
+    agg_dense_plan_free(&dp);   /* key_cols/key_syms done — agg loop below reads neither */
 
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
@@ -7393,12 +12268,15 @@ static ray_t* exec_group_v2_run_inner(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* col;
         if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {       /* binary agg (pearson) */
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
-            ray_t* x_col = ray_table_get_col(tbl, ie->sym);
-            ray_t* y_col = ray_table_get_col(tbl, ye->sym);
+            ray_t* x_col = ray_table_col(tbl, ie->sym);
+            if (x_col && RAY_IS_ERR(x_col)) { agg_groups_free(&groups); ray_release(result); return x_col; }
+            ray_t* y_col = ray_table_col(tbl, ye->sym);
+            if (y_col && RAY_IS_ERR(y_col)) { agg_groups_free(&groups); ray_release(result); return y_col; }
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], x_col->type);
             col = agg_run_one_bin(vt, x_col, y_col, groups.gids, nrows, groups.ngroups, kparam);
         } else {
-            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_get_col(tbl, ie->sym) : NULL;
+            ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_col(tbl, ie->sym) : NULL;
+            if (val_col && RAY_IS_ERR(val_col)) { agg_groups_free(&groups); ray_release(result); return val_col; }
             int8_t in_type = val_col ? val_col->type : RAY_I64;
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], in_type);
             col = agg_run_one(vt, val_col, groups.gids, nrows, groups.ngroups, kparam);
@@ -7465,9 +12343,31 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         return compact ? compact : ray_error("oom", NULL);
     }
     for (uint32_t i = 0; i < n_want; i++) {
-        ray_t* src = ray_table_get_col(tbl, want[i]);
+        /* A parted column only on a segment-streamed table, from its
+         * first-N pre-pass over generation-2 keys (an in-place concat group
+         * runs no selection, group_seg_stream_ok): gathered by range like
+         * an encoded one, a plain parted wrapper from its segments. */
+        ray_t* gcol = NULL;
+        ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc(tbl, want[i]));
+        ray_col_meta_t pm;
+        if (!enc && g->grp_seg_stream && ray_table_col_meta(tbl, want[i], &pm) && RAY_IS_PARTED(pm.type))
+            enc = ray_table_slot(tbl, want[i]);
+        if (enc) {
+            /* generation 2 (or a parted column): the survivors' vectors,
+             * decoded or point-read by range (idx ascending); the gather's
+             * result is as fresh as gather_by_idx's */
+            ray_t* err = ray_col_gather_enc(enc, NULL, true, idx, n_sel, &gcol);
+            if (err) { ray_release(compact); scratch_free(want_hdr); return err; }
+            compact = ray_table_add_col(compact, want[i], gcol);
+            ray_release(gcol);
+            if (!compact || RAY_IS_ERR(compact)) { scratch_free(want_hdr); return compact ? compact : ray_error("oom", NULL); }
+            continue;
+        }
+        ray_t* src = ray_table_col(tbl, want[i]);
+        if (src && RAY_IS_ERR(src)) { ray_release(compact); scratch_free(want_hdr); return src; }
         if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
-        ray_t* gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
+        assert(!RAY_IS_PARTED(src->type));
+        gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
         if (!gcol || RAY_IS_ERR(gcol)) {
             ray_release(compact); scratch_free(want_hdr);
             return gcol ? gcol : ray_error("oom", NULL);
@@ -7537,18 +12437,6 @@ ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     ray_release(prefix_block);
     return result;
-}
-
-/* Read element `row` of an integer/temporal/SYM column widened to int64. */
-static inline int64_t agg_read_key_i64(ray_t* col, const void* data, int64_t row) {
-    switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)data)[row];
-        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)data)[row];
-        case RAY_I16: return ((const int16_t*)data)[row];
-        case RAY_U8:  case RAY_BOOL: return ((const uint8_t*)data)[row];
-        case RAY_SYM: return (int64_t)ray_read_sym(data, row, col->type, col->attrs);
-        default: return 0;  /* gate guarantees only the above reach here */
-    }
 }
 
 ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
@@ -7730,6 +12618,24 @@ static uint64_t agg_list_key_hash(ray_t* value, const ray_group_sym_view_t* view
         for (int64_t i = 0; i < value->len; i++) hash = ray_hash_combine(hash, agg_list_key_hash(children[i], view));
         return hash;
     }
+    /* TABLE / DICT cells compare in atom_eq (the fallthrough of
+     * agg_list_key_eq).  Hashing their names and columns only spreads the
+     * buckets: the fallback hash (type and length) puts every table of one
+     * length in one bucket, a linear scan per row. */
+    if (value->type == RAY_TABLE) {
+        int64_t nc = ray_table_ncols(value);
+        uint64_t hash = ray_hash_i64(nc);
+        for (int64_t c = 0; c < nc; c++) {
+            hash = ray_hash_combine(hash, ray_hash_i64(ray_table_col_name(value, c)));
+            ray_t* col = ray_table_col_idx(value, c);
+            if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }   /* hashes as absent */
+            hash = ray_hash_combine(hash, agg_list_key_hash(col, view));
+        }
+        return hash;
+    }
+    if (value->type == RAY_DICT)
+        return ray_hash_combine(agg_list_key_hash(ray_dict_keys(value), view),
+                                agg_list_key_hash(ray_dict_vals(value), view));
     if (value->type == RAY_SYM || value->type == RAY_STR) {
         uint64_t hash = ray_hash_i64(value->type);
         for (int64_t i = 0; i < value->len; i++) {
@@ -8160,7 +13066,8 @@ ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms
             for (int j = 0; j < keep_n; j++) if (keep_syms[j] == cn) { req = true; break; }
             if (!req) continue;
         }
-        ray_t* sc = ray_table_get_col_idx(tbl, c);
+        ray_t* sc = ray_table_col_idx(tbl, c);
+        if (sc && RAY_IS_ERR(sc)) { agg_groups_free(&groups); ray_release(result); return sc; }
         if (!sc) continue;
         ray_t* dc = agg_gather_col_at(sc, groups.first_row, groups.ngroups);
         if (!dc || RAY_IS_ERR(dc)) {

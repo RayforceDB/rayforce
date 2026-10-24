@@ -46,6 +46,11 @@
 #define ATTR_QUOTED  0x20  /* -RAY_SYM atom with this flag SET = quoted/literal symbol;
                               CLEAR (default) = name reference, resolved at eval. */
 
+/* Head of the list the parser makes from the [name count] binding of an
+ * indexed `times`: (RAY_TIMES_BIND name count).  The space keeps any
+ * source token from spelling it. */
+#define RAY_TIMES_BIND "times bind"
+
 /* Internal eval flag for RAY_LIST values carried as nested IPC arguments.
  * The evaluator still runs callable lists normally; this only makes a
  * non-callable list head fall back to returning the list as data. */
@@ -140,18 +145,24 @@ enum {
  */
 #define LAMBDA_SLOTS 10
 
+/* The slots that hold no reference, and the last one that does.  The free
+ * walk in mem/heap.c drops slots 0 .. LAMBDA_SLOT_CAPROWS but n_locals. */
+#define LAMBDA_SLOT_NLOCALS   4
+#define LAMBDA_SLOT_CAPROWS   8
+#define LAMBDA_SLOT_CAPQ      9
+
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
 #define LAMBDA_PARAMS(lam)    (((ray_t**)ray_data(lam))[0])
-#define LAMBDA_BODY(lam)      (((ray_t**)ray_data(lam))[1])
+#define LAMBDA_BODY(lam)      (((ray_t**)ray_data(lam))[1])   /* not-a-table */
 #define LAMBDA_BC(lam)        (((ray_t**)ray_data(lam))[2])
 #define LAMBDA_CONSTS(lam)    (((ray_t**)ray_data(lam))[3])
-#define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[4]))
+#define LAMBDA_NLOCALS(lam)   (*((int32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_NLOCALS]))
 #define LAMBDA_NFO(lam)       (((ray_t**)ray_data(lam))[5])
 #define LAMBDA_DBG(lam)       (((ray_t**)ray_data(lam))[6])
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
-#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[8])
-#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[9]))
+#define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
+#define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 
@@ -244,6 +255,8 @@ void ray_lang_print(FILE* fp, ray_t* val);
 void ray_eval_request_interrupt(void);
 void ray_eval_clear_interrupt(void);
 int  ray_eval_is_interrupted(void);
+/* Depth of the evaluation in progress on this thread: 0 between statements. */
+int  ray_eval_depth(void);
 
 /* Return the current eval context's nfo (source location) object, or NULL. */
 ray_t* ray_eval_get_nfo(void);
@@ -253,6 +266,13 @@ void   ray_eval_set_nfo(ray_t* nfo);
  * a VM error propagates without a trap.  Cleared at the start of ray_eval_str. */
 ray_t* ray_get_error_trace(void);
 void   ray_clear_error_trace(void);
+
+/* Pending uncaught (raise x) value.  ray_raise_clear drops it — call at each
+ * top-level evaluation boundary (ray_eval_str does).  ray_raise_render
+ * writes a bounded rendering into buf for an error printer; false when no
+ * raise is pending. */
+void   ray_raise_clear(void);
+bool   ray_raise_render(char* buf, size_t cap);
 
 /* Restricted mode: when true, builtins with RAY_FN_RESTRICTED are blocked. */
 void ray_eval_set_restricted(bool on);
@@ -420,6 +440,8 @@ ray_t* ray_while_fn(ray_t** args, int64_t n);
 ray_t* ray_times_fn(ray_t** args, int64_t n);
 ray_t* ray_times_norm_fn(ray_t* x);
 ray_t* ray_times_dec_fn(ray_t* x);
+ray_t* ray_times_idx_fn(ray_t* lim, ray_t* ctr);
+bool   ray_times_binding(ray_t* ast, int64_t* name, ray_t** count);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);

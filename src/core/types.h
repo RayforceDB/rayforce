@@ -32,9 +32,10 @@
  * Internal .c files can include either rayforce.h directly or types.h.
  */
 #include <rayforce.h>
+#include <float.h>
 
 /* Number of types (positive range): must be > max type ID */
-#define RAY_TYPE_COUNT 15
+#define RAY_TYPE_COUNT 17
 
 /* Type sizes lookup table (defined in types.c) */
 extern const uint8_t ray_type_sizes[256];
@@ -67,6 +68,15 @@ static inline int16_t ray_cast_f64_to_i16_null(double v) {
     return (int16_t)v;
 }
 
+/* F32 has no infinities either: a value past FLT_MAX saturates, as the
+ * integer narrowings above do.  NaN (the float null) stays null. */
+static inline float ray_cast_f64_to_f32_null(double v) {
+    if (v != v) return NULL_F32;
+    if (v >= (double)FLT_MAX) return FLT_MAX;
+    if (v <= -(double)FLT_MAX) return -FLT_MAX;
+    return (float)v;
+}
+
 static inline uint8_t ray_cast_f64_to_u8_null(double v) {
     if (v != v || v <= 0.0) return 0;
     if (v >= (double)UINT8_MAX) return UINT8_MAX;
@@ -74,7 +84,8 @@ static inline uint8_t ray_cast_f64_to_u8_null(double v) {
 }
 
 static inline uint8_t ray_cast_f64_to_bool_null(double v) {
-    return (v == v && v != 0.0) ? 1 : 0;
+    /* BOOL has no null: every non-zero value, including NaN, is true. */
+    return v != 0.0 ? 1 : 0;
 }
 
 /* Two's-complement wraparound integer add/mul.  Signed overflow is UB in C;

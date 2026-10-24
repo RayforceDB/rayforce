@@ -26,6 +26,9 @@
 #include "ops/ops.h"
 #include "ops/idxop.h"
 #include "mem/sys.h"
+#include "ops/colgather.h"   /* generation-2 top-K gathers */
+#include "ops/rowsel.h"      /* exec_sort_head_sel: the winners' rowsel */
+#include <stdatomic.h>
 
 /* --------------------------------------------------------------------------
  * Sort comparator: compare two row indices across all sort keys.
@@ -61,7 +64,7 @@ int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
             float vb = ((float*)ray_data(col))[b];
             if (va < vb) cmp = -1;
             else if (va > vb) cmp = 1;
-        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
             int64_t va = ((int64_t*)ray_data(col))[a];
             int64_t vb = ((int64_t*)ray_data(col))[b];
             if (va < vb) cmp = -1;
@@ -251,6 +254,12 @@ static void sortedness_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t i = start + 1; i < end; i++) {
         if (keys[i] < keys[i - 1]) unsorted++;
     }
+    /* a clamped dispatch's task spans several grains: the caller counts
+     * every grain boundary pair, so this task's inner ones are taken back */
+    const int64_t grain = RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (RAY_UNLIKELY(end - start > grain))
+        for (int64_t b = (start / grain + 1) * grain; b < end; b += grain)
+            if (keys[b] < keys[b - 1]) unsorted--;
     c->pw_unsorted[wid] += unsorted;
 }
 
@@ -948,7 +957,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     if (c->n_keys <= 1) {
         /* Single-key fast path */
         switch (c->type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
             const int64_t* d = (const int64_t*)c->data;
             bool has_nulls = c->col && ray_vec_may_have_nulls(c->col);
             bool nf = c->nulls_first;
@@ -1139,13 +1148,11 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
                 if (c->enum_ranks[k]) {
                     uint32_t raw = (uint32_t)ray_read_sym(ray_data(col), i, col->type, col->attrs);
                     val = (int64_t)c->enum_ranks[k][raw];
-                } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+                } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
                     val = ((const int64_t*)ray_data(col))[i];
                 } else if (col->type == RAY_F64) {
-                    uint64_t bits;
-                    memcpy(&bits, &((const double*)ray_data(col))[i], 8);
-                    uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                    val = (int64_t)(bits ^ mask);
+                    double x = ((const double*)ray_data(col))[i];
+                    val = radix_f64_is_null(x) ? c->mins[k] : radix_f64_ord(x);
                 } else if (col->type == RAY_I32 || col->type == RAY_DATE || col->type == RAY_TIME) {
                     val = (int64_t)((const int32_t*)ray_data(col))[i];
                 } else if (col->type == RAY_I16) {
@@ -2199,13 +2206,6 @@ void mk_prescan_fn(void* arg, uint32_t wid,
     int64_t* my_mins = c->pw_mins + (int64_t)wid * nk;
     int64_t* my_maxs = c->pw_maxs + (int64_t)wid * nk;
 
-    /* Initialize on first morsel, merge on subsequent */
-    for (uint32_t k = 0; k < nk; k++) {
-        if (my_mins[k] == INT64_MAX) {
-            /* first morsel for this worker — will be set below */
-        }
-    }
-
     for (uint32_t k = 0; k < nk; k++) {
         ray_t* col = c->vecs[k];
         int64_t kmin = my_mins[k], kmax = my_maxs[k];
@@ -2221,7 +2221,7 @@ void mk_prescan_fn(void* arg, uint32_t wid,
                 if (v < kmin) kmin = v;
                 if (v > kmax) kmax = v;
             }
-        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
             const int64_t* d = (const int64_t*)ray_data(col);
             for (int64_t i = start; i < end; i++) {
                 if (d[i] < kmin) kmin = d[i];
@@ -2230,10 +2230,8 @@ void mk_prescan_fn(void* arg, uint32_t wid,
         } else if (col->type == RAY_F64) {
             const double* d = (const double*)ray_data(col);
             for (int64_t i = start; i < end; i++) {
-                uint64_t bits;
-                memcpy(&bits, &d[i], 8);
-                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                int64_t v = (int64_t)(bits ^ mask);
+                if (radix_f64_is_null(d[i])) continue;
+                int64_t v = radix_f64_ord(d[i]);
                 if (v < kmin) kmin = v;
                 if (v > kmax) kmax = v;
             }
@@ -2269,7 +2267,7 @@ void mk_prescan_fn(void* arg, uint32_t wid,
  * Sequential writes — no random access. */
 static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_keys,
                                int64_t n, bool desc) {
-    if (type == RAY_I64 || type == RAY_TIMESTAMP) {
+    if (type == RAY_I64 || type == RAY_TIMESPAN || type == RAY_TIMESTAMP) {
         int64_t* d = (int64_t*)dst;
         if (desc)
             for (int64_t i = 0; i < n; i++)
@@ -2332,10 +2330,12 @@ static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_key
  * nrows:       number of rows in each column
  * sorted_keys_out: if non-NULL, receives sorted radix keys (caller frees keys_hdr_out)
  * keys_hdr_out:    if non-NULL, receives scratch header for sorted_keys_out
+ * prepared_ranks: optional borrowed lexical ranks; caller retains ownership
  * Returns:     ray_t* I64 vector of sorted indices (caller owns), or RAY_ERROR */
 static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                                uint32_t n_cols, int64_t nrows,
-                               uint64_t** sorted_keys_out, ray_t** keys_hdr_out) {
+                               uint64_t** sorted_keys_out, ray_t** keys_hdr_out,
+                               uint32_t* const* prepared_ranks) {
     if (n_cols == 0 || nrows <= 0)
         return ray_vec_new(RAY_I64, 0);
     /* No n_cols cap here: the composite-radix fast path below (`fits`)
@@ -2415,8 +2415,10 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             if (enum_ranks) {
                 for (uint32_t k = 0; k < n_cols; k++) {
                     if (RAY_IS_SYM(cols[k]->type)) {
-                        enum_ranks[k] = build_enum_rank(cols[k], nrows,
-                                                         &enum_rank_hdrs[k]);
+                        enum_ranks[k] = prepared_ranks ? prepared_ranks[k] : NULL;
+                        if (!enum_ranks[k])
+                            enum_ranks[k] = build_enum_rank(cols[k], nrows,
+                                                           &enum_rank_hdrs[k]);
                         if (!enum_ranks[k]) { can_radix = false; break; }
                     }
                 }
@@ -2649,30 +2651,14 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                 uint16_t total_bits = 0;
                 bool fits = true;
 
-                /* A float null is NaN, and the composite encode packs a
-                 * double by flipping its bits — which puts NaN above every
-                 * real number, i.e. last on ascending, whatever
-                 * sort_nulls_first says.  The other types carry a sentinel
-                 * that already lands where the rule wants it (INT64_MIN is
-                 * the smallest), so only F64 disagrees.  Rather than teach
-                 * the packing a second placement, hand a null-bearing float
-                 * key to the rank-then-compose fallback, which ranks
-                 * through sort_indices_ex and is null-aware.  Leaving it in
-                 * the direct encode is what made a multi-key sort place
-                 * floats one way below 64 rows and the other way above. */
-                bool nullable_f64_key = false;
-                for (uint32_t k = 0; k < n_cols; k++)
-                    if (cols[k]->type == RAY_F64 &&
-                        ray_vec_may_have_nulls(cols[k])) {
-                        nullable_f64_key = true;
-                        break;
-                    }
-
+                /* A null-bearing F64 key packs its nulls into a reserved
+                 * slot below its minimum (radix_key_bounds_finish), so it
+                 * stays on the composite with the placement the comparator
+                 * gives, at every row count. */
                 ray_pool_t* mk_prescan_pool = (nrows >= SMALL_POOL_THRESHOLD) ? pool : NULL;
-                if (has_wide_key || nullable_f64_key) {
+                if (has_wide_key) {
                     /* RAY_STR / RAY_GUID can't be packed into a composite
-                     * uint64 key, and a nullable float must not be.  Force
-                     * the rank-then-compose fallback. */
+                     * uint64 key.  Force the rank-then-compose fallback. */
                     total_bits = UINT16_MAX;
                     fits = false;
                 } else if (n_cols <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool) {
@@ -2706,6 +2692,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             if (wmin < kmin) kmin = wmin;
                             if (wmax > kmax) kmax = wmax;
                         }
+                        radix_key_bounds_finish(cols[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         /* Unsigned subtraction: kmin can be the i64 null
@@ -2734,7 +2721,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
-                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
                             const int64_t* d = (const int64_t*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
                                 if (d[i] < kmin) kmin = d[i];
@@ -2743,10 +2730,8 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         } else if (col->type == RAY_F64) {
                             const double* d = (const double*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
-                                uint64_t bits;
-                                memcpy(&bits, &d[i], 8);
-                                uint64_t mask = -(bits >> 63) | ((uint64_t)1 << 63);
-                                int64_t v = (int64_t)(bits ^ mask);
+                                if (radix_f64_is_null(d[i])) continue;
+                                int64_t v = radix_f64_ord(d[i]);
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
@@ -2770,6 +2755,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             }
                         }
 
+                        radix_key_bounds_finish(cols[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
                         /* Unsigned subtraction: kmin can be the i64 null
@@ -2815,7 +2801,8 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         uint8_t nf_arg[1]   = { knf };
                         ray_t* sk_idx = sort_indices_ex(col_arg, desc_arg,
                                                          nf_arg, 1, nrows,
-                                                         NULL, NULL);
+                                                         NULL, NULL,
+                                                         enum_ranks + k);
                         if (!sk_idx || RAY_IS_ERR(sk_idx)) { rank_ok = false; break; }
                         int64_t* sk_idx_data = (int64_t*)ray_data(sk_idx);
                         uint32_t* r = (uint32_t*)scratch_alloc(&rank_hdrs[k],
@@ -2929,9 +2916,9 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                     uint8_t accum = 0;
                     for (int k = n_cols - 1; k >= 0; k--) {
                         bit_shifts[k] = accum;
-                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint64_t range = (uint64_t)maxs[k] - (uint64_t)mins[k];
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         accum += bits;
                     }
@@ -2952,7 +2939,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             };
                             for (uint32_t k = 0; k < n_cols; k++) {
                                 enc.mins[k] = mins[k];
-                                enc.ranges[k] = maxs[k] - mins[k];
+                                enc.ranges[k] = (int64_t)((uint64_t)maxs[k] - (uint64_t)mins[k]);
                                 enc.bit_shifts[k] = bit_shifts[k];
                                 enc.descs[k] = descs ? descs[k] : 0;
                                 enc.enum_ranks[k] = enum_ranks[k];
@@ -3140,8 +3127,10 @@ static void topk_cmp_sift_down(const sort_cmp_ctx_t* ctx, int64_t* heap,
 
 /* Comparator-based top-K: works for any comparable sort key types and any
  * number of keys (1..n).  Used when the radix-encoded fast path is not
- * applicable.  O(n log K + K log K). */
-static ray_t* topk_indices_cmp(ray_t** cols, uint8_t* descs, uint8_t* nfs,
+ * applicable.  O(n log K + K log K).  Always inlined: ray_topk_table_multi
+ * keeps the code it had as the only caller (exec_sort_head_sel is the
+ * second). */
+static inline __attribute__((always_inline)) ray_t* topk_indices_cmp(ray_t** cols, uint8_t* descs, uint8_t* nfs,
                                uint8_t n_cols, int64_t nrows, int64_t k) {
     if (!cols || n_cols == 0 || k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     for (uint8_t c = 0; c < n_cols; c++) if (!cols[c]) return NULL;
@@ -3231,7 +3220,7 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     int8_t type = col->type;
     /* Whitelist of types where radix_encode_fn produces an order-preserving
      * uint64 — exactly the cases topk can handle without a comparator. */
-    bool ok = (type == RAY_I64 || type == RAY_TIMESTAMP ||
+    bool ok = (type == RAY_I64 || type == RAY_TIMESPAN || type == RAY_TIMESTAMP ||
                type == RAY_F64 || type == RAY_F32 ||
                type == RAY_I32 || type == RAY_DATE || type == RAY_TIME ||
                type == RAY_SYM || type == RAY_STR || type == RAY_GUID ||
@@ -3350,8 +3339,9 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
 static bool table_has_parted_col(ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) &&
+            (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON))
             return true;
     }
     return false;
@@ -3366,10 +3356,21 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
     ray_t* result = ray_table_new(ncols);
     if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result; }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
         int64_t name = ray_table_col_name(tbl, c);
+        ray_t* dst = NULL;
+        /* a generation-2 slot: the K rows' vectors, decoded by range */
+        ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, c));
+        if (enc) {
+            ray_t* err = ray_col_gather_enc(enc, NULL, true, idx_data, k, &dst);
+            if (err) { ray_release(idx); ray_release(result); return err; }
+            result = ray_table_add_col(result, name, dst);
+            ray_release(dst);
+            if (!result || RAY_IS_ERR(result)) { ray_release(idx); return result ? result : ray_error("oom", NULL); }
+            continue;
+        }
+        ray_t* src = ray_table_col_idx(tbl, c);
+        if (src && RAY_IS_ERR(src)) { ray_release(idx); ray_release(result); return src; }
         if (!src) continue;
-        ray_t* dst;
         if (src->type == RAY_LIST) {
             dst = ray_list_new(k);
             if (!dst || RAY_IS_ERR(dst)) {
@@ -3412,8 +3413,8 @@ ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
     if (k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (src && src->type == RAY_LIST) return NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_LIST) return NULL;
     }
 
     ray_t* idx = topk_indices_single(col, desc, nf, nrows, k);
@@ -3439,8 +3440,8 @@ ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
     if (k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(tbl, c);
-        if (src && src->type == RAY_LIST) return NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_LIST) return NULL;
     }
     for (uint8_t i = 0; i < n_keys; i++)
         if (!key_cols[i] || key_cols[i]->len < nrows) return NULL;
@@ -3518,7 +3519,7 @@ ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj) {
 
 ray_t* ray_sort_indices(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                         uint8_t n_cols, int64_t nrows) {
-    return sort_indices_ex(cols, descs, nulls_first, n_cols, nrows, NULL, NULL);
+    return sort_indices_ex(cols, descs, nulls_first, n_cols, nrows, NULL, NULL, NULL);
 }
 
 ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
@@ -3527,7 +3528,7 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
         uint64_t* sorted_keys = NULL;
         ray_t* keys_hdr = NULL;
         ray_t* idx = sort_indices_ex(cols, descs, nulls_first, 1, nrows,
-                                      &sorted_keys, &keys_hdr);
+                                      &sorted_keys, &keys_hdr, NULL);
         if (!idx || RAY_IS_ERR(idx)) return idx;
 
         bool c0_shifted = ray_vec_may_have_nulls(cols[0]) &&
@@ -3577,7 +3578,8 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
  * POSITION: the projection names scans by their source column and
  * expressions `_e<c>`, so a hidden key or a renamed output can share a
  * name with another projected column and a name lookup would read the
- * wrong one.  Any other key resolves by name.  Borrowed. */
+ * wrong one.  Any other key resolves by name.  Borrowed; NULL when absent,
+ * an owned error when an encoded column fails to materialize. */
 static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 uint32_t key_id, int64_t key_sym) {
     ray_op_t* child = g ? op_child(g, op, 0) : NULL;
@@ -3587,9 +3589,58 @@ static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             (int64_t)se->sort.n_cols == ray_table_ncols(tbl))
             for (uint32_t c = 0; c < se->sort.n_cols; c++)
                 if (se->sort.columns[c] == key_id)
-                    return ray_table_get_col_idx(tbl, c);
+                    return ray_table_col_idx(tbl, c);
     }
-    return ray_table_get_col(tbl, key_sym);
+    return ray_table_col(tbl, key_sym);
+}
+
+/* ---- The top-k shortcut's gate, one copy for exec_sort and
+ * exec_sort_head_sel (the late route must decline exactly where the
+ * shortcut would not run on the compacted table) ---- */
+
+/* The shape: 1..16 keys (the shortcut's fixed key arrays), K below the
+ * rows and at most 8192. */
+static inline bool topk_shortcut_shape(uint32_t n_sort, int64_t limit, int64_t nrows) {
+    return limit > 0 && n_sort >= 1 && n_sort <= 16 && limit < nrows && limit <= 8192;
+}
+
+/* Key k is a column scan (the shortcut takes no computed key): its op id
+ * and name symbol. */
+static inline bool topk_scan_key(ray_graph_t* g, const ray_op_ext_t* ext, uint32_t k, uint32_t* id, int64_t* sym) {
+    ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
+    ray_op_ext_t* key_ext = find_ext(g, key_op->id);
+    if (!key_ext || key_ext->base.opcode != OP_SCAN) return false;
+    *id = key_op->id;
+    *sym = key_ext->sym;
+    return true;
+}
+
+/* Key k's column of `tbl` as the shortcut reads it (sort_key_scan_col);
+ * NULL for a computed key or a missing column (an error, freed: the full
+ * sort re-reads the key and reports it). */
+static inline ray_t* topk_key_col(ray_graph_t* g, ray_op_t* op, const ray_op_ext_t* ext, ray_t* tbl, uint32_t k) {
+    uint32_t id; int64_t sym;
+    if (!topk_scan_key(g, ext, k, &id, &sym)) return NULL;
+    ray_t* col = sort_key_scan_col(g, op, tbl, id, sym);
+    if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
+    return col;
+}
+
+/* Key k's nulls-first flag, the sort's default when unset. */
+static inline uint8_t topk_key_nf(const ray_op_ext_t* ext, uint32_t k) {
+    uint8_t d = ext->sort.desc ? ext->sort.desc[k] : 0;
+    return ext->sort.nulls_first ? ext->sort.nulls_first[k] : sort_nulls_first(d);
+}
+
+/* A LIST column (flat or parted): ray_topk_table / _multi decline. */
+static inline bool topk_has_list(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && (m.type == RAY_LIST || m.type == RAY_PARTED_BASE + RAY_LIST))
+            return true;
+    }
+    return false;
 }
 
 ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
@@ -3615,38 +3666,20 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
      * n_sort <= 16: the shortcut's key_cols/nfs scratch below is a
      * fixed-16 stack array; wider sorts skip straight to the general
      * sort_indices_ex path (itself n_cols-unbounded). */
-    if (limit > 0 && n_sort >= 1 && n_sort <= 16 && limit < nrows && limit <= 8192 &&
-        g && g->selection == NULL) {
+    if (topk_shortcut_shape(n_sort, limit, nrows) && g && g->selection == NULL) {
         ray_t* key_cols[16];
         int    all_scan = 1;
-        for (uint32_t k = 0; k < n_sort; k++) {
-            ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
-            ray_op_ext_t* key_ext = find_ext(g, key_op->id);
-            if (key_ext && key_ext->base.opcode == OP_SCAN) {
-                key_cols[k] = sort_key_scan_col(g, op, tbl, key_op->id, key_ext->sym);
-                if (!key_cols[k]) { all_scan = 0; break; }
-            } else {
-                all_scan = 0;
-                break;
-            }
-        }
+        for (uint32_t k = 0; k < n_sort; k++)
+            if (!(key_cols[k] = topk_key_col(g, op, ext, tbl, k))) { all_scan = 0; break; }
         if (all_scan) {
             if (n_sort == 1) {
                 uint8_t desc = ext->sort.desc ? ext->sort.desc[0] : 0;
-                uint8_t nf   = ext->sort.nulls_first
-                              ? ext->sort.nulls_first[0]
-                              : sort_nulls_first(desc);
-                ray_t* topk_res = ray_topk_table(tbl, key_cols[0], desc, nf, limit);
+                ray_t* topk_res = ray_topk_table(tbl, key_cols[0], desc, topk_key_nf(ext, 0), limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
                 if (topk_res && RAY_IS_ERR(topk_res)) ray_release(topk_res);
             } else {
                 uint8_t nfs[16];
-                for (uint32_t k = 0; k < n_sort; k++) {
-                    uint8_t d = ext->sort.desc ? ext->sort.desc[k] : 0;
-                    nfs[k] = ext->sort.nulls_first
-                             ? ext->sort.nulls_first[k]
-                             : sort_nulls_first(d);
-                }
+                for (uint32_t k = 0; k < n_sort; k++) nfs[k] = topk_key_nf(ext, k);
                 ray_t* topk_res = ray_topk_table_multi(tbl, key_cols,
                     ext->sort.desc, nfs, n_sort, limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
@@ -3694,6 +3727,29 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         }
     }
 
+    /* With no take, an already ordered table needs no permutation or
+     * gather.  The shared check rejects null-bearing and unsupported key
+     * types; mixed directions still require the general comparator. */
+    if (limit <= 0 && n_sort > 0 && !table_has_parted_col(tbl) &&
+        (!g || !g->selection)) {
+        uint8_t descending = ext->sort.desc ? ext->sort.desc[0] : 0;
+        bool uniform = ray_is_vec(sort_vecs[0]) && sort_vecs[0]->len == nrows;
+        for (uint32_t k = 1; k < n_sort && uniform; k++)
+            if (!ray_is_vec(sort_vecs[k]) || sort_vecs[k]->len != nrows ||
+                (ext->sort.desc ? ext->sort.desc[k] : 0) != descending) {
+                uniform = false;
+                break;
+            }
+        if (uniform && ray_key_cols_sorted(sort_vecs, n_sort, descending, nrows) &&
+            !pool_cancelled(ray_pool_get())) {
+            for (uint32_t k = 0; k < n_sort; k++)
+                if (sort_owned[k]) ray_release(sort_vecs[k]);
+            scratch_free(sort_hdr);
+            ray_retain(tbl);
+            return tbl;
+        }
+    }
+
     /* ---- Sort-index permutation reuse ----
      * When there is exactly one ascending sort key that is a direct column
      * scan and that column carries a fresh, null-free sort index, reuse the
@@ -3723,6 +3779,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
             /* Index eligible and fresh: consult + hit. */
             ray_idx_consults[IDX_SITE_SORT]++;
             ray_idx_hits[IDX_SITE_SORT]++;
+            ray_idx_note_use(sort_vecs[0]);
             ray_retain(perm);
             idx_vec = perm;
             goto sort_idx_ready;
@@ -3730,7 +3787,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     }
     idx_vec = sort_indices_ex(sort_vecs, ext->sort.desc,
                               ext->sort.nulls_first, n_sort, nrows,
-                              &sorted_keys, &sorted_keys_hdr);
+                              &sorted_keys, &sorted_keys_hdr, NULL);
 sort_idx_ready:;
     if (!idx_vec || RAY_IS_ERR(idx_vec)) {
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
@@ -3778,10 +3835,24 @@ sort_idx_ready:;
     /* Pre-allocate all output columns, then do a single fused gather pass */
     ray_pool_t* gather_pool = (gather_rows > RAY_PARALLEL_THRESHOLD) ? ray_pool_get() : NULL;
     ray_t* new_cols[ncols];
+    ray_t* src_cols[ncols];   /* borrowed: the plain source columns */
     int64_t col_names[ncols];
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = col;
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t j = 0; j < c; j++)
+                if (new_cols[j]) ray_release(new_cols[j]);
+            ray_release(result);
+            if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            for (uint32_t k = 0; k < n_sort; k++)
+                if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
+                    ray_release(sort_vecs[k]);
+            scratch_free(sort_hdr);
+            ray_release(idx_vec);
+            return col;
+        }
         if (!col) { new_cols[c] = NULL; continue; }
         ray_t* nc;
         if (col->type == RAY_LIST) {
@@ -3859,7 +3930,7 @@ sort_idx_ready:;
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, base);
+            ray_t* col = src_cols[base];
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -3888,7 +3959,7 @@ sort_idx_ready:;
     /* Propagate str_pool / null bitmaps from source columns */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         /* Gather null bits in sorted order */
@@ -3917,6 +3988,164 @@ sort_idx_ready:;
     scratch_free(sort_hdr);
 
     ray_release(idx_vec);
+    return result;
+}
+
+/* ---- HEAD(SORT) under a lazy selection: late materialization ----
+ * The old route compacted every column of the table under the selection,
+ * then took the top `limit` rows of the compacted table (ray_topk_table /
+ * _multi) and gathered them again.  Here only the sort keys are compacted;
+ * the top-k runs on them exactly as it ran on the compacted table (the
+ * same values at the same positions, ties kept by the lower position);
+ * the winners' positions are mapped back to source rows through the
+ * selection, and only those rows of every column are compacted (a rowsel
+ * of the winners, ascending) and put in the top-k order by the same
+ * gather.  So the answer is the old route's, row for row, and every
+ * column but the keys is read for `limit` rows instead of the selection's
+ * (parted q24: 646 survivors of 105 columns gathered for 10 results).
+ * NULL when the shape is not the one the top-k shortcut takes (the caller
+ * compacts the whole table and sorts, as before). */
+static ray_t* sel_rows_rowsel(int64_t nrows, const int64_t* rows, int64_t k) {
+    int64_t idx_count = 0;
+    for (int64_t i = 0; i < k; ) {
+        int64_t seg = rows[i] / RAY_MORSEL_ELEMS, j = i;
+        while (j < k && rows[j] / RAY_MORSEL_ELEMS == seg) j++;
+        int64_t seglen = nrows - seg * RAY_MORSEL_ELEMS < RAY_MORSEL_ELEMS ? nrows - seg * RAY_MORSEL_ELEMS : RAY_MORSEL_ELEMS;
+        if (j - i != seglen) idx_count += j - i;
+        i = j;
+    }
+    ray_t* sel = ray_rowsel_new(nrows, k, idx_count);
+    if (!sel) return NULL;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    uint8_t* flags = ray_rowsel_flags(sel);
+    uint32_t* offs = ray_rowsel_offsets(sel);
+    uint16_t* idx = ray_rowsel_idx(sel);
+    memset(flags, RAY_SEL_NONE, m->n_segs);
+    uint32_t at = 0;
+    int64_t i = 0;
+    for (uint32_t seg = 0; seg < m->n_segs; seg++) {
+        offs[seg] = at;
+        int64_t j = i;
+        while (j < k && rows[j] / RAY_MORSEL_ELEMS == (int64_t)seg) j++;
+        if (j == i) continue;
+        int64_t seglen = nrows - (int64_t)seg * RAY_MORSEL_ELEMS < RAY_MORSEL_ELEMS
+                       ? nrows - (int64_t)seg * RAY_MORSEL_ELEMS : RAY_MORSEL_ELEMS;
+        if (j - i == seglen) {
+            flags[seg] = RAY_SEL_ALL;
+        } else {
+            flags[seg] = RAY_SEL_MIX;
+            for (int64_t q = i; q < j; q++) idx[at++] = (uint16_t)(rows[q] - (int64_t)seg * RAY_MORSEL_ELEMS);
+        }
+        i = j;
+    }
+    offs[m->n_segs] = at;
+    return sel;
+}
+
+/* A position pair: the winner's position in the compacted keys and its
+ * rank in the top-k order. */
+typedef struct { int64_t pos, rank; } sel_late_pair_t;
+static int sel_late_cmp(const void* a, const void* b) {
+    int64_t x = ((const sel_late_pair_t*)a)->pos, y = ((const sel_late_pair_t*)b)->pos;
+    return (x > y) - (x < y);
+}
+
+static _Atomic(uint64_t) g_late_heads;   /* test hook: late-materialized HEAD(SORT)s */
+uint64_t ray_sort_test_late_heads(void) { return atomic_load_explicit(&g_late_heads, memory_order_relaxed); }
+
+ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit) {
+    if (!g || !tbl || tbl->type != RAY_TABLE || !sel) return NULL;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return NULL;
+    uint32_t n_sort = ext->sort.n_cols;
+    ray_rowsel_t* meta = ray_rowsel_meta(sel);
+    int64_t nrows = ray_table_nrows(tbl), pass = meta->total_pass;
+    /* exec_sort's top-k shortcut gate, as it would see the compacted
+     * table (its rows: the selection's), and ray_topk_table's LIST rule */
+    if (!topk_shortcut_shape(n_sort, limit, pass) || meta->nrows != nrows || topk_has_list(tbl)) return NULL;
+    /* keys resolved by name on the key table (sort_key_scan_col's
+     * projected-child case keeps the old route) */
+    ray_op_t* child = op_child(g, op, 0);
+    if (child && child->opcode == OP_SELECT) return NULL;
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t keys[16];
+    for (uint32_t k = 0; k < n_sort; k++) {
+        uint32_t id;
+        if (!topk_scan_key(g, ext, k, &id, &keys[k])) return NULL;
+        bool found = false;
+        for (int64_t c = 0; c < ncols && !found; c++) found = ray_table_col_name(tbl, c) == keys[k];
+        if (!found) return NULL;
+    }
+    ray_t* ktbl = sel_compact(g, tbl, sel, keys, (int)n_sort);
+    if (!ktbl || RAY_IS_ERR(ktbl)) return ktbl;
+    ray_t* key_cols[16];
+    uint8_t nfs[16];
+    for (uint32_t k = 0; k < n_sort; k++) {
+        key_cols[k] = topk_key_col(g, op, ext, ktbl, k);
+        nfs[k] = topk_key_nf(ext, k);
+        /* a short key: sel_compact's alloc fallback handed back the table */
+        if (!key_cols[k] || key_cols[k]->len != pass) { ray_release(ktbl); return key_cols[k] ? ray_error("oom", NULL) : NULL; }
+    }
+    ray_t* idx = n_sort == 1
+        ? topk_indices_single(key_cols[0], ext->sort.desc ? ext->sort.desc[0] : 0, nfs[0], pass, limit)
+        : topk_indices_cmp(key_cols, ext->sort.desc, nfs, (uint8_t)n_sort, pass, limit);
+    ray_release(ktbl);
+    if (!idx || RAY_IS_ERR(idx)) {                      /* unsupported, or the full sort reports it */
+        if (idx) ray_error_free(idx);
+        return NULL;
+    }
+    /* the winners' source rows, ascending, through the selection's segments */
+    const int64_t* pos = (const int64_t*)ray_data(idx);
+    ray_t* ph = NULL;
+    sel_late_pair_t* pr = (sel_late_pair_t*)scratch_alloc(&ph, (size_t)limit * sizeof(sel_late_pair_t));
+    ray_t* rh = NULL;
+    int64_t* rows = (int64_t*)scratch_alloc(&rh, (size_t)limit * sizeof(int64_t));
+    ray_t* perm = ray_vec_new(RAY_I64, limit);
+    if (!pr || !rows || !perm || RAY_IS_ERR(perm)) {
+        if (ph) scratch_free(ph);
+        if (rh) scratch_free(rh);
+        if (perm && !RAY_IS_ERR(perm)) ray_release(perm);
+        ray_release(idx);
+        return ray_error("oom", NULL);
+    }
+    for (int64_t i = 0; i < limit; i++) { pr[i].pos = pos[i]; pr[i].rank = i; }
+    ray_release(idx);
+    qsort(pr, (size_t)limit, sizeof *pr, sel_late_cmp);
+    const uint8_t* flags = ray_rowsel_flags(sel);
+    const uint32_t* offs = ray_rowsel_offsets(sel);
+    const uint16_t* sidx = ray_rowsel_idx(sel);
+    int64_t cum = 0, q = 0;
+    for (uint32_t seg = 0; seg < meta->n_segs && q < limit; seg++) {
+        if (flags[seg] == RAY_SEL_NONE) continue;
+        int64_t lo = (int64_t)seg * RAY_MORSEL_ELEMS;
+        int64_t cnt = flags[seg] == RAY_SEL_ALL ? (nrows - lo < RAY_MORSEL_ELEMS ? nrows - lo : RAY_MORSEL_ELEMS)
+                                                : (int64_t)offs[seg + 1] - (int64_t)offs[seg];
+        for (; q < limit && pr[q].pos < cum + cnt; q++) {
+            int64_t l = pr[q].pos - cum;
+            rows[q] = lo + (flags[seg] == RAY_SEL_ALL ? l : (int64_t)sidx[offs[seg] + l]);
+        }
+        cum += cnt;
+    }
+    perm->len = limit;
+    int64_t* pm = (int64_t*)ray_data(perm);
+    for (int64_t i = 0; i < limit; i++) pm[pr[i].rank] = i;  /* rank -> its row's place among the winners */
+    scratch_free(ph);
+    ray_t* err = NULL;
+    if (q != limit) err = ray_error("corrupt", "sort: selection holds fewer rows than its %lld", (long long)pass);
+    ray_t* wsel = err ? NULL : sel_rows_rowsel(nrows, rows, limit);
+    scratch_free(rh);
+    if (!err && !wsel) err = ray_error("oom", NULL);
+    if (err) { ray_release(perm); return err; }
+    ray_t* wtbl = sel_compact(g, tbl, wsel, NULL, 0);
+    ray_rowsel_release(wsel);
+    if (!wtbl || RAY_IS_ERR(wtbl)) { ray_release(perm); return wtbl ? wtbl : ray_error("oom", NULL); }
+    if (ray_table_nrows(wtbl) != limit) {               /* sel_compact's alloc fallback: the table itself */
+        ray_release(wtbl); ray_release(perm);
+        return ray_error("oom", NULL);
+    }
+    ray_t* result = topk_gather_rows(wtbl, perm, limit);   /* releases perm */
+    ray_release(wtbl);
+    atomic_fetch_add_explicit(&g_late_heads, 1, memory_order_relaxed);
     return result;
 }
 
@@ -4026,22 +4255,82 @@ ray_t* ray_rank_fn(ray_t* x) {
  * published through it; the dispatch barrier joins all tasks before return. */
 typedef struct {
     ray_t**  key_cols;
+    uint32_t** sym_ranks; /* lexical rank by raw intern ID, prepared before dispatch */
     int64_t  n_keys;
     uint8_t  descending;
     _Atomic int* ordered;
 } sorted_check_ctx_t;
+
+/* Unranked symbol keys are scanned serially; a rank budget refusal does
+ * not mean their lexical order is undecidable. Equal IDs need no lookup. */
+static int sorted_check_sym_cmp(const sorted_check_ctx_t* c, int64_t k,
+                                int64_t ia, int64_t ib) {
+    if (ia == ib) return 0;
+    if (c->sym_ranks && c->sym_ranks[k])
+        return (c->sym_ranks[k][ia] > c->sym_ranks[k][ib]) -
+               (c->sym_ranks[k][ia] < c->sym_ranks[k][ib]);
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(c->key_cols[k]);
+    ray_t* sa = ray_sym_domain_str(dom, ia);
+    ray_t* sb = ray_sym_domain_str(dom, ib);
+    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+    uint32_t ml = la < lb ? la : lb;
+    int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
+    return cmp ? cmp : (la > lb) - (la < lb);
+}
+
+/* Share the budgeted probe and worker scan at the secondary's physical
+ * width. TIME is int32_t; I64/TIMESTAMP are int64_t. Dispatch once outside
+ * rows; comparison budget is still spent only at unequal SYM boundaries. */
+#define SORTED_SYM_SECONDARY(lane_t) do { \
+    int64_t comparisons = 0; \
+    ray_t* sc = c->key_cols[0]; \
+    const void* sd = ray_data(sc); \
+    uint8_t sattrs = sc->attrs; \
+    const lane_t* restrict tv = (const lane_t*)ray_data(c->key_cols[1]); \
+    for (int64_t b = start; b < end; b += 4096) { \
+        if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return false; \
+        int64_t e = b + 4096 < end ? b + 4096 : end; \
+        for (int64_t i = b; i < e; i++) { \
+            int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs); \
+            int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs); \
+            if (RAY_LIKELY(ia == ib)) { \
+                if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return false; } \
+            } else { \
+                int cmp = sorted_check_sym_cmp(c, 0, ia, ib); \
+                if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return false; } \
+                if (next_row && ++comparisons >= RAY_MORSEL_ELEMS) { \
+                    *next_row = i + 1; \
+                    return true; \
+                } \
+            } \
+        } \
+    } \
+    if (next_row) *next_row = end; \
+    return true; \
+} while (0)
+
+static bool sorted_check_sym_numeric(sorted_check_ctx_t* c, int64_t start,
+                                      int64_t end, int64_t* next_row) {
+    if (c->key_cols[1]->type == RAY_TIME)
+        SORTED_SYM_SECONDARY(int32_t);
+    else
+        SORTED_SYM_SECONDARY(int64_t);
+}
+#undef SORTED_SYM_SECONDARY
 
 static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
     if (start < 1) start = 1;
 
-    /* Specialized (SYM, i64-family) two-key loop — the canonical
-     * (sym, time) shape.  The generic loop below pays a type-switch per
-     * read and an atomic flag load per row; here adjacent sym ids
+    /* Specialized (SYM, integer-secondary) two-key loop.  The generic loop
+     * below pays a type-switch per read and an atomic flag load per row;
+     * here adjacent sym ids
      * compare directly (equal ids on ~all rows of a sorted table — the
-     * string comparison only runs at run boundaries), the secondary key
-     * reads raw i64, and the bail flag is polled per 4096-row block.
+     * lexical comparison only runs at run boundaries), the secondary key
+     * reads TIME as int32_t and I64/TIMESTAMP as int64_t, and the bail flag
+     * is polled per 4096-row block.
      *
      * Callers reach this only for null-free keys (ray_key_cols_sorted rejects
      * actual nulls up front, including for SYM).  That is not squeamishness
@@ -4054,31 +4343,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
          c->key_cols[1]->type == RAY_TIME ||
          c->key_cols[1]->type == RAY_TIMESTAMP) &&
         !ray_vec_may_have_nulls(c->key_cols[1])) {
-        ray_t* sc = c->key_cols[0];
-        const void* sd = ray_data(sc);
-        uint8_t sattrs = sc->attrs;
-        const int64_t* restrict tv = (const int64_t*)ray_data(c->key_cols[1]);
-        struct ray_sym_domain_s* dom = ray_sym_vec_domain(sc);
-        for (int64_t b = start; b < end; b += 4096) {
-            if (!atomic_load_explicit(c->ordered, memory_order_relaxed)) return;
-            int64_t e = b + 4096 < end ? b + 4096 : end;
-            for (int64_t i = b; i < e; i++) {
-                int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs);
-                int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs);
-                if (RAY_LIKELY(ia == ib)) {
-                    if (tv[i] < tv[i - 1]) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
-                } else {
-                    ray_t* sa = ray_sym_domain_str(dom, ia);
-                    ray_t* sb = ray_sym_domain_str(dom, ib);
-                    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
-                    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
-                    uint32_t ml = la < lb ? la : lb;
-                    int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
-                    if (cmp == 0) cmp = (la > lb) - (la < lb);
-                    if (cmp > 0) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
-                }
-            }
-        }
+        sorted_check_sym_numeric(c, start, end, NULL);
         return;
     }
 
@@ -4091,14 +4356,7 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
                 int64_t ia = ray_read_sym(ray_data(col), i - 1, RAY_SYM, col->attrs);
                 int64_t ib = ray_read_sym(ray_data(col), i,     RAY_SYM, col->attrs);
                 if (ia != ib) {
-                    struct ray_sym_domain_s* dom = ray_sym_vec_domain(col);
-                    ray_t* sa = ray_sym_domain_str(dom, ia);
-                    ray_t* sb = ray_sym_domain_str(dom, ib);
-                    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
-                    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
-                    uint32_t ml = la < lb ? la : lb;
-                    if (ml > 0) cmp = memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml);
-                    if (cmp == 0) cmp = (la > lb) - (la < lb);
+                    cmp = sorted_check_sym_cmp(c, k, ia, ib);
                 }
             } else {
                 int64_t va = read_col_i64(ray_data(col), i - 1, col->type, col->attrs);
@@ -4108,6 +4366,90 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
         }
         if (c->descending ? (cmp < 0) : (cmp > 0)) { atomic_store_explicit(c->ordered, 0, memory_order_relaxed); return; }
     }
+}
+
+/* Preparation-only serial probe. Spend at most one morsel of actual
+ * symbol comparisons, rather than one morsel of rows. Equal IDs and keys
+ * bypassed by a preceding key's ordering consume no budget. Constant and
+ * low-transition inputs finish here without any rank preparation. */
+static bool sorted_check_probe(sorted_check_ctx_t* c, int64_t nrows,
+                                int64_t* next_row) {
+    /* Probe and worker use the same width-correct ascending typed scan. */
+    if (!c->descending && c->n_keys == 2 &&
+        c->key_cols[0]->type == RAY_SYM &&
+        (c->key_cols[1]->type == RAY_I64 ||
+         c->key_cols[1]->type == RAY_TIME ||
+         c->key_cols[1]->type == RAY_TIMESTAMP) &&
+        !ray_vec_may_have_nulls(c->key_cols[1]))
+        return sorted_check_sym_numeric(c, 1, nrows, next_row);
+    int64_t comparisons = 0;
+    for (int64_t i = 1; i < nrows; i++) {
+        int cmp = 0;
+        for (int64_t k = 0; k < c->n_keys && cmp == 0; k++) {
+            ray_t* col = c->key_cols[k];
+            if (col->type == RAY_SYM) {
+                int64_t ia = ray_read_sym(ray_data(col), i - 1, RAY_SYM, col->attrs);
+                int64_t ib = ray_read_sym(ray_data(col), i, RAY_SYM, col->attrs);
+                if (ia != ib) {
+                    comparisons++;
+                    cmp = sorted_check_sym_cmp(c, k, ia, ib);
+                }
+            } else {
+                int64_t va = read_col_i64(ray_data(col), i - 1, col->type, col->attrs);
+                int64_t vb = read_col_i64(ray_data(col), i, col->type, col->attrs);
+                cmp = (va > vb) - (va < vb);
+            }
+        }
+        if (c->descending ? cmp < 0 : cmp > 0) return false;
+        if (comparisons >= RAY_MORSEL_ELEMS) {
+            *next_row = i + 1;
+            return true;
+        }
+    }
+    *next_row = nrows;
+    return true;
+}
+
+/* Only table scans large enough to use secondary workers prepare ranks,
+ * and only after the unranked probe exhausts its comparison budget. Small,
+ * serial and partition checks keep their cheap early-exit string scan.
+ * Prepared ranks are returned to the table caller, which either frees them
+ * on the sorted shortcut or lends them to the real sort after a late
+ * inversion. A density/OOM refusal retains serial lexical comparison.
+ * Optional rank/header arrays are caller-owned, zeroed heap storage; the
+ * partition caller supplies neither and needs no per-key rank buffers. */
+static bool sorted_check_run(ray_t** key_cols, int64_t n_keys,
+                             uint8_t descending, int64_t nrows,
+                             uint32_t** ranks, ray_t** rank_hdrs) {
+    if (nrows < 2) return true;
+    _Atomic int ordered = 1;
+    sorted_check_ctx_t sctx = {
+        .key_cols = key_cols, .sym_ranks = ranks, .n_keys = n_keys,
+        .descending = descending, .ordered = &ordered,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    bool parallel = pool && ray_pool_total_workers(pool) > 1 &&
+                    nrows >= RAY_PARALLEL_THRESHOLD;
+    bool has_sym = false;
+    for (int64_t k = 0; k < n_keys; k++)
+        if (key_cols[k]->type == RAY_SYM) { has_sym = true; break; }
+    int64_t start = 1;
+    if (has_sym && ranks && rank_hdrs && parallel) {
+        if (!sorted_check_probe(&sctx, nrows, &start)) return false;
+        if (start == nrows) return true;
+        for (int64_t k = 0; k < n_keys; k++) {
+            if (key_cols[k]->type != RAY_SYM) continue;
+            ranks[k] = build_enum_rank(key_cols[k], nrows, &rank_hdrs[k]);
+            if (!ranks[k]) { parallel = false; break; }
+        }
+    } else if (has_sym) {
+        parallel = false;
+    }
+    if (parallel)
+        ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
+    else
+        sorted_check_fn(&sctx, 0, start, nrows);
+    return atomic_load_explicit(&ordered, memory_order_relaxed) != 0;
 }
 
 /* Public: are these key columns already in sorted order under the sort's
@@ -4130,7 +4472,8 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
  * asked for the other end.  So the rejection is conservatism about the
  * requested placement, not an undecidable ordering — a caller that pins the
  * default could decide it.
- * O(nrows) with early bail on the first violation; a 0/1-row column is
+ * O(nrows) with early bail on the first violation. Symbol keys use a serial
+ * string scan without domain-sized rank preparation. A 0/1-row column is
  * trivially sorted.  Used by the parted ORDER BY streaming path in query.c
  * to verify each partition is internally sorted at O(partition), never a
  * full sort. */
@@ -4149,18 +4492,7 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
             t != RAY_TIMESTAMP && t != RAY_SYM)
             return false;
     }
-    if (nrows < 2) return true;
-    _Atomic int ordered = 1;
-    sorted_check_ctx_t sctx = {
-        .key_cols = key_cols, .n_keys = n_keys,
-        .descending = descending, .ordered = &ordered,
-    };
-    ray_pool_t* pool = ray_pool_get();
-    if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
-        ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
-    else
-        sorted_check_fn(&sctx, 0, 1, nrows);
-    return atomic_load_explicit(&ordered, memory_order_relaxed) != 0;
+    return sorted_check_run(key_cols, n_keys, descending, nrows, NULL, NULL);
 }
 
 static bool sort_part_key_type(int8_t t) {
@@ -4219,7 +4551,10 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
     }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t cn = ray_table_col_name(tbl, c);
-        ray_t* col = (cn == key_id) ? stamped : ray_table_get_col_idx(tbl, c);
+        ray_t* col = stamped;
+        if (cn != key_id) {
+            col = ray_table_slot_idx(tbl, c);
+        }
         out = ray_table_add_col(out, cn, col);
         if (!out || RAY_IS_ERR(out)) {
             ray_release(stamped);
@@ -4251,16 +4586,20 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     if (n_keys == 0) { ray_retain(tbl); return tbl; }
 
-    /* Exact-size carve for the key ids, resolved key columns and per-key
-     * descending flags: one block, the two 8-byte arrays (key_ids,
-     * key_cols) followed by the descs bytes.  Unbounded key count; freed
-     * at every exit below. */
+    /* Exact-size heap carve: ids, columns, optional rank pointers/headers,
+     * then descending bytes. Key counts are unbounded, including repeated
+     * names, so no per-key arrays may live on the stack. Freed on every exit. */
+    const size_t per_key = sizeof(int64_t) + sizeof(ray_t*) +
+                           sizeof(uint32_t*) + sizeof(ray_t*) + sizeof(uint8_t);
+    if ((uint64_t)n_keys > SIZE_MAX / per_key)
+        return ray_error("limit", "xasc/xdesc: too many sort keys");
     ray_t* k_hdr;
-    int64_t* key_ids = (int64_t*)scratch_alloc(&k_hdr,
-        (size_t)n_keys * (sizeof(int64_t) + sizeof(ray_t*) + sizeof(uint8_t)));
+    int64_t* key_ids = (int64_t*)scratch_calloc(&k_hdr, (size_t)n_keys * per_key);
     if (!key_ids) return ray_error("oom", NULL);
     ray_t** key_cols = (ray_t**)(key_ids + n_keys);
-    uint8_t* descs   = (uint8_t*)(key_cols + n_keys);
+    uint32_t** prepared_ranks = (uint32_t**)(key_cols + n_keys);
+    ray_t** prepared_hdrs = (ray_t**)(prepared_ranks + n_keys);
+    uint8_t* descs = (uint8_t*)(prepared_hdrs + n_keys);
 
     if (keys->type == -RAY_SYM) {
         /* Single symbol atom */
@@ -4286,7 +4625,12 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     /* Resolve key columns */
     for (int64_t i = 0; i < n_keys; i++) {
-        key_cols[i] = ray_table_get_col(tbl, key_ids[i]);
+        key_cols[i] = ray_table_col(tbl, key_ids[i]);
+        if (key_cols[i] && RAY_IS_ERR(key_cols[i])) {
+            ray_t* err = key_cols[i];
+            scratch_free(k_hdr);
+            return err;
+        }
         if (!key_cols[i]) {
             scratch_free(k_hdr);
             return ray_error("domain", "xasc/xdesc: key column not found in table");
@@ -4305,8 +4649,9 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * input retained: the sort, the whole-table gather and the null/attr
      * propagation all vanish.  Restricted to null-free integer-family and
      * SYM keys: null placement and float NaN ordering belong to the real
-     * sort.  An unsorted input bails at its first violation, so the scan
-     * costs a few comparisons, not O(n). */
+     * sort. A bounded-comparison serial probe rejects common unsorted inputs
+     * and finishes low-transition inputs without rank setup. Late inversions
+     * after rank setup reuse prepared ranks in the real sort. */
     {
         bool detectable = true;
         for (int64_t k = 0; k < n_keys && detectable; k++) {
@@ -4318,20 +4663,12 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 detectable = false;
         }
         if (detectable) {
-            _Atomic int ordered = 1;
-            sorted_check_ctx_t sctx = {
-                .key_cols = key_cols, .n_keys = n_keys,
-                .descending = descending, .ordered = &ordered,
-            };
-            ray_pool_t* pool = ray_pool_get();
-            if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
-                ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
-            else
-                sorted_check_fn(&sctx, 0, 1, nrows);
-            if (atomic_load_explicit(&ordered, memory_order_relaxed)) {
+            if (sorted_check_run(key_cols, n_keys, descending, nrows,
+                                 prepared_ranks, prepared_hdrs)) {
                 ray_t* out = (descending || n_keys <= 1) ? NULL
                     : sort_stamp_ordered_table(tbl, key_ids[0], key_cols[0],
                                                n_keys > 1 ? key_ids[1] : -1);
+                for (int64_t k = 0; k < n_keys; k++) scratch_free(prepared_hdrs[k]);
                 scratch_free(k_hdr);
                 if (out) return out;
                 ray_retain(tbl);
@@ -4343,7 +4680,8 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     uint64_t* sorted_keys = NULL;
     ray_t* sorted_keys_hdr = NULL;
     ray_t* idx = sort_indices_ex(key_cols, descs, NULL, n_keys, nrows,
-                                 &sorted_keys, &sorted_keys_hdr);
+                                 &sorted_keys, &sorted_keys_hdr, prepared_ranks);
+    for (int64_t k = 0; k < n_keys; k++) scratch_free(prepared_hdrs[k]);
     if (RAY_IS_ERR(idx)) {
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
         scratch_free(k_hdr);
@@ -4368,7 +4706,8 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
 
     ray_t* nc_hdr = NULL;
     ray_t** new_cols = (ray_t**)scratch_alloc(&nc_hdr,
-                             (size_t)ncols * sizeof(ray_t*));
+                             (size_t)ncols * 2 * sizeof(ray_t*));
+    ray_t** src_cols = new_cols ? new_cols + ncols : NULL;   /* borrowed plain sources */
     ray_t* cn_hdr = NULL;
     int64_t* col_names = (int64_t*)scratch_alloc(&cn_hdr,
                              (size_t)ncols * sizeof(int64_t));
@@ -4380,11 +4719,22 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         ray_release(idx);
         return ray_error("oom", NULL);
     }
-    for (int64_t c = 0; c < ncols; c++) new_cols[c] = NULL;
+    for (int64_t c = 0; c < ncols; c++) { new_cols[c] = NULL; src_cols[c] = NULL; }
 
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        src_cols[c] = col;
+        if (col && RAY_IS_ERR(col)) {
+            for (int64_t j = 0; j < c; j++)
+                if (new_cols[j]) ray_release(new_cols[j]);
+            scratch_free(nc_hdr);
+            scratch_free(cn_hdr);
+            if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            scratch_free(k_hdr);
+            ray_release(idx);
+            return col;
+        }
         if (!col) continue;
         ray_t* nc;
         if (col->type == RAY_LIST)
@@ -4452,7 +4802,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         int64_t g_nc = 0;
         for (; base < ncols && g_nc < MGATHER_MAX_COLS; base++) {
             if (!new_cols[base] || base == decode_col_idx) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, base);
+            ray_t* col = src_cols[base];
             if (col->type == RAY_LIST) continue;
             g_srcs[g_nc] = (char*)ray_data(col);
             g_dsts[g_nc] = (char*)ray_data(new_cols[base]);
@@ -4483,7 +4833,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
      * gather_by_idx. */
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = src_cols[c];
         if (!col) continue;
         col_propagate_str_pool(new_cols[c], col);
         bool src_has_nulls = ray_vec_may_have_nulls(col);

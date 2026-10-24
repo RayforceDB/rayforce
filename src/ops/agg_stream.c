@@ -70,6 +70,21 @@ static void sum_i64_update(void* base, size_t stride, const uint32_t* gids,
     });
 }
 
+#if ATOMIC_LLONG_LOCK_FREE == 2
+/* Concurrent form of sum_i64_update: one relaxed wrapping add per live row. */
+static void sum_i64_shared(void* base, size_t stride, const uint32_t* gids,
+                           const void* vals, const ray_valid_t* valid, int64_t n) {
+    const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        __atomic_fetch_add(&((sum_i64_state*)((char*)base + (size_t)gids[i]*stride))->sum,
+                           d[i], __ATOMIC_RELAXED);
+    });
+}
+#define SUM_I64_SHARED .update_shared = sum_i64_shared, .shared_add = true,
+#else
+#define SUM_I64_SHARED
+#endif
+
 static void sum_i64_merge(void* dst, const void* src, acc_arena_t* a) {
     (void)a;
     ((sum_i64_state*)dst)->sum = (int64_t)((uint64_t)((sum_i64_state*)dst)->sum
@@ -85,6 +100,7 @@ static const agg_vtable_t SUM_I64 = {
     .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
     .init = sum_i64_init, .update_batch = sum_i64_update,
     .merge = sum_i64_merge, .finalize = sum_i64_final, .finalize_value = sum_i64_final_value,
+    SUM_I64_SHARED
 };
 
 /* ---- count (type-agnostic over live rows) ---------------------------- */
@@ -97,6 +113,19 @@ static void count_update(void* base, size_t stride, const uint32_t* gids,
     for (int64_t i = 0; i < n; i++)
         ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++;
 }
+#if ATOMIC_LLONG_LOCK_FREE == 2
+/* Concurrent form of count_update: one relaxed add per row. */
+static void count_shared(void* base, size_t stride, const uint32_t* gids,
+                         const void* vals, const ray_valid_t* valid, int64_t n) {
+    (void)vals; (void)valid;
+    for (int64_t i = 0; i < n; i++)
+        __atomic_fetch_add(&((count_state*)((char*)base + (size_t)gids[i]*stride))->n,
+                           1, __ATOMIC_RELAXED);
+}
+#define COUNT_SHARED .update_shared = count_shared,
+#else
+#define COUNT_SHARED
+#endif
 static void count_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; ((count_state*)d)->n += ((const count_state*)s)->n;
 }
@@ -108,7 +137,35 @@ static const agg_vtable_t COUNT_ANY = {
     .state_size = sizeof(count_state), .kind = ACC_STREAMING, .out_type = RAY_I64,
     .init = count_init, .update_batch = count_update,
     .merge = count_merge, .finalize = count_final, .finalize_value = count_final_value,
+    COUNT_SHARED
+    .shared_add = true,
 };
+
+/* ---- non-null count (internal OP_COUNT_NN) ----------------------------
+ * The per-partition AVG/VAR divisor of a nullable column: the AVG state's
+ * count without its sum, read straight from the column (no materialized
+ * not-null indicator).  One kernel per nullable native representation. */
+#define COUNT_NN_KERNEL(SFX, T)                                                \
+static void count_nn_##SFX##_update(void* base, size_t stride,                 \
+                                    const uint32_t* gids, const void* vals,    \
+                                    const ray_valid_t* valid, int64_t n,       \
+                                    acc_arena_t* a) {                          \
+    (void)a; const T* d = (const T*)vals;                                      \
+    AGG_UPDATE_LOOP(valid, n, {                                                \
+        ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++;           \
+    });                                                                        \
+}                                                                              \
+static const agg_vtable_t COUNT_NN_##SFX = {                                   \
+    .state_size = sizeof(count_state), .kind = ACC_STREAMING, .out_type = RAY_I64, \
+    .init = count_init, .update_batch = count_nn_##SFX##_update,               \
+    .merge = count_merge, .finalize = count_final, .finalize_value = count_final_value, \
+};
+COUNT_NN_KERNEL(F64, double)
+COUNT_NN_KERNEL(F32, float)
+COUNT_NN_KERNEL(I64, int64_t)
+COUNT_NN_KERNEL(I32, int32_t)
+COUNT_NN_KERNEL(I16, int16_t)
+#undef COUNT_NN_KERNEL
 
 /* ---- min / max I64 (empty group → typed null) ------------------------ */
 typedef struct { int64_t v; int64_t cnt; } ext_i64_state;
@@ -575,7 +632,7 @@ static inline double pearson_read_f64(const ray_valid_t* v, int64_t i) {
     switch (v->type) {
         case RAY_F32:                       return ((const float*)v->base)[i];
         case RAY_F64:                       return ((const double*)v->base)[i];
-        case RAY_I64: case RAY_TIMESTAMP:   return (double)((const int64_t*)v->base)[i];
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:   return (double)((const int64_t*)v->base)[i];
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                                             return (double)((const int32_t*)v->base)[i];
         case RAY_I16:                       return (double)((const int16_t*)v->base)[i];
@@ -678,7 +735,7 @@ static inline int truth_read(const ray_valid_t* v, int64_t i) {
     switch (v->type) {
         case RAY_F32:                       return ((const float*)v->base)[i] != 0.0f;
         case RAY_F64:                       return ((const double*)v->base)[i] != 0.0;
-        case RAY_I64: case RAY_TIMESTAMP:   return ((const int64_t*)v->base)[i] != 0;
+        case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP:   return ((const int64_t*)v->base)[i] != 0;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                                             return ((const int32_t*)v->base)[i] != 0;
         case RAY_I16:                       return ((const int16_t*)v->base)[i] != 0;
@@ -1846,7 +1903,56 @@ static const agg_vtable_t PROD_F64 = {
     .merge = prod_f64_merge, .finalize = prod_f64_final, .finalize_value = prod_f64_final_value,
 };
 
+static ray_t* sum_timespan_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param;
+    return ray_timespan(((const sum_i64_state*)s)->sum);
+}
+static bool ext_timespan_value(const void* s, void* dst) {
+    *(int64_t*)dst = ((const ext_i64_state*)s)->v;
+    return false;
+}
+static ray_t* ext_timespan_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param;
+    return ray_timespan(((const ext_i64_state*)s)->v);
+}
+static const agg_vtable_t SUM_TIMESPAN = {
+    .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
+    .init = sum_i64_init, .update_batch = sum_i64_update,
+    .merge = sum_i64_merge, .finalize = sum_timespan_final, .finalize_value = sum_i64_final_value,
+};
+static const agg_vtable_t MIN_TIMESPAN = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
+    .init = min_i64_init, .update_batch = min_timestamp_native_update,
+    .merge = min_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
+};
+static void max_timespan_init(void* s) {
+    max_i64_init(s);
+    ((ext_i64_state*)s)->v = -INT64_MAX;
+}
+static const agg_vtable_t MAX_TIMESPAN = {
+    .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
+    .init = max_timespan_init, .update_batch = max_timestamp_native_update,
+    .merge = max_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
+};
+
 const agg_vtable_t* agg_resolve(uint16_t agg_kind, int8_t in_type) {
+    if (in_type == RAY_TIMESPAN) {
+        if (agg_kind == OP_SUM) return &SUM_TIMESPAN;
+        if (agg_kind == OP_MIN) return &MIN_TIMESPAN;
+        if (agg_kind == OP_MAX) return &MAX_TIMESPAN;
+        return agg_resolve(agg_kind, RAY_I64);
+    }
+
+    if (agg_kind == OP_COUNT_NN) {
+        switch (in_type) {
+            case RAY_F64: return &COUNT_NN_F64;
+            case RAY_F32: return &COUNT_NN_F32;
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: return &COUNT_NN_I64;
+            case RAY_I32: case RAY_DATE: case RAY_TIME: return &COUNT_NN_I32;
+            case RAY_I16: return &COUNT_NN_I16;
+            default: return NULL;
+        }
+    }
     if (agg_kind == OP_PROD && in_type == RAY_BOOL) return &PROD_BOOL;
     if (agg_kind == OP_PROD && in_type == RAY_U8) return &PROD_U8;
     if (agg_kind == OP_PROD && in_type == RAY_I16) return &PROD_I16;

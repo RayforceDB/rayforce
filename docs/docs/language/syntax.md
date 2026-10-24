@@ -74,14 +74,24 @@ end of its month is normalized by the calendar rather than rejected, so
 ### Times
 
 Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnight (i32).
+Values past 24 hours and negative values are valid; for the range, and what an
+out-of-range result becomes, see [Date/Time types](../guides/types.md#date-time).
 
 ```lisp
 09:30:00.000  ; 9:30 AM
 14:15:30.500  ; 2:15:30.5 PM
 ```
 
-Hours must be `0`-`23`, minutes and seconds `0`-`59`; out-of-range
-components are a parse error.
+A time literal has two hour digits, `00`-`99`, and two digits each for
+minutes and seconds. Minutes and seconds past `59` carry into the next unit,
+the way a day past the end of its month does for dates, so `01:60:00.000`
+parses as `02:00:00.000`. A leading `-` makes the time negative
+(`-01:00:00.000`). The fractional part is optional (`09:30:00` is
+`09:30:00.000`) and is a decimal fraction of a second: one to three digits are
+padded (`09:30:00.5` is `09:30:00.500`), and digits past the third are
+dropped. A timestamp literal, the string cast `(as 'time "...")` and the CSV
+reader read it the same way. Times beyond `99:59:59.999` come from arithmetic
+or from `(as 'TIME <ms>)`: `(as 'TIME 2147483647)` is `596:31:23.647`.
 
 ### Timestamps
 
@@ -92,10 +102,13 @@ Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01
 2024.01.15D09:30:00.000000000      ; date + time (ns)
 ```
 
-The date and time parts follow the same range rules as above. Because the
-value is a 64-bit nanosecond count from the epoch, timestamps only span
-roughly ±292 years around 2000 (about 1708 to 2292); a year outside that
-range is a parse error.
+The date part follows the date rules above. The time part is stricter than a
+time literal: hours `00`-`23` and minutes and seconds `00`-`59`, anything else
+being a parse error; no leading `-`; and the fractional part is required, with
+one to nine digits read as a decimal fraction (`.5` is half a second; digits
+past the ninth are dropped). Because the value is a 64-bit nanosecond count
+from the epoch, timestamps only span roughly ±292 years around 2000 (about
+1708 to 2292); a year outside that range is a parse error.
 
 ### GUIDs
 
@@ -118,13 +131,19 @@ sentinel for their type:
 0Ni   ; i32 null
 0Nh   ; i16 null
 0Nf   ; f64 null
+0Ne   ; f32 null
+0Ng   ; guid null (the all-zero GUID)
 0Nd   ; date null
 0Nt   ; time null
 0Np   ; timestamp null
 (nil? 0Nl)   ; true
 ```
 
-Symbols have no typed null literal (there is no `0Ns`).
+Symbols have no `0N` null literal (there is no `0Ns`). Their null is the
+empty symbol, written as a lone quote `'`, and it works wherever a symbol
+does: `(set s ')`, `(take ' 3)` is `[' ' ']`, `[a ' b]`, `{k: '}`. It prints as
+`'` too, so a printed vector reads back as the same value. The symbol `null`
+is an ordinary symbol, not the null.
 
 `nil?` is element-wise: given a vector or a list it returns a `B8` vector with
 one entry per element, so `(where (nil? v))` and `(sum (as 'I64 (nil? v)))`
@@ -248,6 +267,12 @@ The single quote `'` prevents evaluation, creating a symbol atom. Useful for col
 
 `quote` returns its argument unevaluated. When the argument is a bare name, the result is a literal symbol — `(quote name)` is equal to the tick form `'name`. Such a literal symbol, when it names a from-table column, resolves to that column during query evaluation. This is how the dynamic-query idiom works: a query assembled as data evaluates `(quote name)` to the literal symbol `'name` during construction, and that symbol resolves to the column when the query runs (see [IPC](../storage/ipc.md)). Inside a query, the tick form `'name` and a bare `name` resolve the same way.
 
+An inline `(quote name)` node written directly inside a query expression is
+different: it keeps a literal symbol even when a column has that name (see
+[Select](../queries/select.md)). In the dynamic-query idiom above, `quote`
+was evaluated while constructing the query as data, before query evaluation.
+
+
 ## Comments
 
 Line comments start with a semicolon and extend to the end of the line:
@@ -362,8 +387,8 @@ Every `.`-prefixed name is protected: `set`, `let`, lambda parameters, and `del`
   (raise "oops")     ; throws an error
   (fn [e] "caught")) ; handler receives error → "caught"
 
-; Unhandled raise:
-; (raise "custom error") ; error: domain
+; Unhandled raise: the error code, then the raised value
+; (raise "custom error") ; error: domain: custom error
 ```
 
 ## Lambdas & the VM
@@ -492,7 +517,7 @@ ray_t* result = ray_execute(g, projected);
 3. **SIP** (Sideways Information Passing) — propagate selection bitmaps backward through expand chains
 4. **Factorize** — avoid materializing cross-products with factorized vectors
 5. **Predicate pushdown** — move filters closer to data sources
-6. **Filter reorder** — cheapest filters first
+6. **Filter reorder** — rank eligible row-local filters by static selectivity and cost without crossing row-domain barriers
 7. **Fusion** — merge adjacent operations into single morsel loops
 8. **DCE** (Dead Code Elimination) — remove unused DAG nodes
 

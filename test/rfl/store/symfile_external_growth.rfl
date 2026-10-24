@@ -1,0 +1,40 @@
+;; @requires: posix  (the writer runs as a child process through .sys.exec)
+;; A reader that reopens a root whose symfile another process grew keeps
+;; memory proportional to the vocabulary, however often it reopens — #717.
+;;
+;; Each reopen is a cache hit that extends the shared domain.  The arrays
+;; it replaces and the mapping it supersedes used to be kept until the
+;; domain died, and a reader that always holds the previous view never
+;; lets it die: one more copy of the vocabulary's arrays and one more
+;; mapping of the symfile per reopen.  Now they are freed by the reopen.
+
+;; The writer: K rows whose SYM column holds <prefix>_0 .. <prefix>_<K-1>,
+;; written outside the root through the root's symfile.
+(.sys.exec "rm -rf /tmp/rfl_717 && mkdir -p /tmp/rfl_717/root") -- 0
+(write "/tmp/rfl_717/writer.rfl" "(set a (get (.sys.args) 'user)) (set k (as 'i64 (get a 'k))) (set names (map (fn [j] (format \"%_%\" (get a 'p) j)) (til k))) (.db.splayed.set (get a 'dir) (table [s v] (list (as 'sym names) (til k))) (get a 'sym)) (exit 0)")
+(.sys.exec "./rayforce -c 1 /tmp/rfl_717/writer.rfl -- -dir /tmp/rfl_717/root/1/t -sym /tmp/rfl_717/root/.sym -p base -k 5000") -- 0
+
+(set P (.db.parted.get "/tmp/rfl_717/root" 't))
+(count P) -- 5000
+
+;; One step: the writer appends 10 symbols, the reader reopens.
+(set grow (fn [i] (do (.sys.exec (format "./rayforce -c 1 /tmp/rfl_717/writer.rfl -- -dir /tmp/rfl_717/scratch/t -sym /tmp/rfl_717/root/.sym -p new% -k 10" i)) (set P (.db.parted.get "/tmp/rfl_717/root" 't)) (count P))))
+
+;; Warm-up: the first reopens materialise what the reader touches.
+(map grow (til 2)) -- [5000 5000]
+(set m2 (.sys.mem))
+(distinct (map grow (+ 2 (til 18)))) -- [5000]
+(set m20 (.sys.mem))
+
+;; The grown vocabulary is there: a symbol the last writer added resolves.
+(.sys.exec "./rayforce -c 1 /tmp/rfl_717/writer.rfl -- -dir /tmp/rfl_717/scratch/t -sym /tmp/rfl_717/root/.sym -p new19 -k 10") -- 0
+(count (select {s: s from: (.db.splayed.get "/tmp/rfl_717/scratch/t" "/tmp/rfl_717/root/.sym") where: (== s 'new19_9)})) -- 1
+
+;; 18 reopens later: no copy of the vocabulary per reopen (the leak was
+;; about 90 KB each here, 1.6 MB over the run; the bound leaves room for a
+;; heap pool or arena growing meanwhile), and the symfile is mapped once —
+;; each reopen unmapped the image it replaced.
+(< (- (get m20 'sys-current) (get m2 'sys-current)) 524288) -- true
+(<= (- (get m20 'sys-mapped) (get m2 'sys-mapped)) (.fs.size "/tmp/rfl_717/root/.sym")) -- true
+
+(.sys.exec "rm -rf /tmp/rfl_717") -- 0

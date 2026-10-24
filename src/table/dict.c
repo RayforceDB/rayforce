@@ -55,7 +55,7 @@ static ray_t* dict_alloc_block(ray_t* keys, ray_t* vals) {
     memset(d->aux, 0, 16);
     ray_t** slots = ray_dict_slots(d);
     slots[0] = keys;
-    slots[1] = vals;
+    slots[1] = vals;   /* not-a-table */
     return d;
 }
 
@@ -68,7 +68,10 @@ static ray_t* dict_alloc_block(ray_t* keys, ray_t* vals) {
 
 ray_t* ray_dict_new(ray_t* keys, ray_t* vals) {
     if (!keys || RAY_IS_ERR(keys)) {
-        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        if (vals && vals != keys) {
+            if (RAY_IS_ERR(vals)) ray_error_free(vals);
+            else ray_release(vals);
+        }
         return keys ? keys : ray_error("type", "dict: keys vector is null");
     }
     if (!vals || RAY_IS_ERR(vals)) {
@@ -169,7 +172,7 @@ ray_t* ray_dict_probe_sym_borrowed(ray_t* d, int64_t sym_id) {
 ray_t* ray_container_probe_sym(ray_t* v, int64_t sym_id) {
     if (!v || RAY_IS_ERR(v)) return NULL;
     if (v->type == RAY_DICT) return ray_dict_probe_sym_borrowed(v, sym_id);
-    if (v->type == RAY_TABLE) return ray_table_get_col(v, sym_id);
+    if (v->type == RAY_TABLE) return ray_table_col(v, sym_id);   /* plain column or owned error */
     return NULL;
 }
 
@@ -263,6 +266,7 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
             }
         }
         case RAY_I64:
+        case RAY_TIMESPAN:
         case RAY_TIMESTAMP: {
             const int64_t* a = (const int64_t*)base;
             int64_t v = key_atom->i64;
@@ -358,6 +362,7 @@ static ray_t* dict_vals_at(ray_t* vals, int64_t idx, bool* owned_out) {
         case RAY_F64:       atom = ray_f64(((double*)base)[idx]);                    break;
         case RAY_DATE:      atom = ray_date(((int32_t*)base)[idx]);                  break;
         case RAY_TIME:      atom = ray_time(((int32_t*)base)[idx]);                  break;
+        case RAY_TIMESPAN: atom = ray_timespan(((int64_t*)base)[idx]);              break;
         case RAY_TIMESTAMP: atom = ray_timestamp(((int64_t*)base)[idx]);              break;
         case RAY_SYM: {
             int64_t id = ray_read_sym(base, idx, vals->type, vals->attrs);
@@ -541,7 +546,7 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
 
     ray_t** slots = ray_dict_slots(d);
     ray_t* keys = slots[0];
-    ray_t* vals = slots[1];
+    ray_t* vals = slots[1];   /* not-a-table */
 
     /* The append/set helpers consume the input ref and return an owned ref
      * (possibly the same pointer, or a fresh one after grow — in which case
@@ -553,16 +558,16 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
         if (vals->type == RAY_LIST) {
             ray_t* new_vals = ray_list_set(vals, idx, val);
             if (!new_vals || RAY_IS_ERR(new_vals)) { ray_release(d); return new_vals ? new_vals : ray_error("oom", NULL); }
-            slots[1] = new_vals;
+            slots[1] = new_vals;   /* not-a-table */
         } else {
             /* Typed vector path: promote to LIST first, then update. */
             ray_t* lst = promote_vals_to_list(vals);
             if (!lst || RAY_IS_ERR(lst)) { ray_release(d); return lst ? lst : ray_error("oom", NULL); }
             ray_release(vals);
-            slots[1] = lst;
+            slots[1] = lst;   /* not-a-table */
             ray_t* new_lst = ray_list_set(lst, idx, val);
             if (!new_lst || RAY_IS_ERR(new_lst)) { ray_release(d); return new_lst ? new_lst : ray_error("oom", NULL); }
-            slots[1] = new_lst;
+            slots[1] = new_lst;   /* not-a-table */
         }
         return d;
     }
@@ -572,7 +577,7 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
         ray_t* lst = promote_vals_to_list(vals);
         if (!lst || RAY_IS_ERR(lst)) { ray_release(d); return lst ? lst : ray_error("oom", NULL); }
         ray_release(vals);
-        slots[1] = lst;
+        slots[1] = lst;   /* not-a-table */
         vals = lst;
     }
 
@@ -627,7 +632,7 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
     /* Append val — list_append consumes vals, returns owned (possibly new). */
     ray_t* new_vals = ray_list_append(vals, val);
     if (!new_vals || RAY_IS_ERR(new_vals)) { ray_release(d); return new_vals ? new_vals : ray_error("oom", NULL); }
-    slots[1] = new_vals;
+    slots[1] = new_vals;   /* not-a-table */
 
     return d;
 }
@@ -655,14 +660,14 @@ ray_t* ray_dict_remove(ray_t* d, ray_t* key_atom) {
 
     ray_t** slots = ray_dict_slots(d);
     ray_t* keys = slots[0];
-    ray_t* vals = slots[1];
+    ray_t* vals = slots[1];   /* not-a-table */
 
     /* Promote typed-vector vals to LIST so we can remove uniformly. */
     if (vals->type != RAY_LIST) {
         ray_t* lst = promote_vals_to_list(vals);
         if (!lst || RAY_IS_ERR(lst)) { ray_release(d); return lst ? lst : ray_error("oom", NULL); }
         ray_release(vals);
-        slots[1] = lst;
+        slots[1] = lst;   /* not-a-table */
         vals = lst;
     }
 
@@ -726,7 +731,7 @@ ray_t* ray_dict_remove(ray_t* d, ray_t* key_atom) {
     /* Drop vals[idx] from the LIST. */
     vals = ray_cow(vals);
     if (!vals || RAY_IS_ERR(vals)) { ray_release(d); return vals; }
-    slots[1] = vals;
+    slots[1] = vals;   /* not-a-table */
     ray_t** vslots = (ray_t**)ray_data(vals);
     if (vslots[idx]) ray_release(vslots[idx]);
     for (int64_t i = idx; i + 1 < vals->len; i++) vslots[i] = vslots[i + 1];

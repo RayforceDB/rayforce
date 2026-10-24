@@ -152,11 +152,20 @@ ray_t* ray_sym(int64_t id) {
  * narrowed to the correct element width.
  * -------------------------------------------------------------------------- */
 
+/* DATE and TIME hold 32 bits, as their vector cells do.  The constructors
+ * take an int64_t, so the result of atom arithmetic or a cast can be out of
+ * range: keep its low 32 bits, sign-extended, so that every reader agrees.
+ * The null check reads x->i32 and arithmetic reads x->i64; an unwrapped
+ * value made an atom print, compare and store wrapped but add unwrapped. */
+static inline int64_t atom_wrap_i32(int64_t val) {
+    return (int64_t)(int32_t)(uint32_t)(uint64_t)val;
+}
+
 ray_t* ray_date(int64_t val) {
     ray_t* v = ray_alloc(0);
     if (RAY_IS_ERR(v)) return v;
     v->type = -RAY_DATE;
-    v->i64 = val;
+    v->i64 = atom_wrap_i32(val);
     return v;
 }
 
@@ -164,7 +173,7 @@ ray_t* ray_time(int64_t val) {
     ray_t* v = ray_alloc(0);
     if (RAY_IS_ERR(v)) return v;
     v->type = -RAY_TIME;
-    v->i64 = val;
+    v->i64 = atom_wrap_i32(val);
     return v;
 }
 
@@ -173,6 +182,12 @@ ray_t* ray_timestamp(int64_t val) {
     if (RAY_IS_ERR(v)) return v;
     v->type = -RAY_TIMESTAMP;
     v->i64 = val;
+    return v;
+}
+
+ray_t* ray_timespan(int64_t nanoseconds) {
+    ray_t* v = ray_i64(nanoseconds);
+    if (!RAY_IS_ERR(v)) v->type = -RAY_TIMESPAN;
     return v;
 }
 
@@ -197,7 +212,7 @@ ray_t* ray_typed_null(int8_t type) {
     switch (type) {
         case -RAY_F64:                                 v->f64 = NULL_F64; break;
         case -RAY_F32:                                 v->f64 = (double)NULL_F32; break;
-        case -RAY_I64: case -RAY_TIMESTAMP:            v->i64 = NULL_I64; break;
+        case -RAY_TIMESPAN: case -RAY_I64: case -RAY_TIMESTAMP:            v->i64 = NULL_I64; break;
         case -RAY_I32: case -RAY_DATE: case -RAY_TIME: v->i32 = NULL_I32; break;
         case -RAY_I16:                                 v->i16 = NULL_I16; break;
         case -RAY_SYM:

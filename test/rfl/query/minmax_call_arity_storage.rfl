@@ -1,0 +1,13 @@
+;; @requires: posix
+;; Both operands remain visible with mapped/encoded and two-part source tables.
+(.sys.exec "rm -rf /tmp/rfl_minmax971") -- 0
+(set M971S (table [k x y] (list ['A 'A 'B 'B 'C] [1 5 3 8 9] [4 2 6 7 0])))
+(set CHECK971 (fn [t] (list  (at (select {r: (min x y) from: t}) 'r)  (at (select {r: (max x y) from: t}) 'r)  (at (select {r: (sum (min x y)) from: t}) 'r)  (at (select {r: (min x y) from: t by: k asc: k}) 'r)  (at (select {r: (sum (min x y)) from: t by: k asc: k}) 'r)  (at (select {r: (max (sum x) (sum y)) from: t by: k asc: k}) 'r)  (at (select {r: (min x y) from: t where: (> x 3)}) 'r)  (at (select {r: (min x y) from: t desc: x take: 2}) 'r))))
+(.db.splayed.set "/tmp/rfl_minmax971/s/" M971S)
+(set S971 (.db.splayed.get "/tmp/rfl_minmax971/s/"))
+(CHECK971 S971) -- (list [1 2 3 7 0] [4 5 6 8 9] [13] (list [1 2] [3 7] [0]) [3 10 0] [6 13 9] [2 7 0] [0 7])
+(.db.splayed.set "/tmp/rfl_minmax971/p/2024.01.01/t/" (table [k x y] (list ['A 'A 'B] [1 5 3] [4 2 6])))
+(.db.splayed.set "/tmp/rfl_minmax971/p/2024.01.02/t/" (table [k x y] (list ['B 'C] [8 9] [7 0])))
+(set P971 (.db.parted.get "/tmp/rfl_minmax971/p/" 't))
+(CHECK971 P971) -- (list [1 2 3 7 0] [4 5 6 8 9] [13] (list [1 2] [3 7] [0]) [3 10 0] [6 13 9] [2 7 0] [0 7])
+(.sys.exec "rm -rf /tmp/rfl_minmax971") -- 0

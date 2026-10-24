@@ -385,6 +385,8 @@ For advanced use cases, Rayforce provides a programmatic Datalog API that gives 
 | `(dl-query prog 'pred)` | Retrieve the result table for a predicate |
 | `(dl-provenance prog 'pred)` | Reserved provenance hook; currently returns `domain: not available` |
 
+A program handle owns its program and is released automatically when its binding is replaced or leaves scope. Call `(dl-free prog)` when you want to release it earlier; a later automatic release is safe.
+
 ### Example
 
 ```lisp

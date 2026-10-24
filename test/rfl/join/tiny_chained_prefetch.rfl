@@ -1,0 +1,84 @@
+;; Exact pair-ID correctness coverage for tiny and boundary-sized build tables.
+;; These cases also pass without the prefetch optimization.
+;; Expected pairs were independently enumerated with tuple equality, null==null.
+;; Pair IDs normalized to -1 for absent rows, then lexicographically sorted.
+;; Normalization avoids assuming null sort order. IDs themselves are nonnegative.
+;; No disk paths, pool knobs, cancellation or execution-policy changes.
+
+;; Tiny mixed SYM/I64 composite keys: duplicate Cartesian pairs, partial/all
+;; nulls, near misses on the other component, and unmatched rows on both sides.
+(set JPTL (table [a b li] (list (as 'SYM ["a" "a" "b" "" "a" "" "x" "a" "b" "" "z" "a"]) [1 1 2 1 0N 0N 9 2 2 2 0 1] (til 12))))
+(set JPTR (table [a b ri] (list (as 'SYM ["a" "a" "b" "" "a" "" "q" "" "a"]) [1 1 2 1 0N 0N 7 3 2] (+ 100 (til 9)))))
+(set JPJ (inner-join [a b] JPTL JPTR))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 12
+(at JPP 'li) -- [0 0 1 1 2 3 4 5 7 8 11 11]
+(at JPP 'ri) -- [100 101 100 101 102 103 104 105 108 102 100 101]
+(set JPJ (left-join [a b] JPTL JPTR))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 15
+(at JPP 'li) -- [0 0 1 1 2 3 4 5 6 7 8 9 10 11 11]
+(at JPP 'ri) -- [100 101 100 101 102 103 104 105 -1 108 102 -1 -1 100 101]
+(set JPJ (full-join [a b] JPTL JPTR))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 17
+(at JPP 'li) -- [-1 -1 0 0 1 1 2 3 4 5 6 7 8 9 10 11 11]
+(at JPP 'ri) -- [106 107 100 101 100 101 102 103 104 105 -1 108 102 -1 -1 100 101]
+
+;; Right build size 128: capacity starts 256 and doubles until >= 2*n.
+(set JPB128L (table [a b li] (list (til 140) (take 7 140) (til 140))))
+(set JPB128R (table [a b ri] (list (til 128) (take 7 128) (+ 1000 (til 128)))))
+(set JPJ (inner-join [a b] JPB128L JPB128R))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 128
+(all (== (at JPP 'li) (til 128))) -- true
+(all (== (at JPP 'ri) (+ 1000 (til 128)))) -- true
+(set JPJ (left-join [a b] JPB128L JPB128R))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 140
+(all (== (at JPP 'li) (til 140))) -- true
+(all (== (at JPP 'ri) (concat (+ 1000 (til 128)) (take -1 12)))) -- true
+(set JPJ (full-join [a b] JPB128L JPB128R))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 140
+(all (== (at JPP 'li) (til 140))) -- true
+(all (== (at JPP 'ri) (concat (+ 1000 (til 128)) (take -1 12)))) -- true
+
+;; Right build size 129: capacity starts 256 and doubles until >= 2*n.
+(set JPB129L (table [a b li] (list (til 140) (take 7 140) (til 140))))
+(set JPB129R (table [a b ri] (list (til 129) (take 7 129) (+ 1000 (til 129)))))
+(set JPJ (inner-join [a b] JPB129L JPB129R))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 129
+(all (== (at JPP 'li) (til 129))) -- true
+(all (== (at JPP 'ri) (+ 1000 (til 129)))) -- true
+(set JPJ (left-join [a b] JPB129L JPB129R))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 140
+(all (== (at JPP 'li) (til 140))) -- true
+(all (== (at JPP 'ri) (concat (+ 1000 (til 129)) (take -1 11)))) -- true
+(set JPJ (full-join [a b] JPB129L JPB129R))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 140
+(all (== (at JPP 'li) (til 140))) -- true
+(all (== (at JPP 'ri) (concat (+ 1000 (til 129)) (take -1 11)))) -- true
+
+;; 8197 probes: matches at start, both sides of morsel boundary, and tail;
+;; right key 8192 duplicates, right-only 9000. Exact all-row IDs, not sums.
+(set JPML (table [a b li] (list (til 8197) (take 7 8197) (til 8197))))
+(set JPMR (table [a b ri] (list [0 8191 8192 8192 8196 9000] (take 7 6) (+ 100 (til 6)))))
+(set JPJ (inner-join [a b] JPML JPMR))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 5
+(at JPP 'li) -- [0 8191 8192 8192 8196]
+(at JPP 'ri) -- [100 101 102 103 104]
+(set JPJ (left-join [a b] JPML JPMR))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 8198
+(all (== (at JPP 'li) (concat (til 8193) (+ 8192 (til 5))))) -- true
+(all (== (at JPP 'ri) (concat (concat (concat (concat [100] (take -1 8190)) (+ 101 (til 3))) (take -1 3)) [104]))) -- true
+(set JPJ (full-join [a b] JPML JPMR))
+(set JPP (xasc (table [li ri] (list (fill -1 (at JPJ 'li)) (fill -1 (at JPJ 'ri)))) [li ri]))
+(count JPP) -- 8199
+(all (== (at JPP 'li) (concat (+ -1 (til 8194)) (+ 8192 (til 5))))) -- true
+(all (== (at JPP 'ri) (concat (concat (concat (concat (concat [105] [100]) (take -1 8190)) (+ 101 (til 3))) (take -1 3)) [104]))) -- true

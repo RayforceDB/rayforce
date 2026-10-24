@@ -63,6 +63,16 @@ static inline bool ray_vec_has_nulls(const ray_t* v) {
     return false;
 }
 
+/* Sentinel null test on a raw generation-0 element array (range views,
+ * scan pieces); SYM at the width class in `attrs`. */
+bool ray_raw_is_null(int8_t type, uint8_t attrs, const void* base, int64_t idx);
+
+/* Room for len more bytes in the STR pool *pool, created on first use and
+ * grown as ray_str_vec_append grows it: RAY_OK with the bytes' offset in
+ * *off (the caller copies them and advances (*pool)->len), RAY_ERR_RANGE
+ * when the end would pass UINT32_MAX, RAY_ERR_OOM (*pool unchanged). */
+ray_err_t ray_str_pool_reserve(ray_t** pool, size_t len, int64_t* off);
+
 /* Copy null bits from src to dst (sentinel-based). dst and src must have
  * the same length. Internal helper. */
 ray_err_t ray_vec_copy_nulls(ray_t* dst, const ray_t* src);

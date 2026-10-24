@@ -1,0 +1,10 @@
+;; Fixed-key version of the issue599 join shape; no explicit warmup.
+(set N 130000)
+(set syms (map (fn [i] (parse (format "INST%" i))) (til 773)))
+(set t (table [venue instrument session message_id px] (list (take ['BFU] N) (take syms N) (take ['S1] N) (til N) (til N))))
+(set ks (select {from: t by: [venue instrument] n: (count px)}))
+(set k3 (select {from: ks where: (in instrument ['INST0 'INST1 'INST2]) asc: instrument}))
+(println "keys: %" (as 'STR (at k3 'instrument)))
+(set n 0)
+(println "loop_ms: %" (timeit (times 200 (set n (+ n (count (inner-join [venue instrument] t k3)))))))
+(println "result: %" n)

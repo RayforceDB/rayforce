@@ -37,6 +37,7 @@
   #define _GNU_SOURCE
 #endif
 
+#include "core/timespan.h"
 #include "csv.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -46,7 +47,7 @@
 #include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "lang/format.h"
 #include "ops/hash.h"
-#include "ops/idxop.h"      /* ray_index_payload — shared hash-upgrade policy */
+#include "ops/idxop.h"      /* ray_index_payload */
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"
@@ -298,6 +299,19 @@ static void csv_cardinality_note(uint32_t* hashes, uint16_t* lens,
     non_null[col]++;
 }
 
+static int64_t fast_timespan(const char* field, size_t len, bool* is_null) {
+    char text[128];
+    size_t used = 0;
+    int64_t value = NULL_I64;
+    *is_null = true;
+    if (len >= sizeof(text)) return value;
+    memcpy(text, field, len);
+    text[len] = 0;
+    if (ray_parse_timespan(text, &used, &value) && used == len)
+        *is_null = value == NULL_I64;
+    return *is_null ? NULL_I64 : value;
+}
+
 static int8_t csv_resolve_inferred_type(csv_type_t t,
                                         uint16_t distinct,
                                         uint16_t non_null) {
@@ -307,6 +321,7 @@ static int8_t csv_resolve_inferred_type(csv_type_t t,
         case CSV_TYPE_F64:       return RAY_F64;
         case CSV_TYPE_DATE:      return RAY_DATE;
         case CSV_TYPE_TIME:      return RAY_TIME;
+        case CSV_TYPE_TIMESPAN: return RAY_TIMESPAN;
         case CSV_TYPE_TIMESTAMP: return RAY_TIMESTAMP;
         case CSV_TYPE_GUID:      return RAY_GUID;
         case CSV_TYPE_STR:
@@ -2225,6 +2240,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                         case CSV_TYPE_F64:  ((double*)ctx->col_data[c])[row] = NULL_F64; break;
                         case CSV_TYPE_DATE: ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_TIME: ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_TIMESPAN:
                         case CSV_TYPE_TIMESTAMP:
                             ((int64_t*)ctx->col_data[c])[row] = NULL_I64; break;
                         case CSV_TYPE_GUID:
@@ -2320,6 +2336,13 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     if (is_null) my_had_null[c] = true;
                     break;
                 }
+                case CSV_TYPE_TIMESPAN: {
+                    bool is_null;
+                    int64_t v = fast_timespan(fld, flen, &is_null);
+                    ((int64_t*)ctx->col_data[c])[row] = is_null ? NULL_I64 : v;
+                    if (is_null) my_had_null[c] = true;
+                    break;
+                }
                 case CSV_TYPE_TIMESTAMP: {
                     bool is_null;
                     int64_t v = fast_timestamp(fld, flen, &is_null);
@@ -2412,6 +2435,7 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
                         case CSV_TYPE_F64:  ((double*)col_data[c])[row] = NULL_F64; break;
                         case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_TIME: ((int32_t*)col_data[c])[row] = NULL_I32; break;
+                        case CSV_TYPE_TIMESPAN:
                         case CSV_TYPE_TIMESTAMP:
                             ((int64_t*)col_data[c])[row] = NULL_I64; break;
                         case CSV_TYPE_GUID:
@@ -2505,6 +2529,13 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
                     if (is_null) col_had_null[c] = true;
                     break;
                 }
+                case CSV_TYPE_TIMESPAN: {
+                    bool is_null;
+                    int64_t v = fast_timespan(fld, flen, &is_null);
+                    ((int64_t*)col_data[c])[row] = is_null ? NULL_I64 : v;
+                    if (is_null) col_had_null[c] = true;
+                    break;
+                }
                 case CSV_TYPE_TIMESTAMP: {
                     bool is_null;
                     int64_t v = fast_timestamp(fld, flen, &is_null);
@@ -2555,125 +2586,6 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
         if (row_done) row_done[row] = 1;
     }
     return true;
-}
-
-/* Per-column elem size for the hash-attach cap.  Mirrors the integer
- * shapes accepted by ray_index_attach_hash (BOOL/U8/I16/I32/I64/DATE/
- * TIME/TIMESTAMP); returns 0 for floats and dict-backed types so the
- * caller skips them. */
-static int csv_hash_elem_size(int8_t t) {
-    switch (t) {
-    case RAY_BOOL: case RAY_U8:                       return 1;
-    case RAY_I16:                                     return 2;
-    case RAY_I32: case RAY_DATE:                      return 4;
-    case RAY_I64: case RAY_TIME: case RAY_TIMESTAMP:  return 8;
-    default:                                          return 0;
-    }
-}
-
-/* Decide whether `v` is a good candidate for an auto-attached hash
- * index, using only its (already-attached) chunk_zone as the entropy
- * proxy.  A column is "random-shaped" when each chunk's [min, max]
- * covers more than half the global range — i.e. there's effectively
- * no clustering, so the per-chunk zone-skip never excludes a chunk
- * and the only way to accelerate `col == K` is by hashing.
- *
- * The memory cap rejects columns where the hash index (table+chain
- * arrays — ~24 bytes/row at default load factor) would be much larger
- * than the data itself.  We use 5× the column's data bytes as the
- * budget: this comfortably admits I32/I64 numeric IDs (where the
- * index is 3–5× the data) while still excluding narrow types like
- * BOOL/U8/I16 where the index would dwarf the column.
- *
- * Returns 1 to attach, 0 to skip. */
-/* Payload-level core of the hash-upgrade decision.  Its only caller is the
- * .csv.splayed / Parquet conversion path: the stream writer builds each
- * column's chunk zone inline and, for integer columns whose zone passes this
- * check, the column is re-read once to build the hash.  Indexing is a
- * CONVERSION-time decision, made once and persisted with the column files.
- * A `.csv.read` into memory attaches nothing (it used to run this same
- * heuristic over every column and throw the result away — 19.7 s of a 46 s
- * 8 GB load), so there is no in-memory decision left for the on-disk one to
- * match.  It lives here because the heuristic is written against the
- * chunk-zone payload the CSV type machinery defines. */
-int ray_csv_hash_upgrade_check(int8_t type, int64_t len,
-                               const void* index_payload) {
-    const ray_index_t* ix = (const ray_index_t*)index_payload;
-    int esz = csv_hash_elem_size(type);
-    if (esz == 0) return 0;
-    if (!ix || ix->kind != RAY_IDX_CHUNK_ZONE || ix->u.chunk_zone.is_f64)
-        return 0;
-    uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
-    if (n_chunks < 4) return 0;
-    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
-    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
-
-    /* Whole-column [gmin, gmax] from the chunk extrema, ignoring empty
-     * chunks (mn > mx, set by the chunk_zone scan when a chunk is fully
-     * null). */
-    int64_t gmin = INT64_MAX, gmax = INT64_MIN;
-    for (uint32_t g = 0; g < n_chunks; g++) {
-        if (mins[g] > maxs[g]) continue;
-        if (mins[g] < gmin) gmin = mins[g];
-        if (maxs[g] > gmax) gmax = maxs[g];
-    }
-    if (gmin == INT64_MAX || gmax == INT64_MIN) return 0;
-    /* Compute (gmax - gmin) in uint64 space — the signed subtraction
-     * overflows when the range spans the full I64 width (e.g. UserID
-     * hashing to both sign halves).  Reinterpret as uint64 first;
-     * 2's-complement wrap gives the correct |gmax - gmin|. */
-    uint64_t global_range = (uint64_t)gmax - (uint64_t)gmin;
-    if (global_range == 0) return 0;  /* constant column — pointless */
-
-    /* Average per-chunk span / global range — selectivity proxy.
-     * Sum the per-chunk spans as doubles so the accumulation can't
-     * overflow when chunks span the full I64 width (uint64 sum
-     * across ~150 chunks each ~1.8e19 wide overflows; double has
-     * ~15 significant decimal digits, plenty for this coarse ratio).
-     *
-     * Threshold = 0.5.  mean_ratio measures how much of the global
-     * value range an average chunk spans: it is the entropy/clustering
-     * signal that decides whether a hash index pays off.  A value
-     * near 1.0 means each chunk already covers (almost) the whole
-     * range — the column is effectively uniformly random, chunk_zone
-     * min/max pruning is useless, so every point lookup degenerates
-     * to a full-column scan and a hash index is the only way to make
-     * it cheap.  A small ratio means values are clustered, so
-     * chunk_zone already prunes most chunks and the index buys little.
-     * 0.5 is the natural random-vs-clustered separator: above it a
-     * chunk spans more than half the range (no useful zone pruning,
-     * index it); below it clustering gives the zone map real pruning
-     * power and the index's memory/build cost isn't justified. */
-    double dgr = (double)global_range;
-    double span_sum = 0.0;
-    uint32_t n_eff = 0;
-    for (uint32_t g = 0; g < n_chunks; g++) {
-        if (mins[g] > maxs[g]) continue;
-        uint64_t span = (uint64_t)maxs[g] - (uint64_t)mins[g];
-        span_sum += (double)span;
-        n_eff++;
-    }
-    if (n_eff < 4) return 0;
-    double mean_ratio = (span_sum / (double)n_eff) / dgr;
-    if (mean_ratio <= 0.5) return 0;
-
-    /* Memory cap: ray_index_attach_hash allocates a power-of-two
-     * `cap = next_pow2(2*n)` int64 table plus an n-entry int64
-     * chain.  Skip when the index would cost more than 5× the
-     * column's payload — keeps narrow integer types (where the
-     * index dwarfs the data) out of the index set while admitting
-     * I32 / I64 numeric IDs.  Done in int64 arithmetic (we cap n
-     * to anything that would overflow at the row counts we accept). */
-    int64_t n = len;
-    if (n <= 0) return 0;
-    uint64_t cap = 8;
-    uint64_t want = (uint64_t)(2 * n);
-    while (cap < want) cap <<= 1;
-    uint64_t aux_bytes  = cap * 8u + (uint64_t)n * 8u;
-    uint64_t data_bytes = (uint64_t)n * (uint64_t)esz;
-    if (aux_bytes > 5u * data_bytes) return 0;
-
-    return 1;
 }
 
 /* --------------------------------------------------------------------------
@@ -2880,6 +2792,7 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
             case RAY_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;
+            case RAY_TIMESPAN: parse_types[c] = CSV_TYPE_TIMESPAN; break;
             case RAY_TIMESTAMP: parse_types[c] = CSV_TYPE_TIMESTAMP; break;
             case RAY_GUID:      parse_types[c] = CSV_TYPE_GUID;      break;
             default:            parse_types[c] = CSV_TYPE_STR;       break;
@@ -3278,7 +3191,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
         for (int c = 0; c < ncols; c++) {
             int8_t t = col_types_in[c];
             if (t < RAY_BOOL ||
-                (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
+                ((t >= RAY_TYPE_COUNT || !ray_elem_size(t)) && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
                 scratch_free(row_offsets_hdr);
                 ray_vm_unmap_file(buf, file_size);
@@ -3346,6 +3259,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
             case RAY_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;
+            case RAY_TIMESPAN: parse_types[c] = CSV_TYPE_TIMESPAN; break;
             case RAY_TIMESTAMP: parse_types[c] = CSV_TYPE_TIMESTAMP; break;
             case RAY_GUID:      parse_types[c] = CSV_TYPE_GUID;      break;
             default:           parse_types[c] = CSV_TYPE_STR;       break;
@@ -3554,13 +3468,9 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
 
     /* ---- 11. Build table ---- */
     {
-        /* No index attach at load time.  Index policy lives at csv→splayed
-         * CONVERSION (store/splay.c: chunk-zone / dict, upgraded to a hash
-         * index by ray_csv_hash_upgrade_check) where the decision is made
-         * once and persisted.  A `.csv.read` into memory used to pay for a
-         * chunk-zone AND a hash index on all 105 columns of an 8 GB file —
-         * 3.6 s + 16.1 s of a 46 s load — for indexes most in-memory reads
-         * never probe.  Columns that need one can be indexed explicitly. */
+        /* .csv.read attaches no index: indexes are a conversion-time
+         * decision (zones and dictionaries streamed with the columns by
+         * .csv.splayed / .parquet.splayed, index policy PI). */
 
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
@@ -3616,13 +3526,32 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
                                   col_types_in, n_types, NULL, 0);
 }
 
+/* Fault injection for the suite: RAY_CSV_SPLAYED_INJECT names where a
+ * .csv.splayed load is cancelled: "append" (from column 0's append task,
+ * mid-dispatch), "skip" (the last column's append task returns as a
+ * skipped ticket does) or "close" (before the column finish dispatch);
+ * debug builds only.  "skip" raises no interrupt, which a real skip always
+ * comes with, so production never reaches it; it is kept because only it
+ * reaches the append done-count past the interrupt checks after it. */
+static bool csv_splayed_inject(const char* step) {
+#if defined(DEBUG)
+    const char* e = getenv("RAY_CSV_SPLAYED_INJECT");
+    return e && strcmp(e, step) == 0;
+#else
+    (void)step;
+    return false;
+#endif
+}
+
 /* Append task: column `start` of the chunk table into its writer.  The
- * first failure is kept (a later task cannot clear it). */
+ * first failure is kept (a later task cannot clear it); `done` counts the
+ * columns appended, so a task a cancel skipped reads as not done. */
 typedef struct {
     ray_col_stream_t* writers;
     ray_t*   tbl;
     int      ncols;
     _Atomic(ray_err_t) err;
+    _Atomic(int64_t) done;
     int64_t* col_ns;    /* RAY_CSV_TRACE: per-column append time, or NULL */
 } csv_splayed_append_ctx_t;
 
@@ -3630,13 +3559,24 @@ static void csv_splayed_append_task(void* raw, uint32_t wid, int64_t start, int6
     (void)wid; (void)end;
     csv_splayed_append_ctx_t* a = (csv_splayed_append_ctx_t*)raw;
     if (atomic_load_explicit(&a->err, memory_order_relaxed) != RAY_OK) return;
-    ray_t* col = ray_table_get_col_idx(a->tbl, (int64_t)start);
+    if (start == a->ncols - 1 && csv_splayed_inject("skip")) return;
+    ray_t* col = ray_table_col_idx(a->tbl, (int64_t)start);
+    if (col && RAY_IS_ERR(col)) {
+        ray_err_t ce = ray_err_from_obj(col);
+        ray_error_free(col);
+        ray_err_t ok = RAY_OK;
+        atomic_compare_exchange_strong_explicit(&a->err, &ok, ce, memory_order_relaxed, memory_order_relaxed);
+        return;
+    }
     int64_t tt0 = a->col_ns ? ray_profile_now_ns() : 0;
     ray_err_t e = ray_col_stream_append(&a->writers[start], col);
     if (a->col_ns) a->col_ns[start] += ray_profile_now_ns() - tt0;
+    if (start == 0 && csv_splayed_inject("append")) ray_request_interrupt();
     if (e != RAY_OK) {
         ray_err_t ok = RAY_OK;
         atomic_compare_exchange_strong_explicit(&a->err, &ok, e, memory_order_relaxed, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&a->done, 1, memory_order_relaxed);
     }
 }
 
@@ -3644,7 +3584,8 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk,
-                                          const char* sym_path) {
+                                          const char* sym_path, ray_compress_t mode,
+                                          const char* cur, ray_err_t cur_err) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
@@ -3742,7 +3683,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         for (int c = 0; c < ncols; c++) {
             int8_t t = col_types_in[c];
             if (t < RAY_BOOL ||
-                (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
+                ((t >= RAY_TYPE_COUNT || !ray_elem_size(t)) && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
                 ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_TYPE;
@@ -3829,8 +3770,20 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     ray_col_stream_t writers[CSV_MAX_COLS];
     memset(writers, 0, sizeof(writers));
     for (int c = 0; c < ncols; c++) {
-        err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
-                                      resolved_types[c], sym_dom);
+        /* The column's generation (spec "Generation resolution"): only an
+         * inheriting column consults the destination's current generation,
+         * so only that one fails when it could not be resolved. */
+        ray_t* na = ray_sym_str(col_name_ids[c]);
+        uint8_t gen = 0;
+        if (cur_err != RAY_OK && ray_col_resolve_type_needs_dest(mode, resolved_types[c]))
+            err = cur_err;
+        else
+            err = na ? ray_col_resolve_gen_type_err(mode, resolved_types[c], cur,
+                                                    ray_str_ptr(na), ray_str_len(na), &gen)
+                     : RAY_ERR_CORRUPT;
+        if (err == RAY_OK)
+            err = ray_col_stream_open(&writers[c], dir, col_name_ids[c],
+                                      resolved_types[c], sym_dom, gen);
         if (err == RAY_OK) err = ray_col_stream_index_begin(&writers[c], 0);
         if (err != RAY_OK) {
             for (int j = 0; j <= c; j++) ray_col_stream_abort(&writers[j]);
@@ -3891,7 +3844,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
          * encoded and written side by side. */
         {
             csv_splayed_append_ctx_t actx = { .writers = writers, .tbl = tbl,
-                                              .ncols = ncols, .err = RAY_OK,
+                                              .ncols = ncols, .err = RAY_OK, .done = 0,
                                               .col_ns = trace ? tr_col_ns : NULL };
             ray_pool_t* wpool = ray_pool_get();
             if (ray_pool_par_dispatch_ok(wpool, ncols, 2))
@@ -3899,6 +3852,10 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
             else
                 for (int c = 0; c < ncols; c++) csv_splayed_append_task(&actx, 0, c, c + 1);
             err = actx.err;
+            /* A cancel skips the tasks not yet started and the dispatch
+             * returns normally: their columns miss this chunk (#716). */
+            if (err == RAY_OK && atomic_load_explicit(&actx.done, memory_order_relaxed) != ncols)
+                err = RAY_ERR_CANCEL;
         }
         ray_release(tbl);
         int64_t tr_c3 = ray_profile_now_ns();
@@ -3919,6 +3876,10 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         if (cnt == 0) break;
         chunk_offset = next_offset;
     }
+    /* A cancel that lands during the last chunk's appends, once every one
+     * of them has started (or with the appends run in line), stops the
+     * load before the symfile flush and the column finish. */
+    if (err == RAY_OK && ray_interrupted()) err = RAY_ERR_CANCEL;
 
     /* Flush the symfile BEFORE committing column files (writer_close
      * renames tmp → final): columns must never reference positions the
@@ -3951,6 +3912,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
      * zone finish, index region, header, fclose), then the renames run
      * serially in column order; a failed finish publishes nothing. */
     memset(tr_col_ns, 0, sizeof(tr_col_ns));
+    if (err == RAY_OK && csv_splayed_inject("close")) ray_request_interrupt();
     if (err == RAY_OK) err = ray_col_stream_close_all(writers, ncols, false, trace ? tr_col_ns : NULL);
     else for (int c = 0; c < ncols; c++) ray_col_stream_abort(&writers[c]);
     int64_t tr_close_end = ray_profile_now_ns();
@@ -3964,27 +3926,15 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     }
 
     /* The domain was flushed before the closes and .d names columns through
-     * the global symbol table, so drop its tables before the hash re-read. */
+     * the global symbol table, so drop its tables before .d is written. */
     if (sym_dom) { ray_sym_domain_release(sym_dom); sym_dom = NULL; }
     int64_t tr_rel_end = ray_profile_now_ns();
     if (trace) fprintf(stderr, "csv.splayed: domain_release=%.1fms\n", TR_MS(tr_rel_end - tr_close_end));
 
-    /* Columns whose zone asked for a hash: the only files read back, before
-     * .d so an in-place first write never publishes a half-appended region. */
-    memset(tr_col_ns, 0, sizeof(tr_col_ns));
-    if (err == RAY_OK) ray_col_stream_hash_all(writers, ncols, trace ? tr_col_ns : NULL);
-    for (int c = 0; c < ncols; c++)
-        if (writers[c].index) { ray_release(writers[c].index); writers[c].index = NULL; }
-    int64_t tr_hash_end = ray_profile_now_ns();
-    if (trace) {
-        for (int c = 0; c < ncols; c++) {
-            if (!tr_col_ns[c]) continue;
-            ray_t* na = ray_sym_str(col_name_ids[c]);
-            fprintf(stderr, "csv.splayed: hash col=%s type=%d task=%.1fms\n",
-                    na ? ray_str_ptr(na) : "?", (int)resolved_types[c], TR_MS(tr_col_ns[c]));
-        }
-        fprintf(stderr, "csv.splayed: hash_phase=%.1fms\n", TR_MS(tr_hash_end - tr_rel_end));
-    }
+    /* A cancel that landed in the finish phase stops the load here:
+     * without .d nothing is committed, and the caller's write finish
+     * removes what this load created. */
+    if (err == RAY_OK && ray_interrupted()) err = RAY_ERR_CANCEL;
 
     /* .d LAST — the commit marker.  All column files are renamed into
      * place by now and the symfile is flushed; a crash or error before
@@ -4014,7 +3964,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         }
     }
     if (trace) fprintf(stderr, "csv.splayed: schema=%.1fms total=%.1fms\n",
-                       TR_MS(ray_profile_now_ns() - tr_hash_end), TR_MS(ray_profile_now_ns() - tr_t0));
+                       TR_MS(ray_profile_now_ns() - tr_rel_end), TR_MS(ray_profile_now_ns() - tr_t0));
 #undef TR_MS
 
     if (sym_dom) ray_sym_domain_release(sym_dom);
@@ -4026,17 +3976,26 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                           const int8_t* col_types_in, int32_t n_types,
                                           const int64_t* col_names_in, int32_t n_names,
                                           const char* dir, int64_t rows_per_chunk) {
+    return ray_csv_save_splayed_mode(path, delimiter, header, col_types_in, n_types,
+                                     col_names_in, n_names, dir, rows_per_chunk,
+                                     RAY_COMPRESS_ABSENT);
+}
+
+ray_err_t ray_csv_save_splayed_mode(const char* path, char delimiter, bool header,
+                                    const int8_t* col_types_in, int32_t n_types,
+                                    const int64_t* col_names_in, int32_t n_names,
+                                    const char* dir, int64_t rows_per_chunk, ray_compress_t mode) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !dir) return RAY_ERR_DOMAIN;
     char sym_path[1024];
     int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
     if (n < 0 || (size_t)n >= sizeof(sym_path)) return RAY_ERR_RANGE;
     ray_splay_write_t write;
-    ray_err_t err = ray_splay_write_begin(dir, &write);
+    ray_err_t err = ray_splay_write_begin_mode(dir, mode, &write);
     if (err != RAY_OK) return err;
     err = csv_save_splayed_to_dir(path, delimiter, header, col_types_in, n_types,
                                   col_names_in, n_names, write.dir,
-                                  rows_per_chunk, sym_path);
+                                  rows_per_chunk, sym_path, mode, write.cur, write.cur_err);
     return ray_splay_write_finish(&write, err, false);
 }
 
@@ -4044,7 +4003,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
                                          const int8_t* col_types_in, int32_t n_types,
                                          const int64_t* col_names_in, int32_t n_names,
                                          const char* root, const char* table_name,
-                                         int64_t rows_per_part, bool staged) {
+                                         int64_t rows_per_part, bool staged,
+                                         ray_compress_t mode) {
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !root || !table_name) return RAY_ERR_DOMAIN;
     if (rows_per_part <= 0) rows_per_part = CSV_PART_ROWS_DEFAULT;
@@ -4142,7 +4102,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
         for (int c = 0; c < ncols; c++) {
             int8_t t = col_types_in[c];
             if (t < RAY_BOOL ||
-                (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
+                ((t >= RAY_TYPE_COUNT || !ray_elem_size(t)) && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
                 ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_TYPE;
@@ -4236,7 +4196,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
         /* Match Parquet parted output: build numeric zones while the bounded
          * decoded partition is resident, before serialization. */
         for (int64_t c = 0; c < ray_table_ncols(tbl); c++) {
-            ray_t* col = ray_table_get_col_idx(tbl,c);
+            ray_t* col = ray_table_col_idx(tbl,c);
+            if (col && RAY_IS_ERR(col)) { err = ray_err_from_obj(col); ray_error_free(col); break; }
             if (col->type == RAY_STR || col->type == RAY_SYM || col->type == RAY_F32 || col->type == RAY_GUID) continue;
             ray_retain(col);
             ray_t* indexed = col->len >= 65536 ? ray_index_attach_chunk_zone(&col,16) : ray_index_attach_zone(&col);
@@ -4270,8 +4231,8 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
             err = RAY_ERR_RANGE;
             break;
         }
-        err = staged ? ray_splay_save_staged_bulk(tbl, leaf, root_sym)
-                     : ray_splay_save_bulk(tbl, leaf, root_sym);
+        err = staged ? ray_splay_save_staged_bulk_mode(tbl, leaf, root_sym, mode)
+                     : ray_splay_save_bulk_mode(tbl, leaf, root_sym, mode);
         ray_release(tbl);
         scratch_free(row_offsets_hdr);
         if (err != RAY_OK) {
@@ -4316,6 +4277,16 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                                          const int64_t* col_names, int32_t n_names,
                                          const char* root, const char* table_name,
                                          int64_t rows_per_part) {
+    return ray_csv_save_parted_mode(path, delimiter, header, col_types, n_types,
+                                    col_names, n_names, root, table_name,
+                                    rows_per_part, RAY_COMPRESS_ABSENT);
+}
+
+ray_err_t ray_csv_save_parted_mode(const char* path, char delimiter, bool header,
+                                   const int8_t* col_types, int32_t n_types,
+                                   const int64_t* col_names, int32_t n_names,
+                                   const char* root, const char* table_name,
+                                   int64_t rows_per_part, ray_compress_t mode) {
     if (!path || !root || !*root || !table_name || !*table_name ||
         table_name[0] == '.' || strchr(table_name,'/') || strchr(table_name,'\\'))
         return RAY_ERR_DOMAIN;
@@ -4326,7 +4297,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     struct stat st;
     if (stat(dest,&st) == 0)
         return csv_save_parted_impl(path,delimiter,header,col_types,n_types,
-                                   col_names,n_names,dest,table_name,rows_per_part,false);
+                                   col_names,n_names,dest,table_name,rows_per_part,false,mode);
     /* Fail on an unreadable input before claiming the staging directory:
      * failed staging is retained and blocks the root, which a mistyped
      * source path must not do. */
@@ -4348,7 +4319,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     if (mkdir(staging,0755) != 0) return RAY_ERR_IO;
 #endif
     ray_err_t err = csv_save_parted_impl(path,delimiter,header,col_types,n_types,
-                                       col_names,n_names,staging,table_name,rows_per_part,true);
+                                       col_names,n_names,staging,table_name,rows_per_part,true,mode);
     if (err != RAY_OK) {
         /* Failed staging is kept for diagnosis only when it holds a
          * partition.  A failure before the first one (a type vector that
@@ -4599,6 +4570,12 @@ static void csv_write_cell(csv_writer_t* w, const csv_col_info_t* ci, int64_t r)
     case RAY_TIME:
         csv_write_time(w, ((const int32_t*)d)[dr]);
         break;
+    case RAY_TIMESPAN: {
+        char text[64];
+        int n = ray_format_timespan(text, sizeof(text), ((const int64_t*)d)[dr]);
+        if (n > 0 && n < (int)sizeof(text)) cw_write(w, text, (size_t)n);
+        break;
+    }
     case RAY_TIMESTAMP:
         csv_write_timestamp(w, ((const int64_t*)d)[dr]);
         break;
@@ -4675,8 +4652,18 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
         return RAY_ERR_OOM;
     }
     csv_col_info_t* ci = (csv_col_info_t*)ray_data(col_info_block);
-    for (int64_t c = 0; c < ncols; c++)
-        csv_col_info_init(&ci[c], ray_table_get_col_idx(table, c));
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_col_idx(table, c);
+        if (col && RAY_IS_ERR(col)) {
+            ray_err_t ce = ray_err_from_obj(col);
+            ray_error_free(col);
+            ray_free(col_info_block);
+            fclose(fp);
+            remove(tmp_path);
+            return ce;
+        }
+        csv_col_info_init(&ci[c], col);
+    }
 
     /* Header row: column names */
     for (int64_t c = 0; c < ncols; c++) {

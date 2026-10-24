@@ -189,6 +189,12 @@ ray_t* ray_rowsel_refine(ray_t* existing, ray_t* pred);
  * preserving NONE/ALL compression without materializing a bool vector. */
 ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b);
 
+/* The first `limit` rows `sel` keeps (borrowed), as a fresh rowsel over
+ * the same rows: segments before the cut as they are, the cut segment MIX,
+ * NONE after it.  A limit past total_pass keeps every row.  O(n_segs +
+ * limit).  NULL on OOM. */
+ray_t* ray_rowsel_head(ray_t* sel, int64_t limit);
+
 /* ──────────────────────────────────────────────────────────────────
  * Streaming builder — per-morsel selection emitter
  *
@@ -248,6 +254,17 @@ void rowsel_builder_init(rowsel_builder_t* b, uint32_t n_segs);
  * global n_segs = ceil(nrows / RAY_MORSEL_ELEMS). */
 void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
                          const uint8_t* morsel_bool, int64_t n);
+
+/* rowsel_emit_segment of `n` bools all equal to d (0 / 1), never
+ * scanned: NONE or ALL. */
+void rowsel_emit_uniform(rowsel_builder_t* b, uint32_t seg, uint8_t d, int64_t n);
+
+/* rowsel_emit_segment of a morsel given as n_runs runs: run r covers the
+ * rows [ends[r - 1], ends[r]) (ends[-1] = 0, ends[n_runs - 1] = n) and
+ * passes when pass[r] is set.  The segment is byte-identical to emitting
+ * the runs' expanded bools. */
+void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
+                      const uint8_t* pass, uint32_t n_runs, int64_t n);
 
 /* Concatenate `n_workers` builders (segment ranges globally ordered by
  * worker index) into a fresh ray_rowsel_new(nrows, total_pass, idx_count)

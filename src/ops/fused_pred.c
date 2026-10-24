@@ -34,15 +34,25 @@
  * fused_group.h (ray_fused_group_supported).
  */
 
+#include "ops/colbind.h"
 #include "vec/vec.h"
 #include "ops/fused_group.h"  /* ray_fused_group_supported decl */
 #include "ops/fused_pred.h"
 #include "table/domain.h"     /* sym-domain resolution */
+#include "table/table.h"       /* ray_table_col_meta */
 #include "ops/idxop.h"        /* RAY_IDX_CHUNK_ZONE chunk-skip in fp_eval_cmp */
 #include "lang/eval.h"        /* ATTR_QUOTED */
+#include "store/enc.h"        /* RAY_ENC_VEC: the range-read vector */
+#include "store/enccol.h"     /* ray_enc_chunk_stat_t: the directory gate */
+#include "store/enceval.h"    /* encoded leaves: ray_enc_eval_cmp */
+#include "vec/str.h"          /* ray_str_t_ptr: STR through a view */
 
+#include <assert.h>
 #include <limits.h>
 #include <string.h>
+
+/* FP_EQ..FP_GE are 0..5 and OP_EQ..OP_GE 25..30 in the same order. */
+static inline uint16_t cmp_op_of(fp_op_t op) { return (uint16_t)(OP_EQ + (int)(op - FP_EQ)); }
 
 /* Recognise a 2-character comparison operator: ==, !=, <=, >=.  Returns
  * the FP_* code or -1 on miss. */
@@ -103,21 +113,16 @@ static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
     }
 }
 
-/* Numeric, temporal, STR and GUID comparisons have an explicit typed leg
- * with null-as-minimum ordering. SYM equality uses domain codes. IN keeps
- * its stricter null-free admission because it uses a different evaluator. */
-static int fp_col_supported_op(const ray_t* col, int eq_or_ne) {
-    if (!col) return 0;
-    if (col->type >= RAY_BOOL && col->type <= RAY_TIMESTAMP) return 1;
-    if (col->type == RAY_GUID || col->type == RAY_STR) return 1;
-    if (eq_or_ne && col->type == RAY_SYM) return 1;
-    return !ray_vec_has_nulls(col);
-}
-
-/* Strict form — no nullable column at all.  Used by the shape whose
- * evaluator arm is not an equality compare (IN). */
-static int fp_col_supported(const ray_t* col) {
-    return col && !ray_vec_has_nulls(col);
+/* Planning-time admission by metadata (the bound-source forms are
+ * fp_src_supported_op / fp_src_supported below): numeric, temporal, STR and
+ * GUID comparisons have an explicit typed leg with null-as-minimum
+ * ordering, SYM equality uses domain codes, anything else needs a null-free
+ * column from ray_table_col_has_nulls, never a decode. */
+static int fp_meta_supported_op(ray_t* tbl, int64_t sym, const ray_col_meta_t* m, int eq_or_ne) {
+    if (m->type >= RAY_BOOL && m->type <= RAY_TIMESTAMP) return 1;
+    if (m->type == RAY_GUID || m->type == RAY_STR) return 1;
+    if (eq_or_ne && m->type == RAY_SYM) return 1;
+    return !ray_table_col_has_nulls(tbl, sym);
 }
 
 static int fp_expr_const_str(ray_t* expr) {
@@ -167,10 +172,10 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
      * compile agree — divergence here means the executor returns
      * `nyi` on shapes the planner thought were ok. */
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, lhs->i64);
-        if (!col) return -1;
-        if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return -1;
-        int8_t ct = col->type;
+        ray_col_meta_t m;
+        if (!ray_table_col_meta(tbl, lhs->i64, &m)) return -1;
+        if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return -1;
+        int8_t ct = m.type;
         int is_ord = (code >= 2);  /* LT/LE/GT/GE */
         if (is_ord && ct == RAY_SYM) return -1;
         /* Dict-encoded STR: EQ/NE only, compared on the int32 code vector
@@ -179,7 +184,7 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
          * are meaningless on first-occurrence codes, so reject them. */
         int is_dict_str = (ct == RAY_STR && !is_ord
                            && rhs->type == -RAY_STR
-                           && ray_index_kind(col) == RAY_IDX_DICT);
+                           && m.index_kind == RAY_IDX_DICT);
         /* Only types with a matching typed comparison implementation. */
         if (!is_dict_str
             && ct != RAY_SYM && ct != RAY_BOOL && ct != RAY_U8
@@ -187,7 +192,7 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
             && ct != RAY_DATE && ct != RAY_TIME && ct != RAY_TIMESTAMP
             && ct != RAY_F32 && ct != RAY_F64 && ct != RAY_STR && ct != RAY_GUID)
             return -1;
-        if (!fp_col_supported_op(col, code == 0 || code == 1)) return -1;
+        if (!fp_meta_supported_op(tbl, lhs->i64, &m, code == 0 || code == 1)) return -1;
         if (!is_dict_str && !fp_atom_col_compatible(rhs->type, ct)) return -1;
     }
     return code;
@@ -207,12 +212,12 @@ static int fp_check_like(ray_t* expr, ray_t* tbl) {
         return 0;
     if (!fp_expr_const_str(elems[2])) return 0;
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, lhs->i64);
+        ray_col_meta_t m;
         /* A null text cell is the empty string on every like path (the
          * kernel and this evaluator both match the pattern against ""),
          * so a nullable column is admitted. */
-        if (!col) return 0;
-        if (col->type != RAY_STR && col->type != RAY_SYM) return 0;
+        if (!ray_table_col_meta(tbl, lhs->i64, &m)) return 0;
+        if (m.type != RAY_STR && m.type != RAY_SYM) return 0;
     }
     return 1;
 }
@@ -241,10 +246,10 @@ static int fp_check_in(ray_t* expr, ray_t* tbl) {
     if (ray_len(rhs) > 16) return 0;
     if (!fp_int_family(rhs->type)) return 0;
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, lhs->i64);
-        if (!col || !fp_col_supported(col)) return 0;
-        if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return 0;
-        if (!fp_int_family(col->type)) return 0;
+        ray_col_meta_t m;
+        if (!ray_table_col_meta(tbl, lhs->i64, &m) || ray_table_col_has_nulls(tbl, lhs->i64)) return 0;
+        if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
+        if (!fp_int_family(m.type)) return 0;
     }
     return 1;
 }
@@ -254,7 +259,41 @@ static int fp_check_in(ray_t* expr, ray_t* tbl) {
  *   pred  = simple_cmp | (and simple_cmp simple_cmp …)
  *   simple_cmp = (op col const) where op ∈ {==, !=, <, <=, >, >=}
  *   ordering ops require col to be a numeric/temporal (non-SYM) column.
- *   AND fan-in is bounded by FP_PRED_MAX_CHILDREN (defined in fused_pred.h). */
+ *   AND fan-in is bounded by FP_PRED_MAX_CHILDREN (defined in fused_pred.h).
+ *
+ * A nested `and` is the flat `and` of its leaves: fp_compile_pred_dag
+ * walks nested OP_AND nodes into one child list, so (and (and a b) c) runs
+ * as (and a b c).  The leaf cap counts across the nesting. */
+
+static int fp_is_and(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST || ray_len(expr) < 2) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
+    ray_t* head_sym = ray_sym_str(elems[0]->i64);
+    return head_sym && ray_str_len(head_sym) == 3 &&
+           memcmp(ray_str_ptr(head_sym), "and", 3) == 0;
+}
+
+/* Add the leaves of `(and …)` to *n_leaves; 0 once a leaf is not a fused
+ * comparison or the leaves pass the cap.  Every level holds a leaf or an
+ * `and`, so FP_PRED_MAX_CHILDREN also bounds the depth. */
+static int fp_and_leaves_supported(ray_t* expr, ray_t* tbl, int* n_leaves, int depth) {
+    if (depth > FP_PRED_MAX_CHILDREN) return 0;
+    int64_t n = ray_len(expr);
+    ray_t** elems = (ray_t**)ray_data(expr);
+    for (int64_t i = 1; i < n; i++) {
+        ray_t* leaf = elems[i];
+        if (fp_is_and(leaf)) {
+            if (!fp_and_leaves_supported(leaf, tbl, n_leaves, depth + 1)) return 0;
+            continue;
+        }
+        if (++*n_leaves > FP_PRED_MAX_CHILDREN) return 0;
+        if (fp_check_simple_cmp(leaf, tbl) < 0
+            && !fp_check_like(leaf, tbl)
+            && !fp_check_in(leaf, tbl)) return 0;
+    }
+    return 1;
+}
 
 int ray_fused_group_supported(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
@@ -263,21 +302,9 @@ int ray_fused_group_supported(ray_t* expr, ray_t* tbl) {
     ray_t** elems = (ray_t**)ray_data(expr);
     if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
 
-    /* Detect (and …). */
-    ray_t* head_sym = ray_sym_str(elems[0]->i64);
-    if (head_sym) {
-        size_t hlen = ray_str_len(head_sym);
-        const char* hstr = ray_str_ptr(head_sym);
-        if (hlen == 3 && memcmp(hstr, "and", 3) == 0) {
-            int64_t k = n - 1;
-            if (k < 1 || k > FP_PRED_MAX_CHILDREN) return 0;
-            for (int64_t i = 0; i < k; i++) {
-                if (fp_check_simple_cmp(elems[i + 1], tbl) < 0
-                    && !fp_check_like(elems[i + 1], tbl)
-                    && !fp_check_in(elems[i + 1], tbl)) return 0;
-            }
-            return 1;
-        }
+    if (fp_is_and(expr)) {
+        int n_leaves = 0;
+        return fp_and_leaves_supported(expr, tbl, &n_leaves, 0);
     }
     /* Fall through: single simple cmp. */
     return (fp_check_simple_cmp(expr, tbl) >= 0 ||
@@ -319,12 +346,20 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
 
     if (p->typed_compare) {
         for (int64_t r = start; r < end; r++) {
-            bool an = ray_vec_is_null(p->col_obj, r), bn = p->constant_null;
+            bool an = p->col_obj ? ray_vec_is_null(p->col_obj, r)
+                                 : ray_raw_is_null(ct, p->col_attrs, p->col_base, r);
+            bool bn = p->constant_null;
             int cmp;
             if (an || bn) cmp = an == bn ? 0 : an ? -1 : 1;
             else if (ct == RAY_STR) {
                 size_t len = 0, clen = ray_str_len(p->literal);
-                const char* str = ray_str_vec_get(p->col_obj, r, &len);
+                const char* str;
+                if (p->col_obj) str = ray_str_vec_get(p->col_obj, r, &len);
+                else {
+                    const ray_str_t* sd = &((const ray_str_t*)p->col_base)[r];
+                    len = sd->len;
+                    str = len ? ray_str_t_ptr(sd, p->col_pool) : "";
+                }
                 size_t common = len < clen ? len : clen;
                 cmp = common ? memcmp(str, ray_str_ptr(p->literal), common) : 0;
                 if (!cmp) cmp = (len > clen) - (len < clen);
@@ -388,34 +423,8 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
                 if (cmin <= cmax) {       /* skip empty (all-null) chunks */
                     const uint8_t* nb = (const uint8_t*)ray_data(ix->u.chunk_zone.null_bits);
                     bool has_nulls = (nb[s_ch >> 3] >> (s_ch & 7)) & 1u;
-                    int decision = -1;   /* 0=all-fail, 1=all-pass, -1=mixed */
-                    switch (op) {
-                    case FP_EQ:
-                        if (cval < cmin || cval > cmax)        decision = 0;
-                        else if (!has_nulls && cmin == cmax)   decision = 1;
-                        break;
-                    case FP_NE:
-                        if (!has_nulls && (cval < cmin || cval > cmax)) decision = 1;
-                        else if (!has_nulls && cmin == cmax && cval == cmin) decision = 0;
-                        break;
-                    case FP_LT:
-                        if (!has_nulls && cmin >= cval)        decision = 0;
-                        else if (!has_nulls && cmax < cval)    decision = 1;
-                        break;
-                    case FP_LE:
-                        if (!has_nulls && cmin >  cval)        decision = 0;
-                        else if (!has_nulls && cmax <= cval)   decision = 1;
-                        break;
-                    case FP_GT:
-                        if (cmax <= cval)                      decision = 0;
-                        else if (!has_nulls && cmin >  cval)   decision = 1;
-                        break;
-                    case FP_GE:
-                        if (cmax <  cval)                      decision = 0;
-                        else if (!has_nulls && cmin >= cval)   decision = 1;
-                        break;
-                    default: break;
-                    }
+                    /* 0=all-fail, 1=all-pass, -1=mixed */
+                    int decision = zone_cmp_core(cmin, cmax, true, has_nulls, false, cmp_op_of(op), cval);
                     if (decision >= 0) {
                         memset(bits, (uint8_t)decision, (size_t)n);
                         return;
@@ -443,7 +452,7 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
              * positions through the column's domain (sym-domain Phase 2).
              * The LUT is sized by that domain's count at compile. */
             struct ray_sym_domain_s* like_dom =
-                sym_strings ? NULL : ray_sym_vec_domain(p->col_obj);
+                sym_strings ? NULL : p->like_dom ? p->like_dom : ray_sym_vec_domain(p->col_obj);
             int use_simple = p->pat_compiled.shape != RAY_GLOB_SHAPE_NONE;
             for (int64_t r = 0; r < n; r++) {
                 uint64_t sid = (uint64_t)read_by_esz(base, start + r, esz_l);
@@ -485,7 +494,13 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
         int use_simple = p->pat_compiled.shape != RAY_GLOB_SHAPE_NONE;
         for (int64_t r = 0; r < n; r++) {
             size_t sl = 0;
-            const char* sp = ray_str_vec_get(p->col_obj, start + r, &sl);
+            const char* sp;
+            if (p->col_obj) sp = ray_str_vec_get(p->col_obj, start + r, &sl);
+            else {
+                const ray_str_t* sd = &((const ray_str_t*)p->col_base)[start + r];
+                sl = sd->len;
+                sp = sl ? ray_str_t_ptr(sd, p->col_pool) : "";
+            }
             if (!sp) sp = "";
             bits[r] = use_simple
                     ? (uint8_t)ray_glob_match_compiled(&p->pat_compiled, sp, sl)
@@ -625,7 +640,8 @@ static inline uint8_t fp_eval_cmp_one(const fp_cmp_t* p, int64_t row) {
                 } else {
                     ray_t* s = p->like_sym_strings
                         ? p->like_sym_strings[sid]
-                        : ray_sym_domain_str(ray_sym_vec_domain(p->col_obj), (int64_t)sid);
+                        : ray_sym_domain_str(p->like_dom ? p->like_dom : ray_sym_vec_domain(p->col_obj),
+                                             (int64_t)sid);
                     if (s) { sp = ray_str_ptr(s); sl = ray_str_len(s); }
                 }
                 uint8_t match = 0;
@@ -641,7 +657,13 @@ static inline uint8_t fp_eval_cmp_one(const fp_cmp_t* p, int64_t row) {
         }
         if (p->col_type == RAY_STR) {
             size_t sl = 0;
-            const char* sp = ray_str_vec_get(p->col_obj, row, &sl);
+            const char* sp;
+            if (p->col_obj) sp = ray_str_vec_get(p->col_obj, row, &sl);
+            else {
+                const ray_str_t* sd = &((const ray_str_t*)p->col_base)[row];
+                sl = sd->len;
+                sp = sl ? ray_str_t_ptr(sd, p->col_pool) : "";
+            }
             if (!sp) sp = "";
             return (p->pat_compiled.shape != RAY_GLOB_SHAPE_NONE)
                  ? (uint8_t)ray_glob_match_compiled(&p->pat_compiled, sp, sl)
@@ -695,6 +717,7 @@ void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end,
                   uint8_t* bits)
 {
     int64_t n = end - start;
+    for (uint8_t i = 0; i < p->n_children; i++) assert(!p->children[i].enc);
     if (p->n_children == 0) {
         memset(bits, 1, (size_t)n);
         return;
@@ -716,32 +739,219 @@ void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end,
     }
 }
 
-/* Resolve a constant string to its dict code in a RAY_IDX_DICT column.
- * Codes are assigned by first-occurrence (not sorted), so there is no
- * persisted string->code map; scan the n_distinct first-occurrence rows
- * and compare the string at each.  One-time per-query compile cost.
- * Returns the code, or -1 when the string is absent from the dict. */
-static int64_t fp_dict_str_code(ray_t* col, const ray_index_t* dix,
-                                const char* s, size_t slen) {
-    int64_t nd = dix->u.dict.n_distinct;
-    if (nd <= 0 || !dix->u.dict.first_occ || RAY_IS_ERR(dix->u.dict.first_occ))
-        return -1;
-    const int32_t* focc = (const int32_t*)ray_data(dix->u.dict.first_occ);
-    for (int64_t c = 0; c < nd; c++) {
-        size_t l = 0;
-        const char* p = ray_str_vec_get(col, focc[c], &l);
-        if (!p) continue;
-        if (l == slen && (slen == 0 || memcmp(p, s, slen) == 0))
-            return c;
+void fp_scratch_init(fp_scratch_t* s) {
+    for (int i = 0; i < FP_PRED_MAX_CHILDREN; i++) ray_col_scratch_init(&s->sc[i]);
+}
+void fp_scratch_free(fp_scratch_t* s) {
+    for (int i = 0; i < FP_PRED_MAX_CHILDREN; i++) ray_col_scratch_free(&s->sc[i]);
+}
+
+/* An encoded child whose answer needs no column read: a fold, or a SYM
+ * constant absent from the domain (fp_eval_cmp memsets both). */
+static bool fp_reads_nothing(const fp_cmp_t* c) {
+    return c->fold || (c->col_type == RAY_SYM && !c->cval_in_dict);
+}
+
+/* A child answered on its vector's view (store/enceval.h): a plain
+ * integer / temporal compare, or SYM equality with a constant of the
+ * domain.  A non-typed child has no nulls (fp_src_supported_op), and SYM
+ * nulls are in band, so no null mask is applied. */
+static bool fp_view_leaf(const fp_cmp_t* c) {
+    if (c->typed_compare || c->fold != FP_FOLD_NONE || c->op > FP_GE) return false;
+    if (c->col_type == RAY_SYM) return (c->op == FP_EQ || c->op == FP_NE) && c->cval_in_dict;
+    return zone_dir_type(c->col_type);
+}
+
+/* Rebind an encoded child to the view of [start, start + n) (one vector),
+ * shifted so that row `start` is index 0: rows are passed as [0, n).  The
+ * directory gate decides a whole range from its chunk's statistics first,
+ * then from its vector's descriptor (*decided 0 / 1, nothing read); a
+ * materialization another consumer
+ * published meanwhile is read in place, never decoded again.  Otherwise a
+ * leaf (fp_view_leaf) is evaluated on the vector's view into dst[0, n)
+ * (*decided 2, nothing decoded); a vector without a view is read by
+ * range. */
+static ray_t* fp_bind_view(const fp_cmp_t* c, int64_t start, int64_t n,
+                           ray_col_scratch_t* sc, ray_enc_vview_t* vb, uint8_t* dst,
+                           fp_cmp_t* out, int* decided) {
+    *out = *c;
+    *decided = -1;
+    if (c->idict) {
+        /* the persisted DICT's codes (P6b), in the mapping: no decode, and
+         * never a zone decision (codes are membership values, D6) */
+        const int32_t* cd = NULL;
+        ray_t* e = ray_enccol_idict_codes(c->idict, start, n, &cd);
+        if (e) return e;
+        out->col_base = cd;                        /* rows are view-relative, as for a range read */
+        out->col_obj = NULL;
+        return NULL;
     }
-    return -1;
+    if (!c->typed_compare && zone_dir_type(c->col_type) && c->op <= FP_GE &&
+        (start / RAY_ENC_CHUNK) == ((start + n - 1) / RAY_ENC_CHUNK)) {
+        ray_enc_chunk_stat_t st;
+        if (ray_col_src_chunk_stat(c->src, start / RAY_ENC_CHUNK, &st)) {
+            int d = zone_cmp_core(st.min, st.max, st.has_minmax, st.null_count > 0,
+                                  (int64_t)st.null_count == st.rows, cmp_op_of(c->op), c->cval);
+            if (d >= 0) { *decided = d; return NULL; }
+        }
+        /* then the vector's descriptor (the window lies in one vector);
+         * answer-only, the window is filled, so no consumer guard */
+        int64_t mn, mx; uint32_t nn;
+        if (start / RAY_ENC_VEC == (start + n - 1) / RAY_ENC_VEC &&
+            ray_col_src_vec_stat(c->src, start / RAY_ENC_VEC, &mn, &mx, &nn)) {
+            int d = zone_cmp_core(mn, mx, true, nn > 0, false, cmp_op_of(c->op), c->cval);
+            if (d >= 0) { *decided = d; return NULL; }
+        }
+    }
+    ray_t* rd = ray_col_src_ready(c->src);
+    if (rd && !RAY_IS_PARTED(rd->type)) {
+        ray_t* own = (rd->attrs & RAY_ATTR_SLICE) ? rd->slice_parent : rd;
+        out->col_attrs = rd->attrs;
+        out->col_esz = ray_sym_elem_size(rd->type, rd->attrs);
+        out->col_base = (const char*)ray_data(rd) + (size_t)start * out->col_esz;
+        out->col_pool = (rd->type == RAY_STR && own->str_pool && !RAY_IS_ERR(own->str_pool))
+                      ? (const char*)ray_data(own->str_pool) : NULL;
+        out->col_obj = NULL;                       /* rows are view-relative */
+        return NULL;
+    }
+    if (!rd && fp_view_leaf(c)) {
+        ray_t* verr = NULL;
+        int vr = ray_col_src_vview(c->src, start / RAY_ENC_VEC, vb, &verr);
+        if (vr < 0) return verr;
+        int64_t off = start % RAY_ENC_VEC;
+        /* a bitmap with nulls cannot occur here (a non-typed child is
+         * null-free); were it present, the range read answers exactly */
+        if (vr > 0 && !vb->nullmap && off + n <= vb->n) {
+            uint8_t whole[RAY_ENC_VEC];                /* a window inside the vector */
+            uint8_t* o = off == 0 && n == vb->n ? dst : whole;
+            if (ray_enc_eval_cmp(vb, cmp_op_of(c->op), c->cval, 0, o)) {
+                if (o != dst) memcpy(dst, whole + off, (size_t)n);
+                *decided = 2;
+                return NULL;
+            }
+        }
+    }
+    ray_col_range_t v;
+    ray_t* e = ray_col_range(c->src, start, n, sc, &v);
+    if (e) return e;
+    if (v.n != n) return ray_error("range", "fused predicate: morsel crosses a vector boundary");
+    out->col_base = v.data;
+    out->col_pool = v.str_pool;
+    out->col_obj = NULL;
+    out->col_attrs = v.attrs;
+    out->col_esz = ray_sym_elem_size(v.type, v.attrs);
+    return NULL;
+}
+
+ray_t* fp_eval_pred_rs(const fp_pred_t* p, int64_t start, int64_t end,
+                       uint8_t* bits, fp_scratch_t* s) {
+    int64_t n = end - start;
+    assert(n <= RAY_MORSEL_ELEMS);
+    bool any_enc = false;
+    for (uint8_t i = 0; i < p->n_children; i++) any_enc |= p->children[i].enc;
+    if (!any_enc) { fp_eval_pred(p, start, end, bits); return NULL; }
+    /* encoded children read one vector per call: split at vector boundaries */
+    int64_t cut = ((start / RAY_ENC_VEC) + 1) * RAY_ENC_VEC;
+    if (cut < end) {
+        ray_t* e = fp_eval_pred_rs(p, start, cut, bits, s);
+        return e ? e : fp_eval_pred_rs(p, cut, end, bits + (cut - start), s);
+    }
+    /* Children AND into bits; once no row of the window passes, the rest
+     * would only AND zeros, so they are not evaluated (nor their vectors
+     * decoded). */
+    uint8_t tmp[RAY_MORSEL_ELEMS];
+    for (uint8_t i = 0; i < p->n_children; i++) {
+        const fp_cmp_t* c = &p->children[i];
+        uint8_t* dst = i == 0 ? bits : tmp;
+        if (c->enc && !fp_reads_nothing(c)) {
+            fp_cmp_t local; int decided;
+            ray_t* e = fp_bind_view(c, start, n, &s->sc[i], &s->vb, dst, &local, &decided);
+            if (e) return e;
+            if (decided == 0 || decided == 1) memset(dst, decided, (size_t)n);
+            else if (decided < 0) fp_eval_cmp(&local, 0, n, dst);   /* 2: written on the view */
+        } else if (c->enc) {
+            fp_eval_cmp(c, 0, n, dst);            /* reads no column */
+        } else {
+            fp_eval_cmp(c, start, end, dst);
+        }
+        uint8_t any = 0;
+        if (i == 0) for (int64_t r = 0; r < n; r++) any |= bits[r];
+        else for (int64_t r = 0; r < n; r++) {
+            /* Each non-error branch writes n bytes through dst == tmp:
+             * memset, fp_eval_cmp, or fp_bind_view's decided==2 view. */
+            // cppcheck-suppress legacyUninitvar
+            bits[r] &= tmp[r];
+            any |= bits[r];
+        }
+        if (!any) break;                          /* the window is decided: all fail */
+    }
+    return NULL;
+}
+
+/* Nullability of a bound source.  Generation 0 keeps the exact payload
+ * test; an encoded source answers from its directory null counts (exact),
+ * never a decode. */
+static int fp_src_has_nulls(const ray_col_src_t* s) {
+    if (s->obj->type != RAY_ENCCOL && ray_is_vec(s->obj)) return ray_vec_has_nulls(s->obj);
+    return s->may_null;
+}
+
+/* Numeric, temporal, STR and GUID comparisons have an explicit typed leg
+ * with null-as-minimum ordering. SYM equality uses domain codes. Any other
+ * form needs a null-free source; IN keeps that stricter admission
+ * (fp_src_supported) because it uses a different evaluator. */
+static int fp_src_supported_op(const ray_col_src_t* s, int eq_or_ne) {
+    if (s->type >= RAY_BOOL && s->type <= RAY_TIMESTAMP) return 1;
+    if (s->type == RAY_GUID || s->type == RAY_STR) return 1;
+    if (eq_or_ne && s->type == RAY_SYM) return 1;
+    return !fp_src_has_nulls(s);
+}
+
+static int fp_src_supported(const ray_col_src_t* s) {
+    return !fp_src_has_nulls(s);
+}
+
+/* The step that captures a payload pointer asks for the plain column.  Both
+ * callers hold a ready source (fp_bind_fields only when out->enc is false;
+ * the STR dictionary leg only for a generation-0 column), so it never decodes. */
+static int fp_src_plain(ray_col_src_t* s, ray_t** col, ray_t** err) {
+    ray_t* e = ray_col_src_plain(s, col);   /* ready-only */
+    if (e) { *err = e; return -1; }
+    return 0;
+}
+
+/* The column fields of a compiled child: today's pointers for a ready
+ * source; the source's metadata and no pointer for an encoded one (a view
+ * is bound per morsel by fp_bind_view). */
+static int fp_bind_fields(ray_col_src_t* src, fp_cmp_t* out, ray_t** err) {
+    if (out->enc) {
+        out->col_type  = src->type;
+        out->col_attrs = src->attrs;
+        out->col_esz   = ray_sym_elem_size(src->type, src->attrs);
+        out->col_base  = NULL;
+        out->col_obj   = NULL;
+        out->col_len   = src->len;
+        return 0;
+    }
+    ray_t* col = NULL;
+    if (fp_src_plain(src, &col, err) != 0) return -1;     /* ready-only */
+    out->col_type  = col->type;
+    out->col_attrs = col->attrs;
+    out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
+    out->col_base  = ray_data(col);
+    out->col_obj   = col;
+    out->col_len   = col->len;
+    ray_t* own = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
+    out->col_pool  = (col->type == RAY_STR && own->str_pool && !RAY_IS_ERR(own->str_pool))
+                   ? (const char*)ray_data(own->str_pool) : NULL;
+    return 0;
 }
 
 /* Compile predicate DAG node (a comparison with OP_SCAN lhs and OP_CONST
  * rhs) against `tbl`.  Returns 0 on success, -1 if the shape can't be
  * handled (caller should bail and let the unfused path run). */
 static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
-                          fp_cmp_t* out)
+                          fp_cmp_t* out, ray_t** err)
 {
     if (!pred_op || pred_op->arity != 2) return -1;
     out->fold = FP_FOLD_NONE;
@@ -766,20 +976,24 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     ray_op_ext_t* rext = find_ext(g, rhs->id);
     if (!lext || !rext || !rext->literal) return -1;
 
-    ray_t* col = ray_table_get_col(tbl, lext->sym);
-    if (!col) return -1;
-    if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return -1;
+    /* Bind without decoding: every decision below reads the bound source;
+     * the plain column is requested only where a payload pointer is
+     * captured (R-READ: a decline takes the unfused scan path). */
+    ray_t* berr = NULL;
+    if (ray_col_bind_declines(tbl, lext->sym)) return -1;
+    ray_col_src_t* src = ray_graph_bind_col(g, tbl, lext->sym, &berr);
+    if (berr) { *err = berr; return -1; }
+    if (!src) return -1;
+    if (src->parted) return -1;
+    out->src = src;
+    out->enc = ray_col_src_ready(src) == NULL;     /* a generation-2 single-file column */
+    out->col_pool = NULL;
     if (out->op == FP_IN) {
-        if (!fp_col_supported(col) || !fp_int_family(col->type)) return -1;
+        if (!fp_src_supported(src) || !fp_int_family(src->type)) return -1;
         ray_t* sv = rext->literal;
         if (!sv || !ray_is_vec(sv) || !fp_int_family(sv->type)) return -1;
         if (ray_len(sv) > 16) return -1;
-        out->col_type  = col->type;
-        out->col_attrs = col->attrs;
-        out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
-        out->col_base  = ray_data(col);
-        out->col_obj   = col;
-        out->col_len   = col->len;
+        if (fp_bind_fields(src, out, err) != 0) return -1;
         int8_t st = sv->type;
         int64_t nsv = ray_len(sv);
         int64_t out_n = 0;
@@ -806,29 +1020,25 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         /* A nullable text column is admitted: a null cell is the empty
          * string on every like path, matched against the pattern once
          * here (like_empty_match). */
-        if (col->type != RAY_STR && col->type != RAY_SYM) return -1;
+        if (src->type != RAY_STR && src->type != RAY_SYM) return -1;
         ray_t* cv_like = rext->literal;
         if (!cv_like || cv_like->type != -RAY_STR) return -1;
-        out->col_type  = col->type;
-        out->col_attrs = col->attrs;
-        out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
-        out->col_base  = ray_data(col);
-        out->col_obj   = col;
-        out->col_len   = col->len;
+        if (fp_bind_fields(src, out, err) != 0) return -1;
         out->pat_str   = ray_str_ptr(cv_like);
         out->pat_len   = ray_str_len(cv_like);
         out->pat_compiled = ray_glob_compile(out->pat_str, out->pat_len);
         out->like_empty_match = (out->pat_compiled.shape != RAY_GLOB_SHAPE_NONE)
             ? (uint8_t)ray_glob_match_compiled(&out->pat_compiled, "", 0)
             : (uint8_t)ray_glob_match("", 0, out->pat_str, out->pat_len);
-        if (col->type == RAY_SYM) {
+        if (src->type == RAY_SYM) {
             /* Cell ids are positions in the COLUMN's domain.  Runtime
              * domain: borrow the global string snapshot (lock-free per
              * row).  FILE domain: size the LUT by the domain's count and
-             * resolve lazily via ray_sym_domain_str at eval (col_obj
-             * carries the domain).  Pre-flip this is always the runtime
-             * branch — exact no-op. */
-            if (ray_sym_vec_domain(col) == ray_sym_runtime_domain()) {
+             * resolve lazily via ray_sym_domain_str at eval over like_dom,
+             * the source's domain (an encoded child has no col_obj).
+             * Pre-flip this is always the runtime branch — exact no-op. */
+            out->like_dom = src->dom;
+            if (src->dom == ray_sym_runtime_domain()) {
                 ray_t** sym_strings = NULL;
                 uint32_t sym_count = 0;
                 ray_sym_strings_borrow(&sym_strings, &sym_count);
@@ -839,14 +1049,13 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
                 out->like_lut_count = sym_count;
                 out->like_sym_strings = sym_strings;
             } else {
-                int64_t dn = ray_sym_domain_count(ray_sym_vec_domain(col));
+                int64_t dn = ray_sym_domain_count(src->dom);
                 if (dn <= 0 || dn > UINT32_MAX) return -1;
                 uint8_t* lut = (uint8_t*)scratch_calloc(&out->aux_hdr, (size_t)dn);
                 if (!lut) return -1;
                 out->like_lut = lut;
                 out->like_lut_count = (uint32_t)dn;
-                out->like_sym_strings = NULL;  /* resolve via col_obj's domain */
-                out->like_dom = ray_sym_vec_domain(col);
+                out->like_sym_strings = NULL;  /* resolve via like_dom */
                 out->like_raw_ok = ray_sym_domain_raw_pin(out->like_dom, &out->like_raw) ? 1 : 0;
             }
         }
@@ -856,57 +1065,72 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
 
     /* Dict-encoded STR EQ/NE: drive the comparison on the column's int32
      * dict-code vector (like a W32 SYM).  Resolve the constant string to
-     * its code once; absent ⇒ EQ all-false / NE all-true via fold. */
-    if (col->type == RAY_STR && (out->op == FP_EQ || out->op == FP_NE)
-        && ray_index_kind(col) == RAY_IDX_DICT) {
-        if (!fp_col_supported_op(col, 1)) return -1;
+     * its code once; absent => EQ all-false / NE all-true via fold.  A
+     * source without a dictionary (-2) takes the typed leg below. */
+    if (src->type == RAY_STR && (out->op == FP_EQ || out->op == FP_NE)
+        && rext->literal && rext->literal->type == -RAY_STR) {
         ray_t* cv_str = rext->literal;
-        if (!cv_str || cv_str->type != -RAY_STR) return -1;
-        ray_index_t* dix = ray_index_payload(col->index);
-        ray_t* codes = dix->u.dict.codes;
-        if (!codes || RAY_IS_ERR(codes) || codes->len != col->len) return -1;
-        int64_t code = fp_dict_str_code(col, dix,
-                                        ray_str_ptr(cv_str), ray_str_len(cv_str));
-        out->col_type     = RAY_I32;        /* compare codes as int32 */
-        out->col_attrs    = 0;
-        out->col_esz      = 4;
-        out->col_base     = ray_data(codes);
-        out->col_obj      = codes;
-        out->col_len      = col->len;
-        out->cval         = (code >= 0) ? code : 0;
-        out->cval_in_dict = (code >= 0) ? 1 : 0;
-        if (code < 0)
-            out->fold = (out->op == FP_EQ) ? FP_FOLD_FALSE : FP_FOLD_TRUE;
-        return 0;
+        int64_t code = ray_col_src_dict_code(src, ray_str_ptr(cv_str), ray_str_len(cv_str));
+        if (code != -2) {              /* never for an encoded source (no dictionary) */
+            ray_t* col = NULL;
+            if (fp_src_plain(src, &col, err) != 0) return -1;
+            ray_index_t* dix = ray_index_payload(col->index);
+            ray_t* codes = dix->u.dict.codes;
+            if (!codes || RAY_IS_ERR(codes) || codes->len != col->len) return -1;
+            out->col_type     = RAY_I32;        /* compare codes as int32 */
+            out->col_attrs    = 0;
+            out->col_esz      = 4;
+            out->col_base     = ray_data(codes);
+            out->col_obj      = codes;
+            out->col_len      = col->len;
+            out->cval         = (code >= 0) ? code : 0;
+            out->cval_in_dict = (code >= 0) ? 1 : 0;
+            if (code < 0)
+                out->fold = (out->op == FP_EQ) ? FP_FOLD_FALSE : FP_FOLD_TRUE;
+            return 0;
+        }
+        /* a generation-2 single-file column with a persisted DICT (P6b),
+         * materialized or not: its codes, read from the mapping by range
+         * (fp_bind_view); "" is an entry, so the null rows compare exactly */
+        ray_enccol_t* de = (src->obj && src->obj->type == RAY_ENCCOL) ? ray_enccol_of(src->obj) : NULL;
+        int64_t dc = -2;
+        if (ray_enccol_has_idict(de)) {
+            ray_t* ce = ray_enccol_idict_code(de, ray_str_ptr(cv_str), ray_str_len(cv_str), &dc);
+            if (ce) { *err = ce; return -1; }
+        }
+        if (dc >= -1) {                    /* -2: no DICT after all, the typed leg below */
+            out->col_type = RAY_I32; out->col_attrs = 0; out->col_esz = 4;
+            out->col_base = NULL; out->col_obj = NULL; out->col_len = src->len;
+            out->typed_compare = 0;
+            out->enc = true; out->idict = de;
+            out->cval = dc >= 0 ? dc : 0;
+            out->cval_in_dict = dc >= 0;
+            if (dc < 0) out->fold = (out->op == FP_EQ) ? FP_FOLD_FALSE : FP_FOLD_TRUE;
+            return 0;
+        }
     }
 
     /* Ordering ops on SYM are meaningless (dict ID order != string order). */
-    if (col->type == RAY_SYM && (out->op == FP_LT || out->op == FP_LE ||
+    if (src->type == RAY_SYM && (out->op == FP_LT || out->op == FP_LE ||
                                  out->op == FP_GT || out->op == FP_GE))
         return -1;
     /* Admission and execution share the typed comparison/null contract. */
-    if (!fp_col_supported_op(col, out->op == FP_EQ || out->op == FP_NE))
+    if (!fp_src_supported_op(src, out->op == FP_EQ || out->op == FP_NE))
         return -1;
 
     ray_t* cv = rext->literal;
     /* Atom type ↔ column class compatibility — block mixed-temporal
      * forms like `(== date_col timestamp_const)` whose raw-unit
      * comparison is meaningless. */
-    if (!fp_atom_col_compatible(cv->type, col->type)) return -1;
-
-    out->col_type  = col->type;
-    out->col_attrs = col->attrs;
-    out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
-    out->col_base  = ray_data(col);
-    out->col_obj   = col;
-    out->col_len   = col->len;
+    if (!fp_atom_col_compatible(cv->type, src->type)) return -1;
+    if (fp_bind_fields(src, out, err) != 0) return -1;
 
     out->literal = cv;
     out->constant_null = RAY_ATOM_IS_NULL(cv);
-    out->float_compare = col->type == RAY_F32 || col->type == RAY_F64 || cv->type == -RAY_F32 || cv->type == -RAY_F64;
-    out->typed_compare = col->type == RAY_STR || col->type == RAY_GUID ||
-        (col->type != RAY_SYM && (out->float_compare || out->constant_null || ray_vec_may_have_nulls(col)));
-    if (col->type == RAY_STR || col->type == RAY_GUID) return 0;
+    out->float_compare = src->type == RAY_F32 || src->type == RAY_F64 || cv->type == -RAY_F32 || cv->type == -RAY_F64;
+    out->typed_compare = src->type == RAY_STR || src->type == RAY_GUID ||
+        (src->type != RAY_SYM && (out->float_compare || out->constant_null || src->may_null));
+    if (src->type == RAY_STR || src->type == RAY_GUID) return 0;
 
     if (out->col_type == RAY_SYM) {
         /* The constant must be expressed in the COLUMN's domain — cells
@@ -915,18 +1139,18 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
          * all-true fold via cval_in_dict).  Exact no-op while the column
          * is runtime-domain: a runtime atom's id IS the cell-id space. */
         if (cv->type == -RAY_SYM) {
-            if (ray_sym_vec_domain(col) == ray_sym_runtime_domain()) {
+            if (src->dom == ray_sym_runtime_domain()) {
                 out->cval = cv->i64;
                 out->cval_in_dict = 1;
             } else {
                 ray_t* cs = ray_sym_str(cv->i64);  /* atom: runtime id */
-                int64_t did = cs ? ray_sym_vec_lookup(col, ray_str_ptr(cs),
-                                                      ray_str_len(cs)) : -1;
+                int64_t did = cs ? ray_col_src_sym_find(src, ray_str_ptr(cs),
+                                                         ray_str_len(cs)) : -1;
                 out->cval = (did >= 0) ? did : 0;
                 out->cval_in_dict = (did >= 0) ? 1 : 0;
             }
         } else if (cv->type == -RAY_STR) {
-            int64_t did = ray_sym_vec_lookup(col, ray_str_ptr(cv), ray_str_len(cv));
+            int64_t did = ray_col_src_sym_find(src, ray_str_ptr(cv), ray_str_len(cv));
             out->cval = (did >= 0) ? did : 0;
             out->cval_in_dict = (did >= 0) ? 1 : 0;
         } else {
@@ -1005,18 +1229,18 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
  * OP_AND node.  Returns 0 on success, -1 if a leaf can't be compiled or
  * the fan-in exceeds FP_PRED_MAX_CHILDREN. */
 static int fp_compile_pred_dag(ray_graph_t* g, ray_op_t* node, ray_t* tbl,
-                               fp_pred_t* out)
+                               fp_pred_t* out, ray_t** err)
 {
     if (!node) return -1;
     if (node->opcode == OP_AND) {
-        if (fp_compile_pred_dag(g, op_child(g, node, 0), tbl, out) != 0) return -1;
-        if (fp_compile_pred_dag(g, op_child(g, node, 1), tbl, out) != 0) return -1;
+        if (fp_compile_pred_dag(g, op_child(g, node, 0), tbl, out, err) != 0) return -1;
+        if (fp_compile_pred_dag(g, op_child(g, node, 1), tbl, out, err) != 0) return -1;
         return 0;
     }
     if (out->n_children >= FP_PRED_MAX_CHILDREN) return -1;
     fp_cmp_t tmp;
     memset(&tmp, 0, sizeof(tmp));
-    if (fp_compile_cmp(g, node, tbl, &tmp) != 0) {
+    if (fp_compile_cmp(g, node, tbl, &tmp, err) != 0) {
         if (tmp.aux_hdr) scratch_free(tmp.aux_hdr);
         return -1;
     }
@@ -1049,14 +1273,15 @@ static void fp_pred_order_children(fp_pred_t* p) {
 }
 
 int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
-                    fp_pred_t* out)
+                    fp_pred_t* out, ray_t** err)
 {
+    *err = NULL;
     memset(out, 0, sizeof(*out));
     out->n_children = 0;
     /* No predicate → const-true.  fp_eval_pred memsets bits to 1
      * when n_children == 0, so the worker treats every row as a hit. */
     if (!pred_op) return 0;
-    int rc = fp_compile_pred_dag(g, pred_op, tbl, out);
+    int rc = fp_compile_pred_dag(g, pred_op, tbl, out, err);
     if (rc == 0 && out->n_children > 1)
         fp_pred_order_children(out);
     return rc;

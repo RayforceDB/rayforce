@@ -313,6 +313,64 @@ void rowsel_emit_segment(rowsel_builder_t* b, uint32_t seg,
     b->seg_off[seg + 1] = b->idx_len;
 }
 
+void rowsel_emit_uniform(rowsel_builder_t* b, uint32_t seg, uint8_t d, int64_t n) {
+    assert(seg < b->n_segs && "rowsel_emit_uniform: seg is not builder-local");
+    b->seg_off[seg] = b->idx_len;
+    /* rowsel_emit_segment's classification of n equal bools */
+    if (d && n > 0) { b->seg_flags[seg] = RAY_SEL_ALL; b->total_pass += n; }
+    else b->seg_flags[seg] = RAY_SEL_NONE;
+    b->seg_off[seg + 1] = b->idx_len;
+}
+
+void rowsel_emit_runs(rowsel_builder_t* b, uint32_t seg, const uint16_t* ends,
+                      const uint8_t* pass, uint32_t n_runs, int64_t n) {
+    assert(seg < b->n_segs && "rowsel_emit_runs: seg is not builder-local");
+    b->seg_off[seg] = b->idx_len;
+    uint32_t pc = 0, s0 = 0;
+    for (uint32_t r = 0; r < n_runs; r++) {
+        pc += pass[r] ? (uint32_t)ends[r] - s0 : 0;
+        s0 = ends[r];
+    }
+    b->total_pass += pc;
+    /* rowsel_emit_segment's NONE / ALL / MIX classification */
+    if (pc == 0) {
+        b->seg_flags[seg] = RAY_SEL_NONE;
+    } else if ((int64_t)pc == n) {
+        b->seg_flags[seg] = RAY_SEL_ALL;
+    } else {
+        b->seg_flags[seg] = RAY_SEL_MIX;
+        /* room for pc indices plus one 16-index store past them (below) */
+        if (b->idx_len + pc + 16 > b->idx_cap) {
+            uint32_t newcap = b->idx_cap ? b->idx_cap : 8u;
+            while (newcap < b->idx_len + pc + 16) newcap *= 2u;
+            b->idx = (uint16_t*)ray_realloc_raw(b->idx, (size_t)newcap * sizeof(uint16_t));
+            b->idx_cap = newcap;
+        }
+        /* a passing run's indices in fixed 16-index stores: the indices a
+         * store writes past the run are overwritten by the next passing
+         * run's (out advances by the run's length only), and the last
+         * store's tail lies past idx_len, inside the capacity reserved
+         * above, where nothing reads it */
+        typedef uint16_t idx16_t __attribute__((vector_size(32)));
+        const idx16_t iota = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        uint16_t* out = b->idx + b->idx_len;
+        s0 = 0;
+        for (uint32_t r = 0; r < n_runs; r++) {
+            const uint32_t e = ends[r];
+            if (pass[r]) {
+                for (uint32_t i = s0; i < e; i += 16) {
+                    const idx16_t v = iota + (uint16_t)i;
+                    memcpy(out + (i - s0), &v, sizeof v);
+                }
+                out += e - s0;
+            }
+            s0 = e;
+        }
+        b->idx_len += pc;
+    }
+    b->seg_off[seg + 1] = b->idx_len;
+}
+
 ray_t* rowsel_builder_finish(rowsel_builder_t* builders, uint32_t n_workers,
                              int64_t nrows) {
     int64_t total_pass = 0;
@@ -689,6 +747,59 @@ ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b) {
                 }
                 of[s] = count == 0 ? RAY_SEL_NONE : RAY_SEL_MIX;
             }
+        }
+    }
+    oo[ns] = cum;
+    return out;
+}
+
+ray_t* ray_rowsel_head(ray_t* sel, int64_t limit) {
+    if (!sel) return NULL;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    const uint8_t* fl = ray_rowsel_flags(sel);
+    const uint32_t* off = ray_rowsel_offsets(sel);
+    const uint16_t* ix = ray_rowsel_idx(sel);
+    uint32_t ns = m->n_segs;
+    if (limit < 0) limit = 0;
+    if (limit > m->total_pass) limit = m->total_pass;
+
+    /* Segments [0, whole) are kept as they are; cut_n rows of segment
+     * `whole` finish the head. */
+    uint32_t whole = 0;
+    int64_t kept = 0, cut_n = 0, idx_count = 0;
+    for (; whole < ns && kept < limit; whole++) {
+        int64_t ss = (int64_t)whole * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > m->nrows) se = m->nrows;
+        int64_t pc = fl[whole] == RAY_SEL_NONE ? 0
+                   : fl[whole] == RAY_SEL_ALL  ? se - ss
+                   : (int64_t)(off[whole + 1] - off[whole]);
+        if (kept + pc > limit) { cut_n = limit - kept; idx_count += cut_n; break; }
+        kept += pc;
+        if (fl[whole] == RAY_SEL_MIX) idx_count += pc;
+    }
+
+    ray_t* out = ray_rowsel_new(m->nrows, limit, idx_count);
+    if (!out) return NULL;
+    uint8_t* of = ray_rowsel_flags(out);
+    uint32_t* oo = ray_rowsel_offsets(out);
+    uint16_t* oi = ray_rowsel_idx(out);
+    uint32_t cum = 0;
+    for (uint32_t s = 0; s < ns; s++) {
+        oo[s] = cum;
+        if (s < whole) {
+            of[s] = fl[s];
+            if (fl[s] == RAY_SEL_MIX) {
+                uint32_t pc = off[s + 1] - off[s];
+                memcpy(oi + cum, ix + off[s], pc * sizeof(uint16_t));
+                cum += pc;
+            }
+        } else if (s == whole && cut_n > 0) {
+            of[s] = RAY_SEL_MIX;
+            for (int64_t i = 0; i < cut_n; i++)
+                oi[cum++] = fl[s] == RAY_SEL_ALL ? (uint16_t)i : ix[off[s] + i];
+        } else {
+            of[s] = RAY_SEL_NONE;
         }
     }
     oo[ns] = cum;

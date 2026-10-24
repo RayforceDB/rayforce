@@ -47,7 +47,7 @@ Key design decisions:
 - **32-byte alignment** — nodes are allocated from a contiguous array in the `ray_graph_t`, keeping the DAG hot in L1 cache during optimization walks.
 - **At most 2 inputs** — binary operations use both; unary ops use `inputs[0]` only; sources have both NULL.
 - **Flags** — `OP_FLAG_DEAD` marks nodes removed by DCE.
-- **est_rows** — populated by the type inference pass and used by filter reorder and join planning.
+- **est_rows** — an advisory row-count estimate populated by type inference. It is not the selectivity key used by the current filter-reorder pass.
 
 ### ray_op_ext_t — Extended Node
 
@@ -115,7 +115,11 @@ Pushes `OP_FILTER` nodes closer to data sources by walking the DAG up to four ti
 
 ### 7. Filter Reorder
 
-When multiple filter predicates are chained, reorders them by estimated selectivity (most selective first). Uses the `est_rows` from type inference to estimate selectivity. More selective filters run first, reducing the number of rows processed by subsequent filters.
+Splits and reorders only predicates whose complete resolved expression trees are proved invariant under an order-preserving restriction of the same default-source rows. Both the query front end's AND constructor and the optimizer apply this check before turning a conjunction into sequential filters. An aggregate or running expression cannot acquire an earlier conjunct's survivors as its input merely because that conjunct was cheaper. This is distinct from a final SELECT aggregate, which legitimately consumes the rows selected by WHERE.
+
+The proof checks scalar/row shapes, source identity and hidden operands, not merely whether a predicate contains a scan or produces a scalar. General captured row vectors are refused; fixed typed membership sets have a separate operand role. Unsupported shapes and the bounded analysis limits (4096 graph nodes, depth64) decline the optimization, not the language expression. An unproved predicate is a reorder barrier. Established input/default-table correspondence and the existing GROUP, pushed-filter and shared-consumer restrictions are still required; this expression proof alone does not justify arbitrary structural-input or no-compaction rewrites. It proves value invariance, not general exception or OOM ordering equivalence.
+
+Within an eligible run, static selectivity classes derived from opcode, operand type and constant presence dominate a coarse per-row cost score. Wide constant equality/membership is ranked ahead of neutral shapes; neutral predicates are ordered by cost. SYM equality remains neutral because the logical type alone does not reveal dictionary cardinality. These are static heuristics, not measured selectivities or an `est_rows`-based cost model.
 
 ### 8. Projection Pushdown
 
@@ -165,7 +169,7 @@ Element-wise operation subtrees are compiled to flat bytecode at **execution tim
 - **Registers**: up to 16 slots (`EXPR_MAX_REGS`), each holding a typed lane — `REG_SCAN` (column slice), `REG_CONST` (broadcast scalar), or `REG_SCRATCH` (computed intermediate).
 - **Instructions**: up to 48 opcodes (`EXPR_MAX_INS`) covering arithmetic, comparisons, casts, and logical operations.
 - **Morsel evaluation**: the compiled program is evaluated one morsel at a time (1024 rows) in per-worker, arena-allocated scratch buffers. No full-length intermediate vectors are materialized.
-- **Parallelism**: subtrees covering ≥ 65,536 rows (`RAY_PARALLEL_THRESHOLD`) are dispatched across worker threads, each thread processing its own morsel slice independently.
+- **Parallelism**: eligible compiled subtrees can dispatch data-parallel ranges across worker threads, each processing its own morsel slice. A common minimum is 65,536 rows (`RAY_PARALLEL_THRESHOLD`); the chosen operator, available workers and dispatch-safety guards also determine whether work runs in parallel. This does not parallelize arbitrary Rayfall callbacks.
 - **Parted-segment aware**: for partitioned tables, column pointers are rebound per segment at evaluation time — zero-copy, no gather.
 
 **Null handling.** Nullable integer columns are sentinel-normalized at morsel load: `NULL_I32`/`NULL_I16` are widened to `NULL_I64` in `i64` lanes, or to `NaN` in `f64` lanes. Per-instruction null-aware kernel variants are selected at compile time (sentinel-checking `i64` arithmetic and comparisons, sentinel-mapping casts). F64 `NaN`-nulls propagate through arithmetic natively. Output vectors carry `RAY_ATTR_HAS_NULLS` conservatively. Null-free programs compile to the identical instruction stream as non-nullable inputs — no null checks on the fast path.
@@ -199,9 +203,13 @@ This three-tier scheme means that fully-passing or fully-failing morsels (which 
 
 ### Thread Pool
 
-Rayforce uses a global thread pool (`ray_pool_t`) for parallel execution. Queries with more than `RAY_PARALLEL_THRESHOLD` (64 * 1024 = 65,536) elements are dispatched across worker threads. Each thread processes `RAY_DISPATCH_MORSELS` (8) morsels at a time to amortize scheduling overhead.
+Rayforce uses a global thread pool (`ray_pool_t`) for eligible vector builtins and query operators. Many kernels use `RAY_PARALLEL_THRESHOLD` (64 * 1024 = 65,536) elements as a minimum and batch `RAY_DISPATCH_MORSELS` (8) morsels to amortize scheduling overhead. Eligibility and dispatch geometry are operator-specific; worker availability and safety guards (including avoiding nested dispatch) can keep work serial even above a size threshold.
+
+This is **kernel parallelism**, not automatic parallel evaluation of language functions. `map` and `pmap` currently invoke their callbacks sequentially on the caller's VM; `pmap` is an alias for `map`. A builtin or query inside a callback may itself use eligible parallel kernels. Increasing `-c` does not turn an interpreted parameter sweep into concurrent lambda calls. See [Higher-order functions](../language/math.md#pmap-f-x) and [Multiple Instances](../guides/instances.md).
 
 Each dispatch splits its tasks into one contiguous range per worker (the main thread included); a worker runs its range in order and, once it is empty, steals half of another worker's remaining range from the tail, so an idle thread never waits on a busy one and the rows a worker touches are sequential. Tasks of one dispatch may therefore run in any order and on any worker: operators place results by task index, and any early stop (a `take:` cutoff, a top-N bound) is derived from row positions or values, never from "the earlier tasks have run". The scheduler is selected once at pool creation (`RAY_POOL_STEAL`, default `1`; `0` restores the shared claim cursor for A/B comparison) and `RAY_POOL_TRACE=1` prints the own-versus-stolen task histogram per worker to stderr at pool destroy; see [REPL Reference](../language/repl.md#environment-variables).
+
+The default pool has one thread per CPU of the process affinity mask (Linux; the online CPU count elsewhere), or per CPU of a cgroup CPU quota, rounded up, when that is smaller. Threads are not tied to CPUs: the scheduler places them within the mask.
 
 ### Radix-Partitioned Hash Join
 

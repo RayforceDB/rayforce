@@ -1,0 +1,86 @@
+;; Signed nanosecond duration literals and full-width readback.
+(type 1D) -- 'timespan
+(type [1D 0D01:00:00]) -- 'TIMESPAN
+(as 'I64 1D) -- 86400000000000
+(as 'I64 -0D00:00:00.000000001) -- -1
+(as 'I64 0D00:00:00.5) -- 500000000
+(format "%" -0D00:00:01) -- "-0D00:00:01.000000000"
+(format "%" 1D) -- "1D00:00:00.000000000"
+(type 0Nn) -- 'timespan
+(nil? 0Nn) -- true
+(nil? [1D 0Nn]) -- [false true]
+(as 'I64 106751D23:47:16.854775807) -- 9223372036854775807
+(as 'I64 -106751D23:47:16.854775807) -- -9223372036854775807
+(eval (parse (format "%" [1D -0D00:00:00.000000001 0Nn]))) -- [1D -0D00:00:00.000000001 0Nn]
+(as 'I64 106752D) -- -9223371273709551616
+0D24:00:00 -- 1D
+(parse "0D00:60:00") !- domain
+(parse "0D00:00:60") !- domain
+(parse "1Dfoo") !- parse
+(as 'timespan "0D00:00:01.25") -- 0D00:00:01.25
+(as 'TIMESPAN [1 0Nl -1]) -- [0D00:00:00.000000001 0Nn -0D00:00:00.000000001]
+(as 'TIMESPAN 01:00:00.000) -- 0D01:00:00
+(as 'TIMESPAN [01:00:00.000 0Nt]) -- [0D01:00:00 0Nn]
+;; Timestamp differences and offsets preserve duration units.
+(- 2000.01.02D00:00:00.000000000 2000.01.01D00:00:00.000000000) -- 1D
+(+ 2000.01.01D00:00:00.000000000 1D) -- 2000.01.02D00:00:00.000000000
+(- 2000.01.02D00:00:00.000000000 1D) -- 2000.01.01D00:00:00.000000000
+(+ 1D 2000.01.01D00:00:00.000000000) -- 2000.01.02D00:00:00.000000000
+(+ 1D 1) -- 1D00:00:00.000000001
+(== 1D 86400000000000) -- true
+(* 0D00:00:01 3) -- 0D00:00:03
+(* 3 0D00:00:01) -- 0D00:00:03
+(div 0D00:00:03 2) -- 0D00:00:01.5
+(div 0D00:00:03 0D00:00:01) -- 0D00:00:00.000000003
+(/ 0D00:00:03 0D00:00:01) -- 3.0
+(% 0D00:00:03 0D00:00:01) !- type
+(* 1D 1D) !- type
+(div -0D00:00:00.000000001 2) -- -0D00:00:00.000000001
+(% -0D00:00:00.000000001 1000000000) -- 0D00:00:00.999999999
+(div 1D 0) -- 0Nn
+(+ 1D 0Nn) -- 0Nn
+(neg 1D) -- -1D
+(+ [1D 0Nn] 1D) -- [2D 0Nn]
+(* [1D 0D01:00:00] 2) -- [2D 0D02:00:00]
+(neg [1D -1D 0Nn]) -- [-1D 1D 0Nn]
+(xbar 2000.01.01D01:23:45.000000000 0D01:00:00) -- 2000.01.01D01:00:00.000000000
+(asc [1D -1D 0Nn 0D]) -- [0Nn -1D 0D 1D]
+(min [1D 0D01:00:00 0Nn]) -- 0D01:00:00
+(max [1D 0D01:00:00 0Nn]) -- 1D
+(sum [1D 1D 0Nn]) -- 2D
+(avg [0D00:00:00.000000001 0D00:00:00.000000003]) -- 2.0
+;; Typed storage and query routes must keep the duration tag.
+(de (ser [1D 0Nn -1D])) -- [1D 0Nn -1D]
+(type (de (ser 1D))) -- 'timespan
+(set T (table [s t] (list [1D 0D01:00:00 0Nn] [2000.01.01D00:00:00.000000000 2000.01.02D00:00:00.000000000 0Np])))
+(at (select {from:T y:(+ s 1D)}) 'y) -- [2D 1D01:00:00 0Nn]
+(at (select {from:T y:(- t 2000.01.01D00:00:00.000000000)}) 'y) -- [0D 1D 0Nn]
+(at (select {from:T y:(+ t s)}) 'y) -- [2000.01.02D00:00:00.000000000 2000.01.02D01:00:00.000000000 0Np]
+(at (select {from:T y:(div s 2)}) 'y) -- [0D12:00:00 0D00:30:00 0Nn]
+(count (select {from:T where:(> s 0) })) -- 2
+(type (take [1D 0Nn] 0)) -- 'TIMESPAN
+(first [1D 0Nn]) -- 1D
+(last [0Nn 1D]) -- 1D
+(lag [1D 2D]) -- [0Nn 1D]
+(count (distinct [1D 1D 0Nn 0Nn])) -- 2
+(count (inner-join [s] (table [s x] (list [1D 0D] [1 2])) (table [s y] (list [0D 1D] [3 4])))) -- 2
+(type (+ (as 'TIMESPAN []) 1)) -- 'TIMESPAN
+(type (/ (as 'TIMESPAN []) 1D)) -- 'F64
+(+ [1D] [1 2]) !- length
+(+ [0Nn 1D] [1D 0Nn]) -- [0Nn 0Nn]
+(+ [1D] 0.5) -- [86400000000000.5]
+(div [1D] [0D00:00:01]) -- [0D00:00:00.000086400]
+
+;; Mutation keeps duration payloads and rejects timestamp atoms.
+(set SP (table [k s] (list [1 2] [1D 2D])))
+(insert 'SP (list 3 3D)) -- 'SP
+(upsert 'SP 1 (list 2 0Nn)) -- 'SP
+(at SP 's) -- [1D 0Nn 3D]
+(upsert 'SP 1 (table [k s] (list [1 4] [-1D 4D]))) -- 'SP
+(at SP 's) -- [-1D 0Nn 3D 4D]
+(insert 'SP (list 5 2000.01.01D00:00:00.000000000)) !- type
+
+;; Bucket output uses the value column's physical width.
+(xbar (as 'I16 [1 3 5]) 0D00:00:00.000000002) -- [0 2 4]
+(xbar (as 'U8 [1 3 5]) 0D00:00:00.000000002) -- [0 2 4]
+(xbar (as 'F32 [1 3 5]) 0D00:00:00.000000002) -- [0.0 2.0 4.0]

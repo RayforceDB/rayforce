@@ -1,0 +1,26 @@
+;; @requires: posix (fixture cleanup via .sys.exec)
+;; #966: explicit result types, not just element-wise value equivalence.
+(.sys.exec "rm -rf /tmp/rfl_prior_symbol_storage") -- 0
+(set PS (as 'SYM (list "" "" "a" "a" "" "b")))
+(.db.splayed.set "/tmp/rfl_prior_symbol_storage/s/" (table [s] (list PS)))
+(set ST (.db.splayed.get "/tmp/rfl_prior_symbol_storage/s/"))
+(set SC (at ST 's))
+(type SC) -- 'SYM
+(type (prior == SC)) -- 'B8
+(type (prior != SC)) -- 'B8
+(prior == SC) -- [true true false true false false]
+(prior != SC) -- [false false true false true true]
+(where (prior == SC)) -- [0 1 3]
+(prior == (take SC -3)) -- [true false false]
+
+;; The equal a/a pair crosses the partition boundary.
+(.db.splayed.set "/tmp/rfl_prior_symbol_storage/p/2024.01.01/t/" (table [s] (list (take PS 3))))
+(.db.splayed.set "/tmp/rfl_prior_symbol_storage/p/2024.01.02/t/" (table [s] (list (take PS -3))))
+(set PT (.db.parted.get "/tmp/rfl_prior_symbol_storage/p/" 't))
+(set PC (at PT 's))
+(type PC) -- 'SYM
+(type (prior == PC)) -- 'B8
+(prior == PC) -- [true true false true false false]
+(prior != PC) -- [false false true false true true]
+(where (prior == PC)) -- [0 1 3]
+(.sys.exec "rm -rf /tmp/rfl_prior_symbol_storage") -- 0

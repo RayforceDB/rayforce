@@ -11,9 +11,9 @@ Process-level introspection (build, memory, host info) and command-style operati
 |---|---|---|---|
 | [`.sys.args`](#sys-args) | variadic | — | Command-line arguments as a typed dict. |
 | [`.sys.build`](#sys-build) | nullary | — | Version + build date as a dict. |
-| [`.sys.info`](#sys-info) | variadic | — | Host and process facts: cores, page size, total memory, pid, hostname. |
-| [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
-| [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
+| [`.sys.info`](#sys-info) | nullary | — | Host and process facts: cores, page size, total memory, pool size, pid, hostname. |
+| [`.sys.mem`](#sys-mem) | nullary | — | Allocator statistics. |
+| [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
 | [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
@@ -39,7 +39,7 @@ Signature: `(.sys.args)`. Returns the process's command-line arguments as a dict
 | `source` | str | — | The file currently being evaluated: the innermost `load`, or the command-line script, by the path that was actually opened. Empty at the REPL, under a pipe, or in a hook or timer that runs outside any file. `file` is the script named on the command line (`$0`); `source` follows nested loads (`$BASH_SOURCE`). |
 | `user` | dict | after `--` | The application's own arguments. |
 
-The top-level schema is **stable** — every launcher key is always present with its effective value (the default when the flag wasn't passed), so `(get (.sys.args) 'port)` never misses. Auth passwords (`-u` / `-U`) are deliberately **not** exposed.
+The top-level schema is **stable** — every launcher key is always present with its effective value (the default when the flag wasn't passed), so `(get (.sys.args) 'port)` never misses. Auth passwords (`-u` / `-U`) and the RAM budget (`-m` / `--mem`) are deliberately **not** exposed; the effective budget is [`anon-watermark`](#sys-mem) in `(.sys.mem)`.
 
 ```lisp
 ;; load a sibling of the running file, whichever directory it was started from
@@ -75,12 +75,15 @@ Signature: `(.sys.build)`. Returns a dict with `version` (string) and `build-dat
 
 ## `.sys.info` { #sys-info }
 
-Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64, pid: i64, hostname: str}` on every platform (on Windows from `GetSystemInfo` / `GlobalMemoryStatusEx`).
+Signature: `(.sys.info)`. Returns `{cores: i64, page-size: i64, total-mem: i64, workers: i64, pid: i64, hostname: str}` on every platform (on Windows from `GetSystemInfo` / `GlobalMemoryStatusEx`).
+
+- `cores`: the CPUs this process may run on. On Linux that is its affinity mask, which `taskset`, a cpuset or `docker --cpuset-cpus` may narrow below the machine's CPU count.
+- `workers`: the threads of the execution pool, main included; before the pool exists, the size it will get. `.sys.info` does not create the pool (see [Running Several Instances](../guides/instances.md)).
 
 ```lisp
 (.sys.info)
 ;; => {cores: 10, page-size: 16384, total-mem: 68719476736,
-;;     pid: 48213, hostname: "tp-prod-01"}
+;;     workers: 10, pid: 48213, hostname: "tp-prod-01"}
 ```
 
 `pid` and `hostname` describe *this process*, not the machine, and exist so an
@@ -104,7 +107,8 @@ call — one unavailable field should not cost the caller the others.
 
 ## `.sys.mem` { #sys-mem }
 
-Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
+Signature: `(.sys.mem)`. Returns the allocator's running counters, the spill
+watermark, a few diagnostic counters and the symbol-table size, all `i64`:
 
 | Key | Meaning |
 |---|---|
@@ -116,19 +120,45 @@ Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
 | `sys-current` | **Committed RAM**: every anonymous mapping — the buddy pools (where all vectors live), sys allocations, and the swap-fallback pool. The true live-memory figure. |
 | `sys-mapped` | **File-backed** bytes currently mapped (splayed columns, the symbol file, CSV/script parse buffers). Page-cache, evictable, resident only on touch — kept separate from `sys-current` so a read-once column can't masquerade as live RAM. |
 | `sys-mapped-peak` | High-watermark of `sys-mapped`. |
+| `anon-committed` | **Anonymous RAM** the heap has committed: buddy pools, direct blocks and sys blocks (off-heap tables such as the symbol arenas). Spill-file mappings are not counted. The figure checked against `anon-watermark`. |
+| `anon-peak` | High-watermark of `anon-committed` since process start — the peak RAM the workload demanded, spill excluded. |
+| `anon-watermark` | **Spill threshold** in bytes: a new pool, direct or sys block that would push `anon-committed` past it is mapped over a disk spill file instead of anonymous RAM. Set by `-m SIZE` / `--mem SIZE`; by default the RAM limit (physical RAM, or the cgroup memory limit when smaller) less a quarter of it, at least 3 GiB and at most half, left to the page cache. |
+| `locked-bytes` | Bytes of the heap's mappings locked against swap-out (Linux): the mapped size, which is what `RLIMIT_MEMLOCK` counts, not the resident pages — a page is locked when it is first touched. At most the smaller of `anon-watermark` and half the RAM limit. |
+| `lock-failed` | Times the kernel refused a lock, or a page release could not lock its range again, since start. |
+| `lock-skipped` | Bytes, summed since start, that the heap mapped under the watermark but left unlocked: past the bound, past `RLIMIT_MEMLOCK`, or refused. The heap works on, unlocked. |
+| `group-perpart-runs` | Diagnostic: results served by the streaming parted `by:` (GROUP) kernel — one per query, not per partition; a run that falls back to the flatten path is not counted. |
+| `asof-perpart-runs` | Diagnostic: days processed by the streaming parted asof join — one per day in the union of both sides' partitions. |
+| `sort-perpart-runs` | Diagnostic: partitions processed by the streaming parted `asc:` / `desc:` paths (ordered concat of pre-sorted partitions, or per-partition top-k). |
+| `window-perpart-runs` | Diagnostic: segments processed by the streaming parted window path (the window's partition key includes the table's partition key). |
+| `join-perpart-runs` | Diagnostic: segments processed by the broadcast-streaming join (one side parted, each segment joined against the whole other side). |
+| `sym-count` | Entries in the global symbol table. |
+| `sym-bytes` | Bytes held by the symbol table's string arena (every interned name). |
 
 Every mapping — buddy pool or file — is counted exactly once through the VM
 wrapper layer, so `sys-current` reflects the real committed footprint (a large
-`til` shows up here, not as a flat few MB). There is **no enforced memory
-ceiling**: the heap is out-of-core and spills to a file-backed mapping when
-anonymous `mmap` is refused. Total physical RAM is reported separately by
-[`.sys.info`](#sys-info) as `total-mem`; compare it against
-`bytes-allocated + direct-bytes` to gauge how close a workload is to spilling.
+`til` shows up here, not as a flat few MB). `anon-watermark` is a **spill
+threshold, not a hard cap**: work past it is never rejected, it goes to a
+file-backed spill mapping (as it does when anonymous `mmap` is refused)
+instead of risking the OOM killer — see
+[out-of-core spill](../guides/memory.md#8-total-ram-and-out-of-core-spill).
+Compare `anon-committed` against `anon-watermark` to gauge how close a
+workload is to spilling; total physical RAM is reported separately by
+[`.sys.info`](#sys-info) as `total-mem`.
+
+The `*-perpart-runs` keys are monotonic diagnostic counters: a delta across a
+query shows whether a parted table was streamed partition by partition
+instead of flattened. `sym-count` / `sym-bytes` show whether a query left the
+symbol table where it found it.
 
 ```lisp
 (.sys.mem)
-;; => {alloc-count: 12345, bytes-allocated: 524288, peak-bytes: 2097152,
-;;     sys-current: 34754560, sys-mapped: 0, sys-mapped-peak: 0}
+;; => {alloc-count: 786, bytes-allocated: 28672, direct-bytes: 0,
+;;     peak-bytes: 28672, slab-hits: 354, sys-current: 34836480,
+;;     sys-mapped: 0, sys-mapped-peak: 0, anon-committed: 34795520,
+;;     anon-peak: 34799616, anon-watermark: 50178081792,
+;;     group-perpart-runs: 0, asof-perpart-runs: 0, sort-perpart-runs: 0,
+;;     window-perpart-runs: 0, join-perpart-runs: 0,
+;;     sym-count: 424, sym-bytes: 30336}
 ```
 
 ## `.sys.prof` { #sys-prof }

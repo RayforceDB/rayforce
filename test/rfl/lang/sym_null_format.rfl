@@ -1,0 +1,21 @@
+;; The empty symbol ' is SYM's null.  It prints as ' wherever it appears, a
+;; vector cell included, so the printed form reads back as the same value.
+;; A vector cell used to print as `null`, which reads back as the symbol
+;; `null`, a different, non-null value (#871).
+
+(format "%" ') -- "'"
+(format "%" [A ' B]) -- "[A ' B]"
+(format "%" [' ' ']) -- "[' ' ']"
+(format "%" (list [A ' B] 1)) -- "(list [A ' B] 1)"
+(format "%" (dict [A B] [' X])) -- "{A:' B:X}"
+(format "%" (dict [' A] [1 2])) -- "{':1 A:2}"
+(format "%" (take ' 2)) -- "[' ']"
+
+;; round trip: the printed cell parses back as the null
+(nil? [A ' B]) -- [false true false]
+(nil? (eval (parse (format "%" [A ' B])))) -- [false true false]
+(== [A ' B] (eval (parse (format "%" [A ' B])))) -- [true true true]
+
+;; the symbol `null` is an ordinary, non-null symbol and prints as itself
+(nil? [A null B]) -- [false false false]
+(format "%" [A null B]) -- "[A null B]"

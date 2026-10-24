@@ -212,16 +212,18 @@
 ;;     whose div/mod post-pass marks the zero-divisor row null (lines
 ;;     ~2142-2153, the !r_scalar I64 b[i]==0 -> ray_vec_set_null arm).
 ;;     `%` lowers to OP_MOD, which DOES fuse -> expr_exec_binary I64
-;;     OP_MOD b[j]==0 guard writes 0 (no fused null post-pass).
+;;     OP_MOD b[j]==0 guard writes the null sentinel, as the builtin
+;;     (% (at Tdz 'a) (at Tdz 'z)) does, and the output scan flags it.
 ;;     z has a zero in the middle row.
 ;; ====================================================================
 (set Tdz (table [a z] (list [10 20 30 40] [2 0 5 4])))
 ;; div (non-fused, OP_IDIV) -> zero-divisor row is NULL.
 (at (select {r: (div a z) from: Tdz}) 'r) -- [5 0Nl 6 10]
 (nil? (at (at (select {r: (div a z) from: Tdz}) 'r) 1)) -- true
-;; mod (fused, OP_MOD) -> zero-divisor row is 0, not null.
-(at (select {r: (% a z) from: Tdz}) 'r) -- [0 0 0 0]
-(nil? (at (at (select {r: (% a z) from: Tdz}) 'r) 1)) -- false
+;; mod (fused, OP_MOD) -> zero-divisor row is NULL too.
+(at (select {r: (% a z) from: Tdz}) 'r) -- [0 0Nl 0 0]
+(at (select {r: (% a z) from: Tdz}) 'r) -- (% (at Tdz 'a) (at Tdz 'z))
+(nil? (at (at (select {r: (% a z) from: Tdz}) 'r) 1)) -- true
 
 ;; ====================================================================
 ;; 12. Fused F64 -> I64 CAST out-of-range clamp (expr_exec_unary dt=I64,

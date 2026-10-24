@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* CPU_SET / sched_setaffinity: the CPU-set sizing test */
+#endif
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -1110,34 +1113,73 @@ static test_result_t test_dispatch_n_max_ring_cap_clamp(void) {
 
 /* --------------------------------------------------------------------------
  * Test: ray_pool_dispatch with total_elems large enough that n_tasks would
- * exceed MAX_RING_CAP, exercising the post-growth clamp on lines 246-249
- * (rebalances grain so all elements still get covered).
+ * exceed MAX_RING_CAP: the ring stops growing at the ceiling and the tasks
+ * past it run in a further round of the SAME grain (a widened grain would
+ * move task starts off the TASK_GRAIN boundaries callers index by).
  *
  * total_elems = 70000 * TASK_GRAIN (= 70000 * 8192 = 573M).  We pass a
- * no-op fn so the cost is just the dispatch overhead — even at 65536
- * tasks we're under a second.
+ * no-op fn so the cost is just the dispatch overhead.
  * -------------------------------------------------------------------------- */
 
-static test_result_t test_dispatch_max_ring_cap_clamp(void) {
+static test_result_t test_dispatch_max_ring_rounds(void) {
     ray_heap_init();
 
     ray_pool_t pool;
     TEST_ASSERT_EQ_I(ray_pool_create(&pool, 1), RAY_OK);
 
     pool_count_ctx_t ctx = {0};
-    /* TASK_GRAIN = 8 * 1024 = 8192.  70000 * 8192 = 573_440_000 elements,
-     * which would naively want 70000 tasks. After clamp → 65536 tasks with
-     * a slightly larger grain so total_elems is still fully covered. */
+    /* TASK_GRAIN = 8 * 1024 = 8192.  70000 * 8192 = 573_440_000 elements
+     * want 70000 tasks: 65536 in the first round, 4464 in the second. */
     int64_t grain = 8192;
     int64_t total = 70000LL * grain;
     ray_pool_dispatch(&pool, pool_count_fn, &ctx, total);
 
     /* Ring should grow to MAX_RING_CAP and stop there */
     TEST_ASSERT_EQ_U(pool.task_cap, 65536u);
-    /* Calls clamped to MAX_RING_CAP */
-    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 65536);
-    /* All elements covered (grain rebalanced) */
+    /* One call per TASK_GRAIN, none dropped or widened */
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 70000);
+    /* All elements covered */
     TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), total);
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: a cancelled multi-round dispatch stops at the round boundary.
+ *
+ * Every ticket of a cancelled window is skipped, so the rounds past the
+ * cancel point would be pure publish/wake/skip overhead (over a hundred
+ * rounds when the ring is stuck at RAY_POOL_INIT_TASKS).  The round loop
+ * checks the flag before each round: with it set at entry no window is
+ * published at all, so the ticket high-water mark does not move and fn
+ * never runs.  Covers both ray_pool_dispatch and ray_pool_dispatch_n.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_dispatch_cancelled_skips_rounds(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 1), RAY_OK);
+
+    pool_count_ctx_t ctx = {0};
+    uint64_t limit0 = atomic_load(&pool.task_limit);
+    atomic_store(&pool.cancelled, 1);
+
+    ray_pool_dispatch(&pool, pool_count_fn, &ctx, 70000LL * 8192);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 0);
+    TEST_ASSERT_EQ_U(atomic_load(&pool.task_limit), limit0);
+
+    ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, 70000u);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 0);
+    TEST_ASSERT_EQ_U(atomic_load(&pool.task_limit), limit0);
+
+    /* Cleared again, the same dispatch runs every task once. */
+    atomic_store(&pool.cancelled, 0);
+    ray_pool_dispatch(&pool, pool_count_fn, &ctx, 70000LL * 8192);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 70000);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), 70000LL * 8192);
 
     ray_pool_free(&pool);
     ray_heap_destroy();
@@ -1260,6 +1302,7 @@ static _Atomic(uint32_t) pool_once_hits[POOL_ONCE_MAX];   /* per-ticket hit coun
 
 typedef struct {
     int64_t  grain;              /* elements per ticket: 1 (dispatch_n) or TASK_GRAIN */
+    int64_t  total;              /* elements in the window (last ticket may be short) */
     uint32_t n;                  /* tickets in the window */
     uint32_t block;              /* ticket that waits for every other one; UINT32_MAX = none */
     _Atomic(uint32_t) done;      /* tickets finished */
@@ -1279,15 +1322,20 @@ static void pool_once_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
      * other ticket done), never on a timer. */
     if (t == c->block)
         while (atomic_load_explicit(&c->done, memory_order_acquire) + 1 < c->n) RAY_CPU_RELAX();
-    if (t < POOL_ONCE_MAX && end - start <= c->grain)
+    /* A ticket counts only as its exact range [t*grain, min((t+1)*grain,
+     * total)): callers index per-task state by start / TASK_GRAIN (fused
+     * WHERE rowsel builders, per-task histograms) and rely on it. */
+    int64_t want_end = start + c->grain < c->total ? start + c->grain : c->total;
+    if (t < POOL_ONCE_MAX && start % c->grain == 0 && end == want_end)
         atomic_fetch_add_explicit(&pool_once_hits[t], 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&c->done, 1, memory_order_release);
 }
 
-static void pool_once_reset(pool_once_ctx_t* c, uint32_t n, int64_t grain) {
+static void pool_once_reset(pool_once_ctx_t* c, uint32_t n, int64_t grain, int64_t total) {
     for (uint32_t t = 0; t < n; t++)
         atomic_store_explicit(&pool_once_hits[t], 0, memory_order_relaxed);
     c->grain = grain;
+    c->total = total;
     c->n = n;
     atomic_store_explicit(&c->done, 0, memory_order_relaxed);
 }
@@ -1303,8 +1351,10 @@ static int64_t pool_once_bad(uint32_t n) {
  * and the cross-dispatch invariant (window fully claimed: cursors equal). */
 static test_result_t pool_once_window(ray_pool_t* pool, pool_once_ctx_t* c, uint32_t n,
                                       bool elem_form, uint64_t* tickets) {
-    pool_once_reset(c, n, elem_form ? POOL_ONCE_GRAIN : 1);
-    if (elem_form) ray_pool_dispatch(pool, pool_once_fn, c, (int64_t)n * POOL_ONCE_GRAIN);
+    /* element windows end ragged on every third shape (short last ticket) */
+    int64_t total = elem_form ? (int64_t)n * POOL_ONCE_GRAIN - (int64_t)(n % 3) * 1000 : n;
+    pool_once_reset(c, n, elem_form ? POOL_ONCE_GRAIN : 1, total);
+    if (elem_form) ray_pool_dispatch(pool, pool_once_fn, c, total);
     else           ray_pool_dispatch_n(pool, pool_once_fn, c, n);
     *tickets += n;
     TEST_ASSERT_EQ_U(atomic_load(&c->done), n);
@@ -1345,8 +1395,11 @@ static test_result_t pool_once_battery(ray_pool_t* pool) {
         POOL_ONCE_RUN(pool, &c, 1000, true, &tickets);
     }
 
-    /* more tasks than the ring can ever hold: several dispatch_n rounds */
+    /* more tasks than the ring can ever hold: several rounds through both
+     * entry points.  An element dispatch must still hand out whole
+     * TASK_GRAIN tickets, never a re-derived wider grain (#792). */
     POOL_ONCE_RUN(pool, &c, POOL_ONCE_MAX, false, &tickets);
+    POOL_ONCE_RUN(pool, &c, POOL_ONCE_MAX, true, &tickets);
 
     /* Accounting: in steal mode every ticket was claimed from an own range
      * or stolen, nothing else; the cursor path never touches the counters. */
@@ -1709,7 +1762,7 @@ static test_result_t test_epoll_hup_no_errfn(void) {
      * Only a write to the pipe — no selector-array mutation from here. */
     if (have_wake) {
         char b = 'x';
-        (void)write(wake_pipe[1], &b, 1);
+        if (write(wake_pipe[1], &b, 1) != 1) { /* the loop then exits on its timeout */ }
         epoll_sleep_ms(30);
         close(wake_pipe[1]);
         /* wake_pipe[0] is owned by the poll selector; destroy will clean it */
@@ -1742,7 +1795,97 @@ static test_result_t test_auto_all_logical_cpus(void) {
     if (rc == RAY_OK) ray_pool_free(&local);
     if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
     TEST_ASSERT_EQ_I(rc, RAY_OK);
-    TEST_ASSERT_EQ_I(total, ray_thread_count());
+    /* every CPU the process may run on (taskset or a cpuset narrows the
+     * set on Linux), or fewer under a cgroup CPU quota (millicpus) */
+    int expect = (int)ray_cpu_set_count();
+    int64_t quota = ray_os_cgroup_cpu_quota();
+    if (quota > 0 && (quota + 999) / 1000 < expect) expect = (int)((quota + 999) / 1000);
+    TEST_ASSERT_EQ_I(total, expect);
+    PASS();
+}
+#endif
+
+#if defined(__linux__)
+/* "cores workers" from a child rayforce run under `prefix`, or false. */
+static bool cq_child(const char* prefix, const char* script, long* cores, long* workers) {
+    char cmd[512], out[512];
+    snprintf(cmd, sizeof(cmd), "env -u RAYFORCE_CORES %s ./rayforce -f %s 2>/dev/null", prefix, script);
+    FILE* p = popen(cmd, "r");
+    if (!p) return false;
+    size_t n = fread(out, 1, sizeof(out) - 1, p);
+    out[n] = 0;
+    if (pclose(p) != 0) return false;
+    while (n && (out[n - 1] == '\n' || out[n - 1] == ' ')) out[--n] = 0;
+    char* last = strrchr(out, '\n');
+    return sscanf(last ? last + 1 : out, "%ld %ld", cores, workers) == 2;
+}
+#endif
+
+/* A child under a CPU quota of 1.5 CPUs (a systemd user scope, as docker
+ * --cpus would set) sizes its default pool to 2 threads, or fewer when a
+ * quota above the scope is tighter: the same child in a scope without a
+ * quota gives that bound.  cores still counts every allowed CPU.  Skipped
+ * where no systemd user manager makes scopes, and without ./rayforce (the
+ * TSan job builds only the test binary). */
+static test_result_t test_cpu_quota_child(void) {
+#if !defined(__linux__)
+    SKIP("cgroup CPU quotas are Linux-only");
+#else
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    if (system("command -v systemd-run >/dev/null 2>&1 && "
+               "systemd-run --user --scope -q true >/dev/null 2>&1") != 0)
+        SKIP("no systemd user manager to make a scope with a CPU quota");
+    char script[128];
+    snprintf(script, sizeof(script), "/tmp/rayforce_cq_%d.rfl", (int)getpid());
+    FILE* f = fopen(script, "w");
+    TEST_ASSERT_TRUE(f != NULL);
+    fputs("(set i (.sys.info))\n(println (format \"% %\" (at i 'cores) (at i 'workers)))\n", f);
+    fclose(f);
+    long c0 = 0, w0 = 0, c1 = 0, w1 = 0;
+    bool ok0 = cq_child("systemd-run --user --scope -q", script, &c0, &w0);
+    bool ok1 = cq_child("systemd-run --user --scope -q -p CPUQuota=150%", script, &c1, &w1);
+    unlink(script);
+    TEST_ASSERT_TRUE(ok0);
+    TEST_ASSERT_TRUE(ok1);
+    TEST_ASSERT_EQ_I(c1, c0);
+    TEST_ASSERT_EQ_I(w1, w0 < 2 ? w0 : 2);
+    PASS();
+#endif
+}
+
+#if defined(__linux__)
+#include <sched.h>
+/* The default pool follows the CPUs the process may run on: with the
+ * calling thread narrowed to two of them (as taskset does for a process),
+ * a default pool has two threads, main included.  Under a cgroup CPU quota
+ * of less than two CPUs it has fewer. */
+static test_result_t test_auto_follows_cpu_set(void) {
+    cpu_set_t before, two;
+    CPU_ZERO(&before);
+    if (sched_getaffinity(0, sizeof(before), &before) != 0)
+        SKIP("the kernel's CPU mask is wider than a cpu_set_t: no fixed-size snapshot");
+    if (CPU_COUNT(&before) < 3) SKIP("needs at least 3 CPUs");
+    CPU_ZERO(&two);
+    for (int c = 0, k = 0; c < CPU_SETSIZE && k < 2; c++)
+        if (CPU_ISSET(c, &before)) { CPU_SET(c, &two); k++; }
+    const char* current = getenv("RAYFORCE_CORES");
+    char* saved = current ? strdup(current) : NULL;
+    TEST_ASSERT_TRUE(!current || saved);
+    unsetenv("RAYFORCE_CORES");
+    int set_rc = sched_setaffinity(0, sizeof(two), &two);
+    uint32_t seen = ray_cpu_set_count();
+    ray_pool_t local;
+    ray_err_t rc = set_rc == 0 ? ray_pool_create(&local, 0) : RAY_ERR_IO;
+    uint32_t total = rc == RAY_OK ? ray_pool_total_workers(&local) : 0;
+    if (rc == RAY_OK) ray_pool_free(&local);
+    (void)sched_setaffinity(0, sizeof(before), &before);
+    if (saved) { setenv("RAYFORCE_CORES", saved, 1); free(saved); }
+    TEST_ASSERT_EQ_I(set_rc, 0);
+    TEST_ASSERT_EQ_I(seen, 2);
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    int64_t quota = ray_os_cgroup_cpu_quota();
+    int expect = (quota > 0 && (quota + 999) / 1000 < 2) ? 1 : 2;
+    TEST_ASSERT_EQ_I(total, expect);
     PASS();
 }
 #endif
@@ -1848,10 +1991,17 @@ static void pf_walk_gaps(void* ctx, uint32_t w, int64_t s, int64_t e) {
     }
 }
 
+/* The file's length, not 0 ("to the end"): Linux 5.4 computes the pages a
+ * whole-file FADV_DONTNEED covers as end - start + 1 with end = ~0, which
+ * wraps to 0, so it never sees that pages were left and never drains the
+ * other CPUs' LRU caches to drop them — the last pages each worker brought
+ * in (up to a pagevec, 15, per CPU) stay cached. */
 static bool pf_evict_one(const char* path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
-    bool ok = fdatasync(fd) == 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && fdatasync(fd) == 0 &&
+              posix_fadvise(fd, 0, st.st_size, POSIX_FADV_DONTNEED) == 0;
     close(fd);
     return ok;
 }
@@ -1870,6 +2020,13 @@ static bool pf_none_resident(const uint8_t* p, size_t n) {
     for (size_t off = 0; off < n; off += n / 16)
         if (ray_vm_resident(p + off, 4096)) return false;
     return true;
+}
+
+/* Resident pages of [p, p+n), probed one by one. */
+static int64_t pf_resident_pages(const uint8_t* p, size_t n) {
+    int64_t k = 0;
+    for (size_t off = 0; off < n; off += 4096) k += ray_vm_resident(p + off, 1);
+    return k;
 }
 
 /* Pages this process has read stay mapped and are not evicted: drop both
@@ -1899,14 +2056,8 @@ static bool pf_reset(uint8_t** base, size_t* size, uint8_t** bbase, size_t* bsiz
     if (!*base || !*bbase) return false;
     scan->base[0] = *base;
     scan->base[1] = *bbase;
-    return pf_none_resident(*base, *size) && pf_none_resident(*bbase, *bsize);
-}
-
-/* Resident pages of [p, p+n), probed one by one. */
-static int64_t pf_resident_pages(const uint8_t* p, size_t n) {
-    int64_t k = 0;
-    for (size_t off = 0; off < n; off += 4096) k += ray_vm_resident(p + off, 1);
-    return k;
+    /* Every page: what an eviction leaves is a few pages here and there. */
+    return !pf_resident_pages(*base, *size) && !pf_resident_pages(*bbase, *bsize);
 }
 
 /* Bounded wait (~10 s) for `want` pages of [p, p+n) to be resident. */
@@ -2253,8 +2404,10 @@ static int pq_open_cold(const char* name, const uint8_t** p, size_t* n) {
     ray_release(col);   /* M holds it */
     uintptr_t a = (uintptr_t)*p & ~(uintptr_t)4095;
     posix_madvise((void*)a, (uintptr_t)*p + *n - a, POSIX_MADV_RANDOM);
-    /* Opening reads the header, and the kernel the pages after it. */
-    return pf_none_resident(*p + (512 << 10), *n - (512 << 10)) ? 0 : 1;
+    /* Opening reads the header, and the kernel the pages after it, and the
+     * last pages of the file.  Every page between is probed: an eviction
+     * that falls short leaves a few pages here and there. */
+    return pf_resident_pages(*p + (512 << 10), *n - (1024 << 10)) ? 1 : 0;
 }
 
 static long pq_majflt(void) {
@@ -2403,6 +2556,10 @@ const test_entry_t pool_entries[] = {
 #if defined(__linux__) || defined(__APPLE__)
     { "pool/auto_all_logical_cpus", test_auto_all_logical_cpus, NULL, NULL },
 #endif
+#if defined(__linux__)
+    { "pool/auto_follows_cpu_set",  test_auto_follows_cpu_set,  NULL, NULL },
+#endif
+    { "pool/cpu_quota_child",       test_cpu_quota_child,       NULL, NULL },
     { "pool/parallel_sum", test_parallel_sum, NULL, NULL },
     { "pool/dispatch_reclaims_worker_blocks", test_dispatch_reclaims_worker_blocks, NULL, NULL },
     { "pool/parallel_add", test_parallel_add, NULL, NULL },
@@ -2431,7 +2588,8 @@ const test_entry_t pool_entries[] = {
     { "pool/ray_cancel_global",     test_ray_cancel_global,     NULL, NULL },
     { "pool/workers_participate",   test_dispatch_workers_participate, NULL, NULL },
     { "pool/dispatch_n_max_ring",   test_dispatch_n_max_ring_cap_clamp, NULL, NULL },
-    { "pool/dispatch_max_ring",     test_dispatch_max_ring_cap_clamp, NULL, NULL },
+    { "pool/dispatch_max_ring",     test_dispatch_max_ring_rounds, NULL, NULL },
+    { "pool/dispatch_cancel_rounds", test_dispatch_cancelled_skips_rounds, NULL, NULL },
     { "pool/destroy_when_uninit",   test_destroy_when_uninit,   NULL, NULL },
     { "pool/dispatch_n_multi_grow", test_dispatch_n_multi_grow, NULL, NULL },
     { "pool/dispatch_n_exact_cap",  test_dispatch_n_exact_cap,  NULL, NULL },

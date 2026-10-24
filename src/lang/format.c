@@ -21,8 +21,11 @@
  *   SOFTWARE.
  */
 
+#include "ops/colgather.h"   /* fmt_enc_window: the shown rows of an encoded column */
+#include "core/timespan.h"
 #include "lang/format.h"
 #include "lang/env.h"
+#include "table/table.h"
 #include "table/sym.h"
 #include "lang/eval.h"
 #include "ops/ops.h"    /* RAY_LAZY, ray_lazy_materialize */
@@ -52,6 +55,8 @@ typedef struct {
                          * appended (mode 2) */
     bool    io_err;     /* err was a failed write to sink */
     bool    flushed;    /* some output already reached sink */
+    char    cause_code[16];   /* code of the error that stopped a column from loading */
+    char    cause_msg[192];   /* its detail (names the column file) */
 } fmt_buf_t;
 
 #define FMT_SINK_FLUSH ((int64_t)1 << 20)
@@ -71,6 +76,8 @@ static void fmt_init(fmt_buf_t* b) {
     b->sink    = NULL;
     b->io_err  = false;
     b->flushed = false;
+    b->cause_code[0] = '\0';
+    b->cause_msg[0]  = '\0';
     b->block   = ray_alloc(256);
     if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
         b->err = true; b->err_msg = "cannot allocate the initial output buffer";
@@ -184,7 +191,9 @@ static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
     if (b->err) {
-        ray_t* e = ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
+        ray_t* e = b->cause_code[0]
+            ? ray_error(b->cause_code, "%s: %s", b->err_msg, b->cause_msg)
+            : ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
         fmt_destroy(b);
         return e;
     }
@@ -223,6 +232,7 @@ const char* ray_type_name(int8_t type) {
     case RAY_F64:       return type < 0 ? "f64"       : "F64";
     case RAY_DATE:      return type < 0 ? "date"      : "DATE";
     case RAY_TIME:      return type < 0 ? "time"      : "TIME";
+    case RAY_TIMESPAN:  return type < 0 ? "timespan" : "TIMESPAN";
     case RAY_TIMESTAMP: return type < 0 ? "timestamp" : "TIMESTAMP";
     case RAY_SYM:       return type < 0 ? "sym"       : "SYM";
     case RAY_STR:       return type < 0 ? "str"       : "STR";
@@ -301,6 +311,7 @@ static void fmt_f64(fmt_buf_t* b, double val) {
 
 static void fmt_f32(fmt_buf_t* b, float val) {
     fmt_f64(b, (double)val);
+    fmt_putc(b, 'e');
 }
 
 static void fmt_guid(fmt_buf_t* b, const uint8_t* bytes) {
@@ -388,6 +399,12 @@ static void fmt_time(fmt_buf_t* b, int32_t val) {
     fmt_printf(b, "%02d:%02d:%02d.%03d", h, m, s, ms);
 }
 
+static void fmt_timespan(fmt_buf_t* b, int64_t ns) {
+    char text[64];
+    int n = ray_format_timespan(text, sizeof(text), ns);
+    if (n > 0 && n < (int)sizeof(text)) fmt_putn(b, text, n);
+}
+
 static void fmt_timestamp(fmt_buf_t* b, int64_t val) {
     int y, mo, d, h, mi, s, ns;
     ts_to_parts(val, &y, &mo, &d, &h, &mi, &s, &ns);
@@ -409,7 +426,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode);
 
 /* ===== Null literal display (type → "0Nx" string) ===== */
 
-static const char* null_literal(int8_t type) {
+const char* ray_fmt_null_literal(int8_t type) {
     switch (type) {
     case RAY_BOOL:      return "0Nb";
     case RAY_U8:        return "0Nu";
@@ -420,9 +437,12 @@ static const char* null_literal(int8_t type) {
     case RAY_F32:       return "0Ne";
     case RAY_DATE:      return "0Nd";
     case RAY_TIME:      return "0Nt";
+    case RAY_TIMESPAN: return "0Nn";
     case RAY_TIMESTAMP: return "0Np";
-    /* SYM/STR have no separate null literal: their canonical empty/null values
-     * render as ' / "" on their ordinary formatting paths. */
+    /* SYM's null is the empty symbol, written ' (as fmt_sym_atom renders
+     * it); `null` would read back as the symbol `null`.  STR's null is "",
+     * which its callers write on the ordinary string path. */
+    case RAY_SYM:       return "'";
     case RAY_GUID:      return "0Ng";
     default:            return "null";
     }
@@ -435,7 +455,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
      * distinct null (empty and null are the same value), so it renders
      * as "" via the RAY_STR case below rather than a 0Nc literal. */
     if (vec->type != RAY_STR && ray_vec_is_null(vec, idx)) {
-        fmt_puts(b, null_literal(vec->type));
+        fmt_puts(b, ray_fmt_null_literal(vec->type));
         return;
     }
 
@@ -450,6 +470,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
     case RAY_F64:       fmt_f64(b, ((double*)ray_data(vec))[idx]); break;
     case RAY_DATE:      fmt_date(b, ((int32_t*)ray_data(vec))[idx]); break;
     case RAY_TIME:      fmt_time(b, ((int32_t*)ray_data(vec))[idx]); break;
+    case RAY_TIMESPAN: fmt_timespan(b, ((int64_t*)ray_data(vec))[idx]); break;
     case RAY_TIMESTAMP: fmt_timestamp(b, ((int64_t*)ray_data(vec))[idx]); break;
     case RAY_SYM:
         /* cell-data: resolve through the column's domain */
@@ -519,6 +540,22 @@ static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit) {
 static void fmt_list(fmt_buf_t* b, ray_t* list, int mode) {
     int64_t len = ray_len(list);
     if (len == 0) { fmt_puts(b, "()"); return; }
+
+    /* The binding of an indexed `times`, (RAY_TIMES_BIND name count) as the
+     * parser builds it from [name count]: print it as it was written, so a
+     * quoted loop reads back and round-trips. */
+    {
+        int64_t bname = -1;
+        ray_t* bcount = NULL;
+        if (ray_times_binding(list, &bname, &bcount)) {
+            fmt_putc(b, '[');
+            fmt_obj(b, ((ray_t**)ray_data(list))[1], mode);   /* not-a-table */
+            fmt_putc(b, ' ');
+            fmt_obj(b, bcount, mode);
+            fmt_putc(b, ']');
+            return;
+        }
+    }
 
     /* Historical display equivalence: a homogeneous-atom list renders as a
      * vector [..] in the round-trippable / cell modes (0 and 2), which the
@@ -593,7 +630,7 @@ static void fmt_dict_key(fmt_buf_t* b, ray_t* keys, int64_t i, int mode) {
         const char* sp = ray_str_vec_get(keys, i, &slen);
         k_atom = ray_str(sp ? sp : "", sp ? slen : 0);
         k_owned = true;
-    } else if (keys->type == RAY_I64 || keys->type == RAY_TIMESTAMP) {
+    } else if (keys->type == RAY_I64 || keys->type == RAY_TIMESPAN || keys->type == RAY_TIMESTAMP) {
         k_atom_storage.type = (int8_t)-keys->type;
         k_atom_storage.i64  = ((int64_t*)ray_data(keys))[i];
         k_atom = &k_atom_storage;
@@ -658,7 +695,7 @@ static void fmt_dict_val(fmt_buf_t* b, ray_t* vals, int64_t i, int mode) {
                                 v_storage.i32  = ((int32_t*)ray_data(vals))[i];
                                 v_atom = &v_storage; break;
             case RAY_I64:
-            case RAY_TIMESTAMP: v_storage.type = (int8_t)-vals->type;
+            case RAY_TIMESPAN: case RAY_TIMESTAMP: v_storage.type = (int8_t)-vals->type;
                                 v_storage.i64  = ((int64_t*)ray_data(vals))[i];
                                 v_atom = &v_storage; break;
             case RAY_F32:       v_storage.type = -RAY_F32;
@@ -801,6 +838,180 @@ static void fmt_centered(fmt_buf_t* b, const char* s, int32_t slen, int32_t widt
     for (int32_t i = 0; i < right; i++) fmt_putc(b, ' ');
 }
 
+/* ===== Parted table cells =====
+ *
+ * A parted table's columns hold no cells of their own: a parted column
+ * (RAY_PARTED_BASE + type) is an array of per-partition segments, and the
+ * partition-key column (RAY_MAPCOMMON) one key per partition with that
+ * partition's row count.  Every table format reads their cells in place,
+ * as the flat column they stand for prints them, without building it.  A
+ * NULL segment — a partition without the column (ragged, see store/part.c)
+ * — spans that partition's rows, from the table's partition-key counts,
+ * and prints the column's typed null, as the flat column with nulls does.
+ *
+ * fmt_col_t walks one column: a cursor over its partitions, so reading the
+ * rows in order costs one step per row (a jump back restarts it). */
+typedef struct {
+    ray_t*         col;     /* the table column (any kind) */
+    int8_t         type;    /* element type of the flat column */
+    const int64_t* cnt;     /* per-partition row counts, NULL if none */
+    int64_t        ncnt;
+    int64_t        s;       /* cursor: current partition */
+    int64_t        start;   /* cursor: its first row */
+} fmt_col_t;
+
+enum { FMT_CELL_OUT, FMT_CELL_MISSING, FMT_CELL_AT };
+
+static bool fmt_col_is_parted(ray_t* col) {
+    return col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON);
+}
+
+static int8_t fmt_col_type(ray_t* col) {
+    if (!col) return 0;
+    if (RAY_IS_PARTED(col->type)) return (int8_t)RAY_PARTED_BASETYPE(col->type);
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* keys = ((ray_t**)ray_data(col))[0];
+        return keys ? keys->type : 0;
+    }
+    return col->type;
+}
+
+/* The per-partition row counts of a parted table: its partition-key
+ * column's counts vector, or NULL. */
+static ray_t* fmt_part_counts(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t m;   /* metadata first: MAPCOMMON is plain, nothing decodes */
+        if (!ray_table_col_meta_idx(tbl, c, &m) || m.type != RAY_MAPCOMMON) continue;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (col && !RAY_IS_ERR(col) && col->type == RAY_MAPCOMMON) {
+            ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
+            return rc && !RAY_IS_ERR(rc) ? rc : NULL;
+        }
+    }
+    return NULL;
+}
+
+static void fmt_col_init(fmt_col_t* c, ray_t* col, ray_t* counts) {
+    c->col = col;
+    c->type = fmt_col_type(col);
+    c->cnt = NULL;
+    c->ncnt = 0;
+    c->s = 0;
+    c->start = 0;
+    if (col && col->type == RAY_MAPCOMMON) counts = ((ray_t**)ray_data(col))[1];   /* not-a-table */
+    if (counts && !RAY_IS_ERR(counts)) {
+        c->cnt  = (const int64_t*)ray_data(counts);
+        c->ncnt = counts->len;
+    }
+}
+
+static int64_t fmt_col_nparts(const fmt_col_t* c) {
+    if (RAY_IS_PARTED(c->col->type)) return c->col->len;
+    ray_t* keys = ((ray_t**)ray_data(c->col))[0];
+    if (!keys) return 0;
+    return c->ncnt < keys->len ? c->ncnt : keys->len;
+}
+
+/* Rows of partition p: its segment's length, else the partition's count. */
+static int64_t fmt_col_part_rows(const fmt_col_t* c, int64_t p) {
+    if (RAY_IS_PARTED(c->col->type)) {
+        ray_t* seg = ((ray_t**)ray_data(c->col))[p];
+        if (seg && !RAY_IS_ERR(seg)) return seg->len;
+    }
+    return p < c->ncnt ? c->cnt[p] : 0;
+}
+
+/* Resolve row ri to the vector and index holding its cell (FMT_CELL_AT),
+ * a missing segment's null (FMT_CELL_MISSING), or no such row. */
+static int fmt_col_cell(fmt_col_t* c, int64_t ri, ray_t** vec, int64_t* at) {
+    ray_t* col = c->col;
+    if (!col || ri < 0) return FMT_CELL_OUT;
+    if (!fmt_col_is_parted(col)) {
+        if (ri >= ray_len(col)) return FMT_CELL_OUT;
+        *vec = col; *at = ri;
+        return FMT_CELL_AT;
+    }
+    if (ri < c->start) { c->s = 0; c->start = 0; }
+    int64_t np = fmt_col_nparts(c);
+    while (c->s < np) {
+        int64_t n = fmt_col_part_rows(c, c->s);
+        if (ri - c->start < n) break;
+        c->start += n;
+        c->s++;
+    }
+    if (c->s >= np) return FMT_CELL_OUT;
+    if (col->type == RAY_MAPCOMMON) {
+        *vec = ((ray_t**)ray_data(col))[0];
+        *at = c->s;
+        return FMT_CELL_AT;
+    }
+    ray_t* seg = ((ray_t**)ray_data(col))[c->s];
+    if (!seg || RAY_IS_ERR(seg)) return FMT_CELL_MISSING;
+    *vec = seg;
+    *at = ri - c->start;
+    return FMT_CELL_AT;
+}
+
+/* A missing segment's cell, as fmt_raw_elem prints a null of the type:
+ * its null literal, "" for STR, null for a LIST cell; B8/U8 have no null
+ * (the flat column holds 0 there, as ser writes it). */
+static void fmt_missing_cell(fmt_buf_t* b, int8_t type) {
+    switch (type) {
+    case RAY_BOOL: fmt_bool(b, 0); return;
+    case RAY_U8:   fmt_u8(b, 0); return;
+    case RAY_STR:  fmt_puts(b, "\"\""); return;
+    default:       fmt_puts(b, ray_fmt_null_literal(type)); return;
+    }
+}
+
+/* Write row ri's cell; false when the column has no such row. */
+static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri) {
+    ray_t* v = NULL;
+    int64_t at = 0;
+    switch (fmt_col_cell(c, ri, &v, &at)) {
+    case FMT_CELL_AT:      fmt_raw_elem(b, v, at); return true;
+    case FMT_CELL_MISSING: fmt_missing_cell(b, c->type); return true;
+    default:               return false;
+    }
+}
+
+/* Row ri's element of a parted LIST column (a missing segment's is null). */
+static ray_t* fmt_col_elem(fmt_col_t* c, int64_t ri) {
+    ray_t* v = NULL;
+    int64_t at = 0;
+    if (fmt_col_cell(c, ri, &v, &at) != FMT_CELL_AT) return RAY_NULL_OBJ;
+    return ((ray_t**)ray_data(v))[at];
+}
+
+/* A parted column of `nrows` rows in compact mode (0), exactly as fmt_obj
+ * writes the flat column: fmt_vector unlimited, or fmt_list for LIST. */
+static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows) {
+    if (c->type != RAY_LIST) {
+        if (nrows == 0) { fmt_puts(b, "[]"); return; }
+        fmt_putc(b, '[');
+        for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+            if (ri > 0) fmt_putc(b, ' ');
+            if (!fmt_col_write(b, c, ri)) fmt_missing_cell(b, c->type);
+        }
+        fmt_putc(b, ']');
+        return;
+    }
+    if (nrows == 0) { fmt_puts(b, "()"); return; }
+    ray_t* first = fmt_col_elem(c, 0);
+    bool homogeneous = first && !RAY_IS_ERR(first) && ray_is_atom(first);
+    for (int64_t ri = 1; homogeneous && ri < nrows; ri++) {
+        ray_t* e = fmt_col_elem(c, ri);
+        if (!e || RAY_IS_ERR(e) || e->type != first->type) homogeneous = false;
+    }
+    fmt_puts(b, homogeneous ? "[" : "(list ");
+    for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+        if (ri > 0) fmt_putc(b, ' ');
+        fmt_obj(b, fmt_col_elem(c, ri), 0);
+    }
+    fmt_putc(b, homogeneous ? ']' : ')');
+}
+
 /* The REPL display (mode 1) pre-formats at most FMT_TABLE_MAX_WIDTH x
  * FMT_TABLE_MAX_HEIGHT cells on the stack; mode 2 without a sink pre-formats
  * the whole table on the heap, and show streams it (fmt_table_stream). */
@@ -815,11 +1026,10 @@ typedef struct {
  * each column's display width over every cell; the second writes the rows,
  * which the sink flushes as the buffer fills.  Memory is O(columns), unlike
  * the pre-formatted cell grid of the REPL display. */
-static void fmt_stream_cell(fmt_buf_t* tmp, ray_t* col, int64_t ri,
+static void fmt_stream_cell(fmt_buf_t* tmp, fmt_col_t* col, int64_t ri,
                             const char** s, int32_t* len) {
-    if (!col || ri >= ray_len(col)) { *s = "NA"; *len = 2; return; }
     tmp->len = 0;
-    fmt_raw_elem(tmp, col, ri);
+    if (!fmt_col_write(tmp, col, ri)) { *s = "NA"; *len = 2; return; }
     *s = tmp->buf;
     *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
 }
@@ -839,6 +1049,51 @@ static void fmt_stream_rule(fmt_buf_t* b, const int32_t* w, int64_t n,
  * value in 10k rows wrote 100 MB of spaces). */
 #define FMT_SHOW_PAD_MAX 256
 
+/* Column ci as a plain vector.  A column that fails to materialize sets the
+ * builder's error (the thread-local message keeps the detail) and yields NULL;
+ * callers stop on b->err. */
+static ray_t* fmt_col_idx(fmt_buf_t* b, ray_t* tbl, int64_t ci) {
+    ray_t* c = ray_table_col_idx(tbl, ci);
+    if (c && RAY_IS_ERR(c)) {
+        const char* code = ray_err_code(c);
+        const char* msg  = ray_error_msg();
+        snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
+        snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
+        ray_error_free(c);
+        b->err = true; b->err_msg = "column failed to load";
+        return NULL;
+    }
+    return c;
+}
+
+/* The shown rows of an encoded column ci: the first `half` rows and the
+ * last `height - half`, gathered by range into a vector of `height` rows,
+ * so a display of a compressed table reads what it shows instead of
+ * decoding every column whole.  NULL when the slot is plain or a slice, or
+ * every row is shown (the caller takes the column); NULL with b->err set on
+ * a failed read. */
+static ray_t* fmt_enc_window(fmt_buf_t* b, ray_t* tbl, int64_t ci, int64_t nrows,
+                             int64_t height, int64_t half) {
+    if (height >= nrows) return NULL;
+    ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, ci));
+    if (!enc) return NULL;
+    int64_t ids[FMT_TABLE_MAX_HEIGHT];
+    if (height > FMT_TABLE_MAX_HEIGHT) return NULL;
+    for (int64_t r = 0; r < height; r++) ids[r] = r < half ? r : nrows - height + r;
+    ray_t* out = NULL;
+    ray_t* err = ray_col_gather_enc(enc, NULL, true, ids, height, &out);
+    if (err) {
+        const char* code = ray_err_code(err);
+        const char* msg  = ray_error_msg();
+        snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
+        snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
+        ray_error_free(err);
+        b->err = true; b->err_msg = "column failed to load";
+        return NULL;
+    }
+    return out;
+}
+
 static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
@@ -847,20 +1102,26 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     ray_t* wblk = ray_alloc((size_t)ncols * sizeof(int32_t));
     ray_t* nblk = ray_alloc((size_t)ncols * sizeof(ray_t*));
     if (nblk) memset(ray_data(nblk), 0, (size_t)ncols * sizeof(ray_t*));
+    ray_t* cblk = ray_alloc((size_t)ncols * sizeof(fmt_col_t));   /* cursors over borrowed plain columns */
     fmt_buf_t tmp;
     fmt_init(&tmp);
-    if (!wblk || !nblk || tmp.err) {
+    if (!wblk || !nblk || !cblk || tmp.err) {
         b->err = true; b->err_msg = "out of memory formatting a table";
         goto done;
     }
-    int32_t* widths = (int32_t*)ray_data(wblk);
-    ray_t**  names  = (ray_t**)ray_data(nblk);
+    int32_t*   widths = (int32_t*)ray_data(wblk);
+    ray_t**    names  = (ray_t**)ray_data(nblk);
+    fmt_col_t* cols   = (fmt_col_t*)ray_data(cblk);
+    ray_t*     counts = fmt_part_counts(tbl);
 
     for (int64_t ci = 0; ci < ncols; ci++) {
         ray_t* nm = ray_sym_str(ray_table_col_name(tbl, ci));
         names[ci] = (nm && !RAY_IS_ERR(nm)) ? nm : NULL;
-        ray_t* col = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col ? col->type : 0);
+        ray_t* plain = fmt_col_idx(b, tbl, ci);
+        if (b->err) goto done;
+        fmt_col_t* col = &cols[ci];
+        fmt_col_init(col, plain, counts);
+        const char* tname = ray_type_name(col->type);
         int32_t w = names[ci] ? fmt_utf8_width(ray_str_ptr(names[ci]), (int32_t)ray_str_len(names[ci])) : 1;
         if ((int32_t)strlen(tname) > w) w = (int32_t)strlen(tname);
         int32_t cell_w = 0;
@@ -895,8 +1156,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
     fmt_putc(b, '\n');
     fmt_puts(b, G_V);
     for (int64_t ci = 0; ci < ncols; ci++) {
-        ray_t* col = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col ? col->type : 0);
+        const char* tname = ray_type_name(cols[ci].type);
         fmt_centered(b, tname, (int32_t)strlen(tname), widths[ci]);
         fmt_puts(b, G_V);
     }
@@ -907,7 +1167,7 @@ static void fmt_table_stream(fmt_buf_t* b, ray_t* tbl) {
         fmt_puts(b, G_V);
         for (int64_t ci = 0; ci < ncols; ci++) {
             const char* cs; int32_t cl;
-            fmt_stream_cell(&tmp, ray_table_get_col_idx(tbl, ci), ri, &cs, &cl);
+            fmt_stream_cell(&tmp, &cols[ci], ri, &cs, &cl);
             if (tmp.err) { b->err = true; b->err_msg = "out of memory formatting a table"; goto done; }
             fmt_putc(b, ' ');
             fmt_putn(b, cs, cl);
@@ -935,12 +1195,15 @@ done:
         ray_free(nblk);
     }
     if (wblk) ray_free(wblk);
+    if (cblk) ray_free(cblk);
     fmt_destroy(&tmp);
 }
 
 static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t nrows = ray_table_nrows(tbl);
+
+    ray_t* part_counts = fmt_part_counts(tbl);   /* NULL unless parted */
 
     /* Compact mode: round-trippable (table [names] (list col1 col2 ...)) */
     if (mode == 0) {
@@ -957,8 +1220,13 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         fmt_puts(b, "] (list ");
         for (int64_t i = 0; i < ncols; i++) {
             if (i > 0) fmt_putc(b, ' ');
-            ray_t* col = ray_table_get_col_idx(tbl, i);
-            if (col) {
+            ray_t* col = fmt_col_idx(b, tbl, i);
+            if (b->err) return;
+            if (fmt_col_is_parted(col)) {
+                fmt_col_t cur;
+                fmt_col_init(&cur, col, part_counts);
+                fmt_col_compact(b, &cur, nrows);
+            } else if (col) {
                 fmt_obj(b, col, mode);
             }
         }
@@ -1066,8 +1334,20 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         }
 
         /* Column type */
-        ray_t* col_vec = ray_table_get_col_idx(tbl, ci);
-        const char* tname = ray_type_name(col_vec ? col_vec->type : 0);
+        ray_t* col_win = fmt_enc_window(b, tbl, ci, nrows, table_height, table_height / 2);
+        ray_t* col_vec = col_win ? col_win : b->err ? NULL : fmt_col_idx(b, tbl, ci);
+        if (b->err) {
+            for (int64_t k = 0; k <= ci; k++) if (name_refs[k]) ray_release(name_refs[k]);
+            if (heap_alloc) {
+                ray_free(heap_widths_blk); ray_free(heap_names_blk); ray_free(heap_nlen_blk);
+                ray_free(heap_types_blk); ray_free(heap_tlen_blk); ray_free(heap_refs_blk);
+                ray_free(heap_cells_blk);
+            }
+            return;
+        }
+        fmt_col_t cur;
+        fmt_col_init(&cur, col_vec, part_counts);
+        const char* tname = ray_type_name(cur.type);
         col_types[ci]     = tname;
         col_type_lens[ci] = (int32_t)strlen(tname);
 
@@ -1076,25 +1356,27 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
         int32_t max_w = fmt_utf8_width(col_names[ci], col_name_lens[ci]);
         if (col_type_lens[ci] > max_w) max_w = col_type_lens[ci];
 
-        int64_t col_len = col_vec ? ray_len(col_vec) : 0;
+        /* A parted column spans the table's rows (a NULL segment's too). */
+        int64_t col_len = !col_vec ? 0
+                        : (RAY_IS_PARTED(col_vec->type) || col_vec->type == RAY_MAPCOMMON)
+                        ? nrows : ray_len(col_vec);
 
         /* Format first half (head rows) */
         int64_t half = table_height / 2;
         for (int64_t ri = 0; ri < half; ri++) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
-            if (ri < col_len) {
-                fmt_buf_t tmp;
-                fmt_init(&tmp);
-                fmt_raw_elem(&tmp, col_vec, ri);
+            fmt_buf_t tmp;
+            fmt_init(&tmp);
+            if (ri < col_len && fmt_col_write(&tmp, &cur, ri)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
-                fmt_destroy(&tmp);
             } else {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
+            fmt_destroy(&tmp);
             int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
             if (cell_dw > max_w) max_w = cell_dw;
         }
@@ -1108,22 +1390,22 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             } else {
                 src_idx = col_len - table_height + ri;
             }
-            if (src_idx >= 0 && src_idx < col_len) {
-                fmt_buf_t tmp;
-                fmt_init(&tmp);
-                fmt_raw_elem(&tmp, col_vec, src_idx);
+            fmt_buf_t tmp;
+            fmt_init(&tmp);
+            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
                 cell->len = clen;
-                fmt_destroy(&tmp);
             } else {
                 memcpy(cell->str, "NA", 3);
                 cell->len = 2;
             }
+            fmt_destroy(&tmp);
             int32_t cell_dw = fmt_utf8_width(cell->str, cell->len);
             if (cell_dw > max_w) max_w = cell_dw;
         }
+        if (col_win) ray_release(col_win);
 
         col_widths[ci] = max_w + 2; /* +2 for padding (1 space each side) */
     }
@@ -1305,7 +1587,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         /* STR/SYM use their empty literals as canonical null spellings, so
          * retain those parseable representations instead of inventing 0Nc/0Ns. */
         if (-type != RAY_STR && -type != RAY_SYM && RAY_ATOM_IS_NULL(obj)) {
-            fmt_puts(b, null_literal(-type));
+            fmt_puts(b, ray_fmt_null_literal(-type));
             return;
         }
         /* Atom: type is negated */
@@ -1320,6 +1602,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         case RAY_F64:       fmt_f64(b, obj->f64); break;
         case RAY_DATE:      fmt_date(b, obj->i32); break;
         case RAY_TIME:      fmt_time(b, obj->i32); break;
+        case RAY_TIMESPAN: fmt_timespan(b, obj->i64); break;
         case RAY_TIMESTAMP: fmt_timestamp(b, obj->i64); break;
         case RAY_SYM:  fmt_sym(b, obj->i64); break;
         case RAY_STR:  fmt_str_atom(b, obj, mode > 0); break;
@@ -1464,8 +1747,14 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
 
 /* Write obj to fp in full (show): no row, column or width limits, and
  * streamed, so memory stays bounded whatever the size of obj.  RAY_ERR_IO if
- * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated. */
-ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
+ * fp fails, RAY_ERR_OOM if a scratch buffer cannot be allocated.  A column
+ * that fails to load is reported with its own code: *cause (when non-NULL)
+ * receives an owned error carrying its code and message, and the matching
+ * ray_err_t is returned.  Output flushed before the failure stays written
+ * (a table's columns are all loaded before its first byte, so only values
+ * formatted ahead of it in the same call are affected). */
+ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause) {
+    if (cause) *cause = NULL;
     fmt_buf_t b;
     fmt_init(&b);
     if (b.err) return RAY_ERR_OOM;
@@ -1473,6 +1762,11 @@ ray_err_t ray_fmt_write(FILE* fp, ray_t* obj) {
     fmt_obj(&b, obj, 2);
     if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
         b.io_err = b.err = true;
+    if (b.err && b.cause_code[0] && cause) {
+        *cause = ray_error(b.cause_code, "%s: %s", b.err_msg, b.cause_msg);
+        fmt_destroy(&b);
+        return ray_err_from_obj(*cause);
+    }
     ray_err_t e = !b.err ? RAY_OK : b.io_err ? RAY_ERR_IO : RAY_ERR_OOM;
     /* Out of memory after part of the output was written: end that part
      * with a marker, and report it as written so the caller does not print

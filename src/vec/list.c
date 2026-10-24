@@ -23,6 +23,7 @@
 
 #include "list.h"
 #include "mem/heap.h"
+#include "vec/growth.h"
 #include "lang/format.h"  /* ray_type_name */
 #include <string.h>
 
@@ -72,6 +73,7 @@ ray_t* ray_list_append(ray_t* list, ray_t* item) {
     if (!list || RAY_IS_ERR(list)) return list;
 
     /* COW if shared */
+
     ray_t* original = list;
     list = ray_cow(list);
     if (!list || RAY_IS_ERR(list)) return list;
@@ -80,20 +82,7 @@ ray_t* ray_list_append(ray_t* list, ray_t* item) {
 
     /* Grow if needed */
     if (list->len >= cap) {
-        size_t new_data_size = (size_t)(list->len + 1) * sizeof(ray_t*);
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) {
-                    if (list != original) ray_release(list);
-                    return ray_error("oom", NULL);
-                }
-                s *= 2;
-            }
-            new_data_size = s;
-        }
-        ray_t* new_list = ray_scratch_realloc(list, new_data_size);
+        ray_t* new_list = ray_cell_grow_one(list, sizeof(ray_t*));
         if (!new_list || RAY_IS_ERR(new_list)) {
             if (list != original) ray_release(list);
             return new_list ? new_list : ray_error("oom", NULL);
@@ -161,6 +150,7 @@ ray_t* ray_list_insert_at(ray_t* list, int64_t idx, ray_t* item) {
     if (idx < 0 || idx > list->len) return ray_error("range", "list_insert_at: index out of bounds [0,%lld], got %lld",
                                                      (long long)list->len, (long long)idx);
 
+
     ray_t* original = list;
     list = ray_cow(list);
     if (!list || RAY_IS_ERR(list)) return list;
@@ -168,20 +158,7 @@ ray_t* ray_list_insert_at(ray_t* list, int64_t idx, ray_t* item) {
     int64_t cap = list_capacity(list);
 
     if (list->len >= cap) {
-        size_t new_data_size = (size_t)(list->len + 1) * sizeof(ray_t*);
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) {
-                    if (list != original) ray_release(list);
-                    return ray_error("oom", NULL);
-                }
-                s *= 2;
-            }
-            new_data_size = s;
-        }
-        ray_t* new_list = ray_scratch_realloc(list, new_data_size);
+        ray_t* new_list = ray_cell_grow_one(list, sizeof(ray_t*));
         if (!new_list || RAY_IS_ERR(new_list)) {
             if (list != original) ray_release(list);
             return new_list ? new_list : ray_error("oom", NULL);

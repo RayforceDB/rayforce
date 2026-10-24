@@ -44,14 +44,13 @@
 ;; AND / OR / NOT composites
 (count (select {from: T where: (and (> i 3) (< i 8))})) -- 4
 (sum (at (select {from: T where: (and (> i 3) (< i 8))}) 'i)) -- 22
-;; B3 Part 2 in-query collision rule: a literal `'col` that names a
-;; from-table column resolves to that column.  `'a` and `'c` name no column
-;; of T, so they stay literal symbols.  `'b` DOES name a column (the bool
-;; column `b`), so `(== s 'b)` compares the SYM column `s` against the BOOL
-;; column `b` — those never compare equal, contributing 0 rows.  The OR thus
-;; reduces to its `(== s 'a)` arm: rows where `s == 'a` → count 4, sum(i) 22.
-(count (select {from: T where: (or (== s 'a) (== s 'b))})) -- 4
-(sum (at (select {from: T where: (or (== s 'a) (== s 'b))}) 'i)) -- 22
+;; A tick naming an existing column resolves to that column. Here b is
+;; BOOL, so this mixed SYM/BOOL comparison must report TYPE, not compare IDs.
+(count (select {from: T where: (or (== s 'a) (== s 'b))})) !- type
+(sum (at (select {from: T where: (or (== s 'a) (== s 'b))}) 'i)) !- type
+;; Explicit quote keeps the intended two-symbol OR filter and its row oracle.
+(count (select {from: T where: (or (== s (quote a)) (== s (quote b)))})) -- 7
+(sum (at (select {from: T where: (or (== s (quote a)) (== s (quote b)))}) 'i)) -- 37
 (count (select {from: T where: (not (== s 'c))})) -- 7
 (sum (at (select {from: T where: (not (== s 'c))}) 'i)) -- 37
 (count (select {from: T where: (and (== s 'a) (> i 5))})) -- 2

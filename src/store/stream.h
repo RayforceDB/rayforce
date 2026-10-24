@@ -35,15 +35,16 @@ typedef struct {
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
-    ray_t*  index;          /* after close: the zone kept for a hash candidate;
-                             * the caller releases it AND sets it to NULL, or
-                             * must not call abort afterwards */
-    bool    wants_hash;     /* after close: build a hash by re-reading the file */
+    bool    want_dict;      /* generation 2, STR: index_begin asked for the DICT (built at finish) */
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
+    uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
+    uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */
 } ray_col_stream_t;
 
+/* gen 0 writes today's format; gen 2 stages the same raw payload and
+ * transcodes it chunk by chunk at finish (any other gen: RAY_ERR_VERSION). */
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
-                              int8_t type, struct ray_sym_domain_s* domain);
+                              int8_t type, struct ray_sym_domain_s* domain, uint8_t gen);
 /* Start building the column's index from global row start_row. Call after
  * open and before the first append; no-op for types without an index. */
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row);
@@ -60,26 +61,15 @@ ray_err_t ray_col_stream_close(ray_col_stream_t* w, bool durable);
  * finish error the tmp file is already removed; the caller still calls abort
  * on every writer. */
 ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable);
+/* Refuses (RAY_ERR_DOMAIN) a writer whose finish never ran; a no-op on one
+ * already published or aborted. */
 ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable);
 /* finish every writer as one pool task per column (serially without a
  * pool), then publish them in order.  The first finish error is returned;
- * on any error every writer is aborted and nothing is published.
+ * a task the pool skipped (cancellation) is RAY_ERR_CANCEL; on any error
+ * every writer is aborted and nothing is published.
  * `col_ns` (optional, n entries) receives each column's finish time. */
 ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
                                    int64_t* col_ns);
-/* Build the hash index of every closed writer whose zone asked for one
- * (wants_hash) by re-reading its published file, and release the zones.
- * Several candidates build as pool tasks (one column per task, in waves
- * sized from the RAM budget); a single one builds with the parallel
- * builder.  Best effort: a failed build leaves the column with its zone. */
-void ray_col_stream_hash_all(ray_col_stream_t* w, int64_t n, int64_t* col_ns);
-/* Build the hash index of one closed writer whose zone asked for one, right
- * away and with the whole pool, while its file is still in the page cache;
- * the zone is released and a later ray_col_stream_hash_all skips the
- * writer.  Best effort, as there.  Call outside any pool dispatch. */
-void ray_col_stream_hash_one(ray_col_stream_t* w);
-/* Hash builds in flight at once: clamp(ram_limit / 4 / (58 B * max(rows, 1)),
- * 1, candidates).  Pure; `candidates` >= 1 expected. */
-int64_t ray_col_stream_hash_wave(int64_t ram_limit, int64_t rows, int64_t candidates);
 void ray_col_stream_abort(ray_col_stream_t* w);
 #endif

@@ -257,6 +257,8 @@ static ray_t* string_unary_fn(ray_t* x, uint16_t opcode,
                               ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
     if (!x || RAY_IS_ERR(x)) return x;
     if (ray_is_lazy(x)) {
+        ray_t* perr = ray_lazy_promote(x);              /* a column reference becomes its scan */
+        if (perr) return perr;
         ray_op_t* prev = RAY_LAZY_OP(x);
         if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
             return ray_error("type", "string transform: expected string or symbol vector");
@@ -348,6 +350,8 @@ ray_t* ray_substr_fn(ray_t** args, int64_t n) {
         return ray_error("type", "substr: length must be an integer atom or I64/I32 vector");
 
     if (ray_is_lazy(str)) {
+        ray_t* perr = ray_lazy_promote(str);            /* a column reference becomes its scan */
+        if (perr) return perr;
         ray_graph_t* g = RAY_LAZY_GRAPH(str);
         ray_op_t* prev = RAY_LAZY_OP(str);
         if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
@@ -445,6 +449,8 @@ ray_t* ray_replace_fn(ray_t** args, int64_t n) {
         return ray_error("type", "replace: to must be string or symbol atom");
 
     if (ray_is_lazy(str)) {
+        ray_t* perr = ray_lazy_promote(str);            /* a column reference becomes its scan */
+        if (perr) return perr;
         ray_graph_t* g = RAY_LAZY_GRAPH(str);
         ray_op_t* prev = RAY_LAZY_OP(str);
         if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
@@ -585,6 +591,8 @@ ray_t* ray_str_find_fn(ray_t* hay, ray_t* pattern) {
         return ray_error("domain", "str-find: '*' is not supported in search patterns");
 
     if (ray_is_lazy(hay)) {
+        ray_t* perr = ray_lazy_promote(hay);            /* a column reference becomes its scan */
+        if (perr) return perr;
         ray_graph_t* g = RAY_LAZY_GRAPH(hay);
         ray_op_t* prev = RAY_LAZY_OP(hay);
         if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
@@ -870,8 +878,16 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     ray_t* result = ray_list_new(8);
     if (RAY_IS_ERR(result)) { if (sym_str_s) ray_release(sym_str_s); if (sym_str_d) ray_release(sym_str_d); return result; }
 
-    if (dlen == 0 || slen == 0) {
+    /* A longer delimiter cannot occur in the input.  Guard the unsigned
+     * slen - dlen bound in the search loop below. */
+    if (dlen == 0 || slen < dlen) {
         ray_t* part = ray_str(sp, slen);
+        if (!part || RAY_IS_ERR(part)) {
+            ray_release(result);
+            if (sym_str_s) ray_release(sym_str_s);
+            if (sym_str_d) ray_release(sym_str_d);
+            return part ? part : ray_error("oom", NULL);
+        }
         result = ray_list_append(result, part);
         ray_release(part);
         if (sym_str_s) ray_release(sym_str_s);

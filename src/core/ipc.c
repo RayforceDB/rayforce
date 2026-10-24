@@ -25,6 +25,7 @@
   #define _GNU_SOURCE
 #endif
 
+#include "store/enccol.h"    /* ray_enccol_cache_trim after a request */
 #include "core/ipc.h"
 #include "core/mcast.h"
 #include "core/timer.h"
@@ -480,6 +481,7 @@ static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel,
 
 static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 {
+    ray_serde_fail_clear();
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -490,8 +492,16 @@ static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
      * can put on the wire and we drop as before. */
     ray_t* fallback = NULL;
     if (ser_size <= 0) {
-        fallback = ray_error("type", "result of type %s is not serializable over IPC",
-                             result ? ray_type_name(result->type) : "null");
+        const char* fcode = ray_serde_fail_code();
+        if (fcode) {                       /* an encoded column failed to decode: say so */
+            char code[8], msg[256];
+            snprintf(code, sizeof code, "%s", fcode);
+            snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+            fallback = ray_error(code, "%s", msg);
+        } else {
+            fallback = ray_error("type", "result of type %s is not serializable over IPC",
+                                 result ? ray_type_name(result->type) : "null");
+        }
         result   = fallback;
         ser_size = ray_serde_size(result);
         if (ser_size <= 0) { if (fallback) ray_error_free(fallback); return; }
@@ -499,7 +509,22 @@ static void send_response(ray_sock_t fd, ray_t* result, size_t threshold)
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
     if (!payload) { if (fallback) ray_error_free(fallback); return; }
-    ray_ser_raw(payload, result);
+    int64_t  wrote    = ray_ser_raw(payload, result);
+    if (wrote != ser_size) {
+        /* The write phase disagrees with the size phase (an encoded column
+         * failed to decode): never send the frame, answer with an error. */
+        ray_free_raw(payload);
+        if (fallback) { ray_error_free(fallback); return; }
+        fallback = ray_error("io", "result could not be serialized over IPC");
+        result   = fallback;
+        ser_size = ray_serde_size(result);
+        payload  = ser_size > 0 ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
+        if (!payload || ray_ser_raw(payload, result) != ser_size) {
+            if (payload) ray_free_raw(payload);
+            ray_error_free(fallback);
+            return;
+        }
+    }
 
     uint8_t* send_buf = NULL;
     size_t   send_len = 0;
@@ -1172,6 +1197,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * one between two requests.  Stamping on frame arrival instead would
      * make the measured gap the request's own duration. */
     ray_heap_note_activity();
+    ray_enccol_cache_trim();
     ray_heap_relieve();
 
     return NULL;
@@ -1331,7 +1357,11 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
         if (err_out) *err_out = RAY_ERR_OOM;
         return NULL;
     }
-    ray_ser_raw(payload, msg);
+    if (ray_ser_raw(payload, msg) != ser_size) {
+        ray_free_raw(payload);
+        if (err_out) *err_out = RAY_ERR_IO;
+        return NULL;
+    }
 
     uint8_t* send_buf = NULL;
     size_t   send_len = 0;

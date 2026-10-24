@@ -27,6 +27,9 @@
 #define _GNU_SOURCE
 #endif
 #include "part.h"
+#include "table/table.h"
+#include "store/enccol.h"
+#include "store/encw.h"      /* ray_encw_null_image */
 #include "core/runtime.h"
 #include "mem/sys.h"
 #include "mem/heap.h"
@@ -36,6 +39,7 @@
 #include "table/domain.h"
 #include "lang/cal.h"   /* MONTHDAYS, date_leap_year — calendar-date validation */
 #include "core/numparse.h"  /* ray_parse_i64 — overflow-checked integer names */
+#include "lang/format.h"     /* ray_type_name */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,6 +263,95 @@ static ray_t* collect_part_dirs(const char* db_root, char*** out_dirs,
 }
 
 /* --------------------------------------------------------------------------
+ * ray_null_fill — `rows` cells of `type`'s null on the heap (part.h).  It is
+ * the segment of a column a ragged partition lacks only where generation 2
+ * cannot hold the type (LIST, or a big-endian host); otherwise it is the
+ * fill one chunk of the lazy segment is encoded from (missing_seg), and the
+ * group's plain stand-in for that segment (group.c, grp_synth_plain).
+ * -------------------------------------------------------------------------- */
+ray_t* ray_null_fill(int8_t type, int64_t rows, struct ray_sym_domain_s* dom) {
+    if (type == RAY_LIST) {
+        ray_t* l = ray_list_new(rows);
+        if (!l || RAY_IS_ERR(l)) return l ? l : ray_error("oom", NULL);
+        ray_t** e = (ray_t**)ray_data(l);
+        for (int64_t i = 0; i < rows; i++) e[i] = RAY_NULL_OBJ;   /* arena object: no ref */
+        l->len = rows;
+        return l;
+    }
+    ray_t* v = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W8, rows) : ray_vec_new(type, rows);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = rows;
+    void* p = ray_data(v);
+    switch (type) {
+        case RAY_F64:
+            for (int64_t i = 0; i < rows; i++) ((double*)p)[i] = NULL_F64;
+            break;
+        case RAY_F32:
+            for (int64_t i = 0; i < rows; i++) ((float*)p)[i] = NULL_F32;
+            break;
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+            for (int64_t i = 0; i < rows; i++) ((int64_t*)p)[i] = NULL_I64;
+            break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+            for (int64_t i = 0; i < rows; i++) ((int32_t*)p)[i] = NULL_I32;
+            break;
+        case RAY_I16:
+            for (int64_t i = 0; i < rows; i++) ((int16_t*)p)[i] = NULL_I16;
+            break;
+        case RAY_SYM: case RAY_STR: case RAY_GUID:     /* id 0, the empty string, the zero GUID */
+        case RAY_BOOL: case RAY_U8:
+            memset(p, 0, (size_t)rows * ray_sym_elem_size(type, v->attrs));
+            break;
+        default:
+            ray_release(v);
+            return ray_error("nyi", "parted: a partition lacks a column of type %s", ray_type_name(type));
+    }
+    if (type != RAY_BOOL && type != RAY_U8 && rows > 0) v->attrs |= RAY_ATTR_HAS_NULLS;
+    if (type == RAY_SYM && dom) {
+        ray_sym_domain_retain(dom);
+        v->sym_domain = dom;          /* the fresh vector holds the immortal runtime domain: no release */
+    }
+    return v;
+}
+
+/* --------------------------------------------------------------------------
+ * missing_seg — the segment of a column a ragged partition lacks: `rows`
+ * rows of the column's null, so every column of a parted table has the
+ * table's row count, segment by segment, and a consumer never meets a
+ * missing segment (#724).
+ *
+ * Every type generation 2 stores gets a lazy all-null segment: a
+ * generation-2 RAY_ENCCOL over an in-memory image (ray_encw_null_image, an
+ * anonymous mapping the enccol owns and unmaps), so opening costs about
+ * n_chunks x (64 B + one chunk body) of mapped memory — 11.5 KiB per 65536
+ * rows of I64, ~18 MB per 100M rows where a heap fill held 800 MB — and the
+ * rows decode only when a query reads them, like any encoded segment (its
+ * directory answers null presence without a decode).  The image is the file
+ * the generation-2 writer writes for ray_null_fill's vector, so its
+ * materialization is that vector: the same nulls and attrs (HAS_NULLS on
+ * every nullable type), SYM over `dom`.  The segment is marked synthetic:
+ * generation inheritance treats it as the plain fill it stands for (a save
+ * without a compress option over a generation-0 or fresh destination writes
+ * generation 0, as the heap fill did).  The image is never a file: a save
+ * re-encodes it through the writers.  LIST (and every type on a
+ * host without generation 2) keeps the heap fill: rows x element size,
+ * held for the table's lifetime.  `what` names the segment in errors.
+ * -------------------------------------------------------------------------- */
+static ray_t* missing_seg(int8_t type, int64_t rows, struct ray_sym_domain_s* dom, const char* what) {
+    if (!ray_enc_gen2_supported() || !ray_encw_type_supported(type))
+        return ray_null_fill(type, rows, dom);
+    ray_t* fill = ray_null_fill(type, rows < RAY_ENC_CHUNK ? rows : RAY_ENC_CHUNK, dom);
+    if (!fill || RAY_IS_ERR(fill)) return fill ? fill : ray_error("oom", NULL);
+    void* img = NULL; size_t size = 0;
+    ray_err_t e = ray_encw_null_image(type, fill->attrs, rows, 0, ray_data(fill), &img, &size);
+    ray_release(fill);
+    if (e != RAY_OK) return ray_error(ray_err_code_str(e), "%s: null segment", what);
+    ray_t* v = ray_enccol_open(img, size, what, type == RAY_SYM ? dom : NULL, false);
+    if (v && !RAY_IS_ERR(v)) ray_enccol_set_synthetic(v);   /* inherits as plain (colwrite.c) */
+    return v;
+}
+
+/* --------------------------------------------------------------------------
  * Partition reuse across mounts
  *
  * ray_read_parted used to open every partition of the table from scratch
@@ -431,7 +524,7 @@ static bool part_keep_used(const part_cache_entry_t* e, const void* ctx) {
     (void)ctx;
     if (ray_atomic_load(&e->tbl->rc) > 1) return true;
     for (int64_t i = 0; i < ray_table_ncols(e->tbl); i++) {
-        ray_t* col = ray_table_get_col_idx(e->tbl, i);
+        ray_t* col = ray_table_slot_idx(e->tbl, i);   /* the slot itself: never decoded */
         if (col && ray_atomic_load(&col->rc) > 1) return true;
     }
     return false;
@@ -443,9 +536,14 @@ void ray_parted_cache_prune(void) {
 
 static bool part_domain_matches(ray_t* tbl, struct ray_sym_domain_s* dom) {
     for (int64_t i = 0; i < ray_table_ncols(tbl); i++) {
-        ray_t* col = ray_table_get_col_idx(tbl, i);
-        if (col && col->type == RAY_SYM && ray_sym_vec_domain(col) != dom)
+        ray_t* col = ray_table_slot_idx(tbl, i);   /* the slot itself: never decoded */
+        if (!col) continue;
+        if (col->type == RAY_ENCCOL) {
+            ray_enccol_t* e = ray_enccol_of(col);
+            if (e && e->type == RAY_SYM && e->dom != dom) return false;
+        } else if (col->type == RAY_SYM && ray_sym_vec_domain(col) != dom) {
             return false;
+        }
     }
     return true;
 }
@@ -544,7 +642,10 @@ void ray_parted_cache_clear(void) {
  *
  * Builds parted columns (RAY_PARTED_BASE + base_type) where each segment
  * is an mmap'd vector from ray_read_splayed. Also builds a MAPCOMMON column
- * with partition key names and row counts.
+ * with partition key names and row counts.  No segment is missing: a
+ * partition lacking a tail column gets a segment of nulls of its row count
+ * (missing_seg: a lazy all-null encoded segment, O(chunks) bytes at open),
+ * so every column's segment p has MAPCOMMON row count p.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
@@ -581,8 +682,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         if (!dom) {
             part_cache_sweep(db_root, table_name, seq);
             return ray_error("corrupt",
-                "symfile %s: unreadable or invalid (bad magic, torn record, "
-                "or missing \"\" at position 0)", sym_path);
+                "symfile %s: unreadable or not a symfile", sym_path);
         }
     }
 
@@ -677,8 +777,9 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* Cross-partition schema validation: column association is by INDEX
      * (see the data-column loop below), so every column a partition has
      * must match the first partition's name and type at the same index.
-     * A partition MAY have fewer columns — the missing tail becomes NULL
-     * segments (supported ragged mode) — but never more, and never a
+     * A partition MAY have fewer columns — the missing tail reads as
+     * segments of nulls (supported ragged mode, missing_seg) — but
+     * never more, and never a
      * renamed/retyped column (silent mis-association otherwise).  SYM
      * index width (attrs) may legally differ per partition — partitions
      * written at different dictionary sizes carry different index
@@ -696,9 +797,10 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         for (int64_t c = 0; c < ncols_p; c++) {
             int64_t n0 = ray_table_col_name(part_tables[0], c);
             int64_t np = ray_table_col_name(part_tables[p], c);
-            ray_t* c0 = ray_table_get_col_idx(part_tables[0], c);
-            ray_t* cp = ray_table_get_col_idx(part_tables[p], c);
-            if (n0 != np || !c0 || !cp || c0->type != cp->type) {
+            ray_col_meta_t m0, mp;
+            bool h0 = ray_table_col_meta_idx(part_tables[0], c, &m0);
+            bool hp = ray_table_col_meta_idx(part_tables[p], c, &mp);
+            if (n0 != np || !h0 || !hp || m0.type != mp.type) {
                 ray_t* na = ray_sym_str(np);
                 part_err = ray_error("corrupt",
                     "parted %s: partition %s/%s column %lld ('%.*s') "
@@ -788,8 +890,8 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* ---- Data columns (after MAPCOMMON) ---- */
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(part_tables[0], c);
-        ray_t* first_seg = ray_table_get_col_idx(part_tables[0], c);
-        if (!first_seg) continue;
+        ray_col_meta_t m0;
+        if (!ray_table_col_meta_idx(part_tables[0], c, &m0)) continue;
 
         ray_t* parted = ray_alloc((size_t)part_count * sizeof(ray_t*));
         if (!parted || RAY_IS_ERR(parted)) {
@@ -798,24 +900,56 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             ray_release(result);
             goto fail_tables;
         }
-        parted->type = RAY_PARTED_BASE + first_seg->type;
+        parted->type = RAY_PARTED_BASE + m0.type;
         parted->len = part_count;
         parted->attrs = 0;
         memset(parted->aux, 0, 16);
 
+        /* Segments are the slot objects themselves, encoded or plain, never
+         * decoded here: a decode failure surfaces on materialization. */
+        bool any_enc = false;
         ray_t** segs = (ray_t**)ray_data(parted);
+        memset(segs, 0, (size_t)part_count * sizeof(ray_t*));
         for (int64_t p = 0; p < part_count; p++) {
-            ray_t* seg = ray_table_get_col_idx(part_tables[p], c);
-            if (!seg) {
-                segs[p] = NULL;
+            ray_t* seg = ray_table_get_col_enc_idx(part_tables[p], c);
+            if (seg) any_enc = true;
+            else seg = ray_table_col_idx(part_tables[p], c);   /* plain slot: a lookup */
+            if (seg && !RAY_IS_ERR(seg)) {
+                ray_retain(seg);
+                segs[p] = seg;
                 continue;
             }
-            ray_retain(seg);
+            /* Ragged: partition p lacks this tail column.  Its rows read
+             * as the column's nulls, so the column has the MAPCOMMON row
+             * count of every partition. */
+            if (!seg) {
+                char what[1200];
+                ray_t* na = ray_sym_str(name_id);
+                snprintf(what, sizeof what, "%s/%s/%s/%.*s (absent: nulls)", db_root, part_dirs[p],
+                         table_name, na ? (int)ray_str_len(na) : 1, na ? ray_str_ptr(na) : "?");
+                seg = missing_seg(m0.type, ray_table_nrows(part_tables[p]), dom, what);
+                if (seg && !RAY_IS_ERR(seg) && seg->type == RAY_ENCCOL) any_enc = true;
+            }
+            if (!seg || RAY_IS_ERR(seg)) {
+                ray_release(parted);                           /* releases the filled segs */
+                ray_release(result);
+                part_err = seg ? seg : ray_error("oom", NULL);
+                goto fail_tables;
+            }
             segs[p] = seg;
         }
-
-        result = ray_table_add_col(result, name_id, parted);
-        ray_release(parted);
+        ray_t* slot = parted;
+        if (any_enc) {
+            slot = ray_enccol_parted_new(parted);
+            ray_release(parted);
+            if (!slot || RAY_IS_ERR(slot)) {
+                ray_release(result);
+                part_err = slot ? slot : ray_error("oom", NULL);
+                goto fail_tables;
+            }
+        }
+        result = ray_table_add_col(result, name_id, slot);
+        ray_release(slot);
         if (!result || RAY_IS_ERR(result)) goto fail_tables;
     }
 
@@ -918,22 +1052,22 @@ static ray_t* empty_table_like(ray_t* tmpl) {
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tmpl, c);
-        if (!col) { ray_release(out); return ray_error("type", "empty_table_like: null column"); }
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(tmpl, c, &m)) { ray_release(out); return ray_error("type", "empty_table_like: null column"); }
         ray_t* ecol = NULL;
-        if (col->type == RAY_LIST) {
+        if (m.type == RAY_LIST) {
             ecol = ray_list_new(0);
-        } else if (col->type == RAY_TABLE || col->type == RAY_DICT) {
+        } else if (m.type == RAY_TABLE || m.type == RAY_DICT) {
             int64_t name_id = ray_table_col_name(tmpl, c);
             ray_t* name = ray_sym_str(name_id);
             const char* name_ptr = name ? ray_str_ptr(name) : "?";
             int name_len = name ? (int)ray_str_len(name) : 1;
-            const char* type_name = col->type == RAY_TABLE ? "TABLE" : "DICT";
+            const char* type_name = m.type == RAY_TABLE ? "TABLE" : "DICT";
             ray_release(out);
             return ray_error("nyi", "empty_table_like: column '%.*s' has unsupported nested type %s",
                              name_len, name_ptr, type_name);
         } else {
-            ecol = ray_vec_new(col->type, 0);
+            ecol = ray_vec_new(m.type, 0);
         }
         if (!ecol || RAY_IS_ERR(ecol)) { ray_release(out); return ecol ? ecol : ray_error("oom", NULL); }
         ray_t* nout = ray_table_add_col(out, ray_table_col_name(tmpl, c), ecol);

@@ -340,10 +340,12 @@
 (as 'time "12x34x56") !- domain
 (as 'time "12:3") !- domain
 (as 'time "x") !- domain
-;; time literals with 1-3 digit fractional seconds
-10:00:00.1 -- 10:00:00.001
-10:00:00.01 -- 10:00:00.001
-10:00:00.12 -- 10:00:00.012
+;; time literals with 1-3 digit fractional seconds: a decimal fraction, as
+;; the string cast above reads it
+10:00:00.1 -- 10:00:00.100
+10:00:00.01 -- 10:00:00.010
+10:00:00.12 -- 10:00:00.120
+(== 10:00:00.1 (as 'time "10:00:00.1")) -- true
 10:00:00.011 -- 10:00:00.011
 10:00:00.123 -- 10:00:00.123
 ;; ========== TIME VECTOR CASTS ==========
@@ -643,3 +645,50 @@
 (nil? (as 'I64 NaNf)) -- true
 (nil? (as 'I32 NaNf)) -- true
 (nil? (as 'I16 NaNf)) -- true
+
+;; ========== F32 (#881) ==========
+;; f32 <- atoms
+(type (as 'F32 1.5)) -- 'f32
+(as 'f32 1.5) -- (as 'F32 1.5)
+(as 'F64 (as 'F32 1.5)) -- 1.5
+(as 'F64 (as 'F32 7)) -- 7.0
+(as 'F64 (as 'F32 true)) -- 1.0
+(as 'F64 (as 'F32 "2.5")) -- 2.5
+(nil? (as 'F32 "inf")) -- true
+(nil? (as 'F32 0Nl)) -- true
+(nil? (as 'F32 0Nf)) -- true
+;; past the F32 range saturates to exactly +-FLT_MAX, as integer
+;; narrowings do; it is not the null
+(as 'F64 (as 'F32 1e300)) -- 3.4028234663852886e38
+(as 'F64 (as 'F32 -1e300)) -- -3.4028234663852886e38
+(nil? (as 'F32 [1e300 -1e300])) -- [false false]
+;; temporal atoms, vectors and lists cast through their storage
+(as 'F64 (as 'F32 2024.01.15)) -- 8780.0
+(as 'F64 (as 'F32 [2024.01.15])) -- [8780.0]
+(as 'F64 (as 'F32 00:00:01.000)) -- 1000.0
+(as 'F64 (as 'F32 [00:00:01.000])) -- [1000.0]
+(as 'F64 (as 'F32 2000.01.01D00:00:00.000001000)) -- 1000.0
+(as 'F64 (as 'F32 (list 2024.01.15 00:00:01.000))) -- [8780.0 1000.0]
+;; f32 -> other atoms
+(as 'i64 (as 'F32 7.9)) -- 7
+(as 'i32 (as 'F32 7.9)) -- 7i
+(as 'b8 (as 'F32 2)) -- true
+(as 'sym (as 'F32 0.5)) -- '0.5
+;; f32 <- vectors (null-preserving), and back
+(type (as 'F32 [1 2 3])) -- 'F32
+(as 'F64 (as 'F32 [1 0Nl 3])) -- [1.0 0Nf 3.0]
+(as 'F64 (as 'F32 [1.5 0Nf 2.25])) -- [1.5 0Nf 2.25]
+(as 'I64 (as 'F32 [1.5 0Nf 7.9])) -- [1 0Nl 7]
+(as 'I16 (as 'F32 [1e10 -1e10])) -- [32767h -32767h]
+(as 'F64 (as 'F32 (list 1 2.5 0Nl))) -- [1.0 2.5 0Nf]
+(nil? (as 'F32 [0Nl 0Nf])) -- [true true]
+;; large enough for the parallel cast path
+(sum (as 'F64 (as 'F32 (til 300000)))) -- 44999850000.0
+;; the builtin, vector and query casts agree, both signs and nulls
+(set F32V [1e300 -1e300 0Nf 1.5])
+(set F32T (table [v d] (list F32V [2024.01.15 2024.01.16 0Nd 2024.01.17])))
+(as 'F64 (as 'F32 F32V)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
+(as 'F64 (at (select {x: (as 'F32 v) from: F32T}) 'x)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
+(as 'F64 (at (update {w: (as 'F32 v) from: F32T}) 'w)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
+(as 'F64 (at (select {x: (as 'F32 d) from: F32T}) 'x)) -- [8780.0 8781.0 0Nf 8782.0]
+(as 'F64 (as 'F32 (at F32T 'd))) -- [8780.0 8781.0 0Nf 8782.0]

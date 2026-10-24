@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -82,10 +83,9 @@ static int64_t parse_size_arg(const char* s) {
  * password, a negative number) stays legal — refusing those would break
  * working command lines for no gain.
  *
- * Keep this list in step with the flags handled in main's parse loop and
- * with --help.  (ray_build_sys_args in src/ops/system.c walks argv a
- * second time for .sys.args; it only ever sees a command line that
- * already passed this guard, so it cannot mis-pair.)
+ * Keep this list in step with the flags handled in main's parse loop,
+ * ray_build_sys_args in src/ops/system.c, and --help.  The .sys.args
+ * builder walks argv again and must skip every flag's value too.
  * -------------------------------------------------------------------------- */
 static const char* const k_known_flags[] = {
     "-i", "--interactive", "-p", "--port", "-c", "--cores",
@@ -124,6 +124,11 @@ int main(int argc, char** argv) {
     ray_crash_install();
     ray_expr_stats_init();
     ray_idx_stats_init();
+    /* The heap locks what it maps under the watermark against swap-out
+     * (heap_lock in mem/heap.c), within RLIMIT_MEMLOCK: the binary lets it
+     * have the hard limit, not only the soft one.  Here and not in the
+     * runtime: an embedding's process limits are its host's to set. */
+    ray_os_raise_memlock();
     ray_runtime_t* rt = ray_runtime_create(argc, argv);
     if (!rt) { fprintf(stderr, "failed to create runtime\n"); return 1; }
 
@@ -184,20 +189,41 @@ int main(int argc, char** argv) {
             port = (uint16_t)pv;
         }
         else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
-            if (!v) { ray_runtime_destroy(rt); return 2; }
-            n_cores = atoi(v);
-            if (n_cores < 0) n_cores = 0;
+            const char* flag = argv[i];
+            const char* cv = flag_value(argc, argv, &i, flag);
+            if (!cv) { ray_runtime_destroy(rt); return 2; }
+            int64_t parsed;
+            if (!parse_sys_int_arg(cv, true, true, &parsed)) {
+                fprintf(stderr, "error: %s expects a worker count in 0..%u, got '%s'\n",
+                        flag, (unsigned)(RAY_HEAP_ID_BITS - 1), cv);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            n_cores = (int)parsed;
         }
         else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
+            const char* flag = argv[i];
+            const char* v = flag_value(argc, argv, &i, flag);
             if (!v) { ray_runtime_destroy(rt); return 2; }
-            timeit_init = (atoi(v) != 0);
+            int64_t parsed;
+            if (!parse_sys_int_arg(v, false, false, &parsed)) {
+                fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, v);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            timeit_init = (parsed != 0);
         }
         else if (strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) {
-            const char* v = flag_value(argc, argv, &i, argv[i]);
+            const char* flag = argv[i];
+            const char* v = flag_value(argc, argv, &i, flag);
             if (!v) { ray_runtime_destroy(rt); return 2; }
-            qlog_init = (atoi(v) != 0);
+            int64_t parsed;
+            if (!parse_sys_int_arg(v, false, false, &parsed)) {
+                fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, v);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            qlog_init = (parsed != 0);
         }
         else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
             file = flag_value(argc, argv, &i, argv[i]);
@@ -231,7 +257,7 @@ int main(int argc, char** argv) {
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
                 "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
                 "      --port HOST:PORT  bind the listener to HOST only (e.g. 127.0.0.1:7701)\n"
-                "  -c, --cores N       total execution cores, main included (0 = auto)\n"
+                "  -c, --cores N       decimal digits; 0 = auto, 1..1023 includes main thread\n"
                 "  -t, --timeit N      enable profiler at startup (N != 0)\n"
                 "  -Q, --querylog N    enable query logging at startup (N != 0);\n"
                 "                      read the ring with (.sys.querylog)\n"
@@ -292,10 +318,20 @@ int main(int argc, char** argv) {
      * (file load, REPL eval, builtins).  If -c wasn't given, leave the
      * pool to its lazy default on first use. */
     if (n_cores >= 0) {
+        /* the CPUs this process may run on, or its CPU quota when smaller */
+        uint32_t ncpu = ray_pool_default_total();
+        if ((uint32_t)n_cores > ncpu)
+            fprintf(stderr, "warning: -c %d gives %d threads, more than the %u CPU%s this process "
+                            "may use, and they take turns; use -c %u, or drop -c to size the pool "
+                            "to the CPUs\n",
+                    n_cores, n_cores, ncpu, ncpu == 1 ? "" : "s", ncpu);
         ray_err_t err = ray_pool_init_total((uint32_t)n_cores);
-        if (err != RAY_OK)
-            fprintf(stderr, "warning: ray_pool_init_total(%d) failed (%d)\n",
+        if (err != RAY_OK) {
+            fprintf(stderr, "error: ray_pool_init_total(%d) failed (%d)\n",
                     n_cores, (int)err);
+            ray_runtime_destroy(rt);
+            return 2;
+        }
     }
 
     /* -t at startup flips the global profiler flag. The REPL reads

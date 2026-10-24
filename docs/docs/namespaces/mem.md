@@ -30,7 +30,9 @@ allocator tuning. It is an in-memory size, not a serialized-wire size.
 Signature: `(.mem.ts expression)`.
 
 `.mem.ts` is a special form: it evaluates `expression` exactly once inside a
-process-wide measurement scope. Secondary-worker allocations and worker busy
+process-wide measurement scope. A deferred (lazy) result, such as a bare
+`(sum v)`, is materialized inside the scope, so the time, allocation and worker
+figures include its computation. Secondary-worker allocations and worker busy
 time are included. Result sizing and construction of the returned statistics
 dictionary happen after the time/allocation scope closes.
 

@@ -962,6 +962,7 @@ done:
 
 /* ht_heads is accessed atomically from multiple workers during join build.
  * Using _Atomic(uint32_t)* for C11-compliant atomic access. */
+#define JHT_MIN_CAP 256u
 #define JHT_EMPTY UINT32_MAX  /* sentinel for empty HT slot/chain end */
 
 typedef struct {
@@ -1036,7 +1037,7 @@ typedef struct {
 } join_probe_ctx_t;
 
 /* Pass 2a: count matches per morsel */
-static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1059,7 +1060,7 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
             continue;
         }
 
-        if (l + 8 < row_end) {
+        if (prefetch_heads && l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
@@ -1077,8 +1078,16 @@ static void join_count_fn(void* raw, uint32_t wid, int64_t task_start, int64_t t
     c->morsel_counts[tid] = count;
 }
 
+/* Compile both modes from one body; select once per pass, not per row. */
+static void join_count_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, true);
+}
+static void join_count_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, false);
+}
+
 /* Pass 2b: fill match pairs using pre-computed offsets */
-static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
+RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1108,7 +1117,7 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
             continue;
         }
 
-        if (l + 8 < row_end) {
+        if (prefetch_heads && l + 8 < row_end) {
             uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
@@ -1133,14 +1142,22 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
     }
 }
 
+/* Compile both modes from one body; select once per pass, not per row. */
+static void join_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, true);
+}
+static void join_fill_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, false);
+}
+
 /* Segment count of a parted table = length of any parted column's segs
  * array (mirrors build_segment_table's own read, exec.c:3377-3384, and
  * window.c's window_parted_seg_count). */
 static int64_t join_parted_seg_count(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && RAY_IS_PARTED(col->type)) return col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) return m.n_segs;
     }
     return 0;
 }
@@ -1148,8 +1165,9 @@ static int64_t join_parted_seg_count(ray_t* tbl) {
 static bool join_table_has_parted_col(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) return true;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) &&
+            (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)) return true;
     }
     return false;
 }
@@ -1209,10 +1227,22 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
         ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
-        if (lk && lk->base.opcode == OP_SCAN)
-            l_key_vecs[k] = ray_table_get_col(left_table, lk->sym);
-        if (rk && rk->base.opcode == OP_SCAN)
-            r_key_vecs[k] = ray_table_get_col(right_table, rk->sym);
+        if (lk && lk->base.opcode == OP_SCAN) {
+            l_key_vecs[k] = ray_table_col(left_table, lk->sym);
+            if (l_key_vecs[k] && RAY_IS_ERR(l_key_vecs[k])) {
+                ray_t* e = l_key_vecs[k];
+                scratch_free(key_vecs_hdr);
+                return e;
+            }
+        }
+        if (rk && rk->base.opcode == OP_SCAN) {
+            r_key_vecs[k] = ray_table_col(right_table, rk->sym);
+            if (r_key_vecs[k] && RAY_IS_ERR(r_key_vecs[k])) {
+                ray_t* e = r_key_vecs[k];
+                scratch_free(key_vecs_hdr);
+                return e;
+            }
+        }
         if (rk && rk->base.opcode == OP_CONST && rk->literal)
             r_key_vecs[k] = rk->literal;
     }
@@ -1528,7 +1558,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
 
 chained_ht_fallback:;
     /* ── Chained HT path (small joins / radix OOM fallback) ────────── */
-    uint64_t ht_cap64 = 256;
+    uint64_t ht_cap64 = JHT_MIN_CAP;
     uint64_t target = (uint64_t)right_rows * 2;
     while (ht_cap64 < target) ht_cap64 *= 2;
     if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
@@ -1554,8 +1584,8 @@ chained_ht_fallback:;
     if (n_keys == 1 && join_type == 0 && l_key_vecs[0] &&
         l_key_vecs[0]->type == RAY_I64 && right_rows > left_rows * 2) {
         int64_t cnt_sym = ray_sym_intern("_count", 6);
-        ray_t* cnt_col = ray_table_get_col(left_table, cnt_sym);
-        if (cnt_col) {  /* left is factorized */
+        ray_col_meta_t cnt_m;
+        if (ray_table_col_meta(left_table, cnt_sym, &cnt_m)) {  /* left is factorized */
             int64_t* lk = (int64_t*)ray_data(l_key_vecs[0]);
             int64_t lk_max = 0;
             for (int64_t i = 0; i < left_rows; i++)
@@ -1666,12 +1696,16 @@ chained_ht_fallback:;
         .nullfree    = keys_nullfree,
     };
 
+    /* Minimum heads occupy only 1 KiB: choose no-lookahead callbacks here.
+     * Bodies share their implementation; constant modes remove the row-loop
+     * capacity decision instead of relying on compiler loop unswitching. */
+    const ray_pool_fn count_probe = ht_cap > JHT_MIN_CAP ? join_count_fn : join_count_tiny_fn;
     /* 2a: Count matches per morsel */
     if (pool && n_tasks > 1)
-        ray_pool_dispatch_n(pool, join_count_fn, &probe_ctx, n_tasks);
+        ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
     else
         for (uint32_t t = 0; t < n_tasks; t++)
-            join_count_fn(&probe_ctx, 0, t, t + 1);
+            count_probe(&probe_ctx, 0, t, t + 1);
 
     /* Prefix sum → morsel_offsets (reuse counts array as offsets) */
     pair_count = 0;
@@ -1694,11 +1728,12 @@ chained_ht_fallback:;
     probe_ctx.r_idx = r_idx;
 
     if (pair_count > 0) {
+        const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP ? join_fill_fn : join_fill_tiny_fn;
         if (pool && n_tasks > 1)
-            ray_pool_dispatch_n(pool, join_fill_fn, &probe_ctx, n_tasks);
+            ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
         else
             for (uint32_t t = 0; t < n_tasks; t++)
-                join_fill_fn(&probe_ctx, 0, t, t + 1);
+                fill_probe(&probe_ctx, 0, t, t + 1);
     }
 
     CHECK_CANCEL_GOTO(pool, join_cleanup);
@@ -1748,6 +1783,17 @@ join_gather:;
      * indices), falling back to per-column gather for nullable RIGHT columns. */
     int64_t left_ncols = ray_table_ncols(left_table);
     int64_t right_ncols = ray_table_ncols(right_table);
+    /* Share left columns only when the LEFT join's actual mapping preserves
+     * every left row in order. Cardinality alone is not sufficient: radix
+     * partitioning can reorder even a one-to-one join's output.
+     * Retained columns already carry their nulls, pools and symbol domains;
+     * do not rewrite metadata on these shared objects below. */
+    bool left_identity = join_type == 1 && pair_count == left_rows;
+    if (left_identity) {
+        for (int64_t i = 0; i < pair_count; i++) {
+            if (l_idx[i] != i) { left_identity = false; break; }
+        }
+    }
     result = ray_table_new(left_ncols + right_ncols);
     if (!result || RAY_IS_ERR(result)) goto join_cleanup;
 
@@ -1756,7 +1802,7 @@ join_gather:;
      * MGATHER_MAX_COLS and falls back to per-column gather otherwise, so
      * no column may be dropped here (a fixed [16] cap used to silently
      * truncate wide-table join results). */
-    size_t out_slots = (size_t)(left_ncols * 2 + right_ncols * 3);
+    size_t out_slots = (size_t)(left_ncols * 3 + right_ncols * 3);
     {
         void* out_mem = scratch_alloc(&out_cols_hdr,
                                       (out_slots ? out_slots : 1) * sizeof(void*));
@@ -1773,16 +1819,33 @@ join_gather:;
     ray_t** r_out_cols  = (ray_t**)(l_out_names + left_ncols);
     ray_t** r_src_cols  = r_out_cols + right_ncols;
     int64_t* r_out_names = (int64_t*)(r_src_cols + right_ncols);
+    ray_t** l_src_cols  = (ray_t**)(r_out_names + right_ncols);
 
-    /* Allocate all output columns upfront for batched gather */
+    /* Allocate all output columns upfront for batched gather.  Each source
+     * column is fetched once (borrowed plain object) and kept in
+     * l_src_cols / r_src_cols for the gather and propagate passes. */
     int64_t l_out_count = 0;
     bool l_has_list = false;
     for (int64_t c = 0; c < left_ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(left_table, c);
+        ray_t* col = ray_table_col_idx(left_table, c);
         if (!col) continue;
-        ray_t* new_col = col->type == RAY_LIST
-            ? join_gather_list_col(col, l_idx, pair_count)
-            : col_vec_new(col, pair_count);
+        if (RAY_IS_ERR(col)) {
+            for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
+            ray_release(result);
+            result = col;
+            goto join_cleanup;
+        }
+        ray_t* new_col;
+        /* Slice COW copies only its header, leaving the parent shared.
+         * Preserve the old independent gather for this representation. */
+        if (left_identity && !(col->attrs & RAY_ATTR_SLICE)) {
+            ray_retain(col);
+            new_col = col;
+        } else {
+            new_col = col->type == RAY_LIST
+                ? join_gather_list_col(col, l_idx, pair_count)
+                : col_vec_new(col, pair_count);
+        }
         if (!new_col || RAY_IS_ERR(new_col)) {
             ray_t* err = new_col ? new_col : ray_error("oom", NULL);
             for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
@@ -1791,8 +1854,9 @@ join_gather:;
             goto join_cleanup;
         }
         if (col->type == RAY_LIST) l_has_list = true;
-        else new_col->len = pair_count;
+        else if (new_col != col) new_col->len = pair_count;
         l_out_cols[l_out_count] = new_col;
+        l_src_cols[l_out_count] = col;
         l_out_names[l_out_count] = ray_table_col_name(left_table, c);
         l_out_count++;
     }
@@ -1800,9 +1864,16 @@ join_gather:;
     int64_t r_out_count = 0;
     bool r_has_list = false;
     for (int64_t c = 0; c < right_ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(right_table, c);
+        ray_t* col = ray_table_col_idx(right_table, c);
         int64_t name_id = ray_table_col_name(right_table, c);
         if (!col) continue;
+        if (RAY_IS_ERR(col)) {
+            for (int64_t i = 0; i < l_out_count; i++) ray_release(l_out_cols[i]);
+            for (int64_t i = 0; i < r_out_count; i++) ray_release(r_out_cols[i]);
+            ray_release(result);
+            result = col;
+            goto join_cleanup;
+        }
         bool is_key = false;
         for (uint32_t k = 0; k < n_keys; k++) {
             ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
@@ -1833,29 +1904,25 @@ join_gather:;
     if (pair_count > 0) {
         /* Left columns: multi_gather (non-nullable for INNER/LEFT) */
         bool l_nullable = (join_type == 2);  /* only FULL OUTER */
-        if (!l_nullable && !l_has_list &&
+        if (!left_identity && !l_nullable && !l_has_list &&
             l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
             multi_gather_ctx_t mgctx = { .idx = l_idx, .ncols = l_out_count };
-            int64_t si = 0;
-            for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
-                ray_t* col = ray_table_get_col_idx(left_table, c);
-                if (!col) continue;
+            for (int64_t si = 0; si < l_out_count; si++) {
+                ray_t* col = l_src_cols[si];
                 mgctx.srcs[si] = (char*)ray_data(col);
                 mgctx.dsts[si] = (char*)ray_data(l_out_cols[si]);
                 mgctx.esz[si] = col_esz(col);
-                si++;
             }
             if (pool && pair_count > RAY_PARALLEL_THRESHOLD)
                 ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pair_count);
             else
                 multi_gather_fn(&mgctx, 0, 0, pair_count);
         } else {
-            /* Fall back to per-column gather for nullable or single column */
-            int64_t si = 0;
-            for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
-                ray_t* col = ray_table_get_col_idx(left_table, c);
-                if (!col) continue;
-                if (col->type != RAY_LIST) {
+            /* Gather newly allocated columns, including slice fallbacks.
+             * Retained identity outputs already have their source values. */
+            for (int64_t si = 0; si < l_out_count; si++) {
+                ray_t* col = l_src_cols[si];
+                if (l_out_cols[si] != col && col->type != RAY_LIST) {
                     gather_ctx_t gctx = {
                         .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
                         .esz = col_esz(col), .nullable = l_nullable,
@@ -1865,7 +1932,6 @@ join_gather:;
                     else
                         gather_fn(&gctx, 0, 0, pair_count);
                 }
-                si++;
             }
         }
 
@@ -1904,16 +1970,14 @@ join_gather:;
      * adopt that source's domain (sym-domain Phase 2; no-op while all
      * domains are the runtime singleton). */
     {
-        int64_t si = 0;
-        for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
-            ray_t* col = ray_table_get_col_idx(left_table, c);
-            if (!col) continue;
+        for (int64_t si = 0; si < l_out_count; si++) {
+            ray_t* col = l_src_cols[si];
+            if (l_out_cols[si] == col) continue;  /* retained, metadata intact */
             col_propagate_str_pool(l_out_cols[si], col);
             if (col->type != RAY_LIST)
                 col_propagate_nulls_gather(l_out_cols[si], col, l_idx, pair_count);
             if (l_out_cols[si]->type == RAY_SYM)
                 ray_sym_vec_adopt_domain(l_out_cols[si], col);
-            si++;
         }
     }
     if (join_type == 2 && full_right_only_start >= 0) {
@@ -2165,10 +2229,22 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
         ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
-        if (lk && lk->base.opcode == OP_SCAN)
-            l_key_vecs[k] = ray_table_get_col(left_table, lk->sym);
-        if (rk && rk->base.opcode == OP_SCAN)
-            r_key_vecs[k] = ray_table_get_col(right_table, rk->sym);
+        if (lk && lk->base.opcode == OP_SCAN) {
+            l_key_vecs[k] = ray_table_col(left_table, lk->sym);
+            if (l_key_vecs[k] && RAY_IS_ERR(l_key_vecs[k])) {
+                ray_t* e = l_key_vecs[k];
+                scratch_free(key_vecs_hdr);
+                return e;
+            }
+        }
+        if (rk && rk->base.opcode == OP_SCAN) {
+            r_key_vecs[k] = ray_table_col(right_table, rk->sym);
+            if (r_key_vecs[k] && RAY_IS_ERR(r_key_vecs[k])) {
+                ray_t* e = r_key_vecs[k];
+                scratch_free(key_vecs_hdr);
+                return e;
+            }
+        }
         if (rk && rk->base.opcode == OP_CONST && rk->literal)
             r_key_vecs[k] = rk->literal;
     }
@@ -2294,8 +2370,13 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
     }
 
     for (int64_t c = 0; c < left_ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(left_table, c);
+        ray_t* col = ray_table_col_idx(left_table, c);
         if (!col) continue;
+        if (RAY_IS_ERR(col)) {
+            ray_release(result);
+            scratch_free(out_idx_hdr);
+            return col;
+        }
         ray_t* new_col = col->type == RAY_LIST
             ? join_gather_list_col(col, out_idx, out_count)
             : col_vec_new(col, out_count);
@@ -2672,6 +2753,16 @@ static void asof_idx_match_fn(void* raw, uint32_t wid,
     }
 }
 
+/* The two index variants of asof_hash_group_match (single key and
+ * multi-key) admit only a right side whose FIRST eq key carries a grouped
+ * HASH or PART index.  Shared with the caller so it pays the exact text
+ * null proof (rt_no_nulls) only when one of those variants can use it. */
+static bool asof_rt_eq_indexed(uint32_t n_eq, ray_t* const* rt_eq) {
+    if (n_eq == 0) return false;
+    ray_idx_kind_t kind = ray_index_kind(rt_eq[0]);
+    return kind == RAY_IDX_HASH || kind == RAY_IDX_PART;
+}
+
 static bool asof_hash_group_match(uint32_t n_eq,
                                   ray_t* const* lt_eq, ray_t* const* rt_eq,
                                   const int64_t* const* eq_xlut,
@@ -2802,9 +2893,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * sequential memory and costs a fraction of the binary searches it
      * unlocks.  No pass over the right table is needed: cost is
      * per-probed-key, not per-row. */
-    if (ok && n_eq == 1 && rt_no_nulls &&
-        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
-         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
+    if (ok && n_eq == 1 && rt_no_nulls && asof_rt_eq_indexed(n_eq, rt_eq)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
         ray_t* gsl_hdr = NULL;
@@ -2821,6 +2910,8 @@ static bool asof_hash_group_match(uint32_t n_eq,
              * with a shared bail flag. */
             int64_t verify_rows = 0;
             bool idx_ordered = asof_index_ordered_by(rt_eq[0], rt_time_sym);
+            /* counts the route decision, not a served use (the variant may still bail) */
+            if (idx_ordered) ray_idx_consults[IDX_SITE_ASOF_ORDERED]++;
             for (int32_t g = 0; g < n_groups && served; g++) {
                 int hit = asof_index_group(rt_eq[0], gkeys[g], &gsl[g]);
                 if (hit < 0) { served = false; break; }  /* ineligible */
@@ -2836,6 +2927,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
             }
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
+                ray_idx_note_use(rt_eq[0]);
                 asof_idx_match_ctx_t mctx = {
                     .slices = gsl, .left_gid = left_gid,
                     .lt_time = lt_time, .rt_time = rt_time,
@@ -2866,8 +2958,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * table anyway, the sequential full pass is cheaper per row, so bail
      * upfront on the (known!) slice-length sum. */
     if (ok && n_eq >= 2 && rt_no_nulls && n_groups > 0 &&
-        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
-         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
+        asof_rt_eq_indexed(n_eq, rt_eq)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
 
@@ -2934,6 +3025,8 @@ static bool asof_hash_group_match(uint32_t n_eq,
              * for the density bail. */
             int64_t total_slice = 0;
             bool idx_ordered = asof_index_ordered_by(rt_eq[0], rt_time_sym);
+            /* counts the route decision, not a served use (the variant may still bail) */
+            if (idx_ordered) ray_idx_consults[IDX_SITE_ASOF_ORDERED]++;
             for (int32_t f = 0; f < n_fk && served; f++) {
                 int32_t rep = fk_head[f];
                 int hit = asof_index_group(rt_eq[0],
@@ -2989,6 +3082,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 }
                 if (sparse) {
                     ray_idx_hits[IDX_SITE_ASOF]++;
+                    ray_idx_note_use(rt_eq[0]);
                     scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
                     scratch_free(fnext_hdr); scratch_free(fgid_hdr);
                     scratch_free(fsl_hdr);
@@ -3004,6 +3098,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
 
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
+                ray_idx_note_use(rt_eq[0]);
                 /* Left cursor structures — identical to the full-pass
                  * cursor merge. */
                 memset(lcnt, 0, ((size_t)n_groups + 1) * 4);
@@ -3445,8 +3540,16 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
     /* Get time vectors — use int64 representation for comparison.
      * TIME uses 4-byte i32 (ms), TIMESTAMP uses 8-byte i64 (ns).
      * We expand to a temporary i64 array for uniform comparison. */
-    ray_t* lt_time_vec = ray_table_get_col(left_table, time_sym);
-    ray_t* rt_time_vec = ray_table_get_col(right_table, time_sym);
+    ray_t* lt_time_vec = ray_table_col(left_table, time_sym);
+    ray_t* rt_time_vec = ray_table_col(right_table, time_sym);
+    if ((lt_time_vec && RAY_IS_ERR(lt_time_vec)) ||
+        (rt_time_vec && RAY_IS_ERR(rt_time_vec))) {
+        ray_t* e = (lt_time_vec && RAY_IS_ERR(lt_time_vec)) ? lt_time_vec : rt_time_vec;
+        if (e == lt_time_vec && rt_time_vec && RAY_IS_ERR(rt_time_vec))
+            ray_error_free(rt_time_vec);
+        scratch_free(eqbuf_hdr);
+        return e;
+    }
     if (!lt_time_vec || !rt_time_vec) {
         scratch_free(eqbuf_hdr);
         return ray_error("schema", NULL);
@@ -3486,8 +3589,16 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
     /* Get eq key vectors — stored as ray_t* for type-safe access.
      * lt_eq/rt_eq point into the eqbuf carve above (no separate alloc). */
     for (uint32_t k = 0; k < n_eq; k++) {
-        ray_t* lv = ray_table_get_col(left_table, eq_syms[k]);
-        ray_t* rv = ray_table_get_col(right_table, eq_syms[k]);
+        ray_t* lv = ray_table_col(left_table, eq_syms[k]);
+        ray_t* rv = ray_table_col(right_table, eq_syms[k]);
+        if ((lv && RAY_IS_ERR(lv)) || (rv && RAY_IS_ERR(rv))) {
+            ray_t* e = (lv && RAY_IS_ERR(lv)) ? lv : rv;
+            if (e == lv && rv && RAY_IS_ERR(rv)) ray_error_free(rv);
+            if (lt_time_hdr) scratch_free(lt_time_hdr);
+            if (rt_time_hdr) scratch_free(rt_time_hdr);
+            scratch_free(eqbuf_hdr);
+            return e;
+        }
         if (!lv || !rv) {
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
@@ -3618,10 +3729,27 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
      * (no sorting of either side; a fresh CSR grouped index on a single eq
      * key answers groups with no right pass at all).  Falls back to the
      * sort-merge when the per-group right-time monotonicity precondition
-     * fails. */
+     * fails.
+     *
+     * rt_no_nulls feeds only the index variants.  The O(1) attrs check
+     * settles every key it can; a SYM/STR key, which that check can never
+     * clear, is proven by a full payload scan — so take that scan only
+     * when the first key carries an index the variants accept, and only
+     * after every flag-readable key has passed.  Without such an index
+     * rt_no_nulls stays false at no cost, as nothing would consume it. */
     bool rt_no_nulls = !ray_vec_may_have_nulls(rt_time_vec);
-    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
-        if (ray_vec_may_have_nulls(rt_eq[k])) rt_no_nulls = false;
+    bool rt_text_keys = false;
+    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++) {
+        if (!ray_vec_may_have_nulls(rt_eq[k])) continue;
+        if (join_key_col_scanned(rt_eq[k])) rt_text_keys = true;
+        else rt_no_nulls = false;
+    }
+    if (rt_no_nulls && rt_text_keys) {
+        if (!asof_rt_eq_indexed(n_eq, rt_eq)) rt_no_nulls = false;
+        for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
+            if (join_key_col_scanned(rt_eq[k]) &&
+                !join_key_col_nullfree(rt_eq[k])) rt_no_nulls = false;
+    }
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
@@ -3965,7 +4093,12 @@ build_output:;
     /* Gather left columns — iterate in original row order, preserve nulls */
     for (int64_t c = 0; c < left_ncols; c++) {
         int64_t col_name = ray_table_col_name(left_table, c);
-        ray_t* src_col = ray_table_get_col_idx(left_table, c);
+        ray_t* src_col = ray_table_col_idx(left_table, c);
+        if (src_col && RAY_IS_ERR(src_col)) {
+            ray_release(out);
+            out = src_col;
+            goto window_output_cleanup;
+        }
         ray_t* dst_col = join_gather_col_serial(src_col, lidx, out_n);
         if (!dst_col || RAY_IS_ERR(dst_col)) {
             ray_release(out);
@@ -3985,7 +4118,12 @@ build_output:;
     for (int64_t rc = 0; rc < right_out_count; rc++) {
         int64_t cidx = right_out_idx[rc];
         int64_t col_name = ray_table_col_name(right_table, cidx);
-        ray_t* src_col = ray_table_get_col_idx(right_table, cidx);
+        ray_t* src_col = ray_table_col_idx(right_table, cidx);
+        if (src_col && RAY_IS_ERR(src_col)) {
+            ray_release(out);
+            out = src_col;
+            goto window_output_cleanup;
+        }
         ray_t* dst_col = join_gather_col_serial(src_col, ridx, out_n);
         if (!dst_col || RAY_IS_ERR(dst_col)) {
             ray_release(out);

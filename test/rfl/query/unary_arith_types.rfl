@@ -1,0 +1,200 @@
+;; unary_arith_types.rfl — a unary arithmetic verb in a query takes the
+;; column types its builtin takes (#854).
+;;
+;; The planner lowered `neg`/`abs`/`exp`/`log`/`sqrt`/`ceil`/`floor`/`round`
+;; to DAG kernels that read any fixed-width lane as a number: over a DATE
+;; column `(neg d)` came back as negated day counts ([-8766 ...]) and
+;; `(sqrt d)` as roots of them, TIME and TIMESTAMP likewise, SYM as interned
+;; ids (`(round s)` crashed), and `neg`/`abs` took BOOL and U8, all of which
+;; the builtins reject with `type`.  The integer lanes of `ceil`/`floor`/
+;; `round` returned garbage where the builtin is the identity (round: F64).
+;; Such a projection now declines to the evaluator, which applies the
+;; builtin; over an integer column ceil / floor lower to the column itself
+;; and round to a cast to F64, which is what the builtins return.  Oracle:
+;; the builtin over the column itself.
+;; @requires: posix
+
+(set F (table [d t ts b u h l f s k] (list [2024.01.01 2024.01.02 2024.01.03] [10:00:00.000 11:00:00.000 12:00:00.000] [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000 2024.01.03D10:00:00.000000000] [true false true] (as 'U8 [1 2 3]) (as 'I16 [1 -2 3]) [1 -2 3] [1.5 -2.5 3.5] ['a 'b 'c] [1 1 2])))
+
+;; ─── the builtins reject temporal columns ───────────────────────────────────
+(neg (at F 'd)) !- type
+(sqrt (at F 'ts)) !- type
+(round (at F 't)) !- type
+
+;; ─── so does a projection over a flat table: DATE ───────────────────────────
+(select {x: (neg d) from: F}) !- type
+(select {x: (abs d) from: F}) !- type
+(select {x: (exp d) from: F}) !- type
+(select {x: (log d) from: F}) !- type
+(select {x: (sqrt d) from: F}) !- type
+(select {x: (ceil d) from: F}) !- type
+(select {x: (floor d) from: F}) !- type
+(select {x: (round d) from: F}) !- type
+
+;; TIME
+(select {x: (neg t) from: F}) !- type
+(select {x: (abs t) from: F}) !- type
+(select {x: (exp t) from: F}) !- type
+(select {x: (log t) from: F}) !- type
+(select {x: (sqrt t) from: F}) !- type
+(select {x: (ceil t) from: F}) !- type
+(select {x: (floor t) from: F}) !- type
+(select {x: (round t) from: F}) !- type
+
+;; TIMESTAMP
+(select {x: (neg ts) from: F}) !- type
+(select {x: (abs ts) from: F}) !- type
+(select {x: (exp ts) from: F}) !- type
+(select {x: (log ts) from: F}) !- type
+(select {x: (sqrt ts) from: F}) !- type
+(select {x: (ceil ts) from: F}) !- type
+(select {x: (floor ts) from: F}) !- type
+(select {x: (round ts) from: F}) !- type
+
+;; SYM: the kernels read the interned ids
+(select {x: (neg s) from: F}) !- type
+(select {x: (sqrt s) from: F}) !- type
+(select {x: (floor s) from: F}) !- type
+(select {x: (round s) from: F}) !- type
+
+;; neg / abs reject BOOL and U8 as well; exp/log/sqrt take them
+(neg (at F 'b)) !- type
+(select {x: (neg b) from: F}) !- type
+(select {x: (abs b) from: F}) !- type
+(select {x: (neg u) from: F}) !- type
+(select {x: (abs u) from: F}) !- type
+(at (select {x: (sqrt b) from: F}) 'x) -- (sqrt (at F 'b))
+(at (select {x: (exp u) from: F}) 'x) -- (exp (at F 'u))
+
+;; a temporal literal is not folded to its count either
+(neg 2024.01.01) !- type
+(select {x: (neg 2024.01.01) from: F}) !- type
+(select {x: (sqrt 10:00:00.000) from: F}) !- type
+
+;; ─── the same verb inside update, where:, by: and an aggregate ──────────────
+(update {x: (neg d) from: F}) !- type
+(select {k: k from: F where: (< (neg d) 0)}) !- type
+(select {x: (abs d) by: k from: F}) !- type
+(select {x: (sum (neg d)) from: F}) !- type
+(select {x: (+ (sqrt ts) 1) from: F}) !- type
+
+;; ─── numeric columns still compute ──────────────────────────────────────────
+(at (select {x: (neg l) from: F}) 'x) -- [-1 2 -3]
+(at (select {x: (abs h) from: F}) 'x) -- (abs (at F 'h))
+(at (select {x: (neg f) from: F}) 'x) -- [-1.5 2.5 -3.5]
+(at (select {x: (abs f) from: F}) 'x) -- [1.5 2.5 3.5]
+(at (select {x: (sqrt l) from: F}) 'x) -- (sqrt (at F 'l))
+(at (select {x: (exp f) from: F}) 'x) -- (exp (at F 'f))
+(at (select {x: (log h) from: F}) 'x) -- (log (at F 'h))
+(at (select {x: (ceil f) from: F}) 'x) -- [2.0 -2.0 4.0]
+(at (select {x: (floor f) from: F}) 'x) -- [1.0 -3.0 3.0]
+(at (select {x: (round f) from: F}) 'x) -- [2.0 -3.0 4.0]
+;; ceil / floor of an integer column is the identity; round is F64
+(at (select {x: (ceil l) from: F}) 'x) -- [1 -2 3]
+(at (select {x: (floor h) from: F}) 'x) -- (floor (at F 'h))
+(at (select {x: (round l) from: F}) 'x) -- [1.0 -2.0 3.0]
+(at (select {x: (round h) from: F}) 'x) -- (round (at F 'h))
+(at (select {x: (ceil b) from: F}) 'x) -- (ceil (at F 'b))
+(at (select {x: (neg (- d 2024.01.01)) from: F}) 'x) -- [0 -1 -2]
+;; ─── ceil / floor / round over every integer width, with nulls ──────────────
+;; ceil and floor keep the column (type and nulls); round is F64, 0Nf for null
+(set Z (table [b u h i l k] (list [true false true false] (as 'U8 [1 2 3 0]) (as 'I16 [1 0N -3 7]) (as 'I32 [1 0N -3 7]) [1 0N -3 7] [1 1 2 2])))
+(at (select {x: (ceil b) from: Z}) 'x) -- (ceil (at Z 'b))
+(at (select {x: (floor b) from: Z}) 'x) -- (floor (at Z 'b))
+(at (select {x: (round b) from: Z}) 'x) -- (round (at Z 'b))
+(at (select {x: (ceil u) from: Z}) 'x) -- (ceil (at Z 'u))
+(at (select {x: (floor u) from: Z}) 'x) -- (floor (at Z 'u))
+(at (select {x: (round u) from: Z}) 'x) -- (round (at Z 'u))
+(at (select {x: (ceil h) from: Z}) 'x) -- (ceil (at Z 'h))
+(at (select {x: (floor h) from: Z}) 'x) -- (floor (at Z 'h))
+(at (select {x: (round h) from: Z}) 'x) -- (round (at Z 'h))
+(at (select {x: (ceil i) from: Z}) 'x) -- (ceil (at Z 'i))
+(at (select {x: (floor i) from: Z}) 'x) -- (floor (at Z 'i))
+(at (select {x: (round i) from: Z}) 'x) -- (round (at Z 'i))
+(at (select {x: (ceil l) from: Z}) 'x) -- (ceil (at Z 'l))
+(at (select {x: (floor l) from: Z}) 'x) -- (floor (at Z 'l))
+(at (select {x: (round l) from: Z}) 'x) -- (round (at Z 'l))
+(type (at (select {x: (floor b) from: Z}) 'x)) -- 'B8
+(type (at (select {x: (ceil u) from: Z}) 'x)) -- 'U8
+(type (at (select {x: (floor h) from: Z}) 'x)) -- 'I16
+(type (at (select {x: (ceil i) from: Z}) 'x)) -- 'I32
+(type (at (select {x: (floor l) from: Z}) 'x)) -- 'I64
+(type (at (select {x: (round b) from: Z}) 'x)) -- 'F64
+(type (at (select {x: (round h) from: Z}) 'x)) -- 'F64
+(type (at (select {x: (round i) from: Z}) 'x)) -- 'F64
+(at (select {x: (floor i) from: Z}) 'x) -- (as 'I32 [1 0N -3 7])
+(at (select {x: (round i) from: Z}) 'x) -- [1.0 0Nf -3.0 7.0]
+(nil? (at (select {x: (ceil h) from: Z}) 'x)) -- [false true false false]
+(nil? (at (select {x: (round l) from: Z}) 'x)) -- [false true false false]
+;; the output keeps its own name next to the column it reads, either order
+(select {i: i x: (floor i) from: Z}) -- (table [i x] (list (at Z 'i) (at Z 'i)))
+(select {x: (ceil l) l: l y: (round l) from: Z}) -- (table [x l y] (list (at Z 'l) (at Z 'l) (round (at Z 'l))))
+(select {a: (floor h) b: (ceil h) from: Z}) -- (table [a b] (list (at Z 'h) (at Z 'h)))
+;; update, where:, by: and aggregates
+(at (update {x: (floor i) from: Z}) 'x) -- (at Z 'i)
+(at (update {x: (round i) from: Z}) 'x) -- (round (at Z 'i))
+(at (update {l: (floor l) from: Z}) 'l) -- (at Z 'l)
+(at (select {k: k from: Z where: (> (floor i) 0)}) 'k) -- [1 2]
+(at (select {k: k from: Z where: (nil? (ceil h))}) 'k) -- [1]
+(at (select {k: k from: Z where: (> (round l) 0.0)}) 'k) -- [1 2]
+(at (select {k: k from: Z where: (floor b)}) 'k) -- [1 2]
+(select {x: (sum (floor i)) by: k from: Z}) -- (select {x: (sum i) by: k from: Z})
+(select {x: (sum (round l)) by: k from: Z}) -- (table [k x] (list [1 2] [1.0 4.0]))
+(select {n: (count k) by: {g: (floor h)} from: Z}) -- (select {n: (count k) by: {g: h} from: Z})
+(at (select {x: (sum (ceil h)) from: Z}) 'x) -- (at (select {x: (sum h) from: Z}) 'x)
+(at (select {x: (max (floor i)) from: Z}) 'x) -- (at (select {x: (max i) from: Z}) 'x)
+(at (select {x: (min (ceil u)) from: Z}) 'x) -- (at (select {x: (min u) from: Z}) 'x)
+(at (select {x: (avg (round i)) from: Z}) 'x) -- (at (select {x: (avg i) from: Z}) 'x)
+(at (select {x: (count (floor l)) from: Z}) 'x) -- [4]
+;; nested and constant operands
+(at (select {x: (floor (+ i 1)) from: Z}) 'x) -- (floor (+ (at Z 'i) 1))
+(at (select {x: (round (neg i)) from: Z}) 'x) -- (round (neg (at Z 'i)))
+(at (select {x: (floor (neg h)) from: Z}) 'x) -- (floor (neg (at Z 'h)))
+(at (select {x: (ceil (neg i)) from: Z}) 'x) -- (ceil (neg (at Z 'i)))
+(at (select {x: (floor (ceil l)) from: Z}) 'x) -- (at Z 'l)
+(at (select {x: (round (floor i)) from: Z}) 'x) -- (round (at Z 'i))
+(at (select {x: (+ (floor l) 1) from: Z}) 'x) -- (+ (at Z 'l) 1)
+(at (select {x: (floor (> l 0)) from: Z}) 'x) -- (> (at Z 'l) 0)
+(at (select {x: (+ l (floor 2)) from: Z}) 'x) -- (+ (at Z 'l) 2)
+(at (select {x: (+ i (round 0Ni)) from: Z}) 'x) -- [0Nf 0Nf 0Nf 0Nf]
+(at (select {x: (+ i (floor (as 'I32 5))) from: Z}) 'x) -- (+ (at Z 'i) (as 'I32 5))
+
+(at (select {x: (sum (abs l)) from: F}) 'x) -- [6]
+(at (update {x: (neg f) from: F}) 'x) -- [-1.5 2.5 -3.5]
+(at (select {k: k from: F where: (< (neg l) 0)}) 'k) -- [1 2]
+;; order-preserving verbs on temporals are not arithmetic and stay as they were
+(at (select {x: (maxs d) from: F}) 'x) -- (maxs (at F 'd))
+(at (select {x: (deltas ts) from: F}) 'x) -- (deltas (at F 'ts))
+
+;; ─── a splayed copy and a parted table's DATE column ─────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_unary_arith_types")
+(set N (table [d ts f] (list (at F 'd) (at F 'ts) (at F 'f))))
+(.db.splayed.set "/tmp/rfl_unary_arith_types/s/" N)
+(set S (.db.splayed.get "/tmp/rfl_unary_arith_types/s/"))
+(select {x: (neg d) from: S}) !- type
+(select {x: (sqrt ts) from: S}) !- type
+(select {x: (floor d) from: S}) !- type
+(at (select {x: (neg f) from: S}) 'x) -- [-1.5 2.5 -3.5]
+(set NI (table [h i l] (list (at Z 'h) (at Z 'i) (at Z 'l))))
+(.db.splayed.set "/tmp/rfl_unary_arith_types/si/" NI)
+(set SI (.db.splayed.get "/tmp/rfl_unary_arith_types/si/"))
+(at (select {x: (floor i) from: SI}) 'x) -- (at NI 'i)
+(at (select {x: (ceil h) from: SI}) 'x) -- (at NI 'h)
+(at (select {x: (round l) from: SI}) 'x) -- (round (at NI 'l))
+(.db.splayed.set "/tmp/rfl_unary_arith_types/p/2024.01.01/t/" N)
+(.db.splayed.set "/tmp/rfl_unary_arith_types/p/2024.01.02/t/" N)
+(set P (.db.parted.get "/tmp/rfl_unary_arith_types/p/" 't))
+(select {x: (neg d) from: P}) !- type
+(select {x: (abs ts) from: P}) !- type
+(select {x: (round d) from: P}) !- type
+(at (select {x: (neg f) from: P}) 'x) -- [-1.5 2.5 -3.5 -1.5 2.5 -3.5]
+(.db.splayed.set "/tmp/rfl_unary_arith_types/pi/2024.01.01/t/" NI)
+(.db.splayed.set "/tmp/rfl_unary_arith_types/pi/2024.01.02/t/" NI)
+(set PI (.db.parted.get "/tmp/rfl_unary_arith_types/pi/" 't))
+(select {x: (floor date) from: PI}) !- type
+(select {x: (round date) from: PI}) !- type
+(at (select {x: (floor i) from: PI}) 'x) -- (concat (at NI 'i) (at NI 'i))
+(at (select {x: (ceil h) from: PI}) 'x) -- (concat (at NI 'h) (at NI 'h))
+(at (select {x: (round l) from: PI}) 'x) -- (concat (round (at NI 'l)) (round (at NI 'l)))
+(at (select {x: (sum (round i)) by: date from: PI}) 'x) -- [5.0 5.0]
+(.sys.exec "rm -rf /tmp/rfl_unary_arith_types")

@@ -41,12 +41,14 @@
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
+#include "store/enccol.h"
 #include "store/splay.h"
 #include "store/part.h"
 #include "core/ipc.h"
 #include "core/mcast.h"
 #include "core/poll.h"
 #include "core/timer.h"
+#include "core/pool.h"      /* ray_pool_get — the pool size in .sys.info */
 
 /* Forward decls: keep this TU decoupled from core/runtime.h — only
  * the opaque accessors are needed. */
@@ -71,8 +73,8 @@ void* ray_runtime_get_sys_args(void);
 #define RAY_PCLOSE(f)    _pclose(f)
 #endif
 
-static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
-                             int64_t* out) {
+int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
+                      int64_t* out) {
     if (!s || !*s) return 0;
     const unsigned char* p = (const unsigned char*)s;
     if (!nonnegative && (*p == '+' || *p == '-')) p++;
@@ -84,7 +86,8 @@ static int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
     errno = 0;
     long long v = strtoll(s, &end, 10);
     if (errno == ERANGE || end == s || *end != '\0' ||
-        (nonnegative && v < 0) || (core_count && v > INT_MAX))
+        (nonnegative && v < 0) ||
+        (core_count && v > (int64_t)RAY_HEAP_ID_BITS - 1))
         return 0;
     *out = (int64_t)v;
     return 1;
@@ -175,10 +178,10 @@ static const char* str_to_cpath(ray_t* s, char* buf, size_t bufsz) {
     return buf;
 }
 
-/* (.db.splayed.set "dir" table) or (.db.splayed.set "dir" table "sym_path") */
+/* (.db.splayed.set "dir" table), (... "sym_path"), (... opts), (... "sym_path" opts) */
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
-    if (n < 2 || n > 3)
-        return ray_error("domain", ".db.splayed.set expects 2 or 3 arguments, got %lld", (long long)n);
+    if (n < 2 || n > 4)
+        return ray_error("domain", ".db.splayed.set expects 2 to 4 arguments, got %lld", (long long)n);
 
     char dir[1024];
     if (!str_to_cpath(args[0], dir, sizeof(dir)))
@@ -190,12 +193,59 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
 
     char sym[1024];
     const char* sym_path = NULL;
-    if (n == 3 && args[2] && args[2]->type == -RAY_STR)
-        sym_path = str_to_cpath(args[2], sym, sizeof(sym));
-    else
-        sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
+    ray_t* opts = NULL;
+    bool sym_given = false;
+    for (int64_t i = 2; i < n; i++) {
+        ray_t* a = args[i];
+        if (a && a->type == RAY_DICT) {
+            if (opts) return ray_error("domain", ".db.splayed.set: a second options dict");
+            opts = a;
+        } else if (i == 2) {
+            /* a string names the symfile; anything else is ignored and the
+             * convention applies, as before */
+            if (a && a->type == -RAY_STR) {
+                sym_given = true;   /* an empty or over-long path stays NULL */
+                sym_path = str_to_cpath(a, sym, sizeof(sym));
+            }
+        } else {
+            return ray_error("domain", ".db.splayed.set: argument 4 must be an options dict, got %s",
+                             a ? ray_type_name(a->type) : "null");
+        }
+    }
+    /* options: compress (true/false) and symfile ('shared/'column) */
+    ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
+    for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
+        ray_t* k = ray_sym_vec_cell(okeys, i);
+        bool known = k && ((ray_str_len(k) == 8 && memcmp(ray_str_ptr(k), "compress", 8) == 0) ||
+                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "symfile", 7) == 0));
+        if (!known)
+            return ray_error("domain", "unknown option '%.*s' (compress and symfile are accepted)",
+                             k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
+    }
+    ray_compress_t mode;
+    ray_t* oerr = ray_compress_opt_parse(opts, false, &mode);
+    if (oerr) return oerr;
+    ray_symfile_t layout;
+    oerr = ray_symfile_opt_parse(opts, &layout);
+    if (oerr) return oerr;
+    if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
+    /* A symfile per column has no shared symfile to name, and the segments
+     * of a parted table resolve over its one root symfile: 'column takes
+     * neither a symfile path nor a partition directory (whose convention
+     * resolves to the parted root's symfile, not dir/.sym). */
+    if (layout == RAY_SYMFILE_COLUMN) {
+        char own[1024];
+        size_t dlen = strlen(dir);
+        while (dlen > 1 && dir[dlen - 1] == '/') dlen--;
+        int on = snprintf(own, sizeof(own), "%.*s/.sym", (int)dlen, dir);
+        bool partition = sym_path && on > 0 && (size_t)on < sizeof(own) && strcmp(own, sym_path) != 0;
+        if (sym_given || partition)
+            return ray_error("domain", sym_given
+                ? ".db.splayed.set: a symfile path with symfile 'column"
+                : ".db.splayed.set: symfile 'column for a partition of a parted table");
+    }
 
-    ray_err_t err = ray_splay_save(tbl, dir, sym_path);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);
@@ -711,6 +761,12 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
             OBJSIZE_PUSH(v->obj);
         return true;
     }
+    if (v->type == RAY_ENCCOL) {          /* the decoded cache (and its index), the parted wrapper */
+        ray_t* kids[2];
+        int nk = ray_enccol_children(v, kids);
+        for (int i = 0; i < nk; i++) OBJSIZE_PUSH(kids[i]);
+        return true;
+    }
     if (v->attrs & RAY_ATTR_SLICE) {
         OBJSIZE_PUSH(v->slice_parent);
         return true;
@@ -739,7 +795,7 @@ static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
     if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
         ray_t** slots = (ray_t**)ray_data(v);
         OBJSIZE_PUSH(slots[0]);
-        OBJSIZE_PUSH(slots[1]);
+        OBJSIZE_PUSH(slots[1]);   /* plain-table */
         return true;
     }
     if (v->type == RAY_LIST) {
@@ -787,6 +843,10 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
     ray_query_measure_t measure;
     ray_query_measure_begin(&measure);
     ray_t* result = ray_eval(args[0]);
+    /* Force a lazy result inside the measured scope so the time, worker and
+     * allocation figures cover the computation, not just graph construction
+     * (#856).  Consumes the handle; yields an owned value or an error. */
+    if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
     ray_query_metrics_t metrics;
     ray_query_measure_end(&measure, &metrics);
 
@@ -875,6 +935,8 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
     ray_heap_gc();
+    /* Dead memory the heap keeps for reuse is not kept locked against swap. */
+    ray_heap_unlock_idle();
     /* Same statement-boundary rules as the REPL: under memory pressure what
      * is free goes back now, and an explicit maintenance call is also a
      * chance to notice the process has gone quiet. */
@@ -1267,7 +1329,8 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n) {
 
 /* (.sys.mem) -- return dict with memory allocator statistics */
 ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.mem takes no arguments");
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
@@ -1288,6 +1351,11 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "anon-committed",  14, ray_heap_anon_committed()     },
         { "anon-peak",        9, ray_heap_anon_peak()          },
         { "anon-watermark",  14, ray_heap_anon_watermark()     },
+        /* the heap's mappings locked against swap-out (bytes mapped, not
+         * resident), the kernel's refusals, and the bytes left unlocked */
+        { "locked-bytes",    12, ray_heap_locked_bytes()       },
+        { "lock-failed",     11, ray_heap_lock_failures()      },
+        { "lock-skipped",    12, ray_heap_lock_skipped()       },
         { "group-perpart-runs", 18, ray_group_perpart_runs()   },
         { "asof-perpart-runs",  17, ray_asof_perpart_runs()    },
         { "sort-perpart-runs",  17, ray_sort_perpart_runs()    },
@@ -1329,7 +1397,8 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
  */
 ray_t* ray_prof_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.prof takes no arguments");
 
     /* Read the snapshot of the last completed query — NOT the in-flight
      * buffer, which currently holds this `(.sys.prof)` call's own spans.
@@ -1524,16 +1593,18 @@ static bool ray_os_hostname(char* buf, size_t cap) {
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
-    (void)args; (void)n;
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.info takes no arguments");
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
     if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(5);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
 #if !defined(RAY_OS_WINDOWS)
+    /* cores: the CPUs this process may run on (its affinity mask) */
     int64_t s1 = ray_sym_intern("cores", 5);
     keys = ray_vec_append(keys, &s1);
-    ray_t* v1 = make_i64(sysconf(_SC_NPROCESSORS_ONLN));
+    ray_t* v1 = make_i64((int64_t)ray_cpu_set_count());
     vals = ray_list_append(vals, v1); ray_release(v1);
 
     int64_t s2 = ray_sym_intern("page-size", 9);
@@ -1564,6 +1635,13 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     ray_t* v3 = make_i64(ray_sys_total_ram());
     vals = ray_list_append(vals, v3); ray_release(v3);
 #endif
+
+    /* workers: the threads of the execution pool, main included (the size
+     * a default pool would get while none exists; none is created here) */
+    int64_t sw = ray_sym_intern("workers", 7);
+    keys = ray_vec_append(keys, &sw);
+    ray_t* vw = make_i64((int64_t)ray_pool_size());
+    vals = ray_list_append(vals, vw); ray_release(vw);
 
     /* Process and host identity (#573).  An embedded process previously had
      * no way to name itself: pid plus hostname plus a start timestamp is a
@@ -1634,6 +1712,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         else if (strcmp(argv[i], "-U") == 0 && i + 1 < argc) i++;   /* skip secret */
         else if ((strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0) && i + 1 < argc)
             log = argv[++i];
+        else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) && i + 1 < argc)
+            i++;   /* RAM budget is configured by the launcher, not exposed here */
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { /* ignore */ }
         else file = argv[i];
     }

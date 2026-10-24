@@ -25,6 +25,9 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "lang/format.h"
+#include "ops/idxop.h"
+#include "store/enccol.h"
+#include "vec/vec.h"
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -75,15 +78,19 @@ static bool table_col_is_valid(ray_t* col) {
     return col->type == RAY_LIST ||
            ray_is_vec(col) ||
            RAY_IS_PARTED(col->type) ||
-           col->type == RAY_MAPCOMMON;
+           col->type == RAY_MAPCOMMON ||
+           col->type == RAY_ENCCOL;          /* single or parted; len is logical */
 }
 
 static int64_t table_col_nrows(ray_t* col) {
-    if (!col) return 0;
+    if (!col || ray_is_atom(col)) return 0;      /* an atom has no rows (its len field is payload) */
+    if (col->type == RAY_ENCCOL) return col->len;   /* no decode */
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)
         return ray_parted_nrows(col);
     return col->len;
 }
+
+int64_t ray_table_col_nrows(ray_t* col) { return table_col_nrows(col); }
 
 /* --------------------------------------------------------------------------
  * ray_table_new — allocates an empty table with capacity for `ncols`.
@@ -208,10 +215,13 @@ ray_t* ray_table_validate_rectangular(ray_t* tbl, const char* context) {
 }
 
 /* --------------------------------------------------------------------------
- * ray_table_get_col — lookup column by sym id; borrowed pointer or NULL.
+ * Slot lookups (borrowed slot object, plain or RAY_ENCCOL), then the
+ * accessors built on them: metadata (never decodes), plain column
+ * (materializes an encoded slot), index, encoded object, and the legacy
+ * getters.
  * -------------------------------------------------------------------------- */
 
-ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
+static ray_t* tbl_slot_by_name(ray_t* tbl, int64_t name_id) {
     if (!tbl_is_table(tbl)) return NULL;
     ray_t* schema = tbl_schema(tbl);
     ray_t* cols   = tbl_cols(tbl);
@@ -224,16 +234,156 @@ ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
     return NULL;
 }
 
-/* --------------------------------------------------------------------------
- * ray_table_get_col_idx — borrowed pointer at slot `idx`, or NULL.
- * -------------------------------------------------------------------------- */
-
-ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
+static ray_t* tbl_slot_by_idx(ray_t* tbl, int64_t idx) {
     if (!tbl_is_table(tbl)) return NULL;
     ray_t* cols = tbl_cols(tbl);
     if (!cols) return NULL;
     if (idx < 0 || idx >= cols->len) return NULL;
     return ((ray_t**)ray_data(cols))[idx];
+}
+
+bool ray_col_meta_of(ray_t* c, ray_col_meta_t* m) {
+    memset(m, 0, sizeof *m);
+    if (!c || RAY_IS_ERR(c)) return false;
+    if (c->type == RAY_ENCCOL) { ray_enccol_meta(c, m); return true; }
+    m->type = c->type;
+    m->attrs = c->attrs;
+    m->len = table_col_nrows(c);
+    m->null_count = -1;
+    if (RAY_IS_PARTED(c->type)) { m->n_segs = c->len; return true; }
+    if (ray_is_vec(c) && ray_index_has(c)) {
+        ray_index_t* ix = ray_index_payload(c->index);
+        m->index_kind = ix->kind;
+        m->unique = (ix->markers & RAY_MARK_UNIQUE) != 0;
+    }
+    return true;
+}
+
+bool ray_table_col_meta(ray_t* tbl, int64_t name_id, ray_col_meta_t* m) {
+    return ray_col_meta_of(tbl_slot_by_name(tbl, name_id), m);
+}
+bool ray_table_col_meta_idx(ray_t* tbl, int64_t idx, ray_col_meta_t* m) {
+    return ray_col_meta_of(tbl_slot_by_idx(tbl, idx), m);
+}
+
+static ray_t* slot_plain(ray_t* c) {
+    if (!c) return NULL;
+    return c->type == RAY_ENCCOL ? ray_enccol_materialize(c) : c;
+}
+/* The result is borrowed and read-only: encoded objects are shared between
+ * table copies and share one decoded cache, so never write through it. */
+ray_t* ray_table_col(ray_t* tbl, int64_t name_id)  { return slot_plain(tbl_slot_by_name(tbl, name_id)); }
+ray_t* ray_table_col_idx(ray_t* tbl, int64_t idx)  { return slot_plain(tbl_slot_by_idx(tbl, idx)); }
+
+static ray_t* slot_index(ray_t* c, ray_t** index) {
+    *index = NULL;
+    if (!c) return NULL;
+    if (c->type != RAY_ENCCOL) {
+        if (ray_is_vec(c) && ray_index_has(c)) *index = c->index;
+        return NULL;
+    }
+    if (!ray_enccol_may_have_index(c)) return NULL;    /* parted answers false too */
+    ray_t* d = ray_enccol_materialize(c);
+    if (RAY_IS_ERR(d)) return d;
+    if (ray_index_has(d)) *index = d->index;
+    return NULL;
+}
+ray_t* ray_table_col_index(ray_t* tbl, int64_t name_id, ray_t** index) {
+    return slot_index(tbl_slot_by_name(tbl, name_id), index);
+}
+ray_t* ray_table_col_index_idx(ray_t* tbl, int64_t idx, ray_t** index) {
+    return slot_index(tbl_slot_by_idx(tbl, idx), index);
+}
+
+ray_t* ray_table_get_col_enc(ray_t* tbl, int64_t name_id) {
+    ray_t* c = tbl_slot_by_name(tbl, name_id);
+    return (c && c->type == RAY_ENCCOL) ? c : NULL;
+}
+ray_t* ray_table_get_col_enc_idx(ray_t* tbl, int64_t idx) {
+    ray_t* c = tbl_slot_by_idx(tbl, idx);
+    return (c && c->type == RAY_ENCCOL) ? c : NULL;
+}
+
+ray_t* ray_table_slot(ray_t* tbl, int64_t name_id) { return tbl_slot_by_name(tbl, name_id); }
+ray_t* ray_table_slot_idx(ray_t* tbl, int64_t idx) { return tbl_slot_by_idx(tbl, idx); }
+
+static ray_t* slot_parted_seg(ray_t* c, int64_t s) {
+    if (!c) return NULL;
+    if (c->type == RAY_ENCCOL) return ray_enccol_is_parted(c) ? ray_enccol_seg(c, s) : NULL;
+    if (!RAY_IS_PARTED(c->type) || s < 0 || s >= c->len) return NULL;
+    return ((ray_t**)ray_data(c))[s];                   /* parted wrapper, not a table */
+}
+ray_t* ray_table_parted_seg(ray_t* tbl, int64_t name_id, int64_t s) {
+    return slot_parted_seg(tbl_slot_by_name(tbl, name_id), s);
+}
+ray_t* ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s) {
+    return slot_parted_seg(tbl_slot_by_idx(tbl, idx), s);
+}
+
+/* aux[0] of a parted SYM/STR wrapper: its null presence once computed. */
+#define PARTED_TEXT_NULLS_KNOWN 0x01
+#define PARTED_TEXT_NULLS_HAS   0x02
+
+bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
+    ray_t* c = tbl_slot_by_name(tbl, name_id);
+    if (!c) return false;
+    ray_col_meta_t m;
+    ray_col_meta_of(c, &m);
+    if (m.null_count >= 0) return m.null_count > 0;          /* generation 2: directory */
+    if (m.enc) return (m.attrs & RAY_ATTR_HAS_NULLS) != 0;
+    if (RAY_IS_PARTED(c->type)) {             /* the wrapper carries no flag: ask each segment */
+        /* A text wrapper caches its answer in aux[0] (PARTED_TEXT_NULLS_*):
+         * the segment scans run once per wrapper, not on every planning
+         * call.  A wrapper is never edited in place (an insert builds a new
+         * one, aux zeroed) and its loaded segments are read-only.  The byte
+         * is written with the same value by any racing caller. */
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(c->type);
+        bool text_base = base == RAY_SYM || base == RAY_STR;
+        if (text_base) {
+            uint8_t k = __atomic_load_n(&c->aux[0], __ATOMIC_RELAXED);
+            if (k & PARTED_TEXT_NULLS_KNOWN) return (k & PARTED_TEXT_NULLS_HAS) != 0;
+        }
+        bool any = false;
+        ray_t** segs = (ray_t**)ray_data(c);
+        for (int64_t i = 0; i < c->len; i++) {
+            ray_col_meta_t sm;
+            if (!ray_col_meta_of(segs[i], &sm)) continue;
+            bool text = !sm.enc && (sm.type == RAY_SYM || sm.type == RAY_STR);
+            bool nulls = sm.null_count >= 0 ? sm.null_count > 0   /* an encoded segment's directory */
+                       /* a plain text segment: the exact check, which scans
+                        * the payload (text nulls are in-band, no flag) */
+                       : text ? ray_vec_has_nulls(segs[i])
+                       : (sm.attrs & RAY_ATTR_HAS_NULLS) != 0;
+            if (nulls) { any = true; break; }
+        }
+        if (text_base)
+            __atomic_store_n(&c->aux[0], (uint8_t)(PARTED_TEXT_NULLS_KNOWN |
+                             (any ? PARTED_TEXT_NULLS_HAS : 0)), __ATOMIC_RELAXED);
+        return any;
+    }
+    return ray_is_vec(c) && ray_vec_has_nulls(c);            /* generation 0: today's scan */
+}
+
+/* Legacy getters (public, include/rayforce.h).  A plain slot (the common
+ * case) is a pure lookup that leaves the error slot alone; only an encoded
+ * slot saves the pending message, clears the slot and decodes.  Success
+ * restores the pending message; a failure disposes of the error with
+ * ray_error_free and returns NULL with its message left in the slot. */
+static ray_t* legacy_slot(ray_t* slot) {
+    if (!slot || slot->type != RAY_ENCCOL) return slot;
+    char pending[256];
+    snprintf(pending, sizeof pending, "%s", ray_error_msg() ? ray_error_msg() : "");
+    ray_error_clear();
+    ray_t* c = ray_enccol_materialize(slot);
+    if (RAY_IS_ERR(c)) { ray_error_free(c); return NULL; }
+    if (pending[0]) ray_error_free(ray_error("domain", "%s", pending));
+    return c;
+}
+ray_t* ray_table_get_col(ray_t* tbl, int64_t name_id) {
+    return legacy_slot(tbl_slot_by_name(tbl, name_id));
+}
+ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
+    return legacy_slot(tbl_slot_by_idx(tbl, idx));
 }
 
 /* --------------------------------------------------------------------------
@@ -304,10 +454,7 @@ int64_t ray_table_nrows(ray_t* tbl) {
     ray_t* first_col = ((ray_t**)ray_data(cols))[0];
     if (!first_col || RAY_IS_ERR(first_col)) return 0;
 
-    if (RAY_IS_PARTED(first_col->type) || first_col->type == RAY_MAPCOMMON)
-        return ray_parted_nrows(first_col);
-
-    return first_col->len;
+    return table_col_nrows(first_col);
 }
 
 int64_t ray_parted_nrows(ray_t* v) {
@@ -338,4 +485,27 @@ int64_t ray_parted_nrows(ray_t* v) {
 ray_t* ray_table_schema(ray_t* tbl) {
     if (!tbl_is_table(tbl)) return NULL;
     return tbl_schema(tbl);
+}
+
+bool ray_table_cols_canonical(ray_t* tbl) {
+    if (!tbl_is_table(tbl)) return false;
+    ray_t* schema = tbl_schema(tbl);
+    ray_t* cols = tbl_cols(tbl);
+    return schema && !RAY_IS_ERR(schema) && cols && !RAY_IS_ERR(cols) &&
+           cols->type == RAY_LIST && cols->attrs == 0 && cols->len == schema->len;
+}
+
+ray_t* ray_table_cols_inplace(ray_t* tbl) {
+    if (!tbl_is_table(tbl)) return NULL;
+    ray_t* cols = tbl_cols(tbl);
+    if (!cols || RAY_IS_ERR(cols)) return NULL;
+    ray_t** cv = (ray_t**)ray_data(cols);
+    for (int64_t i = 0; i < cols->len; i++)
+        if (cv[i] && cv[i]->type == RAY_ENCCOL) return NULL;
+    return cols;
+}
+
+bool ray_table_has_col(ray_t* tbl, int64_t name_id) {
+    ray_col_meta_t m;
+    return tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE && ray_table_col_meta(tbl, name_id, &m);
 }

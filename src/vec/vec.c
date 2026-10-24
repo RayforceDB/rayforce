@@ -24,6 +24,7 @@
 #include "vec.h"
 #include "core/platform.h"
 #include "mem/heap.h"
+#include "vec/growth.h"
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/embedding.h"
@@ -43,45 +44,33 @@ static int pair_cmp_idx_then_k(const void* a, const void* b) {
     return (pa[1] > pb[1]) - (pa[1] < pb[1]);
 }
 
-/* Sentinel-based per-element null test.  Caller guarantees v is a
- * non-slice vector (type > 0) and idx is in range.  Returns true iff
- * payload[idx] equals the type-correct NULL_* sentinel.  F64/F32 use
- * (x != x) to detect any NaN bit pattern.  BOOL/U8 are non-nullable
- * and return false. */
-static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
-    const void* p = ray_data((ray_t*)v);
-    switch (v->type) {
-        case RAY_F64: {
-            double x = ((const double*)p)[idx];
-            return x != x;
-        }
-        case RAY_F32: {
-            float x = ((const float*)p)[idx];
-            return x != x;
-        }
-        case RAY_I64:
-        case RAY_TIMESTAMP:
-            return ((const int64_t*)p)[idx] == NULL_I64;
-        case RAY_I32:
-        case RAY_DATE:
-        case RAY_TIME:
-            return ((const int32_t*)p)[idx] == NULL_I32;
-        case RAY_I16:
-            return ((const int16_t*)p)[idx] == NULL_I16;
-        /* SYM uses id 0 as its canonical in-band null.  Width-aware handling
-         * lives in ray_vec_is_null, so there is no arm here. */
-        case RAY_STR:
-            return ((const ray_str_t*)p)[idx].len == 0;
+/* Sentinel null test on a raw generation-0 element array.  F64/F32 use
+ * (x != x) to detect any NaN bit pattern; SYM tests id 0 at the width class
+ * in `attrs`; BOOL/U8 are non-nullable and return false. */
+bool ray_raw_is_null(int8_t type, uint8_t attrs, const void* p, int64_t idx) {
+    switch (type) {
+        case RAY_F64: { double x = ((const double*)p)[idx]; return x != x; }
+        case RAY_F32: { float x = ((const float*)p)[idx];   return x != x; }
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: return ((const int64_t*)p)[idx] == NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)p)[idx] == NULL_I32;
+        case RAY_I16: return ((const int16_t*)p)[idx] == NULL_I16;
+        case RAY_SYM: return ray_read_sym(p, idx, RAY_SYM, attrs) == 0;
+        case RAY_STR: return ((const ray_str_t*)p)[idx].len == 0;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes (canonical convention). */
             static const uint8_t Z[16] = {0};
             return memcmp((const uint8_t*)p + idx * 16, Z, 16) == 0;
         }
-        case RAY_BOOL:
-        case RAY_U8:
-        default:
-            return false;
+        default: return false;     /* BOOL, U8: non-nullable */
     }
+}
+
+/* Sentinel-based per-element null test.  Caller guarantees v is a
+ * non-slice vector (type > 0) and idx is in range.  Returns true iff
+ * payload[idx] equals the type-correct NULL_* sentinel.  SYM is resolved
+ * (width-aware) by ray_vec_is_null before it gets here. */
+static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
+    return ray_raw_is_null(v->type, v->attrs, ray_data((ray_t*)v), idx);
 }
 
 /* In-place drop of attached index — caller must hold a unique ref (rc==1)
@@ -133,7 +122,8 @@ static inline void vec_drop_index_inplace(ray_t* v) {
  *
  * A vector's capacity is determined by its buddy order:
  *   capacity = (2^order - 32) / elem_size
- * When len reaches capacity, realloc to next power-of-2 data size.
+ * Growth requests include header-aware buddy rounding or explicit direct-block
+ * doubling; payload alone is not pre-rounded.
  * -------------------------------------------------------------------------- */
 
 static int64_t vec_capacity(ray_t* vec) {
@@ -151,7 +141,7 @@ static int64_t vec_capacity(ray_t* vec) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_vec_new(int8_t type, int64_t capacity) {
-    if (type <= 0 || type >= RAY_TYPE_COUNT)
+    if (!ray_is_vector_type(type))
         return ray_error("type", "vec_new: type must be a positive concrete vector type, got %s", ray_type_name(type));
     if (type == RAY_SYM)
         return ray_sym_vec_new(RAY_SYM_W64, capacity);  /* default: global sym IDs */
@@ -241,11 +231,12 @@ void ray_sym_vec_adopt_domain(ray_t* out, ray_t* in) {
 
 ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+    if (!ray_is_vec(vec))
         return ray_error("type", "vec_append: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_append: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
 
     /* COW: if shared, copy first */
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
@@ -253,23 +244,11 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     /* Append changes len + writes data; any attached index is now stale. */
     vec_drop_index_inplace(vec);
 
-    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
     /* Grow if needed */
     if (vec->len >= cap) {
-        size_t new_data_size = (size_t)(vec->len + 1) * esz;
-        /* Round up to next power of 2 block */
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) goto fail;
-                s *= 2;
-            }
-            new_data_size = s;
-        }
-        ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
+        ray_t* new_vec = ray_cell_grow_one(vec, esz);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             if (vec != original) ray_release(vec);
             return new_vec ? new_vec : ray_error("oom", NULL);
@@ -287,9 +266,6 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
 
     return vec;
 
-fail:
-    if (vec != original) ray_release(vec);
-    return ray_error("oom", NULL);
 }
 
 /* --------------------------------------------------------------------------
@@ -297,7 +273,7 @@ fail:
  *
  * Append `count` raw elements with one capacity reserve and one memcpy.
  * Same contract as ray_vec_append (COW when shared, index drop, amortized
- * power-of-two growth, original left alive on failure), minus the
+ * geometric growth, original left alive on failure), minus the
  * per-element call overhead — this is the batch-ingest primitive.
  *
  * The raw cells are copied verbatim, sentinels included; the caller
@@ -308,12 +284,17 @@ fail:
 
 ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+    if (!ray_is_vec(vec))
         return ray_error("type", "vec_append_raw: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_append_raw: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
     if (count < 0) return ray_error("range", "vec_append_raw: count must be non-negative, got %lld", (long long)count);
     if (count == 0) return vec;
     if (!src) return ray_error("domain", "vec_append_raw: source pointer is null but count is %lld", (long long)count);
+
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    size_t required;
+    if (!ray_cell_growth_bytes(vec->len, count, esz, &required))
+        return ray_error("oom", NULL);
 
     ray_t* original = vec;
     vec = ray_cow(vec);
@@ -321,21 +302,12 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
 
     vec_drop_index_inplace(vec);
 
-    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
-    if (vec->len > INT64_MAX - count) goto fail;
     if (vec->len + count > cap) {
-        size_t new_data_size = (size_t)(vec->len + count) * esz;
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) goto fail;
-                s *= 2;
-            }
-            new_data_size = s;
-        }
+        size_t new_data_size;
+        if (!ray_cell_growth_request(ray_block_data_bytes(vec), required, &new_data_size))
+            goto fail;
         ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             if (vec != original) ray_release(vec);
@@ -687,12 +659,13 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
 
 ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT)
+    if (!ray_is_vec(vec))
         return ray_error("type", "vec_insert_at: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_insert_at: str vectors use ray_str_vec_insert_at, got %s", ray_type_name(vec->type));
     if (idx < 0 || idx > vec->len) return ray_error("range", "vec_insert_at: index out of bounds [0,%lld], got %lld", (long long)vec->len, (long long)idx);
 
     /* COW: if shared, copy first */
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
@@ -701,22 +674,11 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
      * accelerator index is now stale. */
     vec_drop_index_inplace(vec);
 
-    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     int64_t cap = vec_capacity(vec);
 
     /* Grow if needed */
     if (vec->len >= cap) {
-        size_t new_data_size = (size_t)(vec->len + 1) * esz;
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s = 32;
-            while (s < new_data_size) {
-                if (s > SIZE_MAX / 2) goto fail_oom;
-                s *= 2;
-            }
-            new_data_size = s;
-        }
-        ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
+        ray_t* new_vec = ray_cell_grow_one(vec, esz);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
             if (vec != original) ray_release(vec);
             return new_vec ? new_vec : ray_error("oom", NULL);
@@ -750,9 +712,6 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
 
     return vec;
 
-fail_oom:
-    if (vec != original) ray_release(vec);
-    return ray_error("oom", NULL);
 }
 
 /* --------------------------------------------------------------------------
@@ -807,7 +766,7 @@ ray_t* ray_vec_insert_many(ray_t* vec, ray_t* idxs, ray_t* vals) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
     if (!idxs || RAY_IS_ERR(idxs)) return idxs;
     if (!vals || RAY_IS_ERR(vals)) return vals;
-    if (vec->type <= 0 || vec->type >= RAY_TYPE_COUNT) return ray_error("type", "vec_insert_many: dest expects a concrete vector type, got %s", ray_type_name(vec->type));
+    if (!ray_is_vec(vec)) return ray_error("type", "vec_insert_many: dest expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_insert_many: str vectors are unsupported, use ray_vec_insert_vec_at in a loop, got %s", ray_type_name(vec->type));
     if (idxs->type != RAY_I64) return ray_error("type", "vec_insert_many: indices must be an i64 vector, got %s", ray_type_name(idxs->type));
 
@@ -962,7 +921,7 @@ ray_t* ray_vec_insert_many(ray_t* vec, ray_t* idxs, ray_t* vals) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
-    if (type <= 0 || type >= RAY_TYPE_COUNT)
+    if (!ray_is_vector_type(type))
         return ray_error("type", "vec_from_raw: type must be a positive concrete vector type, got %s", ray_type_name(type));
     if (type == RAY_STR) return ray_error("type", "vec_from_raw: str vectors are unsupported (no pool), got %s", ray_type_name(type));
     if (count < 0) return ray_error("range", "vec_from_raw: count must be non-negative, got %lld", (long long)count);
@@ -1003,7 +962,7 @@ ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
             }
             break;
         case RAY_F64: case RAY_F32:
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME:
         case RAY_I16: case RAY_GUID:
             for (int64_t i = 0; i < count; i++) {
@@ -1064,7 +1023,7 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
         switch (vec->type) {
             case RAY_F64:                          ((double*)p)[idx] = NULL_F64; break;
             case RAY_F32:                          ((float*)p)[idx]  = NULL_F32; break;
-            case RAY_I64: case RAY_TIMESTAMP:      ((int64_t*)p)[idx] = NULL_I64; break;
+            case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:      ((int64_t*)p)[idx] = NULL_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
             case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
             case RAY_SYM:
@@ -1153,6 +1112,51 @@ static inline void str_pool_add_dead(ray_t* vec, uint32_t bytes) {
 }
 
 /* --------------------------------------------------------------------------
+ * ray_str_pool_reserve — room for len more bytes in a STR pool
+ *
+ * Creates the pool on first use (a RAY_U8 block of max(256, 2 * len)
+ * bytes), refuses an end offset above UINT32_MAX (RAY_ERR_RANGE), and
+ * doubles the block until the bytes fit (RAY_ERR_OOM; a failed grow
+ * leaves *pool as it was).  *off is the offset the bytes go at; the
+ * caller copies them and advances (*pool)->len.
+ * -------------------------------------------------------------------------- */
+
+static inline ray_err_t str_pool_reserve(ray_t** pool, size_t len, int64_t* off) {
+    if (!*pool) {
+        ray_t* p = ray_alloc(len < 256 ? 256 : len * 2);
+        if (!p || RAY_IS_ERR(p)) return RAY_ERR_OOM;
+        p->type = RAY_U8;
+        p->len = 0;
+        *pool = p;
+    }
+    int64_t pool_used = (*pool)->len;
+    if (pool_used < 0 || (uint64_t)pool_used > UINT32_MAX ||
+        (uint64_t)len > UINT32_MAX - (uint64_t)pool_used)
+        return RAY_ERR_RANGE;
+    size_t pool_cap = ray_block_data_bytes(*pool);
+    size_t need = (size_t)pool_used + len;
+    if (need > pool_cap) {
+        size_t new_cap = pool_cap;
+        if (new_cap == 0) new_cap = 256;
+        while (new_cap < need) {
+            if (new_cap > SIZE_MAX / 2) return RAY_ERR_OOM;
+            new_cap *= 2;
+        }
+        ray_t* np = ray_scratch_realloc(*pool, new_cap);
+        if (!np || RAY_IS_ERR(np)) return RAY_ERR_OOM;
+        *pool = np;
+    }
+    *off = pool_used;
+    return RAY_OK;
+}
+
+/* Exported for builders outside this file; ray_str_vec_append inlines the
+ * same body. */
+ray_err_t ray_str_pool_reserve(ray_t** pool, size_t len, int64_t* off) {
+    return str_pool_reserve(pool, len, off);
+}
+
+/* --------------------------------------------------------------------------
  * ray_str_vec_append — append a string to a RAY_STR vector
  *
  * Strings <= 12 bytes are inlined in the ray_str_t element.
@@ -1164,6 +1168,7 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
     if (vec->type != RAY_STR) return ray_error("type", "str_vec_append: expects a str vector, got %s", ray_type_name(vec->type));
     if (len > UINT32_MAX) return ray_error("range", "str_vec_append: string length exceeds %lld bytes, got %lld", (long long)UINT32_MAX, (long long)len);
 
+
     ray_t* original = vec;
     vec = ray_cow(vec);
     if (!vec || RAY_IS_ERR(vec)) return vec;
@@ -1171,52 +1176,15 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
 
     int64_t pool_off = 0;
     if (len > RAY_STR_INLINE_MAX) {
-        if (!vec->str_pool) {
-            size_t init_pool = len < 256 ? 256 : len * 2;
-            vec->str_pool = ray_alloc(init_pool);
-            if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) {
-                vec->str_pool = NULL;
-                goto fail_oom;
-            }
-            vec->str_pool->type = RAY_U8;
-            vec->str_pool->len = 0;
-        }
-
-        int64_t pool_used = vec->str_pool->len;
-        if (pool_used < 0 || (uint64_t)pool_used > UINT32_MAX ||
-            (uint64_t)len > UINT32_MAX - (uint64_t)pool_used)
-            goto fail_range;
-        size_t pool_cap = ray_block_data_bytes(vec->str_pool);
-        size_t need = (size_t)pool_used + len;
-        if (need > pool_cap) {
-            size_t new_cap = pool_cap;
-            if (new_cap == 0) new_cap = 256;
-            while (new_cap < need) {
-                if (new_cap > SIZE_MAX / 2) goto fail_oom;
-                new_cap *= 2;
-            }
-            ray_t* np = ray_scratch_realloc(vec->str_pool, new_cap);
-            if (!np || RAY_IS_ERR(np)) goto fail_oom;
-            vec->str_pool = np;
-        }
-
-        pool_off = pool_used;
+        ray_err_t pe = str_pool_reserve(&vec->str_pool, len, &pool_off);
+        if (pe == RAY_ERR_RANGE) goto fail_range;
+        if (pe != RAY_OK) goto fail_oom;
     }
 
     /* Grow element array if needed — pool is already ready */
     int64_t cap = vec_capacity(vec);
     if (vec->len >= cap) {
-        size_t new_data_size = (size_t)(vec->len + 1) * sizeof(ray_str_t);
-        if (new_data_size < 32) new_data_size = 32;
-        else {
-            size_t s2 = 32;
-            while (s2 < new_data_size) {
-                if (s2 > SIZE_MAX / 2) goto fail_oom;
-                s2 *= 2;
-            }
-            new_data_size = s2;
-        }
-        ray_t* nv = ray_scratch_realloc(vec, new_data_size);
+        ray_t* nv = ray_cell_grow_one(vec, sizeof(ray_str_t));
         if (!nv || RAY_IS_ERR(nv)) goto fail_oom;
         vec = nv;
     }
@@ -1612,7 +1580,7 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     switch (vec->type) {
         case RAY_F64:
         case RAY_F32:
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_I32: case RAY_DATE: case RAY_TIME:
         case RAY_I16:
         case RAY_GUID:

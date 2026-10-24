@@ -53,6 +53,7 @@ compile_commands.json
 # Extra build flavours (see Makefile)
 rayforce.tsan
 rayforce.test.tsan
+rayforce.test.rel
 
 # Fuzzing: grown corpus and crash artifacts stay local; only fuzz/seeds/ is committed
 fuzz/corpus/

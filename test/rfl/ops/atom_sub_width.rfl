@@ -1,0 +1,90 @@
+;; #970: atom subtraction uses both operand types, as existing atom addition does.
+;; Five integral kinds, both orders. No new global widening/overflow policy.
+(type (- true true)) -- 'i64
+(- true true) -- 0
+(type (- true 0x03)) -- 'i64
+(- true 0x03) -- -2
+(type (- true 30000h)) -- 'i16
+(- true 30000h) -- -29999h
+(type (- true 90000i)) -- 'i32
+(- true 90000i) -- -89999i
+(type (- true 100000)) -- 'i64
+(- true 100000) -- -99999
+(type (- 0x03 true)) -- 'i64
+(- 0x03 true) -- 2
+(type (- 0x03 0x03)) -- 'u8
+(- 0x03 0x03) -- 0x00
+(type (- 0x03 30000h)) -- 'i16
+(- 0x03 30000h) -- -29997h
+(type (- 0x03 90000i)) -- 'i32
+(- 0x03 90000i) -- -89997i
+(type (- 0x03 100000)) -- 'i64
+(- 0x03 100000) -- -99997
+(type (- 30000h true)) -- 'i16
+(- 30000h true) -- 29999h
+(type (- 30000h 0x03)) -- 'i16
+(- 30000h 0x03) -- 29997h
+(type (- 30000h 30000h)) -- 'i16
+(- 30000h 30000h) -- 0h
+(type (- 30000h 90000i)) -- 'i32
+(- 30000h 90000i) -- -60000i
+(type (- 30000h 100000)) -- 'i64
+(- 30000h 100000) -- -70000
+(type (- 90000i true)) -- 'i32
+(- 90000i true) -- 89999i
+(type (- 90000i 0x03)) -- 'i32
+(- 90000i 0x03) -- 89997i
+(type (- 90000i 30000h)) -- 'i32
+(- 90000i 30000h) -- 60000i
+(type (- 90000i 90000i)) -- 'i32
+(- 90000i 90000i) -- 0i
+(type (- 90000i 100000)) -- 'i64
+(- 90000i 100000) -- -10000
+(type (- 100000 true)) -- 'i64
+(- 100000 true) -- 99999
+(type (- 100000 0x03)) -- 'i64
+(- 100000 0x03) -- 99997
+(type (- 100000 30000h)) -- 'i64
+(- 100000 30000h) -- 70000
+(type (- 100000 90000i)) -- 'i64
+(- 100000 90000i) -- 10000
+(type (- 100000 100000)) -- 'i64
+(- 100000 100000) -- 0
+
+;; Originally reported narrow-right data loss.
+(- 2 0x03) -- -1
+(- 100000 3h) -- 99997
+(- 5000000000 3i) -- 4999999997
+(- 1i 0x02) -- -1i
+(- [100000] 3h) -- [99997]
+
+;; Existing same-width modular wrapping and generated I64 null remain.
+(- 0x02 0x03) -- 0xff
+(- 30000h -30000h) -- -5536h
+(- 2000000000i -2000000000i) -- -294967296i
+(nil? (- 9223372036854775807 -1)) -- true
+(type (- 9223372036854775807 -1)) -- 'i64
+
+;; Null promotion already uses both operands; normal values must agree.
+(type (- 0Ni 3h)) -- 'i32
+(nil? (- 0Ni 3h)) -- true
+(type (- 3h 0Ni)) -- 'i32
+(nil? (- 3h 0Ni)) -- true
+(type (- 100000 0Nh)) -- 'i64
+(nil? (- 100000 0Nh)) -- true
+
+;; Float and temporal dispatch are outside this repair.
+(- 2.5 3h) -- -0.5
+(type (- 2.5e 1.0e)) -- 'f32
+(- 2.5e 1.0e) -- 1.5e
+(- 2024.01.03 2024.01.02) -- 1i
+(- 2024.01.03 1h) -- 2024.01.02
+(- 10:30:00.000 09:30:00.000) -- 01:00:00.000
+(type (- 2024.01.03D00:00:00.000000000 2024.01.02D00:00:00.000000000)) -- 'timespan
+
+;; The compiled atom call must not reintroduce right-width narrowing.
+(set SUBF (fn [a b] (- a b)))
+(type (SUBF 100000 3h)) -- 'i64
+(SUBF 100000 3h) -- 99997
+(type (SUBF 1i 0x02)) -- 'i32
+(SUBF 1i 0x02) -- -1i

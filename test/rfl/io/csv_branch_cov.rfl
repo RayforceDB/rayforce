@@ -348,12 +348,10 @@
 (.sys.exec "rm -rf rf_test_csvbc_pttrace") -- 0
 
 ;; ════════════════════════════════════════════════════════════════════════════
-;; 22. Chunk-zone + hash-index attach (ray_read_csv_named_opts lines ~1937-1945):
-;;     a numeric column only gets a per-chunk zone index once its length reaches
-;;     one chunk (65536 rows); high-entropy values then upgrade to a hash index
-;;     (csv_should_attach_hash).  A 70000-row pseudo-random I64 column crosses
-;;     both thresholds.  Spot-check aggregates so the index attach can't quietly
-;;     corrupt the payload.
+;; 22. A numeric column of one chunk or more (65536 rows) read by .csv.read:
+;;     the read attaches no index (zones and dictionaries are streamed by the
+;;     conversions, index policy PI).  A 70000-row pseudo-random I64 column
+;;     spot-checks the payload of that path.
 ;; ════════════════════════════════════════════════════════════════════════════
 (.sys.exec "awk 'BEGIN{print \"id\"; for(i=1;i<=70000;i++) print (i*2654435761)%2000000000}' > rf_test_csvbc_zone.csv") -- 0
 (set Tz (.csv.read [I64] "rf_test_csvbc_zone.csv"))

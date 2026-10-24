@@ -22,6 +22,7 @@
  */
 
 #include "sym.h"
+#include "domain.h"   /* ray_sym_domain_index_remove */
 #include "core/platform.h"
 #include "store/fileio.h"
 #include "mem/heap.h"
@@ -93,16 +94,28 @@ static sym_table_t g_sym;
 static _Atomic(bool) g_sym_inited = false;
 static bool sym_lazy_materialize_to_locked(uint32_t target_id);
 
-/* Spinlock protecting g_sym mutations in ray_sym_intern */
-static _Atomic(int) g_sym_lock = 0;
+/* Spinlock protecting g_sym mutations in ray_sym_intern.  On its own
+ * 64-byte line: ray_sym_str takes it per call, and a lock sharing a line
+ * with g_sym or g_sym_inited turns every acquire into an invalidation of
+ * the line every reader needs (Ruling 8-2: a .bss shift of 0x20 gave
+ * generation-0 q29 1.365x). */
+static struct {
+    _Alignas(64) _Atomic(int) v;
+    char pad[64 - sizeof(_Atomic(int))];
+} g_sym_lock_line;
+_Static_assert(sizeof(g_sym_lock_line) == 64, "the symbol lock fills its line");
 static inline void sym_lock(void) {
-    while (atomic_exchange_explicit(&g_sym_lock, 1, memory_order_acquire)) {
+    while (atomic_exchange_explicit(&g_sym_lock_line.v, 1, memory_order_acquire)) {
         RAY_CPU_RELAX();
     }
 }
 static inline void sym_unlock(void) {
-    atomic_store_explicit(&g_sym_lock, 0, memory_order_release);
+    atomic_store_explicit(&g_sym_lock_line.v, 0, memory_order_release);
 }
+uintptr_t ray_sym_test_lock_addr(void)   { return (uintptr_t)&g_sym_lock_line.v; }
+uintptr_t ray_sym_test_table_addr(void)  { return (uintptr_t)&g_sym; }
+size_t    ray_sym_test_table_size(void)  { return sizeof g_sym; }
+uintptr_t ray_sym_test_inited_addr(void) { return (uintptr_t)&g_sym_inited; }
 
 /* String atoms for the global sym table live in its arena (off the per-thread
  * buddy heap) — see ray_arena_str in mem/arena.c. */
@@ -1203,7 +1216,10 @@ ray_err_t ray_sym_save(const char* path) {
         return err;
     }
 
-    /* Atomic rename: tmp -> final path */
+    /* Atomic rename: tmp -> final path.  Whatever was there goes, and
+     * with it the record index of a symfile of that name (domain.h): this
+     * writer keeps none, and the new file need not extend the old one. */
+    ray_sym_domain_index_remove(path);
     err = ray_file_rename(tmp_path, path);
     if (err != RAY_OK) {
         remove(tmp_path);

@@ -168,8 +168,10 @@ ray_t* ray_graph_build_fn(ray_t** args, int64_t n) {
         if (weight_sym < 0) return ray_error("type", "graph.build: weight column name must be sym or str, got %s", ray_type_name(args[3]->type));
     }
 
-    ray_t* src_col = ray_table_get_col(tbl, src_sym);
-    ray_t* dst_col = ray_table_get_col(tbl, dst_sym);
+    ray_t* src_col = ray_table_col(tbl, src_sym);
+    if (src_col && RAY_IS_ERR(src_col)) return src_col;
+    ray_t* dst_col = ray_table_col(tbl, dst_sym);
+    if (dst_col && RAY_IS_ERR(dst_col)) return dst_col;
     if (!src_col || !dst_col) return ray_error("name", NULL);
     if (!ray_is_vec(src_col) || !ray_is_vec(dst_col)) return ray_error("type", "graph.build: src and dst columns must be vectors, got %s and %s", ray_type_name(src_col->type), ray_type_name(dst_col->type));
     if (src_col->len != dst_col->len) return ray_error("length", "graph.build: src and dst columns must have equal length, got %lld and %lld", (long long)src_col->len, (long long)dst_col->len);
@@ -209,14 +211,20 @@ ray_t* ray_graph_build_fn(ray_t** args, int64_t n) {
                                          n_nodes, n_nodes, true);
     if (!rel) {
         ray_release(edges);
-        return ray_error("oom", NULL);
+        /* The build gives up on an interrupt (csr.c); report that, not oom. */
+        return ray_interrupted() ? ray_error("cancel", "interrupted")
+                                 : ray_error("oom", NULL);
     }
 
     /* Optional: attach a weight column.  Algorithms that need edge weights
      * (dijkstra, mst, …) look the column up by sym ID via rel->fwd.props.
      * The column is referenced by its original name in the user's table. */
     if (weight_sym >= 0) {
-        ray_t* w_col = ray_table_get_col(tbl, weight_sym);
+        ray_t* w_col = ray_table_col(tbl, weight_sym);
+        if (w_col && RAY_IS_ERR(w_col)) {
+            ray_rel_free(rel); ray_release(edges);
+            return w_col;
+        }
         if (!w_col || !ray_is_vec(w_col)) {
             ray_rel_free(rel); ray_release(edges);
             return ray_error("name", NULL);

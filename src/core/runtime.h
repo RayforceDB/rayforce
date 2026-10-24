@@ -203,10 +203,6 @@ ray_t* ray_error(const char* code, const char* fmt, ...);
 const char* ray_err_code(ray_t* err);
 /* ray_error_free() is published in include/rayforce.h */
 
-/* Read VM error detail message (NULL if empty) */
-const char* ray_error_msg(void);
-
-/* Clear VM error detail */
-void ray_error_clear(void);
+/* ray_error_msg / ray_error_clear: public, include/rayforce.h */
 
 #endif /* RAY_RUNTIME_H */

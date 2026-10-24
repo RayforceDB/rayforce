@@ -36,6 +36,7 @@
 #ifndef RAY_TEST_H
 #define RAY_TEST_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -45,6 +46,31 @@
  * /bin/sh: on Windows system() runs cmd.exe.  Both return 0 on success. */
 int ray_test_rm_rf(const char* path);     /* rm -rf path  */
 int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
+
+/* Per-process scratch root.  Every "/tmp/..." path a test names goes
+ * through ray_test_tmp(), which returns the string with each "/tmp" path
+ * prefix moved under this process's own root (/tmp/rayforce_t.<pid>,
+ * created at startup and removed at exit), so two suites running on one
+ * host never share a file.  The argument may be a whole Rayfall source or
+ * shell line: every "/tmp" path inside it moves.  The result is interned
+ * and valid for the life of the process.  .rfl files get the same rewrite
+ * when they are read.  Call it from the test thread only. */
+const char* ray_test_tmp(const char* s);
+
+/* Disarm every global store / decode / bind test hook and clear a pending
+ * interrupt request.  Teardowns of suites that arm hooks call it, so a test
+ * that fails between arming and disarming never leaks the hook into the
+ * tests after it. */
+void ray_test_hooks_off(void);
+
+/* True while the equivalence pass runs a test (every save is generation 2).
+ * A loaded column or segment is mapped in place (mmod 1; a string pool
+ * shares the mapping, mmod 3) after a generation-0 save, and decoded into
+ * heap memory (mmod 0) after a generation-2 one: residency asserts take the
+ * generation into account so the rest of the test still runs in both. */
+bool ray_test_equiv_pass(void);
+#define TEST_ASSERT_LOADED_MMOD(v, gen0_mmod) \
+    TEST_ASSERT_EQ_U((v)->mmod, ray_test_equiv_pass() ? 0u : (unsigned)(gen0_mmod))
 
 #if defined(_WIN32)
 /* POSIX helpers the tests rely on, mapped onto their MSVCRT equivalents.

@@ -34,6 +34,10 @@ extern "C" {
 /* ===== Internal Type Constants ===== */
 
 #define RAY_SEL       14   /* selection bitmap (lazy filter) */
+/* Encoded (generation-2) column held by a table slot: payload is one
+ * pointer to a refcounted ray_enccol_t (src/store/enccol.h).  Never seen
+ * outside the store layer, the table accessors and the aware paths. */
+#define RAY_ENCCOL    15
 
 /* Lazy DAG handle (atom-only; stored inline in aux region) */
 #define RAY_LAZY      104
@@ -56,6 +60,11 @@ static inline bool ray_is_lazy(ray_t* x) {
 
 ray_t*    ray_lazy_materialize(ray_t* val);
 ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
+
+bool ray_has_timespan(const ray_t* x);
+int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
+ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
+ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);
 
 /* ===== Cancel API ===== */
 
@@ -232,6 +241,11 @@ void     ray_cancel_reset(void);
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
 #define OP_QUANTILE     91   /* exact quantile per group (literal probability) */
 #define OP_MODE        145   /* most frequent non-null value per group */
+/* Internal aggregate, never compiled from Rayfall: the non-null count of its
+ * input (the per-partition AVG/VAR divisor).  The v2 engine counts it in
+ * place (agg_stream.c); a group bound for the legacy engine is re-planned
+ * with the slot as SUM over a not-null indicator (exec_group_run). */
+#define OP_COUNT_NN    147
 #define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
 #define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
 #define OP_COV          133  /* population covariance per group (binary input) */
@@ -262,7 +276,7 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
      * wrappers (e.g. RAY_MAPCOMMON) and out_type==0 to the runtime so a
      * plan-time guard never false-rejects a column it can't classify. */
     bool nonnum   = (t == RAY_SYM || t == RAY_STR || t == RAY_GUID);
-    bool temporal = (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP);
+    bool temporal = (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN);
     switch (op) {
         /* sum: numeric + TIME (duration-like ms count).  SYM/STR/GUID and the
          * absolute temporals DATE/TIMESTAMP are meaningless to sum → reject. */
@@ -516,6 +530,7 @@ typedef struct ray_graph {
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
+    struct ray_col_binds_s* binds;   /* sources bound by this execution (ops/colbind.c) */
 
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
      * Armed by ray_slice_group_probe (exec.c) INSTEAD of executing the
@@ -605,6 +620,11 @@ typedef struct ray_graph {
      * retry, since the interpreter's `if` tests one truth value and would
      * write the then-branch to every row. */
     bool            if_refused;
+
+    /* Set by exec_group_parted around an in-place concat group: the
+     * table's parted columns are grouped from their segments (no flatten);
+     * exec_group_run skips its parted dispatch. */
+    bool            grp_seg_stream;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */
@@ -968,6 +988,18 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root);
 ray_op_t* ray_graph_input_vec(ray_graph_t* g, ray_t* vec);
 ray_t*    ray_lazy_wrap(ray_graph_t* g, ray_op_t* op);
 ray_t*    ray_lazy_append(ray_t* lazy, uint16_t opcode);
+
+/* Column-reference lazy: (at tbl 'col) of an encoded slot.  A RAY_LAZY header
+ * with RAY_LAZY_COLREF in attrs and no graph (GRAPH / OP slots NULL); its
+ * data holds the retained table and the column sym.  The aggregate builtins
+ * answer it on the bound source; ray_lazy_append / ray_lazy_materialize and
+ * every other reader of the lazy slots promote or force it first. */
+#define RAY_LAZY_COLREF 0x01
+ray_t*    ray_lazy_colref(ray_t* tbl, int64_t sym);          /* retains tbl */
+bool      ray_lazy_colref_get(ray_t* lazy, ray_t** tbl, int64_t* sym);   /* borrowed */
+/* Turn a column reference into the OP_SCAN graph it stands for, in place;
+ * a no-op for any other lazy.  NULL or an owned error. */
+ray_t*    ray_lazy_promote(ray_t* lazy);
 
 /* Active query from-table during tree-walk evaluation of query expressions
  * (B3 Part 2).  Set by bind_all_columns while a query's columns are mounted
