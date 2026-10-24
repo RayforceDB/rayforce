@@ -498,6 +498,46 @@ static test_result_t test_public_runtime_destroy_null_is_noop(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Anon watermark — an embedder sets the spill threshold the engine's
+ * -m/--mem sets, through rayforce.h alone (this file does not include
+ * mem/heap.h), and reads it and the peak back.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static test_result_t test_public_anon_watermark_setget(void) {
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(1) << 30);
+    int64_t set = ray_heap_anon_watermark();
+
+    ray_heap_set_anon_watermark(0);                /* 0 = default */
+    int64_t dflt = ray_heap_anon_watermark();
+    int64_t limit = ray_sys_ram_limit();
+    int64_t room = limit / 4;
+    if (room < (INT64_C(3) << 30)) room = INT64_C(3) << 30;
+    if (room > limit / 2) room = limit / 2;
+    int64_t want = limit - room;
+
+    /* Restored before asserting: a failed assert returns early, and the
+     * watermark is process-global, outliving this runtime. */
+    ray_heap_set_anon_watermark(previous == want ? 0 : previous);
+    TEST_ASSERT_EQ_I(set, INT64_C(1) << 30);
+    TEST_ASSERT_EQ_I(dflt, want);
+    PASS();
+}
+
+static test_result_t test_public_anon_peak(void) {
+    int64_t before = ray_heap_anon_peak();
+    TEST_ASSERT(before > 0, "a live runtime has committed RAM");
+    ray_t* v = ray_vec_new(RAY_I64, 1 << 20);
+    bool ok = v && !RAY_IS_ERR(v);
+    if (ok) ray_release(v);
+    else if (v) ray_error_free(v);   /* the caller owns the error */
+    int64_t after = ray_heap_anon_peak();
+    TEST_ASSERT(ok, "an 8 MiB vector allocates");
+    TEST_ASSERT(after >= before, "the peak never falls");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * Interrupt API — global flag (eval.c).  Happy-path set/get round-trip
  * for the public ray_*_interrupt names and their legacy ray_eval_*
  * wrappers.  The flag is thread-local sig_atomic_t storage; here we
@@ -772,6 +812,9 @@ const test_entry_t public_api_entries[] = {
     { "public/runtime_create_with_sym_eval",      test_public_runtime_create_with_sym_eval,     NULL, NULL },
     { "public/runtime_create_with_sym_err_eval",  test_public_runtime_create_with_sym_err_eval, NULL, NULL },
     { "public/runtime_destroy_null_is_noop",      test_public_runtime_destroy_null_is_noop,     NULL, NULL },
+
+    { "public/anon_watermark_setget",  test_public_anon_watermark_setget,  public_api_setup, public_api_teardown },
+    { "public/anon_peak",              test_public_anon_peak,              public_api_setup, public_api_teardown },
 
     /* eval interrupt / nfo / restricted / error-trace public API. */
     { "public/interrupt_roundtrip",            test_public_interrupt_roundtrip,            NULL, NULL },
