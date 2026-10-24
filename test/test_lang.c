@@ -590,27 +590,30 @@ static test_result_t test_query_minmax_bulk_bound(void) {
         "(at (select {r: (min left971 right971) from: MM_T971}) 'r)",
         "(at (select {r: (max left971 right971) from: MM_T971}) 'r)",
         "(at (select {r: (min left971 200) from: MM_T971}) 'r)",
-        "(at (select {r: (max 0Nl right971) from: MM_T971}) 'r)"
+        "(at (select {r: (max 0Nl right971) from: MM_T971}) 'r)",
+        "(at (select {r: (min 0Nl left971) from: MM_T971}) 'r)"
     };
-    for (int c = 0; c < 4; c++) {
+    for (int c = 0; c < 5; c++) {
         uint64_t before = g_frame_epoch;
         ray_t* out = ray_eval_str(exprs[c]);
         uint64_t frames = g_frame_epoch - before;
         bool shape = out && !RAY_IS_ERR(out) && out->type == RAY_I64 && ray_len(out) == 1024;
         bool values = shape;
+        bool null_mark = c != 4 || (shape && (out->attrs & RAY_ATTR_HAS_NULLS));
         if (shape) {
             const int64_t* data = (const int64_t*)ray_data(out);
             for (int64_t i = 0; i < 1024; i++) {
                 int64_t other = 1023 - i;
                 int64_t want = c == 0 ? (i < other ? i : other)
                              : c == 1 ? (i > other ? i : other)
-                             : c == 2 ? (i < 200 ? i : 200) : other;
+                             : c == 2 ? (i < 200 ? i : 200) : c == 3 ? other : INT64_MIN;
                 if (data[i] != want) values = false;
             }
         }
         if (out) { if (RAY_IS_ERR(out)) ray_error_free(out); else ray_release(out); }
         TEST_ASSERT_TRUE(shape);
         TEST_ASSERT_TRUE(values);
+        TEST_ASSERT_TRUE(null_mark);
         TEST_ASSERT_TRUE(frames < 64);
     }
     PASS();

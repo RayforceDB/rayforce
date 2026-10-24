@@ -79,3 +79,8 @@
 (CAPTURE971) -- (list [4 4] [2 2] [6 6] [7 7] [1 2])
 (set HEAD971 (fn [min] (at (select {r: (min x y) from: M971}) 'r)))
 (HEAD971 (fn [a b] (list a b))) -- (list (list 1 4) (list 5 2) (list 3 6) (list 8 7) (list 9 0))
+
+;; Result null metadata must remain usable by downstream consumers.
+(where (nil? (at (select {r: (min x y) from: N971}) 'r))) -- [0 1 2]
+(where (nil? (at (select {r: (max x y) from: N971}) 'r))) -- [2]
+(count (where (nil? (at (select {r: (min 0Nl x) from: M971}) 'r)))) -- 5
