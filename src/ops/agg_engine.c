@@ -93,7 +93,7 @@ static bool agg_indexed_supported(uint16_t op, int8_t t) {
     bool scalar = number || t == RAY_GUID || t == RAY_SYM || t == RAY_STR;
     if (op == OP_FIRST || op == OP_LAST) return scalar || t == RAY_LIST;
     if (op == OP_MIN || op == OP_MAX) return t == RAY_GUID || t == RAY_STR || t == RAY_SYM;
-    if (op == OP_MEDIAN || op == OP_QUANTILE) return number;
+    if (op == OP_MEDIAN || op == OP_QUANTILE) return number || t == RAY_TIMESPAN;
     if (op == OP_MODE || op == OP_TOP_N || op == OP_BOT_N) return scalar;
     return false;
 }

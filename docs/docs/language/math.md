@@ -349,6 +349,14 @@ Median value.
 (med [1 3 5 7 9])  ; 5.0
 ```
 
+For a TIMESPAN vector, the result is an F64 number of **nanoseconds**,
+including fractional nanoseconds for an even-sized input. `SELECT` uses the
+same result type; it does not round the median back into a duration.
+
+```lisp
+(med [0D01:00:00 0D02:00:00])  ; 5400000000000.0
+```
+
 ### `(dev x)` — aggregate
 
 Population standard deviation.
