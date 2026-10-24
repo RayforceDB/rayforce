@@ -3665,11 +3665,21 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             /* Strip trailing null bytes */
             while (la > 0 && ap[la - 1] == '\0') la--;
             while (lb > 0 && bp[lb - 1] == '\0') lb--;
-            char buf[8192];
-            if (la + lb > sizeof(buf)) return ray_error("limit", NULL);
+            if (la > SIZE_MAX - lb) return ray_error("oom", NULL);
+            size_t total = la + lb;
+            if (total == SIZE_MAX || total > (size_t)INT64_MAX)
+                return ray_error("oom", NULL);
+            char sbuf[8192];
+            char* buf = sbuf;
+            if (total > sizeof(sbuf)) {
+                buf = (char*)ray_alloc_raw(total);
+                if (!buf) return ray_error("oom", NULL);
+            }
             memcpy(buf, ap, la);
             memcpy(buf + la, bp, lb);
-            return ray_str(buf, la + lb);
+            ray_t* result = ray_str(buf, total);
+            if (buf != sbuf) ray_free_raw(buf);
+            return result;
         }
     }
     if (a->type == RAY_STR && ray_is_atom(b) && (-b->type) == RAY_STR)
