@@ -3924,6 +3924,48 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
     return col;
 }
 
+/* Cold admission for a direct dyadic min/max output only.  Inspect borrowed
+ * physical slots, never decode or trial-evaluate: the LANGUAGE builtin can
+ * consume these full I64 vectors (including NULL-low lanes) once instead of
+ * paying the fallback evaluator per row.  Do not use this after helper
+ * expansion or in grouped/aggregate classification. */
+static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
+    if (!tbl || tbl->type != RAY_TABLE || nrows <= 0 ||
+        !expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) ||
+        ray_len(expr) != 3) return 0;
+    ray_t** args = (ray_t**)ray_data(expr);
+    ray_t* head = args[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return 0;
+    /* Reject unrelated verbs before any schema lookup.  Keep the existing
+     * name-based reducer/alias classification unchanged. */
+    ray_t* name = ray_sym_str(head->i64);
+    if (!name || ray_str_len(name) != 3 ||
+        (memcmp(ray_str_ptr(name), "min", 3) != 0 &&
+         memcmp(ray_str_ptr(name), "max", 3) != 0)) return 0;
+    if (ray_env_has_lexical_local(head->i64) || ray_table_slot(tbl, head->i64)) return 0;
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || fn->type != RAY_UNARY) return 0;
+    ray_unary_fn native = (ray_unary_fn)(uintptr_t)fn->i64;
+    if (native != ray_min_fn && native != ray_max_fn) return 0;
+    int columns = 0;
+    for (int i = 1; i <= 2; i++) {
+        ray_t* arg = args[i];
+        if (!arg) return 0;
+        if (arg->type == -RAY_I64) {
+            /* Opaque tagged handles are not ordinary numeric literals. */
+            if (arg->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)) return 0;
+            continue;
+        }
+        if (arg->type != -RAY_SYM || (arg->attrs & ATTR_QUOTED) ||
+            ray_sym_is_dotted(arg->i64) || ray_env_has_lexical_local(arg->i64)) return 0;
+        ray_t* col = ray_table_slot(tbl, arg->i64);   /* borrowed; never decodes */
+        if (!col || col->type != RAY_I64 || (col->attrs & RAY_ATTR_SLICE) ||
+            ray_len(col) != nrows) return 0;
+        columns++;
+    }
+    return columns != 0;
+}
+
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * collection builtin (distinct, asc, desc, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
@@ -22283,7 +22325,8 @@ by_dict_done:
                      * alias bound below as a one-row column must not be read
                      * per row.  A bare column name is the column itself. */
                     ray_t* expr = dict_elems[i + 1];
-                    int whole_verb = is_whole_column_projection(expr, tbl);
+                    int whole_verb = select_fallback_bulk_minmax(expr, tbl, nrows) ||
+                                     is_whole_column_projection(expr, tbl);
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
                                      (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)) ||
