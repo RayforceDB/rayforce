@@ -3611,6 +3611,14 @@ static int expr_refs_row_column(ray_t* expr, ray_t* tbl) {
     return 0;
 }
 
+/* min/max overload on arity: only their unary calls reduce rows.  Keep
+ * the name-only resolver for aggregate specifications and other signatures. */
+static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs) {
+    uint16_t op = resolve_agg_opcode(sym_id);
+    if ((op == OP_MIN || op == OP_MAX) && nargs != 1) return 0;
+    return op;
+}
+
 /* Check if an expression is an aggregation call (head is an agg function) */
 static int is_agg_expr(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
@@ -3619,7 +3627,7 @@ static int is_agg_expr(ray_t* expr) {
     if (n < 2) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     if (elems[0]->type != -RAY_SYM) return 0;
-    return resolve_agg_opcode(elems[0]->i64) != 0;
+    return resolve_agg_call_opcode(elems[0]->i64, n - 1) != 0;
 }
 
 /* True iff the expression contains an aggregation call anywhere in
@@ -3914,6 +3922,48 @@ static ray_t* select_fallback_passthrough_col(ray_t* expr, ray_t* tbl, int64_t n
     if (!col || RAY_IS_ERR(col)) return NULL;
     ray_retain(col);
     return col;
+}
+
+/* Cold admission for a direct dyadic min/max output only.  Inspect borrowed
+ * physical slots, never decode or trial-evaluate: the LANGUAGE builtin can
+ * consume these full I64 vectors (including NULL-low lanes) once instead of
+ * paying the fallback evaluator per row.  Do not use this after helper
+ * expansion or in grouped/aggregate classification. */
+static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
+    if (!tbl || tbl->type != RAY_TABLE || nrows <= 0 ||
+        !expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) ||
+        ray_len(expr) != 3) return 0;
+    ray_t** args = (ray_t**)ray_data(expr);
+    ray_t* head = args[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return 0;
+    /* Reject unrelated verbs before any schema lookup.  Keep the existing
+     * name-based reducer/alias classification unchanged. */
+    ray_t* name = ray_sym_str(head->i64);
+    if (!name || ray_str_len(name) != 3 ||
+        (memcmp(ray_str_ptr(name), "min", 3) != 0 &&
+         memcmp(ray_str_ptr(name), "max", 3) != 0)) return 0;
+    if (ray_env_has_lexical_local(head->i64) || ray_table_slot(tbl, head->i64)) return 0;
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || fn->type != RAY_UNARY) return 0;
+    ray_unary_fn native = (ray_unary_fn)(uintptr_t)fn->i64;
+    if (native != ray_min_fn && native != ray_max_fn) return 0;
+    int columns = 0;
+    for (int i = 1; i <= 2; i++) {
+        ray_t* arg = args[i];
+        if (!arg) return 0;
+        if (arg->type == -RAY_I64) {
+            /* Opaque tagged handles are not ordinary numeric literals. */
+            if (arg->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)) return 0;
+            continue;
+        }
+        if (arg->type != -RAY_SYM || (arg->attrs & ATTR_QUOTED) ||
+            ray_sym_is_dotted(arg->i64) || ray_env_has_lexical_local(arg->i64)) return 0;
+        ray_t* col = ray_table_slot(tbl, arg->i64);   /* borrowed; never decodes */
+        if (!col || col->type != RAY_I64 || (col->attrs & RAY_ATTR_SLICE) ||
+            ray_len(col) != nrows) return 0;
+        columns++;
+    }
+    return columns != 0;
 }
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
@@ -4539,7 +4589,7 @@ static bool match_group_desc_count_take(ray_t* tbl, ray_t** dict_elems, int64_t 
     return false;
 }
 
-/* True for `(fn arg ...)` where fn resolves to a RAY_UNARY marked
+/* True for an actual unary `(fn arg)` call whose fn is RAY_UNARY marked
  * RAY_FN_AGGR — i.e. a builtin aggregator (sum/avg/min/max/count and
  * the non-whitelisted med/dev/var/stddev/etc).  Used to route these
  * through the streaming-style per-group AGG branch rather than the
@@ -4549,7 +4599,7 @@ static bool match_group_desc_count_take(ray_t* tbl, ray_t** dict_elems, int64_t 
 static int is_aggr_unary_call(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
     int64_t n = ray_len(expr);
-    if (n < 2) return 0;
+    if (n != 2) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     if (elems[0]->type != -RAY_SYM) return 0;
     ray_t* fn_obj = ray_env_get(elems[0]->i64);
@@ -14421,9 +14471,9 @@ static int select_fallback_scalar_proj(ray_t* expr, const int64_t* scalars, int6
            (via || ray_is_atom(expr));
 }
 
-static bool select_alias_head_is_agg(ray_t* head) {
+static bool select_alias_head_is_agg(ray_t* head, int64_t nargs) {
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
-    if (resolve_agg_opcode(head->i64) != 0) return true;
+    if (resolve_agg_call_opcode(head->i64, nargs) != 0) return true;
     ray_t* s = ray_sym_str(head->i64);
     return s && ray_str_len(s) == 8 && memcmp(ray_str_ptr(s), "distinct", 8) == 0;
 }
@@ -14755,7 +14805,7 @@ static ray_t* select_alias_subst(ray_t* expr, void* vctx) {
         return out;
     }
     select_alias_subst_ctx_t inner = *c;
-    inner.in_agg = c->in_agg || select_alias_head_is_agg(el[0]);
+    inner.in_agg = c->in_agg || select_alias_head_is_agg(el[0], ray_len(expr) - 1);
     /* a call whose head is itself a form — `((fn [x] …) 1)` — is walked
      * from the head, which is where such a lambda's body lives */
     ray_t* out = select_alias_map_list(expr, el[0]->type == RAY_LIST ? 0 : 1,
@@ -22275,7 +22325,8 @@ by_dict_done:
                      * alias bound below as a one-row column must not be read
                      * per row.  A bare column name is the column itself. */
                     ray_t* expr = dict_elems[i + 1];
-                    int whole_verb = is_whole_column_projection(expr, tbl);
+                    int whole_verb = select_fallback_bulk_minmax(expr, tbl, nrows) ||
+                                     is_whole_column_projection(expr, tbl);
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
                                      (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)) ||

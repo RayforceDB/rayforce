@@ -577,6 +577,48 @@ static test_result_t test_eval_nested_arith(void) {
     PASS();
 }
 
+/* An existing cache epoch makes row-binding work observable without a timer
+ * or new production instrumentation.  A per-row fallback rebinds two names
+ * for every row; a whole-vector call changes only a bounded scope. */
+static test_result_t test_query_minmax_bulk_bound(void) {
+    ray_t* setup = ray_eval_str("(do (set MM_LEFT971 (til 1024))"
+        " (set MM_T971 (table [left971 right971] (list MM_LEFT971 (- 1023 MM_LEFT971)))) 1)");
+    bool setup_ok = setup && !RAY_IS_ERR(setup);
+    if (setup) { if (RAY_IS_ERR(setup)) ray_error_free(setup); else ray_release(setup); }
+    TEST_ASSERT_TRUE(setup_ok);
+    const char* exprs[] = {
+        "(at (select {r: (min left971 right971) from: MM_T971}) 'r)",
+        "(at (select {r: (max left971 right971) from: MM_T971}) 'r)",
+        "(at (select {r: (min left971 200) from: MM_T971}) 'r)",
+        "(at (select {r: (max 0Nl right971) from: MM_T971}) 'r)",
+        "(at (select {r: (min 0Nl left971) from: MM_T971}) 'r)"
+    };
+    for (int c = 0; c < 5; c++) {
+        uint64_t before = g_frame_epoch;
+        ray_t* out = ray_eval_str(exprs[c]);
+        uint64_t frames = g_frame_epoch - before;
+        bool shape = out && !RAY_IS_ERR(out) && out->type == RAY_I64 && ray_len(out) == 1024;
+        bool values = shape;
+        bool null_mark = c != 4 || (shape && (out->attrs & RAY_ATTR_HAS_NULLS));
+        if (shape) {
+            const int64_t* data = (const int64_t*)ray_data(out);
+            for (int64_t i = 0; i < 1024; i++) {
+                int64_t other = 1023 - i;
+                int64_t want = c == 0 ? (i < other ? i : other)
+                             : c == 1 ? (i > other ? i : other)
+                             : c == 2 ? (i < 200 ? i : 200) : c == 3 ? other : INT64_MIN;
+                if (data[i] != want) values = false;
+            }
+        }
+        if (out) { if (RAY_IS_ERR(out)) ray_error_free(out); else ray_release(out); }
+        TEST_ASSERT_TRUE(shape);
+        TEST_ASSERT_TRUE(values);
+        TEST_ASSERT_TRUE(null_mark);
+        TEST_ASSERT_TRUE(frames < 64);
+    }
+    PASS();
+}
+
 /* ---- Test: eval subtraction ---- */
 static test_result_t test_eval_sub(void) {
     ray_t* result = ray_eval_str("(- 10 3)");
@@ -10974,6 +11016,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/literal", test_eval_literal, lang_setup, lang_teardown },
     { "lang/eval/add", test_eval_add, lang_setup, lang_teardown },
     { "lang/eval/nested_arith", test_eval_nested_arith, lang_setup, lang_teardown },
+    { "lang/query/minmax_bulk_bound", test_query_minmax_bulk_bound, lang_setup, lang_teardown },
     { "lang/eval/sub", test_eval_sub, lang_setup, lang_teardown },
     { "lang/eval/div", test_eval_div, lang_setup, lang_teardown },
     { "lang/eval/cmp", test_eval_cmp, lang_setup, lang_teardown },
