@@ -74,6 +74,10 @@ jobs:
   # registered no builtins).  This leg keeps the code correct either way.
   ndebug:
     runs-on: ubuntu-latest
+    env:
+      # This leg tests assert removal, not hosted-CPU ISA autodetection.
+      # Match clang-current/fuzz: keep -Werror without native AVX10 conflicts.
+      RAY_MARCH: x86-64
     steps:
       - uses: actions/checkout@v4
       - name: Test with NDEBUG
