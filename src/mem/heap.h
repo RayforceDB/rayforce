@@ -384,16 +384,9 @@ bool ray_raw_discard(void* p, size_t from, size_t upto);
  * and at most half, left to the page cache) are backed by a disk spill file
  * instead — file-backed pages are always reclaimable, so they cannot trigger
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
- * restores the default); intended for diagnostics and tests. */
+ * restores the default).  It, ray_heap_anon_watermark and
+ * ray_heap_anon_peak are public: include/rayforce.h. */
 int64_t ray_heap_anon_committed(void);
-/* High-water mark of the anon-committed footprint since process start — the
- * peak RAM an operator actually demanded (pools, direct and sys blocks;
- * excludes spill). */
-int64_t ray_heap_anon_peak(void);
-/* Current anon watermark in bytes (the effective spill threshold; resolves 0
- * to the default, ray_sys_ram_limit() less the page-cache room). */
-int64_t ray_heap_anon_watermark(void);
-void    ray_heap_set_anon_watermark(int64_t bytes);
 /* Locking against swap-out (heap_lock in heap.c): the bytes of the heap's
  * mappings locked now; the times the kernel refused a lock, or a release
  * could not lock a range again; and the bytes left unlocked — past the
