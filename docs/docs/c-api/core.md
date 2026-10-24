@@ -139,7 +139,7 @@ int64_t ray_heap_anon_peak(void);                    /* peak of the heap's anony
 
 `ray_heap_anon_watermark` resolves 0 to the default. `ray_heap_anon_peak` is the high-water mark, since process start, of the anonymous mappings the heap tracks, counted at their mapped size, spill excluded. It is not the process's RSS, nor all the RAM the embedding process uses. They are what `.sys.mem` reports as `anon-watermark` and `anon-peak`.
 
-On Linux the heap also locks the anonymous memory it maps under the watermark against swap-out, a page at a time as it is faulted in (`MLOCK_ONFAULT`), and best effort: the bytes locked stay within the smaller of the watermark and half the RAM limit. An embedding keeps its host's `RLIMIT_MEMLOCK`, and what does not fit stays unlocked (see [Memory](../guides/memory.md#8-total-ram-and-out-of-core-spill)); `RAY_HEAP_MLOCK=0` turns locking off.
+On Linux the heap also locks the anonymous memory it maps under the watermark against swap-out, a page at a time as it is faulted in (`MLOCK_ONFAULT`), and best effort. The smaller of the watermark and half the RAM limit is the budget for new locks: a mapping that would take the locked bytes past it is left unlocked. Setting the watermark lower unlocks nothing at once: pools and cached blocks are unlocked later, as the heap trims them, and live large blocks stay locked until they are freed, so the locked bytes can stay above the new bound for a while. An embedding keeps its host's `RLIMIT_MEMLOCK`, and what does not fit stays unlocked (see [Memory](../guides/memory.md#8-total-ram-and-out-of-core-spill)); `RAY_HEAP_MLOCK=0` turns locking off.
 
 ```c
 ray_heap_set_anon_watermark(INT64_C(6) << 30);   /* as -m 6G */
