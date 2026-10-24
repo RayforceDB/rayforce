@@ -1,0 +1,26 @@
+;; @requires: posix  (the instances run as child processes through .sys.exec)
+;; @requires: linux  (taskset and cgroups; elsewhere the pool takes every online CPU)
+;; The default pool has one thread per CPU the process may run on: its
+;; affinity mask (taskset, a cpuset), or fewer under a cgroup CPU quota
+;; (docker --cpus, systemd CPUQuota=).  .sys.info reports the CPU count and
+;; the pool size.
+
+(.sys.exec "rm -rf /tmp/rf_cpu_set && mkdir -p /tmp/rf_cpu_set")
+(.sys.exec "printf '(set i (.sys.info))\\n(println (format \"%% %%\" (at i (quote cores)) (at i (quote workers))))\\n' > /tmp/rf_cpu_set/info.rfl")
+
+;; Under taskset the default pool has one thread per allowed CPU.  The CPUs
+;; are the first of the runner's own mask; a runner under a CPU quota below
+;; two CPUs (q, its own default pool size) caps the pool at that.
+;; RAYFORCE_CORES, which the test harness sets, would size the pool itself.
+(.sys.exec "set -- $(taskset -pc $$ | sed 's/.*: //' | tr ',' '\\n' | awk -F- '{ if (NF == 2) for (i = $1; i <= $2; i++) print i; else print $1 }'); [ $# -ge 2 ] || exit 0; q=$(env -u RAYFORCE_CORES ./rayforce -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); q=${q#* }; e=2; [ \"$q\" -lt 2 ] && e=$q; o=$(env -u RAYFORCE_CORES taskset -c $1,$2 ./rayforce -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); [ \"$o\" = \"2 $e\" ]") -- 0
+(.sys.exec "set -- $(taskset -pc $$ | sed 's/.*: //' | tr ',' '\\n' | awk -F- '{ if (NF == 2) for (i = $1; i <= $2; i++) print i; else print $1 }'); o=$(env -u RAYFORCE_CORES taskset -c $1 ./rayforce -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); [ \"$o\" = '1 1' ]") -- 0
+;; -c past the set is obeyed, with a warning on stderr
+(.sys.exec "set -- $(taskset -pc $$ | sed 's/.*: //' | tr ',' '\\n' | awk -F- '{ if (NF == 2) for (i = $1; i <= $2; i++) print i; else print $1 }'); o=$(env -u RAYFORCE_CORES taskset -c $1 ./rayforce -c 3 -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); [ \"$o\" = '1 3' ]") -- 0
+(.sys.exec "set -- $(taskset -pc $$ | sed 's/.*: //' | tr ',' '\\n' | awk -F- '{ if (NF == 2) for (i = $1; i <= $2; i++) print i; else print $1 }'); env -u RAYFORCE_CORES taskset -c $1 ./rayforce -c 3 -f /tmp/rf_cpu_set/info.rfl 2>&1 >/dev/null | grep -q 'gives 3 threads, more than the 1 CPU this process may use'") -- 0
+;; -c within what the process may use: no warning
+(.sys.exec "set -- $(taskset -pc $$ | sed 's/.*: //' | tr ',' '\\n' | awk -F- '{ if (NF == 2) for (i = $1; i <= $2; i++) print i; else print $1 }'); [ $# -ge 2 ] || exit 0; q=$(env -u RAYFORCE_CORES ./rayforce -f /tmp/rf_cpu_set/info.rfl 2>/dev/null | tail -1); q=${q#* }; e=2; [ \"$q\" -lt 2 ] && e=$q; ! env -u RAYFORCE_CORES taskset -c $1,$2 ./rayforce -c $e -f /tmp/rf_cpu_set/info.rfl 2>&1 >/dev/null | grep -q warning") -- 0
+
+;; The CPU quota case runs as pool/cpu_quota_child (test/test_pool.c), where
+;; a missing systemd user manager shows as a skip.
+
+(.sys.exec "rm -rf /tmp/rf_cpu_set")

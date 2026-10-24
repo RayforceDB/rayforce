@@ -39,7 +39,7 @@ static void meta_setup(void) {
 }
 
 static void meta_teardown(void) {
-    unlink(TMP_META_PATH);
+    unlink(ray_test_tmp(TMP_META_PATH));
     ray_sym_destroy();
     ray_heap_destroy();
 }
@@ -54,11 +54,11 @@ static test_result_t test_meta_save_load_roundtrip(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(schema));
 
     /* Save */
-    ray_err_t err = ray_meta_save_d(schema, TMP_META_PATH);
+    ray_err_t err = ray_meta_save_d(schema, ray_test_tmp(TMP_META_PATH));
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Load back */
-    ray_t* loaded = ray_meta_load_d(TMP_META_PATH);
+    ray_t* loaded = ray_meta_load_d(ray_test_tmp(TMP_META_PATH));
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
@@ -79,7 +79,7 @@ static test_result_t test_meta_save_load_roundtrip(void) {
 /* ---- test_meta_save_null_returns_error --------------------------------- */
 
 static test_result_t test_meta_save_null_returns_error(void) {
-    ray_err_t err = ray_meta_save_d(NULL, TMP_META_PATH);
+    ray_err_t err = ray_meta_save_d(NULL, ray_test_tmp(TMP_META_PATH));
     TEST_ASSERT((err) != (RAY_OK), "err != RAY_OK");
 
     PASS();
@@ -89,7 +89,7 @@ static test_result_t test_meta_save_null_returns_error(void) {
 
 static test_result_t test_meta_save_err_ptr_returns_error(void) {
     ray_t* bad = ray_error("type", NULL);
-    ray_err_t err = ray_meta_save_d(bad, TMP_META_PATH);
+    ray_err_t err = ray_meta_save_d(bad, ray_test_tmp(TMP_META_PATH));
     TEST_ASSERT((err) != (RAY_OK), "err != RAY_OK");
     ray_release(bad);
 
@@ -99,7 +99,7 @@ static test_result_t test_meta_save_err_ptr_returns_error(void) {
 /* ---- test_meta_load_nonexistent --------------------------------------- */
 
 static test_result_t test_meta_load_nonexistent(void) {
-    ray_t* loaded = ray_meta_load_d("/tmp/rayforce_no_such_file_meta.d");
+    ray_t* loaded = ray_meta_load_d(ray_test_tmp("/tmp/rayforce_no_such_file_meta.d"));
     /* Should return NULL or error pointer for missing file */
     TEST_ASSERT_TRUE(loaded == NULL || RAY_IS_ERR(loaded));
 

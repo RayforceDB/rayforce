@@ -30,6 +30,10 @@
 (distinct ['a 'b 'ab 'aa 'a 'aa]) -- ['a 'b 'ab 'aa]
 (set l (guid 2)) (set l (concat l l)) (count (distinct l)) -- 2
 (distinct (list [3i 3i] 2i [3i 3i] 2i)) -- (list 2i [3i 3i])
+;; tables and dicts in a list: equal ones collapse, different ones stay
+;; (cell equality saw every table / dict of one length as equal)
+(count (distinct (list (table [q] (list [1])) (table [q] (list [2])) (table [q] (list [1])) (table [r] (list [1]))))) -- 3
+(count (distinct (list {p: 1} {p: 2} {p: 1} {r: 1}))) -- 3
 ;; ========== NULL BITMAP PROPAGATION ==========
 ;; distinct preserves one null
 (distinct [1 0Nl 2 0Nl 1]) -- [0Nl 1 2]

@@ -29,6 +29,8 @@
 #include "core/pool.h"
 #include "mem/sys.h"
 #include "store/col.h"
+#include "store/enccol.h"
+#include "store/encfmt.h"
 #include "store/fileio.h"
 #include "store/serde.h"
 #include "table/sym.h"
@@ -36,7 +38,6 @@
 #include "table/domain.h"
 #include "ops/idxop.h"
 #include "core/profile.h"
-#include "io/csv.h"      /* ray_csv_hash_upgrade_check — shared index policy */
 #include "vec/str.h"
 #include "lang/format.h"
 #include <string.h>
@@ -68,11 +69,49 @@
  * format) and needs no symfile. */
 static bool table_has_sym_cols(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
-    for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && !RAY_IS_ERR(col) && col->type == RAY_SYM) return true;
-    }
+    ray_col_meta_t m;
+    for (int64_t c = 0; c < nc; c++)
+        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_SYM) return true;
     return false;
+}
+
+/* The slot object of column c: its RAY_ENCCOL, or the plain column.  Never
+ * decodes. */
+static ray_t* splay_slot(ray_t* tbl, int64_t c) {
+    ray_t* e = ray_table_get_col_enc_idx(tbl, c);
+    return e ? e : ray_table_col_idx(tbl, c);
+}
+
+/* The symfile of SYM column `name` under the per-column layout: the dotfile
+ * `<dir>/.<name>.sym` next to the column file (dir: the directory holding
+ * the columns, a generation or the table root of a table written once).
+ * Column names never start with '.', so the name cannot be a column's; every
+ * file derived from a symfile (`.ix`, `.lk`, `.tmp`) carries a suffix past
+ * `.sym`, so it cannot be another column's symfile either. */
+bool ray_splay_col_sym_path(char* out, size_t cap, const char* dir,
+                            const char* name, size_t name_len) {
+    if (!out || !cap || !dir || !name) return false;
+    int n = snprintf(out, cap, "%s/.%.*s.sym", dir, (int)name_len, name);
+    return n > 0 && (size_t)n < cap;
+}
+
+ray_t* ray_symfile_opt_parse(ray_t* opts, ray_symfile_t* layout) {
+    *layout = RAY_SYMFILE_SHARED;
+    if (!opts || opts->type != RAY_DICT) return NULL;
+    ray_t* key = ray_sym(ray_sym_intern("symfile", 7));
+    if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
+    ray_t* v = ray_dict_get(opts, key);
+    ray_release(key);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) return v;
+    ray_t* s = v->type == -RAY_SYM ? ray_sym_str(v->i64) : NULL;
+    bool ok = s && !RAY_IS_ERR(s);
+    if (ok && ray_str_len(s) == 6 && memcmp(ray_str_ptr(s), "column", 6) == 0)
+        *layout = RAY_SYMFILE_COLUMN;
+    else if (!(ok && ray_str_len(s) == 6 && memcmp(ray_str_ptr(s), "shared", 6) == 0))
+        ok = false;
+    ray_release(v);
+    return ok ? NULL : ray_error("domain", "symfile must be 'shared or 'column");
 }
 
 /* --------------------------------------------------------------------------
@@ -247,7 +286,22 @@ static ray_err_t splay_has_file(const char* dir, const char* name, bool* exists)
     return *exists || errno == ENOENT ? RAY_OK : RAY_ERR_IO;
 }
 
+/* Removes what `path` names, best effort.  A link goes, never what it
+ * points to: opendir follows a link, so the path is examined with lstat
+ * first and only a real directory is descended.  Every caller relies on
+ * this: the generation prune (a link placed directly under .generations),
+ * the staged-directory removal and the clearing of a failed first write. */
 static void splay_remove_tree_best_effort(const char* path) {
+    struct stat top;
+#ifdef RAY_OS_WINDOWS
+    if (stat(path, &top) != 0) return;
+#else
+    if (lstat(path, &top) != 0) return;
+#endif
+    if (!S_ISDIR(top.st_mode)) {
+        (void)unlink(path);
+        return;
+    }
     DIR* d = opendir(path);
     if (!d) {
         (void)unlink(path);
@@ -334,6 +388,24 @@ static void splay_retire_legacy_schema(const char* root) {
             if (S_ISDIR(st.st_mode)) continue;  /* not a column file */
             if (unlink(path) != 0) all_gone = false;
         }
+        /* the column's own symfile (per-column layout) and its index and
+         * lock: they describe the root column only */
+        static const char* const sym_suffix[] = {"", ".ix", ".lk"};
+        char spath[1100];
+        if (all_gone && ray_splay_col_sym_path(spath, sizeof(spath), root, name, len)) {
+            size_t sl = strlen(spath);
+            for (size_t k = 0; all_gone && k < sizeof(sym_suffix) / sizeof(sym_suffix[0]); k++) {
+                if (sl + strlen(sym_suffix[k]) >= sizeof(spath)) break;
+                memcpy(spath + sl, sym_suffix[k], strlen(sym_suffix[k]) + 1);
+                struct stat st;
+#ifdef RAY_OS_WINDOWS
+                if (stat(spath, &st) != 0) continue;
+#else
+                if (lstat(spath, &st) != 0) continue;
+#endif
+                if (!S_ISDIR(st.st_mode) && unlink(spath) != 0) all_gone = false;
+            }
+        }
     }
     ray_release(names);
     if (all_gone) (void)unlink(retired);
@@ -381,7 +453,12 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
      * columns have already replaced an existing committed generation. */
     int64_t preflight_ncols = ray_table_ncols(tbl);
     for (int64_t c = 0; c < preflight_ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = splay_slot(tbl, c);
+        if (col && RAY_IS_ERR(col)) {           /* a failed decode: its code, message left in the slot */
+            ray_err_t derr = ray_err_from_obj(col);
+            ray_error_free(col);
+            return derr;
+        }
         ray_err_t err = ray_col_save_preflight(col);
         if (err != RAY_OK) return err;
     }
@@ -426,16 +503,84 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
     return RAY_OK;
 }
 
+static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens);
+
+/* Distinct-merge SYM column `col`'s vocabulary into `dom` (find-or-append,
+ * by a walk of its cells read by range, so an encoded column decodes one
+ * vector at a time through its own domain).  A column already over `dom`
+ * is merged by construction. */
+static ray_err_t splay_merge_vocab(ray_t* col, ray_sym_domain_t* dom) {
+    ray_col_src_t src;
+    ray_t* berr = ray_col_src_bind(col, &src);
+    if (berr) { ray_err_t e = ray_err_from_obj(berr); ray_error_free(berr); return e; }
+    if (src.dom == dom) { ray_col_src_release(&src); return RAY_OK; }   /* already merged */
+    ray_col_scratch_t scr; ray_col_scratch_init(&scr);
+    ray_err_t merr = RAY_OK;
+    for (int64_t r = 0; merr == RAY_OK && r < src.len; ) {
+        ray_col_range_t v;
+        ray_t* rerr = ray_col_range(&src, r, src.len - r, &scr, &v);
+        if (rerr) { merr = ray_err_from_obj(rerr); ray_error_free(rerr); break; }
+        if (v.n <= 0) { merr = RAY_ERR_CORRUPT; break; }
+        for (int64_t i = 0; i < v.n; i++) {
+            ray_t* str = ray_sym_domain_str(v.dom, ray_read_sym(v.data, i, RAY_SYM, v.attrs));
+            if (!str) { merr = RAY_ERR_CORRUPT; break; }
+            if (ray_sym_domain_intern(dom, ray_str_ptr(str), ray_str_len(str)) < 0) {
+                merr = RAY_ERR_OOM;
+                break;
+            }
+        }
+        r += v.n;
+    }
+    ray_col_scratch_free(&scr);
+    ray_col_src_release(&src);
+    return merr;
+}
+
+static void splay_release_cdoms(ray_sym_domain_t** cdoms, int64_t n) {
+    if (!cdoms) return;
+    for (int64_t c = 0; c < n; c++)
+        if (cdoms[c]) ray_sym_domain_release(cdoms[c]);
+    ray_free_raw(cdoms);
+}
+
+/* write: the held lock's state (mode, current generation; receives the
+ * resolved generations), or NULL for a private directory. */
 static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
                                         const char* sym_path, bool durable,
-                                        bool flush_sym, bool build_indexes) {
-    ray_err_t validation = splay_validate_save(tbl, dir, sym_path);
+                                        bool flush_sym, bool build_indexes,
+                                        ray_compress_t mode, ray_splay_write_t* write,
+                                        bool sym_col) {
+    ray_err_t validation = splay_validate_save(tbl, dir, sym_col ? NULL : sym_path);
     if (validation != RAY_OK) return validation;
     /* Create directory and any missing parents (mkdir -p semantics).
      * Required for partitioned layouts like "/db/2024.01.01/t/" where the
      * caller hasn't pre-created the date partition. */
     ray_err_t mkdir_err = ray_mkdir_p(dir);
     if (mkdir_err != RAY_OK) return mkdir_err;
+
+    /* 0. Each file's generation, decided once and before anything is
+     *    written: the option, else the source (an encoded slot stays 2),
+     *    else the destination's current generation (read under its lock
+     *    by ray_splay_write_begin). */
+    int64_t ncols_res = ray_table_ncols(tbl);
+    uint8_t* gens = ray_calloc_raw((size_t)(ncols_res > 0 ? ncols_res : 1));
+    if (!gens) return RAY_ERR_OOM;
+    for (int64_t c = 0; c < ncols_res; c++) {
+        ray_t* na = ray_sym_str(ray_table_col_name(tbl, c));
+        if (!na) continue;
+        if (write && write->cur_err != RAY_OK &&
+            ray_col_resolve_needs_dest(mode, splay_slot(tbl, c))) {
+            ray_free_raw(gens);
+            return write->cur_err;                         /* inheritance needs the destination */
+        }
+        ray_err_t gerr = ray_col_resolve_gen_err(mode, splay_slot(tbl, c),
+                                                 write ? write->cur : NULL,
+                                                 ray_str_ptr(na), ray_str_len(na), &gens[c]);
+        if (gerr != RAY_OK) { ray_free_raw(gens); return gerr; }   /* nothing written yet */
+    }
+    if (write) { ray_free_raw(write->gens); write->gens = gens; write->ngens = ncols_res; }
+    ray_err_t ret = RAY_OK;
+    ray_t* schema = NULL;
 
     /* 1. Symfile FIRST — column data must never reference positions the
      *    symfile doesn't persist (crash ordering: sym → columns → .d).
@@ -445,14 +590,48 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
      *    column's vocabulary into it (append-only — existing positions
      *    stay; the find-or-append rides the cell walk), flush, then
      *    write columns re-encoded as positions during the column pass.
+     *    The walk reads each source by range, so an encoded column is
+     *    decoded one vector at a time through its own domain.
      *
      *    Skipped entirely for symbol-free tables: nothing to enumerate
      *    (spec: no-symbol-columns exemption). */
     ray_sym_domain_t* dom = NULL;
-    if (table_has_sym_cols(tbl)) {
-        if (!sym_path) return RAY_ERR_DOMAIN; /* SYM columns need a symfile */
+    ray_sym_domain_t** cdoms = NULL;   /* per-column layout: column c's own, or NULL */
+    if (table_has_sym_cols(tbl) && sym_col) {
+        /* Per-column layout: every SYM column gets its own symfile next to
+         * its column file (ray_splay_col_sym_path), holding that column's
+         * vocabulary only, so a scan of one column reads its strings and no
+         * other column's.  Same order as the shared layout: each symfile
+         * merged and flushed before any column is written. */
+        cdoms = ray_calloc_raw((size_t)(ncols_res > 0 ? ncols_res : 1) * sizeof(*cdoms));
+        if (!cdoms) { ret = RAY_ERR_OOM; goto out; }
+        for (int64_t c = 0; c < ncols_res; c++) {
+            ray_t* col = splay_slot(tbl, c);
+            ray_col_meta_t m;
+            if (!col || RAY_IS_ERR(col) || !ray_col_meta_of(col, &m) || m.type != RAY_SYM)
+                continue;
+            ray_t* na = ray_sym_str(ray_table_col_name(tbl, c));
+            char cpath[1024];
+            if (!na || !ray_splay_col_sym_path(cpath, sizeof(cpath), dir,
+                                               ray_str_ptr(na), ray_str_len(na))) {
+                ret = RAY_ERR_RANGE;
+                goto out;
+            }
+            cdoms[c] = ray_sym_domain_open_or_create(cpath);
+            if (!cdoms[c]) { ret = RAY_ERR_IO; goto out; }
+            if (ray_sym_domain_count(cdoms[c]) == 0 &&
+                ray_sym_domain_intern(cdoms[c], "", 0) != 0) {   /* see the seeding below */
+                ret = RAY_ERR_OOM;
+                goto out;
+            }
+            ray_err_t merr = splay_merge_vocab(col, cdoms[c]);
+            if (merr == RAY_OK && flush_sym) merr = ray_sym_domain_flush(cdoms[c], durable);
+            if (merr != RAY_OK) { ret = merr; goto out; }
+        }
+    } else if (table_has_sym_cols(tbl)) {
+        if (!sym_path) { ret = RAY_ERR_DOMAIN; goto out; } /* SYM columns need a symfile */
         dom = ray_sym_domain_open_or_create(sym_path);
-        if (!dom) return RAY_ERR_IO;
+        if (!dom) { ret = RAY_ERR_IO; goto out; }
 
         /* Empty-vocabulary seeding: a 0-row SYM table merges nothing
          * below, and ray_sym_domain_flush no-ops at count == disk_count
@@ -464,44 +643,38 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
          * non-empty vocabulary the intern is a find hit, a no-op). */
         if (ray_sym_domain_count(dom) == 0 &&
             ray_sym_domain_intern(dom, "", 0) != 0) {
-            ray_sym_domain_release(dom);
-            return RAY_ERR_OOM;
+            ret = RAY_ERR_OOM;
+            goto out;
         }
 
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            if (!col || RAY_IS_ERR(col) || col->type != RAY_SYM) continue;
-            if (ray_sym_vec_domain(col) == dom) continue; /* already merged */
-            for (int64_t i = 0; i < col->len; i++) {
-                ray_t* s = ray_sym_vec_cell(col, i);
-                if (!s) { ray_sym_domain_release(dom); return RAY_ERR_CORRUPT; }
-                if (ray_sym_domain_intern(dom, ray_str_ptr(s),
-                                          ray_str_len(s)) < 0) {
-                    ray_sym_domain_release(dom);
-                    return RAY_ERR_OOM;
-                }
-            }
+            ray_t* col = splay_slot(tbl, c);
+            ray_col_meta_t m;
+            if (!col || RAY_IS_ERR(col) || !ray_col_meta_of(col, &m) || m.type != RAY_SYM)
+                continue;
+            ray_err_t merr = splay_merge_vocab(col, dom);
+            if (merr != RAY_OK) { ret = merr; goto out; }
         }
 
         ray_err_t sym_err = flush_sym ? ray_sym_domain_flush(dom, durable) : RAY_OK;
-        if (sym_err != RAY_OK) {
-            ray_sym_domain_release(dom);
-            return sym_err;
-        }
+        if (sym_err != RAY_OK) { ret = sym_err; goto out; }
     }
 
     int64_t ncols = ray_table_ncols(tbl);
 
-    /* 2. Write the column files in the caller's unpublished directory. */
-    ray_t* schema = ray_vec_new(RAY_STR, ncols > 0 ? ncols : 1);
+    /* 2. Write the column files in the caller's unpublished directory, each
+     *    in its resolved generation, from the slot object (an encoded slot
+     *    is read by range for generation 2). */
+    schema = ray_vec_new(RAY_STR, ncols > 0 ? ncols : 1);
     if (!schema || RAY_IS_ERR(schema)) {
         if (schema) ray_release(schema);
-        if (dom) ray_sym_domain_release(dom);
-        return RAY_ERR_OOM;
+        schema = NULL;
+        ret = RAY_ERR_OOM;
+        goto out;
     }
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = splay_slot(tbl, c);
         if (!col) continue;
         ray_t* name_atom = ray_sym_str(ray_table_col_name(tbl, c));
         if (!name_atom) continue;
@@ -515,58 +688,95 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir,
                                 (int)name_len, name);
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
-            ray_release(schema);
-            if (dom) ray_sym_domain_release(dom);
-            return RAY_ERR_RANGE;
+            ret = RAY_ERR_RANGE;
+            goto out;
         }
-        ray_err_t err = (col->type == RAY_SYM)
-            ? ray_col_save_sym_encoded(col, path, dom, durable)
-            : (durable ? ray_col_save(col, path)
-                       : ray_col_save_bulk(col, path));
-        if (err != RAY_OK) {
-            /* No new .d or .current is published on failure. */
-            ray_release(schema);
-            if (dom) ray_sym_domain_release(dom);
-            return err;
-        }
+        ray_col_meta_t m;
+        ray_col_meta_of(col, &m);
+        ray_col_write_t w;
+        memset(&w, 0, sizeof w);
+        ray_t* berr = ray_col_src_bind(col, &w.src);
+        if (berr) { ret = ray_err_from_obj(berr); ray_error_free(berr); goto out; }
+        w.name = name;
+        w.gen = gens[c];
+        w.target_dom = m.type != RAY_SYM ? NULL : cdoms ? cdoms[c] : dom;
+        w.durable = durable;
+        /* Generation 0 persists a chunk zone for numeric columns of at least
+         * one chunk (ray_splay_build_indexes); generation 2 records it when
+         * the column records no other kind (a stale root records none). */
+        uint8_t rec_kind = m.index_kind, rec_flags = 0;
+        if (ray_is_vec(col)) ray_col_gen2_index_meta(col, &rec_kind, &rec_flags);
+        if (w.gen == 2 && build_indexes && ray_zone_acc_supported(m.type) &&
+            m.len >= RAY_ENC_CHUNK && rec_kind == 0)
+            w.index_kind = RAY_IDX_CHUNK_ZONE;
+        /* generation 0 builds a STR DICT in the same pass (splay_build_index_col):
+         * at least RAY_DICT_MIN_ROWS rows, unless a HASH takes the slot */
+        if (w.gen == 2 && build_indexes && ray_col_dict_wanted(m.type, m.len) && rec_kind != RAY_IDX_HASH)
+            w.index_kind = RAY_IDX_DICT;
+        ray_err_t err = ray_col_save_ctx(&w, path);
+        ray_col_src_release(&w.src);
+        /* No new .d or .current is published on failure. */
+        if (err != RAY_OK) { ret = err; goto out; }
         schema = ray_str_vec_append(schema, name, name_len);
         if (!schema || RAY_IS_ERR(schema)) {
             if (schema) ray_release(schema);
-            if (dom) ray_sym_domain_release(dom);
-            return RAY_ERR_OOM;
+            schema = NULL;
+            ret = RAY_ERR_OOM;
+            goto out;
         }
     }
-    if (dom) ray_sym_domain_release(dom);
+    if (dom) { ray_sym_domain_release(dom); dom = NULL; }
+    splay_release_cdoms(cdoms, ncols_res);
+    cdoms = NULL;
 
     /* Indexes belong to this generation and must precede publication. They are
      * rebuildable accelerators; ray_col_append_index writes the marker last and
-     * intentionally does not fsync them again after ray_col_save fsyncs data. */
+     * intentionally does not fsync them again after ray_col_save fsyncs data.
+     * Generation-2 files record theirs in the enc header instead. */
     if (build_indexes)
-        ray_splay_build_indexes(dir, tbl);
+        splay_build_indexes_gens(dir, tbl, gens);
+
+    /* A cancel before the commit marker leaves nothing committed: the
+     * write finish removes what this save created. */
+    if (ray_interrupted()) {
+        ray_release(schema);
+        return RAY_ERR_CANCEL;
+    }
 
     /* 3. .d LAST — the commit marker. */
     {
         char path[1024];
         int path_len = snprintf(path, sizeof(path), "%s/.d", dir);
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
-            ray_release(schema);
-            return RAY_ERR_RANGE;
+            ret = RAY_ERR_RANGE;
+            goto out;
         }
         ray_err_t err = durable ? ray_col_save(schema, path)
                                 : ray_col_save_bulk(schema, path);
-        ray_release(schema);
-        if (err != RAY_OK) return err;
+        if (err != RAY_OK) { ret = err; goto out; }
     }
 
     /* 4. Sweep files that are no longer part of the table. */
     splay_sweep_stale(tbl, dir);
 
-    return RAY_OK;
+out:
+    if (schema) ray_release(schema);
+    if (dom) ray_sym_domain_release(dom);
+    splay_release_cdoms(cdoms, ncols_res);
+    if (!write) ray_free_raw(gens);
+    return ret;
 }
 
 ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable) {
-    return splay_write_table_impl(tbl, dir, sym_path, durable, true, true);
+    return splay_write_table_impl(tbl, dir, sym_path, durable, true, true,
+                                  RAY_COMPRESS_ABSENT, NULL, false);
+}
+
+ray_err_t ray_splay_write_table_ctx(ray_t* tbl, ray_splay_write_t* write,
+                                     const char* sym_path, bool durable) {
+    return splay_write_table_impl(tbl, write->dir, sym_path, durable, true, true,
+                                  write->mode, write, write->sym_col);
 }
 
 #ifdef RAY_OS_WINDOWS
@@ -733,6 +943,13 @@ static void splay_remove_created(const ray_splay_write_t* write, bool unlink_loc
 
 ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
                                   bool durable) {
+    /* The last moment a cancel can stop a staged write: its generation is
+     * not published yet, so the call reports the cancel and the previous
+     * one stays current.  A first write commits in place with its .d, so
+     * the writers check before writing it; this check is the deliberate
+     * backstop for the .d write itself and for writers yet to come. */
+    if (result == RAY_OK && write->staged && ray_interrupted())
+        result = RAY_ERR_CANCEL;
     if (result == RAY_OK && write->staged) {
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];
@@ -773,6 +990,9 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
         write->before = NULL;
         write->nbefore = 0;
     }
+    ray_free_raw(write->gens);
+    write->gens = NULL;
+    write->ngens = 0;
     bool unlink_lock = locked || write->unlink_lock;
 #ifndef RAY_OS_WINDOWS
     /* Under the lock; a writer waiting on it then finds its lock file
@@ -862,6 +1082,15 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     if (err == RAY_OK) err = splay_has_file(write->root, ".current", &current);
     if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
     write->staged = schema || current;
+    /* The destination's current generation, read under the lock: the
+     * generation inheritance rule compares against it. */
+    write->cur[0] = '\0';
+    if (write->staged) {
+        /* A failure matters only to a column that inherits from the
+         * destination (splay_write_table_impl); explicit modes proceed. */
+        write->cur_err = ray_splay_resolve_dir(write->root, write->cur, sizeof write->cur);
+        if (write->cur_err != RAY_OK) write->cur[0] = '\0';
+    }
     if (!write->staged) {
         splay_snapshot_root(write);
         memcpy(write->dir, write->root, len + 1);
@@ -893,27 +1122,58 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     return RAY_OK;
 }
 
+ray_err_t ray_splay_write_begin_mode(const char* dir, ray_compress_t mode,
+                                     ray_splay_write_t* write) {
+    ray_err_t err = ray_splay_write_begin(dir, write);
+    if (err == RAY_OK) write->mode = mode;
+    return err;
+}
+
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
-                                 const char* sym_path, bool durable) {
-    ray_err_t err = splay_validate_save(tbl, dir, sym_path);
+                                 const char* sym_path, bool durable,
+                                 ray_compress_t mode, bool sym_col) {
+    /* the per-column layout writes no shared symfile: no collision to check */
+    ray_err_t err = splay_validate_save(tbl, dir, sym_col ? NULL : sym_path);
     if (err != RAY_OK) return err;
     ray_splay_write_t write;
-    err = ray_splay_write_begin(dir, &write);
+    err = ray_splay_write_begin_mode(dir, mode, &write);
     if (err != RAY_OK) return err;
-    err = ray_splay_write_table(tbl, write.dir, sym_path, durable);
+    write.sym_col = sym_col;
+    err = ray_splay_write_table_ctx(tbl, &write, sym_path, durable);
     return ray_splay_write_finish(&write, err, durable);
 }
 
 ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, true);
+    return splay_save_impl(tbl, dir, sym_path, true, RAY_COMPRESS_ABSENT, false);
 }
 
 ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, false);
+    return splay_save_impl(tbl, dir, sym_path, false, RAY_COMPRESS_ABSENT, false);
+}
+
+ray_err_t ray_splay_save_mode(ray_t* tbl, const char* dir, const char* sym_path,
+                              ray_compress_t mode) {
+    return splay_save_impl(tbl, dir, sym_path, true, mode, false);
+}
+
+ray_err_t ray_splay_save_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
+                                   ray_compress_t mode) {
+    return splay_save_impl(tbl, dir, sym_path, false, mode, false);
+}
+
+ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
+                                ray_compress_t mode, ray_symfile_t layout) {
+    return splay_save_impl(tbl, dir, sym_path, true, mode, layout == RAY_SYMFILE_COLUMN);
 }
 
 ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_write_table_impl(tbl, dir, sym_path, false, false, false);
+    return splay_write_table_impl(tbl, dir, sym_path, false, false, false,
+                                  RAY_COMPRESS_ABSENT, NULL, false);
+}
+
+ray_err_t ray_splay_save_staged_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
+                                          ray_compress_t mode) {
+    return splay_write_table_impl(tbl, dir, sym_path, false, false, false, mode, NULL, false);
 }
 
 /* --------------------------------------------------------------------------
@@ -924,8 +1184,11 @@ ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sy
  * The .d schema is always loaded via ray_col_load (small, buddy copy).
  * -------------------------------------------------------------------------- */
 
+/* col_syms: a column's own symfile (the per-column layout) is honoured; a
+ * partition of a parted table (ray_read_splayed_dom) refuses one instead,
+ * as its segments must all resolve over the table's one domain. */
 static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
-                                  bool use_mmap) {
+                                  bool use_mmap, bool col_syms) {
     if (!dir) return ray_error("io", NULL);
     bool trace = getenv("RAY_CSV_TRACE") != NULL;
     if (trace)
@@ -995,20 +1258,63 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                              dir, (long long)c, sizeof(path));
         }
 
+        /* A column written with the per-column layout resolves over its
+         * own symfile, `<dir>/.<name>.sym` (ray_splay_col_sym_path), in
+         * place of the table's.  The name is a dotfile no column can have,
+         * and only that layout's writers make it. */
+        ray_sym_domain_t* cdom = NULL;
+        {
+            char spath[1100];
+            struct stat sst;
+            if (!ray_splay_col_sym_path(spath, sizeof(spath), dir, name, name_len)) {
+                ray_release(schema);
+                ray_release(tbl);
+                return ray_error("range", "splayed %s: symfile path for column '%.*s' is too long",
+                                 dir, (int)name_len, name);
+            }
+            if (stat(spath, &sst) == 0 && !col_syms) {
+                ray_release(schema);
+                ray_release(tbl);
+                return ray_error("nyi", "splayed %s: column '%.*s' has a symfile of its own "
+                                 "(symfile 'column), which a partition does not take",
+                                 dir, (int)name_len, name);
+            }
+            if (stat(spath, &sst) == 0) {
+                cdom = ray_sym_domain_open(spath);
+                if (!cdom) {
+                    ray_release(schema);
+                    ray_release(tbl);
+                    return ray_error("corrupt",
+                        "symfile %s: unreadable or invalid (bad magic, torn "
+                        "record, or missing \"\" at position 0)", spath);
+                }
+            } else if (errno != ENOENT) {
+                ray_release(schema);
+                ray_release(tbl);
+                return ray_error("io", "symfile %s: cannot stat", spath);
+            }
+        }
+        ray_sym_domain_t* udom = cdom ? cdom : dom;
+
         /* Domain-attaching loaders: a SYM column resolves over the
          * table's symfile (dom); dom == NULL + SYM column is the loud
          * "sym" error from the col loader (spec: never silent
          * resolution against incidental state). */
-        ray_t* col = use_mmap ? ray_col_mmap_splayed_dom(path, dom)
-                              : ray_col_load_dom(path, dom);
+        ray_t* col = use_mmap ? ray_col_mmap_splayed_dom(path, udom)
+                              : ray_col_load_dom(path, udom);
         if (use_mmap && col && RAY_IS_ERR(col) &&
-            strcmp(ray_err_code(col), "nyi") == 0) {
+            strcmp(ray_err_code(col), "nyi") == 0 && ray_error_msg() == NULL) {
+            /* Contract: the generation-0 mmap refusals that the plain loader
+             * can still serve (col.c) are message-less "nyi"; a "nyi" with a
+             * message is final (a generation-2 file on a big-endian host)
+             * and must reach the caller unchanged. */
             /* ray_release on an error object is a no-op (rayforce.h:180);
              * must use ray_error_free to actually reclaim the error
              * before retrying with the non-mmap loader. */
             ray_error_free(col);
-            col = ray_col_load_dom(path, dom);
+            col = ray_col_load_dom(path, udom);
         }
+        if (cdom) ray_sym_domain_release(cdom);   /* the column holds its own */
         if (!col || RAY_IS_ERR(col)) {
             if (trace)
                 fprintf(stderr, "splayed.get: col load failed path=%s err=%s\n",
@@ -1026,17 +1332,6 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
             ray_error_free(col);
             return ray_error(codebuf, "splayed %s: column '%.*s' failed to load",
                              dir, (int)name_len, name);
-        }
-
-        if (c > 0 && col->len != ray_table_nrows(tbl)) {
-            ray_t* err = ray_error("corrupt",
-                "splayed %s: column '%.*s' has %lld rows, expected %lld "
-                "(torn overwrite?)", dir, (int)name_len, name,
-                (long long)col->len, (long long)ray_table_nrows(tbl));
-            ray_release(col);
-            ray_release(schema);
-            ray_release(tbl);
-            return err;
         }
 
         ray_t* new_df = ray_table_add_col(tbl, name_id, col);
@@ -1114,16 +1409,38 @@ static ray_t* splay_load_once(const char* dir, const char* sym_path,
             if (*held) { ray_sym_domain_release(*held); *held = NULL; }
             if (!dom)
                 return ray_error("corrupt",
-                    "symfile %s: unreadable or invalid (bad magic, torn "
-                    "record, or missing \"\" at position 0)", sym_path);
+                    "symfile %s: unreadable or not a symfile", sym_path);
         }
     }
     /* An earlier attempt's domain not replaced above (no symfile this
      * time) is let go here, before *held is overwritten. */
     if (*held) ray_sym_domain_release(*held);
-    ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap);
+    ray_t* tbl = splay_load_dom_impl(resolved, dom, use_mmap, true);
     *held = dom;   /* released by the caller; columns hold their own refs */
     return tbl;
+}
+
+/* The table's symbol files read whole while the memory left after them
+ * still holds RAY_SYM_PRELOAD_COLS (default 1) of its columns at 8 bytes a
+ * row: the room a query's columns and its work take.  One file per column
+ * goes in column order, so a small machine reads some of them. */
+static void splay_preload_syms(ray_t* tbl) {
+    int64_t k = 1;
+    const char* e = getenv("RAY_SYM_PRELOAD_COLS");
+    if (e && *e) k = atoll(e);
+    int64_t headroom = k * ray_table_nrows(tbl) * 8;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_slot_idx(tbl, c);
+        if (!col) continue;
+        ray_sym_domain_t* d = NULL;
+        if (col->type == RAY_SYM) d = col->sym_domain;
+        else if (col->type == RAY_ENCCOL) {
+            ray_enccol_t* ec = ray_enccol_of(col);
+            if (ec && ec->type == RAY_SYM) d = ec->dom;
+        }
+        if (d && d != ray_sym_runtime_domain()) ray_sym_domain_preload(d, headroom);
+    }
 }
 
 static ray_t* splay_load_impl(const char* dir, const char* sym_path,
@@ -1141,6 +1458,7 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path,
         if (!why) break;
         ray_error_free(tbl);
     }
+    if (tbl && !RAY_IS_ERR(tbl)) splay_preload_syms(tbl);
     if (held) ray_sym_domain_release(held);
     return tbl;
 }
@@ -1161,14 +1479,6 @@ bool ray_splay_has_schema(const char* dir) {
 
 ray_t* ray_splay_load(const char* dir, const char* sym_path) {
     return splay_load_impl(dir, sym_path, false);
-}
-
-/* `dir`/<name of column c> into out[cap]; false when it does not fit. */
-static bool splay_col_path(const char* dir, ray_t* tbl, int64_t c, char* out, size_t cap) {
-    ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
-    if (!nstr || RAY_IS_ERR(nstr)) return false;
-    int n = snprintf(out, cap, "%s/%.*s", dir, (int)ray_str_len(nstr), ray_str_ptr(nstr));
-    return n > 0 && (size_t)n < cap;
 }
 
 /* Hash-index `col` and append the index to its index-less file `path`:
@@ -1195,13 +1505,17 @@ static ray_err_t splay_hash_append(const char* path, ray_t* col) {
 /* Index one column of a just-written splayed table (see
  * ray_splay_build_indexes).  Columns are independent — each reads and
  * appends to its own file — so the caller runs one task per column. */
-/* deferred: when non-NULL and the column qualifies for a hash index, the
- * computed zone is stored there instead of persisted and nothing is written;
- * splay_persist_hash_or_zone finishes the column. */
-static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t** deferred) {
+/* gens: the resolved generation per column, or NULL (all generation 0); a
+ * generation-2 file records its index in the enc header and is skipped. */
+static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
+                                  const uint8_t* gens) {
+    /* Index policy (compressed-columns PI): no heuristic HASH is persisted
+     * for any generation; only explicit .idx.hash indexes are (below).
+     * A generation-2 file records its zone in the enc header. */
+    if (gens && gens[c] == 2) return;
     {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!col || RAY_IS_ERR(col)) return;
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return; }   /* best effort: no index */
 
         /* Explicit SYM index: a SYM column carrying a grouped (hash) index in
          * memory gets a hash index persisted inline — regardless of length (the
@@ -1258,38 +1572,14 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
         if (col->len < (1 << 16)) return;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal
-         * get the per-chunk min/max for block-skip.
-         *
-         * High-entropy numeric columns are then upgraded to a persisted HASH
-         * index using the same chunk-zone entropy heuristic the in-memory
-         * .csv.read load applies (ray_csv_hash_upgrade_check): the index
-         * decision is made ONCE at conversion time, so a `.db.splayed.get`
-         * reload serves equality probes exactly as fast as a fresh CSV load
-         * (previously the reloaded store had only the zone map and e.g.
-         * ClickBench q10 ran 5x slower on-disk than in-memory). */
+         * get the per-chunk min/max for block-skip.  No HASH is built here:
+         * index policy (compressed-columns PI) — converters persist only the
+         * indexes every scan uses; explicit .idx.hash indexes were persisted
+         * by ray_col_save, and ray_col_append_index refuses a marked file. */
         ray_t* idx = (col->type == RAY_STR)
                      ? ray_index_dict_compute(col)
                      : ray_index_chunk_zone_compute(col, 16);
         if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); return; }
-
-        if (col->type != RAY_STR &&
-            ray_csv_hash_upgrade_check(col->type, col->len,
-                                       ray_index_payload(idx))) {
-            if (deferred) {
-                /* Inside a per-column task: the hash build has its own
-                 * parallel path that needs the pool, so hand the zone
-                 * back and let the caller build the hash afterwards. */
-                *deferred = idx;
-                return;
-            }
-            char hpath[1100];
-            if (splay_col_path(dir, tbl, c, hpath, sizeof(hpath)) &&
-                splay_hash_append(hpath, col) == RAY_OK) {
-                ray_release(idx);          /* zone sacrificed for the hash */
-                return;
-            }
-            /* Hash build failed — fall through and persist the zone. */
-        }
 
         ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
         if (nstr && !RAY_IS_ERR(nstr)) {
@@ -1304,85 +1594,35 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c, ray_t*
     }
 }
 
-/* Persist a deferred column: its hash index when the build succeeded
- * (hashed[c]), else the zone it was computed with (deferred[c]). */
-typedef struct { const char* dir; ray_t* tbl; ray_t** deferred; ray_t** hashed; } splay_index_ctx_t;
+typedef struct {
+    const char* dir; ray_t* tbl;
+    const uint8_t* gens;    /* per-column generation, NULL = all 0 */
+} splay_index_ctx_t;
 
-static void splay_persist_deferred(splay_index_ctx_t* x, int64_t c) {
-    ray_t* col = ray_table_get_col_idx(x->tbl, c);
-    ray_t* nstr = ray_sym_str(ray_table_col_name(x->tbl, c));
-    char path[1100];
-    int n = (nstr && !RAY_IS_ERR(nstr))
-        ? snprintf(path, sizeof(path), "%s/%.*s", x->dir, (int)ray_str_len(nstr), ray_str_ptr(nstr))
-        : -1;
-    bool have_path = n > 0 && n < (int)sizeof(path);
-    ray_t* hi = x->hashed[c];
-    if (hi) {
-        if (have_path)
-            (void)ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type);
-        ray_release(hi);
-    } else if (have_path) {
-        (void)ray_col_append_index(path, ray_index_payload(x->deferred[c]), col->len, col->type);
-    }
-    ray_release(x->deferred[c]);
-    x->hashed[c] = NULL; x->deferred[c] = NULL;
-}
-
-static void splay_persist_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid; (void)end;
-    splay_index_ctx_t* x = (splay_index_ctx_t*)raw;
-    if (x->deferred[start]) splay_persist_deferred(x, start);
-}
 static void splay_build_index_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
     splay_index_ctx_t* c = (splay_index_ctx_t*)raw;
-    splay_build_index_col(c->dir, c->tbl, start, &c->deferred[start]);
+    splay_build_index_col(c->dir, c->tbl, start, c->gens);
 }
 
 void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
+    splay_build_indexes_gens(dir, tbl, NULL);
+}
+
+static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens) {
 
     if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
     int64_t nc = ray_table_ncols(tbl);
     if (nc <= 0) return;
-    /* One task per column: the zone / dictionary / hash builds are per-row
+    /* One task per column: the zone / dictionary builds are per-row
      * scans of each column and used to run one after another on the
      * calling thread — the longest serial stretch of a CSV → splayed load. */
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, nc, 2)) {
-        /* Zones / dictionaries per column in parallel; the columns that
-         * qualify for a hash index come back deferred and are built one
-         * after another on this thread, each hash build parallel inside. */
-        ray_t** deferred = (ray_t**)ray_sys_alloc((size_t)nc * 2 * sizeof(ray_t*));
-        if (!deferred) {
-            for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, NULL);
-            return;
-        }
-        memset(deferred, 0, (size_t)nc * 2 * sizeof(ray_t*));
-        splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .deferred = deferred, .hashed = deferred + nc };
+        splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .gens = gens };
         ray_pool_dispatch_n(pool, splay_build_index_task, &ctx, (uint32_t)nc);
-        /* Hash builds one after another (each parallel inside), each into
-         * its file; where that cannot be done in place, built in memory and
-         * written with the zones of the other deferred columns. */
-        for (int64_t c = 0; c < nc; c++) {
-            if (!deferred[c]) continue;
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            char path[1100];
-            ray_err_t e = splay_col_path(dir, tbl, c, path, sizeof(path))
-                        ? ray_col_build_hash_index(path, col, NULL) : RAY_ERR_IO;
-            if (e == RAY_OK) {               /* the zone is sacrificed for the hash */
-                ray_release(deferred[c]);
-                deferred[c] = NULL;
-                continue;
-            }
-            if (e != RAY_ERR_NYI) continue;   /* the zone, then */
-            ray_t* hi = ray_idx_hash_fn(col);
-            if (hi && !RAY_IS_ERR(hi) && (hi->attrs & RAY_ATTR_HAS_INDEX)) ctx.hashed[c] = hi;
-            else if (hi) { if (RAY_IS_ERR(hi)) ray_error_free(hi); else ray_release(hi); }
-        }
-        ray_pool_dispatch_n(pool, splay_persist_task, &ctx, (uint32_t)nc);
-        ray_sys_free(deferred);
     } else {
-        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, NULL);
+        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, gens);
     }
 }
 
@@ -1402,7 +1642,7 @@ static ray_t* splay_read_dom_once(const char* dir, ray_sym_domain_t* dom,
         if (!fresh) return ray_error("corrupt", "cannot refresh splayed symfile");
         dom = fresh;
     }
-    ray_t* tbl = splay_load_dom_impl(resolved, dom, true);
+    ray_t* tbl = splay_load_dom_impl(resolved, dom, true, false);
     if (fresh) ray_sym_domain_release(fresh);
     return tbl;
 }
@@ -1419,54 +1659,4 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
         if (!why) return tbl;
         ray_error_free(tbl);
     }
-}
-
-ray_err_t ray_splay_hash_column(const char* path, ray_t* zone) {
-    if (!path) return RAY_ERR_DOMAIN;
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
-    int64_t t0 = trace ? ray_profile_now_ns() : 0;
-    ray_t* col = ray_col_mmap(path);
-    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return RAY_ERR_IO; }
-    int64_t t1 = trace ? ray_profile_now_ns() : 0;
-    ray_hash_trace_t ht;
-    memset(&ht, 0, sizeof(ht));
-    /* The build reads the column front to back, twice, and not again:
-     * larger read-ahead, and its pages are the first to go under pressure
-     * rather than the build's own. */
-    if (col->len > 0)   /* from the header: madvise wants the mapping's page */
-        ray_vm_advise_seq(col, 32 + (size_t)col->len * ray_sym_elem_size(col->type, col->attrs));
-    /* Built over the mapping, straight into the file: the arrays are
-     * written once, where they end up, and the column is not copied. */
-    ray_err_t err = ray_col_build_hash_index(path, col, trace ? &ht : NULL);
-    if (err == RAY_ERR_NYI) {
-        /* No in-place build here: attached in memory, then appended.  The
-         * mapping is the column's only reference, so the attach builds on it
-         * rather than on a copy. */
-        ray_t* r = ray_index_attach_hash(&col);
-        if (!RAY_IS_ERR(r) && (col->attrs & RAY_ATTR_HAS_INDEX)) {
-            const ray_index_t* hx = ray_index_payload(col->index);
-            ht.n_keys = hx->u.hash.n_keys;
-            ht.n_groups = hx->u.hash.n_groups;
-            ray_hash_mark_t tm = trace ? ray_hash_trace_mark() : (ray_hash_mark_t){0};
-            err = ray_col_append_index(path, hx, col->len, col->type);
-            /* the region is read from the built arrays and written to the file */
-            if (trace) ray_hash_trace_add(&ht, RAY_HXT_APPEND, tm, 2 * ray_index_inline_size(hx));
-        } else {
-            if (RAY_IS_ERR(r)) ray_error_free(r);
-            err = RAY_ERR_IO;
-        }
-    }
-    int64_t t2 = trace ? ray_profile_now_ns() : 0;
-    if (trace && err == RAY_OK) {
-        fprintf(stderr, "splayed hash: file=%s rows=%" PRId64 " keys=%" PRId64 " groups=%" PRId64
-                        " mmap=%.1fms build=%.1fms write=%.1fms\n",
-                path, col->len, ht.n_keys, ht.n_groups, (double)(t1 - t0) / 1e6,
-                (double)(t2 - t1 - ht.ns[RAY_HXT_APPEND]) / 1e6, (double)ht.ns[RAY_HXT_APPEND] / 1e6);
-        ray_hash_trace_print(stderr, "splayed hash io", &ht,
-                             col->len * (int64_t)ray_sym_elem_size(col->type, col->attrs));
-    }
-    if (err != RAY_OK && zone)
-        err = ray_col_append_index(path, ray_index_payload(zone), col->len, col->type);
-    ray_release(col);
-    return err;
 }

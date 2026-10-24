@@ -32,5 +32,9 @@ void           redirect_consumers(ray_graph_t* g, uint32_t old_id,
                                   ray_op_t* new_target,
                                   uint32_t skip_a, uint32_t skip_b);
 ray_op_ext_t*  find_ext(ray_graph_t* g, uint32_t node_id);
+/* Partition-key pruning bitmap for one comparison against a literal (see
+ * opt.c); false when the comparison cannot prune. */
+bool           ray_part_prune_mask(ray_t* key_values, uint16_t cmp_op,
+                                   bool swapped, ray_t* lit, uint64_t* mask);
 
 #endif /* RAY_OPT_H */

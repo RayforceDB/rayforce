@@ -83,7 +83,7 @@ Retaining batches increases memory use.
 ## `.parquet.splayed` { #parquet-splayed }
 
 Convert into a new native directory and return the row count. The optional
-argument is a type vector or `{types: [...] rows: n strict: true}`. For example,
+argument is a type vector or `{types: [...] rows: n strict: true compress: true}`. For example,
 a source containing an integer ID and text can be imported as:
 
 ```lisp
@@ -109,3 +109,27 @@ output, and publish it without replacing an existing destination. Failed staging
 data is retained; existing staging directories are rejected. Imports do not
 support resume or append. Format or conversion failures return `parquet`
 errors; argument, I/O, allocation, and cancellation errors also propagate.
+
+The options dict also takes `compress`: `true` writes generation-2
+(compressed) column files where the column is eligible, `false` (or no
+option, since the destination is always new) generation 0. A non-bool
+`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, because the import writes through the same splayed-table writer as `.db.splayed.set`.
+For example:
+
+```lisp
+(.parquet.splayed {compress: true} "events.parquet" "/tmp/events-native")
+(.parquet.parted {compress: true rows: 262144} "events.parquet" "/tmp/events-db" 'events)
+```
+
+`.parquet.splayed` also takes `symfile`: `'shared` (the default) writes one
+`.sym` for every `SYM` column; `'column` gives each `SYM` column a symbol file
+of its own, `.<column>.sym` next to the column file, so a scan of one column
+(`like`, a grouping that resolves its strings) reads that column's strings
+only. A string that several columns hold is then stored once per column.
+`.db.splayed.get` finds the per-column files by themselves. Any other value is
+a `domain` error, and `.parquet.parted` refuses `'column`: every partition of a
+parted table resolves over the one root `.sym`.
+
+```lisp
+(.parquet.splayed {types: [I64 SYM SYM] symfile: 'column} "hits.parquet" "/tmp/hits")
+```

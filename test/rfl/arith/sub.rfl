@@ -143,9 +143,9 @@
 ;; TIMESTAMP - TIME → TIMESTAMP
 (type (- (as 'TIMESTAMP 5000) (as 'TIME 0))) -- 'timestamp
 
-;; TIMESTAMP - TIMESTAMP → i64 nanos
-(- (as 'TIMESTAMP 5000) (as 'TIMESTAMP 2000)) -- 3000
-(type (- (as 'TIMESTAMP 5000) (as 'TIMESTAMP 2000))) -- 'i64
+;; TIMESTAMP - TIMESTAMP → TIMESPAN
+(- (as 'TIMESTAMP 5000) (as 'TIMESTAMP 2000)) -- 0D00:00:00.000003000
+(type (- (as 'TIMESTAMP 5000) (as 'TIMESTAMP 2000))) -- 'timespan
 
 ;; TIMESTAMP - DATE → type error
 (- (as 'TIMESTAMP 1000) (as 'DATE 7305)) !- type

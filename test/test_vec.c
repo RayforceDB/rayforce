@@ -25,6 +25,8 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "vec/vec.h"
+#include "vec/growth.h"
+#include "ops/idxop.h"
 #include "vec/str.h"
 #include "vec/embedding.h"
 #include "table/sym.h"
@@ -2406,7 +2408,314 @@ static test_result_t test_vec_slice_guards(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+/* A bulk append must not round payload and then let the heap round the
+ * header-inclusive allocation a second time. Compare allocation capacity,
+ * not a process-wide high-water mark or whole-query incidental objects. */
+static test_result_t test_vec_growth_raw_block_sizing(void) {
+    const int64_t n = 333004;
+    ray_t* source = ray_vec_new(RAY_I64, n);
+    ray_t* dst = ray_vec_new(RAY_I64, 0);
+    ray_t* fresh = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(source);
+    TEST_ASSERT_NOT_NULL(dst);
+    TEST_ASSERT_NOT_NULL(fresh);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(source));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(dst));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fresh));
+    source->len = n;
+    int64_t* values = (int64_t*)ray_data(source);
+    for (int64_t i = 0; i < n; i++) values[i] = i - 12345;
+    dst = ray_vec_append_raw(dst, values, n);
+    TEST_ASSERT_NOT_NULL(dst);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(dst));
+    const size_t grown_bytes = ray_block_data_bytes(dst);
+    const size_t fresh_bytes = ray_block_data_bytes(fresh);
+    const bool values_ok = dst->len == n &&
+        memcmp(ray_data(dst), values, (size_t)n * sizeof(int64_t)) == 0;
+    const bool buddy = !ray_is_direct(dst) && !ray_is_direct(fresh);
+    ray_release(source);
+    ray_release(dst);
+    ray_release(fresh);
+    TEST_ASSERT_TRUE(values_ok);
+    TEST_ASSERT_TRUE(buddy);
+    TEST_ASSERT_FMT(grown_bytes == fresh_bytes,
+                    "grown payload capacity %zu, fresh %zu", grown_bytes, fresh_bytes);
+    PASS();
+}
+
+/* Pure arithmetic checks never try to allocate the extreme sizes. */
+static test_result_t test_vec_growth_arithmetic(void) {
+    const size_t widths[] = { 1, 2, 4, 8, 16 };
+    const size_t limit = ray_cell_growth_limit();
+    size_t bytes = 123;
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+        size_t w = widths[i];
+        TEST_ASSERT_TRUE(ray_cell_growth_bytes(17, 23, w, &bytes));
+        TEST_ASSERT_EQ_I(bytes, 40 * w);
+        TEST_ASSERT_TRUE(ray_cell_growth_bytes(0, 0, w, &bytes));
+        TEST_ASSERT_EQ_I(bytes, 0);
+        TEST_ASSERT_FALSE(ray_cell_growth_bytes(-1, 1, w, &bytes));
+        TEST_ASSERT_FALSE(ray_cell_growth_bytes(1, -1, w, &bytes));
+        TEST_ASSERT_FALSE(ray_cell_growth_bytes(INT64_MAX, 1, w, &bytes));
+        TEST_ASSERT_FALSE(ray_cell_growth_bytes((int64_t)(limit / w), 1, w, &bytes));
+        for (unsigned k = 6; k <= 24; k++) {
+            size_t payload = ((size_t)1 << k) - 32;
+            size_t n = payload / w;
+            TEST_ASSERT_TRUE(ray_cell_growth_bytes((int64_t)n, 0, w, &bytes));
+            size_t request = 0;
+            TEST_ASSERT_TRUE(ray_cell_growth_request(0, bytes, &request));
+            TEST_ASSERT_EQ_I(request, bytes);
+            TEST_ASSERT_EQ_I(ray_order_for_size(request), k);
+        }
+    }
+    TEST_ASSERT_FALSE(ray_cell_growth_bytes(0, 1, 0, &bytes));
+    TEST_ASSERT_FALSE(ray_cell_growth_bytes(INT64_MAX, 0, 16, &bytes));
+    TEST_ASSERT_FALSE(ray_cell_growth_request(0, limit + 1, &bytes));
+    TEST_ASSERT_FALSE(ray_cell_growth_request(limit + 1, 1, &bytes));
+    size_t large = limit / 2 + 1;
+    TEST_ASSERT_TRUE(ray_cell_growth_request(large, large + 1, &bytes));
+    TEST_ASSERT_EQ_I(bytes, limit);
+#if SIZE_MAX > UINT32_MAX
+    large = (size_t)(UINT64_C(1) << 40); /* above the largest buddy order */
+    TEST_ASSERT_TRUE(ray_cell_growth_request(large, large + 8, &bytes));
+    TEST_ASSERT_EQ_I(bytes, large * 2);
+#endif
+    PASS();
+}
+
+/* Model every reserve boundary for a one-cell append sequence. The model
+ * uses the allocator's documented size rules, not an elapsed-time threshold.
+ * Removing direct doubling takes thousands of page-sized steps, not <=64. */
+static test_result_t test_vec_growth_geometry(void) {
+    const size_t target = (size_t)40 * 1024 * 1024;
+    size_t room = 0, copied = 0;
+    unsigned reserves = 0;
+    while (room < target) {
+        size_t required = room + sizeof(int64_t), request = 0;
+        TEST_ASSERT_TRUE(ray_cell_growth_request(room, required, &request));
+        copied += room;
+        uint8_t order = ray_order_for_size(request);
+        size_t next = order < RAY_HEAP_POOL_ORDER
+            ? ((size_t)1 << order) - 32
+            : ((request + RAY_DIRECT_HDR + 32 + 4095) & ~(size_t)4095) - RAY_DIRECT_HDR - 32;
+        TEST_ASSERT_TRUE(next >= required);
+        room = next;
+        reserves++;
+        TEST_ASSERT_TRUE(reserves <= 64);
+    }
+    TEST_ASSERT_TRUE(copied < 2 * room);
+    PASS();
+}
+
+static test_result_t test_vec_growth_direct_reserve(void) {
+    /* This size goes directly to a page-rounded mapping, not a buddy pool. */
+    const int64_t n = ((int64_t)1 << 21) + 1024;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    const size_t old_room = ray_block_data_bytes(v);
+    const int64_t old_len = (int64_t)(old_room / sizeof(int64_t));
+    v->len = old_len;
+    int64_t* data = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < old_len; i++) data[i] = i ^ 0x55;
+    int64_t first = -777;
+    v = ray_vec_append_raw(v, &first, 1);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    const size_t new_room = ray_block_data_bytes(v);
+    ray_t* after_reserve = v;
+    bool stable = true;
+    for (int64_t i = 0; i < 1024; i++) {
+        v = ray_vec_append_raw(v, &i, 1);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        if (v != after_reserve) stable = false;
+    }
+    bool values_ok = v->len == old_len + 1025;
+    data = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < old_len; i++)
+        if (data[i] != (i ^ 0x55)) values_ok = false;
+    if (data[old_len] != first) values_ok = false;
+    for (int64_t i = 0; i < 1024; i++)
+        if (data[old_len + 1 + i] != i) values_ok = false;
+    ray_release(v);
+    TEST_ASSERT_TRUE(new_room >= 2 * old_room);
+    TEST_ASSERT_TRUE(stable);
+    TEST_ASSERT_TRUE(values_ok);
+    PASS();
+}
+
+/* Raw storage uses physical element widths, including all four SYM
+ * encodings. The raw API does not translate domains or infer null hints. */
+static test_result_t test_vec_growth_raw_widths(void) {
+    const int8_t types[] = { RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64, RAY_GUID };
+    const uint8_t sym_widths[] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64 };
+    for (size_t k = 0; k < sizeof(types) / sizeof(types[0]) + sizeof(sym_widths); k++) {
+        bool sym = k >= sizeof(types) / sizeof(types[0]);
+        uint8_t sw = sym ? sym_widths[k - sizeof(types) / sizeof(types[0])] : 0;
+        ray_t* v = sym ? ray_sym_vec_new(sw, 0) : ray_vec_new(types[k], 0);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        const int64_t n = 97;
+        size_t width = ray_sym_elem_size(v->type, v->attrs);
+        _Alignas(16) uint8_t raw[97 * 16];
+        memset(raw, 0, sizeof raw);
+        if (sym) {
+            for (int64_t i = 0; i < n; i++)
+                ray_write_sym(raw, i, (uint64_t)(i % 13), RAY_SYM, v->attrs);
+        } else {
+            for (size_t i = 0; i < (size_t)n * width; i++) raw[i] = (uint8_t)(i * 17 + 1);
+        }
+        uint8_t attrs = v->attrs;
+        v = ray_vec_append_raw(v, raw, n);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        bool ok = v->len == n && (v->attrs & RAY_SYM_W_MASK) == (attrs & RAY_SYM_W_MASK) &&
+            memcmp(ray_data(v), raw, (size_t)n * width) == 0;
+        ray_release(v);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+/* Failed size checks/zero batches precede COW and index mutation. A real
+ * growth detaches only the mutated copy's stale index; the retained old
+ * snapshot stays usable. Raw callers still propagate nullable hints. */
+static test_result_t test_vec_growth_indexed_snapshot(void) {
+    const int64_t original[] = { 7, 3, 7, 9, 3, 1 };
+    int64_t more[97];
+    for (int64_t i = 0; i < 97; i++) more[i] = i == 48 ? NULL_I64 : i + 100;
+    for (int order = 0; order < 2; order++) {
+        ray_t* v = ray_vec_from_raw(RAY_I64, original, 6);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&v)));
+        ray_t* old = v;
+        ray_t* index = v->index;
+        ray_retain(old);
+        TEST_ASSERT_EQ_I(ray_atomic_load(&old->rc), 2);
+        TEST_ASSERT(ray_vec_append_raw(v, NULL, 0) == v, "zero append must be an ownership no-op");
+        ray_t* error = ray_vec_append_raw(v, more, INT64_MAX);
+        bool rejected = error && RAY_IS_ERR(error);
+        if (rejected) ray_error_free(error);
+        TEST_ASSERT_TRUE(rejected);
+        TEST_ASSERT_EQ_I(ray_atomic_load(&old->rc), 2);
+        TEST_ASSERT_TRUE(ray_index_has(old));
+        TEST_ASSERT(old->index == index, "failed reserve replaced index");
+        v = ray_vec_append_raw(v, more, 97);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        v->attrs |= RAY_ATTR_HAS_NULLS; /* caller propagation, not raw append */
+        bool ok = v != old && v->len == 103 && old->len == 6 &&
+            !ray_index_has(v) && ray_index_has(old) && old->index == index &&
+            memcmp(ray_data(old), original, sizeof original) == 0 &&
+            memcmp(ray_data(v), original, sizeof original) == 0 &&
+            memcmp((int64_t*)ray_data(v) + 6, more, sizeof more) == 0 &&
+            ray_vec_is_null(v, 54);
+        if (order) { ray_release(old); ray_release(v); }
+        else       { ray_release(v); ray_release(old); }
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_growth_list_refs(void) {
+    for (int order = 0; order < 2; order++) {
+        ray_t* item = ray_i64(42);
+        ray_t* v = ray_list_new(4);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        for (int i = 0; i < 4; i++) v = ray_list_append(v, item);
+        ray_t* old = v;
+        ray_retain(old);
+        v = ray_list_insert_at(v, 1, item); /* COW and a full four-cell block */
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        for (int i = 0; i < 128; i++) {
+            v = ray_list_append(v, item);
+            TEST_ASSERT_NOT_NULL(v);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        }
+        bool ok = old != v && old->len == 4 && v->len == 133 &&
+            ray_atomic_load(&item->rc) == 138;
+        for (int64_t i = 0; i < old->len; i++)
+            if (((ray_t**)ray_data(old))[i] != item) ok = false;
+        for (int64_t i = 0; i < v->len; i++)
+            if (((ray_t**)ray_data(v))[i] != item) ok = false;
+        if (order) {
+            ray_release(old);
+            if (ray_atomic_load(&item->rc) != 134) ok = false;
+            ray_release(v);
+        } else {
+            ray_release(v);
+            if (ray_atomic_load(&item->rc) != 5) ok = false;
+            ray_release(old);
+        }
+        if (ray_atomic_load(&item->rc) != 1) ok = false;
+        ray_release(item);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+static bool growth_string_is(ray_t* v, int64_t i, const char* wanted) {
+    size_t len = 0, n = strlen(wanted);
+    const char* p = ray_str_vec_get(v, i, &len);
+    return len == n && (n == 0 || (p && memcmp(p, wanted, n) == 0));
+}
+
+static test_result_t test_vec_growth_str_refs(void) {
+    const char* a = "a-long-string-for-a-shared-pool";
+    const char* b = "another-long-string-for-the-pool";
+    for (int order = 0; order < 2; order++) {
+        ray_t* v = ray_vec_new(RAY_STR, 2);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        v = ray_str_vec_append(v, a, strlen(a));
+        v = ray_str_vec_append(v, b, strlen(b));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        ray_t* old = v;
+        ray_t* old_pool = v->str_pool;
+        ray_retain(old);
+        for (int i = 0; i < 33; i++) {
+            const char* text = i % 3 == 0 ? "" : i % 3 == 1 ? "tiny" : a;
+            v = ray_str_vec_append(v, text, strlen(text));
+            TEST_ASSERT_NOT_NULL(v);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        }
+        bool ok = old != v && old->len == 2 && v->len == 35 &&
+            old_pool != v->str_pool && ray_atomic_load(&old_pool->rc) == 1 &&
+            ray_atomic_load(&v->str_pool->rc) == 1 &&
+            growth_string_is(old, 0, a) && growth_string_is(old, 1, b) &&
+            growth_string_is(v, 0, a) && growth_string_is(v, 1, b) &&
+            !ray_vec_has_nulls(old) && ray_vec_has_nulls(v);
+        for (int i = 0; i < 33; i++) {
+            const char* text = i % 3 == 0 ? "" : i % 3 == 1 ? "tiny" : a;
+            if (!growth_string_is(v, i + 2, text)) ok = false;
+        }
+        if (order) {
+            ray_release(old);
+            if (!growth_string_is(v, 0, a)) ok = false;
+            ray_release(v);
+        } else {
+            ray_release(v);
+            if (!growth_string_is(old, 1, b)) ok = false;
+            ray_release(old);
+        }
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
 const test_entry_t vec_entries[] = {
+    { "vec/growth_list_refs", test_vec_growth_list_refs, vec_setup, vec_teardown },
+    { "vec/growth_str_refs", test_vec_growth_str_refs, vec_setup, vec_teardown },
+    { "vec/growth_raw_widths", test_vec_growth_raw_widths, vec_setup, vec_teardown },
+    { "vec/growth_indexed_snapshot", test_vec_growth_indexed_snapshot, vec_setup, vec_teardown },
+    { "vec/growth_arithmetic", test_vec_growth_arithmetic, vec_setup, vec_teardown },
+    { "vec/growth_geometry", test_vec_growth_geometry, vec_setup, vec_teardown },
+    { "vec/growth_direct_reserve", test_vec_growth_direct_reserve, vec_setup, vec_teardown },
+    { "vec/growth_raw_block_sizing", test_vec_growth_raw_block_sizing, vec_setup, vec_teardown },
     { "vec/new", test_vec_new, vec_setup, vec_teardown },
     { "vec/new_invalid", test_vec_new_invalid, vec_setup, vec_teardown },
     { "vec/append", test_vec_append, vec_setup, vec_teardown },

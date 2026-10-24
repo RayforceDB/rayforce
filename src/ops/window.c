@@ -35,7 +35,7 @@ static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
         ray_t* col = vecs[k];
         if (!col) continue;
         switch (col->type) {
-        case RAY_I64: case RAY_TIMESTAMP:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
             if (((const int64_t*)ray_data(col))[ra] !=
                 ((const int64_t*)ray_data(col))[rb]) return true;
             break;
@@ -96,7 +96,7 @@ static inline double win_read_f64(ray_t* col, int64_t row) {
     switch (col->type) {
     case RAY_F64: return ((const double*)ray_data(col))[row];
     case RAY_F32: return (double)((const float*)ray_data(col))[row];
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         return (double)((const int64_t*)ray_data(col))[row];
     case RAY_I32: case RAY_DATE: case RAY_TIME:
         return (double)((const int32_t*)ray_data(col))[row];
@@ -110,7 +110,7 @@ static inline double win_read_f64(ray_t* col, int64_t row) {
 
 static inline int64_t win_read_i64(ray_t* col, int64_t row) {
     switch (col->type) {
-    case RAY_I64: case RAY_TIMESTAMP:
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         return ((const int64_t*)ray_data(col))[row];
     case RAY_I32: case RAY_DATE: case RAY_TIME:
         return (int64_t)((const int32_t*)ray_data(col))[row];
@@ -128,13 +128,14 @@ static inline int64_t win_read_i64(ray_t* col, int64_t row) {
 #define win_set_null       par_set_null
 #define win_finalize_nulls par_finalize_nulls
 
-/* Resolve a graph op node to a column vector from tbl */
+/* Resolve a graph op node to a column vector from tbl.  A scan key that
+ * fails to materialize comes back as an owned error (never `owned`). */
 static ray_t* win_resolve_vec(ray_graph_t* g, ray_op_t* key_op, ray_t* tbl,
                               uint8_t* owned) {
     ray_op_ext_t* key_ext = find_ext(g, key_op->id);
     if (key_ext && key_ext->base.opcode == OP_SCAN) {
         *owned = 0;
-        return ray_table_get_col(tbl, key_ext->sym);
+        return ray_table_col(tbl, key_ext->sym);
     }
     *owned = 1;
     ray_t* saved = g->table;
@@ -657,8 +658,8 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
 static int64_t window_parted_seg_count(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && RAY_IS_PARTED(col->type)) return col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) return m.n_segs;
     }
     return 0;  /* not parted (a table of only MAPCOMMON keys can't occur) */
 }
@@ -724,8 +725,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             for (uint32_t k = 0; k < ext->window.n_part_keys && !eligible; k++) {
                 ray_op_ext_t* key_ext = find_ext(g, ext->window.part_keys[k]);
                 if (key_ext && key_ext->base.opcode == OP_SCAN) {
-                    ray_t* col = ray_table_get_col(tbl, key_ext->sym);
-                    if (col && col->type == RAY_MAPCOMMON) eligible = true;
+                    ray_col_meta_t m;
+                    if (ray_table_col_meta(tbl, key_ext->sym, &m) && m.type == RAY_MAPCOMMON)
+                        eligible = true;
                 }
             }
             if (eligible) {
@@ -772,8 +774,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     {
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+            ray_col_meta_t m;
+            if (ray_table_col_meta_idx(tbl, c, &m) &&
+                (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)) {
                 int64_t nseg = window_parted_seg_count(tbl);
                 ray_t* flat = NULL;
                 for (int64_t s = 0; s < nseg; s++) {
@@ -1052,6 +1055,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 uint16_t total_bits = 0;
                 bool fits = true;
 
+                /* A null-bearing F64 key packs its nulls into a reserved
+                 * slot below its minimum (radix_key_bounds_finish), so it
+                 * stays on the composite with the placement the single-key
+                 * encode and the merge comparator give, at every row count. */
                 ray_pool_t* mk_prescan_pool2 = (nrows >= SMALL_POOL_THRESHOLD) ? pool2 : NULL;
                 if (n_sort <= MK_PRESCAN_MAX_KEYS && mk_prescan_pool2) {
                     uint32_t nw = ray_pool_total_workers(mk_prescan_pool2);
@@ -1083,11 +1090,14 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                             if (wmin < kmin) kmin = wmin;
                             if (wmax > kmax) kmax = wmax;
                         }
+                        radix_key_bounds_finish(sort_vecs[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits += bits;
                     }
@@ -1107,11 +1117,19 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                 if (v < kmin) kmin = v;
                                 if (v > kmax) kmax = v;
                             }
-                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
+                        } else if (col->type == RAY_I64 || col->type == RAY_TIMESPAN || col->type == RAY_TIMESTAMP) {
                             const int64_t* d = (const int64_t*)ray_data(col);
                             for (int64_t i = 0; i < nrows; i++) {
                                 if (d[i] < kmin) kmin = d[i];
                                 if (d[i] > kmax) kmax = d[i];
+                            }
+                        } else if (col->type == RAY_F64) {
+                            const double* d = (const double*)ray_data(col);
+                            for (int64_t i = 0; i < nrows; i++) {
+                                if (radix_f64_is_null(d[i])) continue;
+                                int64_t v = radix_f64_ord(d[i]);
+                                if (v < kmin) kmin = v;
+                                if (v > kmax) kmax = v;
                             }
                         } else if (col->type == RAY_I32 || col->type == RAY_DATE || col->type == RAY_TIME) {
                             const int32_t* d = (const int32_t*)ray_data(col);
@@ -1132,11 +1150,14 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                 if (d[i] > kmax) kmax = (int64_t)d[i];
                             }
                         }
+                        radix_key_bounds_finish(sort_vecs[k], &kmin, &kmax);
                         mins[k] = kmin;
                         maxs[k] = kmax;
-                        uint64_t range = (uint64_t)(kmax - kmin);
+                        /* Unsigned subtraction: kmin can be the i64 null
+                         * sentinel, and kmax - kmin then overflows i64. */
+                        uint64_t range = (uint64_t)kmax - (uint64_t)kmin;
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         total_bits += bits;
                     }
@@ -1154,9 +1175,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     uint8_t accum = 0;
                     for (int k = n_sort - 1; k >= 0; k--) {
                         bit_shifts[k] = accum;
-                        uint64_t range = (uint64_t)(maxs[k] - mins[k]);
+                        uint64_t range = (uint64_t)maxs[k] - (uint64_t)mins[k];
                         uint8_t bits = 1;
-                        while (((uint64_t)1 << bits) <= range && bits < 64)
+                        while (bits < 64 && ((uint64_t)1 << bits) <= range)
                             bits++;
                         accum += bits;
                     }
@@ -1174,7 +1195,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         };
                         for (uint32_t k = 0; k < n_sort; k++) {
                             enc.mins[k] = mins[k];
-                            enc.ranges[k] = maxs[k] - mins[k];
+                            enc.ranges[k] = (int64_t)((uint64_t)maxs[k] - (uint64_t)mins[k]);
                             enc.bit_shifts[k] = bit_shifts[k];
                             enc.descs[k] = sort_descs[k];
                             enc.enum_ranks[k] = enum_ranks[k];
@@ -1375,11 +1396,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             goto oom;
         }
         result_vecs[f]->len = nrows;
-        /* Pre-stamp every slot with the width-correct null sentinel.  The
-         * per-partition compute loops below write valid values into
-         * "active" slots and call win_set_null on null-producing slots
-         * without re-writing the payload — pre-stamping ensures every
-         * null slot already holds the correct sentinel. */
+        /* Pre-stamp every slot with the width-correct null sentinel. The
+         * per-partition loops overwrite active slots and also store the
+         * sentinel through win_set_null on null-producing slots. Headers
+         * stay unchanged until win_finalize_nulls after the dispatch. */
         if (is_f64[f]) {
             double* d = (double*)ray_data(result_vecs[f]);
             for (int64_t i = 0; i < nrows; i++) d[i] = NULL_F64;
@@ -1437,7 +1457,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     /* Pass-through original columns */
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
+        ray_t* col = ray_table_slot_idx(tbl, c);
         if (!col) continue;
         int64_t name_id = ray_table_col_name(tbl, c);
         ray_retain(col);

@@ -153,9 +153,9 @@ Boolean logic operators. Work on scalars and vectors alike.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `and` | binary | — | Logical AND | `(and true false)` → `false` |
-| `or` | binary | — | Logical OR | `(or true false)` → `true` |
-| `not` | unary | — | Logical NOT | `(not true)` → `false` |
+| `and` | binary | — | Logical AND; element-wise on vectors and lists (lengths must match) | `(and true false)` → `false` |
+| `or` | binary | — | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `not` | unary | — | Logical NOT; element-wise on vectors and lists | `(not true)` → `false` |
 
 ```lisp
 ; Combine filters with logic ops
@@ -175,8 +175,8 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
-| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values | `(max [3 9 1] 5)` → `[5 9 5]` |
+| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values, in their promoted type (null lowest) | `(min [3 9 1] [2 10 4])` → `[2 9 1]`, `(min 1 2.5)` → `1.0` |
+| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values, in their promoted type (null lowest) | `(max [3 9 1] 5)` → `[5 9 5]`, `(max [2 0] true)` → `[2 1]` |
 | `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
 | `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
 | `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
@@ -218,7 +218,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `map` | variadic | — | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
-| `pmap` | variadic | — | Parallel map (multi-threaded, returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
+| `pmap` | variadic | — | Currently a sequential alias for `map` (returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
@@ -236,7 +236,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 ; Transform each row with map
 (map (fn [x] (* x x)) [1 2 3 4])  ; (1 4 9 16)
 
-; Parallel map for expensive computation
+; pmap currently uses the same sequential callback loop as map
 (pmap (fn [t] (sum (til t))) [100 200 300])
 
 ; Running sum with scan
@@ -259,15 +259,15 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | — | Take first N elements (negative N takes from end) | `(take [10 20 30] 2)` → `[10 20]` |
+| `take` | binary | — | Take first N elements (negative N takes from end); past the length it cycles. A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] -5)` → `[2 3 1 2 3]` |
 | `drop` | binary | — | Drop first N elements (negative N drops from end) | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | — | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | — | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | — | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
 | `fill` | binary | atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
-| `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |
+| `reverse` | unary | — | Reverse element order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | lazy/DAG | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | lazy/DAG | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
@@ -363,16 +363,16 @@ Special forms receive their arguments unevaluated. These are the core language p
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
 | `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
-| `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
-| `times` | variadic | special | Run body exactly n times (count evaluated once); returns null | `(times 5 (set n (+ n 1)))` |
+| `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass; returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
 | `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
-| `alter` | variadic | special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
+| `alter` | variadic | special | Amend a global binding in place and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The target must be a global binding; a name bound by `let` or a parameter of the enclosing function raises `domain` | `(alter 'v set 0 99)` |
 | `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
 
 ```lisp
@@ -542,7 +542,7 @@ String functions are available as direct builtins. The transform functions are l
 | `split` | binary | — | Split string by delimiter into a list of strings | `(split "a,b,c" ",")` → `("a" "b" "c")` |
 | `str-find` | binary | parallel vector | First byte index of a substring; `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | — | Join string/symbol atoms, vectors, or lists with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
-| `strlen` | unary | — | Length of each string | `(strlen "hello")` → `5` |
+| `strlen` | unary | — | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |
 | `upper` | unary | lazy/DAG | Uppercase string or symbol atoms/vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
 | `lower` | unary | lazy/DAG | Lowercase string or symbol atoms/vectors | `(lower 'AbC)` → `'abc` |
 | `trim` | unary | lazy/DAG | Strip leading/trailing whitespace | `(trim "  abc  ")` → `"abc"` |
@@ -661,11 +661,11 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
 | `.sys.build` | nullary | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
-| `.sys.mem` | variadic | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
-| `.sys.prof` | variadic | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
+| `.sys.mem` | nullary | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
+| `.sys.prof` | nullary | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
 | `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`) | `(.sys.querylog)` |
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
-| `.sys.info` | variadic | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
+| `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
 
 ```lisp
 ; Metaprogramming: parse and eval
@@ -678,8 +678,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 (println (format "%ms" (- (.time.now) t0)))
 
 ; System diagnostics
-(.sys.info 0)                  ; OS, CPU cores, memory budget
-(.sys.mem 0)                  ; heap usage statistics
+(.sys.info)                    ; OS, CPU cores, memory budget
+(.sys.mem)                    ; heap usage statistics
 ```
 
 ## Serialization
@@ -707,7 +707,7 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | — | Load splayed table from a directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |

@@ -24,6 +24,32 @@ Suited to "does this value exist in the column" / "which row(s) hold this value"
 
 **Wired today:** filter EQ (integer-family, null-free columns), filter IN, find.  Float equality and null-bearing columns fall back to the scan.
 
+### Hash indexes built after repeated lookups
+
+Converted tables persist chunk zones and string dictionaries, not hash
+indexes. When an equality filter, or an `in` filter with a small set of
+integers, meets an 8-byte integer or timestamp column whose chunk zone cannot
+prune (values spread over the whole range in every chunk), the filter scans.
+Narrower columns are never indexed this way: their index would cost more than
+five times their data. A key outside the column's whole value range is
+answered by the zone alone, without a scan.
+
+Once the same column has been scanned this way often enough to pay for an
+index (about 320 lookups, since one build costs roughly as much as that many
+scans), the engine builds a hash index for it in memory and reuses it for
+later filters in the same process. Compressed columns are covered too: the
+index is built from the decoded column. It is never written to disk and never
+changes the table's column (`.idx.info` still reports its zone). Scans,
+aggregates and range filters never count towards a build.
+
+The memory it holds is bounded by a quarter of the RAM the process may use
+(physical memory, or the container's memory limit when that is smaller). The
+least recently used index is dropped first; an index whose table is gone (a
+reload, a dropped variable) is dropped on the next lookup; a column too large
+for the bound is remembered and scanned without retrying. Build one
+explicitly with `.idx.hash` to have it from the first lookup and to persist
+it with the table.
+
 ### Range queries / sorted access — `.idx.sort`
 
 Suited to "values between A and B", ordered-output queries, and distinct. Build cost O(n log n); space O(n) for the row-id permutation. The original column stays in original order — the sort lives in the permutation, not the values.
@@ -121,7 +147,7 @@ Five things that bite first-time users.
 - **Mutation drops the index.** The quoted-symbol forms `(insert 'v val)` and `(alter 'v set i val)` / `(alter 'v concat vals)` mutate `v` in place and invalidate the attached structure. The mutator paths handle the drop transparently — there's no error, just a silently un-indexed column afterward. Rebuild explicitly after the write. The non-quoted form `(insert v val)` returns a fresh value and leaves the original (still indexed) untouched.
 - **Slices can't carry an index.** Internally, slicing a column produces a fresh slice header without `RAY_ATTR_HAS_INDEX`; `(.idx.*)` attach refuses to operate on a slice ("cannot index a slice; materialize first"). The Rayfall surface for slices today is C-API-only — this is mostly relevant when calling Rayforce from your own C code.
 - **One slot per column, one kind at a time.** Calling `.idx.hash` on a column that already has `.idx.zone` drops the zone first. Multiple coexisting kinds per column is a v2 feature.
-- **No persistence for `.idx.*`.** The on-disk column format never carries an index; `ray_col_save` serializes a clean column. Rebuild after a load. HNSW handles can be persisted explicitly with `hnsw-save` / `hnsw-load`.
+- **Persistence is explicit.** A splayed save (`.db.splayed.set`) persists the hash, sort and bloom indexes you built with `.idx.hash`, `.idx.sort` and `.idx.bloom`, and writes each numeric column's chunk zone and each string column's dictionary. A generation-2 (compressed) save persists the same indexes, so nothing needs rebuilding after a load. The CSV and Parquet converters add no hash index of their own. HNSW handles can be persisted explicitly with `hnsw-save` / `hnsw-load`.
 - **Type support.** `.idx.hash` accepts numeric/boolean columns **and `RAY_SYM`** (it indexes the symbol domain ids). `.idx.zone`, `.idx.sort`, and `.idx.bloom` are numeric/boolean only. `RAY_STR` is deferred for all kinds, and `RAY_SYM` is deferred for the non-hash kinds — an unsupported column is rejected with `error: nyi: <kind>: only numeric/sym vectors supported (got type N)`, because the string/sym pool pointers collide with the index aux bytes and the displacement sweep is pending.
 
 ## 8. Performance characteristics { #perf }

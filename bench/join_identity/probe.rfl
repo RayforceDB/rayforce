@@ -1,0 +1,15 @@
+;; One measured join per process; input construction is outside timeit.
+(set n 1000000)
+(set ids (til n))
+(set left (table [k a b c d e f g]
+                 (list ids (+ ids 1) (+ ids 2) (+ ids 3)
+                       (+ ids 4) (+ ids 5) (+ ids 6) (+ ids 7))))
+(set right (table [k mark] (list [0 500000 999999] [10 20 30])))
+(set elapsed_ms (timeit (set joined (left-join [k] left right))))
+(set valid (and (== (count joined) n)
+                (all (== (at joined 'k) ids))
+                (all (== (at joined 'g) (+ ids 7)))
+                (== (sum (at joined 'mark)) 60)
+                (== (sum (map nil? (at joined 'mark))) (- n 3))))
+(if (not valid) (raise "identity-join: incorrect result"))
+(println (format "BENCH|%|%|%" elapsed_ms (as 'I64 valid) (count joined)))

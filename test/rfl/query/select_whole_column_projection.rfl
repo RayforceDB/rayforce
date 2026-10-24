@@ -1,4 +1,4 @@
-;; Whole-column verbs (distinct / asc / desc / reverse) as SELECT projections.
+;; Whole-column verbs (distinct / asc / desc / reverse / where) as SELECT projections.
 ;;
 ;; These builtins consume an entire column and return a vector; the DAG has no
 ;; bucket for them, so the projection lands in the eval fallback.  Previously the
@@ -33,6 +33,20 @@
 ;; ── SYM column distinct (first-occurrence order) ────────────────────────────
 (at (select {d: (distinct d) from: (table [d] (list ['zebra 'apple 'mango 'apple]))}) 'd) -- ['zebra 'apple 'mango]
 
+;; ── where: the indices of the true rows, over the whole column ──────────────
+;;   Scattered per row it was handed one b8 cell, and failed with "where:
+;;   argument must be a b8 vector, got b8".  A null compares false, as the
+;;   where: clause drops it.
+(set TW (table [i j] (list [1 0Nl 3 4] [5 6 7 8])))
+(at (select {w: (where (> i 2)) from: TW}) 'w) -- (where (> [1 0Nl 3 4] 2))
+(at (select {w: (where (> i 2)) from: TW}) 'w) -- [2 3]
+(at (select {c: (count (where (> i 2))) from: TW}) 'c) -- [2]
+(first (at (select {c: (count (where (> i 2))) from: TW}) 'c)) -- (count (select {from: TW where: (> i 2)}))
+(at (select {c: (count (where (> i 2))) from: TW where: (> j 5)}) 'c) -- [2]
+(at (select {c: (first (where (> i 2))) from: TW}) 'c) -- [2]
+(select {w: (where (> i 2)) j: j from: TW}) !- length
+(where true) !- type
+
 ;; ── ragged result rejected: a length-changing column beside a full column ────
 (select {a: (distinct v) b: v from: T}) !- length
 
@@ -60,3 +74,241 @@
 (at (select {y: x k: (if true 7 0) from: TPB}) 'k) -- (take 7 7)
 (count (select {k: (+ (sum x) 0) from: TPB})) -- 1
 (.sys.exec "rm -rf /tmp/rfl_scalar_bcast_parted") -- 0
+
+;; A scalar aggregate over a whole-column verb, `(first (asc k))`, has no DAG
+;; node and lands in the scalar-aggregate eval fallback, which binds every
+;; column whole.  Over a parted table it bound the parted column itself, and
+;; `asc` rejected it ("asc expects a vector", #732).  Parted == flat for
+;; first/last over asc/desc, with or without where:, across column types.
+(.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted")
+(set W1 (table [s k f t d n] (list ['b 'a 'c] [3 1 2] [1.5 0.5 2.5] (list "bb" "aa" "cc") [2024.03.02 2024.03.01 2024.03.05] [7 0Nl 5])))
+(set W2 (table [s k f t d n] (list ['a ' 'd] [5 4 6] [-1.0 4.0 0Nf] (list "ab" "" "zz") [2024.02.01 2024.04.01 2024.01.09] [0Nl 2 9])))
+(.db.splayed.set "/tmp/rfl_scalar_asc_parted/2024.01.01/t/" W1)
+(.db.splayed.set "/tmp/rfl_scalar_asc_parted/2024.01.02/t/" W2)
+(set TPW (.db.parted.get "/tmp/rfl_scalar_asc_parted/" 't))
+(set TFW (table [s k f t d n] (list (concat (at W1 's) (at W2 's)) (concat (at W1 'k) (at W2 'k)) (concat (at W1 'f) (at W2 'f)) (concat (at W1 't) (at W2 't)) (concat (at W1 'd) (at W2 'd)) (concat (at W1 'n) (at W2 'n)))))
+(at (select {x: (first (asc k)) from: TPW}) 'x) -- [1]
+(select {x: (first (asc k)) from: TPW}) -- (select {x: (first (asc k)) from: TFW})
+(select {x: (last (asc k)) y: (first (desc k)) from: TPW}) -- (select {x: (last (asc k)) y: (first (desc k)) from: TFW})
+(select {x: (first (asc f)) y: (last (asc f)) from: TPW}) -- (select {x: (first (asc f)) y: (last (asc f)) from: TFW})
+(select {x: (first (asc s)) y: (last (asc s)) z: (first (desc s)) from: TPW}) -- (select {x: (first (asc s)) y: (last (asc s)) z: (first (desc s)) from: TFW})
+(select {x: (first (asc t)) y: (last (asc t)) from: TPW}) -- (select {x: (first (asc t)) y: (last (asc t)) from: TFW})
+(select {x: (first (asc d)) y: (last (desc d)) from: TPW}) -- (select {x: (first (asc d)) y: (last (desc d)) from: TFW})
+(select {x: (first (asc n)) y: (last (asc n)) from: TPW}) -- (select {x: (first (asc n)) y: (last (asc n)) from: TFW})
+(select {x: (first (asc k)) c: (count k) m: (min s) from: TPW}) -- (select {x: (first (asc k)) c: (count k) m: (min s) from: TFW})
+(select {x: (first (asc s)) y: (last (asc k)) from: TPW where: (> k 1)}) -- (select {x: (first (asc s)) y: (last (asc k)) from: TFW where: (> k 1)})
+;; A scalar aggregate whose source reads no column has nothing of the
+;; table to bind: over a parted table it answers as over a flat one.
+(at (select {x: (count [1 2 3]) from: TPW}) 'x) -- [3]
+(at (select {x: (first (asc [3 1 2])) from: TPW}) 'x) -- [1]
+(select {x: (count [1 2 3]) y: (first (asc [3 1 2])) from: TPW}) -- (select {x: (count [1 2 3]) y: (first (asc [3 1 2])) from: TFW})
+
+;; An aggregate source that reads no column and has no DAG node, `(til 5)`,
+;; is one collection whatever the row: `(count (til 5))` is 5, as outside a
+;; select.  It was evaluated row by row and counted once per row (the row
+;; count; `sum`/`max` rejected the list of per-row vectors).  A scalar
+;; source keeps its per-row meaning: `(sum 1)` is the row count.
+(at (select {x: (count (til 5)) from: TFW}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TPW}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TFW where: (> k 2)}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TPW where: (> k 2)}) 'x) -- [5]
+(at (select {x: (count (+ 1 (til 5))) y: (count k) from: TPW}) 'x) -- [5]
+(at (select {x: (max (til 5)) from: TFW}) 'x) -- [4]
+(at (select {x: (max (til 5)) from: TPW}) 'x) -- [4]
+(set n5 5)
+(at (select {x: (count (til n5)) from: TPW}) 'x) -- [5]
+(at (select {x: (count (til 5)) from: TFW by: s asc: s}) 'x) -- [5 5 5 5 5]
+(at (select {x: (count (til 5)) from: TPW by: s asc: s}) 'x) -- [5 5 5 5 5]
+(at (select {x: (sum 1) from: TPW}) 'x) -- [6]
+(at (select {x: (count 1) from: TFW}) 'x) -- [6]
+;; Grouped, every aggregate over such a source takes it whole in each
+;; group; the groups are uneven ('a holds two rows), so counting or summing
+;; the group's rows shows.
+(at (select {x: (sum (til 5)) from: TFW by: s asc: s}) 'x) -- [10 10 10 10 10]
+(at (select {x: (sum (til 5)) from: TPW by: s asc: s}) 'x) -- [10 10 10 10 10]
+(at (select {x: (min (+ 1 (til 5))) y: (max (til 5)) from: TFW by: s asc: s}) 'x) -- [1 1 1 1 1]
+(at (select {x: (min (+ 1 (til 5))) y: (max (til 5)) from: TPW by: s asc: s}) 'y) -- [4 4 4 4 4]
+(at (select {x: (avg (til 5)) from: TFW by: s asc: s}) 'x) -- [2.0 2.0 2.0 2.0 2.0]
+(at (select {x: (avg (til 5)) from: TPW by: s asc: s}) 'x) -- [2.0 2.0 2.0 2.0 2.0]
+(at (select {x: (first (reverse (til 5))) y: (last (til 5)) z: (sum k) from: TFW by: s asc: s}) 'x) -- [4 4 4 4 4]
+(at (select {x: (first (reverse (til 5))) y: (last (til 5)) z: (sum k) from: TPW by: s asc: s}) 'y) -- [4 4 4 4 4]
+(at (select {x: (sum (til 5)) z: (sum k) from: TPW by: s asc: s}) 'z) -- (at (select {z: (sum k) from: TFW by: s asc: s}) 'z)
+
+;; Without by: the source is evaluated once, scalar or collection, so an
+;; effect in it runs once, not once per row.
+;; `where` returns the positions it keeps, not one value per row: an
+;; aggregate over it takes what it returns, in each group (positions within
+;; the group) and over the whole table.  Grouped, count/sum/max read the
+;; group's rows instead (count gave the group sizes).
+(set TWi (table [i j] (list [1 1 3 4 5] [5 5 6 6 6])))
+(at (select {c: (count (where (> i 2))) by: j from: TWi}) 'c) -- [0 3]
+(at (select {c: (first (where (> i 2))) by: j from: TWi}) 'c) -- [0Nl 0]
+(at (select {c: (sum (where (> i 2))) d: (sum i) by: j from: TWi}) 'c) -- [0 3]
+(at (select {c: (count (where (> i 2))) from: TWi}) 'c) -- [3]
+(at (select {c: (sum (where (> i 2))) from: TWi where: (> i 1)}) 'c) -- [3]
+(at (select {x: (count (where (> k 2))) from: TFW by: s asc: s}) 'x) -- [1 1 1 0 1]
+(at (select {x: (count (where (> k 2))) from: TPW by: s asc: s}) 'x) -- [1 1 1 0 1]
+(at (select {x: (sum (where (> k 2))) y: (max (where (> k 2))) from: TPW by: s asc: s}) 'x) -- [0 1 0 0 0]
+(at (select {x: (sum (where (> k 2))) y: (max (where (> k 2))) from: TPW by: s asc: s}) 'y) -- [0 1 0 0Nl 0]
+(at (select {x: (count (where (> k 2))) from: TPW}) 'x) -- [4]
+
+;; A grouped source that reads no column and gives one value stands for
+;; every row of the group, as without by: (`(sum 1)` is the row count): 2 in
+;; groups of 1 2 1 1 1 rows sums to 2 4 2 2 2.  It is evaluated once, not
+;; once per group; it was taken as one value per group (1 per group).
+(at (select {x: (sum (at [1 2 3] 1)) from: TFW by: s asc: s}) 'x) -- [2 4 2 2 2]
+(at (select {x: (sum (at [1 2 3] 1)) from: TPW by: s asc: s}) 'x) -- [2 4 2 2 2]
+(at (select {x: (count (at [1 2 3] 1)) from: TPW by: s asc: s}) 'x) -- [1 2 1 1 1]
+(at (select {x: (first (at ['p 'q] 1)) from: TFW by: s asc: s}) 'x) -- ['q 'q 'q 'q 'q]
+(set TB (table [a b] (list (til 10) (< (til 10) 3))))
+(at (select {x: (sum (at [1 2 3] 0)) from: TB by: b}) 'x) -- [3 7]
+(at (select {x: (sum (at [1 2 3] 1)) from: TB by: b}) 'x) -- [6 14]
+(at (select {x: (sum (at [1 2 3] 1)) from: TB by: b where: (> a 1)}) 'x) -- [2 14]
+(set ticks 0)
+(at (select {x: (sum (do (set ticks (+ ticks 1)) (at [1 2 3] 1))) from: TPW by: s asc: s}) 'x) -- [2 4 2 2 2]
+ticks -- 1
+(set ticks 0)
+(at (select {x: (sum (do (set ticks (+ ticks 1)) (til 5))) y: (sum k) from: TFW by: s asc: s}) 'x) -- [10 10 10 10 10]
+ticks -- 1
+
+;; A vector constant in an aggregate stands for a column: one of the
+;; table's length is sliced per group and filtered by where: (the table's
+;; rows before the filter; a parted table's rows across its partitions).
+;; Any other length is a length error; it was read past its end.  One
+;; value spreads over the rows, and count keeps the vector's own length.
+(set W6 [10 20 30 40 50 60])
+(at (select {x: (sum W6) from: TFW}) 'x) -- [210]
+(at (select {x: (sum W6) from: TPW}) 'x) -- [210]
+(at (select {x: (sum W6) from: TFW where: (> k 2)}) 'x) -- [160]
+(at (select {x: (sum W6) from: TPW where: (> k 2)}) 'x) -- [160]
+(at (select {x: (sum W6) from: TFW by: s asc: s}) 'x) -- [50 60 10 30 60]
+(at (select {x: (sum W6) from: TPW by: s asc: s}) 'x) -- [50 60 10 30 60]
+(at (select {x: (sum W6) from: TPW by: s where: (> k 2) asc: s}) 'x) -- [50 40 10 60]
+(at (select {x: (sum [7]) from: TFW}) 'x) -- [42]
+(set L3 [5 1 9])
+(select {x: (sum [1 2 3]) from: TFW}) !- length
+(select {x: (sum [1 2 3]) from: TPW}) !- length
+(select {x: (avg L3) from: TFW}) !- length
+(select {x: (sum (+ 1 L3)) from: TFW}) !- length
+(select {x: (max [1 2 3]) from: TFW by: s}) !- length
+(select {x: (max L3) from: TPW by: s}) !- length
+(select {x: (first L3) from: TFW by: s}) !- length
+(select {x: (sum [1 2 3 4]) from: TFW where: (> k 2)}) !- length
+(at (select {x: (count L3) from: TFW}) 'x) -- [3]
+(at (select {x: (count L3) from: TPW by: s asc: s}) 'x) -- [3 3 3 3 3]
+
+(set ticks 0)
+(at (select {x: (sum (do (set ticks (+ ticks 1)) (at [1 2 3] 0))) from: TFW}) 'x) -- [6]
+ticks -- 1
+(set ticks 0)
+(at (select {x: (count (at (do (set ticks (+ ticks 1)) (til 3)) 1)) from: TPW where: (> k 2)}) 'x) -- [4]
+ticks -- 1
+(set ticks 0)
+(at (select {x: (count (do (set ticks (+ ticks 1)) (til 5))) from: TPW}) 'x) -- [5]
+ticks -- 1
+;; A column-free source with by: is evaluated once and its value spliced back
+;; into the query: every value type must survive the round trip, the other
+;; clauses must apply, and a name that is both a global and a column must
+;; still read the column.
+(set TCF (table [acf b] (list [1 2 3 4 5 6] ['x 'x 'y 'y 'y 'z])))
+(at (select {s: (first (at ['p 'q] 0)) from: TCF by: b}) 's) -- ['p 'p 'p]
+(at (select {s: (first (at ["xy" "z"] 0)) from: TCF by: b}) 's) -- ["xy" "xy" "xy"]
+(at (select {s: (first (list [1 2] [3])) from: TCF by: b}) 's) -- (list [1 2] [1 2] [1 2])
+(at (select {s: (first (at [2024.01.01 2024.02.02] 1)) from: TCF by: b}) 's) -- [2024.02.02 2024.02.02 2024.02.02]
+(at (select {s: (sum (at [1.5 2.5] 0)) from: TCF by: b}) 's) -- [3.0 4.5 1.5]
+(at (select {s: (sum (at [0N 1] 0)) from: TCF by: b}) 's) -- [0 0 0]
+(at (select {s: (avg (at [0N 1] 0)) from: TCF by: b}) 's) -- [0Nf 0Nf 0Nf]
+(at (select {s: (max (at [3 9] 1)) n: (count acf) from: TCF by: b}) 'n) -- [2 3 1]
+(at (select {s: (sum (at [2 3] 0)) from: TCF by: b where: (> acf 1) desc: s take: 1}) 's) -- [6]
+(set GCF 5)
+(at (select {s: (sum (+ GCF 0)) from: TCF by: b}) 's) -- [10 15 5]
+(set acf 100)
+(at (select {s: (sum (+ acf 0)) from: TCF by: b}) 's) -- [3 12 6]
+(set fcf (fn [x] (+ x 1)))
+(at (select {s: (sum (fcf 1)) from: TCF by: b}) 's) -- [4 6 2]
+(at (select {s: (sum (fcf acf)) from: TCF by: b}) 's) -- [5 15 7]
+(set ticks 0)
+(count (select {s: (sum (at [2 3] 0)) from: (do (set ticks (+ ticks 1)) TCF) by: b})) -- 3
+ticks -- 1
+(set ticks 0)
+(at (select {s: (sum (do (set ticks (+ ticks 1)) (til 3))) from: TCF}) 's) -- [3]
+ticks -- 1
+;; A quoted symbol that names a column is the column inside a query (the
+;; literal-column rule): a source holding one reads a column, so it is
+;; sliced per group like the bare name.  It was classed as reading no
+;; column and evaluated once over the whole table ([1300 1300], [3 3]), or
+;; over a parted table met the segmented column whole (`at: index must be
+;; an integer`).
+(set MQ (table [k v s] (list [1 1 2 2 2] [10 20 30 40 50] ['a 'b 'a 'c 'a])))
+(at (select {c: (sum (at [100 200 300] 'k)) by: k from: MQ}) 'c) -- [400 900]
+(at (select {c: (sum (at [100 200 300] 'k)) by: k from: MQ}) 'c) -- (at (select {c: (sum (at [100 200 300] k)) by: k from: MQ}) 'c)
+(at (select {c: (count (distinct 's)) by: k from: MQ}) 'c) -- [2 2]
+(at (select {c: (sum (at [0 10 20 30 40 50 60] 'k)) from: TPW by: s asc: s}) 'c) -- (at (select {c: (sum (at [0 10 20 30 40 50 60] 'k)) from: TFW by: s asc: s}) 'c)
+(at (select {c: (sum (at [0 10 20 30 40 50 60] 'k)) from: TPW by: s asc: s}) 'c) -- [40 60 30 20 60]
+;; A symbol vector inside a source is a literal, whatever names it holds:
+;; `['v 'k]` counts 2 in each group as `['p 'q]` does (it was read as the
+;; columns v and k, and counted the group's rows).
+(at (select {c: (count (at (list ['v 'k]) 0)) by: k from: MQ}) 'c) -- [2 2]
+(at (select {c: (count (at (list ['v 'k]) 0)) by: k from: MQ}) 'c) -- (at (select {c: (count (at (list ['p 'q]) 0)) by: k from: MQ}) 'c)
+(at (select {c: (first (at (list ['v 'k]) 0)) from: MQ}) 'c) -- ['v]
+;; A column-free source is evaluated once for the whole select: not once to
+;; plan the output and again for each group, nor again when the select is
+;; planned anew around another rewritten output.  A collection-valued
+;; aggregate (`first` of a list) keeps the value it was planned with.  Both
+;; shapes counted 4 and 3 evaluations.
+(set ticks 0)
+(at (select {c: (first (do (set ticks (+ ticks 1)) (list [1 2] [3]))) d: (sum (til 3)) by: k from: MQ}) 'c) -- (list [1 2] [1 2])
+ticks -- 1
+(set ticks 0)
+(at (select {c: (first (do (set ticks (+ ticks 1)) (list [1 2] [3]))) by: k from: MQ}) 'c) -- (list [1 2] [1 2])
+ticks -- 1
+(set ticks 0)
+(at (select {c: (first (do (set ticks (+ ticks 1)) (list [1 2] [3]))) d: (sum (til 3)) by: k from: MQ}) 'd) -- [3 3]
+ticks -- 1
+;; The scalar it gives stands for every row, `(sum 1)` included, and the
+;; groups come out in the order every other aggregate gives them (the
+;; first rows where: keeps); they came in the table's order.
+(at (select {c: (sum (at [1 2 3] 0)) by: s from: MQ where: (> v 10)}) 's) -- (at (select {c: (count v) by: s from: MQ where: (> v 10)}) 's)
+(at (select {c: (sum (at [1 2 3] 0)) by: s from: MQ where: (> v 10)}) 's) -- (at (select {c: (sum v) by: s from: MQ where: (> v 10)}) 's)
+(at (select {c: (sum 1) by: s from: MQ where: (> v 10)}) 's) -- (at (select {c: (count v) by: s from: MQ where: (> v 10)}) 's)
+(at (select {c: (sum (at [1 2 3] 0)) n: (count v) by: s from: MQ where: (> v 10)}) 'c) -- (at (select {c: (sum (at [1 2 3] 0)) n: (count v) by: s from: MQ where: (> v 10)}) 'n)
+;; A vector constant of the table's length stays aligned with its rows when
+;; a selective where: compacts the group's input (an expression input
+;; beside it): it was read from its first cell, raising `length` (dev read
+;; V2[0..8] silently).  The projection and a computed input alike.
+(set T3 (table [a k] (list (til 1000) (% (til 1000) 3))))
+(set V2 (* 2 (til 1000)))
+(at (select {s: (sum V2) by: k from: T3 where: (> a 990) asc: k}) 's) -- [5976 5964 5970]
+(at (select {s: (sum V2) m: (sum (+ a 1)) by: k from: T3 where: (> a 990) asc: k}) 's) -- [5976 5964 5970]
+(at (select {s: (sum (+ a V2)) by: k from: T3 where: (> a 990) asc: k}) 's) -- [8964 8946 8955]
+(at (select {s: (+ a V2) m: (* a 2) from: T3 where: (> a 990)}) 's) -- [2973 2976 2979 2982 2985 2988 2991 2994 2997]
+(select {s: (sum [1 2]) m: (sum (+ a 1)) by: k from: T3 where: (> a 990)}) !- length
+(select {s: (sum [1 2]) m: (sum (+ a 1)) by: k from: T3 where: (> a 99999)}) !- length
+;; take: and a dict computed key filter the rows before grouping too:
+;; the vector meets them unfiltered, the where: as their selection (both
+;; raised `length`; dev read the vector's first cells).
+(at (select {c: (sum V2) by: k from: T3 where: (> a 500)}) 'c) -- [250500 248834 249166]
+(at (select {c: (sum V2) by: k from: T3 where: (> a 500) take: 2}) 'c) -- [250500 248834]
+(at (select {c: (sum V2) by: {m: (+ k 1)} from: T3 where: (> a 500)}) 'c) -- [250500 248834 249166]
+(at (select {c: (sum V2) by: {m: (+ k 1)} from: T3 where: (> a 500)}) 'm) -- [1 2 3]
+(at (select {c: (sum (+ a V2)) by: {m: (+ k 1)} from: T3 where: (> a 500) take: 2}) 'c) -- [375750 373251]
+;; Over an empty table nothing of the vector is read: the sum of no
+;; values, as `(sum (til 3))` over it (an empty table grouped, none keyless).
+(set T7 (table [a k] (list (til 10) (% (til 10) 3))))
+(key (select {f: (sum [1 2]) by: k from: (take T7 0)})) -- [k f]
+(count (select {f: (sum [1 2]) by: k from: (take T7 0)})) -- 0
+(key (select {f: (sum [1 2]) from: (take T7 0)})) -- [f]
+(count (select {f: (sum [1 2]) from: (take T7 0)})) -- 0
+(select {f: (sum [1 2]) by: k from: T7 where: (> a 100)}) !- length
+;; A collection-valued aggregate of a column-free source is one cell
+;; without by: too, as each group takes it (it raised `length`).
+(set M5 (table [k v] (list [1 1 2 2 2] [10 20 30 40 50])))
+(at (select {c: (first (enlist [7 8])) from: M5}) 'c) -- (list [7 8])
+(at (select {c: (first (enlist [7 8])) by: k from: M5}) 'c) -- (list [7 8] [7 8])
+(at (select {c: (first (enlist ['v 'k])) from: M5}) 'c) -- (list ['v 'k])
+;; A helper of several statements is not inlined: it runs once per group.
+(set cntcf 0)
+(set hcf (fn [x] (set cntcf (+ cntcf 1)) (til x)))
+(at (select {c: (sum (hcf 3)) by: k from: M5}) 'c) -- [3 3]
+cntcf -- 2
+(.sys.exec "rm -rf /tmp/rfl_scalar_asc_parted") -- 0

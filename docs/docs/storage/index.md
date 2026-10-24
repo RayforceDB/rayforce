@@ -34,7 +34,7 @@ A string column file written by the current engine stores the content hash of ev
 |---|---|
 | `ray_col_save(vec, path)` | Write a vector to a column file. Handles slices, sentinel nulls, and string pools transparently. |
 | `ray_col_load(path)` | Read a column file into a heap-allocated vector. The file is read entirely into memory. |
-| `ray_col_mmap(path)` | Memory-map a column file for zero-copy access. The returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. |
+| `ray_col_mmap(path)` | Memory-map a column file. A generation-0 file is zero-copy: the returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. A compressed (generation-2) file is mapped too, but the column decodes into heap memory the first time it is read. |
 
 ```c
 // Save a vector
@@ -50,7 +50,7 @@ ray_t* mapped = ray_col_mmap("db/trades/price");
 ```
 
 !!! note "Memory-mapped vectors"
-    Memory-mapped vectors have `mmod = 1` in their header, distinguishing them from heap-allocated vectors. The buddy allocator skips them during free. Slices of mmap'd vectors retain a reference to the parent mapping.
+    Memory-mapped generation-0 vectors have `mmod = 1` in their header, distinguishing them from heap-allocated vectors; a decoded compressed column is heap memory. The buddy allocator skips them during free. Slices of mmap'd vectors retain a reference to the parent mapping.
 
 ## Splayed Tables
 
@@ -79,20 +79,27 @@ all columns into a fresh directory below `.generations/`. After the files are
 complete, it atomically replaces the small `.current` manifest. Readers follow
 that manifest, so they see either the previous complete generation or the new
 complete generation — never a mixture of columns from both. A failed write
-before publication leaves the previous generation selected. Tables written by
-older Rayforce versions remain readable; the first replacement upgrades the
-directory to the generation layout.
+before publication leaves the previous generation selected. A cancelled write
+reports `cancel` and changes nothing: the previous generation stays selected,
+and a cancelled first write leaves no table behind, while files that were
+already in the directory before the write are kept. Superseded generations,
+and what a failed first write created, are removed afterwards; a symbolic
+link found among them is unlinked, never followed, so nothing outside the
+table directory is touched. Tables written by older Rayforce versions remain
+readable; the first replacement upgrades the directory to the generation
+layout.
 
 The table, partition and CSV entry points follow the same publication protocol.
 Indexes are built in the new generation before it is published. The CSV and
 Parquet converters build each column's chunk zone or string dictionary from
 the rows as they are streamed and write it with the column, so a conversion
-does not read its own output back; only integer columns whose zone qualifies
-for a hash index are re-read, one column at a time, to build it. An index
-that cannot be written (for example, the disk fills) is dropped and the column
-is published without it. Writers to the
-same table serialize on `.write.lock`; readers resolve the manifest once and
-continue using that generation. The symbol vocabulary stays at its original
+does not read its own output back. The converters add no hash index of their
+own: a hash index is persisted only when the column carries one built with
+`.idx.hash` when the table is saved (a table resaved from an older store keeps
+a hash it already has), and a parted conversion builds none for its segments.
+An index that cannot be written (for example, the disk fills) is dropped and the
+column is published without it. Writers to the same table serialize on
+`.write.lock`; readers resolve the manifest once and continue using that generation. The symbol vocabulary stays at its original
 location and grows append-only.
 
 Publication keeps only the selected generation and removes the others
@@ -198,6 +205,10 @@ Mounting the same root again on the same thread reuses unchanged partitions whil
 
 The cache holds at most 1024 partition tables per thread. GC, symbol-domain opens and the next mount discard entries whose columns have no external references; heap abandonment, heap teardown and runtime shutdown clear the thread's entries. To release a dropped view's mappings and copied LIST values immediately, call `(.sys.gc)`. C callers can also use `ray_parted_cache_clear()` from `store/part.h` to clear their thread's cache.
 
+### Partitions without a column (ragged tables)
+
+A partition may hold fewer columns than the first one, as long as the columns it has come first in the same order with the same names and types; a column it lacks is a NULL segment for that partition. Such a ragged table reads as the flat table with typed nulls in the missing rows, wherever its rows are read: a select over it (projections, `where:`, `asc:`/`desc:`, `take:`, `by:` and aggregates), `(at table 'col)`, the standalone `take` verb, printing and `show`, and `ser`, whose bytes equal those of the equivalent flat table. The partition-key column's row counts give the missing rows; `BOOL` and `U8`, which have no null, read as `false` and `0`. A parted column met away from its table (through `get` on a column value rather than a query) still contributes no rows for a partition that lacks it.
+
 !!! warning "`update` over a partitioned table materializes in memory"
     `update` on a partitioned table flattens the whole table into memory first — the parted/`MAPCOMMON` columns cannot be mutated in place — so the result is an ordinary in-memory table. It is **not** written back to the store: re-reading the root returns the original values, and the returned table loses its parted / memory-mapped identity.
 
@@ -211,7 +222,9 @@ The global symbol intern table maps strings to integer IDs. When saving data to 
 
 ### Append-Only .sym Files
 
-Symbol files use an append-only format. New symbols are appended to the end of the file without rewriting existing entries. This makes concurrent writes safe and enables incremental updates.
+A table's symbol file, which `.db.splayed.set` and the importers write, is append-only: new symbols are appended to the end of the file without rewriting existing entries, so a symbol's position never changes and updates are incremental. One process writes a database at a time: a writer whose view of the file is out of date fails with `RAY_ERR_CORRUPT` instead of overwriting another writer's symbols (see [Running Several Instances](../guides/instances.md)).
+
+The C functions below work on the runtime's global symbol table instead. `ray_sym_save` writes the whole table to a temporary file and renames it over the target, and `ray_sym_load` merges a file into the running table.
 
 | Function | Description |
 |---|---|
@@ -232,7 +245,7 @@ ray_sym_load("db/.sym");
 ### Concurrency and Integrity
 
 - **File locking** — `flock()` on POSIX, `LockFileEx()` on Windows. Multiple processes can safely read the symbol file; writes acquire an exclusive lock.
-- **Corruption detection** — symbol files include checksums. If a file is truncated or corrupted, `ray_sym_load()` returns `RAY_ERR_CORRUPT` and leaves the in-memory table unchanged.
+- **Corruption detection** — symbol files carry no checksum. The loader checks the magic, the entry count and every entry's length; a truncated or malformed file makes `ray_sym_load()` return `RAY_ERR_CORRUPT`.
 - **Arena backing** — interned strings are allocated from a dedicated arena (`ray_arena_t`), making bulk allocation fast and ensuring all strings are freed together when the symbol table is destroyed.
 
 ## CSV Import and Export
@@ -328,9 +341,19 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
 
+A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked, nested/list and explicitly indexed (hash, sort, bloom, part) columns are always written uncompressed. Compressed files keep their chunk zones but carry no persisted hash or dictionary index: a column that a generation-0 save would give one is written without it, and queries over it run without that accelerator.
+
+### Compressed floating-point environment
+
+Generation-2 compressed F32/F64 I/O requires **default floating-point controls** on every calling/executing thread: round-to-nearest (`FE_TONEAREST`), masked FP exceptions, and gradual underflow (FTZ and DAZ disabled). Embedders must maintain those controls during calls. Rayforce does not silently change or normalize them; sticky exception status flags need not be clear and arithmetic may set them. Detected unsupported controls produce `fpenv` (`RAY_ERR_FPENV` in C), not a corruption error. Restore supported controls before retrying the same mapped column; an environment failure is transient, not permanently cached.
+
+The refusal applies conservatively to compressed float writes and whole-column materialization, including decoded-cache hits and non-ALP encodings. ALP range decoding also checks the executing thread. It does not change the file format or require every non-ALP range read to reject nondefault controls.
+
+Detection is deliberately limited: standard rounding is checked, plus SSE rounding, FTZ/DAZ and exception masks on supported x86 SSE builds. This is **not a complete portable FP-environment validator**: x87 trap masks are not checked, and on other native architectures only standard rounding is checked. WebAssembly has fixed nearest rounding. Maintaining other required controls remains the embedder's responsibility; passing a check is not proof that every control is supported.
+
 ### `.db.splayed.get` — Load a Splayed Table
 
-Loads a splayed table from a directory. Columns are memory-mapped for zero-copy access.
+Loads a splayed table from a directory. Columns are memory-mapped: generation-0 files for zero-copy access, while a compressed (generation-2) column decodes into heap memory the first time a query reads it.
 
 ```lisp
 (.db.splayed.get "/tmp/weather")
@@ -391,7 +414,7 @@ For every table present in **any** partition, ensures **every** partition has it
 
 Symbol tables are persisted automatically when you use `.db.splayed.set`. A `.sym` file is written into the table directory containing all interned symbol strings. When loading with `.db.splayed.get` or `.db.parted.get`, the symbol table is loaded first so that symbol columns decode correctly.
 
-At the C API level, `ray_sym_save(path)` and `ray_sym_load(path)` handle persistence directly. The format is append-only — new symbols are appended without rewriting existing entries, making concurrent access safe.
+At the C API level, `ray_sym_save(path)` and `ray_sym_load(path)` handle persistence directly. `ray_sym_save` writes the whole runtime table to a temporary file and renames it over `path`; one process writes a given file.
 
 ## Working Example: Round-Trip
 
@@ -425,3 +448,16 @@ A complete workflow: create a table, save it to disk, load it back, and verify t
 ```
 
 The loaded table is fully functional — you can run `select`, `update`, joins, and aggregations on it just like an in-memory table. Symbol columns resolve correctly because the symbol table was saved and loaded alongside the data.
+
+## Duration column compatibility
+
+TIMESPAN uses the concrete type tag 16 and a signed 64-bit nanosecond
+payload. Serialization, generation-0 and generation-2 splayed columns,
+and partitioned columns preserve the tag and `0Nn` nulls. Tags 14 and 15
+remain internal selection and encoded-column tags.
+
+Readers built before TIMESPAN support reject the new tag, including when
+it appears in a table schema. Upgrade readers before writing duration
+columns to shared storage. Existing column tags and format generations
+retain their meanings. Parquet logical time and duration mappings are
+separate from this column format.

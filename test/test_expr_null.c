@@ -196,7 +196,7 @@ static test_result_t test_nullfree_stream_unchanged(void) {
                                      ray_const_i64(g, 1)),
                           ray_const_i64(g, 2));
     ray_expr_t ex;
-    TEST_ASSERT(expr_compile(g, tbl, e, &ex), "null-free compiles");
+    TEST_ASSERT(expr_compile(g, tbl, e, &ex, &(ray_t*){NULL}), "null-free compiles");
     for (uint8_t i = 0; i < ex.n_ins; i++)
         TEST_ASSERT(ex.ins[i].null_aware == 0, "no null_aware on null-free");
     for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
@@ -323,7 +323,7 @@ static test_result_t test_nullfree_promotion_invariance(void) {
 
     ray_graph_t* g = ray_graph_new(tbl);
     ray_expr_t ex;
-    TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex),
+    TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex, &(ray_t*){NULL}),
                 "null-free promotion compiles");
     /* No INPUT is nullable, so the compiler marks no instruction null_aware
      * and no reg null_src (column-derived nullability).  Single-null float
@@ -917,7 +917,7 @@ static test_result_t test_scalar_broadcast_col_bails(void) {
 
     uint64_t bail_other_before = ray_expr_bail_counts[EXPR_BAIL_OTHER];
     ray_expr_t ex;
-    bool compiled = expr_compile(gc, tbl, add, &ex);
+    bool compiled = expr_compile(gc, tbl, add, &ex, &(ray_t*){NULL});
     TEST_ASSERT_FALSE(compiled);
     TEST_ASSERT_FMT(ray_expr_bail_counts[EXPR_BAIL_OTHER] > bail_other_before,
                     "EXPR_BAIL_OTHER must increment (was %llu, now %llu)",
@@ -1111,7 +1111,7 @@ static test_result_t test_fused_agg_input_allnull_group(void) {
         ray_op_t* mulA = ray_mul(gA, xA, ray_const_i64(gA, 2));
 
         ray_expr_t exA;
-        bool compiled = expr_compile(gA, tbl, mulA, &exA);
+        bool compiled = expr_compile(gA, tbl, mulA, &exA, &(ray_t*){NULL});
         TEST_ASSERT(compiled, "Part A: x*2 expr_compile must succeed for nullable i64");
         TEST_ASSERT(ray_expr_compile_ok > ok_before,
                     "Part A: compile_ok must increment");
@@ -1304,7 +1304,7 @@ static test_result_t test_diff_parted_nullable(void) {
     ray_graph_t* gc = ray_graph_new(tbl);
     ray_op_t* root_b = build_add_const(gc);
     ray_expr_t ex;
-    bool ok = expr_compile(gc, tbl, root_b, &ex);
+    bool ok = expr_compile(gc, tbl, root_b, &ex, &(ray_t*){NULL});
     TEST_ASSERT(ok, "expr_compile on parted tbl succeeds");
     TEST_ASSERT(ex.has_parted, "has_parted set");
     TEST_ASSERT(ex.regs[ex.out_reg].nullable,
@@ -1617,7 +1617,7 @@ static test_result_t test_zone_skip_keeps_nulls_fused_pred(void) {
         zn_op = ops[k];
         ray_graph_t* g = ray_graph_new(tbl);
         fp_pred_t fp;
-        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp) == 0, "fp compiles");
+        TEST_ASSERT(fp_compile_pred(g, b_zone_cmp(g), tbl, &fp, &(ray_t*){NULL}) == 0, "fp compiles");
         for (int64_t ms = 0; ms < ZN_ROWS; ms += 1024)
             fp_eval_pred(&fp, ms, ms + 1024, bits + ms);
         for (int64_t i = 0; i < ZN_ROWS; i++)
@@ -1841,6 +1841,104 @@ static test_result_t test_sym_ordered_sparse_no_intern(void) {
     PASS();
 }
 
+/* ---- Zero divisor over null-free inputs ----------------------------------
+ * A null-free program compiles every instruction with null_aware = 0; the
+ * plain I64 DIV / IDIV / MOD kernels used to write 0 for a zero divisor
+ * where the builtin and the fallback give 0Nl, and the output scan then
+ * found no sentinel.  Pin the fused result against the fallback and
+ * against the expected null rows, and require HAS_NULLS on the output.
+ * Divisor columns of every integer width plus BOOL (the fallback's
+ * zero-divisor pass covered I64 / I32 only) and a constant zero. */
+static ray_t* make_zero_div_table(int8_t yt) {
+    int64_t xv[] = {7, -7, 5, 9, -3, 1, 4, 8};
+    int64_t yv[] = {3, 0, -2, 0, 5, 1, 0, 2};      /* zero at rows 1, 3, 6 */
+    ray_t* xcol = ray_vec_from_raw(RAY_I64, xv, 8);
+    ray_t* ycol;
+    if (yt == RAY_I64) {
+        ycol = ray_vec_from_raw(RAY_I64, yv, 8);
+    } else if (yt == RAY_I32) {
+        int32_t v[8]; for (int i = 0; i < 8; i++) v[i] = (int32_t)yv[i];
+        ycol = ray_vec_from_raw(RAY_I32, v, 8);
+    } else if (yt == RAY_I16) {
+        int16_t v[8]; for (int i = 0; i < 8; i++) v[i] = (int16_t)yv[i];
+        ycol = ray_vec_from_raw(RAY_I16, v, 8);
+    } else {
+        uint8_t v[8]; for (int i = 0; i < 8; i++) v[i] = yv[i] != 0;
+        ycol = ray_vec_from_raw(RAY_BOOL, v, 8);
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    return tbl;
+}
+
+static ray_op_t* build_zd_idiv(ray_graph_t* g) { return ray_idiv(g, ray_scan(g, "x"), ray_scan(g, "y")); }
+static ray_op_t* build_zd_mod(ray_graph_t* g)  { return ray_mod(g, ray_scan(g, "x"), ray_scan(g, "y")); }
+static ray_op_t* build_zd_div(ray_graph_t* g)  { return ray_div(g, ray_scan(g, "x"), ray_scan(g, "y")); }
+static ray_op_t* build_zd_idiv0(ray_graph_t* g) { return ray_idiv(g, ray_scan(g, "x"), ray_const_i64(g, 0)); }
+static ray_op_t* build_zd_mod0(ray_graph_t* g)  { return ray_mod(g, ray_scan(g, "x"), ray_const_i64(g, 0)); }
+/* the sentinel survives a downstream (null-aware) kernel */
+static ray_op_t* build_zd_mod_add(ray_graph_t* g) {
+    return ray_add(g, ray_mod(g, ray_scan(g, "x"), ray_scan(g, "y")), ray_const_i64(g, 1));
+}
+
+static test_result_t test_u8_mod_composition_fuses(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    int64_t xv[] = {7, -7, 5, 9, -3, 1, 4, 8};
+    uint8_t yv[] = {3, 0, 2, 0, 5, 1, 0, 2};
+    ray_t* xcol = ray_vec_from_raw(RAY_I64, xv, 8);
+    ray_t* ycol = ray_vec_from_raw(RAY_U8, yv, 8);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    test_result_t r = diff_run(tbl, build_zd_mod_add, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Fused result: nulls exactly at the rows in want[], HAS_NULLS set, and
+ * equal to the forced fallback.  fused: the program must compile (an I64
+ * divisor does; a narrower one may take the typed executor, whose
+ * zero-divisor pass is then the one under test). */
+static test_result_t zd_check(ray_t* tbl, expr_builder_t b, const bool want[8], bool fused) {
+    test_result_t r = diff_run(tbl, b, fused);
+    if (r.status != TEST_PASS) return r;
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* v = ray_execute(g, b(g));
+    TEST_ASSERT(v && !RAY_IS_ERR(v) && v->len == 8, "fused result");
+    TEST_ASSERT(v->attrs & RAY_ATTR_HAS_NULLS, "HAS_NULLS on a zero-divisor result");
+    for (int64_t i = 0; i < 8; i++)
+        TEST_ASSERT_FMT(ray_vec_is_null(v, i) == want[i], "null at row %lld: got %d want %d",
+                        (long long)i, ray_vec_is_null(v, i), want[i]);
+    ray_release(v); ray_graph_free(g);
+    PASS();
+}
+
+static test_result_t test_zero_divisor_nullfree(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    const bool zero_rows[8] = {false, true, false, true, false, false, true, false};
+    const bool all_rows[8]  = {true, true, true, true, true, true, true, true};
+    const int8_t yts[] = {RAY_I64, RAY_I32, RAY_I16, RAY_BOOL};
+    test_result_t r = { TEST_PASS, NULL };
+    for (size_t t = 0; t < sizeof yts / sizeof yts[0] && r.status == TEST_PASS; t++) {
+        ray_t* tbl = make_zero_div_table(yts[t]);
+        bool i64 = yts[t] == RAY_I64;
+        r = zd_check(tbl, build_zd_idiv, zero_rows, false);   /* IDIV is not fused */
+        if (r.status == TEST_PASS) r = zd_check(tbl, build_zd_mod, zero_rows, i64);
+        if (r.status == TEST_PASS) r = zd_check(tbl, build_zd_div, zero_rows, i64);
+        if (r.status == TEST_PASS) r = zd_check(tbl, build_zd_mod_add, zero_rows, i64);
+        if (r.status == TEST_PASS && i64) {
+            r = zd_check(tbl, build_zd_idiv0, all_rows, false);
+            if (r.status == TEST_PASS) r = zd_check(tbl, build_zd_mod0, all_rows, true);
+        }
+        ray_release(tbl);
+    }
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/sym_ordered_sparse_no_intern", test_sym_ordered_sparse_no_intern, NULL, NULL },
     { "expr_null/sym_ordered_partitions", test_sym_ordered_partitions, NULL, NULL },
@@ -1877,6 +1975,8 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_i64_mul",            test_diff_i64_mul,                     NULL, NULL },
     { "expr_null/diff_i64_div",            test_diff_i64_div,                     NULL, NULL },
     { "expr_null/diff_i64_mod",            test_diff_i64_mod,                     NULL, NULL },
+    { "expr_null/zero_divisor_nullfree",   test_zero_divisor_nullfree,            NULL, NULL },
+    { "expr_null/u8_mod_composition_fuses", test_u8_mod_composition_fuses,        NULL, NULL },
     { "expr_null/diff_i64_min2",           test_diff_i64_min2,                    NULL, NULL },
     { "expr_null/diff_i64_max2",           test_diff_i64_max2,                    NULL, NULL },
     { "expr_null/diff_i64_neg",            test_diff_i64_neg,                     NULL, NULL },

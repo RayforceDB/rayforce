@@ -62,8 +62,17 @@ uint64_t ray_vm_willneed_bytes(void) {
 #include <errno.h>        /* EINTR — ray_os_cgroup_stat_flush */
 #include <stdatomic.h>
 #include <sys/resource.h> /* getrusage: ray_io_counters */
+#include <sched.h>        /* sched_getaffinity: ray_cpu_set_count */
+#include <stdint.h>       /* INT64_MAX: the cgroup quota */
 #if !defined(RUSAGE_THREAD)
 #define RUSAGE_THREAD 1
+#endif
+#include <sys/syscall.h>  /* SYS_mlock2: ray_vm_lock, past libc's mlock interceptors */
+#if !defined(MLOCK_ONFAULT)
+#define MLOCK_ONFAULT 1
+#endif
+#if !defined(MADV_DONTNEED_LOCKED)
+#define MADV_DONTNEED_LOCKED 24   /* Linux 5.18 */
 #endif
 #endif
 #include "mem/sys.h"
@@ -86,6 +95,11 @@ void ray_vm_free(void* ptr, size_t size) {
 }
 
 void* ray_vm_map_file(const char* path, size_t* out_size) {
+    return ray_vm_map_file_id(path, out_size, NULL);
+}
+
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) {
+    if (id) memset(id, 0, sizeof(*id));
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
 
@@ -93,6 +107,18 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
     if (fstat(fd, &st) != 0) {
         close(fd);
         return NULL;
+    }
+    if (id) {
+        id->valid = true;
+        id->ino = (uint64_t)st.st_ino;
+        id->size = (uint64_t)st.st_size;
+#if defined(RAY_OS_MACOS)
+        id->mtime_ns = (int64_t)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+        id->ctime_ns = (int64_t)st.st_ctimespec.tv_sec * 1000000000 + st.st_ctimespec.tv_nsec;
+#else
+        id->mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+        id->ctime_ns = (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec;
+#endif
     }
 
     if (st.st_size <= 0) {
@@ -130,6 +156,18 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
     return p;
 }
 
+/* A zeroed, writable private mapping with no file behind it, released by
+ * ray_vm_unmap_file: an in-memory image that the code mapping files takes
+ * as one of its own (a generated column).  Counted in the file-mapping
+ * total, which ray_vm_unmap_file debits.  NULL on failure. */
+void* ray_vm_map_anon(size_t size) {
+    if (size == 0) return NULL;
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
+
 void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
@@ -146,6 +184,8 @@ static size_t vm_page_size(void) {
     }
     return pg;
 }
+
+size_t ray_vm_page_size(void) { return vm_page_size(); }
 
 #if defined(RAY_OS_LINUX)
 /* A block device's queue attribute in KiB, -1 when it cannot be read. */
@@ -274,7 +314,9 @@ void ray_vm_release(void* ptr, size_t size) {
 #endif
 }
 
-void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
+/* The range of free block blk whose pages may go: [*s, *e), empty if none. */
+static void vm_block_range(void* blk, size_t bsize, bool hugepage,
+                           uintptr_t* s_out, uintptr_t* e_out) {
     if (!hugepage) {
         /* Release only whole pages strictly INSIDE the block, keeping its
          * first page resident: the buddy free-list links (fl_prev/fl_next
@@ -291,9 +333,8 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
          * NULL link (issue #240).  Rounding inward to page-aligned bounds
          * makes the kernel's own rounding a no-op on every platform. */
         size_t pg = vm_page_size();
-        uintptr_t s = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
-        uintptr_t e = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
-        if (e > s) ray_vm_release((void*)s, e - s);
+        *s_out = ((uintptr_t)blk + 32 + (pg - 1)) & ~(uintptr_t)(pg - 1);
+        *e_out = ((uintptr_t)blk + bsize) & ~(uintptr_t)(pg - 1);
         return;
     }
     /* THP pool: release only the whole 2MB-aligned interior so a partial
@@ -308,8 +349,60 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
      * still release only whole 2MB regions, so no THP shatter. */
     uintptr_t s = ((uintptr_t)blk + (2u << 20) - 1) & ~((uintptr_t)(2u << 20) - 1);
     if (s == (uintptr_t)blk) s += (2u << 20);
-    uintptr_t e = ((uintptr_t)blk + bsize) & ~((uintptr_t)(2u << 20) - 1);
+    *s_out = s;
+    *e_out = ((uintptr_t)blk + bsize) & ~((uintptr_t)(2u << 20) - 1);
+}
+
+void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
+    uintptr_t s, e;
+    vm_block_range(blk, bsize, hugepage, &s, &e);
     if (e > s) ray_vm_release((void*)s, e - s);
+}
+
+#if defined(RAY_OS_LINUX)
+/* 0 once MADV_DONTNEED_LOCKED (Linux 5.18) is known not to exist here. */
+static _Atomic(int) vm_dontneed_locked = 1;
+#endif
+
+int ray_vm_release_locked(void* ptr, size_t size) {
+#if defined(RAY_OS_LINUX) && defined(SYS_munlock) && defined(SYS_mlock2)
+    if (!ptr || size == 0) return 0;
+    /* MADV_DONTNEED refuses a locked range; MADV_DONTNEED_LOCKED does not,
+     * and the range stays locked. */
+    if (atomic_load_explicit(&vm_dontneed_locked, memory_order_relaxed)) {
+        if (madvise(ptr, size, MADV_DONTNEED_LOCKED) == 0) return 0;
+        if (errno != EINVAL) return -1;
+        atomic_store_explicit(&vm_dontneed_locked, 0, memory_order_relaxed);
+    }
+    /* Before it: unlock, release, lock again — on fault, so nothing comes
+     * back in, and the kernel merges the range into its mapping again. */
+    if (syscall(SYS_munlock, ptr, size) != 0) return -1;
+    madvise(ptr, size, MADV_DONTNEED);
+    return syscall(SYS_mlock2, ptr, size, MLOCK_ONFAULT) == 0 ? 0 : 1;
+#else
+    ray_vm_release(ptr, size);
+    return 0;
+#endif
+}
+
+int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+    uintptr_t s, e;
+    vm_block_range(blk, bsize, hugepage, &s, &e);
+    return e > s ? ray_vm_release_locked((void*)s, e - s) : 0;
+}
+
+int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+    uintptr_t s, e;
+    vm_block_range(blk, bsize, hugepage, &s, &e);
+    if (e <= s) return 0;
+#if defined(RAY_OS_LINUX)
+    if (madvise((void*)s, e - s, MADV_DONTNEED) == 0) return 0;
+    if (errno != EINVAL) return -1;
+    return ray_vm_release_locked((void*)s, e - s);   /* a locked range */
+#else
+    ray_vm_release((void*)s, e - s);
+    return 0;
+#endif
 }
 
 void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
@@ -343,6 +436,67 @@ bool ray_vm_hugepage(void* ptr, size_t size) {
     return madvise(ptr, size, MADV_HUGEPAGE) == 0;
 #else
     (void)ptr; (void)size; return false;
+#endif
+}
+
+/* Linux: mlock2(MLOCK_ONFAULT) — only the pages faulted in are locked, as
+ * they are faulted.  Called as a raw system call: sanitizer runtimes
+ * intercept mlock() and make it a no-op, and an old libc has no mlock2
+ * wrapper.  Elsewhere nothing: plain mlock() would fault in and wire the
+ * whole range at once. */
+bool ray_vm_lock(void* ptr, size_t size) {
+#if defined(RAY_OS_LINUX) && defined(SYS_mlock2)
+    if (!ptr || size == 0) return false;
+    return syscall(SYS_mlock2, ptr, size, MLOCK_ONFAULT) == 0;
+#else
+    (void)ptr; (void)size; return false;
+#endif
+}
+
+void ray_vm_unlock(void* ptr, size_t size) {
+#if defined(RAY_OS_LINUX) && defined(SYS_munlock)
+    if (ptr && size) (void)syscall(SYS_munlock, ptr, size);
+#else
+    (void)ptr; (void)size;
+#endif
+}
+
+bool ray_os_has_ipc_lock(void) {
+#if defined(RAY_OS_LINUX)
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return false;
+    char line[256];
+    unsigned long long eff = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "CapEff:", 7) == 0) { eff = strtoull(line + 7, NULL, 16); break; }
+    fclose(f);
+    return (eff >> 14) & 1;   /* CAP_IPC_LOCK */
+#else
+    return false;
+#endif
+}
+
+int64_t ray_vm_locked_bytes(void) {
+#if defined(RAY_OS_LINUX)
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    int64_t kb = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "VmLck:", 6) == 0) { kb = strtoll(line + 6, NULL, 10); break; }
+    fclose(f);
+    return kb * 1024;
+#else
+    return 0;
+#endif
+}
+
+void ray_os_raise_memlock(void) {
+#if defined(RAY_OS_LINUX)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur >= rl.rlim_max) return;
+    rl.rlim_cur = rl.rlim_max;
+    (void)setrlimit(RLIMIT_MEMLOCK, &rl);
 #endif
 }
 
@@ -399,6 +553,37 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 uint32_t ray_thread_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return (n > 0) ? (uint32_t)n : 1;
+}
+
+/* The CPUs this process may run on: its affinity mask on Linux, which
+ * taskset, a cgroup cpuset or docker --cpuset-cpus may narrow below the
+ * online count; the online count elsewhere.  The mask read is the calling
+ * thread's: the process's, unless an embedding application narrowed the
+ * thread that first uses the pool (whose workers then inherit it). */
+/* Test hook: a mask buffer below this many bytes fails as a kernel whose
+ * mask is wider than the buffer fails it (EINVAL); 0 = none. */
+static size_t g_cpu_set_test_min;
+void ray_cpu_set_test_min_bytes(size_t n) { g_cpu_set_test_min = n; }
+
+uint32_t ray_cpu_set_count(void) {
+#if defined(RAY_OS_LINUX)
+    /* A kernel built for more CPUs than a cpu_set_t holds (1024) rejects
+     * the fixed buffer with EINVAL however few CPUs the process may use:
+     * retry with a larger one. */
+    for (size_t sz = sizeof(cpu_set_t); sz <= ((size_t)1 << 20); sz *= 2) {
+        cpu_set_t* set = (cpu_set_t*)ray_sys_alloc(sz);
+        if (!set) break;
+        memset(set, 0, sz);
+        int rc, err = EINVAL;
+        if (sz < g_cpu_set_test_min) rc = -1;
+        else { rc = sched_getaffinity(0, sz, set); err = errno; }
+        int n = rc == 0 ? CPU_COUNT_S(sz, set) : 0;
+        ray_sys_free(set);
+        if (rc == 0) { if (n > 0) return (uint32_t)n; break; }
+        if (err != EINVAL) break;
+    }
+#endif
+    return ray_thread_count();
 }
 
 /* Physical cores (SMT siblings collapsed).  The worker pool's kernels are
@@ -620,6 +805,200 @@ int64_t ray_os_cgroup_mem_limit(void) {
     return cgroup_mem_limit(NULL, 0);
 }
 
+/* CPU quota (docker --cpus, systemd CPUQuota=): the CPU time a cgroup may
+ * use per period, as v2 cpu.max "QUOTA PERIOD" ("max" = none) or v1
+ * cpu.cfs_quota_us (-1 = none) over cpu.cfs_period_us, in millicpus.  A
+ * quota does not narrow the affinity mask, so a pool sized to the mask
+ * would run more threads than the quota lets run and be throttled. */
+static int64_t cgroup_cpu_read(const char* dir, bool v2) {
+    char path[640], buf[64];
+    long long q = 0, per = 0;
+    if (v2) {
+        snprintf(path, sizeof(path), "%s/cpu.max", dir);
+        FILE* f = fopen(path, "r");
+        if (!f) return 0;
+        buf[0] = 0;
+        if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+        fclose(f);
+        if (strncmp(buf, "max", 3) == 0 || sscanf(buf, "%lld %lld", &q, &per) != 2) return 0;
+    } else {
+        snprintf(path, sizeof(path), "%s/cpu.cfs_quota_us", dir);
+        FILE* f = fopen(path, "r");
+        if (!f) return 0;
+        if (fscanf(f, "%lld", &q) != 1) q = 0;
+        fclose(f);
+        snprintf(path, sizeof(path), "%s/cpu.cfs_period_us", dir);
+        f = fopen(path, "r");
+        if (!f) return 0;
+        if (fscanf(f, "%lld", &per) != 1) per = 0;
+        fclose(f);
+    }
+    if (q <= 0 || per <= 0 || q > (long long)(INT64_MAX / 1000) - per) return 0;
+    return (int64_t)((q * 1000 + per - 1) / per);
+}
+
+/* Test hook: a directory /proc/self/{cgroup,mountinfo} and the cgroup
+ * files of the quota reader are taken from (NULL: the real ones). */
+static const char* g_cg_test_root;
+void ray_os_cgroup_test_root(const char* dir) { g_cg_test_root = dir; }
+
+static void cg_path(char* out, size_t n, const char* p) {
+    snprintf(out, n, "%s%s", g_cg_test_root ? g_cg_test_root : "", p);
+}
+
+/* Smallest quota over `root`/`cgpath` and every ancestor up to `root`, as
+ * the memory limit walk above. */
+static int64_t cgroup_cpu_walk(const char* root, const char* cgpath, bool v2) {
+    char dir[512];
+    if (snprintf(dir, sizeof(dir), "%s%s", root, cgpath) >= (int)sizeof(dir)) return 0;
+    size_t rootlen = strlen(root);
+    int64_t m = 0;
+    for (;;) {
+        int64_t v = cgroup_cpu_read(dir, v2);
+        if (v > 0 && (m == 0 || v < m)) m = v;
+        if (strlen(dir) <= rootlen) break;
+        char* slash = strrchr(dir, '/');
+        if (!slash || (size_t)(slash - dir) < rootlen) break;
+        *slash = 0;
+    }
+    return m;
+}
+
+/* True when the comma-separated list names `want`. */
+static bool cgroup_list_has(const char* list, const char* want) {
+    size_t wl = strlen(want);
+    while (*list) {
+        size_t n = strcspn(list, ",");
+        if (n == wl && strncmp(list, want, n) == 0) return true;
+        list += n;
+        if (*list == ',') list++;
+    }
+    return false;
+}
+
+/* mountinfo escapes space, tab, newline and backslash as \ooo */
+static void cg_unescape(char* s) {
+    char* o = s;
+    for (char* p = s; *p; p++) {
+        if (p[0] == '\\' && p[1] >= '0' && p[1] <= '3' && p[2] >= '0' && p[2] <= '7' &&
+            p[3] >= '0' && p[3] <= '7') {
+            *o++ = (char)((p[1] - '0') * 64 + (p[2] - '0') * 8 + (p[3] - '0'));
+            p += 3;
+        } else {
+            *o++ = *p;
+        }
+    }
+    *o = 0;
+}
+
+/* One mount of a cgroup hierarchy from a /proc/self/mountinfo line: the
+ * v2 one (`ctrl` NULL), or the v1 one whose super options name `ctrl`.
+ * Its mount point, and the path in the hierarchy the mount shows (its
+ * root: "/" unless a subtree was mounted).  The line is consumed. */
+static bool cgroup_mount_line(char* line, const char* ctrl, char** mnt, char** root) {
+    /* "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS" */
+    line[strcspn(line, "\n")] = 0;
+    char* sep = strstr(line, " - ");
+    if (!sep) return false;
+    *sep = 0;
+    char* f_root = NULL; char* f_mnt = NULL;
+    char* save = NULL;
+    int i = 0;
+    for (char* t = strtok_r(line, " ", &save); t; t = strtok_r(NULL, " ", &save), i++) {
+        if (i == 3) f_root = t;
+        else if (i == 4) { f_mnt = t; break; }
+    }
+    if (!f_root || !f_mnt) return false;
+    char* fstype = strtok_r(sep + 3, " ", &save);
+    char* source = fstype ? strtok_r(NULL, " ", &save) : NULL;
+    char* super = source ? strtok_r(NULL, " ", &save) : NULL;
+    if (!fstype) return false;
+    if (ctrl ? !(strcmp(fstype, "cgroup") == 0 && super && cgroup_list_has(super, ctrl))
+             : strcmp(fstype, "cgroup2") != 0)
+        return false;
+    cg_unescape(f_root);
+    cg_unescape(f_mnt);
+    *mnt = f_mnt;
+    *root = f_root;
+    return true;
+}
+
+/* The quota of a membership path `cgpath` ("" for the root) of the v2
+ * hierarchy (`ctrl` NULL) or the v1 one carrying `ctrl`.  Every mount of
+ * the hierarchy whose subtree holds the membership is a view of it: the
+ * membership is translated through the view's root to its directory under
+ * the mount point, and the cgroup and its ancestors visible there (up to
+ * the mount point) are read.  The tightest quota of all views counts, as
+ * each shows a part of the same ancestry.  Without mountinfo, or with no
+ * mount of the hierarchy listed, the conventional mounts. */
+static int64_t cgroup_cpu_member(const char* ctrl, const char* v1list, const char* cgpath) {
+    char path[600], base[600];
+    cg_path(path, sizeof(path), "/proc/self/mountinfo");
+    FILE* f = fopen(path, "r");
+    bool listed = false;
+    int64_t m = 0;
+    if (f) {
+        char line[2048];
+        while (fgets(line, sizeof(line), f)) {
+            char* mnt; char* root;
+            if (!cgroup_mount_line(line, ctrl, &mnt, &root)) continue;
+            listed = true;
+            const char* rel = cgpath;
+            if (strcmp(root, "/") != 0) {
+                size_t rl = strlen(root);
+                if (strncmp(cgpath, root, rl) != 0 || (cgpath[rl] != 0 && cgpath[rl] != '/'))
+                    continue;   /* the membership is outside this view */
+                rel = cgpath + rl;
+            }
+            cg_path(base, sizeof(base), mnt);
+            int64_t v = cgroup_cpu_walk(base, rel, ctrl == NULL);
+            if (v > 0 && (m == 0 || v < m)) m = v;
+        }
+        fclose(f);
+    }
+    if (listed) return m;
+    if (!ctrl) {
+        cg_path(base, sizeof(base), "/sys/fs/cgroup");
+        return cgroup_cpu_walk(base, cgpath, true);
+    }
+    /* v1 mounts the controller as the directory named by its list
+     * ("cpu,cpuacct"), usually with a "cpu" link to it */
+    char dir[300];
+    snprintf(dir, sizeof(dir), "/sys/fs/cgroup/%s", v1list);
+    cg_path(base, sizeof(base), dir);
+    int64_t v = cgroup_cpu_walk(base, cgpath, false);
+    if (!v) {
+        cg_path(base, sizeof(base), "/sys/fs/cgroup/cpu");
+        v = cgroup_cpu_walk(base, cgpath, false);
+    }
+    return v;
+}
+
+int64_t ray_os_cgroup_cpu_quota(void) {
+    char path[600];
+    cg_path(path, sizeof(path), "/proc/self/cgroup");
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    int64_t m = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char* c1 = strchr(line, ':');
+        char* c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c2) continue;
+        *c2 = 0;
+        const char* ctrls = c1 + 1;
+        char* cgpath = c2 + 1;
+        cgpath[strcspn(cgpath, "\n")] = 0;
+        if (strcmp(cgpath, "/") == 0) cgpath[0] = 0;
+        int64_t v = 0;
+        if (*ctrls == 0) v = cgroup_cpu_member(NULL, NULL, cgpath);
+        else if (cgroup_list_has(ctrls, "cpu")) v = cgroup_cpu_member("cpu", ctrls, cgpath);
+        if (v > 0 && (m == 0 || v < m)) m = v;
+    }
+    fclose(f);
+    return m;
+}
+
 bool ray_os_cgroup_mem_dir(char* buf, size_t n) {
     if (n) buf[0] = 0;
     return n && cgroup_mem_limit(buf, n) > 0 && buf[0];
@@ -638,6 +1017,8 @@ bool ray_os_cgroup_stat_flush(const char* cg) {
 }
 #else
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
+void    ray_os_cgroup_test_root(const char* dir) { (void)dir; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 #endif
@@ -760,6 +1141,12 @@ void ray_vm_free(void* ptr, size_t size) {
     ray_sys_track_sub((int64_t)size);
 }
 
+/* No file identity here: the record index never takes the shortcut. */
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) {
+    if (id) memset(id, 0, sizeof(*id));
+    return ray_vm_map_file(path, out_size);
+}
+
 void* ray_vm_map_file(const char* path, size_t* out_size) {
     HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -821,12 +1208,34 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
     return p;
 }
 
+/* A zeroed, writable view backed by the paging file, released by
+ * ray_vm_unmap_file (UnmapViewOfFile at the view's base): an in-memory
+ * image that the code mapping files takes as one of its own.  Counted in
+ * the file-mapping total.  NULL on failure. */
+void* ray_vm_map_anon(size_t size) {
+    if (size == 0) return NULL;
+    HANDLE hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                     (DWORD)((uint64_t)size >> 32), (DWORD)size, NULL);
+    if (!hMap) return NULL;
+    void* p = MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, size);
+    CloseHandle(hMap);
+    if (!p) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
+
 void ray_vm_advise_seq(void* ptr, size_t size) {
     /* PrefetchVirtualMemory is Win8.1+. Best-effort; ignore failure. */
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = ptr;
     entry.NumberOfBytes  = size;
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+}
+
+size_t ray_vm_page_size(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize ? (size_t)si.dwPageSize : 4096;
 }
 
 void ray_vm_advise_willneed(void* ptr, size_t size) {
@@ -881,6 +1290,20 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
+int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
+int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+bool ray_os_has_ipc_lock(void) { return false; }
+int64_t ray_vm_locked_bytes(void) { return 0; }
+void ray_os_raise_memlock(void) {}
 
 /* --------------------------------------------------------------------------
  * Threading
@@ -923,6 +1346,8 @@ uint32_t ray_thread_count(void) {
     GetSystemInfo(&si);
     return (uint32_t)si.dwNumberOfProcessors;
 }
+uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
+void     ray_cpu_set_test_min_bytes(size_t n) { (void)n; }
 
 /* Windows: no cheap topology read here — fall back to the logical count
  * (the SMT-aware default sizing is a POSIX-side optimization). */
@@ -931,6 +1356,8 @@ uint32_t ray_physical_core_count(void) {
 }
 
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
+void    ray_os_cgroup_test_root(const char* dir) { (void)dir; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 
@@ -1029,6 +1456,12 @@ void ray_vm_free(void* ptr, size_t size) {
     ray_sys_track_sub((int64_t)size);
 }
 
+/* No file identity here: the record index never takes the shortcut. */
+void* ray_vm_map_file_id(const char* path, size_t* out_size, ray_file_id_t* id) {
+    if (id) memset(id, 0, sizeof(*id));
+    return ray_vm_map_file(path, out_size);
+}
+
 void* ray_vm_map_file(const char* path, size_t* out_size) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -1064,8 +1497,24 @@ void* ray_vm_map_fd_ro(int fd, size_t size) {
     return p;
 }
 
+/* A zeroed, writable private mapping with no file behind it, released by
+ * ray_vm_unmap_file: an in-memory image that the code mapping files takes
+ * as one of its own (a generated column).  Counted in the file-mapping
+ * total, which ray_vm_unmap_file debits.  NULL on failure. */
+void* ray_vm_map_anon(size_t size) {
+    if (size == 0) return NULL;
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
+
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
+size_t ray_vm_page_size(void) {
+    long ps = sysconf(_SC_PAGESIZE);
+    return (ps > 0) ? (size_t)ps : 4096;
+}
 void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (ptr && size) atomic_fetch_add_explicit(&vm_willneed_bytes, size, memory_order_relaxed);
 }
@@ -1090,6 +1539,20 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
+int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
+int ray_vm_release_block_locked(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+int ray_vm_release_block_any(void* blk, size_t bsize, bool hugepage) {
+    ray_vm_release_block(blk, bsize, hugepage);
+    return 0;
+}
+bool ray_os_has_ipc_lock(void) { return false; }
+int64_t ray_vm_locked_bytes(void) { return 0; }
+void ray_os_raise_memlock(void) {}
 
 /* Threading — return errors / 1.  pool.c with n_workers==0 (the result of
  * thread_count==1 ⇒ ncpu-1 == 0) never invokes thread_create. */
@@ -1104,7 +1567,11 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
+uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
+void     ray_cpu_set_test_min_bytes(size_t n) { (void)n; }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }
+int64_t ray_os_cgroup_cpu_quota(void) { return 0; }
+void    ray_os_cgroup_test_root(const char* dir) { (void)dir; }
 bool    ray_os_cgroup_mem_dir(char* buf, size_t n) { if (n) buf[0] = 0; return false; }
 bool    ray_os_cgroup_stat_flush(const char* cg) { (void)cg; return false; }
 static uint64_t cache_llc_probe(void) { return 0; }

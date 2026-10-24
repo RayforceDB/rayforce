@@ -186,4 +186,10 @@ static inline size_t ray_sym_bytes_upper(size_t len) {
     return 32 + chars_block;
 }
 
+/* Test hooks: addresses and size of the lock, g_sym and g_sym_inited. */
+uintptr_t ray_sym_test_lock_addr(void);
+uintptr_t ray_sym_test_table_addr(void);
+size_t    ray_sym_test_table_size(void);
+uintptr_t ray_sym_test_inited_addr(void);
+
 #endif /* RAY_SYM_H */

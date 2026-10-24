@@ -43,7 +43,7 @@
 ;; the in-memory one.  The snapshot is taken inside one expression (a line
 ;; of this file interns its own names when it is parsed), and (.sys.mem) is
 ;; called once beforehand (its first call interns its own key names).
-(count (.sys.mem)) -- 18
+(count (.sys.mem)) -- 21
 (set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
 (set NG (nogrow (fn [] (key F))))
 (at NG 0) -- 0
@@ -79,4 +79,62 @@
 (set RU (select {from: F by: (substr ref 1 4) c: (count ref)}))
 (as 'STR (at RU 'ref)) -- ["" "http" "ab5" "ab0" "ab9" "ab4" "ab3" "ab8" "ab2" "ab1" "ab6" "ab7"]
 (at RU 'c) -- [18203 164471 1733 1736 1733 1733 1734 1731 1731 1731 1732 1732]
-(.sys.exec "rm -rf /tmp/rfl_dkv/") -- 0
+;; ── the same column under a name no global holds ───────────────────────
+;; (`ref` is a global above as well; the having match below reads an
+;; aggregate over a global's name as one over a constant, not a column)
+(.sys.exec "rm -rf /tmp/rfl_dkv_u/") -- 0
+(.db.splayed.set "/tmp/rfl_dkv_u/" (table [url v] (list (at T 'ref) (at T 'v))))
+(set FU (.db.splayed.get "/tmp/rfl_dkv_u/"))
+;; the key "" comes first, wherever its first value lies (the place a key
+;; domain gives the empty string, and the row path's order)
+(set E (select {from: FU by: (substr url 40 3) c: (count url) where: (!= url "")}))
+(as 'STR (at E 'url)) -- ["" "/pa" "pag" "age" "e?i" "ge?"]
+(at E 'c) -- [121196 34795 21138 4268 200 200]
+(as 'STR (at (select {from: FU by: (substr url 40 3) c: (count url) sv: (sum v) where: (!= url "")}) 'url)) -- ["" "/pa" "pag" "age" "e?i" "ge?"]
+;; the first value with a key, "https://host29.example.org/p/1919", keys "19"
+(set E2 (select {from: FU by: (substr url 30 2) c: (count url) where: (!= url "")}))
+(take (as 'STR (at E2 'url)) 6) -- ["" "19" "83" "/p" "16" "14"]
+(take (at E2 'c) 6) -- [17660 4134 536 51927 3266 2998]
+;; no where: the null value and the short values share the key "": the
+;; group's min and max skip the null, its avg divides by the others' rows
+(set N3 (select {from: FU by: (substr url 40 3) c: (count url) mn: (min url) mx: (max url) l: (avg (strlen url))}))
+(set N3O (select {from: FU by: (substr url 40 3) c: (count url) mn: (min url) mx: (max url) l: (avg (strlen url)) sv: (sum v)}))
+(as 'STR (at (select {from: N3 asc: url}) 'mn)) -- ["ab0" "http://www.host10.example.org/path/1200/page?id=15600" "http://www.host0.example.org/path/210/page?id=2730" "http://www.host3.example.org/path/3/page?id=39" "http://www.host2.example.org/path/72/page?id=936" "http://www.host0.example.org/path/1050/page?id=13650"]
+(all (== (as 'STR (at (select {from: N3 asc: url}) 'mn)) (as 'STR (at (select {from: N3O asc: url}) 'mn)))) -- true
+(all (== (as 'STR (at (select {from: N3 asc: url}) 'mx)) (as 'STR (at (select {from: N3O asc: url}) 'mx)))) -- true
+(all (== (at (select {from: N3 asc: url}) 'l) (at (select {from: N3O asc: url}) 'l))) -- true
+(all (== (at (select {from: N3 asc: url}) 'c) (at (select {from: N3O asc: url}) 'c))) -- true
+;; ── an enclosing where over the count ──────────────────────────────────
+;; `(select {from: (select {… c: (count url) …}) where: (> c N)})` arms
+;; the group emit filter for the inner grouping: the groups it drops are
+;; dropped before their key or min is made.  The enclosing where still runs,
+;; so the answer is the row path's.
+(set HQ (fn [t] (select {from: (select {from: t by: (let p (str-find url "://") (let s (substr url (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr url 1 4) "http") (not (nil? sl))) (substr r 1 sl) url))))) l: (avg (strlen url)) c: (count url) mn: (min url) where: (!= url "")}) where: (> c 2600)})))
+(set HV (HQ FU))
+(set HO (select {from: (select {from: FU by: (let p (str-find url "://") (let s (substr url (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr url 1 4) "http") (not (nil? sl))) (substr r 1 sl) url))))) l: (avg (strlen url)) c: (count url) mn: (min url) sv: (sum v) where: (!= url "")}) where: (> c 2600)}))
+(count HV) -- 19
+(same HV HO 'c) -- true
+(same HV HO 'l) -- true
+(all (== (as 'STR (at HV 'mn)) (as 'STR (at HO 'mn)))) -- true
+(all (== (as 'STR (at HV 'p)) (as 'STR (at HO 'p)))) -- true
+;; a grouping that sorts and takes picks among all its groups first: the
+;; five longest have about 866 rows each, so none passes the where
+(set TK (fn [t] (select {from: t by: (let p (str-find url "://") (let s (substr url (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr url 1 4) "http") (not (nil? sl))) (substr r 1 sl) url))))) l: (avg (strlen url)) c: (count url) mn: (min url) where: (!= url "") desc: l take: 5})))
+(at (TK FU) 'c) -- [866 866 866 867 868]
+(set TKH (fn [t] (select {from: (select {from: t by: (let p (str-find url "://") (let s (substr url (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr url 1 4) "http") (not (nil? sl))) (substr r 1 sl) url))))) l: (avg (strlen url)) c: (count url) mn: (min url) where: (!= url "") desc: l take: 5}) where: (> c 2600)})))
+(count (TKH FU)) -- 0
+;; the cut without a where: the kept group of the key "" holds the null value,
+;; which its min skips
+(set HQ2 (fn [t] (select {from: (select {from: t by: (substr url 40 3) c: (count url) mn: (min url) l: (avg (strlen url))}) where: (> c 30000)})))
+(as 'STR (at (HQ2 FU) 'mn)) -- ["ab0" "http://www.host10.example.org/path/1200/page?id=15600"]
+(at (HQ2 FU) 'c) -- [139399 34795]
+;; a generation-2 (compressed) store of the same column agrees
+(.sys.exec "rm -rf /tmp/rfl_dkv_z/") -- 0
+(.db.splayed.set "/tmp/rfl_dkv_z/" (table [url v] (list (at T 'ref) (at T 'v))) "/tmp/rfl_dkv_z/.sym" {compress: true})
+(set FZ (.db.splayed.get "/tmp/rfl_dkv_z/" "/tmp/rfl_dkv_z/.sym"))
+(count (HQ FZ)) -- 19
+(all (== (as 'STR (at (HQ FZ) 'mn)) (as 'STR (at HV 'mn)))) -- true
+(all (== (at (HQ FZ) 'l) (at HV 'l))) -- true
+(as 'STR (at (HQ2 FZ) 'mn)) -- ["ab0" "http://www.host10.example.org/path/1200/page?id=15600"]
+(take (as 'STR (at (select {from: FZ by: (substr url 30 2) c: (count url) where: (!= url "")}) 'url)) 6) -- ["" "19" "83" "/p" "16" "14"]
+(.sys.exec "rm -rf /tmp/rfl_dkv/ /tmp/rfl_dkv_u/ /tmp/rfl_dkv_z/") -- 0

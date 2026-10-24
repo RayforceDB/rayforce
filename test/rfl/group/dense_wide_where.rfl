@@ -1,0 +1,20 @@
+;; A where-filtered count over an integer key whose range is within the row
+;; count (600k rows, 590k key values) counts the selected rows only, whichever
+;; route takes it (on a small memory budget the one shared slab does, see
+;; agg_contract/dense_wide_budget_sel).  Each answer is checked against the
+;; same grouping over a table of just the selected rows.
+(set N 600000)
+(set i (til N))
+(set T (table [k v] (list (% (* i 7919) 590000) i)))
+(set S (select {from: T where: (> v 1000)}))
+(count S) -- 598999
+(set same (fn [A B] (and (== (count A) (count B)) (all (== (at (select {from: A asc: k}) 'k) (at (select {from: B asc: k}) 'k))) (all (== (at (select {from: A asc: k}) 'c) (at (select {from: B asc: k}) 'c))))))
+(same (select {from: T by: k c: (count v) where: (> v 1000)}) (select {from: S by: k c: (count v)})) -- true
+(same (select {from: T by: k c: (count v) where: (and (> v 1000) (< v 300000))}) (select {from: (select {from: T where: (and (> v 1000) (< v 300000))}) by: k c: (count v)})) -- true
+(set A (select {from: T by: k c: (count v) s: (sum v) where: (> v 1000)}))
+(set B (select {from: S by: k c: (count v) s: (sum v)}))
+(all (== (at (select {from: A asc: k}) 's) (at (select {from: B asc: k}) 's))) -- true
+(sum (at A 'c)) -- 598999
+(set top (select {from: T by: k c: (count v) desc: c take: 5 where: (> v 1000)}))
+(count top) -- 5
+(all (== (at top 'c) (at (take (xdesc (select {from: S by: k c: (count v)}) 'c) 5) 'c))) -- true

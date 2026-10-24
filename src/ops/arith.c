@@ -69,6 +69,7 @@ static ray_t* ray_f64_unary_math_fn(ray_t* x, ray_unary_fn self,
 }
 
 ray_t* ray_add_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_ADD, a, b);
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_add_fn, OP_ADD, a, b);
     /* Vector fast path — only when at least one operand is a typed vector */
@@ -147,6 +148,10 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b) ||
+        ((a->type == -RAY_TIMESTAMP || a->type == RAY_TIMESTAMP) &&
+         (b->type == -RAY_TIMESTAMP || b->type == RAY_TIMESTAMP)))
+        return ray_timespan_binary(OP_SUB, a, b);
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_sub_fn, OP_SUB, a, b);
 
@@ -224,13 +229,14 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
         if (both_f32_atoms(a, b)) return ray_f32((float)r);
         return make_f64(r);
     }
-    int8_t rt = promote_int_type_right(a, b);
+    int8_t rt = promote_int_type(a, b);
     /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
     int64_t la = as_i64(a), lb = as_i64(b);
     return make_typed_int(rt, (int64_t)((uint64_t)la - (uint64_t)lb));
 }
 
 ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_MUL, a, b);
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_mul_fn, OP_MUL, a, b);
 
@@ -267,6 +273,7 @@ ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_div_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_DIV, a, b);
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_div_fn, OP_DIV, a, b);
     if (!is_numeric(a) || !is_numeric(b))
@@ -281,6 +288,7 @@ ray_t* ray_div_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_IDIV, a, b);
     if (!is_numeric(a) || !is_numeric(b))
         return ray_error("type", "cannot div %s by %s",
                          ray_type_name(a->type), ray_type_name(b->type));
@@ -312,6 +320,7 @@ ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
+    if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_MOD, a, b);
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_mod_fn, OP_MOD, a, b);
     /* Temporal % numeric → temporal (same type as left operand) */
@@ -390,6 +399,11 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_neg_fn(ray_t* x) {
+    if (ray_has_timespan(x)) {
+        if (is_collection(x)) return atomic_map_unary(ray_neg_fn, x);
+        if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_TIMESPAN);
+        return ray_timespan(-x->i64);
+    }
     if (RAY_ATOM_IS_NULL(x)) { ray_retain(x); return x; }
     if (x->type == -RAY_F64) return make_f64(-x->f64);
     if (x->type == -RAY_F32) return ray_f32((float)-x->f64);
@@ -448,6 +462,11 @@ ray_t* ray_ceil_fn(ray_t* x) {
  * convention as `neg`).  Stops `(abs -32768h) → -32768h` (negative
  * result from abs!) and `(abs INT_MIN)` UB simultaneously. */
 ray_t* ray_abs_fn(ray_t* x) {
+    if (ray_has_timespan(x)) {
+        if (is_collection(x)) return atomic_map_unary(ray_abs_fn, x);
+        if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_TIMESPAN);
+        return ray_timespan(x->i64 < 0 ? -x->i64 : x->i64);
+    }
     if (RAY_ATOM_IS_NULL(x)) { ray_retain(x); return x; }
     if (x->type == -RAY_F64) return make_f64(fabs(x->f64));
     if (x->type == -RAY_F32) return ray_f32(fabsf((float)x->f64));

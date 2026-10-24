@@ -27,6 +27,7 @@
 #include "ops/hash.h"
 #include "ops/idxop.h"
 #include "ops/rowsel.h"
+#include "ops/colbind.h"  /* ray_graph_unbind_table */
 #include "table/domain.h"   /* raw vocabulary snapshot for if_sym_side_t */
 #include "core/pool.h"
 #include "lang/format.h"    /* ray_type_name (error context) */
@@ -266,6 +267,8 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
     }
     g->table = saved_table;
     g->selection = saved_sel;
+    /* the branch bound the sub-table's columns on g: drop them with it */
+    if (sub != saved_table) ray_graph_unbind_table(g, sub);
     ray_release(sub);
     return value;
 }
@@ -1829,8 +1832,8 @@ static inline uint64_t pivot_hash_null_words(uint64_t h, const int64_t* nullw,
 static int64_t pivot_parted_seg_count(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && RAY_IS_PARTED(col->type)) return col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type)) return m.n_segs;
     }
     return 0;
 }
@@ -1838,8 +1841,9 @@ static int64_t pivot_parted_seg_count(ray_t* tbl) {
 static bool pivot_table_has_parted_col(ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
-        ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) &&
+            (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON))
             return true;
     }
     return false;
@@ -1848,7 +1852,7 @@ static bool pivot_table_has_parted_col(ray_t* tbl) {
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
-    /* Parted-input guard: exec_pivot fetches columns via ray_table_get_col and
+    /* Parted-input guard: exec_pivot fetches columns via ray_table_col and
      * indexes them by row up to ray_table_nrows.  A raw RAY_PARTED/MAPCOMMON
      * column (whose data is a tiny segs array, not nrows elements) would be
      * indexed out of bounds → OOB read / SIGSEGV.  Flatten (concat all
@@ -1917,18 +1921,25 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     for (uint32_t i = 0; i < n_idx; i++) {
         ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]);
         idx_vecs[i] = (ie && ie->base.opcode == OP_SCAN)
-                     ? ray_table_get_col(tbl, ie->sym) : NULL;
+                     ? ray_table_col(tbl, ie->sym) : NULL;
+        if (idx_vecs[i] && RAY_IS_ERR(idx_vecs[i])) {
+            ray_t* err = idx_vecs[i];
+            scratch_free(key_hdr);
+            return err;
+        }
         if (!idx_vecs[i]) { scratch_free(key_hdr); return ray_error("domain", "pivot: index column not found"); }
     }
 
     ray_op_ext_t* pe = find_ext(g, ext->pivot.pivot_col);
     ray_t* pcol = (pe && pe->base.opcode == OP_SCAN)
-                ? ray_table_get_col(tbl, pe->sym) : NULL;
+                ? ray_table_col(tbl, pe->sym) : NULL;
+    if (pcol && RAY_IS_ERR(pcol)) { scratch_free(key_hdr); return pcol; }
     if (!pcol) { scratch_free(key_hdr); return ray_error("domain", "pivot: pivot column not found"); }
 
     ray_op_ext_t* ve = find_ext(g, ext->pivot.value_col);
     ray_t* vcol = (ve && ve->base.opcode == OP_SCAN)
-                ? ray_table_get_col(tbl, ve->sym) : NULL;
+                ? ray_table_col(tbl, ve->sym) : NULL;
+    if (vcol && RAY_IS_ERR(vcol)) { scratch_free(key_hdr); return vcol; }
     if (!vcol) { scratch_free(key_hdr); return ray_error("domain", "pivot: value column not found"); }
 
     if (nrows == 0) { scratch_free(key_hdr); return ray_table_new(0); }

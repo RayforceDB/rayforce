@@ -1,0 +1,9 @@
+;; P1 size measurement: re-save a splayed store compressed.
+;; Arguments after `--`: --src DIR (the generation-0 store), --out DIR (the
+;; compressed copy).  Defaults: the 10M ClickBench store and build/p1_size/hits under the cwd.
+(set u (at (.sys.args) 'user))
+(set src (if (in 'src (key u)) (at u 'src) "/skull/clickbench/rfsplayed"))
+(set out (if (in 'out (key u)) (at u 'out) "build/p1_size/hits"))
+(set t (.db.splayed.get src))
+(.db.splayed.set out t {compress: true})
+(println (count (.db.splayed.get out)))

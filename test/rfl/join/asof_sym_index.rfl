@@ -1,0 +1,11 @@
+;; A null-free SYM equality key can use its PART index for as-of lookup.
+;; The right side is sorted by symbol and time; each symbol's time slice
+;; stays ordered even though the full time column is not.
+(set Qsi (xasc (table [sym ts bid] (list (at ['aa 'bb 'cc] (% (til 3000) 3)) (til 3000) (as 'F64 (til 3000)))) ['sym 'ts]))
+(set Lsi (table [sym ts] (list ['aa 'bb 'cc] [100 200 2999])))
+(at (asof-join [sym ts] Lsi Qsi) 'bid) -- [99.0 199.0 2999.0]
+
+;; The same admission rule applies when the first of several keys is SYM.
+(set Qmi (xasc (table [sym k ts bid] (list (at ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh] (% (til 3200) 8)) (div (% (til 3200) 16) 8) (til 3200) (as 'F64 (til 3200)))) ['sym 'ts]))
+(set Lmi (table [sym k ts] (list ['aa 'bb] [0 1] [100 101])))
+(at (asof-join [sym k ts] Lmi Qmi) 'bid) -- [96.0 89.0]

@@ -148,7 +148,8 @@ static int32_t add_constant(compiler_t *c, ray_t *value) {
         if (v == value) return i;
         if (v->type == value->type && ray_is_atom(v)) {
             if (v->type == -RAY_I64 && v->i64 == value->i64) return i;
-            if (v->type == -RAY_F64 && v->f64 == value->f64) return i;
+            if (v->type == -RAY_F64 &&
+                memcmp(&v->f64, &value->f64, sizeof v->f64) == 0) return i;
             if (v->type == -RAY_BOOL && v->b8 == value->b8) return i;
             if (v->type == -RAY_SYM && v->i64 == value->i64 &&
                 v->attrs == value->attrs) return i;
@@ -283,422 +284,389 @@ static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
     }
     if (ast->type == RAY_DICT) {  /* slot[0]=keys, slot[1]=vals */
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_refs_locals(c, slots[0]) || ast_refs_locals(c, slots[1]);
+        return ast_refs_locals(c, slots[0]) || ast_refs_locals(c, slots[1]);   /* not-a-table */
     }
     return false;
 }
 
 
-/* ── Compile a list (special form or function call) ── */
-static void compile_list(compiler_t *c, ray_t *ast) {
-    if (c->error) return;
-    EMIT_DBG(c, ast);
-    int64_t n = ray_len(ast);
-    if (n == 0) { c->error = true; return; }
-    ray_t **elems = (ray_t **)ray_data(ast);
-    ray_t *head = elems[0];
-
-    init_sf_syms();
-
-    /* A local (parameter, let or capture) named like a special form or a
-     * builtin is the callee, as it is on the tree walker, where the name
-     * resolves through the scope frames first. */
-    bool head_local = head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
-                      find_local(c, head->i64) >= 0;
-
-    /* Check for special forms by name (name ref = unflagged default) */
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
-        int64_t sym_id = head->i64;
-
-        /* (set name value) — bind in the global env.  Compile the value
-         * expression (so parameter/local slot references resolve in the
-         * current frame), then emit OP_STOREGLOBAL to bind the result by
-         * name.  The value is left on the stack as the form's result.
-         *
-         * This previously emitted OP_CALLD on the whole form, which
-         * tree-walked the value against the global env and so could not
-         * see a compiled lambda's slot-bound parameters: `(fn [a] (set b a))`
-         * raised `name: 'a' undefined`.  A non-symbol name aborts bytecode
-         * emission and falls back to the interpreter, which raises the
-         * proper `type` error via ray_set_fn. */
-        if (sym_id == sf_set && n == 3) {
-            ray_t *name_obj = elems[1];
-            if (name_obj->type != -RAY_SYM) { c->error = true; return; }
-            compile_expr(c, elems[2]);
-            /* Match ray_set_fn: globals must never retain a single-use lazy
-             * DAG handle.  Materializing one alias consumes its graph and
-             * would leave every other global read pointing at a spent handle. */
-            emit(c, OP_FORCE);
-            int32_t idx = add_constant(c, name_obj);
-            if (idx < 256) {
-                emit(c, OP_STOREGLOBAL);
-                emit(c, (uint8_t)idx);
-            } else {
-                emit(c, OP_STOREGLOBAL_W);
-                emit(c, (uint8_t)(idx >> 8));
-                emit(c, (uint8_t)(idx & 0xFF));
-            }
-            return;
-        }
-
-        /* (let name value) — compile value, store in local slot.
-         * Reserved names (`.sys.*`, `.os.*`, `.csv.*`, `.ipc.*`) are
-         * refused here so a compiled lambda can't shadow a builtin
-         * through its local-slot table — the same guard
-         * ray_env_set_local enforces on the tree-walking path.
-         * Setting c->error aborts bytecode emission; call_lambda
-         * then falls back to the tree-walking interpreter which
-         * raises the proper `reserve` error via ray_let_fn.
-         * The five `.ipc.on.*` connection-hook names are exempt —
-         * they're user-settable, so a `let .ipc.on.open ...` in a
-         * compiled body must emit the same OP_STOREENV as any other
-         * local binding.  Without this, the bytecode path would
-         * abort and silently fall back to the interpreter on every
-         * such write. */
-        if (sym_id == sf_let && n == 3) {
-            ray_t *name_obj = elems[1];
-            if (name_obj->type != -RAY_SYM ||
-                (ray_sym_is_reserved(name_obj->i64) &&
-                 !ray_sym_is_ipc_hook(name_obj->i64))) {
-                c->error = true;
-                return;
-            }
-            compile_expr(c, elems[2]);
-            /* Materialize a lazy value before binding — the interpreter's
-             * ray_let_fn does the same.  A lazy handle is single-use
-             * (materialization consumes its deferred graph), so a local
-             * that aliased one would break on its SECOND read (e.g.
-             * `(let v (first xs)) (if (> v 0) v 0)`: the compare consumes
-             * the lazy, the branch then reloads a dead handle). */
-            emit(c, OP_FORCE);
-            emit(c, OP_DUP);
-            int32_t slot = find_local(c, name_obj->i64);
-            if (slot < 0) slot = add_local(c, name_obj->i64);
-            if (slot < 0) { c->error = true; return; }
-            emit(c, OP_STOREENV);
-            emit(c, (uint8_t)slot);
-            return;
-        }
-
-        /* (if cond then else?) */
-        if (sym_id == sf_if && n >= 3) {
-            compile_expr(c, elems[1]);
-            /* Match ray_cond_fn: truthiness belongs to the materialized value,
-             * not to the non-NULL lazy handle that happens to contain it. */
-            emit(c, OP_FORCE);
-            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
-            compile_expr(c, elems[2]);
-            if (n >= 4) {
-                int32_t jmp_pos = emit_jump(c, OP_JMP);
-                patch_jump(c, jmpf_pos);
-                compile_expr(c, elems[3]);
-                patch_jump(c, jmp_pos);
-            } else {
-                int32_t jmp_pos = emit_jump(c, OP_JMP);
-                patch_jump(c, jmpf_pos);
-                ray_t *zero = ray_alloc(0);
-                zero->type = -RAY_I64;
-                zero->i64 = 0;
-                int32_t idx = add_constant(c, zero);
-                ray_release(zero);
-                emit_const(c, idx);
-                patch_jump(c, jmp_pos);
-            }
-            return;
-        }
-
-        /* (do expr1 expr2 ...) */
-        if (sym_id == sf_do && n >= 2) {
-            for (int64_t i = 1; i < n; i++) {
-                if (i > 1) emit(c, OP_POP);
-                compile_expr(c, elems[i]);
-            }
-            return;
-        }
-
-        /* (while cond body...) — the only backward branch the compiler
-         * emits.  Body values are discarded (OP_POP each), and the form
-         * yields null however many times it iterated, matching
-         * ray_while_fn.  No scope is pushed: `let` in the body writes this
-         * frame's local slot, so loop-carried state survives the pass
-         * exactly as it does on the tree-walking path.
-         *
-         * Compiling the body inline — rather than letting this fall through
-         * to the generic special-form path below — is what keeps `return`
-         * working inside a loop: it reaches the sf_return case and unwinds
-         * the lambda, instead of degrading to the tree walker's identity
-         * `return` (issue 588). */
-        if (sym_id == sf_while && n >= 2) {
-            int32_t top = c->code_len;
-            compile_expr(c, elems[1]);
-            /* Truthiness belongs to the materialized value, not to the
-             * non-NULL lazy handle containing it — same rule as sf_if. */
-            emit(c, OP_FORCE);
-            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
-            for (int64_t i = 2; i < n; i++) {
-                compile_expr(c, elems[i]);
-                emit(c, OP_POP);
-            }
-            emit_jump_back(c, top);
-            patch_jump(c, jmpf_pos);
-            int32_t idx = add_constant(c, RAY_NULL_OBJ);
-            emit_const(c, idx);
-            return;
-        }
-
-        /* (times n body...) — a counted loop, desugared onto the same
-         * backward branch `while` uses.
-         *
-         * The count is evaluated ONCE into a hidden local slot, so the
-         * bound is fixed on entry however the body mutates its source.
-         * ray_times_norm_fn type-checks it and clamps a negative bound to
-         * zero, which is what lets the per-pass test be a bare truthiness
-         * check on the counter: 0 is falsy (is_truthy), everything else is
-         * truthy, so the loop needs no comparison call and a negative bound
-         * cannot run away.
-         *
-         * Both helpers are pushed as constant-pool objects rather than
-         * resolved by name, so the loop's own arithmetic is invisible to
-         * user code and immune to an override of `-` or `>`.  The counter's
-         * slot is likewise addressed by index, never by name, and its
-         * sym contains a space so no source token can collide with it —
-         * which is what keeps nested `times` counters apart.
-         *
-         * As with `while`, compiling the body inline is what keeps
-         * `return` unwinding the enclosing lambda from inside the loop. */
-        if (sym_id == sf_times && n >= 2) {
-            ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
-            ray_t *dec_fn  = ray_fn_unary("times dec",  RAY_FN_NONE, ray_times_dec_fn);
-            if (!norm_fn || RAY_IS_ERR(norm_fn) || !dec_fn || RAY_IS_ERR(dec_fn)) {
-                if (norm_fn && !RAY_IS_ERR(norm_fn)) ray_release(norm_fn);
-                if (dec_fn  && !RAY_IS_ERR(dec_fn))  ray_release(dec_fn);
-                c->error = true;
-                return;
-            }
-            int32_t norm_idx = add_constant(c, norm_fn);
-            int32_t dec_idx  = add_constant(c, dec_fn);
-            ray_release(norm_fn);
-            ray_release(dec_fn);
-            int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
-            if (cslot < 0 || c->error) { c->error = true; return; }
-
-            /* counter = normalize(<count>) */
-            emit_const(c, norm_idx);
-            compile_expr(c, elems[1]);
-            emit(c, OP_CALL1);
-            emit(c, OP_STOREENV);
-            emit(c, (uint8_t)cslot);
-
-            int32_t top = c->code_len;
-            emit(c, OP_LOADENV);
-            emit(c, (uint8_t)cslot);
-            int32_t jmpf_pos = emit_jump(c, OP_JMPF);
-            for (int64_t i = 2; i < n; i++) {
-                compile_expr(c, elems[i]);
-                emit(c, OP_POP);
-            }
-            /* counter = counter - 1 */
-            emit_const(c, dec_idx);
-            emit(c, OP_LOADENV);
-            emit(c, (uint8_t)cslot);
-            emit(c, OP_CALL1);
-            emit(c, OP_STOREENV);
-            emit(c, (uint8_t)cslot);
-            emit_jump_back(c, top);
-            patch_jump(c, jmpf_pos);
-            int32_t null_idx = add_constant(c, RAY_NULL_OBJ);
-            emit_const(c, null_idx);
-            return;
-        }
-
-        /* (fn [params] body...) — a closure template compiled once here
-         * and instantiated per evaluation (OP_MKCLOSURE); the dynamic
-         * eval below is the fallback when the literal cannot compile. */
-        if (sym_id == sf_fn && n >= 3) {
-            if (compile_fn_template(c, ast)) return;
-            if (c->error) return;
-            /* The literal captures the window, which binds the locals it
-             * mentions and nothing a caller of this frame had in scope. */
-            bool refs = ast_refs_locals(c, ast);
-            int32_t nsyms = refs ? c->n_locals : 0;
-            ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
-            if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
-            syms->type = RAY_I64;
-            syms->len = nsyms;
-            int64_t *ids = (int64_t*)ray_data(syms);
-            for (int32_t i = 0; i < nsyms; i++)
-                ids[i] = c->locals[i].sym_id;
-            int32_t syms_idx = add_constant(c, syms);
-            ray_release(syms);
-            if (c->error) return;
-            emit_const(c, syms_idx);
-            emit(c, OP_SCOPE_EVAL);
-            int32_t idx = add_constant(c, ast);
-            emit_const(c, idx);
-            emit(c, OP_CALLD);
-            emit(c, 0);
-            emit_const(c, syms_idx);
-            emit(c, OP_SCOPE_END);
-            return;
-        }
-
-        /* (try body handler) — compile to OP_TRAP/OP_TRAP_END */
-        if (sym_id == sf_try && n == 3) {
-            /* Reserve a hidden local for err_val */
-            int32_t err_slot = add_local(c, -1);
-            if (err_slot < 0) { c->error = true; return; }
-
-            int32_t trap_pos = emit_jump(c, OP_TRAP);
-            c->trap_depth++;
-            compile_expr(c, elems[1]);       /* body */
-            c->trap_depth--;
-            emit(c, OP_TRAP_END);
-            int32_t jmp_pos = emit_jump(c, OP_JMP);
-            patch_jump(c, trap_pos);         /* handler starts here */
-            /* err_val is on stack (pushed by vm_error_cleanup).
-             * Stash it, compile handler fn, reload err_val, call. */
-            emit(c, OP_STOREENV);
-            emit(c, (uint8_t)err_slot);
-            compile_expr(c, elems[2]);       /* handler (fn or fallback value) */
-            emit(c, OP_LOADENV);
-            emit(c, (uint8_t)err_slot);
-            emit(c, OP_TRYH);                /* callable → call(err); else value */
-            patch_jump(c, jmp_pos);          /* end */
-            return;
-        }
-
-        /* (return) | (return x) — early exit from enclosing compiled
-         * lambda. (return) pushes RAY_NULL_OBJ explicitly because
-         * OP_RET takes top-of-stack as the result; if (return) sits
-         * inside an outer expression that has already pushed values
-         * (e.g. (+ 1 (return))), relying on OP_RET's stack-empty
-         * fallback would return a stale value. */
-        if (sym_id == sf_return && (n == 1 || n == 2)) {
-            if (n == 2) {
-                compile_expr(c, elems[1]);
-            } else {
-                int32_t idx = add_constant(c, RAY_NULL_OBJ);
-                emit_const(c, idx);
-            }
-            for (int32_t i = 0; i < c->trap_depth; i++)
-                emit(c, OP_TRAP_END);
-            emit(c, OP_RET);
-            return;
-        }
-    }
-
-    /* Self-recursive call: emit OP_CALLS (lean frame reuse, no fn object) */
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
-        head->i64 == sf_self) {
-        int64_t argc = n - 1;
-        if (argc > 64) { c->error = true; return; }
-        for (int64_t i = 1; i < n; i++)
-            compile_expr(c, elems[i]);
-        emit(c, OP_CALLS);
-        emit(c, (uint8_t)argc);
+/* Lower (if c1 r1 c2 r2 ... else?) — args are the forms after `if`, nargs
+ * >= 2.  Each condition jumps past its result when false; the result
+ * jumps to the end of the chain.  Recursing per pair keeps every end jump
+ * local to its own frame.  No fallback: the chain yields 0, matching
+ * ray_cond_fn. */
+static void compile_if_chain(compiler_t *c, ray_t **args, int64_t nargs) {
+    if (nargs == 1) { compile_expr(c, args[0]); return; }
+    if (nargs == 0) {
+        ray_t *zero = ray_alloc(0);
+        zero->type = -RAY_I64;
+        zero->i64 = 0;
+        int32_t idx = add_constant(c, zero);
+        ray_release(zero);
+        emit_const(c, idx);
         return;
     }
+    compile_expr(c, args[0]);
+    /* Match ray_cond_fn: truthiness belongs to the materialized value,
+     * not to the non-NULL lazy handle that happens to contain it. */
+    emit(c, OP_FORCE);
+    int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+    compile_expr(c, args[1]);
+    int32_t jmp_pos = emit_jump(c, OP_JMP);
+    patch_jump(c, jmpf_pos);
+    compile_if_chain(c, args + 2, nargs - 2);
+    patch_jump(c, jmp_pos);
+}
 
-    /* Look up head at compile time to determine call type */
-    ray_t *fn = NULL;
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
-        fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get_compiled(head->i64);
-        if (c->deps && !c->dynamic_globals) {
-            /* Only a builtin shapes the code (baked, a special form, the
-             * call opcode); any other value is called through OP_CALLF. */
-            bool builtin = fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
-            int64_t pair[2] = { head->i64, builtin ? (int64_t)(uintptr_t)fn : 0 };
-            for (int k = 0; k < 2 && !c->error; k++) {
-                c->deps = ray_vec_append(c->deps, &pair[k]);
-                if (!c->deps || RAY_IS_ERR(c->deps)) { c->deps = NULL; c->error = true; }
-            }
-            if (c->error) return;
-        }
-    }
-
-    /* Unrecognized special form: dynamic eval on the entire form.  The
-     * special form re-evaluates its argument ASTs via the tree walker,
-     * which resolves names through scope frames + globals and cannot
-     * see this frame's local slots — so materialize the locals known
-     * at this point (plus self) into a scope frame around the eval,
-     * and sync any let-updates back into the slots afterwards. */
-    if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) {
-        /* The window binds the locals the form mentions (none in the
-         * common globals-only case) and marks where the text's scope
-         * ends: a function the text calls, or a window of whoever called
-         * this frame, sees none of them (OP_SCOPE_EVAL). */
-        bool refs = ast_refs_locals(c, ast);
-        int32_t nsyms = refs ? c->n_locals : 0;
-        ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
-        if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
-        syms->type = RAY_I64;
-        syms->len  = nsyms;
-        int64_t *ids = (int64_t*)ray_data(syms);
-        for (int32_t i = 0; i < nsyms; i++)
-            ids[i] = c->locals[i].sym_id;   /* slot i <-> ids[i] */
-        int32_t syms_idx = add_constant(c, syms);
-        ray_release(syms);
-        if (c->error) return;
-
-        emit_const(c, syms_idx);
-        emit(c, OP_SCOPE_EVAL);
-        int32_t idx = add_constant(c, ast);
-        emit_const(c, idx);
-        emit(c, OP_CALLD);
-        emit(c, 0);
-        emit_const(c, syms_idx);
-        emit(c, OP_SCOPE_END);
-        return;
-    }
-
-    /* `eval` and `resolve` read names from text at run time: the tree
-     * walker that serves them resolves through the scope frames, so the
-     * call runs inside a window that binds this frame's locals, captures
-     * included, the way a dynamic special form does. */
-    int32_t dyn_syms_idx = -1;
-    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
-        (head->i64 == sf_eval || head->i64 == sf_resolve)) {
-        /* With no locals too: the window still marks where the text's
-         * scope ends, so a caller's window below it stays hidden. */
-        ray_t *syms = ray_alloc((size_t)(c->n_locals > 0 ? c->n_locals : 1) * sizeof(int64_t));
-        if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
-        syms->type = RAY_I64;
-        syms->len  = c->n_locals;
-        int64_t *ids = (int64_t*)ray_data(syms);
-        for (int32_t i = 0; i < c->n_locals; i++) ids[i] = c->locals[i].sym_id;
-        dyn_syms_idx = add_constant(c, syms);
-        ray_release(syms);
-        if (c->error) return;
-    }
-
-    /* General function call: compile head, args, then dispatch.
-     * If head resolved to a builtin at compile time, emit LOADCONST
-     * instead of RESOLVE to skip the runtime hash lookup; a closure body
-     * resolves at call time instead (dynamic_globals). */
-    bool baked = fn && !c->dynamic_globals &&
-                 (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
-    if (baked) {
-        int32_t idx = add_constant(c, fn);
-        emit_const(c, idx);
+/* (set name value) — bind in the global env.  Compile the value
+ * expression (so parameter/local slot references resolve in the
+ * current frame), then emit OP_STOREGLOBAL to bind the result by
+ * name.  The value is left on the stack as the form's result.
+ *
+ * This previously emitted OP_CALLD on the whole form, which
+ * tree-walked the value against the global env and so could not
+ * see a compiled lambda's slot-bound parameters: `(fn [a] (set b a))`
+ * raised `name: 'a' undefined`.  A non-symbol name aborts bytecode
+ * emission and falls back to the interpreter, which raises the
+ * proper `type` error via ray_set_fn. */
+static void compile_sf_set(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    ray_t *name_obj = elems[1];
+    if (name_obj->type != -RAY_SYM) { c->error = true; return; }
+    compile_expr(c, elems[2]);
+    /* Match ray_set_fn: globals must never retain a single-use lazy
+     * DAG handle.  Materializing one alias consumes its graph and
+     * would leave every other global read pointing at a spent handle. */
+    emit(c, OP_FORCE);
+    int32_t idx = add_constant(c, name_obj);
+    if (idx < 256) {
+        emit(c, OP_STOREGLOBAL);
+        emit(c, (uint8_t)idx);
     } else {
-        compile_expr(c, head);
+        emit(c, OP_STOREGLOBAL_W);
+        emit(c, (uint8_t)(idx >> 8));
+        emit(c, (uint8_t)(idx & 0xFF));
     }
-    int64_t argc = n - 1;
-    if (argc > 64) { c->error = true; return; }
-    for (int64_t i = 1; i < n; i++)
+}
+
+/* (let name value) — compile value, store in local slot.
+ * Reserved names (`.sys.*`, `.os.*`, `.csv.*`, `.ipc.*`) are
+ * refused here so a compiled lambda can't shadow a builtin
+ * through its local-slot table — the same guard
+ * ray_env_set_local enforces on the tree-walking path.
+ * Setting c->error aborts bytecode emission; call_lambda
+ * then falls back to the tree-walking interpreter which
+ * raises the proper `reserve` error via ray_let_fn.
+ * The five `.ipc.on.*` connection-hook names are exempt —
+ * they're user-settable, so a `let .ipc.on.open ...` in a
+ * compiled body must emit the same OP_STOREENV as any other
+ * local binding.  Without this, the bytecode path would
+ * abort and silently fall back to the interpreter on every
+ * such write. */
+static void compile_sf_let(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    ray_t *name_obj = elems[1];
+    if (name_obj->type != -RAY_SYM ||
+        (ray_sym_is_reserved(name_obj->i64) &&
+         !ray_sym_is_ipc_hook(name_obj->i64))) {
+        c->error = true;
+        return;
+    }
+    compile_expr(c, elems[2]);
+    /* Materialize a lazy value before binding — the interpreter's
+     * ray_let_fn does the same.  A lazy handle is single-use
+     * (materialization consumes its deferred graph), so a local
+     * that aliased one would break on its SECOND read (e.g.
+     * `(let v (first xs)) (if (> v 0) v 0)`: the compare consumes
+     * the lazy, the branch then reloads a dead handle). */
+    emit(c, OP_FORCE);
+    emit(c, OP_DUP);
+    int32_t slot = find_local(c, name_obj->i64);
+    if (slot < 0) slot = add_local(c, name_obj->i64);
+    if (slot < 0) { c->error = true; return; }
+    emit(c, OP_STOREENV);
+    emit(c, (uint8_t)slot);
+}
+
+/* (do expr1 expr2 ...) */
+static void compile_sf_do(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    for (int64_t i = 1; i < n; i++) {
+        if (i > 1) emit(c, OP_POP);
         compile_expr(c, elems[i]);
-
-    /* Record call-site span so errors point to the call expression, not the last arg */
-    EMIT_DBG(c, ast);
-
-    /* The window opens after the arguments, so their code runs in this
-     * frame (a `let` or a `return` there is the frame's), and closes right
-     * after the call. */
-    if (dyn_syms_idx >= 0) {
-        emit_const(c, dyn_syms_idx);
-        emit(c, OP_SCOPE_EVAL);
     }
+}
 
+/* (while cond body...) — the only backward branch the compiler
+ * emits.  Body values are discarded (OP_POP each), and the form
+ * yields null however many times it iterated, matching
+ * ray_while_fn.  No scope is pushed: `let` in the body writes this
+ * frame's local slot, so loop-carried state survives the pass
+ * exactly as it does on the tree-walking path.
+ *
+ * Compiling the body inline — rather than letting this fall through
+ * to the generic special-form path below — is what keeps `return`
+ * working inside a loop: it reaches the sf_return case and unwinds
+ * the lambda, instead of degrading to the tree walker's identity
+ * `return` (issue 588). */
+static void compile_sf_while(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    int32_t top = c->code_len;
+    compile_expr(c, elems[1]);
+    /* Truthiness belongs to the materialized value, not to the
+     * non-NULL lazy handle containing it — same rule as sf_if. */
+    emit(c, OP_FORCE);
+    int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+    for (int64_t i = 2; i < n; i++) {
+        compile_expr(c, elems[i]);
+        emit(c, OP_POP);
+    }
+    emit_jump_back(c, top);
+    patch_jump(c, jmpf_pos);
+    int32_t idx = add_constant(c, RAY_NULL_OBJ);
+    emit_const(c, idx);
+}
+
+/* (times n body...) — a counted loop, desugared onto the same
+ * backward branch `while` uses.
+ *
+ * The count is evaluated ONCE into a hidden local slot, so the
+ * bound is fixed on entry however the body mutates its source.
+ * ray_times_norm_fn type-checks it and clamps a negative bound to
+ * zero, which is what lets the per-pass test be a bare truthiness
+ * check on the counter: 0 is falsy (is_truthy), everything else is
+ * truthy, so the loop needs no comparison call and a negative bound
+ * cannot run away.
+ *
+ * Both helpers are pushed as constant-pool objects rather than
+ * resolved by name, so the loop's own arithmetic is invisible to
+ * user code and immune to an override of `-` or `>`.  The counter's
+ * slot is likewise addressed by index, never by name, and its
+ * sym contains a space so no source token can collide with it —
+ * which is what keeps nested `times` counters apart.
+ *
+ * As with `while`, compiling the body inline is what keeps
+ * `return` unwinding the enclosing lambda from inside the loop.
+ *
+ * The indexed form, (times [i n] body...), keeps the normalized
+ * bound in a second hidden slot and stores bound - counter into
+ * i's slot at the top of each pass, so the index comes from the
+ * loop, never from i, and a body that rebinds i cannot steer it. */
+static void compile_sf_times(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    int64_t iname = -1;
+    ray_t *cexpr = elems[1];
+    int32_t islot = -1, lslot = -1, idx_idx = -1;
+    if (ray_times_binding(elems[1], &iname, &cexpr)) {
+        if (ray_sym_is_reserved(iname) && !ray_sym_is_ipc_hook(iname)) {
+            c->error = true;
+            return;
+        }
+        ray_t *idx_fn = ray_fn_binary("times idx", RAY_FN_NONE, ray_times_idx_fn);
+        if (!idx_fn || RAY_IS_ERR(idx_fn)) { c->error = true; return; }
+        idx_idx = add_constant(c, idx_fn);
+        ray_release(idx_fn);
+        islot = find_local(c, iname);
+        if (islot < 0) islot = add_local(c, iname);
+        lslot = add_local(c, ray_sym_intern("times lim", 9));
+        if (islot < 0 || lslot < 0 || c->error) { c->error = true; return; }
+    }
+    ray_t *norm_fn = ray_fn_unary("times norm", RAY_FN_NONE, ray_times_norm_fn);
+    ray_t *dec_fn  = ray_fn_unary("times dec",  RAY_FN_NONE, ray_times_dec_fn);
+    if (!norm_fn || RAY_IS_ERR(norm_fn) || !dec_fn || RAY_IS_ERR(dec_fn)) {
+        if (norm_fn && !RAY_IS_ERR(norm_fn)) ray_release(norm_fn);
+        if (dec_fn  && !RAY_IS_ERR(dec_fn))  ray_release(dec_fn);
+        c->error = true;
+        return;
+    }
+    int32_t norm_idx = add_constant(c, norm_fn);
+    int32_t dec_idx  = add_constant(c, dec_fn);
+    ray_release(norm_fn);
+    ray_release(dec_fn);
+    int32_t cslot = add_local(c, ray_sym_intern("times ctr", 9));
+    if (cslot < 0 || c->error) { c->error = true; return; }
+
+    /* counter = normalize(<count>), and bound = counter if indexed */
+    emit_const(c, norm_idx);
+    compile_expr(c, cexpr);
+    emit(c, OP_CALL1);
+    if (lslot >= 0) {
+        emit(c, OP_DUP);
+        emit(c, OP_STOREENV);
+        emit(c, (uint8_t)lslot);
+    }
+    emit(c, OP_STOREENV);
+    emit(c, (uint8_t)cslot);
+
+    int32_t top = c->code_len;
+    emit(c, OP_LOADENV);
+    emit(c, (uint8_t)cslot);
+    int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+    /* i = bound - counter */
+    if (islot >= 0) {
+        emit_const(c, idx_idx);
+        emit(c, OP_LOADENV);
+        emit(c, (uint8_t)lslot);
+        emit(c, OP_LOADENV);
+        emit(c, (uint8_t)cslot);
+        emit(c, OP_CALL2);
+        emit(c, OP_STOREENV);
+        emit(c, (uint8_t)islot);
+    }
+    for (int64_t i = 2; i < n; i++) {
+        compile_expr(c, elems[i]);
+        emit(c, OP_POP);
+    }
+    /* counter = counter - 1 */
+    emit_const(c, dec_idx);
+    emit(c, OP_LOADENV);
+    emit(c, (uint8_t)cslot);
+    emit(c, OP_CALL1);
+    emit(c, OP_STOREENV);
+    emit(c, (uint8_t)cslot);
+    emit_jump_back(c, top);
+    patch_jump(c, jmpf_pos);
+    int32_t null_idx = add_constant(c, RAY_NULL_OBJ);
+    emit_const(c, null_idx);
+}
+
+/* (fn [params] body...) — a closure template compiled once here
+ * and instantiated per evaluation (OP_MKCLOSURE); the dynamic
+ * eval below is the fallback when the literal cannot compile. */
+static void compile_sf_fn(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    if (compile_fn_template(c, ast)) return;
+    if (c->error) return;
+    /* The literal captures the window, which binds the locals it
+     * mentions and nothing a caller of this frame had in scope. */
+    bool refs = ast_refs_locals(c, ast);
+    int32_t nsyms = refs ? c->n_locals : 0;
+    ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
+    if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+    syms->type = RAY_I64;
+    syms->len = nsyms;
+    int64_t *ids = (int64_t*)ray_data(syms);
+    for (int32_t i = 0; i < nsyms; i++)
+        ids[i] = c->locals[i].sym_id;
+    int32_t syms_idx = add_constant(c, syms);
+    ray_release(syms);
+    if (c->error) return;
+    emit_const(c, syms_idx);
+    emit(c, OP_SCOPE_EVAL);
+    int32_t idx = add_constant(c, ast);
+    emit_const(c, idx);
+    emit(c, OP_CALLD);
+    emit(c, 0);
+    emit_const(c, syms_idx);
+    emit(c, OP_SCOPE_END);
+}
+
+/* (try body handler) — compile to OP_TRAP/OP_TRAP_END */
+static void compile_sf_try(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    /* Reserve a hidden local for err_val */
+    int32_t err_slot = add_local(c, -1);
+    if (err_slot < 0) { c->error = true; return; }
+
+    int32_t trap_pos = emit_jump(c, OP_TRAP);
+    c->trap_depth++;
+    compile_expr(c, elems[1]);       /* body */
+    c->trap_depth--;
+    emit(c, OP_TRAP_END);
+    int32_t jmp_pos = emit_jump(c, OP_JMP);
+    patch_jump(c, trap_pos);         /* handler starts here */
+    /* err_val is on stack (pushed by vm_error_cleanup).
+     * Stash it, compile handler fn, reload err_val, call. */
+    emit(c, OP_STOREENV);
+    emit(c, (uint8_t)err_slot);
+    compile_expr(c, elems[2]);       /* handler (fn or fallback value) */
+    emit(c, OP_LOADENV);
+    emit(c, (uint8_t)err_slot);
+    emit(c, OP_TRYH);                /* callable → call(err); else value */
+    patch_jump(c, jmp_pos);          /* end */
+}
+
+/* (return) | (return x) — early exit from enclosing compiled
+ * lambda. (return) pushes RAY_NULL_OBJ explicitly because
+ * OP_RET takes top-of-stack as the result; if (return) sits
+ * inside an outer expression that has already pushed values
+ * (e.g. (+ 1 (return))), relying on OP_RET's stack-empty
+ * fallback would return a stale value. */
+static void compile_sf_return(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    if (n == 2) {
+        compile_expr(c, elems[1]);
+    } else {
+        int32_t idx = add_constant(c, RAY_NULL_OBJ);
+        emit_const(c, idx);
+    }
+    for (int32_t i = 0; i < c->trap_depth; i++)
+        emit(c, OP_TRAP_END);
+    emit(c, OP_RET);
+}
+
+/* Unrecognized special form: dynamic eval on the entire form.  The
+ * special form re-evaluates its argument ASTs via the tree walker,
+ * which resolves names through scope frames + globals and cannot
+ * see this frame's local slots — so materialize the locals known
+ * at this point (plus self) into a scope frame around the eval,
+ * and sync any let-updates back into the slots afterwards. */
+static void compile_dyn_form(compiler_t *c, ray_t *ast) {
+    /* The window binds the locals the form mentions (none in the
+     * common globals-only case) and marks where the text's scope
+     * ends: a function the text calls, or a window of whoever called
+     * this frame, sees none of them (OP_SCOPE_EVAL). */
+    bool refs = ast_refs_locals(c, ast);
+    int32_t nsyms = refs ? c->n_locals : 0;
+    ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
+    if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+    syms->type = RAY_I64;
+    syms->len  = nsyms;
+    int64_t *ids = (int64_t*)ray_data(syms);
+    for (int32_t i = 0; i < nsyms; i++)
+        ids[i] = c->locals[i].sym_id;   /* slot i <-> ids[i] */
+    int32_t syms_idx = add_constant(c, syms);
+    ray_release(syms);
+    if (c->error) return;
+
+    emit_const(c, syms_idx);
+    emit(c, OP_SCOPE_EVAL);
+    int32_t idx = add_constant(c, ast);
+    emit_const(c, idx);
+    emit(c, OP_CALLD);
+    emit(c, 0);
+    emit_const(c, syms_idx);
+    emit(c, OP_SCOPE_END);
+}
+
+/* compile_call's callee lookup: the value head names now, recorded in the
+ * dependency list when the code is cached against it. */
+static ray_t *call_head_fn(compiler_t *c, ray_t *head) {
+    ray_t *fn = c->dynamic_globals ? ray_env_get_global(head->i64) : ray_env_get_compiled(head->i64);
+    if (c->deps && !c->dynamic_globals) {
+        /* Only a builtin shapes the code (baked, a special form, the
+         * call opcode); any other value is called through OP_CALLF. */
+        bool builtin = fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+        int64_t pair[2] = { head->i64, builtin ? (int64_t)(uintptr_t)fn : 0 };
+        for (int k = 0; k < 2 && !c->error; k++) {
+            c->deps = ray_vec_append(c->deps, &pair[k]);
+            if (!c->deps || RAY_IS_ERR(c->deps)) { c->deps = NULL; c->error = true; }
+        }
+    }
+    return fn;
+}
+
+/* The window an `eval` or `resolve` call runs in: every local of this
+ * frame.  -1 with c->error set when it cannot be built. */
+static int32_t eval_window_syms(compiler_t *c) {
+    /* With no locals too: the window still marks where the text's
+     * scope ends, so a caller's window below it stays hidden. */
+    ray_t *syms = ray_alloc((size_t)(c->n_locals > 0 ? c->n_locals : 1) * sizeof(int64_t));
+    if (!syms || RAY_IS_ERR(syms)) { c->error = true; return -1; }
+    syms->type = RAY_I64;
+    syms->len  = c->n_locals;
+    int64_t *ids = (int64_t*)ray_data(syms);
+    for (int32_t i = 0; i < c->n_locals; i++) ids[i] = c->locals[i].sym_id;
+    int32_t idx = add_constant(c, syms);
+    ray_release(syms);
+    return c->error ? -1 : idx;
+}
+
+/* compile_call's call opcode, once the callee and the arguments are on
+ * the stack. */
+static void emit_call_op(compiler_t *c, ray_t *fn, bool baked, int64_t argc) {
     bool emitted = false;
     if (fn && !baked && c->dynamic_globals) {
         /* A closure body resolved the callee above (OP_RESOLVE); while
@@ -734,10 +702,120 @@ static void compile_list(compiler_t *c, ray_t *ast) {
         emit(c, OP_CALLF);
         emit(c, (uint8_t)argc);
     }
+}
+
+/* A function call: the arm of compile_list for everything that is not a
+ * special form it compiles inline. */
+static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
+                         ray_t *head, bool head_local) {
+    /* Self-recursive call: emit OP_CALLS (lean frame reuse, no fn object) */
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
+        head->i64 == sf_self) {
+        int64_t argc = n - 1;
+        if (argc > 64) { c->error = true; return; }
+        for (int64_t i = 1; i < n; i++)
+            compile_expr(c, elems[i]);
+        emit(c, OP_CALLS);
+        emit(c, (uint8_t)argc);
+        return;
+    }
+
+    /* Look up head at compile time to determine call type */
+    ray_t *fn = NULL;
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
+        fn = call_head_fn(c, head);
+        if (c->error) return;
+    }
+
+    /* An unrecognized special form: dynamic eval on the whole form. */
+    if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) { compile_dyn_form(c, ast); return; }
+
+    /* `eval` and `resolve` read names from text at run time: the tree
+     * walker that serves them resolves through the scope frames, so the
+     * call runs inside a window that binds this frame's locals, captures
+     * included, the way a dynamic special form does. */
+    int32_t dyn_syms_idx = -1;
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local &&
+        (head->i64 == sf_eval || head->i64 == sf_resolve)) {
+        dyn_syms_idx = eval_window_syms(c);
+        if (c->error) return;
+    }
+
+    /* General function call: compile head, args, then dispatch.
+     * If head resolved to a builtin at compile time, emit LOADCONST
+     * instead of RESOLVE to skip the runtime hash lookup; a closure body
+     * resolves at call time instead (dynamic_globals). */
+    bool baked = fn && !c->dynamic_globals &&
+                 (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+    if (baked) {
+        int32_t idx = add_constant(c, fn);
+        emit_const(c, idx);
+    } else {
+        compile_expr(c, head);
+    }
+    int64_t argc = n - 1;
+    if (argc > 64) { c->error = true; return; }
+    for (int64_t i = 1; i < n; i++)
+        compile_expr(c, elems[i]);
+
+    /* Record call-site span so errors point to the call expression, not the last arg */
+    EMIT_DBG(c, ast);
+
+    /* The window opens after the arguments, so their code runs in this
+     * frame (a `let` or a `return` there is the frame's), and closes right
+     * after the call. */
+    if (dyn_syms_idx >= 0) {
+        emit_const(c, dyn_syms_idx);
+        emit(c, OP_SCOPE_EVAL);
+    }
+
+    emit_call_op(c, fn, baked, argc);
     if (dyn_syms_idx >= 0) {
         emit_const(c, dyn_syms_idx);
         emit(c, OP_SCOPE_END);
     }
+}
+
+/* ── Compile a list (special form or function call) ── */
+/* compile_list dispatches each special form to a function of its own
+ * rather than compiling them all in one body.  The arms recurse into
+ * compile_expr, and an unoptimized build gives a function one frame for
+ * every local of every arm: a single compile_list took 4.7 KB per level
+ * under ASan, so an if chain nested within the 2048-level depth guard
+ * overflowed an 8 MB stack.  Split, each nesting level carries only the
+ * frame of the arm it passes through. */
+static void compile_list(compiler_t *c, ray_t *ast) {
+    if (c->error) return;
+    EMIT_DBG(c, ast);
+    int64_t n = ray_len(ast);
+    if (n == 0) { c->error = true; return; }
+    ray_t **elems = (ray_t **)ray_data(ast);
+    ray_t *head = elems[0];
+
+    init_sf_syms();
+
+    /* A local (parameter, let or capture) named like a special form or a
+     * builtin is the callee, as it is on the tree walker, where the name
+     * resolves through the scope frames first. */
+    bool head_local = head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+                      find_local(c, head->i64) >= 0;
+
+    /* Check for special forms by name (name ref = unflagged default) */
+    if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
+        int64_t sym_id = head->i64;
+
+        if (sym_id == sf_set && n == 3) { compile_sf_set(c, ast, elems, n); return; }
+        if (sym_id == sf_let && n == 3) { compile_sf_let(c, ast, elems, n); return; }
+        if (sym_id == sf_if && n >= 3) { compile_if_chain(c, elems + 1, n - 1); return; }
+        if (sym_id == sf_do && n >= 2) { compile_sf_do(c, ast, elems, n); return; }
+        if (sym_id == sf_while && n >= 2) { compile_sf_while(c, ast, elems, n); return; }
+        if (sym_id == sf_times && n >= 2) { compile_sf_times(c, ast, elems, n); return; }
+        if (sym_id == sf_fn && n >= 3) { compile_sf_fn(c, ast, elems, n); return; }
+        if (sym_id == sf_try && n == 3) { compile_sf_try(c, ast, elems, n); return; }
+        if (sym_id == sf_return && (n == 1 || n == 2)) { compile_sf_return(c, ast, elems, n); return; }
+    }
+
+    compile_call(c, ast, elems, n, head, head_local);
 }
 
 /* ── Compile expression ── */
@@ -940,7 +1018,7 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
         return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, nodes) &&
-               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);   /* not-a-table */
     }
     return true;
 }

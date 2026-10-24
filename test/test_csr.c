@@ -27,6 +27,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/csr.h"
+#include "core/pool.h"
 #include "store/col.h"
 #include "ops/fvec.h"
 #include <string.h>
@@ -1047,7 +1048,7 @@ static test_result_t test_csr_save_load(void) {
     TEST_ASSERT_NOT_NULL(rel);
 
     /* Save */
-    const char* dir = "/tmp/test_csr_save";
+    const char* dir = ray_test_tmp("/tmp/test_csr_save");
     ray_err_t err = ray_rel_save(rel, dir);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -1629,7 +1630,7 @@ static test_result_t test_save_load_rev(void) {
     ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, true);
     TEST_ASSERT_NOT_NULL(rel);
 
-    const char* dir = "/tmp/test_csr_rev";
+    const char* dir = ray_test_tmp("/tmp/test_csr_rev");
     ray_err_t err = ray_rel_save(rel, dir);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -2915,7 +2916,7 @@ static test_result_t test_rel_save_load_errors(void) {
     TEST_ASSERT_NOT_NULL(rel);
 
     /* NULL rel → RAY_ERR_IO */
-    TEST_ASSERT_EQ_I(ray_rel_save(NULL, "/tmp/test_csr_err"), RAY_ERR_IO);
+    TEST_ASSERT_EQ_I(ray_rel_save(NULL, ray_test_tmp("/tmp/test_csr_err")), RAY_ERR_IO);
     /* NULL dir → RAY_ERR_IO */
     TEST_ASSERT_EQ_I(ray_rel_save(rel, NULL), RAY_ERR_IO);
 
@@ -2924,9 +2925,9 @@ static test_result_t test_rel_save_load_errors(void) {
 
     /* ray_rel_load on NULL or non-existent dir → NULL */
     TEST_ASSERT_EQ_PTR(ray_rel_load(NULL), NULL);
-    TEST_ASSERT_EQ_PTR(ray_rel_load("/tmp/this_csr_dir_must_not_exist_xyz"), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_load(ray_test_tmp("/tmp/this_csr_dir_must_not_exist_xyz")), NULL);
     TEST_ASSERT_EQ_PTR(ray_rel_mmap(NULL), NULL);
-    TEST_ASSERT_EQ_PTR(ray_rel_mmap("/tmp/this_csr_dir_must_not_exist_xyz"), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap(ray_test_tmp("/tmp/this_csr_dir_must_not_exist_xyz")), NULL);
 
     ray_rel_free(rel);
     ray_release(edges);
@@ -2947,7 +2948,7 @@ static test_result_t test_rel_save_mmap_reuse(void) {
     ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, true);
     TEST_ASSERT_NOT_NULL(rel);
 
-    const char* dir = "/tmp/test_csr_mmap_reuse";
+    const char* dir = ray_test_tmp("/tmp/test_csr_mmap_reuse");
     /* First save creates dir */
     TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
     /* Second save into existing dir hits the EEXIST branch (mkdir returns -1, errno=EEXIST) */
@@ -3215,7 +3216,7 @@ static test_result_t test_load_nonmonotonic_offsets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_mono";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_mono");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* fwd has 4 nodes, 6 edges.  Forge offsets[5] = {0,5,2,?,6} so the last
@@ -3241,7 +3242,7 @@ static test_result_t test_load_negative_offset(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_neg";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_neg");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* offsets[1] = -1 with last entry still == n_edges (6). */
@@ -3264,7 +3265,7 @@ static test_result_t test_load_offset_count_mismatch(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_count";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_count");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* targets has 6 edges; make offsets[4] = 5 (monotonic, but != 6). */
@@ -3288,7 +3289,7 @@ static test_result_t test_load_empty_offsets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_empty_off";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_empty_off");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     csr_overwrite_i64(dir, "fwd_offsets", NULL, 0);  /* len 0 */
@@ -3310,7 +3311,7 @@ static test_result_t test_load_rev_corrupt_frees_fwd(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_corrupt_rev";
+    const char* dir = ray_test_tmp("/tmp/test_csr_corrupt_rev");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* Corrupt only rev_offsets: fwd loads fine, rev load must fail and the
@@ -3334,7 +3335,7 @@ static test_result_t test_load_missing_rowmap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_rowmap";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_rowmap");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* Delete both rowmap files — they are optional on load. */
@@ -3367,7 +3368,7 @@ static test_result_t test_load_missing_meta(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_meta";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_meta");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3397,7 +3398,7 @@ static test_result_t test_load_short_meta(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_short_meta";
+    const char* dir = ray_test_tmp("/tmp/test_csr_short_meta");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     /* Overwrite meta with a 2-element vector (need >= 5 to apply). */
@@ -3425,7 +3426,7 @@ static test_result_t test_mmap_missing_rowmap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_mmap_no_rowmap";
+    const char* dir = ray_test_tmp("/tmp/test_csr_mmap_no_rowmap");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3452,7 +3453,7 @@ static test_result_t test_load_missing_targets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_targets";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_targets");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3475,7 +3476,7 @@ static test_result_t test_load_missing_offsets(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const char* dir = "/tmp/test_csr_no_offsets";
+    const char* dir = ray_test_tmp("/tmp/test_csr_no_offsets");
     TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
 
     char path[1024];
@@ -3524,7 +3525,7 @@ static test_result_t test_multi_edge_roundtrip(void) {
     TEST_ASSERT_EQ_I(nb[2], 1);
     TEST_ASSERT_EQ_I(nb[3], 2);
 
-    const char* dir = "/tmp/test_csr_multi_edge";
+    const char* dir = ray_test_tmp("/tmp/test_csr_multi_edge");
     TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
 
     ray_rel_t* loaded = ray_rel_load(dir);
@@ -3568,7 +3569,7 @@ static test_result_t test_single_edge_roundtrip(void) {
     TEST_ASSERT_EQ_I(ray_csr_degree(&rel->fwd, 1), 0);
     TEST_ASSERT_EQ_I(ray_csr_degree(&rel->rev, 1), 1);
 
-    const char* dir = "/tmp/test_csr_single_edge";
+    const char* dir = ray_test_tmp("/tmp/test_csr_single_edge");
     TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
     ray_rel_t* loaded = ray_rel_load(dir);
     TEST_ASSERT_NOT_NULL(loaded);
@@ -3665,8 +3666,265 @@ static test_result_t test_csr_tiebreak_determinism(void) {
  * Suite definition
  * -------------------------------------------------------------------------- */
 
+
+/* The parallel two-level build must produce the same three arrays as the
+ * serial counting sort, byte for byte.  Build one graph both ways by moving
+ * the size threshold: 0 forces the parallel path (the harness runs with
+ * RAYFORCE_CORES=2, so the pool has a worker), INT64_MAX forces serial.
+ * The graph spans several key buckets, has a hub past the insertion-sort
+ * cut, parallel edges, out-of-range keys on both sides and, in one
+ * variant, a value past int32 so the int64 scratch branch runs. */
+static test_result_t csr_par_vs_serial(bool wide_value) {
+    enum { N_NODES = 3000, M = 20000 };
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
+    int64_t* s = ray_alloc_raw((size_t)(M + 6) * sizeof(int64_t));
+    int64_t* d = ray_alloc_raw((size_t)(M + 6) * sizeof(int64_t));
+    TEST_ASSERT(s && d, "scratch");
+    int64_t n = 0;
+    for (int64_t i = 0; i < M; i++) {
+        s[n] = (i * 7919) % N_NODES;
+        d[n] = (i * 104729) % N_NODES;
+        if (i % 97 == 0) s[n] = 5;          /* a hub */
+        n++;
+    }
+    s[n] = -1;      d[n] = 5;       n++;
+    s[n] = N_NODES; d[n] = 5;       n++;
+    s[n] = 2;       d[n] = -3;      n++;
+    s[n] = 2;       d[n] = N_NODES; n++;
+    s[n] = 7;       d[n] = 7;       n++;    /* self loop */
+    s[n] = 7;       d[n] = wide_value ? (INT64_C(1) << 40) : 9; n++;
+
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, n);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, n);
+    ray_free_raw(s); ray_free_raw(d);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = INT64_MAX;
+    ray_rel_t* a = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_csr_par_min_edges = 0;
+    ray_rel_t* b = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_csr_par_min_edges = saved;
+    ray_release(tbl);
+    TEST_ASSERT(a && b, "both builds succeed");
+
+    ray_csr_t* pa[2] = { &a->fwd, &a->rev };
+    ray_csr_t* pb[2] = { &b->fwd, &b->rev };
+    for (int k = 0; k < 2; k++) {
+        TEST_ASSERT(pa[k]->n_nodes == pb[k]->n_nodes, "n_nodes");
+        TEST_ASSERT(pa[k]->n_edges == pb[k]->n_edges, "n_edges");
+        /* fwd drops the two bad-src edges; rev drops the two bad-dst ones
+         * plus the wide target when it is out of [0, N_NODES). */
+        int64_t expect = k == 0 ? M + 6 - 2 : M + 6 - 2 - (wide_value ? 1 : 0);
+        TEST_ASSERT(pa[k]->n_edges == expect, "out-of-range keys dropped per side");
+        TEST_ASSERT(pa[k]->offsets->len == pb[k]->offsets->len, "offsets len");
+        TEST_ASSERT(memcmp(ray_data(pa[k]->offsets), ray_data(pb[k]->offsets),
+                           (size_t)pa[k]->offsets->len * sizeof(int64_t)) == 0,
+                    "offsets identical");
+        TEST_ASSERT(memcmp(ray_data(pa[k]->targets), ray_data(pb[k]->targets),
+                           (size_t)pa[k]->n_edges * sizeof(int64_t)) == 0,
+                    "targets identical");
+        TEST_ASSERT(memcmp(ray_data(pa[k]->rowmap), ray_data(pb[k]->rowmap),
+                           (size_t)pa[k]->n_edges * sizeof(int64_t)) == 0,
+                    "rowmap identical");
+    }
+    /* The wide value survived in fwd (values are stored unchecked). */
+    int64_t cnt = 0;
+    int64_t* nb = ray_csr_neighbors(&b->fwd, 7, &cnt);
+    TEST_ASSERT(cnt >= 2, "node 7 has its two explicit edges");
+    bool seen = false;
+    for (int64_t i = 0; i < cnt; i++)
+        if (nb[i] == (wide_value ? (INT64_C(1) << 40) : 9)) seen = true;
+    TEST_ASSERT(seen, "node 7's explicit target is present");
+
+    ray_rel_free(a);
+    ray_rel_free(b);
+    PASS();
+}
+
+/* The key-less build (ray_rel_build: forward key = row index, reverse
+ * keyed by the FK with row indices as values) must match serial byte for
+ * byte too; ray_rel_from_edges never reaches that branch. */
+static test_result_t test_csr_parallel_fk_matches_serial(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    enum { N_TARGET = 2500, M = 30000 };
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
+    int64_t* f = ray_alloc_raw((size_t)M * sizeof(int64_t));
+    TEST_ASSERT(f, "scratch");
+    for (int64_t i = 0; i < M; i++) f[i] = (i * 7919) % N_TARGET;
+    f[11] = -1; f[12] = N_TARGET; f[13] = INT64_C(1) << 40;   /* dropped in rev */
+    for (int64_t i = 0; i < M; i += 101) f[i] = 3;              /* a hub */
+    ray_t* fv = ray_vec_from_raw(RAY_I64, f, M);
+    ray_free_raw(f);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("fk", 2), fv);
+    ray_release(fv);
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = INT64_MAX;
+    ray_rel_t* a = ray_rel_build(tbl, "fk", N_TARGET, true);
+    ray_csr_par_min_edges = 0;
+    ray_rel_t* b = ray_rel_build(tbl, "fk", N_TARGET, true);
+    ray_csr_par_min_edges = saved;
+    ray_release(tbl);
+    TEST_ASSERT(a && b, "both builds succeed");
+
+    for (int k = 0; k < 2; k++) {
+        const ray_csr_t* x = k == 0 ? &a->fwd : &a->rev;
+        const ray_csr_t* y = k == 0 ? &b->fwd : &b->rev;
+        TEST_ASSERT(x->n_nodes == y->n_nodes, "n_nodes equal");
+        TEST_ASSERT(x->n_edges == y->n_edges, "n_edges equal");
+        TEST_ASSERT(x->n_edges == (k == 0 ? M : M - 3), "edges kept per side");
+        TEST_ASSERT(x->offsets->len == y->offsets->len, "offsets len");
+        TEST_ASSERT(memcmp(ray_data(x->offsets), ray_data(y->offsets),
+                           (size_t)x->offsets->len * sizeof(int64_t)) == 0, "offsets identical");
+        TEST_ASSERT(memcmp(ray_data(x->targets), ray_data(y->targets),
+                           (size_t)x->n_edges * sizeof(int64_t)) == 0, "targets identical");
+        TEST_ASSERT(memcmp(ray_data(x->rowmap), ray_data(y->rowmap),
+                           (size_t)x->n_edges * sizeof(int64_t)) == 0, "rowmap identical");
+    }
+    ray_rel_free(a); ray_rel_free(b);
+    PASS();
+}
+
+/* A cancel during the parallel build must not hand back a CSR: skipped
+ * tasks never write their slots.  Arm the interrupt first so every pass
+ * is cut short, then check the build reports the cancel with nothing
+ * left in the relation. */
+static test_result_t test_csr_parallel_cancel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    enum { N_NODES = 3000, M = 20000 };
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
+    int64_t* s = ray_alloc_raw((size_t)M * sizeof(int64_t));
+    int64_t* d = ray_alloc_raw((size_t)M * sizeof(int64_t));
+    TEST_ASSERT(s && d, "scratch");
+    for (int64_t i = 0; i < M; i++) { s[i] = (i * 7919) % N_NODES; d[i] = (i * 104729) % N_NODES; }
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, M);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, M);
+    ray_free_raw(s); ray_free_raw(d);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+
+    int64_t saved = ray_csr_par_min_edges;
+    ray_csr_par_min_edges = 0;
+    ray_request_interrupt();
+    ray_rel_t* r = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_clear_interrupt();
+    ray_csr_par_min_edges = saved;
+    ray_release(tbl);
+
+    TEST_ASSERT(r == NULL, "a cancelled parallel build returns no relation");
+    PASS();
+}
+
+static test_result_t test_csr_parallel_matches_serial(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    test_result_t r = csr_par_vs_serial(false);
+    if (r.status != TEST_PASS) return r;
+    return csr_par_vs_serial(true);
+}
+
+/* A hub whose list is long enough to leave the insertion sort behind must
+ * come out in the same (target, row) order as a short list does, in both
+ * directions, with out-of-range keys dropped and their rows skipped. */
+static test_result_t test_csr_hub_order(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 200 edges out of node 0 to targets 0..49, each 4 times, interleaved
+     * so that neither targets nor rows arrive sorted; node 1 gets 3 edges;
+     * four edges fall outside [0, 60) on one side or the other. */
+    enum { HUB = 200, N_NODES = 60 };
+    int64_t s[HUB + 3 + 4], d[HUB + 3 + 4];
+    int64_t n = 0;
+    for (int64_t i = 0; i < HUB; i++) {
+        s[n] = 0;
+        d[n] = (i * 37) % 50;
+        n++;
+    }
+    s[n] = 1; d[n] = 7; n++;
+    s[n] = 1; d[n] = 3; n++;
+    s[n] = 1; d[n] = 7; n++;
+    s[n] = -1; d[n] = 5;  n++;    /* src out of range: dropped from fwd */
+    s[n] = 60; d[n] = 5;  n++;    /* src out of range: dropped from fwd */
+    s[n] = 2;  d[n] = -3; n++;    /* dst out of range: kept in fwd, dropped from rev */
+    s[n] = 2;  d[n] = 61; n++;
+
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, n);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, n);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(tbl, "src", "dst", N_NODES, N_NODES, true);
+    ray_release(tbl);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Forward: 200 + 3 + 2 kept (the two src=2 edges carry unchecked dsts). */
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, HUB + 3 + 2);
+    TEST_ASSERT_TRUE(rel->fwd.sorted);
+    int64_t* off = (int64_t*)ray_data(rel->fwd.offsets);
+    int64_t* tgt = (int64_t*)ray_data(rel->fwd.targets);
+    int64_t* row = (int64_t*)ray_data(rel->fwd.rowmap);
+    TEST_ASSERT_EQ_I(off[1] - off[0], HUB);
+    for (int64_t i = off[0] + 1; i < off[1]; i++) {
+        /* (target, row) strictly ascending: no two cells compare equal. */
+        TEST_ASSERT_TRUE(tgt[i - 1] < tgt[i] ||
+                         (tgt[i - 1] == tgt[i] && row[i - 1] < row[i]));
+    }
+    /* Every target 0..49 exactly four times, and each row maps back. */
+    for (int64_t i = off[0]; i < off[1]; i++) {
+        TEST_ASSERT_EQ_I(tgt[i], (row[i] * 37) % 50);
+        TEST_ASSERT_TRUE(row[i] >= 0 && row[i] < HUB);
+    }
+    /* Node 1: 3, 7(row 200), 7(row 202). */
+    TEST_ASSERT_EQ_I(off[2] - off[1], 3);
+    TEST_ASSERT_EQ_I(tgt[off[1]], 3);     TEST_ASSERT_EQ_I(row[off[1]], HUB + 1);
+    TEST_ASSERT_EQ_I(tgt[off[1] + 1], 7); TEST_ASSERT_EQ_I(row[off[1] + 1], HUB);
+    TEST_ASSERT_EQ_I(tgt[off[1] + 2], 7); TEST_ASSERT_EQ_I(row[off[1] + 2], HUB + 2);
+    /* Node 2 keeps both edges with their out-of-range dsts as given. */
+    TEST_ASSERT_EQ_I(off[3] - off[2], 2);
+    TEST_ASSERT_EQ_I(tgt[off[2]], -3);
+    TEST_ASSERT_EQ_I(tgt[off[2] + 1], 61);
+
+    /* Reverse: keyed by dst.  Node 5 gets the two edges whose src was out
+     * of range (their src is stored unchecked); node 7 gets rows 200, 202
+     * from src 1 plus whichever hub edges hit 7. */
+    int64_t* roff = (int64_t*)ray_data(rel->rev.offsets);
+    int64_t* rtgt = (int64_t*)ray_data(rel->rev.targets);
+    int64_t* rrow = (int64_t*)ray_data(rel->rev.rowmap);
+    TEST_ASSERT_EQ_I(rel->rev.n_edges, HUB + 3 + 2);
+    TEST_ASSERT_EQ_I(roff[6] - roff[5], 4 + 2);   /* 4 hub edges to 5, plus 2 */
+    TEST_ASSERT_EQ_I(rtgt[roff[5]], -1);          /* src -1 sorts first */
+    TEST_ASSERT_EQ_I(rtgt[roff[6] - 1], 60);      /* src 60 sorts last */
+    for (int64_t i = roff[5] + 1; i < roff[6]; i++)
+        TEST_ASSERT_TRUE(rtgt[i - 1] < rtgt[i] ||
+                         (rtgt[i - 1] == rtgt[i] && rrow[i - 1] < rrow[i]));
+    int64_t seen_from_1 = 0;
+    for (int64_t i = roff[7]; i < roff[8]; i++)
+        if (rtgt[i] == 1) { TEST_ASSERT_TRUE(rrow[i] == HUB || rrow[i] == HUB + 2); seen_from_1++; }
+    TEST_ASSERT_EQ_I(seen_from_1, 2);
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csr_entries[] = {
     { "csr/tiebreak_determinism", test_csr_tiebreak_determinism, NULL, NULL },
+    { "csr/hub_order", test_csr_hub_order, NULL, NULL },
+    { "csr/parallel_matches_serial", test_csr_parallel_matches_serial, NULL, NULL },
+    { "csr/parallel_fk_matches_serial", test_csr_parallel_fk_matches_serial, NULL, NULL },
+    { "csr/parallel_cancel", test_csr_parallel_cancel, NULL, NULL },
     { "csr/build", test_csr_build, NULL, NULL },
     { "csr/sorted", test_csr_sorted, NULL, NULL },
     { "csr/expand", test_expand, NULL, NULL },

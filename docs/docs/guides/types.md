@@ -29,6 +29,7 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'i32` | 32-bit integer | Standard integer |
 | `'i64` | 64-bit integer | Long integer (default) |
 | `'u8` | unsigned 8-bit | Byte values |
+| `'f32` | 32-bit float | Single precision; an f64 past its range saturates to ±3.40e+38 |
 | `'f64` | 64-bit float | Double precision (default) |
 | `'b8` | Boolean | true / false |
 | `'str` | String | Variable-length text |
@@ -36,7 +37,19 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'date` | Date | Days since 2000-01-01 |
 | `'time` | Time | Milliseconds since midnight |
 | `'timestamp` | Timestamp | Nanoseconds since 2000-01-01T00:00:00 |
+| `'timespan` | Duration | Signed count of nanoseconds |
 | `'guid` | GUID | 16-byte unique identifier |
+
+F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
+Scientific notation keeps its exponent: `1e3` is F64, while `1e3e` is F32.
+F32 vectors require a suffix on each non-null element: `[1e 2e 0Ne]`.
+Finite values beyond the F32 range saturate just as casts do. F32 values
+print with the suffix so parsing the output preserves the element type;
+the configured display precision still controls decimal rounding.
+
+Casting F32 to STR instead produces plain numeric text without the literal
+suffix (for example, `(as 'STR 1.5e)` returns `"1.5"`). It uses nine
+significant digits so casting the string back to F32 preserves the value.
 
 **Numeric casts:**
 
@@ -87,6 +100,11 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 ```
 
 **Vector casts:** `as` maps element-wise over vectors.
+
+Casting to `STR` produces a flat string vector from a vector or a LIST of
+atoms. Each outer element must convert to one string atom. A nested vector or
+LIST cell is rejected with a `type` error; this cast does not implicitly format
+or flatten a whole inner collection into a string cell.
 
 ```lisp
 ; Cast an integer vector to float
@@ -187,7 +205,18 @@ Strings can be parsed into numeric, temporal, and symbol types with `as`. Conver
 
 ## 5. Null Semantics in Casting { #null-semantics }
 
-Null values propagate through casts. A typed null in one type becomes a typed null in the target type. Invalid string parses raise a domain error.
+Null values propagate through casts to nullable types. BOOL/B8 and U8 have
+no null value: a numeric or temporal null casts to `true` for BOOL/B8 and
+`0x00` for U8. The result is an ordinary non-null value, consistently for
+atoms, vectors, lists, and query column casts. Empty strings cast to BOOL/B8
+as `false`. Invalid numeric string parses raise a domain error.
+
+```lisp
+(as 'B8 0Nl)             ; true
+(as 'B8 [0 0Nl 1])       ; [false true true]
+(as 'U8 0Nl)             ; 0x00
+(nil? (as 'U8 0Nl))      ; false
+```
 
 ```text
 ; Casting a typed null produces a typed null
@@ -208,11 +237,17 @@ Null values propagate through casts. A typed null in one type becomes a typed nu
     - `0Nl` — null i64
     - `0Nh` — null i16
     - `0Nf` — null f64
+    - `0Ne` — null f32
+    - `0Ng` — null guid (the all-zero GUID)
     - `0Nd` — null date
     - `0Nt` — null time
     - `0Np` — null timestamp
+    - `0Nn` — null timespan
 
-    `SYM` has no typed null literal (`0Ns` does not parse).
+    `SYM` has no `0N` literal (`0Ns` does not parse): its null is the empty
+    symbol, written `'`. `(nil? ')` is `true`, and it prints as `'`, so a
+    printed vector such as `[a ' b]` reads back as the same value. `STR`'s null
+    is the empty string `""`.
 
     Use `nil?` to test for null values: `(nil? 0Ni)` returns `true`.
 
@@ -258,13 +293,25 @@ Rayforce has two string representations with different performance characteristi
 
 ## 7. Date/Time Types { #date-time }
 
-Rayforce has three temporal types, all stored as integers internally:
+Rayforce represents calendar points and clock times with DATE, TIME, and TIMESTAMP, and nanosecond durations with TIMESPAN. All use integer storage:
 
 | Type | Internal | Epoch | Literal Format |
 |---|---|---|---|
 | `date` | i32 | Days since 2000-01-01 | `2024.01.15` |
 | `time` | i32 | Milliseconds since midnight | `12:30:00.000` |
 | `timestamp` | i64 | Nanoseconds since 2000-01-01 midnight | `2024.01.15D12:30:00.000000000` |
+| `timespan` | i64 | Nanoseconds of duration | `1D`, `0D01:00:00.000000000` |
+
+`date` and `time` are 32-bit counts (of days and of milliseconds). A `time`
+is not limited to one day: `48:00:00.000` and negative values are valid, up to
+about ±596 hours. A result past the 32-bit range keeps its low 32 bits, the
+same for an atom and for a vector cell, so `(* 25 24:00:00.000)` is
+`-593:02:47.296`.
+
+Subtracting two timestamps returns TIMESPAN. Cast the difference with
+`as 'I64` when an integer nanosecond count is needed. A duration may be
+added to a timestamp, scaled by an integer, or used as an `xbar` width.
+See [Timespan](timespan.md) for operator result types and migration details.
 
 **Date arithmetic:**
 

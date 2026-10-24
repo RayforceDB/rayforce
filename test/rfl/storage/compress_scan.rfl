@@ -1,0 +1,72 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; .idx.info over a compressed (generation 2) and a plain (generation 0)
+;; splayed column: format generation and bytes, read without decoding.
+(.sys.exec "rm -rf /tmp/rf_test_cscan_a /tmp/rf_test_cscan_b") -- 0
+(set S (table [k] (list (til 150000))))
+(.db.splayed.set "/tmp/rf_test_cscan_a/" S {compress: true})
+(.db.splayed.set "/tmp/rf_test_cscan_b/" S {compress: false})
+(set A (.db.splayed.get "/tmp/rf_test_cscan_a/"))
+(set B (.db.splayed.get "/tmp/rf_test_cscan_b/"))
+(at (.idx.info A 'k) 'gen) -- 2
+(at (.idx.info B 'k) 'gen) -- 0
+(at (.idx.info A 'k) 'raw_bytes) -- 1200000
+(at (.idx.info A 'k) 'materialized) -- false
+(.idx.info [1 2 3]) -- (.idx.info [1 2 3])
+(.sys.exec "rm -rf /tmp/rf_test_cscan_a /tmp/rf_test_cscan_b") -- 0
+;; Compressed-columns P2: the scan shapes over a generation-2 splayed table
+;; answer exactly as over the generation-0 copy of the same data, and leave
+;; the scanned columns unmaterialized (a top-k's sort key is the exception).
+(.sys.exec "rm -rf /tmp/rf_test_cscan") -- 0
+(set i (til 150000))
+(set T (table [k g v f s] (list i (as 'I16 (% i 9)) (as 'I32 (map (fn [j] (if (== 0 (% j 11)) 0N j)) i)) (as 'F64 (% i 977)) (take ['x 'y 'z] 150000))))
+(.db.splayed.set "/tmp/rf_test_cscan/g2/" T {compress: true})
+(.db.splayed.set "/tmp/rf_test_cscan/g0/" T {compress: false})
+(set A (.db.splayed.get "/tmp/rf_test_cscan/g2/"))
+(set B (.db.splayed.get "/tmp/rf_test_cscan/g0/"))
+(count (select {from: A where: (> v 70000)})) -- (count (select {from: B where: (> v 70000)}))
+(count (select {from: A where: (== g 4)})) -- (count (select {from: B where: (== g 4)}))
+(sum (at A 'v)) -- (sum (at B 'v))
+(avg (at A 'f)) -- (avg (at B 'f))
+(min (at A 'k)) -- (min (at B 'k))
+(at (select {s: (sum v) from: A by: g}) 's) -- (at (select {s: (sum v) from: B by: g}) 's)
+(at (.idx.info A 'v) 'materialized) -- false
+(at (.idx.info A 'g) 'materialized) -- false
+(at (.idx.info A 'f) 'materialized) -- false
+(at (.idx.info A 'k) 'materialized) -- false
+;; a filtered group-by over fewer survivors than the parallel threshold
+;; gathers its key and input by range (the v2 compact fallback, P3 Task 6);
+;; its SYM equality predicate compares the column's ids on the fused path
+;; (P3 Task 4), so nothing is materialized
+(at (select {c: (count k) from: A where: (== s 'y) by: g}) 'c) -- (at (select {c: (count k) from: B where: (== s 'y) by: g}) 'c)
+(at (.idx.info A 'g) 'materialized) -- false
+(at (.idx.info A 'k) 'materialized) -- false
+(at (.idx.info A 's) 'materialized) -- false
+(at (select {m: (max f) from: A where: (< k 1000)}) 'm) -- (at (select {m: (max f) from: B where: (< k 1000)}) 'm)
+(at (select {k: k from: A where: (> v 100) desc: k take: 3}) 'k) -- (at (select {k: k from: B where: (> v 100) desc: k take: 3}) 'k)
+(at (.idx.info A 'v) 'materialized) -- false
+(at (.idx.info A 'f) 'materialized) -- false
+(.sys.exec "rm -rf /tmp/rf_test_cscan") -- 0
+;; A computed key or a count distinct over a compressed column whose whole
+;; decode would not stay cached (past a quarter of the anon watermark, as
+;; every 4- and 8-byte column here is under -m 2M) reads it by range: in a
+;; child run under that watermark the by-dict minute key, the computed key
+;; beside a distinct output, the global count distinct and the grouped ones
+;; answer as over the plain copy, with u, et and r left unmaterialized (read
+;; in the query's own statement: the boundary drops a decode that size).
+;; Here, under the default watermark, they decode as before and answer the
+;; same.
+(.sys.exec "rm -rf /tmp/rf_test_cscan_r") -- 0
+(set i (til 140000))
+(set h (% (* i 2654435761) 1000003))
+(set T (table [u et r s] (list (+ (at [0N 0 0 0 0 0 0] (% i 7)) (% (+ (* h 7919) i) 9000)) (+ 2013.07.01D00:00:00.000000000 (* 1000000000 (% (* h 13) 86400))) (as 'I32 (sqrt (as 'F64 (% (* h h) 2500)))) (at (as 'SYMBOL (map (fn [k] (format "p%" k)) (til 3000))) (% (* (% (* h h) 1009) 13) 3000)))))
+(.db.splayed.set "/tmp/rf_test_cscan_r/c/" T "/tmp/rf_test_cscan_r/c.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_cscan_r/p/" T "/tmp/rf_test_cscan_r/p.sym")
+(.sys.exec "printf '%s\n' '(set C (.db.splayed.get \"/tmp/rf_test_cscan_r/c/\" \"/tmp/rf_test_cscan_r/c.sym\"))' '(set P (.db.splayed.get \"/tmp/rf_test_cscan_r/p/\" \"/tmp/rf_test_cscan_r/p.sym\"))' '(set nv (fn [v] (if (== (type v) (quote SYM)) (as (quote STR) v) v)))' '(set fp (fn [x] (if (== (type x) (quote TABLE)) (ser (xasc (table (cols x) (map (fn [c] (nv (at x c))) (cols x))) (cols x))) x)))' '(set eq (fn [a b] (if (== (count a) (count b)) (all (== a b)) false)))' '(set un (fn [c] (not (at (.idx.info C c) (quote materialized)))))' '(set chk (fn [f] (do (set a (fp (f C))) (set m (and (un (quote u)) (and (un (quote et)) (un (quote r))))) (and m (eq a (fp (f P)))))))' '(println (chk (fn [t] (select {from: t by: {u: u m: (minute et)} c: (count u)}))))' '(println (chk (fn [t] (select {from: t by: (hour et) d: (count (distinct u))}))))' '(println (chk (fn [t] (count (distinct (at t (quote u)))))))' '(println (chk (fn [t] (select {from: t by: r d: (count (distinct u))}))))' '(println (chk (fn [t] (select {from: t by: r c: (count u) d: (count (distinct u))}))))' '(println (chk (fn [t] (select {from: t by: s d: (count (distinct u)) where: (!= s \"p7\")}))))' > /tmp/rf_test_cscan_r/q.rfl") -- 0
+(.sys.exec "./rayforce -m 2M /tmp/rf_test_cscan_r/q.rfl </dev/null >/tmp/rf_test_cscan_r/q.out 2>&1; [ $(grep -c '^true$' /tmp/rf_test_cscan_r/q.out) -eq 6 ]") -- 0
+(set A (.db.splayed.get "/tmp/rf_test_cscan_r/c/" "/tmp/rf_test_cscan_r/c.sym"))
+(set B (.db.splayed.get "/tmp/rf_test_cscan_r/p/" "/tmp/rf_test_cscan_r/p.sym"))
+(at (select {from: A by: {u: u m: (minute et)} c: (count u) desc: c take: 5}) 'c) -- (at (select {from: B by: {u: u m: (minute et)} c: (count u) desc: c take: 5}) 'c)
+(count (distinct (at A 'u))) -- (count (distinct (at B 'u)))
+(at (select {from: A by: r d: (count (distinct u)) asc: r}) 'd) -- (at (select {from: B by: r d: (count (distinct u)) asc: r}) 'd)
+(at (select {from: A by: r c: (count u) d: (count (distinct u)) asc: r}) 'd) -- (at (select {from: B by: r c: (count u) d: (count (distinct u)) asc: r}) 'd)
+(.sys.exec "rm -rf /tmp/rf_test_cscan_r") -- 0

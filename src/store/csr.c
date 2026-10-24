@@ -23,6 +23,7 @@
 
 #include "csr.h"
 #include "store/col.h"
+#include "store/enccol.h"
 #include "mem/sys.h"
 #include "store/fileio.h"   /* ray_mkdir */
 #include <stdlib.h>
@@ -30,6 +31,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include "core/pool.h"
 
 /* Forward declaration */
 static void csr_free(ray_csr_t* csr);
@@ -38,50 +40,39 @@ static void csr_free(ray_csr_t* csr);
  * CSR construction helpers
  * -------------------------------------------------------------------------- */
 
-/* Pair for sorting edges */
+/* One (target, row) cell of an adjacency list, for sorting a long list. */
 typedef struct {
-    int64_t src;
-    int64_t dst;
-    int64_t row;  /* original row index for rowmap */
-} edge_pair_t;
+    int64_t target;
+    int64_t row;
+} adj_cell_t;
 
-/* Comparison by src then dst, with .row as a final tie-break.
+static int cmp_adj_cell(const void* a, const void* b) {
+    const adj_cell_t* x = (const adj_cell_t*)a;
+    const adj_cell_t* y = (const adj_cell_t*)b;
+    if (x->target < y->target) return -1;
+    if (x->target > y->target) return 1;
+    if (x->row < y->row) return -1;
+    if (x->row > y->row) return 1;
+    return 0;
+}
+
+/* Sort every adjacency list by (target, row).
  *
- * qsort is not a stable sort: for parallel edges (equal src AND equal dst)
- * the relative order of their original rows would otherwise be platform- and
- * input-dependent, making rowmap (and any golden test or MST that consumes it)
- * non-deterministic.  The .row tie-break pins a total order. */
-static int cmp_edge_by_src(const void* a, const void* b) {
-    const edge_pair_t* ea = (const edge_pair_t*)a;
-    const edge_pair_t* eb = (const edge_pair_t*)b;
-    if (ea->src < eb->src) return -1;
-    if (ea->src > eb->src) return 1;
-    if (ea->dst < eb->dst) return -1;
-    if (ea->dst > eb->dst) return 1;
-    if (ea->row < eb->row) return -1;
-    if (ea->row > eb->row) return 1;
-    return 0;
-}
+ * The order is a total one, so a CSR built from the same edges is the same
+ * bytes on every platform: parallel edges (equal key AND equal target) are
+ * pinned by their original row, which rowmap (and any golden test or MST
+ * that consumes it) relies on.  Lists are short in the common case, so an
+ * insertion sort serves them; a hub's list past ADJ_INSERTION_MAX is packed
+ * into (target, row) cells and qsorted to stay O(d log d). */
+#define ADJ_INSERTION_MAX 32
 
-/* Comparison by dst then src (for reverse CSR), with .row as a final tie-break
- * for determinism (see cmp_edge_by_src). */
-static int cmp_edge_by_dst(const void* a, const void* b) {
-    const edge_pair_t* ea = (const edge_pair_t*)a;
-    const edge_pair_t* eb = (const edge_pair_t*)b;
-    if (ea->dst < eb->dst) return -1;
-    if (ea->dst > eb->dst) return 1;
-    if (ea->src < eb->src) return -1;
-    if (ea->src > eb->src) return 1;
-    if (ea->row < eb->row) return -1;
-    if (ea->row > eb->row) return 1;
-    return 0;
-}
-
-/* Sort targets within each adjacency list (for LFTJ) */
 static void csr_sort_adjacency_lists(ray_csr_t* csr) {
     int64_t* offsets = (int64_t*)ray_data(csr->offsets);
     int64_t* targets = (int64_t*)ray_data(csr->targets);
     int64_t* rowmap = csr->rowmap ? (int64_t*)ray_data(csr->rowmap) : NULL;
+
+    adj_cell_t* cells = NULL;
+    int64_t cells_cap = 0;
 
     for (int64_t node = 0; node < csr->n_nodes; node++) {
         int64_t start = offsets[node];
@@ -89,12 +80,32 @@ static void csr_sort_adjacency_lists(ray_csr_t* csr) {
         int64_t deg = end - start;
         if (deg <= 1) continue;
 
-        /* Simple insertion sort — adjacency lists are typically small */
+        if (deg > ADJ_INSERTION_MAX && rowmap) {
+            if (deg > cells_cap) {
+                ray_free_raw(cells);
+                cells_cap = deg;
+                cells = (adj_cell_t*)ray_alloc_raw((size_t)cells_cap * sizeof(adj_cell_t));
+                if (!cells) { cells_cap = 0; goto insertion; }  /* OOM: slow path */
+            }
+            for (int64_t i = 0; i < deg; i++) {
+                cells[i].target = targets[start + i];
+                cells[i].row = rowmap[start + i];
+            }
+            qsort(cells, (size_t)deg, sizeof(adj_cell_t), cmp_adj_cell);
+            for (int64_t i = 0; i < deg; i++) {
+                targets[start + i] = cells[i].target;
+                rowmap[start + i] = cells[i].row;
+            }
+            continue;
+        }
+
+insertion:
         for (int64_t i = start + 1; i < end; i++) {
             int64_t key = targets[i];
             int64_t row_key = rowmap ? rowmap[i] : 0;
             int64_t j = i - 1;
-            while (j >= start && targets[j] > key) {
+            while (j >= start && (targets[j] > key ||
+                                  (targets[j] == key && rowmap && rowmap[j] > row_key))) {
                 targets[j + 1] = targets[j];
                 if (rowmap) rowmap[j + 1] = rowmap[j];
                 j--;
@@ -103,32 +114,278 @@ static void csr_sort_adjacency_lists(ray_csr_t* csr) {
             if (rowmap) rowmap[j + 1] = row_key;
         }
     }
+    ray_free_raw(cells);
 }
 
-/* Build CSR from sorted edge pairs.
- * pairs must be sorted by the 'key' field (src for fwd, dst for rev). */
-static ray_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
-                                      int64_t n_nodes, bool is_reverse,
-                                      bool sort_targets, ray_csr_t* out) {
+/* Parallel two-level build.  Keys are first partitioned into B contiguous
+ * node-range buckets (B ~ CSR_PAR_BUCKETS, each a power-of-two range of
+ * nodes), then every bucket is counting-sorted on its own.  Each task has
+ * a private histogram row, so no pass touches a shared counter; the only
+ * cross-task step is the serial prefix scan over T*B entries.
+ *
+ * Scratch is (key, val) as int32 when n_nodes fits (the usual case; the
+ * scatter is memory-bound and this cuts its traffic by a third) plus the
+ * int64 row, so 16 bytes per edge; 24 with int64 keys. */
+int64_t ray_csr_par_min_edges = 1 << 20;
+#define CSR_PAR_MAX_TASKS  8           /* memory-bound: 4-8 tasks is the knee on a 32-thread box */
+#define CSR_PAR_BUCKETS    256
+
+typedef struct {
+    const int64_t* keys;      /* NULL: key = row index */
+    const int64_t* vals;
+    int64_t   n_edges, n_nodes;
+    int       T, B, shift;
+    bool      narrow;         /* int32 scratch */
+    int64_t*  hist;           /* [T * B]: counts, then cursors */
+    uint8_t*  wide;           /* [T]: a task saw an in-range value past int32 */
+    int64_t*  bstart;         /* [B + 1]: bucket edge ranges in scratch */
+    void*     skeys; void* svals;   /* int32 or int64, n_edges each */
+    int64_t*  srow;           /* n_edges */
+    int64_t*  off;  int64_t* tgt;  int64_t* rmap;   /* final CSR arrays */
+    int64_t*  pos;            /* [n_nodes] cursors (per-bucket private) */
+} csr_par_t;
+
+static inline int64_t csr_par_key(const csr_par_t* c, int64_t i) {
+    return c->keys ? c->keys[i] : i;
+}
+
+static void csr_par_task_range(const csr_par_t* c, uint32_t t,
+                               int64_t* lo, int64_t* hi) {
+    *lo = c->n_edges * (int64_t)t / c->T;
+    *hi = c->n_edges * (int64_t)(t + 1) / c->T;
+}
+
+/* Phase 1: per-task bucket histogram. */
+static void csr_par_hist_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csr_par_t* c = (csr_par_t*)ctx;
+    uint32_t t = (uint32_t)start;
+    int64_t lo, hi; csr_par_task_range(c, t, &lo, &hi);
+    int64_t* h = c->hist + (size_t)t * c->B;
+    bool wide = false;
+    for (int64_t i = lo; i < hi; i++) {
+        int64_t k = csr_par_key(c, i);
+        if (k < 0 || k >= c->n_nodes) continue;
+        h[k >> c->shift]++;
+        int64_t v = c->vals[i];
+        wide |= (v < INT32_MIN || v > INT32_MAX);
+    }
+    c->wide[t] = wide;
+}
+
+/* Phase 2: per-task scatter into bucket-ordered scratch. */
+static void csr_par_scatter_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csr_par_t* c = (csr_par_t*)ctx;
+    uint32_t t = (uint32_t)start;
+    int64_t lo, hi; csr_par_task_range(c, t, &lo, &hi);
+    int64_t* cur = c->hist + (size_t)t * c->B;
+    if (c->narrow) {
+        int32_t* sk = (int32_t*)c->skeys; int32_t* sv = (int32_t*)c->svals;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t k = csr_par_key(c, i);
+            if (k < 0 || k >= c->n_nodes) continue;
+            int64_t p = cur[k >> c->shift]++;
+            sk[p] = (int32_t)k; sv[p] = (int32_t)c->vals[i]; c->srow[p] = i;
+        }
+    } else {
+        int64_t* sk = (int64_t*)c->skeys; int64_t* sv = (int64_t*)c->svals;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t k = csr_par_key(c, i);
+            if (k < 0 || k >= c->n_nodes) continue;
+            int64_t p = cur[k >> c->shift]++;
+            sk[p] = k; sv[p] = c->vals[i]; c->srow[p] = i;
+        }
+    }
+}
+
+/* Phase 3: one task per bucket — counting sort of that bucket's node
+ * range.  off[v] for v in the range and the bucket's edge span of tgt/rmap
+ * are written by this task only. */
+static void csr_par_bucket_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)end;
+    csr_par_t* c = (csr_par_t*)ctx;
+    int b = (int)start;
+    int64_t nlo = (int64_t)b << c->shift, nhi = (int64_t)(b + 1) << c->shift;
+    if (nhi > c->n_nodes) nhi = c->n_nodes;
+    if (nlo >= nhi) return;
+    int64_t elo = c->bstart[b], ehi = c->bstart[b + 1];
+    for (int64_t v = nlo; v < nhi; v++) c->pos[v] = 0;
+    if (c->narrow) {
+        const int32_t* sk = (const int32_t*)c->skeys;
+        for (int64_t i = elo; i < ehi; i++) c->pos[sk[i]]++;
+    } else {
+        const int64_t* sk = (const int64_t*)c->skeys;
+        for (int64_t i = elo; i < ehi; i++) c->pos[sk[i]]++;
+    }
+    int64_t run = elo;
+    for (int64_t v = nlo; v < nhi; v++) {
+        int64_t d = c->pos[v]; c->off[v] = run; c->pos[v] = run; run += d;
+    }
+    if (c->narrow) {
+        const int32_t* sk = (const int32_t*)c->skeys;
+        const int32_t* sv = (const int32_t*)c->svals;
+        for (int64_t i = elo; i < ehi; i++) {
+            int64_t p = c->pos[sk[i]]++;
+            c->tgt[p] = sv[i]; c->rmap[p] = c->srow[i];
+        }
+    } else {
+        const int64_t* sk = (const int64_t*)c->skeys;
+        const int64_t* sv = (const int64_t*)c->svals;
+        for (int64_t i = elo; i < ehi; i++) {
+            int64_t p = c->pos[sk[i]]++;
+            c->tgt[p] = sv[i]; c->rmap[p] = c->srow[i];
+        }
+    }
+}
+
+/* A cancelled dispatch skips the tasks that have not started and returns
+ * normally (pool.h, ORDER CONTRACT); every pass here needs all of its
+ * tasks, so after each one the build asks and gives up on a cancel. */
+static inline bool csr_par_cancelled(ray_pool_t* pool) {
+    if (ray_interrupted()) return true;
+    return atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
+}
+
+static void csr_par_drop(ray_t** v) {
+    if (*v) { if (RAY_IS_ERR(*v)) ray_error_free(*v); else ray_release(*v); }
+    *v = NULL;
+}
+
+/* Count valid edges and fill out->offsets/targets/rowmap in parallel.
+ * Returns 1 when out is built, 0 when the pool should not be used or
+ * scratch cannot be had (nothing is left in out; the caller builds
+ * serially), -1 when a cancel interrupted a pass (nothing is left in out;
+ * the caller reports RAY_ERR_CANCEL rather than hand back a CSR whose
+ * skipped tasks never wrote their slots). */
+static int csr_build_parallel(const int64_t* keys, const int64_t* vals,
+                              int64_t n_edges, int64_t n_nodes,
+                              ray_csr_t* out) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, n_edges, ray_csr_par_min_edges) ||
+        n_nodes < 2)
+        return 0;
+    int T = (int)ray_pool_total_workers(pool);
+    if (T > CSR_PAR_MAX_TASKS) T = CSR_PAR_MAX_TASKS;
+    int shift = 0;
+    while (((n_nodes - 1) >> shift) >= CSR_PAR_BUCKETS) shift++;
+    int B = (int)(((n_nodes - 1) >> shift) + 1);
+    csr_par_t c = { .keys = keys, .vals = vals, .n_edges = n_edges,
+                    .n_nodes = n_nodes, .T = T, .B = B, .shift = shift };
+    c.hist   = ray_calloc_raw((size_t)T * B * sizeof(int64_t));
+    c.wide   = ray_calloc_raw((size_t)T);
+    c.bstart = ray_alloc_raw((size_t)(B + 1) * sizeof(int64_t));
+    c.srow   = ray_alloc_raw((size_t)n_edges * sizeof(int64_t));
+    c.pos    = ray_alloc_raw((size_t)n_nodes * sizeof(int64_t));
+    bool ok = c.hist && c.wide && c.bstart && c.srow && c.pos;
+    bool cancelled = false;
+
+    if (ok) {
+        ray_pool_dispatch_n(pool, csr_par_hist_fn, &c, (uint32_t)T);
+        cancelled = csr_par_cancelled(pool);
+    }
+    if (ok && !cancelled) {
+        /* Scratch width, known only now: values are stored unchecked (an
+         * out-of-range dst stays in fwd), so the narrow scratch needs every
+         * kept edge's value to fit, and phase 1 saw them all. */
+        bool narrow = n_nodes <= INT32_MAX;
+        for (int t = 0; t < T && narrow; t++) narrow = !c.wide[t];
+        c.narrow = narrow;
+        size_t cell = narrow ? sizeof(int32_t) : sizeof(int64_t);
+        c.skeys = ray_alloc_raw((size_t)n_edges * cell);
+        c.svals = ray_alloc_raw((size_t)n_edges * cell);
+        ok = c.skeys && c.svals;
+    }
+    if (ok && !cancelled) {
+        int64_t run = 0;
+        for (int b = 0; b < B; b++) {
+            c.bstart[b] = run;
+            for (int t = 0; t < T; t++) {
+                int64_t* h = c.hist + (size_t)t * B + b;
+                int64_t d = *h; *h = run; run += d;
+            }
+        }
+        c.bstart[B] = run;
+        int64_t valid_edges = run;
+        out->n_edges = valid_edges;
+
+        out->offsets = ray_vec_new(RAY_I64, n_nodes + 1);
+        out->targets = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
+        out->rowmap  = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
+        ok = out->offsets && !RAY_IS_ERR(out->offsets) &&
+             out->targets && !RAY_IS_ERR(out->targets) &&
+             out->rowmap  && !RAY_IS_ERR(out->rowmap);
+        if (ok) {
+            out->offsets->len = n_nodes + 1;
+            out->targets->len = valid_edges;
+            out->rowmap->len  = valid_edges;
+            c.off  = (int64_t*)ray_data(out->offsets);
+            c.tgt  = (int64_t*)ray_data(out->targets);
+            c.rmap = (int64_t*)ray_data(out->rowmap);
+            c.off[n_nodes] = valid_edges;
+            ray_pool_dispatch_n(pool, csr_par_scatter_fn, &c, (uint32_t)T);
+            cancelled = csr_par_cancelled(pool);
+            if (!cancelled) {
+                ray_pool_dispatch_n(pool, csr_par_bucket_fn, &c, (uint32_t)B);
+                cancelled = csr_par_cancelled(pool);
+            }
+        }
+        if (!ok || cancelled) {
+            /* ray_vec_new hands back an error object on OOM, and
+             * ray_release is a no-op on those: free them as errors. */
+            csr_par_drop(&out->offsets);
+            csr_par_drop(&out->targets);
+            csr_par_drop(&out->rowmap);
+            out->n_edges = 0;
+        }
+    }
+    ray_free_raw(c.hist);  ray_free_raw(c.wide); ray_free_raw(c.bstart);
+    ray_free_raw(c.skeys); ray_free_raw(c.svals);
+    ray_free_raw(c.srow);  ray_free_raw(c.pos);
+    if (cancelled) return -1;
+    return ok ? 1 : 0;
+}
+
+/* Build one CSR direction straight from the edge columns by counting sort:
+ * degree count, prefix sum, scatter in row order, then sort each list.
+ *
+ * keys[i] is the list an edge belongs to and vals[i] its target; a NULL
+ * keys means key = i (an FK column: every row of the source table is one
+ * node with one outgoing edge).  An edge whose key falls outside
+ * [0, n_nodes) is dropped; its val is stored as-is, like the row index.
+ *
+ * The lists come out sorted by (target, row), the one order a build from
+ * these edges has ever had, so `sort_targets` only records that fact. */
+static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
+                                  int64_t n_edges, int64_t n_nodes,
+                                  bool sort_targets, ray_csr_t* out) {
     out->n_nodes = n_nodes;
     out->props = NULL;
 
-    /* Count valid edges (those within [0, n_nodes) range) */
-    int64_t valid_edges = 0;
-    for (int64_t i = 0; i < n_edges; i++) {
-        int64_t key = is_reverse ? pairs[i].dst : pairs[i].src;
-        if (key >= 0 && key < n_nodes) valid_edges++;
+    int par = csr_build_parallel(keys, vals, n_edges, n_nodes, out);
+    if (par < 0) return RAY_ERR_CANCEL;
+    if (par > 0) {
+        csr_sort_adjacency_lists(out);
+        out->sorted = sort_targets;
+        return RAY_OK;
     }
-    out->n_edges = valid_edges;
 
-    /* Allocate offsets (n_nodes + 1) */
+    /* Offsets (n_nodes + 1), zeroed: off[k + 1] accumulates the degree of k. */
     out->offsets = ray_vec_new(RAY_I64, n_nodes + 1);
     if (!out->offsets || RAY_IS_ERR(out->offsets)) return RAY_ERR_OOM;
     out->offsets->len = n_nodes + 1;
     int64_t* off = (int64_t*)ray_data(out->offsets);
     memset(off, 0, (size_t)(n_nodes + 1) * sizeof(int64_t));
+    int64_t valid_edges = 0;
+    for (int64_t i = 0; i < n_edges; i++) {
+        int64_t key = keys ? keys[i] : i;
+        if (key >= 0 && key < n_nodes) { off[key + 1]++; valid_edges++; }
+    }
+    out->n_edges = valid_edges;
 
-    /* Allocate targets */
+    for (int64_t i = 1; i <= n_nodes; i++)
+        off[i] += off[i - 1];
+
     out->targets = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
     if (!out->targets || RAY_IS_ERR(out->targets)) {
         ray_release(out->offsets); out->offsets = NULL;
@@ -137,7 +394,6 @@ static ray_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
     out->targets->len = valid_edges;
     int64_t* tgt = (int64_t*)ray_data(out->targets);
 
-    /* Allocate rowmap */
     out->rowmap = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
     if (!out->rowmap || RAY_IS_ERR(out->rowmap)) {
         ray_release(out->offsets); out->offsets = NULL;
@@ -147,17 +403,7 @@ static ray_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
     out->rowmap->len = valid_edges;
     int64_t* rmap = (int64_t*)ray_data(out->rowmap);
 
-    /* Count degrees */
-    for (int64_t i = 0; i < n_edges; i++) {
-        int64_t key = is_reverse ? pairs[i].dst : pairs[i].src;
-        if (key >= 0 && key < n_nodes) off[key + 1]++;
-    }
-
-    /* Prefix sum */
-    for (int64_t i = 1; i <= n_nodes; i++)
-        off[i] += off[i - 1];
-
-    /* Fill targets + rowmap using a position array */
+    /* Scatter: pos[k] is the next free slot of list k. */
     ray_t* pos_hdr = ray_alloc((size_t)(n_nodes > 0 ? n_nodes : 1) * sizeof(int64_t));
     if (!pos_hdr) {
         ray_release(out->offsets); out->offsets = NULL;
@@ -170,24 +416,17 @@ static ray_err_t csr_build_from_pairs(edge_pair_t* pairs, int64_t n_edges,
         memcpy(pos, off, (size_t)n_nodes * sizeof(int64_t));
 
     for (int64_t i = 0; i < n_edges; i++) {
-        int64_t key = is_reverse ? pairs[i].dst : pairs[i].src;
-        int64_t val = is_reverse ? pairs[i].src : pairs[i].dst;
+        int64_t key = keys ? keys[i] : i;
         if (key >= 0 && key < n_nodes) {
             int64_t p = pos[key]++;
-            tgt[p] = val;
-            rmap[p] = pairs[i].row;
+            tgt[p] = vals[i];
+            rmap[p] = i;
         }
     }
     ray_free(pos_hdr);
 
-    /* Sort within adjacency lists if requested */
-    if (sort_targets) {
-        csr_sort_adjacency_lists(out);
-        out->sorted = true;
-    } else {
-        out->sorted = false;
-    }
-
+    csr_sort_adjacency_lists(out);
+    out->sorted = sort_targets;
     return RAY_OK;
 }
 
@@ -206,8 +445,15 @@ ray_rel_t* ray_rel_from_edges(ray_t* edge_table,
     int64_t dst_sym = ray_sym_intern(dst_col, strlen(dst_col));
     if (src_sym < 0 || dst_sym < 0) return NULL;  /* sym intern OOM */
 
-    ray_t* src_vec = ray_table_get_col(edge_table, src_sym);
-    ray_t* dst_vec = ray_table_get_col(edge_table, dst_sym);
+    /* Known gap: the signature has no error channel, so a column that cannot
+     * materialize declines with NULL and the error message is dropped. */
+    ray_t* src_vec = ray_table_col(edge_table, src_sym);
+    ray_t* dst_vec = ray_table_col(edge_table, dst_sym);
+    if ((src_vec && RAY_IS_ERR(src_vec)) || (dst_vec && RAY_IS_ERR(dst_vec))) {
+        if (src_vec && RAY_IS_ERR(src_vec)) ray_error_free(src_vec);
+        if (dst_vec && RAY_IS_ERR(dst_vec)) ray_error_free(dst_vec);
+        return NULL;
+    }
     if (!src_vec || !dst_vec) return NULL;
     if (src_vec->type != RAY_I64 || dst_vec->type != RAY_I64) return NULL;
 
@@ -215,48 +461,31 @@ ray_rel_t* ray_rel_from_edges(ray_t* edge_table,
     if (n_edges != dst_vec->len) return NULL;
     if (n_src_nodes < 0 || n_dst_nodes < 0) return NULL;
 
-    /* Build edge pairs */
-    ray_t* pairs_hdr = ray_alloc((size_t)n_edges * sizeof(edge_pair_t));
-    if (!pairs_hdr) return NULL;
-    edge_pair_t* pairs = (edge_pair_t*)ray_data(pairs_hdr);
+    const int64_t* src_data = (const int64_t*)ray_data(src_vec);
+    const int64_t* dst_data = (const int64_t*)ray_data(dst_vec);
 
-    int64_t* src_data = (int64_t*)ray_data(src_vec);
-    int64_t* dst_data = (int64_t*)ray_data(dst_vec);
-    for (int64_t i = 0; i < n_edges; i++) {
-        pairs[i].src = src_data[i];
-        pairs[i].dst = dst_data[i];
-        pairs[i].row = i;
-    }
-
-    /* Allocate rel */
     ray_rel_t* rel = (ray_rel_t*)ray_sys_alloc(sizeof(ray_rel_t));
-    if (!rel) { ray_free(pairs_hdr); return NULL; }
+    if (!rel) return NULL;
     memset(rel, 0, sizeof(ray_rel_t));
     rel->name_sym = -1;
 
-    /* Build forward CSR (sorted by src) */
-    /* qsort is from libc, not an external dep */
-    qsort(pairs, (size_t)n_edges, sizeof(edge_pair_t), cmp_edge_by_src);
-    ray_err_t err = csr_build_from_pairs(pairs, n_edges, n_src_nodes, false,
-                                         sort_targets, &rel->fwd);
+    /* Forward CSR: lists keyed by src, targets are dst. */
+    ray_err_t err = csr_build_direct(src_data, dst_data, n_edges, n_src_nodes,
+                                     sort_targets, &rel->fwd);
     if (err != RAY_OK) {
-        ray_free(pairs_hdr);
         ray_sys_free(rel);
         return NULL;
     }
 
-    /* Build reverse CSR (sorted by dst) */
-    qsort(pairs, (size_t)n_edges, sizeof(edge_pair_t), cmp_edge_by_dst);
-    err = csr_build_from_pairs(pairs, n_edges, n_dst_nodes, true,
-                                sort_targets, &rel->rev);
+    /* Reverse CSR: lists keyed by dst, targets are src. */
+    err = csr_build_direct(dst_data, src_data, n_edges, n_dst_nodes,
+                           sort_targets, &rel->rev);
     if (err != RAY_OK) {
-        ray_free(pairs_hdr);
         csr_free(&rel->fwd);
         ray_sys_free(rel);
         return NULL;
     }
 
-    ray_free(pairs_hdr);
     return rel;
 }
 
@@ -270,52 +499,49 @@ ray_rel_t* ray_rel_build(ray_t* from_table, const char* fk_col,
         return NULL;
 
     int64_t fk_sym = ray_sym_intern(fk_col, strlen(fk_col));
-    ray_t* fk_vec = ray_table_get_col(from_table, fk_sym);
+    /* Known gap: a column that cannot materialize declines with NULL and the
+     * error message is dropped (no error channel in the signature). */
+    ray_t* fk_vec = ray_table_col(from_table, fk_sym);
+    if (fk_vec && RAY_IS_ERR(fk_vec)) { ray_error_free(fk_vec); return NULL; }
     if (!fk_vec || fk_vec->type != RAY_I64) return NULL;
     if (n_target_nodes < 0) return NULL;
 
     int64_t n_edges = fk_vec->len;
     int64_t n_src_nodes = ray_table_nrows(from_table);
 
-    /* Build edge pairs: src = row index, dst = fk value */
-    ray_t* pairs_hdr = ray_alloc((size_t)n_edges * sizeof(edge_pair_t));
-    if (!pairs_hdr) return NULL;
-    edge_pair_t* pairs = (edge_pair_t*)ray_data(pairs_hdr);
-
-    int64_t* fk_data = (int64_t*)ray_data(fk_vec);
-    for (int64_t i = 0; i < n_edges; i++) {
-        pairs[i].src = i;
-        pairs[i].dst = fk_data[i];
-        pairs[i].row = i;
-    }
+    const int64_t* fk_data = (const int64_t*)ray_data(fk_vec);
 
     ray_rel_t* rel = (ray_rel_t*)ray_sys_alloc(sizeof(ray_rel_t));
-    if (!rel) { ray_free(pairs_hdr); return NULL; }
+    if (!rel) return NULL;
     memset(rel, 0, sizeof(ray_rel_t));
     rel->name_sym = -1;
 
-    /* Build forward CSR */
-    qsort(pairs, (size_t)n_edges, sizeof(edge_pair_t), cmp_edge_by_src);
-    ray_err_t err = csr_build_from_pairs(pairs, n_edges, n_src_nodes, false,
-                                         sort_targets, &rel->fwd);
+    /* Forward CSR: row i is node i with the single edge i -> fk[i]. */
+    ray_err_t err = csr_build_direct(NULL, fk_data, n_edges, n_src_nodes,
+                                     sort_targets, &rel->fwd);
     if (err != RAY_OK) {
-        ray_free(pairs_hdr);
         ray_sys_free(rel);
         return NULL;
     }
 
-    /* Build reverse CSR */
-    qsort(pairs, (size_t)n_edges, sizeof(edge_pair_t), cmp_edge_by_dst);
-    err = csr_build_from_pairs(pairs, n_edges, n_target_nodes, true,
-                                sort_targets, &rel->rev);
+    /* Reverse CSR: lists keyed by fk value, targets are the row indices. */
+    ray_t* rows_hdr = ray_alloc((size_t)(n_edges > 0 ? n_edges : 1) * sizeof(int64_t));
+    if (!rows_hdr) {
+        csr_free(&rel->fwd);
+        ray_sys_free(rel);
+        return NULL;
+    }
+    int64_t* rows = (int64_t*)ray_data(rows_hdr);
+    for (int64_t i = 0; i < n_edges; i++) rows[i] = i;
+    err = csr_build_direct(fk_data, rows, n_edges, n_target_nodes,
+                           sort_targets, &rel->rev);
+    ray_free(rows_hdr);
     if (err != RAY_OK) {
-        ray_free(pairs_hdr);
         csr_free(&rel->fwd);
         ray_sys_free(rel);
         return NULL;
     }
 
-    ray_free(pairs_hdr);
     return rel;
 }
 
@@ -397,6 +623,31 @@ static ray_err_t csr_save(ray_csr_t* csr, const char* dir, const char* prefix) {
     return RAY_OK;
 }
 
+/* The CSR files are plain vectors.  The mapping loader refuses an encoded
+ * (generation-2) column; the copying loader materializes it into a plain
+ * vector.  RAY_OK with *out set; RAY_ERR_NYI for an encoded file mapped
+ * (the optional ones included: only a missing file is "absent");
+ * RAY_ERR_IO for anything else. */
+static ray_err_t csr_col(const char* path, bool use_mmap, ray_t** out) {
+    *out = NULL;
+    ray_t* c = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+    if (c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL) { ray_release(c); return RAY_ERR_NYI; }
+    if (c && RAY_IS_ERR(c)) {
+        /* a nyi on a generation-2 file (e.g. a big-endian host) */
+        bool enc = false;
+        if (strcmp(ray_err_code(c), "nyi") == 0) {
+            FILE* f = fopen(path, "rb");
+            uint8_t h[32];
+            if (f) { enc = fread(h, 1, 32, f) == 32 && ray_col_gen_of(h) == 2; fclose(f); }
+        }
+        ray_error_free(c);
+        return enc ? RAY_ERR_NYI : RAY_ERR_IO;
+    }
+    if (!c) return RAY_ERR_IO;
+    *out = c;
+    return RAY_OK;
+}
+
 static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* prefix,
                                 bool use_mmap) {
     char path[1024];
@@ -404,28 +655,26 @@ static ray_err_t csr_load_impl(ray_csr_t* csr, const char* dir, const char* pref
 
     len = snprintf(path, sizeof(path), "%s/%s_offsets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->offsets = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (!csr->offsets || RAY_IS_ERR(csr->offsets)) {
-        csr->offsets = NULL;
-        return RAY_ERR_IO;
-    }
+    ray_err_t ce = csr_col(path, use_mmap, &csr->offsets);
+    if (ce != RAY_OK) return ce;
 
     len = snprintf(path, sizeof(path), "%s/%s_targets", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->targets = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (!csr->targets || RAY_IS_ERR(csr->targets)) {
+    ce = csr_col(path, use_mmap, &csr->targets);
+    if (ce != RAY_OK) {
         ray_release(csr->offsets); csr->offsets = NULL;
-        csr->targets = NULL;
-        return RAY_ERR_IO;
+        return ce;
     }
 
     len = snprintf(path, sizeof(path), "%s/%s_rowmap", dir, prefix);
     if (len < 0 || (size_t)len >= sizeof(path)) return RAY_ERR_IO;
-    csr->rowmap = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-    if (!csr->rowmap || RAY_IS_ERR(csr->rowmap)) {
-        /* rowmap is optional — ignore error */
-        csr->rowmap = NULL;
+    ce = csr_col(path, use_mmap, &csr->rowmap);
+    if (ce == RAY_ERR_NYI) {
+        ray_release(csr->offsets); csr->offsets = NULL;
+        ray_release(csr->targets); csr->targets = NULL;
+        return ce;
     }
+    /* rowmap is optional — a missing or unreadable file is absent */
 
     if (csr->offsets->len < 1) {
         ray_release(csr->offsets); csr->offsets = NULL;
@@ -514,8 +763,13 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
     char path[1024];
     int len = snprintf(path, sizeof(path), "%s/meta", dir);
     if (len >= 0 && (size_t)len < sizeof(path)) {
-        ray_t* meta = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
-        if (meta && !RAY_IS_ERR(meta) && meta->len >= 5) {
+        ray_t* meta = NULL;
+        if (csr_col(path, use_mmap, &meta) == RAY_ERR_NYI) {
+            csr_free(&rel->fwd); csr_free(&rel->rev);
+            ray_sys_free(rel);
+            return NULL;
+        }
+        if (meta && meta->len >= 5) {
             int64_t* md = (int64_t*)ray_data(meta);
             rel->from_table = (uint16_t)md[0];
             rel->to_table = (uint16_t)md[1];
@@ -523,7 +777,7 @@ static ray_rel_t* rel_load_impl(const char* dir, bool use_mmap) {
             rel->fwd.sorted = md[3] != 0;
             rel->rev.sorted = md[4] != 0;
             ray_release(meta);
-        } else if (meta && !RAY_IS_ERR(meta)) {
+        } else if (meta) {
             ray_release(meta);
         }
     }

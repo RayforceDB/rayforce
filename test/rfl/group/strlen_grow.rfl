@@ -106,3 +106,251 @@
 ;;   key 1000 -> only row v=1000 -> bot-1 = [1000] (per-group list)
 (first (first (at (select {b: (bot v 1) by: k from: Ttk where: (== k 1000)}) 'b))) -- 1000
 (first (at (select {b: (bot v 1) by: k from: Ttk where: (== k 1000)}) 'k)) -- 1000
+
+;; ────────────────────────────────────────────────────────────────────
+;; strlen fusion null semantics: "" is the STR/SYM null, strlen maps it
+;; to null, so sum/avg(strlen s) skip it — neither the sum nor the AVG
+;; divisor counts it — on every route (issue #770).  The keyless scalar
+;; route and the direct-array route (reached by an integer key under the
+;; count emit filter `where: (> c N)` over the inner select) counted ""
+;; as length 0.  Non-empty lengths 2 4 6 2 4: avg 3.6; g=0 -> (2+4)/2 =
+;; 3.0, g=1 -> (6+2+4)/3 = 4.0, g=2 all "" -> avg null, sum 0.
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf rf_test_strlen_null_spl rf_test_strlen_null_part rf_test_strlen_null_party")
+(set Tn (table [g s] (list [0 0 0 0 1 1 1 1 2 2] (list "aa" "" "bbbb" "" "cccccc" "dd" "" "eeee" "" ""))))
+(set Yn (table [g s] (list (at Tn 'g) (as 'SYM (at Tn 's)))))
+(avg (strlen (at Tn 's))) -- 3.6
+(avg (strlen (at Yn 's))) -- 3.6
+;; keyless scalar route
+(at (select {a: (avg (strlen s)) from: Tn}) 'a) -- [3.6]
+(at (select {b: (sum (strlen s)) from: Tn}) 'b) -- [18]
+(at (select {a: (avg (strlen s)) from: Yn}) 'a) -- [3.6]
+(at (select {a: (avg (strlen s)) from: Tn where: (== g 0)}) 'a) -- [3.0]
+(at (select {a: (avg (strlen s)) from: Tn where: (== g 2)}) 'a) -- [0Nf]
+(at (select {b: (sum (strlen s)) from: Tn where: (== g 2)}) 'b) -- [0]
+(at (select {a: (avg (strlen s)) m: (min (strlen s)) x: (max (strlen s)) from: Tn}) 'm) -- [2]
+;; v2 grouped route
+(at (select {a: (avg (strlen s)) from: Tn by: g}) 'a) -- [3.0 4.0 0Nf]
+(at (select {a: (avg (strlen s)) from: Yn by: g}) 'a) -- [3.0 4.0 0Nf]
+;; direct-array route: SUM/AVG-only accumulator (STR and SYM)
+(set Rd (select {from: (select {c: (count s) a: (avg (strlen s)) b: (sum (strlen s)) from: Tn by: g}) where: (> c 1)}))
+(at Rd 'g) -- [0 1 2]
+(at Rd 'a) -- [3.0 4.0 0Nf]
+(at Rd 'b) -- [6 12 0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Yn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; direct-array route: generic accumulator (a MAX alongside)
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) m: (max g) from: Tn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) m: (max g) from: Yn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; hash route: sparse wide keys
+(set Wn (table [g s] (list (+ 7 (* 100000000 (at Tn 'g))) (at Tn 's))))
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Wn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; SYM key
+(set Kn (table [g s] (list (as 'SYM (at Tn 'g)) (at Tn 's))))
+(at (select {a: (avg (strlen s)) from: Kn by: g}) 'a) -- [3.0 4.0 0Nf]
+;; splayed STR and SYM
+(.db.splayed.set "rf_test_strlen_null_spl/T/" Tn)
+(.db.splayed.set "rf_test_strlen_null_spl/Y/" Yn)
+(set TSn (.db.splayed.get "rf_test_strlen_null_spl/T/"))
+(set YSn (.db.splayed.get "rf_test_strlen_null_spl/Y/"))
+(at (select {a: (avg (strlen s)) from: TSn}) 'a) -- [3.6]
+(at (select {a: (avg (strlen s)) from: YSn}) 'a) -- [3.6]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: TSn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: YSn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; parted STR and SYM: two copies of the table, same ratios
+(.db.splayed.set "rf_test_strlen_null_part/2024.01.01/t/" Tn)
+(.db.splayed.set "rf_test_strlen_null_part/2024.01.02/t/" Tn)
+(.db.splayed.set "rf_test_strlen_null_party/2024.01.01/t/" Yn)
+(.db.splayed.set "rf_test_strlen_null_party/2024.01.02/t/" Yn)
+(set Pn (.db.parted.get "rf_test_strlen_null_part/" 't))
+(set PYn (.db.parted.get "rf_test_strlen_null_party/" 't))
+(at (select {a: (avg (strlen s)) from: Pn}) 'a) -- [3.6]
+(at (select {b: (sum (strlen s)) from: Pn}) 'b) -- [36]
+(at (select {a: (avg (strlen s)) from: Pn where: (== g 0)}) 'a) -- [3.0]
+(at (select {a: (avg (strlen s)) from: PYn}) 'a) -- [3.6]
+(at (select {a: (avg (strlen s)) from: Pn by: g}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Pn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: PYn by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(.sys.exec "rm -rf rf_test_strlen_null_spl rf_test_strlen_null_part rf_test_strlen_null_party")
+;; above the parallel threshold: every third value "", otherwise "abcd"
+(set NL 100000)
+(set Tl (table [g s] (list (% (til NL) 2) (take (list "abcd" "abcd" "") NL))))
+(avg (strlen (at Tl 's))) -- 4.0
+(at (select {a: (avg (strlen s)) from: Tl}) 'a) -- [4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+(set Yl (table [g s] (list (at Tl 'g) (as 'SYM (at Tl 's)))))
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Yl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+;; SUM-only strlen (no null tracking: "" adds 0) on the keyless and the
+;; direct-array routes, STR and SYM
+(at (select {b: (sum (strlen s)) from: Yn}) 'b) -- [18]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Tn by: g}) where: (> c 1)}) 'b) -- [6 12 0]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yn by: g}) where: (> c 1)}) 'b) -- [6 12 0]
+;; AVG(strlen) beside an aggregate over a nullable column (per-agg non-null
+;; counts present): v is null on rows 1 and 4
+(set Tv (table [g s v] (list (at Tn 'g) (at Tn 's) [1 0N 3 4 0N 6 7 8 9 10])))
+(set Rv (select {from: (select {c: (count s) a: (avg (strlen s)) m: (max v) from: Tv by: g}) where: (> c 1)}))
+(at Rv 'a) -- [3.0 4.0 0Nf]
+(at Rv 'm) -- [4 8 10]
+(set Rv2 (select {from: (select {c: (count s) a: (avg (strlen s)) x: (avg v) from: Tv by: g}) where: (> c 1)}))
+(at Rv2 'a) -- [3.0 4.0 0Nf]
+(at Rv2 'x) -- [2.6666666666666665 7.0 9.5]
+;; per-worker merges.  2000 slots x 3 cells = 6000 per accumulator, so 100000
+;; rows allow 16 accumulators: with the 2 workers `make test` pins
+;; (RAYFORCE_CORES=2) each worker keeps its own and the parallel slot merge
+;; runs; fewer rows or more slots would change the path.  FIRST beside
+;; (row-ordered merge); every group holds both "abcd" and ""
+(set Tm (table [g s] (list (% (til NL) 2000) (take (list "abcd" "abcd" "") NL))))
+(set Rm (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tm by: g}) where: (> c 1)}))
+(count Rm) -- 2000
+(distinct (at Rm 'a)) -- [4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) f: (first g) from: Tl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) f: (first g) from: Yl by: g}) where: (> c 1)}) 'a) -- [4.0 4.0]
+;; one strlen agg beside COUNTs (the specialised direct-array loop): key
+;; widths and signedness, SYM key, >=4096 slots (the two `where:` queries
+;; below carry a selection, so they run the generic da_accum_row)
+(set Kw (table [g s] (list [0 0 0 0 1 1 1 1 2 2] (at Tn 's))))
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I32 (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I16 (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'U8 (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (- (at Kw 'g) 5) (at Yn 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'SYM (at Kw 'g)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tn by: g where: (!= g 1)}) where: (> c 1)}) 'a) -- [3.0 0Nf]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yn by: g where: (!= g 0)}) where: (> c 1)}) 'b) -- [12 0]
+;; 5000 slots: with RAYFORCE_CORES=2 (make test) 100000 rows give a budget of
+;; 6 accumulators, so the per-worker accumulators are merged slot-parallel
+(set Tw (table [g s] (list (% (til NL) 5000) (take (list "abcd" "abcd" "") NL))))
+(distinct (at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Tw by: g}) where: (> c 1)}) 'a)) -- [4.0]
+(set Yw (table [g s] (list (at Tw 'g) (as 'SYM (at Tw 's)))))
+(distinct (at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Yw by: g}) where: (> c 1)}) 'a)) -- [4.0]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I16 (- (at Kw 'g) 5)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: (table [g s] (list (as 'I32 (- (at Kw 'g) 5)) (at Kw 's))) by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; a null SYM key groups with itself
+(set Kz (table [g s] (list (as 'SYM (list "" "" "" "" "b" "b" "b" "b" "c" "c")) (at Tn 's))))
+(at (select {from: (select {c: (count s) a: (avg (strlen s)) from: Kz by: g}) where: (> c 1)}) 'a) -- [3.0 4.0 0Nf]
+;; exact sums across the 512-row length blocks of the specialised loop
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Tl by: g}) where: (> c 1)}) 'b) -- [133332 133336]
+(at (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yl by: g}) where: (> c 1)}) 'b) -- [133332 133336]
+
+;; ────────────────────────────────────────────────────────────────────
+;; FILE-domain SYM through the specialised loop (SYM id widths W16/W32),
+;; the keyless route, narrow SYM key widths, a composite key, and the
+;; slot-partitioned drain.  Expected values are hand-computed constants
+;; or the vector-level (sum/avg (strlen ...)) of the same column.
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_strlen888_w16 /tmp/rfl_strlen888_w32 /tmp/rfl_strlen888_k8 /tmp/rfl_strlen888_k16 /tmp/rfl_strlen888_k32")
+;; W16: 300 distinct symbols '0..'299 (lengths 1/2/3) plus six "" nulls at
+;; rows 1000..1005, groups i % 4.  Group sums 638 638 642 642 over 250
+;; non-empty rows each (the vector-level oracle agrees).
+(set M16 (concat (as 'SYM (% (til 1000) 300)) (as 'SYM (list "" "" "" "" "" ""))))
+(set G16 (% (til 1006) 4))
+(sum (strlen M16)) -- 2560
+(sum (strlen (at M16 (where (== G16 2))))) -- 642
+(.db.splayed.set "/tmp/rfl_strlen888_w16/T/" (table [g s] (list G16 M16)))
+(set Y16 (.db.splayed.get "/tmp/rfl_strlen888_w16/T/"))
+(set R16 (select {from: (select {c: (count s) b: (sum (strlen s)) from: Y16 by: g}) where: (> c 1)}))
+(set R16m (select {from: (select {c: (count s) m: (avg (strlen s)) from: Y16 by: g}) where: (> c 1)}))
+(at R16 'b) -- [638 638 642 642]
+(at R16m 'm) -- [2.552 2.552 2.568 2.568]
+;; keyless over the same FILE-domain column (the pinned vocabulary)
+(at (select {b: (sum (strlen s)) m: (avg (strlen s)) from: Y16}) 'b) -- [2560]
+(at (select {b: (sum (strlen s)) from: Y16 where: (== g 3)}) 'b) -- [642]
+;; W32: 70000 distinct symbols '0..'69999, groups below / from 35000:
+;; lengths 10*1 + 90*2 + 900*3 + 9000*4 + 25000*5 = 163890, and 35000*5.
+(set M32 (as 'SYM (til 70000)))
+(set G32 (div (til 70000) 35000))
+(.db.splayed.set "/tmp/rfl_strlen888_w32/T/" (table [g s] (list G32 M32)))
+(set Y32 (.db.splayed.get "/tmp/rfl_strlen888_w32/T/"))
+(set R32 (select {from: (select {c: (count s) b: (sum (strlen s)) from: Y32 by: g}) where: (> c 1)}))
+(set R32m (select {from: (select {c: (count s) m: (avg (strlen s)) from: Y32 by: g}) where: (> c 1)}))
+(at R32 'b) -- [163890 175000]
+(at R32m 'm) -- [4.682571428571428 5.0]
+(at (select {b: (sum (strlen s)) from: Y32}) 'b) -- [338890]
+;; narrow SYM key widths (mapped columns): every key holds the four rows
+;; "" "ab" "cde" "fghi" -> sum 9 over 3 non-empty rows, avg 3.0.
+;; K=200 keys (W8), K=300 (W16); the W32 key follows below.
+(set Wk (fn [K] (table [g s] (list (as 'SYM (% (til (* 4 K)) K)) (at (list "" "ab" "cde" "fghi") (div (til (* 4 K)) K))))))
+(.db.splayed.set "/tmp/rfl_strlen888_k8/T/" (Wk 200))
+(.db.splayed.set "/tmp/rfl_strlen888_k16/T/" (Wk 300))
+(set K8 (select {from: (select {c: (count s) b: (sum (strlen s)) from: (.db.splayed.get "/tmp/rfl_strlen888_k8/T/") by: g}) where: (> c 1)}))
+(set K8m (select {from: (select {c: (count s) m: (avg (strlen s)) from: (.db.splayed.get "/tmp/rfl_strlen888_k8/T/") by: g}) where: (> c 1)}))
+(set K16 (select {from: (select {c: (count s) b: (sum (strlen s)) from: (.db.splayed.get "/tmp/rfl_strlen888_k16/T/") by: g}) where: (> c 1)}))
+(set K16m (select {from: (select {c: (count s) m: (avg (strlen s)) from: (.db.splayed.get "/tmp/rfl_strlen888_k16/T/") by: g}) where: (> c 1)}))
+(count K8) -- 200
+(count K16) -- 300
+(distinct (at K8 'b)) -- [9]
+(distinct (at K16 'b)) -- [9]
+(distinct (at K8m 'm)) -- [3.0]
+(distinct (at K16m 'm)) -- [3.0]
+;; W32 key: 65600 filler rows with distinct key symbols come first, so the
+;; keys of the last 60000 rows (a slice, below the parallel threshold) have
+;; ids above 65535 and are read at 4 bytes.  Each of 30000 tail keys holds
+;; two rows of the same class ("" "ab" "cde" "fghi" by row mod 4):
+;; sum = 2 * length, avg = length, null for "".  The oracle is the
+;; vector-level strlen of the tail's first 30000 rows.
+(set F32 65600)
+(set S32 (at (list "" "ab" "cde" "fghi") (% (til 60000) 4)))
+(set T32 (table [g s] (list (as 'SYM (concat (til F32) (+ F32 (% (til 60000) 30000)))) (concat (take (list "x") F32) S32))))
+(.db.splayed.set "/tmp/rfl_strlen888_k32/T/" T32)
+(set Z32 (drop (.db.splayed.get "/tmp/rfl_strlen888_k32/T/") F32))
+(set O32 (strlen (take (at Z32 's) 30000)))
+(set K32 (select {from: (select {c: (count s) b: (sum (strlen s)) from: Z32 by: g}) where: (> c 1)}))
+(set K32m (select {from: (select {c: (count s) m: (avg (strlen s)) from: Z32 by: g}) where: (> c 1)}))
+(count K32) -- 30000
+(sum (at K32 'b)) -- 135000
+(sum (== (at K32 'b) (* 2 O32))) -- 22500
+(sum (== (at K32m 'm) (as 'F64 O32))) -- 30000
+(sum (nil? (at K32m 'm))) -- 7500
+(.sys.exec "rm -rf /tmp/rfl_strlen888_w16 /tmp/rfl_strlen888_w32 /tmp/rfl_strlen888_k8 /tmp/rfl_strlen888_k16 /tmp/rfl_strlen888_k32")
+;; composite (two-key) direct-array AVG(strlen): groups (0,0) (0,1) (1,0)
+;; (1,1) (2,0); "aa"+"" -> 2.0, "bbbb"+"" -> 4.0, "cccccc"+"dd" -> 4.0,
+;; ""+"eeee" -> 4.0, ""+"" -> null (sum 0)
+(set Tc (table [a b s] (list [0 0 0 0 1 1 1 1 2 2] [0 0 1 1 0 0 1 1 0 0] (list "aa" "" "bbbb" "" "cccccc" "dd" "" "eeee" "" ""))))
+(set Rc (select {from: (select {c: (count s) m: (avg (strlen s)) t: (sum (strlen s)) from: Tc by: [a b]}) where: (> c 1)}))
+(at Rc 'm) -- [2.0 4.0 4.0 4.0 0Nf]
+(at Rc 't) -- [2 4 8 4 0]
+(set Yc (table [a b s] (list (at Tc 'a) (at Tc 'b) (as 'SYM (at Tc 's)))))
+(at (select {from: (select {c: (count s) m: (avg (strlen s)) from: Yc by: [a b]}) where: (> c 1)}) 'm) -- [2.0 4.0 4.0 4.0 0Nf]
+;; slot-partitioned drain: 17999 slots x 3 cells = 53997 per worker against
+;; 107994 scanned rows leaves the budget under 2 workers, so with 2 or more
+;; workers the rows are bucketed by slot span (n_slots >= 2 * workers).
+;; Each group holds rows g + 17999*j, j = 0..5: two "" and four "abcd".
+(set NP 107994)
+(set Tq (table [g s] (list (% (til NP) 17999) (take (list "abcd" "abcd" "") NP))))
+(set Rq (select {from: (select {c: (count s) b: (sum (strlen s)) from: Tq by: g}) where: (> c 1)}))
+(set Rqm (select {from: (select {c: (count s) m: (avg (strlen s)) from: Tq by: g}) where: (> c 1)}))
+(count Rq) -- 17999
+(distinct (at Rq 'b)) -- [16]
+(distinct (at Rqm 'm)) -- [4.0]
+(set Yq (table [g s] (list (at Tq 'g) (as 'SYM (at Tq 's)))))
+(set Rqy (select {from: (select {c: (count s) b: (sum (strlen s)) from: Yq by: g}) where: (> c 1)}))
+(set Rqym (select {from: (select {c: (count s) m: (avg (strlen s)) from: Yq by: g}) where: (> c 1)}))
+(distinct (at Rqy 'b)) -- [16]
+(distinct (at Rqym 'm)) -- [4.0]
+
+;; FILE-domain SYM column (a splayed table's symbol file with its .sym.ix
+;; index): strlen reads the lengths from the index.  Symbols of 0, 1, 5, 254,
+;; 255, 256, 300 and 1000 bytes and multi-byte UTF-8 ones (6, 254, 256, 258
+;; bytes) must give the lengths the in-memory twin (runtime domain) gives,
+;; through the plain vector strlen, the keyless sum, the direct-array group-by
+;; (the ClickBench #28 shape, with a where: and a second select) and the
+;; sparse one.
+(.os.setenv "RAY_SYM_INDEX_MIN" "0") -- "0"
+(.sys.exec "rm -rf /tmp/rfl_strlen_ix")
+(set LNx [0 1 5 254 255 256 300 1000])
+(set VAx (map (fn [n] (raze (take (list "a") n))) LNx))
+(set VUx (map (fn [n] (raze (take (list "é") n))) [3 127 128 129]))
+(set VSx (concat VAx VUx))
+(set NRx 70000)
+(set SYx (as 'SYM (map (fn [i] (at VSx i)) (% (til NRx) (count VSx)))))
+(set Tix (table [k w s] (list (% (til NRx) 3) (* 1000000 (% (til NRx) 5)) SYx)))
+(count (.db.splayed.set "/tmp/rfl_strlen_ix/" Tix)) -- 70000
+(set Fix (.db.splayed.get "/tmp/rfl_strlen_ix/"))
+(count (.sys.exec "ls /tmp/rfl_strlen_ix/.sym.ix")) -- 1
+(all (== (strlen (at Fix 's)) (strlen SYx))) -- true
+(sum (strlen (at Fix 's))) -- 16595145
+(distinct (strlen (at Fix 's))) -- [0Nl 1 5 6 254 255 256 258 300 1000]
+(sum (at (select {t: (sum (strlen s)) from: Fix}) 't)) -- 16595145
+(at (select {from: (select {l: (avg (strlen s)) c: (count s) by: k from: Fix where: (!= s "")}) where: (> c 100)}) 'l) -- (at (select {from: (select {l: (avg (strlen s)) c: (count s) by: k from: Tix where: (!= s "")}) where: (> c 100)}) 'l)
+(at (select {t: (sum (strlen s)) c: (count s) by: k from: Fix}) 't) -- (at (select {t: (sum (strlen s)) c: (count s) by: k from: Tix}) 't)
+(at (select {l: (avg (strlen s)) by: w from: Fix where: (!= s "")}) 'l) -- (at (select {l: (avg (strlen s)) by: w from: Tix where: (!= s "")}) 'l)
+(.sys.exec "rm -rf /tmp/rfl_strlen_ix")
+(.os.setenv "RAY_SYM_INDEX_MIN" "") -- ""

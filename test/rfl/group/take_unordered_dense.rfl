@@ -67,13 +67,14 @@
 (set Fs (.db.splayed.get "rf_test_firstn_take/"))
 (eqt (select {from: Fs by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (select {from: F by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10})) -- true
 (eqt (select {from: Fs by: y c: (count u) mx: (max v) f: (min i) take: 10}) (select {from: F by: y c: (count u) mx: (max v) f: (min i) take: 10})) -- true
-;; a parted table keeps the post-execution take over its own group order:
-;; the take is the head of its full result, and the groups are exact
+;; a parted table answers like the in-memory table: the first groups in
+;; first-seen order (f, the first row index of each group, is ascending),
+;; and the groups are exact
 (.db.splayed.set "rf_test_firstn_parted/1/t/" (take F [0 100000]))
 (.db.splayed.set "rf_test_firstn_parted/2/t/" (take F [100000 100000]))
 (.db.splayed.set "rf_test_firstn_parted/3/t/" (take F [200000 100000]))
 (set Fp (.db.parted.get "rf_test_firstn_parted/" 't))
 (set Pfull (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i)}))
-(eqt (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (take Pfull 10)) -- true
+(eqt (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (take (xasc Pfull 'f) 10)) -- true
 (eqt (xasc Pfull 'f) (xasc (select {from: F by: [u s] c: (count u) sv: (sum v) f: (min i)}) 'f)) -- true
 (.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0

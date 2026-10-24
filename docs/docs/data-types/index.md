@@ -13,17 +13,20 @@ All scalar types, their internal constants, storage sizes, and Rayfall literal s
 | **Short integer** | `RAY_I16` | 3 | 2 bytes | `0Nh` | Small integers |
 | **Integer** | `RAY_I32` | 4 | 4 bytes | `0Ni` | `42i` |
 | **Long integer** | `RAY_I64` | 5 | 8 bytes | `0Nl` | `42` |
-| **Single float** | `RAY_F32` | 6 | 4 bytes | sentinel | — |
+| **Single float** | `RAY_F32` | 6 | 4 bytes | `0Ne` | `1.5e` |
 | **Double float** | `RAY_F64` | 7 | 8 bytes | `0Nf` | `3.14` |
 | **Date** | `RAY_DATE` | 8 | 4 bytes | `0Nd` | `2024.01.15` |
 | **Time** | `RAY_TIME` | 9 | 4 bytes | `0Nt` | `09:30:00.000` |
 | **Timestamp** | `RAY_TIMESTAMP` | 10 | 8 bytes | `0Np` | `2024.01.15D09:30:00.000000000` |
-| **GUID** | `RAY_GUID` | 11 | 16 bytes | all-zero GUID | UUID format |
-| **Symbol** | `RAY_SYM` | 12 | Adaptive (8/16/32/64-bit) | none | `'AAPL`, `[AAPL GOOG]` |
-| **String** | `RAY_STR` | 13 | 16 bytes per element | none | `"hello"` |
+| **GUID** | `RAY_GUID` | 11 | 16 bytes | `0Ng` (the all-zero GUID) | `(as 'GUID "...")` |
+| **Symbol** | `RAY_SYM` | 12 | Adaptive (8/16/32/64-bit) | `'` (empty symbol) | `'AAPL`, `[AAPL GOOG]` |
+| **String** | `RAY_STR` | 13 | 16 bytes per element | `""` (empty string) | `"hello"` |
+| **Timespan** | `RAY_TIMESPAN` | 16 | 8 bytes | `0Nn` | `1D`, `0D01:00:00.000000000` |
+
+TIMESPAN is a signed nanosecond duration. See [duration syntax, arithmetic, and migration](../guides/timespan.md). Internal tags 14 and 15 remain reserved.
 
 !!! note "Null handling"
-    Nulls are sentinel-encoded directly in the data array (`INT64_MIN` for `i64`, `NaN` for `f64`, the type-correct reserved value otherwise), not a separate bitmap; the `HAS_NULLS` attribute is a fast "may contain nulls" hint. Parseable null literals are `0Nh` (i16), `0Ni` (i32), `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), and `0Np` (timestamp). `RAY_BOOL`, `RAY_U8`, `RAY_SYM`, and `RAY_STR` have no distinct null value. Use `nil?` to test for null.
+    Nulls are sentinel-encoded directly in the data array (`INT64_MIN` for `i64`, `NaN` for `f64`, the type-correct reserved value otherwise), not a separate bitmap; the `HAS_NULLS` attribute is a fast "may contain nulls" hint. Parseable null literals are `0Nh` (i16), `0Ni` (i32), `0Nl` (i64), `0Nf` (f64), `0Ne` (f32), `0Ng` (guid), `0Nd` (date), `0Nt` (time), `0Np` (timestamp), and `0Nn` (timespan). `RAY_BOOL` and `RAY_U8` have no null value. `RAY_SYM`'s null is the empty symbol `'` and `RAY_STR`'s is the empty string `""`: `(nil? ')` and `(nil? "")` are `true`. Use `nil?` to test for null.
 
 !!! note "Note"
     RAY_SYM and RAY_STR are both string types but serve different purposes. Symbols are dictionary-encoded (interned integers) — ideal for categorical data with repeated values like stock tickers or country codes. Strings are variable-length and stored inline or in a pool — ideal for free-form text.
@@ -124,11 +127,11 @@ ray> (as 'DATE "2024.01.15")
 
 | From | To | Notes |
 |---|---|---|
-| Any numeric | Any numeric | Widening is lossless; narrowing truncates |
+| Any numeric | Any numeric | Widening is lossless; narrowing truncates; F64 → F32 saturates past the F32 range |
 | BOOL | I64, F64 | `true` → 1, `false` → 0 |
 | I64, F64 | BOOL | Non-zero → `true` |
 | Any scalar | STR | Formatted string representation |
-| STR | I64, F64, DATE, TIME, TIMESTAMP | Parsed from standard format |
+| STR | I64, F32, F64, DATE, TIME, TIMESTAMP | Parsed from standard format |
 | SYM | STR | Resolves interned string |
 | STR | SYM | Interns the string |
 | DATE | TIMESTAMP | Midnight on that date |
@@ -140,7 +143,7 @@ Rayforce has three temporal types with different precision and epoch conventions
 
 ### RAY_DATE
 
-Stored as a 32-bit signed integer counting **days since 2000.01.01**. This gives a range of roughly 5.8 million years in either direction.
+Stored as a 32-bit signed integer counting **days since 2000.01.01**. This gives a range of roughly 5.8 million years in either direction. A result past that range keeps its low 32 bits, the same for an atom and for a vector cell.
 
 ```lisp
 ray> 2024.01.15
@@ -153,7 +156,7 @@ ray> (+ 2024.01.15 30)
 
 ### RAY_TIME
 
-Stored as a 32-bit signed integer counting **milliseconds since midnight**. Range covers a full day (0 to 86,399,999 ms).
+Stored as a 32-bit signed integer counting **milliseconds since midnight**. A time of day uses 0 to 86,399,999 ms, but values past 24 hours and negative values are valid, up to about ±596 hours (±2^31 ms). A result past that range keeps its low 32 bits, the same for an atom and for a vector cell: `(* 25 24:00:00.000)` is `-593:02:47.296`.
 
 ```lisp
 ray> 09:30:00.000

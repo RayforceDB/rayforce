@@ -8,6 +8,8 @@
 (prior > [3 1 4 1 5]) -- [false false true false true]
 (prior <= [1 1 2]) -- [true true false]
 (prior >= [1 1 2]) -- [true true true]
+(type (prior == ['a 'a 'b 'b 'a])) -- 'B8
+(type (prior != ['a 'a 'b 'b 'a])) -- 'B8
 (prior == ['a 'a 'b 'b 'a]) -- [true true false true false]
 (prior != ['a 'a 'b 'b 'a]) -- [false false true false true]
 (prior != [1.5 1.5 2.0]) -- [false false true]
@@ -36,3 +38,20 @@
 (where (> (til 100000) 99997)) -- [99998 99999]
 (count (where (>= (til 32) 0))) -- 32
 (where [false false false]) -- (as 'I64 (list))
+
+;; #966: SYM null0 compares as an ordinary canonical code for EQ/NE.
+(set PS (as 'SYM (list "" "" "a" "a" "" "b")))
+(type (prior == PS)) -- 'B8
+(prior == PS) -- [true true false true false false]
+(prior != PS) -- [false false true false true true]
+(where (prior == PS)) -- [0 1 3]
+(type (prior == (take PS -3))) -- 'B8
+(prior == (take PS -3)) -- [true false false]
+(prior != (take PS -3)) -- [false true true]
+(type (prior == ['a])) -- 'B8
+(prior == ['a]) -- [true]
+(count (prior == (as 'SYM (list)))) -- 0
+;; Arbitrary callbacks and nullable numeric inputs retain their boxed path.
+(type (prior (fn [a b] (== a b)) ['a 'b 'b])) -- 'LIST
+(type (prior == VN)) -- 'LIST
+(where (and (prior < [3 2 1]) (prior == ['a 'b 'b]))) -- [2]

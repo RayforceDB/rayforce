@@ -6477,7 +6477,7 @@ static test_result_t test_expr_f64_div_zero_scalar(void) {
     PASS();
 }
 
-/* ---- const_expr_to_i64: F64 constant in linear expression (lines 162-167) ---- */
+/* ---- const_expr_to_i64: an F64 constant declines the linear plan ---- */
 static test_result_t test_expr_group_linear_f64_const(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -6490,8 +6490,8 @@ static test_result_t test_expr_group_linear_f64_const(void) {
     ray_release(v);
 
     /* GROUP n_keys=0, SUM(const_f64(2.0) * a):
-     * const_expr_to_i64 is called on const_f64(2.0), c_is_f64=true,
-     * modf(2.0)=0 → exercises lines 162-167 */
+     * const_expr_to_i64 is called on const_f64(2.0), c_is_f64=true, so it
+     * declines and the F64 product is summed as F64 */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* c2  = ray_const_f64(g, 2.0);
     ray_op_t* a_op = ray_scan(g, "a");
@@ -6505,8 +6505,9 @@ static test_result_t test_expr_group_linear_f64_const(void) {
 
     ray_t* sum_col = ray_table_get_col_idx(result, 0);
     TEST_ASSERT_NOT_NULL(sum_col);
-    /* 2*(1+2+3+4+5) = 30 */
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(sum_col))[0], 30);
+    /* 2.0*(1+2+3+4+5) = 30.0 */
+    TEST_ASSERT_EQ_I(sum_col->type, RAY_F64);
+    TEST_ASSERT_EQ_F(((double*)ray_data(sum_col))[0], 30.0, 0.0);
 
     ray_release(result);
     ray_graph_free(g);
@@ -6623,8 +6624,9 @@ static test_result_t test_expr_group_affine_neg_f64_const(void) {
 
     ray_t* sum_col = ray_table_get_col_idx(result, 0);
     TEST_ASSERT_NOT_NULL(sum_col);
-    /* sum(a - 5) = 5+15+25 = 45 */
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(sum_col))[0], 45);
+    /* sum(a - 5.0) = 5+15+25 = 45.0 */
+    TEST_ASSERT_EQ_I(sum_col->type, RAY_F64);
+    TEST_ASSERT_EQ_F(((double*)ray_data(sum_col))[0], 45.0, 0.0);
 
     ray_release(result);
     ray_graph_free(g);
@@ -6686,8 +6688,9 @@ static test_result_t test_expr_group_affine_const_add(void) {
 
     sum_col = ray_table_get_col_idx(result, 0);
     TEST_ASSERT_NOT_NULL(sum_col);
-    /* sum(a + 5.0) = 1+2+3 + 3*5 = 21 */
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(sum_col))[0], 21);
+    /* sum(a + 5.0) = 1+2+3 + 3*5 = 21.0 */
+    TEST_ASSERT_EQ_I(sum_col->type, RAY_F64);
+    TEST_ASSERT_EQ_F(((double*)ray_data(sum_col))[0], 21.0, 0.0);
 
     ray_release(result);
     ray_graph_free(g);
@@ -6711,8 +6714,8 @@ static test_result_t test_expr_group_affine_f64_i64(void) {
     ray_release(v);
 
     /* GROUP n_keys=0, SUM(a + const_f64(5.0)):
-     * try_affine_sumavg_input: bt=RAY_I64, c_is_f64=true, c_f=5.0
-     * → exercises lines 364-369 (isfinite+modf checks for I64 base) */
+     * try_affine_sumavg_input: bt=RAY_I64, c_is_f64=true, c_f=5.0 → the
+     * scalar route takes it as an F64 bias (agg_affine_t.f64) */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a_op = ray_scan(g, "a");
     ray_op_t* c5   = ray_const_f64(g, 5.0);
@@ -6726,11 +6729,150 @@ static test_result_t test_expr_group_affine_f64_i64(void) {
 
     ray_t* sum_col = ray_table_get_col_idx(result, 0);
     TEST_ASSERT_NOT_NULL(sum_col);
-    /* sum(a + 5) = (10+5) + (20+5) + (30+5) = 75 */
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(sum_col))[0], 75);
+    /* sum(a + 5.0) = (10+5) + (20+5) + (30+5) = 75.0 */
+    TEST_ASSERT_EQ_I(sum_col->type, RAY_F64);
+    TEST_ASSERT_EQ_F(((double*)ray_data(sum_col))[0], 75.0, 0.0);
 
     ray_release(result);
     ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- a FLOAT constant over an integer column: SUM and AVG are F64 ----
+ *
+ * try_affine_sumavg_input takes a FLOAT c over a narrow integer column only
+ * when its type-wide bound proves exact F64 arithmetic (f64_bias_ok: the
+ * scalar route). I64 and a large or fractional bias must be evaluated per
+ * row. The linear plan declines a FLOAT constant outright. The keyed group at the end is a
+ * control: that route already summed (a + 5.0) as F64, and still does. */
+static test_result_t test_expr_affine_f64_bias_route(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t a_raw[] = {10, 20, 30};
+    int64_t k_raw[] = {0, 1, 0};
+    ray_t* a_vec  = ray_vec_from_raw(RAY_I64, a_raw, 3);
+    ray_t* k_vec  = ray_vec_from_raw(RAY_I64, k_raw, 3);
+    ray_t* ts_vec = ray_vec_from_raw(RAY_TIMESTAMP, a_raw, 3);
+    int16_t h_raw[] = {10, 20, 30};
+    ray_t* h_vec = ray_vec_from_raw(RAY_I16, h_raw, 3);
+    ray_t* tbl = ray_table_new(4);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("a", 1), a_vec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), k_vec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("ts", 2), ts_vec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("h", 1), h_vec);
+    ray_release(a_vec); ray_release(k_vec); ray_release(ts_vec); ray_release(h_vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* add_f = ray_add(g, ray_scan(g, "a"), ray_const_f64(g, 5.0));
+    ray_op_t* add_i = ray_add(g, ray_scan(g, "a"), ray_const_i64(g, 5));
+    ray_op_t* add_h = ray_add(g, ray_scan(g, "h"), ray_const_f64(g, 5.0));
+    ray_op_t* add_h_big = ray_add(g, ray_scan(g, "h"),
+                                  ray_const_f64(g, 9007199254740992.0));
+    ray_op_t* add_h_fraction = ray_add(g, ray_scan(g, "h"), ray_const_f64(g, 0.5));
+    ray_op_t* ts_f  = ray_add(g, ray_scan(g, "ts"), ray_const_f64(g, 5.0));
+    ray_op_t* mul_f = ray_mul(g, ray_scan(g, "a"), ray_const_f64(g, 2.0));
+    ray_op_t* mul_i = ray_mul(g, ray_scan(g, "a"), ray_const_i64(g, 2));
+    agg_affine_t aff;
+    agg_linear_t lin;
+    ray_t* vec = NULL;
+    ray_t* err = NULL;
+
+    /* I64 values may round on conversion before the addition. */
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, false, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_FALSE(aff.enabled);
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_FALSE(aff.enabled);
+    /* Small whole-number biases on a narrow type have exact row and sum
+     * arithmetic; a fractional or very large bias does not. */
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_h, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_TRUE(aff.enabled && aff.f64 && aff.bias_f64 == 5.0);
+    TEST_ASSERT_TRUE(vec && vec->type == RAY_I16);
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_big, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_fraction, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    /* (ts + 5.0) is no F64 sum at all: declined either way */
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, ts_f, true, &vec, &aff, &err));
+    TEST_ASSERT_NULL(err);
+    /* control: (a + 5) is an integer bias on every route */
+    memset(&aff, 0, sizeof aff);
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_i, false, &vec, &aff, &err));
+    TEST_ASSERT_TRUE(aff.enabled && !aff.f64 && aff.bias_i64 == 5);
+    /* linear: (a * 2.0) declines, (a * 2) is planned (control) */
+    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, &lin, &err));
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, &lin, &err));
+    TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 1 && lin.coeff_i64[0] == 2);
+    ray_graph_free(g);
+
+    /* control: keyed SUM(a + 5.0) and AVG(a + 5.0) by k stay F64 */
+    g = ray_graph_new(tbl);
+    ray_op_t* key_arr[] = { ray_scan(g, "k") };
+    uint16_t ops[] = { OP_SUM, OP_AVG };
+    ray_op_t* ins[] = { ray_add(g, ray_scan(g, "a"), ray_const_f64(g, 5.0)),
+                        ray_add(g, ray_scan(g, "a"), ray_const_f64(g, 5.0)) };
+    ray_op_t* grp = ray_group(g, key_arr, 1, ops, ins, 2);
+    ray_t* result = ray_execute(g, grp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* kc = ray_table_get_col_idx(result, 0);
+    ray_t* sc = ray_table_get_col_idx(result, 1);
+    ray_t* ac = ray_table_get_col_idx(result, 2);
+    TEST_ASSERT_TRUE(kc && sc && ac);
+    TEST_ASSERT_EQ_I(sc->type, RAY_F64);
+    TEST_ASSERT_EQ_I(ac->type, RAY_F64);
+    for (int64_t i = 0; i < kc->len; i++) {
+        int64_t key = ((int64_t*)ray_data(kc))[i];
+        /* k=0: (10+5) + (30+5) = 50.0, avg 25.0; k=1: 25.0, avg 25.0 */
+        TEST_ASSERT_EQ_F(((double*)ray_data(sc))[i], key == 0 ? 50.0 : 25.0, 0.0);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ac))[i], 25.0, 0.0);
+    }
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* A failed scalar buffer allocation must not fall through to the hash
+ * emitter, which cannot apply the F64 affine bias. */
+static test_result_t test_expr_affine_f64_bias_scalar_oom(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    int16_t raw[] = {10, 20, 30};
+    ray_t* vec = ray_vec_from_raw(RAY_I16, raw, 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("h", 1), vec);
+    ray_release(vec);
+
+    for (int i = 0; i < 2; i++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* input = ray_add(g, ray_scan(g, "h"), ray_const_f64(g, 5.0));
+        uint16_t op[] = {i == 0 ? OP_SUM : OP_AVG};
+        ray_op_t* ins[] = {input};
+        ray_op_t* group = ray_group(g, NULL, 0, op, ins, 1);
+        ray_group_test_route(1);
+        ray_group_test_fail_scalar_alloc(1);
+        ray_t* result = ray_execute(g, group);
+        ray_group_test_fail_scalar_alloc(0);
+        ray_group_test_route(0);
+        TEST_ASSERT_TRUE(result && RAY_IS_ERR(result));
+        ray_error_free(result);
+        ray_graph_free(g);
+    }
     ray_release(tbl);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -6859,7 +7001,9 @@ static test_result_t test_expr_group_nonlinear_fallback(void) {
     PASS();
 }
 
-/* ---- eval_const_numeric_expr: F64 SUB/MUL/MIN2/MAX2, I64 SUB/DIV/MOD/MIN2/MAX2 ---- */
+/* ---- eval_const_numeric_expr: F64 SUB/MUL/MIN2/MAX2, I64 SUB/DIV/MOD/MIN2/MAX2 ----
+ * A FLOAT constant (and `/`, which is F64 even over integers) makes the sum
+ * F64; an integer one keeps it I64. */
 static test_result_t test_expr_group_affine_const_ops(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -6871,7 +7015,7 @@ static test_result_t test_expr_group_affine_const_ops(void) {
     tbl = ray_table_add_col(tbl, na, v);
     ray_release(v);
 
-    /* F64 SUB: a + (const_f64(10) - const_f64(3)) → bias=7 */
+    /* F64 SUB: a + (const_f64(10) - const_f64(3)) → bias=7.0 */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -6883,11 +7027,12 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 107);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 107.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
-    /* F64 MUL: a + (const_f64(3) * const_f64(4)) → bias=12 */
+    /* F64 MUL: a + (const_f64(3) * const_f64(4)) → bias=12.0 */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -6899,7 +7044,8 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 112);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 112.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
@@ -6919,7 +7065,7 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_release(result); ray_graph_free(g);
     }
 
-    /* I64 DIV: a + (const_i64(10) / const_i64(2)) → bias=5 */
+    /* I64 DIV: a + (const_i64(10) / const_i64(2)) → bias=5.0 */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -6931,7 +7077,8 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 105);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 105.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
@@ -6983,7 +7130,7 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_release(result); ray_graph_free(g);
     }
 
-    /* F64 MOD: a + (const_f64(10) % const_f64(3)) → bias=1 (line 118) */
+    /* F64 MOD: a + (const_f64(10) % const_f64(3)) → bias=1.0 (line 118) */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -6995,11 +7142,12 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 101);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 101.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
-    /* F64 MIN2: a + min2(const_f64(3), const_f64(7)) → bias=3 (line 119) */
+    /* F64 MIN2: a + min2(const_f64(3), const_f64(7)) → bias=3.0 (line 119) */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -7011,11 +7159,12 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 103);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 103.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
-    /* F64 MAX2: a + max2(const_f64(3), const_f64(7)) → bias=7 (line 120) */
+    /* F64 MAX2: a + max2(const_f64(3), const_f64(7)) → bias=7.0 (line 120) */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -7027,11 +7176,12 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 107);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 107.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
-    /* I64 DIV: a + (const_i64(9) / const_i64(3)) → bias=3 (lines 134-137) */
+    /* I64 DIV: a + (const_i64(9) / const_i64(3)) → bias=3.0 (lines 134-137) */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* a_op = ray_scan(g, "a");
@@ -7043,7 +7193,8 @@ static test_result_t test_expr_group_affine_const_ops(void) {
         ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
         ray_t* result = ray_execute(g, grp);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(result, 0)))[0], 103);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(result, 0)->type, RAY_F64);
+        TEST_ASSERT_EQ_F(((double*)ray_data(ray_table_get_col_idx(result, 0)))[0], 103.0, 0.0);
         ray_release(result); ray_graph_free(g);
     }
 
@@ -8760,11 +8911,10 @@ static test_result_t test_exec_streaming_mapcommon_too_short(void) {
     PASS();
 }
 
-/* ---- streaming: parted segment is NULL — build_segment_table !segs[seg_idx]
- * path (exec.c L1904: seg_idx >= col->len || !segs[seg_idx]).
- *
- * A parted column with a NULL segment pointer at index 1 triggers the
- * NULL-segment guard in build_segment_table.                             */
+/* ---- streaming: parted segment is NULL (a partition without the column,
+ * ragged parted table).  build_segment_table gives that partition's rows,
+ * from the partition-key counts, as typed nulls; the scan over the two
+ * segments is the flat column with nulls in the second partition's rows. */
 static test_result_t test_exec_streaming_parted_null_segment(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -8783,7 +8933,7 @@ static test_result_t test_exec_streaming_parted_null_segment(void) {
 
     /* Valid MAPCOMMON with 2 keys */
     int64_t kv_data[] = {10, 20};
-    int64_t rc_data[] = {2, 0};
+    int64_t rc_data[] = {2, 3};
     ray_t* kv = ray_vec_from_raw(RAY_I64, kv_data, 2);
     ray_t* rc = ray_vec_from_raw(RAY_I64, rc_data, 2);
     ray_t* mc = exec_make_mapcommon(kv, rc);
@@ -8798,13 +8948,19 @@ static test_result_t test_exec_streaming_parted_null_segment(void) {
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* scan_v = ray_scan(g, "v");
 
-    /* Segment 0: seg_rows from pcol[0]->len=2; MAPCOMMON broadcast OK.
-     * Then pcol[0] itself: seg_idx=0 < col->len=2 and segs[0] non-NULL.
-     * Segment 1: MAPCOMMON kv has key for idx=1 (OK), pcol[1] is NULL
-     * → build_segment_table L1904: !segs[seg_idx] → schema error.      */
+    /* Segment 0: pcol[0], two rows.  Segment 1: pcol[1] is NULL and the
+     * partition counts 3 rows, so the segment table carries three I64
+     * nulls for v; the scan concatenates to five rows. */
     ray_t* result = ray_execute(g, scan_v);
     TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 5);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[1], 2);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 2));
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 4));
+    ray_release(result);
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -8994,6 +9150,280 @@ static test_result_t test_exec_head_filter_pred_error(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(result));
 
     ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Where make_chain_table sets flag: on the first and last 100 rows, on
+ * every even row, or on the first 100 rows only. */
+typedef enum { CHAIN_FLAG_EDGES, CHAIN_FLAG_EVEN, CHAIN_FLAG_HEAD } chain_flag_t;
+
+/* n rows: id = id_base + row, amount 1, flag where `where` says. */
+static ray_t* make_chain_table(int64_t n, int64_t id_base, chain_flag_t where) {
+    ray_t* id = ray_vec_new(RAY_I64, n);
+    ray_t* amount = ray_vec_new(RAY_I64, n);
+    ray_t* flag = ray_vec_new(RAY_I64, n);
+    id->len = amount->len = flag->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(id))[i] = id_base + i;
+        ((int64_t*)ray_data(amount))[i] = 1;
+        ((int64_t*)ray_data(flag))[i] =
+            where == CHAIN_FLAG_EVEN ? i % 2 == 0
+          : where == CHAIN_FLAG_HEAD ? i < 100
+          : (i < 100 || i >= n - 100);
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("id", 2), id);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("amount", 6), amount);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("flag", 4), flag);
+    ray_release(id);
+    ray_release(amount);
+    ray_release(flag);
+    return tbl;
+}
+
+/* HEAD(limit, FILTER(term, FILTER(flag == 1, CONST(input)))) over a graph
+ * whose default table is `deflt`. */
+static ray_t* exec_head_filter_chain(ray_t* deflt, ray_t* input, bool running,
+                                     int64_t bound, int64_t limit) {
+    ray_graph_t* g = ray_graph_new(deflt);
+    ray_op_t* inner = ray_filter(g, ray_const_table(g, input),
+                                 ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+    ray_op_t* term = running
+        ? ray_gt(g, ray_sums_op(g, ray_scan(g, "amount")), ray_const_i64(g, bound))
+        : ray_gt(g, ray_scan(g, "id"), ray_const_i64(g, bound));
+    ray_t* result = ray_execute(g, ray_head(g, ray_filter(g, inner, term), limit));
+    ray_graph_free(g);
+    return result;
+}
+
+/* HEAD over a filter chain: the outer term sees the inner filter's rows.
+ * Flag on the first and last 100 rows: a running outer term
+ * (sums(amount) > 150) keeps rows 151..200 of those 200, ids 5950..5999;
+ * a row-local one (id > 5920) keeps the first 50 past 5920, and a
+ * negative limit keeps none.  Over tables A (the default) and B with
+ * flag on even rows and B's ids from 10000, a chain on B reads B's rows. */
+static test_result_t test_exec_head_filter_chain_domain(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_chain_table(6000, 0, CHAIN_FLAG_EDGES);
+    for (int running = 1; running >= 0; running--) {
+        ray_t* result = exec_head_filter_chain(tbl, tbl, running,
+                                               running ? 150 : 5920, 50);
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 50);
+        ray_t* ids = ray_table_get_col(result, ray_sym_intern("id", 2));
+        int64_t first = running ? 5950 : 5921;
+        for (int64_t i = 0; i < 50; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(ids))[i], first + i);
+        ray_release(result);
+
+        result = exec_head_filter_chain(tbl, tbl, running, 0, -1);
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+        TEST_ASSERT_EQ_I(ray_table_ncols(result), 3);
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 0);
+        ray_release(result);
+    }
+
+    ray_t* deflt = make_chain_table(6000, 0, CHAIN_FLAG_EVEN);
+    ray_t* other = make_chain_table(6000, 10000, CHAIN_FLAG_EVEN);
+    ray_t* result = exec_head_filter_chain(deflt, other, false, 10000, 50);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 50);
+    ray_t* ids = ray_table_get_col(result, ray_sym_intern("id", 2));
+    for (int64_t i = 0; i < 50; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(ids))[i], 10002 + 2 * i);
+    ray_release(result);
+
+    ray_release(other);
+    ray_release(deflt);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* SELECT over FILTER(flag == 1, CONST(input)) whose columns share one
+ * MUL(FILLS(amount), 2) node: the node itself first, then SUMS of it, then
+ * ADD(node, 0) — SUMS and ADD are its two DAG consumers, which arms the
+ * memo (the select's own column list is not counted).  Under the filter's
+ * selection the parallel MUL skips every block without a kept row, so a
+ * memo of that value would hand SUMS unwritten rows; SUMS reads every row,
+ * so kept row i must be 2 * (i + 1), as a serial sum. */
+static test_result_t test_exec_memo_under_selection(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    enum { N = 2 * RAY_PARALLEL_THRESHOLD, EDGE = 100 };
+    ray_t* tbl = make_chain_table(N, 0, CHAIN_FLAG_EDGES);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+    ray_op_t* twice = ray_mul(g, ray_fills_op(g, ray_scan(g, "amount")),
+                              ray_const_i64(g, 2));
+    ray_op_t* cols[] = { ray_scan(g, "id"), twice, ray_sums_op(g, twice),
+                         ray_add(g, twice, ray_const_i64(g, 0)) };
+    ray_t* result = ray_execute(g, ray_select_op(g, kept, cols, 4));
+    ray_graph_free(g);
+
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 2 * EDGE);
+    const int64_t* ids = (const int64_t*)ray_data(ray_table_get_col_idx(result, 0));
+    const int64_t* sums = (const int64_t*)ray_data(ray_table_get_col_idx(result, 2));
+    for (int64_t i = 0; i < 2 * EDGE; i++)
+        TEST_ASSERT_EQ_I(sums[i], 2 * (ids[i] + 1));
+
+    ray_release(result);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* SELECT over FILTER(flag == 1, CONST(input)) of one order op over
+ * MUL(FILLS(amount), id) = id, flag on the first EDGE rows only.  Under the
+ * filter's selection the parallel MUL writes the first block alone; the
+ * order op reads every row, so kept row i is N-1-i under reverse and desc
+ * and i under asc.  Rayfall projections reach these verbs through the
+ * eval fallback over the kept rows, so only a C-API graph gets here. */
+static test_result_t test_exec_order_ops_under_selection(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    enum { N = 2 * RAY_PARALLEL_THRESHOLD, EDGE = 100 };
+    ray_t* tbl = make_chain_table(N, 0, CHAIN_FLAG_HEAD);
+
+    struct { ray_op_t* (*op)(ray_graph_t*, ray_op_t*); bool ascending; } order_ops[] =
+        { { ray_reverse_op, false }, { ray_asc_op, true }, { ray_desc_op, false } };
+    for (int k = 0; k < 3; k++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                    ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+        ray_op_t* ids = ray_mul(g, ray_fills_op(g, ray_scan(g, "amount")),
+                                ray_scan(g, "id"));
+        ray_op_t* cols[] = { order_ops[k].op(g, ids) };
+        ray_t* result = ray_execute(g, ray_select_op(g, kept, cols, 1));
+        ray_graph_free(g);
+
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), EDGE);
+        const int64_t* got = (const int64_t*)ray_data(ray_table_get_col_idx(result, 0));
+        for (int64_t i = 0; i < EDGE; i++)
+            TEST_ASSERT_EQ_I(got[i], order_ops[k].ascending ? i : N - 1 - i);
+        ray_release(result);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* flag 1 0 1 0, score 60 20 45 35: the whole table's avg score is 40,
+ * the flag == 1 rows' 52.5. */
+static ray_t* make_room_table(void) {
+    const int64_t flags[] = { 1, 0, 1, 0 }, scores[] = { 60, 20, 45, 35 };
+    ray_t* flag = ray_vec_new(RAY_I64, 4);
+    ray_t* score = ray_vec_new(RAY_I64, 4);
+    flag->len = score->len = 4;
+    memcpy(ray_data(flag), flags, sizeof flags);
+    memcpy(ray_data(score), scores, sizeof scores);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("flag", 4), flag);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("score", 5), score);
+    ray_release(flag);
+    ray_release(score);
+    return tbl;
+}
+
+/* SELECT over FILTER(flag == 1, CONST(input)) whose columns share one
+ * x = SUB(score, AVG(score)), SUMS(x) and SUM(x) in either order.  SUMS
+ * reads x over the whole table (20 -20 5 -5, running 20 0 5 0, kept 20 5);
+ * SUM reads it over the kept rows (7.5 -7.5, sum 0).  Neither may be
+ * handed the other's x. */
+static test_result_t test_exec_memo_across_row_domains(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_room_table();
+    for (int sums_first = 1; sums_first >= 0; sums_first--) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                    ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+        ray_op_t* x = ray_sub(g, ray_scan(g, "score"), ray_avg(g, ray_scan(g, "score")));
+        ray_op_t* running = ray_sums_op(g, x);
+        ray_op_t* total = ray_sum(g, x);
+        ray_op_t* cols[] = { sums_first ? running : total, sums_first ? total : running };
+        ray_t* result = ray_execute(g, ray_select_op(g, kept, cols, 2));
+        ray_graph_free(g);
+
+        TEST_ASSERT_NOT_NULL(result);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 2);
+        const double* sums = (const double*)ray_data(ray_table_get_col_idx(result, !sums_first));
+        const double* sum = (const double*)ray_data(ray_table_get_col_idx(result, sums_first));
+        TEST_ASSERT_EQ_F(sums[0], 20.0, 1e-9);
+        TEST_ASSERT_EQ_F(sums[1], 5.0, 1e-9);
+        TEST_ASSERT_EQ_F(sum[0], 0.0, 1e-9);
+        TEST_ASSERT_EQ_F(sum[1], 0.0, 1e-9);
+        ray_release(result);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* SUMS over a FILTER, which installs a selection and returns a table:
+ * rejected, with and without an outer FILTER's selection installed.  The
+ * selection the inner FILTER installs is released either way: after a
+ * warm-up, repeated calls leave the heap as they found it. */
+static test_result_t test_exec_all_rows_child_selection(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_room_table();
+    for (int outer = 0; outer <= 1; outer++) {
+        size_t before = 0;
+        for (int call = 0; call < 110; call++) {
+            if (call == 10) {
+                ray_mem_stats_t st;
+                ray_mem_stats(&st);
+                before = st.bytes_allocated;
+            }
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* inner = ray_filter(g, ray_const_table(g, tbl),
+                                         ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+            ray_op_t* root = ray_sums_op(g, inner);
+            if (outer) {
+                ray_op_t* kept = ray_filter(g, ray_const_table(g, tbl),
+                                            ray_eq(g, ray_scan(g, "flag"), ray_const_i64(g, 1)));
+                ray_op_t* cols[] = { root };
+                root = ray_select_op(g, kept, cols, 1);
+            }
+            ray_t* result = ray_execute(g, root);
+            ray_graph_free(g);
+            TEST_ASSERT_NOT_NULL(result);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+            ray_error_free(result);
+        }
+        ray_mem_stats_t st;
+        ray_mem_stats(&st);
+        TEST_ASSERT_FMT(st.bytes_allocated == before, "outer %d: %zu bytes allocated, %zu before",
+                        outer, st.bytes_allocated, before);
+    }
+
     ray_release(tbl);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -10145,20 +10575,15 @@ static test_result_t test_expr_f64_to_narrow_cast(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* (as 'BOOL v) on nullable F64 col — F64→BOOL CAST with NaN-handling.
-     * Regression for prior bug where NaN (= NULL_F64 sentinel) was treated
-     * as truthy because IEEE `NaN != 0.0` is true.  Fixed by adding an
-     * explicit NaN check (`src[i] == src[i]`).
-     * Raw data: [1.7, 2.3, 0.0, 4.9, 0.5] but row 2 was overwritten with
-     * NULL_F64 sentinel via ray_vec_set_null(v, 2, true).  So the seen
-     * input is [1.7, 2.3, NaN(null), 4.9, 0.5] → [1, 1, 0, 1, 1] → sum 4. */
+    /* F64→BOOL: only zero is false, so the NaN null sentinel is true.
+     * Input [1.7, 2.3, NaN, 4.9, 0.5] yields five true values. */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "v");
     ray_op_t* cbool = ray_cast(g, col, RAY_BOOL);
     s = ray_sum(g, cbool);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11953,12 +12378,51 @@ static test_result_t test_expr_unary_i64_to_bool_cast(void) {
     ray_op_t* s   = ray_sum(g, ca);
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* cast(0)=false=0, cast(5)=true=1, cast(-3)=true=1, pos3=null=0 → sum=2 */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* Only zero is false; the non-zero null sentinel also casts to true. */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
 
     ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Call the typed fallback directly so expression fusion cannot mask a
+ * regression in its null-to-BOOL or post-cast null propagation rules. */
+static test_result_t test_expr_typed_null_to_bool_cast(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int16_t h[] = {NULL_I16, 0, -1};
+    const int32_t i[] = {NULL_I32, 0, -1};
+    const int64_t l[] = {NULL_I64, 0, -1};
+    const float e[] = {NULL_F32, 0.0f, -1.0f};
+    const double f[] = {NULL_F64, 0.0, -1.0};
+    const int8_t types[] = {RAY_I16, RAY_I32, RAY_I64, RAY_F32, RAY_F64};
+    const void* values[] = {h, i, l, e, f};
+    ray_op_t op = {.opcode = OP_CAST, .out_type = RAY_BOOL};
+
+    for (size_t k = 0; k < sizeof(types) / sizeof(types[0]); k++) {
+        ray_t* input = ray_vec_from_raw(types[k], values[k], 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(input));
+        ray_vec_set_null(input, 0, true);
+        ray_t* result = exec_elementwise_unary(NULL, &op, input);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+        TEST_ASSERT_EQ_I(result->len, 3);
+        const uint8_t* data = (const uint8_t*)ray_data(result);
+        TEST_ASSERT_EQ_I(data[0], 1);
+        TEST_ASSERT_EQ_I(data[1], 0);
+        TEST_ASSERT_EQ_I(data[2], 1);
+        TEST_ASSERT_FALSE(ray_vec_may_have_nulls(result));
+        for (int64_t row = 0; row < 3; row++)
+            TEST_ASSERT_FALSE(ray_vec_is_null(result, row));
+        ray_release(result);
+        ray_release(input);
+    }
+
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -14178,17 +14642,14 @@ static test_result_t test_expr_binary_sym_w32_arith(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* BOOL comparison: sw == 2 → lp_u32 in BOOL slow path (integer src_is_i64_all)
-     * Also covers lp_u32 in BOOL block src_is_i64_all EQ loop */
+    /* Mixed SYM/I64 equality must decline, not compare raw IDs. Do not
+     * pass a declined node into ray_sum (#768). Arithmetic above is unchanged. */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "sw");
     c = ray_const_i64(g, 2);
     op = ray_eq(g, col, c);
-    s = ray_sum(g, op);
-    result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 1);  /* only position 1 (val=2) matches */
-    ray_release(result);
+    TEST_ASSERT(op == NULL, "symbol/numeric equality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline leaves evaluator fallback available");
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -14257,16 +14718,13 @@ static test_result_t test_expr_binary_sym_w32_rhs(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* BOOL: 2 == sw2 → rp_u32 in BOOL src_is_i64_all EQ loop */
+    /* Reversed numeric/SYM equality has the same constructor contract. */
     g = ray_graph_new(tbl);
     a = ray_const_i64(g, 2);
     col = ray_scan(g, "sw2");
     op = ray_eq(g, a, col);
-    s = ray_sum(g, op);
-    result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 1);  /* only val=2 matches */
-    ray_release(result);
+    TEST_ASSERT(op == NULL, "numeric/symbol equality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline leaves evaluator fallback available");
     ray_graph_free(g);
 
     /* SYM W32 vec-vs-vec: two W32 cols → lp_u32 + rp_u32 simultaneously */
@@ -15278,23 +15736,21 @@ static test_result_t test_expr_binary_bool_float_path_lhs(void) {
         TEST_ASSERT_EQ_I(result->i64, 1);
         ray_release(result); ray_graph_free(g);
 
-        /* EQ: 2==1→F, 3==3→T, 4==5→F, 3==3→T → sum=2 */
+        /* EQ/NE no longer admit raw ID versus F64 comparisons (#768). */
         g = ray_graph_new(tbl);
         a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
-        op = ray_eq(g, a, b); s = ray_sum(g, op);
-        result = ray_execute(g, s);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 2);
-        ray_release(result); ray_graph_free(g);
+        op = ray_eq(g, a, b);
+        TEST_ASSERT(op == NULL, "SYM/F64 equality declines");
+        TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+        ray_graph_free(g);
 
         /* NE */
         g = ray_graph_new(tbl);
         a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
-        op = ray_ne(g, a, b); s = ray_sum(g, op);
-        result = ray_execute(g, s);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 2);
-        ray_release(result); ray_graph_free(g);
+        op = ray_ne(g, a, b);
+        TEST_ASSERT(op == NULL, "SYM/F64 equality declines");
+        TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+        ray_graph_free(g);
 
         /* LE: 2<=1→F, 3<=3→T, 4<=5→T, 3<=3→T → sum=3 */
         g = ray_graph_new(tbl);
@@ -15514,31 +15970,29 @@ static test_result_t test_expr_binary_bool_int_w32_lhs(void) {
     ray_t* tbl = make_two_col_table(na, vs, nb, vb);
     ray_release(vs); ray_release(vb);
 
-    /* EQ: 1==2→F, 3==3→T, 5==4→F, 3==3→T → sum=2 */
+    /* EQ/NE decline incompatible logical types, rather than compare IDs. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a = ray_scan(g, "bip_lw32");
     ray_op_t* b = ray_scan(g, "bip_ri64");
     ray_op_t* op = ray_eq(g, a, b);
-    ray_op_t* s = ray_sum(g, op);
-    ray_t* result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result); ray_graph_free(g);
+    TEST_ASSERT(op == NULL, "SYM/I64 equality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+    ray_graph_free(g);
 
-    /* NE: 1!=2→T, 3!=3→F, 5!=4→T, 3!=3→F → sum=2 */
+    /* NE has the same incompatible-type decline. */
     g = ray_graph_new(tbl);
     a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
-    op = ray_ne(g, a, b); s = ray_sum(g, op);
-    result = ray_execute(g, s);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result); ray_graph_free(g);
+    op = ray_ne(g, a, b);
+    TEST_ASSERT(op == NULL, "SYM/I64 inequality declines");
+    TEST_ASSERT(g->compile_err == NULL, "decline is not a language error");
+    ray_graph_free(g);
 
     /* LT: 1<2→T, 3<3→F, 5<4→F, 3<3→F → sum=1 */
     g = ray_graph_new(tbl);
     a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
-    op = ray_lt(g, a, b); s = ray_sum(g, op);
-    result = ray_execute(g, s);
+    op = ray_lt(g, a, b);
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->i64, 1);
     ray_release(result); ray_graph_free(g);
@@ -17698,6 +18152,8 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_group_linear_cancel", test_expr_group_linear_cancel, NULL, NULL },
     { "exec/expr_group_nonlinear_fallback", test_expr_group_nonlinear_fallback, NULL, NULL },
     { "exec/expr_group_affine_f64_i64", test_expr_group_affine_f64_i64, NULL, NULL },
+    { "exec/expr_affine_f64_bias_route", test_expr_affine_f64_bias_route, NULL, NULL },
+    { "exec/expr_affine_f64_bias_scalar_oom", test_expr_affine_f64_bias_scalar_oom, NULL, NULL },
     { "exec/expr_group_linear_double_term", test_expr_group_linear_double_term, NULL, NULL },
     { "exec/expr_group_linear_mid_cancel", test_expr_group_linear_mid_cancel, NULL, NULL },
     { "exec/expr_group_affine_neg_i64_const", test_expr_group_affine_neg_i64_const, NULL, NULL },
@@ -17739,6 +18195,11 @@ const test_entry_t exec_entries[] = {
     { "exec/filter_group_pred_error",          test_exec_filter_group_pred_error,          NULL, NULL },
     { "exec/head_filter_input_error",          test_exec_head_filter_input_error,          NULL, NULL },
     { "exec/head_filter_pred_error",           test_exec_head_filter_pred_error,           NULL, NULL },
+    { "exec/head_filter_chain_domain",         test_exec_head_filter_chain_domain,         NULL, NULL },
+    { "exec/memo_under_selection",             test_exec_memo_under_selection,             NULL, NULL },
+    { "exec/order_ops_under_selection",        test_exec_order_ops_under_selection,        NULL, NULL },
+    { "exec/memo_across_row_domains",          test_exec_memo_across_row_domains,          NULL, NULL },
+    { "exec/all_rows_child_selection",         test_exec_all_rows_child_selection,         NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },
     { "exec/deep_binary_chain",                test_exec_deep_binary_chain,                NULL, NULL },
@@ -17788,6 +18249,7 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_set_all_null_f32",              test_expr_set_all_null_f32,              NULL, NULL },
     { "exec/expr_unary_f64_cast_default",        test_expr_unary_f64_cast_default,        NULL, NULL },
     { "exec/expr_unary_i64_to_f64_cast",         test_expr_unary_i64_to_f64_cast,         NULL, NULL },
+    { "exec/expr_typed_null_to_bool_cast", test_expr_typed_null_to_bool_cast, NULL, NULL },
     { "exec/expr_unary_i64_to_bool_cast",        test_expr_unary_i64_to_bool_cast,        NULL, NULL },
     { "exec/expr_binary_f64_and_or",             test_expr_binary_f64_and_or,             NULL, NULL },
     { "exec/expr_sym_w32_fast_eq_ne",            test_expr_sym_w32_fast_eq_ne,            NULL, NULL },

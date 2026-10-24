@@ -33,6 +33,7 @@
 #include "core/platform.h"  /* ray_os_cgroup_mem_limit */
 #include "mem/heap.h"       /* ray_heap_anon_watermark */
 #include "lang/format.h"    /* ray_fmt for eval_err */
+#include "lang/eval.h"      /* ray_raise_render */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -675,10 +676,30 @@ static test_result_t test_build_sys_args_edges(void) {
     PASS();
 }
 
+static test_result_t test_build_sys_args_mem_flag(void) {
+    char* cases[][4] = {
+        { "rayforce", "script.rfl", "-m", "4G" },
+        { "rayforce", "script.rfl", "--mem", "512M" },
+        { "rayforce", "-m", "4G", "script.rfl" },
+        { "rayforce", "--mem", "512M", "script.rfl" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ray_t* d = ray_build_sys_args(4, cases[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+        ray_t* file = args_top(d, "file");
+        TEST_ASSERT_EQ_I(file->type, -RAY_STR);
+        TEST_ASSERT_EQ_I(strcmp(ray_str_ptr(file), "script.rfl"), 0);
+        ray_release(file);
+        ray_release(d);
+    }
+    PASS();
+}
+
 static test_result_t test_build_sys_args_rejects_malformed_numbers(void) {
     char* cases[][3] = {
         { "rayforce", "-c", "2abc" },
         { "rayforce", "-c", "999999999999999999999999" },
+        { "rayforce", "-c", "1024" },
         { "rayforce", "-t", "1abc" },
         { "rayforce", "-Q", "0abc" },
     };
@@ -1125,6 +1146,54 @@ static test_result_t test_timer_callback_error(void) {
     PASS();
 }
 
+/* A callback that raises prints the raised value after the code, as the
+ * REPL does; a value left pending by an earlier evaluation is not
+ * reported against the callback's own error. */
+static test_result_t test_timer_callback_raise(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* A stale uncaught raise from a "previous line". */
+    ray_t* stale = ray_eval_str("(raise \"stale value\")");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(stale));
+    ray_error_free(stale);
+
+    char path[96];
+    snprintf(path, sizeof path, "/tmp/ray_test_timer_err_%d", (int)getpid());
+    fflush(stderr);
+    int saved = dup(STDERR_FILENO);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT_TRUE(fd >= 0);
+    dup2(fd, STDERR_FILENO);
+
+    ray_t* id = ray_eval_str(
+        "(.time.timer.set 1 1 (fn [t] (raise \"order 7 rejected\")))");
+    ray_t* id2 = ray_eval_str(
+        "(.time.timer.set 2 1 (fn [t] (* t \"oops\")))");
+    ray_timers_pump_for((ray_timers_t*)poll->timers, 60);
+
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, STDERR_FILENO); close(saved); }
+    char out[2048];
+    lseek(fd, 0, SEEK_SET);
+    ssize_t n = read(fd, out, sizeof out - 1);
+    out[n > 0 ? n : 0] = '\0';
+    close(fd);
+    unlink(path);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(id));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(id2));
+    TEST_ASSERT_NOT_NULL(strstr(out, "error: domain: order 7 rejected"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "error: type"));
+    TEST_ASSERT_NULL(strstr(out, "stale value"));
+    /* The raised value does not linger past the report. */
+    char buf[32];
+    TEST_ASSERT_FALSE(ray_raise_render(buf, sizeof buf));
+    ray_release(id);
+    ray_release(id2);
+    PASS();
+}
+
 /* ray_timers_pump_for guard rails: NULL ptr + non-positive budget. */
 static test_result_t test_timer_pump_for_guards(void) {
     /* Both early-return; nothing crashes. */
@@ -1366,6 +1435,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_defaults",     test_build_sys_args_defaults,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
     { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
+    { "runtime/build_sys_args_mem_flag",     test_build_sys_args_mem_flag,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_rejects_malformed_numbers", test_build_sys_args_rejects_malformed_numbers, sys_setup, sys_teardown },
     { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
@@ -1380,6 +1450,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/timer_heap_tie_break",        test_timer_heap_tie_break,        sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_forever_rearm",         test_timer_forever_rearm,         sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_callback_error",        test_timer_callback_error,        sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_callback_raise",        test_timer_callback_raise,        sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_pump_for_guards",       test_timer_pump_for_guards,       sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_create_destroy_paths",  test_timer_create_destroy_paths,  sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_env",                  test_syscov_env,                  sys_setup, sys_teardown },

@@ -67,8 +67,8 @@ All comparison operators are **atomic** and return boolean results.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `and` | binary | Logical AND | `(and true false)` → `false` |
-| `or` | binary | Logical OR | `(or true false)` → `true` |
+| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
+| `or` | binary | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
 | `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation
@@ -129,7 +129,7 @@ Functions that take other functions as arguments.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `map` | variadic | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
-| `pmap` | variadic | Parallel map (multi-threaded, returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
+| `pmap` | variadic | Currently a sequential alias for `map` (returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
@@ -158,15 +158,15 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
-| `take` | binary | Take first/last N elements | `(take [10 20 30] 2)` → `[10 20]` |
+| `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
 | `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
 | `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
-| `at` | binary | Index a collection; vector keys batch dictionary lookups | `(at [10 20 30] 1)` → `20` |
+| `at` | binary | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
 | `fill` | binary, atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
-| `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
+| `reverse` | unary | Reverse order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
@@ -231,7 +231,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `xkey` | binary | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
 | `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
 | `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
-| `alter` | variadic, special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
+| `alter` | variadic, special | Amend a global binding in place and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The target must be a global binding; a name bound by `let` or a parameter of the enclosing function raises `domain` | `(alter 'v set 0 99)` |
 | `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 
@@ -294,7 +294,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 
 Indices are *pre-insertion* positions in `[0, count]`; `idx == count` is equivalent to append. Vector positional inserts of a same-typed vector splice that vector in. List positional inserts always add the value as a single slot — use `concat` to splice. Multi-insert is stable on duplicate indices, preserving input order. Typed-null atoms (`0Nl`, `0Nf`, …) carry their null flag through — the inserted slot is marked null, not zero.
 
-For a parted target, `rows` must match the physical data-column schema exactly in name and concrete vector type. Do **not** include the virtual `date` or `part` column. A list maps values in physical column order; a table or dictionary may reorder columns, but must contain every physical name exactly once. Atoms append one row. Equal-length vectors append a batch, and atom values alongside them broadcast across that batch. Generic `null` is accepted for sentinel-nullable columns; `SYM` and `STR` map it to their empty value because those types have no distinct null, while `BOOL` and `U8` reject it because they are non-nullable.
+For a parted target, `rows` must match the physical data-column schema exactly in name and concrete vector type. Do **not** include the virtual `date` or `part` column. A list maps values in physical column order; a table or dictionary may reorder columns, but must contain every physical name exactly once. Atoms append one row. Equal-length vectors append a batch, and atom values alongside them broadcast across that batch. Generic `null` is accepted for sentinel-nullable columns; `SYM` and `STR` map it to their null, which is their empty value (`'` or `""`), while `BOOL` and `U8` reject it because they are non-nullable.
 
 The partition key must equal the current last key, which grows that live segment, or be strictly later, which starts a new live segment. Earlier keys — including an existing historical partition — are immutable and cannot be inserted into. Existing partition metadata must already be strictly increasing in logical key order; integer directory names are ordered by value (`1`, `2`, `10` — no zero-padding needed), so only two spellings of one value (`1` and `01`) violate this, and they are rejected as `corrupt`. Every historical physical segment must be present. A missing segment in the last partition can be repaired only by a non-empty same-key append; it blocks an empty insert or a move to a later key. `BOOL`/`U8` cannot be null-backfilled when that missing segment already represents existing rows, but a missing zero-row segment needs no backfill.
 
@@ -384,7 +384,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
 | `str-find` | binary | First byte index of a substring; returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | Join strings or symbols with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
-| `strlen` | unary | Length of each string | `(strlen "hello")` → `5` |
+| `strlen` | unary | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |
 | `upper` | unary | Uppercase string or symbol atoms/vectors; lazy/DAG for vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
 | `lower` | unary | Lowercase string or symbol atoms/vectors; lazy/DAG for vectors | `(lower 'AbC)` → `'abc` |
 | `trim` | unary | Strip leading/trailing whitespace; lazy/DAG for vectors | `(trim "  abc  ")` → `"abc"` |
@@ -497,7 +497,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional (if/then/else) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback) | `(try (/ 1 0) (fn [e] 0))` |
@@ -524,8 +524,8 @@ spills exactly as it did before.
 | `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
-| `.sys.mem` | variadic | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
-| `.sys.info` | variadic | System information (cores, page size, memory) | `(.sys.info)` |
+| `.sys.mem` | nullary | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |
+| `.sys.info` | nullary | System information (cores, page size, memory) | `(.sys.info)` |
 
 ## Serialization & Storage
 
@@ -533,7 +533,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |
@@ -612,6 +612,8 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-eval` | unary | Evaluate program to fixpoint | `(dl-eval prog)` |
 | `dl-query` | binary | Query a derived or base relation | `(dl-query prog 'edge)` |
 | `dl-provenance` | binary | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'rel)` |
+
+A `dl-program` handle owns its program. Rebinding its symbol or leaving the handle's scope releases the program automatically; use `(dl-free prog)` to release it earlier.
 
 ```lisp
 ; Low-level Datalog program

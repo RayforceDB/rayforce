@@ -1,0 +1,56 @@
+;; Dyadic (min a b) / (max a b): element-wise, null lowest, and the result
+;; takes the promoted type of the operands whichever one is chosen (an
+;; integer against a boolean is an integer, against a float a float).
+
+;; ── the result type does not depend on which operand wins ───────────
+(min 1 2.5) -- 1.0
+(type (min 1 2.5)) -- 'f64
+(type (max 3 2.5)) -- 'f64
+(min true 3) -- 1
+(type (min true 3)) -- 'i64
+(max false 0) -- 0
+(min [2 0] true) -- [1 0]
+(type (min [2 0] true)) -- 'I64
+(min [2 0] [true true]) -- [1 0]
+(max (as 'U8 [1 9]) (as 'I16 [5 5])) -- (as 'I16 [5 9])
+(type (max (as 'U8 [1 9]) (as 'I16 [5 5]))) -- 'I16
+
+;; a scalar wider than the vector is not narrowed to the vector's type,
+;; whichever side it is on
+(max 300 (as 'U8 [1 2])) -- [300 300]
+(max (as 'U8 [1 2]) 300) -- [300 300]
+(min -5 (as 'U8 [1 2])) -- [-5 -5]
+(min 1 (as 'U8 [5 0])) -- [1 0]
+
+;; same types are unchanged
+(min [3 9 1] [2 10 4]) -- [2 9 1]
+(max [3 9 1] 5) -- [5 9 5]
+(min 'a 'b) -- 'a
+(max [true false] false) -- [true false]
+
+;; DATE against TIMESTAMP gives a TIMESTAMP
+(type (max 2024.01.02 (as 'TIMESTAMP 2024.01.01))) -- 'timestamp
+(max 2024.01.02 (as 'TIMESTAMP 2024.01.01)) -- (as 'TIMESTAMP 2024.01.02)
+(type (min (as 'DATE [2024.01.02]) (as 'TIMESTAMP 2024.01.01))) -- 'TIMESTAMP
+
+;; nulls stay lowest, and promote with the result
+(min 0Nl 1) -- 0Nl
+(max 0Nl 1) -- 1
+(min 0Nl 1.5) -- 0Nf
+(max 0Nf 1) -- 1.0
+(min [0Nl 1] 0) -- [0Nl 0]
+(max [0Nf 2.0] 1) -- [1.0 2.0]
+
+;; ── over a LIST, uniform results make a vector ──────────────────────
+(min (list 1 2) 1) -- [1 1]
+(type (max (list 1 2) 1)) -- 'I64
+(max (list 1 2) (list 3 0)) -- [3 2]
+;; results of different types stay a LIST
+(max (list 1 2.0) 1) -- (list 1 2.0)
+;; a nested LIST keeps its shape
+(min (list [1 5] [3 0]) 2) -- (list [1 2] [2 0])
+
+;; ── errors ──────────────────────────────────────────────────────────
+(min [1 2] [1 2 3]) !- length
+(min 1 'a) !- type
+(max [1 2] [1 2 3]) !- length

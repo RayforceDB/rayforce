@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "core/timespan.h"
 #include "lang/parse.h"
 #include "lang/nfo.h"
 #include "lang/env.h"
@@ -179,14 +180,17 @@ static const char* try_parse_time(const char* start, int32_t *ms_out) {
     if (!(c[0] >= '0' && c[0] <= '9' && c[1] >= '0' && c[1] <= '9')) return NULL;
     int ss = (c[0] - '0') * 10 + (c[1] - '0'); c += 2;
 
-    /* .mmm (milliseconds) */
+    /* .fff: a decimal fraction of a second, as in a timestamp literal and
+     * the CSV reader.  Fewer than three digits are padded (.5 is 500 ms);
+     * digits past the third are dropped. */
     int ms = 0;
     if (*c == '.') {
         c++;
         if (!(*c >= '0' && *c <= '9')) return NULL;
-        ms = (*c - '0'); c++;
-        if (*c >= '0' && *c <= '9') { ms = ms * 10 + (*c - '0'); c++; }
-        if (*c >= '0' && *c <= '9') { ms = ms * 10 + (*c - '0'); c++; }
+        int nd = 0;
+        for (; *c >= '0' && *c <= '9'; c++)
+            if (nd < 3) { ms = ms * 10 + (*c - '0'); nd++; }
+        for (; nd < 3; nd++) ms *= 10;
     }
 
     *ms_out = sign * (int32_t)((hh * 3600 + mm * 60 + ss) * 1000 + ms);
@@ -199,6 +203,11 @@ static ray_t* parse_number(ray_parser_t *p) {
     int is_neg = 0;
     if (*p->pos == '-') { is_neg = 1; p->pos++; }
 
+    if (p->pos[0] == '0' && p->pos[1] == 'W' && p->pos[2] == 'n') {
+        p->pos += 3;
+        return ray_timespan(is_neg ? -INT64_MAX : INT64_MAX);
+    }
+
     /* Hex literal: 0x.. */
     if (p->pos[0] == '0' && p->pos[1] == 'x') {
         p->pos += 2;
@@ -209,7 +218,7 @@ static ray_t* parse_number(ray_parser_t *p) {
         return ray_u8((uint8_t)v);
     }
 
-    /* Null literal: 0N{h,i,d,t,p,l,f,s} or bare 0N (defaults to i64 null). */
+    /* Null literal: 0N{h,i,d,t,p,l,f,e,g} or bare 0N (defaults to i64 null). */
     if (!is_neg && p->pos[0] == '0' && p->pos[1] == 'N') {
         switch (p->pos[2]) {
         case 'h': p->pos += 3; return ray_typed_null(-RAY_I16);
@@ -217,8 +226,11 @@ static ray_t* parse_number(ray_parser_t *p) {
         case 'd': p->pos += 3; return ray_typed_null(-RAY_DATE);
         case 't': p->pos += 3; return ray_typed_null(-RAY_TIME);
         case 'p': p->pos += 3; return ray_typed_null(-RAY_TIMESTAMP);
+        case 'n': p->pos += 3; return ray_typed_null(-RAY_TIMESPAN);
         case 'l': p->pos += 3; return ray_typed_null(-RAY_I64);
         case 'f': p->pos += 3; return ray_typed_null(-RAY_F64);
+        case 'e': p->pos += 3; return ray_typed_null(-RAY_F32);
+        case 'g': p->pos += 3; return ray_typed_null(-RAY_GUID);
         /* SYM has no typed null and no `0Ns` literal.  The empty symbol
          * (sym 0) is written `'` (parse_symbol below). */
         }
@@ -236,6 +248,15 @@ static ray_t* parse_number(ray_parser_t *p) {
     const char *dstart = p->pos;
     while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
     int ndigits = (int)(p->pos - dstart);
+    if (*p->pos == 'D') {
+        size_t consumed;
+        int64_t ns;
+        if (!ray_parse_timespan(start, &consumed, &ns))
+            return ray_error("domain", "parse: invalid or out-of-range timespan");
+        p->pos = start + consumed;
+        return ray_timespan(ns);
+    }
+
 
     /* Date/Timestamp: YYYY.MM.DD or YYYY.MM.DDDhh:mm:ss.nnnnnnnnn */
     if (ndigits == 4 && !is_neg && *p->pos == '.' &&
@@ -335,19 +356,26 @@ plain_number:;
         while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
     }
     if (*p->pos == 'e' || *p->pos == 'E') {
-        is_float = 1;
-        p->pos++;
-        if (*p->pos == '+' || *p->pos == '-') p->pos++;
-        while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
+        /* A trailing lowercase e is the F32 suffix; an exponent must
+         * have digits (optionally after a sign). */
+        const char *exp = p->pos + 1;
+        if (*exp == '+' || *exp == '-') exp++;
+        if (*exp >= '0' && *exp <= '9') {
+            is_float = 1;
+            p->pos = exp;
+            while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
+        }
     }
 
     size_t span = (size_t)(p->pos - start);
 
-    if (is_float) {
+    int is_f32 = (*p->pos == 'e');
+    if (is_f32) p->pos++;
+    if (is_float || is_f32) {
         double v = 0.0;
         if (ray_parse_f64(start, span, &v) == 0)
             return ray_error("parse", NULL);
-        return ray_f64(v);
+        return is_f32 ? ray_f32(ray_cast_f64_to_f32_null(v)) : ray_f64(v);
     }
 
     /* Integer parse — overflow signalled by `n == 0` (digits present but
@@ -607,7 +635,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
             return vec;
         }
         switch (vec_type) {
-            case RAY_I64: case RAY_TIMESTAMP: {
+            case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: {
                 int64_t* d = (int64_t*)ray_data(vec);
                 for (int32_t i = 0; i < count; i++) d[i] = elems[i]->i64;
                 break;
@@ -615,6 +643,19 @@ static ray_t* parse_vector(ray_parser_t *p) {
             case RAY_F64: {
                 double* d = (double*)ray_data(vec);
                 for (int32_t i = 0; i < count; i++) d[i] = elems[i]->f64;
+                break;
+            }
+            case RAY_F32: {
+                /* F32 atoms keep their value in the f64 slot (ray_f32). */
+                float* d = (float*)ray_data(vec);
+                for (int32_t i = 0; i < count; i++) d[i] = (float)elems[i]->f64;
+                break;
+            }
+            case RAY_GUID: {
+                /* A GUID atom's 16 bytes live in its obj U8 buffer. */
+                uint8_t* d = (uint8_t*)ray_data(vec);
+                for (int32_t i = 0; i < count; i++)
+                    memcpy(d + (size_t)i * 16, ray_data(elems[i]->obj), 16);
                 break;
             }
             case RAY_I32: case RAY_DATE: case RAY_TIME: {
@@ -810,6 +851,52 @@ static ray_t* parse_dict(ray_parser_t *p) {
 }
 
 /* ── List (s-expression): (fn arg1 arg2 ...) ── */
+/* ── times binding: the [name count] after a `times` head ──
+ *
+ * Not a vector literal: the count is an expression, so `[i (count qty)]`
+ * or `[i 5]` would mix element types, and a bare name in it would read
+ * as a symbol literal rather than a reference.  It parses instead into
+ * the list (RAY_TIMES_BIND name count), whose head is a symbol no source
+ * token can spell (it contains a space), so it is told apart from a
+ * count expression however it was reached (see ray_times_binding). */
+static ray_t* parse_times_binding(ray_parser_t *p) {
+    int32_t sl = p->line, sc = p->col;
+    advance(p, 1); /* skip [ */
+    ray_t* list = ray_list_new(3);
+    if (RAY_IS_ERR(list)) return list;
+    ray_t* marker = ray_sym(ray_sym_intern(RAY_TIMES_BIND, sizeof(RAY_TIMES_BIND) - 1));
+    if (RAY_IS_ERR(marker)) { ray_release(list); return marker; }
+    list = ray_list_append(list, marker);
+    ray_release(marker);
+    if (RAY_IS_ERR(list)) return list;
+
+    for (int i = 0; i < 2; i++) {
+        skip_ws_and_comments(p);
+        if (*p->pos == ']') {
+            ray_release(list);
+            return ray_error("parse", "times: binding must be [name count]");
+        }
+        ray_t* elem = parse_expr(p);
+        if (RAY_IS_ERR(elem)) { ray_release(list); return elem; }
+        if (i == 0 && (elem->type != -RAY_SYM || (elem->attrs & ATTR_QUOTED))) {
+            ray_release(elem);
+            ray_release(list);
+            return ray_error("parse", "times: binding must be [name count], with a name first");
+        }
+        list = ray_list_append(list, elem);
+        ray_release(elem);
+        if (RAY_IS_ERR(list)) return list;
+    }
+    skip_ws_and_comments(p);
+    if (*p->pos != ']') {
+        ray_release(list);
+        return ray_error("parse", "times: binding must be [name count]");
+    }
+    advance(p, 1); /* skip ] */
+    nfo_record(p, list, sl, sc);
+    return list;
+}
+
 static ray_t* parse_list(ray_parser_t *p) {
     advance(p, 1); /* skip ( */
     ray_t* list = ray_list_new(4);
@@ -817,7 +904,19 @@ static ray_t* parse_list(ray_parser_t *p) {
 
     skip_ws_and_comments(p);
     while (*p->pos && *p->pos != ')') {
-        ray_t* elem = parse_expr(p);
+        ray_t* elem;
+        /* (times [i n] body...): a bracket right after a `times` head is
+         * the index binding, not a vector literal. */
+        if (list->len == 1 && *p->pos == '[') {
+            ray_t* head = ((ray_t**)ray_data(list))[0];
+            if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+                head->i64 == ray_sym_intern("times", 5))
+                elem = parse_times_binding(p);
+            else
+                elem = parse_expr(p);
+        } else {
+            elem = parse_expr(p);
+        }
         if (RAY_IS_ERR(elem)) { ray_release(list); return elem; }
         list = ray_list_append(list, elem);
         ray_release(elem);

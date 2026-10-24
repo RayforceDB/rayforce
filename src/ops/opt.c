@@ -28,6 +28,7 @@
 #include "vec/vec.h"
 #include "opt.h"
 #include "idiom.h"
+#include "table/table.h"   /* ray_table_col_meta */
 #include "core/profile.h"
 #include "mem/heap.h"
 #include <float.h>
@@ -36,6 +37,10 @@
 
 /* Forward declaration — defined below, used by type inference and DCE passes. */
 ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id);
+
+/* Shared resolved-expression dependency proof (exec.c/internal.h).  Keep
+ * the optimizer's local edge accessors rather than including internal.h. */
+bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
 
 /* Shared 32-byte node allocator (graph.c).  Forwarded by graph_alloc_node_opt;
  * node ids are realloc-stable so no pointer fixups are needed. */
@@ -161,6 +166,11 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
+                    /* Second inputs of binary aggs (wsum/wavg/cov/pearson). */
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !visited[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins2[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -480,17 +490,16 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_SUB: r = lv - rv; break;
                 case OP_MUL: r = lv * rv; break;
                 case OP_MOD:
-                    if (rv == 0.0f) r = NULL_F32;
-                    else {
-                        r = fmodf(lv, rv);
-                        if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
-                    }
+                    if (rv == 0.0f) return false;   /* 0Nf at run time */
+                    r = fmodf(lv, rv);
+                    if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
                 default: return false;
             }
-            folded = ray_f32(isfinite(r) ? r : NULL_F32);
+            if (!isfinite(r)) return false;   /* see the F64 arm */
+            folded = ray_f32(r);
             break;
         }
         case RAY_F64: {
@@ -501,8 +510,11 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_ADD: r = lv + rv; break;
                 case OP_SUB: r = lv - rv; break;
                 case OP_MUL: r = lv * rv; break;
-                case OP_DIV: r = lv / rv; break;  /* IEEE 754: ±Inf or NaN */
-                case OP_MOD: r = fmod(lv, rv); break;  /* IEEE 754: NaN for rv==0 */
+                case OP_DIV: r = lv / rv; break;
+                case OP_MOD:
+                    r = fmod(lv, rv);
+                    if (r != 0.0 && ((r > 0.0) != (rv > 0.0))) r += rv;
+                    break;
                 case OP_POW:
                     if (!pow_atom_type_admitted(le->literal) ||
                         !pow_atom_type_admitted(re->literal))
@@ -513,6 +525,10 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MAX2: r = fmax(lv, rv); break;  /* NaN-propagating */
                 default: return false;
             }
+            /* A non-finite result (x/0, overflow) is 0Nf at run time; a
+             * folded constant would carry Inf/NaN without its null flag,
+             * so leave it to the kernels. */
+            if (!isfinite(r)) return false;
             folded = ray_f64(r);
             break;
         }
@@ -524,11 +540,17 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_ADD: r = (int64_t)((uint64_t)lv + (uint64_t)rv); break;
                 case OP_SUB: r = (int64_t)((uint64_t)lv - (uint64_t)rv); break;
                 case OP_MUL: r = (int64_t)((uint64_t)lv * (uint64_t)rv); break;
+                /* A zero divisor (or INT64_MIN / -1) is 0Nl at run time:
+                 * leave it to the kernels rather than fold a 0. */
                 case OP_DIV:
-                    r = (rv != 0 && !(lv == INT64_MIN && rv == -1)) ? lv / rv : 0;
+                    if (rv == 0 || (lv == INT64_MIN && rv == -1)) return false;
+                    r = lv / rv;
+                    if (r * rv != lv && ((lv < 0) != (rv < 0))) r--;
                     break;
                 case OP_MOD:
-                    r = (rv != 0 && !(lv == INT64_MIN && rv == -1)) ? lv % rv : 0;
+                    if (rv == 0 || (lv == INT64_MIN && rv == -1)) return false;
+                    r = lv % rv;
+                    if (r != 0 && ((r ^ rv) < 0)) r += rv;
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -566,10 +588,14 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_SUB: r = (int32_t)((uint32_t)lv - (uint32_t)rv); break;
                 case OP_MUL: r = (int32_t)((uint32_t)lv * (uint32_t)rv); break;
                 case OP_DIV:
-                    r = (rv != 0 && !(lv == INT32_MIN && rv == -1)) ? lv / rv : 0;
+                    if (rv == 0 || (lv == INT32_MIN && rv == -1)) return false;
+                    r = lv / rv;
+                    if (r * rv != lv && ((lv < 0) != (rv < 0))) r--;
                     break;
                 case OP_MOD:
-                    r = (rv != 0 && !(lv == INT32_MIN && rv == -1)) ? lv % rv : 0;
+                    if (rv == 0 || (lv == INT32_MIN && rv == -1)) return false;
+                    r = lv % rv;
+                    if (r != 0 && ((r ^ rv) < 0)) r += rv;
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -778,6 +804,11 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
+                    /* Second inputs of binary aggs (wsum/wavg/cov/pearson). */
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !visited[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                stack[sp++] = ext->agg_ins2[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -924,6 +955,13 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                             if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->agg_ins[a];
                         }
+                        /* Second inputs of binary aggs: an expression
+                         * referenced only here must stay live. */
+                        if (ext->agg_ins2)
+                            for (uint32_t a = 0; a < ext->n_aggs; a++) {
+                                if (op_node(g, ext->agg_ins2[a]) && !live[ext->agg_ins2[a]] && sp < (int)stack_cap)
+                                    stack[sp++] = ext->agg_ins2[a];
+                            }
                         break;
                     case OP_SORT:
                     case OP_SELECT:
@@ -1599,11 +1637,44 @@ static int filter_rank_key(ray_graph_t* g, ray_op_t* pred) {
     return filter_selectivity_rank(g, pred) * 100 + filter_cost(g, pred);
 }
 
-/* Split FILTER(AND(a, b), input) into FILTER(a, FILTER(b, input)).
+/* A reorderable filter run must stay in the default table's row domain.
+ * Filters preserve schema; an unsafe predicate may be an immovable barrier
+ * inside this ancestry.  Do not infer correspondence through a group, join,
+ * projection, order/position change, or a registered secondary scan. */
+bool filter_input_default_domain(ray_graph_t* g, uint32_t id) {
+    if (!g || !g->nodes) return false;
+    uint32_t budget = g->node_count;
+    while (budget--) {
+        if (id >= g->node_count) return false;
+        ray_op_t* n = &g->nodes[id];
+        if (n->id != id || (n->flags & OP_FLAG_DEAD)) return false;
+        if (n->opcode == OP_FILTER) {
+            if (n->arity != 2 || n->in_id[1] >= g->node_count) return false;
+            id = n->in_id[0];
+        } else if (n->opcode == OP_ALIAS || n->opcode == OP_MATERIALIZE) {
+            if (n->arity != 1) return false;
+            id = n->in_id[0];
+        } else if (n->opcode == OP_SCAN) {
+            return ray_expr_subset_invariant(g, id);
+        } else if (n->opcode == OP_CONST) {
+            ray_op_ext_t* x = find_ext(g, id);
+            return n->arity == 0 && x && g->table &&
+                   g->table->type == RAY_TABLE && x->literal == g->table;
+        } else {
+            return false;
+        }
+    }
+    return false;  /* cyclic or unproved ancestry */
+}
+
+/* Split FILTER(AND(a, b), input) into FILTER(b, FILTER(a, input)) only
+ * when both complete limbs preserve verdicts under a source-row subset.
  * Returns the new outer filter node, or the original if no split. */
 static ray_op_t* split_and_filter(ray_graph_t* g, ray_op_t* filter_node) {
     if (!filter_node || filter_node->opcode != OP_FILTER) return filter_node;
-    if (filter_node->arity != 2) return filter_node;
+    if (filter_node->arity != 2 ||
+        filter_node->in_id[0] >= g->node_count ||
+        filter_node->in_id[1] >= g->node_count) return filter_node;
 
     ray_op_t* pred = op_child(g, filter_node, 1);
     if (!pred || pred->opcode != OP_AND || pred->arity != 2) return filter_node;
@@ -1620,6 +1691,8 @@ static ray_op_t* split_and_filter(ray_graph_t* g, ray_op_t* filter_node) {
      * on an agg-output ref, row-count mismatch on a key ref).  Left intact, the
      * single FILTER(AND, GROUP) is handled correctly by the HAVING fusion. */
     if (input->opcode == OP_GROUP) return filter_node;
+    if (!filter_input_default_domain(g, input->id) ||
+        !ray_expr_subset_invariant(g, pred->id)) return filter_node;
 
     /* Save IDs before potential realloc */
     uint32_t filter_id = filter_node->id;
@@ -1657,8 +1730,15 @@ static ray_op_t* split_and_filter(ray_graph_t* g, ray_op_t* filter_node) {
 static int collect_filter_chain(ray_graph_t* g, ray_op_t* top, ray_op_t** chain, int max) {
     int n = 0;
     ray_op_t* cur = top;
+    if (!top || !filter_input_default_domain(g, top->id)) return 0;
     while (cur && cur->opcode == OP_FILTER &&
            !(cur->flags & OP_FLAG_PUSHED) && n < max) {
+        if ((cur->flags & OP_FLAG_DEAD) || cur->arity != 2 ||
+            cur->in_id[0] >= g->node_count ||
+            cur->in_id[1] >= g->node_count ||
+            !ray_expr_subset_invariant(g, cur->in_id[1])) break;
+        /* Stop BEFORE the unsafe predicate: it is a domain barrier, not
+         * an expensive predicate that may be sorted across its neighbors. */
         chain[n++] = cur;
         cur = op_child(g, cur, 0);
     }
@@ -1834,6 +1914,12 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                             live[ext->agg_ins[a]] = true;
                             if (qt < (int)nc) q[qt++] = ext->agg_ins[a];
                         }
+                    if (ext->agg_ins2)
+                        for (uint32_t a = 0; a < ext->n_aggs; a++)
+                            if (op_node(g, ext->agg_ins2[a]) && !live[ext->agg_ins2[a]]) {
+                                live[ext->agg_ins2[a]] = true;
+                                if (qt < (int)nc) q[qt++] = ext->agg_ins2[a];
+                            }
                     break;
                 case OP_SORT:
                 case OP_SELECT:
@@ -1935,6 +2021,166 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
  * est_rows=1 to hint that most partitions can be skipped at execution time.
  * -------------------------------------------------------------------------- */
 
+/* Partitions whose key passes `key cmp_op lit` (`lit cmp_op key` when
+ * swapped) set their bit in `mask` (key_values->len bits, zeroed by the
+ * caller).  False when the comparison cannot prune — a type-class mismatch,
+ * an unsupported literal, or an allocation failure — and every partition
+ * must then be kept.  Shared by the partition-pruning pass and select's
+ * pre-fetch pruning of a parted source. */
+bool ray_part_prune_mask(ray_t* key_values, uint16_t cmp_op, bool swapped,
+                         ray_t* lit, uint64_t* mask) {
+    int64_t n_parts = key_values->len;
+    /* Type-class check: partition keys and the literal must live in
+     * the same value namespace, otherwise comparisons are nonsense.
+     *   - SYM keys are interned IDs; they can only be compared to
+     *     SYM set elements.
+     *   - int-family keys (I16/I32/I64/DATE/TIME/TIMESTAMP/BOOL/U8)
+     *     compare only to other int-family values.
+     *   - mixing the two is always wrong at the raw-bits level,
+     *     so skip pruning (the executor filter still runs). */
+    int8_t pkey_t = key_values->type;
+    int8_t lit_base = lit->type < 0 ? (int8_t)(-lit->type) : lit->type;
+    bool pkey_is_sym = (pkey_t == RAY_SYM);
+    bool lit_is_sym  = (lit_base == RAY_SYM);
+    if (pkey_is_sym != lit_is_sym) return false;
+    /* Raw partition ids have no lexical ordering (#738). Let the
+     * domain-aware predicate executor select these rows instead. */
+    if (pkey_is_sym && (cmp_op == OP_LT || cmp_op == OP_LE ||
+                        cmp_op == OP_GT || cmp_op == OP_GE))
+        return false;
+
+    /* OP_IN / OP_NOT_IN expects a literal vector const on the RHS.
+     * For the scalar ops, the const is a single atom or 1-elem vec. */
+    bool is_in  = (cmp_op == OP_IN);
+    bool is_nin = (cmp_op == OP_NOT_IN);
+
+    /* For IN/NOT_IN the scan must be the LHS (col IN set), not
+     * swapped — we never pruned on `const IN col_set` anyway. */
+    if ((is_in || is_nin) && swapped) return false;
+
+    /* Extract constant(s) for comparison.  Scalar ops take one
+     * value; IN ops take an array of values read from the vec
+     * literal.  We normalize all values to int64_t (which covers
+     * I64, TIMESTAMP, SYM interned IDs, and sign-extended I32/
+     * DATE/TIME).  Atoms store the value in the header; vectors
+     * store it in data. */
+    int64_t const_val = 0;                 /* for scalar ops */
+    int64_t set_stack[32];
+    int64_t* set_vals = set_stack;         /* for IN/NOT_IN */
+    int64_t set_len   = 0;
+    ray_t*  set_heap  = NULL;
+
+    int8_t lt = lit->type < 0 ? (int8_t)(-lit->type) : lit->type;
+    bool narrow32 = (lt == RAY_I32 || lt == RAY_DATE || lt == RAY_TIME);
+    bool wide64   = (lt == RAY_I64 || lt == RAY_TIMESTAMP || lt == RAY_SYM);
+    if (!narrow32 && !wide64)
+        return false;  /* unsupported type for partition pruning */
+
+    if (is_in || is_nin) {
+        /* Literal must be a vector (ray_const_vec carries the vec
+         * pointer unchanged in ext->literal). */
+        if (lit->type <= 0) return false;
+        set_len = lit->len;
+        if (set_len <= 0) {
+            /* Empty set: for IN no partition can match → mask stays 0
+             * (the caller skips every segment).  For
+             * NOT_IN every partition passes → set all bits. */
+            if (is_nin) {
+                for (int64_t p = 0; p < n_parts; p++)
+                    mask[p / 64] |= (1ULL << (p % 64));
+            }
+            return true;
+        }
+        if (set_len > 32) {
+            set_heap = ray_alloc((size_t)set_len * sizeof(int64_t));
+            if (!set_heap) return false;
+            set_vals = (int64_t*)ray_data(set_heap);
+        }
+        /* Read set elements — skip nulls in the literal so a null
+         * sentinel can never match a partition key. */
+        int64_t next = 0;
+        bool set_has_nulls = ray_vec_may_have_nulls(lit);
+        for (int64_t i = 0; i < set_len; i++) {
+            if (set_has_nulls && ray_vec_is_null(lit, i)) continue;
+            if (narrow32) {
+                int32_t v32;
+                memcpy(&v32, (char*)ray_data(lit) + i * sizeof(int32_t), sizeof(int32_t));
+                set_vals[next++] = v32;
+            } else {
+                int64_t v64;
+                memcpy(&v64, (char*)ray_data(lit) + i * sizeof(int64_t), sizeof(int64_t));
+                set_vals[next++] = v64;
+            }
+        }
+        set_len = next;
+        /* Also handle the degenerate case where all set elements
+         * were null — treat like empty set. */
+        if (set_len == 0) {
+            if (is_nin) {
+                for (int64_t p = 0; p < n_parts; p++)
+                    mask[p / 64] |= (1ULL << (p % 64));
+            }
+            if (set_heap) ray_free(set_heap);
+            return true;
+        }
+    } else {
+        /* Scalar const path (EQ/NE/LT/GT/LE/GE). */
+        if (wide64) {
+            if (lit->type < 0) const_val = lit->i64;
+            else memcpy(&const_val, ray_data(lit), sizeof(int64_t));
+        } else {
+            int32_t v32;
+            if (lit->type < 0) v32 = lit->i32;
+            else memcpy(&v32, ray_data(lit), sizeof(int32_t));
+            const_val = v32;
+        }
+    }
+
+    /* Effective comparison: if swapped, reverse direction
+     * (IN/NOT_IN are never swapped — gated above). */
+    uint16_t eff_op = cmp_op;
+    if (swapped) {
+        if (cmp_op == OP_LT) eff_op = OP_GT;
+        else if (cmp_op == OP_GT) eff_op = OP_LT;
+        else if (cmp_op == OP_LE) eff_op = OP_GE;
+        else if (cmp_op == OP_GE) eff_op = OP_LE;
+    }
+
+    for (int64_t p = 0; p < n_parts; p++) {
+        int64_t pkey = 0;
+        if (key_values->type == RAY_DATE || key_values->type == RAY_I32 || key_values->type == RAY_TIME) {
+            int32_t v32;
+            memcpy(&v32, (char*)ray_data(key_values) + p * sizeof(int32_t), sizeof(int32_t));
+            pkey = v32;
+        } else {
+            memcpy(&pkey, (char*)ray_data(key_values) + p * sizeof(int64_t), sizeof(int64_t));
+        }
+
+        bool pass = false;
+        if (is_in || is_nin) {
+            bool found = false;
+            for (int64_t j = 0; j < set_len; j++) {
+                if (pkey == set_vals[j]) { found = true; break; }
+            }
+            pass = is_in ? found : !found;
+        } else {
+            switch (eff_op) {
+                case OP_EQ: pass = (pkey == const_val); break;
+                case OP_NE: pass = (pkey != const_val); break;
+                case OP_LT: pass = (pkey <  const_val); break;
+                case OP_GT: pass = (pkey >  const_val); break;
+                case OP_LE: pass = (pkey <= const_val); break;
+                case OP_GE: pass = (pkey >= const_val); break;
+                default: break;
+            }
+        }
+        if (pass)
+            mask[p / 64] |= (1ULL << (p % 64));
+    }
+    if (set_heap) ray_free(set_heap);
+    return true;
+}
+
 static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
     if (!g || !root) return;
     (void)root;
@@ -1981,8 +2227,11 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             tbl = g->table;
         if (!tbl) continue;
 
-        ray_t* mc_col = ray_table_get_col(tbl, scan_ext->sym);
-        if (!mc_col || mc_col->type != RAY_MAPCOMMON) continue;
+        ray_col_meta_t mm;
+        if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
+        ray_t* mc_col = ray_table_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
+        if (!mc_col) continue;
+        if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
 
         /* Extract constant value */
         ray_op_ext_t* const_ext = find_ext(g, const_node->id);
@@ -1997,164 +2246,14 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         int64_t n_parts = key_values->len;
         if (n_parts <= 0) continue;
 
-        /* Type-class check: partition keys and the literal must live in
-         * the same value namespace, otherwise comparisons are nonsense.
-         *   - SYM keys are interned IDs; they can only be compared to
-         *     SYM set elements.
-         *   - int-family keys (I16/I32/I64/DATE/TIME/TIMESTAMP/BOOL/U8)
-         *     compare only to other int-family values.
-         *   - mixing the two is always wrong at the raw-bits level,
-         *     so skip pruning (the executor filter still runs). */
-        int8_t pkey_t = key_values->type;
-        int8_t lit_base = lit->type < 0 ? (int8_t)(-lit->type) : lit->type;
-        bool pkey_is_sym = (pkey_t == RAY_SYM);
-        bool lit_is_sym  = (lit_base == RAY_SYM);
-        if (pkey_is_sym != lit_is_sym) {
-            continue;
-        }
-        /* Raw partition ids have no lexical ordering (#738). Let the
-         * domain-aware predicate executor select these rows instead. */
-        if (pkey_is_sym && (cmp_op == OP_LT || cmp_op == OP_LE ||
-                            cmp_op == OP_GT || cmp_op == OP_GE))
-            continue;
-
         /* Allocate seg_mask bitmap */
         uint32_t n_words = (uint32_t)((n_parts + 63) / 64);
         uint64_t* mask = (uint64_t*)ray_calloc_raw(n_words * sizeof(uint64_t));
         if (!mask) continue;
-
-        /* OP_IN / OP_NOT_IN expects a literal vector const on the RHS.
-         * For the scalar ops, the const is a single atom or 1-elem vec. */
-        bool is_in  = (cmp_op == OP_IN);
-        bool is_nin = (cmp_op == OP_NOT_IN);
-
-        /* For IN/NOT_IN the scan must be the LHS (col IN set), not
-         * swapped — we never pruned on `const IN col_set` anyway. */
-        if ((is_in || is_nin) && swapped) { ray_free_raw(mask); continue; }
-
-        /* Extract constant(s) for comparison.  Scalar ops take one
-         * value; IN ops take an array of values read from the vec
-         * literal.  We normalize all values to int64_t (which covers
-         * I64, TIMESTAMP, SYM interned IDs, and sign-extended I32/
-         * DATE/TIME).  Atoms store the value in the header; vectors
-         * store it in data. */
-        int64_t const_val = 0;                 /* for scalar ops */
-        int64_t set_stack[32];
-        int64_t* set_vals = set_stack;         /* for IN/NOT_IN */
-        int64_t set_len   = 0;
-        ray_t*  set_heap  = NULL;
-
-        int8_t lt = lit->type < 0 ? (int8_t)(-lit->type) : lit->type;
-        bool narrow32 = (lt == RAY_I32 || lt == RAY_DATE || lt == RAY_TIME);
-        bool wide64   = (lt == RAY_I64 || lt == RAY_TIMESTAMP || lt == RAY_SYM);
-        if (!narrow32 && !wide64) {
+        if (!ray_part_prune_mask(key_values, cmp_op, swapped, lit, mask)) {
             ray_free_raw(mask);
-            continue;  /* unsupported type for partition pruning */
+            continue;
         }
-
-        if (is_in || is_nin) {
-            /* Literal must be a vector (ray_const_vec carries the vec
-             * pointer unchanged in ext->literal). */
-            if (lit->type <= 0) { ray_free_raw(mask); continue; }
-            set_len = lit->len;
-            if (set_len <= 0) {
-                /* Empty set: for IN no partition can match → mask stays 0
-                 * and we attach it below (skipping all segments).  For
-                 * NOT_IN every partition passes → set all bits. */
-                if (is_nin) {
-                    for (int64_t p = 0; p < n_parts; p++)
-                        mask[p / 64] |= (1ULL << (p % 64));
-                }
-                goto attach_mask;
-            }
-            if (set_len > 32) {
-                set_heap = ray_alloc((size_t)set_len * sizeof(int64_t));
-                if (!set_heap) { ray_free_raw(mask); continue; }
-                set_vals = (int64_t*)ray_data(set_heap);
-            }
-            /* Read set elements — skip nulls in the literal so a null
-             * sentinel can never match a partition key. */
-            int64_t next = 0;
-            bool set_has_nulls = ray_vec_may_have_nulls(lit);
-            for (int64_t i = 0; i < set_len; i++) {
-                if (set_has_nulls && ray_vec_is_null(lit, i)) continue;
-                if (narrow32) {
-                    int32_t v32;
-                    memcpy(&v32, (char*)ray_data(lit) + i * sizeof(int32_t), sizeof(int32_t));
-                    set_vals[next++] = v32;
-                } else {
-                    int64_t v64;
-                    memcpy(&v64, (char*)ray_data(lit) + i * sizeof(int64_t), sizeof(int64_t));
-                    set_vals[next++] = v64;
-                }
-            }
-            set_len = next;
-            /* Also handle the degenerate case where all set elements
-             * were null — treat like empty set. */
-            if (set_len == 0) {
-                if (is_nin) {
-                    for (int64_t p = 0; p < n_parts; p++)
-                        mask[p / 64] |= (1ULL << (p % 64));
-                }
-                if (set_heap) ray_free(set_heap);
-                goto attach_mask;
-            }
-        } else {
-            /* Scalar const path (EQ/NE/LT/GT/LE/GE). */
-            if (wide64) {
-                if (lit->type < 0) const_val = lit->i64;
-                else memcpy(&const_val, ray_data(lit), sizeof(int64_t));
-            } else {
-                int32_t v32;
-                if (lit->type < 0) v32 = lit->i32;
-                else memcpy(&v32, ray_data(lit), sizeof(int32_t));
-                const_val = v32;
-            }
-        }
-
-        /* Effective comparison: if swapped, reverse direction
-         * (IN/NOT_IN are never swapped — gated above). */
-        uint16_t eff_op = cmp_op;
-        if (swapped) {
-            if (cmp_op == OP_LT) eff_op = OP_GT;
-            else if (cmp_op == OP_GT) eff_op = OP_LT;
-            else if (cmp_op == OP_LE) eff_op = OP_GE;
-            else if (cmp_op == OP_GE) eff_op = OP_LE;
-        }
-
-        for (int64_t p = 0; p < n_parts; p++) {
-            int64_t pkey = 0;
-            if (key_values->type == RAY_DATE || key_values->type == RAY_I32 || key_values->type == RAY_TIME) {
-                int32_t v32;
-                memcpy(&v32, (char*)ray_data(key_values) + p * sizeof(int32_t), sizeof(int32_t));
-                pkey = v32;
-            } else {
-                memcpy(&pkey, (char*)ray_data(key_values) + p * sizeof(int64_t), sizeof(int64_t));
-            }
-
-            bool pass = false;
-            if (is_in || is_nin) {
-                bool found = false;
-                for (int64_t j = 0; j < set_len; j++) {
-                    if (pkey == set_vals[j]) { found = true; break; }
-                }
-                pass = is_in ? found : !found;
-            } else {
-                switch (eff_op) {
-                    case OP_EQ: pass = (pkey == const_val); break;
-                    case OP_NE: pass = (pkey != const_val); break;
-                    case OP_LT: pass = (pkey <  const_val); break;
-                    case OP_GT: pass = (pkey >  const_val); break;
-                    case OP_LE: pass = (pkey <= const_val); break;
-                    case OP_GE: pass = (pkey >= const_val); break;
-                    default: break;
-                }
-            }
-            if (pass)
-                mask[p / 64] |= (1ULL << (p % 64));
-        }
-        if (set_heap) ray_free(set_heap);
-    attach_mask:;
 
         /* Attach seg_mask to OP_SCAN nodes reading parted columns from same table.
          * When !any_active the mask is all-zeros — attach it anyway so the
@@ -2173,8 +2272,8 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             memcpy(&sn_tid, sn_ext->base.pad, sizeof(uint16_t));
             if (sn_tid != stored_table_id) continue;
 
-            ray_t* sn_col = ray_table_get_col(tbl, sn_ext->sym);
-            if (!sn_col || !RAY_IS_PARTED(sn_col->type)) continue;
+            ray_col_meta_t sm;
+            if (!ray_table_col_meta(tbl, sn_ext->sym, &sm) || !RAY_IS_PARTED(sm.type)) continue;
 
             if (sn_ext->seg_mask) {
                 /* AND with existing mask (conjunctive filters) */

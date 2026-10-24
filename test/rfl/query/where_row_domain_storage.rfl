@@ -1,0 +1,32 @@
+;; @requires: posix
+;; The equivalence runner repeats saved-table fixtures with generation 2.
+;; Relative paths stay inside the harness per-process working directory.
+(.sys.exec "rm -rf rfl_where_row_domain")
+(set S (table [name room score] (list ['Ann 'Cid 'Bob 'Dan] ['A 'A 'B 'B] [60 45 20 35])))
+(.db.splayed.set "rfl_where_row_domain/s/" S)
+(set A (.db.splayed.get "rfl_where_row_domain/s/"))
+(at (select {from: A where: (and (== room 'A) (> score (avg score)))}) 'name) -- ['Ann 'Cid]
+(at (select {from: A where: (and (> score (avg score)) (== room 'A)) take: 5}) 'name) -- ['Ann 'Cid]
+(first (at (select {a: (avg score) from: A where: (== room 'A)}) 'a)) -- 52.5
+(.db.splayed.set "rfl_where_row_domain/db/2024.01.01/s/" (table [name room score] (list ['Ann 'Cid] ['A 'A] [60 45])))
+(.db.splayed.set "rfl_where_row_domain/db/2024.01.02/s/" (table [name room score] (list ['Bob 'Dan] ['B 'B] [20 35])))
+(set P (.db.parted.get "rfl_where_row_domain/db/" 's))
+(at (select {from: P where: (and (== room 'A) (> score (avg score)))}) 'name) -- ['Ann 'Cid]
+(at (select {from: P where: (and (> score (avg score)) (== room 'A)) take: 5}) 'name) -- ['Ann 'Cid]
+(first (at (select {a: (avg score) from: P where: (== room 'A)}) 'a)) -- 52.5
+(set x (til 200000))
+(set T (table [order region amount] (list x (at ['US 'EU] (as 'I64 (or (< x 1024) (>= x 199000)))) (+ 1 (* 0 x)))))
+(set T (update {from: T amount: (if (== 5 (% order 10)) 0Nl amount)}))
+(.db.splayed.set "rfl_where_row_domain/t/" T)
+(set B (.db.splayed.get "rfl_where_row_domain/t/"))
+(count (select {from: B where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000))})) -- 1000
+(count (select {from: B where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000)) take: 5000})) -- 1000
+(.db.splayed.set "rfl_where_row_domain/p/2024.01.01/t/" (select {from: T where: (< order 65536)}))
+(.db.splayed.set "rfl_where_row_domain/p/2024.01.02/t/" (select {from: T where: (and (>= order 65536) (< order 131072))}))
+(.db.splayed.set "rfl_where_row_domain/p/2024.01.03/t/" (select {from: T where: (>= order 131072)}))
+(set R (.db.parted.get "rfl_where_row_domain/p/" 't))
+(count (select {from: R where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000))})) -- 1000
+(count (select {from: R where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000)) take: 5000})) -- 1000
+(at (select {from: B where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000))}) 'order) -- (+ 199000 (til 1000))
+(at (select {from: R where: (and (== region 'EU) (>= (sums (* (fills amount) 2)) 398000)) take: 5000}) 'order) -- (+ 199000 (til 1000))
+(.sys.exec "rm -rf rfl_where_row_domain") -- 0

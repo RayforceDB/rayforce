@@ -21,9 +21,11 @@
  *   SOFTWARE.
  */
 
+#include "ops/colbind.h"
 #include "graph.h"
 #include "internal.h"   /* EXT_TRAIL, graph_alloc_ext_node_ex */
 #include "store/csr.h"
+#include "table/table.h"   /* ray_table_col_meta */
 #include "store/hnsw.h"
 #include <string.h>
 
@@ -140,6 +142,7 @@ ray_graph_t* ray_graph_new(ray_t* tbl) {
 void ray_graph_free(ray_graph_t* g) {
     if (!g) return;
 
+    ray_graph_binds_free(g);
     if (g->compile_err) { ray_error_free(g->compile_err); g->compile_err = NULL; }   /* errors are not refcounted */
 
     /* Unconsumed slice-group hint (error paths / shapes that never
@@ -211,6 +214,14 @@ void ray_graph_free(ray_graph_t* g) {
  * the base type and the wrapper stays where it belongs, on the column.  The
  * executor decides how to read a parted column from the column itself, never
  * from the node. */
+/* Estimated rows as the graph has always recorded them: a parted wrapper's
+ * len (its segment count), MAPCOMMON's len (2), else the row count. */
+static uint32_t scan_est_rows(const ray_col_meta_t* m) {
+    if (RAY_IS_PARTED(m->type)) return (uint32_t)m->n_segs;
+    if (m->type == RAY_MAPCOMMON) return 2;
+    return (uint32_t)m->len;
+}
+
 static int8_t scan_out_type(int8_t col_type) {
     return RAY_IS_PARTED(col_type) ? (int8_t)RAY_PARTED_BASETYPE(col_type)
                                    : col_type;
@@ -229,10 +240,10 @@ ray_op_t* ray_scan(ray_graph_t* g, const char* col_name) {
 
     /* Infer output type from the bound table */
     if (g->table) {
-        ray_t* col = ray_table_get_col(g->table, sym_id);
-        if (col) {
-            ext->base.out_type = scan_out_type(col->type);
-            ext->base.est_rows = (uint32_t)col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta(g->table, sym_id, &m)) {
+            ext->base.out_type = scan_out_type(m.type);
+            ext->base.est_rows = scan_est_rows(&m);
         }
     }
 
@@ -410,7 +421,8 @@ static ray_op_t* make_binary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_o
     n->arity = 2;
     n->in_id[0] = a->id;
     n->in_id[1] = b->id;
-    n->out_type = out_type;
+    int8_t span_out = ray_timespan_binary_type(opcode, a->out_type, b->out_type);
+    n->out_type = span_out > 0 ? span_out : out_type;
     n->est_rows = est;
     return n;
 }
@@ -499,8 +511,9 @@ static int8_t cmp_temporal_type(ray_graph_t* g, ray_op_t* x) {
     /* A date-partitioned table's key scans as MAPCOMMON over DATE values. */
     if (t == RAY_MAPCOMMON && x->opcode == OP_SCAN && g->table) {
         ray_op_ext_t* ext = find_ext(g, x->id);
-        ray_t* col = ext ? ray_table_get_col(g->table, ext->sym) : NULL;
-        if (col && col->type == RAY_MAPCOMMON && col->attrs == RAY_MC_DATE)
+        ray_col_meta_t m;
+        if (ext && ray_table_col_meta(g->table, ext->sym, &m)
+            && m.type == RAY_MAPCOMMON && m.attrs == RAY_MC_DATE)
             return RAY_DATE;
     }
     return 0;
@@ -559,7 +572,26 @@ static uint16_t cmp_flip(uint16_t opcode) {
     }
 }
 
+/* Called only for an otherwise mismatched SYM pair. String literals carry
+ * SYM execution metadata but must keep their existing text admission path. */
+static int cmp_is_symbol_value(ray_graph_t* g, ray_op_t* x) {
+    if (x->opcode != OP_CONST) return 1;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    return !ext || !ext->literal || ext->literal->type != -RAY_STR;
+}
+
 static ray_op_t* make_cmp(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
+    int8_t a_type = a->out_type, b_type = b->out_type;
+    if (RAY_IS_PARTED(a_type)) a_type = (int8_t)RAY_PARTED_BASETYPE(a_type);
+    if (RAY_IS_PARTED(b_type)) b_type = (int8_t)RAY_PARTED_BASETYPE(b_type);
+    /* Symbol IDs are not numeric values. Let the evaluator apply its
+     * value-sensitive builtin/null rules to unsupported equality pairs. */
+    if ((opcode == OP_EQ || opcode == OP_NE) &&
+        ((a_type == RAY_SYM && b_type != RAY_SYM && b_type != RAY_STR &&
+          cmp_is_symbol_value(g, a)) ||
+         (b_type == RAY_SYM && a_type != RAY_SYM && a_type != RAY_STR &&
+          cmp_is_symbol_value(g, b))))
+        return NULL;
     int8_t ta = cmp_temporal_type(g, a);
     int8_t tb = cmp_temporal_type(g, b);
     if (!ta || !tb || ta == tb) return make_binary(g, opcode, a, b, RAY_BOOL);
@@ -619,8 +651,8 @@ static bool if_branch_is_list_scan(ray_graph_t* g, ray_op_t* b) {
     if (!b || b->opcode != OP_SCAN || !g->table) return false;
     ray_op_ext_t* ext = find_ext(g, b->id);
     if (!ext) return false;
-    ray_t* col = ray_table_get_col(g->table, ext->sym);
-    return col && col->type == RAY_LIST;
+    ray_col_meta_t m;
+    return ray_table_col_meta(g->table, ext->sym, &m) && m.type == RAY_LIST;
 }
 
 /* Is node `id` a bare null atom literal (`0N`, `0Nf`, `0Ni`, ...)? */
@@ -817,7 +849,13 @@ ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n) {
  * Reduction ops
  * -------------------------------------------------------------------------- */
 
-ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_SUM, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64); }
+ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a) {
+    int8_t type = a->out_type;
+    if (RAY_IS_PARTED(type)) type = (int8_t)RAY_PARTED_BASETYPE(type);
+    int8_t out = type == RAY_F64 || type == RAY_F32 ? RAY_F64
+                 : type == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_I64;
+    return make_unary(g, OP_SUM, a, out);
+}
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_PROD, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64); }
 ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ALL, a, RAY_BOOL); }
 ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ANY, a, RAY_BOOL); }
@@ -1470,10 +1508,10 @@ ray_op_t* ray_scan_table(ray_graph_t* g, uint16_t table_id, const char* col_name
     /* Infer output type from the specified table */
     ray_t* tbl = g->tables[table_id];
     if (tbl) {
-        ray_t* col = ray_table_get_col(tbl, sym_id);
-        if (col) {
-            ext->base.out_type = scan_out_type(col->type);
-            ext->base.est_rows = (uint32_t)col->len;
+        ray_col_meta_t m;
+        if (ray_table_col_meta(tbl, sym_id, &m)) {
+            ext->base.out_type = scan_out_type(m.type);
+            ext->base.est_rows = scan_est_rows(&m);
         }
     }
 
@@ -1942,7 +1980,59 @@ ray_t* ray_lazy_wrap(ray_graph_t* g, ray_op_t* op) {
     return h;
 }
 
+/* ---- Column-reference lazies ---- */
+
+typedef struct { ray_t* tbl; int64_t sym; } lazy_colref_t;
+
+ray_t* ray_lazy_colref(ray_t* tbl, int64_t sym) {
+    ray_t* h = ray_alloc(sizeof(lazy_colref_t));
+    if (!h) return ray_error("oom", NULL);
+    h->type  = RAY_LAZY;
+    h->attrs = RAY_LAZY_COLREF;
+    RAY_LAZY_GRAPH(h) = NULL;
+    RAY_LAZY_OP(h)    = NULL;
+    lazy_colref_t* c = (lazy_colref_t*)ray_data(h);
+    c->tbl = tbl;
+    c->sym = sym;
+    ray_retain(tbl);
+    return h;
+}
+
+bool ray_lazy_colref_get(ray_t* lazy, ray_t** tbl, int64_t* sym) {
+    if (!ray_is_lazy(lazy) || !(lazy->attrs & RAY_LAZY_COLREF)) return false;
+    lazy_colref_t* c = (lazy_colref_t*)ray_data(lazy);
+    if (!c->tbl) return false;
+    *tbl = c->tbl;
+    *sym = c->sym;
+    return true;
+}
+
+ray_t* ray_lazy_promote(ray_t* lazy) {
+    ray_t* tbl; int64_t sym;
+    if (!ray_lazy_colref_get(lazy, &tbl, &sym)) return NULL;
+    ray_t* nm = ray_sym_str(sym);                       /* borrowed */
+    size_t nl = (nm && !RAY_IS_ERR(nm)) ? ray_str_len(nm) : 0;
+    char nb[256];
+    if (nl == 0 || nl >= sizeof nb || memchr(ray_str_ptr(nm), '\0', nl))
+        return ray_error("domain", "lazy column: name not scannable");
+    memcpy(nb, ray_str_ptr(nm), nl);
+    nb[nl] = '\0';                                      /* ray_scan interns strlen(name) bytes */
+    ray_graph_t* g = ray_graph_new(tbl);                /* retains tbl */
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* sc = ray_scan(g, nb);
+    if (!sc) { ray_graph_free(g); return ray_error("oom", NULL); }
+    lazy_colref_t* c = (lazy_colref_t*)ray_data(lazy);
+    c->tbl = NULL;
+    lazy->attrs &= (uint8_t)~RAY_LAZY_COLREF;
+    RAY_LAZY_GRAPH(lazy) = g;
+    RAY_LAZY_OP(lazy)    = sc;
+    ray_release(tbl);                                   /* the graph holds its own */
+    return NULL;
+}
+
 ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
+    ray_t* perr = ray_lazy_promote(lazy);
+    if (perr) return perr;
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
     if (!g || !prev)
@@ -2012,6 +2102,8 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
 }
 
 ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
+    ray_t* perr = ray_lazy_promote(lazy);
+    if (perr) return perr;
     ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
     ray_op_t*    prev = RAY_LAZY_OP(lazy);
     if (!g || !prev)
@@ -2045,6 +2137,14 @@ ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
 
 ray_t* ray_lazy_materialize(ray_t* val) {
     if (!ray_is_lazy(val)) return val;
+
+    /* A column reference forces to what (at tbl 'col) returned eagerly. */
+    ray_t* ctbl; int64_t csym;
+    if (ray_lazy_colref_get(val, &ctbl, &csym)) {
+        ray_t* r = ray_table_col_value(ctbl, csym);
+        ray_release(val);
+        return r;
+    }
 
     ray_graph_t* g  = RAY_LAZY_GRAPH(val);
     ray_op_t*    op = RAY_LAZY_OP(val);

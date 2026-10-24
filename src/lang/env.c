@@ -89,6 +89,10 @@ static inline void env_unlock(void) {
 }
 
 #define ENV_CAP 1024
+#define ENV_WRITE_INDEX_BITS 11
+#define ENV_WRITE_INDEX_CAP (1u << ENV_WRITE_INDEX_BITS)
+_Static_assert(ENV_CAP < UINT16_MAX, "write index stores slot plus one");
+_Static_assert(ENV_WRITE_INDEX_CAP >= 2 * ENV_CAP, "write index needs empty buckets");
 
 static struct {
     int64_t keys[ENV_CAP];
@@ -102,7 +106,32 @@ static struct {
      * preserved across snapshot/restore. */
     uint8_t  user[ENV_CAP];
     int32_t count;
+    /* Writers hold env_lock. Zero is an empty bucket, otherwise slot + 1.
+     * Readers retain their existing validated hints and value-cache epochs. */
+    uint16_t write_index[ENV_WRITE_INDEX_CAP];
 } g_env;
+
+/* Every name ever given a slot in g_env, as a one-hash Bloom filter.
+ * A dotted read (`d.k`) first looks the whole name up flat, and only the
+ * reserved builtins (`.sys.gc`, `.os.getenv`, ...) have dotted slots, so
+ * that lookup nearly always misses, and a miss scans every slot.  A clear
+ * bit answers it at once.  Bits are set under env_lock before the slot is
+ * published and only cleared by ray_env_init: a clear bit proves the name
+ * has no slot, and a collision only costs the scan.  Plain names keep the
+ * scan, which their hint makes rare. */
+#define ENV_SLOT_FILTER_BITS 15
+static _Atomic uint64_t g_env_slot_filter[(1 << ENV_SLOT_FILTER_BITS) / 64];
+static inline uint32_t env_slot_filter_bit(int64_t sym_id) {
+    return (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15)) >> (64 - ENV_SLOT_FILTER_BITS));
+}
+static inline void env_slot_filter_add(int64_t sym_id) {
+    uint32_t b = env_slot_filter_bit(sym_id);
+    atomic_fetch_or_explicit(&g_env_slot_filter[b / 64], UINT64_C(1) << (b % 64), memory_order_release);
+}
+static inline bool env_slot_filter_may_have(int64_t sym_id) {
+    uint32_t b = env_slot_filter_bit(sym_id);
+    return (atomic_load_explicit(&g_env_slot_filter[b / 64], memory_order_acquire) >> (b % 64)) & 1;
+}
 
 /* What a name compiled code resolves stays the same while neither moves:
  * the frame epoch (this thread's scope frames: a push, a pop, a binding,
@@ -387,6 +416,8 @@ int64_t ray_sym_ipc_hook(int idx) {
 ray_err_t ray_env_init(void) {
     env_globals_moved();
     memset(&g_env, 0, sizeof(g_env));
+    for (size_t i = 0; i < sizeof(g_env_slot_filter) / sizeof(g_env_slot_filter[0]); i++)
+        atomic_store_explicit(&g_env_slot_filter[i], 0, memory_order_relaxed);
     __VM->scope_depth = 0;
     /* The IPC hook sym IDs are interned lazily on first probe via
      * `ipc_hook_syms_ensure`.  We deliberately do NOT pre-intern here:
@@ -458,6 +489,7 @@ static ray_t* env_global_lookup(int64_t sym_id) {
     int32_t i = hint[h].idx;
     int32_t n = g_env.count;
     if (hint[h].sym == sym_id && i < n && g_env.keys[i] == sym_id) return g_env.vals[i];
+    if (ray_sym_is_dotted(sym_id) && !env_slot_filter_may_have(sym_id)) return NULL;
     for (i = 0; i < n; i++) {
         if (g_env.keys[i] != sym_id) continue;
         hint[h].sym = sym_id;
@@ -517,6 +549,9 @@ ray_t* ray_env_get_local(int64_t sym_id) {
     return NULL;
 }
 
+/* Borrowed lookup.  A NULL for a dotted path into a table may also mean the
+ * column failed to load (the detail is in ray_error_msg()); ray_env_resolve
+ * returns that failure as an error instead. */
 static ray_t* env_get_impl(int64_t sym_id, bool in_callee);
 ray_t* ray_env_get(int64_t sym_id) {
     return env_get_impl(sym_id, false);
@@ -552,6 +587,12 @@ static ray_t* env_get_impl(int64_t sym_id, bool in_callee) {
     ray_t* v = env_lookup_flat_impl(segs[0], NULL, in_callee);
     for (int i = 1; v && i < n; i++) {
         v = ray_container_probe_sym(v, segs[i]);
+        if (v && RAY_IS_ERR(v)) {
+            /* A borrowed-ref API has no channel for the owned error: report
+             * "undefined"; ray_env_resolve (the evaluator's path) surfaces it. */
+            ray_error_free(v);
+            return NULL;
+        }
     }
     return v;
 }
@@ -658,7 +699,13 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
             }
             next_fresh = (next != NULL);
         }
-        if (!next) next = ray_container_probe_sym(v, segs[i]);
+        if (!next) {
+            next = ray_container_probe_sym(v, segs[i]);
+            if (next && RAY_IS_ERR(next)) {   /* a column that failed to load */
+                if (fresh) ray_release(v);
+                return next;
+            }
+        }
         if (next) {
             if (fresh) ray_release(v);
             v = next;
@@ -725,34 +772,57 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
  * ray_del_fn's contract via ray_env_set(sym, NULL) and also covers the
  * cascade-up case in env_set_dotted where every dict in a dotted path was
  * emptied by the delete. */
+/* Index only write lookup. Keep lock acquisition, global value epochs, slot
+ * order, user flags, and the read path unchanged. At most half the buckets
+ * can be occupied because the binding table is still capped at ENV_CAP. */
+static uint32_t env_write_bucket(int64_t sym_id) {
+    uint32_t bucket = (uint32_t)(((uint64_t)sym_id * UINT64_C(0x9E3779B97F4A7C15))
+                                 >> (64 - ENV_WRITE_INDEX_BITS));
+    while (g_env.write_index[bucket]) {
+        int32_t slot = (int32_t)g_env.write_index[bucket] - 1;
+        if (g_env.keys[slot] == sym_id) break;
+        bucket = (bucket + 1) & (ENV_WRITE_INDEX_CAP - 1);
+    }
+    return bucket;
+}
+
+/* Delete already compacts the ordered slot arrays. Rebuild the small index
+ * under the same lock so no shifted slot or probe-chain hole can survive. */
+static void env_write_index_rebuild(void) {
+    memset(g_env.write_index, 0, sizeof(g_env.write_index));
+    for (int32_t i = 0; i < g_env.count; i++)
+        g_env.write_index[env_write_bucket(g_env.keys[i])] = (uint16_t)(i + 1);
+}
+
 static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
     env_globals_moved();
     env_lock();
-    for (int32_t i = 0; i < g_env.count; i++) {
-        if (g_env.keys[i] == sym_id) {
-            if (val == NULL) {
-                if (g_env.vals[i]) ray_release(g_env.vals[i]);
-                for (int32_t j = i; j + 1 < g_env.count; j++) {
-                    g_env.keys[j] = g_env.keys[j + 1];
-                    g_env.vals[j] = g_env.vals[j + 1];
-                    g_env.user[j] = g_env.user[j + 1];
-                }
-                g_env.count--;
-                env_unlock();
-                return RAY_OK;
-            }
+    uint32_t bucket = env_write_bucket(sym_id);
+    int32_t i = (int32_t)g_env.write_index[bucket] - 1;
+    if (i >= 0) {
+        if (val == NULL) {
             if (g_env.vals[i]) ray_release(g_env.vals[i]);
-            ray_retain(val);
-            g_env.vals[i] = val;
-            /* User write upgrades a builtin slot to user-defined, so a
-             * (set + 42) override survives snapshot/restore.  A builtin
-             * re-bind (e.g. theoretical hot reload) leaves the existing
-             * flag alone — once user, always user, until the slot is
-             * deleted. */
-            if (is_user) g_env.user[i] = 1;
+            for (int32_t j = i; j + 1 < g_env.count; j++) {
+                g_env.keys[j] = g_env.keys[j + 1];
+                g_env.vals[j] = g_env.vals[j + 1];
+                g_env.user[j] = g_env.user[j + 1];
+            }
+            g_env.count--;
+            env_write_index_rebuild();
             env_unlock();
             return RAY_OK;
         }
+        if (g_env.vals[i]) ray_release(g_env.vals[i]);
+        ray_retain(val);
+        g_env.vals[i] = val;
+        /* User write upgrades a builtin slot to user-defined, so a
+         * (set + 42) override survives snapshot/restore.  A builtin
+         * re-bind (e.g. theoretical hot reload) leaves the existing
+         * flag alone — once user, always user, until the slot is
+         * deleted. */
+        if (is_user) g_env.user[i] = 1;
+        env_unlock();
+        return RAY_OK;
     }
     if (val == NULL) {   /* deleting an absent binding: no-op */
         env_unlock();
@@ -762,10 +832,12 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
         env_unlock();
         return RAY_ERR_OOM;
     }
+    env_slot_filter_add(sym_id);
     g_env.keys[g_env.count] = sym_id;
     ray_retain(val);
     g_env.vals[g_env.count] = val;
     g_env.user[g_env.count] = is_user ? 1 : 0;
+    g_env.write_index[bucket] = (uint16_t)(g_env.count + 1);
     g_env.count++;
     env_unlock();
     return RAY_OK;
@@ -994,6 +1066,33 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
 /* Scope-specific base lookups used by env_set_dotted. */
 ray_t* ray_env_get_global(int64_t sym_id) {
     return env_global_lookup(sym_id);
+}
+
+/* True when `leaf` (what ray_env_get returned for the dotted `sym_id`) is
+ * reached through a chain of dicts that nothing else references: the global
+ * head and every dict below it held once, each dict's vals list held once.
+ * A write into the leaf is then seen through this name only, so it needs no
+ * copy and no rebuild of the chain.  The leaf's own count is the caller's to
+ * check.  A flat binding of the dotted name, a local shadowing the head, a
+ * table on the way or any shared level says no. */
+bool ray_env_dotted_sole(int64_t sym_id, ray_t* leaf) {
+    const int64_t* segs;
+    int n = ray_sym_segs(sym_id, &segs);
+    if (n < 2 || !leaf) return false;
+    if (env_lookup_flat_impl(sym_id, NULL, false)) return false;
+
+    ray_t* v = env_global_lookup(segs[0]);
+    for (int i = 1; i < n; i++) {
+        if (!v || v->type != RAY_DICT || v->rc != 1 || v->mmod != 0 ||
+            (v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)))
+            return false;
+        ray_t* vals = ray_dict_slots(v)[1];
+        if (!vals || vals->type != RAY_LIST || vals->rc != 1 || vals->mmod != 0 ||
+            (vals->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA)))
+            return false;
+        v = ray_dict_probe_sym_borrowed(v, segs[i]);
+    }
+    return v == leaf;
 }
 
 static ray_t* lookup_top_frame(int64_t sym_id) {

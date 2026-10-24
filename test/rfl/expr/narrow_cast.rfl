@@ -93,13 +93,13 @@
 ;; at expr.c:1360 lacked opcode gating, so OP_CAST hit the OP_ISNULL
 ;; specialization and filled dst with 0 regardless of input.  Fix gates
 ;; the branch on opc and adds a CAST arm that applies truthy semantics
-;; treating NULL_I64 (INT64_MIN) sentinel as false.
-;; Input: [1 2 0Nl 4 5] → [true true false true true].
+;; treating the non-zero NULL_I64 (INT64_MIN) sentinel as true.
+;; Input: [1 2 0Nl 4 5] → [true true true true true].
 (set TnullI_bool (at (select {x: (as 'BOOL v) from: TnullI}) 'x))
 (type TnullI_bool) -- 'B8
 (at TnullI_bool 0) -- true
 (at TnullI_bool 1) -- true
-(at TnullI_bool 2) -- false     ;; null → false (was 0 via ISNULL-stuck bug)
+(at TnullI_bool 2) -- true      ;; non-zero null sentinel → true
 (at TnullI_bool 3) -- true
 (at TnullI_bool 4) -- true
 

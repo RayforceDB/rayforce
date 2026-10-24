@@ -48,6 +48,7 @@
 #include <stdio.h>   /* FILE: ray_index_inline_write_file */
 #include <rayforce.h>
 #include "mem/heap.h"  /* RAY_ATTR_HAS_INDEX */
+#include "vec/str.h"   /* ray_str_t: ray_dict_acc_add_raw */
 
 /* Maximum key columns a RAY_IDX_UKEY map covers.  Chosen so the arm fits
  * the existing union (see the static assert below); a wider key simply gets
@@ -253,17 +254,117 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
     return (ray_index_t*)idx->data;
 }
 
+/* The 64-bit mix every hash index uses (builder, probes, and the
+ * generation-2 validator). */
+static inline uint64_t ray_index_mix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31; return x;
+}
+
 /* ── Routing observability: per-site consult/hit counters ──
  * Diagnostic, unsynchronized (same caveat as ray_expr_bail_counts). */
 typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
     IDX_SITE_FILTER_PART, IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND,
     IDX_SITE_SORT, IDX_SITE_DISTINCT, IDX_SITE_ASOF,
-    IDX_SITE_FILTER_EQRANGE, IDX_SITE_GROUP_SLICE, IDX_SITE__N
+    IDX_SITE_FILTER_EQRANGE, IDX_SITE_GROUP_SLICE, IDX_SITE_ASOF_ORDERED, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
 void ray_idx_stats_init(void);   /* atexit dump when RAY_IDX_STATS set */
+
+/* Per-index use attribution (diagnostic, for the index policy
+ * measurement).  Counts one use of col->index; read and reset through the
+ * `.idx.uses` builtin.  No-op for vectors without an index. */
+void   ray_idx_note_use(const ray_t* col);
+/* A consult answered from encv's directory (zone class or exclusion): counts
+ * under the RAY_ENCCOL object itself. */
+void   ray_idx_note_use_enc(const ray_t* encv);
+ray_t* ray_idx_uses_fn(ray_t* tbl);
+
+/* ===== Lazy in-memory HASH (index policy) =====
+ *
+ * The converters persist a CHUNK_ZONE, not a HASH.  Point lookups (equality
+ * or `in` filters) on an 8-byte integer or timestamp column whose zone cannot
+ * prune (the cost test admits no narrower type) build a HASH in memory once
+ * they have been repeated enough, and reuse it in the same process.
+ * The index lives in a process-wide cache keyed by the plain column object
+ * (generation 0: the table's column; generation 2: the encoded object's
+ * materialization), never in a table slot and never attached to the column,
+ * so no save can see it.  An entry holds one reference to the column and an
+ * indexed heap copy (ray_idx_hash_fn, copy-on-write); an entry whose column
+ * only the cache still holds is dropped on the next probe.  The bytes held stay
+ * within a quarter of ray_sys_ram_limit(); least recently used entries are
+ * evicted to make room.  A column the budget or a failed build declines is
+ * remembered, so later probes do not retry it.
+ *
+ * The build waits for proven repetition: the scan answers a wanted column's
+ * probes, and the rows they read are counted in a pending entry, until that
+ * scan work pays for one build.  Measured on 10M unclustered I64 rows (8
+ * cores, release, page cache warm): the parallel in-memory build, column copy
+ * included, takes 615 ms (about 61 ns/row); the equality scan it replaces
+ * reads the mapped column in 1.9 ms (about 0.19 ns/row).  61 / 0.19 rounds
+ * to 320 full-column probes: the 320th probe builds, the first 319 scan.
+ * A cold scan costs more and pays sooner, so the warm ratio is the safe one.
+ *
+ * Threads: the cache takes its own lock, but its entries share column
+ * objects with the caller's tables, so a caller outside the pool's workers
+ * that probes while another thread uses the same objects must run with
+ * ray_rc_sync set (atomic reference counts), as for any shared object. */
+#define RAY_IDX_LAZY_BUILD_PROBES 320
+
+/* The random-shape test the converters used: a fresh, integer CHUNK_ZONE of
+ * at least 4 non-empty chunks whose mean chunk span exceeds half the global
+ * range, and an index costing at most 5x the column's payload. */
+bool   ray_idx_lazy_hash_wanted(const ray_t* col);
+/* True when col's fresh integer chunk zone proves that no row equals key
+ * (key outside its whole-column [min, max]), or, for _set, no row equals any
+ * element of the integer vector set.  The caller has ruled out nulls. */
+bool   ray_idx_zone_excludes(const ray_t* col, int64_t key);
+bool   ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set);
+/* Directory twins for a single-file generation-2 column (encv a
+ * RAY_ENCCOL): the answer the zone its materialization would synthesize
+ * (enc_synth_zone / enc_synth_chunk_zone, src/store/enccol.c) gives,
+ * from the same directory entries, never decoding.  UNKNOWN / false for a
+ * parted column, another recorded kind, or a type the zone does not cover. */
+bool   ray_enc_zone_excludes(ray_t* encv, int64_t key);
+bool   ray_enc_zone_excludes_set(ray_t* encv, const ray_t* set);
+bool   ray_enc_lazy_hash_wanted(ray_t* encv);
+/* For a probe on `col`: NULL with *out = a retained vector equal to col
+ * carrying a HASH (from the cache, or built now), or NULL with *out = NULL
+ * when no lazy index applies (not wanted, over budget, declined before, or
+ * still pending: the caller scans and this probe's work is counted); an
+ * owned error on failure to build (the caller falls back to its scan). */
+ray_t* ray_idx_lazy_hash(ray_t* col, ray_t** out);
+/* ray_idx_lazy_hash for a single-file generation-2 column (encv its
+ * RAY_ENCCOL): the probes are counted on the encoded payload (any header
+ * copy), and the column is materialized only when the build fires; the
+ * built entry is keyed by that materialization, and *out is its indexed
+ * copy.  ray_idx_lazy_hash / _lookup / _work on the published
+ * materialization meet the same entry. */
+ray_t* ray_idx_lazy_hash_enc(ray_t* encv, ray_t** out);
+/* The cached indexed copy for col, retained (the caller releases it), or NULL. */
+ray_t* ray_idx_lazy_lookup(const ray_t* col);
+/* Drop the entry of a column object that is going away (the generation-2
+ * object frees its materialization). */
+void   ray_idx_lazy_forget(const ray_t* col);
+/* An encoded column's payload is freed: its memo (a probe count kept
+ * before the column was materialized) goes with it. */
+struct ray_enccol_s;
+void   ray_idx_lazy_forget_enc(const struct ray_enccol_s* e);
+/* Tests: rows the scans of col's pending probes read (0 once built), or -1
+ * when col has no entry or was declined. */
+int64_t ray_idx_lazy_work(const ray_t* col);
+/* Test hook: the next lazy build fails with `code` ("oom" or "cancel");
+ * NULL disarms. */
+void    ray_idx_lazy_test_fail_build(const char* code);
+/* Tests and runtime teardown: drop every entry; indexed entry count; every
+ * entry (built, pending, declined); bytes held. */
+void    ray_idx_lazy_clear(void);
+int64_t ray_idx_lazy_count(void);
+int64_t ray_idx_lazy_entries(void);
+int64_t ray_idx_lazy_bytes(void);
 
 /* ===== Attach / Detach ===== */
 
@@ -352,6 +453,27 @@ bool ray_zone_int_sum(ray_t* x, int64_t* sum_out, int64_t* nn_out);
  * metadata: true when the per-chunk high words are stored, or when no
  * partial sum can wrap int64 (then the wrapped sum is the exact one). */
 bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* nn_out);
+/* OP_SUM / OP_AVG / OP_MIN / OP_MAX of a single-file generation-2 column
+ * whose recorded index is CHUNK_ZONE, answered as ray_sum_fn / ray_avg_fn /
+ * ray_min_fn / ray_max_fn answer the generation-0 column from its
+ * CHUNK_ZONE (the zone the materialization would synthesize), from the
+ * directory; NULL when that zone path would not answer. */
+ray_t* ray_zone_dir_answer(ray_t* encv, uint16_t opcode);
+/* ray_zone_int_sum128's twin for the same columns: the exact 128-bit sum
+ * and non-null count from the directory; false when the zone the
+ * materialization would synthesize carries no integer sums. */
+bool ray_zone_dir_int_sum128(ray_t* encv, int64_t* hi, uint64_t* lo, int64_t* nn);
+/* ray_zone_dir_answer's answer for every single-file stored generation-2
+ * column, with or without a recorded zone: the execution-time reduction
+ * (ray_reduce_src) takes it.  Planning-time answers stay on
+ * ray_zone_dir_answer, so they do not widen past generation 0's. */
+ray_t* ray_dir_answer(ray_t* encv, uint16_t opcode);
+/* The directory totals (a ray_enc_col_totals_t, store/enccol.h) of one
+ * parted segment for an integer or temporal SUM / AVG / MIN / MAX: true
+ * when the segment is a single-file stored generation-2 column the
+ * directory answers `opcode` for, false for a plain, synthetic or float
+ * segment (the caller reduces its rows). */
+bool ray_dir_seg_totals(ray_t* segv, uint16_t opcode, void* totals_out);
 
 /* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
  * attaching it — standalone RAY_INDEX object (caller releases / attaches).
@@ -362,7 +484,7 @@ ray_t* ray_index_attach_dict(ray_t** vp);
 
 /* ===== Incremental STR dictionary ===== */
 
-typedef struct {
+typedef struct ray_dict_acc_s {
     int32_t*  codes;     int64_t n_rows;     int64_t cap_rows;
     int32_t*  first_occ; int64_t n_distinct; int64_t cap_distinct;
     uint64_t* offs;      /* per distinct: byte offset into pool */
@@ -378,13 +500,33 @@ ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
  * sets dead and returns RAY_OK; further adds are no-ops. A non-OK return
  * (OOM, CANCEL) leaves the accumulator partial: free/discard it. */
 ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v);
+/* Appends n raw STR descriptors whose pooled bytes are relative to `pool`
+ * (ray_str_t_ptr): the same codes ray_dict_acc_add assigns to the same
+ * strings, with the same dead / error rules. */
+ray_err_t ray_dict_acc_add_raw(ray_dict_acc_t* a, const ray_str_t* d, const char* pool, int64_t n);
+/* The fewest rows a saved generation-0 STR column carries its DICT index at. */
+#define RAY_DICT_MIN_ROWS 65536
 /* The standalone RAY_IDX_DICT for a column of `len` rows, identical to
- * ray_index_dict_compute; NULL when dead or len < 65536. Frees `a`. */
+ * ray_index_dict_compute; NULL when dead or len < RAY_DICT_MIN_ROWS. Frees `a`. */
 ray_t*    ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len);
 void      ray_dict_acc_free(ray_dict_acc_t* a);
 
 /* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
+/* Attach a heap-built root to a fresh plain vector.  Consumes `root` on
+ * success and on error; refuses (corrupt) a pair the matrix does not
+ * admit, a root whose parent_type or built_for_len disagree, a slice, or
+ * a vector already indexed. */
+ray_t* ray_index_attach_persisted(ray_t** vp, ray_t* root);
+/* A zeroed RAY_INDEX block of `kind` for a parent (public wrapper of the
+ * allocator used by every builder). */
+ray_t* ray_index_new_root(ray_idx_kind_t kind, int8_t parent_type, int64_t parent_len);
+/* Spec "Materialization" step 3 admission matrix:
+ * numeric and temporal types carry HASH, SORT, BLOOM, PART, ZONE,
+ * CHUNK_ZONE and a marker-only root; SYM carries HASH, PART and a
+ * marker-only root; STR carries HASH, DICT (persisted for generation 2
+ * since P6b) and a marker-only root; GUID carries nothing. */
+bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t parent_type);
 
 /* ── Inline on-disk index region (zero-copy mmap) ──
  * ray_index_inline_size: bytes the region occupies (32-aligned ray_t blocks).
@@ -434,6 +576,15 @@ void ray_hash_trace_print(FILE* f, const char* what, const ray_hash_trace_t* t, 
  * did: the mapped memory, if any, holds no complete region.  `tr` (may be
  * NULL) collects the phases. */
 typedef uint8_t* (*ray_index_region_fn)(void* ctx, int64_t bytes);
+/* The arrays of HASH payload `ix` in the generation-1 layout a
+ * generation-2 index region stores: every array I64, the groups numbered by
+ * first occurrence (row order of their first rows), each group in the first
+ * free slot from mix64(key) & mask (the low-bits home rule): the bytes the
+ * generation-1 builders made.  Shared (retained) when ix is that layout
+ * already; fresh otherwise.  False on OOM (outputs NULL). */
+bool ray_index_hash_legacy(const ray_index_t* ix, ray_t** table, ray_t** gkeys,
+                           ray_t** offs, ray_t** rows);
+
 ray_err_t ray_index_hash_build_region(ray_t* v, ray_index_region_fn map, void* ctx,
                                       ray_hash_trace_t* tr);
 
@@ -502,6 +653,10 @@ ray_t* ray_index_info(ray_t* v);
 typedef enum { RAY_ZONE_UNKNOWN = 0, RAY_ZONE_ALL = 1, RAY_ZONE_NONE = 2 } ray_zone_class_t;
 ray_zone_class_t ray_index_zone_class(ray_t* col, uint16_t cmp_op,
                                       int64_t key_i, double key_f);
+/* Its directory twin for a generation-2 column recording ZONE (see
+ * ray_enc_zone_excludes): UNKNOWN unless encv is a single-file RAY_ENCCOL
+ * without nulls. */
+ray_zone_class_t ray_enc_zone_class(ray_t* encv, uint16_t cmp_op, int64_t key_i, double key_f);
 
 /* Build an all-NONE rowsel of `n` rows.  Wraps rowsel_from_sorted_ids(n, NULL, 0).
  * Returns NULL on OOM; returns a valid zero-match rowsel on success. */
@@ -545,6 +700,20 @@ bool ray_index_bloom_absent(ray_t* col, int64_t key);
  * Floats are intentionally not supported — equality on F32/F64
  * has NaN / -0 semantics the unfused compare kernel handles. */
 ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
+/* ray_index_hash_eq_rowsel for a single-file generation-2 column whose
+ * recorded HASH region is probed where it is mapped, without materializing
+ * the column or copying the region: the root's layout is checked against
+ * the region, every slot, group and offset the probe reads is bounded, and
+ * the group's rows are checked ascending, inside the column, and holding
+ * `key` (read back by range: a region that disagrees with the column is
+ * `corrupt`, naming it).  `key` as for ray_index_hash_eq_rowsel (a SYM key
+ * a nonzero domain id).  1: *sel the selection (an empty one for an absent
+ * key); 0 declined (no such region, a key or type it does not cover, or a
+ * group dense enough for the scan, as ray_index_hash_eq_rowsel declines);
+ * -1: *err owned. */
+int    ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err);
+/* Test hook: probes ray_enc_hash_eq_rowsel answered since process start. */
+uint64_t ray_enc_hash_test_probes(void);
 
 /* Direct equality selection for a fresh part index.  `key` is a numeric
  * value or a column-domain SYM id.  Dense matches remain eligible because
@@ -761,6 +930,7 @@ ray_t* ray_idx_bloom_fn(ray_t* v);  /* (.idx.bloom v) -> v with bloom attached *
 ray_t* ray_idx_drop_fn (ray_t* v);  /* (.idx.drop  v) -> v with index removed */
 ray_t* ray_idx_has_fn  (ray_t* v);  /* (.idx.has?  v) -> 0b/1b */
 ray_t* ray_idx_info_fn (ray_t* v);  /* (.idx.info  v) -> dict of metadata */
+ray_t* ray_idx_info_vary_fn(ray_t** args, int64_t n);  /* (.idx.info col) | (.idx.info table 'col) */
 
 ray_t* ray_attr_set_fn (ray_t* name, ray_t* v); /* (.attr.set 'name v) */
 ray_t* ray_attr_get_fn (ray_t* v);              /* (.attr.get v) -> sym vec */

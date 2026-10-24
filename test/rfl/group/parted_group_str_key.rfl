@@ -1,0 +1,67 @@
+;; parted_group_str_key.rfl — per-partition streaming GROUP BY whose key (or a
+;; FIRST/LAST input) is a STR expression, under a selective WHERE (#737).
+;;
+;; `(if cond Referer "")` over a SYM column yields a STR key column in each
+;; partition's partial.  The merge pass concatenated the partials' key and agg
+;; columns with a raw cell copy: a STR cell is a descriptor into its own
+;; vector's string pool, so the merged column held pool offsets with no pool
+;; and the merge group read a NULL string (SIGSEGV in agg_group_keys).  The
+;; merge now copies STR (and LIST) columns cell by cell into the output's own
+;; storage.
+;;
+;; Ten partitions, so the merge runs two batches (MERGE_BATCH is 8) and the
+;; second one carries the running result's STR columns too.  Some partitions
+;; keep no row (another date, another CounterID).  The strings are longer than
+;; the inline width, so they live in the pool.  Gen 0 and gen 2 stores, each
+;; against an identical-data flat oracle; 'group-perpart-runs proves the
+;; streaming route ran.
+(.sys.exec "rm -rf /tmp/rfl_pg737_0 /tmp/rfl_pg737_2")
+(set refs (as 'SYM ["http://referer.example.com/long/path/a" "" "http://referer.example.com/long/path/b"]))
+(set urls (as 'SYM ["http://url.example.com/some/long/page/1" "http://url.example.com/some/long/page/2" ""]))
+(set mk (fn [n c d] (table [CounterID EventDate IsRefresh TraficSourceID SearchEngineID AdvEngineID Referer URL] (list (as 'I32 (+ c (% (til n) 97))) (+ d (* 0 (til n))) (as 'I16 (% (til n) 4)) (as 'I16 (+ 1 (% (til n) 2))) (as 'I16 (* 3 (% (til n) 3))) (as 'I16 (% (til n) 5)) (at refs (% (til n) 3)) (at urls (% (til n) 7))))))
+(set cids [0 0 1000 0 0 0 1000 0 0 0])
+(set days [2013.07.15 2013.07.14 2013.07.15 2013.07.15 2013.07.15 2013.07.14 2013.07.15 2013.07.15 2013.07.15 2013.07.15])
+(set parts (map (fn [k] (mk 4000 (at cids k) (at days k))) (til 10)))
+(set wr (fn [root k c] (.db.splayed.set (format "%/%/hits/" root (+ k 1)) (at parts k) (format "%/.sym" root) (if c {compress: true} {compress: false}))))
+(count (map (fn [k] (wr "/tmp/rfl_pg737_0" k false)) (til 10))) -- 10
+(count (map (fn [k] (wr "/tmp/rfl_pg737_2" k true)) (til 10))) -- 10
+(set P0 (.db.parted.get "/tmp/rfl_pg737_0/" 'hits))
+(set P2 (.db.parted.get "/tmp/rfl_pg737_2/" 'hits))
+(set F (fold concat parts))
+(count F) -- 40000
+
+;; ─── (1) the issue's shape: STR expression key beside a SYM key ─────────────
+(set q1 (fn [t] (select {from: (select {PageViews: (count URL) from: t where: (and (== CounterID 62) (== EventDate 2013.07.15) (== IsRefresh 0) (== TraficSourceID 1)) by: {TraficSourceID: TraficSourceID SearchEngineID: SearchEngineID AdvEngineID: AdvEngineID Src: (if (and (== SearchEngineID 0) (== AdvEngineID 0)) Referer "") Dst: URL} desc: PageViews take: 1010}) asc: [Src Dst SearchEngineID AdvEngineID]})))
+(set RF1 (q1 F))
+(set B1 (at (.sys.mem) 'group-perpart-runs))
+(set R01 (q1 P0))
+(> (at (.sys.mem) 'group-perpart-runs) B1) -- true
+(set B2 (at (.sys.mem) 'group-perpart-runs))
+(set R21 (q1 P2))
+(> (at (.sys.mem) 'group-perpart-runs) B2) -- true
+(> (count RF1) 8) -- true
+(type (at R01 'Src)) -- 'STR
+(== (format "%" R01) (format "%" RF1)) -- true
+(== (format "%" R21) (format "%" RF1)) -- true
+
+;; ─── (2) STR FIRST / LAST partials beside the STR key ───────────────────────
+(set q2 (fn [t] (select {from: (select {c: (count URL) f: (first (if (== AdvEngineID 0) Referer "")) l: (last (if (== AdvEngineID 1) Referer "none")) from: t where: (and (== CounterID 62) (== EventDate 2013.07.15) (== IsRefresh 0)) by: {SearchEngineID: SearchEngineID Src: (if (== AdvEngineID 0) Referer "")} desc: c take: 100}) asc: [Src SearchEngineID]})))
+(set RF2 (q2 F))
+(set B3 (at (.sys.mem) 'group-perpart-runs))
+(set R02 (q2 P0))
+(> (at (.sys.mem) 'group-perpart-runs) B3) -- true
+(type (at R02 'f)) -- 'STR
+(== (format "%" R02) (format "%" RF2)) -- true
+(== (format "%" (q2 P2)) (format "%" RF2)) -- true
+
+;; ─── (3) STR FIRST / LAST partials under a fixed-width key only ─────────────
+(set q3 (fn [t] (select {from: (select {c: (count URL) f: (first (if (== AdvEngineID 0) Referer "")) l: (last (if (== AdvEngineID 1) Referer "none")) from: t where: (and (== CounterID 62) (== EventDate 2013.07.15) (== IsRefresh 0)) by: {SearchEngineID: SearchEngineID AdvEngineID: AdvEngineID}}) asc: [SearchEngineID AdvEngineID]})))
+(set RF3 (q3 F))
+(set B4 (at (.sys.mem) 'group-perpart-runs))
+(set R03 (q3 P0))
+(> (at (.sys.mem) 'group-perpart-runs) B4) -- true
+(type (at R03 'f)) -- 'STR
+(== (format "%" R03) (format "%" RF3)) -- true
+(== (format "%" (q3 P2)) (format "%" RF3)) -- true
+
+(.sys.exec "rm -rf /tmp/rfl_pg737_0 /tmp/rfl_pg737_2") -- 0

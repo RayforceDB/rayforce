@@ -37,6 +37,9 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef RAY_OS_LINUX
+#include <sched.h>
+#endif
 
 /* ---- test_vm_alloc_free ------------------------------------------------ */
 
@@ -167,6 +170,122 @@ static test_result_t test_cgroup_stat_flush(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+#ifdef RAY_OS_LINUX
+/* Writes `text` to root/rel, creating its directories. */
+static void cgq_put(const char* root, const char* rel, const char* text) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", root, rel);
+    for (char* p = path + strlen(root) + 1; *p; p++)
+        if (*p == '/') { *p = 0; (void)mkdir(path, 0700); *p = '/'; }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    ssize_t n = write(fd, text, strlen(text));
+    (void)n;
+    close(fd);
+}
+
+/* The quota of a fake /proc + /sys under a fresh directory. */
+static int64_t cgq_quota(const char* tag, const char* cgroup, const char* mountinfo,
+                         const char* const* files) {
+    char root[128], cmd[300];
+    snprintf(root, sizeof(root), "/tmp/rayforce_cgq_%d_%s", (int)getpid(), tag);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
+    if (system(cmd) != 0) return -2;
+    (void)mkdir(root, 0700);
+    cgq_put(root, "proc/self/cgroup", cgroup);
+    if (mountinfo) cgq_put(root, "proc/self/mountinfo", mountinfo);
+    for (int i = 0; files[i]; i += 2) cgq_put(root, files[i], files[i + 1]);
+    ray_os_cgroup_test_root(root);
+    int64_t q = ray_os_cgroup_cpu_quota();
+    ray_os_cgroup_test_root(NULL);
+    if (system(cmd) != 0) return -3;
+    return q;
+}
+#endif
+
+/* The CPU quota is found through the mount the hierarchy is visible at:
+ * its mount point and the subtree it shows (/proc/self/mountinfo), for v2
+ * and for a v1 cpu controller wherever mounted; the smallest over the
+ * cgroup and its visible ancestors; the conventional mounts without
+ * mountinfo. */
+static test_result_t test_cgroup_cpu_quota(void) {
+    int64_t real = ray_os_cgroup_cpu_quota();
+    TEST_ASSERT(real >= 0, "a quota is never negative");
+#ifdef RAY_OS_LINUX
+    const char* v2mi = "30 25 0:26 / /sys/fs/cgroup rw,nosuid shared:9 - cgroup2 cgroup2 rw\n";
+    const char* const canon[] = { "sys/fs/cgroup/a/b/cpu.max", "150000 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("v2", "0::/a/b\n", v2mi, canon), 1500);
+    /* the v2 subtree /tenant mounted at /sys/fs/cgroup: /tenant/job lives at
+     * /sys/fs/cgroup/job, and the unlimited visible root does not count */
+    const char* const sub[] = { "sys/fs/cgroup/job/cpu.max", "150000 100000\n",
+                                "sys/fs/cgroup/cpu.max", "max 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("sub", "0::/tenant/job\n",
+                               "30 25 0:26 /tenant /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", sub), 1500);
+    /* a membership outside the visible subtree has no readable quota */
+    TEST_ASSERT_EQ_I(cgq_quota("out", "0::/other/job\n",
+                               "30 25 0:26 /tenant /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", sub), 0);
+    /* several views of the hierarchy: the one holding the membership counts,
+     * whatever comes first in mountinfo */
+    const char* const lim[] = { "sys/fs/cgroup/limited/cpu.max", "150000 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("multi", "0::/limited\n",
+                               "30 25 0:26 /other /unrelated rw - cgroup2 cgroup2 rw\n"
+                               "31 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", lim), 1500);
+    /* a narrow view and a full one: the ancestor quota only the full view
+     * shows is the tighter one */
+    const char* const both[] = { "narrow/leaf/cpu.max", "150000 100000\n",
+                                 "sys/fs/cgroup/org/tenant/leaf/cpu.max", "150000 100000\n",
+                                 "sys/fs/cgroup/org/cpu.max", "50000 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("views", "0::/org/tenant/leaf\n",
+                               "30 25 0:26 /org/tenant /narrow rw - cgroup2 cgroup2 rw\n"
+                               "31 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n", both), 500);
+    /* a v1 cpu controller mounted off the conventional place */
+    const char* const v1[] = { "cgroup/cpu/x/cpu.cfs_quota_us", "50000\n",
+                               "cgroup/cpu/x/cpu.cfs_period_us", "100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("v1", "4:cpu,cpuacct:/x\n",
+                               "40 25 0:30 / /cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct\n", v1), 500);
+    /* a tighter ancestor wins (a quarter of a CPU, in millicpus) */
+    const char* const anc[] = { "sys/fs/cgroup/a/b/cpu.max", "300000 100000\n",
+                                "sys/fs/cgroup/a/cpu.max", "25000 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("anc", "0::/a/b\n", v2mi, anc), 250);
+    const char* const none[] = { "sys/fs/cgroup/a/b/cpu.max", "max 100000\n", NULL };
+    TEST_ASSERT_EQ_I(cgq_quota("none", "0::/a/b\n", v2mi, none), 0);
+    /* no mountinfo: the conventional /sys/fs/cgroup */
+    TEST_ASSERT_EQ_I(cgq_quota("nomi", "0::/a/b\n", NULL, canon), 1500);
+    TEST_ASSERT_EQ_I(ray_os_cgroup_cpu_quota(), real);
+#else
+    TEST_ASSERT_EQ_I(real, 0);
+#endif
+    PASS();
+}
+
+/* A kernel whose CPU mask is wider than a cpu_set_t rejects the fixed
+ * buffer (EINVAL); the count retries with a larger one instead of falling
+ * back to every online CPU. */
+static test_result_t test_cpu_set_count_wide_mask(void) {
+    uint32_t n = ray_cpu_set_count();
+    TEST_ASSERT(n >= 1, "at least one CPU");
+#ifdef RAY_OS_LINUX
+    cpu_set_t set, two;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0)
+        SKIP("the kernel's CPU mask is wider than a cpu_set_t: no fixed-size snapshot");
+    TEST_ASSERT_EQ_I(n, CPU_COUNT(&set));
+    if (CPU_COUNT(&set) < 3) SKIP("needs at least 3 CPUs");
+    /* two CPUs of the mask, so the fallback (every online CPU) differs */
+    CPU_ZERO(&two);
+    for (int c = 0, k = 0; c < CPU_SETSIZE && k < 2; c++)
+        if (CPU_ISSET(c, &set)) { CPU_SET(c, &two); k++; }
+    int rc = sched_setaffinity(0, sizeof(two), &two);
+    ray_cpu_set_test_min_bytes(4 * sizeof(cpu_set_t));
+    uint32_t wide = ray_cpu_set_count();
+    ray_cpu_set_test_min_bytes(0);
+    (void)sched_setaffinity(0, sizeof(set), &set);
+    TEST_ASSERT_EQ_I(rc, 0);
+    TEST_ASSERT_EQ_I(wide, 2);
+#endif
+    PASS();
+}
+
 const test_entry_t platform_entries[] = {
     { "platform/vm_alloc_free", test_vm_alloc_free, NULL, NULL },
     { "platform/vm_alloc_aligned", test_vm_alloc_aligned, NULL, NULL },
@@ -174,6 +293,8 @@ const test_entry_t platform_entries[] = {
     { "platform/thread_create_join", test_thread_create_join, NULL, NULL },
     { "platform/cgroup_mem_limit", test_cgroup_mem_limit, NULL, NULL },
     { "platform/cgroup_stat_flush", test_cgroup_stat_flush, NULL, NULL },
+    { "platform/cgroup_cpu_quota", test_cgroup_cpu_quota, NULL, NULL },
+    { "platform/cpu_set_count_wide_mask", test_cpu_set_count_wide_mask, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

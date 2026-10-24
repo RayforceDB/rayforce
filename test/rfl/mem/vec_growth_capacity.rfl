@@ -1,0 +1,16 @@
+;; A two-column initial batch uses minimal header-inclusive buddy blocks.
+;; This is caller-live allocation for a serial append, not RSS/high-water or
+;; a guarantee that freed pools return to the OS. Allow incidental metadata;
+;; the old two8MiB column blocks exceed this9MiB bound by a wide margin.
+(set n 333004)
+(set src (table [a b] (list (til n) (til n))))
+(set L (table [a b] (list (take [0] 0) (take [0] 0))))
+(set before (at (.sys.mem) 'bytes-allocated))
+(insert 'L src)
+(set used (- (at (.sys.mem) 'bytes-allocated) before))
+(< used 9437184) -- true
+(count L) -- n
+(sum (at L 'a)) -- (sum (til n))
+(sum (at L 'b)) -- (sum (til n))
+(at (at L 'a) [0 166502 333003]) -- [0 166502 333003]
+(at (at L 'b) [0 166502 333003]) -- [0 166502 333003]

@@ -13,6 +13,7 @@
 #include "core/profile.h"
 #include "core/runtime.h"   /* ray_error_msg: a pool task's error message */
 #include "mem/heap.h"
+#include "table/table.h"
 #include "mem/sys.h"        /* ray_sys_free: the grouped import's redo list */
 #include "table/sym.h"
 #include "table/domain.h"
@@ -27,6 +28,7 @@
 #include "store/splay.h"
 #include "store/stream.h"
 #include "store/col.h"
+#include "store/colrange.h"
 #include "store/fileio.h"
 #include "lang/eval.h"
 #include "lang/internal.h"
@@ -303,6 +305,8 @@ struct ray_parquet {
     pq_interval* excluded;
     int64_t nexcluded, exclude_pos, group_rows, bloom_skipped, parallel_batches;
     bool failed, emitted, borrowed, filter_nulls;
+    uint8_t compress;     /* the import's compress option (ray_compress_t; 0 = absent) */
+    bool symcol;          /* the import's symfile 'column option: a symbol file per column */
 };
 static bool pq_reserve(uint8_t** buf, size_t* cap, size_t n) {
     if (n > PQ_MAX_PAGE) return false;
@@ -1411,6 +1415,8 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->nselected = nselected; r->noutput = parent->noutput;
     r->filter_pos = parent->filter_pos; r->filter_lo = parent->filter_lo; r->filter_hi = parent->filter_hi;
     r->filter_nulls = parent->filter_nulls;
+    r->compress = parent->compress;
+    r->symcol = parent->symcol;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
@@ -1425,7 +1431,8 @@ static ray_pool_t* pq_group_pool(ray_parquet_t* r) {
 static ray_t* pq_append_table(ray_t** vectors, ray_t* batch, int64_t ncols) {
     int64_t nr = ray_table_nrows(batch);
     for (int64_t c = 0; c < ncols; c++) {
-        ray_t* src = ray_table_get_col_idx(batch,c);
+        ray_t* src = ray_table_col_idx(batch,c);
+        if (src && RAY_IS_ERR(src)) return src;
         if (src->type == RAY_STR) {
             for (int64_t i = 0; i < nr; i++) {
                 size_t n; const char* p = ray_str_vec_get(src,i,&n);
@@ -1606,16 +1613,35 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         if (!keys || keys->type != RAY_SYM) return pq_error("import option keys must be symbols");
         for (int64_t i = 0; i < keys->len; i++) {
             ray_t* key = ray_sym_vec_cell(keys,i); const char* k = key ? ray_str_ptr(key) : NULL;
-            if (!k || (strcmp(k,"types") && strcmp(k,"strict") && strcmp(k,"rows"))) return pq_error("unknown import option");
+            if (!k || (strcmp(k,"types") && strcmp(k,"strict") && strcmp(k,"rows") && strcmp(k,"compress") && strcmp(k,"symfile"))) return pq_error("unknown import option");
         }
         ray_t* err = pq_strict_option(r,types);
         ray_t* rows = pq_option(types,"rows");
+        if (rows && RAY_IS_ERR(rows)) {          /* the lookup itself failed */
+            if (!err) err = rows; else ray_error_free(rows);
+            rows = NULL;
+        }
         if (!err && rows) {
             if (rows->type != -RAY_I64 || rows->i64 < 1 || rows->i64 > PQ_MAX_PART_ROWS)
                 err = pq_error("partition rows must be 1..1048576");
             else r->batch_rows = rows->i64;
         }
         if (rows) ray_release(rows);
+        ray_t* cmp = pq_option(types,"compress");
+        if (cmp && RAY_IS_ERR(cmp)) {            /* the lookup itself failed */
+            if (!err) err = cmp; else ray_error_free(cmp);
+            cmp = NULL;
+        }
+        if (!err && cmp) {
+            if (cmp->type != -RAY_BOOL) err = ray_error("domain","parquet: compress must be true or false");
+            else r->compress = cmp->b8 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF;
+        }
+        if (cmp) ray_release(cmp);
+        if (!err) {
+            ray_symfile_t layout;
+            err = ray_symfile_opt_parse(types,&layout);
+            if (!err) r->symcol = layout == RAY_SYMFILE_COLUMN;
+        }
         ray_t* schema = pq_option(types,"types");
         if (!err && schema && schema->type != RAY_SYM) err = pq_error("types must be a symbol vector");
         if (!err) err = pq_import_types(r,schema);
@@ -1657,7 +1683,7 @@ typedef struct {
  * shared vocabulary once after all workers join, before publishing the root.
  * Flushing it here rewrites the growing dictionary for every partition. */
 static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* leaf,
-                                   const char* sym, bool durable) {
+                                   const char* sym, bool durable, ray_compress_t mode) {
     ray_sym_domain_t* domain = NULL;
     for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].import_domain) domain = r->schema[c].import_domain;
     /* No import domain means no SYM column, so the vocabulary is untouched.
@@ -1666,7 +1692,8 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
      * the whole tree: write them as a bare staged save, without the writer
      * lock, generation handling or index pass that publishing a live table
      * needs.  The spool then deletes exactly the files it wrote. */
-    if (!domain) return durable ? ray_splay_save(batch,leaf,sym) : ray_splay_save_staged_bulk(batch,leaf,sym);
+    if (!domain) return durable ? ray_splay_save_mode(batch,leaf,sym,mode)
+                                : ray_splay_save_staged_bulk_mode(batch,leaf,sym,mode);
     ray_err_t e = ray_mkdir_p(leaf); if (e != RAY_OK) return e;
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { if (schema) ray_release(schema); return RAY_ERR_OOM; }
@@ -1675,9 +1702,19 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
         ray_t* name = ray_sym_str(r->schema[c].name);
         int n = snprintf(path,sizeof(path),"%s/%s",leaf,ray_str_ptr(name));
         if (n < 0 || (size_t)n >= sizeof(path)) { e = RAY_ERR_RANGE; break; }
-        ray_t* col = ray_table_get_col_idx(batch,c);
-        e = col->type == RAY_SYM ? ray_col_save_sym_encoded(col,path,domain,durable) :
-            durable ? ray_col_save(col,path) : ray_col_save_bulk(col,path);
+        /* a decoded batch: plain columns, SYM over the import domain; the
+         * leaf is fresh, so there is no destination to inherit from */
+        ray_t* col = ray_table_col_idx(batch,c);
+        if (col && RAY_IS_ERR(col)) { e = ray_err_from_obj(col); ray_error_free(col); break; }
+        ray_col_write_t cw; memset(&cw,0,sizeof cw);
+        ray_t* berr = ray_col_src_bind(col,&cw.src);
+        if (berr) { e = ray_err_from_obj(berr); ray_error_free(berr); break; }
+        cw.name = ray_str_ptr(name);
+        e = ray_col_resolve_gen_err(mode,col,NULL,ray_str_ptr(name),ray_str_len(name),&cw.gen);
+        cw.target_dom = col->type == RAY_SYM ? domain : NULL;
+        cw.durable = durable;
+        if (e == RAY_OK) e = ray_col_save_ctx(&cw,path);
+        ray_col_src_release(&cw.src);
         if (e != RAY_OK) break;
         ray_t* next = ray_str_vec_append(schema,ray_str_ptr(name),ray_str_len(name));
         if (!next || RAY_IS_ERR(next)) { if (next) ray_release(next); e = RAY_ERR_OOM; break; }
@@ -1698,7 +1735,8 @@ static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* ta
         if (!batch || RAY_IS_ERR(batch)) return batch;
         /* Native zones are built while the bounded decoded batch is resident. */
         if (durable) for (int64_t c = 0; c < r->ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(batch,c);
+            ray_t* col = ray_table_col_idx(batch,c);
+            if (col && RAY_IS_ERR(col)) { ray_release(batch); return col; }
             if (col->type == RAY_STR || col->type == RAY_SYM || col->type == RAY_F32) continue;
             ray_retain(col);
             ray_t* e = col->len >= PQ_BATCH ? ray_index_attach_chunk_zone(&col,16) : ray_index_attach_zone(&col);
@@ -1710,7 +1748,8 @@ static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* ta
         /* All leaves are private staging output. Sync them together after
          * the workers finish, avoiding a directory fsync per column rename. */
         ray_err_t e = n < 0 || (size_t)n >= sizeof(leaf) ? RAY_ERR_RANGE :
-            pq_save_partition(r,batch,leaf,sym,false);
+            pq_save_partition(r,batch,leaf,sym,false,
+                              durable ? (ray_compress_t)r->compress : RAY_COMPRESS_OFF);
         ray_release(batch);
         if (e != RAY_OK) return ray_error(ray_err_code_str(e),"parquet: native partition write failed");
     }
@@ -1832,6 +1871,7 @@ ray_t* ray_parquet_parted_typed(const char* path, const char* root, const char* 
     char staging[1100], sym[1200]; int64_t parts;
     ray_sym_domain_t* domain = NULL;
     err = pq_import_types(r,types);
+    if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
     if (!err) err = pq_stage(r,root,staging,sizeof(staging),true);
     if (err) goto done;
     /* Global runtime interning is not worker-safe. Decode symbols straight
@@ -2165,7 +2205,9 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
             ray_t* batch = ray_parquet_next(r);
             if (!batch) break;
             if (RAY_IS_ERR(batch)) { w->errors[task] = batch; break; }
-            ray_err_t err = ray_col_stream_append(&local,ray_table_get_col_idx(batch,0));
+            ray_t* bcol = ray_table_col_idx(batch,0);
+            if (bcol && RAY_IS_ERR(bcol)) { w->errors[task] = bcol; ray_release(batch); break; }
+            ray_err_t err = ray_col_stream_append(&local,bcol);
             row += ray_table_nrows(batch); ray_release(batch);
             if (err != RAY_OK) { w->errors[task] = ray_error(ray_err_code_str(err),"parquet: direct column write failed"); break; }
         }
@@ -2208,12 +2250,19 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
  * entries to the symbol file every quarter second (and starts their
  * writeback), so the final flush writes only the tail and its sync finds
  * the rest on disk. */
-typedef struct { ray_sym_domain_t* dom; _Atomic(bool) stop; _Atomic(int) err; } pq_symflush_t;
+typedef struct {
+    ray_sym_domain_t* dom;     /* the first (the shared one, for the trace) */
+    ray_sym_domain_t** doms;   /* every symbol file's domain: one, or one a column (symfile 'column) */
+    int64_t ndoms;
+    _Atomic(bool) stop; _Atomic(int) err;
+} pq_symflush_t;
 static void pq_symflush_fn(void* arg) {
     pq_symflush_t* s = arg;
     while (!atomic_load_explicit(&s->stop,memory_order_acquire)) {
-        ray_err_t e = ray_sym_domain_flush_append(s->dom,false);
-        if (e != RAY_OK) { atomic_store_explicit(&s->err,(int)e,memory_order_release); return; }
+        for (int64_t i = 0; i < s->ndoms; i++) {
+            ray_err_t e = ray_sym_domain_flush_append(s->doms[i],false);
+            if (e != RAY_OK) { atomic_store_explicit(&s->err,(int)e,memory_order_release); return; }
+        }
         /* in slices, so the import's end does not wait out the interval */
         for (int i = 0; i < 25 && !atomic_load_explicit(&s->stop,memory_order_acquire); i++)
             ray_sleep_ms(10);
@@ -2896,13 +2945,25 @@ out:
  * column by column (a pass is one column, or a few when the file has fewer
  * row groups than the pool has workers): one column file is written at a
  * time instead of all of them at once.  Numeric and temporal columns go
- * first and are closed as soon as their pass ends, their hash index built
- * while the file is still in the page cache; symbol columns follow in
+ * first and are closed as soon as their pass ends; symbol columns follow in
  * passes of their own, smallest first, so the file domain only grows once
  * the other columns are done.  With memory to spare one pass takes every
- * column, and the columns close and are indexed together after it, as the
+ * column, and the columns close together after it, as the
  * row-group import does.  Symbol columns close with the domain, after its
  * flush. */
+/* The entries of the import dictionaries of the symbol columns order[from,
+ * to), each dictionary counted once (one shared, or one a column under
+ * symfile 'column): the trace's seeding counts. */
+static int64_t pq_imp_count(ray_col_stream_t* writers, const int64_t* order, int64_t from, int64_t to) {
+    int64_t n = 0;
+    for (int64_t i = from; i < to; i++) {
+        ray_symimp_t* imp = ray_sym_domain_import(writers[order[i]].dom);
+        bool seen = false;
+        for (int64_t k = from; k < i && !seen; k++) seen = ray_sym_domain_import(writers[order[k]].dom) == imp;
+        if (imp && !seen) n += ray_symimp_count(imp);
+    }
+    return n;
+}
 static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t chunks = r->ngroups*r->ncols;
     if (chunks > UINT32_MAX) return pq_error("too many column chunk tasks");
@@ -2923,7 +2984,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     ray_symgrp_t* sgrp = NULL;   /* the grouped symbol import, or NULL */
     ray_symimp_t* simp = NULL;
     ray_t* err = NULL;
-    pq_symflush_t symf = {NULL,false,(int)RAY_OK};
+    pq_symflush_t symf = {NULL,NULL,0,false,(int)RAY_OK};
+    ray_sym_domain_t** fdoms = NULL;   /* symf.doms: the symbol columns' distinct domains */
+    bool grouped = false;              /* grouped symbol passes (sgrp, or one a column under symfile 'column) */
+    ray_symgrp_order_t so = RAY_SYMGRP_ROWS;
     ray_thread_t sym_thread = 0;
     bool sym_running = false;
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !pick || !order) { err = ray_error("oom",NULL); goto done; }
@@ -2954,7 +3018,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     /* The pass layout follows memory: physical RAM or the cgroup limit,
      * the page cache the output competes for (not the heap budget of -m).
      * Column by column pays off when the output does not fit it with room
-     * to spare: each column is written and indexed while it is hot, and
+     * to spare: each column is written while it is hot, and
      * only it is.  With plenty of memory one pass over every column keeps
      * all the decode work overlapped with the symbol domain's commits and
      * wins.  RAY_PQ_PASS_COLS forces columns per pass, symbol passes
@@ -3087,23 +3151,27 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         }
     }
     if (mode == PQ_SYM_GROUPED && simp) {
-        ray_symgrp_order_t so = RAY_SYMGRP_ROWS;
         const char* e = getenv("RAY_PQ_SYM_ORDER");
         if (e && !strcmp(e,"shards")) so = RAY_SYMGRP_SHARDS;
         else if (e && !strcmp(e,"freq")) so = RAY_SYMGRP_FREQ;
         else if (e && !strcmp(e,"rowsflat")) so = RAY_SYMGRP_ROWS_FLAT;
-        sgrp = ray_symgrp_new(simp,so);
-        if (!sgrp) { err = ray_error("oom",NULL); goto done; }
+        /* symfile 'column: every grouped column has a dictionary of its
+         * own, and its pass a grouped import over it (made by the pass) */
+        if (!r->symcol) {
+            sgrp = ray_symgrp_new(simp,so);
+            if (!sgrp) { err = ray_error("oom",NULL); goto done; }
+        }
+        grouped = true;
         if (nd == r->ncols) nd = nnum;   /* forced: every symbol column grouped */
     } else nd = r->ncols;
     int64_t seeded = -1, seed0 = 0;   /* the trace's: the dictionary's count after the seeding, and before */
     if (seed) {
         int64_t ts = trace ? ray_profile_now_ns() : 0, entries = 0;
         int64_t bad_col;
-        seed0 = ray_symimp_count(simp);
+        seed0 = pq_imp_count(writers,order,nnum,r->ncols);
         const char* se = pq_seed_dicts(r,order,nnum,nd,&entries,&bad_col);
         if (se) { err = pq_col_error(r,se,bad_col); goto done; }
-        seeded = ray_symimp_count(simp);
+        seeded = pq_imp_count(writers,order,nnum,r->ncols);
         if (trace) fprintf(stderr,"parquet symseed: cols=%lld groups=%lld entries=%lld ms=%.1f\n",(long long)(nd-nnum),
                            (long long)r->ngroups,(long long)entries,(double)(ray_profile_now_ns()-ts)/1e6);
     }
@@ -3115,13 +3183,22 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                     (int)ray_str_len(nm),ray_str_ptr(nm),(double)bytes[order[i]]/1048576.0,(long long)bytes[order[i]],
                     (double)vocab[order[i]]/1048576.0,(long long)vocab[order[i]],(int)donly[order[i]],i < nd ? "direct" : "grouped");
         }
-    if (!sgrp && nnum < r->ncols && writers[order[nnum]].dom) {
+    if (!grouped && nnum < r->ncols && writers[order[nnum]].dom) {
         symf.dom = writers[order[nnum]].dom;
+        fdoms = ray_alloc_raw((size_t)(r->ncols-nnum)*sizeof(*fdoms));
+        if (!fdoms) { err = ray_error("oom",NULL); goto done; }
+        for (int64_t i = nnum; i < r->ncols; i++) {
+            ray_sym_domain_t* d = writers[order[i]].dom;
+            bool seen = false;
+            for (int64_t k = 0; k < symf.ndoms && !seen; k++) seen = fdoms[k] == d;
+            if (d && !seen) fdoms[symf.ndoms++] = d;
+        }
+        symf.doms = fdoms;
         if (ray_thread_create(&sym_thread,pq_symflush_fn,&symf) == RAY_OK) sym_running = true;
     }
     ray_symimp_stats_t ist;   /* the import dictionary's counts, per pass */
     if (trace && symf.dom) ray_sym_domain_import_stats(symf.dom,&ist);
-    bool all = !colwise && !sgrp;
+    bool all = !colwise && !grouped;
     for (int64_t p = 0; p < r->ncols && !err; p += work.npass) {
         int64_t wd = all ? r->ncols : p < nnum ? width : p < nd ? sym_width : 1;
         int64_t lim = all ? r->ncols : p < nnum ? nnum : p < nd ? nd : r->ncols;
@@ -3129,7 +3206,16 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         work.npass = lim - p < wd ? lim - p : wd;
         int64_t tasks = r->ngroups*work.npass;
         int64_t t0 = trace ? ray_profile_now_ns() : 0, t1 = 0;
-        if (sgrp && p >= nd) {
+        ray_symgrp_t* pg = sgrp;   /* the pass's grouped import */
+        ray_symimp_t* pimp = simp;
+        if (grouped && p >= nd && r->symcol) {
+            /* symfile 'column: the column's own dictionary; one that has
+             * none (its file made without one) goes direct */
+            pimp = ray_sym_domain_import(writers[work.pass[0]].dom);
+            pg = pimp ? ray_symgrp_new(pimp,so) : NULL;
+            if (pimp && !pg) { err = ray_error("oom",NULL); break; }
+        }
+        if (pg && p >= nd) {
             /* memory for the pass: what is left under the anon watermark */
             int64_t wm = ray_heap_anon_watermark();
             int64_t budget = wm > 0 ? wm - ray_heap_anon_committed() : (int64_t)1 << 30;
@@ -3144,14 +3230,15 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             const char* e = getenv("RAY_PQ_SYM_GROUPS");
             if (e && *e && strtol(e,NULL,10) > 0) groups = (int)strtol(e,NULL,10);
             else {
-                int64_t need = (ray_symgrp_entries(sgrp) + r->rows) * 24;
+                int64_t need = (ray_symgrp_entries(pg) + r->rows) * 24;
                 while (groups < RAY_SYMGRP_MAX && need / groups > budget / 4) groups *= 2;
             }
-            pq_sym_grouped(&work,sgrp,simp,work.pass[0],groups,budget,workers,trace);
+            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,budget,workers,trace);
         } else if (tasks > 0) {
             if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
             else pq_write_direct_group(&work,0,0,tasks);
         }
+        if (pg && pg != sgrp) ray_symgrp_free(pg);   /* a column's own (symfile 'column) */
         /* errors[0] even with no tasks: a grouped pass over a file of no row
          * groups still runs its steps, and reports there */
         for (int64_t t = 0; t < (tasks > 0 ? tasks : 1); t++) if (errors[t]) {
@@ -3167,7 +3254,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
          * leave out a PLAIN page): their positions are the workers' */
         if (trace && seeded >= 0 && p < nd && p + work.npass >= nd)
             fprintf(stderr,"parquet symdirect: cols=%lld seeded=%lld seed_miss=%lld\n",(long long)(nd-nnum),
-                    (long long)(seeded-seed0),(long long)(ray_symimp_count(simp)-seeded));
+                    (long long)(seeded-seed0),(long long)(pq_imp_count(writers,order,nnum,r->ncols)-seeded));
         if (trace) t1 = ray_profile_now_ns();
         for (int64_t i = 0; i < work.npass; i++) {
             int64_t c = work.pass[i];
@@ -3176,7 +3263,6 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             if (all || writers[c].type == RAY_SYM) continue;
             ray_err_t e = ray_col_stream_close(&writers[c],false);
             if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
-            ray_col_stream_hash_one(&writers[c]);
         }
         /* the workers' page and dictionary buffers grown past PQ_SPARE_MAX
          * for this pass's columns go with the pass */
@@ -3201,17 +3287,17 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                         (double)ist.tab_bytes/1048576.0,(double)ist.off_bytes/1048576.0);
         }
     }
-    /* One pass: the columns finish side by side and their hash indexes are
-     * built in waves while the symbol file appender is still writing (its
-     * writeback can wait on the column data's); a symbol column's header
-     * takes the domain's final count, which no longer changes.  The
-     * column-by-column passes have closed and indexed theirs already. */
+    /* One pass: the columns finish side by side while the symbol file
+     * appender is still writing (its writeback can wait on the column
+     * data's); a symbol column's header takes the domain's final count,
+     * which no longer changes.  The column-by-column passes have closed
+     * theirs already.  No hash index is built: converters persist no
+     * auto-built hash (index policy), a column keeps its chunk zone. */
     if (all && !err) {
         int64_t tc = trace ? ray_profile_now_ns() : 0;
         ray_err_t e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
         if (e != RAY_OK) err = ray_error(ray_err_code_str(e),"parquet: column close failed");
-        else ray_col_stream_hash_all(writers,r->ncols,NULL);
-        if (trace) fprintf(stderr,"parquet phase: close+hash=%.1fms\n",(double)(ray_profile_now_ns()-tc)/1e6);
+        if (trace) fprintf(stderr,"parquet phase: close=%.1fms\n",(double)(ray_profile_now_ns()-tc)/1e6);
     }
     if (sym_running) {
         atomic_store_explicit(&symf.stop,true,memory_order_release);
@@ -3228,8 +3314,14 @@ done:
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
     }
     ray_free_raw(spare);
+    ray_free_raw(fdoms);
     ray_symgrp_free(sgrp);
     return err;
+}
+static void pq_release_doms(ray_sym_domain_t** doms, int64_t n) {
+    if (!doms) return;
+    for (int64_t c = 0; c < n; c++) if (doms[c]) ray_sym_domain_release(doms[c]);
+    ray_free_raw(doms);
 }
 ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types) {
 #ifdef RAY_FUZZING
@@ -3243,27 +3335,46 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     char staging[1100], spool[1200], leaf[1500], file[1700];
     ray_col_stream_t* writers = NULL; int64_t opened = 0, parts = 0;
     ray_err_t e = RAY_OK; ray_sym_domain_t* domain = NULL;
+    ray_sym_domain_t** cdoms = NULL;   /* symfile 'column: column c's own domain, or NULL */
     err = pq_import_types(r,types);
     if (err) goto done;
     err = pq_stage(r,dir,staging,sizeof(staging),false);
     if (err) goto done;
     writers = ray_calloc_raw((size_t)r->ncols*sizeof(*writers));
     if (!writers) { err = ray_error("oom",NULL); goto done; }
-    for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol && !domain) {
-        snprintf(file,sizeof(file),"%s/.sym",staging);
-        /* The direct import (no STR column) builds the symbol file with the
-         * import dictionary: strings go straight into the mapped file. */
-        bool str_cols = false;
-        for (int64_t k = 0; k < r->ncols; k++)
-            if (!r->schema[k].native_symbol && r->schema[k].type == RAY_STR) str_cols = true;
-        if (!str_cols) domain = ray_sym_domain_create_import(file);
-        if (!domain) domain = ray_sym_domain_open_or_create(file);
-        if (!domain) { err = ray_error("oom",NULL); goto done; }
-        if (ray_sym_domain_intern(domain,"",0) != 0) { err = pq_error("cannot initialize native symbol domain"); goto done; }
+    if (r->symcol) {
+        cdoms = ray_calloc_raw((size_t)(r->ncols > 0 ? r->ncols : 1)*sizeof(*cdoms));
+        if (!cdoms) { err = ray_error("oom",NULL); goto done; }
+    }
+    /* The direct import (no STR column) builds the symbol file with the
+     * import dictionary: strings go straight into the mapped file. */
+    bool str_cols = false;
+    for (int64_t k = 0; k < r->ncols; k++)
+        if (!r->schema[k].native_symbol && r->schema[k].type == RAY_STR) str_cols = true;
+    for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol && (cdoms || !domain)) {
+        /* shared: one symbol file, `.sym`; symfile 'column: each symbol
+         * column's own, `.<col>.sym` (ray_splay_col_sym_path) */
+        ray_t* nm = ray_sym_str(r->schema[c].name);
+        if (!cdoms) snprintf(file,sizeof(file),"%s/.sym",staging);
+        else if (!nm || !ray_splay_col_sym_path(file,sizeof(file),staging,ray_str_ptr(nm),ray_str_len(nm))) {
+            err = pq_error("symbol file path is too long"); goto done;
+        }
+        ray_sym_domain_t* d = str_cols ? NULL : ray_sym_domain_create_import(file);
+        if (!d) d = ray_sym_domain_open_or_create(file);
+        if (!d) { err = ray_error("oom",NULL); goto done; }
+        if (cdoms) cdoms[c] = d; else domain = d;
+        if (ray_sym_domain_intern(d,"",0) != 0) { err = pq_error("cannot initialize native symbol domain"); goto done; }
     }
     for (int64_t c = 0; c < r->ncols; c++) {
         opened++;
-        e = ray_col_stream_open(&writers[c],staging,r->schema[c].name,r->schema[c].native_symbol ? RAY_SYM : (int8_t)r->schema[c].type,domain);
+        int8_t wt = r->schema[c].native_symbol ? RAY_SYM : (int8_t)r->schema[c].type;
+        /* the destination must not exist: nothing to inherit from */
+        ray_t* nm = ray_sym_str(r->schema[c].name);
+        uint8_t gen = 0;
+        e = nm ? ray_col_resolve_gen_type_err((ray_compress_t)r->compress,wt,NULL,
+                                              ray_str_ptr(nm),ray_str_len(nm),&gen) : RAY_ERR_CORRUPT;
+        if (e == RAY_OK) e = ray_col_stream_open(&writers[c],staging,r->schema[c].name,wt,
+                                                 cdoms && cdoms[c] ? cdoms[c] : domain,gen);
         if (e != RAY_OK) goto io_fail;
     }
     for (int64_t c = 0; c < r->ncols; c++) {
@@ -3291,7 +3402,9 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
         ray_t* batch = ray_read_splayed(leaf,NULL);
         if (!batch || RAY_IS_ERR(batch)) { err = batch ? batch : ray_error("oom",NULL); goto done; }
         for (int64_t c = 0; c < r->ncols; c++) {
-            e = ray_col_stream_append(&writers[c],ray_table_get_col_idx(batch,c));
+            ray_t* bcol = ray_table_col_idx(batch,c);
+            if (bcol && RAY_IS_ERR(bcol)) { e = ray_err_from_obj(bcol); ray_error_free(bcol); break; }
+            e = ray_col_stream_append(&writers[c],bcol);
             if (e != RAY_OK) break;
         }
         ray_release(batch);
@@ -3312,25 +3425,37 @@ finish_columns:
     /* the direct import appended the symbols as they came: this writes
      * what is left and syncs the file */
     if (domain) { e = ray_sym_domain_flush_append(domain,true); if (e != RAY_OK) goto io_fail; }
+    for (int64_t c = 0; cdoms && c < r->ncols; c++)
+        if (cdoms[c]) { e = ray_sym_domain_flush_append(cdoms[c],true); if (e != RAY_OK) goto io_fail; }
     if (trace) { fprintf(stderr,"parquet phase: sym flush=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     /* All columns are still under a private staging directory (the direct
-     * import has closed and indexed them already, but for the symbol
-     * columns of its column-by-column passes). Commit their final images
-     * together below, after the hash re-read of any column left.  Every
+     * import has closed them already, but for the symbol columns of its
+     * column-by-column passes). Commit their final images together below.  Every
      * column finishes as a pool task; the renames run serially after. */
     e = ray_col_stream_close_all(writers,r->ncols,false,NULL);
     if (e != RAY_OK) goto io_fail;
     /* The persisted domain is flushed and every writer is closed (the zone
      * and dictionary indexes were built inline while streaming). Drop the
-     * ingestion hash tables and string arena before any hash re-read of the
-     * integer columns; reopening needs only the file-backed vocabulary. */
-    if (domain) {
-        ray_sym_domain_release(domain); domain = NULL;
+     * ingestion hash tables and string arena before the schema is written;
+     * reopening needs only the file-backed vocabulary. */
+    bool zsym = cdoms && r->compress == RAY_COMPRESS_ON;
+    if (domain || cdoms) {
+        if (domain) { ray_sym_domain_release(domain); domain = NULL; }
+        pq_release_doms(cdoms,r->ncols); cdoms = NULL;
         for (int64_t c = 0; c < opened; c++) writers[c].dom = NULL;
     }
+    /* symfile 'column under compress: each column's vocabulary, written
+     * whole, is coded (FSST) now that no domain holds it open */
+    for (int64_t c = 0; zsym && c < r->ncols; c++) if (r->schema[c].native_symbol) {
+        ray_t* nm = ray_sym_str(r->schema[c].name);
+        if (!nm || !ray_splay_col_sym_path(file,sizeof(file),staging,ray_str_ptr(nm),ray_str_len(nm))) {
+            err = pq_error("symbol file path is too long"); goto done;
+        }
+        e = ray_sym_domain_compress(file);
+        if (e != RAY_OK) goto io_fail;
+    }
+    if (trace && zsym) { fprintf(stderr,"parquet phase: sym compress=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     if (trace) { fprintf(stderr,"parquet phase: close=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
-    ray_col_stream_hash_all(writers,r->ncols,NULL);
-    if (trace) { fprintf(stderr,"parquet phase: hash=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     ray_t* schema = ray_vec_new(RAY_STR,r->ncols);
     if (!schema || RAY_IS_ERR(schema)) { err = schema ? schema : ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
@@ -3361,7 +3486,8 @@ io_fail:
     err = ray_error(ray_err_code_str(e),"parquet: splayed write failed; staging directory retained");
 done:
     for (int64_t c = 0; c < opened; c++) ray_col_stream_abort(&writers[c]);
-    ray_free_raw(writers); if (domain) ray_sym_domain_release(domain); ray_parquet_close(r); return err;
+    ray_free_raw(writers); if (domain) ray_sym_domain_release(domain);
+    pq_release_doms(cdoms,r ? r->ncols : 0); ray_parquet_close(r); return err;
 }
 
 ray_t* ray_parquet_splayed(const char* path, const char* dir) {
@@ -3382,11 +3508,15 @@ ray_t* ray_parquet_read_fn(ray_t** args, int64_t n) {
     return p ? ray_parquet_read(p,n == 2 ? args[0] : NULL) : ray_error("type","parquet.read: path must be a nonempty string");
 }
 ray_t* ray_parquet_splayed_fn(ray_t** args, int64_t n) {
+    if (n >= 2 && args[0] && args[0]->type == RAY_DICT && args[1] && args[1]->type == RAY_DICT)
+        return ray_error("domain","parquet: a second options dict");
     if (n != 2 && n != 3) return ray_error("arity","parquet.splayed: [types] path directory");
     const char* path = pq_path_arg(args[n-2]); const char* dir = pq_path_arg(args[n-1]);
     return path && dir ? ray_parquet_splayed_typed(path,dir,n == 3 ? args[0] : NULL) : ray_error("type","parquet.splayed: expected two paths");
 }
 ray_t* ray_parquet_parted_fn(ray_t** args, int64_t n) {
+    if (n >= 2 && args[0] && args[0]->type == RAY_DICT && args[1] && args[1]->type == RAY_DICT)
+        return ray_error("domain","parquet: a second options dict");
     if (n != 3 && n != 4) return ray_error("arity","parquet.parted: [types] path root table-name");
     const char* p = pq_path_arg(args[n-3]); const char* root = pq_path_arg(args[n-2]);
     ray_t* name = args[n-1]->type == -RAY_SYM ? ray_sym_str(args[n-1]->i64) : args[n-1];
@@ -3437,7 +3567,7 @@ ray_t* ray_parquet_scan_fn(ray_t** args, int64_t n) {
         return ray_error("oom",NULL);
     }
     ray_retain(path); ((ray_t**)ray_data(vals))[0] = path; vals->len = 1;
-    if (n == 2) { ray_retain(args[0]); ((ray_t**)ray_data(vals))[1] = args[0]; vals->len = 2; }
+    if (n == 2) { ray_retain(args[0]); ((ray_t**)ray_data(vals))[1] = args[0]; vals->len = 2; }   /* not-a-table */
     return ray_dict_new(keys,vals);
 }
 static const char* pq_symbol_name(ray_t* x) {
@@ -3583,12 +3713,17 @@ static bool pq_predicates(ray_parquet_t* r, ray_t* where, pq_predicate* predicat
     if (pos == r->noutput) return false;
     predicates[(*n)++] = (pq_predicate){pos,lo,hi}; return true;
 }
-static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int64_t n) {
+/* Compacts the batch's columns in place, dropping rows that fail the integer
+ * predicates.  Returns NULL or an owned error. */
+static ray_t* pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int64_t n) {
+    ray_t* cols = ray_table_cols_inplace(batch);
+    if (!cols) return ray_error("type", "parquet: batch holds an encoded column");
+    ray_t** cv = (ray_t**)ray_data(cols);
     int64_t rows = ray_table_nrows(batch), dst = 0, nc = ray_table_ncols(batch);
     for (int64_t i = 0; i < rows; i++) {
         bool keep = true;
         for (int64_t p = 0; p < n && keep; p++) {
-            ray_t* v = ray_table_get_col_idx(batch,predicates[p].pos);
+            ray_t* v = cv[predicates[p].pos];
             int64_t x = v->type == RAY_I16 ? ((int16_t*)ray_data(v))[i] :
                 v->type == RAY_I32 ? ((int32_t*)ray_data(v))[i] : ((int64_t*)ray_data(v))[i];
             keep = ray_vec_is_null(v,i) ? predicates[p].lo == INT64_MIN :
@@ -3596,22 +3731,27 @@ static void pq_filter_integers(ray_t* batch, const pq_predicate* predicates, int
         }
         if (!keep) continue;
         if (dst != i) for (int64_t c = 0; c < nc; c++) {
-            ray_t* v = ray_table_get_col_idx(batch,c); size_t size = ray_sym_elem_size(v->type,v->attrs);
+            ray_t* v = cv[c]; size_t size = ray_sym_elem_size(v->type,v->attrs);
             memcpy((uint8_t*)ray_data(v)+(size_t)dst*size,(uint8_t*)ray_data(v)+(size_t)i*size,size);
         }
         dst++;
     }
-    for (int64_t c = 0; c < nc; c++) ray_table_get_col_idx(batch,c)->len = dst;
+    for (int64_t c = 0; c < nc; c++) cv[c]->len = dst;
+    return NULL;
 }
 static ray_t* pq_accumulate(ray_parquet_t* r, pq_aggregate* aggs, int64_t n,
                             const uint32_t* gids, const pq_predicate* predicates, int64_t np) {
     for (;;) {
         ray_t* batch = ray_parquet_next(r);
         if (!batch || RAY_IS_ERR(batch)) return batch;
-        if (np) pq_filter_integers(batch,predicates,np);
+        if (np) {
+            ray_t* fe = pq_filter_integers(batch,predicates,np);
+            if (fe) { ray_release(batch); return fe; }
+        }
         int64_t rows = ray_table_nrows(batch);
         for (int64_t a = 0; a < n; a++) {
-            ray_t* v = ray_table_get_col_idx(batch,aggs[a].pos);
+            ray_t* v = ray_table_col_idx(batch,aggs[a].pos);
+            if (v && RAY_IS_ERR(v)) { ray_release(batch); return v; }
             ray_valid_t valid = {ray_data(v),v->type,ray_vec_may_have_nulls(v)};
             aggs[a].kernel->update_batch(aggs[a].state,aggs[a].kernel->state_size,gids,ray_data(v),&valid,rows,NULL);
         }

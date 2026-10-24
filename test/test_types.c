@@ -53,6 +53,9 @@ static test_result_t test_type_sizes_known_types(void) {
     TEST_ASSERT_EQ_U(ray_type_sizes[RAY_DATE], 4);
     TEST_ASSERT_EQ_U(ray_type_sizes[RAY_TIME], 4);
     TEST_ASSERT_EQ_U(ray_type_sizes[RAY_TIMESTAMP], 8);
+    TEST_ASSERT_EQ_U(ray_type_sizes[RAY_TIMESPAN], 8);
+    TEST_ASSERT_TRUE(RAY_TIMESPAN != RAY_SEL);
+    TEST_ASSERT_TRUE(RAY_TIMESPAN != RAY_ENCCOL);
     TEST_ASSERT_EQ_U(ray_type_sizes[RAY_GUID], 16);
 
     PASS();
@@ -94,6 +97,7 @@ static test_result_t test_type_sizes_pointer_types(void) {
 
     /* SEL has no fixed element size */
     TEST_ASSERT_EQ_U(ray_type_sizes[RAY_SEL], 0);
+    TEST_ASSERT_EQ_U(ray_type_sizes[RAY_ENCCOL], 0);
 
     PASS();
 }
@@ -195,9 +199,60 @@ static test_result_t test_fn_name_builtin(void) {
     PASS();
 }
 
+static test_result_t test_timespan_storage_tag(void) {
+    ray_t* atom = ray_timespan(NULL_I64);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(atom));
+    TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(atom));
+    ray_release(atom);
+    int64_t raw[] = {NULL_I64, INT64_MAX, -INT64_MAX, 0};
+    ray_t* vector = ray_vec_from_raw(RAY_TIMESPAN, raw, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vector));
+    TEST_ASSERT_TRUE(ray_is_vec(vector));
+    TEST_ASSERT_TRUE(ray_vec_is_null(vector, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(vector, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(vector, 2));
+    ray_release(vector);
+    const int8_t internal[] = {RAY_SEL, RAY_ENCCOL};
+    for (size_t i = 0; i < sizeof(internal); i++) {
+        ray_t* bad = ray_vec_new(internal[i], 1);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        ray_error_free(bad);
+    }
+    PASS();
+}
+
+static test_result_t test_timespan_dag_difference(void) {
+    int64_t values[] = {INT64_C(86400000000000), 0, NULL_I64};
+    ray_t* source = ray_vec_from_raw(RAY_TIMESTAMP, values, 3);
+    ray_t* epoch = ray_timestamp(0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(source));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(epoch));
+    ray_graph_t* graph = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(graph);
+    ray_op_t* left = ray_const_vec(graph, source);
+    ray_op_t* right = ray_const_atom(graph, epoch);
+    ray_op_t* difference = ray_sub(graph, left, right);
+    ray_release(source);
+    ray_release(epoch);
+    TEST_ASSERT_NOT_NULL(difference);
+    TEST_ASSERT_EQ_I(difference->out_type, RAY_TIMESPAN);
+    ray_t* result = ray_execute(graph, difference);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TIMESPAN);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(result))[0], values[0]);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(result))[1], 0);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 2));
+    ray_release(result);
+    ray_graph_free(graph);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t types_entries[] = {
+    { "types/timespan_dag_difference", test_timespan_dag_difference, types_runtime_setup, types_runtime_teardown },
+    { "types/timespan_storage_tag", test_timespan_storage_tag, types_runtime_setup, types_runtime_teardown },
     { "types/sizes_known_types", test_type_sizes_known_types, NULL, NULL },
     { "types/elem_size_macro", test_elem_size_macro, NULL, NULL },
     { "types/sizes_pointer_types", test_type_sizes_pointer_types, NULL, NULL },

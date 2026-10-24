@@ -56,6 +56,9 @@ make test       # run full test suite
 ./rayforce      # start the Rayfall REPL
 ```
 
+`make` compiles with `clang` when `CC` is not set; `make CC=gcc` (or `CC=gcc`
+in the environment) builds with gcc.
+
 ## Rayfall REPL
 
 Rayforce ships with **Rayfall** — a Lisp-like query language with a rich set
@@ -139,6 +142,45 @@ int main(void) {
     ray_heap_destroy();
 }
 ```
+
+## Embedding
+
+`make lib` builds the engine as a static library, `librayforce.a`, with no
+dependencies beyond libc, libm and pthreads. The build compiles library
+objects with `-ffunction-sections -fdata-sections` (the Makefile's
+`LIB_CFLAGS` flavour, applied automatically to the `.lib.o` objects that go
+into the archive), so no extra flags are needed at this step.
+
+To discard everything your code never reaches, pass `-Wl,--gc-sections` to
+the linker on the final link, and `-s` to strip the result. A DAG-route
+client, meaning one that builds and executes query plans through the
+`ray_graph_*`, `ray_scan` and `ray_execute` C API and never calls
+`ray_eval_str` or loads `.rfl` files, never touches the Rayfall parser,
+compiler, REPL or IPC server, and section GC drops that whole surface
+(mixing the two routes pulls the parser back in):
+
+```sh
+make clean && make lib
+cc -O2 -Iinclude -Isrc examples/analytics.c librayforce.a \
+   -lm -lpthread -Wl,--gc-sections -s -o analytics
+```
+
+The command above is the Linux one. On macOS, use `-Wl,-dead_strip` in
+place of `-Wl,--gc-sections` (the Makefile's platform block does the same
+for its own release links). On MinGW, link the winsock libraries as well:
+`-lws2_32 -lmswsock -lkernel32 -ladvapi32`, with the same section-GC flag
+the toolchain accepts.
+
+A checkout at the current commit links `analytics.c` to a 3.47 MB
+stripped binary, from a 10.22 MB archive; sizes move with the tree, so
+this is just one measurement, not a bound.
+
+Memory follows consumed-argument conventions documented per function in
+the headers: arguments marked `consumes` are released by the call, and
+returns marked `borrowed` stay owned by the container. On error paths the
+library releases the references it holds. Values are COW, managed with
+`ray_retain`/`ray_release`; error objects are owned and freed with
+`ray_error_free`.
 
 ## How It Works
 

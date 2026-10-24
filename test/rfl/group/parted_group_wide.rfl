@@ -79,5 +79,232 @@
 (< (max (abs (- (at RP 'sdv) (at RF 'sdv)))) 0.000001) -- true
 (< (max (abs (- (at RP 'vrv) (at RF 'vrv)))) 0.000001) -- true
 
+;; ─── nullable inputs: AVG/VAR/STDDEV divide by the NON-NULL count (#767) ─────
+;; The streaming kernel decomposes AVG into SUM+COUNT and VAR/STDDEV into
+;; SUM+SUM(x²)+COUNT.  SUM skips nulls, so the COUNT must too — it used to be
+;; the group row count, dividing the non-null sum by every row.  Fixture: 2
+;; partitions × 600 rows, key g = i mod 3 (gate: 3*100 <= 600).  Every 4th row
+;; is null; g=2 is null everywhere (all-null group → null avg/var, as flat);
+;; g=1 is all null in partition 1 only.  f is F64, k the same values as I64.
+(set mknull (fn [n off] (do (set i (+ (til n) off)) (set g (% i 3)) (set z (or (or (== g 2) (== (% i 4) 0)) (and (< off 1) (== g 1)))) (set f (/ (as 'F64 i) (as 'F64 (not z)))) (table [g f k] (list g f (as 'I64 f))))))
+(.sys.exec "rm -rf /tmp/rfl_pgwn")
+(.db.splayed.set "/tmp/rfl_pgwn/2024.01.01/t/" (mknull 600 0))
+(.db.splayed.set "/tmp/rfl_pgwn/2024.01.02/t/" (mknull 600 600))
+(set Pn (.db.parted.get "/tmp/rfl_pgwn/" 't))
+(set Fn (concat (mknull 600 0) (mknull 600 600)))
+(set qn (fn [T] (select {a: (avg f) v: (var f) vp: (var_pop f) d: (dev f) sd: (stddev f) sp: (stddev_pop f) ak: (avg k) vk: (var k) dk: (dev k) fi: (first f) la: (last k) from: T by: g asc: g})))
+(set Bn (at (.sys.mem) 'group-perpart-runs))
+(set NP (qn Pn))
+(> (at (.sys.mem) 'group-perpart-runs) Bn) -- true
+(set NF (qn Fn))
+(at NP 'a)  -- [600.0 900.0 0Nf]
+(at NP 'ak) -- [600.0 900.0 0Nf]
+(at NP 'a)  -- (at NF 'a)
+(at NP 'ak) -- (at NF 'ak)
+(at NP 'fi) -- (at NF 'fi)
+(at NP 'la) -- (at NF 'la)
+(nil? (at NP 'v))  -- (nil? (at NF 'v))
+(nil? (at NP 'vk)) -- (nil? (at NF 'vk))
+(< (max (abs (- (take (at NP 'v)  2) (take (at NF 'v)  2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'vp) 2) (take (at NF 'vp) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'd)  2) (take (at NF 'd)  2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'sd) 2) (take (at NF 'sd) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'sp) 2) (take (at NF 'sp) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'vk) 2) (take (at NF 'vk) 2)))) 0.000001) -- true
+(< (max (abs (- (take (at NP 'dk) 2) (take (at NF 'dk) 2)))) 0.000001) -- true
+;; same under a pushed-down WHERE (k is not filtered, so its nulls survive)
+(set wn (fn [T] (select {a: (avg k) v: (var k) from: T where: (> g 0) by: g asc: g})))
+(at (wn Pn) 'a) -- (at (wn Fn) 'a)
+(< (abs (- (first (at (wn Pn) 'v)) (first (at (wn Fn) 'v)))) 0.000001) -- true
+;; ungrouped, and grouped by the MAPCOMMON partition column
+(set un (fn [T] (select {a: (avg f) ak: (avg k) v: (var k) from: T})))
+(at (un Pn) 'a)  -- (at (un Fn) 'a)
+(at (un Pn) 'ak) -- (at (un Fn) 'ak)
+(< (abs (- (first (at (un Pn) 'v)) (first (at (un Fn) 'v)))) 0.000001) -- true
+(at (select {a: (avg f) ak: (avg k) from: Pn by: date}) 'a)  -- [300.0 900.0]
+(at (select {a: (avg f) ak: (avg k) from: Pn by: date}) 'ak) -- [300.0 900.0]
+;; mixed partitions: partition 1 has no nulls (its segments carry no
+;; HAS_NULLS, so its divisor slot takes the free group row count), partition 2
+;; does (that slot sums a not-null indicator).  A user (count f) sits next to
+;; (avg f): both divisor columns were named "f_count" by the first partial, so
+;; the merge — which scans by name — read the row count for avg's divisor.
+(set mkclean (fn [n off] (do (set i (+ (til n) off)) (table [g f k] (list (% i 3) (as 'F64 i) i)))))
+(.sys.exec "rm -rf /tmp/rfl_pgwm")
+(.db.splayed.set "/tmp/rfl_pgwm/2024.01.01/t/" (mkclean 600 0))
+(.db.splayed.set "/tmp/rfl_pgwm/2024.01.02/t/" (mknull 600 600))
+(set Pm (.db.parted.get "/tmp/rfl_pgwm/" 't))
+(set Fm (concat (mkclean 600 0) (mknull 600 600)))
+(set qm (fn [T] (select {c: (count f) a: (avg f) v: (var f) ck: (count k) ak: (avg k) dk: (dev k) from: T by: g asc: g})))
+(set Bm (at (.sys.mem) 'group-perpart-runs))
+(set MP (qm Pm))
+(> (at (.sys.mem) 'group-perpart-runs) Bm) -- true
+(set MF (qm Fm))
+(last (at MP 'a)) -- 300.5
+(at MP 'a)  -- (at MF 'a)
+(at MP 'ak) -- (at MF 'ak)
+(at MP 'c)  -- (at MF 'c)
+(at MP 'ck) -- (at MF 'ck)
+(any (nil? (at MP 'v)))  -- false
+(any (nil? (at MP 'dk))) -- false
+(< (max (abs (- (at MP 'v)  (at MF 'v))))  0.000001) -- true
+(< (max (abs (- (at MP 'dk) (at MF 'dk)))) 0.000001) -- true
+;; ungrouped over the same mix
+(set um (fn [T] (select {c: (count f) a: (avg f) v: (var k) from: T})))
+(at (um Pm) 'a) -- (at (um Fm) 'a)
+(at (um Pm) 'c) -- (at (um Fm) 'c)
+(< (abs (- (first (at (um Pm) 'v)) (first (at (um Fm) 'v)))) 0.000001) -- true
+
+;; avg-only shapes: the partition group runs on the v2 engine, which counts
+;; each nullable column's live rows in place (internal non-null count, one
+;; kernel per representation) instead of summing a materialized indicator.
+;; Mixed with a null-free partition (row-count divisor) in Pm.
+(set mkty (fn [n off] (do (set t (mknull n off)) (table [g f k i h d] (list (at t 'g) (at t 'f) (at t 'k) (as 'I32 (at t 'k)) (as 'I16 (% (at t 'k) 1000)) (as 'DATE (at t 'k)))))))
+(.sys.exec "rm -rf /tmp/rfl_pgwt")
+(.db.splayed.set "/tmp/rfl_pgwt/2024.01.01/t/" (mkty 600 0))
+(.db.splayed.set "/tmp/rfl_pgwt/2024.01.02/t/" (mkty 600 600))
+(set Pt (.db.parted.get "/tmp/rfl_pgwt/" 't))
+(set Ft (concat (mkty 600 0) (mkty 600 600)))
+(set qt (fn [T] (select {a: (avg f) ak: (avg k) ai: (avg i) ah: (avg h) s: (sum f) from: T by: g asc: g})))
+(set Bt (at (.sys.mem) 'group-perpart-runs))
+(set TP (qt Pt))
+(> (at (.sys.mem) 'group-perpart-runs) Bt) -- true
+(set TF (qt Ft))
+(at TP 'a)  -- [600.0 900.0 0Nf]
+(at TP 'ak) -- [600.0 900.0 0Nf]
+(at TP 'ai) -- [600.0 900.0 0Nf]
+(at TP 'a)  -- (at TF 'a)
+(at TP 'ak) -- (at TF 'ak)
+(at TP 'ai) -- (at TF 'ai)
+(at TP 'ah) -- (at TF 'ah)
+(at TP 's)  -- (at TF 's)
+;; v2 has no SUM over DATE (a DATE avg's partial), so this partition group
+;; runs on the legacy engine: its non-null count slots (OP_COUNT_NN) are
+;; re-planned there as SUM over a not-null indicator, whatever the pool size
+(at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'a) -- (at (select {a: (avg d) af: (avg f) from: Ft by: g asc: g}) 'a)
+(at (select {a: (avg d) af: (avg f) from: Pt by: g asc: g}) 'af) -- [600.0 900.0 0Nf]
+;; a TIME input: SUM over TIME emits a 4-byte TIME partial on both engines,
+;; which the readout took as I64 (garbage averages, zero variances); the
+;; partial is summed as I64.  Every 4th row null, no all-null group.
+(set mktm (fn [n off] (do (set i (+ (til n) off)) (set k (as 'I64 (/ (as 'F64 i) (as 'F64 (!= (% i 4) 0))))) (table [g t k] (list (% i 3) (as 'TIME k) k)))))
+(.sys.exec "rm -rf /tmp/rfl_pgwtm")
+(.db.splayed.set "/tmp/rfl_pgwtm/2024.01.01/t/" (mktm 600 0))
+(.db.splayed.set "/tmp/rfl_pgwtm/2024.01.02/t/" (mktm 600 600))
+(set Ptm (.db.parted.get "/tmp/rfl_pgwtm/" 't))
+(set Ftm (concat (mktm 600 0) (mktm 600 600)))
+(set qtm (fn [T] (select {a: (avg t) v: (var t) d: (dev t) ak: (avg k) from: T by: g asc: g})))
+(set Btm (at (.sys.mem) 'group-perpart-runs))
+(set MTP (qtm Ptm))
+(> (at (.sys.mem) 'group-perpart-runs) Btm) -- true
+(set MTF (qtm Ftm))
+(at MTP 'a)  -- [600.0 600.0 600.0]
+(at MTP 'a)  -- (at MTF 'a)
+(at MTP 'ak) -- (at MTF 'ak)
+(any (nil? (at MTP 'v))) -- false
+(< (max (abs (- (at MTP 'v) (at MTF 'v)))) 0.000001) -- true
+(< (max (abs (- (at MTP 'd) (at MTF 'd)))) 0.000001) -- true
+(set qa (fn [T] (select {c: (count f) a: (avg f) ak: (avg k) from: T by: g asc: g})))
+(at (qa Pm) 'a)  -- (at (qa Fm) 'a)
+(at (qa Pm) 'ak) -- (at (qa Fm) 'ak)
+(at (qa Pm) 'c)  -- (at (qa Fm) 'c)
+(last (at (qa Pm) 'a)) -- 300.5
+
+;; ─── key column named like an aggregate partial ─────────────────────────────
+;; The merge table holds the key columns next to the partials and the merge
+;; GROUP BY scanned them by name, so a key named after a partial ("f_count"
+;; for (count f)) was read in the partial's place: counts [0 3 6], avg
+;; [0Nf 499833.33 250083.33].  Keys named like the positional merge names
+;; (_gm0.._gm3) must not clash either; _gpnn1 is one more name of that shape.
+(set mkname (fn [n off] (do (set i (+ (til n) off)) (table [_gpnn1 f_count _gm0 _gm1 _gm3 f] (list (% i 3) (% i 3) (% i 3) (% i 3) (% i 3) (as 'F64 i))))))
+(.sys.exec "rm -rf /tmp/rfl_pgwk")
+(.db.splayed.set "/tmp/rfl_pgwk/2024.01.01/t/" (mkname 1000 0))
+(.db.splayed.set "/tmp/rfl_pgwk/2024.01.02/t/" (mkname 1000 1000))
+(.db.splayed.set "/tmp/rfl_pgwk/2024.01.03/t/" (mkname 1000 2000))
+(set Pk (.db.parted.get "/tmp/rfl_pgwk/" 't))
+(set Fk (concat (mkname 1000 0) (concat (mkname 1000 1000) (mkname 1000 2000))))
+(set Bk (at (.sys.mem) 'group-perpart-runs))
+(set KA (select {a: (avg f) from: Pk by: _gpnn1 asc: _gpnn1}))
+(> (at (.sys.mem) 'group-perpart-runs) Bk) -- true
+(at KA 'a) -- [1498.5 1499.5 1500.5]
+(at KA 'a) -- (at (select {a: (avg f) from: Fk by: _gpnn1 asc: _gpnn1}) 'a)
+(at (select {c: (count f) from: Pk by: f_count asc: f_count}) 'c) -- [1000 1000 1000]
+(at (select {c: (count f) from: Pk by: f_count asc: f_count}) 'c) -- (at (select {c: (count f) from: Fk by: f_count asc: f_count}) 'c)
+(set qk (fn [T] (select {c: (count f) a: (avg f) v: (var f) s: (sum f) from: T by: {_gm1: _gm1 date: date _gm3: _gm3} asc: [_gm1 date]})))
+(set Bq (at (.sys.mem) 'group-perpart-runs))
+(set KP (qk Pk))
+(> (at (.sys.mem) 'group-perpart-runs) Bq) -- true
+(set mkd (fn [n off d] (update {date: d from: (mkname n off)})))
+(set KF (qk (concat (mkd 1000 0 2024.01.01) (concat (mkd 1000 1000 2024.01.02) (mkd 1000 2000 2024.01.03)))))
+(at KP 'c) -- (at KF 'c)
+(at KP 's) -- (at KF 's)
+(at KP '_gm3) -- (at KF '_gm3)
+(< (max (abs (- (at KP 'v) (at KF 'v)))) 0.000001) -- true
+(at KP 'a) -- (at KF 'a)
+(at KP 'a) -- [499.5 1500.0 2499.0 499.0 1499.5 2500.0 500.0 1499.0 2499.5]
+
+;; ─── null atom as an aggregate input (parted) ────────────────────────────────
+;; Its broadcast filled the sentinel without HAS_NULLS, so (avg 0Nl) averaged
+;; INT64_MIN per group and wsum summed it.
+(at (select {s: (avg 0Nl) from: Pm by: g asc: g}) 's) -- [0Nf 0Nf 0Nf]
+(at (select {s: (wsum 0Nl f) from: Pm by: g asc: g}) 's) -- [0.0 0.0 0.0]
+(at (select {s: (wsum f 0Nl) from: Pm by: g asc: g}) 's) -- [0.0 0.0 0.0]
+(at (select {s: (avg 0Nl) from: Pm}) 's) -- [0Nf]
+(at (select {s: (wsum 0Nl f) from: Pm}) 's) -- [0.0]
+
+;; ─── cardinality gate over a full-span or nullable integer key ──────────────
+;; The gate's range proxy hi - lo + 1 overflowed (UBSan abort) for an I64 key
+;; spanning more than INT64_MAX or holding 0N next to a positive value, and in
+;; i32 arithmetic for an I32 key spanning more than INT32_MAX or holding 0Ni.
+(.sys.exec "rm -rf /tmp/rfl_pgs")
+(.db.splayed.set "/tmp/rfl_pgs/1/t/" (table [a b c d v] (list [-9000000000000000000 9000000000000000000 3] [0N 5 3] (as 'I32 [-2000000000 2000000000 3]) (as 'I32 [0N 5 3]) [10 20 30])))
+(.db.splayed.set "/tmp/rfl_pgs/2/t/" (table [a b c d v] (list [-9000000000000000000 9000000000000000000 4] [0N 5 4] (as 'I32 [-2000000000 2000000000 4]) (as 'I32 [0N 5 4]) [40 50 60])))
+(set Ps (.db.parted.get "/tmp/rfl_pgs/" 't))
+;; Route pinned too: 3 rows per partition, so the full-span keys saturate the
+;; estimate to rows_per_part+1 and the nullable ones count 3 values plus the
+;; null; est_groups*100 > rows_per_part either way, so none of these streams
+;; per partition.  A span computed in signed arithmetic that wrapped small
+;; would pick the per-partition route by accident and still sum right.
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Ps by: a asc: a}) 's) -- [50 30 60 70]
+(at (select {s: (sum v) from: Ps by: b asc: b}) 's) -- [50 30 60 70]
+(at (select {s: (sum v) from: Ps by: c asc: c}) 's) -- [50 30 60 70]
+(at (select {s: (sum v) from: Ps by: d asc: d}) 's) -- [50 30 60 70]
+(at (.sys.mem) 'group-perpart-runs) -- B
+(.sys.exec "rm -rf /tmp/rfl_pgs")
+
+;; A nullable low-cardinality key must still stream per partition: the gate
+;; took the null sentinel as the low end of the range, so 0N next to 1..3
+;; estimated rows_per_part+1 groups (I64) or ~2^31 (I32) and sent the group-by
+;; to the concat path.  Four groups (null + 1..3) over 1000 rows/partition
+;; clear est_groups*100 <= rows_per_part only when the null counts as one group.
+(set NN 1000)
+;; The same for the other integer-like widths — DATE, TIME, TIMESTAMP, I16 —
+;; which had no range estimate at all (card = rows of the partition) and so
+;; always left the per-partition path.
+(set PN (fn [b] (table [k j d t p h v] (list (at [0N 1 2 3] (% (til NN) 4)) (as 'I32 (at [0N 1 2 3] (% (til NN) 4))) (as 'DATE (at [0N 1 2 3] (% (til NN) 4))) (as 'TIME (at [0N 1 2 3] (% (til NN) 4))) (as 'TIMESTAMP (at [0N 1 2 3] (% (til NN) 4))) (as 'I16 (at [0N 1 2 3] (% (til NN) 4))) (+ b (til NN))))))
+(.sys.exec "rm -rf /tmp/rfl_pgn")
+(.db.splayed.set "/tmp/rfl_pgn/1/t/" (PN 0))
+(.db.splayed.set "/tmp/rfl_pgn/2/t/" (PN 1000))
+(.db.splayed.set "/tmp/rfl_pgn/3/t/" (PN 2000))
+(set Pn (.db.parted.get "/tmp/rfl_pgn/" 't))
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: k asc: k}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: j asc: j}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: d asc: d}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: t asc: t}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: p asc: p}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(set B (at (.sys.mem) 'group-perpart-runs))
+(at (select {s: (sum v) from: Pn by: h asc: h}) 's) -- [1123500 1124250 1125000 1125750]
+(> (at (.sys.mem) 'group-perpart-runs) B) -- true
+(.sys.exec "rm -rf /tmp/rfl_pgn")
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_pgw")
+(.sys.exec "rm -rf /tmp/rfl_pgw /tmp/rfl_pgwn /tmp/rfl_pgwm /tmp/rfl_pgwk /tmp/rfl_pgwt /tmp/rfl_pgwtm")

@@ -359,10 +359,14 @@ static ray_t* exec_like_input(ray_graph_t* g, ray_op_t* input_op) {
         scan_tbl = g->table;
     if (!scan_tbl) return exec_node(g, input_op);
 
-    ray_t* col = ray_table_get_col(scan_tbl, ext->sym);
+    ray_col_meta_t cm;
+    if (!ray_table_col_meta(scan_tbl, ext->sym, &cm) || !RAY_IS_PARTED(cm.type))
+        return exec_node(g, input_op);
+    ray_t* col = ray_table_col(scan_tbl, ext->sym);
+    if (col && RAY_IS_ERR(col)) return col;
     if (!col) return exec_node(g, input_op);
-    if (RAY_IS_PARTED(col->type)) {
-        int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+    {
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(cm.type);
         if (base == RAY_STR || RAY_IS_SYM(base)) {
             ray_retain(col);
             return col;
@@ -777,9 +781,8 @@ static void strlen_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_t 
         if (ray_vec_is_null(input, i)) { c->dst[i] = NULL_I64; any_null = true; continue; }
         int64_t sid = ray_read_sym(base, i, input->type, input->attrs);
         if (c->raw_ok && sid >= 0 && sid < c->raw.count) {
-            size_t sl;
-            (void)ray_sym_domain_raw_str(&c->raw, sid, &sl);
-            c->dst[i] = (int64_t)sl;
+            int64_t sl = ray_sym_domain_raw_len(&c->raw, sid);
+            c->dst[i] = sl < 0 ? 0 : sl;
         } else {
             const char* sp; size_t sl;
             sym_elem(input, i, &sp, &sl);

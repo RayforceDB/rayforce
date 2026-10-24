@@ -1,0 +1,14 @@
+;; Duration keys and accumulators retain their 64-bit lanes across morsels.
+(set N 100000)
+(set K (table [s v] (list (as 'TIMESPAN (% (til N) 10)) (til N))))
+(set G (select {from:K by:s n:(count v) asc:s}))
+(count G) -- 10
+(type (at G 's)) -- 'TIMESPAN
+(as 'I64 (at G 's)) -- (til 10)
+(at G 'n) -- (take [10000] 10)
+(set V (table [k s] (list (% (til N) 10) (as 'TIMESPAN (til N)))))
+(set R (select {from:V by:k total:(sum s) asc:k}))
+(type (at R 'total)) -- 'TIMESPAN
+(as 'I64 (at R 'total)) -- (+ 499950000 (* 10000 (til 10)))
+(count (select {from:K where:(>= s 5)})) -- 50000
+(count (inner-join [s] K G)) -- N
