@@ -2659,7 +2659,7 @@ static ray_t* rank_per_group_buf(ray_t* src,
     int8_t t = src->type;
     if (t != RAY_F64 && t != RAY_F32 && t != RAY_I64 && t != RAY_I32 &&
         t != RAY_I16 && t != RAY_U8 && t != RAY_BOOL && t != RAY_DATE &&
-        t != RAY_TIME && t != RAY_TIMESTAMP) return NULL;
+        t != RAY_TIME && t != RAY_TIMESTAMP && t != RAY_TIMESPAN) return NULL;
     if (use_quantile && (!__builtin_isfinite(q) || q < 0.0 || q > 1.0))
         return ray_error("domain", "quantile: probability out of range");
 

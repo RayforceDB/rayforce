@@ -1075,6 +1075,66 @@ static test_result_t test_dense_task_local(void) {
     PASS();
 }
 
+/* #973: adding duration support to indexed rank consumers must not broaden
+ * unrelated aggregators' type admission.  No execution is needed to test it. */
+static test_result_t test_timespan_rank_admission(void) {
+    ray_t* tbl = ray_eval_str("(table [k v] (list [0 0 1 1] (as 'TIMESPAN [1 2 -4 -1])))");
+    TEST_ASSERT_FMT(tbl && !RAY_IS_ERR(tbl), "duration admission fixture");
+    const uint16_t operations[] = { OP_MEDIAN, OP_QUANTILE, OP_MODE };
+    for (int a = 0; a < 3; a++) {
+        ray_graph_t* graph = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(graph);
+        ray_op_t* keys[] = { ray_scan(graph, "k") };
+        ray_op_t* ins[] = { ray_scan(graph, "v") };
+        int64_t param = 0;
+        double q = 0.25;
+        if (operations[a] == OP_QUANTILE) memcpy(&param, &q, sizeof(param));
+        uint16_t operation = operations[a];
+        ray_op_t* group = ray_group_build(graph, keys, 1, &operation, ins, NULL, &param, 1);
+        bool built = group != NULL;
+        agg_v2_reason_t got = built ? agg_v2_admission(graph, group, tbl) : AGG_V2_SHAPE;
+        ray_graph_free(graph);
+        agg_v2_reason_t want = a < 2 ? AGG_V2_ADMITTED : AGG_V2_AGG_TYPE;
+        TEST_ASSERT_FMT(built && got == want, "duration rank admission op=%u got=%d want=%d",
+                        operations[a], got, want);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
+/* Native F64 nanoseconds, NULL publication, empty groups, explicit reversed
+ * row indices and an actual offset SLICE (not merely a negative TAKE). */
+static test_result_t test_timespan_rank_slice(void) {
+    ray_t* parent = ray_eval_str("(as 'TIMESPAN [123 0Nl 1 2 0Nl -4 -1 0Nl 0Nl 456])");
+    TEST_ASSERT_FMT(parent && !RAY_IS_ERR(parent), "duration slice fixture");
+    int64_t original[10];
+    memcpy(original, ray_data(parent), sizeof(original));
+    ray_t* slice = ray_vec_slice(parent, 1, 8);
+    TEST_ASSERT_FMT(slice && !RAY_IS_ERR(slice) && (slice->attrs & RAY_ATTR_SLICE), "real offset slice");
+    const int64_t identity[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    const int64_t reversed[] = { 3, 2, 1, 0, 5, 4, 7, 6 };
+    const int64_t offsets[] = { 0, 4, 6, 8 }, counts[] = { 4, 2, 2, 0 };
+    for (int indexed = 0; indexed < 2; indexed++) {
+        for (int quantile = 0; quantile < 2; quantile++) {
+            ray_t* out = quantile
+                ? ray_quantile_per_group_buf(slice, indexed ? reversed : identity, offsets, counts, 4, 0.25)
+                : ray_median_per_group_buf(slice, indexed ? reversed : identity, offsets, counts, 4);
+            TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "duration rank slice result");
+            TEST_ASSERT_EQ_I(out->type, RAY_F64);
+            TEST_ASSERT_EQ_I(out->len, 4);
+            TEST_ASSERT_EQ_F(((double*)ray_data(out))[0], quantile ? 1.25 : 1.5, 0.0);
+            TEST_ASSERT_EQ_F(((double*)ray_data(out))[1], quantile ? -3.25 : -2.5, 0.0);
+            TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
+            TEST_ASSERT_TRUE(ray_vec_is_null(out, 2));
+            TEST_ASSERT_TRUE(ray_vec_is_null(out, 3));
+            ray_release(out);
+        }
+    }
+    TEST_ASSERT_TRUE(memcmp(original, ray_data(parent), sizeof(original)) == 0);
+    ray_release(slice); ray_release(parent);
+    PASS();
+}
+
 static test_result_t test_rank_widths_nulls_and_slices(void) {
     const int8_t types[] = { RAY_BOOL, RAY_F32 };
     for (int t = 0; t < 2; t++) {
@@ -4274,6 +4334,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
+    { "agg_contract/timespan_rank_admission", test_timespan_rank_admission, contract_setup, contract_teardown },
+    { "agg_contract/timespan_rank_slice", test_timespan_rank_slice, contract_setup, contract_teardown },
     { "agg_contract/rank_widths_nulls_slices", test_rank_widths_nulls_and_slices, contract_setup, contract_teardown },
     { "agg_contract/nullable_differential", test_nullable_differential, contract_setup, contract_teardown },
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },
