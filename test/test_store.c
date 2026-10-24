@@ -7504,9 +7504,9 @@ static bool parted_cache_remount(ray_t** views, int i, bool* reused) {
 /* Under a cap of three, the least recently mounted partition goes first and
  * a hit makes its partition the newest.  A cyclic pass over more partitions
  * than the cap misses on every mount, and every mount reads right.  With no
- * cap all stay.  A cleared, pruned or replaced entry leaves the index
- * consistent.  Saved as generation 0: the asserts read plain segments'
- * payloads and reference counts. */
+ * cap, or one past 32 bits, all stay.  A cleared, pruned or replaced entry
+ * leaves the index consistent.  Saved as generation 0: the asserts read
+ * plain segments' payloads and reference counts. */
 static test_result_t parted_cache_recency(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     for (int i = 0; i < 5; i++) {
@@ -7551,6 +7551,18 @@ static test_result_t parted_cache_recency(void) {
         for (int i = 0; i < 5; i++) {
             TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
             TEST_ASSERT_TRUE(reused == (round == 1 || i >= 2));
+        }
+    }
+    for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i));
+
+    /* A cap past 32 bits is a large cap even where size_t is 32 bits: from
+     * empty, each table loads once and then hits. */
+    ray_parted_cache_set_max((int64_t)1 << 32);
+    ray_parted_cache_clear();
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 5; i++) {
+            TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+            TEST_ASSERT_TRUE(reused == (round == 1));
         }
     }
     for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i));

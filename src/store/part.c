@@ -692,9 +692,11 @@ static ray_t* part_open(const char* path, struct ray_sym_domain_s* dom,
     fresh->seq = seq;
     fresh->hash = hash;
     part_cache_insert(fresh);
-    /* Never the fresh entry: it is the newest of at least two. */
+    /* Never the fresh entry: it is the newest of at least two.  The count
+     * widens rather than the cap narrowing: where size_t is 32 bits, a cap
+     * of 2^32 would otherwise read as 0 and evict the fresh entry too. */
     int64_t cap = part_cache_cap();
-    while (cap > 0 && g_part_count > (size_t)cap)
+    while (cap > 0 && (uint64_t)g_part_count > (uint64_t)cap)
         part_cache_remove(g_part_oldest);
     return tbl;
 }
