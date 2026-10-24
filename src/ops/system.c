@@ -212,14 +212,16 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                              a ? ray_type_name(a->type) : "null");
         }
     }
-    /* options: compress (true/false) and symfile ('shared/'column) */
+    /* options: compress (true/false), symfile ('shared/'column) and index
+     * (true/false: false writes no automatic dictionary or chunk zone) */
     ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
     for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
         ray_t* k = ray_sym_vec_cell(okeys, i);
         bool known = k && ((ray_str_len(k) == 8 && memcmp(ray_str_ptr(k), "compress", 8) == 0) ||
-                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "symfile", 7) == 0));
+                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "symfile", 7) == 0) ||
+                           (ray_str_len(k) == 5 && memcmp(ray_str_ptr(k), "index", 5) == 0));
         if (!known)
-            return ray_error("domain", "unknown option '%.*s' (compress and symfile are accepted)",
+            return ray_error("domain", "unknown option '%.*s' (compress, symfile and index are accepted)",
                              k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
     }
     ray_compress_t mode;
@@ -227,6 +229,9 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     if (oerr) return oerr;
     ray_symfile_t layout;
     oerr = ray_symfile_opt_parse(opts, &layout);
+    if (oerr) return oerr;
+    bool auto_index;
+    oerr = ray_splay_index_opt_parse(opts, &auto_index);
     if (oerr) return oerr;
     if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
     /* A symfile per column has no shared symfile to name, and the segments
@@ -245,7 +250,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                 : ".db.splayed.set: symfile 'column for a partition of a parted table");
     }
 
-    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, auto_index);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);

@@ -114,6 +114,21 @@ ray_t* ray_symfile_opt_parse(ray_t* opts, ray_symfile_t* layout) {
     return ok ? NULL : ray_error("domain", "symfile must be 'shared or 'column");
 }
 
+ray_t* ray_splay_index_opt_parse(ray_t* opts, bool* auto_index) {
+    *auto_index = true;
+    if (!opts || opts->type != RAY_DICT) return NULL;
+    ray_t* key = ray_sym(ray_sym_intern("index", 5));
+    if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
+    ray_t* v = ray_dict_get(opts, key);
+    ray_release(key);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) return v;
+    bool ok = v->type == -RAY_BOOL;
+    if (ok) *auto_index = v->b8 != 0;
+    ray_release(v);
+    return ok ? NULL : ray_error("domain", "index must be true or false");
+}
+
 /* --------------------------------------------------------------------------
  * ray_splay_save — save a table to a splayed table directory
  * -------------------------------------------------------------------------- */
@@ -503,7 +518,8 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
     return RAY_OK;
 }
 
-static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens);
+static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens,
+                                     bool auto_index);
 
 /* Distinct-merge SYM column `col`'s vocabulary into `dom` (find-or-append,
  * by a walk of its cells read by range, so an encoded column decodes one
@@ -552,6 +568,9 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
                                         bool sym_col) {
     ray_err_t validation = splay_validate_save(tbl, dir, sym_col ? NULL : sym_path);
     if (validation != RAY_OK) return validation;
+    /* the size-gated dictionary and chunk zone; explicit indexes follow
+     * build_indexes alone */
+    bool auto_index = build_indexes && !(write && write->no_auto_index);
     /* Create directory and any missing parents (mkdir -p semantics).
      * Required for partitioned layouts like "/db/2024.01.01/t/" where the
      * caller hasn't pre-created the date partition. */
@@ -703,15 +722,16 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         w.durable = durable;
         /* Generation 0 persists a chunk zone for numeric columns of at least
          * one chunk (ray_splay_build_indexes); generation 2 records it when
-         * the column records no other kind (a stale root records none). */
+         * the column records no other kind (a stale root records none).
+         * Neither when the call's index option is false. */
         uint8_t rec_kind = m.index_kind, rec_flags = 0;
         if (ray_is_vec(col)) ray_col_gen2_index_meta(col, &rec_kind, &rec_flags);
-        if (w.gen == 2 && build_indexes && ray_zone_acc_supported(m.type) &&
+        if (w.gen == 2 && auto_index && ray_zone_acc_supported(m.type) &&
             m.len >= RAY_ENC_CHUNK && rec_kind == 0)
             w.index_kind = RAY_IDX_CHUNK_ZONE;
         /* generation 0 builds a STR DICT in the same pass (splay_build_index_col):
          * at least RAY_DICT_MIN_ROWS rows, unless a HASH takes the slot */
-        if (w.gen == 2 && build_indexes && ray_col_dict_wanted(m.type, m.len) && rec_kind != RAY_IDX_HASH)
+        if (w.gen == 2 && auto_index && ray_col_dict_wanted(m.type, m.len) && rec_kind != RAY_IDX_HASH)
             w.index_kind = RAY_IDX_DICT;
         ray_err_t err = ray_col_save_ctx(&w, path);
         ray_col_src_release(&w.src);
@@ -734,7 +754,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
      * intentionally does not fsync them again after ray_col_save fsyncs data.
      * Generation-2 files record theirs in the enc header instead. */
     if (build_indexes)
-        splay_build_indexes_gens(dir, tbl, gens);
+        splay_build_indexes_gens(dir, tbl, gens, auto_index);
 
     /* A cancel before the commit marker leaves nothing committed: the
      * write finish removes what this save created. */
@@ -1131,7 +1151,8 @@ ray_err_t ray_splay_write_begin_mode(const char* dir, ray_compress_t mode,
 
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable,
-                                 ray_compress_t mode, bool sym_col) {
+                                 ray_compress_t mode, bool sym_col,
+                                 bool auto_index) {
     /* the per-column layout writes no shared symfile: no collision to check */
     ray_err_t err = splay_validate_save(tbl, dir, sym_col ? NULL : sym_path);
     if (err != RAY_OK) return err;
@@ -1139,31 +1160,34 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
     err = ray_splay_write_begin_mode(dir, mode, &write);
     if (err != RAY_OK) return err;
     write.sym_col = sym_col;
+    write.no_auto_index = !auto_index;
     err = ray_splay_write_table_ctx(tbl, &write, sym_path, durable);
     return ray_splay_write_finish(&write, err, durable);
 }
 
 ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, true, RAY_COMPRESS_ABSENT, false);
+    return splay_save_impl(tbl, dir, sym_path, true, RAY_COMPRESS_ABSENT, false, true);
 }
 
 ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, false, RAY_COMPRESS_ABSENT, false);
+    return splay_save_impl(tbl, dir, sym_path, false, RAY_COMPRESS_ABSENT, false, true);
 }
 
 ray_err_t ray_splay_save_mode(ray_t* tbl, const char* dir, const char* sym_path,
                               ray_compress_t mode) {
-    return splay_save_impl(tbl, dir, sym_path, true, mode, false);
+    return splay_save_impl(tbl, dir, sym_path, true, mode, false, true);
 }
 
 ray_err_t ray_splay_save_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
                                    ray_compress_t mode) {
-    return splay_save_impl(tbl, dir, sym_path, false, mode, false);
+    return splay_save_impl(tbl, dir, sym_path, false, mode, false, true);
 }
 
 ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
-                                ray_compress_t mode, ray_symfile_t layout) {
-    return splay_save_impl(tbl, dir, sym_path, true, mode, layout == RAY_SYMFILE_COLUMN);
+                                ray_compress_t mode, ray_symfile_t layout,
+                                bool auto_index) {
+    return splay_save_impl(tbl, dir, sym_path, true, mode, layout == RAY_SYMFILE_COLUMN,
+                           auto_index);
 }
 
 ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
@@ -1506,9 +1530,11 @@ static ray_err_t splay_hash_append(const char* path, ray_t* col) {
  * ray_splay_build_indexes).  Columns are independent — each reads and
  * appends to its own file — so the caller runs one task per column. */
 /* gens: the resolved generation per column, or NULL (all generation 0); a
- * generation-2 file records its index in the enc header and is skipped. */
+ * generation-2 file records its index in the enc header and is skipped.
+ * auto_index false (the save's index option) builds only the explicit
+ * indexes, not the size-gated dictionary or chunk zone. */
 static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
-                                  const uint8_t* gens) {
+                                  const uint8_t* gens, bool auto_index) {
     /* Index policy (compressed-columns PI): no heuristic HASH is persisted
      * for any generation; only explicit .idx.hash indexes are (below).
      * A generation-2 file records its zone in the enc header. */
@@ -1569,7 +1595,7 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
             return;
         }
 
-        if (col->len < (1 << 16)) return;
+        if (!auto_index || col->len < (1 << 16)) return;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal
          * get the per-chunk min/max for block-skip.  No HASH is built here:
@@ -1597,19 +1623,21 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
 typedef struct {
     const char* dir; ray_t* tbl;
     const uint8_t* gens;    /* per-column generation, NULL = all 0 */
+    bool auto_index;        /* the size-gated dictionary / chunk zone too */
 } splay_index_ctx_t;
 
 static void splay_build_index_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid; (void)end;
     splay_index_ctx_t* c = (splay_index_ctx_t*)raw;
-    splay_build_index_col(c->dir, c->tbl, start, c->gens);
+    splay_build_index_col(c->dir, c->tbl, start, c->gens, c->auto_index);
 }
 
 void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
-    splay_build_indexes_gens(dir, tbl, NULL);
+    splay_build_indexes_gens(dir, tbl, NULL, true);
 }
 
-static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens) {
+static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens,
+                                     bool auto_index) {
 
     if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
     int64_t nc = ray_table_ncols(tbl);
@@ -1619,10 +1647,11 @@ static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t*
      * calling thread — the longest serial stretch of a CSV → splayed load. */
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, nc, 2)) {
-        splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .gens = gens };
+        splay_index_ctx_t ctx = { .dir = dir, .tbl = tbl, .gens = gens,
+                                  .auto_index = auto_index };
         ray_pool_dispatch_n(pool, splay_build_index_task, &ctx, (uint32_t)nc);
     } else {
-        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, gens);
+        for (int64_t c = 0; c < nc; c++) splay_build_index_col(dir, tbl, c, gens, auto_index);
     }
 }
 
