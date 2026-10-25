@@ -27747,8 +27747,19 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                  * Raw cells carry their null sentinels; propagate the
                  * flag with them. */
                 res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
-                if (!RAY_IS_ERR(res) && ray_vec_may_have_nulls(pay))
-                    res->attrs |= RAY_ATTR_HAS_NULLS;
+                /* ray_vec_may_have_nulls is true for every SYM vector (the
+                 * flag cannot prove a text column null-free), so it would
+                 * mark each appended SYM column and change its serialised
+                 * attrs byte; look at the cells instead. */
+                if (!RAY_IS_ERR(res) && !(res->attrs & RAY_ATTR_HAS_NULLS)) {
+                    /* Nothing to scan for after a failed append or when the
+                     * destination already carries the flag (the OR could not
+                     * change it); the exact SYM scan stops at the first null. */
+                    bool pay_has_nulls = pay->type == RAY_SYM ? ray_vec_text_has_nulls(pay)
+                                                              : ray_vec_may_have_nulls(pay);
+                    if (pay_has_nulls)
+                        res->attrs |= RAY_ATTR_HAS_NULLS;
+                }
             } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
                 /* Differently-typed vector or generic list: coerce cell by
                  * cell, exactly like the rebuild does. */

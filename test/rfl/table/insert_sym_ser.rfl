@@ -1,0 +1,28 @@
+;; A multi-row insert marked the table's SYM columns "may have nulls" (the
+;; flag byte after the type byte of `ser`) even when no cell is null, so the
+;; serialised bytes of equal data depended on how the rows arrived.
+(set mk (fn [n] (as 'table (dict [a b] (list (take [SRC] n) (til n))))))
+(set flag (fn [t] (at (ser (at t 'a)) 17)))
+
+;; table batch into a named table (in-place append)
+(set j (mk 1))
+(insert 'j (mk 2))
+(flag j) -- 0x00
+(all (== (ser (at j 'a)) (ser (at (mk 3) 'a)))) -- true
+
+;; column-list batch
+(set k (mk 1))
+(insert 'k (list (take [SRC] 2) [5 6]))
+(flag k) -- 0x00
+(all (== (ser (at k 'a)) (ser (at (mk 3) 'a)))) -- true
+
+;; row inserts and a fresh table agree with them
+(set r (mk 1))
+(insert 'r (list 'SRC 5))
+(flag r) -- 0x00
+
+;; a batch that does hold a null symbol still carries the flag
+(set n (mk 1))
+(insert 'n (list (concat (take [SRC] 1) (as 'SYM (list ""))) [5 6]))
+(flag n) -- 0x40
+(nil? (at (at n 'a) 2)) -- true
