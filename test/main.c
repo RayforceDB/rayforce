@@ -188,6 +188,7 @@ extern const test_entry_t stress_matrix_entries[];
 extern const test_entry_t stress_random_entries[];
 extern const test_entry_t str_entries[];
 extern const test_entry_t sym_entries[];
+extern const test_entry_t read_budget_entries[];
 extern const test_entry_t text_null_entries[];
 extern const test_entry_t sys_entries[];
 extern const test_entry_t table_entries[];
@@ -239,6 +240,7 @@ static const test_entry_t* const compiled_groups[] = {
     stress_eval_entries,
     stress_matrix_entries,
     stress_random_entries,
+    read_budget_entries,
     text_null_entries, str_entries,      sym_entries,      sys_entries,      table_entries,
     term_entries,     traverse_entries,
     types_entries,    vec_entries,      window_entries,
@@ -956,7 +958,7 @@ void ray_test_hooks_off(void) {
 
 /* ---- Per-process scratch root (declared in test.h) ---- */
 
-static char   g_tmp_root[64];   /* "/tmp/rayforce_t.<pid>", set in main() */
+static char   g_tmp_root[4096];   /* TMPDIR/rayforce_t.<pid>, default /tmp, set in main() */
 static size_t g_tmp_root_len;
 
 /* A "/tmp" path starts at s[i]: "/tmp" as a whole path component, not part
@@ -1138,7 +1140,12 @@ int main(int argc, char** argv) {
     }
 
     if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
-    snprintf(g_tmp_root, sizeof g_tmp_root, "/tmp/rayforce_t.%ld", (long)getpid());
+    const char* test_tmp = getenv("TMPDIR");
+    if (!test_tmp || !*test_tmp) test_tmp = "/tmp";
+    int tmp_len = snprintf(g_tmp_root, sizeof g_tmp_root, "%s/rayforce_t.%ld", test_tmp, (long)getpid());
+    if (tmp_len < 0 || (size_t)tmp_len >= sizeof g_tmp_root) {
+        fprintf(stderr, "TMPDIR path too long\n"); return 1;
+    }
     (void)ray_test_rm_rf(g_tmp_root);                    /* a dead run's leftovers under a reused pid */
     if (ray_test_mkdir_p(g_tmp_root) != 0) { fprintf(stderr, "cannot create %s\n", g_tmp_root); return 2; }
     g_tmp_root_len = strlen(g_tmp_root);
