@@ -1886,7 +1886,7 @@ static ray_t* col_load_impl(const char* path, struct ray_sym_domain_s* dom,
             ray_release(vec);
             return ray_error("sym",
                 "column %s: SYM data but no symfile resolved "
-                "(missing <dir>/sym or explicit sym argument)", path);
+                "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", path);
         } else {
             /* Bare load: process-local runtime-id semantics. */
             vec->sym_domain = ray_sym_runtime_domain();
@@ -1967,7 +1967,7 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
             ray_vm_unmap_file(cm.mapped, cm.mapped_size);
             return ray_error("sym",
                 "column %s: SYM data but no symfile resolved "
-                "(missing <dir>/sym or explicit sym argument)", path);
+                "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", path);
         } else {
             /* Bare load: process-local runtime-id semantics.  Fast-reject a
              * file whose saved dictionary count exceeds the live table — it
