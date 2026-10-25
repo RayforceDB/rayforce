@@ -318,7 +318,7 @@ ray_t* ray_enccol_open(void* mapped, size_t size, const char* path,
             e->dom = dom; ray_sym_domain_retain(dom); e->dom_owned = true;
         } else if (require_dom) {
             err = ray_error("sym", "column %s: SYM data but no symfile resolved "
-                                   "(missing <dir>/sym or explicit sym argument)", e->path);
+                                   "(missing <dir>/.sym -- a file named \"sym\" is not read -- or explicit sym argument)", e->path);
         } else {
             /* runtime ids of another process: the live table must hold them */
             uint32_t cur = ray_sym_count();
