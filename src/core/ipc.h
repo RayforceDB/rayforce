@@ -113,6 +113,15 @@ int64_t ray_ipc_current_handle(void);
 ray_poll_t* ray_ipc_active_poll(void);
 ray_poll_t* ray_ipc_context_poll(void);
 bool ray_ipc_auto_journal_eval(void);
+/* Enter (true) or leave (false) the auto-journaled evaluation scope: while it
+ * is set `.log.write` is refused, because the frame being evaluated is already
+ * in the journal and a nested synthetic record would make a replay diverge
+ * from the live run.  Returns the previous value; a caller that evaluates a
+ * request it has just journaled itself (a transport other than the native
+ * IPC listener) saves it, sets true, evaluates, and restores the saved value,
+ * exactly as eval_payload does for a native SYNC frame.  Thread-local. */
+bool ray_ipc_set_auto_journal_eval(bool enabled);
+#define RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL 1
 #ifdef DEBUG
 void ray_ipc_set_auto_journal_eval_for_test(bool enabled);
 #endif
