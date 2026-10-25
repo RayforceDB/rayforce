@@ -12,6 +12,7 @@ typedef enum { RAY_READ_OK, RAY_READ_LIMIT, RAY_READ_OOM, RAY_READ_INVALID } ray
 typedef struct ray_read_budget {
     size_t limit, live, peak, attempts, fail_after;
     ray_read_status_t status;
+    bool closed;
     ray_read_records_t* records;
 } ray_read_budget_t;
 
@@ -23,6 +24,9 @@ void ray_read_sys_free(ray_read_budget_t* b, void* p);
 /* Transfer a preallocated block to permanent storage, after nonfailing commit. */
 void ray_read_sys_transfer(ray_read_budget_t* b, void* p);
 ray_t* ray_read_alloc(ray_read_budget_t* b, size_t bytes);
+/* Best-effort early release: shared values remain ledger-owned and charged.
+ * May be retried after parents are released. close is terminal and drops all
+ * ledger refs; retain an output root before close to transfer ownership. */
 void ray_read_release(ray_read_budget_t* b, ray_t* v);
 ray_t* ray_read_string(ray_read_budget_t* b, const char* s, size_t n);
 ray_t* ray_read_i64(ray_read_budget_t* b, const int64_t* values, size_t n);

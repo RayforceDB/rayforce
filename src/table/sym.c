@@ -1453,7 +1453,7 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
     sym_segs_t* segments = NULL;
     bool locked = false, ok = false;
     size_t text_bytes = 0, slots = 1;
-    if (b->status != RAY_READ_OK) return false;
+    if (b->closed || b->status != RAY_READ_OK) return false;
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire) ||
         (count && (!strings || !lengths || !out_ids)) || count > UINT32_MAX / 2) {
         b->status = RAY_READ_INVALID; return false;

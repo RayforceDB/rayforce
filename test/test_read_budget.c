@@ -139,11 +139,66 @@ static test_result_t oversized_cache(void) {
     PASS();
 }
 
+/* A ledger reference may be dropped only when it really releases the block.
+ * Parent LISTs keep their children alive even if a caller discards its handle. */
+static test_result_t retained_child_admission(void) {
+    const int64_t values[1024] = {0};
+    for (size_t aliases = 1; aliases <= 2; aliases++) {
+        ray_read_budget_t b;
+        TEST_ASSERT_TRUE(ray_read_budget_init(&b, 32768));
+        ray_t* child = ray_read_i64(&b, values, 1024);
+        TEST_ASSERT_NOT_NULL(child);
+        ray_t* children[] = {child};
+        for (size_t i = 0; i < aliases; i++)
+            TEST_ASSERT_NOT_NULL(ray_read_list(&b, children, 1));
+        size_t before = b.live;
+        ray_read_release(&b, child);
+        TEST_ASSERT_EQ_U(b.live, before);
+        TEST_ASSERT_NULL(ray_read_i64(&b, values, 1024));
+        TEST_ASSERT_EQ_I(b.status, RAY_READ_LIMIT);
+        TEST_ASSERT(b.peak <= b.limit, "no uncharged retained child");
+        ray_read_budget_close(&b);
+        TEST_ASSERT_EQ_U(b.live, 0);
+        TEST_ASSERT_EQ_I(b.status, RAY_READ_LIMIT);
+        TEST_ASSERT_TRUE(b.closed);
+    }
+    PASS();
+}
+
+static test_result_t retained_child_reclaim(void) {
+    const int64_t values[1024] = {0};
+    ray_read_budget_t b;
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 32768));
+    ray_t* child = ray_read_i64(&b, values, 1024);
+    TEST_ASSERT_NOT_NULL(child);
+    ray_t* children[] = {child};
+    ray_t* a = ray_read_list(&b, children, 1);
+    ray_t* c = ray_read_list(&b, children, 1);
+    TEST_ASSERT_NOT_NULL(a); TEST_ASSERT_NOT_NULL(c);
+    ray_read_release(&b, child);
+    ray_read_release(&b, a);
+    size_t shared = b.live;
+    ray_read_release(&b, child);
+    TEST_ASSERT_EQ_U(b.live, shared);
+    ray_read_release(&b, c);
+    size_t unique = b.live, charge;
+    TEST_ASSERT_TRUE(ray_alloc_charge(sizeof values, &charge));
+    ray_read_release(&b, child);
+    TEST_ASSERT_EQ_U(b.live, unique - charge);
+    TEST_ASSERT_NOT_NULL(ray_read_i64(&b, values, 1024));
+    ray_read_budget_close(&b);
+    TEST_ASSERT_EQ_U(b.live, 0);
+    TEST_ASSERT_NULL(ray_read_alloc(&b, 0)); /* close ends the admission scope */
+    PASS();
+}
+
 const test_entry_t read_budget_entries[] = {
     {"reader_proof/budget_edges", budget_edges, setup, teardown},
     {"reader_proof/transitive_ownership", transitive_ownership, setup, teardown},
     {"reader_proof/construction_faults", construction_faults, setup, teardown},
     {"reader_proof/resize_peak", resize_peak, setup, teardown},
     {"reader_proof/oversized_cache", oversized_cache, setup, teardown},
+    {"reader_proof/retained_child_admission", retained_child_admission, setup, teardown},
+    {"reader_proof/retained_child_reclaim", retained_child_reclaim, setup, teardown},
     {NULL, NULL, NULL, NULL}
 };
