@@ -2122,6 +2122,43 @@ static test_result_t test_ops_write_noopen(void) {
     PASS();
 }
 
+/* 22qa. ray_ipc_set_auto_journal_eval: production setter, returns the previous
+ * value so a nested scope restores correctly. */
+static test_result_t test_ops_write_auto_journal_eval_scope(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_auto_scope");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_FALSE(ray_ipc_auto_journal_eval());
+
+    bool outer = ray_ipc_set_auto_journal_eval(true);
+    TEST_ASSERT_FALSE(outer);
+    TEST_ASSERT_TRUE(ray_ipc_auto_journal_eval());
+
+    ray_t* expr = ray_i64(42);
+    TEST_ASSERT_NOT_NULL(expr);
+    ray_t* r = ray_log_write_fn(expr);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+    ray_error_free(r);
+
+    /* nested: the inner scope sees true and restores true */
+    bool inner = ray_ipc_set_auto_journal_eval(true);
+    TEST_ASSERT_TRUE(inner);
+    ray_ipc_set_auto_journal_eval(inner);
+    TEST_ASSERT_TRUE(ray_ipc_auto_journal_eval());
+
+    ray_ipc_set_auto_journal_eval(outer);
+    TEST_ASSERT_FALSE(ray_ipc_auto_journal_eval());
+    r = ray_log_write_fn(expr);           /* outside the scope the write is accepted */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_release(expr);
+    ray_journal_close();
+    PASS();
+}
+
 /* 22q. ray_log_write_fn: reject explicit writes from auto-journaled IPC eval. */
 static test_result_t test_ops_write_rejects_auto_journal_eval(void) {
     char base[256]; make_base(base, sizeof(base), "ops_auto_eval");
@@ -2790,6 +2827,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
+    { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
     { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
