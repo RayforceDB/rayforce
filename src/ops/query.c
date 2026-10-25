@@ -22001,6 +22001,7 @@ by_dict_done:
             uint16_t*  s_agg_ops  = (uint16_t*)(s_agg_ins2 + s_max);
             int64_t    s_n_aggs = 0;
             int        s_has_binary = 0;
+            int        s_has_param = 0;
             int        s_use_eval_fallback = 0;
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
@@ -22009,6 +22010,35 @@ by_dict_done:
                 ray_t*  val_expr  = dict_elems[i + 1];
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
                 uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
+                /* Reuse the outer exact-sized collectors: aggs_max bounds
+                 * all output slots, and their storage outlives this GROUP.
+                 * Presence, not nonzero bits, distinguishes q=0 from no q. */
+                agg_k[s_n_aggs] = 0;
+                if (op == OP_QUANTILE) {
+                    double q;
+                    /* Preserve the existing median default for parameters
+                     * this literal-only path cannot resolve.  In a mixed
+                     * parameter array each such slot still needs q=.5;
+                     * zero bits mean q=0, not an absent probability. */
+                    agg_k[s_n_aggs] = encode_agg_f64_param(0.5);
+                    bool percentile = agg_name_is_percentile(agg_elems[0]->i64);
+                    if (ray_len(val_expr) == 3) {
+                        /* Qualify only the new transport, not the old name-based
+                         * aggregate classification.  A replacement or column
+                         * named quantile must not acquire builtin q semantics. */
+                        ray_t* head = agg_elems[0];
+                        ray_t* fn = (head->attrs & ATTR_QUOTED) ||
+                                    ray_table_slot(tbl, head->i64)
+                            ? NULL : ray_env_get(head->i64);
+                        ray_binary_fn native = percentile ? ray_percentile_fn : ray_quantile_fn;
+                        if (fn && fn->type == RAY_BINARY &&
+                            (ray_binary_fn)(uintptr_t)fn->i64 == native &&
+                            quantile_literal_prob(agg_elems[2], percentile, &q)) {
+                            agg_k[s_n_aggs] = encode_agg_f64_param(q);
+                            s_has_param = 1;
+                        }
+                    }
+                }
                 s_agg_ops[s_n_aggs] = op;
                 s_agg_ins[s_n_aggs] = compile_expr_dag(g, agg_elems[1]);
                 s_agg_ins2[s_n_aggs] = NULL;
@@ -22016,6 +22046,8 @@ by_dict_done:
                     s_use_eval_fallback = 1;
                     break;
                 }
+                agg_in_ids[s_n_aggs] = s_agg_ins[s_n_aggs]->id;
+                agg_in2_ids[s_n_aggs] = RAY_OP_NONE;
                 /* OP_GROUP's COUNT counts source rows. A constant collection
                  * has its own length, independent of the source or WHERE. */
                 if (op == OP_COUNT && op_tree_is_scalar(g, s_agg_ins[s_n_aggs]->id) &&
@@ -22055,6 +22087,7 @@ by_dict_done:
                         scratch_free(sagg_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select: binary aggregation does not admit second input type %s", ray_type_name(in_t));
                     }
+                    agg_in2_ids[s_n_aggs] = s_agg_ins2[s_n_aggs]->id;
                     s_has_binary = 1;
                 }
                 s_n_aggs++;
@@ -22097,9 +22130,17 @@ by_dict_done:
                 scratch_free(sagg_hdr);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             }
-            if (s_has_binary)
+            /* Later input compilation may move g->nodes; retain ids during
+             * collection and resolve pointers only after the last compile. */
+            for (int64_t a = 0; a < s_n_aggs; a++) {
+                s_agg_ins[a] = &g->nodes[agg_in_ids[a]];
+                s_agg_ins2[a] = agg_in2_ids[a] != RAY_OP_NONE
+                    ? &g->nodes[agg_in2_ids[a]] : NULL;
+            }
+            if (s_has_binary || s_has_param)
                 root = ray_group_build(g, NULL, 0, s_agg_ops, s_agg_ins,
-                                       s_agg_ins2, NULL, s_n_aggs);
+                                       s_has_binary ? s_agg_ins2 : NULL,
+                                       s_has_param ? agg_k : NULL, s_n_aggs);
             else
                 root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, s_n_aggs);
             scratch_free(sagg_hdr);
