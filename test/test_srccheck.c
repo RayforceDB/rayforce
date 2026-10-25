@@ -168,9 +168,11 @@ static test_result_t test_cols_inplace_plain(void) {
  * Rayfall or shell line, the bare root; an already-moved path and a path
  * that merely contains "/tmp" elsewhere are left alone.  The root exists. */
 static test_result_t test_tmp_paths_per_process(void) {
-    char root[64];
-    snprintf(root, sizeof root, "/tmp/rayforce_t.%ld", (long)getpid());
-    char want[256];
+    char root[4096];
+    const char* base = getenv("TMPDIR");
+    if (!base || !*base) base = "/tmp";
+    snprintf(root, sizeof root, "%s/rayforce_t.%ld", base, (long)getpid());
+    char want[12544];
     snprintf(want, sizeof want, "%s/rayforce_x/a", root);
     TEST_ASSERT_STR_EQ(ray_test_tmp("/tmp/rayforce_x/a"), want);
     TEST_ASSERT_STR_EQ(ray_test_tmp(want), want);
