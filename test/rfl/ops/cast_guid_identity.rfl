@@ -1,0 +1,10 @@
+;; (as 'GUID v) on a GUID vector is the identity, like any same-type cast.
+;; It raised "as: cannot cast GUID to guid" for a non-empty GUID vector.
+(set g (at (guid 1) 0))
+(type (as 'GUID (enlist g))) -- 'GUID
+(== (as 'GUID (enlist g)) (enlist g)) -- [true]
+(count (as 'GUID (guid 5))) -- 5
+(set v (guid 3))
+(== (as 'GUID v) v) -- [true true true]
+(type (as 'GUID (as 'GUID []))) -- 'GUID
+(type (as 'GUID g)) -- 'guid
