@@ -276,6 +276,10 @@ void ray_heap_release_pages(void);
  *   of the caller's heap and the workers'; returns the number of blocks
  *   released, or -1 if it did nothing.  Safe to call from any maintenance
  *   point.
+ * ray_heap_release_now    — the same sweep, due or not, and the
+ *   direct-block cache drained: for a caller that knows it has finished
+ *   with a peak ((.sys.gc 1)).  Disarms the decay.  Returns the number of
+ *   blocks released, as ray_heap_decay, or -1 inside parallel work.
  *
  * The threshold is fixed policy, reachable only through
  * ray_heap_set_decay_ms: negative disables the decay, 0 releases at the
@@ -283,6 +287,7 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
+int64_t ray_heap_release_now(void);
 /* At a statement boundary: after a statement that spilled (or one that,
  * right after such a relief, needed its room for large blocks), unmap the
  * empty pools of the heaps that did not spill a pool when that makes room

@@ -16,7 +16,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
-| [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
+| [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Run allocator maintenance and return `0`; `(.sys.gc 1)` also releases free pages now, best effort. |
 | [`.sys.env`](#sys-env) | variadic (0–1) | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
@@ -266,11 +266,31 @@ The `-Q` startup flag is the equivalent for enabling logging from launch.
 
 ## `.sys.gc` { #sys-gc }
 
-Signature: `(.sys.gc)`. Runs allocator maintenance: drains cross-thread frees,
+Signature: `(.sys.gc [mode])`. Runs allocator maintenance: drains cross-thread frees,
 flushes slab caches, coalesces free buddy blocks, reclaims empty oversized
 pools, and incrementally returns aged free pages to the operating system.
 Rayforce values remain deterministically reference-counted—this is allocator
 GC, not a tracing object collector. Returns `0`.
+
+`mode` is `0` (the same as no argument) or `1`. `(.sys.gc 1)` also runs the
+ten-second idle decay's sweep now, without waiting for the process to go
+quiet or for free blocks to age, and unmaps the cached large blocks, which
+the decay keeps. A server that a timer or a client keeps busy never goes
+quiet for that long, so this is how it gives back a peak it has finished
+with; the next use of that memory faults the released pages in again. It is
+best effort, not a promise that every free page leaves the process: the
+sweep covers the calling thread's heap and the idle workers' heaps, a block
+keeps its first page and one under 8 KiB keeps all of them, a spill pool's
+memory goes back only with the pool, and when resident memory drops is up
+to the operating system. It returns `0`, as `(.sys.gc)` does. Another mode
+is a `domain` error, a non-`i64` a `type` error, and more than one argument
+an `arity` error. See
+[Giving a peak back](../guides/memory.md#giving-a-peak-back).
+
+```lisp
+(.sys.gc)    ; 0
+(.sys.gc 1)  ; 0 — free pages released now, not after an idle spell
+```
 
 ## `.sys.env` { #sys-env }
 
