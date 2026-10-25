@@ -1282,6 +1282,22 @@ ray_t* ray_alter_set_cow_fail(ray_t* original_var, ray_t* cow_result,
     return cow_result ? cow_result : ray_error("oom", NULL);
 }
 
+/* Store one cell for `alter ... set`.  A STR vector holds pool-backed cells
+ * that store_typed_elem cannot write (it returns -1, which the caller used to
+ * drop, so the write was a silent no-op); route it through ray_str_vec_set,
+ * which may hand back a new block.  Returns the vector to keep writing into,
+ * or an error (the caller releases its other references). */
+static ray_t* alter_store_cell(ray_t* var, int64_t i, ray_t* elem) {
+    if (var->type != RAY_STR) {
+        store_typed_elem(var, i, elem);
+        return var;
+    }
+    if (!elem || elem->type != -RAY_STR)
+        return ray_error("type", "alter set: str vector requires str values, got %s",
+                         elem ? ray_type_name(elem->type) : "null");
+    return ray_str_vec_set(var, i, ray_str_ptr(elem), ray_str_len(elem));
+}
+
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
     if (n < 3) return ray_error("domain", "alter: expects at least 3 arguments (var, op, ...), got %lld", (long long)n);
     /* First arg: evaluate to get the symbol */
@@ -1439,7 +1455,9 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
             /* Single index — bounds already validated above. */
             int64_t i = as_i64(idx);
             ray_release(idx);
-            store_typed_elem(var, i, val);
+            ray_t* nv = alter_store_cell(var, i, val);
+            if (RAY_IS_ERR(nv)) { ray_release(val); ray_release(name_sym); return nv; }
+            var = nv;
         } else {
             /* Vector of indices — set each to val.
              * If val is a vector of same length, set pairwise.
@@ -1452,14 +1470,17 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
                 int64_t i = as_i64(ie);
                 if (alloc) ray_release(ie);
                 if (i < 0 || i >= var->len) continue;
+                ray_t* nv;
                 if (val_is_vec) {
                     int va = 0;
                     ray_t* ve = collection_elem(val, k, &va);
-                    store_typed_elem(var, i, ve);
+                    nv = alter_store_cell(var, i, ve);
                     if (va) ray_release(ve);
                 } else {
-                    store_typed_elem(var, i, val);
+                    nv = alter_store_cell(var, i, val);
                 }
+                if (RAY_IS_ERR(nv)) { ray_release(idx); ray_release(val); ray_release(name_sym); return nv; }
+                var = nv;
             }
             ray_release(idx);
         }

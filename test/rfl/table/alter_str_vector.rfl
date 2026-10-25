@@ -1,0 +1,32 @@
+;; (alter 'v set idx values) on a STR vector was a silent no-op: the cell
+;; writer declined STR cells and the caller dropped the failure.
+
+;; index vector with a vector of values
+(set v (take (as 'STR (list "")) 4))
+(alter 'v set [1 3] (as 'STR (list "a" "b"))) -- 'v
+v -- ["" "a" "" "b"]
+
+;; scalar index, long (pooled) string, then overwrite it with a short one
+(alter 'v set 0 "a string that is longer than the inline limit") -- 'v
+(at v 0) -- "a string that is longer than the inline limit"
+(alter 'v set 0 "x") -- 'v
+v -- ["x" "a" "" "b"]
+
+;; a scalar broadcasts over an index vector
+(alter 'v set [0 2] "z") -- 'v
+v -- ["z" "a" "z" "b"]
+
+;; an alias keeps the old value (copy on write)
+(set w v)
+(alter 'v set 1 "q") -- 'v
+w -- ["z" "a" "z" "b"]
+v -- ["z" "q" "z" "b"]
+
+;; a non-string value is rejected and the vector is unchanged
+(alter 'v set 1 5) !- type
+v -- ["z" "q" "z" "b"]
+
+;; other element types still scatter as before
+(set n (til 4))
+(alter 'n set [1 3] [10 30]) -- 'n
+n -- [0 10 2 30]
