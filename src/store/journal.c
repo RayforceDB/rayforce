@@ -306,11 +306,24 @@ ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
     if (!g_journal.fp || g_journal.in_replay) return RAY_OK;
     if (!hdr || !payload || payload_len < 0) return RAY_ERR_DOMAIN;
 
-    if (fwrite(hdr, 1, sizeof(*hdr), g_journal.fp) != sizeof(*hdr))
-        return RAY_ERR_IO;
-    if (payload_len > 0 &&
-        fwrite(payload, 1, (size_t)payload_len, g_journal.fp) != (size_t)payload_len)
-        return RAY_ERR_IO;
+    /* The stream is unbuffered (setvbuf _IONBF at open), so every fwrite is one
+     * write(2).  A frame is header + payload: gather a small frame into one
+     * buffer so it costs one syscall instead of two (the append itself is
+     * ~2-3 us on a local filesystem, i.e. a third of a small sync request).
+     * Large frames keep the two-call path to avoid the copy. */
+    uint8_t frame[2048];
+    if (payload_len >= 0 && (size_t)payload_len <= sizeof(frame) - sizeof(*hdr)) {
+        memcpy(frame, hdr, sizeof(*hdr));
+        if (payload_len > 0) memcpy(frame + sizeof(*hdr), payload, (size_t)payload_len);
+        size_t total = sizeof(*hdr) + (size_t)payload_len;
+        if (fwrite(frame, 1, total, g_journal.fp) != total) return RAY_ERR_IO;
+    } else {
+        if (fwrite(hdr, 1, sizeof(*hdr), g_journal.fp) != sizeof(*hdr))
+            return RAY_ERR_IO;
+        if (payload_len > 0 &&
+            fwrite(payload, 1, (size_t)payload_len, g_journal.fp) != (size_t)payload_len)
+            return RAY_ERR_IO;
+    }
 
     if (g_journal.mode == RAY_JOURNAL_SYNC) {
         if (fflush(g_journal.fp) != 0) return RAY_ERR_IO;
