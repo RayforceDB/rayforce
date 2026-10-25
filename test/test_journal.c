@@ -2128,34 +2128,44 @@ static test_result_t test_ops_write_auto_journal_eval_scope(void) {
     char base[256]; make_base(base, sizeof(base), "ops_auto_scope");
 
     TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-    TEST_ASSERT_FALSE(ray_ipc_auto_journal_eval());
 
-    bool outer = ray_ipc_set_auto_journal_eval(true);
-    TEST_ASSERT_FALSE(outer);
-    TEST_ASSERT_TRUE(ray_ipc_auto_journal_eval());
+    /* The flag is thread-local state the fixture teardown does not reset:
+     * collect every observation, restore the previous scope and release what
+     * the test owns, and only then assert. */
+    bool before = ray_ipc_auto_journal_eval();
+    bool outer  = ray_ipc_set_auto_journal_eval(true);
+    bool in_scope = ray_ipc_auto_journal_eval();
 
     ray_t* expr = ray_i64(42);
-    TEST_ASSERT_NOT_NULL(expr);
-    ray_t* r = ray_log_write_fn(expr);
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
-    ray_error_free(r);
+    ray_t* r_in = expr ? ray_log_write_fn(expr) : NULL;
+    bool in_is_err = r_in && RAY_IS_ERR(r_in);
+    bool in_code_domain = in_is_err && strcmp(ray_err_code(r_in), "domain") == 0;
 
     /* nested: the inner scope sees true and restores true */
     bool inner = ray_ipc_set_auto_journal_eval(true);
-    TEST_ASSERT_TRUE(inner);
     ray_ipc_set_auto_journal_eval(inner);
-    TEST_ASSERT_TRUE(ray_ipc_auto_journal_eval());
+    bool after_nested = ray_ipc_auto_journal_eval();
 
     ray_ipc_set_auto_journal_eval(outer);
-    TEST_ASSERT_FALSE(ray_ipc_auto_journal_eval());
-    r = ray_log_write_fn(expr);           /* outside the scope the write is accepted */
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    ray_release(r);
-    ray_release(expr);
+    bool after_restore = ray_ipc_auto_journal_eval();
+    ray_t* r_out = expr ? ray_log_write_fn(expr) : NULL;   /* outside the scope the write is accepted */
+    bool out_ok = r_out && !RAY_IS_ERR(r_out);
+
+    if (r_in) { if (RAY_IS_ERR(r_in)) ray_error_free(r_in); else ray_release(r_in); }
+    if (r_out) { if (RAY_IS_ERR(r_out)) ray_error_free(r_out); else ray_release(r_out); }
+    if (expr) ray_release(expr);
     ray_journal_close();
+    cleanup_base(base);
+
+    TEST_ASSERT_FALSE(before);
+    TEST_ASSERT_FALSE(outer);
+    TEST_ASSERT_TRUE(in_scope);
+    TEST_ASSERT_TRUE(in_is_err);
+    TEST_ASSERT_TRUE(in_code_domain);
+    TEST_ASSERT_TRUE(inner);
+    TEST_ASSERT_TRUE(after_nested);
+    TEST_ASSERT_FALSE(after_restore);
+    TEST_ASSERT_TRUE(out_ok);
     PASS();
 }
 
