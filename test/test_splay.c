@@ -3332,7 +3332,7 @@ static test_result_t test_per_column_symfiles(void) {
         snprintf(pb, sizeof pb, "%s/.b.sym", dir);
         snprintf(pn, sizeof pn, "%s/.n.sym", dir);
         TEST_ASSERT_EQ_I(ray_splay_save_layout(t, dir, shared, gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF,
-                                               RAY_SYMFILE_COLUMN), RAY_OK);
+                                               RAY_SYMFILE_COLUMN, true), RAY_OK);
         struct stat st;
         TEST_ASSERT_TRUE(stat(shared, &st) != 0);            /* no shared symfile */
         TEST_ASSERT_TRUE(stat(pn, &st) != 0);                /* none for a non-SYM column */
