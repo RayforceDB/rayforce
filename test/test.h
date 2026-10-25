@@ -56,6 +56,8 @@ int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
  * and valid for the life of the process.  .rfl files get the same rewrite
  * when they are read.  Call it from the test thread only. */
 const char* ray_test_tmp(const char* s);
+/* Immutable startup snapshot; later fixture environment changes do not move it. */
+const char* ray_test_tmp_root(void);
 
 /* Disarm every global store / decode / bind test hook and clear a pending
  * interrupt request.  Teardowns of suites that arm hooks call it, so a test
