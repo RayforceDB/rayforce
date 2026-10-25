@@ -63,7 +63,9 @@ ASan/UBSan are enabled by the default test build.
 
 Set `TMPDIR` to an existing disk-backed directory before building/running.
 The test driver now places its isolated per-process scratch root there;
-its existing scratch-path regression covers the selected root.
+its scratch-path regressions cover the selected root and later TMPDIR
+mutation. Affected splay/compression fixtures format logical paths before
+translation, avoiding short buffers that truncate long startup roots.
 
 ## Limits of the proof
 

@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include "test.h"
 #include "table/table.h"
 #include "vec/vec.h"
@@ -168,10 +169,7 @@ static test_result_t test_cols_inplace_plain(void) {
  * Rayfall or shell line, the bare root; an already-moved path and a path
  * that merely contains "/tmp" elsewhere are left alone.  The root exists. */
 static test_result_t test_tmp_paths_per_process(void) {
-    char root[4096];
-    const char* base = getenv("TMPDIR");
-    if (!base || !*base) base = "/tmp";
-    snprintf(root, sizeof root, "%s/rayforce_t.%ld", base, (long)getpid());
+    const char* root = ray_test_tmp_root();
     char want[12544];
     snprintf(want, sizeof want, "%s/rayforce_x/a", root);
     /* Compare complete paths, but keep diagnostics independent of their
@@ -187,6 +185,26 @@ static test_result_t test_tmp_paths_per_process(void) {
     TEST_ASSERT_TRUE(ray_test_tmp("/tmp/rayforce_x/a") == ray_test_tmp("/tmp/rayforce_x/a"));
     struct stat st;
     TEST_ASSERT_TRUE(stat(root, &st) == 0 && S_ISDIR(st.st_mode));
+    PASS();
+}
+
+/* Model an earlier fixture unsetting TMPDIR in the same test process. */
+static test_result_t test_tmp_root_environment_change(void) {
+    const char* expected = ray_test_tmp("/tmp");
+    const char* previous = getenv("TMPDIR");
+    char* saved = NULL;
+    if (previous) {
+        size_t n = strlen(previous) + 1;
+        saved = malloc(n);
+        TEST_ASSERT_NOT_NULL(saved);
+        memcpy(saved, previous, n);
+    }
+    unsetenv("TMPDIR");
+    const char* root = ray_test_tmp_root();
+    bool stable = root && strcmp(root, expected) == 0;
+    if (saved) setenv("TMPDIR", saved, 1); else unsetenv("TMPDIR");
+    free(saved);
+    TEST_ASSERT(stable, "scratch root remains the startup snapshot");
     PASS();
 }
 
@@ -528,6 +546,7 @@ const test_entry_t srccheck_entries[] = {
     { "srccheck/materializer_attach", test_materializer_attach, NULL, NULL },
     { "srccheck/cols_inplace_plain", test_cols_inplace_plain, NULL, NULL },
     { "srccheck/tmp_paths_per_process", test_tmp_paths_per_process, NULL, NULL },
+    { "srccheck/tmp_root_environment_change", test_tmp_root_environment_change, NULL, NULL },
     { "srccheck/plain_requests_marked",      test_plain_requests_marked,      NULL, NULL },
     { "srccheck/plain_marker_forms",         test_plain_marker_forms,         NULL, NULL },
     { "srccheck/no_table_decode_or_return",  test_no_table_decode_or_return,  NULL, NULL },
