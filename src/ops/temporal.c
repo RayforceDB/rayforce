@@ -912,19 +912,16 @@ ray_t* ray_date_clock_fn(ray_t* arg) {
     struct tm* t = local ? localtime(&now) : gmtime(&now);
     if (!t) return ray_error("domain", "date: failed to get current time");
 
-    /* Reconstruct midnight of today */
-    struct tm day = *t;
-    day.tm_hour = 0; day.tm_min = 0; day.tm_sec = 0; day.tm_isdst = -1;
-    time_t day_time = mktime(&day);
-
-    /* For UTC (global), mktime interprets as local — adjust via difference */
+    /* Local: read the broken-down local fields as if they were UTC
+     * (timegm), so the day count is the local calendar day.  mktime would
+     * give the UTC instant of local midnight, one day early east of UTC. */
     if (!local) {
-        /* Use a simpler approach: total days from epoch */
         int32_t days = (int32_t)((now - ray_epoch_offset()) / 86400);
         return ray_date((int64_t)days);
     }
-
-    /* Local: days since the rayforce epoch, in local time sense */
+    struct tm day = *t;
+    day.tm_hour = 0; day.tm_min = 0; day.tm_sec = 0; day.tm_isdst = 0;
+    time_t day_time = timegm(&day);
     int32_t days = (int32_t)((day_time - ray_epoch_offset()) / 86400);
     return ray_date((int64_t)days);
 }
@@ -957,9 +954,11 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
     if (!local)
         return ray_timestamp(ray_timestamp_now_ns());
 
-    /* For local, compute offset from rayforce epoch in local terms */
+    /* Local wall clock as a timestamp: the broken-down local fields read
+     * as UTC (timegm).  mktime converts them straight back to the same
+     * instant, which made 'local equal to 'global. */
     struct tm lt = *t;
-    lt.tm_isdst = -1;
-    int64_t secs = mktime(&lt) - ray_epoch_offset();
+    lt.tm_isdst = 0;
+    int64_t secs = (int64_t)timegm(&lt) - ray_epoch_offset();
     return ray_timestamp(secs * 1000000000LL);
 }
