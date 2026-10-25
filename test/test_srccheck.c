@@ -174,10 +174,15 @@ static test_result_t test_tmp_paths_per_process(void) {
     snprintf(root, sizeof root, "%s/rayforce_t.%ld", base, (long)getpid());
     char want[12544];
     snprintf(want, sizeof want, "%s/rayforce_x/a", root);
-    TEST_ASSERT_STR_EQ(ray_test_tmp("/tmp/rayforce_x/a"), want);
-    TEST_ASSERT_STR_EQ(ray_test_tmp(want), want);
+    /* Compare complete paths, but keep diagnostics independent of their
+     * potentially large length (GCC -Werror=format-truncation). */
+    TEST_ASSERT(strcmp(ray_test_tmp("/tmp/rayforce_x/a"), want) == 0,
+                "plain path moved under selected scratch root");
+    TEST_ASSERT(strcmp(ray_test_tmp(want), want) == 0,
+                "already-moved path unchanged");
     snprintf(want, sizeof want, "(.db.splayed.set \"%s/t\" T) rm -rf %s/u; cd %s", root, root, root);
-    TEST_ASSERT_STR_EQ(ray_test_tmp("(.db.splayed.set \"/tmp/t\" T) rm -rf /tmp/u; cd /tmp"), want);
+    TEST_ASSERT(strcmp(ray_test_tmp("(.db.splayed.set \"/tmp/t\" T) rm -rf /tmp/u; cd /tmp"), want) == 0,
+                "embedded paths moved under selected scratch root");
     TEST_ASSERT_STR_EQ(ray_test_tmp("/var/tmp/x /tmpx rf_tmp/y"), "/var/tmp/x /tmpx rf_tmp/y");
     TEST_ASSERT_TRUE(ray_test_tmp("/tmp/rayforce_x/a") == ray_test_tmp("/tmp/rayforce_x/a"));
     struct stat st;
