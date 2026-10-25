@@ -305,12 +305,7 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     uint8_t attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
     uint32_t sc = w->type == RAY_SYM ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
     if (err == RAY_OK) err = ray_encw_begin(&ew, f, w->type, attrs, w->rows, sc, ik, 0);
-    for (int64_t c = 0; err == RAY_OK && c < ew.n_chunks; c++) {
-        if (ray_interrupted()) { err = RAY_ERR_CANCEL; break; }
-        int64_t n = w->rows - c * RAY_ENC_CHUNK;
-        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
-        err = ray_encw_chunk(&ew, data + (size_t)c * RAY_ENC_CHUNK * esz, pool, n);
-    }
+    if (err == RAY_OK) err = ray_encw_chunks(&ew, data, esz, pool);
     if (err == RAY_OK) err = ray_encw_finish(&ew);
     ray_encw_free(&ew);
     ray_vm_unmap_file(m, msz);

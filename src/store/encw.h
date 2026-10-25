@@ -130,6 +130,13 @@ typedef struct {
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
 ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
+/* Every chunk not yet written, of a column whose rows lie contiguously at
+ * `data` (row i at data + i * esz): the file is byte for byte what
+ * ray_encw_chunk chunk by chunk writes.  Chunk 0 trains on the caller; the
+ * rest encode on the pool when a dispatch is possible (not from inside one),
+ * serially otherwise.  STR stays serial: its STR_DICT entries and DICT index
+ * follow row order. */
+ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool);
 ray_err_t ray_encw_finish(ray_encw_t* w);
 void      ray_encw_free(ray_encw_t* w);
 /* Write s's index as the region (index_kind = the root's kind).  A writer

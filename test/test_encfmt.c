@@ -31,6 +31,8 @@
 #include "store/stream.h"
 #include "vec/str.h"
 #include "ops/idxop.h"
+#include "core/pool.h"
+#include "ops/ops.h"         /* ray_cancel */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1349,6 +1351,102 @@ static test_result_t test_save_io_failure(void) {
     PASS();
 }
 
+/* One column file, chunk by chunk (ray_encw_chunk) or with ray_encw_chunks. */
+static ray_err_t encw_file(const char* path, int8_t type, uint8_t attrs, const void* data,
+                           size_t esz, int64_t len, uint32_t sc, bool par) {
+    FILE* f = fopen(path, "wb+");
+    if (!f) return RAY_ERR_IO;
+    ray_encw_t w;
+    ray_err_t e = ray_encw_begin(&w, f, type, attrs, len, sc, 0, 0);
+    if (e == RAY_OK && par) e = ray_encw_chunks(&w, data, esz, NULL);
+    for (int64_t c = 0; e == RAY_OK && !par && c < w.n_chunks; c++) {
+        int64_t n = len - c * RAY_ENC_CHUNK;
+        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+        e = ray_encw_chunk(&w, (const char*)data + (size_t)c * RAY_ENC_CHUNK * esz, NULL, n);
+    }
+    if (e == RAY_OK) e = ray_encw_finish(&w);
+    ray_encw_free(&w);
+    if (fclose(f) != 0 && e == RAY_OK) e = RAY_ERR_IO;
+    return e;
+}
+
+/* ray_encw_chunks writes the bytes ray_encw_chunk writes, at 1, 2 and 4
+ * workers: I64 with a VALUE_DICT trained on chunk 0, nulls and a wide
+ * chunk; F64 with ALP and NaN nulls; SYM.  Five chunks and a short tail:
+ * one worker encodes serially, two fill a batch of slots and a partial one
+ * follows, four take them all in one partial batch. */
+static test_result_t test_chunks_core_count(void) {
+    enum { N = 5 * RAY_ENC_CHUNK + 1234 };
+    int64_t* i64 = malloc(N * sizeof *i64);
+    double* f64 = malloc(N * sizeof *f64);
+    uint32_t* sym = malloc(N * sizeof *sym);
+    TEST_ASSERT_TRUE(i64 && f64 && sym);
+    for (int64_t i = 0; i < N; i++) {
+        int64_t c = i / RAY_ENC_CHUNK;
+        i64[i] = c == 4 ? (int64_t)((uint64_t)i * 2654435761u) : (i / 7) % 50;
+        if (c == 3 && i % 1000 == 0) i64[i] = NULL_I64;
+        f64[i] = (double)(i % 1000) / 100.0;
+        if (c == 5 && i % 777 == 0) f64[i] = NULL_F64;
+        sym[i] = 1 + (uint32_t)(((uint64_t)i * 2654435761u) % 5000);
+    }
+    const struct { const char* name; int8_t type; uint8_t attrs; const void* data; size_t esz; uint32_t sc; } col[3] = {
+        { "i64", RAY_I64, 0, i64, 8, 0 },
+        { "f64", RAY_F64, 0, f64, 8, 0 },
+        { "sym", RAY_SYM, RAY_SYM_W32, sym, 4, 6000 },
+    };
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    static const uint32_t ws[3] = { 1, 2, 4 };
+    bool ok = true, same = true;
+    char path[512];
+    for (int k = 0; k < 3 && ok; k++) {
+        snprintf(path, sizeof path, "%s/%s.ref", ray_test_tmp(ENCFMT_TMP), col[k].name);
+        ok = encw_file(path, col[k].type, col[k].attrs, col[k].data, col[k].esz, N, col[k].sc, false) == RAY_OK;
+        size_t nr = 0; uint8_t* ref = ok ? read_file(path, &nr) : NULL;
+        ok = ok && ref;
+        for (int w = 0; w < 3 && ok; w++) {
+            ray_pool_destroy();
+            if (ray_pool_init_total(ws[w]) != RAY_OK) { ok = false; break; }
+            snprintf(path, sizeof path, "%s/%s.par", ray_test_tmp(ENCFMT_TMP), col[k].name);
+            ok = encw_file(path, col[k].type, col[k].attrs, col[k].data, col[k].esz, N, col[k].sc, true) == RAY_OK;
+            size_t np = 0; uint8_t* par = ok ? read_file(path, &np) : NULL;
+            ok = ok && par;
+            if (ok && (np != nr || memcmp(par, ref, nr) != 0)) same = false;
+            free(par);
+        }
+        free(ref);
+    }
+    ray_pool_destroy();
+    ray_err_t back = ray_pool_init_total(cores);
+    free(i64); free(f64); free(sym);
+    TEST_ASSERT_EQ_I(back, RAY_OK);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
+/* A cancelled dispatch skips the chunk tasks: ray_encw_chunks fails with
+ * RAY_ERR_CANCEL instead of writing the slots they never filled. */
+static test_result_t test_chunks_cancelled(void) {
+    enum { N = 3 * RAY_ENC_CHUNK };
+    int64_t* d = malloc(N * sizeof *d);
+    TEST_ASSERT_NOT_NULL(d);
+    for (int64_t i = 0; i < N; i++) d[i] = i % 977;
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    ray_err_t init = ray_pool_init_total(4);
+    ray_cancel();
+    ray_err_t e = init == RAY_OK
+        ? encw_file(ray_test_tmp(ENCFMT_TMP "/cancel"), RAY_I64, 0, d, 8, N, 0, true) : RAY_OK;
+    ray_cancel_reset();
+    ray_pool_destroy();
+    ray_err_t back = ray_pool_init_total(cores);
+    free(d);
+    TEST_ASSERT_EQ_I(init, RAY_OK);
+    TEST_ASSERT_EQ_I(back, RAY_OK);
+    TEST_ASSERT_EQ_I(e, RAY_ERR_CANCEL);
+    PASS();
+}
+
 const test_entry_t encfmt_entries[] = {
     { "encfmt/discriminator_pairs",       test_discriminator_pairs,       encfmt_setup, encfmt_teardown },
     { "encfmt/discriminator_cross_pairs", test_discriminator_cross_pairs, encfmt_setup, encfmt_teardown },
@@ -1389,5 +1487,7 @@ const test_entry_t encfmt_entries[] = {
     { "encfmt/golden_emit",               test_golden_emit,               encfmt_setup, encfmt_teardown },
     { "encfmt/golden_match",              test_golden_match,              encfmt_setup, encfmt_teardown },
     { "encfmt/golden_stream", test_golden_stream, encfmt_setup, encfmt_teardown },
+    { "encfmt/chunks_core_count",         test_chunks_core_count,         encfmt_setup, encfmt_teardown },
+    { "encfmt/chunks_cancelled",          test_chunks_cancelled,          encfmt_setup, encfmt_teardown },
     { NULL, NULL, NULL, NULL },
 };

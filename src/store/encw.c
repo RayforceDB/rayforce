@@ -27,6 +27,7 @@
 #include "ops/hash.h"     /* ray_hash_bytes */
 #include "store/col.h"       /* COL_DISK_ATTRS_MASK */
 #include "core/platform.h"   /* ray_vm_map_anon */
+#include "core/pool.h"
 #include <stdatomic.h>
 #include <string.h>
 
@@ -736,6 +737,105 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
     if ((err = fput(w, w->chunk.p, w->chunk.len)) != RAY_OK) return err;
     w->chunk_i++;
     return RAY_OK;
+}
+
+/* ray_encw_chunks: the chunks after the first encode side by side.  Each
+ * task works on a slot: a shallow copy of the writer, so the structures
+ * chunk 0 trained (VALUE_DICT, ALP candidates) are shared read-only, with
+ * the slot's own chunk buffer and vector and its own accumulators, which
+ * the caller folds in chunk order. */
+#define ENCW_SLOTS_PER_WORKER 2
+
+typedef struct {
+    ray_encw_t       w;
+    ray_enc_dirent_t de;
+    ray_err_t        err;
+} encw_slot_t;
+
+typedef struct {
+    encw_slot_t* slot;
+    const char*  data;
+    const char*  pool;
+    size_t       esz;
+    int64_t      first;     /* chunk of slot 0 */
+    int64_t      len;
+} encw_par_t;
+
+static void encw_par_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    encw_par_t* x = (encw_par_t*)raw;
+    for (int64_t i = start; i < end; i++) {
+        int64_t c = x->first + i, n = x->len - c * RAY_ENC_CHUNK;
+        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+        encw_slot_t* s = &x->slot[i];
+        s->err = encw_chunk_body(&s->w, x->data + (size_t)c * RAY_ENC_CHUNK * x->esz, x->pool, n, &s->de);
+    }
+}
+
+static ray_err_t encw_next_serial(ray_encw_t* w, const char* d, size_t esz, const char* str_pool) {
+    if (ray_interrupted()) return RAY_ERR_CANCEL;
+    int64_t n = w->len - w->chunk_i * RAY_ENC_CHUNK;
+    if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+    return ray_encw_chunk(w, d + (size_t)w->chunk_i * RAY_ENC_CHUNK * esz, str_pool, n);
+}
+
+ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool) {
+    const char* d = (const char*)data;
+    ray_err_t err = RAY_OK;
+    /* chunk 0 trains the column's structures; STR's STR_DICT accumulator
+     * and DICT index take entries in row order, so STR stays serial */
+    while (err == RAY_OK && w->chunk_i < w->n_chunks && (w->chunk_i == 0 || w->type == RAY_STR))
+        err = encw_next_serial(w, d, esz, str_pool);
+    if (err != RAY_OK || w->chunk_i >= w->n_chunks) return err;
+    ray_pool_t* pool = ray_pool_get();
+    int64_t left = w->n_chunks - w->chunk_i;
+    int64_t nslot = pool ? (int64_t)ray_pool_total_workers(pool) * ENCW_SLOTS_PER_WORKER : 0;
+    if (nslot > left) nslot = left;
+    encw_slot_t* slot = ray_pool_par_dispatch_ok(pool, left, 2)
+                      ? ray_calloc_raw((size_t)nslot * sizeof *slot) : NULL;
+    if (!slot) {                                    /* serial: no pool, nested, or no memory */
+        while (err == RAY_OK && w->chunk_i < w->n_chunks) err = encw_next_serial(w, d, esz, str_pool);
+        return err;
+    }
+    encw_par_t x = { slot, d, str_pool, esz, 0, w->len };
+    while (err == RAY_OK && w->chunk_i < w->n_chunks) {
+        if (ray_interrupted()) { err = RAY_ERR_CANCEL; break; }
+        int64_t nb = w->n_chunks - w->chunk_i;
+        if (nb > nslot) nb = nslot;
+        for (int64_t i = 0; i < nb; i++) {
+            ray_enc_buf_t chunk = slot[i].w.chunk;
+            ray_encw_vec_t vec = slot[i].w.vec;
+            slot[i].w = *w;
+            slot[i].w.chunk = chunk; slot[i].w.vec = vec;
+            slot[i].w.dict_used = slot[i].w.any_bitmap_null = slot[i].w.fsst_used = false;
+            slot[i].w.str_occ_bytes = slot[i].w.str_pool_bytes = 0;
+            slot[i].err = RAY_ERR_CANCEL;           /* a task a cancel skips keeps it */
+        }
+        x.first = w->chunk_i;
+        ray_pool_dispatch_n(pool, encw_par_task, &x, (uint32_t)nb);
+        if (ray_interrupted()) { err = RAY_ERR_CANCEL; break; }
+        for (int64_t i = 0; i < nb && err == RAY_OK; i++) {
+            const ray_encw_t* s = &slot[i].w;
+            if ((err = slot[i].err) != RAY_OK) break;
+            w->dict_used |= s->dict_used;
+            w->any_bitmap_null |= s->any_bitmap_null;
+            w->fsst_used |= s->fsst_used;
+            w->str_occ_bytes += s->str_occ_bytes;
+            if (w->str_occ_bytes > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+            w->str_pool_bytes += s->str_pool_bytes;
+            ray_enc_dirent_t* de = &w->dir[w->chunk_i];
+            *de = slot[i].de;
+            de->offset = w->pos;
+            if ((err = fput(w, s->chunk.p, s->chunk.len)) != RAY_OK) break;
+            w->chunk_i++;
+        }
+    }
+    for (int64_t i = 0; i < nslot; i++) {
+        ray_enc_buf_free(&slot[i].w.chunk);
+        ray_encw_vec_free(&slot[i].w.vec);
+    }
+    ray_free_raw(slot);
+    return err;
 }
 
 /* The persisted attrs of the column: the source's disk attrs, HAS_NULLS
