@@ -6,9 +6,11 @@
 ;; what actually matters here.)
 ;; .sys.gc returns 0 on success — doubles as a binding-exists probe.
 ;; Registered as variadic so the zero-argument call remains valid while
-;; the implementation can reject unexpected arguments explicitly.
+;; the implementation checks its one optional argument, a mode
+;; (test/rfl/mem/gc_release_now.rfl).
 (.sys.gc) -- 0
-(.sys.gc 0) !- arity
+(.sys.gc 0) -- 0
+(.sys.gc 0 0) !- arity
 (count (.sys.info)) -- 6
 (count (.sys.mem)) -- 21
 (count (.sys.build)) -- 2

@@ -7364,6 +7364,22 @@ static test_result_t test_parted_missing_symfile(void) {
     PASS();
 }
 
+/* A shared symbol file named "sym" (no dot) is not read.  The error must
+ * name the real file, "<root>/.sym", not the "sym" it never looks for. */
+static test_result_t test_parted_symfile_name_in_error(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* src = parted_symbol_part("aa");
+    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
+                                    TMP_PARTED_ROOT "/sym"), RAY_OK);
+    ray_release(src);
+    ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_ERR_CODE_MSG(view, "sym", "<dir>/.sym");
+    ray_error_free(view);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
 /* Same inode, size and mtime: a copied LIST payload must still reload.
  * Numeric mmap payloads alone cannot detect a bad cache hit here because
  * an in-place write is already visible through the old mapping. */
@@ -8347,6 +8363,7 @@ const test_entry_t store_entries[] = {
     { "store/parted_rebuilt_without_gc", test_parted_rebuilt_without_gc, store_setup, store_teardown },
     { "store/parted_rebuilt_symbols", test_parted_rebuilt_symbols, store_setup, store_teardown },
     { "store/parted_missing_symfile", test_parted_missing_symfile, store_setup, store_teardown },
+    { "store/parted_symfile_name_in_error", test_parted_symfile_name_in_error, store_setup, store_teardown },
     { "store/parted_restored_mtime", test_parted_restored_mtime, store_setup, store_teardown },
     { "store/parted_generation_and_sweep", test_parted_generation_and_sweep, store_setup, store_teardown },
     { "store/parted_concurrent_mounts", test_parted_concurrent_mounts, store_setup, store_teardown },
