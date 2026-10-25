@@ -1014,6 +1014,8 @@ static char* tmp_strdup(const char* s) {
     return memcpy(d, s, n);
 }
 
+const char* ray_test_tmp_root(void) { return g_tmp_root; }
+
 const char* ray_test_tmp(const char* s) {
     if (!s) return s;
     if (g_tmp_n * 2 >= g_tmp_cap) {

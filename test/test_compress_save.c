@@ -3930,7 +3930,8 @@ static test_result_t test_dml_parted_gen2(void) {
     };
     int64_t want[sizeof qs / sizeof *qs];
     for (int m = 0; m < 3; m++) {
-        char dir[64]; snprintf(dir, sizeof dir, ray_test_tmp(CS_TMP "/dp%d"), m);
+        char logical[64]; snprintf(logical, sizeof logical, CS_TMP "/dp%d", m);
+        const char* dir = ray_test_tmp(logical);
         ray_t* t = pdb_make(dir, masks[m], false);
         TEST_ASSERT_NOT_NULL(t);
         if (m) TEST_ASSERT_TRUE(ray_table_get_col_enc(t, ray_sym_intern("a", 1)) != NULL);
@@ -3994,7 +3995,8 @@ static test_result_t test_join_sites_parted(void) {
     for (int64_t i = 0; i < 3000; i++) { pv[i] = 5 * i + (i % 3); cv[i] = i; }
     ray_t* P = t29_plain("b", pv, "c", cv, 3000);
     for (int m = 0; m < 2; m++) {
-        char dir[64]; snprintf(dir, sizeof dir, ray_test_tmp(CS_TMP "/jp%d"), m + 1);
+        char logical[64]; snprintf(logical, sizeof logical, CS_TMP "/jp%d", m + 1);
+        const char* dir = ray_test_tmp(logical);
         ray_t* tm = pdb_make(dir, masks[m], false);
         TEST_ASSERT_NOT_NULL(tm);
         for (int c = 0; c < 6; c++) {
