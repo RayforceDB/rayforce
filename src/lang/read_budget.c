@@ -23,7 +23,7 @@ bool ray_read_budget_init(ray_read_budget_t* b, size_t limit) {
 }
 
 static bool reserve(ray_read_budget_t* b, size_t charge) {
-    if (b->status != RAY_READ_OK) return false;
+    if (b->closed || b->status != RAY_READ_OK) return false;
     if (b->live > b->limit || charge > b->limit - b->live) {
         b->status = RAY_READ_LIMIT;
         return false;
@@ -40,7 +40,7 @@ static bool acquire_fails(ray_read_budget_t* b) {
 }
 
 static read_record_t* slot(ray_read_budget_t* b) {
-    if (b->status != RAY_READ_OK) return NULL;
+    if (b->closed || b->status != RAY_READ_OK) return NULL;
     for (ray_read_records_t* c = b->records; c; c = c->next)
         for (size_t i = 0; i < READ_RECORDS; i++)
             if (!c->entries[i].ptr) return &c->entries[i];
@@ -89,6 +89,10 @@ static void remove_record(ray_read_budget_t* b, void* p, bool sys, bool transfer
             read_record_t* r = &c->entries[i];
             if (r->ptr != p || r->sys != sys) continue;
             if (!transfer) {
+                /* A parent or external alias can keep this block alive.
+                 * Keep our ledger ref AND its charge until uniquely owned.
+                 * Closing the scope is the only unconditional release. */
+                if (!sys && ray_atomic_load(&((ray_t*)p)->rc) != 1) return;
                 if (sys) ray_sys_free(p); else ray_release(p);
             }
             b->live -= r->charge;
@@ -104,6 +108,8 @@ void ray_read_sys_transfer(ray_read_budget_t* b, void* p) { remove_record(b, p, 
 void ray_read_release(ray_read_budget_t* b, ray_t* p) { remove_record(b, p, false, false); }
 
 void ray_read_budget_close(ray_read_budget_t* b) {
+    /* Teardown refunds all charges, so no later/reentrant admission is valid. */
+    b->closed = true; /* Preserve the original failure status for diagnostics. */
     ray_read_records_t* c = b->records;
     while (c) {
         ray_read_records_t* next = c->next;

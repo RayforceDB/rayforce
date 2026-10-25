@@ -13,6 +13,14 @@ ownership to the caller. Nested string buffers and LIST child references use
 the normal refcount rules. Closing after any injected failure releases all
 context-owned references and system buffers.
 
+Early `ray_read_release` is conservative: if another reference exists, keep
+both the context's ledger reference and its charge. A LIST retaining a child
+must not make that child's memory disappear from admission accounting. Release
+can be retried after parents/aliases are dropped. Scope close is terminal:
+it unconditionally drops the ledger references and rejects further admission.
+Only explicit output-root retention followed by close transfers the result
+out of the reader scope.
+
 The first constructors are byte strings, I64 vectors (including null flags)
 and generic LISTs. They are narrow construction paths whose nested allocations
 are visible to the context. Other constructors must not be called inside this
@@ -47,7 +55,9 @@ make test TEST_FILTER=reader_proof
 ```
 
 The allocation cases cover cap-1/cap/cap+1, arithmetic overflow, header charging,
-string-buffer/atom failure positions, real root ownership after context close,
+string-buffer/atom failure positions, retained-child admission with one/multiple
+parent aliases, eventual unique-child reclamation, terminal close, real root
+ownership after context close,
 resize peaks and preservation of ordinary oversized direct-cache reuse.
 ASan/UBSan are enabled by the default test build.
 
