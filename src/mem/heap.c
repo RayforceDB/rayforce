@@ -3737,8 +3737,10 @@ int64_t ray_heap_decay(void) {
  * it: the caller says the memory it freed will not be reused soon.  A server
  * that a timer or a client keeps busy is never idle for the threshold, so
  * without this it keeps its largest working set for the rest of its life.
- * Disarms the decay as a sweep does: until new work, there is nothing more
- * to give back. */
+ * It reaches what the sweep reaches and no more: the caller's heap and the
+ * parked workers' (heap_each_quiescent), and of a free block the pages
+ * heap_release_free_pages may release.  Disarms the decay as a sweep does:
+ * until new work, another sweep has nothing more to give back. */
 int64_t ray_heap_release_now(void) {
     if (atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) != 0)
         return -1;

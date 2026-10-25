@@ -936,9 +936,10 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
 /* (.sys.gc [mode]) -- perform the allocator maintenance pass used by v1:
  * drain foreign frees, flush slab caches, coalesce blocks and release
  * reclaimable pages/pools.  Rayforce values are reference-counted, so this
- * is allocator GC rather than a tracing collector.  Mode 1 also hands back
- * every page the heap holds free, now, as the idle decay would once due
- * (ray_heap_release_now); mode 0 is the same as none.  Returns 0: a count
+ * is allocator GC rather than a tracing collector.  Mode 1 also runs the
+ * idle decay's sweep now, due or not, and drains the direct-block cache
+ * (ray_heap_release_now): best effort, it reaches only the heaps and pages
+ * the sweep does; mode 0 is the same as none.  Returns 0: a count
  * of what went back would mislead, since a block the heap splits, merges or
  * takes back from a parked pool is released anew.  Variadic to allow
  * `(.sys.gc)`. */

@@ -649,7 +649,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 |---|---|---|---|---|
 | `eval` | unary | — | Evaluate a parsed Rayfall expression | `(eval (parse "(+ 1 2)"))` → `3` |
 | `parse` | unary | — | Parse a string into a Rayfall expression tree | `(parse "(+ 1 2)")` |
-| `.sys.gc` | variadic (0–1) | — | Trigger GC / heap flush, returns `0`; mode `1` also hands every free page back now | `(.sys.gc)`, `(.sys.gc 1)` |
+| `.sys.gc` | variadic (0–1) | — | Trigger GC / heap flush, returns `0`; mode `1` also releases free pages now, best effort | `(.sys.gc)`, `(.sys.gc 1)` |
 | `.mem.objsize` | unary | — | Logical bytes retained by an object graph; shared children count once | `(.mem.objsize value)` |
 | `.mem.ts` | special form | — | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict | `(.mem.ts (select {from: trades}))` |
 | `.sys.exec` | variadic | restricted | Execute a shell command; exit code, or `{code, out}` with `'out` | `(.sys.exec "ls -la" 'out)` |
