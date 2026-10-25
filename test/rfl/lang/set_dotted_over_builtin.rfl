@@ -1,0 +1,14 @@
+;; (set rc.x 1) raised `type`: `rc` is a builtin, and the dotted write took
+;; the function for a non-dict value.  A plain (set rc 7) shadows a builtin,
+;; so a dotted write creates the namespace the same way.
+(set rc.x 1) -- 1
+rc.x -- 1
+(type rc) -- 'DICT
+(set rc.y.z 2) -- 2
+rc.y.z -- 2
+(count rc) -- 2
+
+;; a name bound to a non-dict value is still refused
+(set held 5)
+(set held.x 1) !- type
+held -- 5

@@ -968,6 +968,12 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
      * non-dict intermediate is an error. */
     ray_t* parents[256];
     parents[0] = base_lookup(segs[0]);
+    /* A builtin is not a value the user bound: a plain (set rc 7) shadows
+     * it, so (set rc.x 1) creates the namespace the same way instead of
+     * failing on the function it would shadow. */
+    if (parents[0] && (parents[0]->type == RAY_UNARY || parents[0]->type == RAY_BINARY ||
+                       parents[0]->type == RAY_VARY))
+        parents[0] = NULL;
     if (parents[0] && parents[0]->type != RAY_DICT)
         return RAY_ERR_TYPE;
 
