@@ -525,6 +525,68 @@ static test_result_t test_idle_decay_respects_threshold(void) {
     PASS();
 }
 
+/* An explicit release does not wait for the decay: with work just stamped
+ * and the threshold far off, the decay does nothing, and ray_heap_release_now
+ * hands the same block back at once — what (.sys.gc 1) is for, a server that
+ * a timer keeps from ever going idle.  It disarms the decay as a sweep does. */
+static test_result_t test_release_now_ignores_threshold(void) {
+    ray_heap_set_decay_ms(600000);
+
+    const size_t big = (16u << 20) - 4096;
+    ray_t* v = ray_alloc(big);
+    if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
+    memset(ray_data(v), 0xA5, big);
+    size_t rss_live = heap_rss_kb();
+    ray_free(v);
+
+    ray_heap_note_activity();
+    int64_t decayed = ray_heap_decay();
+    int64_t released = ray_heap_release_now();
+    size_t rss_now = heap_rss_kb();
+    int64_t due = ray_heap_decay_due_ms();
+    ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
+
+    TEST_ASSERT(decayed < 0, "the decay is not due");
+    TEST_ASSERT(released >= 1, "the release handed back at least one block");
+    if (rss_live > 0) {
+        size_t half = (big / 1024) / 2;
+        TEST_ASSERT(rss_now + half < rss_live, "most of the freed block left the resident set");
+    }
+    TEST_ASSERT(due < 0, "the release disarmed the decay");
+
+    /* Released pages refault: the address space is untouched. */
+    ray_t* w = ray_alloc(big);
+    TEST_ASSERT_NOT_NULL(w);
+    memset(ray_data(w), 0x5A, big);
+    ray_free(w);
+    PASS();
+}
+
+/* The idle decay keeps the direct-block cache — freed large blocks, kept
+ * mapped for the next one of their size; an explicit release unmaps them
+ * too, and their committed bytes drop with them. */
+static test_result_t test_release_now_drains_direct_cache(void) {
+    const size_t big = (size_t)64 << 20;   /* past the pool order: direct */
+    ray_heap_direct_cache_drain();
+    int64_t base = ray_heap_anon_committed();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark((int64_t)big * 16 * 4);   /* a cache budget */
+    ray_t* v = ray_alloc(big);
+    if (!v) { ray_heap_set_anon_watermark(previous); SKIP("64 MB block unavailable"); }
+    int64_t map = (int64_t)ray_direct_map_size(v);
+    memset(ray_data(v), 0xA5, 1 << 20);
+    ray_free(v);                           /* to the direct-block cache */
+    bool cached = ray_heap_anon_committed() == base + map;
+
+    (void)ray_heap_release_now();
+    bool drained = ray_heap_anon_committed() == base;
+    ray_heap_set_anon_watermark(previous);
+
+    TEST_ASSERT(cached, "the freed block was kept in the cache");
+    TEST_ASSERT(drained, "the cached block was unmapped");
+    PASS();
+}
+
 /* ---- ray_heap_gc oversized-pool reclamation ---------------------------- *
  *
  * Allocate a block large enough to force a pool > 32 MB (pool_order >
@@ -6284,5 +6346,7 @@ const test_entry_t heap_entries[] = {
     { "heap/scratch_realloc_has_index", test_scratch_realloc_has_index_detach, heap_setup, heap_teardown },
     { "heap/idle_decay_releases",      test_idle_decay_releases_pages,   heap_setup, heap_teardown },
     { "heap/idle_decay_threshold",     test_idle_decay_respects_threshold, heap_setup, heap_teardown },
+    { "heap/release_now_threshold",    test_release_now_ignores_threshold, heap_setup, heap_teardown },
+    { "heap/release_now_direct_cache", test_release_now_drains_direct_cache, heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };
