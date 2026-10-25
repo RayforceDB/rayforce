@@ -64,5 +64,6 @@ or writer/reader acceptance profile is implemented here. Constructor input is
 trusted C data, not source text. A complete reader must add its own grammar and
 symbol staging without general evaluation.
 
-This proof does not implement symbol publication. A future reader must show
-that every fallible result-building step precedes symbol publication.
+Keep this proof separate from the
+[symbol publication proof](symbol-publication-proof.md). A future reader must
+show that every remaining fallible construction step precedes publication.

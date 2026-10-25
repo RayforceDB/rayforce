@@ -235,3 +235,14 @@ void ray_arena_destroy(ray_arena_t* arena) {
     }
     ray_sys_free(arena);
 }
+
+size_t ray_arena_chunk_header_bytes(void) {
+    return ARENA_ALIGN_UP(sizeof(ray_arena_chunk_t));
+}
+
+void ray_arena_adopt_full_chunk(ray_arena_t* arena, void* storage, size_t bytes) {
+    ray_arena_chunk_t* c = storage;
+    c->cap = c->used = bytes - ray_arena_chunk_header_bytes();
+    c->next = arena->chunks;
+    arena->chunks = c;
+}
