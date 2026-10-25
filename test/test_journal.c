@@ -2122,6 +2122,53 @@ static test_result_t test_ops_write_noopen(void) {
     PASS();
 }
 
+/* 22qa. ray_ipc_set_auto_journal_eval: production setter, returns the previous
+ * value so a nested scope restores correctly. */
+static test_result_t test_ops_write_auto_journal_eval_scope(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_auto_scope");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+
+    /* The flag is thread-local state the fixture teardown does not reset:
+     * collect every observation, restore the previous scope and release what
+     * the test owns, and only then assert. */
+    bool before = ray_ipc_auto_journal_eval();
+    bool outer  = ray_ipc_set_auto_journal_eval(true);
+    bool in_scope = ray_ipc_auto_journal_eval();
+
+    ray_t* expr = ray_i64(42);
+    ray_t* r_in = expr ? ray_log_write_fn(expr) : NULL;
+    bool in_is_err = r_in && RAY_IS_ERR(r_in);
+    bool in_code_domain = in_is_err && strcmp(ray_err_code(r_in), "domain") == 0;
+
+    /* nested: the inner scope sees true and restores true */
+    bool inner = ray_ipc_set_auto_journal_eval(true);
+    ray_ipc_set_auto_journal_eval(inner);
+    bool after_nested = ray_ipc_auto_journal_eval();
+
+    ray_ipc_set_auto_journal_eval(outer);
+    bool after_restore = ray_ipc_auto_journal_eval();
+    ray_t* r_out = expr ? ray_log_write_fn(expr) : NULL;   /* outside the scope the write is accepted */
+    bool out_ok = r_out && !RAY_IS_ERR(r_out);
+
+    if (r_in) { if (RAY_IS_ERR(r_in)) ray_error_free(r_in); else ray_release(r_in); }
+    if (r_out) { if (RAY_IS_ERR(r_out)) ray_error_free(r_out); else ray_release(r_out); }
+    if (expr) ray_release(expr);
+    ray_journal_close();
+    cleanup_base(base);
+
+    TEST_ASSERT_FALSE(before);
+    TEST_ASSERT_FALSE(outer);
+    TEST_ASSERT_TRUE(in_scope);
+    TEST_ASSERT_TRUE(in_is_err);
+    TEST_ASSERT_TRUE(in_code_domain);
+    TEST_ASSERT_TRUE(inner);
+    TEST_ASSERT_TRUE(after_nested);
+    TEST_ASSERT_FALSE(after_restore);
+    TEST_ASSERT_TRUE(out_ok);
+    PASS();
+}
+
 /* 22q. ray_log_write_fn: reject explicit writes from auto-journaled IPC eval. */
 static test_result_t test_ops_write_rejects_auto_journal_eval(void) {
     char base[256]; make_base(base, sizeof(base), "ops_auto_eval");
@@ -2790,6 +2837,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
+    { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
     { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },

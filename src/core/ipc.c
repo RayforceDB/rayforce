@@ -283,6 +283,12 @@ bool ray_ipc_auto_journal_eval(void) {
     return g_auto_journal_eval;
 }
 
+bool ray_ipc_set_auto_journal_eval(bool enabled) {
+    bool prev = g_auto_journal_eval;
+    g_auto_journal_eval = enabled;
+    return prev;
+}
+
 #ifdef DEBUG
 void ray_ipc_set_auto_journal_eval_for_test(bool enabled) {
     g_auto_journal_eval = enabled;
@@ -671,8 +677,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     }
 
     ray_t* result = NULL;
-    bool prev_auto_journal_eval = g_auto_journal_eval;
-    if (auto_journaled) g_auto_journal_eval = true;
+    bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
         if (msg->type == RAY_LIST) {
             ray_t** elems = (ray_t**)ray_data(msg);
@@ -721,7 +726,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
             ray_release(msg);
         }
     }
-    g_auto_journal_eval = prev_auto_journal_eval;
+    ray_ipc_set_auto_journal_eval(prev_auto_journal_eval);
     /* A lazy result is an internal deferred-DAG representation that cannot
      * be serialized — force it to a concrete value before it reaches the
      * wire.  The direct ray_eval(msg) path (non-STR payloads, e.g. an
