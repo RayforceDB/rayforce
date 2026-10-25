@@ -39,6 +39,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include <fcntl.h>
 
 /* Forward declarations for lang modules */
@@ -11028,6 +11029,53 @@ static test_result_t test_env_write_index_flags_and_capacity(void) {
     PASS();
 }
 
+/* (date 'local) was one day behind east of UTC and (timestamp 'local) was
+ * identical to (timestamp 'global).  TZ is process-global and the cases run
+ * in one process, so every observation is collected first, TZ is restored
+ * (to unset if it was unset) unconditionally, and only then asserted. */
+static bool eval_is_true(const char* src) {
+    ray_t* r = ray_eval_str(src);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    return ok;
+}
+
+static test_result_t test_clock_local_follows_tz(void) {
+    /* POSIX TZ names: Etc/GMT-14 is UTC+14, Etc/GMT+11 is UTC-11. */
+    static const struct { const char* tz; const char* offset_ns; } zones[] = {
+        { "Etc/GMT-14", "50400000000000" },
+        { "Etc/GMT+11", "-39600000000000" },
+        { "UTC",        "0" },
+    };
+    enum { NZ = 3 };
+    bool off_ok[NZ], date_ok[NZ];
+
+    const char* old = getenv("TZ");
+    char* saved = old ? strdup(old) : NULL;
+    for (int k = 0; k < NZ; k++) {
+        char src[512];
+        setenv("TZ", zones[k].tz, 1);
+        tzset();
+        /* local - global stays within 2 s of the zone offset */
+        snprintf(src, sizeof src,
+            "(< (abs (- (- (as 'I64 (timestamp 'local)) (as 'I64 (timestamp 'global))) %s)) 2000000000)",
+            zones[k].offset_ns);
+        off_ok[k] = eval_is_true(src);
+        /* the local date is the day of the local timestamp */
+        date_ok[k] = eval_is_true(
+            "(== (as 'I64 (date 'local)) (div (as 'I64 (timestamp 'local)) 86400000000000))");
+    }
+    if (saved) setenv("TZ", saved, 1); else unsetenv("TZ");
+    tzset();
+    free(saved);
+
+    for (int k = 0; k < NZ; k++) {
+        TEST_ASSERT_TRUE(off_ok[k]);
+        TEST_ASSERT_TRUE(date_ok[k]);
+    }
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
@@ -11479,6 +11527,7 @@ const test_entry_t lang_entries[] = {
     { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
     { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
     { "lang/closure_heavy_literal_captures", test_closure_heavy_literal_captures, lang_setup, lang_teardown },
+    { "lang/clock_local_follows_tz", test_clock_local_follows_tz, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },
