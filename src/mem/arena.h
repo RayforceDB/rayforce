@@ -72,5 +72,10 @@ void ray_arena_reset(ray_arena_t* arena);
 
 /* Destroy arena — free all backing memory. */
 void ray_arena_destroy(ray_arena_t* arena);
+/* Transactional value publication: caller allocates header+payload with
+ * ray_sys_alloc, fills payload using ray_arena_str_at, then adopts without
+ * allocation. The entire chunk is marked used. Storage ownership transfers. */
+size_t ray_arena_chunk_header_bytes(void);
+void ray_arena_adopt_full_chunk(ray_arena_t* arena, void* storage, size_t bytes);
 
 #endif /* RAY_ARENA_H */
