@@ -213,6 +213,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
       - name: Update tap formula
+        id: update_tap_formula
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         continue-on-error: true
         env:
@@ -236,3 +237,15 @@ jobs:
           git add Formula/rayforce.rb
           git commit -m "rayforce ${VERSION}" || { echo "formula unchanged — nothing to push"; exit 0; }
           git push origin HEAD
+
+      - name: Report failed tap update
+        if: ${{ steps.update_tap_formula.outcome == 'failure' }}
+        continue-on-error: true
+        run: |
+          echo "::warning title=Homebrew tap update failed::The core release job succeeded, but its best-effort Homebrew update failed. Inspect the tap step before claiming the formula advanced."
+          {
+            echo "### Homebrew tap update failed"
+            echo "The core release job succeeded, but the best-effort tap update did not complete successfully."
+            echo "Inspect the Update tap formula log and repair the cause privately; do not print credentials."
+            echo "A green core release does not confirm the Homebrew formula version."
+          } >> "$GITHUB_STEP_SUMMARY"

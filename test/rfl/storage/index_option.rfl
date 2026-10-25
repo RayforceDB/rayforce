@@ -1,0 +1,69 @@
+;; @requires: posix  (cleanup and byte counts run through a POSIX shell via .sys.exec)
+;; .db.splayed.set {index: false} builds none of the indexes a save builds
+;; on its own (a STR column's dictionary, a numeric column's chunk zone), in
+;; generation 0 or 2.  An index the column already carries — one the caller
+;; attached (.idx.hash), or a chunk zone a loaded column brought from its
+;; file — is persisted either way, and the values read back are the same.
+(.sys.exec "rm -rf /tmp/rf_test_idx_opt") -- 0
+(set n 70000)
+(set i (til n))
+(set t (table [s v h] (list (as 'STR (map (fn [j] (format "k%" (% j 977))) i)) (% (* i 7919) 1000003) (.idx.hash (% (* i 31) 70001)))))
+(.db.splayed.set "/tmp/rf_test_idx_opt/a/" t)
+(.db.splayed.set "/tmp/rf_test_idx_opt/b/" t {index: false})
+(set A (.db.splayed.get "/tmp/rf_test_idx_opt/a/"))
+(set B (.db.splayed.get "/tmp/rf_test_idx_opt/b/"))
+;; generation 0: the default builds a dictionary and a chunk zone
+(at (.idx.info (at A 's)) 'kind) -- 'dict
+(at (.idx.info (at A 'v)) 'kind) -- 'chunk_zone
+(at (.idx.info (at A 'h)) 'kind) -- 'hash
+;; index false: neither, the explicit hash still
+(nil? (.idx.info (at B 's))) -- true
+(nil? (.idx.info (at B 'v))) -- true
+(at (.idx.info (at B 'h)) 'kind) -- 'hash
+(all (== (at A 's) (at B 's))) -- true
+(all (== (at A 'v) (at B 'v))) -- true
+(at (select {from: B where: (== v 7919)}) 'v) -- [7919]
+(.sys.exec "test $(find /tmp/rf_test_idx_opt/b -type f -exec cat {} + | wc -c) -lt $(find /tmp/rf_test_idx_opt/a -type f -exec cat {} + | wc -c)") -- 0
+
+;; generation 2 records its indexes in the file header: the same choice
+(.db.splayed.set "/tmp/rf_test_idx_opt/c/" t {compress: true})
+(.db.splayed.set "/tmp/rf_test_idx_opt/d/" t {compress: true index: false})
+(set C (.db.splayed.get "/tmp/rf_test_idx_opt/c/"))
+(set D (.db.splayed.get "/tmp/rf_test_idx_opt/d/"))
+(at (.idx.info C 's) 'index) -- 'dict
+(at (.idx.info C 'v) 'index) -- 'chunk_zone
+(at (.idx.info D 's) 'gen) -- 2
+(at (.idx.info D 's) 'index) -- 'none
+(at (.idx.info D 'v) 'index) -- 'none
+(at (.idx.info D 'h) 'index) -- 'hash
+(all (== (at C 's) (at D 's))) -- true
+(all (== (at A 'v) (at D 'v))) -- true
+
+;; after a symbol path, as a partition of a parted table is written
+(.db.splayed.set "/tmp/rf_test_idx_opt/p/2026.01.01/t/" t "/tmp/rf_test_idx_opt/p/.sym" {index: false})
+(count (.db.parted.get "/tmp/rf_test_idx_opt/p" 't)) -- 70000
+(nil? (.idx.info (at (.db.splayed.get "/tmp/rf_test_idx_opt/p/2026.01.01/t/" "/tmp/rf_test_idx_opt/p/.sym") 's))) -- true
+
+;; a loaded column keeps what it brought from its file: the chunk zone and the
+;; hash are written again, in either generation; a dictionary is only ever
+;; built, never carried over, so the loaded STR column is written without one
+(.db.splayed.set "/tmp/rf_test_idx_opt/r0/" A {compress: false index: false})
+(.db.splayed.set "/tmp/rf_test_idx_opt/r2/" C {compress: true index: false})
+(set R0 (.db.splayed.get "/tmp/rf_test_idx_opt/r0/"))
+(set R2 (.db.splayed.get "/tmp/rf_test_idx_opt/r2/"))
+(nil? (.idx.info (at R0 's))) -- true
+(at (.idx.info (at R0 'v)) 'kind) -- 'chunk_zone
+(at (.idx.info (at R0 'h)) 'kind) -- 'hash
+(nil? (.idx.info (at R2 's))) -- true
+(at (.idx.info (at R2 'v)) 'kind) -- 'chunk_zone
+(at (.idx.info (at R2 'h)) 'kind) -- 'hash
+(all (== (at A 'v) (at R2 'v))) -- true
+(all (== (at A 's) (at R0 's))) -- true
+
+;; true is the default; anything but a bool is refused, as an unknown key is
+(.db.splayed.set "/tmp/rf_test_idx_opt/e/" t {index: true})
+(at (.idx.info (at (.db.splayed.get "/tmp/rf_test_idx_opt/e/") 's)) 'kind) -- 'dict
+(.db.splayed.set "/tmp/rf_test_idx_opt/x/" t {index: 1}) !- domain
+(.db.splayed.set "/tmp/rf_test_idx_opt/x/" t {index: 'no}) !- domain
+(.db.splayed.set "/tmp/rf_test_idx_opt/x/" t {indexes: false}) !- domain
+(.sys.exec "rm -rf /tmp/rf_test_idx_opt") -- 0

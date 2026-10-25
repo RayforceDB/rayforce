@@ -1,0 +1,10 @@
+;; New literal transport must not reinterpret median-returning replacements.
+(set C981 (table [s] (list (as 'F64 [0 8 16 24]))))
+((fn [quantile] (at (select {q: (quantile s 0.25) from: C981}) 'q)) (fn [x ignored] (med x))) -- [12.0]
+((fn [percentile] (at (select {q: (percentile s 25) from: C981}) 'q)) (fn [x ignored] (med x))) -- [12.0]
+((fn [] (let saved quantile) (set quantile (fn [x ignored] (med x))) (let result (try (at (select {q: (quantile s 0.25) from: C981}) 'q) (fn [e] 0))) (set quantile saved) result)) -- [12.0]
+
+;; A corresponding native callback supplied lexically still qualifies.
+((fn [quantile] (at (select {q: (quantile s 0.25) from: C981}) 'q)) quantile) -- [6.0]
+((fn [] (let quantile (fn [x p] (med x))) (at (select {q: (quantile s 0.25) from: C981}) 'q))) -- [12.0]
+((fn [] (let saved percentile) (set 'percentile (fn [x p] (med x))) (let out (try (at (select {q: (percentile s 25) from: C981}) 'q) (fn [e] 0))) (set 'percentile saved) out)) -- [12.0]
