@@ -1,0 +1,31 @@
+;; Row insert into an F32 column.  It always failed with
+;; "insert: unsupported column type F32".  An F32 atom is stored as is, an
+;; F64 or integer atom is narrowed, a non-numeric value is rejected.
+
+;; in place (named table), repeated so the second insert appends to data
+(set t (table [c] (list (as 'F32 (list)))))
+(insert 't (list 2.5e)) -- 't
+(insert 't (list 2.5)) -- 't
+(insert 't (list 3)) -- 't
+(type (get t 'c)) -- 'F32
+(count t) -- 3
+(as 'F64 (get t 'c)) -- [2.5 2.5 3.0]
+
+;; functional form keeps the original, and a null is a null
+(set u (insert t (list 0Ne)))
+(count t) -- 3
+(count u) -- 4
+(type (get u 'c)) -- 'F32
+(nil? (at (get u 'c) 3)) -- true
+
+;; an F32 column next to others, appended to the rebuild path through a shared alias
+(set w (table [id c] (list [1] (as 'F32 [1.5e]))))
+(set alias w)
+(insert 'w (list 2 0.25)) -- 'w
+(count w) -- 2
+(count alias) -- 1
+(as 'F64 (get w 'c)) -- [1.5 0.25]
+
+;; non-numeric values are still rejected, and the table is untouched
+(insert 't (list 'x)) !- type
+(count t) -- 3
