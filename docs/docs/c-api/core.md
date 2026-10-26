@@ -305,6 +305,8 @@ Sets the element at index `idx`. The index must be in range `[0, len)`. Uses COW
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
 ```
 
+For a supported non-STR slice, this copies only the visible range into an independent vector, even if the slice header is unique. The parent and other views remain unchanged. Successful mutation consumes one input reference; if detachment allocation fails, the original input reference remains owned by the caller. Keep the original pointer until a successful return.
+
 ### ray_vec_get
 
 Returns a pointer to the element at index `idx`. The returned pointer is valid until the vector is reallocated or freed. Returns `NULL` if `idx` is out of range.
@@ -318,7 +320,7 @@ if (p) printf("%lld\n", *p);
 
 ### ray_vec_slice
 
-Creates a zero-copy slice referencing the original vector's data from `offset` to `offset + len`. The slice retains the parent (incrementing its `rc`), so the parent must not be freed while the slice exists. Mutations require COW.
+Creates a zero-copy slice referencing the original vector's data from `offset` to `offset + len`. The slice retains the parent (incrementing its `rc`); the caller may release its own parent reference while the slice exists. Mutations require COW. A direct `ray_cow` copies a slice header, not its backing payload; use `ray_vec_set` for supported single-element writes rather than treating that header copy as independent writable data.
 
 ```c
 ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len);
