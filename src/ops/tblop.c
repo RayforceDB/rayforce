@@ -1282,6 +1282,48 @@ ray_t* ray_alter_set_cow_fail(ray_t* original_var, ray_t* cow_result,
     return cow_result ? cow_result : ray_error("oom", NULL);
 }
 
+/* Store one cell for `alter ... set`.  A STR vector holds pool-backed cells
+ * that store_typed_elem cannot write (it returns -1, which the caller used to
+ * drop, so the write was a silent no-op); route it through ray_str_vec_set,
+ * which may hand back a new block.
+ *
+ * Ownership contract: `var` is the caller's OWNING reference and is always
+ * consumed.  On success the result is the vector to keep writing into (an
+ * owning reference, possibly a new block); on failure `var` has been released
+ * and an error is returned, so the caller must not release it again.
+ *
+ * ray_str_vec_set copies a shared vector itself and, when that copy has
+ * happened, a later failure releases the copy and leaves the input reference
+ * already given up -- while a failure before the copy leaves it with the
+ * caller.  The two cases cannot be told apart from outside, so make the vector
+ * unshared first: ray_cow consumes `var` only on success (a failed copy leaves
+ * it ours), and the block it returns has a single owner, so the cow inside
+ * ray_str_vec_set is then a no-op and every failure leaves that block with us
+ * to release exactly once. */
+static ray_t* alter_store_cell(ray_t* var, int64_t i, ray_t* elem) {
+    if (var->type != RAY_STR) {
+        store_typed_elem(var, i, elem);
+        return var;
+    }
+    if (!elem || elem->type != -RAY_STR) {
+        const char* tn = elem ? ray_type_name(elem->type) : "null";
+        ray_t* err = ray_error("type", "alter set: str vector requires str values, got %s", tn);
+        ray_release(var);
+        return err;
+    }
+    ray_t* own = ray_cow(var);
+    if (!own || RAY_IS_ERR(own)) {
+        ray_release(var);
+        return own ? own : ray_error("oom", NULL);
+    }
+    ray_t* r = ray_str_vec_set(own, i, ray_str_ptr(elem), ray_str_len(elem));
+    if (!r || RAY_IS_ERR(r)) {
+        ray_release(own);
+        return r ? r : ray_error("oom", NULL);
+    }
+    return r;
+}
+
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
     if (n < 3) return ray_error("domain", "alter: expects at least 3 arguments (var, op, ...), got %lld", (long long)n);
     /* First arg: evaluate to get the symbol */
@@ -1439,7 +1481,9 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
             /* Single index — bounds already validated above. */
             int64_t i = as_i64(idx);
             ray_release(idx);
-            store_typed_elem(var, i, val);
+            ray_t* nv = alter_store_cell(var, i, val);
+            if (RAY_IS_ERR(nv)) { ray_release(val); ray_release(name_sym); return nv; }
+            var = nv;
         } else {
             /* Vector of indices — set each to val.
              * If val is a vector of same length, set pairwise.
@@ -1452,14 +1496,17 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
                 int64_t i = as_i64(ie);
                 if (alloc) ray_release(ie);
                 if (i < 0 || i >= var->len) continue;
+                ray_t* nv;
                 if (val_is_vec) {
                     int va = 0;
                     ray_t* ve = collection_elem(val, k, &va);
-                    store_typed_elem(var, i, ve);
+                    nv = alter_store_cell(var, i, ve);
                     if (va) ray_release(ve);
                 } else {
-                    store_typed_elem(var, i, val);
+                    nv = alter_store_cell(var, i, val);
                 }
+                if (RAY_IS_ERR(nv)) { ray_release(idx); ray_release(val); ray_release(name_sym); return nv; }
+                var = nv;
             }
             ray_release(idx);
         }
