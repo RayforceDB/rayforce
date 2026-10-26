@@ -6236,6 +6236,13 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
 
 static inline int64_t group_strlen_at(const ray_t* col, int64_t row);
 
+/* Where the thread's last test of a partial segment stopped: the first
+ * entry not below its row.  The scans test ascending rows, so the next row
+ * walks on from there instead of searching the segment again.  Any position
+ * whose previous entry is below the row is a valid start (a segment's
+ * entries ascend), so a stale one only costs the search. */
+static RAY_TLS uint32_t g_rowsel_pos;
+
 static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
     if (!sel) return true;
     ray_rowsel_t* m = ray_rowsel_meta(sel);
@@ -6248,14 +6255,20 @@ static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
     uint32_t lo = ray_rowsel_offsets(sel)[seg];
     uint32_t hi = ray_rowsel_offsets(sel)[seg + 1];
     const uint16_t* idx = ray_rowsel_idx(sel);
-    while (lo < hi) {
-        uint32_t mid = lo + ((hi - lo) >> 1);
-        uint16_t v = idx[mid];
-        if (v == local) return true;
-        if (v < local) lo = mid + 1;
-        else hi = mid;
+    uint32_t p = g_rowsel_pos;
+    if (p >= lo && p <= hi && (p == lo || idx[p - 1] < local)) {
+        while (p < hi && idx[p] < local) p++;
+    } else {
+        while (lo < hi) {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (idx[mid] < local) lo = mid + 1;
+            else hi = mid;
+        }
+        p = lo;
+        hi = ray_rowsel_offsets(sel)[seg + 1];
     }
-    return false;
+    g_rowsel_pos = p;
+    return p < hi && idx[p] == local;
 }
 
 /* ---- Range reads of the fat-entry builders (radix phase 1, its v2

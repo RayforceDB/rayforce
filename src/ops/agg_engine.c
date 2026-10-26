@@ -3318,11 +3318,16 @@ static void agg_dense_sel_rows(void* raw, const agg_view_t* v, uint32_t wid, int
         loc->oom = 1;
 }
 
-/* Phase A, sel mode: chunk-iterate the SELECTED rows in [start,end)
- * (selected-row space).  Decode each chunk's ORIGINAL rows, compute dense
- * slots, gather agg values per chunk into reused scratch, and batch-update.
- * No full index array, no full compact column.  Staged sources are read by
- * R-SPARSE through this task's cursors. */
+static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, int64_t start, int64_t end);
+
+/* Phase A, sel mode: the SELECTED rows in [start,end) (selected-row
+ * space), segment by segment.  The rows of a mixed segment are decoded
+ * into chunks of ORIGINAL rows: dense slots computed, agg values gathered
+ * per chunk into reused scratch, batch-updated (R-SPARSE through the
+ * task's cursors when a source is staged).  A run of segments the
+ * selection takes whole is a dense row range, accumulated as without a
+ * selection (agg_dense_phaseA_fn, by pieces when staged).  The buffered
+ * rows go first, so every slot still sees its rows in ascending order. */
 static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_local_t* loc = &c->locals[wid];
     if (loc->oom || end <= start) return;
@@ -3336,15 +3341,65 @@ static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start
         if (ray_scan_fail_skip(rr->fail, start)) { agg_sel_scratch_free(&sc); return; }
         if (!agg_curs_init(&cs, rr)) { loc->oom = 1; agg_sel_scratch_free(&sc); return; }
     }
-    agg_sel_cursor_t cur;
+    agg_sel_cursor_t cur;                               /* for the read-ahead bound only */
     agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
     agg_dense_sel_run_t t = { c, loc, rows, gid, &sc };
-    int64_t cn;
-    while (!loc->oom && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
-        if (!rr->staged) { agg_dense_sel_rows(&t, c->whole, wid, 0, cn); continue; }
-        ray_t* err = agg_idx_walk(rr, &cs, rows, 0, cn, &t, agg_dense_sel_rows, wid);
-        if (err) { ray_scan_fail_note(rr->fail, start, err); break; }
+    const ray_rowsel_t* m = ray_rowsel_meta(c->sel);
+    const uint8_t* flags = ray_rowsel_flags(c->sel);
+    const uint32_t* offs = ray_rowsel_offsets(c->sel);
+    const uint16_t* idx = ray_rowsel_idx(c->sel);
+    const int64_t* pre = c->sel_prefix;
+    const int64_t M = RAY_MORSEL_ELEMS;
+    uint32_t s = 0, hs = m->n_segs;                     /* the segment holding selected row `start` */
+    while (s < hs) { uint32_t mid = s + (hs - s) / 2; if (pre[mid + 1] <= start) s = mid + 1; else hs = mid; }
+    int64_t nb = 0;                                     /* buffered rows of mixed segments */
+    ray_t* err = NULL;
+    bool failed = false;                                /* a dense range's read failed (noted) */
+    #define AGG_SEL_FLUSH() do {                                                    \
+        if (nb > 0 && !loc->oom) {                                                  \
+            if (!rr->staged) agg_dense_sel_rows(&t, c->whole, wid, 0, nb);          \
+            else err = agg_idx_walk(rr, &cs, rows, 0, nb, &t, agg_dense_sel_rows, wid); \
+        }                                                                           \
+        nb = 0;                                                                     \
+    } while (0)
+    while (s < m->n_segs && pre[s] < end && !err && !failed && !loc->oom) {
+        if (flags[s] == RAY_SEL_NONE) { s++; continue; }
+        const int64_t seg_sel = pre[s + 1] - pre[s];
+        const int64_t p0 = start > pre[s] ? start - pre[s] : 0;
+        const int64_t p1 = end - pre[s] < seg_sel ? end - pre[s] : seg_sel;
+        const int64_t base = (int64_t)s * M;
+        if (flags[s] == RAY_SEL_ALL) {
+            /* the whole segments that follow join the range, up to the
+             * kernel's 8192 rows */
+            int64_t r0 = base + p0, r1 = base + p1;
+            s++;
+            while (p1 == seg_sel && s < m->n_segs && flags[s] == RAY_SEL_ALL && pre[s] < end &&
+                   r1 == (int64_t)s * M && r1 - r0 < 8192) {
+                int64_t q1 = end - pre[s] < pre[s + 1] - pre[s] ? end - pre[s] : pre[s + 1] - pre[s];
+                int64_t e1 = (int64_t)s * M + q1;
+                if (e1 - r0 > 8192) break;
+                r1 = e1;
+                if (q1 < pre[s + 1] - pre[s]) { s++; break; }
+                s++;
+            }
+            AGG_SEL_FLUSH();
+            if (err || loc->oom) break;
+            if (agg_cancelled()) break;
+            ray_pool_scan_at(m->nrows, r0, cur.row_end);
+            if (!rr->staged) agg_dense_phaseA_fn(c, c->whole, wid, r0, r1);
+            else if (!agg_walk_cs(rr, &cs, c, agg_dense_phaseA_fn, wid, r0, r1, start)) failed = true;
+            continue;
+        }
+        const uint16_t* si = idx + offs[s];
+        for (int64_t q = p0; q < p1 && !err; q++) {
+            rows[nb++] = base + si[q];
+            if (nb == AGG_SEL_CHUNK) AGG_SEL_FLUSH();
+        }
+        s++;
     }
+    if (!err && !failed) AGG_SEL_FLUSH();
+    #undef AGG_SEL_FLUSH
+    if (err) ray_scan_fail_note(rr->fail, start, err);
     agg_curs_free(&cs, rr);
     agg_sel_scratch_free(&sc);
 }
