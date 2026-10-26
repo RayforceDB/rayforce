@@ -50,6 +50,7 @@
 #include "store/part.h"
 #include "store/serde.h"
 #include "store/stream.h"
+#include "store/fileio.h"
 #include "vec/str.h"
 #include "ops/datalog.h"
 #include "core/ipc.h"
@@ -1678,18 +1679,26 @@ static ray_err_t stream_staged(const char* name, int8_t type, struct ray_sym_dom
     return e;
 }
 
-/* A payload staged in memory (Linux) gives the column file the staging file
- * gives, byte for byte, and leaves no staging behind.  Only a generation-2
- * writer of a type other than STR stages so, and only before its first
- * append; an abort after appends to a memory stage leaves nothing. */
+/* Whether this host has memory files (ray_file_open_mem): optional even on
+ * Linux, where a denied memfd or /proc reopen falls back to the file. */
+static bool cs_mem_files(void) {
+    char path[64];
+    ray_fd_t fd = ray_file_open_mem(path, sizeof(path));
+    if (fd == RAY_FD_INVALID) return false;
+    ray_file_close(fd);
+    return true;
+}
+
+/* A payload staged in memory (where memory files exist) gives the column
+ * file the staging file gives, byte for byte, and leaves no staging behind.
+ * Only a generation-2 writer of a type other than STR stages so, and only
+ * before its first append; an abort after appends to a memory stage leaves
+ * nothing. */
 static test_result_t test_stream_stage_mem(void) {
     struct ray_sym_domain_s* d = ray_sym_domain_open_or_create(ray_test_tmp(CS_TMP "/m.sym"));
     TEST_ASSERT_TRUE(d != NULL);
     TEST_ASSERT_EQ_I(ray_sym_domain_intern(d, "", 0), 0);
-    bool mem_files = false;
-#ifdef RAY_OS_LINUX
-    mem_files = true;
-#endif
+    bool mem_files = cs_mem_files();
     const char* names[2][2] = { { "mi0", "mi1" }, { "ms0", "ms1" } };
     for (int t = 0; t < 2; t++) {
         int8_t type = t ? RAY_SYM : RAY_I64;

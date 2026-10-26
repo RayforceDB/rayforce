@@ -6,6 +6,8 @@
 #include "io/parquet.h"
 #include "core/pool.h"
 #include "mem/heap.h"
+#include "store/fileio.h"
+#include "store/encfmt.h"   /* ray_col_gen_of */
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "table/table.h"
@@ -3864,8 +3866,19 @@ static test_result_t test_pq_symfile_column(void) {
     PASS();
 }
 
+/* Whether this host has memory files (ray_file_open_mem): optional even on
+ * Linux, where a denied memfd or /proc reopen falls back to the file. */
+static bool pq_mem_files(void) {
+    char path[64];
+    ray_fd_t fd = ray_file_open_mem(path, sizeof(path));
+    if (fd == RAY_FD_INVALID) return false;
+    ray_file_close(fd);
+    return true;
+}
+
 /* Generation 2 stages each column's raw payload until its close encodes it:
- * in memory (Linux) by default, in the staging file under RAY_PQ_STAGE=file.
+ * in memory by default (where memory files exist and the pass fits the
+ * memory admission), in the staging file under RAY_PQ_STAGE=file.
  * Both give the same files, byte for byte (on one worker: the direct
  * import's positions follow its tasks), in one pass and column by column
  * (where a symbol column is encoded at its pass's end, saving the domain's
@@ -3888,10 +3901,8 @@ static test_result_t test_pq_stage_mem(void) {
     ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
     int64_t rows = 140000;   /* three encoding chunks */
     TEST_ASSERT_TRUE(pq_synth(src, rows, 9, pq_synth_mixed));
-    bool mem_files = false;
-#ifdef RAY_OS_LINUX
-    mem_files = true;
-#endif
+    bool mem_files = pq_mem_files();
+    int64_t ram = ray_sys_ram_limit();
     size_t cap = (size_t)1 << 16;
     char* trace = (char*)ray_sys_alloc(cap);
     TEST_ASSERT_TRUE(trace != NULL);
@@ -3904,7 +3915,11 @@ static test_result_t test_pq_stage_mem(void) {
             if (run & 1) pq_set_layout("1");
             if (run & 2) pq_set_symmode("grouped");
             pq_set_env("RAY_PQ_STAGE", stage[k]);
+            /* the default decides by memory: give it the headroom, the
+             * watermark at the whole RAM limit, whatever the heap holds */
+            if (k == 0 && ram > 0) ray_heap_set_anon_watermark(ram);
             ray_t* res = pq_traced_import(src, dir[k], opts, trace, cap);
+            ray_heap_set_anon_watermark(0);
             pq_sym_env_clear();
             if (!res || RAY_IS_ERR(res)) {
                 fprintf(stderr, "  %d/%d: import failed: %s\n", run, k, res ? ray_err_code(res) : "null");
@@ -3916,7 +3931,7 @@ static test_result_t test_pq_stage_mem(void) {
              * 'file, or by default with no memory size to go by (no runtime) */
             int lines = 0;
             double staged = pq_trace_sum(trace, "mem_staged", &lines);
-            double want = k == 1 || !mem_files || (k == 0 && ray_sys_ram_limit() <= 0) ? 0 : 3;
+            double want = k == 1 || !mem_files || (k == 0 && ram <= 0) ? 0 : 3;
             if (!lines || staged != want) {
                 fprintf(stderr, "  %d/%d: %.0f columns staged in memory over %d passes (want %.0f)\n",
                         run, k, staged, lines, want);
@@ -3934,6 +3949,73 @@ static test_result_t test_pq_stage_mem(void) {
         for (int k = 0; k < 3; k++) pq_remove_native(dir[k], names, 3);
     }
     ray_sys_free(trace);
+    unlink(src);
+    ray_release(opts); ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
+/* Column t's strings: 500, none of them column s's. */
+static const char* pq_synth_late(int64_t r, char* buf, uint32_t* len) {
+    *len = (uint32_t)snprintf(buf, 256, "late-%lld", (long long)(r % 500));
+    return buf;
+}
+/* Column by column, a generation-2 symbol column is encoded at its own
+ * pass's end with the domain's count then: one whose pass runs before the
+ * other's new strings saves a count below the symbol file's final one, and
+ * still loads, its rows unchanged.  Both stagings. */
+static test_result_t test_pq_stage_early_sym_count(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], path[220];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-early-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-early-%d", (int)getpid());
+    const char* names[] = {"x","s","t"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    int64_t rows = 140000;
+    pq_synth_t = pq_synth_late;
+    bool made = pq_synth(src, rows, 9, pq_synth_mixed);
+    int bad = made ? 0 : 1;
+    const char* stage[] = {"file", "mem"};
+    for (int k = 0; made && k < 2; k++) {
+        if (pq_pool(1) != RAY_OK) { bad++; break; }
+        pq_set_layout("1");
+        pq_set_symmode("direct");
+        pq_set_env("RAY_PQ_STAGE", stage[k]);
+        ray_t* res = ray_parquet_splayed_typed(src, dir, opts);
+        pq_sym_env_clear();
+        if (!res || RAY_IS_ERR(res)) {
+            fprintf(stderr, "  %s: import failed: %s\n", stage[k], res ? ray_err_code(res) : "null");
+            if (res) ray_error_free(res);
+            bad++; continue;
+        }
+        ray_release(res);
+        int64_t final = pq_sym_count(dir), saved[2] = {-1, -1};
+        for (int c = 0; c < 2; c++) {
+            snprintf(path, sizeof(path), "%s/%s", dir, names[1 + c]);
+            FILE* f = fopen(path, "rb");
+            ray_t hdr;
+            if (f && fread(&hdr, 1, 32, f) == 32 && ray_col_gen_of(&hdr) == 2) saved[c] = (int64_t)hdr.rc;
+            if (f) fclose(f);
+        }
+        int64_t lo = saved[0] < saved[1] ? saved[0] : saved[1], hi = saved[0] < saved[1] ? saved[1] : saved[0];
+        if (lo < 0 || lo >= final || hi > final) {
+            fprintf(stderr, "  %s: saved counts %lld, %lld, symbol file %lld\n", stage[k],
+                    (long long)saved[0], (long long)saved[1], (long long)final);
+            bad++;
+        }
+        if (!pq_synth_check(dir, rows, pq_synth_mixed)) { fprintf(stderr, "  %s: rows differ\n", stage[k]); bad++; }
+        pq_remove_native(dir, names, 3);
+    }
+    pq_synth_t = NULL;
     unlink(src);
     ray_release(opts); ray_release(types);
     ray_pool_destroy();
@@ -3971,6 +4053,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_mixed_modes",test_pq_sym_mixed_modes,pq_setup,pq_teardown},
     {"parquet/symfile_column",test_pq_symfile_column,pq_setup,pq_teardown},
     {"parquet/stage_mem",test_pq_stage_mem,pq_setup,pq_teardown},
+    {"parquet/stage_early_sym_count",test_pq_stage_early_sym_count,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},

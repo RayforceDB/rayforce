@@ -3050,7 +3050,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     }
     if (width > r->ncols) width = r->ncols;
     /* Generation 2 stages a column's raw payload until its close encodes
-     * it: in memory, which is never written to storage, while a pass's
+     * it: in a memory file, which no filesystem writes back, while a pass's
      * payload takes at most a quarter of memory (ray_col_stream_stage_mem),
      * in the staging file past that.  RAY_PQ_STAGE=file|mem decides for
      * every pass instead. */
@@ -3230,10 +3230,14 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             int64_t b = pq_stage_bytes(&writers[work.pass[i]],r->rows);
             raw = b > INT64_MAX - raw ? INT64_MAX : raw + b;
         }
-        /* A memory file's pages are not reclaimed (no swap): the payload
-         * also fits under the heap's watermark beside what is committed, so
-         * the room the watermark keeps for the page cache stays, and a
-         * grouped pass's budget below leaves it out. */
+        /* A memory file's pages are not reclaimed as the page cache's are
+         * (only swapped, where there is swap): the payload also fits under
+         * the heap's watermark beside what is committed when the pass
+         * starts, and a grouped pass's budget below leaves it out.  That is
+         * the admission, not a reservation: the heap's own spill threshold
+         * does not see these bytes, so a direct pass's later allocations
+         * (its symbol dictionary) can still take the room the watermark
+         * keeps for the page cache, until the pass's closes free them. */
         int64_t swm = ray_heap_anon_watermark();
         if (stage == 'm' || (stage != 'f' && ram > 0 && raw <= ram / 4 &&
                              swm > 0 && raw <= swm - ray_heap_anon_committed()))

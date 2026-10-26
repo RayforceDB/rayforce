@@ -50,8 +50,8 @@ typedef struct {
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
                               int8_t type, struct ray_sym_domain_s* domain, uint8_t gen);
 /* Generation 2, before the first append: stage the raw payload in a memory
- * file (ray_file_open_mem) instead of the staging file, so none of it is
- * written to storage before finish encodes it; the column file is then
+ * file (ray_file_open_mem) instead of the staging file, so no staging file
+ * is written back before finish encodes it; the column file is then
  * written once, at finish.  STR keeps its staging files.  False, the
  * staging file kept, for any other writer or where the host has no memory
  * files. */
