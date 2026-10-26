@@ -12,3 +12,20 @@ rc.y.z -- 2
 (set held 5)
 (set held.x 1) !- type
 held -- 5
+
+;; a function the user bound is a user binding, not a builtin registration:
+;; an alias and a rebound builtin name are refused and keep their value
+(set held count)
+(set held.x 1) !- type
+(held [1 2 3]) -- 3
+(set len2 +)
+(set len2.x 1) !- type
+(len2 1 2) -- 3
+(set sum count)
+(set sum.x 1) !- type
+(sum [1 2]) -- 2
+
+;; `let` writes through the same helper: a function bound by `let` is a user
+;; binding too, while an untouched builtin name still takes a namespace
+(do (let held2 count) (let held2.x 1)) !- type
+(do (let rc.q 5) rc.q) -- 5
