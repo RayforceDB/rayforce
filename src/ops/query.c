@@ -24354,8 +24354,9 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
         /* F32 atoms keep their value in the f64 union slot (see ray_f32),
          * so an F32 and an F64 atom both narrow from atom->f64. */
         if (at != -RAY_F32 && at != -RAY_F64 && !is_int) return ray_error("type", "insert: f32 column requires a numeric value, got %s", ray_type_name(at));
-        float v = (at == -RAY_F32 || at == -RAY_F64) ? (float)atom->f64
-                                                     : (float)as_i64(atom);
+        float v = (at == -RAY_F32 || at == -RAY_F64)
+                      ? ray_cast_f64_to_f32_null(atom->f64)  /* saturates, no inf */
+                      : (float)as_i64(atom);
         return ray_vec_append(col_vec, &v);
     }
     case RAY_DATE: {

@@ -29,3 +29,24 @@
 ;; non-numeric values are still rejected, and the table is untouched
 (insert 't (list 'x)) !- type
 (count t) -- 3
+
+;; a finite F64 past FLT_MAX saturates to +/-FLT_MAX at the insert (F32 has no
+;; infinities), in place and through a shared alias; a null stays a null
+(set o (table [c] (list (as 'F32 (list)))))
+(insert 'o (list 1e300)) -- 'o
+(insert 'o (list -1e300)) -- 'o
+(insert 'o (list 0Nf)) -- 'o
+(insert 'o (list 0.5)) -- 'o
+(== (at (as 'F64 (get o 'c)) 0) 3.4028234663852886e38) -- true
+(== (at (as 'F64 (get o 'c)) 1) -3.4028234663852886e38) -- true
+(nil? (at (get o 'c) 2)) -- true
+(== (at (as 'F64 (get o 'c)) 3) 0.5) -- true
+(set sh (table [id c] (list [1] (as 'F32 [1.5e]))))
+(set sh_alias sh)
+(insert 'sh (list 2 1e300)) -- 'sh
+(insert 'sh (list 3 -1e300)) -- 'sh
+(count sh_alias) -- 1
+(== (at (as 'F64 (get sh 'c)) 1) 3.4028234663852886e38) -- true
+(== (at (as 'F64 (get sh 'c)) 2) -3.4028234663852886e38) -- true
+(set ov (insert sh (list 4 1e300)))
+(== (at (as 'F64 (get ov 'c)) 3) 3.4028234663852886e38) -- true
