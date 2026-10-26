@@ -990,7 +990,10 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
      * ((set held count), (set rc count)) is a user binding like any other
      * non-dict value and stays refused, and so does any local binding, since
      * a local frame holds no registrations. */
-    if (parents[0] && base_lookup == ray_env_get_global &&
+    /* Value kind first: a DICT head (every ordinary namespace update) can
+     * never be a registration, so it skips the lock and slot lookup. */
+    if (parents[0] && parents[0]->type != RAY_DICT &&
+        base_lookup == ray_env_get_global &&
         env_global_is_builtin_registration(segs[0]))
         parents[0] = NULL;
     if (parents[0] && parents[0]->type != RAY_DICT)
