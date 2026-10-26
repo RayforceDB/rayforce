@@ -143,11 +143,7 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
         is.order_name = colw_order_name(vec->index, &is.order_len);
         ray_encw_set_index(&w, &is);
     }
-    for (int64_t c = 0; e == RAY_OK && c < w.n_chunks; c++) {
-        int64_t n = vec->len - c * RAY_ENC_CHUNK;
-        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
-        e = ray_encw_chunk(&w, data + (size_t)c * RAY_ENC_CHUNK * esz, pool, n);
-    }
+    if (e == RAY_OK) e = ray_encw_chunks(&w, data, esz, pool);
     /* colw_region_msg reads the thread-local message: clear it first, so a
      * plain io error from finish never picks up a stale "index region:" */
     if (e == RAY_OK && region) ray_error_clear();
