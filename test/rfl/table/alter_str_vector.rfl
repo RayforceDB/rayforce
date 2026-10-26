@@ -30,3 +30,31 @@ v -- ["z" "q" "z" "b"]
 (set n (til 4))
 (alter 'n set [1 3] [10 30]) -- 'n
 n -- [0 10 2 30]
+
+;; rejected writes release every reference they took: the refcount of the
+;; target and of its alias is the same before and after, for a scalar index,
+;; an index vector (rejected on the first cell and on a later one), and a
+;; shared vector (the copy made for the write is dropped, the binding keeps
+;; the original)
+(set r (take (as 'STR (list "a")) 4))
+(set ra r)
+(set rc0 (rc r))
+(alter 'r set 1 5) !- type
+(== (rc r) rc0) -- true
+(alter 'r set [0 1] 5) !- type
+(== (rc r) rc0) -- true
+(== (rc ra) rc0) -- true
+(alter 'r set [0 1] (list "x" 5)) !- type
+(== (rc r) rc0) -- true
+r -- ["a" "a" "a" "a"]
+ra -- ["a" "a" "a" "a"]
+;; an unshared target: a rejected write leaves it with its single binding
+(set u (take (as 'STR (list "a")) 4))
+(set u0 (rc u))
+(alter 'u set 2 1.5) !- type
+(== (rc u) u0) -- true
+u -- ["a" "a" "a" "a"]
+;; a write after the rejections still succeeds and does not touch the alias
+(alter 'r set 1 "b") -- 'r
+r -- ["a" "b" "a" "a"]
+ra -- ["a" "a" "a" "a"]

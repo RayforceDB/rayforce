@@ -1285,17 +1285,43 @@ ray_t* ray_alter_set_cow_fail(ray_t* original_var, ray_t* cow_result,
 /* Store one cell for `alter ... set`.  A STR vector holds pool-backed cells
  * that store_typed_elem cannot write (it returns -1, which the caller used to
  * drop, so the write was a silent no-op); route it through ray_str_vec_set,
- * which may hand back a new block.  Returns the vector to keep writing into,
- * or an error (the caller releases its other references). */
+ * which may hand back a new block.
+ *
+ * Ownership contract: `var` is the caller's OWNING reference and is always
+ * consumed.  On success the result is the vector to keep writing into (an
+ * owning reference, possibly a new block); on failure `var` has been released
+ * and an error is returned, so the caller must not release it again.
+ *
+ * ray_str_vec_set copies a shared vector itself and, when that copy has
+ * happened, a later failure releases the copy and leaves the input reference
+ * already given up -- while a failure before the copy leaves it with the
+ * caller.  The two cases cannot be told apart from outside, so make the vector
+ * unshared first: ray_cow consumes `var` only on success (a failed copy leaves
+ * it ours), and the block it returns has a single owner, so the cow inside
+ * ray_str_vec_set is then a no-op and every failure leaves that block with us
+ * to release exactly once. */
 static ray_t* alter_store_cell(ray_t* var, int64_t i, ray_t* elem) {
     if (var->type != RAY_STR) {
         store_typed_elem(var, i, elem);
         return var;
     }
-    if (!elem || elem->type != -RAY_STR)
-        return ray_error("type", "alter set: str vector requires str values, got %s",
-                         elem ? ray_type_name(elem->type) : "null");
-    return ray_str_vec_set(var, i, ray_str_ptr(elem), ray_str_len(elem));
+    if (!elem || elem->type != -RAY_STR) {
+        const char* tn = elem ? ray_type_name(elem->type) : "null";
+        ray_t* err = ray_error("type", "alter set: str vector requires str values, got %s", tn);
+        ray_release(var);
+        return err;
+    }
+    ray_t* own = ray_cow(var);
+    if (!own || RAY_IS_ERR(own)) {
+        ray_release(var);
+        return own ? own : ray_error("oom", NULL);
+    }
+    ray_t* r = ray_str_vec_set(own, i, ray_str_ptr(elem), ray_str_len(elem));
+    if (!r || RAY_IS_ERR(r)) {
+        ray_release(own);
+        return r ? r : ray_error("oom", NULL);
+    }
+    return r;
 }
 
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
