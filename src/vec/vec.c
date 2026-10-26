@@ -329,11 +329,39 @@ fail:
  * ray_vec_set
  * -------------------------------------------------------------------------- */
 
+/* A view owns only its header: header COW cannot make its payload writable.
+ * Keep the old view alive through the element copy: elem may point into its
+ * last retained parent. Ordinary vector writes do not take this cold path. */
+static __attribute__((cold, noinline))
+ray_t* vec_set_slice_cow(ray_t* vec, int64_t idx, const void* elem) {
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    ray_t* out = vec->type == RAY_SYM
+        ? ray_sym_vec_new(vec->attrs & RAY_SYM_W_MASK, vec->len)
+        : ray_vec_new(vec->type, vec->len);
+    if (!out) return ray_error("oom", NULL);
+    if (RAY_IS_ERR(out)) return out;
+    out->len = vec->len;
+    memcpy(ray_data(out), ray_data(vec), (size_t)vec->len * esz);
+    if (vec->type == RAY_SYM) ray_sym_vec_adopt_domain(out, vec);
+    /* Preserve stored hints, not SYM's always-conservative row-kernel gate.
+     * Public slices are flattened to their ultimate parent. */
+    if ((vec->attrs | vec->slice_parent->attrs) & RAY_ATTR_HAS_NULLS)
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    memcpy((char*)ray_data(out) + (size_t)idx * esz, elem, esz);
+    if (ray_raw_is_null(out->type, out->attrs, ray_data(out), idx))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_release(vec);
+    return out;
+}
+
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem) {
     if (!vec || RAY_IS_ERR(vec)) return vec;
     if (vec->type == RAY_STR) return ray_error("type", "vec_set: str vectors use ray_str_vec_set, got %s", ray_type_name(vec->type));
     if (idx < 0 || idx >= vec->len)
         return ray_error("range", "vec_set: index out of bounds [0,%lld), got %lld", (long long)vec->len, (long long)idx);
+
+    if (RAY_UNLIKELY(vec->attrs & RAY_ATTR_SLICE))
+        return vec_set_slice_cow(vec, idx, elem);
 
     /* COW: if shared, copy first */
     vec = ray_cow(vec);
