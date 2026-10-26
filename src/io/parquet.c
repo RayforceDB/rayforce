@@ -2184,7 +2184,7 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         ray_col_stream_t local = {0};
         local.type = w->writers[c].type; local.dom = w->writers[c].dom;
         size_t size = local.type == RAY_SYM ? 4 : ray_elem_size(local.type);
-        local.fp = fopen(w->writers[c].tmp_path,"r+b");
+        local.fp = fopen(w->writers[c].stage_path,"r+b");
         if (!local.fp) {
             w->errors[task] = pq_error("cannot open native column");
             if (spare) pq_trade_buffers(&r->cursors[0],spare);
@@ -2224,8 +2224,9 @@ static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int
         /* Start this chunk's writeback now: the pages leave while the
          * import goes on, instead of all at the final sync.  A failed flush
          * has dropped its buffer, and the close after it may well succeed:
-         * it is the task's error. */
-        if (w->writeback && !w->errors[task]) {
+         * it is the task's error.  A generation-2 column's staged payload
+         * is encoded and dropped at its close: none of it is written back. */
+        if (w->writeback && w->writers[c].gen != 2 && !w->errors[task]) {
             if (fflush(local.fp) != 0) w->errors[task] = pq_error("native column write failed");
             else ray_file_writeback_start(fileno(local.fp),32+w->offsets[g]*(int64_t)size,
                                           (row-w->offsets[g])*(int64_t)size);
@@ -2760,7 +2761,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
             k.codes = (uint32_t*)ray_data(k.vec);
             k.ncodes = 0;
             local.type = RAY_SYM; local.dom = dw->writers[w->c].dom;
-            local.fp = fopen(dw->writers[w->c].tmp_path,"r+b");
+            local.fp = fopen(dw->writers[w->c].stage_path,"r+b");
             if (!local.fp) err = "cannot open native column";
         }
         if (!err) {
@@ -2781,7 +2782,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
         if (!err && !pq_g_wflush(&k)) err = "symbol file write failed";
         io2 = pq_tio_now(w->trace);
         if (!err && !pq_g_flush(&k)) err = "native column write failed";
-        if (!err && dw->writeback) {
+        if (!err && dw->writeback && dw->writers[w->c].gen != 2) {
             if (fflush(local.fp) != 0) err = "native column write failed";
             else ray_file_writeback_start(fileno(local.fp),32+dw->offsets[g]*4,(dw->offsets[g+1]-dw->offsets[g])*4);
         }
@@ -2964,6 +2965,13 @@ static int64_t pq_imp_count(ray_col_stream_t* writers, const int64_t* order, int
     }
     return n;
 }
+/* The raw payload a generation-2 column stages until its close (STR keeps
+ * its own files). */
+static int64_t pq_stage_bytes(const ray_col_stream_t* s, int64_t rows) {
+    if (s->gen != 2 || s->type == RAY_STR) return 0;
+    return rows*(int64_t)(s->type == RAY_SYM ? 4 : ray_elem_size(s->type));
+}
+
 static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t chunks = r->ngroups*r->ncols;
     if (chunks > UINT32_MAX) return pq_error("too many column chunk tasks");
@@ -3041,6 +3049,17 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (e && *e && strtol(e,NULL,10) > 0) { width = strtol(e,NULL,10); colwise = width < r->ncols; forced = true; }
     }
     if (width > r->ncols) width = r->ncols;
+    /* Generation 2 stages a column's raw payload until its close encodes
+     * it: in memory, which is never written to storage, while a pass's
+     * payload takes at most a quarter of memory (ray_col_stream_stage_mem),
+     * in the staging file past that.  RAY_PQ_STAGE=file|mem decides for
+     * every pass instead. */
+    int stage = 0;   /* 'f' file, 'm' memory, 0 by size */
+    {
+        const char* e = getenv("RAY_PQ_STAGE");
+        if (e && !strcmp(e,"file")) stage = 'f';
+        else if (e && !strcmp(e,"mem")) stage = 'm';
+    }
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
     spare = ray_calloc_raw((size_t)workers*sizeof(*spare));   /* best effort */
     if (spare) nspare = workers;
@@ -3206,6 +3225,23 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         work.npass = lim - p < wd ? lim - p : wd;
         int64_t tasks = r->ngroups*work.npass;
         int64_t t0 = trace ? ray_profile_now_ns() : 0, t1 = 0;
+        int64_t raw = 0, in_mem = 0, held = 0;   /* the pass's staged payload (saturating); in memory: columns, bytes */
+        for (int64_t i = 0; i < work.npass; i++) {
+            int64_t b = pq_stage_bytes(&writers[work.pass[i]],r->rows);
+            raw = b > INT64_MAX - raw ? INT64_MAX : raw + b;
+        }
+        /* A memory file's pages are not reclaimed (no swap): the payload
+         * also fits under the heap's watermark beside what is committed, so
+         * the room the watermark keeps for the page cache stays, and a
+         * grouped pass's budget below leaves it out. */
+        int64_t swm = ray_heap_anon_watermark();
+        if (stage == 'm' || (stage != 'f' && ram > 0 && raw <= ram / 4 &&
+                             swm > 0 && raw <= swm - ray_heap_anon_committed()))
+            for (int64_t i = 0; i < work.npass; i++)
+                if (ray_col_stream_stage_mem(&writers[work.pass[i]])) {
+                    in_mem++;
+                    held += pq_stage_bytes(&writers[work.pass[i]],r->rows);
+                }
         ray_symgrp_t* pg = sgrp;   /* the pass's grouped import */
         ray_symimp_t* pimp = simp;
         if (grouped && p >= nd && r->symcol) {
@@ -3218,7 +3254,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (pg && p >= nd) {
             /* memory for the pass: what is left under the anon watermark */
             int64_t wm = ray_heap_anon_watermark();
-            int64_t budget = wm > 0 ? wm - ray_heap_anon_committed() : (int64_t)1 << 30;
+            int64_t budget = wm > 0 ? wm - ray_heap_anon_committed() - held : (int64_t)1 << 30;
             if (budget < ((int64_t)64 << 20)) budget = (int64_t)64 << 20;
             /* hash groups: a group's index table (~24 B an entry, the
              * column's rows bounding its new strings) within a quarter.  The
@@ -3260,7 +3296,14 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             int64_t c = work.pass[i];
             writers[c].rows = r->rows;
             writers[c].had_nulls = atomic_load_explicit(&nulls[c],memory_order_relaxed) != 0;
-            if (all || writers[c].type == RAY_SYM) continue;
+            /* A generation-0 symbol column's raw file is its column file,
+             * whose header takes the domain's final count at the end.  A
+             * generation-2 one is encoded now, its staged payload dropped
+             * with it: the count it saves, the domain's now, covers every
+             * position it holds (later passes only append positions), and
+             * the staging directory is published after the symbol files
+             * all the same. */
+            if (all || (writers[c].type == RAY_SYM && writers[c].gen != 2)) continue;
             ray_err_t e = ray_col_stream_close(&writers[c],false);
             if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
         }
@@ -3272,10 +3315,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         }
         if (trace && !err) {
             ray_t* nm = ray_sym_str(r->schema[work.pass[0]].name);
-            fprintf(stderr,"parquet pass: first=%.*s cols=%lld %s decode=%.1fms close=%.1fms\n",
+            fprintf(stderr,"parquet pass: first=%.*s cols=%lld %s decode=%.1fms close=%.1fms mem_staged=%lld\n",
                     (int)ray_str_len(nm),ray_str_ptr(nm),(long long)work.npass,
                     writers[work.pass[0]].type == RAY_SYM ? "sym" : "num",
-                    (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6);
+                    (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6,(long long)in_mem);
             if (symf.dom && ray_sym_domain_import_stats(symf.dom,&ist) && ist.strings)
                 fprintf(stderr,"parquet symimp: strings=%lld dedup=%lld probes=%lld hits=%lld added=%lld"
                         " slots=%lld false_tags=%lld grows=%lld grow_mb=%.1f"

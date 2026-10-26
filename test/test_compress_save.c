@@ -1652,6 +1652,93 @@ static test_result_t test_stream_gen2_transcode_failure(void) {
 #endif
 }
 
+/* Three appends of 140000 rows streamed into `name` at generation 2, the
+ * payload staged in memory when `mem` (*staged: it was): I64 with nulls
+ * every 7th row, or SYM text over d; the converters' zone accumulator on. */
+static ray_err_t stream_staged(const char* name, int8_t type, struct ray_sym_domain_s* d, bool mem, bool* staged) {
+    ray_col_stream_t w;
+    ray_err_t e = ray_col_stream_open(&w, ray_test_tmp(CS_TMP), ray_sym_intern(name, strlen(name)), type, d, 2);
+    *staged = e == RAY_OK && mem && ray_col_stream_stage_mem(&w);
+    if (e == RAY_OK) e = ray_col_stream_index_begin(&w, 0);
+    int64_t cut[4] = { 0, 50000, 100001, 140000 };
+    for (int k = 0; e == RAY_OK && k < 3; k++) {
+        ray_t* p;
+        if (type == RAY_SYM) p = sym_text_rows(cut[k], cut[k + 1]);
+        else {
+            p = ray_vec_new(RAY_I64, cut[k + 1] - cut[k]); p->len = cut[k + 1] - cut[k];
+            for (int64_t i = 0; i < p->len; i++)
+                ((int64_t*)ray_data(p))[i] = (cut[k] + i) % 7 ? (cut[k] + i) * 13 : NULL_I64;
+            p->attrs |= RAY_ATTR_HAS_NULLS;
+        }
+        e = ray_col_stream_append(&w, p);
+        ray_release(p);
+    }
+    if (e == RAY_OK) e = ray_col_stream_close(&w, false);
+    ray_col_stream_abort(&w);
+    return e;
+}
+
+/* A payload staged in memory (Linux) gives the column file the staging file
+ * gives, byte for byte, and leaves no staging behind.  Only a generation-2
+ * writer of a type other than STR stages so, and only before its first
+ * append; an abort after appends to a memory stage leaves nothing. */
+static test_result_t test_stream_stage_mem(void) {
+    struct ray_sym_domain_s* d = ray_sym_domain_open_or_create(ray_test_tmp(CS_TMP "/m.sym"));
+    TEST_ASSERT_TRUE(d != NULL);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(d, "", 0), 0);
+    bool mem_files = false;
+#ifdef RAY_OS_LINUX
+    mem_files = true;
+#endif
+    const char* names[2][2] = { { "mi0", "mi1" }, { "ms0", "ms1" } };
+    for (int t = 0; t < 2; t++) {
+        int8_t type = t ? RAY_SYM : RAY_I64;
+        bool staged;
+        TEST_ASSERT_EQ_I(stream_staged(names[t][0], type, t ? d : NULL, false, &staged), RAY_OK);
+        TEST_ASSERT_FALSE(staged);
+        TEST_ASSERT_EQ_I(stream_staged(names[t][1], type, t ? d : NULL, true, &staged), RAY_OK);
+        TEST_ASSERT_TRUE(staged == mem_files);
+        char a[256], b[256];
+        snprintf(a, sizeof a, "%s/%s", ray_test_tmp(CS_TMP), names[t][0]);
+        snprintf(b, sizeof b, "%s/%s", ray_test_tmp(CS_TMP), names[t][1]);
+        size_t na, nb; uint8_t* pa = slurp(a, &na); uint8_t* pb = slurp(b, &nb);
+        TEST_ASSERT_TRUE(pa && pb && na == nb && memcmp(pa, pb, na) == 0);
+        free(pa); free(pb);
+    }
+#ifdef RAY_OS_LINUX
+    TEST_ASSERT_FALSE(cs_dir_has_stream_tmp(ray_test_tmp(CS_TMP)));
+#endif
+    ray_col_stream_t w;
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, ray_test_tmp(CS_TMP), ray_sym_intern("g0", 2), RAY_I64, NULL, 0), RAY_OK);
+    TEST_ASSERT_FALSE(ray_col_stream_stage_mem(&w));   /* generation 0: the staging file is the column file */
+    ray_col_stream_abort(&w);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, ray_test_tmp(CS_TMP), ray_sym_intern("st", 2), RAY_STR, NULL, 2), RAY_OK);
+    TEST_ASSERT_FALSE(ray_col_stream_stage_mem(&w));   /* STR: its pool spools beside it */
+    ray_col_stream_abort(&w);
+    ray_t* v = i64_col(1000, 3);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, ray_test_tmp(CS_TMP), ray_sym_intern("ap", 2), RAY_I64, NULL, 2), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    TEST_ASSERT_FALSE(ray_col_stream_stage_mem(&w));   /* rows already in the staging file */
+    ray_col_stream_abort(&w);
+    TEST_ASSERT_EQ_I(ray_col_stream_open(&w, ray_test_tmp(CS_TMP), ray_sym_intern("ab", 2), RAY_I64, NULL, 2), RAY_OK);
+    TEST_ASSERT_TRUE(ray_col_stream_stage_mem(&w) == mem_files);
+    TEST_ASSERT_FALSE(ray_col_stream_stage_mem(&w));   /* staged once */
+    TEST_ASSERT_EQ_I(ray_col_stream_append(&w, v), RAY_OK);
+    ray_col_stream_abort(&w);
+    ray_release(v);
+    const char* gone[] = { "g0", "st", "ap", "ab" };
+    for (int i = 0; i < 4; i++) {
+        char p[256];
+        snprintf(p, sizeof p, "%s/%s", ray_test_tmp(CS_TMP), gone[i]);
+        TEST_ASSERT_TRUE(access(p, F_OK) != 0);
+    }
+#ifdef RAY_OS_LINUX
+    TEST_ASSERT_FALSE(cs_dir_has_stream_tmp(ray_test_tmp(CS_TMP)));
+#endif
+    ray_sym_domain_release(d);
+    PASS();
+}
+
 /* The resident generation-0 STR writer used to copy the runtime str_pool
  * pointer (aux bytes 8..15) into the file when HAS_NULLS was set: two saves
  * of equal vectors now give identical bytes, with those bytes zero. */
@@ -4830,6 +4917,7 @@ const test_entry_t compress_entries[] = {
     { "compress/stream_str_matches_resident", test_stream_str_matches_resident, cs_setup, cs_teardown },
     { "compress/stream_sym_gen2",          test_stream_sym_gen2,          cs_setup, cs_teardown },
     { "compress/stream_gen2_transcode_failure", test_stream_gen2_transcode_failure, cs_setup, cs_teardown },
+    { "compress/stream_stage_mem",          test_stream_stage_mem,          cs_setup, cs_teardown },
     { "compress/str_header_no_pointer",    test_str_header_no_pointer,    cs_setup, cs_teardown },
     { "compress/csv_splayed_symbol",       test_csv_splayed_symbol,       rt_setup, rt_teardown },
     { "compress/csv_splayed_option",      test_csv_splayed_option,      rt_setup, rt_teardown },

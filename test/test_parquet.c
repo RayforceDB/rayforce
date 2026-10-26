@@ -346,7 +346,7 @@ static void pq_set_symmode(const char* v) { pq_set_env("RAY_PQ_SYM_MODE", v); }
 static void pq_sym_env_clear(void) {
     const char* knobs[] = {"RAY_PQ_SYM_MODE","RAY_PQ_SYM_ORDER","RAY_PQ_SYM_GROUPS","RAY_PQ_SYM_WINDOW",
                            "RAY_PQ_SYM_ARENA","RAY_PQ_SYM_HASH_BITS","RAY_PQ_SYM_INJECT","RAY_PQ_PASS_COLS",
-                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE","RAY_PQ_SYM_HASH_TOP"};
+                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE","RAY_PQ_SYM_HASH_TOP","RAY_PQ_STAGE"};
     for (size_t i = 0; i < sizeof(knobs)/sizeof(knobs[0]); i++) pq_set_env(knobs[i], NULL);
 }
 
@@ -3864,6 +3864,83 @@ static test_result_t test_pq_symfile_column(void) {
     PASS();
 }
 
+/* Generation 2 stages each column's raw payload until its close encodes it:
+ * in memory (Linux) by default, in the staging file under RAY_PQ_STAGE=file.
+ * Both give the same files, byte for byte (on one worker: the direct
+ * import's positions follow its tasks), in one pass and column by column
+ * (where a symbol column is encoded at its pass's end, saving the domain's
+ * count then), direct and grouped, and every row reads back. */
+static test_result_t test_pq_stage_mem(void) {
+    pq_sym_env_clear();
+    char src[160], dir[3][160], a[220], b[220];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-stage-%d.parquet", (int)getpid());
+    for (int k = 0; k < 3; k++) snprintf(dir[k], sizeof(dir[k]), "/tmp/rayforce-pq-stage-%d-%d", (int)getpid(), k);
+    const char* names[] = {"x","s","t"};
+    const char* stage[] = {NULL, "file", "mem"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    int64_t rows = 140000;   /* three encoding chunks */
+    TEST_ASSERT_TRUE(pq_synth(src, rows, 9, pq_synth_mixed));
+    bool mem_files = false;
+#ifdef RAY_OS_LINUX
+    mem_files = true;
+#endif
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    int bad = 0;
+    for (int run = 0; run < 8; run++) {
+        /* bit 0 column by column, bit 1 grouped, bit 2 four workers */
+        int cores = run & 4 ? 4 : 1;
+        for (int k = 0; k < 3; k++) {
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+            if (run & 1) pq_set_layout("1");
+            if (run & 2) pq_set_symmode("grouped");
+            pq_set_env("RAY_PQ_STAGE", stage[k]);
+            ray_t* res = pq_traced_import(src, dir[k], opts, trace, cap);
+            pq_sym_env_clear();
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  %d/%d: import failed: %s\n", run, k, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                bad++; continue;
+            }
+            ray_release(res);
+            /* each of the three columns staged in memory once, but under
+             * 'file, or by default with no memory size to go by (no runtime) */
+            int lines = 0;
+            double staged = pq_trace_sum(trace, "mem_staged", &lines);
+            double want = k == 1 || !mem_files || (k == 0 && ray_sys_ram_limit() <= 0) ? 0 : 3;
+            if (!lines || staged != want) {
+                fprintf(stderr, "  %d/%d: %.0f columns staged in memory over %d passes (want %.0f)\n",
+                        run, k, staged, lines, want);
+                bad++;
+            }
+            if (!pq_synth_check(dir[k], rows, pq_synth_mixed)) { fprintf(stderr, "  %d/%d: rows differ\n", run, k); bad++; }
+        }
+        const char* files[] = {"x","s","t",".sym"};
+        for (int k = 1; cores == 1 && k < 3; k++)
+            for (int f = 0; f < 4; f++) {
+                snprintf(a, sizeof(a), "%s/%s", dir[0], files[f]);
+                snprintf(b, sizeof(b), "%s/%s", dir[k], files[f]);
+                if (!pq_same_file(a, b)) { fprintf(stderr, "  %d: %s differs under %s\n", run, files[f], stage[k]); bad++; }
+            }
+        for (int k = 0; k < 3; k++) pq_remove_native(dir[k], names, 3);
+    }
+    ray_sys_free(trace);
+    unlink(src);
+    ray_release(opts); ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
 const test_entry_t parquet_entries[] = {
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
@@ -3893,6 +3970,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_grouped_layout",test_pq_sym_grouped_layout,pq_setup,pq_teardown},
     {"parquet/sym_mixed_modes",test_pq_sym_mixed_modes,pq_setup,pq_teardown},
     {"parquet/symfile_column",test_pq_symfile_column,pq_setup,pq_teardown},
+    {"parquet/stage_mem",test_pq_stage_mem,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},

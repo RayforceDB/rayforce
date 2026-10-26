@@ -14,6 +14,10 @@ typedef struct {
     char pool_path[1024];
     char path[1024];
     char tmp_path[1024];
+    /* where the raw payload is staged, which a converter's tasks open to
+     * write their row ranges: tmp_path, or a memory file */
+    char stage_path[1024];
+    bool in_mem;            /* ray_col_stream_stage_mem: fp is the memory file's, open until finish maps it */
     int8_t type;
     uint8_t attrs;
     int64_t rows;
@@ -45,6 +49,13 @@ typedef struct {
  * transcodes it chunk by chunk at finish (any other gen: RAY_ERR_VERSION). */
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
                               int8_t type, struct ray_sym_domain_s* domain, uint8_t gen);
+/* Generation 2, before the first append: stage the raw payload in a memory
+ * file (ray_file_open_mem) instead of the staging file, so none of it is
+ * written to storage before finish encodes it; the column file is then
+ * written once, at finish.  STR keeps its staging files.  False, the
+ * staging file kept, for any other writer or where the host has no memory
+ * files. */
+bool ray_col_stream_stage_mem(ray_col_stream_t* w);
 /* Start building the column's index from global row start_row. Call after
  * open and before the first append; no-op for types without an index. */
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row);

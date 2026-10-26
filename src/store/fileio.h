@@ -65,5 +65,10 @@ ray_err_t ray_file_rename_new(const char* old_path, const char* new_path);
 ray_err_t ray_file_rename_new_emulated(const char* old_path, const char* new_path);
 ray_err_t ray_mkdir(const char* path);
 ray_err_t ray_mkdir_p(const char* path);  /* like `mkdir -p` */
+/* A file in memory, which the kernel never writes to storage (Linux memfd):
+ * its descriptor, and in path[cap] the path that opens it again, each open
+ * with an offset of its own, while the descriptor stays open.
+ * RAY_FD_INVALID where the host has none, or that path does not open it. */
+ray_fd_t ray_file_open_mem(char* path, size_t cap);
 
 #endif /* RAY_FILEIO_H */
