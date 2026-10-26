@@ -2040,6 +2040,18 @@ ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
     return make_i64(ray_ipc_current_handle());
 }
 
+/* `(.ipc.auto_journal_eval)` answers true while the current evaluation
+ * runs inside an auto-journaled IPC request: the engine (or an embedder
+ * such as a q-wire layer, through ray_ipc_set_auto_journal_eval) has
+ * already journaled the enclosing request and will replay it, so the
+ * code it runs must not append frames of its own (`.log.write` refuses
+ * with `domain` there).  False everywhere else.  Variadic for the
+ * `(.ipc.auto_journal_eval)` call form. */
+ray_t* ray_ipc_auto_journal_eval_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    return make_bool(ray_ipc_auto_journal_eval() ? 1 : 0);
+}
+
 static ray_t* ipc_txlimit_dict(int64_t bytes, int64_t frames) {
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 2);
     ray_t* vals = ray_list_new(2);
