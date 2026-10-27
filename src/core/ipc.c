@@ -974,6 +974,9 @@ typedef struct {
     bool             compress_explicit;
     bool             upgrade_waiting;
     ray_poll_buf_t*  upgrade_resp;
+    /* A server's RDMA endpoint answered but not yet moved to: the client
+     * probes the fabric first and says XP_READY, or refuses. */
+    ray_xport_t*     pending_xport;
 } ray_ipc_conn_data_t;
 
 /* ===== Transport policy ===== */
@@ -1048,6 +1051,7 @@ enum {
     XP_SHM_OFFER = 2,   /* + token (16) + ring bytes (8) + the Unix socket's name, NUL-terminated */
     XP_RDMA      = 3,   /* + ray_rdma_record_t */
     XP_SWITCHED  = 4,   /* the server's last TCP frame: its side now reads the rings */
+    XP_READY     = 5,   /* the client's last TCP frame: its RDMA probe crossed, move now */
 };
 #define XP_TOKEN_LEN 16
 #define XP_NAME_MAX  64
@@ -1452,6 +1456,10 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
             ray_poll_buf_free(cd->upgrade_resp);
             cd->upgrade_resp = NULL;
         }
+        if (cd->pending_xport) {
+            cd->pending_xport->ops->destroy(cd->pending_xport);
+            cd->pending_xport = NULL;
+        }
 #ifdef RAY_IPC_XPORT
         shm_offers_drop_conn(poll, sel->id, cd);
 #endif
@@ -1621,6 +1629,29 @@ static bool conn_move(ray_poll_t* poll, int64_t id, ray_xport_t* x)
     return true;
 }
 
+/* The server's side of a move: the connection goes to `x`, and the
+ * client hears so in the server's last TCP frame. */
+static void server_switch(ray_poll_t* poll, int64_t id, ray_xport_t* x)
+{
+    ray_selector_t* conn = ray_poll_get(poll, id);
+    if (!conn) { x->ops->destroy(x); return; }
+    ray_sock_t sock = (ray_sock_t)conn->fd;
+    if (conn_move(poll, id, x)) {
+        uint8_t switched = XP_SWITCHED;
+        if (upgrade_send(sock, &switched, 1) < 0) ray_poll_deregister(poll, id);
+    }
+}
+
+/* The side channel's one-byte answers: 'k' with the descriptors, 'n' for
+ * no — a client that hears no knows the server has not moved and stays
+ * on TCP, where a silent close would have left it guessing. */
+static void side_say_no(int fd)
+{
+    char no = 'n';
+    ssize_t r = send(fd, &no, 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+    (void)r;
+}
+
 /* A connection on the side channel showing a token: the descriptors go
  * to it, the offered connection moves to the rings, and the client hears
  * so on TCP. */
@@ -1638,6 +1669,7 @@ static ray_t* shm_side_read(ray_poll_t* poll, ray_selector_t* sel)
     struct ucred who;
     socklen_t wl = sizeof who;
     if (!o || getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &who, &wl) != 0 || who.uid != getuid()) {
+        side_say_no(fd);
         ray_poll_deregister(poll, sel->id);
         return NULL;
     }
@@ -1668,11 +1700,7 @@ static ray_t* shm_side_read(ray_poll_t* poll, ray_selector_t* sel)
         taken.xport->ops->destroy(taken.xport);
         return NULL;
     }
-    ray_sock_t sock = (ray_sock_t)conn->fd;
-    if (conn_move(poll, taken.conn_id, taken.xport)) {
-        uint8_t switched = XP_SWITCHED;
-        if (upgrade_send(sock, &switched, 1) < 0) ray_poll_deregister(poll, taken.conn_id);
-    }
+    server_switch(poll, taken.conn_id, taken.xport);
     return NULL;
 }
 
@@ -1697,6 +1725,9 @@ static ray_t* shm_side_accept(ray_poll_t* poll, ray_selector_t* sel)
     socklen_t wl = sizeof who;
     if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &who, &wl) != 0 || who.uid != getuid() ||
         g_side_conns >= SHM_SIDE_CONNS_MAX) {
+        /* Another user's client, or too many waiting: told no, so it
+         * stays on TCP as it always could. */
+        side_say_no(c);
         close(c);
         return NULL;
     }
@@ -1794,6 +1825,7 @@ static int shm_fetch_rings(const char* name, const uint8_t* token, int fds[3], i
     wait_ms = left <= 0 ? 0 : left > INT_MAX ? INT_MAX : (int)left;
     struct pollfd p = { s, POLLIN, 0 };
     bool got = poll(&p, 1, wait_ms) > 0 && recvmsg(s, &mh, MSG_CMSG_CLOEXEC) == 1;
+    if (got && byte == 'n') { close(s); return 0; }   /* refused before anything moved */
     /* Exactly three descriptors in one message, or none of what came is
      * kept: a stray descriptor installed by recvmsg must still be closed. */
     bool ok = false;
@@ -1801,7 +1833,7 @@ static int shm_fetch_rings(const char* name, const uint8_t* token, int fds[3], i
         if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
         size_t n = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
         int* got_fds = (int*)CMSG_DATA(cm);
-        if (!ok && n == 3) {
+        if (!ok && n == 3 && byte == 'k') {
             memcpy(fds, got_fds, sizeof(int) * 3);
             ok = true;
         } else {
@@ -1859,8 +1891,10 @@ static uint8_t reply_kind(const ray_poll_buf_t* r)
 #endif /* RAY_IPC_XPORT */
 
 /* A client's upgrade record, answered: shared memory on this host (the
- * rings made and offered under a token), RDMA (our record, the connection
- * moving as the answer goes out), or a refusal. */
+ * rings made and offered under a token), RDMA (our record, the move
+ * waiting for the client's XP_READY once its probe has crossed), or a
+ * refusal.  XP_READY and a client's XP_REFUSE settle a pending RDMA
+ * endpoint and are not answered. */
 static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
                           ray_poll_buf_t* payload)
 {
@@ -1874,7 +1908,15 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
     answer[0] = XP_REFUSE;
     ray_xport_t* rdma = NULL;
 #ifdef RAY_IPC_XPORT
-    bool may = !sel->xport && (cd->peer_caps & RAY_IPC_CAP_XPORT);
+    if (cd->pending_xport && (kind == XP_READY || kind == XP_REFUSE)) {
+        ray_xport_t* x = cd->pending_xport;
+        cd->pending_xport = NULL;
+        if (kind == XP_READY) server_switch(poll, id, x);
+        else x->ops->destroy(x);
+        return;
+    }
+    if (kind == XP_READY || kind == XP_REFUSE) return;   /* nothing pending: nothing to say */
+    bool may = !sel->xport && !cd->pending_xport && (cd->peer_caps & RAY_IPC_CAP_XPORT);
     if (may && kind == XP_SHM_ASK && n == 1 + RAY_SHM_IDENTITY_LEN &&
         policy_allows(g_xport_policy, RAY_XPORT_SHM)) {
         const char* me = ray_shm_host_identity();
@@ -1933,7 +1975,7 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
         return;
     }
 #ifdef RAY_IPC_XPORT
-    if (rdma) conn_move(poll, id, rdma);
+    if (rdma) cd->pending_xport = rdma;   /* moved on the client's XP_READY */
 #endif
 }
 
@@ -2017,8 +2059,25 @@ static int client_upgrade(ray_poll_t* poll, int64_t id, int want, int64_t deadli
         if (reply_kind(reply) == XP_RDMA && (size_t)reply->offset == 1 + sizeof peer) {
             memcpy(&peer, reply->data + 1, sizeof peer);
             ray_poll_buf_free(reply);
-            /* The server has moved already: a failure here ends the connection. */
-            if (!ray_rdma_connect(x, &peer)) { x->ops->destroy(x); return -1; }
+            /* Two devices do not make one fabric: the first write to the
+             * peer's ring is the proof, and it is tried before either side
+             * moves.  Without it both stay on TCP (the server drops its
+             * endpoint on the refusal). */
+            int64_t left = deadline - ray_time_now_ms();
+            int probe_ms = left > 3000 ? 3000 : left < 100 ? 100 : (int)left;
+            bool reach = ray_rdma_connect(x, &peer) && ray_rdma_probe(x, probe_ms);
+            uint8_t word = reach ? XP_READY : XP_REFUSE;
+            sel = ray_poll_get(poll, id);
+            if (!sel || conn_tx_drain_blocking(poll, sel, deadline) < 0 ||
+                upgrade_send((ray_sock_t)sel->fd, &word, 1) < 0) {
+                x->ops->destroy(x);
+                return -1;
+            }
+            if (!reach) { x->ops->destroy(x); return miss; }
+            if (upgrade_wait(poll, id, deadline, &reply) < 0) { x->ops->destroy(x); return -1; }
+            uint8_t k = reply_kind(reply);
+            ray_poll_buf_free(reply);
+            if (k != XP_SWITCHED) { x->ops->destroy(x); return -1; }
             return conn_move(poll, id, x) ? 0 : -1;
         }
         ray_poll_buf_free(reply);

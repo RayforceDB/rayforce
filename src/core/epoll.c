@@ -33,6 +33,7 @@
 #include "mem/sys.h"
 #include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
@@ -256,6 +257,15 @@ static bool xport_news(ray_poll_t* poll)
     return false;
 }
 
+/* True when an upgraded connection's socket has bytes or an EOF. */
+static bool xport_sock_spoke(ray_selector_t* sel)
+{
+    char b;
+    ssize_t n = recv((int)sel->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n >= 0) return true;
+    return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+}
+
 static void xport_woke(ray_poll_t* poll)
 {
     for (uint32_t i = 0; i < poll->n_sels; i++) {
@@ -358,6 +368,17 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             if (eid < poll->n_sels)
                 sel = poll->sels[eid];
             if (!sel) continue;
+
+            /* The socket of an upgraded connection carries nothing but the
+             * peer's going: readable, it has closed or sent what it must
+             * not, and either way the connection ends — serving it would
+             * find nothing in the ring and leave the level-triggered event
+             * standing. */
+            if (sel->xport && (events[i].events & EPOLLIN) && xport_sock_spoke(sel)) {
+                if (sel->error_fn) sel->error_fn(poll, sel);
+                else ray_poll_deregister(poll, sel->id);
+                goto next_event;
+            }
 
             /* Process readable data first — even if hangup is also set.
              * A client may send a message and close; epoll reports both

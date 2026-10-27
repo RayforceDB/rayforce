@@ -70,6 +70,11 @@ ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine);
 /* Connects to the peer the record describes; false on failure, after
  * which the transport is only good for destroying. */
 bool         ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer);
+/* After connecting: one empty write to the peer's ring, waited for within
+ * timeout_ms.  True when it completed, which is the only proof that the
+ * two fabrics reach each other; false when the hardware gave up or the
+ * time ran out, after which the transport is only good for destroying. */
+bool         ray_rdma_probe(ray_xport_t* x, int timeout_ms);
 /* The device in use, for reporting: NULL without one. */
 const char*  ray_rdma_device_name(void);
 

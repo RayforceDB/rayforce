@@ -124,7 +124,9 @@ static int64_t shm_write(ray_xport_t* x, const uint8_t* p, int64_t len, bool blo
     int64_t taken = 0;
     while (len > 0) {
         uint64_t head = atomic_load_explicit(&s->out->head, memory_order_relaxed);
-        uint64_t room = s->ring - (head - atomic_load_explicit(&s->out->tail, memory_order_acquire));
+        uint64_t used = head - atomic_load_explicit(&s->out->tail, memory_order_acquire);
+        if (used > s->ring) return -1;   /* the peer's tail makes no sense: the link is broken */
+        uint64_t room = s->ring - used;
         if (room == 0) {
             if (!block) return taken;
             wait_for_room(s);
@@ -151,6 +153,7 @@ static int64_t shm_read(ray_xport_t* x, uint8_t* p, int64_t len)
     shm_xport_t* s = (shm_xport_t*)x;
     uint64_t tail  = atomic_load_explicit(&s->in->tail, memory_order_relaxed);
     uint64_t avail = atomic_load_explicit(&s->in->head, memory_order_acquire) - tail;
+    if (avail > s->ring) return -1;      /* the peer's head makes no sense: the link is broken */
     if (avail == 0 || len <= 0) return 0;
     uint64_t k = (uint64_t)len < avail ? (uint64_t)len : avail;
     uint64_t at = tail % s->ring;

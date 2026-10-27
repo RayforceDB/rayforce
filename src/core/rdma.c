@@ -213,7 +213,10 @@ typedef struct {
     bool                     failed;
     bool                     armed;       /* the completion queue will raise an event on the channel */
     bool                     connected;
+    bool                     probe_done;  /* the probe's own completion was seen */
 } rdma_xport_t;
+
+#define RDMA_WR_PROBE 2   /* the probe's work request id; ring writes carry 0 */
 
 static int64_t now_ns(void)
 {
@@ -271,6 +274,8 @@ static bool progress(rdma_xport_t* e)
                     e->rx_avail += landed;
                 }
                 reposts++;
+            } else if (wc[i].wr_id == RDMA_WR_PROBE) {
+                e->probe_done = true;
             } else {
                 e->outstanding -= RDMA_SIGNAL_EVERY;   /* a signalled send stands for the ones before it */
             }
@@ -564,11 +569,41 @@ bool ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer)
                      IBV_QP_MAX_QP_RD_ATOMIC) != 0)
         return false;
     /* The queue pair is ready to send before the peer's may be ready to
-     * receive (a server moves as it answers, the client after reading the
-     * answer); the hardware retransmits across that gap, and nothing is
-     * sent unasked right after a move anyway. */
+     * receive (a server answers before the client has connected); the
+     * hardware retransmits across that gap, and the client's probe is the
+     * first thing that crosses. */
     e->connected = true;
     return true;
+}
+
+bool ray_rdma_probe(ray_xport_t* x, int timeout_ms)
+{
+    rdma_xport_t* e = (rdma_xport_t*)x;
+    if (!e->connected || e->failed) return false;
+    /* An empty write carrying a credit of nothing: the peer takes it as
+     * no news and reposts the receive it used.  Signalled, under its own
+     * id, so its completion is told apart from the ring writes'. */
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof wr);
+    wr.wr_id               = RDMA_WR_PROBE;
+    wr.opcode              = IBV_WR_RDMA_WRITE_WITH_IMM;
+    wr.imm_data            = htonl(RDMA_CREDIT);
+    wr.send_flags          = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = e->peer_ring;
+    wr.wr.rdma.rkey        = e->peer_rkey;
+    e->probe_done = false;
+    if (ibv_post_send(e->qp, &wr, &bad) != 0) { e->failed = true; return false; }
+    int64_t until = now_ns() + (int64_t)timeout_ms * 1000000LL;
+    for (;;) {
+        drain_events(e);
+        progress(e);
+        if (e->probe_done) return true;
+        if (e->failed) return false;
+        int64_t left_ms = (until - now_ns()) / 1000000LL;
+        if (left_ms <= 0) { e->failed = true; return false; }
+        struct pollfd p = { e->ch->fd, POLLIN, 0 };
+        poll(&p, 1, left_ms > 10 ? 10 : (int)left_ms);
+    }
 }
 
 #else
@@ -578,6 +613,7 @@ bool ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer)
 bool         ray_rdma_available(void) { return false; }
 ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine) { (void)mine; return NULL; }
 bool         ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer) { (void)x; (void)peer; return false; }
+bool         ray_rdma_probe(ray_xport_t* x, int timeout_ms) { (void)x; (void)timeout_ms; return false; }
 const char*  ray_rdma_device_name(void) { return NULL; }
 
 #endif
