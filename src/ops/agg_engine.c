@@ -3357,6 +3357,7 @@ static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start
     bool failed = false;                                /* a dense range's read failed (noted) */
     #define AGG_SEL_FLUSH() do {                                                    \
         if (nb > 0 && !loc->oom) {                                                  \
+            ray_pool_scan_at(m->nrows, rows[0], cur.row_end);                       \
             if (!rr->staged) agg_dense_sel_rows(&t, c->whole, wid, 0, nb);          \
             else err = agg_idx_walk(rr, &cs, rows, 0, nb, &t, agg_dense_sel_rows, wid); \
         }                                                                           \
