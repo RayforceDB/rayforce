@@ -951,6 +951,21 @@ bool ray_env_in_query_helper(bool* named) {
     return false;
 }
 
+/* True when the global slot for `sym_id` still holds the function builtin
+ * registration put there (user flag clear).  A user write to the name, even
+ * of the same function, sets the flag and makes this false. */
+static bool env_global_is_builtin_registration(int64_t sym_id) {
+    env_lock();
+    uint32_t bucket = env_write_bucket(sym_id);
+    int32_t i = (int32_t)g_env.write_index[bucket] - 1;
+    bool r = i >= 0 && g_env.keys[i] == sym_id && !g_env.user[i] &&
+             g_env.vals[i] &&
+             (g_env.vals[i]->type == RAY_UNARY || g_env.vals[i]->type == RAY_BINARY ||
+              g_env.vals[i]->type == RAY_VARY);
+    env_unlock();
+    return r;
+}
+
 /* Dotted-path write.  base_lookup(head_sym) returns the current binding in
  * the scope we are writing to (global or local frame), or NULL.  bind_fn
  * rebinds the new top-level dict in that same scope.  Walks the existing
@@ -968,6 +983,19 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
      * non-dict intermediate is an error. */
     ray_t* parents[256];
     parents[0] = base_lookup(segs[0]);
+    /* A builtin registration is not a value the user bound: a plain
+     * (set rc 7) shadows it, so (set rc.x 1) creates the namespace the same
+     * way instead of failing on the function it would shadow.  Only an
+     * untouched registration counts: a function the user bound themselves
+     * ((set held count), (set rc count)) is a user binding like any other
+     * non-dict value and stays refused, and so does any local binding, since
+     * a local frame holds no registrations. */
+    /* Value kind first: a DICT head (every ordinary namespace update) can
+     * never be a registration, so it skips the lock and slot lookup. */
+    if (parents[0] && parents[0]->type != RAY_DICT &&
+        base_lookup == ray_env_get_global &&
+        env_global_is_builtin_registration(segs[0]))
+        parents[0] = NULL;
     if (parents[0] && parents[0]->type != RAY_DICT)
         return RAY_ERR_TYPE;
 

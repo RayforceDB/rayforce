@@ -1,5 +1,8 @@
 /* Copyright (c) 2026 Anton Kundenko. MIT license; see LICENSE.
  * Shared by CSV and Parquet native conversion. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L   /* fdopen */
+#endif
 #include "stream.h"
 #include "ops/hash.h"
 #include "store/col.h"
@@ -50,12 +53,42 @@ ray_err_t ray_col_stream_open(ray_col_stream_t* w,
     if (n < 0 || (size_t)n >= sizeof(w->tmp_path)) return RAY_ERR_RANGE;
     n = snprintf(w->pool_path, sizeof(w->pool_path), "%s/.stream-%.*s.pool", dir, (int)name_len, name);
     if (n < 0 || (size_t)n >= sizeof(w->pool_path)) return RAY_ERR_RANGE;
+    memcpy(w->stage_path, w->tmp_path, sizeof(w->stage_path));
 
     w->fp = fopen(w->tmp_path, "wb+");
     if (!w->fp) return RAY_ERR_IO;
     ray_t zero = {0};
     if (fwrite(&zero, 1, 32, w->fp) != 32) return RAY_ERR_IO;
     return RAY_OK;
+}
+
+bool ray_col_stream_stage_mem(ray_col_stream_t* w) {
+#if defined(RAY_OS_WINDOWS)
+    (void)w;
+    return false;   /* no memory files there (ray_file_open_mem) */
+#else
+    if (w->gen != 2 || w->type == RAY_STR || !w->fp || w->in_mem || w->rows) return false;
+    char path[sizeof(w->stage_path)];
+    ray_fd_t fd = ray_file_open_mem(path, sizeof(path));
+    if (fd == RAY_FD_INVALID) return false;
+    FILE* f = fdopen(fd, "r+b");   /* the writer's one descriptor of it, as the file's */
+    if (!f) { ray_file_close(fd); return false; }
+    ray_t zero = {0};
+    if (fwrite(&zero, 1, 32, f) != 32 || fflush(f) != 0) { fclose(f); return false; }
+    fclose(w->fp);
+    remove(w->tmp_path);   /* finish writes the column file there */
+    w->fp = f; w->in_mem = true;
+    memcpy(w->stage_path, path, sizeof(path));
+    return true;
+#endif
+}
+
+/* The memory file goes with its last descriptor and mapping. */
+static void stream_drop_mem(ray_col_stream_t* w) {
+    if (!w->in_mem) return;
+    if (w->fp) fclose(w->fp);
+    w->fp = NULL;
+    w->in_mem = false;
 }
 
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
@@ -276,6 +309,7 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
  * ([32 B zero header][rows x element][STR: 32 B pool header + pool]); it is
  * mapped and transcoded chunk by chunk into a second staging file, which
  * then replaces the first (published by ray_col_stream_publish as today).
+ * A payload staged in memory is transcoded straight into tmp_path.
  * The zone accumulator is recorded as CHUNK_ZONE only (in the enc header);
  * a STR column whose index_begin ran records the DICT, which the column
  * writer builds from the chunks it encodes (P6b).  Closes w->fp on every path. */
@@ -285,20 +319,25 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
                   ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, w->type)) ? RAY_IDX_CHUNK_ZONE
                : (w->want_dict && ray_col_dict_wanted(w->type, w->rows)) ? RAY_IDX_DICT : 0;
     stream_drop_index(w);                         /* the DICT is built by the column writer */
+    bool mem = w->in_mem;
     ray_err_t err = fflush(w->fp) == 0 ? RAY_OK : RAY_ERR_IO;
-    if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
-    w->fp = NULL;
-    if (err != RAY_OK) return err;
+    /* the memory file stays open until it is mapped: closed, it is gone */
+    if (!mem) {
+        if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+        w->fp = NULL;
+    }
+    if (err != RAY_OK) { stream_drop_mem(w); return err; }
     uint8_t esz = w->type == RAY_SYM ? 4 : ray_sym_elem_size(w->type, 0);
     uint64_t need = 32 + (uint64_t)w->rows * esz + (w->type == RAY_STR ? 32 + w->pool_bytes : 0);
     size_t msz = 0;
-    void* m = ray_vm_map_file(w->tmp_path, &msz);
+    void* m = ray_vm_map_file(w->stage_path, &msz);
+    stream_drop_mem(w);                           /* the mapping keeps its pages */
     /* the index was dropped above, so the staging file is exactly the payload */
     if (!m || msz != need) { if (m) ray_vm_unmap_file(m, msz); return RAY_ERR_IO; }
     const uint8_t* data = (const uint8_t*)m + 32;
     const char* pool = w->type == RAY_STR ? (const char*)m + 32 + (size_t)w->rows * 16 + 32 : NULL;
     char enc_path[1100];
-    snprintf(enc_path, sizeof enc_path, "%s.g2", w->tmp_path);
+    snprintf(enc_path, sizeof enc_path, mem ? "%s" : "%s.g2", w->tmp_path);
     FILE* f = fopen(enc_path, "wb+");
     err = f ? RAY_OK : RAY_ERR_IO;
     ray_encw_t ew; memset(&ew, 0, sizeof ew);
@@ -315,7 +354,7 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
         if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
         else { err = ray_file_sync(fd); ray_file_close(fd); }
     }
-    if (err == RAY_OK) err = ray_file_rename(enc_path, w->tmp_path);
+    if (err == RAY_OK && !mem) err = ray_file_rename(enc_path, w->tmp_path);
     if (err != RAY_OK) remove(enc_path);
     return err;
 }
@@ -490,6 +529,7 @@ void ray_col_stream_abort(ray_col_stream_t* w) {
     ray_col_stream_drop_lut(w);
     stream_drop_index(w);
     w->finished = false;
+    stream_drop_mem(w);
     if (w->fp) fclose(w->fp);
     w->fp = NULL;
     if (w->pool_fp) fclose(w->pool_fp);
