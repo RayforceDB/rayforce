@@ -1357,6 +1357,18 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
             }
             continue;
         }
+        /* a dense segment of a fixed-width base other than SYM (whose
+         * segments may differ in width and domain): its bytes and nulls */
+        if (base != RAY_STR && base != RAY_SYM && seg->type == base &&
+            !(seg->attrs & RAY_ATTR_SLICE) && ray_is_vec(seg)) {
+            size_t esz = (size_t)ray_type_sizes[base];
+            memcpy((char*)ray_data(out) + (size_t)pos * esz, ray_data(seg), (size_t)seg->len * esz);
+            if (ray_vec_may_have_nulls(seg))
+                for (int64_t i = 0; i < seg->len; i++)
+                    if (ray_vec_is_null(seg, i)) ray_vec_set_null(out, pos + i, true);
+            pos += seg->len;
+            continue;
+        }
         for (int64_t i = 0; i < seg->len; i++) {
             if (base == RAY_STR) {
                 size_t slen = 0;
@@ -2888,6 +2900,127 @@ static ray_t* at_gather_typed(ray_t* vec, ray_t* idx) {
     return out;
 }
 
+/* Rows ids[0..n) (ascending) of a parted column of a table with partition
+ * counts cnt / ncnt, read from the segments that hold them as the filter
+ * gathers them: LIST cells retained, STR deep-copied, the rest cell by
+ * cell with their null bits.  An owned vector or error. */
+static ray_t* parted_rows_asc(ray_t* col, const int64_t* cnt, int64_t ncnt,
+                              const int64_t* ids, int64_t n) {
+    ray_t** segs = (ray_t**)ray_data(col);
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+    if (base == RAY_LIST) return parted_gather_list_rows_c(segs, col->len, ids, n, cnt, ncnt);
+    if (base == RAY_STR)  return parted_gather_str_rows_c(segs, col->len, ids, n, cnt, ncnt);
+    uint8_t attrs = base == RAY_SYM ? parted_sym_max_attrs(segs, col->len) : 0;
+    ray_t* out = typed_vec_new(base, attrs, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    parted_gather_col(col, ids, n, out, cnt, ncnt);
+    col_propagate_str_pool_parted(out, segs, col->len);
+    if (base == RAY_SYM) ray_sym_vec_adopt_domain(out, sym_domain_rep(col));
+    return out;
+}
+
+/* Row `row` (in range) of a table whose columns are read in place, as a
+ * dict of its column names to cells. */
+static ray_t* table_row_dict(ray_t* vec, int64_t row) {
+    int64_t ncols = ray_table_ncols(vec);
+    /* Build a dict: keys SYM vec + vals LIST */
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, ncols);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_list_new(ncols);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t key_id = ray_table_col_name(vec, c);
+        keys = ray_vec_append(keys, &key_id);
+        if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+        ray_t* col = ray_table_col_idx(vec, c);
+        if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
+        int alloc = 0;
+        ray_t* val = collection_elem(col, row, &alloc);
+        if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
+        vals = ray_list_append(vals, val);
+        if (alloc) ray_release(val);
+        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    }
+    return ray_dict_new(keys, vals);
+}
+
+static int at_pair_cmp(const void* a, const void* b) {
+    int64_t x = ((const int64_t*)a)[0], y = ((const int64_t*)b)[0];
+    return x < y ? -1 : x > y;
+}
+
+/* Rows ids[0..n) of a parted column, in that order, repeats included: the
+ * ascending ids read directly, any other order read sorted and then put
+ * back by position.  An owned vector or error. */
+static ray_t* parted_at_rows(ray_t* col, const int64_t* cnt, int64_t ncnt,
+                             const int64_t* ids, int64_t n) {
+    bool asc = true;
+    for (int64_t i = 1; i < n && asc; i++) asc = ids[i] >= ids[i - 1];
+    if (asc) return parted_rows_asc(col, cnt, ncnt, ids, n);
+    ray_t* pairs = ray_vec_new(RAY_I64, 2 * n);   /* (row, position) */
+    ray_t* back  = ray_vec_new(RAY_I64, n);
+    if (!pairs || RAY_IS_ERR(pairs) || !back || RAY_IS_ERR(back)) {
+        if (pairs && !RAY_IS_ERR(pairs)) ray_release(pairs);
+        if (back && !RAY_IS_ERR(back)) ray_release(back);
+        return ray_error("oom", NULL);
+    }
+    int64_t* pr = (int64_t*)ray_data(pairs);
+    int64_t* bk = (int64_t*)ray_data(back);
+    for (int64_t i = 0; i < n; i++) { pr[2 * i] = ids[i]; pr[2 * i + 1] = i; }
+    qsort(pr, (size_t)n, 2 * sizeof(int64_t), at_pair_cmp);
+    for (int64_t k = 0; k < n; k++) bk[pr[2 * k + 1]] = k;   /* id i is sorted row k */
+    for (int64_t k = 0; k < n; k++) pr[k] = pr[2 * k];        /* the sorted rows */
+    ray_t* sorted = parted_rows_asc(col, cnt, ncnt, pr, n);
+    ray_t* out = (sorted && !RAY_IS_ERR(sorted)) ? gather_by_idx(sorted, bk, n) : sorted;
+    if (sorted && !RAY_IS_ERR(sorted)) ray_release(sorted);
+    ray_release(pairs);
+    ray_release(back);
+    return out ? out : ray_error("oom", NULL);
+}
+
+/* Rows ids[0..n) (any order) of a MAPCOMMON column: each row's partition
+ * key.  An owned vector or error. */
+static ray_t* mapcommon_at_rows(ray_t* mc, const int64_t* ids, int64_t n) {
+    ray_t** mp = (ray_t**)ray_data(mc);
+    ray_t* kv = mp[0];
+    const int64_t* counts = (const int64_t*)ray_data(mp[1]);
+    int64_t np = kv->len;
+    size_t esz = (size_t)ray_sym_elem_size(kv->type, kv->attrs);
+    ray_t* out = ray_vec_new(kv->type, n);
+    ray_t* endv = ray_vec_new(RAY_I64, np > 0 ? np : 1);
+    if (!out || RAY_IS_ERR(out) || !endv || RAY_IS_ERR(endv)) {
+        if (out && !RAY_IS_ERR(out)) ray_release(out);
+        if (endv && !RAY_IS_ERR(endv)) ray_release(endv);
+        return ray_error("oom", NULL);
+    }
+    out->len = n;
+    if (kv->type == RAY_SYM) ray_sym_vec_adopt_domain(out, kv);
+    int64_t* ends = (int64_t*)ray_data(endv);
+    for (int64_t p = 0, e = 0; p < np; p++) { e += counts[p]; ends[p] = e; }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t lo = 0, hi = np > 0 ? np - 1 : 0;   /* first partition ending past the row */
+        while (lo < hi) { int64_t mid = (lo + hi) / 2; if (ids[i] < ends[mid]) hi = mid; else lo = mid + 1; }
+        memcpy((char*)ray_data(out) + (size_t)i * esz, (const char*)ray_data(kv) + (size_t)lo * esz, esz);
+    }
+    ray_release(endv);
+    return out;
+}
+
+/* Whether a table's rows are read through anything but dense columns: a
+ * parted, MAPCOMMON or encoded slot, which (at tbl rows) reads by row
+ * instead of materializing the column. */
+static bool at_table_indirect(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        if (ray_col_gather_slot(ray_table_get_col_enc_idx(tbl, c))) return true;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, c, &m) && (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
+}
+
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     /* Table column access by symbol key — return the typed vector directly.
@@ -2910,26 +3043,21 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         int64_t row = as_i64(idx);
         int64_t nrows = ray_table_nrows(vec);
         if (row < 0 || row >= nrows) return ray_error("domain", "at: row index %lld out of range for table of %lld rows", (long long)row, (long long)nrows);
-        int64_t ncols = ray_table_ncols(vec);
-        /* Build a dict: keys SYM vec + vals LIST */
-        ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, ncols);
-        if (RAY_IS_ERR(keys)) return keys;
-        ray_t* vals = ray_list_new(ncols);
-        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-        for (int64_t c = 0; c < ncols; c++) {
-            int64_t key_id = ray_table_col_name(vec, c);
-            keys = ray_vec_append(keys, &key_id);
-            if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-            ray_t* col = ray_table_col_idx(vec, c);
-            if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
-            int alloc = 0;
-            ray_t* val = collection_elem(col, row, &alloc);
-            if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
-            vals = ray_list_append(vals, val);
-            if (alloc) ray_release(val);
-            if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+        /* A parted, MAPCOMMON or encoded column: the row is read as a
+         * one-row table, then its cells; plain columns are read in place. */
+        if (at_table_indirect(vec)) {
+            ray_t* one = ray_vec_new(RAY_I64, 1);
+            if (!one || RAY_IS_ERR(one)) return one ? one : ray_error("oom", NULL);
+            one->len = 1;
+            ((int64_t*)ray_data(one))[0] = row;
+            ray_t* t1 = ray_at_fn(vec, one);
+            ray_release(one);
+            if (!t1 || RAY_IS_ERR(t1)) return t1 ? t1 : ray_error("oom", NULL);
+            ray_t* d = table_row_dict(t1, 0);
+            ray_release(t1);
+            return d;
         }
-        return ray_dict_new(keys, vals);
+        return table_row_dict(vec, row);
     }
 
     /* Table row selection by index vector: apply the row ids to each
@@ -2948,27 +3076,26 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         int64_t ncols = ray_table_ncols(vec);
         ray_t* result = ray_table_new(ncols);
         if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+        int64_t ncnt = 0;
+        const int64_t* cnt = parted_table_counts(vec, &ncnt);
         for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_col_idx(vec, c);
-            if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
             int64_t name = ray_table_col_name(vec, c);
-            if (!col) continue;
-            /* Parted and MAPCOMMON columns (.db.parted.get) are not dense
-             * vectors: flatten them the way the symbol arm does, then gather. */
-            ray_t* flat = NULL;
-            if (RAY_IS_PARTED(col->type)) {
-                int64_t ncnt = 0;
-                const int64_t* cnt = parted_table_counts(vec, &ncnt);
-                flat = parted_to_flat_vec_c(col, cnt, ncnt);
-            } else if (col->type == RAY_MAPCOMMON) {
-                flat = materialize_mapcommon(col);
+            ray_t* gathered = NULL;
+            /* An encoded slot is read at the rows (each touched vector
+             * once), a parted or MAPCOMMON column from the partitions that
+             * hold them: none is materialized whole. */
+            ray_t* enc = ray_col_gather_slot(ray_table_get_col_enc_idx(vec, c));
+            if (enc) {
+                ray_t* ge = ray_col_gather_enc(enc, NULL, true, ids, nidx, &gathered);
+                if (ge) { ray_release(result); return ge; }
+            } else {
+                ray_t* col = ray_table_col_idx(vec, c);
+                if (col && RAY_IS_ERR(col)) { ray_release(result); return col; }
+                if (!col) continue;
+                if (RAY_IS_PARTED(col->type))         gathered = parted_at_rows(col, cnt, ncnt, ids, nidx);
+                else if (col->type == RAY_MAPCOMMON)  gathered = mapcommon_at_rows(col, ids, nidx);
+                else                                  gathered = gather_by_idx(col, ids, nidx);
             }
-            if (flat && RAY_IS_ERR(flat)) {
-                ray_release(result);
-                return flat;
-            }
-            ray_t* gathered = gather_by_idx(flat ? flat : col, ids, nidx);
-            if (flat) ray_release(flat);
             if (!gathered || RAY_IS_ERR(gathered)) {
                 ray_release(result);
                 return gathered ? gathered : ray_error("oom", NULL);

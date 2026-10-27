@@ -30,49 +30,6 @@
  * Filter execution — extracted from exec.c
  * ============================================================================ */
 
-/* Gather from a parted column using global row indices (sorted ascending).
- * Walks match_idx with an advancing segment cursor — O(count + n_segs). */
-static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
-                               int64_t count, ray_t* dst_col,
-                               const int64_t* cnt, int64_t ncnt) {
-    int64_t n_segs = parted_col->len;
-    if (n_segs == 0) return;  /* zero-length VLA is UB in C17 */
-    ray_t** segs = (ray_t**)ray_data(parted_col);
-    int8_t base = (int8_t)RAY_PARTED_BASETYPE(parted_col->type);
-    /* Output width is fixed by dst_col (callers allocate it at the max
-     * segment width); narrower segments are widened per cell. */
-    uint8_t out_attrs = (base == RAY_SYM) ? dst_col->attrs : 0;
-    uint8_t esz = ray_sym_elem_size(base, out_attrs);
-    char* dst = (char*)ray_data(dst_col);
-    memset(dst, 0, (size_t)count * esz);
-
-    /* Build prefix-sum segment end table (a NULL segment spans its
-     * partition's rows, from the table's partition counts) */
-    int64_t seg_ends[n_segs];
-    int64_t cumul = 0;
-    for (int64_t i = 0; i < n_segs; i++) {
-        cumul += parted_seg_rows(segs, i, cnt, ncnt);
-        seg_ends[i] = cumul;
-    }
-
-    /* Walk match_idx (sorted ascending) with advancing segment cursor */
-    int64_t seg = 0;
-    for (int64_t i = 0; i < count; i++) {
-        int64_t row = match_idx[i];
-        while (seg < n_segs - 1 && row >= seg_ends[seg]) seg++;
-        if (!segs[seg]) {
-            parted_fill_nulls(dst_col, i, 1);   /* a missing segment's row */
-            continue;
-        }
-        int64_t seg_start = (seg > 0) ? seg_ends[seg - 1] : 0;
-        int64_t local_row = row - seg_start;
-        parted_copy_cells(dst, base, out_attrs, i, segs[seg], local_row, 1);
-        if (ray_vec_may_have_nulls(segs[seg]) &&
-            ray_vec_is_null(segs[seg], local_row))
-            ray_vec_set_null(dst_col, i, true);
-    }
-}
-
 /* Filter a single vector by boolean predicate. */
 static ray_t* exec_filter_vec(ray_t* input, ray_t* pred, int64_t pass_count) {
     /* RAY_LIST: cells are ray_t* — gather them with a retain.  The
