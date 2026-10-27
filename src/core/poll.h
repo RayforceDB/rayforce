@@ -34,6 +34,11 @@ typedef struct ray_selector ray_selector_t;
 
 #define RAY_SEL_STDIN   0
 #define RAY_SEL_SOCKET  3
+/* The wake-up descriptor of an upgraded connection's transport (below):
+ * readable when bytes landed in its ring or ring space came back.  Its
+ * selector carries no rx/tx state of its own; `data` names the
+ * connection selector it serves (as an id cast to a pointer). */
+#define RAY_SEL_XPORT   4
 
 /* ===== Callbacks ===== */
 
@@ -67,6 +72,54 @@ typedef struct ray_poll_buf {
     uint8_t              storage[];
 } ray_poll_buf_t;
 
+/* ===== Transport — where an upgraded connection's bytes go =====
+ *
+ * A connection starts on its socket.  Once both peers agree (core/ipc.c),
+ * its frames move to a faster transport: shared-memory rings on one host
+ * (core/shm.c), remote memory across hosts with RDMA (core/rdma.c).  The
+ * socket stays open, carrying nothing but the peer's going.  A transport
+ * is a reliable byte stream the poll loop drives like a socket, with one
+ * difference it has to know about: bytes can land without any descriptor
+ * becoming readable, so the loop asks `pending` before it sleeps and tells
+ * the transport that it sleeps (`prepare_sleep`), at which point the peer
+ * starts writing to `event_fd`. */
+typedef struct ray_xport ray_xport_t;
+
+typedef struct ray_xport_ops {
+    /* Bytes copied out: > 0, or 0 when none has arrived, -1 when the link
+     * failed. */
+    int64_t (*read)(ray_xport_t* x, uint8_t* buf, int64_t len);
+    /* Bytes taken now: > 0, or 0 when nothing fits (never with `block`,
+     * which waits for room until all are taken), -1 when the link failed. */
+    int64_t (*write)(ray_xport_t* x, const uint8_t* buf, int64_t len, bool block);
+    /* Bytes wait to be read (or the link failed).  Takes what the peer
+     * announced first, so it is also the loop's "progress" step. */
+    bool    (*pending)(ray_xport_t* x);
+    /* At least one byte can be written now. */
+    bool    (*room)(ray_xport_t* x);
+    /* About to sleep on event_fd: the peer will ring it from now on when
+     * bytes arrive if `want_data`, when ring space returns if `want_room`.
+     * False when what is waited for arrived between the last look and the
+     * flag: do not sleep. */
+    bool    (*prepare_sleep)(ray_xport_t* x, bool want_data, bool want_room);
+    /* Awake again: the peer stops ringing, the bell is quietened. */
+    void    (*woke)(ray_xport_t* x);
+    void    (*destroy)(ray_xport_t* x);
+} ray_xport_ops_t;
+
+#define RAY_XPORT_TCP   0
+#define RAY_XPORT_SHM   1
+#define RAY_XPORT_RDMA  2
+
+struct ray_xport {
+    const ray_xport_ops_t* ops;
+    int     event_fd;
+    uint8_t kind;           /* RAY_XPORT_SHM / RAY_XPORT_RDMA */
+    /* Whether event_fd also announces returned ring space; a sleeper with
+     * queued output on a transport without it looks again soon. */
+    bool    fd_tells_room;
+};
+
 /* ===== Selector — one per registered fd ===== */
 
 struct ray_selector {
@@ -86,6 +139,11 @@ struct ray_selector {
         int64_t         limit_frames;  /* idem; 0 = process default (which may be unlimited) */
         int64_t         hwm_bytes;     /* largest backlog ever queued on this connection */
     } tx;
+    /* The transport this connection moved to, or NULL while on its socket.
+     * Owned by the selector: deregistering it destroys the transport and
+     * the RAY_SEL_XPORT selector (`xport_id`) that waits on its event_fd. */
+    ray_xport_t*     xport;
+    int64_t          xport_id;
 };
 
 /* ===== Registration ===== */
@@ -123,6 +181,7 @@ struct ray_poll {
     void*            timers;           /* opaque ray_timers_t*; lazily allocated */
     void*            mcast;            /* opaque ray_mcast_t*; lazily allocated */
     int64_t          tx_hwm_bytes;     /* largest backlog ever queued on any connection */
+    uint32_t         n_xport;          /* connections on a transport right now */
 };
 
 /* ===== API ===== */
@@ -156,5 +215,31 @@ ray_poll_buf_t*   ray_poll_buf_from_frame(ray_poll_frame_t* f); /* node holding 
 void            ray_poll_tx_request(ray_poll_t* poll, ray_selector_t* sel);
 void            ray_poll_tx_cancel(ray_poll_t* poll, ray_selector_t* sel);
 int             ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel);
+
+/* ===== Transports ===== */
+
+/* Move `sel` to `xport`: registers a RAY_SEL_XPORT selector on its
+ * event_fd and routes the connection's bytes through it from now on.  The
+ * transport is owned by the selector on success; on failure (-1) the
+ * caller still owns it. */
+int             ray_poll_xport_attach(ray_poll_t* poll, ray_selector_t* sel,
+                                      ray_xport_t* xport);
+/* The connection's byte stream, wherever it is: its transport once it
+ * has one, else its socket through recv_fn/send_fn.  Same contract as the
+ * io callbacks: bytes moved, 0 for EOF (recv) or nothing taken (send with
+ * errno EAGAIN), -1 with errno (EAGAIN when nothing is there yet). */
+int64_t         ray_poll_sel_recv(ray_selector_t* sel, uint8_t* buf, int64_t len);
+int64_t         ray_poll_sel_send(ray_selector_t* sel, const uint8_t* buf, int64_t len);
+/* Fill the selector's rx buffer and run its read_fn for every phase it
+ * completes, until the stream has nothing more right now.  Returns 0 then,
+ * or -1 when the selector was deregistered (peer gone, protocol error).
+ * The one rx pump: the poll backends and the sync-send wait share it. */
+int             ray_poll_serve_rx(ray_poll_t* poll, int64_t id);
+/* Write what the queue holds and the stream takes; -1 when the selector
+ * was deregistered on a write error. */
+int             ray_poll_serve_tx(ray_poll_t* poll, int64_t id);
+/* For the backends' deregister: tears the transport down with its
+ * connection (no-op without one). */
+void            ray_poll_xport_detach(ray_poll_t* poll, ray_selector_t* sel);
 
 #endif /* RAY_POLL_H */

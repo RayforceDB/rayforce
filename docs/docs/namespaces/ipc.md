@@ -1,6 +1,6 @@
 # `.ipc.*` — connection IPC
 
-Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over TCP. The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes. All five connection builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
+Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages. A connection opens over TCP; between two Rayforce processes it then moves to a faster transport when both sides can — shared-memory rings on one host, RDMA across hosts — and stays on TCP otherwise (see [Transports](../storage/ipc.md#transports)). The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes on TCP links that leave the host. The connection builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
 
 !!! note "One handle namespace"
     A handle is a handle, whichever side of the wire you are on: the `i64` returned by `.ipc.open` and the `h` a server-side hook receives (or reads via `.ipc.handle`) name connections in the same namespace, and `.ipc.send`, `.ipc.post`, and `.ipc.close` accept either. A server can therefore push messages back through the handle its hooks were given — from inside the hook or any time later. Handles are only meaningful inside the process that owns the connection; they are not stable identifiers across processes or reconnects.
@@ -12,11 +12,12 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.ipc.open`](#ipc-open) | variadic | restricted | Open a TCP connection (optional connect timeout); return an i64 handle. |
+| [`.ipc.open`](#ipc-open) | variadic | restricted | Open a connection (optional connect timeout or options dict); return an i64 handle. |
 | [`.ipc.send`](#ipc-send) | variadic | restricted | Send a message synchronously (optional deadline); return the server's result. |
 | [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
-| [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. |
+| [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. Given a live handle, that connection's view, transport included. |
+| [`.ipc.transport`](#ipc-transport) | variadic | restricted | Read or set the process's transport policy: `auto`, `tcp`, `shm` or `rdma`. |
 
 ## `.ipc.open` { #ipc-open }
 
@@ -39,12 +40,13 @@ Options dict keys (all optional; keys must be symbols):
 | `timeout` | Connect + handshake budget in ms, as the bare-integer form. | 5 seconds. |
 | `compress` | Threshold in bytes: `0N` never compresses, `0` always does, `n` compresses payloads larger than `n`. | Loopback links never compress; others use 2,000. |
 | `keepalive` | Dead-peer budget in ms, or `0N` to turn detection off. `0` is rejected. | Detection on, 60-second budget. |
+| `transport` | A symbol: `auto` moves the connection to shared memory when the peer is on this host and to RDMA when it is on another and both hosts have a device, else stays on TCP; `tcp` never moves; `shm` or `rdma` insists on that transport and fails the open with `io` when the peer refuses it or it is unavailable. | The process policy, `(.ipc.transport)`. |
 
 **Dead-peer detection.** A peer can become unreachable without closing the socket: a suspended host, a NAT or firewall that silently drops the flow, or a machine that loses power. No reset ever arrives. Without detection the handle stays open forever, and `.ipc.on.close` never fires. To prevent that, outbound connections enable TCP keepalive: after half the budget of silence the kernel starts probing, and it declares the peer dead about one budget after the peer last sent anything. The connection is then torn down like any other failure: a pending `.ipc.send` returns `io` and `.ipc.on.close` fires. A peer that is alive answers the probes from its kernel, even while it is busy evaluating, so a long query is never cut off.
 
 Keepalive only probes while none of our data is waiting for acknowledgement. Passing an explicit `keepalive` budget also bounds how long sent data may stay unacknowledged (`TCP_USER_TIMEOUT` on Linux), which catches a peer that vanishes mid-request. The cost is that a live peer which stops **reading** for that long also counts as dead: a large request to a server busy with something else, for example. The default does not set this bound. In that case a peer that vanishes with our data in flight is dropped by the operating system's retransmission limit, which is about 15 minutes on Linux. The budget is applied in whole seconds for the probe schedule. Platforms without these socket options skip them.
 
-The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged.
+The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged. The second byte also carries the transport capability each side offers; see [Transports](../storage/ipc.md#transports) for how a connection then moves off TCP, and `(.ipc.handle h)` to see where it landed.
 
 ```text
 ;; Unauthenticated
@@ -58,6 +60,14 @@ The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-ve
 
 ;; Declare the peer dead after ~10s of silence or unacknowledged data
 (set h (.ipc.open "127.0.0.1:5000" (dict [keepalive] [10000])))
+
+;; Stay on TCP even though the server is on this host
+(set h (.ipc.open "127.0.0.1:5000" (dict ['transport] ['tcp])))
+
+;; Insist on RDMA: an `io` error if either side has no device
+(set h (.ipc.open "10.99.0.2:5000" (dict ['transport] ['rdma])))
+(get (.ipc.handle h) 'transport)
+;; => rdma
 ```
 
 ## `.ipc.send` { #ipc-send }
@@ -127,6 +137,8 @@ Signature: `(.ipc.handle)` — variadic but invoked with no args by convention.
 
 Returns the handle of the connection that triggered the currently-executing server-side hook (`.ipc.on.open`, `.on.close`, `.on.sync`, `.on.async`, `.on.auth`). Outside any hook it returns `-1`.
 
+Given a live connection handle, `(.ipc.handle h)` instead returns that connection's view: `handle`, `inbound` (accepted here, or opened by `.ipc.open`), `transport` (`tcp`, `shm` or `rdma`: where its bytes go), and the transmit-queue figures `limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes` (see `.ipc.txlimit` in [IPC & Serialization](../storage/ipc.md#ipctxlimit)).
+
 This is the only way to read the handle inside `on.sync` / `on.async` / `on.auth`, whose lambda signatures don't include `h`. For `on.open` and `on.close` the value always equals the `h` argument the hook receives.
 
 ```lisp
@@ -137,6 +149,25 @@ This is the only way to read the handle inside `on.sync` / `on.async` / `on.auth
 ;; Outside any hook
 (.ipc.handle)
 ;; => -1
+```
+
+## `.ipc.transport` { #ipc-transport }
+
+Signature: `(.ipc.transport)` reads the process's transport policy; `(.ipc.transport 'policy)` sets it and returns it. The policy is a symbol:
+
+| Policy | As a client (`.ipc.open` without a `transport` option) | As a server |
+|---|---|---|
+| `auto` | Asks for shared memory when the peer is on this host, for RDMA when it is on another host and both have a device; stays on TCP otherwise. The default. | Offers shared memory to a peer on this host and RDMA to one on another. |
+| `tcp` | Never asks: the connection stays on TCP. | Offers nothing: every connection stays on TCP. |
+| `shm` | Asks for shared memory only, and fails the open with `io` when it is not granted. | Offers shared memory only. |
+| `rdma` | Asks for RDMA only, and fails the open with `io` when it is not granted. | Offers RDMA only. |
+
+A connection that has already moved keeps its transport when the policy changes. The policy is restricted: it decides what the process offers its peers. A `transport` option on `.ipc.open` overrides it for that one connection.
+
+```lisp
+(.ipc.transport)         ;; => auto
+(.ipc.transport 'tcp)    ;; => tcp — from now on nothing moves off TCP
+(.ipc.transport 'bogus)  ;; domain error
 ```
 
 ## Server-side connection hooks

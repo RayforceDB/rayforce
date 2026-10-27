@@ -77,6 +77,13 @@ void ray_poll_destroy(ray_poll_t* poll)
         ray_selector_t* sel = poll->sels[i];
         if (!sel) continue;
         if (sel->close_fn) sel->close_fn(poll, sel);
+        /* A transport goes with its connection; its wake selector is
+         * freed by this same loop (the transport closes the descriptor). */
+        if (sel->xport) {
+            ray_xport_t* x = sel->xport;
+            sel->xport = NULL;
+            x->ops->destroy(x);
+        }
         struct kevent kev;
         EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
@@ -183,6 +190,7 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     EV_SET(&kev, (uintptr_t)sel->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
     kevent((int)poll->fd, &kev, 1, NULL, 0, NULL);
 
+    ray_poll_xport_detach(poll, sel);
     if (sel->close_fn) sel->close_fn(poll, sel);
     if (sel->rx.buf) ray_poll_buf_free(sel->rx.buf);
     ray_poll_buf_free(sel->tx.buf);

@@ -22,6 +22,10 @@
  */
 
 #if defined(__linux__)
+#define _GNU_SOURCE
+#endif
+
+#if defined(__linux__)
 
 #include "core/poll.h"
 #include "core/mcast.h"
@@ -33,6 +37,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <string.h>
+#include <time.h>
 
 #define RAY_POLL_MAX_EVENTS 64
 #define RAY_POLL_INITIAL_CAP 16
@@ -40,7 +45,10 @@
 static uint32_t epoll_selector_events(ray_selector_t* sel)
 {
     uint32_t events = EPOLLIN | EPOLLRDHUP;
-    if (sel && sel->tx.buf) events |= EPOLLOUT;
+    /* An upgraded connection's socket is always writable and carries
+     * nothing: waiting on EPOLLOUT for its queue would spin the loop while
+     * the ring is full.  Its transport announces room on event_fd. */
+    if (sel && sel->tx.buf && !sel->xport) events |= EPOLLOUT;
     return events;
 }
 
@@ -85,6 +93,13 @@ void ray_poll_destroy(ray_poll_t* poll)
         ray_selector_t* sel = poll->sels[i];
         if (!sel) continue;
         if (sel->close_fn) sel->close_fn(poll, sel);
+        /* A transport goes with its connection; its wake selector is
+         * freed by this same loop (the transport closes the descriptor). */
+        if (sel->xport) {
+            ray_xport_t* x = sel->xport;
+            sel->xport = NULL;
+            x->ops->destroy(x);
+        }
         epoll_ctl((int)poll->fd, EPOLL_CTL_DEL, (int)sel->fd, NULL);
         if (sel->rx.buf) ray_poll_buf_free(sel->rx.buf);
         ray_poll_buf_free(sel->tx.buf);
@@ -182,12 +197,94 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     if (!sel) return;
 
     epoll_ctl((int)poll->fd, EPOLL_CTL_DEL, (int)sel->fd, NULL);
+    ray_poll_xport_detach(poll, sel);
     if (sel->close_fn) sel->close_fn(poll, sel);
     if (sel->rx.buf) ray_poll_buf_free(sel->rx.buf);
     ray_poll_buf_free(sel->tx.buf);
     ray_sys_free(sel);
     poll->sels[id] = NULL;
     if (poll->n_live > 0) poll->n_live--;
+}
+
+/* ===== Transports: what no descriptor announces =====
+ *
+ * Bytes land in a transport's ring without a wakeup unless the peer was
+ * told the loop sleeps.  So before each wait: serve what landed while the
+ * loop was busy, spin a moment for what is about to (an answer within it
+ * costs neither side a system call), then raise each transport's sleeping
+ * flag.  A transport with news in the gap between the look and the flag
+ * cancels the sleep. */
+
+#define RAY_XPORT_SPIN_NS 20000   /* 20 µs */
+
+static int64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* Serve every transport connection with bytes to read or room for its
+ * queue; true when any was served. */
+static bool xport_serve(ray_poll_t* poll)
+{
+    bool served = false;
+    for (uint32_t i = 0; i < poll->n_sels && poll->code < 0; i++) {
+        ray_selector_t* sel = poll->sels[i];
+        if (!sel || !sel->xport) continue;
+        ray_xport_t* x = sel->xport;
+        if (sel->tx.buf && x->ops->room(x)) {
+            served = true;
+            if (ray_poll_serve_tx(poll, (int64_t)i) < 0) continue;
+        }
+        if (x->ops->pending(x)) {
+            served = true;
+            ray_poll_serve_rx(poll, (int64_t)i);
+        }
+    }
+    return served;
+}
+
+static bool xport_news(ray_poll_t* poll)
+{
+    for (uint32_t i = 0; i < poll->n_sels; i++) {
+        ray_selector_t* sel = poll->sels[i];
+        if (!sel || !sel->xport) continue;
+        ray_xport_t* x = sel->xport;
+        if (x->ops->pending(x) || (sel->tx.buf && x->ops->room(x))) return true;
+    }
+    return false;
+}
+
+static void xport_woke(ray_poll_t* poll)
+{
+    for (uint32_t i = 0; i < poll->n_sels; i++) {
+        ray_selector_t* sel = poll->sels[i];
+        if (sel && sel->xport) sel->xport->ops->woke(sel->xport);
+    }
+}
+
+/* The wait the loop may take after this pass: -1 as planned, 0 when a
+ * transport was served (the socket events of this round are still owed a
+ * look), 1 ms when a transport with queued output cannot announce room. */
+static int xport_pass(ray_poll_t* poll)
+{
+    if (xport_serve(poll)) return 0;
+    int64_t until = now_ns() + RAY_XPORT_SPIN_NS;
+    do {
+        if (xport_news(poll)) { xport_serve(poll); return 0; }
+    } while (now_ns() < until);
+    bool news = false, queued = false;
+    for (uint32_t i = 0; i < poll->n_sels; i++) {
+        ray_selector_t* sel = poll->sels[i];
+        if (!sel || !sel->xport) continue;
+        ray_xport_t* x = sel->xport;
+        bool want_room = sel->tx.buf != NULL;
+        if (!x->ops->prepare_sleep(x, true, want_room)) news = true;
+        if (want_room && !x->fd_tells_room) queued = true;
+    }
+    if (news) { xport_woke(poll); return 0; }
+    return queued ? 1 : -1;
 }
 
 int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
@@ -242,7 +339,13 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             }
         }
 
+        if (poll->n_xport > 0) {
+            int w = xport_pass(poll);
+            if (w >= 0 && (wait_ms < 0 || w < wait_ms)) wait_ms = w;
+        }
+
         int n = epoll_wait((int)poll->fd, events, RAY_POLL_MAX_EVENTS, wait_ms);
+        if (poll->n_xport > 0) xport_woke(poll);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -260,72 +363,11 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
              * A client may send a message and close; epoll reports both
              * EPOLLIN and EPOLLHUP in the same event. */
             if (events[i].events & EPOLLIN) {
-                /* Loop: read data → call read_fn → if state advanced,
-                 * read more. Handles multi-phase protocols (handshake →
-                 * header → payload) arriving in a single epoll event. */
-                for (;;) {
-                    /* Fill rx buffer */
-                    if (sel->rx.recv_fn && sel->rx.buf) {
-                        while (sel->rx.buf->offset < sel->rx.buf->size) {
-                            int64_t nr = sel->rx.recv_fn(
-                                sel->fd,
-                                sel->rx.buf->data + sel->rx.buf->offset,
-                                sel->rx.buf->size - sel->rx.buf->offset);
-                            if (nr <= 0) {
-                                if (nr < 0 && errno == EINTR) continue;
-                                if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                                    break;
-                                /* Error or peer closed mid-read */
-                                if (sel->error_fn)
-                                    sel->error_fn(poll, sel);
-                                else
-                                    ray_poll_deregister(poll, sel->id);
-                                goto next_event;
-                            }
-                            sel->rx.buf->offset += nr;
-                        }
-                    }
-
-                    /* Not enough data for current phase */
-                    if (sel->rx.buf && sel->rx.buf->offset < sel->rx.buf->size)
-                        break;
-
-                    /* Call read_fn — may advance state and request new buffer */
-                    if (!sel->rx.read_fn) break;
-                    ray_t* obj = sel->rx.read_fn(poll, sel);
-
-                    /* Re-validate: read_fn may have deregistered this selector */
-                    if (eid >= poll->n_sels || !poll->sels[eid]) goto next_event;
-                    sel = poll->sels[eid];
-
-                    if (obj && sel->data_fn)
-                        sel->data_fn(poll, sel, obj);
-
-                    /* If data_fn deregistered the selector, stop */
-                    if (eid >= poll->n_sels || !poll->sels[eid]) goto next_event;
-                    sel = poll->sels[eid];
-
-                    /* If no rx buffer (state machine done or not set), stop */
-                    if (!sel->rx.buf) break;
-                    /* If buffer already has enough data for next phase, loop */
-                    if (sel->rx.buf->offset >= sel->rx.buf->size) continue;
-                    /* Otherwise try reading more (may EAGAIN → break) */
-                }
+                if (ray_poll_serve_rx(poll, (int64_t)eid) < 0) goto next_event;
             }
 
             if (events[i].events & EPOLLOUT) {
-                if (eid >= poll->n_sels || !poll->sels[eid]) goto next_event;
-                sel = poll->sels[eid];
-                if (ray_poll_tx_flush(poll, sel) < 0) {
-                    if (eid < poll->n_sels && poll->sels[eid]) {
-                        sel = poll->sels[eid];
-                        if (sel->error_fn)
-                            sel->error_fn(poll, sel);
-                        else
-                            ray_poll_deregister(poll, sel->id);
-                    }
-                    goto next_event;
-                }
+                if (ray_poll_serve_tx(poll, (int64_t)eid) < 0) goto next_event;
             }
 
             /* Error / hangup — after data is drained */

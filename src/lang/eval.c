@@ -4557,6 +4557,9 @@ static void ray_register_builtins(void) {
     /* Transmit backlog policy: read, set the process default, or override
      * one connection.  Privileged — it decides when a peer is dropped. */
     register_vary(  ".ipc.txlimit", RAY_FN_RESTRICTED, ray_ipc_txlimit_fn);
+    /* Transport policy: which faster road a connection may move to.
+     * Privileged — it decides what this process offers its peers. */
+    register_vary(  ".ipc.transport", RAY_FN_RESTRICTED, ray_ipc_transport_fn);
 
     /* Multicast/pub-sub over IPC.  Subscriptions are allowed under
      * restricted IPC; publishing stays privileged. */

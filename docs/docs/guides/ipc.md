@@ -267,6 +267,32 @@ A common pattern is one data server with multiple query clients. Each client con
 
     The server is single-threaded. Client queries are processed sequentially in the order they arrive. For CPU-intensive workloads, consider partitioning data across multiple server processes.
 
+## 7a. Fast Transports
+
+Two Rayforce processes that can do better than TCP do so on their own. After the handshake a connection between them moves to shared-memory rings when both are on one host, and to RDMA when they are on different hosts that both have a device; a connection to or from an older build, or across hosts without devices, stays on TCP. Nothing in a script changes: `.ipc.send`, `.ipc.post`, hooks, journaling and restricted mode behave the same on every transport.
+
+```lisp
+;; On the server's host
+(set h (.ipc.open "127.0.0.1:5000"))
+(get (.ipc.handle h) 'transport)
+;; => shm
+
+;; From another host on the same InfiniBand or RoCE fabric
+(set h (.ipc.open "10.99.0.2:5000"))
+(get (.ipc.handle h) 'transport)
+;; => rdma
+
+;; Keep one connection on TCP, or insist on a transport (an `io` error
+;; when it cannot be had)
+(.ipc.open "127.0.0.1:5000" (dict ['transport] ['tcp]))
+(.ipc.open "10.99.0.2:5000" (dict ['transport] ['rdma]))
+
+;; A server that must not share memory with anyone
+(.ipc.transport 'tcp)
+```
+
+See [Transports](../storage/ipc.md#transports) for how the switch works, what it measured, and [`.ipc.transport`](../namespaces/ipc.md#ipc-transport) for the policy.
+
 ## 8. Error Handling
 
 Several categories of errors can occur during IPC operations.
@@ -322,7 +348,9 @@ The IPC layer is also accessible from C, enabling you to embed Rayforce clients 
 
 | Function | Description |
 |---|---|
-| `ray_ipc_connect(host, port, user, password, timeout_ms)` | Open a TCP connection. Returns a handle. Pass `NULL` for user/password if no auth, and `0` for `timeout_ms` to use the default connect timeout. |
+| `ray_ipc_connect(host, port, user, password, timeout_ms)` | Open a connection. Returns a handle. Pass `NULL` for user/password if no auth, and `0` for `timeout_ms` to use the default connect timeout. The connection moves to shared memory or RDMA under the process policy, as `.ipc.open` does. |
+| `ray_ipc_connect_with(host, port, user, password, &opts)` | The same with every `.ipc.open` option in a `ray_ipc_open_opts_t`: `timeout_ms`, `compress_threshold`, `keepalive_ms` and `transport` (`RAY_IPC_XPORT_AUTO`, `_TCP`, `_SHM`, `_RDMA`). Returns `-7` when the transport asked for cannot be taken. |
+| `ray_ipc_xport_policy_set(policy)` / `ray_ipc_xport_policy_get()` | The process transport policy behind `.ipc.transport`. |
 | `ray_ipc_send(handle, msg)` | Synchronous send: serialize `msg`, send, wait for response, return deserialized result. |
 | `ray_ipc_send_async(handle, msg)` | Fire-and-forget send: serialize and send `msg` without waiting for a response. |
 | `ray_ipc_close(handle)` | Close the connection and free the handle. |

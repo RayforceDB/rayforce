@@ -132,6 +132,11 @@ static test_result_t assert_ok(ray_t* x, const char* label) {
 
 static test_result_t start_server(ray_poll_t** poll_out, uint16_t* port_out,
                                   ray_vm_t** vm_out, ray_thread_t* tid_out) {
+    /* These tests drive the socket itself — a shrunk SO_SNDBUF to force
+     * queueing, an invalidated fd to make a send fail — so the
+     * connections must stay on TCP: on one host they would otherwise move
+     * to shared-memory rings, which no socket option touches. */
+    ray_ipc_xport_policy_set(RAY_IPC_XPORT_TCP);
     ray_poll_t* poll = ray_poll_create();
     TEST_ASSERT_NOT_NULL(poll);
     int64_t listener_id = ray_ipc_listen(poll, 0);
@@ -158,6 +163,7 @@ static void stop_server(ray_poll_t* poll, uint16_t port, ray_vm_t* vm, ray_threa
     poll_stop(poll, port);
     ray_thread_join(tid);
     ray_poll_destroy(poll);
+    ray_ipc_xport_policy_set(RAY_IPC_XPORT_AUTO);
     ray_sys_free(vm);
 }
 

@@ -31,7 +31,36 @@ The server runs in the same thread as the REPL. IPC connections are processed be
 
 ## Handshake
 
-Every IPC connection opens with a 2-byte exchange before any framed payload flows: `{ wire_version, auth_flag }`. The client sends its `RAY_SERDE_WIRE_VERSION` and a zero; the server replies with its own wire version and `0x01` if password auth is required, `0x00` otherwise. Either side will drop the connection if the peer's first byte doesn't match — this is what prevents a new peer from ever writing a newer-format payload to a peer that couldn't parse it.
+Every IPC connection opens with a 2-byte exchange before any framed payload flows: `{ wire_version, capabilities }`. The client sends its `RAY_SERDE_WIRE_VERSION` and its capabilities; the server replies with its own wire version and a byte whose low bit is `0x01` if password auth is required, `0x00` otherwise. Either side will drop the connection if the peer's first byte doesn't match — this is what prevents a new peer from ever writing a newer-format payload to a peer that couldn't parse it.
+
+The high four bits of the second byte are capabilities. A client that can move a connection off TCP sets `0x10` (`RAY_IPC_CAP_XPORT`); a server that can too answers with the bit set, in the same byte as the auth flag. A server only ever sets capability bits when the client advertised some, so an older client, which sends a zero and refuses any reply byte but `0x00` or `0x01`, never sees one; an older server ignores the client's byte and answers as before, so a newer client simply stays on TCP. See [Transports](#transports).
+
+## Transports { #transports }
+
+A connection between two Rayforce processes starts on TCP and, once the handshake has shown that both sides can, moves to a faster road for its bytes. The frames stay exactly the same — header, serialised payload, sync/async/response semantics, hooks, journaling, restricted mode — only where the bytes travel changes. The TCP socket stays open and carries nothing more; it is how either side learns that the peer has gone.
+
+| Transport | When | How |
+|---|---|---|
+| `shm` | Both processes are on one host (the client's loopback or any address of the host; the two compare the kernel's boot identity). Linux. | The server creates a memory file holding a 16 MB ring per direction and two eventfds, and offers them under a one-use token. The client presents the token on the server's private abstract Unix socket, from the same user (checked by peer credentials), and receives the descriptors. Each side copies frames into its ring and the peer copies them out; a side with nothing to do says it sleeps and is woken through its eventfd, so a busy pair makes no system calls. |
+| `rdma` | The hosts differ, and both have an active RDMA port (InfiniBand, or RoCE v2 over Ethernet) with the verbs library installed. Linux. | Each side registers a 64 MB receiving ring and tells the peer its queue pair and the ring's key. A sender copies a frame into its staging ring and writes it into the peer's ring with one RDMA write whose immediate value counts the bytes; the receiver returns space the same way. Completions are polled briefly, then awaited through the completion channel. The library is loaded the first time a connection wants it, so a build with the verbs headers runs unchanged on a host without the library. |
+| `tcp` | Everything else: an older peer, a host without the facilities, a policy of `tcp`, or a refusal. | As before. |
+
+The client asks after the handshake, in one `UPGRADE` frame (message type 3) carrying its host identity or its RDMA record; the server answers with an offer, its own record, or a refusal, and both sides move together: the server once the shared-memory descriptors have been handed over (it then writes one last frame on TCP, after which the client reads the rings), or as it answers an RDMA request. Every byte either side wrote on TCP before moving is read before the rings are, so nothing is lost or reordered across the switch. A moved connection no longer compresses its payloads unless `.ipc.open` asked for a threshold explicitly: nothing crosses a network any more, so compression would only cost the CPU.
+
+What this process offers and asks for is its policy, `(.ipc.transport)`: `auto` (the default), `tcp`, `shm` or `rdma`; a `transport` option on `.ipc.open` overrides it for one connection and, when it names a transport the link cannot take, fails the open with `io` instead of silently staying on TCP. `(.ipc.handle h)` reports where a connection landed as `transport`. See [`.ipc.transport`](../namespaces/ipc.md#ipc-transport).
+
+Measured between two processes on one 28-core host, and between two hosts on FDR InfiniBand (one `(+ 1 2)` round trip; ten million longs sent as a sync argument and fetched as a result; a million-row table of three columns both ways; a thousand async posts), TCP with its default compression against the transport each pair moves to:
+
+| | TCP, two hosts | RDMA | TCP, one host | shared memory |
+|---|---:|---:|---:|---:|
+| round trip | 27 µs | 6 µs | 16 µs | 3 µs |
+| 10M longs to the server | 202 ms | 62 ms | 30 ms | 29 ms |
+| 10M longs from the server | 151 ms | 43 ms | 27 ms | 21 ms |
+| 1M-row table to the server | 82 ms | 34 ms | 36 ms | 30 ms |
+| 1M-row table from the server | 49 ms | 24 ms | 14 ms | 13 ms |
+| 1000 async posts | 2.8 ms | 0.7 ms | 0.6 ms | 0.3 ms |
+
+Across hosts the link was the limit and the transport removes it; on one host loopback TCP never compresses and the kernel copies at memory speed already, so what shared memory buys there is the round trip (no socket, no wakeup through the kernel while both sides are busy) — the bulk transfers are bounded by serialising and copying the values, which both transports still do into and out of their rings.
 
 ## Authentication
 
@@ -186,7 +215,7 @@ Every connection queues outbound bytes the socket cannot take immediately (async
 (.ipc.txlimit 8388608)         ; 8 MiB per connection, frames unlimited
 (.ipc.txlimit 8388608 64)      ; at most 8 MiB or 64 queued frames, whichever first
 (.ipc.txlimit h 67108864 0)    ; one connection may hold 64 MiB
-(.ipc.handle h)                ; {handle inbound limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
+(.ipc.handle h)                ; {handle inbound transport limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
 ```
 
 The default is 256 MiB with no frame cap; the minimum is 4 KiB, and `frames` of `0` means unlimited. Changing the default applies to every connection without an override, including ones already open. `.mc.stats` reports the default as `tx_limit_bytes` / `tx_limit_frames` and the largest backlog any connection has held as `tx_hwm_bytes`. `.ipc.txlimit` is restricted: it decides when a peer is dropped.
@@ -262,7 +291,7 @@ Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, follow
 | 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `3`). Decoupled from `RAY_VERSION_MAJOR`. A receiver that sees a different byte here rejects the payload with a `version` error instead of attempting to parse it. |
 | 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). |
 | 6 | 1 byte | `endian` | Endianness: `0` = little-endian |
-| 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response |
+| 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response, `3` = upgrade (a transport record, never evaluated or journaled; see [Transports](#transports)) |
 | 8 | 8 bytes | `size` | Payload size in bytes (`int64`) |
 
 The corresponding C struct:
@@ -273,7 +302,7 @@ typedef struct ray_ipc_header_t {
     uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 3) */
     uint8_t  flags;      /* bit0 compressed, bit1 restricted (journal), bit2 verbose */
     uint8_t  endian;     /* 0 = little-endian */
-    uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response */
+    uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response, 3 = upgrade */
     int64_t  size;       /* payload size in bytes */
 } ray_ipc_header_t;
 ```
@@ -296,7 +325,7 @@ Payloads larger than 2,000 bytes are automatically compressed using delta + RLE 
 - **Threshold** — payloads ≤ 2,000 bytes are sent uncompressed
 - **Transparent** — compression is automatic; the `flags` header byte signals whether the payload is compressed
 
-If compression doesn't reduce the payload size, the data is sent uncompressed.
+If compression doesn't reduce the payload size, the data is sent uncompressed. Links that never leave the host — loopback and Unix-domain peers, and any connection that moved to shared memory or RDMA — do not compress unless `.ipc.open` set a threshold explicitly; see [Transports](#transports).
 
 ## Supported Types
 
