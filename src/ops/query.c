@@ -13559,8 +13559,9 @@ static bool count_conj_ok(ray_t* tbl, ray_t* e, int depth) {
     return count_cmp_types_ok(type, op, rhs, true);
 }
 
-/* The query dict of `expr` when it is a call of the select special form
- * (not a local or a global of that name), else NULL. */
+/* The query dict of `expr` when it is a call of the select builtin
+ * (whatever the name select is bound to otherwise: a local, a lambda,
+ * another special form), else NULL. */
 static ray_t* select_form_dict(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2) return NULL;
     ray_t** elems = (ray_t**)ray_data(expr);
@@ -13570,7 +13571,9 @@ static ray_t* select_form_dict(ray_t* expr) {
         memcmp(ray_str_ptr(name), "select", 6) != 0)
         return NULL;
     ray_t* sel_fn = ray_env_get(elems[0]->i64);
-    if (!sel_fn || !(sel_fn->attrs & RAY_FN_SPECIAL_FORM)) return NULL;
+    if (!sel_fn || sel_fn->type != RAY_VARY ||
+        (ray_vary_fn)(uintptr_t)sel_fn->i64 != ray_select)
+        return NULL;
     ray_t* dict = elems[1];
     return dict && dict->type == RAY_DICT ? dict : NULL;
 }
@@ -13631,6 +13634,9 @@ ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled) {
     return r ? r : ray_error("oom", NULL);
 }
 
+static ray_t* count_select_on(ray_t* tbl, ray_t* where_expr, int* handled);
+static ray_t* count_select_over(ray_t* dict, ray_t* src);
+
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (handled) *handled = 0;
     ray_t* dict = select_form_dict(expr);
@@ -13661,14 +13667,82 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     }
     DICT_VIEW_CLOSE(dv);  /* dv dead past the clause-keyword scan */
 
+    /* from: is evaluated once: past this point a shape the count does not
+     * take runs the select over the table already evaluated, never the
+     * whole form again */
     ray_t* tbl = ray_eval(from_expr);
-    if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("type", "select count: `from:` evaluation failed");
-    if (tbl->type != RAY_TABLE) {
-        int8_t tbl_t = tbl->type;            /* capture BEFORE free */
-        ray_release(tbl);
-        return ray_error("type", "select count: `from:` must be a table, got %s", ray_type_name(tbl_t));
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        if (handled) *handled = 1;
+        return tbl ? tbl : ray_error("type", "select count: `from:` evaluation failed");
     }
+    if (tbl->type != RAY_TABLE) {
+        /* a source the select reads itself (a parquet scan) or rejects:
+         * its answer, over the value quoted so it is not evaluated again */
+        ray_t* q = query_quote_value(tbl);
+        ray_release(tbl);
+        if (handled) *handled = 1;
+        return q ? count_select_over(dict, q) : ray_error("oom", NULL);
+    }
+    int on_handled = 0;
+    ray_retain(tbl);
+    ray_t* r = count_select_on(tbl, where_expr, &on_handled);
+    if (on_handled) {
+        ray_release(tbl);
+        if (handled) *handled = 1;
+        return r;
+    }
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    if (handled) *handled = 1;
+    return count_select_over(dict, tbl);
+}
 
+/* The rows of the select whose query dict is `dict` with from: replaced by
+ * the already evaluated table `src` (consumed; a table evaluates to itself),
+ * counted off its result. */
+static ray_t* count_select_over(ray_t* dict, ray_t* src) {
+    int64_t from_id = dict_key_id(dict, "from");
+    DICT_VIEW_DECL(dv);
+    DICT_VIEW_OPEN(dict, dv);
+    if (DICT_VIEW_OVERFLOW(dv)) { DICT_VIEW_CLOSE(dv); ray_release(src); return ray_error("oom", NULL); }
+    int64_t np = dv_n / 2;
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, np > 0 ? np : 1);
+    ray_t* vals = ray_list_new(np > 0 ? np : 1);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
+        DICT_VIEW_CLOSE(dv);
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        ray_release(src);
+        return ray_error("oom", NULL);
+    }
+    int64_t* kd = (int64_t*)ray_data(keys);
+    for (int64_t i = 0; i < np; i++) {
+        kd[i] = dv[2 * i]->i64;
+        ray_t* v = kd[i] == from_id ? src : dv[2 * i + 1];
+        if (!RAY_IS_ERR(vals)) vals = ray_list_append(vals, v);
+    }
+    DICT_VIEW_CLOSE(dv);
+    keys->len = np;
+    ray_release(src);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    ray_t* d = ray_dict_new(keys, vals);
+    if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+    ray_t* res = ray_select(&d, 1);
+    ray_release(d);
+    if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+    if (ray_is_lazy(res)) {
+        res = ray_lazy_materialize(res);
+        if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+    }
+    ray_t* cnt = ray_count_fn(res);
+    ray_release(res);
+    return cnt;
+}
+
+/* The count shortcut over `tbl` (consumed), the evaluated from: of a select
+ * of clauses from: and where: alone.  *handled 0 (and NULL) when the select
+ * must run instead. */
+static ray_t* count_select_on(ray_t* tbl, ray_t* where_expr, int* handled) {
+    if (handled) *handled = 0;
     if (!where_expr) {
         if (handled) *handled = 1;
         int64_t nrows = ray_table_nrows(tbl);
@@ -13717,6 +13791,7 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (!pred) {
         ray_t* pred_vec = eval_where_mask(where_expr, tbl, "select count");
         if (!pred_vec || RAY_IS_ERR(pred_vec)) {
+            if (handled) *handled = 1;  /* where ran: its error is the query's */
             ray_graph_free(g);
             ray_release(tbl);
             return pred_vec ? pred_vec :
@@ -13784,6 +13859,8 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
 
     ray_t* pred_vec = exec_node(g, pred);
     if (!pred_vec || RAY_IS_ERR(pred_vec)) {
+        /* the compiled where reads columns alone: the select runs it again
+         * for its own error text */
         ray_graph_free(g);
         ray_release(tbl);
         return pred_vec ? pred_vec : ray_error("type", "select count: WHERE predicate evaluation failed");
@@ -13898,7 +13975,7 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
 
 /* Can evaluating `e` reach a column of `tbl` only by naming it?  True when
  * the tree holds nothing but literals (no symbols among them), column names
- * and names of global builtins other than eval: a lambda (bound or literal
+ * and names of global builtins other than eval and resolve: a lambda (bound or literal
  * body aside, which is walked), a local, a quoted name or an unknown name may
  * read query locals by name at run time, so those keep every column bound. */
 static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
@@ -13915,8 +13992,11 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
         ray_t* fn = ray_env_get(e->i64);
         if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
             return false;
-        ray_t* nm = ray_sym_str(e->i64);
-        return !(nm && ray_str_len(nm) == 4 && memcmp(ray_str_ptr(nm), "eval", 4) == 0);
+        /* eval and resolve read names from text or symbols at run time,
+         * whatever name they are reached by */
+        if (fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn)
+            return false;
+        return !(fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == ray_resolve_fn);
     }
     if (e->type == RAY_LIST) {
         ray_t** el = (ray_t**)ray_data(e);

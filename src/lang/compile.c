@@ -744,15 +744,17 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
          (n == 3 && fn->type == RAY_BINARY &&
           (ray_binary_fn)(uintptr_t)fn->i64 == ray_take_fn));
     if (sel_arg_form && elems[1] && elems[1]->type == RAY_LIST && ray_len(elems[1]) == 2) {
-        /* only the select special form: not a local of that name, nor a
-         * global rebound to a function (the shortcut goes by the name) */
+        /* only the select builtin: not a local of that name, nor a global
+         * rebound to a function or another special form (the shortcut runs
+         * ray_select itself) */
         ray_t **sel = (ray_t**)ray_data(elems[1]);
         if (sel[0] && sel[0]->type == -RAY_SYM && !(sel[0]->attrs & ATTR_QUOTED) &&
             sel[0]->i64 == sf_select && find_local(c, sf_select) < 0 &&
             sel[1] && sel[1]->type == RAY_DICT) {
             ray_t *sfn = call_head_fn(c, sel[0]);
             if (c->error) return;
-            if (sfn && (sfn->attrs & RAY_FN_SPECIAL_FORM)) {
+            if (sfn && sfn->type == RAY_VARY &&
+                (ray_vary_fn)(uintptr_t)sfn->i64 == ray_select) {
                 compile_dyn_form(c, ast);
                 return;
             }

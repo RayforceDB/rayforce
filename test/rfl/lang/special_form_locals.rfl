@@ -86,3 +86,9 @@ alter_shadow -- [5 5]
 (cnt_rebound 25) -- 2
 ((fn [n] (count (select {from: ctbl where: (> v n)}))) 25) -- 2
 (count (select {from: ctbl where: (> v 25)})) -- 2
+;; select rebound to another special form: the form it names now runs
+(set select quote)
+(first (select {from: ctbl})) !- type
+(take (select {from: ctbl}) 2) -- (take (quote {from: ctbl}) 2)
+(count (select {from: ctbl})) -- 1
+((fn [] (count (select {from: ctbl})))) -- 1

@@ -143,3 +143,24 @@
 (count (select {from: TA where: (and (< a 50) (or 0.0 (> b 1)))})) -- (count (select {x: a from: TA where: (and (< a 50) (or 0.0 (> b 1)))}))
 (count (select {from: TA where: (and (< a 50) (+ b 1))})) !- type
 (count (select {from: TA where: (and (< a 50) (> zz 1))})) !- schema
+
+;; ────────────────────────────────────────────────────────────────────
+;; from: is evaluated once, also where the count leaves the select to run
+;; (an `and` with a constant conjunct, a from: that is not a table)
+;; ────────────────────────────────────────────────────────────────────
+(set TE (table [a] (list [1 2 3])))
+(set ce_hits 0)
+(count (select {from: (do (set ce_hits (+ ce_hits 1)) TE) where: (and (> a 0) true)})) -- 3
+ce_hits -- 1
+(set ce_hits 0)
+((fn [] (count (select {from: (do (set ce_hits (+ ce_hits 1)) TE) where: (and (> a 0) true)})))) -- 3
+ce_hits -- 1
+(set ce_hits 0)
+(count (select {from: (do (set ce_hits (+ ce_hits 1)) TE) where: (> a 1)})) -- 2
+ce_hits -- 1
+(set ce_hits 0)
+(count (select {from: (do (set ce_hits (+ ce_hits 1)) 5)})) !- type
+ce_hits -- 1
+(count (select {from: (list (fn [] TE))})) !- type
+(count (select {from: (list (fn [] TE)) where: (> a 1)})) !- type
+(count (select {from: TE where: (> zz 1)})) !- schema

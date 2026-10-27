@@ -1245,3 +1245,15 @@ Ctg -- 1
 (at (take (select {from: TH asc: r take: 10}) 3) 'a) -- [0 5 10]
 (take (select {from: TH where: (> zz 1) asc: r}) 3) !- schema
 (take (select {from: TH asc: r}) th_no_such_name) !- name
+
+;; a named count that evaluating the select rebinds is read after it, as
+;; any call reads its arguments in order
+(set TR (table [a] (list [10 20 30])))
+(set tr_n 1)
+(count (take (select {from: (do (set tr_n 2) TR)}) tr_n)) -- 2
+(set tr_set set)
+(set tr_n 1)
+(count (take (select {from: (do (tr_set tr_n 2) TR)}) tr_n)) -- 2
+(set tr_bump (fn [] (set tr_n 2)))
+(set tr_n 1)
+(count (take (select {from: (do (tr_bump) TR)}) tr_n)) -- 2

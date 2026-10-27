@@ -305,16 +305,61 @@ static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* i
     affine_sum_cache[affine_sum_cache_n++] = *in;
 }
 
+/* Can evaluating `e` leave a name bound to another value?  False only when
+ * every call in it is of a builtin that neither writes (RAY_FN_RESTRICTED:
+ * set, del, update, ...) nor binds or runs code (let, fn, eval, resolve), and
+ * no name in it is bound to a lambda, whatever name each is reached by. */
+static bool expr_rebinds_nothing(ray_t* e, int depth) {
+    if (!e) return true;
+    if (depth > 64) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        ray_t* v = ray_env_get(e->i64);
+        return !v || v->type != RAY_LAMBDA;
+    }
+    if (e->type == RAY_DICT) {                           /* a query dict: its values */
+        ray_t* vals = ray_dict_vals(e);
+        if (!vals || vals->type != RAY_LIST) return true;
+        ray_t** vv = (ray_t**)ray_data(vals);
+        for (int64_t i = 0; i < ray_len(vals); i++)
+            if (!expr_rebinds_nothing(vv[i], depth + 1)) return false;
+        return true;
+    }
+    if (e->type != RAY_LIST) return true;                /* a literal */
+    int64_t n = ray_len(e);
+    if (n == 0) return true;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || (fn->attrs & RAY_FN_RESTRICTED)) return false;
+    if (fn->type == RAY_UNARY) {
+        if ((ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn) return false;
+    } else if (fn->type == RAY_BINARY) {
+        if ((ray_binary_fn)(uintptr_t)fn->i64 == ray_let_fn) return false;
+    } else if (fn->type == RAY_VARY) {
+        ray_vary_fn vf = (ray_vary_fn)(uintptr_t)fn->i64;
+        if (vf == ray_fn || vf == ray_resolve_fn) return false;
+    } else {
+        return false;
+    }
+    for (int64_t i = 1; i < n; i++)
+        if (!expr_rebinds_nothing(el[i], depth + 1)) return false;
+    return true;
+}
+
 /* The count of (take x n) when it is known before x is evaluated: n an
- * integer literal or a name bound to an integer atom, above zero.  An
- * owned atom, else NULL (x first, then n, as any call). */
-static ray_t* take_count_arg(ray_t* e) {
+ * integer literal, or a name bound to an integer atom that evaluating x
+ * cannot rebind (expr_rebinds_nothing), above zero.  An owned atom, else
+ * NULL (x first, then n, as any call). */
+static ray_t* take_count_arg(ray_t* e, ray_t* x) {
     if (!e) return NULL;
     ray_t* v = NULL;
     if (e->type == -RAY_I64 || e->type == -RAY_I32 || e->type == -RAY_I16) {
         v = e;
         ray_retain(v);
     } else if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        if (!expr_rebinds_nothing(x, 0)) return NULL;
         v = ray_eval(e);
         if (!v) return NULL;
         if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
@@ -5085,10 +5130,10 @@ ray_t* ray_eval(ray_t* obj) {
                 goto out;
             }
             if (fn == (ray_binary_fn)ray_take_fn) {
-                /* (take (select ...) n), n > 0 a literal or a name: the
-                 * select's first n rows alone; a select of fewer rows is
+                /* (take (select ...) n), n > 0 a literal or a name the
+                 * select cannot rebind: the select's first n rows alone; a select of fewer rows is
                  * its whole result, which take then repeats as for any table */
-                ray_t* nv = take_count_arg(elems[2]);
+                ray_t* nv = take_count_arg(elems[2], elems[1]);
                 int handled = 0;
                 ray_t* top = nv ? ray_try_select_head_expr(elems[1], as_i64(nv), &handled) : NULL;
                 if (handled) {
