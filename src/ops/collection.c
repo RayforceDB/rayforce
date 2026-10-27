@@ -2920,6 +2920,31 @@ static ray_t* parted_rows_asc(ray_t* col, const int64_t* cnt, int64_t ncnt,
     return out;
 }
 
+/* Row `row` (in range) of a table whose columns are read in place, as a
+ * dict of its column names to cells. */
+static ray_t* table_row_dict(ray_t* vec, int64_t row) {
+    int64_t ncols = ray_table_ncols(vec);
+    /* Build a dict: keys SYM vec + vals LIST */
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, ncols);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_list_new(ncols);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t key_id = ray_table_col_name(vec, c);
+        keys = ray_vec_append(keys, &key_id);
+        if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+        ray_t* col = ray_table_col_idx(vec, c);
+        if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
+        int alloc = 0;
+        ray_t* val = collection_elem(col, row, &alloc);
+        if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
+        vals = ray_list_append(vals, val);
+        if (alloc) ray_release(val);
+        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    }
+    return ray_dict_new(keys, vals);
+}
+
 static int at_pair_cmp(const void* a, const void* b) {
     int64_t x = ((const int64_t*)a)[0], y = ((const int64_t*)b)[0];
     return x < y ? -1 : x > y;
@@ -3028,32 +3053,11 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             ray_t* t1 = ray_at_fn(vec, one);
             ray_release(one);
             if (!t1 || RAY_IS_ERR(t1)) return t1 ? t1 : ray_error("oom", NULL);
-            ray_t* zero = ray_i64(0);
-            ray_t* d = ray_at_fn(t1, zero);
-            ray_release(zero);
+            ray_t* d = table_row_dict(t1, 0);
             ray_release(t1);
             return d;
         }
-        int64_t ncols = ray_table_ncols(vec);
-        /* Build a dict: keys SYM vec + vals LIST */
-        ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, ncols);
-        if (RAY_IS_ERR(keys)) return keys;
-        ray_t* vals = ray_list_new(ncols);
-        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-        for (int64_t c = 0; c < ncols; c++) {
-            int64_t key_id = ray_table_col_name(vec, c);
-            keys = ray_vec_append(keys, &key_id);
-            if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-            ray_t* col = ray_table_col_idx(vec, c);
-            if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
-            int alloc = 0;
-            ray_t* val = collection_elem(col, row, &alloc);
-            if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
-            vals = ray_list_append(vals, val);
-            if (alloc) ray_release(val);
-            if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-        }
-        return ray_dict_new(keys, vals);
+        return table_row_dict(vec, row);
     }
 
     /* Table row selection by index vector: apply the row ids to each
