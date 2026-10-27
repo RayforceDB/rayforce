@@ -16,13 +16,41 @@
 (try (raise 7) abs) -- 7
 (try (raise -3) abs) -- 3
 
-;; ── runtime error (no raise) → err_val defaults to 0 ────────────────────────
+;; ── runtime error (no raise) → the handler gets {code msg} ──────────────────
 (try (/ 1 "x") (fn [e] -1)) -- -1
 (try (sum null) (fn [e] -99)) -- -99
 (try (neg null) (fn [e] -2)) -- -2
+;; The error's code as a symbol and its message as a string: what the REPL
+;; prints for it, "type: cannot add i64 and sym".
+(try (+ 1 'a) (fn [e] e)) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
+(try (+ 1 'a) (fn [e] (type (at e 'code)))) -- 'sym
+(try (+ 1 'a) (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "type: cannot add i64 and sym"
+(try (1 2) (fn [e] e)) -- (dict [code msg] (list 'type "eval: head of list is not callable, got i64"))
+(try (.db.splayed.get "/no-such-dir-try-raise/t/") (fn [e] (at e 'code))) -- 'io
+(try (.db.splayed.get "/no-such-dir-try-raise/t/") (fn [e] (> (count (at e 'msg)) 0))) -- true
+;; A unary builtin handler gets the dict too.
+(try (+ 1 'a) type) -- 'DICT
+;; The same inside a function (the compiled path), from the function's own
+;; body or from a callee.
+((fn [x] (try (+ x 'a) (fn [e] e))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
+(set add_sym (fn [x] (+ x 'b)))
+((fn [x] (try (add_sym x) (fn [e] e))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
+((fn [] (try (.db.splayed.get "/no-such-dir-try-raise/t/") (fn [e] (at e 'code))))) -- 'io
+(set add2 (fn [a b] (+ a b)))
+((fn [] (try (add2 1 2 3) (fn [e] e)))) -- (dict [code msg] (list 'arity "expected 2 args, got 3"))
+(try (map (fn [x] (+ x 'a)) [1 2]) (fn [e] (at e 'code))) -- 'type
+((fn [] (try (map (fn [x] (+ x 'a)) [1 2]) (fn [e] (at e 'msg))))) -- "cannot add i64 and sym"
+;; A handler sees its own error, not one an earlier try caught.
+(try (do (try (+ 1 'a) 0) (1 2)) (fn [e] (at e 'msg))) -- "eval: head of list is not callable, got i64"
+((fn [] (try (do (try (+ 1 'a) 0) (1 2)) (fn [e] (at e 'msg))))) -- "apply: head is not callable, got i64"
+;; A handler can rethrow the message.
+(try (try (+ 1 'a) (fn [e] (raise (at e 'msg)))) (fn [e] e)) -- "cannot add i64 and sym"
 
 ;; ── undefined name error trapped ────────────────────────────────────────────
 (try undefined_name_xyz (fn [e] 0)) -- 0
+(try undefined_name_xyz (fn [e] e)) -- (dict [code msg] (list 'name "'undefined_name_xyz' undefined"))
+;; Compiled, an unresolved name carries no message, as the REPL prints it.
+((fn [] (try undefined_name_xyz (fn [e] e)))) -- (dict [code msg] (list 'name ""))
 
 ;; ── handler expression itself fails → propagates that error ─────────────────
 (try (raise 1) no_such_fn) !- name
