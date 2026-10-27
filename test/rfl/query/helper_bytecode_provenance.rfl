@@ -314,7 +314,7 @@ OUT6 -- [3 3 3 3 3 3]
 (set TB9 (table [v g] (list [1 2 3 10 20 30] ['a 'a 'b 'b 'c 'c])))
 (set kneg (fn [v] 1 (if (< v 0) (raise 'negative) (% v 7))))
 (at (select {n: (count v) by: (kneg v) from: TB9}) 'v) -- [1 2 3 6]
-(try (+ 1 'a) (fn [e] e)) -- 0
+(try (+ 1 'a) (fn [e] e)) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
 
 ;; ── a key body with an effect runs once per row ───────────────────────────
 ;; It is never evaluated whole first, so the effect is not repeated.
