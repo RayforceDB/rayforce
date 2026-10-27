@@ -6236,6 +6236,13 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
 
 static inline int64_t group_strlen_at(const ray_t* col, int64_t row);
 
+/* Where the thread's last test of a partial segment stopped: the first
+ * entry not below its row.  The scans test ascending rows, so the next row
+ * walks on from there instead of searching the segment again.  Any position
+ * whose previous entry is below the row is a valid start (a segment's
+ * entries ascend), so a stale one only costs the search. */
+static RAY_TLS uint32_t g_rowsel_pos;
+
 static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
     if (!sel) return true;
     ray_rowsel_t* m = ray_rowsel_meta(sel);
@@ -6248,14 +6255,20 @@ static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
     uint32_t lo = ray_rowsel_offsets(sel)[seg];
     uint32_t hi = ray_rowsel_offsets(sel)[seg + 1];
     const uint16_t* idx = ray_rowsel_idx(sel);
-    while (lo < hi) {
-        uint32_t mid = lo + ((hi - lo) >> 1);
-        uint16_t v = idx[mid];
-        if (v == local) return true;
-        if (v < local) lo = mid + 1;
-        else hi = mid;
+    uint32_t p = g_rowsel_pos;
+    if (p >= lo && p <= hi && (p == lo || idx[p - 1] < local)) {
+        while (p < hi && idx[p] < local) p++;
+    } else {
+        while (lo < hi) {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (idx[mid] < local) lo = mid + 1;
+            else hi = mid;
+        }
+        p = lo;
+        hi = ray_rowsel_offsets(sel)[seg + 1];
     }
-    return false;
+    g_rowsel_pos = p;
+    return p < hi && idx[p] == local;
 }
 
 /* ---- Range reads of the fat-entry builders (radix phase 1, its v2
@@ -10610,8 +10623,9 @@ RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
     return staged ? da_sid_len_piece_slow(c, a, rr) : da_sid_len_slow(c, a, r);
 }
 
-/* One SUM/AVG(strlen) beside COUNTs, one key, no row selection
- * (c->sl_agg >= 0).  Per block of rows the lengths are read first by a loop
+/* One SUM/AVG(strlen) beside COUNTs, one key, no row index list
+ * (c->sl_agg >= 0), over a row range every row of which counts.  Per block
+ * of rows the lengths are read first by a loop
  * of the column's own kind — STR descriptors, or SYM ids at their width —
  * and then folded by a loop of the key's width, so neither loop carries the
  * other's dispatch nor da_accum_row's per-agg one.  Keeps the state the
@@ -10620,8 +10634,8 @@ RAY_INLINE int64_t da_sid_len(const da_ctx_t* c, uint32_t a, int64_t sid,
 #define DA_SL_BLK 512
 /* The two wrappers instantiate this with a constant mode. Piece pointers
  * address row_base; lengths are consumed synchronously before the walk advances. */
-RAY_INLINE void da_accum_strlen_body(da_ctx_t* c, da_accum_t* acc,
-                                    int64_t start, int64_t end, const bool staged) {
+RAY_INLINE void da_accum_strlen_range(da_ctx_t* c, da_accum_t* acc,
+                                     int64_t start, int64_t end, const bool staged) {
     const uint32_t sa = (uint32_t)c->sl_agg;
     const size_t n_aggs = c->n_aggs;
     int64_t* restrict count = acc->count;
@@ -10706,6 +10720,67 @@ RAY_INLINE void da_accum_strlen_body(da_ctx_t* c, da_accum_t* acc,
     #undef DA_SL_SYM
 }
 #undef DA_SL_BLK
+
+/* da_accum_strlen_range's fold for the selected rows of one mixed segment:
+ * `idx` its n ascending in-segment offsets, the rows outside [lo, hi)
+ * skipped.  One row at a time, through the same length and key reads. */
+RAY_INLINE void da_accum_strlen_rows(da_ctx_t* c, da_accum_t* acc, int64_t base,
+                                     const uint16_t* idx, int64_t n, int64_t lo, int64_t hi,
+                                     const bool staged) {
+    const uint32_t sa = (uint32_t)c->sl_agg;
+    const size_t n_aggs = c->n_aggs;
+    int64_t* nn = acc->nn_count;
+    int64_t* sln = acc->sl_null;
+    const ray_t* col = c->agg_cols[sa];
+    const int64_t rb = staged ? c->row_base : 0;
+    const ray_str_t* desc = staged ? NULL : c->agg_str[sa];
+    const void* ids = desc ? NULL : (staged ? c->agg_ptrs[sa] : ray_data((ray_t*)col));
+    const uint8_t attrs = staged ? da_agg_attrs(c, sa, true) : col->attrs;
+    const ray_sym_domain_raw_t* raw =
+        (!desc && c->agg_raw_ok && c->agg_raw_ok[sa]) ? &c->agg_raw[sa] : NULL;
+    const bool rt = !staged && !desc && c->sym_strings &&
+                    ray_sym_vec_domain((ray_t*)col) == ray_sym_runtime_domain();
+    for (int64_t i = 0; i < n; i++) {
+        int64_t r = base + idx[i];
+        if (r < lo) continue;
+        if (r >= hi) break;
+        int64_t len = desc ? (int64_t)desc[r].len
+                           : da_sid_len(c, sa, ray_read_sym(ids, r - rb, RAY_SYM, attrs),
+                                        raw, rt, r, r - rb, staged);
+        int32_t gid = da_composite_gid(c, r - rb);
+        acc->count[gid]++;
+        size_t ix = (size_t)gid * n_aggs + sa;
+        acc->sum[ix].i = wrap_add_i64(acc->sum[ix].i, len);
+        if (nn) nn[ix]++;
+        if (RAY_UNLIKELY(len == 0) && sln) sln[ix]++;
+    }
+}
+
+/* The strlen fold over rows [start, end), under the row selection when
+ * there is one: a run of segments it takes whole is one range of the
+ * blocked loop, a mixed segment's rows are folded one by one, a segment
+ * it rejects is not read. */
+RAY_INLINE void da_accum_strlen_body(da_ctx_t* c, da_accum_t* acc,
+                                    int64_t start, int64_t end, const bool staged) {
+    if (!c->rowsel) { da_accum_strlen_range(c, acc, start, end, staged); return; }
+    const uint8_t* flags = ray_rowsel_flags(c->rowsel);
+    const uint32_t* offs = ray_rowsel_offsets(c->rowsel);
+    const uint16_t* idx = ray_rowsel_idx(c->rowsel);
+    const int64_t M = RAY_MORSEL_ELEMS;
+    for (int64_t r = start; r < end; ) {
+        int64_t seg = r / M;
+        int64_t se = (seg + 1) * M < end ? (seg + 1) * M : end;
+        if (flags[seg] == RAY_SEL_ALL) {
+            while (se < end && flags[se / M] == RAY_SEL_ALL)
+                se = (se / M + 1) * M < end ? (se / M + 1) * M : end;
+            da_accum_strlen_range(c, acc, r, se, staged);
+        } else if (flags[seg] != RAY_SEL_NONE) {
+            da_accum_strlen_rows(c, acc, seg * M, idx + offs[seg],
+                                 (int64_t)(offs[seg + 1] - offs[seg]), r, se, staged);
+        }
+        r = se;
+    }
+}
 
 static void __attribute__((noinline))
 da_accum_strlen_fn(da_ctx_t* c, da_accum_t* acc, int64_t start, int64_t end) {
@@ -17047,7 +17122,7 @@ da_path:;
             }
             da_ctx.agg_str = da_agg_str;
             da_ctx.sl_agg = -1;
-            if (all_sum && n_keys == 1 && !match_idx && !rowsel) {
+            if (all_sum && n_keys == 1 && !match_idx) {
                 int32_t one = -1;
                 bool sl_ok = true;
                 for (uint32_t a = 0; a < n_aggs && sl_ok; a++) {
