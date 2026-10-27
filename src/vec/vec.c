@@ -24,6 +24,7 @@
 #include "vec.h"
 #include "core/platform.h"
 #include "mem/heap.h"
+#include "mem/cow.h"
 #include "vec/growth.h"
 #include "table/sym.h"
 #include "table/domain.h"
@@ -225,6 +226,39 @@ void ray_sym_vec_adopt_domain(ray_t* out, ray_t* in) {
     out->sym_domain = dom;
 }
 
+/* Slice headers do not own writable capacity. Build the complete splice while
+ * the old view keeps every possibly aliased source byte and domain alive. */
+static __attribute__((cold, noinline))
+ray_t* vec_splice_slice_cow(ray_t* vec, int64_t idx, const void* src,
+                            int64_t count, bool scalar) {
+    uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
+    size_t required;
+    if (!ray_cell_growth_bytes(vec->len, count, esz, &required))
+        return ray_error("oom", NULL);
+    int64_t len = vec->len + count;
+    ray_t* out = vec->type == RAY_SYM
+        ? ray_sym_vec_new(vec->attrs & RAY_SYM_W_MASK, len)
+        : ray_vec_new(vec->type, len);
+    if (!out || RAY_IS_ERR(out))
+        return out ? out : ray_error("oom", NULL);
+
+    size_t prefix = (size_t)idx * esz;
+    size_t inserted = (size_t)count * esz;
+    size_t suffix = required - prefix - inserted;
+    char* dst = ray_data(out);
+    const char* old = ray_data(vec);
+    if (prefix) memcpy(dst, old, prefix);
+    memcpy(dst + prefix, src, inserted);
+    if (suffix) memcpy(dst + prefix + inserted, old + prefix, suffix);
+    out->len = len;
+    if (vec->type == RAY_SYM) ray_sym_vec_adopt_domain(out, vec);
+    out->attrs |= (vec->attrs | vec->slice_parent->attrs) & RAY_ATTR_HAS_NULLS;
+    if (scalar && ray_raw_is_null(out->type, out->attrs, ray_data(out), idx))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_release(vec);
+    return out;
+}
+
 /* --------------------------------------------------------------------------
  * ray_vec_append
  * -------------------------------------------------------------------------- */
@@ -235,11 +269,16 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
         return ray_error("type", "vec_append: expects a concrete vector type, got %s", ray_type_name(vec->type));
     if (vec->type == RAY_STR) return ray_error("type", "vec_append: str vectors use ray_str_vec_append, got %s", ray_type_name(vec->type));
 
+    if (RAY_UNLIKELY(vec->attrs & RAY_ATTR_SLICE))
+        return vec_splice_slice_cow(vec, vec->len, elem, 1, true);
+
     /* COW: if shared, copy first */
     uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     ray_t* original = vec;
-    vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!ray_cow_can_reuse_header(vec)) {
+        vec = ray_cow(vec);
+        if (!vec || RAY_IS_ERR(vec)) return vec;
+    }
 
     /* Append changes len + writes data; any attached index is now stale. */
     vec_drop_index_inplace(vec);
@@ -296,9 +335,14 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
     if (!ray_cell_growth_bytes(vec->len, count, esz, &required))
         return ray_error("oom", NULL);
 
+    if (RAY_UNLIKELY(vec->attrs & RAY_ATTR_SLICE))
+        return vec_splice_slice_cow(vec, vec->len, src, count, false);
+
     ray_t* original = vec;
-    vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!ray_cow_can_reuse_header(vec)) {
+        vec = ray_cow(vec);
+        if (!vec || RAY_IS_ERR(vec)) return vec;
+    }
 
     vec_drop_index_inplace(vec);
 
@@ -692,11 +736,16 @@ ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem) {
     if (vec->type == RAY_STR) return ray_error("type", "vec_insert_at: str vectors use ray_str_vec_insert_at, got %s", ray_type_name(vec->type));
     if (idx < 0 || idx > vec->len) return ray_error("range", "vec_insert_at: index out of bounds [0,%lld], got %lld", (long long)vec->len, (long long)idx);
 
+    if (RAY_UNLIKELY(vec->attrs & RAY_ATTR_SLICE))
+        return vec_splice_slice_cow(vec, idx, elem, 1, true);
+
     /* COW: if shared, copy first */
     uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     ray_t* original = vec;
-    vec = ray_cow(vec);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!ray_cow_can_reuse_header(vec)) {
+        vec = ray_cow(vec);
+        if (!vec || RAY_IS_ERR(vec)) return vec;
+    }
 
     /* In-place insert mutates len + data + aux; any attached
      * accelerator index is now stale. */

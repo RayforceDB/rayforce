@@ -147,24 +147,30 @@ ray_heap_set_anon_watermark(INT64_C(6) << 30);   /* as -m 6G */
 
 ### ray_cow
 
-Copy-on-write: if `v` is the sole owner (`rc == 1`), returns `v` unchanged. Otherwise, creates a deep copy and returns it with `rc = 1`. The original is not modified. After `ray_cow()`, if the returned pointer differs from the original, the caller must release it on error paths.
+For a valid non-arena heap value, reuses a sole-owner header (`rc == 1`); otherwise copies its allocation and returns a header with `rc = 1`. A successful copy consumes one input reference; other owners retain the original. If allocation fails, the input reference remains owned by the caller. Arena headers retain their existing special lifetime policy.
+
+This is not a recursive deep copy. In particular, copying a slice header retains its backing parent rather than materializing independent writable data. Header uniqueness alone does not authorize mutation through a backing pointer.
 
 ```c
 ray_t* ray_cow(ray_t* v);
 ```
 
-#### COW pattern
+#### COW ownership pattern
 
 ```c
-ray_t* original = ray_vec_new(RAY_I64, 100);
-ray_retain(original);  /* rc = 2: shared */
-
-ray_t* writable = ray_cow(original);
-/* writable != original (copy was made because rc > 1) */
-/* Now safe to mutate writable without affecting original */
-
-/* On error paths, release the copy: */
-if (writable != original) ray_release(writable);
+/* v is an owned, valid non-arena, non-slice vector. */
+ray_t* alias = ray_retain(v);
+ray_t* writable = ray_cow(v);
+if (!writable || RAY_IS_ERR(writable)) {
+    if (writable && RAY_IS_ERR(writable)) ray_error_free(writable);
+    ray_release(v);       /* failed COW did not consume this reference */
+    ray_release(alias);
+    return;
+}
+/* COW consumed v's input reference; alias still owns the old value. */
+/* Use the appropriate mutator for writable, then release each owner once. */
+ray_release(writable);
+ray_release(alias);
 ```
 
 ## Atom Constructors
@@ -294,8 +300,18 @@ Appends a single element to the end of the vector. The `elem` pointer must point
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
 
 int64_t val = 42;
-v = ray_vec_append(v, &val);  /* always reassign! */
+ray_t* result = ray_vec_append(v, &val);
+/* Check for NULL/error; on success, result replaces the owned input. */
 ```
+
+For a supported non-STR slice, append, raw append and single-element insertion construct an independent result from the visible range. The parent, other views and their indexes/attributes remain unchanged; SYM width and domain are preserved. The source pointer may refer into the old backing allocation: the slice keeps that allocation alive until all copies finish.
+
+```c
+ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);
+ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem);
+```
+
+A successful slice operation consumes one input reference. If slice-result allocation fails, the caller still owns the original input: keep its pointer until success, and free any returned owned error with `ray_error_free`. This slice-specific preservation does not redefine ordinary vector growth-failure ownership. Raw append of zero elements remains an identity/no-op and permits a NULL source; raw callers remain responsible for their existing null-hint obligations.
 
 ### ray_vec_set
 
@@ -320,7 +336,7 @@ if (p) printf("%lld\n", *p);
 
 ### ray_vec_slice
 
-Creates a zero-copy slice referencing the original vector's data from `offset` to `offset + len`. The slice retains the parent (incrementing its `rc`); the caller may release its own parent reference while the slice exists. Mutations require COW. A direct `ray_cow` copies a slice header, not its backing payload; use `ray_vec_set` for supported single-element writes rather than treating that header copy as independent writable data.
+Creates a zero-copy slice referencing the original vector's data from `offset` to `offset + len`. The slice retains the parent (incrementing its `rc`); the caller may release its own parent reference while the slice exists. Mutations require COW. A direct `ray_cow` copies a slice header, not its backing payload; use the supported slice-aware `ray_vec_set`, `ray_vec_append`, `ray_vec_append_raw` or `ray_vec_insert_at` operations rather than treating that header copy as independent writable data.
 
 ```c
 ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len);
