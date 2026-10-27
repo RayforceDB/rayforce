@@ -233,7 +233,7 @@ static void emit_jump_back(compiler_t *c, int32_t target) {
 
 /* Cached sym IDs for special forms */
 static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_times = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
-static _Thread_local int64_t sf_eval = -1, sf_resolve = -1;
+static _Thread_local int64_t sf_eval = -1, sf_resolve = -1, sf_select = -1;
 
 static void init_sf_syms(void) {
     if (sf_set >= 0) return;
@@ -250,6 +250,7 @@ static void init_sf_syms(void) {
     sf_null   = ray_sym_intern("null", 4);
     sf_eval    = ray_sym_intern("eval", 4);
     sf_resolve = ray_sym_intern("resolve", 7);
+    sf_select  = ray_sym_intern("select", 6);
 }
 
 /* Does `ast` mention any of the current locals — or `self`, or a
@@ -729,6 +730,28 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
 
     /* An unrecognized special form: dynamic eval on the whole form. */
     if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) { compile_dyn_form(c, ast); return; }
+
+    /* `(count (select {...}))`: the tree walker counts the select's rows
+     * off its selection without gathering a column
+     * (ray_try_count_select_expr); compiled, the select would gather every
+     * column for count to take the length.  The whole form is evaluated
+     * dynamically, as the select alone would be. */
+    if (fn && fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_count_fn &&
+        n == 2 && elems[1] && elems[1]->type == RAY_LIST && ray_len(elems[1]) == 2) {
+        /* only the select special form: not a local of that name, nor a
+         * global rebound to a function (the shortcut goes by the name) */
+        ray_t **sel = (ray_t**)ray_data(elems[1]);
+        if (sel[0] && sel[0]->type == -RAY_SYM && !(sel[0]->attrs & ATTR_QUOTED) &&
+            sel[0]->i64 == sf_select && find_local(c, sf_select) < 0 &&
+            sel[1] && sel[1]->type == RAY_DICT) {
+            ray_t *sfn = call_head_fn(c, sel[0]);
+            if (c->error) return;
+            if (sfn && (sfn->attrs & RAY_FN_SPECIAL_FORM)) {
+                compile_dyn_form(c, ast);
+                return;
+            }
+        }
+    }
 
     /* `eval` and `resolve` read names from text at run time: the tree
      * walker that serves them resolves through the scope frames, so the
@@ -1391,5 +1414,5 @@ ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {
 
 void ray_compile_reset(void) {
     sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = sf_null = -1;
-    sf_eval = sf_resolve = -1;
+    sf_eval = sf_resolve = sf_select = -1;
 }

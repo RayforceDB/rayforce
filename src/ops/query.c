@@ -13564,6 +13564,9 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (!name || ray_str_len(name) != 6 ||
         memcmp(ray_str_ptr(name), "select", 6) != 0)
         return NULL;
+    /* the select special form, not a local or a global of that name */
+    ray_t* sel_fn = ray_env_get(elems[0]->i64);
+    if (!sel_fn || !(sel_fn->attrs & RAY_FN_SPECIAL_FORM)) return NULL;
 
     ray_t* dict = elems[1];
     if (!dict || dict->type != RAY_DICT) return NULL;
