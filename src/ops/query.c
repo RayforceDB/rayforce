@@ -13520,24 +13520,28 @@ static ray_t* where_mask_spread(ray_t* m, int64_t tn, const char* label) {
     return ray_where_mask_coerce(m, tn, label);
 }
 
-/* `where` is an `(and ...)` call of two or more conjuncts. */
-static bool count_where_is_and(ray_t* w) {
+/* `where` is a call of `name` with two or more arguments. */
+static bool count_where_is_call(ray_t* w, const char* name) {
+    size_t nl = strlen(name);
     if (!w || w->type != RAY_LIST || ray_len(w) < 3) return false;
     ray_t* h = ((ray_t**)ray_data(w))[0];
     if (!h || h->type != -RAY_SYM) return false;
     ray_t* wn = ray_sym_str(h->i64);
-    return wn && ray_str_len(wn) == 3 && memcmp(ray_str_ptr(wn), "and", 3) == 0;
+    return wn && (size_t)ray_str_len(wn) == nl && memcmp(ray_str_ptr(wn), name, nl) == 0;
 }
 
+static bool count_where_is_and(ray_t* w) { return count_where_is_call(w, "and"); }
+
 /* A conjunct the count shortcut answers as the select does: a nested
- * `(and ...)` of such conjuncts, or a compare of a column with a literal the
- * single-compare count would take (count_cmp_parse, count_cmp_types_ok),
- * plus a numeric literal on a float column.  Nullability is not part of the
- * shape: a null cell fails every compare in the selection as in the
- * select. */
+ * `(and ...)` or `(or ...)` of such conjuncts, or a compare of a column with
+ * a literal the single-compare count would take (count_cmp_parse,
+ * count_cmp_types_ok), plus a numeric literal on a float column.  Every leaf
+ * is row-local, so the `or` selects the rows the select's filter does.
+ * Nullability is not part of the shape: a null cell fails every compare in
+ * the selection as in the select. */
 static bool count_conj_ok(ray_t* tbl, ray_t* e, int depth) {
     if (depth > 16) return false;
-    if (count_where_is_and(e)) {
+    if (count_where_is_and(e) || count_where_is_call(e, "or")) {
         ray_t** el = (ray_t**)ray_data(e);
         for (int64_t i = 1; i < ray_len(e); i++)
             if (!count_conj_ok(tbl, el[i], depth + 1)) return false;
@@ -13674,8 +13678,8 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
 
     /* A conjunction is counted off its selection below (the fused
      * predicate, else the bool mask), never gathering a column, only when
-     * every conjunct is whitelisted (count_conj_ok).  Anything else (`or`,
-     * constants, aggregates, arithmetic) is the select's: its optimizer
+     * every conjunct is whitelisted (count_conj_ok).  Anything else
+     * (constants, aggregates, arithmetic) is the select's: its optimizer
      * folds constants and its chained filters refine what an aggregate
      * reads. */
     if (count_where_is_and(where_expr) && !count_conj_ok(tbl, where_expr, 0)) {

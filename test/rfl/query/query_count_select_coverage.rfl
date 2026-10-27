@@ -115,3 +115,31 @@
 (count (select {from: Tdag where: (and (> v 2) (< v 8))})) -- 5
 ;; Value-pair: kept rows are {3,4,5,6,7}=25.
 (sum (at (select {from: Tdag where: (and (> v 2) (< v 8))}) 'v)) -- 25
+
+;; ────────────────────────────────────────────────────────────────────
+;; `and` whose conjuncts nest `or`s of column-vs-literal compares: counted
+;; off its selection; any other conjunct leaves the count to the select.
+;; Both give the select's own count (a select with an output column always
+;; goes the select's way)
+;; ────────────────────────────────────────────────────────────────────
+(set TA (table [a b f u k] (list (% (til 3000) 97) (% (* (til 3000) 7) 13) (as 'F64 (% (til 3000) 11)) (take ["ab" "Google x" "" "zz"] 3000) (% (til 3000) 3))))
+(set TAN (update {a: (if (== (% a 5) 0) 0Nl a) f: (if (== (% b 4) 0) 0Nf f) from: TA}))
+(set ga 40)
+(set fa (fn [x] (> x 20)))
+(count (select {from: TA where: (and (< a 50) (or (> b 10) (< b 5)))})) -- 835
+(count (select {from: TA where: (and (< a 50) (or (> b 10) (< b 5)))})) -- (count (select {x: a from: TA where: (and (< a 50) (or (> b 10) (< b 5)))}))
+(count (select {from: TA where: (and (< a 50) (like u "*Google*"))})) -- (count (select {x: a from: TA where: (and (< a 50) (like u "*Google*"))}))
+(count (select {from: TA where: (and (< a 50) (in b [1 2 3]))})) -- (count (select {x: a from: TA where: (and (< a 50) (in b [1 2 3]))}))
+(count (select {from: TA where: (and (< a 50) (not (== b 3)) (< (+ a b) 30))})) -- (count (select {x: a from: TA where: (and (< a 50) (not (== b 3)) (< (+ a b) 30))}))
+(count (select {from: TA where: (and (> a 4) (> b (avg b)))})) -- (count (select {x: a from: TA where: (and (> a 4) (> b (avg b)))}))
+(count (select {from: TA where: (and (> (sums b) 1000) (< a 50))})) -- (count (select {x: a from: TA where: (and (> (sums b) 1000) (< a 50))}))
+(count (select {from: TA where: (and (< a 50) true)})) -- (count (select {x: a from: TA where: (< a 50)}))
+(count (select {from: TA where: (and (< a 50) (== 1 0))})) -- 0
+(count (select {from: TA where: (and (< a ga) (fa a) (> f 2.5))})) -- (count (select {x: a from: TA where: (and (< a ga) (fa a) (> f 2.5))}))
+(count (select {from: TAN where: (and (< a 50) (> f 3.0) (in k [0 1]))})) -- (count (select {x: a from: TAN where: (and (< a 50) (> f 3.0) (in k [0 1]))}))
+(count (select {from: TAN where: (and (not (nil? a)) (or (> f 3.0) (nil? f)))})) -- (count (select {x: a from: TAN where: (and (not (nil? a)) (or (> f 3.0) (nil? f)))}))
+(count (select {from: TAN where: (and (< a 50) (or (> f 3.0) (< f 1.0)))})) -- (count (select {x: a from: TAN where: (and (< a 50) (or (> f 3.0) (< f 1.0)))}))
+(count (select {from: TAN where: (and (or (< a 10) (and (> b 3) (< b 9))) (> f 1.0))})) -- (count (select {x: a from: TAN where: (and (or (< a 10) (and (> b 3) (< b 9))) (> f 1.0))}))
+(count (select {from: TA where: (and (< a 50) (or 0.0 (> b 1)))})) -- (count (select {x: a from: TA where: (and (< a 50) (or 0.0 (> b 1)))}))
+(count (select {from: TA where: (and (< a 50) (+ b 1))})) !- type
+(count (select {from: TA where: (and (< a 50) (> zz 1))})) !- schema
