@@ -42,6 +42,8 @@ typedef struct {
     int64_t       n;
     int64_t       cap;
     int64_t       next_id;
+    ray_timer_t*  firing;       /* popped timer whose callback is running, else NULL */
+    bool          firing_dead;  /* ray_timers_del hit `firing`: drop it after the callback */
 } ray_timers_t;
 
 /* Create an empty heap with `initial_cap` slots (rounded up to 1).
@@ -56,7 +58,9 @@ void ray_timers_destroy(ray_timers_t* t);
 int64_t ray_timers_add(ray_timers_t* t, int64_t tic_ms, int64_t num, ray_t* fn);
 
 /* Remove the timer with `id`.  Releases its lambda.
- * Returns true if found+removed, false otherwise. */
+ * Returns true if found+removed, false otherwise.  The timer whose callback
+ * is running is out of the heap; deleting it marks it dead and it is freed,
+ * not re-armed, when the callback returns. */
 bool ray_timers_del(ray_timers_t* t, int64_t id);
 
 /* Deadline (monotonic ms) of the soonest-firing timer, or INT64_MAX if empty. */
