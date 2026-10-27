@@ -47,7 +47,13 @@ The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup an
 
 Signature: `(.log.write expr)`. Serialises `expr` and appends a frame to the open journal.
 
-Errors: `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size), `oom`, `io`. Lazy values are forced before serialisation.
+Errors: `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size, or the call runs inside an auto-journaled IPC request), `oom`, `io`. Lazy values are forced before serialisation.
+
+Inside an auto-journaled IPC request the request itself is the journal entry and is re-evaluated on replay, so an extra frame would apply the change twice. Code shared between journaled request handlers and other paths tests `(.ipc.auto_journal_eval)` and skips its own write there:
+
+```lisp
+(if (.ipc.auto_journal_eval) null (.log.write expr))
+```
 
 ```lisp
 (.log.open 'async "/tmp/rayforce-journal")

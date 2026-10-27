@@ -2192,6 +2192,38 @@ static test_result_t test_ops_write_rejects_auto_journal_eval(void) {
     PASS();
 }
 
+/* 22qb. (.ipc.auto_journal_eval): the Rayfall-visible predicate reads the
+ * auto-journal scope, so code running inside a journaled request can skip
+ * its own frames instead of hitting the `.log.write` refusal. */
+static test_result_t test_ops_auto_journal_eval_predicate(void) {
+    /* Collect, restore the thread-local scope, then assert. */
+    ray_t* outside = ray_eval_str("(.ipc.auto_journal_eval)");
+    bool outer = ray_ipc_set_auto_journal_eval(true);
+    ray_t* inside = ray_eval_str("(.ipc.auto_journal_eval)");
+    ray_t* guarded = ray_eval_str("(if (.ipc.auto_journal_eval) 'skip 'write)");
+    ray_ipc_set_auto_journal_eval(outer);
+    ray_t* restored = ray_eval_str("(.ipc.auto_journal_eval)");
+
+    bool outside_false = outside && !RAY_IS_ERR(outside) && outside->type == -RAY_BOOL && !outside->b8;
+    bool inside_true   = inside && !RAY_IS_ERR(inside) && inside->type == -RAY_BOOL && inside->b8;
+    bool guard_skip    = guarded && !RAY_IS_ERR(guarded) && guarded->type == -RAY_SYM
+                         && guarded->i64 == ray_sym_intern("skip", 4);
+    bool restored_false = restored && !RAY_IS_ERR(restored) && restored->type == -RAY_BOOL && !restored->b8;
+
+    ray_t* all[] = { outside, inside, guarded, restored };
+    for (int i = 0; i < 4; i++) {
+        if (!all[i]) continue;
+        if (RAY_IS_ERR(all[i])) ray_error_free(all[i]); else ray_release(all[i]);
+    }
+
+    TEST_ASSERT_FALSE(outer);
+    TEST_ASSERT_TRUE(outside_false);
+    TEST_ASSERT_TRUE(inside_true);
+    TEST_ASSERT_TRUE(guard_skip);
+    TEST_ASSERT_TRUE(restored_false);
+    PASS();
+}
+
 /* 22r. ray_log_write_fn: pay_size <= 0 (lines 100-103).
  *
  *  ray_serde_size returns 0 for object types not in its switch (any type
@@ -2837,6 +2869,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
+    { "journal/ops_auto_journal_eval_predicate", test_ops_auto_journal_eval_predicate, jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
