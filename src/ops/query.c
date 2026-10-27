@@ -22164,7 +22164,24 @@ by_dict_done:
                 ray_t* eval_tbl = tbl;
                 int release_eval_tbl = 0;
                 if (g->selection) {
-                    eval_tbl = sel_compact(g, tbl, g->selection, NULL, 0);
+                    /* The where: rows of the columns the outputs name, when
+                     * no output can reach a column otherwise (a lambda, a
+                     * local, eval: eval_group_keep_ok); else every column. */
+                    int64_t knc = ray_table_ncols(tbl);
+                    ray_t* keep_hdr = NULL;
+                    int64_t* keep = knc > 0
+                        ? (int64_t*)scratch_alloc(&keep_hdr, (size_t)knc * sizeof(int64_t)) : NULL;
+                    int keep_n = 0;
+                    for (int64_t i = 0; keep && i + 1 < dict_n; i += 2) {
+                        int64_t kid = dict_elems[i]->i64;
+                        if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
+                            kid == asc_id || kid == desc_id || kid == nearest_id) continue;
+                        if (!eval_group_keep_ok(dict_elems[i + 1], tbl)) { keep_n = 0; break; }
+                        keep_n = collect_col_refs_set(dict_elems[i + 1], tbl, keep, (int)knc, keep_n);
+                    }
+                    if (keep_n >= knc) keep_n = 0;           /* all of them anyway */
+                    eval_tbl = sel_compact(g, tbl, g->selection, keep_n ? keep : NULL, keep_n);
+                    if (keep_hdr) scratch_free(keep_hdr);
                     if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
                         if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                         ray_graph_free(g); ray_release(tbl);
