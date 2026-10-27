@@ -1,0 +1,77 @@
+;; GUID vectors compare cell by cell exactly as two guid atoms do: the 16
+;; bytes in memcmp order, so a null guid (all-zero bytes) equals another
+;; null and sorts below every other value.  A vector operand takes a typed
+;; loop instead of boxing every cell; each answer below is what the atom
+;; compare gives for that pair of cells.
+
+(set ga (as 'guid "00000000-0000-0000-0000-000000000001"))
+(set gb (as 'guid "00000000-0000-0000-0000-000000000002"))
+(set gc (as 'guid "ffffffff-0000-0000-0000-000000000000"))
+;; A = [1 2 null F null], B = [1 F null 2 1]
+(set A (as 'GUID (list "00000000-0000-0000-0000-000000000001" "00000000-0000-0000-0000-000000000002" "00000000-0000-0000-0000-000000000000" "ffffffff-0000-0000-0000-000000000000" "00000000-0000-0000-0000-000000000000")))
+(set B (as 'GUID (list "00000000-0000-0000-0000-000000000001" "ffffffff-0000-0000-0000-000000000000" "00000000-0000-0000-0000-000000000000" "00000000-0000-0000-0000-000000000002" "00000000-0000-0000-0000-000000000001")))
+
+;; ─── vector against vector ─────────────────────────────────────────
+(== A B) -- [true false true false false]
+(!= A B) -- [false true false true true]
+(< A B)  -- [false true false false true]
+(<= A B) -- [true true true false true]
+(> A B)  -- [false false false true false]
+(>= A B) -- [true false true true false]
+(type (== A B)) -- 'B8
+;; the atoms agree, cell by cell
+(< (at A 1) (at B 1)) -- (at (< A B) 1)
+(< (at A 4) (at B 4)) -- (at (< A B) 4)
+(== (at A 2) (at B 2)) -- (at (== A B) 2)
+
+;; ─── vector against an atom, atom against a vector ─────────────────
+(== A gb) -- [false true false false false]
+(!= A gb) -- [true false true true true]
+(< A gb)  -- [true false true false true]
+(<= A gb) -- [true true true false true]
+(> A gb)  -- [false false false true false]
+(>= A gb) -- [false true false true false]
+(== gb A) -- [false true false false false]
+(< gb A)  -- [false false false true false]
+(> gb A)  -- [true false true false true]
+(>= gc A) -- [true true true true true]
+;; a null atom equals the null cells only
+(== A 0Ng) -- [false false true false true]
+(!= 0Ng A) -- [true true false true false]
+(< 0Ng A)  -- [true true false true false]
+
+;; ─── shapes the compare rejects ────────────────────────────────────
+(== A (take B 3)) !- length
+(!= A (take B 3)) !- length
+(< A (take B 3))  !- length
+(== A [1 2 3 4 5]) !- type
+(== A 5) !- type
+(type (== (take A 0) (take B 0))) -- 'B8
+(count (== (take A 0) (take B 0))) -- 0
+(count (< (take A 0) ga)) -- 0
+
+;; ─── past the parallel threshold ───────────────────────────────────
+(set n 100001)
+(set G (guid n))
+(set C (at G (til n)))
+(set R (reverse G))
+(all (== G C)) -- true
+(any (!= G C)) -- false
+;; only the middle cell of a reversal is in place
+(where (== G R)) -- [50000]
+(where (!= G R)) -- (except (til n) [50000])
+(+ (+ (sum (< G R)) (sum (> G R))) (sum (== G R))) -- n
+(all (== (< G R) (> R G))) -- true
+(all (== (<= G R) (not (> G R)))) -- true
+(all (== (>= G R) (not (< G R)))) -- true
+(at (< G R) 7) -- (< (at G 7) (at R 7))
+(at (> G R) 99999) -- (> (at G 99999) (at R 99999))
+(where (== G (at G 777))) -- [777]
+(where (== (at G 777) G)) -- [777]
+(sum (!= G (at G 777))) -- 100000
+(all (== (< G (at G 777)) (> (at G 777) G))) -- true
+
+;; ─── a slice of a vector compares as its cells ─────────────────────
+(all (== (drop G 3) (drop C 3))) -- true
+(where (== (drop G 1) (drop R 1))) -- [49999]
+(where (== (drop G 1) (at G 778))) -- [777]
