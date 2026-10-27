@@ -640,6 +640,11 @@ static ray_t* join_gather_col_rows(ray_t* src, const int64_t* idx,
         ray_pool_dispatch(pool, gather_fn, &gctx, n);
     else
         gather_fn(&gctx, 0, 0, n);
+    /* a cancelled dispatch skips tasks: their rows were never written */
+    if (pool_cancelled(pool)) {
+        ray_release(out);
+        return ray_error("cancel", NULL);
+    }
     out->len = n;
     col_propagate_str_pool(out, src);
     col_propagate_nulls_gather(out, src, idx, n);

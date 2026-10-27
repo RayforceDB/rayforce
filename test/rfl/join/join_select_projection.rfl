@@ -31,6 +31,21 @@
 (set jpg (fn [] (sum w)))
 (select {s: (jpg) from: (left-join [k] jpL jpR)}) -- (select {s: (jpg) from: jpLJ})
 (select {s: (eval (quote (sum r1))) from: (left-join [k] jpL jpR)}) -- (select {s: (eval (quote (sum r1))) from: jpLJ})
+(select {s: (sum (resolve (quote r1))) from: (left-join [k] jpL jpR)}) -- (select {s: (sum r1) from: jpLJ})
+(select {s: (sum (resolve (quote r1))) from: (inner-join [k] jpL jpR)}) -- (select {s: (sum r1) from: jpIJ})
+(set jpev eval)
+(select {s: (jpev (quote (sum r1))) from: (left-join [k] jpL jpR)}) -- (select {s: (jpev (quote (sum r1))) from: jpLJ})
+(select {s: (jpev (quote (sum r1))) from: (inner-join [k] jpL jpR)}) -- (select {s: (jpev (quote (sum r1))) from: jpIJ})
+;; a parameter or let named like a joined column is the callable, not the column
+(set jph (fn [] r1))
+((fn [w] (select {s: (sum (w)) from: (left-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpLJ})
+((fn [w] (select {s: (sum (w)) from: (inner-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpIJ})
+((fn [] (let w jph) (select {s: (sum (w)) from: (left-join [k] jpL jpR)}))) -- (select {s: (sum r1) from: jpLJ})
+((fn [h] (select {s: (sum (h)) from: (left-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpLJ})
+;; the same reads in a grouped select whose where: runs as its own filter
+(set jpT (table [k a r1] (list (% (til 3000) 3) (til 3000) (* 10 (til 3000)))))
+((fn [a] (select {s: (sum (a)) from: jpT where: (> r1 5) by: k})) jph) -- (select {s: (sum r1) from: jpT where: (> r1 5) by: k})
+(select {s: (sum (resolve (quote r1))) from: jpT where: (> a 5) by: k}) -- (select {s: (sum r1) from: jpT where: (> a 5) by: k})
 ;; no outputs: the whole joined table
 (take (select {from: (left-join [k] jpL jpR) where: (> v 2990)}) 3) -- (take (select {from: jpLJ where: (> v 2990)}) 3)
 ;; a nested select names what it reads from the join

@@ -13837,21 +13837,32 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
     if (!e) return true;
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return false;
+        /* a lexical local wins over a column of its name (query locals never
+         * shadow one): it may be a callable reading anything */
+        if (ray_env_has_lexical_local(e->i64)) return false;
         if (tbl_has_col(tbl, e->i64)) return true;
         if (ray_sym_is_dotted(e->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(e->i64, &segs);
-            return nsegs >= 1 && tbl_has_col(tbl, segs[0]);
+            return nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
         }
         if (ray_env_get_local(e->i64)) return false;
         ray_t* fn = ray_env_get(e->i64);
         if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
             return false;
-        ray_t* nm = ray_sym_str(e->i64);
-        return !(nm && ray_str_len(nm) == 4 && memcmp(ray_str_ptr(nm), "eval", 4) == 0);
+        /* eval and resolve read names from text or symbols at run time,
+         * whatever name they are reached by */
+        if (fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn)
+            return false;
+        return !(fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == ray_resolve_fn);
     }
     if (e->type == RAY_LIST) {
         ray_t** el = (ray_t**)ray_data(e);
+        /* a quoted form names no column for collect_col_refs_set, which
+         * skips it, yet its symbols may be looked up at run time */
+        if (ray_len(e) == 2 && el[0] && el[0]->type == -RAY_SYM &&
+            !(el[0]->attrs & ATTR_QUOTED) && el[0]->i64 == ray_sym_intern("quote", 5))
+            return false;
         for (int64_t i = 0; i < ray_len(e); i++)
             if (!expr_reads_named_columns_only(el[i], tbl)) return false;
         return true;
