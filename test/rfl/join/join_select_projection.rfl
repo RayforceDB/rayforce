@@ -42,6 +42,13 @@
 ((fn [w] (select {s: (sum (w)) from: (inner-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpIJ})
 ((fn [] (let w jph) (select {s: (sum (w)) from: (left-join [k] jpL jpR)}))) -- (select {s: (sum r1) from: jpLJ})
 ((fn [h] (select {s: (sum (h)) from: (left-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpLJ})
+;; a join inside a lambda that is the from: is not the select's to narrow
+(set jpfd (fn [] (distinct (left-join [k] jpL jpR))))
+(select {s: (sum w) from: (jpfd)}) -- (select {s: (sum w) from: (distinct jpLJ)})
+(select {c: (count w) from: (jpfd)}) -- (select {c: (count w) from: (distinct jpLJ)})
+(set jpfx (fn [] (xasc (left-join [k] jpL jpR) 'r1)))
+(select {s: (sum w) from: (jpfx)}) -- (select {s: (sum w) from: (xasc jpLJ 'r1)})
+((fn [left-join] (select {s: (sum w) from: (left-join [k] jpL jpR)})) (fn [a b c] (distinct (inner-join a b c)))) -- (select {s: (sum w) from: (distinct jpIJ)})
 ;; the same reads in a grouped select whose where: runs as its own filter
 (set jpT (table [k a r1] (list (% (til 3000) 3) (til 3000) (* 10 (til 3000)))))
 ((fn [a] (select {s: (sum (a)) from: jpT where: (> r1 5) by: k})) jph) -- (select {s: (sum r1) from: jpT where: (> r1 5) by: k})

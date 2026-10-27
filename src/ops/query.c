@@ -17250,6 +17250,20 @@ typedef struct {
 static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                               select_owned_t* own);
 
+/* Is `from_expr` a call of the left/inner/full join builtin itself?  Only
+ * that join reads the published projection (join_narrow_inputs): any other
+ * from: — a lambda whose body joins, a wrapper — may need every column. */
+static bool select_from_is_join(ray_t* from_expr) {
+    if (!from_expr || from_expr->type != RAY_LIST || ray_len(from_expr) < 1) return false;
+    ray_t* head = ((ray_t**)ray_data(from_expr))[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+    if (ray_env_has_lexical_local(head->i64)) return false;
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || fn->type != RAY_VARY) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_left_join_fn || f == ray_inner_join_fn || f == ray_full_join_fn;
+}
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     select_owned_t own = {0};
     ray_t* r = ray_select_body(args, n, plan, &own);
@@ -17304,7 +17318,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     if (pvm && proj_buf && proj_compute_keep(dict, proj_buf, (int)proj_hdr_keys, &proj_n)) {
         pvm->proj_keep = proj_buf; pvm->proj_keep_n = proj_n;
         pvm->proj_depth = pvm->eval_depth; pvm->proj_active = true;
-        pvm->proj_dict = dict;
+        pvm->proj_dict = select_from_is_join(from_expr) ? dict : NULL;
     }
     ray_t* tbl = ray_eval(from_expr);
     if (pvm) { pvm->proj_keep = pj_k; pvm->proj_keep_n = pj_n;
