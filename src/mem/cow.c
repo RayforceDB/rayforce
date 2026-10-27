@@ -59,9 +59,7 @@ void ray_release(ray_t* v) {
 
 ray_t* ray_cow(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return v;
-    if (v->attrs & RAY_ATTR_ARENA) return v;  /* arena-owned, no-op */
-    uint32_t rc = RAY_LIKELY(!ray_rc_sync) ? v->rc : ray_atomic_load(&v->rc);
-    if (rc == 1) return v;  /* sole owner -- mutate in place */
+    if (ray_cow_can_reuse_header(v)) return v;
     ray_t* copy = ray_alloc_copy(v);
     if (!copy || RAY_IS_ERR(copy)) return copy;
     /* L3: ray_alloc_copy() already sets copy->rc = 1, so no redundant store needed. */
