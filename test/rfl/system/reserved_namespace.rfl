@@ -29,8 +29,10 @@
 ;; getenv, setenv
 (count .fs) -- 2
 ;; size, list
-(count .ipc) -- 6
-;; open, close, send, post, handle, txlimit
+(count .ipc) -- 7
+;; open, close, send, post, handle, auto_journal_eval, txlimit
+;; outside an auto-journaled IPC request the scope predicate is false
+(.ipc.auto_journal_eval) -- false
 (count .csv) -- 4
 ;; read, splayed, parted, write
 ;; .db.* — three-level reserved namespace for storage I/O.  The

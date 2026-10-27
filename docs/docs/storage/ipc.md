@@ -193,7 +193,7 @@ The default is 256 MiB with no frame cap; the minimum is 4 KiB, and `frames` of 
 
 ## Connection Hooks
 
-The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. `close` also fires on the client side for a connection opened with `.ipc.open`, so a subscriber sees its publisher go away. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.
+The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. `(.ipc.auto_journal_eval)` answers `true` while the current evaluation runs inside an auto-journaled request, where the request is already the journal entry and handlers must not `.log.write` frames of their own. `close` also fires on the client side for a connection opened with `.ipc.open`, so a subscriber sees its publisher go away. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.
 
 ## Serialization with `ser`
 
