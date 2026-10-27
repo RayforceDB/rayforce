@@ -71,6 +71,14 @@ alter_shadow -- [5 5]
 ((fn [n] (count (select {from: ctbl where: (> nosuchcol n)}))) 1) !- schema
 ;; a local or a global named select that is not the special form is called
 ((fn [select t] (count (select {from: t}))) (fn [d] [1 2 3]) ctbl) -- 3
+;; take and first of a select in a compiled body: the frame's locals reach
+;; the select and the count, a local select is called
+((fn [t n] (at (take (select {from: t where: (> v 10) desc: v}) n) 'v)) ctbl 2) -- (at (take (select {from: ctbl where: (> v 10) desc: v}) 2) 'v)
+((fn [t] (at (first (select {from: t desc: v})) 'v)) ctbl) -- (max (at ctbl 'v))
+((fn [t] (let k 3) (count (take (select {from: t asc: v}) k))) ctbl) -- 3
+((fn [t] (count (take (select {from: t where: (> v 1000)}) 2))) ctbl) -- 2
+((fn [select t] (first (select {from: t}))) (fn [d] [7 8]) ctbl) -- 7
+((fn [select t] (take (select {from: t}) 1)) (fn [d] [7 8]) ctbl) -- [7]
 ;; (last in the file: the global select stays rebound)
 (set cnt_rebound (fn [n] (count (select {from: ctbl where: (> v n)}))))
 (cnt_rebound 25) -- 4

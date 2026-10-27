@@ -13555,8 +13555,9 @@ static bool count_conj_ok(ray_t* tbl, ray_t* e, int depth) {
     return count_cmp_types_ok(type, op, rhs, true);
 }
 
-ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
-    if (handled) *handled = 0;
+/* The query dict of `expr` when it is a call of the select special form
+ * (not a local or a global of that name), else NULL. */
+static ray_t* select_form_dict(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2) return NULL;
     ray_t** elems = (ray_t**)ray_data(expr);
     if (!elems[0] || elems[0]->type != -RAY_SYM) return NULL;
@@ -13564,12 +13565,72 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (!name || ray_str_len(name) != 6 ||
         memcmp(ray_str_ptr(name), "select", 6) != 0)
         return NULL;
-    /* the select special form, not a local or a global of that name */
     ray_t* sel_fn = ray_env_get(elems[0]->i64);
     if (!sel_fn || !(sel_fn->attrs & RAY_FN_SPECIAL_FORM)) return NULL;
-
     ray_t* dict = elems[1];
-    if (!dict || dict->type != RAY_DICT) return NULL;
+    return dict && dict->type == RAY_DICT ? dict : NULL;
+}
+
+/* The first n > 0 rows of `expr`, a select of whole rows (no output
+ * columns, no by:, take: or nearest:), for (take (select ...) n) and
+ * (first (select ...)): the select runs with take: n, which keeps the rows
+ * the full select would put first — a sort's top n, the first n a where
+ * passes — without sorting or gathering the rest.  An owned table (fewer
+ * than n rows when the select has fewer), or error; NULL with *handled 0
+ * when the shape is not one of these. */
+ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled) {
+    if (handled) *handled = 0;
+    ray_t* dict = n > 0 ? select_form_dict(expr) : NULL;
+    if (!dict || !dict_get(dict, "from")) return NULL;
+    int64_t from_id  = dict_key_id(dict, "from");
+    int64_t where_id = dict_key_id(dict, "where");
+    int64_t asc_id   = dict_key_id(dict, "asc");
+    int64_t desc_id  = dict_key_id(dict, "desc");
+
+    DICT_VIEW_DECL(dv);
+    DICT_VIEW_OPEN(dict, dv);
+    if (DICT_VIEW_OVERFLOW(dv)) { DICT_VIEW_CLOSE(dv); return NULL; }
+    int64_t np = dv_n / 2;
+    for (int64_t i = 0; i + 1 < dv_n; i += 2) {
+        int64_t kid = dv[i]->i64;
+        if (kid != from_id && kid != where_id && kid != asc_id && kid != desc_id)
+            { DICT_VIEW_CLOSE(dv); return NULL; }
+    }
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, np + 1);
+    ray_t* vals = ray_list_new(np + 1);
+    ray_t* nv = ray_i64(n);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals) || !nv || RAY_IS_ERR(nv)) {
+        DICT_VIEW_CLOSE(dv);
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        if (nv && !RAY_IS_ERR(nv)) ray_release(nv);
+        return NULL;
+    }
+    int64_t* kd = (int64_t*)ray_data(keys);
+    for (int64_t i = 0; i < np; i++) {
+        kd[i] = dv[2 * i]->i64;
+        if (!RAY_IS_ERR(vals)) vals = ray_list_append(vals, dv[2 * i + 1]);
+    }
+    DICT_VIEW_CLOSE(dv);
+    kd[np] = ray_sym_intern("take", 4);
+    keys->len = np + 1;
+    if (!RAY_IS_ERR(vals)) vals = ray_list_append(vals, nv);
+    ray_release(nv);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return NULL; }
+    ray_t* head = ray_dict_new(keys, vals);
+    if (!head || RAY_IS_ERR(head)) return NULL;
+
+    if (handled) *handled = 1;
+    ray_t* r = ray_select(&head, 1);
+    ray_release(head);
+    if (r && !RAY_IS_ERR(r) && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    return r ? r : ray_error("oom", NULL);
+}
+
+ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
+    if (handled) *handled = 0;
+    ray_t* dict = select_form_dict(expr);
+    if (!dict) return NULL;
 
     ray_t* from_expr = dict_get(dict, "from");
     ray_t* where_expr = dict_get(dict, "where");

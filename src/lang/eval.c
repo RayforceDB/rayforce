@@ -305,6 +305,29 @@ static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* i
     affine_sum_cache[affine_sum_cache_n++] = *in;
 }
 
+/* The count of (take x n) when it is known before x is evaluated: n an
+ * integer literal or a name bound to an integer atom, above zero.  An
+ * owned atom, else NULL (x first, then n, as any call). */
+static ray_t* take_count_arg(ray_t* e) {
+    if (!e) return NULL;
+    ray_t* v = NULL;
+    if (e->type == -RAY_I64 || e->type == -RAY_I32 || e->type == -RAY_I16) {
+        v = e;
+        ray_retain(v);
+    } else if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        v = ray_eval(e);
+        if (!v) return NULL;
+        if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    } else {
+        return NULL;
+    }
+    if ((v->type == -RAY_I64 || v->type == -RAY_I32 || v->type == -RAY_I16) &&
+        !RAY_IS_NULL(v) && as_i64(v) > 0)
+        return v;
+    ray_release(v);
+    return NULL;
+}
+
 static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
@@ -5014,6 +5037,17 @@ ray_t* ray_eval(ray_t* obj) {
                     rows = 0; goto out;
                 }
             }
+            if (fn == (ray_unary_fn)ray_first_fn) {
+                /* (first (select ...)): the select's first row alone */
+                int handled = 0;
+                ray_t* top = ray_try_select_head_expr(elems[1], 1, &handled);
+                if (handled) {
+                    ray_release(head);
+                    ret = top && !RAY_IS_ERR(top) ? ray_first_fn(top) : top;
+                    if (top && !RAY_IS_ERR(top)) ray_release(top);
+                    rows = 0; goto out;
+                }
+            }
             ray_t* arg = ray_eval(elems[1]);
             rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
@@ -5049,6 +5083,27 @@ ray_t* ray_eval(ray_t* obj) {
                 ret = fn(elems[1], elems[2]);
                 rows = inherits ? g_eval_rows : 0;
                 goto out;
+            }
+            if (fn == (ray_binary_fn)ray_take_fn) {
+                /* (take (select ...) n), n > 0 a literal or a name: the
+                 * select's first n rows alone; a select of fewer rows is
+                 * its whole result, which take then repeats as for any table */
+                ray_t* nv = take_count_arg(elems[2]);
+                int handled = 0;
+                ray_t* top = nv ? ray_try_select_head_expr(elems[1], as_i64(nv), &handled) : NULL;
+                if (handled) {
+                    ray_release(head);
+                    if (top && !RAY_IS_ERR(top) && top->type == RAY_TABLE &&
+                        ray_table_nrows(top) < as_i64(nv)) {
+                        ret = ray_take_fn(top, nv);
+                        ray_release(top);
+                    } else {
+                        ret = top;
+                    }
+                    ray_release(nv);
+                    rows = 0; goto out;
+                }
+                if (nv) ray_release(nv);
             }
             bool rowwise = ray_active_query_table() && vm_fn_rowwise(head);
             ray_t* left = ray_eval(elems[1]);

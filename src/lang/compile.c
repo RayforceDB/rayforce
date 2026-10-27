@@ -731,13 +731,19 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     /* An unrecognized special form: dynamic eval on the whole form. */
     if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) { compile_dyn_form(c, ast); return; }
 
-    /* `(count (select {...}))`: the tree walker counts the select's rows
-     * off its selection without gathering a column
-     * (ray_try_count_select_expr); compiled, the select would gather every
-     * column for count to take the length.  The whole form is evaluated
-     * dynamically, as the select alone would be. */
-    if (fn && fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_count_fn &&
-        n == 2 && elems[1] && elems[1]->type == RAY_LIST && ray_len(elems[1]) == 2) {
+    /* `(count (select {...}))`, `(first (select {...}))` and
+     * `(take (select {...}) n)`: the tree walker counts the select's rows
+     * off its selection, or runs it with take: (ray_try_count_select_expr,
+     * ray_try_select_head_expr), without gathering what is not used;
+     * compiled, the select would gather every column of every row.  The
+     * whole form is evaluated dynamically, as the select alone would be. */
+    bool sel_arg_form = fn &&
+        ((n == 2 && fn->type == RAY_UNARY &&
+          ((ray_unary_fn)(uintptr_t)fn->i64 == ray_count_fn ||
+           (ray_unary_fn)(uintptr_t)fn->i64 == ray_first_fn)) ||
+         (n == 3 && fn->type == RAY_BINARY &&
+          (ray_binary_fn)(uintptr_t)fn->i64 == ray_take_fn));
+    if (sel_arg_form && elems[1] && elems[1]->type == RAY_LIST && ray_len(elems[1]) == 2) {
         /* only the select special form: not a local of that name, nor a
          * global rebound to a function (the shortcut goes by the name) */
         ray_t **sel = (ray_t**)ray_data(elems[1]);
