@@ -306,17 +306,14 @@ static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* i
 }
 
 /* Can evaluating `e` leave a name bound to another value?  False only when
- * every call in it is of a builtin that neither writes (RAY_FN_RESTRICTED:
- * set, del, update, ...) nor binds or runs code (let, fn, eval, resolve), and
- * no name in it is bound to a lambda, whatever name each is reached by. */
+ * every call in it is of a builtin that runs no code it is handed: an
+ * operator with an opcode, an atomic or aggregate builtin, `and`, `or`,
+ * `if` or `select`.  Anything else, a lambda, or a builtin that may call a
+ * function value (map, fold, apply, ...) however that value was reached,
+ * may run a `set`. */
 static bool expr_rebinds_nothing(ray_t* e, int depth) {
     if (!e) return true;
     if (depth > 64) return false;
-    if (e->type == -RAY_SYM) {
-        if (e->attrs & ATTR_QUOTED) return true;
-        ray_t* v = ray_env_get(e->i64);
-        return !v || v->type != RAY_LAMBDA;
-    }
     if (e->type == RAY_DICT) {                           /* a query dict: its values */
         ray_t* vals = ray_dict_vals(e);
         if (!vals || vals->type != RAY_LIST) return true;
@@ -325,7 +322,7 @@ static bool expr_rebinds_nothing(ray_t* e, int depth) {
             if (!expr_rebinds_nothing(vv[i], depth + 1)) return false;
         return true;
     }
-    if (e->type != RAY_LIST) return true;                /* a literal */
+    if (e->type != RAY_LIST) return true;                /* a name or a literal */
     int64_t n = ray_len(e);
     if (n == 0) return true;
     ray_t** el = (ray_t**)ray_data(e);
@@ -333,16 +330,17 @@ static bool expr_rebinds_nothing(ray_t* e, int depth) {
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
     ray_t* fn = ray_env_get(h->i64);
     if (!fn || (fn->attrs & RAY_FN_RESTRICTED)) return false;
-    if (fn->type == RAY_UNARY) {
-        if ((ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn) return false;
-    } else if (fn->type == RAY_BINARY) {
-        if ((ray_binary_fn)(uintptr_t)fn->i64 == ray_let_fn) return false;
-    } else if (fn->type == RAY_VARY) {
-        ray_vary_fn vf = (ray_vary_fn)(uintptr_t)fn->i64;
-        if (vf == ray_fn || vf == ray_resolve_fn) return false;
-    } else {
+    if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY)
         return false;
+    bool pure = RAY_FN_OPCODE(fn) != 0 ||
+                (fn->attrs & (RAY_FN_ATOMIC | RAY_FN_LEFT_ATOMIC |
+                              RAY_FN_RIGHT_ATOMIC | RAY_FN_AGGR));
+    if (!pure && fn->type == RAY_VARY) {
+        ray_vary_fn vf = (ray_vary_fn)(uintptr_t)fn->i64;
+        pure = vf == ray_and_vary_fn || vf == ray_or_vary_fn ||
+               vf == ray_cond_fn || vf == ray_select;
     }
+    if (!pure) return false;
     for (int64_t i = 1; i < n; i++)
         if (!expr_rebinds_nothing(el[i], depth + 1)) return false;
     return true;

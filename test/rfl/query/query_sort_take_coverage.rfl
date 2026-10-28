@@ -1257,3 +1257,11 @@ Ctg -- 1
 (set tr_bump (fn [] (set tr_n 2)))
 (set tr_n 1)
 (count (take (select {from: (do (tr_bump) TR)}) tr_n)) -- 2
+;; a function handed to a builtin as a value, by name or out of a list
+(set tr_n 1)
+(count (take (select {from: (do (map eval (list (parse "(set tr_n 2)"))) TR)}) tr_n)) -- 2
+(set tr_fns (list eval))
+(set tr_n 1)
+(count (take (select {from: (do (map (first tr_fns) (list (parse "(set tr_n 2)"))) TR)}) tr_n)) -- 2
+(set tr_n 2)
+(at (take (select {from: TR where: (> a 10)}) tr_n) 'a) -- [20 30]
