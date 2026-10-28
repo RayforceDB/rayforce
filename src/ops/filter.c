@@ -25,6 +25,7 @@
 #include "ops/rowsel.h"
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "ops/colgather.h"
+#include <stdatomic.h>
 
 /* ============================================================================
  * Filter execution — extracted from exec.c
@@ -926,6 +927,49 @@ static void scidx_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
     }
 }
 
+/* A gathered SYM column's null flag.  A SYM null is id 0 and the gather
+ * copied the ids verbatim, so the column holds a null exactly where the
+ * output holds a 0: one pass over the output on the workers sets the
+ * HAS_NULLS bit that a per-row test of the source set one row at a time. */
+typedef struct {
+    const void*   data;
+    uint8_t       w;
+    _Atomic(int)  zero;
+} sym_zero_scan_t;
+
+#define SYM_MIN_SCAN(T, MAXV) do {                                  \
+        const T* p = c->data;                                       \
+        T m = MAXV;                                                 \
+        for (int64_t i = start; i < end; i++) m = p[i] < m ? p[i] : m; \
+        mn = m;                                                     \
+    } while (0)
+
+static void sym_zero_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    sym_zero_scan_t* c = raw;
+    if (atomic_load_explicit(&c->zero, memory_order_relaxed)) return;
+    uint64_t mn;
+    switch (c->w) {
+    case RAY_SYM_W8:  SYM_MIN_SCAN(uint8_t, UINT8_MAX);   break;
+    case RAY_SYM_W16: SYM_MIN_SCAN(uint16_t, UINT16_MAX); break;
+    case RAY_SYM_W32: SYM_MIN_SCAN(uint32_t, UINT32_MAX); break;
+    default:          SYM_MIN_SCAN(uint64_t, UINT64_MAX); break;
+    }
+    if (mn == 0) atomic_store_explicit(&c->zero, 1, memory_order_relaxed);
+}
+#undef SYM_MIN_SCAN
+
+static void sym_gather_set_nulls(ray_t* dst, int64_t n, ray_pool_t* pool) {
+    if (n <= 0) return;
+    sym_zero_scan_t c = { .data = ray_data(dst), .w = (uint8_t)(dst->attrs & RAY_SYM_W_MASK) };
+    atomic_init(&c.zero, 0);
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, sym_zero_scan_fn, &c, n);
+    else
+        sym_zero_scan_fn(&c, 0, 0, n);
+    if (atomic_load_explicit(&c.zero, memory_order_relaxed)) dst->attrs |= RAY_ATTR_HAS_NULLS;
+}
+
 /* keep-set membership: is column name-sym `nm` present in keep_syms? */
 static inline bool sel_compact_keep(int64_t nm, const int64_t* keep_syms, int keep_n) {
     for (int j = 0; j < keep_n; j++)
@@ -1291,7 +1335,11 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             /* Parted null propagation handled in parted_gather_col / parted_gather_str_rows */
         } else if (scol) {
             col_propagate_str_pool(new_cols[c], scol);
-            col_propagate_nulls_gather(new_cols[c], scol, match_idx, pass_count);
+            if (scol->type == RAY_SYM && !(scol->attrs & RAY_ATTR_SLICE) && new_cols[c]->type == RAY_SYM &&
+                (new_cols[c]->attrs & RAY_SYM_W_MASK) == (scol->attrs & RAY_SYM_W_MASK))
+                sym_gather_set_nulls(new_cols[c], pass_count, pool);
+            else
+                col_propagate_nulls_gather(new_cols[c], scol, match_idx, pass_count);
         }
         /* SYM gathers above copied cell ids verbatim — resolve over the
          * source column's domain (flat → scol; parted → first SYM seg;
