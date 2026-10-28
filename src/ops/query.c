@@ -8334,7 +8334,15 @@ static int dkv_agg_kind(ray_t* v, int64_t col) {
  * key values over the vocabulary).  Positions are distinct, so the order is the
  * rank of each position among those present: a bitmap over the domain
  * (set on the workers), a running popcount per word, then a scatter on the
- * workers.  Returns a new table, or NULL (H kept). */
+ * workers.  Returns a new table, or NULL (H kept).
+ *
+ * A partitioned grouping emits H as a few ascending runs (one per key
+ * partition), the positions of a run strided by the partition count.  A row
+ * scatter then writes its output at stride, a cache line per row, from every
+ * worker.  Instead each task takes a range of the domain's bitmap words and
+ * merges, from every run, the rows whose positions fall in the range: the
+ * reads are one forward stream per run, the writes land in the range's own
+ * stretch of the output, and no bit is set by two tasks. */
 typedef struct {
     const void*     cd;
     uint8_t         attrs;
@@ -8346,7 +8354,88 @@ typedef struct {
     uint8_t         nattrs;
     int64_t*        nnd;
     atomic_int      bad;
+    /* the run form: run q is rows [rs[q], rs[q + 1]) */
+    const int64_t*  rs;
+    int64_t         nruns, nwords, wtasks;
+    /* run detection: the descents each chunk found */
+    int64_t         du, chunks, desc_cap;
+    int64_t*        desc;
+    int64_t*        desc_n;
+    atomic_int      overflow;
 } dkv_order_ctx_t;
+
+#define DKV_RUN_MAX    4096   /* most runs the range merge takes */
+#define DKV_RUN_CHUNKS 64
+#define DKV_RUN_DESC   (DKV_RUN_MAX / 8)   /* a chunk's descents kept */
+
+static void dkv_runs_detect_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkv_order_ctx_t* c = (dkv_order_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t lo = c->du / c->chunks * t;
+        int64_t hi = t + 1 == c->chunks ? c->du : c->du / c->chunks * (t + 1);
+        int64_t* d = c->desc + t * c->desc_cap;
+        int64_t n = 0;
+        int64_t prev = lo > 0 ? ray_read_sym(c->cd, lo - 1, RAY_SYM, c->attrs) : -1;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t cur = ray_read_sym(c->cd, i, RAY_SYM, c->attrs);
+            if (cur < 0 || cur >= c->dom_count) atomic_store_explicit(&c->bad, 1, memory_order_relaxed);
+            if (cur <= prev && i > 0) {
+                if (n == c->desc_cap) { atomic_store_explicit(&c->overflow, 1, memory_order_relaxed); break; }
+                d[n++] = i;
+            }
+            prev = cur;
+        }
+        c->desc_n[t] = n;
+    }
+}
+
+/* The first row of [lo, hi) whose position is at least `target`. */
+static int64_t dkv_run_lower(const dkv_order_ctx_t* c, int64_t lo, int64_t hi, int64_t target) {
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (ray_read_sym(c->cd, mid, RAY_SYM, c->attrs) < target) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static void dkv_order_mark_runs_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkv_order_ctx_t* c = (dkv_order_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t w0 = c->nwords / c->wtasks * t;
+        int64_t w1 = t + 1 == c->wtasks ? c->nwords : c->nwords / c->wtasks * (t + 1);
+        for (int64_t q = 0; q < c->nruns; q++) {
+            int64_t i = dkv_run_lower(c, c->rs[q], c->rs[q + 1], w0 * 64);
+            for (; i < c->rs[q + 1]; i++) {
+                int64_t pos = ray_read_sym(c->cd, i, RAY_SYM, c->attrs);
+                if (pos >= w1 * 64) break;
+                c->bits[pos >> 6] |= (uint64_t)1 << (pos & 63);
+            }
+        }
+    }
+}
+
+static void dkv_order_scatter_runs_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkv_order_ctx_t* c = (dkv_order_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t w0 = c->nwords / c->wtasks * t;
+        int64_t w1 = t + 1 == c->wtasks ? c->nwords : c->nwords / c->wtasks * (t + 1);
+        for (int64_t q = 0; q < c->nruns; q++) {
+            int64_t i = dkv_run_lower(c, c->rs[q], c->rs[q + 1], w0 * 64);
+            for (; i < c->rs[q + 1]; i++) {
+                int64_t pos = ray_read_sym(c->cd, i, RAY_SYM, c->attrs);
+                if (pos >= w1 * 64) break;
+                int64_t w = pos >> 6;
+                int64_t r = c->wrank[w] + __builtin_popcountll(c->bits[w] & (((uint64_t)1 << (pos & 63)) - 1));
+                ray_write_sym(c->ncd, r, (uint64_t)pos, RAY_SYM, c->nattrs);
+                c->nnd[r] = c->hnd[i];
+            }
+        }
+    }
+}
 
 static void dkv_order_mark_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
@@ -8379,33 +8468,78 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     ray_t* Hn = tbl_col_idx_or_null(H, 1);
     int64_t du = ray_table_nrows(H);
     if (!Hc || !Hn || dom_count <= 0 || du <= 1) return NULL;
-    /* A dense grouping emits its groups ascending by code already: keep H
-     * rather than hold a second copy of it. */
-    {
-        const void* cd = ray_data(Hc);
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD);
+    dkv_order_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.cd = ray_data(Hc); c.attrs = Hc->attrs; c.dom_count = dom_count;
+    atomic_store_explicit(&c.bad, 0, memory_order_relaxed);
+    atomic_store_explicit(&c.overflow, 0, memory_order_relaxed);
+    /* The ascending runs of H.  A dense grouping that emits ascending by code
+     * is one run: keep H rather than hold a second copy of it. */
+    ray_t *rh = NULL, *dh = NULL, *dnh = NULL;
+    int64_t* rs = NULL;
+    if (par) {
+        c.du = du;
+        c.chunks = du / 4096 < DKV_RUN_CHUNKS ? (du / 4096 > 0 ? du / 4096 : 1) : DKV_RUN_CHUNKS;
+        c.desc_cap = DKV_RUN_DESC;
+        c.desc = (int64_t*)scratch_alloc(&dh, (size_t)c.chunks * (size_t)c.desc_cap * sizeof(int64_t));
+        c.desc_n = (int64_t*)scratch_alloc(&dnh, (size_t)c.chunks * sizeof(int64_t));
+        if (c.desc && c.desc_n) {
+            ray_pool_dispatch_n(pool, dkv_runs_detect_fn, &c, (uint32_t)c.chunks);
+            if (atomic_load_explicit(&c.bad, memory_order_relaxed)) {
+                scratch_free(dh); scratch_free(dnh);
+                return NULL;
+            }
+            int64_t total = 1;
+            for (int64_t t = 0; t < c.chunks; t++) total += c.desc_n[t];
+            if (total == 1 && !atomic_load_explicit(&c.overflow, memory_order_relaxed)) {
+                scratch_free(dh); scratch_free(dnh);
+                return NULL;
+            }
+            if (!atomic_load_explicit(&c.overflow, memory_order_relaxed) && total <= DKV_RUN_MAX) {
+                rs = (int64_t*)scratch_alloc(&rh, (size_t)(total + 1) * sizeof(int64_t));
+                if (rs) {
+                    int64_t k = 0;
+                    rs[k++] = 0;
+                    for (int64_t t = 0; t < c.chunks; t++)
+                        for (int64_t j = 0; j < c.desc_n[t]; j++) rs[k++] = c.desc[t * c.desc_cap + j];
+                    rs[k] = du;
+                    c.rs = rs; c.nruns = total;
+                }
+            }
+        }
+        scratch_free(dh); scratch_free(dnh);
+    }
+    if (!c.rs) {
+        const void* cd = c.cd;
         int64_t prev = ray_read_sym(cd, 0, RAY_SYM, Hc->attrs), i = 1;
         for (; i < du; i++) {
             int64_t cur = ray_read_sym(cd, i, RAY_SYM, Hc->attrs);
             if (cur <= prev) break;
             prev = cur;
         }
-        if (i == du) return NULL;
+        if (i == du) { scratch_free(rh); return NULL; }
     }
     int64_t nw = (dom_count + 63) / 64;
-    ray_t *bh = NULL, *rh = NULL;
+    ray_t *bh = NULL, *wh = NULL;
     uint64_t* bits  = (uint64_t*)scratch_calloc(&bh, (size_t)nw * sizeof(uint64_t));
-    int64_t*  wrank = (int64_t*)scratch_alloc(&rh, (size_t)nw * sizeof(int64_t));
-    if (!bits || !wrank) { scratch_free(bh); scratch_free(rh); return NULL; }
-    dkv_order_ctx_t c;
-    memset(&c, 0, sizeof(c));
-    c.cd = ray_data(Hc); c.attrs = Hc->attrs; c.dom_count = dom_count;
+    int64_t*  wrank = (int64_t*)scratch_alloc(&wh, (size_t)nw * sizeof(int64_t));
+    if (!bits || !wrank) { scratch_free(bh); scratch_free(wh); scratch_free(rh); return NULL; }
     c.bits = bits; c.wrank = wrank;
-    atomic_store_explicit(&c.bad, 0, memory_order_relaxed);
-    ray_pool_t* pool = ray_pool_get();
-    bool par = ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD);
-    if (par) ray_pool_dispatch(pool, dkv_order_mark_fn, &c, du);
-    else     dkv_order_mark_fn(&c, 0, 0, du);
-    if (atomic_load_explicit(&c.bad, memory_order_relaxed)) { scratch_free(bh); scratch_free(rh); return NULL; }
+    c.nwords = nw;
+    c.wtasks = nw < 4096 ? 1 : (int64_t)ray_pool_total_workers(pool) * 8;
+    if (c.wtasks > RAY_POOL_INIT_TASKS) c.wtasks = RAY_POOL_INIT_TASKS;
+    if (c.wtasks > nw) c.wtasks = nw;
+    if (c.rs) {
+        if (par && c.wtasks > 1) ray_pool_dispatch_n(pool, dkv_order_mark_runs_fn, &c, (uint32_t)c.wtasks);
+        else dkv_order_mark_runs_fn(&c, 0, 0, c.wtasks);
+    } else if (par) {
+        ray_pool_dispatch(pool, dkv_order_mark_fn, &c, du);
+    } else {
+        dkv_order_mark_fn(&c, 0, 0, du);
+    }
+    if (atomic_load_explicit(&c.bad, memory_order_relaxed)) { scratch_free(bh); scratch_free(wh); scratch_free(rh); return NULL; }
     int64_t run = 0;
     for (int64_t w = 0; w < nw; w++) {
         wrank[w] = run;
@@ -8416,7 +8550,7 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     if (!nc || RAY_IS_ERR(nc) || !nn || RAY_IS_ERR(nn)) {
         if (nc && !RAY_IS_ERR(nc)) ray_release(nc);
         if (nn && !RAY_IS_ERR(nn)) ray_release(nn);
-        scratch_free(bh); scratch_free(rh);
+        scratch_free(bh); scratch_free(wh); scratch_free(rh);
         return NULL;
     }
     ray_sym_vec_adopt_domain(nc, Hc);
@@ -8425,10 +8559,16 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     c.nattrs = nc->attrs;
     c.nnd = (int64_t*)ray_data(nn);
     c.hnd = (const int64_t*)ray_data(Hn);
-    if (par) ray_pool_dispatch(pool, dkv_order_scatter_fn, &c, du);
-    else     dkv_order_scatter_fn(&c, 0, 0, du);
+    if (c.rs) {
+        if (c.wtasks > 1) ray_pool_dispatch_n(pool, dkv_order_scatter_runs_fn, &c, (uint32_t)c.wtasks);
+        else dkv_order_scatter_runs_fn(&c, 0, 0, c.wtasks);
+    } else if (par) {
+        ray_pool_dispatch(pool, dkv_order_scatter_fn, &c, du);
+    } else {
+        dkv_order_scatter_fn(&c, 0, 0, du);
+    }
     if (Hc->attrs & RAY_ATTR_HAS_NULLS) nc->attrs |= RAY_ATTR_HAS_NULLS;
-    scratch_free(bh); scratch_free(rh);
+    scratch_free(bh); scratch_free(wh); scratch_free(rh);
     ray_t* out = ray_table_new(2);
     if (!out || RAY_IS_ERR(out)) { ray_release(nc); ray_release(nn); return NULL; }
     out = ray_table_add_col(out, ray_table_col_name(H, 0), nc);
