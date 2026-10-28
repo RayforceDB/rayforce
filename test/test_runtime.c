@@ -34,6 +34,7 @@
 #include "mem/heap.h"       /* ray_heap_anon_watermark */
 #include "lang/format.h"    /* ray_fmt for eval_err */
 #include "lang/eval.h"      /* ray_raise_render */
+#include "lang/env.h"       /* ray_fn_unary */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -953,6 +954,92 @@ static test_result_t test_timer_self_delete_in_callback(void) {
     PASS();
 }
 
+/* Nested dispatch: a callback that re-enters ray_timers_fire_expired must
+ * not lose a cancellation made by itself or by the inner timer.  C unary
+ * callbacks and forced deadlines, no sleeping. */
+typedef struct {
+    ray_timers_t* t;
+    int64_t a_id, b_id;
+    int a_calls, b_calls, first_delete, second_delete;
+    int mode;   /* 0: A del self then nest; 1: B dels suspended A; 2: A nests then dels self */
+} nest_ctx_t;
+static nest_ctx_t g_nest;
+
+static ray_t* nest_cb_a(ray_t* arg) {
+    (void)arg;
+    g_nest.a_calls++;
+    if (g_nest.mode == 0) {
+        g_nest.first_delete = ray_timers_del(g_nest.t, g_nest.a_id);
+        ray_timers_fire_expired(g_nest.t);
+    } else if (g_nest.mode == 1) {
+        ray_timers_fire_expired(g_nest.t);
+    } else {
+        ray_timers_fire_expired(g_nest.t);
+        g_nest.first_delete = ray_timers_del(g_nest.t, g_nest.a_id);
+        g_nest.second_delete = ray_timers_del(g_nest.t, g_nest.a_id);
+    }
+    return NULL;
+}
+
+static ray_t* nest_cb_b(ray_t* arg) {
+    (void)arg;
+    g_nest.b_calls++;
+    if (g_nest.mode == 1) {
+        g_nest.first_delete = ray_timers_del(g_nest.t, g_nest.a_id);
+        g_nest.second_delete = ray_timers_del(g_nest.t, g_nest.a_id);
+    }
+    return NULL;
+}
+
+static int nest_run(int mode) {
+    memset(&g_nest, 0, sizeof g_nest);
+    g_nest.mode = mode;
+    g_nest.t = ray_timers_create(4);
+    if (!g_nest.t) return -1;
+    ray_t* fa = ray_fn_unary("nest_a", RAY_FN_NONE, nest_cb_a);
+    ray_t* fb = ray_fn_unary("nest_b", RAY_FN_NONE, nest_cb_b);
+    g_nest.a_id = ray_timers_add(g_nest.t, 1000, 3, fa);
+    g_nest.b_id = ray_timers_add(g_nest.t, 1000, 1, fb);
+    ray_release(fa);
+    ray_release(fb);
+    /* force both due: A first, then B */
+    for (int64_t i = 0; i < g_nest.t->n; i++)
+        g_nest.t->heap[i]->exp_ms = g_nest.t->heap[i]->id == g_nest.a_id ? 1 : 2;
+    ray_timers_fire_expired(g_nest.t);
+    return 0;
+}
+
+static test_result_t test_timer_self_delete_nested_dispatch(void) {
+    /* (a) A deletes itself, then nested-dispatches one-shot B */
+    TEST_ASSERT_EQ_I(nest_run(0), 0);
+    TEST_ASSERT_EQ_I(g_nest.first_delete, 1);
+    TEST_ASSERT_EQ_I(g_nest.a_calls, 1);
+    TEST_ASSERT_EQ_I(g_nest.b_calls, 1);
+    TEST_ASSERT_EQ_I(g_nest.t->n, 0);
+    TEST_ASSERT_NULL(g_nest.t->firing);
+    ray_timers_destroy(g_nest.t);
+
+    /* (b) B deletes the suspended A: marked once, then idempotent, not re-armed */
+    TEST_ASSERT_EQ_I(nest_run(1), 0);
+    TEST_ASSERT_EQ_I(g_nest.first_delete, 1);
+    TEST_ASSERT_EQ_I(g_nest.second_delete, 0);
+    TEST_ASSERT_EQ_I(g_nest.a_calls, 1);
+    TEST_ASSERT_EQ_I(g_nest.b_calls, 1);
+    TEST_ASSERT_EQ_I(g_nest.t->n, 0);
+    TEST_ASSERT_NULL(g_nest.t->firing);
+    ray_timers_destroy(g_nest.t);
+
+    /* (c) A deletes itself after the nested call returns */
+    TEST_ASSERT_EQ_I(nest_run(2), 0);
+    TEST_ASSERT_EQ_I(g_nest.first_delete, 1);
+    TEST_ASSERT_EQ_I(g_nest.second_delete, 0);
+    TEST_ASSERT_EQ_I(g_nest.a_calls, 1);
+    TEST_ASSERT_EQ_I(g_nest.b_calls, 1);
+    TEST_ASSERT_EQ_I(g_nest.t->n, 0);
+    ray_timers_destroy(g_nest.t);
+    PASS();
+}
+
 /* An unbounded ray_poll_run with nothing registered and nothing scheduled
  * returns instead of blocking forever, and one that has only a pending
  * timer returns once the timer has fired (#493: a script or a piped
@@ -1531,6 +1618,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_time_timer_fires",     test_syscov_time_timer_fires,     sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/poll_run_for_fires_timer",    test_poll_run_for_fires_timer,    sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_self_delete_in_callback", test_timer_self_delete_in_callback, sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_self_delete_nested_dispatch", test_timer_self_delete_nested_dispatch, sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/poll_run_returns_when_idle",    test_poll_run_returns_when_idle,    sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_heap_grow_past_initial_cap", test_timer_heap_grow_past_initial_cap, sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/timer_next_deadline_ms",      test_timer_next_deadline_ms,      sys_setup_with_poll, sys_teardown_with_poll },
