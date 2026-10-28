@@ -561,8 +561,14 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
  * An open-addressing table of 16-byte keys stored in place, for `in` over
  * guid cells without the hashset's per-row type dispatch.  The all-zero
  * key is the null guid; it doubles as the empty-slot marker, so the table
- * keeps it in a flag of its own.  Keys compare as bytes, so a null cell
- * matches a null in the set, as the hashset's null bucket has it.
+ * keeps it in a flag of its own.
+ *
+ * A guid cell is null when its 16 bytes are zero, whether or not its vector
+ * carries HAS_NULLS: producers can write the zero payload without the flag
+ * (ray_vec_append does).  RAY_ATOM_IS_NULL, the scalar == and the query's
+ * null-row masks read the bytes, and so does this table.  `in` therefore
+ * answers as == does, cell for cell: a zero cell is in a set that holds a
+ * zero cell, whichever vector carries the flag.
  * ══════════════════════════════════════════ */
 
 typedef struct {
@@ -571,11 +577,21 @@ typedef struct {
     bool      has_null;
 } guid_set_t;
 
+static _Atomic int64_t g_in_guid_fail_at;   /* test hook: fail the nth allocation */
+void ray_in_guid_test_fail_alloc(int64_t nth) { atomic_store(&g_in_guid_fail_at, nth); }
+static void* in_guid_calloc(size_t size) {
+    int64_t v = atomic_load(&g_in_guid_fail_at);
+    while (v > 0)
+        if (atomic_compare_exchange_weak(&g_in_guid_fail_at, &v, v - 1))
+            return v == 1 ? NULL : ray_calloc_raw(size);
+    return ray_calloc_raw(size);
+}
+
 /* A table for up to n keys, load factor at most 0.5. */
 static bool guid_set_init(guid_set_t* gs, int64_t n) {
     int64_t cap = 16;
     while (cap < n * 2) cap <<= 1;
-    gs->keys = (uint64_t*)ray_calloc_raw((size_t)cap * 16);
+    gs->keys = (uint64_t*)in_guid_calloc((size_t)cap * 16);
     gs->mask = cap - 1;
     gs->has_null = false;
     return gs->keys != NULL;
@@ -635,7 +651,7 @@ static void guid_in_probe_fn(void* raw, uint32_t wid, int64_t start, int64_t end
 typedef struct {
     const guid_set_t* gs;
     const uint8_t*    set;
-    _Atomic(uint8_t)* seen;       /* one a slot */
+    _Atomic uint8_t*  seen;       /* one a slot */
     _Atomic(bool)     null_seen;
     _Atomic(int64_t)  found;      /* distinct needles marked */
     int64_t           distinct;
@@ -668,13 +684,17 @@ static void guid_in_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
 /* out[i]: is cell i of the guid vector `val` among the m guids at `set`?
  * The table holds the smaller side.  The set: one probe a row.  The
  * needles: one scan of the set, which stops once every distinct needle has
- * been seen.  Either loop is pool-parallel.  NULL on OOM: the caller falls
- * back. */
+ * been seen.  Either loop is pool-parallel.
+ *
+ * The answer, an "oom" error, or "cancel" when a cancel cut a dispatch
+ * short; never a fallback.  The hashset takes a zero cell for null only in
+ * a vector that carries HAS_NULLS, so it could answer differently for the
+ * same bytes. */
 static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
     int64_t n = val->len;
     const uint8_t* vd = (const uint8_t*)ray_data(val);
     guid_set_t gs;
-    if (!guid_set_init(&gs, m <= n ? m : n)) return NULL;
+    if (!guid_set_init(&gs, m <= n ? m : n)) return ray_error("oom", NULL);
     ray_t* result = ray_vec_new(RAY_BOOL, n);
     if (!result || RAY_IS_ERR(result)) {
         ray_free_raw(gs.keys);
@@ -686,19 +706,24 @@ static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
         for (int64_t j = 0; j < m; j++) guid_set_add(&gs, set + j * 16);
         guid_in_ctx_t ctx = { .gs = &gs, .cells = vd, .out = out };
         ray_pool_t* pool = ray_pool_get();
-        if (pool && n >= RAY_PARALLEL_THRESHOLD)
+        bool par = pool && n >= RAY_PARALLEL_THRESHOLD;
+        if (par)
             ray_pool_dispatch(pool, guid_in_probe_fn, &ctx, n);
         else
             guid_in_probe_fn(&ctx, 0, 0, n);
         ray_free_raw(gs.keys);
+        /* A cancel skips the tasks not yet started: no answer. */
+        if (par && pool_cancelled(pool)) {
+            ray_release(result);
+            return ray_error("cancel", "interrupted");
+        }
         return result;
     }
-    _Atomic(uint8_t)* seen =
-        (_Atomic(uint8_t)*)ray_calloc_raw((size_t)(gs.mask + 1) * sizeof(*seen));
+    _Atomic uint8_t* seen = in_guid_calloc((size_t)(gs.mask + 1) * sizeof(*seen));
     if (!seen) {
         ray_free_raw(gs.keys);
         ray_release(result);
-        return NULL;
+        return ray_error("oom", NULL);
     }
     int64_t distinct = 0;
     for (int64_t i = 0; i < n; i++)
@@ -708,10 +733,18 @@ static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
     atomic_init(&sc.null_seen, false);
     atomic_init(&sc.found, 0);
     ray_pool_t* pool = ray_pool_get();
-    if (pool && m >= RAY_PARALLEL_THRESHOLD)
+    bool par = pool && m >= RAY_PARALLEL_THRESHOLD;
+    if (par)
         ray_pool_dispatch(pool, guid_in_scan_fn, &sc, m);
     else
         guid_in_scan_fn(&sc, 0, 0, m);
+    /* A cancel skips the tasks not yet started: the seen marks are short. */
+    if (par && pool_cancelled(pool)) {
+        ray_free_raw((void*)seen);
+        ray_free_raw(gs.keys);
+        ray_release(result);
+        return ray_error("cancel", "interrupted");
+    }
     bool null_seen = atomic_load_explicit(&sc.null_seen, memory_order_relaxed);
     for (int64_t i = 0; i < n; i++) {
         const uint8_t* p = vd + i * 16;
@@ -1769,9 +1802,8 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         /* A guid vector against one guid: a set of one key. */
         if (val->type == RAY_GUID && vec->type == -RAY_GUID) {
             static const uint8_t null_guid[16] = {0};
-            ray_t* r = in_guid(val, vec->obj ? (const uint8_t*)ray_data(vec->obj)
-                                             : null_guid, 1);
-            if (r) return r;
+            return in_guid(val, vec->obj ? (const uint8_t*)ray_data(vec->obj)
+                                         : null_guid, 1);
         }
         /* Hash-based fast path: both sides are typed vecs of compatible
          * shape and the result is a row-aligned bool vec.  Build a
@@ -1799,13 +1831,12 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 }
                 ray_free_raw(pos);
             }
-            /* Guid cells: in_guid's typed table.  The kernel below
-             * declines guids, and the hashset dispatched on type for every
-             * row: ~10 ns a row against ~1 for an I64 column. */
-            if (val->type == RAY_GUID && vec->type == RAY_GUID) {
-                ray_t* r = in_guid(val, (const uint8_t*)ray_data(vec), vec->len);
-                if (r) return r;
-            }
+            /* Guid cells: in_guid's typed table, their only route.  The
+             * kernel below declines guids, and the hashset dispatched on
+             * type for every row: ~10 ns a row against ~1 for an I64
+             * column. */
+            if (val->type == RAY_GUID && vec->type == RAY_GUID)
+                return in_guid(val, (const uint8_t*)ray_data(vec), vec->len);
             /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
              * ints, pool-parallel — the same engine the fused WHERE path
              * uses.  Gated off null-bearing operands: this hashset path
@@ -1920,7 +1951,8 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
         /* A guid in a guid vector: compare the cells' bytes in place, a
-         * null guid matching a null cell. */
+         * null guid matching a zero cell, flagged or not (GUID membership
+         * above). */
         if (val->type == -RAY_GUID && vec->type == RAY_GUID) {
             static const uint8_t null_guid[16] = {0};
             const uint8_t* key = val->obj ? (const uint8_t*)ray_data(val->obj) : null_guid;

@@ -1182,6 +1182,143 @@ static test_result_t test_eval_select_where_in_guid_nulls(void) {
     PASS();
 }
 
+/* ---- Test: guid compare and `in` read a zero cell's bytes, not the hint --
+ * ray_vec_from_raw flags a zero guid with HAS_NULLS; ray_vec_append of the
+ * same bytes does not.  Either way the cell is null: `in` must answer as
+ * `==` does whichever vector carries the flag, with the key table built on
+ * either side, for a vector against one guid and for one guid in a vector. */
+static test_result_t test_eval_in_guid_unflagged_nulls(void) {
+    static const uint8_t g1[16] = {1}, g2[16] = {2}, g3[16] = {3}, z[16] = {0};
+    uint8_t raw[32];
+    memcpy(raw, g1, 16);
+    memcpy(raw + 16, z, 16);
+    ray_t* f = ray_vec_from_raw(RAY_GUID, raw, 2);
+    TEST_ASSERT_TRUE(f && !RAY_IS_ERR(f));
+    TEST_ASSERT_TRUE((f->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    ray_t* u = ray_vec_new(RAY_GUID, 3);
+    u = ray_vec_append(u, g2);
+    u = ray_vec_append(u, g3);
+    u = ray_vec_append(u, z);
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u));
+    TEST_ASSERT_TRUE((u->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    ray_env_set(ray_sym_intern("_gf", 3), f);
+    ray_env_set(ray_sym_intern("_gu", 3), u);
+
+    ASSERT_EQ("(== (at _gf [1 1 1]) _gu)", "[false false true]");
+    ASSERT_EQ("(== _gu (at _gf 1))", "[false false true]");
+    ASSERT_EQ("(in _gf _gu)", "[false true]");           /* table over the needles */
+    ASSERT_EQ("(in _gu _gf)", "[false false true]");     /* table over the set */
+    ASSERT_EQ("(in _gu 0Ng)", "[false false true]");
+    ASSERT_EQ("(in _gf (at _gu 2))", "[false true]");
+    ASSERT_EQ("(in 0Ng _gu)", "true");
+    ASSERT_EQ("(in (at _gu 2) _gf)", "true");
+
+    ray_release(f);
+    ray_release(u);
+    PASS();
+}
+
+/* ---- Test: a failed guid `in` scratch allocation answers "oom" ----
+ * in_guid does not fall back to the hashset, which reads the null hint
+ * (test_eval_in_guid_unflagged_nulls).  Fail the key table on either side,
+ * then the scan's seen marks: each attempt returns "oom" and frees what it
+ * took, and the next call answers. */
+static test_result_t test_eval_in_guid_oom(void) {
+    ray_t* h = ray_eval_str("(set _gh (guid 64))");
+    ray_t* p = ray_eval_str("(set _gp (concat (at _gh [3 5]) (guid 1)))");
+    ray_t* g = ray_eval_str("(set _gg (at _gh 7))");
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && p && !RAY_IS_ERR(p) && g && !RAY_IS_ERR(g));
+    struct { ray_t* val; ray_t* set; int64_t nth; int64_t hits; } cases[] = {
+        { h, p, 1, 2 },   /* the key table, over the set */
+        { p, h, 1, 2 },   /* the key table, over the needles */
+        { p, h, 2, 2 },   /* the seen marks of the scan */
+        { h, g, 1, 1 },   /* one guid: a table of one key */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* r = ray_in_fn(cases[c].val, cases[c].set);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_error_clear();
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_in_guid_test_fail_alloc(cases[c].nth);
+        r = ray_in_fn(cases[c].val, cases[c].set);
+        ray_in_guid_test_fail_alloc(0);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %zu: no error", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %zu: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = ray_in_fn(cases[c].val, cases[c].set);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_BOOL);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++) hits += ((bool*)ray_data(r))[i];
+        TEST_ASSERT_EQ_I(hits, cases[c].hits);
+        ray_release(r);
+    }
+    ray_release(h);
+    ray_release(p);
+    ray_release(g);
+    PASS();
+}
+
+/* ---- Test: a cancelled guid compare or `in` dispatch answers "cancel" ----
+ * A cancel makes ray_pool_dispatch skip every task not yet started, so the
+ * bool vector it was filling is incomplete.  The compare, and `in` with the
+ * table over the set (one probe a row) and over the needles (one scan of
+ * the set), each dispatch over 131073 rows: under a cancel each must return
+ * "cancel", free what it took and leave the interrupt set; once cleared,
+ * each answers.  Called below the evaluator, whose own checks would
+ * otherwise answer first. */
+static test_result_t test_eval_guid_cancel(void) {
+    if (!ray_pool_get()) SKIP("no pool to dispatch to");
+    ray_t* g = ray_eval_str("(set _gc (guid 131073))");
+    ray_t* h = ray_eval_str("(set _gd (at _gc (til 131073)))");
+    ray_t* s = ray_eval_str("(set _gs (take _gc 17))");
+    TEST_ASSERT_TRUE(g && !RAY_IS_ERR(g) && h && !RAY_IS_ERR(h) && s && !RAY_IS_ERR(s));
+    TEST_ASSERT_TRUE(g->len >= RAY_PARALLEL_THRESHOLD);
+    for (int c = 0; c < 3; c++) {
+        int64_t want = c == 0 ? 131073 : 17;
+        ray_t* r = c == 0 ? atomic_map_binary_op(ray_eq_fn, OP_EQ, g, h)   /* compare */
+                 : c == 1 ? ray_in_fn(g, s)        /* the table over the set */
+                 :          ray_in_fn(s, g);       /* the table over the needles */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));   /* warm up */
+        ray_release(r);
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_request_interrupt();
+        r = c == 0 ? atomic_map_binary_op(ray_eq_fn, OP_EQ, g, h)
+          : c == 1 ? ray_in_fn(g, s)
+          :          ray_in_fn(s, g);
+        bool still = ray_interrupted();
+        ray_clear_interrupt();
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %d: answered under a cancel", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+        TEST_ASSERT_FMT(still, "case %d: the interrupt was cleared", c);
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %d: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = c == 0 ? atomic_map_binary_op(ray_eq_fn, OP_EQ, g, h)
+          : c == 1 ? ray_in_fn(g, s)
+          :          ray_in_fn(s, g);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_BOOL);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++) hits += ((bool*)ray_data(r))[i];
+        TEST_ASSERT_EQ_I(hits, want);
+        ray_release(r);
+    }
+    ray_release(g);
+    ray_release(h);
+    ray_release(s);
+    PASS();
+}
+
 /* ---- Test: except ---- */
 static test_result_t test_eval_except(void) {
     ray_t* result = ray_eval_str("(except [1 2 3] [2])");
@@ -11133,6 +11270,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/distinct", test_eval_distinct, lang_setup, lang_teardown },
     { "lang/eval/in", test_eval_in, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_guid_nulls", test_eval_select_where_in_guid_nulls, lang_setup, lang_teardown },
+    { "lang/eval/in_guid_unflagged_nulls", test_eval_in_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/in_guid_oom", test_eval_in_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
     { "lang/eval/sect", test_eval_sect, lang_setup, lang_teardown },

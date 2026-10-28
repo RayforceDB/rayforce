@@ -1408,27 +1408,37 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         if ((l_guid_vec || l_guid_atom) && (r_guid_vec || r_guid_atom)) {
             static const uint8_t null_guid[16] = {0};
             ray_t* out = ray_vec_new(RAY_BOOL, len);
-            if (out && !RAY_IS_ERR(out)) {
-                out->len = len;
-                guidcmp_ctx_t gctx = {
-                    .lp = l_guid_vec ? (const uint8_t*)ray_data(left)
-                        : left->obj  ? (const uint8_t*)ray_data(left->obj) : null_guid,
-                    .lstride = l_guid_vec ? 16 : 0,
-                    .rp = r_guid_vec ? (const uint8_t*)ray_data(right)
-                        : right->obj ? (const uint8_t*)ray_data(right->obj) : null_guid,
-                    .rstride = r_guid_vec ? 16 : 0,
-                    .obuf = (bool*)ray_data(out), .opc = dag_opcode,
-                };
-                ray_pool_t* pool = ray_pool_get();
-                if (pool && len >= RAY_PARALLEL_THRESHOLD)
-                    ray_pool_dispatch(pool, guidvec_cmp_fn, &gctx, len);
-                else
-                    guidvec_cmp_fn(&gctx, 0, 0, len);
+            /* The slow path would ask for the same vector: hand back this
+             * failure rather than retry it there. */
+            if (!out || RAY_IS_ERR(out)) {
                 ray_release(e0);
-                return out;
+                return out ? out : ray_error("oom", NULL);
             }
-            if (out && !RAY_IS_ERR(out)) ray_release(out);
-            /* Fall through to slow path on allocation failure. */
+            out->len = len;
+            guidcmp_ctx_t gctx = {
+                .lp = l_guid_vec ? (const uint8_t*)ray_data(left)
+                    : left->obj  ? (const uint8_t*)ray_data(left->obj) : null_guid,
+                .lstride = l_guid_vec ? 16 : 0,
+                .rp = r_guid_vec ? (const uint8_t*)ray_data(right)
+                    : right->obj ? (const uint8_t*)ray_data(right->obj) : null_guid,
+                .rstride = r_guid_vec ? 16 : 0,
+                .obuf = (bool*)ray_data(out), .opc = dag_opcode,
+            };
+            ray_pool_t* pool = ray_pool_get();
+            if (pool && len >= RAY_PARALLEL_THRESHOLD) {
+                ray_pool_dispatch(pool, guidvec_cmp_fn, &gctx, len);
+                /* A cancel skips the tasks not yet started: no answer. */
+                if (ray_interrupted() ||
+                    atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+                    ray_release(out);
+                    ray_release(e0);
+                    return ray_error("cancel", "interrupted");
+                }
+            } else {
+                guidvec_cmp_fn(&gctx, 0, 0, len);
+            }
+            ray_release(e0);
+            return out;
         }
     }
 
