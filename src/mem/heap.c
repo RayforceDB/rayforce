@@ -1933,7 +1933,26 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     return v;
 }
 
+#ifdef DEBUG
+/* Test seam: ray_alloc on this thread returns NULL, as an exhausted heap
+ * does, for `count` calls starting with the nth from now, so a test can
+ * fail each allocation of a construction in turn.  nth 0 disarms. */
+static _Thread_local int64_t g_alloc_fail_at, g_alloc_fail_count;
+void ray_alloc_fail_set_for_test(int64_t nth, int64_t count) {
+    g_alloc_fail_at    = count > 0 && nth > 0 ? nth : 0;
+    g_alloc_fail_count = count;
+}
+static bool alloc_fails_for_test(void) {
+    if (--g_alloc_fail_at > 0) return false;
+    if (--g_alloc_fail_count > 0) g_alloc_fail_at = 1;   /* the next one too */
+    return true;
+}
+#endif
+
 ray_t* ray_alloc(size_t data_size) {
+#ifdef DEBUG
+    if (RAY_UNLIKELY(g_alloc_fail_at > 0) && alloc_fails_for_test()) return NULL;
+#endif
     ray_heap_t* h = ray_tl_heap;
     if (RAY_UNLIKELY(!h)) {
         ray_heap_init();

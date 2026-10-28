@@ -36,6 +36,7 @@
 #include "test.h"
 #include "ops/agg_engine.h"   /* --census: agg_route_stats */
 #include "core/pool.h"         /* ray_pool_test_ring_fail */
+#include "mem/heap.h"          /* ray_alloc_fail_set_for_test */
 #include "test_rfl.h"
 
 #include <stdio.h>
@@ -949,6 +950,7 @@ void ray_test_hooks_off(void) {
     ray_group_test_fail_scalar_alloc(0);
     ray_group_test_scalar_grain(0);
     ray_pool_test_ring_fail(0);
+    ray_alloc_fail_set_for_test(0, 0);
     agg_test_force_smallhash(false);
     agg_test_no_wide_dense(false);
     ray_clear_interrupt();

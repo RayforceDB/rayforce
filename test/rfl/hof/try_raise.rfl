@@ -81,6 +81,21 @@
 ((fn [data] (try (+ data 1) data)) 5) -- 6
 ((fn [a b] (try (raise 0) b)) 1 2) -- 2
 
+;; ── compiled path: a handler that is a plain value ─────────────────────────
+;; Its trap builds and pushes no error value; the value is the result.
+((fn [] (try (+ 1 'a) 0))) -- 0
+((fn [] (try (+ 1 'a) "fallback"))) -- "fallback"
+((fn [] (try (raise 5) [1 2 3]))) -- [1 2 3]
+((fn [] (try (+ 1 2) 0))) -- 3
+;; The stack under the try is as the body would have left it.
+((fn [] (+ 10 (try (+ 1 'a) 5)))) -- 15
+((fn [] (+ 10 (try (+ 1 'a) (fn [e] 5))))) -- 15
+;; Nested either way round with a handler that reads the error.
+((fn [] (try (do (try (+ 1 'a) 0) (+ 2 "b")) (fn [e] (at e 'msg))))) -- "cannot add i64 and str"
+((fn [] (try (try (+ 1 'a) (fn [e] (raise (at e 'code)))) 7))) -- 7
+;; Twenty catches in one frame: each trap is taken down.
+((fn [n] (let i 0) (let s 0) (while (< i n) (let s (+ s (try (+ i 'a) 1))) (let i (+ i 1))) s) 20) -- 20
+
 ;; ── nested try ──────────────────────────────────────────────────────────────
 (try (try (raise 5) (fn [e] (raise (+ e 10)))) (fn [e] e)) -- 15
 
