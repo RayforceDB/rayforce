@@ -382,7 +382,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
-| `str-find` | binary | First byte index of a substring; returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
+| `str-find` | binary | First byte index of a literal substring (no wildcards; use `like` for patterns); returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | Join strings or symbols with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |
 | `upper` | unary | Uppercase string or symbol atoms/vectors; lazy/DAG for vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |

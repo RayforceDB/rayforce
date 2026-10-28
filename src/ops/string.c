@@ -848,7 +848,8 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
 typedef struct {
     const ray_str_t* elems;
     const char* pool_data;
-    const ray_strpat_t* pattern;
+    const char* needle;
+    size_t needle_len;
     int64_t* dst;
     ray_pool_t* pool;
     _Atomic(int) any_null;
@@ -866,7 +867,7 @@ static void str_find_parts_task(void* vctx, uint32_t worker_id,
         const char* sp = ray_str_t_ptr(&c->elems[i], c->pool_data);
         size_t sl = c->elems[i].len;
         size_t pos = 0;
-        bool found = ray_strpat_find(c->pattern, sp, sl, &pos);
+        bool found = ray_str_find_literal(sp, sl, c->needle, c->needle_len, &pos);
         c->dst[i] = found ? (int64_t)pos : NULL_I64;
         if (!found) any_null = true;
     }
@@ -902,12 +903,6 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         ray_release(pat_v);
         return ray_error("type", "str-find: pattern must be string or symbol atom");
     }
-    ray_strpat_t search;
-    if (!ray_strpat_compile(pattern, pattern_len, &search)) {
-        ray_release(input);
-        ray_release(pat_v);
-        return ray_error("domain", "str-find: '*' is not supported in search patterns");
-    }
 
     if (input->type != RAY_STR && input->type != RAY_SYM) {
         ray_release(input);
@@ -933,7 +928,8 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         str_find_parts_ctx_t ctx = {
             .elems = elems,
             .pool_data = pool_data,
-            .pattern = &search,
+            .needle = pattern,
+            .needle_len = pattern_len,
             .dst = dst,
             .pool = pool
         };
@@ -969,7 +965,7 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         size_t sl = 0;
         sym_elem(input, i, &sp, &sl);
         size_t pos = 0;
-        bool found = ray_strpat_find(&search, sp, sl, &pos);
+        bool found = ray_str_find_literal(sp, sl, pattern, pattern_len, &pos);
         dst[i] = found ? (int64_t)pos : NULL_I64;
         if (!found) any_null = true;
     }

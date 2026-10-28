@@ -221,6 +221,14 @@ static const char* strpat_memmem(const char* s, size_t sn,
 #endif
 }
 
+bool ray_str_find_literal(const char* s, size_t sn, const char* nd, size_t nl,
+                          size_t* out_pos) {
+    const char* hit = strpat_memmem(s, sn, nd, nl);
+    if (!hit) return false;
+    if (out_pos) *out_pos = (size_t)(hit - s);
+    return true;
+}
+
 bool ray_strpat_compile(const char* p, size_t pn, ray_strpat_t* out) {
     if (!out) return false;
     *out = (ray_strpat_t){ .pat = p, .pat_len = pn, .literal = true };
