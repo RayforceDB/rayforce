@@ -13837,21 +13837,32 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
     if (!e) return true;
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return false;
+        /* a lexical local wins over a column of its name (query locals never
+         * shadow one): it may be a callable reading anything */
+        if (ray_env_has_lexical_local(e->i64)) return false;
         if (tbl_has_col(tbl, e->i64)) return true;
         if (ray_sym_is_dotted(e->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(e->i64, &segs);
-            return nsegs >= 1 && tbl_has_col(tbl, segs[0]);
+            return nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
         }
         if (ray_env_get_local(e->i64)) return false;
         ray_t* fn = ray_env_get(e->i64);
         if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
             return false;
-        ray_t* nm = ray_sym_str(e->i64);
-        return !(nm && ray_str_len(nm) == 4 && memcmp(ray_str_ptr(nm), "eval", 4) == 0);
+        /* eval and resolve read names from text or symbols at run time,
+         * whatever name they are reached by */
+        if (fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn)
+            return false;
+        return !(fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == ray_resolve_fn);
     }
     if (e->type == RAY_LIST) {
         ray_t** el = (ray_t**)ray_data(e);
+        /* a quoted form names no column for collect_col_refs_set, which
+         * skips it, yet its symbols may be looked up at run time */
+        if (ray_len(e) == 2 && el[0] && el[0]->type == -RAY_SYM &&
+            !(el[0]->attrs & ATTR_QUOTED) && el[0]->i64 == ray_sym_intern("quote", 5))
+            return false;
         for (int64_t i = 0; i < ray_len(e); i++)
             if (!expr_reads_named_columns_only(el[i], tbl)) return false;
         return true;
@@ -17239,6 +17250,20 @@ typedef struct {
 static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                               select_owned_t* own);
 
+/* Is `from_expr` a call of the left/inner/full join builtin itself?  Only
+ * that join reads the published projection (join_narrow_inputs): any other
+ * from: — a lambda whose body joins, a wrapper — may need every column. */
+static bool select_from_is_join(ray_t* from_expr) {
+    if (!from_expr || from_expr->type != RAY_LIST || ray_len(from_expr) < 1) return false;
+    ray_t* head = ((ray_t**)ray_data(from_expr))[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+    if (ray_env_has_lexical_local(head->i64)) return false;
+    ray_t* fn = ray_env_get(head->i64);
+    if (!fn || fn->type != RAY_VARY) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_left_join_fn || f == ray_inner_join_fn || f == ray_full_join_fn;
+}
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     select_owned_t own = {0};
     ray_t* r = ray_select_body(args, n, plan, &own);
@@ -17289,13 +17314,16 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     const int64_t* pj_k = pvm ? pvm->proj_keep    : NULL;
     int            pj_n = pvm ? pvm->proj_keep_n  : 0;
     bool           pj_a = pvm ? pvm->proj_active  : false;
+    ray_t*         pj_q = pvm ? pvm->proj_dict    : NULL;
     if (pvm && proj_buf && proj_compute_keep(dict, proj_buf, (int)proj_hdr_keys, &proj_n)) {
         pvm->proj_keep = proj_buf; pvm->proj_keep_n = proj_n;
         pvm->proj_depth = pvm->eval_depth; pvm->proj_active = true;
+        pvm->proj_dict = select_from_is_join(from_expr) ? dict : NULL;
     }
     ray_t* tbl = ray_eval(from_expr);
     if (pvm) { pvm->proj_keep = pj_k; pvm->proj_keep_n = pj_n;
-               pvm->proj_depth = pj_d; pvm->proj_active = pj_a; }
+               pvm->proj_depth = pj_d; pvm->proj_active = pj_a;
+               pvm->proj_dict = pj_q; }
     scratch_free(proj_hdr);   /* proj_buf dead past the from: eval + restore */
     if (emit_filter_set)
         ray_group_emit_filter_set(prev_emit_filter);
@@ -29525,7 +29553,110 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
 
 /* Shared implementation for left-join (join_type=1) and inner-join (join_type=0).
  * (left-join t1 t2 [key ...]) / (inner-join t1 t2 [key ...]) */
-static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
+/* `tbl` narrowed to the columns in keep[0..kn), in their order, the slots
+ * shared (an encoded column stays encoded).  NULL when nothing would be
+ * dropped, or `tbl` has a parted or MAPCOMMON column (its partition counts
+ * travel with the whole table). */
+static ray_t* join_narrow_input(ray_t* tbl, const int64_t* keep, int kn) {
+    int64_t nc = ray_table_ncols(tbl);
+    int64_t nkeep = 0;
+    for (int64_t c = 0; c < nc; c++) {
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(tbl, c, &m) || RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)
+            return NULL;
+        int64_t name = ray_table_col_name(tbl, c);
+        for (int j = 0; j < kn; j++) if (keep[j] == name) { nkeep++; break; }
+    }
+    if (nkeep == nc) return NULL;
+    ray_t* out = ray_table_new(nkeep);
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        int64_t name = ray_table_col_name(tbl, c);
+        for (int j = 0; j < kn; j++)
+            if (keep[j] == name) { out = ray_table_add_col(out, name, ray_table_slot_idx(tbl, c)); break; }
+    }
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return NULL; }
+    return out;
+}
+
+/* Projection pushdown into a join that is the immediate from: of a select
+ * with outputs (the published hint, proj_dict): when every clause of that
+ * select reads the joined columns only by naming them (eval_group_keep_ok),
+ * the inputs are narrowed to the keys and the columns those clauses name,
+ * so the join gathers no column the select does not read.  *lo / *ro are
+ * owned narrowed inputs or NULL (use the input as is). */
+static void join_narrow_inputs(ray_t* left, ray_t* right, ray_t** key_elems, int64_t nk,
+                               ray_t** lo, ray_t** ro) {
+    *lo = *ro = NULL;
+    ray_vm_t* vm = __VM;
+    if (!vm || !vm->proj_active || !vm->proj_dict || vm->eval_depth != vm->proj_depth + 1)
+        return;
+    ray_t* dict = vm->proj_dict;
+    /* the joined columns, by name: left's, then right's others */
+    int64_t lnc = ray_table_ncols(left), rnc = ray_table_ncols(right);
+    ray_t* schema = ray_table_new(lnc + rnc);
+    for (int64_t c = 0; c < lnc && schema && !RAY_IS_ERR(schema); c++)
+        schema = ray_table_add_col(schema, ray_table_col_name(left, c), ray_table_slot_idx(left, c));
+    for (int64_t c = 0; c < rnc && schema && !RAY_IS_ERR(schema); c++)
+        if (!tbl_has_col(schema, ray_table_col_name(right, c)))
+            schema = ray_table_add_col(schema, ray_table_col_name(right, c), ray_table_slot_idx(right, c));
+    if (!schema || RAY_IS_ERR(schema)) { if (schema) ray_error_free(schema); return; }
+
+    int64_t from_id = dict_key_id(dict, "from");
+    /* A grouped select drops an output that is a bare key name, and one left
+     * with no outputs emits the first of every column: with by:, outputs
+     * that are all bare names keep every column. */
+    if (dict_get(dict, "by")) {
+        int64_t where_id = dict_key_id(dict, "where"), by_id = dict_key_id(dict, "by");
+        int64_t take_id = dict_key_id(dict, "take"), asc_id = dict_key_id(dict, "asc");
+        int64_t desc_id = dict_key_id(dict, "desc"), nearest_id = dict_key_id(dict, "nearest");
+        bool all_names = true;
+        DICT_VIEW_DECL(bv);
+        DICT_VIEW_OPEN(dict, bv);
+        if (DICT_VIEW_OVERFLOW(bv)) all_names = true;
+        else for (int64_t i = 0; i + 1 < bv_n && all_names; i += 2) {
+            int64_t kid = bv[i]->i64;
+            if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
+                kid == asc_id || kid == desc_id || kid == nearest_id) continue;
+            ray_t* v = bv[i + 1];
+            if (!v || v->type != -RAY_SYM) all_names = false;
+        }
+        DICT_VIEW_CLOSE(bv);
+        if (all_names) { ray_release(schema); return; }
+    }
+    int64_t max = nk + ray_table_ncols(schema) + 1;
+    ray_t* keep_hdr = NULL;
+    int64_t* keep = (int64_t*)scratch_alloc(&keep_hdr, (size_t)max * sizeof(int64_t));
+    bool ok = keep != NULL;
+    int kn = 0;
+    for (int64_t i = 0; ok && i < nk; i++) keep[kn++] = key_elems[i]->i64;
+    DICT_VIEW_DECL(dv);
+    if (ok) {
+        DICT_VIEW_OPEN(dict, dv);
+        if (DICT_VIEW_OVERFLOW(dv)) ok = false;
+        for (int64_t i = 0; ok && i + 1 < dv_n; i += 2) {
+            if (dv[i]->i64 == from_id) continue;
+            ray_t* v = dv[i + 1];
+            if (!eval_group_keep_ok(v, schema)) { ok = false; break; }
+            if (v && v->type == RAY_DICT) {          /* a by-dict: its values */
+                ray_t* vals = ray_dict_vals(v);
+                ray_t** ve = (ray_t**)ray_data(vals);
+                for (int64_t j = 0; j < ray_len(vals); j++)
+                    kn = collect_col_refs_set(ve[j], schema, keep, (int)max, kn);
+            } else {
+                kn = collect_col_refs_set(v, schema, keep, (int)max, kn);
+            }
+        }
+        DICT_VIEW_CLOSE(dv);
+    }
+    if (ok && kn < max) {
+        *lo = join_narrow_input(left, keep, kn);
+        *ro = join_narrow_input(right, keep, kn);
+    }
+    if (keep_hdr) scratch_free(keep_hdr);
+    ray_release(schema);
+}
+
+static ray_t* join_exec(ray_t** args, int64_t n, uint8_t join_type) {
     if (n < 3) return ray_error("arity", "join: expects left table, right table and keys, got %lld args", (long long)n);
 
     ray_t* left_tbl  = args[0];
@@ -29616,6 +29747,40 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
     ray_t* result = ray_execute(g, jn);
     ray_graph_free(g);
     return result;
+}
+
+/* A join, its inputs first narrowed to what the select it feeds reads
+ * (join_narrow_inputs); join_exec checks the arguments either way. */
+static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
+    if (n != 3) return join_exec(args, n, join_type);
+    int li = 0, ri = 1, ki = 2;
+    if (args[0]->type != RAY_TABLE && args[1]->type == RAY_TABLE && args[2]->type == RAY_TABLE)
+        { ki = 0; li = 1; ri = 2; }
+    if (args[li]->type != RAY_TABLE || args[ri]->type != RAY_TABLE) return join_exec(args, n, join_type);
+    ray_t* bxk = NULL;
+    ray_t* keys = unbox_vec_arg(args[ki], &bxk);
+    if (!keys || RAY_IS_ERR(keys)) {                 /* the boxed list itself */
+        if (keys) ray_error_free(keys);
+        return join_exec(args, n, join_type);
+    }
+    if (!is_list(keys) || ray_len(keys) == 0) {
+        if (bxk) ray_release(bxk);
+        return join_exec(args, n, join_type);
+    }
+    ray_t** ke = (ray_t**)ray_data(keys);
+    bool syms = true;
+    for (int64_t i = 0; i < ray_len(keys); i++) if (!ke[i] || ke[i]->type != -RAY_SYM) syms = false;
+    ray_t *lo = NULL, *ro = NULL;
+    if (syms) join_narrow_inputs(args[li], args[ri], ke, ray_len(keys), &lo, &ro);
+    if (bxk) ray_release(bxk);
+    if (!lo && !ro) return join_exec(args, n, join_type);
+    ray_t* nargs[3] = { args[0], args[1], args[2] };
+    if (lo) nargs[li] = lo;
+    if (ro) nargs[ri] = ro;
+    ray_t* r = join_exec(nargs, n, join_type);
+    if (lo) ray_release(lo);
+    if (ro) ray_release(ro);
+    return r;
 }
 
 ray_t* ray_left_join_fn(ray_t** args, int64_t n)  { return join_impl(args, n, 1); }

@@ -119,6 +119,8 @@ typedef struct {
     int              proj_keep_n;
     int32_t          proj_depth;  /* eval_depth at publish; consumed only at +1 */
     bool             proj_active;
+    ray_t           *proj_dict;   /* the publisher's query dict (borrowed): a join
+                                   * judges its clauses against the joined columns */
     /* ── filter-compaction keep-set: a select about to execute its WHERE-filter
      * DAG publishes the column syms its (provably keys-only distinct) downstream
      * will read, so the top-level filter finalization (ray_execute_inner) gathers
