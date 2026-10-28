@@ -506,6 +506,57 @@ static bool hashset_insert(hashset_t* hs, int64_t i) {
     return true;
 }
 
+/* Exact batched find for verified-sorted, null-free I64 vectors only.
+ * Metadata admission never scans either payload. ray_data makes slice
+ * accesses and answers relative to the searched window. Decline writes nothing. */
+static __attribute__((noinline)) bool find_sorted_i64(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    if (hay->type != RAY_I64 || nd->type != RAY_I64 || hay->len < 2 ||
+        !ray_attr_is_sorted(hay) || ray_vec_may_have_nulls(hay) ||
+        ray_vec_may_have_nulls(nd)) return false;
+
+    const int64_t* h = (const int64_t*)ray_data(hay);
+    const int64_t* q = (const int64_t*)ray_data(nd);
+    int64_t n = hay->len, m = nd->len, j = 0;
+    /* Eight independent [lo,hi) searches, with no padded probe reads. */
+    for (; m - j >= 8; j += 8) {
+        int64_t lo[8], hi[8], key[8];
+        for (int lane = 0; lane < 8; lane++) {
+            lo[lane] = 0;
+            hi[lane] = n;
+            key[lane] = q[j + lane];
+        }
+        bool work;
+        do {
+            work = false;
+            for (int lane = 0; lane < 8; lane++) {
+                if (lo[lane] < hi[lane]) {
+                    work = true;
+                    int64_t mid = lo[lane] + (hi[lane] - lo[lane]) / 2;
+                    if (h[mid] < key[lane]) lo[lane] = mid + 1;
+                    else hi[lane] = mid;
+                }
+            }
+        } while (work);
+        for (int lane = 0; lane < 8; lane++) {
+            int64_t pos = lo[lane];
+            if (pos < n && h[pos] == key[lane]) out[j + lane] = pos;
+            else { out[j + lane] = NULL_I64; *any_null = true; }
+        }
+    }
+    /* Scalar tail uses the same signed lower_bound and exact equality. */
+    for (; j < m; j++) {
+        int64_t lo = 0, hi = n;
+        while (lo < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            if (h[mid] < q[j]) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < n && h[lo] == q[j]) out[j] = lo;
+        else { out[j] = NULL_I64; *any_null = true; }
+    }
+    return true;
+}
+
 /* Vector-needle find with the NEEDLES hashed and the haystack scanned once:
  * out[i] = first row of `hay` equal to needle i, NULL_I64 on a miss.  The
  * alternative (hash the haystack, probe the needles) costs a hash build over
@@ -3291,7 +3342,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         }
         return ray_typed_null(-RAY_I64);
     }
-    /* Vector val: (find vec [v1 v2]) → dense I64 [idx1 idx2], O(n+m) via hashset. */
+    /* Vector val: (find vec [v1 v2]) → dense I64 [idx1 idx2]. */
     if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
         ray_t* result = ray_vec_new(RAY_I64, vlen);
@@ -3300,12 +3351,13 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         int64_t* out = (int64_t*)ray_data(result);
         bool any_null = false;
 
-        /* Both sides typed vecs — O(n+m).  In order of preference:
+        /* Both sides typed vecs, in order of preference:
          *   1. an attached hash index on the haystack: one probe per needle,
          *      nothing built per call;
-         *   2. fewer needles than rows: hash the needles, scan the haystack
+         *   2. sparse sorted, null-free I64: exact batched lower_bound;
+         *   3. fewer needles than rows: hash the needles, scan the haystack
          *      once (find_hash_needles);
-         *   3. hash the haystack, probe the needles (mirrors ray_in_fn). */
+         *   4. hash the haystack, probe the needles (mirrors ray_in_fn). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
             bool done = false;
             if (ray_index_has(vec)) {
@@ -3316,6 +3368,10 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     done = true;
                 }
             }
+            /* Keep tiny and dense probes on the existing hash/scan routes.
+             * This sparse admission avoids their sampled crossover region. */
+            if (!done && vec->len >= 4096 && vlen <= vec->len / 8)
+                done = find_sorted_i64(vec, val, out, &any_null);
             if (!done && find_needle_side_ok(vec, val))
                 done = find_hash_needles(vec, val, out, &any_null);
             if (!done) {
