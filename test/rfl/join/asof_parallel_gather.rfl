@@ -1,0 +1,18 @@
+;; As-of output columns past the parallel gather threshold: every left row
+;; with an exact match takes its right row's cells (nulls, symbols, strings
+;; included), a left row on a symbol the right table lacks takes nulls.
+(set apN 200000)
+(set apB (update {b: (if (== (% b 4) 0) 0Nl (* 3 b)) from: (table [s t b w q] (list (% (til apN) 10) (* 2 (til apN)) (til apN) (take ['p 'qq 'r] apN) (take ["m" "nn" ""] apN)))}))
+(set apA (table [s t v] (list (% (til apN) 10) (* 2 (til apN)) (til apN))))
+(set apR (asof-join [s t] apA apB))
+(count apR) -- apN
+(at apR 'v) -- (til apN)
+(at apR 'b) -- (at apB 'b)
+(at apR 'w) -- (at apB 'w)
+(at apR 'q) -- (at apB 'q)
+;; odd rows on symbol 99, which the right table lacks
+(set apA2 (update {s: (if (== (% v 2) 0) s 99) from: apA}))
+(set apR2 (asof-join [s t] apA2 apB))
+(at (at apR2 'b) (+ 1 (* 2 (til 100000)))) -- (take 0Nl 100000)
+(at (at apR2 'b) (* 2 (til 100000))) -- (at (at apB 'b) (* 2 (til 100000)))
+(at (at apR2 'w) (* 2 (til 100000))) -- (at (at apB 'w) (* 2 (til 100000)))
