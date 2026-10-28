@@ -5,21 +5,53 @@
 (str-find "banana" "") -- 0
 (str-find 'banana "na") -- 2
 (str-find "banana" 'na) -- 2
-(str-find "abc123" "c[0-9]") -- 2
-(str-find "abc123" "b?1") -- 1
-(str-find "a?c" "[?]") -- 1
-(str-find "a*c" "[*]") -- 1
+
+;; The needle is a literal byte string: `?`, `[`, `]`, `*` and `.` have no
+;; special meaning (patterns are `like`).
+(str-find "abc123" "c[0-9]") -- 0Nl
+(str-find "abc123" "b?1") -- 0Nl
+(str-find "a?c" "[?]") -- 0Nl
+(str-find "a?c" "?") -- 1
+(str-find "a*c" "*") -- 1
+(str-find "a[b" "[") -- 1
+(str-find "abc" "[b]") -- 0Nl
+(str-find "a[b]c" "[b]") -- 1
+(str-find "axb" "?") -- 0Nl
+(str-find "42" ".") -- 0Nl
+(str-find "a.c" ".") -- 1
+(str-find "a*c" "[*]") -- 0Nl
+(str-find "" "") -- 0
+(str-find "" "a") -- 0Nl
 
 (str-find ["banana" "cab" ""] "a") -- [1 1 0Nl]
 (str-find ["abc" "def" "ghi"] "e") -- [0Nl 1 0Nl]
 (str-find ['banana 'cab 'x] "a") -- [1 1 0Nl]
-(str-find ["abc123" "xx9" "abc"] "[0-9]") -- [3 2 0Nl]
+(str-find ["abc123" "xx9" "abc"] "[0-9]") -- [0Nl 0Nl 0Nl]
+(str-find ["a?c" "axc" "?"] "?") -- [1 0Nl 0]
+(str-find ['a?c 'axc] "?") -- [1 0Nl]
 (str-find (list "aba" 'cab "") "a") -- [0 1 0Nl]
 
 (str-find [1 2] "a") !- type
 (str-find "abc" 1) !- type
 (str-find (list "a" 2) "a") !- type
-(str-find "abc" "*") !- domain
+
+;; The same needles through a query: a derived column, a where clause and a
+;; derived group key (the derived-key program).
+(set SF (table [s] (list ["abc123" "a?c" "a*c" "a[b" "a[b]c" "axb" "42" "a.c"])))
+(at (select {from: SF k: (str-find s "c[0-9]")}) 'k) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {from: SF k: (str-find s "?")}) 'k) -- [0Nl 1 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {from: SF k: (str-find s "*")}) 'k) -- [0Nl 0Nl 1 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {from: SF k: (str-find s "[")}) 'k) -- [0Nl 0Nl 0Nl 1 1 0Nl 0Nl 0Nl]
+(at (select {from: SF k: (str-find s "[b]")}) 'k) -- [0Nl 0Nl 0Nl 0Nl 1 0Nl 0Nl 0Nl]
+(at (select {from: SF k: (str-find s "[?]")}) 'k) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {from: SF k: (str-find s ".")}) 'k) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 1]
+(at (select {from: SF k: (str-find s "")}) 'k) -- [0 0 0 0 0 0 0 0]
+(at (select {from: SF where: (>= (str-find s "?") 0)}) 's) -- ["a?c"]
+(at (select {from: SF where: (>= (str-find s "*") 0)}) 's) -- ["a*c"]
+(at (select {from: SF where: (>= (str-find s "[b]") 0)}) 's) -- ["a[b]c"]
+(at (select {from: SF where: (>= (str-find s "b?1") 0)}) 's) -- []
+(count (select {from: SF by: (if (== (str-find s "?") 1) "q" "o") c: (count s)})) -- 2
+(at (select {from: SF by: (if (== (str-find s "?") 1) "q" "o") c: (count s)}) 'c) -- [1 7]
 
 (str-join ["a" "b" "c"] ",") -- "a,b,c"
 (str-join ['a 'b 'c] "-") -- "a-b-c"
