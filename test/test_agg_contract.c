@@ -2309,6 +2309,48 @@ static test_result_t test_dense_native_topn(void) {
     PASS();
 }
 
+/* The partitioned dense strategy (a min beside the count) under a top-N
+ * filter selects from the occupancy of its first-row array on the workers:
+ * the emit holds the kept groups only, and they are the groups the full
+ * result ranks first. */
+static test_result_t test_dense_partitioned_topn(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set dp_i (til 1000000)) "
+        "(set dp_t (table [k v] (list (as 'I32 (% (* dp_i dp_i) 50021)) (% dp_i 13))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v) desc:c take:5})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+#if ATOMIC_LLONG_LOCK_FREE == 2
+    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_PARTITIONED);
+#endif
+    TEST_ASSERT_TRUE(stats.topn_native);
+    TEST_ASSERT_EQ_I(stats.dense_emit_slots, stats.topn_kept);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
+    ray_t* check = ray_eval_str(
+        "(all (== (at (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v) desc:c take:5}) 'c) "
+        "(take (at (xdesc (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)}) 'c) 'c) 5)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    /* no filter: the occupied slots are collected from the same bitmap, in
+     * slot order */
+    r = ray_eval_str("(select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    check = ray_eval_str(
+        "(and (== (count (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)})) (count (distinct (at dp_t 'k)))) "
+        "(== (sum (at (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)}) 'c)) 1000000))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    ray_release(ray_eval_str("(set dp_t 0) (set dp_i 0)"));
+    PASS();
+}
+
 /* Sparse int keys below the dense plan: the table-stack strategy takes a
  * low-cardinality input (one table per task, no scatter) and declines an
  * all-distinct one to radix at its sample gate.  A skewed input whose
@@ -4330,6 +4372,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
     { "agg_contract/tablestack_routes", test_tablestack_routes, contract_setup, contract_teardown },
     { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
+    { "agg_contract/dense_partitioned_topn", test_dense_partitioned_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
