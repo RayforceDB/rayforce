@@ -343,7 +343,9 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n);
 /* Collection */
 ray_t* ray_distinct_fn(ray_t* x);
 ray_t* ray_in_fn(ray_t* val, ray_t* vec);
+#ifdef DEBUG
 void   ray_in_guid_test_fail_alloc(int64_t nth);   /* tests: fail the nth guid `in` scratch allocation (0 = off) */
+#endif
 ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec);
 /* Query text concat; str_out: a STR atom operand is a STR column's cell.
  * rows_mask bit 0 / bit 1: a / b is a column's cell, so a null one is the

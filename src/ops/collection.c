@@ -577,13 +577,17 @@ typedef struct {
     bool      has_null;
 } guid_set_t;
 
+#ifdef DEBUG
 static _Atomic int64_t g_in_guid_fail_at;   /* test hook: fail the nth allocation */
 void ray_in_guid_test_fail_alloc(int64_t nth) { atomic_store(&g_in_guid_fail_at, nth); }
+#endif
 static void* in_guid_calloc(size_t size) {
+#ifdef DEBUG
     int64_t v = atomic_load(&g_in_guid_fail_at);
     while (v > 0)
         if (atomic_compare_exchange_weak(&g_in_guid_fail_at, &v, v - 1))
             return v == 1 ? NULL : ray_calloc_raw(size);
+#endif
     return ray_calloc_raw(size);
 }
 
