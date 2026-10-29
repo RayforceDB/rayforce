@@ -273,6 +273,12 @@ lib: $(LIB_LIB_OBJ)
 	rm -f lib$(TARGET).a
 	$(AR) rc lib$(TARGET).a $(LIB_LIB_OBJ)
 
+# Install-headers staging root. Mirrors the source layout under include/ so
+# the headers' own quoted includes ("ops/ops.h", "store/hnsw.h") resolve
+# with -I on this root alone. Kept out of include/ so a staged tree never
+# shadows src/ during a build.
+INSTALL_INCLUDE ?= install/include
+
 # Release tarball: build the optimized binary and package it as
 # dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256 checksum.
 # Used by .github/workflows/release.yml (which passes RAY_VERSION=X.Y.Z) and
@@ -283,10 +289,38 @@ dist: release
 	 name=$(TARGET)-$(VERSION)-$$os-$$arch; stage=dist/$$name; \
 	 mkdir -p $$stage; \
 	 cp $(TARGET) LICENSE README.md include/rayforce.h $$stage/; \
-	 tar -czf dist/$$name.tar.gz -C dist $$name; \
-	 rm -rf $$stage; \
-	 ( cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum $$name.tar.gz || shasum -a 256 $$name.tar.gz; } > $$name.tar.gz.sha256 ); \
-	 echo "built dist/$$name.tar.gz"
+# Install the headers a C client needs to use the engine in-process: the
+# public one plus the internal ones a binding includes directly (issue
+# #849). Staged read-only under $(INSTALL_INCLUDE)/rayforce/, laid out as
+# the sources are, because the headers include their siblings by
+# src-relative path ("ops/ops.h", "store/hnsw.h"). Copies, not symlinks, so
+# the staged tree outlives the checkout it came from.
+#
+# rayforce.h is staged twice: under rayforce/ for clients writing
+# <rayforce/rayforce.h>, and at the root of $(INSTALL_INCLUDE), which is
+# where the internal headers' own `#include <rayforce.h>` looks for it.
+#
+# Staging only: no ABI or API promise beyond "these are the headers at this
+# commit".
+INSTALL_HEADERS := include/rayforce.h \
+                   src/ops/ops.h src/io/parquet.h src/mem/heap.h \
+                   src/store/hnsw.h src/core/platform.h
+
+install-headers:
+	@rm -rf $(INSTALL_INCLUDE)/rayforce $(INSTALL_INCLUDE)/rayforce.h; \
+	d=$(INSTALL_INCLUDE)/rayforce/include; \
+	mkdir -p $$d; \
+	cp include/rayforce.h $$d/; \
+	chmod 444 $$d/rayforce.h
+	@for h in $(filter-out include/rayforce.h,$(INSTALL_HEADERS)); do \
+		d=$(INSTALL_INCLUDE)/rayforce/$${h%/*}; \
+		mkdir -p $$d; \
+		cp $$h $$d/; \
+		chmod 444 $$d/$${h##*/}; \
+	done
+	@cp include/rayforce.h $(INSTALL_INCLUDE)/rayforce.h
+	@chmod 444 $(INSTALL_INCLUDE)/rayforce.h
+	@echo "staged $(words $(INSTALL_HEADERS)) headers under $(INSTALL_INCLUDE)/rayforce"
 
 # Worker threads per process during tests. Without this the runtime
 # auto-sizes to ncpu-1, so on a many-core box the in-process harness AND
@@ -529,13 +563,14 @@ clean:
 	-rm -f $(TARGET) $(TARGET).test $(TARGET).test.rel lib$(TARGET).a
 	-rm -f $(TARGET).tsan $(TARGET).test.tsan
 	-rm -rf build build_release build_fuzz build_compdb dist
+	-rm -rf $(INSTALL_INCLUDE)/rayforce
 	# Test-generated fixtures (see test/rfl/system/*.rfl) — should not linger after a run.
 	-rm -f rf_test_*.csv
 	# Coverage artefacts (see `make coverage`).
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib dist test test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib dist install-headers test test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.
