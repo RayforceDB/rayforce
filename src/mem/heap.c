@@ -2099,8 +2099,8 @@ static void heap_zero_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
-static void heap_zero(void* p, size_t n) {
-    if (n >= HEAP_PAR_ZERO_MIN) {
+static void heap_zero(void* p, size_t n, bool pool_ok) {
+    if (pool_ok && n >= HEAP_PAR_ZERO_MIN) {
         ray_pool_t* pool = ray_pool_live();
         if (ray_pool_par_dispatch_ok(pool, 2, 2)) {
             size_t chunk = n / ((size_t)ray_pool_total_workers(pool) * 2);
@@ -2116,7 +2116,14 @@ static void heap_zero(void* p, size_t n) {
 ray_t* ray_alloc_zeroed(size_t data_size) {
     bool fresh;
     ray_t* v = heap_alloc_impl(data_size, &fresh);
-    if (v && !fresh && data_size) heap_zero(ray_data(v), data_size);
+    if (v && !fresh && data_size) heap_zero(ray_data(v), data_size, false);
+    return v;
+}
+
+ray_t* ray_alloc_zeroed_query(size_t data_size) {
+    bool fresh;
+    ray_t* v = heap_alloc_impl(data_size, &fresh);
+    if (v && !fresh && data_size) heap_zero(ray_data(v), data_size, true);
     return v;
 }
 

@@ -325,6 +325,16 @@ int64_t ray_heap_spill_discard_count(void);
 void ray_heap_test_scribble(bool on);
 #endif
 
+/* ray_alloc whose data bytes read as zero, on the calling thread: a block
+ * mapped for this call is zero already and is handed out as is, any other
+ * is zeroed here.  Any thread may call it (ray_calloc_raw does). */
+ray_t* ray_alloc_zeroed(size_t data_size);
+/* ray_alloc_zeroed for the engine's query paths (scratch_calloc): a large
+ * block that is not fresh is zeroed across the pool when the caller is
+ * outside a dispatch.  The pool takes tasks from one dispatcher only, so
+ * only the thread that evaluates queries may call it. */
+ray_t* ray_alloc_zeroed_query(size_t data_size);
+
 /* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */

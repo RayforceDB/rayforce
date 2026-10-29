@@ -137,7 +137,7 @@ static inline void* scratch_realloc(ray_t** hdr_out, size_t old_bytes, size_t ne
 }
 
 static inline void* scratch_calloc(ray_t** hdr_out, size_t nbytes) {
-    ray_t* h = ray_alloc_zeroed(nbytes);
+    ray_t* h = ray_alloc_zeroed_query(nbytes);
     if (!h) { *hdr_out = NULL; return NULL; }
     *hdr_out = h;
     return ray_data(h);
