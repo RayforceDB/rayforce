@@ -8386,6 +8386,14 @@ typedef struct {
     double*   sum_y;     /* Σy   */
     double*   sumsq_y;   /* Σy²  */
     double*   sumxy;     /* Σxy  */
+    /* One bit per chunk of DA_LZ_SLOTS slots: set once the chunk's cells
+     * hold their seeds.  A worker's set (not the merge target's) is left
+     * unseeded at allocation and seeded a chunk at a time before the first
+     * row that lands in it (da_touch, or da_seed_span for a block of the
+     * strlen fold); the merge skips the chunks it never touched.  All ones
+     * for a set seeded whole. */
+    uint64_t* touched;
+    int64_t   unseeded;  /* chunks not yet seeded; 0 for a set seeded whole */
     /* Arena headers */
     ray_t* _h_sum;
     ray_t* _h_sum_hi;
@@ -8400,7 +8408,17 @@ typedef struct {
     ray_t* _h_sum_y;
     ray_t* _h_sumsq_y;
     ray_t* _h_sumxy;
+    ray_t* _h_touched;
 } da_accum_t;
+
+#define DA_LZ_SHIFT 6
+#define DA_LZ_SLOTS ((int64_t)1 << DA_LZ_SHIFT)
+#define DA_LZ_MASK  (DA_LZ_SLOTS - 1)
+
+static inline bool da_chunk_touched(const da_accum_t* a, int64_t slot) {
+    uint64_t ch = (uint64_t)slot >> DA_LZ_SHIFT;
+    return (a->touched[ch >> 6] >> (ch & 63)) & 1;
+}
 
 static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_sum);
@@ -8416,6 +8434,7 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_sum_y);
     scratch_free(a->_h_sumsq_y);
     scratch_free(a->_h_sumxy);
+    scratch_free(a->_h_touched);
 }
 
 /* Unified agg result emitter — used by both DA and HT paths.
@@ -10386,12 +10405,64 @@ static inline bool da_sym_lex_lt(const da_ctx_t* c, uint32_t a_idx, int64_t x, i
     return sym_lex_lt(ray_sym_vec_domain(c->agg_cols[a_idx]), x, y);
 }
 
+/* Seed chunk `ch` of accumulator set `acc` as the allocation seeds a whole
+ * set: zero sums and counts, MIN/MAX at their "not seen" values, the
+ * FIRST/LAST row bounds at their extremes. */
+static void __attribute__((noinline))
+da_chunk_seed(const da_ctx_t* c, da_accum_t* acc, uint64_t ch) {
+    const size_t na = c->n_aggs;
+    const size_t lo = (size_t)ch << DA_LZ_SHIFT;
+    const size_t hi = lo + DA_LZ_SLOTS < c->n_slots ? lo + DA_LZ_SLOTS : c->n_slots;
+    const size_t n = hi - lo;
+    memset(acc->count + lo, 0, n * sizeof(int64_t));
+    if (acc->sum)       memset(acc->sum + lo * na, 0, n * na * sizeof(da_val_t));
+    if (acc->sum_hi)    memset(acc->sum_hi + lo * na, 0, n * na * sizeof(int64_t));
+    if (acc->sumsq_f64) memset(acc->sumsq_f64 + lo * na, 0, n * na * sizeof(double));
+    if (acc->nn_count)  memset(acc->nn_count + lo * na, 0, n * na * sizeof(int64_t));
+    if (acc->sl_null)   memset(acc->sl_null + lo * na, 0, n * na * sizeof(int64_t));
+    if (acc->sum_y)     memset(acc->sum_y + lo * na, 0, n * na * sizeof(double));
+    if (acc->sumsq_y)   memset(acc->sumsq_y + lo * na, 0, n * na * sizeof(double));
+    if (acc->sumxy)     memset(acc->sumxy + lo * na, 0, n * na * sizeof(double));
+    for (size_t i = lo * na; i < hi * na; i++) {
+        bool fp = group_fp_type(c->agg_types[i % na]);
+        if (acc->min_val) { if (fp) acc->min_val[i].f = DBL_MAX;  else acc->min_val[i].i = INT64_MAX; }
+        if (acc->max_val) { if (fp) acc->max_val[i].f = -DBL_MAX; else acc->max_val[i].i = INT64_MIN; }
+    }
+    /* never allocated under da_lazy (FIRST/LAST merge by row index over
+     * whole sets); seeded as the allocation does so that lifting that
+     * exclusion needs nothing here */
+    for (size_t s = lo; s < hi; s++) {
+        if (acc->first_row) acc->first_row[s] = INT64_MAX;
+        if (acc->last_row)  acc->last_row[s]  = INT64_MIN;
+    }
+    acc->touched[ch >> 6] |= (uint64_t)1 << (ch & 63);
+    acc->unseeded--;
+}
+
+/* Seeds every chunk of slots [lo, hi] not seeded yet. */
+static void __attribute__((noinline))
+da_seed_span(const da_ctx_t* c, da_accum_t* acc, int64_t lo, int64_t hi) {
+    const uint64_t last = (uint64_t)hi >> DA_LZ_SHIFT;
+    for (uint64_t ch = (uint64_t)lo >> DA_LZ_SHIFT; ch <= last; ch++) {
+        uint64_t w = acc->touched[ch >> 6];
+        if (w == ~(uint64_t)0) { ch |= 63; continue; }   /* a word of seeded chunks */
+        if (!((w >> (ch & 63)) & 1)) da_chunk_seed(c, acc, ch);
+    }
+}
+
+/* Before a row's first write into slot gid's chunk. */
+RAY_INLINE void da_touch(const da_ctx_t* c, da_accum_t* acc, int32_t gid) {
+    if (RAY_UNLIKELY(!da_chunk_touched(acc, gid)))
+        da_chunk_seed(c, acc, (uint64_t)(uint32_t)gid >> DA_LZ_SHIFT);
+}
+
 /* Row r (absolute: selection, FIRST/LAST order, fused-product terms) is
  * read from the input pieces at rr = r - row_base.  `staged` is constant
  * per instance (see da_accum_body). */
 RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64_t r, int64_t rr,
                                   const bool staged) {
     uint8_t n_aggs = c->n_aggs;
+    da_touch(c, acc, gid);
     acc->count[gid]++;
     size_t base = (size_t)gid * n_aggs;
 
@@ -10638,8 +10709,6 @@ RAY_INLINE void da_accum_strlen_range(da_ctx_t* c, da_accum_t* acc,
                                      int64_t start, int64_t end, const bool staged) {
     const uint32_t sa = (uint32_t)c->sl_agg;
     const size_t n_aggs = c->n_aggs;
-    int64_t* restrict count = acc->count;
-    da_val_t* restrict sum = acc->sum;
     int64_t* nn = acc->nn_count;
     int64_t* sln = acc->sl_null;
     const int64_t kmin = c->key_mins[0];
@@ -10664,9 +10733,14 @@ RAY_INLINE void da_accum_strlen_range(da_ctx_t* c, da_accum_t* acc,
                                  b0 + j, b0 + j - rb, staged); \
     } while (0)
     #define DA_SL_PF_DIST 8
-    #define DA_SL_FOLD(KTYPE, KCAST) \
+    /* The fold of a block.  A lazily seeded set (acc->unseeded) seeds the
+     * chunk or two the block's keys span before it, so that fold carries no
+     * per-row check; a block whose keys span more chunks folds through
+     * da_touch instead (its seeds written through acc: no restrict there). */
+    #define DA_SL_FOLD_LOOP(KTYPE, KCAST, TOUCH, QUAL) \
     do { \
-        const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
+        int64_t* QUAL count = acc->count; \
+        da_val_t* QUAL sum = acc->sum; \
         for (int64_t j = 0; j < n; j++) { \
             int64_t r = b0 + j; \
             if (da_pf && RAY_LIKELY(r + DA_SL_PF_DIST < end)) { \
@@ -10678,6 +10752,7 @@ RAY_INLINE void da_accum_strlen_range(da_ctx_t* c, da_accum_t* acc,
             int64_t kv = (int64_t)KCAST kp[r - rb]; \
             if (ksym && kv == 0) kv = kmin; \
             int32_t gid = (int32_t)(kv - kmin); \
+            if (TOUCH) da_touch(c, acc, gid); \
             count[gid]++; \
             size_t idx = (size_t)gid * n_aggs + sa; \
             int64_t len = lens[j]; \
@@ -10685,6 +10760,25 @@ RAY_INLINE void da_accum_strlen_range(da_ctx_t* c, da_accum_t* acc,
             if (nn) nn[idx]++; \
             if (RAY_UNLIKELY(len == 0) && sln) sln[idx]++; \
         } \
+    } while (0)
+    #define DA_SL_FOLD(KTYPE, KCAST) \
+    do { \
+        const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
+        bool rowwise = false; \
+        if (acc->unseeded) { \
+            int64_t lo = INT64_MAX, hi = INT64_MIN; \
+            for (int64_t j = 0; j < n; j++) { \
+                int64_t kv = (int64_t)KCAST kp[b0 + j - rb]; \
+                if (ksym && kv == 0) kv = kmin; \
+                lo = kv < lo ? kv : lo; \
+                hi = kv > hi ? kv : hi; \
+            } \
+            if (((hi - kmin) >> DA_LZ_SHIFT) - ((lo - kmin) >> DA_LZ_SHIFT) < 2) \
+                da_seed_span(c, acc, lo - kmin, hi - kmin); \
+            else rowwise = true; \
+        } \
+        if (rowwise) DA_SL_FOLD_LOOP(KTYPE, KCAST, 1, ); \
+        else         DA_SL_FOLD_LOOP(KTYPE, KCAST, 0, restrict); \
     } while (0)
     for (int64_t b0 = start; b0 < end; b0 += DA_SL_BLK) {
         int64_t n = end - b0 < DA_SL_BLK ? end - b0 : DA_SL_BLK;
@@ -10716,6 +10810,7 @@ RAY_INLINE void da_accum_strlen_range(da_ctx_t* c, da_accum_t* acc,
         }
     }
     #undef DA_SL_FOLD
+    #undef DA_SL_FOLD_LOOP
     #undef DA_SL_PF_DIST
     #undef DA_SL_SYM
 }
@@ -10748,6 +10843,7 @@ RAY_INLINE void da_accum_strlen_rows(da_ctx_t* c, da_accum_t* acc, int64_t base,
                            : da_sid_len(c, sa, ray_read_sym(ids, r - rb, RAY_SYM, attrs),
                                         raw, rt, r, r - rb, staged);
         int32_t gid = da_composite_gid(c, r - rb);
+        da_touch(c, acc, gid);
         acc->count[gid]++;
         size_t ix = (size_t)gid * n_aggs + sa;
         acc->sum[ix].i = wrap_add_i64(acc->sum[ix].i, len);
@@ -11130,6 +11226,7 @@ typedef struct {
     const int8_t* agg_types;  /* per-agg value type (for typed merge) */
     const uint16_t* agg_ops;  /* per-agg opcode (for FIRST/LAST merge) */
     ray_t* const* agg_cols;   /* per-agg input vec (SYM lex via its domain) */
+    _Atomic(uint64_t) skipped; /* OUT: chunks skipped as never seeded (route stat) */
 } da_merge_ctx_t;
 
 static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
@@ -11138,9 +11235,11 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     da_accum_t* merged = &c->accums[0];
     uint8_t n_aggs = c->n_aggs;
     const int8_t* agg_types = c->agg_types;
+    uint64_t skipped = 0;
     for (uint32_t w = 1; w < c->n_src_workers; w++) {
         da_accum_t* wa = &c->accums[w];
         for (int64_t s = start; s < end; s++) {
+            if (!da_chunk_touched(wa, s)) { s |= DA_LZ_MASK; skipped++; continue; }   /* nothing there */
             size_t base = (size_t)s * n_aggs;
             if (c->need_flags & DA_NEED_SUMSQ) {
                 for (uint32_t a = 0; a < n_aggs; a++)
@@ -11234,6 +11333,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
             merged->count[s] += wa->count[s];
         }
     }
+    if (skipped) atomic_fetch_add_explicit(&c->skipped, skipped, memory_order_relaxed);
 }
 
 /* ============================================================================
@@ -16915,30 +17015,42 @@ da_path:;
                 da_n_workers * sizeof(da_accum_t));
             if (!accums) goto ht_path;
 
+            /* The workers' sets are seeded lazily, a chunk of slots at a
+             * time before the rows that reach it (da_touch), when the
+             * parallel merge below folds them, which skips the chunks a
+             * worker never touched: a key range far wider than any worker's
+             * share of the groups then costs neither a serial seeding of
+             * every set nor a merge of their untouched cells.  The merge
+             * target accums[0] is seeded whole: the emit reads every slot. */
+            const bool da_lazy = da_n_workers > 1 && n_slots >= 1024 && da_pool &&
+                                 !da_has_first_last;
+            const size_t da_tw = ((((size_t)n_slots + DA_LZ_SLOTS - 1) >> DA_LZ_SHIFT) + 63) >> 6;
             bool alloc_ok = true;
             for (uint32_t w = 0; w < da_n_workers; w++) {
+                const bool lz = da_lazy && w > 0;
+                #define DA_ARR(T, H, N) ((T*)(lz ? scratch_alloc(H, (N) * sizeof(T)) \
+                                             : scratch_calloc(H, (N) * sizeof(T))))
+                accums[w].touched = (uint64_t*)scratch_alloc(&accums[w]._h_touched,
+                    da_tw * sizeof(uint64_t));
+                if (!accums[w].touched) { alloc_ok = false; break; }
+                memset(accums[w].touched, lz ? 0 : 0xff, da_tw * sizeof(uint64_t));
+                accums[w].unseeded = lz ? (int64_t)(((size_t)n_slots + DA_LZ_SLOTS - 1) >> DA_LZ_SHIFT) : 0;
                 if (need_flags & DA_NEED_SUM) {
-                    accums[w].sum = (da_val_t*)scratch_calloc(&accums[w]._h_sum,
-                        total * sizeof(da_val_t));
+                    accums[w].sum = DA_ARR(da_val_t, &accums[w]._h_sum, total);
                     if (!accums[w].sum) { alloc_ok = false; break; }
                 }
                 if (da_need_sum128) {
-                    accums[w].sum_hi = (int64_t*)scratch_calloc(&accums[w]._h_sum_hi,
-                        total * sizeof(int64_t));
+                    accums[w].sum_hi = DA_ARR(int64_t, &accums[w]._h_sum_hi, total);
                     if (!accums[w].sum_hi) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_SUMSQ) {
-                    accums[w].sumsq_f64 = (double*)scratch_calloc(&accums[w]._h_sumsq,
-                        total * sizeof(double));
+                    accums[w].sumsq_f64 = DA_ARR(double, &accums[w]._h_sumsq, total);
                     if (!accums[w].sumsq_f64) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_PAIR) {
-                    accums[w].sum_y = (double*)scratch_calloc(&accums[w]._h_sum_y,
-                        total * sizeof(double));
-                    accums[w].sumsq_y = (double*)scratch_calloc(&accums[w]._h_sumsq_y,
-                        total * sizeof(double));
-                    accums[w].sumxy = (double*)scratch_calloc(&accums[w]._h_sumxy,
-                        total * sizeof(double));
+                    accums[w].sum_y = DA_ARR(double, &accums[w]._h_sum_y, total);
+                    accums[w].sumsq_y = DA_ARR(double, &accums[w]._h_sumsq_y, total);
+                    accums[w].sumxy = DA_ARR(double, &accums[w]._h_sumxy, total);
                     if (!accums[w].sum_y || !accums[w].sumsq_y || !accums[w].sumxy) {
                         alloc_ok = false; break;
                     }
@@ -16947,7 +17059,7 @@ da_path:;
                     accums[w].min_val = (da_val_t*)scratch_alloc(&accums[w]._h_min,
                         total * sizeof(da_val_t));
                     if (!accums[w].min_val) { alloc_ok = false; break; }
-                    for (size_t i = 0; i < total; i++) {
+                    for (size_t i = 0; !lz && i < total; i++) {
                         uint8_t a = (uint8_t)(i % n_aggs);
                         if (group_fp_type(agg_types[a])) accums[w].min_val[i].f = DBL_MAX;
                         else accums[w].min_val[i].i = INT64_MAX;
@@ -16957,26 +17069,24 @@ da_path:;
                     accums[w].max_val = (da_val_t*)scratch_alloc(&accums[w]._h_max,
                         total * sizeof(da_val_t));
                     if (!accums[w].max_val) { alloc_ok = false; break; }
-                    for (size_t i = 0; i < total; i++) {
+                    for (size_t i = 0; !lz && i < total; i++) {
                         uint8_t a = (uint8_t)(i % n_aggs);
                         if (group_fp_type(agg_types[a])) accums[w].max_val[i].f = -DBL_MAX;
                         else accums[w].max_val[i].i = INT64_MIN;
                     }
                 }
-                accums[w].count = (int64_t*)scratch_calloc(&accums[w]._h_count,
-                    n_slots * sizeof(int64_t));
+                accums[w].count = DA_ARR(int64_t, &accums[w]._h_count, n_slots);
                 if (!accums[w].count) { alloc_ok = false; break; }
                 if (da_any_nullable) {
-                    accums[w].nn_count = (int64_t*)scratch_calloc(
-                        &accums[w]._h_nn_count, total * sizeof(int64_t));
+                    accums[w].nn_count = DA_ARR(int64_t, &accums[w]._h_nn_count, total);
                     if (!accums[w].nn_count) { alloc_ok = false; break; }
                 }
                 if (da_strlen_avg) {
-                    accums[w].sl_null = (int64_t*)scratch_calloc(
-                        &accums[w]._h_sl_null, total * sizeof(int64_t));
+                    accums[w].sl_null = DA_ARR(int64_t, &accums[w]._h_sl_null, total);
                     if (!accums[w].sl_null) { alloc_ok = false; break; }
                 }
-                if (da_has_first_last) {
+                #undef DA_ARR
+                if (da_has_first_last) {   /* never lazy */
                     accums[w].first_row = (int64_t*)scratch_alloc(
                         &accums[w]._h_first_row, n_slots * sizeof(int64_t));
                     if (!accums[w].first_row) { alloc_ok = false; break; }
@@ -17292,8 +17402,10 @@ da_path:;
                     for (uint32_t s = 0; s < n_slots; s++)
                         merged->count[s] += wa->count[s];
                 }
-            } else if (da_n_workers > 1 && n_slots >= 1024 && da_pool) {
-                /* Parallel merge: dispatch over disjoint slot ranges */
+            } else if (da_lazy) {
+                /* Parallel merge over disjoint slot ranges: the only merge
+                 * that skips the chunks a worker never seeded, so it is
+                 * gated exactly as the lazy seeding is (da_lazy) */
                 da_merge_ctx_t merge_ctx = {
                     .accums        = accums,
                     .n_src_workers = da_n_workers,
@@ -17302,8 +17414,10 @@ da_path:;
                     .agg_types     = agg_types,
                     .agg_ops       = ext->agg_ops,
                     .agg_cols      = da_agg_cols,
+                    .skipped       = 0,
                 };
                 ray_pool_dispatch(da_pool, da_merge_fn, &merge_ctx, (int64_t)n_slots);
+                agg_route_note_da_lazy(atomic_load_explicit(&merge_ctx.skipped, memory_order_relaxed));
             } else {
                 /* Sequential merge for small slot counts */
                 for (uint32_t w = 1; w < da_n_workers; w++) {

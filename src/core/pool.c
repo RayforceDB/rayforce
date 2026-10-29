@@ -27,6 +27,9 @@
 #include "mem/cow.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
+#ifdef DEBUG
+#include "rayforce.h"       /* ray_request_interrupt: the cancel-at test hook */
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -790,6 +793,32 @@ static inline void pool_scan_end(ray_pool_t* pool) {
 static _Atomic(uint32_t) g_pool_test_cap;
 void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_cap, cap, memory_order_relaxed); }
 
+/* Test hook (ray_pool_test_cancel_at): the nth dispatch since arming finds
+ * the query cancelled before its first round, as a cancel landing between
+ * two dispatches leaves it: a cancel request (both flags), or the pool's
+ * flag alone; 0 off.  Test/debug objects only: a release dispatch carries
+ * no trace of it. */
+#ifdef DEBUG
+static _Atomic(uint32_t) g_pool_test_cancel_at, g_pool_test_dispatches;
+static _Atomic(bool) g_pool_test_cancel_pool_only;
+void ray_pool_test_cancel_at(uint32_t nth, bool pool_only) {
+    atomic_store_explicit(&g_pool_test_dispatches, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_pool_test_cancel_pool_only, pool_only, memory_order_relaxed);
+    atomic_store_explicit(&g_pool_test_cancel_at, nth, memory_order_relaxed);
+}
+static inline void pool_test_cancel_tick(ray_pool_t* pool) {
+    uint32_t at = atomic_load_explicit(&g_pool_test_cancel_at, memory_order_relaxed);
+    if (RAY_LIKELY(!at)) return;
+    if (atomic_fetch_add_explicit(&g_pool_test_dispatches, 1, memory_order_relaxed) + 1 != at) return;
+    if (atomic_load_explicit(&g_pool_test_cancel_pool_only, memory_order_relaxed))
+        atomic_store_explicit(&pool->cancelled, 1, memory_order_release);
+    else
+        ray_request_interrupt();
+}
+#else
+static inline void pool_test_cancel_tick(ray_pool_t* pool) { (void)pool; }
+#endif
+
 /* Tasks one round may take: the ring, or the test hook's smaller cap. */
 static inline uint32_t pool_round_cap(const ray_pool_t* pool) {
     uint32_t test_cap = atomic_load_explicit(&g_pool_test_cap, memory_order_relaxed);
@@ -825,6 +854,16 @@ static inline uint64_t pool_window_base(const ray_pool_t* pool) {
  * drain.  Read-ahead for the window is armed by the caller (pool_scan_begin)
  * before this and disarmed here. */
 static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, bool prog) {
+    /* Mark parallel region before the window opens: workers are about to
+     * run, cross-heap freelist modification is unsafe until spin-wait
+     * completes, and a graph executed from a task must see a dispatch in
+     * flight (ray_execute resets the cancel flag at the outermost call
+     * only).  A worker holding a surplus token from an earlier window may
+     * claim a ticket the moment it is published, so the flag goes first. */
+    atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
+    /* Main thread enters atomic refcount mode during parallel dispatch */
+    ray_rc_sync = true;
+
     /* pending must be visible before the window opens; the task_limit
      * store-release publishes the ring fill AND pending to claimers.  In
      * steal mode the range words are the publication (release each) and
@@ -837,13 +876,6 @@ static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, b
     } else {
         atomic_store_explicit(&pool->task_limit, base + n_tasks, memory_order_release);
     }
-
-    /* Mark parallel region: workers are about to run, cross-heap
-     * freelist modification is unsafe until spin-wait completes. */
-    atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
-
-    /* Main thread enters atomic refcount mode during parallel dispatch */
-    ray_rc_sync = true;
 
     /* Wake worker threads — only as many as have something to claim.  Main
      * participates as worker 0, so at most n_tasks-1 helpers can be useful;
@@ -935,6 +967,7 @@ static void dispatch_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
 static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                              int64_t total_elems, int64_t grain) {
     if (total_elems <= 0) return;
+    pool_test_cancel_tick(pool);
 
     /* Calculate number of tasks.
      * Overflow guard: total_elems + grain - 1 could wrap for extreme values. */
@@ -1015,6 +1048,7 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
 void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                          uint32_t n_tasks) {
     if (n_tasks == 0) return;
+    pool_test_cancel_tick(pool);
 
     pool_ring_grow(pool, (int64_t)n_tasks);
 

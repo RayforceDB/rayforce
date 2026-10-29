@@ -6578,6 +6578,9 @@ static bool dk_chunk_views(const void* dv, uint8_t dattrs, int64_t lo, int64_t n
         ray_pool_dispatch(pool, dk_chunk_scan_fn, &c, n);
     else
         dk_chunk_scan_fn(&c, 0, 0, n);
+    /* the pool skips the tickets of a cancelled query: the views of the
+     * rows it skipped were never written (so after every dispatch below) */
+    if (pool_cancelled(pool)) return false;
     if (atomic_load_explicit(&c.late, memory_order_relaxed)) {
         for (int64_t i = 0; i < n; i++) {
             if (len[i] != UINT32_MAX) continue;
@@ -6626,6 +6629,7 @@ static ray_t* derived_key_chunk_strs(const char** ptr, uint32_t* len, int64_t n)
     if (par) ray_pool_dispatch(pool, dk_chunk_fill_fn, &c, n);
     else     dk_chunk_fill_fn(&c, 0, 0, n);
     scratch_free(aux_hdr);
+    if (pool_cancelled(pool)) { ray_release(sv); return NULL; }
     return sv;
 }
 
@@ -7174,6 +7178,7 @@ static bool dkh_keys_of(ray_t* by_expr, int64_t col, const dkp_prog_t* prog, dkp
                              .kp = kp, .kl = kl, .kh = kh, .regs = regs };
         if (par) ray_pool_dispatch(pool, dkp_run_fn, &rc, n);
         else     dkp_run_fn(&rc, 0, 0, n);
+        if (pool_cancelled(pool)) return false;
         ray_profile_tick("derived key: program over values");
         return true;
     }
@@ -7206,7 +7211,7 @@ static bool dkh_keys_of(ray_t* by_expr, int64_t col, const dkp_prog_t* prog, dkp
     /* a SYM key's cells resolve through its domain's atoms: serial */
     if (par && kc->type == RAY_STR) ray_pool_dispatch(pool, dk_kview_fn, &vc, n);
     else                            dk_kview_fn(&vc, 0, 0, n);
-    if (atomic_load_explicit(&vc.bad, memory_order_relaxed)) { ray_release(kc); return false; }
+    if (pool_cancelled(pool) || atomic_load_explicit(&vc.bad, memory_order_relaxed)) { ray_release(kc); return false; }
     *kc_out = kc;
     return true;
 }
@@ -7625,7 +7630,7 @@ static bool dkh_grow(dkh_t* c, bool par) {
     if (ok && any) {
         if (par) ray_pool_dispatch_n(pool, dkh_grow_fn, c, DKH_NPART);
         else     dkh_grow_fn(c, 0, 0, DKH_NPART);
-        if (ray_interrupted()) ok = false;
+        if (pool_cancelled(pool)) ok = false;
     }
     /* swap in what moved (or drop what was staged, on failure) */
     for (int p = 0; p < DKH_NPART; p++) {
@@ -7757,7 +7762,7 @@ static bool dkh_build(dkh_t* c) {
     }
 
     for (int64_t lo = 0; lo < du; lo += chunk) {
-        if (ray_interrupted()) return false;
+        if (pool_cancelled(pool)) return false;
         int64_t n = du - lo < chunk ? du - lo : chunk;
         c->lo = lo; c->n = n;
         bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
@@ -7776,6 +7781,9 @@ static bool dkh_build(dkh_t* c) {
         c->nt = nt;
         if (nt > 1) ray_pool_dispatch_n(pool, dkh_count_fn, c, (uint32_t)nt);
         else        dkh_count_fn(c, 0, 0, 1);
+        /* the pool skips the tickets of a cancelled query: the counts of
+         * the tasks it skipped were never written */
+        if (pool_cancelled(pool)) { if (kc) ray_release(kc); return false; }
         int64_t run = 0;
         for (int p = 0; p < DKH_NPART; p++) {
             dkh_part_t* P = &c->part[p];
@@ -7791,13 +7799,14 @@ static bool dkh_build(dkh_t* c) {
         }
         if (nt > 1) ray_pool_dispatch_n(pool, dkh_scatter_fn, c, (uint32_t)nt);
         else        dkh_scatter_fn(c, 0, 0, 1);
+        if (pool_cancelled(pool)) { if (kc) ray_release(kc); return false; }
 
         /* the partitions, until every one has taken its items */
         bool ok = dkh_grow(c, par);
         while (ok) {
             if (par) ray_pool_dispatch_n(pool, dkh_group_fn, c, DKH_NPART);
             else     dkh_group_fn(c, 0, 0, DKH_NPART);
-            if (ray_interrupted()) { ok = false; break; }
+            if (pool_cancelled(pool)) { ok = false; break; }
             bool pending = false;
             for (int p = 0; p < DKH_NPART; p++) if (c->part[p].cur < c->part[p].end) pending = true;
             if (!pending) break;
@@ -7824,6 +7833,7 @@ static bool dkh_build(dkh_t* c) {
     bool par = ray_pool_par_dispatch_ok(pool, G, RAY_PARALLEL_THRESHOLD);
     if (par) ray_pool_dispatch_n(pool, dkh_mark_fn, c, DKH_NPART);
     else     dkh_mark_fn(c, 0, 0, DKH_NPART);
+    if (pool_cancelled(pool)) return false;
     int64_t run = 0;
     for (int64_t w = 0; w < nw; w++) { wrank[w] = run; run += __builtin_popcountll(c->bits[w]); }
     c->wrank = wrank;
@@ -7836,6 +7846,7 @@ static bool dkh_build(dkh_t* c) {
     }
     if (par) ray_pool_dispatch_n(pool, dkh_rank_fn, c, DKH_NPART);
     else     dkh_rank_fn(c, 0, 0, DKH_NPART);
+    if (pool_cancelled(pool)) return false;
     scratch_free(c->hdrs[5]); c->hdrs[5] = NULL; c->bits = NULL;
     scratch_free(c->hdrs[6]); c->hdrs[6] = NULL; c->wrank = NULL;
     /* the chunk buffers are done */
@@ -7891,6 +7902,7 @@ static bool dkh_intern_keys(const dkh_t* c, const uint32_t* codes, int64_t n,
     ray_pool_t* pool = ray_pool_get();
     if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, dkh_keys_fn, &k, n);
     else                                                          dkh_keys_fn(&k, 0, 0, n);
+    if (pool_cancelled(pool)) { scratch_free(hdr); return false; }
     bool ok = ray_sym_domain_intern_batch(kdom, n, k.strs, k.lens, k.h32, pos);
     scratch_free(hdr);
     ray_profile_tick("derived key: key domain interned");
@@ -7949,6 +7961,7 @@ static ray_t* derived_key_str_chunks(ray_t* by_expr, int64_t col_sym, ray_t* dom
         if (ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, dkh_spread_fn, &sc, du);
         else                                                           dkh_spread_fn(&sc, 0, 0, du);
         scratch_free(phdr);
+        if (pool_cancelled(pool)) { ray_release(key_dom); goto done; }
         ray_profile_tick("derived key: keys spread");
         out = key_dom;
     }
@@ -8068,12 +8081,13 @@ static bool dkh_kept_minmax_scatter(const dkh_t* c, const uint32_t* oix,
     m.want  = (uint8_t*)mem;
     bool ok = true;
     for (int64_t lo = 0; lo < c->du && ok; lo += chunk) {
-        if (ray_interrupted()) { ok = false; break; }
+        if (pool_cancelled(pool)) { ok = false; break; }
         int64_t n = c->du - lo < chunk ? c->du - lo : chunk;
         m.lo = lo; m.n = n;
         bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
         if (par) ray_pool_dispatch(pool, dkh_mm_want_fn, &m, n);
         else     dkh_mm_want_fn(&m, 0, 0, n);
+        if (pool_cancelled(pool)) { ok = false; break; }
         if (!dk_chunk_views(c->dv, c->dattrs, lo, n, c->raw, c->dom, m.want, m.sp, m.sl, true)) { ok = false; break; }
         int64_t nt = 1;
         if (par) {
@@ -8084,6 +8098,7 @@ static bool dkh_kept_minmax_scatter(const dkh_t* c, const uint32_t* oix,
         m.nt = nt;
         if (nt > 1) ray_pool_dispatch_n(pool, dkh_mm_count_fn, &m, (uint32_t)nt);
         else        dkh_mm_count_fn(&m, 0, 0, 1);
+        if (pool_cancelled(pool)) { ok = false; break; }
         int64_t run = 0;
         for (int p = 0; p < DKH_NPART; p++) {
             m.pstart[p] = run;
@@ -8098,7 +8113,7 @@ static bool dkh_kept_minmax_scatter(const dkh_t* c, const uint32_t* oix,
         else        dkh_mm_scatter_fn(&m, 0, 0, 1);
         if (par) ray_pool_dispatch_n(pool, dkh_mm_fn, &m, DKH_NPART);
         else     dkh_mm_fn(&m, 0, 0, DKH_NPART);
-        if (ray_interrupted()) ok = false;
+        if (pool_cancelled(pool)) ok = false;
     }
     scratch_free(hdr);
     scratch_free(thdr);
@@ -8199,7 +8214,7 @@ static bool dkh_kept_minmax(const dkh_t* c, const uint32_t* oix, int64_t K,
     atomic_store_explicit(&m.late, 0, memory_order_relaxed);
     if (par) ray_pool_dispatch(pool, dkh_mmw_fn, &m, c->du);
     else     dkh_mmw_fn(&m, 0, 0, c->du);
-    bool ok = !ray_interrupted();
+    bool ok = !pool_cancelled(pool);
     /* merge: per kept group, the best over the workers */
     for (int64_t o = 0; ok && o < K; o++) {
         for (int64_t wk = 0; wk < nw; wk++) {
@@ -8334,7 +8349,15 @@ static int dkv_agg_kind(ray_t* v, int64_t col) {
  * key values over the vocabulary).  Positions are distinct, so the order is the
  * rank of each position among those present: a bitmap over the domain
  * (set on the workers), a running popcount per word, then a scatter on the
- * workers.  Returns a new table, or NULL (H kept). */
+ * workers.  Returns a new table, or NULL (H kept).
+ *
+ * A partitioned grouping emits H as a few ascending runs (one per key
+ * partition), the positions of a run strided by the partition count.  A row
+ * scatter then writes its output at stride, a cache line per row, from every
+ * worker.  Instead each task takes a range of the domain's bitmap words and
+ * merges, from every run, the rows whose positions fall in the range: the
+ * reads are one forward stream per run, the writes land in the range's own
+ * stretch of the output, and no bit is set by two tasks. */
 typedef struct {
     const void*     cd;
     uint8_t         attrs;
@@ -8346,7 +8369,88 @@ typedef struct {
     uint8_t         nattrs;
     int64_t*        nnd;
     atomic_int      bad;
+    /* the run form: run q is rows [rs[q], rs[q + 1]) */
+    const int64_t*  rs;
+    int64_t         nruns, nwords, wtasks;
+    /* run detection: the descents each chunk found */
+    int64_t         du, chunks, desc_cap;
+    int64_t*        desc;
+    int64_t*        desc_n;
+    atomic_int      overflow;
 } dkv_order_ctx_t;
+
+#define DKV_RUN_MAX    4096   /* most runs the range merge takes */
+#define DKV_RUN_CHUNKS 64
+#define DKV_RUN_DESC   (DKV_RUN_MAX / 8)   /* a chunk's descents kept */
+
+static void dkv_runs_detect_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkv_order_ctx_t* c = (dkv_order_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t lo = c->du / c->chunks * t;
+        int64_t hi = t + 1 == c->chunks ? c->du : c->du / c->chunks * (t + 1);
+        int64_t* d = c->desc + t * c->desc_cap;
+        int64_t n = 0;
+        int64_t prev = lo > 0 ? ray_read_sym(c->cd, lo - 1, RAY_SYM, c->attrs) : -1;
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t cur = ray_read_sym(c->cd, i, RAY_SYM, c->attrs);
+            if (cur < 0 || cur >= c->dom_count) atomic_store_explicit(&c->bad, 1, memory_order_relaxed);
+            if (cur <= prev && i > 0) {
+                if (n == c->desc_cap) { atomic_store_explicit(&c->overflow, 1, memory_order_relaxed); break; }
+                d[n++] = i;
+            }
+            prev = cur;
+        }
+        c->desc_n[t] = n;
+    }
+}
+
+/* The first row of [lo, hi) whose position is at least `target`. */
+static int64_t dkv_run_lower(const dkv_order_ctx_t* c, int64_t lo, int64_t hi, int64_t target) {
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (ray_read_sym(c->cd, mid, RAY_SYM, c->attrs) < target) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static void dkv_order_mark_runs_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkv_order_ctx_t* c = (dkv_order_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t w0 = c->nwords / c->wtasks * t;
+        int64_t w1 = t + 1 == c->wtasks ? c->nwords : c->nwords / c->wtasks * (t + 1);
+        for (int64_t q = 0; q < c->nruns; q++) {
+            int64_t i = dkv_run_lower(c, c->rs[q], c->rs[q + 1], w0 * 64);
+            for (; i < c->rs[q + 1]; i++) {
+                int64_t pos = ray_read_sym(c->cd, i, RAY_SYM, c->attrs);
+                if (pos >= w1 * 64) break;
+                c->bits[pos >> 6] |= (uint64_t)1 << (pos & 63);
+            }
+        }
+    }
+}
+
+static void dkv_order_scatter_runs_fn(void* vctx, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    dkv_order_ctx_t* c = (dkv_order_ctx_t*)vctx;
+    for (int64_t t = t0; t < t1; t++) {
+        int64_t w0 = c->nwords / c->wtasks * t;
+        int64_t w1 = t + 1 == c->wtasks ? c->nwords : c->nwords / c->wtasks * (t + 1);
+        for (int64_t q = 0; q < c->nruns; q++) {
+            int64_t i = dkv_run_lower(c, c->rs[q], c->rs[q + 1], w0 * 64);
+            for (; i < c->rs[q + 1]; i++) {
+                int64_t pos = ray_read_sym(c->cd, i, RAY_SYM, c->attrs);
+                if (pos >= w1 * 64) break;
+                int64_t w = pos >> 6;
+                int64_t r = c->wrank[w] + __builtin_popcountll(c->bits[w] & (((uint64_t)1 << (pos & 63)) - 1));
+                ray_write_sym(c->ncd, r, (uint64_t)pos, RAY_SYM, c->nattrs);
+                c->nnd[r] = c->hnd[i];
+            }
+        }
+    }
+}
 
 static void dkv_order_mark_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
@@ -8379,33 +8483,85 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     ray_t* Hn = tbl_col_idx_or_null(H, 1);
     int64_t du = ray_table_nrows(H);
     if (!Hc || !Hn || dom_count <= 0 || du <= 1) return NULL;
-    /* A dense grouping emits its groups ascending by code already: keep H
-     * rather than hold a second copy of it. */
-    {
-        const void* cd = ray_data(Hc);
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD);
+    dkv_order_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.cd = ray_data(Hc); c.attrs = Hc->attrs; c.dom_count = dom_count;
+    atomic_store_explicit(&c.bad, 0, memory_order_relaxed);
+    atomic_store_explicit(&c.overflow, 0, memory_order_relaxed);
+    /* The ascending runs of H.  A dense grouping that emits ascending by code
+     * is one run: keep H rather than hold a second copy of it. */
+    ray_t *rh = NULL, *dh = NULL, *dnh = NULL;
+    int64_t* rs = NULL;
+    if (par) {
+        c.du = du;
+        c.chunks = du / 4096 < DKV_RUN_CHUNKS ? (du / 4096 > 0 ? du / 4096 : 1) : DKV_RUN_CHUNKS;
+        c.desc_cap = DKV_RUN_DESC;
+        c.desc = (int64_t*)scratch_alloc(&dh, (size_t)c.chunks * (size_t)c.desc_cap * sizeof(int64_t));
+        c.desc_n = (int64_t*)scratch_alloc(&dnh, (size_t)c.chunks * sizeof(int64_t));
+        if (c.desc && c.desc_n) {
+            agg_route_note_vocab_order();
+            ray_pool_dispatch_n(pool, dkv_runs_detect_fn, &c, (uint32_t)c.chunks);
+            /* the pool skips the tickets of a cancelled query: the lengths
+             * of the chunks it skipped were never written.  H is kept as
+             * it is; the cancel is answered by the enclosing select. */
+            if (pool_cancelled(pool) || atomic_load_explicit(&c.bad, memory_order_relaxed)) {
+                scratch_free(dh); scratch_free(dnh);
+                return NULL;
+            }
+            int64_t total = 1;
+            for (int64_t t = 0; t < c.chunks; t++) total += c.desc_n[t];
+            if (total == 1 && !atomic_load_explicit(&c.overflow, memory_order_relaxed)) {
+                scratch_free(dh); scratch_free(dnh);
+                return NULL;
+            }
+            if (!atomic_load_explicit(&c.overflow, memory_order_relaxed) && total <= DKV_RUN_MAX) {
+                rs = (int64_t*)scratch_alloc(&rh, (size_t)(total + 1) * sizeof(int64_t));
+                if (rs) {
+                    int64_t k = 0;
+                    rs[k++] = 0;
+                    for (int64_t t = 0; t < c.chunks; t++)
+                        for (int64_t j = 0; j < c.desc_n[t]; j++) rs[k++] = c.desc[t * c.desc_cap + j];
+                    rs[k] = du;
+                    c.rs = rs; c.nruns = total;
+                }
+            }
+        }
+        scratch_free(dh); scratch_free(dnh);
+    }
+    if (!c.rs) {
+        const void* cd = c.cd;
         int64_t prev = ray_read_sym(cd, 0, RAY_SYM, Hc->attrs), i = 1;
         for (; i < du; i++) {
             int64_t cur = ray_read_sym(cd, i, RAY_SYM, Hc->attrs);
             if (cur <= prev) break;
             prev = cur;
         }
-        if (i == du) return NULL;
+        if (i == du) { scratch_free(rh); return NULL; }
     }
     int64_t nw = (dom_count + 63) / 64;
-    ray_t *bh = NULL, *rh = NULL;
+    ray_t *bh = NULL, *wh = NULL;
     uint64_t* bits  = (uint64_t*)scratch_calloc(&bh, (size_t)nw * sizeof(uint64_t));
-    int64_t*  wrank = (int64_t*)scratch_alloc(&rh, (size_t)nw * sizeof(int64_t));
-    if (!bits || !wrank) { scratch_free(bh); scratch_free(rh); return NULL; }
-    dkv_order_ctx_t c;
-    memset(&c, 0, sizeof(c));
-    c.cd = ray_data(Hc); c.attrs = Hc->attrs; c.dom_count = dom_count;
+    int64_t*  wrank = (int64_t*)scratch_alloc(&wh, (size_t)nw * sizeof(int64_t));
+    if (!bits || !wrank) { scratch_free(bh); scratch_free(wh); scratch_free(rh); return NULL; }
     c.bits = bits; c.wrank = wrank;
-    atomic_store_explicit(&c.bad, 0, memory_order_relaxed);
-    ray_pool_t* pool = ray_pool_get();
-    bool par = ray_pool_par_dispatch_ok(pool, du, RAY_PARALLEL_THRESHOLD);
-    if (par) ray_pool_dispatch(pool, dkv_order_mark_fn, &c, du);
-    else     dkv_order_mark_fn(&c, 0, 0, du);
-    if (atomic_load_explicit(&c.bad, memory_order_relaxed)) { scratch_free(bh); scratch_free(rh); return NULL; }
+    c.nwords = nw;
+    c.wtasks = nw < 4096 ? 1 : (int64_t)ray_pool_total_workers(pool) * 8;
+    if (c.wtasks > RAY_POOL_INIT_TASKS) c.wtasks = RAY_POOL_INIT_TASKS;
+    if (c.wtasks > nw) c.wtasks = nw;
+    if (c.rs) {
+        if (par && c.wtasks > 1) ray_pool_dispatch_n(pool, dkv_order_mark_runs_fn, &c, (uint32_t)c.wtasks);
+        else dkv_order_mark_runs_fn(&c, 0, 0, c.wtasks);
+    } else if (par) {
+        ray_pool_dispatch(pool, dkv_order_mark_fn, &c, du);
+    } else {
+        dkv_order_mark_fn(&c, 0, 0, du);
+    }
+    if (pool_cancelled(pool) || atomic_load_explicit(&c.bad, memory_order_relaxed)) {
+        scratch_free(bh); scratch_free(wh); scratch_free(rh);
+        return NULL;
+    }
     int64_t run = 0;
     for (int64_t w = 0; w < nw; w++) {
         wrank[w] = run;
@@ -8416,7 +8572,7 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     if (!nc || RAY_IS_ERR(nc) || !nn || RAY_IS_ERR(nn)) {
         if (nc && !RAY_IS_ERR(nc)) ray_release(nc);
         if (nn && !RAY_IS_ERR(nn)) ray_release(nn);
-        scratch_free(bh); scratch_free(rh);
+        scratch_free(bh); scratch_free(wh); scratch_free(rh);
         return NULL;
     }
     ray_sym_vec_adopt_domain(nc, Hc);
@@ -8425,10 +8581,20 @@ static ray_t* dkv_order_by_position(ray_t* H, int64_t dom_count) {
     c.nattrs = nc->attrs;
     c.nnd = (int64_t*)ray_data(nn);
     c.hnd = (const int64_t*)ray_data(Hn);
-    if (par) ray_pool_dispatch(pool, dkv_order_scatter_fn, &c, du);
-    else     dkv_order_scatter_fn(&c, 0, 0, du);
+    if (c.rs) {
+        if (c.wtasks > 1) ray_pool_dispatch_n(pool, dkv_order_scatter_runs_fn, &c, (uint32_t)c.wtasks);
+        else dkv_order_scatter_runs_fn(&c, 0, 0, c.wtasks);
+    } else if (par) {
+        ray_pool_dispatch(pool, dkv_order_scatter_fn, &c, du);
+    } else {
+        dkv_order_scatter_fn(&c, 0, 0, du);
+    }
+    scratch_free(bh); scratch_free(wh); scratch_free(rh);
+    if (pool_cancelled(pool)) {               /* rows of skipped tasks unwritten */
+        ray_release(nc); ray_release(nn);
+        return NULL;
+    }
     if (Hc->attrs & RAY_ATTR_HAS_NULLS) nc->attrs |= RAY_ATTR_HAS_NULLS;
-    scratch_free(bh); scratch_free(rh);
     ray_t* out = ray_table_new(2);
     if (!out || RAY_IS_ERR(out)) { ray_release(nc); ray_release(nn); return NULL; }
     out = ray_table_add_col(out, ray_table_col_name(H, 0), nc);
@@ -8791,6 +8957,7 @@ static bool dk2_grow(dk2_t* c, bool par) {
         if (staged && (staged >= DK2_STAGE_BYTES || p == DKH_NPART - 1)) {
             if (par) ray_pool_dispatch_n(pool, dk2_move_fn, c, DKH_NPART);
             else     dk2_move_fn(c, 0, 0, DKH_NPART);
+            if (pool_cancelled(pool)) { ok = false; break; }   /* nothing moved: keep the old tables */
             for (int q = 0; q <= p; q++) {
                 dk2_part_t* Q = &c->part[q];
                 if (!Q->nt) continue;
@@ -8806,7 +8973,7 @@ static bool dk2_grow(dk2_t* c, bool par) {
         if (P->nt) { scratch_free(P->nhdr); P->nt = NULL; P->ncap = 0; P->nhdr = NULL; }
         P->full = 0;
     }
-    return ok && !ray_interrupted();
+    return ok && !pool_cancelled(pool);
 }
 
 /* pass B table: slot of a hash's low 32 bits */
@@ -8988,6 +9155,7 @@ static bool dk2_select(dk2_t* c, int64_t lo, int64_t n, int64_t nt_max, ray_t** 
     c->nt = nt;
     if (nt > 1) ray_pool_dispatch_n(pool, dk2_mark_fn, c, (uint32_t)nt);
     else        dk2_mark_fn(c, 0, 0, 1);
+    if (pool_cancelled(pool)) return false;
     int64_t run = 0;
     for (int64_t t = 0; t < nt; t++) { int64_t k = c->tcnt[t]; c->tcnt[t] = run; run += k; }
     c->m = run;
@@ -8996,6 +9164,7 @@ static bool dk2_select(dk2_t* c, int64_t lo, int64_t n, int64_t nt_max, ray_t** 
     atomic_store_explicit(&c->n_none, 0, memory_order_relaxed);
     if (nt > 1) ray_pool_dispatch_n(pool, dk2_compact_fn, c, (uint32_t)nt);
     else        dk2_compact_fn(c, 0, 0, 1);
+    if (pool_cancelled(pool)) return false;
     int64_t np = atomic_load_explicit(&c->n_none, memory_order_relaxed);
     if (np == 0) return true;
     /* the values without a slice: their keys again, then into place */
@@ -9100,7 +9269,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
 
     /* pass A: rows by hash */
     for (int64_t lo = 0; lo < du; lo += chunk) {
-        if (ray_interrupted()) goto done;
+        if (pool_cancelled(pool)) goto done;
         int64_t n = du - lo < chunk ? du - lo : chunk;
         c->lo = lo; c->n = n;
         bool par = ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD);
@@ -9115,6 +9284,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
         c->nt = nt;
         if (nt > 1) ray_pool_dispatch_n(pool, dk2_count_fn, c, (uint32_t)nt);
         else        dk2_count_fn(c, 0, 0, 1);
+        if (pool_cancelled(pool)) { if (kc) ray_release(kc); kc = NULL; goto done; }
         int64_t run = 0;
         for (int p = 0; p < DKH_NPART; p++) {
             dk2_part_t* P = &c->part[p];
@@ -9129,11 +9299,12 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
         if (nt > 1) ray_pool_dispatch_n(pool, dk2_scatter_fn, c, (uint32_t)nt);
         else        dk2_scatter_fn(c, 0, 0, 1);
         if (kc) { ray_release(kc); kc = NULL; }   /* the slices are taken: hashes only from here */
+        if (pool_cancelled(pool)) goto done;
         bool ok = dk2_grow(c, par);
         while (ok) {
             if (par) ray_pool_dispatch_n(pool, dk2_group_fn, c, DKH_NPART);
             else     dk2_group_fn(c, 0, 0, DKH_NPART);
-            if (ray_interrupted()) { ok = false; break; }
+            if (pool_cancelled(pool)) { ok = false; break; }
             bool pending = false;
             for (int p = 0; p < DKH_NPART; p++) if (c->part[p].cur < c->part[p].end) pending = true;
             if (!pending) break;
@@ -9201,7 +9372,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
         /* the values under a candidate's low 32 bits, on the workers */
         c->mode = 0;
         for (int64_t lo = 0; lo < du; lo += chunk) {
-            if (ray_interrupted()) goto done;
+            if (pool_cancelled(pool)) goto done;
             int64_t n = du - lo < chunk ? du - lo : chunk;
             if (!dk2_select(c, lo, n, nt_max, &kc, &khdr)) goto done;
             if (c->m > 0) {
@@ -9212,6 +9383,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
             }
             if (kc) { ray_release(kc); kc = NULL; }
             scratch_free(khdr); khdr = NULL;
+            if (pool_cancelled(pool)) goto done;
         }
         for (int64_t g = 0; g < NC; g++)
             for (int64_t t = 0; t < c->nacc; t++) dk2_acc_merge(c->zp, &c->grp[g].a, &c->acc[t * NC + g]);
@@ -9223,7 +9395,7 @@ static ray_t* dk2_run(ray_t* by_expr, int64_t col, ray_t* Hc, ray_t* Hn, bool pa
         if (atomic_load_explicit(&c->n_unres, memory_order_relaxed) > 0) {
             c->mode = 1;
             for (int64_t lo = 0; lo < du; lo += chunk) {
-                if (ray_interrupted()) goto done;
+                if (pool_cancelled(pool)) goto done;
                 int64_t n = du - lo < chunk ? du - lo : chunk;
                 if (!dk2_select(c, lo, n, nt_max, &kc, &khdr)) goto done;
                 for (int64_t j = 0; j < c->m; j++) {
@@ -9722,6 +9894,9 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel
     if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
     if (key_dom) {
         ray_release(dom_vec);
+    } else if (pool_cancelled(rpool)) {       /* refused for the cancel: no recomputation */
+        ray_release(dom_vec); scratch_free(pos_hdr);
+        return NULL;
     } else {
         ray_t* mini = ray_table_new(0);
         if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
@@ -9754,6 +9929,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel
         else          dk_spread_fn(&rc, 0, 0, nrows);
         scratch_free(pos_hdr);
         ray_release(key_dom);
+        if (pool_cancelled(rpool)) { ray_release(spread); return NULL; }
     } else {
         /* Any other key vector (the one-shot SYM evaluation's width, or a
          * non-SYM result): index by slot and gather. */
@@ -9764,6 +9940,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel
         if (rows_par) ray_pool_dispatch(rpool, dk_spread_fn, &rc, nrows);
         else          dk_spread_fn(&rc, 0, 0, nrows);
         scratch_free(pos_hdr);
+        if (pool_cancelled(rpool)) { ray_release(ids); ray_release(key_dom); return NULL; }
         spread = ray_at_fn(key_dom, ids);
         ray_release(ids);
         ray_release(key_dom);
@@ -21195,6 +21372,13 @@ by_dict_done:
             } else if (dom_key) {
                 key_ops[0] = ray_const_vec(g, dom_key);
                 ray_release(dom_key);
+            } else if (pool_cancelled(ray_pool_get())) {
+                /* the per-symbol evaluation refused for the cancel: the
+                 * row-wise key is not compiled in its place (a cancel
+                 * from an earlier query is cleared at its boundary, so
+                 * one seen here is this query's) */
+                if (!g->compile_err) g->compile_err = ray_error("cancel", NULL);
+                key_ops[0] = NULL;
             } else {
                 key_ops[0] = compile_expr_dag(g, by_expr);
             }
@@ -21636,6 +21820,7 @@ by_dict_done:
                     ray_env_push_query_scope();
                     computed_key = bind_referenced_columns(filtered_tbl, &by_expr, 1);
                     if (!computed_key) computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
+                    if (!computed_key && pool_cancelled(ray_pool_get())) computed_key = ray_error("cancel", NULL);
                     if (!computed_key) computed_key = ray_eval(by_expr);
                     if (computed_key && !RAY_IS_ERR(computed_key) && ray_is_lazy(computed_key))
                         computed_key = ray_lazy_materialize(computed_key);

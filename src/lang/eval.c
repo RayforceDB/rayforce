@@ -1143,6 +1143,13 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                             if (is_idiv) root->out_type = RAY_I64;
                             ray_t* result = ray_execute(g, root);
                             ray_graph_free(g);
+                            /* a cancelled query stays cancelled: the
+                             * per-element loop below is not its answer */
+                            if (result && RAY_IS_ERR(result)) {
+                                if (strcmp(ray_err_code(result), "cancel") == 0) { ray_release(e0); return result; }
+                                ray_error_free(result);
+                                result = NULL;
+                            }
                             if (result && !RAY_IS_ERR(result)) {
                                 /* Restore temporal type tag if promote() collapsed it */
                                 if (ray_is_vec(result) && result->type != out_type &&
@@ -1450,6 +1457,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         ray_release(e0);
 
         for (int64_t i = 1; i < len; i++) {
+            if ((i & 0xFFFF) == 0 && g_eval_interrupted) { ray_release(vec); return ray_error("cancel", "interrupted"); }
             int la = 0, ra = 0;
             ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
             ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
@@ -1498,6 +1506,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     out[0] = e0;  /* first element already computed */
 
     for (int64_t i = 1; i < len; i++) {
+        if ((i & 0xFFFF) == 0 && g_eval_interrupted) {
+            result->len = i;                 /* the filled prefix only */
+            ray_release(result);
+            return ray_error("cancel", "interrupted");
+        }
         int la = 0, ra = 0;
         ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
         ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;

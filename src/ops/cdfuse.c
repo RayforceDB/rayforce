@@ -62,12 +62,12 @@
 #include "ops/rowsel.h"    /* ray_rowsel_* — the bounded kernel's selection */
 #include "core/platform.h" /* ray_vm_advise_willneed */
 
-/* Peak-footprint estimate used by the admission gate below: 32B/row for
+/* Peak-footprint estimate used by the admission gate below: 24B/row for
  * phase 1's records plus up to 24B per (partition, key) pair in phase 2,
  * itself bounded by the row count — see the KNOWN MEMORY BOUND comment at
- * the phase-3 call site.  56B/row is that worst case (all-distinct input),
+ * the phase-3 call site.  48B/row is that worst case (all-distinct input),
  * both phases' buffers alive simultaneously until cdf_free_all runs. */
-#define CDF_BYTES_PER_ROW 56
+#define CDF_BYTES_PER_ROW 48
 
 /* ══════════════════════════════════════════
  * Shared helpers
@@ -92,7 +92,7 @@ typedef struct {
     uint32_t n, cap;
 } cdf_buf_t;
 
-#define CDF_REC 32 /* [pairhash 8][k 8][v 8][row 8] */
+#define CDF_REC 24 /* [k 8][v 8][row 8]; the pair hash is recomputed by phase 2 */
 
 /* Upper bound on partitions.  Phase 3's merge input is
  * n_parts × distinct-keys-per-partition and pair-hash partitioning lets every
@@ -209,10 +209,9 @@ static void cdf_p1_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
             if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
             uint32_t part = hash & (c->n_parts - 1);
             char* record = my[part].buf + (size_t)my[part].n++ * CDF_REC;
-            ((uint64_t*)record)[0] = hash;
-            ((int64_t*)record)[1] = k;
-            ((int64_t*)record)[2] = v;
-            ((int64_t*)record)[3] = r;
+            ((int64_t*)record)[0] = k;
+            ((int64_t*)record)[1] = v;
+            ((int64_t*)record)[2] = r;
         }
         atomic_fetch_add_explicit(&c->rows_done, limit - begin, memory_order_relaxed);
     }
@@ -326,16 +325,16 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
             cdf_buf_t* b = &c->bufs[(size_t)w * c->n_parts + p];
             const char* rec = b->buf;
             for (uint32_t i = 0; i < b->n; i++, rec += CDF_REC) {
-                uint64_t ph = ((const uint64_t*)rec)[0];
-                int64_t k = ((const int64_t*)rec)[1];
-                int64_t v = ((const int64_t*)rec)[2];
-                int64_t row = ((const int64_t*)rec)[3];
+                int64_t k = ((const int64_t*)rec)[0];
+                int64_t v = ((const int64_t*)rec)[1];
+                int64_t row = ((const int64_t*)rec)[2];
+                uint64_t ph = cdf_pair_hash(k, v);
 
                 /* k table probe for EVERY record: this partition's first_row
                  * must be the MIN over all its rows of the key, not only over
                  * rows that open a fresh (k,v) pair.  The slot index comes
                  * from a hash of k ALONE — recomputed here rather than stored,
-                 * to keep the record at 32B — and that hash never selects a
+                 * to keep the record at 24B — and that hash never selects a
                  * partition, so it needs no bit shift-out. */
                 uint64_t t = cdf_fmix64(ray_hash_i64(k)) & dmask;
                 int64_t gi = 0;
@@ -685,9 +684,9 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
      *
      * KNOWN MEMORY BOUND: peak footprint scales with ROWS, not with groups —
      * phase 2's partial triples (24B per distinct (partition, key) pair, itself
-     * bounded by the row count) coexist with phase 1's 32B-per-row records
+     * bounded by the row count) coexist with phase 1's 24B-per-row records
      * until the cdf_free_all below, so a pathological all-distinct input peaks
-     * near 56B/row.  Cardinality-aware admission (declining when the estimated
+     * near 48B/row.  Cardinality-aware admission (declining when the estimated
      * distinct-pair count would blow a budget) is future work. */
     cdf_merge_t mg[CDF_MERGE_PARTS];
     memset(mg, 0, sizeof(mg));

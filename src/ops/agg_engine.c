@@ -53,6 +53,11 @@ static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
 agg_route_stats_t agg_route_stats(void) { return route_stats; }
 void agg_route_note_key_domain(void) { route_stats.key_domain_evals++; }
+void agg_route_note_vocab_order(void) { route_stats.key_vocab_order++; }
+void agg_route_note_da_lazy(uint64_t skipped_chunks) {
+    route_stats.da_lazy_merges++;
+    route_stats.da_lazy_skipped += skipped_chunks;
+}
 void agg_route_record(agg_route_t route) {
     static const char* const names[AGG_ROUTE_COUNT] = {
         "group: none", "group: legacy", "group: slices", "group: parted",
@@ -3852,6 +3857,9 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
         atomic_init(&c.fail, 0);
         if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_vals_fn, &c, tasks);
         else agg_slots_vals_fn(&c, 0, 0, 1);
+        /* a cancelled dispatch skips tasks: their values and candidates
+         * were never written */
+        if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
         if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
             if (cap > 0) {
                 int64_t nc = 0;
@@ -3863,8 +3871,10 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
             }
             if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_mark_fn, &c, tasks);
             else agg_slots_mark_fn(&c, 0, 0, 1);
-            kept = 0;
-            for (uint32_t t = 0; t < tasks; t++) kept += c.kept[t];
+            if (!agg_cancelled()) {
+                kept = 0;
+                for (uint32_t t = 0; t < tasks; t++) kept += c.kept[t];
+            }
         }
     }
     ray_free_raw(vals); ray_free_raw(cand); ray_free_raw(cand_n);
@@ -4012,6 +4022,9 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
         atomic_init(&c.fail, 0);
         if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
         else agg_lean_fn(&c, 0, 0, 1);
+        /* a cancelled dispatch skips tasks: their counts and candidates
+         * never got written, the selection is refused like a failed one */
+        if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
         if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
             int64_t total = 0, nc = 0;
             for (uint32_t t = 0; t < tasks; t++) {
@@ -4024,6 +4037,7 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
             c.pass = 1;
             if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
             else agg_lean_fn(&c, 0, 0, 1);
+            if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
             if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
                 int64_t n = 0;
                 for (uint32_t t = 0; t < tasks; t++) n += c.kept_n[t];
@@ -4043,6 +4057,89 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
     }
     ray_free_raw(cand); ray_free_raw(all); ray_free_raw(meta); ray_free_raw(kept);
     return result;
+}
+
+/* The occupancy bitmap of a first-row array: bit s is set when slot s holds a
+ * group (first[s] != INT64_MAX).  Word ranges, one task each. */
+typedef struct {
+    const int64_t* first;
+    uint64_t*      occ;
+    int64_t        slots, words;
+    uint32_t       tasks;
+} agg_occ_first_ctx_t;
+
+static void agg_occ_first_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_occ_first_ctx_t* c = raw;
+    for (int64_t t = start; t < end; t++) {
+        int64_t w0 = c->words / c->tasks * t;
+        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        for (int64_t w = w0; w < w1; w++) {
+            int64_t base = w * 64;
+            int64_t n = c->slots - base < 64 ? c->slots - base : 64;
+            uint64_t b = 0;
+            for (int64_t i = 0; i < n; i++) b |= (uint64_t)(c->first[base + i] != INT64_MAX) << i;
+            c->occ[w] = b;
+        }
+    }
+}
+
+/* The occupied slots of a bitmap in ascending order: tasks count the set bits
+ * of their word ranges, a prefix places them, and each task writes its
+ * range's slots at its place.  1 when out holds them, 0 when the counts do
+ * not add up to ng (the caller collects serially), -1 when the query was
+ * cancelled under a dispatch: the pool skips the tickets of a cancelled
+ * query, so the counts, or out, were never written. */
+typedef struct {
+    const uint64_t* occ;
+    int64_t*        out;
+    int64_t*        at;        /* [tasks + 1]: counts, then first positions */
+    int64_t         words;
+    uint32_t        tasks;
+    int             pass;      /* 0: count, 1: write */
+} agg_occ_collect_ctx_t;
+
+static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_occ_collect_ctx_t* c = raw;
+    for (int64_t t = start; t < end; t++) {
+        int64_t w0 = c->words / c->tasks * t;
+        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        if (c->pass == 0) {
+            int64_t n = 0;
+            for (int64_t w = w0; w < w1; w++) n += __builtin_popcountll(c->occ[w]);
+            c->at[t] = n;
+        } else {
+            int64_t j = c->at[t];
+            for (int64_t w = w0; w < w1; w++)
+                for (uint64_t b = c->occ[w]; b; b &= b - 1) c->out[j++] = w * 64 + __builtin_ctzll(b);
+        }
+    }
+}
+
+static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots, int64_t ng, int64_t* out) {
+    int64_t words = (slots + 63) / 64;
+    uint32_t tasks = ray_pool_par_dispatch_ok(pool, slots, RAY_PARALLEL_THRESHOLD)
+                   ? ray_pool_total_workers(pool) * 4 : 1;
+    if ((int64_t)tasks > words) tasks = (uint32_t)(words > 0 ? words : 1);
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    int64_t* at = ray_alloc_raw(((size_t)tasks + 1) * sizeof(int64_t));
+    if (!at) return 0;
+    agg_occ_collect_ctx_t c = { .occ = occ, .out = out, .at = at, .words = words, .tasks = tasks, .pass = 0 };
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_collect_fn, &c, tasks);
+    else agg_occ_collect_fn(&c, 0, 0, 1);
+    if (agg_cancelled()) { ray_free_raw(at); return -1; }
+    int64_t run = 0;
+    for (uint32_t t = 0; t < tasks; t++) { int64_t n = at[t]; at[t] = run; run += n; }
+    int ok = run == ng;
+    if (ok) {
+        c.pass = 1;
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_collect_fn, &c, tasks);
+        else agg_occ_collect_fn(&c, 0, 0, 1);
+        if (agg_cancelled()) ok = -1;
+    }
+    ray_free_raw(at);
+    return ok;
 }
 
 /* Shared output stage. Takes ownership of states/first/occ (occ: a bitmap of
@@ -4067,6 +4164,35 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     int64_t ng = 0;
     int64_t* occupied_slot = NULL;
     int64_t* first_row_ordered = NULL;
+    /* A first-row array of a key-planned output (the keys are rebuilt from
+     * the slots, the array only says which are occupied): its occupancy as
+     * a bitmap, so the selection and the collection below walk the words on
+     * the workers instead of the slots in one thread. */
+    if (!occ && gfirst && key_plan && group_limit <= 0 && total_slots > 0) {
+        int64_t words = (total_slots + 63) / 64;
+        uint64_t* ob = ray_alloc_raw((size_t)words * sizeof(uint64_t));
+        if (ob) {
+            uint32_t tasks = ray_pool_par_dispatch_ok(pool, total_slots, RAY_PARALLEL_THRESHOLD)
+                           ? ray_pool_total_workers(pool) * 4 : 1;
+            if ((int64_t)tasks > words) tasks = (uint32_t)words;
+            if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+            agg_occ_first_ctx_t oc = { .first = gfirst, .occ = ob, .slots = total_slots,
+                                       .words = words, .tasks = tasks };
+            if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_first_fn, &oc, tasks);
+            else agg_occ_first_fn(&oc, 0, 0, 1);
+            /* the tickets of a cancelled query are skipped: ob's words
+             * were never written */
+            if (agg_cancelled()) {
+                ray_free_raw(ob);
+                agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+                ray_free_raw(gstates); ray_free_raw(gfirst);
+                return ray_error("cancel", NULL);
+            }
+            ray_free_raw(gfirst);
+            gfirst = NULL;
+            occ = ob;
+        }
+    }
     /* A slab with an occupancy bitmap under a top-N filter keeps only the
      * groups the filter keeps (agg_dense_lean_select): no entry per group. */
     if (occ && ef && key_plan && group_limit <= 0) {
@@ -4103,7 +4229,15 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
-    { int64_t i = 0;
+    int collected = occ && !first_row_ordered ? agg_occ_collect(pool, occ, total_slots, ng, occupied_slot) : 0;
+    if (collected < 0) {
+        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
+        agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+        ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+        return ray_error("cancel", NULL);
+    }
+    if (!collected) {
+      int64_t i = 0;
       for (int64_t s = 0; s < total_slots; s++)
           if (occ ? (occ[s >> 6] >> (s & 63)) & 1 : gfirst[s] != INT64_MAX) {
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
