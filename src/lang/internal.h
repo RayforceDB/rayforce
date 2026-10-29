@@ -784,6 +784,7 @@ void ray_group_topk_stats_for_test(int64_t out[10]);
 ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);
 ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled);
+bool   ray_select_form_whole(ray_t* expr);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);
 ray_t* ray_upsert_fn(ray_t** args, int64_t n);

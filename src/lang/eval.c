@@ -356,8 +356,9 @@ static bool expr_rebinds_nothing(ray_t* e, int depth) {
 
 /* The count of (take x n) when it is known before x is evaluated: n an
  * integer literal, or a name bound to an integer atom that evaluating x
- * cannot rebind (expr_rebinds_nothing), above zero.  An owned atom, else
- * NULL (x first, then n, as any call). */
+ * cannot rebind (expr_rebinds_nothing), above zero.  A dotted name that no
+ * binding or container path answers is a method call, so it is not read
+ * here.  An owned atom, else NULL (x first, then n, as any call). */
 static ray_t* take_count_arg(ray_t* e, ray_t* x) {
     if (!e) return NULL;
     ray_t* v = NULL;
@@ -365,6 +366,7 @@ static ray_t* take_count_arg(ray_t* e, ray_t* x) {
         v = e;
         ray_retain(v);
     } else if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        if (ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64)) return NULL;
         if (!expr_rebinds_nothing(x, 0)) return NULL;
         v = ray_eval(e);
         if (!v) return NULL;
@@ -5135,10 +5137,11 @@ ray_t* ray_eval(ray_t* obj) {
                 rows = inherits ? g_eval_rows : 0;
                 goto out;
             }
-            if (fn == (ray_binary_fn)ray_take_fn) {
+            if (fn == (ray_binary_fn)ray_take_fn && ray_select_form_whole(elems[1])) {
                 /* (take (select ...) n), n > 0 a literal or a name the
                  * select cannot rebind: the select's first n rows alone; a select of fewer rows is
-                 * its whole result, which take then repeats as for any table */
+                 * its whole result, which take then repeats as for any table.  The shape is
+                 * checked first, so no other take reads its count early. */
                 ray_t* nv = take_count_arg(elems[2], elems[1]);
                 int handled = 0;
                 ray_t* top = nv ? ray_try_select_head_expr(elems[1], as_i64(nv), &handled) : NULL;

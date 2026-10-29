@@ -1277,3 +1277,16 @@ Ctg -- 1
 (set tr_d (dict ['t] (list TR)))
 (set tr_n 2)
 (at (take (select {from: tr_d.t where: (> a 10)}) tr_n) 'a) -- [20 30]
+;; the count itself a method call: it runs once, after the select, as for
+;; any take
+(set tr_hits 0)
+(set tr_cnt (parse "(do (set tr_hits (+ tr_hits 1)) 2)"))
+(count (take (select {from: TR}) tr_cnt.eval)) -- 2
+tr_hits -- 1
+(count (take [1 2 3] tr_cnt.eval)) -- 2
+tr_hits -- 2
+;; ...so a count that rebinds the select's table does so after the select
+(set tr_src TR)
+(set tr_swap (parse "(do (set tr_src (take TR 1)) 2)"))
+(at (take (select {from: tr_src}) tr_swap.eval) 'a) -- [10 20]
+(count tr_src) -- 1

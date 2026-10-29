@@ -13578,6 +13578,13 @@ static ray_t* select_form_dict(ray_t* expr) {
     return dict && dict->type == RAY_DICT ? dict : NULL;
 }
 
+/* Whether `expr` is a call of the select builtin with a from: (the shape
+ * the take shortcut below may answer), read off the form alone. */
+bool ray_select_form_whole(ray_t* expr) {
+    ray_t* dict = select_form_dict(expr);
+    return dict && dict_get(dict, "from");
+}
+
 /* The first n > 0 rows of `expr`, a select of whole rows (no output
  * columns, no by:, take: or nearest:), for (take (select ...) n) and
  * (first (select ...)): the select runs with take: n, which keeps the rows
