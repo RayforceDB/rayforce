@@ -1265,3 +1265,15 @@ Ctg -- 1
 (count (take (select {from: (do (map (first tr_fns) (list (parse "(set tr_n 2)"))) TR)}) tr_n)) -- 2
 (set tr_n 2)
 (at (take (select {from: TR where: (> a 10)}) tr_n) 'a) -- [20 30]
+;; an unquoted dotted name that nothing answers is a method call on the
+;; container (tr_payload.eval evaluates the parsed form), so the count is
+;; read after it, as on the plain path
+(set tr_payload (parse "(do (set tr_n 2) TR)"))
+(set tr_n 1)
+(list (count (take (select {from: tr_payload.eval}) tr_n)) tr_n) -- [2 2]
+(set tr_n 1)
+(list (count (take (do (select {from: tr_payload.eval})) tr_n)) tr_n) -- [2 2]
+;; a dotted path into a container is a read and keeps the early count
+(set tr_d (dict ['t] (list TR)))
+(set tr_n 2)
+(at (take (select {from: tr_d.t where: (> a 10)}) tr_n) 'a) -- [20 30]

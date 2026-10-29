@@ -322,7 +322,15 @@ static bool expr_rebinds_nothing(ray_t* e, int depth) {
             if (!expr_rebinds_nothing(vv[i], depth + 1)) return false;
         return true;
     }
-    if (e->type != RAY_LIST) return true;                /* a name or a literal */
+    if (e->type != RAY_LIST) {                           /* a name or a literal */
+        /* A dotted name that no binding or container path answers is
+         * resolved by the evaluator as a method call on the container
+         * (`x.eval` runs eval over x), so it may run anything: decline it.
+         * ray_env_get probes bindings and containers only, never a method. */
+        if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED) &&
+            ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64)) return false;
+        return true;
+    }
     int64_t n = ray_len(e);
     if (n == 0) return true;
     ray_t** el = (ray_t**)ray_data(e);
