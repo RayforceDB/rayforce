@@ -734,8 +734,8 @@ static test_result_t test_load_col_path_too_long(void) {
     const char* dir = ray_test_tmp("/tmp/rft_ln");
     rm_rf(dir);
 
-    /* Build a column name that is 1017 chars: dir (11) + "/" (1) + name (1017)
-     * = 1029 >= 1024 triggers the range check. */
+    /* This name plus the isolated scratch prefix exceeds the 1024-byte
+     * column-path limit, independently of the chosen TMPDIR length. */
     char long_name[1018];
     memset(long_name, 'c', sizeof(long_name) - 1);
     long_name[sizeof(long_name) - 1] = '\0';
@@ -761,8 +761,7 @@ static test_result_t test_load_col_path_too_long(void) {
     fake_schema = ray_str_vec_append(fake_schema, long_name, sizeof(long_name) - 1);
     TEST_ASSERT_FALSE(RAY_IS_ERR(fake_schema));
 
-    char d_path[64];
-    snprintf(d_path, sizeof(d_path), "%s/.d", dir);
+    const char* d_path = ray_test_tmp("/tmp/rft_ln/.d");
     ray_err_t ds_err = ray_col_save(fake_schema, d_path);
     TEST_ASSERT_EQ_I(ds_err, RAY_OK);
 

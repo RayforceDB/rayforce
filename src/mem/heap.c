@@ -1749,14 +1749,14 @@ static void direct_cache_release(ray_direct_cache_node_t* node) {
 
 /* Best fitting cached block within the existing waste bound. Exact matches
  * stop the search; similar-sized analytical scratch is the common case. */
-static void* direct_cache_take(size_t need, size_t* out_size, bool* out_locked) {
+static void* direct_cache_take(size_t need, size_t maximum, size_t* out_size, bool* out_locked) {
     direct_cache_lock();
     size_t slack = need / 4;
     if (slack < (2u << 20)) slack = (2u << 20);
     ray_direct_cache_node_t* best = NULL;
     for (ray_direct_cache_node_t* node = g_direct_cache_head; node; node = node->next) {
         size_t bytes = node->map_size;
-        if (bytes >= need && bytes - need <= slack && (!best || bytes < best->map_size)) {
+        if (bytes >= need && bytes <= maximum && bytes - need <= slack && (!best || bytes < best->map_size)) {
             best = node;
             if (bytes == need) break;
         }
@@ -1865,7 +1865,7 @@ static int64_t direct_cache_bytes(void) {
 
 /* Direct large allocation: mmap the exact page-rounded size instead of a
  * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
-static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
+static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cache) {
     if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return NULL;
     size_t map_size = (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095;
 
@@ -1878,7 +1878,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
      * committed totals while cached), no kernel page-zeroing on fault. */
     size_t cached_size = 0;
     bool locked = false;
-    base = direct_cache_take(map_size, &cached_size, &locked);
+    base = direct_cache_take(map_size, exact_cache ? map_size : SIZE_MAX, &cached_size, &locked);
     if (base) {
         map_size = cached_size;
         /* Unlocked while cached (ray_heap_unlock_idle): back in service it
@@ -1933,6 +1933,33 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     return v;
 }
 
+bool ray_alloc_charge(size_t data_size, size_t* charge) {
+    if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return false;
+    uint8_t order = ray_order_for_size(data_size);
+    *charge = order >= RAY_HEAP_POOL_ORDER
+        ? (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095
+        : BSIZEOF(order);
+    return true;
+}
+
+ray_t* ray_alloc_admitted(size_t data_size, size_t limit, size_t* charge) {
+    size_t bytes;
+    if (!ray_alloc_charge(data_size, &bytes) || bytes > limit) return NULL;
+    ray_t* value;
+    if (ray_order_for_size(data_size) < RAY_HEAP_POOL_ORDER) {
+        value = ray_alloc(data_size);
+    } else {
+        /* No buddy fallback: its different charge was not admitted. */
+        ray_heap_t* h = ray_tl_heap;
+        if (!h) { ray_heap_init(); h = ray_tl_heap; }
+        if (!h) return NULL;
+        value = heap_alloc_direct(h, data_size, true);
+        if (value) mem_trace_note_alloc(bytes);
+    }
+    if (value) *charge = bytes;
+    return value;
+}
+
 ray_t* ray_alloc(size_t data_size) {
     ray_heap_t* h = ray_tl_heap;
     if (RAY_UNLIKELY(!h)) {
@@ -1950,7 +1977,7 @@ ray_t* ray_alloc(size_t data_size) {
      * mmap failure, fall through to the buddy pool only when the buddy model
      * can still represent the request. */
     if (RAY_UNLIKELY(order >= RAY_HEAP_POOL_ORDER)) {
-        ray_t* v = heap_alloc_direct(h, data_size);
+        ray_t* v = heap_alloc_direct(h, data_size, false);
         if (v) {
             ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)((char*)v - RAY_DIRECT_HDR);
             mem_trace_note_alloc(hdr->map_size);
