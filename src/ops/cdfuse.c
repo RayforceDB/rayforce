@@ -264,6 +264,69 @@ typedef struct {
     _Atomic(int64_t) done;
 } cdf_p2_ctx_t;
 
+/* The partition-local tables of phase 2 start at CDF_TAB_MIN slots (or at
+ * the 2 x record bound when that is smaller) and double at half load, up to
+ * that bound.  The records bound the pairs and the groups, but a partition
+ * commonly holds far fewer distinct pairs than records, and a table sized
+ * to the records was a sentinel fill of 2 x 4 bytes per record for nothing.
+ * Half load, not less: doubling earlier made the tables and their
+ * re-placing cost more than the probes it saved. */
+#define CDF_TAB_MIN 1024
+
+/* (k,v) dedupe table: 16 B key slot + int32 occupancy (an in-band sentinel is
+ * unsafe: every int64 is a valid value). */
+static bool cdf_pairs_alloc(ray_t** hdr, int64_t** dkv, int32_t** docc, uint64_t cap) {
+    int64_t* t = (int64_t*)scratch_alloc(hdr, (size_t)cap * 2 * sizeof(int64_t) + (size_t)cap * 4);
+    if (!t) return false;
+    *dkv = t;
+    *docc = (int32_t*)(t + (size_t)cap * 2);
+    memset(*docc, 0xFF, (size_t)cap * 4);
+    return true;
+}
+
+/* Double the (k,v) table, re-placing every pair by its hash. */
+static bool cdf_pairs_grow(ray_t** hdr, int64_t** dkv, int32_t** docc, uint64_t* cap,
+                           uint32_t part_bits) {
+    uint64_t ncap = *cap * 2, nmask = ncap - 1;
+    ray_t* nh = NULL; int64_t* nkv = NULL; int32_t* nocc = NULL;
+    if (!cdf_pairs_alloc(&nh, &nkv, &nocc, ncap)) return false;
+    for (uint64_t s = 0; s < *cap; s++) {
+        if ((*docc)[s] == -1) continue;
+        int64_t k = (*dkv)[s * 2], v = (*dkv)[s * 2 + 1];
+        uint64_t t = (cdf_pair_hash(k, v) >> part_bits) & nmask;
+        while (nocc[t] != -1) t = (t + 1) & nmask;
+        nkv[t * 2] = k; nkv[t * 2 + 1] = v; nocc[t] = 1;
+    }
+    scratch_free(*hdr);
+    *hdr = nh; *dkv = nkv; *docc = nocc; *cap = ncap;
+    return true;
+}
+
+/* k table: slots of (k, group index), both written on first insert. */
+static bool cdf_keys_alloc(ray_t** hdr, int64_t** kk, int32_t** kidx, uint64_t cap) {
+    int64_t* t = (int64_t*)scratch_alloc(hdr, (size_t)cap * sizeof(int64_t) + (size_t)cap * 4);
+    if (!t) return false;
+    *kk = t;
+    *kidx = (int32_t*)(t + cap);
+    memset(*kidx, 0xFF, (size_t)cap * 4);
+    return true;
+}
+
+static bool cdf_keys_grow(ray_t** hdr, int64_t** kk, int32_t** kidx, uint64_t* cap) {
+    uint64_t ncap = *cap * 2, nmask = ncap - 1;
+    ray_t* nh = NULL; int64_t* nk = NULL; int32_t* nidx = NULL;
+    if (!cdf_keys_alloc(&nh, &nk, &nidx, ncap)) return false;
+    for (uint64_t s = 0; s < *cap; s++) {
+        if ((*kidx)[s] == -1) continue;
+        uint64_t t = cdf_fmix64(ray_hash_i64((*kk)[s])) & nmask;
+        while (nidx[t] != -1) t = (t + 1) & nmask;
+        nk[t] = (*kk)[s]; nidx[t] = (*kidx)[s];
+    }
+    scratch_free(*hdr);
+    *hdr = nh; *kk = nk; *kidx = nidx; *cap = ncap;
+    return true;
+}
+
 static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     cdf_p2_ctx_t* c = (cdf_p2_ctx_t*)vctx;
@@ -278,37 +341,23 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
             continue;
         }
 
-        /* Both partition-local tables are sized to 2× the record count:
-         * groups and distinct (k,v) pairs are each bounded by the record
-         * count, so load stays ≤ 0.5 and linear probing always finds an
-         * empty slot. */
-        uint64_t dcap = 8;
-        while (dcap < (uint64_t)total * 2) dcap <<= 1;
-        uint64_t dmask = dcap - 1;
-
-        /* (k,v) dedupe table: 16B key slot + int32 occupancy (an in-band
-         * sentinel is unsafe — every int64 is a valid value). */
-        ray_t* dh_hdr = NULL;
-        int64_t* dkv = (int64_t*)scratch_alloc(
-            &dh_hdr, (size_t)dcap * 2 * sizeof(int64_t) + (size_t)dcap * 4);
-        if (!dkv) {
-            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
-            return;
-        }
-        int32_t* docc = (int32_t*)(dkv + (size_t)dcap * 2);
-        memset(docc, 0xFF, (size_t)dcap * 4);
-
-        /* k table: slots of (k, group index), both written on first insert. */
-        ray_t* kh_hdr = NULL;
-        int64_t* kk = (int64_t*)scratch_alloc(
-            &kh_hdr, (size_t)dcap * sizeof(int64_t) + (size_t)dcap * 4);
-        if (!kk) {
+        /* Both tables start small and double at half load up to the 2 x
+         * record bound (cdf_pairs_grow, cdf_keys_grow), so linear probing
+         * always finds an empty slot. */
+        uint64_t full = 8;
+        while (full < (uint64_t)total * 2) full <<= 1;
+        uint64_t dcap = full < CDF_TAB_MIN ? full : CDF_TAB_MIN;
+        uint64_t kcap = dcap;
+        ray_t* dh_hdr = NULL; int64_t* dkv = NULL; int32_t* docc = NULL;
+        ray_t* kh_hdr = NULL; int64_t* kk = NULL; int32_t* kidx = NULL;
+        if (!cdf_pairs_alloc(&dh_hdr, &dkv, &docc, dcap) ||
+            !cdf_keys_alloc(&kh_hdr, &kk, &kidx, kcap)) {
             scratch_free(dh_hdr);
+            scratch_free(kh_hdr);
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             return;
         }
-        int32_t* kidx = (int32_t*)(kk + dcap);
-        memset(kidx, 0xFF, (size_t)dcap * 4);
+        int64_t npairs = 0;
 
         int64_t cap = total < 256 ? total : 256;
         cdf_grp_t* grps = (cdf_grp_t*)ray_alloc_raw((size_t)cap * sizeof(cdf_grp_t));
@@ -336,7 +385,10 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
                  * from a hash of k ALONE — recomputed here rather than stored,
                  * to keep the record at 24B — and that hash never selects a
                  * partition, so it needs no bit shift-out. */
-                uint64_t t = cdf_fmix64(ray_hash_i64(k)) & dmask;
+                if ((uint64_t)(ng + 1) * 2 > kcap && kcap < full &&
+                    !cdf_keys_grow(&kh_hdr, &kk, &kidx, &kcap)) { failed = 1; break; }
+                uint64_t kmask = kcap - 1;
+                uint64_t t = cdf_fmix64(ray_hash_i64(k)) & kmask;
                 int64_t gi = 0;
                 for (;;) {
                     if (kidx[t] == -1) {
@@ -370,18 +422,22 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
                         if (row < grps[gi].first) grps[gi].first = row;
                         break;
                     }
-                    t = (t + 1) & dmask;
+                    t = (t + 1) & kmask;
                 }
                 if (failed) break;
 
                 /* Dedupe on the pair hash already in the record; slot bits
                  * above the partition bits. */
+                if ((uint64_t)(npairs + 1) * 2 > dcap && dcap < full &&
+                    !cdf_pairs_grow(&dh_hdr, &dkv, &docc, &dcap, c->part_bits)) { failed = 1; break; }
+                uint64_t dmask = dcap - 1;
                 uint64_t s = (ph >> c->part_bits) & dmask;
                 for (;;) {
                     if (docc[s] == -1) {
                         dkv[s * 2] = k;
                         dkv[s * 2 + 1] = v;
                         docc[s] = 1;
+                        npairs++;
                         grps[gi].cnt++;
                         break;
                     }
