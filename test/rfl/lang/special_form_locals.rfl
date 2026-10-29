@@ -58,3 +58,37 @@ alter_shadow -- [5 5]
 ;; trap handler runs with a balanced scope stack, and the local slots
 ;; are still intact afterwards
 ((fn [x] (try (and x (undefined-name-xyz)) (fn [e] 0)) x) 6) -- 6
+
+;; count of a select inside a lambda runs dynamically as a whole, so it is
+;; counted off the selection as at top level: params, let-locals, a table
+;; passed in and a closure's capture all resolve in its where
+(set ctbl (table [k v] (list [1 2 3 4 5 6] [10 20 30 40 50 60])))
+((fn [n] (count (select {from: ctbl where: (> v n)}))) 25) -- 4
+((fn [] (let lo 15) (let hi 45) (count (select {from: ctbl where: (and (> v lo) (< v hi))})))) -- 3
+((fn [t n] (count (select {from: t where: (== k n)}))) ctbl 3) -- 1
+((fn [t] (count (select {from: t}))) ctbl) -- 6
+(((fn [n] (fn [m] (count (select {from: ctbl where: (and (> v n) (< v m))})))) 10) 60) -- 4
+((fn [n] (count (select {from: ctbl where: (> nosuchcol n)}))) 1) !- schema
+;; a local or a global named select that is not the special form is called
+((fn [select t] (count (select {from: t}))) (fn [d] [1 2 3]) ctbl) -- 3
+;; take and first of a select in a compiled body: the frame's locals reach
+;; the select and the count, a local select is called
+((fn [t n] (at (take (select {from: t where: (> v 10) desc: v}) n) 'v)) ctbl 2) -- (at (take (select {from: ctbl where: (> v 10) desc: v}) 2) 'v)
+((fn [t] (at (first (select {from: t desc: v})) 'v)) ctbl) -- (max (at ctbl 'v))
+((fn [t] (let k 3) (count (take (select {from: t asc: v}) k))) ctbl) -- 3
+((fn [t] (count (take (select {from: t where: (> v 1000)}) 2))) ctbl) -- 2
+((fn [select t] (first (select {from: t}))) (fn [d] [7 8]) ctbl) -- 7
+((fn [select t] (take (select {from: t}) 1)) (fn [d] [7 8]) ctbl) -- [7]
+;; (last in the file: the global select stays rebound)
+(set cnt_rebound (fn [n] (count (select {from: ctbl where: (> v n)}))))
+(cnt_rebound 25) -- 4
+(set select (fn [d] [1 2]))
+(cnt_rebound 25) -- 2
+((fn [n] (count (select {from: ctbl where: (> v n)}))) 25) -- 2
+(count (select {from: ctbl where: (> v 25)})) -- 2
+;; select rebound to another special form: the form it names now runs
+(set select quote)
+(first (select {from: ctbl})) !- type
+(take (select {from: ctbl}) 2) -- (take (quote {from: ctbl}) 2)
+(count (select {from: ctbl})) -- 1
+((fn [] (count (select {from: ctbl})))) -- 1
