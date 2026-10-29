@@ -1103,6 +1103,10 @@ uint32_t ray_pool_size(void) {
     return pool_default_workers() + 1;
 }
 
+ray_pool_t* ray_pool_live(void) {
+    return atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2 ? &g_pool : NULL;
+}
+
 ray_pool_t* ray_pool_get(void) {
     uint32_t state = atomic_load_explicit(&g_pool_init_state, memory_order_acquire);
     if (state == 2) return &g_pool;

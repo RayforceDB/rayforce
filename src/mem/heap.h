@@ -358,7 +358,9 @@ typedef struct {
     int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
     int    locked;        /* locked against swap-out (heap_lock) */
     char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
-    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*)];
+    int    fresh;         /* mapped for this allocation (its pages read as zero),
+                             not taken from the reuse cache */
+    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 3 * sizeof(int) - sizeof(char*)];
 } ray_direct_hdr_t;
 _Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
 

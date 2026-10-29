@@ -354,6 +354,10 @@ int64_t  ray_vec_get_sym_id(ray_t* vec, int64_t idx);
 /* ===== Memory Allocator API ===== */
 
 ray_t*    ray_alloc(size_t data_size);
+/* ray_alloc whose data bytes read as zero.  A block mapped for this call is
+ * zero already and is handed out as is; any other block is zeroed, a large
+ * one across the pool's threads when the caller is outside a dispatch. */
+ray_t*    ray_alloc_zeroed(size_t data_size);
 /* NOTE: ray_free supports cross-thread free via foreign_blocks list.
  * Blocks freed from a non-owning thread are deferred and coalesced
  * when the owning heap flushes foreign blocks. */
