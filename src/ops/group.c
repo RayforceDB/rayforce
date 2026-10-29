@@ -1144,6 +1144,44 @@ static int64_t cd_seq_count(int8_t in_type, uint8_t in_attrs,
     return count;
 }
 
+/* The dense SYM count over the pool: workers set a bit per code of the
+ * column's domain (a word is or-ed only when its bit is still clear, so a
+ * code costs one locked or at most per worker), then the bits are counted. */
+typedef struct {
+    const void*        base;
+    uint8_t            esz;
+    uint32_t           nsyms;
+    _Atomic(uint64_t)* bits;
+    _Atomic(int)       bad;      /* a code outside the domain */
+} cd_sym_bits_ctx_t;
+
+static void cd_sym_bits_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    cd_sym_bits_ctx_t* c = (cd_sym_bits_ctx_t*)raw;
+    const uint32_t nsyms = c->nsyms;
+    _Atomic(uint64_t)* bits = c->bits;
+#define CD_SYM_BITS_LOOP(T) do {                                                     \
+        const T* ids = (const T*)c->base;                                            \
+        for (int64_t i = start; i < end; i++) {                                      \
+            uint64_t id = (uint64_t)ids[i];                                          \
+            if (RAY_UNLIKELY(id >= nsyms)) {                                         \
+                atomic_store_explicit(&c->bad, 1, memory_order_relaxed);             \
+                return;                                                              \
+            }                                                                        \
+            uint64_t b = (uint64_t)1 << (id & 63);                                   \
+            if (!(atomic_load_explicit(&bits[id >> 6], memory_order_relaxed) & b))   \
+                atomic_fetch_or_explicit(&bits[id >> 6], b, memory_order_relaxed);   \
+        }                                                                            \
+    } while (0)
+    switch (c->esz) {
+    case 1:  CD_SYM_BITS_LOOP(uint8_t);  break;
+    case 2:  CD_SYM_BITS_LOOP(uint16_t); break;
+    case 4:  CD_SYM_BITS_LOOP(uint32_t); break;
+    default: CD_SYM_BITS_LOOP(uint64_t); break;
+    }
+#undef CD_SYM_BITS_LOOP
+}
+
 static int64_t cd_sym_dense_count(ray_t* input) {
     /* Cell ids are positions in the COLUMN's domain — size seen[] by that
      * domain's count, not the global intern count (a FILE-domain position
@@ -1154,14 +1192,30 @@ static int64_t cd_sym_dense_count(ray_t* input) {
     uint32_t nsyms = (dom_n > 0 && dom_n <= UINT32_MAX) ? (uint32_t)dom_n : 0;
     if (nsyms == 0) return dom_n == 0 ? 0 : -2;
 
-    ray_t* seen_hdr = NULL;
-    uint8_t* seen = (uint8_t*)scratch_calloc(&seen_hdr, (size_t)nsyms);
-    if (!seen) return -1;
-
     const void* base = ray_data(input);
     int64_t distinct = 0;
     int64_t len = input->len;
     uint8_t esz = ray_sym_elem_size(input->type, input->attrs);
+
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD)) {
+        size_t words = ((size_t)nsyms + 63) / 64;
+        ray_t* bits_hdr = NULL;
+        _Atomic(uint64_t)* bits = (_Atomic(uint64_t)*)scratch_calloc(&bits_hdr, words * sizeof(uint64_t));
+        if (!bits) return -1;
+        cd_sym_bits_ctx_t c = { .base = base, .esz = esz, .nsyms = nsyms, .bits = bits, .bad = 0 };
+        ray_pool_dispatch(pool, cd_sym_bits_fn, &c, len);
+        if (pool_cancelled(pool)) { scratch_free(bits_hdr); return -3; }   /* tasks were skipped */
+        if (atomic_load_explicit(&c.bad, memory_order_relaxed)) { scratch_free(bits_hdr); return -2; }
+        for (size_t w = 0; w < words; w++)
+            distinct += __builtin_popcountll(atomic_load_explicit(&bits[w], memory_order_relaxed));
+        scratch_free(bits_hdr);
+        return distinct;
+    }
+
+    ray_t* seen_hdr = NULL;
+    uint8_t* seen = (uint8_t*)scratch_calloc(&seen_hdr, (size_t)nsyms);
+    if (!seen) return -1;
 
 #define CD_SYM_DENSE_LOOP(T) do {                                      \
         const T* ids = (const T*)base;                                  \
@@ -1264,6 +1318,7 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         int64_t cnt = cd_sym_dense_count(input);
         if (cnt >= 0) return ray_i64(cnt);
         if (cnt == -1) return ray_error("oom", NULL);
+        if (cnt == -3) return ray_error("cancel", NULL);
     }
 
     /* Small-input fast path: per-row dispatch overhead would dwarf the
