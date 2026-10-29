@@ -123,6 +123,8 @@ enum {
     OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
     OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
                        * of that kind, OP_CALLF's general call otherwise */
+    OP_TRAPV,         /* OP_TRAP for a handler that is a plain value: the
+                       * trap pushes no error value, which it never reads */
     OP__COUNT
 };
 
@@ -191,6 +193,7 @@ typedef struct {
     int32_t  scope_depth; /* env scope depth at trap point — an error inside
                            * an OP_SCOPE_BEGIN..END window must unwind the
                            * materialized frame(s) before the handler runs */
+    bool     value;     /* armed by OP_TRAPV: push no error value */
 } vm_trap_t;
 
 #define VM_TRAP_SIZE 16
@@ -445,6 +448,7 @@ bool   ray_times_binding(ray_t* ast, int64_t* name, ray_t** count);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
+bool   ray_try_handler_is_value(ray_t* handler_expr);
 
 
 bool ray_eval_query_helper_active(void);

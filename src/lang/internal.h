@@ -749,6 +749,10 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range);
 /* Query bridge builtins (formerly in eval.c, now in ops/query.c) */
 ray_t* ray_select_fn(ray_t** args, int64_t n);
 #ifdef DEBUG
+/* What a `try` handler receives for an engine error with this code and
+ * message (lang/eval.c try_error_value): the {code msg} dict, or null
+ * when it cannot be built. */
+ray_t* ray_try_error_value_for_test(const char* code, const char* msg);
 /* Chunk length of the per-distinct-symbol key evaluation over a FILE
  * domain (ops/query.c derived_key_str_chunks); 0 restores the default. */
 void ray_derived_key_chunk_set_for_test(int64_t rows);

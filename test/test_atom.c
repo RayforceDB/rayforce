@@ -539,6 +539,54 @@ static test_result_t test_atom_typed_null_timestamp(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+/* ---- An exhausted heap: an oom error, nothing left allocated ----------- */
+
+static ray_t* oom_str_empty(void) { return ray_str("", 0); }
+static ray_t* oom_str_short(void) { return ray_str("abc", 3); }
+static ray_t* oom_str_long(void)  { return ray_str("cannot add i64 and sym", 22); }
+static ray_t* oom_sym(void)       { return ray_sym(ray_sym_intern("oom_atom", 8)); }
+
+static size_t atom_heap_bytes(void) {
+    ray_mem_stats_t s;
+    ray_mem_stats(&s);
+    return s.bytes_allocated;
+}
+
+/* Each allocation a constructor makes fails in turn: a string of up to 6
+ * bytes and a symbol make one (the header), a longer string two (its
+ * bytes, then the header).  Failed alone, the oom error the constructor
+ * returns is a block of its own; failed with the error's allocation too,
+ * it is the static RAY_OOM_OBJ.  Either way it is an error, not NULL, and
+ * nothing is left allocated. */
+static test_result_t test_atom_oom(void) {
+    static const struct { ray_t* (*make)(void); int64_t allocs; } cases[] = {
+        { oom_str_empty, 1 }, { oom_str_short, 1 }, { oom_str_long, 2 }, { oom_sym, 1 },
+    };
+    ray_sym_intern("oom_atom", 8);   /* interned before anything is failed */
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int64_t nth = 1; nth <= cases[i].allocs; nth++) {
+            for (int64_t count = 1; count <= 2; count++) {
+                size_t before = atom_heap_bytes();
+                ray_alloc_fail_set_for_test(nth, count);
+                ray_t* v = cases[i].make();
+                ray_alloc_fail_set_for_test(0, 0);
+                TEST_ASSERT_TRUE(RAY_IS_ERR(v));
+                TEST_ASSERT_STR_EQ(ray_err_code(v), "oom");
+                TEST_ASSERT_TRUE(count == 1 ? v != RAY_OOM_OBJ : v == RAY_OOM_OBJ);
+                ray_error_free(v);
+                TEST_ASSERT_EQ_U(atom_heap_bytes(), before);
+            }
+        }
+        /* Armed one past the last allocation: the atom is built. */
+        ray_alloc_fail_set_for_test(cases[i].allocs + 1, 1);
+        ray_t* v = cases[i].make();
+        ray_alloc_fail_set_for_test(0, 0);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        ray_release(v);
+    }
+    PASS();
+}
+
 const test_entry_t atom_entries[] = {
     { "atom/bool", test_atom_bool, atom_setup, atom_teardown },
     { "atom/u8", test_atom_u8, atom_setup, atom_teardown },
@@ -550,6 +598,7 @@ const test_entry_t atom_entries[] = {
     { "atom/str_sso", test_atom_str_sso, atom_setup, atom_teardown },
     { "atom/str_long", test_atom_str_long, atom_setup, atom_teardown },
     { "atom/sym", test_atom_sym, atom_setup, atom_teardown },
+    { "atom/oom", test_atom_oom, atom_setup, atom_teardown },
     { "atom/date", test_atom_date, atom_setup, atom_teardown },
     { "atom/time", test_atom_time, atom_setup, atom_teardown },
     { "atom/timestamp", test_atom_timestamp, atom_setup, atom_teardown },

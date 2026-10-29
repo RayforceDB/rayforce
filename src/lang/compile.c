@@ -556,19 +556,27 @@ static void compile_sf_fn(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
     emit(c, OP_SCOPE_END);
 }
 
-/* (try body handler) — compile to OP_TRAP/OP_TRAP_END */
+/* (try body handler) — compile to OP_TRAP/OP_TRAP_END.  A handler that
+ * is a plain value (ray_try_handler_is_value) gets OP_TRAPV, whose trap
+ * pushes no error value: the handler code is the value alone. */
 static void compile_sf_try(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n) {
+    bool value = ray_try_handler_is_value(elems[2]);
     /* Reserve a hidden local for err_val */
-    int32_t err_slot = add_local(c, -1);
-    if (err_slot < 0) { c->error = true; return; }
+    int32_t err_slot = value ? -1 : add_local(c, -1);
+    if (!value && err_slot < 0) { c->error = true; return; }
 
-    int32_t trap_pos = emit_jump(c, OP_TRAP);
+    int32_t trap_pos = emit_jump(c, value ? OP_TRAPV : OP_TRAP);
     c->trap_depth++;
     compile_expr(c, elems[1]);       /* body */
     c->trap_depth--;
     emit(c, OP_TRAP_END);
     int32_t jmp_pos = emit_jump(c, OP_JMP);
     patch_jump(c, trap_pos);         /* handler starts here */
+    if (value) {
+        compile_expr(c, elems[2]);   /* the fallback value */
+        patch_jump(c, jmp_pos);
+        return;
+    }
     /* err_val is on stack (pushed by vm_error_cleanup).
      * Stash it, compile handler fn, reload err_val, call. */
     emit(c, OP_STOREENV);

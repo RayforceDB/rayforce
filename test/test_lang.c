@@ -6917,6 +6917,104 @@ static test_result_t test_eval_try_raise_value(void) {
     PASS();
 }
 
+/* --- try: the {code msg} dict when its allocations fail --- */
+static size_t lang_heap_bytes(void) {
+    ray_mem_stats_t s;
+    ray_mem_stats(&s);
+    return s.bytes_allocated;
+}
+
+/* What a handler gets for an engine error, built with each of its
+ * allocations failed in turn: the message (one block, or two from 7 bytes
+ * on), the code symbol, the keys, the values and the dict.  Failed alone,
+ * the constructor's oom error is a block of its own; failed with the
+ * error's allocation too, it is the static RAY_OOM_OBJ.  Either way the
+ * handler gets null and nothing is left allocated. */
+static test_result_t test_eval_try_error_value_oom(void) {
+    static const char* msgs[] = { "", "abc", "1234567", "cannot add i64 and sym" };
+    for (size_t i = 0; i < sizeof(msgs) / sizeof(msgs[0]); i++) {
+        ray_t* d = ray_try_error_value_for_test("type", msgs[i]);   /* interns */
+        ray_release(d);
+        ray_mem_stats_t s0, s1;
+        ray_mem_stats(&s0);
+        d = ray_try_error_value_for_test("type", msgs[i]);
+        ray_mem_stats(&s1);
+        int64_t allocs = (int64_t)(s1.alloc_count - s0.alloc_count);
+        TEST_ASSERT_EQ_I(allocs, strlen(msgs[i]) < 7 ? 5 : 6);
+        TEST_ASSERT_EQ_I(d->type, RAY_DICT);
+        ray_t** vals = (ray_t**)ray_data(ray_dict_vals(d));
+        TEST_ASSERT_EQ_I(vals[0]->type, -RAY_SYM);
+        TEST_ASSERT_EQ_I(vals[0]->i64, ray_sym_intern("type", 4));
+        TEST_ASSERT_EQ_I(vals[1]->type, -RAY_STR);
+        TEST_ASSERT_EQ_U(ray_str_len(vals[1]), strlen(msgs[i]));
+        TEST_ASSERT_MEM_EQ(strlen(msgs[i]), ray_str_ptr(vals[1]), msgs[i]);
+        ray_release(d);
+        for (int64_t nth = 1; nth <= allocs; nth++) {
+            for (int64_t count = 1; count <= 2; count++) {
+                size_t before = lang_heap_bytes();
+                ray_alloc_fail_set_for_test(nth, count);
+                ray_t* v = ray_try_error_value_for_test("type", msgs[i]);
+                ray_alloc_fail_set_for_test(0, 0);
+                TEST_ASSERT_EQ_PTR(v, RAY_NULL_OBJ);
+                TEST_ASSERT_EQ_U(lang_heap_bytes(), before);
+            }
+        }
+    }
+    PASS();
+}
+
+/* Blocks allocated evaluating `ast` once more (the first run compiles a
+ * lambda it calls and interns its names). */
+static int64_t lang_eval_allocs(ray_t* ast) {
+    ray_t* r = ray_eval(ast);
+    if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+    ray_mem_stats_t s0, s1;
+    ray_mem_stats(&s0);
+    r = ray_eval(ast);
+    ray_mem_stats(&s1);
+    if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+    return (int64_t)(s1.alloc_count - s0.alloc_count);
+}
+
+/* A handler that is a plain value never reads the error value, so a try
+ * with one builds none: an engine error caught by it costs what a raise
+ * caught by it does, at the top level and compiled.  A name holding the
+ * same value is no plain value, and its try builds the dict. */
+static test_result_t test_eval_try_value_handler_builds_nothing(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set hzero 0)"
+        "    (set fv (fn [] (try (+ 1 'a) 0)))"
+        "    (set fr (fn [] (try (raise 1) 0)))"
+        "    (set fh (fn [] (try (+ 1 'a) hzero))))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* src[] = {
+        "(try (+ 1 'a) 0)", "(try (raise 1) 0)", "(try (+ 1 'a) hzero)",
+        "(fv)", "(fr)", "(fh)",
+    };
+    int64_t n[6];
+    for (int i = 0; i < 6; i++) {
+        ray_t* r = ray_eval_str(src[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, 0);
+        ray_release(r);
+        ray_t* ast = ray_parse(src[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        n[i] = lang_eval_allocs(ast);
+        ray_release(ast);
+    }
+    TEST_ASSERT_FMT(n[0] == n[1], "top level: engine error %lld blocks, raise %lld",
+                    (long long)n[0], (long long)n[1]);
+    TEST_ASSERT_FMT(n[3] == n[4], "compiled: engine error %lld blocks, raise %lld",
+                    (long long)n[3], (long long)n[4]);
+    TEST_ASSERT_FMT(n[2] >= n[0] + 5, "top level: a name handler %lld blocks, a value %lld",
+                    (long long)n[2], (long long)n[0]);
+    TEST_ASSERT_FMT(n[5] >= n[3] + 5, "compiled: a name handler %lld blocks, a value %lld",
+                    (long long)n[5], (long long)n[3]);
+    PASS();
+}
+
 /* --- dotted table col not found error --- */
 static test_result_t test_eval_dotted_table_not_found(void) {
     ASSERT_ER("(do (set tbl99 (table ['a] (list [1 2 3]))) tbl99.notacol)", "name");
@@ -11352,6 +11450,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/and_or_forms", test_eval_and_or_forms, lang_setup, lang_teardown },
     { "lang/eval/get_error_trace", test_eval_get_error_trace, lang_setup, lang_teardown },
     { "lang/eval/try_raise_value", test_eval_try_raise_value, lang_setup, lang_teardown },
+    { "lang/eval/try_error_value_oom", test_eval_try_error_value_oom, lang_setup, lang_teardown },
+    { "lang/eval/try_value_handler_builds_nothing", test_eval_try_value_handler_builds_nothing, lang_setup, lang_teardown },
     { "lang/eval/dotted_table_not_found", test_eval_dotted_table_not_found, lang_setup, lang_teardown },
     { "lang/eval/value_fn_table", test_eval_value_fn_table, lang_setup, lang_teardown },
     { "lang/eval/value_fn_error", test_eval_value_fn_error, lang_setup, lang_teardown },
