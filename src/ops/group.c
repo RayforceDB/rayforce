@@ -1201,7 +1201,7 @@ static int64_t cd_sym_dense_count(ray_t* input) {
     if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD)) {
         size_t words = ((size_t)nsyms + 63) / 64;
         ray_t* bits_hdr = NULL;
-        _Atomic(uint64_t)* bits = (_Atomic(uint64_t)*)scratch_calloc(&bits_hdr, words * sizeof(uint64_t));
+        _Atomic(uint64_t)* bits = scratch_calloc(&bits_hdr, words * sizeof(uint64_t));   /* void*: no cast */
         if (!bits) return -1;
         cd_sym_bits_ctx_t c = { .base = base, .esz = esz, .nsyms = nsyms, .bits = bits, .bad = 0 };
         ray_pool_dispatch(pool, cd_sym_bits_fn, &c, len);
