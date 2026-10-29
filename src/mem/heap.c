@@ -1933,13 +1933,18 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     return v;
 }
 
-/* Test hook (ray_heap_test_scribble): fresh blocks filled with 0xA5. */
+/* Test hook (ray_heap_test_scribble): fresh blocks filled with 0xA5.
+ * Test/debug objects only: a release ray_alloc carries no trace of it. */
+#ifdef DEBUG
 static _Atomic(bool) g_heap_test_scribble;
 void ray_heap_test_scribble(bool on) { atomic_store_explicit(&g_heap_test_scribble, on, memory_order_relaxed); }
 static inline void heap_test_scribble(ray_t* v, size_t data_size) {
     if (RAY_UNLIKELY(atomic_load_explicit(&g_heap_test_scribble, memory_order_relaxed)) && v && data_size)
         memset(ray_data(v), 0xA5, data_size);
 }
+#else
+static inline void heap_test_scribble(ray_t* v, size_t data_size) { (void)v; (void)data_size; }
+#endif
 
 ray_t* ray_alloc(size_t data_size) {
     ray_heap_t* h = ray_tl_heap;

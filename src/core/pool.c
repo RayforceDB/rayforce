@@ -27,7 +27,9 @@
 #include "mem/cow.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
+#ifdef DEBUG
 #include "rayforce.h"       /* ray_request_interrupt: the cancel-at test hook */
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -794,7 +796,9 @@ void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_
 /* Test hook (ray_pool_test_cancel_at): the nth dispatch since arming finds
  * the query cancelled before its first round, as a cancel landing between
  * two dispatches leaves it: a cancel request (both flags), or the pool's
- * flag alone; 0 off. */
+ * flag alone; 0 off.  Test/debug objects only: a release dispatch carries
+ * no trace of it. */
+#ifdef DEBUG
 static _Atomic(uint32_t) g_pool_test_cancel_at, g_pool_test_dispatches;
 static _Atomic(bool) g_pool_test_cancel_pool_only;
 void ray_pool_test_cancel_at(uint32_t nth, bool pool_only) {
@@ -811,6 +815,9 @@ static inline void pool_test_cancel_tick(ray_pool_t* pool) {
     else
         ray_request_interrupt();
 }
+#else
+static inline void pool_test_cancel_tick(ray_pool_t* pool) { (void)pool; }
+#endif
 
 /* Tasks one round may take: the ring, or the test hook's smaller cap. */
 static inline uint32_t pool_round_cap(const ray_pool_t* pool) {

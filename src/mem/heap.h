@@ -319,8 +319,11 @@ bool ray_heap_spill_discards(void);
 int64_t ray_heap_spill_discard_count(void);
 /* Test hook (C tests only): every block ray_alloc hands out is filled with
  * 0xA5 first, so a word a task never wrote reads as garbage rather than as
- * what the block's previous user left there.  Disarmed by ray_test_hooks_off. */
+ * what the block's previous user left there.  Disarmed by ray_test_hooks_off.
+ * Compiled only under DEBUG, as the test objects are. */
+#ifdef DEBUG
 void ray_heap_test_scribble(bool on);
+#endif
 
 /* --------------------------------------------------------------------------
  * Constants
