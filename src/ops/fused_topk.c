@@ -89,11 +89,12 @@ void ray_fused_topk_counters_reset(void) { atomic_store(&g_fpk_ran, 0); atomic_s
  * its entry): chunk-slot prunes (per task fragment, so a chunk split
  * across tasks counts once per task: dispatch geometry, not distinct
  * chunks) and pruned morsels. */
-static _Atomic uint64_t g_fpk_pruned_chunks, g_fpk_pruned_vecs;
+static _Atomic uint64_t g_fpk_pruned_chunks, g_fpk_pruned_vecs, g_fpk_seeded;
 void ray_fused_topk_test_pruned(uint64_t* chunks, uint64_t* vectors) {
     *chunks  = atomic_load(&g_fpk_pruned_chunks);
     *vectors = atomic_load(&g_fpk_pruned_vecs);
 }
+uint64_t ray_fused_topk_test_seeded(void) { return atomic_load(&g_fpk_seeded); }
 
 /* Per-range statistics class of a generation-2 first key. */
 enum { FPK_STATS = 0, FPK_ALL_NULL = 1, FPK_NO_STATS = 2 };
@@ -941,6 +942,7 @@ static void fpk_sym_seed_bound(fpk_par_ctx_t* c, const uint8_t* zstat) {
     if (n == k) {
         atomic_store_explicit(&c->bound, h[0], memory_order_relaxed);
         atomic_store_explicit(&c->bound_set, 1, memory_order_release);
+        atomic_store_explicit(&g_fpk_seeded, 1, memory_order_relaxed);
     }
     scratch_free(hh);
 }
@@ -960,6 +962,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     if (n_sort_keys == 0 || n_sort_keys > FPK_MAX_KEYS) return NULL;
     atomic_store(&g_fpk_pruned_chunks, 0);
     atomic_store(&g_fpk_pruned_vecs, 0);
+    atomic_store(&g_fpk_seeded, 0);
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
 

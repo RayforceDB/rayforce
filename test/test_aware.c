@@ -3987,7 +3987,7 @@ static test_result_t test_topk_sym_prefix_prune(void) {
                   "(if (and (>= j 262144) (< j 262194)) (format \" a%\" j) (format \"m%\" (% j 5000))))) (til 400000))) "
                   "(% (* (til 400000) 13) 1000)))", -1);
     static const char* const q[] = {
-        "(select {s: s from: T where: (!= s \"\") asc: s take: 10})",        /* the bound is seeded */
+        "(select {s: s from: T where: (!= s \"\") asc: s take: 10})",        /* 7 chunks: too few to seed */
         "(select {s: s v: v from: T where: (and (!= s \"\") (> v 100)) asc: s take: 10})",
         "(select {s: s from: T where: (!= s \"\") desc: s take: 10})",
         "(select {s: s v: v from: T where: (> v 100) asc: s take: 12})",      /* nulls lead: nothing pruned */
@@ -4000,11 +4000,43 @@ static test_result_t test_topk_sym_prefix_prune(void) {
     aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/sp2/\"))");
     aw_eval_ok(q[0]);
     ray_fused_topk_test_pruned(&pc, &pv);
-    TEST_ASSERT_FMT(pc + pv > 0, "seeded ascending SYM take: %llu chunks, %llu vectors pruned",
+    TEST_ASSERT_FMT(pc + pv > 0, "ascending SYM take: %llu chunks, %llu vectors pruned",
                     (unsigned long long)pc, (unsigned long long)pv);
+    TEST_ASSERT_EQ_I(ray_fused_topk_test_seeded(), 0);         /* one witness a chunk, 7 of 10 */
     aw_eval_ok(q[1]);
     ray_fused_topk_test_pruned(&pc, &pv);
     TEST_ASSERT_FMT(pv > 0, "ascending SYM take under another filter: %llu vectors pruned", (unsigned long long)pv);
+    TEST_ASSERT_EQ_I(ray_fused_topk_test_seeded(), 0);
+    /* A seeded bound: four chunks of "c", "b", "z" and "d" strings (a null
+     * every 9 rows).  A take of 2 has two chunk witnesses: ascending the
+     * seed is chunk 0's minimum, and chunks 2 and 3 lie strictly above it;
+     * descending it is chunk 3's maximum, chunks 0 and 1 strictly below.
+     * Under a second filter no bound is seeded (the witnesses may fail
+     * it), and a take of 5 has too few chunks. */
+    aw_save("ss", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (== 0 (% j 9)) \"\" "
+                  "(format \"%%\" (at [\"c\" \"b\" \"z\" \"d\"] (div j 65536)) (% (* j 7919) 100003)))) (til 262144))) "
+                  "(% (til 262144) 100)))", -1);
+    static const struct { const char* q; uint64_t seeded; } qs[] = {
+        { "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 2})", 1 },
+        { "(select {s: s v: v from: T where: (!= s \"\") desc: s take: 2})", 1 },
+        { "(select {s: s v: v from: T where: (and (!= s \"\") (> v 50)) asc: s take: 2})", 0 },
+        { "(select {s: s v: v from: T where: (and (!= s \"\") (> v 50)) desc: s take: 2})", 0 },
+        { "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 5})", 0 },
+    };
+    for (size_t i = 0; i < sizeof(qs) / sizeof(qs[0]); i++) {
+        AW_SAME("ss", qs[i].q, 0);
+        aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/ss2/\"))");
+        aw_eval_ok(qs[i].q);
+        TEST_ASSERT_FMT(ray_fused_topk_test_seeded() == qs[i].seeded, "%s: seeded %llu, want %llu", qs[i].q,
+                        (unsigned long long)ray_fused_topk_test_seeded(), (unsigned long long)qs[i].seeded);
+        /* the flag is this query's: its select ran the fused top-k (it
+         * resets the flag with the pruning counters) and pruned */
+        if (qs[i].seeded) {
+            ray_fused_topk_test_pruned(&pc, &pv);
+            TEST_ASSERT_FMT(pc + pv > 0, "%s: %llu chunks, %llu vectors pruned", qs[i].q,
+                            (unsigned long long)pc, (unsigned long long)pv);
+        }
+    }
     /* The best strings, " b<j>", one per 4096 rows (in some 70 vectors),
      * all rejected by the second filter: a bound seeded from the vectors'
      * minima would rule out the answer, so none is seeded under it. */
