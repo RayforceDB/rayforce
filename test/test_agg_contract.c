@@ -340,46 +340,99 @@ static test_result_t test_derived_key_per_symbol_route(void) {
 
 
 /* The legacy dense-array grouping seeds the workers' sets lazily and its
- * parallel merge skips the chunks a worker never seeded: sorted keys leave
- * most of a worker's chunks unseeded, scattered keys reach every chunk.
- * agg_route_stats() shows the merge ran (da_lazy_merges) and how many
- * chunks it skipped (da_lazy_skipped); the values match a serial sum. */
+ * parallel merge skips the chunks a worker never seeded.  agg_route_stats()
+ * shows the merge ran (da_lazy_merges) and the (worker, chunk) pairs it
+ * skipped (da_lazy_skipped).  Which worker takes which rows is the pool's
+ * choice, so the skip count is asserted only where the keys decide it:
+ * four values across an 18-chunk range reach at most four chunks of any
+ * worker, so each of the three workers past the first skips at least 14.  The sorted and
+ * scattered groupings of 1103 keys check the merged values. */
 static test_result_t test_dense_array_lazy_merge_route(void) {
+    /* Four workers: within the accumulator budget of every case below (the
+     * budget is rows over cells per worker; past it the grouping partitions
+     * the slots instead and no lazy merge runs), whatever the host's count. */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
     static const char* const setup =
         "(set Gz 1103) "
         "(set iz (til (* 500 Gz))) "
         "(set wz (as 'SYM [\"a\" \"bb\" \"ccc\" \"dddd\" \"eeeee\" \"ffffff\" \"ggggggg\"])) "
-        "(set Tz (table [k kx v nv w] (list (+ 5000 (div iz 500)) (+ 5000 (% (* iz 7919) Gz)) iz (- 0 iz) (at wz (% iz 7)))))";
+        "(set Tz (table [k kx v nv w] (list (+ 5000 (div iz 500)) (+ 5000 (% (* iz 7919) Gz)) iz (- 0 iz) (at wz (% iz 7))))) "
+        "(set is (til 70000)) "
+        "(set Ts (table [k v w] (list (at [5000 5400 5800 6103] (% is 4)) is (at wz (% is 7)))))";
     ray_t* r = ray_eval_str(setup);
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
-    const struct { const char* q; bool skips; } cases[] = {
-        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: k}))", true },
-        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: kx}))", false },
+    const struct { const char* q; const char* chk; } cases[] = {
+        /* sorted: a group's 500 rows are i = 500g..500g+499 */
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: k}))",
+          "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
+          " (+ (if (all (== (at R 's) (+ (* 250000 (- (at R 'k) 5000)) 124750))) 1 0) (if (all (== (at R 'mn) (* 500 (- (at R 'k) 5000)))) 1 0)))"
+          " (+ (if (all (== (at R 'mx) (- 0 (* 500 (- (at R 'k) 5000))))) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))" },
+        /* scattered: a group's rows are one residue class mod 1103, so
+         * its smallest row is below 1103 and its largest 499 classes on */
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mxv: (max v) from: Tz by: kx}))",
+          "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
+          " (+ (if (== (sum (at R 's)) (sum (at Tz 'v))) 1 0) (if (all (< (at R 'mn) 1103)) 1 0)))"
+          " (+ (if (all (== (- (at R 'mxv) (at R 'mn)) 550397)) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))" },
+        /* sparse: group j holds i = 4m + j, m < 17500 */
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) from: Ts by: k}))",
+          "(+ (+ (+ (if (all (== (at R 'k) [5000 5400 5800 6103])) 1 0) (if (all (== (at R 'c) 17500)) 1 0))"
+          " (+ (if (all (== (at R 's) (+ 612465000 (* 17500 [0 1 2 3])))) 1 0) (if (all (== (at R 'mn) [0 1 2 3])) 1 0)))"
+          " (+ (if (== (count R) 4) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Ts 'w)))) 1 0)))" },
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         agg_route_reset();
         ray_t* out = ray_eval_str(cases[c].q);
         TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
         agg_route_stats_t st = agg_route_stats();
-        TEST_ASSERT_EQ_I(st.da_lazy_merges, 1);
-        if (cases[c].skips) TEST_ASSERT_FMT(st.da_lazy_skipped > 0, "case %zu: no chunk skipped", c);
-        else                TEST_ASSERT_EQ_I(st.da_lazy_skipped, 0);
         ray_release(out);
-        /* 1103 groups of 500 rows; over the sorted key a group's sum is
-         * 250000*g + 124750 and its min 500*g; the strlen and v sums over
-         * all groups are the columns' */
-        ray_t* chk = ray_eval_str(c == 0
-            ? "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
-              " (if (all (== (at R 's) (+ (* 250000 (- (at R 'k) 5000)) 124750))) 1 0))"
-              " (+ (if (all (== (at R 'mn) (* 500 (- (at R 'k) 5000)))) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))"
-            : "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
-              " (if (== (sum (at R 's)) (sum (at Tz 'v))) 1 0))"
-              " (+ (if (== (sum (at R 'mn)) (sum (at (select {m: (min v) from: Tz by: kx}) 'm))) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))");
+        TEST_ASSERT_EQ_I(st.da_lazy_merges, 1);
+        if (c == 2)
+            TEST_ASSERT_FMT(st.da_lazy_skipped >= 14u * 3u,
+                            "sparse keys: %llu (worker, chunk) pairs skipped, expected at least 42",
+                            (unsigned long long)st.da_lazy_skipped);
+        ray_t* chk = ray_eval_str(cases[c].chk);
         TEST_ASSERT_NOT_NULL(chk); TEST_ASSERT_FALSE(RAY_IS_ERR(chk));
-        TEST_ASSERT_FMT(chk->type == -RAY_I64 && chk->i64 == 5, "case %zu: %lld of 5 value checks hold", c,
+        TEST_ASSERT_FMT(chk->type == -RAY_I64 && chk->i64 == 6, "case %zu: %lld of 6 value checks hold", c,
                         chk->type == -RAY_I64 ? (long long)chk->i64 : -1LL);
         ray_release(chk);
     }
+    PASS();
+}
+
+/* The distinct count of a plain SYM column above the parallel floor sets
+ * its code bits on the pool: a cancel landing before that dispatch, or
+ * before any earlier one of the query, answers `cancel` (the count's own
+ * check, else the execute boundary) and never a count of the bits some
+ * tasks set; armed past the last dispatch, the count. */
+static test_result_t test_sym_distinct_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* r = ray_eval_str("(set cdc (as 'SYMBOL (map (fn [j] (format \"d%\" (% (* j 7919) 50000))) (til 200000))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const char* q = "(count (distinct cdc))";
+    int cancelled = 0, answered = 0;
+    for (int mode = 0; mode < 2; mode++)
+        for (int k = 1; k <= 8; k++) {
+            ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+            ray_t* got = ray_eval_str(q);
+            ray_pool_test_cancel_at(0, false);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (RAY_IS_ERR(got)) {
+                bool is_cancel = strcmp(ray_err_code(got), "cancel") == 0;
+                ray_error_free(got);
+                TEST_ASSERT_FMT(is_cancel, "mode %d, cancel before dispatch %d: an error other than cancel", mode, k);
+                cancelled++;
+                continue;
+            }
+            TEST_ASSERT_FMT(got->type == -RAY_I64 && got->i64 == 50000,
+                            "mode %d, cancel before dispatch %d: %lld distinct, want 50000", mode, k,
+                            got->type == -RAY_I64 ? (long long)got->i64 : -1LL);
+            ray_release(got);
+            answered++;
+        }
+    TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
     PASS();
 }
 
@@ -4498,6 +4551,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
     { "agg_contract/derived_key_cancel_at_dispatch", test_derived_key_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/dense_array_lazy_merge_route", test_dense_array_lazy_merge_route, contract_setup, contract_teardown },
+    { "agg_contract/sym_distinct_cancel_at_dispatch", test_sym_distinct_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },

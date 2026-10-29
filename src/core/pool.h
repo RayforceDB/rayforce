@@ -289,6 +289,8 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx, uint32_t n
 
 /* Global pool lifecycle (lazy singleton) */
 ray_pool_t* ray_pool_get(void);
+/* The singleton while it is up, else NULL: never creates it. */
+ray_pool_t* ray_pool_live(void);
 /* Threads of the global pool, main included: its size when it exists, else
  * the size a default one would get (nothing is created). */
 uint32_t ray_pool_size(void);

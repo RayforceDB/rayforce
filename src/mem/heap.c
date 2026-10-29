@@ -1878,9 +1878,11 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
      * committed totals while cached), no kernel page-zeroing on fault. */
     size_t cached_size = 0;
     bool locked = false;
+    bool fresh = true;
     base = direct_cache_take(map_size, &cached_size, &locked);
     if (base) {
         map_size = cached_size;
+        fresh = false;
         /* Unlocked while cached (ray_heap_unlock_idle): back in service it
          * is locked again, under the watermark and within the bound. */
         if (!locked && !heap_anon_would_exceed(0)) locked = heap_lock(base, map_size);
@@ -1917,6 +1919,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     hdr->swap_fd   = swap_fd;
     hdr->locked    = locked;
     hdr->swap_path = swap_path;
+    hdr->fresh     = fresh;
 
     ray_t* v = (ray_t*)((char*)base + RAY_DIRECT_HDR);
     memset(v, 0, 32);
@@ -1946,7 +1949,10 @@ static inline void heap_test_scribble(ray_t* v, size_t data_size) {
 static inline void heap_test_scribble(ray_t* v, size_t data_size) { (void)v; (void)data_size; }
 #endif
 
-ray_t* ray_alloc(size_t data_size) {
+/* The allocation behind ray_alloc and ray_alloc_zeroed; *fresh tells whether
+ * the block was mapped for this call (its data reads as zero). */
+static ray_t* heap_alloc_impl(size_t data_size, bool* fresh) {
+    *fresh = false;
     ray_heap_t* h = ray_tl_heap;
     if (RAY_UNLIKELY(!h)) {
         ray_heap_init();
@@ -1967,7 +1973,7 @@ ray_t* ray_alloc(size_t data_size) {
         if (v) {
             ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)((char*)v - RAY_DIRECT_HDR);
             mem_trace_note_alloc(hdr->map_size);
-            heap_test_scribble(v, data_size);
+            *fresh = hdr->fresh != 0;
             return v;
         }
         if (order > RAY_HEAP_MAX_ORDER) return NULL;
@@ -1997,7 +2003,6 @@ ray_t* ray_alloc(size_t data_size) {
             RAY_STAT(h->stats.peak_bytes = h->stats.bytes_allocated > h->stats.peak_bytes
                 ? h->stats.bytes_allocated : h->stats.peak_bytes);
             mem_trace_note_alloc(BSIZEOF(order));
-            heap_test_scribble(v, data_size);
             return v;
         }
     }
@@ -2064,8 +2069,62 @@ ray_t* ray_alloc(size_t data_size) {
 
     mem_trace_note_alloc(BSIZEOF(order));
 
-    heap_test_scribble(blk, data_size);
     return blk;
+}
+
+ray_t* ray_alloc(size_t data_size) {
+    bool fresh;
+    ray_t* v = heap_alloc_impl(data_size, &fresh);
+    if (v) heap_test_scribble(v, data_size);
+    return v;
+}
+
+/* Zeroing a block that is not fresh: across the pool when the block is
+ * large and the caller is outside a dispatch (a serial memset of hundreds
+ * of megabytes is a query's single-threaded stage), else here.  A cancelled
+ * query skips the tasks of a dispatch, so the block is zeroed here then. */
+#define HEAP_PAR_ZERO_MIN   ((size_t)4 << 20)
+#define HEAP_PAR_ZERO_CHUNK ((size_t)1 << 20)
+
+typedef struct { char* p; size_t n; size_t chunk; } heap_zero_ctx_t;
+
+static void heap_zero_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    heap_zero_ctx_t* c = (heap_zero_ctx_t*)raw;
+    for (int64_t t = start; t < end; t++) {
+        size_t off = (size_t)t * c->chunk;
+        if (off >= c->n) break;
+        size_t len = c->n - off < c->chunk ? c->n - off : c->chunk;
+        memset(c->p + off, 0, len);
+    }
+}
+
+static void heap_zero(void* p, size_t n, bool pool_ok) {
+    if (pool_ok && n >= HEAP_PAR_ZERO_MIN) {
+        ray_pool_t* pool = ray_pool_live();
+        if (ray_pool_par_dispatch_ok(pool, 2, 2)) {
+            size_t chunk = n / ((size_t)ray_pool_total_workers(pool) * 2);
+            if (chunk < HEAP_PAR_ZERO_CHUNK) chunk = HEAP_PAR_ZERO_CHUNK;
+            heap_zero_ctx_t c = { .p = (char*)p, .n = n, .chunk = chunk };
+            ray_pool_dispatch_n(pool, heap_zero_fn, &c, (uint32_t)((n + chunk - 1) / chunk));
+            if (!atomic_load_explicit(&pool->cancelled, memory_order_acquire)) return;
+        }
+    }
+    memset(p, 0, n);
+}
+
+ray_t* ray_alloc_zeroed(size_t data_size) {
+    bool fresh;
+    ray_t* v = heap_alloc_impl(data_size, &fresh);
+    if (v && !fresh && data_size) heap_zero(ray_data(v), data_size, false);
+    return v;
+}
+
+ray_t* ray_alloc_zeroed_query(size_t data_size) {
+    bool fresh;
+    ray_t* v = heap_alloc_impl(data_size, &fresh);
+    if (v && !fresh && data_size) heap_zero(ray_data(v), data_size, true);
+    return v;
 }
 
 /* --------------------------------------------------------------------------
@@ -2512,9 +2571,11 @@ void* ray_alloc_raw(size_t n) {
 }
 
 void* ray_calloc_raw(size_t n) {
-    void* p = ray_alloc_raw(n);
-    if (p && n) memset(p, 0, n);
-    return p;
+    ray_t* v = ray_alloc_zeroed(n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->type = RAY_U8;
+    v->len  = (int64_t)n;
+    return ray_data(v);
 }
 
 void ray_free_raw(void* p) {
