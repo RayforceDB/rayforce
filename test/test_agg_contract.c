@@ -400,6 +400,42 @@ static test_result_t test_dense_array_lazy_merge_route(void) {
     PASS();
 }
 
+/* The distinct count of a plain SYM column above the parallel floor sets
+ * its code bits on the pool: a cancel landing before that dispatch, or
+ * before any earlier one of the query, answers `cancel` (the count's own
+ * check, else the execute boundary) and never a count of the bits some
+ * tasks set; armed past the last dispatch, the count. */
+static test_result_t test_sym_distinct_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* r = ray_eval_str("(set cdc (as 'SYMBOL (map (fn [j] (format \"d%\" (% (* j 7919) 50000))) (til 200000))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const char* q = "(count (distinct cdc))";
+    int cancelled = 0, answered = 0;
+    for (int mode = 0; mode < 2; mode++)
+        for (int k = 1; k <= 8; k++) {
+            ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+            ray_t* got = ray_eval_str(q);
+            ray_pool_test_cancel_at(0, false);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (RAY_IS_ERR(got)) {
+                bool is_cancel = strcmp(ray_err_code(got), "cancel") == 0;
+                ray_error_free(got);
+                TEST_ASSERT_FMT(is_cancel, "mode %d, cancel before dispatch %d: an error other than cancel", mode, k);
+                cancelled++;
+                continue;
+            }
+            TEST_ASSERT_FMT(got->type == -RAY_I64 && got->i64 == 50000,
+                            "mode %d, cancel before dispatch %d: %lld distinct, want 50000", mode, k,
+                            got->type == -RAY_I64 ? (long long)got->i64 : -1LL);
+            ray_release(got);
+            answered++;
+        }
+    TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
+    PASS();
+}
+
 /* Cancellation under the per-symbol grouping passes.  The pool skips every
  * ticket of a cancelled query, so a dispatch the cancel lands before writes
  * none of its per-task output: the run detectors' lengths and the presence
@@ -4515,6 +4551,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
     { "agg_contract/derived_key_cancel_at_dispatch", test_derived_key_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/dense_array_lazy_merge_route", test_dense_array_lazy_merge_route, contract_setup, contract_teardown },
+    { "agg_contract/sym_distinct_cancel_at_dispatch", test_sym_distinct_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },
