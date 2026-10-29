@@ -309,32 +309,39 @@ dist: release
 # src-relative path ("ops/ops.h", "store/hnsw.h"). Copies, not symlinks, so
 # the staged tree outlives the checkout it came from.
 #
-# rayforce.h is staged twice: under rayforce/ for clients writing
-# <rayforce/rayforce.h>, and at the root of $(STAGE_ROOT), which is
-# where the internal headers' own `#include <rayforce.h>` looks for it.
+# rayforce.h is staged twice: once at the root of $(STAGE_ROOT), which is
+# where the internal headers' own `#include <rayforce.h>` looks for it, and
+# once nested under rayforce/include/rayforce/.
 #
-# Every path in the recipe is quoted: a staging root may contain spaces.
+# Two include roots cover the staged tree: -I$(STAGE_ROOT) serves
+# <rayforce.h>, -I$(STAGE_ROOT)/rayforce/src serves the internal headers'
+# "ops/ops.h" and "store/hnsw.h" forms. <rayforce/rayforce.h> is not
+# provided by the staging layout.
+#
+# Every path in the recipe is quoted, because a staging root may contain
+# spaces, and each shell runs under set -e, so a failed step aborts the
+# target instead of leaving a partial tree with a success message.
 #
 # Staging only: no ABI or API promise beyond "these are the headers at this
-# commit".
+# commit", and nothing here should be read as one.
 INSTALL_HEADERS := include/rayforce.h \
                    src/ops/ops.h src/io/parquet.h src/mem/heap.h \
                    src/store/hnsw.h src/core/platform.h
 
 install-headers:
-	@rm -rf "$(STAGE_ROOT)/rayforce" "$(STAGE_ROOT)/rayforce.h"; \
+	@set -e; rm -rf "$(STAGE_ROOT)/rayforce" "$(STAGE_ROOT)/rayforce.h"; \
 	d="$(STAGE_ROOT)/rayforce/include/rayforce"; \
 	mkdir -p "$$d"; \
 	cp include/rayforce.h "$$d/"; \
 	chmod 444 "$$d/rayforce.h"
-	@for h in $(filter-out include/rayforce.h,$(INSTALL_HEADERS)); do \
+	@set -e; for h in $(filter-out include/rayforce.h,$(INSTALL_HEADERS)); do \
 		d="$(STAGE_ROOT)/rayforce/$${h%/*}"; \
 		mkdir -p "$$d"; \
 		cp "$$h" "$$d/"; \
 		chmod 444 "$$d/$${h##*/}"; \
 	done
-	@cp include/rayforce.h "$(STAGE_ROOT)/rayforce.h"
-	@chmod 444 "$(STAGE_ROOT)/rayforce.h"
+	@set -e; cp include/rayforce.h "$(STAGE_ROOT)/rayforce.h"; \
+	chmod 444 "$(STAGE_ROOT)/rayforce.h"
 	@echo "staged 7 headers (6 sources, rayforce.h twice) under $(STAGE_ROOT)/rayforce"
 
 # Worker threads per process during tests. Without this the runtime
