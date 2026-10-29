@@ -338,6 +338,51 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     PASS();
 }
 
+
+/* The legacy dense-array grouping seeds the workers' sets lazily and its
+ * parallel merge skips the chunks a worker never seeded: sorted keys leave
+ * most of a worker's chunks unseeded, scattered keys reach every chunk.
+ * agg_route_stats() shows the merge ran (da_lazy_merges) and how many
+ * chunks it skipped (da_lazy_skipped); the values match a serial sum. */
+static test_result_t test_dense_array_lazy_merge_route(void) {
+    static const char* const setup =
+        "(set Gz 1103) "
+        "(set iz (til (* 500 Gz))) "
+        "(set wz (as 'SYM [\"a\" \"bb\" \"ccc\" \"dddd\" \"eeeee\" \"ffffff\" \"ggggggg\"])) "
+        "(set Tz (table [k kx v nv w] (list (+ 5000 (div iz 500)) (+ 5000 (% (* iz 7919) Gz)) iz (- 0 iz) (at wz (% iz 7)))))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; bool skips; } cases[] = {
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: k}))", true },
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: kx}))", false },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        agg_route_reset();
+        ray_t* out = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        agg_route_stats_t st = agg_route_stats();
+        TEST_ASSERT_EQ_I(st.da_lazy_merges, 1);
+        if (cases[c].skips) TEST_ASSERT_FMT(st.da_lazy_skipped > 0, "case %zu: no chunk skipped", c);
+        else                TEST_ASSERT_EQ_I(st.da_lazy_skipped, 0);
+        ray_release(out);
+        /* 1103 groups of 500 rows; over the sorted key a group's sum is
+         * 250000*g + 124750 and its min 500*g; the strlen and v sums over
+         * all groups are the columns' */
+        ray_t* chk = ray_eval_str(c == 0
+            ? "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
+              " (if (all (== (at R 's) (+ (* 250000 (- (at R 'k) 5000)) 124750))) 1 0))"
+              " (+ (if (all (== (at R 'mn) (* 500 (- (at R 'k) 5000)))) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))"
+            : "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
+              " (if (== (sum (at R 's)) (sum (at Tz 'v))) 1 0))"
+              " (+ (if (== (sum (at R 'mn)) (sum (at (select {m: (min v) from: Tz by: kx}) 'm))) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))");
+        TEST_ASSERT_NOT_NULL(chk); TEST_ASSERT_FALSE(RAY_IS_ERR(chk));
+        TEST_ASSERT_FMT(chk->type == -RAY_I64 && chk->i64 == 5, "case %zu: %lld of 5 value checks hold", c,
+                        chk->type == -RAY_I64 ? (long long)chk->i64 : -1LL);
+        ray_release(chk);
+    }
+    PASS();
+}
+
 /* Cancellation under the per-symbol grouping passes.  The pool skips every
  * ticket of a cancelled query, so a dispatch the cancel lands before writes
  * none of its per-task output: the run detectors' lengths and the presence
@@ -4452,6 +4497,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
     { "agg_contract/derived_key_cancel_at_dispatch", test_derived_key_cancel_at_dispatch, contract_setup, contract_teardown },
+    { "agg_contract/dense_array_lazy_merge_route", test_dense_array_lazy_merge_route, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },

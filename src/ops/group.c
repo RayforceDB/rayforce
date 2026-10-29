@@ -11226,6 +11226,7 @@ typedef struct {
     const int8_t* agg_types;  /* per-agg value type (for typed merge) */
     const uint16_t* agg_ops;  /* per-agg opcode (for FIRST/LAST merge) */
     ray_t* const* agg_cols;   /* per-agg input vec (SYM lex via its domain) */
+    _Atomic(uint64_t) skipped; /* OUT: chunks skipped as never seeded (route stat) */
 } da_merge_ctx_t;
 
 static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
@@ -11234,10 +11235,11 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     da_accum_t* merged = &c->accums[0];
     uint8_t n_aggs = c->n_aggs;
     const int8_t* agg_types = c->agg_types;
+    uint64_t skipped = 0;
     for (uint32_t w = 1; w < c->n_src_workers; w++) {
         da_accum_t* wa = &c->accums[w];
         for (int64_t s = start; s < end; s++) {
-            if (!da_chunk_touched(wa, s)) { s |= DA_LZ_MASK; continue; }   /* nothing there */
+            if (!da_chunk_touched(wa, s)) { s |= DA_LZ_MASK; skipped++; continue; }   /* nothing there */
             size_t base = (size_t)s * n_aggs;
             if (c->need_flags & DA_NEED_SUMSQ) {
                 for (uint32_t a = 0; a < n_aggs; a++)
@@ -11331,6 +11333,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
             merged->count[s] += wa->count[s];
         }
     }
+    if (skipped) atomic_fetch_add_explicit(&c->skipped, skipped, memory_order_relaxed);
 }
 
 /* ============================================================================
@@ -17411,8 +17414,10 @@ da_path:;
                     .agg_types     = agg_types,
                     .agg_ops       = ext->agg_ops,
                     .agg_cols      = da_agg_cols,
+                    .skipped       = 0,
                 };
                 ray_pool_dispatch(da_pool, da_merge_fn, &merge_ctx, (int64_t)n_slots);
+                agg_route_note_da_lazy(atomic_load_explicit(&merge_ctx.skipped, memory_order_relaxed));
             } else {
                 /* Sequential merge for small slot counts */
                 for (uint32_t w = 1; w < da_n_workers; w++) {
