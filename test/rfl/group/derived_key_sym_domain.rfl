@@ -375,3 +375,16 @@
 (set OSC (select {from: TS by: rf c: (count w)}))
 (== (count RSC) (count OSC)) -- true
 (all (== (asc (at RSC 'c)) (asc (at OSC 'c)))) -- true
+
+;; a vocabulary past the parallel threshold (540k distinct values): the
+;; grouping hands the values back in a core-count dependent order and they
+;; are ranked into vocabulary order, which for symbols interned in row order
+;; is the row order -- every symbol its own group, in the order of the column
+(set N2 540000)
+(set refq (as 'SYMBOL (concat "http://dkvord" (as 'STR (til N2)))))
+(set TQ (table [ref] (list refq)))
+(set RQ (select {from: TQ by: (let p (str-find ref "://") (let s (substr ref (+ p 4) -1) (let r (if (== (str-find s "www.") 0) (substr s 5 -1) s) (let sl (str-find r "/") (if (and (within p [4 5]) (== (substr ref 1 4) "http") (not (nil? sl))) (substr r 1 sl) ref))))) c: (count ref) mn: (min ref) where: (!= ref "")}))
+(count RQ) -- 540000
+(all (== (at RQ 'c) 1)) -- true
+(all (== (at (value RQ) 0) refq)) -- true
+(all (== (at RQ 'mn) refq)) -- true

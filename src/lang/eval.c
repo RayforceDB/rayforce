@@ -305,6 +305,82 @@ static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* i
     affine_sum_cache[affine_sum_cache_n++] = *in;
 }
 
+/* Can evaluating `e` leave a name bound to another value?  False only when
+ * every call in it is of a builtin that runs no code it is handed: an
+ * operator with an opcode, an atomic or aggregate builtin, `and`, `or`,
+ * `if` or `select`.  Anything else, a lambda, or a builtin that may call a
+ * function value (map, fold, apply, ...) however that value was reached,
+ * may run a `set`. */
+static bool expr_rebinds_nothing(ray_t* e, int depth) {
+    if (!e) return true;
+    if (depth > 64) return false;
+    if (e->type == RAY_DICT) {                           /* a query dict: its values */
+        ray_t* vals = ray_dict_vals(e);
+        if (!vals || vals->type != RAY_LIST) return true;
+        ray_t** vv = (ray_t**)ray_data(vals);
+        for (int64_t i = 0; i < ray_len(vals); i++)
+            if (!expr_rebinds_nothing(vv[i], depth + 1)) return false;
+        return true;
+    }
+    if (e->type != RAY_LIST) {                           /* a name or a literal */
+        /* A dotted name that no binding or container path answers is
+         * resolved by the evaluator as a method call on the container
+         * (`x.eval` runs eval over x), so it may run anything: decline it.
+         * ray_env_get probes bindings and containers only, never a method. */
+        if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED) &&
+            ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64)) return false;
+        return true;
+    }
+    int64_t n = ray_len(e);
+    if (n == 0) return true;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || (fn->attrs & RAY_FN_RESTRICTED)) return false;
+    if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY)
+        return false;
+    bool pure = RAY_FN_OPCODE(fn) != 0 ||
+                (fn->attrs & (RAY_FN_ATOMIC | RAY_FN_LEFT_ATOMIC |
+                              RAY_FN_RIGHT_ATOMIC | RAY_FN_AGGR));
+    if (!pure && fn->type == RAY_VARY) {
+        ray_vary_fn vf = (ray_vary_fn)(uintptr_t)fn->i64;
+        pure = vf == ray_and_vary_fn || vf == ray_or_vary_fn ||
+               vf == ray_cond_fn || vf == ray_select;
+    }
+    if (!pure) return false;
+    for (int64_t i = 1; i < n; i++)
+        if (!expr_rebinds_nothing(el[i], depth + 1)) return false;
+    return true;
+}
+
+/* The count of (take x n) when it is known before x is evaluated: n an
+ * integer literal, or a name bound to an integer atom that evaluating x
+ * cannot rebind (expr_rebinds_nothing), above zero.  A dotted name that no
+ * binding or container path answers is a method call, so it is not read
+ * here.  An owned atom, else NULL (x first, then n, as any call). */
+static ray_t* take_count_arg(ray_t* e, ray_t* x) {
+    if (!e) return NULL;
+    ray_t* v = NULL;
+    if (e->type == -RAY_I64 || e->type == -RAY_I32 || e->type == -RAY_I16) {
+        v = e;
+        ray_retain(v);
+    } else if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        if (ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64)) return NULL;
+        if (!expr_rebinds_nothing(x, 0)) return NULL;
+        v = ray_eval(e);
+        if (!v) return NULL;
+        if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    } else {
+        return NULL;
+    }
+    if ((v->type == -RAY_I64 || v->type == -RAY_I32 || v->type == -RAY_I16) &&
+        !RAY_IS_NULL(v) && as_i64(v) > 0)
+        return v;
+    ray_release(v);
+    return NULL;
+}
+
 static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
@@ -567,6 +643,45 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
         }
         default:            return ray_i64(0);
     }
+}
+
+/* The scalar fill/min/max results for wide cells have a common type, but the
+ * generic atomic mapper boxes them.  Collapse only homogeneous wide results;
+ * mixed-type LIST operands keep their existing boxed shape. */
+static ray_t* atomic_collapse_wide(ray_t* list) {
+    if (!list || RAY_IS_ERR(list) || list->type != RAY_LIST || list->len == 0)
+        return list;
+    ray_t** cells = (ray_t**)ray_data(list);
+    int8_t t = cells[0] ? cells[0]->type : 0;
+    if (t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) return list;
+    for (int64_t i = 1; i < list->len; i++)
+        if (!cells[i] || cells[i]->type != t) return list;
+
+    ray_t* vec = ray_vec_new((int8_t)-t, t == -RAY_STR ? 0 : list->len);
+    if (!vec || RAY_IS_ERR(vec)) {
+        ray_release(list);
+        return vec ? vec : ray_error("oom", NULL);
+    }
+    if (t == -RAY_STR) {
+        for (int64_t i = 0; i < list->len; i++) {
+            ray_t* next = ray_str_vec_append(vec, ray_str_ptr(cells[i]), ray_str_len(cells[i]));
+            if (!next || RAY_IS_ERR(next)) {
+                ray_release(vec);
+                ray_release(list);
+                return next ? next : ray_error("oom", NULL);
+            }
+            vec = next;
+        }
+    } else {
+        vec->len = list->len;
+        for (int64_t i = 0; i < list->len; i++)
+            if (store_typed_elem(vec, i, cells[i]) != 0) {
+                ray_release(vec);
+                return list;
+            }
+    }
+    ray_release(list);
+    return vec;
 }
 
 /* Map a binary function element-wise over collections.
@@ -1067,6 +1182,13 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                             if (is_idiv) root->out_type = RAY_I64;
                             ray_t* result = ray_execute(g, root);
                             ray_graph_free(g);
+                            /* a cancelled query stays cancelled: the
+                             * per-element loop below is not its answer */
+                            if (result && RAY_IS_ERR(result)) {
+                                if (strcmp(ray_err_code(result), "cancel") == 0) { ray_release(e0); return result; }
+                                ray_error_free(result);
+                                result = NULL;
+                            }
                             if (result && !RAY_IS_ERR(result)) {
                                 /* Restore temporal type tag if promote() collapsed it */
                                 if (ray_is_vec(result) && result->type != out_type &&
@@ -1374,6 +1496,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         ray_release(e0);
 
         for (int64_t i = 1; i < len; i++) {
+            if ((i & 0xFFFF) == 0 && g_eval_interrupted) { ray_release(vec); return ray_error("cancel", "interrupted"); }
             int la = 0, ra = 0;
             ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
             ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
@@ -1422,6 +1545,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     out[0] = e0;  /* first element already computed */
 
     for (int64_t i = 1; i < len; i++) {
+        if ((i & 0xFFFF) == 0 && g_eval_interrupted) {
+            result->len = i;                 /* the filled prefix only */
+            ray_release(result);
+            return ray_error("cancel", "interrupted");
+        }
         int la = 0, ra = 0;
         ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
         ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
@@ -1450,6 +1578,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         out[i] = elem;
     }
     #undef COERCE_TO_SCALAR
+    if (!force_boxed && (fn == ray_fill_fn || fn == ray_min2_fn || fn == ray_max2_fn))
+        return atomic_collapse_wide(result);
     return ray_list_collapse_bool(result);
 }
 
@@ -5014,6 +5144,17 @@ ray_t* ray_eval(ray_t* obj) {
                     rows = 0; goto out;
                 }
             }
+            if (fn == (ray_unary_fn)ray_first_fn) {
+                /* (first (select ...)): the select's first row alone */
+                int handled = 0;
+                ray_t* top = ray_try_select_head_expr(elems[1], 1, &handled);
+                if (handled) {
+                    ray_release(head);
+                    ret = top && !RAY_IS_ERR(top) ? ray_first_fn(top) : top;
+                    if (top && !RAY_IS_ERR(top)) ray_release(top);
+                    rows = 0; goto out;
+                }
+            }
             ray_t* arg = ray_eval(elems[1]);
             rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
@@ -5049,6 +5190,28 @@ ray_t* ray_eval(ray_t* obj) {
                 ret = fn(elems[1], elems[2]);
                 rows = inherits ? g_eval_rows : 0;
                 goto out;
+            }
+            if (fn == (ray_binary_fn)ray_take_fn && ray_select_form_whole(elems[1])) {
+                /* (take (select ...) n), n > 0 a literal or a name the
+                 * select cannot rebind: the select's first n rows alone; a select of fewer rows is
+                 * its whole result, which take then repeats as for any table.  The shape is
+                 * checked first, so no other take reads its count early. */
+                ray_t* nv = take_count_arg(elems[2], elems[1]);
+                int handled = 0;
+                ray_t* top = nv ? ray_try_select_head_expr(elems[1], as_i64(nv), &handled) : NULL;
+                if (handled) {
+                    ray_release(head);
+                    if (top && !RAY_IS_ERR(top) && top->type == RAY_TABLE &&
+                        ray_table_nrows(top) < as_i64(nv)) {
+                        ret = ray_take_fn(top, nv);
+                        ray_release(top);
+                    } else {
+                        ret = top;
+                    }
+                    ray_release(nv);
+                    rows = 0; goto out;
+                }
+                if (nv) ray_release(nv);
             }
             bool rowwise = ray_active_query_table() && vm_fn_rowwise(head);
             ray_t* left = ray_eval(elems[1]);

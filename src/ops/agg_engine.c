@@ -53,12 +53,17 @@ static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
 agg_route_stats_t agg_route_stats(void) { return route_stats; }
 void agg_route_note_key_domain(void) { route_stats.key_domain_evals++; }
+void agg_route_note_vocab_order(void) { route_stats.key_vocab_order++; }
+void agg_route_note_da_lazy(uint64_t skipped_chunks) {
+    route_stats.da_lazy_merges++;
+    route_stats.da_lazy_skipped += skipped_chunks;
+}
 void agg_route_record(agg_route_t route) {
     static const char* const names[AGG_ROUTE_COUNT] = {
         "group: none", "group: legacy", "group: slices", "group: parted",
         "group: v2 serial dense", "group: v2 serial hash", "group: v2 dense",
         "group: v2 radix", "group: v2 hash", "group: v2 smallhash", "group: v2 indexed",
-        "group: v2 tablestack"
+        "group: v2 tablestack", "group: v2 runs"
     };
     route_stats.routes[route]++;
     ray_profile_tick(names[route]);
@@ -3318,11 +3323,16 @@ static void agg_dense_sel_rows(void* raw, const agg_view_t* v, uint32_t wid, int
         loc->oom = 1;
 }
 
-/* Phase A, sel mode: chunk-iterate the SELECTED rows in [start,end)
- * (selected-row space).  Decode each chunk's ORIGINAL rows, compute dense
- * slots, gather agg values per chunk into reused scratch, and batch-update.
- * No full index array, no full compact column.  Staged sources are read by
- * R-SPARSE through this task's cursors. */
+static void agg_dense_phaseA_fn(void* vctx, const agg_view_t* v, uint32_t wid, int64_t start, int64_t end);
+
+/* Phase A, sel mode: the SELECTED rows in [start,end) (selected-row
+ * space), segment by segment.  The rows of a mixed segment are decoded
+ * into chunks of ORIGINAL rows: dense slots computed, agg values gathered
+ * per chunk into reused scratch, batch-updated (R-SPARSE through the
+ * task's cursors when a source is staged).  A run of segments the
+ * selection takes whole is a dense row range, accumulated as without a
+ * selection (agg_dense_phaseA_fn, by pieces when staged).  The buffered
+ * rows go first, so every slot still sees its rows in ascending order. */
 static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start, int64_t end) {
     agg_dense_local_t* loc = &c->locals[wid];
     if (loc->oom || end <= start) return;
@@ -3336,15 +3346,66 @@ static void agg_dense_phaseA_sel(agg_dense_ctx_t* c, uint32_t wid, int64_t start
         if (ray_scan_fail_skip(rr->fail, start)) { agg_sel_scratch_free(&sc); return; }
         if (!agg_curs_init(&cs, rr)) { loc->oom = 1; agg_sel_scratch_free(&sc); return; }
     }
-    agg_sel_cursor_t cur;
+    agg_sel_cursor_t cur;                               /* for the read-ahead bound only */
     agg_sel_cursor_init(&cur, c->sel, c->sel_prefix, start, end);
     agg_dense_sel_run_t t = { c, loc, rows, gid, &sc };
-    int64_t cn;
-    while (!loc->oom && (cn = agg_sel_cursor_next(&cur, rows)) > 0) {
-        if (!rr->staged) { agg_dense_sel_rows(&t, c->whole, wid, 0, cn); continue; }
-        ray_t* err = agg_idx_walk(rr, &cs, rows, 0, cn, &t, agg_dense_sel_rows, wid);
-        if (err) { ray_scan_fail_note(rr->fail, start, err); break; }
+    const ray_rowsel_t* m = ray_rowsel_meta(c->sel);
+    const uint8_t* flags = ray_rowsel_flags(c->sel);
+    const uint32_t* offs = ray_rowsel_offsets(c->sel);
+    const uint16_t* idx = ray_rowsel_idx(c->sel);
+    const int64_t* pre = c->sel_prefix;
+    const int64_t M = RAY_MORSEL_ELEMS;
+    uint32_t s = 0, hs = m->n_segs;                     /* the segment holding selected row `start` */
+    while (s < hs) { uint32_t mid = s + (hs - s) / 2; if (pre[mid + 1] <= start) s = mid + 1; else hs = mid; }
+    int64_t nb = 0;                                     /* buffered rows of mixed segments */
+    ray_t* err = NULL;
+    bool failed = false;                                /* a dense range's read failed (noted) */
+    #define AGG_SEL_FLUSH() do {                                                    \
+        if (nb > 0 && !loc->oom) {                                                  \
+            ray_pool_scan_at(m->nrows, rows[0], cur.row_end);                       \
+            if (!rr->staged) agg_dense_sel_rows(&t, c->whole, wid, 0, nb);          \
+            else err = agg_idx_walk(rr, &cs, rows, 0, nb, &t, agg_dense_sel_rows, wid); \
+        }                                                                           \
+        nb = 0;                                                                     \
+    } while (0)
+    while (s < m->n_segs && pre[s] < end && !err && !failed && !loc->oom) {
+        if (flags[s] == RAY_SEL_NONE) { s++; continue; }
+        const int64_t seg_sel = pre[s + 1] - pre[s];
+        const int64_t p0 = start > pre[s] ? start - pre[s] : 0;
+        const int64_t p1 = end - pre[s] < seg_sel ? end - pre[s] : seg_sel;
+        const int64_t base = (int64_t)s * M;
+        if (flags[s] == RAY_SEL_ALL) {
+            /* the whole segments that follow join the range, up to the
+             * kernel's 8192 rows */
+            int64_t r0 = base + p0, r1 = base + p1;
+            s++;
+            while (p1 == seg_sel && s < m->n_segs && flags[s] == RAY_SEL_ALL && pre[s] < end &&
+                   r1 == (int64_t)s * M && r1 - r0 < 8192) {
+                int64_t q1 = end - pre[s] < pre[s + 1] - pre[s] ? end - pre[s] : pre[s + 1] - pre[s];
+                int64_t e1 = (int64_t)s * M + q1;
+                if (e1 - r0 > 8192) break;
+                r1 = e1;
+                if (q1 < pre[s + 1] - pre[s]) { s++; break; }
+                s++;
+            }
+            AGG_SEL_FLUSH();
+            if (err || loc->oom) break;
+            if (agg_cancelled()) break;
+            ray_pool_scan_at(m->nrows, r0, cur.row_end);
+            if (!rr->staged) agg_dense_phaseA_fn(c, c->whole, wid, r0, r1);
+            else if (!agg_walk_cs(rr, &cs, c, agg_dense_phaseA_fn, wid, r0, r1, start)) failed = true;
+            continue;
+        }
+        const uint16_t* si = idx + offs[s];
+        for (int64_t q = p0; q < p1 && !err; q++) {
+            rows[nb++] = base + si[q];
+            if (nb == AGG_SEL_CHUNK) AGG_SEL_FLUSH();
+        }
+        s++;
     }
+    if (!err && !failed) AGG_SEL_FLUSH();
+    #undef AGG_SEL_FLUSH
+    if (err) ray_scan_fail_note(rr->fail, start, err);
     agg_curs_free(&cs, rr);
     agg_sel_scratch_free(&sc);
 }
@@ -3796,6 +3857,9 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
         atomic_init(&c.fail, 0);
         if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_vals_fn, &c, tasks);
         else agg_slots_vals_fn(&c, 0, 0, 1);
+        /* a cancelled dispatch skips tasks: their values and candidates
+         * were never written */
+        if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
         if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
             if (cap > 0) {
                 int64_t nc = 0;
@@ -3807,8 +3871,10 @@ static int64_t agg_slots_topn_select(ray_pool_t* pool, const agg_vtable_t* vt,
             }
             if (tasks > 1) ray_pool_dispatch_n(pool, agg_slots_mark_fn, &c, tasks);
             else agg_slots_mark_fn(&c, 0, 0, 1);
-            kept = 0;
-            for (uint32_t t = 0; t < tasks; t++) kept += c.kept[t];
+            if (!agg_cancelled()) {
+                kept = 0;
+                for (uint32_t t = 0; t < tasks; t++) kept += c.kept[t];
+            }
         }
     }
     ray_free_raw(vals); ray_free_raw(cand); ray_free_raw(cand_n);
@@ -3956,6 +4022,9 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
         atomic_init(&c.fail, 0);
         if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
         else agg_lean_fn(&c, 0, 0, 1);
+        /* a cancelled dispatch skips tasks: their counts and candidates
+         * never got written, the selection is refused like a failed one */
+        if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
         if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
             int64_t total = 0, nc = 0;
             for (uint32_t t = 0; t < tasks; t++) {
@@ -3968,6 +4037,7 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
             c.pass = 1;
             if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
             else agg_lean_fn(&c, 0, 0, 1);
+            if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
             if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
                 int64_t n = 0;
                 for (uint32_t t = 0; t < tasks; t++) n += c.kept_n[t];
@@ -3987,6 +4057,89 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
     }
     ray_free_raw(cand); ray_free_raw(all); ray_free_raw(meta); ray_free_raw(kept);
     return result;
+}
+
+/* The occupancy bitmap of a first-row array: bit s is set when slot s holds a
+ * group (first[s] != INT64_MAX).  Word ranges, one task each. */
+typedef struct {
+    const int64_t* first;
+    uint64_t*      occ;
+    int64_t        slots, words;
+    uint32_t       tasks;
+} agg_occ_first_ctx_t;
+
+static void agg_occ_first_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_occ_first_ctx_t* c = raw;
+    for (int64_t t = start; t < end; t++) {
+        int64_t w0 = c->words / c->tasks * t;
+        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        for (int64_t w = w0; w < w1; w++) {
+            int64_t base = w * 64;
+            int64_t n = c->slots - base < 64 ? c->slots - base : 64;
+            uint64_t b = 0;
+            for (int64_t i = 0; i < n; i++) b |= (uint64_t)(c->first[base + i] != INT64_MAX) << i;
+            c->occ[w] = b;
+        }
+    }
+}
+
+/* The occupied slots of a bitmap in ascending order: tasks count the set bits
+ * of their word ranges, a prefix places them, and each task writes its
+ * range's slots at its place.  1 when out holds them, 0 when the counts do
+ * not add up to ng (the caller collects serially), -1 when the query was
+ * cancelled under a dispatch: the pool skips the tickets of a cancelled
+ * query, so the counts, or out, were never written. */
+typedef struct {
+    const uint64_t* occ;
+    int64_t*        out;
+    int64_t*        at;        /* [tasks + 1]: counts, then first positions */
+    int64_t         words;
+    uint32_t        tasks;
+    int             pass;      /* 0: count, 1: write */
+} agg_occ_collect_ctx_t;
+
+static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_occ_collect_ctx_t* c = raw;
+    for (int64_t t = start; t < end; t++) {
+        int64_t w0 = c->words / c->tasks * t;
+        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        if (c->pass == 0) {
+            int64_t n = 0;
+            for (int64_t w = w0; w < w1; w++) n += __builtin_popcountll(c->occ[w]);
+            c->at[t] = n;
+        } else {
+            int64_t j = c->at[t];
+            for (int64_t w = w0; w < w1; w++)
+                for (uint64_t b = c->occ[w]; b; b &= b - 1) c->out[j++] = w * 64 + __builtin_ctzll(b);
+        }
+    }
+}
+
+static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots, int64_t ng, int64_t* out) {
+    int64_t words = (slots + 63) / 64;
+    uint32_t tasks = ray_pool_par_dispatch_ok(pool, slots, RAY_PARALLEL_THRESHOLD)
+                   ? ray_pool_total_workers(pool) * 4 : 1;
+    if ((int64_t)tasks > words) tasks = (uint32_t)(words > 0 ? words : 1);
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    int64_t* at = ray_alloc_raw(((size_t)tasks + 1) * sizeof(int64_t));
+    if (!at) return 0;
+    agg_occ_collect_ctx_t c = { .occ = occ, .out = out, .at = at, .words = words, .tasks = tasks, .pass = 0 };
+    if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_collect_fn, &c, tasks);
+    else agg_occ_collect_fn(&c, 0, 0, 1);
+    if (agg_cancelled()) { ray_free_raw(at); return -1; }
+    int64_t run = 0;
+    for (uint32_t t = 0; t < tasks; t++) { int64_t n = at[t]; at[t] = run; run += n; }
+    int ok = run == ng;
+    if (ok) {
+        c.pass = 1;
+        if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_collect_fn, &c, tasks);
+        else agg_occ_collect_fn(&c, 0, 0, 1);
+        if (agg_cancelled()) ok = -1;
+    }
+    ray_free_raw(at);
+    return ok;
 }
 
 /* Shared output stage. Takes ownership of states/first/occ (occ: a bitmap of
@@ -4011,6 +4164,35 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     int64_t ng = 0;
     int64_t* occupied_slot = NULL;
     int64_t* first_row_ordered = NULL;
+    /* A first-row array of a key-planned output (the keys are rebuilt from
+     * the slots, the array only says which are occupied): its occupancy as
+     * a bitmap, so the selection and the collection below walk the words on
+     * the workers instead of the slots in one thread. */
+    if (!occ && gfirst && key_plan && group_limit <= 0 && total_slots > 0) {
+        int64_t words = (total_slots + 63) / 64;
+        uint64_t* ob = ray_alloc_raw((size_t)words * sizeof(uint64_t));
+        if (ob) {
+            uint32_t tasks = ray_pool_par_dispatch_ok(pool, total_slots, RAY_PARALLEL_THRESHOLD)
+                           ? ray_pool_total_workers(pool) * 4 : 1;
+            if ((int64_t)tasks > words) tasks = (uint32_t)words;
+            if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+            agg_occ_first_ctx_t oc = { .first = gfirst, .occ = ob, .slots = total_slots,
+                                       .words = words, .tasks = tasks };
+            if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_first_fn, &oc, tasks);
+            else agg_occ_first_fn(&oc, 0, 0, 1);
+            /* the tickets of a cancelled query are skipped: ob's words
+             * were never written */
+            if (agg_cancelled()) {
+                ray_free_raw(ob);
+                agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+                ray_free_raw(gstates); ray_free_raw(gfirst);
+                return ray_error("cancel", NULL);
+            }
+            ray_free_raw(gfirst);
+            gfirst = NULL;
+            occ = ob;
+        }
+    }
     /* A slab with an occupancy bitmap under a top-N filter keeps only the
      * groups the filter keeps (agg_dense_lean_select): no entry per group. */
     if (occ && ef && key_plan && group_limit <= 0) {
@@ -4047,7 +4229,15 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
-    { int64_t i = 0;
+    int collected = occ && !first_row_ordered ? agg_occ_collect(pool, occ, total_slots, ng, occupied_slot) : 0;
+    if (collected < 0) {
+        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
+        agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+        ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+        return ray_error("cancel", NULL);
+    }
+    if (!collected) {
+      int64_t i = 0;
       for (int64_t s = 0; s < total_slots; s++)
           if (occ ? (occ[s >> 6] >> (s & 63)) & 1 : gfirst[s] != INT64_MAX) {
               if (first_row_ordered) first_row_ordered[i] = gfirst[s];
@@ -7574,6 +7764,13 @@ agg_radix_select_topn(ray_pool_t* pool, const agg_radix_part_t* parts, uint32_t 
     }
     if (pool) ray_pool_dispatch_n(pool, agg_radix_mark_fn, &c, n_parts);
     else agg_radix_mark_fn(&c, 0, 0, n_parts);
+    /* A cancel skips the tasks of this dispatch and the one above (it stays
+     * set for the query): keep is unwritten, and with the kept counts at
+     * zero the loop below would write a selection of one entry per byte. */
+    if (pool && pool_cancelled(pool)) {
+        ray_free_raw(base); ray_free_raw(vals); ray_free_raw(keep);
+        ray_free_raw(cand); ray_free_raw(cand_n); *rc = 3; return NULL;
+    }
     int64_t kept = 0;
     for (uint32_t p = 0; p < n_parts; p++) kept += c.kept[p];
     ray_free_raw(cand); ray_free_raw(cand_n);
@@ -7789,11 +7986,11 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
             n_emit = kept;
             route_stats.topn_native = true;
             route_stats.topn_kept = kept;
-        } else if (rc == 1) {
+        } else if (rc == 1 || rc == 3) {
             agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
             ray_free_raw(parts);
             agg_desc_free(d);
-            return ray_error("oom", NULL);
+            return ray_error(rc == 1 ? "oom" : "cancel", NULL);
         }
         /* rc == 2: no scalar order for this aggregate — full path below. */
     }
@@ -7857,6 +8054,7 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
         else
             memset(pairs, 0xFF, (size_t)(input_count > 0 ? input_count : 1) * sizeof(agg_radix_order_t));
     }
+    bool ord_cancel = false;
     bool order_ok = true;
     int64_t ordered = 0;
     bool ord_parallel_done = false;
@@ -7887,17 +8085,22 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
                     .chunk = ORD_CHUNK, .counts = ord_counts,
                 };
                 ray_pool_dispatch_n(pool, agg_ord_count_fn, &cctx, (uint32_t)n_chunks);
+                /* a cancel skips these tasks: the counts are unwritten, and
+                 * the compaction would write at offsets summed from them */
+                ord_cancel = pool_cancelled(pool);
                 /* Exclusive prefix (serial over a few hundred chunks). */
                 int64_t run = 0;
-                for (int64_t ch = 0; ch < n_chunks; ch++) {
+                for (int64_t ch = 0; ch < n_chunks && !ord_cancel; ch++) {
                     int64_t n = ord_counts[ch];
                     ord_counts[ch] = run;
                     run += n;
                 }
                 ordered = run;
-                order_ok = ordered == ng;
+                order_ok = !ord_cancel && ordered == ng;
                 if (order_ok) {
                     ray_pool_dispatch_n(pool, agg_ord_compact_fn, &cctx, (uint32_t)n_chunks);
+                    ord_cancel = pool_cancelled(pool);   /* else the key emit reads them */
+                    order_ok = !ord_cancel;
                     ray_free_raw(pairs);
                     pairs = compacted;
                     compacted = NULL;
@@ -7933,7 +8136,8 @@ static ray_t* agg_parts_emit(ray_op_ext_t* ext, agg_desc_t* d,
         agg_radix_parts_destroy(parts, n_parts, vts, off, block, n_aggs);
         ray_free_raw(parts);
         agg_desc_free(d);
-        return ray_error("group", "failed to order radix groups");
+        return ord_cancel ? ray_error("cancel", NULL)
+                          : ray_error("group", "failed to order radix groups");
     }
     }   /* end full-order path */
     ray_profile_tick("radix: ordered groups");
@@ -8388,6 +8592,354 @@ static uint32_t agg_radix_spill_run(agg_radix_ctx_t* c, ray_pool_t* pool, uint32
     ray_free_raw(wave_of); ray_free_raw(wave_base); ray_free_raw(sp.bufs);
     ray_free_raw(sp.rbuf); ray_free_raw(sp.blks); ray_free_raw(wave_blks);
     return next;
+}
+
+/* ===== Runs of equal keys: integer keys, every aggregate a COUNT =====
+ *
+ * A column sorted on a leading key holds its rows of a value together, so a
+ * grouping on it sees each key in runs.  The radix scatter writes a record
+ * per row; here a task collapses every run of equal keys in its rows into
+ * one record (the keys, the run's first row and length), lays its records
+ * out by partition, and each partition is then grouped by summing the run
+ * lengths, its first rows MIN-folded.  The keys are read as the radix path
+ * reads them (agg_read_key_i64_raw, a null is its value) into the radix
+ * partition slots, so the emit (first-seen order, the top-N selection, the
+ * key columns) is shared and the answer is the same.  Declines (NULL) on
+ * any other shape, when a sample says the runs are too short to pay, and
+ * on OOM (the radix path then runs). */
+#define AGG_RUN_PARTS      1024u
+#define AGG_RUN_MAX_KEYS   8
+#define AGG_RUN_MIN_ROWS   (1 << 20)
+#define AGG_RUN_SAMPLE     16      /* sample windows of AGG_RUN_SAMPLE_ROWS */
+#define AGG_RUN_SAMPLE_ROWS 4096
+/* The average run length from which the kernel beats the radix path on a
+ * 48-thread two-socket machine (measured crossovers 2.2 for one key, 2.8
+ * for three: a wider record costs more of the memory traffic it saves);
+ * fewer threads cross earlier. */
+#define AGG_RUN_MIN_LEN_1  2.25
+#define AGG_RUN_MIN_LEN_N  2.75
+
+/* A run is n_keys + 1 words: its keys, then its first row's offset in the
+ * task (high half) with its length (low half); a task's rows number fewer
+ * than 2^31. */
+typedef struct {
+    ray_col_src_t*  src[AGG_RUN_MAX_KEYS];      /* a key read by range when staged */
+    const void*     plain[AGG_RUN_MAX_KEYS];    /* or in place */
+    int8_t          type[AGG_RUN_MAX_KEYS];
+    uint8_t         attrs[AGG_RUN_MAX_KEYS];
+    uint32_t        n_keys;
+    int64_t         nrows, grain, ntasks;
+    uint32_t        nw, n_parts;
+    uint64_t**      scratch;      /* [nw]: a worker's runs of one task (grain records) */
+    ray_t**         scratch_hdr;
+    uint64_t**      trec;         /* [ntasks]: a task's runs, by partition */
+    ray_t**         trec_hdr;
+    uint32_t*       toff;         /* [ntasks * (n_parts + 1)]: partition p of task t is
+                                   * records toff[t * (n_parts + 1) + p] .. of trec[t] */
+    agg_radix_part_t* parts;
+    const size_t*   off; size_t block; uint32_t n_aggs;
+    _Atomic(int)    oom;
+    ray_scan_fail_t* fail;        /* NULL while sampling */
+} agg_run_ctx_t;
+
+static inline uint64_t agg_run_hash(const uint64_t* k, uint32_t n_keys) {
+    if (n_keys == 1) return agg_radix_fmix64(k[0]);
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < n_keys; i++) { h ^= k[i]; h *= 1099511628211ULL; }
+    return agg_radix_fmix64(h);
+}
+static inline uint32_t agg_run_part(uint64_t h, uint32_t mask) { return (uint32_t)(h >> 40) & mask; }
+
+/* Views of every key at row r (*n: the rows all of them hold, at most
+ * hi - r): false on a range error (noted while scanning) or an empty view. */
+static bool agg_run_views(const agg_run_ctx_t* c, int64_t r, int64_t hi, ray_col_scratch_t* scr,
+                          const void** data, int8_t* ty, uint8_t* at, int64_t* i0, int64_t* n) {
+    *n = hi - r;
+    for (uint32_t k = 0; k < c->n_keys; k++) {
+        ty[k] = c->type[k]; at[k] = c->attrs[k];
+        if (c->plain[k]) { data[k] = c->plain[k]; i0[k] = r; continue; }
+        ray_col_range_t v;
+        ray_t* err = ray_col_range(c->src[k], r, hi - r, &scr[k], &v);
+        if (err) { if (c->fail) ray_scan_fail_note(c->fail, r, err); else ray_error_free(err); return false; }
+        if (v.n <= 0) return false;
+        data[k] = v.data; ty[k] = v.type; at[k] = v.attrs; i0[k] = 0;
+        if (v.n < *n) *n = v.n;
+    }
+    return true;
+}
+
+/* Phase 1: tasks [start, end), each `grain` rows: its runs collapsed into
+ * the worker's scratch, then laid out by partition in an array of the
+ * task's own (one allocation a task, written once). */
+RAY_INLINE void agg_run_collect_body(agg_run_ctx_t* c, uint32_t wid, int64_t start, int64_t end,
+                                     const uint32_t nk) {
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+    const uint32_t S = nk + 1;
+    if (!c->scratch[wid]) {
+        c->scratch[wid] = (uint64_t*)scratch_alloc(&c->scratch_hdr[wid], (size_t)c->grain * S * sizeof(uint64_t));
+        if (!c->scratch[wid]) { atomic_store_explicit(&c->oom, 1, memory_order_relaxed); return; }
+    }
+    uint64_t* sc = c->scratch[wid];
+    const uint32_t P = c->n_parts, mask = P - 1;
+    uint32_t hist[AGG_RUN_PARTS + 1];
+    for (int64_t t = start; t < end; t++) {
+        int64_t lo = t * c->grain, hi = lo + c->grain;
+        if (hi > c->nrows) hi = c->nrows;
+        uint32_t* off = c->toff + (size_t)t * (P + 1);
+        if (lo >= hi) { memset(off, 0, (size_t)(P + 1) * sizeof(uint32_t)); continue; }
+        int64_t n_runs = 0;
+        bool have = false, failed = false;
+        uint64_t cur[AGG_RUN_MAX_KEYS], kv[AGG_RUN_MAX_KEYS];
+        int64_t first = lo;
+        uint64_t w = 0;
+        ray_col_scratch_t scr[AGG_RUN_MAX_KEYS];
+        for (uint32_t k = 0; k < nk; k++) ray_col_scratch_init(&scr[k]);
+#define AGG_RUN_EMIT() do {                                                        \
+            uint64_t* o_ = sc + (size_t)n_runs++ * S;                              \
+            for (uint32_t k_ = 0; k_ < nk; k_++) o_[k_] = cur[k_];                 \
+            o_[nk] = (uint64_t)(first - lo) << 32 | w;                             \
+        } while (0)
+        for (int64_t r = lo; r < hi; ) {
+            const void* data[AGG_RUN_MAX_KEYS]; int8_t ty[AGG_RUN_MAX_KEYS]; uint8_t at[AGG_RUN_MAX_KEYS];
+            int64_t i0[AGG_RUN_MAX_KEYS], n;
+            if (!agg_run_views(c, r, hi, scr, data, ty, at, i0, &n)) { failed = true; break; }
+            if (nk == 1) {
+                /* one typed loop a view: the key's width decided once, not a row */
+#define AGG_RUN_LOOP(EXPR) do {                                                    \
+                    for (int64_t i = 0; i < n; i++) {                              \
+                        uint64_t k = (uint64_t)(EXPR);                             \
+                        if (have && k == cur[0]) { w++; continue; }                \
+                        if (have) AGG_RUN_EMIT();                                  \
+                        have = true; cur[0] = k; first = r + i; w = 1;             \
+                    }                                                              \
+                } while (0)
+                switch (ty[0]) {
+                case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
+                    const int64_t* d = (const int64_t*)data[0] + i0[0]; AGG_RUN_LOOP(d[i]); break; }
+                case RAY_I32: case RAY_DATE: case RAY_TIME: {
+                    const int32_t* d = (const int32_t*)data[0] + i0[0]; AGG_RUN_LOOP((int64_t)d[i]); break; }
+                default:
+                    AGG_RUN_LOOP(agg_read_key_i64_raw(ty[0], at[0], data[0], i0[0] + i)); break;
+                }
+#undef AGG_RUN_LOOP
+            } else {
+                for (int64_t i = 0; i < n; i++) {
+                    bool same = have;
+                    for (uint32_t k = 0; k < nk; k++) {
+                        kv[k] = (uint64_t)agg_read_key_i64_raw(ty[k], at[k], data[k], i0[k] + i);
+                        same = same && kv[k] == cur[k];
+                    }
+                    if (same) { w++; continue; }
+                    if (have) AGG_RUN_EMIT();
+                    have = true; memcpy(cur, kv, nk * sizeof(uint64_t)); first = r + i; w = 1;
+                }
+            }
+            r += n;
+        }
+        for (uint32_t k = 0; k < nk; k++) ray_col_scratch_free(&scr[k]);
+        if (failed) { memset(off, 0, (size_t)(P + 1) * sizeof(uint32_t)); continue; }
+        if (have) AGG_RUN_EMIT();
+#undef AGG_RUN_EMIT
+        memset(hist, 0, sizeof hist);
+        for (int64_t i = 0; i < n_runs; i++) hist[agg_run_part(agg_run_hash(sc + (size_t)i * S, nk), mask) + 1]++;
+        for (uint32_t p = 0; p < P; p++) hist[p + 1] += hist[p];
+        memcpy(off, hist, (size_t)(P + 1) * sizeof(uint32_t));
+        uint64_t* out = (uint64_t*)scratch_alloc(&c->trec_hdr[t], (size_t)(n_runs ? n_runs : 1) * S * sizeof(uint64_t));
+        if (!out) { atomic_store_explicit(&c->oom, 1, memory_order_relaxed); return; }
+        c->trec[t] = out;
+        for (int64_t i = 0; i < n_runs; i++) {
+            const uint64_t* rec = sc + (size_t)i * S;
+            memcpy(out + (size_t)hist[agg_run_part(agg_run_hash(rec, nk), mask)]++ * S, rec, S * sizeof(uint64_t));
+        }
+    }
+}
+/* One key compiled apart (its records, hash and compares sized at build
+ * time); more keys by count. */
+static void agg_run_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    agg_run_ctx_t* c = (agg_run_ctx_t*)raw;
+    if (c->n_keys == 1) agg_run_collect_body(c, wid, start, end, 1);
+    else agg_run_collect_body(c, wid, start, end, c->n_keys);
+}
+
+/* Phase 2: partitions [start, end): sum the run lengths per key into the
+ * radix partition slot (states with every COUNT set, MIN first rows, keys
+ * in build order, n_keys words a group). */
+RAY_INLINE void agg_run_group_body(agg_run_ctx_t* c, int64_t start, int64_t end, const uint32_t nk) {
+    const uint32_t P1 = c->n_parts + 1, S = nk + 1;
+    for (int64_t p = start; p < end; p++) {
+        if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+        agg_radix_part_t* pr = &c->parts[p];
+        int64_t total = 0;
+        for (int64_t t = 0; t < c->ntasks; t++) {
+            const uint32_t* off = c->toff + (size_t)t * P1;
+            total += off[p + 1] - off[p];
+        }
+        if (total == 0) continue;
+        uint64_t cap = 16;
+        while (cap < (uint64_t)total * 2) cap <<= 1;
+        uint64_t mask = cap - 1;
+        const size_t blk = c->block, o0 = c->off[0];
+        int32_t* ht    = ray_alloc_raw((size_t)cap * sizeof(int32_t));
+        int64_t* keys  = ray_alloc_raw((size_t)total * nk * sizeof(int64_t));
+        int64_t* frow  = ray_alloc_raw((size_t)total * sizeof(int64_t));
+        char*    states = ray_alloc_raw((size_t)total * blk);    /* the counts in place */
+        if (!ht || !keys || !frow || !states) {
+            ray_free_raw(ht); ray_free_raw(keys); ray_free_raw(frow); ray_free_raw(states);
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed); return;
+        }
+        memset(ht, 0xFF, (size_t)cap * sizeof(int32_t));
+        int64_t ng = 0;
+        for (int64_t t = 0; t < c->ntasks; t++) {
+            const uint32_t* off = c->toff + (size_t)t * P1;
+            const uint64_t* tr = c->trec[t];
+            const int64_t lo = t * c->grain;
+            for (uint32_t i = off[p]; i < off[p + 1]; i++) {
+                const uint64_t* rec = tr + (size_t)i * S;
+                int64_t row = lo + (int64_t)(rec[nk] >> 32), w = (int64_t)(uint32_t)rec[nk];
+                uint64_t h = agg_run_hash(rec, nk) & mask;
+                for (;;) {
+                    int32_t gg = ht[h];
+                    if (gg < 0) {
+                        ht[h] = (int32_t)ng;
+                        memcpy(keys + (size_t)ng * nk, rec, nk * sizeof(int64_t));
+                        frow[ng] = row;
+                        memcpy(states + (size_t)ng * blk + o0, &w, sizeof w);   /* count_state */
+                        ng++;
+                        break;
+                    }
+                    if (memcmp(keys + (size_t)gg * nk, rec, nk * sizeof(int64_t)) == 0) {
+                        int64_t* n = (int64_t*)(void*)(states + (size_t)gg * blk + o0);
+                        *n += w;
+                        if (row < frow[gg]) frow[gg] = row;
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
+        }
+        ray_free_raw(ht);
+        for (uint32_t a = 1; a < c->n_aggs; a++)          /* every COUNT is the same count */
+            for (int64_t gg = 0; gg < ng; gg++)
+                memcpy(states + (size_t)gg * blk + c->off[a], states + (size_t)gg * blk + o0, sizeof(int64_t));
+        pr->states = states; pr->first_row = frow; pr->keys = keys; pr->ng = ng;
+    }
+}
+static void agg_run_group_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    agg_run_ctx_t* c = (agg_run_ctx_t*)raw;
+    if (c->n_keys == 1) agg_run_group_body(c, start, end, 1);
+    else agg_run_group_body(c, start, end, c->n_keys);
+}
+
+/* Average run length of the keys over AGG_RUN_SAMPLE windows spread over
+ * the rows; 0 on a read failure. */
+static double agg_run_sample(const agg_run_ctx_t* c) {
+    int64_t rows = 0, runs = 0;
+    const uint32_t nk = c->n_keys;
+    ray_col_scratch_t scr[AGG_RUN_MAX_KEYS];
+    for (uint32_t k = 0; k < nk; k++) ray_col_scratch_init(&scr[k]);
+    bool ok = true;
+    for (int s = 0; s < AGG_RUN_SAMPLE && ok; s++) {
+        int64_t lo = c->nrows / AGG_RUN_SAMPLE * s, hi = lo + AGG_RUN_SAMPLE_ROWS;
+        if (hi > c->nrows) hi = c->nrows;
+        uint64_t prev[AGG_RUN_MAX_KEYS] = { 0 };
+        bool have = false;
+        for (int64_t r = lo; r < hi; ) {
+            const void* data[AGG_RUN_MAX_KEYS]; int8_t ty[AGG_RUN_MAX_KEYS]; uint8_t at[AGG_RUN_MAX_KEYS];
+            int64_t i0[AGG_RUN_MAX_KEYS], n;
+            if (!agg_run_views(c, r, hi, scr, data, ty, at, i0, &n)) { ok = false; break; }
+            for (int64_t i = 0; i < n; i++) {
+                bool same = have;
+                for (uint32_t k = 0; k < nk; k++) {
+                    uint64_t v = (uint64_t)agg_read_key_i64_raw(ty[k], at[k], data[k], i0[k] + i);
+                    same = same && v == prev[k];
+                    prev[k] = v;
+                }
+                if (!same) runs++;
+                have = true; rows++;
+            }
+            r += n;
+        }
+    }
+    for (uint32_t k = 0; k < nk; k++) ray_col_scratch_free(&scr[k]);
+    return ok && runs ? (double)rows / (double)runs : 0;
+}
+
+static ray_t* exec_group_v2_count_runs(
+        ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
+        ray_t** key_cols, int64_t* key_syms,
+        const agg_vtable_t** vts, const size_t* off, size_t block,
+        ray_t* sel, int64_t group_limit, const ray_group_emit_filter_t* efp) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || ext->n_keys == 0 || ext->n_keys > AGG_RUN_MAX_KEYS || ext->n_aggs == 0 || sel ||
+        nrows < AGG_RUN_MIN_ROWS) return NULL;
+    const agg_vtable_t* cntvt = agg_resolve(OP_COUNT, RAY_I64);
+    for (uint32_t a = 0; a < ext->n_aggs; a++)
+        if (ext->agg_ops[a] != OP_COUNT || vts[a] != cntvt) return NULL;
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, nrows, AGG_RUN_MIN_ROWS)) return NULL;
+    agg_desc_t d;
+    ray_t* derr = NULL;
+    if (!agg_desc_init(&d, g, ext, tbl, key_cols, &derr)) return derr;
+    uint32_t nw = ray_pool_total_workers(pool);
+    agg_run_ctx_t c = {
+        .n_keys = ext->n_keys,
+        .nrows = nrows, .nw = nw, .n_parts = AGG_RUN_PARTS,
+        .off = off, .block = block, .n_aggs = ext->n_aggs, .oom = 0, .fail = NULL,
+    };
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        int8_t kt = d.key_types[k];
+        bool kok = kt == RAY_I64 || kt == RAY_I32 || kt == RAY_I16 || kt == RAY_DATE || kt == RAY_TIME ||
+                   kt == RAY_TIMESTAMP || kt == RAY_TIMESPAN || kt == RAY_U8 || kt == RAY_SYM;
+        c.plain[k] = d.key_data[k];
+        c.src[k] = c.plain[k] ? NULL : (d.key_srcs ? d.key_srcs[k] : NULL);
+        if (!kok || (!c.plain[k] && !c.src[k])) { agg_desc_free(&d); return NULL; }
+        c.type[k] = kt; c.attrs[k] = d.key_attrs[k];
+    }
+    double avg = agg_run_sample(&c);
+    if (avg < (ext->n_keys == 1 ? AGG_RUN_MIN_LEN_1 : AGG_RUN_MIN_LEN_N)) { agg_desc_free(&d); return NULL; }
+    c.fail = &d.fail;
+    int64_t ntasks = (int64_t)nw * 8;
+    c.grain = (nrows + ntasks - 1) / ntasks;
+    c.grain = (c.grain + RAY_ENC_VEC - 1) / RAY_ENC_VEC * RAY_ENC_VEC;     /* whole vectors */
+    if (c.grain > ((int64_t)1 << 31)) c.grain = (int64_t)1 << 31;         /* a run's offset word */
+    c.ntasks = (nrows + c.grain - 1) / c.grain;
+    ray_t *ptr_hdr = NULL, *toff_hdr = NULL;
+    void** ptrs = (void**)scratch_calloc(&ptr_hdr, ((size_t)nw * 2 + (size_t)c.ntasks * 2) * sizeof(void*));
+    c.toff = (uint32_t*)scratch_alloc(&toff_hdr, (size_t)c.ntasks * (c.n_parts + 1) * sizeof(uint32_t));
+    c.parts = ray_calloc_raw((size_t)c.n_parts * sizeof(agg_radix_part_t));
+    ray_t* res = NULL;
+    if (ptrs) {
+        c.scratch = (uint64_t**)ptrs;                 c.scratch_hdr = (ray_t**)(ptrs + nw);
+        c.trec = (uint64_t**)(ptrs + 2 * nw);         c.trec_hdr = (ray_t**)(ptrs + 2 * nw + c.ntasks);
+    }
+    if (!ptrs || !c.toff || !c.parts) goto out;
+    agg_route_record(AGG_ROUTE_V2_RUNS);
+    ray_scan_fail_init(&d.fail);
+    ray_pool_dispatch_n(pool, agg_run_collect_fn, &c, (uint32_t)c.ntasks);
+    for (uint32_t w = 0; w < nw; w++) { scratch_free(c.scratch_hdr[w]); c.scratch_hdr[w] = NULL; }
+    if ((res = ray_scan_fail_finish(&d.fail, pool)) != NULL) goto out;
+    if (atomic_load_explicit(&c.oom, memory_order_relaxed)) goto out;
+    ray_profile_tick("runs: collected");
+    ray_pool_dispatch_n(pool, agg_run_group_fn, &c, c.n_parts);
+    for (int64_t t = 0; t < c.ntasks; t++) { scratch_free(c.trec_hdr[t]); c.trec_hdr[t] = NULL; }
+    /* A cancel skips tasks of both dispatches: a partition is then whole
+     * or empty (agg_run_group_fn publishes it at the end), and the emit's
+     * own dispatches answer the cancel. */
+    if (atomic_load_explicit(&c.oom, memory_order_relaxed)) goto out;
+    ray_profile_tick("runs: grouped partitions");
+    scratch_free(toff_hdr); scratch_free(ptr_hdr);
+    return agg_parts_emit(ext, &d, c.parts, c.n_parts, pool, nw, key_cols, key_syms,
+                          vts, off, block, nrows, group_limit, efp);
+out:
+    if (ptrs) {
+        for (uint32_t w = 0; w < nw; w++) scratch_free(c.scratch_hdr[w]);
+        for (int64_t t = 0; t < c.ntasks; t++) scratch_free(c.trec_hdr[t]);
+    }
+    scratch_free(toff_hdr); scratch_free(ptr_hdr);
+    if (c.parts) { agg_radix_parts_destroy(c.parts, c.n_parts, vts, off, block, ext->n_aggs); ray_free_raw(c.parts); }
+    agg_desc_free(&d);
+    return res;
 }
 
 static ray_t* exec_group_v2_parallel_radix(
@@ -12208,6 +12760,9 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                         key_cols, key_syms, &ks->rr, vts, off, block, sel, sel_prefix, n_sel,
                         group_limit, efp)
                 : NULL;
+            if (!r)     /* runs of equal keys, every aggregate a COUNT */
+                r = exec_group_v2_count_runs(g, op, tbl, nrows, key_cols, key_syms,
+                                             vts, off, block, sel, group_limit, efp);
             if (!r) {   /* declined by its sample gate (or disabled) */
                 agg_route_record(AGG_ROUTE_V2_RADIX);
                 r = exec_group_v2_parallel_radix(g, op, tbl, nrows,
