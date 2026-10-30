@@ -269,7 +269,7 @@ A common pattern is one data server with multiple query clients. Each client con
 
 ## 7a. Fast Transports
 
-Two Rayforce processes that can do better than TCP do so on their own. After the handshake a connection between them moves to shared-memory rings when both are on one host, and to RDMA when they are on different hosts that both have a device; a connection to or from an older build, or across hosts without devices, stays on TCP. Nothing in a script changes: `.ipc.send`, `.ipc.post`, hooks, journaling and restricted mode behave the same on every transport.
+Two Rayforce processes that can do better than TCP do so on their own. After the handshake a connection between them moves to shared-memory rings when both are on one host, and to RDMA when they are on different hosts that both have a device; a connection to or from an older build, or across hosts without devices, stays on TCP. Nothing in a script changes: `.ipc.send`, `.ipc.post`, hooks, journaling and restricted mode behave the same on every transport, and so do messages the two sides exchange while the connection moves — a greeting posted from `.ipc.on.open`, the posts an `.ipc.on.async` hook makes in reply. A server shares at most 2 GB of rings at once (63 connections); further local connections stay on TCP.
 
 ```lisp
 ;; On the server's host

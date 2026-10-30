@@ -49,6 +49,13 @@ const char* ray_shm_host_identity(void);
 uint64_t ray_shm_ring_bytes(void);
 #define RAY_SHM_RING_DEFAULT (16ULL << 20)
 #define RAY_SHM_RING_MAX     (1ULL << 30)
+/* The ring bytes a process makes for its clients at most, the files'
+ * control pages included: 2 GB is 63 connections at the default ring.
+ * A connection past it is refused the upgrade and stays on TCP.  The
+ * pages themselves come only as rings are written. */
+#define RAY_SHM_BUDGET       (2ULL << 30)
+/* Ring bytes made for clients and not yet torn down. */
+uint64_t ray_shm_rings_in_use(void);
 
 /* The server's half: the memory file and two eventfds, in `fds` for the
  * client (the file, the eventfd the client sleeps on, the one the server

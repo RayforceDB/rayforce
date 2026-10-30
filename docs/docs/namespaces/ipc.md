@@ -157,7 +157,7 @@ Signature: `(.ipc.transport)` reads the process's transport policy; `(.ipc.trans
 
 | Policy | As a client (`.ipc.open` without a `transport` option) | As a server |
 |---|---|---|
-| `auto` | Asks for shared memory when the peer is on this host, for RDMA when it is on another host and both have a device; stays on TCP otherwise. The default. | Offers shared memory to a peer on this host and RDMA to one on another. |
+| `auto` | Asks for shared memory when the peer is on this host, for RDMA when it is on another host and both have a device; stays on TCP otherwise. The default. | Offers shared memory to a peer on this host (up to 2 GB of rings at once, 63 connections; the rest stay on TCP) and RDMA to one on another. |
 | `tcp` | Never asks: the connection stays on TCP. | Offers nothing: every connection stays on TCP. |
 | `shm` | Asks for shared memory only, and fails the open with `io` when it is not granted. | Offers shared memory only. |
 | `rdma` | Asks for RDMA only, and fails the open with `io` when it is not granted. | Offers RDMA only. |

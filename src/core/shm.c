@@ -73,7 +73,14 @@ typedef struct {
     shm_dir_t*     in;
     uint8_t*       out_ring;
     uint8_t*       in_ring;
+    bool           budgeted;        /* the server's rings, counted against g_rings */
 } shm_xport_t;
+
+/* Ring bytes this process has made for its clients and not yet torn
+ * down.  Past RAY_SHM_BUDGET a new offer is refused and the connection
+ * stays on TCP.  Only the thread of the listening poll creates rings, but
+ * any thread may close a connection: atomic. */
+static _Atomic uint64_t g_rings;
 
 static int64_t now_ns(void)
 {
@@ -201,6 +208,7 @@ static void shm_destroy(ray_xport_t* x)
 {
     shm_xport_t* s = (shm_xport_t*)x;
     size_t bytes = SHM_PAGE + 2 * (size_t)s->ring;
+    if (s->budgeted) atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
     munmap(s->map, bytes);
     ray_sys_track_sub((int64_t)bytes);
     close(s->mine);
@@ -221,9 +229,10 @@ static const ray_xport_ops_t shm_ops = {
 static void* shm_map(int fd, uint64_t ring)
 {
     size_t bytes = SHM_PAGE + 2 * (size_t)ring;
-    /* Faulted in now, not mid-transfer: a page fault per 4 KB inside a
-     * copy measured slower than the whole map up front. */
-    void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+    /* Pages come as the rings are first written, not up front: an idle
+     * connection holds a page or two, not both rings.  The first lap of
+     * a ring pays a fault per page; every later one none. */
+    void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) return NULL;
     ray_sys_track_add((int64_t)bytes);
     return p;
@@ -269,18 +278,31 @@ const char* ray_shm_host_identity(void)
 
 uint64_t ray_shm_ring_bytes(void)
 {
-    /* 16 MB a direction, faulted in when the connection upgrades (about
-     * 2 ms): larger rings cost setup and gain nothing measured. */
+    /* 16 MB a direction: larger rings gain nothing measured. */
     return RAY_SHM_RING_DEFAULT;
+}
+
+uint64_t ray_shm_rings_in_use(void)
+{
+    return atomic_load_explicit(&g_rings, memory_order_relaxed);
 }
 
 ray_xport_t* ray_shm_create(uint64_t ring, int fds[3])
 {
+    /* Claimed before anything is made, given back on every failure. */
+    uint64_t bytes = SHM_PAGE + 2 * ring;
+    if (atomic_fetch_add_explicit(&g_rings, bytes, memory_order_relaxed) + bytes > RAY_SHM_BUDGET) {
+        atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
+        return NULL;
+    }
     int f = -1;
 #ifdef SYS_memfd_create
     f = (int)syscall(SYS_memfd_create, "rayforce-ring", 1u /* MFD_CLOEXEC */);
 #endif
-    if (f < 0) return NULL;
+    if (f < 0) {
+        atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
+        return NULL;
+    }
     int client = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     int server = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     void* map = NULL;
@@ -292,8 +314,10 @@ ray_xport_t* ray_shm_create(uint64_t ring, int fds[3])
         int all[5] = { f, client, server, mine, peer };
         for (int i = 0; i < 5; i++) if (all[i] >= 0) close(all[i]);
         if (map) { munmap(map, SHM_PAGE + 2 * (size_t)ring); ray_sys_track_sub((int64_t)(SHM_PAGE + 2 * ring)); }
+        atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
         return NULL;
     }
+    s->budgeted = true;
     shm_control_t* c = (shm_control_t*)map;
     memset(c, 0, sizeof *c);
     c->magic = SHM_MAGIC;
@@ -331,6 +355,7 @@ ray_xport_t* ray_shm_attach(uint64_t ring, const int fds[3])
 
 const char*  ray_shm_host_identity(void) { return ""; }
 uint64_t     ray_shm_ring_bytes(void) { return 0; }
+uint64_t     ray_shm_rings_in_use(void) { return 0; }
 ray_xport_t* ray_shm_create(uint64_t ring, int fds[3]) { (void)ring; (void)fds; return NULL; }
 ray_xport_t* ray_shm_attach(uint64_t ring, const int fds[3]) { (void)ring; (void)fds; return NULL; }
 
