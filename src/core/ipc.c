@@ -988,6 +988,7 @@ typedef struct {
      * the rx pump moves the connection to it as that frame is read, at
      * whatever depth of nested waits it arrives. */
     ray_xport_t*     switch_xport;
+    int64_t          switch_deadline;   /* the open's deadline, for the drain before the client's marker */
 } ray_ipc_conn_data_t;
 
 /* ===== Transport policy ===== */
@@ -1702,8 +1703,13 @@ static bool client_switch(ray_poll_t* poll, int64_t id, ray_xport_t* x)
 {
     ray_selector_t* conn = ray_poll_get(poll, id);
     if (!conn) { x->ops->destroy(x); return false; }
+    /* Bounded by the open's deadline: a server blocked writing a full ring
+     * we do not read yet does not read TCP either, and a queue larger than
+     * the socket takes would wait on it for ever. */
+    ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)conn->data;
+    int64_t deadline = cd ? cd->switch_deadline : -1;
     uint8_t switched = XP_SWITCHED;
-    if (conn_tx_drain_blocking(poll, conn, -1) < 0 ||
+    if (conn_tx_drain_blocking(poll, conn, deadline) < 0 ||
         upgrade_send((ray_sock_t)conn->fd, &switched, 1) < 0) {
         x->ops->destroy(x);
         ray_poll_deregister(poll, id);
@@ -1776,9 +1782,24 @@ static ray_t* shm_side_read(ray_poll_t* poll, ray_selector_t* sel)
 
 /* Side connections waiting for their token.  The abstract socket has no
  * permissions of its own, so a stranger is turned away at accept, and
- * what is left is bounded: an idler cannot hold descriptors for ever. */
+ * what is left is bounded: at most SHM_SIDE_CONNS_MAX wait at once, and
+ * one that has not shown a token within SHM_SIDE_IDLE_MS is dropped at
+ * the next accept, so idlers cannot keep every later client off the
+ * rings.  A side connection's `data` is the time it was accepted. */
 #define SHM_SIDE_CONNS_MAX 64
+#define SHM_SIDE_IDLE_MS   5000
 static int g_side_conns;
+
+static void shm_side_conns_expire(ray_poll_t* poll)
+{
+    int64_t now = ray_time_now_ms();
+    for (uint32_t i = 0; i < poll->n_sels; i++) {
+        ray_selector_t* s = poll->sels[i];
+        if (s && s->rx.read_fn == shm_side_read &&
+            now - (int64_t)(intptr_t)s->data > SHM_SIDE_IDLE_MS)
+            ray_poll_deregister(poll, (int64_t)i);
+    }
+}
 
 static void shm_side_conn_on_close(ray_poll_t* poll, ray_selector_t* sel)
 {
@@ -1793,6 +1814,7 @@ static ray_t* shm_side_accept(ray_poll_t* poll, ray_selector_t* sel)
     if (c < 0) return NULL;
     struct ucred who;
     socklen_t wl = sizeof who;
+    if (g_side_conns >= SHM_SIDE_CONNS_MAX) shm_side_conns_expire(poll);
     if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &who, &wl) != 0 || who.uid != getuid() ||
         g_side_conns >= SHM_SIDE_CONNS_MAX) {
         /* Another user's client, or too many waiting: told no, so it
@@ -1807,6 +1829,7 @@ static ray_t* shm_side_accept(ray_poll_t* poll, ray_selector_t* sel)
     reg.recv_fn  = ipc_recv_fn;
     reg.read_fn  = shm_side_read;
     reg.close_fn = shm_side_conn_on_close;
+    reg.data     = (void*)(intptr_t)ray_time_now_ms();
     int64_t id = ray_poll_register(poll, &reg);
     if (id < 0) { close(c); return NULL; }
     g_side_conns++;
@@ -2058,7 +2081,8 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
 static int client_await_switch(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
                                ray_xport_t* x, int64_t deadline)
 {
-    cd->switch_xport = x;
+    cd->switch_xport    = x;
+    cd->switch_deadline = deadline;
     ray_poll_buf_t* reply = NULL;
     int rc = upgrade_wait(poll, id, deadline, &reply);
     uint8_t k = reply_kind(reply);

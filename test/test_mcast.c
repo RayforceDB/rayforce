@@ -12,6 +12,7 @@
 #include <rayforce.h>
 #include "core/ipc.h"
 #include "core/poll.h"
+#include "core/shm.h"
 #include "core/runtime.h"
 #include "core/sock.h"
 #include "lang/env.h"
@@ -1292,6 +1293,11 @@ static test_result_t test_mcast_sync_reply_after_queued_frame(void) {
 }
 
 static test_result_t on_rings(test_result_t (*t)(void)) {
+#if defined(__linux__)
+    if (!*ray_shm_host_identity()) SKIP("this host names no boot identity: no shared memory");
+#else
+    SKIP("shared-memory rings are Linux-only");
+#endif
     g_on_rings = true;
     test_result_t r = t();
     g_on_rings = false;

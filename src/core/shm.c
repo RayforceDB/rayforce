@@ -210,7 +210,7 @@ static void shm_destroy(ray_xport_t* x)
     size_t bytes = SHM_PAGE + 2 * (size_t)s->ring;
     if (s->budgeted) atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
     munmap(s->map, bytes);
-    ray_sys_track_sub((int64_t)bytes);
+    ray_sys_track_file_sub((int64_t)bytes);
     close(s->mine);
     close(s->peer);
     ray_sys_free(s);
@@ -231,10 +231,12 @@ static void* shm_map(int fd, uint64_t ring)
     size_t bytes = SHM_PAGE + 2 * (size_t)ring;
     /* Pages come as the rings are first written, not up front: an idle
      * connection holds a page or two, not both rings.  The first lap of
-     * a ring pays a fault per page; every later one none. */
+     * a ring pays a fault per page; every later one none.  Counted as a
+     * file mapping, like a mapped column: the length is reserved, the
+     * resident part is what has been written. */
     void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) return NULL;
-    ray_sys_track_add((int64_t)bytes);
+    ray_sys_track_file_add((int64_t)bytes);
     return p;
 }
 
@@ -313,7 +315,7 @@ ray_xport_t* ray_shm_create(uint64_t ring, int fds[3])
     if (!s) {
         int all[5] = { f, client, server, mine, peer };
         for (int i = 0; i < 5; i++) if (all[i] >= 0) close(all[i]);
-        if (map) { munmap(map, SHM_PAGE + 2 * (size_t)ring); ray_sys_track_sub((int64_t)(SHM_PAGE + 2 * ring)); }
+        if (map) { munmap(map, SHM_PAGE + 2 * (size_t)ring); ray_sys_track_file_sub((int64_t)(SHM_PAGE + 2 * ring)); }
         atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
         return NULL;
     }
@@ -343,7 +345,7 @@ ray_xport_t* ray_shm_attach(uint64_t ring, const int fds[3])
     if (map && c->magic == SHM_MAGIC && c->ring == ring)
         s = shm_new(map, ring, false, fds[1], fds[2]);
     if (!s) {
-        if (map) { munmap(map, SHM_PAGE + 2 * (size_t)ring); ray_sys_track_sub((int64_t)(SHM_PAGE + 2 * ring)); }
+        if (map) { munmap(map, SHM_PAGE + 2 * (size_t)ring); ray_sys_track_file_sub((int64_t)(SHM_PAGE + 2 * ring)); }
         close(fds[1]);
         close(fds[2]);
         return NULL;

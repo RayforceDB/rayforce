@@ -11,19 +11,24 @@
 ;;     it waits for the server's last TCP frame, the server's replies), and
 ;;     the connection ends on the rings with every step answered;
 ;;   - a server whose side channel cannot take another connection says no,
-;;     and the client stays on TCP (AUTO) or fails the open (`shm`);
+;;     and the client stays on TCP (AUTO) or fails the open (`shm`); side
+;;     connections idle past 5 s give their slots up;
 ;;   - a server makes at most RAY_SHM_BUDGET of rings: 63 connections at
 ;;     the default ring, the next one stays on TCP, and a closed one makes
 ;;     room again;
 ;;   - a client blocked on a full ring notices the server's death.
 ;;
 ;; Readiness probe: completes a real handshake (see log_journal.rfl).
+;; The server notices a client's close on its own schedule, so wherever a
+;; step needs the rings a closed connection held, it retries a bounded
+;; number of times rather than sleeping a fixed while.  The side-channel
+;; helper is a python3 script (as parquet_writer_shapes.rfl uses one).
 
 (.sys.exec "pkill -KILL -f '[r]ayforce -p 19987' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held")
+(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_pid")
 (.sys.exec "printf '%s\\n' '(set n 0)' '(set .ipc.on.open (fn [h] (.ipc.post h \"(pong 0)\")))' '(set ping (fn [k] (do (set n k) (if (< k 400) (.ipc.post (.ipc.handle) (format \"(pong %)\" (+ k 1)))) k)))' > /tmp/rftest_xport_edges.rfl")
 
-(.sys.exec "./rayforce -p 19987 /tmp/rftest_xport_edges.rfl </dev/null >/dev/null 2>&1 &")
+(.sys.exec "./rayforce -p 19987 /tmp/rftest_xport_edges.rfl </dev/null >/dev/null 2>&1 & echo $! > /tmp/rftest_xport_pid")
 (.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19987 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 ;; ── frames written while the other side moves ───────────────────────
@@ -42,27 +47,37 @@ m -- 400
 (.ipc.close c)
 (set pong (fn [k] k))
 
+;; Opens a connection, retrying while it lands on TCP for want of rings a
+;; closed connection still held; returns the last handle.
+(set open-shm (fn [] (do (set t (.ipc.open "127.0.0.1:19987")) (set tries 0) (while (and (!= (get (.ipc.handle t) 'transport) 'shm) (< tries 50)) (do (.ipc.close t) (.sys.exec "sleep 0.1") (set t (.ipc.open "127.0.0.1:19987")) (set tries (+ tries 1)))) t)))
+
 ;; ── the side channel says no ────────────────────────────────────────
 ;; A helper holds every slot of the server's side channel; the next
 ;; client is turned away there, after the offer, and stays on TCP.
 (.sys.exec "printf '%s\\n' 'import socket, sys, time' 'pid = sys.argv[1]' 'names = [l.split()[-1] for l in open(\"/proc/net/unix\") if (\"@rayforce-shm.\" + pid + \".\") in l]' 'ss = []' 'for i in range(64): ss.append(socket.socket(socket.AF_UNIX)); ss[-1].connect(chr(0) + names[0][1:])' 'time.sleep(0.5)' 'open(sys.argv[2], \"w\").write(\"ok\")' 'time.sleep(float(sys.argv[3]))' > /tmp/rftest_xport_hold.py")
-(.sys.exec "python3 /tmp/rftest_xport_hold.py $(pgrep -f '[r]ayforce -p 19987' | head -1) /tmp/rftest_xport_held 3 >/dev/null 2>&1 &")
+(.sys.exec "python3 /tmp/rftest_xport_hold.py $(cat /tmp/rftest_xport_pid) /tmp/rftest_xport_held 9 >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 50); do [ -f /tmp/rftest_xport_held ] && exit 0; sleep 0.1; done; exit 1") -- 0
 (set c (.ipc.open "127.0.0.1:19987"))
 (get (.ipc.handle c) 'transport) -- 'tcp
 (.ipc.send c "(+ 1 2)") -- 3
 (.ipc.close c)
 (.ipc.open "127.0.0.1:19987" (dict ['transport] ['shm])) !- io
-;; the helper gone, the slots are free again
-(.sys.exec "for i in $(seq 50); do pgrep -f '[r]ftest_xport_hold' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
-(.sys.exec "sleep 0.2")
+;; idlers that show no token within 5 s are dropped at the next accept:
+;; with the helper still holding its connections, a client gets the rings
+(.sys.exec "sleep 5.5")
 (set c (.ipc.open "127.0.0.1:19987"))
 (get (.ipc.handle c) 'transport) -- 'shm
 (.ipc.close c)
-(.sys.exec "sleep 0.2")
+;; the helper gone, the slots are free again
+(.sys.exec "for i in $(seq 50); do pgrep -f '[r]ftest_xport_hold' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(set c (open-shm))
+(get (.ipc.handle c) 'transport) -- 'shm
+(.ipc.close c)
 
 ;; ── the server's ring budget ────────────────────────────────────────
-(set hs (map (fn [k] (.ipc.open "127.0.0.1:19987")) (til 63)))
+;; Every one of the 63 on the rings once the earlier closes have landed
+;; (open-shm waits for each in turn).
+(set hs (map (fn [k] (open-shm)) (til 63)))
 (all (== (map (fn [x] (get (.ipc.handle x) 'transport)) hs) 'shm)) -- true
 (set t (.ipc.open "127.0.0.1:19987"))
 (get (.ipc.handle t) 'transport) -- 'tcp
@@ -71,18 +86,16 @@ m -- 400
 (.ipc.open "127.0.0.1:19987" (dict ['transport] ['shm])) !- io
 ;; one closed makes room for one
 (.ipc.close (first hs))
-(.sys.exec "sleep 0.2")
-(set t (.ipc.open "127.0.0.1:19987"))
+(set t (open-shm))
 (get (.ipc.handle t) 'transport) -- 'shm
 (.ipc.close t)
 (map (fn [x] (.ipc.close x)) (drop hs 1))
-(.sys.exec "sleep 0.2")
 
 ;; ── a full ring and a dead peer ─────────────────────────────────────
 ;; The server busies itself, so a 48 MB request fills the 16 MB ring and
 ;; the send waits for room; the server is killed meanwhile, and the
 ;; waiting send fails instead of waiting for ever.
-(set c (.ipc.open "127.0.0.1:19987"))
+(set c (open-shm))
 (get (.ipc.handle c) 'transport) -- 'shm
 (.ipc.post c "(do (set s (.time.now)) (while (< (.time.now) (+ s 5000)) 0) 0)")
 (.sys.exec "(sleep 1; pkill -KILL -f '[r]ayforce -p 19987') >/dev/null 2>&1 &")
@@ -90,4 +103,4 @@ m -- 400
 
 ;; ── teardown ────────────────────────────────────────────────────────
 (.sys.exec "pkill -KILL -f '[r]ayforce -p 19987' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held")
+(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_pid")
