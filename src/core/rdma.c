@@ -189,6 +189,12 @@ static rdma_port_t* port(void)
 #define RDMA_SIGNAL_EVERY 128
 #define RDMA_SPIN_NS      50000         /* a waiting side polls this long before sleeping */
 #define RDMA_COPY_MAX     (1u << 22)
+/* Sends outstanding at most (the queue's depth less a signalling
+ * interval: a send is known done only when a later signalled one is), and
+ * of them ring writes: the rest is kept for credits, so a sender whose
+ * queue is full of its own bytes can still return the peer's space. */
+#define RDMA_SQ_MAX       (RDMA_SENDS - RDMA_SIGNAL_EVERY)
+#define RDMA_SQ_DATA      (RDMA_SQ_MAX - 16)
 
 typedef struct {
     ray_xport_t              base;
@@ -306,15 +312,21 @@ static void drain_events(rdma_xport_t* e)
     }
 }
 
-/* One write of ring bytes (or none, for a credit) with its immediate. */
+/* The send queue takes another send while fewer than `limit` are
+ * outstanding.  A peer that stops taking completions — busy with a long
+ * query — leaves our sends unacknowledged: a non-blocking writer then
+ * reports no progress and the poll loop waits for the completions on the
+ * channel, as it waits for ring space. */
+static bool sq_room(rdma_xport_t* e, int limit)
+{
+    if (e->outstanding >= limit) progress(e);
+    return e->outstanding < limit;
+}
+
+/* One write of ring bytes (or none, for a credit) with its immediate;
+ * the caller has seen room for it in the send queue. */
 static bool post_write(rdma_xport_t* e, uint64_t off, uint32_t n, uint32_t imm)
 {
-    while (e->outstanding >= RDMA_SENDS - RDMA_SIGNAL_EVERY && !e->failed) {   /* the send queue's room */
-        struct pollfd p = { e->ch->fd, POLLIN, 0 };
-        poll(&p, 1, 1);
-        drain_events(e);
-        progress(e);
-    }
     if (e->failed) return false;
     struct ibv_sge sge;
     memset(&sge, 0, sizeof sge);
@@ -342,10 +354,13 @@ static bool post_write(rdma_xport_t* e, uint64_t off, uint32_t n, uint32_t imm)
  * ring, or all of it once everything that landed is read. */
 static void report(rdma_xport_t* e)
 {
+    /* A full send queue defers the credit: the next look (a read, a
+     * pending check, a sleep) sends it once a completion has made room. */
     if (e->rx_unreported &&
         (e->rx_unreported >= e->rx_size / 4 ||
          (e->rx_avail == 0 && e->rx_unreported >= e->rx_size / 16) ||
-         (e->rx_avail == 0 && e->rx_unreported >= 65536))) {
+         (e->rx_avail == 0 && e->rx_unreported >= 65536)) &&
+        sq_room(e, RDMA_SQ_MAX)) {
         post_write(e, 0, 0, RDMA_CREDIT | (uint32_t)e->rx_unreported);
         e->rx_unreported = 0;
     }
@@ -355,7 +370,18 @@ static bool rdma_room(ray_xport_t* x)
 {
     rdma_xport_t* e = (rdma_xport_t*)x;
     if (e->tx_pos - e->peer_read == e->tx_size) progress(e);
-    return e->failed || e->tx_pos - e->peer_read < e->tx_size;
+    return e->failed ||
+           (e->tx_pos - e->peer_read < e->tx_size && sq_room(e, RDMA_SQ_DATA));
+}
+
+/* A blocking writer's wait for the peer: its credit, or the completions
+ * that free the send queue. */
+static void wait_peer(rdma_xport_t* e)
+{
+    drain_events(e);
+    struct pollfd pf = { e->ch->fd, POLLIN, 0 };
+    poll(&pf, 1, 10);
+    drain_events(e);
 }
 
 static int64_t rdma_write(ray_xport_t* x, const uint8_t* p, int64_t len, bool block)
@@ -369,11 +395,14 @@ static int64_t rdma_write(ray_xport_t* x, const uint8_t* p, int64_t len, bool bl
             if (!progress(e)) return -1;
             if (e->tx_pos - e->peer_read == e->tx_size) {
                 if (!block) return taken;
-                drain_events(e);
-                struct pollfd pf = { e->ch->fd, POLLIN, 0 };
-                poll(&pf, 1, 10);
-                drain_events(e);
+                wait_peer(e);
             }
+            continue;
+        }
+        if (!sq_room(e, RDMA_SQ_DATA)) {
+            if (e->failed) return -1;
+            if (!block) return taken;
+            wait_peer(e);
             continue;
         }
         uint64_t off = e->tx_pos % e->tx_size;
@@ -417,6 +446,7 @@ static bool rdma_pending(ray_xport_t* x)
 {
     rdma_xport_t* e = (rdma_xport_t*)x;
     progress(e);
+    report(e);   /* a credit a full send queue deferred */
     return e->rx_avail || e->failed;
 }
 
@@ -427,9 +457,11 @@ static bool rdma_prepare_sleep(ray_xport_t* x, bool want_data, bool want_room)
      * after raises the channel. */
     drain_events(e);
     progress(e);
+    report(e);
     if (e->failed) return false;
     if (want_data && e->rx_avail) return false;
-    if (want_room && e->tx_pos - e->peer_read < e->tx_size) return false;
+    if (want_room && e->tx_pos - e->peer_read < e->tx_size && e->outstanding < RDMA_SQ_DATA)
+        return false;
     return true;
 }
 
