@@ -117,6 +117,7 @@ nav:
           - Advanced Analytics: docs/tutorials/analytics.md
       - Rayfall Language:
           - Syntax: docs/language/syntax.md
+          - Names and Scope: docs/language/name-resolution.md
           - Functions Reference: docs/language/functions.md
           - Math Operations: docs/language/math.md
           - String Operations: docs/language/string.md
