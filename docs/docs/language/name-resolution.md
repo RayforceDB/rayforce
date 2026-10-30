@@ -8,7 +8,8 @@ that column.
 ## Global and local bindings
 
 `set` binds a global name. `let` binds in the current frame: the top level, a
-function call, or a `do` block. Function parameters are local to that call.
+function call, or an interpreted `do` block. Function parameters are local to
+that call.
 
 ```lisp
 (set x 10)
@@ -17,8 +18,16 @@ x                                 ; 10
 ((fn [x] x) 30)                  ; 30
 ```
 
-`do` creates a new frame. `while` does not: a `let` in its body belongs to the
-enclosing frame. A later `let` of the same name in that frame changes the
+At the top level, interpreted `do` pushes a frame, as the example shows. A
+compiled function body runs `do` inline: a `let` inside it can rebind a
+parameter and remain visible after the `do`:
+
+```lisp
+((fn [x] (do (let x 20)) x) 10) ; 20
+```
+
+`while` does not push a frame on either route: a `let` in its body belongs to
+the enclosing frame. A later `let` of the same name in that frame changes the
 value subsequent reads see.
 
 ## Names in queries
@@ -34,15 +43,23 @@ that column.
 (select {p: price from: trades})  ; p is [10 20], from the column
 ```
 
-An output alias does not create a binding for another expression in the same
-query. A quoted symbol used as data can also name a column in query context;
-see [Select](../queries/select.md) for the query-specific rules.
+A later projection can read an earlier output alias in the same `select`:
+
+```lisp
+(select {p: price q: (+ p 1) from: trades}) ; q is [11 21]
+```
+
+The alias is bound after its own expression. `where:` and `by:` use the source
+table rather than projection aliases; sort keys have their own scope rules.
+A quoted symbol used as data can also name a column in query context. See
+[Select](../queries/select.md) for these query-specific rules.
 
 ## Closures
 
-A closure captures the local bindings visible where its `fn` is written. It
-does not capture locals of whoever calls it. A name that was not captured is
-resolved when the closure runs, so a later global `set` can change its value.
+A closure captures the local bindings visible where its `fn` is written. A
+caller's local cannot replace a *captured* binding. An uncaptured name is
+resolved when the closure runs: it can see a later global `set`, or an ordinary
+local in an interpreted caller's frame.
 
 ```lisp
 (set g 1)
@@ -52,20 +69,38 @@ resolved when the closure runs, so a later global `set` can change its value.
 (f)                               ; 12: captured x, current global g
 ```
 
+For an uncaptured function name, the caller's interpreted local can win:
+
+```lisp
+(set namedfn (fn [v] (+ v 1)))
+(set closedfn (fn [v] (namedfn v)))
+(do (let namedfn (fn [v] 99)) (closedfn 3)) ; 99
+```
+
 `eval` and `resolve` inside a function body can see that body's locals and
 captures. `(resolve 'x)` reads the currently visible binding of `x`; `eval`
 evaluates a parsed expression in the current context.
 
 ## Mutating a named table
 
-The quoted-symbol forms `(insert 't rows)`, `(upsert 't keys rows)` and
-`(alter 't ...)` rebind the *global* `t` by name. They do not mutate a local
-parameter or `let` binding. In particular, `alter` rejects a local target
-with a `domain` error. To work with a local table, use the value-returning
-form and bind its result explicitly.
+The quoted-symbol forms of `insert` and `upsert` look up the named table in
+the visible scope, local first. They can amend a sole-owned local table in
+place. A path that rebuilds the result instead writes back to a global name,
+so the quoted-symbol form is not a reliable way to update a local:
+
+```lisp
+(do (let local_t (table [x] (list (til 2))))
+    (insert 'local_t (list 3))
+    (count local_t))                 ; 3, amended in place
+```
+
+`alter` differs: it requires a global target and rejects a local target with
+a `domain` error. For a local table, use the value-returning `insert` or
+`upsert` form and bind its result explicitly.
 
 Names beginning with `.` are reserved for system namespaces such as `.sys`
-and `.db`. `set`, `let`, parameters, and `del` cannot bind or delete them.
-This rule is the same in interpreted expressions and compiled function
-bodies; compiled closures capture locals at creation rather than reading a
-caller's frame.
+and `.db`; ordinary dotted names cannot be rebound, and parameters cannot
+use reserved names. The five connection-hook slots `.ipc.on.open`,
+`.ipc.on.close`, `.ipc.on.sync`, `.ipc.on.async`, and `.ipc.on.auth` are the
+exception: `set` installs a hook and `del` clears it. See
+[IPC Connection Hooks](../storage/ipc-hooks.md).
