@@ -1,0 +1,22 @@
+;; Compact output must quote string bytes before it is parsed again.
+(set quoted "a\"b")
+(== quoted (first (eval (parse (format "%" (list quoted 1)))))) -- true
+(set slash "C:\\new")
+(== slash (first (eval (parse (format "%" (list slash 1)))))) -- true
+(set controls "one\ntwo\tthree\r")
+(== controls (first (eval (parse (format "%" (list controls 1)))))) -- true
+(set byte "a\001b")
+(== byte (first (eval (parse (format "%" (list byte 1)))))) -- true
+
+;; A quote from data cannot close a string literal and run a sibling form.
+(set payload "x\"] (println \"INJECTED\") [\"")
+(== payload (first (eval (parse (format "%" (list payload 1)))))) -- true
+
+;; Both atom and vector/table formatting use the same escaping rules.
+(set t (table [s] (list (as 'STR (list quoted slash controls payload)))))
+(all (== (at t 's) (at (eval (parse (format "%" t))) 's))) -- true
+
+;; The escape decoder must also accept a long emitted string.
+(set long (str-join (map (fn [i] "a") (til 5000)) ""))
+(set long (concat long "\\"))
+(== long (first (eval (parse (format "%" (list long 1)))))) -- true
