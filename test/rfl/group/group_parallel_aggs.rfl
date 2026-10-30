@@ -97,6 +97,66 @@
 (at (at Rdfl 'f) 0) -- 0
 (at (at Rdfl 'l) 0) -- 99996
 
+;; ─── DA worker sets seeded lazily, a chunk of 64 slots at a time ─────
+;; A strlen aggregate keeps the grouping on the DA route; 1103 slots (the
+;; last chunk partial) and 500 rows a group give every worker of a small
+;; pool its own set (a pool past ~30 workers partitions the slots instead).
+;; Sorted keys: each worker seeds the few chunks its rows
+;; reach and the merge skips the rest.  Scattered keys: every chunk of every
+;; set is reached through the row-by-row seeding.  MIN/MAX read their
+;; seeds; a missed seed or a merged unseeded chunk changes the answers.
+(set Gz 1103)
+(set iz (til (* 500 Gz)))
+(set wz (as 'SYM ["a" "bb" "ccc" "dddd" "eeeee" "ffffff" "ggggggg"]))
+(set Tz (table [k kx v nv w] (list (+ 5000 (div iz 500)) (+ 5000 (% (* iz 7919) Gz)) iz (- 0 iz) (at wz (% iz 7)))))
+(set Rz (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: k}))
+(set gz (- (at Rz 'k) 5000))
+(count Rz) -- 1103
+(all (== (at Rz 'c) 500)) -- true
+(all (== (at Rz 's) (+ (* 250000 gz) 124750))) -- true
+(all (== (at Rz 'mn) (* 500 gz))) -- true
+(all (== (at Rz 'mx) (* -500 gz))) -- true
+(at (at Rz 'l) 0) -- 1994
+(sum (at Rz 'l)) -- (sum (strlen (at Tz 'w)))
+(set Rx (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mxv: (max v) mx: (max nv) from: Tz by: kx}))
+(count Rx) -- 1103
+(all (== (at Rx 'c) 500)) -- true
+(all (< (at Rx 'mn) Gz)) -- true
+(all (== (- (at Rx 'mxv) (at Rx 'mn)) 550397)) -- true
+(all (== (at Rx 'mx) (- 0 (at Rx 'mn)))) -- true
+(all (== (at Rx 's) (+ (* 500 (at Rx 'mn)) 137599250))) -- true
+(sum (at Rx 'l)) -- (sum (strlen (at Tz 'w)))
+(set Lx (select {l: (avg (strlen w)) c: (count w) from: Tz by: kx}))
+(all (== (at Lx 'c) 500)) -- true
+(< (abs (- (sum (* (at Lx 'l) (at Lx 'c))) (sum (strlen (at Tz 'w))))) 0.001) -- true
+(set Lz (select {l: (avg (strlen w)) c: (count w) from: Tz by: k}))
+(all (== (at Lz 'c) 500)) -- true
+(< (abs (- (sum (* (at Lz 'l) (at Lz 'c))) (sum (strlen (at Tz 'w))))) 0.001) -- true
+;; A where: on a column sends the strlen fold through the mixed-segment row
+;; path, which seeds before its first write as well.
+(set Wz (select {l: (avg (strlen w)) c: (count w) from: Tz by: kx where: (> (% v 3) 0)}))
+(set Wt (select {from: Tz where: (> (% v 3) 0)}))
+(count Wz) -- 1103
+(sum (at Wz 'c)) -- (count Wt)
+(< (abs (- (sum (* (at Wz 'l) (at Wz 'c))) (sum (strlen (at Wt 'w))))) 0.001) -- true
+;; The F64 MIN/MAX seeds (the fp sentinels), the nullable inputs' non-null
+;; counts and the squares of a variance seed from zero too, and "" marks
+;; the strlen path's null cells.  The same aggregates without the strlen
+;; take another engine: its answer is the reference.
+(set wn (as 'SYM ["" "bb" "" "dddd" "eeeee" "" "ggggggg"]))
+(set Tn (table [kx v f ni w] (list (at Tz 'kx) iz (map (fn [x] (if (== 0 (% x 97)) 0Nf (as 'F64 x))) iz) (map (fn [x] (if (== 0 (% x 13)) 0N x)) iz) (at wn (% iz 7)))))
+(set Nd (select {from: (select {zl: (sum (strlen w)) fmn: (min f) fmx: (max f) fa: (avg f) vf: (var f) na: (avg ni) c: (count v) from: Tn by: kx}) asc: kx}))
+(set Nr (select {from: (select {fmn: (min f) fmx: (max f) fa: (avg f) vf: (var f) na: (avg ni) c: (count v) from: Tn by: kx}) asc: kx}))
+(count Nd) -- 1103
+(all (== (at Nd 'kx) (at Nr 'kx))) -- true
+(all (== (at Nd 'c) (at Nr 'c))) -- true
+(all (== (at Nd 'fmn) (at Nr 'fmn))) -- true
+(all (== (at Nd 'fmx) (at Nr 'fmx))) -- true
+(< (max (abs (- (at Nd 'fa) (at Nr 'fa)))) 0.000001) -- true
+(< (max (abs (/ (- (at Nd 'vf) (at Nr 'vf)) (at Nr 'vf)))) 0.000000001) -- true
+(< (max (abs (- (at Nd 'na) (at Nr 'na)))) 0.000001) -- true
+(sum (at Nd 'zl)) -- (sum (strlen (at Tn 'w)))
+
 ;; ─── Null-aware group agg: all-null group → typed null output ─────────
 ;; Groups where all values are null should emit typed null for
 ;; min/max/prod/first/last (nn==0 finalization path).

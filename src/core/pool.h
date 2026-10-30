@@ -271,6 +271,17 @@ void ray_pool_dispatch_geometry(ray_pool_t* pool, int64_t total_elems, int64_t g
  * elements when the realloc fails, or above RAY_POOL_MAX_TASKS tasks; 0 off.
  * Disarmed by ray_test_hooks_off. */
 void ray_pool_test_ring_fail(uint32_t cap);
+/* Test hook (C tests only): the nth dispatch after arming (ray_pool_dispatch,
+ * ray_pool_dispatch_grain and ray_pool_dispatch_n counted together) finds
+ * the query cancelled before its first round, so every ticket of it on that
+ * pool is skipped and nothing of it runs: a cancel request (the eval flag
+ * and the pool's cancelled flag, as ray_request_interrupt sets them), or the
+ * pool's cancelled flag alone when pool_only (as ray_cancel sets it); nth 0
+ * off.  Disarmed by ray_test_hooks_off (which clears the interrupt).
+ * Compiled only under DEBUG, as the test objects are. */
+#ifdef DEBUG
+void ray_pool_test_cancel_at(uint32_t nth, bool pool_only);
+#endif
 
 /* Dispatch exactly n_tasks tasks, each with range [i, i+1).
  * Used for partition-parallel workloads where each task is one partition. */
@@ -278,6 +289,8 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx, uint32_t n
 
 /* Global pool lifecycle (lazy singleton) */
 ray_pool_t* ray_pool_get(void);
+/* The singleton while it is up, else NULL: never creates it. */
+ray_pool_t* ray_pool_live(void);
 /* Threads of the global pool, main included: its size when it exists, else
  * the size a default one would get (nothing is created). */
 uint32_t ray_pool_size(void);

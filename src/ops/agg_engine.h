@@ -96,6 +96,7 @@ typedef enum {
     AGG_ROUTE_V2_SMALLHASH,
     AGG_ROUTE_V2_INDEXED,
     AGG_ROUTE_V2_TABLESTACK,
+    AGG_ROUTE_V2_RUNS,
     AGG_ROUTE_COUNT,
 } agg_route_t;
 
@@ -121,6 +122,9 @@ typedef struct {
     uint64_t dense_local_slots;     /* allocated group-state slots, including partials */
     uint32_t dense_tasks;           /* local/partition tasks; worker count for shared updates */
     uint64_t key_domain_evals;      /* computed keys evaluated once per distinct symbol */
+    uint64_t key_vocab_order;       /* ...of which put back into vocabulary order on the pool */
+    uint64_t da_lazy_merges;        /* legacy dense-array groupings merged over lazily seeded sets */
+    uint64_t da_lazy_skipped;       /* ...(worker, 64-slot chunk) pairs those merges skipped as never seeded */
     bool topn_native;               /* last v2 run selected the emit filter's top-N itself */
     int64_t topn_kept;              /* groups kept by that selection (ties included) */
     uint64_t first_n;               /* unordered take: N answered by the first-N pre-pass */
@@ -141,6 +145,8 @@ typedef struct {
 enum { AGG_RADIX_P1_TWO_PASS = 1, AGG_RADIX_P1_FUSED_RECORDS, AGG_RADIX_P1_FUSED_COMPACT };
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
+void agg_route_note_vocab_order(void);
+void agg_route_note_da_lazy(uint64_t skipped_chunks);
 agg_route_stats_t agg_route_stats(void);
 void agg_route_record(agg_route_t route);
 void agg_route_reason(agg_v2_reason_t reason);

@@ -1265,6 +1265,75 @@ static test_result_t test_sel_compact_none_pass(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * sel_compact — SYM null flag of a compacted column
+ *
+ * A SYM null is id 0, copied verbatim by the gather.  The compacted column
+ * carries HAS_NULLS exactly when a kept row holds a 0 (a null in a dropped
+ * row does not count), at each width, over a row count past the parallel
+ * threshold and under it.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_sel_compact_sym_nulls(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t sizes[2] = { 3000, 300000 };
+    const uint8_t widths[3] = { RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32 };
+    for (int si = 0; si < 2; si++) {
+        const int64_t N = sizes[si];
+        for (int wi = 0; wi < 3; wi++) {
+            /* column 0: nulls in dropped rows only; 1: one kept null; 2: none */
+            ray_t* cols[3];
+            for (int c = 0; c < 3; c++) {
+                cols[c] = ray_sym_vec_new(widths[wi], N);
+                cols[c]->len = N;
+                for (int64_t i = 0; i < N; i++) {
+                    uint64_t id = 1 + (uint64_t)(i % 50);
+                    if (c == 0 && i % 3 == 0 && i % 7 == 0) id = 0;
+                    if (c == 1 && i == 1000) id = 0;
+                    ray_write_sym(ray_data(cols[c]), i, id, RAY_SYM, cols[c]->attrs);
+                }
+            }
+            ray_t* pred = ray_vec_new(RAY_BOOL, N);
+            pred->len = N;
+            int64_t kept = 0;
+            for (int64_t i = 0; i < N; i++) {
+                ((uint8_t*)ray_data(pred))[i] = i % 3 != 0;
+                kept += i % 3 != 0;
+            }
+            ray_t* tbl = ray_table_new(3);
+            const char* names[3] = { "n0", "n1", "n2" };
+            for (int c = 0; c < 3; c++) {
+                tbl = ray_table_add_col(tbl, ray_sym_intern(names[c], 2), cols[c]);
+                ray_release(cols[c]);
+            }
+            ray_t* sel = ray_rowsel_from_pred(pred);
+            TEST_ASSERT_NOT_NULL(sel);
+            ray_t* res = sel_compact(NULL, tbl, sel, NULL, 0);
+            TEST_ASSERT_TRUE(res && !RAY_IS_ERR(res));
+            TEST_ASSERT_EQ_I(ray_table_nrows(res), kept);
+            for (int c = 0; c < 3; c++) {
+                ray_t* rc = ray_table_get_col(res, ray_sym_intern(names[c], 2));
+                TEST_ASSERT_NOT_NULL(rc);
+                TEST_ASSERT_EQ_I(rc->attrs & RAY_SYM_W_MASK, widths[wi]);
+                TEST_ASSERT_EQ_I((rc->attrs & RAY_ATTR_HAS_NULLS) != 0, c == 1);
+            }
+            ray_t* r1 = ray_table_get_col(res, ray_sym_intern("n1", 2));
+            int64_t zeros = 0;
+            for (int64_t i = 0; i < kept; i++)
+                zeros += ray_read_sym(ray_data(r1), i, RAY_SYM, r1->attrs) == 0;
+            TEST_ASSERT_EQ_I(zeros, 1);
+            ray_rowsel_release(sel);
+            ray_release(res);
+            ray_release(pred);
+            ray_release(tbl);
+        }
+    }
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test 19: sel_compact — parted column table
  *
  * Targets filter.c L609-629 (the has_parted branch in sel_compact) and
@@ -2924,6 +2993,7 @@ const test_entry_t partition_exec_entries[] = {
     { "filter/filter_head_parted",   test_filter_head_parted,             NULL, NULL },
     { "filter/sel_compact_basic",    test_sel_compact_basic,              NULL, NULL },
     { "filter/sel_compact_none",     test_sel_compact_none_pass,          NULL, NULL },
+    { "filter/sel_compact_sym_nulls", test_sel_compact_sym_nulls,         NULL, NULL },
     { "filter/sel_compact_parted",   test_sel_compact_parted,             NULL, NULL },
     { "filter/seq_mapcommon",        test_filter_seq_mapcommon,           NULL, NULL },
     { "filter/head_zero_limit",      test_filter_head_zero_limit,         NULL, NULL },

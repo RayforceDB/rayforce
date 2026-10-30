@@ -338,6 +338,354 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     PASS();
 }
 
+
+/* The legacy dense-array grouping seeds the workers' sets lazily and its
+ * parallel merge skips the chunks a worker never seeded.  agg_route_stats()
+ * shows the merge ran (da_lazy_merges) and the (worker, chunk) pairs it
+ * skipped (da_lazy_skipped).  Which worker takes which rows is the pool's
+ * choice, so the skip count is asserted only where the keys decide it:
+ * four values across an 18-chunk range reach at most four chunks of any
+ * worker, so each of the three workers past the first skips at least 14.  The sorted and
+ * scattered groupings of 1103 keys check the merged values. */
+static test_result_t test_dense_array_lazy_merge_route(void) {
+    /* Four workers: within the accumulator budget of every case below (the
+     * budget is rows over cells per worker; past it the grouping partitions
+     * the slots instead and no lazy merge runs), whatever the host's count. */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const char* const setup =
+        "(set Gz 1103) "
+        "(set iz (til (* 500 Gz))) "
+        "(set wz (as 'SYM [\"a\" \"bb\" \"ccc\" \"dddd\" \"eeeee\" \"ffffff\" \"ggggggg\"])) "
+        "(set Tz (table [k kx v nv w] (list (+ 5000 (div iz 500)) (+ 5000 (% (* iz 7919) Gz)) iz (- 0 iz) (at wz (% iz 7))))) "
+        "(set is (til 70000)) "
+        "(set Ts (table [k v w] (list (at [5000 5400 5800 6103] (% is 4)) is (at wz (% is 7)))))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; const char* chk; } cases[] = {
+        /* sorted: a group's 500 rows are i = 500g..500g+499 */
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mx: (max nv) from: Tz by: k}))",
+          "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
+          " (+ (if (all (== (at R 's) (+ (* 250000 (- (at R 'k) 5000)) 124750))) 1 0) (if (all (== (at R 'mn) (* 500 (- (at R 'k) 5000)))) 1 0)))"
+          " (+ (if (all (== (at R 'mx) (- 0 (* 500 (- (at R 'k) 5000))))) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))" },
+        /* scattered: a group's rows are one residue class mod 1103, so
+         * its smallest row is below 1103 and its largest 499 classes on */
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) mxv: (max v) from: Tz by: kx}))",
+          "(+ (+ (+ (if (== (count R) 1103) 1 0) (if (all (== (at R 'c) 500)) 1 0))"
+          " (+ (if (== (sum (at R 's)) (sum (at Tz 'v))) 1 0) (if (all (< (at R 'mn) 1103)) 1 0)))"
+          " (+ (if (all (== (- (at R 'mxv) (at R 'mn)) 550397)) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Tz 'w)))) 1 0)))" },
+        /* sparse: group j holds i = 4m + j, m < 17500 */
+        { "(set R (select {l: (sum (strlen w)) c: (count v) s: (sum v) mn: (min v) from: Ts by: k}))",
+          "(+ (+ (+ (if (all (== (at R 'k) [5000 5400 5800 6103])) 1 0) (if (all (== (at R 'c) 17500)) 1 0))"
+          " (+ (if (all (== (at R 's) (+ 612465000 (* 17500 [0 1 2 3])))) 1 0) (if (all (== (at R 'mn) [0 1 2 3])) 1 0)))"
+          " (+ (if (== (count R) 4) 1 0) (if (== (sum (at R 'l)) (sum (strlen (at Ts 'w)))) 1 0)))" },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        agg_route_reset();
+        ray_t* out = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        agg_route_stats_t st = agg_route_stats();
+        ray_release(out);
+        TEST_ASSERT_EQ_I(st.da_lazy_merges, 1);
+        if (c == 2)
+            TEST_ASSERT_FMT(st.da_lazy_skipped >= 14u * 3u,
+                            "sparse keys: %llu (worker, chunk) pairs skipped, expected at least 42",
+                            (unsigned long long)st.da_lazy_skipped);
+        ray_t* chk = ray_eval_str(cases[c].chk);
+        TEST_ASSERT_NOT_NULL(chk); TEST_ASSERT_FALSE(RAY_IS_ERR(chk));
+        TEST_ASSERT_FMT(chk->type == -RAY_I64 && chk->i64 == 6, "case %zu: %lld of 6 value checks hold", c,
+                        chk->type == -RAY_I64 ? (long long)chk->i64 : -1LL);
+        ray_release(chk);
+    }
+    PASS();
+}
+
+/* The distinct count of a plain SYM column above the parallel floor sets
+ * its code bits on the pool: a cancel landing before that dispatch, or
+ * before any earlier one of the query, answers `cancel` (the count's own
+ * check, else the execute boundary) and never a count of the bits some
+ * tasks set; armed past the last dispatch, the count. */
+static test_result_t test_sym_distinct_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* r = ray_eval_str("(set cdc (as 'SYMBOL (map (fn [j] (format \"d%\" (% (* j 7919) 50000))) (til 200000))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const char* q = "(count (distinct cdc))";
+    int cancelled = 0, answered = 0;
+    for (int mode = 0; mode < 2; mode++)
+        for (int k = 1; k <= 8; k++) {
+            ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+            ray_t* got = ray_eval_str(q);
+            ray_pool_test_cancel_at(0, false);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (RAY_IS_ERR(got)) {
+                bool is_cancel = strcmp(ray_err_code(got), "cancel") == 0;
+                ray_error_free(got);
+                TEST_ASSERT_FMT(is_cancel, "mode %d, cancel before dispatch %d: an error other than cancel", mode, k);
+                cancelled++;
+                continue;
+            }
+            TEST_ASSERT_FMT(got->type == -RAY_I64 && got->i64 == 50000,
+                            "mode %d, cancel before dispatch %d: %lld distinct, want 50000", mode, k,
+                            got->type == -RAY_I64 ? (long long)got->i64 : -1LL);
+            ray_release(got);
+            answered++;
+        }
+    TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
+    PASS();
+}
+
+/* A grouping on integer or SYM keys whose aggregates are all COUNTs, over
+ * keys held in runs of equal values, collapses each run into one record
+ * (the runs route).  The same query with a SUM beside the counts takes the
+ * radix route: its key and count columns must be the runs route's, in the
+ * same order (first-seen for the whole group, count then first row for the
+ * top N), over runs of 5 that cross the 1024-row vectors and the tasks,
+ * keys seen again in later runs, nulls among the keys, one to three keys
+ * (a SYM one, a computed one), each read in place and by range from a
+ * compressed file.  Keys without runs keep the radix route. */
+#define CRUN_DIR "/tmp/rayforce_test_count_runs/t/"
+static test_result_t test_count_runs_route(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf("/tmp/rayforce_test_count_runs");
+    /* 1.2M rows: runs of 5 over 60011 keys, each seen in 4 runs (the last
+     * few keys in 3); k sparse 64-bit, h the same as I32, z zeros for the
+     * radix twin, n a key with nulls, s a SYM of the key (the null symbol
+     * among its 13 values), t a key of its own (3 values in runs of 7, so
+     * a run of k holds two of t and a k meets every t), u keys without runs */
+    ray_t* r = ray_eval_str(
+        "(set ci (til 1200000))"
+        "(set cg (% (div ci 5) 60011))"
+        "(set cy (as 'SYMBOL (map (fn [j] (if (== j 4) \"\" (format \"y%\" j))) (til 13))))"
+        "(set CR (table [k h z n s t u] (list (* cg 7919000003) (as 'I32 (* cg 35771))"
+        " (* ci 0) (+ (* cg 7919000003) (at [0 0 0 0Nl 0 0 0] (% cg 7))) (at cy (% cg 13))"
+        " (% (div ci 7) 3) (% (* ci 2654435761) 1000000007))))"
+        "(.db.splayed.set \"" CRUN_DIR "\" CR {compress: true})"
+        "(set CM (.db.splayed.get \"" CRUN_DIR "\"))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    /* groups: the whole group's count (0: a top N) */
+    static const struct { const char* runs; const char* radix; agg_route_t route; int64_t groups; } cases[] = {
+        { "(select {from:X by:k c:(count k)})",
+          "(select {from:X by:k c:(count k) zz:(sum z)})", AGG_ROUTE_V2_RUNS, 60011 },
+        { "(select {from:X by:k c:(count k) desc:c take:10})",
+          "(select {from:X by:k c:(count k) zz:(sum z) desc:c take:10})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:k c:(count k) asc:c take:7})",
+          "(select {from:X by:k c:(count k) zz:(sum z) asc:c take:7})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:h c:(count h) d:(count z) desc:c take:10})",
+          "(select {from:X by:h c:(count h) d:(count z) zz:(sum z) desc:c take:10})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:n c:(count n) desc:c take:10})",
+          "(select {from:X by:n c:(count n) zz:(sum z) desc:c take:10})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:[k s] c:(count k)})",
+          "(select {from:X by:[k s] c:(count k) zz:(sum z)})", AGG_ROUTE_V2_RUNS, 60011 },
+        { "(select {from:X by:[k t] c:(count k)})",
+          "(select {from:X by:[k t] c:(count k) zz:(sum z)})", AGG_ROUTE_V2_RUNS, 180033 },
+        { "(select {from:X by:[t k] c:(count t) desc:c take:10})",
+          "(select {from:X by:[t k] c:(count t) zz:(sum z) desc:c take:10})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:[s n] c:(count s) desc:c take:10})",
+          "(select {from:X by:[s n] c:(count s) zz:(sum z) desc:c take:10})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:{h: h s: s m: (div k 3)} c:(count h) asc:c take:6})",
+          "(select {from:X by:{h: h s: s m: (div k 3)} c:(count h) zz:(sum z) asc:c take:6})", AGG_ROUTE_V2_RUNS, 0 },
+        { "(select {from:X by:u c:(count u) desc:c take:10})",
+          "(select {from:X by:u c:(count u) zz:(sum z) desc:c take:10})", AGG_ROUTE_V2_RADIX, 0 },
+    };
+    for (int src = 0; src < 2; src++)
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            const char* tn = src ? "CM" : "CR";
+            char qa[512], qb[512], qc[1400];
+            const char* x = strstr(cases[c].runs, "X");
+            snprintf(qa, sizeof qa, "%.*s%s%s", (int)(x - cases[c].runs), cases[c].runs, tn, x + 1);
+            x = strstr(cases[c].radix, "X");
+            snprintf(qb, sizeof qb, "%.*s%s%s", (int)(x - cases[c].radix), cases[c].radix, tn, x + 1);
+            agg_route_reset();
+            ray_t* got = ray_eval_str(qa);
+            agg_route_stats_t st = agg_route_stats();
+            TEST_ASSERT_NOT_NULL(got); TEST_ASSERT_FALSE(RAY_IS_ERR(got)); ray_release(got);
+            TEST_ASSERT_FMT(st.routes[cases[c].route] == 1 && st.routes[AGG_ROUTE_V2_RUNS + AGG_ROUTE_V2_RADIX - cases[c].route] == 0,
+                            "%s case %zu: runs %d radix %d", tn, c,
+                            (int)st.routes[AGG_ROUTE_V2_RUNS], (int)st.routes[AGG_ROUTE_V2_RADIX]);
+            agg_route_reset();
+            got = ray_eval_str(qb);
+            st = agg_route_stats();
+            TEST_ASSERT_NOT_NULL(got); TEST_ASSERT_FALSE(RAY_IS_ERR(got)); ray_release(got);
+            TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_RADIX] == 1, "%s case %zu: the twin is not radix", tn, c);
+            /* the twin's columns but s, and the closed forms of the counts */
+            snprintf(qc, sizeof qc,
+                "(do (set ra %s) (set rb %s) (set ck (first (key ra)))"
+                " (sum (as 'I64 (list (and (== (count (key rb)) (+ 1 (count (key ra)))) (all (== (key ra) (take (key rb) (count (key ra))))))"
+                "    (all (map (fn [x] (all (== (at ra x) (at rb x)))) (key ra)))"
+                "    (all (== (at ra 'c) (at rb 'c)))"
+                "    (or (== %lld 0) (== (sum (at ra 'c)) 1200000))"
+                "    (or (== %lld 0) (== (count ra) %lld))))))", qa, qb,
+                (long long)cases[c].groups, (long long)cases[c].groups, (long long)cases[c].groups);
+            ray_t* chk = ray_eval_str(qc);
+            TEST_ASSERT_NOT_NULL(chk); TEST_ASSERT_FALSE(RAY_IS_ERR(chk));
+            TEST_ASSERT_FMT(chk->type == -RAY_I64 && chk->i64 == 5, "%s case %zu: %lld of 5 checks hold", tn, c,
+                            chk->type == -RAY_I64 ? (long long)chk->i64 : -1LL);
+            ray_release(chk);
+        }
+    r = ray_eval_str("(set CM 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf("/tmp/rayforce_test_count_runs");
+    PASS();
+}
+
+/* The runs route's dispatches and the shared emit's (the top-N selection,
+ * the first-seen order, the finalize): a cancel landing before any of them,
+ * as a cancel request or the pool's flag alone, answers `cancel` over
+ * blocks filled with garbage, never counts or keys from buffers the skipped
+ * tasks did not write; armed past the last dispatch, the answer.  The
+ * radix twin (a SUM beside the count) shares the emit. */
+static test_result_t test_count_runs_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    ray_t* r = ray_eval_str("(set CC (table [k] (list (* (% (div (til 1200000) 5) 60011) 7919000003))))"
+                            "(set CS (table [k z] (list (* (div (til 300000) 5) 7919000003) (til 300000))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    /* the top 3 (counts 20 at the first keys), the whole group (60011 keys,
+     * 1.2M rows), their radix twins, and a radix whole group of 300k rows */
+    static const struct { const char* q; int64_t want; } cases[] = {
+        { "(do (set cr (select {from:CC by:k c:(count k) desc:c take:3})) (+ (sum (at cr 'c)) (first (at cr 'k))))", 60 },
+        { "(do (set cr (select {from:CC by:k c:(count k)})) (+ (+ (sum (at cr 'c)) (count cr)) (at (at cr 'k) 7)))", 1260011 + 7 * 7919000003LL },
+        { "(do (set cr (select {from:CC by:k c:(count k) s:(sum k) desc:c take:3})) (+ (sum (at cr 'c)) (first (at cr 'k))))", 60 },
+        { "(do (set cr (select {from:CC by:k c:(count k) s:(sum k)})) (+ (+ (sum (at cr 'c)) (count cr)) (at (at cr 'k) 7)))", 1260011 + 7 * 7919000003LL },
+        /* below the parallel order's floor: the first-seen map is filled on
+         * the pool and read serially */
+        { "(do (set cr (select {from:CS by:k c:(count k) s:(sum z)})) (+ (+ (sum (at cr 'c)) (count cr)) (at (at cr 'k) 7)))", 360000 + 7 * 7919000003LL },
+    };
+    ray_heap_test_scribble(true);
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        int cancelled = 0, answered = 0;
+        for (int mode = 0; mode < 2; mode++)
+            for (int k = 1; k <= 24; k++) {
+                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_t* got = ray_eval_str(cases[ci].q);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                if (!got) ray_heap_test_scribble(false);
+                TEST_ASSERT_NOT_NULL(got);
+                if (RAY_IS_ERR(got)) {
+                    char code[64];
+                    snprintf(code, sizeof code, "%s", ray_err_code(got));
+                    bool is_cancel = strcmp(code, "cancel") == 0;
+                    ray_error_free(got);
+                    if (!is_cancel) ray_heap_test_scribble(false);
+                    TEST_ASSERT_FMT(is_cancel, "case %zu mode %d, cancel before dispatch %d: error %s, not cancel",
+                                    ci, mode, k, code);
+                    cancelled++;
+                    continue;
+                }
+                bool ok = got->type == -RAY_I64 && got->i64 == cases[ci].want;
+                long long v = got->type == -RAY_I64 ? (long long)got->i64 : -1LL;
+                ray_release(got);
+                if (!ok) ray_heap_test_scribble(false);
+                TEST_ASSERT_FMT(ok, "case %zu mode %d, cancel before dispatch %d: %lld, want %lld", ci, mode, k,
+                                v, (long long)cases[ci].want);
+                answered++;
+            }
+        if (cancelled == 0 || answered == 0) ray_heap_test_scribble(false);
+        TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "case %zu: %d cancelled, %d answered", ci, cancelled, answered);
+    }
+    ray_heap_test_scribble(false);
+    PASS();
+}
+
+/* Cancellation under the per-symbol grouping passes.  The pool skips every
+ * ticket of a cancelled query, so a dispatch the cancel lands before writes
+ * none of its per-task output: the run detectors' lengths and the presence
+ * bits of the vocabulary-order pass, the hash counts, the scattered items,
+ * the spread keys.  Each query runs once per dispatch it makes with the
+ * cancel landing right before that dispatch (ray_pool_test_cancel_at), over
+ * blocks filled with garbage (ray_heap_test_scribble): each run is `cancel`
+ * or the answer, never one built from unwritten buffers (a prefix over
+ * garbage lengths overflows under UBSan).  The plain retry answers. */
+static test_result_t test_derived_key_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    /* 150k rows, 75k distinct symbols in runs of 2: the first 65536 rows
+     * repeat enough for the per-symbol route, and the distinct values are
+     * above the parallel floor of the order pass */
+    ray_t* r = ray_eval_str("(set j (til 150000)) "
+        "(set T (table [s v] (list (as 'SYMBOL (map (fn [x] (format \"a%\" (div x 2))) j)) (as 'F64 (% j 7)))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    /* a count of the key column groups over the distinct values, with the
+     * vocabulary-order pass (derived_key_vocab_aggs); a count of another
+     * column evaluates the key per distinct symbol and spreads it over the
+     * rows (derived_key_over_sym_domain) */
+    static const struct { const char* inner; uint64_t vocab; } cases[] = {
+        { "(select {from: T by: (substr s 0 2) c: (count s)})", 1 },
+        { "(select {from: T by: (substr s 0 2) c: (count v)})", 0 },
+    };
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        agg_route_reset();
+        r = ray_eval_str(cases[ci].inner);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        agg_route_stats_t st = agg_route_stats();
+        TEST_ASSERT_EQ_I(st.key_domain_evals, 1);
+        TEST_ASSERT_EQ_I(st.key_vocab_order, cases[ci].vocab);
+        char q[512];
+        snprintf(q, sizeof q, "(select {from: %s asc: s})", cases[ci].inner);
+        ray_t* want = ray_eval_str(q);
+        if (want && RAY_IS_ERR(want)) { ray_error_free(want); want = NULL; }
+        TEST_ASSERT_FMT(want != NULL, "%s: the plain query fails", q);
+        ray_t* ws = ray_fmt(want, 0);
+        ray_release(want);
+        ray_heap_test_scribble(true);
+        int cancelled = 0, last = 0;
+        /* mode 0: a cancel request (both flags), until the run that
+         * answers, which is the one armed past the query's last dispatch;
+         * mode 1: the pool's flag alone (the engine's own checks, not the
+         * evaluator's), over those dispatches, every one of which answers
+         * `cancel` */
+        for (int mode = 0; mode < 2; mode++) {
+            for (int k = 1; k <= 128 && (mode == 0 || k <= last); k++) {
+                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_t* got = ray_eval_str(q);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                if (!got) { ray_heap_test_scribble(false); ray_release(ws); }
+                TEST_ASSERT_NOT_NULL(got);
+                if (RAY_IS_ERR(got)) {
+                    bool is_cancel = strcmp(ray_err_code(got), "cancel") == 0;
+                    ray_error_free(got);
+                    if (!is_cancel) { ray_heap_test_scribble(false); ray_release(ws); }
+                    TEST_ASSERT_FMT(is_cancel, "%s mode %d, cancel before dispatch %d: an error other than cancel",
+                                    cases[ci].inner, mode, k);
+                    cancelled++;
+                    continue;
+                }
+                /* under the pool's flag alone nothing clears the cancel:
+                 * an answer means the key was recomputed, or a later
+                 * outermost execute reset the flag (a lost cancel) */
+                if (mode == 1) { ray_release(got); ray_heap_test_scribble(false); ray_release(ws); }
+                TEST_ASSERT_FMT(mode == 0, "%s: cancel before dispatch %d: answered under the pool's cancel", cases[ci].inner, k);
+                ray_t* gs = ray_fmt(got, 0);
+                bool same = strcmp(ray_str_ptr(gs), ray_str_ptr(ws)) == 0;
+                ray_release(gs); ray_release(got);
+                if (!same) { ray_heap_test_scribble(false); ray_release(ws); }
+                TEST_ASSERT_FMT(same, "%s: cancel before dispatch %d: a wrong answer", cases[ci].inner, k);
+                last = k - 1; break;
+            }
+        }
+        ray_heap_test_scribble(false);
+        bool counts = cancelled >= 1 && last >= 1;
+        if (!counts) ray_release(ws);
+        TEST_ASSERT_FMT(counts, "%s: %d runs cancelled over %d dispatches", cases[ci].inner, cancelled, last);
+        /* the plain retry */
+        ray_t* again = ray_eval_str(q);
+        ray_t* as = again && !RAY_IS_ERR(again) ? ray_fmt(again, 0) : NULL;
+        bool same = as && strcmp(ray_str_ptr(as), ray_str_ptr(ws)) == 0;
+        if (as) ray_release(as);
+        if (again) { if (RAY_IS_ERR(again)) ray_error_free(again); else ray_release(again); }
+        ray_release(ws);
+        TEST_ASSERT_TRUE(same);
+    }
+    PASS();
+}
+
 static test_result_t test_group_routes_and_bool_outputs(void) {
     /* Route expectations below use two cores regardless of harness settings. */
     ray_pool_destroy();
@@ -2306,6 +2654,48 @@ static test_result_t test_dense_native_topn(void) {
     TEST_ASSERT_EQ_I(check->i64, 1);
     ray_release(check); ray_release(r);
     ray_release(ray_eval_str("(set dt_t 0) (set dt_i 0)"));
+    PASS();
+}
+
+/* The partitioned dense strategy (a min beside the count) under a top-N
+ * filter selects from the occupancy of its first-row array on the workers:
+ * the emit holds the kept groups only, and they are the groups the full
+ * result ranks first. */
+static test_result_t test_dense_partitioned_topn(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set dp_i (til 1000000)) "
+        "(set dp_t (table [k v] (list (as 'I32 (% (* dp_i dp_i) 50021)) (% dp_i 13))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    agg_route_reset();
+    ray_t* r = ray_eval_str("(select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v) desc:c take:5})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    agg_route_stats_t stats = agg_route_stats();
+    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+#if ATOMIC_LLONG_LOCK_FREE == 2
+    TEST_ASSERT_EQ_I(stats.dense_strategy, AGG_DENSE_PARTITIONED);
+#endif
+    TEST_ASSERT_TRUE(stats.topn_native);
+    TEST_ASSERT_EQ_I(stats.dense_emit_slots, stats.topn_kept);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
+    ray_t* check = ray_eval_str(
+        "(all (== (at (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v) desc:c take:5}) 'c) "
+        "(take (at (xdesc (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)}) 'c) 'c) 5)))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    /* no filter: the occupied slots are collected from the same bitmap, in
+     * slot order */
+    r = ray_eval_str("(select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    check = ray_eval_str(
+        "(and (== (count (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)})) (count (distinct (at dp_t 'k)))) "
+        "(== (sum (at (select {from:dp_t by:k lo:(min v) hi:(max v) c:(count v)}) 'c)) 1000000))");
+    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
+    TEST_ASSERT_EQ_I(check->i64, 1);
+    ray_release(check); ray_release(r);
+    ray_release(ray_eval_str("(set dp_t 0) (set dp_i 0)"));
     PASS();
 }
 
@@ -4316,6 +4706,11 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
+    { "agg_contract/derived_key_cancel_at_dispatch", test_derived_key_cancel_at_dispatch, contract_setup, contract_teardown },
+    { "agg_contract/dense_array_lazy_merge_route", test_dense_array_lazy_merge_route, contract_setup, contract_teardown },
+    { "agg_contract/sym_distinct_cancel_at_dispatch", test_sym_distinct_cancel_at_dispatch, contract_setup, contract_teardown },
+    { "agg_contract/count_runs_route", test_count_runs_route, contract_setup, contract_teardown },
+    { "agg_contract/count_runs_cancel_at_dispatch", test_count_runs_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },
@@ -4330,6 +4725,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/radix_native_topn", test_radix_native_topn, contract_setup, contract_teardown },
     { "agg_contract/tablestack_routes", test_tablestack_routes, contract_setup, contract_teardown },
     { "agg_contract/dense_native_topn", test_dense_native_topn, contract_setup, contract_teardown },
+    { "agg_contract/dense_partitioned_topn", test_dense_partitioned_topn, contract_setup, contract_teardown },
     { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },

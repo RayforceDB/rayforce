@@ -1,0 +1,17 @@
+;; @requires: posix
+;; A generation-0 STR column keeps its UNIQUE marker whether the save writes
+;; a marker-only index or builds a size-gated dictionary.
+(.sys.exec "rm -rf /tmp/rf_str_unique_splay") -- 0
+(set small (.attr.set 'unique (as 'STR ["a" "b" "c"])))
+(.db.splayed.set "/tmp/rf_str_unique_splay/small/" (table [s] (list small)) {compress: false})
+(.attr.get (at (.db.splayed.get "/tmp/rf_str_unique_splay/small/") 's)) -- ['unique]
+
+;; An explicit index:false disables auto indexes, not a marker the caller set.
+(.db.splayed.set "/tmp/rf_str_unique_splay/noauto/" (table [s] (list small)) {compress: false index: false})
+(.attr.get (at (.db.splayed.get "/tmp/rf_str_unique_splay/noauto/") 's)) -- ['unique]
+
+(set large (.attr.set 'unique (as 'STR (map (fn [i] (format "key %" i)) (til 65536)))))
+(.db.splayed.set "/tmp/rf_str_unique_splay/large/" (table [s] (list large)) {compress: false})
+(set loaded (at (.db.splayed.get "/tmp/rf_str_unique_splay/large/") 's))
+(.attr.get loaded) -- ['unique]
+(at (.idx.info loaded) 'kind) -- 'dict
