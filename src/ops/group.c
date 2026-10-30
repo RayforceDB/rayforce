@@ -957,10 +957,12 @@ static inline int64_t cd_f64_key(double fv) {
 /* The partition of a value: the top bits of its multiplicative hash, which
  * depend on every bit of the value (the low ones depend on its low bits
  * only: values sharing them, multiples of 1024 say, all fell into one
- * partition and deduplicated on one thread).  p_shift = 64 - p_bits; the
- * dedup takes its slots from the low bits. */
+ * partition and deduplicated on one thread).  p_shift = 64 - p_bits.  The
+ * multiplier is K2: the distinct-values dedup slots on the top bits of
+ * val * K1, which a K1 partition would fix, packing a partition's values
+ * into 1/P of its table. */
 static inline uint64_t cd_part_of(int64_t val, unsigned p_shift) {
-    return ((uint64_t)val * CD_HASH_K1) >> p_shift;
+    return ((uint64_t)val * CD_HASH_K2) >> p_shift;
 }
 static inline unsigned cd_part_shift(uint64_t p_mask) {
     return 64u - (unsigned)__builtin_popcountll(p_mask);

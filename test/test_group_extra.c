@@ -1321,6 +1321,34 @@ static test_result_t test_count_distinct_runs_partitions(void) {
     TEST_ASSERT_EQ_I(cd_exec_count(v), n);
     ray_release(v);
 
+    /* distinct values shares the partition function and slots its own
+     * table on the top bits of val * K1: 1M distinct values, then 1M
+     * multiples of 4096, each kept once, ascending (a partition on those
+     * same bits packs its values into 1/P of the table: minutes) */
+    const int64_t m = (int64_t)1 << 20;
+    for (int pass = 0; pass < 2; pass++) {
+        v = ray_vec_new(RAY_I64, m);
+        TEST_ASSERT_NOT_NULL(v);
+        v->len = m;
+        p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < m; i++)
+            p[i] = pass ? i * 4096 : (int64_t)(((uint64_t)i * 2654435761ULL) % 1000000007ULL);
+        ray_t* d = distinct_vec_eager(v);
+        TEST_ASSERT(d && !RAY_IS_ERR(d), "distinct values");
+        TEST_ASSERT_EQ_I(d->len, m);
+        const int64_t* q64 = (const int64_t*)ray_data(d);
+        int64_t rising = 0, sum_in = 0, sum_out = 0;
+        for (int64_t i = 0; i < m; i++) {
+            rising += i == 0 || q64[i] > q64[i - 1];
+            sum_in += p[i];
+            sum_out += q64[i];
+        }
+        TEST_ASSERT_EQ_I(rising, m);
+        TEST_ASSERT_EQ_I(sum_out, sum_in);
+        ray_release(d);
+        ray_release(v);
+    }
+
     /* the freed 67 MB columns and scratch stay in the process-wide direct
      * block cache; later tests measure fresh direct mappings */
     ray_heap_direct_cache_drain();
