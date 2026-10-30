@@ -37,6 +37,8 @@ Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is
 
 `do` evaluates expressions in order and returns the last result. `let` bindings inside `do` are scoped to that block:
 
+For the full name lookup rules, see [Names and scope](name-resolution.md).
+
 ```text
 ‣ (do
     (set x 10)
