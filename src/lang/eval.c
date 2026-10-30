@@ -5311,8 +5311,16 @@ ray_t* ray_eval(ray_t* obj) {
                 goto out;
             }
             int64_t argc = n - 1;
-            if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
-            ray_t* args[64];
+            /* A printed LIST can contain arbitrarily many cells.  Keep the
+             * usual stack path and arity guard for other variadic calls. */
+            if (argc > 64 && fn != ray_list_fn) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
+            ray_t* stack_args[64];
+            ray_t** args = stack_args;
+            if (argc > 64) {
+                if ((uint64_t)argc > SIZE_MAX / sizeof(ray_t*)) { ray_release(head); ret = ray_error("limit", NULL); goto out; }
+                args = ray_alloc_raw((size_t)argc * sizeof(ray_t*));
+                if (!args) { ray_release(head); ret = ray_error("oom", NULL); goto out; }
+            }
             int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
@@ -5320,6 +5328,7 @@ ray_t* ray_eval(ray_t* obj) {
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
+                    if (args != stack_args) ray_free_raw(args);
                     ray_release(head);
                     ret = err; goto out;
                 }
@@ -5328,11 +5337,12 @@ ray_t* ray_eval(ray_t* obj) {
                  : any_rows && ray_active_query_table() && vm_fn_rowwise(head) ? any_rows : 0;
             if (!(head->attrs & RAY_FN_LAZY_AWARE)) {
                 ray_t* err = materialize_owned_args(args, argc);
-                if (err) { ray_release(head); ret = err; goto out; }
+                if (err) { if (args != stack_args) ray_free_raw(args); ray_release(head); ret = err; goto out; }
             }
             ray_release(head);
             ray_t* result = fn(args, argc);
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
+            if (args != stack_args) ray_free_raw(args);
             ret = result; goto out;
         }
         case RAY_LAMBDA: {

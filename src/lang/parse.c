@@ -563,22 +563,35 @@ static ray_t* parse_name(ray_parser_t *p) {
 static ray_t* parse_vector(ray_parser_t *p) {
     advance(p, 1); /* skip [ */
 
-    /* Collect parsed elements into a temporary array.  This lives on the
-     * HEAP, not the stack: parse_expr recurses back into parse_vector for
-     * each element, so a stack-resident 4096-pointer buffer (32 KB) per
-     * frame would let a nested "[[[[..." input exhaust the C stack.  A
-     * heap buffer keeps the recursive frame small (see RAY_PARSE_MAX_DEPTH). */
-    ray_t* elems_buf = ray_alloc(4096 * sizeof(ray_t*));
-    if (RAY_IS_ERR(elems_buf)) return elems_buf;
+    /* Keep the temporary array on the heap: nested vectors recurse into
+     * parse_expr.  Grow it with the literal instead of limiting a printed
+     * vector to 4096 elements. */
+    int32_t cap = 64;
+    ray_t* elems_buf = ray_alloc((size_t)cap * sizeof(ray_t*));
+    if (!elems_buf || RAY_IS_ERR(elems_buf)) return elems_buf ? elems_buf : ray_error("oom", NULL);
     ray_t** elems = (ray_t**)ray_data(elems_buf);
     int32_t count = 0;
 
     skip_ws_and_comments(p);
     while (*p->pos && *p->pos != ']') {
-        if (count >= 4096) {
-            for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+        if (count == cap) {
+            if (cap > INT32_MAX / 2) {
+                for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+                ray_free(elems_buf);
+                return ray_error("limit", "vector literal exceeds supported length");
+            }
+            int32_t next_cap = cap * 2;
+            ray_t* grown = ray_alloc((size_t)next_cap * sizeof(ray_t*));
+            if (!grown || RAY_IS_ERR(grown)) {
+                for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+                ray_free(elems_buf);
+                return grown ? grown : ray_error("oom", NULL);
+            }
+            memcpy(ray_data(grown), elems, (size_t)count * sizeof(ray_t*));
             ray_free(elems_buf);
-            return ray_error("limit", NULL);
+            elems_buf = grown;
+            elems = (ray_t**)ray_data(elems_buf);
+            cap = next_cap;
         }
         ray_t* elem = parse_expr(p);
         if (RAY_IS_ERR(elem)) {
