@@ -1,0 +1,45 @@
+;; repr preserves numeric and GUID types and values as parseable source text.
+(repr (list [1h 2h] 1)) -- "(list [1h 2h] 1)"
+(type (first (eval (parse (repr (list [1h 2h] 1)))))) -- 'I16
+(type (first (eval (parse (repr (list [1i 0Ni] 1)))))) -- 'I32
+(all (== (first (eval (parse (repr (list [1i 0Ni] 1))))) [1i 0Ni])) -- true
+(set i32List990 (list 1i 2i))
+(type (eval (parse (repr i32List990)))) -- 'LIST
+(all (== (ser i32List990) (ser (eval (parse (repr i32List990)))))) -- true
+(set i64List990 (list 1 2))
+(type (eval (parse (repr i64List990)))) -- 'LIST
+(all (== (ser i64List990) (ser (eval (parse (repr i64List990)))))) -- true
+
+(set precise [64123.45678 0.3333333333333333 9007199254740994.0 123456789.5])
+(all (== (ser precise) (ser (eval (parse (repr precise)))))) -- true
+(repr 0.1) -- "0.1"
+(repr 3.3) -- "3.3"
+(set real32 (as 'F32 [0.123456789 16777216.0 1e20 1e-20]))
+(all (== (ser real32) (ser (eval (parse (repr real32)))))) -- true
+(repr 0.1e) -- "0.1e"
+(all (== (ser (* -1.0 [0.0 1.0])) (ser (eval (parse (repr (* -1.0 [0.0 1.0]))))))) -- true
+
+(set guid990 (as 'GUID "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"))
+(type (eval (parse (repr guid990)))) -- 'guid
+(all (== (ser guid990) (ser (eval (parse (repr guid990)))))) -- true
+(as 'STR guid990) -- "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+(as 'STR (as 'SYMBOL guid990)) -- "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+(set guids990 (enlist guid990 guid990))
+(type (eval (parse (repr guids990)))) -- 'GUID
+(all (== (ser guids990) (ser (eval (parse (repr guids990)))))) -- true
+(set guidListOne990 (list guid990))
+(type (eval (parse (repr guidListOne990)))) -- 'LIST
+(all (== (ser guidListOne990) (ser (eval (parse (repr guidListOne990)))))) -- true
+(set guidListTwo990 (list guid990 guid990))
+(type (eval (parse (repr guidListTwo990)))) -- 'LIST
+(all (== (ser guidListTwo990) (ser (eval (parse (repr guidListTwo990)))))) -- true
+(set emptyGuid990 (as 'GUID (list)))
+(type (eval (parse (repr emptyGuid990)))) -- 'GUID
+(count (eval (parse (repr emptyGuid990)))) -- 0
+
+;; Ordinary format remains display-oriented and consistent in every template.
+(format "%" 5i) -- "5"
+(format "n=%" 5i) -- "n=5"
+(format "%" 0.1) -- "0.1"
+(format "v=%" 0.1) -- "v=0.1"
+(format "id=%" guid990) -- "id=0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"

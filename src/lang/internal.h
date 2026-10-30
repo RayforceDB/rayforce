@@ -721,6 +721,7 @@ ray_t* agg_group_indices(ray_t* source);
 ray_t* ray_println_fn(ray_t** args, int64_t n);
 ray_t* ray_show_fn(ray_t** args, int64_t n);
 ray_t* ray_format_fn(ray_t** args, int64_t n);
+ray_t* ray_repr_fn(ray_t* value);
 ray_t* ray_resolve_fn(ray_t** args, int64_t n);
 ray_t* ray_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_exit_fn(ray_t* arg);
