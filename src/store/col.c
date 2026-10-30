@@ -1225,6 +1225,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             data = ray_data(vec);
         }
 
+        size_t str_pool_start = SIZE_MAX, str_pool_end = 0;
         if (data_size > 0 && vec->type == RAY_STR) {
             /* Pooled descriptors are written with their content hash filled
              * in (RAY_COL_STR_HASHED).  They are staged through a bounded
@@ -1240,17 +1241,27 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
                 pool_base = (const char*)ray_data(pool_owner->str_pool);
                 pool_len  = (size_t)pool_owner->str_pool->len;
             }
+            /* Find the exact pool span used by this column before streaming
+             * descriptors: their offsets must be rebased by its first byte. */
+            for (int64_t i = 0; i < vec->len; i++) {
+                if (ray_str_is_inline(&src[i])) continue;
+                if (!pool_base || src[i].pool_off > pool_len ||
+                    src[i].len > pool_len - src[i].pool_off) {
+                    fclose(f); remove(tmp_path); return RAY_ERR_CORRUPT;
+                }
+                if ((size_t)src[i].pool_off < str_pool_start)
+                    str_pool_start = (size_t)src[i].pool_off;
+                size_t end = (size_t)src[i].pool_off + (size_t)src[i].len;
+                if (end > str_pool_end) str_pool_end = end;
+            }
             ray_str_t buf[1024];
             for (int64_t off = 0; off < vec->len; ) {
                 int64_t cnt = vec->len - off < 1024 ? vec->len - off : 1024;
                 memcpy(buf, src + off, (size_t)cnt * sizeof(ray_str_t));
                 for (int64_t i = 0; i < cnt; i++) {
                     if (ray_str_is_inline(&buf[i])) continue;
-                    if (!pool_base || buf[i].pool_off > pool_len ||
-                        buf[i].len > pool_len - buf[i].pool_off) {
-                        fclose(f); remove(tmp_path); return RAY_ERR_CORRUPT;
-                    }
                     buf[i].hash32 = ray_str_t_hash32(&buf[i], pool_base);
+                    buf[i].pool_off -= str_pool_start;
                 }
                 written = fwrite(buf, 1, (size_t)cnt * sizeof(ray_str_t), f);
                 if (written != (size_t)cnt * sizeof(ray_str_t)) {
@@ -1266,7 +1277,13 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         sym_xlate = NULL;
 
         if (vec->type == RAY_STR) {
-            size_t pool_size = col_str_pool_payload_len(vec);
+            /* Persist just the span referenced by this column.  A sliced
+             * STR vector may share both an unused prefix and an unused tail
+             * of its parent's pool. */
+            size_t pool_size = str_pool_start == SIZE_MAX ? 0 : str_pool_end - str_pool_start;
+            if (str_pool_end > col_str_pool_payload_len(vec)) {
+                fclose(f); remove(tmp_path); return RAY_ERR_CORRUPT;
+            }
             ray_t pool_header;
             memset(&pool_header, 0, sizeof(pool_header));
             if (vec->str_pool && !RAY_IS_ERR(vec->str_pool)) {
@@ -1292,7 +1309,8 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
                     remove(tmp_path);
                     return RAY_ERR_CORRUPT;
                 }
-                written = fwrite(ray_data(vec->str_pool), 1, pool_size, f);
+                written = fwrite((const char*)ray_data(vec->str_pool) + str_pool_start,
+                                 1, pool_size, f);
                 if (written != pool_size) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
             }
         }
