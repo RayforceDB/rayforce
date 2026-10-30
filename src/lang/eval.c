@@ -645,6 +645,45 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
     }
 }
 
+/* The scalar fill/min/max results for wide cells have a common type, but the
+ * generic atomic mapper boxes them.  Collapse only homogeneous wide results;
+ * mixed-type LIST operands keep their existing boxed shape. */
+static ray_t* atomic_collapse_wide(ray_t* list) {
+    if (!list || RAY_IS_ERR(list) || list->type != RAY_LIST || list->len == 0)
+        return list;
+    ray_t** cells = (ray_t**)ray_data(list);
+    int8_t t = cells[0] ? cells[0]->type : 0;
+    if (t != -RAY_SYM && t != -RAY_STR && t != -RAY_GUID) return list;
+    for (int64_t i = 1; i < list->len; i++)
+        if (!cells[i] || cells[i]->type != t) return list;
+
+    ray_t* vec = ray_vec_new((int8_t)-t, t == -RAY_STR ? 0 : list->len);
+    if (!vec || RAY_IS_ERR(vec)) {
+        ray_release(list);
+        return vec ? vec : ray_error("oom", NULL);
+    }
+    if (t == -RAY_STR) {
+        for (int64_t i = 0; i < list->len; i++) {
+            ray_t* next = ray_str_vec_append(vec, ray_str_ptr(cells[i]), ray_str_len(cells[i]));
+            if (!next || RAY_IS_ERR(next)) {
+                ray_release(vec);
+                ray_release(list);
+                return next ? next : ray_error("oom", NULL);
+            }
+            vec = next;
+        }
+    } else {
+        vec->len = list->len;
+        for (int64_t i = 0; i < list->len; i++)
+            if (store_typed_elem(vec, i, cells[i]) != 0) {
+                ray_release(vec);
+                return list;
+            }
+    }
+    ray_release(list);
+    return vec;
+}
+
 /* Map a binary function element-wise over collections.
  * Both args can be collections (zip-map) or one scalar (broadcast).
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise. */
@@ -1539,6 +1578,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         out[i] = elem;
     }
     #undef COERCE_TO_SCALAR
+    if (!force_boxed && (fn == ray_fill_fn || fn == ray_min2_fn || fn == ray_max2_fn))
+        return atomic_collapse_wide(result);
     return ray_list_collapse_bool(result);
 }
 
