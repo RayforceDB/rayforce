@@ -1241,6 +1241,95 @@ static test_result_t test_count_distinct_parallel_types(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test 13b: count_distinct over runs and many partitions
+ *
+ * Past 8M rows the parallel kernel takes 128+ partitions, and a value equal
+ * to the row before it in a task is one record with it.  Exact counts on
+ * runs (crossing the tasks, the same values again in later runs), on F64
+ * runs that mix 0.0 with -0.0 and NaNs of other bits, and on values without
+ * runs, on multiples of 4096, and on values without runs, every one
+ * distinct.
+ * -------------------------------------------------------------------------- */
+static int64_t cd_exec_count(ray_t* vec) {
+    int64_t name_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, name_v, vec);
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* res = ray_execute(g, ray_count_distinct(g, ray_scan(g, "v")));
+    int64_t n = res && !RAY_IS_ERR(res) && res->type == -RAY_I64 ? res->i64 : -1;
+    if (res && RAY_IS_ERR(res)) ray_error_free(res); else if (res) ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    return n;
+}
+
+static test_result_t test_count_distinct_runs_partitions(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int64_t n = ((int64_t)1 << 23) + 12345;
+
+    /* I64 runs of 3 over 1000003 values (each in two or three runs) */
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = n;
+    int64_t* p = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) p[i] = ((i / 3) % 1000003) * 7919;
+    TEST_ASSERT_EQ_I(cd_exec_count(v), 1000003);
+    ray_release(v);
+
+    /* I32 runs of 7 over 50021 values */
+    v = ray_vec_new(RAY_I32, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = n;
+    int32_t* q = (int32_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) q[i] = (int32_t)((i / 7) % 50021) - 25000;
+    TEST_ASSERT_EQ_I(cd_exec_count(v), 50021);
+    ray_release(v);
+
+    /* F64 runs of 5 over 777 values: value 0 alternates 0.0 and -0.0 inside
+     * its runs, value 1 is a NaN of one of three bit patterns */
+    v = ray_vec_new(RAY_F64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = n;
+    double* d = (double*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = (i / 5) % 777;
+        if (k == 0) d[i] = (i & 1) ? -0.0 : 0.0;
+        else if (k == 1) {
+            uint64_t bits = 0x7FF8000000000000ULL | (uint64_t)(i % 3);
+            memcpy(&d[i], &bits, sizeof bits);
+        } else d[i] = (double)k * 0.5;
+    }
+    TEST_ASSERT_EQ_I(cd_exec_count(v), 777);
+    ray_release(v);
+
+    /* runs of 2 over multiples of 4096 (low bits all zero), n / 2 values */
+    v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = n;
+    p = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) p[i] = (i / 2) * 4096;
+    TEST_ASSERT_EQ_I(cd_exec_count(v), (n + 1) / 2);
+    ray_release(v);
+
+    /* no runs: i * 2654435761 mod a prime above n, every value distinct */
+    v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = n;
+    p = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) p[i] = (int64_t)(((uint64_t)i * 2654435761ULL) % 1000000007ULL);
+    TEST_ASSERT_EQ_I(cd_exec_count(v), n);
+    ray_release(v);
+
+    /* the freed 67 MB columns and scratch stay in the process-wide direct
+     * block cache; later tests measure fresh direct mappings */
+    ray_heap_direct_cache_drain();
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test 14: ray_count_distinct_per_group parallel path (chunk 2)
  *
  * Direct C invocation of ray_count_distinct_per_group with n_rows >=
@@ -3056,6 +3145,7 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/reduction_bits_any_pool",       test_reduction_bits_any_pool,       NULL, NULL },
     { "group_extra/reduction_bits_wide_chunks",    test_reduction_bits_wide_chunks,    NULL, NULL },
     { "group_extra/count_distinct_parallel_types", test_count_distinct_parallel_types, NULL, NULL },
+    { "group_extra/count_distinct_runs_partitions", test_count_distinct_runs_partitions, NULL, NULL },
     { "group_extra/count_distinct_per_group_parallel", test_count_distinct_per_group_parallel, NULL, NULL },
     { "group_extra/i16_group_top_count_emit_filter", test_i16_group_top_count_emit_filter, NULL, NULL },
     { "group_extra/sym_group_top_count_emit_filter", test_sym_group_top_count_emit_filter, NULL, NULL },

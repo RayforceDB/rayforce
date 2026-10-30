@@ -936,12 +936,52 @@ typedef struct {
     uint8_t     is_f64;
     int8_t      type;
     uint8_t     attrs;
+    bool        runs;          /* a run of equal values is one record (counting only) */
 } cd_count_ctx_t;
 
 /* Count rows per partition (per task, into task-local slot).  Two
  * passes: this one fills the histograms; the next does the scatter.
  * Dispatched via ray_pool_dispatch_n with start=task_idx so the
  * cursor key is stable across the histogram and scatter passes. */
+/* The value a count-distinct partitions and compares: an integer as
+ * itself (SYM: its id), an F64 by its bits with every NaN one NaN and -0.0
+ * as 0.0. */
+static inline int64_t cd_f64_key(double fv) {
+    if (fv != fv) fv = (double)NAN;
+    else fv = clear_neg_zero(fv);
+    int64_t val;
+    memcpy(&val, &fv, sizeof(int64_t));
+    return val;
+}
+
+/* The partition of a value: the top bits of its multiplicative hash, which
+ * depend on every bit of the value (the low ones depend on its low bits
+ * only: values sharing them, multiples of 1024 say, all fell into one
+ * partition and deduplicated on one thread).  p_shift = 64 - p_bits; the
+ * dedup takes its slots from the low bits. */
+static inline uint64_t cd_part_of(int64_t val, unsigned p_shift) {
+    return ((uint64_t)val * CD_HASH_K1) >> p_shift;
+}
+static inline unsigned cd_part_shift(uint64_t p_mask) {
+    return 64u - (unsigned)__builtin_popcountll(p_mask);
+}
+
+/* A task's rows [start, end) as count-distinct records, partitioned by
+ * hash.  With runs_ a value equal to the row before it in the task adds
+ * no distinct value and is skipped (a run of equal values is one record);
+ * the histogram and the scatter pass walk the same rows by the same rule,
+ * so their counts agree. */
+#define CD_RUN_LOOP(LOAD, ACT) do {                                           \
+        int64_t prev_ = 0; bool have_ = false;                                \
+        for (int64_t i = start; i < end; i++) {                               \
+            int64_t val = (LOAD);                                             \
+            if (runs_ && have_ && val == prev_) continue;                     \
+            have_ = true; prev_ = val;                                        \
+            uint64_t p = cd_part_of(val, p_shift);                            \
+            ACT;                                                              \
+        }                                                                     \
+    } while (0)
+
 static void cd_hist_fn(void* ctx, uint32_t worker_id,
                        int64_t start, int64_t end) {
     (void)worker_id;
@@ -952,70 +992,30 @@ static void cd_hist_fn(void* ctx, uint32_t worker_id,
     int64_t row_end = row_start + x->grain;
     if (row_end > x->total) row_end = x->total;
     int64_t* hist = x->counts + (size_t)task_idx * (x->p_mask + 1);
-    /* Reuse the existing tight loops by aliasing the local names. */
     start = row_start;
     end = row_end;
+    const bool runs_ = x->runs;
     const void* base = x->base;
     int8_t in_type = x->type;
     uint8_t in_attrs = x->attrs;
-    uint64_t p_mask = x->p_mask;
+    const unsigned p_shift = cd_part_shift(x->p_mask);
     if (x->is_f64) {
         const double* d = (const double*)base;
-        for (int64_t i = start; i < end; i++) {
-            double fv = d[i];
-            if (fv != fv) fv = (double)NAN;
-            else fv = clear_neg_zero(fv);
-            int64_t val;
-            memcpy(&val, &fv, sizeof(int64_t));
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            hist[p]++;
-        }
+        CD_RUN_LOOP(cd_f64_key(d[i]), hist[p]++);
     } else if (in_type == RAY_I64 || in_type == RAY_TIMESPAN || in_type == RAY_TIMESTAMP) {
         const int64_t* d = (const int64_t*)base;
-        for (int64_t i = start; i < end; i++) {
-            int64_t val = d[i];
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            hist[p]++;
-        }
+        CD_RUN_LOOP(d[i], hist[p]++);
     } else if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME) {
         const int32_t* d = (const int32_t*)base;
-        for (int64_t i = start; i < end; i++) {
-            int64_t val = d[i];
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            hist[p]++;
-        }
+        CD_RUN_LOOP(d[i], hist[p]++);
     } else if (in_type == RAY_I16) {
         const int16_t* d = (const int16_t*)base;
-        for (int64_t i = start; i < end; i++) {
-            int64_t val = d[i];
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            hist[p]++;
-        }
+        CD_RUN_LOOP(d[i], hist[p]++);
     } else if (in_type == RAY_BOOL || in_type == RAY_U8) {
         const uint8_t* d = (const uint8_t*)base;
-        for (int64_t i = start; i < end; i++) {
-            int64_t val = d[i];
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            hist[p]++;
-        }
+        CD_RUN_LOOP(d[i], hist[p]++);
     } else if (in_type == RAY_SYM) {
-        for (int64_t i = start; i < end; i++) {
-            int64_t val = read_col_i64(base, i, in_type, in_attrs);
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            hist[p]++;
-        }
+        CD_RUN_LOOP(read_col_i64(base, i, in_type, in_attrs), hist[p]++);
     }
 }
 
@@ -1042,52 +1042,34 @@ static void cd_scatter_fn(void* ctx, uint32_t worker_id,
     int64_t row_end = row_start + x->grain;
     if (row_end > x->total) row_end = x->total;
     int64_t* cur = x->cursor + (size_t)task_idx * (x->p_mask + 1);
-    /* Reuse the existing tight loops by aliasing the local names. */
     start = row_start;
     end = row_end;
+    const bool runs_ = true;      /* the count-distinct scatter */
     int64_t* out = x->out_buf;
     const void* base = x->base;
     int8_t in_type = x->type;
     uint8_t in_attrs = x->attrs;
-    uint64_t p_mask = x->p_mask;
-    #define SCATTER_BODY(LOAD)                                                \
-        for (int64_t i = start; i < end; i++) {                               \
-            int64_t val = (LOAD);                                             \
-            uint64_t h = (uint64_t)val * CD_HASH_K1;                          \
-            h ^= h >> 33;                                                     \
-            uint64_t p = (h ^ (h >> 33)) & p_mask;                            \
-            out[cur[p]++] = val;                                              \
-        }
+    const unsigned p_shift = cd_part_shift(x->p_mask);
     if (x->is_f64) {
         const double* d = (const double*)base;
-        for (int64_t i = start; i < end; i++) {
-            double fv = d[i];
-            if (fv != fv) fv = (double)NAN;
-            else fv = clear_neg_zero(fv);
-            int64_t val;
-            memcpy(&val, &fv, sizeof(int64_t));
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
-            out[cur[p]++] = val;
-        }
+        CD_RUN_LOOP(cd_f64_key(d[i]), out[cur[p]++] = val);
     } else if (in_type == RAY_I64 || in_type == RAY_TIMESPAN || in_type == RAY_TIMESTAMP) {
         const int64_t* d = (const int64_t*)base;
-        SCATTER_BODY(d[i])
+        CD_RUN_LOOP(d[i], out[cur[p]++] = val);
     } else if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME) {
         const int32_t* d = (const int32_t*)base;
-        SCATTER_BODY(d[i])
+        CD_RUN_LOOP(d[i], out[cur[p]++] = val);
     } else if (in_type == RAY_I16) {
         const int16_t* d = (const int16_t*)base;
-        SCATTER_BODY(d[i])
+        CD_RUN_LOOP(d[i], out[cur[p]++] = val);
     } else if (in_type == RAY_BOOL || in_type == RAY_U8) {
         const uint8_t* d = (const uint8_t*)base;
-        SCATTER_BODY(d[i])
+        CD_RUN_LOOP(d[i], out[cur[p]++] = val);
     } else { /* RAY_SYM */
-        SCATTER_BODY(read_col_i64(base, i, in_type, in_attrs))
+        CD_RUN_LOOP(read_col_i64(base, i, in_type, in_attrs), out[cur[p]++] = val);
     }
-    #undef SCATTER_BODY
 }
+#undef CD_RUN_LOOP
 
 /* Sequential fallback for small inputs / when the pool isn't available.
  * Same algorithm as the original: open-addressing hash set, single pass. */
@@ -1331,12 +1313,15 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 
     uint32_t nw = ray_pool_total_workers(pool);
 
-    /* Partition count: a small power of two ≥ nw, capped so per-partition
-     * sets stay in L2.  16 works well for nw=28; 32 for >32 workers.  */
+    /* Partition count: a power of two of at least 16 (32 past 8 workers,
+     * 64 past 32), and enough for some 64K rows a partition, up to 1024,
+     * so each partition's set stays small and the dedup has a task for
+     * every worker. */
     uint32_t p_bits;
     if (nw <= 8) p_bits = 4;       /* 16 partitions */
     else if (nw <= 32) p_bits = 5;  /* 32 partitions */
     else p_bits = 6;                /* 64 partitions */
+    while (p_bits < 10 && (len >> (16 + p_bits)) > 0) p_bits++;
     uint64_t P = (uint64_t)1 << p_bits;
     uint64_t p_mask = P - 1;
 
@@ -1347,6 +1332,8 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
      * is fixed when ray_pool_dispatch_n fills the ring. */
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     if (grain <= 0) grain = 8192;
+    /* some 16 tasks a worker: the histograms and cursors are P cells a task */
+    while (len / grain > (int64_t)nw * 16) grain *= 2;
     int64_t n_tasks_64 = (len + grain - 1) / grain;
     if (n_tasks_64 <= 0) n_tasks_64 = 1;
     /* Tasks past the ring run in further rounds; the only bound on the task
@@ -1371,7 +1358,7 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         .p_bits = p_bits, .p_mask = p_mask,
         .grain = grain, .total = len,
         .stride_log2 = 0, .is_f64 = (in_type == RAY_F64),
-        .type = in_type, .attrs = input->attrs,
+        .type = in_type, .attrs = input->attrs, .runs = true,
     };
     ray_pool_dispatch_n(pool, cd_hist_fn, &hctx, n_tasks);
 
@@ -1400,8 +1387,8 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     }
     part_off[P] = total;
 
-    /* Sanity: total must equal len. */
-    if (total != len) {
+    /* Sanity: one record a run, at most one a row. */
+    if (total > len) {
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
         return ray_error("nyi", "count_distinct: histogram mismatch");
     }
@@ -1409,7 +1396,7 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     /* Pass 2: scatter values into out_buf. */
     ray_t* buf_hdr = NULL;
     int64_t* out_buf = (int64_t*)scratch_alloc(&buf_hdr,
-                                               (size_t)len * sizeof(int64_t));
+                                               (size_t)(total > 0 ? total : 1) * sizeof(int64_t));
     if (!out_buf) {
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
         return ray_error("oom", NULL);
@@ -1495,13 +1482,11 @@ static void dv_scatter_fn(void* ctx, uint32_t worker_id,
     int64_t* out = x->out_buf;
     int64_t* rid = x->rid_buf;
     const void* base = x->base;
-    uint64_t p_mask = x->p_mask;
+    const unsigned p_shift = cd_part_shift(x->p_mask);   /* as cd_hist_fn */
     #define DV_SCATTER_BODY(LOAD)                                             \
         for (int64_t i = row_start; i < row_end; i++) {                       \
             int64_t val = (LOAD);                                             \
-            uint64_t h = (uint64_t)val * CD_HASH_K1;                          \
-            h ^= h >> 33;                                                     \
-            uint64_t p = (h ^ (h >> 33)) & p_mask;                            \
+            uint64_t p = cd_part_of(val, p_shift);                            \
             int64_t c = cur[p]++;                                             \
             out[c] = val;                                                     \
             rid[c] = i;                                                       \
@@ -1514,9 +1499,7 @@ static void dv_scatter_fn(void* ctx, uint32_t worker_id,
             else fv = clear_neg_zero(fv);
             int64_t val;
             memcpy(&val, &fv, sizeof(int64_t));
-            uint64_t h = (uint64_t)val * CD_HASH_K1;
-            h ^= h >> 33;
-            uint64_t p = (h ^ (h >> 33)) & p_mask;
+            uint64_t p = cd_part_of(val, p_shift);
             int64_t c = cur[p]++;
             out[c] = val;
             rid[c] = i;
