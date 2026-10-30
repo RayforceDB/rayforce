@@ -1596,6 +1596,23 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
             return;
         }
 
+        bool str_unique = col->type == RAY_STR && ray_index_has(col) &&
+                          (ray_index_payload(col->index)->markers & RAY_MARK_UNIQUE);
+        if (str_unique && (!auto_index || col->len < (1 << 16))) {
+            /* A marker-only STR root is omitted by ray_col_save.  Persist it
+             * here when there is no size-gated dictionary to carry it. */
+            ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+            if (nstr && !RAY_IS_ERR(nstr)) {
+                char path[1100];
+                int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                                 (int)ray_str_len(nstr), ray_str_ptr(nstr));
+                if (n > 0 && n < (int)sizeof(path))
+                    (void)ray_col_append_index(path, ray_index_payload(col->index),
+                                               col->len, RAY_STR);
+            }
+            return;
+        }
+
         if (!auto_index || col->len < (1 << 16)) return;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal
@@ -1607,6 +1624,7 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                      ? ray_index_dict_compute(col)
                      : ray_index_chunk_zone_compute(col, 16);
         if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); return; }
+        if (str_unique) ray_index_payload(idx)->markers |= RAY_MARK_UNIQUE;
 
         ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
         if (nstr && !RAY_IS_ERR(nstr)) {

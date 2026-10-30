@@ -7921,6 +7921,56 @@ static test_result_t test_col_slice_save(void) {
     PASS();
 }
 
+/* A STR view stores slice_offset in the same union arm as str_pool.  Saving
+ * must read the pool from its parent even when the view begins at offset 1. */
+static test_result_t test_col_str_slice_save(void) {
+    const char* values[] = {
+        "first-long-pooled-value", "second-long-pooled-value",
+        "third-long-pooled-value"
+    };
+    ray_t* parent = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+    for (size_t i = 0; i < 3; i++) {
+        parent = ray_str_vec_append(parent, values[i], strlen(values[i]));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+    }
+
+    for (int64_t offset = 0; offset <= 1; offset++) {
+        ray_t* view = ray_vec_slice(parent, offset, 1);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+        TEST_ASSERT_TRUE(view->attrs & RAY_ATTR_SLICE);
+        TEST_ASSERT_EQ_I(ray_col_save(view, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
+
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_STR);
+        TEST_ASSERT_EQ_I(loaded->len, 1);
+        TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_SLICE);
+        TEST_ASSERT_EQ_I(loaded->str_pool->len, (int64_t)strlen(values[offset]));
+        size_t len = 0;
+        const char* got = ray_str_vec_get(loaded, 0, &len);
+        TEST_ASSERT_EQ_U(len, strlen(values[offset]));
+        TEST_ASSERT_TRUE(memcmp(got, values[offset], len) == 0);
+        ray_release(loaded);
+
+        ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+        got = ray_str_vec_get(mapped, 0, &len);
+        TEST_ASSERT_EQ_U(len, strlen(values[offset]));
+        TEST_ASSERT_TRUE(memcmp(got, values[offset], len) == 0);
+        ray_release(mapped);
+        ray_release(view);
+    }
+
+    size_t len = 0;
+    const char* original = ray_str_vec_get(parent, 2, &len);
+    TEST_ASSERT_EQ_U(len, strlen(values[2]));
+    TEST_ASSERT_TRUE(memcmp(original, values[2], len) == 0);
+    ray_release(parent);
+    unlink(ray_test_tmp(TMP_COL_PATH));
+    PASS();
+}
+
 /* ---- test_col_sym_empty_roundtrip --------------------------------------- */
 /* Covers validate_sym_bounds "len == 0" early-return (line 46 arm 46:27):
  * a zero-length RAY_SYM column skips the index scan. */
@@ -8375,6 +8425,7 @@ const test_entry_t store_entries[] = {
     { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },
     { "store/col_str_inline_only", test_col_str_inline_only_roundtrip, store_setup, store_teardown },
     { "store/col_slice_save", test_col_slice_save, store_setup, store_teardown },
+    { "store/col_str_slice_save", test_col_str_slice_save, store_setup, store_teardown },
     { "store/col_sym_empty_roundtrip", test_col_sym_empty_roundtrip, store_setup, store_teardown },
     { "store/col_sym_saved_count_reject", test_col_sym_saved_count_reject, store_setup, store_teardown },
     { "store/col_str_list_empty_string", test_col_str_list_empty_string, store_setup, store_teardown },
