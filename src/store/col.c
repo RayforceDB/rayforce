@@ -1225,6 +1225,8 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             data = ray_data(vec);
         }
 
+        /* A slice uses this union arm for slice_offset, not str_pool. */
+        ray_t* str_pool_owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
         size_t str_pool_start = SIZE_MAX, str_pool_end = 0;
         if (data_size > 0 && vec->type == RAY_STR) {
             /* Pooled descriptors are written with their content hash filled
@@ -1233,13 +1235,12 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
              * save must not write into it.  A hash the column already
              * caches is reused; a missing one (lazy, 0) is computed here. */
             const ray_str_t* src = (const ray_str_t*)data;
-            ray_t* pool_owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
             const char* pool_base = NULL;
             size_t pool_len = 0;
-            if (pool_owner->str_pool && !RAY_IS_ERR(pool_owner->str_pool) &&
-                pool_owner->str_pool->len > 0) {
-                pool_base = (const char*)ray_data(pool_owner->str_pool);
-                pool_len  = (size_t)pool_owner->str_pool->len;
+            if (str_pool_owner->str_pool && !RAY_IS_ERR(str_pool_owner->str_pool) &&
+                str_pool_owner->str_pool->len > 0) {
+                pool_base = (const char*)ray_data(str_pool_owner->str_pool);
+                pool_len  = (size_t)str_pool_owner->str_pool->len;
             }
             /* Find the exact pool span used by this column before streaming
              * descriptors: their offsets must be rebased by its first byte. */
@@ -1281,13 +1282,13 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
              * STR vector may share both an unused prefix and an unused tail
              * of its parent's pool. */
             size_t pool_size = str_pool_start == SIZE_MAX ? 0 : str_pool_end - str_pool_start;
-            if (str_pool_end > col_str_pool_payload_len(vec)) {
+            if (str_pool_end > col_str_pool_payload_len(str_pool_owner)) {
                 fclose(f); remove(tmp_path); return RAY_ERR_CORRUPT;
             }
             ray_t pool_header;
             memset(&pool_header, 0, sizeof(pool_header));
-            if (vec->str_pool && !RAY_IS_ERR(vec->str_pool)) {
-                memcpy(&pool_header, vec->str_pool, 32);
+            if (str_pool_owner->str_pool && !RAY_IS_ERR(str_pool_owner->str_pool)) {
+                memcpy(&pool_header, str_pool_owner->str_pool, 32);
                 /* aux is runtime-only state and one of its arms is a live
                  * heap pointer — the shared-mapping descriptor a mapped pool
                  * carries.  Only bytes 16-31 were being scrubbed, so that
@@ -1304,12 +1305,12 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             written = fwrite(&pool_header, 1, 32, f);
             if (written != 32) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
             if (pool_size > 0) {
-                if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) {
+                if (!str_pool_owner->str_pool || RAY_IS_ERR(str_pool_owner->str_pool)) {
                     fclose(f);
                     remove(tmp_path);
                     return RAY_ERR_CORRUPT;
                 }
-                written = fwrite((const char*)ray_data(vec->str_pool) + str_pool_start,
+                written = fwrite((const char*)ray_data(str_pool_owner->str_pool) + str_pool_start,
                                  1, pool_size, f);
                 if (written != pool_size) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
             }
