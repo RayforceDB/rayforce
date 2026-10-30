@@ -597,6 +597,36 @@ static test_result_t test_ipc_send_list_dict_arg_literal(void) {
     PASS();
 }
 
+static test_result_t test_ipc_builtin_head_arg_is_data(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+
+    const char* setup_src = "(set ipc_echo (fn [x] x))";
+    ray_t* setup = ray_str(setup_src, strlen(setup_src));
+    ray_t* result = ray_ipc_send(h, setup);
+    ray_release(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_t* msg = ray_eval_str("(list 'ipc_echo (list 'in 1 2))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+    result = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    ray_t* head = ray_list_get(result, 0);
+    TEST_ASSERT_EQ_I(head->type, -RAY_SYM);
+    TEST_ASSERT_EQ_I(head->i64, ray_sym_intern("in", 2));
+    ray_release(result);
+
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    PASS();
+}
+
 /* ---- test_ipc_connect_fail_no_server ------------------------------------ */
 /*
  * ray_ipc_connect to a port with nothing listening must return -1.
@@ -3027,6 +3057,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/send_list_select_msg",       test_ipc_send_list_select_msg,           ipc_setup, ipc_teardown },
     { "ipc/send_compiled_lambda_msg",   test_ipc_send_compiled_lambda_msg,       ipc_setup, ipc_teardown },
     { "ipc/send_list_dict_arg_literal", test_ipc_send_list_dict_arg_literal,     ipc_setup, ipc_teardown },
+    { "ipc/builtin_head_arg_is_data",   test_ipc_builtin_head_arg_is_data,       ipc_setup, ipc_teardown },
     { "ipc/connect_fail_no_server",      test_ipc_connect_fail_no_server,         ipc_setup, ipc_teardown },
     { "ipc/connect_auth_no_user",       test_ipc_connect_auth_no_user,           ipc_setup, ipc_teardown },
     { "ipc/close_invalid_handle",       test_ipc_close_invalid_handle,           ipc_setup, ipc_teardown },
