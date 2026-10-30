@@ -96,6 +96,7 @@ typedef enum {
     AGG_ROUTE_V2_SMALLHASH,
     AGG_ROUTE_V2_INDEXED,
     AGG_ROUTE_V2_TABLESTACK,
+    AGG_ROUTE_V2_RUNS,
     AGG_ROUTE_COUNT,
 } agg_route_t;
 
