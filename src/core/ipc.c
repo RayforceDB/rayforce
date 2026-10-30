@@ -65,16 +65,6 @@
 #include "lang/internal.h"
 #include "table/sym.h"
 
-static void mark_ipc_literal_fallbacks(ray_t* obj) {
-    if (!obj || RAY_IS_ERR(obj) || obj->type != RAY_LIST)
-        return;
-
-    obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
-    ray_t** elems = (ray_t**)ray_data(obj);
-    for (int64_t i = 0; i < ray_len(obj); i++)
-        mark_ipc_literal_fallbacks(elems[i]);
-}
-
 /* ===== Compression (delta + RLE) ===== */
 
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
@@ -679,11 +669,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     ray_t* result = NULL;
     bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
-        if (msg->type == RAY_LIST) {
-            ray_t** elems = (ray_t**)ray_data(msg);
-            for (int64_t i = 1; i < ray_len(msg); i++)
-                mark_ipc_literal_fallbacks(elems[i]);
-        }
+        ray_eval_mark_ipc_literal_args(msg);
 
         /* Dispatch through `.ipc.on.sync` / `.ipc.on.async` hook if
          * installed; otherwise fall back to v1's inline-eval default.

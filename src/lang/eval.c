@@ -4906,6 +4906,21 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     }
 }
 
+static void mark_ipc_literal_list(ray_t* obj) {
+    if (!obj || RAY_IS_ERR(obj) || obj->type != RAY_LIST) return;
+    obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+    ray_t** elems = (ray_t**)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++)
+        mark_ipc_literal_list(elems[i]);
+}
+
+void ray_eval_mark_ipc_literal_args(ray_t* msg) {
+    if (!msg || RAY_IS_ERR(msg) || msg->type != RAY_LIST) return;
+    ray_t** elems = (ray_t**)ray_data(msg);
+    for (int64_t i = 1; i < msg->len; i++)
+        mark_ipc_literal_list(elems[i]);
+}
+
 ray_t* ray_eval(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return obj;
 
@@ -5011,20 +5026,19 @@ ray_t* ray_eval(ray_t* obj) {
      * the (dict ...) builtin for evaluated construction. */
     if (obj->type != RAY_LIST) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
+    /* IPC arguments are data, including a list whose head resolves to a
+     * builtin or a user function.  The outer request remains callable. */
+    if (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) {
+        ray_retain(obj); ret = obj; rows = 0; goto out;
+    }
+
     /* Empty list */
     if (ray_len(obj) == 0) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
     /* List: evaluate first element, dispatch by type */
     ray_t** elems = (ray_t**)ray_data(obj);
-    int literal_fallback = (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) != 0;
     ray_t* head = ray_eval(elems[0]);
     if (RAY_IS_ERR(head)) {
-        const char* code = ray_err_code(head);
-        if (literal_fallback && code && strcmp(code, "name") == 0) {
-            ray_error_free(head);
-            ray_retain(obj);
-            ret = obj; goto out;
-        }
         ret = head; goto out;
     }
 
@@ -5035,11 +5049,6 @@ ray_t* ray_eval(ray_t* obj) {
     if (head->type == -RAY_SYM) {
         ray_t* fn = ray_env_resolve(head->i64);
         if (!fn) {
-            if (literal_fallback) {
-                ray_release(head);
-                ray_retain(obj);
-                ret = obj; goto out;
-            }
             ray_t* ns = ray_sym_str(head->i64);
             if (ns) {
                 ret = ray_error("name", "'%.*s' undefined",
@@ -5054,13 +5063,6 @@ ray_t* ray_eval(ray_t* obj) {
         /* env_resolve may also surface a real error (e.g. nyi from a
          * dotted-target deref) — propagate it directly. */
         if (RAY_IS_ERR(fn)) {
-            const char* code = ray_err_code(fn);
-            if (literal_fallback && code && strcmp(code, "name") == 0) {
-                ray_release(head);
-                ray_error_free(fn);
-                ray_retain(obj);
-                ret = obj; goto out;
-            }
             ray_release(head); ret = fn; goto out;
         }
         ray_release(head);
@@ -5371,10 +5373,6 @@ ray_t* ray_eval(ray_t* obj) {
         default: {
             int8_t head_type = head->type;
             ray_release(head);
-            if (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) {
-                ray_retain(obj);
-                ret = obj; goto out;
-            }
             ret = ray_error("type", "eval: head of list is not callable, got %s", ray_type_name(head_type)); goto out;
         }
     }
