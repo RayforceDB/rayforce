@@ -1,0 +1,55 @@
+;; Count-distinct tables that start small and grow.
+;;
+;; The fused grouped kernel (cdfuse.c, phase 2) used to size each
+;; partition's pair and key tables to twice its record count; they now start
+;; at 1024 slots and double at half load.  Partitions far below the bound
+;; (few distinct values per key) and partitions at the bound (every value
+;; distinct) must count the same as before.  The ungrouped radix path keeps
+;; its sizing; it is checked alongside.
+(set N 4194304)
+(set r (til N))
+(set k (% r 3))
+
+;; The fused kernel splits the rows over 1024 partitions (4096 records
+;; each here), so a partition's tables start below their record bound.
+;;
+;; 150 distinct values, 50 per key: every partition stays far below its
+;; record count.
+(set lo (% r 150))
+(set t (table [k x] (list k lo)))
+(set a (select {from:t by:k n:(count (distinct x))}))
+(at a 'k) -- [0 1 2]
+(at a 'n) -- [50 50 50]
+
+;; every value distinct: the tables double up to the record bound.
+(set t2 (table [k x] (list k r)))
+(set b (select {from:t2 by:k n:(count (distinct x))}))
+(at b 'k) -- [0 1 2]
+(at b 'n) -- [1398102 1398101 1398101]
+
+;; a million distinct values per key (three million pairs, about 2900 a
+;; partition, so each pair table doubles three times), and the last 1.2M
+;; rows repeat pairs seen before the doublings: an entry lost in a doubling
+;; would count its pair again.
+(set md (% r 1000000))
+(set t4 (table [k x] (list k md)))
+(at (select {from:t4 by:k n:(count (distinct x))}) 'n) -- [1000000 1000000 1000000]
+
+;; 262144 groups of sixteen values: the key table doubles three times.  A
+;; key entry lost in a doubling would open a second group for the key in
+;; its partition, which the merge of phase 3 joins again, so only a crash or
+;; a hang shows here; group_extra/cd_fused_tables_grow checks every group.
+(set t5 (table [k x] (list (% r 262144) (div r 262144))))
+(set e (select {from:t5 by:k n:(count (distinct x))}))
+(count (at e 'k)) -- 262144
+(sum (at e 'n)) -- 4194304
+(min (at e 'n)) -- 16
+
+;; F64 values through the same kernel
+(set t3 (table [k x] (list k (as 'F64 (% r 7)))))
+(at (select {from:t3 by:k n:(count (distinct x))}) 'n) -- [7 7 7]
+
+;; ungrouped radix count-distinct, unchanged, both regimes
+(count (distinct lo)) -- 150
+(count (distinct r)) -- 4194304
+(count (distinct (% r 100000))) -- 100000

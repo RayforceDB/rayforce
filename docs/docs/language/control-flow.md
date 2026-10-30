@@ -35,7 +35,11 @@ Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is
 
 ## Sequential Evaluation: do
 
-`do` evaluates expressions in order and returns the last result. `let` bindings inside `do` are scoped to that block:
+`do` evaluates expressions in order and returns the last result. At the top
+level, interpreted `do` gives `let` bindings a block scope. In a compiled
+function body, `do` runs inline and a `let` can remain visible afterward:
+
+For the full name lookup rules, see [Names and scope](name-resolution.md).
 
 ```text
 ‣ (do

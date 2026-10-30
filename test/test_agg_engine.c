@@ -2636,6 +2636,98 @@ static test_result_t test_parted_flatten_parallel(void) {
     PASS();
 }
 
+/* Cancellation under the dense output stage.  The pool skips every ticket
+ * of a cancelled query, so a dispatch the cancel lands before writes none
+ * of its per-task output: the occupancy bitmap made of the first-row array,
+ * the per-task counts of the slot collection, the collected slots.  The
+ * query runs once per dispatch it makes with the cancel landing right
+ * before that dispatch (ray_pool_test_cancel_at), over blocks filled with
+ * garbage (ray_heap_test_scribble): each run is `cancel` or the answer,
+ * never a result or a group count built from unwritten buffers, and the
+ * sanitizers see a prefix over garbage counts or a slot never collected.
+ * The plain retry answers. */
+static test_result_t test_dense_partitioned_cancel_at_dispatch(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    /* 8192 keys 8 apart over 262144 rows, float extrema: the key-partitioned
+     * dense strategy (test_dense_strategies in test_agg_contract.c) with a
+     * first-row array for its 65536 slots, which the finish turns into a
+     * bitmap and collects from in parallel */
+    ae_eval_ok("(set i (til 262144))");
+    ae_eval_ok("(set T (table [k v] (list (as 'I32 (* 8 (- (% (div i 2) 8192) 4096))) (as 'F64 (- (% i 10007) 5000)))))");
+    static const char* const q = "(select {mn: (min v) mx: (max v) c: (count v) from: T by: k})";
+    agg_route_reset();
+    size_t nr = 0;
+    char* ref = ae_csv(q, &nr);
+    agg_route_stats_t st = agg_route_stats();
+    uint64_t ng = st.dense_emit_slots;
+    bool shape = ref && nr > 0 && ng == 8192;
+#if ATOMIC_LLONG_LOCK_FREE == 2
+    shape = shape && st.dense_strategy == AGG_DENSE_PARTITIONED;
+#endif
+    if (!shape) free(ref);
+    TEST_ASSERT_FMT(shape, "not the partitioned dense route (strategy %d, %llu slots)",
+                    (int)st.dense_strategy, (unsigned long long)ng);
+    char setq[256];
+    snprintf(setq, sizeof setq, "(set R %s)", q);
+    /* fresh blocks hold 0xA5 rather than a previous run's values: a count
+     * or a slot a skipped task never wrote reads as the garbage it may be */
+    ray_heap_test_scribble(true);
+    int cancelled = 0, last = 0;
+    /* mode 0: a cancel request (both flags), until the run that answers,
+     * which is the one armed past the query's last dispatch; mode 1: the
+     * pool's flag alone (the engine's own checks, not the evaluator's),
+     * over those dispatches, every one of which answers `cancel` */
+    for (int mode = 0; mode < 2; mode++) {
+        for (int k = 1; k <= 96 && (mode == 0 || k <= last); k++) {
+            ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+            agg_route_reset();
+            ray_t* r = ae_eval(setq);
+            ray_pool_test_cancel_at(0, false);
+            ray_clear_interrupt();
+            st = agg_route_stats();
+            bool err = r && RAY_IS_ERR(r);
+            bool is_cancel = err && strcmp(ray_err_code(r), "cancel") == 0;
+            ae_drop(r);
+            /* a finish the cancel stopped counted no groups; one it did
+             * not stop counted them all, never a bitmap it never built */
+            bool slots = st.dense_emit_slots == 0 || st.dense_emit_slots == ng;
+            if (!slots) { ray_heap_test_scribble(false); free(ref); }
+            TEST_ASSERT_FMT(slots, "mode %d, cancel before dispatch %d: %llu emit slots",
+                            mode, k, (unsigned long long)st.dense_emit_slots);
+            if (err) {
+                if (!is_cancel) { ray_heap_test_scribble(false); free(ref); }
+                TEST_ASSERT_FMT(is_cancel, "mode %d, cancel before dispatch %d: an error other than cancel", mode, k);
+                cancelled++;
+                continue;
+            }
+            /* under the pool's flag alone nothing clears the cancel: an
+             * answer means a later outermost execute reset it (a lost cancel) */
+            if (mode == 1) { ray_heap_test_scribble(false); free(ref); }
+            TEST_ASSERT_FMT(mode == 0, "cancel before dispatch %d: answered under the pool's cancel", k);
+            size_t ngot = 0;
+            char* got = ae_csv("R", &ngot);
+            bool same = got && ngot == nr && memcmp(got, ref, nr) == 0;
+            free(got);
+            if (!same) { ray_heap_test_scribble(false); free(ref); }
+            TEST_ASSERT_FMT(same, "cancel before dispatch %d: a wrong answer", k);
+            last = k - 1; break;
+        }
+    }
+    ray_heap_test_scribble(false);
+    /* the finish alone dispatches three times (bitmap, counts, slots) after
+     * the four passes of the grouping */
+    bool counts = cancelled >= 7 && last >= 7;
+    if (!counts) free(ref);
+    TEST_ASSERT_FMT(counts, "%d runs cancelled over %d dispatches", cancelled, last);
+    /* the plain retry */
+    size_t ngot = 0;
+    char* got = ae_csv(q, &ngot);
+    bool same = got && ngot == nr && memcmp(got, ref, nr) == 0;
+    free(got); free(ref);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
 /* Task 17i: a parallel flatten decodes each whole vector of an encoded
  * segment straight into the flat vector, and copies a run of RAW vectors
  * lying end to end at once.  Three partitions of 200001, 199999 and
@@ -2849,6 +2941,7 @@ const test_entry_t agg_engine_entries[] = {
     { "radix_fused_capped_decode_once", test_radix_fused_capped_decode_once, ae_rt_setup, ae_rt_teardown },
     { "radix_fused_capped_below_half", test_radix_fused_capped_below_half, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
+    { "dense_partitioned_cancel_at_dispatch", test_dense_partitioned_cancel_at_dispatch, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },

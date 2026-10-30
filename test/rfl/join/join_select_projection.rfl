@@ -1,0 +1,61 @@
+;; A join that is the immediate from: of a select with outputs gathers only
+;; the keys and the columns the select's clauses name; the answers are those
+;; of the same join bound whole first (a from: name is not narrowed).
+(set jpL (table [k k2 v x l1 s] (list (% (til 3000) 100) (% (til 3000) 3) (til 3000) (* 2 (til 3000)) (til 3000) (take ['a 'b 'c] 3000))))
+(set jpR (table [k k2 w x r1 u] (list (% (til 300) 100) (% (til 300) 3) (til 300) (* 10 (til 300)) (til 300) (take ["p" "q"] 300))))
+(set jpLJ (left-join [k] jpL jpR))
+(set jpIJ (inner-join [k] jpL jpR))
+(set jpIJ2 (inner-join [k k2] jpL jpR))
+(select {s: (sum w) from: (left-join [k] jpL jpR)}) -- (select {s: (sum w) from: jpLJ})
+(select {s: (sum w) c: (count v) from: (inner-join [k] jpL jpR)}) -- (select {s: (sum w) c: (count v) from: jpIJ})
+;; a column on both sides: the join's own choice of which it keeps
+(select {s: (sum x) from: (left-join [k] jpL jpR)}) -- (select {s: (sum x) from: jpLJ})
+(select {s: (sum x) from: (inner-join [k] jpL jpR)}) -- (select {s: (sum x) from: jpIJ})
+(select {s: (sum w) by: s from: (left-join [k] jpL jpR)}) -- (select {s: (sum w) by: s from: jpLJ})
+(select {s: (sum w) from: (left-join [k] jpL jpR) where: (> r1 10)}) -- (select {s: (sum w) from: jpLJ where: (> r1 10)})
+(select {m: (max u) from: (left-join [k] jpL jpR) where: (== s 'b)}) -- (select {m: (max u) from: jpLJ where: (== s 'b)})
+(select {a: v b: w from: (inner-join [k k2] jpL jpR) asc: w take: 5}) -- (select {a: v b: w from: jpIJ2 asc: w take: 5})
+(select {s: (sum w) n: (first x) from: (left-join [k] jpL jpR) by: k2 desc: s take: 2}) -- (select {s: (sum w) n: (first x) from: jpLJ by: k2 desc: s take: 2})
+(select {s: (sum w) from: (left-join [k] jpL jpR) by: {kk: k}}) -- (select {s: (sum w) from: jpLJ by: {kk: k}})
+;; grouped outputs that are only the key name: the first of every column
+(select {s: s from: (left-join [k] jpL jpR) by: s}) -- (select {s: s from: jpLJ by: s})
+(select {a: s from: (left-join [k] jpL jpR) by: s}) -- (select {a: s from: jpLJ by: s})
+(select {a: s b: k from: (inner-join [k] jpL jpR) by: s}) -- (select {a: s b: k from: jpIJ by: s})
+(select {s: s from: (left-join [k] jpL jpR) by: {s: s}}) -- (select {s: s from: jpLJ by: {s: s}})
+(select {a: s n: (count v) from: (left-join [k] jpL jpR) by: s}) -- (select {a: s n: (count v) from: jpLJ by: s})
+;; a clause that may read a column without naming it keeps every column
+(set jpf (fn [z] (* z 2)))
+(select {s: (sum (jpf w)) from: (left-join [k] jpL jpR)}) -- (select {s: (sum (jpf w)) from: jpLJ})
+((fn [q] (select {s: (sum (+ w q)) from: (left-join [k] jpL jpR)})) 1) -- (select {s: (sum (+ w 1)) from: jpLJ})
+;; a lambda reads a query column by its name at run time
+(set jpg (fn [] (sum w)))
+(select {s: (jpg) from: (left-join [k] jpL jpR)}) -- (select {s: (jpg) from: jpLJ})
+(select {s: (eval (quote (sum r1))) from: (left-join [k] jpL jpR)}) -- (select {s: (eval (quote (sum r1))) from: jpLJ})
+(select {s: (sum (resolve (quote r1))) from: (left-join [k] jpL jpR)}) -- (select {s: (sum r1) from: jpLJ})
+(select {s: (sum (resolve (quote r1))) from: (inner-join [k] jpL jpR)}) -- (select {s: (sum r1) from: jpIJ})
+(set jpev eval)
+(select {s: (jpev (quote (sum r1))) from: (left-join [k] jpL jpR)}) -- (select {s: (jpev (quote (sum r1))) from: jpLJ})
+(select {s: (jpev (quote (sum r1))) from: (inner-join [k] jpL jpR)}) -- (select {s: (jpev (quote (sum r1))) from: jpIJ})
+;; a parameter or let named like a joined column is the callable, not the column
+(set jph (fn [] r1))
+((fn [w] (select {s: (sum (w)) from: (left-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpLJ})
+((fn [w] (select {s: (sum (w)) from: (inner-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpIJ})
+((fn [] (let w jph) (select {s: (sum (w)) from: (left-join [k] jpL jpR)}))) -- (select {s: (sum r1) from: jpLJ})
+((fn [h] (select {s: (sum (h)) from: (left-join [k] jpL jpR)})) jph) -- (select {s: (sum r1) from: jpLJ})
+;; a join inside a lambda that is the from: is not the select's to narrow
+(set jpfd (fn [] (distinct (left-join [k] jpL jpR))))
+(select {s: (sum w) from: (jpfd)}) -- (select {s: (sum w) from: (distinct jpLJ)})
+(select {c: (count w) from: (jpfd)}) -- (select {c: (count w) from: (distinct jpLJ)})
+(set jpfx (fn [] (xasc (left-join [k] jpL jpR) 'r1)))
+(select {s: (sum w) from: (jpfx)}) -- (select {s: (sum w) from: (xasc jpLJ 'r1)})
+((fn [left-join] (select {s: (sum w) from: (left-join [k] jpL jpR)})) (fn [a b c] (distinct (inner-join a b c)))) -- (select {s: (sum w) from: (distinct jpIJ)})
+;; the same reads in a grouped select whose where: runs as its own filter
+(set jpT (table [k a r1] (list (% (til 3000) 3) (til 3000) (* 10 (til 3000)))))
+((fn [a] (select {s: (sum (a)) from: jpT where: (> r1 5) by: k})) jph) -- (select {s: (sum r1) from: jpT where: (> r1 5) by: k})
+(select {s: (sum (resolve (quote r1))) from: jpT where: (> a 5) by: k}) -- (select {s: (sum r1) from: jpT where: (> a 5) by: k})
+;; no outputs: the whole joined table
+(take (select {from: (left-join [k] jpL jpR) where: (> v 2990)}) 3) -- (take (select {from: jpLJ where: (> v 2990)}) 3)
+;; a nested select names what it reads from the join
+(select {t: (sum s2) from: (select {s2: (sum w) by: k from: (left-join [k] jpL jpR)})}) -- (select {t: (sum s2) from: (select {s2: (sum w) by: k from: jpLJ})})
+(select {s: (sum w) from: (left-join [zz] jpL jpR)}) !- domain
+(select {s: (sum zz) from: (left-join [k] jpL jpR)}) !- schema

@@ -36,12 +36,22 @@ typedef struct {
     ray_t*  fn;       /* retained 1-arity lambda */
 } ray_timer_t;
 
+/* One active callback invocation.  Lives on the dispatcher's stack; frames
+ * link innermost-to-outermost through `prev`, so a callback that re-enters
+ * ray_timers_fire_expired keeps every suspended invocation reachable. */
+typedef struct ray_timer_frame {
+    ray_timer_t*            timer;  /* popped timer whose callback is running */
+    bool                    dead;   /* ray_timers_del hit it: free, don't re-arm, on unwind */
+    struct ray_timer_frame* prev;   /* enclosing (suspended) invocation, or NULL */
+} ray_timer_frame_t;
+
 /* Min-heap keyed on (exp_ms, id).  Owns its entries and their lambdas. */
 typedef struct {
     ray_timer_t** heap;
     int64_t       n;
     int64_t       cap;
     int64_t       next_id;
+    ray_timer_frame_t* firing;  /* innermost active callback frame, else NULL */
 } ray_timers_t;
 
 /* Create an empty heap with `initial_cap` slots (rounded up to 1).
@@ -56,7 +66,10 @@ void ray_timers_destroy(ray_timers_t* t);
 int64_t ray_timers_add(ray_timers_t* t, int64_t tic_ms, int64_t num, ray_t* fn);
 
 /* Remove the timer with `id`.  Releases its lambda.
- * Returns true if found+removed, false otherwise. */
+ * Returns true if found+removed, false otherwise.  The timer whose callback
+ * is running, and any suspended one further out in a nested dispatch, is out
+ * of the heap; deleting it only marks its frame dead.  The callback keeps its
+ * lambda until it returns, then the timer is freed, not re-armed. */
 bool ray_timers_del(ray_timers_t* t, int64_t id);
 
 /* Deadline (monotonic ms) of the soonest-firing timer, or INT64_MAX if empty. */

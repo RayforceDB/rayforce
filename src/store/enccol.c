@@ -2606,6 +2606,15 @@ void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_
     out->sum_lo = de.sum_lo; out->sum_hi = de.sum_hi;
 }
 
+bool ray_enccol_chunk_pfx(const ray_enccol_t* e, int64_t c, uint32_t* mn, uint32_t* mx) {
+    if (e->type != RAY_SYM) return false;
+    ray_enc_dirent_t de;
+    dirent_at(e, c, &de);
+    if (!(de.flags & RAY_ENC_SYM_PFX)) return false;
+    *mn = de.rsv0; *mx = de.rsv1;
+    return true;
+}
+
 bool ray_enccol_code_bounds(const ray_enccol_t* e, int64_t c, int j, int64_t* lo, int64_t* hi) {
     if (e->type != RAY_STR || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || c < 0 || c >= e->n_chunks) return false;
     if (j < 0) {
