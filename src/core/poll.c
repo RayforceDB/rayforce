@@ -140,7 +140,7 @@ void ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel, int64_t size)
 
 int64_t ray_poll_sel_recv(ray_selector_t* sel, uint8_t* buf, int64_t len)
 {
-    if (sel->xport) {
+    if (sel->xport && !sel->rx_on_sock) {
         int64_t n = sel->xport->ops->read(sel->xport, buf, len);
         if (n < 0) { errno = ECONNRESET; return -1; }
         if (n == 0) { errno = EAGAIN; return -1; }
@@ -254,8 +254,9 @@ int ray_poll_xport_attach(ray_poll_t* poll, ray_selector_t* sel, ray_xport_t* xp
     reg.data    = (void*)(intptr_t)sel->id;
     int64_t id = ray_poll_register(poll, &reg);
     if (id < 0) return -1;
-    sel->xport    = xport;
-    sel->xport_id = id;
+    sel->xport      = xport;
+    sel->xport_id   = id;
+    sel->rx_on_sock = false;
     poll->n_xport++;
     /* The socket's write readiness means nothing now: room is announced
      * through event_fd.  Re-derive its interest set (drops EPOLLOUT). */

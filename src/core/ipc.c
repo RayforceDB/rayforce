@@ -505,7 +505,9 @@ static int64_t xport_now_ns(void)
 static int conn_wait_readable(ray_selector_t* sel, int wait_ms)
 {
     ray_xport_t* x = sel->xport;
-    if (!x) return ray_sock_wait_readable_intr((ray_sock_t)sel->fd, wait_ms);
+    /* Still reading the socket (the peer's last TCP frame not yet in):
+     * that is where the next bytes come from. */
+    if (!x || sel->rx_on_sock) return ray_sock_wait_readable_intr((ray_sock_t)sel->fd, wait_ms);
 #ifdef RAY_IPC_XPORT
     if (x->ops->pending(x)) return 1;
     int64_t until = xport_now_ns() + XPORT_SPIN_NS;
@@ -551,12 +553,17 @@ static int64_t conn_send_all(ray_selector_t* sel, const uint8_t* buf, size_t len
             if (left < wait_ms) wait_ms = (int)left;
         }
         /* Room is all that is waited for: inbound bytes nobody is reading
-         * right now must not keep the writer awake. */
+         * right now must not keep the writer awake.  A socket still read
+         * (rx_on_sock) may hold the peer's frames: only its hangup counts. */
         if (x->ops->prepare_sleep(x, false, true)) {
-            struct pollfd p[2] = { { x->event_fd, POLLIN, 0 }, { (int)sel->fd, POLLIN, 0 } };
+            short sev = sel->rx_on_sock ? POLLRDHUP : POLLIN;
+            struct pollfd p[2] = { { x->event_fd, POLLIN, 0 }, { (int)sel->fd, sev, 0 } };
             poll(p, 2, wait_ms);
             x->ops->woke(x);
-            if (p[1].revents && conn_sock_gone(sel) < 0) { errno = EPIPE; return -1; }
+            if (p[1].revents && (sel->rx_on_sock || conn_sock_gone(sel) < 0)) {
+                errno = EPIPE;
+                return -1;
+            }
         }
     }
     return (int64_t)len;
@@ -977,6 +984,10 @@ typedef struct {
     /* A server's RDMA endpoint answered but not yet moved to: the client
      * probes the fabric first and says XP_READY, or refuses. */
     ray_xport_t*     pending_xport;
+    /* A client's transport, made and waiting for the server's XP_SWITCHED:
+     * the rx pump moves the connection to it as that frame is read, at
+     * whatever depth of nested waits it arrives. */
+    ray_xport_t*     switch_xport;
 } ray_ipc_conn_data_t;
 
 /* ===== Transport policy ===== */
@@ -1050,7 +1061,7 @@ enum {
     XP_SHM_ASK   = 1,   /* + the client's host identity (RAY_SHM_IDENTITY_LEN) */
     XP_SHM_OFFER = 2,   /* + token (16) + ring bytes (8) + the Unix socket's name, NUL-terminated */
     XP_RDMA      = 3,   /* + ray_rdma_record_t */
-    XP_SWITCHED  = 4,   /* the server's last TCP frame: its side now reads the rings */
+    XP_SWITCHED  = 4,   /* the writer's last TCP frame: what it writes next is on the transport */
     XP_READY     = 5,   /* the client's last TCP frame: its RDMA probe crossed, move now */
 };
 #define XP_TOKEN_LEN 16
@@ -1066,6 +1077,7 @@ static void   serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* c
 static int    client_upgrade(ray_poll_t* poll, int64_t id, int want, int64_t deadline);
 #ifdef RAY_IPC_XPORT
 static void   shm_offers_drop_conn(ray_poll_t* poll, int64_t id, const void* cd);
+static bool   client_switch(ray_poll_t* poll, int64_t id, ray_xport_t* x);
 static void   shm_side_listen(ray_poll_t* poll);
 #endif
 static int    conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel,
@@ -1329,6 +1341,26 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     /* An upgrade record: the answer a client of ours waits for, or a
      * client's ask that we answer.  Never evaluated, never journaled. */
     if (hdr.msgtype == RAY_IPC_MSG_UPGRADE) {
+#ifdef RAY_IPC_XPORT
+        uint8_t kind = payload->offset >= 1 ? payload->data[0] : XP_REFUSE;
+        if (kind == XP_SWITCHED && sel->xport && sel->rx_on_sock) {
+            /* The peer's last TCP frame: every byte it wrote before moving
+             * has been read, the rest is in the transport. */
+            sel->rx_on_sock = false;
+            ray_poll_buf_free(payload);
+            return NULL;
+        }
+        if (kind == XP_SWITCHED && cd->switch_xport) {
+            /* The server's last TCP frame: move now, before any frame its
+             * transport carries is due — a nested wait reads them next. */
+            ray_xport_t* x = cd->switch_xport;
+            cd->switch_xport = NULL;
+            if (!client_switch(poll, id, x)) {
+                ray_poll_buf_free(payload);
+                return NULL;
+            }
+        }
+#endif
         if (cd->upgrade_waiting && !cd->upgrade_resp) {
             cd->upgrade_resp = payload;
             return NULL;
@@ -1460,6 +1492,10 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
             cd->pending_xport->ops->destroy(cd->pending_xport);
             cd->pending_xport = NULL;
         }
+        if (cd->switch_xport) {
+            cd->switch_xport->ops->destroy(cd->switch_xport);
+            cd->switch_xport = NULL;
+        }
 #ifdef RAY_IPC_XPORT
         shm_offers_drop_conn(poll, sel->id, cd);
 #endif
@@ -1478,12 +1514,21 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
  * private road for the descriptors: the server makes the rings, keeps
  * them under a one-use token, and the client shows the token on the
  * server's abstract Unix socket — from the same user, checked by peer
- * credentials — to receive them.  The server moves the connection when
- * the descriptors have gone and says so with one last TCP frame
- * (XP_SWITCHED); the client moves when it has read that frame, so every
- * byte either side wrote on TCP before moving has been read before the
- * rings are.  RDMA needs no second road: the records carry everything,
- * the server moves as it answers, the client as it reads the answer.
+ * credentials — to receive them.  RDMA needs no second road: the records
+ * carry everything, and the client proves the fabric with a probe before
+ * it says XP_READY.
+ *
+ * Each direction then switches on its own, marked by its writer's last
+ * TCP frame (XP_SWITCHED).  The server moves when the descriptors have
+ * gone (or on XP_READY): it sends its XP_SWITCHED and writes to the
+ * transport from then on, but keeps reading TCP.  The client, reading
+ * that frame — in whichever wait of its own it arrives, a callback's
+ * nested round trip included — reads the transport from then on, sends
+ * its own XP_SWITCHED after whatever it had queued, and writes to the
+ * transport too.  The server reads the transport once that frame is in.
+ * So a frame either side writes while the other is still moving — a
+ * callback's post during the client's negotiation, its reply — is read
+ * on the road it was written to, in order.
  * ====================================================================== */
 
 /* One UPGRADE frame, written straight to the socket: the connection is on
@@ -1612,10 +1657,12 @@ static void shm_side_on_close(ray_poll_t* poll, ray_selector_t* sel)
     close((int)sel->fd);
 }
 
-/* Moves `conn` to `x`, its queue drained first so no frame straddles the
- * two roads.  On any failure the connection is dropped: the peer has
- * moved, or is about to, and TCP alone can no longer carry it. */
-static bool conn_move(ray_poll_t* poll, int64_t id, ray_xport_t* x)
+/* Moves `conn`'s writing to `x`, its queue drained first so no frame
+ * straddles the two roads; its reading moves too unless `rx_on_sock`
+ * keeps it on the socket until the peer's last TCP frame.  On any failure
+ * the connection is dropped: the peer has moved, or is about to, and TCP
+ * alone can no longer carry it. */
+static bool conn_move(ray_poll_t* poll, int64_t id, ray_xport_t* x, bool rx_on_sock)
 {
     ray_selector_t* conn = ray_poll_get(poll, id);
     if (!conn || !conn->data || conn->xport ||
@@ -1625,21 +1672,44 @@ static bool conn_move(ray_poll_t* poll, int64_t id, ray_xport_t* x)
         if (conn) ray_poll_deregister(poll, id);
         return false;
     }
+    conn->rx_on_sock = rx_on_sock;
     upgraded_threshold((ray_ipc_conn_data_t*)conn->data);
     return true;
 }
 
-/* The server's side of a move: the connection goes to `x`, and the
- * client hears so in the server's last TCP frame. */
+/* The server's side of a move: the connection writes to `x` from now on,
+ * and the client hears so in the server's last TCP frame.  The client
+ * may still be writing TCP — a callback it runs before that frame
+ * reaches it can post on this connection — so the server reads the
+ * socket until the client's own last TCP frame says it has moved. */
 static void server_switch(ray_poll_t* poll, int64_t id, ray_xport_t* x)
 {
     ray_selector_t* conn = ray_poll_get(poll, id);
     if (!conn) { x->ops->destroy(x); return; }
     ray_sock_t sock = (ray_sock_t)conn->fd;
-    if (conn_move(poll, id, x)) {
+    if (conn_move(poll, id, x, true)) {
         uint8_t switched = XP_SWITCHED;
         if (upgrade_send(sock, &switched, 1) < 0) ray_poll_deregister(poll, id);
     }
+}
+
+/* The client's side, as the server's last TCP frame is read: everything
+ * the server wrote before moving has been read, so the client reads the
+ * transport from now on; what the client queued goes out on TCP, then
+ * its own last TCP frame, then it writes to the transport too.  False
+ * when the connection was dropped. */
+static bool client_switch(ray_poll_t* poll, int64_t id, ray_xport_t* x)
+{
+    ray_selector_t* conn = ray_poll_get(poll, id);
+    if (!conn) { x->ops->destroy(x); return false; }
+    uint8_t switched = XP_SWITCHED;
+    if (conn_tx_drain_blocking(poll, conn, -1) < 0 ||
+        upgrade_send((ray_sock_t)conn->fd, &switched, 1) < 0) {
+        x->ops->destroy(x);
+        ray_poll_deregister(poll, id);
+        return false;
+    }
+    return conn_move(poll, id, x, false);
 }
 
 /* The side channel's one-byte answers: 'k' with the descriptors, 'n' for
@@ -1915,8 +1985,10 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
         else x->ops->destroy(x);
         return;
     }
-    if (kind == XP_READY || kind == XP_REFUSE) return;   /* nothing pending: nothing to say */
-    bool may = !sel->xport && !cd->pending_xport && (cd->peer_caps & RAY_IPC_CAP_XPORT);
+    if (kind == XP_READY || kind == XP_REFUSE || kind == XP_SWITCHED)
+        return;   /* nothing pending: nothing to say */
+    bool may = !sel->xport && !cd->pending_xport && !cd->switch_xport &&
+               (cd->peer_caps & RAY_IPC_CAP_XPORT);
     if (may && kind == XP_SHM_ASK && n == 1 + RAY_SHM_IDENTITY_LEN &&
         policy_allows(g_xport_policy, RAY_XPORT_SHM)) {
         const char* me = ray_shm_host_identity();
@@ -1979,6 +2051,29 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
 #endif
 }
 
+#ifdef RAY_IPC_XPORT
+/* The client's wait for the server's XP_SWITCHED with `x` made: the rx
+ * pump moves the connection as the frame is read (client_switch).  0 when
+ * it moved to `x`; -1 when it did not (the caller closes it). */
+static int client_await_switch(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
+                               ray_xport_t* x, int64_t deadline)
+{
+    cd->switch_xport = x;
+    ray_poll_buf_t* reply = NULL;
+    int rc = upgrade_wait(poll, id, deadline, &reply);
+    uint8_t k = reply_kind(reply);
+    ray_poll_buf_free(reply);
+    ray_selector_t* sel = ray_poll_get(poll, id);
+    if (!sel || sel->data != (void*)cd) return -1;   /* closed: its close took x */
+    if (cd->switch_xport) {                          /* never moved */
+        cd->switch_xport->ops->destroy(cd->switch_xport);
+        cd->switch_xport = NULL;
+        return -1;
+    }
+    return rc == 0 && k == XP_SWITCHED && sel->xport == x ? 0 : -1;
+}
+#endif
+
 /* A new client connection, handshaken and registered: ask the server to
  * move it.  Shared memory when the peer is on this host, RDMA when it is
  * on another and this host has a device; `want` names one of them to
@@ -2027,18 +2122,9 @@ static int client_upgrade(ray_poll_t* poll, int64_t id, int want, int64_t deadli
             int fetched = shm_fetch_rings(name, token, fds, deadline);
             if (fetched == 0) return miss;
             if (fetched < 0) return -1;
-            if (upgrade_wait(poll, id, deadline, &reply) < 0) {
-                for (int i = 0; i < 3; i++) close(fds[i]);
-                return -1;
-            }
-            uint8_t k = reply_kind(reply);
-            ray_poll_buf_free(reply);
             ray_xport_t* x = ray_shm_attach(ring, fds);   /* consumes fds */
-            if (k != XP_SWITCHED || !x) {
-                if (x) x->ops->destroy(x);
-                return -1;
-            }
-            return conn_move(poll, id, x) ? 0 : -1;
+            if (!x) return -1;
+            return client_await_switch(poll, id, cd, x, deadline);
         }
         ray_poll_buf_free(reply);
         return miss;   /* refused: stay on TCP (AUTO never tries RDMA on one host) */
@@ -2074,11 +2160,7 @@ static int client_upgrade(ray_poll_t* poll, int64_t id, int want, int64_t deadli
                 return -1;
             }
             if (!reach) { x->ops->destroy(x); return miss; }
-            if (upgrade_wait(poll, id, deadline, &reply) < 0) { x->ops->destroy(x); return -1; }
-            uint8_t k = reply_kind(reply);
-            ray_poll_buf_free(reply);
-            if (k != XP_SWITCHED) { x->ops->destroy(x); return -1; }
-            return conn_move(poll, id, x) ? 0 : -1;
+            return client_await_switch(poll, id, cd, x, deadline);
         }
         ray_poll_buf_free(reply);
         x->ops->destroy(x);

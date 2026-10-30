@@ -238,7 +238,9 @@ static bool xport_serve(ray_poll_t* poll)
             served = true;
             if (ray_poll_serve_tx(poll, (int64_t)i) < 0) continue;
         }
-        if (x->ops->pending(x)) {
+        /* Still reading the socket: what landed waits for the peer's last
+         * TCP frame, and the socket's own events serve that. */
+        if (!sel->rx_on_sock && x->ops->pending(x)) {
             served = true;
             ray_poll_serve_rx(poll, (int64_t)i);
         }
@@ -252,7 +254,8 @@ static bool xport_news(ray_poll_t* poll)
         ray_selector_t* sel = poll->sels[i];
         if (!sel || !sel->xport) continue;
         ray_xport_t* x = sel->xport;
-        if (x->ops->pending(x) || (sel->tx.buf && x->ops->room(x))) return true;
+        if ((!sel->rx_on_sock && x->ops->pending(x)) || (sel->tx.buf && x->ops->room(x)))
+            return true;
     }
     return false;
 }
@@ -290,7 +293,7 @@ static int xport_pass(ray_poll_t* poll)
         if (!sel || !sel->xport) continue;
         ray_xport_t* x = sel->xport;
         bool want_room = sel->tx.buf != NULL;
-        if (!x->ops->prepare_sleep(x, true, want_room)) news = true;
+        if (!x->ops->prepare_sleep(x, !sel->rx_on_sock, want_room)) news = true;
         if (want_room && !x->fd_tells_room) queued = true;
     }
     if (news) { xport_woke(poll); return 0; }
@@ -370,11 +373,13 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             if (!sel) continue;
 
             /* The socket of an upgraded connection carries nothing but the
-             * peer's going: readable, it has closed or sent what it must
-             * not, and either way the connection ends — serving it would
-             * find nothing in the ring and leave the level-triggered event
-             * standing. */
-            if (sel->xport && (events[i].events & EPOLLIN) && xport_sock_spoke(sel)) {
+             * peer's going once the peer's last TCP frame has been read:
+             * readable then, it has closed or sent what it must not, and
+             * either way the connection ends — serving it would find
+             * nothing in the ring and leave the level-triggered event
+             * standing.  Before that frame it is read as before. */
+            if (sel->xport && !sel->rx_on_sock && (events[i].events & EPOLLIN) &&
+                xport_sock_spoke(sel)) {
                 if (sel->error_fn) sel->error_fn(poll, sel);
                 else ray_poll_deregister(poll, sel->id);
                 goto next_event;

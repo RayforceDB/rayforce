@@ -144,6 +144,11 @@ struct ray_selector {
      * the RAY_SEL_XPORT selector (`xport_id`) that waits on its event_fd. */
     ray_xport_t*     xport;
     int64_t          xport_id;
+    /* Moved, but still reading the socket: each direction switches on its
+     * own, and a connection that already writes to its transport reads TCP
+     * until the peer's last TCP frame (core/ipc.c, XP_SWITCHED) has come.
+     * Bytes the peer puts on the transport meanwhile wait in it. */
+    bool             rx_on_sock;
 };
 
 /* ===== Registration ===== */
@@ -225,7 +230,8 @@ int             ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel);
 int             ray_poll_xport_attach(ray_poll_t* poll, ray_selector_t* sel,
                                       ray_xport_t* xport);
 /* The connection's byte stream, wherever it is: its transport once it
- * has one, else its socket through recv_fn/send_fn.  Same contract as the
+ * has one (for reading, once `rx_on_sock` is clear), else its socket
+ * through recv_fn/send_fn.  Same contract as the
  * io callbacks: bytes moved, 0 for EOF (recv) or nothing taken (send with
  * errno EAGAIN), -1 with errno (EAGAIN when nothing is there yet). */
 int64_t         ray_poll_sel_recv(ray_selector_t* sel, uint8_t* buf, int64_t len);
