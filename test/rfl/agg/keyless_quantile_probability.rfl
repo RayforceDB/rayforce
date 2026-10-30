@@ -1,4 +1,4 @@
-;; #981 partial: preserve literal probabilities without changing evaluator fallback.
+;; Keyless aggregate transport preserves literal and bound scalar probabilities.
 (set Q981 (table [s t keep] (list (as 'F64 [0 8 16 24]) [1 3 5 7] [false true false true])))
 (quantile (at Q981 's) 0.25) -- 6.0
 (at (select {q: (quantile s 0.25) from: Q981}) 'q) -- [6.0]
@@ -16,14 +16,22 @@
 (at (select {q: (quantile s 0.25) from: Q981 where: false}) 'q) -- [0Nf]
 (set N981 (table [s] (list (as 'F64 [0Nf 0Nf]))))
 (at (select {q: (quantile s 0.25) from: N981}) 'q) -- [0Nf]
-;; This partial repair changes literal probabilities only.  Preserve the
-;; already-correct bound median case without declaring other bound values fixed.
+;; A bound probability must not silently fall back to the median.
 (set P981 0.5)
 (quantile (at Q981 's) P981) -- 12.0
 (at (select {q: (quantile s P981) from: Q981}) 'q) -- [12.0]
 (value (select {a: (quantile s 0) b: (quantile s P981) c: (quantile s 0.25) from: Q981})) -- (list [0.0] [12.0] [6.0])
+(set P981 0.25)
+(quantile (at Q981 's) P981) -- 6.0
+(at (select {q: (quantile s P981) from: Q981}) 'q) -- [6.0]
+(value (select {a: (quantile s 0) b: (quantile s P981) c: (quantile s 0.75) from: Q981})) -- (list [0.0] [6.0] [18.0])
+(set P981 0)
+(at (select {q: (quantile s P981) from: Q981}) 'q) -- [0.0]
+((fn [P981] (at (select {q: (quantile s P981) from: Q981}) 'q)) 0.75) -- [18.0]
 (set PP981 50)
 (value (select {a: (percentile s 25) b: (percentile s PP981) from: Q981})) -- (list [6.0] [12.0])
+(set PP981 25)
+(at (select {p: (percentile s PP981) from: Q981}) 'p) -- [6.0]
 ;; Existing grouped parameter transport must remain correct.
 (set G981 (table [g s] (list [0 0 1 1] (as 'F64 [0 8 16 24]))))
 (at (select {q: (quantile s 0.25) from: G981 by: g asc: g}) 'q) -- [2.0 18.0]

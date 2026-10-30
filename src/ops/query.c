@@ -942,6 +942,18 @@ static bool quantile_literal_prob(ray_t* prob_expr, bool percentile,
     return true;
 }
 
+/* Keyless SELECT can carry a scalar probability bound in the caller's
+ * environment as well as a literal.  A source column of the same name wins
+ * over that binding and must not be treated as a scalar parameter. */
+static bool quantile_keyless_prob(ray_t* prob_expr, ray_t* tbl,
+                                  bool percentile, double* out_q) {
+    if (quantile_literal_prob(prob_expr, percentile, out_q)) return true;
+    if (!prob_expr || prob_expr->type != -RAY_SYM ||
+        (prob_expr->attrs & ATTR_QUOTED) ||
+        ray_table_slot(tbl, prob_expr->i64)) return false;
+    return quantile_literal_prob(ray_env_get(prob_expr->i64), percentile, out_q);
+}
+
 /* True when any GROUP BY key names a BOOL column of `tbl`.  A BOOL-keyed
  * group is emitted in key order (false before true) and query.c reorders the
  * finished result to first-occurrence AFTERWARDS, so a take must not be pushed
@@ -22398,7 +22410,7 @@ by_dict_done:
                         ray_binary_fn native = percentile ? ray_percentile_fn : ray_quantile_fn;
                         if (fn && fn->type == RAY_BINARY &&
                             (ray_binary_fn)(uintptr_t)fn->i64 == native &&
-                            quantile_literal_prob(agg_elems[2], percentile, &q)) {
+                            quantile_keyless_prob(agg_elems[2], tbl, percentile, &q)) {
                             agg_k[s_n_aggs] = encode_agg_f64_param(q);
                             s_has_param = 1;
                         }
