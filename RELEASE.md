@@ -84,15 +84,18 @@ spans the entire v2 line and was given a hand-written highlights summary instead
 
 ## How the version reaches the binary
 
-The Makefile resolves the version (CI override `RAY_VERSION=` > latest git tag >
+The Makefile resolves the version (CI override `RAY_VERSION=` > highest git tag >
 `0.0.0` dev default) and injects it at compile time via `-D`, exactly like it
 already does for the git commit and build date. `ray_version_string()`, the REPL
 banner, and `.sys.build` all report that value. The literals in
 `include/rayforce.h` are only `#ifndef`-guarded `0.0.0` fallbacks for untagged
 builds and for downstream code that includes the header without our `-D` flags.
 
-A plain local `make` on an untagged commit reports `0.0.0`; with tags present it
-reports the latest via `git describe`. To build a specific version locally:
+A plain local `make` reports the highest `vX.Y.Z` tag in the repository, whether
+or not it is an ancestor of `HEAD`: release tags live on `master`, which never
+merges back into `dev`, so `git describe` would leave `dev` builds on an older
+release. A clone without tags reports `0.0.0`. To build a specific version
+locally:
 
 ```sh
 make dist RAY_VERSION=2.1.3
