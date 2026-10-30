@@ -302,6 +302,7 @@ static ray_t* eval_one(ray_t* msg) {
         ray_sys_free(tmp);
         return r;
     }
+    ray_eval_mark_ipc_literal_args(msg);
     return ray_eval(msg);
 }
 
