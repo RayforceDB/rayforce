@@ -311,7 +311,7 @@ static test_result_t test_closure_sym_walk_guard(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
         bool dynamic = false;
         int64_t weight = 0;
-        ray_t* ment = ray_closure_mentioned_syms(ast, &dynamic, &weight);
+        ray_t* ment = ray_closure_mentioned_syms(ast, NULL, &dynamic, &weight, NULL);
         if (i == 0) {
             TEST_ASSERT(ment != NULL, "a body within the guard is walked");
             TEST_ASSERT_EQ_I(ment->len, 1);
@@ -11304,11 +11304,50 @@ static test_result_t test_local_mutation_fast_paths(void) {
     PASS();
 }
 
+/* A dotted read of a local, compiled, then the runtime is destroyed and
+ * created again on this thread: the code of the second runtime refers to
+ * nothing the first one's heap held. */
+static test_result_t test_dotted_local_read_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+        }
+        ASSERT_EQ("((fn [] (let d (dict [v] (list 41))) d.v))", "41");
+    }
+    PASS();
+}
+
+/* A dotted read of a local reads the head's slot and walks the rest
+ * (compile_dotted_local), rather than evaluating the name in a window:
+ * no constant is the I64 vector of local names a window binds. */
+static test_result_t test_dotted_local_read_slot(void) {
+    ray_t* def = ray_eval_str("(set dlrslot (fn [] (let d (dict [v] (list 7))) d.v))");
+    TEST_ASSERT_NOT_NULL(def);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(def));
+    ray_release(def);
+    ASSERT_EQ("(dlrslot)", "7");
+    ray_t* lam = ray_env_get(ray_sym_intern("dlrslot", 7));
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(lam), "the lambda compiled on its call");
+    ray_t* consts = LAMBDA_CONSTS(lam);
+    TEST_ASSERT_NOT_NULL(consts);
+    bool window = false;
+    for (int64_t i = 0; i < consts->len && !window; i++) {
+        ray_t* k = ((ray_t**)ray_data(consts))[i];
+        window = k && k->type == RAY_I64;
+    }
+    TEST_ASSERT(!window, "the read walks below the head's slot, without a window");
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
     { "lang/local_mutation_fast_paths", test_local_mutation_fast_paths, lang_setup, lang_teardown },
+    { "lang/dotted_local_read_reinit", test_dotted_local_read_reinit, lang_setup, lang_teardown },
+    { "lang/dotted_local_read_slot", test_dotted_local_read_slot, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },

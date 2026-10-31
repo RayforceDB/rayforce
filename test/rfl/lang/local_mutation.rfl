@@ -128,6 +128,19 @@ t -- [50 60 9]
 ;; ... other callees through a local head are called as before
 ((fn [f x] (f x 1)) + 2) -- 3
 ((fn [f x] (f x 1)) (fn [a b] (* (+ a b) 10)) 3) -- 40
+;; ... a computed head is evaluated once, and the callee tested is the one
+;; called, compiled as on the tree walker
+(set lmn 0)
+((fn [] (let t (til 3)) ((do (set lmn (+ lmn 1)) insert) 't 9) t)) -- [0 1 2 9]
+lmn -- 1
+(set lmn 0)
+((fn [fs] (let t (til 3)) ((do (set lmn (+ lmn 1)) (first fs)) 't 9) t) (list insert)) -- [0 1 2 9]
+lmn -- 1
+(set lmn 0)
+(set lmch (eval (parse (format "(fn [] % (let t (til 3)) ((do (set lmn (+ lmn 1)) insert) 't 9) t)" lmpad))))
+(lmch) -- [0 1 2 9]
+lmn -- 1
+t -- [50 60]
 
 ;; An aliased mutator or one held in a local, inside a nested closure with
 ;; a computed target, keeps the capture and leaves the global alone.
@@ -142,6 +155,28 @@ capv -- [50 60]
 capv -- [50 60]
 ((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
 capv -- [50 60]
+;; ... also when the local head shadows a global bound to something else
+(set h (fn [a b] 0))
+((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
+capv -- [50 60]
+(set lmcount count)
+((fn [lmcount] (let capv (til 3)) (let capf (fn [] (lmcount (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
+capv -- [50 60]
+;; A captured head decides by the value it captured: one holding a mutator
+;; keeps every capture, compiled or interpreted, any other keeps only what
+;; the body mentions, so an ordinary higher-order closure holds nothing else.
+(set lmmk (fn [f] (let capv (til 3)) (fn [] (f (as 'SYM "capv") 9) capv)))
+((lmmk insert)) -- [0 1 2 9]
+((lmmk (fn [a b] 0))) -- [0 1 2]
+capv -- [50 60]
+(set lmmki (eval (parse (format "(fn [f] % (let capv (til 3)) (fn [] (f (as 'SYM \"capv\") 9) capv))" lmpad))))
+((lmmki insert)) -- [0 1 2 9]
+capv -- [50 60]
+(set lmbig (fn [f] (let big (til 10000000)) (let small 1) (fn [x y] (f x y))))
+(set lmdb (at (.sys.mem) 'direct-bytes))
+(set lmc1 (lmbig +))
+(< (- (at (.sys.mem) 'direct-bytes) lmdb) 1000000) -- true
+(lmc1 3 4) -- 7
 
 ;; An interpreted query helper mutates its own locals and parameters; its
 ;; bindings are not taken for source columns.  Built at the top level, the
@@ -173,3 +208,7 @@ capv -- [50 60]
 ((fn [] (let d (dict [v] (list 1))) (try d.w (fn [e] 'missing)))) -- 'missing
 ((fn [] (let r d.v) (let d (dict [v] (list 99))) r)) -- [50 60]
 ((fn [] (let v 5) (let d (dict [v] (list [1 2]))) d.v)) -- [1 2]
+;; ... a later segment naming a local is an accessor the window sees
+((fn [] (let hh neg) (let x 5) x.hh)) -- -5
+;; ... a head holding the generic null has no members
+((fn [] (let d null) d.v)) !- name

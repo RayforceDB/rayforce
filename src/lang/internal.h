@@ -578,8 +578,13 @@ ray_t* ray_pivot_fn(ray_t** args, int64_t n);
 ray_t* ray_modify_fn(ray_t** args, int64_t n);
 ray_t* ray_alter_fn(ray_t** args, int64_t n);
 /* insert or alter: a quoted target resolves to the binding visible at the
- * call, so a call reaching one must have the caller's locals in scope. */
-bool ray_fn_is_local_mutator(const ray_t* fn);
+ * call, so a call reaching one must have the caller's locals in scope.
+ * Inline: OP_JMPNM tests every callee unknown at compile time. */
+static inline bool ray_fn_is_local_mutator(const ray_t* fn) {
+    if (!fn || fn->type != RAY_VARY || !(fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_insert || f == ray_insert_fn || f == ray_alter_fn;
+}
 ray_t* ray_del_fn(ray_t** args, int64_t n);
 ray_t* ray_row_fn(ray_t* tbl, ray_t* idx);
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2);
