@@ -83,30 +83,9 @@ ray_glob_compiled_t ray_glob_compile(const char* p, size_t pn);
 bool ray_glob_match_compiled(const ray_glob_compiled_t* c,
                              const char* s, size_t sn);
 
-typedef struct {
-    const char* pat;
-    size_t      pat_len;
-    size_t      tokens;
-    const char* anchor;
-    size_t      anchor_len;
-    size_t      anchor_token;
-    bool        literal;
-} ray_strpat_t;
-
-/* Compile a search pattern using literals, `?`, and character classes.
- * `*` is not a search wildcard; match a literal star with `[*]`.
- * (str-find does not use this: it is a literal search, ray_str_find_literal.) */
-bool ray_strpat_compile(const char* p, size_t pn, ray_strpat_t* out);
-
-/* Find the first byte offset whose substring matches a search pattern.
- * The empty pattern matches at offset 0. */
-bool ray_strpat_find(const ray_strpat_t* c, const char* s, size_t sn,
-                     size_t* out_pos);
 /* Literal substring search (str-find): first byte offset of the needle in
  * s, no wildcards. The empty needle matches at offset 0. */
 bool ray_str_find_literal(const char* s, size_t sn, const char* nd, size_t nl,
                           size_t* out_pos);
-bool ray_strpat_find_raw(const char* s, size_t sn, const char* p, size_t pn,
-                         size_t* out_pos);
 
 #endif /* RAY_OPS_GLOB_H */
