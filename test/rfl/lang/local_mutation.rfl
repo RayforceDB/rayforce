@@ -96,3 +96,36 @@ capv -- [50 60]
 capstate.v -- [50 60]
 ((fn [] (let capstate (dict [v] (list (til 3)))) (let capf (fn [] (insert (as 'SYM "capstate.v") 9))) (capf) capstate.v)) -- [0 1 2]
 capstate.v -- [50 60]
+
+;; A body with more locals than a frame has slots stays on the tree walker;
+;; the cases below run each mutation both compiled and interpreted.
+(set lmpad (raze (map (fn [i] (format "(let lmz% 0) " i)) (til 300))))
+(set lmtw (fn [src] (eval (parse (format src lmpad)))))
+
+;; A mutator reached through a local or parameter head targets the frame's
+;; binding, compiled as on the tree walker, and never the same-named global.
+(set t [50 60])
+((fn [f] (let t (til 3)) (f 't 9) t) insert) -- [0 1 2 9]
+t -- [50 60]
+((lmtw "(fn [f] % (let t (til 3)) (f 't 9) t)") insert) -- [0 1 2 9]
+t -- [50 60]
+((fn [f] (let t (til 3)) (f 't 'set 0 9) t) alter) -- [9 1 2]
+((lmtw "(fn [f] % (let t (til 3)) (f 't 'set 0 9) t)") alter) -- [9 1 2]
+((fn [f] (let t (til 3)) (f 't set 0 9) t) alter) -- [9 1 2]
+((fn [f] (let t (til 3)) (f (as 'SYM "t") 9) t) insert) -- [0 1 2 9]
+((lmtw "(fn [f] % (let t (til 3)) (f (as 'SYM \"t\") 9) t)") insert) -- [0 1 2 9]
+((fn [] (let t (til 3)) (let g insert) (g 't 9) t)) -- [0 1 2 9]
+t -- [50 60]
+;; ... a head unbound when the body compiles, bound before it runs
+(set lmlater (fn [] (let t (til 3)) (lmins 't 9) t))
+(set lmins insert)
+(lmlater) -- [0 1 2 9]
+t -- [50 60]
+;; ... with no local of that name, the global is the visible binding
+((fn [f] (f 't 9)) insert) -- 't
+t -- [50 60 9]
+(set t [50 60])
+;; ... other callees through a local head are called as before
+((fn [f x] (f x 1)) + 2) -- 3
+((fn [f x] (f x 1)) (fn [a b] (* (+ a b) 10)) 3) -- 40
+
