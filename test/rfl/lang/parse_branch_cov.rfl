@@ -197,14 +197,13 @@
 "a\zb" -- "a\zb"
 ;; unterminated string → parse error
 (parse "\"unterminated") !- parse
-;; >4094-byte escaped string overflows the decode buffer → domain error
-;; (parse_string :368).  Built on disk so the long source stays off the
+;; Long escaped strings use a proportional decode buffer.  Built on disk so the long source stays off the
 ;; .rfl line: a leading quote, 4100 'A's, then a \n escape + closing quote.
 (.sys.exec "rm -f /tmp/rfl_parse_long.txt")
 (.sys.exec "printf '\"' > /tmp/rfl_parse_long.txt")
 (.sys.exec "head -c 4100 /dev/zero | tr '\\0' 'A' >> /tmp/rfl_parse_long.txt")
 (.sys.exec "printf '\\\\n\"' >> /tmp/rfl_parse_long.txt")
-(parse (read "/tmp/rfl_parse_long.txt")) !- domain
+(strlen (parse (read "/tmp/rfl_parse_long.txt"))) -- 4101
 (.sys.exec "rm -f /tmp/rfl_parse_long.txt")
 
 ;; ════════════════════════════════════════════════════════════════════
