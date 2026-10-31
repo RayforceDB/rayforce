@@ -1,0 +1,9 @@
+;; Compact output can be parsed again past the old vector and call limits.
+(count (eval (parse (format "%" (til 4097))))) -- 4097
+(last (eval (parse (format "%" (til 4097))))) -- 4096
+
+(set many (map (fn [i] (list i "a")) (til 65)))
+(count (eval (parse (format "%" many)))) -- 65
+(last (last (eval (parse (format "%" many))))) -- "a"
+
+(count (at (eval (parse (format "%" (table [x] (list (til 4097)))))) 'x)) -- 4097

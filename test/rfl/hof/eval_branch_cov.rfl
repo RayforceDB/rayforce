@@ -257,10 +257,10 @@ captured_x -- 77
 ;; argc > 64: a lambda call with 65 args trips the domain guard.
 ;; Build a fn that accepts 65 params (compile fails > 64 too — fall
 ;; through to tree-walk).  We use a non-existent fn so just count args.
-;; Use vary `list` test first: 65 evaluated args triggers RAY_VARY 65>64.
+;; `list` can grow past 64; another variadic builtin still tests the guard.
 (count (list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)) -- 64
-;; 65 args → ray_eval RAY_VARY argc>64 (line 3105) → domain
-(list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65) !- domain
+;; 65 args → ray_eval RAY_VARY argc>64 → domain
+(enlist 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65) !- domain
 ;; LAMBDA with mid-arg error: second arg errors after first succeeded.
 ;; ray_eval RAY_LAMBDA case 3133: j-loop releases the prior good arg.
 ((fn [x y] (+ x y)) 5 undefined_lambda_mid_z) !- name
