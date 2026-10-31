@@ -684,6 +684,50 @@ static test_result_t test_dispatch_ring_growth(void) {
     PASS();
 }
 
+/* A graph executed from a task (a per-row expression on a worker) is at
+ * depth 0 of ray_execute's per-thread nesting, yet inside the query: it
+ * must not reset the pool's cancel flag, which only the outermost call,
+ * with no dispatch in flight, may do.  The cancel lands in the task, right
+ * before the graph runs; the flag must still be set when the task is done
+ * and when the dispatch returns. */
+typedef struct { ray_graph_t* g; ray_op_t* op; int flag_after; } exec_in_task_ctx_t;
+static void exec_in_task_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; (void)start; (void)end;
+    exec_in_task_ctx_t* c = raw;
+    ray_cancel();
+    ray_t* r = ray_execute(c->g, c->op);
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    c->flag_after = (int)atomic_load_explicit(&ray_pool_get()->cancelled, memory_order_relaxed);
+}
+
+static test_result_t test_exec_in_task_keeps_cancel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_pool_t* pool = ray_pool_get();
+    int64_t n = 1000;
+    ray_t* vec = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(vec))[i] = i;
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("val", 3), vec);
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* op = ray_sum(g, ray_scan(g, "val"));
+    exec_in_task_ctx_t c = { .g = g, .op = op, .flag_after = -1 };
+    ray_cancel_reset();
+    ray_pool_dispatch_n(pool, exec_in_task_fn, &c, 1);
+    int flag_end = (int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed);
+    ray_cancel_reset();
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT_FMT(c.flag_after == 1, "cancel flag after a graph run in a task: %d", c.flag_after);
+    TEST_ASSERT_EQ_I(flag_end, 1);
+    PASS();
+}
+
 /* --------------------------------------------------------------------------
  * Test: cancel-mid-dispatch path on dispatch_n.
  *
@@ -2574,6 +2618,7 @@ const test_entry_t pool_entries[] = {
     { "pool/dispatch_n_ring_grow",  test_dispatch_n_ring_growth, NULL, NULL },
     { "pool/dispatch_ring_grow",    test_dispatch_ring_growth,  NULL, NULL },
     { "pool/dispatch_n_cancelled",  test_dispatch_n_cancelled,  NULL, NULL },
+    { "pool/exec_in_task_keeps_cancel", test_exec_in_task_keeps_cancel, NULL, NULL },
     { "pool/dispatch_cancelled",    test_dispatch_cancelled,    NULL, NULL },
     { "pool/zero_workers",          test_pool_zero_workers,     NULL, NULL },
     { "pool/total_workers",         test_pool_total_workers,    NULL, NULL },

@@ -89,11 +89,12 @@ void ray_fused_topk_counters_reset(void) { atomic_store(&g_fpk_ran, 0); atomic_s
  * its entry): chunk-slot prunes (per task fragment, so a chunk split
  * across tasks counts once per task: dispatch geometry, not distinct
  * chunks) and pruned morsels. */
-static _Atomic uint64_t g_fpk_pruned_chunks, g_fpk_pruned_vecs;
+static _Atomic uint64_t g_fpk_pruned_chunks, g_fpk_pruned_vecs, g_fpk_seeded;
 void ray_fused_topk_test_pruned(uint64_t* chunks, uint64_t* vectors) {
     *chunks  = atomic_load(&g_fpk_pruned_chunks);
     *vectors = atomic_load(&g_fpk_pruned_vecs);
 }
+uint64_t ray_fused_topk_test_seeded(void) { return atomic_load(&g_fpk_seeded); }
 
 /* Per-range statistics class of a generation-2 first key. */
 enum { FPK_STATS = 0, FPK_ALL_NULL = 1, FPK_NO_STATS = 2 };
@@ -143,6 +144,12 @@ typedef struct fpk_dir_s {
     const uint8_t*       zstat;
     ray_enccol_t*        e;
     const ray_col_src_t* src;
+    /* a SYM first key: the zones are its strings' four-byte prefixes
+     * (RAY_ENC_SYM_PFX), and the bound is the prefix of the worst key */
+    bool                 sym;
+    /* the predicate passes no row whose first key is null (a != of the
+     * null symbol on it): a range's nulls never surface */
+    bool                 excl_nulls;
 } fpk_dir_t;
 
 typedef struct {
@@ -252,11 +259,27 @@ static inline int64_t fpk_key_i64(const fpk_keyspec_t* ks, int64_t row) {
 }
 
 /* A full heap's worst row publishes its first key as a pruning bound. */
+/* The four-byte prefix of a SYM key's code (RAY_ENC_SYM_PFX), as the
+ * bound compares it with a range's prefix bounds; -1 for a code past the
+ * pinned vocabulary (no bound is published from it). */
+static int64_t fpk_sym_pfx(const fpk_keyspec_t* ks, uint32_t code) {
+    if ((int64_t)code >= ks->raw.count) return -1;
+    size_t n = 0;
+    const char* p = ray_sym_domain_raw_str(&ks->raw, (int64_t)code, &n);
+    if (!p) return -1;                   /* a decode that failed: no bound */
+    uint32_t x = 0;
+    for (size_t i = 0; i < 4; i++) x = (x << 8) | (i < n ? (uint8_t)p[i] : 0u);
+    return (int64_t)x;
+}
+
 static void fpk_publish_bound(fpk_par_ctx_t* c, int64_t worst_row) {
     if (!c->zmin) return;
     const fpk_keyspec_t* ks = &c->keys[0];
     if (ks->has_nulls && ray_vec_is_null(ks->col, worst_row)) return;
-    int64_t v = fpk_key_i64(ks, worst_row);
+    int64_t v = c->zdir && c->zdir->sym
+        ? fpk_sym_pfx(ks, (uint32_t)read_by_esz(ks->base, worst_row, ks->esz))
+        : fpk_key_i64(ks, worst_row);
+    if (v < 0 && c->zdir && c->zdir->sym) return;
     int64_t cur = atomic_load_explicit(&c->bound, memory_order_relaxed);
     bool set = atomic_load_explicit(&c->bound_set, memory_order_relaxed);
     for (;;) {
@@ -312,6 +335,14 @@ static inline bool fpk_dir_chunk_pruned(const fpk_par_ctx_t* c, int64_t g) {
 static bool fpk_one_vec_pruned(const fpk_par_ctx_t* c, int64_t v) {
     int64_t vrows = c->nrows - v * RAY_ENC_VEC;
     if (vrows > RAY_ENC_VEC) vrows = RAY_ENC_VEC;
+    if (c->zdir->sym) {
+        const ray_enc_desc_t* d = &ray_enccol_descs(c->zdir->e, v / RAY_ENC_VECS_PER_CHUNK)[v % RAY_ENC_VECS_PER_CHUNK];
+        if (d->n_nulls == vrows && c->zdir->excl_nulls) return true;     /* no row passes */
+        if (!(d->flags & RAY_ENC_SYM_PFX))
+            return fpk_stat_prunes(c, d->n_nulls == vrows ? FPK_ALL_NULL : FPK_NO_STATS, true, 0, 0);
+        return fpk_stat_prunes(c, FPK_STATS, d->n_nulls > 0 && !c->zdir->excl_nulls,
+                               (int64_t)d->rsv1, (int64_t)d->rsv2);
+    }
     int64_t mn = 0, mx = 0;
     uint32_t nn = 0;
     uint8_t cls = FPK_STATS;
@@ -665,7 +696,9 @@ static void fpk_rk_publish_bound(fpk_par_ctx_t* c, int64_t e) {
     if (!c->zmin) return;
     const uint32_t nk = c->n_keys;
     if (c->rk->kn[e * nk]) return;
-    int64_t v = c->rk->kv[e * nk];
+    int64_t v = c->zdir && c->zdir->sym ? fpk_sym_pfx(&c->keys[0], (uint32_t)c->rk->kv[e * nk])
+                                        : c->rk->kv[e * nk];
+    if (v < 0 && c->zdir && c->zdir->sym) return;
     int64_t cur = atomic_load_explicit(&c->bound, memory_order_relaxed);
     bool set = atomic_load_explicit(&c->bound_set, memory_order_relaxed);
     for (;;) {
@@ -868,6 +901,52 @@ static void fpk_sort_final(const fpk_par_ctx_t* c, int64_t* idx, int32_t n) {
     }
 }
 
+/* The bound before any row is read, for a SYM first key whose only
+ * predicate drops its nulls: every chunk with prefix bounds holds a passing
+ * row whose prefix is its minimum (its maximum, descending), so the k-th
+ * best of those extrema over distinct chunks bounds the k-th best key's
+ * prefix, and a chunk or vector that cannot beat it is skipped unread from
+ * the first morsel on.  Read off the zone arrays the directory filled: no
+ * descriptor is touched before the scan. */
+static void fpk_sym_seed_bound(fpk_par_ctx_t* c, const uint8_t* zstat) {
+    const int64_t k = c->k;
+    const bool desc = c->zdesc;
+    ray_t* hh = NULL;
+    int64_t* h = (int64_t*)scratch_alloc(&hh, (size_t)k * sizeof(int64_t));
+    if (!h) return;
+    int64_t n = 0;
+    /* the k best extrema, the worst at h[0] */
+    #define FPK_SEED_WORSE(a, b) (desc ? (a) < (b) : (a) > (b))
+    for (uint32_t g = 0; g < c->zn; g++) {
+        if (zstat[g] != FPK_STATS) continue;
+        int64_t x = desc ? c->zmax[g] : c->zmin[g];
+        if (x == INT64_MAX || x == INT64_MIN) continue;      /* no passing row */
+        if (n < k) {
+            int64_t i = n++;
+            h[i] = x;
+            while (i > 0 && FPK_SEED_WORSE(h[i], h[(i - 1) / 2])) {
+                int64_t p = (i - 1) / 2, t = h[p]; h[p] = h[i]; h[i] = t; i = p;
+            }
+        } else if (FPK_SEED_WORSE(h[0], x)) {
+            h[0] = x;
+            for (int64_t i = 0;;) {
+                int64_t l = 2 * i + 1, r = l + 1, w = i;
+                if (l < n && FPK_SEED_WORSE(h[l], h[w])) w = l;
+                if (r < n && FPK_SEED_WORSE(h[r], h[w])) w = r;
+                if (w == i) break;
+                int64_t t = h[w]; h[w] = h[i]; h[i] = t; i = w;
+            }
+        }
+    }
+    #undef FPK_SEED_WORSE
+    if (n == k) {
+        atomic_store_explicit(&c->bound, h[0], memory_order_relaxed);
+        atomic_store_explicit(&c->bound_set, 1, memory_order_release);
+        atomic_store_explicit(&g_fpk_seeded, 1, memory_order_relaxed);
+    }
+    scratch_free(hh);
+}
+
 ray_t* ray_fused_topk_select(ray_t* tbl,
                              ray_t* where_expr,
                              const int64_t* sort_key_syms,
@@ -883,6 +962,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     if (n_sort_keys == 0 || n_sort_keys > FPK_MAX_KEYS) return NULL;
     atomic_store(&g_fpk_pruned_chunks, 0);
     atomic_store(&g_fpk_pruned_vecs, 0);
+    atomic_store(&g_fpk_seeded, 0);
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
 
@@ -969,7 +1049,8 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
      * descriptors (built before the dispatch); its materialization's
      * synthesized chunk zone is not used. */
     ray_enccol_t* kenc = NULL;
-    if (ray_col_src_encoded(ksrc0) && !ksrc0->parted && fpk_prunable_type(ctx.keys[0].type)) {
+    bool ksym = ctx.keys[0].type == RAY_SYM && ctx.keys[0].raw_ok;
+    if (ray_col_src_encoded(ksrc0) && !ksrc0->parted && (fpk_prunable_type(ctx.keys[0].type) || ksym)) {
         ray_enccol_t* e = ray_enccol_of(ksrc0->obj);
         if (e->kind == RAY_ENCCOL_SINGLE && !e->synthetic && e->len == nrows &&
             e->n_chunks * RAY_ENC_CHUNK >= nrows)
@@ -1059,7 +1140,17 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
      * by the chunk count (structure, not statistics: answer-only).  An all-null chunk gets its null bit and an empty
      * range, as the chunk-zone builder writes.  On OOM nothing is pruned. */
     ray_t *zmin_hdr = NULL, *zmax_hdr = NULL, *znb_hdr = NULL, *zstat_hdr = NULL;
-    fpk_dir_t zdir = { NULL, kenc, ksrc0 };
+    fpk_dir_t zdir = { NULL, kenc, ksrc0, false, false };
+    if (kenc && ksym) {
+        /* a != of the null symbol on the key itself: its nulls never pass */
+        zdir.sym = true;
+        for (uint8_t i = 0; i < ctx.pred.n_children; i++) {
+            const fp_cmp_t* ch = &ctx.pred.children[i];
+            if (ch->op == FP_NE && ch->col_type == RAY_SYM && ch->fold == FP_FOLD_NONE &&
+                ch->cval == 0 && ch->cval_in_dict && ch->src && ch->src->obj == ksrc0->obj)
+                zdir.excl_nulls = true;
+        }
+    }
     if (kenc) {
         int64_t nc = kenc->n_chunks;
         int64_t* mins = (int64_t*)scratch_alloc(&zmin_hdr, (size_t)nc * sizeof(int64_t));
@@ -1071,17 +1162,25 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                 ray_enc_chunk_stat_t st;
                 ray_enccol_chunk_stat(kenc, c, &st);
                 bool all_null = (int64_t)st.null_count == st.rows;
-                if (st.null_count) nb[c >> 3] |= (uint8_t)(1u << (c & 7));
-                if (all_null || !st.has_minmax) { mins[c] = INT64_MAX; maxs[c] = INT64_MIN; }
-                else                            { mins[c] = st.min; maxs[c] = st.max; }
-                zst[c] = all_null ? FPK_ALL_NULL : st.has_minmax ? FPK_STATS : FPK_NO_STATS;
+                uint32_t pmn = 0, pmx = 0;
+                bool stats = zdir.sym ? ray_enccol_chunk_pfx(kenc, c, &pmn, &pmx) : st.has_minmax;
+                if (st.null_count && !zdir.excl_nulls) nb[c >> 3] |= (uint8_t)(1u << (c & 7));
+                if (all_null || !stats) { mins[c] = INT64_MAX; maxs[c] = INT64_MIN; }
+                else if (zdir.sym)      { mins[c] = (int64_t)pmn; maxs[c] = (int64_t)pmx; }
+                else                    { mins[c] = st.min; maxs[c] = st.max; }
+                /* an all-null chunk whose nulls never pass holds no row: the
+                 * empty range prunes it either way */
+                zst[c] = all_null ? (zdir.excl_nulls ? FPK_STATS : FPK_ALL_NULL)
+                       : stats ? FPK_STATS : FPK_NO_STATS;
             }
             ctx.zmin = mins; ctx.zmax = maxs; ctx.znull = nb;
             zdir.zstat = zst;
             ctx.zdir = &zdir;
             ctx.zn = (uint32_t)nc; ctx.zlog2 = 16;      /* RAY_ENC_CHUNK rows */
             ctx.zdesc = ctx.keys[0].desc;
-            ctx.znulls_better = ctx.keys[0].nulls_first;
+            ctx.znulls_better = ctx.keys[0].nulls_first && !zdir.excl_nulls;
+            if (zdir.sym && zdir.excl_nulls && ctx.pred.n_children == 1)
+                fpk_sym_seed_bound(&ctx, zst);
         }
     }
     if (ctx.zmin) {

@@ -1210,3 +1210,83 @@ Ctg -- 1
 ;; where: keeps, as the grouped form should: [[23 34] [45 56]]
 ;; ((fn [t z] (at (select {d: (+ y z) by: k from: t where: (> y 15)}) 'd)) Tcd [1 2 3 4 5 6]) -- (list [23 34] [45 56])
 (.sys.exec "rm -rf /tmp/rfl_cklocal")
+
+;; ────────────────────────────────────────────────────────────────────
+;; (take (select ...) n) and (first (select ...)) of a select of whole rows
+;; run the select with take: n: the same rows as the full select's first n,
+;; ties in source order; a select of fewer rows repeats as take does
+;; ────────────────────────────────────────────────────────────────────
+(set TH (table [r a s] (list (% (* (til 3000) 7919) 5) (til 3000) (take ['b 'a 'c 'a] 3000))))
+(set THN (update {r: (if (== (% a 7) 0) 0Nl r) from: TH}))
+(set thk 4)
+(at (take (select {from: TH asc: r}) 4) 'a) -- [0 5 10 15]
+(at (take (select {from: TH desc: s asc: a}) thk) 'a) -- [2 6 10 14]
+;; the reference: the same select bound whole, then taken
+(set thf (select {from: THN desc: r}))
+(take (select {from: THN desc: r}) 5) -- (take thf 5)
+(first (select {from: THN asc: r})) -- (first (select {from: THN asc: r take: 3000}))
+(set thw (select {from: TH where: (> a 2990) asc: r}))
+(count thw) -- 9
+(take (select {from: TH where: (> a 2990) asc: r}) 9) -- (take thw 9)
+(take (select {from: TH where: (> a 2990) asc: r}) 25) -- (take thw 25)
+(set thd (select {from: TH where: (> a 100) desc: s}))
+(take (select {from: TH where: (> a 100) desc: s}) 2000) -- (take thd 2000)
+(first (select {from: TH where: (> a 100) desc: s})) -- (first thd)
+(take (select {from: TH where: (> a 10)}) 3) -- (take (select {from: TH where: (> a 10) take: 3}) 3)
+(at (first (select {from: TH})) 'a) -- 0
+(first (select {from: TH where: (> a 5000) asc: r})) !- domain
+(set the0 (select {from: TH where: (> a 5000) asc: r}))
+(take (select {from: TH where: (> a 5000) asc: r}) 3) -- (take the0 3)
+;; other counts and shapes take the whole select's result as before
+(count (take (select {from: TH asc: r}) 0)) -- 0
+(at (take (select {from: TH asc: r}) -2) 'a) -- (at (take (select {from: TH asc: r}) -2) 'a)
+(take (select {from: TH asc: r}) 2.0) !- type
+(at (take (select {x: a from: TH asc: r}) 3) 'x) -- [0 5 10]
+(at (take (select {from: TH asc: r take: 10}) 3) 'a) -- [0 5 10]
+(take (select {from: TH where: (> zz 1) asc: r}) 3) !- schema
+(take (select {from: TH asc: r}) th_no_such_name) !- name
+
+;; a named count that evaluating the select rebinds is read after it, as
+;; any call reads its arguments in order
+(set TR (table [a] (list [10 20 30])))
+(set tr_n 1)
+(count (take (select {from: (do (set tr_n 2) TR)}) tr_n)) -- 2
+(set tr_set set)
+(set tr_n 1)
+(count (take (select {from: (do (tr_set tr_n 2) TR)}) tr_n)) -- 2
+(set tr_bump (fn [] (set tr_n 2)))
+(set tr_n 1)
+(count (take (select {from: (do (tr_bump) TR)}) tr_n)) -- 2
+;; a function handed to a builtin as a value, by name or out of a list
+(set tr_n 1)
+(count (take (select {from: (do (map eval (list (parse "(set tr_n 2)"))) TR)}) tr_n)) -- 2
+(set tr_fns (list eval))
+(set tr_n 1)
+(count (take (select {from: (do (map (first tr_fns) (list (parse "(set tr_n 2)"))) TR)}) tr_n)) -- 2
+(set tr_n 2)
+(at (take (select {from: TR where: (> a 10)}) tr_n) 'a) -- [20 30]
+;; an unquoted dotted name that nothing answers is a method call on the
+;; container (tr_payload.eval evaluates the parsed form), so the count is
+;; read after it, as on the plain path
+(set tr_payload (parse "(do (set tr_n 2) TR)"))
+(set tr_n 1)
+(list (count (take (select {from: tr_payload.eval}) tr_n)) tr_n) -- [2 2]
+(set tr_n 1)
+(list (count (take (do (select {from: tr_payload.eval})) tr_n)) tr_n) -- [2 2]
+;; a dotted path into a container is a read and keeps the early count
+(set tr_d (dict ['t] (list TR)))
+(set tr_n 2)
+(at (take (select {from: tr_d.t where: (> a 10)}) tr_n) 'a) -- [20 30]
+;; the count itself a method call: it runs once, after the select, as for
+;; any take
+(set tr_hits 0)
+(set tr_cnt (parse "(do (set tr_hits (+ tr_hits 1)) 2)"))
+(count (take (select {from: TR}) tr_cnt.eval)) -- 2
+tr_hits -- 1
+(count (take [1 2 3] tr_cnt.eval)) -- 2
+tr_hits -- 2
+;; ...so a count that rebinds the select's table does so after the select
+(set tr_src TR)
+(set tr_swap (parse "(do (set tr_src (take TR 1)) 2)"))
+(at (take (select {from: tr_src}) tr_swap.eval) 'a) -- [10 20]
+(count tr_src) -- 1

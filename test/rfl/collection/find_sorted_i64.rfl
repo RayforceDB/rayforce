@@ -1,0 +1,16 @@
+;; Sorted exact-I64 vector find: hand-computed semantics, not route proof.
+;; Large enough for the sparse route, with a batch and scalar tail.
+(set sf (.attr.set 'sorted (til 4096)))
+(find sf [0 2048 4095 4096 -1 1 2 3 4]) -- [0 2048 4095 0Nl 0Nl 1 2 3 4]
+(type (find sf [0 4096])) -- 'I64
+(find sf [4095 0 2048 1 2 3 4 5]) -- [4095 0 2048 1 2 3 4 5]
+(find sf [-1 4096 4097 -2 -3 -4 -5 -6 -7]) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+;; Duplicates return the first position, including the batch's scalar tail.
+(set sd (.attr.set 'sorted (concat (til 4096) [4095 4095])))
+(find sd [4095 4095 0 4096 1 2 3 4 5]) -- [4095 4095 0 0Nl 1 2 3 4 5]
+;; Null needle must retain the ordinary null-equality fallback.
+(find sf [0Nl 4095 0]) -- [0Nl 4095 0]
+;; Unmarked, scalar and tiny queries retain their existing semantics.
+(find (til 4096) [0 4096]) -- [0 0Nl]
+(find sf 4095) -- 4095
+(find (.attr.set 'sorted [1 1 3]) [1 3 2]) -- [0 2 0Nl]

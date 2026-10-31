@@ -317,6 +317,23 @@ bool ray_heap_spill_discards(void);
 /* How many parked spill pools a boundary has set out to discard so far —
  * each once per use (ray_heap_relieve).  For tests. */
 int64_t ray_heap_spill_discard_count(void);
+/* Test hook (C tests only): every block ray_alloc hands out is filled with
+ * 0xA5 first, so a word a task never wrote reads as garbage rather than as
+ * what the block's previous user left there.  Disarmed by ray_test_hooks_off.
+ * Compiled only under DEBUG, as the test objects are. */
+#ifdef DEBUG
+void ray_heap_test_scribble(bool on);
+#endif
+
+/* ray_alloc whose data bytes read as zero, on the calling thread: a block
+ * mapped for this call is zero already and is handed out as is, any other
+ * is zeroed here.  Any thread may call it (ray_calloc_raw does). */
+ray_t* ray_alloc_zeroed(size_t data_size);
+/* ray_alloc_zeroed for the engine's query paths (scratch_calloc): a large
+ * block that is not fresh is zeroed across the pool when the caller is
+ * outside a dispatch.  The pool takes tasks from one dispatcher only, so
+ * only the thread that evaluates queries may call it. */
+ray_t* ray_alloc_zeroed_query(size_t data_size);
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -351,7 +368,9 @@ typedef struct {
     int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
     int    locked;        /* locked against swap-out (heap_lock) */
     char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
-    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*)];
+    int    fresh;         /* mapped for this allocation (its pages read as zero),
+                             not taken from the reuse cache */
+    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 3 * sizeof(int) - sizeof(char*)];
 } ray_direct_hdr_t;
 _Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
 

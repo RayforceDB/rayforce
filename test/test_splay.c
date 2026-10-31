@@ -2827,6 +2827,7 @@ static test_result_t test_generation_first_write_keeps_others(void) {
 }
 
 #ifndef _WIN32
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -2917,6 +2918,7 @@ static test_result_t test_generation_reader_races(void) {
  * so each resolve of the reader waits here: the first gets g-1, the second
  * (the reader asking whether the table moved on) gets g-2 once the symfile
  * is gone, and every later one reads the plain file `last` puts in place.
+ * A NULL sym skips unlinking for the interrupt fixture below.
  * Plain libc only: it runs in a forked child. */
 static void held_domain_child(const char* cur, const char* next,
                               const char* last, const char* sym) {
@@ -2925,7 +2927,7 @@ static void held_domain_child(const char* cur, const char* next,
     for (int i = 0; i < 2; i++) {
         int fd = open(cur, O_WRONLY);
         if (fd < 0) _exit(1);
-        if (i == 1 && unlink(sym) != 0) _exit(1);
+        if (i == 1 && sym && unlink(sym) != 0) _exit(1);
         if (rename(repl[i], cur) != 0) _exit(1);
         size_t len = strlen(gens[i]);
         if (write(fd, gens[i], len) != (ssize_t)len) _exit(1);
@@ -3017,74 +3019,141 @@ static test_result_t test_generation_retry_releases_domain(void) {
     return r;
 }
 
-/* A reader of a table whose every generation is broken (y shorter than x)
- * while another process keeps publishing them retries for as long as the
- * table changes; an interrupt stops it at once, and the read returns an
- * error, not a table.  Columns of a million rows make each copying attempt
- * slower than one publish, so the table has always moved on by the time an
- * attempt fails. */
-static test_result_t test_generation_reader_interrupted(void) {
-    const char* dir = TMP_SPLAY_BASE "/generation_cancel";
-    const char* tmpl = TMP_SPLAY_BASE "/generation_cancel_tmpl";
-    rm_rf(dir);
-    rm_rf(tmpl);
-    const int64_t n = 1000000;
-    ray_t* xc = ray_vec_new(RAY_I64, n);
-    xc->len = n;
-    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(xc))[i] = i;
-    ray_t* t = ray_table_new(2);
-    t = ray_table_add_col(t, ray_sym_intern("x", 1), xc);
-    t = ray_table_add_col(t, ray_sym_intern("y", 1), xc);
-    ray_release(xc);
-    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save(t, dir, NULL), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save(t, tmpl, NULL), RAY_OK);
-    char resolved[1024], g0[1100], g0y[1200];
-    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(dir, resolved, sizeof(resolved)), RAY_OK);
-    snprintf(g0, sizeof(g0), "%s/.generations/g-0", dir);
-    TEST_ASSERT_EQ_I(rename(resolved, g0), 0);
-    snprintf(g0y, sizeof(g0y), "%s/y", g0);
-    ray_t* short_y = ray_vec_new(RAY_I64, n - 1);
-    short_y->len = n - 1;
-    memset(ray_data(short_y), 0, (size_t)(n - 1) * sizeof(int64_t));
-    TEST_ASSERT_EQ_I(ray_col_save(short_y, TMP_SPLAY_BASE "/generation_cancel_tmpl/y"), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_col_save(short_y, g0y), RAY_OK);
-    ray_release(short_y);
-    FILE* f = fopen(TMP_SPLAY_BASE "/generation_cancel/.current", "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    fputs(".generations/g-0\n", f);
-    fclose(f);
+/* A failed g-1 read sees exactly one publication of coherent g-2.  The
+ * existing FIFO writer supplies the two resolves without sleeps or a racing
+ * publisher.  mode: 0 = moving, 1 = stable missing schema, 2 = stable g-2. */
+static test_result_t generation_interrupt_run(const char* base, pid_t* child,
+                                              int mode, bool requested) {
+    char g1[1200], g2[1200], src[1100], resolved[1024];
+    char cur[1200], next[1200], last[1200];
+    snprintf(g1, sizeof(g1), "%s/.generations/g-1", base);
+    snprintf(g2, sizeof(g2), "%s/.generations/g-2", base);
+    snprintf(src, sizeof(src), "%s/src", base);
+    snprintf(cur, sizeof(cur), "%s/.current", base);
+    snprintf(next, sizeof(next), "%s/.current.next", base);
+    snprintf(last, sizeof(last), "%s/.current.last", base);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(g1), 0);   /* no .d: attempt 1 fails */
 
-    fflush(NULL);
-    pid_t child = fork();
-    TEST_ASSERT_TRUE(child >= 0);
-    if (child == 0) generation_flip_child(dir, tmpl, 1 << 30);   /* killed below */
-    /* Wait until the writer is publishing. */
-    for (int i = 0; i < 5000; i++) {
-        char now[1024];
-        if (ray_splay_resolve_dir(dir, now, sizeof(now)) == RAY_OK && strcmp(now, g0) != 0) break;
-        struct timespec ms = {0, 1000 * 1000};
-        nanosleep(&ms, NULL);
+    ray_t* pair = generation_pair(2);
+    ray_err_t err = ray_splay_save(pair, src, NULL);
+    ray_release(pair);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_resolve_dir(src, resolved, sizeof(resolved)), RAY_OK);
+    TEST_ASSERT_EQ_I(rename(resolved, g2), 0);
+
+    FILE* f = fopen(mode == 0 ? last : cur, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    int wrote = fputs(mode == 1 ? ".generations/g-1\n" : ".generations/g-2\n", f);
+    int closed = fclose(f);
+    TEST_ASSERT_TRUE(wrote >= 0);
+    TEST_ASSERT_EQ_I(closed, 0);
+    if (mode == 0) {
+        if (mkfifo(cur, 0644) != 0 || mkfifo(next, 0644) != 0)
+            SKIP("mkfifo unavailable");
+        fflush(NULL);
+        *child = fork();
+        if (*child < 0) SKIP("fork unavailable");
+        if (*child == 0) held_domain_child(cur, next, last, NULL);
     }
 
-    ray_request_interrupt();
-    struct timespec a, b;
-    clock_gettime(CLOCK_MONOTONIC, &a);
-    ray_t* m = ray_splay_load(dir, NULL);
-    clock_gettime(CLOCK_MONOTONIC, &b);
     ray_clear_interrupt();
-    kill(child, SIGKILL);
-    int status = 0;
-    waitpid(child, &status, 0);
-    double secs = (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9;
-    bool err = m && RAY_IS_ERR(m);
-    if (m && RAY_IS_ERR(m)) ray_error_free(m); else if (m) ray_release(m);
-    TEST_ASSERT_TRUE(err);
-    TEST_ASSERT_TRUE(secs < 2.0);
-    ray_release(t);
-    rm_rf(dir);
-    rm_rf(tmpl);
+    ray_error_clear();
+    if (requested) ray_request_interrupt();
+    ray_t* m = ray_splay_load(base, NULL);
+    bool is_error = m && RAY_IS_ERR(m);
+    bool cancel = is_error && strcmp(ray_err_code(m), "cancel") == 0;
+    bool io = is_error && strcmp(ray_err_code(m), "io") == 0;
+    bool interrupted = ray_error_msg() && strcmp(ray_error_msg(), "interrupted") == 0;
+    bool loaded = m && !is_error && m->type == RAY_TABLE &&
+                  ray_table_nrows(m) == 2 && ray_table_ncols(m) == 2;
+    if (loaded) {
+        ray_t* x = ray_table_get_col(m, ray_sym_intern("x", 1));
+        ray_t* y = ray_table_get_col(m, ray_sym_intern("y", 1));
+        loaded = x && y && x->type == RAY_I64 && y->type == RAY_I64 &&
+                 x->len == 2 && y->len == 2;
+        if (loaded) {
+            const int64_t* xd = ray_data(x);
+            const int64_t* yd = ray_data(y);
+            loaded = xd[0] == 2 && xd[1] == 3 && yd[0] == 20 && yd[1] == 30;
+        }
+    }
+    if (is_error) ray_error_free(m); else if (m) ray_release(m);
+    /* A successful retry may retain g-1's TLS message: it is not an error
+     * result.  Snapshot only the cancel detail, then clear all test state. */
+    ray_clear_interrupt();
+    ray_error_clear();
+
+    /* No assertion after the load until values/errors, child and paths are
+     * cleaned up.  If a regression returns before resolve 2, kill the writer
+     * instead of waiting forever for its second FIFO open. */
+    struct stat cs;
+    bool regular = lstat(cur, &cs) == 0 && S_ISREG(cs.st_mode);
+    bool selected = false;
+    if (regular) {
+        f = fopen(cur, "rb");
+        if (f) {
+            char text[64];
+            selected = fgets(text, sizeof(text), f) != NULL &&
+                       strcmp(text, mode == 1 ? ".generations/g-1\n" :
+                                               ".generations/g-2\n") == 0;
+            if (fclose(f) != 0) selected = false;
+        }
+    }
+    bool child_ok = true;
+    if (*child > 0) {
+        if (!regular) (void)kill(*child, SIGKILL);
+        int status = 0;
+        pid_t reaped;
+        do { reaped = waitpid(*child, &status, 0); } while (reaped < 0 && errno == EINTR);
+        child_ok = reaped == *child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (reaped == *child || (reaped < 0 && errno == ECHILD)) *child = -1;
+    }
+    rm_rf(base);
+    if (mode == 0 && requested) {
+        TEST_ASSERT_TRUE(cancel);
+        TEST_ASSERT_TRUE(interrupted);
+    } else if (mode == 1) {
+        TEST_ASSERT_TRUE(io);   /* unchanged failure is not cancellation */
+    } else {
+        TEST_ASSERT_FMT(loaded, "mode=%d requested=%d: expected coherent g-2 values", mode, requested);
+    }
+    TEST_ASSERT_FMT(child_ok, "mode=%d requested=%d: writer did not exit normally", mode, requested);
+    TEST_ASSERT_FMT(regular && selected, "mode=%d requested=%d: wrong final manifest", mode, requested);
     PASS();
+}
+
+/* Cancellation is specific to a failed read whose generation moved on.
+ * The clear companion must actually retry and return g-2, while unchanged
+ * missing tables retain io even if interrupted.  Coherent reads run clear:
+ * compressed-column decoding can independently honor an interrupt. */
+static test_result_t test_generation_reader_interrupted(void) {
+    char base[256];
+    snprintf(base, sizeof(base), "/tmp/rayforce_test_splay_cancel_%ld", (long)getpid());
+    bool entry_interrupt = ray_interrupted();
+    ray_clear_interrupt();
+    ray_error_clear();
+    test_result_t r = { TEST_PASS, NULL };
+    for (int mode = 0; mode < 3; mode++) {
+        for (int requested = mode == 2 ? 0 : 1; requested >= 0; requested--) {
+            rm_rf(base);
+            pid_t child = -1;
+            r = generation_interrupt_run(base, &child, mode, requested != 0);
+            /* Also covers every setup assertion/skip and unexpected wait
+             * failure in the helper.  Never leave a blocked FIFO writer. */
+            if (child > 0) {
+                (void)kill(child, SIGKILL);
+                pid_t reaped;
+                do { reaped = waitpid(child, NULL, 0); } while (reaped < 0 && errno == EINTR);
+            }
+            rm_rf(base);
+            ray_clear_interrupt();
+            ray_error_clear();
+            if (r.status != TEST_PASS) goto done;
+        }
+    }
+done:
+    if (entry_interrupt) ray_request_interrupt();
+    return r;
 }
 #endif
 
