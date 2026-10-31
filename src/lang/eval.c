@@ -196,6 +196,12 @@ bool ray_raise_render(char* buf, size_t cap) {
 void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
 
+bool ray_fn_is_local_mutator(const ray_t* fn) {
+    if (!fn || fn->type != RAY_VARY) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_insert || f == ray_insert_fn || f == ray_alter_fn;
+}
+
 static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
@@ -3234,6 +3240,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL1R]        = &&op_call1r,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
+        [OP_JMPM]          = &&op_jmpm,
     };
 
     /* Arity check before allocating VM state */
@@ -3590,6 +3597,20 @@ op_calln: {
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, result_rows);
+    DISPATCH();
+}
+
+op_jmpm: {
+    /* A local or unbound callee holding insert or alter: its target names
+     * a binding of this frame as readily as a global, and its arguments
+     * are forms it reads itself, so the compiler's dynamic form for the
+     * whole call takes over (see OP_JMPM). */
+    int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
+    ip += 2;
+    if (ray_fn_is_local_mutator(PEEK())) {
+        ray_release(POP());
+        ip += offset;
+    }
     DISPATCH();
 }
 

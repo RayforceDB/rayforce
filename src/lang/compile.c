@@ -739,8 +739,7 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     if (fn && (fn->attrs & RAY_FN_SPECIAL_FORM)) {
         /* A mutator's target may be a computed symbol, not a literal mention
          * of the local. Its eval window must still expose the current frame. */
-        ray_vary_fn f = fn->type == RAY_VARY ? (ray_vary_fn)(uintptr_t)fn->i64 : NULL;
-        compile_dyn_form(c, ast, f == ray_insert || f == ray_insert_fn || f == ray_alter_fn);
+        compile_dyn_form(c, ast, ray_fn_is_local_mutator(fn));
         return;
     }
 
@@ -797,6 +796,13 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     } else {
         compile_expr(c, head);
     }
+    /* A callee unknown here (a local, an unbound name, a computed head) may
+     * hold insert or alter when it runs.  Such a call must read its target
+     * and arguments as the tree walker does, through this frame's locals:
+     * OP_JMPM sends it to a dynamic form before any argument is evaluated. */
+    int32_t mut_jump = -1;
+    if (!fn && dyn_syms_idx < 0)
+        mut_jump = emit_jump(c, OP_JMPM);
     int64_t argc = n - 1;
     if (argc > 64) { c->error = true; return; }
     for (int64_t i = 1; i < n; i++)
@@ -817,6 +823,12 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     if (dyn_syms_idx >= 0) {
         emit_const(c, dyn_syms_idx);
         emit(c, OP_SCOPE_END);
+    }
+    if (mut_jump >= 0) {
+        int32_t end_jump = emit_jump(c, OP_JMP);
+        patch_jump(c, mut_jump);
+        compile_dyn_form(c, ast, true);
+        patch_jump(c, end_jump);
     }
 }
 
