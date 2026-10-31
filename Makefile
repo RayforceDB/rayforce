@@ -292,6 +292,20 @@ lib: $(LIB_LIB_OBJ)
 	rm -f lib$(TARGET).a
 	$(AR) rc lib$(TARGET).a $(LIB_LIB_OBJ)
 
+# Install-headers staging root. Mirrors the source layout under include/ so
+# the headers' own quoted includes ("ops/ops.h", "store/hnsw.h") resolve
+# with -I on this root alone. Kept out of include/ so a staged tree never
+# shadows src/ during a build.
+#
+# STAGE_ROOT is the root actually written. `INSTALL_INCLUDE` names a root
+# outright; otherwise the root is install/include, staged under the
+# `DESTDIR` directory when that is set. Both may be given:
+# INSTALL_INCLUDE wins, because it is the explicit path override. `clean`
+# goes through this same definition, so cleaning with the same overrides
+# removes what those overrides staged and nothing else.
+INSTALL_INCLUDE ?=
+STAGE_ROOT = $(if $(INSTALL_INCLUDE),$(INSTALL_INCLUDE),$(if $(DESTDIR),$(DESTDIR)/include,install/include))
+
 # Release tarball: build the optimized binary and package it as
 # dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256 checksum.
 # Used by .github/workflows/release.yml (which passes RAY_VERSION=X.Y.Z) and
@@ -306,6 +320,48 @@ dist: release
 	 rm -rf $$stage; \
 	 ( cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum $$name.tar.gz || shasum -a 256 $$name.tar.gz; } > $$name.tar.gz.sha256 ); \
 	 echo "built dist/$$name.tar.gz"
+
+# Install the headers a C client needs to use the engine in-process: the
+# public one plus the internal ones a binding includes directly (issue
+# #849). Staged read-only under $(STAGE_ROOT)/rayforce/, laid out as
+# the sources are, because the headers include their siblings by
+# src-relative path ("ops/ops.h", "store/hnsw.h"). Copies, not symlinks, so
+# the staged tree outlives the checkout it came from.
+#
+# rayforce.h is staged twice: once at the root of $(STAGE_ROOT), which is
+# where the internal headers' own `#include <rayforce.h>` looks for it, and
+# once nested under rayforce/include/rayforce/.
+#
+# Two include roots cover the staged tree: -I$(STAGE_ROOT) serves
+# <rayforce.h>, -I$(STAGE_ROOT)/rayforce/src serves the internal headers'
+# "ops/ops.h" and "store/hnsw.h" forms. <rayforce/rayforce.h> is not
+# provided by the staging layout.
+#
+# Every path in the recipe is quoted, because a staging root may contain
+# spaces, and each shell runs under set -e, so a failed step aborts the
+# target instead of leaving a partial tree with a success message.
+#
+# Staging only: no ABI or API promise beyond "these are the headers at this
+# commit", and nothing here should be read as one.
+INSTALL_HEADERS := include/rayforce.h \
+                   src/ops/ops.h src/io/parquet.h src/mem/heap.h \
+                   src/store/hnsw.h src/core/platform.h
+
+install-headers:
+	@set -e; rm -rf "$(STAGE_ROOT)/rayforce" "$(STAGE_ROOT)/rayforce.h"; \
+	d="$(STAGE_ROOT)/rayforce/include/rayforce"; \
+	mkdir -p "$$d"; \
+	cp include/rayforce.h "$$d/"; \
+	chmod 444 "$$d/rayforce.h"
+	@set -e; for h in $(filter-out include/rayforce.h,$(INSTALL_HEADERS)); do \
+		d="$(STAGE_ROOT)/rayforce/$${h%/*}"; \
+		mkdir -p "$$d"; \
+		cp "$$h" "$$d/"; \
+		chmod 444 "$$d/$${h##*/}"; \
+	done
+	@set -e; cp include/rayforce.h "$(STAGE_ROOT)/rayforce.h"; \
+	chmod 444 "$(STAGE_ROOT)/rayforce.h"
+	@echo "staged 7 headers (6 sources, rayforce.h twice) under $(STAGE_ROOT)/rayforce"
 
 # Worker threads per process during tests. Without this the runtime
 # auto-sizes to ncpu-1, so on a many-core box the in-process harness AND
@@ -548,13 +604,15 @@ clean:
 	-rm -f $(TARGET) $(TARGET).test $(TARGET).test.rel lib$(TARGET).a
 	-rm -f $(TARGET).tsan $(TARGET).test.tsan
 	-rm -rf build build_release build_fuzz build_compdb dist
+	-rm -rf "$(STAGE_ROOT)/rayforce"
+	-rm -f "$(STAGE_ROOT)/rayforce.h"
 	# Test-generated fixtures (see test/rfl/system/*.rfl) — should not linger after a run.
 	-rm -f rf_test_*.csv
 	# Coverage artefacts (see `make coverage`).
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib dist test test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib dist install-headers test test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

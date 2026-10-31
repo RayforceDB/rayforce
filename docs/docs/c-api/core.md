@@ -1,7 +1,9 @@
 # Core C API Reference
 
-!!! note "Headers"
+!!! note "Headers and include paths"
     Include `<rayforce.h>` for the bulk of the public API. A few internal helpers documented here live in their own headers — in particular `ray_cow` and the `ray_heap_init` / `ray_heap_destroy` lifecycle calls are declared in `"mem/heap.h"`, not in `<rayforce.h>`. The Makefile builds the static archive `librayforce.a`; it does not provide a shared-library target. On Linux, link the archive with `-Wl,--gc-sections -lm -lpthread` so the linker can discard unused function and data sections.
+
+    Building against a source checkout uses two include roots, `cc -Iinclude -Isrc ...`. Building against a staged install (`make install-headers`) uses the staged pair instead: `cc -Iinstall/include -Iinstall/include/rayforce/src ...` - the quoted, `src/`-relative includes of `ops.h`, `parquet.h` and `heap.h` do not resolve from a flat directory. The target fails loudly on a failed copy, so a successful run leaves a complete staged tree. Staging is a convenience, not an SDK contract: it promises the header contents at the commit that staged them, no ABI stability and no API stability, so stage from the same engine revision you built the archive against.
 
 ## Floating-point environment for compressed columns
 
