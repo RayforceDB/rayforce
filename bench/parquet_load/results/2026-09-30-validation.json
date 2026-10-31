@@ -104,6 +104,5 @@
     "passed": true,
     "command": "mkdocs build --strict --site-dir build/parquet-recovery/site",
     "log": "build/parquet-recovery/docs-build.log"
-  },
-  "remaining_plan": "docs/parquet-completion-plan.md"
+  }
 }

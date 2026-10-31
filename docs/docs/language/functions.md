@@ -128,8 +128,8 @@ Functions that take other functions as arguments.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `map` | variadic | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
-| `pmap` | variadic | Currently a sequential alias for `map` (returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
+| `map` | variadic | Apply function to each element; same-type atom results form a typed vector, otherwise a list | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
+| `pmap` | variadic | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
@@ -142,18 +142,36 @@ Functions that take other functions as arguments.
 | `map-left` | variadic | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
 | `map-right` | variadic | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
+`map` and `pmap` return a typed vector when every result is an atom of
+exactly the same vector-supported type, including strings, symbols and
+representable typed nulls. Native boolean/byte null atoms remain boxed
+because those vector types are non-nullable. Opaque graph, HNSW index and
+Datalog program handles also remain boxed: their integer payload alone cannot
+represent the handle's resource ownership. Mixed atom types (including
+integers mixed with floats), nested results and untyped `null` results
+remain a `LIST`. Empty input returns an empty `LIST`, since there is no
+result type to infer. A binary map with a scalar third argument still calls
+the function once and returns its result directly. Callbacks run left to
+right, exactly once per input element; an error stops the walk. A later type
+mismatch converts the collected prefix to a list without repeating
+callbacks. `scan` and the other iterators keep their existing result-type
+rules. This changes callers that relied on every map result being a `LIST`.
+Use `(concat (list) result)` to explicitly box a result for a list-only
+consumer, such as a positional row payload or `raze` joining string fragments.
+`raze` leaves an already typed vector unchanged.
+
 ## Collection Operations
 
 Operations on vectors as collections.
 
-Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR string/character membership keeps its collection behavior and is not supported by the typed query-plan kernel.
+Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR membership is not supported by the typed query-plan kernel. A string atom tested against a list is one whole value and returns one boolean: `(in "ab" (list "ab" "c"))` → `true`. A string tested against a string returns one result per character: `(in "ab" "abc")` → `[true true]`. A vector or list of strings is tested element by element: `(in ["p" "qq"] (list "qq"))` → `[false true]`.
 
 Query `concat` joins text row by row when every vector operand comes from a source column, including computed text columns and column arguments to inlined helpers. Scalar text operands also retain query string concatenation. A literal or bound collection operand keeps ordinary collection concatenation, in either argument order. Inside a user function `concat` keeps ordinary collection semantics unless an operand derives from the query's rows. Numeric collection concatenation evaluates over the whole column, or each group inside an aggregate. Non-text collection concatenation is binary. Scalars broadcast to the projected collection length; a one-row input column is still a column. Non-scalar output columns of different lengths are rejected before `take:`; a standalone collection projection may change the row count. When a `where:` selection is applied to a collection projection, its rows must align with the input rows. Counting a constant collection returns its length, independently of the source row count or group size. In a projection, a `concat` operand the planner has no node for (a reordered, indexed or cast column such as `(reverse s)`, `(at s 0)` or `(as 'STR x)`) is evaluated over the whole column, so select, update, `where:` and `by:` agree. Inside a helper body a quoted symbol is the symbol itself, as when the helper runs as bytecode, and a nested helper's free names are globals or source columns, never its caller's formals; a helper whose body uses only pure builtins is inlined; a closure never is, since its body reads its captures. Grouped outputs that the planner cannot serve natively keep the requested output order, and an output named like a group key keeps both columns, the key first. A helper that the planner cannot inline (several statements, a closure, recursion) runs as bytecode when called from a query fallback; `return`, lazy arguments and recursion depth behave as outside a query, and each value carries whether it derives from the query's rows, so `concat` keeps text semantics through `let` bindings, nested calls and helper results while a bound vector stays a collection. Inside such a helper a free name that is a source column is the row's cell during row-by-row evaluation and the whole column otherwise; an output alias never captures it, and other free names are globals. Such a helper can also be the `by:` key, evaluated over the rows `where:` keeps: a body built from pure builtins and pure helpers runs whole first, and again row by row when a conditional in it tested a vector or the whole-column run failed (a failed run is swallowed whole, its `raise` payload included); a body with an effect runs row by row from the start, so the effect happens once per row. The decision follows each callee wherever it is bound (a global helper, a parameter, a `let`, a capture, a lambda literal bound earlier in the body): `set`, `eval`, system and I/O builtins and a callee that is computed or unknown are effects; every other builtin and every helper built from them is pure, and a pure body keeps the whole-column semantics whichever way it is reached. A source column shadows a global of the same name inside a helper, on the planned path and in fallbacks alike. A text cell reduced from a column (`first`, `last`, `min`, `max`) is a cell of those rows: in a grouped select or update `(concat (first s) 'zz)` joins each group's cell with the literal, and an empty symbol cell is empty text, as for the cell itself; a cell reduced from a STR column makes the result STR, as the column does.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
-| `in` | binary | Membership test (element in vector) | `(in 2 [1 2 3])` → `true` |
+| `in` | binary | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
@@ -382,7 +400,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
-| `str-find` | binary | First byte index of a substring; returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
+| `str-find` | binary | First byte index of a literal substring (no wildcards; use `like` for patterns); returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | Join strings or symbols with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |
 | `upper` | unary | Uppercase string or symbol atoms/vectors; lazy/DAG for vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |

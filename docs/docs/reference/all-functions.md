@@ -217,8 +217,8 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `map` | variadic | — | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
-| `pmap` | variadic | — | Currently a sequential alias for `map` (returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
+| `map` | variadic | — | Apply function to each element; same-type atom results form a typed vector, otherwise a list | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
+| `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
@@ -234,7 +234,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 ```lisp
 ; Transform each row with map
-(map (fn [x] (* x x)) [1 2 3 4])  ; (1 4 9 16)
+(map (fn [x] (* x x)) [1 2 3 4])  ; [1 4 9 16]
 
 ; pmap currently uses the same sequential callback loop as map
 (pmap (fn [t] (sum (til t))) [100 200 300])
@@ -243,18 +243,36 @@ Functions that take other functions as arguments for mapping, folding, and filte
 (scan + (enlist 1 2 3 4))  ; [1 3 6 10]
 ```
 
+`map` and `pmap` return a typed vector when every result is an atom of
+exactly the same vector-supported type, including strings, symbols and
+representable typed nulls. Native boolean/byte null atoms remain boxed
+because those vector types are non-nullable. Opaque graph, HNSW index and
+Datalog program handles also remain boxed: their integer payload alone cannot
+represent the handle's resource ownership. Mixed atom types (including
+integers mixed with floats), nested results and untyped `null` results
+remain a `LIST`. Empty input returns an empty `LIST`, since there is no
+result type to infer. A binary map with a scalar third argument still calls
+the function once and returns its result directly. Callbacks run left to
+right, exactly once per input element; an error stops the walk. A later type
+mismatch converts the collected prefix to a list without repeating
+callbacks. `scan` and the other iterators keep their existing result-type
+rules. This changes callers that relied on every map result being a `LIST`.
+Use `(concat (list) result)` to explicitly box a result for a list-only
+consumer, such as a positional row payload or `raze` joining string fragments.
+`raze` leaves an already typed vector unchanged.
+
 ## Collection Operations { #collection }
 
 Operations on vectors and lists as collections — set operations, indexing, searching, and construction.
 
-Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR string/character membership keeps its collection behavior and is not supported by the typed query-plan kernel.
+Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR membership is not supported by the typed query-plan kernel. A string atom tested against a list is one whole value and returns one boolean: `(in "ab" (list "ab" "c"))` → `true`. A string tested against a string returns one result per character: `(in "ab" "abc")` → `[true true]`. A vector or list of strings is tested element by element: `(in ["p" "qq"] (list "qq"))` → `[false true]`.
 
 Query `concat` joins text row by row when an operand comes from a source column, including computed text columns. Scalar text operands also retain query string concatenation. Literal and bound collections keep ordinary `concat` semantics, as do calls inside user functions whose operands do not derive from the query's rows. Numeric collection concatenation evaluates over the whole column, or each group inside an aggregate. Non-text collection concatenation is binary. Scalars broadcast to the projected collection length; a one-row input column is still a column. Non-scalar output columns of different lengths are rejected before `take:`; a standalone collection projection may change the row count. When a `where:` selection is applied to a collection projection, its rows must align with the input rows. A `concat` operand the planner has no node for (a reordered, indexed or cast column) is evaluated over the whole column in a projection, matching update, `where:` and `by:`. Inside a helper body a quoted symbol is the symbol itself and a nested helper's free names are globals or source columns, never its caller's formals; helpers built from pure builtins are inlined, never closures. Grouped outputs the planner cannot serve natively keep the requested output order; an output named like a group key keeps both columns, the key first. Helpers the planner cannot inline run as bytecode from a query fallback with row provenance tracked per value: `concat` keeps text semantics through `let`, nested calls and results, a bound vector stays a collection, and a free source-column name is the row's cell (or the whole column) rather than an output alias. Such a helper can also be the `by:` key, evaluated over the rows `where:` keeps: a body built from pure builtins and pure helpers runs whole first, and again row by row when a conditional in it tested a vector or the whole-column run failed (a failed run is swallowed whole, its `raise` payload included); a body with an effect (`set`, `eval`, system or I/O builtins, a computed or unknown callee) runs row by row from the start, so the effect happens once per row; callees are followed wherever they are bound, so a pure helper reached through a parameter, a `let` or a capture keeps the whole-column semantics. A source column shadows a global of the same name inside a helper, on the planned path and in fallbacks alike. A text cell reduced from a column (`first`, `last`, `min`, `max`) is a cell of those rows, so a grouped `(concat (first s) 'zz)` joins each group's cell with the literal, an empty cell is empty text, and a cell of a STR column keeps STR output, at every operand position (a query `concat` takes up to 255 operands).
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `distinct` | unary | — | Remove duplicates, preserving order | `(distinct [1 2 2 3])` → `[1 2 3]` |
-| `in` | binary | — | Membership test (is element in vector?) | `(in 2 [1 2 3])` → `true` |
+| `in` | binary | — | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | — | Negated membership test | `(not-in 2 [1 3])` → `true` |
 | `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
 | `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
@@ -540,7 +558,7 @@ String functions are available as direct builtins. The transform functions are l
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `split` | binary | — | Split string by delimiter into a list of strings | `(split "a,b,c" ",")` → `("a" "b" "c")` |
-| `str-find` | binary | parallel vector | First byte index of a substring; `0Nl` when absent | `(str-find "banana" "na")` → `2` |
+| `str-find` | binary | parallel vector | First byte index of a literal substring (no wildcards; see `like`); `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | — | Join string/symbol atoms, vectors, or lists with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | — | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |
 | `upper` | unary | lazy/DAG | Uppercase string or symbol atoms/vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |

@@ -607,6 +607,215 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
 }
 
 /* ══════════════════════════════════════════
+ * GUID membership
+ *
+ * An open-addressing table of 16-byte keys stored in place, for `in` over
+ * guid cells without the hashset's per-row type dispatch.  The all-zero
+ * key is the null guid; it doubles as the empty-slot marker, so the table
+ * keeps it in a flag of its own.
+ *
+ * A guid cell is null when its 16 bytes are zero, whether or not its vector
+ * carries HAS_NULLS: producers can write the zero payload without the flag
+ * (ray_vec_append does).  RAY_ATOM_IS_NULL, the scalar == and the query's
+ * null-row masks read the bytes, and so does this table.  `in` therefore
+ * answers as == does, cell for cell: a zero cell is in a set that holds a
+ * zero cell, whichever vector carries the flag.
+ * ══════════════════════════════════════════ */
+
+typedef struct {
+    uint64_t* keys;      /* 2 words a slot; {0, 0} = empty */
+    int64_t   mask;      /* slots - 1; slots is a power of 2 */
+    bool      has_null;
+} guid_set_t;
+
+#ifdef DEBUG
+static _Atomic int64_t g_in_guid_fail_at;   /* test hook: fail the nth allocation */
+void ray_in_guid_test_fail_alloc(int64_t nth) { atomic_store(&g_in_guid_fail_at, nth); }
+#endif
+static void* in_guid_calloc(size_t size) {
+#ifdef DEBUG
+    int64_t v = atomic_load(&g_in_guid_fail_at);
+    while (v > 0)
+        if (atomic_compare_exchange_weak(&g_in_guid_fail_at, &v, v - 1))
+            return v == 1 ? NULL : ray_calloc_raw(size);
+#endif
+    return ray_calloc_raw(size);
+}
+
+/* A table for up to n keys, load factor at most 0.5. */
+static bool guid_set_init(guid_set_t* gs, int64_t n) {
+    int64_t cap = 16;
+    while (cap < n * 2) cap <<= 1;
+    gs->keys = (uint64_t*)in_guid_calloc((size_t)cap * 16);
+    gs->mask = cap - 1;
+    gs->has_null = false;
+    return gs->keys != NULL;
+}
+
+/* The slot holding the non-null key (lo, hi) at p, or ~slot (negative) of
+ * the empty slot it would take. */
+static inline int64_t guid_set_slot(const guid_set_t* gs, const uint8_t* p,
+                                    uint64_t lo, uint64_t hi) {
+    int64_t s = (int64_t)(ray_hash_bytes(p, 16) & (uint64_t)gs->mask);
+    for (;;) {
+        const uint64_t* k = gs->keys + 2 * s;
+        if (k[0] == lo && k[1] == hi) return s;
+        if ((k[0] | k[1]) == 0) return ~s;
+        s = (s + 1) & gs->mask;
+    }
+}
+
+/* Add the key at p; true if it was not there yet. */
+static bool guid_set_add(guid_set_t* gs, const uint8_t* p) {
+    uint64_t lo, hi;
+    memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+    if ((lo | hi) == 0) {
+        bool fresh = !gs->has_null;
+        gs->has_null = true;
+        return fresh;
+    }
+    int64_t s = guid_set_slot(gs, p, lo, hi);
+    if (s >= 0) return false;
+    uint64_t* k = gs->keys + 2 * ~s;
+    k[0] = lo; k[1] = hi;
+    return true;
+}
+
+typedef struct {
+    const guid_set_t* gs;
+    const uint8_t*    cells;
+    bool*             out;
+} guid_in_ctx_t;
+
+static void guid_in_probe_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    guid_in_ctx_t* c = (guid_in_ctx_t*)raw;
+    for (int64_t i = start; i < end; i++) {
+        const uint8_t* p = c->cells + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        c->out[i] = (lo | hi) ? guid_set_slot(c->gs, p, lo, hi) >= 0
+                              : c->gs->has_null;
+    }
+}
+
+/* The scan of the set when the table holds the needles: a set cell that
+ * matches a needle marks the needle's slot.  Workers stop once every
+ * distinct needle is marked; which worker marks a slot first does not
+ * change the answer. */
+typedef struct {
+    const guid_set_t* gs;
+    const uint8_t*    set;
+    _Atomic uint8_t*  seen;       /* one a slot */
+    _Atomic(bool)     null_seen;
+    _Atomic(int64_t)  found;      /* distinct needles marked */
+    int64_t           distinct;
+} guid_scan_ctx_t;
+
+static void guid_in_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    guid_scan_ctx_t* c = (guid_scan_ctx_t*)raw;
+    for (int64_t j = start; j < end; j++) {
+        if (((j - start) & 1023) == 0 &&
+            atomic_load_explicit(&c->found, memory_order_relaxed) >= c->distinct)
+            return;
+        const uint8_t* p = c->set + j * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        if ((lo | hi) == 0) {
+            if (c->gs->has_null &&
+                !atomic_exchange_explicit(&c->null_seen, true, memory_order_relaxed))
+                atomic_fetch_add_explicit(&c->found, 1, memory_order_relaxed);
+            continue;
+        }
+        int64_t s = guid_set_slot(c->gs, p, lo, hi);
+        if (s >= 0 &&
+            !atomic_load_explicit(&c->seen[s], memory_order_relaxed) &&
+            !atomic_exchange_explicit(&c->seen[s], 1, memory_order_relaxed))
+            atomic_fetch_add_explicit(&c->found, 1, memory_order_relaxed);
+    }
+}
+
+/* out[i]: is cell i of the guid vector `val` among the m guids at `set`?
+ * The table holds the smaller side.  The set: one probe a row.  The
+ * needles: one scan of the set, which stops once every distinct needle has
+ * been seen.  Either loop is pool-parallel.
+ *
+ * The answer, an "oom" error, or "cancel" when a cancel cut a dispatch
+ * short; never a fallback.  The hashset takes a zero cell for null only in
+ * a vector that carries HAS_NULLS, so it could answer differently for the
+ * same bytes. */
+static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
+    int64_t n = val->len;
+    const uint8_t* vd = (const uint8_t*)ray_data(val);
+    guid_set_t gs;
+    if (!guid_set_init(&gs, m <= n ? m : n)) return ray_error("oom", NULL);
+    ray_t* result = ray_vec_new(RAY_BOOL, n);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_free_raw(gs.keys);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = n;
+    bool* out = (bool*)ray_data(result);
+    if (m <= n) {
+        for (int64_t j = 0; j < m; j++) guid_set_add(&gs, set + j * 16);
+        guid_in_ctx_t ctx = { .gs = &gs, .cells = vd, .out = out };
+        ray_pool_t* pool = ray_pool_get();
+        bool par = pool && n >= RAY_PARALLEL_THRESHOLD;
+        if (par)
+            ray_pool_dispatch(pool, guid_in_probe_fn, &ctx, n);
+        else
+            guid_in_probe_fn(&ctx, 0, 0, n);
+        ray_free_raw(gs.keys);
+        /* A cancel skips the tasks not yet started: no answer. */
+        if (par && pool_cancelled(pool)) {
+            ray_release(result);
+            return ray_error("cancel", "interrupted");
+        }
+        return result;
+    }
+    _Atomic uint8_t* seen = in_guid_calloc((size_t)(gs.mask + 1) * sizeof(*seen));
+    if (!seen) {
+        ray_free_raw(gs.keys);
+        ray_release(result);
+        return ray_error("oom", NULL);
+    }
+    int64_t distinct = 0;
+    for (int64_t i = 0; i < n; i++)
+        if (guid_set_add(&gs, vd + i * 16)) distinct++;
+    guid_scan_ctx_t sc = { .gs = &gs, .set = set, .seen = seen,
+                           .distinct = distinct };
+    atomic_init(&sc.null_seen, false);
+    atomic_init(&sc.found, 0);
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && m >= RAY_PARALLEL_THRESHOLD;
+    if (par)
+        ray_pool_dispatch(pool, guid_in_scan_fn, &sc, m);
+    else
+        guid_in_scan_fn(&sc, 0, 0, m);
+    /* A cancel skips the tasks not yet started: the seen marks are short. */
+    if (par && pool_cancelled(pool)) {
+        ray_free_raw((void*)seen);
+        ray_free_raw(gs.keys);
+        ray_release(result);
+        return ray_error("cancel", "interrupted");
+    }
+    bool null_seen = atomic_load_explicit(&sc.null_seen, memory_order_relaxed);
+    for (int64_t i = 0; i < n; i++) {
+        const uint8_t* p = vd + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        out[i] = (lo | hi)
+            ? atomic_load_explicit(&seen[guid_set_slot(&gs, p, lo, hi)],
+                                   memory_order_relaxed) != 0
+            : null_seen;
+    }
+    ray_free_raw((void*)seen);
+    ray_free_raw(gs.keys);
+    return result;
+}
+
+/* ══════════════════════════════════════════
  * Higher-order functions
  * ══════════════════════════════════════════ */
 
@@ -628,6 +837,33 @@ static ray_t* iter_elem_owned(ray_t* coll, int64_t i) {
     ray_t* e = iter_elem(coll, i, &owned);
     if (!owned && !RAY_IS_ERR(e)) ray_retain(e);
     return e;
+}
+
+/* An exact-type atom that can be represented in a vector. BOOL/U8 have
+ * no vector null: a native typed-null atom of either type stays boxed. */
+static bool map_vector_atom(ray_t* value) {
+    if (value->type >= 0 || !ray_is_vector_type(-value->type)) return false;
+    /* These I64 atoms own opaque resources. A raw integer cell cannot
+     * carry their tags or finalizers, including after a typed prefix. */
+    if (value->type == -RAY_I64 &&
+        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)))
+        return false;
+    return !((value->type == -RAY_BOOL || value->type == -RAY_U8) &&
+             RAY_ATOM_IS_NULL(value));
+}
+
+/* Rebox only the completed prefix, without invoking the callback again.
+ * Reserve the full result length so fallback needs no further list growth.
+ * On failure the caller still owns prefix. */
+static ray_t* map_box_prefix(ray_t* prefix, int64_t capacity) {
+    ray_t* list = ray_list_new(capacity);
+    if (RAY_IS_ERR(list)) return list;
+    for (int64_t i = 0; i < prefix->len; i++) {
+        ray_t* value = iter_elem_owned(prefix, i);
+        if (RAY_IS_ERR(value)) { ray_release(list); return value; }
+        ((ray_t**)ray_data(list))[list->len++] = value;
+    }
+    return list;
 }
 
 /* (map fn val vec) — apply binary fn(val, elem) to each element of vec.
@@ -656,28 +892,56 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     }
 
     int64_t len = ray_len(coll);
-    ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) return ray_error("oom", NULL);
-    result->type = RAY_LIST;
-    result->len = len;
-    ray_t** out = (ray_t**)ray_data(result);
+    if (len == 0) return ray_list_new(0);  /* no callback result to infer */
+    ray_t* result = NULL;
     for (int64_t i = 0; i < len; i++) {
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
-        if (RAY_IS_ERR(elem))  out[i] = elem;
-        else if (n == 2)       out[i] = call_fn1(fn, elem);
-        else                   out[i] = call_fn2(fn, val, elem);
+        ray_t* value;
+        if (RAY_IS_ERR(elem))  value = elem;
+        else if (n == 2)      value = call_fn1(fn, elem);
+        else                  value = call_fn2(fn, val, elem);
         if (owned) ray_release(elem);
-        /* Materialise a lazy result (e.g. the lambda returned
-         * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
-         * of unforced lazy nodes breaks every downstream consumer that
-         * doesn't force per element (sum, ==, +). */
-        if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
-        if (RAY_IS_ERR(out[i])) {
-            ray_t* err = out[i];
-            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result);
-            return err;
+        /* Force each result before choosing its representation, as the
+         * previous list collector did for lazy callback results. */
+        if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
+        if (RAY_IS_ERR(value)) { ray_release(result); return value; }
+
+        /* Once heterogeneous, stay boxed without rechecking atom types. */
+        if (result && result->type == RAY_LIST) {
+            ((ray_t**)ray_data(result))[result->len++] = value;
+            continue;
+        }
+        bool atom = map_vector_atom(value);
+        if (!result) {
+            result = atom ? ray_vec_new(-value->type, len) : ray_list_new(len);
+            if (RAY_IS_ERR(result)) { ray_release(value); return result; }
+        } else if (result->type != RAY_LIST &&
+                   (!atom || value->type != -result->type)) {
+            ray_t* list = map_box_prefix(result, len);
+            ray_release(result);
+            if (RAY_IS_ERR(list)) { ray_release(value); return list; }
+            result = list;
+        }
+
+        if (result->type == RAY_LIST) {
+            ((ray_t**)ray_data(result))[result->len++] = value; /* transfer */
+        } else if (result->type == RAY_STR) {
+            ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), ray_str_len(value));
+            ray_release(value);
+            if (RAY_IS_ERR(next)) { ray_release(result); return next; }
+            result = next;
+        } else {
+            /* Capacity is reserved, SYM atoms have runtime ids and the
+             * destination is a fresh runtime-domain vector. Exact type
+             * agreement above prevents any numeric promotion. */
+            result->len++;
+            int status = store_typed_elem(result, i, value);
+            ray_release(value);
+            if (status != 0) {
+                ray_release(result);
+                return ray_error("type", "map: cannot store callback result");
+            }
         }
     }
     return result;
@@ -1538,9 +1802,8 @@ ray_t* ray_distinct_fn(ray_t* x) {
 
 /* (in val vec) — check membership */
 /* One element of a collection left operand.  A string element is one whole
- * value: the lone-string arms of ray_in_fn answer per character, which is
- * right for a string atom on its own but not for a row of a collection —
- * (in ["p" "qq"] (list "qq" "zz")) answered [[false] [false false]].  A
+ * value, including when the left operand itself is a string and the right
+ * operand is a list.  Only string-in-string checks are per character.  A
  * string set (vector) already compares whole strings in ray_in_fn. */
 static ray_t* in_row(ray_t* elem, ray_t* vec) {
     if (elem->type == -RAY_STR && ray_is_atom(vec))
@@ -1582,7 +1845,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         return r;
     }
     /* A string column's cell, bound for one row of a query, is one value:
-     * the per-character arms below are for a lone string literal. */
+     * the string-in-string arm below is for a lone string literal. */
     if (val->type == -RAY_STR && (val->attrs & RAY_ATTR_STR_CELL) &&
         (ray_is_atom(vec) || vec->type == RAY_LIST))
         return in_row(val, vec);
@@ -1607,26 +1870,9 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     /* Scalar in scalar: equality check */
     if (ray_is_atom(val) && ray_is_atom(vec))
         return make_bool(atom_eq(val, vec) ? 1 : 0);
-    /* STR in LIST: for each char of val, check membership in list elements */
-    if (ray_is_atom(val) && (-val->type) == RAY_STR && (vec->type == RAY_LIST)) {
-        const char* vp = ray_str_ptr(val);
-        size_t vlen = ray_str_len(val);
-        ray_t* result = ray_vec_new(RAY_BOOL, (int64_t)vlen);
-        if (RAY_IS_ERR(result)) return result;
-        result->len = (int64_t)vlen;
-        bool* out_b = (bool*)ray_data(result);
-        ray_t** list_elems = (ray_t**)ray_data(vec);
-        int64_t list_len = ray_len(vec);
-        for (size_t i = 0; i < vlen; i++) {
-            out_b[i] = false;
-            ray_t* ch = ray_str(&vp[i], 1);
-            for (int64_t j = 0; j < list_len; j++) {
-                if (atom_eq(ch, list_elems[j])) { out_b[i] = true; break; }
-            }
-            ray_release(ch);
-        }
-        return result;
-    }
+    /* STR in LIST: the string is one scalar needle, as for SYM in LIST. */
+    if (val->type == -RAY_STR && vec->type == RAY_LIST)
+        return in_row(val, vec);
     /* Vector val: map in over each element */
     if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
@@ -1657,6 +1903,12 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             ray_release(sv);
             return r;
         }
+        /* A guid vector against one guid: a set of one key. */
+        if (val->type == RAY_GUID && vec->type == -RAY_GUID) {
+            static const uint8_t null_guid[16] = {0};
+            return in_guid(val, vec->obj ? (const uint8_t*)ray_data(vec->obj)
+                                         : null_guid, 1);
+        }
         /* Hash-based fast path: both sides are typed vecs of compatible
          * shape and the result is a row-aligned bool vec.  Build a
          * hashset over `vec` once, probe per element of `val`.  Was
@@ -1683,6 +1935,12 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 }
                 ray_free_raw(pos);
             }
+            /* Guid cells: in_guid's typed table, their only route.  The
+             * kernel below declines guids, and the hashset dispatched on
+             * type for every row: ~10 ns a row against ~1 for an I64
+             * column. */
+            if (val->type == RAY_GUID && vec->type == RAY_GUID)
+                return in_guid(val, (const uint8_t*)ray_data(vec), vec->len);
             /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
              * ints, pool-parallel — the same engine the fused WHERE path
              * uses.  Gated off null-bearing operands: this hashset path
@@ -1796,6 +2054,17 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     }
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
+        /* A guid in a guid vector: compare the cells' bytes in place, a
+         * null guid matching a zero cell, flagged or not (GUID membership
+         * above). */
+        if (val->type == -RAY_GUID && vec->type == RAY_GUID) {
+            static const uint8_t null_guid[16] = {0};
+            const uint8_t* key = val->obj ? (const uint8_t*)ray_data(val->obj) : null_guid;
+            const uint8_t* cells = (const uint8_t*)ray_data(vec);
+            for (int64_t i = 0; i < vec->len; i++)
+                if (memcmp(cells + i * 16, key, 16) == 0) return make_bool(1);
+            return make_bool(0);
+        }
         int64_t len = vec->len;
         bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);

@@ -411,13 +411,26 @@ static void fmt_timestamp(fmt_buf_t* b, int64_t val) {
     fmt_printf(b, "%04d.%02d.%02dD%02d:%02d:%02d.%09d", y, mo, d, h, mi, s, ns);
 }
 
+static void fmt_str_quoted(fmt_buf_t* b, const char* p, size_t n, bool escape) {
+    fmt_putc(b, '"');
+    if (!escape) {
+        fmt_putn(b, p, (int64_t)n);
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)p[i];
+            if (c == '"' || c == '\\') { fmt_putc(b, '\\'); fmt_putc(b, (char)c); }
+            else if (c == '\n') fmt_puts(b, "\\n");
+            else if (c == '\r') fmt_puts(b, "\\r");
+            else if (c == '\t') fmt_puts(b, "\\t");
+            else if (c < 0x20 || c == 0x7f) fmt_printf(b, "\\%03o", c);
+            else fmt_putc(b, (char)c);
+        }
+    }
+    fmt_putc(b, '"');
+}
+
 static void fmt_str_atom(fmt_buf_t* b, ray_t* obj, int full) {
-    (void)full;
-    const char* p = ray_str_ptr(obj);
-    size_t      n = ray_str_len(obj);
-    fmt_putc(b, '"');
-    fmt_putn(b, p, (int64_t)n);
-    fmt_putc(b, '"');
+    fmt_str_quoted(b, ray_str_ptr(obj), ray_str_len(obj), !full);
 }
 
 /* ===== Forward declarations ===== */
@@ -450,7 +463,7 @@ const char* ray_fmt_null_literal(int8_t type) {
 
 /* ===== Vector element formatter ===== */
 
-static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
+static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, bool compact) {
     /* Check for null.  STR is the exception — a string element has no
      * distinct null (empty and null are the same value), so it renders
      * as "" via the RAY_STR case below rather than a 0Nc literal. */
@@ -479,9 +492,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
     case RAY_STR: {
         size_t slen = 0;
         const char* p = ray_str_vec_get(vec, idx, &slen);
-        fmt_putc(b, '"');
-        if (p) fmt_putn(b, p, (int64_t)slen);
-        fmt_putc(b, '"');
+        fmt_str_quoted(b, p ? p : "", p ? slen : 0, compact);
         break;
     }
     case RAY_GUID:
@@ -510,7 +521,7 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx) {
 
 /* ===== Vector formatter ===== */
 
-static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit) {
+static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, bool compact) {
     int64_t len = ray_len(vec);
     if (len == 0) { fmt_puts(b, "[]"); return; }
 
@@ -521,7 +532,7 @@ static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit) {
         if (i > 0) fmt_putc(b, ' ');
 
         int32_t before = b->len;
-        fmt_raw_elem(b, vec, i);
+        fmt_raw_elem(b, vec, i, compact);
 
         /* Width limiting: check if we exceeded the limit */
         if (limit > 0 && (b->len - start_len) > limit) {
@@ -966,11 +977,11 @@ static void fmt_missing_cell(fmt_buf_t* b, int8_t type) {
 }
 
 /* Write row ri's cell; false when the column has no such row. */
-static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri) {
+static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri, bool compact) {
     ray_t* v = NULL;
     int64_t at = 0;
     switch (fmt_col_cell(c, ri, &v, &at)) {
-    case FMT_CELL_AT:      fmt_raw_elem(b, v, at); return true;
+    case FMT_CELL_AT:      fmt_raw_elem(b, v, at, compact); return true;
     case FMT_CELL_MISSING: fmt_missing_cell(b, c->type); return true;
     default:               return false;
     }
@@ -992,7 +1003,7 @@ static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows) {
         fmt_putc(b, '[');
         for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
             if (ri > 0) fmt_putc(b, ' ');
-            if (!fmt_col_write(b, c, ri)) fmt_missing_cell(b, c->type);
+            if (!fmt_col_write(b, c, ri, true)) fmt_missing_cell(b, c->type);
         }
         fmt_putc(b, ']');
         return;
@@ -1029,7 +1040,7 @@ typedef struct {
 static void fmt_stream_cell(fmt_buf_t* tmp, fmt_col_t* col, int64_t ri,
                             const char** s, int32_t* len) {
     tmp->len = 0;
-    if (!fmt_col_write(tmp, col, ri)) { *s = "NA"; *len = 2; return; }
+    if (!fmt_col_write(tmp, col, ri, false)) { *s = "NA"; *len = 2; return; }
     *s = tmp->buf;
     *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
 }
@@ -1367,7 +1378,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
             fmt_buf_t tmp;
             fmt_init(&tmp);
-            if (ri < col_len && fmt_col_write(&tmp, &cur, ri)) {
+            if (ri < col_len && fmt_col_write(&tmp, &cur, ri, false)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
@@ -1392,7 +1403,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             }
             fmt_buf_t tmp;
             fmt_init(&tmp);
-            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx)) {
+            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx, false)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
@@ -1611,7 +1622,7 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         }
     } else if (ray_is_vec(obj)) {
         int limit = (mode == 1) ? g_row_width : -1;
-        fmt_vector(b, obj, limit);
+        fmt_vector(b, obj, limit, mode == 0);
     } else if (type == RAY_LIST) {
         fmt_list(b, obj, mode);
     } else if (type == RAY_TABLE) {

@@ -1,0 +1,74 @@
+;; Opaque tagged I64 handles must retain their resource ownership in LISTs.
+(set E958 (table [src dst] (list [0 1] [1 0])))
+(set V958 (list [1.0 0.0] [0.0 1.0]))
+
+;; graph: newly created results, retained aliases, numeric-prefix fallback,
+;; and a later string mismatch all preserve a usable handle.
+(set graph_created958 (map (fn [_] (.graph.build E958 'src 'dst)) [0 1]))
+(at (.graph.info (at graph_created958 0)) 'n_edges) -- 2
+(at (.graph.info (at graph_created958 1)) 'n_edges) -- 2
+(type graph_created958) -- 'LIST
+(set graph_original958 (.graph.build E958 'src 'dst))
+(set graph_alias958 (map (fn [h] h) (list graph_original958 graph_original958)))
+(at (.graph.info (at graph_alias958 0)) 'n_edges) -- 2
+(at (.graph.info graph_original958) 'n_edges) -- 2
+(set graph_original958 null)
+(at (.graph.info (at graph_alias958 1)) 'n_edges) -- 2
+(set graph_late958 (map (fn [i] (if (== i 0) 7 (.graph.build E958 'src 'dst))) [0 1]))
+(at graph_late958 0) -- 7
+(at (.graph.info (at graph_late958 1)) 'n_edges) -- 2
+(type graph_late958) -- 'LIST
+(set graph_mixed958 (map (fn [i] (if (== i 2) "tail" (.graph.build E958 'src 'dst))) [0 1 2]))
+(at (.graph.info (at graph_mixed958 0)) 'n_edges) -- 2
+(at (.graph.info (at graph_mixed958 1)) 'n_edges) -- 2
+(at graph_mixed958 2) -- "tail"
+
+;; hnsw: newly created results, retained aliases, numeric-prefix fallback,
+;; and a later string mismatch all preserve a usable handle.
+(set hnsw_created958 (map (fn [_] (hnsw-build V958 'l2 8 100)) [0 1]))
+(at (hnsw-info (at hnsw_created958 0)) 'nrows) -- 2
+(at (hnsw-info (at hnsw_created958 1)) 'nrows) -- 2
+(type hnsw_created958) -- 'LIST
+(set hnsw_original958 (hnsw-build V958 'l2 8 100))
+(set hnsw_alias958 (map (fn [h] h) (list hnsw_original958 hnsw_original958)))
+(at (hnsw-info (at hnsw_alias958 0)) 'nrows) -- 2
+(at (hnsw-info hnsw_original958) 'nrows) -- 2
+(set hnsw_original958 null)
+(at (hnsw-info (at hnsw_alias958 1)) 'nrows) -- 2
+(set hnsw_late958 (map (fn [i] (if (== i 0) 7 (hnsw-build V958 'l2 8 100))) [0 1]))
+(at hnsw_late958 0) -- 7
+(at (hnsw-info (at hnsw_late958 1)) 'nrows) -- 2
+(type hnsw_late958) -- 'LIST
+(set hnsw_mixed958 (map (fn [i] (if (== i 2) "tail" (hnsw-build V958 'l2 8 100))) [0 1 2]))
+(at (hnsw-info (at hnsw_mixed958 0)) 'nrows) -- 2
+(at (hnsw-info (at hnsw_mixed958 1)) 'nrows) -- 2
+(at hnsw_mixed958 2) -- "tail"
+
+;; program: newly created results, retained aliases, numeric-prefix fallback,
+;; and a later string mismatch all preserve a usable handle.
+(set program_created958 (map (fn [_] (dl-program)) [0 1]))
+(dl-stratify (at program_created958 0)) -- true
+(dl-stratify (at program_created958 1)) -- true
+(type program_created958) -- 'LIST
+(set program_original958 (dl-program))
+(set program_alias958 (map (fn [h] h) (list program_original958 program_original958)))
+(dl-stratify (at program_alias958 0)) -- true
+(dl-stratify program_original958) -- true
+(set program_original958 null)
+(dl-stratify (at program_alias958 1)) -- true
+(set program_late958 (map (fn [i] (if (== i 0) 7 (dl-program))) [0 1]))
+(at program_late958 0) -- 7
+(dl-stratify (at program_late958 1)) -- true
+(type program_late958) -- 'LIST
+(set program_mixed958 (map (fn [i] (if (== i 2) "tail" (dl-program))) [0 1 2]))
+(dl-stratify (at program_mixed958 0)) -- true
+(dl-stratify (at program_mixed958 1)) -- true
+(at program_mixed958 2) -- "tail"
+
+;; Two representation changes must retain an existing handle verbatim.
+(set saved958 (.graph.build E958 'src 'dst))
+(set transitions958 (pmap (fn [x] x) (list 7 saved958 "tail")))
+(set saved958 null)
+(at transitions958 0) -- 7
+(at (.graph.info (at transitions958 1)) 'n_edges) -- 2
+(at transitions958 2) -- "tail"

@@ -571,7 +571,8 @@ Functions that take other functions as arguments for flexible iteration patterns
 
 ### `(map f x)`
 
-Apply function `f` to each element of `x`. Returns a list of results.
+Apply function `f` to each element of `x`. Results that are atoms of the
+same type form a typed vector; anything else forms a list.
 
 ```lisp
 (map (fn [x] (* x x)) [1 2 3])  ; [1 4 9]
@@ -636,13 +637,13 @@ Keep elements of `vec` where the boolean `mask` is true.
 ### `(pmap f x)`
 
 Currently a **sequential alias for `map`**: it calls the function for each
-input element in order on the calling thread's VM and returns the same list as
+input element in order on the calling thread's VM and returns the same result as
 `map`. A larger input or a larger `-c` setting does not distribute these callback
 invocations across workers. The name can signal intent, but does not currently
 provide parallel lambda evaluation.
 
 ```lisp
-(pmap (fn [x] (* x x)) [1 2 3])  ; (1 4 9), evaluated sequentially
+(pmap (fn [x] (* x x)) [1 2 3])  ; [1 4 9], evaluated sequentially
 ```
 
 Eligible vector builtins and query operators can use the morsel-driven thread
