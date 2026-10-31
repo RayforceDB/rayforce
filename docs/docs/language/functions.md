@@ -249,7 +249,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `xkey` | binary | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
 | `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
 | `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
-| `alter` | variadic, special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
+| `alter` | variadic, special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
 | `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 
@@ -289,7 +289,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 
 `insert` has two table forms:
 
-- `(insert target rows)` is the ordinary two-argument form. It returns a new flat table, or rebinds and returns a quoted target symbol such as `'trades`. The row payload can be a list, table, or dictionary, as described by the target's physical columns.
+- `(insert target rows)` is the ordinary two-argument form. It returns a new flat table, or rebinds and returns a quoted target symbol such as `'trades`, which names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it. The row payload can be a list, table, or dictionary, as described by the target's physical columns.
 - `(insert parted partition-key rows)` grows the in-memory live tail of a parted table and returns a fresh logical view, leaving `parted` unchanged. Quote a symbol — `(insert 'parted partition-key rows)` — to rebind that symbol to the fresh view and return the symbol. A validated zero-row batch is a no-op and returns the existing view without rebinding. This is distinct from the three-argument positional form for vectors and lists, where the second argument is an insertion index.
 
 ```lisp

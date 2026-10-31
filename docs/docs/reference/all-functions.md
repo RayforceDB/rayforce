@@ -390,7 +390,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
-| `alter` | variadic | special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
+| `alter` | variadic | special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
 | `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
 
 ```lisp
@@ -475,7 +475,7 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
-| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key | `(insert 't 2024.01.16 rows)` |
+| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
 | `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp

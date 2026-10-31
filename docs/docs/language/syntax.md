@@ -481,11 +481,21 @@ and shared dictionary paths retain copy-on-write isolation. Other operations
 retain their existing allocation behavior; named mutation does not promise
 that every operation or representation avoids allocation.
 
-A closure with a computed `alter` or `insert` target retains the enclosing
-bindings that the target could name, just as dynamic `eval` or `resolve`
-does. Constructing the target symbol at runtime does not redirect a captured
-local write into a same-named global. Captures remain values: amending one
-inside the closure does not change the enclosing function's binding.
+This applies when the call's head is the literal `alter` or `insert`, or a
+global alias of one, such as `(set ins insert)`, bound when the function is
+compiled. A mutator reached through any other head (a parameter, a `let`, a
+dotted head, a computed head, or a name unbound at that time) is an ordinary
+callee: in compiled code a quoted target resolves as a global, as before, and
+a computed target publishes nothing. The tree walker, which runs a function
+too large to compile, resolves a quoted target through the caller's frames
+whatever the head.
+
+Under a literal head or an alias, a closure with a computed `alter` or
+`insert` target retains the enclosing bindings that the target could name,
+just as dynamic `eval` or `resolve` does. Constructing the target symbol at
+runtime does not redirect a captured local write into a same-named global.
+Captures remain values: amending one inside the closure does not change the
+enclosing function's binding.
 
 A separately defined function does not gain access to its caller's locals.
 Query source columns/aliases are not writable named targets, and a dotted
