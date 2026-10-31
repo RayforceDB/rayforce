@@ -1248,8 +1248,9 @@ static test_result_t test_count_distinct_parallel_types(void) {
  * column), and a value equal to the row before it in a task is one record
  * with it.  Exact counts, in the order run: I64 runs of 3, I32 runs of 7,
  * F64 runs with signed zeros and NaNs, multiples of 4096 in runs of 2,
- * values with no runs (every one distinct), and few values with no runs
- * (I64 cycling through 1000, I16 through 300).
+ * values with no runs (every one distinct), few values with no runs
+ * (I64 cycling through 1000, I16 through 300), and I64 values repeating
+ * with a period of 100K rows.
  * -------------------------------------------------------------------------- */
 static int64_t cd_exec_count(ray_t* vec) {
     int64_t name_v = ray_sym_intern("v", 1);
@@ -1336,6 +1337,15 @@ static test_result_t test_count_distinct_runs_partitions(void) {
     int16_t* h = (int16_t*)ray_data(v);
     for (int64_t i = 0; i < n; i++) h[i] = (int16_t)((i * 7) % 300 - 150);
     TEST_ASSERT_EQ_I(cd_exec_count(v), 300);
+    ray_release(v);
+
+    /* values repeating with a long period: (i * 7919) mod 100000 */
+    v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = n;
+    p = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) p[i] = (i * 7919) % 100000;
+    TEST_ASSERT_EQ_I(cd_exec_count(v), 100000);
     ray_release(v);
 
     /* distinct values shares the partition function and slots its own

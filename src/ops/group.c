@@ -1226,48 +1226,44 @@ static int64_t cd_sym_dense_count(ray_t* input) {
     return distinct;
 }
 
-/* Whether the column has few distinct values, from CD_SAMPLE_RUNS runs of
- * CD_SAMPLE_RUN neighbouring rows spread over it (cheap to read).  A value
- * counts once in a run: met again only in another run, far along the
- * column, it says the column repeats it.  Only a sample that met nearly
- * every value in more than one run (its singletons, f1, under an eighth) is
- * taken for a column of few values: then the larger of Chao1,
- * d + f1^2 / (2 f2) (d the sample's distinct values, f2 those met in two
- * runs), and f1 * len / sampled, the rows a tail of values seen once would
- * take (Chao1 alone misses such a tail behind a few hot values).  Otherwise
- * the row count, as an upper bound.  The partition count follows the
- * estimate: a column of a thousand values gains nothing from hundreds of
- * partitions, its histogram and scatter only get wider (dedup sets of a
- * few entries). */
-#define CD_SAMPLE_RUNS 64
-#define CD_SAMPLE_RUN  64
-#define CD_SAMPLE_SLOTS 8192            /* power of two, twice the sample */
+/* The column's distinct values, estimated from CD_SAMPLE_ROWS rows, one at a
+ * random place in each of as many equal stretches of the column (rows next
+ * to each other say little about a column whose values repeat with a long
+ * period).  With d the sample's distinct values and f1, f2 those met once
+ * and twice: when the sample repeats enough values (f2 >= CD_SAMPLE_F2_MIN),
+ * Chao1, d + f1^2 / (2 f2).  Otherwise, if the singletons are under an
+ * eighth of the sample, the larger of Chao1 and f1 * len / sampled, the
+ * rows a tail of values seen once would take (Chao1 alone misses such a
+ * tail behind a few hot values).  Otherwise the row count, as an upper
+ * bound.  The partition count follows the estimate: a column of a thousand
+ * values gains nothing from hundreds of partitions, its histogram and
+ * scatter only get wider (dedup sets of a few entries). */
+#define CD_SAMPLE_ROWS   4096
+#define CD_SAMPLE_F2_MIN 4
+#define CD_SAMPLE_SLOTS  8192           /* power of two, twice the sample */
 static int64_t cd_distinct_estimate(int8_t type, uint8_t attrs, const void* base, int64_t len) {
-    if (len < (int64_t)CD_SAMPLE_RUNS * CD_SAMPLE_RUN * 4) return len;
-    ray_t* key_hdr = NULL; ray_t* cnt_hdr = NULL; ray_t* run_hdr = NULL;
+    if (len < (int64_t)CD_SAMPLE_ROWS * 4) return len;
+    ray_t* key_hdr = NULL; ray_t* cnt_hdr = NULL;
     int64_t*  key = (int64_t*)scratch_alloc(&key_hdr, CD_SAMPLE_SLOTS * sizeof(int64_t));
     uint16_t* cnt = (uint16_t*)scratch_calloc(&cnt_hdr, CD_SAMPLE_SLOTS * sizeof(uint16_t));
-    uint8_t*  run = (uint8_t*)scratch_calloc(&run_hdr, CD_SAMPLE_SLOTS);   /* last run counted, + 1 */
-    if (!key || !cnt || !run) {
+    if (!key || !cnt) {
         if (key_hdr) scratch_free(key_hdr);
         if (cnt_hdr) scratch_free(cnt_hdr);
-        if (run_hdr) scratch_free(run_hdr);
         return len;
     }
-    int64_t sampled = 0, d = 0;
-    for (int64_t r = 0; r < CD_SAMPLE_RUNS; r++) {
-        int64_t lo = r * (len - CD_SAMPLE_RUN) / (CD_SAMPLE_RUNS - 1);
-        for (int64_t i = lo; i < lo + CD_SAMPLE_RUN; i++) {
-            int64_t v = type == RAY_F64 ? cd_f64_key(((const double*)base)[i])
-                                        : read_col_i64(base, i, type, attrs);
-            uint64_t sl = ((uint64_t)v * CD_HASH_K1) >> (64 - 13);
-            while (cnt[sl] && key[sl] != v) sl = (sl + 1) & (CD_SAMPLE_SLOTS - 1);
-            if (run[sl] == (uint8_t)(r + 1)) continue;
-            run[sl] = (uint8_t)(r + 1);
-            if (!cnt[sl]) { key[sl] = v; d++; }
-            cnt[sl]++;
-            sampled++;
-        }
+    int64_t stride = len / CD_SAMPLE_ROWS, d = 0;
+    for (int64_t r = 0; r < CD_SAMPLE_ROWS; r++) {
+        uint64_t x = ((uint64_t)r + 1) * 0x9E3779B97F4A7C15ULL;   /* splitmix64 */
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        x ^= x >> 31;
+        int64_t i = r * stride + (int64_t)(x % (uint64_t)stride);
+        int64_t v = type == RAY_F64 ? cd_f64_key(((const double*)base)[i])
+                                    : read_col_i64(base, i, type, attrs);
+        uint64_t sl = ((uint64_t)v * CD_HASH_K1) >> (64 - 13);
+        while (cnt[sl] && key[sl] != v) sl = (sl + 1) & (CD_SAMPLE_SLOTS - 1);
+        if (!cnt[sl]) { key[sl] = v; d++; }
+        cnt[sl]++;
     }
     int64_t f1 = 0, f2 = 0;
     for (int64_t sl = 0; sl < CD_SAMPLE_SLOTS; sl++) {
@@ -1276,11 +1272,12 @@ static int64_t cd_distinct_estimate(int8_t type, uint8_t attrs, const void* base
     }
     scratch_free(key_hdr);
     scratch_free(cnt_hdr);
-    scratch_free(run_hdr);
-    if (f1 * 8 >= sampled) return len;
     int64_t est = d + (f1 * f1) / (2 * (f2 > 0 ? f2 : 1));
-    int64_t tail = f1 * len / sampled;
-    if (tail > est) est = tail;
+    if (f2 < CD_SAMPLE_F2_MIN) {
+        if (f1 * 8 >= CD_SAMPLE_ROWS) return len;
+        int64_t tail = f1 * len / CD_SAMPLE_ROWS;
+        if (tail > est) est = tail;
+    }
     return est < len ? est : len;
 }
 
@@ -1374,15 +1371,19 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     uint32_t nw = ray_pool_total_workers(pool);
 
     /* Partition count: a power of two of at least 16 (32 past 8 workers,
-     * 64 past 32), and enough for some 64K distinct values a partition (by
-     * cd_distinct_estimate), up to 1024, so each partition's set stays
-     * small and the dedup has a task for every worker. */
+     * 64 past 32), up to 1024, and enough for some 64K distinct values a
+     * partition (by cd_distinct_estimate), so each partition's set stays
+     * small.  It also grows towards 8 partitions a worker while each would
+     * still hold 1K values, so the dedup has tasks for every worker; a
+     * column of few values keeps few partitions. */
     uint32_t p_bits;
     if (nw <= 8) p_bits = 4;       /* 16 partitions */
     else if (nw <= 32) p_bits = 5;  /* 32 partitions */
     else p_bits = 6;                /* 64 partitions */
     int64_t est = cd_distinct_estimate(in_type, input->attrs, base, len);
-    while (p_bits < 10 && (est >> (16 + p_bits)) > 0) p_bits++;
+    while (p_bits < 10 && ((est >> (16 + p_bits)) > 0 ||
+           (((uint64_t)1 << p_bits) < (uint64_t)nw * 8 && (est >> (10 + p_bits)) > 0)))
+        p_bits++;
     uint64_t P = (uint64_t)1 << p_bits;
     uint64_t p_mask = P - 1;
 
@@ -1393,8 +1394,11 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
      * is fixed when ray_pool_dispatch_n fills the ring. */
     int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
     if (grain <= 0) grain = 8192;
-    /* some 16 tasks a worker: the histograms and cursors are P cells a task */
-    while (len / grain > (int64_t)nw * 16) grain *= 2;
+    /* The histograms and cursors are P cells a task: past 64K cells, fewer
+     * and larger tasks, down to some 16 a worker.  Below that the small
+     * tasks stay, so a worker that finishes early takes another. */
+    while (len / grain > (int64_t)nw * 16 && (len / grain) * (int64_t)P > ((int64_t)1 << 16))
+        grain *= 2;
     int64_t n_tasks_64 = (len + grain - 1) / grain;
     if (n_tasks_64 <= 0) n_tasks_64 = 1;
     /* Tasks past the ring run in further rounds; the only bound on the task
