@@ -129,3 +129,17 @@ t -- [50 60 9]
 ((fn [f x] (f x 1)) + 2) -- 3
 ((fn [f x] (f x 1)) (fn [a b] (* (+ a b) 10)) 3) -- 40
 
+;; An aliased mutator or one held in a local, inside a nested closure with
+;; a computed target, keeps the capture and leaves the global alone.
+(set capv [50 60])
+(set lmi insert)
+(set lma alter)
+((fn [] (let capv (til 3)) (let capf (fn [] (lmi (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (lma (as 'SYM "capv") 'set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let g insert) (let capf (fn [] (g (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
+capv -- [50 60]
+
