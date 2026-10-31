@@ -970,6 +970,20 @@ static bool closure_shape_ok(ray_t *closure) {
  * computed target, which can reach a name that is not spelled out. */
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
                                 bool stop, int64_t *nodes);
+/* May the head of a call with `len` elements be insert or alter when it
+ * runs?  The literal names; a global bound to either (an alias such as
+ * (set ins insert), which compile_call resolves by value); and a name with
+ * no global binding, which is a local or a parameter that compile_call
+ * guards with OP_JMPM.  A head other than the literal names needs a target
+ * and a value to be a mutation, so a single-argument call does not count. */
+static bool head_may_mutate(ray_t *head, int64_t len) {
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED))
+        return false;
+    if (head->i64 == sf_alter || head->i64 == sf_insert) return true;
+    if (len < 3 || head->i64 == sf_self) return false;
+    ray_t *v = ray_env_get_global(head->i64);
+    return !v || ray_fn_is_local_mutator(v);
+}
 /* The nodes a walk for a closure's names visits at most.  A large constant
  * is one node however many bytes it holds; only text shared over and over
  * (a list nested in itself 2^22 times, say) reaches the budget, and the
@@ -1075,9 +1089,7 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
          * those captures before compile_dyn_form exposes the closure's
          * slots; an eval window cannot recover a discarded capture.
          * Literal targets already contribute their names below. */
-        if (ast->len >= 2 && elems[0] && elems[0]->type == -RAY_SYM &&
-            !(elems[0]->attrs & ATTR_QUOTED) &&
-            (elems[0]->i64 == sf_alter || elems[0]->i64 == sf_insert) &&
+        if (ast->len >= 2 && head_may_mutate(elems[0], ast->len) &&
             !(elems[1] && elems[1]->type == -RAY_SYM &&
               (elems[1]->attrs & ATTR_QUOTED)))
             *dynamic = true;
