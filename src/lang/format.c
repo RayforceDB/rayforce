@@ -977,11 +977,11 @@ static void fmt_missing_cell(fmt_buf_t* b, int8_t type) {
 }
 
 /* Write row ri's cell; false when the column has no such row. */
-static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri) {
+static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri, bool compact) {
     ray_t* v = NULL;
     int64_t at = 0;
     switch (fmt_col_cell(c, ri, &v, &at)) {
-    case FMT_CELL_AT:      fmt_raw_elem(b, v, at, false); return true;
+    case FMT_CELL_AT:      fmt_raw_elem(b, v, at, compact); return true;
     case FMT_CELL_MISSING: fmt_missing_cell(b, c->type); return true;
     default:               return false;
     }
@@ -1003,7 +1003,7 @@ static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows) {
         fmt_putc(b, '[');
         for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
             if (ri > 0) fmt_putc(b, ' ');
-            if (!fmt_col_write(b, c, ri)) fmt_missing_cell(b, c->type);
+            if (!fmt_col_write(b, c, ri, true)) fmt_missing_cell(b, c->type);
         }
         fmt_putc(b, ']');
         return;
@@ -1040,7 +1040,7 @@ typedef struct {
 static void fmt_stream_cell(fmt_buf_t* tmp, fmt_col_t* col, int64_t ri,
                             const char** s, int32_t* len) {
     tmp->len = 0;
-    if (!fmt_col_write(tmp, col, ri)) { *s = "NA"; *len = 2; return; }
+    if (!fmt_col_write(tmp, col, ri, false)) { *s = "NA"; *len = 2; return; }
     *s = tmp->buf;
     *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
 }
@@ -1378,7 +1378,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
             fmt_buf_t tmp;
             fmt_init(&tmp);
-            if (ri < col_len && fmt_col_write(&tmp, &cur, ri)) {
+            if (ri < col_len && fmt_col_write(&tmp, &cur, ri, false)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
@@ -1403,7 +1403,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             }
             fmt_buf_t tmp;
             fmt_init(&tmp);
-            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx)) {
+            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx, false)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
