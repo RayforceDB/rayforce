@@ -118,8 +118,22 @@ ifeq ($(RAY_WINDOWS),1)
                     -Wl,--stack,8388608
   RELEASE_LDFLAGS = -Wl,--gc-sections
 else ifeq ($(UNAME_S),Linux)
-  LIBS            = -lm -lpthread
+  # -ldl: the RDMA transport loads the verbs library at run time, only on a
+  # host that has it (glibc before 2.34 keeps dlopen in its own library).
+  LIBS            = -lm -lpthread -ldl
   RELEASE_LDFLAGS = -Wl,--gc-sections -Wl,--as-needed
+  # The remote-memory transport (src/core/rdma.c) needs the verbs headers
+  # to build; without them it compiles to "never available" and every
+  # connection stays on TCP or shared memory.  VERBS_INC points at an
+  # include directory holding infiniband/verbs.h when it is not the
+  # system's.
+  VERBS_INC ?= /usr/include
+  ifneq ($(wildcard $(VERBS_INC)/infiniband/verbs.h),)
+    DEFS += -DRAY_HAVE_VERBS
+    ifneq ($(VERBS_INC),/usr/include)
+      DEFS += -isystem $(VERBS_INC)
+    endif
+  endif
 else
   LIBS            = -lm
   RELEASE_LDFLAGS = -Wl,-dead_strip

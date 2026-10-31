@@ -2885,7 +2885,8 @@ static test_result_t test_ipc_wire_unknown_msgtype_is_evaluated(void) {
     TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
 
     ray_t* q = ray_str("(set _wire_svc 99)", 18);
-    TEST_ASSERT_EQ_I(wire_send(s, 3 /* no such msgtype */, q), 0);
+    /* 3 is an UPGRADE record now (answered, never evaluated); 9 is nothing. */
+    TEST_ASSERT_EQ_I(wire_send(s, 9 /* no such msgtype */, q), 0);
     ray_release(q);
 
     TEST_ASSERT_EQ_I(ray_sock_wait_readable(s, 150), 0);   /* no reply */

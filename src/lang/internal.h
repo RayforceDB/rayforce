@@ -685,6 +685,7 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_auto_journal_eval_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n);
+ray_t* ray_ipc_transport_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_unsub_fn(ray_t* topic);
 ray_t* ray_mc_pub_fn(ray_t* topic, ray_t* payload);

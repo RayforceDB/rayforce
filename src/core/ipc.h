@@ -81,6 +81,45 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 #define RAY_IPC_MSG_ASYNC  0
 #define RAY_IPC_MSG_SYNC   1
 #define RAY_IPC_MSG_RESP   2
+/* An upgrade record (below): the payload is the record's bytes, not a
+ * serialized value, and is never evaluated or journaled. */
+#define RAY_IPC_MSG_UPGRADE 3
+
+/* ===== Transports =====
+ *
+ * A connection opens on TCP as it always has.  The second byte of the
+ * client's greeting, zero until now, carries its capabilities; a server
+ * that understands them answers with the capabilities both share in the
+ * high bits of its own second byte (the low bit stays the auth flag), and
+ * only when the client advertised any, so an older client never sees a
+ * byte it would refuse.  With RAY_IPC_CAP_XPORT agreed, the client may
+ * then ask, in an UPGRADE frame, to move the connection: to shared-memory
+ * rings when both are on one host (core/shm.c), to remote memory across
+ * hosts with RDMA (core/rdma.c).  The server answers with an UPGRADE
+ * frame of its own: an offer, its record, or a refusal, after which the
+ * connection either moves or stays on TCP.  Both sides keep speaking the
+ * same frames; only the bytes' road changes.  The socket stays open to
+ * tell of the peer's going.
+ *
+ * The policy says what this process offers and asks for: AUTO (shared
+ * memory on one host, RDMA across hosts, else TCP), TCP (never upgrade),
+ * SHM or RDMA (that one, else refuse / fail the open). */
+#define RAY_IPC_CAP_XPORT 0x10
+#define RAY_IPC_CAP_MASK  0xF0
+
+#define RAY_IPC_XPORT_AUTO 0
+#define RAY_IPC_XPORT_TCP  1
+#define RAY_IPC_XPORT_SHM  2
+#define RAY_IPC_XPORT_RDMA 3
+
+int         ray_ipc_xport_policy_get(void);
+bool        ray_ipc_xport_policy_set(int policy);
+/* "auto" / "tcp" / "shm" / "rdma" for a policy; "tcp" / "shm" / "rdma"
+ * for a transport kind (RAY_XPORT_*).  NULL for anything else. */
+const char* ray_ipc_xport_policy_name(int policy);
+const char* ray_ipc_xport_kind_name(int kind);
+/* Parses "auto" / "tcp" / "shm" / "rdma"; -1 for anything else. */
+int         ray_ipc_xport_policy_parse(const char* s, size_t n);
 
 #define RAY_IPC_FLAG_COMPRESSED 0x01
 /* Set by the journal hook in core/ipc.c eval_payload when the inbound
@@ -160,6 +199,24 @@ int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
                            int timeout_ms, size_t compress_threshold,
                            int keepalive_ms);
 
+/* Every option of .ipc.open in one place.  `transport` is a
+ * RAY_IPC_XPORT_* policy for this one connection: AUTO takes the
+ * process policy. */
+typedef struct {
+    int    timeout_ms;
+    size_t compress_threshold;
+    int    keepalive_ms;
+    int    transport;
+} ray_ipc_open_opts_t;
+
+/* As ray_ipc_connect_opts, with every option; additionally returns -7
+ * when the connection's transport policy names a transport the link
+ * cannot take (the peer refused it, or it is not available here) — the
+ * connection is then closed rather than silently left on TCP. */
+int64_t   ray_ipc_connect_with(const char* host, uint16_t port,
+                               const char* user, const char* password,
+                               const ray_ipc_open_opts_t* opts);
+
 /* Parse .ipc.open's optional second argument: an integer timeout in
  * milliseconds, or a dict with optional `timeout`, `compress` and
  * `keepalive`.  `compress` is a threshold in bytes — 0N never
@@ -171,6 +228,9 @@ int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
 ray_t*    ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
                                   size_t* compress_threshold,
                                   int* keepalive_ms);
+/* The same, with the `transport` option too (a symbol: `auto`, `tcp`,
+ * `shm` or `rdma`; absent leaves RAY_IPC_XPORT_AUTO). */
+ray_t*    ray_ipc_parse_open_opts_full(ray_t* arg, ray_ipc_open_opts_t* out);
 
 /* The compression threshold in force on an open handle, or
  * RAY_IPC_COMPRESS_AUTO if the handle does not resolve. */
@@ -214,6 +274,7 @@ typedef struct {
     int64_t queued_frames;
     int64_t hwm_bytes;      /* largest backlog ever queued here */
     bool    inbound;        /* accepted by a listener here (true) or opened by .ipc.open (false) */
+    uint8_t transport;      /* RAY_XPORT_TCP / RAY_XPORT_SHM / RAY_XPORT_RDMA: where its bytes go */
 } ray_ipc_tx_info_t;
 
 void      ray_ipc_tx_limit_get(int64_t* bytes, int64_t* frames);
