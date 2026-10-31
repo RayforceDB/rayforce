@@ -239,9 +239,10 @@
 ;; Inside compiled fn, (set .sys.gc 5) emits OP_STOREGLOBAL → reserve
 ;; error via op_storeglobal's err != RAY_OK arm (eval.c:1860).
 (bad_set_fn) !- reserve
-;; Trap catches it; non-raise errors deliver i64(0) to the handler
-;; (eval.c:2297 / 281 default), so the handler sees 0 not the sentinel.
-(try (bad_set_fn) (fn [e] e)) -- 0
+;; Trap catches it; a non-raise error hands the handler its code and
+;; message (none here: the opcode rebuilds the error from its code), not
+;; the error object.
+(try (bad_set_fn) (fn [e] e)) -- (dict [code msg] (list 'reserve ""))
 ;; (set <param> <val>) — compile.c:236 special case where set's value
 ;; uses a slot-bound parameter (regression covered by commit 90cf600).
 ;; Exercises OP_STOREGLOBAL with a value compiled from a slot ref.

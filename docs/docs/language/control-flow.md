@@ -193,6 +193,13 @@ Recursive lambdas use `self` to refer to the enclosing function:
 "caught"
 ```
 
+An error the engine raises itself reaches the handler as a dict of its code and message:
+
+```lisp
+‣ (try (+ 1 "hello") (fn [e] e))
+{code:type msg:"cannot add i64 and str"}
+```
+
 If no error is raised, `try` returns the result of the body expression normally. Works inside lambdas compiled to bytecode.
 
 ### Fallback value

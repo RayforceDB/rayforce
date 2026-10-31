@@ -489,6 +489,77 @@ ray_t* ray_raise_fn(ray_t* val) {
     return ray_error("domain", NULL);
 }
 
+/* Dispose of a construction temporary that was not handed on: an error is
+ * freed (errors are not refcounted, so ray_release would leave it
+ * allocated), anything else released. */
+static void try_drop(ray_t* v) {
+    if (RAY_IS_ERR(v)) ray_error_free(v);
+    else ray_release(v);
+}
+
+/* The value a `try` handler receives for an error the engine raised
+ * itself (a (raise x) hands it x): the dict
+ * {code: 'type msg: "cannot add i64 and sym"}, the code and message the
+ * REPL prints for the error, msg "" when it carries none.  Called before
+ * the error is freed or the handler runs, since msg is usually
+ * ray_error_msg(), the thread's last error message.  null, which takes no
+ * allocation, if the dict cannot be built. */
+static ray_t* try_error_value(const char* code, const char* msg) {
+    if (!code) code = "error";
+    if (!msg) msg = "";
+    ray_t *sm, *sc = NULL, *keys = NULL, *vals = NULL, *d;
+    int64_t kc, km, kv;
+    /* The message first: a failure below makes an error of its own,
+     * which overwrites the thread's last message. */
+    sm = ray_str(msg, strlen(msg));
+    if (RAY_IS_ERR(sm)) goto fail;
+    kc = ray_sym_intern("code", 4);
+    km = ray_sym_intern("msg", 3);
+    kv = ray_sym_intern(code, strlen(code));
+    if (kc < 0 || km < 0 || kv < 0) goto fail;
+    sc = ray_sym(kv);
+    if (RAY_IS_ERR(sc)) goto fail;
+    keys = ray_sym_vec_new(RAY_SYM_W64, 2);
+    if (RAY_IS_ERR(keys)) goto fail;
+    vals = ray_list_new(2);
+    if (RAY_IS_ERR(vals)) goto fail;
+    /* Filled in place, vals taking sc and sm over: nothing between the
+     * allocations above and the dict's own can fail. */
+    ((int64_t*)ray_data(keys))[0] = kc;
+    ((int64_t*)ray_data(keys))[1] = km;
+    keys->len = 2;
+    ((ray_t**)ray_data(vals))[0] = sc;
+    ((ray_t**)ray_data(vals))[1] = sm;   /* not-a-table */
+    vals->len = 2;
+    d = ray_dict_new(keys, vals);   /* consumes keys and vals, failing too */
+    if (!RAY_IS_ERR(d)) return d;
+    ray_error_free(d);
+    return RAY_NULL_OBJ;
+fail:
+    try_drop(sm);
+    try_drop(sc);
+    try_drop(keys);
+    try_drop(vals);
+    return RAY_NULL_OBJ;
+}
+
+#ifdef DEBUG
+ray_t* ray_try_error_value_for_test(const char* code, const char* msg) {
+    return try_error_value(code, msg);
+}
+#endif
+
+/* True when a `try` handler expression is a plain value: not a name or a
+ * symbol (either can resolve to a function), not a call, not a function.
+ * Such a handler is the result as it stands, so the error value it would
+ * be handed is never read and need not be built.  Shared with the
+ * compiler, which gives it a trap that pushes none (OP_TRAPV). */
+bool ray_try_handler_is_value(ray_t* h) {
+    if (!h || RAY_IS_ERR(h)) return false;
+    return h->type != -RAY_SYM && h->type != RAY_LIST &&
+           h->type != RAY_LAMBDA && h->type != RAY_UNARY;
+}
+
 /* Dispatch a `try` handler value against the error value.  A *callable*
  * handler (a lambda or a unary builtin) is invoked with the error and its
  * result returned; ANY other value is returned as-is as a fallback result.
@@ -535,10 +606,13 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     if (!RAY_IS_ERR(result)) return result;
     if (is_return_marker(result)) return result;   /* a `return` is not an error */
 
-    /* Get error value (set by raise, or default for runtime errors) */
+    /* Get error value (set by raise, or the engine error's code and
+     * message, which a plain-value handler never reads) */
     ray_t* err_val = __VM->raise_val;
     __VM->raise_val = NULL;
-    if (!err_val) err_val = make_i64(0);
+    if (!err_val)
+        err_val = ray_try_handler_is_value(handler_expr) ? RAY_NULL_OBJ
+                : try_error_value(ray_err_code(result), ray_error_msg());
     /* The caught error itself goes no further: errors are not refcounted,
      * so ray_release would leave it allocated.  Nor does the trace its
      * unwind recorded. */
@@ -3219,6 +3293,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_LOADCONST_W] = &&op_loadconst_w,
         [OP_RESOLVE_W]  = &&op_resolve_w,
         [OP_TRAP]       = &&op_trap,
+        [OP_TRAPV]      = &&op_trapv,
         [OP_TRAP_END]   = &&op_trap_end,
         [OP_STOREGLOBAL]   = &&op_storeglobal,
         [OP_STOREGLOBAL_W] = &&op_storeglobal_w,
@@ -3889,14 +3964,16 @@ op_ret: {
     DISPATCH();
 }
 
+op_trapv:   /* the handler is a plain value: it reads no error value */
 op_trap: {
+    bool value = code[ip - 1] == OP_TRAPV;
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     if (vm.tp >= VM_TRAP_SIZE) goto vm_error_limit;
     vm.ts[vm.tp++] = (vm_trap_t){
         .rp = vm.rp, .sp = vm.sp, .handler_ip = ip + offset,
         .fn = vm.fn, .fp = vm.fp, .n_locals = n_locals,
-        .scope_depth = ray_env_scope_depth()
+        .scope_depth = ray_env_scope_depth(), .value = value
     };
     ray_retain(vm.fn);
     DISPATCH();
@@ -4199,14 +4276,23 @@ vm_error_cleanup: {
 
         /* Get error value.  If __VM->raise_val is set, a user (raise x)
          * just ran — its value is the real payload the handler must
-         * see.  Otherwise the handler gets 0, as ray_try_fn gives it for
-         * a runtime error.  vm_err_obj, the error itself (the sentinel
-         * ray_raise_fn returns, or a builtin's or the VM's own), goes no
-         * further: errors are not refcounted, so ray_release would leave
-         * it allocated. */
+         * see.  Otherwise the handler gets the error's code and message,
+         * as ray_try_fn gives it: vm_err_obj's when there is one, else
+         * the VM's own (vm_err_str, vm_err_detail), the error an untrapped
+         * exit would make.  A trap armed by OP_TRAPV, whose handler is a
+         * plain value, takes none.  vm_err_obj, the error itself (the
+         * sentinel ray_raise_fn returns, or a builtin's or the VM's own),
+         * goes no further: errors are not refcounted, so ray_release would
+         * leave it allocated. */
         ray_t *err_val = __VM->raise_val;
         __VM->raise_val = NULL;
-        if (!err_val) err_val = make_i64(0);
+        if (trap.value) {
+            ray_release(err_val);
+            err_val = NULL;
+        } else if (!err_val)
+            err_val = vm_err_obj && RAY_IS_ERR(vm_err_obj)
+                ? try_error_value(ray_err_code(vm_err_obj), ray_error_msg())
+                : try_error_value(vm_err_str, vm_err_detail);
         if (vm_err_obj) {
             if (RAY_IS_ERR(vm_err_obj)) ray_error_free(vm_err_obj);
             else ray_release(vm_err_obj);
@@ -4222,7 +4308,7 @@ vm_error_cleanup: {
         code = (uint8_t *)ray_data(LAMBDA_BC(vm.fn));
         cpool = (ray_t **)ray_data(LAMBDA_CONSTS(vm.fn));
         ip = trap.handler_ip;
-        PUSH(err_val);
+        if (!trap.value) PUSH(err_val);
         DISPATCH();
     }
 

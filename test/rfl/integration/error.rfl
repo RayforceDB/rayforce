@@ -7,12 +7,12 @@
 ;; ========== NESTED TRY ==========
 (try (try (raise "inner") (fn [e] (raise "outer"))) (fn [e] 42)) -- 42
 ;; ========== TRY INSIDE A FUNCTION ==========
-;; A runtime error hands the handler 0 inside a function as at the top
-;; level.  The compiled path handed it the error object itself, which is
-;; not refcounted: a handler returning it rethrew it, and none freed it.
-(try (+ 1 'a) (fn [e] e)) -- 0
-((fn [x] (try (+ x 'a) (fn [e] e))) 1) -- 0
-((fn [x] (try (+ x 'a) (fn [e] (type e)))) 1) -- 'i64
+;; A runtime error hands the handler a dict of its code and message inside
+;; a function as at the top level, never the error object itself: that is
+;; not refcounted, so a handler returning it rethrew it, and none freed it.
+(try (+ 1 'a) (fn [e] e)) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
+((fn [x] (try (+ x 'a) (fn [e] e))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
+((fn [x] (try (+ x 'a) (fn [e] (type e)))) 1) -- 'DICT
 ((fn [x] (try (raise x) (fn [e] (+ e 1)))) 1) -- 2
 ((fn [x] (try (try (raise x) (fn [e] (raise (+ e 10)))) (fn [e] e))) 1) -- 11
 ((fn [x] (try (+ x 'a) 7)) 1) -- 7
