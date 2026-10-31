@@ -45,6 +45,7 @@ void     ray_env_destroy(void);
 ray_t*    ray_env_get(int64_t sym_id);
 /* Borrowed flat global binding, ignoring local/query frames. */
 ray_t*    ray_env_get_global(int64_t sym_id);
+ray_t*    ray_env_path_get(ray_t* head, int64_t sym_id);
 ray_t*    ray_env_get_local(int64_t sym_id);
 /* A dotted name's leaf sits under a global chain of dicts held only once. */
 bool      ray_env_dotted_sole(int64_t sym_id, ray_t* leaf);
