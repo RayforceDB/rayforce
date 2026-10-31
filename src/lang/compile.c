@@ -832,6 +832,43 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     }
 }
 
+/* `head.k...` read below a head already loaded from a local slot (see
+ * compile_dotted_local).  Undefined is a name error, as for the name read
+ * whole by the tree walker. */
+static ray_t* dotted_local_get(ray_t* head, ray_t* name) {
+    ray_t* v = ray_env_path_get(head, name->i64);
+    if (v) return v;
+    ray_t* s = ray_sym_str(name->i64);   /* borrowed */
+    return ray_error("name", "'%.*s' undefined",
+                     s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
+}
+
+/* A dotted name whose head is a local: load the head as the name alone
+ * would load, then walk the remaining segments (ray_env_path_get, the walk
+ * the tree walker applies past a head).  False, emitting nothing, when a
+ * later segment names a local too: the walk's accessor step would find
+ * that local in an eval window, so the caller keeps the dynamic form. */
+static bool compile_dotted_local(compiler_t *c, ray_t *ast) {
+    const int64_t *segs = NULL;
+    int n = ray_sym_segs(ast->i64, &segs);
+    if (n < 2 || find_local(c, segs[0]) < 0) return false;
+    for (int i = 1; i < n; i++)
+        if (find_local(c, segs[i]) >= 0) return false;
+    static _Thread_local ray_t *path_fn = NULL;
+    if (!path_fn) {
+        path_fn = ray_fn_binary("dotted-local-get", RAY_FN_NONE, dotted_local_get);
+        if (!path_fn || RAY_IS_ERR(path_fn)) { path_fn = NULL; return false; }
+    }
+    emit_const(c, add_constant(c, path_fn));
+    ray_t *head = ray_sym(segs[0]);
+    if (!head || RAY_IS_ERR(head)) { c->error = true; return true; }
+    compile_expr(c, head);
+    ray_release(head);
+    emit_const(c, add_constant(c, ast));
+    emit_call_op(c, path_fn, true, 2);
+    return true;
+}
+
 /* ── Compile a list (special form or function call) ── */
 /* compile_list dispatches each special form to a function of its own
  * rather than compiling them all in one body.  The arms recurse into
@@ -854,7 +891,9 @@ static void compile_list(compiler_t *c, ray_t *ast) {
      * builtin is the callee, as it is on the tree walker, where the name
      * resolves through the scope frames first. */
     bool head_local = head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
-                      find_local(c, head->i64) >= 0;
+                      (find_local(c, head->i64) >= 0 ||
+                       /* `d.f` with d a local: the callee is read through d */
+                       (ray_sym_is_dotted(head->i64) && sym_is_local_ref(c, head->i64)));
 
     /* Check for special forms by name (name ref = unflagged default) */
     if (head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) && !head_local) {
@@ -912,8 +951,10 @@ static void compile_expr_at(compiler_t *c, ray_t *ast) {
                 emit(c, (uint8_t)(idx & 0xFF));
             } else if (ray_sym_is_dotted(ast->i64) && sym_is_local_ref(c, ast->i64)) {
                 /* A member of a local dictionary must resolve through this
-                 * frame, not a same-named global root. */
-                compile_dyn_form(c, ast, true);
+                 * frame, not a same-named global root: read the head's slot
+                 * and walk the rest, or evaluate the name in a window. */
+                if (!compile_dotted_local(c, ast))
+                    compile_dyn_form(c, ast, true);
             } else if (ast->i64 == sf_self) {
                 /* `self` as a value is the running lambda, as the tree
                  * walker binds it in every call frame. */

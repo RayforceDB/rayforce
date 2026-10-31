@@ -610,6 +610,7 @@ ray_t* ray_env_resolve(int64_t sym_id) {
 }
 
 static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee);
+RAY_INLINE ray_t* env_walk_path(ray_t* v, const int64_t* segs, int n);
 ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
     return env_resolve_impl(sym_id, rows, false);
 }
@@ -676,10 +677,18 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     int n = ray_sym_segs(sym_id, &segs);
     if (n < 2) return NULL;
 
+    return env_walk_path(env_lookup_flat_impl(segs[0], rows, in_callee), segs, n);
+}
+
+/* The dotted walk below a resolved head `v` (borrowed): segs[1..n-1] as
+ * linked-column derefs, container probes or unary accessors, in that
+ * order.  An owned result, NULL when a segment names nothing, or the error
+ * a column load raised.  Inlined: as a call of its own it cost a resolve
+ * of a global dotted name about 4% in a loop of such reads. */
+RAY_INLINE ray_t* env_walk_path(ray_t* v, const int64_t* segs, int n) {
     /* `v` is either a borrowed env/container pointer (fresh=false) or a
      * fresh temporal-extract result (fresh=true).  When switching between
      * the two we must release the previous fresh value to avoid leaks. */
-    ray_t* v = env_lookup_flat_impl(segs[0], rows, in_callee);
     bool   fresh = false;
 
     for (int i = 1; v && i < n; i++) {
@@ -763,6 +772,16 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     if (!v) return NULL;
     if (!fresh) ray_retain(v);   /* hand back an owned ref */
     return v;
+}
+
+/* A dotted name read below an already loaded head (compiled code that holds
+ * the head in a local slot): the walk ray_env_resolve applies past the
+ * head.  An owned result, NULL when undefined, or an error. */
+ray_t* ray_env_path_get(ray_t* head, int64_t sym_id) {
+    const int64_t* segs;
+    int n = ray_sym_segs(sym_id, &segs);
+    if (n < 2 || !head) return NULL;
+    return env_walk_path(head, segs, n);
 }
 
 /* Flat-binding helpers: mutate a specific scope (global or top frame) by

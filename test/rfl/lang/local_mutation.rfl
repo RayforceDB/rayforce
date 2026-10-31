@@ -159,3 +159,17 @@ capv -- [50 60]
 (at (select {a: ((fn [p] (let q (til 3)) (alter 'q set 0 p) (sum q)) x) from: lmT}) 'a) -- [4 5 6]
 (at (select {a: ((fn [p] (alter 'p set 0 7) (concat p x)) (enlist x)) from: lmT}) 'a) -- (list [7 1] [7 2] [7 3])
 
+;; A dotted call head rooted in a local calls through the local, as a read
+;; of the same name does; the global root keeps its own member.
+(set d (dict [f v] (list neg [50 60])))
+((fn [] (let d (dict [f v] (list (fn [x] (* x 10)) [1 2]))) d.v)) -- [1 2]
+((fn [] (let d (dict [f v] (list (fn [x] (* x 10)) [1 2]))) (d.f 3))) -- 30
+((fn [d] (d.f 4)) (dict [f] (list (fn [x] (+ x 1))))) -- 5
+(d.f 3) -- -3
+;; ... dotted local reads walk the path below the slot: nested members,
+;; temporal accessors, a missing member, a head bound later in the body
+((fn [] (let n (dict [a] (list (dict [b] (list 7))))) n.a.b)) -- 7
+((fn [] (let ts 2024.01.15D09:30:00.000000000) ts.hh)) -- 9
+((fn [] (let d (dict [v] (list 1))) (try d.w (fn [e] 'missing)))) -- 'missing
+((fn [] (let r d.v) (let d (dict [v] (list 99))) r)) -- [50 60]
+((fn [] (let v 5) (let d (dict [v] (list [1 2]))) d.v)) -- [1 2]
