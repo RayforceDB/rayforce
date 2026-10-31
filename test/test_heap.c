@@ -52,6 +52,7 @@
 #define RAY_HEAP_DECAY_MS_TEST_DEFAULT 10000
 #include "ops/ops.h"
 #include <string.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -6208,6 +6209,117 @@ static test_result_t test_relieve_futile_unmap(void)         { return relieve_un
 
 /* ---- Suite definition -------------------------------------------------- */
 
+
+/* ---- ray_alloc_zeroed --------------------------------------------------- *
+ *
+ * Every byte reads as zero whatever block the heap hands out: a slab block,
+ * a buddy block, a direct mapping, and each of them again after a dirty
+ * free, when the block comes back from the slab cache, the freelist or the
+ * direct-block cache with its old contents.  The last size is a direct
+ * block zeroed across the pool when one is live. */
+static bool heap_all_zero(const void* p, size_t n) {
+    const unsigned char* b = (const unsigned char*)p;
+    for (size_t i = 0; i < n; i++) if (b[i]) return false;
+    return true;
+}
+
+static test_result_t test_alloc_zeroed_sizes(void) {
+    /* A live pool, so the blocks of 4 MB and more are zeroed across it:
+     * buddy blocks of 8 and 16 MB (never fresh), and direct blocks, one of
+     * them with a last chunk shorter than the rest. */
+    TEST_ASSERT_NOT_NULL(ray_pool_get());
+    static const size_t sizes[] = { 1, 64, 4096, (size_t)1 << 20, (size_t)8 << 20,
+                                    ((size_t)16 << 20) - 4096, (size_t)40 << 20,
+                                    ((size_t)40 << 20) + 4097 };
+    for (int query = 0; query < 2; query++)
+    for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+        size_t n = sizes[s];
+        for (int round = 0; round < 3; round++) {
+            ray_t* v = query ? ray_alloc_zeroed_query(n) : ray_alloc_zeroed(n);
+            TEST_ASSERT_NOT_NULL(v);
+            TEST_ASSERT_FMT(heap_all_zero(ray_data(v), n),
+                            "%s size %zu round %d: a zeroed block reads dirty",
+                            query ? "query" : "plain", n, round);
+            memset(ray_data(v), 0xA5, n);   /* dirty it for the next round */
+            ray_free(v);
+        }
+    }
+    PASS();
+}
+
+/* A query cancelled during the zeroing dispatch has its tasks skipped: the
+ * block must still come back zero (zeroed on the calling thread).  The
+ * block is a dirty one from the direct-block cache, as the committed bytes
+ * prove, so a skipped zeroing would show. */
+static test_result_t test_alloc_zeroed_under_cancel(void) {
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    const size_t n = (size_t)40 << 20;
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark((int64_t)n * 16 * 32);
+    ray_t* v = ray_alloc_zeroed_query(n);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t committed = ray_heap_anon_committed();
+    memset(ray_data(v), 0xA5, n);
+    ray_free(v);                              /* parked dirty in the direct cache */
+    atomic_store_explicit(&pool->cancelled, 1, memory_order_release);
+    v = ray_alloc_zeroed_query(n);            /* the pool skips the zeroing tasks */
+    atomic_store_explicit(&pool->cancelled, 0, memory_order_release);
+    bool reused = v && ray_heap_anon_committed() == committed;
+    bool zero = v && heap_all_zero(ray_data(v), n);
+    if (v) ray_free(v);
+    ray_heap_direct_cache_drain();
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT(reused, "the second block did not come from the direct cache");
+    TEST_ASSERT(zero, "a zeroed block reads dirty after a cancelled zeroing dispatch");
+    PASS();
+}
+
+/* The raw allocator any thread may call never dispatches: the pool takes
+ * tasks from one dispatcher.  With the cancel-at hook armed, a dispatch
+ * would cancel the pool; dirty blocks of every class, from the calling
+ * thread and from a thread outside the pool, come back zero and leave the
+ * pool as it was. */
+typedef struct { size_t n; bool ok; } heap_raw_thread_t;
+static void* heap_raw_thread(void* arg) {
+    heap_raw_thread_t* t = (heap_raw_thread_t*)arg;
+    t->ok = true;
+    for (int round = 0; round < 3; round++) {
+        uint8_t* p = (uint8_t*)ray_calloc_raw(t->n);
+        if (!p || !heap_all_zero(p, t->n)) { t->ok = false; if (p) ray_free_raw(p); break; }
+        memset(p, 0xA5, t->n);
+        ray_free_raw(p);
+    }
+    ray_heap_destroy();                       /* the thread's own heap */
+    return NULL;
+}
+
+static test_result_t test_calloc_raw_never_dispatches(void) {
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    ray_pool_test_cancel_at(1, true);         /* the next dispatch cancels the pool */
+    static const size_t sizes[] = { (size_t)8 << 20, (size_t)40 << 20 };
+    bool ok = true;
+    for (size_t s = 0; s < 2 && ok; s++)
+        for (int round = 0; round < 3 && ok; round++) {
+            uint8_t* p = (uint8_t*)ray_calloc_raw(sizes[s]);
+            ok = p && heap_all_zero(p, sizes[s]);
+            if (p) { memset(p, 0xA5, sizes[s]); ray_free_raw(p); }
+        }
+    heap_raw_thread_t t = { (size_t)8 << 20, false };
+    pthread_t th;
+    bool started = pthread_create(&th, NULL, heap_raw_thread, &t) == 0;
+    if (started) pthread_join(th, NULL);
+    bool cancelled = atomic_load_explicit(&pool->cancelled, memory_order_acquire) != 0;
+    ray_pool_test_cancel_at(0, false);
+    atomic_store_explicit(&pool->cancelled, 0, memory_order_release);
+    TEST_ASSERT(ok, "a raw zeroed block reads dirty");
+    TEST_ASSERT(started && t.ok, "a raw zeroed block from a thread outside the pool reads dirty");
+    TEST_ASSERT(!cancelled, "the raw allocator dispatched to the pool");
+    PASS();
+}
+
 const test_entry_t heap_entries[] = {
     { "heap/slab_overflow",            test_slab_overflow_falls_through, heap_setup, heap_teardown },
     { "heap/multi_pool_growth",        test_multi_pool_growth,           heap_setup, heap_teardown },
@@ -6348,5 +6460,8 @@ const test_entry_t heap_entries[] = {
     { "heap/idle_decay_threshold",     test_idle_decay_respects_threshold, heap_setup, heap_teardown },
     { "heap/release_now_threshold",    test_release_now_ignores_threshold, heap_setup, heap_teardown },
     { "heap/release_now_direct_cache", test_release_now_drains_direct_cache, heap_setup, heap_teardown },
+    { "heap/alloc_zeroed_sizes",       test_alloc_zeroed_sizes,          heap_setup, heap_teardown },
+    { "heap/alloc_zeroed_under_cancel",test_alloc_zeroed_under_cancel,   heap_setup, heap_teardown },
+    { "heap/calloc_raw_never_dispatches", test_calloc_raw_never_dispatches, heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };

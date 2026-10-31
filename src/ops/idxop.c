@@ -1245,11 +1245,14 @@ ray_t* ray_index_dict_compute(ray_t* v) {
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx) {
     if (!idx || RAY_IS_ERR(idx) || idx->type != RAY_INDEX)
         return ray_error("type", "attach_built: not an index object");
-    bool is_dict = (ray_index_payload(idx)->kind == RAY_IDX_DICT);
-    bool is_hash = (ray_index_payload(idx)->kind == RAY_IDX_HASH);
+    ray_index_t* ix = ray_index_payload(idx);
+    bool is_dict = ix->kind == RAY_IDX_DICT;
+    bool is_hash = ix->kind == RAY_IDX_HASH;
+    bool is_marker = ix->kind == RAY_IDX_NONE && (ix->markers & RAY_MARK_UNIQUE);
     /* STR carries the dict and (since the vector-needle find work) the hash;
      * SYM carries the hash.  rc=1 → ray_cow no-op. */
-    ray_t* v = prepare_attach_ex(vp, "index", is_dict || is_hash, is_hash);
+    ray_t* v = prepare_attach_ex(vp, "index", is_dict || is_hash || is_marker,
+                                 is_hash || is_marker);
     if (RAY_IS_ERR(v)) return v;
     return attach_finalize(v, idx);
 }

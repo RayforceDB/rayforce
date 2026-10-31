@@ -2926,6 +2926,44 @@ static test_result_t test_cd_fused_skewed(void) {
     PASS();
 }
 
+/* Tables that start at 1024 slots and double (phase 2): four million rows
+ * over 1024 partitions.  Three keys over a million values each, the last
+ * 1.2M rows repeating pairs seen before the pair tables doubled, so a pair
+ * lost in a doubling is counted twice; and 262144 keys of sixteen values,
+ * so the key tables double too (a key lost there opens a second group that
+ * phase 3 joins again: only a crash or a hang would show).  Every group is
+ * checked against the reference: key, count and first row. */
+static test_result_t test_cd_fused_tables_grow(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int64_t n = 4194304;
+    const struct { int64_t nk, nv; int many_keys; } cases[] = {
+        { 3, 1000000, 0 },
+        { 262144, 16, 1 },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* k = ray_vec_new(RAY_I64, n);
+        ray_t* v = ray_vec_new(RAY_I64, n);
+        TEST_ASSERT_NOT_NULL(k);
+        TEST_ASSERT_NOT_NULL(v);
+        int64_t* kd = (int64_t*)ray_data(k);
+        int64_t* vd = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < n; i++) {
+            if (cases[c].many_keys) { kd[i] = i % 262144; vd[i] = i / 262144; }
+            else                    { kd[i] = i % 3;      vd[i] = i % 1000000; }
+        }
+        k->len = n; v->len = n;
+        ray_t* r = ray_cd_fused(k, v, n);
+        TEST_ASSERT_FMT(r != NULL, "case %zu: the fused kernel declined", c);
+        test_result_t chk = cdf_verify(r, kd, vd, n, cases[c].nk, cases[c].nv);
+        if (chk.status != TEST_PASS) return chk;
+        ray_release(r); ray_release(k); ray_release(v);
+    }
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Self-correlated columns: v == k on every row.  A symmetric pair-hash combine
  * (hash(k) ^ hash(v)) cancels to zero here, sending every row to partition 0 at
  * dedupe slot 0 — a single serial probe cluster that took minutes on 20M rows.
@@ -3035,5 +3073,6 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/cd_fused_narrow_types",         test_cd_fused_narrow_types,         NULL, NULL },
     { "group_extra/cd_fused_skewed",               test_cd_fused_skewed,               NULL, NULL },
     { "group_extra/cd_fused_self",                 test_cd_fused_self,                 NULL, NULL },
+    { "group_extra/cd_fused_tables_grow",          test_cd_fused_tables_grow,          NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

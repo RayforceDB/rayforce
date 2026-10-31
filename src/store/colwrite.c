@@ -345,6 +345,9 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     ray_err_t e = !buf ? RAY_ERR_OOM : (!f ? RAY_ERR_IO : RAY_OK);
     ray_encw_t ew; memset(&ew, 0, sizeof ew);
     if (e == RAY_OK) e = ray_encw_begin(&ew, f, type, attrs, s->len, sc, ik, cf);
+    /* the codes are positions of the target domain, else runtime ids */
+    if (e == RAY_OK && type == RAY_SYM)
+        ray_encw_set_sym_domain(&ew, w->target_dom ? w->target_dom : ray_sym_runtime_domain());
     if (e == RAY_OK && idx_root) {
         /* the source attrs, as colw_gen2_vec passes them: finish writes the
          * region at the column's final persisted attrs (SYM PART keys at

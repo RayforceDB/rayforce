@@ -8,6 +8,7 @@
 #include "mem/heap.h"
 #include "store/fileio.h"
 #include "store/encfmt.h"   /* ray_col_gen_of */
+#include "store/enccol.h"   /* ray_enccol_chunk_pfx: SYM prefix bounds */
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "table/table.h"
@@ -3722,6 +3723,82 @@ static int64_t pq_col_distinct(const char* dir, int c) {
     ray_release(t);
     return n;
 }
+/* The prefix of a string as RAY_ENC_SYM_PFX stores it. */
+static uint32_t pq_pfx4(const char* p, size_t n) {
+    uint32_t x = 0;
+    for (size_t i = 0; i < 4; i++) x = (x << 8) | (i < n ? (uint8_t)p[i] : 0u);
+    return x;
+}
+/* A compressed import writes the string-prefix bounds of its SYM columns
+ * (RAY_ENC_SYM_PFX) whichever symbol file the column resolves through: the
+ * shared .sym (the import dictionary while the columns are encoded) and its
+ * own (symfile 'column).  Every chunk's and vector's bounds are the
+ * minimum and maximum prefix of its non-null strings, read back here. */
+static test_result_t test_pq_sym_prefix_bounds(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], sym[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-pfx-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-pfx-%d", (int)getpid());
+    const char* names[] = {"x","s","t"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const int64_t rows = 140000;                       /* three chunks, the last partial */
+    pq_synth_t = NULL; pq_synth_dict = 0;
+    TEST_ASSERT_TRUE(pq_synth(src, rows, 5, pq_synth_mixed));
+    TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
+    const char* layouts[] = {"shared", "column"};
+    for (int l = 0; l < 2; l++) {
+        ray_t* opts = pq_symcol_opts(types, layouts[l], true);
+        size_t cap = (size_t)1 << 16;
+        char* trace = (char*)ray_sys_alloc(cap);
+        TEST_ASSERT_TRUE(trace != NULL);
+        ray_t* res = pq_traced_import(src, dir, opts, trace, cap);
+        ray_sys_free(trace);
+        ray_release(opts);
+        TEST_ASSERT_FMT(res && !RAY_IS_ERR(res), "%s: import failed", layouts[l]);
+        ray_release(res);
+        snprintf(sym, sizeof(sym), "%s/.sym", dir);
+        ray_t* t = ray_read_splayed(dir, l == 0 ? sym : NULL);
+        TEST_ASSERT_FMT(t && !RAY_IS_ERR(t), "%s: read back", layouts[l]);
+        for (int c = 1; c < 3; c++) {
+            ray_t* encv = ray_table_get_col_enc_idx(t, c);
+            TEST_ASSERT_FMT(encv != NULL, "%s: column %s is not encoded", layouts[l], names[c]);
+            ray_enccol_t* e = ray_enccol_of(encv);
+            ray_t* col = ray_table_get_col_idx(t, c);
+            TEST_ASSERT_TRUE(col && col->type == RAY_SYM && col->len == rows);
+            for (int64_t v = 0; v * RAY_ENC_VEC < rows; v++) {
+                uint32_t mn = UINT32_MAX, mx = 0; bool have = false;
+                for (int64_t r = v * RAY_ENC_VEC; r < rows && r < (v + 1) * RAY_ENC_VEC; r++) {
+                    if (ray_read_sym(ray_data(col), r, RAY_SYM, col->attrs) == 0) continue;   /* null */
+                    ray_t* a = ray_sym_vec_cell(col, r);
+                    uint32_t p = pq_pfx4(ray_str_ptr(a), ray_str_len(a));
+                    if (p < mn) mn = p;
+                    if (p > mx) mx = p;
+                    have = true;
+                }
+                const ray_enc_desc_t* d = &ray_enccol_descs(e, v / RAY_ENC_VECS_PER_CHUNK)[v % RAY_ENC_VECS_PER_CHUNK];
+                TEST_ASSERT_FMT(have == ((d->flags & RAY_ENC_SYM_PFX) != 0), "%s %s vector %lld: bounds %d, values %d",
+                                layouts[l], names[c], (long long)v, (d->flags & RAY_ENC_SYM_PFX) != 0, have);
+                if (have) TEST_ASSERT_FMT(d->rsv1 == mn && d->rsv2 == mx, "%s %s vector %lld: [%08x %08x], want [%08x %08x]",
+                                          layouts[l], names[c], (long long)v, d->rsv1, d->rsv2, mn, mx);
+            }
+            for (int64_t ch = 0; ch < e->n_chunks; ch++) {
+                uint32_t mn, mx;
+                TEST_ASSERT_FMT(ray_enccol_chunk_pfx(e, ch, &mn, &mx), "%s %s chunk %lld: no bounds",
+                                layouts[l], names[c], (long long)ch);
+                TEST_ASSERT_TRUE(mn <= mx);
+            }
+        }
+        ray_release(t);
+        if (l == 0) pq_remove_native(dir, names, 3); else pq_remove_symcol(dir, names, 3);
+        snprintf(sym, sizeof(sym), "%s/.sym", dir); unlink(sym);
+        snprintf(sym, sizeof(sym), "%s/.sym.ix", dir); unlink(sym);
+    }
+    unlink(src);
+    ray_release(types);
+    PASS();
+}
+
 /* symfile 'column: each symbol column its own symbol file, `.s.sym` and
  * `.t.sym`, and no `.sym`.  Every row's string is the shared import's; each
  * file holds its column's distinct strings and "" (t's vocabulary meets
@@ -4047,6 +4124,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
     {"parquet/native_dictionary",test_pq_native_dictionary,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
+    {"parquet/sym_prefix_bounds",test_pq_sym_prefix_bounds,pq_setup,pq_teardown},
     {"parquet/sym_grouped",test_pq_sym_grouped,pq_setup,pq_teardown},
     {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
     {"parquet/sym_grouped_layout",test_pq_sym_grouped_layout,pq_setup,pq_teardown},

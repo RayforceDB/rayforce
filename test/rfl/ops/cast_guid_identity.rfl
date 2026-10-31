@@ -1,0 +1,22 @@
+;; (as 'GUID v) on a GUID vector is the identity, like any same-type cast.
+;; It raised "as: cannot cast GUID to guid" for a non-empty GUID vector.
+(set g (at (guid 1) 0))
+(type (as 'GUID (enlist g))) -- 'GUID
+(== (as 'GUID (enlist g)) (enlist g)) -- [true]
+(count (as 'GUID (guid 5))) -- 5
+(set v (guid 3))
+(== (as 'GUID v) v) -- [true true true]
+(type (as 'GUID (as 'GUID []))) -- 'GUID
+(type (as 'GUID g)) -- 'guid
+
+;; a GUID vector holding a null keeps its values and its null
+(set n (concat (guid 2) (enlist 0Ng)))
+(type (as 'GUID n)) -- 'GUID
+(nil? (as 'GUID n)) -- [false false true]
+(== (as 'GUID n) n) -- [true true true]
+
+;; a sliced GUID vector
+(set s (drop (guid 3) 1))
+(type (as 'GUID s)) -- 'GUID
+(count (as 'GUID s)) -- 2
+(== (as 'GUID s) s) -- [true true]
