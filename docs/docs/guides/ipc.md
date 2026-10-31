@@ -147,8 +147,9 @@ Instead of strings, construct the query as a list. Builtins resolve to function 
 ;; => [0 2 4 6 8 10 12 14 16 18]
 ```
 
-When constructing a request with `list`, a nested list headed by a quoted
-symbol is data: `(list 'upd (list 'in 1 2))` passes `['in 1 2]` to `upd`.
+When constructing a request with `list`, a nested list headed by a symbol
+(quoted or unquoted) is data: `(list 'upd (list 'in 1 2))` passes `['in 1 2]`
+to `upd`. An unquoted `(quote value)` argument still evaluates to `value`.
 A nested list headed by a function value still runs on the server, as
 `(list til 10)` does above. To call a function whose name was previously
 sent as a quoted symbol head, send the function value instead (for example,
