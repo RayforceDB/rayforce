@@ -99,6 +99,10 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * not on the server's.  Default sync messages still get the bare
  * result, so existing IPC clients are unaffected. */
 #define RAY_IPC_FLAG_VERBOSE    0x04
+/* Persisted on newly written IPC journal frames.  Replay applies the
+ * symbol-headed argument rule only when this bit is present, so older
+ * journals keep the evaluation contract under which they were recorded. */
+#define RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS 0x08
 #define RAY_IPC_MAX_CONNS 256
 
 /* ===== Connection hooks (.ipc.on.*) ===== */

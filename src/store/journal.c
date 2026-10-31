@@ -278,7 +278,7 @@ static bool decompress_if_needed(const ray_ipc_header_t* hdr,
 
 /* Evaluate a deserialized message exactly as eval_payload would: string
  * payloads run through ray_eval_str, everything else through ray_eval. */
-static ray_t* eval_one(ray_t* msg) {
+static ray_t* eval_one(ray_t* msg, bool literal_symbol_args) {
     if (!msg || RAY_IS_ERR(msg)) return msg;
     if (msg->type == -RAY_STR) {
         const char* s = ray_str_ptr(msg);
@@ -292,6 +292,7 @@ static ray_t* eval_one(ray_t* msg) {
         ray_sys_free(tmp);
         return r;
     }
+    if (literal_symbol_args) ray_eval_mark_ipc_literal_args(msg);
     return ray_eval(msg);
 }
 
@@ -429,7 +430,7 @@ static ray_err_t journal_replay_from(const char*           path,
          * no IPC connection context. */
         bool prev_restricted = ray_eval_get_restricted();
         ray_eval_set_restricted(hdr.flags & RAY_IPC_FLAG_RESTRICTED);
-        ray_t* result = eval_one(msg);
+        ray_t* result = eval_one(msg, (hdr.flags & RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS) != 0);
         ray_eval_set_restricted(prev_restricted);
         ray_release(msg);
 

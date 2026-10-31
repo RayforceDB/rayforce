@@ -89,7 +89,7 @@ static void jrn_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
 /* ── Helper: write a well-formed journal entry for `val` to file `f` ── */
 
-static bool write_journal_entry(FILE* f, ray_t* val) {
+static bool write_journal_entry_flags(FILE* f, ray_t* val, uint8_t flags) {
     int64_t psize = ray_serde_size(val);
     if (psize <= 0) return false;
     uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
@@ -101,12 +101,17 @@ static bool write_journal_entry(FILE* f, ray_t* val) {
     memset(&hdr, 0, sizeof(hdr));
     hdr.prefix  = RAY_SERDE_PREFIX;
     hdr.version = RAY_SERDE_WIRE_VERSION;
+    hdr.flags   = flags;
     hdr.size    = psize;
 
     bool ok = (fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)) &&
               (fwrite(buf, 1, (size_t)psize, f) == (size_t)psize);
     ray_sys_free(buf);
     return ok;
+}
+
+static bool write_journal_entry(FILE* f, ray_t* val) {
+    return write_journal_entry_flags(f, val, 0);
 }
 
 /* ── Helper: create a temp path and optionally get .log / .qdb paths ── */
@@ -417,6 +422,83 @@ static test_result_t test_journal_replay_clean_single(void) {
     TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
     TEST_ASSERT_EQ_I(chunks, 1);
     TEST_ASSERT_EQ_I(errs, 0);
+
+    cleanup_base(base);
+    PASS();
+}
+
+static test_result_t test_journal_replay_literal_args(void) {
+    char base[256]; make_base(base, sizeof(base), "literal_args");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    ray_t* setup = ray_eval_str("(set ipc_lit_upd (fn [m] (set ipc_lit_state m)))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    FILE* f = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    ray_t* msg = ray_eval_str("(list 'ipc_lit_upd (list 'in 1 2))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+    TEST_ASSERT_TRUE(write_journal_entry_flags(f, msg, RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS));
+    fclose(f);
+
+    int64_t chunks = 0, errs = 0;
+    ray_jreplay_status_t status = RAY_JREPLAY_OK;
+    TEST_ASSERT_EQ_I(ray_journal_replay(lpath, &chunks, &errs, &status), RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    ray_t* state = ray_eval_str("ipc_lit_state");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(state));
+    TEST_ASSERT_EQ_I(state->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(state->len, 3);
+    ray_t* head = ray_list_get(state, 0);
+    TEST_ASSERT_EQ_I(head->type, -RAY_SYM);
+    TEST_ASSERT_EQ_I(head->i64, ray_sym_intern("in", 2));
+    ray_release(state);
+
+    /* Flagged frames must evaluate a real (quote x) argument exactly as
+     * the live IPC path does, including after journal replay. */
+    FILE* quoted_log = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(quoted_log);
+    ray_t* quoted = ray_list_new(2);
+    ray_t* item = ray_sym(ray_sym_intern("quote", 5));
+    ray_list_append(quoted, item); ray_release(item);
+    item = ray_i64(42);
+    ray_list_append(quoted, item); ray_release(item);
+    ray_t* quoted_msg = ray_list_new(2);
+    item = ray_sym(ray_sym_intern("ipc_lit_upd", 11));
+    ray_list_append(quoted_msg, item); ray_release(item);
+    ray_list_append(quoted_msg, quoted); ray_release(quoted);
+    TEST_ASSERT_TRUE(write_journal_entry_flags(quoted_log, quoted_msg,
+                                               RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS));
+    ray_release(quoted_msg);
+    fclose(quoted_log);
+    TEST_ASSERT_EQ_I(ray_journal_replay(lpath, &chunks, &errs, &status), RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    ray_t* quoted_state = ray_eval_str("ipc_lit_state");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(quoted_state));
+    TEST_ASSERT_EQ_I(quoted_state->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(quoted_state->i64, 42);
+    ray_release(quoted_state);
+
+    /* A pre-fix journal has no semantics bit: replay the callable symbol
+     * head under the contract in force when that frame was recorded. */
+    FILE* old = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(old);
+    TEST_ASSERT_TRUE(write_journal_entry(old, msg));
+    ray_release(msg);
+    fclose(old);
+    TEST_ASSERT_EQ_I(ray_journal_replay(lpath, &chunks, &errs, &status), RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    ray_t* legacy = ray_eval_str("ipc_lit_state");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(legacy));
+    TEST_ASSERT_EQ_I(legacy->type, -RAY_BOOL);
+    TEST_ASSERT_FALSE(legacy->b8);
+    ray_release(legacy);
 
     cleanup_base(base);
     PASS();
@@ -2792,6 +2874,7 @@ const test_entry_t journal_entries[] = {
     /* Replay */
     { "journal/replay_no_file",            test_journal_replay_no_file,            jrn_setup, jrn_teardown },
     { "journal/replay_clean_single",       test_journal_replay_clean_single,       jrn_setup, jrn_teardown },
+    { "journal/replay_literal_args",        test_journal_replay_literal_args,        jrn_setup, jrn_teardown },
     { "journal/replay_empty",              test_journal_replay_empty,              jrn_setup, jrn_teardown },
     { "journal/replay_badtail_short_hdr",  test_journal_replay_badtail_short_hdr,  jrn_setup, jrn_teardown },
     { "journal/replay_badtail_bad_prefix", test_journal_replay_badtail_bad_prefix, jrn_setup, jrn_teardown },

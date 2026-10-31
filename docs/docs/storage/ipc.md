@@ -157,6 +157,15 @@ Non-string values are evaluated directly on the server via `ray_eval`. Construct
 ;; => [0 2 4 6 8 10 12 14 16 18]
 ```
 
+In a request built with `list`, a nested list headed by a symbol (quoted or
+unquoted) is passed as data: `(list 'upd (list 'in 1 2))` gives `upd` the list
+`['in 1 2]`. An unquoted `(quote value)` argument still evaluates to `value`.
+A nested list headed by a function value still runs on the server, as
+`(list til 10)` does above. Clients that deliberately sent a quoted symbol
+head to call it can send the function value instead (for example,
+`(list in 1 2)`) or send a source string. Newly written journal frames
+record this rule; older frames replay under their original rule.
+
 For dynamic queries, substitute values into the dict at construction time:
 
 ```text

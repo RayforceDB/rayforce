@@ -65,16 +65,6 @@
 #include "lang/internal.h"
 #include "table/sym.h"
 
-static void mark_ipc_literal_fallbacks(ray_t* obj) {
-    if (!obj || RAY_IS_ERR(obj) || obj->type != RAY_LIST)
-        return;
-
-    obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
-    ray_t** elems = (ray_t**)ray_data(obj);
-    for (int64_t i = 0; i < ray_len(obj); i++)
-        mark_ipc_literal_fallbacks(elems[i]);
-}
-
 /* ===== Compression (delta + RLE) ===== */
 
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
@@ -616,12 +606,13 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     /* Journal hook: log every inbound SYNC message (state-mutation
      * channel in the IPC model) before evaluation, so a crash mid-handler
      * still leaves the message on disk for replay.  We write the raw
-     * inbound bytes — header + payload — verbatim, no decompression
-     * round-trip.  Async messages and responses are not logged, so
+     * inbound payload without a decompression round-trip, and a local
+     * header copy records the evaluation rules and connection state.
+     * Async messages and responses are not logged, so
      * background pings and result frames don't pollute the log.
      * No-op when no journal is open or during in-progress replay.
      *
-     * RAY_IPC_FLAG_RESTRICTED is captured into a LOCAL header copy:
+     * RAY_IPC_FLAG_RESTRICTED is captured into that LOCAL header copy:
      * we mark the persisted frame with the connection's restricted
      * state at write time so replay can re-impose it.  Without this
      * a `-U` client's writes silently elevate to full privilege on
@@ -640,6 +631,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         ray_ipc_header_t log_hdr = *hdr;
         if (ray_eval_get_restricted())
             log_hdr.flags |= RAY_IPC_FLAG_RESTRICTED;
+        log_hdr.flags |= RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS;
         ray_err_t je = ray_journal_write_bytes(&log_hdr, payload, (int64_t)payload_len);
         if (je != RAY_OK) {
             fprintf(stderr, "log: ERROR  journal write failed (rc=%d) — refusing to evaluate\n", (int)je);
@@ -679,11 +671,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     ray_t* result = NULL;
     bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
-        if (msg->type == RAY_LIST) {
-            ray_t** elems = (ray_t**)ray_data(msg);
-            for (int64_t i = 1; i < ray_len(msg); i++)
-                mark_ipc_literal_fallbacks(elems[i]);
-        }
+        ray_eval_mark_ipc_literal_args(msg);
 
         /* Dispatch through `.ipc.on.sync` / `.ipc.on.async` hook if
          * installed; otherwise fall back to v1's inline-eval default.
