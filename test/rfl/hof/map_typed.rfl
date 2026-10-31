@@ -1,0 +1,84 @@
+;; Homogeneous atoms become exact-type vectors; no numeric promotion.
+(type (map (fn [x] (+ x 1)) [1 2 3])) -- 'I64
+(map + 10 [1 2 3]) -- [11 12 13]
+(type (pmap + 10 [1 2 3])) -- 'I64
+(type (map (fn [a x] (if (== x 2) a x)) 2.5 [0 1 2])) -- 'LIST
+(type (pmap (fn [x] (enlist x)) [0 1])) -- 'LIST
+(type (map + 10 5)) -- 'i64
+(type (map (fn [x] x) [])) -- 'LIST
+(type (pmap (fn [x] x) [])) -- 'LIST
+
+(set source [1 0Nl 3])
+(type (map (fn [x] x) source)) -- 'I64
+(map (fn [x] x) source) -- source
+(set source (as 'I32 [1 0Nl 3]))
+(type (map (fn [x] x) source)) -- 'I32
+(map (fn [x] x) source) -- source
+(set source (as 'I16 [1 0Nl 3]))
+(type (map (fn [x] x) source)) -- 'I16
+(map (fn [x] x) source) -- source
+(set source [1.5 0Nf 3.5])
+(type (map (fn [x] x) source)) -- 'F64
+(map (fn [x] x) source) -- source
+(set source [1.5e 0Ne 3.5e])
+(type (map (fn [x] x) source)) -- 'F32
+(map (fn [x] x) source) -- source
+(set source [true false true])
+(type (map (fn [x] x) source)) -- 'B8
+(map (fn [x] x) source) -- source
+(set source (as 'U8 [1 2 255]))
+(type (map (fn [x] x) source)) -- 'U8
+(map (fn [x] x) source) -- source
+(set source [2024.01.01 0Nd 2024.01.03])
+(type (map (fn [x] x) source)) -- 'DATE
+(map (fn [x] x) source) -- source
+(set source [01:00:00.000 0Nt 03:00:00.000])
+(type (map (fn [x] x) source)) -- 'TIME
+(map (fn [x] x) source) -- source
+(set source [2024.01.01D00:00:00.000 0Np 2024.01.03D00:00:00.000])
+(type (map (fn [x] x) source)) -- 'TIMESTAMP
+(map (fn [x] x) source) -- source
+(set source [1D 0Nn 3D])
+(type (map (fn [x] x) source)) -- 'TIMESPAN
+(map (fn [x] x) source) -- source
+(set source ['a ' 'b])
+(type (map (fn [x] x) source)) -- 'SYM
+(map (fn [x] x) source) -- source
+(set source (enlist "short" "" "a string longer than inline storage"))
+(type (map (fn [x] x) source)) -- 'STR
+(map (fn [x] x) source) -- source
+(set source (enlist (as 'GUID "12345678-1234-1234-1234-123456789abc") 0Ng))
+(type (map (fn [x] x) source)) -- 'GUID
+(map (fn [x] x) source) -- source
+
+;; Heterogeneous values, generic nulls and nesting remain lists, even when
+;; the first differing item comes after a long homogeneous prefix.
+(type (map (fn [x] (if (== x 2) 2.0 x)) [0 1 2])) -- 'LIST
+(type (map (fn [x] (if (== x 999) 'last x)) (til 1000))) -- 'LIST
+(at (map (fn [x] (if (== x 999) 'last x)) (til 1000)) 999) -- 'last
+(type (map (fn [x] (if (== x 2) (list x) x)) [0 1 2])) -- 'LIST
+(type (map (fn [x] null) [1 2])) -- 'LIST
+(type (map (fn [x] (if (== x 2) null x)) [0 1 2])) -- 'LIST
+(type (map (fn [x] (enlist x)) [1 2])) -- 'LIST
+(map (fn [x] x) (list 1 'a "text" (list 2))) -- (list 1 'a "text" (list 2))
+;; A late differing result must retain exact prefix atom types and nulls.
+(map (fn [x] x) (list 0Ne 1.5e 'last)) -- (list 0Ne 1.5e 'last)
+(map (fn [x] x) (list 1D 0Nn 'last)) -- (list 1D 0Nn 'last)
+(map (fn [x] x) (list "long prefix string beyond inline" "" 'last)) -- (list "long prefix string beyond inline" "" 'last)
+(map (fn [x] x) (list 0Ng 'last)) -- (list 0Ng 'last)
+
+;; Left-to-right, exactly once, including fallback and callback errors.
+(set calls (list))
+(map (fn [x] (set calls (concat calls (list x))) (if (== x 2) 'last x)) [0 1 2 3])
+calls -- (list 0 1 2 3)
+(set calls (list))
+(map (fn [x] (set calls (concat calls (list x))) (if (== x 2) (raise "stop") x)) [0 1 2 3]) !- domain
+calls -- (list 0 1 2)
+(set calls (list))
+(map (fn [x] (set calls (concat calls (list x))) (if (== x 1) 'mixed (if (== x 2) (raise "stop") x))) [0 1 2 3]) !- domain
+calls -- (list 0 1 2)
+
+;; Consumers requiring a boxed list must request that representation.
+(type (concat (list) (map (fn [x] (+ x 1)) [1 2]))) -- 'LIST
+(concat (list) (map (fn [x] (+ x 1)) [1 2])) -- (list 2 3)
+(raze (concat (list) (map (fn [x] (format "x%" x)) [1 2]))) -- "x1x2"
