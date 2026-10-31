@@ -41,7 +41,23 @@ BUILD_INFO := $(GIT_HASH) $(RAY_VERSION) $(BUILD_DATE)
 BUILD_INFO_STAMP := build/.build-info
 $(shell mkdir -p build && { [ "$$(cat $(BUILD_INFO_STAMP) 2>/dev/null)" = "$(BUILD_INFO)" ] || echo "$(BUILD_INFO)" > $(BUILD_INFO_STAMP); })
 
-WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
+WARNS_BASE = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
+# On a host whose CPU reports AVX10.1-256, clang -march=native enables
+# +avx10.1-256 and, when avx512f is enabled as well, promotes it to
+# avx10.1-512.  It reports the promotion as -Winvalid-feature-combination,
+# which -Werror turns into a build failure.  AVX10.1-256 alone does not
+# establish the failure; it is that combination from -march=native.  The
+# diagnostic is demoted back to a visible warning rather than hidden.  This
+# only silences the build error: a compile-only check does not validate the
+# generated code on such a CPU.  CI alternative: RAY_MARCH=x86-64-v3.
+# The option is probed per compiler: clang older than 16 does not know it
+# (and -Werror makes the unknown -Wno-error= name fail every object), and
+# gcc has no such diagnostic and rejects the name, so both get nothing.
+# The fuzz and tsan objects build with $(CLANG), so it is probed separately.
+AVX10_DEMOTE := -Wno-error=invalid-feature-combination
+avx10_demote = $(shell $(1) -Werror $(AVX10_DEMOTE) -x c -fsyntax-only /dev/null 2>/dev/null && echo $(AVX10_DEMOTE))
+WARNS       := $(WARNS_BASE) $(call avx10_demote,$(CC))
+WARNS_CLANG := $(WARNS_BASE) $(call avx10_demote,$(CLANG))
 DEFS    = -DRAYFORCE_GIT_COMMIT=\"$(GIT_HASH)\" -DRAYFORCE_BUILD_DATE=\"$(BUILD_DATE)\" \
           -DRAY_VERSION_MAJOR=$(VERSION_MAJOR) -DRAY_VERSION_MINOR=$(VERSION_MINOR) \
           -DRAY_VERSION_PATCH=$(VERSION_PATCH) -DRAYFORCE_VERSION=\"$(RAY_VERSION)\"
@@ -138,13 +154,13 @@ DEBUG_LDFLAGS   = -fsanitize=address,undefined
 #   (see src/lang/syscmd.c) so eval-based fuzzing stays sandboxed.
 #   Linux-only: the system toolchain on macOS does not bundle the fuzzer
 #   runtime.
-FUZZ_CFLAGS = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG -DRAY_FUZZING \
+FUZZ_CFLAGS = -fPIC $(WARNS_CLANG) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG -DRAY_FUZZING \
   -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer
 
 # tsan: data-race detection for the lock-free pool/heap paths.  Mutually
 # exclusive with address sanitizing, hence its own flavour.  DEBUG is kept
 # so the invariant checks run under it too.
-TSAN_CFLAGS  = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG \
+TSAN_CFLAGS  = -fPIC $(WARNS_CLANG) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG \
   -fsanitize=thread -fno-omit-frame-pointer
 TSAN_LDFLAGS = -fsanitize=thread
 
