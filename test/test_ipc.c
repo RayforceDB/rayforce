@@ -603,7 +603,7 @@ static test_result_t test_ipc_builtin_head_arg_is_data(void) {
     int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
-    const char* setup_src = "(set ipc_echo (fn [x] x))";
+    const char* setup_src = "(set ipc_echo (fn [x] x)) (set ipc_eval (fn [x] (eval x)))";
     ray_t* setup = ray_str(setup_src, strlen(setup_src));
     ray_t* result = ray_ipc_send(h, setup);
     ray_release(setup);
@@ -620,6 +620,28 @@ static test_result_t test_ipc_builtin_head_arg_is_data(void) {
     ray_t* head = ray_list_get(result, 0);
     TEST_ASSERT_EQ_I(head->type, -RAY_SYM);
     TEST_ASSERT_EQ_I(head->i64, ray_sym_intern("in", 2));
+    ray_release(result);
+
+    /* A function object at the head remains a call, as in the documented
+     * (list map ... (list til 10)) request construction. */
+    msg = ray_eval_str("(list 'ipc_echo (list til 10))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+    result = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 10);
+    ray_release(result);
+
+    /* The literal marker is transient: explicit eval in a handler can
+     * still call a symbol-headed list after receiving it as data. */
+    msg = ray_eval_str("(list 'ipc_eval (list 'in 1 2))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+    result = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_BOOL);
+    TEST_ASSERT_FALSE(result->b8);
     ray_release(result);
 
     ray_ipc_close(h);
@@ -1123,6 +1145,15 @@ static test_result_t test_ipc_journal_path(void) {
     ray_test_server_stop(&srv);
 
     ray_journal_close();
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "%s.log", jbase);
+    FILE* log = fopen(log_path, "rb");
+    TEST_ASSERT_NOT_NULL(log);
+    TEST_ASSERT_EQ_I(fseek(log, 16, SEEK_SET), 0); /* generation preamble */
+    ray_ipc_header_t stored;
+    TEST_ASSERT_EQ_I(fread(&stored, 1, sizeof(stored), log), sizeof(stored));
+    TEST_ASSERT_TRUE((stored.flags & RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS) != 0);
+    fclose(log);
     ipc_rm_journal(jbase); /* cleanup */
     PASS();
 }

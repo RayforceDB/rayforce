@@ -89,7 +89,7 @@ static void jrn_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
 /* ── Helper: write a well-formed journal entry for `val` to file `f` ── */
 
-static bool write_journal_entry(FILE* f, ray_t* val) {
+static bool write_journal_entry_flags(FILE* f, ray_t* val, uint8_t flags) {
     int64_t psize = ray_serde_size(val);
     if (psize <= 0) return false;
     uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
@@ -101,12 +101,17 @@ static bool write_journal_entry(FILE* f, ray_t* val) {
     memset(&hdr, 0, sizeof(hdr));
     hdr.prefix  = RAY_SERDE_PREFIX;
     hdr.version = RAY_SERDE_WIRE_VERSION;
+    hdr.flags   = flags;
     hdr.size    = psize;
 
     bool ok = (fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)) &&
               (fwrite(buf, 1, (size_t)psize, f) == (size_t)psize);
     ray_sys_free(buf);
     return ok;
+}
+
+static bool write_journal_entry(FILE* f, ray_t* val) {
+    return write_journal_entry_flags(f, val, 0);
 }
 
 /* ── Helper: create a temp path and optionally get .log / .qdb paths ── */
@@ -433,8 +438,7 @@ static test_result_t test_journal_replay_literal_args(void) {
     TEST_ASSERT_NOT_NULL(f);
     ray_t* msg = ray_eval_str("(list 'ipc_lit_upd (list 'in 1 2))");
     TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
-    TEST_ASSERT_TRUE(write_journal_entry(f, msg));
-    ray_release(msg);
+    TEST_ASSERT_TRUE(write_journal_entry_flags(f, msg, RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS));
     fclose(f);
 
     int64_t chunks = 0, errs = 0;
@@ -451,6 +455,23 @@ static test_result_t test_journal_replay_literal_args(void) {
     TEST_ASSERT_EQ_I(head->type, -RAY_SYM);
     TEST_ASSERT_EQ_I(head->i64, ray_sym_intern("in", 2));
     ray_release(state);
+
+    /* A pre-fix journal has no semantics bit: replay the callable symbol
+     * head under the contract in force when that frame was recorded. */
+    FILE* old = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(old);
+    TEST_ASSERT_TRUE(write_journal_entry(old, msg));
+    ray_release(msg);
+    fclose(old);
+    TEST_ASSERT_EQ_I(ray_journal_replay(lpath, &chunks, &errs, &status), RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    ray_t* legacy = ray_eval_str("ipc_lit_state");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(legacy));
+    TEST_ASSERT_EQ_I(legacy->type, -RAY_BOOL);
+    TEST_ASSERT_FALSE(legacy->b8);
+    ray_release(legacy);
 
     cleanup_base(base);
     PASS();
