@@ -1,0 +1,7 @@
+;; A projection hint must keep all grouped columns when an outer lambda
+;; may read a query local that its call expression does not name.
+(set T (table [a b c v g] (list [1 2 3 4 5 6] [10 20 30 40 50 60] [1 1 2 2 3 3] [1 2 3 4 5 6] [1 1 2 2 3 3])))
+(set f (fn [z] (+ z b)))
+(select {m: (sum (f a)) from: T}) -- (table [m] (list [231]))
+(select {m: (sum (f a)) from: (select {from: T by: [a c]})}) -- (table [m] (list [231]))
+(select {m: (sum (f a)) from: (select {from: T where: (> a 0) by: [a c]})}) -- (table [m] (list [231]))
