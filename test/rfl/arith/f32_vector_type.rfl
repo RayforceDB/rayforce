@@ -1,0 +1,44 @@
+;; F32 vectors retain their element type through mapping and selecting verbs.
+(set v (as 'F32 [2.5 -3.5]))
+(type (+ v v)) -- 'F32
+(type (- v v)) -- 'F32
+(type (* v v)) -- 'F32
+(type (neg v)) -- 'F32
+(type (abs v)) -- 'F32
+(type (floor v)) -- 'F32
+(type (ceil v)) -- 'F32
+(type (fill (as 'F32 0.0) (as 'F32 [1.0 0Nf]))) -- 'F32
+(type (enlist (as 'F32 1.5) (as 'F32 2.5))) -- 'F32
+(type (first v)) -- 'f32
+(type (last v)) -- 'f32
+(type (min v)) -- 'f32
+(type (max v)) -- 'f32
+(first (as 'F32 [0Nf 2.5])) -- 2.5e
+(last (as 'F32 [2.5 0Nf])) -- 2.5e
+(type (mins v)) -- 'F32
+(type (maxs v)) -- 'F32
+(type (mmin 2 v)) -- 'F32
+(type (mmax 2 v)) -- 'F32
+(type (min (as 'F32 [0Nf 2.5]))) -- 'f32
+(nil? (min (as 'F32 [0Nf]))) -- true
+(type (mins (as 'F32 [0Nf 2.5]))) -- 'F32
+(at (table [x] (list (+ v v))) 'x) -- (as 'F32 [5.0 -7.0])
+(set T (table [n] (list [1 2])))
+(type (at (select {r: (+ n (as 'F32 2.5)) from: T}) 'r)) -- 'F64
+
+;; Planner, bound-column and grouped reductions agree with eager vectors.
+(set TF (table [g x] (list [0 0 1 1] (as 'F32 [2.5 0Nf -3.5 4.5]))))
+(set RF (select {mn: (min x) mx: (max x) f: (first x) l: (last x) from: TF}))
+(type (at RF 'mn)) -- 'F32
+(type (at RF 'mx)) -- 'F32
+(type (at RF 'f)) -- 'F32
+(type (at RF 'l)) -- 'F32
+(set RFG (select {mn: (min x) mx: (max x) f: (first x) l: (last x) from: TF by: g asc: g}))
+(type (at RFG 'mn)) -- 'F32
+(type (at RFG 'mx)) -- 'F32
+(type (at RFG 'f)) -- 'F32
+(type (at RFG 'l)) -- 'F32
+(at RFG 'mn) -- (as 'F32 [2.5 -3.5])
+(at RFG 'mx) -- (as 'F32 [2.5 4.5])
+(at RFG 'f) -- (as 'F32 [2.5 -3.5])
+(at RFG 'l) -- (as 'F32 [2.5 4.5])

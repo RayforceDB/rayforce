@@ -3597,6 +3597,14 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 
     (void)g;
     if (!input || RAY_IS_ERR(input)) return input;
+    if (op->opcode == OP_CAST && op->out_type == RAY_F32 && ray_is_atom(input)) {
+        const char* name = ray_type_name(op->out_type);
+        ray_t* target = ray_sym(ray_sym_intern(name, strlen(name)));
+        if (!target || RAY_IS_ERR(target)) return target ? target : ray_error("oom", NULL);
+        ray_t* result = ray_cast_fn(target, input);
+        ray_release(target);
+        return result;
+    }
     if (!ray_is_vec(input)) return ray_error("type", "expr eval: unary op expects a vector, got %s", ray_type_name(input->type));
     int64_t len = input->len;
     int8_t in_type = input->type;

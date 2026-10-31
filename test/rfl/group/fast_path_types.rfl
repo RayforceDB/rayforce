@@ -9,7 +9,8 @@
 (at (select {from:exact by:k asc:k m:(max v)}) 'm) -- [9007199254740993 9223372036854775807]
 (set mixed (table [k v] (list [0 1 0 1 0 1] (f32 [3.0 9.0 1.0 7.0 2.0 8.0]))))
 (at (select {from:mixed by:k asc:k m:(med v) s:(sum v) f:(first v) l:(last v)}) 'm) -- [2.0 8.0]
-(at (select {from:mixed by:k asc:k m:(med v) s:(sum v) f:(first v) l:(last v)}) 'f) -- [3.0 9.0]
+(at (select {from:mixed by:k asc:k m:(med v) s:(sum v) f:(first v) l:(last v)}) 'f) -- (f32 [3.0 9.0])
+(at (select {from:mixed by:k asc:k m:(med v) s:(sum v) f:(first v) l:(last v)}) 'l) -- (f32 [2.0 8.0])
 (at (select {from:mixed by:k asc:k t:(top v 2)}) 't) -- (list (f32 [3.0 2.0]) (f32 [9.0 8.0]))
 (set words (table [k v] (list [0 0 0 1 1 1] ["long pooled zebra string" "a" "m" "z" "b" "y"])))
 (at (select {from:words by:k asc:k t:(top v 2)}) 't) -- (list ["m" "long pooled zebra string"] ["z" "y"])

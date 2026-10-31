@@ -476,7 +476,7 @@ bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* n
  * (collection.c).  The builtins below answer it as they answer the column:
  * on its bound source (ray_reduce_src: the directory, or range reads), with
  * the column's type-error messages, and with the out type the vector path
- * gives (ray_min_op / ray_max_op: F32 answers F64).  first / last read row
+ * gives.  first / last read row
  * 0 / len - 1 itself for the types they read with collection_elem (SYM,
  * STR, GUID: by forcing the column).  *done false: not a column reference,
  * or an op the source does not serve (the caller appends it: the lazy is
@@ -526,7 +526,7 @@ static ray_t* colref_answer(ray_t* x, uint16_t op, bool* done) {
             }
         } else {
             int8_t out = 0;
-            if (op == OP_MIN || op == OP_MAX) out = t == RAY_F32 ? RAY_F64 : t;   /* ray_min_op */
+            if (op == OP_MIN || op == OP_MAX) out = t;
             else if (op == OP_SUM || op == OP_PROD) out = (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
             else if (op == OP_AVG) out = RAY_F64;
             r = ray_reduce_src(&src, op, out);
@@ -869,11 +869,26 @@ ray_t* ray_avg_fn(ray_t* x) {
     return make_f64(sum / (double)cnt);
 }
 
+static ray_t* agg_f32_extreme(ray_t* x, bool want_max) {
+    const float* d = (const float*)ray_data(x);
+    bool found = false;
+    float best = 0.0f;
+    for (int64_t i = 0; i < x->len; i++) {
+        /* F32 nulls are NaNs.  Check the payload even when HAS_NULLS was
+         * lost so a leading null cannot pin the result at NaN. */
+        if (d[i] != d[i]) continue;
+        if (!found || (want_max ? d[i] > best : d[i] < best)) best = d[i];
+        found = true;
+    }
+    return found && isfinite(best) ? ray_f32(best) : ray_typed_null(-RAY_F32);
+}
+
 ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_MIN);
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 0);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
+        if (x->type == RAY_F32) return agg_f32_extreme(x, false);
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
             int64_t best = INT64_MAX;
@@ -945,6 +960,7 @@ ray_t* ray_max_fn(ray_t* x) {
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 1);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
+        if (x->type == RAY_F32) return agg_f32_extreme(x, true);
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
             int64_t best = -INT64_MAX;

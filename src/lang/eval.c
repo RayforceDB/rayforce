@@ -1582,7 +1582,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
 
     /* SLOW PATH: per-element scalar loop (fallback for mixed types, temporal, etc.) */
     if (!force_boxed &&
-        (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
+        (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
          out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
          out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN)) {
         ray_t* vec = ray_vec_new(out_type, len);
@@ -1731,7 +1731,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     int8_t out_type = -(e0->type);
 
     /* Try typed vector path for numeric/bool/temporal output */
-    if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
+    if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
         out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
         out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN) {
         ray_t* vec = ray_vec_new(out_type, len);
