@@ -311,7 +311,7 @@ static test_result_t test_closure_sym_walk_guard(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
         bool dynamic = false;
         int64_t weight = 0;
-        ray_t* ment = ray_closure_mentioned_syms(ast, NULL, &dynamic, &weight, NULL);
+        ray_t* ment = ray_closure_mentioned_syms(ast, &dynamic, &weight);
         if (i == 0) {
             TEST_ASSERT(ment != NULL, "a body within the guard is walked");
             TEST_ASSERT_EQ_I(ment->len, 1);
@@ -11304,6 +11304,35 @@ static test_result_t test_local_mutation_fast_paths(void) {
     PASS();
 }
 
+/* local_mutation.rfl builds its "interpreted" fixtures from 300 lets joined
+ * into one string: a body with more locals than a frame has slots stays on
+ * the tree walker.  Check that, and that a small body of the same shape
+ * does compile, so the check can fail. */
+static test_result_t test_local_mutation_walker_fixture(void) {
+    const char* defs[] = {
+        "(set lmpadc (fold concat \"\" (map (fn [i] (format \"(let lmz% 0) \" i)) (til 300))))",
+        "(set lmwalk (eval (parse (format \"(fn [f] % (let t (til 3)) (f 't 9) t)\" lmpadc))))",
+        "(set lmsmall (fn [f] (let t (til 3)) (f 't 9) t))",
+        "(set t [50 60])",   /* compiled code reaches a global target through f */
+    };
+    for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) {
+        ray_t* r = ray_eval_str(defs[i]);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ASSERT_EQ("(type lmpadc)", "'str");
+    ASSERT_EQ("(lmwalk insert)", "[0 1 2 9]");
+    ASSERT_EQ("(lmsmall insert)", "[0 1 2]");
+    ray_t* walk = ray_env_get(ray_sym_intern("lmwalk", 6));
+    ray_t* small = ray_env_get(ray_sym_intern("lmsmall", 7));
+    TEST_ASSERT_NOT_NULL(walk);
+    TEST_ASSERT_NOT_NULL(small);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(walk), "the padded fixture stays on the tree walker");
+    TEST_ASSERT(LAMBDA_IS_COMPILED(small), "the same body without padding compiles");
+    PASS();
+}
+
 /* A dotted read of a local, compiled, then the runtime is destroyed and
  * created again on this thread: the code of the second runtime refers to
  * nothing the first one's heap held. */
@@ -11346,6 +11375,7 @@ const test_entry_t lang_entries[] = {
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
     { "lang/local_mutation_fast_paths", test_local_mutation_fast_paths, lang_setup, lang_teardown },
+    { "lang/local_mutation_walker_fixture", test_local_mutation_walker_fixture, lang_setup, lang_teardown },
     { "lang/dotted_local_read_reinit", test_dotted_local_read_reinit, lang_setup, lang_teardown },
     { "lang/dotted_local_read_slot", test_dotted_local_read_slot, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },

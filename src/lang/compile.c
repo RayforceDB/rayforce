@@ -237,9 +237,6 @@ static void emit_jump_back(compiler_t *c, int32_t target) {
 static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_while = -1, sf_times = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
 static _Thread_local int64_t sf_eval = -1, sf_resolve = -1, sf_select = -1;
 static _Thread_local int64_t sf_alter = -1, sf_insert = -1;
-/* The hidden local a guarded call keeps its callee in (see compile_call):
- * a name source text cannot spell, so no binding of the program shadows it. */
-static _Thread_local int64_t sf_callee = -1;
 
 static void init_sf_syms(void) {
     if (sf_set >= 0) return;
@@ -259,7 +256,6 @@ static void init_sf_syms(void) {
     sf_select  = ray_sym_intern("select", 6);
     sf_alter = ray_sym_intern("alter", 5);
     sf_insert = ray_sym_intern("insert", 6);
-    sf_callee = ray_sym_intern("callee of a guarded call", 24);
 }
 
 /* Does `ast` mention any of the current locals — or `self`, or a
@@ -719,7 +715,6 @@ static void emit_call_op(compiler_t *c, ray_t *fn, bool baked, int64_t argc) {
 
 /* A function call: the arm of compile_list for everything that is not a
  * special form it compiles inline. */
-static void compile_mutator_call(compiler_t *c, ray_t **elems, int64_t n);
 static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
                          ray_t *head, bool head_local) {
     /* Self-recursive call: emit OP_CALLS (lean frame reuse, no fn object) */
@@ -802,19 +797,6 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
     } else {
         compile_expr(c, head);
     }
-    /* A callee unknown here (a local, an unbound name, a computed head) may
-     * hold insert or alter when it runs.  Such a call must read its target
-     * and arguments as the tree walker does, through this frame's locals:
-     * OP_JMPNM keeps such a call on a dynamic form, before any argument is
-     * evaluated and with the callee already evaluated; any other callee
-     * jumps over that form to the ordinary call. */
-    int32_t call_jump = -1, end_jump = -1;
-    if (!fn && dyn_syms_idx < 0) {
-        call_jump = emit_jump(c, OP_JMPNM);
-        compile_mutator_call(c, elems, n);
-        end_jump = emit_jump(c, OP_JMP);
-        patch_jump(c, call_jump);
-    }
     int64_t argc = n - 1;
     if (argc > 64) { c->error = true; return; }
     for (int64_t i = 1; i < n; i++)
@@ -836,35 +818,6 @@ static void compile_call(compiler_t *c, ray_t *ast, ray_t **elems, int64_t n,
         emit_const(c, dyn_syms_idx);
         emit(c, OP_SCOPE_END);
     }
-    if (end_jump >= 0) patch_jump(c, end_jump);
-}
-
-/* The mutator path of a guarded call (OP_JMPNM falls through to it with
- * the callee on the stack): keep the callee in a hidden local and hand the tree walker
- * the call with that local as its head.  The head is not evaluated twice,
- * so its side effects run once and the callee tested is the one called;
- * the arguments are read as forms, as for a literal insert or alter. */
-static void compile_mutator_call(compiler_t *c, ray_t **elems, int64_t n) {
-    int32_t li = find_local(c, sf_callee);
-    int32_t slot = li >= 0 ? li : add_local(c, sf_callee);
-    if (slot < 0) { c->error = true; return; }
-    emit(c, OP_STOREENV);
-    emit(c, (uint8_t)slot);
-    ray_t *form = ray_alloc((size_t)n * sizeof(ray_t*));
-    ray_t *head = ray_sym(sf_callee);
-    if (!form || RAY_IS_ERR(form) || !head || RAY_IS_ERR(head)) {
-        if (form && !RAY_IS_ERR(form)) { form->type = RAY_LIST; form->len = 0; ray_release(form); }
-        if (head && !RAY_IS_ERR(head)) ray_release(head);
-        c->error = true;
-        return;
-    }
-    form->type = RAY_LIST;
-    form->len = n;
-    ray_t **fe = (ray_t**)ray_data(form);
-    fe[0] = head;   /* owned by the form */
-    for (int64_t i = 1; i < n; i++) { ray_retain(elems[i]); fe[i] = elems[i]; }
-    compile_dyn_form(c, form, true);
-    ray_release(form);
 }
 
 /* A dotted name whose head is a local: load the head as the name alone
@@ -1026,70 +979,24 @@ static bool closure_shape_ok(ray_t *closure) {
     return keys && vals && keys->type == RAY_SYM && vals->type == RAY_LIST && keys->len == vals->len;
 }
 
-/* What a closure's capture set depends on beyond the names its body
- * mentions.  `heads`: call heads that may hold insert or alter when the
- * call runs and are given a computed target (a call with a target and a
- * value whose first argument is not a quoted symbol), other than the
- * literal names; whether the closure must keep every capture then depends
- * on what the head is bound to where the closure is made (see
- * closure_heads_wide).  `inner`: names the body binds itself (lets and
- * nested parameters).  A head bound there takes its value inside the
- * closure, not through a capture, so it widens nothing. */
-typedef struct { ray_t *heads; ray_t *inner; } name_walk_t;
-
 /* Every symbol id mentioned anywhere in `ast` (atoms, sym vectors, lists,
  * dicts), appended to the I64 vector *out without duplicates.  *dynamic is
- * set when the text mentions `eval` / `resolve`, or a literal insert or
- * alter with a computed target, which can reach a name that is not spelled
- * out.  `w`, when given, also collects heads and inner names (name_walk_t). */
+ * set when the text mentions `eval` / `resolve`, or a mutator with a
+ * computed target, which can reach a name that is not spelled out. */
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
-                                bool stop, int64_t *nodes, name_walk_t *w);
-static bool ids_add(ray_t **v, int64_t id) {
-    const int64_t *have = (const int64_t*)ray_data(*v);
-    for (int64_t i = 0; i < (*v)->len; i++) if (have[i] == id) return true;
-    *v = ray_vec_append(*v, &id);
-    return *v && !RAY_IS_ERR(*v);
-}
-static bool ids_have(ray_t *v, int64_t id) {
-    if (!v) return false;
-    const int64_t *have = (const int64_t*)ray_data(v);
-    for (int64_t i = 0; i < v->len; i++) if (have[i] == id) return true;
-    return false;
-}
-static bool name_walk_init(name_walk_t *w) {
-    w->heads = ray_vec_new(RAY_I64, 4);
-    w->inner = ray_vec_new(RAY_I64, 4);
-    if (w->heads && !RAY_IS_ERR(w->heads)) w->heads->len = 0; else w->heads = NULL;
-    if (w->inner && !RAY_IS_ERR(w->inner)) w->inner->len = 0; else w->inner = NULL;
-    return w->heads && w->inner;
-}
-static void name_walk_free(name_walk_t *w) {
-    if (w->heads) ray_release(w->heads);
-    if (w->inner) ray_release(w->inner);
-    w->heads = w->inner = NULL;
-}
-/* Record the names a parameter node binds (a SYM vector or a list of
- * symbol atoms) as inner. */
-static bool name_walk_params(name_walk_t *w, ray_t *params) {
-    if (!params) return true;
-    if (params->type == RAY_SYM) {
-        for (int64_t i = 0; i < params->len; i++)
-            if (!ids_add(&w->inner, ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs))) return false;
-    } else if (params->type == RAY_LIST) {
-        ray_t **pe = (ray_t**)ray_data(params);
-        for (int64_t i = 0; i < params->len; i++)
-            if (pe[i] && pe[i]->type == -RAY_SYM && !ids_add(&w->inner, pe[i]->i64)) return false;
-    }
-    return true;
-}
-/* The heads that decide: collected heads the body does not bind itself.
- * Removes the others in place. */
-static void name_walk_settle(name_walk_t *w) {
-    int64_t *h = (int64_t*)ray_data(w->heads);
-    int64_t k = 0;
-    for (int64_t i = 0; i < w->heads->len; i++)
-        if (!ids_have(w->inner, h[i])) h[k++] = h[i];
-    w->heads->len = k;
+                                bool stop, int64_t *nodes);
+/* May the head of a call with `len` elements be insert or alter when it
+ * is compiled?  The literal names, and a global bound to either at compile
+ * time (an alias such as (set ins insert), which compile_call resolves by
+ * value).  A local, a parameter or a name unbound here is an ordinary
+ * callee: a mutator reached through one resolves its target as a global,
+ * as on `dev`. */
+static bool head_may_mutate(ray_t *head, int64_t len) {
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED))
+        return false;
+    if (head->i64 == sf_alter || head->i64 == sf_insert) return true;
+    if (len < 3) return false;
+    return ray_fn_is_local_mutator(ray_env_get_global(head->i64));
 }
 /* The nodes a walk for a closure's names visits at most.  A large constant
  * is one node however many bytes it holds; only text shared over and over
@@ -1098,9 +1005,9 @@ static void name_walk_settle(name_walk_t *w) {
 enum { AST_NAME_NODES = 1 << 16 };
 
 /* Every name `ast` mentions, for a closure's capture set. */
-static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic, name_walk_t *w) {
+static bool ast_collect_syms(ray_t *ast, ray_t **out, bool *dynamic) {
     int64_t weight = 0, nodes = AST_NAME_NODES;
-    return ast_collect_syms_at(ast, out, dynamic, 0, &weight, false, &nodes, w);
+    return ast_collect_syms_at(ast, out, dynamic, 0, &weight, false, &nodes);
 }
 
 /* The bytes a value spliced into text holds whole: a table's columns, a
@@ -1163,7 +1070,7 @@ static int64_t ast_node_bytes(ray_t *v, int64_t cap) {
 /* `stop`: the walk serves only the template table, which will not keep a
  * literal past its bound, so it gives up (false) once the weight passes it. */
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
-                                bool stop, int64_t *nodes, name_walk_t *w) {
+                                bool stop, int64_t *nodes) {
     if (!ast || !*out) return false;
     if (depth > 1024) return false;
     if (nodes && --*nodes < 0) return false;
@@ -1195,32 +1102,19 @@ static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int dept
         /* A computed mutator target can name any enclosing binding. Keep
          * those captures before compile_dyn_form exposes the closure's
          * slots; an eval window cannot recover a discarded capture.
-         * Literal targets already contribute their names below.  Under a
-         * head other than the literal names it depends on the head's
-         * binding where the closure is made (name_walk_t). */
-        ray_t *hd = ast->len >= 2 ? elems[0] : NULL;
-        if (hd && hd->type == -RAY_SYM && !(hd->attrs & ATTR_QUOTED)) {
-            bool computed = !(elems[1] && elems[1]->type == -RAY_SYM &&
-                              (elems[1]->attrs & ATTR_QUOTED));
-            if (hd->i64 == sf_alter || hd->i64 == sf_insert) {
-                if (computed) *dynamic = true;
-            } else if (w && computed && ast->len >= 3 && hd->i64 != sf_self &&
-                       !ids_add(&w->heads, hd->i64)) {
-                return false;
-            }
-            if (w && hd->i64 == sf_let && elems[1] && elems[1]->type == -RAY_SYM &&
-                !ids_add(&w->inner, elems[1]->i64))
-                return false;
-            if (w && hd->i64 == sf_fn && !name_walk_params(w, elems[1])) return false;
-        }
+         * Literal targets already contribute their names below. */
+        if (ast->len >= 2 && head_may_mutate(elems[0], ast->len) &&
+            !(elems[1] && elems[1]->type == -RAY_SYM &&
+              (elems[1]->attrs & ATTR_QUOTED)))
+            *dynamic = true;
         for (int64_t i = 0; i < ast->len; i++)
-            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop, nodes, w)) return false;
+            if (!ast_collect_syms_at(elems[i], out, dynamic, depth + 1, weight, stop, nodes)) return false;
         return true;
     }
     if (ast->type == RAY_DICT) {
         ray_t **slots = (ray_t**)ray_data(ast);
-        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, nodes, w) &&
-               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes, w);   /* not-a-table */
+        return ast_collect_syms_at(slots[0], out, dynamic, depth + 1, weight, stop, nodes) &&
+               ast_collect_syms_at(slots[1], out, dynamic, depth + 1, weight, stop, nodes);   /* not-a-table */
     }
     return true;
 }
@@ -1239,22 +1133,6 @@ static bool syms_contain(ray_t *syms, int64_t id) {
     return false;
 }
 
-/* Must a closure keep every capture because of one of `heads` (see
- * name_walk_t)?  A head the closure captures decides by the value it
- * captured, which is the only value the body can call through it; any
- * other head by the global it names now, as compile_call resolves it. */
-static bool closure_heads_wide(ray_t *closure, ray_t *heads) {
-    if (!heads) return false;
-    const int64_t *h = (const int64_t*)ray_data(heads);
-    for (int64_t i = 0; i < heads->len; i++) {
-        ray_t *v = closure ? ray_dict_probe_sym_borrowed(closure, h[i]) : NULL;
-        if (!v) v = ray_env_get_global(h[i]);
-        if (ray_fn_is_local_mutator(v)) return true;
-    }
-    return false;
-}
-bool ray_closure_heads_wide(ray_t *closure, ray_t *heads) { return closure_heads_wide(closure, heads); }
-
 /* The capture names a closure body can reach: the closure dict's keys that
  * the body mentions (every key for dynamic name resolution), never
  * `self`.  A SYM vector the caller releases, or NULL for none.  *failed is
@@ -1272,14 +1150,7 @@ static ray_t *closure_capture_names(ray_t *lambda, bool *failed) {
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) { *failed = true; return NULL; }
     bool dynamic = false;
-    name_walk_t w;
-    bool ok = name_walk_init(&w) && ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic, &w) &&
-              name_walk_params(&w, LAMBDA_PARAMS(lambda));
-    if (ok) {
-        name_walk_settle(&w);
-        if (closure_heads_wide(closure, w.heads)) dynamic = true;
-    }
-    name_walk_free(&w);
+    bool ok = ast_collect_syms(LAMBDA_BODY(lambda), &mentioned, &dynamic);
     ray_t *names = ok ? ray_sym_vec_new(RAY_SYM_W64, keys->len) : NULL;
     if (!names || RAY_IS_ERR(names)) *failed = true;
     if (names && !RAY_IS_ERR(names)) {
@@ -1353,25 +1224,9 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     if (!mentioned || RAY_IS_ERR(mentioned)) { if (own_params) ray_release(params); return false; }
     bool dynamic = false, ok = true;
     int64_t tweight = 0, tnodes = AST_NAME_NODES;
-    name_walk_t w;
-    ok = name_walk_init(&w);
     for (int64_t i = 2; i < n && ok; i++)
-        ok = ast_collect_syms_at(elems[i], &mentioned, &dynamic, 0, &tweight, false, &tnodes, &w);
-    ok = ok && name_walk_params(&w, params);
-    if (!ok) { name_walk_free(&w); ray_release(mentioned); if (own_params) ray_release(params); return false; }
-    /* A head that is a local here decides when the closure is made, by
-     * the value its slot holds then (the value the closure captures); a
-     * head naming a global decides now (closure_heads_wide). */
-    name_walk_settle(&w);
-    int32_t head_slots[256];
-    int nhead = 0;
-    const int64_t *wh = (const int64_t*)ray_data(w.heads);
-    for (int64_t i = 0; i < w.heads->len; i++) {
-        int32_t sl = find_local(c, wh[i]);
-        if (sl >= 0) { if (nhead < 256) head_slots[nhead++] = sl; }
-        else if (ray_fn_is_local_mutator(ray_env_get_global(wh[i]))) dynamic = true;
-    }
-    name_walk_free(&w);
+        ok = ast_collect_syms_at(elems[i], &mentioned, &dynamic, 0, &tweight, false, &tnodes);
+    if (!ok) { ray_release(mentioned); if (own_params) ray_release(params); return false; }
 
     /* Capture names and the enclosing slots they come from, in slot order. */
     ray_t *names = ray_sym_vec_new(RAY_SYM_W64, c->n_locals > 0 ? c->n_locals : 1);
@@ -1427,31 +1282,11 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     int32_t sidx = add_constant(c, slots);
     ray_release(tmpl); ray_release(names); ray_release(slots);
     if (c->error) return false;
-    /* A head slot holding insert or alter: the tree walker makes this
-     * closure instead, with every local in its window, and the closure
-     * then keeps every capture (closure_capture_names). */
-    int32_t wide_jumps[256];
-    int nwide = 0;
-    for (int k = 0; !dynamic && k < nhead; k++) {
-        emit(c, OP_LOADENV);
-        emit(c, (uint8_t)head_slots[k]);
-        int32_t next = emit_jump(c, OP_JMPNM);
-        emit(c, OP_POP);
-        wide_jumps[nwide++] = emit_jump(c, OP_JMP);
-        patch_jump(c, next);
-        emit(c, OP_POP);
-    }
     emit_const(c, tidx);
     emit_const(c, nidx);
     emit_const(c, sidx);
     emit(c, OP_MKCLOSURE);
-    if (nwide) {
-        int32_t end_jump = emit_jump(c, OP_JMP);
-        for (int k = 0; k < nwide; k++) patch_jump(c, wide_jumps[k]);
-        compile_dyn_form(c, ast, true);
-        patch_jump(c, end_jump);
-    }
-    return !c->error;
+    return true;
 }
 
 ray_t *ray_closure_capture_names(ray_t *lambda) { bool failed; return closure_capture_names(lambda, &failed); }
@@ -1460,27 +1295,13 @@ ray_t *ray_closure_capture_names(ray_t *lambda) { bool failed; return closure_ca
  * it uses eval or resolve; NULL on allocation failure, nesting past the
  * walk's guard, or a weight past RAY_CLOSURE_TMPL_MAX_BYTES (the walk
  * stops there: the template table would not keep the literal). */
-ray_t *ray_closure_mentioned_syms(ray_t *body, ray_t *params, bool *dynamic, int64_t *weight,
-                                  ray_t **heads) {
+ray_t *ray_closure_mentioned_syms(ray_t *body, bool *dynamic, int64_t *weight) {
     init_sf_syms();
-    if (heads) *heads = NULL;
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
     if (!mentioned || RAY_IS_ERR(mentioned)) return NULL;
     *dynamic = false;
     *weight = 0;
-    name_walk_t w = { NULL, NULL };
-    if (heads && !name_walk_init(&w)) { name_walk_free(&w); ray_release(mentioned); return NULL; }
-    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true, NULL, heads ? &w : NULL) ||
-        (heads && !name_walk_params(&w, params))) {
-        name_walk_free(&w);
-        if (mentioned) ray_release(mentioned);
-        return NULL;
-    }
-    if (heads) {
-        name_walk_settle(&w);
-        if (w.heads->len) { *heads = w.heads; w.heads = NULL; }
-        name_walk_free(&w);
-    }
+    if (!ast_collect_syms_at(body, &mentioned, dynamic, 0, weight, true, NULL)) { if (mentioned) ray_release(mentioned); return NULL; }
     return mentioned;
 }
 
@@ -1674,5 +1495,5 @@ ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {
 void ray_compile_reset(void) {
     sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = sf_null = -1;
     sf_eval = sf_resolve = sf_select = -1;
-    sf_alter = sf_insert = sf_callee = -1;
+    sf_alter = sf_insert = -1;
 }

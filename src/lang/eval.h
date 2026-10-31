@@ -123,13 +123,6 @@ enum {
     OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
     OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
                        * of that kind, OP_CALLF's general call otherwise */
-    OP_JMPNM,         /* jump (2-byte signed offset) unless TOS is insert or
-                       * alter; TOS stays on the stack either way.  Guards a
-                       * call whose callee is unknown at compile time (a
-                       * local, an unbound name, a computed head): a mutator
-                       * found there runs as a dynamic form, as the tree
-                       * walker would run it, and a closure whose captured
-                       * head holds one is made by the tree walker */
     OP_PATHGET,       /* pop a head value; push the dotted name cpool[2-byte
                        * index] read below it, by the walk the tree walker
                        * applies past a dotted name's head (ray_env_path_get);
@@ -241,12 +234,7 @@ bool ray_compile_definition(ray_t* lambda, ray_t** deps);
 /* The capture names a closure's body can reach (its dict keys the body
  * mentions; all of them under eval/resolve), as a SYM vector or NULL. */
 ray_t* ray_closure_capture_names(ray_t* lambda);
-/* `heads`, when given, receives the call heads whose binding where a
- * closure is made decides whether it keeps every capture (an I64 vector,
- * owned, or NULL for none); see ray_closure_heads_wide. */
-ray_t* ray_closure_mentioned_syms(ray_t* body, ray_t* params, bool* dynamic, int64_t* weight,
-                                  ray_t** heads);
-bool   ray_closure_heads_wide(ray_t* closure, ray_t* heads);
+ray_t* ray_closure_mentioned_syms(ray_t* body, bool* dynamic, int64_t* weight);
 ray_t* ray_closure_names_from(ray_t* closure, ray_t* mentioned, bool dynamic);
 /* The closure dict shape the compiled capture binding assumes: NULL, or SYM
  * keys with a LIST of values of the same length. */

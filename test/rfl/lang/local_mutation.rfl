@@ -97,81 +97,88 @@ capstate.v -- [50 60]
 ((fn [] (let capstate (dict [v] (list (til 3)))) (let capf (fn [] (insert (as 'SYM "capstate.v") 9))) (capf) capstate.v)) -- [0 1 2]
 capstate.v -- [50 60]
 
-;; A body with more locals than a frame has slots stays on the tree walker;
-;; the cases below run each mutation both compiled and interpreted.
-(set lmpad (raze (map (fn [i] (format "(let lmz% 0) " i)) (til 300))))
+;; A body with more locals than a frame has slots (256) stays on the tree
+;; walker.  The padding is one string of 300 lets, so the fixtures below
+;; really are interpreted (test_local_mutation_walker_fixture checks it).
+(set lmpad (fold concat "" (map (fn [i] (format "(let lmz% 0) " i)) (til 300))))
 (set lmtw (fn [src] (eval (parse (format src lmpad)))))
 
-;; A mutator reached through a local or parameter head targets the frame's
-;; binding, compiled as on the tree walker, and never the same-named global.
+;; Local targets need a literal insert or alter head, or a global alias of
+;; one.  Any other head (a parameter, a let, a dotted head, a computed head,
+;; a name unbound when the body compiles) is an ordinary callee: in compiled
+;; code a quoted target resolves as a global, as on dev, and a computed
+;; target publishes nothing.
 (set t [50 60])
-((fn [f] (let t (til 3)) (f 't 9) t) insert) -- [0 1 2 9]
-t -- [50 60]
-((lmtw "(fn [f] % (let t (til 3)) (f 't 9) t)") insert) -- [0 1 2 9]
-t -- [50 60]
-((fn [f] (let t (til 3)) (f 't 'set 0 9) t) alter) -- [9 1 2]
-((lmtw "(fn [f] % (let t (til 3)) (f 't 'set 0 9) t)") alter) -- [9 1 2]
-((fn [f] (let t (til 3)) (f 't set 0 9) t) alter) -- [9 1 2]
-((fn [f] (let t (til 3)) (f (as 'SYM "t") 9) t) insert) -- [0 1 2 9]
-((lmtw "(fn [f] % (let t (til 3)) (f (as 'SYM \"t\") 9) t)") insert) -- [0 1 2 9]
-((fn [] (let t (til 3)) (let g insert) (g 't 9) t)) -- [0 1 2 9]
-t -- [50 60]
-;; ... a head unbound when the body compiles, bound before it runs
-(set lmlater (fn [] (let t (til 3)) (lmins 't 9) t))
-(set lmins insert)
-(lmlater) -- [0 1 2 9]
-t -- [50 60]
-;; ... with no local of that name, the global is the visible binding
-((fn [f] (f 't 9)) insert) -- 't
+((fn [f] (let t (til 3)) (f 't 9) t) insert) -- [0 1 2]
 t -- [50 60 9]
 (set t [50 60])
+((fn [f] (let t (til 3)) (f 't 'set 0 9) t) alter) -- [0 1 2]
+t -- [9 60]
+(set t [50 60])
+((fn [f] (let t (til 3)) (f (as 'SYM "t") 9) t) insert) -- [0 1 2]
+t -- [50 60]
+((fn [] (let t (til 3)) (let g insert) (g 't 9) t)) -- [0 1 2]
+t -- [50 60 9]
+(set t [50 60])
+;; ... a computed head is an ordinary callee: evaluated once
+(set lmn 0)
+((fn [] (let t (til 3)) ((do (set lmn (+ lmn 1)) insert) 't 9) t)) -- [0 1 2]
+lmn -- 1
+t -- [50 60 9]
+(set t [50 60])
+;; ... a function that stays on the tree walker reaches the same resolver
+;; with its frames in scope, so a quoted target there names the local
+((lmtw "(fn [f] % (let t (til 3)) (f 't 9) t)") insert) -- [0 1 2 9]
+t -- [50 60]
 ;; ... other callees through a local head are called as before
 ((fn [f x] (f x 1)) + 2) -- 3
 ((fn [f x] (f x 1)) (fn [a b] (* (+ a b) 10)) 3) -- 40
-;; ... a computed head is evaluated once, and the callee tested is the one
-;; called, compiled as on the tree walker
-(set lmn 0)
-((fn [] (let t (til 3)) ((do (set lmn (+ lmn 1)) insert) 't 9) t)) -- [0 1 2 9]
-lmn -- 1
-(set lmn 0)
-((fn [fs] (let t (til 3)) ((do (set lmn (+ lmn 1)) (first fs)) 't 9) t) (list insert)) -- [0 1 2 9]
-lmn -- 1
-(set lmn 0)
-(set lmch (eval (parse (format "(fn [] % (let t (til 3)) ((do (set lmn (+ lmn 1)) insert) 't 9) t)" lmpad))))
-(lmch) -- [0 1 2 9]
-lmn -- 1
-t -- [50 60]
 
-;; An aliased mutator or one held in a local, inside a nested closure with
-;; a computed target, keeps the capture and leaves the global alone.
+;; Inside a nested closure the same heads do not keep the enclosing
+;; bindings of a computed target, which therefore names nothing local: the
+;; mutator publishes nothing, and no same-named global is written.
 (set capv [50 60])
+(((fn [] (let capv (til 3)) (fn [g] (g (as 'SYM "capv") 9)))) insert)
+capv -- [50 60]
+(((lmtw "(fn [] % (let capv (til 3)) (fn [g] (g (as 'SYM \"capv\") 9)))")) insert)
+capv -- [50 60]
+(((fn [] (let capv (til 3)) (fn [] (let g insert) (g (as 'SYM "capv") 9)))))
+capv -- [50 60]
+(((lmtw "(fn [] % (let capv (til 3)) (fn [] (let g insert) (g (as 'SYM \"capv\") 9)))")))
+capv -- [50 60]
+(set lmmk3 (fn [h] (let capv (til 3)) (fn [] (h (as 'SYM "capv") 9) ((fn [h] h) 0))))
+((lmmk3 insert))
+capv -- [50 60]
+(set lmmkd (fn [d] (let capv (til 3)) (fn [] (d.f (as 'SYM "capv") 9))))
+((lmmkd (dict [f] (list insert))))
+capv -- [50 60]
+(set lmmk4 (fn [] (let capv (til 3)) (fn [] (lmins4 (as 'SYM "capv") 9))))
+(try ((lmmk4)) (fn [e] 0))
+(set lmins4 insert)
+((lmmk4))
+capv -- [50 60]
+;; ... also when the local head shadows a global bound to something else
+(set h (fn [a b] 0))
+(((fn [h] (let capv (til 3)) (fn [] (h (as 'SYM "capv") 9))) insert))
+capv -- [50 60]
+(set lmcount count)
+(((fn [lmcount] (let capv (til 3)) (fn [] (lmcount (as 'SYM "capv") 9))) insert))
+capv -- [50 60]
+
+;; A global alias of insert or alter is a mutator head: a nested closure
+;; with a computed target keeps the enclosing bindings, compiled or not.
 (set lmi insert)
 (set lma alter)
 ((fn [] (let capv (til 3)) (let capf (fn [] (lmi (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
 capv -- [50 60]
 ((fn [] (let capv (til 3)) (let capf (fn [] (lma (as 'SYM "capv") 'set 0 9))) (capf) capv)) -- [0 1 2]
 capv -- [50 60]
-((fn [] (let capv (til 3)) (let g insert) (let capf (fn [] (g (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+((fn [] (let t (til 3)) (lmi 't 9) t)) -- [0 1 2 9]
+t -- [50 60]
+((lmtw "(fn [] % (let capv (til 3)) (let capf (fn [] (lmi (as 'SYM \"capv\") 9))) (capf) capv)")) -- [0 1 2]
 capv -- [50 60]
-((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
-capv -- [50 60]
-;; ... also when the local head shadows a global bound to something else
-(set h (fn [a b] 0))
-((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
-capv -- [50 60]
-(set lmcount count)
-((fn [lmcount] (let capv (til 3)) (let capf (fn [] (lmcount (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
-capv -- [50 60]
-;; A captured head decides by the value it captured: one holding a mutator
-;; keeps every capture, compiled or interpreted, any other keeps only what
-;; the body mentions, so an ordinary higher-order closure holds nothing else.
-(set lmmk (fn [f] (let capv (til 3)) (fn [] (f (as 'SYM "capv") 9) capv)))
-((lmmk insert)) -- [0 1 2 9]
-((lmmk (fn [a b] 0))) -- [0 1 2]
-capv -- [50 60]
-(set lmmki (eval (parse (format "(fn [f] % (let capv (til 3)) (fn [] (f (as 'SYM \"capv\") 9) capv))" lmpad))))
-((lmmki insert)) -- [0 1 2 9]
-capv -- [50 60]
+;; Heads other than those widen nothing: an ordinary higher-order closure
+;; holds only what its body mentions.
 (set lmbig (fn [f] (let big (til 10000000)) (let small 1) (fn [x y] (f x y))))
 (set lmdb (at (.sys.mem) 'direct-bytes))
 (set lmc1 (lmbig +))

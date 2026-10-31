@@ -196,6 +196,12 @@ bool ray_raise_render(char* buf, size_t cap) {
 void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
 
+bool ray_fn_is_local_mutator(const ray_t* fn) {
+    if (!fn || fn->type != RAY_VARY) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_insert || f == ray_insert_fn || f == ray_alter_fn;
+}
+
 static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
@@ -2559,12 +2565,8 @@ typedef struct {
                        * and differ in the middle */
     int64_t nbody;
     ray_t*  mentioned; /* the symbols the body mentions (I64 vector) */
-    ray_t*  heads;     /* call heads whose captured value decides `dynamic`
-                        * (ray_closure_mentioned_syms), or NULL */
-    bool    stat;      /* the body uses eval or resolve, or a literal mutator
-                        * with a computed target: every capture counts */
-    bool    dynamic;   /* every capture counts for the closures sharing this
-                        * entry: `stat`, or one of `heads` captured a mutator */
+    bool    dynamic;   /* the body uses eval or resolve, or a mutator with a
+                        * computed target: every capture counts */
     bool    failed;    /* the body did not compile: its closures stay interpreted */
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
@@ -2589,7 +2591,6 @@ static void closure_tmpl_drop(closure_tmpl_t* e) {
     if (e->params) ray_release(e->params);
     for (int64_t i = 0; i < e->nbody && i < CLOSURE_TMPL_MAX_BODY; i++) if (e->body[i]) ray_release(e->body[i]);
     if (e->mentioned) ray_release(e->mentioned);
-    if (e->heads) ray_release(e->heads);
     if (e->names) ray_release(e->names);
     if (e->tmpl) ray_release(e->tmpl);
     if (e->deps) ray_release(e->deps);
@@ -2669,8 +2670,6 @@ static void closure_share_template(ray_t* lambda) {
         if ((!e->tmpl && !e->failed) || e->deps || e->params != params || e->nbody != body->len) continue;
         bool same = true;
         for (int64_t k = 0; k < body->len && same; k++) same = e->body[k] == bn[k];
-        if (same && e->dynamic != (e->stat || ray_closure_heads_wide(LAMBDA_CLOSURE(lambda), e->heads)))
-            continue;   /* this closure keeps another capture set */
         if (same && closure_entry_names_match(e, LAMBDA_CLOSURE(lambda))) {
             if (e->failed) LAMBDA_NLOCALS(lambda) = -1;   /* known not to compile */
             else closure_share_from(lambda, e->tmpl);
@@ -2678,22 +2677,19 @@ static void closure_share_template(ray_t* lambda) {
         }
     }
     /* A new literal, or a known one with another capture set. */
-    bool stat = false;
+    bool dynamic = false;
     int64_t weight = 0;
-    ray_t* heads = NULL;
-    ray_t* mentioned = ray_closure_mentioned_syms(body, params, &stat, &weight, &heads);
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
     if (!mentioned) return;
     if (weight > CLOSURE_TMPL_MAX_BYTES) {
         /* A literal built around a large constant is not kept: the table
          * would hold the constant alive after its closures are gone. */
         ray_release(mentioned);
-        if (heads) ray_release(heads);
         return;
     }
-    bool dynamic = stat || ray_closure_heads_wide(LAMBDA_CLOSURE(lambda), heads);
     ray_t* names = ray_closure_names_from(LAMBDA_CLOSURE(lambda), mentioned, dynamic);
     ray_t* tmpl = ray_alloc(LAMBDA_SLOTS * sizeof(ray_t*));
-    if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); ray_release(mentioned); if (heads) ray_release(heads); return; }
+    if (!tmpl || RAY_IS_ERR(tmpl)) { if (names) ray_release(names); ray_release(mentioned); return; }
     tmpl->type = RAY_LAMBDA;
     tmpl->attrs = 0;
     tmpl->len = 0;
@@ -2722,8 +2718,6 @@ static void closure_share_template(ray_t* lambda) {
     for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
     e->nbody = body->len;
     e->mentioned = mentioned;   /* owned */
-    e->heads = heads;           /* owned, may be NULL */
-    e->stat = stat;
     e->dynamic = dynamic;
     e->failed = !compiled;
     e->bytes = weight;
@@ -2771,7 +2765,7 @@ static void definition_compile(ray_t* lambda) {
     }
     bool dynamic = false;
     int64_t weight = 0;
-    ray_t* mentioned = ray_closure_mentioned_syms(body, params, &dynamic, &weight, NULL);
+    ray_t* mentioned = ray_closure_mentioned_syms(body, &dynamic, &weight);
     if (!mentioned || weight > CLOSURE_TMPL_MAX_BYTES) {
         if (mentioned) ray_release(mentioned);
         ray_compile(lambda);
@@ -3255,7 +3249,6 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL1R]        = &&op_call1r,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
-        [OP_JMPNM]         = &&op_jmpnm,
         [OP_PATHGET]       = &&op_pathget,
     };
 
@@ -3613,18 +3606,6 @@ op_calln: {
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, result_rows);
-    DISPATCH();
-}
-
-op_jmpnm: {
-    /* A local or unbound callee holding insert or alter: its target names
-     * a binding of this frame as readily as a global, and its arguments
-     * are forms it reads itself, so the compiler's dynamic form for the
-     * call takes over, given the callee left on the stack.  Any other
-     * callee jumps over that form to the ordinary call (see OP_JMPNM). */
-    int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
-    ip += 2;
-    if (RAY_LIKELY(!ray_fn_is_local_mutator(PEEK()))) ip += offset;
     DISPATCH();
 }
 
