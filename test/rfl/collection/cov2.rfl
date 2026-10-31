@@ -359,13 +359,12 @@
 (filter [1 2 3] [true false]) !- length
 
 ;; ════════════════════════════════════════════════════════════════
-;; 28. in — STR val in LIST (lines 914-931)
+;; 28. in — STR val in LIST
 ;; ════════════════════════════════════════════════════════════════
-;; String "ab" in list: for each char of "ab", check membership in list
+;; String "ab" is one value, and neither "a" nor "b" equals it.
 (set _res (in "ab" (list "a" "b" "c")))
-(at _res 0) -- true
-(at _res 1) -- true
-(count _res) -- 2
+_res -- false
+(type _res) -- 'b8
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 29. in — typed vec val with has_nulls path (lines 1015-1026)

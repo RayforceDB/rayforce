@@ -1802,9 +1802,8 @@ ray_t* ray_distinct_fn(ray_t* x) {
 
 /* (in val vec) — check membership */
 /* One element of a collection left operand.  A string element is one whole
- * value: the lone-string arms of ray_in_fn answer per character, which is
- * right for a string atom on its own but not for a row of a collection —
- * (in ["p" "qq"] (list "qq" "zz")) answered [[false] [false false]].  A
+ * value, including when the left operand itself is a string and the right
+ * operand is a list.  Only string-in-string checks are per character.  A
  * string set (vector) already compares whole strings in ray_in_fn. */
 static ray_t* in_row(ray_t* elem, ray_t* vec) {
     if (elem->type == -RAY_STR && ray_is_atom(vec))
@@ -1846,7 +1845,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         return r;
     }
     /* A string column's cell, bound for one row of a query, is one value:
-     * the per-character arms below are for a lone string literal. */
+     * the string-in-string arm below is for a lone string literal. */
     if (val->type == -RAY_STR && (val->attrs & RAY_ATTR_STR_CELL) &&
         (ray_is_atom(vec) || vec->type == RAY_LIST))
         return in_row(val, vec);
@@ -1871,26 +1870,9 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     /* Scalar in scalar: equality check */
     if (ray_is_atom(val) && ray_is_atom(vec))
         return make_bool(atom_eq(val, vec) ? 1 : 0);
-    /* STR in LIST: for each char of val, check membership in list elements */
-    if (ray_is_atom(val) && (-val->type) == RAY_STR && (vec->type == RAY_LIST)) {
-        const char* vp = ray_str_ptr(val);
-        size_t vlen = ray_str_len(val);
-        ray_t* result = ray_vec_new(RAY_BOOL, (int64_t)vlen);
-        if (RAY_IS_ERR(result)) return result;
-        result->len = (int64_t)vlen;
-        bool* out_b = (bool*)ray_data(result);
-        ray_t** list_elems = (ray_t**)ray_data(vec);
-        int64_t list_len = ray_len(vec);
-        for (size_t i = 0; i < vlen; i++) {
-            out_b[i] = false;
-            ray_t* ch = ray_str(&vp[i], 1);
-            for (int64_t j = 0; j < list_len; j++) {
-                if (atom_eq(ch, list_elems[j])) { out_b[i] = true; break; }
-            }
-            ray_release(ch);
-        }
-        return result;
-    }
+    /* STR in LIST: the string is one scalar needle, as for SYM in LIST. */
+    if (val->type == -RAY_STR && vec->type == RAY_LIST)
+        return in_row(val, vec);
     /* Vector val: map in over each element */
     if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
