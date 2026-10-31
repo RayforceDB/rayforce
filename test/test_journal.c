@@ -456,6 +456,33 @@ static test_result_t test_journal_replay_literal_args(void) {
     TEST_ASSERT_EQ_I(head->i64, ray_sym_intern("in", 2));
     ray_release(state);
 
+    /* Flagged frames must evaluate a real (quote x) argument exactly as
+     * the live IPC path does, including after journal replay. */
+    FILE* quoted_log = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(quoted_log);
+    ray_t* quoted = ray_list_new(2);
+    ray_t* item = ray_sym(ray_sym_intern("quote", 5));
+    ray_list_append(quoted, item); ray_release(item);
+    item = ray_i64(42);
+    ray_list_append(quoted, item); ray_release(item);
+    ray_t* quoted_msg = ray_list_new(2);
+    item = ray_sym(ray_sym_intern("ipc_lit_upd", 11));
+    ray_list_append(quoted_msg, item); ray_release(item);
+    ray_list_append(quoted_msg, quoted); ray_release(quoted);
+    TEST_ASSERT_TRUE(write_journal_entry_flags(quoted_log, quoted_msg,
+                                               RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS));
+    ray_release(quoted_msg);
+    fclose(quoted_log);
+    TEST_ASSERT_EQ_I(ray_journal_replay(lpath, &chunks, &errs, &status), RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    ray_t* quoted_state = ray_eval_str("ipc_lit_state");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(quoted_state));
+    TEST_ASSERT_EQ_I(quoted_state->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(quoted_state->i64, 42);
+    ray_release(quoted_state);
+
     /* A pre-fix journal has no semantics bit: replay the callable symbol
      * head under the contract in force when that frame was recorded. */
     FILE* old = fopen(lpath, "wb");

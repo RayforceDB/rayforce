@@ -644,6 +644,24 @@ static test_result_t test_ipc_builtin_head_arg_is_data(void) {
     TEST_ASSERT_FALSE(result->b8);
     ray_release(result);
 
+    /* A genuine quote form built by a client must still evaluate before
+     * the handler receives its argument. */
+    ray_t* quoted = ray_list_new(2);
+    ray_t* item = ray_sym(ray_sym_intern("quote", 5));
+    ray_list_append(quoted, item); ray_release(item);
+    item = ray_i64(42);
+    ray_list_append(quoted, item); ray_release(item);
+    msg = ray_list_new(2);
+    item = ray_sym(ray_sym_intern("ipc_echo", 8));
+    ray_list_append(msg, item); ray_release(item);
+    ray_list_append(msg, quoted); ray_release(quoted);
+    result = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(result->i64, 42);
+    ray_release(result);
+
     ray_ipc_close(h);
     ray_test_server_stop(&srv);
     PASS();

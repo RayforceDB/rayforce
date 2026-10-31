@@ -4988,6 +4988,14 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
 
 static void mark_ipc_literal_list(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj) || obj->type != RAY_LIST) return;
+    /* A real (quote x) is an expression that must evaluate to x.  Leave
+     * both the wrapper and its payload untouched, including on replay. */
+    if (obj->len == 2) {
+        ray_t* head = ((ray_t**)ray_data(obj))[0];
+        if (head && head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+            head->i64 == ray_sym_intern("quote", 5))
+            return;
+    }
     obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
     ray_t** elems = (ray_t**)ray_data(obj);
     for (int64_t i = 0; i < obj->len; i++)

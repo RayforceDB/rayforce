@@ -596,27 +596,6 @@ static ray_t* deser_frame(uint8_t* payload, size_t payload_len, uint8_t flags)
     return msg;
 }
 
-/* Multicast's internal update frame carries an explicit (quote payload)
- * argument.  That quote already keeps any nested data list unevaluated;
- * marking the wrapper as literal would instead pass the two-cell quote
- * form itself to upd.  Match the complete frame shape so ordinary IPC
- * requests still get literal-argument protection. */
-static bool ipc_is_quoted_mcast_update(ray_t* msg) {
-    if (!msg || msg->type != RAY_LIST || ray_len(msg) != 4) return false;
-    ray_t** e = (ray_t**)ray_data(msg);
-    if (!e[0] || e[0]->type != -RAY_SYM ||
-        !e[1] || e[1]->type != -RAY_STR ||
-        !e[2] || e[2]->type != -RAY_I64 ||
-        !e[3] || e[3]->type != RAY_LIST || ray_len(e[3]) != 2)
-        return false;
-    ray_t* quote_head = ((ray_t**)ray_data(e[3]))[0];
-    return quote_head && quote_head->type == -RAY_SYM &&
-           !(e[0]->attrs & ATTR_QUOTED) &&
-           !(quote_head->attrs & ATTR_QUOTED) &&
-           e[0]->i64 == ray_sym_intern("upd", 3) &&
-           quote_head->i64 == ray_sym_intern("quote", 5);
-}
-
 /* Run the actual decompress + de-serialize + ray_eval pipeline on a
  * single inbound payload.  The wrapper eval_payload() below decides
  * whether to capture stdout/stderr (RAY_IPC_FLAG_VERBOSE) and whether
@@ -692,8 +671,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     ray_t* result = NULL;
     bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
-        if (!ipc_is_quoted_mcast_update(msg))
-            ray_eval_mark_ipc_literal_args(msg);
+        ray_eval_mark_ipc_literal_args(msg);
 
         /* Dispatch through `.ipc.on.sync` / `.ipc.on.async` hook if
          * installed; otherwise fall back to v1's inline-eval default.
