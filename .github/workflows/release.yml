@@ -28,6 +28,9 @@ permissions:
 
 jobs:
   prepare:
+    permissions:
+      contents: write
+      pull-requests: read  # exact merged release PR source provenance
     # Manual dispatch always runs; the PR path only on an actual merge whose
     # title declares a release version.
     if: >-
@@ -55,6 +58,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
           DISPATCH_SHA: ${{ github.sha }}
         run: |
@@ -83,7 +87,14 @@ jobs:
           else
             # Feature-oriented changelog (grouped by conventional-commit type),
             # not GitHub's default author/PR ledger.
-            bash .github/release-notes.sh "$VERSION" "$SHA" > "$RUNNER_TEMP/notes.md"
+            # Pin only the notes source; SHA remains the artifact/build/tag target.
+            notes_args=("$VERSION" "$SHA")
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              notes_args+=(--allow-direct-merge)
+            else
+              export RELEASE_SOURCE_SHA="$PR_SOURCE_SHA"
+            fi
+            bash .github/release-notes.sh "${notes_args[@]}" > "$RUNNER_TEMP/notes.md"
             gh release create "v$VERSION" \
               --target "$SHA" \
               --title "v$VERSION" \
@@ -188,8 +199,8 @@ jobs:
           set -euo pipefail
           url="https://github.com/${GH_REPO}/releases/tag/v${VERSION}"
           # Changelog highlights = the release body minus the collapsed
-          # "Maintenance & internal" <details> block (Zulip won't render it).
-          notes="$(gh release view "v$VERSION" --json body -q .body | sed '/<details>/,/<\/details>/d')"
+          # "Maintenance & internal" block and hidden provenance (not user-facing).
+          notes="$(gh release view "v$VERSION" --json body -q .body | sed -e '/<details>/,/<\/details>/d' -e '/^<!-- release-notes-source-v1 /d')"
           content="$(printf '🚀 **Rayforce v%s** is out!\n\n%s\n\n📦 Release & downloads: %s' "$VERSION" "$notes" "$url")"
           resp="$(curl -sS -X POST 'https://rayforcedb.zulipchat.com/api/v1/messages' \
             -u "releases-bot@rayforcedb.zulipchat.com:${ZULIP_API_KEY}" \

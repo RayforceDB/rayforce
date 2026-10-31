@@ -2084,7 +2084,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     /* Cast to GUID/guid */
     if (cast_match(tname, tlen, "GUID") || cast_match(tname, tlen, "guid")) {
         ray_release(s);
-        if (val->type == -RAY_GUID) { ray_retain(val); return val; }
+        if (val->type == -RAY_GUID || val->type == RAY_GUID) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
             /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
              * Require the canonical hyphenated form exactly: 32 hex

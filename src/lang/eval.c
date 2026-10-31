@@ -879,6 +879,37 @@ static void strvec_cmp_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
+/* Pool worker: GUID compare — vec-vec or vec-vs-atom over 16-byte cells.
+ * The atom side has stride 0, so one loop serves every shape.  Equality
+ * compares the two 8-byte halves; ordering is the memcmp the scalar cmp
+ * fns apply to two guid atoms. */
+typedef struct {
+    const uint8_t* lp; int64_t lstride;
+    const uint8_t* rp; int64_t rstride;
+    bool*    obuf;
+    uint16_t opc;
+} guidcmp_ctx_t;
+
+static void guidvec_cmp_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    guidcmp_ctx_t* c = (guidcmp_ctx_t*)raw;
+    const uint8_t* lp = c->lp;
+    const uint8_t* rp = c->rp;
+    int64_t ls = c->lstride, rs = c->rstride;
+    if (c->opc == OP_EQ || c->opc == OP_NE) {
+        bool inv = c->opc == OP_NE;
+        for (int64_t i = start; i < end; i++) {
+            uint64_t l0, l1, r0, r1;
+            memcpy(&l0, lp + i * ls, 8); memcpy(&l1, lp + i * ls + 8, 8);
+            memcpy(&r0, rp + i * rs, 8); memcpy(&r1, rp + i * rs + 8, 8);
+            c->obuf[i] = ((l0 == r0) & (l1 == r1)) ^ inv;
+        }
+        return;
+    }
+    for (int64_t i = start; i < end; i++)
+        c->obuf[i] = cmp_apply(c->opc, memcmp(lp + i * ls, rp + i * rs, 16));
+}
+
 /* Pool worker for the R7/R8 SYM compare fast paths.  rd == NULL means the
  * right side is a scalar target id (R7); otherwise element-wise vec-vec
  * (R8), optionally translating left ids through a vocabulary LUT when the
@@ -1481,6 +1512,55 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                 return out;
             }
             if (out && !RAY_IS_ERR(out)) ray_release(out);
+        }
+    }
+
+    /* R11 fast path: GUID compares (== != < <= > >=), vec-vec and
+     * vec-vs-atom.  The DAG path declines GUID, so without this every cell
+     * of both operands was boxed into an atom for the scalar fn: ~7 ms for
+     * 140k rows against ~0.2 ms for SYM.  A null guid is all-zero bytes, so
+     * comparing the bytes gives the scalar fns' answers for nulls too:
+     * null == null, and a null below every other value. */
+    if (!force_boxed && out_type == RAY_BOOL &&
+        dag_opcode >= OP_EQ && dag_opcode <= OP_GE) {
+        int l_guid_vec  = left_coll  && left->type  == RAY_GUID;
+        int r_guid_vec  = right_coll && right->type == RAY_GUID;
+        int l_guid_atom = !left_coll  && left->type  == -RAY_GUID;
+        int r_guid_atom = !right_coll && right->type == -RAY_GUID;
+        if ((l_guid_vec || l_guid_atom) && (r_guid_vec || r_guid_atom)) {
+            static const uint8_t null_guid[16] = {0};
+            ray_t* out = ray_vec_new(RAY_BOOL, len);
+            /* The slow path would ask for the same vector: hand back this
+             * failure rather than retry it there. */
+            if (!out || RAY_IS_ERR(out)) {
+                ray_release(e0);
+                return out ? out : ray_error("oom", NULL);
+            }
+            out->len = len;
+            guidcmp_ctx_t gctx = {
+                .lp = l_guid_vec ? (const uint8_t*)ray_data(left)
+                    : left->obj  ? (const uint8_t*)ray_data(left->obj) : null_guid,
+                .lstride = l_guid_vec ? 16 : 0,
+                .rp = r_guid_vec ? (const uint8_t*)ray_data(right)
+                    : right->obj ? (const uint8_t*)ray_data(right->obj) : null_guid,
+                .rstride = r_guid_vec ? 16 : 0,
+                .obuf = (bool*)ray_data(out), .opc = dag_opcode,
+            };
+            ray_pool_t* pool = ray_pool_get();
+            if (pool && len >= RAY_PARALLEL_THRESHOLD) {
+                ray_pool_dispatch(pool, guidvec_cmp_fn, &gctx, len);
+                /* A cancel skips the tasks not yet started: no answer. */
+                if (ray_interrupted() ||
+                    atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+                    ray_release(out);
+                    ray_release(e0);
+                    return ray_error("cancel", "interrupted");
+                }
+            } else {
+                guidvec_cmp_fn(&gctx, 0, 0, len);
+            }
+            ray_release(e0);
+            return out;
         }
     }
 
