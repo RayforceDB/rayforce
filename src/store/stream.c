@@ -344,6 +344,7 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     uint8_t attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
     uint32_t sc = w->type == RAY_SYM ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
     if (err == RAY_OK) err = ray_encw_begin(&ew, f, w->type, attrs, w->rows, sc, ik, 0);
+    if (err == RAY_OK && w->type == RAY_SYM) ray_encw_set_sym_domain(&ew, w->dom);
     if (err == RAY_OK) err = ray_encw_chunks(&ew, data, esz, pool);
     if (err == RAY_OK) err = ray_encw_finish(&ew);
     ray_encw_free(&ew);

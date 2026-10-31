@@ -17,10 +17,13 @@ AR      = ar
 TARGET  = rayforce
 # Version: the git tag is the single source of truth. Precedence:
 #   explicit override (CI passes RAY_VERSION=X.Y.Z from the release PR title)
-#   > latest git tag (vX.Y.Z) > 0.0.0 dev default.
+#   > highest vX.Y.Z git tag > 0.0.0 dev default.
+# Release tags sit on master and never flow back into dev, so the highest tag
+# is taken from the whole repository rather than from HEAD's ancestry (which
+# `git describe` would walk, leaving dev builds on an older release).
 # The value is injected into the build via -D below (see DEFS); nothing is
 # hand-edited in source to cut a release. See RELEASE.md.
-RAY_VERSION ?= $(shell git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 2>/dev/null | sed 's/^v//')
+RAY_VERSION ?= $(shell git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname 2>/dev/null | head -n 1 | sed 's/^v//')
 ifeq ($(strip $(RAY_VERSION)),)
   RAY_VERSION := 0.0.0
 endif

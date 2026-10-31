@@ -1,0 +1,9 @@
+;; @requires: posix
+;; Saving a short generation-0 slice must not copy the rest of its parent's
+;; string pool into the column file.
+(set src (as 'STR (map (fn [i] (format "a fairly long string number % for the pool" i)) (til 10000))))
+(set part (take (drop src 5000) 100))
+(.db.splayed.set "/tmp/rf_str_slice_pool/t/" (table [s] (list part)) {compress: false})
+(set got (at (.db.splayed.get "/tmp/rf_str_slice_pool/t/") 's))
+(all (== got part)) -- true
+(.sys.exec "test $(find /tmp/rf_str_slice_pool/t -name s -type f -exec cat {} + | wc -c) -lt 20000") -- 0

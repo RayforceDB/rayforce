@@ -137,12 +137,10 @@ extern ray_profile_t g_ray_profile;
 /* Allocate zero-initialized scratch buffer, returns data pointer.
  * *hdr_out receives the ray_t* header for later ray_free(). */
 static inline void* scratch_calloc(ray_t** hdr_out, size_t nbytes) {
-    ray_t* h = ray_alloc(nbytes);
+    ray_t* h = ray_alloc_zeroed_query(nbytes);
     if (!h) { *hdr_out = NULL; return NULL; }
-    void* p = ray_data(h);
-    memset(p, 0, nbytes);
     *hdr_out = h;
-    return p;
+    return ray_data(h);
 }
 
 /* Allocate uninitialized scratch buffer. */

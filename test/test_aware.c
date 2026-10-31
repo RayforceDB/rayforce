@@ -3974,6 +3974,100 @@ static bool aw_forge_absent(const char* path, int64_t c) {
  * generation 0; nothing materializes (the sort key is read by range).  kn has a
  * null every 1000 rows and chunk 2 all null; its values climb to 300004
  * at row 299999 and restart at 5. */
+/* A SYM first key prunes from its strings' four-byte prefixes
+ * (RAY_ENC_SYM_PFX).  Every seventh row is null (""), 5000 "m" values fill
+ * every chunk, and the best strings — " a<j>", a leading space — sit in
+ * chunk 4 alone, so an ascending take past `!= s ""` reads chunk 4 and
+ * prunes the rest, from a bound seeded before any row is read.  The tie
+ * table holds "abcd" strings in chunks 1 and 3 whose prefixes are equal
+ * while chunk 3 holds the best ones: a prefix equal to the bound is never
+ * pruned. */
+static test_result_t test_topk_sym_prefix_prune(void) {
+    aw_save("sp", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (== 0 (% j 7)) \"\" "
+                  "(if (and (>= j 262144) (< j 262194)) (format \" a%\" j) (format \"m%\" (% j 5000))))) (til 400000))) "
+                  "(% (* (til 400000) 13) 1000)))", -1);
+    static const char* const q[] = {
+        "(select {s: s from: T where: (!= s \"\") asc: s take: 10})",        /* 7 chunks: too few to seed */
+        "(select {s: s v: v from: T where: (and (!= s \"\") (> v 100)) asc: s take: 10})",
+        "(select {s: s from: T where: (!= s \"\") desc: s take: 10})",
+        "(select {s: s v: v from: T where: (> v 100) asc: s take: 12})",      /* nulls lead: nothing pruned */
+        "(select {s: s from: T asc: s take: 70})",
+        "(select {s: s v: v from: T where: (!= s \"\") asc: [s v] take: 60})",
+        NULL,
+    };
+    for (int i = 0; q[i]; i++) AW_SAME("sp", q[i], 0);
+    uint64_t pc = 0, pv = 0;
+    aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/sp2/\"))");
+    aw_eval_ok(q[0]);
+    ray_fused_topk_test_pruned(&pc, &pv);
+    TEST_ASSERT_FMT(pc + pv > 0, "ascending SYM take: %llu chunks, %llu vectors pruned",
+                    (unsigned long long)pc, (unsigned long long)pv);
+    TEST_ASSERT_EQ_I(ray_fused_topk_test_seeded(), 0);         /* one witness a chunk, 7 of 10 */
+    aw_eval_ok(q[1]);
+    ray_fused_topk_test_pruned(&pc, &pv);
+    TEST_ASSERT_FMT(pv > 0, "ascending SYM take under another filter: %llu vectors pruned", (unsigned long long)pv);
+    TEST_ASSERT_EQ_I(ray_fused_topk_test_seeded(), 0);
+    /* A seeded bound: four chunks of "c", "b", "z" and "d" strings (a null
+     * every 9 rows).  A take of 2 has two chunk witnesses: ascending the
+     * seed is chunk 0's minimum, and chunks 2 and 3 lie strictly above it;
+     * descending it is chunk 3's maximum, chunks 0 and 1 strictly below.
+     * Under a second filter no bound is seeded (the witnesses may fail
+     * it), and a take of 5 has too few chunks. */
+    aw_save("ss", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (== 0 (% j 9)) \"\" "
+                  "(format \"%%\" (at [\"c\" \"b\" \"z\" \"d\"] (div j 65536)) (% (* j 7919) 100003)))) (til 262144))) "
+                  "(% (til 262144) 100)))", -1);
+    static const struct { const char* q; uint64_t seeded; } qs[] = {
+        { "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 2})", 1 },
+        { "(select {s: s v: v from: T where: (!= s \"\") desc: s take: 2})", 1 },
+        { "(select {s: s v: v from: T where: (and (!= s \"\") (> v 50)) asc: s take: 2})", 0 },
+        { "(select {s: s v: v from: T where: (and (!= s \"\") (> v 50)) desc: s take: 2})", 0 },
+        { "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 5})", 0 },
+    };
+    for (size_t i = 0; i < sizeof(qs) / sizeof(qs[0]); i++) {
+        AW_SAME("ss", qs[i].q, 0);
+        aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/ss2/\"))");
+        aw_eval_ok(qs[i].q);
+        TEST_ASSERT_FMT(ray_fused_topk_test_seeded() == qs[i].seeded, "%s: seeded %llu, want %llu", qs[i].q,
+                        (unsigned long long)ray_fused_topk_test_seeded(), (unsigned long long)qs[i].seeded);
+        /* the flag is this query's: its select ran the fused top-k (it
+         * resets the flag with the pruning counters) and pruned */
+        if (qs[i].seeded) {
+            ray_fused_topk_test_pruned(&pc, &pv);
+            TEST_ASSERT_FMT(pc + pv > 0, "%s: %llu chunks, %llu vectors pruned", qs[i].q,
+                            (unsigned long long)pc, (unsigned long long)pv);
+        }
+    }
+    /* The best strings, " b<j>", one per 4096 rows (in some 70 vectors),
+     * all rejected by the second filter: a bound seeded from the vectors'
+     * minima would rule out the answer, so none is seeded under it. */
+    aw_save("sw", "(table [s w i] (list (as 'SYMBOL (map (fn [j] (if (== 1 (% j 4096)) (format \" b%\" j) "
+                  "(format \"m%\" (% j 5000)))) (til 300000))) (map (fn [j] (if (== 1 (% j 4096)) 1 0)) (til 300000)) (til 300000)))", -1);
+    /* the row ids tell the answer's rows apart: the best string repeats */
+    AW_SAME("sw", "(select {s: s i: i from: T where: (and (!= s \"\") (== w 0)) asc: s take: 3})", 0);
+    /* Ten nulls in the last vectors of the last chunk, among "z" strings,
+     * after "y" ones, the best strings ("a") in the chunks before: ascending
+     * without a null-dropping predicate the nulls lead, and the bound a
+     * full heap of "y" or "a" rows publishes must not prune the vectors
+     * that hold them on their prefixes. */
+    aw_save("sn", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (>= j 299000) (if (== 0 (% j 100)) \"\" (format \"z%\" j)) "
+                  "(if (>= j 262144) (format \"y%\" j) (format \"a%\" (% j 7000))))) (til 300000))) (% (til 300000) 100)))", -1);
+    AW_SAME("sn", "(select {s: s v: v from: T asc: s take: 5})", 0);
+    AW_SAME("sn", "(select {s: s v: v from: T where: (> v 10) asc: s take: 5})", 0);
+    AW_SAME("sn", "(select {s: s v: v from: T where: (!= s \"\") desc: s take: 5})", 0);
+    /* A prefix tie inside one chunk: vector 0 holds "abcdX" (worse), vector
+     * 1 "abcdA" (the answer), one task scans both in order, so the bound is
+     * "abcd" when vector 1 is reached; an equal prefix is never pruned. */
+    aw_save("sv", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (< j 1024) (format \"abcdX%\" j) "
+                  "(if (< j 1034) (format \"abcdA%\" j) (format \"q%\" (% j 300))))) (til 200000))) (til 200000)))", -1);
+    AW_SAME("sv", "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 5})", 0);
+    aw_save("st", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (< j 65636)) (format \"abcdX%\" j) "
+                  "(if (and (>= j 196608) (< j 196618)) (format \"abcdA%\" j) (format \"q%\" (% j 300))))) (til 300000))) "
+                  "(til 300000)))", -1);
+    AW_SAME("st", "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 5})", 0);
+    AW_SAME("st", "(select {s: s v: v from: T where: (> v 10) asc: s take: 5})", 0);
+    PASS();
+}
+
 static test_result_t test_topk_prune_cases(void) {
     aw_save("tp", "(table [kn v] (list (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N "
                   "(+ 5 (% j 300000)))) (til 400000))) (% (* (til 400000) 13) 1000)))", -1);
@@ -5443,6 +5537,7 @@ const test_entry_t aware_entries[] = {
     { "aware/count_on_runs",       test_count_on_runs,       aw_setup, aw_teardown },
     { "aware/group_count_on_runs", test_group_count_on_runs, aw_setup, aw_teardown },
     { "aware/topk_prune_cases",    test_topk_prune_cases,    aw_setup, aw_teardown },
+    { "aware/topk_sym_prefix_prune", test_topk_sym_prefix_prune, aw_setup, aw_teardown },
     { "aware/topk_range_keys",     test_topk_range_keys,     aw_setup, aw_teardown },
     { "aware/group_topn_ties",     test_group_topn_ties,     aw_setup, aw_teardown },
     { "aware/group_topn_nulls",    test_group_topn_nulls,    aw_setup, aw_teardown },

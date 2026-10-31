@@ -29,6 +29,7 @@
 #include "store/encfmt.h"
 #include "store/encidx.h"
 #include "store/fsst.h"
+#include "table/domain.h"
 
 typedef struct {
     ray_enc_desc_t desc;        /* payload_off is set by the column writer */
@@ -122,6 +123,9 @@ typedef struct {
     bool     fsst_used;        /* some vector is FSST: the FSST_TABLE entry is written */
     uint64_t str_occ_bytes;    /* per-occurrence pooled bytes (the generation-0 bound) */
     struct ray_dict_acc_s* idict;  /* STR, index_kind DICT (P6b): generation 0's accumulator, fed per chunk */
+    ray_sym_domain_t* sym_dom;     /* SYM: the domain the codes are positions of (RAY_ENC_SYM_PFX); NULL: no bounds */
+    ray_sym_domain_raw_t sym_raw; bool sym_raw_ok;
+    struct ray_symimp_s* sym_imp; int64_t sym_imp_count;   /* an import domain's dictionary */
 } ray_encw_t;
 /* index_kind RAY_IDX_DICT (P6b, spec "Writing the index"): the writer
  * builds the DICT region itself from the chunks it encodes and writes it at
@@ -145,6 +149,9 @@ void      ray_encw_free(ray_encw_t* w);
  * column's final persisted attrs at finish.  A region writer failure leaves
  * its "index region: ..." message in ray_error_msg(). */
 void      ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s);
+/* A SYM column's domain (its codes are positions in it): the writer records
+ * the string-prefix bounds of every chunk and vector (RAY_ENC_SYM_PFX). */
+void      ray_encw_set_sym_domain(ray_encw_t* w, ray_sym_domain_t* dom);
 /* Copy `len` bytes of an already validated region of `kind` verbatim (never
  * on a writer begun with RAY_IDX_DICT). */
 void      ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region, uint64_t len);
