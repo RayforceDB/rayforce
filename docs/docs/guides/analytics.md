@@ -336,7 +336,7 @@ Use `nil?` to check for null values:
 ```lisp
 (nil? 0Nl)            ; true
 (nil? 42)             ; false
-(map nil? (list 10 0Nl 30))  ; (false true false)
+(map nil? (list 10 0Nl 30))  ; [false true false]
 ```
 
 Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), `0Np` (timestamp).
