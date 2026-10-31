@@ -196,6 +196,12 @@ bool ray_raise_render(char* buf, size_t cap) {
 void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
 
+bool ray_fn_is_local_mutator(const ray_t* fn) {
+    if (!fn || fn->type != RAY_VARY) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_insert || f == ray_insert_fn || f == ray_alter_fn;
+}
+
 static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
@@ -3009,19 +3015,27 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         return ray_error("arity", "expected %" PRId64 " args, got %" PRId64, param_count, argc);
 
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
+    /* A query helper's call frame caches source columns on demand, above
+     * its table_from.  It sits below the frame that binds self, the
+     * parameters and the body's lets, so none of those is ever taken for
+     * a column: the captures' frame for a closure, an empty call frame
+     * otherwise, as a compiled helper keeps its locals in VM slots. */
+    bool call_frame = has_closure || query;
     if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda), LAMBDA_CAPROWS(lambda),
                                             LAMBDA_CAPQ(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
     if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
+    if (query && !has_closure &&
+        ray_env_push_call_scope(ray_query_helper_table(), named) != RAY_OK)
+        return ray_error("oom", NULL);
     if (ray_env_push_scope() != RAY_OK) {
-        if (has_closure) ray_env_pop_scope();
+        if (call_frame) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
     /* Closures made inside the body capture down to this call's frames
-     * (its captures and parameters), never the caller's locals. */
-    ray_env_mark_lexical_scope(has_closure ? 1 : 0);
-
-    if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
+     * (its captures or columns, and its parameters), never the caller's
+     * locals. */
+    ray_env_mark_lexical_scope(call_frame ? 1 : 0);
 
     /* Bind 'self' to the current lambda for recursion */
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
@@ -3037,7 +3051,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             arg = ray_lazy_materialize(arg);
             if (!arg || RAY_IS_ERR(arg)) {
                 ray_env_pop_scope();
-                if (has_closure) ray_env_pop_scope();
+                if (call_frame) ray_env_pop_scope();
                 return arg ? arg : ray_error("type", NULL);
             }
         }
@@ -3064,7 +3078,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             }
             __VM->lambda_depth--;
             ray_env_pop_scope();
-            if (has_closure) ray_env_pop_scope();
+            if (call_frame) ray_env_pop_scope();
             return result;
         }
     }
@@ -3072,7 +3086,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     if (out_rows) *out_rows = g_eval_rows;   /* the body's last value's provenance */
 
     ray_env_pop_scope();
-    if (has_closure) ray_env_pop_scope();
+    if (call_frame) ray_env_pop_scope();
     return result;
 }
 
@@ -3234,6 +3248,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL1R]        = &&op_call1r,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
+        [OP_JMPM]          = &&op_jmpm,
     };
 
     /* Arity check before allocating VM state */
@@ -3590,6 +3605,20 @@ op_calln: {
     ray_release(fn_obj);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, result_rows);
+    DISPATCH();
+}
+
+op_jmpm: {
+    /* A local or unbound callee holding insert or alter: its target names
+     * a binding of this frame as readily as a global, and its arguments
+     * are forms it reads itself, so the compiler's dynamic form for the
+     * whole call takes over (see OP_JMPM). */
+    int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
+    ip += 2;
+    if (ray_fn_is_local_mutator(PEEK())) {
+        ray_release(POP());
+        ip += offset;
+    }
     DISPATCH();
 }
 

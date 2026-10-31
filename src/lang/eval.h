@@ -123,6 +123,12 @@ enum {
     OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
     OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
                        * of that kind, OP_CALLF's general call otherwise */
+    OP_JMPM,          /* jump (2-byte signed offset) when TOS is insert or
+                       * alter, popping it; fall through leaving it otherwise.
+                       * Guards a call whose callee is unknown at compile
+                       * time (a local, an unbound name): a mutator found
+                       * there runs as a dynamic form, as the tree walker
+                       * would run it */
     OP__COUNT
 };
 

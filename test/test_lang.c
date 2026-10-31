@@ -11213,10 +11213,50 @@ static test_result_t test_clock_local_follows_tz(void) {
     PASS();
 }
 
+/* Return an address as data, without retaining the inspected value. Using
+ * eval below exposes compiled slots through the same window as mutators. */
+static ray_t* mutation_local_address(ray_t* name) {
+    if (!name || name->type != -RAY_SYM) return ray_error("type", NULL);
+    ray_env_target_t target;
+    ray_t* value = NULL;
+    ray_err_t err = ray_env_target_resolve(name->i64, &target, &value);
+    return err == RAY_OK ? ray_i64((int64_t)(uintptr_t)value)
+                        : ray_error(ray_err_code_str(err), NULL);
+}
+
+static test_result_t test_local_mutation_fast_paths(void) {
+    ray_t* inspector = ray_fn_unary("mutation-local-address", 0, mutation_local_address);
+    TEST_ASSERT_NOT_NULL(inspector);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inspector));
+    TEST_ASSERT_EQ_I(ray_env_bind(ray_sym_intern("mutation-local-address", 22), inspector), RAY_OK);
+    ray_release(inspector);
+
+    /* These assertions test physical engagement, not just equal results. An
+     * unused alias must force a copy, whereas a VM mirror must not. */
+    ASSERT_EQ("((fn [] (let v (til 10000)) "
+              "(let p (eval (quote (mutation-local-address 'v)))) "
+              "(alter 'v set 0 99) "
+              "(== p (eval (quote (mutation-local-address 'v))))))", "true");
+    ASSERT_EQ("((fn [] (let t (table [x] (list (til 10000)))) "
+              "(let p (eval (quote (mutation-local-address 't)))) "
+              "(insert 't (list 99)) "
+              "(== p (eval (quote (mutation-local-address 't))))))", "true");
+    ASSERT_EQ("((fn [] (let v (til 10)) (let alias v) "
+              "(let p (eval (quote (mutation-local-address 'v)))) "
+              "(alter 'v set 0 99) "
+              "(== p (eval (quote (mutation-local-address 'v))))))", "false");
+    ASSERT_EQ("((fn [] (let t (table [x] (list (til 10)))) (let alias t) "
+              "(let p (eval (quote (mutation-local-address 't)))) "
+              "(insert 't (list 99)) "
+              "(== p (eval (quote (mutation-local-address 't))))))", "false");
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
+    { "lang/local_mutation_fast_paths", test_local_mutation_fast_paths, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },

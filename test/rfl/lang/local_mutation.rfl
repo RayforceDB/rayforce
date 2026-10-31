@@ -1,0 +1,175 @@
+;; Quoted insert and alter target the same lexical binding that is read.
+(set vg [50 60])
+(set vf (fn [] (let vg (til 2)) (insert 'vg 9) vg))
+(list (vf) vg) -- (list [0 1 9] [50 60])
+
+((fn [] (let v (til 3)) (alter 'v set 1 9) v)) -- [0 9 2]
+((fn [] (let v (til 3)) (alter 'v concat [3 4]) v)) -- [0 1 2 3 4]
+((fn [] (let v (list 1 2 3)) (alter 'v remove 1) v)) -- (list 1 3)
+((fn [] (let v (list 1 2)) (alter 'v set 0 'x) v)) -- (list 'x 2)
+
+;; Parameters retain copy-on-write isolation from the caller.
+(set arg [1 2 3])
+((fn [v] (alter 'v set 0 9) v) arg) -- [9 2 3]
+arg -- [1 2 3]
+((fn [v] (insert 'v 4) v) arg) -- [1 2 3 4]
+arg -- [1 2 3]
+
+;; A real alias or captured value must not observe the write.
+((fn [] (let v (til 3)) (let alias v) (alter 'v set 0 9) (list v alias))) -- (list [9 1 2] [0 1 2])
+((fn [] (let v (til 3)) (let saved (fn [] v)) (alter 'v set 0 9) (list v (saved)))) -- (list [9 1 2] [0 1 2])
+((fn [] (let v (til 5)) (let sliced (drop v 2)) (alter 'v set 2 9) (list v sliced))) -- (list [0 1 9 3 4] [2 3 4])
+((fn [] (let v (til 5)) (let sliced (drop v 2)) (alter 'sliced set 0 9) (list v sliced))) -- (list [0 1 2 3 4] [9 3 4])
+
+;; Errors leave the target bound and do not write a same-named global.
+(set v [50 60])
+((fn [] (let v (til 3)) (try (alter 'v set 99 9) (fn [e] 0)) v)) -- [0 1 2]
+v -- [50 60]
+((fn [] (let v (til 3)) (try (insert 'v 'bad) (fn [e] 0)) v)) -- [0 1 2]
+v -- [50 60]
+((fn [] (let v (til 3)) (try (alter 'v set (raise "bad") 9) (fn [e] 0)) v)) -- [0 1 2]
+
+;; A successfully published write survives a later caught error.
+((fn [] (let v (til 3)) (try (do (alter 'v set 0 9) (raise "bad")) (fn [e] 0)) v)) -- [9 1 2]
+
+;; A symbol constructed at runtime still targets the enclosing local.
+((fn [] (let v (til 3)) (alter (as 'SYM "v") set 0 9) v)) -- [9 1 2]
+((fn [] (let v (til 3)) (insert (as 'SYM "v") 9) v)) -- [0 1 2 9]
+v -- [50 60]
+
+;; Dotted locals use their own dictionary chain, never the global root.
+(set state (dict [v] (list [50 60])))
+((fn [] (let state (dict [v] (list (til 3)))) (alter 'state.v set 0 9) state.v)) -- [9 1 2]
+state.v -- [50 60]
+((fn [] (let state (dict [v] (list (til 3)))) (let alias state) (alter 'state.v set 0 9) (list state.v alias.v))) -- (list [9 1 2] [0 1 2])
+
+;; Local tables append without rebinding an unrelated global table.
+(set P (table [x] (list [50 60])))
+((fn [] (let P (table [x] (list (til 2)))) (insert 'P (list 9)) (at P 'x))) -- [0 1 9]
+(at P 'x) -- [50 60]
+((fn [] (let P (table [x] (list (til 2)))) (let alias P) (insert 'P (list 9)) (list (at P 'x) (at alias 'x)))) -- (list [0 1 9] [0 1])
+((fn [] (let P (table [x] (list (til 2)))) (let saved (fn [] P)) (insert 'P (list 9)) (list (count P) (count (saved))))) -- (list 3 2)
+((fn [] (let P (table [x] (list (til 2)))) (try (insert 'P (list 1 2)) (fn [e] 0)) (at P 'x))) -- [0 1]
+
+;; The whole dictionary path, not just its leaf's refcount, must be private.
+((fn [] (let s (dict [P] (list (table [x] (list (til 2)))))) (let alias s) (insert 's.P (list 9)) (list (count s.P) (count alias.P)))) -- (list 3 2)
+
+;; A separately defined function cannot mutate its caller's unrelated local.
+(set append_global (fn [] (insert 'vg 9)))
+((fn [] (let vg [1 2]) (append_global) vg)) -- [1 2]
+vg -- [50 60 9]
+
+(alter 'unknown_950 set 0 1) !- name
+(insert 'unknown_950 1) !- domain
+
+;; Nested closures capture computed mutator targets just like literal ones.
+;; None of these may clobber the same-named global; closure writes keep the
+;; enclosing value unchanged under copy-on-write.
+(set capv [50 60])
+((fn [] (let capv (til 3)) (let capf (fn [] (alter (as 'SYM "capv") set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (alter 'capv set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (count capv) (alter (as 'SYM "capv") set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (insert (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (insert 'capv 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (count capv) (insert (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+
+;; Capture selection also applies to interpreted closure creation and to
+;; a target passed through a captured variable or another nested function.
+((fn [] (let capv (til 3)) (let capf (eval (quote (fn [] (alter (as 'SYM "capv") set 0 9))))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (eval (quote (fn [] (insert (as 'SYM "capv") 9))))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let target 'capv) (let capf (fn [] (alter target set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] ((fn [] (insert (as 'SYM "capv") 9))))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+
+;; Computed dictionary paths retain the captured root, too.
+(set capstate (dict [v] (list [50 60])))
+((fn [] (let capstate (dict [v] (list (til 3)))) (let capf (fn [] (alter (as 'SYM "capstate.v") set 0 9))) (capf) capstate.v)) -- [0 1 2]
+capstate.v -- [50 60]
+((fn [] (let capstate (dict [v] (list (til 3)))) (let capf (fn [] (insert (as 'SYM "capstate.v") 9))) (capf) capstate.v)) -- [0 1 2]
+capstate.v -- [50 60]
+
+;; A body with more locals than a frame has slots stays on the tree walker;
+;; the cases below run each mutation both compiled and interpreted.
+(set lmpad (raze (map (fn [i] (format "(let lmz% 0) " i)) (til 300))))
+(set lmtw (fn [src] (eval (parse (format src lmpad)))))
+
+;; A mutator reached through a local or parameter head targets the frame's
+;; binding, compiled as on the tree walker, and never the same-named global.
+(set t [50 60])
+((fn [f] (let t (til 3)) (f 't 9) t) insert) -- [0 1 2 9]
+t -- [50 60]
+((lmtw "(fn [f] % (let t (til 3)) (f 't 9) t)") insert) -- [0 1 2 9]
+t -- [50 60]
+((fn [f] (let t (til 3)) (f 't 'set 0 9) t) alter) -- [9 1 2]
+((lmtw "(fn [f] % (let t (til 3)) (f 't 'set 0 9) t)") alter) -- [9 1 2]
+((fn [f] (let t (til 3)) (f 't set 0 9) t) alter) -- [9 1 2]
+((fn [f] (let t (til 3)) (f (as 'SYM "t") 9) t) insert) -- [0 1 2 9]
+((lmtw "(fn [f] % (let t (til 3)) (f (as 'SYM \"t\") 9) t)") insert) -- [0 1 2 9]
+((fn [] (let t (til 3)) (let g insert) (g 't 9) t)) -- [0 1 2 9]
+t -- [50 60]
+;; ... a head unbound when the body compiles, bound before it runs
+(set lmlater (fn [] (let t (til 3)) (lmins 't 9) t))
+(set lmins insert)
+(lmlater) -- [0 1 2 9]
+t -- [50 60]
+;; ... with no local of that name, the global is the visible binding
+((fn [f] (f 't 9)) insert) -- 't
+t -- [50 60 9]
+(set t [50 60])
+;; ... other callees through a local head are called as before
+((fn [f x] (f x 1)) + 2) -- 3
+((fn [f x] (f x 1)) (fn [a b] (* (+ a b) 10)) 3) -- 40
+
+;; An aliased mutator or one held in a local, inside a nested closure with
+;; a computed target, keeps the capture and leaves the global alone.
+(set capv [50 60])
+(set lmi insert)
+(set lma alter)
+((fn [] (let capv (til 3)) (let capf (fn [] (lmi (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let capf (fn [] (lma (as 'SYM "capv") 'set 0 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [] (let capv (til 3)) (let g insert) (let capf (fn [] (g (as 'SYM "capv") 9))) (capf) capv)) -- [0 1 2]
+capv -- [50 60]
+((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
+capv -- [50 60]
+
+;; An interpreted query helper mutates its own locals and parameters; its
+;; bindings are not taken for source columns.  Built at the top level, the
+;; helpers have no closure (lmtw would make them closures of its frame).
+(set lmT (table [x] (list [1 2 3])))
+(set lmhl (eval (parse (format "(fn [p] % (let q (til 3)) (alter 'q set 0 p) (sum q))" lmpad))))
+(at (select {a: (lmhl x) from: lmT}) 'a) -- [4 5 6]
+(set lmhi (eval (parse (format "(fn [p] % (let q (til 2)) (insert 'q p) (count q))" lmpad))))
+(at (select {a: (lmhi x) from: lmT}) 'a) -- [3 3 3]
+(set lmhp (eval (parse (format "(fn [p] % (alter 'p set 0 7) (concat p x))" lmpad))))
+(at (select {a: (lmhp (enlist x)) from: lmT}) 'a) -- (list [7 1] [7 2] [7 3])
+(set lmhc (eval (parse (format "(fn [p] % (let q (til 3)) (alter (as 'SYM \"q\") set 0 p) (sum q))" lmpad))))
+(at (select {a: (lmhc x) from: lmT}) 'a) -- [4 5 6]
+;; ... the compiled helper gives the same answers
+(at (select {a: ((fn [p] (let q (til 3)) (alter 'q set 0 p) (sum q)) x) from: lmT}) 'a) -- [4 5 6]
+(at (select {a: ((fn [p] (alter 'p set 0 7) (concat p x)) (enlist x)) from: lmT}) 'a) -- (list [7 1] [7 2] [7 3])
+
+;; A dotted call head rooted in a local calls through the local, as a read
+;; of the same name does; the global root keeps its own member.
+(set d (dict [f v] (list neg [50 60])))
+((fn [] (let d (dict [f v] (list (fn [x] (* x 10)) [1 2]))) d.v)) -- [1 2]
+((fn [] (let d (dict [f v] (list (fn [x] (* x 10)) [1 2]))) (d.f 3))) -- 30
+((fn [d] (d.f 4)) (dict [f] (list (fn [x] (+ x 1))))) -- 5
+(d.f 3) -- -3
+;; ... dotted local reads walk the path below the slot: nested members,
+;; temporal accessors, a missing member, a head bound later in the body
+((fn [] (let n (dict [a] (list (dict [b] (list 7))))) n.a.b)) -- 7
+((fn [] (let ts 2024.01.15D09:30:00.000000000) ts.hh)) -- 9
+((fn [] (let d (dict [v] (list 1))) (try d.w (fn [e] 'missing)))) -- 'missing
+((fn [] (let r d.v) (let d (dict [v] (list 99))) r)) -- [50 60]
+((fn [] (let v 5) (let d (dict [v] (list [1 2]))) d.v)) -- [1 2]

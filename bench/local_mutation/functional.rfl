@@ -1,0 +1,18 @@
+;; #950 baseline: functional rebinding of local state copies the table.
+;; Run an optimized build: rayforce -c 1 -f bench/local_mutation/functional.rfl
+(set N 500)
+(set syms (take [a b c d e f g h i j] N))
+(set mkP (fn [] (table [ts sym qty]
+  (list (as 'I64 []) (as 'SYM []) (as 'I64 [])))))
+(set runF (fn [steps]
+  (let P (mkP)) (let q (take 0 N)) (let k 0)
+  (while (< k steps)
+    (let P (insert P (list (take k N) syms q)))
+    (let q (+ q (concat (take 1 10) (take 0 (- N 10)))))
+    (let k (+ k 1)))
+  (if (not (and (== (count P) (* steps N)) (== (sum q) (* steps 10))))
+    (raise "functional benchmark checksum mismatch"))
+  (count P)))
+(runF 10)
+(println (list "functional-1000-ms" (timeit (runF 1000))))
+(println (list "functional-2000-ms" (timeit (runF 2000))))
