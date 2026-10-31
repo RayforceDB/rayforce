@@ -52,7 +52,8 @@
 #define RAY_TIMES_BIND "times bind"
 
 /* Internal eval flag for RAY_LIST values carried as nested IPC arguments.
- * A marked argument is data regardless of whether its head names a function. */
+ * A marked symbol-headed list is data; a function-headed list still runs.
+ * The evaluator consumes the flag when it returns a data list. */
 #define RAY_EVAL_LITERAL_FALLBACK 0x04
 void ray_eval_mark_ipc_literal_args(ray_t* msg);
 
