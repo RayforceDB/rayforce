@@ -143,3 +143,19 @@ capv -- [50 60]
 ((fn [h] (let capv (til 3)) (let capf (fn [] (h (as 'SYM "capv") 9))) (capf) capv) insert) -- [0 1 2]
 capv -- [50 60]
 
+;; An interpreted query helper mutates its own locals and parameters; its
+;; bindings are not taken for source columns.  Built at the top level, the
+;; helpers have no closure (lmtw would make them closures of its frame).
+(set lmT (table [x] (list [1 2 3])))
+(set lmhl (eval (parse (format "(fn [p] % (let q (til 3)) (alter 'q set 0 p) (sum q))" lmpad))))
+(at (select {a: (lmhl x) from: lmT}) 'a) -- [4 5 6]
+(set lmhi (eval (parse (format "(fn [p] % (let q (til 2)) (insert 'q p) (count q))" lmpad))))
+(at (select {a: (lmhi x) from: lmT}) 'a) -- [3 3 3]
+(set lmhp (eval (parse (format "(fn [p] % (alter 'p set 0 7) (concat p x))" lmpad))))
+(at (select {a: (lmhp (enlist x)) from: lmT}) 'a) -- (list [7 1] [7 2] [7 3])
+(set lmhc (eval (parse (format "(fn [p] % (let q (til 3)) (alter (as 'SYM \"q\") set 0 p) (sum q))" lmpad))))
+(at (select {a: (lmhc x) from: lmT}) 'a) -- [4 5 6]
+;; ... the compiled helper gives the same answers
+(at (select {a: ((fn [p] (let q (til 3)) (alter 'q set 0 p) (sum q)) x) from: lmT}) 'a) -- [4 5 6]
+(at (select {a: ((fn [p] (alter 'p set 0 7) (concat p x)) (enlist x)) from: lmT}) 'a) -- (list [7 1] [7 2] [7 3])
+
