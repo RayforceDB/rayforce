@@ -424,14 +424,15 @@ static ray_t* parse_string(ray_parser_t *p) {
 
     if (!has_escape) return ray_str(start, raw_len);
 
-    /* Decode escape sequences into a temporary buffer */
-    char buf[4096];
+    /* Escapes cannot expand past the raw literal length.  Keep the buffer
+     * proportional to the input so a long printed string still reads back. */
+    ray_t* decoded = ray_alloc(raw_len);
+    if (!decoded || RAY_IS_ERR(decoded)) return decoded ? decoded : ray_error("oom", NULL);
+    char* buf = (char*)ray_data(decoded);
     size_t out = 0;
     const char *r = start;
     const char *end = start + raw_len;
     while (r < end) {
-        if (out >= sizeof(buf) - 2)
-            return ray_error("domain", "parse: string literal exceeds %zu-byte escape buffer", sizeof(buf) - 2);  /* string too long for escape buffer */
         if (*r == '\\' && r + 1 < end) {
             r++;
             switch (*r) {
@@ -459,7 +460,9 @@ static ray_t* parse_string(ray_parser_t *p) {
             buf[out++] = *r++;
         }
     }
-    return ray_str(buf, out);
+    ray_t* result = ray_str(buf, out);
+    ray_free(decoded);
+    return result;
 }
 
 /* ── Symbol/char parsing: 'name or 'a' ── */
