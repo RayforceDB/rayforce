@@ -177,6 +177,14 @@ restored
 
 The deserialized table is identical to the original — all types, column names, and values are preserved.
 
+`ser` bytes are a transport representation, not a canonical encoding for value
+equality or content hashes. A symbol atom's serialized flags include whether it
+was written as a quoted literal. A generic LIST column loaded from splayed
+storage reconstructs its symbol atoms without that parser flag, so the original
+and loaded values can compare equal while their `ser` byte vectors differ. Use
+value equality to compare them; do not use a digest of `ser` as a value identity
+check across storage round trips.
+
 ## 6. Splayed and Partitioned Tables
 
 Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format — faster than CSV and preserving exact types. Three functions cover on-disk tables:
