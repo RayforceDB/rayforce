@@ -4,6 +4,20 @@
 (in 5 [1 2 3]) -- false
 (in [1 5 2] [1 2 3]) -- [true false true]
 
+;; A string needle in a list has one boolean verdict, including a miss.
+;; A B8 vector containing false is truthy as a container in `if`.
+(in "f" (list " " "\t")) -- false
+(type (in "f" (list " " "\t"))) -- 'b8
+(if (in "f" (list " " "\t")) "T" "F") -- "F"
+(if (in " " (list " " "\t")) "T" "F") -- "T"
+(in "ab" (list "ab" "c")) -- true
+(in "ab" (list "a" "b")) -- false
+(not-in "ab" (list "a" "b")) -- true
+(type (not-in "ab" (list "a" "b"))) -- 'b8
+(in 'f (list 'x 'y)) -- false
+(type (in 'f (list 'x 'y))) -- 'b8
+(in ["f" " "] (list " " "\t")) -- [false true]
+
 ;; every element of a vector is in itself
 (set V [3 1 4 1 5 9 2 6])
 (count V) -- (sum (in V V))
@@ -49,10 +63,10 @@
 (in (list 3h 2i 5 0Nl) [1 0Nl 2 3]) -- (list true true false true)
 (in [0 1 0Nl] 0Nl) -- [false false true]
 (in [3] (list 3i 2 5)) -- [true]
-(in 'a' (list "iu" "asd")) -- [false]
-(in 'a' (list "iu" "asd" 'a')) -- [true]
-(in "asd" (list "iu" "asd")) -- [false false false]
-(in "asd" (list 'd' "asd")) -- [false false true]
+(in 'a' (list "iu" "asd")) -- false
+(in 'a' (list "iu" "asd" 'a')) -- true
+(in "asd" (list "iu" "asd")) -- true
+(in "asd" (list 'd' "asd")) -- true
 (in (list "asd") (list "iu" "asd")) -- [true]
 (in (list "asd" "iu") "asd") -- [true false]
 (set l (guid 2)) (in l l) -- [true true]
@@ -223,8 +237,8 @@
 ;; A string element of a collection is one whole value.  Against a list of
 ;; strings or a string atom each element answered per character — a list of
 ;; per-character vectors that `where` refused — and inside a query the
-;; executor refused any string column with nyi.  A lone string atom on the
-;; left still answers per character, as above.
+;; executor refused any string column with nyi.  A lone string atom against
+;; a list is one whole-value membership test.
 (in ["p" "qq"] (list "qq" "zz")) -- [false true]
 (in ["p" "qq"] "qq") -- [false true]
 (in ["p" "qq" ""] (list "qq" 1 'zz)) -- [false true false]
@@ -239,7 +253,7 @@
 (in (list "zz" (list "c")) "c") -- (list false [true])
 (in (list 1 (list 1 2)) 1) -- (list true [true false])
 (in (list 1 2 (list 3 1)) [1]) -- (list true false [false true])
-(in "ab" (list "a" "b" "c")) -- [true true]
+(in "ab" (list "a" "b" "c")) -- false
 
 (set TS (table [s n] (list ["p" "qq" "zz" ""] [1 2 3 4])))
 (at (select {from: TS where: (in s ["qq" "zz"])}) 'n) -- [2 3]
@@ -331,9 +345,9 @@
 (set RQ (select {c: (list s) from: TQ}))
 (in (first (first (at RQ 'c))) "q") -- [true true]
 (set RQ2 (select {c: (dict [k] (list s)) from: TQ}))
-(in (at (first (at RQ2 'c)) 'k) (list "q")) -- [true true]
-;; a lone string literal in a query still answers per character, per row
-(at (select {c: (in "ab" (list "a" "b")) from: TS take: 1}) 'c) -- (list [true true])
+(in (at (first (at RQ2 'c)) 'k) (list "q")) -- false
+;; a lone string literal in a query gives one verdict per row
+(at (select {c: (in "ab" (list "a" "b")) from: TS take: 1}) 'c) -- [false]
 ;; a set held in a global list is read by the evaluator, not taken for a column
 (set SETL (list "qq" "zz"))
 (at (select {from: TS where: (in s SETL)}) 'n) -- [2 3]

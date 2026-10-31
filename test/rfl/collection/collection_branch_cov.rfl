@@ -306,9 +306,9 @@
 (in 3 3) -- true
 (in 3 4) -- false
 
-;; STR in LIST (lines 903-921)
-(in "ab" (list "a" "b" "c")) -- [true true]
-(in "xy" (list "x" "z")) -- [true false]
+;; STR in LIST: one whole-string verdict
+(in "ab" (list "a" "b" "c")) -- false
+(in "xy" (list "x" "z")) -- false
 
 ;; Empty collection val (line 925-927)
 (in (as 'I64 (list)) [1 2 3]) -- []
