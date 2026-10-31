@@ -1,0 +1,13 @@
+;; A compiled function addresses its constants with at most two bytes.  Past
+;; 0xFFFF constants the function is left to the tree walker, which gives the
+;; right values; without that, constant 70000 reads as constant 4464.
+;; The literals are distinct, so none is shared, and the body is built with
+;; parse because it would not fit a source file.
+(set cplits (fn [lo n] (str-join (map (fn [i] (as 'STR (+ lo i))) (til n)) " ")))
+
+;; OP_LOADCONST_W: the last literal sits at index 70000.
+(set cpf1 (eval (parse (format "(fn [] % 123456789)" (cplits 3000000 70000)))))
+(cpf1) -- 123456789
+;; ... the last index that fits still compiles and reads its own constant
+(set cpf2 (eval (parse (format "(fn [] % 123456789)" (cplits 3000000 65534)))))
+(cpf2) -- 123456789

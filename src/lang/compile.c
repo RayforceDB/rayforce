@@ -157,6 +157,11 @@ static int32_t add_constant(compiler_t *c, ray_t *value) {
                 v->attrs == value->attrs) return i;
         }
     }
+    /* A constant index is written as one byte (OP_LOADCONST), or as two
+     * (OP_LOADCONST_W, and the operand of OP_PATHGET).  An index past
+     * 0xFFFF would read as the constant of its low 16 bits, silently:
+     * refuse it, and the function stays on the tree walker. */
+    if (c->n_consts > 0xFFFF) { c->error = true; return c->n_consts; }
     if (c->n_consts >= c->consts_cap) {
         int32_t new_cap = c->consts_cap * 2;
         ray_t *new_obj = ray_alloc(new_cap * sizeof(ray_t *));

@@ -1,0 +1,10 @@
+;; OP_PATHGET carries its constant index in two bytes, like OP_LOADCONST_W.
+;; Past 0xFFFF constants the function is left to the tree walker; without
+;; that, the constant of d.v (index 70000) reads as d.a's (index 4464).
+(set cplits (fn [lo n] (str-join (map (fn [i] (as 'STR (+ lo i))) (til n)) " ")))
+
+(set cpf3 (eval (parse (format "(fn [d] % d.a % d.v)" (cplits 3000000 4464) (cplits 4000000 65535)))))
+(cpf3 (dict [a v] (list 7 42))) -- 42
+;; ... a function that fits reads its own constant
+(set cpf4 (eval (parse (format "(fn [d] % d.a % d.v)" (cplits 3000000 100) (cplits 4000000 100)))))
+(cpf4 (dict [a v] (list 7 42))) -- 42
