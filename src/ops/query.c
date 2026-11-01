@@ -28120,7 +28120,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                  * Raw cells carry their null sentinels; propagate the
                  * flag with them. */
                 res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
-                if (!RAY_IS_ERR(res) && ray_vec_may_have_nulls(pay))
+                /* SYM is conservatively nullable even with no zero ids;
+                 * persist HAS_NULLS only when this payload has a null. */
+                if (!RAY_IS_ERR(res) &&
+                    (ct == RAY_SYM ? ray_vec_text_has_nulls(pay)
+                                   : ray_vec_may_have_nulls(pay)))
                     res->attrs |= RAY_ATTR_HAS_NULLS;
             } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
                 /* Differently-typed vector or generic list: coerce cell by
