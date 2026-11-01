@@ -1329,6 +1329,7 @@ static ray_t* alter_target(ray_t** args, int64_t n,
                            ray_t* name_sym);
 
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
+    bool via_callee = ray_env_mutator_callee_take();   /* before anything else runs */
     if (n < 3) return ray_error("domain", "alter: expects at least 3 arguments (var, op, ...), got %lld", (long long)n);
     /* First arg: evaluate to get the symbol */
     ray_t* name_sym = ray_eval(args[0]);
@@ -1337,7 +1338,7 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
 
     ray_env_target_t target;
     ray_t* var = NULL;
-    ray_err_t err = ray_env_target_resolve(name_sym->i64, &target, &var);
+    ray_err_t err = ray_env_target_resolve_via(name_sym->i64, via_callee, &target, &var);
     if (err != RAY_OK) {
         ray_release(name_sym);
         return ray_error(ray_err_code_str(err), "alter: cannot resolve target binding");

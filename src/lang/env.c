@@ -1202,9 +1202,20 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
 
 /* Resolve like a read, but never turn query columns or dotted accessors into
  * writable globals. A call boundary hides its caller's locals. */
-static ray_err_t target_flat(int64_t name, int32_t* scope, ray_t** value) {
+static ray_err_t target_flat(int64_t name, bool via_callee, int32_t* scope, ray_t** value) {
     bool in_callee = false;
-    if (__VM) for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    int32_t d = __VM ? __VM->scope_depth - 1 : -1;
+    if (via_callee) {
+        /* Past the frames of the function making the call: down to and
+         * including the one that bounds it. */
+        while (d >= 0) {
+            bool bound = __VM->scope_stack[d].lexical;
+            d--;
+            if (bound) break;
+        }
+        in_callee = true;
+    }
+    for (; d >= 0; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->lexical) in_callee = true;
         if (f->eval_window && in_callee) continue;
@@ -1240,20 +1251,33 @@ static ray_t* target_root(const ray_env_target_t* target) {
     return NULL;
 }
 
+static _Thread_local bool g_mutator_callee;
+void ray_env_mutator_callee_arm(void) { g_mutator_callee = true; }
+bool ray_env_mutator_callee_take(void) {
+    bool armed = g_mutator_callee;
+    g_mutator_callee = false;
+    return armed;
+}
+
 ray_err_t ray_env_target_resolve(int64_t name, ray_env_target_t* target,
                                  ray_t** value) {
+    return ray_env_target_resolve_via(name, false, target, value);
+}
+
+ray_err_t ray_env_target_resolve_via(int64_t name, bool via_callee,
+                                     ray_env_target_t* target, ray_t** value) {
     *target = (ray_env_target_t){ .name = name, .root = name, .scope = -1 };
     *value = NULL;
     if (ray_sym_is_reserved(name) && !ray_sym_is_ipc_hook(name))
         return RAY_ERR_RESERVED;
-    ray_err_t err = target_flat(name, &target->scope, value);
+    ray_err_t err = target_flat(name, via_callee, &target->scope, value);
     if (err != RAY_ERR_NAME || !ray_sym_is_dotted(name)) return err;
     const int64_t* segs;
     int n = ray_sym_segs(name, &segs);
     if (n < 2) return RAY_ERR_NAME;
     target->root = segs[0];
     target->dotted = true;
-    err = target_flat(target->root, &target->scope, value);
+    err = target_flat(target->root, via_callee, &target->scope, value);
     if (err != RAY_OK) return err;
     for (int i = 1; i < n; i++) {
         if ((*value)->type != RAY_DICT) return RAY_ERR_TYPE;

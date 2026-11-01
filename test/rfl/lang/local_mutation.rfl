@@ -105,19 +105,30 @@ capstate.v -- [50 60]
 
 ;; Local targets need a literal insert or alter head, or a global alias of
 ;; one.  Any other head (a parameter, a let, a dotted head, a computed head,
-;; a name unbound when the body compiles) is an ordinary callee: in compiled
-;; code a quoted target resolves as a global, as on dev, and a computed
-;; target publishes nothing.
+;; a name unbound when the body compiles) is an ordinary callee: a quoted
+;; target resolves as a global and a computed target publishes nothing, in
+;; compiled code and on the tree walker (lmtw) alike.
 (set t [50 60])
 ((fn [f] (let t (til 3)) (f 't 9) t) insert) -- [0 1 2]
+t -- [50 60 9]
+(set t [50 60])
+((lmtw "(fn [f] % (let t (til 3)) (f 't 9) t)") insert) -- [0 1 2]
 t -- [50 60 9]
 (set t [50 60])
 ((fn [f] (let t (til 3)) (f 't 'set 0 9) t) alter) -- [0 1 2]
 t -- [9 60]
 (set t [50 60])
+((lmtw "(fn [f] % (let t (til 3)) (f 't 'set 0 9) t)") alter) -- [0 1 2]
+t -- [9 60]
+(set t [50 60])
 ((fn [f] (let t (til 3)) (f (as 'SYM "t") 9) t) insert) -- [0 1 2]
 t -- [50 60]
+((lmtw "(fn [f] % (let t (til 3)) (f (as 'SYM \"t\") 9) t)") insert) -- [0 1 2]
+t -- [50 60]
 ((fn [] (let t (til 3)) (let g insert) (g 't 9) t)) -- [0 1 2]
+t -- [50 60 9]
+(set t [50 60])
+((lmtw "(fn [] % (let t (til 3)) (let g insert) (g 't 9) t)")) -- [0 1 2]
 t -- [50 60 9]
 (set t [50 60])
 ;; ... a computed head is an ordinary callee: evaluated once
@@ -126,9 +137,9 @@ t -- [50 60 9]
 lmn -- 1
 t -- [50 60 9]
 (set t [50 60])
-;; ... a function that stays on the tree walker reaches the same resolver
-;; with its frames in scope, so a quoted target there names the local
-((lmtw "(fn [f] % (let t (til 3)) (f 't 9) t)") insert) -- [0 1 2 9]
+;; ... a literal head or an alias in a function on the tree walker still
+;; names the local
+((lmtw "(fn [] % (let t (til 3)) (insert 't 9) t)")) -- [0 1 2 9]
 t -- [50 60]
 ;; ... other callees through a local head are called as before
 ((fn [f x] (f x 1)) + 2) -- 3

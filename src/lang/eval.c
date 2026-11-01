@@ -202,6 +202,16 @@ bool ray_fn_is_local_mutator(const ray_t* fn) {
     return f == ray_insert || f == ray_insert_fn || f == ray_alter_fn;
 }
 
+/* The head `hd` of a call, which evaluated to the mutator `head`, is the
+ * literal insert or alter or a global alias of one: an unquoted symbol bound
+ * in no local frame, whose global binding is that mutator.  Any other head
+ * (a parameter, a let, a dotted head, a computed head) makes the mutator an
+ * ordinary callee, as compile_call treats it. */
+static bool mutator_head_is_global(const ray_t* hd, const ray_t* head) {
+    if (!hd || hd->type != -RAY_SYM || (hd->attrs & ATTR_QUOTED)) return false;
+    return !ray_env_get_local(hd->i64) && ray_env_get_global(hd->i64) == head;
+}
+
 static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
@@ -5417,7 +5427,13 @@ ray_t* ray_eval(ray_t* obj) {
         case RAY_VARY: {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_vary_fn fn = (ray_vary_fn)(uintptr_t)head->i64;
-            if (head->attrs & RAY_FN_SPECIAL_FORM) {
+            /* insert or alter reached through any head but the literal name
+             * or a global alias: an ordinary call, its operands evaluated
+             * first, and its quoted target is no binding of this function. */
+            bool callee_mutator = (head->attrs & RAY_FN_SPECIAL_FORM) &&
+                                  ray_fn_is_local_mutator(head) &&
+                                  !mutator_head_is_global(elems[0], head);
+            if ((head->attrs & RAY_FN_SPECIAL_FORM) && !callee_mutator) {
                 /* A control form returns one of its operands; any other
                  * form (a query, a table op) builds a new value. */
                 bool inherits = form_inherits_rows(head);
@@ -5447,6 +5463,7 @@ ray_t* ray_eval(ray_t* obj) {
                 if (err) { ray_release(head); ret = err; goto out; }
             }
             ray_release(head);
+            if (callee_mutator) ray_env_mutator_callee_arm();
             ray_t* result = fn(args, argc);
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ret = result; goto out;

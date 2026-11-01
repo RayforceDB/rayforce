@@ -60,6 +60,17 @@ typedef struct {
 } ray_env_target_t;
 ray_err_t ray_env_target_resolve(int64_t name, ray_env_target_t* target,
                                  ray_t** value);
+/* A mutator reached through a head other than the literal insert or alter,
+ * or a global alias of one, is an ordinary callee: its quoted target names
+ * no binding of the function making the call.  `via_callee` resolves the
+ * name past that function's own frames (up to the frame that bounds it:
+ * its parameters, lets and captures), as compiled code does, where those
+ * frames are not in scope.  The tree walker arms the flag just before it
+ * calls such a mutator; insert and alter take it on entry. */
+ray_err_t ray_env_target_resolve_via(int64_t name, bool via_callee,
+                                     ray_env_target_t* target, ray_t** value);
+void ray_env_mutator_callee_arm(void);
+bool ray_env_mutator_callee_take(void);
 ray_err_t ray_env_target_set(const ray_env_target_t* target, ray_t* value);
 /* refs counts the mutator's owning refs, excluding binding/VM mirror refs. */
 bool ray_env_target_sole(const ray_env_target_t* target, ray_t* value,

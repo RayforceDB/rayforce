@@ -11322,8 +11322,10 @@ static test_result_t test_local_mutation_walker_fixture(void) {
         ray_release(r);
     }
     ASSERT_EQ("(type lmpadc)", "'str");
-    ASSERT_EQ("(lmwalk insert)", "[0 1 2 9]");
+    /* both write the global t through a parameter holding insert */
+    ASSERT_EQ("(lmwalk insert)", "[0 1 2]");
     ASSERT_EQ("(lmsmall insert)", "[0 1 2]");
+    ASSERT_EQ("t", "[50 60 9 9]");
     ray_t* walk = ray_env_get(ray_sym_intern("lmwalk", 6));
     ray_t* small = ray_env_get(ray_sym_intern("lmsmall", 7));
     TEST_ASSERT_NOT_NULL(walk);

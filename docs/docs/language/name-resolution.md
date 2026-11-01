@@ -100,8 +100,8 @@ This holds when the call's head is the literal `insert` or `alter`, or a
 global alias of one, such as `(set ins insert)`, bound when the function is
 compiled. A mutator reached through any other head (a parameter, a `let`, a
 dotted head, a computed head, or a name unbound at that time) is an ordinary
-callee: in compiled code a quoted target resolves as a global, and a computed
-target publishes nothing. See [`insert` / `upsert`](syntax.md#insert-upsert).
+callee: a quoted target resolves as a global and a computed target publishes
+nothing, whether the function is compiled or left to the tree walker. See [`insert` / `upsert`](syntax.md#insert-upsert).
 
 `upsert` is unchanged: its quoted form still writes back to a global name
 when it rebuilds the result, so for a local table use the value-returning

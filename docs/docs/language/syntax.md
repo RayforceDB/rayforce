@@ -485,10 +485,9 @@ This applies when the call's head is the literal `alter` or `insert`, or a
 global alias of one, such as `(set ins insert)`, bound when the function is
 compiled. A mutator reached through any other head (a parameter, a `let`, a
 dotted head, a computed head, or a name unbound at that time) is an ordinary
-callee: in compiled code a quoted target resolves as a global, as before, and
-a computed target publishes nothing. The tree walker, which runs a function
-too large to compile, resolves a quoted target through the caller's frames
-whatever the head.
+callee: a quoted target resolves as a global, as before, and a computed
+target publishes nothing, whether the function is compiled or left to the
+tree walker.
 
 Under a literal head or an alias, a closure with a computed `alter` or
 `insert` target retains the enclosing bindings that the target could name,

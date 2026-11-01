@@ -27605,6 +27605,7 @@ ray_t* ray_insert_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_insert(ray_t** args, int64_t n) {
+    bool via_callee = ray_env_mutator_callee_take();   /* before anything else runs */
     if (n < 2) return ray_error("arity", "insert: expects a target and a value, got %lld args", (long long)n);
 
     /* In-place vs functional is decided by the EVALUATED first argument:
@@ -27630,7 +27631,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             /* Resolve once: a local target must never publish into a global. */
             inplace_sym = tbl->i64;
             ray_release(tbl);
-            ray_err_t err = ray_env_target_resolve(inplace_sym, &target, &tbl);
+            ray_err_t err = ray_env_target_resolve_via(inplace_sym, via_callee, &target, &tbl);
             if (err != RAY_OK)
                 return ray_error(err == RAY_ERR_NAME ? "domain" : ray_err_code_str(err),
                                  "insert: cannot resolve target binding");
