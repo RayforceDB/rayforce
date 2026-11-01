@@ -3925,7 +3925,7 @@ static bool ts_delta_type(int8_t t) {
 static bool ts_ratio_type(int8_t t) {
     switch (t) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-        case RAY_F32: case RAY_F64:
+        case RAY_F32: case RAY_F64: case RAY_TIMESPAN:
             return true;
         default:
             return false;
