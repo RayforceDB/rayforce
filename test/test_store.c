@@ -2058,6 +2058,44 @@ static test_result_t test_stream_sym_chunks(void) {
     PASS();
 }
 
+/* A rebuilt symbol file with the same byte count must not reuse the old
+ * cached id-to-string mapping merely because its size did not change. */
+static test_result_t test_sym_domain_same_size_replacement(void) {
+#if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+    SKIP("file identity is unavailable on this platform");
+#else
+    char dir[160], path[200], replacement[200];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-sym-replace-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    snprintf(path, sizeof(path), "%s/.sym", dir);
+    snprintf(replacement, sizeof(replacement), "%s/.new", dir);
+    ray_sym_domain_t* old = ray_sym_domain_open_or_create(path);
+    ray_sym_domain_t* fresh = ray_sym_domain_open_or_create(replacement);
+    TEST_ASSERT_TRUE(old && fresh);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(fresh, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "aa", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "bb", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(fresh, "bb", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(fresh, "aa", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(old, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(fresh, false), RAY_OK);
+    ray_sym_domain_t* again = ray_sym_domain_open(path);
+    TEST_ASSERT_TRUE(again == old); /* this process's own flush is valid */
+    ray_sym_domain_release(again);
+    struct stat a, b;
+    TEST_ASSERT_EQ_I(stat(path, &a), 0);
+    TEST_ASSERT_EQ_I(stat(replacement, &b), 0);
+    TEST_ASSERT_EQ_I(a.st_size, b.st_size);
+    TEST_ASSERT_EQ_I(rename(replacement, path), 0);
+    TEST_ASSERT_NULL(ray_sym_domain_open(path));
+    ray_sym_domain_release(fresh);
+    ray_sym_domain_release(old);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#endif
+}
+
 /* STR chunks into a SYM writer: interned into the writer's domain, a batch
  * of 8192 at a time.  The same 20000 strings (a few hundred distinct, "",
  * repeats across batches) into a file domain and into an import dictionary
@@ -8451,6 +8489,7 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
     { "store/stream_sym_chunks", test_stream_sym_chunks, store_setup, store_teardown },
+    { "store/sym_domain_same_size_replacement", test_sym_domain_same_size_replacement, store_setup, store_teardown },
     { "store/stream_sym_from_str", test_stream_sym_from_str, store_setup, store_teardown },
     { "store/stream_sym_foreign", test_stream_sym_foreign, store_setup, store_teardown },
     { "store/stream_sym_lut_stale", test_stream_sym_lut_stale, store_setup, store_teardown },
