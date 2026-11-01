@@ -1,0 +1,29 @@
+;; `sum` of a TIMESPAN column is a TIMESPAN inside a query as well as outside
+;; one, as it already was per group.
+(set T (table [g sp] (list [1 1 2] (enlist 0D01:00:00 0D02:00:00 0D03:00:00))))
+(type (sum (at T 'sp))) -- 'timespan
+
+;; no key
+(type (at (select {r: (sum sp) from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (sum sp) from: T}) 'r)) -- [21600000000000]
+
+;; filtered and over an expression
+(type (at (select {r: (sum sp) from: T where: (> g 1)}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (sum sp) from: T where: (> g 1)}) 'r)) -- [10800000000000]
+(type (at (select {r: (sum (+ sp sp)) from: T}) 'r)) -- 'TIMESPAN
+
+;; grouped by another column, and by the summed column itself
+(type (at (select {r: (sum sp) by: g from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (sum sp) by: g from: T}) 'r)) -- [10800000000000 10800000000000]
+(type (at (select {r: (sum sp) by: sp from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (sum sp) by: sp from: T}) 'r)) -- [3600000000000 7200000000000 10800000000000]
+
+;; the query and the same sum on the extracted vector agree
+(as 'I64 (at (select {r: (sum sp) from: T}) 'r)) -- (enlist (as 'I64 (sum (at T 'sp))))
+
+;; update
+(type (at (update {r: (sum sp) from: T}) 'r)) -- 'TIMESPAN
+
+;; the integer columns are unaffected
+(set I (table [v] (list [1 2 3])))
+(type (at (select {r: (sum v) from: I}) 'r)) -- 'I64
