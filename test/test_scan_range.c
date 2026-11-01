@@ -5315,6 +5315,10 @@ static test_result_t test_parted_eval_group_keep(void) {
         /* q12: the inner implicit group feeds an outer that reads g, s, h */
         { "(select {c: (count h) from: (select {from: T where: (!= u 0) by: {g: g s: s h: h}}) "
           "by: {g: g s: s} desc: c take: 10})", 0, "kvdb" },
+        /* A multi-key outer by: is a literal SYM vector; it must not
+         * disable the nested projection hint. */
+        { "(select {c: (count (distinct h)) from: (select {from: T where: (!= u 0) by: [g s h]}) "
+          "by: [g s] desc: c take: 10})", 0, "kvdb" },
         /* q14: key g, distinct k; u in the where: only */
         { "(select {g: g u: (count (distinct k)) from: T where: (!= u 0) by: g desc: u take: 10})", 0, "vdsbh" },
         /* q23: four outputs over s, h, k; g and v in the where: only */

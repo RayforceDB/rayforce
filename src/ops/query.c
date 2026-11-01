@@ -14160,11 +14160,16 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
         /* a lexical local wins over a column of its name (query locals never
          * shadow one): it may be a callable reading anything */
         if (ray_env_has_lexical_local(e->i64)) return false;
-        if (tbl_has_col(tbl, e->i64)) return true;
+        if (tbl && tbl_has_col(tbl, e->i64)) return true;
+        /* Before evaluating a nested from: there is no table to inspect.
+         * An unbound plain name can only be a column; bound callables need
+         * the checks below so user lambdas cannot hide column reads. */
+        if (!tbl && !ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64) &&
+            !ray_env_get_local(e->i64)) return true;
         if (ray_sym_is_dotted(e->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(e->i64, &segs);
-            return nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
+            return tbl && nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
         }
         if (ray_env_get_local(e->i64)) return false;
         ray_t* fn = ray_env_get(e->i64);
@@ -14347,6 +14352,7 @@ static int64_t proj_keep_bound(ray_t* dict) {
  * value exprs, so it references only named columns), collect the column syms its
  * non-`from` clauses reference.  Returns false (→ carry all) for an implicit-all
  * select, which references every column. */
+static bool eval_group_keep_ok(ray_t* e, ray_t* tbl);
 static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
     int64_t from_id    = dict_key_id(dict, "from");
     int64_t where_id   = dict_key_id(dict, "where");
@@ -14366,6 +14372,14 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
         if (kid != where_id && kid != by_id && kid != take_id &&
             kid != asc_id && kid != desc_id && kid != nearest_id)
             has_value_expr = true;                   /* an explicit projection */
+        /* A SYM vector is a literal set of named keys (by:/sort keys),
+         * not a callable that can read an unlisted column. */
+        ray_t* clause = pv[i + 1];
+        if ((!clause || clause->type != RAY_SYM) &&
+            !eval_group_keep_ok(clause, NULL)) {
+            DICT_VIEW_CLOSE(pv);
+            return false;
+        }
         n = collect_syms(pv[i + 1], out, max, n);
     }
     DICT_VIEW_CLOSE(pv);  /* pv dead past the clause scan */
