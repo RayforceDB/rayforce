@@ -76,3 +76,10 @@
 (type (med [1 2 3])) -- 'f64
 (type (avgs [1 2 3])) -- 'F64
 (type (mavg 2 [1 2 3])) -- 'F64
+
+;; a mean taken of a lazy intermediate keeps the type too
+(type (avg (lag S))) -- 'timespan
+(as 'I64 (avg (lag S))) -- 4200000000000
+(type (med (lag S))) -- 'timespan
+(type (avgs (lag S))) -- 'TIMESPAN
+(type (avg (lead [1 2 3]))) -- 'f64
