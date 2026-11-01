@@ -44,6 +44,10 @@ typedef struct {
     ray_t   **consts;     /* == ray_data(consts_obj) */
     int32_t  n_consts;
     int32_t  consts_cap;
+    ray_t    *cindex_obj; /* open-addressing index of the pool (see add_constant) */
+    int32_t  *cindex;     /* == ray_data(cindex_obj): constant index + 1, 0 empty */
+    int32_t  cindex_cap;  /* a power of two, at least twice n_consts */
+    bool     cindex_off;  /* the index could not be built: the pool is scanned */
 
     struct { int64_t sym_id; int32_t slot; } locals[256];
     int32_t  n_locals;
@@ -93,6 +97,7 @@ static void compiler_destroy(compiler_t *c) {
     for (int32_t i = 0; i < c->n_consts; i++)
         if (c->consts[i]) ray_release(c->consts[i]);
     ray_release(c->consts_obj);
+    if (c->cindex_obj) ray_release(c->cindex_obj);
     ray_release(c->code_obj);
     if (c->deps) { ray_release(c->deps); c->deps = NULL; }
 }
@@ -144,19 +149,76 @@ static void emit_const(compiler_t *c, int32_t idx) {
 }
 
 /* ── Constant pool ── */
-static int32_t add_constant(compiler_t *c, ray_t *value) {
-    for (int32_t i = 0; i < c->n_consts; i++) {
-        ray_t *v = c->consts[i];
-        if (v == value) return i;
-        if (v->type == value->type && ray_is_atom(v)) {
-            if (v->type == -RAY_I64 && v->i64 == value->i64) return i;
-            if (v->type == -RAY_F64 &&
-                memcmp(&v->f64, &value->f64, sizeof v->f64) == 0) return i;
-            if (v->type == -RAY_BOOL && v->b8 == value->b8) return i;
-            if (v->type == -RAY_SYM && v->i64 == value->i64 &&
-                v->attrs == value->attrs) return i;
-        }
+/* The constants add_constant shares: the same object, or an atom of one of
+ * four types holding the same value. */
+static bool const_same(const ray_t *v, const ray_t *value) {
+    if (v == value) return true;
+    if (v->type == value->type && ray_is_atom(v)) {
+        if (v->type == -RAY_I64) return v->i64 == value->i64;
+        if (v->type == -RAY_F64) return memcmp(&v->f64, &value->f64, sizeof v->f64) == 0;
+        if (v->type == -RAY_BOOL) return v->b8 == value->b8;
+        if (v->type == -RAY_SYM) return v->i64 == value->i64 && v->attrs == value->attrs;
     }
+    return false;
+}
+
+/* A hash that agrees with const_same: the value for those four atom types,
+ * the address for anything else. */
+static uint64_t const_hash(const ray_t *v) {
+    uint64_t k;
+    if (v->type == -RAY_I64 || v->type == -RAY_SYM) k = (uint64_t)v->i64;
+    else if (v->type == -RAY_F64) memcpy(&k, &v->f64, sizeof k);
+    else if (v->type == -RAY_BOOL) k = v->b8;
+    else k = (uint64_t)(uintptr_t)v;
+    k = (k ^ ((uint64_t)(uint8_t)v->type << 56)) * UINT64_C(0x9E3779B97F4A7C15);
+    return k ^ (k >> 32);
+}
+
+/* Adding N distinct constants one by one scans the pool each time: N^2/2
+ * comparisons, 2 billion for a pool of 65536.  Past CINDEX_MIN constants an
+ * index finds the match instead.  It finds the same constant as the scan
+ * (const_same, the first one added), and any failure to build it leaves the
+ * scan. */
+enum { CINDEX_MIN = 64 };
+
+static void const_index_put(compiler_t *c, int32_t idx) {
+    uint32_t mask = (uint32_t)c->cindex_cap - 1;
+    uint32_t h = (uint32_t)const_hash(c->consts[idx]) & mask;
+    while (c->cindex[h]) h = (h + 1) & mask;
+    c->cindex[h] = idx + 1;
+}
+
+/* Build the index for the constants now in the pool, with room to double. */
+static void const_index_build(compiler_t *c) {
+    int32_t cap = 256;
+    while (cap < (c->n_consts + 1) * 2) cap *= 2;
+    ray_t *obj = ray_alloc((size_t)cap * sizeof(int32_t));
+    if (!obj || RAY_IS_ERR(obj)) { c->cindex_off = true; return; }
+    obj->type = RAY_I32;
+    obj->len = 0;
+    if (c->cindex_obj) ray_release(c->cindex_obj);
+    c->cindex_obj = obj;
+    c->cindex = (int32_t *)ray_data(obj);
+    c->cindex_cap = cap;
+    memset(c->cindex, 0, (size_t)cap * sizeof(int32_t));
+    for (int32_t i = 0; i < c->n_consts; i++) const_index_put(c, i);
+}
+
+static int32_t const_find(compiler_t *c, ray_t *value) {
+    if (c->cindex) {
+        uint32_t mask = (uint32_t)c->cindex_cap - 1;
+        for (uint32_t h = (uint32_t)const_hash(value) & mask; c->cindex[h]; h = (h + 1) & mask)
+            if (const_same(c->consts[c->cindex[h] - 1], value)) return c->cindex[h] - 1;
+        return -1;
+    }
+    for (int32_t i = 0; i < c->n_consts; i++)
+        if (const_same(c->consts[i], value)) return i;
+    return -1;
+}
+
+static int32_t add_constant(compiler_t *c, ray_t *value) {
+    int32_t found = const_find(c, value);
+    if (found >= 0) return found;
     /* A constant index is written as one byte (OP_LOADCONST), or as two
      * (OP_LOADCONST_W, and the operand of OP_PATHGET).  An index past
      * 0xFFFF would read as the constant of its low 16 bits, silently:
@@ -178,7 +240,14 @@ static int32_t add_constant(compiler_t *c, ray_t *value) {
     }
     ray_retain(value);
     c->consts[c->n_consts] = value;
-    return c->n_consts++;
+    int32_t idx = c->n_consts++;
+    if (c->cindex) {
+        if (c->n_consts * 2 > c->cindex_cap) { c->cindex = NULL; const_index_build(c); }
+        else const_index_put(c, idx);
+    } else if (!c->cindex_off && c->n_consts >= CINDEX_MIN) {
+        const_index_build(c);
+    }
+    return idx;
 }
 
 /* ── Local variable tracking ── */

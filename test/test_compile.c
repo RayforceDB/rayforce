@@ -35,6 +35,7 @@
 #include "lang/env.h"
 #include "lang/parse.h"
 #include "ops/ops.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
@@ -736,6 +737,49 @@ static test_result_t test_compile_large_const_pool(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * 13b. Large constant pools, built as lists of atoms handed to ray_fn.
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* A function of `params` and the body `body[0..nbody)` (borrowed), bound to
+ * the global `name`, returning the lambda for LAMBDA_IS_COMPILED once it
+ * has been called. */
+static ray_t* pool_fn(const char* name, const char* params, ray_t** body, int64_t nbody) {
+    ray_t** args = (ray_t**)malloc((size_t)(nbody + 1) * sizeof *args);
+    if (!args) return NULL;
+    args[0] = ray_eval_str(params);
+    for (int64_t i = 0; i < nbody; i++) args[1 + i] = body[i];
+    ray_t* fn = ray_fn(args, nbody + 1);
+    ray_release(args[0]);
+    free(args);
+    if (!fn || RAY_IS_ERR(fn)) return fn;
+    ray_env_set(ray_sym_intern(name, strlen(name)), fn);
+    return fn;
+}
+
+/* Past 64 constants add_constant finds a shared one through an index. The
+ * pool must hold exactly what the scan it replaces would: each distinct
+ * integer, float, bool and symbol once, however often it is repeated. */
+static test_result_t test_compile_pool_shares_constants(void) {
+    enum { N = 300 };
+    ray_t* body[4 * N + 4];
+    int64_t at = 0;
+    for (int round = 0; round < 3; round++)          /* every value 3 times */
+        for (int i = 0; i < N; i++) body[at++] = ray_i64(1000 + i);
+    for (int i = 0; i < 100; i++) body[at++] = ray_f64(0.5 + i);
+    for (int i = 0; i < 100; i++) body[at++] = ray_f64(0.5 + i);
+    body[at++] = ray_bool(true);
+    body[at++] = ray_bool(false);
+    body[at++] = ray_bool(true);
+    body[at++] = ray_i64(1000);                       /* last: the result */
+    ray_t* fn = pool_fn("pool_sh", "[]", body, at);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fn));
+    EVAL_I64("(pool_sh)", 1000);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(fn), "compiled");
+    TEST_ASSERT_EQ_I(LAMBDA_CONSTS(fn)->len, N + 100 + 2);   /* 300 ints, 100 floats, true, false */
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * 14. Many symbols in body — forces OP_RESOLVE_W path (lines 409-413)
  *     Need > 256 distinct symbol entries in the const pool.
  *     We do this by having a big lambda with many unique variable refs.
@@ -1101,6 +1145,7 @@ const test_entry_t compile_entries[] = {
     { "compile/binary_wrong_arity",  test_compile_binary_wrong_arity,  compile_setup, compile_teardown },
     { "compile/lambda_call",         test_compile_lambda_call,         compile_setup, compile_teardown },
     { "compile/large_const_pool",    test_compile_large_const_pool,    compile_setup, compile_teardown },
+    { "compile/pool_shares_constants",     test_compile_pool_shares_constants,     compile_setup, compile_teardown },
     { "compile/many_symbols",        test_compile_many_symbols,        compile_setup, compile_teardown },
     { "compile/code_buffer_grow",    test_compile_code_buffer_grow,    compile_setup, compile_teardown },
     { "compile/if_with_else",        test_compile_if_with_else,        compile_setup, compile_teardown },
