@@ -14372,7 +14372,11 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
         if (kid != where_id && kid != by_id && kid != take_id &&
             kid != asc_id && kid != desc_id && kid != nearest_id)
             has_value_expr = true;                   /* an explicit projection */
-        if (!eval_group_keep_ok(pv[i + 1], NULL)) {
+        /* A SYM vector is a literal set of named keys (by:/sort keys),
+         * not a callable that can read an unlisted column. */
+        ray_t* clause = pv[i + 1];
+        if ((!clause || clause->type != RAY_SYM) &&
+            !eval_group_keep_ok(clause, NULL)) {
             DICT_VIEW_CLOSE(pv);
             return false;
         }
