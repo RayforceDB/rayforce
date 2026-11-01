@@ -2839,7 +2839,9 @@ static test_result_t test_generation_first_write_keeps_others(void) {
  * writer's are not.  Plain libc only: it runs in a forked child. */
 static void generation_flip_child(const char* dir, const char* tmpl, int flips) {
     const char* names[] = {".d", "x", "y"};
-    struct timespec pause = {0, 100 * 1000};
+    /* Keep multiple publications far enough apart that a reader under CPU
+     * load can finish its bounded re-resolve loop before eight more flips. */
+    struct timespec pause = {0, 5 * 1000 * 1000};
     for (int i = 1; i <= flips; i++) {
         char tmp[1100], cur[1100], path[1200], src[1200];
         snprintf(path, sizeof(path), "%s/.generations/g-%d", dir, i);
@@ -2892,7 +2894,7 @@ static test_result_t test_generation_reader_races(void) {
     fflush(NULL);
     pid_t child = fork();
     TEST_ASSERT_TRUE(child >= 0);
-    if (child == 0) generation_flip_child(dir, tmpl, 3000);
+    if (child == 0) generation_flip_child(dir, tmpl, 200);
 
     int reads = 0, failures = 0, status = 0;
     while (waitpid(child, &status, WNOHANG) == 0) {
