@@ -83,3 +83,11 @@
 (type (med (lag S))) -- 'timespan
 (type (avgs (lag S))) -- 'TIMESPAN
 (type (avg (lead [1 2 3]))) -- 'f64
+
+;; grouped mean and deviation next to a count, with a null duration in a group
+(set Gn (table [g sp] (list [1 1 2 2] (enlist 0D01:00:00 0Nn 0D02:00:00 0D04:00:00))))
+(set Rn (select {m: (avg sp) d: (dev sp) c: (count sp) by: g from: Gn}))
+(type (at Rn 'm)) -- 'TIMESPAN
+(type (at Rn 'd)) -- 'TIMESPAN
+(as 'I64 (at Rn 'm)) -- [3600000000000 10800000000000]
+(at Rn 'c) -- [2 2]
