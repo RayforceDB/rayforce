@@ -2048,6 +2048,7 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_ANY:
             out_type = RAY_BOOL; break;
         case OP_AVG:
+            out_type = mean_out_type(prev->out_type); break;
         case OP_STDDEV:
         case OP_STDDEV_POP:
         case OP_VAR:
