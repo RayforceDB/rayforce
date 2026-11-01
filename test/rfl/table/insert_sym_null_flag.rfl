@@ -1,0 +1,19 @@
+;; A null-free SYM batch append must not mark the column HAS_NULLS simply
+;; because SYM values can encode a null as id 0.
+(set mk1024 (fn [n] (as 'table (dict [a b] (list (take [SRC] n) (til n))))))
+(set flag1024 (fn [t] (at (ser (at t 'a)) 17)))
+
+(set j1024 (mk1024 1))
+(insert 'j1024 (mk1024 2))
+(flag1024 j1024) -- 0x00
+(ser (at j1024 'a)) -- (ser (at (mk1024 3) 'a))
+
+(set j1024 (mk1024 1))
+(insert 'j1024 (list (take [SRC] 2) [5 6]))
+(flag1024 j1024) -- 0x00
+
+;; A real empty-symbol cell still sets the flag.
+(set j1024 (mk1024 1))
+(insert 'j1024 (list (as 'SYM [SRC ']) [5 6]))
+(flag1024 j1024) -- 0x40
+(nil? (at (at j1024 'a) 2)) -- true
