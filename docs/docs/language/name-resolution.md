@@ -83,10 +83,12 @@ evaluates a parsed expression in the current context.
 
 ## Mutating a named table
 
-The quoted-symbol forms of `insert` and `upsert` look up the named table in
-the visible scope, local first. They can amend a sole-owned local table in
-place. A path that rebuilds the result instead writes back to a global name,
-so the quoted-symbol form is not a reliable way to update a local:
+The quoted-symbol forms of `insert` and `alter` resolve the name to the
+innermost visible local or parameter, then to a global, and publish their
+result back to that same binding. They amend a sole-owned local in place; a
+shared value (an alias, a capture, a slice) is copied first, so its other
+holders do not see the write. An unbound target is an error, and an error
+never redirects a local write into a same-named global:
 
 ```lisp
 (do (let local_t (table [x] (list (til 2))))
@@ -94,9 +96,16 @@ so the quoted-symbol form is not a reliable way to update a local:
     (count local_t))                 ; 3, amended in place
 ```
 
-`alter` differs: it requires a global target and rejects a local target with
-a `domain` error. For a local table, use the value-returning `insert` or
-`upsert` form and bind its result explicitly.
+This holds when the call's head is the literal `insert` or `alter`, or a
+global alias of one, such as `(set ins insert)`, bound when the function is
+compiled. A mutator reached through any other head (a parameter, a `let`, a
+dotted head, a computed head, or a name unbound at that time) is an ordinary
+callee: a quoted target resolves as a global and a computed target publishes
+nothing, whether the function is compiled or left to the tree walker. See [`insert` / `upsert`](syntax.md#insert-upsert).
+
+`upsert` is unchanged: its quoted form still writes back to a global name
+when it rebuilds the result, so for a local table use the value-returning
+form and bind its result explicitly.
 
 Names beginning with `.` are reserved for system namespaces such as `.sys`
 and `.db`; ordinary dotted names cannot be rebound, and parameters cannot

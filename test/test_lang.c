@@ -11265,10 +11265,121 @@ static test_result_t test_clock_local_follows_tz(void) {
     PASS();
 }
 
+/* Return an address as data, without retaining the inspected value. Using
+ * eval below exposes compiled slots through the same window as mutators. */
+static ray_t* mutation_local_address(ray_t* name) {
+    if (!name || name->type != -RAY_SYM) return ray_error("type", NULL);
+    ray_env_target_t target;
+    ray_t* value = NULL;
+    ray_err_t err = ray_env_target_resolve(name->i64, &target, &value);
+    return err == RAY_OK ? ray_i64((int64_t)(uintptr_t)value)
+                        : ray_error(ray_err_code_str(err), NULL);
+}
+
+static test_result_t test_local_mutation_fast_paths(void) {
+    ray_t* inspector = ray_fn_unary("mutation-local-address", 0, mutation_local_address);
+    TEST_ASSERT_NOT_NULL(inspector);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inspector));
+    TEST_ASSERT_EQ_I(ray_env_bind(ray_sym_intern("mutation-local-address", 22), inspector), RAY_OK);
+    ray_release(inspector);
+
+    /* These assertions test physical engagement, not just equal results. An
+     * unused alias must force a copy, whereas a VM mirror must not. */
+    ASSERT_EQ("((fn [] (let v (til 10000)) "
+              "(let p (eval (quote (mutation-local-address 'v)))) "
+              "(alter 'v set 0 99) "
+              "(== p (eval (quote (mutation-local-address 'v))))))", "true");
+    ASSERT_EQ("((fn [] (let t (table [x] (list (til 10000)))) "
+              "(let p (eval (quote (mutation-local-address 't)))) "
+              "(insert 't (list 99)) "
+              "(== p (eval (quote (mutation-local-address 't))))))", "true");
+    ASSERT_EQ("((fn [] (let v (til 10)) (let alias v) "
+              "(let p (eval (quote (mutation-local-address 'v)))) "
+              "(alter 'v set 0 99) "
+              "(== p (eval (quote (mutation-local-address 'v))))))", "false");
+    ASSERT_EQ("((fn [] (let t (table [x] (list (til 10)))) (let alias t) "
+              "(let p (eval (quote (mutation-local-address 't)))) "
+              "(insert 't (list 99)) "
+              "(== p (eval (quote (mutation-local-address 't))))))", "false");
+    PASS();
+}
+
+/* local_mutation.rfl builds its "interpreted" fixtures from 300 lets joined
+ * into one string: a body with more locals than a frame has slots stays on
+ * the tree walker.  Check that, and that a small body of the same shape
+ * does compile, so the check can fail. */
+static test_result_t test_local_mutation_walker_fixture(void) {
+    const char* defs[] = {
+        "(set lmpadc (fold concat \"\" (map (fn [i] (format \"(let lmz% 0) \" i)) (til 300))))",
+        "(set lmwalk (eval (parse (format \"(fn [f] % (let t (til 3)) (f 't 9) t)\" lmpadc))))",
+        "(set lmsmall (fn [f] (let t (til 3)) (f 't 9) t))",
+        "(set t [50 60])",   /* compiled code reaches a global target through f */
+    };
+    for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) {
+        ray_t* r = ray_eval_str(defs[i]);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ASSERT_EQ("(type lmpadc)", "'str");
+    /* both write the global t through a parameter holding insert */
+    ASSERT_EQ("(lmwalk insert)", "[0 1 2]");
+    ASSERT_EQ("(lmsmall insert)", "[0 1 2]");
+    ASSERT_EQ("t", "[50 60 9 9]");
+    ray_t* walk = ray_env_get(ray_sym_intern("lmwalk", 6));
+    ray_t* small = ray_env_get(ray_sym_intern("lmsmall", 7));
+    TEST_ASSERT_NOT_NULL(walk);
+    TEST_ASSERT_NOT_NULL(small);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(walk), "the padded fixture stays on the tree walker");
+    TEST_ASSERT(LAMBDA_IS_COMPILED(small), "the same body without padding compiles");
+    PASS();
+}
+
+/* A dotted read of a local, compiled, then the runtime is destroyed and
+ * created again on this thread: the code of the second runtime refers to
+ * nothing the first one's heap held. */
+static test_result_t test_dotted_local_read_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+        }
+        ASSERT_EQ("((fn [] (let d (dict [v] (list 41))) d.v))", "41");
+    }
+    PASS();
+}
+
+/* A dotted read of a local reads the head's slot and walks the rest
+ * (compile_dotted_local), rather than evaluating the name in a window:
+ * no constant is the I64 vector of local names a window binds. */
+static test_result_t test_dotted_local_read_slot(void) {
+    ray_t* def = ray_eval_str("(set dlrslot (fn [] (let d (dict [v] (list 7))) d.v))");
+    TEST_ASSERT_NOT_NULL(def);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(def));
+    ray_release(def);
+    ASSERT_EQ("(dlrslot)", "7");
+    ray_t* lam = ray_env_get(ray_sym_intern("dlrslot", 7));
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(lam), "the lambda compiled on its call");
+    ray_t* consts = LAMBDA_CONSTS(lam);
+    TEST_ASSERT_NOT_NULL(consts);
+    bool window = false;
+    for (int64_t i = 0; i < consts->len && !window; i++) {
+        ray_t* k = ((ray_t**)ray_data(consts))[i];
+        window = k && k->type == RAY_I64;
+    }
+    TEST_ASSERT(!window, "the read walks below the head's slot, without a window");
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
+    { "lang/local_mutation_fast_paths", test_local_mutation_fast_paths, lang_setup, lang_teardown },
+    { "lang/local_mutation_walker_fixture", test_local_mutation_walker_fixture, lang_setup, lang_teardown },
+    { "lang/dotted_local_read_reinit", test_dotted_local_read_reinit, lang_setup, lang_teardown },
+    { "lang/dotted_local_read_slot", test_dotted_local_read_slot, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },

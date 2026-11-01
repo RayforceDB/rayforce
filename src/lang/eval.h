@@ -123,6 +123,10 @@ enum {
     OP_CALL2R,        /* operand, for a builtin a closure body resolves when */
     OP_CALLNR,        /* it runs: the fast call while the name holds a builtin
                        * of that kind, OP_CALLF's general call otherwise */
+    OP_PATHGET,       /* pop a head value; push the dotted name cpool[2-byte
+                       * index] read below it, by the walk the tree walker
+                       * applies past a dotted name's head (ray_env_path_get);
+                       * a name error when it is undefined */
     OP__COUNT
 };
 
