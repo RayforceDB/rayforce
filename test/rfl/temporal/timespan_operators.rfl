@@ -117,8 +117,8 @@
 (as 'I64 (- 2000.01.02D00:00:00.000000000 2000.01.01D00:00:00.000000000)) -- 86400000000000
 (type (sum [1D 0Nn 2D])) -- 'timespan
 (as 'I64 (sum [1D 0Nn 2D])) -- 259200000000000
-(type (avg [1D 0Nn 2D])) -- 'f64
-(avg [1D 0Nn 2D]) -- 129600000000000.0
+(type (avg [1D 0Nn 2D])) -- 'timespan
+(as 'I64 (avg [1D 0Nn 2D])) -- 129600000000000
 (type (min [1D 0Nn 2D])) -- 'timespan
 (as 'I64 (min [1D 0Nn 2D])) -- 86400000000000
 (type (max [1D 0Nn 2D])) -- 'timespan

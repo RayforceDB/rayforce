@@ -1,0 +1,85 @@
+;; The mean and median of durations are durations, rounded to the nanosecond
+;; (half away from zero), in every spelling: scalar, scan, window, query.
+(set S (enlist 0D01:00:00 0D02:00:00 0D00:30:00 0D04:00:00))
+
+;; scalar
+(type (avg S)) -- 'timespan
+(as 'I64 (avg S)) -- 6750000000000
+(type (med S)) -- 'timespan
+(as 'I64 (med S)) -- 5400000000000
+(type (avg 0D01:00:00)) -- 'timespan
+(type (med 0D01:00:00)) -- 'timespan
+(as 'I64 (med 0D01:00:00)) -- 3600000000000
+(as 'I64 (avg 0D01:00:00)) -- 3600000000000
+
+;; rounding: 1.5 ns rounds away from zero
+(as 'I64 (avg (as 'TIMESPAN [1 2]))) -- 2
+(as 'I64 (avg (as 'TIMESPAN [-1 -2]))) -- -2
+(as 'I64 (med (as 'TIMESPAN [1 2]))) -- 2
+(as 'I64 (med (as 'TIMESPAN [-1 -2]))) -- -2
+
+;; nulls are skipped; no value at all is a null duration
+(as 'I64 (avg (enlist 0D01:00:00 0Nn 0D03:00:00))) -- 7200000000000
+(as 'I64 (med (enlist 0D01:00:00 0Nn 0D03:00:00))) -- 7200000000000
+(type (avg (enlist 0Nn 0Nn))) -- 'timespan
+(nil? (avg (enlist 0Nn 0Nn))) -- true
+(nil? (med (enlist 0Nn 0Nn))) -- true
+
+;; quantiles of durations are durations too
+(type (quantile (as 'TIMESPAN [0 10 20 30]) 0.5)) -- 'timespan
+(as 'I64 (quantile (as 'TIMESPAN [0 10 20 30]) 0.5)) -- 15
+(as 'I64 (quantile (as 'TIMESPAN [0 10 20 30]) 0.25)) -- 8
+(as 'I64 (percentile (as 'TIMESPAN [0 10 20 30]) 75)) -- 23
+(nil? (quantile (enlist 0Nn 0Nn) 0.5)) -- true
+
+;; running and moving means
+(type (avgs S)) -- 'TIMESPAN
+(as 'I64 (avgs S)) -- [3600000000000 5400000000000 4200000000000 6750000000000]
+(type (mavg 2 S)) -- 'TIMESPAN
+(as 'I64 (mavg 2 S)) -- [3600000000000 5400000000000 4500000000000 8100000000000]
+(nil? (at (avgs (enlist 0Nn 0D01:00:00)) 0)) -- true
+
+;; queries: no key, filtered, keyed, update, windows
+(set T (table [g sp v] (list [1 1 2] (enlist 0D01:00:00 0D02:00:00 0D03:00:00) [1.0 2.0 4.0])))
+(type (at (select {r: (avg sp) from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (avg sp) from: T}) 'r)) -- [7200000000000]
+(type (at (select {r: (med sp) from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (med sp) from: T}) 'r)) -- [7200000000000]
+(type (at (select {r: (avg sp) from: T where: (> g 1)}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg sp) by: g from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (avg sp) by: g from: T}) 'r)) -- [5400000000000 10800000000000]
+(type (at (select {r: (med sp) by: g from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (med sp) by: g from: T}) 'r)) -- [5400000000000 10800000000000]
+(type (at (update {r: (avg sp) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avgs sp) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (mavg 2 sp) from: T}) 'r)) -- 'TIMESPAN
+
+;; several aggregates side by side keep their own types and columns
+(set R (select {a: (avg sp) m: (med sp) f: (avg v) s: (sum sp) by: g from: T}))
+(type (at R 'a)) -- 'TIMESPAN
+(type (at R 'm)) -- 'TIMESPAN
+(type (at R 'f)) -- 'F64
+(type (at R 's)) -- 'TIMESPAN
+(at R 'f) -- [1.5 4.0]
+(as 'I64 (at R 'a)) -- [5400000000000 10800000000000]
+
+;; a table large enough for the parallel and many-group engines
+(set N 300000)
+(set B (table [g sp] (list (% (til N) 1000) (as 'TIMESPAN (* (til N) 1000)))))
+(type (at (select {r: (avg sp) from: B}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg sp) by: g from: B}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (med sp) by: g from: B}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (avg sp) from: B}) 'r)) -- (enlist (as 'I64 (avg (at B 'sp))))
+
+;; the integer and float means are unchanged
+(type (avg [1 2 3])) -- 'f64
+(type (med [1 2 3])) -- 'f64
+(type (avgs [1 2 3])) -- 'F64
+(type (mavg 2 [1 2 3])) -- 'F64
+
+;; a mean taken of a lazy intermediate keeps the type too
+(type (avg (lag S))) -- 'timespan
+(as 'I64 (avg (lag S))) -- 4200000000000
+(type (med (lag S))) -- 'timespan
+(type (avgs (lag S))) -- 'TIMESPAN
+(type (avg (lead [1 2 3]))) -- 'f64
