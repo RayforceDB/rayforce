@@ -249,6 +249,10 @@ void     ray_heap_reclaim_worker(ray_heap_t* h);
 void     ray_heap_push_pending(ray_heap_t* heap);
 void     ray_heap_drain_pending(void);
 uint8_t  ray_order_for_size(size_t data_size);
+/* Explicit reader admission path. Charges include headers exactly once.
+ * Direct blocks use exact-size cache matches only; ordinary ray_alloc is unchanged. */
+bool ray_alloc_charge(size_t data_size, size_t* charge);
+ray_t* ray_alloc_admitted(size_t data_size, size_t limit, size_t* charge);
 void     ray_mem_stats(ray_mem_stats_t* out);
 bool     ray_mem_trace_begin(void);
 void     ray_mem_trace_end(ray_mem_trace_t* out);

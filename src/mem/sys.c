@@ -83,6 +83,13 @@ static inline size_t page_round(size_t n) {
 /* Committed-RAM accounting now lives in ray_vm_alloc / ray_vm_free (every
  * mapping funnels through them), so ray_sys_alloc/free no longer touch the
  * counter themselves — doing so would double-count. */
+bool ray_sys_charge(size_t size, size_t* charge) {
+    if (size == 0) size = 1;
+    if (size > SIZE_MAX - SYS_HDR_SIZE - 4095) return false;
+    *charge = page_round(SYS_HDR_SIZE + size);
+    return true;
+}
+
 void* ray_sys_alloc(size_t size) {
     if (size == 0) size = 1;
     if (size > SIZE_MAX - SYS_HDR_SIZE) return NULL;

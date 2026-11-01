@@ -119,3 +119,13 @@ legs.
 - **Nightly** (`.github/workflows/nightly.yml`): deep randomized stress, the full
   suite under TSan, long fuzz runs, and a server soak (`scripts/soak.sh`) that
   kill/restarts the server and watches resident memory for leaks.
+
+### Reader boundary proofs
+
+The internal #994 experiments are documented separately:
+[reader-local allocation](docs/reader-allocation-proof.md) and
+[whole-document symbol publication](docs/symbol-publication-proof.md).
+Run only their tests with `make test TEST_FILTER=reader_proof`. Set `TMPDIR`
+to an existing disk-backed directory to place test scratch there.
+These proofs do not expose a complete Rayfall data reader or change ordinary
+partial-batch symbol interning semantics.
