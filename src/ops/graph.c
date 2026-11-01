@@ -874,7 +874,7 @@ ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, O
 ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_LEAD, a, a->out_type); }
 ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a) {
     int8_t t = a->out_type;
-    return make_unary(g, OP_DELTAS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t));
+    return make_unary(g, OP_DELTAS, a, deltas_out_type(t));
 }
 ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_RATIOS, a, RAY_F64); }
 ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_FILLS, a, a->out_type); }
@@ -2068,7 +2068,7 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_LEAD:
             out_type = prev->out_type; break;     /* shifts preserve type */
         case OP_DELTAS:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : scan_int_out_type(prev->out_type);
+            out_type = deltas_out_type(prev->out_type);
             break;
         case OP_RATIOS:
             out_type = RAY_F64; break;

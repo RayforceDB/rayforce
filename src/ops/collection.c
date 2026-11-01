@@ -3963,16 +3963,19 @@ static void ts_deltas_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t 
             out[r] = ray_f64_fin(cur - prev);
         }
     } else {
-        int64_t* out = (int64_t*)ray_data(c->dst);
+        /* the lane of the result: 8 bytes, or 4 for a TIME or DATE difference */
+        void* out = ray_data(c->dst);
+        int8_t ot = c->dst->type;
+        int64_t null_v = ot == RAY_TIME || ot == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64;
         for (int64_t r = start + 1; r < end + 1; r++) {
             if (ts_morsel_checkpoint(c->pool, r - (start + 1))) return;
             if (c->has_nulls && (ray_vec_is_null(src, r) || ray_vec_is_null(src, r - 1))) {
-                out[r] = NULL_I64;
+                write_col_i64(out, r, null_v, ot, c->dst->attrs);
                 continue;
             }
             int64_t cur = read_col_i64(d, r, t, src->attrs);
             int64_t prev = read_col_i64(d, r - 1, t, src->attrs);
-            out[r] = (int64_t)((uint64_t)cur - (uint64_t)prev);
+            write_col_i64(out, r, (int64_t)((uint64_t)cur - (uint64_t)prev), ot, c->dst->attrs);
         }
     }
 }
@@ -3991,14 +3994,15 @@ ray_t* deltas_vec_eager(ray_t* x) {
         return ray_error("type", "deltas expects a numeric or temporal vector, got %s", ray_type_name(x->type));
 
     int64_t n = x->len;
-    int8_t out_type = (x->type == RAY_F64 || x->type == RAY_F32) ? RAY_F64 : scan_int_out_type(x->type);
+    int8_t out_type = deltas_out_type(x->type);
     ray_t* out = ray_vec_new(out_type, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
     if (n == 0) return out;
     out->attrs |= RAY_ATTR_HAS_NULLS;
     if (out_type == RAY_F64) ((double*)ray_data(out))[0] = NULL_F64;
-    else                     ((int64_t*)ray_data(out))[0] = NULL_I64;
+    else write_col_i64(ray_data(out), 0, out_type == RAY_TIME || out_type == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64,
+                       out_type, out->attrs);
     if (n == 1) return out;
 
     ray_pool_t* pool = ray_pool_get();
