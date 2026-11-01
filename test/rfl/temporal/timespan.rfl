@@ -48,7 +48,8 @@
 (min [1D 0D01:00:00 0Nn]) -- 0D01:00:00
 (max [1D 0D01:00:00 0Nn]) -- 1D
 (sum [1D 1D 0Nn]) -- 2D
-(avg [0D00:00:00.000000001 0D00:00:00.000000003]) -- 2.0
+(type (avg [0D00:00:00.000000001 0D00:00:00.000000003])) -- 'timespan
+(as 'I64 (avg [0D00:00:00.000000001 0D00:00:00.000000003])) -- 2
 ;; Typed storage and query routes must keep the duration tag.
 (de (ser [1D 0Nn -1D])) -- [1D 0Nn -1D]
 (type (de (ser 1D))) -- 'timespan
