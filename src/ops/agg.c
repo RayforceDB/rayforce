@@ -1442,7 +1442,14 @@ double ray_median_dbl_inplace(double* a, int64_t n) {
 }
 
 
-ray_t* ray_dev_fn(ray_t* x) { return var_stddev_core(x, 0, 1); }
+/* The standard deviation of durations is a duration (a variance is a squared
+ * duration and stays F64), rounded to the nanosecond. */
+static ray_t* stddev_core(ray_t* x, int sample) {
+    ray_t* r = var_stddev_core(x, sample, 1);
+    return x && x->type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
+}
+
+ray_t* ray_dev_fn(ray_t* x) { return stddev_core(x, 0); }
 
 /* Shared core for variance / stddev in sample or population mode.
  * sample=1 -> divide sum-of-squares by (n-1); sample=0 -> divide by n.
@@ -1499,8 +1506,8 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
     return make_f64(take_sqrt ? sqrt(v) : v);
 }
 
-ray_t* ray_stddev_fn(ray_t* x)     { return var_stddev_core(x, 1, 1); }
-ray_t* ray_stddev_pop_fn(ray_t* x) { return var_stddev_core(x, 0, 1); }
+ray_t* ray_stddev_fn(ray_t* x)     { return stddev_core(x, 1); }
+ray_t* ray_stddev_pop_fn(ray_t* x) { return stddev_core(x, 0); }
 ray_t* ray_var_fn(ray_t* x)        { return var_stddev_core(x, 1, 0); }
 ray_t* ray_var_pop_fn(ray_t* x)    { return var_stddev_core(x, 0, 0); }
 

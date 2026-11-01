@@ -918,10 +918,10 @@ ray_op_t* ray_mvar_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     return make_unary_param(g, OP_MVAR, a, RAY_F64, window);
 }
 ray_op_t* ray_mdev_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
-    return make_unary_param(g, OP_MDEV, a, RAY_F64, window);
+    return make_unary_param(g, OP_MDEV, a, mean_out_type(a->out_type), window);
 }
-ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, RAY_F64); }
-ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, RAY_F64); }
+ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, mean_out_type(a->out_type)); }
+ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, mean_out_type(a->out_type)); }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
 ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_VAR_POP, a, RAY_F64); }
 
@@ -2048,9 +2048,9 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_ANY:
             out_type = RAY_BOOL; break;
         case OP_AVG:
-            out_type = mean_out_type(prev->out_type); break;
         case OP_STDDEV:
         case OP_STDDEV_POP:
+            out_type = mean_out_type(prev->out_type); break;
         case OP_VAR:
         case OP_VAR_POP:
             out_type = RAY_F64; break;
@@ -2115,9 +2115,9 @@ ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
         case OP_MCOUNT:
             out_type = RAY_I64; break;
         case OP_MAVG:
+        case OP_MDEV:
             out_type = mean_out_type(prev->out_type); break;
         case OP_MVAR:
-        case OP_MDEV:
             out_type = RAY_F64; break;
         case OP_MSUM:
             out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;

@@ -4646,9 +4646,9 @@ static bool ts_moving_type(uint16_t opcode, int8_t t) {
         case OP_MMAX:
             return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
         case OP_MAVG:
+        case OP_MDEV:
             return ts_numeric_type(t) || t == RAY_TIMESPAN;
         case OP_MVAR:
-        case OP_MDEV:
             return ts_numeric_type(t);
         default:
             return ts_numeric_type(t);
@@ -5043,8 +5043,9 @@ ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
     if (opcode == OP_MMIN || opcode == OP_MMAX)
         return moving_minmax_vec_eager(x, opcode, window, out_type);
     ray_t* out = moving_prefix_vec_eager(x, opcode, window, out_type);
-    /* the moving mean of durations is a duration */
-    if (opcode == OP_MAVG && x->type == RAY_TIMESPAN) return ray_timespan_of_f64_vec(out);
+    /* the moving mean and deviation of durations are durations */
+    if ((opcode == OP_MAVG || opcode == OP_MDEV) && x->type == RAY_TIMESPAN)
+        return ray_timespan_of_f64_vec(out);
     return out;
 }
 

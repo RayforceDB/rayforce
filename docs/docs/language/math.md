@@ -362,7 +362,9 @@ type, as do `quantile` and `percentile`.
 
 ### `(dev x)` — aggregate
 
-Population standard deviation.
+Population standard deviation. The standard deviation of a TIMESPAN vector
+(`dev`, `stddev`, `stddev_pop`, `mdev`) is a TIMESPAN, rounded to the
+nanosecond; a variance of durations is a squared duration and stays F64.
 
 ```lisp
 (dev [2 4 4 4 5 5 7 9])  ; 2.0

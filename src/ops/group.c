@@ -4395,7 +4395,10 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
             else if (opcode == OP_VAR) val = var_pop * m->cnt / (m->cnt - 1);
             else if (opcode == OP_STDDEV_POP) val = sqrt(var_pop);
             else val = sqrt(var_pop * m->cnt / (m->cnt - 1));
-            return ray_f64(ray_f64_fin(val));
+            ray_t* r = ray_f64(ray_f64_fin(val));
+            /* the standard deviation of durations is a duration */
+            return in_type == RAY_TIMESPAN && (opcode == OP_STDDEV || opcode == OP_STDDEV_POP)
+                   ? ray_timespan_of_f64_atom(r) : r;
         }
         default:       return ray_error("nyi", NULL);
     }
@@ -13377,8 +13380,9 @@ grp_done:
     return result;
 }
 
-/* The mean of durations is a duration.  The grouping engines accumulate and
- * emit it as F64 nanoseconds; the AVG column of a TIMESPAN input is rounded to
+/* The mean and the standard deviation of durations are durations.  The grouping
+ * engines accumulate and emit them as F64 nanoseconds; the AVG, STDDEV and
+ * STDDEV_POP columns of a TIMESPAN input are rounded to
  * a TIMESPAN column here, once, whichever engine produced it.  Output columns
  * are the keys followed by the aggregates, in order.  (MEDIAN comes out of
  * ray_median_per_group_buf already typed.) */
@@ -13388,7 +13392,8 @@ static ray_t* group_retag_duration_means(ray_graph_t* g, ray_op_t* op, ray_t* re
     if (!ext) return result;
     int64_t ncols = ray_table_ncols(result);
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
-        if (ext->agg_ops[a] != OP_AVG) continue;
+        uint16_t aop = ext->agg_ops[a];
+        if (aop != OP_AVG && aop != OP_STDDEV && aop != OP_STDDEV_POP) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in || in->out_type != RAY_TIMESPAN) continue;
         int64_t ci = (int64_t)ext->n_keys + a;
