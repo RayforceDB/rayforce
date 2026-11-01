@@ -77,4 +77,8 @@
 (set Pfull (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i)}))
 (eqt (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (take (xasc Pfull 'f) 10)) -- true
 (eqt (xasc Pfull 'f) (xasc (select {from: F by: [u s] c: (count u) sv: (sum v) f: (min i)}) 'f)) -- true
+;; A deferred by-dict key on parted input must keep first-seen group order
+;; before an unordered take; the strategy's slot order is not row order.
+(eqt (select {from: Fp by: {ku: u} c: (count v) take: 3}) (select {from: F by: {ku: u} c: (count v) take: 3})) -- true
+(eqt (select {from: Fp by: {ku: (% u 7)} c: (count v) take: 3}) (select {from: F by: {ku: (% u 7)} c: (count v) take: 3})) -- true
 (.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0

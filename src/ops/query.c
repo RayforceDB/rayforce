@@ -18284,7 +18284,10 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 }
             }
         }
-        if (by_input_parted && n_out > 0) {
+        /* The deferred parted grouping route emits by strategy order for a
+         * by-dict key.  Only an unordered take needs first-seen order;
+         * sorted top-N keeps the streaming route and sorts its result. */
+        if (by_input_parted && n_out > 0 && (!take_expr || has_sort || nearest_expr)) {
             bool defer_ok = true;
             for (int64_t i = 0; i + 1 < dict_n && defer_ok; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
