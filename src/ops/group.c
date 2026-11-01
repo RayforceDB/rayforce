@@ -4326,6 +4326,14 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
     return out;
 }
 
+/* Result type of an integer-lane SUM over a column of `src_t`: TIME and
+ * TIMESPAN keep their type (a total of durations is a duration, as the scalar
+ * ray_sum_fn answers); every other integer family widens to I64.  DATE and
+ * TIMESTAMP are rejected at type-admission, so never reach here. */
+static inline int8_t sum_int_out_type(int8_t src_t) {
+    return src_t == RAY_TIME || src_t == RAY_TIMESPAN ? src_t : RAY_I64;
+}
+
 /* `src` is the reduced SYM column when out_type == RAY_SYM (NULL
  * otherwise): the accumulated value is a CELL id in src's domain, and
  * the result is a SYM ATOM — runtime-domain by the atom rule — so it
@@ -4364,7 +4372,7 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
     bool fp = in_type == RAY_F64 || in_type == RAY_F32;
     ray_t* sym_src = in_type == RAY_SYM ? input : NULL;
     switch (opcode) {
-        case OP_SUM:   return fp ? ray_f64(ray_f64_fin(m->sum_f)) : (in_type == RAY_TIME ? ray_time(m->sum_i) : ray_i64(m->sum_i));
+        case OP_SUM:   return fp ? ray_f64(ray_f64_fin(m->sum_f)) : (in_type == RAY_TIME ? ray_time(m->sum_i) : in_type == RAY_TIMESPAN ? ray_timespan(m->sum_i) : ray_i64(m->sum_i));
         case OP_PROD:  return fp ? ray_f64(ray_f64_fin(m->prod_f)) : ray_i64(m->prod_i);
         case OP_ALL:   return ray_bool(m->zero_count == 0);
         case OP_ANY:   return ray_bool(m->cnt > m->zero_count);
@@ -8593,8 +8601,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 out_type = RAY_BOOL; break;
             case OP_COUNT: out_type = RAY_I64; break;
             case OP_SUM: {
-                /* sum preserves TIME (a duration-like temporal): time+time is
-                 * a time, matching the scalar ray_sum_fn.  Other integer
+                /* sum preserves TIME and TIMESPAN (duration-like temporals):
+                 * time+time is a time and a total of durations a duration,
+                 * matching the scalar ray_sum_fn.  Other integer
                  * families widen to I64; DATE/TIMESTAMP are rejected at
                  * type-admission so never reach here.  The affine/linear SUM
                  * fast paths leave agg_col NULL (they aggregate without
@@ -8602,8 +8611,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                  * from the aggregation input op when the vector is absent. */
                 int8_t src_t = agg_col ? agg_col->type
                              : (op_node(g, ext->agg_ins[a]) ? op_node(g, ext->agg_ins[a])->out_type : 0);
-                out_type = is_f64 || f64_bias ? RAY_F64
-                         : (src_t == RAY_TIME ? RAY_TIME : RAY_I64);
+                out_type = is_f64 || f64_bias ? RAY_F64 : sum_int_out_type(src_t);
                 break;
             }
             case OP_PROD:
@@ -19674,11 +19682,9 @@ v2_emit:;
                     out_type = RAY_BOOL; break;
                 case OP_COUNT: out_type = RAY_I64; break;
                 case OP_SUM:
-                    /* sum preserves TIME (duration-like); other integer
-                     * families widen to I64.  DATE/TIMESTAMP rejected at
-                     * type-admission. */
+                    /* sum preserves TIME and TIMESPAN; see sum_int_out_type. */
                     out_type = is_f64 ? RAY_F64
-                             : (agg_col && agg_col->type == RAY_TIME ? RAY_TIME : RAY_I64);
+                             : sum_int_out_type(agg_col ? agg_col->type : 0);
                     break;
                 case OP_PROD:
                     out_type = is_f64 ? RAY_F64 : RAY_I64; break;
@@ -20315,7 +20321,7 @@ sequential_fallback:;
                  * from the aggregation input op when the vector is absent. */
                 int8_t src_t = agg_col ? agg_col->type
                              : (op_node(g, ext->agg_ins[a]) ? op_node(g, ext->agg_ins[a])->out_type : 0);
-                out_type = is_f64 ? RAY_F64 : (src_t == RAY_TIME ? RAY_TIME : RAY_I64);
+                out_type = is_f64 ? RAY_F64 : sum_int_out_type(src_t);
                 break;
             }
             case OP_PROD:
