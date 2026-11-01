@@ -1,0 +1,57 @@
+;; Running scans and moving windows over a TIMESPAN vector keep the type, as
+;; `sum`, `min`, `max` and `-` do.
+(set S (enlist 0D01:00:00 0D02:00:00 0D00:30:00 0D04:00:00))
+
+;; deltas: first cell null, then consecutive differences
+(type (deltas S)) -- 'TIMESPAN
+(as 'I64 (at (deltas S) 1)) -- 3600000000000
+(as 'I64 (at (deltas S) 2)) -- -5400000000000
+(nil? (at (deltas S) 0)) -- true
+
+;; sums
+(type (sums S)) -- 'TIMESPAN
+(as 'I64 (sums S)) -- [3600000000000 10800000000000 12600000000000 27000000000000]
+
+;; ratios: a duration over a duration is a plain number, as `/` answers
+(type (ratios S)) -- 'F64
+(nil? (at (ratios S) 0)) -- true
+(at (ratios S) 1) -- 2.0
+(at (ratios S) 2) -- 0.25
+(at (ratios S) 3) -- 8.0
+
+;; running min / max
+(type (mins S)) -- 'TIMESPAN
+(as 'I64 (mins S)) -- [3600000000000 3600000000000 1800000000000 1800000000000]
+(type (maxs S)) -- 'TIMESPAN
+(as 'I64 (maxs S)) -- [3600000000000 7200000000000 7200000000000 14400000000000]
+
+;; moving windows
+(type (msum 2 S)) -- 'TIMESPAN
+(as 'I64 (msum 2 S)) -- [3600000000000 10800000000000 9000000000000 16200000000000]
+(type (mmin 2 S)) -- 'TIMESPAN
+(as 'I64 (mmin 2 S)) -- [3600000000000 3600000000000 1800000000000 1800000000000]
+(type (mmax 2 S)) -- 'TIMESPAN
+(as 'I64 (mmax 2 S)) -- [3600000000000 7200000000000 7200000000000 14400000000000]
+
+;; the scans agree with the same expression on the I64 counts
+(set N (as 'I64 S))
+(all (== (as 'I64 (sums S)) (sums N))) -- true
+(all (== (as 'I64 (msum 3 S)) (msum 3 N))) -- true
+
+;; nulls are skipped by the running scans and propagate through deltas
+(set Z (enlist 0D01:00:00 0Nn 0D03:00:00))
+(type (sums Z)) -- 'TIMESPAN
+(as 'I64 (sums Z)) -- [3600000000000 3600000000000 14400000000000]
+(nil? (at (deltas Z) 1)) -- true
+(nil? (at (deltas Z) 2)) -- true
+
+;; lazily, inside a query, the column keeps its type
+(set T (table [sp] (list S)))
+(type (at (select {r: (sums sp) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (deltas sp) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (msum 2 sp) from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (sums sp) from: T}) 'r)) -- [3600000000000 10800000000000 12600000000000 27000000000000]
+
+;; scans that have no meaning for a duration stay rejected
+(avgs S) !- type
+(prds S) !- type
