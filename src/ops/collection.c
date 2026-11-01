@@ -3943,7 +3943,7 @@ static bool ts_delta_type(int8_t t) {
     switch (t) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
         case RAY_F32: case RAY_F64:
-        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN:
             return true;
         default:
             return false;
@@ -4019,7 +4019,7 @@ ray_t* deltas_vec_eager(ray_t* x) {
         return ray_error("type", "deltas expects a numeric or temporal vector, got %s", ray_type_name(x->type));
 
     int64_t n = x->len;
-    int8_t out_type = (x->type == RAY_F64 || x->type == RAY_F32) ? RAY_F64 : RAY_I64;
+    int8_t out_type = (x->type == RAY_F64 || x->type == RAY_F32) ? RAY_F64 : scan_int_out_type(x->type);
     ray_t* out = ray_vec_new(out_type, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
@@ -4286,8 +4286,10 @@ static bool ts_numeric_type(int8_t t) {
 
 static bool ts_running_type(uint16_t opcode, int8_t t) {
     if (opcode == OP_MINS || opcode == OP_MAXS) {
-        return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+        return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME ||
+               t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
     }
+    if (opcode == OP_SUMS) return ts_numeric_type(t) || t == RAY_TIMESPAN;
     return ts_numeric_type(t);
 }
 
@@ -4296,6 +4298,7 @@ static int8_t ts_running_out_type(uint16_t opcode, int8_t t) {
         case OP_AVGS:
             return RAY_F64;
         case OP_SUMS:
+            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t);
         case OP_PRDS:
             return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
         case OP_MINS:
@@ -4669,7 +4672,10 @@ static bool ts_moving_type(uint16_t opcode, int8_t t) {
             return true;
         case OP_MMIN:
         case OP_MMAX:
-            return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+            return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME ||
+                   t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+        case OP_MSUM:
+            return ts_numeric_type(t) || t == RAY_TIMESPAN;
         case OP_MVAR:
         case OP_MDEV:
             return ts_numeric_type(t);
@@ -4687,7 +4693,7 @@ static int8_t ts_moving_out_type(uint16_t opcode, int8_t t) {
         case OP_MDEV:
             return RAY_F64;
         case OP_MSUM:
-            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
+            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t);
         case OP_MMIN:
         case OP_MMAX:
             return t;
@@ -4792,7 +4798,7 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     double* prefix_f = NULL;
     int64_t* prefix_count = NULL;
 
-    bool need_i = (opcode == OP_MSUM && out_type == RAY_I64);
+    bool need_i = (opcode == OP_MSUM && out_type != RAY_F64);
     bool need_f = (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64));
     bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT);
     bool has_nulls = ray_vec_may_have_nulls(x);

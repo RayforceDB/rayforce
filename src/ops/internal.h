@@ -183,6 +183,14 @@ static inline int64_t sym_intern_safe(const char* s, size_t len) {
     return id >= 0 ? id : 0;
 }
 
+/* Result type of the additive scans (deltas, sums, msum) over an integer-lane
+ * input: a TIMESPAN stays a TIMESPAN, as `sum` and `-` keep it; every other
+ * integer-lane input answers I64 counts.  Float inputs answer F64 and are not
+ * routed here. */
+static inline int8_t scan_int_out_type(int8_t t) {
+    return t == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_I64;
+}
+
 /* ══════════════════════════════════════════
  * Unified column read/write helpers
  * ══════════════════════════════════════════ */
