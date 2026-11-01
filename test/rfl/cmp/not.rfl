@@ -9,3 +9,9 @@
 
 ;; not X XOR X is always false (complementary)
 (count B) -- (sum (!= B (not B)))
+
+;; element-wise over a TIMESPAN vector, as over the other temporal types:
+;; true where the cell is zero or null
+(not (enlist 0D01:00:00 0D00:00:00)) -- [false true]
+(not (enlist 0D00:00:00 0D00:00:01)) -- [true false]
+(not (enlist 0D01:00:00)) -- [false]
