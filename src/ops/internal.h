@@ -205,6 +205,12 @@ static inline int8_t scan_int_out_type(int8_t t) {
     return t == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_I64;
 }
 
+/* Result type of a mean or median (avg, avgs, mavg, med): F64, except that the
+ * mean of durations is a duration. */
+static inline int8_t mean_out_type(int8_t t) {
+    return t == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_F64;
+}
+
 /* ══════════════════════════════════════════
  * Unified column read/write helpers
  * ══════════════════════════════════════════ */
@@ -1670,6 +1676,12 @@ ray_t* distinct_radix_first_ids(ray_t* input);
  * returned as RAY_IS_ERR ray_t*. */
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups);
+
+/* Mean and median of durations are durations: round an F64 atom / vector of
+ * nanosecond counts to a TIMESPAN one (consumes its argument; nulls stay
+ * null, errors pass through).  See agg.c. */
+ray_t* ray_timespan_of_f64_atom(ray_t* r);
+ray_t* ray_timespan_of_f64_vec(ray_t* col);
 
 /* Parallel exact median per group via ray_pool_dispatch_n.  idx_buf is
  * the group-contiguous row-index layout produced by the upstream

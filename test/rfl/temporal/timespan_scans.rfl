@@ -53,5 +53,4 @@
 (as 'I64 (at (select {r: (sums sp) from: T}) 'r)) -- [3600000000000 10800000000000 12600000000000 27000000000000]
 
 ;; scans that have no meaning for a duration stay rejected
-(avgs S) !- type
 (prds S) !- type

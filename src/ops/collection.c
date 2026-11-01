@@ -4294,6 +4294,7 @@ static bool ts_running_type(uint16_t opcode, int8_t t) {
                t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
     }
     if (opcode == OP_SUMS) return ts_numeric_type(t) || t == RAY_TIMESPAN;
+    if (opcode == OP_AVGS) return ts_numeric_type(t) || t == RAY_TIMESPAN;
     return ts_numeric_type(t);
 }
 
@@ -4553,6 +4554,8 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
     }
     scratch_free(summary_hdr);
     scratch_free(carry_hdr);
+    /* the running mean of durations is a duration */
+    if (opcode == OP_AVGS && x->type == RAY_TIMESPAN) return ray_timespan_of_f64_vec(out);
     return out;
 }
 
@@ -4679,6 +4682,7 @@ static bool ts_moving_type(uint16_t opcode, int8_t t) {
             return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME ||
                    t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
         case OP_MSUM:
+        case OP_MAVG:
             return ts_numeric_type(t) || t == RAY_TIMESPAN;
         case OP_MVAR:
         case OP_MDEV:
@@ -5223,7 +5227,10 @@ ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
         return moving_minmax_vec_eager(x, opcode, window, out_type);
     if (opcode == OP_MVAR || opcode == OP_MDEV)
         return moving_variance_vec_eager(x, opcode, window, out_type);
-    return moving_prefix_vec_eager(x, opcode, window, out_type);
+    ray_t* out = moving_prefix_vec_eager(x, opcode, window, out_type);
+    /* the moving mean of durations is a duration */
+    if (opcode == OP_MAVG && x->type == RAY_TIMESPAN) return ray_timespan_of_f64_vec(out);
+    return out;
 }
 
 static ray_t* ts_start_lazy_unary(ray_t* x, ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
