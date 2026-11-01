@@ -35,6 +35,8 @@
 #include "lang/env.h"
 #include "lang/parse.h"
 #include "ops/ops.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
@@ -735,6 +737,28 @@ static test_result_t test_compile_large_const_pool(void) {
     PASS();
 }
 
+/* A wide constant operand has only 16 bits.  Once the pool is full, the
+ * lambda must fall back to the tree walker instead of loading entry zero. */
+static test_result_t test_compile_const_pool_overflow_falls_back(void) {
+    enum { N = 65537 };
+    size_t cap = (size_t)N * 12 + 64;
+    char* src = (char*)malloc(cap);
+    TEST_ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "((fn [] ");
+    for (int i = 0; i < N; i++)
+        pos += (size_t)snprintf(src + pos, cap - pos, "%d ", 3000000 + i);
+    snprintf(src + pos, cap - pos, "123456789))");
+
+    ray_t* result = ray_eval_str(src);
+    free(src);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(result->i64, 123456789);
+    ray_release(result);
+    PASS();
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 14. Many symbols in body — forces OP_RESOLVE_W path (lines 409-413)
  *     Need > 256 distinct symbol entries in the const pool.
@@ -1101,6 +1125,8 @@ const test_entry_t compile_entries[] = {
     { "compile/binary_wrong_arity",  test_compile_binary_wrong_arity,  compile_setup, compile_teardown },
     { "compile/lambda_call",         test_compile_lambda_call,         compile_setup, compile_teardown },
     { "compile/large_const_pool",    test_compile_large_const_pool,    compile_setup, compile_teardown },
+    { "compile/const_pool_overflow_falls_back", test_compile_const_pool_overflow_falls_back,
+                                     compile_setup, compile_teardown },
     { "compile/many_symbols",        test_compile_many_symbols,        compile_setup, compile_teardown },
     { "compile/code_buffer_grow",    test_compile_code_buffer_grow,    compile_setup, compile_teardown },
     { "compile/if_with_else",        test_compile_if_with_else,        compile_setup, compile_teardown },

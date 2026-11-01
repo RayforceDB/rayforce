@@ -155,6 +155,13 @@ static int32_t add_constant(compiler_t *c, ray_t *value) {
                 v->attrs == value->attrs) return i;
         }
     }
+    /* OP_LOADCONST_W and the other wide constant operands hold only 16 bits.
+     * A new entry beyond that limit would wrap to an earlier constant and
+     * silently change the result; leave this lambda to the tree walker. */
+    if (c->n_consts > UINT16_MAX) {
+        c->error = true;
+        return 0;
+    }
     if (c->n_consts >= c->consts_cap) {
         int32_t new_cap = c->consts_cap * 2;
         ray_t *new_obj = ray_alloc(new_cap * sizeof(ray_t *));
@@ -1302,6 +1309,11 @@ bool ray_compile_definition(ray_t *lambda, ray_t **deps) {
 }
 
 static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_globals, ray_t **deps) {
+    /* A body this large can overflow a 16-bit constant index even when its
+     * forms are simple.  Avoid the quadratic constant-pool search and let
+     * the tree walker handle it; nested expressions still use the precise
+     * add_constant bound below. */
+    if (ray_len(LAMBDA_BODY(lambda)) > UINT16_MAX) return false;
     compiler_t c;
     if (!compiler_init(&c)) return false;
     c.lambda = lambda;
@@ -1359,7 +1371,7 @@ static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_glo
     ray_t *body = LAMBDA_BODY(lambda);
     int64_t body_count = ray_len(body);
     ray_t **body_exprs = (ray_t **)ray_data(body);
-    for (int64_t i = 0; i < body_count; i++) {
+    for (int64_t i = 0; i < body_count && !c.error; i++) {
         if (i > 0) emit(&c, OP_POP);
         compile_expr(&c, body_exprs[i]);
     }
