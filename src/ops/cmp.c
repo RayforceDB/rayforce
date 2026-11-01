@@ -468,7 +468,7 @@ ray_t* ray_not_fn(ray_t* x) {
                           x->type == RAY_I32 || x->type == RAY_I64 ||
                           x->type == RAY_F32 || x->type == RAY_F64 ||
                           x->type == RAY_DATE || x->type == RAY_TIME ||
-                          x->type == RAY_TIMESTAMP)) {
+                          x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN)) {
         int64_t n = x->len;
         ray_t* r = ray_vec_new(RAY_BOOL, n);
         if (RAY_IS_ERR(r)) return r;
