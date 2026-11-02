@@ -102,6 +102,7 @@ ray_t* ray_str(const char* s, size_t len) {
          * Exactly 7 bytes would fill all of sdata[7] with no NUL terminator,
          * so 7-byte strings fall through to the long-string path. */
         ray_t* v = ray_alloc(0);
+        if (!v) return ray_error("oom", NULL);
         if (RAY_IS_ERR(v)) return v;
         v->type = -RAY_STR;
         v->slen = (uint8_t)len;
@@ -114,16 +115,17 @@ ray_t* ray_str(const char* s, size_t len) {
      * (including ctypes c_char_p) may read until '\0'. */
     size_t data_size = len + 1;
     ray_t* chars = ray_alloc(data_size);
-    if (!chars || RAY_IS_ERR(chars)) return chars;
+    if (!chars) return ray_error("oom", NULL);
+    if (RAY_IS_ERR(chars)) return chars;
     chars->type = RAY_U8;
     chars->len = (int64_t)len;
     memcpy(ray_data(chars), s, len);
     ((char*)ray_data(chars))[len] = '\0';
 
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) {
+    if (!v || RAY_IS_ERR(v)) {
         ray_free(chars);
-        return v;
+        return v ? v : ray_error("oom", NULL);
     }
     v->type = -RAY_STR;
     v->obj = chars;
@@ -136,6 +138,7 @@ ray_t* ray_str(const char* s, size_t len) {
 
 ray_t* ray_sym(int64_t id) {
     ray_t* v = ray_alloc(0);
+    if (!v) return ray_error("oom", NULL);
     if (RAY_IS_ERR(v)) return v;
     v->type = -RAY_SYM;
     v->i64 = id;
