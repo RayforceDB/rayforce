@@ -505,6 +505,19 @@ ray_t* ray_raise_fn(ray_t* val) {
     return ray_error("domain", NULL);
 }
 
+/* The errors both engines raise for the same mistake, so that their text,
+ * which a `try` handler reads as msg, doesn't depend on whether the code
+ * was compiled. */
+static ray_t* undefined_name_error(int64_t sym) {
+    ray_t* s = ray_sym_str(sym);   /* borrowed */
+    if (!s) return ray_error("name", NULL);
+    return ray_error("name", "'%.*s' undefined", (int)ray_str_len(s), ray_str_ptr(s));
+}
+
+static ray_t* head_not_callable_error(int8_t type) {
+    return ray_error("type", "head is not callable, got %s", ray_type_name(type));
+}
+
 /* Dispose of a construction temporary that was not handed on: an error is
  * freed (errors are not refcounted, so ray_release would leave it
  * allocated), anything else released. */
@@ -523,16 +536,25 @@ static void try_drop(ray_t* v) {
 static ray_t* try_error_value(const char* code, const char* msg) {
     if (!code) code = "error";
     if (!msg) msg = "";
+    /* The keys' ids hold for the symbol table's lifetime: one lookup each
+     * per table, not per catch.  An epoch of 0 is no table yet. */
+    static _Thread_local uint64_t key_epoch;
+    static _Thread_local int64_t kc, km;
     ray_t *sm, *sc = NULL, *keys = NULL, *vals = NULL, *d;
-    int64_t kc, km, kv;
+    int64_t kv;
     /* The message first: a failure below makes an error of its own,
      * which overwrites the thread's last message. */
     sm = ray_str(msg, strlen(msg));
     if (RAY_IS_ERR(sm)) goto fail;
-    kc = ray_sym_intern("code", 4);
-    km = ray_sym_intern("msg", 3);
+    uint64_t epoch = ray_sym_epoch();
+    if (key_epoch != epoch || !epoch) {
+        kc = ray_sym_intern("code", 4);
+        km = ray_sym_intern("msg", 3);
+        if (kc < 0 || km < 0) { key_epoch = 0; goto fail; }
+        key_epoch = epoch;
+    }
     kv = ray_sym_intern(code, strlen(code));
-    if (kc < 0 || km < 0 || kv < 0) goto fail;
+    if (kv < 0) goto fail;
     sc = ray_sym(kv);
     if (RAY_IS_ERR(sc)) goto fail;
     keys = ray_sym_vec_new(RAY_SYM_W64, 2);
@@ -3480,7 +3502,7 @@ op_resolve: {
         }
     }
     ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
-    if (!val) goto vm_error_name;
+    if (!val) { vm_err_obj = undefined_name_error(name_obj->i64); goto vm_error; }
     /* env_resolve returns an owned ref (rc >= 1); no extra retain needed.
      * It can also return a real error (e.g. nyi from a parted-target link
      * deref inside the dotted walker) — surface that as a VM error rather
@@ -3496,7 +3518,7 @@ op_resolve_w: {
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;
     ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
-    if (!val) goto vm_error_name;
+    if (!val) { vm_err_obj = undefined_name_error(name_obj->i64); goto vm_error; }
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
     PUSHR(val, val_rows);
     DISPATCH();
@@ -3704,9 +3726,7 @@ op_pathget: {
     ray_t *pv = ray_env_path_get(phead, pname->i64);
     ray_release(phead);
     if (RAY_UNLIKELY(!pv)) {
-        ray_t *ps = ray_sym_str(pname->i64);   /* borrowed */
-        vm_err_obj = ray_error("name", "'%.*s' undefined",
-                               ps ? (int)ray_str_len(ps) : 0, ps ? ray_str_ptr(ps) : "");
+        vm_err_obj = undefined_name_error(pname->i64);
         goto vm_error;
     }
     if (RAY_IS_ERR(pv)) { vm_err_obj = pv; goto vm_error; }
@@ -3883,7 +3903,7 @@ unary_done:
         }
         default:
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
-            result = ray_error("type", "apply: head is not callable, got %s", ray_type_name(fn_obj->type));
+            result = head_not_callable_error(fn_obj->type);
             break;
         }
         uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
@@ -4193,7 +4213,7 @@ op_loadenvg: {
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;
     val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
-    if (!val) goto vm_error_name;
+    if (!val) { vm_err_obj = undefined_name_error(name_obj->i64); goto vm_error; }
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
     PUSHR(val, val_rows);
     DISPATCH();
@@ -5181,14 +5201,7 @@ ray_t* ray_eval(ray_t* obj) {
             uint8_t val_rows = 0;   /* a query's column binding, or a helper's */
             ray_t* val = ray_env_resolve_rows(obj->i64, &val_rows);
             if (!val) {
-                ray_t* ns = ray_sym_str(obj->i64);
-                if (ns) {
-                    ret = ray_error("name", "'%.*s' undefined",
-                                    (int)ray_str_len(ns), ray_str_ptr(ns));
-                    ray_release(ns);
-                } else {
-                    ret = ray_error("name", NULL);
-                }
+                ret = undefined_name_error(obj->i64);
                 goto out;
             }
             /* env_resolve may also return a real error (e.g. nyi from a
@@ -5252,14 +5265,7 @@ ray_t* ray_eval(ray_t* obj) {
                 ray_retain(obj);
                 ret = obj; goto out;
             }
-            ray_t* ns = ray_sym_str(head->i64);
-            if (ns) {
-                ret = ray_error("name", "'%.*s' undefined",
-                                (int)ray_str_len(ns), ray_str_ptr(ns));
-                ray_release(ns);
-            } else {
-                ret = ray_error("name", NULL);
-            }
+            ret = undefined_name_error(head->i64);
             ray_release(head);
             goto out;
         }
@@ -5594,7 +5600,7 @@ ray_t* ray_eval(ray_t* obj) {
                 ray_retain(obj);
                 ret = obj; goto out;
             }
-            ret = ray_error("type", "eval: head of list is not callable, got %s", ray_type_name(head_type)); goto out;
+            ret = head_not_callable_error(head_type); goto out;
         }
     }
 

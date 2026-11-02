@@ -7204,6 +7204,75 @@ static test_result_t test_eval_try_value_handler_builds_nothing(void) {
     PASS();
 }
 
+/* A catch leaves nothing allocated, whatever the handler and whichever
+ * engine runs it: the raised value is released, or the dict, or the error.
+ * The raised list holds a string too long for its header, so a leak of it
+ * shows as several blocks.  Counts net bytes, which an allocation count
+ * can't see. */
+static test_result_t test_eval_try_catch_releases(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set hlam (fn [e] 0))"
+        "    (set rv (fn [] (try (raise (list 1 \"abcdefghijk\")) 0)))"
+        "    (set rl (fn [] (try (raise (list 1 \"abcdefghijk\")) (fn [e] 0))))"
+        "    (set rn (fn [] (try (raise (list 1 \"abcdefghijk\")) hlam)))"
+        "    (set ev (fn [] (try (+ 1 'a) 0)))"
+        "    (set el (fn [] (try (+ 1 'a) (fn [e] e))))"
+        "    (set en (fn [] (try try_catch_no_such_name (fn [e] e)))))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* src[] = {
+        "(try (raise (list 1 \"abcdefghijk\")) 0)",
+        "(try (raise (list 1 \"abcdefghijk\")) (fn [e] 0))",
+        "(try (raise (list 1 \"abcdefghijk\")) hlam)",
+        "(try (+ 1 'a) 0)",
+        "(try (+ 1 'a) (fn [e] e))",
+        "(try try_catch_no_such_name (fn [e] e))",
+        "(rv)", "(rl)", "(rn)", "(ev)", "(el)", "(en)",
+    };
+    for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++) {
+        ray_t* ast = ray_parse(src[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        /* The first runs compile the lambda and intern the names. */
+        for (int run = 0; run < 2; run++) {
+            size_t before = lang_heap_bytes();
+            for (int k = 0; k < 200; k++) {
+                ray_t* r = ray_eval(ast);
+                TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+                ray_release(r);
+            }
+            if (run)
+                TEST_ASSERT_FMT(lang_heap_bytes() == before, "%s: %zu bytes, then %zu",
+                                src[i], before, lang_heap_bytes());
+        }
+        ray_release(ast);
+    }
+    PASS();
+}
+
+/* The handler dict's keys are cached by symbol id.  A runtime restart
+ * deals the ids out again: here an earlier intern takes the id "code" had,
+ * and the dict must still say code and msg. */
+static test_result_t test_eval_try_error_keys_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+            ray_sym_intern("try_keys_reinit_a", 17);
+            ray_sym_intern("try_keys_reinit_b", 17);
+        }
+        ray_t* r = ray_eval_str("(try (+ 1 'a) (fn [e] (at e 'code)))");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_SYM);
+        TEST_ASSERT_EQ_I(r->i64, ray_sym_intern("type", 4));
+        ray_release(r);
+        r = ray_eval_str("(try (+ 1 'a) (fn [e] (at e 'msg)))");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_STR);
+        ray_release(r);
+    }
+    PASS();
+}
+
 /* --- dotted table col not found error --- */
 static test_result_t test_eval_dotted_table_not_found(void) {
     ASSERT_ER("(do (set tbl99 (table ['a] (list [1 2 3]))) tbl99.notacol)", "name");
@@ -11756,6 +11825,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/try_raise_value", test_eval_try_raise_value, lang_setup, lang_teardown },
     { "lang/eval/try_error_value_oom", test_eval_try_error_value_oom, lang_setup, lang_teardown },
     { "lang/eval/try_value_handler_builds_nothing", test_eval_try_value_handler_builds_nothing, lang_setup, lang_teardown },
+    { "lang/eval/try_catch_releases", test_eval_try_catch_releases, lang_setup, lang_teardown },
+    { "lang/eval/try_error_keys_reinit", test_eval_try_error_keys_reinit, lang_setup, lang_teardown },
     { "lang/eval/dotted_table_not_found", test_eval_dotted_table_not_found, lang_setup, lang_teardown },
     { "lang/eval/value_fn_table", test_eval_value_fn_table, lang_setup, lang_teardown },
     { "lang/eval/value_fn_error", test_eval_value_fn_error, lang_setup, lang_teardown },
