@@ -605,6 +605,17 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, int mode) {
 
 static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, int mode) {
     int64_t len = ray_len(vec);
+    if (mode == RAY_FMT_ROUNDTRIP && vec->type == RAY_SYM) {
+        fmt_puts(b, "(as 'SYM (list");
+        for (int64_t i = 0; i < len; i++) {
+            ray_t* s = ray_sym_vec_cell(vec, i);
+            fmt_putc(b, ' ');
+            fmt_str_quoted(b, s ? ray_str_ptr(s) : "",
+                           s ? ray_str_len(s) : 0, true);
+        }
+        fmt_puts(b, "))");
+        return;
+    }
     if (mode == RAY_FMT_ROUNDTRIP && vec->type == RAY_GUID) {
         fmt_puts(b, "(as 'GUID (list");
         for (int64_t i = 0; i < len; i++) {
@@ -1103,6 +1114,20 @@ static ray_t* fmt_col_elem(fmt_col_t* c, int64_t ri) {
 /* A parted column of `nrows` rows in an unlimited structural mode, exactly
  * as fmt_obj writes the flat column: fmt_vector, or fmt_list for LIST. */
 static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows, int mode) {
+    if (mode == RAY_FMT_ROUNDTRIP && c->type == RAY_SYM) {
+        fmt_puts(b, "(as 'SYM (list");
+        for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+            ray_t* v = NULL;
+            int64_t at = 0;
+            ray_t* s = fmt_col_cell(c, ri, &v, &at) == FMT_CELL_AT
+                ? ray_sym_vec_cell(v, at) : NULL;
+            fmt_putc(b, ' ');
+            fmt_str_quoted(b, s ? ray_str_ptr(s) : "",
+                           s ? ray_str_len(s) : 0, true);
+        }
+        fmt_puts(b, "))");
+        return;
+    }
     /* Match fmt_vector's round-trippable representation exactly.  GUID
      * vectors cannot use the generic [...] spelling because that loses the
      * vector type when the value is parsed again. */
@@ -1342,17 +1367,25 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
 
     /* Structural modes: (table [names] (list col1 col2 ...)). */
     if (mode == RAY_FMT_COMPACT || mode == RAY_FMT_ROUNDTRIP) {
-        fmt_puts(b, "(table [");
+        fmt_puts(b, mode == RAY_FMT_ROUNDTRIP
+                        ? "(table (as 'SYM (list"
+                        : "(table [");
         for (int64_t i = 0; i < ncols; i++) {
-            if (i > 0) fmt_putc(b, ' ');
+            if (mode != RAY_FMT_ROUNDTRIP && i > 0) fmt_putc(b, ' ');
             int64_t name_id = ray_table_col_name(tbl, i);
             ray_t* name_str = ray_sym_str(name_id);
-            if (name_str && !RAY_IS_ERR(name_str)) {
+            if (mode == RAY_FMT_ROUNDTRIP) {
+                fmt_putc(b, ' ');
+                fmt_str_quoted(b,
+                               name_str && !RAY_IS_ERR(name_str) ? ray_str_ptr(name_str) : "",
+                               name_str && !RAY_IS_ERR(name_str) ? ray_str_len(name_str) : 0,
+                               true);
+            } else if (name_str && !RAY_IS_ERR(name_str)) {
                 fmt_putn(b, ray_str_ptr(name_str), (int64_t)ray_str_len(name_str));
-                ray_release(name_str);
             }
+            if (name_str && !RAY_IS_ERR(name_str)) ray_release(name_str);
         }
-        fmt_puts(b, "] (list ");
+        fmt_puts(b, mode == RAY_FMT_ROUNDTRIP ? ")) (list " : "] (list ");
         for (int64_t i = 0; i < ncols; i++) {
             if (i > 0) fmt_putc(b, ' ');
             ray_t* col = fmt_col_idx(b, tbl, i);

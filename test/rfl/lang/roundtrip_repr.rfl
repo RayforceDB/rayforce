@@ -68,6 +68,12 @@
 (all (== (ser symList990) (ser (eval (parse (repr symList990)))))) -- true
 (set symDict990 (dict [v] (list symList990)))
 (all (== (ser symDict990) (ser (eval (parse (repr symDict990)))))) -- true
+(set symVec990 (as 'SYM (list "a b" "c")))
+(all (== (ser symVec990) (ser (eval (parse (repr symVec990)))))) -- true
+(set symKeyDict990 (dict symVec990 [1 2]))
+(all (== (ser symKeyDict990) (ser (eval (parse (repr symKeyDict990)))))) -- true
+(set symNameTable990 (table symVec990 (list [1] [2])))
+(all (== (ser symNameTable990) (ser (eval (parse (repr symNameTable990)))))) -- true
 
 ;; Ordinary format remains display-oriented and consistent in every template.
 (format "%" 5i) -- "5"
