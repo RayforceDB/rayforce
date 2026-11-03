@@ -4113,6 +4113,45 @@ ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count) {
 }
 
 /* --------------------------------------------------------------------------
+ * Hash-index distinct (GUID): the groups are the distinct values
+ * -------------------------------------------------------------------------- */
+
+static ray_index_t* guid_distinct_index(ray_t* col) {
+    if (!col || RAY_IS_ERR(col) || col->type != RAY_GUID) return NULL;
+    if (!idx_fresh_any(col, RAY_IDX_HASH)) return NULL;
+    ray_index_t* ix = ray_index_payload(col->index);
+    if (!ix->u.hash.offs || !ix->u.hash.rows ||
+        ix->u.hash.offs->len != ix->u.hash.n_groups + 1) return NULL;
+    return ix;
+}
+
+ray_t* ray_index_hash_first_rows(ray_t* col) {
+    ray_index_t* ix = guid_distinct_index(col);
+    if (!ix) return NULL;
+    int64_t ng = ix->u.hash.n_groups;
+    ray_t* out = ray_vec_new(RAY_I64, ng > 0 ? ng : 1);
+    if (!out || RAY_IS_ERR(out)) return NULL;
+    int64_t* o = (int64_t*)ray_data(out);
+    const ray_t* ofv = ix->u.hash.offs;
+    const ray_t* rwv = ix->u.hash.rows;
+    bool asc = true;
+    for (int64_t g = 0; g < ng; g++) {
+        o[g] = hx_get(rwv, hx_get(ofv, g));
+        if (g > 0 && o[g] < o[g - 1]) asc = false;
+    }
+    /* the serial builder numbers groups by first occurrence and an append
+     * adds them in row order, so this sort is for any other numbering */
+    if (!asc) qsort(o, (size_t)ng, sizeof(int64_t), cmp_i64_plain);
+    out->len = ng;
+    return out;
+}
+
+int64_t ray_index_hash_distinct_count(ray_t* col) {
+    ray_index_t* ix = guid_distinct_index(col);
+    return ix ? ix->u.hash.n_groups : -1;
+}
+
+/* --------------------------------------------------------------------------
  * Bloom filter — m bits, k=3 hashes via double-hashing
  *
  * Layout: m is rounded to the next power of two >= max(64, 8*n_non_null).

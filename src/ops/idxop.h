@@ -109,10 +109,10 @@ typedef enum {
 /* Hash index an append left holding each key's FIRST row only: an appended
  * row that repeated a key already held was not added to its group (adding
  * it would re-lay the CSR rows, O(n) per append).  Every key, and the first
- * row of each, is still exact, so find / in / dict lookup read it
- * (ray_index_find_*); every other consumer goes through idx_fresh, which
- * treats it as stale.  A save rebuilds it from the values, so it never
- * reaches a file.  Cleared only by a rebuild. */
+ * row of each, is still exact, so find / in / dict lookup and distinct read
+ * it (ray_index_find_*, ray_index_hash_first_rows); every other consumer
+ * goes through idx_fresh, which treats it as stale.  A save rebuilds it from
+ * the values, so it never reaches a file.  Cleared only by a rebuild. */
 #define RAY_MARK_FIRST_ONLY 0x08
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
@@ -944,6 +944,20 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col);
  * Returns NULL if not eligible (no sort index, stale, null-bearing) or on
  * OOM.  The caller is responsible for releasing the returned vector. */
 ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count);
+
+/* ===== Hash-index distinct (GUID) =====
+ *
+ * A GUID hash keys every row, the zero guid included, so its groups are the
+ * column's distinct values and each group's first row is that value's first
+ * occurrence — also in a first-row-only index (RAY_MARK_FIRST_ONLY), whose
+ * missing rows are repeats.
+ *
+ * ray_index_hash_first_rows: a RAY_I64 vector of those first rows in
+ * ascending order (distinct's first-appearance order), or NULL when `col`
+ * is not a GUID vector with a fresh hash index, or on OOM.
+ * ray_index_hash_distinct_count: the number of groups, or -1 likewise. */
+ray_t*  ray_index_hash_first_rows(ray_t* col);
+int64_t ray_index_hash_distinct_count(ray_t* col);
 
 /* ===== Internal helpers (used by retain/release/detach in heap.c
  * and by mutation paths in vec.c) ===== */

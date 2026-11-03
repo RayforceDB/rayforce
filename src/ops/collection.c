@@ -1545,6 +1545,20 @@ ray_t* distinct_vec_eager(ray_t* x) {
         }
     }
 
+    /* A guid hash index: its groups are the distinct guids, each one's
+     * first row in first-appearance order (ray_index_hash_first_rows). */
+    if (x->type == RAY_GUID && ray_index_has(x)) {
+        ray_idx_consults[IDX_SITE_DISTINCT]++;
+        ray_t* ids = ray_index_hash_first_rows(x);
+        if (ids) {
+            ray_idx_hits[IDX_SITE_DISTINCT]++;
+            ray_idx_note_use(x);
+            ray_t* result = gather_by_idx(x, (int64_t*)ray_data(ids), ray_len(ids));
+            ray_release(ids);
+            return result;
+        }
+    }
+
     int64_t idx_stack[256];
     int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_alloc_raw((size_t)len * sizeof(int64_t));
     if (!idx) return ray_error("oom", NULL);
@@ -1614,6 +1628,18 @@ ray_t* distinct_vec_eager(ray_t* x) {
         count = ray_len(rids);
         memcpy(idx, ray_data(rids), (size_t)count * sizeof(int64_t));
         ray_release(rids);
+    } else if (x->type == RAY_GUID) {
+        /* in_guid's table of 16-byte keys, without the hashset's per-row
+         * type dispatch; it takes the zero guid once, as the hashset does */
+        guid_set_t gs;
+        if (!guid_set_init(&gs, len)) {
+            if (idx != idx_stack) ray_free_raw(idx);
+            return ray_error("oom", NULL);
+        }
+        const uint8_t* gd = (const uint8_t*)ray_data(x);
+        for (int64_t i = 0; i < len; i++)
+            if (guid_set_add(&gs, gd + i * 16)) idx[count++] = i;
+        ray_free_raw(gs.keys);
     } else {
         hashset_t hs;
         if (!hashset_init(&hs, x, len)) {

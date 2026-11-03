@@ -75,6 +75,29 @@
 (at (.idx.info (concat gi (at g [0]))) 'first_only) -- true
 (find (concat gi (at g [0])) (at g [0 2])) -- [0 3]
 
+;; ─────────────────────────── distinct: from the index, and without one ─────
+;; first-appearance order, the zero guid one value among the others
+(distinct gi) -- (at g [0 1 2 3])
+(distinct h) -- (at g [0 1 2 3])
+(count (distinct gi)) -- 4
+(count (distinct h)) -- 4
+(distinct gz) -- (concat (at g [0 1 2 3]) [0Ng])
+(distinct hz) -- (concat (at g [0 1 2 3]) [0Ng])
+(count (distinct gz)) -- 5
+;; a first-row-only index still answers: its missing rows are repeats
+(set gf (concat gi (at g [5 0 4])))
+(at (.idx.info gf) 'first_only) -- true
+(distinct gf) -- (at g [0 1 2 3 5 4])
+(count (distinct gf)) -- 6
+;; past 65536 rows: the parallel kernel unindexed, the groups indexed
+(set dh (concat big (concat (take big 100) (concat [0Ng] big))))
+(distinct dh) -- (concat big [0Ng])
+(count (distinct dh)) -- 70001
+(set di (.idx.hash dh))
+(distinct di) -- (concat big [0Ng])
+(count (distinct di)) -- 70001
+(distinct (concat [0Ng] dh)) -- (concat [0Ng] big)
+
 ;; ─────────────────────────── a query filter keeps the scan's answer ────────
 (set T (table ['k 'v] (list gi [1 2 3 4 5 6])))
 (at (select {from: T where: (in k (at g [2 5]))}) 'v) -- [4]
