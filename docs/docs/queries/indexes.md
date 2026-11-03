@@ -23,7 +23,7 @@ The executor consults indexes at five sites.  Each site has a specific consumpti
 | `.idx.hash` / `part` backing | `where key IN …` + `group by key` | Resolve only the requested key slices and aggregate them directly, skipping filter scan and group discovery. Part slices stream as contiguous ranges. |
 | `.idx.sort` | ORDER BY — single ascending key | The pre-built permutation is reused directly rather than re-sorting.  Descending ORDER BY falls back to recompute (reversing the perm would swap tie-group positions relative to stable DESC sort). |
 | `.idx.sort` | `distinct` | Walk the sort permutation once to collect first-occurrence row ids per distinct value — O(n) with no hash table.  SYM/GUID/STR columns fall back. |
-| `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family, `SYM` and `STR` needles against a column of the same family; float and cross-family needles fall through to the scan.  A **vector** of needles probes once per needle — nothing is built per call. |
+| `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family, `SYM`, `STR` and `GUID` needles against a column of the same family; float and cross-family needles fall through to the scan.  A `GUID` index keys every row by its bytes, the null guid included, so a `GUID` column with nulls keeps its index and a null needle finds a null cell, as on the scan.  A **vector** of needles probes once per needle — nothing is built per call. |
 | `.idx.hash` | `in` — `(in needles v)` with `v` indexed, and `(at d keys)` on a dict keyed by an indexed vector | One probe per needle, same type matrix as `find`.  Without an index, `find` / `in` hash whichever side is smaller and scan the other once. |
 
 ### Eligibility conditions (uniform)
@@ -94,7 +94,7 @@ Each kind has a one-arg attach builtin.  Attaching is idempotent — if a differ
 
 `(.idx.zone v)   (.idx.hash v)   (.idx.sort v)   (.idx.bloom v)`
 
-Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` **additionally** accepts `RAY_SYM` (keyed on domain ids) and `RAY_STR` (keyed on a 64-bit hash of the bytes, payload compared on every hit).  `RAY_SYM` / `RAY_STR` on the non-hash kinds is deferred to v2.
+Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` **additionally** accepts `RAY_SYM` (keyed on domain ids), `RAY_STR` and `RAY_GUID` (each keyed on a 64-bit hash of the bytes, payload compared on every hit).  `RAY_SYM` / `RAY_STR` / `RAY_GUID` on the non-hash kinds is deferred to v2.
 
 ### Examples
 
@@ -210,7 +210,7 @@ This design has three useful properties:
 
 ## Caveats and Limits
 
-- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids).  `RAY_STR` — and `RAY_SYM` on the zone/sort/bloom kinds — is not yet supported: the `sym_dict` / `str_pool` pointers in aux bytes 8–15 collide with the index layout and the displacement sweep is pending.
+- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids), `RAY_STR` and `RAY_GUID` (indexing a hash of each row's bytes).  `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the zone/sort/bloom kinds are not yet supported.
 - **One slot per column.**  A column carries at most one index kind at a time.  Calling a different kind's attach replaces the existing one.  Multiple indexes per column are deferred — the slot can point to a list-of-indexes in v2 if real workloads want both eq and range fast paths.
 - **In-memory only.**  Indexes do not persist across `ray_col_save` / `ray_col_load`; users rebuild explicitly after a load.  Unlike the HNSW handle (see [Vector Search](../graph/vector-search.md)), which has dedicated `hnsw-save` / `hnsw-load` builtins for explicit persistence, `.idx.*` has no on-disk format at all — rebuild is the only option.
 - **Float equality not indexed.**  Hash-EQ and hash-IN routes are integer-family only — float equality has NaN / -0 semantics that the unfused compare kernel handles; the index paths intentionally don't replicate that.

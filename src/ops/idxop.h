@@ -761,17 +761,19 @@ int64_t ray_index_find_row(ray_t* col, int64_t key);
 /* ===== Hash-index find: one atom / a vector of needles =====
  *
  * ray_index_find_atom: like ray_index_find_row but keyed by an ATOM, so it
- * also serves SYM columns (the symbol re-expressed in the column's domain)
- * and STR columns (the bytes).  Same contract: >= 0 first row, -1 provably
- * absent, -2 not eligible (no fresh null-free hash index, null / float /
- * cross-family needle) — caller falls back to the scan.
+ * also serves SYM columns (the symbol re-expressed in the column's domain),
+ * STR and GUID columns (the bytes).  Same contract: >= 0 first row, -1
+ * provably absent, -2 not eligible (no fresh null-free hash index, null /
+ * float / cross-family needle) — caller falls back to the scan.
  *
  * ray_index_find_vec: one probe per needle of the typed vector `needles`
  * into `out[needles->len]` (first matching row, NULL_I64 on a miss; a null
- * needle misses — the index is only consulted on null-free columns).
+ * needle misses — the index is only consulted on null-free columns — but a
+ * GUID index holds every row and a null guid needle probes its bytes).
  * Returns 1 when handled, 0 when not eligible (out is then unspecified and
  * the caller builds its own hash).  Integer-family needles for an
- * integer-family column, SYM for SYM (any domain), STR for STR. */
+ * integer-family column, SYM for SYM (any domain), STR for STR, GUID for
+ * GUID. */
 int64_t ray_index_find_atom(ray_t* col, ray_t* atom);
 int ray_index_find_vec(ray_t* col, ray_t* needles, int64_t* out, bool* any_miss);
 
