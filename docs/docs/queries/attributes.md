@@ -3,7 +3,7 @@
 Semantic properties stamped onto columns — `sorted`, `unique`, `grouped`, `parted`.  Where an [accelerator index](indexes.md) is a *physical* structure (a hash table, a permutation), a column attribute is an *assertion about meaning*: this column is non-descending, these values are distinct.  The `.attr.*` family layers over the same storage as `.idx.*`, but its contract is semantic, not structural.
 
 !!! note "v1 status"
-    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `parted` are numeric (`parted` also takes symbols); `unique` and `grouped` take numeric, symbol and string columns.
+    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `parted` are numeric (`parted` also takes symbols); `unique` and `grouped` take numeric, symbol and string columns, and `grouped` also takes guid columns.
 
 ## Why Attributes Are Separate from Indexes
 

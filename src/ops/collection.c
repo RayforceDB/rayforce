@@ -3677,13 +3677,14 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
 
-        /* Hash-index fast path: an integer-family, symbol or string needle
-         * against an indexed column of the same family (ray_index_find_atom
-         * owns the type matrix).  Float and cross-family needles fall
-         * through to the scan (the scan owns promotion semantics; we do
-         * not replicate them here). */
+        /* Hash-index fast path: an integer-family, symbol, string or guid
+         * needle against an indexed column of the same family
+         * (ray_index_find_atom owns the type matrix).  Float and cross-family
+         * needles fall through to the scan (the scan owns promotion
+         * semantics; we do not replicate them here).  A guid index keys
+         * every row by its bytes, so the column's nulls do not matter. */
         if (!val_null && ray_is_atom(val) && ray_index_has(vec) &&
-            (!has_nulls || vec->type == RAY_SYM)) {
+            (!has_nulls || vec->type == RAY_SYM || vec->type == RAY_GUID)) {
             ray_idx_consults[IDX_SITE_FIND]++;
             int64_t row = ray_index_find_atom(vec, val);
             if (row >= -1) {   /* -2 means not eligible — fall through */
