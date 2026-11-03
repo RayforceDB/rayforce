@@ -56,6 +56,19 @@
 (repr (list (fn [x] x))) !- format
 (repr (dict [f] (list (fn [x] x)))) !- format
 
+;; Symbol atoms must not become environment lookups.  The explicit constructor
+;; also preserves symbol names that cannot be written as bare identifiers.
+(set a 5)
+(set symA990 (as 'SYM "a"))
+(type (eval (parse (repr symA990)))) -- 'sym
+(all (== (ser symA990) (ser (eval (parse (repr symA990)))))) -- true
+(set symSpace990 (as 'SYM "a b"))
+(all (== (ser symSpace990) (ser (eval (parse (repr symSpace990)))))) -- true
+(set symList990 (list symA990 symSpace990))
+(all (== (ser symList990) (ser (eval (parse (repr symList990)))))) -- true
+(set symDict990 (dict [v] (list symList990)))
+(all (== (ser symDict990) (ser (eval (parse (repr symDict990)))))) -- true
+
 ;; Ordinary format remains display-oriented and consistent in every template.
 (format "%" 5i) -- "5"
 (format "n=%" 5i) -- "n=5"

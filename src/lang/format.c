@@ -406,6 +406,23 @@ static void fmt_sym(fmt_buf_t* b, int64_t sym_id) {
     fmt_sym_atom(b, ray_sym_str(sym_id));
 }
 
+static void fmt_str_quoted(fmt_buf_t* b, const char* s, size_t len, bool escape);
+
+/* A bare symbol name is an environment lookup when evaluated.  Round-trip
+ * output therefore uses the explicit string-to-SYM constructor, which also
+ * admits names that are not valid identifiers.  The empty symbol keeps its
+ * canonical quote literal. */
+static void fmt_sym_roundtrip(fmt_buf_t* b, int64_t sym_id) {
+    ray_t* s = ray_sym_str(sym_id);
+    if (!s || RAY_IS_ERR(s) || ray_str_len(s) == 0) {
+        fmt_putc(b, '\'');
+        return;
+    }
+    fmt_puts(b, "(as 'SYM ");
+    fmt_str_quoted(b, ray_str_ptr(s), ray_str_len(s), true);
+    fmt_putc(b, ')');
+}
+
 /* ===== Date/time/timestamp helpers ===== */
 
 #include "lang/cal.h"
@@ -1727,7 +1744,10 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         case RAY_TIME:      fmt_time(b, obj->i32); break;
         case RAY_TIMESPAN: fmt_timespan(b, obj->i64); break;
         case RAY_TIMESTAMP: fmt_timestamp(b, obj->i64); break;
-        case RAY_SYM:  fmt_sym(b, obj->i64); break;
+        case RAY_SYM:
+            if (mode == RAY_FMT_ROUNDTRIP) fmt_sym_roundtrip(b, obj->i64);
+            else fmt_sym(b, obj->i64);
+            break;
         case RAY_STR:  fmt_str_atom(b, obj, mode); break;
         case RAY_GUID:
             if (mode == RAY_FMT_ROUNDTRIP) fmt_puts(b, "(as 'GUID \"");
