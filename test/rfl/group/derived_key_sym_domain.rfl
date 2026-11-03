@@ -178,7 +178,7 @@
 (set R4 (select {from: FT by: (if (!= (str-find ref "?") (str-find ref "#")) (substr ref (* 2 (str-find ref "o")) 3) "none") c: (count ref)}))
 (set O4 (refg (rowk (fn [x] (if (!= (str-find x "?") (str-find x "#")) (substr x (* 2 (str-find x "o")) 3) "none")))))
 (all (== (fpk R4) (fpk O4))) -- true
-;; a search pattern with a wildcard
+;; a needle holding `?` (a literal byte, not a wildcard)
 (set R5 (select {from: FT by: (substr ref (+ 1 (str-find ref "s?te")) 6) c: (count ref)}))
 (set O5 (refg (rowk (fn [x] (substr x (+ 1 (str-find x "s?te")) 6)))))
 (all (== (fpk R5) (fpk O5))) -- true

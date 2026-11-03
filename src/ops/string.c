@@ -849,7 +849,8 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
 typedef struct {
     const ray_str_t* elems;
     const char* pool_data;
-    const ray_strpat_t* pattern;
+    const char* needle;
+    size_t needle_len;
     int64_t* dst;
     ray_pool_t* pool;
     _Atomic(int) any_null;
@@ -867,7 +868,7 @@ static void str_find_parts_task(void* vctx, uint32_t worker_id,
         const char* sp = ray_str_t_ptr(&c->elems[i], c->pool_data);
         size_t sl = c->elems[i].len;
         size_t pos = 0;
-        bool found = ray_strpat_find(c->pattern, sp, sl, &pos);
+        bool found = ray_str_find_literal(sp, sl, c->needle, c->needle_len, &pos);
         c->dst[i] = found ? (int64_t)pos : NULL_I64;
         if (!found) any_null = true;
     }
@@ -934,7 +935,8 @@ static void sym_reader_at(const sym_reader_t* r, int64_t pos,
 
 typedef struct {
     sym_reader_t         rd;
-    const ray_strpat_t*  pattern;
+    const char*          needle;
+    size_t               needle_len;
     int64_t*             dst;
     ray_pool_t*          pool;
     _Atomic(int)         any_null;
@@ -954,7 +956,7 @@ static void str_find_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_
             const char* sp; size_t sl;
             sym_reader_at(&c->rd, ray_read_sym(base, i, RAY_SYM, attrs), &sp, &sl);
             size_t pos = 0;
-            bool found = ray_strpat_find(c->pattern, sp, sl, &pos);
+            bool found = ray_str_find_literal(sp, sl, c->needle, c->needle_len, &pos);
             c->dst[i] = found ? (int64_t)pos : NULL_I64;
             if (!found) any_null = true;
         }
@@ -971,7 +973,7 @@ static void str_find_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_
         sym_reader_block(&c->rd, ids, n, sp, sl);
         for (int j = 0; j < n; j++) {
             size_t pos = 0;
-            bool found = ray_strpat_find(c->pattern, sp[j], sl[j], &pos);
+            bool found = ray_str_find_literal(sp[j], sl[j], c->needle, c->needle_len, &pos);
             c->dst[b + j] = found ? (int64_t)pos : NULL_I64;
             if (!found) any_null = true;
         }
@@ -1008,12 +1010,6 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         ray_release(pat_v);
         return ray_error("type", "str-find: pattern must be string or symbol atom");
     }
-    ray_strpat_t search;
-    if (!ray_strpat_compile(pattern, pattern_len, &search)) {
-        ray_release(input);
-        ray_release(pat_v);
-        return ray_error("domain", "str-find: '*' is not supported in search patterns");
-    }
 
     if (input->type != RAY_STR && input->type != RAY_SYM) {
         ray_release(input);
@@ -1039,7 +1035,8 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         str_find_parts_ctx_t ctx = {
             .elems = elems,
             .pool_data = pool_data,
-            .pattern = &search,
+            .needle = pattern,
+            .needle_len = pattern_len,
             .dst = dst,
             .pool = pool
         };
@@ -1066,7 +1063,8 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
     /* SYM: the rows in parallel, each string read from its domain. */
     {
         ray_pool_t* pool = nrows >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
-        str_find_sym_ctx_t ctx = { .pattern = &search, .dst = dst, .pool = pool };
+        str_find_sym_ctx_t ctx = { .needle = pattern, .needle_len = pattern_len,
+                                   .dst = dst, .pool = pool };
         sym_reader_init(&ctx.rd, input);
         atomic_init(&ctx.any_null, 0);
         if (pool && ray_pool_total_workers(pool) >= 2)

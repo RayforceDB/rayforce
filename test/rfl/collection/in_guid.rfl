@@ -1,0 +1,65 @@
+;; `in` over GUID vectors and atoms.  The 16-byte cells are hashed on the
+;; smaller side, whichever operand that is, and compared as bytes: a null
+;; guid (all-zero bytes) is a member of a set that holds a null and of no
+;; other.  Inside a query a null row is neither in nor not-in.
+
+(set H (guid 1000))
+(set P (concat (at H [5 10 15]) (guid 2)))
+
+;; ─── a vector against a smaller set, and a few needles against a vector ─
+(where (in H P)) -- [5 10 15]
+(in P H) -- [true true true false false]
+(type (in H P)) -- 'B8
+(count (in H P)) -- 1000
+
+;; duplicates on either side
+(set D (at H [7 5 7 5]))
+(in D H) -- [true true true true]
+(where (in H D)) -- [5 7]
+(where (in (concat D D) (concat H H))) -- (til 8)
+
+;; ─── one guid against a vector, a vector against one guid ──────────
+(in (at H 9) H) -- true
+(in (first (guid 1)) H) -- false
+(where (in H (at H 9))) -- [9]
+(any (in H (first (guid 1)))) -- false
+
+;; ─── nulls ─────────────────────────────────────────────────────────
+(set HN (concat H 0Ng))
+(set PN (concat P 0Ng))
+(in 0Ng HN) -- true
+(in 0Ng H) -- false
+(where (in HN 0Ng)) -- [1000]
+(any (in H 0Ng)) -- false
+(where (in HN PN)) -- [5 10 15 1000]
+(where (in HN P)) -- [5 10 15]
+(where (in H PN)) -- [5 10 15]
+(in PN H) -- [true true true false false false]
+(in PN HN) -- [true true true false false true]
+
+;; ─── empty operands ────────────────────────────────────────────────
+(type (in (take H 0) H)) -- 'B8
+(count (in (take H 0) H)) -- 0
+(count (in H (take H 0))) -- 1000
+(any (in H (take H 0))) -- false
+(in (at H 3) (take H 0)) -- false
+
+;; ─── past the parallel threshold, both orientations ────────────────
+(set HB (guid 100000))
+(set pos (* (til 150) 600))
+(set PB (concat (at HB pos) (guid 150)))
+(where (in HB PB)) -- pos
+(where (in PB HB)) -- (til 150)
+(all (in HB HB)) -- true
+(all (in (reverse HB) HB)) -- true
+(where (in HB (at HB 99999))) -- [99999]
+
+;; ─── a slice of a vector, on either side ───────────────────────────
+(where (in (drop HB 1) PB)) -- (- (drop pos 1) 1)
+(where (in PB (drop HB 1))) -- (drop (til 150) 1)
+
+;; ─── inside a query ────────────────────────────────────────────────
+(set T (table [k] (list HN)))
+(count (select {from: T where: (in k PN)})) -- 3
+(count (select {from: T where: (not-in k PN)})) -- 997
+(count (select {from: T where: (in k P)})) -- 3

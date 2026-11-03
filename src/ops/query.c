@@ -33,7 +33,6 @@
 #include "ops/internal.h"
 #include "ops/colbind.h"      /* ray_col_bind_declines — the count fast path binds */
 #include "ops/hash.h"
-#include "ops/glob.h"         /* ray_strpat — str-find in the derived-key program */
 #include "ops/idxop.h"        /* ray_index_kind / RAY_IDX_DICT — dict-code row_gid */
 #include "ops/agg_engine.h"   /* agg_select_distinct — dict-linked pure-distinct path */
 #include "core/runtime.h"     /* __VM — per-thread query/eval context */
@@ -6731,8 +6730,8 @@ static inline int64_t dk_sel_it_next(dk_sel_it_t* it) {
  * result is a view of the value or a literal, hashed where it is computed.
  * Each operator keeps the chunk DAG's semantics over STR:
  *   - the empty string is the null string: nil? is true, strlen is null;
- *   - str-find: the 0-based offset of the first match of the compiled
- *     search pattern (ray_strpat_find, as exec_str_find), else null;
+ *   - str-find: the 0-based byte offset of the first occurrence of the
+ *     literal needle (as exec_str_find), else null;
  *   - substr: 1-based; a start below 1 counts from 1, a negative or overlong
  *     length runs to the end, a start past the end gives "", a null start
  *     or length gives "" (substr_view_fn);
@@ -6764,7 +6763,7 @@ typedef struct {
     int          n, col, npat, res, nex;
     uint8_t      ex[DKP_MAX_INS];     /* the non-literal instructions, in order */
     dkp_ins_t    ins[DKP_MAX_INS];
-    ray_strpat_t pat[DKP_MAX_PATS];
+    struct { const char* p; size_t n; } pat[DKP_MAX_PATS];
 } dkp_prog_t;
 typedef struct { const char* p; int64_t v; } dkp_reg_t;   /* STR: bytes, length */
 
@@ -6906,7 +6905,8 @@ static int dkp_compile(dkp_prog_t* P, ray_t* e, int64_t col, int64_t* bsym, int*
         if (n != 3 || !el[2] || el[2]->type != -RAY_STR || P->npat >= DKP_MAX_PATS) return -1;
         int a = DKP_ARG(1);
         if (a < 0 || DKP_K(a) != DKP_STR) return -1;
-        if (!ray_strpat_compile(ray_str_ptr(el[2]), ray_str_len(el[2]), &P->pat[P->npat])) return -1;
+        P->pat[P->npat].p = ray_str_ptr(el[2]);
+        P->pat[P->npat].n = ray_str_len(el[2]);
         int r = dkp_emit(P, DKO_FIND, DKP_I64, a, 0, 0);
         if (r >= 0) P->ins[r].imm = P->npat++;
         return r;
@@ -6965,8 +6965,7 @@ static bool dkp_build(dkp_prog_t* P, ray_t* by_expr, int64_t col_sym) {
     return r >= 0 && P->ins[r].kind == DKP_STR;
 }
 
-/* The first occurrence of a literal search pattern — what ray_strpat_find
- * returns for a pattern without `?` or classes (memmem there) — found by
+/* The first occurrence of a literal needle (str-find), found by
  * memchr on its first byte: the values are short, and memmem's setup
  * outweighs the scan over a URL-sized haystack. */
 static inline int64_t dkp_find_literal(const char* s, size_t sn, const char* nd, size_t nl) {
@@ -7040,16 +7039,8 @@ static void dkp_run_batch(const dkp_prog_t* P, dkp_reg_t* R, const char* const* 
         case DKO_NILI: for (int t = 0; t < m; t++) o[t].v = a[t].v == NULL_I64; break;
         case DKO_IF:   for (int t = 0; t < m; t++) o[t] = a[t].v ? b[t] : c[t]; break;
         case DKO_FIND: {
-            const ray_strpat_t* pt = &P->pat[x->imm];
-            if (pt->literal) {
-                for (int t = 0; t < m; t++)
-                    o[t].v = dkp_find_literal(a[t].p, (size_t)a[t].v, pt->pat, pt->pat_len);
-            } else {
-                for (int t = 0; t < m; t++) {
-                    size_t pos = 0;
-                    o[t].v = ray_strpat_find(pt, a[t].p, (size_t)a[t].v, &pos) ? (int64_t)pos : NULL_I64;
-                }
-            }
+            for (int t = 0; t < m; t++)
+                o[t].v = dkp_find_literal(a[t].p, (size_t)a[t].v, P->pat[x->imm].p, P->pat[x->imm].n);
             break;
         }
         case DKO_SUBSTR:
@@ -27614,14 +27605,16 @@ ray_t* ray_insert_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_insert(ray_t** args, int64_t n) {
+    bool via_callee = ray_env_mutator_callee_take();   /* before anything else runs */
     if (n < 2) return ray_error("arity", "insert: expects a target and a value, got %lld args", (long long)n);
 
     /* In-place vs functional is decided by the EVALUATED first argument:
-     * a symbol value names a global to amend in place (returning that
+     * a symbol value names a binding to amend in place (returning that
      * symbol); a table/vec value is amended functionally (returning the
      * new value).  Evaluating first means it works however the symbol
      * arrives — literal 'sym, (quote sym), a variable, or a lambda param. */
     int64_t inplace_sym = -1;
+    ray_env_target_t target = {0};
     ray_t* tbl_raw = args[0];
     ray_t* tbl;
 
@@ -27635,11 +27628,13 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         tbl = ray_eval(tbl_raw);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("type", "insert: target evaluation failed");
         if (tbl->type == -RAY_SYM) {
-            /* Symbol value → resolve the named global for in-place insert */
+            /* Resolve once: a local target must never publish into a global. */
             inplace_sym = tbl->i64;
             ray_release(tbl);
-            tbl = ray_env_get(inplace_sym);
-            if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "insert: target symbol is unbound");
+            ray_err_t err = ray_env_target_resolve_via(inplace_sym, via_callee, &target, &tbl);
+            if (err != RAY_OK)
+                return ray_error(err == RAY_ERR_NAME ? "domain" : ray_err_code_str(err),
+                                 "insert: cannot resolve target binding");
             ray_retain(tbl);
         }
     }
@@ -27815,9 +27810,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
             /* In-place amend stores the new value and returns the symbol. */
-            ray_env_set(inplace_sym, result);
+            ray_err_t err = ray_env_target_set(&target, result);
             ray_release(result);
-            return ray_sym(inplace_sym);
+            return err == RAY_OK ? ray_sym(inplace_sym)
+                : ray_error(ray_err_code_str(err), "insert: cannot publish target");
         }
         return result;
     }
@@ -27869,7 +27865,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
              * and surface dotted-path OOM/type failures instead of
              * falsely returning the target symbol as success. */
             ray_err_t bind_err = result == tbl ? RAY_OK
-                               : ray_env_set(inplace_sym, result);
+                               : ray_env_target_set(&target, result);
             ray_release(result);
             ray_release(tbl);
             if (bind_err != RAY_OK) {
@@ -28019,8 +28015,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
      * On a mid-batch failure the appended lengths are rolled back, so the
      * table keeps its pre-insert value; unlike the rebuild, already-grown
      * capacity and dropped accelerator indexes are not restored. */
-    bool inplace_ok = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
-                      !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    bool inplace_ok = inplace_sym >= 0 && ray_env_target_sole(&target, tbl, 1);
     ray_t* live_cols = NULL;
     if (inplace_ok) {
         live_cols = ray_table_cols_inplace(tbl);         /* NULL: an encoded slot */
@@ -28338,9 +28333,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
     /* In-place: store the new table in the env and return the symbol. */
     if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
-        ray_env_set(inplace_sym, result);
+        ray_err_t err = ray_env_target_set(&target, result);
         ray_release(result);
-        return ray_sym(inplace_sym);
+        return err == RAY_OK ? ray_sym(inplace_sym)
+            : ray_error(ray_err_code_str(err), "insert: cannot publish target");
     }
     return result;
 }

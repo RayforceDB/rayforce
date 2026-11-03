@@ -172,15 +172,12 @@ lz_let -- 60
 (lazy_fold_fn [1 2 3]) -- 12
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 13. atomic_map_unary boxed-list fallback (lines 1001-1021 in eval.c)
-;;     fn must produce a non-numeric atom for each element so the
-;;     typed-vector fast path is bypassed and a RAY_LIST is built.
-;;     map(sym-name, sym_vec): sym-name returns -RAY_STR per element.
+;; 13. Map a named unary function over symbols. Its same-type atom
+;;     results now form a SYM vector, rather than a boxed list.
 ;; ═══════════════════════════════════════════════════════════════════
-;; sym-name on a SYM vec → each result is -RAY_STR → boxed list output
 (set sv_names (as 'SYM ['hello 'world 'foo]))
 (set names_out (map sym-name sv_names))
-(type names_out) -- 'LIST
+(type names_out) -- 'SYM
 (count names_out) -- 3
 ;; Verify elements are syms (sym-name returns sym atoms)
 (type (at names_out 0)) -- 'sym

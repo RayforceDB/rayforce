@@ -1,0 +1,16 @@
+;; fill and dyadic min/max keep homogeneous wide vector types.
+(type (fill 'z (enlist 'a '))) -- 'SYM
+(fill 'z (enlist 'a ')) -- ['a 'z]
+(type (fill "z" (enlist "a" ""))) -- 'STR
+(fill "z" (enlist "a" "")) -- ["a" "z"]
+
+(type (min (enlist 'b 'a) (enlist 'a 'c))) -- 'SYM
+(min (enlist 'b 'a) (enlist 'a 'c)) -- ['a 'a]
+(type (max (enlist "b" "a") (enlist "a" "c"))) -- 'STR
+(max (enlist "b" "a") (enlist "a" "c")) -- ["b" "c"]
+
+(set g (guid 2))
+(type (fill (first g) g)) -- 'GUID
+(type (min g (reverse g))) -- 'GUID
+(type (max g (reverse g))) -- 'GUID
+(count (max g (reverse g))) -- 2

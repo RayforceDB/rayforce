@@ -1009,12 +1009,12 @@ static test_result_t test_eval_map(void) {
     ray_t* result = ray_eval_str("(map + 1 [1 2 3])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 3);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 2);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 3);
-    TEST_ASSERT_EQ_I(elems[2]->i64, 4);
+    int64_t* elems = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(elems[0], 2);
+    TEST_ASSERT_EQ_I(elems[1], 3);
+    TEST_ASSERT_EQ_I(elems[2], 4);
     ray_release(result);
     PASS();
 }
@@ -1024,13 +1024,65 @@ static test_result_t test_eval_pmap(void) {
     ray_t* result = ray_eval_str("(pmap * 2 [1 2 3])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 3);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 2);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 4);
-    TEST_ASSERT_EQ_I(elems[2]->i64, 6);
+    int64_t* elems = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(elems[0], 2);
+    TEST_ASSERT_EQ_I(elems[1], 4);
+    TEST_ASSERT_EQ_I(elems[2], 6);
     ray_release(result);
+    PASS();
+}
+
+/* Private symbol positions must become runtime ids in map's output, and
+ * a native BOOL/U8 typed-null must stay boxed (their vectors have no null). */
+static test_result_t test_map_typed_domains_and_nulls(void) {
+    ray_sym_domain_t* domain = ray_sym_domain_new();
+    TEST_ASSERT_NOT_NULL(domain);
+    ray_t* source = ray_sym_vec_new(RAY_SYM_W8, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(source));
+    source->sym_domain = domain; /* transfer ownership */
+    int64_t a = ray_sym_domain_intern(domain, "map_alpha", 9);
+    int64_t b = ray_sym_domain_intern(domain, "map_beta", 8);
+    TEST_ASSERT_TRUE(a > 0 && b > 0 && a != b);
+    uint8_t* cells = (uint8_t*)ray_data(source);
+    cells[0] = (uint8_t)a; cells[1] = 0; cells[2] = (uint8_t)b;
+    source->len = 3;
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("map_source", 10), source), RAY_OK);
+    ray_release(source);
+    ray_t* result = ray_eval_str("(map (fn [x] x) map_source)");
+    TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(result), ray_sym_runtime_domain());
+    TEST_ASSERT_EQ_I(result->len, 3);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(result), 0, RAY_SYM, result->attrs),
+                     ray_sym_intern("map_alpha", 9));
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(result), 2, RAY_SYM, result->attrs),
+                     ray_sym_intern("map_beta", 8));
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("map_source", 10), NULL), RAY_OK);
+    ray_release(result);
+
+    for (int t = RAY_BOOL; t <= RAY_U8; t++) {
+        ray_t* null = ray_typed_null(-t);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(null));
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("map_null", 8), null), RAY_OK);
+        ray_release(null);
+        result = ray_eval_str("(map (fn [x] map_null) [0 1])");
+        TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(((ray_t**)ray_data(result))[0]));
+        ray_release(result);
+        /* The null arrives after one representable atom: exercise fallback. */
+        result = ray_eval_str(t == RAY_BOOL
+            ? "(map (fn [x] (if (== x 1) map_null true)) [0 1])"
+            : "(map (fn [x] (if (== x 1) map_null (as 'U8 7))) [0 1])");
+        TEST_ASSERT_NOT_NULL(result); TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(((ray_t**)ray_data(result))[1]));
+        TEST_ASSERT_EQ_I(((ray_t**)ray_data(result))[0]->type, -t);
+        ray_release(result);
+    }
     PASS();
 }
 
@@ -1179,6 +1231,143 @@ static test_result_t test_eval_select_where_in_guid_nulls(void) {
     ASSERT_EQ("(count (select {from: t where: (in g (distinct Pg))}))", "1");
     ASSERT_EQ("(count (select {from: t where: (not-in g (distinct (list probe)))}))", "1");
     ray_release(table);
+    PASS();
+}
+
+/* ---- Test: guid compare and `in` read a zero cell's bytes, not the hint --
+ * ray_vec_from_raw flags a zero guid with HAS_NULLS; ray_vec_append of the
+ * same bytes does not.  Either way the cell is null: `in` must answer as
+ * `==` does whichever vector carries the flag, with the key table built on
+ * either side, for a vector against one guid and for one guid in a vector. */
+static test_result_t test_eval_in_guid_unflagged_nulls(void) {
+    static const uint8_t g1[16] = {1}, g2[16] = {2}, g3[16] = {3}, z[16] = {0};
+    uint8_t raw[32];
+    memcpy(raw, g1, 16);
+    memcpy(raw + 16, z, 16);
+    ray_t* f = ray_vec_from_raw(RAY_GUID, raw, 2);
+    TEST_ASSERT_TRUE(f && !RAY_IS_ERR(f));
+    TEST_ASSERT_TRUE((f->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    ray_t* u = ray_vec_new(RAY_GUID, 3);
+    u = ray_vec_append(u, g2);
+    u = ray_vec_append(u, g3);
+    u = ray_vec_append(u, z);
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u));
+    TEST_ASSERT_TRUE((u->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    ray_env_set(ray_sym_intern("_gf", 3), f);
+    ray_env_set(ray_sym_intern("_gu", 3), u);
+
+    ASSERT_EQ("(== (at _gf [1 1 1]) _gu)", "[false false true]");
+    ASSERT_EQ("(== _gu (at _gf 1))", "[false false true]");
+    ASSERT_EQ("(in _gf _gu)", "[false true]");           /* table over the needles */
+    ASSERT_EQ("(in _gu _gf)", "[false false true]");     /* table over the set */
+    ASSERT_EQ("(in _gu 0Ng)", "[false false true]");
+    ASSERT_EQ("(in _gf (at _gu 2))", "[false true]");
+    ASSERT_EQ("(in 0Ng _gu)", "true");
+    ASSERT_EQ("(in (at _gu 2) _gf)", "true");
+
+    ray_release(f);
+    ray_release(u);
+    PASS();
+}
+
+/* ---- Test: a failed guid `in` scratch allocation answers "oom" ----
+ * in_guid does not fall back to the hashset, which reads the null hint
+ * (test_eval_in_guid_unflagged_nulls).  Fail the key table on either side,
+ * then the scan's seen marks: each attempt returns "oom" and frees what it
+ * took, and the next call answers. */
+static test_result_t test_eval_in_guid_oom(void) {
+    ray_t* h = ray_eval_str("(set _gh (guid 64))");
+    ray_t* p = ray_eval_str("(set _gp (concat (at _gh [3 5]) (guid 1)))");
+    ray_t* g = ray_eval_str("(set _gg (at _gh 7))");
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && p && !RAY_IS_ERR(p) && g && !RAY_IS_ERR(g));
+    struct { ray_t* val; ray_t* set; int64_t nth; int64_t hits; } cases[] = {
+        { h, p, 1, 2 },   /* the key table, over the set */
+        { p, h, 1, 2 },   /* the key table, over the needles */
+        { p, h, 2, 2 },   /* the seen marks of the scan */
+        { h, g, 1, 1 },   /* one guid: a table of one key */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* r = ray_in_fn(cases[c].val, cases[c].set);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_error_clear();
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_in_guid_test_fail_alloc(cases[c].nth);
+        r = ray_in_fn(cases[c].val, cases[c].set);
+        ray_in_guid_test_fail_alloc(0);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %zu: no error", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %zu: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = ray_in_fn(cases[c].val, cases[c].set);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_BOOL);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++) hits += ((bool*)ray_data(r))[i];
+        TEST_ASSERT_EQ_I(hits, cases[c].hits);
+        ray_release(r);
+    }
+    ray_release(h);
+    ray_release(p);
+    ray_release(g);
+    PASS();
+}
+
+/* ---- Test: a cancelled guid compare or `in` dispatch answers "cancel" ----
+ * A cancel makes ray_pool_dispatch skip every task not yet started, so the
+ * bool vector it was filling is incomplete.  The compare, and `in` with the
+ * table over the set (one probe a row) and over the needles (one scan of
+ * the set), each dispatch over 131073 rows: under a cancel each must return
+ * "cancel", free what it took and leave the interrupt set; once cleared,
+ * each answers.  Called below the evaluator, whose own checks would
+ * otherwise answer first. */
+static test_result_t test_eval_guid_cancel(void) {
+    if (!ray_pool_get()) SKIP("no pool to dispatch to");
+    ray_t* g = ray_eval_str("(set _gc (guid 131073))");
+    ray_t* h = ray_eval_str("(set _gd (at _gc (til 131073)))");
+    ray_t* s = ray_eval_str("(set _gs (take _gc 17))");
+    TEST_ASSERT_TRUE(g && !RAY_IS_ERR(g) && h && !RAY_IS_ERR(h) && s && !RAY_IS_ERR(s));
+    TEST_ASSERT_TRUE(g->len >= RAY_PARALLEL_THRESHOLD);
+    for (int c = 0; c < 3; c++) {
+        int64_t want = c == 0 ? 131073 : 17;
+        ray_t* r = c == 0 ? atomic_map_binary_op(ray_eq_fn, OP_EQ, g, h)   /* compare */
+                 : c == 1 ? ray_in_fn(g, s)        /* the table over the set */
+                 :          ray_in_fn(s, g);       /* the table over the needles */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));   /* warm up */
+        ray_release(r);
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_request_interrupt();
+        r = c == 0 ? atomic_map_binary_op(ray_eq_fn, OP_EQ, g, h)
+          : c == 1 ? ray_in_fn(g, s)
+          :          ray_in_fn(s, g);
+        bool still = ray_interrupted();
+        ray_clear_interrupt();
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %d: answered under a cancel", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+        TEST_ASSERT_FMT(still, "case %d: the interrupt was cleared", c);
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %d: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = c == 0 ? atomic_map_binary_op(ray_eq_fn, OP_EQ, g, h)
+          : c == 1 ? ray_in_fn(g, s)
+          :          ray_in_fn(s, g);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_BOOL);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++) hits += ((bool*)ray_data(r))[i];
+        TEST_ASSERT_EQ_I(hits, want);
+        ray_release(r);
+    }
+    ray_release(g);
+    ray_release(h);
+    ray_release(s);
     PASS();
 }
 
@@ -6917,6 +7106,173 @@ static test_result_t test_eval_try_raise_value(void) {
     PASS();
 }
 
+/* --- try: the {code msg} dict when its allocations fail --- */
+static size_t lang_heap_bytes(void) {
+    ray_mem_stats_t s;
+    ray_mem_stats(&s);
+    return s.bytes_allocated;
+}
+
+/* What a handler gets for an engine error, built with each of its
+ * allocations failed in turn: the message (one block, or two from 7 bytes
+ * on), the code symbol, the keys, the values and the dict.  Failed alone,
+ * the constructor's oom error is a block of its own; failed with the
+ * error's allocation too, it is the static RAY_OOM_OBJ.  Either way the
+ * handler gets null and nothing is left allocated. */
+static test_result_t test_eval_try_error_value_oom(void) {
+    static const char* msgs[] = { "", "abc", "1234567", "cannot add i64 and sym" };
+    for (size_t i = 0; i < sizeof(msgs) / sizeof(msgs[0]); i++) {
+        ray_t* d = ray_try_error_value_for_test("type", msgs[i]);   /* interns */
+        ray_release(d);
+        ray_mem_stats_t s0, s1;
+        ray_mem_stats(&s0);
+        d = ray_try_error_value_for_test("type", msgs[i]);
+        ray_mem_stats(&s1);
+        int64_t allocs = (int64_t)(s1.alloc_count - s0.alloc_count);
+        TEST_ASSERT_EQ_I(allocs, strlen(msgs[i]) < 7 ? 5 : 6);
+        TEST_ASSERT_EQ_I(d->type, RAY_DICT);
+        ray_t** vals = (ray_t**)ray_data(ray_dict_vals(d));
+        TEST_ASSERT_EQ_I(vals[0]->type, -RAY_SYM);
+        TEST_ASSERT_EQ_I(vals[0]->i64, ray_sym_intern("type", 4));
+        TEST_ASSERT_EQ_I(vals[1]->type, -RAY_STR);
+        TEST_ASSERT_EQ_U(ray_str_len(vals[1]), strlen(msgs[i]));
+        TEST_ASSERT_MEM_EQ(strlen(msgs[i]), ray_str_ptr(vals[1]), msgs[i]);
+        ray_release(d);
+        for (int64_t nth = 1; nth <= allocs; nth++) {
+            for (int64_t count = 1; count <= 2; count++) {
+                size_t before = lang_heap_bytes();
+                ray_alloc_fail_set_for_test(nth, count);
+                ray_t* v = ray_try_error_value_for_test("type", msgs[i]);
+                ray_alloc_fail_set_for_test(0, 0);
+                TEST_ASSERT_EQ_PTR(v, RAY_NULL_OBJ);
+                TEST_ASSERT_EQ_U(lang_heap_bytes(), before);
+            }
+        }
+    }
+    PASS();
+}
+
+/* Blocks allocated evaluating `ast` once more (the first run compiles a
+ * lambda it calls and interns its names). */
+static int64_t lang_eval_allocs(ray_t* ast) {
+    ray_t* r = ray_eval(ast);
+    if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+    ray_mem_stats_t s0, s1;
+    ray_mem_stats(&s0);
+    r = ray_eval(ast);
+    ray_mem_stats(&s1);
+    if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+    return (int64_t)(s1.alloc_count - s0.alloc_count);
+}
+
+/* A handler that is a plain value never reads the error value, so a try
+ * with one builds none: an engine error caught by it costs what a raise
+ * caught by it does, at the top level and compiled.  A name holding the
+ * same value is no plain value, and its try builds the dict. */
+static test_result_t test_eval_try_value_handler_builds_nothing(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set hzero 0)"
+        "    (set fv (fn [] (try (+ 1 'a) 0)))"
+        "    (set fr (fn [] (try (raise 1) 0)))"
+        "    (set fh (fn [] (try (+ 1 'a) hzero))))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* src[] = {
+        "(try (+ 1 'a) 0)", "(try (raise 1) 0)", "(try (+ 1 'a) hzero)",
+        "(fv)", "(fr)", "(fh)",
+    };
+    int64_t n[6];
+    for (int i = 0; i < 6; i++) {
+        ray_t* r = ray_eval_str(src[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, 0);
+        ray_release(r);
+        ray_t* ast = ray_parse(src[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        n[i] = lang_eval_allocs(ast);
+        ray_release(ast);
+    }
+    TEST_ASSERT_FMT(n[0] == n[1], "top level: engine error %lld blocks, raise %lld",
+                    (long long)n[0], (long long)n[1]);
+    TEST_ASSERT_FMT(n[3] == n[4], "compiled: engine error %lld blocks, raise %lld",
+                    (long long)n[3], (long long)n[4]);
+    TEST_ASSERT_FMT(n[2] >= n[0] + 5, "top level: a name handler %lld blocks, a value %lld",
+                    (long long)n[2], (long long)n[0]);
+    TEST_ASSERT_FMT(n[5] >= n[3] + 5, "compiled: a name handler %lld blocks, a value %lld",
+                    (long long)n[5], (long long)n[3]);
+    PASS();
+}
+
+/* A catch leaves nothing allocated, whatever the handler and whichever
+ * engine runs it: the raised value is released, or the dict, or the error.
+ * The raised list holds a string too long for its header, so a leak of it
+ * shows as several blocks.  Counts net bytes, which an allocation count
+ * can't see. */
+static test_result_t test_eval_try_catch_releases(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set hlam (fn [e] 0))"
+        "    (set rv (fn [] (try (raise (list 1 \"abcdefghijk\")) 0)))"
+        "    (set rl (fn [] (try (raise (list 1 \"abcdefghijk\")) (fn [e] 0))))"
+        "    (set rn (fn [] (try (raise (list 1 \"abcdefghijk\")) hlam)))"
+        "    (set ev (fn [] (try (+ 1 'a) 0)))"
+        "    (set el (fn [] (try (+ 1 'a) (fn [e] e))))"
+        "    (set en (fn [] (try try_catch_no_such_name (fn [e] e)))))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* src[] = {
+        "(try (raise (list 1 \"abcdefghijk\")) 0)",
+        "(try (raise (list 1 \"abcdefghijk\")) (fn [e] 0))",
+        "(try (raise (list 1 \"abcdefghijk\")) hlam)",
+        "(try (+ 1 'a) 0)",
+        "(try (+ 1 'a) (fn [e] e))",
+        "(try try_catch_no_such_name (fn [e] e))",
+        "(rv)", "(rl)", "(rn)", "(ev)", "(el)", "(en)",
+    };
+    for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++) {
+        ray_t* ast = ray_parse(src[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ast));
+        /* The first runs compile the lambda and intern the names. */
+        for (int run = 0; run < 2; run++) {
+            size_t before = lang_heap_bytes();
+            for (int k = 0; k < 200; k++) {
+                ray_t* r = ray_eval(ast);
+                TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+                ray_release(r);
+            }
+            if (run)
+                TEST_ASSERT_FMT(lang_heap_bytes() == before, "%s: %zu bytes, then %zu",
+                                src[i], before, lang_heap_bytes());
+        }
+        ray_release(ast);
+    }
+    PASS();
+}
+
+/* The handler dict's keys are cached by symbol id.  A runtime restart
+ * deals the ids out again: here an earlier intern takes the id "code" had,
+ * and the dict must still say code and msg. */
+static test_result_t test_eval_try_error_keys_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+            ray_sym_intern("try_keys_reinit_a", 17);
+            ray_sym_intern("try_keys_reinit_b", 17);
+        }
+        ray_t* r = ray_eval_str("(try (+ 1 'a) (fn [e] (at e 'code)))");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_SYM);
+        TEST_ASSERT_EQ_I(r->i64, ray_sym_intern("type", 4));
+        ray_release(r);
+        r = ray_eval_str("(try (+ 1 'a) (fn [e] (at e 'msg)))");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_STR);
+        ray_release(r);
+    }
+    PASS();
+}
+
 /* --- dotted table col not found error --- */
 static test_result_t test_eval_dotted_table_not_found(void) {
     ASSERT_ER("(do (set tbl99 (table ['a] (list [1 2 3]))) tbl99.notacol)", "name");
@@ -11076,10 +11432,121 @@ static test_result_t test_clock_local_follows_tz(void) {
     PASS();
 }
 
+/* Return an address as data, without retaining the inspected value. Using
+ * eval below exposes compiled slots through the same window as mutators. */
+static ray_t* mutation_local_address(ray_t* name) {
+    if (!name || name->type != -RAY_SYM) return ray_error("type", NULL);
+    ray_env_target_t target;
+    ray_t* value = NULL;
+    ray_err_t err = ray_env_target_resolve(name->i64, &target, &value);
+    return err == RAY_OK ? ray_i64((int64_t)(uintptr_t)value)
+                        : ray_error(ray_err_code_str(err), NULL);
+}
+
+static test_result_t test_local_mutation_fast_paths(void) {
+    ray_t* inspector = ray_fn_unary("mutation-local-address", 0, mutation_local_address);
+    TEST_ASSERT_NOT_NULL(inspector);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inspector));
+    TEST_ASSERT_EQ_I(ray_env_bind(ray_sym_intern("mutation-local-address", 22), inspector), RAY_OK);
+    ray_release(inspector);
+
+    /* These assertions test physical engagement, not just equal results. An
+     * unused alias must force a copy, whereas a VM mirror must not. */
+    ASSERT_EQ("((fn [] (let v (til 10000)) "
+              "(let p (eval (quote (mutation-local-address 'v)))) "
+              "(alter 'v set 0 99) "
+              "(== p (eval (quote (mutation-local-address 'v))))))", "true");
+    ASSERT_EQ("((fn [] (let t (table [x] (list (til 10000)))) "
+              "(let p (eval (quote (mutation-local-address 't)))) "
+              "(insert 't (list 99)) "
+              "(== p (eval (quote (mutation-local-address 't))))))", "true");
+    ASSERT_EQ("((fn [] (let v (til 10)) (let alias v) "
+              "(let p (eval (quote (mutation-local-address 'v)))) "
+              "(alter 'v set 0 99) "
+              "(== p (eval (quote (mutation-local-address 'v))))))", "false");
+    ASSERT_EQ("((fn [] (let t (table [x] (list (til 10)))) (let alias t) "
+              "(let p (eval (quote (mutation-local-address 't)))) "
+              "(insert 't (list 99)) "
+              "(== p (eval (quote (mutation-local-address 't))))))", "false");
+    PASS();
+}
+
+/* local_mutation.rfl builds its "interpreted" fixtures from 300 lets joined
+ * into one string: a body with more locals than a frame has slots stays on
+ * the tree walker.  Check that, and that a small body of the same shape
+ * does compile, so the check can fail. */
+static test_result_t test_local_mutation_walker_fixture(void) {
+    const char* defs[] = {
+        "(set lmpadc (fold concat \"\" (map (fn [i] (format \"(let lmz% 0) \" i)) (til 300))))",
+        "(set lmwalk (eval (parse (format \"(fn [f] % (let t (til 3)) (f 't 9) t)\" lmpadc))))",
+        "(set lmsmall (fn [f] (let t (til 3)) (f 't 9) t))",
+        "(set t [50 60])",   /* compiled code reaches a global target through f */
+    };
+    for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) {
+        ray_t* r = ray_eval_str(defs[i]);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ASSERT_EQ("(type lmpadc)", "'str");
+    /* both write the global t through a parameter holding insert */
+    ASSERT_EQ("(lmwalk insert)", "[0 1 2]");
+    ASSERT_EQ("(lmsmall insert)", "[0 1 2]");
+    ASSERT_EQ("t", "[50 60 9 9]");
+    ray_t* walk = ray_env_get(ray_sym_intern("lmwalk", 6));
+    ray_t* small = ray_env_get(ray_sym_intern("lmsmall", 7));
+    TEST_ASSERT_NOT_NULL(walk);
+    TEST_ASSERT_NOT_NULL(small);
+    TEST_ASSERT(!LAMBDA_IS_COMPILED(walk), "the padded fixture stays on the tree walker");
+    TEST_ASSERT(LAMBDA_IS_COMPILED(small), "the same body without padding compiles");
+    PASS();
+}
+
+/* A dotted read of a local, compiled, then the runtime is destroyed and
+ * created again on this thread: the code of the second runtime refers to
+ * nothing the first one's heap held. */
+static test_result_t test_dotted_local_read_reinit(void) {
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            ray_runtime_destroy(__RUNTIME);
+            ray_runtime_create(0, NULL);
+        }
+        ASSERT_EQ("((fn [] (let d (dict [v] (list 41))) d.v))", "41");
+    }
+    PASS();
+}
+
+/* A dotted read of a local reads the head's slot and walks the rest
+ * (compile_dotted_local), rather than evaluating the name in a window:
+ * no constant is the I64 vector of local names a window binds. */
+static test_result_t test_dotted_local_read_slot(void) {
+    ray_t* def = ray_eval_str("(set dlrslot (fn [] (let d (dict [v] (list 7))) d.v))");
+    TEST_ASSERT_NOT_NULL(def);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(def));
+    ray_release(def);
+    ASSERT_EQ("(dlrslot)", "7");
+    ray_t* lam = ray_env_get(ray_sym_intern("dlrslot", 7));
+    TEST_ASSERT_NOT_NULL(lam);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(lam), "the lambda compiled on its call");
+    ray_t* consts = LAMBDA_CONSTS(lam);
+    TEST_ASSERT_NOT_NULL(consts);
+    bool window = false;
+    for (int64_t i = 0; i < consts->len && !window; i++) {
+        ray_t* k = ((ray_t**)ray_data(consts))[i];
+        window = k && k->type == RAY_I64;
+    }
+    TEST_ASSERT(!window, "the read walks below the head's slot, without a window");
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
+    { "lang/local_mutation_fast_paths", test_local_mutation_fast_paths, lang_setup, lang_teardown },
+    { "lang/local_mutation_walker_fixture", test_local_mutation_walker_fixture, lang_setup, lang_teardown },
+    { "lang/dotted_local_read_reinit", test_dotted_local_read_reinit, lang_setup, lang_teardown },
+    { "lang/dotted_local_read_slot", test_dotted_local_read_slot, lang_setup, lang_teardown },
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
@@ -11124,6 +11591,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/avg", test_eval_avg, lang_setup, lang_teardown },
     { "lang/eval/min_max", test_eval_min_max, lang_setup, lang_teardown },
     { "lang/eval/first_last", test_eval_first_last, lang_setup, lang_teardown },
+    { "lang/eval/map_typed_domains_nulls", test_map_typed_domains_and_nulls, lang_setup, lang_teardown },
     { "lang/eval/map", test_eval_map, lang_setup, lang_teardown },
     { "lang/eval/pmap", test_eval_pmap, lang_setup, lang_teardown },
     { "lang/eval/fold", test_eval_fold, lang_setup, lang_teardown },
@@ -11133,6 +11601,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/distinct", test_eval_distinct, lang_setup, lang_teardown },
     { "lang/eval/in", test_eval_in, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_guid_nulls", test_eval_select_where_in_guid_nulls, lang_setup, lang_teardown },
+    { "lang/eval/in_guid_unflagged_nulls", test_eval_in_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/in_guid_oom", test_eval_in_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
     { "lang/eval/sect", test_eval_sect, lang_setup, lang_teardown },
@@ -11352,6 +11823,10 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/and_or_forms", test_eval_and_or_forms, lang_setup, lang_teardown },
     { "lang/eval/get_error_trace", test_eval_get_error_trace, lang_setup, lang_teardown },
     { "lang/eval/try_raise_value", test_eval_try_raise_value, lang_setup, lang_teardown },
+    { "lang/eval/try_error_value_oom", test_eval_try_error_value_oom, lang_setup, lang_teardown },
+    { "lang/eval/try_value_handler_builds_nothing", test_eval_try_value_handler_builds_nothing, lang_setup, lang_teardown },
+    { "lang/eval/try_catch_releases", test_eval_try_catch_releases, lang_setup, lang_teardown },
+    { "lang/eval/try_error_keys_reinit", test_eval_try_error_keys_reinit, lang_setup, lang_teardown },
     { "lang/eval/dotted_table_not_found", test_eval_dotted_table_not_found, lang_setup, lang_teardown },
     { "lang/eval/value_fn_table", test_eval_value_fn_table, lang_setup, lang_teardown },
     { "lang/eval/value_fn_error", test_eval_value_fn_error, lang_setup, lang_teardown },

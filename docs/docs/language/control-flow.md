@@ -193,6 +193,13 @@ Recursive lambdas use `self` to refer to the enclosing function:
 "caught"
 ```
 
+An error the engine raises itself reaches the handler as a dict of its code and message:
+
+```lisp
+‣ (try (+ 1 "hello") (fn [e] e))
+{code:type msg:"cannot add i64 and str"}
+```
+
 If no error is raised, `try` returns the result of the body expression normally. Works inside lambdas compiled to bytecode.
 
 ### Fallback value
@@ -289,9 +296,10 @@ Null rules:
 Lambdas are auto-mapped over vectors when called directly. Use `map` for explicit element-wise application, `fold` for reductions, and `scan` for running accumulations:
 
 ```lisp
-;; map applies a function to each element, returning a list
+;; map applies a function to each element; same-type atom results
+;; form a typed vector, anything else a list
 ‣ (map (fn [x] (* x x)) [1 2 3 4 5])
-; => (1 4 9 16 25)
+; => [1 4 9 16 25]
 
 ;; lambdas auto-map over vectors
 ‣ ((fn [x] (* x x)) (til 5))

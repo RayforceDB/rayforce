@@ -7,6 +7,8 @@ rayforce
 rayforce.test
 build/
 build_*/
+# `make install-headers` staging tree (see Makefile)
+install/
 .DS_Store
 *.swp
 gmon.out

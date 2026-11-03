@@ -139,7 +139,7 @@ Splits each string element by the given delimiter and returns a list of string v
 
 **`(str-find str needle)`** — binary · atom/vector/list
 
-Returns the first 0-based byte index of `needle` in each string or symbol value. A missing substring returns `0Nl`, matching the collection `find` convention for "not found". Empty `needle` returns `0`. Large string/symbol vectors run through the thread pool and poll cancellation between morsels.
+Returns the first 0-based byte index of `needle` in each string or symbol value. The search is a literal substring match: `?`, `*`, `[`, `]` and `.` are ordinary bytes with no special meaning; use [`like`](#like) for glob patterns. A missing substring returns `0Nl`, matching the collection `find` convention for "not found". Empty `needle` returns `0`. Large string/symbol vectors run through the thread pool and poll cancellation between morsels.
 
 ```lisp
 (str-find "banana" "na")

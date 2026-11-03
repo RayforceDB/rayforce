@@ -61,6 +61,8 @@ jobs:
       RAY_MARCH: x86-64
     steps:
       - uses: actions/checkout@v4
+      - name: Test release-note source boundaries (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 .github/test_release_notes.py -v
       - name: Install Clang 23
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
