@@ -24,8 +24,11 @@
 #define _GNU_SOURCE
 
 #include "test.h"
+#include <signal.h>
+#include <sys/resource.h>
 #include <rayforce.h>
 #include "store/journal.h"
+#include "table/dict.h"
 #include "store/fileio.h"
 #include "store/serde.h"
 #include "lang/eval.h"
@@ -2224,6 +2227,113 @@ static test_result_t test_ops_auto_journal_eval_predicate(void) {
     PASS();
 }
 
+/* 22qb. (.log.status): the journal state as a dict.  Before any open it
+ * reports open=false with null path/mode; after an open it carries the
+ * active path, the mode and the byte size; a roll keeps the active file
+ * name; a roll that loses its handle past the close (forced here with a
+ * 1-byte RLIMIT_FSIZE, so the new log's preamble cannot be written) leaves
+ * open=false while the path and mode stay; a close keeps them too. */
+static ray_t* status_field(ray_t* d, const char* name) {
+    if (!d || RAY_IS_ERR(d) || d->type != RAY_DICT) return NULL;
+    return ray_dict_probe_sym_borrowed(d, ray_sym_intern(name, strlen(name)));
+}
+static bool status_open(ray_t* d) {
+    ray_t* v = status_field(d, "open");
+    return v && v->type == -RAY_BOOL && v->b8;
+}
+static bool status_path_is(ray_t* d, const char* want) {
+    ray_t* v = status_field(d, "path");
+    if (!v || v->type != -RAY_STR) return false;
+    return ray_str_len(v) == strlen(want) && memcmp(ray_str_ptr(v), want, strlen(want)) == 0;
+}
+static bool status_mode_is(ray_t* d, const char* want) {
+    ray_t* v = status_field(d, "mode");
+    return v && v->type == -RAY_SYM && v->i64 == ray_sym_intern(want, strlen(want));
+}
+static int64_t status_bytes(ray_t* d) {
+    ray_t* v = status_field(d, "bytes");
+    return v && v->type == -RAY_I64 ? v->i64 : -1;
+}
+static void status_free(ray_t* r) {
+    if (!r) return;
+    if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+}
+
+static test_result_t test_ops_log_status(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_status");
+    char want[300]; snprintf(want, sizeof(want), "%s.log", base);
+
+    /* No journal is open (earlier tests in this process may have left a
+     * last path and mode behind, so null path/mode is left to
+     * rfl/system/log_status.rfl, which runs in a fresh process). */
+    ray_journal_close();
+    ray_t* s0 = ray_eval_str("(.log.status)");
+    bool s0_shape = s0 && !RAY_IS_ERR(s0) && s0->type == RAY_DICT && ray_dict_len(s0) == 5;
+    bool s0_closed = !status_open(s0) && status_bytes(s0) == 0;
+    status_free(s0);
+
+    char src[400];
+    snprintf(src, sizeof(src), "(.log.open 'async \"%s\")", base);
+    ray_t* o = ray_eval_str(src);
+    bool open_ok = o && !RAY_IS_ERR(o);
+    status_free(o);
+    ray_t* s1 = ray_eval_str("(.log.status)");
+    bool s1_open = status_open(s1) && status_path_is(s1, want) && status_mode_is(s1, "async")
+                   && status_bytes(s1) > 0;
+    status_free(s1);
+
+    /* A successful roll leaves the same active file, open, and fresh. */
+    ray_t* r = ray_eval_str("(.log.roll)");
+    bool roll_ok = r && !RAY_IS_ERR(r);
+    status_free(r);
+    ray_t* s2 = ray_eval_str("(.log.status)");
+    bool s2_open = status_open(s2) && status_path_is(s2, want);
+    status_free(s2);
+
+    /* Force the roll to fail past the close: the archive rename succeeds,
+     * the new log cannot be created because its preamble exceeds the file
+     * size limit. */
+    struct rlimit old, lim;
+    bool forced = false, s3_lost = false, roll_err = false, w_err = false;
+    signal(SIGXFSZ, SIG_IGN);
+    if (getrlimit(RLIMIT_FSIZE, &old) == 0) {
+        lim = old; lim.rlim_cur = 1;
+        if (setrlimit(RLIMIT_FSIZE, &lim) == 0) {
+            forced = true;
+            ray_t* rr = ray_eval_str("(.log.roll)");
+            roll_err = rr && RAY_IS_ERR(rr);
+            status_free(rr);
+            setrlimit(RLIMIT_FSIZE, &old);
+            ray_t* s3 = ray_eval_str("(.log.status)");
+            s3_lost = !status_open(s3) && status_path_is(s3, want) && status_mode_is(s3, "async")
+                      && status_bytes(s3) == 0;
+            status_free(s3);
+            ray_t* w = ray_eval_str("(.log.write 1)");
+            w_err = w && RAY_IS_ERR(w);
+            status_free(w);
+        }
+    }
+
+    ray_journal_close();
+    ray_t* s4 = ray_eval_str("(.log.status)");
+    bool s4_closed = !status_open(s4) && status_path_is(s4, want);
+    status_free(s4);
+
+    cleanup_base(base);
+    TEST_ASSERT_TRUE(s0_shape);
+    TEST_ASSERT_TRUE(s0_closed);
+    TEST_ASSERT_TRUE(open_ok);
+    TEST_ASSERT_TRUE(s1_open);
+    TEST_ASSERT_TRUE(roll_ok);
+    TEST_ASSERT_TRUE(s2_open);
+    TEST_ASSERT_TRUE(forced);
+    TEST_ASSERT_TRUE(roll_err);
+    TEST_ASSERT_TRUE(s3_lost);
+    TEST_ASSERT_TRUE(w_err);
+    TEST_ASSERT_TRUE(s4_closed);
+    PASS();
+}
+
 /* 22r. ray_log_write_fn: pay_size <= 0 (lines 100-103).
  *
  *  ray_serde_size returns 0 for object types not in its switch (any type
@@ -2870,6 +2980,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
     { "journal/ops_auto_journal_eval_predicate", test_ops_auto_journal_eval_predicate, jrn_setup, jrn_teardown },
+    { "journal/ops_log_status", test_ops_log_status, jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */

@@ -299,6 +299,17 @@ static ray_t* eval_one(ray_t* msg) {
 
 bool ray_journal_is_open(void) { return g_journal.fp != NULL; }
 
+void ray_journal_info(ray_journal_info_t* out) {
+    out->open  = g_journal.fp != NULL;
+    out->mode  = g_journal.mode;
+    out->path  = g_journal.log_path;
+    out->bytes = 0;
+    if (g_journal.fp && fseek(g_journal.fp, 0, SEEK_END) == 0) {
+        long end = ftell(g_journal.fp);
+        if (end > 0) out->bytes = (int64_t)end;
+    }
+}
+
 ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
                                   const uint8_t*          payload,
                                   int64_t                 payload_len)

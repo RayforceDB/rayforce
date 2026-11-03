@@ -81,6 +81,51 @@ ray_t* ray_log_open_fn(ray_t** args, int64_t n) {
     return err_to_ray(e, "io");
 }
 
+/* (.log.status) — read-only view of the journal state as a dict:
+ *   open  bool  a journal handle is present (writes are being journaled)
+ *   path  str   the active log file, null if none was ever opened
+ *   mode  sym   `sync or `async, null if none was ever opened
+ *   bytes i64   size of the active log, 0 when not open
+ *   auto  bool  the current evaluation runs inside an auto-journaled
+ *               IPC request (same value as (.ipc.auto_journal_eval))
+ * path and mode keep the last journal's values after .log.close or a
+ * .log.roll that lost its handle, so `open` false with a non-null path
+ * tells a closed journal from one that never existed.  Never raises
+ * except on allocation failure. */
+ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    ray_journal_info_t info;
+    ray_journal_info(&info);
+
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_list_new(5);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+
+    static const char* names[5] = { "open", "path", "mode", "bytes", "auto" };
+    bool have = info.mode != RAY_JOURNAL_OFF && info.path[0];
+    for (int i = 0; i < 5; i++) {
+        ray_t* v;
+        switch (i) {
+        case 0: v = ray_bool(info.open); break;
+        case 1: v = have ? ray_str(info.path, strlen(info.path)) : RAY_NULL_OBJ; break;
+        case 2: v = !have ? RAY_NULL_OBJ
+                  : info.mode == RAY_JOURNAL_SYNC ? ray_sym(ray_sym_intern("sync", 4))
+                                                  : ray_sym(ray_sym_intern("async", 5));
+                break;
+        case 3: v = ray_i64(info.bytes); break;
+        default: v = ray_bool(ray_ipc_auto_journal_eval()); break;
+        }
+        int64_t k = ray_sym_intern(names[i], strlen(names[i]));
+        keys = ray_vec_append(keys, &k);
+        if (RAY_IS_ERR(keys)) { if (v != RAY_NULL_OBJ) ray_release(v); ray_release(vals); return keys; }
+        vals = ray_list_append(vals, v);
+        if (v != RAY_NULL_OBJ) ray_release(v);
+        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    }
+    return ray_dict_new(keys, vals);
+}
+
 /* (.log.write expr) — append a synthetic entry containing the
  * serialized form of `expr`.  Useful for users who want REPL-driven
  * mutations captured in the log alongside the IPC stream.

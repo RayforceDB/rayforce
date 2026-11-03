@@ -70,7 +70,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
-`.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
+`.log.snapshot`, `.log.status`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
@@ -792,6 +792,12 @@ Built-in Entity-Attribute-Value store. The EAV table has three columns: `e` (ent
 (pull db 1)                  ; {name:100 age:30}
 (scan-eav db 'name)         ; table of (e, v) where a=name
 ```
+
+## Journal { #journal }
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `.log.status` | variadic | — | Journal state as a dict: `open` (handle present), `path`, `mode` (`sync`/`async`, null if never opened), `bytes`, `auto` (inside an auto-journaled request); never raises | `(if (get (.log.status) 'open) null (exit 1))` |
 
 ## Datalog
 

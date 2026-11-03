@@ -86,6 +86,22 @@ ray_err_t ray_journal_open_append(const char* base, ray_journal_mode_t mode);
 /* True iff a journal is currently open for append. */
 bool ray_journal_is_open(void);
 
+/* Snapshot of the journal state, for introspection.  `open` is the same
+ * answer as ray_journal_is_open().  `mode` and `path` describe the last
+ * journal opened in this process and survive ray_journal_close and a
+ * ray_journal_roll that lost its handle; `path` is "" and `mode` is
+ * RAY_JOURNAL_OFF if none was opened (or after ray_journal_purge).
+ * `bytes` is the size of the active log (0 when not open).  `path` points
+ * into module storage and is valid until the next journal call. */
+typedef struct {
+    bool               open;
+    ray_journal_mode_t mode;
+    const char*        path;
+    int64_t            bytes;
+} ray_journal_info_t;
+
+void ray_journal_info(ray_journal_info_t* out);
+
 /* Append one entry to the active journal.  No-op (returns RAY_OK) if
  * no journal is open or if a replay is currently in progress (we do
  * NOT recursively log replayed messages even if .log.write is called
