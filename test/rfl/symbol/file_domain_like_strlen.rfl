@@ -109,6 +109,22 @@
 (.os.setenv "RAY_SYM_COLD" "0") -- "0"
 (== (count (select {from: F where: (and (!= sp "") (like u "*google*"))})) (sum M1)) -- true
 (== (count (select {from: F where: (and (!= sp "") (like u "*/p/7/*"))})) (sum M2)) -- true
+;; min / max per group over a cold FILE dictionary compare ranks of the
+;; named entries, built once in dictionary order; the extremes must equal the
+;; resident path's and the strings' own
+(set TS (table [g sp u] (list (at F 'g) SPS US)))
+(set GS (select {from: TS by: g mn: (min u) mx: (max u) c: (count u) where: (and (!= sp "") (like u "*google*"))}))
+(set MN (dict (at GS 'g) (at GS 'mn)))
+(set MX (dict (at GS 'g) (at GS 'mx)))
+(.os.setenv "RAY_SYM_COLD" "1") -- "1"
+(set G1 (select {from: F by: g mn: (min u) mx: (max u) c: (count u) where: (and (!= sp "") (like u "*google*"))}))
+(> (max (at G1 'c)) 1) -- true
+(all (== (as 'STR (at G1 'mn)) (map (fn [k] (at MN k)) (at G1 'g)))) -- true
+(all (== (as 'STR (at G1 'mx)) (map (fn [k] (at MX k)) (at G1 'g)))) -- true
+(.os.setenv "RAY_SYM_COLD" "0") -- "0"
+(set G0 (select {from: F by: g mn: (min u) mx: (max u) c: (count u) where: (and (!= sp "") (like u "*google*"))}))
+(all (== (at G0 'mn) (at G1 'mn))) -- true
+(all (== (at G0 'mx) (at G1 'mx))) -- true
 (.os.setenv "RAY_SYM_COLD" "") -- ""
 
 ;; a dictionary with entries appended past the file's (the table saved
