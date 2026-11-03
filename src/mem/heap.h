@@ -150,6 +150,12 @@ ray_t*    ray_scratch_realloc(ray_t* v, size_t new_data_size);
 
 ray_t*    ray_cow(ray_t* v);
 
+#ifdef DEBUG
+/* Test seam: ray_alloc on this thread returns NULL for `count` calls,
+ * starting with the nth from now; nth 0 disarms. */
+void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
+#endif
+
 /* ===== Memory Statistics ===== */
 
 typedef struct {

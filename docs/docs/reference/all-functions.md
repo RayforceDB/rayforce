@@ -386,11 +386,11 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass; returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
-| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
+| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
-| `alter` | variadic | special | Amend a global binding in place and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The target must be a global binding; a name bound by `let` or a parameter of the enclosing function raises `domain` | `(alter 'v set 0 99)` |
+| `alter` | variadic | special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
 | `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
 
 ```lisp
@@ -475,7 +475,7 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
-| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key | `(insert 't 2024.01.16 rows)` |
+| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
 | `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
