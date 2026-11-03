@@ -71,6 +71,9 @@
 (.idx.has? c1) -- true
 (find c1 (at g [4 0 5])) -- [6 0 0N]
 (find c1 (at g [4 0 5])) -- (find (concat h (at g [4])) (at g [4 0 5]))
+;; a repeated key leaves it first-row-only (see ops/idx_append.rfl)
+(at (.idx.info (concat gi (at g [0]))) 'first_only) -- true
+(find (concat gi (at g [0])) (at g [0 2])) -- [0 3]
 
 ;; ─────────────────────────── a query filter keeps the scan's answer ────────
 (set T (table ['k 'v] (list gi [1 2 3 4 5 6])))

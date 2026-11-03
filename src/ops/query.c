@@ -28179,6 +28179,12 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                         if (cells[k]) ray_release(cells[k]);
                 }
                 col->len = nrows;
+                /* An append extended the column's hash index over the rows
+                 * just undone (ray_index_append_extend): drop it. */
+                if (ray_index_has(col) && ray_index_payload(col->index)->built_for_len != nrows) {
+                    ray_t* d = ray_index_drop(&col);
+                    if (d && !RAY_IS_ERR(d)) slots[c] = d;
+                }
             }
         } else {
             /* insert appends without consulting keys, and in ascending row
@@ -28337,6 +28343,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             new_col = append_atom_to_col(new_col, row_elems[c]);
         }
         if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
+
+        /* The rebuilt column holds orig_col's rows, then the new ones: its
+         * hash index extended over them, as concat carries one
+         * (ray_index_carry_append; best-effort). */
+        if (ray_index_has(orig_col)) ray_index_carry_append(orig_col, new_col);
 
         result = ray_table_add_col(result, col_name, new_col);
         ray_release(new_col);
