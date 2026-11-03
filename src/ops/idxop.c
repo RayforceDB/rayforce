@@ -1585,14 +1585,6 @@ static inline void hx_set(ray_t* v, int64_t i, int64_t x) {
     if (v->type == RAY_I32) ((uint32_t*)d)[i] = (uint32_t)x;
     else                    ((int64_t*)d)[i] = x;
 }
-/* Copy `n` entries of `src` into `dst`, converting between widths. */
-static void hx_copy_into(ray_t* dst, const ray_t* src, int64_t n) {
-    if (dst->type == src->type) {
-        memcpy(ray_data(dst), ray_data((ray_t*)src), (size_t)n * (size_t)ray_elem_size(src->type));
-        return;
-    }
-    for (int64_t i = 0; i < n; i++) hx_set(dst, i, hx_get(src, i));
-}
 static inline ray_idx_rows_t hx_rows(const ray_t* rows, int64_t off) {
     bool nw = rows->type == RAY_I32;
     const uint8_t* d = (const uint8_t*)ray_data((ray_t*)rows);
@@ -2505,11 +2497,10 @@ done:
     return 1;
 }
 
-ray_t* ray_index_attach_hash(ray_t** vp) {
-    /* allow_str / allow_guid: keyed on a byte hash with payload-verified
-     * compares; allow_sym: RAY_SYM uses domain ids. */
-    ray_t* v = prepare_attach_ex(vp, "hash", true, true, true);
-    if (RAY_IS_ERR(v)) return v;
+/* A hash index over v's values, not attached: the RAY_INDEX block, or an
+ * error ("oom", "cancel").  v may carry an index of its own (it occupies
+ * aux bytes 0-7, which no read below touches). */
+static ray_t* hash_build_block(ray_t* v) {
     bool bytes = hash_byte_keyed(v->type);
     /* GUID: every row is a key, the zero guid included.  `find`, `in` and
      * the hashset compare guid cells by their bytes, so a zero cell matches
@@ -2543,7 +2534,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
         ix->u.hash.n_groups = pn;
         ix->u.hash.order_sym = -1;
         ix->markers |= RAY_MARK_HASH_HIGH;
-        return attach_finalize(v, idx);
+        return idx;
     }
     /* STR / GUID: a serial walk, groups numbered by first occurrence.
      * Build-time capacity: sized by rows for O(1) inserts. */
@@ -2688,7 +2679,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     ix->u.hash.order_sym = -1;
     hx_narrow_payload(ix);
 
-    return attach_finalize(v, idx);
+    return idx;
 
 hash_cancel_csr:
     scratch_free(rgid_hdr);
@@ -2696,6 +2687,29 @@ hash_cancel_csr:
     ray_release(offs);
     ray_release(rows);
     return ray_error("cancel", "interrupted");
+}
+
+ray_t* ray_index_attach_hash(ray_t** vp) {
+    /* allow_str / allow_guid: keyed on a byte hash with payload-verified
+     * compares; allow_sym: RAY_SYM uses domain ids. */
+    ray_t* v = prepare_attach_ex(vp, "hash", true, true, true);
+    if (RAY_IS_ERR(v)) return v;
+    ray_t* idx = hash_build_block(v);
+    if (!idx || RAY_IS_ERR(idx)) return idx ? idx : ray_error("oom", NULL);
+    return attach_finalize(v, idx);
+}
+
+ray_t* ray_index_hash_rebuild(ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || ray_index_kind(v) != RAY_IDX_HASH) return NULL;
+    const ray_index_t* ox = ray_index_payload(v->index);
+    ray_t* idx = hash_build_block(v);
+    if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); return NULL; }
+    ray_index_t* nx = ray_index_payload(idx);
+    /* the column's own aux and null hint, as the attached index saved them */
+    memcpy(nx->saved_aux, ox->saved_aux, 16);
+    nx->saved_attrs = ox->saved_attrs;
+    nx->markers |= (uint8_t)(ox->markers & RAY_MARK_UNIQUE);
+    return idx;
 }
 
 
@@ -2974,8 +2988,13 @@ static ray_index_t* hash_probe_setup_guid(ray_t* col, const uint8_t* p, int64_t*
  * bloom indexes skip null rows during build, so probing a null-bearing column
  * is correct (the chain simply won't surface null-row matches).  Callers that
  * must exclude null-bearing columns for semantic reasons (sort perm, range
- * scan) should add their own HAS_NULLS check. */
-static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
+ * scan) should add their own HAS_NULLS check.
+ *
+ * idx_fresh_any also admits a first-row-only hash (RAY_MARK_FIRST_ONLY),
+ * whose groups miss the rows an append repeated a key in; only the
+ * first-row consults (idx_find_fresh) may read one.  idx_fresh, the gate
+ * of every other consult, refuses it. */
+static bool idx_fresh_any(ray_t* col, ray_idx_kind_t kind) {
     if (!col || RAY_IS_ERR(col)) return false;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return false;
     if (!ray_index_has(col)) return false;
@@ -2983,11 +3002,23 @@ static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
     return ix->kind == (uint8_t)kind && ix->built_for_len == col->len;
 }
 
-/* The freshness a find / in / dict probe of `col`'s hash needs.  SYM and
- * GUID probes are sound beside null rows (a nonzero SYM id; GUID cells
- * compare by their bytes), every other type wants a null-free column. */
+static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
+    return idx_fresh_any(col, kind) &&
+           !(ray_index_payload(col->index)->markers & RAY_MARK_FIRST_ONLY);
+}
+
+bool ray_index_hash_first_only(const ray_t* col) {
+    return col && !RAY_IS_ERR(col) && ray_index_kind((ray_t*)col) == RAY_IDX_HASH &&
+           (ray_index_payload(col->index)->markers & RAY_MARK_FIRST_ONLY);
+}
+
+/* The freshness a find / in / dict probe of `col`'s hash needs — the key's
+ * first row, or its presence, which a first-row-only index still holds.
+ * SYM and GUID probes are sound beside null rows (a nonzero SYM id; GUID
+ * cells compare by their bytes), every other type wants a null-free
+ * column. */
 static bool idx_find_fresh(ray_t* col) {
-    if (!idx_fresh(col, RAY_IDX_HASH)) return false;
+    if (!idx_fresh_any(col, RAY_IDX_HASH)) return false;
     return col->type == RAY_SYM || col->type == RAY_GUID || !ray_vec_has_nulls(col);
 }
 
@@ -4427,6 +4458,12 @@ ray_t* ray_index_info(ray_t* v) {
         if (RAY_IS_ERR(r)) goto fail;
         r = dict_append_sym_i64(&keys, &vals, "n_groups", ix->u.hash.n_groups);
         if (RAY_IS_ERR(r)) goto fail;
+        /* An append left it holding each key's first row only: find / in
+         * still read it, nothing else does (RAY_MARK_FIRST_ONLY). */
+        if (ix->markers & RAY_MARK_FIRST_ONLY) {
+            r = dict_append_sym_bool(&keys, &vals, "first_only", true);
+            if (RAY_IS_ERR(r)) goto fail;
+        }
         break;
     case RAY_IDX_SORT:
         r = dict_append_sym_i64(&keys, &vals, "perm_len",
@@ -4680,9 +4717,10 @@ static void index_set_order_sym(ray_t* v, int64_t order_sym) {
 }
 
 static ray_t* attach_backing_index_carry_markers(ray_t* v, ray_t* (*fn)(ray_t**)) {
-    /* The rebuilt table keeps its own home rule. */
+    /* The rebuilt table keeps its own home rule, and holds every row. */
     uint8_t carry = (v && !RAY_IS_ERR(v) && ray_index_has(v))
-                    ? (uint8_t)(ray_index_payload(v->index)->markers & ~RAY_MARK_HASH_HIGH) : 0;
+                    ? (uint8_t)(ray_index_payload(v->index)->markers &
+                                ~(RAY_MARK_HASH_HIGH | RAY_MARK_FIRST_ONLY)) : 0;
     int64_t order_sym = index_order_sym(v);
     ray_t* w = attach_via(v, fn);
     if (w && !RAY_IS_ERR(w) && carry && (w->attrs & RAY_ATTR_HAS_INDEX))
@@ -4732,7 +4770,8 @@ ray_t* ray_attr_get_fn(ray_t* v) {
         ray_index_t* ix = ray_index_payload(v->index);
         if (ix->markers & RAY_MARK_UNIQUE)
             out[syms->len++] = ray_sym_intern_runtime("unique", 6);
-        if (ix->kind == RAY_IDX_HASH)
+        /* a first-row-only hash no longer holds every row of a key */
+        if (ix->kind == RAY_IDX_HASH && !(ix->markers & RAY_MARK_FIRST_ONLY))
             out[syms->len++] = ray_sym_intern_runtime("grouped", 7);
         else if (ix->kind == RAY_IDX_PART)
             out[syms->len++] = ray_sym_intern_runtime("parted", 6);
@@ -4782,7 +4821,8 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
     if (t == RAY_F32 || t == RAY_F64) return -2;
     if (hash_byte_keyed(t)) return -2;   /* STR / GUID: see ray_index_find_atom */
 
-    /* Nonzero symbol equality is safe even when other rows are null. */
+    /* Nonzero symbol equality is safe even when other rows are null.  The
+     * first row is all this returns, so a first-row-only index answers. */
     if (t == RAY_SYM && key == 0) return -2;
     if (!idx_find_fresh(col)) return -2;
 
@@ -5052,106 +5092,233 @@ int ray_index_find_vec(ray_t* col, ray_t* nd, int64_t* out, bool* any_miss) {
     return 1;
 }
 
+/* ---- A hash index extended over appended rows ------------------------------
+ *
+ * One routine serves the in-place append (ray_index_append_take / _extend,
+ * called from vec.c) and the concat carry: hash_extend probes each appended
+ * row once against an index whose child vectors the caller holds alone,
+ * adding a single-row group for a new key and leaving the index
+ * first-row-only (RAY_MARK_FIRST_ONLY) on a key it already holds — that row
+ * would belong in the middle of the CSR rows, a re-lay of O(n) per append.
+ * Nothing over the old rows is rehashed. */
+
+/* A heap copy of child vector `v` (same type and length). */
+static ray_t* hx_vec_copy(const ray_t* v) {
+    ray_t* c = ray_vec_new(v->type, v->len > 0 ? v->len : 1);
+    if (!c || RAY_IS_ERR(c)) return NULL;
+    memcpy(ray_data(c), ray_data((ray_t*)v), (size_t)v->len * (size_t)ray_elem_size(v->type));
+    c->len = v->len;
+    return c;
+}
+
+static bool hx_sole(const ray_t* v) {
+    return v && !RAY_IS_ERR(v) && v->mmod == 0 && ray_atomic_load(&((ray_t*)v)->rc) == 1;
+}
+
+/* A sole-owned heap copy of hash index `sx`: its head, markers and saved
+ * aux, and copies of its four child vectors.  NULL on OOM. */
+static ray_t* hash_index_copy(const ray_index_t* sx) {
+    ray_t* idx = ray_index_alloc(RAY_IDX_HASH, sx->parent_type, sx->built_for_len);
+    if (!idx || RAY_IS_ERR(idx)) return NULL;
+    ray_index_t* ix = ray_index_payload(idx);
+    memcpy(ix, sx, sizeof(*ix));
+    ix->markers &= (uint8_t)~RAY_MARK_MMAP;
+    ix->u.hash.table = ix->u.hash.gkeys = ix->u.hash.offs = ix->u.hash.rows = NULL;
+    ix->u.hash.table = hx_vec_copy(sx->u.hash.table);
+    ix->u.hash.gkeys = ix->u.hash.table ? hx_vec_copy(sx->u.hash.gkeys) : NULL;
+    ix->u.hash.offs  = ix->u.hash.gkeys ? hx_vec_copy(sx->u.hash.offs)  : NULL;
+    ix->u.hash.rows  = ix->u.hash.offs  ? hx_vec_copy(sx->u.hash.rows)  : NULL;
+    if (!ix->u.hash.rows) { ray_release(idx); return NULL; }   /* releases the copies made */
+    return idx;
+}
+
+/* Key word of group g: an old group's in gkeys, a group this extension
+ * added in nk[]. */
+static inline uint64_t hx_group_kw(const int64_t* gk, int64_t ng0, const int64_t* nk, int64_t g) {
+    return g < ng0 ? (uint64_t)gk[g] : (uint64_t)nk[g - ng0];
+}
+
+/* Double the slot table of `ix`, re-placing the ng0 old and na new groups
+ * under its home rule.  False on OOM (ix unchanged). */
+static bool hx_table_grow(ray_index_t* ix, const int64_t* gk, int64_t ng0,
+                          const int64_t* nk, int64_t na) {
+    ray_t* old = ix->u.hash.table;
+    uint64_t cap = (ix->u.hash.mask + 1) * 2, mask = cap - 1;
+    ray_t* nt = ray_vec_new(old->type, (int64_t)cap);
+    if (!nt || RAY_IS_ERR(nt)) return false;
+    memset(ray_data(nt), 0, (size_t)cap * (size_t)ray_elem_size(old->type));
+    nt->len = (int64_t)cap;
+    for (int64_t g = 0; g < ng0 + na; g++) {
+        uint64_t s = hx_home_m(ix->markers, mask, mix64(hx_group_kw(gk, ng0, nk, g)));
+        while (hx_get(nt, (int64_t)s) != 0) s = (s + 1) & mask;
+        hx_set(nt, (int64_t)s, g + 1);
+    }
+    ray_release(old);
+    ix->u.hash.table = nt;
+    ix->u.hash.mask  = mask;
+    return true;
+}
+
+/* Append `n` values of `src` (int64) to child vector *vp in its width. */
+static bool hx_append(ray_t** vp, const int64_t* src, int64_t n, uint32_t* narrow) {
+    const void* p = src;
+    if ((*vp)->type == RAY_I32) {
+        for (int64_t i = 0; i < n; i++) narrow[i] = (uint32_t)src[i];
+        p = narrow;
+    }
+    ray_t* r = ray_vec_append_raw(*vp, p, n);
+    if (!r || RAY_IS_ERR(r)) { if (r) ray_error_free(r); return false; }
+    *vp = r;
+    return true;
+}
+
+/* Extend hash index `ix` — its built_for_len rows are v's first n0, its
+ * child vectors the caller's alone — over v's rows [n0, n1).  False when it
+ * cannot be (the caller then releases the index): a null appended to a
+ * column other than GUID (whose index keys the zero guid like any value),
+ * row ids past a narrow table's width, a malformed payload, OOM. */
+static bool hash_extend(ray_index_t* ix, ray_t* v, int64_t n0, int64_t n1) {
+    if (ix->kind != RAY_IDX_HASH || ix->built_for_len != n0 || n1 < n0) return false;
+    ray_t* gkeys = ix->u.hash.gkeys;
+    ray_t* offs  = ix->u.hash.offs;
+    ray_t* rows  = ix->u.hash.rows;
+    if (!ix->u.hash.table || !gkeys || !offs || !rows) return false;
+    int64_t ng0 = ix->u.hash.n_groups, nk0 = ix->u.hash.n_keys, add = n1 - n0;
+    if (gkeys->len != ng0 || offs->len != ng0 + 1 || rows->len != nk0 ||
+        ix->u.hash.table->len != (int64_t)(ix->u.hash.mask + 1)) return false;
+    if (add == 0) return true;
+    /* every value a narrow child stores must fit 32 bits: row ids below n1,
+     * offsets up to nk0 + add, slot entries up to ng0 + add */
+    if ((rows->type == RAY_I32 && n1 > (int64_t)UINT32_MAX) ||
+        (offs->type == RAY_I32 && nk0 + add > (int64_t)UINT32_MAX) ||
+        (ix->u.hash.table->type == RAY_I32 && ng0 + add > (int64_t)UINT32_MAX)) return false;
+
+    int8_t t = v->type;
+    bool bytes = hash_byte_keyed(t);
+    bool keep_nulls = (t == RAY_GUID);
+    ray_t* sc_hdr = NULL;
+    /* per new group: its key word, its row, then a narrow staging area */
+    int64_t* nkw = (int64_t*)scratch_alloc(&sc_hdr, (size_t)add * (2 * sizeof(int64_t) + sizeof(uint32_t)));
+    if (!nkw) return false;
+    int64_t* nrow = nkw + add;
+    uint32_t* narrow = (uint32_t*)(nrow + add);
+    const int64_t* gk = (const int64_t*)ray_data(gkeys);
+    const uint8_t* base = (const uint8_t*)ray_data(v);
+    int64_t na = 0;
+    bool repeat = false;
+    bool ok = true;
+
+    for (int64_t r = n0; r < n1 && ok; r++) {
+        if (!keep_nulls && ray_raw_is_null(t, v->attrs, base, r)) { ok = false; break; }
+        uint64_t kw = hash_row_key_word(v, base, r);
+        uint64_t h = mix64(kw);
+        uint64_t mask = ix->u.hash.mask;
+        uint64_t slot = hx_home_m(ix->markers, mask, h);
+        bool hit = false;
+        for (;;) {
+            int64_t gp1 = hx_get(ix->u.hash.table, (int64_t)slot);
+            if (gp1 == 0) break;
+            int64_t g = gp1 - 1;
+            if (hx_group_kw(gk, ng0, nkw, g) == kw) {
+                int64_t first = g < ng0 ? hx_get(rows, hx_get(offs, g)) : nrow[g - ng0];
+                if (!bytes || hash_rows_eq(v, first, r)) { hit = true; break; }
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (hit) { repeat = true; continue; }
+        /* a new key: keep the table at most half full */
+        if ((uint64_t)(ng0 + na + 1) * 2 > ix->u.hash.mask + 1) {
+            if (!hx_table_grow(ix, gk, ng0, nkw, na)) { ok = false; break; }
+            mask = ix->u.hash.mask;
+            slot = hx_home_m(ix->markers, mask, h);
+            while (hx_get(ix->u.hash.table, (int64_t)slot) != 0) slot = (slot + 1) & mask;
+        }
+        hx_set(ix->u.hash.table, (int64_t)slot, ng0 + na + 1);
+        nkw[na] = (int64_t)kw;
+        nrow[na] = r;
+        na++;
+    }
+    if (ok && na > 0) {
+        /* each new group holds one row: its offset bound is one past the last */
+        ok = hx_append(&ix->u.hash.gkeys, nkw, na, narrow) &&
+             hx_append(&ix->u.hash.rows, nrow, na, narrow);
+        if (ok) {
+            for (int64_t j = 0; j < na; j++) nkw[j] = nk0 + j + 1;
+            ok = hx_append(&ix->u.hash.offs, nkw, na, narrow);
+        }
+    }
+    scratch_free(sc_hdr);
+    if (!ok) return false;
+    ix->u.hash.n_groups = ng0 + na;
+    ix->u.hash.n_keys   = nk0 + na;
+    ix->built_for_len   = n1;
+    if (repeat) {
+        /* The repeated rows are not in their groups: `unique` is no longer
+         * true, and neither is any within-group order. */
+        ix->markers |= RAY_MARK_FIRST_ONLY;
+        ix->markers &= (uint8_t)~RAY_MARK_UNIQUE;
+        ix->u.hash.order_sym = -1;
+    }
+    return true;
+}
+
+ray_t* ray_index_append_take(ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || (v->attrs & RAY_ATTR_SLICE)) return NULL;
+    if (v->type == RAY_STR) return NULL;          /* its appends go through ray_str_vec_append */
+    if (!idx_fresh_any(v, RAY_IDX_HASH)) return NULL;
+    ray_t* idx = v->index;
+    ray_index_t* ix = ray_index_payload(idx);
+    if (!ix->u.hash.table || !ix->u.hash.gkeys || !ix->u.hash.offs || !ix->u.hash.rows) return NULL;
+    /* A mapped index rides the column file's mapping and holds no reference
+     * of v's; a shared one is another holder's too.  Either is copied. */
+    bool mapped = idx->mmod == 1;
+    bool own = !mapped && !(ix->markers & RAY_MARK_MMAP) &&
+               ray_atomic_load(&idx->rc) == 1 &&
+               hx_sole(ix->u.hash.table) && hx_sole(ix->u.hash.gkeys) &&
+               hx_sole(ix->u.hash.offs) && hx_sole(ix->u.hash.rows);
+    ray_t* keep = own ? idx : hash_index_copy(ix);
+    if (!keep) return NULL;
+    /* Detach as vec_drop_index_inplace does: the saved aux holds no owned
+     * reference.  v's reference to its index moves to `keep` when it is
+     * that index; a shared one is released, a mapped one held none. */
+    memcpy(v->aux, ix->saved_aux, 16);
+    v->attrs &= (uint8_t)~RAY_ATTR_HAS_INDEX;
+    if (!own && !mapped) ray_release(idx);
+    return keep;
+}
+
+void ray_index_append_extend(ray_t* v, ray_t* idx, int64_t n0) {
+    if (!idx) return;
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
+        (v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX)) ||
+        ray_index_payload(idx)->parent_type != v->type ||
+        !hash_extend(ray_index_payload(idx), v, n0, v->len)) {
+        ray_release(idx);
+        return;
+    }
+    attach_finalize(v, idx);
+}
+
 /* Carry `src`'s hash index onto `dst`, a fresh vector holding src's rows
- * followed by appended rows.  Rebuilds nothing over the old rows: the group
- * tables are copied and each appended row is probed once and added as a new
- * single-row group.  An appended row that repeats a key is left alone — the
- * CSR row slices would need re-laying (O(n), the re-attach cost the carry
- * exists to avoid) and a `unique` marker would stop being true — so dst
- * simply stays unindexed, as every concat result did before. */
+ * followed by appended rows: a copy of the index, extended over the tail.
+ * Without an index the result is a plain vector, as every concat result was
+ * before the carry. */
 void ray_index_carry_append(ray_t* src, ray_t* dst) {
     if (!src || RAY_IS_ERR(src) || !dst || RAY_IS_ERR(dst)) return;
     if (!ray_is_vec(dst) || dst->type != src->type || dst->len < src->len) return;
-    if (dst->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX)) return;
-    if (!idx_fresh_nonull(src, RAY_IDX_HASH)) return;
+    if (dst->attrs & (RAY_ATTR_SLICE | RAY_ATTR_HAS_INDEX)) return;
+    if (!idx_find_fresh(src)) return;
     int8_t t = src->type;
     if (t == RAY_F32 || t == RAY_F64) return;
     if (t == RAY_SYM && ray_sym_vec_domain(src) != ray_sym_vec_domain(dst)) return;
     ray_index_t* sx = ray_index_payload(src->index);
     if (!sx->u.hash.table || !sx->u.hash.gkeys || !sx->u.hash.offs || !sx->u.hash.rows) return;
-
-    int64_t n0 = src->len, n1 = dst->len, add = n1 - n0;
-    int64_t og = sx->u.hash.n_groups, ok = sx->u.hash.n_keys;
-    if (add > INT64_MAX - og || add > INT64_MAX - ok) return;   /* no signed overflow below */
-    bool bytes = hash_byte_keyed(t);
-
-    /* Built in the width they end in: narrow while every value (at most
-     * n1) fits 32 bits, as hx_narrow would leave them. */
-    int8_t aw = n1 <= (int64_t)UINT32_MAX ? RAY_I32 : RAY_I64;
-    ray_t* gkeys = ray_vec_new(RAY_I64, og + add > 0 ? og + add : 1);
-    ray_t* offs  = ray_vec_new(aw, og + add + 1);
-    ray_t* rows  = ray_vec_new(aw, ok + add > 0 ? ok + add : 1);
-    uint64_t cap = next_pow2((uint64_t)(og + add < 4 ? 8 : 2 * (og + add)));
-    if (cap < 8) cap = 8;
-    ray_t* table = ray_vec_new(aw, (int64_t)cap);
-    if (!gkeys || RAY_IS_ERR(gkeys) || !offs || RAY_IS_ERR(offs) ||
-        !rows || RAY_IS_ERR(rows) || !table || RAY_IS_ERR(table)) {
-        if (gkeys && !RAY_IS_ERR(gkeys)) ray_release(gkeys);
-        if (offs  && !RAY_IS_ERR(offs))  ray_release(offs);
-        if (rows  && !RAY_IS_ERR(rows))  ray_release(rows);
-        if (table && !RAY_IS_ERR(table)) ray_release(table);
+    ray_t* idx = hash_index_copy(sx);
+    if (!idx) return;
+    if (!hash_extend(ray_index_payload(idx), dst, src->len, dst->len)) {
+        ray_release(idx);
         return;
     }
-    int64_t* gk  = (int64_t*)ray_data(gkeys);
-    uint64_t mask = cap - 1;
-    memcpy(gk, ray_data(sx->u.hash.gkeys), (size_t)og * sizeof(int64_t));
-    hx_copy_into(offs, sx->u.hash.offs, og + 1);
-    hx_copy_into(rows, sx->u.hash.rows, ok);
-    if (cap == sx->u.hash.mask + 1) {
-        /* Same capacity: the old slots are valid as they are. */
-        hx_copy_into(table, sx->u.hash.table, (int64_t)cap);
-    } else {
-        /* Re-placed under src's home rule: its markers carry over. */
-        memset(ray_data(table), 0, (size_t)cap * (size_t)ray_elem_size(aw));
-        for (int64_t g = 0; g < og; g++) {
-            uint64_t slot = hx_home_m(sx->markers, mask, mix64((uint64_t)gk[g]));
-            while (hx_get(table, (int64_t)slot) != 0) slot = (slot + 1) & mask;
-            hx_set(table, (int64_t)slot, g + 1);
-        }
-    }
-
-    /* Appended rows: probe with equality; a hit means a repeated key. */
-    const uint8_t* base = (const uint8_t*)ray_data(dst);
-    int64_t ng = og, nk = ok;
-    for (int64_t r = n0; r < n1; r++) {
-        int64_t kw = (int64_t)hash_row_key_word(dst, base, r);
-        uint64_t slot = hx_home_m(sx->markers, mask, mix64((uint64_t)kw));
-        for (;;) {
-            int64_t gp1 = hx_get(table, (int64_t)slot);
-            if (gp1 == 0) break;
-            if (gk[gp1 - 1] == kw &&
-                (!bytes || hash_rows_eq(dst, hx_get(rows, hx_get(offs, gp1 - 1)), r))) {
-                ray_release(gkeys); ray_release(offs);
-                ray_release(rows);  ray_release(table);
-                return;                       /* repeated key: not carried */
-            }
-            slot = (slot + 1) & mask;
-        }
-        hx_set(table, (int64_t)slot, ng + 1);
-        gk[ng] = kw;
-        hx_set(rows, nk, r);
-        hx_set(offs, ng + 1, nk + 1);
-        ng++; nk++;
-    }
-    gkeys->len = ng; offs->len = ng + 1; rows->len = nk; table->len = (int64_t)cap;
-
-    ray_t* idx = ray_index_alloc(RAY_IDX_HASH, t, n1);
-    if (!idx || RAY_IS_ERR(idx)) {
-        ray_release(gkeys); ray_release(offs); ray_release(rows); ray_release(table);
-        return;
-    }
-    ray_index_t* ix = ray_index_payload(idx);
-    ix->u.hash.table    = table;
-    ix->u.hash.gkeys    = gkeys;
-    ix->u.hash.offs     = offs;
-    ix->u.hash.rows     = rows;
-    ix->u.hash.mask     = mask;
-    ix->u.hash.n_keys   = nk;
-    ix->u.hash.n_groups = ng;
-    /* Every appended key is new, so `unique` stays true and a single-row
-     * group is trivially ordered by any column: the markers carry over. */
-    ix->u.hash.order_sym = sx->u.hash.order_sym;
-    ix->markers = sx->markers;
     attach_finalize(dst, idx);
 }
 

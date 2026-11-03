@@ -1613,9 +1613,14 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                 char path[1024];
                 int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
                                  (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                if (n > 0 && n < (int)sizeof(path))
-                    (void)ray_col_append_index(path, ray_index_payload(col->index),
+                /* a first-row-only hash (an append repeated a key) is
+                 * written as the complete one its values give */
+                bool partial = ray_index_hash_first_only(col);
+                ray_t* full = partial ? ray_index_hash_rebuild(col) : NULL;
+                if (n > 0 && n < (int)sizeof(path) && (full || !partial))
+                    (void)ray_col_append_index(path, ray_index_payload(full ? full : col->index),
                                                col->len, RAY_STR);
+                if (full) ray_release(full);
             }
             return;
         }

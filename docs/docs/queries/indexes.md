@@ -35,7 +35,7 @@ All five sites apply the same prechecks before consulting an index:
 - **Not parted / not MAPCOMMON:** parted and MAPCOMMON columns skip routing at the filter and IN sites.
 - **Default table:** filter and IN sites only route columns from the query's default table (non-default table references are skipped).
 
-Mutation auto-drops the attached index — the in-place mutators (`(insert 'v val)`, `(alter 'v set i val)`) call `ray_index_drop()` before writing, so a mutated column always has `HAS_INDEX` clear afterward.  Reattach explicitly after the write.  The one append that keeps a hash index is `concat` (and `(alter 'v concat vals)`, which rebinds to a `concat` result) when every appended key is new — see [Common Workflows](#common-workflows).
+A write to existing rows (`(alter 'v set i val)`, an `update`) drops the attached index, so the column has `HAS_INDEX` clear afterward; reattach explicitly after the write.  An append keeps a hash index and drops any other kind: `insert` (into a vector or a table's column, in place or not), `concat` and `(alter 'v concat vals)` extend the hash over the appended rows — see [Mutation Drops the Index](#mutation-drops-the-index).
 
 ### Fallback guarantee
 
@@ -134,7 +134,9 @@ Indexed columns participate in normal operations transparently.  `(sum vh)`, `(a
 
 ### Mutation Drops the Index
 
-The Rayfall in-place mutators — `(insert 'v val)` for append and `(alter 'v set i val)` for set — invalidate the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent `(.idx.has?)` calls return false; reattach the index after the write if you want index routing on the updated column.  `(alter 'v concat val)` rebinds `v` to `(concat v val)`, so a hash index survives it when every appended key is new (see below).
+A write to existing rows — `(alter 'v set i val)` — invalidates the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent `(.idx.has?)` calls return false; reattach the index after the write if you want index routing on the updated column.
+
+An append keeps a **hash** index (any other kind is dropped): `(insert 'v val)`, `(insert 't rows)` on a table's indexed column, their non-quoted forms, `concat` and `(alter 'v concat val)` extend it over the new rows, probing each once — the old rows are not rehashed.  A new key becomes a group of its own.  A key the hash already holds is not added to its group (that would re-lay every row): the hash is left first-row-only, `.idx.info` reports `first_only: true`, and it still answers `find`, `in` and a dict lookup — every other consult reads the column, and a save writes a complete hash built from the values.  `.idx.hash` or `.attr.set 'grouped` rebuilds a complete one.  A null appended to a column other than a guid one drops the hash.  An append to a column whose hash is shared (another binding holds it, or it was loaded from a file) copies it once.
 
 ```lisp
 (set v [5 1 9 3 7])
@@ -142,6 +144,13 @@ The Rayfall in-place mutators — `(insert 'v val)` for append and `(alter 'v se
 (.idx.has? vz)              ; ⇒ true
 (alter 'vz set 0 100)
 (.idx.has? vz)              ; ⇒ false
+
+(set t (table [k] (list (.idx.hash [10 20 30]))))
+(insert 't (table [k] (list [40])))
+(.idx.has? (at t 'k))                          ; ⇒ true   — a new key: a group of its own
+(insert 't (table [k] (list [20])))
+(at (.idx.info (at t 'k)) 'first_only)         ; ⇒ true   — a repeat
+(find (at t 'k) [20 40])                       ; ⇒ [1 3]  — still through the hash
 ```
 
 ### Coexistence with Linked Columns
@@ -163,7 +172,7 @@ An accelerator index uses bytes 0–7 of the column's [nullmap union](https://gi
 (set v (.idx.drop v))         ; optional early release; mutators auto-drop
 ```
 
-An append of new keys keeps the hash: `(concat v [7000 7007])` carries the index over (see [Attributes — Conservative Propagation](attributes.md#conservative-propagation)); an appended repeat drops it as before.
+An append keeps the hash: `(concat v [7000 7007])` carries the index over, and so does `(insert 'v 7014)` in place; an appended repeat leaves it first-row-only, still serving `find` and `in` (see [Mutation Drops the Index](#mutation-drops-the-index)).
 
 ### Range scans on a stable column
 
