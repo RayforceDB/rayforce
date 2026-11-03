@@ -60,13 +60,26 @@ _Static_assert(sizeof(ray_rdma_record_t) == 56, "rdma record layout");
 #define RAY_RDMA_RECORD_VERSION 1
 
 #define RAY_RDMA_RING_DEFAULT (64ULL << 20)
+/* The receiving ring a peer may describe: what this side mirrors in its
+ * staging and registers, so a peer cannot ask for more than this side
+ * would make itself. */
+#define RAY_RDMA_RING_MIN     (1ULL << 20)
+/* The registered (pinned) memory a server's endpoints may hold in all,
+ * each its receiving ring plus the largest staging it could be asked
+ * for: 16 connections.  Past it an upgrade is refused and the
+ * connection stays on TCP. */
+#define RAY_RDMA_BUDGET       (2ULL << 30)
 
 /* Whether this host can upgrade: the library loads and an active port
  * exists (the first active port with an address is taken). */
 bool         ray_rdma_available(void);
 /* A queue pair and a registered receiving ring, ready to be connected,
- * described in `mine`; NULL when it cannot be made. */
-ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine);
+ * described in `mine`; NULL when it cannot be made.  A `budgeted`
+ * endpoint (the server's) counts against RAY_RDMA_BUDGET until it is
+ * destroyed, and is not made past it. */
+ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine, bool budgeted);
+/* The registered memory budgeted endpoints hold now. */
+uint64_t     ray_rdma_bytes_in_use(void);
 /* Connects to the peer the record describes; false on failure, after
  * which the transport is only good for destroying. */
 bool         ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer);

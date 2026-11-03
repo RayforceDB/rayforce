@@ -991,6 +991,10 @@ typedef struct {
     int64_t          switch_deadline;   /* the open's deadline, for the drain before the client's marker */
 } ray_ipc_conn_data_t;
 
+#ifdef RAY_IPC_XPORT
+static void rdma_pending_forget(ray_ipc_conn_data_t* cd);
+#endif
+
 /* ===== Transport policy ===== */
 
 static int g_xport_policy = RAY_IPC_XPORT_AUTO;
@@ -1492,6 +1496,9 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
         if (cd->pending_xport) {
             cd->pending_xport->ops->destroy(cd->pending_xport);
             cd->pending_xport = NULL;
+#ifdef RAY_IPC_XPORT
+            rdma_pending_forget(cd);
+#endif
         }
         if (cd->switch_xport) {
             cd->switch_xport->ops->destroy(cd->switch_xport);
@@ -1605,6 +1612,57 @@ static void shm_offers_drop_conn(ray_poll_t* poll, int64_t id, const void* cd)
         if (g_offers[i].used && g_offers[i].poll == poll &&
             g_offers[i].conn_id == id && g_offers[i].cd == cd)
             shm_offer_drop(&g_offers[i]);
+}
+
+/* A server's RDMA endpoints answered and not yet confirmed: each holds
+ * registered memory until the client says XP_READY or XP_REFUSE, so an
+ * endpoint nobody confirms within RDMA_PENDING_TTL_MS is destroyed (the
+ * client's own probe gives up after 3 s), and no more than
+ * RDMA_PENDING_MAX wait at once.  Touched only by the listening poll's
+ * thread, like g_offers. */
+typedef struct {
+    ray_ipc_conn_data_t* cd;
+    int64_t              made_ms;
+} rdma_pending_t;
+
+#define RDMA_PENDING_MAX    16
+#define RDMA_PENDING_TTL_MS 10000
+
+static rdma_pending_t g_rdma_pending[RDMA_PENDING_MAX];
+
+static void rdma_pending_note(ray_ipc_conn_data_t* cd)
+{
+    for (int i = 0; i < RDMA_PENDING_MAX; i++)
+        if (!g_rdma_pending[i].cd) {
+            g_rdma_pending[i].cd      = cd;
+            g_rdma_pending[i].made_ms = ray_time_now_ms();
+            return;
+        }
+}
+
+static void rdma_pending_forget(ray_ipc_conn_data_t* cd)
+{
+    for (int i = 0; i < RDMA_PENDING_MAX; i++)
+        if (g_rdma_pending[i].cd == cd) memset(&g_rdma_pending[i], 0, sizeof g_rdma_pending[i]);
+}
+
+static void rdma_pending_expire(void)
+{
+    int64_t now = ray_time_now_ms();
+    for (int i = 0; i < RDMA_PENDING_MAX; i++) {
+        ray_ipc_conn_data_t* cd = g_rdma_pending[i].cd;
+        if (!cd || now - g_rdma_pending[i].made_ms <= RDMA_PENDING_TTL_MS) continue;
+        if (cd->pending_xport) cd->pending_xport->ops->destroy(cd->pending_xport);
+        cd->pending_xport = NULL;   /* a late XP_READY finds nothing and gets no XP_SWITCHED */
+        memset(&g_rdma_pending[i], 0, sizeof g_rdma_pending[i]);
+    }
+}
+
+static bool rdma_pending_room(void)
+{
+    for (int i = 0; i < RDMA_PENDING_MAX; i++)
+        if (!g_rdma_pending[i].cd) return true;
+    return false;
 }
 
 static bool random_bytes(uint8_t* p, size_t n)
@@ -2004,6 +2062,7 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
     if (cd->pending_xport && (kind == XP_READY || kind == XP_REFUSE)) {
         ray_xport_t* x = cd->pending_xport;
         cd->pending_xport = NULL;
+        rdma_pending_forget(cd);
         if (kind == XP_READY) server_switch(poll, id, x);
         else x->ops->destroy(x);
         return;
@@ -2052,7 +2111,8 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
                policy_allows(g_xport_policy, RAY_XPORT_RDMA) && ray_rdma_available()) {
         ray_rdma_record_t peer, mine;
         memcpy(&peer, r + 1, sizeof peer);
-        rdma = ray_rdma_create(&mine);
+        rdma_pending_expire();
+        rdma = rdma_pending_room() ? ray_rdma_create(&mine, true) : NULL;
         if (rdma && !ray_rdma_connect(rdma, &peer)) { rdma->ops->destroy(rdma); rdma = NULL; }
         if (rdma) {
             answer[0] = XP_RDMA;
@@ -2070,7 +2130,10 @@ static void serve_upgrade(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd,
         return;
     }
 #ifdef RAY_IPC_XPORT
-    if (rdma) cd->pending_xport = rdma;   /* moved on the client's XP_READY */
+    if (rdma) {
+        cd->pending_xport = rdma;   /* moved on the client's XP_READY */
+        rdma_pending_note(cd);
+    }
 #endif
 }
 
@@ -2157,7 +2220,7 @@ static int client_upgrade(ray_poll_t* poll, int64_t id, int want, int64_t deadli
     if (try_rdma) {
         if (!ray_rdma_available()) return miss;
         ray_rdma_record_t mine, peer;
-        ray_xport_t* x = ray_rdma_create(&mine);
+        ray_xport_t* x = ray_rdma_create(&mine, false);
         if (!x) return miss;
         uint8_t ask[1 + sizeof mine];
         ask[0] = XP_RDMA;

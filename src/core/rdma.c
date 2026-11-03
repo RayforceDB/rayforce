@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -220,7 +221,17 @@ typedef struct {
     bool                     armed;       /* the completion queue will raise an event on the channel */
     bool                     connected;
     bool                     probe_done;  /* the probe's own completion was seen */
+    bool                     budgeted;    /* counted against g_rdma_bytes */
 } rdma_xport_t;
+
+/* Each budgeted endpoint's claim: its ring and the largest staging. */
+#define RDMA_CLAIM (RAY_RDMA_RING_DEFAULT + RAY_RDMA_RING_DEFAULT)
+static _Atomic uint64_t g_rdma_bytes;
+
+uint64_t ray_rdma_bytes_in_use(void)
+{
+    return atomic_load_explicit(&g_rdma_bytes, memory_order_relaxed);
+}
 
 #define RDMA_WR_PROBE 2   /* the probe's work request id; ring writes carry 0 */
 
@@ -482,6 +493,7 @@ static void rdma_destroy(ray_xport_t* x)
     if (e->pd) a->dealloc_pd(e->pd);
     if (e->rx) ray_vm_free(e->rx, (size_t)e->rx_size);
     if (e->tx) ray_vm_free(e->tx, (size_t)e->tx_size);
+    if (e->budgeted) atomic_fetch_sub_explicit(&g_rdma_bytes, RDMA_CLAIM, memory_order_relaxed);
     ray_sys_free(e);
 }
 
@@ -495,13 +507,23 @@ static const ray_xport_ops_t rdma_ops = {
     .destroy       = rdma_destroy,
 };
 
-ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine)
+ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine, bool budgeted)
 {
     if (!ray_rdma_available()) return NULL;
     rdma_api_t* a = api();
     rdma_port_t* p = port();
+    /* Claimed before anything is made; rdma_destroy gives it back. */
+    if (budgeted &&
+        atomic_fetch_add_explicit(&g_rdma_bytes, RDMA_CLAIM, memory_order_relaxed) + RDMA_CLAIM > RAY_RDMA_BUDGET) {
+        atomic_fetch_sub_explicit(&g_rdma_bytes, RDMA_CLAIM, memory_order_relaxed);
+        return NULL;
+    }
     rdma_xport_t* e = (rdma_xport_t*)ray_sys_alloc(sizeof(rdma_xport_t));
-    if (!e) return NULL;
+    if (!e) {
+        if (budgeted) atomic_fetch_sub_explicit(&g_rdma_bytes, RDMA_CLAIM, memory_order_relaxed);
+        return NULL;
+    }
+    e->budgeted           = budgeted;
     e->base.ops           = &rdma_ops;
     e->base.kind          = RAY_XPORT_RDMA;
     e->base.fd_tells_room = true;   /* credits are completions on the same channel */
@@ -550,8 +572,10 @@ bool ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer)
     rdma_xport_t* e = (rdma_xport_t*)x;
     rdma_api_t* a = api();
     rdma_port_t* p = e->port;
-    if (peer->version != RAY_RDMA_RECORD_VERSION || peer->ring_size == 0 ||
-        peer->ring_size > (1ULL << 31) || peer->link_layer != (p->ib ? 1 : 2))
+    /* The staging mirrors the peer's ring and is registered (pinned), so
+     * its size is bounded by what this side makes for itself. */
+    if (peer->version != RAY_RDMA_RECORD_VERSION || peer->ring_size < RAY_RDMA_RING_MIN ||
+        peer->ring_size > RAY_RDMA_RING_DEFAULT || peer->link_layer != (p->ib ? 1 : 2))
         return false;
     /* The staging ring mirrors the peer's receiving ring. */
     e->tx_size = peer->ring_size;
@@ -643,7 +667,8 @@ bool ray_rdma_probe(ray_xport_t* x, int timeout_ms)
 /* This build has no verbs headers, or is not Linux: no host can upgrade,
  * every connection stays on its socket. */
 bool         ray_rdma_available(void) { return false; }
-ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine) { (void)mine; return NULL; }
+ray_xport_t* ray_rdma_create(ray_rdma_record_t* mine, bool budgeted) { (void)mine; (void)budgeted; return NULL; }
+uint64_t     ray_rdma_bytes_in_use(void) { return 0; }
 bool         ray_rdma_connect(ray_xport_t* x, const ray_rdma_record_t* peer) { (void)x; (void)peer; return false; }
 bool         ray_rdma_probe(ray_xport_t* x, int timeout_ms) { (void)x; (void)timeout_ms; return false; }
 const char*  ray_rdma_device_name(void) { return NULL; }
