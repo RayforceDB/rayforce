@@ -943,14 +943,18 @@ static bool quantile_literal_prob(ray_t* prob_expr, bool percentile,
 }
 
 /* Keyless SELECT can carry a scalar probability bound in the caller's
- * environment as well as a literal.  A source column of the same name wins
- * over that binding and must not be treated as a scalar parameter. */
+ * environment as well as a literal.  Match ordinary SELECT name resolution:
+ * a lexical parameter/let binding wins over a same-named source column, while
+ * a source column still wins over a global. */
 static bool quantile_keyless_prob(ray_t* prob_expr, ray_t* tbl,
                                   bool percentile, double* out_q) {
     if (quantile_literal_prob(prob_expr, percentile, out_q)) return true;
     if (!prob_expr || prob_expr->type != -RAY_SYM ||
-        (prob_expr->attrs & ATTR_QUOTED) ||
-        ray_table_slot(tbl, prob_expr->i64)) return false;
+        (prob_expr->attrs & ATTR_QUOTED)) return false;
+    ray_t* lexical = ray_env_get_lexical_local(prob_expr->i64);
+    if (lexical)
+        return quantile_literal_prob(lexical, percentile, out_q);
+    if (ray_table_slot(tbl, prob_expr->i64)) return false;
     return quantile_literal_prob(ray_env_get(prob_expr->i64), percentile, out_q);
 }
 

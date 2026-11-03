@@ -28,6 +28,14 @@
 (set P981 0)
 (at (select {q: (quantile s P981) from: Q981}) 'q) -- [0.0]
 ((fn [P981] (at (select {q: (quantile s P981) from: Q981}) 'q)) 0.75) -- [18.0]
+;; A caller lexical binding keeps SELECT precedence even when the source has a
+;; same-named column; without a lexical binding, the column still wins over a
+;; global scalar and leaves the existing median fallback intact.
+(set QC981 (table [s P981] (list (as 'F64 [0 8 16 24]) [1 2 3 4])))
+((fn [P981] (at (select {q: (quantile s P981) from: QC981}) 'q)) 0.25) -- [6.0]
+((fn [] (let P981 0.75) (at (select {q: (quantile s P981) from: QC981}) 'q))) -- [18.0]
+(set P981 0.25)
+(at (select {q: (quantile s P981) from: QC981}) 'q) -- [12.0]
 (set PP981 50)
 (value (select {a: (percentile s 25) b: (percentile s PP981) from: Q981})) -- (list [6.0] [12.0])
 (set PP981 25)
