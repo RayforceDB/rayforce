@@ -237,6 +237,10 @@ ray_t*    ray_ipc_parse_open_opts_full(ray_t* arg, ray_ipc_open_opts_t* out);
 size_t    ray_ipc_handle_threshold(int64_t handle);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
+/* Sends the cancel a client sends on Ctrl-C for the sync request
+ * outstanding on `handle` (one urgent byte; see ipc.c).  0, or -1 for a
+ * handle that is not a connection. */
+int       ray_ipc_send_cancel(int64_t handle);
 /* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
  * On expiry the connection is closed (on.close fires) and an `io` error
  * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */

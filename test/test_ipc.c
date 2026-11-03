@@ -3020,7 +3020,135 @@ static test_result_t test_ipc_mcast_local_not_compressed(void) {
     PASS();
 }
 
+/* ---- a late cancel byte on a moved connection -------------------------- */
+/*
+ * Ctrl-C (or a sync timeout) sends one urgent byte on the TCP socket.  On
+ * TCP the next request is read past a byte that came too late, which
+ * discards it; a moved connection's requests come through the transport,
+ * so the byte names the request it is for, and one for a request already
+ * answered must not cancel the next.  This holds however late the server
+ * looks at the socket: the check is the byte, not the timing.
+ */
+static test_result_t test_ipc_cancel_byte_on_idle_moved_link(void) {
+#if defined(__linux__)
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 2000);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+    ray_selector_t* sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
+    TEST_ASSERT_NOT_NULL(sel);
+    if (!sel->xport) {
+        ray_ipc_close(h);
+        ray_test_server_stop(&srv);
+        SKIP("the connection did not move to shared memory here");
+    }
+    /* A query answered, then its cancel: late, as a Ctrl-C pressed as
+     * the answer arrives would be. */
+    ray_t* m0 = ray_str("0", 1);
+    ray_t* r0 = ray_ipc_send(h, m0);
+    ray_release(m0);
+    TEST_ASSERT_NOT_NULL(r0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    ray_release(r0);
+    TEST_ASSERT_EQ_I(ray_ipc_send_cancel(h), 0);
+    sleep_ms(20);
+    for (int i = 0; i < 3; i++) {
+        ray_t* msg  = ray_str("(+ 1 2)", 7);
+        ray_t* resp = ray_ipc_send(h, msg);
+        ray_release(msg);
+        TEST_ASSERT_NOT_NULL(resp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(resp));
+        TEST_ASSERT_EQ_I(resp->i64, 3);
+        ray_release(resp);
+    }
+    sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_NOT_NULL(sel->xport);
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    PASS();
+#else
+    SKIP("moved connections are Linux-only");
+#endif
+}
+
+#if defined(__linux__)
+#include <signal.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+typedef struct { int64_t h; long after_ms; } oob_later_t;
+static void oob_later_fn(void* arg) {
+    oob_later_t* o = (oob_later_t*)arg;
+    sleep_ms(o->after_ms);
+    (void)ray_ipc_send_cancel(o->h);
+}
+#endif
+
+/* The same byte mid-query on a moved connection cancels that query (the
+ * server's SIGURG takes it), and the link answers the next one.  The
+ * server is its own process, as a client's would be: in one process the
+ * two would share the interrupt flag the cancel raises. */
+static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
+#if defined(__linux__)
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    const uint16_t port = 19986;
+    pid_t pid = fork();
+    TEST_ASSERT((pid) >= (0), "fork");
+    if (pid == 0) {
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
+        execl("./rayforce", "./rayforce", "-p", "19986", (char*)NULL);
+        _exit(127);
+    }
+    int64_t h = -1;
+    for (int i = 0; i < 100 && h < 0; i++) {
+        h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 1000);
+        if (h < 0) sleep_ms(50);
+    }
+    if (h < 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+    TEST_ASSERT((h) >= (0), "connected to the spawned server");
+    ray_selector_t* sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
+    if (!sel || !sel->xport) {
+        ray_ipc_close(h);
+        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        SKIP("the connection did not move to shared memory here");
+    }
+    static oob_later_t o;
+    o.h = h;
+    o.after_ms = 200;
+    ray_thread_t tid;
+    ray_thread_create(&tid, oob_later_fn, &o);
+    const char* q = "(do (set k 0) (while (< k 1000000000) (set k (+ k 1))) k)";
+    int64_t t0 = ray_time_now_ms();
+    ray_t* msg  = ray_str(q, strlen(q));
+    ray_t* r1   = ray_ipc_send(h, msg);
+    ray_release(msg);
+    int64_t took = ray_time_now_ms() - t0;
+    ray_thread_join(tid);
+    msg = ray_str("(+ 1 2)", 7);
+    ray_t* r2 = ray_ipc_send(h, msg);
+    ray_release(msg);
+    ray_ipc_close(h);
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT(RAY_IS_ERR(r1), "the query is cancelled");
+    TEST_ASSERT_STR_EQ(ray_err_code(r1), "cancel");
+    ray_error_free(r1);
+    TEST_ASSERT((took) < (5000), "cancelled long before it would finish");
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->i64, 3);
+    ray_release(r2);
+    PASS();
+#else
+    SKIP("moved connections are Linux-only");
+#endif
+}
+
 const test_entry_t ipc_entries[] = {
+    { "ipc/cancel_byte_on_idle_moved_link", test_ipc_cancel_byte_on_idle_moved_link, ipc_setup, ipc_teardown },
+    { "ipc/cancel_byte_mid_query_moved_link", test_ipc_cancel_byte_mid_query_moved_link, ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },

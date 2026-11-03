@@ -989,6 +989,11 @@ typedef struct {
      * whatever depth of nested waits it arrives. */
     ray_xport_t*     switch_xport;
     int64_t          switch_deadline;   /* the open's deadline, for the drain before the client's marker */
+    /* Sync requests sent (a client) and received (a server) on this
+     * connection, mod 256: on a moved connection a cancel byte names the
+     * request it is for (see the out-of-band cancel below). */
+    uint8_t          tx_sync_seq;
+    uint8_t          rx_sync_seq;
 } ray_ipc_conn_data_t;
 
 #ifdef RAY_IPC_XPORT
@@ -1126,6 +1131,33 @@ static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
  * ray_request_interrupt(). */
 static volatile sig_atomic_t g_ipc_active_fd = -1;
 
+/* Which cancel byte the running query answers to.  On TCP any byte does:
+ * the stream is read past a byte sent after its query was answered,
+ * which discards it, so a pending byte is always for the query running
+ * or waiting.  A moved connection's requests come through the transport,
+ * not the socket, so nothing discards a late byte: there the client
+ * sends the number of its sync request (mod 256; one at a time per
+ * connection, nested sends on a busy handle are refused) and a byte for
+ * any other request is dropped.  CANCEL_ANY on TCP, CANCEL_NONE while a
+ * moved connection's async message runs (the client only cancels a sync
+ * request; its byte waits for that one). */
+#define CANCEL_ANY  (-1)
+#define CANCEL_NONE (-2)
+static volatile sig_atomic_t g_ipc_active_seq = CANCEL_ANY;
+
+/* Whether a pending cancel byte on `fd` is for the request `want` names,
+ * taking it when it is and dropping it when it names another request.
+ * Async-signal-safe. */
+static bool oob_cancel_for(int fd, int want)
+{
+    if (want == CANCEL_ANY) return ray_sock_take_oob((ray_sock_t)fd) != 0;
+    if (want == CANCEL_NONE) return false;
+    int b = ray_sock_peek_oob((ray_sock_t)fd);
+    if (b < 0) return false;
+    (void)ray_sock_take_oob((ray_sock_t)fd);
+    return b == want;
+}
+
 #ifndef RAY_OS_WINDOWS   /* no SIGURG on Windows: OOB cancel is POSIX-only */
 static void ipc_sigurg_handler(int sig)
 {
@@ -1136,7 +1168,7 @@ static void ipc_sigurg_handler(int sig)
     /* Cancel ONLY if the urgent byte is on the RUNNING query's connection.
      * OOB from any OTHER (queued) client must not touch this query; that byte
      * stays pending on its socket and is honored when that client runs. */
-    if (ray_sock_take_oob((ray_sock_t)fd))
+    if (oob_cancel_for(fd, g_ipc_active_seq))
         ray_request_interrupt();
 }
 #endif
@@ -1411,7 +1443,10 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * which unblocks the waiting client.  A cancel is thus always scoped to the
      * connection that sent it and never affects another client's query. */
     ray_t* result;
-    if (ray_sock_take_oob((ray_sock_t)sel->fd)) {
+    if (hdr.msgtype == RAY_IPC_MSG_SYNC) cd->rx_sync_seq++;
+    int cancel_seq = !sel->xport ? CANCEL_ANY
+                   : hdr.msgtype == RAY_IPC_MSG_SYNC ? (int)cd->rx_sync_seq : CANCEL_NONE;
+    if (oob_cancel_for((int)sel->fd, cancel_seq)) {
         result = ray_error("cancel", "interrupted");
     } else {
         /* Clear any stale cancel first: the server is single-threaded, so each
@@ -1420,9 +1455,11 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * line the same way).  Publish the active fd so a SIGURG for THIS
          * connection cancels this query. */
         ray_clear_interrupt();
+        g_ipc_active_seq = cancel_seq;
         g_ipc_active_fd = (int)sel->fd;
         result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
         g_ipc_active_fd = -1;
+        g_ipc_active_seq = CANCEL_ANY;
     }
 
     ipc_ctx_set(prev_handle, prev_poll);
@@ -2683,11 +2720,29 @@ void ray_ipc_close(int64_t handle)
  * deadline has left a partial frame on the stream, which is unusable for
  * the same reason.  Before closing, the peer is sent the same urgent-data
  * cancel as Ctrl-C, so it stops evaluating a query nobody will read. */
+/* The cancel byte for the sync request outstanding on `sel`: '!' on
+ * TCP, the request's number on a moved connection. */
+static void send_cancel(ray_selector_t* sel)
+{
+    ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
+    char b = (sel->xport && cd) ? (char)cd->tx_sync_seq : '!';
+    ray_sock_send_oob((ray_sock_t)sel->fd, b);
+}
+
+int ray_ipc_send_cancel(int64_t handle)
+{
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    ray_selector_t* sel = poll ? ray_poll_get(poll, handle) : NULL;
+    if (!sel || !sel->data) return -1;
+    send_cancel(sel);
+    return 0;
+}
+
 static ray_t* sync_expire(ray_poll_t* poll, int64_t id, int64_t timeout_ms)
 {
     ray_selector_t* sel = ray_poll_get(poll, id);
     if (sel) {
-        ray_sock_send_oob((ray_sock_t)sel->fd, '!');
+        send_cancel(sel);
         ray_poll_deregister(poll, id);
     }
     return ray_error("io", "ipc send timed out after %lld ms; connection closed",
@@ -2721,6 +2776,8 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
         if (owned) ray_release(msg);
         return ray_error("io", "nested sync send on busy handle");
     }
+
+    cd->tx_sync_seq++;   /* the number a cancel of this request carries */
 
     /* Drain any half-sent multicast frame queued to this fd before writing the
      * sync request, so its bytes can't interleave into the pending frame. */
@@ -2789,7 +2846,7 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
              * cancel reply.  Best-effort: a server without OOB-cancel support
              * ignores the byte and the query completes as before. */
             if (ray_interrupted()) {
-                ray_sock_send_oob((ray_sock_t)sel->fd, '!');
+                send_cancel(sel);
                 ray_clear_interrupt();  /* consume; do not resend or cancel locally */
             }
             continue;
