@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #endif
 
 #if defined(__linux__)
@@ -306,6 +307,23 @@ static test_result_t test_shm_budget_bounds_the_rings(void) {
     PASS();
 }
 
+static test_result_t test_shm_ring_file_is_sealed(void) {
+    /* The client gets the ring's file writable: shrinking or growing it
+     * is refused, so the server's mapping stays backed. */
+    int fds[3];
+    ray_xport_t* x = ray_shm_create(1u << 20, fds);
+    TEST_ASSERT_NOT_NULL(x);
+    struct stat st;
+    TEST_ASSERT_EQ_I(fstat(fds[0], &st), 0);
+    TEST_ASSERT((ftruncate(fds[0], st.st_size / 2)) != (0), "shrinking is refused");
+    TEST_ASSERT((ftruncate(fds[0], st.st_size * 2)) != (0), "growing is refused");
+    TEST_ASSERT_EQ_I(fstat(fds[0], &st), 0);
+    TEST_ASSERT_EQ_I((int64_t)st.st_size, (int64_t)(4096 + 2 * (1u << 20)));
+    x->ops->destroy(x);
+    for (int i = 0; i < 3; i++) close(fds[i]);
+    PASS();
+}
+
 static test_result_t test_shm_host_identity(void) {
     const char* id = ray_shm_host_identity();
     TEST_ASSERT_NOT_NULL(id);
@@ -322,6 +340,7 @@ const test_entry_t shm_entries[] = {
     { "shm/attach_refuses_bad_header", test_shm_attach_refuses_a_bad_header, NULL, NULL },
     { "shm/peer_positions_break_link", test_shm_peer_positions_break_the_link, NULL, NULL },
     { "shm/budget_bounds_the_rings", test_shm_budget_bounds_the_rings, NULL, NULL },
+    { "shm/ring_file_is_sealed",     test_shm_ring_file_is_sealed,     NULL, NULL },
     { "shm/host_identity",           test_shm_host_identity,           NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

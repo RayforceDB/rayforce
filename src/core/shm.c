@@ -32,6 +32,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -261,21 +262,25 @@ static shm_xport_t* shm_new(void* map, uint64_t ring, bool server, int mine, int
     return s;
 }
 
+static char           g_host_id[RAY_SHM_IDENTITY_LEN + 4];
+static pthread_once_t g_host_id_once = PTHREAD_ONCE_INIT;
+
+static void host_identity_read(void)
+{
+    int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t r = read(fd, g_host_id, RAY_SHM_IDENTITY_LEN);
+    close(fd);
+    if (r != RAY_SHM_IDENTITY_LEN) g_host_id[0] = 0;
+    else g_host_id[RAY_SHM_IDENTITY_LEN] = 0;
+}
+
 const char* ray_shm_host_identity(void)
 {
-    static char id[RAY_SHM_IDENTITY_LEN + 4];
-    static bool read_once = false;
-    if (!read_once) {
-        read_once = true;
-        int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            ssize_t r = read(fd, id, RAY_SHM_IDENTITY_LEN);
-            close(fd);
-            if (r != RAY_SHM_IDENTITY_LEN) id[0] = 0;
-            else id[RAY_SHM_IDENTITY_LEN] = 0;
-        }
-    }
-    return id;
+    /* Read once, whichever thread asks first (a client poll may run off
+     * the main thread). */
+    pthread_once(&g_host_id_once, host_identity_read);
+    return g_host_id;
 }
 
 uint64_t ray_shm_ring_bytes(void)
@@ -289,6 +294,16 @@ uint64_t ray_shm_rings_in_use(void)
     return atomic_load_explicit(&g_rings, memory_order_relaxed);
 }
 
+static int shm_seal(int f)
+{
+#if defined(F_ADD_SEALS) && defined(F_SEAL_SHRINK) && defined(F_SEAL_GROW) && defined(F_SEAL_SEAL)
+    return fcntl(f, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL);
+#else
+    (void)f;
+    return 0;
+#endif
+}
+
 ray_xport_t* ray_shm_create(uint64_t ring, int fds[3])
 {
     /* Claimed before anything is made, given back on every failure. */
@@ -299,7 +314,7 @@ ray_xport_t* ray_shm_create(uint64_t ring, int fds[3])
     }
     int f = -1;
 #ifdef SYS_memfd_create
-    f = (int)syscall(SYS_memfd_create, "rayforce-ring", 1u /* MFD_CLOEXEC */);
+    f = (int)syscall(SYS_memfd_create, "rayforce-ring", 1u | 2u /* MFD_CLOEXEC | MFD_ALLOW_SEALING */);
 #endif
     if (f < 0) {
         atomic_fetch_sub_explicit(&g_rings, bytes, memory_order_relaxed);
@@ -308,7 +323,9 @@ ray_xport_t* ray_shm_create(uint64_t ring, int fds[3])
     int client = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     int server = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     void* map = NULL;
-    if (client >= 0 && server >= 0 && ftruncate(f, (off_t)(SHM_PAGE + 2 * ring)) == 0)
+    /* Sealed at its size: the client gets the descriptor writable, and a
+     * file it shrank would fault the server's next touch of the ring. */
+    if (client >= 0 && server >= 0 && ftruncate(f, (off_t)(SHM_PAGE + 2 * ring)) == 0 && shm_seal(f) == 0)
         map = shm_map(f, ring);
     int mine = map ? dup(server) : -1, peer = map ? dup(client) : -1;
     shm_xport_t* s = (map && mine >= 0 && peer >= 0) ? shm_new(map, ring, true, mine, peer) : NULL;
