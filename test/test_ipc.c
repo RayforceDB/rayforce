@@ -3088,16 +3088,20 @@ static void oob_later_fn(void* arg) {
  * server's SIGURG takes it), and the link answers the next one.  The
  * server is its own process, as a client's would be: in one process the
  * two would share the interrupt flag the cancel raises. */
-static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
+/* refuse_first: send one message that cannot be framed before the long
+ * query.  It is refused with nothing written, so it must not use up a
+ * request number: the cancel that follows still names the long query. */
+static test_result_t cancel_mid_query_moved_link(uint16_t port, bool refuse_first) {
 #if defined(__linux__)
     if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
-    const uint16_t port = 19986;
+    char portstr[8];
+    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
     pid_t pid = fork();
     TEST_ASSERT((pid) >= (0), "fork");
     if (pid == 0) {
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
-        execl("./rayforce", "./rayforce", "-p", "19986", (char*)NULL);
+        execl("./rayforce", "./rayforce", "-p", portstr, (char*)NULL);
         _exit(127);
     }
     int64_t h = -1;
@@ -3113,6 +3117,23 @@ static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
         kill(pid, SIGTERM); waitpid(pid, NULL, 0);
         SKIP("the connection did not move to shared memory here");
     }
+    if (refuse_first) {
+        ray_t* bad = ray_i64(7);
+        int8_t orig_type = bad->type;
+        bad->type = 50;             /* no serde type: framing fails */
+        ray_t* r0 = ray_ipc_send(h, bad);
+        bad->type = orig_type;
+        ray_release(bad);
+        bool refused = r0 && RAY_IS_ERR(r0);
+        if (r0) { if (RAY_IS_ERR(r0)) ray_error_free(r0); else ray_release(r0); }
+        sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
+        if (!refused || !sel || !sel->xport) {
+            if (sel) ray_ipc_close(h);
+            kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        }
+        TEST_ASSERT(refused, "a message that cannot be framed is refused");
+        TEST_ASSERT(sel && sel->xport, "the refusal leaves the link open and moved");
+    }
     static oob_later_t o;
     o.h = h;
     o.after_ms = 200;
@@ -3121,7 +3142,8 @@ static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
     const char* q = "(do (set k 0) (while (< k 1000000000) (set k (+ k 1))) k)";
     int64_t t0 = ray_time_now_ms();
     ray_t* msg  = ray_str(q, strlen(q));
-    ray_t* r1   = ray_ipc_send(h, msg);
+    /* Bounded, so a lost cancel fails the test instead of hanging it. */
+    ray_t* r1   = ray_ipc_send_timeout(h, msg, 10000);
     ray_release(msg);
     int64_t took = ray_time_now_ms() - t0;
     ray_thread_join(tid);
@@ -3142,13 +3164,23 @@ static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
     ray_release(r2);
     PASS();
 #else
+    (void)port; (void)refuse_first;
     SKIP("moved connections are Linux-only");
 #endif
+}
+
+static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
+    return cancel_mid_query_moved_link(19986, false);
+}
+
+static test_result_t test_ipc_cancel_after_refused_send_moved_link(void) {
+    return cancel_mid_query_moved_link(19985, true);
 }
 
 const test_entry_t ipc_entries[] = {
     { "ipc/cancel_byte_on_idle_moved_link", test_ipc_cancel_byte_on_idle_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_byte_mid_query_moved_link", test_ipc_cancel_byte_mid_query_moved_link, ipc_setup, ipc_teardown },
+    { "ipc/cancel_after_refused_send_moved_link", test_ipc_cancel_after_refused_send_moved_link, ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },

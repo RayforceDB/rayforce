@@ -2777,21 +2777,36 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
         return ray_error("io", "nested sync send on busy handle");
     }
 
-    cd->tx_sync_seq++;   /* the number a cancel of this request carries */
+    /* Build the frame before anything is written: a message that cannot
+     * be framed is refused with nothing on the wire and the connection
+     * as it was, request number included. */
+    ray_err_t ferr = RAY_OK;
+    ray_poll_frame_t* frame = conn_frame_msg(msg, RAY_IPC_MSG_SYNC, extra_flags,
+                                             conn_threshold(sel), &ferr);
+    if (owned) ray_release(msg);
+    if (!frame) return ray_error("io", "ipc send failed");
+
+    /* From here the request goes out, so it takes the next number: the
+     * server counts every SYNC frame it reads, and a cancel of this
+     * request carries the same count. */
+    cd->tx_sync_seq++;
 
     /* Drain any half-sent multicast frame queued to this fd before writing the
      * sync request, so its bytes can't interleave into the pending frame. */
     errno = 0;
-    if (conn_tx_drain_blocking(poll, sel, deadline) < 0 ||
-        conn_write_msg(sel, msg, RAY_IPC_MSG_SYNC,
-                       extra_flags, conn_threshold(sel), deadline) < 0) {
+    int64_t wrc = conn_tx_drain_blocking(poll, sel, deadline);
+    if (wrc >= 0)
+        wrc = conn_send_all(sel, frame->data, (size_t)frame->size, deadline);
+    ray_poll_frame_release(frame);
+    if (wrc < 0) {
         int e = errno;
-        if (owned) ray_release(msg);
         if (deadline >= 0 && e == ETIMEDOUT)
             return sync_expire(poll, sel->id, timeout_ms);
-        return ray_error("io", "ipc send failed");
+        /* Part of a frame may be on the wire, so the stream (and the
+         * request count) can no longer be trusted: close it. */
+        ray_poll_deregister(poll, sel->id);
+        return ray_error("io", "ipc send failed; connection closed");
     }
-    if (owned) ray_release(msg);
 
     cd->sync_waiting = true;
     cd->sync_ready   = false;
