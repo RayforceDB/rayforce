@@ -597,6 +597,12 @@ static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, int mode) {
         fmt_puts(b, "))");
         return;
     }
+    if (mode == RAY_FMT_ROUNDTRIP && len == 0) {
+        fmt_puts(b, "(as '");
+        fmt_puts(b, ray_type_name(vec->type));
+        fmt_puts(b, " [])");
+        return;
+    }
     if (len == 0) { fmt_puts(b, "[]"); return; }
 
     fmt_puts(b, "[");
@@ -818,6 +824,14 @@ static void fmt_dict(fmt_buf_t* b, ray_t* dict, int mode) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     int64_t npairs = keys ? keys->len : 0;
+    if (mode == RAY_FMT_ROUNDTRIP) {
+        fmt_puts(b, "(dict ");
+        fmt_obj(b, keys, mode);
+        fmt_putc(b, ' ');
+        fmt_obj(b, vals, mode);
+        fmt_putc(b, ')');
+        return;
+    }
     if (npairs == 0) { fmt_puts(b, "{}"); return; }
 
     int64_t max_pairs = (mode == RAY_FMT_REPL) ? FMT_LIST_MAX_HEIGHT : npairs;
@@ -1082,6 +1096,12 @@ static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows, int mode)
             if (!fmt_col_write(b, c, ri, mode)) fmt_missing_cell(b, c->type);
         }
         fmt_puts(b, "))");
+        return;
+    }
+    if (mode == RAY_FMT_ROUNDTRIP && c->type != RAY_LIST && nrows == 0) {
+        fmt_puts(b, "(as '");
+        fmt_puts(b, ray_type_name(c->type));
+        fmt_puts(b, " [])");
         return;
     }
     if (c->type != RAY_LIST) {
@@ -1673,6 +1693,11 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
 static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
     if (!obj || RAY_IS_NULL(obj)) { fmt_puts(b, "null"); return; } /* keep !obj: ray_fmt(NULL) is a public entry point, receives genuine-absence C NULL, not a value; also renders list/dict elements, which may be C NULL */
     if (RAY_IS_ERR(obj)) {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support error values";
+            return;
+        }
         char code[8] = {0};
         memcpy(code, obj->sdata, obj->slen < 7 ? obj->slen : 7);
         fmt_puts(b, "error: ");
@@ -1721,8 +1746,18 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
     } else if (type == RAY_DICT) {
         fmt_dict(b, obj, mode);
     } else if (type == RAY_LAMBDA) {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support callable values";
+            return;
+        }
         fmt_puts(b, "lambda");
     } else if (type == RAY_UNARY || type == RAY_BINARY || type == RAY_VARY) {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support callable values";
+            return;
+        }
         /* Render function objects with angle brackets so a fn is
          * visually distinct from a sym or string.  Without them,
          * `.os` printed as `{getenv:.os.getenv …}` — looked like
@@ -1742,6 +1777,11 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         if (concrete) ray_release(concrete);
         return;
     } else {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support this value type";
+            return;
+        }
         fmt_printf(b, "<%s>", ray_type_name(type));
     }
 }

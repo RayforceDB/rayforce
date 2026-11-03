@@ -37,6 +37,25 @@
 (type (eval (parse (repr emptyGuid990)))) -- 'GUID
 (count (eval (parse (repr emptyGuid990)))) -- 0
 
+;; Empty vectors retain their declared type, including nested values and
+;; empty table columns.
+(type (eval (parse (repr (as 'I32 []))))) -- 'I32
+(type (eval (parse (repr (as 'F32 []))))) -- 'F32
+(type (first (eval (parse (repr (list (as 'I32 []))))))) -- 'I32
+(type (at (eval (parse (repr (table [v] (list (as 'F32 [])))))) 'v)) -- 'F32
+
+;; Dictionary values are data, so repr uses the explicit constructor rather
+;; than dictionary-literal syntax, whose values intentionally remain syntax.
+(set dict990 (dict [v] (list (list 1 2))))
+(count (at (eval (parse (repr dict990))) 'v)) -- 2
+(all (== (ser dict990) (ser (eval (parse (repr dict990)))))) -- true
+
+;; Successful repr output is reserved for values in the supported data
+;; domain; callables fail clearly even when nested in a container.
+(repr (fn [x] x)) !- format
+(repr (list (fn [x] x))) !- format
+(repr (dict [f] (list (fn [x] x)))) !- format
+
 ;; Ordinary format remains display-oriented and consistent in every template.
 (format "%" 5i) -- "5"
 (format "n=%" 5i) -- "n=5"
