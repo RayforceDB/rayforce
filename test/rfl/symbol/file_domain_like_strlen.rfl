@@ -87,3 +87,41 @@
 ;; the where predicate over the file-domain column still filters
 (== (count (select {from: F where: (and (like u "*google*") (!= sp ""))})) (sum (as 'I64 (and (like US "*google*") (!= SPS ""))))) -- true
 (.sys.exec "rm -rf /tmp/rfl_fdom_like/") -- 0
+
+;; like under a row selection over a big FILE dictionary (a cheap conjunct
+;; first, then the pattern over only the surviving rows).  The
+;; dictionary is resolved in code order for the codes those rows name, then
+;; the rows read the table; every count must equal the string oracle, and
+;; codes no surviving row names must not decide anything.
+(.os.setenv "RAY_SYM_COLD" "1") -- "1"
+(set SELI (as 'I64 (!= SPS "")))
+(set M1 (* SELI (as 'I64 (like US "*google*"))))
+(== (count (select {from: F where: (and (!= sp "") (like u "*google*"))})) (sum M1)) -- true
+(== (count (select {from: F where: (and (like u "*google*") (!= sp ""))})) (sum M1)) -- true
+(set M2 (* SELI (as 'I64 (like US "*/p/7/*"))))
+(== (count (select {from: F where: (and (!= sp "") (like u "*/p/7/*"))})) (sum M2)) -- true
+(set Gq (select {from: F by: sp c: (count u) where: (and (!= sp "") (like u "*google*"))}))
+(== (sum (at Gq 'c)) (sum M1)) -- true
+(set M3 (* (as 'I64 (< g 50)) (as 'I64 (like US "*/p/1*"))))
+(== (sum (at (select {from: F by: g c: (count u) where: (and (< g 50) (like u "*/p/1*"))}) 'c)) (sum M3)) -- true
+
+;; the same, with the sweep forced off: the lazy row-order path agrees
+(.os.setenv "RAY_SYM_COLD" "0") -- "0"
+(== (count (select {from: F where: (and (!= sp "") (like u "*google*"))})) (sum M1)) -- true
+(== (count (select {from: F where: (and (!= sp "") (like u "*/p/7/*"))})) (sum M2)) -- true
+(.os.setenv "RAY_SYM_COLD" "") -- ""
+
+;; a dictionary with entries appended past the file's (the table saved
+;; again over its own directory with new symbols): the sweep resolves the
+;; file's entries, the appended ones are resolved in the row pass
+(.sys.exec "rm -rf /tmp/rfl_fdom_like_app/") -- 0
+(.db.splayed.set "/tmp/rfl_fdom_like_app/" (table [u] (list (at F 'u))))
+(set A0 (.db.splayed.get "/tmp/rfl_fdom_like_app/"))
+(.db.splayed.set "/tmp/rfl_fdom_like_app/" (table [u] (list (concat (at A0 'u) (as 'SYMBOL (list "aaa_new1" "aaa_new_google"))))))
+(set A1 (.db.splayed.get "/tmp/rfl_fdom_like_app/"))
+(.os.setenv "RAY_SYM_COLD" "1") -- "1"
+(sum (as 'I64 (like (at A1 'u) "*zzz_none*"))) -- 0
+(== (sum (as 'I64 (like (at A1 'u) "*google*"))) (+ 1 (sum (as 'I64 (like US "*google*"))))) -- true
+(== (count (select {from: A1 where: (not (like u "*zzz_none*"))})) (+ 2 N)) -- true
+(.os.setenv "RAY_SYM_COLD" "") -- ""
+(.sys.exec "rm -rf /tmp/rfl_fdom_like_app/") -- 0

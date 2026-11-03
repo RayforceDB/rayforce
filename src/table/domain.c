@@ -1881,6 +1881,25 @@ bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out
     return true;
 }
 
+bool ray_sym_domain_raw_cold(const ray_sym_domain_raw_t* r) {
+    const char* force = getenv("RAY_SYM_COLD");   /* tests: "1" cold, "0" resident */
+    if (force && force[0] == '1') return r->ib != NULL;
+    if (force && force[0] == '0') return false;
+#if defined(__linux__)
+    if (!r->ib || r->count < RAY_SYM_INDEX_STRIDE) return false;
+    int64_t nb = (r->count - 1) / RAY_SYM_INDEX_STRIDE + 1;
+    int64_t samples = nb < 64 ? nb : 64, cold = 0;
+    for (int64_t i = 0; i < samples; i++) {
+        int64_t k = samples > 1 ? i * (nb - 1) / (samples - 1) : 0;
+        if (!ray_vm_resident(r->map + r->ib[k].off, 1)) cold++;
+    }
+    return cold * 8 > samples;   /* more than an eighth of the samples are not resident */
+#else
+    (void)r;
+    return false;
+#endif
+}
+
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
     (void)dom;   /* the snapshot outlives its readers by contract: no pin
                   * across a reopen (domain.h, ray_sym_domain_raw_pin) */

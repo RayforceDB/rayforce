@@ -188,6 +188,12 @@ bool ray_sym_domain_raw_pin(ray_sym_domain_t* dom, ray_sym_domain_raw_t* out);
  * prints the decision. */
 void ray_sym_domain_preload(ray_sym_domain_t* dom, int64_t headroom);
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom);
+/* Whether most of a pinned FILE dictionary is not in the page cache: 64
+ * index blocks spread over it, one page each.  A caller that would read the
+ * entries its rows name in row order reads them in position order instead
+ * when it is cold.  Always false where residency cannot be asked.
+ * RAY_SYM_COLD=1 / 0 (tests) answers cold / resident for every dictionary. */
+bool ray_sym_domain_raw_cold(const ray_sym_domain_raw_t* r);
 const char* ray_sym_domain_raw_str_z(const ray_sym_domain_raw_t* r, int64_t pos, size_t* len);
 /* Entry `pos` (below r->count) of a compressed file decoded into `out`, which
  * holds its length (ray_sym_domain_raw_len) and 8 bytes more: a caller that
