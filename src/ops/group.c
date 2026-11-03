@@ -1304,6 +1304,8 @@ static ray_t* cd_widen_f32(ray_t* src) {
     return out;
 }
 
+static ray_t* distinct_guid_scan(ray_t* input, bool count_only);   /* below */
+
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     (void)g; (void)op;
     if (!input || RAY_IS_ERR(input)) return input;
@@ -1336,10 +1338,19 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     case RAY_STR:
     case RAY_GUID:
     case RAY_LIST: {
+        /* A guid hash index holds the count: its groups are the distinct
+         * guids (ray_index_hash_distinct_count). */
+        if (in_type == RAY_GUID) {
+            int64_t ng = ray_index_hash_distinct_count(input);
+            if (ng >= 0) return ray_i64(ng);
+            /* the guid kernel's count, without its row ids */
+            ray_t* cnt = distinct_guid_scan(input, true);
+            if (cnt) return cnt;
+        }
         /* The hash kernel only handles fixed-width scalar types.  For
          * STR / GUID / LIST the rewrite-aware path is to delegate to
-         * distinct_vec_eager (which uses the row-aware hashset_t) and
-         * count its result.  Slower than the radix kernel but correct. */
+         * distinct_vec_eager (its guid kernels, or the row-aware
+         * hashset_t) and count its result. */
         ray_t* dist = distinct_vec_eager(input);
         if (!dist || RAY_IS_ERR(dist)) return dist ? dist : ray_error("oom", NULL);
         int64_t cnt = ray_len(dist);
@@ -1644,6 +1655,192 @@ static void dv_part_dedup_fn(void* ctx, uint32_t worker_id,
     }
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * Parallel GUID distinct — first-occurrence row ids.
+ *
+ * The kernel above for 16-byte keys: a guid's partition is the top bits of
+ * its hash (ray_hash_bytes, as `in` and the hashset take it), the scatter
+ * carries (hash, row id) pairs, and each partition dedups on the hash and
+ * confirms a hit against the 16 bytes.  The zero guid is a value like any
+ * other (the hashset keeps one).  Partition slices ascend in row order, as
+ * above, so the first row a partition keeps is the value's first.
+ * ════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const uint8_t* base;
+    int64_t*       counts;   /* per-task × P: rows, then the scatter cursors */
+    uint64_t*      hbuf;     /* partitioned hashes */
+    int64_t*       rbuf;     /* partitioned row ids */
+    unsigned       p_shift;  /* partition = hash >> p_shift */
+    uint64_t       P;
+    int64_t        grain, total;
+} dg_ctx_t;
+
+static void dg_hist_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id; (void)end;
+    dg_ctx_t* x = (dg_ctx_t*)ctx;
+    int64_t lo = start * x->grain, hi = lo + x->grain;
+    if (hi > x->total) hi = x->total;
+    int64_t* c = x->counts + (size_t)start * x->P;
+    for (int64_t i = lo; i < hi; i++)
+        c[ray_hash_bytes(x->base + i * 16, 16) >> x->p_shift]++;
+}
+
+static void dg_scatter_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id; (void)end;
+    dg_ctx_t* x = (dg_ctx_t*)ctx;
+    int64_t lo = start * x->grain, hi = lo + x->grain;
+    if (hi > x->total) hi = x->total;
+    int64_t* cur = x->counts + (size_t)start * x->P;
+    for (int64_t i = lo; i < hi; i++) {
+        uint64_t h = ray_hash_bytes(x->base + i * 16, 16);
+        int64_t j = cur[h >> x->p_shift]++;
+        x->hbuf[j] = h;
+        x->rbuf[j] = i;
+    }
+}
+
+typedef struct {
+    const uint8_t*  base;
+    const uint64_t* hbuf;
+    const int64_t*  rbuf;
+    const int64_t*  part_off;
+    int64_t*        part_count;   /* OUT: distinct per partition */
+    uint8_t*        first;        /* OUT: len bytes; 1 = first occurrence (NULL: count only) */
+    int64_t*        wtab;         /* per worker: tcap row slots, then tcap hashes; zeroed */
+    uint64_t        tcap;         /* slots for the largest partition */
+} dg_part_ctx_t;
+
+static void dg_part_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    dg_part_ctx_t* x = (dg_part_ctx_t*)ctx;
+    /* the worker's own table, reused across its partitions: allocating one
+     * per partition put every partition on fresh pages */
+    int64_t* srow = x->wtab + (size_t)worker_id * 2 * x->tcap;
+    uint64_t* shash = (uint64_t*)(srow + x->tcap);
+    for (int64_t p = start; p < end; p++) {
+        int64_t off = x->part_off[p], cnt = x->part_off[p + 1] - off;
+        if (cnt == 0) { x->part_count[p] = 0; continue; }
+        uint64_t cap = 32;
+        while (cap < (uint64_t)cnt * 2) cap <<= 1;
+        uint64_t mask = cap - 1;
+        /* slot: the row id + 1 it holds (0 = empty), and that row's hash */
+        const uint64_t* hs = x->hbuf + off;
+        const int64_t* rs = x->rbuf + off;
+        int64_t count = 0;
+        for (int64_t j = 0; j < cnt; j++) {
+            uint64_t h = hs[j];
+            int64_t r = rs[j];
+            const uint8_t* key = x->base + r * 16;
+            uint64_t s = h & mask;    /* the partition took the top bits */
+            for (;;) {
+                int64_t held = srow[s];
+                if (held == 0) {
+                    srow[s] = r + 1;
+                    shash[s] = h;
+                    if (x->first) x->first[r] = 1;
+                    count++;
+                    break;
+                }
+                if (shash[s] == h && memcmp(x->base + (held - 1) * 16, key, 16) == 0) break;
+                s = (s + 1) & mask;
+            }
+        }
+        memset(srow, 0, (size_t)cap * sizeof(int64_t));   /* empty again for the next one */
+        x->part_count[p] = count;
+    }
+}
+
+/* The first-occurrence row ids of guid vector `input`, ascending (an I64
+ * vector), or with count_only their number (an I64 atom) — no row marks,
+ * no sweep.  An error ("oom", "cancel"), or NULL when the kernel declines
+ * (too short, no pool). */
+static ray_t* distinct_guid_scan(ray_t* input, bool count_only) {
+    int64_t len = input->len;
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || len < (1 << 16)) return NULL;
+    uint32_t nw = ray_pool_total_workers(pool);
+    /* partitions of ~16K rows: a partition's table (16 bytes a slot, at
+     * most half full) stays cache-sized, and there are enough of them to
+     * keep every worker busy */
+    unsigned p_bits = 4;
+    while (p_bits < 12 && (len >> p_bits) > (1 << 14)) p_bits++;
+    while (p_bits < 12 && ((uint64_t)1 << p_bits) < (uint64_t)nw * 4) p_bits++;
+    uint64_t P = (uint64_t)1 << p_bits;
+    int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (grain <= 0) grain = 8192;
+    int64_t n_tasks_64 = (len + grain - 1) / grain;
+    if (n_tasks_64 <= 0 || n_tasks_64 > UINT32_MAX) return NULL;
+    uint32_t n_tasks = (uint32_t)n_tasks_64;
+
+    ray_t *cnt_hdr = NULL, *off_hdr = NULL, *hb_hdr = NULL, *rb_hdr = NULL;
+    ray_t *first_hdr = NULL, *pc_hdr = NULL, *wt_hdr = NULL;
+    ray_t* ret = NULL;
+    int64_t* counts   = (int64_t*)scratch_calloc(&cnt_hdr, (size_t)P * n_tasks * sizeof(int64_t));
+    int64_t* part_off = (int64_t*)scratch_alloc(&off_hdr, (size_t)(P + 1) * sizeof(int64_t));
+    uint64_t* hbuf    = (uint64_t*)scratch_alloc(&hb_hdr, (size_t)len * sizeof(uint64_t));
+    int64_t* rbuf     = (int64_t*)scratch_alloc(&rb_hdr, (size_t)len * sizeof(int64_t));
+    uint8_t* first    = count_only ? NULL : (uint8_t*)scratch_calloc(&first_hdr, (size_t)len);
+    int64_t* pcount   = (int64_t*)scratch_alloc(&pc_hdr, (size_t)P * sizeof(int64_t));
+    if (!counts || !part_off || !hbuf || !rbuf || (!count_only && !first) || !pcount) {
+        ret = ray_error("oom", NULL);
+        goto out;
+    }
+    dg_ctx_t c = {
+        .base = (const uint8_t*)ray_data(input), .counts = counts, .hbuf = hbuf, .rbuf = rbuf,
+        .p_shift = 64 - p_bits, .P = P, .grain = grain, .total = len,
+    };
+    ray_pool_dispatch_n(pool, dg_hist_fn, &c, n_tasks);
+    if (pool_cancelled(pool)) { ret = ray_error("cancel", NULL); goto out; }
+    /* the counts become each task's cursors: partition-major, task order */
+    int64_t total = 0;
+    for (uint64_t p = 0; p < P; p++) {
+        part_off[p] = total;
+        for (uint32_t t = 0; t < n_tasks; t++) {
+            int64_t k = counts[(size_t)t * P + p];
+            counts[(size_t)t * P + p] = total;
+            total += k;
+        }
+    }
+    part_off[P] = total;
+    if (total != len) { ret = ray_error("nyi", "distinct: histogram mismatch"); goto out; }
+    ray_pool_dispatch_n(pool, dg_scatter_fn, &c, n_tasks);
+    if (pool_cancelled(pool)) { ret = ray_error("cancel", NULL); goto out; }
+
+    int64_t maxcnt = 0;
+    for (uint64_t p = 0; p < P; p++)
+        if (part_off[p + 1] - part_off[p] > maxcnt) maxcnt = part_off[p + 1] - part_off[p];
+    uint64_t tcap = 32;
+    while (tcap < (uint64_t)maxcnt * 2) tcap <<= 1;
+    int64_t* wtab = (int64_t*)scratch_calloc(&wt_hdr, (size_t)nw * 2 * tcap * sizeof(int64_t));
+    if (!wtab) { ret = ray_error("oom", NULL); goto out; }
+    dg_part_ctx_t d = {
+        .base = c.base, .hbuf = hbuf, .rbuf = rbuf, .part_off = part_off,
+        .part_count = pcount, .first = first, .wtab = wtab, .tcap = tcap,
+    };
+    ray_pool_dispatch_n(pool, dg_part_fn, &d, (uint32_t)P);
+    if (pool_cancelled(pool)) { ret = ray_error("cancel", NULL); goto out; }
+    int64_t n_distinct = 0;
+    for (uint64_t p = 0; p < P; p++) n_distinct += pcount[p];
+    if (count_only) { ret = ray_i64(n_distinct); goto out; }
+    ret = ray_vec_new(RAY_I64, n_distinct > 0 ? n_distinct : 1);
+    if (!ret || RAY_IS_ERR(ret)) { ret = ret ? ret : ray_error("oom", NULL); goto out; }
+    {
+        int64_t* ids = (int64_t*)ray_data(ret);
+        int64_t k = 0;
+        for (int64_t i = 0; i < len; i++)
+            if (first[i]) ids[k++] = i;
+        ret->len = k;
+        if (k != n_distinct) {
+            ray_release(ret);
+            ret = ray_error("nyi", "distinct: first-occurrence sweep mismatch");
+        }
+    }
+out:
+    scratch_free(wt_hdr); scratch_free(pc_hdr); scratch_free(first_hdr); scratch_free(rb_hdr);
+    scratch_free(hb_hdr); scratch_free(off_hdr); scratch_free(cnt_hdr);
+    return ret;
+}
+
 ray_t* distinct_radix_first_ids(ray_t* input) {
     if (!input || RAY_IS_ERR(input)) return NULL;
 
@@ -1654,6 +1851,8 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         break;
+    case RAY_GUID:
+        return distinct_guid_scan(input, false);
     case RAY_F64:
         /* The kernel canonicalizes every NaN to one value.  The eager
          * hashset only does that under the HAS_NULLS gate (ungated NaNs
