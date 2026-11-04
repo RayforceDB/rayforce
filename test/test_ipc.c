@@ -54,6 +54,7 @@
 
 #include "test.h"
 #include "ipc_harness.h"
+#include "core/ipc_limits.h"
 #ifdef RAY_OS_WINDOWS
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -3391,7 +3392,80 @@ static test_result_t test_ipc_cancel_seen_nested_moved_link(void) {
 #endif
 }
 
+/* These are metadata-only boundaries, not a claim that an admitted body
+ * necessarily decodes. Queue framing also includes the 16-byte header. */
+static test_result_t test_ipc_size_admission_boundaries(void) {
+    const int64_t b = RAY_IPC_BODY_MAX_BYTES;
+    const size_t q = (size_t)RAY_IPC_FRAME_MAX_BYTES - sizeof(ray_ipc_header_t);
+    TEST_ASSERT_FALSE(ray_ipc_body_size_ok(0));
+    TEST_ASSERT_FALSE(ray_ipc_body_size_ok(-1));
+    TEST_ASSERT_TRUE(ray_ipc_body_size_ok(b - 1));
+    TEST_ASSERT_TRUE(ray_ipc_body_size_ok(b));
+    TEST_ASSERT_FALSE(ray_ipc_body_size_ok(b + 1));
+    TEST_ASSERT_FALSE(ray_ipc_body_size_ok(INT64_MAX));
+    TEST_ASSERT_FALSE(ray_ipc_queue_body_size_ok(0));
+    TEST_ASSERT_TRUE(ray_ipc_queue_body_size_ok(q - 1));
+    TEST_ASSERT_TRUE(ray_ipc_queue_body_size_ok(q));
+    TEST_ASSERT_FALSE(ray_ipc_queue_body_size_ok(q + 1));
+    TEST_ASSERT_FALSE(ray_ipc_queue_body_size_ok(SIZE_MAX));
+    TEST_ASSERT_TRUE(ray_ipc_queue_size_preflight((int64_t)q, SIZE_MAX));
+    TEST_ASSERT_FALSE(ray_ipc_queue_size_preflight((int64_t)q + 1, SIZE_MAX));
+    /* Do not reject a compression-eligible decoded boundary merely because
+     * its uncompressed frame would exceed the queue cap. */
+    TEST_ASSERT_TRUE(ray_ipc_queue_size_preflight(b, 0));
+    TEST_ASSERT_TRUE(ray_ipc_queue_size_preflight(b, RAY_IPC_COMPRESS_THRESHOLD));
+    TEST_ASSERT_FALSE(ray_ipc_queue_size_preflight(b + 1, 0));
+    TEST_ASSERT_FALSE(ray_ipc_queue_size_preflight(INT64_MAX, SIZE_MAX));
+    PASS();
+}
+
+static test_result_t test_ipc_oversize_shared_value_refused(void) {
+    /* Genuine backing, not a forged huge length: 65 references to one 4 MiB
+     * vector serialize to over 256 MiB while retaining only 4 MiB of data. */
+    const int64_t bytes = 4 * 1024 * 1024;
+    const int64_t copies = 65;
+    ray_t* block = ray_vec_new(RAY_U8, bytes);
+    if (!block || RAY_IS_ERR(block)) {
+        if (RAY_IS_ERR(block)) ray_error_free(block);
+        TEST_ASSERT(false, "allocate shared IPC test value");
+    }
+    memset(ray_data(block), 0, (size_t)bytes);
+    block->len = bytes;
+    ray_t* msg = ray_list_new(copies);
+    if (!msg || RAY_IS_ERR(msg)) {
+        ray_release(block);
+        if (RAY_IS_ERR(msg)) ray_error_free(msg);
+        TEST_ASSERT(false, "allocate IPC test list");
+    }
+    ray_t** slots = (ray_t**)ray_data(msg);
+    for (int64_t i = 0; i < copies; i++) {
+        ray_retain(block);
+        slots[i] = block;
+    }
+    msg->len = copies;
+    ray_release(block);
+    int64_t serialized = ray_serde_size(msg);
+    if (serialized <= RAY_IPC_BODY_MAX_BYTES) {
+        ray_release(msg);
+        TEST_ASSERT(false, "shared values must expand on the wire");
+    }
+    ray_poll_frame_t* compressed = NULL;
+    ray_poll_frame_t* plain = NULL;
+    ray_err_t ec = ray_ipc_frame_async_at(msg, 0, &compressed);
+    ray_err_t ep = ray_ipc_frame_async_at(msg, RAY_IPC_COMPRESS_NEVER, &plain);
+    bool refused_compressed = ec == RAY_ERR_IO && compressed == NULL;
+    bool refused_plain = ep == RAY_ERR_IO && plain == NULL;
+    if (compressed) ray_poll_frame_release(compressed);
+    if (plain) ray_poll_frame_release(plain);
+    ray_release(msg);
+    TEST_ASSERT_TRUE(refused_compressed);
+    TEST_ASSERT_TRUE(refused_plain);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
+    { "ipc/size_admission_boundaries", test_ipc_size_admission_boundaries, ipc_setup, ipc_teardown },
+    { "ipc/oversize_shared_value_refused", test_ipc_oversize_shared_value_refused, ipc_setup, ipc_teardown },
     { "ipc/cancel_byte_on_idle_moved_link", test_ipc_cancel_byte_on_idle_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_byte_mid_query_moved_link", test_ipc_cancel_byte_mid_query_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_after_refused_send_moved_link", test_ipc_cancel_after_refused_send_moved_link, ipc_setup, ipc_teardown },
