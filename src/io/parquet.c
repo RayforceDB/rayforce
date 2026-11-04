@@ -1920,6 +1920,7 @@ static bool pq_remove_dir(const char* path) {
  * waits for another and the payload is never staged whole. */
 typedef struct {
     ray_col_stream_t* s;           /* NULL: the pass column is not chunked */
+    ray_encw_t tmpl;               /* the trained writer as training left it: tasks encode from it while puts move s->ew */
     int64_t n_chunks;
     size_t esz;
     ray_encw_part_t** part;        /* [n_chunks] encoded, not yet put */
@@ -2254,7 +2255,7 @@ static void pq_chunked_flush(pq_chunked* k) {
 static ray_err_t pq_chunked_encode(pq_chunked* k, int64_t ch, const uint8_t* data, bool* nulls) {
     ray_encw_part_t* p = ray_calloc_raw(sizeof(*p));
     if (!p) return RAY_ERR_OOM;
-    ray_err_t e = ray_encw_encode(k->s->ew,ch,data,p);
+    ray_err_t e = ray_encw_encode(&k->tmpl,ch,data,p);
     if (e != RAY_OK) { ray_encw_part_free(p); ray_free_raw(p); return e; }
     if (p->de.null_count) *nulls = true;
     k->part[ch] = p;
@@ -2306,7 +2307,9 @@ static void pq_chunked_task(pq_direct_work* w, uint32_t worker, pq_column* spare
     }
     if (!e && ee != RAY_OK) e = ray_error(ray_err_code_str(ee),"parquet: column chunk encode failed");
     if (e) w->errors[task] = e;
-    if (flagged || nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
+    /* HAS_NULLS as the staged path: the batch flag, or a null cell where
+     * the column keeps a zone (its saw_null) */
+    if (flagged || (nulls && w->writers[c].zone)) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
     if (b == &own) ray_free_raw(own.p);
     pq_chunked_flush(k);
 }
@@ -2335,6 +2338,7 @@ static void pq_chunked_train(void* ptr, uint32_t worker, int64_t start, int64_t 
         if (!e) {
             ray_err_t te = ray_encw_train(k->s->ew,buf,want);
             if (te != RAY_OK) e = ray_error(ray_err_code_str(te),"parquet: column chunk encode failed");
+            else k->tmpl = *k->s->ew;   /* no put runs before the windows */
         }
         ray_free_raw(buf);
         if (e) { w->errors[i] = e; pq_task_msg_note(w->emsg,i); }
@@ -3548,7 +3552,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                 for (int64_t t = work.task0; t < work.task0 + nt; t++) failed |= errors[t] != NULL;
                 if (ray_interrupted()) break;
             }
-            for (int64_t i = 0; nchk && i < work.npass; i++) {
+            for (int64_t i = 0; chk && i < work.npass; i++) {
                 pq_chunked* k = &chk[i];
                 if (!k->s) continue;
                 int ke = atomic_load(&k->err);

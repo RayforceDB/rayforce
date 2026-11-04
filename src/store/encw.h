@@ -146,7 +146,9 @@ ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const cha
  * any order) and written in chunk order: ray_encw_train trains the column's
  * structures on chunk 0's rows, as ray_encw_chunk does; ray_encw_encode then
  * encodes chunk `c` (its rows contiguous at `data`) into a part, reading the
- * writer only; ray_encw_put writes the part of chunk chunk_i.  The file is
+ * writer only (a copy of it taken after training, where puts may run
+ * meanwhile: a put moves the writer); ray_encw_put writes the part of chunk
+ * chunk_i.  The file is
  * byte for byte what ray_encw_chunk chunk by chunk writes.  Not for STR
  * (its STR_DICT entries and DICT index follow row order) or SYM (prefix
  * bounds).  A part starts zeroed and may be reused; ray_encw_part_free
