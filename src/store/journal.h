@@ -87,17 +87,24 @@ ray_err_t ray_journal_open_append(const char* base, ray_journal_mode_t mode);
 bool ray_journal_is_open(void);
 
 /* Snapshot of the journal state, for introspection.  `open` is the same
- * answer as ray_journal_is_open().  `mode` and `path` describe the last
- * journal opened in this process and survive ray_journal_close and a
- * ray_journal_roll that lost its handle; `path` is "" and `mode` is
- * RAY_JOURNAL_OFF if none was opened (or after ray_journal_purge).
- * `bytes` is the size of the active log (0 when not open).  `path` points
- * into module storage and is valid until the next journal call. */
+ * answer as ray_journal_is_open(): a handle is present, not proof that the
+ * last append reached the disk.  `opened_ok` is true once a journal was
+ * opened successfully in this process (cleared by ray_journal_purge).
+ * `mode` and `path` describe the last SUCCESSFULLY opened journal: they are
+ * committed only when an open succeeds, so a failed open never changes
+ * them, and they survive ray_journal_close and a ray_journal_roll that lost
+ * its handle.  Without a successful open `path` is "" and `mode` is
+ * RAY_JOURNAL_OFF.  `bytes` is the size of the active log, 0 when not open;
+ * `bytes_ok` is false when the size probe failed (then `bytes` is 0 and
+ * meaningless).  `path` points into module storage and is valid until the
+ * next journal call. */
 typedef struct {
     bool               open;
+    bool               opened_ok;
     ray_journal_mode_t mode;
     const char*        path;
     int64_t            bytes;
+    bool               bytes_ok;
 } ray_journal_info_t;
 
 void ray_journal_info(ray_journal_info_t* out);

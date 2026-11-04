@@ -81,47 +81,96 @@ ray_t* ray_log_open_fn(ray_t** args, int64_t n) {
     return err_to_ray(e, "io");
 }
 
+/* Checked atom construction for (.log.status).  ray_bool and ray_i64 test
+ * ray_alloc's result only with RAY_IS_ERR and then dereference it, so a NULL
+ * allocation crashes before they return.  These two allocate through
+ * ray_alloc directly and test for NULL as well as an error.  The primitives
+ * themselves are left as they are (a separate change). */
+static ray_t* status_atom(int8_t type) {
+    ray_t* v = ray_alloc(0);
+    if (!v) return ray_error("oom", NULL);
+    if (RAY_IS_ERR(v)) return v;
+    v->type = type;
+    return v;
+}
+static ray_t* status_bool(bool b) {
+    ray_t* v = status_atom(-RAY_BOOL);
+    if (!RAY_IS_ERR(v)) v->b8 = b ? 1 : 0;
+    return v;
+}
+static ray_t* status_i64(int64_t x) {
+    ray_t* v = status_atom(-RAY_I64);
+    if (!RAY_IS_ERR(v)) v->i64 = x;
+    return v;
+}
+static ray_t* status_sym(const char* s) {
+    int64_t id = ray_sym_intern(s, strlen(s));
+    if (id < 0) return ray_error("oom", NULL);
+    return ray_sym(id);
+}
+
 /* (.log.status) — read-only view of the journal state as a dict:
- *   open  bool  a journal handle is present (writes are being journaled)
- *   path  str   the active log file, null if none was ever opened
- *   mode  sym   `sync or `async, null if none was ever opened
- *   bytes i64   size of the active log, 0 when not open
- *   auto  bool  the current evaluation runs inside an auto-journaled
- *               IPC request (same value as (.ipc.auto_journal_eval))
- * path and mode keep the last journal's values after .log.close or a
- * .log.roll that lost its handle, so `open` false with a non-null path
- * tells a closed journal from one that never existed.  Never raises
- * except on allocation failure. */
+ *   open       bool  a journal handle is present (writes are being
+ *                    journaled).  A handle, not proof that the last append
+ *                    reached the disk.
+ *   opened_ok  bool  a journal was opened successfully at least once in
+ *                    this process (false after a failed first open, and
+ *                    after .log.purge)
+ *   path       str   the last SUCCESSFULLY opened log file, null if none
+ *   mode       sym   `sync or `async of that journal, null if none
+ *   bytes      i64   size of the active log; 0 when not open, null when
+ *                    the size probe failed
+ *   auto       bool  the current evaluation runs inside an auto-journaled
+ *                    IPC request (same value as (.ipc.auto_journal_eval))
+ * path and mode are committed only when an open succeeds, so a failed open
+ * (of a first or a later journal) never replaces them.  They survive
+ * .log.close and a .log.roll that lost its handle: `open` false with
+ * `opened_ok` true tells a lost or closed journal from one that never
+ * existed.  Raises only on allocation or symbol-intern failure; any
+ * partially built result is released and the error is returned. */
+#define STATUS_N 6
 ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
     ray_journal_info_t info;
     ray_journal_info(&info);
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, STATUS_N);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(5);
+    ray_t* vals = ray_list_new(STATUS_N);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
-    static const char* names[5] = { "open", "path", "mode", "bytes", "auto" };
-    bool have = info.mode != RAY_JOURNAL_OFF && info.path[0];
-    for (int i = 0; i < 5; i++) {
+    static const char* names[STATUS_N] =
+        { "open", "opened_ok", "path", "mode", "bytes", "auto" };
+    for (int i = 0; i < STATUS_N; i++) {
         ray_t* v;
         switch (i) {
-        case 0: v = ray_bool(info.open); break;
-        case 1: v = have ? ray_str(info.path, strlen(info.path)) : RAY_NULL_OBJ; break;
-        case 2: v = !have ? RAY_NULL_OBJ
-                  : info.mode == RAY_JOURNAL_SYNC ? ray_sym(ray_sym_intern("sync", 4))
-                                                  : ray_sym(ray_sym_intern("async", 5));
-                break;
-        case 3: v = ray_i64(info.bytes); break;
-        default: v = ray_bool(ray_ipc_auto_journal_eval()); break;
+        case 0: v = status_bool(info.open); break;
+        case 1: v = status_bool(info.opened_ok); break;
+        case 2: v = info.opened_ok ? ray_str(info.path, strlen(info.path)) : RAY_NULL_OBJ; break;
+        case 3: v = !info.opened_ok ? RAY_NULL_OBJ
+                  : status_sym(info.mode == RAY_JOURNAL_SYNC ? "sync" : "async"); break;
+        case 4: v = info.bytes_ok ? status_i64(info.bytes) : RAY_NULL_OBJ; break;
+        default: v = status_bool(ray_ipc_auto_journal_eval()); break;
         }
+        if (RAY_IS_ERR(v)) { ray_release(keys); ray_release(vals); return v; }
+
         int64_t k = ray_sym_intern(names[i], strlen(names[i]));
-        keys = ray_vec_append(keys, &k);
-        if (RAY_IS_ERR(keys)) { if (v != RAY_NULL_OBJ) ray_release(v); ray_release(vals); return keys; }
-        vals = ray_list_append(vals, v);
+        if (k < 0) {
+            if (v != RAY_NULL_OBJ) ray_release(v);
+            ray_release(keys); ray_release(vals);
+            return ray_error("oom", NULL);
+        }
+        ray_t* nk = ray_vec_append(keys, &k);
+        if (RAY_IS_ERR(nk)) {   /* append consumed keys */
+            if (v != RAY_NULL_OBJ) ray_release(v);
+            ray_release(vals);
+            return nk;
+        }
+        keys = nk;
+        ray_t* nv = ray_list_append(vals, v);
         if (v != RAY_NULL_OBJ) ray_release(v);
-        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+        if (RAY_IS_ERR(nv)) { ray_release(keys); return nv; }
+        vals = nv;
     }
     return ray_dict_new(keys, vals);
 }

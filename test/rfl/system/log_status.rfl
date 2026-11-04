@@ -1,13 +1,14 @@
 ;; (.log.status) at top level, no journal open: the dict is returned, never
 ;; an error.
 (type (.log.status)) -- 'DICT
-(count (.log.status)) -- 5
-(key (.log.status)) -- [open path mode bytes auto]
+(count (.log.status)) -- 6
+(key (.log.status)) -- [open opened_ok path mode bytes auto]
 (get (.log.status) 'open) -- false
 (get (.log.status) 'bytes) -- 0
 (get (.log.status) 'auto) -- false
-;; path and mode are null only in a process that never opened a journal; the
-;; test runner shares one process with the journal tests, so they are not
-;; pinned here (test_journal.c covers the opened states).
+;; opened_ok, path and mode describe the last successful open; the test
+;; runner shares one process with the journal tests, so they are not pinned
+;; here (test_journal.c covers the never-opened, failed-open and opened
+;; states).
 ;; outside a journal the read-only builtin is also fine in a lambda
 ((fn [] (get (.log.status) 'open))) -- false

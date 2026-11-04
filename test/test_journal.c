@@ -42,6 +42,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include <stdint.h>
 #include <fcntl.h>
 #if defined(_WIN32)
@@ -2227,19 +2230,28 @@ static test_result_t test_ops_auto_journal_eval_predicate(void) {
     PASS();
 }
 
-/* 22qb. (.log.status): the journal state as a dict.  Before any open it
- * reports open=false with null path/mode; after an open it carries the
- * active path, the mode and the byte size; a roll keeps the active file
- * name; a roll that loses its handle past the close (forced here with a
- * 1-byte RLIMIT_FSIZE, so the new log's preamble cannot be written) leaves
- * open=false while the path and mode stay; a close keeps them too. */
+/* 22qb. (.log.status): the journal state as a dict.  `path` and `mode` are
+ * the last SUCCESSFULLY opened journal and `opened_ok` says whether there
+ * was one.  Covered here: a failed first open (open=false, opened_ok=false,
+ * path/mode null), an open, a roll, a failed open of another base that must
+ * not replace the remembered one, a close, and a roll that loses its handle
+ * past the close (open=false, opened_ok=true, path = last successful).  The
+ * last one needs a 1-byte RLIMIT_FSIZE so the new log's preamble cannot be
+ * written; that, and the SIGXFSZ it raises, are confined to a forked child
+ * so the shared test process never changes its limit or signal disposition. */
 static ray_t* status_field(ray_t* d, const char* name) {
     if (!d || RAY_IS_ERR(d) || d->type != RAY_DICT) return NULL;
     return ray_dict_probe_sym_borrowed(d, ray_sym_intern(name, strlen(name)));
 }
-static bool status_open(ray_t* d) {
-    ray_t* v = status_field(d, "open");
+static bool status_flag(ray_t* d, const char* name) {
+    ray_t* v = status_field(d, name);
     return v && v->type == -RAY_BOOL && v->b8;
+}
+static bool status_open(ray_t* d) { return status_flag(d, "open"); }
+static bool status_opened_ok(ray_t* d) { return status_flag(d, "opened_ok"); }
+static bool status_is_null(ray_t* d, const char* name) {
+    ray_t* v = status_field(d, name);
+    return v && RAY_IS_NULL(v);
 }
 static bool status_path_is(ray_t* d, const char* want) {
     ray_t* v = status_field(d, "path");
@@ -2259,27 +2271,76 @@ static void status_free(ray_t* r) {
     if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
 }
 
+#ifndef _WIN32
+/* Child half of the failed-roll case.  Returns 0 or the number of the first
+ * failed check. */
+static int status_lost_roll_child(const char* want, const char* bad_src) {
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_FSIZE, &lim) != 0) return 1;
+    lim.rlim_cur = 1;
+    if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) return 2;
+    if (setrlimit(RLIMIT_FSIZE, &lim) != 0) return 3;
+    ray_t* rr = ray_eval_str("(.log.roll)");
+    bool roll_err = rr && RAY_IS_ERR(rr);
+    status_free(rr);
+    if (!roll_err) return 4;
+    ray_t* s = ray_eval_str("(.log.status)");
+    bool lost = !status_open(s) && status_opened_ok(s) && status_path_is(s, want)
+                && status_mode_is(s, "async") && status_bytes(s) == 0;
+    status_free(s);
+    if (!lost) return 5;
+    ray_t* w = ray_eval_str("(.log.write 1)");
+    bool w_err = w && RAY_IS_ERR(w);
+    status_free(w);
+    if (!w_err) return 6;
+    /* a failed open of another base leaves the remembered identity alone */
+    ray_t* b = ray_eval_str(bad_src);
+    bool b_err = b && RAY_IS_ERR(b);
+    status_free(b);
+    if (!b_err) return 7;
+    s = ray_eval_str("(.log.status)");
+    bool kept = !status_open(s) && status_opened_ok(s) && status_path_is(s, want)
+                && status_mode_is(s, "async");
+    status_free(s);
+    return kept ? 0 : 8;
+}
+#endif
+
 static test_result_t test_ops_log_status(void) {
     char base[256]; make_base(base, sizeof(base), "ops_status");
     char want[300]; snprintf(want, sizeof(want), "%s.log", base);
+    char src[400], bad_src[400];
+    snprintf(bad_src, sizeof(bad_src), "(.log.open 'sync \"%s_nodir/x/y\")", base);
 
-    /* No journal is open (earlier tests in this process may have left a
-     * last path and mode behind, so null path/mode is left to
-     * rfl/system/log_status.rfl, which runs in a fresh process). */
-    ray_journal_close();
+    /* Reset the process-wide journal state that earlier tests may have
+     * left: a purge forgets the last successful identity. */
+    if (ray_journal_is_open()) ray_journal_close();
+    snprintf(src, sizeof(src), "(.log.open 'async \"%s\")", base);
+    ray_t* pre = ray_eval_str(src);
+    status_free(pre);
+    ray_journal_purge();
+
     ray_t* s0 = ray_eval_str("(.log.status)");
-    bool s0_shape = s0 && !RAY_IS_ERR(s0) && s0->type == RAY_DICT && ray_dict_len(s0) == 5;
-    bool s0_closed = !status_open(s0) && status_bytes(s0) == 0;
+    bool s0_shape = s0 && !RAY_IS_ERR(s0) && s0->type == RAY_DICT && ray_dict_len(s0) == 6;
+    bool s0_closed = !status_open(s0) && !status_opened_ok(s0) && status_bytes(s0) == 0
+                     && status_is_null(s0, "path") && status_is_null(s0, "mode");
     status_free(s0);
 
-    char src[400];
-    snprintf(src, sizeof(src), "(.log.open 'async \"%s\")", base);
+    /* A failed first open does not report an identity. */
+    ray_t* f = ray_eval_str(bad_src);
+    bool f_err = f && RAY_IS_ERR(f);
+    status_free(f);
+    ray_t* sf = ray_eval_str("(.log.status)");
+    bool sf_none = !status_open(sf) && !status_opened_ok(sf)
+                   && status_is_null(sf, "path") && status_is_null(sf, "mode");
+    status_free(sf);
+
     ray_t* o = ray_eval_str(src);
     bool open_ok = o && !RAY_IS_ERR(o);
     status_free(o);
     ray_t* s1 = ray_eval_str("(.log.status)");
-    bool s1_open = status_open(s1) && status_path_is(s1, want) && status_mode_is(s1, "async")
-                   && status_bytes(s1) > 0;
+    bool s1_open = status_open(s1) && status_opened_ok(s1) && status_path_is(s1, want)
+                   && status_mode_is(s1, "async") && status_bytes(s1) > 0;
     status_free(s1);
 
     /* A successful roll leaves the same active file, open, and fresh. */
@@ -2290,46 +2351,45 @@ static test_result_t test_ops_log_status(void) {
     bool s2_open = status_open(s2) && status_path_is(s2, want);
     status_free(s2);
 
-    /* Force the roll to fail past the close: the archive rename succeeds,
-     * the new log cannot be created because its preamble exceeds the file
-     * size limit. */
-    struct rlimit old, lim;
-    bool forced = false, s3_lost = false, roll_err = false, w_err = false;
-    signal(SIGXFSZ, SIG_IGN);
-    if (getrlimit(RLIMIT_FSIZE, &old) == 0) {
-        lim = old; lim.rlim_cur = 1;
-        if (setrlimit(RLIMIT_FSIZE, &lim) == 0) {
-            forced = true;
-            ray_t* rr = ray_eval_str("(.log.roll)");
-            roll_err = rr && RAY_IS_ERR(rr);
-            status_free(rr);
-            setrlimit(RLIMIT_FSIZE, &old);
-            ray_t* s3 = ray_eval_str("(.log.status)");
-            s3_lost = !status_open(s3) && status_path_is(s3, want) && status_mode_is(s3, "async")
-                      && status_bytes(s3) == 0;
-            status_free(s3);
-            ray_t* w = ray_eval_str("(.log.write 1)");
-            w_err = w && RAY_IS_ERR(w);
-            status_free(w);
-        }
+    /* Failed roll past the close, in a child process. */
+    bool forked = false, child_ok = false;
+    int child_rc = -1;
+#ifndef _WIN32
+    pid_t pid = fork();
+    if (pid == 0) _exit(status_lost_roll_child(want, bad_src));
+    if (pid > 0) {
+        int st = 0;
+        forked = waitpid(pid, &st, 0) == pid;
+        if (forked && WIFEXITED(st)) { child_rc = WEXITSTATUS(st); child_ok = child_rc == 0; }
     }
+#else
+    forked = child_ok = true;   /* RLIMIT_FSIZE injection is POSIX only */
+#endif
+
+    /* The parent's journal and limits are untouched by the child. */
+    ray_t* s3 = ray_eval_str("(.log.status)");
+    bool s3_open = status_open(s3) && status_opened_ok(s3);
+    status_free(s3);
 
     ray_journal_close();
     ray_t* s4 = ray_eval_str("(.log.status)");
-    bool s4_closed = !status_open(s4) && status_path_is(s4, want);
+    bool s4_closed = !status_open(s4) && status_opened_ok(s4) && status_path_is(s4, want)
+                     && status_mode_is(s4, "async");
     status_free(s4);
 
     cleanup_base(base);
     TEST_ASSERT_TRUE(s0_shape);
     TEST_ASSERT_TRUE(s0_closed);
+    TEST_ASSERT_TRUE(f_err);
+    TEST_ASSERT_TRUE(sf_none);
     TEST_ASSERT_TRUE(open_ok);
     TEST_ASSERT_TRUE(s1_open);
     TEST_ASSERT_TRUE(roll_ok);
     TEST_ASSERT_TRUE(s2_open);
-    TEST_ASSERT_TRUE(forced);
-    TEST_ASSERT_TRUE(roll_err);
-    TEST_ASSERT_TRUE(s3_lost);
-    TEST_ASSERT_TRUE(w_err);
+    TEST_ASSERT_TRUE(forked);
+    TEST_ASSERT_EQ_I(child_rc, 0);
+    TEST_ASSERT_TRUE(child_ok);
+    TEST_ASSERT_TRUE(s3_open);
     TEST_ASSERT_TRUE(s4_closed);
     PASS();
 }

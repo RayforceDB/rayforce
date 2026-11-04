@@ -46,28 +46,31 @@ The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup an
 
 ## `.log.status` { #log-status }
 
-Signature: `(.log.status)`. Returns a dict describing the journal; read-only, never raises, and answers the same way when no journal was ever opened.
+Signature: `(.log.status)`. Returns a dict describing the journal; read-only, and answers the same way when no journal was ever opened. It raises only if allocating the result (or interning a symbol) fails.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `open` | bool | a journal handle is present, i.e. writes and auto-journaled requests are being appended |
-| `path` | string, or null | the active log file (`<base>.log`); null if no journal was opened |
-| `mode` | sym, or null | `'sync` or `'async`; null if no journal was opened |
-| `bytes` | i64 | size of the active log in bytes, `0` when `open` is false |
+| `open` | bool | a journal handle is present, i.e. writes and auto-journaled requests are being appended. A handle, not proof that the last append reached the disk |
+| `opened_ok` | bool | a journal was opened successfully at least once in this process; false after a failed first open, and after [`.log.purge`](#log-purge) |
+| `path` | string, or null | the last **successfully** opened log file (`<base>.log`); null if there was none |
+| `mode` | sym, or null | `'sync` or `'async` of that journal; null if there was none |
+| `bytes` | i64, or null | size of the active log in bytes; `0` when `open` is false, null if the size could not be read |
 | `auto` | bool | the current evaluation runs inside an auto-journaled IPC request (same value as [`.ipc.auto_journal_eval`](#log-write)) |
 
-`path` and `mode` keep the values of the last journal after `.log.close`, and after a `.log.roll` that failed once the old file was closed (for example the new log could not be created: disk full, out of file descriptors). In that second case the process has no journal handle, sync requests are no longer journaled, and `.log.sync` still returns null; `open` is the only way to see it. An embedder that must not run unjournaled can check it and stop:
+`path` and `mode` are committed only when an open succeeds. A failed `.log.open` therefore never reports an identity (`opened_ok` stays false, `path` and `mode` stay null) and never replaces the remembered one. They keep the values of the last successful journal after `.log.close`, and after a `.log.roll` that failed once the old file was closed (for example the new log could not be created: disk full, out of file descriptors). In that second case the process has no journal handle, sync requests are no longer journaled, and `.log.sync` still returns null; `open` is false while `opened_ok` is true. An embedder that must not run unjournaled can check it and stop:
 
 ```lisp
 (if (get (.log.status) 'open) null (exit 1))
 ```
 
+The getter only reports. Whether a request is acknowledged while the journal is down is a separate IPC policy.
+
 ```lisp
 (.log.status)
-;; {open:false path:null mode:null bytes:0 auto:false}
+;; {open:false opened_ok:false path:null mode:null bytes:0 auto:false}
 (.log.open 'async "/tmp/rayforce-journal")
 (.log.status)
-;; {open:true path:"/tmp/rayforce-journal.log" mode:async bytes:16 auto:false}
+;; {open:true opened_ok:true path:"/tmp/rayforce-journal.log" mode:async bytes:16 auto:false}
 (.log.close)
 ```
 
