@@ -3463,7 +3463,60 @@ static test_result_t test_ipc_oversize_shared_value_refused(void) {
     PASS();
 }
 
+/* Loopback replies are uncompressed here. The framing test separately
+ * forces compression on the oversized logical value. */
+static test_result_t test_ipc_oversize_response_error(void) {
+    const char* expr = "(take 65 (enlist (take 4194304 0x00)))";
+    ray_t* local = ray_eval_str(expr);
+    bool oversized = local && !RAY_IS_ERR(local) &&
+                     ray_serde_size(local) > RAY_IPC_BODY_MAX_BYTES;
+    if (RAY_IS_ERR(local)) ray_error_free(local);
+    else if (local) ray_release(local);
+    TEST_ASSERT_TRUE(oversized);
+
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    if (h < 0) {
+        ray_test_server_stop(&srv);
+        TEST_ASSERT(false, "connect for oversized response");
+    }
+    ray_t* q = ray_str(expr, strlen(expr));
+    if (!q || RAY_IS_ERR(q)) {
+        if (RAY_IS_ERR(q)) ray_error_free(q);
+        ray_ipc_close(h);
+        ray_test_server_stop(&srv);
+        TEST_ASSERT(false, "allocate oversized response request");
+    }
+    ray_t* r = ray_ipc_send_timeout(h, q, 2000);
+    ray_release(q);
+    const char* msg = ray_error_msg();
+    bool limit_error = r && RAY_IS_ERR(r) &&
+                       strcmp(ray_err_code(r), "io") == 0 && msg &&
+                       strstr(msg, "256 MiB decoded payload limit") != NULL;
+    if (RAY_IS_ERR(r)) ray_error_free(r);
+    else if (r) ray_release(r);
+
+    /* A clean error response, not an oversized prefix or a closed stream:
+     * the same handle must still process its next request. */
+    q = ray_str("(+ 20 22)", 9);
+    bool healthy = false;
+    if (q && !RAY_IS_ERR(q)) {
+        r = ray_ipc_send_timeout(h, q, 2000);
+        healthy = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 42;
+        if (RAY_IS_ERR(r)) ray_error_free(r);
+        else if (r) ray_release(r);
+        ray_release(q);
+    } else if (RAY_IS_ERR(q)) ray_error_free(q);
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    TEST_ASSERT_TRUE(limit_error);
+    TEST_ASSERT_TRUE(healthy);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
+    { "ipc/oversize_response_error", test_ipc_oversize_response_error, ipc_setup, ipc_teardown },
     { "ipc/size_admission_boundaries", test_ipc_size_admission_boundaries, ipc_setup, ipc_teardown },
     { "ipc/oversize_shared_value_refused", test_ipc_oversize_shared_value_refused, ipc_setup, ipc_teardown },
     { "ipc/cancel_byte_on_idle_moved_link", test_ipc_cancel_byte_on_idle_moved_link, ipc_setup, ipc_teardown },
