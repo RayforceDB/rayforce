@@ -81,14 +81,22 @@ static void delta_fill(const uint64_t* v, int n, int T, uint64_t* d) {
     }
 }
 
+/* delta_fill's d, read in place: rows [L, a) take v on both sides, rows
+ * [a, e) the padding on the left; past e = n + L both sides are padding,
+ * so those deltas are 0 (then the minimum is 0). */
 int ray_enc_delta_width(const uint64_t* v, int n, ray_enc_kind_t k, uint64_t* dbase) {
     const int T = k.T, L = RAY_ENC_VEC / T;
     const uint64_t m = tmask(T);
-    uint64_t d[RAY_ENC_VEC];
-    delta_fill(v, n, T, d);
-    uint64_t mn = d[L], mx = 0;
-    for (int i = L; i < RAY_ENC_VEC; i++) if (d[i] < mn) mn = d[i];
-    for (int i = L; i < RAY_ENC_VEC; i++) { uint64_t r = (d[i] - mn) & m; if (r > mx) mx = r; }
+    const uint64_t last = n ? v[n - 1] & m : 0;
+    const int a = n > L ? n : L, e = n + L < RAY_ENC_VEC ? n + L : RAY_ENC_VEC;
+    uint64_t mn = 0, mx = 0;
+    if (e == RAY_ENC_VEC) {
+        mn = ~0ull;
+        for (int i = L; i < a; i++) { uint64_t d = (v[i] - v[i - L]) & m; mn = d < mn ? d : mn; }
+        for (int i = a; i < e; i++) { uint64_t d = (last - v[i - L]) & m; mn = d < mn ? d : mn; }
+    }
+    for (int i = L; i < a; i++) { uint64_t r = (((v[i] - v[i - L]) & m) - mn) & m; mx = r > mx ? r : mx; }
+    for (int i = a; i < e; i++) { uint64_t r = (((last - v[i - L]) & m) - mn) & m; mx = r > mx ? r : mx; }
     *dbase = mn;
     return ray_enc_bitlen(mx);
 }

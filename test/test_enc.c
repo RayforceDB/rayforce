@@ -472,6 +472,33 @@ static test_result_t test_layout_delta_partial(void) {
     PASS();
 }
 
+/* ray_enc_delta_width against the reference body at the lengths where the
+ * padding starts: before a lane row, inside the last one, at 1024. */
+static test_result_t test_delta_width_lengths(void) {
+    static const int Ts[4] = { 8, 16, 32, 64 };
+    static uint64_t v[RAY_ENC_VEC];
+    static uint8_t exp[8 + 8 * 128 + RAY_ENC_VEC * 8];
+    for (int a = 0; a < 4; a++) {
+        const int T = Ts[a], L = RAY_ENC_VEC / T;
+        const int ns[10] = { 1, L - 1, L, L + 1, 500, RAY_ENC_VEC - L - 1, RAY_ENC_VEC - L,
+                             RAY_ENC_VEC - L + 1, RAY_ENC_VEC - 1, RAY_ENC_VEC };
+        ray_enc_kind_t k = { (uint8_t)T, true, false };
+        for (int b = 0; b < 10; b++) {
+            const int n = ns[b] > 0 ? ns[b] : 1;
+            for (int d = 0; d < 2; d++) {
+                if (d) delta_data(v, n, T);
+                else for_data(v, n, T, -200, 1000, 0x9e37ull + (uint64_t)T * 1031 + (uint64_t)n);
+                int w; uint64_t db, rdb;
+                (void)ref_delta_body(v, n, T, exp, &w);
+                memcpy(&rdb, exp, 8);
+                TEST_ASSERT_FMT(ray_enc_delta_width(v, n, k, &db) == w && db == rdb,
+                                "T=%d n=%d data=%d", T, n, d);
+            }
+        }
+    }
+    PASS();
+}
+
 /* T=16, w=3, value 5 at lane 5 row 5: lane bits 15..17 straddle words 0 and 1. */
 static test_result_t test_pack_layout_straddle(void) {
     uint64_t u[RAY_ENC_VEC] = {0};
@@ -715,6 +742,7 @@ const test_entry_t enc_entries[] = {
     { "enc/for_width_signed_extremes",  test_for_width_signed_extremes,  enc_setup, enc_teardown },
     { "enc/for_width_narrow",           test_for_width_narrow,           enc_setup, enc_teardown },
     { "enc/delta_width_sorted",         test_delta_width_sorted,         enc_setup, enc_teardown },
+    { "enc/delta_width_lengths",        test_delta_width_lengths,        enc_setup, enc_teardown },
     { "enc/choose_const",               test_choose_const,               enc_setup, enc_teardown },
     { "enc/choose_rle_runs",            test_choose_rle_runs,            enc_setup, enc_teardown },
     { "enc/choose_for",                 test_choose_for,                 enc_setup, enc_teardown },
