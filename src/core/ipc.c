@@ -999,9 +999,6 @@ typedef struct {
      * and the request number it carries.  At most one is outstanding. */
     bool             cancel_unconfirmed;
     uint8_t          cancel_tag;
-    /* A server: a cancel byte was taken from this socket since the last
-     * reply, which that reply then confirms. */
-    bool             cancel_seen;
 } ray_ipc_conn_data_t;
 
 #ifdef RAY_IPC_XPORT
@@ -1469,15 +1466,29 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * line the same way).  Publish the active fd so a SIGURG for THIS
          * connection cancels this query. */
         ray_clear_interrupt();
-        g_ipc_oob_taken = 0;
+        /* An eval can dispatch another connection's request inside it
+         * (a sync send pumps its peer's frames while it waits), so the
+         * running request's cancel context is saved and given back: a
+         * byte taken in the nested request is that request's, and the
+         * outer one answers to its own byte again once it resumes. */
+        int prev_fd    = g_ipc_active_fd;
+        int prev_seq   = g_ipc_active_seq;
+        int prev_taken = g_ipc_oob_taken;
+        g_ipc_active_fd  = -1;
+        g_ipc_oob_taken  = 0;
         g_ipc_active_seq = cancel_seq;
-        g_ipc_active_fd = (int)sel->fd;
+        g_ipc_active_fd  = (int)sel->fd;
         result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
-        g_ipc_active_fd = -1;
-        g_ipc_active_seq = CANCEL_ANY;
+        g_ipc_active_fd  = -1;
         if (g_ipc_oob_taken) taken = 1;
+        g_ipc_oob_taken  = prev_taken;
+        g_ipc_active_seq = prev_seq;
+        g_ipc_active_fd  = prev_fd;
+        /* A byte for the outer request that came while the nested one ran
+         * raised its SIGURG then, against the nested connection: look again. */
+        if (prev_fd >= 0 && oob_cancel_for(prev_fd, prev_seq, &g_ipc_oob_taken))
+            ray_request_interrupt();
     }
-    if (taken) cd->cancel_seen = true;
 
     ipc_ctx_set(prev_handle, prev_poll);
     ray_eval_set_restricted(prev_restricted);
@@ -1496,11 +1507,9 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
             conn_tx_drain_blocking(poll, cur, -1) == 0)
             {
                 ray_ipc_conn_data_t* rcd = (ray_ipc_conn_data_t*)cur->data;
-                uint8_t ack = 0;
-                if (rcd && rcd->cancel_seen && cur->xport) {
-                    ack = RAY_IPC_FLAG_CANCEL_SEEN;
-                    rcd->cancel_seen = false;
-                }
+                /* `cd` may have been freed by the eval (it can close its own
+                 * connection), so only the revalidated one is touched. */
+                uint8_t ack = (taken && cur->xport) ? RAY_IPC_FLAG_CANCEL_SEEN : 0;
                 send_response(cur, result,
                               rcd ? rcd->compress_threshold
                                   : ray_ipc_link_threshold((ray_sock_t)cur->fd),
