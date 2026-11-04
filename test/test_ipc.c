@@ -3490,10 +3490,10 @@ static test_result_t test_ipc_oversize_response_error(void) {
     }
     ray_t* r = ray_ipc_send_timeout(h, q, 2000);
     ray_release(q);
-    const char* msg = ray_error_msg();
-    bool limit_error = r && RAY_IS_ERR(r) &&
-                       strcmp(ray_err_code(r), "io") == 0 && msg &&
-                       strstr(msg, "256 MiB decoded payload limit") != NULL;
+    /* Native v3 error frames carry the code, not the thread-local message.
+     * The following same-handle request distinguishes a clean error reply
+     * from a peer rejecting an oversized frame and closing the stream. */
+    bool limit_error = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
     if (RAY_IS_ERR(r)) ray_error_free(r);
     else if (r) ray_release(r);
 
