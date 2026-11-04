@@ -3466,7 +3466,7 @@ static test_result_t test_ipc_oversize_shared_value_refused(void) {
 /* Loopback replies are uncompressed here. The framing test separately
  * forces compression on the oversized logical value. */
 static test_result_t test_ipc_oversize_response_error(void) {
-    const char* expr = "(take 65 (enlist (take 4194304 0x00)))";
+    const char* expr = "(take (enlist (take 0x00 4194304)) 65)";
     ray_t* local = ray_eval_str(expr);
     bool oversized = local && !RAY_IS_ERR(local) &&
                      ray_serde_size(local) > RAY_IPC_BODY_MAX_BYTES;
