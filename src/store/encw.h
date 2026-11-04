@@ -127,6 +127,8 @@ typedef struct {
     ray_sym_domain_raw_t sym_raw; bool sym_raw_ok;
     struct ray_symimp_s* sym_imp; int64_t sym_imp_count;   /* an import domain's dictionary */
     uint32_t* sym_pfx; int64_t sym_pfx_n;   /* every domain position's prefix, read once; NULL: per row */
+    /* ray_encw_set_sym_bounds: each vector's bounds by column vector, from where the strings were */
+    const uint32_t* sym_bmn; const uint32_t* sym_bmx; const uint8_t* sym_bhas;
 } ray_encw_t;
 /* index_kind RAY_IDX_DICT (P6b, spec "Writing the index"): the writer
  * builds the DICT region itself from the chunks it encodes and writes it at
@@ -173,6 +175,12 @@ void      ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s);
 /* A SYM column's domain (its codes are positions in it): the writer records
  * the string-prefix bounds of every chunk and vector (RAY_ENC_SYM_PFX). */
 void      ray_encw_set_sym_domain(ray_encw_t* w, ray_sym_domain_t* dom);
+/* After ray_encw_set_sym_domain: the bounds of every vector of the column,
+ * computed where its strings were (a converter's decode), so the writer
+ * reads no string for them.  Vector v (rows [v * RAY_ENC_VEC, + RAY_ENC_VEC))
+ * has bounds [mn[v], mx[v]] when has[v], none when it holds no non-null
+ * row.  Borrowed until finish. */
+void      ray_encw_set_sym_bounds(ray_encw_t* w, const uint32_t* mn, const uint32_t* mx, const uint8_t* has);
 /* Copy `len` bytes of an already validated region of `kind` verbatim (never
  * on a writer begun with RAY_IDX_DICT). */
 void      ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region, uint64_t len);

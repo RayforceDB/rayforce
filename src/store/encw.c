@@ -603,6 +603,11 @@ void ray_encw_set_sym_domain(ray_encw_t* w, ray_sym_domain_t* dom) {
     w->sym_imp_count = w->sym_imp ? ray_symimp_count(w->sym_imp) : 0;
 }
 
+void ray_encw_set_sym_bounds(ray_encw_t* w, const uint32_t* mn, const uint32_t* mx, const uint8_t* has) {
+    if (!w->sym_dom) return;
+    w->sym_bmn = mn; w->sym_bmx = mx; w->sym_bhas = has;
+}
+
 /* The first four bytes of a string, big-endian, zero-padded. */
 static inline uint32_t encw_pfx4(const char* p, size_t n) {
     uint32_t x = 0;
@@ -850,8 +855,11 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
         ray_enc_desc_t desc = w->vec.desc;
         desc.payload_off = w->chunk.len;
         if (w->sym_dom) {
-            uint32_t pmn, pmx;
-            if (encw_sym_vec_pfx(w, data, j * RAY_ENC_VEC, vn, &pmn, &pmx)) {
+            uint32_t pmn = 0, pmx = 0;
+            int64_t cv = w->chunk_i * RAY_ENC_VECS_PER_CHUNK + j;   /* the column's vector */
+            bool got = w->sym_bhas ? (pmn = w->sym_bmn[cv], pmx = w->sym_bmx[cv], w->sym_bhas[cv] != 0)
+                                   : encw_sym_vec_pfx(w, data, j * RAY_ENC_VEC, vn, &pmn, &pmx);
+            if (got) {
                 desc.rsv1 = pmn; desc.rsv2 = pmx;
                 desc.flags |= RAY_ENC_SYM_PFX;
                 if (!pfx_have || pmn < pfx_mn) pfx_mn = pmn;
@@ -946,6 +954,7 @@ static void encw_par_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
         int64_t c = x->first + i, n = x->len - c * RAY_ENC_CHUNK;
         if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
         encw_slot_t* s = &x->slot[i];
+        s->w.chunk_i = c;                            /* the chunk the body encodes */
         s->err = encw_chunk_body(&s->w, x->data + (size_t)c * RAY_ENC_CHUNK * x->esz, x->pool, n, &s->de);
     }
 }
@@ -960,7 +969,7 @@ static ray_err_t encw_next_serial(ray_encw_t* w, const char* d, size_t esz, cons
 ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool) {
     const char* d = (const char*)data;
     ray_err_t err = RAY_OK;
-    if (w->chunk_i == 0 && w->sym_dom && !w->sym_pfx) encw_sym_pfx_table(w, data);
+    if (w->chunk_i == 0 && w->sym_dom && !w->sym_pfx && !w->sym_bhas) encw_sym_pfx_table(w, data);
     /* chunk 0 trains the column's structures; STR's STR_DICT accumulator
      * and DICT index take entries in row order, so STR stays serial */
     while (err == RAY_OK && w->chunk_i < w->n_chunks && (w->chunk_i == 0 || w->type == RAY_STR))

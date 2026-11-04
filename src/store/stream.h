@@ -45,6 +45,10 @@ typedef struct {
     uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
     uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */
     ray_encw_t* ew;         /* ray_col_stream_chunked_begin: the column file's writer, chunks put as they come */
+    /* generation 2, SYM: the prefix bounds of every vector, borrowed from a
+     * converter that computed them from the strings (ray_encw_set_sym_bounds);
+     * NULL: the writer reads them from the domain */
+    const uint32_t* sym_bmn; const uint32_t* sym_bmx; const uint8_t* sym_bhas;
 } ray_col_stream_t;
 
 /* gen 0 writes today's format; gen 2 stages the same raw payload and

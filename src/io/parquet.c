@@ -30,6 +30,7 @@
 #include "store/col.h"
 #include "store/colrange.h"
 #include "store/fileio.h"
+#include "store/enc.h"
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include <limits.h>
@@ -2575,12 +2576,25 @@ static uint32_t pq_dedup_id(pq_dedup* d, uint64_t h, const char* s, uint32_t len
     return (uint32_t)d->n;
 }
 
+/* A grouped symbol column's string-prefix bounds by column vector (the
+ * column writer's RAY_ENC_SYM_PFX, ray_encw_set_sym_bounds), made by its
+ * second decode from the strings it walks, so its close reads no string of
+ * the dictionary; the tasks of neighbouring row groups share the vectors at
+ * their edges.  has[v]: vector v holds a non-null row. */
+typedef struct {
+    _Atomic(uint32_t)* mn;
+    _Atomic(uint32_t)* mx;
+    _Atomic(uint8_t)* has;
+    int64_t n;
+} pq_symb;
+
 /* A worker's buffers for the pass's chunks, kept from one chunk to the
  * next: grown once, their pages warm, freed with the pass. */
 typedef struct {
     pq_dedup d;
     uint32_t* dmap; int64_t dcap;            /* dictionary index -> local id */
     ray_symgrp_res_t* res; uint32_t* map; int64_t rcap;
+    uint32_t* pfx;                           /* [rcap] second: string prefixes by local id */
     ray_t* vec;                              /* a batch of codes */
     char* wbuf;                              /* records on their way to the file, 2 PQ_GWBUF */
 } pq_gscratch;
@@ -2601,6 +2615,7 @@ typedef struct {
     uint64_t hmask;              /* the hashes kept (all but in a collision test) */
     bool counts, redo, trace;
     pq_gscratch* ws;             /* [nws], by worker */
+    pq_symb* sb;                 /* the column's vector bounds, or NULL: its writer reads the dictionary */
     int64_t nws;
     _Atomic(int64_t) rows, gens;
     _Atomic(int64_t) split[PQ_GS_N][4];
@@ -2619,6 +2634,10 @@ typedef struct {
     int64_t nres;                /* second: local ids the first decode made */
     ray_symgrp_res_t* res;       /* second: verdicts by local id */
     uint32_t* map;               /* second: positions by local id */
+    uint32_t* pfx;               /* second, w->sb: string prefixes by local id */
+    int64_t row;                 /* second: the column row the next code is */
+    int64_t bv;                  /* second, w->sb: the vector being bounded (-1 none), */
+    uint32_t bmn, bmx; bool bhave;   /*   its bounds so far */
     /* second, ROWS*: the task's records in two runs, [1] those later tasks
      * meet again, [0] the others (ray_symgrp_task_off) */
     int64_t cursor[2];           /* the next record's offset */
@@ -2703,6 +2722,11 @@ static bool pq_g2_first(pq_gtask* k, uint32_t local, uint64_t h, const char* s, 
         }
     } else return false;
     k->map[local] = (uint32_t)pos;
+    if (k->pfx) {   /* encw_pfx4: the first four bytes, big-endian, zero-padded */
+        uint32_t x = 0;
+        for (uint32_t i = 0; i < 4; i++) x = (x << 8) | (i < len ? (uint8_t)s[i] : 0u);
+        k->pfx[local] = x;
+    }
     return true;
 }
 
@@ -2725,10 +2749,42 @@ static bool pq_g_flush(pq_gtask* k) {
     k->ncodes = 0;
     return e == RAY_OK;
 }
+/* The task's bounds of vector k->bv into the column's: a vector at a row
+ * group's edge is shared with the neighbouring task. */
+static void pq_g_bound_merge(pq_gtask* k) {
+    pq_symb* b = k->w->sb;
+    if (!b || k->bv < 0 || !k->bhave) return;
+    uint32_t cur = atomic_load_explicit(&b->mn[k->bv],memory_order_relaxed);
+    while (k->bmn < cur && !atomic_compare_exchange_weak_explicit(&b->mn[k->bv],&cur,k->bmn,
+               memory_order_relaxed,memory_order_relaxed)) {}
+    cur = atomic_load_explicit(&b->mx[k->bv],memory_order_relaxed);
+    while (k->bmx > cur && !atomic_compare_exchange_weak_explicit(&b->mx[k->bv],&cur,k->bmx,
+               memory_order_relaxed,memory_order_relaxed)) {}
+    atomic_store_explicit(&b->has[k->bv],1,memory_order_relaxed);
+}
+
+/* `run` rows of local id `local` into the bounds of their vectors (local 0:
+ * the null symbol, bounding nothing). */
+static void pq_g_bound(pq_gtask* k, uint32_t local, int64_t run) {
+    while (run > 0) {
+        int64_t v = k->row / RAY_ENC_VEC, m = (v + 1) * RAY_ENC_VEC - k->row;
+        if (m > run) m = run;
+        if (v != k->bv) { pq_g_bound_merge(k); k->bv = v; k->bhave = false; }
+        if (local) {
+            uint32_t p = k->pfx[local];
+            if (!k->bhave || p < k->bmn) k->bmn = p;
+            if (!k->bhave || p > k->bmx) k->bmx = p;
+            k->bhave = true;
+        }
+        k->row += m; run -= m;
+    }
+}
+
 /* `run` rows of local id `local`. */
 static bool pq_g_emit(pq_gtask* k, uint32_t local, int64_t run) {
     if (k->d.cnt) k->d.cnt[local] += (uint32_t)run;
     if (!k->second) return true;
+    if (k->pfx) pq_g_bound(k,local,run);
     uint32_t pos = k->map[local];
     while (run > 0) {
         int64_t room = PQ_BATCH-k->ncodes, m = run < room ? run : room;
@@ -2923,7 +2979,9 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
             ray_symgrp_res_t* res = ray_realloc_raw(ws->res,(size_t)(n+1)*sizeof(*res));
             if (res) ws->res = res;
             uint32_t* map = res ? ray_realloc_raw(ws->map,(size_t)(n+1)*sizeof(*map)) : NULL;
-            if (map) { ws->map = map; ws->rcap = n+1; }
+            if (map) ws->map = map;
+            uint32_t* pfx = map ? ray_realloc_raw(ws->pfx,(size_t)(n+1)*sizeof(*pfx)) : NULL;
+            if (pfx) { ws->pfx = pfx; ws->rcap = n+1; }
         }
         if (ws && !ws->vec) {
             ray_t* v = ray_sym_vec_new(RAY_SYM_W32,PQ_BATCH);
@@ -2931,7 +2989,8 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
             else if (v) ray_release(v);
         }
         if (ws && !ws->wbuf) ws->wbuf = ray_alloc_raw((size_t)PQ_GWBUF*2);
-        if (ws && ws->rcap >= n+1) { k.res = ws->res; k.map = ws->map; }
+        if (ws && ws->rcap >= n+1) { k.res = ws->res; k.map = ws->map; k.pfx = w->sb ? ws->pfx : NULL; }
+        k.row = dw->offsets[g]; k.bv = -1;
         if (ws) { k.vec = ws->vec; k.wbuf[0] = ws->wbuf; k.wbuf[1] = ws->wbuf ? ws->wbuf + PQ_GWBUF : NULL; }
         if (!err && (!ws || !k.res || !k.map || !k.vec || !k.wbuf[0] || !pq_dedup_reset(&k.d,w->acap,false)))
             err = "symbol code allocation failed";
@@ -2965,6 +3024,7 @@ static void pq_g2_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
             if (err) bad = w->c;
         }
         if (!err && !pq_g_wflush(&k)) err = "symbol file write failed";
+        if (!err) pq_g_bound_merge(&k);
         io2 = pq_tio_now(w->trace);
         if (!err && !pq_g_flush(&k)) err = "native column write failed";
         if (!err && dw->writeback && dw->writers[w->c].gen != 2) {
@@ -3004,11 +3064,32 @@ static void pq_io_print(const char* phase, pq_io_t a, pq_io_t b, int64_t t0, int
 }
 
 /* One symbol column, grouped: errors land in dw->errors by row group. */
+static void pq_symb_free(pq_symb* b) {
+    ray_free_raw((void*)b->mn); ray_free_raw((void*)b->mx); ray_free_raw((void*)b->has);
+    memset(b,0,sizeof(*b));
+}
+
+/* Bounds for a column of `rows` rows: false (none, the writer reads them
+ * from the dictionary) when out of memory. */
+static bool pq_symb_init(pq_symb* b, int64_t rows) {
+    memset(b,0,sizeof(*b));
+    int64_t n = (rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
+    b->mn = ray_alloc_raw((size_t)(n+1)*sizeof(*b->mn));
+    b->mx = ray_alloc_raw((size_t)(n+1)*sizeof(*b->mx));
+    b->has = ray_alloc_raw((size_t)(n+1)*sizeof(*b->has));
+    if (!b->mn || !b->mx || !b->has) { pq_symb_free(b); return false; }
+    for (int64_t v = 0; v < n; v++) {
+        atomic_init(&b->mn[v],UINT32_MAX); atomic_init(&b->mx[v],0); atomic_init(&b->has[v],0);
+    }
+    b->n = n;
+    return true;
+}
+
 static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* imp, int64_t c,
-                           int groups, int64_t budget, int64_t workers, bool trace) {
+                           int groups, int64_t budget, int64_t workers, bool trace, pq_symb* sb) {
     ray_parquet_t* r = dw->parent;
     ray_pool_t* pool = ray_pool_get();
-    pq_gwork w = {.dw = dw, .c = c, .g = g, .imp = imp, .hmask = UINT64_MAX};
+    pq_gwork w = {.dw = dw, .c = c, .g = g, .imp = imp, .hmask = UINT64_MAX, .sb = sb};
     w.acap = budget/4/workers;
     if (w.acap < ((int64_t)4 << 20)) w.acap = (int64_t)4 << 20;
     w.counts = ray_symgrp_order(g) == RAY_SYMGRP_FREQ;
@@ -3119,7 +3200,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
 out:
     for (int64_t i = 0; i < w.nws; i++) {
         pq_gscratch* s = &w.ws[i];
-        pq_dedup_free(&s->d); ray_free_raw(s->dmap); ray_free_raw(s->res); ray_free_raw(s->map);
+        pq_dedup_free(&s->d); ray_free_raw(s->dmap); ray_free_raw(s->res); ray_free_raw(s->map); ray_free_raw(s->pfx);
         ray_free_raw(s->wbuf);
         if (s->vec) ray_release(s->vec);
     }
@@ -3213,6 +3294,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     bool sym_running = false;
     pq_chunked* chk = NULL;   /* [ncols] the pass's chunked columns (pq_direct_work.chunked) */
     pq_cbuf* cbuf = NULL;     /* [nspare] pq_direct_work.cbuf */
+    pq_symb psb = {0};   /* the grouped pass column's vector bounds (pq_symb) */
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !pick || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
@@ -3507,7 +3589,17 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
                 int64_t need = (ray_symgrp_entries(pg) + r->rows) * 24;
                 while (groups < RAY_SYMGRP_MAX && need / groups > budget / 4) groups *= 2;
             }
-            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,budget,workers,trace);
+            /* the column's prefix bounds from the strings the second decode
+             * walks; RAY_PQ_SYM_BOUNDS=dict leaves them to its writer, which
+             * reads each code's string from the dictionary */
+            ray_col_stream_t* sw = &writers[work.pass[0]];
+            const char* be = getenv("RAY_PQ_SYM_BOUNDS");
+            bool bounds = sw->gen == 2 && !(be && !strcmp(be,"dict")) && pq_symb_init(&psb,r->rows);
+            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,budget,workers,trace,bounds ? &psb : NULL);
+            if (bounds) {
+                sw->sym_bmn = (const uint32_t*)psb.mn; sw->sym_bmx = (const uint32_t*)psb.mx;
+                sw->sym_bhas = (const uint8_t*)psb.has;
+            }
         } else if (tasks > 0) {
             /* the pass's chunked columns, trained before their row groups go */
             int64_t nchk = 0, per = 0, gmax = 0;
@@ -3595,8 +3687,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
              * all the same. */
             if (all || (writers[c].type == RAY_SYM && writers[c].gen != 2)) continue;
             ray_err_t e = ray_col_stream_close(&writers[c],false);
+            writers[c].sym_bmn = writers[c].sym_bmx = NULL; writers[c].sym_bhas = NULL;
             if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
         }
+        pq_symb_free(&psb);
         /* the workers' page and dictionary buffers grown past PQ_SPARE_MAX
          * for this pass's columns go with the pass */
         for (int64_t i = 0; i < nspare; i++) {
@@ -3652,6 +3746,8 @@ done:
     ray_free_raw(chk);
     ray_free_raw(fdoms);
     ray_symgrp_free(sgrp);
+    for (int64_t c = 0; c < r->ncols; c++) { writers[c].sym_bmn = writers[c].sym_bmx = NULL; writers[c].sym_bhas = NULL; }
+    pq_symb_free(&psb);
     return err;
 }
 static void pq_release_doms(ray_sym_domain_t** doms, int64_t n) {
