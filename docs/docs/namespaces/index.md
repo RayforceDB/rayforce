@@ -13,7 +13,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.fs.*`](fs.md) | Filesystem metadata: `size`, `list`. |
 | [`.graph.*`](graph.md) | Graph builders and algorithms (PageRank, Louvain, Dijkstra, MST, BFS/DFS, expand, …). |
 | [`.idx.*`](idx.md) | Accelerator indexes: bloom, hash, sort, zone. |
-| [`.ipc.*`](ipc.md) | TCP client IPC and the server connection-hook accessor. |
+| [`.ipc.*`](ipc.md) | Client IPC (TCP, moving to shared memory or RDMA when both sides can), the transport policy, and the server connection-hook accessor. |
 | [`.log.*`](log.md) | Write-ahead log: open, write, sync, snapshot, roll, replay, validate. |
 | [`.mem.*`](mem.md) | Value sizing and scoped time/allocation measurement. |
 | [`.os.*`](os.md) | Process environment: `getenv`, `setenv`. |
@@ -28,7 +28,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 
 - `.csv.read`, `.csv.write`, `.csv.splayed`, `.csv.parted`
 - `.db.splayed.set`, `.db.parted.fill`
-- `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post`
+- `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post`, `.ipc.txlimit`, `.ipc.transport`
 - `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
 - `.os.getenv`, `.os.setenv`
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
