@@ -4097,9 +4097,8 @@ static void binary_range_str(ray_op_t* op, ray_t* lhs, ray_t* rhs, ray_t* result
     if (!r_scalar) { str_resolve(rhs, &r_elems, &r_pool); r_elems += start; }
 
     /* For scalar side, build a single ray_str_t */
-    ray_str_t l_scalar_elem, r_scalar_elem;   /* a union: {0} zeroes only its first member */
-    memset(&l_scalar_elem, 0, sizeof l_scalar_elem);
-    memset(&r_scalar_elem, 0, sizeof r_scalar_elem);
+    // cppcheck-suppress UnionZeroInit // the first member, {len, data[12]}, is all 16 bytes of the union
+    ray_str_t l_scalar_elem = {0}, r_scalar_elem = {0};
     const char* l_scalar_pool = NULL;
     const char* r_scalar_pool = NULL;
     if (l_scalar) {

@@ -601,7 +601,7 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
         }
         ray_t* tbl = names
-            // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
+            // cppcheck-suppress uninitvar // col_types is filled for all ncols (<= 256, checked above); col_names only when names is set, the only case it is passed
             ? ray_read_csv_named_opts(path, 0, false, col_types, (int32_t)ncols,
                                       col_names, (int32_t)ncols)
             : ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
