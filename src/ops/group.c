@@ -2834,7 +2834,8 @@ ray_t* ray_median_per_group_buf(ray_t* src,
                                 const int64_t* offsets,
                                 const int64_t* grp_cnt,
                                 int64_t n_groups) {
-    return rank_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups, 0.0, false);
+    ray_t* r = rank_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups, 0.0, false);
+    return src && src->type == RAY_TIMESPAN ? ray_timespan_of_f64_vec(r) : r;
 }
 
 ray_t* ray_quantile_per_group_buf(ray_t* src,
@@ -2843,7 +2844,8 @@ ray_t* ray_quantile_per_group_buf(ray_t* src,
                                   const int64_t* grp_cnt,
                                   int64_t n_groups,
                                   double q) {
-    return rank_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups, q, true);
+    ray_t* r = rank_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups, q, true);
+    return src && src->type == RAY_TIMESPAN ? ray_timespan_of_f64_vec(r) : r;
 }
 
 static uint64_t mode_hash_cap(int64_t n) {
@@ -4373,7 +4375,11 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
         /* COUNT returns total length including nulls — matches ray_count_fn's
          * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
         case OP_COUNT: return ray_i64(scan_n);
-        case OP_AVG:   return m->cnt > 0 ? ray_f64(ray_f64_fin(fp ? m->sum_f / m->cnt : ray_i128_to_f64(m->sum_hi, (uint64_t)m->sum_i) / m->cnt)) : ray_typed_null(-RAY_F64);
+        case OP_AVG: {
+            ray_t* r = m->cnt > 0 ? ray_f64(ray_f64_fin(fp ? m->sum_f / m->cnt : ray_i128_to_f64(m->sum_hi, (uint64_t)m->sum_i) / m->cnt)) : ray_typed_null(-RAY_F64);
+            /* the mean of durations is a duration */
+            return in_type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
+        }
         case OP_FIRST: return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->first_f) : reduction_i64_result(m->first_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_LAST:  return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->last_f) : reduction_i64_result(m->last_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_VAR: case OP_VAR_POP:
@@ -4389,7 +4395,10 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
             else if (opcode == OP_VAR) val = var_pop * m->cnt / (m->cnt - 1);
             else if (opcode == OP_STDDEV_POP) val = sqrt(var_pop);
             else val = sqrt(var_pop * m->cnt / (m->cnt - 1));
-            return ray_f64(ray_f64_fin(val));
+            ray_t* r = ray_f64(ray_f64_fin(val));
+            /* the standard deviation of durations is a duration */
+            return in_type == RAY_TIMESPAN && (opcode == OP_STDDEV || opcode == OP_STDDEV_POP)
+                   ? ray_timespan_of_f64_atom(r) : r;
         }
         default:       return ray_error("nyi", NULL);
     }
@@ -13123,7 +13132,7 @@ static ray_t* group_const_inputs_check(ray_graph_t* g, ray_op_ext_t* ext, ray_t*
     return NULL;
 }
 
-ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
+static ray_t* exec_group_core(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
     ray_dict_cd_clear();
     /* Save the outer group-key cardinality hint and publish a fresh empty one
      * for this group (nest-safe, mirrors proj_keep in query.c); restore it on
@@ -13369,6 +13378,39 @@ grp_done:
         memcpy(gvm->grp_card_val, sv_grp_val, sizeof sv_grp_val);
     }
     return result;
+}
+
+/* The mean and the standard deviation of durations are durations.  The grouping
+ * engines accumulate and emit them as F64 nanoseconds; the AVG, STDDEV and
+ * STDDEV_POP columns of a TIMESPAN input are rounded to
+ * a TIMESPAN column here, once, whichever engine produced it.  Output columns
+ * are the keys followed by the aggregates, in order.  (MEDIAN comes out of
+ * ray_median_per_group_buf already typed.) */
+static ray_t* group_retag_duration_means(ray_graph_t* g, ray_op_t* op, ray_t* result) {
+    if (!result || RAY_IS_ERR(result) || result->type != RAY_TABLE) return result;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return result;
+    int64_t ncols = ray_table_ncols(result);
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        uint16_t aop = ext->agg_ops[a];
+        if (aop != OP_AVG && aop != OP_STDDEV && aop != OP_STDDEV_POP) continue;
+        ray_op_t* in = op_node(g, ext->agg_ins[a]);
+        if (!in || in->out_type != RAY_TIMESPAN) continue;
+        int64_t ci = (int64_t)ext->n_keys + a;
+        if (ci >= ncols) continue;
+        ray_t* col = ray_table_col_idx(result, ci);
+        if (!col || RAY_IS_ERR(col) || col->type != RAY_F64) continue;
+        ray_retain(col);
+        ray_t* ts = ray_timespan_of_f64_vec(col);
+        if (!ts || RAY_IS_ERR(ts)) { if (ts) ray_error_free(ts); continue; }
+        ray_table_set_col_idx(result, ci, ts);
+        ray_release(ts);
+    }
+    return result;
+}
+
+ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
+    return group_retag_duration_means(g, op, exec_group_core(g, op, tbl, group_limit));
 }
 
 /* ============================================================================

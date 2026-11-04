@@ -1450,7 +1450,7 @@ static test_result_t test_timespan_rank_admission(void) {
     PASS();
 }
 
-/* Native F64 nanoseconds, NULL publication, empty groups, explicit reversed
+/* Median and quantile as durations, NULL publication, empty groups, explicit reversed
  * row indices and an actual offset SLICE (not merely a negative TAKE). */
 static test_result_t test_timespan_rank_slice(void) {
     ray_t* parent = ray_eval_str("(as 'TIMESPAN [123 0Nl 1 2 0Nl -4 -1 0Nl 0Nl 456])");
@@ -1468,10 +1468,12 @@ static test_result_t test_timespan_rank_slice(void) {
                 ? ray_quantile_per_group_buf(slice, indexed ? reversed : identity, offsets, counts, 4, 0.25)
                 : ray_median_per_group_buf(slice, indexed ? reversed : identity, offsets, counts, 4);
             TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "duration rank slice result");
-            TEST_ASSERT_EQ_I(out->type, RAY_F64);
+            /* a median or quantile of durations is a duration, rounded half
+             * away from zero (1.25 -> 1, 1.5 -> 2, -2.5 and -3.25 -> -3) */
+            TEST_ASSERT_EQ_I(out->type, RAY_TIMESPAN);
             TEST_ASSERT_EQ_I(out->len, 4);
-            TEST_ASSERT_EQ_F(((double*)ray_data(out))[0], quantile ? 1.25 : 1.5, 0.0);
-            TEST_ASSERT_EQ_F(((double*)ray_data(out))[1], quantile ? -3.25 : -2.5, 0.0);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[0], quantile ? 1 : 2);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[1], -3);
             TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
             TEST_ASSERT_TRUE(ray_vec_is_null(out, 2));
             TEST_ASSERT_TRUE(ray_vec_is_null(out, 3));

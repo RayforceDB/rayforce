@@ -1,0 +1,41 @@
+;; The standard deviation of durations is a duration, rounded to the nanosecond;
+;; a variance is a squared duration and stays F64.
+(set S (enlist 0D01:00:00 0D02:00:00 0D00:30:00 0D04:00:00))
+(set N (as 'F64 (as 'I64 S)))
+
+;; scalar: the type, and the value against the F64 computation on the counts
+(type (dev S)) -- 'timespan
+(type (stddev S)) -- 'timespan
+(type (stddev_pop S)) -- 'timespan
+(<= (abs (- (as 'I64 (dev S)) (as 'I64 (dev N)))) 1) -- true
+(<= (abs (- (as 'I64 (stddev S)) (as 'I64 (stddev N)))) 1) -- true
+(== (as 'I64 (dev S)) (as 'I64 (stddev_pop S))) -- true
+(type (var S)) -- 'f64
+(type (dev N)) -- 'f64
+
+;; nulls are skipped; too few values is a null duration
+(nil? (stddev (enlist 0D01:00:00))) -- true
+(type (stddev (enlist 0D01:00:00))) -- 'timespan
+(<= (abs (- (as 'I64 (stddev (enlist 0D01:00:00 0Nn 0D03:00:00))) 5091168824543)) 2) -- true
+
+;; moving deviation
+(type (mdev 2 S)) -- 'TIMESPAN
+(< (abs (- (as 'I64 (at (mdev 2 S) 1)) 1800000000000)) 1000000) -- true
+(< (abs (- (as 'I64 (at (mdev 2 S) 3)) 6300000000000)) 1000000) -- true
+(type (mdev 2 N)) -- 'F64
+
+;; queries: no key, keyed, update
+(set T (table [g sp] (list [1 1 1 2 2 2] (enlist 0D01:00:00 0D02:00:00 0D00:30:00 0D04:00:00 0D01:00:00 0D01:30:00))))
+(set V (table [g v] (list [1 1 1 2 2 2] (as 'F64 (as 'I64 (at T 'sp))))))
+(type (at (select {r: (dev sp) from: T}) 'r)) -- 'TIMESPAN
+(<= (abs (- (as 'I64 (at (select {r: (dev sp) from: T}) 'r)) (as 'I64 (at (select {r: (dev v) from: V}) 'r)))) 1) -- [true]
+(type (at (select {r: (stddev sp) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev sp) by: g from: T}) 'r)) -- 'TIMESPAN
+(all (<= (abs (- (as 'I64 (at (select {r: (stddev sp) by: g from: T}) 'r)) (as 'I64 (at (select {r: (stddev v) by: g from: V}) 'r)))) 1)) -- true
+(type (at (select {r: (dev sp) by: g from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (var sp) by: g from: T}) 'r)) -- 'F64
+(type (at (update {r: (stddev sp) from: T}) 'r)) -- 'TIMESPAN
+
+;; a lazy intermediate keeps the type; floats are unchanged
+(type (stddev (lag S))) -- 'timespan
+(type (at (select {r: (dev v) from: V}) 'r)) -- 'F64

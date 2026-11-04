@@ -802,6 +802,45 @@ ray_t* ray_any_fn(ray_t* x) {
     return agg_truth_vec(x, 0);
 }
 
+/* The mean and median of durations are durations: the F64 the numeric kernels
+ * answer (a count of nanoseconds) is rounded back to a TIMESPAN, half away
+ * from zero.  A value outside the int64 range cannot be a duration and reads
+ * as null, as does a NaN (the all-null answer). */
+static int64_t f64_to_timespan_ns(double v) {
+    if (v != v || v >= 9223372036854775807.0 || v <= -9223372036854775807.0)
+        return NULL_I64;
+    return (int64_t)llround(v);
+}
+
+/* Consumes `r`, an F64 atom, and answers the TIMESPAN atom of the same value
+ * (errors pass through). */
+ray_t* ray_timespan_of_f64_atom(ray_t* r) {
+    if (!r || RAY_IS_ERR(r) || r->type != -RAY_F64) return r;
+    int64_t ns = RAY_ATOM_IS_NULL(r) ? NULL_I64 : f64_to_timespan_ns(r->f64);
+    ray_release(r);
+    return ns == NULL_I64 ? ray_typed_null(-RAY_TIMESPAN) : ray_timespan(ns);
+}
+
+/* Consumes `col`, an F64 vector, and answers the TIMESPAN vector of the same
+ * values; null cells stay null. */
+ray_t* ray_timespan_of_f64_vec(ray_t* col) {
+    if (!col || RAY_IS_ERR(col) || col->type != RAY_F64) return col;
+    int64_t n = col->len;
+    ray_t* out = ray_vec_new(RAY_TIMESPAN, n);
+    if (!out || RAY_IS_ERR(out)) { ray_release(col); return out ? out : ray_error("oom", NULL); }
+    out->len = n;
+    const double* src = (const double*)ray_data(col);
+    int64_t* dst = (int64_t*)ray_data(out);
+    bool nulls = false;
+    for (int64_t i = 0; i < n; i++) {
+        dst[i] = ray_vec_is_null(col, i) ? NULL_I64 : f64_to_timespan_ns(src[i]);
+        nulls |= dst[i] == NULL_I64;
+    }
+    if (nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_release(col);
+    return out;
+}
+
 ray_t* ray_count_fn(ray_t* x) {
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_COUNT);
     if (x->type == RAY_TABLE) return make_i64(ray_table_nrows(x));
@@ -820,15 +859,15 @@ ray_t* ray_count_fn(ray_t* x) {
 }
 
 ray_t* ray_avg_fn(ray_t* x) {
-    if (x->type == -RAY_TIMESPAN)
-        return RAY_ATOM_IS_NULL(x) ? ray_typed_null(-RAY_F64) : ray_f64((double)x->i64);
+    if (x->type == -RAY_TIMESPAN) { ray_retain(x); return x; }
     if (x->type == RAY_TIMESPAN) {
         ray_t* counts = ray_vec_from_raw(RAY_I64, ray_data(x), x->len);
         if (RAY_IS_ERR(counts)) return counts;
         counts->attrs |= x->attrs & RAY_ATTR_HAS_NULLS;
         ray_t* result = ray_avg_fn(counts);
         ray_release(counts);
-        return result;
+        if (result && ray_is_lazy(result)) result = ray_lazy_materialize(result);
+        return ray_timespan_of_f64_atom(result);
     }
 
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_AVG);
@@ -1130,7 +1169,7 @@ static ray_t* vec_to_f64_scratch(ray_t* x, double** out_vals) {
     return scratch;
 }
 
-ray_t* ray_med_fn(ray_t* x) {
+static ray_t* med_f64(ray_t* x) {
     /* The dispatcher always materialises non-LAZY_AWARE fn args, so x
      * is already concrete here. */
     if (RAY_IS_ERR(x)) return x;
@@ -1190,6 +1229,15 @@ ray_t* ray_med_fn(ray_t* x) {
     }
     ray_release(scratch);
     return make_f64(median);
+}
+
+/* The median of durations is a duration, rounded to the nanosecond. */
+ray_t* ray_med_fn(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    /* the median of one duration is that duration (a null stays null) */
+    if (x->type == -RAY_TIMESPAN) { ray_retain(x); return x; }
+    ray_t* r = med_f64(x);
+    return x->type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
 }
 
 ray_t* ray_mode_fn(ray_t* x) {
@@ -1299,7 +1347,7 @@ double ray_quantile_dbl_inplace(double* a, int64_t n, double q) {
     return lower + frac * (upper - lower);
 }
 
-static ray_t* quantile_core(ray_t* x, double q, const char* name) {
+static ray_t* quantile_f64(ray_t* x, double q, const char* name) {
     if (RAY_IS_ERR(x)) return x;
     if (ray_is_atom(x)) {
         if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
@@ -1349,6 +1397,14 @@ static ray_t* quantile_core(ray_t* x, double q, const char* name) {
     return make_f64(v);
 }
 
+/* A quantile of durations is a duration, rounded to the nanosecond. */
+static ray_t* quantile_core(ray_t* x, double q, const char* name) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (x->type == -RAY_TIMESPAN) { ray_retain(x); return x; }
+    ray_t* r = quantile_f64(x, q, name);
+    return x->type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
+}
+
 ray_t* ray_quantile_fn(ray_t* x, ray_t* q_obj) {
     double q = 0.0;
     ray_t* err = quantile_prob_arg(q_obj, 1.0, "quantile", &q);
@@ -1386,7 +1442,14 @@ double ray_median_dbl_inplace(double* a, int64_t n) {
 }
 
 
-ray_t* ray_dev_fn(ray_t* x) { return var_stddev_core(x, 0, 1); }
+/* The standard deviation of durations is a duration (a variance is a squared
+ * duration and stays F64), rounded to the nanosecond. */
+static ray_t* stddev_core(ray_t* x, int sample) {
+    ray_t* r = var_stddev_core(x, sample, 1);
+    return x && x->type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
+}
+
+ray_t* ray_dev_fn(ray_t* x) { return stddev_core(x, 0); }
 
 /* Shared core for variance / stddev in sample or population mode.
  * sample=1 -> divide sum-of-squares by (n-1); sample=0 -> divide by n.
@@ -1443,8 +1506,8 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
     return make_f64(take_sqrt ? sqrt(v) : v);
 }
 
-ray_t* ray_stddev_fn(ray_t* x)     { return var_stddev_core(x, 1, 1); }
-ray_t* ray_stddev_pop_fn(ray_t* x) { return var_stddev_core(x, 0, 1); }
+ray_t* ray_stddev_fn(ray_t* x)     { return stddev_core(x, 1); }
+ray_t* ray_stddev_pop_fn(ray_t* x) { return stddev_core(x, 0); }
 ray_t* ray_var_fn(ray_t* x)        { return var_stddev_core(x, 1, 0); }
 ray_t* ray_var_pop_fn(ray_t* x)    { return var_stddev_core(x, 0, 0); }
 

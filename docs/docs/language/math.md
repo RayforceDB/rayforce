@@ -319,7 +319,9 @@ Number of elements. Counts total vector length, including nulls.
 
 ### `(avg x)` — aggregate
 
-Arithmetic mean.
+Arithmetic mean. The mean of a TIMESPAN vector is a TIMESPAN, rounded to the
+nanosecond (half away from zero); `avgs` and `mavg` of a TIMESPAN vector
+are TIMESPAN vectors as well.
 
 ```lisp
 (avg [2 4 6])  ; 4.0
@@ -349,17 +351,20 @@ Median value.
 (med [1 3 5 7 9])  ; 5.0
 ```
 
-For a TIMESPAN vector, the result is an F64 number of **nanoseconds**,
-including fractional nanoseconds for an even-sized input. `SELECT` uses the
-same result type; it does not round the median back into a duration.
+For a TIMESPAN vector, the median is a TIMESPAN: a median of durations is a
+duration. An even-sized input takes the midpoint of the two middle values,
+rounded to the nanosecond (half away from zero). `SELECT` uses the same result
+type, as do `quantile` and `percentile`.
 
 ```lisp
-(med [0D01:00:00 0D02:00:00])  ; 5400000000000.0
+(med [0D01:00:00 0D02:00:00])  ; 0D01:30:00.000000000
 ```
 
 ### `(dev x)` — aggregate
 
-Population standard deviation.
+Population standard deviation. The standard deviation of a TIMESPAN vector
+(`dev`, `stddev`, `stddev_pop`, `mdev`) is a TIMESPAN, rounded to the
+nanosecond; a variance of durations is a squared duration and stays F64.
 
 ```lisp
 (dev [2 4 4 4 5 5 7 9])  ; 2.0

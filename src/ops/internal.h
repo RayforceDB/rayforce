@@ -183,6 +183,12 @@ static inline int64_t sym_intern_safe(const char* s, size_t len) {
     return id >= 0 ? id : 0;
 }
 
+/* Result type of a mean or median (avg, avgs, mavg, med): F64, except that the
+ * mean of durations is a duration. */
+static inline int8_t mean_out_type(int8_t t) {
+    return t == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_F64;
+}
+
 /* ══════════════════════════════════════════
  * Unified column read/write helpers
  * ══════════════════════════════════════════ */
@@ -1654,6 +1660,12 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
  * group-by phase (already prefix-summed; offsets[g]..offsets[g]+
  * grp_cnt[g] is group g's slice).  Returns F64 vec of n_groups, NULL
  * on unsupported source type (caller falls back to serial). */
+/* Mean and median of durations are durations: round an F64 atom / vector of
+ * nanosecond counts to a TIMESPAN one (consumes its argument; nulls stay
+ * null, errors pass through).  See agg.c. */
+ray_t* ray_timespan_of_f64_atom(ray_t* r);
+ray_t* ray_timespan_of_f64_vec(ray_t* col);
+
 ray_t* ray_median_per_group_buf(ray_t* src,
                                 const int64_t* idx_buf,
                                 const int64_t* offsets,
