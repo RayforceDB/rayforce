@@ -5594,6 +5594,7 @@ static inline int32_t agg_sh_gid(agg_sh_ctx_t* c, agg_sh_t* sh, const agg_view_t
     uint32_t nk = c->n_keys;
     int64_t w[nk];
     for (uint32_t k = 0; k < nk; k++) w[k] = agg_vkey(v, c->rr->key_types, k, r);
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
     return agg_sh_find_or_insert_words(sh, w, c->vts, c->off, c->n_aggs, r);
 }
 

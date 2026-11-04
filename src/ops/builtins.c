@@ -601,6 +601,7 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
         }
         ray_t* tbl = names
+            // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
             ? ray_read_csv_named_opts(path, 0, false, col_types, (int32_t)ncols,
                                       col_names, (int32_t)ncols)
             : ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
@@ -2118,6 +2119,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 else                bytes[nib >> 1] |= (uint8_t)v;
                 nib++;
             }
+            // cppcheck-suppress uninitvar // sl == 36 is checked above, so the loop fills all 16 bytes
             return ray_guid(bytes);
         }
         /* Vector of GUIDs: empty vector cast */
