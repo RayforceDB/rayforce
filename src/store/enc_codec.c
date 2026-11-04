@@ -166,12 +166,22 @@ static bool dict_codes(const uint64_t* v, int n, ray_enc_kind_t k,
     return true;
 }
 
+/* A vector's dictionary codes, looked up once for the size model and the
+ * writer: state 0 not yet, 1 found, -1 a value outside the dictionary. */
+typedef struct { uint64_t codes[RAY_ENC_VEC]; int state; } dict_memo_t;
+
+static const uint64_t* dict_codes_memo(const uint64_t* v, int n, ray_enc_kind_t k,
+                                       const ray_enc_dict_t* d, dict_memo_t* memo) {
+    if (!memo->state) memo->state = dict_codes(v, n, k, d, memo->codes) ? 1 : -1;
+    return memo->state > 0 ? memo->codes : NULL;
+}
+
 static int64_t hdr(int depth) { return depth > 0 ? 8 : 0; }
 
 /* Size of encoding `enc` for v, or -1 if not applicable. */
 static int64_t enc_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
                         ray_enc_slot_t slot, int depth, const ray_enc_dict_t* dict,
-                        uint8_t* width) {
+                        dict_memo_t* memo, uint8_t* width) {
     uint64_t base;
     *width = 0;
     switch (enc) {
@@ -193,8 +203,8 @@ static int64_t enc_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
     }
     case RAY_ENC_DICT: {
         if (!dict) return -1;                                         /* never dereference a missing dictionary */
-        uint64_t codes[RAY_ENC_VEC];
-        if (!dict_codes(v, n, k, dict, codes)) return -1;
+        const uint64_t* codes = dict_codes_memo(v, n, k, dict, memo);
+        if (!codes) return -1;
         ray_enc_choice_t cc = ray_enc_choose(codes, n, K_U32, RAY_ENC_SLOT_CODES, depth + 1, NULL);
         return cc.bytes;
     }
@@ -202,9 +212,9 @@ static int64_t enc_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
     return -1;
 }
 
-ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
-                                ray_enc_slot_t slot, int depth,
-                                const ray_enc_dict_t* dict) {
+static ray_enc_choice_t choose_memo(const uint64_t* v, int n, ray_enc_kind_t k,
+                                    ray_enc_slot_t slot, int depth,
+                                    const ray_enc_dict_t* dict, dict_memo_t* memo) {
     static const uint8_t order[] = { RAY_ENC_RAW, RAY_ENC_CONST, RAY_ENC_FOR_BP,
                                      RAY_ENC_DELTA_BP, RAY_ENC_RLE, RAY_ENC_DICT };
     uint8_t w;
@@ -213,7 +223,7 @@ ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
     for (size_t i = 1; i < sizeof order; i++) {
         uint8_t e = order[i];
         if (!enc_legal(e, slot, depth, k, dict)) continue;
-        int64_t sz = enc_size(e, v, n, k, slot, depth, dict, &w);
+        int64_t sz = enc_size(e, v, n, k, slot, depth, dict, memo, &w);
         if (sz >= 0 && sz < best.bytes) { best.enc = e; best.width = w; best.bytes = sz; }
     }
     if (best.enc != RAY_ENC_RAW && best.bytes * 8 > raw * 7) {   /* need >= 1/8 gain */
@@ -221,6 +231,13 @@ ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
     }
     best.bytes += hdr(depth);
     return best;
+}
+
+ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
+                                ray_enc_slot_t slot, int depth,
+                                const ray_enc_dict_t* dict) {
+    dict_memo_t memo; memo.state = 0;
+    return choose_memo(v, n, k, slot, depth, dict, &memo);
 }
 
 /* ---- writers ---- */
@@ -240,7 +257,7 @@ static bool write_packed(const uint64_t* u, int T, int w, ray_enc_buf_t* b) {
 
 static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc_kind_t k,
                        ray_enc_slot_t slot, int depth, const ray_enc_dict_t* dict,
-                       ray_enc_buf_t* b) {
+                       dict_memo_t* memo, ray_enc_buf_t* b) {
     const uint64_t m = tmask(k.T);
     switch (enc) {
     case RAY_ENC_RAW:   return write_raw(v, n, k.T, b);
@@ -276,8 +293,8 @@ static bool write_body(uint8_t enc, uint8_t w, const uint64_t* v, int n, ray_enc
     }
     case RAY_ENC_DICT: {
         if (!dict) return false;                                      /* never dereference a missing dictionary */
-        uint64_t codes[RAY_ENC_VEC];
-        if (!dict_codes(v, n, k, dict, codes)) return false;
+        const uint64_t* codes = dict_codes_memo(v, n, k, dict, memo);
+        if (!codes) return false;
         ray_enc_choice_t c;
         return ray_enc_write(codes, n, K_U32, RAY_ENC_SLOT_CODES, depth + 1, NULL, b, &c);
     }
@@ -289,14 +306,15 @@ bool ray_enc_write(const uint64_t* v, int n, ray_enc_kind_t k,
                    ray_enc_slot_t slot, int depth, const ray_enc_dict_t* dict,
                    ray_enc_buf_t* out, ray_enc_choice_t* chosen) {
     if (n < 0 || n > RAY_ENC_VEC) return false;
-    ray_enc_choice_t c = ray_enc_choose(v, n, k, slot, depth, dict);
+    dict_memo_t memo; memo.state = 0;
+    ray_enc_choice_t c = choose_memo(v, n, k, slot, depth, dict, &memo);
     size_t at = out->len;
     if (depth > 0) {
         uint8_t h[8] = { c.enc, c.width, 0, 0, 0, 0, 0, 0 };
         if (!ray_enc_buf_put(out, h, 8)) { out->len = at; return false; }
     }
     size_t body_at = out->len;
-    if (!write_body(c.enc, c.width, v, n, k, slot, depth, dict, out)) { out->len = at; return false; }
+    if (!write_body(c.enc, c.width, v, n, k, slot, depth, dict, &memo, out)) { out->len = at; return false; }
     if (depth > 0) {
         uint32_t bb = (uint32_t)(out->len - body_at);
         memcpy(out->p + at + 4, &bb, 4);
@@ -311,10 +329,11 @@ bool ray_enc_write_as(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t k,
     if (n < 0 || n > RAY_ENC_VEC) return false;
     if (enc > RAY_ENC_DICT || !enc_legal(enc, RAY_ENC_SLOT_TOP, 0, k, dict)) return false;
     uint8_t w;
-    int64_t sz = enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &w);
+    dict_memo_t memo; memo.state = 0;
+    int64_t sz = enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &memo, &w);
     if (sz < 0) return false;
     size_t at = out->len;
-    if (!write_body(enc, w, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, out)) { out->len = at; return false; }
+    if (!write_body(enc, w, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &memo, out)) { out->len = at; return false; }
     if ((int64_t)(out->len - at) != sz) { out->len = at; return false; }     /* size model and writer agree */
     if (chosen) { chosen->enc = enc; chosen->width = w; chosen->bytes = sz; }
     return true;
@@ -324,7 +343,8 @@ int64_t ray_enc_body_size(uint8_t enc, const uint64_t* v, int n, ray_enc_kind_t 
                           const ray_enc_dict_t* dict) {
     if (n < 0 || n > RAY_ENC_VEC || enc > RAY_ENC_DICT || !enc_legal(enc, RAY_ENC_SLOT_TOP, 0, k, dict)) return -1;
     uint8_t w;
-    return enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &w);
+    dict_memo_t memo; memo.state = 0;
+    return enc_size(enc, v, n, k, RAY_ENC_SLOT_TOP, 0, dict, &memo, &w);
 }
 
 /* ---- readers ----
