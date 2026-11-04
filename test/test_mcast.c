@@ -12,6 +12,7 @@
 #include <rayforce.h>
 #include "core/ipc.h"
 #include "core/poll.h"
+#include "core/shm.h"
 #include "core/runtime.h"
 #include "core/sock.h"
 #include "lang/env.h"
@@ -130,8 +131,17 @@ static test_result_t assert_ok(ray_t* x, const char* label) {
     PASS();
 }
 
+/* Most of these tests drive the socket itself — a shrunk SO_SNDBUF to
+ * force queueing, an invalidated fd to make a send fail — so their
+ * connections stay on TCP: on one host they would otherwise move to
+ * shared-memory rings, which no socket option touches.  The tests that
+ * only publish and subscribe run a second time with the default policy,
+ * their connections on the rings (on_rings below). */
+static bool g_on_rings;
+
 static test_result_t start_server(ray_poll_t** poll_out, uint16_t* port_out,
                                   ray_vm_t** vm_out, ray_thread_t* tid_out) {
+    ray_ipc_xport_policy_set(g_on_rings ? RAY_IPC_XPORT_AUTO : RAY_IPC_XPORT_TCP);
     ray_poll_t* poll = ray_poll_create();
     TEST_ASSERT_NOT_NULL(poll);
     int64_t listener_id = ray_ipc_listen(poll, 0);
@@ -158,6 +168,7 @@ static void stop_server(ray_poll_t* poll, uint16_t port, ray_vm_t* vm, ray_threa
     poll_stop(poll, port);
     ray_thread_join(tid);
     ray_poll_destroy(poll);
+    ray_ipc_xport_policy_set(RAY_IPC_XPORT_AUTO);
     ray_sys_free(vm);
 }
 
@@ -185,6 +196,11 @@ static test_result_t test_mcast_single_client_pub(void) {
 
     int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "client connected");
+#if defined(__linux__)
+    ray_ipc_tx_info_t info;
+    TEST_ASSERT_EQ_I(ray_ipc_tx_info(h, &info), RAY_OK);
+    TEST_ASSERT_EQ_I(info.transport, g_on_rings ? RAY_XPORT_SHM : RAY_XPORT_TCP);
+#endif
 
     ray_t* sub_msg = ray_str("(.mc.sub \"ticks\" null)", strlen("(.mc.sub \"ticks\" null)"));
     ray_t* sub = ray_ipc_send(h, sub_msg);
@@ -1276,11 +1292,35 @@ static test_result_t test_mcast_sync_reply_after_queued_frame(void) {
     PASS();
 }
 
+static test_result_t on_rings(test_result_t (*t)(void)) {
+#if defined(__linux__)
+    if (!*ray_shm_host_identity()) SKIP("this host names no boot identity: no shared memory");
+#else
+    SKIP("shared-memory rings are Linux-only");
+#endif
+    g_on_rings = true;
+    test_result_t r = t();
+    g_on_rings = false;
+    return r;
+}
+static test_result_t test_mcast_single_client_pub_rings(void) {
+    return on_rings(test_mcast_single_client_pub);
+}
+static test_result_t test_mcast_two_clients_rings(void) {
+    return on_rings(test_mcast_two_clients_unsub_close_stats);
+}
+static test_result_t test_mcast_multi_topic_routing_rings(void) {
+    return on_rings(test_mcast_multi_topic_routing);
+}
+
 const test_entry_t mcast_entries[] = {
     { "mcast/single_client_pub",          test_mcast_single_client_pub,          mcast_setup, mcast_teardown },
     { "mcast/two_clients_unsub_close",    test_mcast_two_clients_unsub_close_stats, mcast_setup, mcast_teardown },
     { "mcast/duplicate_sub_idempotent",   test_mcast_duplicate_sub_is_idempotent, mcast_setup, mcast_teardown },
     { "mcast/multi_topic_routing",        test_mcast_multi_topic_routing,        mcast_setup, mcast_teardown },
+    { "mcast/single_client_pub_rings",    test_mcast_single_client_pub_rings,    mcast_setup, mcast_teardown },
+    { "mcast/two_clients_rings",          test_mcast_two_clients_rings,          mcast_setup, mcast_teardown },
+    { "mcast/multi_topic_routing_rings",  test_mcast_multi_topic_routing_rings,  mcast_setup, mcast_teardown },
     { "mcast/no_subscribers_api_errors",  test_mcast_no_subscribers_and_api_errors, mcast_setup, mcast_teardown },
     { "mcast/bare_sub_shorthand",         test_mcast_bare_subscribe_shorthand, mcast_setup, mcast_teardown },
     { "mcast/restricted_sub_not_pub",     test_mcast_restricted_sub_but_not_pub, mcast_setup, mcast_teardown },
