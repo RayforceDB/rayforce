@@ -151,12 +151,15 @@ static int rle_split(const uint64_t* v, int n, uint64_t* vals, uint64_t* ends) {
 
 static bool dict_codes(const uint64_t* v, int n, ray_enc_kind_t k,
                        const ray_enc_dict_t* d, uint64_t* codes) {
-    for (int i = 0; i < n; i++) {
-        uint32_t lo = 0, hi = d->n;
-        while (lo < hi) {
-            uint32_t mid = (lo + hi) / 2;
-            if (ray_enc_lt(d->v[mid], v[i], k)) lo = mid + 1; else hi = mid;
+    for (int i = 0; i < n; i++) {                       /* lower bound on the order keys */
+        const uint64_t x = ray_enc_okey(v[i], k);
+        uint32_t lo = 0, len = d->n;
+        while (len > 1) {
+            uint32_t half = len / 2;
+            lo = ray_enc_okey(d->v[lo + half - 1], k) < x ? lo + half : lo;
+            len -= half;
         }
+        if (len == 1 && ray_enc_okey(d->v[lo], k) < x) lo++;
         if (lo >= d->n || d->v[lo] != v[i]) return false;   /* not in dictionary */
         codes[i] = lo;
     }
