@@ -125,6 +125,20 @@
 (set G0 (select {from: F by: g mn: (min u) mx: (max u) c: (count u) where: (and (!= sp "") (like u "*google*"))}))
 (all (== (at G0 'mn) (at G1 'mn))) -- true
 (all (== (at G0 'mx) (at G1 'mx))) -- true
+;; rows naming the empty symbol (position 0, no bytes), a group of empties only
+(.sys.exec "rm -rf /tmp/rfl_fdom_like_null/") -- 0
+(set T3 (table [g3 s3] (list [1 1 2 2 3 3 4 4] (as 'SYMBOL ["" "b" "" "a" "" "" "c" "a"]))))
+(.db.splayed.set "/tmp/rfl_fdom_like_null/" T3)
+(set F3 (.db.splayed.get "/tmp/rfl_fdom_like_null/"))
+(.os.setenv "RAY_SYM_COLD" "1") -- "1"
+(set R1 (xasc (select {from: F3 by: g3 mn: (min s3) mx: (max s3)}) 'g3))
+(.os.setenv "RAY_SYM_COLD" "0") -- "0"
+(set R0 (xasc (select {from: F3 by: g3 mn: (min s3) mx: (max s3)}) 'g3))
+(== (as 'STR (at R1 'mn)) ["b" "a" "" "a"]) -- [true true true true]
+(== (as 'STR (at R1 'mx)) ["b" "a" "" "c"]) -- [true true true true]
+(== (at R1 'mn) (at R0 'mn)) -- [true true true true]
+(== (at R1 'mx) (at R0 'mx)) -- [true true true true]
+(.sys.exec "rm -rf /tmp/rfl_fdom_like_null/") -- 0
 (.os.setenv "RAY_SYM_COLD" "") -- ""
 
 ;; a dictionary with entries appended past the file's (the table saved

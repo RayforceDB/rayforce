@@ -11010,7 +11010,7 @@ static bool agg_sym_rank_build(ray_t* src, const int64_t* rows, int64_t nrows, a
             if (!nb) goto done;
             bytes = nb; bcap = nc;
         }
-        memcpy(bytes + blen, sp, sl);
+        if (sl) memcpy(bytes + blen, sp, sl);   /* position 0, the empty symbol, has no bytes */
         ent[j] = (agg_sym_rank_ent_t){blen, (uint32_t)sl, (uint32_t)j, NULL};
         blen += sl;
     }
