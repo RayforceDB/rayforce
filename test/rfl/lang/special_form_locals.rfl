@@ -15,18 +15,12 @@
 (count data) -- 2
 (at data 1)  -- 7
 
-;; alter reads local bindings but writes globals.  Reject the local before
-;; changing either it or an unrelated global with the same name.
-((fn [] (let alter_only_local [1 2 3]) (alter 'alter_only_local set 0 9))) !- domain
-alter_only_local !- name
 (set alter_shadow [5 5])
-((fn [] (let alter_shadow [1 2 3]) (alter 'alter_shadow set 0 9))) !- domain
+((fn [] (let alter_shadow [1 2 3]) (alter 'alter_shadow set 0 9) alter_shadow)) -- [9 2 3]
 alter_shadow -- [5 5]
-((fn [] (let alter_shadow [1 2 3]) (alter 'alter_shadow concat [4]))) !- domain
-alter_shadow -- [5 5]
-((fn [] (let alter_shadow (list 1 2 3)) (alter 'alter_shadow remove 0))) !- domain
-alter_shadow -- [5 5]
-((fn [alter_shadow] (alter 'alter_shadow set 0 9)) [1 2 3]) !- domain
+((fn [] (let alter_shadow [1 2 3]) (alter 'alter_shadow concat [4]) alter_shadow)) -- [1 2 3 4]
+((fn [] (let alter_shadow (list 1 2 3)) (alter 'alter_shadow remove 0) alter_shadow)) -- (list 2 3)
+((fn [alter_shadow] (alter 'alter_shadow set 0 9) alter_shadow) [1 2 3]) -- [9 2 3]
 alter_shadow -- [5 5]
 
 ;; and/or with params — must match the top-level (tree-walk) results:

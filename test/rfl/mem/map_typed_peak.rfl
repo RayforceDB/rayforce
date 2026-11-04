@@ -1,0 +1,9 @@
+;; Homogeneous map results must not retain one boxed atom per output row.
+;; Input and result each occupy roughly one vector, plus runtime overhead.
+;; The old list collector exceeds this four-vector budget.
+(set n 200000)
+(set input (til n))
+(set output (map (fn [x] (+ x 1)) input))
+(type output) -- 'I64
+(sum output) -- 20000100000
+(< (at (.sys.mem) 'peak-bytes) (* 4 (* 8 n))) -- true

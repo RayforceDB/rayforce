@@ -482,8 +482,10 @@ ray_t* ray_replace_fn(ray_t** args, int64_t n) {
     return ray_lazy_wrap(g, op);
 }
 
+typedef struct { const char* p; size_t n; } str_needle_t;
+
 static int64_t str_find_index(const char* hay, size_t hay_len,
-                              const ray_strpat_t* pattern,
+                              const str_needle_t* pattern,
                               ray_pool_t* pool, bool* cancelled) {
     if (cancelled) *cancelled = false;
     if (pool_cancelled(pool)) {
@@ -491,8 +493,8 @@ static int64_t str_find_index(const char* hay, size_t hay_len,
         return NULL_I64;
     }
     size_t pos = 0;
-    return ray_strpat_find(pattern, hay, hay_len, &pos) ? (int64_t)pos
-                                                       : NULL_I64;
+    return ray_str_find_literal(hay, hay_len, pattern->p, pattern->n, &pos)
+               ? (int64_t)pos : NULL_I64;
 }
 
 static bool str_vec_cell_bytes(ray_t* x, int64_t row,
@@ -518,7 +520,7 @@ static bool str_vec_cell_bytes(ray_t* x, int64_t row,
 
 typedef struct {
     ray_t* hay;
-    const ray_strpat_t* pattern;
+    const str_needle_t* pattern;
     int64_t* out;
     ray_pool_t* pool;
     _Atomic(int) any_null;
@@ -563,7 +565,7 @@ static void str_find_vec_task(void* vctx, uint32_t worker_id,
         atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
 }
 
-static ray_t* str_find_vec(ray_t* hay, const ray_strpat_t* pattern) {
+static ray_t* str_find_vec(ray_t* hay, const str_needle_t* pattern) {
     int64_t n = hay->len;
     ray_t* out = ray_vec_new(RAY_I64, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -605,9 +607,7 @@ ray_t* ray_str_find_fn(ray_t* hay, ray_t* pattern) {
     size_t nl = 0;
     if (!str_atom_arg(pattern, &np, &nl))
         return ray_error("type", "str-find: pattern must be string or symbol atom");
-    ray_strpat_t search;
-    if (!ray_strpat_compile(np, nl, &search))
-        return ray_error("domain", "str-find: '*' is not supported in search patterns");
+    str_needle_t search = { np, nl };
 
     if (ray_is_lazy(hay)) {
         ray_t* perr = ray_lazy_promote(hay);            /* a column reference becomes its scan */
