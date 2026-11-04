@@ -690,11 +690,13 @@ static void encw_pfx_fill_task(void* raw, uint32_t wid, int64_t start, int64_t e
     }
 }
 
+/* On the pool, or serially block by block (a column finish already runs
+ * inside a dispatch), stopping at a cancel. */
 static void encw_pfx_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
                          encw_pfx_par_t* x, int64_t items) {
     int64_t nt = (items + ENCW_PFX_TASK - 1) / ENCW_PFX_TASK;
     if (ray_pool_par_dispatch_ok(pool, nt, 2)) ray_pool_dispatch_n(pool, fn, x, (uint32_t)nt);
-    else fn(x, 0, 0, nt);
+    else for (int64_t k = 0; k < nt && !ray_interrupted(); k++) fn(x, 0, k, k + 1);
 }
 
 static void encw_sym_pfx_table(ray_encw_t* w, const void* data) {
