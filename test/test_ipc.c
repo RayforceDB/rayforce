@@ -3051,6 +3051,8 @@ static test_result_t test_ipc_cancel_byte_on_idle_moved_link(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
     ray_release(r0);
     TEST_ASSERT_EQ_I(ray_ipc_send_cancel(h), 0);
+    int tag = ray_ipc_cancel_unconfirmed_for_test(h);
+    TEST_ASSERT((tag) >= (0), "the cancel waits for the server to confirm it");
     sleep_ms(20);
     for (int i = 0; i < 3; i++) {
         ray_t* msg  = ray_str("(+ 1 2)", 7);
@@ -3064,8 +3066,76 @@ static test_result_t test_ipc_cancel_byte_on_idle_moved_link(void) {
     sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
     TEST_ASSERT_NOT_NULL(sel);
     TEST_ASSERT_NOT_NULL(sel->xport);
+    TEST_ASSERT_EQ_I(ray_ipc_cancel_unconfirmed_for_test(h), -1);
     ray_ipc_close(h);
     ray_test_server_stop(&srv);
+    PASS();
+#else
+    SKIP("moved connections are Linux-only");
+#endif
+}
+
+/* ---- a cancel byte that never arrives ---------------------------------- */
+/*
+ * The byte is a number mod 256, so one held up in the network must not
+ * still be around when the number comes round again.  With the byte held
+ * back the server never confirms it: a cancel for another request is
+ * refused (a second urgent byte would turn the first into stream data),
+ * requests go on until the next would carry the held number, and that one
+ * closes the connection instead.
+ */
+static test_result_t test_ipc_cancel_unconfirmed_moved_link(void) {
+#if defined(__linux__)
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 2000);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    ray_selector_t* sel = ray_poll_get(poll, h);
+    TEST_ASSERT_NOT_NULL(sel);
+    if (!sel->xport) {
+        ray_ipc_close(h);
+        ray_test_server_stop(&srv);
+        SKIP("the connection did not move to shared memory here");
+    }
+    ray_t* m0 = ray_str("0", 1);
+    ray_t* r0 = ray_ipc_send(h, m0);
+    ray_release(m0);
+    TEST_ASSERT(r0 && !RAY_IS_ERR(r0), "first query answers");
+    ray_release(r0);
+    ray_ipc_hold_cancel_for_test(true);
+    int rc1 = ray_ipc_send_cancel(h);
+    int rc2 = ray_ipc_send_cancel(h);      /* same request: not sent twice */
+    int tag = ray_ipc_cancel_unconfirmed_for_test(h);
+    ray_ipc_hold_cancel_for_test(false);
+    TEST_ASSERT_EQ_I(rc1, 0);
+    TEST_ASSERT_EQ_I(rc2, 0);
+    TEST_ASSERT((tag) >= (0), "the held cancel is unconfirmed");
+    int answered = 0;
+    ray_t* last = NULL;
+    for (int i = 0; i < 300; i++) {
+        ray_t* msg = ray_str("(+ 1 2)", 7);
+        last = ray_ipc_send(h, msg);
+        ray_release(msg);
+        if (!last || RAY_IS_ERR(last)) break;
+        ray_release(last);
+        last = NULL;
+        answered++;
+        if (answered == 1) {
+            /* A cancel for this later request cannot be named safely. */
+            TEST_ASSERT_EQ_I(ray_ipc_send_cancel(h), -2);
+            TEST_ASSERT_EQ_I(ray_ipc_cancel_unconfirmed_for_test(h), tag);
+        }
+    }
+    bool closed = ray_poll_get(poll, h) == NULL;
+    if (!closed) ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    TEST_ASSERT_NOT_NULL(last);
+    TEST_ASSERT(RAY_IS_ERR(last), "the request that would reuse the number is refused");
+    TEST_ASSERT_STR_EQ(ray_err_code(last), "io");
+    ray_error_free(last);
+    TEST_ASSERT_EQ_I(answered, 255);
+    TEST_ASSERT(closed, "the connection is closed");
     PASS();
 #else
     SKIP("moved connections are Linux-only");
@@ -3181,6 +3251,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/cancel_byte_on_idle_moved_link", test_ipc_cancel_byte_on_idle_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_byte_mid_query_moved_link", test_ipc_cancel_byte_mid_query_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_after_refused_send_moved_link", test_ipc_cancel_after_refused_send_moved_link, ipc_setup, ipc_teardown },
+    { "ipc/cancel_unconfirmed_moved_link", test_ipc_cancel_unconfirmed_moved_link, ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },

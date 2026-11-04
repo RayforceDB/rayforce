@@ -138,6 +138,13 @@ int         ray_ipc_xport_policy_parse(const char* s, size_t n);
  * not on the server's.  Default sync messages still get the bare
  * result, so existing IPC clients are unaffected. */
 #define RAY_IPC_FLAG_VERBOSE    0x04
+/* Set by a server on a reply over a moved (shared-memory or RDMA)
+ * connection when it has taken a cancel byte from that connection's
+ * socket since its last reply.  The client keeps at most one cancel
+ * byte unconfirmed; this is what confirms it (see send_cancel in
+ * core/ipc.c).  Never set on TCP, where reading the stream past a
+ * cancel byte discards it. */
+#define RAY_IPC_FLAG_CANCEL_SEEN 0x08
 #define RAY_IPC_MAX_CONNS 256
 
 /* ===== Connection hooks (.ipc.on.*) ===== */
@@ -238,9 +245,17 @@ size_t    ray_ipc_handle_threshold(int64_t handle);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 /* Sends the cancel a client sends on Ctrl-C for the sync request
- * outstanding on `handle` (one urgent byte; see ipc.c).  0, or -1 for a
- * handle that is not a connection. */
+ * outstanding on `handle` (one urgent byte; see ipc.c).  0; -1 for a
+ * handle that is not a connection; -2 when nothing was sent because a
+ * cancel for an earlier request on this moved connection is still
+ * unconfirmed (close the handle to stop the request). */
 int       ray_ipc_send_cancel(int64_t handle);
+/* Test hooks (C tests only).  hold: a moved connection's cancel is
+ * recorded as sent but its byte is kept back, as one held up in the
+ * network would be.  unconfirmed: the request number of the cancel on
+ * `handle` the server has not confirmed yet, or -1. */
+void      ray_ipc_hold_cancel_for_test(bool hold);
+int       ray_ipc_cancel_unconfirmed_for_test(int64_t handle);
 /* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
  * On expiry the connection is closed (on.close fires) and an `io` error
  * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */

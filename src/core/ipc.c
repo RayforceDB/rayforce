@@ -592,7 +592,8 @@ static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel,
     return 0;
 }
 
-static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold)
+static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
+                          uint8_t extra_flags)
 {
     ray_serde_fail_clear();
     int64_t ser_size = ray_serde_size(result);
@@ -671,7 +672,7 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold)
     ray_ipc_header_t hdr = {
         .prefix  = RAY_SERDE_PREFIX,
         .version = RAY_SERDE_WIRE_VERSION,
-        .flags   = flags,
+        .flags   = (uint8_t)(flags | extra_flags),
         .endian  = RAY_SERDE_ENDIAN,
         .msgtype = RAY_IPC_MSG_RESP,
         .size    = (int64_t)send_len,
@@ -994,6 +995,13 @@ typedef struct {
      * request it is for (see the out-of-band cancel below). */
     uint8_t          tx_sync_seq;
     uint8_t          rx_sync_seq;
+    /* A client's cancel byte not yet confirmed by RAY_IPC_FLAG_CANCEL_SEEN,
+     * and the request number it carries.  At most one is outstanding. */
+    bool             cancel_unconfirmed;
+    uint8_t          cancel_tag;
+    /* A server: a cancel byte was taken from this socket since the last
+     * reply, which that reply then confirms. */
+    bool             cancel_seen;
 } ray_ipc_conn_data_t;
 
 #ifdef RAY_IPC_XPORT
@@ -1144,17 +1152,21 @@ static volatile sig_atomic_t g_ipc_active_fd = -1;
 #define CANCEL_ANY  (-1)
 #define CANCEL_NONE (-2)
 static volatile sig_atomic_t g_ipc_active_seq = CANCEL_ANY;
+/* Set by the SIGURG handler when it takes a numbered byte off the running
+ * request's socket, so the reply can confirm it. */
+static volatile sig_atomic_t g_ipc_oob_taken = 0;
 
 /* Whether a pending cancel byte on `fd` is for the request `want` names,
  * taking it when it is and dropping it when it names another request.
- * Async-signal-safe. */
-static bool oob_cancel_for(int fd, int want)
+ * A numbered byte taken either way sets *taken.  Async-signal-safe. */
+static bool oob_cancel_for(int fd, int want, volatile sig_atomic_t* taken)
 {
     if (want == CANCEL_ANY) return ray_sock_take_oob((ray_sock_t)fd) != 0;
     if (want == CANCEL_NONE) return false;
     int b = ray_sock_peek_oob((ray_sock_t)fd);
     if (b < 0) return false;
     (void)ray_sock_take_oob((ray_sock_t)fd);
+    *taken = 1;
     return b == want;
 }
 
@@ -1168,7 +1180,7 @@ static void ipc_sigurg_handler(int sig)
     /* Cancel ONLY if the urgent byte is on the RUNNING query's connection.
      * OOB from any OTHER (queued) client must not touch this query; that byte
      * stays pending on its socket and is honored when that client runs. */
-    if (oob_cancel_for(fd, g_ipc_active_seq))
+    if (oob_cancel_for(fd, g_ipc_active_seq, &g_ipc_oob_taken))
         ray_request_interrupt();
 }
 #endif
@@ -1411,6 +1423,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * conn instead of evaluating it.  A response nobody waits for has
      * no defined meaning — log and drop. */
     if (hdr.msgtype == RAY_IPC_MSG_RESP) {
+        if (hdr.flags & RAY_IPC_FLAG_CANCEL_SEEN) cd->cancel_unconfirmed = false;
         ray_t* obj = deser_frame(payload->data, (size_t)payload->offset,
                                  hdr.flags);
         ray_poll_buf_free(payload);
@@ -1446,7 +1459,8 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     if (hdr.msgtype == RAY_IPC_MSG_SYNC) cd->rx_sync_seq++;
     int cancel_seq = !sel->xport ? CANCEL_ANY
                    : hdr.msgtype == RAY_IPC_MSG_SYNC ? (int)cd->rx_sync_seq : CANCEL_NONE;
-    if (oob_cancel_for((int)sel->fd, cancel_seq)) {
+    volatile sig_atomic_t taken = 0;
+    if (oob_cancel_for((int)sel->fd, cancel_seq, &taken)) {
         result = ray_error("cancel", "interrupted");
     } else {
         /* Clear any stale cancel first: the server is single-threaded, so each
@@ -1455,12 +1469,15 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * line the same way).  Publish the active fd so a SIGURG for THIS
          * connection cancels this query. */
         ray_clear_interrupt();
+        g_ipc_oob_taken = 0;
         g_ipc_active_seq = cancel_seq;
         g_ipc_active_fd = (int)sel->fd;
         result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
         g_ipc_active_fd = -1;
         g_ipc_active_seq = CANCEL_ANY;
+        if (g_ipc_oob_taken) taken = 1;
     }
+    if (taken) cd->cancel_seen = true;
 
     ipc_ctx_set(prev_handle, prev_poll);
     ray_eval_set_restricted(prev_restricted);
@@ -1479,9 +1496,15 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
             conn_tx_drain_blocking(poll, cur, -1) == 0)
             {
                 ray_ipc_conn_data_t* rcd = (ray_ipc_conn_data_t*)cur->data;
+                uint8_t ack = 0;
+                if (rcd && rcd->cancel_seen && cur->xport) {
+                    ack = RAY_IPC_FLAG_CANCEL_SEEN;
+                    rcd->cancel_seen = false;
+                }
                 send_response(cur, result,
                               rcd ? rcd->compress_threshold
-                                  : ray_ipc_link_threshold((ray_sock_t)cur->fd));
+                                  : ray_ipc_link_threshold((ray_sock_t)cur->fd),
+                              ack);
             }
     }
     if (result != RAY_NULL_OBJ) ray_release(result);
@@ -2721,12 +2744,42 @@ void ray_ipc_close(int64_t handle)
  * the same reason.  Before closing, the peer is sent the same urgent-data
  * cancel as Ctrl-C, so it stops evaluating a query nobody will read. */
 /* The cancel byte for the sync request outstanding on `sel`: '!' on
- * TCP, the request's number on a moved connection. */
-static void send_cancel(ray_selector_t* sel)
+ * TCP, the request's number on a moved connection.
+ *
+ * On a moved connection nothing reads the socket but the cancel path, so
+ * a byte held up in the network could arrive 256 requests later and name
+ * a request it was never for.  The client therefore keeps at most one
+ * byte unconfirmed: the server's next reply after it takes the byte
+ * carries RAY_IPC_FLAG_CANCEL_SEEN.  The same request's byte is not sent
+ * twice (a second urgent byte would turn the first into stream data).
+ * Returns false when a byte for another request is still unconfirmed:
+ * the connection can no longer cancel safely and the caller closes it. */
+static bool g_cancel_hold_for_test = false;
+
+void ray_ipc_hold_cancel_for_test(bool hold) { g_cancel_hold_for_test = hold; }
+
+int ray_ipc_cancel_unconfirmed_for_test(int64_t handle)
+{
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    ray_selector_t* sel = poll ? ray_poll_get(poll, handle) : NULL;
+    ray_ipc_conn_data_t* cd = sel ? (ray_ipc_conn_data_t*)sel->data : NULL;
+    return cd && cd->cancel_unconfirmed ? (int)cd->cancel_tag : -1;
+}
+
+static bool send_cancel(ray_selector_t* sel)
 {
     ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
-    char b = (sel->xport && cd) ? (char)cd->tx_sync_seq : '!';
-    ray_sock_send_oob((ray_sock_t)sel->fd, b);
+    if (!sel->xport || !cd) {
+        ray_sock_send_oob((ray_sock_t)sel->fd, '!');
+        return true;
+    }
+    if (cd->cancel_unconfirmed)
+        return cd->cancel_tag == cd->tx_sync_seq;
+    cd->cancel_unconfirmed = true;
+    cd->cancel_tag = cd->tx_sync_seq;
+    if (!g_cancel_hold_for_test)
+        ray_sock_send_oob((ray_sock_t)sel->fd, (char)cd->tx_sync_seq);
+    return true;
 }
 
 int ray_ipc_send_cancel(int64_t handle)
@@ -2734,15 +2787,14 @@ int ray_ipc_send_cancel(int64_t handle)
     ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
     ray_selector_t* sel = poll ? ray_poll_get(poll, handle) : NULL;
     if (!sel || !sel->data) return -1;
-    send_cancel(sel);
-    return 0;
+    return send_cancel(sel) ? 0 : -2;
 }
 
 static ray_t* sync_expire(ray_poll_t* poll, int64_t id, int64_t timeout_ms)
 {
     ray_selector_t* sel = ray_poll_get(poll, id);
     if (sel) {
-        send_cancel(sel);
+        (void)send_cancel(sel);   /* closing either way */
         ray_poll_deregister(poll, id);
     }
     return ray_error("io", "ipc send timed out after %lld ms; connection closed",
@@ -2785,6 +2837,17 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
                                              conn_threshold(sel), &ferr);
     if (owned) ray_release(msg);
     if (!frame) return ray_error("io", "ipc send failed");
+
+    /* A cancel byte still unconfirmed carries a number this request would
+     * take again: if it arrived now it would cancel this request.  Neither
+     * side can tell, so the connection is closed instead. */
+    if (sel->xport && cd->cancel_unconfirmed &&
+        (uint8_t)(cd->tx_sync_seq + 1) == cd->cancel_tag) {
+        ray_poll_frame_release(frame);
+        ray_poll_deregister(poll, sel->id);
+        return ray_error("io", "ipc send refused: an earlier cancel was never "
+                               "confirmed; connection closed");
+    }
 
     /* From here the request goes out, so it takes the next number: the
      * server counts every SYNC frame it reads, and a cancel of this
@@ -2861,8 +2924,14 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
              * cancel reply.  Best-effort: a server without OOB-cancel support
              * ignores the byte and the query completes as before. */
             if (ray_interrupted()) {
-                send_cancel(sel);
+                bool sent = send_cancel(sel);
                 ray_clear_interrupt();  /* consume; do not resend or cancel locally */
+                if (!sent) {
+                    /* An earlier request's cancel is still unconfirmed, so
+                     * this one cannot be named safely: close instead. */
+                    ray_poll_deregister(poll, id);
+                    return ray_error("cancel", "interrupted; connection closed");
+                }
             }
             continue;
         }
