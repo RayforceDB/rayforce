@@ -45,6 +45,9 @@
  * lower row counts. */
 #define LIKE_PAR_MIN_ROWS_STR  200000
 #define LIKE_PAR_MIN_ROWS_SYM  100000
+/* The dictionary sweep's rows: fewer name at most as many entries, which
+ * cost no more read in row order, so the residency probe is not paid. */
+#define LIKE_SWEEP_MIN_ROWS    65536
 
 /* SYM-LIKE row worker: one pass over the rows.  lut[sid] is 0 while the
  * symbol is unresolved, 1 for "no match", 2 for "match".  A worker that
@@ -520,12 +523,15 @@ ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
                 rctx.sel_idx    = ray_rowsel_idx(selection);
                 rctx.sel_n_segs = sm->n_segs;
             }
+            int64_t work = len;
+            if (selection) work = ray_rowsel_meta(selection)->total_pass;
             rctx.raw_ok = dom ? ray_sym_domain_raw_pin(dom, &rctx.raw) : false;
             ray_pool_t* pool = ray_pool_get();
             bool par = ray_pool_par_dispatch_ok(pool, len, LIKE_PAR_MIN_ROWS_SYM);
             /* A big FILE dictionary: mark the codes the rows name, resolve
              * them in dictionary order, then fill the rows from the table. */
-            if (rctx.raw_ok && dict_n >= 65536 && ray_sym_domain_raw_cold(&rctx.raw)) {
+            if (rctx.raw_ok && dict_n >= 65536 && work >= LIKE_SWEEP_MIN_ROWS &&
+                ray_sym_domain_raw_cold(&rctx.raw)) {
                 rctx.mark = true;
                 if (par) ray_pool_dispatch(pool, like_rows_fn, &rctx, len);
                 else like_rows_fn(&rctx, 0, 0, len);
