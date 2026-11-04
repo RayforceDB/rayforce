@@ -485,9 +485,14 @@ static test_result_t test_delta_width_lengths(void) {
         ray_enc_kind_t k = { (uint8_t)T, true, false };
         for (int b = 0; b < 10; b++) {
             const int n = ns[b] > 0 ? ns[b] : 1;
-            for (int d = 0; d < 2; d++) {
-                if (d) delta_data(v, n, T);
-                else for_data(v, n, T, -200, 1000, 0x9e37ull + (uint64_t)T * 1031 + (uint64_t)n);
+            for (int d = 0; d < 3; d++) {
+                if (d == 1) delta_data(v, n, T);
+                else if (d == 0) for_data(v, n, T, -200, 1000, 0x9e37ull + (uint64_t)T * 1031 + (uint64_t)n);
+                else {            /* one bump at n - L: only the first padded row's delta is -1 */
+                    if (n < L) continue;
+                    for (int i = 0; i < n; i++) v[i] = 40;
+                    v[n - L] = 41;
+                }
                 int w; uint64_t db, rdb;
                 (void)ref_delta_body(v, n, T, exp, &w);
                 memcpy(&rdb, exp, 8);
