@@ -50,7 +50,7 @@ Signature: `(.log.status)`. Returns a dict describing the journal; read-only, an
 
 | Key | Type | Meaning |
 |---|---|---|
-| `open` | bool | a journal handle is present, i.e. writes and auto-journaled requests are being appended. A handle, not proof that the last append reached the disk |
+| `open` | bool | a journal handle is present. Not proof of append health or durability: a failed append is not reflected here, and writes are also suppressed during replay |
 | `opened_ok` | bool | a journal was opened successfully at least once in this process; false after a failed first open, and after [`.log.purge`](#log-purge) |
 | `path` | string, or null | the last **successfully** opened log file (`<base>.log`); null if there was none |
 | `mode` | sym, or null | `'sync` or `'async` of that journal; null if there was none |

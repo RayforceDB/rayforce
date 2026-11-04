@@ -797,7 +797,7 @@ Built-in Entity-Attribute-Value store. The EAV table has three columns: `e` (ent
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.log.status` | variadic | — | Journal state as a dict: `open` (handle present), `path`, `mode` (`sync`/`async`, null if never opened), `bytes`, `auto` (inside an auto-journaled request); never raises | `(if (get (.log.status) 'open) null (exit 1))` |
+| `.log.status` | variadic | — | Journal state as a dict of six fields: `open` (handle present), `opened_ok` (a journal was opened successfully at least once), `path`, `mode` (`sync`/`async`; both null if never opened successfully), `bytes` (nullable: null if the size probe failed), `auto` (inside an auto-journaled request); raises only on allocation/intern failure | `(if (get (.log.status) 'open) null (exit 1))` |
 
 ## Datalog
 

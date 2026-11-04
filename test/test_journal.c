@@ -2293,7 +2293,7 @@ static int status_lost_roll_child(const char* want, const char* bad_src) {
     bool w_err = w && RAY_IS_ERR(w);
     status_free(w);
     if (!w_err) return 6;
-    /* a failed open of another base leaves the remembered identity alone */
+    /* a failed open of another base (lock stage) leaves the remembered identity alone */
     ray_t* b = ray_eval_str(bad_src);
     bool b_err = b && RAY_IS_ERR(b);
     status_free(b);
@@ -2310,6 +2310,8 @@ static test_result_t test_ops_log_status(void) {
     char base[256]; make_base(base, sizeof(base), "ops_status");
     char want[300]; snprintf(want, sizeof(want), "%s.log", base);
     char src[400], bad_src[400];
+    /* lock stage: the .lk cannot be created, so journal_lock fails before
+     * any candidate path/mode exists */
     snprintf(bad_src, sizeof(bad_src), "(.log.open 'sync \"%s_nodir/x/y\")", base);
 
     /* Reset the process-wide journal state that earlier tests may have
@@ -2326,7 +2328,7 @@ static test_result_t test_ops_log_status(void) {
                      && status_is_null(s0, "path") && status_is_null(s0, "mode");
     status_free(s0);
 
-    /* A failed first open does not report an identity. */
+    /* A failed first open (lock stage) does not report an identity. */
     ray_t* f = ray_eval_str(bad_src);
     bool f_err = f && RAY_IS_ERR(f);
     status_free(f);
@@ -2391,6 +2393,97 @@ static test_result_t test_ops_log_status(void) {
     TEST_ASSERT_TRUE(child_ok);
     TEST_ASSERT_TRUE(s3_open);
     TEST_ASSERT_TRUE(s4_closed);
+    PASS();
+}
+
+#ifndef _WIN32
+static bool path_size(const char* path, off_t* size) {
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    *size = st.st_size;
+    return true;
+}
+
+/* Child half of the post-lock failure cases.  The base directory is valid,
+ * so <base>.lk is created (0 bytes, allowed under RLIMIT_FSIZE 1) and the
+ * lock is taken; <base>.log is created by fopen("ab"), and the 16-byte
+ * preamble write then fails.  The failure stage is asserted on the files:
+ * the lock file exists and the log file exists but is shorter than the
+ * preamble, which cannot be a lock-stage failure.  `keep` is NULL for the
+ * first-open case, else the base opened successfully (unrestricted) first.
+ * Returns 0 or the number of the first failed check. */
+static int status_open_stage_child(const char* keep, const char* bad) {
+    if (ray_journal_is_open()) ray_journal_close();
+    ray_journal_purge();
+    char want[320] = "";
+    char src[400];
+    if (keep) {
+        snprintf(want, sizeof(want), "%s.log", keep);
+        snprintf(src, sizeof(src), "(.log.open 'async \"%s\")", keep);
+        ray_t* a = ray_eval_str(src);
+        bool a_ok = a && !RAY_IS_ERR(a);
+        status_free(a);
+        if (!a_ok) return 1;
+        ray_journal_close();
+    }
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_FSIZE, &lim) != 0) return 2;
+    lim.rlim_cur = 1;
+    if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) return 3;
+    if (setrlimit(RLIMIT_FSIZE, &lim) != 0) return 4;
+    snprintf(src, sizeof(src), "(.log.open 'sync \"%s\")", bad);
+    ray_t* b = ray_eval_str(src);
+    bool b_err = b && RAY_IS_ERR(b);
+    status_free(b);
+    if (!b_err) return 5;
+    /* stage: lock taken (.lk exists), log created, preamble incomplete */
+    char p[320]; off_t sz = -1;
+    snprintf(p, sizeof(p), "%s.lk", bad);
+    if (!path_size(p, &sz)) return 6;
+    snprintf(p, sizeof(p), "%s.log", bad);
+    if (!path_size(p, &sz) || sz >= 16) return 7;
+    ray_t* s = ray_eval_str("(.log.status)");
+    bool good;
+    if (keep)
+        good = !status_open(s) && status_opened_ok(s) && status_path_is(s, want)
+               && status_mode_is(s, "async");
+    else
+        good = !status_open(s) && !status_opened_ok(s)
+               && status_is_null(s, "path") && status_is_null(s, "mode");
+    status_free(s);
+    return good ? 0 : 8;
+}
+
+static int status_open_stage_run(const char* keep, const char* bad) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(status_open_stage_child(keep, bad));
+    if (pid < 0) return -1;
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) return -2;
+    return WEXITSTATUS(st);
+}
+#endif
+
+/* .log.status identity when the open fails AFTER the lock is taken, at the
+ * open/preamble stage (the shared-process test above only covers a lock
+ * stage failure).  Both cases run in forked children (RLIMIT_FSIZE 1 byte,
+ * SIGXFSZ ignored there only). */
+static test_result_t test_ops_log_status_open_stage(void) {
+    char a[256], b[256], c[256];
+    make_base(a, sizeof(a), "ops_stage_a");
+    make_base(b, sizeof(b), "ops_stage_b");
+    make_base(c, sizeof(c), "ops_stage_c");
+    if (ray_journal_is_open()) ray_journal_close();
+    ray_journal_purge();
+#ifndef _WIN32
+    int first_rc = status_open_stage_run(NULL, b);   /* never opened, open b fails */
+    int later_rc = status_open_stage_run(a, c);      /* A opened, open c fails */
+#else
+    int first_rc = 0, later_rc = 0;   /* RLIMIT_FSIZE injection is POSIX only */
+#endif
+    cleanup_base(a); cleanup_base(b); cleanup_base(c);
+    TEST_ASSERT_EQ_I(first_rc, 0);
+    TEST_ASSERT_EQ_I(later_rc, 0);
     PASS();
 }
 
@@ -3041,6 +3134,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
     { "journal/ops_auto_journal_eval_predicate", test_ops_auto_journal_eval_predicate, jrn_setup, jrn_teardown },
     { "journal/ops_log_status", test_ops_log_status, jrn_setup, jrn_teardown },
+    { "journal/ops_log_status_open_stage", test_ops_log_status_open_stage, jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
