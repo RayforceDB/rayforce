@@ -1017,6 +1017,46 @@ ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const cha
     return err;
 }
 
+ray_err_t ray_encw_train(ray_encw_t* w, const void* data, int64_t n) {
+    if (w->type == RAY_STR || w->type == RAY_SYM) return RAY_ERR_NYI;
+    if (w->chunk_i != 0 || w->n_chunks == 0) return RAY_ERR_RANGE;
+    int64_t want = w->len < RAY_ENC_CHUNK ? w->len : RAY_ENC_CHUNK;
+    if (n != want) return RAY_ERR_RANGE;
+    if ((w->type == RAY_F32 || w->type == RAY_F64) && !ray_enc_fp_env_ok()) return RAY_ERR_FPENV;
+    return ray_encw_type_has_dict(w->type) ? train_dict(w, data, n) : RAY_OK;
+}
+
+ray_err_t ray_encw_encode(const ray_encw_t* w, int64_t c, const void* data, ray_encw_part_t* p) {
+    if (w->type == RAY_STR || w->type == RAY_SYM) return RAY_ERR_NYI;
+    if (c < 0 || c >= w->n_chunks) return RAY_ERR_RANGE;
+    int64_t n = w->len - c * RAY_ENC_CHUNK;
+    if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+    ray_enc_buf_t chunk = p->w.chunk;
+    ray_encw_vec_t vec = p->w.vec;
+    p->w = *w;
+    p->w.chunk = chunk; p->w.vec = vec;
+    p->w.dict_used = p->w.any_bitmap_null = false;
+    p->c = c;
+    return encw_chunk_body(&p->w, data, NULL, n, &p->de);
+}
+
+ray_err_t ray_encw_put(ray_encw_t* w, ray_encw_part_t* p) {
+    if (p->c != w->chunk_i || w->chunk_i >= w->n_chunks) return RAY_ERR_RANGE;
+    w->dict_used |= p->w.dict_used;
+    w->any_bitmap_null |= p->w.any_bitmap_null;
+    ray_enc_dirent_t* de = &w->dir[w->chunk_i];
+    *de = p->de;
+    de->offset = w->pos;
+    ray_err_t err = fput(w, p->w.chunk.p, p->w.chunk.len);
+    if (err == RAY_OK) w->chunk_i++;
+    return err;
+}
+
+void ray_encw_part_free(ray_encw_part_t* p) {
+    ray_enc_buf_free(&p->w.chunk);
+    ray_encw_vec_free(&p->w.vec);
+}
+
 /* The persisted attrs of the column: the source's disk attrs, HAS_NULLS
  * for bitmap nulls. */
 static uint8_t encw_final_attrs(const ray_encw_t* w, bool has_nulls) {

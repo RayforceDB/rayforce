@@ -142,6 +142,24 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
  * serially otherwise.  STR stays serial: its STR_DICT entries and DICT index
  * follow row order. */
 ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool);
+/* A column whose chunks are encoded where their rows arrive (any thread,
+ * any order) and written in chunk order: ray_encw_train trains the column's
+ * structures on chunk 0's rows, as ray_encw_chunk does; ray_encw_encode then
+ * encodes chunk `c` (its rows contiguous at `data`) into a part, reading the
+ * writer only; ray_encw_put writes the part of chunk chunk_i.  The file is
+ * byte for byte what ray_encw_chunk chunk by chunk writes.  Not for STR
+ * (its STR_DICT entries and DICT index follow row order) or SYM (prefix
+ * bounds).  A part starts zeroed and may be reused; ray_encw_part_free
+ * releases its buffers. */
+typedef struct {
+    ray_encw_t       w;        /* a shallow copy of the writer: the trained structures are shared */
+    ray_enc_dirent_t de;
+    int64_t          c;
+} ray_encw_part_t;
+ray_err_t ray_encw_train(ray_encw_t* w, const void* data, int64_t n);
+ray_err_t ray_encw_encode(const ray_encw_t* w, int64_t c, const void* data, ray_encw_part_t* p);
+ray_err_t ray_encw_put(ray_encw_t* w, ray_encw_part_t* p);
+void      ray_encw_part_free(ray_encw_part_t* p);
 ray_err_t ray_encw_finish(ray_encw_t* w);
 void      ray_encw_free(ray_encw_t* w);
 /* Write s's index as the region (index_kind = the root's kind).  A writer

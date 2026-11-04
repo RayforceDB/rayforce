@@ -1913,6 +1913,28 @@ static bool pq_remove_dir(const char* path) {
  * (see pq_write_direct). */
 #define PQ_COLWISE_RATIO 2
 
+/* A chunked column's chunks on their way from the tasks to its file
+ * (ray_col_stream_chunked_begin): the task that holds a chunk's last rows
+ * encodes it, a chunk that crosses row groups gathered in `edge` first;
+ * whoever holds `lock` puts the encoded parts in chunk order, so no task
+ * waits for another and the payload is never staged whole. */
+typedef struct {
+    ray_col_stream_t* s;           /* NULL: the pass column is not chunked */
+    int64_t n_chunks;
+    size_t esz;
+    ray_encw_part_t** part;        /* [n_chunks] encoded, not yet put */
+    _Atomic(uint8_t)* ready;       /* [n_chunks] part[c] is set */
+    _Atomic(uint8_t*)* edge;       /* [n_chunks] the rows gathered of a chunk that crosses row groups */
+    _Atomic(int64_t)* filled;      /* [n_chunks] how many */
+    _Atomic(int64_t) next;         /* the chunk to put next */
+    atomic_flag lock;
+    _Atomic(int) err;              /* the first put's error (ray_err_t) */
+} pq_chunked;
+
+/* A worker's decode buffer for the chunked tasks, grown and kept for the
+ * import. */
+typedef struct { uint8_t* p; size_t cap; } pq_cbuf;
+
 typedef struct {
     ray_parquet_t* parent;
     ray_col_stream_t* writers;
@@ -1932,6 +1954,9 @@ typedef struct {
     int64_t nspare;
     bool reverse;                  /* debug: the row groups last to first (RAY_PQ_DIRECT_REVERSE) */
     pq_task_msg* emsg;             /* the failed tasks' messages (errors[]'s) */
+    int64_t task0;                 /* the dispatch's first task: a window of row groups starts at task0 / npass */
+    pq_chunked* chunked;           /* [npass] the pass's columns, or NULL: none chunked */
+    pq_cbuf* cbuf;                 /* [nspare] */
 } pq_direct_work;
 
 /* Trade a task cursor's page, dictionary and symbol buffers with its
@@ -2165,14 +2190,170 @@ static void pq_prefetch_chunks(pq_direct_work* w, int64_t g, int64_t c) {
         ray_vm_advise_willneed(r->map + lo,(size_t)(hi-lo));
     }
 }
+/* Row group g of column c decoded into dst, room for `cap` rows: NULL, or
+ * the task's error.  *got: the rows; *flagged: a batch flagged HAS_NULLS
+ * (ray_col_stream_append's rule). */
+static ray_t* pq_decode_rows(pq_direct_work* w, pq_column* spare, int64_t g, int64_t c,
+                             uint8_t* dst, int64_t cap, int64_t* got, bool* flagged) {
+    *got = 0;
+    if (w->prefetched) pq_prefetch_chunks(w,g,c);
+    ray_parquet_t* r = pq_group_reader(w->parent,g,1);
+    if (!r) return ray_error("oom",NULL);
+    r->selected[0] = (int32_t)c; r->nselected = r->noutput = 1;
+    if (spare) pq_trade_buffers(&r->cursors[0],spare);
+    int8_t type = w->writers[c].type;
+    size_t esz = ray_elem_size(type);
+    ray_t* err = NULL;
+    for (;;) {
+        ray_t* batch = ray_parquet_next(r);
+        if (!batch) break;
+        if (RAY_IS_ERR(batch)) { err = batch; break; }
+        ray_t* bcol = ray_table_col_idx(batch,0);
+        if (bcol && RAY_IS_ERR(bcol)) { err = bcol; ray_release(batch); break; }
+        if (!bcol || bcol->type != type || (bcol->attrs & RAY_ATTR_SLICE)) {
+            err = ray_error(ray_err_code_str(RAY_ERR_TYPE),"parquet: direct column write failed");
+            ray_release(batch); break;
+        }
+        if (bcol->len > cap - *got) {
+            err = pq_error("row group holds more rows than its metadata gives");
+            ray_release(batch); break;
+        }
+        if (bcol->len) memcpy(dst + (size_t)*got * esz, ray_data(bcol), (size_t)bcol->len * esz);
+        if (bcol->attrs & RAY_ATTR_HAS_NULLS) *flagged = true;
+        *got += bcol->len;
+        ray_release(batch);
+    }
+    if (spare) pq_trade_buffers(&r->cursors[0],spare);
+    ray_parquet_close(r);
+    return err;
+}
+
+/* Put the chunked column's ready parts in chunk order.  The lock is only
+ * tried: its holder puts what is ready and looks again after letting go, so
+ * a part made ready meanwhile is put by one of the two (the ready flags, the
+ * lock and that second look are sequentially consistent).  After a put
+ * fails, the parts are freed unput. */
+static void pq_chunked_flush(pq_chunked* k) {
+    while (!atomic_flag_test_and_set(&k->lock)) {
+        int64_t c = atomic_load_explicit(&k->next,memory_order_relaxed);
+        while (c < k->n_chunks && atomic_load(&k->ready[c])) {
+            ray_encw_part_t* p = k->part[c];
+            if (atomic_load_explicit(&k->err,memory_order_relaxed) == RAY_OK) {
+                ray_err_t e = ray_encw_put(k->s->ew,p);
+                if (e != RAY_OK) atomic_store_explicit(&k->err,(int)e,memory_order_relaxed);
+            }
+            ray_encw_part_free(p); ray_free_raw(p); k->part[c] = NULL;
+            c++;
+        }
+        atomic_store_explicit(&k->next,c,memory_order_relaxed);
+        atomic_flag_clear(&k->lock);
+        if (!(c < k->n_chunks && atomic_load(&k->ready[c]))) return;
+    }
+}
+
+static ray_err_t pq_chunked_encode(pq_chunked* k, int64_t ch, const uint8_t* data, bool* nulls) {
+    ray_encw_part_t* p = ray_calloc_raw(sizeof(*p));
+    if (!p) return RAY_ERR_OOM;
+    ray_err_t e = ray_encw_encode(k->s->ew,ch,data,p);
+    if (e != RAY_OK) { ray_encw_part_free(p); ray_free_raw(p); return e; }
+    if (p->de.null_count) *nulls = true;
+    k->part[ch] = p;
+    atomic_store(&k->ready[ch],1);
+    return RAY_OK;
+}
+
+/* A chunked column's row group: decoded into the worker's buffer, its whole
+ * chunks encoded from there, its rows of a chunk shared with a neighbouring
+ * row group added to that chunk's edge (the task that completes an edge
+ * encodes it); then the ready parts go to the file. */
+static void pq_chunked_task(pq_direct_work* w, uint32_t worker, pq_column* spare,
+                            int64_t g, int64_t i, int64_t task) {
+    pq_chunked* k = &w->chunked[i];
+    int64_t c = w->pass[i], rows = w->parent->rows;
+    int64_t r0 = w->offsets[g], r1 = w->offsets[g+1], n = r1 - r0;
+    if (n <= 0) return;
+    size_t esz = k->esz, need = (size_t)n * esz;
+    pq_cbuf own = {0};
+    pq_cbuf* b = w->cbuf && (int64_t)worker < w->nspare ? &w->cbuf[worker] : &own;
+    if (b->cap < need) {
+        ray_free_raw(b->p);
+        b->p = ray_alloc_raw(need); b->cap = b->p ? need : 0;
+        if (!b->p) { w->errors[task] = ray_error("oom",NULL); return; }
+    }
+    int64_t got = 0;
+    bool flagged = false, nulls = false;
+    ray_t* e = pq_decode_rows(w,spare,g,c,b->p,n,&got,&flagged);
+    if (!e && got != n) e = pq_error("row group ended before its assigned output range");
+    ray_err_t ee = RAY_OK;
+    for (int64_t ch = r0 / RAY_ENC_CHUNK; !e && ee == RAY_OK && ch * RAY_ENC_CHUNK < r1; ch++) {
+        int64_t cs = ch * RAY_ENC_CHUNK, cz = cs + RAY_ENC_CHUNK < rows ? cs + RAY_ENC_CHUNK : rows;
+        int64_t a = cs > r0 ? cs : r0, z = cz < r1 ? cz : r1;
+        const uint8_t* src = b->p + (size_t)(a - r0) * esz;
+        if (a == cs && z == cz) { ee = pq_chunked_encode(k,ch,src,&nulls); continue; }
+        uint8_t* eb = atomic_load(&k->edge[ch]);
+        if (!eb) {
+            uint8_t* nb = ray_alloc_raw((size_t)(cz - cs) * esz);
+            if (!nb) { ee = RAY_ERR_OOM; break; }
+            if (atomic_compare_exchange_strong(&k->edge[ch],&eb,nb)) eb = nb;
+            else ray_free_raw(nb);
+        }
+        memcpy(eb + (size_t)(a - cs) * esz, src, (size_t)(z - a) * esz);
+        if (atomic_fetch_add(&k->filled[ch],z - a) + (z - a) == cz - cs) {
+            ee = pq_chunked_encode(k,ch,eb,&nulls);
+            atomic_store(&k->edge[ch],NULL);
+            ray_free_raw(eb);
+        }
+    }
+    if (!e && ee != RAY_OK) e = ray_error(ray_err_code_str(ee),"parquet: column chunk encode failed");
+    if (e) w->errors[task] = e;
+    if (flagged || nulls) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
+    if (b == &own) ray_free_raw(own.p);
+    pq_chunked_flush(k);
+}
+
+/* Each chunked pass column trained on its first chunk's rows (ray_encw_train),
+ * decoded from the row groups holding them; their own tasks decode those rows
+ * again.  A failure is the error of the column's task in row group 0. */
+static void pq_chunked_train(void* ptr, uint32_t worker, int64_t start, int64_t end) {
+    pq_direct_work* w = ptr;
+    pq_column* spare = (int64_t)worker < w->nspare ? &w->spare[worker] : NULL;
+    for (int64_t i = start; i < end; i++) {
+        pq_chunked* k = &w->chunked[i];
+        if (!k->s || !k->n_chunks) continue;
+        int64_t want = w->parent->rows < RAY_ENC_CHUNK ? w->parent->rows : RAY_ENC_CHUNK;
+        int64_t ng = 0;
+        while (w->offsets[ng] < want) ng++;           /* row groups [0, ng) hold rows [0, want) */
+        int64_t cap = w->offsets[ng], at = 0;
+        uint8_t* buf = ray_alloc_raw((size_t)cap * k->esz);
+        ray_t* e = buf ? NULL : ray_error("oom",NULL);
+        for (int64_t g = 0; g < ng && !e; g++) {
+            int64_t got = 0; bool fl = false;
+            e = pq_decode_rows(w,spare,g,w->pass[i],buf + (size_t)at * k->esz,cap - at,&got,&fl);
+            at += got;
+        }
+        if (!e && at < want) e = pq_error("row group ended before its assigned output range");
+        if (!e) {
+            ray_err_t te = ray_encw_train(k->s->ew,buf,want);
+            if (te != RAY_OK) e = ray_error(ray_err_code_str(te),"parquet: column chunk encode failed");
+        }
+        ray_free_raw(buf);
+        if (e) { w->errors[i] = e; pq_task_msg_note(w->emsg,i); }
+    }
+}
+
 static void pq_write_direct_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     pq_direct_work* w = ptr;
     pq_column* spare = (int64_t)worker < w->nspare ? &w->spare[worker] : NULL;
-    for (int64_t task = start; task < end; task++) {
+    for (int64_t task = w->task0 + start; task < w->task0 + end; task++) {
         /* Row groups outermost within a pass: a worker reads one group's
          * chunks of the pass's columns side by side. */
         int64_t g = task/w->npass, c = w->pass[task%w->npass];
         if (w->reverse) g = w->parent->ngroups-1-g;
+        if (w->chunked && w->chunked[task%w->npass].s) {
+            pq_chunked_task(w,worker,spare,g,task%w->npass,task);
+            if (w->errors[task]) pq_task_msg_note(w->emsg,task);
+            continue;
+        }
         if (w->prefetched) pq_prefetch_chunks(w,g,c);
         ray_parquet_t* r = pq_group_reader(w->parent,g,1);
         if (!r) { w->errors[task] = ray_error("oom",NULL); goto next; }
@@ -2966,10 +3147,38 @@ static int64_t pq_imp_count(ray_col_stream_t* writers, const int64_t* order, int
     return n;
 }
 /* The raw payload a generation-2 column stages until its close (STR keeps
- * its own files). */
+ * its own files; a chunked column stages none). */
 static int64_t pq_stage_bytes(const ray_col_stream_t* s, int64_t rows) {
-    if (s->gen != 2 || s->type == RAY_STR) return 0;
+    if (s->gen != 2 || s->type == RAY_STR || s->ew) return 0;
     return rows*(int64_t)(s->type == RAY_SYM ? 4 : ray_elem_size(s->type));
+}
+
+static bool pq_chunked_init(pq_chunked* k, ray_col_stream_t* s) {
+    memset(k,0,sizeof(*k));
+    atomic_flag_clear(&k->lock);
+    int64_t n = s->ew->n_chunks;
+    k->s = s; k->n_chunks = n; k->esz = ray_elem_size(s->type);
+    k->part = ray_calloc_raw((size_t)(n+1)*sizeof(*k->part));
+    k->ready = ray_calloc_raw((size_t)(n+1)*sizeof(*k->ready));
+    k->edge = ray_calloc_raw((size_t)(n+1)*sizeof(*k->edge));
+    k->filled = ray_calloc_raw((size_t)(n+1)*sizeof(*k->filled));
+    if (!k->part || !k->ready || !k->edge || !k->filled) return false;
+    for (int64_t c = 0; c < n; c++) {
+        atomic_init(&k->ready[c],0); atomic_init(&k->edge[c],NULL); atomic_init(&k->filled[c],0);
+    }
+    atomic_init(&k->next,0); atomic_init(&k->err,(int)RAY_OK);
+    return true;
+}
+
+/* A chunked pass column's state: an error that left parts unput or edges
+ * unfilled frees them here. */
+static void pq_chunked_free(pq_chunked* k) {
+    for (int64_t c = 0; c < k->n_chunks; c++) {
+        if (k->part && k->part[c]) { ray_encw_part_free(k->part[c]); ray_free_raw(k->part[c]); }
+        if (k->edge) ray_free_raw(atomic_load(&k->edge[c]));
+    }
+    ray_free_raw(k->part); ray_free_raw((void*)k->ready); ray_free_raw((void*)k->edge); ray_free_raw((void*)k->filled);
+    memset(k,0,sizeof(*k));
 }
 
 static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
@@ -2998,6 +3207,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     ray_symgrp_order_t so = RAY_SYMGRP_ROWS;
     ray_thread_t sym_thread = 0;
     bool sym_running = false;
+    pq_chunked* chk = NULL;   /* [ncols] the pass's chunked columns (pq_direct_work.chunked) */
+    pq_cbuf* cbuf = NULL;     /* [nspare] pq_direct_work.cbuf */
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !pick || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
@@ -3060,12 +3271,28 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (e && !strcmp(e,"file")) stage = 'f';
         else if (e && !strcmp(e,"mem")) stage = 'm';
     }
+    /* A numeric or temporal generation-2 column stages nothing: its chunks
+     * are encoded in the tasks that decode their rows and written in order
+     * as they come (pq_chunked), the memory they wait in bounded by windows
+     * of row groups.  RAY_PQ_STAGE stages them as before. */
+    int64_t nchunked = 0;
+    for (int64_t c = 0; c < r->ncols && !stage; c++) {
+        if (!ray_col_stream_chunked_ok(&writers[c])) continue;
+        ray_err_t ce = ray_col_stream_chunked_begin(&writers[c],r->rows);
+        if (ce != RAY_OK) { err = ray_error(ray_err_code_str(ce),"parquet: column writer"); goto done; }
+        nchunked++;
+    }
     bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
     spare = ray_calloc_raw((size_t)workers*sizeof(*spare));   /* best effort */
     if (spare) nspare = workers;
+    if (nchunked) {
+        chk = ray_calloc_raw((size_t)r->ncols*sizeof(*chk));
+        cbuf = nspare ? ray_calloc_raw((size_t)nspare*sizeof(*cbuf)) : NULL;   /* best effort, as spare */
+        if (!chk) { err = ray_error("oom",NULL); goto done; }
+    }
     pq_task_msg emsg;   /* the failed tasks' messages, a pass at a time */
     pq_task_msg_reset(&emsg);
-    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare,false,&emsg};
+    pq_direct_work work = {r,writers,offsets,nulls,locks,errors,NULL,0,lo,hi,NULL,0,0,true,spare,nspare,false,&emsg,0,NULL,cbuf};
     /* Starting each chunk's writeback as it is written spares one pass its
      * final sync; column by column the passes end their files anyway and
      * the extra I/O requests only slow the decode. */
@@ -3226,6 +3453,9 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         int64_t tasks = r->ngroups*work.npass;
         int64_t t0 = trace ? ray_profile_now_ns() : 0, t1 = 0;
         int64_t raw = 0, in_mem = 0, held = 0;   /* the pass's staged payload (saturating); in memory: columns, bytes */
+        ray_t* cerr = NULL;   /* the chunked columns' error, after the tasks' */
+        int64_t pchk = 0;     /* the trace's: chunked columns in the pass */
+        for (int64_t i = 0; i < work.npass; i++) if (writers[work.pass[i]].ew) pchk++;
         for (int64_t i = 0; i < work.npass; i++) {
             int64_t b = pq_stage_bytes(&writers[work.pass[i]],r->rows);
             raw = b > INT64_MAX - raw ? INT64_MAX : raw + b;
@@ -3275,8 +3505,59 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             }
             pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,budget,workers,trace);
         } else if (tasks > 0) {
-            if (ray_pool_par_dispatch_ok(pool,tasks,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)tasks);
-            else pq_write_direct_group(&work,0,0,tasks);
+            /* the pass's chunked columns, trained before their row groups go */
+            int64_t nchk = 0, per = 0, gmax = 0;
+            for (int64_t g = 0; g < r->ngroups; g++) if (offsets[g+1]-offsets[g] > gmax) gmax = offsets[g+1]-offsets[g];
+            for (int64_t i = 0; chk && i < work.npass && !cerr; i++) {
+                if (!writers[work.pass[i]].ew) { memset(&chk[i],0,sizeof(chk[i])); continue; }
+                if (!pq_chunked_init(&chk[i],&writers[work.pass[i]])) { cerr = ray_error("oom",NULL); break; }
+                nchk++; per += gmax*(int64_t)chk[i].esz;
+            }
+            if (nchk) {
+                work.chunked = chk;
+                if (!cerr) {
+                    if (ray_pool_par_dispatch_ok(pool,work.npass,2)) ray_pool_dispatch_n(pool,pq_chunked_train,&work,(uint32_t)work.npass);
+                    else pq_chunked_train(&work,0,0,work.npass);
+                }
+            }
+            /* Windows of row groups: a window's rows (its parts before they
+             * are put, its decode buffers) within a quarter of the memory
+             * free under the heap's watermark; one window where it holds
+             * them all, as every pass without a chunked column. */
+            int64_t wg = r->ngroups;
+            if (nchk && per > 0) {
+                int64_t wm = ray_heap_anon_watermark();
+                int64_t budget = wm > 0 ? (wm - ray_heap_anon_committed()) / 4 : INT64_MAX;
+                if (budget < ((int64_t)64 << 20)) budget = (int64_t)64 << 20;
+                wg = budget / per;
+#if defined(DEBUG)
+                const char* e = getenv("RAY_PQ_CHUNK_WINDOW");   /* the suite: row groups a window */
+                if (e && *e && strtoll(e,NULL,10) > 0) wg = strtoll(e,NULL,10);
+#endif
+                if (wg < 1) wg = 1;
+                if (wg > r->ngroups) wg = r->ngroups;
+            }
+            bool failed = cerr != NULL;
+            for (int64_t t = 0; nchk && t < work.npass; t++) failed |= errors[t] != NULL;   /* the trainings' */
+            for (int64_t g0 = 0; g0 < r->ngroups && !failed; g0 += wg) {
+                int64_t ng = r->ngroups - g0 < wg ? r->ngroups - g0 : wg, nt = ng*work.npass;
+                work.task0 = g0*work.npass;
+                if (ray_pool_par_dispatch_ok(pool,nt,2)) ray_pool_dispatch_n(pool,pq_write_direct_group,&work,(uint32_t)nt);
+                else pq_write_direct_group(&work,0,0,nt);
+                for (int64_t i = 0; nchk && i < work.npass; i++) if (chk[i].s) pq_chunked_flush(&chk[i]);
+                for (int64_t t = work.task0; t < work.task0 + nt; t++) failed |= errors[t] != NULL;
+                if (ray_interrupted()) break;
+            }
+            for (int64_t i = 0; nchk && i < work.npass; i++) {
+                pq_chunked* k = &chk[i];
+                if (!k->s) continue;
+                int ke = atomic_load(&k->err);
+                if (!cerr && ke != RAY_OK) cerr = ray_error(ray_err_code_str((ray_err_t)ke),"parquet: column chunk write failed");
+                else if (!cerr && !failed && !ray_interrupted() && atomic_load(&k->next) != k->n_chunks)
+                    cerr = pq_error("column chunks left unwritten");
+                pq_chunked_free(k);
+            }
+            work.chunked = NULL; work.task0 = 0;
         }
         if (pg && pg != sgrp) ray_symgrp_free(pg);   /* a column's own (symfile 'column) */
         /* errors[0] even with no tasks: a grouped pass over a file of no row
@@ -3285,6 +3566,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             if (!err) err = pq_task_msg_raise(&emsg,t,errors[t]); else ray_error_free(errors[t]);
             errors[t] = NULL;
         }
+        if (cerr) { if (!err) err = cerr; else ray_error_free(cerr); cerr = NULL; }
         pq_task_msg_reset(&emsg);
         if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
         if (!err && atomic_load_explicit(&symf.err,memory_order_acquire) != RAY_OK)
@@ -3319,10 +3601,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         }
         if (trace && !err) {
             ray_t* nm = ray_sym_str(r->schema[work.pass[0]].name);
-            fprintf(stderr,"parquet pass: first=%.*s cols=%lld %s decode=%.1fms close=%.1fms mem_staged=%lld\n",
+            fprintf(stderr,"parquet pass: first=%.*s cols=%lld %s decode=%.1fms close=%.1fms mem_staged=%lld chunked=%lld\n",
                     (int)ray_str_len(nm),ray_str_ptr(nm),(long long)work.npass,
                     writers[work.pass[0]].type == RAY_SYM ? "sym" : "num",
-                    (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6,(long long)in_mem);
+                    (double)(t1-t0)/1e6,(double)(ray_profile_now_ns()-t1)/1e6,(long long)in_mem,(long long)pchk);
             if (symf.dom && ray_sym_domain_import_stats(symf.dom,&ist) && ist.strings)
                 fprintf(stderr,"parquet symimp: strings=%lld dedup=%lld probes=%lld hits=%lld added=%lld"
                         " slots=%lld false_tags=%lld grows=%lld grow_mb=%.1f"
@@ -3361,6 +3643,9 @@ done:
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
     }
     ray_free_raw(spare);
+    for (int64_t i = 0; cbuf && i < nspare; i++) ray_free_raw(cbuf[i].p);
+    ray_free_raw(cbuf);
+    ray_free_raw(chk);
     ray_free_raw(fdoms);
     ray_symgrp_free(sgrp);
     return err;
