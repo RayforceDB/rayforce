@@ -309,6 +309,18 @@ typedef struct ray_ipc_header_t {
 
 The header is exactly 16 bytes, enforced by a compile-time static assertion.
 
+A receiver admits a positive wire body of at most 256 MiB. The decoded
+serialized body is also limited to 256 MiB: compression does not raise this
+limit. An oversized response is replaced with an `io` error rather than a
+frame the peer will reject.
+
+Queued outgoing messages have a separate 256 MiB **complete-frame** cap,
+including the 16-byte header. Thus a plain queued body is at most 268435440
+bytes; a compression-eligible decoded body up to 256 MiB may still fit after
+compression. Known-uncompressed and decoded-size refusals occur before
+payload allocation. These per-message limits are not a process-memory budget.
+
+
 ### Wire-version history
 
 - **v2** — atoms serialized as `type(1) + value-bytes`. Typed-null atoms (`0Nl`, `0Nf`, …) lost their null bit on round-trip.
