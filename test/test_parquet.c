@@ -4051,14 +4051,21 @@ static test_result_t test_pq_stage_mem(void) {
                 bad++; continue;
             }
             ray_release(res);
-            /* each of the three columns staged in memory once, but under
-             * 'file, or by default with no memory size to go by (no runtime) */
+            /* each of the three columns staged in memory once under 'mem; by
+             * default the two SYM ones, numeric x chunked (staging nothing),
+             * and none with no memory size to go by (no runtime); none under
+             * 'file */
             int lines = 0;
             double staged = pq_trace_sum(trace, "mem_staged", &lines);
-            double want = k == 1 || !mem_files || (k == 0 && ram <= 0) ? 0 : 3;
+            double want = k == 1 || !mem_files || (k == 0 && ram <= 0) ? 0 : k == 0 ? 2 : 3;
             if (!lines || staged != want) {
                 fprintf(stderr, "  %d/%d: %.0f columns staged in memory over %d passes (want %.0f)\n",
                         run, k, staged, lines, want);
+                bad++;
+            }
+            double chunked = pq_trace_sum(trace, "chunked", NULL);
+            if (chunked != (k == 0 ? 1 : 0)) {
+                fprintf(stderr, "  %d/%d: %.0f columns chunked (want %d)\n", run, k, chunked, k == 0);
                 bad++;
             }
             if (!pq_synth_check(dir[k], rows, pq_synth_mixed)) { fprintf(stderr, "  %d/%d: rows differ\n", run, k); bad++; }
