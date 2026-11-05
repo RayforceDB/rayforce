@@ -1748,6 +1748,7 @@ ray_t* ray_distinct_fn(ray_t* x) {
         for (int i = 0; i < nu - 1; i++)
             for (int j = i + 1; j < nu; j++)
                 if ((unsigned char)uniq[i] > (unsigned char)uniq[j]) { char t = uniq[i]; uniq[i] = uniq[j]; uniq[j] = t; }
+        // cppcheck-suppress uninitvar // only the first nu bytes, filled above, are read
         return ray_str(uniq, (size_t)nu);
     }
 
