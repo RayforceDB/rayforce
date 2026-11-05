@@ -2502,10 +2502,10 @@ done:
  * aux bytes 0-7, which no read below touches). */
 static ray_t* hash_build_block(ray_t* v) {
     bool bytes = hash_byte_keyed(v->type);
-    /* GUID: every row is a key, the zero guid included.  `find`, `in` and
-     * the hashset compare guid cells by their bytes, so a zero cell matches
-     * a zero cell whichever vector carries HAS_NULLS (see in_guid); the
-     * index answers the same way. */
+    /* GUID: every row is a key, the zero guid included.  `find` and `in`
+     * compare guid cells by their bytes, so a zero cell matches a zero cell
+     * whichever vector carries HAS_NULLS (find_guid, in_guid); the index
+     * answers the same way. */
     bool skip_nulls = (v->type != RAY_GUID);
 
     int64_t n = v->len;

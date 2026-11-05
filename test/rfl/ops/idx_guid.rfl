@@ -3,8 +3,8 @@
 ;; round trips in generation 0 and 2.
 ;;
 ;; A guid index keys every row by its 16 bytes, the zero guid among them, as
-;; find, in and the hashset compare guid cells.  Every indexed answer is
-;; cross-checked against the same call on the plain vector.
+;; find and in compare guid cells.  Every indexed answer is cross-checked
+;; against the same call on the plain vector.
 
 ;; ─────────────────────────── attach: .idx.hash and grouped ─────────────────
 (set g (guid 6))

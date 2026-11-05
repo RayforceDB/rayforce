@@ -1270,6 +1270,119 @@ static test_result_t test_eval_in_guid_unflagged_nulls(void) {
     PASS();
 }
 
+/* ---- Test: guid `find` reads a zero cell's bytes, not the hint ----
+ * As for `in` (test_eval_in_guid_unflagged_nulls): a zero cell finds a zero
+ * cell whichever vector carries HAS_NULLS, with the table over either side,
+ * for one guid, and through a dict.  A hash index keys the zero guid like
+ * any other, so the same calls on an indexed vector give the same rows. */
+static test_result_t test_eval_find_guid_unflagged_nulls(void) {
+    static const uint8_t g1[16] = {1}, g2[16] = {2}, g3[16] = {3}, z[16] = {0};
+    uint8_t raw[32];
+    memcpy(raw, g1, 16);
+    memcpy(raw + 16, z, 16);
+    ray_t* f = ray_vec_from_raw(RAY_GUID, raw, 2);           /* g1 0, flagged */
+    ray_t* f1 = ray_vec_from_raw(RAY_GUID, z, 1);            /* 0, flagged */
+    ray_t* u = ray_vec_new(RAY_GUID, 3);                     /* g2 g3 0 */
+    u = ray_vec_append(u, g2);
+    u = ray_vec_append(u, g3);
+    u = ray_vec_append(u, z);
+    ray_t* u1 = ray_vec_append(ray_vec_new(RAY_GUID, 1), z); /* 0 */
+    TEST_ASSERT_TRUE(f && !RAY_IS_ERR(f) && f1 && !RAY_IS_ERR(f1));
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u1 && !RAY_IS_ERR(u1));
+    TEST_ASSERT_TRUE((f->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((f1->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((u->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    TEST_ASSERT_TRUE((u1->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    ray_env_set(ray_sym_intern("_gf", 3), f);
+    ray_env_set(ray_sym_intern("_gf1", 4), f1);
+    ray_env_set(ray_sym_intern("_gu", 3), u);
+    ray_env_set(ray_sym_intern("_gu1", 4), u1);
+
+    /* One zero cell each way round. */
+    ASSERT_EQ("(find _gf1 _gu1)", "[0]");
+    ASSERT_EQ("(find _gu1 _gf1)", "[0]");
+    /* As many needles as rows or more: the table over the haystack. */
+    ASSERT_EQ("(find _gf _gu)", "[0N 0N 1]");
+    ASSERT_EQ("(find _gu1 _gf)", "[0N 0]");
+    /* Fewer needles: the table over the needles. */
+    ASSERT_EQ("(find _gu _gf)", "[0N 2]");
+    ASSERT_EQ("(find _gf _gu1)", "[1]");
+    /* One guid. */
+    ASSERT_EQ("(find _gu 0Ng)", "2");
+    ASSERT_EQ("(find _gu (at _gf 1))", "2");
+    ASSERT_EQ("(find _gf (at _gu 2))", "1");
+    ASSERT_EQ("(find _gu1 (at _gf1 0))", "0");
+    /* An indexed haystack gives the same rows. */
+    ASSERT_EQ("(find (.idx.hash _gf1) _gu1)", "[0]");
+    ASSERT_EQ("(find (.idx.hash _gu1) _gf1)", "[0]");
+    ASSERT_EQ("(find (.idx.hash _gf) _gu)", "[0N 0N 1]");
+    ASSERT_EQ("(find (.idx.hash _gu) _gf)", "[0N 2]");
+    ASSERT_EQ("(find (.idx.hash _gu) 0Ng)", "2");
+    /* A dict keyed by the vector: one key, and a batch through find. */
+    ASSERT_EQ("(at (dict _gu [10 20 30]) 0Ng)", "30");
+    ASSERT_EQ("(at (dict _gu [10 20 30]) (at _gf 1))", "30");
+    ASSERT_EQ("(at (dict _gf [10 20]) (at _gu 2))", "20");
+    ASSERT_EQ("(at (dict _gu [10 20 30]) _gf)", "(list 0N 30)");
+    ASSERT_EQ("(at (dict _gf [10 20]) _gu)", "(list 0N 0N 20)");
+    ASSERT_EQ("(at (dict (.idx.hash _gu) [10 20 30]) _gf)", "(list 0N 30)");
+    ASSERT_EQ("(at (dict (.idx.hash _gu) [10 20 30]) 0Ng)", "30");
+    /* remove finds its key the same way. */
+    ASSERT_EQ("(count (remove (dict _gu [10 20 30]) 0Ng))", "2");
+
+    ray_release(f);
+    ray_release(f1);
+    ray_release(u);
+    ray_release(u1);
+    PASS();
+}
+
+/* ---- Test: a failed guid `find` scratch allocation answers "oom" ----
+ * find_guid does not fall back to the hashset either.  Fail the key table,
+ * then the first rows, with the table over the needles and over the
+ * haystack: each attempt returns "oom" and frees what it took, and the
+ * next call answers. */
+static test_result_t test_eval_find_guid_oom(void) {
+    ray_t* h = ray_eval_str("(set _gh (guid 64))");
+    ray_t* p = ray_eval_str("(set _gp (concat (at _gh [3 5]) (guid 1)))");
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && p && !RAY_IS_ERR(p));
+    struct { ray_t* vec; ray_t* val; int64_t nth; int64_t hits; } cases[] = {
+        { h, p, 1, 2 },   /* the key table, over the needles */
+        { h, p, 2, 2 },   /* the first rows, over the needles */
+        { p, h, 1, 2 },   /* the key table, over the haystack */
+        { p, h, 2, 2 },   /* the first rows, over the haystack */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* r = ray_find_fn(cases[c].vec, cases[c].val);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_error_clear();
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_in_guid_test_fail_alloc(cases[c].nth);
+        r = ray_find_fn(cases[c].vec, cases[c].val);
+        ray_in_guid_test_fail_alloc(0);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %zu: no error", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %zu: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = ray_find_fn(cases[c].vec, cases[c].val);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64);
+        TEST_ASSERT_EQ_I(r->len, cases[c].val->len);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++)
+            hits += ((int64_t*)ray_data(r))[i] != NULL_I64;
+        TEST_ASSERT_EQ_I(hits, cases[c].hits);
+        ray_release(r);
+    }
+    ray_release(h);
+    ray_release(p);
+    PASS();
+}
+
 /* ---- Test: a failed guid `in` scratch allocation answers "oom" ----
  * in_guid does not fall back to the hashset, which reads the null hint
  * (test_eval_in_guid_unflagged_nulls).  Fail the key table on either side,
@@ -11602,6 +11715,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/in", test_eval_in, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_guid_nulls", test_eval_select_where_in_guid_nulls, lang_setup, lang_teardown },
     { "lang/eval/in_guid_unflagged_nulls", test_eval_in_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/find_guid_unflagged_nulls", test_eval_find_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/find_guid_oom", test_eval_find_guid_oom, lang_setup, lang_teardown },
     { "lang/eval/in_guid_oom", test_eval_in_guid_oom, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
