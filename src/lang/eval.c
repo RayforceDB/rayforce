@@ -4946,6 +4946,7 @@ static void ray_register_builtins(void) {
      * startup; these builtins expose the same machinery to Rayfall code
      * for manual control (open from a script, snapshot on demand, etc). */
     register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
+    register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
     register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
     register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);

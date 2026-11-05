@@ -590,8 +590,11 @@ tidy:
 # each file up to 12 times — most files hit that cap, which is what made
 # the whole-tree pass take ~50 minutes.  Undefined macros stay undefined, so
 # the Windows/macOS/WASM branches are not analysed here; every Linux file is.
+# __has_attribute is given as 0: the analyser cannot evaluate the builtin in
+# an #if (parse.c), and the attributes it guards change no code paths.
 CPPCHECK_DEFS = -D__linux__ -D__GNUC__ -D__x86_64__ -D__SIZEOF_INT128__=16 \
-  -D__ORDER_LITTLE_ENDIAN__=1234 -D__BYTE_ORDER__=1234 -D__GLIBC__ -DDEBUG
+  -D__ORDER_LITTLE_ENDIAN__=1234 -D__BYTE_ORDER__=1234 -D__GLIBC__ -DDEBUG \
+  '-D__has_attribute(x)=0'
 
 cppcheck:
 	@command -v cppcheck >/dev/null || { echo "cppcheck: not found"; exit 1; }
