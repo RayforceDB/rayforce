@@ -559,6 +559,7 @@ void ray_encw_free(ray_encw_t* w) {
     sd_free(&w->sdict);
     ray_free_raw(w->fsst); w->fsst = NULL;
     ray_free_raw(w->fsst_ix); w->fsst_ix = NULL;
+    ray_free_raw(w->sym_pfx); w->sym_pfx = NULL;
     ray_enc_buf_free(&w->chunk);
     ray_encw_vec_free(&w->vec);
     if (w->idict) { ray_dict_acc_free(w->idict); ray_free_raw(w->idict); w->idict = NULL; }
@@ -633,6 +634,87 @@ static bool encw_sym_pfx(const ray_encw_t* w, int64_t pos, uint32_t* out) {
     return true;
 }
 
+/* The prefix table of a column whose rows lie contiguously (ray_encw_chunks):
+ * the positions its rows hold are marked in one pass over the rows, then
+ * their prefixes are read once, in position order.  Rows looking up their
+ * own codes read the domain's records at random, and a dictionary larger
+ * than memory then faults a page in for nearly every row.  No table (rows
+ * look up their own) for a domain with more positions than the column has
+ * rows, a held position without a string, a cancel, or no memory. */
+#define ENCW_PFX_TASK 65536
+typedef struct {
+    const ray_encw_t* w;
+    const void*       data;
+    _Atomic(uint8_t)* held;
+    uint32_t*         t;
+    int64_t           n;
+    _Atomic(bool)     bad;
+} encw_pfx_par_t;
+
+static void encw_pfx_mark_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    encw_pfx_par_t* x = (encw_pfx_par_t*)raw;
+    int64_t lo = start * ENCW_PFX_TASK, hi = end * ENCW_PFX_TASK;
+    if (hi > x->w->len) hi = x->w->len;
+    for (int64_t i = lo; i < hi; i++) {
+        int64_t c = ray_read_sym(x->data, i, RAY_SYM, x->w->attrs);
+        if (c <= 0 || c >= x->n) continue;          /* the null symbol, or looked up per row */
+        if (!atomic_load_explicit(&x->held[c], memory_order_relaxed))
+            atomic_store_explicit(&x->held[c], 1, memory_order_relaxed);
+    }
+}
+
+/* An import dictionary's written records are mapped for random lookups (no
+ * read-around), so the fill asks for the window of records ahead itself. */
+#define ENCW_PFX_RA ((int64_t)1 << 20)
+
+static void encw_pfx_fill_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    encw_pfx_par_t* x = (encw_pfx_par_t*)raw;
+    const ray_symimp_t* m = x->w->sym_imp;
+    int64_t lo = start * ENCW_PFX_TASK, hi = end * ENCW_PFX_TASK, ra_lo = 0, ra_hi = 0;
+    if (hi > x->n) hi = x->n;
+    for (int64_t i = lo; i < hi; i++) {
+        if (!atomic_load_explicit(&x->held[i], memory_order_relaxed)) continue;
+        if (m) {
+            int64_t off = ray_symimp_offset(m, i);
+            if (off < ra_lo || off >= ra_hi) {
+                ray_symimp_willneed(m, off, ENCW_PFX_RA);
+                ra_lo = off; ra_hi = off + ENCW_PFX_RA;
+            }
+        }
+        if (!encw_sym_pfx(x->w, i, &x->t[i])) {
+            atomic_store(&x->bad, true);
+            return;
+        }
+    }
+}
+
+/* On the pool, or serially block by block (a column finish already runs
+ * inside a dispatch), stopping at a cancel. */
+static void encw_pfx_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
+                         encw_pfx_par_t* x, int64_t items) {
+    int64_t nt = (items + ENCW_PFX_TASK - 1) / ENCW_PFX_TASK;
+    if (ray_pool_par_dispatch_ok(pool, nt, 2)) ray_pool_dispatch_n(pool, fn, x, (uint32_t)nt);
+    else for (int64_t k = 0; k < nt && !ray_interrupted(); k++) fn(x, 0, k, k + 1);
+}
+
+static void encw_sym_pfx_table(ray_encw_t* w, const void* data) {
+    int64_t n = w->sym_imp ? w->sym_imp_count : ray_sym_domain_count(w->sym_dom);
+    if (n < 2 || n > w->len) return;
+    encw_pfx_par_t x = { w, data, ray_calloc_raw((size_t)n), ray_alloc_raw((size_t)n * sizeof(uint32_t)), n, false };
+    bool ok = x.held && x.t;
+    if (ok) {
+        ray_pool_t* pool = ray_pool_get();
+        encw_pfx_run(pool, encw_pfx_mark_task, &x, w->len);
+        if (!ray_interrupted()) encw_pfx_run(pool, encw_pfx_fill_task, &x, n);
+        ok = !ray_interrupted() && !atomic_load(&x.bad);
+    }
+    ray_free_raw(x.held);
+    if (!ok) { ray_free_raw(x.t); return; }
+    w->sym_pfx = x.t; w->sym_pfx_n = n;
+}
+
 /* Prefix bounds of rows [start, start + n) of a SYM chunk: false for an
  * all-null range or a code without a string (no bounds are written).  A
  * small direct-mapped cache keeps a repeated code to one lookup. */
@@ -647,6 +729,13 @@ static bool encw_sym_vec_pfx(const ray_encw_t* w, const void* data, int64_t star
     for (int i = 0; i < n; i++) {
         int64_t code = ray_read_sym(data, start + i, RAY_SYM, w->attrs);
         if (code == 0) continue;                    /* the null symbol */
+        if (code < w->sym_pfx_n) {
+            uint32_t p = w->sym_pfx[code];
+            if (!have || p < lo) lo = p;
+            if (!have || p > hi) hi = p;
+            have = true;
+            continue;
+        }
         uint32_t slot = (uint32_t)((uint64_t)code * 0x9E3779B97F4A7C15ull >> 54);
         uint32_t p;
         if (ck[slot] == code) p = cv[slot];
@@ -871,6 +960,7 @@ static ray_err_t encw_next_serial(ray_encw_t* w, const char* d, size_t esz, cons
 ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool) {
     const char* d = (const char*)data;
     ray_err_t err = RAY_OK;
+    if (w->chunk_i == 0 && w->sym_dom && !w->sym_pfx) encw_sym_pfx_table(w, data);
     /* chunk 0 trains the column's structures; STR's STR_DICT accumulator
      * and DICT index take entries in row order, so STR stays serial */
     while (err == RAY_OK && w->chunk_i < w->n_chunks && (w->chunk_i == 0 || w->type == RAY_STR))
