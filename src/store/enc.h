@@ -148,7 +148,13 @@ typedef enum {
     RAY_ENC_SLOT_FSST_LENGTHS  /* kind U32: RAW, FOR_BP */
 } ray_enc_slot_t;
 
-typedef struct { const uint64_t* v; uint32_t n; } ray_enc_dict_t;
+/* A value dictionary: n distinct T-bit patterns in kind order; ix, when
+ * not NULL, its hash index (ray_enc_dict_index): code + 1 by slot, 0 empty,
+ * mask + 1 slots. */
+typedef struct { const uint64_t* v; uint32_t n; const uint32_t* ix; uint64_t mask; } ray_enc_dict_t;
+/* The hash index of n patterns for ray_enc_dict_t.ix (*mask set), or NULL
+ * out of memory; ray_free_raw frees it. */
+uint32_t* ray_enc_dict_index(const uint64_t* v, uint32_t n, uint64_t* mask);
 typedef struct { uint8_t enc, width; int64_t bytes; } ray_enc_choice_t;
 
 ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,

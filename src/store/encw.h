@@ -112,6 +112,7 @@ typedef struct {
     uint64_t str_pool_bytes;
     bool     any_bitmap_null;
     uint64_t* dict_v; uint32_t dict_n; bool dict_used;
+    uint32_t* dict_ix; uint64_t dict_mask;   /* dict_v's hash index (ray_enc_dict_index), or NULL */
     ray_enc_buf_t  chunk;
     ray_encw_vec_t vec;
     ray_enc_idx_src_t idx; bool has_idx;              /* region from a heap root */

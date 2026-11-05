@@ -92,7 +92,25 @@ static ray_err_t encw_int(int8_t type, uint8_t attrs, const void* data, int64_t 
     if (in->bitmap && in->n_nulls > 0 && (err = put(o, in->nullmap, 128)) != RAY_OK) goto out;
     bool have = false; int64_t mn = 0, mx = 0;
     bool sum = ray_encw_type_summable(type);
-    for (int i = 0; i < n; i++) {
+    if (in->n_nulls == 0) {
+        /* no null row: the extrema in a straight loop, and the sum in
+         * int64 while 1024 values of their range cannot overflow it */
+        const int sh = 64 - in->k.T;
+        const bool sg = in->k.is_signed;
+        int64_t a = ray_enc_logical(in->bits[0], in->k), b = a;
+        for (int i = 1; i < n; i++) {
+            int64_t x = sg ? (int64_t)(in->bits[i] << sh) >> sh : (int64_t)in->bits[i];
+            a = x < a ? x : a; b = x > b ? x : b;
+        }
+        mn = a; mx = b; have = true;
+        if (sum && a >= -(INT64_C(1) << 52) && b <= (INT64_C(1) << 52)) {
+            int64_t s = 0;
+            for (int i = 0; i < n; i++) s += sg ? (int64_t)(in->bits[i] << sh) >> sh : (int64_t)in->bits[i];
+            ray_i128_add(&o->sum_hi, &o->sum_lo, s);
+        } else if (sum) {
+            for (int i = 0; i < n; i++) ray_i128_add(&o->sum_hi, &o->sum_lo, ray_enc_logical(in->bits[i], in->k));
+        }
+    } else for (int i = 0; i < n; i++) {
         bool null = in->bitmap ? ((in->nullmap[i >> 3] >> (i & 7)) & 1)
                                : (type == RAY_SYM && in->bits[i] == 0);
         if (null) continue;
@@ -556,6 +574,7 @@ static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
 void ray_encw_free(ray_encw_t* w) {
     ray_free_raw(w->dir); w->dir = NULL;
     ray_free_raw(w->dict_v); w->dict_v = NULL;
+    ray_free_raw(w->dict_ix); w->dict_ix = NULL;
     sd_free(&w->sdict);
     ray_free_raw(w->fsst); w->fsst = NULL;
     ray_free_raw(w->fsst_ix); w->fsst_ix = NULL;
@@ -801,6 +820,7 @@ static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
     ray_free_raw(all); ray_free_raw(in);
     if (tr < 0) return RAY_ERR_OOM;
     if (tr == 0) { w->dict_v = NULL; w->dict_n = 0; }
+    else if (!(w->dict_ix = ray_enc_dict_index(w->dict_v, w->dict_n, &w->dict_mask))) return RAY_ERR_OOM;
     return RAY_OK;
 }
 
@@ -835,7 +855,7 @@ static double bits_double(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
 static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* str_pool, int64_t n,
                                  ray_enc_dirent_t* de) {
     ray_err_t err;
-    ray_enc_dict_t dict = { w->dict_v, w->dict_n };
+    ray_enc_dict_t dict = { w->dict_v, w->dict_n, w->dict_ix, w->dict_mask };
     w->chunk.len = 0; w->chunk.oom = false;
     if (!ray_enc_buf_put(&w->chunk, NULL, RAY_ENC_DESC_AREA)) return RAY_ERR_OOM;
     memset(de, 0, sizeof *de);
