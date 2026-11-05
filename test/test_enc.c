@@ -420,6 +420,35 @@ static test_result_t test_dict_index_same_bytes(void) {
     PASS();
 }
 
+/* The hash index spreads 1024 patterns that differ only in their high bits
+ * (integral and quarter-step doubles, I64 shifted left 48) as it does
+ * others: no run of occupied slots is longer than 32, where slots taken
+ * from the product's middle bits put them all in one run of 1024. */
+static test_result_t test_dict_index_spread(void) {
+    static uint64_t v[1024];
+    for (int p = 0; p < 6; p++) {
+        for (int i = 0; i < 1024; i++) {
+            double f = p == 0 ? (double)i : p == 1 ? i * 0.25 : p == 2 ? -(double)i : 0.1 + i * 0.01;
+            if (p < 4) memcpy(&v[i], &f, 8);
+            else v[i] = p == 4 ? (uint64_t)i << 48 : (uint64_t)i;
+        }
+        uint64_t mask = 0;
+        uint32_t* ix = ray_enc_dict_index(v, 1024, &mask);
+        TEST_ASSERT_TRUE(ix != NULL);
+        TEST_ASSERT_EQ_I((int64_t)mask, 2047);
+        int run = 0, longest = 0, used = 0;
+        for (uint64_t k = 0; k < 2 * (mask + 1); k++) {   /* twice round: a run across the end */
+            run = ix[k & mask] ? run + 1 : 0;
+            if (run > longest) longest = run;
+            if (k <= mask && ix[k]) used++;
+        }
+        ray_free_raw(ix);
+        TEST_ASSERT_EQ_I(used, 1024);
+        TEST_ASSERT_FMT(longest <= 32, "pattern %d: a run of %d slots", p, longest);
+    }
+    PASS();
+}
+
 /* ---- independent byte-level references (spec "Encodings"), no codec calls ---- */
 static uint64_t ref_mask(int T) { return T == 64 ? ~0ull : ((1ull << T) - 1); }
 
@@ -814,6 +843,7 @@ const test_entry_t enc_entries[] = {
     { "enc/i64_extremes_roundtrip",     test_i64_extremes_roundtrip,     enc_setup, enc_teardown },
     { "enc/dict_codes_rle_nested",      test_dict_codes_rle_nested,      enc_setup, enc_teardown },
     { "enc/dict_index_same_bytes",      test_dict_index_same_bytes,      enc_setup, enc_teardown },
+    { "enc/dict_index_spread",          test_dict_index_spread,          enc_setup, enc_teardown },
     { "enc/layout_for_partial",         test_layout_for_partial,         enc_setup, enc_teardown },
     { "enc/layout_delta_partial",       test_layout_delta_partial,       enc_setup, enc_teardown },
     { "enc/pack_layout_straddle",       test_pack_layout_straddle,       enc_setup, enc_teardown },

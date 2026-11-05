@@ -157,7 +157,12 @@ static int rle_split(const uint64_t* v, int n, uint64_t* vals, uint64_t* ends) {
     return r;
 }
 
-static inline uint64_t dict_slot(uint64_t x, uint64_t mask) { return ((x * 0x9E3779B97F4A7C15ull) >> 32) & mask; }
+/* The product's top bits, which every bit of x reaches (patterns that differ
+ * only in their high bits, as integral doubles do, spread too); mask + 1 is
+ * a power of two of at least 16. */
+static inline uint64_t dict_slot(uint64_t x, uint64_t mask) {
+    return (x * 0x9E3779B97F4A7C15ull) >> __builtin_clzll(mask);
+}
 
 uint32_t* ray_enc_dict_index(const uint64_t* v, uint32_t n, uint64_t* mask) {
     uint64_t cap = 16;
