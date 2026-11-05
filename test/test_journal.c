@@ -95,7 +95,7 @@ static void jrn_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
 /* ── Helper: write a well-formed journal entry for `val` to file `f` ── */
 
-static bool write_journal_entry(FILE* f, ray_t* val) {
+static bool write_journal_entry_version(FILE* f, ray_t* val, uint8_t version) {
     int64_t psize = ray_serde_size(val);
     if (psize <= 0) return false;
     uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
@@ -106,13 +106,17 @@ static bool write_journal_entry(FILE* f, ray_t* val) {
     ray_ipc_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.prefix  = RAY_SERDE_PREFIX;
-    hdr.version = RAY_SERDE_WIRE_VERSION;
+    hdr.version = version;
     hdr.size    = psize;
 
     bool ok = (fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)) &&
               (fwrite(buf, 1, (size_t)psize, f) == (size_t)psize);
     ray_sys_free(buf);
     return ok;
+}
+
+static bool write_journal_entry(FILE* f, ray_t* val) {
+    return write_journal_entry_version(f, val, RAY_SERDE_WIRE_VERSION);
 }
 
 /* ── Helper: create a temp path and optionally get .log / .qdb paths ── */
@@ -428,6 +432,34 @@ static test_result_t test_journal_replay_clean_single(void) {
     PASS();
 }
 
+/* Journals written before error messages joined the wire remain replayable.
+ * The string payload layout is unchanged, so this is a genuine v3 frame. */
+static test_result_t test_journal_replay_v3_frame(void) {
+    char base[256]; make_base(base, sizeof(base), "rep_v3");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    FILE* f = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    ray_t* expr = ray_str("(set jrn_v3 88)", 15);
+    TEST_ASSERT_TRUE(write_journal_entry_version(f, expr, RAY_SERDE_WIRE_VERSION_MIN));
+    ray_release(expr);
+    fclose(f);
+
+    int64_t chunks = 0, errs = 0;
+    ray_jreplay_status_t status = RAY_JREPLAY_OK;
+    ray_err_t e = ray_journal_replay(lpath, &chunks, &errs, &status);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+
+    ray_t* value = ray_env_get(ray_sym_intern("jrn_v3", 6));
+    TEST_ASSERT_NOT_NULL(value);
+    TEST_ASSERT_EQ_I(value->i64, 88);
+    cleanup_base(base);
+    PASS();
+}
+
 /* 2c. Replay empty log -> 0 chunks, RAY_JREPLAY_OK. */
 static test_result_t test_journal_replay_empty(void) {
     char base[256]; make_base(base, sizeof(base), "rep_empty");
@@ -500,8 +532,8 @@ static test_result_t test_journal_replay_badtail_bad_prefix(void) {
     PASS();
 }
 
-/* 2f. Replay with badtail — bad wire version. */
-static test_result_t test_journal_replay_badtail_bad_version(void) {
+/* 2f. An unknown wire version is version skew, not a truncatable tail. */
+static test_result_t test_journal_replay_version_skew(void) {
     char base[256]; make_base(base, sizeof(base), "rep_badver");
     char lpath[270]; log_path(lpath, sizeof(lpath), base);
 
@@ -521,7 +553,7 @@ static test_result_t test_journal_replay_badtail_bad_version(void) {
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
     ray_err_t e = ray_journal_replay(lpath, NULL, NULL, &status);
     TEST_ASSERT_EQ_I(e, RAY_ERR_DOMAIN);
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_BADTAIL);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_DESER);
     PASS();
 }
 
@@ -3055,10 +3087,11 @@ const test_entry_t journal_entries[] = {
     /* Replay */
     { "journal/replay_no_file",            test_journal_replay_no_file,            jrn_setup, jrn_teardown },
     { "journal/replay_clean_single",       test_journal_replay_clean_single,       jrn_setup, jrn_teardown },
+    { "journal/replay_v3_frame",           test_journal_replay_v3_frame,           jrn_setup, jrn_teardown },
     { "journal/replay_empty",              test_journal_replay_empty,              jrn_setup, jrn_teardown },
     { "journal/replay_badtail_short_hdr",  test_journal_replay_badtail_short_hdr,  jrn_setup, jrn_teardown },
     { "journal/replay_badtail_bad_prefix", test_journal_replay_badtail_bad_prefix, jrn_setup, jrn_teardown },
-    { "journal/replay_badtail_bad_version",test_journal_replay_badtail_bad_version,jrn_setup, jrn_teardown },
+    { "journal/replay_version_skew",       test_journal_replay_version_skew,       jrn_setup, jrn_teardown },
     { "journal/replay_badtail_oversize",   test_journal_replay_badtail_oversize,   jrn_setup, jrn_teardown },
     { "journal/replay_badtail_zero_size",  test_journal_replay_badtail_zero_size,  jrn_setup, jrn_teardown },
     { "journal/replay_badtail_short_payload", test_journal_replay_badtail_short_payload, jrn_setup, jrn_teardown },

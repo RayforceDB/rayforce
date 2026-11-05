@@ -40,7 +40,7 @@
 
 ;; ── phase 1: spawn server with -l, send mutations, kill ─────────────
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 (set h (.ipc.open "127.0.0.1:19990"))
 (>= h 0) -- true
@@ -70,7 +70,7 @@
 
 ;; ── phase 2: restart, assert replay restored a/b/c/d ────────────────
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 (set h2 (.ipc.open "127.0.0.1:19990"))
 (>= h2 0) -- true
@@ -111,7 +111,7 @@
 
 ;; ── phase 3: restart, assert state survived via .qdb (not .log) ─────
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 (set h3 (.ipc.open "127.0.0.1:19990"))
 (.ipc.send h3 "a") -- 100

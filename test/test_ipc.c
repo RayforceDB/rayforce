@@ -3490,8 +3490,7 @@ static test_result_t test_ipc_oversize_response_error(void) {
     }
     ray_t* r = ray_ipc_send_timeout(h, q, 2000);
     ray_release(q);
-    /* Native v3 error frames carry the code, not the thread-local message.
-     * The following same-handle request distinguishes a clean error reply
+    /* The following same-handle request distinguishes a clean error reply
      * from a peer rejecting an oversized frame and closing the stream. */
     bool limit_error = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
     if (RAY_IS_ERR(r)) ray_error_free(r);
@@ -3515,7 +3514,72 @@ static test_result_t test_ipc_oversize_response_error(void) {
     PASS();
 }
 
+/* A server-side diagnostic must cross the native IPC boundary with its error
+ * category.  Before wire v4 only the category was encoded, leaving callers
+ * with no explanation of the remote failure. */
+static test_result_t test_ipc_error_message_roundtrip(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    if (h < 0) {
+        ray_test_server_stop(&srv);
+        TEST_ASSERT(false, "connect for remote error response");
+    }
+
+    const char* expr = "(raise \"custom failure: the whole sentence\")";
+    ray_t* q = ray_str(expr, strlen(expr));
+    ray_t* r = ray_ipc_send_timeout(h, q, 2000);
+    ray_release(q);
+
+    bool is_error = r && RAY_IS_ERR(r);
+    bool has_message = is_error && ray_error_msg() &&
+                       strcmp(ray_error_msg(), "custom failure: the whole sentence") == 0;
+    if (is_error) ray_error_free(r);
+    else if (r) ray_release(r);
+
+    q = ray_str(expr, strlen(expr));
+    r = ray_ipc_send_verbose(h, q);
+    ray_release(q);
+    /* A nested wire error aborts list deserialization and is returned as the
+     * top-level client error; its diagnostic must survive verbose wrapping. */
+    bool verbose_error = r && RAY_IS_ERR(r);
+    bool verbose_message = verbose_error && ray_error_msg() &&
+                           strcmp(ray_error_msg(), "custom failure: the whole sentence") == 0;
+    if (verbose_error) ray_error_free(r);
+    else if (r) ray_release(r);
+
+    /* A later raw expression LIST must not inherit the preceding request's
+     * pending raise text.  This route calls ray_eval directly, not
+     * ray_eval_str, and therefore exercises the IPC evaluation boundary. */
+    ray_t* call = ray_list_new(2);
+    ray_t* fn = ray_sym(ray_sym_intern("read-bytes", 10));
+    const char* missing = "/tmp/rayforce-ipc-pending-raise-must-not-exist";
+    ray_t* path = ray_str(missing, strlen(missing));
+    ray_list_append(call, fn);
+    ray_list_append(call, path);
+    ray_release(fn);
+    ray_release(path);
+    r = ray_ipc_send_timeout(h, call, 2000);
+    ray_release(call);
+    bool unrelated_io = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
+    bool no_inherited_message = unrelated_io && ray_error_msg() == NULL;
+    if (unrelated_io) ray_error_free(r);
+    else if (r) ray_release(r);
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+
+    TEST_ASSERT_TRUE(is_error);
+    TEST_ASSERT_FMT(has_message, "remote message: %s", ray_error_msg() ? ray_error_msg() : "(null)");
+    TEST_ASSERT_TRUE(verbose_error);
+    TEST_ASSERT_FMT(verbose_message, "verbose remote message: %s",
+                    ray_error_msg() ? ray_error_msg() : "(null)");
+    TEST_ASSERT_TRUE(unrelated_io);
+    TEST_ASSERT_TRUE(no_inherited_message);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
+    { "ipc/error_message_roundtrip", test_ipc_error_message_roundtrip, ipc_setup, ipc_teardown },
     { "ipc/oversize_response_error", test_ipc_oversize_response_error, ipc_setup, ipc_teardown },
     { "ipc/size_admission_boundaries", test_ipc_size_admission_boundaries, ipc_setup, ipc_teardown },
     { "ipc/oversize_shared_value_refused", test_ipc_oversize_shared_value_refused, ipc_setup, ipc_teardown },

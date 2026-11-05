@@ -410,7 +410,8 @@ static ray_err_t journal_replay_from(const char*           path,
         if (r == SIZE_MAX)                          { status = RAY_JREPLAY_IO;      break; }
         if (r != sizeof(hdr))                       { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.prefix  != RAY_SERDE_PREFIX)        { status = RAY_JREPLAY_BADTAIL; break; }
-        if (hdr.version != RAY_SERDE_WIRE_VERSION)  { status = RAY_JREPLAY_BADTAIL; break; }
+        if (!ray_serde_wire_version_supported(hdr.version))
+                                                    { status = RAY_JREPLAY_DESER;   break; }
         if (hdr.endian  != RAY_SERDE_ENDIAN)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024)
                                                     { status = RAY_JREPLAY_BADTAIL; break; }
@@ -439,7 +440,7 @@ static ray_err_t journal_replay_from(const char*           path,
         }
 
         int64_t consumed = pay_len;
-        ray_t*  msg      = ray_de_raw(payload, &consumed);
+        ray_t*  msg      = ray_de_raw_version(payload, &consumed, hdr.version);
         if (owned) ray_sys_free(payload);
         ray_sys_free(buf);
 
@@ -527,7 +528,7 @@ ray_err_t ray_journal_validate(const char* path,
         if (r == 0) break;                                /* clean EOF */
         if (r != sizeof(hdr))                       break;
         if (hdr.prefix  != RAY_SERDE_PREFIX)        break;
-        if (hdr.version != RAY_SERDE_WIRE_VERSION)  break;
+        if (!ray_serde_wire_version_supported(hdr.version)) break;
         if (hdr.endian  != RAY_SERDE_ENDIAN)        break;
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024) break;
 
