@@ -1685,8 +1685,8 @@ ray_t* distinct_vec_eager(ray_t* x) {
     /* Parallel radix kernel for large fixed-width columns — same
      * partition scheme as exec_count_distinct, producing the same row-id
      * set the hashset pass below would (one first-occurrence id per
-     * value).  NULL means the kernel declined (type, size, or pool) and
-     * the hashset handles it.  Either way the ids flow into the shared
+     * value).  NULL means the kernel declined (type, size, pool, or
+     * memory) and the hashset handles it.  Either way the ids flow into the shared
      * sort + gather tail, so result semantics are identical. */
     int64_t count = 0;
     ray_t* rids = distinct_radix_first_ids(x);
@@ -1698,9 +1698,12 @@ ray_t* distinct_vec_eager(ray_t* x) {
         count = ray_len(rids);
         memcpy(idx, ray_data(rids), (size_t)count * sizeof(int64_t));
         ray_release(rids);
-    } else if (x->type == RAY_GUID) {
-        /* in_guid's table of 16-byte keys, without the hashset's per-row
-         * type dispatch; it takes the zero guid once, as the hashset does */
+    } else if (x->type == RAY_GUID && len < (1 << 16)) {
+        /* a column too short for the guid kernel: in_guid's table of
+         * 16-byte keys, without the hashset's per-row type dispatch; it
+         * takes the zero guid once, as the hashset does.  A longer one the
+         * kernel declined, short of memory, takes the hashset, at 8 bytes
+         * a slot to this table's 16. */
         guid_set_t gs;
         if (!guid_set_init(&gs, len)) {
             if (idx != idx_stack) ray_free_raw(idx);

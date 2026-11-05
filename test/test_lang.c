@@ -1430,6 +1430,203 @@ static test_result_t test_eval_in_guid_oom(void) {
     PASS();
 }
 
+/* Whether expressions a and b evaluate to the same guid vector, byte for
+ * byte. */
+static bool guid_vec_same(const char* a, const char* b) {
+    ray_t* x = ray_eval_str(a);
+    ray_t* y = ray_eval_str(b);
+    bool same = x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y)
+             && x->type == RAY_GUID && y->type == RAY_GUID && x->len == y->len
+             && memcmp(ray_data(x), ray_data(y), (size_t)x->len * 16) == 0;
+    if (x) { if (RAY_IS_ERR(x)) ray_error_free(x); else ray_release(x); }
+    if (y) { if (RAY_IS_ERR(y)) ray_error_free(y); else ray_release(y); }
+    return same;
+}
+
+/* ---- Test: guid distinct's memory follows the column, not the workers ----
+ * Every repeat of a guid lands in that guid's partition, so a column of one
+ * value, or mostly of the zero guid, puts nearly every row in one
+ * partition.  A worker's table is capped by the mean partition, not that
+ * one: the kernel's peak, for the row ids and for the count, stays within
+ * four times the column whatever the worker count (16 bytes a row for the
+ * scatter, a byte for the marks, the workers' tables within the column's
+ * size, each block rounded up to a power of 2).  Sized by the longest
+ * partition, each worker's table took 32 bytes a row.  Lengths just under
+ * a power of 2 keep the scatter's blocks from rounding up. */
+static test_result_t test_eval_distinct_guid_skewed(void) {
+    struct { const char* set; int64_t len; int64_t nids; int64_t ids[5]; } cases[] = {
+        /* the zero guid but for four at the end */
+        { "(set _gk (concat (take [0Ng] 262076) (guid 4)))", 262080, 5,
+          { 0, 262076, 262077, 262078, 262079 } },
+        /* one guid throughout */
+        { "(set _gk (take (guid 1) 131008))", 131008, 1, { 0 } },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* v = ray_eval_str(cases[c].set);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->type == RAY_GUID);
+        TEST_ASSERT_EQ_I(v->len, cases[c].len);
+        uint64_t col = (uint64_t)v->len * 16;
+        ray_t* r = distinct_radix_first_ids(v);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = distinct_radix_first_ids(v);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64);
+        TEST_ASSERT_EQ_I(r->len, cases[c].nids);
+        for (int64_t i = 0; i < cases[c].nids; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[i], cases[c].ids[i]);
+        ray_release(r);
+        TEST_ASSERT_FMT(tr.peak_live_bytes <= 4 * col,
+                        "case %zu, row ids: peak %llu bytes, column %llu", c,
+                        (unsigned long long)tr.peak_live_bytes, (unsigned long long)col);
+
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = exec_count_distinct(NULL, NULL, v);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, cases[c].nids);
+        ray_release(r);
+        TEST_ASSERT_FMT(tr.peak_live_bytes <= 4 * col,
+                        "case %zu, count: peak %llu bytes, column %llu", c,
+                        (unsigned long long)tr.peak_live_bytes, (unsigned long long)col);
+        ray_release(v);
+    }
+    ray_t* g4 = ray_eval_str("(set _gd4 (guid 4))");
+    TEST_ASSERT_TRUE(g4 && !RAY_IS_ERR(g4));
+    bool nul = guid_vec_same("(distinct (concat (take [0Ng] 262076) _gd4))",
+                             "(concat [0Ng] _gd4)");
+    bool one = guid_vec_same("(distinct (take (at _gd4 [2]) 131008))", "(at _gd4 [2])");
+    ray_release(g4);
+    TEST_ASSERT_TRUE(nul);
+    TEST_ASSERT_TRUE(one);
+    PASS();
+}
+
+/* ---- Test: a partition past its worker's table grows a table of its own ----
+ * With a worker's table capped at 32 slots, every partition of 50000
+ * distinct guids, the zero guid, then the same 50000 again outgrows it and
+ * doubles a table of its own over and over.  The row ids, the count and
+ * distinct's answer are the uncapped kernel's. */
+static test_result_t test_eval_distinct_guid_table_growth(void) {
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 100001);
+    for (int capped = 0; capped < 2; capped++) {
+        ray_distinct_guid_test_table_cap(capped ? 32 : 0);
+        ray_t* ids = distinct_radix_first_ids(v);
+        ray_t* cnt = exec_count_distinct(NULL, NULL, v);
+        bool same = guid_vec_same("(distinct _gv)", "(concat _gd [0Ng])");
+        ray_distinct_guid_test_table_cap(0);
+        TEST_ASSERT_TRUE(ids && !RAY_IS_ERR(ids) && ids->type == RAY_I64);
+        TEST_ASSERT_EQ_I(ids->len, 50001);
+        int64_t off = -1;   /* the first id out of place */
+        for (int64_t i = 0; i < ids->len && off < 0; i++)
+            if (((int64_t*)ray_data(ids))[i] != i) off = i;
+        ray_release(ids);
+        TEST_ASSERT_FMT(off < 0, "capped %d: id %lld out of place", capped, (long long)off);
+        TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cnt->i64, 50001);
+        ray_release(cnt);
+        TEST_ASSERT_FMT(same, "capped %d: distinct differs", capped);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- Test: guid distinct short of memory declines to the hashset ----
+ * Fail each of the kernel's allocations in turn: its counts, the scatter's
+ * buffers, the marks, the workers' tables, and (the table capped at 32
+ * slots) a partition's own on a worker.  Each time the kernel frees what it
+ * took and declines, and distinct and its count still answer. */
+static test_result_t test_eval_distinct_guid_oom(void) {
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    ray_t* r = distinct_radix_first_ids(v);   /* warm up */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    const int64_t nths[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 40 };
+    for (size_t c = 0; c < sizeof(nths) / sizeof(nths[0]); c++) {
+        long long nth = (long long)nths[c];
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        ray_distinct_guid_test_table_cap(32);
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        r = distinct_radix_first_ids(v);
+        ray_distinct_guid_test_fail_alloc(0);
+        ray_mem_trace_end(&tr);
+        bool declined = r == NULL;
+        if (r && !RAY_IS_ERR(r)) ray_release(r);
+        else if (r) ray_error_free(r);
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        bool same = guid_vec_same("(distinct _gv)", "(concat _gd [0Ng])");
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        ray_t* cnt = exec_count_distinct(NULL, NULL, v);
+        ray_distinct_guid_test_fail_alloc(0);
+        ray_distinct_guid_test_table_cap(0);
+        TEST_ASSERT_FMT(declined, "nth %lld: the kernel did not decline", nth);
+        TEST_ASSERT_FMT(tr.net_bytes == 0, "nth %lld: %lld bytes kept", nth,
+                        (long long)tr.net_bytes);
+        TEST_ASSERT_FMT(same, "nth %lld: distinct differs", nth);
+        TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cnt->i64, 50001);
+        ray_release(cnt);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- Test: a cancelled guid distinct answers "cancel", never the hashset ----
+ * The kernel declines to the hashset when it is short of memory, but not
+ * when it is cancelled.  Cancel each of its three dispatches in turn (the
+ * histogram, the scatter, the partitions), by a cancel request and by the
+ * pool's flag alone: the row ids and the count each answer "cancel" and
+ * free what they took, and once cleared, each answers. */
+static test_result_t test_eval_distinct_guid_cancel(void) {
+    if (!ray_pool_get()) SKIP("no pool to dispatch to");
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    for (int count = 0; count < 2; count++) {
+        ray_t* r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));   /* warm up */
+        ray_release(r);
+        for (int pool_only = 0; pool_only < 2; pool_only++) {
+            for (uint32_t k = 1; k <= 3; k++) {
+                ray_mem_trace_t tr;
+                TEST_ASSERT_TRUE(ray_mem_trace_begin());
+                ray_pool_test_cancel_at(k, pool_only);
+                r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                bool is_cancel = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "cancel") == 0;
+                if (r && RAY_IS_ERR(r)) ray_error_free(r);
+                else if (r) ray_release(r);
+                ray_error_clear();
+                ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(is_cancel, "%s, dispatch %u, pool flag %d: %s",
+                                count ? "count" : "row ids", k, pool_only,
+                                r ? "not cancel" : "declined");
+                TEST_ASSERT_FMT(tr.net_bytes == 0, "%s, dispatch %u: %lld bytes kept",
+                                count ? "count" : "row ids", k, (long long)tr.net_bytes);
+            }
+        }
+        r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(count ? r->i64 : r->len, 50001);
+        ray_release(r);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
 /* ---- Test: a cancelled guid compare or `in` dispatch answers "cancel" ----
  * A cancel makes ray_pool_dispatch skip every task not yet started, so the
  * bool vector it was filling is incomplete.  The compare, and `in` with the
@@ -11718,6 +11915,10 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/find_guid_unflagged_nulls", test_eval_find_guid_unflagged_nulls, lang_setup, lang_teardown },
     { "lang/eval/find_guid_oom", test_eval_find_guid_oom, lang_setup, lang_teardown },
     { "lang/eval/in_guid_oom", test_eval_in_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_skewed", test_eval_distinct_guid_skewed, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_table_growth", test_eval_distinct_guid_table_growth, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_oom", test_eval_distinct_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
