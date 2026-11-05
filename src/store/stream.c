@@ -67,7 +67,7 @@ bool ray_col_stream_stage_mem(ray_col_stream_t* w) {
     (void)w;
     return false;   /* no memory files there (ray_file_open_mem) */
 #else
-    if (w->gen != 2 || w->type == RAY_STR || !w->fp || w->in_mem || w->rows) return false;
+    if (w->gen != 2 || w->type == RAY_STR || !w->fp || w->in_mem || w->ew || w->rows) return false;
     char path[sizeof(w->stage_path)];
     ray_fd_t fd = ray_file_open_mem(path, sizeof(path));
     if (fd == RAY_FD_INVALID) return false;
@@ -81,6 +81,32 @@ bool ray_col_stream_stage_mem(ray_col_stream_t* w) {
     memcpy(w->stage_path, path, sizeof(path));
     return true;
 #endif
+}
+
+bool ray_col_stream_chunked_ok(const ray_col_stream_t* w) {
+    return w->gen == 2 && w->type != RAY_STR && w->type != RAY_SYM && ray_encw_type_supported(w->type) &&
+           w->fp && !w->in_mem && !w->ew && !w->rows;
+}
+
+ray_err_t ray_col_stream_chunked_begin(ray_col_stream_t* w, int64_t rows) {
+    if (!ray_col_stream_chunked_ok(w) || rows < 0) return RAY_ERR_DOMAIN;
+    /* the staging file is the column file from its first byte */
+    if (fclose(w->fp) != 0) { w->fp = NULL; return RAY_ERR_IO; }
+    w->fp = fopen(w->tmp_path, "wb+");
+    if (!w->fp) return RAY_ERR_IO;
+    w->ew = (ray_encw_t*)ray_alloc_raw(sizeof(*w->ew));
+    if (!w->ew) return RAY_ERR_OOM;
+    /* stream_finish_gen2's index kind: the zone a converter began */
+    uint8_t ik = (w->zone && rows >= RAY_ENC_CHUNK &&
+                  ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, w->type)) ? RAY_IDX_CHUNK_ZONE : 0;
+    ray_err_t err = ray_encw_begin(w->ew, w->fp, w->type, w->attrs, rows, 0, ik, 0);
+    if (err != RAY_OK) { ray_encw_free(w->ew); ray_free_raw(w->ew); w->ew = NULL; }
+    return err;
+}
+
+static void stream_drop_chunked(ray_col_stream_t* w) {
+    if (!w->ew) return;
+    ray_encw_free(w->ew); ray_free_raw(w->ew); w->ew = NULL;
 }
 
 /* The memory file goes with its last descriptor and mapping. */
@@ -143,7 +169,7 @@ static void stream_drop_index(ray_col_stream_t* w) {
 
 ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                                            ray_t* col) {
-    if (!w->fp || !col || RAY_IS_ERR(col) || (col->type != w->type && !(w->type == RAY_SYM && col->type == RAY_STR)) || (col->attrs & RAY_ATTR_SLICE)) return RAY_ERR_TYPE;
+    if (!w->fp || w->ew || !col || RAY_IS_ERR(col) || (col->type != w->type && !(w->type == RAY_SYM && col->type == RAY_STR)) || (col->attrs & RAY_ATTR_SLICE)) return RAY_ERR_TYPE;
     int64_t n = col->len;
     if (n < 0 || n > INT64_MAX-w->rows) return RAY_ERR_RANGE;
 
@@ -344,7 +370,10 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     uint8_t attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
     uint32_t sc = w->type == RAY_SYM ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
     if (err == RAY_OK) err = ray_encw_begin(&ew, f, w->type, attrs, w->rows, sc, ik, 0);
-    if (err == RAY_OK && w->type == RAY_SYM) ray_encw_set_sym_domain(&ew, w->dom);
+    if (err == RAY_OK && w->type == RAY_SYM) {
+        ray_encw_set_sym_domain(&ew, w->dom);
+        if (w->sym_bhas) ray_encw_set_sym_bounds(&ew, w->sym_bmn, w->sym_bmx, w->sym_bhas);
+    }
     if (err == RAY_OK) err = ray_encw_chunks(&ew, data, esz, pool);
     if (err == RAY_OK) err = ray_encw_finish(&ew);
     ray_encw_free(&ew);
@@ -360,9 +389,30 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     return err;
 }
 
+/* A chunked column (ray_col_stream_chunked_begin), every chunk put: the
+ * headers take HAS_NULLS from had_nulls, as stream_finish_gen2's writer
+ * takes it from the attrs it begins with (no chunk's encoding reads it). */
+static ray_err_t stream_finish_chunked(ray_col_stream_t* w, bool durable) {
+    stream_drop_index(w);
+    w->ew->attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
+    ray_err_t err = ray_encw_finish(w->ew);
+    stream_drop_chunked(w);
+    if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    w->fp = NULL;
+    if (err == RAY_OK && durable) {
+        ray_fd_t fd = ray_file_open(w->tmp_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
+        else { err = ray_file_sync(fd); ray_file_close(fd); }
+    }
+    if (err != RAY_OK) remove(w->tmp_path);
+    else w->finished = true;
+    return err;
+}
+
 ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
     ray_col_stream_drop_lut(w);
     if (!w->fp) return RAY_OK;
+    if (w->ew) return stream_finish_chunked(w, durable);
     ray_err_t err = RAY_OK;
 
     if (w->type == RAY_STR) {
@@ -529,6 +579,7 @@ ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
 void ray_col_stream_abort(ray_col_stream_t* w) {
     ray_col_stream_drop_lut(w);
     stream_drop_index(w);
+    stream_drop_chunked(w);
     w->finished = false;
     stream_drop_mem(w);
     if (w->fp) fclose(w->fp);

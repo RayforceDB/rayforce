@@ -142,7 +142,7 @@ static test_result_t test_float_bodies(void) {
     TEST_ASSERT_TRUE(memcmp(v, out, sizeof v) == 0);
     bp->len = 0;
     uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
-    ray_enc_dict_t dict = { dv, 4 };
+    ray_enc_dict_t dict = { dv, 4, NULL, 0 };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(i * 7) % 4];
     TEST_ASSERT_TRUE(ray_enc_body_size(RAY_ENC_DICT, v, RAY_ENC_VEC, K64F, &dict) > 0);
     TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_DICT, v, RAY_ENC_VEC, K64F, &dict, bp, &c));
@@ -407,7 +407,7 @@ static test_result_t test_float_choice(void) {
     TEST_ASSERT_EQ_I(choice_enc(v, RAY_ENC_VEC, 64, NULL, NULL, 0, &ch), 0);
     TEST_ASSERT_EQ_I(ch.enc, RAY_ENC_RLE);
     uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
-    ray_enc_dict_t dict = { dv, 4 };
+    ray_enc_dict_t dict = { dv, 4, NULL, 0 };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(uint32_t)(i * 2654435761u) >> 30];
     TEST_ASSERT_EQ_I(choice_enc(v, RAY_ENC_VEC, 64, &dict, NULL, 0, &ch), 0);
     TEST_ASSERT_EQ_I(ch.enc, RAY_ENC_DICT);
@@ -1790,7 +1790,7 @@ static test_result_t test_fast_equals_reference(void) {
             TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_RLE, v, n, bmp, NULL, NULL, "rle"), "%s", fe_what);
             /* DICT over FOR_BP codes and over RLE codes */
             for (int k = 0; k < 40; k++) dvals[k] = fe_bits(ty, -20.0 + 0.75 * k);
-            ray_enc_dict_t dict = { dvals, 40 };
+            ray_enc_dict_t dict = { dvals, 40, NULL, 0 };
             for (int i = 0; i < n; i++) v[i] = dvals[(i * 7) % 40];
             TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &dict, NULL, "dict for_bp codes"), "%s", fe_what);
             for (int i = 0; i < n; i++) v[i] = dvals[(i / 50 * 3) % 40];
@@ -1833,7 +1833,7 @@ static test_result_t test_fast_equals_reference(void) {
             {
                 static uint64_t idv[5];
                 idv[0] = ninf; idv[1] = fe_bits(ty, -1.0); idv[2] = fe_bits(ty, 0.5); idv[3] = fe_bits(ty, 7.0); idv[4] = pinf;
-                ray_enc_dict_t idict = { idv, 5 };
+                ray_enc_dict_t idict = { idv, 5, NULL, 0 };
                 for (int i = 0; i < n; i++) v[i] = idv[(i * 3) % 5];
                 TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &idict, NULL, "dict +-inf"), "%s", fe_what);
             }
