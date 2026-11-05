@@ -5,13 +5,14 @@ A binary append-only journal of serialised Rayfall expressions. The runtime keep
 The journal is intentionally minimal: there's no per-entry timestamp or transaction grouping at the journal layer. Snapshot + replay is the only recovery model.
 
 !!! note "Restricted under `-U`"
-    `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.write`, `.log.sync`, `.log.validate`) are unrestricted — they cannot escalate privilege beyond what the IPC peer could already do.
+    `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.write`, `.log.sync`, `.log.validate`, `.log.status`) are unrestricted — they cannot escalate privilege beyond what the IPC peer could already do.
 
 ## Reference
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
 | [`.log.open`](#log-open) | variadic | restricted | Open a journal in async or sync mode. |
+| [`.log.status`](#log-status) | variadic | — | Report the journal state as a dict. |
 | [`.log.write`](#log-write) | unary | — | Append a serialised expression to the open journal. |
 | [`.log.sync`](#log-sync) | nullary | — | `fsync` the journal. |
 | [`.log.snapshot`](#log-snapshot) | nullary | restricted | Write a snapshot of current state and roll to a fresh segment. |
@@ -42,6 +43,36 @@ Errors: `rank` (arity != 2), `type` (mode not a sym / base not a string), `domai
 ```
 
 The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup and, unlike the bare verb, additionally load the latest snapshot and replay the log first — a full crash-recovery, then open-for-append.
+
+## `.log.status` { #log-status }
+
+Signature: `(.log.status)`. Returns a dict describing the journal; read-only, and answers the same way when no journal was ever opened. It raises only if allocating the result (or interning a symbol) fails.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `open` | bool | a journal handle is present. Not proof of append health or durability: a failed append is not reflected here, and writes are also suppressed during replay |
+| `opened_ok` | bool | a journal was opened successfully at least once in this process; false after a failed first open, and after [`.log.purge`](#log-purge) |
+| `path` | string, or null | the last **successfully** opened log file (`<base>.log`); null if there was none |
+| `mode` | sym, or null | `'sync` or `'async` of that journal; null if there was none |
+| `bytes` | i64, or null | size of the active log in bytes; `0` when `open` is false, null if the size could not be read |
+| `auto` | bool | the current evaluation runs inside an auto-journaled IPC request (same value as [`.ipc.auto_journal_eval`](#log-write)) |
+
+`path` and `mode` are committed only when an open succeeds. A failed `.log.open` therefore never reports an identity (`opened_ok` stays false, `path` and `mode` stay null) and never replaces the remembered one. They keep the values of the last successful journal after `.log.close`, and after a `.log.roll` that failed once the old file was closed (for example the new log could not be created: disk full, out of file descriptors). In that second case the process has no journal handle, sync requests are no longer journaled, and `.log.sync` still returns null; `open` is false while `opened_ok` is true. An embedder that must not run unjournaled can check it and stop:
+
+```lisp
+(if (get (.log.status) 'open) null (exit 1))
+```
+
+The getter only reports. Whether a request is acknowledged while the journal is down is a separate IPC policy.
+
+```lisp
+(.log.status)
+;; {open:false opened_ok:false path:null mode:null bytes:0 auto:false}
+(.log.open 'async "/tmp/rayforce-journal")
+(.log.status)
+;; {open:true opened_ok:true path:"/tmp/rayforce-journal.log" mode:async bytes:16 auto:false}
+(.log.close)
+```
 
 ## `.log.write` { #log-write }
 
