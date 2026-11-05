@@ -307,7 +307,7 @@ static test_result_t test_dict_wide_sparse_values(void) {
     TEST_ASSERT_EQ_I(dn, 4);
     TEST_ASSERT_EQ_U(d[0], 11ull);
     TEST_ASSERT_EQ_U(d[3], 123456789012345ull);
-    ray_enc_dict_t dict = { d, dn };
+    ray_enc_dict_t dict = { d, dn, NULL, 0 };
     TEST_ASSERT_EQ_I(enc_roundtrip(v, RAY_ENC_VEC, k, &dict, NULL), RAY_ENC_DICT);
     ray_free_raw(d);
     PASS();
@@ -350,7 +350,7 @@ static test_result_t test_dict_codes_rle_nested(void) {
     ray_enc_kind_t k = { 64, true, false };
     uint64_t* d; uint32_t dn;
     TEST_ASSERT_EQ_I(ray_enc_train_dict(v, RAY_ENC_VEC, k, &d, &dn), 1);
-    ray_enc_dict_t dict = { d, dn };
+    ray_enc_dict_t dict = { d, dn, NULL, 0 };
     ray_enc_buf_t b = {0};
     ray_enc_choice_t c;
     TEST_ASSERT_TRUE(ray_enc_write(v, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, &dict, &b, &c));
@@ -361,6 +361,62 @@ static test_result_t test_dict_codes_rle_nested(void) {
     for (int i = 0; i < RAY_ENC_VEC; i++) TEST_ASSERT_FMT(out[i] == v[i], "i=%d", i);
     ray_enc_buf_free(&b);
     ray_free_raw(d);
+    PASS();
+}
+
+/* The dictionary's hash index (ray_enc_dict_index) gives the bytes the
+ * binary search gives: integer and float kinds, dictionaries of 1 to 65536
+ * patterns (-0.0 and +0.0 both in the float ones), vectors of dictionary
+ * values at random and in runs, and with one value outside. */
+static test_result_t test_dict_index_same_bytes(void) {
+    static const ray_enc_kind_t kinds[6] = { { 8, true, false }, { 16, true, false }, { 32, true, false },
+                                             { 64, true, false }, { 32, false, true }, { 64, false, true } };
+    static const uint32_t sizes[4] = { 1, 3, 300, 65536 };
+    static uint64_t pool[65536], all[65536], v[RAY_ENC_VEC];
+    uint64_t s = 977;
+    int dicts = 0;
+    for (int ki = 0; ki < 6; ki++)
+        for (int si = 0; si < 4; si++) {
+            const ray_enc_kind_t k = kinds[ki];
+            const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1;
+            const uint32_t np = sizes[si];
+            if (np > m) continue;
+            uint32_t at = 0;
+            if (k.is_float && np >= 2) {    /* -0.0 and +0.0 */
+                pool[at++] = k.T == 64 ? 0x8000000000000000ull : 0x80000000ull;
+                pool[at++] = 0;
+            }
+            for (uint64_t x = 1; at < np; x++)
+                pool[at++] = k.is_float ? (k.T == 64 ? 0x3ff0000000000000ull + x * 977 : 0x3f800000ull + x * 97)
+                                        : (x * 2654435761ull) & m;
+            /* a pattern outside: the float infinity, an integer past the pool */
+            const uint64_t out = k.is_float ? (k.T == 64 ? 0x7ff0000000000000ull : 0x7f800000ull)
+                                            : ((uint64_t)(np + 1) * 2654435761ull) & m;
+            memcpy(all, pool, (size_t)np * sizeof *all);
+            uint64_t* d; uint32_t dn;
+            TEST_ASSERT_EQ_I(ray_enc_train_dict(all, np, k, &d, &dn), 1);
+            TEST_ASSERT_EQ_I(dn, np);
+            uint64_t mask;
+            uint32_t* ix = ray_enc_dict_index(d, dn, &mask);
+            TEST_ASSERT_TRUE(ix != NULL);
+            ray_enc_dict_t plain = { d, dn, NULL, 0 }, hashed = { d, dn, ix, mask };
+            for (int shape = 0; shape < 3; shape++) {
+                for (int i = 0; i < RAY_ENC_VEC; i++)
+                    v[i] = pool[(shape == 0 ? enc_rng(&s) : (uint64_t)(i / 7) * 31) % np];
+                if (shape == 2) v[enc_rng(&s) % RAY_ENC_VEC] = out;
+                ray_enc_buf_t a = {0}, b = {0};
+                ray_enc_choice_t ca, cb;
+                TEST_ASSERT_TRUE(ray_enc_write(v, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, &plain, &a, &ca));
+                TEST_ASSERT_TRUE(ray_enc_write(v, RAY_ENC_VEC, k, RAY_ENC_SLOT_TOP, 0, &hashed, &b, &cb));
+                TEST_ASSERT_FMT(ca.enc == cb.enc && a.len == b.len && !memcmp(a.p, b.p, a.len),
+                                "T=%d float=%d dict=%u shape=%d enc %d/%d", k.T, k.is_float, dn, shape, ca.enc, cb.enc);
+                if (shape == 2) TEST_ASSERT_FMT(cb.enc != RAY_ENC_DICT, "T=%d dict=%u: DICT with a value outside", k.T, dn);
+                dicts += cb.enc == RAY_ENC_DICT;
+                ray_enc_buf_free(&a); ray_enc_buf_free(&b);
+            }
+            ray_free_raw(ix); ray_free_raw(d);
+        }
+    TEST_ASSERT_FMT(dicts >= 4, "only %d vectors chose DICT", dicts);   /* the lookup decided something */
     PASS();
 }
 
@@ -607,7 +663,7 @@ static size_t put_child(uint8_t* p, uint8_t enc, uint32_t body_bytes) {
 static test_result_t test_read_rle_under_dict(void) {
     ray_enc_kind_t k = { 64, true, false };
     uint64_t dv[1] = { 7 };
-    ray_enc_dict_t dict = { dv, 1 };
+    ray_enc_dict_t dict = { dv, 1, NULL, 0 };
     uint64_t out[RAY_ENC_VEC];
     uint8_t body[96];
     /* control: one run of 4 values, values RAW (one u64), ends RAW U16 (one) */
@@ -677,7 +733,7 @@ static test_result_t test_write_as_forced(void) {
     ray_enc_kind_t k64 = { 64, true, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = 900000000001ull;
     uint64_t dv[2] = { 11, 900000000001ull };
-    ray_enc_dict_t dict = { dv, 2 };
+    ray_enc_dict_t dict = { dv, 2, NULL, 0 };
     TEST_ASSERT_EQ_I(forced_roundtrip(RAY_ENC_DICT, v, RAY_ENC_VEC, k64, &dict, &b, &c), 0);
     TEST_ASSERT_EQ_I(b.p[0], RAY_ENC_FOR_BP);            /* codes child header */
     TEST_ASSERT_EQ_I(b.p[1], 0);                         /* width 0 */
@@ -757,6 +813,7 @@ const test_entry_t enc_entries[] = {
     { "enc/roundtrip_lengths_and_types",test_roundtrip_lengths_and_types,enc_setup, enc_teardown },
     { "enc/i64_extremes_roundtrip",     test_i64_extremes_roundtrip,     enc_setup, enc_teardown },
     { "enc/dict_codes_rle_nested",      test_dict_codes_rle_nested,      enc_setup, enc_teardown },
+    { "enc/dict_index_same_bytes",      test_dict_index_same_bytes,      enc_setup, enc_teardown },
     { "enc/layout_for_partial",         test_layout_for_partial,         enc_setup, enc_teardown },
     { "enc/layout_delta_partial",       test_layout_delta_partial,       enc_setup, enc_teardown },
     { "enc/pack_layout_straddle",       test_pack_layout_straddle,       enc_setup, enc_teardown },

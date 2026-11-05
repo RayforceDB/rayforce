@@ -1464,7 +1464,7 @@ static test_result_t test_dict_null_dictionary(void) {
     uint64_t v[16]; uint64_t dv[2] = { 10, 20 };
     for (int i = 0; i < 16; i++) v[i] = dv[i & 1];
     ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(RAY_I64, 0, &k));
-    ray_enc_dict_t d = { dv, 2 };
+    ray_enc_dict_t d = { dv, 2, NULL, 0 };
     ray_enc_buf_t buf = {0}, buf2 = {0}; ray_enc_choice_t ch;
     bool wrote = ray_enc_write_as(RAY_ENC_DICT, v, 16, k, &d, &buf, &ch);
     bool wrote_null = ray_enc_write_as(RAY_ENC_DICT, v, 16, k, NULL, &buf2, &ch);

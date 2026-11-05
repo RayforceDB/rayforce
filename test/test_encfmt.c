@@ -467,7 +467,7 @@ static test_result_t test_vec_roundtrip_dict(void) {
     int32_t a[RAY_ENC_VEC];
     static const int32_t vals[3] = { 10, 1000000, 2000000000 };
     uint64_t dv[3] = { 10, 1000000, 2000000000 };
-    ray_enc_dict_t dict = { dv, 3 };
+    ray_enc_dict_t dict = { dv, 3, NULL, 0 };
     for (int i = 0; i < RAY_ENC_VEC; i++) a[i] = vals[(i * 7) % 3 == 0 ? 0 : (i % 2) + 1];
     RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, &dict, -1, RAY_ENC_DICT));
     RT(roundtrip(RAY_I32, 0, a, RAY_ENC_VEC, &dict, RAY_ENC_DICT, RAY_ENC_DICT));
@@ -481,7 +481,7 @@ static test_result_t test_vec_roundtrip_dict(void) {
     uint8_t sy[RAY_ENC_VEC], bo[RAY_ENC_VEC];
     for (int i = 0; i < RAY_ENC_VEC; i++) { sy[i] = (uint8_t)(1 + (i * 7) % 3); bo[i] = (uint8_t)(i & 1); }
     uint64_t sd[3] = { 1, 2, 3 }, bd[2] = { 0, 1 };
-    ray_enc_dict_t sdict = { sd, 3 }, bdict = { bd, 2 };
+    ray_enc_dict_t sdict = { sd, 3, NULL, 0 }, bdict = { bd, 2, NULL, 0 };
     TEST_ASSERT_EQ_I(ray_encw_vec(RAY_SYM, RAY_SYM_W8, sy, NULL, 0, RAY_ENC_VEC, &sdict, &v), RAY_OK);
     TEST_ASSERT_TRUE(v.desc.encoding != RAY_ENC_DICT);
     TEST_ASSERT_EQ_I(ray_encw_vec(RAY_BOOL, 0, bo, NULL, 0, RAY_ENC_VEC, &bdict, &v), RAY_OK);
