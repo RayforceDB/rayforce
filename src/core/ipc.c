@@ -27,6 +27,7 @@
 
 #include "store/enccol.h"    /* ray_enccol_cache_trim after a request */
 #include "core/ipc.h"
+#include "core/ipc_limits.h"
 #include "core/mcast.h"
 #include "core/timer.h"
 #include "core/shm.h"
@@ -195,9 +196,6 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 #define RAY_IPC_PHASE_HEADER    1
 #define RAY_IPC_PHASE_PAYLOAD   2
 #define RAY_IPC_PHASE_CREDS     3
-/* Hard cap on a single wire frame; the backlog a connection may hold is
- * the separately configurable transmit limit (ray_ipc_tx_limit_set). */
-#define RAY_IPC_FRAME_MAX_BYTES (256LL * 1024LL * 1024LL)
 
 static int64_t g_tx_limit_bytes  = RAY_IPC_TX_DEFAULT_BYTES;
 static int64_t g_tx_limit_frames = 0;   /* unlimited */
@@ -605,20 +603,25 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
      * goes out unless even that fails — in which case there is nothing we
      * can put on the wire and we drop as before. */
     ray_t* fallback = NULL;
-    if (ser_size <= 0) {
-        const char* fcode = ray_serde_fail_code();
-        if (fcode) {                       /* an encoded column failed to decode: say so */
-            char code[8], msg[256];
-            snprintf(code, sizeof code, "%s", fcode);
-            snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
-            fallback = ray_error(code, "%s", msg);
+    if (!ray_ipc_body_size_ok(ser_size)) {
+        if (ser_size > RAY_IPC_BODY_MAX_BYTES) {
+            fallback = ray_error("io", "IPC result exceeds the 256 MiB decoded payload limit");
         } else {
-            fallback = ray_error("type", "result of type %s is not serializable over IPC",
-                                 result ? ray_type_name(result->type) : "null");
+            const char* fcode = ray_serde_fail_code();
+            if (fcode) {                       /* an encoded column failed to decode: say so */
+                char code[8], msg[256];
+                snprintf(code, sizeof code, "%s", fcode);
+                snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+                fallback = ray_error(code, "%s", msg);
+            } else {
+                fallback = ray_error("type", "result of type %s is not serializable over IPC",
+                                     result ? ray_type_name(result->type) : "null");
+            }
         }
+        if (!fallback) return;
         result   = fallback;
         ser_size = ray_serde_size(result);
-        if (ser_size <= 0) { if (fallback) ray_error_free(fallback); return; }
+        if (!ray_ipc_body_size_ok(ser_size)) { ray_error_free(fallback); return; }
     }
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
@@ -632,7 +635,7 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         fallback = ray_error("io", "result could not be serialized over IPC");
         result   = fallback;
         ser_size = ray_serde_size(result);
-        payload  = ser_size > 0 ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
+        payload  = ray_ipc_body_size_ok(ser_size) ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
         if (!payload || ray_ser_raw(payload, result) != ser_size) {
             if (payload) ray_free_raw(payload);
             ray_error_free(fallback);
@@ -696,7 +699,7 @@ static ray_t* deser_frame(uint8_t* payload, size_t payload_len, uint8_t flags)
         if (payload_len < 4) return NULL;
         uint32_t uncomp_size;
         memcpy(&uncomp_size, payload, 4);
-        if (uncomp_size == 0 || uncomp_size > 256u * 1024u * 1024u) return NULL;
+        if (!ray_ipc_body_size_ok((int64_t)uncomp_size)) return NULL;
         decompressed = (uint8_t*)ray_alloc_raw(uncomp_size);
         if (!decompressed) return NULL;
         size_t dlen = ray_ipc_decompress(payload + 4, payload_len - 4,
@@ -1349,8 +1352,7 @@ static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel)
     if (cd->hdr.prefix != RAY_SERDE_PREFIX ||
         cd->hdr.version != RAY_SERDE_WIRE_VERSION ||
         cd->hdr.endian != RAY_SERDE_ENDIAN ||
-        cd->hdr.size <= 0 ||
-        cd->hdr.size > 256 * 1024 * 1024) {
+        !ray_ipc_body_size_ok(cd->hdr.size)) {
         ray_poll_deregister(poll, sel->id);
         return NULL;
     }
@@ -2426,6 +2428,11 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
         return NULL;
     }
 
+    if (!ray_ipc_queue_size_preflight(ser_size, threshold)) {
+        if (err_out) *err_out = RAY_ERR_IO;
+        return NULL;
+    }
+
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
     if (!payload) {
         if (err_out) *err_out = RAY_ERR_OOM;
@@ -2475,14 +2482,14 @@ static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
         .size    = (int64_t)send_len,
     };
 
-    size_t total = sizeof(hdr) + send_len;
-    if (total > (size_t)RAY_IPC_FRAME_MAX_BYTES) {
+    if (!ray_ipc_queue_body_size_ok(send_len)) {
         ray_free_raw(send_buf);
         if (payload) ray_free_raw(payload);
         if (err_out) *err_out = RAY_ERR_IO;
         return NULL;
     }
 
+    size_t total = sizeof(hdr) + send_len;
     ray_poll_frame_t* frame = ray_poll_frame_new((int64_t)total);
     if (!frame) {
         ray_free_raw(send_buf);

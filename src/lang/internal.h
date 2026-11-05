@@ -705,6 +705,7 @@ ray_t* ray_guid_fn(ray_t* n_arg);
  * Implementations live in src/ops/journal.c; the on-disk machinery
  * is src/store/journal.c. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n);
+ray_t* ray_log_status_fn(ray_t** args, int64_t n);
 ray_t* ray_log_write_fn(ray_t* expr);
 ray_t* ray_log_replay_fn(ray_t* path);
 ray_t* ray_log_validate_fn(ray_t* path);

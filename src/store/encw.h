@@ -126,6 +126,7 @@ typedef struct {
     ray_sym_domain_t* sym_dom;     /* SYM: the domain the codes are positions of (RAY_ENC_SYM_PFX); NULL: no bounds */
     ray_sym_domain_raw_t sym_raw; bool sym_raw_ok;
     struct ray_symimp_s* sym_imp; int64_t sym_imp_count;   /* an import domain's dictionary */
+    uint32_t* sym_pfx; int64_t sym_pfx_n;   /* every domain position's prefix, read once; NULL: per row */
 } ray_encw_t;
 /* index_kind RAY_IDX_DICT (P6b, spec "Writing the index"): the writer
  * builds the DICT region itself from the chunks it encodes and writes it at

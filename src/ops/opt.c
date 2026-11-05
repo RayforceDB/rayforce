@@ -1536,6 +1536,12 @@ static ray_op_t* pass_predicate_pushdown(ray_graph_t* g, ray_op_t* root) {
 /* Score a predicate subtree: lower = cheaper = execute first. */
 static int filter_cost(ray_graph_t* g, ray_op_t* pred) {
     if (!pred) return 99;
+    /* A negation costs what it negates: `(not (like ...))` is a substring
+     * scan, not a cheap col-col compare. */
+    if (pred->opcode == OP_NOT && pred->arity == 1) {
+        ray_op_t* in = op_child(g, pred, 0);
+        if (in) return filter_cost(g, in) + 1;
+    }
     int cost = 0;
 
     /* Constant comparison: one input is OP_CONST */
