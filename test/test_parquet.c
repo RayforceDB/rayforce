@@ -1494,12 +1494,14 @@ static test_result_t test_pq_train_prefix(void) {
     };
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
-    int64_t keys[] = {ray_sym_intern("types",5),ray_sym_intern("compress",8)};
-    ray_t* values = ray_list_new(2);
+    int64_t keys[] = {ray_sym_intern("types",5),ray_sym_intern("compress",8),ray_sym_intern("rows",4)};
+    ray_t* values = ray_list_new(3);
     ((ray_t**)ray_data(values))[0] = types;
     ((ray_t**)ray_data(values))[1] = ray_bool(true);
-    values->len = 2;
-    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,2),values);
+    /* A reachable non-chunk-sized batch exercises the cached last-batch cap. */
+    ((ray_t**)ray_data(values))[2] = ray_i64(50000);
+    values->len = 3;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,3),values);
     size_t trace_cap = (size_t)1 << 16;
     char* trace = ray_sys_alloc(trace_cap);
     TEST_ASSERT_TRUE(trace != NULL);

@@ -2199,7 +2199,7 @@ static void pq_prefetch_chunks(pq_direct_work* w, int64_t g, int64_t c) {
 /* Full-group callers keep the strict cap/EOF check. Training may stop at
  * its prefix; cap both the configured and cached group batch before next
  * so it does not decode a tail which it would merely discard. */
-static ray_t* pq_decode_rows(pq_direct_work* w, pq_column* spare, int64_t g, int64_t c,
+RAY_INLINE ray_t* pq_decode_rows_mode(pq_direct_work* w, pq_column* spare, int64_t g, int64_t c,
                              uint8_t* dst, int64_t cap, bool prefix, int64_t* got, bool* flagged) {
     *got = 0;
     if (w->prefetched) pq_prefetch_chunks(w,g,c);
@@ -2239,6 +2239,16 @@ static ray_t* pq_decode_rows(pq_direct_work* w, pq_column* spare, int64_t g, int
     ray_parquet_close(r);
     return err;
 }
+/* Keep mode state out of the normal full-group loop/caller frame. */
+static __attribute__((noinline)) ray_t* pq_decode_rows(pq_direct_work* w, pq_column* spare, int64_t g, int64_t c,
+                             uint8_t* dst, int64_t cap, int64_t* got, bool* flagged) {
+    return pq_decode_rows_mode(w,spare,g,c,dst,cap,false,got,flagged);
+}
+static __attribute__((noinline)) ray_t* pq_decode_prefix(pq_direct_work* w, pq_column* spare, int64_t g, int64_t c,
+                             uint8_t* dst, int64_t cap, int64_t* got, bool* flagged) {
+    return pq_decode_rows_mode(w,spare,g,c,dst,cap,true,got,flagged);
+}
+
 
 /* Put the chunked column's ready parts in chunk order.  The lock is only
  * tried: its holder puts what is ready and looks again after letting go, so
@@ -2303,7 +2313,7 @@ static void pq_chunked_task(pq_direct_work* w, uint32_t worker, pq_column* spare
     }
     int64_t got = 0;
     bool flagged = false, nulls = false;
-    ray_t* e = pq_decode_rows(w,spare,g,c,b->p,n,false,&got,&flagged);
+    ray_t* e = pq_decode_rows(w,spare,g,c,b->p,n,&got,&flagged);
     if (!e && got != n) e = pq_error("row group ended before its assigned output range");
     ray_err_t ee = RAY_OK;
     for (int64_t ch = r0 / RAY_ENC_CHUNK; !e && ee == RAY_OK && ch * RAY_ENC_CHUNK < r1; ch++) {
@@ -2357,7 +2367,10 @@ static void pq_chunked_train(void* ptr, uint32_t worker, int64_t start, int64_t 
         ray_t* e = buf ? NULL : ray_error("oom",NULL);
         for (int64_t g = 0; g < ng && !e; g++) {
             int64_t got = 0; bool fl = false;
-            e = pq_decode_rows(w,spare,g,w->pass[i],buf + (size_t)at * k->esz,cap - at,true,&got,&fl);
+            if (w->offsets[g+1] > want)
+                e = pq_decode_prefix(w,spare,g,w->pass[i],buf + (size_t)at * k->esz,cap - at,&got,&fl);
+            else
+                e = pq_decode_rows(w,spare,g,w->pass[i],buf + (size_t)at * k->esz,cap - at,&got,&fl);
             at += got;
         }
         if (!e && at < want) e = pq_error("row group ended before its assigned output range");
