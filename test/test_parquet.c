@@ -1576,9 +1576,9 @@ static test_result_t test_pq_chunked_cancel(void) {
     values->len = 2;
     ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
     const char* names[] = {"x","s","t"};
-    const char* steps[] = {"chunk","flush"};
+    const char* steps[] = {"train","chunk","flush"};
     TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);   /* the tasks one by one, in order */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         pq_set_env("RAY_PQ_PASS_COLS", "1");   /* x's pass holds no other task to cancel */
         pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
         ray_t* res = ray_parquet_splayed_typed(src, dir, opts);

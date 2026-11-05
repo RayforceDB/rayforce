@@ -2256,11 +2256,11 @@ static __attribute__((noinline)) ray_t* pq_decode_prefix(pq_direct_work* w, pq_c
  * lock and that second look are sequentially consistent).  After a put
  * fails, or once the conversion is cancelled, the parts are freed unput. */
 static bool pq_g_inject(const char* step);
-/* The suite's cancel of a chunked column (RAY_PQ_SYM_INJECT): "chunk" after
- * its chunk 0 is encoded, "flush" before a task puts its parts; a chunk
- * encoded or put after it fails. */
+/* The suite's cancel of a chunked column (RAY_PQ_SYM_INJECT): "train"
+ * after prefix decode, "chunk" after chunk 0, "flush" before a task puts
+ * its parts; training, encoding or putting after it fails. */
 static bool pq_chunked_late(void) {
-    return (pq_g_inject("chunk") || pq_g_inject("flush")) && ray_interrupted();
+    return (pq_g_inject("train") || pq_g_inject("chunk") || pq_g_inject("flush")) && ray_interrupted();
 }
 static void pq_chunked_flush(pq_chunked* k) {
     while (!atomic_flag_test_and_set(&k->lock)) {
@@ -2374,8 +2374,13 @@ static void pq_chunked_train(void* ptr, uint32_t worker, int64_t start, int64_t 
             at += got;
         }
         if (!e && at < want) e = pq_error("row group ended before its assigned output range");
+#if defined(DEBUG)
+        if (!e && pq_g_inject("train")) ray_request_interrupt();
+#endif
+        /* A prefix can finish without next's EOF/cancel poll. */
+        if (!e && ray_interrupted()) e = ray_error("cancel",NULL);
         if (!e) {
-            ray_err_t te = ray_encw_train(k->s->ew,buf,want);
+            ray_err_t te = pq_chunked_late() ? RAY_ERR_DOMAIN : ray_encw_train(k->s->ew,buf,want);
             if (te != RAY_OK) e = ray_error(ray_err_code_str(te),"parquet: column chunk encode failed");
             else k->tmpl = *k->s->ew;   /* no put runs before the windows */
         }
