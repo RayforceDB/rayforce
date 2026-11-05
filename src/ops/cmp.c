@@ -414,6 +414,7 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
      * combination (so `(and vec false)` broadcasts to all-false vector
      * of acc's shape rather than a bare scalar). */
     if (ray_is_atom(acc) && !is_truthy(acc)) {
+        if (acc->type == -RAY_BOOL) return acc;
         ray_release(acc);
         return make_bool(0);
     }
@@ -438,6 +439,7 @@ ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
     if (n == 1) return acc;
     /* Short-circuit only on scalar truthy accumulator (see AND comment). */
     if (ray_is_atom(acc) && is_truthy(acc)) {
+        if (acc->type == -RAY_BOOL) return acc;
         ray_release(acc);
         return make_bool(1);
     }
