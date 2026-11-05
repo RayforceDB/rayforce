@@ -385,11 +385,12 @@ ray_t* ray_or_fn(ray_t* a, ray_t* b) {
  * `args` are UNEVALUATED AST nodes — registered with RAY_FN_SPECIAL_FORM
  * so the evaluator hands us raw forms rather than computed values.  We
  * call ray_eval per arg ourselves and stop as soon as the result is
- * determined: AND on first scalar falsy, OR on first scalar truthy.
+ * determined: AND on first scalar falsy, OR on first scalar truthy.  A
+ * multi-argument scalar result is always BOOL; the determining operand's
+ * original type must not leak through the short-circuit path.
  *
  * Mixed scalar+vector: when the running accumulator becomes a *scalar*
- * with the determining truth value, we return it immediately — same
- * shape as Lisp/Clojure where short-circuit yields the determinant.
+ * with the determining truth value, we return its normalized boolean.
  * If the accumulator is a vector we cannot short-circuit (subsequent
  * args may be vectors that still need element-wise combination), so we
  * fall through to ray_and_fn / ray_or_fn for that step. */
@@ -412,7 +413,10 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
      * If acc is a vector, subsequent args still need element-wise
      * combination (so `(and vec false)` broadcasts to all-false vector
      * of acc's shape rather than a bare scalar). */
-    if (ray_is_atom(acc) && !is_truthy(acc)) return acc;
+    if (ray_is_atom(acc) && !is_truthy(acc)) {
+        ray_release(acc);
+        return make_bool(0);
+    }
     for (int64_t i = 1; i < n; i++) {
         ray_t* v = eval_and_short(args[i]);
         if (!v || RAY_IS_ERR(v)) { ray_release(acc); return v; }
@@ -433,7 +437,10 @@ ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
     /* Single arg = identity — see ray_and_vary_fn for rationale. */
     if (n == 1) return acc;
     /* Short-circuit only on scalar truthy accumulator (see AND comment). */
-    if (ray_is_atom(acc) && is_truthy(acc)) return acc;
+    if (ray_is_atom(acc) && is_truthy(acc)) {
+        ray_release(acc);
+        return make_bool(1);
+    }
     for (int64_t i = 1; i < n; i++) {
         ray_t* v = eval_and_short(args[i]);
         if (!v || RAY_IS_ERR(v)) { ray_release(acc); return v; }
