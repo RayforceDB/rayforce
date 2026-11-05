@@ -1483,6 +1483,53 @@ static test_result_t test_pq_sym_grouped_failures(void) {
     PASS();
 }
 
+/* A cancel during a numeric column's row group stops its chunks: cancelled
+ * (a debug build injects it) after the first of the row group's four chunks
+ * is encoded, or before the task puts the chunks it encoded, the import
+ * encodes and puts no chunk after it (a debug build fails one that is),
+ * reports the cancel and publishes nothing. */
+static test_result_t test_pq_chunked_cancel(void) {
+#if !defined(DEBUG)
+    SKIP("debug builds inject the cancel");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-chcancel-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-chcancel-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_synth(src, 200000, 1, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);   /* generation 2: x chunked */
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    const char* names[] = {"x","s","t"};
+    const char* steps[] = {"chunk","flush"};
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);   /* the tasks one by one, in order */
+    for (int i = 0; i < 2; i++) {
+        pq_set_env("RAY_PQ_PASS_COLS", "1");   /* x's pass holds no other task to cancel */
+        pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+        ray_t* res = ray_parquet_splayed_typed(src, dir, opts);
+        pq_set_env("RAY_PQ_SYM_INJECT", NULL); pq_set_env("RAY_PQ_PASS_COLS", NULL);
+        bool failed = res && RAY_IS_ERR(res);
+        char code[32] = "";
+        if (failed) snprintf(code, sizeof(code), "%s", ray_err_code(res));
+        if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+        ray_clear_interrupt();
+        pq_remove_native(partial, names, 3);
+        TEST_ASSERT_TRUE(failed);
+        TEST_ASSERT_STR_EQ(code, "cancel");
+        TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
+    }
+    ray_pool_destroy();
+    ray_release(opts); unlink(src);
+    PASS();
+#endif
+}
+
 /* One row group of six rows of a required BYTE_ARRAY column s, every row
  * the first entry of a stored (uncompressed) dictionary page of two entries
  * whose header declares `declared` decoded bytes and `count` entries. */
@@ -4133,6 +4180,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/stage_mem",test_pq_stage_mem,pq_setup,pq_teardown},
     {"parquet/stage_early_sym_count",test_pq_stage_early_sym_count,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
+    {"parquet/chunked_cancel",test_pq_chunked_cancel,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},
     {"parquet/symgrp_collision_determinism",test_pq_sym_grouped_collision_determinism,pq_setup,pq_teardown},

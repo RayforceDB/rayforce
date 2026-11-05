@@ -2234,14 +2234,21 @@ static ray_t* pq_decode_rows(pq_direct_work* w, pq_column* spare, int64_t g, int
  * tried: its holder puts what is ready and looks again after letting go, so
  * a part made ready meanwhile is put by one of the two (the ready flags, the
  * lock and that second look are sequentially consistent).  After a put
- * fails, the parts are freed unput. */
+ * fails, or once the conversion is cancelled, the parts are freed unput. */
+static bool pq_g_inject(const char* step);
+/* The suite's cancel of a chunked column (RAY_PQ_SYM_INJECT): "chunk" after
+ * its chunk 0 is encoded, "flush" before a task puts its parts; a chunk
+ * encoded or put after it fails. */
+static bool pq_chunked_late(void) {
+    return (pq_g_inject("chunk") || pq_g_inject("flush")) && ray_interrupted();
+}
 static void pq_chunked_flush(pq_chunked* k) {
     while (!atomic_flag_test_and_set(&k->lock)) {
         int64_t c = atomic_load_explicit(&k->next,memory_order_relaxed);
         while (c < k->n_chunks && atomic_load(&k->ready[c])) {
             ray_encw_part_t* p = k->part[c];
-            if (atomic_load_explicit(&k->err,memory_order_relaxed) == RAY_OK) {
-                ray_err_t e = ray_encw_put(k->s->ew,p);
+            if (atomic_load_explicit(&k->err,memory_order_relaxed) == RAY_OK && !ray_interrupted()) {
+                ray_err_t e = pq_chunked_late() ? RAY_ERR_DOMAIN : ray_encw_put(k->s->ew,p);
                 if (e != RAY_OK) atomic_store_explicit(&k->err,(int)e,memory_order_relaxed);
             }
             ray_encw_part_free(p); ray_free_raw(p); k->part[c] = NULL;
@@ -2254,6 +2261,7 @@ static void pq_chunked_flush(pq_chunked* k) {
 }
 
 static ray_err_t pq_chunked_encode(pq_chunked* k, int64_t ch, const uint8_t* data, bool* nulls) {
+    if (pq_chunked_late()) return RAY_ERR_DOMAIN;
     ray_encw_part_t* p = ray_calloc_raw(sizeof(*p));
     if (!p) return RAY_ERR_OOM;
     ray_err_t e = ray_encw_encode(&k->tmpl,ch,data,p);
@@ -2267,7 +2275,8 @@ static ray_err_t pq_chunked_encode(pq_chunked* k, int64_t ch, const uint8_t* dat
 /* A chunked column's row group: decoded into the worker's buffer, its whole
  * chunks encoded from there, its rows of a chunk shared with a neighbouring
  * row group added to that chunk's edge (the task that completes an edge
- * encodes it); then the ready parts go to the file. */
+ * encodes it); then the ready parts go to the file.  A cancel stops it at
+ * the next chunk. */
 static void pq_chunked_task(pq_direct_work* w, uint32_t worker, pq_column* spare,
                             int64_t g, int64_t i, int64_t task) {
     pq_chunked* k = &w->chunked[i];
@@ -2288,10 +2297,15 @@ static void pq_chunked_task(pq_direct_work* w, uint32_t worker, pq_column* spare
     if (!e && got != n) e = pq_error("row group ended before its assigned output range");
     ray_err_t ee = RAY_OK;
     for (int64_t ch = r0 / RAY_ENC_CHUNK; !e && ee == RAY_OK && ch * RAY_ENC_CHUNK < r1; ch++) {
+        if (ray_interrupted()) { e = ray_error("cancel","parquet conversion interrupted"); break; }
         int64_t cs = ch * RAY_ENC_CHUNK, cz = cs + RAY_ENC_CHUNK < rows ? cs + RAY_ENC_CHUNK : rows;
         int64_t a = cs > r0 ? cs : r0, z = cz < r1 ? cz : r1;
         const uint8_t* src = b->p + (size_t)(a - r0) * esz;
-        if (a == cs && z == cz) { ee = pq_chunked_encode(k,ch,src,&nulls); continue; }
+        if (a == cs && z == cz) {
+            ee = pq_chunked_encode(k,ch,src,&nulls);
+            if (ee == RAY_OK && ch == 0 && pq_g_inject("chunk")) ray_request_interrupt();
+            continue;
+        }
         uint8_t* eb = atomic_load(&k->edge[ch]);
         if (!eb) {
             uint8_t* nb = ray_alloc_raw((size_t)(cz - cs) * esz);
@@ -2312,6 +2326,7 @@ static void pq_chunked_task(pq_direct_work* w, uint32_t worker, pq_column* spare
      * the column keeps a zone (its saw_null) */
     if (flagged || (nulls && w->writers[c].zone)) atomic_store_explicit(&w->nulls[c],1,memory_order_relaxed);
     if (b == &own) ray_free_raw(own.p);
+    if (pq_g_inject("flush")) ray_request_interrupt();
     pq_chunked_flush(k);
 }
 
@@ -2856,7 +2871,8 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
 /* Fault injection for the suite: RAY_PQ_SYM_INJECT names the step that
  * fails as out of memory ("r1", "p2", "load", "r2", "settle"; "reload" in
  * table/symgrp.c: a window's load after the first), whose record writes
- * fail ("write"), or is cancelled ("cancel"); debug builds only. */
+ * fail ("write"), or is cancelled ("cancel"; a chunked column's "chunk"
+ * and "flush", pq_chunked_late); debug builds only. */
 static bool pq_g_inject(const char* step) {
 #if defined(DEBUG)
     const char* e = getenv("RAY_PQ_SYM_INJECT");
