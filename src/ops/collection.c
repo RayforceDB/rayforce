@@ -607,19 +607,19 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
 }
 
 /* ══════════════════════════════════════════
- * GUID membership
+ * GUID membership and find
  *
- * An open-addressing table of 16-byte keys stored in place, for `in` over
- * guid cells without the hashset's per-row type dispatch.  The all-zero
- * key is the null guid; it doubles as the empty-slot marker, so the table
- * keeps it in a flag of its own.
+ * An open-addressing table of 16-byte keys stored in place, for `in` and
+ * `find` over guid cells without the hashset's per-row type dispatch.  The
+ * all-zero key is the null guid; it doubles as the empty-slot marker, so
+ * the table keeps it in a flag of its own.
  *
  * A guid cell is null when its 16 bytes are zero, whether or not its vector
  * carries HAS_NULLS: producers can write the zero payload without the flag
  * (ray_vec_append does).  RAY_ATOM_IS_NULL, the scalar == and the query's
- * null-row masks read the bytes, and so does this table.  `in` therefore
- * answers as == does, cell for cell: a zero cell is in a set that holds a
- * zero cell, whichever vector carries the flag.
+ * null-row masks read the bytes, and so does this table.  `in` and `find`
+ * therefore answer as == does, cell for cell: a zero cell is in, and is
+ * found in, a vector that holds a zero cell, whichever carries the flag.
  * ══════════════════════════════════════════ */
 
 typedef struct {
@@ -813,6 +813,76 @@ static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
     ray_free_raw((void*)seen);
     ray_free_raw(gs.keys);
     return result;
+}
+
+/* out[i]: the first row of the guid vector `hay` holding the 16 bytes of
+ * needle i, NULL_I64 on a miss.  The bytes alone, as in_guid: a zero cell
+ * finds the first zero cell whichever vector carries HAS_NULLS, as a hash
+ * index on `hay` (which keys the zero guid like any other) answers.  The
+ * table holds the smaller side, as in find_hash_needles: the haystack's
+ * first row a key, probed once a needle; or the needles, with one scan of
+ * the haystack that stops once every distinct needle has a row.  `first`
+ * holds row + 1 a slot, 0 while there is none.
+ *
+ * NULL, or an "oom" error; never a fallback to the hashset, which takes a
+ * zero cell for null only in a vector that carries HAS_NULLS. */
+static ray_t* find_guid(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    int64_t n = hay->len, m = nd->len;
+    const uint8_t* hd = (const uint8_t*)ray_data(hay);
+    const uint8_t* ndd = (const uint8_t*)ray_data(nd);
+    bool by_needles = m < n;
+    guid_set_t gs;
+    if (!guid_set_init(&gs, by_needles ? m : n)) return ray_error("oom", NULL);
+    int64_t* first = (int64_t*)in_guid_calloc((size_t)(gs.mask + 1) * sizeof(int64_t));
+    if (!first) { ray_free_raw(gs.keys); return ray_error("oom", NULL); }
+    int64_t null_first = 0;   /* row + 1 of the first zero cell */
+    if (by_needles) {
+        int64_t distinct = 0, found = 0;
+        for (int64_t i = 0; i < m; i++)
+            if (guid_set_add(&gs, ndd + i * 16)) distinct++;
+        for (int64_t r = 0; r < n && found < distinct; r++) {
+            const uint8_t* p = hd + r * 16;
+            uint64_t lo, hi;
+            memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+            if ((lo | hi) == 0) {
+                if (gs.has_null && !null_first) { null_first = r + 1; found++; }
+                continue;
+            }
+            int64_t s = guid_set_slot(&gs, p, lo, hi);
+            if (s >= 0 && !first[s]) { first[s] = r + 1; found++; }
+        }
+    } else {
+        for (int64_t r = 0; r < n; r++) {
+            const uint8_t* p = hd + r * 16;
+            uint64_t lo, hi;
+            memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+            if ((lo | hi) == 0) {
+                if (!null_first) null_first = r + 1;
+                continue;
+            }
+            int64_t s = guid_set_slot(&gs, p, lo, hi);
+            if (s < 0) {
+                uint64_t* k = gs.keys + 2 * ~s;
+                k[0] = lo; k[1] = hi;
+                first[~s] = r + 1;
+            }
+        }
+    }
+    for (int64_t i = 0; i < m; i++) {
+        const uint8_t* p = ndd + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        int64_t row = null_first;
+        if (lo | hi) {
+            int64_t s = guid_set_slot(&gs, p, lo, hi);
+            row = s >= 0 ? first[s] : 0;
+        }
+        if (row) out[i] = row - 1;
+        else { out[i] = NULL_I64; *any_null = true; }
+    }
+    ray_free_raw(first);
+    ray_free_raw(gs.keys);
+    return NULL;
 }
 
 /* ══════════════════════════════════════════
@@ -3650,10 +3720,11 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         /* Both sides typed vecs, in order of preference:
          *   1. an attached hash index on the haystack: one probe per needle,
          *      nothing built per call;
-         *   2. sparse sorted, null-free I64: exact batched lower_bound;
-         *   3. fewer needles than rows: hash the needles, scan the haystack
+         *   2. guid cells: find_guid's typed table, their only route;
+         *   3. sparse sorted, null-free I64: exact batched lower_bound;
+         *   4. fewer needles than rows: hash the needles, scan the haystack
          *      once (find_hash_needles);
-         *   4. hash the haystack, probe the needles (mirrors ray_in_fn). */
+         *   5. hash the haystack, probe the needles (mirrors ray_in_fn). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
             bool done = false;
             if (ray_index_has(vec)) {
@@ -3663,6 +3734,11 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     ray_idx_note_use(vec);
                     done = true;
                 }
+            }
+            if (!done && vec->type == RAY_GUID && val->type == RAY_GUID) {
+                ray_t* err = find_guid(vec, val, out, &any_null);
+                if (err) { ray_release(result); return err; }
+                done = true;
             }
             /* Keep tiny and dense probes on the existing hash/scan routes.
              * This sparse admission avoids their sampled crossover region. */
@@ -3721,6 +3797,18 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     return ray_typed_null(-RAY_I64);
                 return make_i64(row);
             }
+        }
+
+        /* A guid in a guid vector: compare the cells' bytes in place, a
+         * null guid finding the first zero cell, flagged or not (GUID
+         * membership and find above). */
+        if (vec->type == RAY_GUID && val->type == -RAY_GUID) {
+            static const uint8_t null_guid[16] = {0};
+            const uint8_t* key = val->obj ? (const uint8_t*)ray_data(val->obj) : null_guid;
+            const uint8_t* cells = (const uint8_t*)ray_data(vec);
+            for (int64_t i = 0; i < len; i++)
+                if (memcmp(cells + i * 16, key, 16) == 0) return make_i64(i);
+            return ray_typed_null(-RAY_I64);
         }
 
         if (has_nulls) {
