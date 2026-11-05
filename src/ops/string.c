@@ -1415,6 +1415,7 @@ static void substr_sym_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         int64_t ids[64]; const char* sp[64]; size_t sl[64];
         int n = 0;
         while (bits) { ids[n++] = w * 64 + __builtin_ctzll(bits); bits &= bits - 1; }
+        // cppcheck-suppress uninitvar // bits is nonzero here, so the loop above fills ids[0, n)
         sym_reader_block(&c->rd, ids, n, sp, sl);
         for (int j = 0; j < n; j++, k++) {
             if ((size_t)c->st >= sl[j]) {

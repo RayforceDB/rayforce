@@ -28573,6 +28573,7 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
     for (int64_t k = 0; k < nk; k++) kci[k] = ix->u.ukey.kci[k];
     upsert_map_t map = { NULL, (int64_t*)ray_data(ix->u.ukey.slots), ix->u.ukey.mask };
     for (int64_t r = nrows0; r < n; r++)
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
     ix->u.ukey.nrows = n;
 }

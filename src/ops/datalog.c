@@ -2502,6 +2502,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         }
     }
 
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
     ray_t* projected = dl_project(accum, proj_cols, rule->head_arity, head_rel,
                                    rule->head_consts, rule->head_const_types);
     ray_release(accum);

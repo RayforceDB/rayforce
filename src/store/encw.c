@@ -376,6 +376,7 @@ static ray_err_t str_choose_plain(const ray_str_t* s, const char* pool, int n, c
         if (!fb) return RAY_ERR_OOM;
         const char* sp[RAY_ENC_VEC]; uint32_t sl[RAY_ENC_VEC];
         for (int i = 0; i < n; i++) { sp[i] = ray_str_t_ptr(&s[i], pool); sl[i] = s[i].len; }
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         ft = ray_enc_fsst_encode(side->fsst, side->fsst_ix, sp, sl, n, fb, cl);
         bool fit = true;                                  /* the lengths child is U32 */
         for (int i = 0; i < n; i++) if (cl[i] > UINT32_MAX) fit = false;
