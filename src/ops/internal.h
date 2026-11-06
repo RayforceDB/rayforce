@@ -1614,6 +1614,12 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
 void ray_group_test_route(int route);
 /* Fail the next scalar chunk-buffer allocation, then disarm automatically. */
 void ray_group_test_fail_scalar_alloc(int fail);
+/* Test hooks (C tests only) for the guid distinct kernel: fail its nth
+ * scratch allocation, a worker's table included (0 = off); cap a worker's
+ * table at `slots` (32 or more, rounded down to a power of 2; 0 = off).
+ * Disarmed by ray_test_hooks_off. */
+void ray_distinct_guid_test_fail_alloc(int64_t nth);
+void ray_distinct_guid_test_table_cap(int64_t slots);
 /* Test hook (C tests only): the scalar route's chunk walk (scalar_chunk_fn)
  * runs serially in tasks of `rows` rows, any cut (as ray_pool_dispatch's
  * grain after its ring clamp); 0 dispatches as usual.  Disarmed by

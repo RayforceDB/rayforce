@@ -463,3 +463,23 @@ it appears in a table schema. Upgrade readers before writing duration
 columns to shared storage. Existing column tags and format generations
 retain their meanings. Parquet logical time and duration mappings are
 separate from this column format.
+
+## GUID hash index compatibility
+
+A splayed save persists a hash index on a GUID column (`.idx.hash`,
+`grouped`) in both format generations, so the index is there after a
+load. Readers built before GUID hash indexes, v3.0.1 among them, treat
+the two generations differently:
+
+- **Generation 0.** They decline the index and load the column without
+  it; every answer is the same.
+- **Generation 2** (`{compress: true}`). They open the table and read its
+  other columns, but reading the GUID column fails with
+  `corrupt: index kind 1 is not admitted on type GUID`. The values on
+  disk are intact; only the index is unknown to them.
+
+Upgrade readers before writing indexed GUID columns to shared
+generation-2 storage, or save the column without its index
+(`.idx.drop`). Hash indexes on other column types, including one an
+append extended, keep the format older readers read. Existing column
+tags and format generations retain their meanings.

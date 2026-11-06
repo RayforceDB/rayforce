@@ -28179,6 +28179,12 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                         if (cells[k]) ray_release(cells[k]);
                 }
                 col->len = nrows;
+                /* An append extended the column's hash index over the rows
+                 * just undone (ray_index_append_extend): drop it. */
+                if (ray_index_has(col) && ray_index_payload(col->index)->built_for_len != nrows) {
+                    ray_t* d = ray_index_drop(&col);
+                    if (d && !RAY_IS_ERR(d)) slots[c] = d;
+                }
             }
         } else {
             /* insert appends without consulting keys, and in ascending row
@@ -28337,6 +28343,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             new_col = append_atom_to_col(new_col, row_elems[c]);
         }
         if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
+
+        /* The rebuilt column holds orig_col's rows, then the new ones: its
+         * hash index extended over them, as concat carries one
+         * (ray_index_carry_append; best-effort). */
+        if (ray_index_has(orig_col)) ray_index_carry_append(orig_col, new_col);
 
         result = ray_table_add_col(result, col_name, new_col);
         ray_release(new_col);
@@ -28785,6 +28796,13 @@ static void upsert_rollback_appends(ray_t** slots, int64_t ncols, int64_t nrows0
                 if (cells[k]) ray_release(cells[k]);
         }
         col->len = nrows0;
+        /* An append extended the column's hash index over the rows just
+         * undone (ray_index_append_extend): drop it, as insert's rollback
+         * does. */
+        if (ray_index_has(col) && ray_index_payload(col->index)->built_for_len != nrows0) {
+            ray_t* d = ray_index_drop(&col);
+            if (d && !RAY_IS_ERR(d)) slots[c] = d;
+        }
     }
 }
 
@@ -29051,8 +29069,16 @@ static ray_t* upsert_apply_vectors(ray_t** slots, int64_t ncols,
         if (!buf) { err = ray_error("oom", NULL); goto out; }
         memset(buf, 0, (size_t)napp * 16);
         for (int64_t c = 0; c < ncols; c++) {
-            /* Grow the column by napp zeroed cells in one step (and drop
-             * its index), then gather the new rows straight into the tail. */
+            /* Grow the column by napp zeroed cells in one step, then gather
+             * the new rows straight into the tail.  An append extends a
+             * hash index over the cells it writes, the zeros here, so the
+             * index goes first. */
+            if (ray_index_has(slots[c])) {
+                ray_t* col = slots[c];
+                col = ray_index_drop(&col);
+                if (!col || RAY_IS_ERR(col)) { err = col ? col : ray_error("oom", NULL); goto out; }
+                slots[c] = col;
+            }
             int64_t tail = slots[c]->len;
             ray_t* res = ray_vec_append_raw(slots[c], buf, napp);
             if (RAY_IS_ERR(res)) { err = res; goto out; }
