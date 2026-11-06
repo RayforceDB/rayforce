@@ -692,3 +692,100 @@
 (as 'F64 (at (update {w: (as 'F32 v) from: F32T}) 'w)) -- [3.4028234663852886e38 -3.4028234663852886e38 0Nf 1.5]
 (as 'F64 (at (select {x: (as 'F32 d) from: F32T}) 'x)) -- [8780.0 8781.0 0Nf 8782.0]
 (as 'F64 (as 'F32 (at F32T 'd))) -- [8780.0 8781.0 0Nf 8782.0]
+
+;; ========== LIST TARGET ==========
+;; (as 'LIST v) boxes a typed vector into a generic LIST of atoms; a LIST
+;; comes back unchanged.  Results are checked by type/count/element type,
+;; since the compact printer shows an all-atom LIST like a vector.
+(type (as 'LIST [1 2])) -- 'LIST
+(count (as 'LIST [1 2])) -- 2
+(type (at (as 'LIST [1 2]) 0)) -- 'i64
+(as 'LIST [10 20 30]) -- [10 20 30]
+(at (as 'LIST [10 20 30]) 2) -- 30
+;; the target name follows the same case rule as the other names
+(type (as 'list [1 2])) -- 'LIST
+(type (as 'List [1 2])) -- 'LIST
+;; every vector type keeps its element type
+(type (at (as 'LIST [true false]) 1)) -- 'b8
+(type (at (as 'LIST [0x01 0x02]) 1)) -- 'u8
+(type (at (as 'LIST [1h 2h]) 1)) -- 'i16
+(type (at (as 'LIST [1i 2i]) 1)) -- 'i32
+(type (at (as 'LIST [1 2]) 1)) -- 'i64
+(type (at (as 'LIST [1.5 2.5]) 1)) -- 'f64
+(type (at (as 'LIST (as 'F32 [1 2])) 1)) -- 'f32
+(type (at (as 'LIST [2024.01.15 2024.01.16]) 1)) -- 'date
+(type (at (as 'LIST [00:00:01.000 00:00:02.000]) 1)) -- 'time
+(type (at (as 'LIST [2024.01.15D00:00:00.000000000]) 0)) -- 'timestamp
+(type (at (as 'LIST ['a 'b]) 1)) -- 'sym
+(type (at (as 'LIST ["a" "bc"]) 1)) -- 'str
+(type (at (as 'LIST (guid 2)) 1)) -- 'guid
+(count (as 'LIST (guid 3))) -- 3
+(at (as 'LIST ['a 'b]) 1) -- 'b
+(at (as 'LIST ["a" "bc"]) 1) -- "bc"
+(at (as 'LIST [true false]) 0) -- true
+;; a typed null cell stays a typed null atom
+(nil? (at (as 'LIST [1 0Nl 3]) 1)) -- true
+(type (at (as 'LIST [1 0Nl 3]) 1)) -- 'i64
+(nil? (at (as 'LIST [1.5 0Nf]) 1)) -- true
+(type (at (as 'LIST [1.5 0Nf]) 1)) -- 'f64
+(nil? (at (as 'LIST [1h 0Nh]) 1)) -- true
+(nil? (at (as 'LIST [1i 0Ni]) 1)) -- true
+(type (at (as 'LIST [1i 0Ni]) 1)) -- 'i32
+(nil? (at (as 'LIST (as 'F32 [1 0Nf])) 1)) -- true
+(type (at (as 'LIST (as 'F32 [1 0Nf])) 1)) -- 'f32
+(nil? (at (as 'LIST [2024.01.15 0Nd]) 1)) -- true
+(type (at (as 'LIST [2024.01.15 0Nd]) 1)) -- 'date
+(nil? (at (as 'LIST [00:00:01.000 0Nt]) 1)) -- true
+(nil? (at (as 'LIST [2024.01.15D00:00:00.000000000 0Np]) 1)) -- true
+(nil? (at (as 'LIST [1 0Nl 3]) 0)) -- false
+;; an empty vector gives an empty LIST
+(type (as 'LIST [])) -- 'LIST
+(count (as 'LIST [])) -- 0
+(count (as 'LIST (take [1 2 3] 0))) -- 0
+;; a slice
+(type (as 'LIST (take [1 2 3 4] 2))) -- 'LIST
+(count (as 'LIST (take [1 2 3 4] 2))) -- 2
+(at (as 'LIST (drop [1 2 3 4] 1)) 0) -- 2
+(count (as 'LIST (drop [1 2 3 4] 1))) -- 3
+(at (as 'LIST (drop ['a 'b 'c] 2)) 0) -- 'c
+;; a LIST comes back unchanged and keeps its mixed contents
+(set ASL (list 1 'a "x"))
+(type (as 'LIST ASL)) -- 'LIST
+(count (as 'LIST ASL)) -- 3
+(type (at (as 'LIST ASL) 1)) -- 'sym
+(type (at (as 'list ASL) 2)) -- 'str
+(count (as 'LIST (list))) -- 0
+(== (as 'LIST (as 'LIST [1 2])) [1 2]) -- [true true]
+;; the same-type paths retain: the result shares the input, whose count
+;; goes up by exactly the one held reference
+(set ASR (list 7 'b))
+(set ASR0 (rc ASR))
+(set ASR1 (as 'LIST ASR))
+(- (rc ASR) ASR0) -- 1
+(set ASR1 0)
+(- (rc ASR) ASR0) -- 0
+;; an atom, a dict and a table have no list form here
+(as 'LIST 1) !- type
+(as 'LIST 0Nl) !- type
+(as 'LIST 'a) !- type
+(as 'LIST "abc") !- type
+(as 'LIST (dict ['a] [1])) !- type
+(as 'LIST (table [a] (list [1 2]))) !- type
+;; a SYM column read back from disk (FILE domain) boxes to its symbols
+(.sys.exec "rm -rf /tmp/rfl_as_list_fdom/") -- 0
+(.db.splayed.set "/tmp/rfl_as_list_fdom/" (table [s] (list ['x 'y 'x])))
+(set ASF (at (.db.splayed.get "/tmp/rfl_as_list_fdom/") 's))
+(type (as 'LIST ASF)) -- 'LIST
+(count (as 'LIST ASF)) -- 3
+(type (at (as 'LIST ASF) 1)) -- 'sym
+(at (as 'LIST ASF) 1) -- 'y
+(.sys.exec "rm -rf /tmp/rfl_as_list_fdom/") -- 0
+;; the query form: `as` is applied per row, so a column of vector cells
+;; (a LIST column) yields a LIST per row, and a column of atoms is
+;; rejected with the same type error as the builtin
+(set ASQ (table [c] (list (list [1 2] [3 4 5]))))
+(set ASQR (at (select {r: (as 'LIST c) from: ASQ}) 'r))
+(type (at ASQR 1)) -- 'LIST
+(count (at ASQR 1)) -- 3
+(type (at (at ASQR 1) 0)) -- 'i64
+(select {r: (as 'LIST v) from: (table [v] (list [1 2 3]))}) !- type
