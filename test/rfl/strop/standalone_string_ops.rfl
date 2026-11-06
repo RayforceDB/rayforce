@@ -69,3 +69,44 @@
 (at (select {y: (concat (first s) "x") z: x from: TsL}) 'y) -- ['abx 'abx 'abx 'abx]
 (at (select {y: (concat s 'zz) from: TsL}) 'y) -- ['abzz 'cdzz 'efzz 'ghzz]
 (at (select {y: (concat t 'q) from: TsL}) 'y) -- ["abq" "cdq" "efq" "ghq"]
+
+;; A SYM vector long enough for the pool (above RAY_PARALLEL_THRESHOLD):
+;; str-find resolves its strings in parallel, substr at scalar bounds cuts
+;; each distinct code once and fills the rows from their code's rank.  Each
+;; result is checked row by row against the atom builtin, on a vector of
+;; the runtime domain and on a column read back from a splayed table (a
+;; FILE domain).  Picks: the first codes, the repeat of the first, the
+;; middle, the last.
+(.sys.exec "rm -rf /tmp/rfl_sso_sym")
+(set ssoN 70000)
+(set ssoS (as 'SYM (map (fn [i] (format "http://www.host%.example.org/p/%" (% i 311) i)) (til ssoN))))
+(set ssoE (as 'SYM (map (fn [i] (if (== (% i 5) 0) "" (format "k%" (% i 13)))) (til ssoN))))
+(set ssoPick [0 1 2 310 311 312 1000 34999 69998 69999])
+(set ssoRef (fn [f v] (map (fn [i] (f (at v i))) ssoPick)))
+(all (== (at (substr ssoS 8 -1) ssoPick) (ssoRef (fn [x] (substr x 8 -1)) ssoS))) -- true
+(all (== (at (substr ssoS 16 3) ssoPick) (ssoRef (fn [x] (substr x 16 3)) ssoS))) -- true
+(all (== (at (substr ssoS 60 3) ssoPick) (ssoRef (fn [x] (substr x 60 3)) ssoS))) -- true
+(all (== (at (substr ssoE 2 -1) ssoPick) (ssoRef (fn [x] (substr x 2 -1)) ssoE))) -- true
+(count (distinct (substr ssoS 16 3))) -- 311
+(count (distinct (substr ssoE 2 -1))) -- 14
+(all (== (at (str-find ssoS "host") ssoPick) (ssoRef (fn [x] (str-find x "host")) ssoS))) -- true
+(all (== (at (str-find ssoE "9") ssoPick) (ssoRef (fn [x] (str-find x "9")) ssoE))) -- true
+(sum (fills (str-find ssoE "9"))) -- 69991
+(.db.splayed.set "/tmp/rfl_sso_sym/t" (table [s e] (list ssoS ssoE)))
+(set ssoF (.db.splayed.get "/tmp/rfl_sso_sym/t"))
+(all (== (at (at (select {from: ssoF r: (substr s 8 -1)}) 'r) ssoPick) (ssoRef (fn [x] (substr x 8 -1)) ssoS))) -- true
+(all (== (at (at (select {from: ssoF r: (substr e 2 -1)}) 'r) ssoPick) (ssoRef (fn [x] (substr x 2 -1)) ssoE))) -- true
+(all (== (at (at (select {from: ssoF r: (str-find s "/p/")}) 'r) ssoPick) (ssoRef (fn [x] (str-find x "/p/")) ssoS))) -- true
+(at (select {from: ssoF by: (substr s 12 7) c: (count s) desc: c take: 1}) 'c) -- [226]
+(.sys.exec "rm -rf /tmp/rfl_sso_sym")
+;; The same column with per-column compressed symfiles: an entry is decoded
+;; into the reading thread's ring, so str-find reads a file's strings one at
+;; a time and substr leaves such a column to its row loop.
+(.sys.exec "rm -rf /tmp/rfl_sso_z")
+(.db.splayed.set "/tmp/rfl_sso_z/t" (table [s e] (list ssoS ssoE)) {symfile: 'column compress: true})
+(set ssoZ (.db.splayed.get "/tmp/rfl_sso_z/t"))
+(all (== (at (select {from: ssoZ r: (str-find s "/p/")}) 'r) (str-find ssoS "/p/"))) -- true
+(all (== (at (select {from: ssoZ r: (str-find e "9")}) 'r) (str-find ssoE "9"))) -- true
+(all (== (at (select {from: ssoZ r: (substr s 8 -1)}) 'r) (substr ssoS 8 -1))) -- true
+(all (== (at (select {from: ssoZ r: (substr e 2 -1)}) 'r) (substr ssoE 2 -1))) -- true
+(.sys.exec "rm -rf /tmp/rfl_sso_z")

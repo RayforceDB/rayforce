@@ -601,6 +601,7 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
         }
         ray_t* tbl = names
+            // cppcheck-suppress uninitvar // col_types is filled for all ncols (<= 256, checked above); col_names only when names is set, the only case it is passed
             ? ray_read_csv_named_opts(path, 0, false, col_types, (int32_t)ncols,
                                       col_names, (int32_t)ncols)
             : ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
@@ -2084,7 +2085,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
     /* Cast to GUID/guid */
     if (cast_match(tname, tlen, "GUID") || cast_match(tname, tlen, "guid")) {
         ray_release(s);
-        if (val->type == -RAY_GUID) { ray_retain(val); return val; }
+        if (val->type == -RAY_GUID || val->type == RAY_GUID) { ray_retain(val); return val; }
         if (val->type == -RAY_STR) {
             /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
              * Require the canonical hyphenated form exactly: 32 hex
@@ -2118,6 +2119,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 else                bytes[nib >> 1] |= (uint8_t)v;
                 nib++;
             }
+            // cppcheck-suppress uninitvar // sl == 36 is checked above, so the loop fills all 16 bytes
             return ray_guid(bytes);
         }
         /* Vector of GUIDs: empty vector cast */
@@ -3665,11 +3667,21 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             /* Strip trailing null bytes */
             while (la > 0 && ap[la - 1] == '\0') la--;
             while (lb > 0 && bp[lb - 1] == '\0') lb--;
-            char buf[8192];
-            if (la + lb > sizeof(buf)) return ray_error("limit", NULL);
+            if (la > SIZE_MAX - lb) return ray_error("oom", NULL);
+            size_t total = la + lb;
+            if (total == SIZE_MAX || total > (size_t)INT64_MAX)
+                return ray_error("oom", NULL);
+            char sbuf[8192];
+            char* buf = sbuf;
+            if (total > sizeof(sbuf)) {
+                buf = (char*)ray_alloc_raw(total);
+                if (!buf) return ray_error("oom", NULL);
+            }
             memcpy(buf, ap, la);
             memcpy(buf + la, bp, lb);
-            return ray_str(buf, la + lb);
+            ray_t* result = ray_str(buf, total);
+            if (buf != sbuf) ray_free_raw(buf);
+            return result;
         }
     }
     if (a->type == RAY_STR && ray_is_atom(b) && (-b->type) == RAY_STR)

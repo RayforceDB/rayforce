@@ -6,6 +6,9 @@
 #include "io/parquet.h"
 #include "core/pool.h"
 #include "mem/heap.h"
+#include "store/fileio.h"
+#include "store/encfmt.h"   /* ray_col_gen_of */
+#include "store/enccol.h"   /* ray_enccol_chunk_pfx: SYM prefix bounds */
 #include "mem/sys.h"
 #include "table/sym.h"
 #include "table/table.h"
@@ -346,7 +349,7 @@ static void pq_set_symmode(const char* v) { pq_set_env("RAY_PQ_SYM_MODE", v); }
 static void pq_sym_env_clear(void) {
     const char* knobs[] = {"RAY_PQ_SYM_MODE","RAY_PQ_SYM_ORDER","RAY_PQ_SYM_GROUPS","RAY_PQ_SYM_WINDOW",
                            "RAY_PQ_SYM_ARENA","RAY_PQ_SYM_HASH_BITS","RAY_PQ_SYM_INJECT","RAY_PQ_PASS_COLS",
-                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE","RAY_PQ_SYM_HASH_TOP"};
+                           "RAY_PQ_SYM_RAM","RAY_PQ_DIRECT_REVERSE","RAY_PQ_SYM_HASH_TOP","RAY_PQ_STAGE"};
     for (size_t i = 0; i < sizeof(knobs)/sizeof(knobs[0]); i++) pq_set_env(knobs[i], NULL);
 }
 
@@ -1478,6 +1481,53 @@ static test_result_t test_pq_sym_grouped_failures(void) {
     ray_pool_destroy();
     ray_release(types); unlink(src); unlink(big);
     PASS();
+}
+
+/* A cancel during a numeric column's row group stops its chunks: cancelled
+ * (a debug build injects it) after the first of the row group's four chunks
+ * is encoded, or before the task puts the chunks it encoded, the import
+ * encodes and puts no chunk after it (a debug build fails one that is),
+ * reports the cancel and publishes nothing. */
+static test_result_t test_pq_chunked_cancel(void) {
+#if !defined(DEBUG)
+    SKIP("debug builds inject the cancel");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-chcancel-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-chcancel-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_synth(src, 200000, 1, pq_synth_mixed));
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);   /* generation 2: x chunked */
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    const char* names[] = {"x","s","t"};
+    const char* steps[] = {"chunk","flush"};
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);   /* the tasks one by one, in order */
+    for (int i = 0; i < 2; i++) {
+        pq_set_env("RAY_PQ_PASS_COLS", "1");   /* x's pass holds no other task to cancel */
+        pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
+        ray_t* res = ray_parquet_splayed_typed(src, dir, opts);
+        pq_set_env("RAY_PQ_SYM_INJECT", NULL); pq_set_env("RAY_PQ_PASS_COLS", NULL);
+        bool failed = res && RAY_IS_ERR(res);
+        char code[32] = "";
+        if (failed) snprintf(code, sizeof(code), "%s", ray_err_code(res));
+        if (res) { if (failed) ray_error_free(res); else ray_release(res); }
+        ray_clear_interrupt();
+        pq_remove_native(partial, names, 3);
+        TEST_ASSERT_TRUE(failed);
+        TEST_ASSERT_STR_EQ(code, "cancel");
+        TEST_ASSERT_TRUE(access(dir, F_OK) != 0);
+    }
+    ray_pool_destroy();
+    ray_release(opts); unlink(src);
+    PASS();
+#endif
 }
 
 /* One row group of six rows of a required BYTE_ARRAY column s, every row
@@ -3720,6 +3770,82 @@ static int64_t pq_col_distinct(const char* dir, int c) {
     ray_release(t);
     return n;
 }
+/* The prefix of a string as RAY_ENC_SYM_PFX stores it. */
+static uint32_t pq_pfx4(const char* p, size_t n) {
+    uint32_t x = 0;
+    for (size_t i = 0; i < 4; i++) x = (x << 8) | (i < n ? (uint8_t)p[i] : 0u);
+    return x;
+}
+/* A compressed import writes the string-prefix bounds of its SYM columns
+ * (RAY_ENC_SYM_PFX) whichever symbol file the column resolves through: the
+ * shared .sym (the import dictionary while the columns are encoded) and its
+ * own (symfile 'column).  Every chunk's and vector's bounds are the
+ * minimum and maximum prefix of its non-null strings, read back here. */
+static test_result_t test_pq_sym_prefix_bounds(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], sym[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-pfx-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-pfx-%d", (int)getpid());
+    const char* names[] = {"x","s","t"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    const int64_t rows = 140000;                       /* three chunks, the last partial */
+    pq_synth_t = NULL; pq_synth_dict = 0;
+    TEST_ASSERT_TRUE(pq_synth(src, rows, 5, pq_synth_mixed));
+    TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
+    const char* layouts[] = {"shared", "column"};
+    for (int l = 0; l < 2; l++) {
+        ray_t* opts = pq_symcol_opts(types, layouts[l], true);
+        size_t cap = (size_t)1 << 16;
+        char* trace = (char*)ray_sys_alloc(cap);
+        TEST_ASSERT_TRUE(trace != NULL);
+        ray_t* res = pq_traced_import(src, dir, opts, trace, cap);
+        ray_sys_free(trace);
+        ray_release(opts);
+        TEST_ASSERT_FMT(res && !RAY_IS_ERR(res), "%s: import failed", layouts[l]);
+        ray_release(res);
+        snprintf(sym, sizeof(sym), "%s/.sym", dir);
+        ray_t* t = ray_read_splayed(dir, l == 0 ? sym : NULL);
+        TEST_ASSERT_FMT(t && !RAY_IS_ERR(t), "%s: read back", layouts[l]);
+        for (int c = 1; c < 3; c++) {
+            ray_t* encv = ray_table_get_col_enc_idx(t, c);
+            TEST_ASSERT_FMT(encv != NULL, "%s: column %s is not encoded", layouts[l], names[c]);
+            ray_enccol_t* e = ray_enccol_of(encv);
+            ray_t* col = ray_table_get_col_idx(t, c);
+            TEST_ASSERT_TRUE(col && col->type == RAY_SYM && col->len == rows);
+            for (int64_t v = 0; v * RAY_ENC_VEC < rows; v++) {
+                uint32_t mn = UINT32_MAX, mx = 0; bool have = false;
+                for (int64_t r = v * RAY_ENC_VEC; r < rows && r < (v + 1) * RAY_ENC_VEC; r++) {
+                    if (ray_read_sym(ray_data(col), r, RAY_SYM, col->attrs) == 0) continue;   /* null */
+                    ray_t* a = ray_sym_vec_cell(col, r);
+                    uint32_t p = pq_pfx4(ray_str_ptr(a), ray_str_len(a));
+                    if (p < mn) mn = p;
+                    if (p > mx) mx = p;
+                    have = true;
+                }
+                const ray_enc_desc_t* d = &ray_enccol_descs(e, v / RAY_ENC_VECS_PER_CHUNK)[v % RAY_ENC_VECS_PER_CHUNK];
+                TEST_ASSERT_FMT(have == ((d->flags & RAY_ENC_SYM_PFX) != 0), "%s %s vector %lld: bounds %d, values %d",
+                                layouts[l], names[c], (long long)v, (d->flags & RAY_ENC_SYM_PFX) != 0, have);
+                if (have) TEST_ASSERT_FMT(d->rsv1 == mn && d->rsv2 == mx, "%s %s vector %lld: [%08x %08x], want [%08x %08x]",
+                                          layouts[l], names[c], (long long)v, d->rsv1, d->rsv2, mn, mx);
+            }
+            for (int64_t ch = 0; ch < e->n_chunks; ch++) {
+                uint32_t mn, mx;
+                TEST_ASSERT_FMT(ray_enccol_chunk_pfx(e, ch, &mn, &mx), "%s %s chunk %lld: no bounds",
+                                layouts[l], names[c], (long long)ch);
+                TEST_ASSERT_TRUE(mn <= mx);
+            }
+        }
+        ray_release(t);
+        if (l == 0) pq_remove_native(dir, names, 3); else pq_remove_symcol(dir, names, 3);
+        snprintf(sym, sizeof(sym), "%s/.sym", dir); unlink(sym);
+        snprintf(sym, sizeof(sym), "%s/.sym.ix", dir); unlink(sym);
+    }
+    unlink(src);
+    ray_release(types);
+    PASS();
+}
+
 /* symfile 'column: each symbol column its own symbol file, `.s.sym` and
  * `.t.sym`, and no `.sym`.  Every row's string is the shared import's; each
  * file holds its column's distinct strings and "" (t's vocabulary meets
@@ -3864,6 +3990,170 @@ static test_result_t test_pq_symfile_column(void) {
     PASS();
 }
 
+/* Whether this host has memory files (ray_file_open_mem): optional even on
+ * Linux, where a denied memfd or /proc reopen falls back to the file. */
+static bool pq_mem_files(void) {
+    char path[64];
+    ray_fd_t fd = ray_file_open_mem(path, sizeof(path));
+    if (fd == RAY_FD_INVALID) return false;
+    ray_file_close(fd);
+    return true;
+}
+
+/* Generation 2 stages each column's raw payload until its close encodes it:
+ * in memory by default (where memory files exist and the pass fits the
+ * memory admission), in the staging file under RAY_PQ_STAGE=file.
+ * Both give the same files, byte for byte (on one worker: the direct
+ * import's positions follow its tasks), in one pass and column by column
+ * (where a symbol column is encoded at its pass's end, saving the domain's
+ * count then), direct and grouped, and every row reads back. */
+static test_result_t test_pq_stage_mem(void) {
+    pq_sym_env_clear();
+    char src[160], dir[3][160], a[220], b[220];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-stage-%d.parquet", (int)getpid());
+    for (int k = 0; k < 3; k++) snprintf(dir[k], sizeof(dir[k]), "/tmp/rayforce-pq-stage-%d-%d", (int)getpid(), k);
+    const char* names[] = {"x","s","t"};
+    const char* stage[] = {NULL, "file", "mem"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    int64_t rows = 140000;   /* three encoding chunks */
+    TEST_ASSERT_TRUE(pq_synth(src, rows, 9, pq_synth_mixed));
+    bool mem_files = pq_mem_files();
+    int64_t ram = ray_sys_ram_limit();
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    int bad = 0;
+    for (int run = 0; run < 8; run++) {
+        /* bit 0 column by column, bit 1 grouped, bit 2 four workers */
+        int cores = run & 4 ? 4 : 1;
+        for (int k = 0; k < 3; k++) {
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+            if (run & 1) pq_set_layout("1");
+            if (run & 2) pq_set_symmode("grouped");
+            pq_set_env("RAY_PQ_STAGE", stage[k]);
+            /* the default decides by memory: give it the headroom, the
+             * watermark at the whole RAM limit, whatever the heap holds */
+            if (k == 0 && ram > 0) ray_heap_set_anon_watermark(ram);
+            ray_t* res = pq_traced_import(src, dir[k], opts, trace, cap);
+            ray_heap_set_anon_watermark(0);
+            pq_sym_env_clear();
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  %d/%d: import failed: %s\n", run, k, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                bad++; continue;
+            }
+            ray_release(res);
+            /* each of the three columns staged in memory once under 'mem; by
+             * default the two SYM ones, numeric x chunked (staging nothing),
+             * and none with no memory size to go by (no runtime); none under
+             * 'file */
+            int lines = 0;
+            double staged = pq_trace_sum(trace, "mem_staged", &lines);
+            double want = k == 1 || !mem_files || (k == 0 && ram <= 0) ? 0 : k == 0 ? 2 : 3;
+            if (!lines || staged != want) {
+                fprintf(stderr, "  %d/%d: %.0f columns staged in memory over %d passes (want %.0f)\n",
+                        run, k, staged, lines, want);
+                bad++;
+            }
+            double chunked = pq_trace_sum(trace, "chunked", NULL);
+            if (chunked != (k == 0 ? 1 : 0)) {
+                fprintf(stderr, "  %d/%d: %.0f columns chunked (want %d)\n", run, k, chunked, k == 0);
+                bad++;
+            }
+            if (!pq_synth_check(dir[k], rows, pq_synth_mixed)) { fprintf(stderr, "  %d/%d: rows differ\n", run, k); bad++; }
+        }
+        const char* files[] = {"x","s","t",".sym"};
+        for (int k = 1; cores == 1 && k < 3; k++)
+            for (int f = 0; f < 4; f++) {
+                snprintf(a, sizeof(a), "%s/%s", dir[0], files[f]);
+                snprintf(b, sizeof(b), "%s/%s", dir[k], files[f]);
+                if (!pq_same_file(a, b)) { fprintf(stderr, "  %d: %s differs under %s\n", run, files[f], stage[k]); bad++; }
+            }
+        for (int k = 0; k < 3; k++) pq_remove_native(dir[k], names, 3);
+    }
+    ray_sys_free(trace);
+    unlink(src);
+    ray_release(opts); ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
+/* Column t's strings: 500, none of them column s's. */
+static const char* pq_synth_late(int64_t r, char* buf, uint32_t* len) {
+    *len = (uint32_t)snprintf(buf, 256, "late-%lld", (long long)(r % 500));
+    return buf;
+}
+/* Column by column, a generation-2 symbol column is encoded at its own
+ * pass's end with the domain's count then: one whose pass runs before the
+ * other's new strings saves a count below the symbol file's final one, and
+ * still loads, its rows unchanged.  Both stagings. */
+static test_result_t test_pq_stage_early_sym_count(void) {
+    pq_sym_env_clear();
+    char src[160], dir[160], path[220];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-early-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-early-%d", (int)getpid());
+    const char* names[] = {"x","s","t"};
+    int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    int64_t rows = 140000;
+    pq_synth_t = pq_synth_late;
+    bool made = pq_synth(src, rows, 9, pq_synth_mixed);
+    int bad = made ? 0 : 1;
+    const char* stage[] = {"file", "mem"};
+    for (int k = 0; made && k < 2; k++) {
+        if (pq_pool(1) != RAY_OK) { bad++; break; }
+        pq_set_layout("1");
+        pq_set_symmode("direct");
+        pq_set_env("RAY_PQ_STAGE", stage[k]);
+        ray_t* res = ray_parquet_splayed_typed(src, dir, opts);
+        pq_sym_env_clear();
+        if (!res || RAY_IS_ERR(res)) {
+            fprintf(stderr, "  %s: import failed: %s\n", stage[k], res ? ray_err_code(res) : "null");
+            if (res) ray_error_free(res);
+            bad++; continue;
+        }
+        ray_release(res);
+        int64_t final = pq_sym_count(dir), saved[2] = {-1, -1};
+        for (int c = 0; c < 2; c++) {
+            snprintf(path, sizeof(path), "%s/%s", dir, names[1 + c]);
+            FILE* f = fopen(path, "rb");
+            ray_t hdr;
+            if (f && fread(&hdr, 1, 32, f) == 32 && ray_col_gen_of(&hdr) == 2) saved[c] = (int64_t)hdr.rc;
+            if (f) fclose(f);
+        }
+        int64_t lo = saved[0] < saved[1] ? saved[0] : saved[1], hi = saved[0] < saved[1] ? saved[1] : saved[0];
+        if (lo < 0 || lo >= final || hi > final) {
+            fprintf(stderr, "  %s: saved counts %lld, %lld, symbol file %lld\n", stage[k],
+                    (long long)saved[0], (long long)saved[1], (long long)final);
+            bad++;
+        }
+        if (!pq_synth_check(dir, rows, pq_synth_mixed)) { fprintf(stderr, "  %s: rows differ\n", stage[k]); bad++; }
+        pq_remove_native(dir, names, 3);
+    }
+    pq_synth_t = NULL;
+    unlink(src);
+    ray_release(opts); ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
 const test_entry_t parquet_entries[] = {
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
@@ -3888,12 +4178,16 @@ const test_entry_t parquet_entries[] = {
     {"parquet/native_edges",test_pq_native_edges,pq_setup,pq_teardown},
     {"parquet/native_dictionary",test_pq_native_dictionary,pq_setup,pq_teardown},
     {"parquet/group_native",test_pq_group_native,pq_setup,pq_teardown},
+    {"parquet/sym_prefix_bounds",test_pq_sym_prefix_bounds,pq_setup,pq_teardown},
     {"parquet/sym_grouped",test_pq_sym_grouped,pq_setup,pq_teardown},
     {"parquet/sym_grouped_collisions",test_pq_sym_grouped_collisions,pq_setup,pq_teardown},
     {"parquet/sym_grouped_layout",test_pq_sym_grouped_layout,pq_setup,pq_teardown},
     {"parquet/sym_mixed_modes",test_pq_sym_mixed_modes,pq_setup,pq_teardown},
     {"parquet/symfile_column",test_pq_symfile_column,pq_setup,pq_teardown},
+    {"parquet/stage_mem",test_pq_stage_mem,pq_setup,pq_teardown},
+    {"parquet/stage_early_sym_count",test_pq_stage_early_sym_count,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
+    {"parquet/chunked_cancel",test_pq_chunked_cancel,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},
     {"parquet/symgrp_collision_determinism",test_pq_sym_grouped_collision_determinism,pq_setup,pq_teardown},

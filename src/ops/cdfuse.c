@@ -62,12 +62,12 @@
 #include "ops/rowsel.h"    /* ray_rowsel_* — the bounded kernel's selection */
 #include "core/platform.h" /* ray_vm_advise_willneed */
 
-/* Peak-footprint estimate used by the admission gate below: 32B/row for
+/* Peak-footprint estimate used by the admission gate below: 24B/row for
  * phase 1's records plus up to 24B per (partition, key) pair in phase 2,
  * itself bounded by the row count — see the KNOWN MEMORY BOUND comment at
- * the phase-3 call site.  56B/row is that worst case (all-distinct input),
+ * the phase-3 call site.  48B/row is that worst case (all-distinct input),
  * both phases' buffers alive simultaneously until cdf_free_all runs. */
-#define CDF_BYTES_PER_ROW 56
+#define CDF_BYTES_PER_ROW 48
 
 /* ══════════════════════════════════════════
  * Shared helpers
@@ -92,7 +92,7 @@ typedef struct {
     uint32_t n, cap;
 } cdf_buf_t;
 
-#define CDF_REC 32 /* [pairhash 8][k 8][v 8][row 8] */
+#define CDF_REC 24 /* [k 8][v 8][row 8]; the pair hash is recomputed by phase 2 */
 
 /* Upper bound on partitions.  Phase 3's merge input is
  * n_parts × distinct-keys-per-partition and pair-hash partitioning lets every
@@ -209,10 +209,9 @@ static void cdf_p1_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
             if (c->dedup && cdf_repeat(recent, hash, k, v)) continue;
             uint32_t part = hash & (c->n_parts - 1);
             char* record = my[part].buf + (size_t)my[part].n++ * CDF_REC;
-            ((uint64_t*)record)[0] = hash;
-            ((int64_t*)record)[1] = k;
-            ((int64_t*)record)[2] = v;
-            ((int64_t*)record)[3] = r;
+            ((int64_t*)record)[0] = k;
+            ((int64_t*)record)[1] = v;
+            ((int64_t*)record)[2] = r;
         }
         atomic_fetch_add_explicit(&c->rows_done, limit - begin, memory_order_relaxed);
     }
@@ -265,6 +264,69 @@ typedef struct {
     _Atomic(int64_t) done;
 } cdf_p2_ctx_t;
 
+/* The partition-local tables of phase 2 start at CDF_TAB_MIN slots (or at
+ * the 2 x record bound when that is smaller) and double at half load, up to
+ * that bound.  The records bound the pairs and the groups, but a partition
+ * commonly holds far fewer distinct pairs than records, and a table sized
+ * to the records was a sentinel fill of 2 x 4 bytes per record for nothing.
+ * Half load, not less: doubling earlier made the tables and their
+ * re-placing cost more than the probes it saved. */
+#define CDF_TAB_MIN 1024
+
+/* (k,v) dedupe table: 16 B key slot + int32 occupancy (an in-band sentinel is
+ * unsafe: every int64 is a valid value). */
+static bool cdf_pairs_alloc(ray_t** hdr, int64_t** dkv, int32_t** docc, uint64_t cap) {
+    int64_t* t = (int64_t*)scratch_alloc(hdr, (size_t)cap * 2 * sizeof(int64_t) + (size_t)cap * 4);
+    if (!t) return false;
+    *dkv = t;
+    *docc = (int32_t*)(t + (size_t)cap * 2);
+    memset(*docc, 0xFF, (size_t)cap * 4);
+    return true;
+}
+
+/* Double the (k,v) table, re-placing every pair by its hash. */
+static bool cdf_pairs_grow(ray_t** hdr, int64_t** dkv, int32_t** docc, uint64_t* cap,
+                           uint32_t part_bits) {
+    uint64_t ncap = *cap * 2, nmask = ncap - 1;
+    ray_t* nh = NULL; int64_t* nkv = NULL; int32_t* nocc = NULL;
+    if (!cdf_pairs_alloc(&nh, &nkv, &nocc, ncap)) return false;
+    for (uint64_t s = 0; s < *cap; s++) {
+        if ((*docc)[s] == -1) continue;
+        int64_t k = (*dkv)[s * 2], v = (*dkv)[s * 2 + 1];
+        uint64_t t = (cdf_pair_hash(k, v) >> part_bits) & nmask;
+        while (nocc[t] != -1) t = (t + 1) & nmask;
+        nkv[t * 2] = k; nkv[t * 2 + 1] = v; nocc[t] = 1;
+    }
+    scratch_free(*hdr);
+    *hdr = nh; *dkv = nkv; *docc = nocc; *cap = ncap;
+    return true;
+}
+
+/* k table: slots of (k, group index), both written on first insert. */
+static bool cdf_keys_alloc(ray_t** hdr, int64_t** kk, int32_t** kidx, uint64_t cap) {
+    int64_t* t = (int64_t*)scratch_alloc(hdr, (size_t)cap * sizeof(int64_t) + (size_t)cap * 4);
+    if (!t) return false;
+    *kk = t;
+    *kidx = (int32_t*)(t + cap);
+    memset(*kidx, 0xFF, (size_t)cap * 4);
+    return true;
+}
+
+static bool cdf_keys_grow(ray_t** hdr, int64_t** kk, int32_t** kidx, uint64_t* cap) {
+    uint64_t ncap = *cap * 2, nmask = ncap - 1;
+    ray_t* nh = NULL; int64_t* nk = NULL; int32_t* nidx = NULL;
+    if (!cdf_keys_alloc(&nh, &nk, &nidx, ncap)) return false;
+    for (uint64_t s = 0; s < *cap; s++) {
+        if ((*kidx)[s] == -1) continue;
+        uint64_t t = cdf_fmix64(ray_hash_i64((*kk)[s])) & nmask;
+        while (nidx[t] != -1) t = (t + 1) & nmask;
+        nk[t] = (*kk)[s]; nidx[t] = (*kidx)[s];
+    }
+    scratch_free(*hdr);
+    *hdr = nh; *kk = nk; *kidx = nidx; *cap = ncap;
+    return true;
+}
+
 static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     cdf_p2_ctx_t* c = (cdf_p2_ctx_t*)vctx;
@@ -279,37 +341,23 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
             continue;
         }
 
-        /* Both partition-local tables are sized to 2× the record count:
-         * groups and distinct (k,v) pairs are each bounded by the record
-         * count, so load stays ≤ 0.5 and linear probing always finds an
-         * empty slot. */
-        uint64_t dcap = 8;
-        while (dcap < (uint64_t)total * 2) dcap <<= 1;
-        uint64_t dmask = dcap - 1;
-
-        /* (k,v) dedupe table: 16B key slot + int32 occupancy (an in-band
-         * sentinel is unsafe — every int64 is a valid value). */
-        ray_t* dh_hdr = NULL;
-        int64_t* dkv = (int64_t*)scratch_alloc(
-            &dh_hdr, (size_t)dcap * 2 * sizeof(int64_t) + (size_t)dcap * 4);
-        if (!dkv) {
-            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
-            return;
-        }
-        int32_t* docc = (int32_t*)(dkv + (size_t)dcap * 2);
-        memset(docc, 0xFF, (size_t)dcap * 4);
-
-        /* k table: slots of (k, group index), both written on first insert. */
-        ray_t* kh_hdr = NULL;
-        int64_t* kk = (int64_t*)scratch_alloc(
-            &kh_hdr, (size_t)dcap * sizeof(int64_t) + (size_t)dcap * 4);
-        if (!kk) {
+        /* Both tables start small and double at half load up to the 2 x
+         * record bound (cdf_pairs_grow, cdf_keys_grow), so linear probing
+         * always finds an empty slot. */
+        uint64_t full = 8;
+        while (full < (uint64_t)total * 2) full <<= 1;
+        uint64_t dcap = full < CDF_TAB_MIN ? full : CDF_TAB_MIN;
+        uint64_t kcap = dcap;
+        ray_t* dh_hdr = NULL; int64_t* dkv = NULL; int32_t* docc = NULL;
+        ray_t* kh_hdr = NULL; int64_t* kk = NULL; int32_t* kidx = NULL;
+        if (!cdf_pairs_alloc(&dh_hdr, &dkv, &docc, dcap) ||
+            !cdf_keys_alloc(&kh_hdr, &kk, &kidx, kcap)) {
             scratch_free(dh_hdr);
+            scratch_free(kh_hdr);
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             return;
         }
-        int32_t* kidx = (int32_t*)(kk + dcap);
-        memset(kidx, 0xFF, (size_t)dcap * 4);
+        int64_t npairs = 0;
 
         int64_t cap = total < 256 ? total : 256;
         cdf_grp_t* grps = (cdf_grp_t*)ray_alloc_raw((size_t)cap * sizeof(cdf_grp_t));
@@ -326,18 +374,21 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
             cdf_buf_t* b = &c->bufs[(size_t)w * c->n_parts + p];
             const char* rec = b->buf;
             for (uint32_t i = 0; i < b->n; i++, rec += CDF_REC) {
-                uint64_t ph = ((const uint64_t*)rec)[0];
-                int64_t k = ((const int64_t*)rec)[1];
-                int64_t v = ((const int64_t*)rec)[2];
-                int64_t row = ((const int64_t*)rec)[3];
+                int64_t k = ((const int64_t*)rec)[0];
+                int64_t v = ((const int64_t*)rec)[1];
+                int64_t row = ((const int64_t*)rec)[2];
+                uint64_t ph = cdf_pair_hash(k, v);
 
                 /* k table probe for EVERY record: this partition's first_row
                  * must be the MIN over all its rows of the key, not only over
                  * rows that open a fresh (k,v) pair.  The slot index comes
                  * from a hash of k ALONE — recomputed here rather than stored,
-                 * to keep the record at 32B — and that hash never selects a
+                 * to keep the record at 24B — and that hash never selects a
                  * partition, so it needs no bit shift-out. */
-                uint64_t t = cdf_fmix64(ray_hash_i64(k)) & dmask;
+                if ((uint64_t)(ng + 1) * 2 > kcap && kcap < full &&
+                    !cdf_keys_grow(&kh_hdr, &kk, &kidx, &kcap)) { failed = 1; break; }
+                uint64_t kmask = kcap - 1;
+                uint64_t t = cdf_fmix64(ray_hash_i64(k)) & kmask;
                 int64_t gi = 0;
                 for (;;) {
                     if (kidx[t] == -1) {
@@ -371,18 +422,22 @@ static void cdf_p2_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
                         if (row < grps[gi].first) grps[gi].first = row;
                         break;
                     }
-                    t = (t + 1) & dmask;
+                    t = (t + 1) & kmask;
                 }
                 if (failed) break;
 
                 /* Dedupe on the pair hash already in the record; slot bits
                  * above the partition bits. */
+                if ((uint64_t)(npairs + 1) * 2 > dcap && dcap < full &&
+                    !cdf_pairs_grow(&dh_hdr, &dkv, &docc, &dcap, c->part_bits)) { failed = 1; break; }
+                uint64_t dmask = dcap - 1;
                 uint64_t s = (ph >> c->part_bits) & dmask;
                 for (;;) {
                     if (docc[s] == -1) {
                         dkv[s * 2] = k;
                         dkv[s * 2 + 1] = v;
                         docc[s] = 1;
+                        npairs++;
                         grps[gi].cnt++;
                         break;
                     }
@@ -685,9 +740,9 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
      *
      * KNOWN MEMORY BOUND: peak footprint scales with ROWS, not with groups —
      * phase 2's partial triples (24B per distinct (partition, key) pair, itself
-     * bounded by the row count) coexist with phase 1's 32B-per-row records
+     * bounded by the row count) coexist with phase 1's 24B-per-row records
      * until the cdf_free_all below, so a pathological all-distinct input peaks
-     * near 56B/row.  Cardinality-aware admission (declining when the estimated
+     * near 48B/row.  Cardinality-aware admission (declining when the estimated
      * distinct-pair count would blow a budget) is future work. */
     cdf_merge_t mg[CDF_MERGE_PARTS];
     memset(mg, 0, sizeof(mg));

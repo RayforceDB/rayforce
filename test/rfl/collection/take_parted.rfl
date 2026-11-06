@@ -57,6 +57,23 @@
 (take _tp [-3 2]) -- (take _tf [-3 2])
 (take _tp [5 10]) -- (take _tf [5 10])
 (count (take _tp [7 2])) -- 0
+;; at by rows reads the partitions that hold them, nothing flattened:
+;; any order, repeats, a row of the partition without b and name, and the
+;; single-row forms, exactly as the flat table answers
+(at _tp [6 0 3 3 1]) -- (at _tf [6 0 3 3 1])
+(at _tp [1 2 4]) -- (at _tf [1 2 4])
+(at _tp [4 3 2 1 0]) -- (at _tf [4 3 2 1 0])
+(at _tp (where (> (at _tp 'a) 2))) -- (at _tf (where (> (at _tf 'a) 2)))
+(at _tp 3) -- (at _tf 3)
+(at _tp 0) -- (at _tf 0)
+(first _tp) -- (first _tf)
+(last _tp) -- (last _tf)
+(at _tp 7) !- domain
+(at _tp [0 7]) !- domain
+;; a whole column: dense segments copied, nulls kept
+(at _tp 'a) -- (at _tf 'a)
+(at _tp 'c) -- (at _tf 'c)
+(at _tp 'b) -- (at _tf 'b)
 (.sys.exec "rm -rf /tmp/rfl_take_parted")
 
 ;; take over a compressed (generation 2) table: an encoded column is read
@@ -81,4 +98,18 @@
 (take _gc [70000 2]) -- (take _gp [70000 2])
 (take _gc [66000 8000]) -- (take _gp [66000 8000])
 (at (take _gc -2) 'a) -- [3943662 3951581]
+;; at by rows on the compressed table reads the rows' vectors only
+(at _gc [69999 5 5 40000 0]) -- (at _gp [69999 5 5 40000 0])
+(at _gc 12345) -- (at _gp 12345)
+(first _gc) -- (first _gp)
+;; and on compressed partitions of it (the partition key the only extra column)
+(.db.splayed.set "/tmp/rfl_take_gen2/z/2024.01.01/t/" (take _gt [0 30000]) "/tmp/rfl_take_gen2/z/.sym" {compress: true})
+(.db.splayed.set "/tmp/rfl_take_gen2/z/2024.01.02/t/" (take _gt [30000 25000]) "/tmp/rfl_take_gen2/z/.sym" {compress: true})
+(.db.splayed.set "/tmp/rfl_take_gen2/z/2024.01.03/t/" (take _gt [55000 15000]) "/tmp/rfl_take_gen2/z/.sym" {compress: true})
+(set _gz (.db.parted.get "/tmp/rfl_take_gen2/z/" 't))
+(set _gzr (fn [r] (select {a: a b: b s: s from: r})))
+(_gzr (at _gz [69999 29999 30000 5 5 54999 55000])) -- (at _gp [69999 29999 30000 5 5 54999 55000])
+(_gzr (at _gz (til 70000))) -- _gp
+(at (at _gz [29999 30000 69999]) 'date) -- [2024.01.01 2024.01.02 2024.01.03]
+(at _gz 54999) -- (at (at _gz [54999]) 0)
 (.sys.exec "rm -rf /tmp/rfl_take_gen2")

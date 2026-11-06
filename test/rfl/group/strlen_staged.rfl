@@ -187,4 +187,22 @@
 (at SLR 'c) -- [18726 18726 18726 18726 18725 18725 18725]
 (value SLR) -- (value SLP)
 (nil? (at SLR 'a)) -- [false false false false false false false]
+;; wide32 under a where: the strlen fold reads the selection's whole
+;; segments as ranges and its mixed ones row by row, generation 2 (SLU)
+;; and plain (SLT), against the same grouping over the filtered table
+;; whole segments in and out
+(value (select {a: (sum (strlen y)) c: (count y) from: SLU where: (> p 0) by: l asc: l})) -- (value (select {a: (sum (strlen y)) c: (count y) from: (select {from: SLT where: (> p 0)}) by: l asc: l}))
+(value (select {a: (sum (strlen y)) c: (count y) from: SLT where: (> p 0) by: l asc: l})) -- (value (select {a: (sum (strlen y)) c: (count y) from: (select {from: SLT where: (> p 0)}) by: l asc: l}))
+(value (select {a: (avg (strlen y)) c: (count y) from: SLU where: (> p 0) by: l asc: l})) -- (value (select {a: (avg (strlen y)) c: (count y) from: (select {from: SLT where: (> p 0)}) by: l asc: l}))
+(value (select {a: (avg (strlen y)) c: (count y) from: SLT where: (> p 0) by: l asc: l})) -- (value (select {a: (avg (strlen y)) c: (count y) from: (select {from: SLT where: (> p 0)}) by: l asc: l}))
+;; every segment mixed
+(value (select {a: (sum (strlen y)) c: (count y) from: SLU where: (!= h 0) by: l asc: l})) -- (value (select {a: (sum (strlen y)) c: (count y) from: (select {from: SLT where: (!= h 0)}) by: l asc: l}))
+(value (select {a: (sum (strlen y)) c: (count y) from: SLT where: (!= h 0) by: l asc: l})) -- (value (select {a: (sum (strlen y)) c: (count y) from: (select {from: SLT where: (!= h 0)}) by: l asc: l}))
+(value (select {a: (avg (strlen y)) c: (count y) from: SLU where: (!= h 0) by: l asc: l})) -- (value (select {a: (avg (strlen y)) c: (count y) from: (select {from: SLT where: (!= h 0)}) by: l asc: l}))
+(value (select {a: (avg (strlen y)) c: (count y) from: SLT where: (!= h 0) by: l asc: l})) -- (value (select {a: (avg (strlen y)) c: (count y) from: (select {from: SLT where: (!= h 0)}) by: l asc: l}))
+;; mixed, whole and rejected segments
+(value (select {a: (sum (strlen y)) c: (count y) from: SLU where: (and (> p -3000) (!= h 1)) by: l asc: l})) -- (value (select {a: (sum (strlen y)) c: (count y) from: (select {from: SLT where: (and (> p -3000) (!= h 1))}) by: l asc: l}))
+(value (select {a: (sum (strlen y)) c: (count y) from: SLT where: (and (> p -3000) (!= h 1)) by: l asc: l})) -- (value (select {a: (sum (strlen y)) c: (count y) from: (select {from: SLT where: (and (> p -3000) (!= h 1))}) by: l asc: l}))
+(value (select {a: (avg (strlen y)) c: (count y) from: SLU where: (and (> p -3000) (!= h 1)) by: l asc: l})) -- (value (select {a: (avg (strlen y)) c: (count y) from: (select {from: SLT where: (and (> p -3000) (!= h 1))}) by: l asc: l}))
+(value (select {a: (avg (strlen y)) c: (count y) from: SLT where: (and (> p -3000) (!= h 1)) by: l asc: l})) -- (value (select {a: (avg (strlen y)) c: (count y) from: (select {from: SLT where: (and (> p -3000) (!= h 1))}) by: l asc: l}))
 (.sys.exec "rm -rf rfl_strlen_staged")

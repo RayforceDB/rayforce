@@ -171,6 +171,43 @@ for its own release links). On MinGW, link the winsock libraries as well:
 `-lws2_32 -lmswsock -lkernel32 -ladvapi32`, with the same section-GC flag
 the toolchain accepts.
 
+### Staged headers (`make install-headers`)
+
+`make install-headers` copies the headers a C client needs into a staging
+root, so a tree staged from one machine can be carried to a build host
+that has no checkout. The staged set is `include/rayforce.h` (public)
+plus the internals that bindings include directly - `src/ops/ops.h`,
+`src/io/parquet.h`, `src/mem/heap.h` - and the two those internals reach
+through their own quoted includes, `src/store/hnsw.h` (from `ops.h`) and
+`src/core/platform.h` (from `heap.h`). They are copies rather than
+symlinks, staged read-only, mirroring the source layout: the internals
+land under `install/include/rayforce/`, and `rayforce.h` is staged
+twice - inside that tree and at the stage root
+(`install/include/rayforce.h`), which is the copy that lets
+`-Iinstall/include` resolve `<rayforce.h>`. `DESTDIR` and
+`INSTALL_INCLUDE` move the stage root, and `make clean` removes what the
+same overrides staged.
+
+The staged layout needs **two include roots**: the internals include
+their siblings by quoted, `src/`-relative path, so `-Iinstall/include`
+alone does not resolve `"ops/ops.h"`:
+
+```sh
+cc -O2 -Iinstall/include -Iinstall/include/rayforce/src \
+   examples/analytics.c librayforce.a -lm -lpthread -o analytics
+```
+
+The target fails loudly: any failed copy aborts it, so a run that
+returns success has left a complete tree, and one that cannot stage says
+so rather than reporting success over a partial one.
+
+Staging is a convenience for building against one engine revision, not
+an SDK contract. What it promises is the header contents at the commit
+that staged them - no ABI stability, and no API stability either. The
+staged set carries internal types and layouts that can change between
+revisions, so stage from the same commit you built `librayforce.a`
+from.
+
 A checkout at the current commit links `analytics.c` to a 3.47 MB
 stripped binary, from a 10.22 MB archive; sizes move with the tree, so
 this is just one measurement, not a bound.

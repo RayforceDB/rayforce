@@ -60,7 +60,7 @@ A callback that overruns its period does not replay the fires it missed. After e
 
 ## `.time.timer.del` { #time-timer-del }
 
-Signature: `(.time.timer.del id)`. Removes the timer with that id from the heap and releases its retained lambda. Returns null. Idempotent — passing an unknown id is not an error.
+Signature: `(.time.timer.del id)`. Removes the timer with that id from the heap and releases its retained lambda. Returns null. Idempotent — passing an unknown id is not an error. A timer may delete itself from inside its own callback: the current call finishes and the timer is not fired again.
 
 Errors: `type` if `id` isn't an `i64`.
 

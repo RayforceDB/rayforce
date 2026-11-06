@@ -24,6 +24,7 @@
 ;; Reopenable source: whole-query grouping, sorting, repeated scans and pushdown.
 (set pqs (.parquet.scan "test/data/parquet/flat-1-v2.parquet"))
 (count (select {from: pqs})) -- 18
+(count (select {from: pqs where: (and (>= x 4) (<= x 7))})) -- 6
 (sum (at (select {from: pqs x: x}) 'x)) -- 74
 (count (cols (select {from: pqs name: name where: (and (>= x 4) (<= x 7))}))) -- 1
 (count (select {from: pqs name: name where: (and (>= x 4) (<= x 7))})) -- 6

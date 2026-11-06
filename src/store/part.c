@@ -34,6 +34,7 @@
 #include "mem/sys.h"
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/hash.h"     /* ray_hash_bytes — the partition cache's key index */
 #include "store/splay.h"
 #include "table/sym.h"
 #include "table/domain.h"
@@ -369,11 +370,18 @@ static ray_t* missing_seg(int8_t type, int64_t rows, struct ray_sym_domain_s* do
  * not be hidden by reuse).
  *
  * Ownership is thread-local: ray_t reference counts are not atomic on
- * ordinary callers.  Each thread keeps at most RAY_PART_CACHE_MAX tables;
- * oldest entries are evicted first.  GC, symbol-domain opens and the next
- * mount discard entries whose columns have no users outside the cache.
- * Heap abandon/destroy releases the rest before the heap changes owner
- * or is unmapped.
+ * ordinary callers.  Each thread keeps at most RAY_PART_CACHE_MAX tables
+ * (1024; RAY_PART_CACHE_MAX in the environment, read once, sets another
+ * count, and 0 sets none); the least recently mounted are evicted first.
+ * GC, symbol-domain opens and the next mount discard entries whose columns
+ * have no users outside the cache.  Heap abandon/destroy releases the rest
+ * before the heap changes owner or is unmapped.
+ *
+ * A mount looks up, replaces and evicts one entry per partition, so none of
+ * these walks the cache: entries are chained by key hash, and a recency
+ * list runs from the newest (a hit moves its entry there) to the oldest
+ * (the eviction's).  A cyclic pass over more partitions than the cap holds
+ * hits nothing, but then costs the loads and no more.
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -393,13 +401,44 @@ typedef struct part_cache_entry_s {
     part_file_sig_t* sigs;      /* [0] = .d, then one per column in table order */
     int64_t          nsigs;
     uint64_t         seq;       /* the last mount that touched this entry */
-    struct part_cache_entry_s* next;
+    uint64_t         hash;      /* ray_hash_bytes of key */
+    struct part_cache_entry_s* chain;   /* next in the same bucket */
+    struct part_cache_entry_s* newer;   /* recency list, toward g_part_newest */
+    struct part_cache_entry_s* older;   /* toward g_part_oldest */
 } part_cache_entry_t;
 
 #define RAY_PART_CACHE_MAX 1024
-static RAY_TLS part_cache_entry_t* g_part_cache;
+static RAY_TLS part_cache_entry_t** g_part_buckets;   /* g_part_nbuckets chains */
+static RAY_TLS size_t g_part_nbuckets;                /* a power of two; 0 when empty */
+static RAY_TLS part_cache_entry_t* g_part_newest;
+static RAY_TLS part_cache_entry_t* g_part_oldest;
 static RAY_TLS uint64_t g_part_seq;
 static RAY_TLS size_t g_part_count;
+
+/* The cap is per thread but one setting for the process: -1 until the
+ * environment is read. */
+static _Atomic(int64_t) g_part_cap = -1;
+
+static int64_t part_cache_cap(void) {
+    int64_t cap = atomic_load_explicit(&g_part_cap, memory_order_relaxed);
+    if (cap >= 0) return cap;
+    cap = RAY_PART_CACHE_MAX;
+    const char* e = getenv("RAY_PART_CACHE_MAX");
+    if (e && *e >= '0' && *e <= '9') {   /* a decimal count; anything else keeps the default */
+        char* end = NULL;
+        unsigned long long v = strtoull(e, &end, 10);
+        if (end && *end == '\0' && v <= (unsigned long long)INT64_MAX) cap = (int64_t)v;
+    }
+    int64_t unread = -1;   /* a setter that ran meanwhile wins */
+    atomic_compare_exchange_strong(&g_part_cap, &unread, cap);
+    return atomic_load_explicit(&g_part_cap, memory_order_relaxed);
+}
+
+int64_t ray_parted_cache_set_max(int64_t max) {
+    int64_t was = part_cache_cap();
+    atomic_store_explicit(&g_part_cap, max < 0 ? -1 : max, memory_order_relaxed);
+    return was;
+}
 
 static bool part_file_sig(const char* path, part_file_sig_t* out) {
     struct stat st;
@@ -469,37 +508,33 @@ static bool part_entry_current(const part_cache_entry_t* e) {
     return true;
 }
 
-static char* part_strdup(const char* s) {
-    size_t n = strlen(s) + 1;
-    char* d = (char*)ray_sys_alloc(n);
-    if (d) memcpy(d, s, n);
-    return d;
-}
-
+/* key, resolved and sigs live in the entry's own block. */
 static void part_entry_free(part_cache_entry_t* e) {
     if (!e) return;
     if (e->tbl) ray_release(e->tbl);
-    ray_sys_free(e->key);
-    ray_sys_free(e->resolved);
-    ray_sys_free(e->sigs);
-    ray_sys_free(e);
+    ray_free_raw(e);
 }
 
 /* Describe a freshly loaded partition.  NULL when it cannot be described
  * (a path too long, a file already gone): the load is still returned to
- * the caller, it just is not kept. */
+ * the caller, it just is not kept.  One block from the thread's heap (the
+ * cache is cleared before the heap goes): past the cap every mount of a
+ * partition loads it and evicts another, and a mapping per entry and per
+ * string made each miss cost more than the load. */
 static part_cache_entry_t* part_entry_new(const char* key, const char* resolved,
                                           ray_t* tbl) {
     int64_t n = 1 + ray_table_ncols(tbl);
-    part_cache_entry_t* e = (part_cache_entry_t*)ray_sys_alloc(sizeof(*e));
+    size_t kl = strlen(key) + 1, rl = strlen(resolved) + 1;
+    size_t sz = sizeof(part_cache_entry_t) + (size_t)n * sizeof(part_file_sig_t);
+    part_cache_entry_t* e = (part_cache_entry_t*)ray_calloc_raw(sz + kl + rl);
     if (!e) return NULL;
-    memset(e, 0, sizeof(*e));
-    e->key      = part_strdup(key);
-    e->resolved = part_strdup(resolved);
-    e->sigs     = (part_file_sig_t*)ray_sys_alloc((size_t)n * sizeof(part_file_sig_t));
+    e->sigs     = (part_file_sig_t*)(e + 1);
     e->nsigs    = n;
-    if (!e->key || !e->resolved || !e->sigs ||
-        !part_sigs_take(resolved, tbl, e->sigs, n)) {
+    e->key      = (char*)e + sz;
+    e->resolved = e->key + kl;
+    memcpy(e->key, key, kl);
+    memcpy(e->resolved, resolved, rl);
+    if (!part_sigs_take(resolved, tbl, e->sigs, n)) {
         part_entry_free(e);
         return NULL;
     }
@@ -508,15 +543,77 @@ static part_cache_entry_t* part_entry_new(const char* key, const char* resolved,
     return e;
 }
 
-/* Only the owning thread visits or releases its cached objects. */
+static part_cache_entry_t* part_cache_find(const char* key, uint64_t hash) {
+    if (!g_part_nbuckets) return NULL;
+    for (part_cache_entry_t* e = g_part_buckets[hash & (g_part_nbuckets - 1)]; e; e = e->chain)
+        if (e->hash == hash && strcmp(e->key, key) == 0) return e;
+    return NULL;
+}
+
+/* Room for one more entry at no more than one per bucket.  False only when
+ * there is no table at all; a table that cannot grow serves, chains longer. */
+static bool part_cache_reserve(void) {
+    if (g_part_count < g_part_nbuckets) return true;
+    size_t n = g_part_nbuckets ? g_part_nbuckets * 2 : 64;
+    part_cache_entry_t** b = (part_cache_entry_t**)ray_calloc_raw(n * sizeof(*b));
+    if (!b) return g_part_nbuckets != 0;
+    for (size_t i = 0; i < g_part_nbuckets; i++) {
+        for (part_cache_entry_t* e = g_part_buckets[i], *next; e; e = next) {
+            next = e->chain;
+            e->chain = b[e->hash & (n - 1)];
+            b[e->hash & (n - 1)] = e;
+        }
+    }
+    ray_free_raw(g_part_buckets);
+    g_part_buckets = b;
+    g_part_nbuckets = n;
+    return true;
+}
+
+static void part_cache_push_newest(part_cache_entry_t* e) {
+    e->newer = NULL;
+    e->older = g_part_newest;
+    if (g_part_newest) g_part_newest->newer = e; else g_part_oldest = e;
+    g_part_newest = e;
+}
+
+static void part_cache_unlink_recency(part_cache_entry_t* e) {
+    if (e->newer) e->newer->older = e->older; else g_part_newest = e->older;
+    if (e->older) e->older->newer = e->newer; else g_part_oldest = e->newer;
+    e->newer = e->older = NULL;
+}
+
+/* After part_cache_reserve. */
+static void part_cache_insert(part_cache_entry_t* e) {
+    part_cache_entry_t** b = &g_part_buckets[e->hash & (g_part_nbuckets - 1)];
+    e->chain = *b;
+    *b = e;
+    part_cache_push_newest(e);
+    g_part_count++;
+}
+
+static void part_cache_remove(part_cache_entry_t* e) {
+    for (part_cache_entry_t** pp = &g_part_buckets[e->hash & (g_part_nbuckets - 1)];
+         *pp; pp = &(*pp)->chain) {
+        if (*pp == e) { *pp = e->chain; break; }
+    }
+    part_cache_unlink_recency(e);
+    g_part_count--;
+    part_entry_free(e);
+}
+
+/* Only the owning thread visits or releases its cached objects.  An empty
+ * cache gives its table back too. */
 static void part_cache_drop(bool (*keep)(const part_cache_entry_t*, const void*),
                             const void* ctx) {
-    for (part_cache_entry_t** pp = &g_part_cache; *pp; ) {
-        part_cache_entry_t* e = *pp;
-        if (keep(e, ctx)) { pp = &e->next; continue; }
-        *pp = e->next;
-        g_part_count--;
-        part_entry_free(e);
+    for (part_cache_entry_t* e = g_part_newest, *older; e; e = older) {
+        older = e->older;
+        if (!keep(e, ctx)) part_cache_remove(e);
+    }
+    if (g_part_count == 0 && g_part_buckets) {
+        ray_free_raw(g_part_buckets);
+        g_part_buckets = NULL;
+        g_part_nbuckets = 0;
     }
 }
 
@@ -559,18 +656,19 @@ static ray_t* part_open(const char* path, struct ray_sym_domain_s* dom,
     if (ray_splay_resolve_dir(path, resolved, sizeof(resolved)) != RAY_OK)
         return ray_read_splayed_dom(path, dom);   /* the loader reports it */
 
-    for (part_cache_entry_t* e = g_part_cache; e; e = e->next) {
-        if (strcmp(e->key, path) != 0) continue;
-        if (strcmp(e->resolved, resolved) == 0 &&
-            part_domain_matches(e->tbl, dom) && part_entry_current(e)) {
-            e->seq = seq;
-            ray_t* tbl = e->tbl;
-            ray_retain(tbl);
-            *reused = true;
-            return tbl;
-        }
-        break;   /* changed: replaced below once the fresh load succeeds */
+    uint64_t hash = ray_hash_bytes(path, strlen(path));
+    part_cache_entry_t* e = part_cache_find(path, hash);
+    if (e && strcmp(e->resolved, resolved) == 0 &&
+        part_domain_matches(e->tbl, dom) && part_entry_current(e)) {
+        e->seq = seq;
+        part_cache_unlink_recency(e);
+        part_cache_push_newest(e);
+        ray_t* tbl = e->tbl;
+        ray_retain(tbl);
+        *reused = true;
+        return tbl;
     }
+    /* changed, if kept: replaced below once the fresh load succeeds */
 
     ray_t* tbl = ray_read_splayed_dom(path, dom);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
@@ -584,27 +682,22 @@ static ray_t* part_open(const char* path, struct ray_sym_domain_s* dom,
     part_cache_entry_t* fresh = part_entry_new(path, resolved, tbl);
     if (!fresh) return tbl;
 
-    for (part_cache_entry_t** pp = &g_part_cache; *pp; pp = &(*pp)->next) {
-        if (strcmp((*pp)->key, path) == 0) {
-            part_cache_entry_t* old = *pp;
-            *pp = old->next;
-            g_part_count--;
-            part_entry_free(old);
-            break;
-        }
+    /* Looked up again: the load may have pruned the entry found above. */
+    part_cache_entry_t* old = part_cache_find(path, hash);
+    if (old) part_cache_remove(old);
+    if (!part_cache_reserve()) {
+        part_entry_free(fresh);
+        return tbl;
     }
     fresh->seq = seq;
-    fresh->next = g_part_cache;
-    g_part_cache = fresh;
-    if (++g_part_count > RAY_PART_CACHE_MAX) {
-        part_cache_entry_t** oldest = &g_part_cache;
-        for (part_cache_entry_t** pp = &g_part_cache; *pp; pp = &(*pp)->next)
-            if ((*pp)->seq <= (*oldest)->seq) oldest = pp;
-        part_cache_entry_t* dead = *oldest;
-        *oldest = dead->next;
-        g_part_count--;
-        part_entry_free(dead);
-    }
+    fresh->hash = hash;
+    part_cache_insert(fresh);
+    /* Never the fresh entry: it is the newest of at least two.  The count
+     * widens rather than the cap narrowing: where size_t is 32 bits, a cap
+     * of 2^32 would otherwise read as 0 and evict the fresh entry too. */
+    int64_t cap = part_cache_cap();
+    while (cap > 0 && (uint64_t)g_part_count > (uint64_t)cap)
+        part_cache_remove(g_part_oldest);
     return tbl;
 }
 

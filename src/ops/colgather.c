@@ -315,6 +315,7 @@ static ray_t* grows_range(ray_col_src_t* src, const int64_t* ids, const int64_t*
                 uint8_t nul[GATHER_POINT_ROWS];
                 const int64_t* rp = ids + k;     /* in order: the ids themselves */
                 if (ord) { for (int64_t q = k; q < j; q++) rows[q - k] = ids[ord[q]]; rp = rows; }
+                // cppcheck-suppress uninitvar // rp is ids + k, or rows filled for [k, j) just above
                 int pr = ray_col_src_gather_points(src, rp, j - k, x, nul, &err);
                 if (pr < 0) break;
                 if (pr > 0) {                    /* every row of the vector served */

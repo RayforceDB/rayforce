@@ -371,7 +371,11 @@ Symbols whose name starts with `.` are a reserved system namespace populated at 
 .csv     ; {read:<.csv.read> write:<.csv.write>}
 ```
 
-Every `.`-prefixed name is protected: `set`, `let`, lambda parameters, and `del` all refuse such names with `error: reserve`. This keeps user code from shadowing the builtin surface, regardless of where it's bound.
+Ordinary `.`-prefixed names are protected: `set`, `let`, lambda parameters,
+and `del` refuse them with `error: reserve`. The five designated `.ipc.on.*`
+[connection-hook slots](../storage/ipc-hooks.md) are an exception: `set` can
+install a hook and `del` can clear it. Parameters still cannot use reserved
+names.
 
 ```text
 (set .os.foo 1)        ; error: reserve
@@ -412,7 +416,7 @@ User-defined functions are created with `fn`. Lambdas compile lazily to bytecode
 
 The VM supports trap frames for `try`/`raise` error handling, ensuring exceptions unwind cleanly through compiled code.
 
-A lambda made inside another function is a closure over the locals visible where it was made. A `fn` literal inside a compiled body is compiled once, as a template, when the enclosing function compiles; every closure made from it shares that bytecode and captures only the enclosing locals its body mentions (all of them when the body uses `eval` or `resolve`), so making a closure costs no compilation and its recursion depth does not shrink with the bindings in scope. Its captures are locals of its own body: a `let` of a captured name rebinds it for that call, a capture (or a parameter or `let`) named like a builtin or a special form is the callee, a parameter shadows a capture of its name, `self` inside a closure is the closure itself, and a caller's local of the same name never stands in for a capture. A `let` that has not run leaves its name unbound, in the body and in a closure made after it, so a read of it finds the global of that name or raises a name error, as on the tree walker. Capture is lexical: a closure captures the bindings of the function it is written in, never a caller's locals. A closure body resolves the names it does not capture when it runs, so a global rebound after the closure was made is seen; a lambda made with nothing captured keeps the builtins it names as they were when it compiled. `eval` and `resolve` inside a compiled body see its locals and captures; their arguments run as part of the body. A lazy value is materialized when captured. A body nested deeper than 2048 levels (built at run time; parsed text stops at 1024) is not compiled and runs on the interpreter, whose own depth limit of 512 nested evaluations applies. A closure made by interpreted code (at the top level, by `eval`, or inside a special form the compiler hands to the tree walker) shares a template too, kept per literal and capture set in a per-thread table of 256 entries, so it is born compiled as well; one written inside a query stays on the tree walker and keeps the query's rule for quoted symbols.
+A lambda made inside another function is a closure over the locals visible where it was made. A `fn` literal inside a compiled body is compiled once, as a template, when the enclosing function compiles; every closure made from it shares that bytecode and captures only the enclosing locals its body mentions (all of them when the body uses `eval` or `resolve`), so making a closure costs no compilation and its recursion depth does not shrink with the bindings in scope. Its captures are locals of its own body: a `let` of a captured name rebinds it for that call, a capture (or a parameter or `let`) named like a builtin or a special form is the callee, a parameter shadows a capture of its name, `self` inside a closure is the closure itself, and a caller's local of the same name never stands in for a capture. A `let` that has not run leaves its name unbound, in the body and in a closure made after it, so a read can find a visible interpreted caller's local, the global of that name, or raise a name error. Capture is lexical: a closure captures the bindings of the function it is written in, never a caller's locals. A closure body resolves the names it does not capture when it runs, so a global rebound after the closure was made is seen, and an ordinary local in an interpreted caller's frame can also be seen; a lambda made with nothing captured keeps the builtins it names as they were when it compiled. `eval` and `resolve` inside a compiled body see its locals and captures; their arguments run as part of the body. A lazy value is materialized when captured. A body nested deeper than 2048 levels (built at run time; parsed text stops at 1024) is not compiled and runs on the interpreter, whose own depth limit of 512 nested evaluations applies. A closure made by interpreted code (at the top level, by `eval`, or inside a special form the compiler hands to the tree walker) shares a template too, kept per literal and capture set in a per-thread table of 256 entries, so it is born compiled as well; one written inside a query stays on the tree walker and keeps the query's rule for quoted symbols.
 
 ## Select & Update
 
@@ -455,8 +459,48 @@ combined table (the two-argument form does not mutate its argument):
                (list [TSLA] [250.0] [300])))
 ```
 
-To mutate a named global in place, pass the target as a quoted symbol —
-`(insert 'trades newrows)` — or use `upsert` with an explicit key count,
+For named mutation, `(insert 'trades newrows)` appends to the innermost
+visible local or parameter named `trades`, falling back to a global only
+when no such local exists. It returns the target symbol. An error never
+redirects a local write into a same-named global. The same resolution applies
+to `alter`, including dictionary paths rooted in a local:
+
+```lisp
+(set collect (fn [rows]
+  (let records (table [ts qty] (list (as 'I64 []) (as 'I64 []))))
+  (let weights (til 3))
+  (insert 'records rows)
+  (alter 'weights set 0 99)
+  records))
+```
+
+A unique ordinary local table can use the same amortized append path as a
+unique global table. Unique writable vectors can be amended by `alter set`
+without copying. Actual aliases, captured values, slices, mapped storage,
+and shared dictionary paths retain copy-on-write isolation. Other operations
+retain their existing allocation behavior; named mutation does not promise
+that every operation or representation avoids allocation.
+
+This applies when the call's head is the literal `alter` or `insert`, or a
+global alias of one, such as `(set ins insert)`, bound when the function is
+compiled. A mutator reached through any other head (a parameter, a `let`, a
+dotted head, a computed head, or a name unbound at that time) is an ordinary
+callee: a quoted target resolves as a global, as before, and a computed
+target publishes nothing, whether the function is compiled or left to the
+tree walker.
+
+Under a literal head or an alias, a closure with a computed `alter` or
+`insert` target retains the enclosing bindings that the target could name,
+just as dynamic `eval` or `resolve` does. Constructing the target symbol at
+runtime does not redirect a captured local write into a same-named global.
+Captures remain values: amending one inside the closure does not change the
+enclosing function's binding.
+
+A separately defined function does not gain access to its caller's locals.
+Query source columns/aliases are not writable named targets, and a dotted
+mutation path must traverse dictionaries rather than table columns or methods.
+An unbound target is an error. These rules do not change `upsert`'s existing
+contract; for a global target it takes an explicit key count:
 `(upsert 'trades 1 newrows)`.
 
 ## C API

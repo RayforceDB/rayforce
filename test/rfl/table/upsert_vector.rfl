@@ -6,7 +6,9 @@
 ;; (the per-cell path) — and requires the two tables to be identical.  The
 ;; batches repeat keys, mix hits with misses, and carry nulls.
 
-(set rowwise (fn [tn nk P cols] (map (fn [r] (upsert tn nk (map (fn [c] (at (at P c) r)) cols))) (til (count P)))))
+;; The per-cell oracle requires an explicitly boxed positional row, even
+;; when every mapped cell has the same atom type.
+(set rowwise (fn [tn nk P cols] (map (fn [r] (upsert tn nk (concat (list) (map (fn [c] (at (at P c) r)) cols)))) (til (count P)))))
 (set NI 37)
 (set insts (as 'SYMBOL (map (fn [i] (format "i%" i)) (til NI))))
 (set TS 2026.09.15D12:00:00.000000000)

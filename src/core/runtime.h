@@ -65,6 +65,12 @@ typedef struct {
      * text calls.  A lookup made by compiled code, or from inside a lambda
      * called under the window, passes it by. */
     uint8_t  eval_window;
+    /* A dynamic-eval window mirrors these bytecode locals. The slots remain
+     * owning refs; named mutation may discount only the matching mirror. */
+    ray_t** slot_values;
+    const int64_t* slot_names;
+    uint8_t* slot_rows;
+    int32_t slot_count;
     /* RAY_SCOPE_CALL only: the call was made by name, so the body's text
      * was written outside the query and its literal symbols are literals. */
     uint8_t  named;
@@ -119,6 +125,8 @@ typedef struct {
     int              proj_keep_n;
     int32_t          proj_depth;  /* eval_depth at publish; consumed only at +1 */
     bool             proj_active;
+    ray_t           *proj_dict;   /* the publisher's query dict (borrowed): a join
+                                   * judges its clauses against the joined columns */
     /* ── filter-compaction keep-set: a select about to execute its WHERE-filter
      * DAG publishes the column syms its (provably keys-only distinct) downstream
      * will read, so the top-level filter finalization (ray_execute_inner) gathers

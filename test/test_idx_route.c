@@ -2807,7 +2807,98 @@ static test_result_t test_range_adversarial_sweep(void) {
     PASS();
 }
 
+/* Large enough to exercise sorted exact-find, including a batch plus tail.
+ * Explicitly stamp the returned view: slicing does not inherit SORTED. */
+static test_result_t test_find_sorted_i64_views(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    int64_t original[4120];
+    for (int64_t i = 0; i < 4120; i++) original[i] = (i / 3) * 2 - 10;
+    int64_t probes[] = {99,99,99,99,99, -2,-2,-4,0,2,4096,INT64_MAX,-1,
+                        2730,2732,-2,4,6,8,10,12,14};
+    ray_t* hp = ray_vec_from_raw(RAY_I64, original, 4120);
+    ray_t* qp = ray_vec_from_raw(RAY_I64, probes, 22);
+    TEST_ASSERT(hp && !RAY_IS_ERR(hp), "haystack parent");
+    TEST_ASSERT(qp && !RAY_IS_ERR(qp), "probe parent");
+    ray_t* h = ray_vec_slice(hp, 13, 4099);
+    ray_t* q = ray_vec_slice(qp, 5, 17);
+    TEST_ASSERT(h && !RAY_IS_ERR(h), "haystack view");
+    TEST_ASSERT(q && !RAY_IS_ERR(q), "probe view");
+    ray_t* tag = ray_sym(ray_sym_intern("sorted", 6));
+    TEST_ASSERT(tag && !RAY_IS_ERR(tag), "sorted tag");
+    ray_t* marked = ray_attr_set_fn(tag, h);
+    ray_release(tag);
+    ray_release(h);
+    h = marked;
+    TEST_ASSERT(h && !RAY_IS_ERR(h), "mark view");
+    TEST_ASSERT(h->attrs & RAY_ATTR_SLICE, "retain haystack view");
+    TEST_ASSERT(q->attrs & RAY_ATTR_SLICE, "retain probe view");
+    TEST_ASSERT_EQ_I(h->slice_offset, 13);
+    TEST_ASSERT_EQ_I(q->slice_offset, 5);
+    uint8_t ha = h->attrs, qa = q->attrs;
+    int64_t hr = h->rc, qr = q->rc, hpr = hp->rc, qpr = qp->rc;
+    ray_t* result = ray_find_fn(h, q);
+    TEST_ASSERT(result && !RAY_IS_ERR(result), "find views");
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 17);
+    bool any_null = false;
+    for (int64_t j = 0; j < 17; j++) {
+        int64_t expected = INT64_MIN;
+        for (int64_t i = 0; i < 4099; i++) {
+            if (original[13 + i] == probes[5 + j]) { expected = i; break; }
+        }
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[j], expected);
+        any_null |= expected == INT64_MIN;
+    }
+    TEST_ASSERT_EQ_I(!!(result->attrs & RAY_ATTR_HAS_NULLS), any_null);
+    TEST_ASSERT_EQ_I(h->attrs, ha);
+    TEST_ASSERT_EQ_I(q->attrs, qa);
+    TEST_ASSERT_EQ_I(h->rc, hr);
+    TEST_ASSERT_EQ_I(q->rc, qr);
+    TEST_ASSERT_EQ_I(hp->rc, hpr);
+    TEST_ASSERT_EQ_I(qp->rc, qpr);
+    TEST_ASSERT(memcmp(ray_data(hp), original, sizeof(original)) == 0, "haystack unchanged");
+    TEST_ASSERT(memcmp(ray_data(qp), probes, sizeof(probes)) == 0, "probes unchanged");
+    ray_release(result); ray_release(h); ray_release(q); ray_release(hp); ray_release(qp);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_find_sorted_i64_extremes(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    int64_t values[4099];
+    values[0] = INT64_MIN + 1;
+    values[1] = -9007199254740993LL;
+    values[2] = -1; values[3] = 0; values[4] = 0;
+    values[5] = 9007199254740992LL; values[6] = 9007199254740993LL;
+    for (int64_t i = 7; i < 4099; i++) values[i] = INT64_MAX;
+    int64_t probes[] = {INT64_MAX, INT64_MIN + 1, -9007199254740993LL, -1, 0,
+                        9007199254740992LL, 9007199254740993LL, 1, INT64_MAX - 1};
+    int64_t expected[] = {7, 0, 1, 2, 3, 5, 6, INT64_MIN, INT64_MIN};
+    ray_t* h = ray_vec_from_raw(RAY_I64, values, 4099);
+    ray_t* q = ray_vec_from_raw(RAY_I64, probes, 9);
+    TEST_ASSERT(h && !RAY_IS_ERR(h), "haystack");
+    TEST_ASSERT(q && !RAY_IS_ERR(q), "probes");
+    ray_t* tag = ray_sym(ray_sym_intern("sorted", 6));
+    TEST_ASSERT(tag && !RAY_IS_ERR(tag), "sorted tag");
+    ray_t* marked = ray_attr_set_fn(tag, h);
+    ray_release(tag); ray_release(h); h = marked;
+    TEST_ASSERT(h && !RAY_IS_ERR(h), "mark haystack");
+    ray_t* result = ray_find_fn(h, q);
+    TEST_ASSERT(result && !RAY_IS_ERR(result), "find signed extremes");
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 9);
+    TEST_ASSERT(memcmp(ray_data(result), expected, sizeof(expected)) == 0, "exact signed positions");
+    TEST_ASSERT(result->attrs & RAY_ATTR_HAS_NULLS, "misses carry null hint");
+    ray_release(result); ray_release(h); ray_release(q);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
+    { "idx_route/find_sorted_i64_views", test_find_sorted_i64_views, NULL, NULL },
+    { "idx_route/find_sorted_i64_extremes", test_find_sorted_i64_extremes, NULL, NULL },
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
     { "idx_route/zone_all",              test_zone_all,              NULL, NULL },

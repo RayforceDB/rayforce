@@ -6407,11 +6407,24 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
      * path may execute a sub-graph (the grouped expression bridge
      * materializing an input the element-wise compiler declines, #756);
      * were that call to reset the flag, a cancel that arrived before it
-     * would be dropped and the workers would run the remaining tickets. */
-    bool outermost = exec_depth++ == 0;
+     * would be dropped and the workers would run the remaining tickets.
+     * The depth is per thread: a task of a dispatch that executes a graph
+     * (a per-row expression on a worker) is at depth 0 on its own thread
+     * yet inside the query, so a call under an in-flight dispatch is never
+     * the outermost one either. */
+    bool outermost = exec_depth++ == 0 &&
+                     atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0;
     ray_t* result = ray_execute_inner(g, root, outermost);
     exec_depth--;
     if (own_scan) ray_pool_scan_set(prev_scan);
+    /* A cancelled query answers `cancel`, whatever its nodes made of the
+     * tickets the pool skipped for it: the pool runs none of a cancelled
+     * query's tasks, so a stage that reads a dispatch's output without
+     * looking at the flag would hand back what was never computed. */
+    if (pool_cancelled(ray_pool_get())) {
+        if (result) { if (RAY_IS_ERR(result)) ray_error_free(result); else ray_release(result); }
+        return ray_error("cancel", NULL);
+    }
     return result ? result : ray_error("oom", NULL);
 }
 

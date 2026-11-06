@@ -143,11 +143,7 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
         is.order_name = colw_order_name(vec->index, &is.order_len);
         ray_encw_set_index(&w, &is);
     }
-    for (int64_t c = 0; e == RAY_OK && c < w.n_chunks; c++) {
-        int64_t n = vec->len - c * RAY_ENC_CHUNK;
-        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
-        e = ray_encw_chunk(&w, data + (size_t)c * RAY_ENC_CHUNK * esz, pool, n);
-    }
+    if (e == RAY_OK) e = ray_encw_chunks(&w, data, esz, pool);
     /* colw_region_msg reads the thread-local message: clear it first, so a
      * plain io error from finish never picks up a stale "index region:" */
     if (e == RAY_OK && region) ray_error_clear();
@@ -349,6 +345,9 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     ray_err_t e = !buf ? RAY_ERR_OOM : (!f ? RAY_ERR_IO : RAY_OK);
     ray_encw_t ew; memset(&ew, 0, sizeof ew);
     if (e == RAY_OK) e = ray_encw_begin(&ew, f, type, attrs, s->len, sc, ik, cf);
+    /* the codes are positions of the target domain, else runtime ids */
+    if (e == RAY_OK && type == RAY_SYM)
+        ray_encw_set_sym_domain(&ew, w->target_dom ? w->target_dom : ray_sym_runtime_domain());
     if (e == RAY_OK && idx_root) {
         /* the source attrs, as colw_gen2_vec passes them: finish writes the
          * region at the column's final persisted attrs (SYM PART keys at

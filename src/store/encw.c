@@ -27,6 +27,9 @@
 #include "ops/hash.h"     /* ray_hash_bytes */
 #include "store/col.h"       /* COL_DISK_ATTRS_MASK */
 #include "core/platform.h"   /* ray_vm_map_anon */
+#include "core/pool.h"
+#include "table/sym.h"       /* ray_read_sym */
+#include "table/symimp.h"    /* the import dictionary's records */
 #include <stdatomic.h>
 #include <string.h>
 
@@ -89,7 +92,25 @@ static ray_err_t encw_int(int8_t type, uint8_t attrs, const void* data, int64_t 
     if (in->bitmap && in->n_nulls > 0 && (err = put(o, in->nullmap, 128)) != RAY_OK) goto out;
     bool have = false; int64_t mn = 0, mx = 0;
     bool sum = ray_encw_type_summable(type);
-    for (int i = 0; i < n; i++) {
+    if (in->n_nulls == 0) {
+        /* no null row: the extrema in a straight loop, and the sum in
+         * int64 while 1024 values of their range cannot overflow it */
+        const int sh = 64 - in->k.T;
+        const bool sg = in->k.is_signed;
+        int64_t a = ray_enc_logical(in->bits[0], in->k), b = a;
+        for (int i = 1; i < n; i++) {
+            int64_t x = sg ? (int64_t)(in->bits[i] << sh) >> sh : (int64_t)in->bits[i];
+            a = x < a ? x : a; b = x > b ? x : b;
+        }
+        mn = a; mx = b; have = true;
+        if (sum && a >= -(INT64_C(1) << 52) && b <= (INT64_C(1) << 52)) {
+            int64_t s = 0;
+            for (int i = 0; i < n; i++) s += sg ? (int64_t)(in->bits[i] << sh) >> sh : (int64_t)in->bits[i];
+            ray_i128_add(&o->sum_hi, &o->sum_lo, s);
+        } else if (sum) {
+            for (int i = 0; i < n; i++) ray_i128_add(&o->sum_hi, &o->sum_lo, ray_enc_logical(in->bits[i], in->k));
+        }
+    } else for (int i = 0; i < n; i++) {
         bool null = in->bitmap ? ((in->nullmap[i >> 3] >> (i & 7)) & 1)
                                : (type == RAY_SYM && in->bits[i] == 0);
         if (null) continue;
@@ -355,6 +376,7 @@ static ray_err_t str_choose_plain(const ray_str_t* s, const char* pool, int n, c
         if (!fb) return RAY_ERR_OOM;
         const char* sp[RAY_ENC_VEC]; uint32_t sl[RAY_ENC_VEC];
         for (int i = 0; i < n; i++) { sp[i] = ray_str_t_ptr(&s[i], pool); sl[i] = s[i].len; }
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         ft = ray_enc_fsst_encode(side->fsst, side->fsst_ix, sp, sl, n, fb, cl);
         bool fit = true;                                  /* the lengths child is U32 */
         for (int i = 0; i < n; i++) if (cl[i] > UINT32_MAX) fit = false;
@@ -553,9 +575,11 @@ static ray_err_t fput(ray_encw_t* w, const void* p, size_t n) {
 void ray_encw_free(ray_encw_t* w) {
     ray_free_raw(w->dir); w->dir = NULL;
     ray_free_raw(w->dict_v); w->dict_v = NULL;
+    ray_free_raw(w->dict_ix); w->dict_ix = NULL;
     sd_free(&w->sdict);
     ray_free_raw(w->fsst); w->fsst = NULL;
     ray_free_raw(w->fsst_ix); w->fsst_ix = NULL;
+    ray_free_raw(w->sym_pfx); w->sym_pfx = NULL;
     ray_enc_buf_free(&w->chunk);
     ray_encw_vec_free(&w->vec);
     if (w->idict) { ray_dict_acc_free(w->idict); ray_free_raw(w->idict); w->idict = NULL; }
@@ -586,6 +610,171 @@ ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int
     }
     /* Headers and directory are written last, at offset 0 (finish). */
     return fput(w, NULL, (size_t)RAY_ENC_DIR_OFF + (size_t)w->n_chunks * sizeof(ray_enc_dirent_t));
+}
+
+void ray_encw_set_sym_domain(ray_encw_t* w, ray_sym_domain_t* dom) {
+    if (w->type != RAY_SYM || !dom) return;
+    w->sym_dom = dom;
+    w->sym_raw_ok = ray_sym_domain_raw_pin(dom, &w->sym_raw);
+    /* an import domain resolves no string itself: its dictionary's records
+     * are read in place (fixed mapping and offset blocks, every position
+     * a column holds written before the column is encoded) */
+    w->sym_imp = ray_sym_domain_import(dom);
+    w->sym_imp_count = w->sym_imp ? ray_symimp_count(w->sym_imp) : 0;
+}
+
+void ray_encw_set_sym_bounds(ray_encw_t* w, const uint32_t* mn, const uint32_t* mx, const uint8_t* has) {
+    if (!w->sym_dom) return;
+    w->sym_bmn = mn; w->sym_bmx = mx; w->sym_bhas = has;
+}
+
+/* The first four bytes of a string, big-endian, zero-padded. */
+static inline uint32_t encw_pfx4(const char* p, size_t n) {
+    uint32_t x = 0;
+    for (size_t i = 0; i < 4; i++) x = (x << 8) | (i < n ? (uint8_t)p[i] : 0u);
+    return x;
+}
+
+/* The prefix of position `pos` of the writer's domain; false when the
+ * domain has no string there. */
+static bool encw_sym_pfx(const ray_encw_t* w, int64_t pos, uint32_t* out) {
+    if (w->sym_imp) {
+        if (pos >= w->sym_imp_count) return false;
+        uint32_t len;
+        const char* s = ray_symimp_get(w->sym_imp, pos, &len);
+        if (!s) return false;
+        *out = encw_pfx4(s, len);
+        return true;
+    }
+    if (w->sym_raw_ok && pos < w->sym_raw.count) {
+        size_t len;
+        const char* s = ray_sym_domain_raw_str(&w->sym_raw, pos, &len);
+        if (!s) return false;            /* a decode that failed: no bounds */
+        *out = encw_pfx4(s, len);
+        return true;
+    }
+    ray_t* a = ray_sym_domain_str(w->sym_dom, pos);
+    if (!a) return false;
+    *out = encw_pfx4(ray_str_ptr(a), ray_str_len(a));
+    return true;
+}
+
+/* The prefix table of a column whose rows lie contiguously (ray_encw_chunks):
+ * the positions its rows hold are marked in one pass over the rows, then
+ * their prefixes are read once, in position order.  Rows looking up their
+ * own codes read the domain's records at random, and a dictionary larger
+ * than memory then faults a page in for nearly every row.  No table (rows
+ * look up their own) for a domain with more positions than the column has
+ * rows, a held position without a string, a cancel, or no memory. */
+#define ENCW_PFX_TASK 65536
+typedef struct {
+    const ray_encw_t* w;
+    const void*       data;
+    _Atomic(uint8_t)* held;
+    uint32_t*         t;
+    int64_t           n;
+    _Atomic(bool)     bad;
+} encw_pfx_par_t;
+
+static void encw_pfx_mark_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    encw_pfx_par_t* x = (encw_pfx_par_t*)raw;
+    int64_t lo = start * ENCW_PFX_TASK, hi = end * ENCW_PFX_TASK;
+    if (hi > x->w->len) hi = x->w->len;
+    for (int64_t i = lo; i < hi; i++) {
+        int64_t c = ray_read_sym(x->data, i, RAY_SYM, x->w->attrs);
+        if (c <= 0 || c >= x->n) continue;          /* the null symbol, or looked up per row */
+        if (!atomic_load_explicit(&x->held[c], memory_order_relaxed))
+            atomic_store_explicit(&x->held[c], 1, memory_order_relaxed);
+    }
+}
+
+/* An import dictionary's written records are mapped for random lookups (no
+ * read-around), so the fill asks for the window of records ahead itself. */
+#define ENCW_PFX_RA ((int64_t)1 << 20)
+
+static void encw_pfx_fill_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    encw_pfx_par_t* x = (encw_pfx_par_t*)raw;
+    const ray_symimp_t* m = x->w->sym_imp;
+    int64_t lo = start * ENCW_PFX_TASK, hi = end * ENCW_PFX_TASK, ra_lo = 0, ra_hi = 0;
+    if (hi > x->n) hi = x->n;
+    for (int64_t i = lo; i < hi; i++) {
+        if (!atomic_load_explicit(&x->held[i], memory_order_relaxed)) continue;
+        if (m) {
+            int64_t off = ray_symimp_offset(m, i);
+            if (off < ra_lo || off >= ra_hi) {
+                ray_symimp_willneed(m, off, ENCW_PFX_RA);
+                ra_lo = off; ra_hi = off + ENCW_PFX_RA;
+            }
+        }
+        if (!encw_sym_pfx(x->w, i, &x->t[i])) {
+            atomic_store(&x->bad, true);
+            return;
+        }
+    }
+}
+
+/* On the pool, or serially block by block (a column finish already runs
+ * inside a dispatch), stopping at a cancel. */
+static void encw_pfx_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
+                         encw_pfx_par_t* x, int64_t items) {
+    int64_t nt = (items + ENCW_PFX_TASK - 1) / ENCW_PFX_TASK;
+    if (ray_pool_par_dispatch_ok(pool, nt, 2)) ray_pool_dispatch_n(pool, fn, x, (uint32_t)nt);
+    else for (int64_t k = 0; k < nt && !ray_interrupted(); k++) fn(x, 0, k, k + 1);
+}
+
+static void encw_sym_pfx_table(ray_encw_t* w, const void* data) {
+    int64_t n = w->sym_imp ? w->sym_imp_count : ray_sym_domain_count(w->sym_dom);
+    if (n < 2 || n > w->len) return;
+    encw_pfx_par_t x = { w, data, ray_calloc_raw((size_t)n), ray_alloc_raw((size_t)n * sizeof(uint32_t)), n, false };
+    bool ok = x.held && x.t;
+    if (ok) {
+        ray_pool_t* pool = ray_pool_get();
+        encw_pfx_run(pool, encw_pfx_mark_task, &x, w->len);
+        if (!ray_interrupted()) encw_pfx_run(pool, encw_pfx_fill_task, &x, n);
+        ok = !ray_interrupted() && !atomic_load(&x.bad);
+    }
+    ray_free_raw(x.held);
+    if (!ok) { ray_free_raw(x.t); return; }
+    w->sym_pfx = x.t; w->sym_pfx_n = n;
+}
+
+/* Prefix bounds of rows [start, start + n) of a SYM chunk: false for an
+ * all-null range or a code without a string (no bounds are written).  A
+ * small direct-mapped cache keeps a repeated code to one lookup. */
+#define ENCW_PFX_CACHE 1024
+static bool encw_sym_vec_pfx(const ray_encw_t* w, const void* data, int64_t start, int n,
+                             uint32_t* mn, uint32_t* mx) {
+    int64_t ck[ENCW_PFX_CACHE];
+    uint32_t cv[ENCW_PFX_CACHE];
+    for (int i = 0; i < ENCW_PFX_CACHE; i++) ck[i] = -1;
+    bool have = false;
+    uint32_t lo = 0, hi = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t code = ray_read_sym(data, start + i, RAY_SYM, w->attrs);
+        if (code == 0) continue;                    /* the null symbol */
+        if (code < w->sym_pfx_n) {
+            uint32_t p = w->sym_pfx[code];
+            if (!have || p < lo) lo = p;
+            if (!have || p > hi) hi = p;
+            have = true;
+            continue;
+        }
+        uint32_t slot = (uint32_t)((uint64_t)code * 0x9E3779B97F4A7C15ull >> 54);
+        uint32_t p;
+        if (ck[slot] == code) p = cv[slot];
+        else {
+            if (!encw_sym_pfx(w, code, &p)) return false;
+            ck[slot] = code; cv[slot] = p;
+        }
+        if (!have || p < lo) lo = p;
+        if (!have || p > hi) hi = p;
+        have = true;
+    }
+    if (!have) return false;
+    *mn = lo; *mx = hi;
+    return true;
 }
 
 void ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s) {
@@ -632,6 +821,7 @@ static ray_err_t train_dict(ray_encw_t* w, const void* data, int64_t n) {
     ray_free_raw(all); ray_free_raw(in);
     if (tr < 0) return RAY_ERR_OOM;
     if (tr == 0) { w->dict_v = NULL; w->dict_n = 0; }
+    else if (!(w->dict_ix = ray_enc_dict_index(w->dict_v, w->dict_n, &w->dict_mask))) return RAY_ERR_OOM;
     return RAY_OK;
 }
 
@@ -666,12 +856,14 @@ static double bits_double(int64_t b) { double d; memcpy(&d, &b, 8); return d; }
 static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* str_pool, int64_t n,
                                  ray_enc_dirent_t* de) {
     ray_err_t err;
-    ray_enc_dict_t dict = { w->dict_v, w->dict_n };
+    ray_enc_dict_t dict = { w->dict_v, w->dict_n, w->dict_ix, w->dict_mask };
     w->chunk.len = 0; w->chunk.oom = false;
     if (!ray_enc_buf_put(&w->chunk, NULL, RAY_ENC_DESC_AREA)) return RAY_ERR_OOM;
     memset(de, 0, sizeof *de);
     bool have = false, fl = type_is_float(w->type);
     bool str = w->type == RAY_STR, dict_chunk = false, all_sdict = true;
+    bool pfx_have = false, pfx_all = true;
+    uint32_t pfx_mn = 0, pfx_mx = 0;
     if (str && (err = str_plan_chunk(w, data, str_pool, n, &dict_chunk)) != RAY_OK) return err;
     int64_t nv = (n + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
     for (int64_t j = 0; j < nv; j++) {
@@ -683,6 +875,21 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
         if (err != RAY_OK) return err;
         ray_enc_desc_t desc = w->vec.desc;
         desc.payload_off = w->chunk.len;
+        if (w->sym_dom) {
+            uint32_t pmn = 0, pmx = 0;
+            int64_t cv = w->chunk_i * RAY_ENC_VECS_PER_CHUNK + j;   /* the column's vector */
+            bool got = w->sym_bhas ? (pmn = w->sym_bmn[cv], pmx = w->sym_bmx[cv], w->sym_bhas[cv] != 0)
+                                   : encw_sym_vec_pfx(w, data, j * RAY_ENC_VEC, vn, &pmn, &pmx);
+            if (got) {
+                desc.rsv1 = pmn; desc.rsv2 = pmx;
+                desc.flags |= RAY_ENC_SYM_PFX;
+                if (!pfx_have || pmn < pfx_mn) pfx_mn = pmn;
+                if (!pfx_have || pmx > pfx_mx) pfx_mx = pmx;
+                pfx_have = true;
+            } else if (w->vec.n_nulls < vn) {
+                pfx_all = false;                    /* a vector with values but no bounds */
+            }
+        }
         if (!ray_enc_buf_put(&w->chunk, w->vec.payload.p, w->vec.payload.len)) return RAY_ERR_OOM;
         memcpy(w->chunk.p + j * sizeof(ray_enc_desc_t), &desc, sizeof desc);
         if (desc.encoding == RAY_ENC_DICT) w->dict_used = true;
@@ -710,6 +917,7 @@ static ray_err_t encw_chunk_body(ray_encw_t* w, const void* data, const char* st
     /* STR: code bounds only when every vector is STR_DICT (D5); the combine
      * above folded only STR_DICT vectors. */
     if (!have || (str && !all_sdict)) { de->flags = RAY_ENC_STAT_ABSENT; de->min = de->max = 0; }
+    if (pfx_have && pfx_all) { de->rsv0 = pfx_mn; de->rsv1 = pfx_mx; de->flags |= RAY_ENC_SYM_PFX; }
     de->bytes = w->chunk.len;
     return RAY_OK;
 }
@@ -736,6 +944,147 @@ ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, 
     if ((err = fput(w, w->chunk.p, w->chunk.len)) != RAY_OK) return err;
     w->chunk_i++;
     return RAY_OK;
+}
+
+/* ray_encw_chunks: the chunks after the first encode side by side.  Each
+ * task works on a slot: a shallow copy of the writer, so the structures
+ * chunk 0 trained (VALUE_DICT, ALP candidates) are shared read-only, with
+ * the slot's own chunk buffer and vector and its own accumulators, which
+ * the caller folds in chunk order. */
+#define ENCW_SLOTS_PER_WORKER 2
+
+typedef struct {
+    ray_encw_t       w;
+    ray_enc_dirent_t de;
+    ray_err_t        err;
+} encw_slot_t;
+
+typedef struct {
+    encw_slot_t* slot;
+    const char*  data;
+    const char*  pool;
+    size_t       esz;
+    int64_t      first;     /* chunk of slot 0 */
+    int64_t      len;
+} encw_par_t;
+
+static void encw_par_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    encw_par_t* x = (encw_par_t*)raw;
+    for (int64_t i = start; i < end; i++) {
+        int64_t c = x->first + i, n = x->len - c * RAY_ENC_CHUNK;
+        if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+        encw_slot_t* s = &x->slot[i];
+        s->w.chunk_i = c;                            /* the chunk the body encodes */
+        s->err = encw_chunk_body(&s->w, x->data + (size_t)c * RAY_ENC_CHUNK * x->esz, x->pool, n, &s->de);
+    }
+}
+
+static ray_err_t encw_next_serial(ray_encw_t* w, const char* d, size_t esz, const char* str_pool) {
+    if (ray_interrupted()) return RAY_ERR_CANCEL;
+    int64_t n = w->len - w->chunk_i * RAY_ENC_CHUNK;
+    if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+    return ray_encw_chunk(w, d + (size_t)w->chunk_i * RAY_ENC_CHUNK * esz, str_pool, n);
+}
+
+ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool) {
+    const char* d = (const char*)data;
+    ray_err_t err = RAY_OK;
+    if (w->chunk_i == 0 && w->sym_dom && !w->sym_pfx && !w->sym_bhas) encw_sym_pfx_table(w, data);
+    /* chunk 0 trains the column's structures; STR's STR_DICT accumulator
+     * and DICT index take entries in row order, so STR stays serial */
+    while (err == RAY_OK && w->chunk_i < w->n_chunks && (w->chunk_i == 0 || w->type == RAY_STR))
+        err = encw_next_serial(w, d, esz, str_pool);
+    if (err != RAY_OK || w->chunk_i >= w->n_chunks) return err;
+    ray_pool_t* pool = ray_pool_get();
+    int64_t left = w->n_chunks - w->chunk_i;
+    int64_t nslot = pool ? (int64_t)ray_pool_total_workers(pool) * ENCW_SLOTS_PER_WORKER : 0;
+    if (nslot > left) nslot = left;
+    encw_slot_t* slot = ray_pool_par_dispatch_ok(pool, left, 2)
+                      ? ray_calloc_raw((size_t)nslot * sizeof *slot) : NULL;
+    if (!slot) {                                    /* serial: no pool, nested, or no memory */
+        while (err == RAY_OK && w->chunk_i < w->n_chunks) err = encw_next_serial(w, d, esz, str_pool);
+        return err;
+    }
+    encw_par_t x = { slot, d, str_pool, esz, 0, w->len };
+    while (err == RAY_OK && w->chunk_i < w->n_chunks) {
+        if (ray_interrupted()) { err = RAY_ERR_CANCEL; break; }
+        int64_t nb = w->n_chunks - w->chunk_i;
+        if (nb > nslot) nb = nslot;
+        for (int64_t i = 0; i < nb; i++) {
+            ray_enc_buf_t chunk = slot[i].w.chunk;
+            ray_encw_vec_t vec = slot[i].w.vec;
+            slot[i].w = *w;
+            slot[i].w.chunk = chunk; slot[i].w.vec = vec;
+            slot[i].w.dict_used = slot[i].w.any_bitmap_null = slot[i].w.fsst_used = false;
+            slot[i].w.str_occ_bytes = slot[i].w.str_pool_bytes = 0;
+            slot[i].err = RAY_ERR_CANCEL;           /* a task a cancel skips keeps it */
+        }
+        x.first = w->chunk_i;
+        ray_pool_dispatch_n(pool, encw_par_task, &x, (uint32_t)nb);
+        if (ray_interrupted()) { err = RAY_ERR_CANCEL; break; }
+        for (int64_t i = 0; i < nb && err == RAY_OK; i++) {
+            const ray_encw_t* s = &slot[i].w;
+            if ((err = slot[i].err) != RAY_OK) break;
+            w->dict_used |= s->dict_used;
+            w->any_bitmap_null |= s->any_bitmap_null;
+            w->fsst_used |= s->fsst_used;
+            w->str_occ_bytes += s->str_occ_bytes;
+            if (w->str_occ_bytes > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+            w->str_pool_bytes += s->str_pool_bytes;
+            ray_enc_dirent_t* de = &w->dir[w->chunk_i];
+            *de = slot[i].de;
+            de->offset = w->pos;
+            if ((err = fput(w, s->chunk.p, s->chunk.len)) != RAY_OK) break;
+            w->chunk_i++;
+        }
+    }
+    for (int64_t i = 0; i < nslot; i++) {
+        ray_enc_buf_free(&slot[i].w.chunk);
+        ray_encw_vec_free(&slot[i].w.vec);
+    }
+    ray_free_raw(slot);
+    return err;
+}
+
+ray_err_t ray_encw_train(ray_encw_t* w, const void* data, int64_t n) {
+    if (w->type == RAY_STR || w->type == RAY_SYM) return RAY_ERR_NYI;
+    if (w->chunk_i != 0 || w->n_chunks == 0) return RAY_ERR_RANGE;
+    int64_t want = w->len < RAY_ENC_CHUNK ? w->len : RAY_ENC_CHUNK;
+    if (n != want) return RAY_ERR_RANGE;
+    if ((w->type == RAY_F32 || w->type == RAY_F64) && !ray_enc_fp_env_ok()) return RAY_ERR_FPENV;
+    return ray_encw_type_has_dict(w->type) ? train_dict(w, data, n) : RAY_OK;
+}
+
+ray_err_t ray_encw_encode(const ray_encw_t* w, int64_t c, const void* data, ray_encw_part_t* p) {
+    if (w->type == RAY_STR || w->type == RAY_SYM) return RAY_ERR_NYI;
+    if (c < 0 || c >= w->n_chunks) return RAY_ERR_RANGE;
+    int64_t n = w->len - c * RAY_ENC_CHUNK;
+    if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
+    ray_enc_buf_t chunk = p->w.chunk;
+    ray_encw_vec_t vec = p->w.vec;
+    p->w = *w;
+    p->w.chunk = chunk; p->w.vec = vec;
+    p->w.dict_used = p->w.any_bitmap_null = false;
+    p->c = c;
+    return encw_chunk_body(&p->w, data, NULL, n, &p->de);
+}
+
+ray_err_t ray_encw_put(ray_encw_t* w, ray_encw_part_t* p) {
+    if (p->c != w->chunk_i || w->chunk_i >= w->n_chunks) return RAY_ERR_RANGE;
+    w->dict_used |= p->w.dict_used;
+    w->any_bitmap_null |= p->w.any_bitmap_null;
+    ray_enc_dirent_t* de = &w->dir[w->chunk_i];
+    *de = p->de;
+    de->offset = w->pos;
+    ray_err_t err = fput(w, p->w.chunk.p, p->w.chunk.len);
+    if (err == RAY_OK) w->chunk_i++;
+    return err;
+}
+
+void ray_encw_part_free(ray_encw_part_t* p) {
+    ray_enc_buf_free(&p->w.chunk);
+    ray_encw_vec_free(&p->w.vec);
 }
 
 /* The persisted attrs of the column: the source's disk attrs, HAS_NULLS

@@ -90,6 +90,52 @@ tracing collector.
     reclaimable immediately when their last reference is released. `(.sys.gc)`
     performs the allocator-side consolidation and page-return pass.
 
+### Giving a peak back: `(.sys.gc 1)` { #giving-a-peak-back }
+
+A free block keeps its pages, so the next query of the same shape reuses
+them without faulting them in again. Short of memory pressure, the process
+hands most of them back to the operating system only once it has been idle
+for ten seconds (the idle decay). Every fired timer and every served
+request counts as activity, so a server that polls on a timer, or that a
+client polls, is never idle for that long. It keeps its largest working set
+for the rest of its life, even when that memory is free.
+
+`(.sys.gc 1)` runs the idle decay's sweep now, without waiting for the
+process to go quiet or for free blocks to age, and also unmaps the cached
+large blocks, which the decay keeps. It drains cross-thread frees and slab
+caches, unmaps empty spill pools, and releases the pages of the free blocks
+the sweep reaches. Like `(.sys.gc)` it returns `0`; what went back shows in
+the process's resident memory (`VmRSS` in `/proc/<pid>/status` on Linux).
+`(.sys.gc 0)` is the same as `(.sys.gc)`.
+
+It is a best-effort maintenance request, not a promise that every free page
+leaves the process:
+
+- It works on the calling thread's heap and the idle worker threads' heaps.
+  A heap of another live thread, such as an embedding's own thread, is left
+  to that thread.
+- A block keeps its first page, which holds its free-list links, and blocks
+  under 8 KiB keep all their pages. Under transparent huge pages only the
+  whole 2 MiB regions inside a block are released.
+- The free pages of a [spill pool](#8-total-ram-and-out-of-core-spill) are
+  the spill file's page cache, which releasing would not free. They go back
+  only when the whole pool is empty and unmapped, and a heap keeps its last
+  pool. An empty anonymous pool stays mapped, with its pages released.
+- When the resident memory drops is up to the operating system. Linux drops
+  released pages at once; macOS reclaims them lazily, when it needs the
+  memory.
+
+```lisp
+(set v (til 100000000))  ; an 800 MB peak
+(set v 0)                ; finished with it
+(.sys.gc 1)              ; 0 — free pages released now, not after an idle spell
+```
+
+Call it where a program knows it has finished with a peak and will not
+need that memory again soon: after a nightly batch, after closing a day.
+The cost is paid on reuse: the next query that needs the memory faults the
+released pages in again.
+
 ## 4. The `.sys.info` Function
 
 Call `(.sys.info)` to see system-level information about the Rayforce runtime:
@@ -428,6 +474,7 @@ This tells you the join needed about 1 GB of temporary memory beyond what was al
 |---|---|---|
 | `(.sys.mem)` | Returns heap allocation statistics | Monitor memory usage, detect leaks |
 | `(.sys.gc)` | Flushes caches, releases pages | Between heavy queries, before benchmarks |
+| `(.sys.gc 1)` | Also releases free pages now, best effort | A server finished with a peak |
 | `(.sys.info)` | Shows system and runtime info | Check total RAM, CPU count, OS details |
 | `(timeit expr)` | Measures execution time of one expression | Benchmark a specific operation |
 | `:timeit` | Toggles profiling for all REPL expressions | Interactive performance exploration |

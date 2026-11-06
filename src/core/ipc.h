@@ -81,6 +81,45 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 #define RAY_IPC_MSG_ASYNC  0
 #define RAY_IPC_MSG_SYNC   1
 #define RAY_IPC_MSG_RESP   2
+/* An upgrade record (below): the payload is the record's bytes, not a
+ * serialized value, and is never evaluated or journaled. */
+#define RAY_IPC_MSG_UPGRADE 3
+
+/* ===== Transports =====
+ *
+ * A connection opens on TCP as it always has.  The second byte of the
+ * client's greeting, zero until now, carries its capabilities; a server
+ * that understands them answers with the capabilities both share in the
+ * high bits of its own second byte (the low bit stays the auth flag), and
+ * only when the client advertised any, so an older client never sees a
+ * byte it would refuse.  With RAY_IPC_CAP_XPORT agreed, the client may
+ * then ask, in an UPGRADE frame, to move the connection: to shared-memory
+ * rings when both are on one host (core/shm.c), to remote memory across
+ * hosts with RDMA (core/rdma.c).  The server answers with an UPGRADE
+ * frame of its own: an offer, its record, or a refusal, after which the
+ * connection either moves or stays on TCP.  Both sides keep speaking the
+ * same frames; only the bytes' road changes.  The socket stays open to
+ * tell of the peer's going.
+ *
+ * The policy says what this process offers and asks for: AUTO (shared
+ * memory on one host, RDMA across hosts, else TCP), TCP (never upgrade),
+ * SHM or RDMA (that one, else refuse / fail the open). */
+#define RAY_IPC_CAP_XPORT 0x10
+#define RAY_IPC_CAP_MASK  0xF0
+
+#define RAY_IPC_XPORT_AUTO 0
+#define RAY_IPC_XPORT_TCP  1
+#define RAY_IPC_XPORT_SHM  2
+#define RAY_IPC_XPORT_RDMA 3
+
+int         ray_ipc_xport_policy_get(void);
+bool        ray_ipc_xport_policy_set(int policy);
+/* "auto" / "tcp" / "shm" / "rdma" for a policy; "tcp" / "shm" / "rdma"
+ * for a transport kind (RAY_XPORT_*).  NULL for anything else. */
+const char* ray_ipc_xport_policy_name(int policy);
+const char* ray_ipc_xport_kind_name(int kind);
+/* Parses "auto" / "tcp" / "shm" / "rdma"; -1 for anything else. */
+int         ray_ipc_xport_policy_parse(const char* s, size_t n);
 
 #define RAY_IPC_FLAG_COMPRESSED 0x01
 /* Set by the journal hook in core/ipc.c eval_payload when the inbound
@@ -99,6 +138,13 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * not on the server's.  Default sync messages still get the bare
  * result, so existing IPC clients are unaffected. */
 #define RAY_IPC_FLAG_VERBOSE    0x04
+/* Set by a server on a reply over a moved (shared-memory or RDMA)
+ * connection when it has taken a cancel byte from that connection's
+ * socket since its last reply.  The client keeps at most one cancel
+ * byte unconfirmed; this is what confirms it (see send_cancel in
+ * core/ipc.c).  Never set on TCP, where reading the stream past a
+ * cancel byte discards it. */
+#define RAY_IPC_FLAG_CANCEL_SEEN 0x08
 #define RAY_IPC_MAX_CONNS 256
 
 /* ===== Connection hooks (.ipc.on.*) ===== */
@@ -113,6 +159,15 @@ int64_t ray_ipc_current_handle(void);
 ray_poll_t* ray_ipc_active_poll(void);
 ray_poll_t* ray_ipc_context_poll(void);
 bool ray_ipc_auto_journal_eval(void);
+/* Enter (true) or leave (false) the auto-journaled evaluation scope: while it
+ * is set `.log.write` is refused, because the frame being evaluated is already
+ * in the journal and a nested synthetic record would make a replay diverge
+ * from the live run.  Returns the previous value; a caller that evaluates a
+ * request it has just journaled itself (a transport other than the native
+ * IPC listener) saves it, sets true, evaluates, and restores the saved value,
+ * exactly as eval_payload does for a native SYNC frame.  Thread-local. */
+bool ray_ipc_set_auto_journal_eval(bool enabled);
+#define RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL 1
 #ifdef DEBUG
 void ray_ipc_set_auto_journal_eval_for_test(bool enabled);
 #endif
@@ -151,6 +206,24 @@ int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
                            int timeout_ms, size_t compress_threshold,
                            int keepalive_ms);
 
+/* Every option of .ipc.open in one place.  `transport` is a
+ * RAY_IPC_XPORT_* policy for this one connection: AUTO takes the
+ * process policy. */
+typedef struct {
+    int    timeout_ms;
+    size_t compress_threshold;
+    int    keepalive_ms;
+    int    transport;
+} ray_ipc_open_opts_t;
+
+/* As ray_ipc_connect_opts, with every option; additionally returns -7
+ * when the connection's transport policy names a transport the link
+ * cannot take (the peer refused it, or it is not available here) — the
+ * connection is then closed rather than silently left on TCP. */
+int64_t   ray_ipc_connect_with(const char* host, uint16_t port,
+                               const char* user, const char* password,
+                               const ray_ipc_open_opts_t* opts);
+
 /* Parse .ipc.open's optional second argument: an integer timeout in
  * milliseconds, or a dict with optional `timeout`, `compress` and
  * `keepalive`.  `compress` is a threshold in bytes — 0N never
@@ -162,12 +235,27 @@ int64_t   ray_ipc_connect_opts(const char* host, uint16_t port,
 ray_t*    ray_ipc_parse_open_opts(ray_t* arg, int* timeout_ms,
                                   size_t* compress_threshold,
                                   int* keepalive_ms);
+/* The same, with the `transport` option too (a symbol: `auto`, `tcp`,
+ * `shm` or `rdma`; absent leaves RAY_IPC_XPORT_AUTO). */
+ray_t*    ray_ipc_parse_open_opts_full(ray_t* arg, ray_ipc_open_opts_t* out);
 
 /* The compression threshold in force on an open handle, or
  * RAY_IPC_COMPRESS_AUTO if the handle does not resolve. */
 size_t    ray_ipc_handle_threshold(int64_t handle);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
+/* Sends the cancel a client sends on Ctrl-C for the sync request
+ * outstanding on `handle` (one urgent byte; see ipc.c).  0; -1 for a
+ * handle that is not a connection; -2 when nothing was sent because a
+ * cancel for an earlier request on this moved connection is still
+ * unconfirmed (close the handle to stop the request). */
+int       ray_ipc_send_cancel(int64_t handle);
+/* Test hooks (C tests only).  hold: a moved connection's cancel is
+ * recorded as sent but its byte is kept back, as one held up in the
+ * network would be.  unconfirmed: the request number of the cancel on
+ * `handle` the server has not confirmed yet, or -1. */
+void      ray_ipc_hold_cancel_for_test(bool hold);
+int       ray_ipc_cancel_unconfirmed_for_test(int64_t handle);
 /* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
  * On expiry the connection is closed (on.close fires) and an `io` error
  * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */
@@ -205,6 +293,7 @@ typedef struct {
     int64_t queued_frames;
     int64_t hwm_bytes;      /* largest backlog ever queued here */
     bool    inbound;        /* accepted by a listener here (true) or opened by .ipc.open (false) */
+    uint8_t transport;      /* RAY_XPORT_TCP / RAY_XPORT_SHM / RAY_XPORT_RDMA: where its bytes go */
 } ray_ipc_tx_info_t;
 
 void      ray_ipc_tx_limit_get(int64_t* bytes, int64_t* frames);

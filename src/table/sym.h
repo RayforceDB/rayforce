@@ -133,6 +133,9 @@ int64_t ray_sym_intern_batch(const uint32_t* hashes, const char* const* strs,
 int64_t ray_sym_intern_batch_no_split(const uint32_t* hashes, const char* const* strs,
                                       const size_t* lens, int64_t n, int64_t* out_ids);
 
+/* The atoms of n runtime ids under one lock (NULL where unknown); borrowed. */
+void ray_sym_str_batch(const int64_t* ids, int64_t n, ray_t** out);
+
 /* Monotonic counter bumped by ray_sym_init and ray_sym_destroy.  A cache
  * keyed on sym ids is valid only while this is unchanged: ids are stable
  * for the table's lifetime, but a teardown frees the atoms they point at. */

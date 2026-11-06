@@ -577,6 +577,10 @@ uint16_t pivot_fn_to_agg_op(ray_t* fn);
 ray_t* ray_pivot_fn(ray_t** args, int64_t n);
 ray_t* ray_modify_fn(ray_t** args, int64_t n);
 ray_t* ray_alter_fn(ray_t** args, int64_t n);
+/* insert or alter: a quoted target resolves to the binding visible at the
+ * call, so a call compiled with one as its head must have the caller's
+ * locals in scope. */
+bool ray_fn_is_local_mutator(const ray_t* fn);
 ray_t* ray_del_fn(ray_t** args, int64_t n);
 ray_t* ray_row_fn(ray_t* tbl, ray_t* idx);
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2);
@@ -683,7 +687,9 @@ ray_t* ray_hclose_fn(ray_t* x);
 ray_t* ray_hsend_fn(ray_t** args, int64_t n);
 ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n);
+ray_t* ray_ipc_auto_journal_eval_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n);
+ray_t* ray_ipc_transport_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_unsub_fn(ray_t* topic);
 ray_t* ray_mc_pub_fn(ray_t* topic, ray_t* payload);
@@ -699,6 +705,7 @@ ray_t* ray_guid_fn(ray_t* n_arg);
  * Implementations live in src/ops/journal.c; the on-disk machinery
  * is src/store/journal.c. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n);
+ray_t* ray_log_status_fn(ray_t** args, int64_t n);
 ray_t* ray_log_write_fn(ray_t* expr);
 ray_t* ray_log_replay_fn(ray_t* path);
 ray_t* ray_log_validate_fn(ray_t* path);
@@ -748,6 +755,10 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range);
 /* Query bridge builtins (formerly in eval.c, now in ops/query.c) */
 ray_t* ray_select_fn(ray_t** args, int64_t n);
 #ifdef DEBUG
+/* What a `try` handler receives for an engine error with this code and
+ * message (lang/eval.c try_error_value): the {code msg} dict, or null
+ * when it cannot be built. */
+ray_t* ray_try_error_value_for_test(const char* code, const char* msg);
 /* Chunk length of the per-distinct-symbol key evaluation over a FILE
  * domain (ops/query.c derived_key_str_chunks); 0 restores the default. */
 void ray_derived_key_chunk_set_for_test(int64_t rows);
@@ -782,6 +793,8 @@ void ray_group_topk_stats_for_test(int64_t out[10]);
 #endif
 ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);
+ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled);
+bool   ray_select_form_whole(ray_t* expr);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);
 ray_t* ray_upsert_fn(ray_t** args, int64_t n);

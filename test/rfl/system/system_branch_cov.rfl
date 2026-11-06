@@ -180,8 +180,9 @@
 ;; ray_gc_fn  (line 539)
 ;; ══════════════════════════════════════════════════════════════════════
 (.sys.gc) -- 0
-(.sys.gc 0) !- arity
-(.sys.gc "x") !- arity
+(.sys.gc 0) -- 0
+(.sys.gc "x") !- type
+(.sys.gc 0 0) !- arity
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_sys_bc_*")

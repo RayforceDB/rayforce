@@ -4,6 +4,7 @@
 #include <rayforce.h>
 #include <stdio.h>
 #include "ops/idxop.h"
+#include "store/encw.h"
 /* One column, appended in bounded batches. SYM target domain is borrowed.
  * Close commits the column; caller flushes its symbol domain first and writes
  * the table schema last. STR pools spool to disk, with native 32-bit offsets. */
@@ -14,6 +15,10 @@ typedef struct {
     char pool_path[1024];
     char path[1024];
     char tmp_path[1024];
+    /* where the raw payload is staged, which a converter's tasks open to
+     * write their row ranges: tmp_path, or a memory file */
+    char stage_path[1024];
+    bool in_mem;            /* ray_col_stream_stage_mem: fp is the memory file's, open until finish maps it */
     int8_t type;
     uint8_t attrs;
     int64_t rows;
@@ -39,12 +44,34 @@ typedef struct {
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
     uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
     uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */
+    ray_encw_t* ew;         /* ray_col_stream_chunked_begin: the column file's writer, chunks put as they come */
+    /* generation 2, SYM: the prefix bounds of every vector, borrowed from a
+     * converter that computed them from the strings (ray_encw_set_sym_bounds);
+     * NULL: the writer reads them from the domain */
+    const uint32_t* sym_bmn; const uint32_t* sym_bmx; const uint8_t* sym_bhas;
 } ray_col_stream_t;
 
 /* gen 0 writes today's format; gen 2 stages the same raw payload and
  * transcodes it chunk by chunk at finish (any other gen: RAY_ERR_VERSION). */
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
                               int8_t type, struct ray_sym_domain_s* domain, uint8_t gen);
+/* Generation 2, before the first append: stage the raw payload in a memory
+ * file (ray_file_open_mem) instead of the staging file, so no staging file
+ * is written back before finish encodes it; the column file is then
+ * written once, at finish.  STR keeps its staging files.  False, the
+ * staging file kept, for any other writer or where the host has no memory
+ * files. */
+bool ray_col_stream_stage_mem(ray_col_stream_t* w);
+/* Generation 2, a numeric or temporal column (not SYM, not STR), before the
+ * first append: no payload is staged.  The staging file becomes the column
+ * file, written by w->ew: the caller trains it on chunk 0's rows
+ * (ray_encw_train), encodes chunks where their rows are (ray_encw_encode)
+ * and puts them in chunk order (ray_encw_put); it sets had_nulls (a null in
+ * any chunk, or a flagged source) before finish, which writes the headers.
+ * Appends are refused.  `rows` is the column's length.  ray_col_stream_chunked_ok
+ * says whether the writer can. */
+bool      ray_col_stream_chunked_ok(const ray_col_stream_t* w);
+ray_err_t ray_col_stream_chunked_begin(ray_col_stream_t* w, int64_t rows);
 /* Start building the column's index from global row start_row. Call after
  * open and before the first append; no-op for types without an index. */
 ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row);

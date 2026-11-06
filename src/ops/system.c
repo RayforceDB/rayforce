@@ -212,14 +212,17 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                              a ? ray_type_name(a->type) : "null");
         }
     }
-    /* options: compress (true/false) and symfile ('shared/'column) */
+    /* options: compress (true/false), symfile ('shared/'column) and index
+     * (true/false: false builds no automatic dictionary or chunk zone; an
+     * index the column already carries is written as usual) */
     ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
     for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
         ray_t* k = ray_sym_vec_cell(okeys, i);
         bool known = k && ((ray_str_len(k) == 8 && memcmp(ray_str_ptr(k), "compress", 8) == 0) ||
-                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "symfile", 7) == 0));
+                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "symfile", 7) == 0) ||
+                           (ray_str_len(k) == 5 && memcmp(ray_str_ptr(k), "index", 5) == 0));
         if (!known)
-            return ray_error("domain", "unknown option '%.*s' (compress and symfile are accepted)",
+            return ray_error("domain", "unknown option '%.*s' (compress, symfile and index are accepted)",
                              k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
     }
     ray_compress_t mode;
@@ -227,6 +230,9 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     if (oerr) return oerr;
     ray_symfile_t layout;
     oerr = ray_symfile_opt_parse(opts, &layout);
+    if (oerr) return oerr;
+    bool auto_index;
+    oerr = ray_splay_index_opt_parse(opts, &auto_index);
     if (oerr) return oerr;
     if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
     /* A symfile per column has no shared symfile to name, and the segments
@@ -245,7 +251,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                 : ".db.splayed.set: symfile 'column for a partition of a parted table");
     }
 
-    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, auto_index);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);
@@ -927,13 +933,26 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
-/* (.sys.gc) -- perform the allocator maintenance pass used by v1: drain
- * foreign frees, flush slab caches, coalesce blocks and release reclaimable
- * pages/pools.  Rayforce values are reference-counted, so this is allocator
- * GC rather than a tracing collector.  Variadic to allow `(.sys.gc)`. */
+/* (.sys.gc [mode]) -- perform the allocator maintenance pass used by v1:
+ * drain foreign frees, flush slab caches, coalesce blocks and release
+ * reclaimable pages/pools.  Rayforce values are reference-counted, so this
+ * is allocator GC rather than a tracing collector.  Mode 1 also runs the
+ * idle decay's sweep now, due or not, and drains the direct-block cache
+ * (ray_heap_release_now): best effort, it reaches only the heaps and pages
+ * the sweep does; mode 0 is the same as none.  Returns 0: a count
+ * of what went back would mislead, since a block the heap splits, merges or
+ * takes back from a parked pool is released anew.  Variadic to allow
+ * `(.sys.gc)`. */
 ray_t* ray_gc_fn(ray_t** args, int64_t n) {
-    (void)args;
-    if (n != 0) return ray_error("arity", ".sys.gc takes no arguments");
+    if (n > 1) return ray_error("arity", ".sys.gc takes no argument or a mode, 0 or 1");
+    bool now = false;
+    if (n == 1) {
+        if (args[0]->type != -RAY_I64)
+            return ray_error("type", ".sys.gc: mode must be i64, got %s", ray_type_name(args[0]->type));
+        if (args[0]->i64 != 0 && args[0]->i64 != 1)
+            return ray_error("domain", ".sys.gc: mode must be 0 or 1, got %lld", (long long)args[0]->i64);
+        now = args[0]->i64 == 1;
+    }
     ray_heap_gc();
     /* Dead memory the heap keeps for reuse is not kept locked against swap. */
     ray_heap_unlock_idle();
@@ -941,7 +960,8 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
      * is free goes back now, and an explicit maintenance call is also a
      * chance to notice the process has gone quiet. */
     ray_heap_relieve();
-    ray_heap_decay();
+    if (now) (void)ray_heap_release_now();
+    else ray_heap_decay();
     return ray_i64(0);
 }
 
@@ -1830,13 +1850,16 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
 
     /* Optional second argument: an integer connect timeout in
      * milliseconds (0 = use default), or an options dict carrying
-     * `timeout`, `compress` (#541) and/or `keepalive` (#589). */
-    int    timeout_ms = 0;
-    size_t compress   = RAY_IPC_COMPRESS_AUTO;
-    int    keepalive  = RAY_IPC_KEEPALIVE_AUTO;
+     * `timeout`, `compress` (#541), `keepalive` (#589) and/or
+     * `transport`. */
+    ray_ipc_open_opts_t opts = {
+        .timeout_ms         = 0,
+        .compress_threshold = RAY_IPC_COMPRESS_AUTO,
+        .keepalive_ms       = RAY_IPC_KEEPALIVE_AUTO,
+        .transport          = RAY_IPC_XPORT_AUTO,
+    };
     if (n == 2) {
-        ray_t* err = ray_ipc_parse_open_opts(args[1], &timeout_ms, &compress,
-                                             &keepalive);
+        ray_t* err = ray_ipc_parse_open_opts_full(args[1], &opts);
         if (err) return err;
     }
 
@@ -1894,8 +1917,11 @@ ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
     const char* pw_ptr = (n_parts >= 4) ? password : NULL;
     const char* us_ptr = (n_parts >= 4) ? user : NULL;
 
-    int64_t h = ray_ipc_connect_opts(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms,
-                                     compress, keepalive);
+    int64_t h = ray_ipc_connect_with(host, (uint16_t)port, us_ptr, pw_ptr, &opts);
+    if (h == -7) return ray_error("io", "transport %s unavailable: %s:%d",
+                                  ray_ipc_xport_policy_name(opts.transport == RAY_IPC_XPORT_AUTO
+                                                            ? ray_ipc_xport_policy_get() : opts.transport),
+                                  host, port);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
     if (h == -4) return ray_error("io", "wire version mismatch: %s:%d", host, port);
@@ -1973,26 +1999,33 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg) {
  * hook, or -1 outside any hook.  Registered variadic so both
  * `(.ipc.handle)` (no args) and `(.ipc.handle 0)` (one arg, ignored)
  * work — matches the convention of `.sys.gc` / `.sys.info`. */
-/* Build {handle limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
- * for a live connection. */
+/* Build {handle inbound transport limit_bytes limit_frames queued_bytes
+ * queued_frames hwm_bytes} for a live connection. */
 static ray_t* ipc_tx_info_dict(int64_t h, const ray_ipc_tx_info_t* ti) {
-    static const char* const names[7] = { "handle", "inbound", "limit_bytes", "limit_frames",
+    static const char* const names[8] = { "handle", "inbound", "transport", "limit_bytes", "limit_frames",
                                           "queued_bytes", "queued_frames", "hwm_bytes" };
-    int64_t vals_i[7] = { h, ti->inbound ? 1 : 0, ti->limit_bytes, ti->limit_frames,
+    int64_t vals_i[8] = { h, ti->inbound ? 1 : 0, 0, ti->limit_bytes, ti->limit_frames,
                           ti->queued_bytes, ti->queued_frames, ti->hwm_bytes };
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 7);
-    ray_t* vals = ray_list_new(7);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
+    ray_t* vals = ray_list_new(8);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
         if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
         if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
         return ray_error("oom", NULL);
     }
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         int64_t k = ray_sym_intern(names[i], strlen(names[i]));
         keys = ray_vec_append(keys, &k);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-        /* `inbound` is the direction: accepted here, or opened by .ipc.open */
-        ray_t* v = (i == 1) ? ray_bool(vals_i[i] != 0) : make_i64(vals_i[i]);
+        /* `inbound` is the direction: accepted here, or opened by .ipc.open;
+         * `transport` where its bytes go: `tcp`, `shm` or `rdma`. */
+        ray_t* v;
+        if (i == 1) v = ray_bool(vals_i[i] != 0);
+        else if (i == 2) {
+            const char* tn = ray_ipc_xport_kind_name(ti->transport);
+            if (!tn) tn = "tcp";
+            v = ray_sym(ray_sym_intern(tn, strlen(tn)));
+        } else v = make_i64(vals_i[i]);
         vals = ray_list_append(vals, v); ray_release(v);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
@@ -2018,6 +2051,18 @@ ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
         if (ray_ipc_tx_info(h, &ti) == RAY_OK) return ipc_tx_info_dict(h, &ti);
     }
     return make_i64(ray_ipc_current_handle());
+}
+
+/* `(.ipc.auto_journal_eval)` answers true while the current evaluation
+ * runs inside an auto-journaled IPC request: the engine (or an embedder
+ * such as a q-wire layer, through ray_ipc_set_auto_journal_eval) has
+ * already journaled the enclosing request and will replay it, so the
+ * code it runs must not append frames of its own (`.log.write` refuses
+ * with `domain` there).  False everywhere else.  Variadic for the
+ * `(.ipc.auto_journal_eval)` call form. */
+ray_t* ray_ipc_auto_journal_eval_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    return make_bool(ray_ipc_auto_journal_eval() ? 1 : 0);
 }
 
 static ray_t* ipc_txlimit_dict(int64_t bytes, int64_t frames) {
@@ -2068,6 +2113,30 @@ ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n) {
     if (ray_ipc_tx_limit_set(bytes, frames) != RAY_OK)
         return ray_error("domain", ".ipc.txlimit: bytes must be >= %lld and frames >= 0", (long long)RAY_IPC_TX_MIN_BYTES);
     return ipc_txlimit_dict(bytes, frames);
+}
+
+/* (.ipc.transport)         -> the process policy: `auto`, `tcp`, `shm` or `rdma`
+ * (.ipc.transport 'policy) -> set it; returns the policy set.
+ * The policy is what this process offers as a server and asks for as a
+ * client (an .ipc.open `transport` option overrides it per connection):
+ * `auto` moves a connection to shared memory on one host and to RDMA
+ * across hosts when both sides can, else stays on TCP; `tcp` never
+ * moves; `shm` and `rdma` move only to that transport. */
+ray_t* ray_ipc_transport_fn(ray_t** args, int64_t n) {
+    if (n > 1) return ray_error("rank", ".ipc.transport takes 0 or 1 argument, got %lld", (long long)n);
+    if (n == 1) {
+        ray_t* x = args[0];
+        int policy = -1;
+        if (x && ray_is_atom(x) && x->type == -RAY_SYM) {
+            ray_t* xs = ray_sym_str(x->i64);
+            if (xs) policy = ray_ipc_xport_policy_parse(ray_str_ptr(xs), ray_str_len(xs));
+        }
+        if (policy < 0)
+            return ray_error("domain", ".ipc.transport expects `auto`, `tcp`, `shm` or `rdma`");
+        ray_ipc_xport_policy_set(policy);
+    }
+    const char* name = ray_ipc_xport_policy_name(ray_ipc_xport_policy_get());
+    return ray_sym(ray_sym_intern(name, strlen(name)));
 }
 
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n) {

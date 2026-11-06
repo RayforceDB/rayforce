@@ -1,0 +1,32 @@
+;; Symbol orderings compare text, not intern ids, inside a select and over a
+;; parted table.  Through v2.11 `<`, `<=`, `>` and `>=` in `where:` and `min`
+;; and `max` of a SYM column compared intern ids, the order the symbols were
+;; first seen.  `query/sym_ordered_compare.rfl` and `agg/min_max_sym.rfl`
+;; cover an in-memory table; this covers the same forms over a parted table
+;; of two segments sharing one symfile, with its partition column dropped, as
+;; an embedding that serves the rows without the key mounts it.  The names
+;; are interned here first, in an order that is not their text's.
+(set S (table [Name] (list ['Zqzulu 'Mqmike 'Aqalpha 'Kqkilo])))
+(.sys.exec "rm -rf /tmp/rfl_sym_ordering_parted")
+(.db.splayed.set "/tmp/rfl_sym_ordering_parted/0/S/" (take S 2) "/tmp/rfl_sym_ordering_parted/.sym")
+(.db.splayed.set "/tmp/rfl_sym_ordering_parted/1/S/" (drop S 2) "/tmp/rfl_sym_ordering_parted/.sym")
+(set P (.db.parted.get "/tmp/rfl_sym_ordering_parted/" 'S))
+(set R (xcols P (drop (cols P) 1)))
+;; in memory
+(get (select {from: S where: (< Name 'Mqmike)}) 'Name) -- ['Aqalpha 'Kqkilo]
+(get (select {from: S where: (<= Name 'Mqmike)}) 'Name) -- ['Mqmike 'Aqalpha 'Kqkilo]
+(get (select {from: S where: (> Name 'Mqmike)}) 'Name) -- ['Zqzulu]
+(get (select {from: S where: (>= Name 'Mqmike)}) 'Name) -- ['Zqzulu 'Mqmike]
+(get (select {from: S m: (min Name)}) 'm) -- ['Aqalpha]
+(get (select {from: S m: (max Name)}) 'm) -- ['Zqzulu]
+;; parted, with the partition column
+(get (select {from: P where: (< Name 'Mqmike)}) 'Name) -- ['Aqalpha 'Kqkilo]
+(get (select {from: P m: (min Name)}) 'm) -- ['Aqalpha]
+;; parted, the partition column dropped
+(get (select {from: R where: (< Name 'Mqmike)}) 'Name) -- ['Aqalpha 'Kqkilo]
+(get (select {from: R where: (<= Name 'Mqmike)}) 'Name) -- ['Mqmike 'Aqalpha 'Kqkilo]
+(get (select {from: R where: (> Name 'Mqmike)}) 'Name) -- ['Zqzulu]
+(get (select {from: R where: (>= Name 'Mqmike)}) 'Name) -- ['Zqzulu 'Mqmike]
+(get (select {from: R m: (min Name)}) 'm) -- ['Aqalpha]
+(get (select {from: R m: (max Name)}) 'm) -- ['Zqzulu]
+(.sys.exec "rm -rf /tmp/rfl_sym_ordering_parted")

@@ -35,6 +35,12 @@ ray_t*    ray_read_parted(const char* db_root, const char* table_name);
  * table goes away. */
 void      ray_parted_cache_clear(void);
 void      ray_parted_cache_prune(void);
+/* Set the cap on each thread's cached partitions (0: none; negative: the
+ * default or RAY_PART_CACHE_MAX again, read at the next mount).  It applies
+ * from the next mount that loads a partition.  The environment is read once
+ * on first use, so this exists to let a test drive the cap without re-exec.
+ * Returns the cap it replaced. */
+int64_t   ray_parted_cache_set_max(int64_t max);
 
 /* Enumerate the table names under a parted db root — the splayed-table
  * subdirectories (those with a `.d` schema) of the first partition.

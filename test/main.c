@@ -36,6 +36,7 @@
 #include "test.h"
 #include "ops/agg_engine.h"   /* --census: agg_route_stats */
 #include "core/pool.h"         /* ray_pool_test_ring_fail */
+#include "mem/heap.h"          /* ray_alloc_fail_set_for_test */
 #include "test_rfl.h"
 
 #include <stdio.h>
@@ -54,6 +55,7 @@
 #include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
 #include "store/col.h"      /* ray_store_test_force_compress — equivalence pass */
 #include "store/enccol.h"   /* ray_test_hooks_off */
+#include "mem/heap.h"       /* ray_heap_test_scribble */
 #include "store/encw.h"
 #include "ops/colbind.h"
 
@@ -158,6 +160,8 @@ extern const test_entry_t pipe_entries[];
 extern const test_entry_t platform_entries[];
 extern const test_entry_t pool_entries[];
 extern const test_entry_t progress_entries[];
+extern const test_entry_t shm_entries[];
+extern const test_entry_t rdma_entries[];
 extern const test_entry_t public_api_entries[];
 extern const test_entry_t repl_entries[];
 extern const test_entry_t rowsel_entries[];
@@ -223,7 +227,7 @@ static const test_entry_t* const compiled_groups[] = {
     mcast_entries,
     numparse_entries, opt_entries,      partition_exec_entries,
     pipe_entries,     platform_entries,
-    pool_entries,     progress_entries,
+    pool_entries,     progress_entries, shm_entries,      rdma_entries,
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries, select_merge_entries,
     sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
@@ -948,7 +952,11 @@ void ray_test_hooks_off(void) {
     ray_group_test_route(0);
     ray_group_test_fail_scalar_alloc(0);
     ray_group_test_scalar_grain(0);
+    ray_in_guid_test_fail_alloc(0);
     ray_pool_test_ring_fail(0);
+    ray_pool_test_cancel_at(0, false);
+    ray_heap_test_scribble(false);
+    ray_alloc_fail_set_for_test(0, 0);
     agg_test_force_smallhash(false);
     agg_test_no_wide_dense(false);
     ray_clear_interrupt();

@@ -147,6 +147,15 @@ int64_t ray_timers_add(ray_timers_t* t, int64_t tic_ms, int64_t num, ray_t* fn) 
 
 bool ray_timers_del(ray_timers_t* t, int64_t id) {
     if (!t) return false;
+    /* Active invocations first, innermost to outermost: their timers are
+     * out of the heap.  Only mark; the dispatcher owns the timer and its
+     * lambda until the callback returns. */
+    for (ray_timer_frame_t* f = t->firing; f; f = f->prev) {
+        if (f->timer->id != id) continue;
+        if (f->dead) return false;          /* already deleted: idempotent */
+        f->dead = true;
+        return true;
+    }
     for (int64_t i = 0; i < t->n; i++) {
         if (t->heap[i]->id != id) continue;
         ray_release(t->heap[i]->fn);
@@ -174,6 +183,9 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
     int64_t now = ray_time_now_ms();
     uint32_t fired = 0;
 
+    /* The timer is popped before its callback runs, so no heap index is held
+     * across the call: a nested fire or a delete may reshape the heap freely,
+     * and the loop condition re-reads t->n and the head each iteration. */
     while (t->n > 0 && t->heap[0]->exp_ms <= now) {
         /* Pop the head: swap with tail, sift down. */
         ray_timer_t* timer = t->heap[0];
@@ -192,7 +204,13 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
          * left uncaught by the last REPL line must not be reported
          * against this callback's error. */
         ray_raise_clear();
+        ray_timer_frame_t frame = { timer, false, t->firing };
+        t->firing = &frame;
         ray_t* result = call_fn1(timer->fn, arg);
+        /* The callback may have re-entered this function; every nested
+         * frame has unwound by now, so t->firing is &frame again. */
+        t->firing = frame.prev;
+        bool dead = frame.dead;
         ray_release(arg);
         if (result) {
             if (RAY_IS_ERR(result)) {
@@ -221,7 +239,7 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
          * timer T/tic deadlines behind, and this loop would fire it that
          * many times back-to-back before the poll loop served any I/O.
          * Missed intervals are skipped, not replayed. */
-        if (timer->num == 0 || timer->num > 1) {
+        if (!dead && (timer->num == 0 || timer->num > 1)) {
             if (timer->num > 1) timer->num--;
             now = ray_time_now_ms();
             timer->exp_ms += timer->tic_ms;
@@ -230,7 +248,8 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
             heap_up(t->heap, t->n);
             t->n++;
         } else {
-            /* num == 1: last fire just happened. */
+            /* num == 1: last fire just happened, or the callback deleted
+             * its own timer. */
             ray_release(timer->fn);
             ray_sys_free(timer);
         }

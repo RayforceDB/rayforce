@@ -64,3 +64,13 @@
 (at (select {m: (max i) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
 (at (select {m: (count (distinct i)) x: (+ ts 1) from: T}) 'm) -- [4 4 4 4]
 (count (select {m: (max i) s: (+ (max ts) 1) from: T})) -- 1
+
+;; ── scalar aggregates with a where on the eval fallback read the where:
+;; rows of the columns they name only; one that can reach a column without
+;; naming it (a local) keeps them all ─
+(set TK (table [a b c s] (list [1 2 2 3 3 3 4 4] [10 20 30 40 50 60 70 80] [5 5 6 6 7 7 8 8] ['x 'y 'x 'y 'z 'z 'x 'y])))
+(value (select {u: (count (distinct a)) v: (count (distinct c)) from: TK where: (> b 15)})) -- (list [3] [4])
+(value (select {u: (count (distinct (+ a c))) from: TK where: (> b 15)})) -- (list [5])
+(value (select {u: (count (distinct s)) n: (sum b) from: TK where: (< b 45)})) -- (list [2] [100])
+(value (select {u: (sum (til 3)) from: TK where: (> b 15)})) -- (list [3])
+((fn [k] (value (select {u: (count (distinct (+ a k))) from: TK where: (> b 15)}))) 1) -- (list [3])

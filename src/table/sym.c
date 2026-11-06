@@ -998,6 +998,25 @@ ray_t* ray_sym_str(int64_t id) {
     return s;
 }
 
+/* The atoms of n ids under one lock, NULL where an id is unknown: for a
+ * pool worker resolving a block of cells, which would otherwise take the
+ * lock per cell against every other worker. */
+void ray_sym_str_batch(const int64_t* ids, int64_t n, ray_t** out) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) {
+        for (int64_t i = 0; i < n; i++) out[i] = NULL;
+        return;
+    }
+    sym_lock();
+    for (int64_t i = 0; i < n; i++) {
+        int64_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= g_sym.str_count) { out[i] = NULL; continue; }
+        if (!g_sym.strings[id] && (uint32_t)id < g_sym.lazy_count &&
+            !sym_lazy_materialize_to_locked((uint32_t)id)) { out[i] = NULL; continue; }
+        out[i] = g_sym.strings[id];
+    }
+    sym_unlock();
+}
+
 /* --------------------------------------------------------------------------
  * ray_sym_count
  * -------------------------------------------------------------------------- */

@@ -55,6 +55,14 @@
 #define RAY_ENC_FLAG_UNIQUE     0x01          /* col_flags bit 0 */
 #define RAY_ENC_STAT_ABSENT     0x01          /* directory and descriptor flags bit 0 */
 #define RAY_ENC_DESC_TRAILER    0x02          /* descriptor flags bit 1 */
+/* Directory and descriptor flags bit 2, SYM columns: string-prefix bounds.
+ * The first four bytes of the range's non-null strings (in the column's
+ * domain), big-endian and zero-padded, so that string order implies prefix
+ * order: their minimum and maximum, in the descriptor's rsv1 / rsv2 and the
+ * directory entry's rsv0 / rsv1.  Clear: no bounds (a file written before
+ * them, an all-null range, a writer without the domain).  Readers that do
+ * not know the bit ignore it, as they ignore the reserved fields. */
+#define RAY_ENC_SYM_PFX         0x04
 #define RAY_ENC_SIDE_VALUE_DICT 1
 #define RAY_ENC_SIDE_STR_DICT   2
 #define RAY_ENC_SIDE_FSST_TABLE 3

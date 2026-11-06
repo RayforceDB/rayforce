@@ -29,6 +29,7 @@
 #include "store/encfmt.h"
 #include "store/encidx.h"
 #include "store/fsst.h"
+#include "table/domain.h"
 
 typedef struct {
     ray_enc_desc_t desc;        /* payload_off is set by the column writer */
@@ -111,6 +112,7 @@ typedef struct {
     uint64_t str_pool_bytes;
     bool     any_bitmap_null;
     uint64_t* dict_v; uint32_t dict_n; bool dict_used;
+    uint32_t* dict_ix; uint64_t dict_mask;   /* dict_v's hash index (ray_enc_dict_index), or NULL */
     ray_enc_buf_t  chunk;
     ray_encw_vec_t vec;
     ray_enc_idx_src_t idx; bool has_idx;              /* region from a heap root */
@@ -122,6 +124,12 @@ typedef struct {
     bool     fsst_used;        /* some vector is FSST: the FSST_TABLE entry is written */
     uint64_t str_occ_bytes;    /* per-occurrence pooled bytes (the generation-0 bound) */
     struct ray_dict_acc_s* idict;  /* STR, index_kind DICT (P6b): generation 0's accumulator, fed per chunk */
+    ray_sym_domain_t* sym_dom;     /* SYM: the domain the codes are positions of (RAY_ENC_SYM_PFX); NULL: no bounds */
+    ray_sym_domain_raw_t sym_raw; bool sym_raw_ok;
+    struct ray_symimp_s* sym_imp; int64_t sym_imp_count;   /* an import domain's dictionary */
+    uint32_t* sym_pfx; int64_t sym_pfx_n;   /* every domain position's prefix, read once; NULL: per row */
+    /* ray_encw_set_sym_bounds: each vector's bounds by column vector, from where the strings were */
+    const uint32_t* sym_bmn; const uint32_t* sym_bmx; const uint8_t* sym_bhas;
 } ray_encw_t;
 /* index_kind RAY_IDX_DICT (P6b, spec "Writing the index"): the writer
  * builds the DICT region itself from the chunks it encodes and writes it at
@@ -130,6 +138,33 @@ typedef struct {
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
 ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
+/* Every chunk not yet written, of a column whose rows lie contiguously at
+ * `data` (row i at data + i * esz): the file is byte for byte what
+ * ray_encw_chunk chunk by chunk writes.  Chunk 0 trains on the caller; the
+ * rest encode on the pool when a dispatch is possible (not from inside one),
+ * serially otherwise.  STR stays serial: its STR_DICT entries and DICT index
+ * follow row order. */
+ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const char* str_pool);
+/* A column whose chunks are encoded where their rows arrive (any thread,
+ * any order) and written in chunk order: ray_encw_train trains the column's
+ * structures on chunk 0's rows, as ray_encw_chunk does; ray_encw_encode then
+ * encodes chunk `c` (its rows contiguous at `data`) into a part, reading the
+ * writer only (a copy of it taken after training, where puts may run
+ * meanwhile: a put moves the writer); ray_encw_put writes the part of chunk
+ * chunk_i.  The file is
+ * byte for byte what ray_encw_chunk chunk by chunk writes.  Not for STR
+ * (its STR_DICT entries and DICT index follow row order) or SYM (prefix
+ * bounds).  A part starts zeroed and may be reused; ray_encw_part_free
+ * releases its buffers. */
+typedef struct {
+    ray_encw_t       w;        /* a shallow copy of the writer: the trained structures are shared */
+    ray_enc_dirent_t de;
+    int64_t          c;
+} ray_encw_part_t;
+ray_err_t ray_encw_train(ray_encw_t* w, const void* data, int64_t n);
+ray_err_t ray_encw_encode(const ray_encw_t* w, int64_t c, const void* data, ray_encw_part_t* p);
+ray_err_t ray_encw_put(ray_encw_t* w, ray_encw_part_t* p);
+void      ray_encw_part_free(ray_encw_part_t* p);
 ray_err_t ray_encw_finish(ray_encw_t* w);
 void      ray_encw_free(ray_encw_t* w);
 /* Write s's index as the region (index_kind = the root's kind).  A writer
@@ -138,6 +173,15 @@ void      ray_encw_free(ray_encw_t* w);
  * column's final persisted attrs at finish.  A region writer failure leaves
  * its "index region: ..." message in ray_error_msg(). */
 void      ray_encw_set_index(ray_encw_t* w, const ray_enc_idx_src_t* s);
+/* A SYM column's domain (its codes are positions in it): the writer records
+ * the string-prefix bounds of every chunk and vector (RAY_ENC_SYM_PFX). */
+void      ray_encw_set_sym_domain(ray_encw_t* w, ray_sym_domain_t* dom);
+/* After ray_encw_set_sym_domain: the bounds of every vector of the column,
+ * computed where its strings were (a converter's decode), so the writer
+ * reads no string for them.  Vector v (rows [v * RAY_ENC_VEC, + RAY_ENC_VEC))
+ * has bounds [mn[v], mx[v]] when has[v], none when it holds no non-null
+ * row.  Borrowed until finish. */
+void      ray_encw_set_sym_bounds(ray_encw_t* w, const uint32_t* mn, const uint32_t* mx, const uint8_t* has);
 /* Copy `len` bytes of an already validated region of `kind` verbatim (never
  * on a writer begun with RAY_IDX_DICT). */
 void      ray_encw_set_index_copy(ray_encw_t* w, uint8_t kind, const uint8_t* region, uint64_t len);

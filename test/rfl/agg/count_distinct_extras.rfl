@@ -268,3 +268,13 @@
 (set QV (CDO (select {from: Tsp where: (> u 100)})))
 (all (== (at QW 'd) (at QV 'd))) -- true
 (sum (at QW 'c)) -- (count (select {from: Tsp where: (> u 100)}))
+
+;; A SYM column above the parallel floor counts its codes on the pool (a
+;; bit per code of its domain): 70000 distinct over 200000 rows, the same
+;; with every fifth row null, and against the string column's count.
+(set cdsN 200000)
+(set cdsS (as 'SYMBOL (map (fn [j] (format "c%" (% (* j 7919) 70000))) (til cdsN))))
+(count (distinct cdsS)) -- 70000
+(set cdsSn (as 'SYMBOL (map (fn [j] (if (== 0 (% j 5)) "" (format "c%" (% (* j 7919) 70000)))) (til cdsN))))
+(count (distinct cdsSn)) -- (count (distinct (as 'STR cdsSn)))
+(count (distinct (take cdsS 1000))) -- (count (distinct (as 'STR (take cdsS 1000))))

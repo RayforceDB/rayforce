@@ -397,6 +397,9 @@ typedef struct ray_enc_chunk_stat_s {
 } ray_enc_chunk_stat_t;
 /* Chunk c of a single-file encoded column.  c must be below e->n_chunks. */
 void ray_enccol_chunk_stat(const ray_enccol_t* e, int64_t c, ray_enc_chunk_stat_t* out);
+/* A SYM column's string-prefix bounds of chunk c (RAY_ENC_SYM_PFX): false
+ * when the chunk has none.  c must be below e->n_chunks. */
+bool ray_enccol_chunk_pfx(const ray_enccol_t* e, int64_t c, uint32_t* mn, uint32_t* mx);
 /* STR code bounds (membership bounds, spec "Statistics") of chunk c (j < 0)
  * or of vector j of chunk c: true with [*lo, *hi] when present.  The only
  * reader of STR statistics as statistics; every generic accessor reports

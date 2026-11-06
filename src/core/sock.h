@@ -68,6 +68,9 @@ int        ray_sock_send_oob(ray_sock_t s, char byte);
 void       ray_sock_set_oob_owner(ray_sock_t s);
 /* Consume one pending urgent byte on s; returns 1 if present (async-signal-safe). */
 int        ray_sock_take_oob(ray_sock_t s);
+/* The pending urgent byte on `s`, left pending: 0-255, or -1 when there
+ * is none.  Async-signal-safe (recv). */
+int        ray_sock_peek_oob(ray_sock_t s);
 void       ray_sock_close(ray_sock_t s);
 ray_err_t  ray_sock_set_nonblocking(ray_sock_t s);
 /* Dead-peer detection for an established TCP connection (#589).

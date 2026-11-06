@@ -61,6 +61,13 @@ static struct {
     int64_t            log_gen;    /* live log's generation id, 0 = legacy/unknown */
     ray_fd_t           lock_fd;    /* <base>.lk, held while the journal is open */
     char               lock_path[RAY_JOURNAL_PATH_MAX];   /* the held <base>.lk */
+    /* Identity of the last journal whose open SUCCEEDED (for
+     * ray_journal_info).  log_path/mode above are assigned before the open
+     * is attempted, so they can describe a failed attempt; these are only
+     * written once the log is open with its preamble, and cleared by purge. */
+    bool               opened_ok;
+    ray_journal_mode_t ok_mode;
+    char               ok_path[RAY_JOURNAL_PATH_MAX];
 } g_journal = {
     .mode      = RAY_JOURNAL_OFF,
     .fp        = NULL,
@@ -69,6 +76,9 @@ static struct {
     .in_replay = false,
     .log_gen   = 0,
     .lock_fd   = RAY_FD_INVALID,
+    .opened_ok = false,
+    .ok_mode   = RAY_JOURNAL_OFF,
+    .ok_path   = {0},
 };
 
 /* One writer per journal base.  The journal is single-writer (an entry is
@@ -299,6 +309,22 @@ static ray_t* eval_one(ray_t* msg) {
 
 bool ray_journal_is_open(void) { return g_journal.fp != NULL; }
 
+void ray_journal_info(ray_journal_info_t* out) {
+    out->open      = g_journal.fp != NULL;
+    out->opened_ok = g_journal.opened_ok;
+    out->mode      = g_journal.ok_mode;
+    out->path      = g_journal.ok_path;
+    out->bytes     = 0;
+    out->bytes_ok  = true;
+    if (g_journal.fp) {
+        /* ftello/off_t: ftell's long is 32 bits on LLP64 and 32-bit targets */
+        off_t end = -1;
+        if (fseeko(g_journal.fp, 0, SEEK_END) == 0) end = ftello(g_journal.fp);
+        if (end >= 0) out->bytes = (int64_t)end;
+        else out->bytes_ok = false;
+    }
+}
+
 ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
                                   const uint8_t*          payload,
                                   int64_t                 payload_len)
@@ -306,11 +332,24 @@ ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
     if (!g_journal.fp || g_journal.in_replay) return RAY_OK;
     if (!hdr || !payload || payload_len < 0) return RAY_ERR_DOMAIN;
 
-    if (fwrite(hdr, 1, sizeof(*hdr), g_journal.fp) != sizeof(*hdr))
-        return RAY_ERR_IO;
-    if (payload_len > 0 &&
-        fwrite(payload, 1, (size_t)payload_len, g_journal.fp) != (size_t)payload_len)
-        return RAY_ERR_IO;
+    /* The stream is unbuffered (setvbuf _IONBF at open), so every fwrite is one
+     * write(2).  A frame is header + payload: gather a small frame into one
+     * buffer so it costs one syscall instead of two (the append itself is
+     * ~2-3 us on a local filesystem, i.e. a third of a small sync request).
+     * Large frames keep the two-call path to avoid the copy. */
+    uint8_t frame[2048];
+    if (payload_len >= 0 && (size_t)payload_len <= sizeof(frame) - sizeof(*hdr)) {
+        memcpy(frame, hdr, sizeof(*hdr));
+        if (payload_len > 0) memcpy(frame + sizeof(*hdr), payload, (size_t)payload_len);
+        size_t total = sizeof(*hdr) + (size_t)payload_len;
+        if (fwrite(frame, 1, total, g_journal.fp) != total) return RAY_ERR_IO;
+    } else {
+        if (fwrite(hdr, 1, sizeof(*hdr), g_journal.fp) != sizeof(*hdr))
+            return RAY_ERR_IO;
+        if (payload_len > 0 &&
+            fwrite(payload, 1, (size_t)payload_len, g_journal.fp) != (size_t)payload_len)
+            return RAY_ERR_IO;
+    }
 
     if (g_journal.mode == RAY_JOURNAL_SYNC) {
         if (fflush(g_journal.fp) != 0) return RAY_ERR_IO;
@@ -553,6 +592,10 @@ static ray_err_t open_log_for_append(void) {
      * In RAY_JOURNAL_SYNC mode we additionally fsync per write; here
      * we just need the bytes to leave the process. */
     setvbuf(g_journal.fp, NULL, _IONBF, 0);
+    /* Open with its preamble in place: commit the identity for introspection. */
+    memcpy(g_journal.ok_path, g_journal.log_path, sizeof(g_journal.ok_path));
+    g_journal.ok_mode   = g_journal.mode;
+    g_journal.opened_ok = true;
     return RAY_OK;
 }
 
@@ -877,6 +920,9 @@ ray_err_t ray_journal_purge(void) {
     g_journal.mode        = RAY_JOURNAL_OFF;
     g_journal.base[0]     = '\0';
     g_journal.log_path[0] = '\0';
+    g_journal.opened_ok   = false;
+    g_journal.ok_mode     = RAY_JOURNAL_OFF;
+    g_journal.ok_path[0]  = '\0';
 
     return result;
 }

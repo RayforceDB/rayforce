@@ -2058,6 +2058,44 @@ static test_result_t test_stream_sym_chunks(void) {
     PASS();
 }
 
+/* A rebuilt symbol file with the same byte count must not reuse the old
+ * cached id-to-string mapping merely because its size did not change. */
+static test_result_t test_sym_domain_same_size_replacement(void) {
+#if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+    SKIP("file identity is unavailable on this platform");
+#else
+    char dir[160], path[200], replacement[200];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-sym-replace-%d", (int)getpid());
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
+    snprintf(path, sizeof(path), "%s/.sym", dir);
+    snprintf(replacement, sizeof(replacement), "%s/.new", dir);
+    ray_sym_domain_t* old = ray_sym_domain_open_or_create(path);
+    ray_sym_domain_t* fresh = ray_sym_domain_open_or_create(replacement);
+    TEST_ASSERT_TRUE(old && fresh);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(fresh, "", 0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "aa", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "bb", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(fresh, "bb", 2), 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(fresh, "aa", 2), 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(old, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(fresh, false), RAY_OK);
+    ray_sym_domain_t* again = ray_sym_domain_open(path);
+    TEST_ASSERT_TRUE(again == old); /* this process's own flush is valid */
+    ray_sym_domain_release(again);
+    struct stat a, b;
+    TEST_ASSERT_EQ_I(stat(path, &a), 0);
+    TEST_ASSERT_EQ_I(stat(replacement, &b), 0);
+    TEST_ASSERT_EQ_I(a.st_size, b.st_size);
+    TEST_ASSERT_EQ_I(rename(replacement, path), 0);
+    TEST_ASSERT_NULL(ray_sym_domain_open(path));
+    ray_sym_domain_release(fresh);
+    ray_sym_domain_release(old);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+#endif
+}
+
 /* STR chunks into a SYM writer: interned into the writer's domain, a batch
  * of 8192 at a time.  The same 20000 strings (a few hundred distinct, "",
  * repeats across batches) into a file domain and into an import dictionary
@@ -7364,6 +7402,22 @@ static test_result_t test_parted_missing_symfile(void) {
     PASS();
 }
 
+/* A shared symbol file named "sym" (no dot) is not read.  The error must
+ * name the real file, "<root>/.sym", not the "sym" it never looks for. */
+static test_result_t test_parted_symfile_name_in_error(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    ray_t* src = parted_symbol_part("aa");
+    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
+                                    TMP_PARTED_ROOT "/sym"), RAY_OK);
+    ray_release(src);
+    ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
+    TEST_ASSERT_ERR_CODE_MSG(view, "sym", "<dir>/.sym");
+    ray_error_free(view);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    PASS();
+}
+
 /* Same inode, size and mtime: a copied LIST payload must still reload.
  * Numeric mmap payloads alone cannot detect a bad cache hit here because
  * an in-place write is already visible through the old mapping. */
@@ -7479,6 +7533,128 @@ static test_result_t test_parted_cache_limit(void) {
     ray_release(src);
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     PASS();
+}
+
+static ray_t* parted_cache_seg(ray_t* view) {
+    return ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
+}
+
+/* Remount table i of five, one partition each, replacing its view; whether
+ * the mount reused the partition the old view had. */
+static bool parted_cache_remount(ray_t** views, int i, bool* reused) {
+    char name[8];
+    snprintf(name, sizeof(name), "t%d", i);
+    ray_t* v = ray_read_parted(TMP_PARTED_ROOT, name);
+    if (!v || RAY_IS_ERR(v)) return false;
+    *reused = views[i] && parted_cache_seg(v) == parted_cache_seg(views[i]);
+    if (views[i]) ray_release(views[i]);
+    views[i] = v;
+    return true;
+}
+
+/* A segment's users: its view, and the cache while it keeps the partition. */
+#define PARTED_CACHED(views, i) (ray_atomic_load(&parted_cache_seg((views)[i])->rc) == 2)
+
+/* Under a cap of three, the least recently mounted partition goes first and
+ * a hit makes its partition the newest.  A cyclic pass over more partitions
+ * than the cap misses on every mount, and every mount reads right.  With no
+ * cap, or one past 32 bits, all stay.  A cleared, pruned or replaced entry
+ * leaves the index consistent.  Saved as generation 0: the asserts read
+ * plain segments' payloads and reference counts. */
+static test_result_t parted_cache_recency(void) {
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    for (int i = 0; i < 5; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "%s/1/t%d", TMP_PARTED_ROOT, i);
+        ray_t* src = parted_remount_part(10 * i);
+        TEST_ASSERT_EQ_I(ray_splay_save_mode(src, path, NULL, RAY_COMPRESS_OFF), RAY_OK);
+        ray_release(src);
+    }
+    ray_t* views[5] = { NULL };
+    bool reused;
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+    /* t0 again: a hit, and t0 the newest, so t3 evicts t1, then t4 t2. */
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 0, &reused));
+    TEST_ASSERT_TRUE(reused);
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
+    TEST_ASSERT_FALSE(PARTED_CACHED(views, 1));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 2));
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 4, &reused));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 0));
+    TEST_ASSERT_FALSE(PARTED_CACHED(views, 2));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 3));
+    TEST_ASSERT_TRUE(PARTED_CACHED(views, 4));
+
+    /* From empty, two cycles over five: each mount a miss, each table its own. */
+    ray_parted_cache_clear();
+    for (int i = 0; i < 5; i++) TEST_ASSERT_FALSE(PARTED_CACHED(views, i));
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 5; i++) {
+            TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+            TEST_ASSERT_FALSE(reused);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(views[i])))[0], 10 * i);
+            TEST_ASSERT_EQ_I(ray_table_nrows(views[i]), 3);
+        }
+    }
+    for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i) == (i >= 2));
+
+    /* No cap: t0 and t1 load once more, then every mount is a hit. */
+    ray_parted_cache_set_max(0);
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 5; i++) {
+            TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+            TEST_ASSERT_TRUE(reused == (round == 1 || i >= 2));
+        }
+    }
+    for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i));
+
+    /* A cap past 32 bits is a large cap even where size_t is 32 bits: from
+     * empty, each table loads once and then hits. */
+    ray_parted_cache_set_max((int64_t)1 << 32);
+    ray_parted_cache_clear();
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 5; i++) {
+            TEST_ASSERT_TRUE(parted_cache_remount(views, i, &reused));
+            TEST_ASSERT_TRUE(reused == (round == 1));
+        }
+    }
+    for (int i = 0; i < 5; i++) TEST_ASSERT_TRUE(PARTED_CACHED(views, i));
+
+    /* Pruned once its view is gone: the next mount loads, the one after hits. */
+    ray_release(views[1]);
+    views[1] = NULL;
+    ray_heap_gc();
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 1, &reused));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(views[1])))[0], 10);
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 1, &reused));
+    TEST_ASSERT_TRUE(reused);
+
+    /* Replaced on disk: a fresh load takes the entry's place, and is the hit. */
+    ray_t* old3 = views[3];
+    ray_retain(old3);
+    ray_t* c = parted_remount_part(70);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(c, TMP_PARTED_ROOT "/1/t3", NULL, RAY_COMPRESS_OFF), RAY_OK);
+    ray_release(c);
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
+    TEST_ASSERT_FALSE(reused);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(views[3])))[0], 70);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(parted_cache_seg(old3)))[0], 30);   /* the old view keeps its rows */
+    TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
+    TEST_ASSERT_TRUE(reused);
+    ray_release(old3);
+
+    for (int i = 0; i < 5; i++) ray_release(views[i]);
+    PASS();
+}
+
+static test_result_t test_parted_cache_recency(void) {
+    int64_t was = ray_parted_cache_set_max(3);
+    test_result_t r = parted_cache_recency();
+    ray_parted_cache_set_max(was);
+    ray_parted_cache_clear();
+    (void)ray_test_rm_rf(TMP_PARTED_ROOT);
+    return r;
 }
 
 typedef struct { atomic_int* ready; atomic_bool* go; bool ok; } parted_thread_t;
@@ -7778,6 +7954,56 @@ static test_result_t test_col_slice_save(void) {
     ray_release(loaded);
 
     ray_release(slice);
+    ray_release(parent);
+    unlink(ray_test_tmp(TMP_COL_PATH));
+    PASS();
+}
+
+/* A STR view stores slice_offset in the same union arm as str_pool.  Saving
+ * must read the pool from its parent even when the view begins at offset 1. */
+static test_result_t test_col_str_slice_save(void) {
+    const char* values[] = {
+        "first-long-pooled-value", "second-long-pooled-value",
+        "third-long-pooled-value"
+    };
+    ray_t* parent = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+    for (size_t i = 0; i < 3; i++) {
+        parent = ray_str_vec_append(parent, values[i], strlen(values[i]));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+    }
+
+    for (int64_t offset = 0; offset <= 1; offset++) {
+        ray_t* view = ray_vec_slice(parent, offset, 1);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+        TEST_ASSERT_TRUE(view->attrs & RAY_ATTR_SLICE);
+        TEST_ASSERT_EQ_I(ray_col_save(view, ray_test_tmp(TMP_COL_PATH)), RAY_OK);
+
+        ray_t* loaded = ray_col_load(ray_test_tmp(TMP_COL_PATH));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_STR);
+        TEST_ASSERT_EQ_I(loaded->len, 1);
+        TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_SLICE);
+        TEST_ASSERT_EQ_I(loaded->str_pool->len, (int64_t)strlen(values[offset]));
+        size_t len = 0;
+        const char* got = ray_str_vec_get(loaded, 0, &len);
+        TEST_ASSERT_EQ_U(len, strlen(values[offset]));
+        TEST_ASSERT_TRUE(memcmp(got, values[offset], len) == 0);
+        ray_release(loaded);
+
+        ray_t* mapped = ray_col_mmap(ray_test_tmp(TMP_COL_PATH));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+        got = ray_str_vec_get(mapped, 0, &len);
+        TEST_ASSERT_EQ_U(len, strlen(values[offset]));
+        TEST_ASSERT_TRUE(memcmp(got, values[offset], len) == 0);
+        ray_release(mapped);
+        ray_release(view);
+    }
+
+    size_t len = 0;
+    const char* original = ray_str_vec_get(parent, 2, &len);
+    TEST_ASSERT_EQ_U(len, strlen(values[2]));
+    TEST_ASSERT_TRUE(memcmp(original, values[2], len) == 0);
     ray_release(parent);
     unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
@@ -8217,6 +8443,7 @@ const test_entry_t store_entries[] = {
     { "store/col_str_hash_persisted", test_col_str_hash_persisted, store_setup, store_teardown },
     { "store/stream_str_hash_persisted", test_stream_str_hash_persisted, store_setup, store_teardown },
     { "store/parted_cache_limit", test_parted_cache_limit, store_setup, store_teardown },
+    { "store/parted_cache_recency", test_parted_cache_recency, store_setup, store_teardown },
     { "store/parted_cache_gc", test_parted_cache_gc, store_setup, store_teardown },
     { "store/parted_live_domain_open", test_parted_live_domain_open, store_setup, store_teardown },
     { "store/parted_rebuilt_write_without_gc", test_parted_rebuilt_write_without_gc, store_setup, store_teardown },
@@ -8224,6 +8451,7 @@ const test_entry_t store_entries[] = {
     { "store/parted_rebuilt_without_gc", test_parted_rebuilt_without_gc, store_setup, store_teardown },
     { "store/parted_rebuilt_symbols", test_parted_rebuilt_symbols, store_setup, store_teardown },
     { "store/parted_missing_symfile", test_parted_missing_symfile, store_setup, store_teardown },
+    { "store/parted_symfile_name_in_error", test_parted_symfile_name_in_error, store_setup, store_teardown },
     { "store/parted_restored_mtime", test_parted_restored_mtime, store_setup, store_teardown },
     { "store/parted_generation_and_sweep", test_parted_generation_and_sweep, store_setup, store_teardown },
     { "store/parted_concurrent_mounts", test_parted_concurrent_mounts, store_setup, store_teardown },
@@ -8235,6 +8463,7 @@ const test_entry_t store_entries[] = {
     { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },
     { "store/col_str_inline_only", test_col_str_inline_only_roundtrip, store_setup, store_teardown },
     { "store/col_slice_save", test_col_slice_save, store_setup, store_teardown },
+    { "store/col_str_slice_save", test_col_str_slice_save, store_setup, store_teardown },
     { "store/col_sym_empty_roundtrip", test_col_sym_empty_roundtrip, store_setup, store_teardown },
     { "store/col_sym_saved_count_reject", test_col_sym_saved_count_reject, store_setup, store_teardown },
     { "store/col_str_list_empty_string", test_col_str_list_empty_string, store_setup, store_teardown },
@@ -8260,6 +8489,7 @@ const test_entry_t store_entries[] = {
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },
     { "store/stream_sym_chunks", test_stream_sym_chunks, store_setup, store_teardown },
+    { "store/sym_domain_same_size_replacement", test_sym_domain_same_size_replacement, store_setup, store_teardown },
     { "store/stream_sym_from_str", test_stream_sym_from_str, store_setup, store_teardown },
     { "store/stream_sym_foreign", test_stream_sym_foreign, store_setup, store_teardown },
     { "store/stream_sym_lut_stale", test_stream_sym_lut_stale, store_setup, store_teardown },

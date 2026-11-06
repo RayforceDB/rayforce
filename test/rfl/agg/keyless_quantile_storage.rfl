@@ -1,0 +1,22 @@
+;; @requires: posix (temporary fixture cleanup)
+;; Absolute whole-column interpolation across unequal partitions, not averaged partition quantiles.
+(.sys.exec "rm -rf /tmp/rfl_quantile981") -- 0
+(set QA981 (table [g s] (list [0 1 0 2 3] (as 'F64 [0 2 100 0Nf -4]))))
+(set QB981 (table [g s] (list [0 1 2 3] (as 'F64 [8 4 0Nf -1]))))
+(set QT981 (concat QA981 QB981))
+(set QC981 (fn [tt] (list (type (at (select {q: (quantile s 0.25) from: tt}) 'q)) (at (select {q: (quantile s 0.25) from: tt}) 'q) (at (select {q: (quantile s 0.75) from: tt}) 'q) (at (select {q: (quantile s 0) from: tt}) 'q) (at (select {q: (percentile s 100) from: tt}) 'q) (at (select {q: (quantile s 0.25) from: tt where: (== g 0)}) 'q) (at (select {q: (quantile s 0.25) from: tt by: g asc: g}) 'q))))
+(QC981 QT981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(.db.splayed.set "/tmp/rfl_quantile981/plain" QT981 {compress:false})
+(set QD981 (.db.splayed.get "/tmp/rfl_quantile981/plain"))
+(QC981 QD981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(QC981 QD981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(.db.splayed.set "/tmp/rfl_quantile981/encoded" QT981 {compress:true})
+(set QE981 (.db.splayed.get "/tmp/rfl_quantile981/encoded"))
+(QC981 QE981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(QC981 QE981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(.db.splayed.set "/tmp/rfl_quantile981/p/2024.01.01/t" QA981 {compress:false})
+(.db.splayed.set "/tmp/rfl_quantile981/p/2024.01.02/t" QB981 {compress:true})
+(set QP981 (.db.parted.get "/tmp/rfl_quantile981/p" 't))
+(QC981 QP981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(QC981 QP981) -- (list 'F64 [-0.5] [6.0] [-4.0] [100.0] [4.0] [4.0 2.5 0Nf -3.25])
+(.sys.exec "rm -rf /tmp/rfl_quantile981") -- 0

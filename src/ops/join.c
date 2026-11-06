@@ -623,20 +623,27 @@ static ray_t* join_gather_list_col(const ray_t* src, const int64_t* idx,
 /* Serial one-column gather used by the asof output builder.  Fixed-width
  * columns preserve SYM width/domain, STR pools, and null sentinels; LIST
  * columns take the ownership-aware path above. */
-static ray_t* join_gather_col_serial(ray_t* src, const int64_t* idx,
+static ray_t* join_gather_col_rows(ray_t* src, const int64_t* idx,
                                      int64_t n) {
     if (src->type == RAY_LIST)
         return join_gather_list_col(src, idx, n);
 
     ray_t* out = col_vec_new(src, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-    uint8_t esz = col_esz(src);
-    const char* s = (const char*)ray_data(src);
-    char* d = (char*)ray_data(out);
-    for (int64_t i = 0; i < n; i++) {
-        int64_t row = idx[i];
-        if (row >= 0) memcpy(d + i * esz, s + row * esz, esz);
-        else          memset(d + i * esz, 0, esz);
+    /* the rows across the pool; a -1 row is zeroed, its null set below */
+    gather_ctx_t gctx = {
+        .idx = (int64_t*)idx, .src_col = src, .dst_col = out,
+        .esz = col_esz(src), .nullable = true,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && n > RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, gather_fn, &gctx, n);
+    else
+        gather_fn(&gctx, 0, 0, n);
+    /* a cancelled dispatch skips tasks: their rows were never written */
+    if (pool_cancelled(pool)) {
+        ray_release(out);
+        return ray_error("cancel", NULL);
     }
     out->len = n;
     col_propagate_str_pool(out, src);
@@ -4099,7 +4106,7 @@ build_output:;
             out = src_col;
             goto window_output_cleanup;
         }
-        ray_t* dst_col = join_gather_col_serial(src_col, lidx, out_n);
+        ray_t* dst_col = join_gather_col_rows(src_col, lidx, out_n);
         if (!dst_col || RAY_IS_ERR(dst_col)) {
             ray_release(out);
             out = dst_col ? dst_col : ray_error("oom", NULL);
@@ -4124,7 +4131,7 @@ build_output:;
             out = src_col;
             goto window_output_cleanup;
         }
-        ray_t* dst_col = join_gather_col_serial(src_col, ridx, out_n);
+        ray_t* dst_col = join_gather_col_rows(src_col, ridx, out_n);
         if (!dst_col || RAY_IS_ERR(dst_col)) {
             ray_release(out);
             out = dst_col ? dst_col : ray_error("oom", NULL);

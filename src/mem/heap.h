@@ -150,6 +150,12 @@ ray_t*    ray_scratch_realloc(ray_t* v, size_t new_data_size);
 
 ray_t*    ray_cow(ray_t* v);
 
+#ifdef DEBUG
+/* Test seam: ray_alloc on this thread returns NULL for `count` calls,
+ * starting with the nth from now; nth 0 disarms. */
+void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
+#endif
+
 /* ===== Memory Statistics ===== */
 
 typedef struct {
@@ -276,6 +282,10 @@ void ray_heap_release_pages(void);
  *   of the caller's heap and the workers'; returns the number of blocks
  *   released, or -1 if it did nothing.  Safe to call from any maintenance
  *   point.
+ * ray_heap_release_now    — the same sweep, due or not, and the
+ *   direct-block cache drained: for a caller that knows it has finished
+ *   with a peak ((.sys.gc 1)).  Disarms the decay.  Returns the number of
+ *   blocks released, as ray_heap_decay, or -1 inside parallel work.
  *
  * The threshold is fixed policy, reachable only through
  * ray_heap_set_decay_ms: negative disables the decay, 0 releases at the
@@ -283,6 +293,7 @@ void ray_heap_release_pages(void);
 void    ray_heap_note_activity(void);
 int64_t ray_heap_decay_due_ms(void);
 int64_t ray_heap_decay(void);
+int64_t ray_heap_release_now(void);
 /* At a statement boundary: after a statement that spilled (or one that,
  * right after such a relief, needed its room for large blocks), unmap the
  * empty pools of the heaps that did not spill a pool when that makes room
@@ -312,6 +323,23 @@ bool ray_heap_spill_discards(void);
 /* How many parked spill pools a boundary has set out to discard so far —
  * each once per use (ray_heap_relieve).  For tests. */
 int64_t ray_heap_spill_discard_count(void);
+/* Test hook (C tests only): every block ray_alloc hands out is filled with
+ * 0xA5 first, so a word a task never wrote reads as garbage rather than as
+ * what the block's previous user left there.  Disarmed by ray_test_hooks_off.
+ * Compiled only under DEBUG, as the test objects are. */
+#ifdef DEBUG
+void ray_heap_test_scribble(bool on);
+#endif
+
+/* ray_alloc whose data bytes read as zero, on the calling thread: a block
+ * mapped for this call is zero already and is handed out as is, any other
+ * is zeroed here.  Any thread may call it (ray_calloc_raw does). */
+ray_t* ray_alloc_zeroed(size_t data_size);
+/* ray_alloc_zeroed for the engine's query paths (scratch_calloc): a large
+ * block that is not fresh is zeroed across the pool when the caller is
+ * outside a dispatch.  The pool takes tasks from one dispatcher only, so
+ * only the thread that evaluates queries may call it. */
+ray_t* ray_alloc_zeroed_query(size_t data_size);
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -346,7 +374,9 @@ typedef struct {
     int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
     int    locked;        /* locked against swap-out (heap_lock) */
     char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
-    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*)];
+    int    fresh;         /* mapped for this allocation (its pages read as zero),
+                             not taken from the reuse cache */
+    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 3 * sizeof(int) - sizeof(char*)];
 } ray_direct_hdr_t;
 _Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
 
@@ -384,16 +414,9 @@ bool ray_raw_discard(void* p, size_t from, size_t upto);
  * and at most half, left to the page cache) are backed by a disk spill file
  * instead — file-backed pages are always reclaimable, so they cannot trigger
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
- * restores the default); intended for diagnostics and tests. */
+ * restores the default).  It, ray_heap_anon_watermark and
+ * ray_heap_anon_peak are public: include/rayforce.h. */
 int64_t ray_heap_anon_committed(void);
-/* High-water mark of the anon-committed footprint since process start — the
- * peak RAM an operator actually demanded (pools, direct and sys blocks;
- * excludes spill). */
-int64_t ray_heap_anon_peak(void);
-/* Current anon watermark in bytes (the effective spill threshold; resolves 0
- * to the default, ray_sys_ram_limit() less the page-cache room). */
-int64_t ray_heap_anon_watermark(void);
-void    ray_heap_set_anon_watermark(int64_t bytes);
 /* Locking against swap-out (heap_lock in heap.c): the bytes of the heap's
  * mappings locked now; the times the kernel refused a lock, or a release
  * could not lock a range again; and the bytes left unlocked — past the

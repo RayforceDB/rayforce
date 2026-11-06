@@ -57,7 +57,7 @@
 
 typedef struct ray_ipc_header_t {
     uint32_t prefix;     /* RAY_SERDE_PREFIX */
-    uint8_t  version;    /* RAY_VERSION_MAJOR */
+    uint8_t  version;    /* RAY_SERDE_WIRE_VERSION */
     uint8_t  flags;      /* 0 */
     uint8_t  endian;     /* 0 = little */
     uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response */

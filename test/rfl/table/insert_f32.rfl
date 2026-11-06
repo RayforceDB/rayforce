@@ -1,0 +1,52 @@
+;; Row insert into an F32 column.  It always failed with
+;; "insert: unsupported column type F32".  An F32 atom is stored as is, an
+;; F64 or integer atom is narrowed, a non-numeric value is rejected.
+
+;; in place (named table), repeated so the second insert appends to data
+(set t (table [c] (list (as 'F32 (list)))))
+(insert 't (list 2.5e)) -- 't
+(insert 't (list 2.5)) -- 't
+(insert 't (list 3)) -- 't
+(type (get t 'c)) -- 'F32
+(count t) -- 3
+(as 'F64 (get t 'c)) -- [2.5 2.5 3.0]
+
+;; functional form keeps the original, and a null is a null
+(set u (insert t (list 0Ne)))
+(count t) -- 3
+(count u) -- 4
+(type (get u 'c)) -- 'F32
+(nil? (at (get u 'c) 3)) -- true
+
+;; an F32 column next to others, appended to the rebuild path through a shared alias
+(set w (table [id c] (list [1] (as 'F32 [1.5e]))))
+(set alias w)
+(insert 'w (list 2 0.25)) -- 'w
+(count w) -- 2
+(count alias) -- 1
+(as 'F64 (get w 'c)) -- [1.5 0.25]
+
+;; non-numeric values are still rejected, and the table is untouched
+(insert 't (list 'x)) !- type
+(count t) -- 3
+
+;; a finite F64 past FLT_MAX saturates to +/-FLT_MAX at the insert (F32 has no
+;; infinities), in place and through a shared alias; a null stays a null
+(set o (table [c] (list (as 'F32 (list)))))
+(insert 'o (list 1e300)) -- 'o
+(insert 'o (list -1e300)) -- 'o
+(insert 'o (list 0Nf)) -- 'o
+(insert 'o (list 0.5)) -- 'o
+(== (at (as 'F64 (get o 'c)) 0) 3.4028234663852886e38) -- true
+(== (at (as 'F64 (get o 'c)) 1) -3.4028234663852886e38) -- true
+(nil? (at (get o 'c) 2)) -- true
+(== (at (as 'F64 (get o 'c)) 3) 0.5) -- true
+(set sh (table [id c] (list [1] (as 'F32 [1.5e]))))
+(set sh_alias sh)
+(insert 'sh (list 2 1e300)) -- 'sh
+(insert 'sh (list 3 -1e300)) -- 'sh
+(count sh_alias) -- 1
+(== (at (as 'F64 (get sh 'c)) 1) 3.4028234663852886e38) -- true
+(== (at (as 'F64 (get sh 'c)) 2) -3.4028234663852886e38) -- true
+(set ov (insert sh (list 4 1e300)))
+(== (at (as 'F64 (get ov 'c)) 3) 3.4028234663852886e38) -- true

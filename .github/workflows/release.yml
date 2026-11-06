@@ -28,6 +28,9 @@ permissions:
 
 jobs:
   prepare:
+    permissions:
+      contents: write
+      pull-requests: read  # exact merged release PR source provenance
     # Manual dispatch always runs; the PR path only on an actual merge whose
     # title declares a release version.
     if: >-
@@ -55,6 +58,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
           DISPATCH_SHA: ${{ github.sha }}
         run: |
@@ -83,7 +87,14 @@ jobs:
           else
             # Feature-oriented changelog (grouped by conventional-commit type),
             # not GitHub's default author/PR ledger.
-            bash .github/release-notes.sh "$VERSION" "$SHA" > "$RUNNER_TEMP/notes.md"
+            # Pin only the notes source; SHA remains the artifact/build/tag target.
+            notes_args=("$VERSION" "$SHA")
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              notes_args+=(--allow-direct-merge)
+            else
+              export RELEASE_SOURCE_SHA="$PR_SOURCE_SHA"
+            fi
+            bash .github/release-notes.sh "${notes_args[@]}" > "$RUNNER_TEMP/notes.md"
             gh release create "v$VERSION" \
               --target "$SHA" \
               --title "v$VERSION" \
@@ -188,8 +199,8 @@ jobs:
           set -euo pipefail
           url="https://github.com/${GH_REPO}/releases/tag/v${VERSION}"
           # Changelog highlights = the release body minus the collapsed
-          # "Maintenance & internal" <details> block (Zulip won't render it).
-          notes="$(gh release view "v$VERSION" --json body -q .body | sed '/<details>/,/<\/details>/d')"
+          # "Maintenance & internal" block and hidden provenance (not user-facing).
+          notes="$(gh release view "v$VERSION" --json body -q .body | sed -e '/<details>/,/<\/details>/d' -e '/^<!-- release-notes-source-v1 /d')"
           content="$(printf '🚀 **Rayforce v%s** is out!\n\n%s\n\n📦 Release & downloads: %s' "$VERSION" "$notes" "$url")"
           resp="$(curl -sS -X POST 'https://rayforcedb.zulipchat.com/api/v1/messages' \
             -u "releases-bot@rayforcedb.zulipchat.com:${ZULIP_API_KEY}" \
@@ -213,6 +224,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
       - name: Update tap formula
+        id: update_tap_formula
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         continue-on-error: true
         env:
@@ -236,3 +248,15 @@ jobs:
           git add Formula/rayforce.rb
           git commit -m "rayforce ${VERSION}" || { echo "formula unchanged — nothing to push"; exit 0; }
           git push origin HEAD
+
+      - name: Report failed tap update
+        if: ${{ steps.update_tap_formula.outcome == 'failure' }}
+        continue-on-error: true
+        run: |
+          echo "::warning title=Homebrew tap update failed::The core release job succeeded, but its best-effort Homebrew update failed. Inspect the tap step before claiming the formula advanced."
+          {
+            echo "### Homebrew tap update failed"
+            echo "The core release job succeeded, but the best-effort tap update did not complete successfully."
+            echo "Inspect the Update tap formula log and repair the cause privately; do not print credentials."
+            echo "A green core release does not confirm the Homebrew formula version."
+          } >> "$GITHUB_STEP_SUMMARY"

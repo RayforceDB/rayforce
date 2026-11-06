@@ -117,6 +117,7 @@ nav:
           - Advanced Analytics: docs/tutorials/analytics.md
       - Rayfall Language:
           - Syntax: docs/language/syntax.md
+          - Names and Scope: docs/language/name-resolution.md
           - Functions Reference: docs/language/functions.md
           - Math Operations: docs/language/math.md
           - String Operations: docs/language/string.md
@@ -174,10 +175,6 @@ nav:
           - Pipeline & Optimizer: docs/architecture/pipeline.md
           - Memory Model: docs/architecture/memory.md
           - Block Offloading: docs/architecture/offloading.md
-      - Design Notes:
-          - Aggregation Fast Paths: aggregation-fast-path-plan.md
-          - Grouping Engine Scaling: grouping-engine-scaling-plan.md
-          - Multicast Implementation: multicast-implementation-plan.md
       - C API:
           - Core API: docs/c-api/core.md
           - DAG API: docs/c-api/dag.md

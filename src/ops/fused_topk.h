@@ -107,5 +107,8 @@ void ray_fused_topk_counters_reset(void);
  * first key: chunk-slot prunes (one per task fragment of a chunk, so they
  * follow the dispatch geometry, not distinct chunks) and pruned morsels. */
 void ray_fused_topk_test_pruned(uint64_t* chunks, uint64_t* vectors);
+/* Test hook: 1 when the last ray_fused_topk_select seeded its bound from
+ * the directory's SYM prefix extrema before reading any row. */
+uint64_t ray_fused_topk_test_seeded(void);
 
 #endif /* RAY_OPS_FUSED_TOPK_H */

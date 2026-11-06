@@ -24,12 +24,15 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "mem/cow.h"
 #include "vec/vec.h"
 #include "vec/growth.h"
 #include "ops/idxop.h"
 #include "vec/str.h"
 #include "vec/embedding.h"
 #include "table/sym.h"
+#include "table/domain.h"
+#include "lang/internal.h"
 #include "core/platform.h"
 #include "store/serde.h"
 #include <string.h>
@@ -2707,7 +2710,514 @@ static test_result_t test_vec_growth_str_refs(void) {
     PASS();
 }
 
+/* ---- slice setter value semantics --------------------------------------- */
+
+/* Success consumes one owner; failure leaves it with the caller. Keep that
+ * protocol even on an unexpected error so the final assertion is leak-free. */
+static bool set_slice_owned(ray_t** owner, int64_t row, const void* elem) {
+    ray_t* result = ray_vec_set(*owner, row, elem);
+    if (!result) return false;
+    if (RAY_IS_ERR(result)) {
+        ray_error_free(result);
+        return false;
+    }
+    *owner = result;
+    return true;
+}
+
+static bool set_slice_plain(ray_t* v) {
+    return !(v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_SORTED)) && !ray_index_has(v);
+}
+
+/* Use the actual find operator, not a model of sorted/hash lookup. */
+static bool set_slice_find_keys(ray_t* v, ray_t* keys, int64_t a, int64_t b) {
+    ray_t* found = ray_find_fn(v, keys);
+    if (!found) return false;
+    if (RAY_IS_ERR(found)) {
+        ray_error_free(found);
+        return false;
+    }
+    int64_t expected[] = {a, b};
+    bool ok = found->type == RAY_I64 && found->len == 2 &&
+        memcmp(ray_data(found), expected, sizeof expected) == 0;
+    ray_release(found);
+    return ok;
+}
+
+static test_result_t test_vec_set_slice_isolation(void) {
+    const int64_t raw[] = {1, 2, 3};
+    const int64_t probes[] = {2, 9};
+    const int64_t changed[] = {9, 3};
+    for (int mode = 0; mode < 3; mode++) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 3);
+        TEST_ASSERT_NOT_NULL(parent);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+        parent->attrs |= RAY_ATTR_SORTED; /* truthful sorted fixture */
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&parent)));
+        ray_t* index = parent->index;
+        ray_t* keys = ray_vec_from_raw(RAY_I64, probes, 2);
+        TEST_ASSERT_NOT_NULL(keys);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(keys));
+        bool before = set_slice_find_keys(parent, keys, 1, NULL_I64);
+        ray_t* outer = ray_vec_slice(parent, 0, 3);
+        TEST_ASSERT_NOT_NULL(outer);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(outer));
+        ray_t* view = mode == 2 ? ray_vec_slice(outer, 1, 2) :
+                                 ray_vec_slice(parent, 1, 2);
+        ray_t* overlap = ray_vec_slice(parent, 0, 2);
+        TEST_ASSERT_NOT_NULL(overlap);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(overlap));
+        TEST_ASSERT_NOT_NULL(view);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+        /* Slices don't inherit parent accelerators. A separately sorted
+         * slice is legal; detachment must discard its own marker too. */
+        view->attrs |= RAY_ATTR_SORTED;
+        ray_t* alias = NULL;
+        if (mode == 1) { alias = view; ray_retain(alias); }
+        int64_t nine = 9;
+        bool wrote = set_slice_owned(&view, 0, &nine);
+        bool ok = wrote && before && set_slice_plain(view) && view->len == 2 &&
+            memcmp(ray_data(view), changed, sizeof changed) == 0 &&
+            memcmp(ray_data(parent), raw, sizeof raw) == 0 &&
+            memcmp(ray_data(outer), raw, sizeof raw) == 0 &&
+            memcmp(ray_data(overlap), raw, 2 * sizeof(int64_t)) == 0 &&
+            (parent->attrs & RAY_ATTR_SORTED) && ray_index_has(parent) &&
+            parent->index == index;
+        if (alias) ok = ok && (alias->attrs & RAY_ATTR_SORTED) &&
+            memcmp(ray_data(alias), raw + 1, 2 * sizeof(int64_t)) == 0;
+        /* Deliberately evaluate actual indexed find even if payload checks
+         * failed: baseline's stale index otherwise masks the changed bytes. */
+        bool parent_find = set_slice_find_keys(parent, keys, 1, NULL_I64);
+        bool result_find = set_slice_find_keys(view, keys, NULL_I64, 0);
+        ray_release(alias);
+        ray_release(overlap);
+        ray_release(outer);
+        ray_release(parent);
+        /* Result payload must remain readable after all old owners go. */
+        ok = ok && memcmp(ray_data(view), changed, sizeof changed) == 0;
+        ray_release(view);
+        ray_release(keys);
+        TEST_ASSERT_TRUE(ok && parent_find && result_find);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_set_slice_backing_elem(void) {
+    const int64_t raw[] = {11, 22, 33, 44};
+    const int64_t expected[] = {44, 33};
+    for (int shared = 0; shared < 2; shared++) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 4);
+        TEST_ASSERT_NOT_NULL(parent);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+        ray_t* view = ray_vec_slice(parent, 1, 2);
+        TEST_ASSERT_NOT_NULL(view);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+        ray_t* alias = NULL;
+        if (shared) { alias = view; ray_retain(alias); }
+        /* elem is outside the slice, but inside its backing allocation.
+         * In the unique case the slice is now the last owner of parent. */
+        const void* elem = ray_vec_get(parent, 3);
+        ray_release(parent);
+        bool wrote = set_slice_owned(&view, 0, elem);
+        bool ok = wrote && set_slice_plain(view) && view->len == 2 &&
+            memcmp(ray_data(view), expected, sizeof expected) == 0;
+        if (alias) ok = ok &&
+            memcmp(ray_data(alias), raw + 1, 2 * sizeof(int64_t)) == 0;
+        ray_release(alias);
+        ok = ok && memcmp(ray_data(view), expected, sizeof expected) == 0;
+        ray_release(view);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_set_slice_primitive_nulls(void) {
+    const int8_t types[] = {RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64,
+        RAY_F32, RAY_F64, RAY_DATE, RAY_TIME, RAY_TIMESTAMP, RAY_TIMESPAN, RAY_GUID};
+    for (size_t c = 0; c < sizeof types / sizeof types[0]; c++) {
+        int8_t type = types[c];
+        size_t width = ray_elem_size(type);
+        /* All typed reads are from allocated vectors. These byte arrays
+         * are only memcpy/memcmp inputs, never cast to wider pointers. */
+        uint8_t raw[48], replacement[16], snapshot[48];
+        memset(raw, type == RAY_BOOL ? 1 : 0x11, sizeof raw);
+        memset(replacement, type == RAY_BOOL ? 0 : 0x22, sizeof replacement);
+        bool nullable = type != RAY_BOOL && type != RAY_U8;
+        for (int insert_null = 0; insert_null < (nullable ? 2 : 1); insert_null++) {
+            ray_t* parent = ray_vec_from_raw(type, raw, 3);
+            TEST_ASSERT_NOT_NULL(parent);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+            ray_t* null_value = ray_vec_from_raw(type, raw, 1);
+            TEST_ASSERT_NOT_NULL(null_value);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(null_value));
+            if (nullable) {
+                TEST_ASSERT_EQ_I(ray_vec_set_null_checked(null_value, 0, true), RAY_OK);
+                if (!insert_null)
+                    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(parent, 1, true), RAY_OK);
+            }
+            memcpy(snapshot, ray_data(parent), 3 * width);
+            uint8_t parent_attrs = parent->attrs;
+            ray_t* view = ray_vec_slice(parent, 1, 1);
+            TEST_ASSERT_NOT_NULL(view);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+            const void* value = insert_null ? ray_data(null_value) : replacement;
+            bool wrote = set_slice_owned(&view, 0, value);
+            bool ok = wrote && set_slice_plain(view) && view->type == type && view->len == 1 &&
+                memcmp(ray_data(view), value, width) == 0 &&
+                memcmp(ray_data(parent), snapshot, 3 * width) == 0 &&
+                parent->attrs == parent_attrs;
+            if (nullable) ok = ok && (view->attrs & RAY_ATTR_HAS_NULLS) &&
+                ray_vec_is_null(view, 0) == (insert_null != 0);
+            ray_release(parent);
+            ok = ok && memcmp(ray_data(view), value, width) == 0;
+            ray_release(null_value);
+            ray_release(view);
+            TEST_ASSERT_TRUE(ok);
+        }
+    }
+    PASS();
+}
+
+static void set_slice_sym_setup(void) {
+    ray_heap_init();
+    ray_sym_init();
+}
+
+static void set_slice_sym_teardown(void) {
+    ray_sym_destroy();
+    ray_heap_destroy();
+}
+
+/* A private refcounted dictionary exercises domain ownership without files
+ * or the immortal runtime singleton masking a missing retain. Real mmap/cache
+ * FILE-domain coverage remains separate from this bounded fixture. */
+static test_result_t test_vec_set_slice_sym_widths(void) {
+    const uint8_t widths[] = {RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64};
+    for (size_t c = 0; c < sizeof widths / sizeof widths[0]; c++) {
+        ray_sym_domain_t* domain = ray_sym_domain_new();
+        TEST_ASSERT_NOT_NULL(domain);
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(domain, "alpha", 5), 1);
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(domain, "beta", 4), 2);
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(domain, "gamma", 5), 3);
+        ray_t* parent = ray_sym_vec_new(widths[c], 3);
+        TEST_ASSERT_NOT_NULL(parent);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+        parent->len = 3; /* constructor reserves capacity only */
+        parent->sym_domain = domain;
+        ray_sym_domain_retain(domain);
+        ray_write_sym(ray_data(parent), 0, 1, RAY_SYM, parent->attrs);
+        ray_write_sym(ray_data(parent), 1, 0, RAY_SYM, parent->attrs);
+        ray_write_sym(ray_data(parent), 2, 3, RAY_SYM, parent->attrs);
+        parent->attrs |= RAY_ATTR_HAS_NULLS;
+        uint8_t snapshot[24];
+        size_t width = RAY_SYM_ELEM(parent->attrs);
+        memcpy(snapshot, ray_data(parent), 3 * width);
+        ray_t* view = ray_vec_slice(parent, 1, 2);
+        TEST_ASSERT_NOT_NULL(view);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+        ray_t* alias = view;
+        ray_retain(alias);
+        /* Source is an aligned SYM slot with the same physical width. */
+        bool wrote = set_slice_owned(&view, 0, ray_vec_get(parent, 0));
+        bool ok = wrote && set_slice_plain(view) && view->type == RAY_SYM && view->len == 2 &&
+            (view->attrs & RAY_SYM_W_MASK) == widths[c] &&
+            ray_sym_vec_domain(view) == domain && (view->attrs & RAY_ATTR_HAS_NULLS) &&
+            !ray_vec_is_null(view, 0) && ray_vec_is_null(alias, 0) &&
+            memcmp(ray_data(parent), snapshot, 3 * width) == 0 &&
+            memcmp(ray_data(alias), snapshot + width, 2 * width) == 0 &&
+            ray_read_sym(ray_data(view), 0, RAY_SYM, view->attrs) == 1 &&
+            ray_read_sym(ray_data(view), 1, RAY_SYM, view->attrs) == 3;
+        /* Also insert canonical null into a fresh tail slice. */
+        ray_t* tail = ray_vec_slice(parent, 2, 1);
+        TEST_ASSERT_NOT_NULL(tail);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tail));
+        bool nulled = set_slice_owned(&tail, 0, ray_vec_get(parent, 1));
+        ok = ok && nulled && set_slice_plain(tail) && ray_vec_is_null(tail, 0) &&
+            (tail->attrs & RAY_SYM_W_MASK) == widths[c] &&
+            ray_sym_vec_domain(tail) == domain &&
+            memcmp(ray_data(parent), snapshot, 3 * width) == 0;
+        ray_release(tail);
+        ray_release(alias);
+        ray_release(parent);
+        ray_sym_domain_release(domain);
+        /* No external domain, parent or old view owner remains. Borrowed
+         * atoms are not released; view alone must keep their domain alive. */
+        ray_t* first = ray_sym_vec_cell(view, 0);
+        ray_t* second = ray_sym_vec_cell(view, 1);
+        ok = ok && first && second && strcmp(ray_str_ptr(first), "alpha") == 0 &&
+            strcmp(ray_str_ptr(second), "gamma") == 0;
+        ray_release(view);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+/* ---- #1035: append/raw/insert must materialize slice payloads ------------ */
+
+/* Slice failures preserve the owner; ordinary controls below avoid any growth
+ * after a successful COW. This does not redefine general growth-failure ownership.
+ * Never inspect a consumed unique header; src may belong to its parent. */
+static bool grow_slice_owned(ray_t** owner, int op, int64_t at,
+                             const void* src, int64_t count) {
+    ray_t* out = op == 0 ? ray_vec_append(*owner, src) : op == 1 ?
+        ray_vec_append_raw(*owner, src, count) : ray_vec_insert_at(*owner, at, src);
+    if (!out) return false;
+    if (RAY_IS_ERR(out)) { ray_error_free(out); return false; }
+    *owner = out;
+    return true;
+}
+
+static bool grow_slice_values(ray_t* v, const int64_t* values, int64_t n) {
+    return v->type == RAY_I64 && v->len == n &&
+        memcmp(ray_data(v), values, (size_t)n * sizeof(*values)) == 0;
+}
+
+static test_result_t test_vec_grow_slice_isolation(void) {
+    const int64_t raw[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const int64_t probes[] = {3, 9}, extra[] = {9, 10, 11};
+    for (int op = 0; op < 3; op++) for (int mode = 0; mode < 3; mode++)
+    for (int at = 0; at <= (op == 2 ? 2 : 0); at++) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 8);
+        TEST_ASSERT_NOT_NULL(parent);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+        parent->attrs |= RAY_ATTR_SORTED;
+        ray_t* attached = ray_index_attach_hash(&parent);
+        bool ok = attached && !RAY_IS_ERR(attached);
+        if (attached && RAY_IS_ERR(attached)) ray_error_free(attached);
+        TEST_ASSERT_TRUE(ok);
+        ray_t* index = parent->index;
+        uint8_t attrs = parent->attrs;
+        ray_t* keys = ray_vec_from_raw(RAY_I64, probes, 2);
+        ray_t* outer = ray_vec_slice(parent, 0, 6);
+        ray_t* view = ray_vec_slice(mode == 2 ? outer : parent, 1, 2);
+        ray_t* overlap = ray_vec_slice(parent, 2, 3);
+        TEST_ASSERT_NOT_NULL(view);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(view));
+        view->attrs |= RAY_ATTR_SORTED;
+        ray_t* alias = mode == 1 ? view : NULL;
+        if (alias) ray_retain(alias);
+        int64_t expected[5] = {2, 3, 9, 10, 11};
+        int64_t n = op == 1 ? 5 : 3;
+        if (op == 2) {
+            for (int i = 0; i < 3; i++)
+                expected[i] = i < at ? raw[i + 1] : i == at ? 9 : raw[i];
+        }
+        bool wrote = grow_slice_owned(&view, op, at, extra, 3);
+        ok = ok && wrote && set_slice_plain(view) && grow_slice_values(view, expected, n) &&
+            grow_slice_values(parent, raw, 8) && grow_slice_values(outer, raw, 6) &&
+            grow_slice_values(overlap, raw + 2, 3) && parent->attrs == attrs &&
+            parent->index == index && ray_index_has(parent);
+        if (alias) ok = ok && grow_slice_values(alias, raw + 1, 2) &&
+            (alias->attrs & RAY_ATTR_SORTED);
+        bool indexed = set_slice_find_keys(parent, keys, 2, NULL_I64);
+        ray_t* dropped = ray_index_drop(&parent);
+        bool drop_ok = dropped && !RAY_IS_ERR(dropped);
+        if (dropped && RAY_IS_ERR(dropped)) ray_error_free(dropped);
+        parent->attrs &= ~RAY_ATTR_SORTED;
+        bool plain = set_slice_find_keys(parent, keys, 2, NULL_I64);
+        ray_release(alias); ray_release(overlap); ray_release(outer); ray_release(parent);
+        ok = ok && grow_slice_values(view, expected, n);
+        ray_release(view); ray_release(keys);
+        TEST_ASSERT_TRUE(ok && indexed && drop_ok && plain);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_grow_slice_backing_source(void) {
+    int64_t raw[256];
+    for (int i = 0; i < 256; i++) raw[i] = i + 100;
+    for (int op = 0; op < 3; op++) for (int outside = 0; outside < 2; outside++)
+    for (int shared = 0; shared < 2; shared++) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 256);
+        ray_t* view = ray_vec_slice(parent, 1, 2);
+        ray_t* alias = shared ? view : NULL;
+        if (alias) ray_retain(alias);
+        int start = outside ? 140 : 1;
+        const void* src = ray_vec_get(parent, start);
+        int64_t expected[130] = {101, 102};
+        int count = op == 1 && outside ? 100 : 1;
+        if (op == 2) { expected[0] = raw[start]; expected[1] = 101; expected[2] = 102; }
+        else memcpy(expected + 2, raw + start, (size_t)count * sizeof(int64_t));
+        /* View is the last parent owner in the unique case. Raw 100 crosses
+         * header allocation slack; its outside source is disjoint even on
+         * baseline, and all baseline destination writes stay in parent. */
+        ray_release(parent);
+        bool wrote = grow_slice_owned(&view, op, 0, src, count);
+        bool ok = wrote && set_slice_plain(view) &&
+            grow_slice_values(view, expected, 2 + count);
+        if (alias) ok = ok && grow_slice_values(alias, raw + 1, 2);
+        ray_release(alias);
+        ok = ok && grow_slice_values(view, expected, 2 + count);
+        ray_release(view);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_grow_slice_zero_raw(void) {
+    const int64_t raw[] = {1, 2, 3};
+    for (int shared = 0; shared < 2; shared++) for (int empty = 0; empty < 2; empty++) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 3);
+        ray_t* view = ray_vec_slice(parent, empty ? 3 : 1, empty ? 0 : 2);
+        if (shared) ray_retain(view);
+        uint32_t rc = ray_atomic_load(&view->rc);
+        uint8_t attrs = view->attrs;
+        ray_t* result = ray_vec_append_raw(view, NULL, 0);
+        bool ok = result == view && ray_atomic_load(&view->rc) == rc &&
+            view->attrs == attrs && view->len == (empty ? 0 : 2) &&
+            grow_slice_values(parent, raw, 3);
+        /* The specified no-op returns a borrowed identical pointer. */
+        if (result && RAY_IS_ERR(result)) ray_error_free(result);
+        else if (result && result != view) ray_release(result);
+        if (shared) ray_release(view);
+        ray_release(view); ray_release(parent);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_grow_slice_hints_controls(void) {
+    const int64_t raw[] = {10, 20, 30}, extra = 40;
+    for (int op = 0; op < 3; op++) for (int hint = 0; hint < 3; hint++)
+    for (int empty = 0; empty < 2; empty++) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 3);
+        if (hint == 1) parent->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* view = hint == 0 ? ray_vec_from_raw(RAY_I64, raw + 1, empty ? 0 : 1) :
+            ray_vec_slice(parent, empty ? 3 : 1, empty ? 0 : 1);
+        if (hint == 2) view->attrs |= RAY_ATTR_HAS_NULLS;
+        /* Hints are conservative, including a parent-only hint added after
+         * view construction. No raw sentinel scan is required by this test. */
+        if (hint == 1) view->attrs &= ~RAY_ATTR_HAS_NULLS;
+        uint8_t attrs = parent->attrs;
+        bool wrote = grow_slice_owned(&view, op, empty ? 0 : 1, &extra, 1);
+        const int64_t expected[] = {20, 40};
+        bool ok = wrote && set_slice_plain(view) && grow_slice_values(view, empty ? expected + 1 : expected, empty ? 1 : 2) &&
+            grow_slice_values(parent, raw, 3) && parent->attrs == attrs &&
+            (!hint || (view->attrs & RAY_ATTR_HAS_NULLS));
+        ray_release(view); ray_release(parent);
+        TEST_ASSERT_TRUE(ok);
+    }
+    /* A fresh scalar result records its inserted sentinel without a scan. */
+    for (int op = 0; op <= 2; op += 2) {
+        ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 3);
+        ray_t* view = ray_vec_slice(parent, 1, 1);
+        const int64_t nil = NULL_I64;
+        bool wrote = grow_slice_owned(&view, op, op == 2 ? 0 : 1, &nil, 1);
+        bool ok = wrote && set_slice_plain(view) && view->len == 2 &&
+            (view->attrs & RAY_ATTR_HAS_NULLS) &&
+            ray_vec_is_null(view, op == 2 ? 0 : 1) &&
+            grow_slice_values(parent, raw, 3);
+        ray_release(view); ray_release(parent);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+static test_result_t test_vec_grow_slice_sym_widths(void) {
+    const uint8_t widths[] = {RAY_SYM_W8, RAY_SYM_W16, RAY_SYM_W32, RAY_SYM_W64};
+    for (size_t w = 0; w < sizeof widths; w++) for (int op = 0; op < 3; op++)
+    for (int null_source = 0; null_source < 2; null_source++) {
+        ray_sym_domain_t* domain = ray_sym_domain_new();
+        TEST_ASSERT_NOT_NULL(domain);
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(domain, "alpha", 5), 1);
+        TEST_ASSERT_EQ_I(ray_sym_domain_intern(domain, "beta", 4), 2);
+        ray_t* parent = ray_sym_vec_new(widths[w], 4);
+        TEST_ASSERT_NOT_NULL(parent);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+        parent->len = 4;
+        parent->sym_domain = domain;
+        ray_sym_domain_retain(domain);
+        const uint64_t ids[] = {1, 2, 1, 0};
+        for (int i = 0; i < 4; i++)
+            ray_write_sym(ray_data(parent), i, ids[i], RAY_SYM, parent->attrs);
+        size_t width = RAY_SYM_ELEM(parent->attrs);
+        uint8_t snapshot[32];
+        memcpy(snapshot, ray_data(parent), 4 * width);
+        ray_t* view = ray_vec_slice(parent, 1, 1);
+        ray_t* alias = view;
+        ray_retain(alias);
+        /* Raw callers, not append_raw, propagate source sentinel hints. */
+        if (op == 1 && null_source) view->attrs |= RAY_ATTR_HAS_NULLS;
+        const void* src = ray_vec_get(parent, null_source ? 3 : 0);
+        bool wrote = grow_slice_owned(&view, op, 0, src, 1);
+        int64_t expected[] = {2, null_source ? 0 : 1};
+        if (op == 2) { expected[1] = 2; expected[0] = null_source ? 0 : 1; }
+        bool ok = wrote && set_slice_plain(view) && view->type == RAY_SYM && view->len == 2 &&
+            (view->attrs & RAY_SYM_W_MASK) == widths[w] && ray_sym_vec_domain(view) == domain &&
+            ray_read_sym(ray_data(view), 0, RAY_SYM, view->attrs) == expected[0] &&
+            ray_read_sym(ray_data(view), 1, RAY_SYM, view->attrs) == expected[1] &&
+            (!null_source || ((view->attrs & RAY_ATTR_HAS_NULLS) &&
+                ray_vec_is_null(view, op == 2 ? 0 : 1))) &&
+            memcmp(ray_data(parent), snapshot, 4 * width) == 0 &&
+            alias->len == 1 && ray_read_sym(ray_data(alias), 0, RAY_SYM, alias->attrs) == 2;
+        ray_release(alias); ray_release(parent); ray_sym_domain_release(domain);
+        /* No external dictionary reference: detached result alone owns it. */
+        ray_t* cell = ray_sym_vec_cell(view, op == 2 ? 1 : 0);
+        ok = ok && cell && strcmp(ray_str_ptr(cell), "beta") == 0;
+        if (!null_source) {
+            cell = ray_sym_vec_cell(view, op == 2 ? 0 : 1);
+            ok = ok && cell && strcmp(ray_str_ptr(cell), "alpha") == 0;
+        }
+        ray_release(view);
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+/* Header-reuse equivalence, not a guarantee about arena payload lifetimes. */
+static test_result_t test_vec_grow_ordinary_cow_modes(void) {
+    bool saved_sync = ray_rc_sync;
+    const int64_t raw[] = {1, 2}, appended[] = {1, 2, 9}, inserted[] = {1, 9, 2};
+    const int64_t extra = 9;
+    for (int sync = 0; sync < 2; sync++) for (int shared = 0; shared < 2; shared++)
+    for (int op = 0; op < 3; op++) {
+        ray_rc_sync = sync != 0;
+        ray_t* v = ray_vec_from_raw(RAY_I64, raw, 2);
+        bool ok = v && !RAY_IS_ERR(v);
+        if (!ok) {
+            if (v && RAY_IS_ERR(v)) ray_error_free(v);
+            ray_rc_sync = saved_sync;
+            TEST_ASSERT_TRUE(ok);
+        }
+        v->attrs |= RAY_ATTR_SORTED;
+        ray_t* status = ray_index_attach_hash(&v);
+        ok = status && !RAY_IS_ERR(status);
+        if (status && RAY_IS_ERR(status)) ray_error_free(status);
+        ray_t* alias = shared ? v : NULL;
+        if (alias) ray_retain(alias);
+        uintptr_t old_address = (uintptr_t)v, index_address = (uintptr_t)v->index;
+        uint8_t attrs = v->attrs;
+        /* len2 fits the original and copied block with one added cell, so a
+         * successful shared COW cannot be followed by a second growth failure. */
+        bool wrote = ok && grow_slice_owned(&v, op, 1, &extra, 1);
+        ok = wrote && grow_slice_values(v, op == 2 ? inserted : appended, 3) &&
+            set_slice_plain(v) && v->rc == 1 &&
+            ((uintptr_t)v == old_address) == !shared;
+        if (alias) ok = ok && alias->rc == 1 && grow_slice_values(alias, raw, 2) &&
+            alias->attrs == attrs && (uintptr_t)alias->index == index_address;
+        ray_release(alias); ray_release(v);
+        ray_t arena_header = {0};
+        arena_header.type = RAY_I64; arena_header.attrs = RAY_ATTR_ARENA;
+        ok = ok && ray_cow_can_reuse_header(&arena_header) &&
+            ray_cow(&arena_header) == &arena_header;
+        ray_rc_sync = saved_sync;
+        TEST_ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
 const test_entry_t vec_entries[] = {
+    { "vec/grow_ordinary_cow_modes", test_vec_grow_ordinary_cow_modes, vec_setup, vec_teardown },
+    { "vec/grow_slice_isolation", test_vec_grow_slice_isolation, vec_setup, vec_teardown },
+    { "vec/grow_slice_backing_source", test_vec_grow_slice_backing_source, vec_setup, vec_teardown },
+    { "vec/grow_slice_zero_raw", test_vec_grow_slice_zero_raw, vec_setup, vec_teardown },
+    { "vec/grow_slice_hints_controls", test_vec_grow_slice_hints_controls, vec_setup, vec_teardown },
+    { "vec/grow_slice_sym_widths", test_vec_grow_slice_sym_widths, set_slice_sym_setup, set_slice_sym_teardown },
+
+    { "vec/set_slice_isolation", test_vec_set_slice_isolation, vec_setup, vec_teardown },
+    { "vec/set_slice_backing_elem", test_vec_set_slice_backing_elem, vec_setup, vec_teardown },
+    { "vec/set_slice_primitive_nulls", test_vec_set_slice_primitive_nulls, vec_setup, vec_teardown },
+    { "vec/set_slice_sym_widths", test_vec_set_slice_sym_widths, set_slice_sym_setup, set_slice_sym_teardown },
     { "vec/growth_list_refs", test_vec_growth_list_refs, vec_setup, vec_teardown },
     { "vec/growth_str_refs", test_vec_growth_str_refs, vec_setup, vec_teardown },
     { "vec/growth_raw_widths", test_vec_growth_raw_widths, vec_setup, vec_teardown },

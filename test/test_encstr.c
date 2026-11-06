@@ -789,10 +789,9 @@ static test_result_t test_dict_equals_gen0(void) {
  * and from an encoded passenger source (a generation-2 store resaved): UNIQUE
  * known before materialization (header), .attr.get equal to the source's
  * after it.  A generation-0 passenger source (the generation-0 store
- * resaved): DICT, and UNIQUE as generation 0 keeps it, which is not at all
- * for STR (the generation-0 save drops a STR column's marker-only UNIQUE, a
- * pre-existing dev behaviour, #864): .attr.get equal to
- * generation 0's.  A short column (< 65536 rows) answers no index without
+ * resaved) also retains UNIQUE: the generation-0 STR save now persists a
+ * marker-only UNIQUE index, so the resaved DICT and .attr.get match the
+ * generation-0 source.  A short column (< 65536 rows) answers no index without
  * decoding. */
 static test_result_t test_dict_variants(void) {
     /* low cardinality, long strings: every chunk is a STR_DICT chunk */
@@ -817,7 +816,7 @@ static test_result_t test_dict_variants(void) {
     static const struct { const char* dir; bool unique; const char* ref; } vs[3] = {
         { "/u2", true,  "U" },
         { "/uq", true,  "U" },
-        { "/up", false, "(at (.db.splayed.get \"" ST_TMP "/u0/\") 's)" },
+        { "/up", true,  "(at (.db.splayed.get \"" ST_TMP "/u0/\") 's)" },
     };
     for (int d = 0; d < 3; d++) {
         char fl[600]; TEST_ASSERT_TRUE(st_live(vs[d].dir, "s", fl, sizeof fl));

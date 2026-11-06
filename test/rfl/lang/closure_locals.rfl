@@ -60,7 +60,8 @@
 ;; more captures than a frame has slots: the closure stays on the tree walker
 ;; and still sees every capture, never a global of the same name
 (set a299 -1)
-(set src (raze (concat (concat (enlist "(fn [] ") (map (fn [i] (concat (concat "(let a" (format "%" i)) (concat (concat " " (format "%" i)) ") "))) (til 300))) (enlist "(fn [] (+ a0 a299)))"))))
+;; Raze joins a list of string fragments; a STR vector itself is unchanged.
+(set src (raze (concat (concat (enlist "(fn [] ") (concat (list) (map (fn [i] (concat (concat "(let a" (format "%" i)) (concat (concat " " (format "%" i)) ") "))) (til 300)))) (enlist "(fn [] (+ a0 a299)))"))))
 (set big (eval (parse src)))
 (set bc (big))
 (bc) -- 299
@@ -104,9 +105,9 @@
 (set mk10 (fn [a b c d e f g h i j] (fn [n] (if (== n 0) j (+ 1 (self (- n 1)))))))
 (set f10 (mk10 1 2 3 4 5 6 7 8 9 10))
 (f10 100) -- 110
-(set src50 (raze (list "(fn [" (raze (map (fn [i] (format "a% " i)) (til 50))) "] (fn [n] (if (== n 0) a49 (+ 1 (self (- n 1))))))")))
+(set src50 (raze (list "(fn [" (raze (concat (list) (map (fn [i] (format "a% " i)) (til 50)))) "] (fn [n] (if (== n 0) a49 (+ 1 (self (- n 1))))))")))
 (set mk50 (eval (parse src50)))
-(set f50 (eval (parse (raze (list "(mk50 " (raze (map (fn [i] (format "% " i)) (til 50))) ")")))))
+(set f50 (eval (parse (raze (list "(mk50 " (raze (concat (list) (map (fn [i] (format "% " i)) (til 50)))) ")")))))
 (f50 100) -- 149
 ;; a lazy value is materialized when captured, so the closure can run twice
 (set c1 ((fn [v] (fn [] (at v 0))) (asc [3 1 2])))

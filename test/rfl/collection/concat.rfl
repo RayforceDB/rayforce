@@ -37,6 +37,16 @@
 (concat 't' "est\000") -- "test"
 (concat "tes\000" 't') -- "test"
 (concat "te\000" "st\000") -- "test"
+;; String concatenation can grow beyond the small stack-buffer threshold.
+(set LONG_8191 (str-join (map (fn [i] "a") (til 8191)) ""))
+(set LONG_8192 (concat LONG_8191 "x"))
+(count LONG_8192) -- 8192
+(count (concat LONG_8192 "y")) -- 8193
+(== (concat LONG_8192 "y") (str-join (list LONG_8192 "y") "")) -- true
+(count (concat (concat LONG_8192 "y") "z")) -- 8194
+(set LONG_5000 (str-join (map (fn [i] "a") (til 5000)) ""))
+(count (concat LONG_5000 LONG_5000)) -- 10000
+(== (concat LONG_5000 LONG_5000) (str-join (list LONG_5000 LONG_5000) "")) -- true
 (concat 1h 2h) -- [1h 2h]
 (concat [1h] 2h) -- [1h 2h]
 (concat 1h [2h]) -- [1h 2h]

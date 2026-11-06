@@ -1,0 +1,21 @@
+;; #987: runtime special-form/eval windows must not alias nested loop state.
+((fn [] (let outer 0) (let inner 0) (times [k 8] (let outer (+ outer 1)) (times [j 5] (let inner (+ inner 1)) (let a [1 2]) (if (not (all (or (nil? a) (== a a)))) (raise "unexpected")))) (list outer inner k j))) -- (list 8 40 7 4)
+((fn [] (let n 0) (times 8 (times 5 (let n (+ n 1)) (let a [1 2]) (all (or (nil? a) (== a a))))) n)) -- 40
+((fn [] (let n 0) (times [k 8] (times [j 5] (let n (+ n 1)) (let a [1 2]) (all (and (not (nil? a)) (== a a))))) n)) -- 40
+;; Explicit eval uses the same bridge, independently of vector boolean logic.
+((fn [] (let n 0) (times [k 8] (times [j 5] (let n (+ n 1)) (let a [1 2]) (eval "(all (== a a))"))) n)) -- 40
+;; Real user locals rebound by dynamic forms must STILL sync back to bytecode.
+((fn [] (let n 0) (times [k 8] (times [j 5] (or (let n (+ n 1)) false))) n)) -- 40
+;; Reuse the same compiled lambda, not just fresh compilation on every call.
+(set F987 (fn [] (let n 0) (times [k 8] (times [j 5] (let n (+ n 1)) (let a [1 2]) (all (or (nil? a) (== a a))))) n))
+(F987) -- 40
+(F987) -- 40
+;; A determining scalar still crosses the same local-reference window.
+((fn [] (let n 0) (times [k 8] (times [j 5] (let n (+ n 1)) (let a [1 2]) (or true (== a a)))) n)) -- 40
+;; Pin every index pair, not only totals and the final pair.
+((fn [] (let out (list)) (times [k 8] (times [j 5] (let a [1 2]) (if (not (all (or (nil? a) (== a a)))) (raise "unexpected")) (let out (concat out (+ (* k 10) j))))) out)) -- [0 1 2 3 4 10 11 12 13 14 20 21 22 23 24 30 31 32 33 34 40 41 42 43 44 50 51 52 53 54 60 61 62 63 64 70 71 72 73 74]
+;; The completed inner loop's stale spill must not overwrite a live outer one.
+;; Bound the counterfactual so a broken loop becomes an error, not a test hang.
+((fn [] (let n 0) (times [k 3] (times [j 2] 0) (let n (+ n 1)) (if (> n 4) (raise "bounded runaway")) (let a [1 2]) (or (== a a) false)) n)) -- 3
+;; A caught payload lives in another anonymous slot while the handler compiles.
+((fn [] (let acc 0) (times [k 3] (let a [1 2]) (let got (try (raise 17) (if (all (or (nil? a) (== a a))) (fn [e] e) (fn [e] -1)))) (let acc (+ acc got))) acc)) -- 51

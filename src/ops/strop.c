@@ -482,8 +482,10 @@ ray_t* ray_replace_fn(ray_t** args, int64_t n) {
     return ray_lazy_wrap(g, op);
 }
 
+typedef struct { const char* p; size_t n; } str_needle_t;
+
 static int64_t str_find_index(const char* hay, size_t hay_len,
-                              const ray_strpat_t* pattern,
+                              const str_needle_t* pattern,
                               ray_pool_t* pool, bool* cancelled) {
     if (cancelled) *cancelled = false;
     if (pool_cancelled(pool)) {
@@ -491,8 +493,8 @@ static int64_t str_find_index(const char* hay, size_t hay_len,
         return NULL_I64;
     }
     size_t pos = 0;
-    return ray_strpat_find(pattern, hay, hay_len, &pos) ? (int64_t)pos
-                                                       : NULL_I64;
+    return ray_str_find_literal(hay, hay_len, pattern->p, pattern->n, &pos)
+               ? (int64_t)pos : NULL_I64;
 }
 
 static bool str_vec_cell_bytes(ray_t* x, int64_t row,
@@ -518,35 +520,52 @@ static bool str_vec_cell_bytes(ray_t* x, int64_t row,
 
 typedef struct {
     ray_t* hay;
-    const ray_strpat_t* pattern;
+    const str_needle_t* pattern;
     int64_t* out;
     ray_pool_t* pool;
     _Atomic(int) any_null;
+    /* a SYM haystack of the global table: its atoms are read in blocks,
+     * under one lock per block instead of one per cell against every
+     * other worker */
+    bool sym_runtime;
 } str_find_vec_ctx_t;
 
+#define STR_FIND_BLOCK 256
 static void str_find_vec_task(void* vctx, uint32_t worker_id,
                               int64_t lo, int64_t hi) {
     (void)worker_id;
     str_find_vec_ctx_t* c = (str_find_vec_ctx_t*)vctx;
     bool any_null = false;
-    for (int64_t i = lo; i < hi; i++) {
-        if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 &&
-            pool_cancelled(c->pool))
-            return;
-        const char* hp = "";
-        size_t hl = 0;
-        str_vec_cell_bytes(c->hay, i, &hp, &hl);
-        bool cancelled = false;
-        int64_t idx = str_find_index(hp, hl, c->pattern, c->pool, &cancelled);
-        if (cancelled) return;
-        c->out[i] = idx;
-        if (idx == NULL_I64) any_null = true;
+    int64_t ids[STR_FIND_BLOCK];
+    ray_t* atoms[STR_FIND_BLOCK];
+    for (int64_t b = lo; b < hi; b += STR_FIND_BLOCK) {
+        if (pool_cancelled(c->pool)) return;
+        int n = (int)(hi - b < STR_FIND_BLOCK ? hi - b : STR_FIND_BLOCK);
+        if (c->sym_runtime) {
+            for (int j = 0; j < n; j++)
+                ids[j] = ray_read_sym(ray_data(c->hay), b + j, RAY_SYM, c->hay->attrs);
+            ray_sym_str_batch(ids, n, atoms);
+        }
+        for (int j = 0; j < n; j++) {
+            const char* hp = "";
+            size_t hl = 0;
+            if (c->sym_runtime) {
+                if (atoms[j]) { hp = ray_str_ptr(atoms[j]); hl = ray_str_len(atoms[j]); }
+            } else {
+                str_vec_cell_bytes(c->hay, b + j, &hp, &hl);
+            }
+            bool cancelled = false;
+            int64_t idx = str_find_index(hp, hl, c->pattern, c->pool, &cancelled);
+            if (cancelled) return;
+            c->out[b + j] = idx;
+            if (idx == NULL_I64) any_null = true;
+        }
     }
     if (any_null)
         atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
 }
 
-static ray_t* str_find_vec(ray_t* hay, const ray_strpat_t* pattern) {
+static ray_t* str_find_vec(ray_t* hay, const str_needle_t* pattern) {
     int64_t n = hay->len;
     ray_t* out = ray_vec_new(RAY_I64, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -558,7 +577,9 @@ static ray_t* str_find_vec(ray_t* hay, const ray_strpat_t* pattern) {
         .hay = hay,
         .pattern = pattern,
         .out = dst,
-        .pool = pool
+        .pool = pool,
+        .sym_runtime = hay->type == RAY_SYM &&
+                       ray_sym_vec_domain(hay) == ray_sym_runtime_domain()
     };
     atomic_init(&ctx.any_null, 0);
 
@@ -586,9 +607,7 @@ ray_t* ray_str_find_fn(ray_t* hay, ray_t* pattern) {
     size_t nl = 0;
     if (!str_atom_arg(pattern, &np, &nl))
         return ray_error("type", "str-find: pattern must be string or symbol atom");
-    ray_strpat_t search;
-    if (!ray_strpat_compile(np, nl, &search))
-        return ray_error("domain", "str-find: '*' is not supported in search patterns");
+    str_needle_t search = { np, nl };
 
     if (ray_is_lazy(hay)) {
         ray_t* perr = ray_lazy_promote(hay);            /* a column reference becomes its scan */

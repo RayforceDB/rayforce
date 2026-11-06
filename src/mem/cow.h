@@ -41,6 +41,15 @@
  * The thread pool sets true before parallel dispatch. */
 extern RAY_TLS bool ray_rc_sync;
 
+/* Whether ray_cow may reuse a valid, non-NULL, non-error HEADER. Arena
+ * headers follow their existing non-refcounted policy. A unique slice header
+ * does NOT establish writable backing data; mutators must detach views first. */
+RAY_INLINE bool ray_cow_can_reuse_header(ray_t* v) {
+    if (v->attrs & RAY_ATTR_ARENA) return true;
+    uint32_t rc = RAY_LIKELY(!ray_rc_sync) ? v->rc : ray_atomic_load(&v->rc);
+    return rc == 1;
+}
+
 #ifdef DEBUG
 /* Debug stale-pointer detector — see src/mem/heap.c (issue #240). */
 void ray_dfd_check_live(const void* p, const char* who);

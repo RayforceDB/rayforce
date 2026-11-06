@@ -176,6 +176,11 @@ ray_err_t ray_mkdir_p(const char* path) {
     return RAY_OK;
 }
 
+ray_fd_t ray_file_open_mem(char* path, size_t cap) {
+    (void)path; (void)cap;
+    return RAY_FD_INVALID;
+}
+
 #else
 
 /* ===== POSIX implementation ===== */
@@ -332,6 +337,26 @@ ray_err_t ray_mkdir_p(const char* path) {
     }
     if (mkdir(buf, 0755) != 0 && errno != EEXIST) return RAY_ERR_IO;
     return RAY_OK;
+}
+
+ray_fd_t ray_file_open_mem(char* path, size_t cap) {
+#if defined(RAY_OS_LINUX) && defined(SYS_memfd_create)
+    /* Through syscall(): the memfd_create wrapper came in glibc 2.27.
+     * Not executable, which kernels from 6.3 ask to be said (and may
+     * require); older ones reject the flag. */
+    int fd = (int)syscall(SYS_memfd_create, "rayforce", 1u | 8u /* MFD_CLOEXEC | MFD_NOEXEC_SEAL */);
+    if (fd < 0 && errno == EINVAL) fd = (int)syscall(SYS_memfd_create, "rayforce", 1u /* MFD_CLOEXEC */);
+    if (fd < 0) return RAY_FD_INVALID;
+    /* the callers reopen it by this path (a /proc without it: none) */
+    int n = snprintf(path, cap, "/proc/self/fd/%d", fd);
+    int again = n > 0 && (size_t)n < cap ? open(path, O_RDWR) : -1;
+    if (again < 0) { close(fd); return RAY_FD_INVALID; }
+    close(again);
+    return fd;
+#else
+    (void)path; (void)cap;
+    return RAY_FD_INVALID;
+#endif
 }
 
 #endif

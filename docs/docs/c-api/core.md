@@ -1,7 +1,9 @@
 # Core C API Reference
 
-!!! note "Headers"
+!!! note "Headers and include paths"
     Include `<rayforce.h>` for the bulk of the public API. A few internal helpers documented here live in their own headers — in particular `ray_cow` and the `ray_heap_init` / `ray_heap_destroy` lifecycle calls are declared in `"mem/heap.h"`, not in `<rayforce.h>`. The Makefile builds the static archive `librayforce.a`; it does not provide a shared-library target. On Linux, link the archive with `-Wl,--gc-sections -lm -lpthread` so the linker can discard unused function and data sections.
+
+    Building against a source checkout uses two include roots, `cc -Iinclude -Isrc ...`. Building against a staged install (`make install-headers`) uses the staged pair instead: `cc -Iinstall/include -Iinstall/include/rayforce/src ...` - the quoted, `src/`-relative includes of `ops.h`, `parquet.h` and `heap.h` do not resolve from a flat directory. The target fails loudly on a failed copy, so a successful run leaves a complete staged tree. Staging is a convenience, not an SDK contract: it promises the header contents at the commit that staged them, no ABI stability and no API stability, so stage from the same engine revision you built the archive against.
 
 ## Floating-point environment for compressed columns
 
@@ -127,26 +129,50 @@ ray_t* col = ray_vec_new(RAY_I64, 1000000);
 caml_alloc_custom_mem(&ops, sizeof(ray_t*), ray_shallow_bytes(col));  /* OCaml: charge the GC */
 ```
 
+### ray_heap_set_anon_watermark / ray_heap_anon_watermark / ray_heap_anon_peak
+
+The spill threshold the engine's `-m SIZE` sets, for a program that embeds the library. The heap counts the anonymous memory it maps itself: pools, direct blocks and sys blocks. A new pool, direct block or large sys block that would push the count past the anon watermark is backed by a spill file (under `RAY_HEAP_SWAP`, else `TMPDIR`) instead; where no spill file can be made it stays in anonymous RAM rather than fail. It is a threshold the engine manages, not a cap on the process's RAM nor a guarantee against the OOM killer: mapped inputs and the page cache, and what the host allocates itself, are outside the count (see [Memory](../guides/memory.md)). The default is `ray_sys_ram_limit()` — physical RAM, or a smaller container/cgroup limit — less a quarter of it, at least 3 GiB and at most half, left to the page cache.
+
+```c
+void    ray_heap_set_anon_watermark(int64_t bytes);  /* 0 restores the default */
+int64_t ray_heap_anon_watermark(void);               /* the threshold in force */
+int64_t ray_heap_anon_peak(void);                    /* peak of the heap's anonymous mappings */
+```
+
+`ray_heap_anon_watermark` resolves 0 to the default. `ray_heap_anon_peak` is the high-water mark, since process start, of the anonymous mappings the heap tracks, counted at their mapped size, spill excluded. It is not the process's RSS, nor all the RAM the embedding process uses. They are what `.sys.mem` reports as `anon-watermark` and `anon-peak`.
+
+On Linux the heap also locks the anonymous memory it maps under the watermark against swap-out, a page at a time as it is faulted in (`MLOCK_ONFAULT`), and best effort. The smaller of the watermark and half the RAM limit is the budget for new locks: a mapping that would take the locked bytes past it is left unlocked. Setting the watermark lower unlocks nothing at once: pools and cached blocks are unlocked later, as the heap trims them, and live large blocks stay locked until they are freed, so the locked bytes can stay above the new bound for a while. An embedding keeps its host's `RLIMIT_MEMLOCK`, and what does not fit stays unlocked (see [Memory](../guides/memory.md#8-total-ram-and-out-of-core-spill)); `RAY_HEAP_MLOCK=0` turns locking off.
+
+```c
+ray_heap_set_anon_watermark(INT64_C(6) << 30);   /* as -m 6G */
+```
+
 ### ray_cow
 
-Copy-on-write: if `v` is the sole owner (`rc == 1`), returns `v` unchanged. Otherwise, creates a deep copy and returns it with `rc = 1`. The original is not modified. After `ray_cow()`, if the returned pointer differs from the original, the caller must release it on error paths.
+For a valid non-arena heap value, reuses a sole-owner header (`rc == 1`); otherwise copies its allocation and returns a header with `rc = 1`. A successful copy consumes one input reference; other owners retain the original. If allocation fails, the input reference remains owned by the caller. Arena headers retain their existing special lifetime policy.
+
+This is not a recursive deep copy. In particular, copying a slice header retains its backing parent rather than materializing independent writable data. Header uniqueness alone does not authorize mutation through a backing pointer.
 
 ```c
 ray_t* ray_cow(ray_t* v);
 ```
 
-#### COW pattern
+#### COW ownership pattern
 
 ```c
-ray_t* original = ray_vec_new(RAY_I64, 100);
-ray_retain(original);  /* rc = 2: shared */
-
-ray_t* writable = ray_cow(original);
-/* writable != original (copy was made because rc > 1) */
-/* Now safe to mutate writable without affecting original */
-
-/* On error paths, release the copy: */
-if (writable != original) ray_release(writable);
+/* v is an owned, valid non-arena, non-slice vector. */
+ray_t* alias = ray_retain(v);
+ray_t* writable = ray_cow(v);
+if (!writable || RAY_IS_ERR(writable)) {
+    if (writable && RAY_IS_ERR(writable)) ray_error_free(writable);
+    ray_release(v);       /* failed COW did not consume this reference */
+    ray_release(alias);
+    return;
+}
+/* COW consumed v's input reference; alias still owns the old value. */
+/* Use the appropriate mutator for writable, then release each owner once. */
+ray_release(writable);
+ray_release(alias);
 ```
 
 ## Atom Constructors
@@ -276,8 +302,18 @@ Appends a single element to the end of the vector. The `elem` pointer must point
 ray_t* ray_vec_append(ray_t* vec, const void* elem);
 
 int64_t val = 42;
-v = ray_vec_append(v, &val);  /* always reassign! */
+ray_t* result = ray_vec_append(v, &val);
+/* Check for NULL/error; on success, result replaces the owned input. */
 ```
+
+For a supported non-STR slice, append, raw append and single-element insertion construct an independent result from the visible range. The parent, other views and their indexes/attributes remain unchanged; SYM width and domain are preserved. The source pointer may refer into the old backing allocation: the slice keeps that allocation alive until all copies finish.
+
+```c
+ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count);
+ray_t* ray_vec_insert_at(ray_t* vec, int64_t idx, const void* elem);
+```
+
+A successful slice operation consumes one input reference. If slice-result allocation fails, the caller still owns the original input: keep its pointer until success, and free any returned owned error with `ray_error_free`. This slice-specific preservation does not redefine ordinary vector growth-failure ownership. Raw append of zero elements remains an identity/no-op and permits a NULL source; raw callers remain responsible for their existing null-hint obligations.
 
 ### ray_vec_set
 
@@ -286,6 +322,8 @@ Sets the element at index `idx`. The index must be in range `[0, len)`. Uses COW
 ```c
 ray_t* ray_vec_set(ray_t* vec, int64_t idx, const void* elem);
 ```
+
+For a supported non-STR slice, this copies only the visible range into an independent vector, even if the slice header is unique. The parent and other views remain unchanged. Successful mutation consumes one input reference; if detachment allocation fails, the original input reference remains owned by the caller. Keep the original pointer until a successful return.
 
 ### ray_vec_get
 
@@ -300,7 +338,7 @@ if (p) printf("%lld\n", *p);
 
 ### ray_vec_slice
 
-Creates a zero-copy slice referencing the original vector's data from `offset` to `offset + len`. The slice retains the parent (incrementing its `rc`), so the parent must not be freed while the slice exists. Mutations require COW.
+Creates a zero-copy slice referencing the original vector's data from `offset` to `offset + len`. The slice retains the parent (incrementing its `rc`); the caller may release its own parent reference while the slice exists. Mutations require COW. A direct `ray_cow` copies a slice header, not its backing payload; use the supported slice-aware `ray_vec_set`, `ray_vec_append`, `ray_vec_append_raw` or `ray_vec_insert_at` operations rather than treating that header copy as independent writable data.
 
 ```c
 ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len);
