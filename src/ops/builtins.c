@@ -2595,6 +2595,11 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n) {
             for (int64_t i = 0; i < n; i++) d[i] = args[i]->f64;
             break;
         }
+        case RAY_F32: {
+            float* d = (float*)ray_data(vec);
+            for (int64_t i = 0; i < n; i++) d[i] = (float)args[i]->f64;
+            break;
+        }
         case RAY_I32: case RAY_DATE: case RAY_TIME: {
             int32_t* d = (int32_t*)ray_data(vec);
             for (int64_t i = 0; i < n; i++) d[i] = args[i]->i32;

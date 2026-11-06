@@ -56,7 +56,7 @@ static const struct {
     { RAY_I16, { RAY_I64, RAY_I64, RAY_F64, RAY_I16, RAY_I16, RAY_I16, RAY_I16, RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_I32, { RAY_I64, RAY_I64, RAY_F64, RAY_I32, RAY_I32, RAY_I32, RAY_I32, RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_I64, { RAY_I64, RAY_I64, RAY_F64, RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
-    { RAY_F32, { RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
+    { RAY_F32, { RAY_I64, RAY_F64, RAY_F64, RAY_F32, RAY_F32, RAY_F32, RAY_F32, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_F64, { RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_DATE, { RAY_I64, 0, RAY_F64, RAY_DATE, RAY_DATE, RAY_DATE, RAY_DATE, 0, RAY_F64, RAY_F64, RAY_F64, RAY_F64, 0, 0, RAY_F64 } },
     { RAY_TIME, { RAY_I64, RAY_TIME, RAY_F64, RAY_TIME, RAY_TIME, RAY_TIME, RAY_TIME, 0, RAY_F64, RAY_F64, RAY_F64, RAY_F64, 0, 0, RAY_F64 } },
@@ -150,6 +150,35 @@ static test_result_t test_unary_contracts(void) {
             }
             ray_release(got);
         }
+    }
+    PASS();
+}
+
+/* F32 extrema keep their width through every grouped execution family, not
+ * only the default v2 route.  Routes 1 and 2 force the legacy direct-array
+ * and hash/radix ladders used by mapped, selected, and fallback queries. */
+static test_result_t test_f32_extrema_routes(void) {
+    ray_t* init = ray_eval_str(
+        "(set f32rt (table [g x] (list [0 0 1 1] (as 'F32 [2.5 0Nf -3.5 4.5]))))");
+    TEST_ASSERT_NOT_NULL(init); TEST_ASSERT_FALSE(RAY_IS_ERR(init)); ray_release(init);
+    const float expected[][2] = {{2.5f, -3.5f}, {2.5f, 4.5f},
+                                 {2.5f, -3.5f}, {2.5f, 4.5f}};
+    for (int route = 0; route <= 2; route++) {
+        ray_group_test_route(route);
+        ray_t* got = ray_eval_str(
+            "(select {mn:(min x) mx:(max x) f:(first x) l:(last x) "
+            "from:f32rt by:g asc:g})");
+        ray_group_test_route(0);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "F32 grouped route %d failed", route);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got), 2);
+        for (int c = 0; c < 4; c++) {
+            ray_t* col = ray_table_get_col_idx(got, c + 1);
+            TEST_ASSERT_FMT(col && col->type == RAY_F32,
+                            "F32 grouped route %d column %d type", route, c);
+            const float* d = ray_data(col);
+            TEST_ASSERT_TRUE(d[0] == expected[c][0] && d[1] == expected[c][1]);
+        }
+        ray_release(got);
     }
     PASS();
 }
@@ -926,9 +955,11 @@ static test_result_t test_dense_strategies(void) {
                     } else {
                         for (int a = 0; a < 2; a++) {
                             ray_t* col = ray_table_get_col_idx(out, a + 1);
-                            TEST_ASSERT_EQ_I(col->type, type == RAY_F32 ? RAY_F64 : type);
+                            TEST_ASSERT_EQ_I(col->type, type);
                             if (floating) {
-                                double got = ((double*)ray_data(col))[row];
+                                double got = type == RAY_F32
+                                    ? ((float*)ray_data(col))[row]
+                                    : ((double*)ray_data(col))[row];
                                 TEST_ASSERT_TRUE(mn[index] == INT64_MAX ? isnan(got) : got == (a ? mx[index] : mn[index]));
                                 continue;
                             }
@@ -4702,6 +4733,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
+    { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },

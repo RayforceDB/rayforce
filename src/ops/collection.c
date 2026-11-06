@@ -4273,7 +4273,7 @@ static int8_t ts_running_out_type(uint16_t opcode, int8_t t) {
             return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
         case OP_MINS:
         case OP_MAXS:
-            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t;
+            return t;
         default:
             return RAY_I64;
     }
@@ -4400,12 +4400,14 @@ static void ts_run_write(ray_t* out, int64_t row, const ts_run_state_t* s,
             return;
         case OP_MINS:
             if (!s->seen) { ray_vec_set_null(out, row, true); return; }
-            if (is_float) ((double*)d)[row] = ray_f64_fin(s->min_f);
+            if (out->type == RAY_F32) ((float*)d)[row] = isfinite(s->min_f) ? (float)s->min_f : NULL_F32;
+            else if (is_float) ((double*)d)[row] = ray_f64_fin(s->min_f);
             else write_col_i64(d, row, s->min_i, out->type, out->attrs);
             return;
         case OP_MAXS:
             if (!s->seen) { ray_vec_set_null(out, row, true); return; }
-            if (is_float) ((double*)d)[row] = ray_f64_fin(s->max_f);
+            if (out->type == RAY_F32) ((float*)d)[row] = isfinite(s->max_f) ? (float)s->max_f : NULL_F32;
+            else if (is_float) ((double*)d)[row] = ray_f64_fin(s->max_f);
             else write_col_i64(d, row, s->max_i, out->type, out->attrs);
             return;
     }
@@ -4663,7 +4665,7 @@ static int8_t ts_moving_out_type(uint16_t opcode, int8_t t) {
             return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
         case OP_MMIN:
         case OP_MMAX:
-            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t;
+            return t;
         default:
             return RAY_I64;
     }
@@ -4916,7 +4918,8 @@ static bool ts_mminmax_better(ts_mminmax_ctx_t* c, int64_t a, int64_t b) {
 
 static void ts_mminmax_write(ts_mminmax_ctx_t* c, int64_t out_row, int64_t src_row) {
     void* out = ray_data(c->dst);
-    if (c->is_float) ((double*)out)[out_row] = ray_f64_fin(ts_read_as_f64(c->src, src_row));
+    if (c->src->type == RAY_F32) ((float*)out)[out_row] = ((const float*)ray_data(c->src))[src_row];
+    else if (c->is_float) ((double*)out)[out_row] = ray_f64_fin(ts_read_as_f64(c->src, src_row));
     else write_col_i64(out, out_row, ts_read_as_i64(c->src, src_row), c->dst->type, c->dst->attrs);
 }
 

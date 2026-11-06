@@ -2738,9 +2738,11 @@ static test_result_t test_reduce_scan_ops(void) {
         "(count (at T 'd))", "(sum (at T 'e))", "(avg (at T 'e))", "(min (at T 'e))", "(max (at T 'e))",
         "(first (at T 'e))", "(last (at T 'e))", "(prod (at T 'e))", "(any (at T 'e))", NULL };
     for (int i = 0; q0[i]; i++) SR_SAME(q0[i], 0);
-    /* F32: the answers' types are the vector builtins' (F64 for every one) */
+    /* F32: additive reductions widen, while extrema and endpoints preserve
+     * the input type, through both the generation-0 and generation-2 paths. */
     static const char* const qf[] = { "(sum (at T 'e))", "(avg (at T 'e))", "(min (at T 'e))", "(max (at T 'e))",
                                       "(first (at T 'e))", "(last (at T 'e))", NULL };
+    static const int8_t qf_ty[] = { -RAY_F64, -RAY_F64, -RAY_F32, -RAY_F32, -RAY_F32, -RAY_F32 };
     for (int i = 0; qf[i]; i++) {
         int8_t ty[2];
         for (int gen = 0; gen < 2; gen++) {
@@ -2750,7 +2752,7 @@ static test_result_t test_reduce_scan_ops(void) {
             ty[gen] = r->type;
             sr_drop(r);
         }
-        TEST_ASSERT_FMT(ty[0] == ty[1] && ty[0] == -RAY_F64, "%s: types %d / %d", qf[i], ty[0], ty[1]);
+        TEST_ASSERT_FMT(ty[0] == ty[1] && ty[0] == qf_ty[i], "%s: types %d / %d", qf[i], ty[0], ty[1]);
     }
     /* a reduction after a selection reads the selected rows, not the column */
     SR_SAME("(select {s: (sum v) m: (min f) from: T where: (> k 150000)})", 0);   /* the scalar route on range reads (Task 10; was 2) */
