@@ -551,7 +551,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |
