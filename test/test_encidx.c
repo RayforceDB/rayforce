@@ -2491,8 +2491,9 @@ static test_result_t test_stale_root_chunk_zone(void) {
 /* D1: the SYM HASH / PART a splayed save writes as generation 2 keep the
  * source's UNIQUE (checked against the in-memory source), and every query
  * answers as on generation 0.  Generation 0's own save drops the SYM PART
- * and UNIQUE (splay_build_index_col rebuilds a bare HASH), the attribute
- * difference D1 accepts. */
+ * (a SYM PART's keys carry a domain no generation-0 region can hold), the
+ * attribute difference D1 accepts; it keeps the HASH's UNIQUE
+ * (splay_build_index_col). */
 static test_result_t test_sym_splay_kept(void) {
     ray_t* r = ixr_eval("(set SY (as 'SYM (map (fn [i] (concat \"k\" (as 'STR i))) (til 6000))))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
@@ -2521,9 +2522,9 @@ static test_result_t test_sym_splay_kept(void) {
         NULL,
     };
     for (int i = 0; kept[i]; i++) TEST_ASSERT_FMT(ixr_i64(kept[i]) == 1, "%s", kept[i]);
-    /* generation 0's loss, as D1 records it (dev's splay_build_index_col) */
+    /* generation 0: the PART is still lost (D1), the HASH keeps UNIQUE */
     TEST_ASSERT_EQ_I(ixr_i64("(if (in 'parted (.attr.get (at X0 'p))) 1 0)"), 0);
-    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at X0 'g))) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at X0 'g))) 1 0)"), 1);
     static const char* const qs[] = {
         "(sum (at (select {from: %s where: (== p 'b)}) 'v))",
         "(sum (at (select {from: %s where: (in p ['a 'd])}) 'v))",

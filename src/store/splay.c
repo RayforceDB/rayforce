@@ -1568,6 +1568,21 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                 if (n > 0 && n < (int)sizeof(path)) {
                     ray_t* fc = ray_col_load(path);  /* file-local codes */
                     if (fc && !RAY_IS_ERR(fc)) {
+                        /* UNIQUE is a property of the saved values: file-local
+                         * positions are a one-to-one renaming of the ids, so
+                         * it carries over.  order_sym does not: it is a
+                         * runtime symbol id and a generation-0 region holds
+                         * no name to resolve it by, so it stays unset. */
+                        ray_index_t* six = ray_index_payload(col->index);
+                        if ((six->markers & RAY_MARK_UNIQUE) && six->built_for_len == col->len) {
+                            /* re-checked on the saved values: a failed
+                             * check leaves the hash without the marker */
+                            ray_t* tag = ray_sym(ray_sym_intern("unique", 6));
+                            ray_t* u = (tag && !RAY_IS_ERR(tag)) ? ray_attr_set_fn(tag, fc) : NULL;
+                            if (tag && !RAY_IS_ERR(tag)) ray_release(tag);
+                            if (u && !RAY_IS_ERR(u)) { ray_release(fc); fc = u; }
+                            else if (u) ray_error_free(u);
+                        }
                         (void)splay_hash_append(path, fc);  /* hash over file-local */
                         ray_release(fc);
                     } else if (fc) {
