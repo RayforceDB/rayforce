@@ -646,7 +646,9 @@ static void* in_guid_calloc(size_t size) {
 static bool guid_set_init(guid_set_t* gs, int64_t n) {
     int64_t cap = 16;
     while (cap < n * 2) cap <<= 1;
-    gs->keys = (uint64_t*)in_guid_calloc((size_t)cap * 16);
+    /* 16 bytes a slot: more than a size_t holds (a 32-bit target) is out
+     * of memory */
+    gs->keys = (uint64_t)cap <= SIZE_MAX / 16 ? (uint64_t*)in_guid_calloc((size_t)cap * 16) : NULL;
     gs->mask = cap - 1;
     gs->has_null = false;
     return gs->keys != NULL;
