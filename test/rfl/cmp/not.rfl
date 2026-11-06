@@ -9,3 +9,59 @@
 
 ;; not X XOR X is always false (complementary)
 (count B) -- (sum (!= B (not B)))
+
+;; `not` has no meaning for the cells of a STR, SYM or GUID vector: a type
+;; error, as the compiled form gives, not one boolean for the whole vector.
+(not (enlist "a" "")) !- type
+(not (enlist "" "" "")) !- type
+(not ['a 'b]) !- type
+(not (as 'SYMBOL ["a" "" "b"])) !- type
+(set Zg (as 'GUID (list "00000000-0000-0000-0000-000000000000" "11111111-1111-1111-1111-111111111111" "00000000-0000-0000-0000-000000000000")))
+(not Zg) !- type
+(not (guid 2)) !- type
+
+;; a slice of each, and the empty vectors (the compiled form rejects an empty
+;; column too)
+(not (drop (enlist "a" "" "bb") 1)) !- type
+(not (drop (as 'SYMBOL ["a" "" "b"]) 1)) !- type
+(not (drop Zg 1)) !- type
+(not (take (enlist "a") 0)) !- type
+(not (take ['a] 0)) !- type
+(not (take (guid 1) 0)) !- type
+
+;; atoms are unchanged
+(not "") -- true
+(not "a") -- false
+(not 'a) -- false
+(not (at Zg 0)) -- true
+(not (at Zg 1)) -- false
+
+;; the query form raises the same error
+(set Tq (table [s g] (list (enlist "a" "" "b") Zg)))
+(select {r: (not s) from: Tq}) !- type
+(select {r: (not g) from: Tq}) !- type
+(select {r: (not y) from: (table [y] (list (as 'SYMBOL ["a" "" "b"])))}) !- type
+
+;; a SYM column in a query raises whatever it holds: no empty symbol, an
+;; empty symbol, in a projection and in a where:, in memory and splayed
+;; with a sym file, and large (the path must not depend on the size)
+(set Yn (table [y] (list ['a 'b 'c])))
+(set Ye (table [y] (list (as 'SYMBOL ["a" "" "c"]))))
+(select {r: (not y) from: Yn}) !- type
+(select {r: (not y) from: Ye}) !- type
+(select {from: Yn where: (not y)}) !- type
+(select {from: Ye where: (not y)}) !- type
+(select {r: (not (not y)) from: Yn}) !- type
+(.sys.exec "rm -rf /tmp/rf-not976y /tmp/rf-not976y.sym") -- 0
+(.db.splayed.set "/tmp/rf-not976y/" Yn "/tmp/rf-not976y.sym")
+(set Ys (.db.splayed.get "/tmp/rf-not976y/" "/tmp/rf-not976y.sym"))
+(select {r: (not y) from: Ys}) !- type
+(select {from: Ys where: (not y)}) !- type
+(.sys.exec "rm -rf /tmp/rf-not976y /tmp/rf-not976y.sym") -- 0
+(set Yb (table [y] (list (take ['a 'b 'c] 80000))))
+(select {r: (not y) from: Yb}) !- type
+(select {from: Yb where: (not y)}) !- type
+;; comparisons on a SYM column keep working
+(at (select {r: (== y 'a) from: Yn}) 'r) -- [true false false]
+(at (select {from: Yn where: (!= y 'a)}) 'y) -- ['b 'c]
+(count (select {from: Yb where: (== y 'a)})) -- 26667
