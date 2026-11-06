@@ -1745,6 +1745,7 @@ typedef struct {
 static int64_t* dg_grow(ray_t** hdr, const int64_t* srow, const uint64_t* shash,
                         uint64_t cap) {
     uint64_t ncap = cap * 2, nmask = ncap - 1;
+    if (ncap > SIZE_MAX / (2 * sizeof(int64_t))) return NULL;   /* a 32-bit size_t */
     int64_t* nrow = (int64_t*)dg_alloc(hdr, (size_t)ncap * 2 * sizeof(int64_t), false);
     if (!nrow) return NULL;
     uint64_t* nhash = (uint64_t*)(nrow + ncap);
@@ -1886,6 +1887,9 @@ static ray_t* distinct_guid_scan(ray_t* input, bool count_only) {
     int64_t tc = atomic_load(&g_dg_test_table_cap);
     if (tc >= 32) while (tcap > (uint64_t)tc) tcap >>= 1;
 #endif
+    /* the scatter's buffers are the column's size or less; the workers'
+     * tables, on a 32-bit size_t, need not be */
+    if (tcap > SIZE_MAX / (2 * sizeof(int64_t)) / nw) goto out;
     int64_t* wtab = (int64_t*)dg_alloc(&wt_hdr, (size_t)nw * 2 * tcap * sizeof(int64_t), true);
     if (!wtab) goto out;
     ray_pool_dispatch_n(pool, dg_scatter_fn, &c, n_tasks);

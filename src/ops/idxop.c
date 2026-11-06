@@ -2540,6 +2540,9 @@ static ray_t* hash_build_block(ray_t* v) {
      * Build-time capacity: sized by rows for O(1) inserts. */
     uint64_t bcap = next_pow2((uint64_t)(n < 4 ? 8 : 2 * n));
     if (bcap < 8) bcap = 8;
+    /* the rows themselves fit; a table whose bytes a size_t can't hold (a
+     * 32-bit target) does not */
+    if (bcap > SIZE_MAX / sizeof(int64_t)) return ray_error("oom", NULL);
     uint64_t bmask = bcap - 1;
 
     ray_t* btab_hdr = NULL;
@@ -5235,12 +5238,21 @@ static bool hash_extend(ray_index_t* ix, ray_t* v, int64_t n0, int64_t n1) {
     int8_t t = v->type;
     bool bytes = hash_byte_keyed(t);
     bool keep_nulls = (t == RAY_GUID);
+    /* Scratch per new group: its key word, its row, then a narrow staging
+     * area.  A new group is a key the index lacks: at most one a row, and
+     * for a one- or two-byte key (its key word is its value) no more than
+     * the type has values.  A count whose bytes a size_t can't hold (a
+     * 32-bit target) declines: the caller drops the index, the rows stay. */
+    const size_t per_group = 2 * sizeof(int64_t) + sizeof(uint32_t);
+    int64_t ncap = add;
+    if ((t == RAY_BOOL || t == RAY_U8) && ncap > 256) ncap = 256;
+    else if (t == RAY_I16 && ncap > 65536) ncap = 65536;
+    if ((uint64_t)ncap > SIZE_MAX / per_group) return false;
     ray_t* sc_hdr = NULL;
-    /* per new group: its key word, its row, then a narrow staging area */
-    int64_t* nkw = (int64_t*)scratch_alloc(&sc_hdr, (size_t)add * (2 * sizeof(int64_t) + sizeof(uint32_t)));
+    int64_t* nkw = (int64_t*)scratch_alloc(&sc_hdr, (size_t)ncap * per_group);
     if (!nkw) return false;
-    int64_t* nrow = nkw + add;
-    uint32_t* narrow = (uint32_t*)(nrow + add);
+    int64_t* nrow = nkw + ncap;
+    uint32_t* narrow = (uint32_t*)(nrow + ncap);
     const int64_t* gk = (const int64_t*)ray_data(gkeys);
     const uint8_t* base = (const uint8_t*)ray_data(v);
     int64_t na = 0;
@@ -5265,7 +5277,9 @@ static bool hash_extend(ray_index_t* ix, ray_t* v, int64_t n0, int64_t n1) {
             slot = (slot + 1) & mask;
         }
         if (hit) { repeat = true; continue; }
-        /* a new key: keep the table at most half full */
+        /* a new key, in bounds of the scratch (ncap bounds the new keys) */
+        if (na == ncap) { ok = false; break; }
+        /* keep the table at most half full */
         if ((uint64_t)(ng0 + na + 1) * 2 > ix->u.hash.mask + 1) {
             if (!hx_table_grow(ix, gk, ng0, nkw, na)) { ok = false; break; }
             mask = ix->u.hash.mask;
