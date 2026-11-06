@@ -17,6 +17,19 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 1000000     ; no separators needed
 ```
 
+I64 `+`, `-`, `*`, `sum`, and `sums` use wrapping arithmetic, including their
+vector and query forms. The result wraps modulo 2^64 and is interpreted as a
+signed I64; it does not raise an overflow error. The minimum I64 bit pattern
+is reserved for the null sentinel, so a wrapped result equal to that pattern
+prints as `0Nl`. For example, `(+ 9223372036854775807 2)` is
+`-9223372036854775807`, while `(+ 9223372036854775807 1)` is `0Nl`.
+
+Casting an out-of-range F64 with `as 'I64` clamps to the nearest non-null I64
+bound: `(as 'I64 1e19)` is `9223372036854775807`, and
+`(as 'I64 -1e19)` is `-9223372036854775807`. These operations do not detect
+overflow; check bounds explicitly when a wrapped or clamped value is not
+acceptable for the application.
+
 ### Floats
 
 64-bit IEEE 754 double-precision floating point.
