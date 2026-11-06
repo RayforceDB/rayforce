@@ -28,6 +28,13 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 2.5e-3      ; small value
 ```
 
+Rayfall has no infinity values or infinity literals. Non-finite floating
+results (positive or negative infinity and NaN) become the floating null
+`0Nf`; `nil?` reports true for them. For example, `(/ 1 0)` and `(exp 1000)`
+both return `0Nf`. A floating overflow therefore cannot be distinguished
+from missing data after the operation. Check inputs or bounds before the
+operation if that distinction matters.
+
 ### Booleans
 
 ```lisp
