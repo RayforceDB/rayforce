@@ -288,7 +288,7 @@ Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, follow
 | Offset | Size | Field | Description |
 |---|---|---|---|
 | 0 | 4 bytes | `prefix` | Magic bytes `0xcefadefa` — identifies Rayforce binary data |
-| 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `3`). Decoupled from `RAY_VERSION_MAJOR`. A receiver that sees a different byte here rejects the payload with a `version` error instead of attempting to parse it. |
+| 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `4`). Decoupled from `RAY_VERSION_MAJOR`. Readers accept version 3 for existing serialized objects and journals; live IPC peers still require an exact handshake match before exchanging frames. |
 | 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). Bit 3 (`0x08`, `RAY_IPC_FLAG_CANCEL_SEEN`): on a reply over a shared-memory or RDMA connection, the server has taken a cancel byte since its last reply (see the transports above). |
 | 6 | 1 byte | `endian` | Endianness: `0` = little-endian |
 | 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response, `3` = upgrade (a transport record, never evaluated or journaled; see [Transports](#transports)) |
@@ -299,7 +299,7 @@ The corresponding C struct:
 ```c
 typedef struct ray_ipc_header_t {
     uint32_t prefix;     /* RAY_SERDE_PREFIX (0xcefadefa) */
-    uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 3) */
+    uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 4) */
     uint8_t  flags;      /* bit0 compressed, bit1 restricted (journal), bit2 verbose */
     uint8_t  endian;     /* 0 = little-endian */
     uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response, 3 = upgrade */
@@ -308,6 +308,11 @@ typedef struct ray_ipc_header_t {
 ```
 
 The header is exactly 16 bytes, enforced by a compile-time static assertion.
+
+Version 4 extends an error payload from its eight-byte category field to
+`category[8]`, a one-byte message length, and up to 255 message bytes. Version
+3 error records remain readable as category-only errors so persisted objects
+and journals survive the upgrade.
 
 A receiver admits a positive wire body of at most 256 MiB. The decoded
 serialized body is also limited to 256 MiB: compression does not raise this

@@ -5104,6 +5104,20 @@ static test_result_t test_serde_de_error_paths(void) {
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r); ray_release(w);
     }
+    /* Error record advertises message bytes that are not present. */
+    {
+        ray_t* e = ray_error("domain", "truncated diagnostic");
+        ray_t* w = ray_ser(e);
+        TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(w);
+        hdr->size--;
+        w->len--;
+        ray_t* r = ray_de(w);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "truncated message"));
+        ray_error_free(r); ray_release(w); ray_error_free(e);
+    }
     PASS();
 }
 
@@ -5254,10 +5268,10 @@ static test_result_t test_serde_builtin_name_roundtrip(void) {
 
 static test_result_t test_serde_error_roundtrip(void) {
     /* Build an error object and round-trip it through ser/de */
-    ray_t* e = ray_error("domain", NULL);
+    ray_t* e = ray_error("domain", "custom failure: the whole sentence");
     TEST_ASSERT_NOT_NULL(e); TEST_ASSERT_TRUE(RAY_IS_ERR(e));
 
-    /* ray_ser handles IS_ERR: writes 1+8 bytes */
+    /* ray_ser handles IS_ERR: writes the code and diagnostic text. */
     ray_t* w = ray_ser(e);
     TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
 
@@ -5265,8 +5279,25 @@ static test_result_t test_serde_error_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(b);
     /* The deserialized form is a RAY_ERROR object */
     TEST_ASSERT_TRUE(RAY_IS_ERR(b));
+    TEST_ASSERT_STR_EQ(ray_err_code(b), "domain");
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "custom failure: the whole sentence");
 
-    ray_release(b); ray_release(w); ray_release(e);
+    ray_error_free(b); ray_release(w); ray_error_free(e);
+
+    /* A version-3 error record carried only its fixed eight-byte category.
+     * Existing persisted objects must still load after the v4 upgrade. */
+    e = ray_error("domain", "old message was not on the wire");
+    w = ray_ser(e);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(w);
+    hdr->version = RAY_SERDE_WIRE_VERSION_MIN;
+    hdr->size = 1 + 8;
+    w->len = (int64_t)sizeof(*hdr) + hdr->size;
+    b = ray_de(w);
+    TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_TRUE(RAY_IS_ERR(b));
+    TEST_ASSERT_STR_EQ(ray_err_code(b), "domain");
+    TEST_ASSERT_NULL(ray_error_msg());
+    ray_error_free(b); ray_release(w); ray_error_free(e);
     PASS();
 }
 
@@ -5362,7 +5393,7 @@ static test_result_t test_serde_f32_atom_and_edge_cases(void) {
          * object with type==RAY_ERROR. Directly test via ray_ser which calls
          * serde_size internally. */
         int64_t sz = ray_serde_size(e);
-        TEST_ASSERT_EQ_I(sz, 1 + 8);
+        TEST_ASSERT_EQ_I(sz, 1 + 8 + 1);
         ray_release(e);
     }
     /* safe_strlen: trigger the no-null path (line 77) by crafting a raw

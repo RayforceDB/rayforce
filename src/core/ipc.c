@@ -594,6 +594,7 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
                           uint8_t extra_flags)
 {
     ray_serde_fail_clear();
+    ray_t* fallback = NULL;
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -602,8 +603,12 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
      * (issue #285).  ray_error frames serialize, so the substitute always
      * goes out unless even that fails — in which case there is nothing we
      * can put on the wire and we drop as before. */
-    ray_t* fallback = NULL;
     if (!ray_ipc_body_size_ok(ser_size)) {
+        if (fallback) {
+            ray_error_free(fallback);
+            fallback = NULL;
+            result = NULL;
+        }
         if (ser_size > RAY_IPC_BODY_MAX_BYTES) {
             fallback = ray_error("io", "IPC result exceeds the 256 MiB decoded payload limit");
         } else {
@@ -724,6 +729,16 @@ static ray_t* deser_frame(uint8_t* payload, size_t payload_len, uint8_t flags)
 static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
                                 ray_ipc_header_t* hdr)
 {
+    /* An inbound frame is a top-level evaluation boundary even when its
+     * payload is a raw expression LIST (which bypasses ray_eval_str's
+     * boundary cleanup).  Detach any outer/nested evaluation's pending
+     * raise while this request runs, then restore it before returning. */
+    ray_t* saved_raise = NULL;
+    if (__VM) {
+        saved_raise = __VM->raise_val;
+        __VM->raise_val = NULL;
+    }
+
     /* Journal hook: log every inbound SYNC message (state-mutation
      * channel in the IPC model) before evaluation, so a crash mid-handler
      * still leaves the message on disk for replay.  We write the raw
@@ -754,7 +769,12 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         ray_err_t je = ray_journal_write_bytes(&log_hdr, payload, (int64_t)payload_len);
         if (je != RAY_OK) {
             fprintf(stderr, "log: ERROR  journal write failed (rc=%d) — refusing to evaluate\n", (int)je);
-            return ray_error("io", "journal write failed; mutation refused");
+            ray_t* err = ray_error("io", "journal write failed; mutation refused");
+            if (__VM) {
+                ray_raise_clear();
+                __VM->raise_val = saved_raise;
+            }
+            return err;
         }
         auto_journaled = true;
     }
@@ -848,7 +868,25 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     if (result && ray_is_lazy(result))
         result = ray_lazy_materialize(result);  /* consumes the retain */
 
+    /* `raise x` deliberately keeps x as a pending value instead of eagerly
+     * formatting it into ray_error_msg().  Capture it before the outer
+     * verbose wrapper turns the error into a child of [captured, result];
+     * send_response can no longer recognize a top-level error after that. */
+    if (result && RAY_IS_ERR(result) && !ray_error_msg()) {
+        char raised[256];
+        if (ray_raise_render(raised, sizeof raised)) {
+            char code[8];
+            snprintf(code, sizeof code, "%s", ray_err_code(result));
+            ray_t* marker = ray_error(code, "%s", raised);
+            if (marker) ray_error_free(marker);
+        }
+    }
+
     ray_qlog_end(&qc, qsrc, qsrc_len, result);
+    if (__VM) {
+        ray_raise_clear();
+        __VM->raise_val = saved_raise;
+    }
     return result ? result : RAY_NULL_OBJ;
 }
 

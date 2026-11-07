@@ -676,7 +676,12 @@ static int64_t ser_table_cols_size(ray_t* tbl, ray_t* cols_list) {
 
 int64_t ray_serde_size(ray_t* obj) {
     if (!obj) return 1; /* RAY_SERDE_NULL marker */
-    if (RAY_IS_ERR(obj)) return 1 + 8; /* type + sdata */
+    if (RAY_IS_ERR(obj)) {
+        const char* msg = ray_error_msg();
+        size_t msg_len = msg ? strlen(msg) : 0;
+        if (msg_len > UINT8_MAX) msg_len = UINT8_MAX;
+        return 1 + 8 + 1 + (int64_t)msg_len;
+    }
     if (RAY_IS_NULL(obj)) return 1; /* just the null type byte */
 
     int8_t type = obj->type;
@@ -790,8 +795,12 @@ int64_t ray_serde_size(ray_t* obj) {
         (void)serde_builtin_name(obj, &nlen);
         return 1 + (int64_t)nlen + 1; /* type + name + null terminator */
     }
-    case RAY_ERROR:
-        return 1 + 8; /* sdata */
+    case RAY_ERROR: {
+        const char* msg = ray_error_msg();
+        size_t msg_len = msg ? strlen(msg) : 0;
+        if (msg_len > UINT8_MAX) msg_len = UINT8_MAX;
+        return 1 + 8 + 1 + (int64_t)msg_len; /* type + sdata + message */
+    }
     default:
         return 0;
     }
@@ -807,10 +816,15 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         return 1;
     }
     if (RAY_IS_ERR(obj)) {
+        const char* msg = ray_error_msg();
+        size_t msg_len = msg ? strlen(msg) : 0;
+        if (msg_len > UINT8_MAX) msg_len = UINT8_MAX;
         buf[0] = (uint8_t)RAY_ERROR;
         memcpy(buf + 1, obj->sdata, 7);
         buf[8] = 0;
-        return 1 + 8;
+        buf[9] = (uint8_t)msg_len;
+        if (msg_len) memcpy(buf + 10, msg, msg_len);
+        return 1 + 8 + 1 + (int64_t)msg_len;
     }
     /* RAY_NULL_OBJ — ray_serde_size mirrors this with `return 1`.
      * Without this branch, ser_raw fell through to the vec path,
@@ -1059,10 +1073,16 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         return 1 + (int64_t)nlen + 1;
     }
 
-    case RAY_ERROR:
+    case RAY_ERROR: {
+        const char* msg = ray_error_msg();
+        size_t msg_len = msg ? strlen(msg) : 0;
+        if (msg_len > UINT8_MAX) msg_len = UINT8_MAX;
         memcpy(buf, obj->sdata, 7);
         buf[7] = 0;
-        return 1 + 8;
+        buf[8] = (uint8_t)msg_len;
+        if (msg_len) memcpy(buf + 9, msg, msg_len);
+        return 1 + 8 + 1 + (int64_t)msg_len;
+    }
 
     default:
         return 0;
@@ -1079,6 +1099,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
  * run on worker-pool threads. */
 #define RAY_DE_MAX_DEPTH 512
 static _Thread_local int g_de_depth = 0;
+static _Thread_local uint8_t g_de_wire_version = RAY_SERDE_WIRE_VERSION;
 
 static ray_t* de_raw_inner(uint8_t* buf, int64_t* len);
 
@@ -1088,6 +1109,16 @@ ray_t* ray_de_raw(uint8_t* buf, int64_t* len) {
     g_de_depth++;
     ray_t* r = de_raw_inner(buf, len);
     g_de_depth--;
+    return r;
+}
+
+ray_t* ray_de_raw_version(uint8_t* buf, int64_t* len, uint8_t version) {
+    if (!ray_serde_wire_version_supported(version))
+        return ray_error("version", "serde wire version %u is unsupported", (unsigned)version);
+    uint8_t previous = g_de_wire_version;
+    g_de_wire_version = version;
+    ray_t* r = ray_de_raw(buf, len);
+    g_de_wire_version = previous;
     return r;
 }
 
@@ -1591,7 +1622,16 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
     }
 
     case RAY_ERROR: {
-        if (*len < 8) return ray_error("domain", "deserialize error: truncated error code, need 8 bytes");
+        if (g_de_wire_version < RAY_SERDE_ERROR_MESSAGE_VERSION) {
+            if (*len < 8)
+                return ray_error("domain", "deserialize error: truncated error code, need 8 bytes");
+            char code[9];
+            memcpy(code, buf, 8);
+            code[8] = '\0';
+            *len -= 8;
+            return ray_error(code, NULL);
+        }
+        if (*len < 9) return ray_error("domain", "deserialize error: truncated error record, need at least 9 bytes");
         /* A well-formed writer NUL-terminates the 8-byte code field (byte
          * 7 == 0), but a corrupt or hostile frame may fill all 8 bytes.
          * Copy into a bounded, always-terminated buffer so ray_error's
@@ -1599,8 +1639,13 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         char code[9];
         memcpy(code, buf, 8);
         code[8] = '\0';
-        ray_t* err = ray_error(code, NULL);
-        *len -= 8;
+        uint8_t msg_len = buf[8];
+        if (*len - 9 < (int64_t)msg_len)
+            return ray_error("domain", "deserialize error: truncated message, need %u bytes", (unsigned)msg_len);
+        ray_t* err = msg_len
+            ? ray_error(code, "%.*s", (int)msg_len, (const char*)buf + 9)
+            : ray_error(code, NULL);
+        *len -= 9 + (int64_t)msg_len;
         return err;
     }
 
@@ -1686,7 +1731,7 @@ ray_t* ray_de(ray_t* bytes) {
     ray_ipc_header_t* hdr = (ray_ipc_header_t*)buf;
     if (hdr->prefix != RAY_SERDE_PREFIX)
         return ray_error("domain", "deserialize: bad ipc header magic prefix");
-    if (hdr->version != RAY_SERDE_WIRE_VERSION)
+    if (!ray_serde_wire_version_supported(hdr->version))
         return ray_error("version", "serde wire version mismatch");
     if (hdr->endian != RAY_SERDE_ENDIAN)
         return ray_error("domain", "deserialize: byte-order mismatch (frame endian %d, host %d)",
@@ -1697,7 +1742,8 @@ ray_t* ray_de(ray_t* bytes) {
         return ray_error("domain", "deserialize: ipc header size %lld + header != buffer length %lld", (long long)hdr->size, (long long)total);
 
     int64_t len = hdr->size;
-    ray_t* result = ray_de_raw(buf + sizeof(ray_ipc_header_t), &len);
+    ray_t* result = ray_de_raw_version(buf + sizeof(ray_ipc_header_t), &len,
+                                      hdr->version);
     if (!result || RAY_IS_ERR(result)) return result;
     if (len != 0) {
         ray_release(result);
