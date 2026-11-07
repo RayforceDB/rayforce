@@ -17631,6 +17631,9 @@ static bool select_dep_mentions(ray_t* e, const int64_t* syms, int n) {
 static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan) {
     ray_t* by = dict_get(dict, "by");
     if (!by || by->type != RAY_DICT || dict_get(dict, "nearest")) return NULL;
+    /* code a clause runs (a named lambda, eval, ...) may read a dropped key
+     * by name, which no scan of the clauses below sees */
+    if (clauses_run_code(dict, tbl, true)) return NULL;
     ray_t* bk = ray_dict_keys(by);
     ray_t* bv = ray_dict_vals(by);
     if (!bk || bk->type != RAY_SYM || !bv || bv->type != RAY_LIST) return NULL;

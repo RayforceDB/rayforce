@@ -257,3 +257,7 @@
 (at (select {from: Tw by: {k: k j: (- k 0x02)} c: (count v) asc: k}) 'j) -- [-2 -1 1]
 (set Td (table [k v] (list [2024.01.03 2024.01.01 2024.01.03] [1 2 3])))
 (type (at (select {from: Td by: {k: k j: (- k 2)} c: (count v) asc: k}) 'j)) -- (type (at (select {from: Td by: {k: k j: (- k 2)} c: (count v) asc: [k j]}) 'j))
+;; a named function reading the dependent key by its name keeps the key in the grouping
+(set Th (table [k v] (list [1 1 2] [10 20 30])))
+(set dep_hidden (fn [x] (+ j 2)))
+(select {from: Th by: {kk: k j: (- k 1) h: (dep_hidden k)} c: (count v) desc: c}) -- (table [kk j h c] (list [1 2] [0 1] [2 3] [2 1]))
