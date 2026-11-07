@@ -5143,6 +5143,37 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     }
 }
 
+static void mark_ipc_literal_list(ray_t* obj) {
+    if (!obj || RAY_IS_ERR(obj) || obj->type != RAY_LIST) return;
+    /* A real (quote x) is an expression that must evaluate to x.  Leave
+     * both the wrapper and its payload untouched, including on replay. */
+    if (obj->len == 2) {
+        ray_t* head = ((ray_t**)ray_data(obj))[0];
+        if (head && head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) &&
+            head->i64 == ray_sym_intern("quote", 5))
+            return;
+    }
+    obj->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+    ray_t** elems = (ray_t**)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++)
+        mark_ipc_literal_list(elems[i]);
+}
+
+static void clear_ipc_literal_list(ray_t* obj) {
+    if (!obj || RAY_IS_ERR(obj) || obj->type != RAY_LIST) return;
+    obj->attrs &= (uint8_t)~RAY_EVAL_LITERAL_FALLBACK;
+    ray_t** elems = (ray_t**)ray_data(obj);
+    for (int64_t i = 0; i < obj->len; i++)
+        clear_ipc_literal_list(elems[i]);
+}
+
+void ray_eval_mark_ipc_literal_args(ray_t* msg) {
+    if (!msg || RAY_IS_ERR(msg) || msg->type != RAY_LIST) return;
+    ray_t** elems = (ray_t**)ray_data(msg);
+    for (int64_t i = 1; i < msg->len; i++)
+        mark_ipc_literal_list(elems[i]);
+}
+
 ray_t* ray_eval(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return obj;
 
@@ -5242,16 +5273,31 @@ ray_t* ray_eval(ray_t* obj) {
     if (obj->type != RAY_LIST) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
     /* Empty list */
-    if (ray_len(obj) == 0) { ray_retain(obj); ret = obj; rows = 0; goto out; }
+    if (ray_len(obj) == 0) {
+        /* An empty IPC argument may still carry the transient literal
+         * mark; consume it so a handler that keeps the list and appends
+         * an ordinary expression later does not inherit it. */
+        if (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) clear_ipc_literal_list(obj);
+        ray_retain(obj); ret = obj; rows = 0; goto out;
+    }
 
     /* List: evaluate first element, dispatch by type */
     ray_t** elems = (ray_t**)ray_data(obj);
     int literal_fallback = (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) != 0;
+    /* A quoted symbol at the head of an IPC argument is data, even when
+     * its name resolves to a builtin.  Function objects remain callable,
+     * as in (list til 10).  Consume the transient mark before a handler
+     * stores the argument for a later explicit eval. */
+    if (literal_fallback && elems[0] && elems[0]->type == -RAY_SYM) {
+        clear_ipc_literal_list(obj);
+        ray_retain(obj); ret = obj; rows = 0; goto out;
+    }
     ray_t* head = ray_eval(elems[0]);
     if (RAY_IS_ERR(head)) {
         const char* code = ray_err_code(head);
         if (literal_fallback && code && strcmp(code, "name") == 0) {
             ray_error_free(head);
+            clear_ipc_literal_list(obj);
             ray_retain(obj);
             ret = obj; goto out;
         }
@@ -5267,6 +5313,7 @@ ray_t* ray_eval(ray_t* obj) {
         if (!fn) {
             if (literal_fallback) {
                 ray_release(head);
+                clear_ipc_literal_list(obj);
                 ray_retain(obj);
                 ret = obj; goto out;
             }
@@ -5281,6 +5328,7 @@ ray_t* ray_eval(ray_t* obj) {
             if (literal_fallback && code && strcmp(code, "name") == 0) {
                 ray_release(head);
                 ray_error_free(fn);
+                clear_ipc_literal_list(obj);
                 ray_retain(obj);
                 ret = obj; goto out;
             }
@@ -5601,7 +5649,8 @@ ray_t* ray_eval(ray_t* obj) {
         default: {
             int8_t head_type = head->type;
             ray_release(head);
-            if (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) {
+            if (literal_fallback) {
+                clear_ipc_literal_list(obj);
                 ray_retain(obj);
                 ret = obj; goto out;
             }

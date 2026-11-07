@@ -145,6 +145,10 @@ int         ray_ipc_xport_policy_parse(const char* s, size_t n);
  * core/ipc.c).  Never set on TCP, where reading the stream past a
  * cancel byte discards it. */
 #define RAY_IPC_FLAG_CANCEL_SEEN 0x08
+/* Persisted on newly written IPC journal frames.  Replay applies the
+ * symbol-headed argument rule only when this bit is present, so older
+ * journals keep the evaluation contract under which they were recorded. */
+#define RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS 0x10
 #define RAY_IPC_MAX_CONNS 256
 
 /* ===== Connection hooks (.ipc.on.*) ===== */

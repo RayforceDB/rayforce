@@ -770,6 +770,71 @@ static test_result_t test_eval_literal_fallback_preserves_boxed_data(void) {
     PASS();
 }
 
+/* The literal-args mark on an empty list must be consumed by eval, so a
+ * handler that keeps the argument and later appends an ordinary
+ * (in 1 2) expression still evaluates it as code. */
+static test_result_t test_eval_literal_fallback_empty_list_mark_consumed(void) {
+    ray_t* msg = ray_list_new(2);
+    ray_t* head = ray_sym(ray_sym_intern("noop", 4));
+    ray_t* arg = ray_list_new(0);
+    TEST_ASSERT_NOT_NULL(msg);
+    msg = ray_list_append(msg, head);
+    msg = ray_list_append(msg, arg);
+    ray_release(head);
+    ray_release(arg);
+    ray_eval_mark_ipc_literal_args(msg);
+    ray_t* kept = ((ray_t**)ray_data(msg))[1];
+    TEST_ASSERT_TRUE((kept->attrs & RAY_EVAL_LITERAL_FALLBACK) != 0);
+
+    ray_t* r = ray_eval(kept);          /* handler-side explicit eval */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE((kept->attrs & RAY_EVAL_LITERAL_FALLBACK) == 0);
+
+    ray_t* lst = kept;
+    ray_retain(lst);
+    ray_release(msg);                    /* handler now owns the arg alone */
+    ray_t* in_sym = ray_sym(ray_sym_intern("in", 2));
+    ray_t* a = ray_i64(1);
+    ray_t* b = ray_i64(2);
+    lst = ray_list_append(lst, in_sym);
+    lst = ray_list_append(lst, a);
+    lst = ray_list_append(lst, b);
+    ray_release(in_sym); ray_release(a); ray_release(b);
+    TEST_ASSERT_EQ_I(lst->len, 3);
+
+    ray_t* res = ray_eval(lst);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(res->type, -RAY_BOOL);
+    TEST_ASSERT_EQ_I(res->b8, 0);
+    ray_release(res);
+    ray_release(lst);
+    PASS();
+}
+
+/* Control: a marked non-empty argument is consumed on eval. */
+static test_result_t test_eval_literal_fallback_nonempty_mark_consumed(void) {
+    ray_t* arg = ray_eval_str("(list 'ipc_data_tag 1)");
+    TEST_ASSERT_NOT_NULL(arg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(arg));
+    ray_t* msg = ray_list_new(2);
+    ray_t* head = ray_sym(ray_sym_intern("noop", 4));
+    msg = ray_list_append(msg, head);
+    msg = ray_list_append(msg, arg);
+    ray_release(head);
+    ray_release(arg);
+    ray_eval_mark_ipc_literal_args(msg);
+    ray_t* kept = ((ray_t**)ray_data(msg))[1];
+    TEST_ASSERT_TRUE((kept->attrs & RAY_EVAL_LITERAL_FALLBACK) != 0);
+    ray_t* r = ray_eval(kept);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE((kept->attrs & RAY_EVAL_LITERAL_FALLBACK) == 0);
+    ray_release(msg);
+    PASS();
+}
+
 /* ---- Test: eval if true ---- */
 static test_result_t test_eval_if_true(void) {
     ray_t* result = ray_eval_str("(if true 1 2)");
@@ -11656,6 +11721,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/set", test_eval_set, lang_setup, lang_teardown },
     { "lang/eval/symbol_head_applies", test_eval_symbol_head_applies, lang_setup, lang_teardown },
     { "lang/eval/literal_fallback_preserves_boxed_data", test_eval_literal_fallback_preserves_boxed_data, lang_setup, lang_teardown },
+    { "lang/eval/literal_fallback_empty_list_mark_consumed", test_eval_literal_fallback_empty_list_mark_consumed, lang_setup, lang_teardown },
+    { "lang/eval/literal_fallback_nonempty_mark_consumed", test_eval_literal_fallback_nonempty_mark_consumed, lang_setup, lang_teardown },
     { "lang/eval/if_true", test_eval_if_true, lang_setup, lang_teardown },
     { "lang/eval/if_false", test_eval_if_false, lang_setup, lang_teardown },
     { "lang/eval/let", test_eval_let, lang_setup, lang_teardown },

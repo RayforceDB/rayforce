@@ -52,9 +52,10 @@
 #define RAY_TIMES_BIND "times bind"
 
 /* Internal eval flag for RAY_LIST values carried as nested IPC arguments.
- * The evaluator still runs callable lists normally; this only makes a
- * non-callable list head fall back to returning the list as data. */
+ * A marked symbol-headed list is data; a function-headed list still runs.
+ * The evaluator consumes the flag when it returns a data list. */
 #define RAY_EVAL_LITERAL_FALLBACK 0x04
+void ray_eval_mark_ipc_literal_args(ray_t* msg);
 
 /* Function type signatures */
 typedef ray_t* (*ray_unary_fn)(ray_t*);
