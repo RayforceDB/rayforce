@@ -235,3 +235,13 @@
 (Fe 5) -- (select {from: Ue by: {k: k j: j} c: (count v) desc: c})
 (set Ge (fn [a] (select {from: Te by: {a: k j: (- k 1)} c: (count v) desc: c})))
 (Ge 5) -- (select {from: Ue by: {a: k j: j} c: (count v) desc: c})
+;; no outputs: the grouped select keeps first-of-group source columns
+(at (select {from: Te by: {kk: k j: (- k 1)}}) 'v) -- (at (select {from: Ue by: {kk: k j: j}}) 'v)
+;; a later key reading the dependent key by its name
+(select {from: Te by: {kk: k j: (- k 1) h: (+ j 2)} c: (count v) desc: c}) -- (select {from: Ue by: {kk: k j: j h: (+ j 2)} c: (count v) desc: c})
+;; a sort naming the dependent key in a vector
+(select {from: Te by: {kk: k j: (- k 1)} c: (count v) asc: [j] take: 2}) -- (select {from: Ue by: {kk: k j: j} c: (count v) asc: [j] take: 2})
+(select {from: Te by: {kk: k j: (- k 1)} c: (count v) desc: [c j]}) -- (select {from: Ue by: {kk: k j: j} c: (count v) desc: [c j]})
+;; the + or - the key's name held when the select began, though a clause rebinds it
+(set dep_op +)
+(select {from: Te by: {kk: k j: (dep_op k 1)} c: (count v) desc: c take: (do (set dep_op -) 2)}) -- (table [kk j c] (list [0Nl 3] [0Nl 4] [4 3]))

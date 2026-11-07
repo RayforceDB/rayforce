@@ -17611,6 +17611,22 @@ static bool select_from_is_join(ray_t* from_expr) {
  * output names a dropped key.  NULL when the shape does not apply; else the
  * select's result (or its error). */
 #define SELECT_DEP_MAX_KEYS 15
+
+/* select_expr_mentions, the names of a SYM vector too (`asc: [j]`) */
+static bool select_dep_mentions(ray_t* e, const int64_t* syms, int n) {
+    if (!e) return false;
+    if (e->type == RAY_SYM) {
+        for (int64_t i = 0; i < e->len; i++)
+            for (int k = 0; k < n; k++) if (sym_cell_runtime_id(e, i) == syms[k]) return true;
+        return false;
+    }
+    if (e->type != RAY_LIST) return select_expr_mentions(e, syms, n);
+    ray_t** el = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++)
+        if (select_dep_mentions(el[i], syms, n)) return true;
+    return false;
+}
+
 static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan) {
     ray_t* by = dict_get(dict, "by");
     if (!by || by->type != RAY_DICT || dict_get(dict, "nearest")) return NULL;
@@ -17622,6 +17638,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     ray_t** bvals = (ray_t**)ray_data(bv);
     int64_t alias[SELECT_DEP_MAX_KEYS], col[SELECT_DEP_MAX_KEYS], dropped[SELECT_DEP_MAX_KEYS];
     int base[SELECT_DEP_MAX_KEYS];   /* a dropped key: the key whose column it reads; else -1 */
+    ray_t* op[SELECT_DEP_MAX_KEYS];  /* a dropped key: the + or - its head names now */
     int n_drop = 0;
     for (int64_t i = 0; i < nb; i++) {
         alias[i] = sym_cell_runtime_id(bk, i);
@@ -17641,8 +17658,9 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         ray_t* v = bvals[i];
         if (!v || v->type != RAY_LIST || v->len != 3 || (v->attrs & ATTR_QUOTED)) continue;
         ray_t** el = (ray_t**)ray_data(v);
-        if (!el[0] || el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED) ||
-            !builtin_named(sym_binding(el[0]->i64), addsub, 2)) continue;
+        if (!el[0] || el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) continue;
+        op[i] = sym_binding(el[0]->i64);
+        if (!builtin_named(op[i], addsub, 2)) continue;
         for (int side = 1; side <= 2 && base[i] < 0; side++) {
             ray_t* s = el[side];
             ray_t* c = el[3 - side];
@@ -17655,6 +17673,9 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         if (base[i] >= 0) dropped[n_drop++] = alias[i];
     }
     if (!n_drop) return NULL;
+    /* nor may a by: value read a dropped key by its name */
+    for (int64_t j = 0; j < nb; j++)
+        if (select_dep_mentions(bvals[j], dropped, n_drop)) return NULL;
     /* A dropped key's name is its own: no column of the table (the by-dict
      * rejects such an alias), no other key, output or clause. */
     for (int k = 0; k < n_drop; k++) {
@@ -17676,11 +17697,36 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     for (int64_t i = 0; i < nd; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         if (kid == from_id || kid == by_id) continue;
-        if (select_expr_mentions(vals[i], dropped, n_drop)) return NULL;
+        if (select_dep_mentions(vals[i], dropped, n_drop)) return NULL;
         if (kid == where_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
         for (int64_t j = 0; j < nb; j++) if (alias[j] == kid) return NULL;
         if (ray_env_get_lexical_local(kid)) return NULL;
         n_out++;
+    }
+    /* With no outputs a grouped select keeps every source column, which
+     * the groups no longer carry. */
+    if (!n_out) return NULL;
+
+    /* The dropped keys' expressions, built before the grouping runs its
+     * clauses (which may rebind a name): the head is the + or - its name
+     * held now, the base column the base key's column in the groups. */
+    ray_t* dexp[SELECT_DEP_MAX_KEYS] = {0};
+    for (int64_t i = 0; i < nb; i++) {
+        if (base[i] < 0) continue;
+        ray_t** el = (ray_t**)ray_data(bvals[i]);
+        ray_t* e = ray_list_new(3);
+        for (int k = 0; k < 3 && e && !RAY_IS_ERR(e); k++) {
+            bool src = k > 0 && el[k]->type == -RAY_SYM && el[k]->i64 == col[base[i]];
+            ray_t* a = k == 0 ? op[i] : src ? ray_sym(alias[base[i]]) : el[k];
+            if (!a || RAY_IS_ERR(a)) { ray_release(e); e = a; break; }
+            e = ray_list_append(e, a);
+            if (src) ray_release(a);
+        }
+        if (!e || RAY_IS_ERR(e)) {
+            for (int64_t j = 0; j < i; j++) if (dexp[j]) ray_release(dexp[j]);
+            return e ? e : ray_error("oom", NULL);
+        }
+        dexp[i] = e;
     }
 
     /* the grouping, by the other keys */
@@ -17691,13 +17737,15 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         ((int64_t*)ray_data(nk))[nk->len++] = alias[i];
         nv = ray_list_append(nv, bvals[i]);
     }
+    ray_t* r = NULL;
     if (!nk || RAY_IS_ERR(nk) || !nv || RAY_IS_ERR(nv)) {
         if (nk && !RAY_IS_ERR(nk)) ray_release(nk);
         if (nv && !RAY_IS_ERR(nv)) ray_release(nv);
-        return ray_error("oom", NULL);
+        r = ray_error("oom", NULL);
+        goto done;
     }
     ray_t* nby = ray_dict_new(nk, nv);
-    if (!nby || RAY_IS_ERR(nby)) return nby ? nby : ray_error("oom", NULL);
+    if (!nby || RAY_IS_ERR(nby)) { r = nby ? nby : ray_error("oom", NULL); goto done; }
     ray_t* inner = select_dict_with_from(dict, tbl);
     ray_t* by_key = ray_sym(by_id);
     if (inner && !RAY_IS_ERR(inner) && by_key && !RAY_IS_ERR(by_key))
@@ -17705,10 +17753,10 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     else if (inner && !RAY_IS_ERR(inner)) { ray_release(inner); inner = NULL; }
     if (by_key && !RAY_IS_ERR(by_key)) ray_release(by_key);
     ray_release(nby);
-    if (!inner || RAY_IS_ERR(inner)) return inner ? inner : ray_error("oom", NULL);
+    if (!inner || RAY_IS_ERR(inner)) { r = inner ? inner : ray_error("oom", NULL); goto done; }
     ray_t* grouped = ray_select_impl(&inner, 1, plan);
     ray_release(inner);
-    if (!grouped || RAY_IS_ERR(grouped) || grouped->type != RAY_TABLE) return grouped;
+    if (!grouped || RAY_IS_ERR(grouped) || grouped->type != RAY_TABLE) { r = grouped; goto done; }
 
     /* over the groups: the keys in their order, a dropped one computed from
      * its key's column, then the outputs */
@@ -17730,15 +17778,8 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
             e = ray_sym(name);
         } else {
             name = alias[i];
-            ray_t** el = (ray_t**)ray_data(bvals[i]);
-            e = ray_list_new(3);
-            for (int k = 0; k < 3 && e && !RAY_IS_ERR(e); k++) {
-                bool src = k > 0 && el[k]->type == -RAY_SYM && el[k]->i64 == col[base[i]];
-                ray_t* a = src ? ray_sym(alias[base[i]]) : el[k];
-                if (!a || RAY_IS_ERR(a)) { ray_release(e); e = a; break; }
-                e = ray_list_append(e, a);
-                if (src) ray_release(a);
-            }
+            e = dexp[i];
+            ray_retain(e);
         }
         if (!e || RAY_IS_ERR(e)) { ray_release(ov); ov = e ? e : ray_error("oom", NULL); break; }
         ((int64_t*)ray_data(ok))[ok->len++] = name;
@@ -17747,13 +17788,16 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     }
     if (!ok || RAY_IS_ERR(ok) || !ov || RAY_IS_ERR(ov)) {
         if (ok && !RAY_IS_ERR(ok)) ray_release(ok);
-        if (ov && !RAY_IS_ERR(ov)) return ray_release(ov), ray_error("oom", NULL);
-        return ov ? ov : ray_error("oom", NULL);
+        if (ov && !RAY_IS_ERR(ov)) { ray_release(ov); ov = NULL; }
+        r = ov ? ov : ray_error("oom", NULL);
+        goto done;
     }
     ray_t* outer = ray_dict_new(ok, ov);
-    if (!outer || RAY_IS_ERR(outer)) return outer ? outer : ray_error("oom", NULL);
-    ray_t* r = ray_select_impl(&outer, 1, plan);
+    if (!outer || RAY_IS_ERR(outer)) { r = outer ? outer : ray_error("oom", NULL); goto done; }
+    r = ray_select_impl(&outer, 1, plan);
     ray_release(outer);
+done:
+    for (int64_t i = 0; i < nb; i++) if (dexp[i]) ray_release(dexp[i]);
     return r;
 }
 
