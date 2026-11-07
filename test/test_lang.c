@@ -7113,6 +7113,90 @@ static size_t lang_heap_bytes(void) {
     return s.bytes_allocated;
 }
 
+#ifdef DEBUG
+static _Thread_local int64_t alter_dict_extract_fail_at;
+
+/* Arm only after all expression setup/evaluation is done. The next blocks
+ * belong to key/value extraction and the dict's COW, not parsing or the
+ * unrelated header-only numeric atom constructors. */
+static ray_t* alter_dict_arm_extract_failure(ray_t* value) {
+    ray_retain(value);
+    ray_alloc_fail_set_for_test(alter_dict_extract_fail_at, 1);
+    return value;
+}
+#endif
+
+static test_result_t test_eval_alter_dict_extract_oom(void) {
+#ifndef DEBUG
+    SKIP("allocation injection requires DEBUG");
+#else
+    ray_t* name = ray_sym(ray_sym_intern("_alter_owned", sizeof("_alter_owned") - 1));
+    ray_t* op = ray_sym(ray_sym_intern("set", 3));
+    ray_t* keys = ray_eval_str("[\"a\" \"b\"]");
+    ray_t* values = ray_eval_str("[\"x\" \"y\"]");
+    ray_t* fn = ray_fn_unary("alter-arm-extraction", 0, alter_dict_arm_extract_failure);
+    TEST_ASSERT_TRUE(name && op && keys && values && fn);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(keys) || RAY_IS_ERR(values) || RAY_IS_ERR(fn));
+    TEST_ASSERT_EQ_I(keys->type, RAY_STR);
+    TEST_ASSERT_EQ_I(values->type, RAY_STR);
+    name->attrs |= ATTR_QUOTED;
+    ray_t* call = ray_list_new(2);
+    call = ray_list_append(call, fn);
+    call = ray_list_append(call, values);
+    TEST_ASSERT_TRUE(call && !RAY_IS_ERR(call));
+    ray_t* args[] = {name, op, keys, call};
+    alter_dict_extract_fail_at = 0;
+    ray_t* warm = ray_eval(call);
+    TEST_ASSERT_TRUE(warm && !RAY_IS_ERR(warm));
+    ray_release(warm);
+    int bad = 0;
+    /* key1/value1, header/value-list COW, key2/value2. Later failures
+     * discard an already modified private dict, never publish a prefix. */
+    for (int64_t nth = 1; nth <= 6; nth++) {
+        ray_t* original = ray_eval_str("(set _alter_owned (dict [\"a\" \"b\"] (list \"u\" \"v\")))");
+        TEST_ASSERT_TRUE(original && !RAY_IS_ERR(original));
+        TEST_ASSERT_EQ_I(original->type, RAY_DICT);
+        TEST_ASSERT_EQ_I(ray_dict_vals(original)->type, RAY_LIST);
+        uint32_t refs = original->rc;
+        size_t before = lang_heap_bytes();
+        alter_dict_extract_fail_at = nth;
+        ray_t* r = ray_alter_fn(args, 4);
+        ray_alloc_fail_set_for_test(0, 0);
+        alter_dict_extract_fail_at = 0;
+        bool oom = RAY_IS_ERR(r) && strcmp(ray_err_code(r), "oom") == 0;
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        size_t after = lang_heap_bytes();
+        ray_t* current = ray_eval_str("_alter_owned");
+        bool unchanged = current == original && original->rc == refs + 1u;
+        ray_t** vv = (ray_t**)ray_data(ray_dict_vals(original));
+        unchanged = unchanged && ray_str_len(vv[0]) == 1 && ray_str_ptr(vv[0])[0] == 'u'
+                              && ray_str_len(vv[1]) == 1 && ray_str_ptr(vv[1])[0] == 'v';
+        ray_release(current);
+        if (!oom || before != after || !unchanged) {
+            fprintf(stderr, "alter dict fault %lld: oom=%d bytes=%zu/%zu unchanged=%d\n",
+                    (long long)nth, (int)oom, before, after, (int)unchanged);
+            bad++;
+        }
+        ray_release(original);
+        r = ray_alter_fn(args, 4);
+        bool healthy = r && !RAY_IS_ERR(r) && r->type == -RAY_SYM;
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        current = ray_eval_str("_alter_owned");
+        if (current && !RAY_IS_ERR(current) && current->type == RAY_DICT) {
+            vv = (ray_t**)ray_data(ray_dict_vals(current));
+            healthy = healthy && ray_str_len(vv[0]) == 1 && ray_str_ptr(vv[0])[0] == 'x'
+                              && ray_str_len(vv[1]) == 1 && ray_str_ptr(vv[1])[0] == 'y';
+        } else healthy = false;
+        if (RAY_IS_ERR(current)) ray_error_free(current); else ray_release(current);
+        if (!healthy) bad++;
+    }
+    ray_release(call); ray_release(fn); ray_release(values); ray_release(keys);
+    ray_release(op); ray_release(name);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+
 /* What a handler gets for an engine error, built with each of its
  * allocations failed in turn: the message (one block, or two from 7 bytes
  * on), the code symbol, the keys, the values and the dict.  Failed alone,
@@ -11823,6 +11907,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/and_or_forms", test_eval_and_or_forms, lang_setup, lang_teardown },
     { "lang/eval/get_error_trace", test_eval_get_error_trace, lang_setup, lang_teardown },
     { "lang/eval/try_raise_value", test_eval_try_raise_value, lang_setup, lang_teardown },
+    { "lang/eval/alter_dict_extract_oom", test_eval_alter_dict_extract_oom, lang_setup, lang_teardown },
     { "lang/eval/try_error_value_oom", test_eval_try_error_value_oom, lang_setup, lang_teardown },
     { "lang/eval/try_value_handler_builds_nothing", test_eval_try_value_handler_builds_nothing, lang_setup, lang_teardown },
     { "lang/eval/try_catch_releases", test_eval_try_catch_releases, lang_setup, lang_teardown },
