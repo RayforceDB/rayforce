@@ -5272,7 +5272,13 @@ ray_t* ray_eval(ray_t* obj) {
     if (obj->type != RAY_LIST) { ray_retain(obj); ret = obj; rows = 0; goto out; }
 
     /* Empty list */
-    if (ray_len(obj) == 0) { ray_retain(obj); ret = obj; rows = 0; goto out; }
+    if (ray_len(obj) == 0) {
+        /* An empty IPC argument may still carry the transient literal
+         * mark; consume it so a handler that keeps the list and appends
+         * an ordinary expression later does not inherit it. */
+        if (obj->attrs & RAY_EVAL_LITERAL_FALLBACK) clear_ipc_literal_list(obj);
+        ray_retain(obj); ret = obj; rows = 0; goto out;
+    }
 
     /* List: evaluate first element, dispatch by type */
     ray_t** elems = (ray_t**)ray_data(obj);
