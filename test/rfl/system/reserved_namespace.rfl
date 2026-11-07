@@ -33,8 +33,8 @@
 ;; open, close, send, post, handle, auto_journal_eval, txlimit, transport
 ;; outside an auto-journaled IPC request the scope predicate is false
 (.ipc.auto_journal_eval) -- false
-(count .log) -- 10
-;; open, write, replay, validate, roll, snapshot, sync, close, purge, status
+(count .log) -- 11
+;; open, write, replay, replay_report, validate, roll, snapshot, sync, close, purge, status
 (count .csv) -- 4
 ;; read, splayed, parted, write
 ;; .db.* — three-level reserved namespace for storage I/O.  The

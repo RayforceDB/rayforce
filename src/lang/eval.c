@@ -4949,6 +4949,7 @@ static void ray_register_builtins(void) {
     register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
     register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
     register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
+    register_unary(".log.replay_report", RAY_FN_RESTRICTED, ray_log_replay_report_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
     register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
     register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);
