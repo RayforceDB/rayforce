@@ -118,12 +118,12 @@ ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
                                   const uint8_t*          payload,
                                   int64_t                 payload_len);
 
-/* Replay a log file, evaluating each entry in order.  Sets *out_chunks
- * to entries successfully replayed and *out_eval_errors to entries that
- * deserialized cleanly but raised an error during ray_eval (those are
- * skipped with a stderr warning, not fatal — framing was intact).
- * *out_status is RAY_JREPLAY_OK on a clean tail or RAY_JREPLAY_BADTAIL
- * if a truncated/corrupt frame was found. */
+/* Replay a log file, evaluating each entry in order.  *out_chunks counts
+ * evaluated entries INCLUDING entries whose evaluation returned an error;
+ * *out_eval_errors counts those errors.  They warn and replay continues:
+ * no rollback of an entry's partial effects or the already-applied prefix.
+ * *out_status records a terminal framing/read/decode/resource/interruption
+ * failure, or RAY_JREPLAY_OK on a clean tail (not proof all evals succeeded). */
 ray_err_t ray_journal_replay(const char*           path,
                              int64_t*              out_chunks,
                              int64_t*              out_eval_errors,

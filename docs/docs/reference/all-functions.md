@@ -47,7 +47,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `read-bytes`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
-`.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`,
+`.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
@@ -797,6 +797,8 @@ Built-in Entity-Attribute-Value store. The EAV table has three columns: `e` (ent
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
+| `.log.replay` | unary | restricted | Replay and return processed entries, **including** evaluation errors; warns and continues, no rollback | `(.log.replay "journal.log")` |
+| `.log.replay_report` | unary | restricted | Replay **once** and return I64 `entries` / `eval_errors` on a clean tail; terminal errors still raise and may leave an applied prefix. Not a previous-call status getter, fail-fast mode, or invariant/rollback guarantee | `(.log.replay_report "journal.log")` |
 | `.log.status` | variadic | — | Journal state as a dict of six fields: `open` (handle present), `opened_ok` (a journal was opened successfully at least once), `path`, `mode` (`sync`/`async`; both null if never opened successfully), `bytes` (nullable: null if the size probe failed), `auto` (inside an auto-journaled request); raises only on allocation/intern failure | `(if (get (.log.status) 'open) null (exit 1))` |
 
 ## Datalog
