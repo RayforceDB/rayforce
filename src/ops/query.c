@@ -17663,6 +17663,10 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
             if (alias[j] == dropped[k] && base[j] < 0) return NULL;
         for (int j = 0; j < k; j++) if (dropped[j] == dropped[k]) return NULL;
     }
+    /* The groups' columns are read back by name: a lexical local of a key's
+     * name would hide its column. */
+    for (int64_t j = 0; j < nb; j++)
+        if (ray_env_get_lexical_local(alias[j])) return NULL;
     int64_t from_id = ray_sym_intern("from", 4), by_id = ray_sym_intern("by", 2);
     int64_t where_id = ray_sym_intern("where", 5), take_id = ray_sym_intern("take", 4);
     int64_t asc_id = ray_sym_intern("asc", 3), desc_id = ray_sym_intern("desc", 4);
@@ -17675,6 +17679,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         if (select_expr_mentions(vals[i], dropped, n_drop)) return NULL;
         if (kid == where_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
         for (int64_t j = 0; j < nb; j++) if (alias[j] == kid) return NULL;
+        if (ray_env_get_lexical_local(kid)) return NULL;
         n_out++;
     }
 

@@ -230,3 +230,8 @@
 (set Ti (table [k v] (list (as 'I32 [7 7 9]) [1 2 3])))
 (at (select {from: Ti by: {k: k j: (- k 1)} c: (count v) desc: c}) 'j) -- [6 8]
 (type (at (select {from: Ti by: {k: k j: (- k 1)} c: (count v) desc: c}) 'k)) -- 'I32
+;; a parameter named as an output or a key does not hide its column
+(set Fe (fn [c] (select {from: Te by: {k: k j: (- k 1)} c: (count v) desc: c})))
+(Fe 5) -- (select {from: Ue by: {k: k j: j} c: (count v) desc: c})
+(set Ge (fn [a] (select {from: Te by: {a: k j: (- k 1)} c: (count v) desc: c})))
+(Ge 5) -- (select {from: Ue by: {a: k j: j} c: (count v) desc: c})
