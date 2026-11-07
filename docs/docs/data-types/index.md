@@ -136,6 +136,7 @@ ray> (as 'DATE "2024.01.15")
 | STR | SYM | Interns the string |
 | DATE | TIMESTAMP | Midnight on that date |
 | TIMESTAMP | DATE | Truncates to day |
+| Any typed vector | LIST | Boxes each cell into an atom (`(as 'LIST [1 2])` is a two-item `LIST` of `i64` atoms); null cells stay typed null atoms. A `LIST` is returned unchanged; an atom, dict or table is a `type` error |
 
 ## Temporal Types
 
