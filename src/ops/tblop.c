@@ -1387,17 +1387,31 @@ static ray_t* alter_target(ray_t** args, int64_t n,
             for (int64_t k = 0; k < nkeys; k++) {
                 int ka = 0, va = 0;
                 ray_t* key = many ? collection_elem(idx, k, &ka) : idx;
-                ray_t* v = pairwise ? collection_elem(val, k, &va) : val;
-                ray_t* nd;
-                if (!key || RAY_IS_ERR(key) || !ray_is_atom(key)) {
-                    const char* kt = key && !RAY_IS_ERR(key) ? ray_type_name(key->type) : "null";
-                    nd = ray_error("type", "alter set: dict key must be an atom, got %s", kt);
-                    ray_release(d);
-                } else {
-                    nd = ray_dict_upsert(d, key, v);
+                /* Extraction errors are owned, even when the helper's
+                 * allocated flag is zero. Transfer them, not a new type
+                 * error; do not extract a value after a failed key. */
+                if (!key || RAY_IS_ERR(key)) {
+                    ray_release(d); ray_release(idx); ray_release(val); ray_release(name_sym);
+                    return key ? key : ray_error("oom", NULL);
                 }
+                if (!ray_is_atom(key)) {
+                    ray_t* err = ray_error("type", "alter set: dict key must be an atom, got %s", ray_type_name(key->type));
+                    if (ka) ray_release(key);
+                    ray_release(d); ray_release(idx); ray_release(val); ray_release(name_sym);
+                    return err;
+                }
+                ray_t* v = pairwise ? collection_elem(val, k, &va) : val;
+                if (!v || RAY_IS_ERR(v)) {
+                    if (ka) ray_release(key);
+                    ray_release(d); ray_release(idx); ray_release(val); ray_release(name_sym);
+                    return v ? v : ray_error("oom", NULL);
+                }
+                ray_t* nd = ray_dict_upsert(d, key, v);
                 if (ka) ray_release(key);
                 if (va) ray_release(v);
+                /* Upsert consumes d on success or owned error. Its NULL
+                 * return is a failed header COW, which retains our ref. */
+                if (!nd) { ray_release(d); nd = ray_error("oom", NULL); }
                 if (RAY_IS_ERR(nd)) { ray_release(idx); ray_release(val); ray_release(name_sym); return nd; }
                 d = nd;
             }
