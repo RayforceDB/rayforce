@@ -17639,6 +17639,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     int64_t alias[SELECT_DEP_MAX_KEYS], col[SELECT_DEP_MAX_KEYS], dropped[SELECT_DEP_MAX_KEYS];
     int base[SELECT_DEP_MAX_KEYS];   /* a dropped key: the key whose column it reads; else -1 */
     ray_t* op[SELECT_DEP_MAX_KEYS];  /* a dropped key: the + or - its head names now */
+    int cside[SELECT_DEP_MAX_KEYS];  /* a dropped key: its operand that names the column */
     int n_drop = 0;
     for (int64_t i = 0; i < nb; i++) {
         alias[i] = sym_cell_runtime_id(bk, i);
@@ -17668,7 +17669,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
             if (c->type != -RAY_U8 && c->type != -RAY_I16 && c->type != -RAY_I32 &&
                 c->type != -RAY_I64 && c->type != -RAY_F32 && c->type != -RAY_F64) continue;
             for (int64_t j = 0; j < nb && base[i] < 0; j++)
-                if (j != i && col[j] == s->i64) base[i] = (int)j;
+                if (j != i && col[j] == s->i64) { base[i] = (int)j; cside[i] = side; }
         }
         if (base[i] >= 0) dropped[n_drop++] = alias[i];
     }
@@ -17707,27 +17708,9 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
      * the groups no longer carry. */
     if (!n_out) return NULL;
 
-    /* The dropped keys' expressions, built before the grouping runs its
-     * clauses (which may rebind a name): the head is the + or - its name
-     * held now, the base column the base key's column in the groups. */
-    ray_t* dexp[SELECT_DEP_MAX_KEYS] = {0};
-    for (int64_t i = 0; i < nb; i++) {
-        if (base[i] < 0) continue;
-        ray_t** el = (ray_t**)ray_data(bvals[i]);
-        ray_t* e = ray_list_new(3);
-        for (int k = 0; k < 3 && e && !RAY_IS_ERR(e); k++) {
-            bool src = k > 0 && el[k]->type == -RAY_SYM && el[k]->i64 == col[base[i]];
-            ray_t* a = k == 0 ? op[i] : src ? ray_sym(alias[base[i]]) : el[k];
-            if (!a || RAY_IS_ERR(a)) { ray_release(e); e = a; break; }
-            e = ray_list_append(e, a);
-            if (src) ray_release(a);
-        }
-        if (!e || RAY_IS_ERR(e)) {
-            for (int64_t j = 0; j < i; j++) if (dexp[j]) ray_release(dexp[j]);
-            return e ? e : ray_error("oom", NULL);
-        }
-        dexp[i] = e;
-    }
+    /* The grouping runs its clauses, which may rebind a name: the + or -
+     * each dropped key's head names now is held for after it. */
+    for (int64_t i = 0; i < nb; i++) if (base[i] >= 0) ray_retain(op[i]);
 
     /* the grouping, by the other keys */
     ray_t* nk = ray_vec_new(RAY_SYM, nb - n_drop);
@@ -17757,9 +17740,18 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     ray_t* grouped = ray_select_impl(&inner, 1, plan);
     ray_release(inner);
     if (!grouped || RAY_IS_ERR(grouped) || grouped->type != RAY_TABLE) { r = grouped; goto done; }
+    /* a dropped key, from its base key's column in the groups */
+    for (int64_t i = 0; i < nb; i++) {
+        if (base[i] < 0) continue;
+        ray_t* bc = ray_table_get_col(grouped, alias[base[i]]);
+        ray_t* c = ((ray_t**)ray_data(bvals[i]))[3 - cside[i]];
+        ray_t* v = !bc ? ray_error("schema", NULL) : cside[i] == 1 ? call_fn2(op[i], bc, c) : call_fn2(op[i], c, bc);
+        if (v && !RAY_IS_ERR(v)) { grouped = ray_table_add_col(grouped, alias[i], v); ray_release(v); }
+        else { ray_release(grouped); grouped = v ? v : ray_error("oom", NULL); }
+        if (RAY_IS_ERR(grouped)) { r = grouped; goto done; }
+    }
 
-    /* over the groups: the keys in their order, a dropped one computed from
-     * its key's column, then the outputs */
+    /* over the groups: the keys in their order, then the outputs */
     ray_t* ok = ray_vec_new(RAY_SYM, 1 + nb + n_out);
     ray_t* ov = ray_list_new((int32_t)(1 + nb + n_out));
     if (ok && !RAY_IS_ERR(ok)) ((int64_t*)ray_data(ok))[ok->len++] = from_id;
@@ -17773,13 +17765,9 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
             if (name == from_id || name == by_id || name == where_id || name == take_id ||
                 name == asc_id || name == desc_id) continue;
             e = ray_sym(name);
-        } else if (base[i] < 0) {
-            name = alias[i];
-            e = ray_sym(name);
         } else {
             name = alias[i];
-            e = dexp[i];
-            ray_retain(e);
+            e = ray_sym(name);
         }
         if (!e || RAY_IS_ERR(e)) { ray_release(ov); ov = e ? e : ray_error("oom", NULL); break; }
         ((int64_t*)ray_data(ok))[ok->len++] = name;
@@ -17797,7 +17785,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     r = ray_select_impl(&outer, 1, plan);
     ray_release(outer);
 done:
-    for (int64_t i = 0; i < nb; i++) if (dexp[i]) ray_release(dexp[i]);
+    for (int64_t i = 0; i < nb; i++) if (base[i] >= 0) ray_release(op[i]);
     return r;
 }
 

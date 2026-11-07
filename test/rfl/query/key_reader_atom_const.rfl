@@ -245,3 +245,5 @@
 ;; the + or - the key's name held when the select began, though a clause rebinds it
 (set dep_op +)
 (select {from: Te by: {kk: k j: (dep_op k 1)} c: (count v) desc: c take: (do (set dep_op -) 2)}) -- (table [kk j c] (list [0Nl 3] [0Nl 4] [4 3]))
+;; no groups: the dependent key is still a typed column
+(select {from: Te by: {k: k j: (- k 1)} c: (count v) where: (> v 99)}) -- (select {from: Ue by: {k: k j: j} c: (count v) where: (> v 99)})
