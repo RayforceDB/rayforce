@@ -708,6 +708,7 @@ ray_t* ray_log_open_fn(ray_t** args, int64_t n);
 ray_t* ray_log_status_fn(ray_t** args, int64_t n);
 ray_t* ray_log_write_fn(ray_t* expr);
 ray_t* ray_log_replay_fn(ray_t* path);
+ray_t* ray_log_replay_report_fn(ray_t* path);
 ray_t* ray_log_validate_fn(ray_t* path);
 ray_t* ray_log_roll_fn(ray_t** args, int64_t n);
 ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n);
