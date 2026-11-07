@@ -192,8 +192,19 @@ unquoted) is passed as data: `(list 'upd (list 'in 1 2))` gives `upd` the list
 A nested list headed by a function value still runs on the server, as
 `(list til 10)` does above. Clients that deliberately sent a quoted symbol
 head to call it can send the function value instead (for example,
-`(list in 1 2)`) or send a source string. Newly written journal frames
-record this rule; older frames replay under their original rule.
+`(list in 1 2)`) or send a source string.
+
+The rule a frame follows is recorded in the journal frame's own header, as the
+flag `0x10` (`RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS`). This is a journal-only marker:
+the live wire version is unchanged, so live peers are unaffected and only replay
+reads it. A server with this change replays each frame under the rule its header
+records, so a frame written by an earlier version — which carries no flag —
+still replays under the old rule, exactly as it always did. The marker only
+travels forward, though: a server from *before* this change does not recognise
+the flag, so when it replays a frame that a newer server wrote with the flag
+set, it applies the old rule and that entry can replay to a different stored
+value. Once a journal holds flagged frames, do not roll the server back below
+this change to replay them.
 
 For dynamic queries, substitute values into the dict at construction time:
 
