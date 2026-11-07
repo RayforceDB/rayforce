@@ -206,3 +206,54 @@
 (as 'I64 (at (at Gd32 'k) 0)) -- 2
 (at (at Gd32 'a) 0) -- 9
 (at (at Gd32 'c) 0) -- 2
+
+;; ============================================================
+;; Part E — select_drop_dependent_keys: a key that is another key's
+;; column plus or minus a number is left out of the grouping and
+;; computed on its groups.  Each expected result groups by the same
+;; keys held as plain columns (j = k - 1, m = 5 + k, d = 10 - k),
+;; which the rule does not touch.  k appears 4 (null), 3, 2 and 1
+;; times, so count-descending orders are unique.
+;; ============================================================
+(set Te (table [k v] (list [3 1 3 2 0Nl 3 2 0Nl 0Nl 0Nl] [1 2 3 4 5 6 7 8 9 10])))
+(set Ue (table [k v j m d] (list (at Te 'k) (at Te 'v) (- (at Te 'k) 1) (+ 5 (at Te 'k)) (- 10 (at Te 'k)))))
+(select {from: Te by: {k: k j: (- k 1) m: (+ 5 k)} c: (count v) s: (sum v) desc: c}) -- (select {from: Ue by: {k: k j: j m: m} c: (count v) s: (sum v) desc: c})
+;; the null key's group keeps null dependent keys
+(at (select {from: Te by: {k: k j: (- k 1)} c: (count v) desc: c take: 1}) 'j) -- [0Nl]
+;; a base key under another name; the column on the right of `-`
+(select {from: Te by: {kk: k d: (- 10 k)} c: (count v) desc: c}) -- (select {from: Ue by: {kk: k d: d} c: (count v) desc: c})
+;; where: and take: run in the grouping
+(select {from: Te by: {k: k j: (- k 1)} c: (count v) where: (> v 2) desc: c take: 2}) -- (select {from: Ue by: {k: k j: j} c: (count v) where: (> v 2) desc: c take: 2})
+;; a sort on the dependent key keeps it in the grouping
+(select {from: Te by: {k: k j: (- k 1)} c: (count v) asc: j}) -- (select {from: Ue by: {k: k j: j} c: (count v) asc: j})
+;; an I32 base: the dependent key is I64, as the arithmetic gives it
+(set Ti (table [k v] (list (as 'I32 [7 7 9]) [1 2 3])))
+(at (select {from: Ti by: {k: k j: (- k 1)} c: (count v) desc: c}) 'j) -- [6 8]
+(type (at (select {from: Ti by: {k: k j: (- k 1)} c: (count v) desc: c}) 'k)) -- 'I32
+;; a parameter named as an output or a key does not hide its column
+(set Fe (fn [c] (select {from: Te by: {k: k j: (- k 1)} c: (count v) desc: c})))
+(Fe 5) -- (select {from: Ue by: {k: k j: j} c: (count v) desc: c})
+(set Ge (fn [a] (select {from: Te by: {a: k j: (- k 1)} c: (count v) desc: c})))
+(Ge 5) -- (select {from: Ue by: {a: k j: j} c: (count v) desc: c})
+;; no outputs: the grouped select keeps first-of-group source columns
+(at (select {from: Te by: {kk: k j: (- k 1)}}) 'v) -- (at (select {from: Ue by: {kk: k j: j}}) 'v)
+;; a later key reading the dependent key by its name
+(select {from: Te by: {kk: k j: (- k 1) h: (+ j 2)} c: (count v) desc: c}) -- (select {from: Ue by: {kk: k j: j h: (+ j 2)} c: (count v) desc: c})
+;; a sort naming the dependent key in a vector
+(select {from: Te by: {kk: k j: (- k 1)} c: (count v) asc: [j] take: 2}) -- (select {from: Ue by: {kk: k j: j} c: (count v) asc: [j] take: 2})
+(select {from: Te by: {kk: k j: (- k 1)} c: (count v) desc: [c j]}) -- (select {from: Ue by: {kk: k j: j} c: (count v) desc: [c j]})
+;; the + or - the key's name held when the select began, though a clause rebinds it
+(set dep_op +)
+(select {from: Te by: {kk: k j: (dep_op k 1)} c: (count v) desc: c take: (do (set dep_op -) 2)}) -- (table [kk j c] (list [0Nl 3] [0Nl 4] [4 3]))
+;; no groups: the dependent key is still a typed column
+(select {from: Te by: {k: k j: (- k 1)} c: (count v) where: (> v 99)}) -- (select {from: Ue by: {k: k j: j} c: (count v) where: (> v 99)})
+;; a narrow base with the constant first widens as the arithmetic does
+(set Tn (table [k v] (list (as 'I16 [32767 1 32767]) [1 2 3])))
+(at (select {from: Tn by: {k: k j: (+ 1 k)} c: (count v) desc: c}) 'j) -- [32768 2]
+(set Tu (table [k v] (list (as 'U8 [3 1 3]) [1 2 3])))
+(at (select {from: Tu by: {k: k j: (- 1 k)} c: (count v) desc: c}) 'j) -- [-2 0]
+;; a narrow constant or a temporal base keeps the key in the grouping, which types it
+(set Tw (table [k v] (list (as 'U8 [3 1 3 0]) [1 2 3 4])))
+(at (select {from: Tw by: {k: k j: (- k 0x02)} c: (count v) asc: k}) 'j) -- [-2 -1 1]
+(set Td (table [k v] (list [2024.01.03 2024.01.01 2024.01.03] [1 2 3])))
+(type (at (select {from: Td by: {k: k j: (- k 2)} c: (count v) asc: k}) 'j)) -- (type (at (select {from: Td by: {k: k j: (- k 2)} c: (count v) asc: [k j]}) 'j))
