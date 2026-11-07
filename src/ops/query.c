@@ -17744,12 +17744,12 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     /* a dropped key, from its base key's column in the groups */
     for (int64_t i = 0; i < nb; i++) {
         if (base[i] < 0) continue;
-        ray_t* bc = ray_table_get_col(grouped, alias[base[i]]);
+        ray_t* bc = ray_table_col(grouped, alias[base[i]]);
         ray_t* c = ((ray_t**)ray_data(bvals[i]))[3 - cside[i]];
         /* as the evaluator applies it: the opcode's kernel widens a narrow
          * column, a constant on either side */
         ray_binary_fn f = (ray_binary_fn)(uintptr_t)op[i]->i64;
-        ray_t* v = !bc ? ray_error("schema", NULL)
+        ray_t* v = !bc ? ray_error("schema", NULL) : RAY_IS_ERR(bc) ? bc
                  : atomic_map_binary_op(f, RAY_FN_OPCODE(op[i]), cside[i] == 1 ? bc : c, cside[i] == 1 ? c : bc);
         if (v && !RAY_IS_ERR(v)) { grouped = ray_table_add_col(grouped, alias[i], v); ray_release(v); }
         else { ray_release(grouped); grouped = v ? v : ray_error("oom", NULL); }
