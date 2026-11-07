@@ -4935,14 +4935,15 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
             return;
         }
 
-        ray_t *in_hdr = NULL, *out_hdr = NULL;
-        ts_mvar_item_t* in = (ts_mvar_item_t*)scratch_alloc(
-            &in_hdr, (size_t)cap * sizeof(ts_mvar_item_t));
-        ts_mvar_item_t* out = (ts_mvar_item_t*)scratch_alloc(
-            &out_hdr, (size_t)cap * sizeof(ts_mvar_item_t));
-        if (!in || !out) {
-            if (in_hdr) scratch_free(in_hdr);
-            if (out_hdr) scratch_free(out_hdr);
+        /* The two stacks contain at most cap items together. Incoming grows
+         * from the left, outgoing from the right; transfer copies a popped
+         * item before replacing its slot. No extra cell is needed: expiration
+         * precedes the next push when the window is full. */
+        ray_t* queue_hdr = NULL;
+        ts_mvar_item_t* items = (ts_mvar_item_t*)scratch_alloc(
+            &queue_hdr, (size_t)cap * sizeof(ts_mvar_item_t));
+        if (!items) {
+            if (queue_hdr) scratch_free(queue_hdr);
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
             return;
         }
@@ -4950,8 +4951,7 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
         int64_t in_len = 0, out_len = 0, queue_len = 0;
         for (int64_t r = scan_lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - scan_lo)) {
-                scratch_free(in_hdr);
-                scratch_free(out_hdr);
+                scratch_free(queue_hdr);
                 return;
             }
 
@@ -4960,15 +4960,14 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
                     int64_t transferred = 0;
                     while (in_len > 0) {
                         if (ts_morsel_checkpoint(c->pool, transferred++)) {
-                            scratch_free(in_hdr);
-                            scratch_free(out_hdr);
+                            scratch_free(queue_hdr);
                             return;
                         }
-                        ts_mvar_item_t item = in[--in_len];
+                        ts_mvar_item_t item = items[--in_len];
                         ts_mvar_state_t one = ts_mvar_singleton(item.value, item.nonnull);
                         item.aggregate = out_len == 0 ? one :
-                            ts_mvar_merge(one, out[out_len - 1].aggregate);
-                        out[out_len++] = item;
+                            ts_mvar_merge(one, items[cap - out_len].aggregate);
+                        items[cap - ++out_len] = item;
                     }
                 }
                 out_len--;
@@ -4978,19 +4977,19 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
             bool nonnull = !(c->has_nulls && ray_vec_is_null(c->src, r));
             double value = nonnull ? ts_read_as_f64(c->src, r) : 0.0;
             ts_mvar_state_t one = ts_mvar_singleton(value, nonnull);
-            in[in_len] = (ts_mvar_item_t){
+            items[in_len] = (ts_mvar_item_t){
                 .value = value,
                 .nonnull = nonnull,
                 .aggregate = in_len == 0 ? one :
-                    ts_mvar_merge(in[in_len - 1].aggregate, one)
+                    ts_mvar_merge(items[in_len - 1].aggregate, one)
             };
             in_len++;
             queue_len++;
 
             if (r >= lo) {
                 ts_mvar_state_t state = {0};
-                if (out_len > 0) state = out[out_len - 1].aggregate;
-                if (in_len > 0) state = ts_mvar_merge(state, in[in_len - 1].aggregate);
+                if (out_len > 0) state = items[cap - out_len].aggregate;
+                if (in_len > 0) state = ts_mvar_merge(state, items[in_len - 1].aggregate);
                 if (state.count == 0) {
                     ray_vec_set_null(c->dst, r, true);
                 } else if (state.count == 1) {
@@ -5003,8 +5002,7 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
                 }
             }
         }
-        scratch_free(in_hdr);
-        scratch_free(out_hdr);
+        scratch_free(queue_hdr);
     }
 }
 
