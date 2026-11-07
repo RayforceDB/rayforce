@@ -28138,9 +28138,16 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 /* Same-typed fixed-width vector (SYM already W64 runtime
                  * here, so ids are verbatim): one reserve, one memcpy.
                  * Raw cells carry their null sentinels; propagate the
-                 * flag with them. */
+                 * flag only when the payload really has a null.  SYM
+                 * vectors always answer ray_vec_may_have_nulls true, so
+                 * they are scanned (as in vec concat): a null-free batch
+                 * must not mark the column, or ser of equal rows would
+                 * depend on how they arrived. */
+                bool pay_nulls = (pay->type == RAY_SYM)
+                                     ? ray_vec_text_has_nulls(pay)
+                                     : ray_vec_may_have_nulls(pay);
                 res = ray_vec_append_raw(col, ray_data(pay), ray_len(pay));
-                if (!RAY_IS_ERR(res) && ray_vec_may_have_nulls(pay))
+                if (!RAY_IS_ERR(res) && pay_nulls)
                     res->attrs |= RAY_ATTR_HAS_NULLS;
             } else if (ray_is_vec(pay) || pay->type == RAY_LIST) {
                 /* Differently-typed vector or generic list: coerce cell by

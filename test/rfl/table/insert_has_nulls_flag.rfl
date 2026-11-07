@@ -1,0 +1,61 @@
+;; #1024: a batch insert must not mark a SYM column HAS_NULLS when no cell is
+;; null.  ray_vec_may_have_nulls is always true for SYM/STR ("cannot prove
+;; null-free from attrs"), so the in-place append copied it as the flag and
+;; ser of equal, null-free rows depended on how they arrived.  Byte 17 of ser
+;; of a column is its flag byte: 0x00 clean, 0x40 HAS_NULLS.
+
+(set mk (fn [n] (as 'table (dict [a b] (list (take [SRC] n) (til n))))))
+(set mks (fn [n] (as 'table (dict [a b] (list (take ["x"] n) (til n))))))
+(set fl (fn [t] (at (ser (at t 'a)) 17)))
+
+;; ── the four shapes of the report: all clean ────────────────────────────
+(set j (mk 1))
+(insert 'j (mk 2))
+(fl j) -- 0x00
+(set j (mk 1))
+(insert 'j (list 'SRC 5))
+(fl j) -- 0x00
+(set j (mk 1))
+(insert 'j (list (take [SRC] 2) [5 6]))
+(fl j) -- 0x00
+(fl (mk 3)) -- 0x00
+
+;; equal null-free data serialises identically whatever the insert history
+(set jb (mk 1))
+(insert 'jb (mk 2))
+(set jr (mk 1))
+(insert 'jr (list 'SRC 1))
+(insert 'jr (list 'SRC 2))
+(all (== (ser (at jb 'a)) (ser (at jr 'a)))) -- true
+(all (== (ser (at jb 'a)) (ser (at (mk 3) 'a)))) -- true
+
+;; ── STR columns stay clean too ──────────────────────────────────────────
+(set j (mks 1))
+(insert 'j (mks 2))
+(fl j) -- 0x00
+(set j (mks 1))
+(insert 'j (list (take ["y"] 2) [5 6]))
+(fl j) -- 0x00
+(set j (mks 1))
+(insert 'j (list "z" 5))
+(fl j) -- 0x00
+(fl (mks 3)) -- 0x00
+
+;; ── a payload that DOES hold a null keeps the flag and the null ─────────
+(set j (mk 1))
+(insert 'j (as 'table (dict [a b] (list [SRC '] [1 2]))))
+(fl j) -- 0x40
+(nil? (at j 'a)) -- [false false true]
+(count j) -- 3
+
+(set j (mks 1))
+(insert 'j (as 'table (dict [a b] (list (list "q" "") [1 2]))))
+(fl j) -- 0x40
+(nil? (at j 'a)) -- [false false true]
+
+;; a clean batch after a null one does not clear the flag
+(set j (mk 1))
+(insert 'j (as 'table (dict [a b] (list [SRC '] [1 2]))))
+(insert 'j (mk 2))
+(fl j) -- 0x40
+(nil? (at j 'a)) -- [false false true false false]
