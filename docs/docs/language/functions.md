@@ -100,8 +100,8 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `wavg` | binary, aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
 | `quantile` | binary, aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
 | `percentile` | binary, aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
-| `first` | unary | First element of vector | `(first [10 20 30])` → `10` |
-| `last` | unary | Last element of vector | `(last [10 20 30])` → `30` |
+| `first` | unary | First element of vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `1` |
+| `last` | unary | Last element of vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally, `(at v (- (count v) 1))` | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `2` |
 
 Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a row when either vector input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
 
