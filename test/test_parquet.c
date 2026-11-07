@@ -1483,6 +1483,75 @@ static test_result_t test_pq_sym_grouped_failures(void) {
     PASS();
 }
 
+/* Training visits only the first encoding chunk, including when its end
+ * falls inside a large group or after several small groups. The remaining
+ * full-group conversion keeps its strict reader path. Compare the numeric
+ * file with the same codec's forced-file route, not merely loaded rows. */
+static test_result_t test_pq_train_prefix(void) {
+    pq_sym_env_clear();
+    const struct { int64_t rows, groups; int cores; } cases[] = {
+        {200000,1,1}, {200000,9,4}, {131072,4,1}, {32767,1,4}
+    };
+    int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,tids,3);
+    int64_t keys[] = {ray_sym_intern("types",5),ray_sym_intern("compress",8),ray_sym_intern("rows",4)};
+    ray_t* values = ray_list_new(3);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    /* A reachable non-chunk-sized batch exercises the cached last-batch cap. */
+    ((ray_t**)ray_data(values))[2] = ray_i64(50000);
+    values->len = 3;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,3),values);
+    size_t trace_cap = (size_t)1 << 16;
+    char* trace = ray_sys_alloc(trace_cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    const char* names[] = {"x","s","t"};
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        char src[160], dir[2][180], partial[220], a[220], b[220];
+        snprintf(src,sizeof(src),"/tmp/rayforce-pq-prefix-%d-%zu.parquet",(int)getpid(),i);
+        for (int k = 0; k < 2; k++)
+            snprintf(dir[k],sizeof(dir[k]),"/tmp/rayforce-pq-prefix-%d-%zu-%d",(int)getpid(),i,k);
+        if (!pq_synth(src,cases[i].rows,cases[i].groups,pq_synth_mixed)) { bad++; continue; }
+        TEST_ASSERT_EQ_I(pq_pool(cases[i].cores),RAY_OK);
+        for (int k = 0; k < 2; k++) {
+            pq_sym_env_clear();
+            pq_set_env("RAY_PQ_STAGE",k ? "file" : NULL);
+            ray_t* res = pq_traced_import(src,dir[k],opts,trace,trace_cap);
+            pq_sym_env_clear();
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr,"  prefix %zu/%d: import failed: %s\n",i,k,res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                bad++;
+            } else {
+                ray_release(res);
+                int lines = 0;
+                double rows = pq_trace_sum(trace,"train_rows",&lines);
+                double bytes = pq_trace_sum(trace,"train_buf_bytes",NULL);
+                int64_t want = cases[i].rows < RAY_ENC_CHUNK ? cases[i].rows : RAY_ENC_CHUNK;
+                if (lines != (k ? 0 : 1) || rows != (k ? 0 : (double)want) ||
+                    bytes != (k ? 0 : (double)((size_t)want*sizeof(int32_t)))) {
+                    fprintf(stderr,"  prefix %zu/%d: lines=%d rows=%.0f requested bytes=%.0f\n",i,k,lines,rows,bytes);
+                    bad++;
+                }
+                if (!pq_synth_check(dir[k],cases[i].rows,pq_synth_mixed)) bad++;
+            }
+        }
+        snprintf(a,sizeof(a),"%s/x",dir[0]); snprintf(b,sizeof(b),"%s/x",dir[1]);
+        if (!pq_same_file(a,b)) bad++;
+        for (int k = 0; k < 2; k++) {
+            pq_remove_native(dir[k],names,3);
+            snprintf(partial,sizeof(partial),"%s.parquet-partial",dir[k]);
+            pq_remove_native(partial,names,3);
+        }
+        unlink(src);
+    }
+    ray_pool_destroy();
+    ray_sys_free(trace); ray_release(opts);
+    TEST_ASSERT_EQ_I(bad,0);
+    PASS();
+}
+
 /* A cancel during a numeric column's row group stops its chunks: cancelled
  * (a debug build injects it) after the first of the row group's four chunks
  * is encoded, or before the task puts the chunks it encoded, the import
@@ -1507,9 +1576,9 @@ static test_result_t test_pq_chunked_cancel(void) {
     values->len = 2;
     ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
     const char* names[] = {"x","s","t"};
-    const char* steps[] = {"chunk","flush"};
+    const char* steps[] = {"train","chunk","flush"};
     TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);   /* the tasks one by one, in order */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         pq_set_env("RAY_PQ_PASS_COLS", "1");   /* x's pass holds no other task to cancel */
         pq_set_env("RAY_PQ_SYM_INJECT", steps[i]);
         ray_t* res = ray_parquet_splayed_typed(src, dir, opts);
@@ -4187,6 +4256,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/stage_mem",test_pq_stage_mem,pq_setup,pq_teardown},
     {"parquet/stage_early_sym_count",test_pq_stage_early_sym_count,pq_setup,pq_teardown},
     {"parquet/sym_grouped_failures",test_pq_sym_grouped_failures,pq_setup,pq_teardown},
+    {"parquet/train_prefix",test_pq_train_prefix,pq_setup,pq_teardown},
     {"parquet/chunked_cancel",test_pq_chunked_cancel,pq_setup,pq_teardown},
     {"parquet/dict_page_size",test_pq_dict_page_size,pq_setup,pq_teardown},
     {"parquet/import_no_growth",test_pq_import_no_growth,pq_setup,pq_teardown},
