@@ -1513,6 +1513,15 @@ static ray_err_t splay_hash_append(const char* path, ray_t* col) {
     if (err != RAY_ERR_NYI) return err;
     ray_t* hi = ray_idx_hash_fn(col);
     if (!hi || RAY_IS_ERR(hi)) { if (hi) ray_error_free(hi); return RAY_ERR_OOM; }
+    /* The fresh HASH root does not inherit the UNIQUE marker `col` carries
+     * (the in-place builder copies it from the same source).  The caller
+     * has already verified it; propagate it, never re-scan.  A column
+     * without the marker is left exactly as built. */
+    if ((col->attrs & RAY_ATTR_HAS_INDEX) && col->index && !RAY_IS_ERR(col->index) &&
+        (ray_index_payload(col->index)->markers & RAY_MARK_UNIQUE) &&
+        (hi->attrs & RAY_ATTR_HAS_INDEX) && hi->index && !RAY_IS_ERR(hi->index) &&
+        ray_index_payload(hi->index)->kind == RAY_IDX_HASH)
+        ray_index_payload(hi->index)->markers |= RAY_MARK_UNIQUE;
     err = (hi->attrs & RAY_ATTR_HAS_INDEX)
         ? ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type)
         : RAY_ERR_IO;
