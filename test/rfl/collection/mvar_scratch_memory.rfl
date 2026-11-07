@@ -1,0 +1,11 @@
+;; Both Welford stacks together hold at most N rows when window=N.
+;; Bound allocator-charged peak (not RSS); leave room for block rounding/VM.
+;; A full-window call uses one logical task regardless of configured workers.
+(set _mqs_n 131072)
+(set _mqs_x (as 'F64 (til _mqs_n)))
+(set _mqs (.mem.ts (mvar _mqs_n _mqs_x)))
+(< (at _mqs 'peak-live-bytes) (+ (* 80 _mqs_n) 1048576)) -- true
+(at _mqs 'workers) -- 0
+(count (at _mqs 'result)) -- 131072
+(>= (at (at _mqs 'result) 131071) 1431655765.249) -- true
+(<= (at (at _mqs 'result) 131071) 1431655765.251) -- true
