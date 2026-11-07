@@ -206,3 +206,27 @@
 (as 'I64 (at (at Gd32 'k) 0)) -- 2
 (at (at Gd32 'a) 0) -- 9
 (at (at Gd32 'c) 0) -- 2
+
+;; ============================================================
+;; Part E — select_drop_dependent_keys: a key that is another key's
+;; column plus or minus a number is left out of the grouping and
+;; computed on its groups.  Each expected result groups by the same
+;; keys held as plain columns (j = k - 1, m = 5 + k, d = 10 - k),
+;; which the rule does not touch.  k appears 4 (null), 3, 2 and 1
+;; times, so count-descending orders are unique.
+;; ============================================================
+(set Te (table [k v] (list [3 1 3 2 0Nl 3 2 0Nl 0Nl 0Nl] [1 2 3 4 5 6 7 8 9 10])))
+(set Ue (table [k v j m d] (list (at Te 'k) (at Te 'v) (- (at Te 'k) 1) (+ 5 (at Te 'k)) (- 10 (at Te 'k)))))
+(select {from: Te by: {k: k j: (- k 1) m: (+ 5 k)} c: (count v) s: (sum v) desc: c}) -- (select {from: Ue by: {k: k j: j m: m} c: (count v) s: (sum v) desc: c})
+;; the null key's group keeps null dependent keys
+(at (select {from: Te by: {k: k j: (- k 1)} c: (count v) desc: c take: 1}) 'j) -- [0Nl]
+;; a base key under another name; the column on the right of `-`
+(select {from: Te by: {kk: k d: (- 10 k)} c: (count v) desc: c}) -- (select {from: Ue by: {kk: k d: d} c: (count v) desc: c})
+;; where: and take: run in the grouping
+(select {from: Te by: {k: k j: (- k 1)} c: (count v) where: (> v 2) desc: c take: 2}) -- (select {from: Ue by: {k: k j: j} c: (count v) where: (> v 2) desc: c take: 2})
+;; a sort on the dependent key keeps it in the grouping
+(select {from: Te by: {k: k j: (- k 1)} c: (count v) asc: j}) -- (select {from: Ue by: {k: k j: j} c: (count v) asc: j})
+;; an I32 base: the dependent key is I64, as the arithmetic gives it
+(set Ti (table [k v] (list (as 'I32 [7 7 9]) [1 2 3])))
+(at (select {from: Ti by: {k: k j: (- k 1)} c: (count v) desc: c}) 'j) -- [6 8]
+(type (at (select {from: Ti by: {k: k j: (- k 1)} c: (count v) desc: c}) 'k)) -- 'I32
