@@ -17606,9 +17606,10 @@ static bool select_from_is_join(ray_t* from_expr) {
  * grouping runs without such keys and they are computed on its groups
  * after, so each row hashes, scatters and compares fewer key bytes, and a
  * grouping the memory gate (hh_grouping_outgrows) would send to two passes
- * may fit.  Taken only for an integer or temporal column (exact equality:
- * the key of a group is the key of each of its rows) when no clause or
- * output names a dropped key.  NULL when the shape does not apply; else the
+ * may fit.  Taken only for an integer column and an I64 or F64 constant
+ * (exact equality: the key of a group is the key of each of its rows; the
+ * types the grouping itself gives such a key) when no clause or output
+ * names a dropped key.  NULL when the shape does not apply; else the
  * select's result (or its error). */
 #define SELECT_DEP_MAX_KEYS 15
 
@@ -17650,9 +17651,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) || !sym_names_col(tbl, v->i64) ||
             !ray_table_col_meta(tbl, v->i64, &m)) continue;
         int8_t t = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
-        if (t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-            t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP)
-            col[i] = v->i64;
+        if (t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64) col[i] = v->i64;
     }
     static const char* const addsub[] = { "+", "-" };
     for (int64_t i = 0; i < nb; i++) {
@@ -17661,13 +17660,15 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         ray_t** el = (ray_t**)ray_data(v);
         if (!el[0] || el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) continue;
         op[i] = sym_binding(el[0]->i64);
-        if (!builtin_named(op[i], addsub, 2)) continue;
+        if (!builtin_named(op[i], addsub, 2) || op[i]->type != RAY_BINARY ||
+            !(op[i]->attrs & RAY_FN_ATOMIC)) continue;
         for (int side = 1; side <= 2 && base[i] < 0; side++) {
             ray_t* s = el[side];
             ray_t* c = el[3 - side];
             if (!s || s->type != -RAY_SYM || (s->attrs & ATTR_QUOTED) || !c) continue;
-            if (c->type != -RAY_U8 && c->type != -RAY_I16 && c->type != -RAY_I32 &&
-                c->type != -RAY_I64 && c->type != -RAY_F32 && c->type != -RAY_F64) continue;
+            /* a narrower constant would keep a narrow column narrow, which
+             * a key the grouping computes does not */
+            if (c->type != -RAY_I64 && c->type != -RAY_F64) continue;
             for (int64_t j = 0; j < nb && base[i] < 0; j++)
                 if (j != i && col[j] == s->i64) { base[i] = (int)j; cside[i] = side; }
         }
@@ -17745,7 +17746,11 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         if (base[i] < 0) continue;
         ray_t* bc = ray_table_get_col(grouped, alias[base[i]]);
         ray_t* c = ((ray_t**)ray_data(bvals[i]))[3 - cside[i]];
-        ray_t* v = !bc ? ray_error("schema", NULL) : cside[i] == 1 ? call_fn2(op[i], bc, c) : call_fn2(op[i], c, bc);
+        /* as the evaluator applies it: the opcode's kernel widens a narrow
+         * column, a constant on either side */
+        ray_binary_fn f = (ray_binary_fn)(uintptr_t)op[i]->i64;
+        ray_t* v = !bc ? ray_error("schema", NULL)
+                 : atomic_map_binary_op(f, RAY_FN_OPCODE(op[i]), cside[i] == 1 ? bc : c, cside[i] == 1 ? c : bc);
         if (v && !RAY_IS_ERR(v)) { grouped = ray_table_add_col(grouped, alias[i], v); ray_release(v); }
         else { ray_release(grouped); grouped = v ? v : ray_error("oom", NULL); }
         if (RAY_IS_ERR(grouped)) { r = grouped; goto done; }
