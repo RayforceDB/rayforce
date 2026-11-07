@@ -601,7 +601,7 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
 
     /* Append key — helper consumes `keys`, returns owned (possibly new) ref. */
     ray_t* new_keys = NULL;
-    if (keys->type == RAY_SYM) {
+    if (keys->type == RAY_SYM && key_atom->type == -RAY_SYM) {
         int64_t kid = key_atom->i64;
         new_keys = ray_vec_append(keys, &kid);
     } else if (keys->type == RAY_STR && key_atom->type == -RAY_STR) {
