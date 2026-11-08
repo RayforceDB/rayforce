@@ -42,3 +42,20 @@
 (at RFG 'mx) -- (as 'F32 [2.5 4.5])
 (at RFG 'f) -- (as 'F32 [2.5 -3.5])
 (at RFG 'l) -- (as 'F32 [2.5 4.5])
+
+;; Non-finite F32 arithmetic is null on the eager path, as inside select and
+;; as for F64 (single-null float model): never a raw inf, never an unflagged NaN.
+(set w (as 'F32 [3.0e38 1.0 -3.0e38 2.0]))
+(+ w w) -- (as 'F32 [0Nf 2.0 0Nf 4.0])
+(nil? (+ w w)) -- [true false true false]
+(- w (neg w)) -- (as 'F32 [0Nf 2.0 0Nf 4.0])
+(* w w) -- (as 'F32 [0Nf 1.0 0Nf 4.0])
+(mins (+ w w)) -- (as 'F32 [0Nf 2.0 2.0 2.0])
+(nil? (mins (+ w w))) -- [true false false false]
+(maxs (+ w w)) -- (as 'F32 [0Nf 2.0 2.0 4.0])
+(max (+ w w)) -- 4.0e
+(min (+ w w)) -- 2.0e
+(first (+ w w)) -- 2.0e
+(type (+ w (as 'F32 1.0))) -- 'F32
+(+ [1e308 1.0] [1e308 1.0]) -- [0Nf 2.0]
+(at (select {x: (+ w w) from: (table [w] (list w))}) 'x) -- (as 'F32 [0Nf 2.0 0Nf 4.0])
