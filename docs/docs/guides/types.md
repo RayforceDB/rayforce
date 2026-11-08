@@ -49,7 +49,11 @@ the configured display precision still controls decimal rounding.
 
 F64 values have a null sentinel but no positive or negative infinity value.
 Non-finite F64 arithmetic results are returned as null, so an overflowed result
-is treated as missing by null-aware operations such as `fill` and aggregates.
+is treated as missing by null-aware operations such as `fill` and aggregates,
+except where a vector kernel does not flag the null it produces: `(sums [1e308 1e308])`
+ends in a null that `fill` replaces but `nil?` does not report, and `avg` and `sum` of it
+return `0Nf` instead of skipping it (see the exceptions in
+[Floats](../language/syntax.md#floats)).
 This differs from systems that retain IEEE infinities as values. F32
 arithmetic does not do this: an overflowing F32 result keeps the IEEE infinity
 and prints as `infe` or `-infe`, which `nil?` and `fill` do not treat as null
