@@ -84,3 +84,20 @@
 (at (select {a: (* x (neg (as 'F32 2.5))) from: T2}) 'a) -- (as 'F32 [-3.75 -5.0])
 (type (at (select {a: (* x (neg (as 'F32 2.5))) from: T2}) 'a)) -- 'F32
 (at (select {a: (neg (as 'I32 2)) from: T2}) 'a) -- [-2 -2]
+
+;; Scans and moving extrema write F32 values, not doubles into an F32 column:
+;; check the values, below and above the parallel threshold.
+(mins (as 'F32 [2.5 -3.5 0Nf 1.25])) -- (as 'F32 [2.5 -3.5 -3.5 -3.5])
+(maxs (as 'F32 [2.5 -3.5 0Nf 4.25])) -- (as 'F32 [2.5 2.5 2.5 4.25])
+(mmin 2 (as 'F32 [2.5 -3.5 0Nf 1.25])) -- (as 'F32 [2.5 -3.5 -3.5 1.25])
+(mmax 2 (as 'F32 [2.5 -3.5 0Nf 1.25])) -- (as 'F32 [2.5 2.5 -3.5 1.25])
+(mins (as 'F32 [0Nf 2.5 -1.5])) -- (as 'F32 [0Nf 2.5 -1.5])
+(set bn 20000)
+(set bd (- (as 'F64 (% (* (til bn) 7919) 1009)) 500.25))
+(set bf (as 'F32 bd))
+(type (mins bf)) -- 'F32
+(== (mins bf) (as 'F32 (mins bd))) -- (take [true] bn)
+(== (maxs bf) (as 'F32 (maxs bd))) -- (take [true] bn)
+(== (mmin 5 bf) (as 'F32 (mmin 5 bd))) -- (take [true] bn)
+(== (mmax 5 bf) (as 'F32 (mmax 5 bd))) -- (take [true] bn)
+(last (mins bf)) -- (as 'F32 (last (mins bd)))
