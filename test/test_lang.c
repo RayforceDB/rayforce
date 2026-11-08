@@ -1627,6 +1627,82 @@ static test_result_t test_eval_distinct_guid_cancel(void) {
     PASS();
 }
 
+/* The i64 atom an expression evaluates to, or INT64_MIN. */
+static int64_t rb_eval_i64(const char* e) {
+    ray_t* r = ray_eval_str(e);
+    int64_t v = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 ? r->i64 : INT64_MIN;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return v;
+}
+
+/* ---- Test: a failed in-place insert or upsert leaves the key's index right ----
+ * An in-place insert appends column by column, and the append of an indexed
+ * key extends its hash over the new rows.  When a later column's append
+ * then fails, the rollback truncates every column and must drop that
+ * extension, or the index would cover rows that are gone.  Fail each
+ * allocation of a 200-row insert, and of a 200-row upsert whose I32 payload
+ * takes the row-at-a-time path (its rollback is upsert_rollback_appends),
+ * in turn: 200 rows outgrow both columns' capacity, so the value column's
+ * growth can fail after the key's index was extended.  After a failure the
+ * key has its 100 rows, or all of them when only the call's result could
+ * not be allocated; either way it is unindexed or indexed over exactly its
+ * rows, and find agrees with the plain column.  Some failure must be the
+ * rollback dropping an extended index.  The call is parsed once and only
+ * its evaluation fails allocations. */
+static test_result_t test_eval_insert_upsert_rollback_index(void) {
+    const char* reset = "(set _rt (table ['k 'v] (list (.idx.hash (til 100)) (til 100))))";
+    struct { const char* op; int64_t grown; } cases[] = {
+        { "(insert '_rt (table ['k 'v] (list (+ 2000 (til 200)) (til 200))))", 300 },
+        { "(upsert '_rt 'k (table ['k 'v] (list (as 'i32 (+ 2000 (til 200))) (as 'i32 (til 200)))))", 300 },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* op = ray_parse(cases[c].op);
+        TEST_ASSERT_TRUE(op && !RAY_IS_ERR(op));
+        /* the allocations of a run that succeeds bound the sweep */
+        ray_t* r = ray_eval_str(reset);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = ray_eval(op);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at _rt 'k))"), cases[c].grown);
+        int64_t failed = 0, dropped = 0;
+        for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
+            r = ray_eval_str(reset);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            ray_release(r);
+            ray_alloc_fail_set_for_test(nth, 1);
+            r = ray_eval(op);
+            ray_alloc_fail_set_for_test(0, 0);
+            bool err = r && RAY_IS_ERR(r);
+            if (err) ray_error_free(r); else if (r) ray_release(r);
+            ray_error_clear();
+            int64_t n = rb_eval_i64("(count (at _rt 'k))");
+            TEST_ASSERT_FMT(n == cases[c].grown || (err && n == 100),
+                            "case %zu, allocation %lld: %lld rows after %s", c,
+                            (long long)nth, (long long)n, err ? "a failure" : "a success");
+            int64_t has = rb_eval_i64("(as 'i64 (.idx.has? (at _rt 'k)))");
+            if (has == 1) {
+                int64_t len = rb_eval_i64("(at (.idx.info (at _rt 'k)) 'length)");
+                TEST_ASSERT_FMT(len == n, "case %zu, allocation %lld: the index covers %lld of %lld rows",
+                                c, (long long)nth, (long long)len, (long long)n);
+            } else if (err && n == 100) {
+                dropped++;
+            }
+            if (err) failed++;
+            ASSERT_EQ("(find (at _rt 'k) [2000 5 2199 99 -1])",
+                      "(find (.idx.drop (at _rt 'k)) [2000 5 2199 99 -1])");
+        }
+        ray_release(op);
+        TEST_ASSERT_FMT(failed > 0, "case %zu: no allocation failed the call", c);
+        TEST_ASSERT_FMT(dropped > 0, "case %zu: no rollback dropped an extended index", c);
+    }
+    PASS();
+}
+
 /* ---- Test: a cancelled guid compare or `in` dispatch answers "cancel" ----
  * A cancel makes ray_pool_dispatch skip every task not yet started, so the
  * bool vector it was filling is incomplete.  The compare, and `in` with the
@@ -12003,6 +12079,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/distinct_guid_table_growth", test_eval_distinct_guid_table_growth, lang_setup, lang_teardown },
     { "lang/eval/distinct_guid_oom", test_eval_distinct_guid_oom, lang_setup, lang_teardown },
     { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
+    { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },

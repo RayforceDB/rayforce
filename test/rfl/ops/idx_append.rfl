@@ -163,6 +163,19 @@
 (at (select {from: (.db.splayed.get "/tmp/rf-idx-append/i0/") where: (== k 5)}) 'v) -- [5 10]
 ;; the in-memory index is left first-row-only by the save
 (at (.idx.info (at tg 'k)) 'first_only) -- true
+;; a STR column: in-place appends drop its hash, but concat carries one,
+;; and a repeat leaves it first-row-only; the save writes the complete one
+(set tss (table ['s 'v] (list (concat (.idx.hash ["a" "b" "c"]) ["a" "d"]) [1 2 3 4 5])))
+(at (.idx.info (at tss 's)) 'first_only) -- true
+(at (.idx.info (at tss 's)) 'n_keys) -- 4
+(.db.splayed.set "/tmp/rf-idx-append/s0/" tss)
+(set ls (at (.db.splayed.get "/tmp/rf-idx-append/s0/") 's))
+(.idx.has? ls) -- true
+(at (.idx.info ls) 'n_keys) -- 5
+(nil? (at (.idx.info ls) 'first_only)) -- true
+(find ls ["a" "d" "c" "z"]) -- [0 4 2 0N]
+(at (select {from: (.db.splayed.get "/tmp/rf-idx-append/s0/") where: (in s ["a"])}) 'v) -- [1 4]
+(at (.idx.info (at tss 's)) 'first_only) -- true
 
 ;; ─────────────────────────── a loaded column: its mapped index copied ──────
 (set tl (.db.splayed.get "/tmp/rf-idx-append/g0/"))

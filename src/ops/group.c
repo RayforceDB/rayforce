@@ -1341,8 +1341,15 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         /* A guid hash index holds the count: its groups are the distinct
          * guids (ray_index_hash_distinct_count). */
         if (in_type == RAY_GUID) {
-            int64_t ng = ray_index_hash_distinct_count(input);
-            if (ng >= 0) return ray_i64(ng);
+            if (ray_index_has(input)) {
+                ray_idx_consults[IDX_SITE_COUNT_DISTINCT]++;
+                int64_t ng = ray_index_hash_distinct_count(input);
+                if (ng >= 0) {
+                    ray_idx_hits[IDX_SITE_COUNT_DISTINCT]++;
+                    ray_idx_note_use(input);
+                    return ray_i64(ng);
+                }
+            }
             /* the guid kernel's count, without its row ids; if it declines,
              * distinct_vec_eager tries it for the ids, then the hashset */
             ray_t* cnt = distinct_guid_scan(input, true);
