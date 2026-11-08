@@ -835,6 +835,64 @@ static test_result_t test_eval_literal_fallback_nonempty_mark_consumed(void) {
     PASS();
 }
 
+/* Build msg = (noop ARG), mark it as an IPC request and return the marked
+ * argument (borrowed from msg). */
+static ray_t* literal_mark_msg(ray_t* arg, ray_t** msg_out) {
+    ray_t* msg = ray_list_new(2);
+    ray_t* head = ray_sym(ray_sym_intern("noop", 4));
+    msg = ray_list_append(msg, head);
+    msg = ray_list_append(msg, arg);
+    ray_release(head);
+    ray_release(arg);
+    ray_eval_mark_ipc_literal_args(msg);
+    *msg_out = msg;
+    return ((ray_t**)ray_data(msg))[1];
+}
+
+/* Eval a marked argument and require the same object back with the transient
+ * mark consumed (a handler may keep it and eval an ordinary expression). */
+static test_result_t literal_fallback_returns_same_unmarked(ray_t* kept, ray_t* msg) {
+    TEST_ASSERT_TRUE((kept->attrs & RAY_EVAL_LITERAL_FALLBACK) != 0);
+    ray_t* r = ray_eval(kept);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(r == kept);
+    TEST_ASSERT_TRUE((kept->attrs & RAY_EVAL_LITERAL_FALLBACK) == 0);
+    ray_release(r);
+    ray_release(msg);
+    PASS();
+}
+
+/* Non-callable head: (list (list 'a) 1) has a data-list head, so eval takes
+ * the default non-callable-head fallback return, which must clear the mark. */
+static test_result_t test_eval_literal_fallback_list_head_mark_consumed(void) {
+    ray_t* arg = ray_eval_str("(list (list 'a) 1)");
+    TEST_ASSERT_NOT_NULL(arg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(arg));
+    ray_t* msg;
+    ray_t* kept = literal_mark_msg(arg, &msg);
+    return literal_fallback_returns_same_unmarked(kept, msg);
+}
+
+/* Head that resolves to an undefined name: the unmarked (quote zz) list
+ * evaluates to the unquoted symbol, which is not bound (the `!fn` return). */
+static test_result_t test_eval_literal_fallback_unbound_head_mark_consumed(void) {
+    ray_t* q = ray_list_new(2);
+    ray_t* qs = ray_sym(ray_sym_intern("quote", 5));
+    ray_t* nm = ray_sym(ray_sym_intern("zz_unbound_ipc_head", 19));
+    nm->attrs &= (uint8_t)~ATTR_QUOTED;
+    q = ray_list_append(q, qs);
+    q = ray_list_append(q, nm);
+    ray_release(qs); ray_release(nm);
+    ray_t* arg = ray_list_new(2);
+    ray_t* one = ray_i64(1);
+    arg = ray_list_append(arg, q);
+    arg = ray_list_append(arg, one);
+    ray_release(q); ray_release(one);
+    ray_t* msg;
+    ray_t* kept = literal_mark_msg(arg, &msg);
+    return literal_fallback_returns_same_unmarked(kept, msg);
+}
+
 /* ---- Test: eval if true ---- */
 static test_result_t test_eval_if_true(void) {
     ray_t* result = ray_eval_str("(if true 1 2)");
@@ -11639,6 +11697,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/literal_fallback_preserves_boxed_data", test_eval_literal_fallback_preserves_boxed_data, lang_setup, lang_teardown },
     { "lang/eval/literal_fallback_empty_list_mark_consumed", test_eval_literal_fallback_empty_list_mark_consumed, lang_setup, lang_teardown },
     { "lang/eval/literal_fallback_nonempty_mark_consumed", test_eval_literal_fallback_nonempty_mark_consumed, lang_setup, lang_teardown },
+    { "lang/eval/literal_fallback_list_head_mark_consumed", test_eval_literal_fallback_list_head_mark_consumed, lang_setup, lang_teardown },
+    { "lang/eval/literal_fallback_unbound_head_mark_consumed", test_eval_literal_fallback_unbound_head_mark_consumed, lang_setup, lang_teardown },
     { "lang/eval/if_true", test_eval_if_true, lang_setup, lang_teardown },
     { "lang/eval/if_false", test_eval_if_false, lang_setup, lang_teardown },
     { "lang/eval/let", test_eval_let, lang_setup, lang_teardown },
