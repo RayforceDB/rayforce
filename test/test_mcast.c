@@ -85,6 +85,16 @@ static bool pump_until_env_i64_at_least(const char* name, size_t len,
     return false;
 }
 
+/* Pump until `want` updates have arrived (pump_client's 20 rounds at
+ * most), then one round more, in which a duplicate right behind them would
+ * still land before the caller checks the count. */
+static void pump_delivered(int64_t want) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    if (!poll) return;
+    if (pump_until_env_i64_at_least("_mc_count", 9, want, 20))
+        ray_poll_run_for(poll, 10);
+}
+
 static uint16_t get_listen_port(ray_sock_t fd) {
     struct sockaddr_in addr;
     socklen_t len = sizeof(addr);
@@ -217,7 +227,7 @@ static test_result_t test_mcast_single_client_pub(void) {
     if (ok.status != TEST_PASS) return ok;
     TEST_ASSERT_EQ_I(pub->i64, 1);
     ray_release(pub);
-    pump_client();
+    pump_delivered(1);
 
     ray_t* c = ray_env_get(ray_sym_intern("_mc_count", 9));
     ray_t* s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
@@ -240,7 +250,7 @@ static test_result_t test_mcast_single_client_pub(void) {
     if (ok.status != TEST_PASS) return ok;
     TEST_ASSERT_EQ_I(pub->i64, 2);
     ray_release(pub);
-    pump_client();
+    pump_delivered(2);
 
     c = ray_env_get(ray_sym_intern("_mc_count", 9));
     s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
@@ -263,7 +273,7 @@ static test_result_t test_mcast_single_client_pub(void) {
     if (ok.status != TEST_PASS) return ok;
     TEST_ASSERT_EQ_I(pub->i64, 3);
     ray_release(pub);
-    pump_client();
+    pump_delivered(3);
 
     c = ray_env_get(ray_sym_intern("_mc_count", 9));
     s = ray_env_get(ray_sym_intern("_mc_last_seq", 12));
