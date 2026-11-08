@@ -833,7 +833,8 @@ static test_result_t test_dict_variants(void) {
         col = ray_table_col(t, ray_sym_intern("s", 1));
         TEST_ASSERT_TRUE(col && !RAY_IS_ERR(col));
         /* 70000 distinct strings: the DICT's second copy would outweigh the
-         * column, so it is not persisted (#1094); UNIQUE is in the header */
+         * column, so it is not persisted (#1094); m.unique above shows UNIQUE
+         * still comes from the header */
         TEST_ASSERT_EQ_I(ray_index_kind(col), 0);
         st_unhold(t, NULL); ray_release(t);
         char qa[700];                                     /* .attr.get equal to the source's */

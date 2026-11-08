@@ -27,8 +27,8 @@
 (at (.idx.info N 's) 'index) -- 'none
 
 ;; the compressed column is not meaningfully larger than the raw one
-(.sys.exec "test $(stat -c %s $(find /tmp/rf_test_strdict_cost/z -name r -type f)) -le $(( $(stat -c %s $(find /tmp/rf_test_strdict_cost/raw -name r -type f)) * 105 / 100 ))") -- 0
-(.sys.exec "test $(stat -c %s $(find /tmp/rf_test_strdict_cost/z -name r -type f)) -eq $(stat -c %s $(find /tmp/rf_test_strdict_cost/zni -name r -type f))") -- 0
+(.sys.exec "test $(find /tmp/rf_test_strdict_cost/z -name r -type f -exec cat {} + | wc -c | tr -d ' ') -le $(( $(find /tmp/rf_test_strdict_cost/raw -name r -type f -exec cat {} + | wc -c | tr -d ' ') * 105 / 100 ))") -- 0
+(.sys.exec "test $(find /tmp/rf_test_strdict_cost/z -name r -type f -exec cat {} + | wc -c | tr -d ' ') -eq $(find /tmp/rf_test_strdict_cost/zni -name r -type f -exec cat {} + | wc -c | tr -d ' ')") -- 0
 
 ;; values and queries are unchanged without the index
 (all (== (at Z 'r) big)) -- true
