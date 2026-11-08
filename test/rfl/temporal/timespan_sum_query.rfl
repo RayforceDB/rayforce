@@ -27,3 +27,11 @@
 ;; the integer columns are unaffected
 (set I (table [v] (list [1 2 3])))
 (type (at (select {r: (sum v) from: I}) 'r)) -- 'I64
+
+;; null durations: skipped by a query with no key, as by the function
+(set Z (table [g sp] (list [1 1 2] (enlist 0D01:00:00 0Nn 0D03:00:00))))
+(as 'I64 (at (select {r: (sum sp) from: Z}) 'r)) -- [14400000000000]
+(as 'I64 (at (select {r: (sum sp) from: Z}) 'r)) -- (enlist (as 'I64 (sum (at Z 'sp))))
+(as 'I64 (at (select {r: (avg sp) from: Z}) 'r)) -- (enlist (as 'I64 (avg (at Z 'sp))))
+(as 'I64 (at (select {r: (min sp) from: Z}) 'r)) -- [3600000000000]
+(as 'I64 (at (select {r: (sum sp) by: g from: Z}) 'r)) -- [3600000000000 10800000000000]

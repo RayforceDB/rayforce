@@ -91,3 +91,15 @@
 (type (at Rn 'd)) -- 'TIMESPAN
 (as 'I64 (at Rn 'm)) -- [3600000000000 10800000000000]
 (at Rn 'c) -- [2 2]
+
+;; an ungrouped query skips a null duration, as the same function on the
+;; extracted vector does
+(set Nu (table [sp] (list (enlist 0D01:00:00 0Nn 0D03:00:00))))
+(as 'I64 (at (select {r: (avg sp) from: Nu}) 'r)) -- [7200000000000]
+(as 'I64 (at (select {r: (sum sp) from: Nu}) 'r)) -- [14400000000000]
+(as 'I64 (at (select {r: (min sp) from: Nu}) 'r)) -- [3600000000000]
+(as 'I64 (at (select {r: (max sp) from: Nu}) 'r)) -- [10800000000000]
+(at (select {r: (stddev sp) from: Nu}) 'r) -- (enlist (stddev (at Nu 'sp)))
+(at (select {r: (dev sp) from: Nu}) 'r) -- (enlist (dev (at Nu 'sp)))
+(at (select {r: (stddev_pop sp) from: Nu}) 'r) -- (enlist (stddev_pop (at Nu 'sp)))
+(at (select {r: (count sp) from: Nu}) 'r) -- [3]

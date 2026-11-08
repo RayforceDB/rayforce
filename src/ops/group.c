@@ -16085,7 +16085,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 bool is_sentinel_typed = agg_strlen[a]
                     ? ext->agg_ops[a] == OP_AVG
                     : (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                       t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                       t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP ||
+                       t == RAY_TIMESPAN || t == RAY_SYM);
                 sc_int_null_has[a] = is_sentinel_typed && may_null;
                 if (may_null &&
                     (group_fp_type(t) || is_sentinel_typed))
@@ -17130,7 +17131,8 @@ da_path:;
                      * and the per-agg non-null counts. */
                     bool is_sentinel_typed = !agg_strlen[a] &&
                         (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
-                         t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_SYM);
+                         t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP ||
+                         t == RAY_TIMESPAN || t == RAY_SYM);
                     if (is_sentinel_typed && may_null)
                         da_int_null_mask |= ((uint64_t)1 << a);
                     if (may_null && (group_fp_type(t) || is_sentinel_typed))
