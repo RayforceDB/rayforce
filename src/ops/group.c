@@ -204,17 +204,24 @@ int64_t ray_group_test_minmax_staged_rows(void) {
  * Reduction execution
  * ============================================================================ */
 
+/* v - shift as a double: exact in int64 while it fits, else (values more than
+ * 2^63 apart) from the doubles, which the wrapped difference would not be. */
+static inline double red_shift_diff(int64_t v, int64_t shift) {
+    int64_t d;
+    if (__builtin_sub_overflow(v, shift, &d)) return (double)v - (double)shift;
+    return (double)d;
+}
+
+/* The shift is fixed once per accumulator, before its loop, so the loop body
+ * carries no first-row branch. */
 #define REDUCE_ACC_SHIFTED_SQ(acc, v) do { \
-    if (!(acc)->shift_set) { (acc)->shift_i = (v); (acc)->shift_set = true; } \
-    double dv_ = (double)(int64_t)((uint64_t)(v) - (uint64_t)(acc)->shift_i); \
+    double dv_ = red_shift_diff((v), (acc)->shift_i); \
     (acc)->sum_c += dv_; (acc)->sum_sq_c += dv_ * dv_; \
 } while (0)
 
 typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
     int64_t sum_i, min_i, max_i, prod_i, first_i, last_i;
-    /* f64 sum of the integer stream (variance / stddev of integers). */
-    double sum_d;
     /* Variance / stddev of integers: sums of (x - shift_i) and its square,
      * the shift being the first value this accumulator saw.  Squares of the
      * raw values lose the variance to cancellation (a constant column of
@@ -237,7 +244,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->prod_f = 1.0; acc->first_f = 0; acc->last_f = 0; acc->sum_sq_f = 0;
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0;
-    acc->sum_d = 0; acc->sum_hi = 0;
+    acc->sum_hi = 0;
     acc->sum_c = 0; acc->sum_sq_c = 0; acc->shift_i = 0; acc->shift_set = false;
     acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
 }
@@ -416,7 +423,6 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define RED_NEED_SUM       (1u << 0)
 #define RED_NEED_SUM_SQ    (1u << 1)
 #define RED_NEED_PROD      (1u << 2)
-#define RED_NEED_SUM_D     (1u << 3)  /* integer stream accumulated as f64 */
 #define RED_NEED_COUNT     (1u << 4)
 #define RED_NEED_ZERO      (1u << 5)
 #define RED_NEED_MIN       (1u << 6)
@@ -432,7 +438,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define RED_MASK_LAST      (RED_NEED_COUNT | RED_NEED_LAST)
 #define RED_MASK_AVG_I     (RED_NEED_SUM_128 | RED_NEED_COUNT)
 #define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
-#define RED_MASK_STATS_I   (RED_NEED_SUM_D | RED_NEED_SUM_SQ | RED_NEED_COUNT)
+#define RED_MASK_STATS_I   (RED_NEED_SUM_SQ | RED_NEED_COUNT)
 #define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
 
 /* Integer reduction loop — reads native type T, accumulates as i64.
@@ -449,6 +455,12 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define REDUCE_LOOP_I(T, NULL_SENT, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
+        if (((NEEDS) & RED_NEED_SUM_SQ) && !(acc)->shift_set) \
+            for (int64_t j = start; j < end; j++) { \
+                int64_t r_ = (HAS_IDX) ? (idx)[j] : j; \
+                if ((HAS_NULLS) && d[r_] == (T)(NULL_SENT)) continue; \
+                (acc)->shift_i = (int64_t)d[r_]; (acc)->shift_set = true; break; \
+            } \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             T raw = d[row]; \
@@ -462,7 +474,6 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
                 REDUCE_ACC_SHIFTED_SQ(acc, v); \
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
-            if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
             if ((NEEDS) & RED_NEED_SUM_128) { \
                 uint64_t lo_ = (uint64_t)(acc)->sum_i + (uint64_t)v; \
                 (acc)->sum_hi += (v < 0 ? -1 : 0) + (lo_ < (uint64_t)v ? 1 : 0); \
@@ -485,6 +496,12 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define REDUCE_LOOP_BITMAP_I(T, input, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
+        if (((NEEDS) & RED_NEED_SUM_SQ) && !(acc)->shift_set) \
+            for (int64_t j = start; j < end; j++) { \
+                int64_t r_ = (HAS_IDX) ? (idx)[j] : j; \
+                if ((HAS_NULLS) && ray_vec_is_null((input), r_)) continue; \
+                (acc)->shift_i = (int64_t)d[r_]; (acc)->shift_set = true; break; \
+            } \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             if ((HAS_NULLS) && ray_vec_is_null((input), row)) continue; \
@@ -495,7 +512,6 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
                 REDUCE_ACC_SHIFTED_SQ(acc, v); \
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
-            if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
             if ((NEEDS) & RED_NEED_SUM_128) { \
                 uint64_t lo_ = (uint64_t)(acc)->sum_i + (uint64_t)v; \
                 (acc)->sum_hi += (v < 0 ? -1 : 0) + (lo_ < (uint64_t)v ? 1 : 0); \
@@ -832,14 +848,13 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
             dst->sum_f += src->sum_f;
             dst->sum_sq_f += src->sum_sq_f;
         } else {
-            dst->sum_d += src->sum_d;
             if (src->shift_set) {
                 if (!dst->shift_set) {
                     dst->shift_i = src->shift_i; dst->shift_set = true;
                     dst->sum_c = src->sum_c; dst->sum_sq_c = src->sum_sq_c;
                 } else {
                     /* src's sums re-expressed about dst's shift */
-                    double d = (double)(int64_t)((uint64_t)src->shift_i - (uint64_t)dst->shift_i);
+                    double d = red_shift_diff(src->shift_i, dst->shift_i);
                     double n = (double)src->cnt;
                     dst->sum_c += src->sum_c + n * d;
                     dst->sum_sq_c += src->sum_sq_c + 2 * d * src->sum_c + n * d * d;

@@ -58,3 +58,8 @@
 (as 'I64 (at (at (update {r: (dev sp) by: g from: U}) 'r) 0)) -- 0
 (nil? (at (at (update {r: (dev sp) by: g from: U}) 'r) 4)) -- true
 (at (as 'I64 (at (update {r: (stddev sp) by: g from: U}) 'r)) 2) -- (at (as 'I64 (at (select {r: (stddev sp) by: g from: U}) 'r)) 1)
+
+;; values more than 2^63 apart: the centered difference does not wrap
+(set Wd (table [v] (list [-9000000000000000000 9000000000000000000 0])))
+(< (abs (- (at (at (update {r: (stddev v) from: Wd}) 'r) 0) (stddev (at Wd 'v)))) 1000000000000.0) -- true
+(< (abs (- (at (at (update {r: (stddev v) from: Wd}) 'r) 0) 9000000000000000000.0)) 1000000000000.0) -- true
