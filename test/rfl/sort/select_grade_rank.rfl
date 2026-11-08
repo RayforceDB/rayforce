@@ -22,3 +22,36 @@
 rank_obs_count -- [1 1 1]
 rank_obs_rev -- [3 1 2]
 (at (select {from: T r: (rank a)}) 'r) -- (rank [3 0N 1 2])
+
+;; Same save/rebind/restore regression for iasc and idesc.
+(set iasc_orig iasc)
+(set iasc count)
+(set iasc_obs_count (at (select {from: (table [a] (list [3 1 2]))  r: (iasc a)}) 'r))
+(set iasc reverse)
+(set iasc_obs_rev (at (select {from: (table [a] (list [3 1 2]))  r: (iasc a)}) 'r))
+(set iasc iasc_orig)
+iasc_obs_count -- [1 1 1]
+iasc_obs_rev -- [3 1 2]
+(at (select {from: T r: (iasc a)}) 'r) -- (iasc [3 0N 1 2])
+(set idesc_orig idesc)
+(set idesc count)
+(set idesc_obs_count (at (select {from: (table [a] (list [3 1 2]))  r: (idesc a)}) 'r))
+(set idesc reverse)
+(set idesc_obs_rev (at (select {from: (table [a] (list [3 1 2]))  r: (idesc a)}) 'r))
+(set idesc idesc_orig)
+idesc_obs_count -- [1 1 1]
+idesc_obs_rev -- [3 1 2]
+(at (select {from: T r: (idesc a)}) 'r) -- (idesc [3 0N 1 2])
+
+;; An ungrouped aggregate over a grade/rank sees the whole column (these
+;; used to fail with "rank expects a vector"), also under where:.
+(set U (table [a] (list [3 1 2 5])))
+(at (select {from: U r: (sum (rank a))}) 'r) -- [6]
+(at (select {from: U r: (first (iasc a))}) 'r) -- [1]
+(at (select {from: U r: (max (idesc a))}) 'r) -- [3]
+(at (select {from: U r: (count (rank a))}) 'r) -- [4]
+(at (select {from: U r: (sum (rank a)) where: (< a 5)}) 'r) -- [3]
+(at (select {from: U r: (first (iasc a)) where: (< a 5)}) 'r) -- [1]
+(at (select {from: U r: (max (idesc a)) where: (< a 5)}) 'r) -- [2]
+(at (select {from: U r: (count (rank a)) where: (< a 5)}) 'r) -- [3]
+(at (select {from: U r: (iasc a) where: (< a 5)}) 'r) -- [1 2 0]
