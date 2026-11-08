@@ -478,3 +478,9 @@
 (.sys.exec "rm -f rf_csv_card_*.csv") -- 0
 (.sys.exec "rm -f rf_test_csv_types_*.csv") -- 0
 (.sys.exec "rm -rf rf_test_csv_types_parted rf_test_csv_types_parted_q rf_test_csv_types_parted2") -- 0
+
+;; A header with more than 256 columns is a `limit` error (documented cap),
+;; not `range`.
+(.sys.exec "awk 'BEGIN{for(i=1;i<=300;i++) printf \"%sc%d\", (i>1?\",\":\"\"), i; printf \"\\n\"; for(i=1;i<=300;i++) printf \"%s1\", (i>1?\",\":\"\"); printf \"\\n\"}' > rf_test_csv_wide300.csv") -- 0
+(.csv.read "rf_test_csv_wide300.csv") !- limit
+(.sys.exec "rm -f rf_test_csv_wide300.csv") -- 0

@@ -3104,7 +3104,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
         ray_vm_unmap_file(buf, file_size);
         /* fd already closed after mmap (line 1044) — do not close again */
         /* too many columns */
-        return ray_error("range", "csv read: header has too many columns, got %lld (max %d)",
+        return ray_error("limit", "csv read: header has too many columns, got %lld (max %d)",
                          (long long)ncols, CSV_MAX_COLS);
     }
     if (col_types_in && n_types != ncols) {
@@ -3640,7 +3640,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     }
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
-        return RAY_ERR_RANGE;
+        return RAY_ERR_LIMIT;
     }
     if ((col_types_in && n_types != ncols) ||
         (col_names_in && n_names != ncols)) {
@@ -4053,7 +4053,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     }
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
-        return RAY_ERR_RANGE;
+        return RAY_ERR_LIMIT;
     }
     if ((col_types_in && n_types != ncols) ||
         (col_names_in && n_names != ncols)) {
