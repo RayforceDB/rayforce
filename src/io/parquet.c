@@ -253,14 +253,53 @@ static bool pq_rle_next(pq_rle* r, uint32_t* out) {
 static bool pq_rle_done(const pq_rle* r) {
     return !r->c.bad && r->c.p == r->c.end && (!r->left || (r->packed && r->left < 8));
 }
+#if defined(DEBUG)
+/* Test seams for the certification phase: the nth coarse checkpoint from now
+ * on requests an interrupt (0 disables), and the last scan's certified level
+ * count lets a test verify the scan stopped early. Debug builds only. */
+static _Atomic(int64_t) g_cert_interrupt_after;
+static _Atomic(int64_t) g_cert_levels;
+void ray_parquet_test_cert_interrupt_after(int64_t nth) {
+    atomic_store_explicit(&g_cert_interrupt_after,nth,memory_order_relaxed);
+}
+int64_t ray_parquet_test_cert_levels(void) {
+    return atomic_load_explicit(&g_cert_levels,memory_order_relaxed);
+}
+#endif
 /* Every one of the next `n` definition levels is present. The cursor advances
- * exactly as pq_rle_next would; the caller restores its saved copy on false. */
-static bool pq_levels_present(pq_rle* defs, int64_t n) {
-    for (int64_t i = 0; i < n; i++) {
+ * exactly as pq_rle_next would; the caller restores its saved copy on false.
+ * Coarse checkpoints bound the scan's work between interrupts; an interrupted
+ * scan reports through the reader's error path. */
+static const char* pq_levels_present(pq_rle* defs, int64_t n, bool* all) {
+    int64_t i = 0;
+    for (; i < n; i++) {
+        if (!(i & 4095)) {
+            if (ray_interrupted()) {
+#if defined(DEBUG)
+                atomic_store_explicit(&g_cert_levels,i,memory_order_relaxed);
+#endif
+                return "scan interrupted";
+            }
+#if defined(DEBUG)
+            int64_t k = atomic_load_explicit(&g_cert_interrupt_after,memory_order_relaxed);
+            while (k > 0 && !atomic_compare_exchange_weak(&g_cert_interrupt_after,&k,k-1)) {}
+            if (k == 1) ray_request_interrupt();
+#endif
+        }
         uint32_t present;
-        if (!pq_rle_next(defs,&present) || present != 1) return false;
+        if (!pq_rle_next(defs,&present) || present != 1) {
+#if defined(DEBUG)
+            atomic_store_explicit(&g_cert_levels,i,memory_order_relaxed);
+#endif
+            *all = false;
+            return NULL;
+        }
     }
-    return true;
+#if defined(DEBUG)
+    atomic_store_explicit(&g_cert_levels,n,memory_order_relaxed);
+#endif
+    *all = true;
+    return NULL;
 }
 
 typedef struct {
@@ -930,7 +969,8 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
         c->encoding = (int)encoding; c->page_left = count;
         if (!encoding && c->optional && pq_optional_bulk(s)) {
             pq_rle saved = c->defs;
-            c->page_all_present = pq_levels_present(&c->defs,count);
+            const char* lerr = pq_levels_present(&c->defs,count,&c->page_all_present);
+            if (lerr) { c->defs = saved; return lerr; }
             if (!c->page_all_present) c->defs = saved;
         }
         if (encoding) {
