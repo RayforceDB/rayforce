@@ -94,5 +94,11 @@
 (set Tbp (.db.parted.get "rf_test_firstn_bool/" 't))
 (at (at (select {from: Tbp by: {kb: bl} c: (count v) take: 1}) 'kb) 0) -- true
 (eqt (select {from: Tbp by: {kb: bl} c: (count v) take: 1}) (select {from: Tb by: {kb: bl} c: (count v) take: 1})) -- true
+;; a computed BOOL key (alone, and inside a multi-key dict) is emitted in key
+;; order; the take must still give the first-seen groups, true first here
+(at (at (select {from: Tbp by: {kb: (< u 4)} c: (count v) take: 1}) 'kb) 0) -- true
+(eqt (select {from: Tbp by: {kb: (< u 4)} c: (count v) take: 1}) (select {from: Tb by: {kb: (< u 4)} c: (count v) take: 1})) -- true
+(eqt (select {from: Tbp by: {kb: (< u 4) ku: (% u 3)} c: (count v) take: 2}) (select {from: Tb by: {kb: (< u 4) ku: (% u 3)} c: (count v) take: 2})) -- true
+(eqt (select {from: Tbp by: {ku: (% u 3) kb: (< u 4)} c: (count v) take: 3}) (select {from: Tb by: {ku: (% u 3) kb: (< u 4)} c: (count v) take: 3})) -- true
 (.sys.exec "rm -rf rf_test_firstn_bool") -- 0
 (.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0
