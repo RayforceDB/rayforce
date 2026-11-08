@@ -832,9 +832,9 @@ static test_result_t test_dict_variants(void) {
         TEST_ASSERT_EQ_U(k.materialized, 0);
         col = ray_table_col(t, ray_sym_intern("s", 1));
         TEST_ASSERT_TRUE(col && !RAY_IS_ERR(col));
-        TEST_ASSERT_EQ_I(ray_index_kind(col), RAY_IDX_DICT);
-        TEST_ASSERT_EQ_I(!!(ray_index_payload(col->index)->markers & RAY_MARK_UNIQUE), vs[d].unique);
-        TEST_ASSERT_EQ_I(ray_index_payload(col->index)->u.dict.n_distinct, 70000);
+        /* 70000 distinct strings: the DICT's second copy would outweigh the
+         * column, so it is not persisted (#1094); UNIQUE is in the header */
+        TEST_ASSERT_EQ_I(ray_index_kind(col), 0);
         st_unhold(t, NULL); ray_release(t);
         char qa[700];                                     /* .attr.get equal to the source's */
         snprintf(qa, sizeof qa, "(== (count (.attr.get %s)) (count (.attr.get (at (.db.splayed.get \"%s%s/\") 's))))",
@@ -1703,16 +1703,20 @@ static test_result_t test_stream_equals_resident(void) {
         free(pr2);
         TEST_ASSERT_FMT(rsame, "order %d: resave differs from the stream", o);
         ray_enc_hdr_t eh; memcpy(&eh, pa + 32, sizeof eh);
-        TEST_ASSERT_EQ_I(eh.index_kind, RAY_IDX_DICT);
-        TEST_ASSERT_TRUE(eh.index_off > 96 && eh.index_off < na);
+        /* the DICT is kept while column + region stay within the generation-0
+         * payload (#1094): order 1's FSST-coded URLs leave room, order 0's
+         * raw URL vectors do not (70000 distinct strings) */
+        TEST_ASSERT_EQ_I(eh.index_kind, o ? RAY_IDX_DICT : 0);
+        if (o == 0) TEST_ASSERT_EQ_U(eh.index_off, 0);
+        else TEST_ASSERT_TRUE(eh.index_off > 96 && eh.index_off < na);
         /* the bare files carry none: each is the stream's bytes before its
-         * region's 32-alignment padding, its header without the region
+         * region's 32-alignment padding (order 0: the whole file), its header without the region
          * (index_kind 0, index_off 0, end_off the bare file's size) */
-        const uint64_t cut = eh.index_off;
+        const uint64_t cut = o ? eh.index_off : na;
         const char* const bare[2] = { STP("/pl"), STP("/pb") };
         for (int k = 0; k < 2; k++) {
             size_t nb; uint8_t* pb = slurp_file(bare[k], &nb);
-            bool same = pb && nb >= 96 && nb <= cut && ray_enc_pad32(nb) == cut;
+            bool same = pb && nb >= 96 && nb <= cut && (o ? ray_enc_pad32(nb) == cut : nb == cut);
             if (same) {
                 uint8_t* norm = malloc(nb);
                 same = norm != NULL;

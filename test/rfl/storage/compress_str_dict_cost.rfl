@@ -1,0 +1,40 @@
+;; @requires: posix  (byte counts run through a POSIX shell via .sys.exec)
+;; A generation-2 save does not persist the automatic STR DICT when the encoded
+;; column plus the region would exceed the generation-0 payload (#1094): a
+;; distinct-heavy long-text column stays raw-sized with compress: true, with
+;; no index, and reads and filters as before.  A low-cardinality column keeps
+;; its DICT.
+(.sys.exec "rm -rf /tmp/rf_test_strdict_cost") -- 0
+(set n 70000)
+(set i (til n))
+;; 240+ byte strings, every one distinct
+(set pad "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+(set big (as 'STR (map (fn [j] (format "%/%" j pad)) i)))
+(set lo (as 'STR (map (fn [j] (format "k%" (% j 977))) i)))
+(set t (table [r s] (list big lo)))
+(.db.splayed.set "/tmp/rf_test_strdict_cost/raw/" t {compress: false index: false})
+(.db.splayed.set "/tmp/rf_test_strdict_cost/z/" t {compress: true})
+(.db.splayed.set "/tmp/rf_test_strdict_cost/zni/" t {compress: true index: false})
+(set Z (.db.splayed.get "/tmp/rf_test_strdict_cost/z/"))
+(set N (.db.splayed.get "/tmp/rf_test_strdict_cost/zni/"))
+
+;; distinct-heavy: no index recorded, the same as index: false
+(at (.idx.info Z 'r) 'gen) -- 2
+(at (.idx.info Z 'r) 'index) -- 'none
+(at (.idx.info N 'r) 'index) -- 'none
+;; low cardinality: the DICT stays
+(at (.idx.info Z 's) 'index) -- 'dict
+(at (.idx.info N 's) 'index) -- 'none
+
+;; the compressed column is not meaningfully larger than the raw one
+(.sys.exec "test $(stat -c %s $(find /tmp/rf_test_strdict_cost/z -name r -type f)) -le $(( $(stat -c %s $(find /tmp/rf_test_strdict_cost/raw -name r -type f)) * 105 / 100 ))") -- 0
+(.sys.exec "test $(stat -c %s $(find /tmp/rf_test_strdict_cost/z -name r -type f)) -eq $(stat -c %s $(find /tmp/rf_test_strdict_cost/zni -name r -type f))") -- 0
+
+;; values and queries are unchanged without the index
+(all (== (at Z 'r) big)) -- true
+(all (== (at Z 's) lo)) -- true
+(count (select {from: Z where: (== r (at big 12345))})) -- 1
+(count (distinct (at Z 'r))) -- n
+(count (select {from: Z where: (== s "k5")})) -- (count (select {from: t where: (== s "k5")}))
+
+(.sys.exec "rm -rf /tmp/rf_test_strdict_cost") -- 0

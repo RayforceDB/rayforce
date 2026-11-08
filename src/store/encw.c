@@ -61,6 +61,8 @@ static _Atomic(int) g_encw_force_float = -1;
 void ray_encw_test_force_float(int enc) { atomic_store(&g_encw_force_float, enc); }
 static _Atomic(int) g_encw_force_str = -1;
 void ray_encw_test_force_str(int enc) { atomic_store(&g_encw_force_str, enc); }
+static atomic_bool g_encw_keep_dict;
+void ray_encw_test_keep_dict(bool keep) { atomic_store(&g_encw_keep_dict, keep); }
 
 void ray_encw_vec_init(ray_encw_vec_t* v) { memset(v, 0, sizeof *v); }
 void ray_encw_vec_free(ray_encw_vec_t* v) { ray_enc_buf_free(&v->payload); }
@@ -1182,6 +1184,20 @@ static ray_err_t encw_side(ray_encw_t* w, uint64_t* side_off, uint64_t* side_len
     return RAY_OK;
 }
 
+/* The automatic STR DICT stores a second copy of every distinct string, plus
+ * its codes and offsets.  It is kept only while the column written so far
+ * plus that region stays no larger than the generation-0 payload (16 B
+ * descriptor per row plus every pooled byte): a distinct-heavy column (raw
+ * messages, payloads) would otherwise save at about twice its raw size,
+ * though every vector fell back to raw (#1094).  Low- and mixed-cardinality
+ * columns, whose encoding is small, keep it. */
+static bool encw_dict_unpaid(const ray_encw_t* w) {
+    if (atomic_load(&g_encw_keep_dict)) return false;
+    const ray_dict_acc_t* a = w->idict;
+    uint64_t region = 96 + 4ull * (uint64_t)w->len + 12ull * (uint64_t)a->n_distinct + 8 + a->pool_len;
+    return w->pos + region > 16ull * (uint64_t)w->len + w->str_occ_bytes;
+}
+
 ray_err_t ray_encw_finish(ray_encw_t* w) {
     if (w->chunk_i != w->n_chunks) return RAY_ERR_RANGE;
     ray_err_t err;
@@ -1191,6 +1207,10 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
     if (w->sdict.used) w->str_pool_bytes += w->sdict.pooled;
     /* the index region follows the side data, 32-aligned (spec "Writers") */
     uint64_t index_off = 0;
+    if (w->idict && encw_dict_unpaid(w)) {   /* the DICT does not pay: none, as with index: false */
+        ray_dict_acc_free(w->idict); ray_free_raw(w->idict); w->idict = NULL;
+        w->index_kind = 0;
+    }
     if (w->has_idx || w->idx_copy || w->idict) {
         index_off = ray_enc_pad32(w->pos);
         if ((err = fput(w, NULL, (size_t)(index_off - w->pos))) != RAY_OK) return err;

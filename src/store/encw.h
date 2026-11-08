@@ -97,6 +97,10 @@ void      ray_encw_test_force_float(int enc);
  * would pass RAY_ENCW_SDICT_CAP; any other code. */
 void      ray_encw_test_force_str(int enc);
 
+/* Test hook: keep a STR column's automatic DICT whatever its cost (the
+ * region fixtures hold a DICT over a handful of distinct strings). */
+void      ray_encw_test_keep_dict(bool keep);
+
 /* Column assembly (spec "Format"): begin, one chunk per 65536 rows, finish. */
 typedef struct {
     FILE*    f;

@@ -1197,12 +1197,14 @@ static const char* idx_golden_emit(const char* dir) {
         FILE* f = fopen(path, "wb+");
         ray_encw_t w; memset(&w, 0, sizeof w);
         ray_encw_test_force_str(RAY_ENC_RAW);                  /* the subject is the region */
+        ray_encw_test_keep_dict(true);                         /* whatever the DICT costs */
         ray_err_t e = f ? ray_encw_begin(&w, f, RAY_STR, 0, 300, 0, RAY_IDX_DICT, 0) : RAY_ERR_IO;
         const ray_t* own = ds;
         const char* pool = own->str_pool ? (const char*)ray_data(own->str_pool) : NULL;
         if (e == RAY_OK) e = ray_encw_chunk(&w, ray_data(ds), pool, 300);
         if (e == RAY_OK) e = ray_encw_finish(&w);
         ray_encw_test_force_str(-1);
+        ray_encw_test_keep_dict(false);
         if (f) { ray_encw_free(&w); fclose(f); }
         ray_release(ds);
         if (e != RAY_OK) return "idx_dict_str";
