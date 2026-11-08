@@ -101,3 +101,31 @@
 (== (mmin 5 bf) (as 'F32 (mmin 5 bd))) -- (take [true] bn)
 (== (mmax 5 bf) (as 'F32 (mmax 5 bd))) -- (take [true] bn)
 (last (mins bf)) -- (as 'F32 (last (mins bd)))
+
+;; Planner output types are pinned by composing the reductions and scans
+;; with other F32 operands: every result stays F32, eager and in select.
+(set cv (as 'F32 [2.5 -3.5 4.5 1.25]))
+(min (mins cv)) -- -3.5e
+(type (min (mins cv))) -- 'f32
+(- cv (min cv)) -- (as 'F32 [6.0 0.0 8.0 4.75])
+(+ (max cv) (as 'F32 1.0)) -- 5.5e
+(- cv (first cv)) -- (as 'F32 [0.0 -6.0 2.0 -1.25])
+(- (maxs cv) (mins cv)) -- (as 'F32 [0.0 6.0 8.0 8.0])
+(+ cv (mmin 2 cv)) -- (as 'F32 [5.0 -7.0 1.0 2.5])
+(set CT (table [x] (list cv)))
+(set CS (select {a: (- x (min x)) b: (+ (max x) (as 'F32 1.0)) c: (- x (first x)) d: (- (maxs x) (mins x)) e: (min (mins x)) f: (+ x (mmin 2 x)) from: CT}))
+(type (at CS 'a)) -- 'F32
+(type (at CS 'b)) -- 'F32
+(type (at CS 'c)) -- 'F32
+(type (at CS 'd)) -- 'F32
+(type (at CS 'e)) -- 'F32
+(type (at CS 'f)) -- 'F32
+(at CS 'a) -- (as 'F32 [6.0 0.0 8.0 4.75])
+(at CS 'b) -- (as 'F32 [5.5 5.5 5.5 5.5])
+(at CS 'c) -- (as 'F32 [0.0 -6.0 2.0 -1.25])
+(at CS 'd) -- (as 'F32 [0.0 6.0 8.0 8.0])
+(at CS 'e) -- (as 'F32 [-3.5 -3.5 -3.5 -3.5])
+(at CS 'f) -- (as 'F32 [5.0 -7.0 1.0 2.5])
+(set CL (select {mn: (min x) mx: (max x) from: CT}))
+(type (at CL 'mn)) -- 'F32
+(type (at CL 'mx)) -- 'F32
