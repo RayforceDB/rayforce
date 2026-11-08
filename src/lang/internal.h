@@ -236,6 +236,7 @@ static inline int is_truthy(ray_t* x) {
     case -RAY_I16:  return x->i16 != 0;
     case -RAY_I32:  return x->i32 != 0;
     case -RAY_I64: case -RAY_DATE: case -RAY_TIME: case -RAY_TIMESTAMP:
+    case -RAY_TIMESPAN:
         return x->i64 != 0;
     case -RAY_F32: case -RAY_F64:   /* F32 atoms are stored widened */
         return x->f64 != 0.0 && x->f64 == x->f64;

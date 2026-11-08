@@ -16,6 +16,24 @@
 (not (enlist 0D00:00:00 0D00:00:01)) -- [true false]
 (not (enlist 0D01:00:00)) -- [false]
 
+;; the compiled spelling inside a query agrees with the interpreted one
+(set Tn (table [sp] (list (enlist 0D01:00:00 0D00:00:00 0Nn))))
+(at (select {r: (not sp) from: Tn}) 'r) -- [false true true]
+(at (select {r: (not sp) from: Tn}) 'r) -- (not (at Tn 'sp))
+
+;; a zero TIMESPAN atom is falsy, as a zero of the other temporal types is
+(not 0D00:00:00) -- true
+(not 0D00:00:01) -- false
+(not 0Nn) -- true
+(if 0D00:00:00 1 2) -- 2
+(if 0D00:00:01 1 2) -- 1
+
+;; a zero TIMESPAN atom is falsy inside a query too, as a condition
+(set Tc (table [sp v] (list (enlist 0D00:00:00 0D00:00:01) [1 2])))
+(at (select {r: (if 0D00:00:00 v 0) from: Tc}) 'r) -- [0 0]
+(at (select {r: (if 0D00:00:01 v 0) from: Tc}) 'r) -- [1 2]
+(at (select {r: (if (first sp) v 0) from: Tc}) 'r) -- [0 0]
+
 ;; `not` has no meaning for the cells of a STR, SYM or GUID vector: a type
 ;; error, as the compiled form gives, not one boolean for the whole vector.
 (not (enlist "a" "")) !- type
