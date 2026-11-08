@@ -533,7 +533,8 @@ ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) {
         if (done_bytes) madvise(m->map, done_bytes, MADV_RANDOM);
         return RAY_OK;
     }
-    if (msync(m->map, (size_t)tail, MS_SYNC) != 0 || fsync(m->fd) != 0) return RAY_ERR_IO;
+    if (!ray_fsync_disabled() &&
+        (msync(m->map, (size_t)tail, MS_SYNC) != 0 || fsync(m->fd) != 0)) return RAY_ERR_IO;
     err = ray_file_sync_dir(m->path);
     /* The index claims the file's identity, which on macOS the unmap of a
      * written shared mapping still moves (its modification time): it is
