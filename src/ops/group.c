@@ -9375,6 +9375,12 @@ static ray_t* materialize_broadcast_input_fill(ray_t* src, int64_t nrows) {
             for (int64_t i = 0; i < nrows; i++) ((double*)ray_data(out))[i] = v;
             return out;
         }
+        case -RAY_F32: {
+            /* an F32 atom holds its value in the f64 slot (ray_f32) */
+            float v = (float)src->f64;
+            for (int64_t i = 0; i < nrows; i++) ((float*)ray_data(out))[i] = v;
+            return out;
+        }
         case -RAY_I64:
         case -RAY_SYM:
         case -RAY_TIMESTAMP: {
