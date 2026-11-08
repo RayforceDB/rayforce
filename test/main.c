@@ -940,6 +940,7 @@ void ray_test_hooks_off(void) {
     ray_enccol_test_fail_alloc(0);
     ray_enccol_test_fail_path(NULL);
     ray_enccol_test_interrupt_after(0);
+    ray_enccol_test_hold_decode(false);
     ray_enccol_test_parted_mode(0);
     ray_enccol_test_fail_index_parse(false);
     ray_col_test_fail_alloc(0);
@@ -1135,6 +1136,9 @@ static const char* const quick_skip[] = {
     "stress/",          /* randomized soak against a shadow model */
     "stress_eval/",
     "large/",
+    /* Ctrl-C has to land while ./rayforce is still computing: an unsanitized
+     * build finishes first on a fast core.  Runs in make test-full (ASan). */
+    "repl/pty/ctrl_c_during_lazy_materialize",
     NULL,
 };
 #if !defined(_WIN32)   /* -j only: the parallel runner is POSIX-only */
