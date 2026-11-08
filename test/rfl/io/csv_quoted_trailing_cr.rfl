@@ -19,4 +19,29 @@
 ;; schema-driven splayed import goes through the same scanner
 (set S (.csv.splayed [I64 STR STR] "rf_test_csvcr.csv" "rf_test_csvcr_spl"))
 (at S 'u) -- ["\r" "y" "\r\n" "q\r"]
-(.sys.exec "rm -rf rf_test_csvcr_spl rf_test_csvcr.csv rf_test_csvcr_out.csv rf_test_csvcr_crlf.csv") -- 0
+;; ── parallel row decoder (csv_parse_fn, runs only when n_rows > 8192) ───────
+;; 2^15 = 32768 CRLF rows of  1,"q\r"  -- each STR is 2 bytes (q, CR).  With
+;; the strip restored in the parallel decoder the total drops to 32768.
+(.sys.exec "printf 'id,u\r\n' > rf_test_csvcr_big.csv; printf '1,\"q\r\"\r\n' > rf_test_csvcr_blk; i=0; while [ $i -lt 15 ]; do cat rf_test_csvcr_blk rf_test_csvcr_blk > rf_test_csvcr_blk2; mv rf_test_csvcr_blk2 rf_test_csvcr_blk; i=$((i+1)); done; cat rf_test_csvcr_blk >> rf_test_csvcr_big.csv; rm -f rf_test_csvcr_blk") -- 0
+(set B (.csv.read [I64 STR] "rf_test_csvcr_big.csv"))
+(count B) -- 32768
+(sum (map count (at B 'u))) -- 65536
+(at (at B 'u) 20000) -- "q\r"
+
+;; ── INT width pre-scan (csv_auto_scan_rows) ─────────────────────────────────
+;; The pre-scan must see the same field text as the decoder: "5000000000\r" is
+;; not a number, so the column fits I16 with a null (not I64).
+(.sys.exec "printf 'id,n\n1,\"5\"\n2,\"5000000000\r\"\n' > rf_test_csvcr_int.csv") -- 0
+(set N (.csv.read [I64 INT] "rf_test_csvcr_int.csv"))
+(type (at N 'n)) -- 'I16
+(at N 'n) -- (as 'I16 [5 0Nl])
+
+;; ── non-STR last columns ────────────────────────────────────────────────────
+;; A quoted last-column value ending in '\r' is no longer stripped to the bare
+;; value: it is not a valid number/date, so it is null -- the same result as
+;; for that field in a middle column.
+(.sys.exec "printf 'id,v\n1,\"7\r\"\n2,8\n' > rf_test_csvcr_num.csv") -- 0
+(at (.csv.read [I64 I64] "rf_test_csvcr_num.csv") 'v) -- [0Nl 8]
+(.sys.exec "printf 'id,d\n1,\"2024.01.02\r\"\n2,2024.01.03\n' > rf_test_csvcr_date.csv") -- 0
+(at (.csv.read [I64 DATE] "rf_test_csvcr_date.csv") 'd) -- [0Nd 2024.01.03]
+(.sys.exec "rm -rf rf_test_csvcr_spl rf_test_csvcr.csv rf_test_csvcr_out.csv rf_test_csvcr_crlf.csv rf_test_csvcr_big.csv rf_test_csvcr_int.csv rf_test_csvcr_num.csv rf_test_csvcr_date.csv") -- 0
