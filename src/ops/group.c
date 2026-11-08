@@ -4374,8 +4374,8 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
          * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
         case OP_COUNT: return ray_i64(scan_n);
         case OP_AVG:   return m->cnt > 0 ? ray_f64(ray_f64_fin(fp ? m->sum_f / m->cnt : ray_i128_to_f64(m->sum_hi, (uint64_t)m->sum_i) / m->cnt)) : ray_typed_null(-RAY_F64);
-        case OP_FIRST: return m->has_first ? (in_type == RAY_F32 ? ray_f32((float)m->first_f) : in_type == RAY_F64 ? ray_f64(m->first_f) : reduction_i64_result(m->first_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
-        case OP_LAST:  return m->has_first ? (in_type == RAY_F32 ? ray_f32((float)m->last_f) : in_type == RAY_F64 ? ray_f64(m->last_f) : reduction_i64_result(m->last_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
+        case OP_FIRST: return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->first_f) : reduction_i64_result(m->first_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
+        case OP_LAST:  return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->last_f) : reduction_i64_result(m->last_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_VAR: case OP_VAR_POP:
         case OP_STDDEV: case OP_STDDEV_POP: {
             bool insufficient = (opcode == OP_VAR || opcode == OP_STDDEV) ? m->cnt <= 1 : m->cnt <= 0;
