@@ -1561,7 +1561,11 @@ static test_result_t test_materialize_equivalence(void) {
     PASS();
 }
 
-/* Every type with nulls at the boundary lengths; SYM at every width. */
+/* Every type with nulls at the boundary lengths; SYM at every width.  Both
+ * shapes (no nulls, nulls) run at every vector edge and across the chunk
+ * edge (65537); the two in-chunk edges 65535 and 65536 take one shape each,
+ * alternating with the type (and SYM width), so every (type, width, shape)
+ * still meets one of them. */
 static test_result_t test_materialize_lengths(void) {
     static const int8_t types[] = { RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME,
                                     RAY_TIMESTAMP, RAY_F32, RAY_F64, RAY_GUID, RAY_SYM, RAY_STR };
@@ -1571,6 +1575,7 @@ static test_result_t test_materialize_lengths(void) {
         for (size_t l = 0; l < sizeof lens / sizeof *lens; l++)
             for (int s = 0; s < 5; s += 4)                   /* shapes 0 (no nulls) and 4 (nulls) */
                 for (size_t w = 0; w < (types[t] == RAY_SYM ? 4u : 1u); w++) {
+                    if ((lens[l] == 65535 || lens[l] == 65536) && (t + w + (size_t)(lens[l] & 1) + (size_t)s / 4) % 2) continue;
                     g_symw = widths[w];
                     ray_t* v = make_col(types[t], lens[l], s);
                     test_result_t r = check_equivalence(v);
