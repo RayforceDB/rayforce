@@ -129,3 +129,22 @@
 (set CL (select {mn: (min x) mx: (max x) from: CT}))
 (type (at CL 'mn)) -- 'F32
 (type (at CL 'mx)) -- 'F32
+
+;; Scalar F32 arithmetic follows the same single-null model as the vector
+;; kernels and F64 atoms: an overflowing atom result is the F32 null, so
+;; enlist cannot carry a raw infinity into a column.
+(set h (as 'F32 3.0e38))
+(type (+ h h)) -- 'f32
+(nil? (+ h h)) -- true
+(nil? (- h (neg h))) -- true
+(nil? (* h h)) -- true
+(type (* h h)) -- 'f32
+(* (as 'F32 1.5) (as 'F32 2.0)) -- 3.0e
+(- (as 'F32 1.5) (as 'F32 2.0)) -- -0.5e
+(% (as 'F32 -7.5) (as 'F32 2.0)) -- 0.5e
+(nil? (* 1e308 1e308)) -- true
+(enlist (* h h) (as 'F32 1.0)) -- (as 'F32 [0Nf 1.0])
+(nil? (enlist (* h h) (as 'F32 1.0))) -- [true false]
+(maxs (enlist (* h h) (as 'F32 1.0))) -- (as 'F32 [0Nf 1.0])
+(nil? (maxs (enlist (* h h) (as 'F32 1.0)))) -- [true false]
+(max (enlist (* h h) (as 'F32 1.0))) -- 1.0e
