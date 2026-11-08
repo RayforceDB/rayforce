@@ -59,6 +59,16 @@ jobs:
         if: matrix.target == 'debug'
         run: make ${{ env.TEST_TIER }} CC=${{ matrix.compiler }}
 
+      # A test that failed in a parallel worker leaves the list of tests that
+      # worker ran (`--replay FILE` reruns them in that order in one process).
+      - name: Upload test replay files
+        if: failure() && matrix.target == 'debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-replay-${{ matrix.os }}-${{ matrix.compiler }}
+          path: /tmp/rayforce_replay.*
+          if-no-files-found: ignore
+
   # The default Ubuntu compiler is gcc. Exercise the suite with a recent
   # upstream Clang as well, so new -Werror diagnostics reach CI before users
   # of rolling-release toolchains encounter them.
@@ -76,6 +86,13 @@ jobs:
           sudo bash llvm.sh 23
       - name: Test with Clang 23 (${{ env.TEST_TIER }})
         run: make ${{ env.TEST_TIER }} CC=clang-23
+      - name: Upload test replay files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-replay-clang-current
+          path: /tmp/rayforce_replay.*
+          if-no-files-found: ignore
 
   # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
   # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;

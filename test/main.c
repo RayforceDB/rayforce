@@ -1137,6 +1137,7 @@ static const char* const quick_skip[] = {
     "large/",
     NULL,
 };
+#if !defined(_WIN32)   /* -j only: the parallel runner is POSIX-only */
 /* -j runs these after every other test, one at a time, on an otherwise idle
  * machine (prefix match): tests whose outcome depends on which pool worker
  * thread picks up which task (with every core busy, the scheduler reorders
@@ -1149,11 +1150,26 @@ static const char* const exclusive_tests[] = {
     "equiv/rfl/system/ipc_diff",   /* ... its equivalence-pass twin */
     NULL,
 };
+/* -j hands these out first, so each is the first test of a newly forked
+ * worker.  For tests whose arithmetic assumes a small process footprint:
+ * they size a memory watermark from it, and a worker that already ran
+ * hundreds of tests holds several hundred MB more than a fresh one. */
+static const char* const fresh_tests[] = {
+    "agg_contract/dense_wide_budget",   /* also _sel: per-worker slab budget */
+    NULL,
+};
+static bool fresh_test(const char* name) {
+    for (int i = 0; fresh_tests[i]; i++)
+        if (strncmp(name, fresh_tests[i], strlen(fresh_tests[i])) == 0) return true;
+    return false;
+}
+
 static bool exclusive_test(const char* name) {
     for (int i = 0; exclusive_tests[i]; i++)
         if (strncmp(name, exclusive_tests[i], strlen(exclusive_tests[i])) == 0) return true;
     return false;
 }
+#endif
 
 static bool quick_skipped(const char* name) {
     for (int i = 0; quick_skip[i]; i++)
@@ -1239,7 +1255,9 @@ static void collect_jobs(const char* filter, bool quick) {
 static int replay_select(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return -1; }
-    test_job_t* out = (test_job_t*)malloc((size_t)(g_njobs > 0 ? g_njobs : 1) * sizeof *out);
+    /* the selection, then every job behind it (past g_njobs): the full
+     * list stays reachable, it owns the equiv/ names (tmp_strdup) */
+    test_job_t* out = (test_job_t*)malloc((size_t)(g_njobs > 0 ? 2 * g_njobs : 1) * sizeof *out);
     if (!out) { fclose(f); return -1; }
     int n = 0;
     char line[700];
@@ -1252,8 +1270,10 @@ static int replay_select(const char* path) {
         out[n++] = g_jobs[i];
     }
     fclose(f);
+    memcpy(out + n, g_jobs, (size_t)g_njobs * sizeof *out);
+    int total = g_njobs;
     free(g_jobs);
-    g_jobs = out; g_njobs = n; g_jobs_cap = n;
+    g_jobs = out; g_njobs = n; g_jobs_cap = n + total;
     return 0;
 }
 
@@ -1391,7 +1411,7 @@ static void times_save(const char* path, const double* ms) {
  * indices from its command pipe, runs each with run_job() (output into its
  * own log file), and answers on the shared result pipe.  Records are smaller
  * than PIPE_BUF, so writes from different workers never interleave. */
-typedef struct { int32_t job; int32_t status; int64_t log_end; } worker_res_t;
+typedef struct { int32_t job; int32_t status; int32_t retire; int32_t pad; int64_t log_end; } worker_res_t;
 
 typedef struct {
     pid_t   pid;
@@ -1400,6 +1420,7 @@ typedef struct {
     int     job;         /* job in flight, -1 when idle                   */
     int64_t log_pos;     /* log offset where the job in flight started    */
     double  t0;          /* wall-clock dispatch time (ms)                 */
+    bool    retire;      /* it left spill pools: exits, a fresh one follows */
     int*    hist;        /* every job this process ran, in order (replay) */
     int     nhist, hist_cap;
 } worker_t;
@@ -1457,6 +1478,23 @@ typedef struct {
     int*      pass; int* fail; int* skip;
 } pool_t;
 
+/* Whether any heap of this process holds a pool spilled to a file.  Spill
+ * mappings are MAP_SHARED (mem/heap.c): after fork() parent and child write
+ * the same pages, so a later test that forks and keeps running rayforce code
+ * in the child corrupts both heaps.  A test that tightened the memory
+ * watermark can leave such pools behind; the worker then retires, and the
+ * next tests run in a fresh process, as they would after it in a serial run
+ * only by luck of the order. */
+static bool process_has_spill_pools(void) {
+    for (int i = 0; i < RAY_HEAP_REGISTRY_SIZE; i++) {
+        const ray_heap_t* h = ray_heap_registry[i];
+        if (!h) continue;
+        for (uint32_t p = 0; p < h->pool_count && p < RAY_MAX_POOLS; p++)
+            if (h->pools[p].backed) return true;
+    }
+    return false;
+}
+
 static void worker_main(pool_t* P, int cmd_fd, int log_fd) {
     /* drop the parent's handles on the other workers */
     for (int k = 0; k < P->nw; k++) {
@@ -1473,9 +1511,10 @@ static void worker_main(pool_t* P, int cmd_fd, int log_fd) {
     while (read_all(cmd_fd, &j, sizeof j) && j >= 0 && j < g_njobs) {
         test_status_t st = run_job(&g_jobs[j], &pass, &fail, &skip);
         fflush(stdout); fflush(stderr);
-        worker_res_t r = { .job = j, .status = (int32_t)st,
+        bool retire = process_has_spill_pools();
+        worker_res_t r = { .job = j, .status = (int32_t)st, .retire = retire,
                            .log_end = (int64_t)lseek(STDOUT_FILENO, 0, SEEK_CUR) };
-        if (!write_all(P->res_wr, &r, sizeof r)) break;
+        if (!write_all(P->res_wr, &r, sizeof r) || retire) break;
     }
     private_cwd_leave();
     (void)ray_test_rm_rf(g_tmp_root);
@@ -1551,7 +1590,12 @@ static void results_drain(pool_t* P, int timeout_ms) {
         else                          { (*P->fail)++; replay_note(me, r.job); }
         fflush(stdout);
         me->job = -1;
-        if (me->pid > 0) worker_feed(P, k);
+        if (r.retire) {
+            me->retire = true;
+            if (me->cmd_fd >= 0) { close(me->cmd_fd); me->cmd_fd = -1; }
+        } else if (me->pid > 0) {
+            worker_feed(P, k);
+        }
     }
 }
 
@@ -1584,6 +1628,18 @@ static int run_parallel(int nworkers, const char* times_path,
     for (int i = 0; i < g_njobs; i++)
         if (g_jobs[i].est_ms < 0) g_jobs[i].est_ms = -1.0 - (double)i;
     qsort(g_jobs, (size_t)g_njobs, sizeof *g_jobs, job_cmp_est_desc);
+    /* fresh-process tests first, keeping the order of the rest: the first
+     * job each worker gets runs in a process that has run nothing */
+    {
+        test_job_t* tmp = (test_job_t*)malloc((size_t)(g_njobs > 0 ? g_njobs : 1) * sizeof *tmp);
+        if (tmp) {
+            int o = 0;
+            for (int i = 0; i < g_njobs; i++) if (fresh_test(g_jobs[i].e.name))  tmp[o++] = g_jobs[i];
+            for (int i = 0; i < g_njobs; i++) if (!fresh_test(g_jobs[i].e.name)) tmp[o++] = g_jobs[i];
+            memcpy(g_jobs, tmp, (size_t)g_njobs * sizeof *tmp);
+            free(tmp);
+        }
+    }
 
     int rp[2];
     if (pipe(rp) != 0) { perror("pipe"); return -1; }
@@ -1637,8 +1693,8 @@ static int run_parallel(int nworkers, const char* times_path,
             close(me->log_fd); me->log_fd = -1;
             if (me->cmd_fd >= 0) { close(me->cmd_fd); me->cmd_fd = -1; }
             me->job = -1;
-            /* replace a crashed worker while work remains */
-            if (crashed && P.next < g_njobs && worker_spawn(&P, k)) {
+            /* replace a crashed or retired worker while work remains */
+            if ((crashed || me->retire) && P.next < g_njobs && worker_spawn(&P, k)) {
                 alive++;
                 worker_feed(&P, k);
             }
