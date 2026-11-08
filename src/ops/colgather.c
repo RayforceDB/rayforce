@@ -127,7 +127,7 @@ static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int6
             } else {
                 /* the view's pool lives until the next read: copy now */
                 const char* p = v->str_pool + s->pool_off;
-                uint32_t off;
+                uint32_t off = 0;   /* set by acc_pool_put on success; gcc -O1 cannot see it */
                 ray_t* err = acc_pool_put(a, p, s->len, &off);
                 if (err) return err;
                 memcpy(e.prefix, p, 4);

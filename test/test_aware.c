@@ -46,6 +46,7 @@
 #include "ops/colgather.h"
 #include "ops/agg_engine.h"   /* agg_route_stats: the first-n route */
 #include "core/pool.h"      /* ray_cancel */
+#include "core/platform.h"  /* ray_sleep_ms */
 #include "vec/str.h"
 #include <math.h>
 #include <stdio.h>
@@ -90,6 +91,32 @@ static void aw_save(const char* name, const char* tbl, int enc) {
     aw_eval_ok(q);
     ray_encw_test_force(-1);
 }
+
+/* Fixture columns are built vectorized, not by a per-row (map (fn [j] ..)
+ * (til n)) (whose interpreted calls cost most of a test): a periodic rule
+ * maps one period and cycles it with take; nulls are added in ((+ x 0N) is
+ * null); strings are formatted once each and gathered by row (at), a STR
+ * column through (reverse (at V (reverse idx))), whose reverse appends every
+ * row's string to a pool of its own as the map did (a gather shares V's
+ * pool).  Each yields the per-row map's vector exactly: the saved files are
+ * byte for byte the same, symbols interned in the same order.  aw_rule_ok
+ * pins a column to its per-row rule at rows that take each branch. */
+static bool aw_rule_ok(const char* col, const char* rule, const char* rows) {
+    /* rule with each AWR spelled out as rows: no name is interned (the
+     * symbols' ids, and so the SYM columns saved after, stay as before) */
+    char r[1600], q[4096];
+    size_t n = 0;
+    for (const char* c = rule; *c && n + strlen(rows) + 1 < sizeof r; )
+        if (strncmp(c, "AWR", 3) == 0) { n += (size_t)snprintf(r + n, sizeof r - n, "%s", rows); c += 3; }
+        else r[n++] = *c++;
+    r[n] = 0;
+    snprintf(q, sizeof q, "(and (all (== (at %s %s) %s)) (all (== (nil? (at %s %s)) (nil? %s))))", col, rows, r, col, rows, r);
+    ray_t* v = ray_eval_str(q);
+    const bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+    if (v) ray_release(v);
+    return ok;
+}
+#define AW_RULE(col, rule, rows) TEST_ASSERT_FMT(aw_rule_ok((col), (rule), (rows)), "%s at %s is not %s", (col), (rows), (rule))
 
 /* Table <name><gen> loaded with .db.splayed.get (owned), or NULL. */
 static ray_t* aw_load(const char* name, int gen) {
@@ -1189,10 +1216,14 @@ static int64_t aw_unfused_count(const char* name, const char* q) {
     return n;
 }
 
+#define AW_SY_RULE "(as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" (format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) AWR))"
+#define AW_SY_ROWS "[0 1 2 3 4 65535 65536 65537 65538 131072 131073 131074 196608 199999]"
 static test_result_t test_sym_membership(void) {
     /* s clustered: each chunk holds 4 distinct symbols, empty strings (null) in chunks 1-3 */
-    aw_save("sy", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
-                  "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000)))))", -1);
+    aw_save("sy", "(table [s] (list (as 'SYMBOL (at (map (fn [j] (if (== j 16) \"\" (format \"w%\" j))) (til 17)) "
+                  "(+ (+ (* 4 (div (til 200000) 65536)) (% (til 200000) 4)) (* (+ 0 (and (>= (til 200000) 65536) (== 0 (% (til 200000) 3)))) "
+                  "(- 16 (+ (* 4 (div (til 200000) 65536)) (% (til 200000) 4)))))))))", -1);
+    AW_RULE("(at W 's)", AW_SY_RULE, AW_SY_ROWS);
     test_result_t r;
     if ((r = aw_sel_same("sy", ap_s_eq, -1)).status != TEST_PASS) return r;
     if ((r = aw_sel_same("sy", ap_s_ne_empty, -1)).status != TEST_PASS) return r;
@@ -1299,8 +1330,10 @@ static ray_op_t* ap_s_ne_null(ray_graph_t* g) {
     ray_op_t* o = ray_ne(g, ray_scan(g, "s"), ray_const_atom(g, lit)); ray_release(lit); return o;
 }
 static test_result_t test_sym_null_literal(void) {
-    aw_save("sn", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
-                  "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000))) (til 200000)))", -1);
+    aw_save("sn", "(table [s v] (list (as 'SYMBOL (at (map (fn [j] (if (== j 16) \"\" (format \"w%\" j))) (til 17)) "
+                  "(+ (+ (* 4 (div (til 200000) 65536)) (% (til 200000) 4)) (* (+ 0 (and (>= (til 200000) 65536) (== 0 (% (til 200000) 3)))) "
+                  "(- 16 (+ (* 4 (div (til 200000) 65536)) (% (til 200000) 4))))))) (til 200000)))", -1);
+    AW_RULE("(at W 's)", AW_SY_RULE, AW_SY_ROWS);
     int64_t ne = 0, vs = 0;
     for (int64_t j = 0; j < 200000; j++) if (aw_sy_val(j) < 0) { ne++; vs += j; }
     static const char* const qs[] = {
@@ -1377,8 +1410,10 @@ static test_result_t test_sym_null_literal(void) {
  * without "" rows); the rest is answered on the views' ids.  Generation 0
  * (the unchanged in-place kernel) is the reference. */
 static test_result_t test_sym_in_bounds(void) {
-    aw_save("sb", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (== 0 (% j 3))) \"\" "
-                  "(format \"w%\" (+ (* 4 (div j 65536)) (% j 4))))) (til 200000)))))", -1);
+    aw_save("sb", "(table [s] (list (as 'SYMBOL (at (map (fn [j] (if (== j 16) \"\" (format \"w%\" j))) (til 17)) "
+                  "(+ (+ (* 4 (div (til 200000) 65536)) (% (til 200000) 4)) (* (+ 0 (and (>= (til 200000) 65536) (== 0 (% (til 200000) 3)))) "
+                  "(- 16 (+ (* 4 (div (til 200000) 65536)) (% (til 200000) 4)))))))))", -1);
+    AW_RULE("(at W 's)", AW_SY_RULE, AW_SY_ROWS);
     test_result_t r;
     /* decoded bytes: only the RAW tail vector (320 W8 ids, with "" rows)
      * when its chunk's bounds leave it open.  `in` decides chunk 3 from its
@@ -1903,10 +1938,11 @@ static test_result_t test_gather_ragged(void) {
 /* ---- Task 6: gathers in the operators ---------------------------------- */
 
 /* aw_same / AW_SAME: Task 1. */
+#define AW_WIDE_V_RULE "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N j)) AWR))"
 static const char* AW_WIDE =
     "(table [k g v s t] (list (til 200000) (as 'I16 (% (til 200000) 7)) "
-    "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N j)) (til 200000))) "
-    "(take ['a 'b 'c] 200000) (map (fn [j] (format \"text value %\" (% j 333))) (til 200000))))";
+    "(as 'I32 (+ (til 200000) (take (map (fn [j] (if (== 0 (% j 10)) 0N 0)) (til 10)) 200000))) "
+    "(take ['a 'b 'c] 200000) (reverse (at (map (fn [j] (format \"text value %\" (% j 333))) (til 333)) (reverse (% (til 200000) 333))))))";
 
 /* q's answer as .csv.write bytes of table expression q over T (malloc'd;
  * NULL on a failure). */
@@ -1976,6 +2012,7 @@ static test_result_t aw_csv_same(const char* tbl0, const char* tbl2, const char*
 
 static test_result_t test_gather_operators(void) {
     aw_save("go", AW_WIDE, -1);
+    AW_RULE("(at W 'v)", AW_WIDE_V_RULE, "[0 1 10 199999]");
     AW_SAME("go", "(select {from: T where: (< k 100)})", 0);                        /* selection gather, every column */
     AW_SAME("go", "(select {k: k t: t from: T where: (== g 3) take: 7})", 0);         /* take: filter head */
     AW_SAME("go", "(select {k: k v: v t: t from: T where: (> v 100) desc: k take: 5})", 0);   /* top-k: the key read by range */
@@ -1997,6 +2034,7 @@ static test_result_t test_gather_operators(void) {
  * gathers its key and input through agg_build_compact. */
 static test_result_t test_gather_compact_group(void) {
     aw_save("gc", AW_WIDE, -1);
+    AW_RULE("(at W 'v)", AW_WIDE_V_RULE, "[0 1 10 199999]");
     AW_SAME("gc", "(select {c: (count k) from: T where: (< k 1000) by: g})", 0);
     AW_SAME("gc", "(select {c: (count k) m: (max v) from: T where: (< k 1000) by: s})", 0);
     PASS();
@@ -2007,6 +2045,7 @@ static test_result_t test_gather_compact_group(void) {
  * predicate columns (sel_compact). */
 static test_result_t test_gather_refine(void) {
     aw_save("gr", AW_WIDE, -1);
+    AW_RULE("(at W 'v)", AW_WIDE_V_RULE, "[0 1 10 199999]");
     AW_SAME("gr", "(select {c: (count k) from: T where: (and (< k 30000) (> v 100) (!= g 0))})", 0);
     AW_SAME("gr", "(select {k: k t: t from: T where: (and (< k 30000) (> v 100) (!= g 0))})", 0);
     AW_SAME("gr", "(take (select {s: s p: (count s) from: T where: (and (< k 30000) (== g 3) (> v 100)) "
@@ -2093,14 +2132,28 @@ static test_result_t test_gather_parted_sym(void) {
  * STR nulls, pooled and inline STR): each result equals generation 0's
  * `at` and the generation-0 source's own gather (pool bytes included, so
  * the task pools are appended in row order), and the dispatch ran. */
+/* Row j of a STR column: "" (j % 5 == 0), "short" (other even rows), else
+ * "a pooled string of row <j>"; AW_GP_W the pooled rows. */
+#define AW_GP_W "(where (and (!= 0 (% (til 300000) 5)) (== 1 (% (til 300000) 2))))"
+#define AW_GP_STR \
+    "(reverse (at (concat (map (fn [j] (if (== j 0) \"\" \"short\")) (til 2)) (map (fn [j] (format \"a pooled string of row %\" j)) " AW_GP_W ")) " \
+    "(reverse (+ (+ 0 (!= 0 (% (til 300000) 5))) (* (+ 0 (and (!= 0 (% (til 300000) 5)) (== 1 (% (til 300000) 2)))) " \
+    "(+ 1 (bin " AW_GP_W " (til 300000)))))))) "
+#define AW_GP_RULE_ROWS "[0 1 2 3 5 7 11 15 22 299999]"
 #define AW_GP_PRED "(or (< (til 300000) 70000) (and (>= (til 300000) 100000) (< (til 300000) 260000) (!= 0 (% (til 300000) 5))) (> (til 300000) 290000))"
 static test_result_t test_gather_sel_parallel(void) {
+    /* the per-row values, built by column: nulls added in, the pooled
+     * strings (odd rows off the multiples of 5) formatted once each in row
+     * order and gathered, y cycled over its period (3900) */
     aw_save("gp", "(table [i f s y d h] (list "
-            "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) (til 300000)) "
-            "(map (fn [j] (if (== 0 (% j 11)) 0Nf (* j 0.5))) (til 300000)) "
-            "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) (til 300000)) "
-            "(as 'SYMBOL (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 300000))) "
+            "(+ (* (til 300000) 3) (at [0 0N] (+ 0 (== 0 (% (til 300000) 7))))) "
+            "(+ (* (til 300000) 0.5) (at [0.0 0Nf] (+ 0 (== 0 (% (til 300000) 11))))) "
+            AW_GP_STR
+            "(as 'SYMBOL (take (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 3900)) 300000)) "
             "(as 'DATE (til 300000)) (% (til 300000) 251)))", -1);
+    AW_RULE("(at W 'i)", "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) AWR)", AW_GP_RULE_ROWS);
+    AW_RULE("(at W 's)", "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) AWR)", AW_GP_RULE_ROWS);
+    AW_RULE("(at W 'f)", "(map (fn [j] (if (== 0 (% j 11)) 0Nf (* j 0.5))) AWR)", AW_GP_RULE_ROWS);
     ray_t* t0 = aw_load("gp", 0); ray_t* t2 = aw_load("gp", 2);
     TEST_ASSERT_TRUE(t0 && t2);
     ray_t* pred = aw_eval(AW_GP_PRED);
@@ -2143,10 +2196,12 @@ static test_result_t test_gather_sel_parallel(void) {
  * generation-0 reference and the generation-0 source's own gather. */
 static test_result_t test_gather_rows_parallel(void) {
     aw_save("gr", "(table [i s y h] (list "
-            "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) (til 300000)) "
-            "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) (til 300000)) "
-            "(as 'SYMBOL (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 300000))) "
+            "(+ (* (til 300000) 3) (at [0 0N] (+ 0 (== 0 (% (til 300000) 7))))) "
+            AW_GP_STR
+            "(as 'SYMBOL (take (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"k%\" (% j 300)))) (til 3900)) 300000)) "
             "(% (til 300000) 251)))", -1);
+    AW_RULE("(at W 'i)", "(map (fn [j] (if (== 0 (% j 7)) 0Nl (* j 3))) AWR)", AW_GP_RULE_ROWS);
+    AW_RULE("(at W 's)", "(map (fn [j] (if (== 0 (% j 5)) \"\" (if (== 0 (% j 2)) \"short\" (format \"a pooled string of row %\" j)))) AWR)", AW_GP_RULE_ROWS);
     ray_t* t0 = aw_load("gr", 0); ray_t* t2 = aw_load("gr", 2);
     TEST_ASSERT_TRUE(t0 && t2);
     const int64_t n = 2 * 100000;
@@ -2201,9 +2256,11 @@ static ray_t* aw_refine_in_run(ray_t* t, const char* col, bool neg, ray_t* set, 
  * skips the tasks: both the I64 and the pooled STR gather answer `cancel`,
  * with no output and nothing left allocated. */
 static test_result_t test_gather_sel_late_null_cancel(void) {
-    aw_save("gl", "(table [i t u] (list (map (fn [j] (if (== j 250001) 0Nl j)) (til 300000)) "
+    aw_save("gl", "(table [i t u] (list (+ (til 300000) (at [0 0N] (+ 0 (== (til 300000) 250001)))) "
                   "(map (fn [j] (format \"a pooled string of row %\" j)) (til 300000)) "
-                  "(map (fn [j] (if (> j 295000) (format \"a late pooled string %\" j) \"s\")) (til 300000))))", -1);
+                  "(concat (take (map (fn [j] \"s\") (til 1)) 295001) (map (fn [j] (format \"a late pooled string %\" j)) (+ 295001 (til 4999))))))", -1);
+    AW_RULE("(at W 'i)", "(map (fn [j] (if (== j 250001) 0Nl j)) AWR)", "[0 250000 250001 299999]");
+    AW_RULE("(at W 'u)", "(map (fn [j] (if (> j 295000) (format \"a late pooled string %\" j) \"s\")) AWR)", "[0 295000 295001 299999]");
     ray_t* t0 = aw_load("gl", 0); ray_t* t2 = aw_load("gl", 2);
     TEST_ASSERT_TRUE(t0 && t2);
     ray_t* pred = ray_vec_new(RAY_BOOL, 300000); pred->len = 300000;
@@ -2260,6 +2317,7 @@ static test_result_t test_gather_sel_late_null_cancel(void) {
  * members answer as generation 0. */
 static test_result_t test_refine_in(void) {
     aw_save("ri", AW_WIDE, -1);
+    AW_RULE("(at W 'v)", AW_WIDE_V_RULE, "[0 1 10 199999]");
     AW_SAME("ri", "(select {c: (count k) from: T where: (and (== g 3) (in k [3 10 17 24 1000 5000]))})", 0);
     AW_SAME("ri", "(select {k: k v: v from: T where: (and (== g 3) (not-in v [3 10 17 24]))})", 0);
     AW_SAME("ri", "(select {c: (count k) from: T where: (and (== g 3) (in v [0N 101 115 20001]))})", 0);
@@ -2312,7 +2370,7 @@ static test_result_t test_refine_in(void) {
     ray_release(t0); ray_release(t2);
     /* F64 members: NaN nulls, -0.0 against +0.0, through exec_in on the
      * survivors, equal to generation 0 */
-    aw_save("rf", "(table [k f] (list (til 200000) (map (fn [j] (if (== 0 (% j 10)) 0Nf (if (== 0 (% j 7)) -0.0 (* 0.5 (% j 9))))) (til 200000))))", -1);
+    aw_save("rf", "(table [k f] (list (til 200000) (take (map (fn [j] (if (== 0 (% j 10)) 0Nf (if (== 0 (% j 7)) -0.0 (* 0.5 (% j 9))))) (til 630)) 200000)))", -1);
     t0 = aw_load("rf", 0); t2 = aw_load("rf", 2);
     TEST_ASSERT_TRUE(t0 && t2);
     static const struct { bool neg; const char* set; } fs[] = {
@@ -2421,6 +2479,7 @@ static test_result_t aw_ops_same(const char* tbl0, const char* tbl2, bool topk) 
 
 static test_result_t test_gather_filter_ops(void) {
     aw_save("fo", AW_WIDE, -1);
+    AW_RULE("(at W 'v)", AW_WIDE_V_RULE, "[0 1 10 199999]");
     test_result_t r = aw_ops_same("(.db.splayed.get \"" AW_TMP "/fo0/\")", "(.db.splayed.get \"" AW_TMP "/fo2/\")", true);
     if (r.status != TEST_PASS) return r;
     aw_save("fs", "(table [k g v s t] (list (til 3000) (as 'I16 (% (til 3000) 7)) "
@@ -2490,7 +2549,7 @@ static test_result_t test_gather_filter_ops(void) {
  * first-n pre-pass over the keys' sources, nothing unstaged. */
 static test_result_t test_firstn_by_range(void) {
     aw_save("fn", "(table [h s v] (list (% (* (til 300000) 7919) 100003) "
-                  "(as 'SYMBOL (map (fn [j] (format \"p%\" (% j 97))) (til 300000))) (til 300000)))", -1);
+                  "(as 'SYMBOL (take (map (fn [j] (format \"p%\" (% j 97))) (til 97)) 300000)) (til 300000)))", -1);
     static const char* const qs[] = {
         "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
         "(select {c: (count h) s: (sum v) from: T by: h take: 25})",
@@ -2515,7 +2574,7 @@ static void aw_firstn_parted_tables(void) {
             char q[900];
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fp%d/2024.01.0%d/t/\" "
                      "(table [h s v] (list (%% (* (+ (til 150000) %d) 7919) 100003) "
-                     "(as 'SYMBOL (map (fn [j] (format \"p%%\" (%% (+ j %d) 97))) (til 150000))) (+ (til 150000) %d))) "
+                     "(as 'SYMBOL (take (map (fn [j] (format \"p%%\" (%% (+ j %d) 97))) (til 97)) 150000)) (+ (til 150000) %d))) "
                      "\"" AW_TMP "/fp%d/.sym\" {compress: %s})",
                      gen, p + 1, p * 150000, p * 150000, p * 150000, gen, gen ? "true" : "false");
             aw_eval_ok(q);
@@ -2528,7 +2587,7 @@ static test_result_t test_firstn_parted(void) {
         char q[900];
         snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fpm/2024.01.0%d/t/\" "
                  "(table [h s v] (list (%% (* (+ (til 150000) %d) 7919) 100003) "
-                 "(as 'SYMBOL (map (fn [j] (format \"p%%\" (%% (+ j %d) 97))) (til 150000))) (+ (til 150000) %d))) "
+                 "(as 'SYMBOL (take (map (fn [j] (format \"p%%\" (%% (+ j %d) 97))) (til 97)) 150000)) (+ (til 150000) %d))) "
                  "\"" AW_TMP "/fpm/.sym\" {compress: %s})",
                  p + 1, p * 150000, p * 150000, p * 150000, p ? "true" : "false");
         aw_eval_ok(q);
@@ -2859,13 +2918,15 @@ static test_result_t test_gather_sym_points(void) {
             char q[1600];
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sy%d/2024.01.0%d/t/\" "
                      "(table [k a b c] (list (+ %lld (til %lld)) "
-                     "(as 'SYMBOL (map (fn [j] (format \"c%%\" (div j 4096))) (til %lld))) "
-                     "(as 'SYMBOL (map (fn [j] (if (== 0 (%% (div j 7) 13)) \"\" (format \"r%%\" (%% (div j 7) 97)))) (til %lld))) "
-                     "(as 'SYMBOL (map (fn [j] (format \"w%%\" (%% (* j 7919) 300))) (til %lld))))) "
+                     "(as 'SYMBOL (at (map (fn [j] (format \"c%%\" j)) (til 17)) (div (til %lld) 4096))) "      /* b: period 8827, c: 300 */
+                     "(as 'SYMBOL (take (map (fn [j] (if (== 0 (%% (div j 7) 13)) \"\" (format \"r%%\" (%% (div j 7) 97)))) (til 8827)) %lld)) "
+                     "(as 'SYMBOL (take (map (fn [j] (format \"w%%\" (%% (* j 7919) 300))) (til 300)) %lld)))) "
                      "\"" AW_TMP "/sy%d/.sym\" {compress: %s})", gen, p + 1, (long long)(p ? np[0] : 0),
                      (long long)np[p], (long long)np[p], (long long)np[p], (long long)np[p], gen, gen ? "true" : "false");
             aw_eval_ok(q);
         }
+    AW_RULE("(at (map (fn [j] (format \"c%\" j)) (til 17)) (div (til 67000) 4096))", "(map (fn [j] (format \"c%\" (div j 4096))) AWR)",
+            "[0 4095 4096 66999]");
     ray_t* tp[2] = { aw_eval("(.db.parted.get \"" AW_TMP "/sy0\" 't)"), aw_eval("(.db.parted.get \"" AW_TMP "/sy2\" 't)") };
     TEST_ASSERT_TRUE(tp[0] && tp[1] && !RAY_IS_ERR(tp[0]) && !RAY_IS_ERR(tp[1]));
     int64_t ca[8], cb[8], cc[8];
@@ -2972,16 +3033,18 @@ static test_result_t test_sort_head_late(void) {
         for (int p = 0; p < 2; p++) {
             char q[2400];
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/sl%d/2024.01.0%d/t/\" "
-                     "(table [k v s t f w] (list (map (fn [j] (if (== 0 (%% j 101)) 0N (%% (* j 7919) 50))) (til %lld)) "
+                     "(table [k v s t f w] (list (take (map (fn [j] (if (== 0 (%% j 101)) 0N (%% (* j 7919) 50))) (til 5050)) %lld) "
                      "(as 'I32 (%% (* (til %lld) 31) 1000)) "
-                     "(as 'SYMBOL (map (fn [j] (format \"s%%\" (%% j 37))) (til %lld))) (+ %lld (til %lld)) "
-                     "(map (fn [j] (if (== 0 (%% j 89)) 0Nf (* 0.5 (%% (* j 13) 400)))) (til %lld)) "
-                     "(map (fn [j] (if (== 0 (%% j 71)) \"\" (format \"a pooled string %%\" (%% (* j 17) 53)))) (til %lld)))) "
+                     "(as 'SYMBOL (take (map (fn [j] (format \"s%%\" (%% j 37))) (til 37)) %lld)) (+ %lld (til %lld)) "
+                     "(+ (* 0.5 (%% (* (til %lld) 13) 400)) (at [0.0 0Nf] (+ 0 (== 0 (%% (til %lld) 89))))) "
+                     "(reverse (at (map (fn [j] (if (== 0 (%% j 71)) \"\" (format \"a pooled string %%\" (%% (* j 17) 53)))) (til 3763)) (reverse (%% (til %lld) 3763)))))) "
                      "\"" AW_TMP "/sl%d/.sym\" {compress: %s})", gen, p + 1, (long long)np[p], (long long)np[p],
                      (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p], (long long)np[p], (long long)np[p],
-                     gen, gen ? "true" : "false");
+                     (long long)np[p], gen, gen ? "true" : "false");
             aw_eval_ok(q);
         }
+    AW_RULE("(+ (* 0.5 (% (* (til 37000) 13) 400)) (at [0.0 0Nf] (+ 0 (== 0 (% (til 37000) 89)))))",
+            "(map (fn [j] (if (== 0 (% j 89)) 0Nf (* 0.5 (% (* j 13) 400)))) AWR)", "[0 1 89 36999]");
     const char* t0 = "(.db.parted.get \"" AW_TMP "/sl0\" 't)";
     const char* t2 = "(.db.parted.get \"" AW_TMP "/sl2\" 't)";
     static const struct { const char* q; const char* ref; bool late; } qs[] = {
@@ -3546,14 +3609,20 @@ static test_result_t test_scalar_route_stats(void) {
  * total beyond INT64_MAX, an all-null chunk, and selections that cut
  * chunks and vectors at odd rows.  Every answer equals generation 0. */
 static test_result_t test_scalar_route_mixed(void) {
+    /* periodic columns: one period mapped, then cycled by take; f the
+     * same mixed list the per-row map built (0N, an I64 null, every 7th
+     * row: the table makes it an F64 of INT64_MIN), n's null run by concat */
     aw_save("sm", "(table [k x y b u f d s n] (list (til 300000) "
-                  "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 300000))) "
-                  "(map (fn [j] (if (== 0 (% j 5)) 0N 9223372036854775807)) (til 300000)) "
+                  "(as 'I32 (take (map (fn [j] (if (== 0 (% j 9)) 0N (- (% j 50) 20))) (til 450)) 300000)) "
+                  "(take (map (fn [j] (if (== 0 (% j 5)) 0N 9223372036854775807)) (til 5)) 300000) "
                   "(== 0 (% (til 300000) 3)) (as 'U8 (% (til 300000) 251)) "
-                  "(map (fn [j] (if (== 0 (% j 7)) 0N (- (* 0.25 j) 1000.0))) (til 300000)) "
+                  "(at (concat (- (* 0.25 (til 300000)) 1000.0) (list 0N)) "
+                  "(+ (til 300000) (* (- 300000 (til 300000)) (+ 0 (== 0 (% (til 300000) 7)))))) "
                   "(as 'DATE (+ 7000 (div (til 300000) 1000))) "
-                  "(as 'SYM (map (fn [j] (if (== 0 (% j 4)) \"b\" \"a\")) (til 300000))) "
-                  "(as 'I16 (map (fn [j] (if (and (>= j 65536) (< j 131072)) 0N (% j 300))) (til 300000)))))", -1);
+                  "(as 'SYM (take (map (fn [j] (if (== 0 (% j 4)) \"b\" \"a\")) (til 4)) 300000)) "
+                  "(as 'I16 (concat (concat (% (til 65536) 300) (take [0N] 65536)) (% (+ 131072 (til 168928)) 300)))))", -1);
+    AW_RULE("(at W 'f)", "(at (table [f] (list (map (fn [j] (if (== 0 (% j 7)) 0N (- (* 0.25 j) 1000.0))) AWR))) 'f)", "[0 1 7 4000 299999]");
+    AW_RULE("(at W 'n)", "(as 'I16 (map (fn [j] (if (and (>= j 65536) (< j 131072)) 0N (% j 300))) AWR))", "[0 65535 65536 131071 131072 299999]");
     static const char* const qs[] = {
         "(select {s: (sum x) a: (avg x) mn: (min x) mx: (max x) c: (count x) from: T where: (< k 196608)})",
         "(select {s: (sum y) a: (avg y) mx: (max y) from: T where: (>= k 70000)})",
@@ -3591,10 +3660,14 @@ static test_result_t test_scalar_route_time(void) {
     };
     for (int f = 0; f < 3; f++) {
         aw_save(fs[f].name, "(table [k t c p] (list (til 200000) "
-                "(as 'TIME (map (fn [j] (if (== 0 (% j 13)) 0N (* 1000 (- (div j 3) 30000)))) (til 200000))) "
+                "(as 'TIME (+ (* 1000 (- (div (til 200000) 3) 30000)) (at [0 0N] (+ 0 (== 0 (% (til 200000) 13)))))) "
                 "(as 'TIME (* 1000 (div (til 200000) 1024))) "
-                "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 17)) 0N (* 1000000007 (- j 90000)))) (til 200000)))))",
+                "(as 'TIMESTAMP (+ (* 1000000007 (- (til 200000) 90000)) (at [0 0N] (+ 0 (== 0 (% (til 200000) 17))))))))",
                 fs[f].force);
+        if (f == 0) {
+            AW_RULE("(at W 't)", "(as 'TIME (map (fn [j] (if (== 0 (% j 13)) 0N (* 1000 (- (div j 3) 30000)))) AWR))", "[0 1 2 3 13 26 199999]");
+            AW_RULE("(at W 'p)", "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 17)) 0N (* 1000000007 (- j 90000)))) AWR))", "[0 1 17 90000 199999]");
+        }
         static const char* const qs[] = {
             "(select {s: (sum t) a: (avg t) mn: (min t) mx: (max t) sc: (sum c) mc: (max c) pn: (min p) px: (max p) from: T where: (< k 131072)})",
             "(select {s: (sum t) a: (avg t) mn: (min t) mx: (max t) sc: (sum c) ac: (avg c) pn: (min p) px: (max p) from: T where: (>= k 199680)})",
@@ -3727,7 +3800,7 @@ static test_result_t test_scalar_route_parted_stats(void) {
         for (int p = 0; p < 3; p++) {
             char q[700];
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s/2024.01.0%d/t/\" "
-                     "(table [y x] (list (til 70001) (as 'I32 (map (fn [j] (if (== 0 (%% j 11)) 0N (- (%% j 50) 20))) (til 70001))))) {compress: %s})",
+                     "(table [y x] (list (til 70001) (as 'I32 (take (map (fn [j] (if (== 0 (%% j 11)) 0N (- (%% j 50) 20))) (til 550)) 70001)))) {compress: %s})",
                      r ? "pn" : "pw", p + 1, r ? "false" : "true");
             aw_eval_ok(q);
         }
@@ -3769,7 +3842,7 @@ static test_result_t test_scalar_route_parted_stats(void) {
 static test_result_t test_count_on_runs(void) {
     /* a: CONST 0 in 3 of 4 vectors, RLE [0 7 0] in the fourth (the
      * AdvEngineID shape); b: FOR_BP 0..49 */
-    aw_save("cr", "(table [a b] (list (as 'I16 (map (fn [j] (if (and (== 3 (% (div j 1024) 4)) (> (% j 1024) 100) (< (% j 1024) 300)) 7 0)) (til 200000))) "
+    aw_save("cr", "(table [a b] (list (as 'I16 (take (map (fn [j] (if (and (== 3 (% (div j 1024) 4)) (> (% j 1024) 100) (< (% j 1024) 300)) 7 0)) (til 4096)) 200000)) "
                   "(as 'I32 (% (til 200000) 50))))", -1);
     static const char* const q[] = {
         "(count (select {from: T where: (!= a 0)}))",
@@ -3810,7 +3883,7 @@ static test_result_t test_count_on_runs(void) {
         if (r.status != TEST_PASS) return r;
     }
     /* SYM: runs of 300 rows over 7 symbols and "" */
-    aw_save("cs", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (== 3 (% (div j 300) 8)) \"\" (format \"s%\" (% (div j 300) 7)))) (til 200000)))))", -1);
+    aw_save("cs", "(table [s] (list (as 'SYMBOL (take (map (fn [j] (if (== 3 (% (div j 300) 8)) \"\" (format \"s%\" (% (div j 300) 7)))) (til 16800)) 200000))))", -1);
     static const char* const sq[] = {
         "(count (select {from: T where: (== s 's3)}))", "(count (select {from: T where: (!= s 's3)}))",
         "(count (select {from: T where: (== s 'zz)}))", "(count (select {from: T where: (!= s 'zz)}))",
@@ -3833,7 +3906,7 @@ static test_result_t test_count_on_runs(void) {
 static test_result_t test_group_count_on_runs(void) {
     /* the RLE vectors' runs hold over 65536 selected rows: the parallel
      * dense route (below the threshold the selection is compacted) */
-    aw_save("gr", "(table [a] (list (as 'I16 (map (fn [j] (if (and (== 3 (% (div j 1024) 4)) (> (% j 1024) 100) (< (% j 1024) 900)) (+ 1 (% (div j 4096) 5)) 0)) (til 400000)))))", -1);
+    aw_save("gr", "(table [a] (list (as 'I16 (take (map (fn [j] (if (and (== 3 (% (div j 1024) 4)) (> (% j 1024) 100) (< (% j 1024) 900)) (+ 1 (% (div j 4096) 5)) 0)) (til 20480)) 400000))))", -1);
     test_result_t r = aw_reduce("gr", "(select {a: a c: (count a) from: T where: (!= a 0) by: a desc: c take: 10})", 0);
     if (r.status != TEST_PASS) return r;
     TEST_ASSERT_TRUE(g_aw_unaligned || agg_route_stats().dense_strategy == AGG_DENSE_TASK_LOCAL);
@@ -3841,7 +3914,7 @@ static test_result_t test_group_count_on_runs(void) {
     if ((r = aw_reduce("gr", "(select {c: (count a) from: T where: (!= a 3) by: a})", 0)).status != TEST_PASS) return r;
     /* a selection that cuts runs (MIX segments): rows of the run where
      * a second predicate fails */
-    aw_save("gm", "(table [a k] (list (as 'I16 (map (fn [j] (if (and (> (% j 1024) 100) (< (% j 1024) 900)) (+ 1 (% (div j 1024) 5)) 0)) (til 300000))) (til 300000)))", -1);
+    aw_save("gm", "(table [a k] (list (as 'I16 (take (map (fn [j] (if (and (> (% j 1024) 100) (< (% j 1024) 900)) (+ 1 (% (div j 1024) 5)) 0)) (til 5120)) 300000)) (til 300000)))", -1);
     if ((r = aw_reduce("gm", "(select {a: a c: (count a) from: T where: (and (!= a 0) (!= 0 (% k 3))) by: a desc: c take: 10})", -1)).status != TEST_PASS) return r;
     if (!g_aw_unaligned) TEST_ASSERT_FMT(aw_col_decoded("a") == 0, "gm: a decoded %llu", (unsigned long long)aw_col_decoded("a"));
     if ((r = aw_reduce("gm", "(select {c: (count k) d: (count a) from: T where: (< (% k 7) 4) by: a})", -1)).status != TEST_PASS) return r;
@@ -3851,7 +3924,7 @@ static test_result_t test_group_count_on_runs(void) {
     /* a nullable key in runs: a vector with nulls carries a bitmap, so its
      * run view declines (counting it by runs would put the null rows under
      * the run's stored value: 5 groups instead of 6) */
-    aw_save("gn", "(table [a] (list (as 'I16 (map (fn [j] (if (== 500 (% j 4096)) 0Nh (+ 1 (% (div j 1024) 5)))) (til 300000)))))", -1);
+    aw_save("gn", "(table [a] (list (as 'I16 (take (map (fn [j] (if (== 500 (% j 4096)) 0Nh (+ 1 (% (div j 1024) 5)))) (til 20480)) 300000))))", -1);
     if ((r = aw_reduce("gn", "(select {c: (count a) from: T by: a})", -1)).status != TEST_PASS) return r;
     {
         aw_eval_ok("(set R (select {c: (count a) from: T by: a}))");
@@ -3871,7 +3944,7 @@ static test_result_t test_group_count_on_runs(void) {
         if ((r = aw_reduce(pk[i].name, "(select {c: (count a) from: T where: (!= v 0) by: a})", -1)).status != TEST_PASS) return r;
     }
     /* a SYM key in runs, "" (id 0) among them */
-    aw_save("gs", "(table [s] (list (as 'SYMBOL (map (fn [j] (if (== 3 (% (div j 300) 8)) \"\" (format \"s%\" (% (div j 300) 7)))) (til 300000)))))", -1);
+    aw_save("gs", "(table [s] (list (as 'SYMBOL (take (map (fn [j] (if (== 3 (% (div j 300) 8)) \"\" (format \"s%\" (% (div j 300) 7)))) (til 16800)) 300000))))", -1);
     if ((r = aw_reduce("gs", "(select {c: (count s) from: T by: s})", -1)).status != TEST_PASS) return r;
     if ((r = aw_reduce("gs", "(select {c: (count s) from: T where: (!= s 's2) by: s desc: c take: 3})", -1)).status != TEST_PASS) return r;
     /* parted: g (every partition generation 2), m (partition 2 generation
@@ -3890,7 +3963,7 @@ static test_result_t test_group_count_on_runs(void) {
                              pt[t].root, gen, p + 1, g2 ? "true" : "false");
                 else
                     snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s%d/2024.01.0%d/t/\" "
-                             "(table [k a] (list (til 100000) (as '%s (map (fn [j] (if (and (> (%% j 1024) 100) (< (%% j 1024) 900)) (+ 1 (%% (div j 1024) 5)) 0)) (+ (til 100000) %d))))) "
+                             "(table [k a] (list (til 100000) (as '%s (take (map (fn [j] (if (and (> (%% j 1024) 100) (< (%% j 1024) 900)) (+ 1 (%% (div j 1024) 5)) 0)) (+ (til 5120) %d)) 100000)))) "
                              "{compress: %s})", pt[t].root, gen, p + 1, pt[t].ty, p * 777, g2 ? "true" : "false");
                 aw_eval_ok(q);
             }
@@ -3983,9 +4056,17 @@ static bool aw_forge_absent(const char* path, int64_t c) {
  * while chunk 3 holds the best ones: a prefix equal to the bound is never
  * pruned. */
 static test_result_t test_topk_sym_prefix_prune(void) {
-    aw_save("sp", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (== 0 (% j 7)) \"\" "
-                  "(if (and (>= j 262144) (< j 262194)) (format \" a%\" j) (format \"m%\" (% j 5000))))) (til 400000))) "
+    /* the strings formatted once each and gathered in row order (the
+     * symbols intern as the per-row map interned them): m0..m4999, "" at
+     * 5000, the " a<j>" rows after */
+    aw_save("sp", "(table [s v] (list (as 'SYMBOL (at (concat (map (fn [j] (if (== j 5000) \"\" (format \"m%\" j))) (til 5001)) "
+                  "(map (fn [j] (format \" a%\" j)) (+ 262144 (til 50)))) "
+                  "(+ (+ (* (+ 0 (== 0 (% (til 400000) 7))) (- 5000 (% (til 400000) 5000))) "
+                  "(* (+ 0 (and (and (>= (til 400000) 262144) (< (til 400000) 262194)) (!= 0 (% (til 400000) 7)))) "
+                  "(- (+ 5001 (- (til 400000) 262144)) (% (til 400000) 5000)))) (% (til 400000) 5000)))) "
                   "(% (* (til 400000) 13) 1000)))", -1);
+    AW_RULE("(at W 's)", "(as 'SYMBOL (map (fn [j] (if (== 0 (% j 7)) \"\" (if (and (>= j 262144) (< j 262194)) (format \" a%\" j) "
+            "(format \"m%\" (% j 5000))))) AWR))", "[0 1 7 4999 5000 5001 262143 262144 262145 262150 262193 262194 399999]");
     static const char* const q[] = {
         "(select {s: s from: T where: (!= s \"\") asc: s take: 10})",        /* 7 chunks: too few to seed */
         "(select {s: s v: v from: T where: (and (!= s \"\") (> v 100)) asc: s take: 10})",
@@ -4040,8 +4121,14 @@ static test_result_t test_topk_sym_prefix_prune(void) {
     /* The best strings, " b<j>", one per 4096 rows (in some 70 vectors),
      * all rejected by the second filter: a bound seeded from the vectors'
      * minima would rule out the answer, so none is seeded under it. */
-    aw_save("sw", "(table [s w i] (list (as 'SYMBOL (map (fn [j] (if (== 1 (% j 4096)) (format \" b%\" j) "
-                  "(format \"m%\" (% j 5000)))) (til 300000))) (map (fn [j] (if (== 1 (% j 4096)) 1 0)) (til 300000)) (til 300000)))", -1);
+    aw_save("sw", "(table [s w i] (list (as 'SYMBOL (at (concat (map (fn [j] (format \"m%\" j)) (til 5000)) "
+                  "(map (fn [j] (format \" b%\" j)) (+ 1 (* 4096 (til 74))))) "
+                  "(+ (% (til 300000) 5000) (* (+ 0 (== 1 (% (til 300000) 4096))) "
+                  "(- (+ 5000 (div (til 300000) 4096)) (% (til 300000) 5000)))))) "
+                  "(+ 0 (== 1 (% (til 300000) 4096))) (til 300000)))", -1);
+    AW_RULE("(at W 's)", "(as 'SYMBOL (map (fn [j] (if (== 1 (% j 4096)) (format \" b%\" j) (format \"m%\" (% j 5000)))) AWR))",
+            "[0 1 2 4097 4098 299009 299999]");
+    AW_RULE("(at W 'w)", "(map (fn [j] (if (== 1 (% j 4096)) 1 0)) AWR)", "[0 1 2 4097 4098 299009 299999]");
     /* the row ids tell the answer's rows apart: the best string repeats */
     AW_SAME("sw", "(select {s: s i: i from: T where: (and (!= s \"\") (== w 0)) asc: s take: 3})", 0);
     /* Ten nulls in the last vectors of the last chunk, among "z" strings,
@@ -4049,28 +4136,46 @@ static test_result_t test_topk_sym_prefix_prune(void) {
      * without a null-dropping predicate the nulls lead, and the bound a
      * full heap of "y" or "a" rows publishes must not prune the vectors
      * that hold them on their prefixes. */
-    aw_save("sn", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (>= j 299000) (if (== 0 (% j 100)) \"\" (format \"z%\" j)) "
-                  "(if (>= j 262144) (format \"y%\" j) (format \"a%\" (% j 7000))))) (til 300000))) (% (til 300000) 100)))", -1);
+    aw_save("sn", "(table [s v] (list (as 'SYMBOL (at (concat (map (fn [j] (format \"a%\" j)) (til 7000)) "
+                  "(map (fn [j] (if (>= j 299000) (if (== 0 (% j 100)) \"\" (format \"z%\" j)) (format \"y%\" j))) (+ 262144 (til 37856)))) "
+                  "(+ (% (til 300000) 7000) (* (+ 0 (>= (til 300000) 262144)) (- (+ 7000 (- (til 300000) 262144)) (% (til 300000) 7000)))))) "
+                  "(% (til 300000) 100)))", -1);
+    AW_RULE("(at W 's)", "(as 'SYMBOL (map (fn [j] (if (>= j 299000) (if (== 0 (% j 100)) \"\" (format \"z%\" j)) "
+            "(if (>= j 262144) (format \"y%\" j) (format \"a%\" (% j 7000))))) AWR))", "[0 6999 7000 262143 262144 298999 299000 299001 299100 299999]");
     AW_SAME("sn", "(select {s: s v: v from: T asc: s take: 5})", 0);
     AW_SAME("sn", "(select {s: s v: v from: T where: (> v 10) asc: s take: 5})", 0);
     AW_SAME("sn", "(select {s: s v: v from: T where: (!= s \"\") desc: s take: 5})", 0);
     /* A prefix tie inside one chunk: vector 0 holds "abcdX" (worse), vector
      * 1 "abcdA" (the answer), one task scans both in order, so the bound is
      * "abcd" when vector 1 is reached; an equal prefix is never pruned. */
-    aw_save("sv", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (< j 1024) (format \"abcdX%\" j) "
-                  "(if (< j 1034) (format \"abcdA%\" j) (format \"q%\" (% j 300))))) (til 200000))) (til 200000)))", -1);
+    aw_save("sv", "(table [s v] (list (as 'SYMBOL (at (concat (map (fn [j] (if (< j 1024) (format \"abcdX%\" j) (format \"abcdA%\" j))) (til 1034)) "
+                  "(map (fn [j] (format \"q%\" j)) (til 300))) "
+                  "(+ (+ 1034 (% (til 200000) 300)) (* (+ 0 (< (til 200000) 1034)) (- (til 200000) (+ 1034 (% (til 200000) 300))))))) "
+                  "(til 200000)))", -1);
+    AW_RULE("(at W 's)", "(as 'SYMBOL (map (fn [j] (if (< j 1024) (format \"abcdX%\" j) (if (< j 1034) (format \"abcdA%\" j) "
+            "(format \"q%\" (% j 300))))) AWR))", "[0 1023 1024 1033 1034 1035 199999]");
     AW_SAME("sv", "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 5})", 0);
-    aw_save("st", "(table [s v] (list (as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (< j 65636)) (format \"abcdX%\" j) "
-                  "(if (and (>= j 196608) (< j 196618)) (format \"abcdA%\" j) (format \"q%\" (% j 300))))) (til 300000))) "
+    aw_save("st", "(table [s v] (list (as 'SYMBOL (at (concat (concat (map (fn [j] (format \"q%\" j)) (til 300)) "
+                  "(map (fn [j] (format \"abcdX%\" j)) (+ 65536 (til 100)))) (map (fn [j] (format \"abcdA%\" j)) (+ 196608 (til 10)))) "
+                  "(+ (+ (% (til 300000) 300) (* (+ 0 (and (>= (til 300000) 65536) (< (til 300000) 65636))) "
+                  "(- (+ 300 (- (til 300000) 65536)) (% (til 300000) 300)))) "
+                  "(* (+ 0 (and (>= (til 300000) 196608) (< (til 300000) 196618))) (- (+ 400 (- (til 300000) 196608)) (% (til 300000) 300)))))) "
                   "(til 300000)))", -1);
+    AW_RULE("(at W 's)", "(as 'SYMBOL (map (fn [j] (if (and (>= j 65536) (< j 65636)) (format \"abcdX%\" j) "
+            "(if (and (>= j 196608) (< j 196618)) (format \"abcdA%\" j) (format \"q%\" (% j 300))))) AWR))",
+            "[0 65535 65536 65635 65636 196607 196608 196617 196618 299999]");
     AW_SAME("st", "(select {s: s v: v from: T where: (!= s \"\") asc: s take: 5})", 0);
     AW_SAME("st", "(select {s: s v: v from: T where: (> v 10) asc: s take: 5})", 0);
     PASS();
 }
 
 static test_result_t test_topk_prune_cases(void) {
-    aw_save("tp", "(table [kn v] (list (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N "
-                  "(+ 5 (% j 300000)))) (til 400000))) (% (* (til 400000) 13) 1000)))", -1);
+    /* nulls added in: (+ x 0N) is null */
+    aw_save("tp", "(table [kn v] (list (as 'I64 (+ (+ 5 (% (til 400000) 300000)) (at [0 0N] (as 'I64 "
+                  "(or (== 0 (% (til 400000) 1000)) (and (>= (til 400000) 131072) (< (til 400000) 196608))))))) "
+                  "(% (* (til 400000) 13) 1000)))", -1);
+    AW_RULE("(at W 'kn)", "(as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N (+ 5 (% j 300000)))) AWR))",
+            "[0 1 999 1000 131071 131072 150001 196607 196608 300000 300001 399999]");
     static const char* const q[] = {
         "(select {kn: kn v: v from: T where: (> v 100) asc: kn take: 20})",
         "(select {kn: kn v: v from: T where: (> v 100) desc: kn take: 20})",
@@ -4105,9 +4210,13 @@ static test_result_t test_topk_prune_cases(void) {
      * none), and chunk 3 all null.  Ascending prunes vectors only (every
      * chunk has nulls); descending prunes at both levels. */
     aw_save("tr", "(table [i t v] (list "
-                  "(as 'I32 (map (fn [j] (if (or (== 0 (% j 5000)) (and (>= j 196608) (< j 262144))) 0N (- j 150000))) (til 300000))) "
-                  "(as 'TIMESTAMP (map (fn [j] (if (or (== 0 (% j 5000)) (and (>= j 196608) (< j 262144))) 0N (* (- j 150000) 1000000000))) (til 300000))) "
+                  "(as 'I32 (+ (- (til 300000) 150000) (at [0 0N] (+ 0 (or (== 0 (% (til 300000) 5000)) (and (>= (til 300000) 196608) (< (til 300000) 262144))))))) "
+                  "(as 'TIMESTAMP (+ (* (- (til 300000) 150000) 1000000000) (at [0 0N] (+ 0 (or (== 0 (% (til 300000) 5000)) (and (>= (til 300000) 196608) (< (til 300000) 262144))))))) "
                   "(% (* (til 300000) 13) 1000)))", -1);
+    static const char* const tr_rows = "[0 1 5000 150000 196607 196608 200001 262143 262144 299999]";
+    AW_RULE("(at W 'i)", "(as 'I32 (map (fn [j] (if (or (== 0 (% j 5000)) (and (>= j 196608) (< j 262144))) 0N (- j 150000))) AWR))", tr_rows);
+    AW_RULE("(at W 't)", "(as 'TIMESTAMP (map (fn [j] (if (or (== 0 (% j 5000)) (and (>= j 196608) (< j 262144))) 0N "
+            "(* (- j 150000) 1000000000))) AWR))", tr_rows);
     static const char* const qr[] = {
         "(select {i: i v: v from: T where: (> v 100) asc: i take: 12})",
         "(select {i: i v: v from: T where: (> v 100) desc: i take: 12})",
@@ -4125,6 +4234,15 @@ static test_result_t test_topk_prune_cases(void) {
          * leave the best chunk to one task that scans it in rising order */
         if (i == 4 || g_aw_unaligned) continue;
         ray_fused_topk_test_pruned(&pc, &pv);
+        /* vector pruning needs the bound published before a task reaches
+         * the vectors it rules out: on a saturated machine (the parallel
+         * suite) a run may miss it, so the generation-2 query (T, left
+         * loaded by AW_SAME) is run again, 20 ms apart, 25 times at most */
+        for (int a = 0; a < 25 && !(pv > 0 && (!descr[i] || pc > 0)); a++) {
+            ray_sleep_ms(20);
+            aw_eval_ok(qr[i]);
+            ray_fused_topk_test_pruned(&pc, &pv);
+        }
         TEST_ASSERT_FMT(pv > 0 && (!descr[i] || pc > 0), "%s: pruned %llu chunk slots, %llu vectors", qr[i],
                         (unsigned long long)pc, (unsigned long long)pv);
     }
@@ -4157,11 +4275,14 @@ static test_result_t test_topk_prune_cases(void) {
 static test_result_t test_topk_range_keys(void) {
     aw_eval_ok("(set PH (as 'SYMBOL (concat [\"\"] (map (fn [j] (format \"w%\" (- 60 j))) (til 49)))))");
     aw_save("tk", "(table [t s k2 f v u ts] (list "
-                  "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 5003)) 0N (* (div (% (* j 7919) 300007) 3) 1000000000))) (til 300000))) "
+                  "(as 'TIMESTAMP (+ (* (div (% (* (til 300000) 7919) 300007) 3) 1000000000) (at [0 0N] (+ 0 (== 0 (% (til 300000) 5003)))))) "
                   "(at PH (% (* (til 300000) 7) 50)) (as 'I32 (% (til 300000) 5)) "
-                  "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N (% (* j 31) 1000))) (til 300000))) "
-                  "(% (* (til 300000) 13) 1000) (as 'STR (map (fn [j] (format \"u%\" (% j 97))) (til 300000))) "
+                  "(as 'F64 (+ (% (* (til 300000) 31) 1000) (at [0 0N] (+ 0 (== 0 (% (til 300000) 13)))))) "
+                  "(% (* (til 300000) 13) 1000) (as 'STR (take (map (fn [j] (format \"u%\" (% j 97))) (til 97)) 300000)) "
                   "(as 'TIMESTAMP (* (til 300000) 1000000000))))", -1);
+    AW_RULE("(at W 't)", "(as 'TIMESTAMP (map (fn [j] (if (== 0 (% j 5003)) 0N (* (div (% (* j 7919) 300007) 3) 1000000000))) AWR))",
+            "[0 1 5003 10006 299999]");
+    AW_RULE("(at W 'f)", "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N (% (* j 31) 1000))) AWR))", "[0 1 13 299999]");
     static const char* const q[] = {
         "(select {t: t v: v from: T where: (> v 100) asc: t take: 20})",          /* nulls first, by row */
         "(select {t: t v: v from: T where: (> v 100) desc: t take: 20})",
@@ -4468,68 +4589,88 @@ static test_result_t test_group_affine_nulls(void) {
 /* Group-by on a generation-2 STR key through a query-wide string domain
  * (strdom.c): the key column t is never materialized and the groups equal
  * generation 0's. */
-static void aw_str_key_tables(const char* tag, int n_part, int n_flat) {
+/* Table (t: SKT, v: SKV) saved as <tag><kind><gen> for both generations,
+ * as partition `part` (1-based) of a parted root, or flat (0). */
+static void aw_str_key_save(const char* tag, char kind, int part) {
+    for (int gen = 0; gen <= 2; gen += 2) {
+        char q[400];
+        if (part)
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s%c%d/2024.01.0%d/t/\" (table [t v] (list SKT SKV)) {compress: %s})",
+                     tag, kind, gen, part, gen ? "true" : "false");
+        else
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%s%c%d/\" (table [t v] (list SKT SKV)) {compress: %s})",
+                     tag, kind, gen, gen ? "true" : "false");
+        aw_eval_ok(q);
+    }
+}
+
+static bool aw_str_key_tables(const char* tag, int n_part, int n_flat) {
+    bool ok = true;
+    /* Each column is built once and saved as both generations, by the
+     * vectorized idioms above aw_rule_ok. */
     /* STR key with vectors of one repeated string and vectors of many (CONST
      * and RAW before P6; P6 selection makes every chunk STR_DICT, and the
      * forced-RAW twin keeps the RAW vectors),
      * equal strings crossing every vector boundary; two partitions, the
-     * second offset and longer, a string in the first only */
-    for (int gen = 0; gen <= 2; gen += 2)
-        for (int p = 0; p < 2; p++) {
-            char q[1000];
-            int n = n_part + p * 1000, off = p * 777;
-            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sk%d/2024.01.0%d/t/\" "
-                     "(table [t v] (list (map (fn [j] (if (and (== %d 0) (== (%% j 4000) 17)) \"in the first partition only\" "
-                     "(if (< (%% j 2048) 1024) \"constant run text\" (format \"long key %%\" (%% j 37))))) (+ %d (til %d))) "
-                     "(+ %d (til %d)))) {compress: %s})",
-                     tag, gen, p + 1, p, off, n, off, n, gen ? "true" : "false");
-            aw_eval_ok(q);
-        }
-    /* the unparted case: one column mixing CONST and RAW vectors */
-    for (int gen = 0; gen <= 2; gen += 2) {
-        char q[800];
-        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%su%d/\" "
-                 "(table [t v] (list (map (fn [j] (if (< (%% j 2048) 1024) \"constant run text\" "
-                 "(format \"long key %%\" (%% j 37)))) (til %d)) (til %d))) {compress: %s})",
-                 tag, gen, n_flat, n_flat, gen ? "true" : "false");
+     * second offset and longer, a string in the first only.  Row j: "in
+     * the first partition only" (partition 0, j % 4000 == 17), else
+     * "constant run text" (j % 2048 < 1024), else "long key <j % 37>". */
+    for (int p = 0; p < 2; p++) {
+        char q[1000];
+        int n = n_part + p * 1000, off = p * 777;
+        snprintf(q, sizeof q, "(set SKV (+ %d (til %d)))", off, n);
         aw_eval_ok(q);
+        aw_eval_ok("(set SKM (+ (% SKV 37) (* (- 37 (% SKV 37)) (+ 0 (< (% SKV 2048) 1024)))))");
+        snprintf(q, sizeof q, "(set SKT (reverse (at (map (fn [j] (if (== j 37) \"constant run text\" (if (== j 38) \"in the first partition only\" "
+                 "(format \"long key %%\" j)))) (til 39)) (reverse (+ SKM (* (- 38 SKM) (+ 0 (and (== %d 0) (== (%% SKV 4000) 17)))))))))", p);
+        aw_eval_ok(q);
+        char rule[400], rows[100];
+        snprintf(rule, sizeof rule, "(map (fn [j] (if (and (== %d 0) (== (%% j 4000) 17)) \"in the first partition only\" "
+                 "(if (< (%% j 2048) 1024) \"constant run text\" (format \"long key %%\" (%% j 37))))) (+ %d AWR))", p, off);
+        snprintf(rows, sizeof rows, "[0 1 17 1023 1024 2047 2048 4017 %d]", n - 1);
+        ok = ok && aw_rule_ok("SKT", rule, rows);
+        aw_str_key_save(tag, 'k', p + 1);
     }
+    /* the unparted case: one column mixing CONST and RAW vectors */
+    char q[1200];
+    snprintf(q, sizeof q, "(set SKV (til %d))", n_flat);
+    aw_eval_ok(q);
+    aw_eval_ok("(set SKT (reverse (at (map (fn [j] (if (== j 37) \"constant run text\" (format \"long key %\" j))) (til 38)) "
+               "(reverse (+ (% SKV 37) (* (- 37 (% SKV 37)) (+ 0 (< (% SKV 2048) 1024))))))))");
+    char rows[100];
+    snprintf(rows, sizeof rows, "[0 1 1023 1024 2047 2048 %d]", n_flat - 1);
+    ok = ok && aw_rule_ok("SKT", "(map (fn [j] (if (< (% j 2048) 1024) \"constant run text\" (format \"long key %\" (% j 37)))) AWR)", rows);
+    aw_str_key_save(tag, 'u', 0);
     /* CONST vectors beside a non-dictionary vector (P6): each chunk opens
      * with 1024 distinct long keys (no dictionary chunk, so that vector is
      * FSST or RAW), then runs of two constants, one per vector (CONST) */
-    for (int gen = 0; gen <= 2; gen += 2) {
-        char q[900];
-        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sc%d/\" "
-                 "(table [t v] (list (map (fn [j] (if (< (%% j 65536) 1024) "
-                 "(format \"https://www.example.com/path/%%/item?id=%%\" j (%% (* j 7919) 100003)) "
-                 "(if (< (%% j 2048) 1024) \"constant run text\" \"another constant run\"))) (til %d)) (til %d))) "
-                 "{compress: %s})",
-                 tag, gen, n_flat, n_flat, gen ? "true" : "false");
-        aw_eval_ok(q);
-    }
+    aw_eval_ok("(set SKW (where (< (% SKV 65536) 1024)))");
+    aw_eval_ok("(set SKT (reverse (at (concat (map (fn [j] (if (== j 0) \"constant run text\" \"another constant run\")) (til 2)) "
+               "(map (fn [j] (format \"https://www.example.com/path/%/item?id=%\" j (% (* j 7919) 100003))) SKW)) "
+               "(reverse (+ (+ 0 (>= (% SKV 2048) 1024)) (* (+ 0 (< (% SKV 65536) 1024)) "
+               "(- (+ 2 (bin SKW SKV)) (+ 0 (>= (% SKV 2048) 1024)))))))))");
+    snprintf(rows, sizeof rows, n_flat > 132096 ? "[0 1 1023 1024 2047 2048 65535 65536 66559 66560 131072 %d]" : "[0 1 1023 1024 2047 2048 %d]",
+             n_flat - 1);
+    ok = ok && aw_rule_ok("SKT", "(map (fn [j] (if (< (% j 65536) 1024) (format \"https://www.example.com/path/%/item?id=%\" j (% (* j 7919) 100003)) "
+                          "(if (< (% j 2048) 1024) \"constant run text\" \"another constant run\"))) AWR)", rows);
+    aw_str_key_save(tag, 'c', 0);
     /* nulls: "" is the STR null (its canonical empty payload): the null and
      * "" rows are one group in either generation, beside short (inline) and
-     * long (pooled) keys */
-    for (int gen = 0; gen <= 2; gen += 2) {
-        char q[800];
-        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%sn%d/\" "
-                 "(table [t v] (list (map (fn [j] (if (== (%% j 7) 3) \"\" (if (== (%% j 7) 1) "
-                 "(format \"a long pooled key %%\" (%% j 3)) (format \"k%%\" (%% j 5))))) (til %d)) (til %d))) "
-                 "{compress: %s})",
-                 tag, gen, n_flat, n_flat, gen ? "true" : "false");
-        aw_eval_ok(q);
-    }
+     * long (pooled) keys; period 105 */
+    snprintf(q, sizeof q, "(set SKT (reverse (at (map (fn [j] (if (== (%% j 7) 3) \"\" (if (== (%% j 7) 1) "
+             "(format \"a long pooled key %%\" (%% j 3)) (format \"k%%\" (%% j 5))))) (til 105)) (reverse (%% (til %d) 105)))))", n_flat);
+    aw_eval_ok(q);
+    aw_str_key_save(tag, 'n', 0);
     /* first occurrence over a selection: z0 z1 z2, then the cycle b a m;
      * a filter past the z rows sees a m b first, in two partitions */
-    for (int gen = 0; gen <= 2; gen += 2)
-        for (int p = 0; p < 2; p++) {
-            char q[800];
-            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/%so%d/2024.01.0%d/t/\" "
-                     "(table [t v] (list (map (fn [j] (if (< j 3) (format \"z%%\" j) (at [\"b\" \"a\" \"m\"] (%% j 3)))) "
-                     "(til %d)) (til %d))) {compress: %s})",
-                     tag, gen, p + 1, n_part, n_part, gen ? "true" : "false");
-            aw_eval_ok(q);
-        }
+    snprintf(q, sizeof q, "(set SKV (til %d))", n_part);
+    aw_eval_ok(q);
+    snprintf(q, sizeof q, "(set SKT (concat (map (fn [j] (if (< j 3) (format \"z%%\" j) (at [\"b\" \"a\" \"m\"] (%% j 3)))) (til 3)) "
+             "(take (map (fn [j] (if (< j 3) (format \"z%%\" j) (at [\"b\" \"a\" \"m\"] (%% j 3)))) (+ 3 (til 3))) %d)))", n_part - 3);
+    aw_eval_ok(q);
+    for (int p = 0; p < 2; p++) aw_str_key_save(tag, 'o', p + 1);
+    aw_eval_ok("(set SKT 0)"); aw_eval_ok("(set SKV 0)"); aw_eval_ok("(set SKM 0)"); aw_eval_ok("(set SKW 0)");
+    return ok;
 }
 
 /* Each query on table T, loaded as <tag><kind><gen> (k and o parted), on
@@ -4609,8 +4750,8 @@ static const aw_sk_q_t* aw_str_key_queries(void);
 static test_result_t aw_str_key_run(const char* ts, const char* tl, int mix) {
     /* ts: the brief's sizes (the serial strategy); tl: above the parallel
      * threshold, every partition too */
-    aw_str_key_tables(ts, 5000, 10000);
-    aw_str_key_tables(tl, 70000, 140000);
+    TEST_ASSERT_TRUE(aw_str_key_tables(ts, 5000, 10000));
+    TEST_ASSERT_TRUE(aw_str_key_tables(tl, 70000, 140000));
     test_result_t r = aw_str_key_check(ts, aw_str_key_queries(), false, mix);
     if (r.status != TEST_PASS) return r;
     return aw_str_key_check(tl, aw_str_key_queries(), true, mix);
@@ -4776,6 +4917,7 @@ static test_result_t test_pool_clamp(void) {
 /* P3 gate: filtered, rowsel-gather and aggregate shapes, planning included. */
 static test_result_t test_gate_materialization(void) {
     aw_save("gm", AW_WIDE, -1);
+    AW_RULE("(at W 'v)", AW_WIDE_V_RULE, "[0 1 10 199999]");
     static const char* const q[] = {
         "(select {from: T where: (and (>= k 1000) (< k 3000))})",                   /* filter + gather */
         "(select {k: k t: t from: T where: (== s 'b) take: 9})",                    /* SYM equality + take */
@@ -4893,11 +5035,11 @@ static test_result_t test_parted_in(void) {
             snprintf(q, sizeof q,
                      "(.db.splayed.set \"" AW_TMP "/pi%d/2024.01.0%d/t/\" (table [k x v s f w] (list (+ (til 70000) %d) "
                      "(as 'I32 (- (%% (til 70000) 40) %d)) "
-                     "(as 'I32 (map (fn [j] (if (== 0 (%% j 9)) 0N (%% j 1000))) (til 70000))) "
+                     "(as 'I32 (take (map (fn [j] (if (== 0 (%% j 9)) 0N (%% j 1000))) (til 9000)) 70000)) "
                      "(take ['a 'b 'c 'd 'e] 70000) (as 'F64 (%% (til 70000) 50)) %s)) "
                      "\"" AW_TMP "/pi%d/.sym\" {compress: %s})",
                      gen, p + 1, p * 70000, p * 500,
-                     p ? "(as 'I32 (map (fn [j] (if (== 0 (% j 9)) 0N (% j 1000))) (til 70000)))"
+                     p ? "(as 'I32 (take (map (fn [j] (if (== 0 (% j 9)) 0N (% j 1000))) (til 9000)) 70000))"
                        : "(as 'I32 (% (til 70000) 1000))",
                      gen, gen ? "true" : "false");
             aw_eval_ok(q);

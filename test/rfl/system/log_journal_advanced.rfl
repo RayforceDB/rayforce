@@ -34,7 +34,7 @@
 (.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_jdura' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jdura*")
 (.sys.exec "./rayforce -L /tmp/rftest_jdura -p 19991 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hA (wait_ipc "127.0.0.1:19991" 50))
 (.ipc.send hA "(set durable_a 7)") -- 7
@@ -44,11 +44,11 @@
 ;; SIGKILL — no atexit, no fclose, no fflush.  Only the bytes the
 ;; SYNC fsync put on disk count.
 (.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_jdura -p 19991' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -L /tmp/rftest_jdura -p 19991' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -L /tmp/rftest_jdura -p 19991' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
 
 ;; Restart with -L on the same base.  Both bindings must come back.
 (.sys.exec "./rayforce -L /tmp/rftest_jdura -p 19991 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hA2 (wait_ipc "127.0.0.1:19991" 50))
 (.ipc.send hA2 "durable_a") -- 7
@@ -70,7 +70,7 @@
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jovr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jovr*")
 (.sys.exec "./rayforce -l /tmp/rftest_jovr -p 19992 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hB (wait_ipc "127.0.0.1:19992" 50))
 ;; Override the `+` builtin with a sentinel integer, then snapshot.
@@ -81,10 +81,10 @@
 (.ipc.send hB "(.log.snapshot)")
 (.ipc.close hB)
 (.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jovr -p 19992' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_jovr -p 19992' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jovr -p 19992' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
 
 (.sys.exec "./rayforce -l /tmp/rftest_jovr -p 19992 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hB2 (wait_ipc "127.0.0.1:19992" 50))
 ;; The override must have survived the .qdb roundtrip.
@@ -105,7 +105,7 @@
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jerr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jerr*")
 (.sys.exec "./rayforce -l /tmp/rftest_jerr -p 19993 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hC (wait_ipc "127.0.0.1:19993" 50))
 (.ipc.send hC "(set c1 100)") -- 100
@@ -116,10 +116,10 @@
 (.ipc.send hC "(set c3 300)") -- 300
 (.ipc.close hC)
 (.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jerr -p 19993' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_jerr -p 19993' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jerr -p 19993' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
 
 (.sys.exec "./rayforce -l /tmp/rftest_jerr -p 19993 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hC2 (wait_ipc "127.0.0.1:19993" 50))
 (.ipc.send hC2 "c1") -- 100
@@ -141,13 +141,13 @@
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jwr*")
 (.sys.exec "./rayforce -l /tmp/rftest_jwr -p 19994 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19994) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19994) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hD (wait_ipc "127.0.0.1:19994" 50))
 (.ipc.send hD "(.log.write \"(set d1 999)\")") !- domain
 (.ipc.close hD)
 (.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jwr*")
 
@@ -161,7 +161,7 @@
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jsnapfn' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jsnapfn*")
 (.sys.exec "./rayforce -l /tmp/rftest_jsnapfn -p 19995 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19995) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19995) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hE (wait_ipc "127.0.0.1:19995" 50))
 (.ipc.send hE "(set snapshot_inc ((fn [offset] (fn [x] (+ x offset))) 1))")
@@ -170,11 +170,11 @@
 (.ipc.close hE)
 (.sys.exec "test -s /tmp/rftest_jsnapfn.qdb") -- 0
 (.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jsnapfn -p 19995' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_jsnapfn -p 19995' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jsnapfn -p 19995' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
 (.sys.exec "rm -f /tmp/rftest_jsnapfn.log") -- 0
 
 (.sys.exec "./rayforce -l /tmp/rftest_jsnapfn -p 19995 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19995) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19995) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
 
 (set hE2 (wait_ipc "127.0.0.1:19995" 50))
 (.ipc.send hE2 "(snapshot_inc 41)") -- 42
