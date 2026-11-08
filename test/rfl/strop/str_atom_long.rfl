@@ -1,0 +1,19 @@
+;; str_atom_long.rfl — string-atom take / at / filter past the 8 KiB
+;; stack buffer.  These paths used to fail with "limit" once the result
+;; exceeded 8192 bytes; they must work for any length.
+
+(count (take "ab" 8192))   -- 8192
+(count (take "ab" 8193))   -- 8193
+(count (take "ab" 200000)) -- 200000
+(count (take "ab" -20001)) -- 20001
+(count (take 'x' 9000))    -- 9000
+(at (take "abc" 20000) 19999) -- "b"
+(at (take "abc" -20000) 0)    -- "b"
+
+;; (at str idx-vector)
+(count (at (take "ab" 20000) (til 20000))) -- 20000
+(at (take "ab" 20000) [0 1 19999])         -- "abb"
+(at (take "ab" 20000) [0 20000])           !- domain
+
+;; filter by a bool mask
+(count (filter (take "ab" 20000) (take [true false] 20000))) -- 10000
