@@ -551,7 +551,8 @@ static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn
  * a (INT32), b (INT64), c (DOUBLE), every column optional; PLAIN,
  * uncompressed, one v1 data page per chunk.  mode: 0 all present; 1 the
  * second-to-last group has every 17th row null and the last group all null;
- * 2 all null; 3 all present with the native null sentinels at row 0. */
+ * 2 all null; 3 all present with the native null sentinels at row 0;
+ * 4 all present except the last row of group 0. */
 static bool pq_synth_optional(const char* path, int64_t rows, int64_t groups, int mode, bool v2) {
     static const char* names[3] = {"a","b","c"};
     static const int phys[3] = {1,2,5};
@@ -574,6 +575,7 @@ static bool pq_synth_optional(const char* path, int64_t rows, int64_t groups, in
                 if (present && mode == 1 && g == groups-2 && r % 17 == 0) present = false;
                 if (present && mode == 1 && g == groups-1) present = false;
                 if (mode == 2) present = false;
+                if (present && mode == 4 && g == 0 && k == n-1) present = false;
                 if (present) {
                     bits |= (uint8_t)(1u << (k & 7));
                     if (c == 0) {
@@ -743,6 +745,49 @@ static test_result_t test_pq_optional_bulk(void) {
         }
         unlink(path);
     }
+    /* One 65,536-row all-present page whose last row is null: the page
+     * falls back to the per-value path, and the following page still
+     * decodes. Both page layouts. */
+    int64_t last_batches[] = {4096,4097,65536};
+    for (int v = 0; v < 2; v++) {
+        snprintf(path,sizeof(path),"/tmp/rayforce-pq-opbulk-last-%d-v%d.parquet",(int)getpid(),v);
+        TEST_ASSERT_TRUE(pq_synth_optional(path,131072,2,4,v != 0));
+        for (size_t b = 0; b < sizeof(last_batches)/sizeof(last_batches[0]); b++) {
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,last_batches[b],&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+                int64_t nr = ray_table_nrows(t);
+                bool has_null = total <= 65535 && total + nr > 65535;
+                ray_t* a = ray_table_get_col_idx(t,0);
+                ray_t* bb = ray_table_get_col_idx(t,1);
+                ray_t* c = ray_table_get_col_idx(t,2);
+                TEST_ASSERT_EQ_I(!!(a->attrs & RAY_ATTR_HAS_NULLS),has_null);
+                TEST_ASSERT_EQ_I(!!(bb->attrs & RAY_ATTR_HAS_NULLS),has_null);
+                TEST_ASSERT_EQ_I(!!(c->attrs & RAY_ATTR_HAS_NULLS),has_null);
+                for (int64_t i = 0; i < nr; i++) {
+                    int64_t row = total + i;
+                    bool null = row == 65535;
+                    TEST_ASSERT_EQ_I(ray_vec_is_null(a,i),null);
+                    TEST_ASSERT_EQ_I(ray_vec_is_null(bb,i),null);
+                    TEST_ASSERT_EQ_I(ray_vec_is_null(c,i),null);
+                    if (null) continue;
+                    TEST_ASSERT_EQ_I(((int32_t*)ray_data(a))[i],(int32_t)row);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(bb))[i],row*INT64_C(10000000001));
+                    TEST_ASSERT_TRUE(((double*)ray_data(c))[i] == (double)row*0.5);
+                }
+                total += nr;
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,131072);
+            ray_parquet_close(r);
+        }
+        unlink(path);
+    }
     /* Page 0 all present, page 1 every 17th null, page 2 all null; both
      * page layouts. */
     for (int v = 0; v < 2; v++) {
@@ -825,6 +870,31 @@ static test_result_t test_pq_optional_bulk(void) {
     ray_release(opts);
     unlink(path);
     PASS();
+}
+/* A cancellation requested while the bulk gate certifies a large all-present
+ * page is observed inside that scan, before any value is copied: the first
+ * read reports "cancel" and the scan stops at the next coarse checkpoint. */
+static test_result_t test_pq_cert_cancel(void) {
+#if !defined(DEBUG)
+    SKIP("debug builds expose the certification seam");
+#else
+    char path[160];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-cert-cancel-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth_optional(path,65536,1,0,false));
+    ray_clear_interrupt();
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,1,&r));
+    ray_parquet_test_cert_interrupt_after(1);
+    ray_t* res = ray_parquet_next(r);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(res && RAY_IS_ERR(res));
+    TEST_ASSERT_TRUE(ray_err_code(res) && !strcmp(ray_err_code(res),"cancel"));
+    TEST_ASSERT_TRUE(ray_parquet_test_cert_levels() <= 4096);
+    ray_error_free(res);
+    ray_parquet_close(r);
+    unlink(path);
+    PASS();
+#endif
 }
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
@@ -4485,6 +4555,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/snappy",test_pq_snappy,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
+    {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},
     {"parquet/read_metadata",test_pq_read_meta,pq_setup,pq_teardown},
     {"parquet/corrupt",test_pq_corrupt,pq_setup,pq_teardown},
     {"parquet/native",test_pq_native,pq_setup,pq_teardown},
