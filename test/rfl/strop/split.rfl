@@ -69,3 +69,9 @@
 ;; delim falls through and hits the "type" guard on line 280.
 (split "abc" 42)   !- type
 (split "abc" 1.5)  !- type
+
+;; STR / SYM vector input splits element-wise: one list of parts per element.
+(split ["a,b" "c"] ",") -- (list (list "a" "b") (list "c"))
+(split ["a,b" "" ",x"] ",") -- (list (list "a" "b") (list "") (list "" "x"))
+(split ['a_b 'c] "_") -- (list (list "a" "b") (list "c"))
+(count (split (take ["a,b"] 0) ",")) -- 0

@@ -881,6 +881,24 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         }
         return result;
     }
+    /* STR / SYM vector input with a string delimiter: element-wise, one
+     * split result (a list of parts) per input element. */
+    if ((str->type == RAY_STR || str->type == RAY_SYM) && delim->type == -RAY_STR) {
+        ray_t* out = ray_list_new(str->len);
+        if (RAY_IS_ERR(out)) return out;
+        for (int64_t i = 0; i < str->len; i++) {
+            int alloc = 0;
+            ray_t* e = collection_elem(str, i, &alloc);
+            if (!e || RAY_IS_ERR(e)) { ray_release(out); return e ? e : ray_error("oom", NULL); }
+            ray_t* r = ray_split_fn(e, delim);
+            if (alloc) ray_release(e);
+            if (RAY_IS_ERR(r)) { ray_release(out); return r; }
+            out = ray_list_append(out, r);
+            ray_release(r);
+            if (RAY_IS_ERR(out)) return out;
+        }
+        return out;
+    }
     /* Normalize str and delim to string pointers */
     const char *sp, *dp;
     size_t slen, dlen;
