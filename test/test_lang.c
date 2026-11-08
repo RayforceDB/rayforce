@@ -893,6 +893,20 @@ static test_result_t test_eval_literal_fallback_unbound_head_mark_consumed(void)
     return literal_fallback_returns_same_unmarked(kept, msg);
 }
 
+/* Head that is a call raising a name error: (list (list (fn ..) 1) 1) has a
+ * function-value head, so eval skips the symbol-head return, calls it, and
+ * the body's undefined name comes back as the head error.  The fallback
+ * treats the list as data (returns it) and must consume the transient mark
+ * on the list the handler kept. */
+static test_result_t test_eval_literal_fallback_head_name_error_mark_consumed(void) {
+    ray_t* arg = ray_eval_str("(list (list (fn [x] zz_undefined) 1) 1)");
+    TEST_ASSERT_NOT_NULL(arg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(arg));
+    ray_t* msg;
+    ray_t* kept = literal_mark_msg(arg, &msg);
+    return literal_fallback_returns_same_unmarked(kept, msg);
+}
+
 /* ---- Test: eval if true ---- */
 static test_result_t test_eval_if_true(void) {
     ray_t* result = ray_eval_str("(if true 1 2)");
@@ -11699,6 +11713,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/literal_fallback_nonempty_mark_consumed", test_eval_literal_fallback_nonempty_mark_consumed, lang_setup, lang_teardown },
     { "lang/eval/literal_fallback_list_head_mark_consumed", test_eval_literal_fallback_list_head_mark_consumed, lang_setup, lang_teardown },
     { "lang/eval/literal_fallback_unbound_head_mark_consumed", test_eval_literal_fallback_unbound_head_mark_consumed, lang_setup, lang_teardown },
+    { "lang/eval/literal_fallback_head_name_error_mark_consumed", test_eval_literal_fallback_head_name_error_mark_consumed, lang_setup, lang_teardown },
     { "lang/eval/if_true", test_eval_if_true, lang_setup, lang_teardown },
     { "lang/eval/if_false", test_eval_if_false, lang_setup, lang_teardown },
     { "lang/eval/let", test_eval_let, lang_setup, lang_teardown },
