@@ -929,7 +929,7 @@ ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP
  * quickselect path (see ray_median_per_group) — it can't fit the
  * fixed-size row-layout HT because per-group buffer size is variable. */
 ray_op_t* ray_median(ray_graph_t* g, ray_op_t* a) {
-    return make_unary(g, OP_MEDIAN, a, mean_out_type(a->out_type));
+    return make_unary(g, OP_MEDIAN, a, RAY_F64);
 }
 
 /* --------------------------------------------------------------------------
@@ -2050,7 +2050,6 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_AVG:
         case OP_STDDEV:
         case OP_STDDEV_POP:
-            out_type = mean_out_type(prev->out_type); break;
         case OP_VAR:
         case OP_VAR_POP:
             out_type = RAY_F64; break;
@@ -2069,20 +2068,18 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_LEAD:
             out_type = prev->out_type; break;     /* shifts preserve type */
         case OP_DELTAS:
-            out_type = deltas_out_type(prev->out_type);
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
             break;
         case OP_RATIOS:
             out_type = RAY_F64; break;
         case OP_FILLS:
             out_type = prev->out_type; break;
         case OP_SUMS:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : scan_int_out_type(prev->out_type);
-            break;
         case OP_PRDS:
             out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
             break;
         case OP_AVGS:
-            out_type = mean_out_type(prev->out_type); break;
+            out_type = RAY_F64; break;
         case OP_MINS:
         case OP_MAXS:
             out_type = prev->out_type;
@@ -2117,12 +2114,11 @@ ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
         case OP_MCOUNT:
             out_type = RAY_I64; break;
         case OP_MAVG:
-        case OP_MDEV:
-            out_type = mean_out_type(prev->out_type); break;
         case OP_MVAR:
+        case OP_MDEV:
             out_type = RAY_F64; break;
         case OP_MSUM:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : scan_int_out_type(prev->out_type);
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
             break;
         case OP_MMIN:
         case OP_MMAX:
