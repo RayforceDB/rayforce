@@ -32,7 +32,17 @@ See [RELEASE.md](RELEASE.md) for how releases are cut.
 
    ```sh
    make            # builds (debug: ASan + UBSan)
-   make test       # runs the test suite
+   make test       # fast suite (no sanitizers, all cores); `make test-full`
+                   # runs every test under ASan + UBSan, as release PRs do
+   ```
+
+   Tests run in parallel worker processes, each running many tests in turn.
+   A test that fails only after some other test ran in the same process
+   prints a reproduce line; run it to replay that exact sequence in one
+   process, then trim the file it names down to the culprit:
+
+   ```sh
+   ./rayforce.test.fast --replay /tmp/rayforce_replay.<pid>.<n>
    ```
 
 4. Open the PR against **`dev`**. CI runs on every pull request (there are no
