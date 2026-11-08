@@ -180,3 +180,12 @@
 (type (fill (as 'F32 0.0) e32)) -- 'F32
 (type (max e32 e32)) -- 'F32
 (type (- (as 'F64 []) (as 'F64 []))) -- 'F64
+
+;; concat takes an F32 atom on either side, as enlist does, with null flags.
+(concat (as 'F32 2.5) (as 'F32 0Nf)) -- (as 'F32 [2.5 0Nf])
+(type (concat (as 'F32 2.5) (as 'F32 1.5))) -- 'F32
+(concat (as 'F32 [2.5]) (as 'F32 1.5)) -- (as 'F32 [2.5 1.5])
+(concat (as 'F32 0Nf) (as 'F32 [2.5])) -- (as 'F32 [0Nf 2.5])
+(nil? (concat (as 'F32 0Nf) (as 'F32 [2.5]))) -- [true false]
+(min (concat (as 'F32 0Nf) (as 'F32 [2.5]))) -- 2.5e
+(type (concat (as 'F32 []) (as 'F32 1.5))) -- 'F32

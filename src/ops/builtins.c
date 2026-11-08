@@ -3779,6 +3779,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             ((int64_t*)ray_data(result))[0] = a->i64; break;
         case RAY_F64:
             ((double*)ray_data(result))[0] = a->f64; break;
+        case RAY_F32:   /* an F32 atom holds its value in the f64 slot */
+            ((float*)ray_data(result))[0] = (float)a->f64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)ray_data(result))[0] = a->i32; break;
         case RAY_I16:
@@ -3830,6 +3832,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             ((int64_t*)ray_data(result))[na] = b->i64; break;
         case RAY_F64:
             ((double*)ray_data(result))[na] = b->f64; break;
+        case RAY_F32:
+            ((float*)ray_data(result))[na] = (float)b->f64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)ray_data(result))[na] = b->i32; break;
         case RAY_I16:
@@ -3866,6 +3870,10 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         case RAY_F64:
             ((double*)ray_data(result))[0] = a->f64;
             ((double*)ray_data(result))[1] = b->f64;
+            break;
+        case RAY_F32:
+            ((float*)ray_data(result))[0] = (float)a->f64;
+            ((float*)ray_data(result))[1] = (float)b->f64;
             break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)ray_data(result))[0] = a->i32;
