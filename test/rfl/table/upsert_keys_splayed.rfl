@@ -35,14 +35,28 @@
 (set t (table [k v] (list gv [10 20 30])))
 (.db.splayed.set "/tmp/rfl_ups_keys/guid/" t)
 (set s (.db.splayed.get "/tmp/rfl_ups_keys/guid/"))
+;; a non-guid value against a guid key is a type error, table untouched.
+;; This must run on the freshly loaded table: after a successful in-place
+;; upsert it is in memory and the fast path's own error would answer.
+(upsert 's 1 (list 1 5)) !- type
+(count s) -- 3
 (upsert 's 1 (list (at gv 1) 99)) -- 's
 (count s) -- 3
 (at s 'v) -- [10 99 30]
 (upsert 's 1 (list (at (guid 1) 0) 5)) -- 's
 (count s) -- 4
-;; a non-guid value against a guid key is a type error, table untouched
+
+;; SYM and STR key columns, a mistyped key value, on freshly loaded tables
+(set t (table [k v] (list ['a 'b 'c] [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/sym/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/sym/"))
 (upsert 's 1 (list 1 5)) !- type
-(count s) -- 4
+(count s) -- 3
+(set t (table [k v] (list (list "a" "b" "c") [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/str/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/str/"))
+(upsert 's 1 (list 1 5)) !- type
+(count s) -- 3
 
 ;; F32 (matches by value; an F64 atom is narrowed first; null never matches)
 (set t (table [k v] (list (as 'F32 [1.5 2.5 3.5]) [10 20 30])))
