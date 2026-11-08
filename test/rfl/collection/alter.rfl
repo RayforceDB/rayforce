@@ -1,0 +1,28 @@
+
+;; ========== ALTER SET ON DICTS — addressed by key ==========
+;; A dict used to be refused ("target must be a vector or list").  A key is
+;; replaced when present and added when missing; a vector of keys is set
+;; pairwise against a value vector of the same length, otherwise broadcast.
+(set HD (dict [1] [1])) (alter 'HD set 1 2) HD -- (dict [1] [2])
+(set HD (dict [1 2] [10 20])) (alter 'HD set 3 30) HD -- (dict [1 2 3] [10 20 30])
+(set HD (dict [1 2] [10 20])) (alter 'HD set [2 4] [0 40]) HD -- (dict [1 2 4] [10 0 40])
+(set HD (dict [1 2] [10 20])) (alter 'HD set [1 2] 7) HD -- (dict [1 2] [7 7])
+(set HD (dict ['a 'b] [1 2])) (alter 'HD set 'a "x") HD -- (dict ['a 'b] (list "x" 2))
+(alter 'HD set 'b 5) -- 'HD
+;; another binding sharing the dict keeps its contents
+(set HE (dict ['a 'b] [1 2]))
+(set HF HE)
+(alter 'HE set 'a 100)
+HE -- (dict ['a 'b] [100 2])
+HF -- (dict ['a 'b] [1 2])
+;; a key of the wrong type is refused, and the binding is left alone —
+;; a sym-keyed dict used to take an integer key as a raw symbol id
+(alter 'HF set 5 1) !- type
+HF -- (dict ['a 'b] [1 2])
+(alter 'HF set (list [1 2]) 1) !- type
+;; a dict reached through a dotted name is rebound along its chain
+(set HG.x (dict ['p] [1])) (alter 'HG.x set 'q 2) HG.x -- (dict ['p 'q] [1 2])
+;; a let-local dict is amended in its own scope; the global of that name is untouched
+(set HL (dict [1] [1]))
+((fn [] (let HL (dict [1] [1])) (alter 'HL set 1 2) HL)) -- (dict [1] [2])
+HL -- (dict [1] [1])

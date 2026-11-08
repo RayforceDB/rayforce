@@ -587,7 +587,56 @@ static test_result_t test_atom_oom(void) {
     PASS();
 }
 
+/* The scalar constructors allocate a header-only block; an exhausted heap
+ * is an oom error from each, never NULL.  ray_guid and the GUID null make
+ * a second allocation (the header after the 16 payload bytes), failed in
+ * turn as well. */
+static ray_t* oom_bool(void)  { return ray_bool(true); }
+static ray_t* oom_u8(void)    { return ray_u8(7); }
+static ray_t* oom_i16(void)   { return ray_i16(7); }
+static ray_t* oom_i32(void)   { return ray_i32(7); }
+static ray_t* oom_i64(void)   { return ray_i64(7); }
+static ray_t* oom_f32(void)   { return ray_f32(1.5f); }
+static ray_t* oom_f64(void)   { return ray_f64(1.5); }
+static ray_t* oom_date(void)  { return ray_date(7); }
+static ray_t* oom_time(void)  { return ray_time(7); }
+static ray_t* oom_ts(void)    { return ray_timestamp(7); }
+static ray_t* oom_tnull(void) { return ray_typed_null(-RAY_I64); }
+static ray_t* oom_guid(void)  { static const uint8_t g[16] = {1}; return ray_guid(g); }
+static ray_t* oom_gnull(void) { return ray_typed_null(-RAY_GUID); }
+
+static test_result_t test_atom_scalar_oom(void) {
+    static const struct { ray_t* (*make)(void); int64_t allocs; } cases[] = {
+        { oom_bool, 1 }, { oom_u8, 1 }, { oom_i16, 1 }, { oom_i32, 1 },
+        { oom_i64, 1 }, { oom_f32, 1 }, { oom_f64, 1 }, { oom_date, 1 },
+        { oom_time, 1 }, { oom_ts, 1 }, { oom_tnull, 1 },
+        { oom_guid, 2 }, { oom_gnull, 2 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int64_t nth = 1; nth <= cases[i].allocs; nth++) {
+            for (int64_t count = 1; count <= 2; count++) {
+                size_t before = atom_heap_bytes();
+                ray_alloc_fail_set_for_test(nth, count);
+                ray_t* v = cases[i].make();
+                ray_alloc_fail_set_for_test(0, 0);
+                TEST_ASSERT_NOT_NULL(v);
+                TEST_ASSERT_TRUE(RAY_IS_ERR(v));
+                TEST_ASSERT_STR_EQ(ray_err_code(v), "oom");
+                ray_error_free(v);
+                TEST_ASSERT_EQ_U(atom_heap_bytes(), before);
+            }
+        }
+        ray_alloc_fail_set_for_test(cases[i].allocs + 1, 1);
+        ray_t* v = cases[i].make();
+        ray_alloc_fail_set_for_test(0, 0);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        ray_release(v);
+    }
+    PASS();
+}
+
 const test_entry_t atom_entries[] = {
+    { "atom/scalar_oom", test_atom_scalar_oom, atom_setup, atom_teardown },
     { "atom/bool", test_atom_bool, atom_setup, atom_teardown },
     { "atom/u8", test_atom_u8, atom_setup, atom_teardown },
     { "atom/single_char_str", test_atom_single_char_str, atom_setup, atom_teardown },

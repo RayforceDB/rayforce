@@ -1932,7 +1932,8 @@ static uint64_t st_col_decoded(const char* col) {
 #define ST_GB_LOAD0 "(set T (.db.splayed.get \"" ST_TMP "/gb0/\"))"
 static test_result_t test_idict_groupby(void) {
     ST_SAVE2("gb", ST_GB_TABLE);
-    ST_Q_OK_N("(set M " ST_GB_TABLE ")");
+    ST_Q_OK_N("(set M W)");                                /* the saved in-memory table (no index), built once */
+    ST_Q_TRUE("(nil? (.idx.info (at M 's)))");
     char p[600]; TEST_ASSERT_TRUE(st_live("/gb2", "s", p, sizeof p));
     TEST_ASSERT_EQ_I(st_hdr(p).index_kind, RAY_IDX_DICT);
     static const struct { const char* q; bool key_only; } qs[] = {

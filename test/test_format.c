@@ -1781,19 +1781,19 @@ static size_t fmt_write_to_buf(ray_t* obj, char* buf, size_t cap) {
 }
 
 static test_result_t test_fmt_table_parted(void) {
-    ray_t* r = ray_eval_str(
+    ray_t* r = ray_eval_str(ray_test_tmp(
         "(do (.sys.exec \"rm -rf /tmp/rfl_fmt_parted\")"
         " (set T (table [i s t] (list (til 10) (take ['a 'b 'c] 10) (as 'STR (til 10)))))"
         " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.01/t/\" T)"
         " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.02/t/\" (update {i: (+ i 10) from: T}))"
         " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.03/t/\" (update {i: (+ i 20) from: T}))"
-        " 0)");
+        " 0)"));
     TEST_ASSERT_FALSE(!r || RAY_IS_ERR(r));
     ray_release(r);
-    ray_t* parted = ray_eval_str("(.db.parted.get \"/tmp/rfl_fmt_parted/\" 't)");
+    ray_t* parted = ray_eval_str(ray_test_tmp("(.db.parted.get \"/tmp/rfl_fmt_parted/\" 't)"));
     TEST_ASSERT_FALSE(!parted || RAY_IS_ERR(parted));
-    ray_t* flat = ray_eval_str(
-        "(select {from: (.db.parted.get \"/tmp/rfl_fmt_parted/\" 't) where: (>= i 0)})");
+    ray_t* flat = ray_eval_str(ray_test_tmp(
+        "(select {from: (.db.parted.get \"/tmp/rfl_fmt_parted/\" 't) where: (>= i 0)})"));
     TEST_ASSERT_FALSE(!flat || RAY_IS_ERR(flat));
 
     for (int mode = 0; mode <= 2; mode++) {
@@ -1823,7 +1823,7 @@ static test_result_t test_fmt_table_parted(void) {
 
     ray_release(flat);
     ray_release(parted);
-    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rfl_fmt_parted\")");
+    r = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rfl_fmt_parted\")"));
     if (r) ray_release(r);
     PASS();
 }
@@ -1850,10 +1850,10 @@ static test_result_t fmt_ragged_case(int64_t mid) {
         " (.db.splayed.set \"/tmp/rfl_fmt_ragged/2024.01.02/t/\" (table [a] (list RM)))"
         " (.db.splayed.set \"/tmp/rfl_fmt_ragged/2024.01.03/t/\" RC)"
         " 0)", (long long)mid);
-    ray_t* r = ray_eval_str(src);
+    ray_t* r = ray_eval_str(ray_test_tmp(src));
     TEST_ASSERT_FALSE(!r || RAY_IS_ERR(r));
     ray_release(r);
-    ray_t* parted = ray_eval_str("(.db.parted.get \"/tmp/rfl_fmt_ragged/\" 't)");
+    ray_t* parted = ray_eval_str(ray_test_tmp("(.db.parted.get \"/tmp/rfl_fmt_ragged/\" 't)"));
     TEST_ASSERT_FALSE(!parted || RAY_IS_ERR(parted));
     snprintf(src, sizeof(src),
         "(do (set n %lld)"
@@ -1893,7 +1893,7 @@ static test_result_t fmt_ragged_case(int64_t mid) {
 
     ray_release(flat);
     ray_release(parted);
-    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rfl_fmt_ragged\")");
+    r = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rfl_fmt_ragged\")"));
     if (r) ray_release(r);
     PASS();
 }
