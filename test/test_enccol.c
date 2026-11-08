@@ -1723,22 +1723,32 @@ static test_result_t test_cancel_waiter(void) {
     ray_t* v = make_col(RAY_I32, 128 * 65536, 1);
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/cw"), 2), RAY_OK);
     ray_release(v);
-    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/cw"));
-    ray_enccol_t* e = ray_enccol_of(c);
-    cwait_t p = { c, "" }, w = { c, "" };
-    ray_thread_t tp, tw;
-    ray_thread_create(&tp, cancel_wait_thread, &p);
-    while (atomic_load(&e->once.state) != RAY_ENC_ONCE_RUNNING) ray_enc_yield();
-    ray_thread_create(&tw, cancel_wait_thread, &w);
-    while (ray_enc_once_waiters(&e->once) < 1) ray_enc_yield();
-    ray_request_interrupt();
-    ray_thread_join(tp); ray_thread_join(tw);
-    ray_clear_interrupt();
-    TEST_ASSERT_STR_EQ(p.code, "cancel");
-    TEST_ASSERT_STR_EQ(w.code, "cancel");
-    ray_t* r = ray_enccol_materialize(c);
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-    ray_release(c);
+    /* The interrupt can land only after the decode it was meant to stop has
+     * finished (a fast unsanitized build on a fast core): then both calls
+     * succeed and the attempt is retried on a fresh mapping.  Either both
+     * see the attempt's "cancel" or both succeed; anything else is a bug. */
+    bool cancelled = false;
+    for (int attempt = 0; attempt < 50 && !cancelled; attempt++) {
+        ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/cw"));
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+        ray_enccol_t* e = ray_enccol_of(c);
+        cwait_t p = { c, "" }, w = { c, "" };
+        ray_thread_t tp, tw;
+        ray_thread_create(&tp, cancel_wait_thread, &p);
+        while (atomic_load(&e->once.state) != RAY_ENC_ONCE_RUNNING) ray_enc_yield();
+        ray_thread_create(&tw, cancel_wait_thread, &w);
+        while (ray_enc_once_waiters(&e->once) < 1) ray_enc_yield();
+        ray_request_interrupt();
+        ray_thread_join(tp); ray_thread_join(tw);
+        ray_clear_interrupt();
+        TEST_ASSERT_STR_EQ(w.code, p.code);                 /* the waiter gets the attempt's result */
+        cancelled = strcmp(p.code, "cancel") == 0;
+        if (!cancelled) TEST_ASSERT_STR_EQ(p.code, "");      /* the decode won the race: retry */
+        ray_t* r = ray_enccol_materialize(c);               /* retried after a cancel, or done */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(c);
+    }
+    TEST_ASSERT(cancelled, "the interrupt never reached a running attempt in 50 tries");
     PASS();
 }
 
