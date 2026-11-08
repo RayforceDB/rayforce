@@ -55,6 +55,23 @@ jobs:
       # Debug legs execute the suite (tier: see TEST_TIER above); release legs
       # verify optimized artifacts. Runtime tests under release FP flags use
       # the separate `make test-release` profile, not the debug suite below.
+      # TEMPORARY diagnostic (to be removed): macOS-only enccol failures.
+      - name: Diagnose macOS enccol failures
+        if: matrix.os == 'macos-latest' && matrix.target == 'debug'
+        continue-on-error: true
+        run: |
+          T="enccol/runs_kernel_equal enccol/cancel_waiter enccol/load_dom_refcount heap/relieve_needed"
+          make -j3 test CC=clang TEST_FILTER=__none__
+          for t in $T; do
+            echo "== fast -O1, no fsync, alone: $t"; RAYFORCE_CORES=2 RAYFORCE_NO_FSYNC=1 ./rayforce.test.fast -f $t 2>&1 | tail -4
+            echo "== fast -O1, fsync, alone: $t";    RAYFORCE_CORES=2 ./rayforce.test.fast -f $t 2>&1 | tail -2
+          done
+          echo "== fast -O1, whole enccol group, serial"; RAYFORCE_CORES=2 RAYFORCE_NO_FSYNC=1 ./rayforce.test.fast -f enccol/ 2>&1 | grep -E "FAIL|=== " | head
+          make -j3 test-full-bin CC=clang
+          for t in $T; do
+            echo "== asan -O0, alone: $t"; RAYFORCE_CORES=2 RAYFORCE_NO_FSYNC=1 ./rayforce.test -f $t 2>&1 | tail -4
+          done
+
       - name: Test (${{ env.TEST_TIER }})
         if: matrix.target == 'debug'
         run: make ${{ env.TEST_TIER }} CC=${{ matrix.compiler }}
