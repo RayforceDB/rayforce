@@ -277,9 +277,11 @@ static ray_t* parse_number(ray_parser_t *p) {
         p->pos += 2;
 
         /* Two ASCII digits admit month/day up to 99; reject anything
-         * outside the calendar range before encoding.  ymd_to_date indexes
-         * MONTHDAYS[leap][month-1], so an unvalidated month (e.g. the
-         * literal 2024.81.03) reads off the end of that table. */
+         * outside the calendar range before encoding.  ymd_to_date is
+         * closed-form (days_from_civil) and clamps the shifted month index
+         * to 0..11, so an out-of-range month (e.g. the literal 2024.81.03)
+         * would silently encode as December rather than fail: keep this
+         * check so such literals are a parse error instead. */
         if (month < 1 || month > 12 || day < 1 || day > 31)
             return ray_error("parse", "invalid date %04d.%02d.%02d: month must be 1-12, day 1-31", year, month, day);
 
