@@ -38,6 +38,7 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'time` | Time | Milliseconds since midnight |
 | `'timestamp` | Timestamp | Nanoseconds since 2000-01-01T00:00:00 |
 | `'timespan` | Duration | Signed count of nanoseconds |
+| `'LIST` | Generic list | Boxes a typed vector into a `LIST` of atoms (see [Vector casts](#as-function)) |
 | `'guid` | GUID | 16-byte unique identifier |
 
 F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
@@ -99,7 +100,29 @@ significant digits so casting the string back to F32 preserves the value.
 (as 'timestamp "2024-01-15T12:30:00.000")  ; 2024.01.15D12:30:00.000000000
 ```
 
-**Vector casts:** `as` maps element-wise over vectors.
+**Vector casts:** for the numeric, string and temporal targets, `as` maps
+element-wise over vectors.
+
+`'LIST` is the exception: it is not element-wise. It boxes the whole vector into
+a `LIST` of atoms, null cells staying typed null atoms. A `LIST` is returned
+unchanged, and an atom, a dict or a table is a `type` error
+(`as: cannot cast i64 to list`, `as: cannot cast DICT to list`,
+`as: cannot cast TABLE to list`).
+
+```lisp
+(as 'LIST [1 2])      ; (1 2), a LIST of two i64 atoms
+(as 'LIST 1)          ; type error: as: cannot cast i64 to list
+```
+
+In a query the verb decides how `as 'LIST` is evaluated, so the same
+expression can succeed or fail. With `T: (table [k v] (list [1 1 2] [10 20 30]))`:
+
+| Query | Evaluation | Result |
+|---|---|---|
+| `(select {r: (as 'LIST v) from: T})` | per row | `type` error `as: cannot cast i64 to list`, since each cell is an atom |
+| `(select {r: (as 'LIST v) from: T by: k})` | per group | one `LIST` per group, holding that group's boxed cells |
+| `(update {w: (as 'LIST v) from: T})` | whole column | `w` is a `LIST` column of i64 atoms |
+| `(update {w: (as 'LIST v) from: T where: (> v 15)})` | whole column | `type` error `update: a new column under where: must be a typed vector, got LIST` |
 
 Casting to `STR` produces a flat string vector from a vector or a LIST of
 atoms. Each outer element must convert to one string atom. A nested vector or
