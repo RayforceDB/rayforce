@@ -1,0 +1,40 @@
+;; A UTF-8 byte-order mark at the very start of a CSV is not data: it must
+;; not become part of the first column name or the first headerless cell.
+
+;; Header, auto-typed.
+(.sys.exec "printf '\\357\\273\\277id,txt\\n1,a\\n2,b\\n' > rf_test_csv_bom_a.csv") -- 0
+(set A (.csv.read "rf_test_csv_bom_a.csv"))
+(key A) -- ['id 'txt]
+(at (at A 'id) 1) -- 2
+(at (at A 'txt) 0) -- 'a
+
+;; Header, typed schema overload.
+(set B (.csv.read [I64 SYMBOL] "rf_test_csv_bom_a.csv"))
+(key B) -- ['id 'txt]
+(at (at B 'id) 0) -- 1
+
+;; Headerless with explicit names: the first cell stays an I64.
+(.sys.exec "printf '\\357\\273\\2771,a\\n2,b\\n' > rf_test_csv_bom_h.csv") -- 0
+(set H (.csv.read ['x 'y] [I64 SYMBOL] "rf_test_csv_bom_h.csv"))
+(count H) -- 2
+(at (at H 'x) 0) -- 1
+
+;; Large (parallel) path, with BOM.
+(.sys.exec "{ printf '\\357\\273\\277id,v\\n'; seq 1 20000 | sed 's/$/,7/'; } > rf_test_csv_bom_big.csv") -- 0
+(set Big (.csv.read "rf_test_csv_bom_big.csv"))
+(key Big) -- ['id 'v]
+(count Big) -- 20000
+(at (at Big 'id) 19999) -- 20000
+(set BigT (.csv.read [I64 I64] "rf_test_csv_bom_big.csv"))
+(key BigT) -- ['id 'v]
+(count BigT) -- 20000
+
+;; .csv.splayed shares the BOM handling.
+(set S (.csv.splayed "rf_test_csv_bom_a.csv" "rf_test_csv_bom_sp/"))
+(key S) -- ['id 'txt]
+
+;; A file without a BOM is unaffected.
+(.sys.exec "printf 'a,b\\n1,2\\n' > rf_test_csv_bom_n.csv") -- 0
+(key (.csv.read "rf_test_csv_bom_n.csv")) -- ['a 'b]
+
+(.sys.exec "rm -rf rf_test_csv_bom_sp rf_test_csv_bom_a.csv rf_test_csv_bom_h.csv rf_test_csv_bom_big.csv rf_test_csv_bom_n.csv") -- 0

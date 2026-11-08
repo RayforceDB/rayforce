@@ -3039,6 +3039,12 @@ static const char* csv_skip_matching_header(const char* p, const char* buf_end,
  * ray_read_csv_opts — main CSV parser
  * -------------------------------------------------------------------------- */
 
+/* Length of a leading UTF-8 byte-order mark (EF BB BF), else 0. */
+static inline size_t csv_bom_len(const char* buf, size_t size) {
+    return (size >= 3 && (unsigned char)buf[0] == 0xEF &&
+            (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) ? 3 : 0;
+}
+
 /* Body of ray_read_csv_named_opts.  Split out so the byte-metered progress
  * span is closed on exactly one path, whichever of the dozen returns below
  * fires. */
@@ -3068,6 +3074,8 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
 #endif
 
     const char* buf_end = buf + file_size;
+    /* A UTF-8 BOM at the very start of the file is not data. */
+    const char* body = buf + csv_bom_len(buf, file_size);
     ray_t* result = NULL;
 
     /* One monotone bar for the whole load, metered in bytes of input.  Every
@@ -3082,7 +3090,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
      * was considered but adds complexity for a rare edge case. */
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* p = buf; p < buf_end && *p != '\n'; p++) {
+        for (const char* p = body; p < buf_end && *p != '\n'; p++) {
             if (*p == ',') commas++;
             if (*p == '\t') tabs++;
         }
@@ -3092,7 +3100,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     /* ---- 4. Count columns from first line ---- */
     int ncols = 1;
     {
-        const char* p = buf;
+        const char* p = body;
         bool in_quote = false;
         while (p < buf_end && (in_quote || (*p != '\n' && *p != '\r'))) {
             if (*p == '"') in_quote = !in_quote;
@@ -3121,7 +3129,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     }
 
     /* ---- 5. Parse header row ---- */
-    const char* p = buf;
+    const char* p = body;
     char esc_buf[8192];
     int64_t col_name_ids[CSV_MAX_COLS];
 
@@ -3142,7 +3150,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     } else if (col_names_in) {
         for (int c = 0; c < ncols; c++)
             col_name_ids[c] = col_names_in[c];
-        const char* after = csv_skip_matching_header(buf, buf_end, delimiter,
+        const char* after = csv_skip_matching_header(body, buf_end, delimiter,
                                                      ncols, col_names_in, esc_buf);
         if (after) p = after;   /* file carried a header matching the names */
     } else {
@@ -3617,11 +3625,13 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 #endif
 
     const char* buf_end = buf + file_size;
+    /* A UTF-8 BOM at the very start of the file is not data. */
+    const char* body = buf + csv_bom_len(buf, file_size);
     ray_err_t err = RAY_OK;
 
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* q = buf; q < buf_end && *q != '\n'; q++) {
+        for (const char* q = body; q < buf_end && *q != '\n'; q++) {
             if (*q == ',') commas++;
             if (*q == '\t') tabs++;
         }
@@ -3630,7 +3640,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 
     int ncols = 1;
     {
-        const char* q = buf;
+        const char* q = body;
         bool in_quote = false;
         while (q < buf_end && (in_quote || (*q != '\n' && *q != '\r'))) {
             if (*q == '"') in_quote = !in_quote;
@@ -3648,7 +3658,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
         return RAY_ERR_LENGTH;
     }
 
-    const char* p = buf;
+    const char* p = body;
     char esc_buf[8192];
     int64_t col_name_ids[CSV_MAX_COLS];
 
@@ -3666,7 +3676,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     } else if (col_names_in) {
         for (int c = 0; c < ncols; c++)
             col_name_ids[c] = col_names_in[c];
-        const char* after = csv_skip_matching_header(buf, buf_end, delimiter,
+        const char* after = csv_skip_matching_header(body, buf_end, delimiter,
                                                      ncols, col_names_in, esc_buf);
         if (after) p = after;   /* file carried a header matching the names */
     } else {
@@ -4030,11 +4040,13 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
 #endif
 
     const char* buf_end = buf + file_size;
+    /* A UTF-8 BOM at the very start of the file is not data. */
+    const char* body = buf + csv_bom_len(buf, file_size);
     ray_err_t err = RAY_OK;
 
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* q = buf; q < buf_end && *q != '\n'; q++) {
+        for (const char* q = body; q < buf_end && *q != '\n'; q++) {
             if (*q == ',') commas++;
             if (*q == '\t') tabs++;
         }
@@ -4043,7 +4055,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
 
     int ncols = 1;
     {
-        const char* q = buf;
+        const char* q = body;
         bool in_quote = false;
         while (q < buf_end && (in_quote || (*q != '\n' && *q != '\r'))) {
             if (*q == '"') in_quote = !in_quote;
@@ -4061,7 +4073,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
         return RAY_ERR_LENGTH;
     }
 
-    const char* p = buf;
+    const char* p = body;
     char esc_buf[8192];
     int64_t col_name_ids[CSV_MAX_COLS];
 
@@ -4079,7 +4091,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     } else if (col_names_in) {
         for (int c = 0; c < ncols; c++)
             col_name_ids[c] = col_names_in[c];
-        const char* after = csv_skip_matching_header(buf, buf_end, delimiter,
+        const char* after = csv_skip_matching_header(body, buf_end, delimiter,
                                                      ncols, col_names_in, esc_buf);
         if (after) p = after;   /* file carried a header matching the names */
     } else {
