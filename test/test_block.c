@@ -25,6 +25,7 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "core/block.h"
+#include "mem/heap.h"
 #include "table/sym.h"
 #include "ops/ops.h"
 
@@ -284,6 +285,11 @@ static test_result_t test_block_copy_sel(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+/* The copy tests allocate: own a heap for the test and destroy it after, so
+ * no heap (and the environment it resolved) outlives the test on this thread. */
+static void block_setup(void)    { ray_heap_init(); }
+static void block_teardown(void) { ray_heap_destroy(); }
+
 const test_entry_t block_entries[] = {
     { "block/type_macros", test_type_macros, NULL, NULL },
     { "block/ray_data", test_ray_data, NULL, NULL },
@@ -299,8 +305,8 @@ const test_entry_t block_entries[] = {
     { "block/block_size_sel_zero", test_block_size_sel_zero, NULL, NULL },
     { "block/block_size_sel_negative", test_block_size_sel_negative, NULL, NULL },
     { "block/block_size_bad_type", test_block_size_bad_type, NULL, NULL },
-    { "block/block_copy_list", test_block_copy_list, NULL, NULL },
-    { "block/block_copy_sel", test_block_copy_sel, NULL, NULL },
+    { "block/block_copy_list", test_block_copy_list, block_setup, block_teardown },
+    { "block/block_copy_sel", test_block_copy_sel, block_setup, block_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

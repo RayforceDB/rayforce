@@ -38,10 +38,15 @@ ray_t* ray_log_open_fn(ray_t** args, int64_t n);
  * open or if a replay is currently in progress. */
 ray_t* ray_log_write_fn(ray_t* expr);
 
-/* (.log.replay "path") -> i64 chunks replayed.  Errors with "badtail"
- * if the file ends mid-frame; the error message includes the byte
- * offset of the last good entry. */
+/* (.log.replay "path") -> I64 processed-entry count, including evaluation
+ * errors.  Warns and continues on those errors; terminal framing/read/decode/
+ * resource/interruption errors remain errors.  No rollback of prior effects. */
 ray_t* ray_log_replay_fn(ray_t* path);
+/* (.log.replay_report "path") replays ONCE, returning a dict of I64
+ * `entries` and `eval_errors` only on a clean tail.  Preallocates the private
+ * report before applying entries.  Not a previous-call status getter,
+ * fail-fast mode or certification of application invariants. */
+ray_t* ray_log_replay_report_fn(ray_t* path);
 
 /* (.log.validate "path") -> (chunks; valid_bytes) pair.  Validates
  * frames (parse but don't eval) — count valid frames without evaluating. */

@@ -34,7 +34,7 @@
 
 ray_t* ray_bool(bool val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_BOOL;
     v->b8 = val ? 1 : 0;
     return v;
@@ -42,7 +42,7 @@ ray_t* ray_bool(bool val) {
 
 ray_t* ray_u8(uint8_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_U8;
     v->u8 = val;
     return v;
@@ -50,7 +50,7 @@ ray_t* ray_u8(uint8_t val) {
 
 ray_t* ray_i16(int16_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_I16;
     v->i16 = val;
     return v;
@@ -58,7 +58,7 @@ ray_t* ray_i16(int16_t val) {
 
 ray_t* ray_i32(int32_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_I32;
     v->i32 = val;
     return v;
@@ -66,7 +66,7 @@ ray_t* ray_i32(int32_t val) {
 
 ray_t* ray_i64(int64_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_I64;
     v->i64 = val;
     return v;
@@ -74,7 +74,7 @@ ray_t* ray_i64(int64_t val) {
 
 ray_t* ray_f64(double val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_F64;
     v->f64 = val;
     return v;
@@ -86,7 +86,7 @@ ray_t* ray_f64(double val) {
  * box elements through the same atom-construction path used by I32/F64. */
 ray_t* ray_f32(float val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_F32;
     v->f64  = (double)val;
     return v;
@@ -102,6 +102,7 @@ ray_t* ray_str(const char* s, size_t len) {
          * Exactly 7 bytes would fill all of sdata[7] with no NUL terminator,
          * so 7-byte strings fall through to the long-string path. */
         ray_t* v = ray_alloc(0);
+        if (!v) return ray_error("oom", NULL);
         if (RAY_IS_ERR(v)) return v;
         v->type = -RAY_STR;
         v->slen = (uint8_t)len;
@@ -114,16 +115,17 @@ ray_t* ray_str(const char* s, size_t len) {
      * (including ctypes c_char_p) may read until '\0'. */
     size_t data_size = len + 1;
     ray_t* chars = ray_alloc(data_size);
-    if (!chars || RAY_IS_ERR(chars)) return chars;
+    if (!chars) return ray_error("oom", NULL);
+    if (RAY_IS_ERR(chars)) return chars;
     chars->type = RAY_U8;
     chars->len = (int64_t)len;
     memcpy(ray_data(chars), s, len);
     ((char*)ray_data(chars))[len] = '\0';
 
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) {
+    if (!v || RAY_IS_ERR(v)) {
         ray_free(chars);
-        return v;
+        return v ? v : ray_error("oom", NULL);
     }
     v->type = -RAY_STR;
     v->obj = chars;
@@ -136,6 +138,7 @@ ray_t* ray_str(const char* s, size_t len) {
 
 ray_t* ray_sym(int64_t id) {
     ray_t* v = ray_alloc(0);
+    if (!v) return ray_error("oom", NULL);
     if (RAY_IS_ERR(v)) return v;
     v->type = -RAY_SYM;
     v->i64 = id;
@@ -163,7 +166,7 @@ static inline int64_t atom_wrap_i32(int64_t val) {
 
 ray_t* ray_date(int64_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_DATE;
     v->i64 = atom_wrap_i32(val);
     return v;
@@ -171,7 +174,7 @@ ray_t* ray_date(int64_t val) {
 
 ray_t* ray_time(int64_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_TIME;
     v->i64 = atom_wrap_i32(val);
     return v;
@@ -179,7 +182,7 @@ ray_t* ray_time(int64_t val) {
 
 ray_t* ray_timestamp(int64_t val) {
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = -RAY_TIMESTAMP;
     v->i64 = val;
     return v;
@@ -207,7 +210,7 @@ ray_t* ray_typed_null(int8_t type) {
         return v;
     }
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->type = type;
     switch (type) {
         case -RAY_F64:                                 v->f64 = NULL_F64; break;
@@ -232,15 +235,15 @@ ray_t* ray_typed_null(int8_t type) {
 ray_t* ray_guid(const uint8_t* bytes) {
     /* Allocate U8 vector of length 16 */
     ray_t* vec = ray_alloc(16);
-    if (!vec || RAY_IS_ERR(vec)) return vec;
+    if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);
     vec->type = RAY_U8;
     vec->len = 16;
     memcpy(ray_data(vec), bytes, 16);
 
     ray_t* v = ray_alloc(0);
-    if (RAY_IS_ERR(v)) {
+    if (!v || RAY_IS_ERR(v)) {
         ray_free(vec);
-        return v;
+        return v ? v : ray_error("oom", NULL);
     }
     v->type = -RAY_GUID;
     v->obj = vec;

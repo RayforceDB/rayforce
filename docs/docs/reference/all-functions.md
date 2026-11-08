@@ -16,7 +16,7 @@
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (11) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
-| [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
+| [Storage](#storage) (5) | [IPC](#ipc) (10) | [EAV Triple Store](#eav) (5) |
 | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
 
 The examples below use these small in-memory fixtures where a table is needed:
@@ -47,7 +47,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `read-bytes`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
-`.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`,
+`.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
@@ -69,8 +69,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
-`.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.repl.disconnect`, `.log.open`, `.log.roll`,
-`.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
+`.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
+`.log.snapshot`, `.log.status`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
@@ -177,8 +177,8 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values, in their promoted type (null lowest) | `(min [3 9 1] [2 10 4])` → `[2 9 1]`, `(min 1 2.5)` → `1.0` |
 | `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values, in their promoted type (null lowest) | `(max [3 9 1] 5)` → `[5 9 5]`, `(max [2 0] true)` → `[2 1]` |
-| `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
-| `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
+| `first` | unary | — | First element of a vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `1` |
+| `last` | unary | — | Last element of a vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally, `(at v (- (count v) 1))` | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `2` |
 | `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
 | `mode` | unary | aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary | aggr | Population standard deviation | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
@@ -386,11 +386,11 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass; returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
-| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
+| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
-| `alter` | variadic | special | Amend a global binding in place and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector, `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The target must be a global binding; a name bound by `let` or a parameter of the enclosing function raises `domain` | `(alter 'v set 0 99)` |
+| `alter` | variadic | special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector (for a dict, `idx` is a key or a vector of keys: an existing key is replaced, a missing one is added), `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
 | `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
 
 ```lisp
@@ -475,7 +475,7 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
-| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key | `(insert 't 2024.01.16 rows)` |
+| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
 | `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
@@ -745,16 +745,17 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 
 ## IPC (Inter-Process Communication) { #ipc }
 
-TCP-based IPC for connecting to remote Rayforce instances. Uses binary serialization on the wire.
+IPC for connecting to remote Rayforce instances. Uses binary serialization on the wire; a connection opens over TCP and moves to shared memory (one host) or RDMA (two hosts with devices) when both sides can — see [Transports](../storage/ipc.md#transports).
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.ipc.open` | variadic | restricted | Open TCP connection to host:port (optional connect timeout in ms), returns handle | `(.ipc.open "localhost:5000" 2000)` |
+| `.ipc.open` | variadic | restricted | Open a connection to host:port (optional connect timeout in ms, or an options dict with `timeout`, `compress`, `keepalive`, `transport`), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
 | `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
-| `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside; given a live connection handle, that connection's view (`inbound`, `limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes`) | `(.ipc.handle)`, `(.ipc.handle h)` |
+| `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside; given a live connection handle, that connection's view (`inbound`, `transport`, `limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes`) | `(.ipc.handle)`, `(.ipc.handle h)` |
 | `.ipc.auto_journal_eval` | variadic | — | `true` while evaluating inside an auto-journaled IPC request (the request itself is the journal entry and `.log.write` refuses), `false` otherwise | `(if (.ipc.auto_journal_eval) null (.log.write x))` |
 | `.ipc.txlimit` | variadic | restricted | Transmit backlog policy: `()` reads the process default, `(bytes [frames])` sets it, `(h bytes frames)` overrides one connection; a frame that would exceed a connection's limit is refused and a multicast subscriber is dropped and closed | `(.ipc.txlimit 8388608 64)` |
+| `.ipc.transport` | variadic | restricted | Transport policy: `()` reads it, `('auto|'tcp|'shm|'rdma)` sets what this process offers as a server and asks for as a client (`auto`: shared memory on one host, RDMA across hosts, else TCP) | `(.ipc.transport 'tcp)` |
 | `.ipc.on.open` | hook | user-settable | Fires after inbound connection completes handshake; arg = handle | `(set .ipc.on.open (fn [h] ...))` |
 | `.ipc.on.close` | hook | user-settable | Fires once before an established connection is torn down, inbound or outbound, on any cause; arg = handle | `(set .ipc.on.close (fn [h] ...))` |
 | `.ipc.on.sync` | hook | user-settable | Intercepts sync messages; return value becomes the response | `(set .ipc.on.sync (fn [m] (eval (parse m))))` |
@@ -791,6 +792,14 @@ Built-in Entity-Attribute-Value store. The EAV table has three columns: `e` (ent
 (pull db 1)                  ; {name:100 age:30}
 (scan-eav db 'name)         ; table of (e, v) where a=name
 ```
+
+## Journal { #journal }
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `.log.replay` | unary | restricted | Replay and return processed entries, **including** evaluation errors; warns and continues, no rollback | `(.log.replay "journal.log")` |
+| `.log.replay_report` | unary | restricted | Replay **once** and return I64 `entries` / `eval_errors` on a clean tail; terminal errors still raise and may leave an applied prefix. Not a previous-call status getter, fail-fast mode, or invariant/rollback guarantee | `(.log.replay_report "journal.log")` |
+| `.log.status` | variadic | — | Journal state as a dict of six fields: `open` (handle present), `opened_ok` (a journal was opened successfully at least once), `path`, `mode` (`sync`/`async`; both null if never opened successfully), `bytes` (nullable: null if the size probe failed), `auto` (inside an auto-journaled request); raises only on allocation/intern failure | `(if (get (.log.status) 'open) null (exit 1))` |
 
 ## Datalog
 

@@ -610,6 +610,7 @@ ray_t* ray_env_resolve(int64_t sym_id) {
 }
 
 static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee);
+RAY_INLINE ray_t* env_walk_path(ray_t* v, const int64_t* segs, int n);
 ray_t* ray_env_resolve_rows(int64_t sym_id, uint8_t* rows) {
     return env_resolve_impl(sym_id, rows, false);
 }
@@ -676,10 +677,18 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     int n = ray_sym_segs(sym_id, &segs);
     if (n < 2) return NULL;
 
+    return env_walk_path(env_lookup_flat_impl(segs[0], rows, in_callee), segs, n);
+}
+
+/* The dotted walk below a resolved head `v` (borrowed): segs[1..n-1] as
+ * linked-column derefs, container probes or unary accessors, in that
+ * order.  An owned result, NULL when a segment names nothing, or the error
+ * a column load raised.  Inlined: as a call of its own it cost a resolve
+ * of a global dotted name about 4% in a loop of such reads. */
+RAY_INLINE ray_t* env_walk_path(ray_t* v, const int64_t* segs, int n) {
     /* `v` is either a borrowed env/container pointer (fresh=false) or a
      * fresh temporal-extract result (fresh=true).  When switching between
      * the two we must release the previous fresh value to avoid leaks. */
-    ray_t* v = env_lookup_flat_impl(segs[0], rows, in_callee);
     bool   fresh = false;
 
     for (int i = 1; v && i < n; i++) {
@@ -763,6 +772,16 @@ static ray_t* env_resolve_impl(int64_t sym_id, uint8_t* rows, bool in_callee) {
     if (!v) return NULL;
     if (!fresh) ray_retain(v);   /* hand back an owned ref */
     return v;
+}
+
+/* A dotted name read below an already loaded head (compiled code that holds
+ * the head in a local slot): the walk ray_env_resolve applies past the
+ * head.  An owned result, NULL when undefined, or an error. */
+ray_t* ray_env_path_get(ray_t* head, int64_t sym_id) {
+    const int64_t* segs;
+    int n = ray_sym_segs(sym_id, &segs);
+    if (n < 2 || !head) return NULL;
+    return env_walk_path(head, segs, n);
 }
 
 /* Flat-binding helpers: mutate a specific scope (global or top frame) by
@@ -973,7 +992,8 @@ static bool env_global_is_builtin_registration(int64_t sym_id) {
  * dict_upsert.  Auto-creates missing intermediates as empty dicts. */
 static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
                                 ray_t* (*base_lookup)(int64_t),
-                                ray_err_t (*bind_fn)(int64_t, ray_t*)) {
+                                ray_err_t (*bind_fn)(int64_t, ray_t*),
+                                int32_t scope) {
     const int64_t* segs;
     int n = ray_sym_segs(sym_id, &segs);
     if (n < 2) return RAY_ERR_TYPE;   /* dotted flag without segments */
@@ -982,20 +1002,27 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
      * each level's dict pointer (borrowed) so we can rebuild upward.  Any
      * non-dict intermediate is an error. */
     ray_t* parents[256];
-    parents[0] = base_lookup(segs[0]);
-    /* A builtin registration is not a value the user bound: a plain
-     * (set rc 7) shadows it, so (set rc.x 1) creates the namespace the same
-     * way instead of failing on the function it would shadow.  Only an
-     * untouched registration counts: a function the user bound themselves
-     * ((set held count), (set rc count)) is a user binding like any other
-     * non-dict value and stays refused, and so does any local binding, since
-     * a local frame holds no registrations. */
-    /* Value kind first: a DICT head (every ordinary namespace update) can
-     * never be a registration, so it skips the lock and slot lookup. */
-    if (parents[0] && parents[0]->type != RAY_DICT &&
-        base_lookup == ray_env_get_global &&
-        env_global_is_builtin_registration(segs[0]))
-        parents[0] = NULL;
+    parents[0] = NULL;
+    if (scope >= 0) {
+        ray_scope_frame_t* f = &__VM->scope_stack[scope];
+        for (int32_t i = 0; i < f->count; i++)
+            if (f->keys[i] == segs[0]) { parents[0] = f->vals[i]; break; }
+    } else {
+        parents[0] = base_lookup(segs[0]);
+        /* A builtin registration is not a value the user bound: a plain
+         * (set rc 7) shadows it, so (set rc.x 1) creates the namespace the same
+         * way instead of failing on the function it would shadow.  Only an
+         * untouched registration counts: a function the user bound themselves
+         * ((set held count), (set rc count)) is a user binding like any other
+         * non-dict value and stays refused, and so does any local binding, since
+         * a local frame holds no registrations. */
+        /* Value kind first: a DICT head (every ordinary namespace update) can
+         * never be a registration, so it skips the lock and slot lookup. */
+        if (parents[0] && parents[0]->type != RAY_DICT &&
+            base_lookup == ray_env_get_global &&
+            env_global_is_builtin_registration(segs[0]))
+            parents[0] = NULL;
+    }
     if (parents[0] && parents[0]->type != RAY_DICT)
         return RAY_ERR_TYPE;
 
@@ -1086,7 +1113,9 @@ static ray_err_t env_set_dotted(int64_t sym_id, ray_t* val,
     if (deleting && cur && cur->type == RAY_DICT && ray_dict_len(cur) == 0) {
         to_bind = NULL;
     }
-    ray_err_t err = bind_fn(segs[0], to_bind);
+    ray_err_t err = scope >= 0
+        ? env_frame_bind(&__VM->scope_stack[scope], segs[0], to_bind)
+        : bind_fn(segs[0], to_bind);
     if (cur) ray_release(cur);
     return err;
 }
@@ -1147,7 +1176,7 @@ bool ray_sym_is_reserved(int64_t sym_id) {
 
 ray_err_t ray_env_bind(int64_t sym_id, ray_t* val) {
     if (ray_sym_is_dotted(sym_id)) {
-        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global);
+        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global, -1);
     }
     return env_bind_global(sym_id, val);
 }
@@ -1167,8 +1196,151 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
      * flip, env_bind_global would also be reached via ray_env_bind below
      * and the slot would carry user=0 — leaving it out of <base>.qdb. */
     if (ray_sym_is_dotted(sym_id))
-        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global_user);
+        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global_user, -1);
     return env_bind_global_user(sym_id, val);
+}
+
+/* Resolve like a read, but never turn query columns or dotted accessors into
+ * writable globals. A call boundary hides its caller's locals. */
+static ray_err_t target_flat(int64_t name, bool via_callee, int32_t* scope, ray_t** value) {
+    bool in_callee = false;
+    int32_t d = __VM ? __VM->scope_depth - 1 : -1;
+    if (via_callee) {
+        /* Past the frames of the function making the call: down to and
+         * including the one that bounds it. */
+        while (d >= 0) {
+            bool bound = __VM->scope_stack[d].lexical;
+            d--;
+            if (bound) break;
+        }
+        in_callee = true;
+    }
+    for (; d >= 0; d--) {
+        ray_scope_frame_t* f = &__VM->scope_stack[d];
+        if (f->lexical) in_callee = true;
+        if (f->eval_window && in_callee) continue;
+        for (int32_t i = 0; i < f->count; i++) {
+            if (f->keys[i] != name) continue;
+            if (f->kind == RAY_SCOPE_QUERY ||
+                (f->kind == RAY_SCOPE_CALL && f->table && i >= f->table_from))
+                return RAY_ERR_DOMAIN;
+            *scope = d;
+            *value = f->vals[i];
+            return *value ? RAY_OK : RAY_ERR_NAME;
+        }
+        if (f->eval_window) in_callee = true;
+        if (f->kind == RAY_SCOPE_CALL) {
+            /* A source column that has not yet been cached is still not a
+             * global target. Probe names only, without loading the column. */
+            if (f->table) for (int64_t c = 0; c < ray_table_ncols(f->table); c++)
+                if (ray_table_col_name(f->table, c) == name) return RAY_ERR_DOMAIN;
+            break;
+        }
+    }
+    *scope = -1;
+    *value = env_global_lookup(name);
+    return *value ? RAY_OK : RAY_ERR_NAME;
+}
+
+static ray_t* target_root(const ray_env_target_t* target) {
+    if (target->scope < 0) return env_global_lookup(target->root);
+    if (!__VM || target->scope >= __VM->scope_depth) return NULL;
+    ray_scope_frame_t* f = &__VM->scope_stack[target->scope];
+    for (int32_t i = 0; i < f->count; i++)
+        if (f->keys[i] == target->root) return f->vals[i];
+    return NULL;
+}
+
+static _Thread_local bool g_mutator_callee;
+void ray_env_mutator_callee_arm(void) { g_mutator_callee = true; }
+bool ray_env_mutator_callee_take(void) {
+    bool armed = g_mutator_callee;
+    g_mutator_callee = false;
+    return armed;
+}
+
+ray_err_t ray_env_target_resolve(int64_t name, ray_env_target_t* target,
+                                 ray_t** value) {
+    return ray_env_target_resolve_via(name, false, target, value);
+}
+
+ray_err_t ray_env_target_resolve_via(int64_t name, bool via_callee,
+                                     ray_env_target_t* target, ray_t** value) {
+    *target = (ray_env_target_t){ .name = name, .root = name, .scope = -1 };
+    *value = NULL;
+    if (ray_sym_is_reserved(name) && !ray_sym_is_ipc_hook(name))
+        return RAY_ERR_RESERVED;
+    ray_err_t err = target_flat(name, via_callee, &target->scope, value);
+    if (err != RAY_ERR_NAME || !ray_sym_is_dotted(name)) return err;
+    const int64_t* segs;
+    int n = ray_sym_segs(name, &segs);
+    if (n < 2) return RAY_ERR_NAME;
+    target->root = segs[0];
+    target->dotted = true;
+    err = target_flat(target->root, via_callee, &target->scope, value);
+    if (err != RAY_OK) return err;
+    for (int i = 1; i < n; i++) {
+        if ((*value)->type != RAY_DICT) return RAY_ERR_TYPE;
+        *value = ray_dict_probe_sym_borrowed(*value, segs[i]);
+        if (!*value) return RAY_ERR_NAME;
+    }
+    return RAY_OK;
+}
+
+static int target_mirror(const ray_env_target_t* target, ray_t* root) {
+    if (target->scope < 0) return -1;
+    ray_scope_frame_t* f = &__VM->scope_stack[target->scope];
+    for (int32_t i = f->slot_count - 1; i >= 0; i--)
+        if (f->slot_names[i] == target->root)
+            return f->slot_values[i] == root ? i : -1;
+    return -1;
+}
+
+ray_err_t ray_env_target_set(const ray_env_target_t* target, ray_t* value) {
+    if (target->scope < 0) return ray_env_set(target->name, value);
+    if (!__VM || target->scope >= __VM->scope_depth) return RAY_ERR_NAME;
+    ray_err_t err = target->dotted
+        ? env_set_dotted(target->name, value, NULL, NULL, target->scope)
+        : env_frame_bind(&__VM->scope_stack[target->scope], target->root, value);
+    if (err != RAY_OK) return err;
+    /* Publish to the VM slot now too: a later exception may skip SCOPE_END. */
+    ray_scope_frame_t* f = &__VM->scope_stack[target->scope];
+    ray_t* root = target_root(target);
+    for (int32_t i = f->slot_count - 1; i >= 0; i--) {
+        if (f->slot_names[i] != target->root) continue;
+        if (f->slot_values[i] != root) {
+            ray_retain(root);
+            ray_release(f->slot_values[i]);
+            f->slot_values[i] = root;
+        }
+        if (f->slot_rows) f->slot_rows[i] = 2;
+        break;
+    }
+    return RAY_OK;
+}
+
+static bool target_writable(ray_t* v, uint32_t refs) {
+    return v && !RAY_IS_ERR(v) && ray_atomic_load(&v->rc) == refs &&
+           v->mmod == 0 && !(v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+}
+
+bool ray_env_target_sole(const ray_env_target_t* target, ray_t* value,
+                          uint32_t refs) {
+    ray_t* root = target_root(target);
+    uint32_t mirror = target_mirror(target, root) >= 0 ? 1 : 0;
+    if (!target->dotted)
+        return root == value && target_writable(value, 1 + mirror + refs);
+    const int64_t* segs;
+    int n = ray_sym_segs(target->name, &segs);
+    ray_t* v = root;
+    for (int i = 1; i < n; i++) {
+        if (!v || v->type != RAY_DICT ||
+            !target_writable(v, i == 1 ? 1 + mirror : 1)) return false;
+        ray_t* vals = ray_dict_slots(v)[1];
+        if (!vals || vals->type != RAY_LIST || !target_writable(vals, 1)) return false;
+        v = ray_dict_probe_sym_borrowed(v, segs[i]);
+    }
+    return v == value && target_writable(value, 1 + refs);
 }
 
 static ray_err_t env_push_scope(uint8_t kind) {
@@ -1181,6 +1353,10 @@ static ray_err_t env_push_scope(uint8_t kind) {
     f->kind = kind;
     f->lexical = 0;
     f->eval_window = 0;
+    f->slot_values = NULL;
+    f->slot_names = NULL;
+    f->slot_rows = NULL;
+    f->slot_count = 0;
     f->rows = f->rows_inline;
     f->named = 0;
     f->table = NULL;
@@ -1267,7 +1443,7 @@ void ray_env_mark_eval_window(void) {
  * let-locals whose initializer hasn't executed yet: in the tree walker
  * they wouldn't be bound at this point either, so they're skipped. */
 ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
-                             const uint8_t* rows, ray_t* self_obj) {
+                             uint8_t* rows, ray_t* self_obj) {
     ray_err_t err = ray_env_push_scope();
     if (err != RAY_OK) return err;
     if (self_obj) {
@@ -1283,6 +1459,11 @@ ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
             return e;
         }
     }
+    ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
+    f->slot_values = slots;
+    f->slot_names = syms;
+    f->slot_rows = rows;
+    f->slot_count = n;
     return RAY_OK;
 }
 
@@ -1412,7 +1593,7 @@ ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val) {
         return RAY_ERR_RESERVED;
     if (__VM->scope_depth <= 0) return ray_env_set(sym_id, val);
     if (ray_sym_is_dotted(sym_id)) {
-        return env_set_dotted(sym_id, val, lookup_top_frame, env_bind_local);
+        return env_set_dotted(sym_id, val, lookup_top_frame, env_bind_local, -1);
     }
     return env_bind_local(sym_id, val);
 }

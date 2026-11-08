@@ -56,26 +56,6 @@ bool ray_enc_has_bitmap(int8_t type) {
     }
 }
 
-int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k) {
-    if (k.T == 64) return (int64_t)bits;
-    uint64_t m = tmask(k.T);
-    bits &= m;
-    if (k.is_signed && (bits >> (k.T - 1)) & 1) return (int64_t)(bits | ~m);
-    return (int64_t)bits;
-}
-
-bool ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k) {
-    if (k.is_float) {                    /* dictionary order (spec "Comparison semantics") */
-        double x = ray_enc_fval(a, k.T), y = ray_enc_fval(b, k.T);
-        if (x < y) return true;
-        if (x > y) return false;
-        return ((a >> (k.T - 1)) & 1) && !((b >> (k.T - 1)) & 1);   /* -0.0 before +0.0 */
-    }
-    if (k.is_signed) return ray_enc_logical(a, k) < ray_enc_logical(b, k);
-    uint64_t m = tmask(k.T);
-    return (a & m) < (b & m);
-}
-
 bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
                   int64_t start, int n, ray_enc_input_t* in) {
     if (n < 0 || n > RAY_ENC_VEC) return false;
@@ -117,13 +97,30 @@ bool ray_enc_load(const void* data, int8_t type, uint8_t attrs,
     return true;
 }
 
+/* The extrema are taken on ray_enc_okey keys, which map the T-bit patterns
+ * one to one, so a key names its pattern back. */
 void ray_enc_stats(const uint64_t* v, int n, ray_enc_kind_t k, ray_enc_stats_t* s) {
-    s->min = s->max = n ? v[0] : 0;
-    s->runs = n ? 1 : 0;
-    for (int i = 1; i < n; i++) {
-        if (ray_enc_lt(v[i], s->min, k)) s->min = v[i];
-        if (ray_enc_lt(s->max, v[i], k)) s->max = v[i];
-        if (v[i] != v[i - 1]) s->runs++;
+    if (n <= 0) { s->min = s->max = 0; s->runs = 0; s->all_equal = true; return; }
+    const uint64_t m = tmask(k.T), sb = 1ull << (k.T - 1);
+    uint64_t kmn = ray_enc_okey(v[0], k), kmx = kmn;
+    int runs = 1;
+    if (k.is_float) {
+        for (int i = 1; i < n; i++) {
+            uint64_t x = ray_enc_okey(v[i], k);
+            kmn = x < kmn ? x : kmn; kmx = x > kmx ? x : kmx;
+            runs += v[i] != v[i - 1];
+        }
+        s->min = kmn ^ ((kmn & sb) ? sb : m);
+        s->max = kmx ^ ((kmx & sb) ? sb : m);
+    } else {
+        const uint64_t flip = k.is_signed ? sb : 0;
+        for (int i = 1; i < n; i++) {
+            uint64_t x = (v[i] & m) ^ flip;
+            kmn = x < kmn ? x : kmn; kmx = x > kmx ? x : kmx;
+            runs += v[i] != v[i - 1];
+        }
+        s->min = kmn ^ flip; s->max = kmx ^ flip;
     }
-    s->all_equal = s->runs <= 1;
+    s->runs = runs;
+    s->all_equal = runs <= 1;
 }

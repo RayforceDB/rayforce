@@ -136,15 +136,154 @@ void ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel, int64_t size)
     sel->rx.buf = ray_poll_buf_new(size);
 }
 
+/* ===== The connection's byte stream: transport or socket ===== */
+
+int64_t ray_poll_sel_recv(ray_selector_t* sel, uint8_t* buf, int64_t len)
+{
+    if (sel->xport && !sel->rx_on_sock) {
+        int64_t n = sel->xport->ops->read(sel->xport, buf, len);
+        if (n < 0) { errno = ECONNRESET; return -1; }
+        if (n == 0) { errno = EAGAIN; return -1; }
+        return n;
+    }
+    if (!sel->rx.recv_fn) { errno = EAGAIN; return -1; }
+    return sel->rx.recv_fn(sel->fd, buf, len);
+}
+
+int64_t ray_poll_sel_send(ray_selector_t* sel, const uint8_t* buf, int64_t len)
+{
+    if (sel->xport) {
+        int64_t n = sel->xport->ops->write(sel->xport, buf, len, false);
+        if (n < 0) { errno = EPIPE; return -1; }
+        if (n == 0) { errno = EAGAIN; return -1; }
+        return n;
+    }
+    if (!sel->tx.send_fn) { errno = EPIPE; return -1; }
+    return sel->tx.send_fn(sel->fd, (uint8_t*)buf, len);
+}
+
+static void sel_fail(ray_poll_t* poll, ray_selector_t* sel)
+{
+    if (sel->error_fn) sel->error_fn(poll, sel);
+    else ray_poll_deregister(poll, sel->id);
+}
+
+int ray_poll_serve_rx(ray_poll_t* poll, int64_t id)
+{
+    /* Loop: read data → call read_fn → if state advanced, read more.
+     * Handles multi-phase protocols (handshake → header → payload)
+     * arriving in a single wakeup. */
+    for (;;) {
+        ray_selector_t* sel = ray_poll_get(poll, id);
+        if (!sel) return -1;
+        if (sel->rx.buf && (sel->rx.recv_fn || sel->xport)) {
+            while (sel->rx.buf->offset < sel->rx.buf->size) {
+                int64_t nr = ray_poll_sel_recv(sel,
+                                               sel->rx.buf->data + sel->rx.buf->offset,
+                                               sel->rx.buf->size - sel->rx.buf->offset);
+                if (nr <= 0) {
+                    if (nr < 0 && errno == EINTR) continue;
+                    if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                        break;
+                    /* Error or peer closed mid-read */
+                    sel_fail(poll, sel);
+                    return -1;
+                }
+                sel->rx.buf->offset += nr;
+            }
+        }
+
+        /* Not enough data for the current phase */
+        if (sel->rx.buf && sel->rx.buf->offset < sel->rx.buf->size)
+            return 0;
+
+        /* Call read_fn — may advance state and request a new buffer */
+        if (!sel->rx.read_fn) return 0;
+        ray_t* obj = sel->rx.read_fn(poll, sel);
+
+        /* Re-validate: read_fn may have deregistered this selector */
+        sel = ray_poll_get(poll, id);
+        if (!sel) return -1;
+
+        if (obj && sel->data_fn)
+            sel->data_fn(poll, sel, obj);
+
+        /* If data_fn deregistered the selector, stop */
+        sel = ray_poll_get(poll, id);
+        if (!sel) return -1;
+
+        /* No rx buffer (state machine done or not set): stop */
+        if (!sel->rx.buf) return 0;
+        /* The buffer already holds enough for the next phase: loop; else
+         * try reading more (may EAGAIN → done for now). */
+    }
+}
+
+int ray_poll_serve_tx(ray_poll_t* poll, int64_t id)
+{
+    ray_selector_t* sel = ray_poll_get(poll, id);
+    if (!sel) return -1;
+    if (ray_poll_tx_flush(poll, sel) < 0) {
+        sel = ray_poll_get(poll, id);
+        if (sel) sel_fail(poll, sel);
+        return -1;
+    }
+    return 0;
+}
+
+/* The event_fd of a transport became readable: bytes landed or ring
+ * space came back.  Serve the connection it belongs to both ways. */
+static ray_t* xport_wake(ray_poll_t* poll, ray_selector_t* sel)
+{
+    int64_t id = (int64_t)(intptr_t)sel->data;
+    ray_selector_t* conn = ray_poll_get(poll, id);
+    if (!conn || !conn->xport) return NULL;
+    conn->xport->ops->woke(conn->xport);
+    if (conn->tx.buf && ray_poll_serve_tx(poll, id) < 0) return NULL;
+    ray_poll_serve_rx(poll, id);
+    return NULL;
+}
+
+int ray_poll_xport_attach(ray_poll_t* poll, ray_selector_t* sel, ray_xport_t* xport)
+{
+    if (!poll || !sel || !xport || sel->xport) return -1;
+    ray_poll_reg_t reg = {0};
+    reg.fd      = xport->event_fd;
+    reg.type    = RAY_SEL_XPORT;
+    reg.read_fn = xport_wake;
+    reg.data    = (void*)(intptr_t)sel->id;
+    int64_t id = ray_poll_register(poll, &reg);
+    if (id < 0) return -1;
+    sel->xport      = xport;
+    sel->xport_id   = id;
+    sel->rx_on_sock = false;
+    poll->n_xport++;
+    /* The socket's write readiness means nothing now: room is announced
+     * through event_fd.  Re-derive its interest set (drops EPOLLOUT). */
+    ray_poll_tx_cancel(poll, sel);
+    return 0;
+}
+
+/* Called by a backend's deregister: the transport and its wake selector
+ * go with the connection. */
+void ray_poll_xport_detach(ray_poll_t* poll, ray_selector_t* sel)
+{
+    if (!sel->xport) return;
+    ray_xport_t* x = sel->xport;
+    sel->xport = NULL;
+    if (poll->n_xport > 0) poll->n_xport--;
+    ray_poll_deregister(poll, sel->xport_id);
+    x->ops->destroy(x);
+}
+
 int ray_poll_tx_flush(ray_poll_t* poll, ray_selector_t* sel)
 {
-    if (!poll || !sel || !sel->tx.send_fn) return -1;
+    if (!poll || !sel || (!sel->tx.send_fn && !sel->xport)) return -1;
 
     while (sel->tx.buf) {
         ray_poll_buf_t* buf = sel->tx.buf;
         while (buf->offset < buf->size) {
-            int64_t nw = sel->tx.send_fn(
-                sel->fd,
+            int64_t nw = ray_poll_sel_send(sel,
                 buf->data + buf->offset,
                 buf->size - buf->offset);
             if (nw < 0) {
