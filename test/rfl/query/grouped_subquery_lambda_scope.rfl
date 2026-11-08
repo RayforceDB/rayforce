@@ -5,3 +5,11 @@
 (select {m: (sum (f a)) from: T}) -- (table [m] (list [231]))
 (select {m: (sum (f a)) from: (select {from: T by: [a c]})}) -- (table [m] (list [231]))
 (select {m: (sum (f a)) from: (select {from: T where: (> a 0) by: [a c]})}) -- (table [m] (list [231]))
+;; a lambda parameter or a global alias bound to a callable keeps every column
+(set g2 f)
+(select {m: (sum (g2 a)) from: (select {from: T by: [a c]})}) -- (table [m] (list [231]))
+((fn [h] (select {m: (sum (h a)) from: (select {from: T by: [a c]})})) f) -- (table [m] (list [231]))
+;; a bound non-callable value (parameter, global) is a plain filter operand
+((fn [t] (select {m: (sum a) from: (select {from: T by: [a c]}) where: (>= a t)})) 2) -- (table [m] (list [20]))
+(set thr 2)
+(select {m: (sum a) from: (select {from: T by: [a c]}) where: (>= a thr)}) -- (table [m] (list [20]))
