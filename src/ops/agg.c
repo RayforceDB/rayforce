@@ -869,26 +869,11 @@ ray_t* ray_avg_fn(ray_t* x) {
     return make_f64(sum / (double)cnt);
 }
 
-static ray_t* agg_f32_extreme(ray_t* x, bool want_max) {
-    const float* d = (const float*)ray_data(x);
-    bool found = false;
-    float best = 0.0f;
-    for (int64_t i = 0; i < x->len; i++) {
-        /* F32 nulls are NaNs.  Check the payload even when HAS_NULLS was
-         * lost so a leading null cannot pin the result at NaN. */
-        if (d[i] != d[i]) continue;
-        if (!found || (want_max ? d[i] > best : d[i] < best)) best = d[i];
-        found = true;
-    }
-    return found && isfinite(best) ? ray_f32(best) : ray_typed_null(-RAY_F32);
-}
-
 ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_MIN);
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 0);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
-        if (x->type == RAY_F32) return agg_f32_extreme(x, false);
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
             int64_t best = INT64_MAX;
@@ -908,6 +893,9 @@ ray_t* ray_min_fn(ray_t* x) {
                     double mn = INFINITY;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (mins[g] < mn) mn = mins[g];
+                    /* the F32 zone is held as doubles: answer at the column's width */
+                    if (x->type == RAY_F32)
+                        return mn == INFINITY ? ray_typed_null(-RAY_F32) : ray_f32(ray_f64_to_f32_fin(mn));
                     if (mn == INFINITY) return ray_typed_null(-RAY_F64);
                     return make_f64(mn);
                 } else {
@@ -960,7 +948,6 @@ ray_t* ray_max_fn(ray_t* x) {
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 1);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) {
-        if (x->type == RAY_F32) return agg_f32_extreme(x, true);
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
             int64_t best = -INT64_MAX;
@@ -977,6 +964,9 @@ ray_t* ray_max_fn(ray_t* x) {
                     double mx = -INFINITY;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (maxs[g] > mx) mx = maxs[g];
+                    /* the F32 zone is held as doubles: answer at the column's width */
+                    if (x->type == RAY_F32)
+                        return mx == -INFINITY ? ray_typed_null(-RAY_F32) : ray_f32(ray_f64_to_f32_fin(mx));
                     if (mx == -INFINITY) return ray_typed_null(-RAY_F64);
                     return make_f64(mx);
                 } else {

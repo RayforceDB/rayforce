@@ -183,6 +183,26 @@ static test_result_t test_f32_extrema_routes(void) {
     PASS();
 }
 
+/* A NaN payload whose HAS_NULLS bit was lost (a producer that skipped the
+ * flag) must not pin an extreme at NaN: the reduction kernel itself skips
+ * it, so no scalar shortcut is needed in front of the DAG. */
+static test_result_t test_f32_extrema_unflagged_nan(void) {
+    const int64_t n = 20000;
+    ray_t* v = ray_vec_new(RAY_F32, n); v->len = n;
+    float* d = ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = (float)((i * 37) % 1000) - 400.0f;
+    d[0] = NAN; d[7] = NAN;
+    TEST_ASSERT_FALSE(v->attrs & RAY_ATTR_HAS_NULLS);
+    ray_env_set(ray_sym_intern("f32unflagged", 12), v);
+    ray_release(v);
+    ray_t* mn = ray_eval_str("(min f32unflagged)");
+    ray_t* mx = ray_eval_str("(max f32unflagged)");
+    TEST_ASSERT_FMT(mn && mn->type == -RAY_F32 && mn->f64 == -400.0, "min: %s", mn ? "wrong value" : "null");
+    TEST_ASSERT_FMT(mx && mx->type == -RAY_F32 && mx->f64 == 599.0, "max: %s", mx ? "wrong value" : "null");
+    ray_release(mn); ray_release(mx);
+    PASS();
+}
+
 /* Same F32 and F64 inputs at a size where route 2 takes the radix finalizer
  * (radix_phase3_fn) and route 0 the v2 emitters: 400k rows, 100k groups.
  * Every F32 answer must be an F32 column holding the F64 answer narrowed,
@@ -4803,6 +4823,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
+    { "agg_contract/f32_extrema_unflagged_nan", test_f32_extrema_unflagged_nan, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_large_routes", test_f32_extrema_large_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
