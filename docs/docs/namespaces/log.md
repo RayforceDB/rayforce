@@ -1,6 +1,6 @@
 # `.log.*` — write-ahead log
 
-A binary append-only journal of serialised Rayfall expressions. The runtime keeps one journal open at a time. While open, every IPC mutation (and any value explicitly handed to `.log.write`) is appended; `replay` deserialises and re-evaluates each entry to reconstruct state. Files use the same 16-byte IPC header + serialized-payload frames as `.ipc.send`, with optional delta+RLE compression on large entries — the journal is interoperable with the wire format.
+A binary append-only journal of serialised Rayfall expressions. The runtime keeps one journal open at a time. While open, every IPC mutation (and any value explicitly handed to `.log.write`) is appended; `replay` deserialises and re-evaluates each entry to reconstruct state. Files use the same 16-byte IPC header + serialized-payload frames as `.ipc.send`, with optional delta+RLE compression on large entries — the journal is interoperable with the wire format, apart from one header flag that older servers ignore (see [`.log.replay`](#log-replay)).
 
 The journal is intentionally minimal: there's no per-entry timestamp or transaction grouping at the journal layer. Snapshot + replay is the only recovery model.
 
@@ -121,6 +121,9 @@ Errors are precise enough to distinguish recovery strategies:
 | `deser` | Frame intact but payload deserialisation failed — content/version skew. | Do **not** truncate; inspect and fix. |
 | `decompr` | Compressed-frame decompression failed. | Same as `deser`. |
 | `oom` / `io` | Resource exhaustion / read failure. | Retry. |
+
+!!! note "Older servers and flagged frames"
+    Frames that carry IPC request lists are written with header flag `0x10`, which records that a nested list headed by a symbol is data (see [IPC & Serialization](../storage/ipc.md#expression-payloads)). Servers older than the first release after v3.0.2 do not recognise the flag and replay such a frame under the old rule, so an entry can replay to a different stored value. Do not replay a journal that holds flagged frames on an older server.
 
 ```lisp
 (.log.replay "/tmp/rayforce-journal.log")

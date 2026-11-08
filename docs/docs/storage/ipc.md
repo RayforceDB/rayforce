@@ -197,14 +197,15 @@ head to call it can send the function value instead (for example,
 The rule a frame follows is recorded in the journal frame's own header, as the
 flag `0x10` (`RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS`). This is a journal-only marker:
 the live wire version is unchanged, so live peers are unaffected and only replay
-reads it. A server with this change replays each frame under the rule its header
-records, so a frame written by an earlier version — which carries no flag —
-still replays under the old rule, exactly as it always did. The marker only
-travels forward, though: a server from *before* this change does not recognise
-the flag, so when it replays a frame that a newer server wrote with the flag
-set, it applies the old rule and that entry can replay to a different stored
-value. Once a journal holds flagged frames, do not roll the server back below
-this change to replay them.
+reads it. Every release after v3.0.2 writes the flag and replays each frame
+under the rule its header records, so a frame written by an earlier version —
+which carries no flag — still replays under the old rule, exactly as it always
+did. The marker only travels forward, though: v3.0.2 and older servers do not
+recognise the flag, so when they replay a frame that a newer server wrote with
+the flag set, they apply the old rule and that entry can replay to a different
+stored value. Once a journal holds flagged frames, do not replay it on a server
+older than the first release that honours the flag (the first release after
+v3.0.2).
 
 For dynamic queries, substitute values into the dict at construction time:
 
