@@ -941,6 +941,22 @@ static bool quantile_literal_prob(ray_t* prob_expr, bool percentile,
     return true;
 }
 
+/* Keyless SELECT can carry a scalar probability bound in the caller's
+ * environment as well as a literal.  Match ordinary SELECT name resolution:
+ * a lexical parameter/let binding wins over a same-named source column, while
+ * a source column still wins over a global. */
+static bool quantile_keyless_prob(ray_t* prob_expr, ray_t* tbl,
+                                  bool percentile, double* out_q) {
+    if (quantile_literal_prob(prob_expr, percentile, out_q)) return true;
+    if (!prob_expr || prob_expr->type != -RAY_SYM ||
+        (prob_expr->attrs & ATTR_QUOTED)) return false;
+    ray_t* lexical = ray_env_get_lexical_local(prob_expr->i64);
+    if (lexical)
+        return quantile_literal_prob(lexical, percentile, out_q);
+    if (ray_table_slot(tbl, prob_expr->i64)) return false;
+    return quantile_literal_prob(ray_env_get(prob_expr->i64), percentile, out_q);
+}
+
 /* True when any GROUP BY key names a BOOL column of `tbl`.  A BOOL-keyed
  * group is emitted in key order (false before true) and query.c reorders the
  * finished result to first-occurrence AFTERWARDS, so a take must not be pushed
@@ -22399,7 +22415,7 @@ by_dict_done:
                         ray_binary_fn native = percentile ? ray_percentile_fn : ray_quantile_fn;
                         if (fn && fn->type == RAY_BINARY &&
                             (ray_binary_fn)(uintptr_t)fn->i64 == native &&
-                            quantile_literal_prob(agg_elems[2], percentile, &q)) {
+                            quantile_keyless_prob(agg_elems[2], tbl, percentile, &q)) {
                             agg_k[s_n_aggs] = encode_agg_f64_param(q);
                             s_has_param = 1;
                         }
@@ -27616,14 +27632,16 @@ ray_t* ray_insert_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_insert(ray_t** args, int64_t n) {
+    bool via_callee = ray_env_mutator_callee_take();   /* before anything else runs */
     if (n < 2) return ray_error("arity", "insert: expects a target and a value, got %lld args", (long long)n);
 
     /* In-place vs functional is decided by the EVALUATED first argument:
-     * a symbol value names a global to amend in place (returning that
+     * a symbol value names a binding to amend in place (returning that
      * symbol); a table/vec value is amended functionally (returning the
      * new value).  Evaluating first means it works however the symbol
      * arrives — literal 'sym, (quote sym), a variable, or a lambda param. */
     int64_t inplace_sym = -1;
+    ray_env_target_t target = {0};
     ray_t* tbl_raw = args[0];
     ray_t* tbl;
 
@@ -27637,11 +27655,13 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         tbl = ray_eval(tbl_raw);
         if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("type", "insert: target evaluation failed");
         if (tbl->type == -RAY_SYM) {
-            /* Symbol value → resolve the named global for in-place insert */
+            /* Resolve once: a local target must never publish into a global. */
             inplace_sym = tbl->i64;
             ray_release(tbl);
-            tbl = ray_env_get(inplace_sym);
-            if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "insert: target symbol is unbound");
+            ray_err_t err = ray_env_target_resolve_via(inplace_sym, via_callee, &target, &tbl);
+            if (err != RAY_OK)
+                return ray_error(err == RAY_ERR_NAME ? "domain" : ray_err_code_str(err),
+                                 "insert: cannot resolve target binding");
             ray_retain(tbl);
         }
     }
@@ -27817,9 +27837,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
             /* In-place amend stores the new value and returns the symbol. */
-            ray_env_set(inplace_sym, result);
+            ray_err_t err = ray_env_target_set(&target, result);
             ray_release(result);
-            return ray_sym(inplace_sym);
+            return err == RAY_OK ? ray_sym(inplace_sym)
+                : ray_error(ray_err_code_str(err), "insert: cannot publish target");
         }
         return result;
     }
@@ -27871,7 +27892,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
              * and surface dotted-path OOM/type failures instead of
              * falsely returning the target symbol as success. */
             ray_err_t bind_err = result == tbl ? RAY_OK
-                               : ray_env_set(inplace_sym, result);
+                               : ray_env_target_set(&target, result);
             ray_release(result);
             ray_release(tbl);
             if (bind_err != RAY_OK) {
@@ -28021,8 +28042,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
      * On a mid-batch failure the appended lengths are rolled back, so the
      * table keeps its pre-insert value; unlike the rebuild, already-grown
      * capacity and dropped accelerator indexes are not restored. */
-    bool inplace_ok = inplace_sym >= 0 && tbl->rc == 2 && tbl->mmod == 0 &&
-                      !(tbl->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+    bool inplace_ok = inplace_sym >= 0 && ray_env_target_sole(&target, tbl, 1);
     ray_t* live_cols = NULL;
     if (inplace_ok) {
         live_cols = ray_table_cols_inplace(tbl);         /* NULL: an encoded slot */
@@ -28340,9 +28360,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
     /* In-place: store the new table in the env and return the symbol. */
     if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
-        ray_env_set(inplace_sym, result);
+        ray_err_t err = ray_env_target_set(&target, result);
         ray_release(result);
-        return ray_sym(inplace_sym);
+        return err == RAY_OK ? ray_sym(inplace_sym)
+            : ray_error(ray_err_code_str(err), "insert: cannot publish target");
     }
     return result;
 }
@@ -28563,6 +28584,7 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
     for (int64_t k = 0; k < nk; k++) kci[k] = ix->u.ukey.kci[k];
     upsert_map_t map = { NULL, (int64_t*)ray_data(ix->u.ukey.slots), ix->u.ukey.mask };
     for (int64_t r = nrows0; r < n; r++)
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
     ix->u.ukey.nrows = n;
 }

@@ -50,6 +50,7 @@
 #include "core/platform.h"
 #include "core/pool.h"      /* ray_pool_default_total: the -c warning test */
 #include "core/runtime.h"
+#include "store/serde.h"   /* RAY_SERDE_WIRE_VERSION: the listen probe */
 #include "mem/sys.h"
 
 #include <stdio.h>
@@ -638,15 +639,16 @@ static int run_pty_with_input(const char* input, int use_poll)
         }
     }
 
-    /* Wait up to 5s for clean exit, draining master concurrently. */
+    /* Wait up to 5s for clean exit, draining master concurrently: all of
+     * it each round, so a child printing more than one read's worth never
+     * waits on a full pty for the next round. */
     int status = 0;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 500; i++) {
         char buf[4096];
-        ssize_t n = read(master_fd, buf, sizeof(buf));
-        (void)n;
+        while (read(master_fd, buf, sizeof(buf)) > 0) {}
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) goto done;
-        usleep(100 * 1000);
+        usleep(10 * 1000);
     }
     /* Timeout — kill child. */
     kill(pid, SIGKILL);
@@ -780,7 +782,11 @@ static test_result_t test_repl_pty_no_poll_ctrl_d(void) {
  * before it get typed, SIGINT fires, then the trailing :q\n quits. */
 static test_result_t test_repl_pty_sigint(void) {
 #ifndef RAY_OS_WINDOWS
-    int rc = run_pty_with_input("(garbage\x01:q\n", 1);
+    /* If the SIGINT does not clear the line, "(garbage:q" is still an
+     * open expression: ")" closes it (an error is printed) and the second
+     * :q quits, so the child exits instead of running into the helper's
+     * 5 s timeout.  If it does clear the line, the first :q quits. */
+    int rc = run_pty_with_input("(garbage\x01:q\n)\n:q\n", 1);
     TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
                     "unexpected child exit: %d", rc);
 #endif
@@ -1755,9 +1761,11 @@ static test_result_t test_repl_run_piped_listen_ok(void) {
  *   2. Redirects stdin to a pipe with ":listen PORT\n" + EOF.
  *   3. Calls ray_repl_run — enters run_piped (not run_interactive).
  *   4. After stdin EOF, run_piped checks n_sels > 0 → calls ray_poll_run.
- *   5. A SIGALRM after 1 s calls ray_poll_exit(poll,0) which unblocks
- *      epoll_wait and lets the child exit cleanly (exit(0) flushes
- *      llvm-cov profdata). */
+ *   5. A SIGALRM calls ray_poll_exit(poll,0) which unblocks epoll_wait
+ *      and lets the child exit cleanly (exit(0) flushes llvm-cov
+ *      profdata).  The parent sends it as soon as a handshake on PORT is
+ *      answered, which only the poll loop does; the child's alarm(2)
+ *      stays as the bound. */
 #ifndef RAY_OS_WINDOWS
 static int run_piped_with_poll_listen(void)
 {
@@ -1781,7 +1789,8 @@ static int run_piped_with_poll_listen(void)
         /* Wire poll to runtime so :listen can call ray_ipc_listen. */
         ray_runtime_set_poll(poll);
 
-        /* Install SIGALRM handler to exit poll after 1 second. */
+        /* SIGALRM exits the poll: from the parent once the loop answers,
+         * or after 2 s at the latest. */
         g_alarm_exit_poll = poll;
         signal(SIGALRM, alarm_poll_exit_handler);
         alarm(2);
@@ -1805,19 +1814,38 @@ static int run_piped_with_poll_listen(void)
     }
 
     /* Parent: write ":listen PORT\n" then close write end to signal EOF.
-     * Use an ephemeral port; no real client connects — we just need
-     * n_sels > 0 when stdin EOF fires. */
+     * The port is this test's own (19876 is the port system_branch_cov2.rfl
+     * expects nothing to listen on); all we need is n_sels > 0 when stdin
+     * EOF fires. */
     close(pfd[0]);
     usleep(50 * 1000);  /* let child start up */
-    const char* cmd = ":listen 19876\n";
+    const char* cmd = ":listen 19864\n";
     if (write(pfd[1], cmd, strlen(cmd)) < 0) { /* tolerate error */ }
     close(pfd[1]);  /* EOF triggers fgets null → stdin done */
 
+    /* The kernel accepts once the listener exists, before stdin's EOF; a
+     * handshake is answered only from inside ray_poll_run.  Once it is,
+     * end the loop now instead of at the child's 2 s alarm. */
     int status = 0;
-    for (int i = 0; i < 40; i++) {
+    bool signalled = false;
+    for (int i = 0; i < 400; i++) {
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) goto done_piped_poll;
-        usleep(100 * 1000);
+        if (!signalled) {
+            ray_sock_t s = ray_sock_connect("127.0.0.1", 19864, 100);
+            if (s != RAY_INVALID_SOCK) {
+                struct timeval tv = { 0, 100 * 1000 };
+                setsockopt((int)s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                const uint8_t hs[2] = { RAY_SERDE_WIRE_VERSION, 0 };
+                uint8_t ans;
+                if (send((int)s, hs, 2, 0) == 2 && recv((int)s, &ans, 1, 0) == 1) {
+                    kill(pid, SIGALRM);
+                    signalled = true;
+                }
+                ray_sock_close(s);
+            }
+        }
+        usleep(10 * 1000);
     }
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
@@ -1882,14 +1910,16 @@ static int run_pty_with_env_and_input(const char* input, int use_poll,
         }
     }
 
+    /* Up to 5s, draining all the master holds each round: the pivot's
+     * printout is many reads' worth, and a child blocked on a full pty
+     * would otherwise wait 100 ms per 4 KB. */
     int status = 0;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 500; i++) {
         char buf[4096];
-        ssize_t n = read(master_fd, buf, sizeof(buf));
-        (void)n;
+        while (read(master_fd, buf, sizeof(buf)) > 0) {}
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) goto done_env;
-        usleep(100 * 1000);
+        usleep(10 * 1000);
     }
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);

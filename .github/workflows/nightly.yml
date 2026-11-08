@@ -19,7 +19,7 @@ jobs:
       - name: Build (debug + ASan)
         run: make debug
       - name: Build test binary
-        run: make test TEST_CORES=4 || true   # builds rayforce.test; run below with knobs
+        run: make test-full-bin   # ASan rayforce.test; run below with knobs
       - name: Deep randomized stress
         run: |
           # 10 date-derived seeds, 50k ops each, printed for reproduction.

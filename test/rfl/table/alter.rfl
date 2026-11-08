@@ -69,11 +69,11 @@ FF -- [1 2 3 4 5]
 DA.x -- [99 1 2]
 DB.x -- [0 1 2]
 
-;; a table head is the same resolution, and keeps its previous behaviour:
-;; env_set_dotted refuses it, so the amend is discarded rather than applied
+;; A table-column target is not a writable dictionary path. Report the
+;; unsupported target rather than silently discarding a publication error.
 (set TA (table [c] (list (til 3))))
 (set TB TA)
-(alter 'TA.c set 0 77)
+(alter 'TA.c set 0 77) !- type
 (at TA 'c) -- [0 1 2]
 (at TB 'c) -- [0 1 2]
 

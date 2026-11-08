@@ -312,6 +312,7 @@ void ray_enc_alp_train(const uint64_t* bits, int64_t n, int T, ray_enc_alp_cands
         int ns = 0;
         for (int i = 0; i < vn; i += 32) smp[ns++] = bits[s + i];
         int e, f, exc;
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         alp_best_ef(smp, ns, T, &e, &f, &exc);
         if (exc < ns) count[e][f]++;
     }

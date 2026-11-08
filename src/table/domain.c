@@ -280,6 +280,7 @@ struct ray_sym_domain_s {
      * file at that point (cache-hit revalidation key). */
     int64_t   disk_count;
     size_t    disk_size;
+    ray_file_id_t disk_id; /* identity of the last persisted image, not map */
 
     /* FILE: published vocabulary — (atoms, count) pair.  atoms[i] is the
      * string atom for position i (borrowed by callers), LAZILY materialized
@@ -1442,6 +1443,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             dom_blk_t* old_blk = d->blk;
             d->blk = nb;
             d->map_id = nid;
+            d->disk_id = nid;
             nb = NULL;
             d->ix_used = from_ix;
             d->ix_count = from_ix ? nhx.count : 0;
@@ -1515,7 +1517,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 
     /* Failure, or nothing actually new (size-only change): drop the fresh
      * table and the new mapping; keep the existing image. */
-    if (ok && fresh_count == count) d->disk_size = st_size;
+    if (ok && fresh_count == count) { d->disk_size = st_size; d->disk_id = nid; }
     ray_sys_free(nb);
     if (nixm) ray_vm_unmap_file(nixm, nixs);
     ray_vm_unmap_file(map, map_size);
@@ -1609,6 +1611,36 @@ static void dom_preload_release(ray_sym_domain_t* d) {
     d->preloaded = 0;
 }
 
+/* A flush may replace the file while the domain keeps an older mapping.
+ * Track the persisted file separately so cache-hit validation compares the
+ * path against the last successful write, not against that old mapping. */
+static ray_file_id_t dom_stat_id(const struct stat* st) {
+    ray_file_id_t id = {0};
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    if (st) {
+        id.valid = true;
+        id.ino = (uint64_t)st->st_ino;
+        id.size = (uint64_t)st->st_size;
+#if defined(RAY_OS_MACOS)
+        id.mtime_ns = (int64_t)st->st_mtimespec.tv_sec * 1000000000 + st->st_mtimespec.tv_nsec;
+        id.ctime_ns = (int64_t)st->st_ctimespec.tv_sec * 1000000000 + st->st_ctimespec.tv_nsec;
+#else
+        id.mtime_ns = (int64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec;
+        id.ctime_ns = (int64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec;
+#endif
+    }
+#else
+    (void)st;
+#endif
+    return id;
+}
+
+static bool dom_file_id_changed(const ray_file_id_t* old, const ray_file_id_t* now) {
+    return old->valid && now->valid &&
+           (old->ino != now->ino || old->size != now->size ||
+            old->mtime_ns != now->mtime_ns || old->ctime_ns != now->ctime_ns);
+}
+
 static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!path) return NULL;
 
@@ -1631,8 +1663,14 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
             /* Revalidate: external append-only growth extends in place;
              * any other divergence is loud (NULL). */
             size_t cur_size = exists ? (size_t)st.st_size : 0;
-            if (cur_size != d->disk_size &&
-                !dom_extend_from_file_locked(d, cur_size)) {
+            ray_file_id_t current_id = dom_stat_id(exists ? &st : NULL);
+            /* A same-size replacement has no appended records to adopt.
+             * Its old ids may now name different strings: fail loudly. */
+            bool replaced_same_size = cur_size == d->disk_size &&
+                                      dom_file_id_changed(&d->disk_id, &current_id);
+            if (replaced_same_size ||
+                (cur_size != d->disk_size &&
+                 !dom_extend_from_file_locked(d, cur_size))) {
                 dom_unlock();
                 ray_sys_free(rpath);
                 return NULL;
@@ -1664,6 +1702,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
          * (the sparse record index above), from the index file when it is
          * valid, so opening reads only the index and the records after it. */
         d->map = ray_vm_map_file_id(rpath, &d->map_size, &d->map_id);
+        d->disk_id = d->map_id;
         int64_t count = -1;
         const uint8_t* m = (const uint8_t*)d->map;
         if (m && d->map_size >= 12 && dom_rd32(m) == DOMAIN_STRL_MAGIC)
@@ -1840,6 +1879,25 @@ bool ray_sym_domain_ix_info(ray_sym_domain_t* dom, ray_sym_domain_ix_info_t* out
     out->covered = dom->ix_covered;
     dom_unlock();
     return true;
+}
+
+bool ray_sym_domain_raw_cold(const ray_sym_domain_raw_t* r) {
+    const char* force = getenv("RAY_SYM_COLD");   /* tests: "1" cold, "0" resident */
+    if (force && force[0] == '1') return r->ib != NULL;
+    if (force && force[0] == '0') return false;
+#if defined(__linux__)
+    if (!r->ib || r->count < RAY_SYM_INDEX_STRIDE) return false;
+    int64_t nb = (r->count - 1) / RAY_SYM_INDEX_STRIDE + 1;
+    int64_t samples = nb < 64 ? nb : 64, cold = 0;
+    for (int64_t i = 0; i < samples; i++) {
+        int64_t k = samples > 1 ? i * (nb - 1) / (samples - 1) : 0;
+        if (!ray_vm_resident(r->map + r->ib[k].off, 1)) cold++;
+    }
+    return cold * 8 > samples;   /* more than an eighth of the samples are not resident */
+#else
+    (void)r;
+    return false;
+#endif
 }
 
 void ray_sym_domain_raw_unpin(ray_sym_domain_t* dom) {
@@ -2824,9 +2882,12 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     err = ray_file_rename(tmp_path, dom->path);
     if (err != RAY_OK) goto fail_tmp;
 
+    struct stat persisted_st;
+    ray_file_id_t persisted_id = dom_stat_id(stat(dom->path, &persisted_st) == 0 ? &persisted_st : NULL);
     dom_lock();
     dom->disk_count = count;
     dom->disk_size = written_size;
+    dom->disk_id = persisted_id;
     dom_ck_free(&dom->wck);
     dom->wck = tail;
     dom_unlock();
@@ -2969,9 +3030,12 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         if (err == RAY_OK) err = ray_file_sync_dir(dom->path);
     }
     if (err == RAY_OK) {
+        struct stat persisted_st;
+        ray_file_id_t persisted_id = dom_stat_id(stat(dom->path, &persisted_st) == 0 ? &persisted_st : NULL);
         dom_lock();
         dom->disk_count = count;
         dom->disk_size = size;
+        dom->disk_id = persisted_id;
         for (int64_t k = 0; err == RAY_OK && k < tail.n; k++)
             if (!dom_ck_push(&dom->wck, tail.v[k])) err = RAY_ERR_OOM;
         if (err != RAY_OK) dom_ck_free(&dom->wck);   /* no index from here on */

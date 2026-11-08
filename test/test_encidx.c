@@ -2491,8 +2491,9 @@ static test_result_t test_stale_root_chunk_zone(void) {
 /* D1: the SYM HASH / PART a splayed save writes as generation 2 keep the
  * source's UNIQUE (checked against the in-memory source), and every query
  * answers as on generation 0.  Generation 0's own save drops the SYM PART
- * and UNIQUE (splay_build_index_col rebuilds a bare HASH), the attribute
- * difference D1 accepts. */
+ * (a SYM PART's keys carry a domain no generation-0 region can hold), the
+ * attribute difference D1 accepts; it keeps the HASH's UNIQUE
+ * (splay_build_index_col). */
 static test_result_t test_sym_splay_kept(void) {
     ray_t* r = ixr_eval("(set SY (as 'SYM (map (fn [i] (concat \"k\" (as 'STR i))) (til 6000))))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
@@ -2521,9 +2522,9 @@ static test_result_t test_sym_splay_kept(void) {
         NULL,
     };
     for (int i = 0; kept[i]; i++) TEST_ASSERT_FMT(ixr_i64(kept[i]) == 1, "%s", kept[i]);
-    /* generation 0's loss, as D1 records it (dev's splay_build_index_col) */
+    /* generation 0: the PART is still lost (D1), the HASH keeps UNIQUE */
     TEST_ASSERT_EQ_I(ixr_i64("(if (in 'parted (.attr.get (at X0 'p))) 1 0)"), 0);
-    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at X0 'g))) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at X0 'g))) 1 0)"), 1);
     static const char* const qs[] = {
         "(sum (at (select {from: %s where: (== p 'b)}) 'v))",
         "(sum (at (select {from: %s where: (in p ['a 'd])}) 'v))",
@@ -2541,6 +2542,45 @@ static test_result_t test_sym_splay_kept(void) {
         TEST_ASSERT_FMT(a == b && a != INT64_MIN, "%s: %lld vs %lld", qs[i], (long long)a, (long long)b);
     }
     PASS();
+}
+
+/* #838: a generation-0 splayed save carries UNIQUE on a SYM hash index
+ * through both ways the hash is appended -- built in place, and the
+ * in-memory fallback taken where the in-place build answers NYI (macOS,
+ * a copy-on-write or network filesystem).  Debug builds force the fallback
+ * with RAY_HASH_INJECT=fs; a grouped non-unique column is the control. */
+static test_result_t ixr_sym_unique_reload(const char* dir, bool force_fallback) {
+    ray_t* r = ixr_eval("(set SU (as 'SYM (map (fn [i] (concat \"u\" (as 'STR i))) (til 600))))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    r = ixr_eval("(set SN (take (as 'SYM ['a 'b 'c 'd]) 600))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    r = ixr_eval("(set TU (table [u n v] (list (.attr.set 'grouped (.attr.set 'unique SU)) "
+                 "(.attr.set 'grouped SN) (til 600))))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    if (force_fallback) TEST_ASSERT_EQ_I(setenv("RAY_HASH_INJECT", "fs", 1), 0);
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "(.db.splayed.set \"%s/\" TU {compress: false})", dir);
+    r = ixr_eval(cmd);
+    unsetenv("RAY_HASH_INJECT");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    snprintf(cmd, sizeof cmd, "(set XU (.db.splayed.get \"%s/\"))", dir);
+    r = ixr_eval(cmd); TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'grouped (.attr.get (at XU 'u))) 1 0)"), 1);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at XU 'u))) 1 0)"), 1);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'grouped (.attr.get (at XU 'n))) 1 0)"), 1);
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at XU 'n))) 1 0)"), 0);
+    TEST_ASSERT_EQ_I(ixr_i64("(sum (at (select {from: XU where: (== u 'u300)}) 'v))"), 300);
+    TEST_ASSERT_EQ_I(ixr_i64("(count (select {from: XU where: (== n 'a)}))"), 150);
+    PASS();
+}
+static test_result_t test_sym_unique_inplace(void) {
+    return ixr_sym_unique_reload(IDX_TMP "/su_in", false);
+}
+static test_result_t test_sym_unique_fallback(void) {
+#if !defined(DEBUG)
+    SKIP("RAY_HASH_INJECT is read by debug builds only");
+#endif
+    return ixr_sym_unique_reload(IDX_TMP "/su_fb", true);
 }
 
 /* ---- end to end: save paths, converter parity (Task 8) ---- */
@@ -3014,6 +3054,8 @@ const test_entry_t encidx_entries[] = {
     { "idxval/admission_through_all",  test_admission_through_all,  ix_setup, ix_teardown },
     { "idxval/stale_root_chunk_zone",  test_stale_root_chunk_zone,  ixr_setup, ixr_teardown },
     { "idxval/sym_splay_kept",         test_sym_splay_kept,         ixr_setup, ixr_teardown },
+    { "idxval/sym_unique_inplace",     test_sym_unique_inplace,     ixr_setup, ixr_teardown },
+    { "idxval/sym_unique_fallback",    test_sym_unique_fallback,    ixr_setup, ixr_teardown },
     { "idxval/sym_stale_rebuild",      test_sym_stale_rebuild,      ixr_setup, ixr_teardown },
     { "idxval/sym_stale_part_unbuildable", test_sym_stale_part_unbuildable, ix_setup, ix_teardown },
     { "idxval/sym_hash_null_key",  test_sym_hash_null_key,  ixr_setup, ixr_teardown },

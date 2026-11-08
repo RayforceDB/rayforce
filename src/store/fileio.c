@@ -43,6 +43,23 @@
 #  define RAY_PATH_MAX 4096
 #endif
 
+#include <stdlib.h>   /* getenv: RAYFORCE_NO_FSYNC */
+#include <string.h>
+
+/* -1 = not read yet, 0 = flush, 1 = skip.  A benign race: every reader
+ * computes the same value from the same environment. */
+static int g_fsync_disabled = -1;
+
+bool ray_fsync_disabled(void) {
+    int v = __atomic_load_n(&g_fsync_disabled, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char* e = getenv("RAYFORCE_NO_FSYNC");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        __atomic_store_n(&g_fsync_disabled, v, __ATOMIC_RELAXED);
+    }
+    return v == 1;
+}
+
 #ifdef RAY_OS_WINDOWS
 
 #include <errno.h>
@@ -119,6 +136,7 @@ ray_err_t ray_file_unlock(ray_fd_t fd) {
 
 ray_err_t ray_file_sync(ray_fd_t fd) {
     if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    if (ray_fsync_disabled()) return RAY_OK;
     if (!FlushFileBuffers(fd)) return RAY_ERR_IO;
     return RAY_OK;
 }
@@ -243,7 +261,7 @@ ray_err_t ray_file_unlock(ray_fd_t fd) {
 
 ray_err_t ray_file_sync(ray_fd_t fd) {
     if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
-    if (fsync(fd) != 0) return RAY_ERR_IO;
+    if (ray_fsync_fd(fd) != 0) return RAY_ERR_IO;
     return RAY_OK;
 }
 
@@ -264,6 +282,7 @@ ray_err_t ray_file_sync_dir(const char* path) {
     } else {
         dir[0] = '.'; dir[1] = '\0';  /* current directory */
     }
+    if (ray_fsync_disabled()) return RAY_OK;
     int fd = open(dir, O_RDONLY);
     if (fd < 0) return RAY_ERR_IO;
     int rc = fsync(fd);
@@ -357,6 +376,11 @@ ray_fd_t ray_file_open_mem(char* path, size_t cap) {
     (void)path; (void)cap;
     return RAY_FD_INVALID;
 #endif
+}
+
+int ray_fsync_fd(int fd) {
+    if (ray_fsync_disabled()) return 0;
+    return fsync(fd);
 }
 
 #endif
