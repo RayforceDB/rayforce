@@ -941,6 +941,22 @@ static bool quantile_literal_prob(ray_t* prob_expr, bool percentile,
     return true;
 }
 
+/* Keyless SELECT can carry a scalar probability bound in the caller's
+ * environment as well as a literal.  Match ordinary SELECT name resolution:
+ * a lexical parameter/let binding wins over a same-named source column, while
+ * a source column still wins over a global. */
+static bool quantile_keyless_prob(ray_t* prob_expr, ray_t* tbl,
+                                  bool percentile, double* out_q) {
+    if (quantile_literal_prob(prob_expr, percentile, out_q)) return true;
+    if (!prob_expr || prob_expr->type != -RAY_SYM ||
+        (prob_expr->attrs & ATTR_QUOTED)) return false;
+    ray_t* lexical = ray_env_get_lexical_local(prob_expr->i64);
+    if (lexical)
+        return quantile_literal_prob(lexical, percentile, out_q);
+    if (ray_table_slot(tbl, prob_expr->i64)) return false;
+    return quantile_literal_prob(ray_env_get(prob_expr->i64), percentile, out_q);
+}
+
 /* True when any GROUP BY key names a BOOL column of `tbl`.  A BOOL-keyed
  * group is emitted in key order (false before true) and query.c reorders the
  * finished result to first-occurrence AFTERWARDS, so a take must not be pushed
@@ -22389,7 +22405,7 @@ by_dict_done:
                         ray_binary_fn native = percentile ? ray_percentile_fn : ray_quantile_fn;
                         if (fn && fn->type == RAY_BINARY &&
                             (ray_binary_fn)(uintptr_t)fn->i64 == native &&
-                            quantile_literal_prob(agg_elems[2], percentile, &q)) {
+                            quantile_keyless_prob(agg_elems[2], tbl, percentile, &q)) {
                             agg_k[s_n_aggs] = encode_agg_f64_param(q);
                             s_has_param = 1;
                         }
@@ -28557,6 +28573,7 @@ static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0) {
     for (int64_t k = 0; k < nk; k++) kci[k] = ix->u.ukey.kci[k];
     upsert_map_t map = { NULL, (int64_t*)ray_data(ix->u.ukey.slots), ix->u.ukey.mask };
     for (int64_t r = nrows0; r < n; r++)
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         upsert_map_put(&map, upsert_hash_row(slots, kci, nk, r), r);
     ix->u.ukey.nrows = n;
 }

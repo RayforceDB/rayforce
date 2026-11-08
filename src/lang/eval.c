@@ -4920,6 +4920,9 @@ static void ray_register_builtins(void) {
     /* Transmit backlog policy: read, set the process default, or override
      * one connection.  Privileged — it decides when a peer is dropped. */
     register_vary(  ".ipc.txlimit", RAY_FN_RESTRICTED, ray_ipc_txlimit_fn);
+    /* Transport policy: which faster road a connection may move to.
+     * Privileged — it decides what this process offers its peers. */
+    register_vary(  ".ipc.transport", RAY_FN_RESTRICTED, ray_ipc_transport_fn);
 
     /* Multicast/pub-sub over IPC.  Subscriptions are allowed under
      * restricted IPC; publishing stays privileged. */
@@ -4944,8 +4947,10 @@ static void ray_register_builtins(void) {
      * startup; these builtins expose the same machinery to Rayfall code
      * for manual control (open from a script, snapshot on demand, etc). */
     register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
+    register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
     register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
     register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
+    register_unary(".log.replay_report", RAY_FN_RESTRICTED, ray_log_replay_report_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
     register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
     register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);

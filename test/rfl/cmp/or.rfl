@@ -54,6 +54,13 @@
 (or false true  undefined-name)        -- true
 (or false false true  undefined-name)  -- true
 
+;; A determining non-BOOL atom still short-circuits, but logical operators
+;; return one BOOL rather than leaking the operand's type.
+(or 2 undefined-name) -- true
+(type (or 2 3)) -- 'b8
+(type (or 2.5 0)) -- 'b8
+(type (or 'a 'b)) -- 'b8
+
 ;; Short-circuit must NOT trigger when the result is still undetermined —
 ;; full chain runs with all-falsy args until the final true.
 (or false false 1) -- true

@@ -160,6 +160,8 @@ extern const test_entry_t pipe_entries[];
 extern const test_entry_t platform_entries[];
 extern const test_entry_t pool_entries[];
 extern const test_entry_t progress_entries[];
+extern const test_entry_t shm_entries[];
+extern const test_entry_t rdma_entries[];
 extern const test_entry_t public_api_entries[];
 extern const test_entry_t repl_entries[];
 extern const test_entry_t rowsel_entries[];
@@ -225,7 +227,7 @@ static const test_entry_t* const compiled_groups[] = {
     mcast_entries,
     numparse_entries, opt_entries,      partition_exec_entries,
     pipe_entries,     platform_entries,
-    pool_entries,     progress_entries,
+    pool_entries,     progress_entries, shm_entries,      rdma_entries,
     public_api_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries, select_merge_entries,
     sort_entries,     splay_entries,    srccheck_entries, store_entries,    enc_entries,
@@ -585,6 +587,8 @@ static test_result_t run_rfl_at(int idx) {
  * Destroy order also mirrors main.c — poll first, runtime second. */
 static void rfl_setup(void) {
     ray_runtime_create(0, NULL);
+    /* peak-bytes asserts measure this file, not what ran before it */
+    ray_mem_peak_reset_for_test();
     ray_poll_t* p = ray_poll_create();
     if (p) ray_runtime_set_poll(p);
 }
@@ -936,6 +940,7 @@ void ray_test_hooks_off(void) {
     ray_enccol_test_fail_alloc(0);
     ray_enccol_test_fail_path(NULL);
     ray_enccol_test_interrupt_after(0);
+    ray_enccol_test_hold_decode(false);
     ray_enccol_test_parted_mode(0);
     ray_enccol_test_fail_index_parse(false);
     ray_col_test_fail_alloc(0);
@@ -1116,44 +1121,90 @@ static void equiv_c_teardown(void) {
 static void equiv_rfl_setup(void)    { rfl_setup(); ray_store_test_force_compress(true); g_equiv_on = true; }
 static void equiv_rfl_teardown(void) { g_equiv_on = false; ray_store_test_force_compress(false); rfl_teardown(); }
 
-int main(int argc, char** argv) {
-#if defined(_WIN32)
-    (void)_mkdir("/tmp");   /* tests use "/tmp/..." paths (see test.h) */
+/* Wall-clock milliseconds (the summary line; scheduling in -j mode). */
+static double now_wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+/* --quick leaves these out (prefix match), on top of the equivalence pass.
+ * Each one costs seconds and covers a path the quick tier is not for:
+ * randomized soak, multi-second oracle sweeps, large spill.  `make test`
+ * (and CI) still runs every one of them. */
+static const char* const quick_skip[] = {
+    "stress/",          /* randomized soak against a shadow model */
+    "stress_eval/",
+    "large/",
+    /* Ctrl-C has to land while ./rayforce is still computing: an unsanitized
+     * build finishes first on a fast core.  Runs in make test-full (ASan). */
+    "repl/pty/ctrl_c_during_lazy_materialize",
+    NULL,
+};
+#if !defined(_WIN32)   /* -j only: the parallel runner is POSIX-only */
+/* -j runs these after every other test, one at a time, on an otherwise idle
+ * machine (prefix match): tests whose outcome depends on which pool worker
+ * thread picks up which task (with every core busy, the scheduler reorders
+ * them), and pairs that must not overlap.  Each costs well under a second;
+ * coverage is the same. */
+static const char* const exclusive_tests[] = {
+    "heap/relieve_",               /* which worker heap keeps which empty pool */
+    "heap/raw_discard",            /* process-wide anon / direct byte counts */
+    "rfl/system/ipc_diff",         /* fixed server port 19999, shared with ... */
+    "equiv/rfl/system/ipc_diff",   /* ... its equivalence-pass twin */
+    NULL,
+};
+/* -j hands these out first, so each is the first test of a newly forked
+ * worker.  For tests whose arithmetic assumes a small process footprint:
+ * they size a memory watermark from it, and a worker that already ran
+ * hundreds of tests holds several hundred MB more than a fresh one. */
+static const char* const fresh_tests[] = {
+    "agg_contract/dense_wide_budget",   /* also _sel: per-worker slab budget */
+    NULL,
+};
+static bool fresh_test(const char* name) {
+    for (int i = 0; fresh_tests[i]; i++)
+        if (strncmp(name, fresh_tests[i], strlen(fresh_tests[i])) == 0) return true;
+    return false;
+}
+
+static bool exclusive_test(const char* name) {
+    for (int i = 0; exclusive_tests[i]; i++)
+        if (strncmp(name, exclusive_tests[i], strlen(exclusive_tests[i])) == 0) return true;
+    return false;
+}
 #endif
-    ray_expr_stats_init();
-    ray_idx_stats_init();
-    g_color = isatty(fileno(stdout));
 
-    const char* filter = NULL;
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--filter") == 0 || strcmp(argv[i], "-f") == 0)
-            && i + 1 < argc) {
-            filter = argv[++i];
-        } else if (strcmp(argv[i], "--census") == 0 && i + 1 < argc) {
-            g_census = fopen(argv[++i], "w");
-            if (!g_census) { fprintf(stderr, "cannot open census file\n"); return 2; }
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [-f SUBSTR] [--census PATH]\n", argv[0]);
-            printf("  -f, --filter SUBSTR   Only run tests whose name contains SUBSTR.\n");
-            printf("  --census PATH         Record .rfl lines whose grouping ran on the legacy ladder.\n");
-            return 0;
-        } else {
-            fprintf(stderr, "unknown argument: %s\n", argv[i]);
-            return 2;
-        }
+static bool quick_skipped(const char* name) {
+    for (int i = 0; quick_skip[i]; i++)
+        if (strncmp(name, quick_skip[i], strlen(quick_skip[i])) == 0) return true;
+    return false;
+}
+
+/* ─── Job list ────────────────────────────────────────────────────── */
+
+/* Every test the run will execute, in serial order: the compiled-in groups,
+ * the .rfl files, then the equivalence pass.  `inner` is the wrapped entry
+ * of an equiv/ C test (g_equiv_inner while it runs). */
+typedef struct {
+    test_entry_t        e;
+    const test_entry_t* inner;
+    double              est_ms;   /* last recorded wall time; -1 = unknown */
+} test_job_t;
+
+static test_job_t* g_jobs;
+static int         g_njobs, g_jobs_cap;
+
+static void job_add(test_entry_t e, const test_entry_t* inner) {
+    if (g_njobs == g_jobs_cap) {
+        g_jobs_cap = g_jobs_cap ? g_jobs_cap * 2 : 8192;
+        g_jobs = (test_job_t*)realloc(g_jobs, (size_t)g_jobs_cap * sizeof *g_jobs);
+        if (!g_jobs) { fprintf(stderr, "test driver: out of memory\n"); exit(2); }
     }
+    g_jobs[g_njobs++] = (test_job_t){ .e = e, .inner = inner, .est_ms = -1 };
+}
 
-    if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
-    snprintf(g_tmp_root, sizeof g_tmp_root, "/tmp/rayforce_t.%ld", (long)getpid());
-    (void)ray_test_rm_rf(g_tmp_root);                    /* a dead run's leftovers under a reused pid */
-    if (ray_test_mkdir_p(g_tmp_root) != 0) { fprintf(stderr, "cannot create %s\n", g_tmp_root); return 2; }
-    g_tmp_root_len = strlen(g_tmp_root);
-    const char* rfl_root = getenv("RFL_ROOT");
-    if (!rfl_root || !*rfl_root) rfl_root = "test/rfl";
-    if (rfl_scan(rfl_root) < 0) return 2;
-
-    int pass = 0, fail = 0, skip = 0, total = 0;
-
+static void collect_jobs(const char* filter, bool quick) {
     /* Compiled-in groups */
     for (int gi = 0; compiled_groups[gi]; gi++) {
         const test_entry_t* g = compiled_groups[gi];
@@ -1162,26 +1213,22 @@ int main(int argc, char** argv) {
             /* large/ tests need several GiB of RAM and disk: only on request */
             if (strncmp(g[i].name, "large/", 6) == 0 &&
                 !(filter && strncmp(filter, "large/", 6) == 0)) continue;
-            total++;
-            run_one(&g[i], &pass, &fail, &skip);
+            if (quick && quick_skipped(g[i].name)) continue;
+            job_add(g[i], NULL);
         }
     }
 
     /* Dynamic .rfl group */
     for (int i = 0; i < g_rfl_count; i++) {
         if (!name_matches_filter(g_rfl_names[i], filter)) continue;
-        total++;
-        test_entry_t e = {
-            .name     = g_rfl_names[i],
-            .func     = rfl_thunks[i],
-            .setup    = rfl_setup,
-            .teardown = rfl_teardown,
-        };
-        run_one(&e, &pass, &fail, &skip);
+        if (quick && quick_skipped(g_rfl_names[i])) continue;
+        job_add((test_entry_t){ .name = g_rfl_names[i], .func = rfl_thunks[i],
+                                .setup = rfl_setup, .teardown = rfl_teardown }, NULL);
     }
 
     /* Equivalence pass: C groups that save and reload tables, then every
-     * .rfl file that saves one. */
+     * .rfl file that saves one.  --quick leaves the whole pass out. */
+    if (quick) return;
     static const test_entry_t* const equiv_groups[] = {
         splay_entries, store_entries, partition_exec_entries, link_entries,
         /* query-heavy groups that save tables */
@@ -1194,28 +1241,593 @@ int main(int argc, char** argv) {
         for (int i = 0; equiv_groups[gi][i].name; i++) {
             snprintf(ename, sizeof ename, "equiv/%s", equiv_groups[gi][i].name);
             if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
-            g_equiv_inner = &equiv_groups[gi][i];
-            test_entry_t e = { .name = ename, .func = equiv_groups[gi][i].func,
-                               .setup = equiv_c_setup, .teardown = equiv_c_teardown };
-            total++;
-            run_one(&e, &pass, &fail, &skip);
+            job_add((test_entry_t){ .name = tmp_strdup(ename), .func = equiv_groups[gi][i].func,
+                                    .setup = equiv_c_setup, .teardown = equiv_c_teardown },
+                    &equiv_groups[gi][i]);
         }
     }
     for (int i = 0; i < g_rfl_count; i++) {
-        snprintf(ename, sizeof ename, "equiv/%s", g_rfl_names[i]);
+        snprintf(ename, sizeof ename, "equiv/%.255s", g_rfl_names[i]);
         if (!name_matches_filter(ename, filter) || equiv_skipped(ename)) continue;
         if (!rfl_file_saves(g_rfl_paths[i])) continue;
-        test_entry_t e = { .name = ename, .func = rfl_thunks[i],
-                           .setup = equiv_rfl_setup, .teardown = equiv_rfl_teardown };
-        total++;
-        run_one(&e, &pass, &fail, &skip);
+        job_add((test_entry_t){ .name = tmp_strdup(ename), .func = rfl_thunks[i],
+                                .setup = equiv_rfl_setup, .teardown = equiv_rfl_teardown }, NULL);
+    }
+}
+
+/* Keep only the jobs named in `path`, in the file's order. */
+static int replay_select(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); return -1; }
+    /* the selection, then every job behind it (past g_njobs): the full
+     * list stays reachable, it owns the equiv/ names (tmp_strdup) */
+    test_job_t* out = (test_job_t*)malloc((size_t)(g_njobs > 0 ? 2 * g_njobs : 1) * sizeof *out);
+    if (!out) { fclose(f); return -1; }
+    int n = 0;
+    char line[700];
+    while (fgets(line, sizeof line, f) && n < g_njobs) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!*line) continue;
+        int i = 0;
+        while (i < g_njobs && strcmp(g_jobs[i].e.name, line) != 0) i++;
+        if (i == g_njobs) { fprintf(stderr, "replay: no test named %s\n", line); continue; }
+        out[n++] = g_jobs[i];
+    }
+    fclose(f);
+    memcpy(out + n, g_jobs, (size_t)g_njobs * sizeof *out);
+    int total = g_njobs;
+    free(g_jobs);
+    g_jobs = out; g_njobs = n; g_jobs_cap = n + total;
+    return 0;
+}
+
+/* Runs one job in this process; returns its status. */
+static test_status_t run_job(const test_job_t* j, int* pass, int* fail, int* skip) {
+    int p0 = *pass, s0 = *skip;
+    g_equiv_inner = j->inner;
+    run_one(&j->e, pass, fail, skip);
+    g_equiv_inner = NULL;
+    return *pass != p0 ? TEST_PASS : *skip != s0 ? TEST_SKIP : TEST_FAIL;
+}
+
+/* Point this process's scratch root at /tmp/rayforce_t.<pid> and create it.
+ * A forked worker calls it again so no two processes share a file. */
+static int tmp_root_init(void) {
+    snprintf(g_tmp_root, sizeof g_tmp_root, "/tmp/rayforce_t.%ld", (long)getpid());
+    (void)ray_test_rm_rf(g_tmp_root);                    /* a dead run's leftovers under a reused pid */
+    if (ray_test_mkdir_p(g_tmp_root) != 0) { fprintf(stderr, "cannot create %s\n", g_tmp_root); return -1; }
+    g_tmp_root_len = strlen(g_tmp_root);
+    /* forget rewrites interned under a previous root */
+    g_tmp_tab = NULL; g_tmp_cap = 0; g_tmp_n = 0;
+    return 0;
+}
+
+/* Run from a private working directory: <root>/cwd, holding a symlink to
+ * each top-level entry of the directory the suite started in (test/, src/,
+ * ./rayforce ...).  Tests that read repo files by relative path still find
+ * them; files a test creates by relative path ("rf_test_x.csv") land in the
+ * private directory, so -j workers never share one and the checkout stays
+ * clean.  Names a run leaves behind (rf_*, rfl_*, dotfiles ...) are not
+ * linked, so a stale copy in the checkout is never written through. */
+#if !defined(_WIN32)
+static char g_orig_cwd[4096];
+
+static bool cwd_link_skipped(const char* n) {
+    static const char* const pfx[] = { ".", "rf_", "rfl_", "ray_", "__", "rayforce.test.times", NULL };
+    for (int i = 0; pfx[i]; i++) if (strncmp(n, pfx[i], strlen(pfx[i])) == 0) return true;
+    return false;
+}
+
+static int private_cwd_enter(void) {
+    if (!g_orig_cwd[0] && !getcwd(g_orig_cwd, sizeof g_orig_cwd)) return -1;
+    char dir[sizeof g_tmp_root + 8], link[sizeof dir + 512], target[sizeof g_orig_cwd + 512];
+    snprintf(dir, sizeof dir, "%s/cwd", g_tmp_root);
+    if (ray_test_mkdir_p(dir) != 0) return -1;
+    DIR* d = opendir(g_orig_cwd);
+    if (!d) return -1;
+    for (struct dirent* e; (e = readdir(d)); ) {
+        if (cwd_link_skipped(e->d_name)) continue;
+        snprintf(link, sizeof link, "%s/%s", dir, e->d_name);
+        snprintf(target, sizeof target, "%s/%s", g_orig_cwd, e->d_name);
+        if (symlink(target, link) != 0) { /* an entry the test never reads */ }
+    }
+    closedir(d);
+    return chdir(dir);
+}
+
+/* Back to the starting directory, so the root can be removed. */
+static void private_cwd_leave(void) {
+    if (g_orig_cwd[0] && chdir(g_orig_cwd) != 0) perror(g_orig_cwd);
+}
+#else
+static int  private_cwd_enter(void) { return 0; }
+static void private_cwd_leave(void) {}
+#endif
+
+/* ─── Recorded timings (parallel scheduling) ─────────────────────── */
+
+/* "<binary>.times" holds "<ms> <name>" per test from the last parallel run.
+ * Jobs are dispatched longest first, so one slow test does not start last
+ * and leave every other worker idle while it finishes. */
+static int job_cmp_name(const void* a, const void* b) {
+    return strcmp(((const test_job_t*)a)->e.name, ((const test_job_t*)b)->e.name);
+}
+static int job_cmp_est_desc(const void* a, const void* b) {
+    double x = ((const test_job_t*)a)->est_ms, y = ((const test_job_t*)b)->est_ms;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void times_load(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    qsort(g_jobs, (size_t)g_njobs, sizeof *g_jobs, job_cmp_name);
+    char line[700];
+    while (fgets(line, sizeof line, f)) {
+        char* sp = strchr(line, ' ');
+        if (!sp) continue;
+        char* nl = strchr(sp + 1, '\n');
+        if (nl) *nl = '\0';
+        test_job_t key = { .e = { .name = sp + 1 } };
+        test_job_t* hit = (test_job_t*)bsearch(&key, g_jobs, (size_t)g_njobs, sizeof *g_jobs, job_cmp_name);
+        if (hit) hit->est_ms = strtod(line, NULL);
+    }
+    fclose(f);
+}
+
+static void times_save(const char* path, const double* ms) {
+    /* keep entries for tests this (possibly filtered) run did not execute */
+    size_t cap = 1 << 20, len = 0;
+    char* old = (char*)malloc(cap);
+    FILE* f = old ? fopen(path, "r") : NULL;
+    if (f) { len = fread(old, 1, cap - 1, f); fclose(f); }
+    if (old) old[len] = '\0';
+    char tmp[616];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* o = fopen(tmp, "w");
+    if (!o) { free(old); return; }
+    for (int i = 0; i < g_njobs; i++)
+        if (ms[i] >= 0) fprintf(o, "%.1f %s\n", ms[i], g_jobs[i].e.name);
+    for (char* ln = old; ln && *ln; ) {
+        char* nl = strchr(ln, '\n');
+        if (nl) *nl = '\0';
+        char* sp = strchr(ln, ' ');
+        bool ran = false;
+        if (sp) for (int i = 0; i < g_njobs && !ran; i++)
+            ran = ms[i] >= 0 && strcmp(g_jobs[i].e.name, sp + 1) == 0;
+        if (sp && !ran) fprintf(o, "%s\n", ln);
+        ln = nl ? nl + 1 : NULL;
+    }
+    fclose(o);
+    free(old);
+    (void)rename(tmp, path);
+}
+
+#if !defined(_WIN32)
+/* ─── Parallel runner (-j N) ─────────────────────────────────────── */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+
+/* A worker is a fork of the driver taken before any test ran.  It reads job
+ * indices from its command pipe, runs each with run_job() (output into its
+ * own log file), and answers on the shared result pipe.  Records are smaller
+ * than PIPE_BUF, so writes from different workers never interleave. */
+typedef struct { int32_t job; int32_t status; int32_t retire; int32_t pad; int64_t log_end; } worker_res_t;
+
+typedef struct {
+    pid_t   pid;
+    int     cmd_fd;      /* parent -> worker: int32 job index, -1 = exit */
+    int     log_fd;      /* parent's read handle on the worker's log      */
+    int     job;         /* job in flight, -1 when idle                   */
+    int64_t log_pos;     /* log offset where the job in flight started    */
+    double  t0;          /* wall-clock dispatch time (ms)                 */
+    bool    retire;      /* it left spill pools: exits, a fresh one follows */
+    bool    timed_out;   /* killed for running one test past --timeout */
+    int*    hist;        /* every job this process ran, in order (replay) */
+    int     nhist, hist_cap;
+} worker_t;
+
+static double now_ms(void) { return now_wall_ms(); }
+
+static void set_cloexec(int fd) { (void)fcntl(fd, F_SETFD, FD_CLOEXEC); }
+
+static bool write_all(int fd, const void* buf, size_t n) {
+    const char* p = (const char*)buf;
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        p += w; n -= (size_t)w;
+    }
+    return true;
+}
+
+static bool read_all(int fd, void* buf, size_t n) {
+    char* p = (char*)buf;
+    while (n) {
+        ssize_t r = read(fd, p, n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        p += r; n -= (size_t)r;
+    }
+    return true;
+}
+
+/* Copy the worker log [from, to) (to < 0: to EOF) onto stdout. */
+static void log_copy(int fd, int64_t from, int64_t to) {
+    char buf[65536];
+    int64_t pos = from;
+    for (;;) {
+        size_t want = sizeof buf;
+        if (to >= 0) {
+            if (pos >= to) break;
+            if ((int64_t)want > to - pos) want = (size_t)(to - pos);
+        }
+        ssize_t r = pread(fd, buf, want, (off_t)pos);
+        if (r <= 0) break;
+        fwrite(buf, 1, (size_t)r, stdout);
+        pos += r;
+    }
+    fflush(stdout);
+}
+
+typedef struct {
+    worker_t* w;
+    int       nw;
+    int       res_rd, res_wr;
+    double*   ms;
+    int       next;                 /* next job index to dispatch */
+    int*      pass; int* fail; int* skip;
+} pool_t;
+
+/* Whether any heap of this process holds a pool spilled to a file.  Spill
+ * mappings are MAP_SHARED (mem/heap.c): after fork() parent and child write
+ * the same pages, so a later test that forks and keeps running rayforce code
+ * in the child corrupts both heaps.  A test that tightened the memory
+ * watermark can leave such pools behind; the worker then retires, and the
+ * next tests run in a fresh process, as they would after it in a serial run
+ * only by luck of the order. */
+static bool process_has_spill_pools(void) {
+    for (int i = 0; i < RAY_HEAP_REGISTRY_SIZE; i++) {
+        const ray_heap_t* h = ray_heap_registry[i];
+        if (!h) continue;
+        for (uint32_t p = 0; p < h->pool_count && p < RAY_MAX_POOLS; p++)
+            if (h->pools[p].backed) return true;
+    }
+    return false;
+}
+
+static void worker_main(pool_t* P, int cmd_fd, int log_fd) {
+    /* drop the parent's handles on the other workers */
+    for (int k = 0; k < P->nw; k++) {
+        if (P->w[k].cmd_fd >= 0) close(P->w[k].cmd_fd);
+        if (P->w[k].log_fd >= 0) close(P->w[k].log_fd);
+    }
+    close(P->res_rd);
+    dup2(log_fd, STDOUT_FILENO);
+    dup2(log_fd, STDERR_FILENO);
+    close(log_fd);
+    if (tmp_root_init() != 0 || private_cwd_enter() != 0) _exit(2);
+    int pass = 0, fail = 0, skip = 0;
+    int32_t j;
+    while (read_all(cmd_fd, &j, sizeof j) && j >= 0 && j < g_njobs) {
+        test_status_t st = run_job(&g_jobs[j], &pass, &fail, &skip);
+        fflush(stdout); fflush(stderr);
+        bool retire = process_has_spill_pools();
+        worker_res_t r = { .job = j, .status = (int32_t)st, .retire = retire,
+                           .log_end = (int64_t)lseek(STDOUT_FILENO, 0, SEEK_CUR) };
+        if (!write_all(P->res_wr, &r, sizeof r) || retire) break;
+    }
+    private_cwd_leave();
+    (void)ray_test_rm_rf(g_tmp_root);
+    fflush(stdout); fflush(stderr);
+    exit(0);   /* a normal exit, so LeakSanitizer still reports at the end */
+}
+
+/* Fork worker k with a fresh log.  False when it cannot be started. */
+static bool worker_spawn(pool_t* P, int k) {
+    worker_t* me = &P->w[k];
+    char path[128];
+    snprintf(path, sizeof path, "%s/worker%d.%d.log", g_tmp_root, k, P->next);
+    int log_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (log_fd < 0) { perror(path); return false; }
+    (void)unlink(path);   /* both sides keep it open; nothing to clean up */
+    int cmd[2];
+    if (pipe(cmd) != 0) { close(log_fd); perror("pipe"); return false; }
+    set_cloexec(cmd[0]); set_cloexec(cmd[1]);
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); close(log_fd); close(cmd[0]); close(cmd[1]); return false; }
+    if (pid == 0) {
+        close(cmd[1]);
+        me->cmd_fd = -1; me->log_fd = -1;
+        worker_main(P, cmd[0], log_fd);
+    }
+    close(cmd[0]);
+    int rd = dup(log_fd);   /* pread handle independent of the worker's offset */
+    close(log_fd);
+    set_cloexec(rd);
+    *me = (worker_t){ .pid = pid, .cmd_fd = cmd[1], .log_fd = rd, .job = -1, .log_pos = 0,
+                      .hist = me->hist, .hist_cap = me->hist_cap, .nhist = 0 };
+    return true;
+}
+
+/* Give worker k its next job, or tell it to exit when none is left. */
+static void worker_feed(pool_t* P, int k) {
+    worker_t* me = &P->w[k];
+    int32_t j = P->next < g_njobs ? P->next++ : -1;
+    me->job = j; me->t0 = now_ms();
+    if (j >= 0) {
+        if (me->nhist == me->hist_cap) {
+            me->hist_cap = me->hist_cap ? me->hist_cap * 2 : 256;
+            me->hist = (int*)realloc(me->hist, (size_t)me->hist_cap * sizeof *me->hist);
+            if (!me->hist) { fprintf(stderr, "test driver: out of memory\n"); exit(2); }
+        }
+        me->hist[me->nhist++] = j;
+    }
+    if (!write_all(me->cmd_fd, &j, sizeof j) && j >= 0) { me->job = -1; P->next--; return; }
+    if (j < 0) { close(me->cmd_fd); me->cmd_fd = -1; }
+}
+
+static void replay_note(const worker_t* me, int job);
+
+/* Read every queued result; for each, print the test's output, count it and
+ * feed that worker again (unless it already exited). */
+static void results_drain(pool_t* P, int timeout_ms) {
+    for (;;) {
+        struct pollfd pfd = { .fd = P->res_rd, .events = POLLIN };
+        if (poll(&pfd, 1, timeout_ms) <= 0 || !(pfd.revents & POLLIN)) return;
+        timeout_ms = 0;
+        worker_res_t r;
+        if (!read_all(P->res_rd, &r, sizeof r)) return;
+        int k = 0;
+        while (k < P->nw && !(P->w[k].job == r.job && P->w[k].log_fd >= 0)) k++;
+        if (k == P->nw) continue;
+        worker_t* me = &P->w[k];
+        P->ms[r.job] = now_ms() - me->t0;
+        log_copy(me->log_fd, me->log_pos, r.log_end);
+        me->log_pos = r.log_end;
+        if      (r.status == TEST_PASS) (*P->pass)++;
+        else if (r.status == TEST_SKIP) (*P->skip)++;
+        else                          { (*P->fail)++; replay_note(me, r.job); }
+        fflush(stdout);
+        me->job = -1;
+        if (r.retire) {
+            me->retire = true;
+            if (me->cmd_fd >= 0) { close(me->cmd_fd); me->cmd_fd = -1; }
+        } else if (me->pid > 0) {
+            worker_feed(P, k);
+        }
+    }
+}
+
+/* A test that fails in a worker may depend on what that process ran before
+ * it.  Write the worker's history up to and including it, one name a line,
+ * for `--replay FILE` to run in that order in one process. */
+static const char* g_argv0 = "./rayforce.test";
+static void replay_note(const worker_t* me, int job) {
+    static int seq;
+    char path[128];
+    snprintf(path, sizeof path, "/tmp/rayforce_replay.%ld.%d", (long)getpid(), ++seq);
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    for (int i = 0; i < me->nhist; i++) {
+        fprintf(f, "%s\n", g_jobs[me->hist[i]].e.name);
+        if (me->hist[i] == job) break;
+    }
+    fclose(f);
+    int before = me->nhist - 1;
+    printf("        to reproduce (after the %d test%s that ran before it in this worker, in one process):\n"
+           "          %s --replay %s\n",
+           before, before == 1 ? "" : "s", g_argv0, path);
+}
+
+static double g_test_timeout_ms = 600e3;   /* --timeout: per test, -j only */
+
+static int run_parallel(int nworkers, const char* times_path,
+                        int* pass, int* fail, int* skip) {
+    signal(SIGPIPE, SIG_IGN);
+    if (times_path) times_load(times_path);
+    /* longest first; unknown ones after, in their serial order */
+    for (int i = 0; i < g_njobs; i++)
+        if (g_jobs[i].est_ms < 0) g_jobs[i].est_ms = -1.0 - (double)i;
+    qsort(g_jobs, (size_t)g_njobs, sizeof *g_jobs, job_cmp_est_desc);
+    /* fresh-process tests first, keeping the order of the rest: the first
+     * job each worker gets runs in a process that has run nothing */
+    {
+        test_job_t* tmp = (test_job_t*)malloc((size_t)(g_njobs > 0 ? g_njobs : 1) * sizeof *tmp);
+        if (tmp) {
+            int o = 0;
+            for (int i = 0; i < g_njobs; i++) if (fresh_test(g_jobs[i].e.name))  tmp[o++] = g_jobs[i];
+            for (int i = 0; i < g_njobs; i++) if (!fresh_test(g_jobs[i].e.name)) tmp[o++] = g_jobs[i];
+            memcpy(g_jobs, tmp, (size_t)g_njobs * sizeof *tmp);
+            free(tmp);
+        }
     }
 
+    int rp[2];
+    if (pipe(rp) != 0) { perror("pipe"); return -1; }
+    set_cloexec(rp[0]); set_cloexec(rp[1]);
+
+    pool_t P = { .res_rd = rp[0], .res_wr = rp[1], .pass = pass, .fail = fail, .skip = skip };
+    P.nw = nworkers < g_njobs ? nworkers : g_njobs;
+    if (P.nw < 1) P.nw = 1;
+    P.w  = (worker_t*)calloc((size_t)P.nw, sizeof *P.w);
+    P.ms = (double*)malloc((size_t)(g_njobs > 0 ? g_njobs : 1) * sizeof *P.ms);
+    if (!P.w || !P.ms) { fprintf(stderr, "test driver: out of memory\n"); return -1; }
+    for (int k = 0; k < P.nw; k++) P.w[k] = (worker_t){ .cmd_fd = -1, .log_fd = -1, .job = -1 };
+    for (int i = 0; i < g_njobs; i++) P.ms[i] = -1;
+
+    int alive = 0, extra_fail = 0;
+    for (int k = 0; k < P.nw; k++) if (worker_spawn(&P, k)) alive++;
+    if (!alive) { fprintf(stderr, "test driver: could not start workers\n"); return -1; }
+    for (int k = 0; k < P.nw; k++) if (P.w[k].pid > 0) worker_feed(&P, k);
+
+    while (alive > 0) {
+        results_drain(&P, 200);
+        /* a test that hangs takes its worker down, not the run */
+        for (int k = 0; k < P.nw; k++)
+            if (P.w[k].pid > 0 && P.w[k].job >= 0 && !P.w[k].timed_out &&
+                now_ms() - P.w[k].t0 > g_test_timeout_ms) {
+                P.w[k].timed_out = true;
+                kill(P.w[k].pid, SIGKILL);
+            }
+        for (int k = 0; k < P.nw; k++) {
+            worker_t* me = &P.w[k];
+            if (me->pid <= 0) continue;
+            int st;
+            if (waitpid(me->pid, &st, WNOHANG) != me->pid) continue;
+            pid_t dead = me->pid;
+            me->pid = 0;
+            alive--;
+            /* results it wrote just before exiting are still in the pipe */
+            results_drain(&P, 0);
+            char why[96];
+            if (me->timed_out)   snprintf(why, sizeof why, "killed: the test ran past --timeout %g s", g_test_timeout_ms / 1e3);
+            else if (WIFSIGNALED(st)) snprintf(why, sizeof why, "killed by signal %d (%s)", WTERMSIG(st), strsignal(WTERMSIG(st)));
+            else                 snprintf(why, sizeof why, "exited with status %d", WEXITSTATUS(st));
+            bool crashed = me->job >= 0;
+            if (crashed) {
+                log_copy(me->log_fd, me->log_pos, -1);
+                printf("\n        %sFAIL%s  worker %s while running %s\n",
+                       C_RED, C_RESET, why, g_jobs[me->job].e.name);
+                replay_note(me, me->job);
+                P.ms[me->job] = now_ms() - me->t0;
+                (*fail)++;
+            } else if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+                /* after its last test: LeakSanitizer or an atexit check */
+                log_copy(me->log_fd, me->log_pos, -1);
+                printf("%sFAIL%s  worker %ld %s after its last test (output above)\n",
+                       C_RED, C_RESET, (long)dead, why);
+                extra_fail++;
+            }
+            fflush(stdout);
+            close(me->log_fd); me->log_fd = -1;
+            if (me->cmd_fd >= 0) { close(me->cmd_fd); me->cmd_fd = -1; }
+            me->job = -1;
+            /* replace a crashed or retired worker while work remains */
+            if ((crashed || me->retire) && P.next < g_njobs && worker_spawn(&P, k)) {
+                alive++;
+                worker_feed(&P, k);
+            }
+        }
+    }
+    close(P.res_rd); close(P.res_wr);
+    if (times_path) times_save(times_path, P.ms);
+    free(P.ms);
+    for (int k = 0; k < P.nw; k++) free(P.w[k].hist);
+    free(P.w);
+    *fail += extra_fail;
+    return 0;
+}
+#endif
+
+int main(int argc, char** argv) {
+#if !defined(_WIN32)
+    g_argv0 = argv[0];
+#endif
+#if defined(_WIN32)
+    (void)_mkdir("/tmp");   /* tests use "/tmp/..." paths (see test.h) */
+#endif
+    ray_expr_stats_init();
+    ray_idx_stats_init();
+    g_color = isatty(fileno(stdout));
+
+    const char* filter = NULL;
+    int  jobs  = 1;
+    bool quick = false;
+    const char* replay = NULL;
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "--filter") == 0 || strcmp(argv[i], "-f") == 0)
+            && i + 1 < argc) {
+            filter = argv[++i];
+        } else if (strcmp(argv[i], "--census") == 0 && i + 1 < argc) {
+            g_census = fopen(argv[++i], "w");
+            if (!g_census) { fprintf(stderr, "cannot open census file\n"); return 2; }
+        } else if ((strcmp(argv[i], "--jobs") == 0 || strcmp(argv[i], "-j") == 0) && i + 1 < argc) {
+            jobs = atoi(argv[++i]);
+#if defined(_SC_NPROCESSORS_ONLN)   /* hidden by _POSIX_C_SOURCE on macOS */
+            if (jobs <= 0) jobs = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+            if (jobs <= 0) jobs = 4;
+        } else if (strcmp(argv[i], "--quick") == 0) {
+            quick = true;
+        } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+#if !defined(_WIN32)
+            g_test_timeout_ms = atof(argv[i + 1]) * 1e3;
+            if (g_test_timeout_ms <= 0) g_test_timeout_ms = 1e12;
+#endif
+            i++;
+        } else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
+            replay = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [-f SUBSTR] [-j N] [--quick] [--census PATH]\n", argv[0]);
+            printf("  -f, --filter SUBSTR   Only run tests whose name contains SUBSTR.\n");
+            printf("  -j, --jobs N          Run tests in N worker processes (0 = one per CPU).\n");
+            printf("  --timeout SEC         With -j: fail a test that runs longer (default 600; 0 = none).\n");
+            printf("  --quick               Leave out the equivalence pass and the slow tests\n");
+            printf("                        listed in quick_skip (test/main.c).\n");
+            printf("  --replay FILE         Run the tests named in FILE (one a line), in that order,\n");
+            printf("                        in one process: what -j prints for a failure.\n");
+            printf("  --census PATH         Record .rfl lines whose grouping ran on the legacy ladder.\n");
+            return 0;
+        } else {
+            fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    /* the census file is one stream written test by test: keep it serial */
+    if (g_census) jobs = 1;
+#if defined(_WIN32)
+    jobs = 1;   /* no fork(): the parallel runner is POSIX only */
+#endif
+
+    if (g_census) setvbuf(g_census, NULL, _IOLBF, 0);   /* closed by the OS at exit; lines land as written */
+    if (tmp_root_init() != 0) return 2;
+    const char* rfl_root = getenv("RFL_ROOT");
+    if (!rfl_root || !*rfl_root) rfl_root = "test/rfl";
+    if (rfl_scan(rfl_root) < 0) return 2;
+
+    collect_jobs(replay ? NULL : filter, replay ? false : quick);
+    if (replay && replay_select(replay) != 0) return 2;
+    if (replay) jobs = 1;
+
+    int pass = 0, fail = 0, skip = 0, total = g_njobs;
+    double t0 = now_wall_ms();
+    if (jobs > 1 && g_njobs > 1) {
+#if !defined(_WIN32)
+        char times_path[600];
+        snprintf(times_path, sizeof times_path, "%s.times", argv[0]);
+        printf("running %d tests in %d workers\n", g_njobs, jobs < g_njobs ? jobs : g_njobs);
+        fflush(stdout);
+        /* exclusive tests last, in one worker of their own */
+        test_job_t* all = g_jobs;
+        int nall = g_njobs, nx = 0;
+        for (int i = 0; i < nall; i++)
+            if (!exclusive_test(all[i].e.name)) { test_job_t t = all[i]; all[i] = all[nx]; all[nx++] = t; }
+        int phases[2][2] = { { 0, nx }, { nx, nall - nx } };
+        for (int ph = 0; ph < 2; ph++) {
+            if (phases[ph][1] == 0) continue;
+            g_jobs = all + phases[ph][0]; g_njobs = phases[ph][1];
+            if (ph == 1) { printf("running %d exclusive tests one at a time\n", g_njobs); fflush(stdout); }
+            if (run_parallel(ph == 0 ? jobs : 1, times_path, &pass, &fail, &skip) != 0) return 2;
+        }
+        g_jobs = all; g_njobs = nall;
+#endif
+    } else {
+        if (private_cwd_enter() != 0) { fprintf(stderr, "cannot enter a private working directory\n"); return 2; }
+        for (int i = 0; i < g_njobs; i++) run_job(&g_jobs[i], &pass, &fail, &skip);
+    }
+
+    private_cwd_leave();
     (void)ray_test_rm_rf(g_tmp_root);
 
-    printf("\n%s=== %d of %d passed (%d skipped, %d failed) ===%s\n",
+    printf("\n%s=== %d of %d passed (%d skipped, %d failed) in %.1f s ===%s\n",
            fail ? C_RED : (skip ? C_YELLOW : C_GREEN),
-           pass, total, skip, fail, C_RESET);
+           pass, total, skip, fail, (now_wall_ms() - t0) / 1e3, C_RESET);
 
     return fail ? 1 : 0;
 }

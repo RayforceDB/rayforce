@@ -2754,6 +2754,9 @@ ray_err_t ray_index_hash_build_region(ray_t* v, ray_index_region_fn map, void* c
     bool has_ix = (v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index);
     memcpy(ix.saved_aux, has_ix ? ray_index_payload(v->index)->saved_aux : v->aux, 16);
     ix.saved_attrs = v->attrs & RAY_ATTR_HAS_NULLS;
+    /* UNIQUE rides on the root the caller attached, as in the in-memory
+     * attach (a property of the values, so of any re-keying of them). */
+    if (has_ix) ix.markers |= ray_index_payload(v->index)->markers & RAY_MARK_UNIQUE;
     ix.u.hash.table     = d.table;
     ix.u.hash.gkeys     = d.gkeys;
     ix.u.hash.offs      = d.offs;

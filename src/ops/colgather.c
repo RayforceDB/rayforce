@@ -127,7 +127,7 @@ static ray_t* acc_put(gather_acc_t* a, const ray_col_range_t* v, int64_t i, int6
             } else {
                 /* the view's pool lives until the next read: copy now */
                 const char* p = v->str_pool + s->pool_off;
-                uint32_t off;
+                uint32_t off = 0;   /* set by acc_pool_put on success; gcc -O1 cannot see it */
                 ray_t* err = acc_pool_put(a, p, s->len, &off);
                 if (err) return err;
                 memcpy(e.prefix, p, 4);
@@ -315,6 +315,7 @@ static ray_t* grows_range(ray_col_src_t* src, const int64_t* ids, const int64_t*
                 uint8_t nul[GATHER_POINT_ROWS];
                 const int64_t* rp = ids + k;     /* in order: the ids themselves */
                 if (ord) { for (int64_t q = k; q < j; q++) rows[q - k] = ids[ord[q]]; rp = rows; }
+                // cppcheck-suppress uninitvar // rp is ids + k, or rows filled for [k, j) just above
                 int pr = ray_col_src_gather_points(src, rp, j - k, x, nul, &err);
                 if (pr < 0) break;
                 if (pr > 0) {                    /* every row of the vector served */

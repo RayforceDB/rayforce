@@ -134,8 +134,22 @@ ifeq ($(RAY_WINDOWS),1)
                     -Wl,--stack,8388608
   RELEASE_LDFLAGS = -Wl,--gc-sections
 else ifeq ($(UNAME_S),Linux)
-  LIBS            = -lm -lpthread
+  # -ldl: the RDMA transport loads the verbs library at run time, only on a
+  # host that has it (glibc before 2.34 keeps dlopen in its own library).
+  LIBS            = -lm -lpthread -ldl
   RELEASE_LDFLAGS = -Wl,--gc-sections -Wl,--as-needed
+  # The remote-memory transport (src/core/rdma.c) needs the verbs headers
+  # to build; without them it compiles to "never available" and every
+  # connection stays on TCP or shared memory.  VERBS_INC points at an
+  # include directory holding infiniband/verbs.h when it is not the
+  # system's.
+  VERBS_INC ?= /usr/include
+  ifneq ($(wildcard $(VERBS_INC)/infiniband/verbs.h),)
+    DEFS += -DRAY_HAVE_VERBS
+    ifneq ($(VERBS_INC),/usr/include)
+      DEFS += -isystem $(VERBS_INC)
+    endif
+  endif
 else
   LIBS            = -lm
   RELEASE_LDFLAGS = -Wl,-dead_strip
@@ -181,6 +195,12 @@ HARDENED_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) -g \
 # the whole suite that way.
 NDEBUG_CFLAGS = $(DEBUG_CFLAGS) -DNDEBUG
 
+# fast: the dev-loop test flavour (`make test`).  The DEBUG invariant checks
+# and test seams, no sanitizers, -O1.  ASan+UBSan roughly double the suite's
+# run time; they run in `make test-full`, which gates every release PR.
+FAST_CFLAGS = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG \
+  -fno-omit-frame-pointer
+
 # Strict IEEE arithmetic for the ALP / ALP_RD codec (compressed-columns P5):
 # its decode is a fixed expression (spec "ALP") and must give the same bits
 # in every build profile, so reassociation, contraction and signed-zero
@@ -217,6 +237,9 @@ NDEBUG_MAIN_OBJ = $(MAIN_SRC:.c=.ndebug.o)
 NDEBUG_TEST_OBJ = $(TEST_SRC:.c=.ndebug.o)
 RELT_LIB_OBJ  = $(LIB_SRC:.c=.reltest.o)
 RELT_TEST_OBJ = $(TEST_SRC:.c=.reltest.o)
+FAST_LIB_OBJ  = $(LIB_SRC:.c=.fast.o)
+FAST_MAIN_OBJ = $(MAIN_SRC:.c=.fast.o)
+FAST_TEST_OBJ = $(TEST_SRC:.c=.fast.o)
 
 # Auto-generated header dependencies (one .d per .o, see DEPFLAGS).
 # The fragments are -included at the very END of this file — including
@@ -228,7 +251,8 @@ DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
        $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
        $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d) \
        $(NDEBUG_LIB_OBJ:.o=.d) $(NDEBUG_MAIN_OBJ:.o=.d) $(NDEBUG_TEST_OBJ:.o=.d) \
-       $(RELT_LIB_OBJ:.o=.d) $(RELT_TEST_OBJ:.o=.d)
+       $(RELT_LIB_OBJ:.o=.d) $(RELT_TEST_OBJ:.o=.d) \
+       $(FAST_LIB_OBJ:.o=.d) $(FAST_MAIN_OBJ:.o=.d) $(FAST_TEST_OBJ:.o=.d)
 
 # Default target (pinned so an -included .d fragment can't steal it).
 .DEFAULT_GOAL := default
@@ -257,6 +281,9 @@ default: debug
 %.ndebug.o: %.c
 	$(CC) -c $(NDEBUG_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
+%.fast.o: %.c
+	$(CC) -c $(FAST_CFLAGS) $(FP_STRICT_$*) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
 # The C suite in the RELEASE FP profile (`make test-release`).  Its own object
 # flavour: the release flags plus -DDEBUG, because the suite calls test
 # seams compiled only under DEBUG (platform.h, ipc.h, lang/internal.h);
@@ -270,7 +297,7 @@ default: debug
 # accessors, the REPL and crash banners, .sys.build, and the test that compares
 # ray_git_commit against GIT_HASH), in every object flavour.
 BUILD_INFO_SRCS := src/core/types src/app/repl src/core/crash src/ops/system test/test_types
-BUILD_INFO_OBJS := $(foreach v,.o .rel.o .lib.o .fuzz.o .tsan.o .hard.o .ndebug.o .reltest.o,$(addsuffix $(v),$(BUILD_INFO_SRCS)))
+BUILD_INFO_OBJS := $(foreach v,.o .rel.o .lib.o .fuzz.o .tsan.o .hard.o .ndebug.o .reltest.o .fast.o,$(addsuffix $(v),$(BUILD_INFO_SRCS)))
 $(BUILD_INFO_OBJS): $(BUILD_INFO_STAMP)
 
 # Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
@@ -372,29 +399,50 @@ install-headers:
 TEST_CORES ?= 2
 TEST_FILTER ?=
 TEST_ARGS = $(if $(TEST_FILTER),-f $(TEST_FILTER),)
+# Test processes: the driver forks TEST_JOBS workers and hands each one test
+# at a time, slowest first (from <binary>.times, written by the last run).
+# TEST_JOBS=1 runs everything in one process, in file order.
+TEST_JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
+# fsync, directory fsync and msync(MS_SYNC) are no-ops under the suite
+# (RAYFORCE_NO_FSYNC): a test cannot observe durability, and on a busy or
+# nearly full disk each flush costs milliseconds -- about a third of the
+# suite's wall time.  TEST_FSYNC=1 keeps the real flushes.
+TEST_ENV = RAYFORCE_CORES=$(TEST_CORES) $(if $(TEST_FSYNC),,RAYFORCE_NO_FSYNC=1)
+TEST_RUN = $(TEST_ENV) ./$(1) -j $(TEST_JOBS) $(TEST_ARGS)
 
-# Tests.  Depends on $(TARGET) because test/rfl/system/ipc_diff.rfl
-# spawns ./$(TARGET) as an IPC server via .sys.exec — both binaries
-# must exist on disk and share the build flavour (sanitizers, coverage).
-test: CFLAGS = $(DEBUG_CFLAGS)
-test: LDFLAGS = $(DEBUG_LDFLAGS)
-test: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
+# The dev-loop suite: FAST_CFLAGS (DEBUG checks, no sanitizers), --quick (no
+# equivalence pass, no randomized stress soak), every test in parallel.
+# Relinks ./$(TARGET) in the same flavour: test/rfl/system/ipc_diff.rfl
+# spawns it as an IPC server via .sys.exec.
+test: $(FAST_LIB_OBJ) $(FAST_MAIN_OBJ) $(FAST_TEST_OBJ)
+	$(CC) $(FAST_CFLAGS) -o $(TARGET) $(FAST_LIB_OBJ) $(FAST_MAIN_OBJ) $(LIBS)
+	$(CC) $(FAST_CFLAGS) -o $(TARGET).test.fast $(FAST_LIB_OBJ) $(FAST_TEST_OBJ) $(LIBS) -Itest
+	$(call TEST_RUN,$(TARGET).test.fast) --quick
+
+# The whole suite under ASan+UBSan: every test, the equivalence pass and the
+# stress soak.  The gate for release PRs (dev -> master); also what coverage
+# and the nightly jobs build on.
+test-full: test-full-bin
+	$(call TEST_RUN,$(TARGET).test)
+
+test-full-bin: CFLAGS = $(DEBUG_CFLAGS)
+test-full-bin: LDFLAGS = $(DEBUG_LDFLAGS)
+test-full-bin: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
-	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
 
 # The suite with every assert() compiled out (see NDEBUG_CFLAGS).  Relinks
 # ./$(TARGET) in the same flavour, as `test` does, for the IPC-diff tests.
 test-ndebug: $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ)
 	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET) $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(LIBS) $(DEBUG_LDFLAGS)
 	$(CC) $(NDEBUG_CFLAGS) -o $(TARGET).test $(NDEBUG_LIB_OBJ) $(NDEBUG_TEST_OBJ) $(LIBS) $(DEBUG_LDFLAGS) -Itest
-	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test $(TEST_ARGS)
+	$(call TEST_RUN,$(TARGET).test)
 
 # The suite over the .reltest.o flavour (see its pattern rule).  Does not
 # relink ./$(TARGET): tests that spawn it get whatever build is on disk.
 test-release: $(RELT_LIB_OBJ) $(RELT_TEST_OBJ)
 	$(CC) $(RELEASE_CFLAGS) -o $(TARGET).test.rel $(RELT_LIB_OBJ) $(RELT_TEST_OBJ) $(LIBS) $(RELEASE_LDFLAGS)
-	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test.rel $(TEST_ARGS)
+	$(call TEST_RUN,$(TARGET).test.rel)
 
 # Multi-GiB generation-2 STR pool limits (spec "Large data").  Needs ~10 GiB
 # of RAM and ~5 GiB of free space under /tmp.
@@ -402,7 +450,7 @@ test-large: CFLAGS = $(DEBUG_CFLAGS)
 test-large: LDFLAGS = $(DEBUG_LDFLAGS)
 test-large: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
-	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test -f large/
+	$(TEST_ENV) ./$(TARGET).test -f large/
 
 # Generation-2 wire structs compile to the same layout on wasm32 (no libc
 # needed: test/wasm/stub supplies the three string.h declarations).
@@ -462,7 +510,7 @@ coverage:
 	$(MAKE) clean
 	rm -f cov-*.profraw default.profraw coverage.profdata
 	rm -rf coverage_html
-	LLVM_PROFILE_FILE='cov-%p.profraw' $(MAKE) test \
+	LLVM_PROFILE_FILE='cov-%p.profraw' $(MAKE) test-full \
 		CC=clang \
 		DEBUG_CFLAGS='$(COVERAGE_CFLAGS)' \
 		DEBUG_LDFLAGS='$(COVERAGE_LDFLAGS)'
@@ -576,8 +624,11 @@ tidy:
 # each file up to 12 times — most files hit that cap, which is what made
 # the whole-tree pass take ~50 minutes.  Undefined macros stay undefined, so
 # the Windows/macOS/WASM branches are not analysed here; every Linux file is.
+# __has_attribute is given as 0: the analyser cannot evaluate the builtin in
+# an #if (parse.c), and the attributes it guards change no code paths.
 CPPCHECK_DEFS = -D__linux__ -D__GNUC__ -D__x86_64__ -D__SIZEOF_INT128__=16 \
-  -D__ORDER_LITTLE_ENDIAN__=1234 -D__BYTE_ORDER__=1234 -D__GLIBC__ -DDEBUG
+  -D__ORDER_LITTLE_ENDIAN__=1234 -D__BYTE_ORDER__=1234 -D__GLIBC__ -DDEBUG \
+  '-D__has_attribute(x)=0'
 
 cppcheck:
 	@command -v cppcheck >/dev/null || { echo "cppcheck: not found"; exit 1; }
@@ -599,9 +650,11 @@ clean:
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
 	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) \
 	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ) \
-	       $(RELT_LIB_OBJ) $(RELT_TEST_OBJ)
+	       $(RELT_LIB_OBJ) $(RELT_TEST_OBJ) \
+	       $(FAST_LIB_OBJ) $(FAST_MAIN_OBJ) $(FAST_TEST_OBJ)
 	-rm -f $(DEPS)
-	-rm -f $(TARGET) $(TARGET).test $(TARGET).test.rel lib$(TARGET).a
+	-rm -f $(TARGET) $(TARGET).test $(TARGET).test.rel $(TARGET).test.fast lib$(TARGET).a
+	-rm -f $(TARGET).test*.times
 	-rm -f $(TARGET).tsan $(TARGET).test.tsan
 	-rm -rf build build_release build_fuzz build_compdb dist
 	-rm -rf "$(STAGE_ROOT)/rayforce"
@@ -612,7 +665,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib dist install-headers test test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

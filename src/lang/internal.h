@@ -689,6 +689,7 @@ ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_auto_journal_eval_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n);
+ray_t* ray_ipc_transport_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_sub_fn(ray_t** args, int64_t n);
 ray_t* ray_mc_unsub_fn(ray_t* topic);
 ray_t* ray_mc_pub_fn(ray_t* topic, ray_t* payload);
@@ -704,8 +705,10 @@ ray_t* ray_guid_fn(ray_t* n_arg);
  * Implementations live in src/ops/journal.c; the on-disk machinery
  * is src/store/journal.c. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n);
+ray_t* ray_log_status_fn(ray_t** args, int64_t n);
 ray_t* ray_log_write_fn(ray_t* expr);
 ray_t* ray_log_replay_fn(ray_t* path);
+ray_t* ray_log_replay_report_fn(ray_t* path);
 ray_t* ray_log_validate_fn(ray_t* path);
 ray_t* ray_log_roll_fn(ray_t** args, int64_t n);
 ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n);
