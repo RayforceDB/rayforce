@@ -618,6 +618,189 @@ static test_result_t test_journal_replay_null_outparams(void) {
 
 /* 2k. Replay with multiple entries — eval error on one (error expression)
  * but framing intact: status stays OK, errs counter increments. */
+/* Additive replay reporting must expose evaluation errors without changing
+ * the legacy count, continuation, terminal errors or restriction boundary. */
+static void replay_report_test_free(ray_t* v) {
+    if (!v) return;
+    if (RAY_IS_ERR(v)) ray_error_free(v);
+    else ray_release(v);
+}
+
+static bool replay_report_test_counts(ray_t* r, int64_t entries, int64_t errors) {
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_DICT) return false;
+    ray_t* keys = ray_dict_keys(r);
+    ray_t* vals = ray_dict_vals(r);
+    if (!keys || keys->type != RAY_SYM || keys->len != 2 ||
+        !vals || vals->type != RAY_I64 || vals->len != 2) return false;
+    int64_t ek = ray_sym_intern("entries", 7);
+    int64_t fk = ray_sym_intern("eval_errors", 11);
+    const int64_t* counts = (const int64_t*)ray_data(vals);
+    return ek >= 0 && fk >= 0 && ray_vec_get_sym_id(keys, 0) == ek &&
+           ray_vec_get_sym_id(keys, 1) == fk && counts[0] == entries &&
+           counts[1] == errors;
+}
+
+static bool replay_report_test_write(FILE* f, const char* expression) {
+    if (!f) return false;
+    ray_t* v = ray_str(expression, strlen(expression));
+    bool ok = v && !RAY_IS_ERR(v) && write_journal_entry(f, v);
+    replay_report_test_free(v);
+    return ok;
+}
+
+static bool replay_report_test_read(const char* path, uint8_t* data,
+                                    size_t cap, size_t* out) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    *out = fread(data, 1, cap, f);
+    bool ok = !ferror(f) && feof(f);
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+static test_result_t test_journal_replay_report_mixed(void) {
+    char base[256]; make_base(base, sizeof(base), "report_mixed");
+    char path[270]; log_path(path, sizeof(path), base);
+    FILE* f = fopen(path, "wb");
+    bool wrote = replay_report_test_write(f, "(set _replay_report_marker (+ _replay_report_marker 1))");
+    wrote = replay_report_test_write(f, "(_replay_report_missing_handler 7)") && wrote;
+    wrote = replay_report_test_write(f, "(set _replay_report_marker (+ _replay_report_marker 10))") && wrote;
+    if (f && fclose(f) != 0) wrote = false;
+    uint8_t before[1024], after[1024];
+    size_t nb = 0, na = 0;
+    bool before_ok = replay_report_test_read(path, before, sizeof(before), &nb);
+
+    ray_t* init = ray_eval_str("(set _replay_report_marker 0)");
+    bool initialized = init && !RAY_IS_ERR(init);
+    replay_report_test_free(init);
+    char call[512];
+    snprintf(call, sizeof(call), "(.log.replay_report \"%s\")", path);
+    ray_t* report = ray_eval_str(call); /* also exercises builtin registration */
+    bool reported = replay_report_test_counts(report, 3, 1);
+    replay_report_test_free(report);
+    ray_t* marker = ray_eval_str("_replay_report_marker");
+    bool continued = marker && !RAY_IS_ERR(marker) &&
+                     marker->type == -RAY_I64 && marker->i64 == 11;
+    replay_report_test_free(marker);
+
+    init = ray_eval_str("(set _replay_report_marker 0)");
+    initialized = init && !RAY_IS_ERR(init) && initialized;
+    replay_report_test_free(init);
+    ray_t* arg = ray_str(path, strlen(path));
+    ray_t* legacy = arg && !RAY_IS_ERR(arg) ? ray_log_replay_fn(arg) : NULL;
+    bool legacy_count = legacy && !RAY_IS_ERR(legacy) &&
+                        legacy->type == -RAY_I64 && legacy->i64 == 3;
+    replay_report_test_free(legacy);
+    replay_report_test_free(arg);
+    marker = ray_eval_str("_replay_report_marker");
+    bool legacy_continued = marker && !RAY_IS_ERR(marker) &&
+                            marker->type == -RAY_I64 && marker->i64 == 11;
+    replay_report_test_free(marker);
+    bool after_ok = replay_report_test_read(path, after, sizeof(after), &na);
+    bool unchanged = before_ok && after_ok && nb == na && memcmp(before, after, nb) == 0;
+    cleanup_base(base);
+
+    TEST_ASSERT_TRUE(wrote && initialized);
+    TEST_ASSERT_TRUE(reported);
+    TEST_ASSERT_TRUE(continued); /* one replay; later entry still applied */
+    TEST_ASSERT_TRUE(legacy_count && legacy_continued);
+    TEST_ASSERT_TRUE(unchanged);
+    PASS();
+}
+
+static test_result_t test_journal_replay_report_clean(void) {
+    char base[256]; make_base(base, sizeof(base), "report_clean");
+    char path[270]; log_path(path, sizeof(path), base);
+    FILE* f = fopen(path, "wb");
+    bool opened = f != NULL;
+    if (f && fclose(f) != 0) opened = false;
+    ray_t* arg = ray_str(path, strlen(path));
+    ray_t* r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
+    bool empty = replay_report_test_counts(r, 0, 0);
+    replay_report_test_free(r);
+    f = fopen(path, "wb");
+    bool wrote = replay_report_test_write(f, "42");
+    if (f && fclose(f) != 0) wrote = false;
+    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
+    bool clean = replay_report_test_counts(r, 1, 0);
+    replay_report_test_free(r);
+    replay_report_test_free(arg);
+    cleanup_base(base);
+    TEST_ASSERT_TRUE(opened && wrote);
+    TEST_ASSERT_TRUE(empty && clean);
+    PASS();
+}
+
+static test_result_t test_journal_replay_report_terminal(void) {
+    char base[256]; make_base(base, sizeof(base), "report_terminal");
+    char path[270]; log_path(path, sizeof(path), base);
+    ray_t* arg = ray_str(path, strlen(path));
+    ray_t* r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
+    bool missing = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
+    replay_report_test_free(r);
+    FILE* f = fopen(path, "wb");
+    bool wrote = replay_report_test_write(f, "(set _replay_report_prefix 1)");
+    if (f && fputc(0, f) == EOF) wrote = false; /* short next header */
+    if (f && fclose(f) != 0) wrote = false;
+    r = ray_eval_str("(set _replay_report_prefix 0)");
+    bool initialized = r && !RAY_IS_ERR(r);
+    replay_report_test_free(r);
+    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
+    bool badtail = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "badtail") == 0;
+    replay_report_test_free(r);
+    r = ray_eval_str("_replay_report_prefix");
+    bool partial = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 1;
+    replay_report_test_free(r);
+    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_fn(arg) : NULL;
+    bool legacy_badtail = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "badtail") == 0;
+    replay_report_test_free(r);
+    r = ray_log_replay_report_fn(NULL);
+    bool type = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "type") == 0;
+    replay_report_test_free(r);
+    replay_report_test_free(arg);
+    cleanup_base(base);
+    TEST_ASSERT_TRUE(wrote && initialized);
+    TEST_ASSERT_TRUE(missing && badtail && legacy_badtail && type);
+    TEST_ASSERT_TRUE(partial); /* terminal error does not roll back prefix */
+    PASS();
+}
+
+static test_result_t test_journal_replay_report_restricted_cancel(void) {
+    char base[256]; make_base(base, sizeof(base), "report_restricted");
+    char path[270]; log_path(path, sizeof(path), base);
+    FILE* f = fopen(path, "wb");
+    bool wrote = replay_report_test_write(f, "(set _replay_report_guard 1)");
+    if (f && fclose(f) != 0) wrote = false;
+    ray_t* r = ray_eval_str("(set _replay_report_guard 0)");
+    bool initialized = r && !RAY_IS_ERR(r);
+    replay_report_test_free(r);
+    bool previous = ray_eval_get_restricted();
+    ray_eval_set_restricted(true);
+    char call[512]; snprintf(call, sizeof(call), "(.log.replay_report \"%s\")", path);
+    r = ray_eval_str(call);
+    bool restricted = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "access") == 0;
+    replay_report_test_free(r);
+    ray_eval_set_restricted(previous);
+    r = ray_eval_str("_replay_report_guard");
+    bool not_applied = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 0;
+    replay_report_test_free(r);
+    ray_t* arg = ray_str(path, strlen(path));
+    ray_request_interrupt();
+    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
+    bool cancelled = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "cancel") == 0;
+    replay_report_test_free(r);
+    ray_clear_interrupt();
+    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
+    bool healthy = replay_report_test_counts(r, 1, 0);
+    replay_report_test_free(r);
+    replay_report_test_free(arg);
+    cleanup_base(base);
+    TEST_ASSERT_TRUE(wrote && initialized);
+    TEST_ASSERT_TRUE(restricted && not_applied);
+    TEST_ASSERT_TRUE(cancelled && healthy);
+    PASS();
+}
+
 static test_result_t test_journal_replay_eval_error(void) {
     char base[256]; make_base(base, sizeof(base), "rep_evalerr");
     char lpath[270]; log_path(lpath, sizeof(lpath), base);
@@ -2973,8 +3156,10 @@ static test_result_t test_journal_open_releases_lock_on_long_base(void) {
     TEST_ASSERT_TRUE(dir[0] != '\0');
     /* The lengths below are what the kernel sees: on macOS /tmp is a
      * symlink to /private/tmp, and a path that fits only before that
-     * expansion fails with ENAMETOOLONG instead of reaching open_append. */
-    char path[1100];
+     * expansion fails with ENAMETOOLONG instead of reaching open_append.
+     * realpath(3) writes up to PATH_MAX bytes: a smaller buffer aborts
+     * under _FORTIFY_SOURCE. */
+    char path[4096];
     if (!realpath(dir, path)) snprintf(path, sizeof(path), "%s", dir);
     while (strlen(path) + 201 < 1010) {
         size_t n = strlen(path);
@@ -3064,6 +3249,10 @@ const test_entry_t journal_entries[] = {
     { "journal/replay_badtail_short_payload", test_journal_replay_badtail_short_payload, jrn_setup, jrn_teardown },
     { "journal/replay_null_outparams",     test_journal_replay_null_outparams,     jrn_setup, jrn_teardown },
     { "journal/replay_eval_error",         test_journal_replay_eval_error,         jrn_setup, jrn_teardown },
+    { "journal/replay_report_mixed", test_journal_replay_report_mixed, jrn_setup, jrn_teardown },
+    { "journal/replay_report_clean", test_journal_replay_report_clean, jrn_setup, jrn_teardown },
+    { "journal/replay_report_terminal", test_journal_replay_report_terminal, jrn_setup, jrn_teardown },
+    { "journal/replay_report_restricted_cancel", test_journal_replay_report_restricted_cancel, jrn_setup, jrn_teardown },
     /* Open/Close */
     { "journal/open_close_basic",          test_journal_open_close_basic,          jrn_setup, jrn_teardown },
     { "journal/open_bad_base",             test_journal_open_bad_base,             jrn_setup, jrn_teardown },

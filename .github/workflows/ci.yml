@@ -13,6 +13,13 @@ on:
   pull_request:
     branches: [master, dev]
 
+# Test tiers.  A PR into dev runs `make test`: the dev-loop suite (DEBUG
+# checks, no sanitizers, no equivalence pass or stress soak, all tests in
+# parallel).  A release PR into master runs `make test-full`: every test
+# under ASan+UBSan, plus the NDEBUG leg -- the gate before anything ships.
+env:
+  TEST_TIER: ${{ github.base_ref == 'master' && 'test-full' || 'test' }}
+
 jobs:
   build-and-test:
     runs-on: ${{ matrix.os }}
@@ -45,12 +52,22 @@ jobs:
         if: matrix.target == 'release' && matrix.compiler == 'gcc'
         run: make -j2 lib CC=${{ matrix.compiler }}
 
-      # Debug legs execute the sanitizer suite; release legs verify optimized
-      # artifacts. Runtime tests under release FP flags use the separate
-      # `make test-release` profile, not the debug suite below.
-      - name: Test
+      # Debug legs execute the suite (tier: see TEST_TIER above); release legs
+      # verify optimized artifacts. Runtime tests under release FP flags use
+      # the separate `make test-release` profile, not the debug suite below.
+      - name: Test (${{ env.TEST_TIER }})
         if: matrix.target == 'debug'
-        run: make test CC=${{ matrix.compiler }}
+        run: make ${{ env.TEST_TIER }} CC=${{ matrix.compiler }}
+
+      # A test that failed in a parallel worker leaves the list of tests that
+      # worker ran (`--replay FILE` reruns them in that order in one process).
+      - name: Upload test replay files
+        if: failure() && matrix.target == 'debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-replay-${{ matrix.os }}-${{ matrix.compiler }}
+          path: /tmp/rayforce_replay.*
+          if-no-files-found: ignore
 
   # The default Ubuntu compiler is gcc. Exercise the suite with a recent
   # upstream Clang as well, so new -Werror diagnostics reach CI before users
@@ -67,14 +84,23 @@ jobs:
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 23
-      - name: Test with Clang 23
-        run: make test CC=clang-23
+      - name: Test with Clang 23 (${{ env.TEST_TIER }})
+        run: make ${{ env.TEST_TIER }} CC=clang-23
+      - name: Upload test replay files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-replay-clang-current
+          path: /tmp/rayforce_replay.*
+          if-no-files-found: ignore
 
   # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
   # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;
   # work placed inside an assert then silently vanishes (#652: an NDEBUG build
   # registered no builtins).  This leg keeps the code correct either way.
+  # A whole sanitized suite: release PRs (into master) only.
   ndebug:
+    if: github.base_ref == 'master'
     runs-on: ubuntu-latest
     env:
       # This leg tests assert removal, not hosted-CPU ISA autodetection.
@@ -186,8 +212,8 @@ jobs:
         run: |
           bt='${{ needs.build-and-test.result }}'
           cl='${{ needs.clang-current.result }}'
-          nd='${{ needs.ndebug.result }}'
+          nd='${{ needs.ndebug.result }}'   # skipped on PRs into dev (release-PR only)
           fz='${{ needs.fuzz-smoke.result }}'
           ts='${{ needs.tsan.result }}'
           echo "build-and-test: $bt   clang-current: $cl   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
-          [ "$bt" = "success" ] && [ "$cl" = "success" ] && [ "$nd" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
+          [ "$bt" = "success" ] && [ "$cl" = "success" ] && { [ "$nd" = "success" ] || [ "$nd" = "skipped" ]; } && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1

@@ -2781,6 +2781,10 @@ ray_t* ray_scratch_realloc(ray_t* v, size_t new_data_size) {
  * ray_mem_stats
  * -------------------------------------------------------------------------- */
 
+void ray_mem_peak_reset_for_test(void) {
+    if (ray_tl_heap) RAY_STAT(ray_tl_heap->stats.peak_bytes = ray_tl_heap->stats.bytes_allocated);
+}
+
 void ray_mem_stats(ray_mem_stats_t* out) {
     if (ray_tl_heap)
         *out = ray_tl_heap->stats;
