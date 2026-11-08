@@ -1748,6 +1748,7 @@ ray_t* ray_distinct_fn(ray_t* x) {
         for (int i = 0; i < nu - 1; i++)
             for (int j = i + 1; j < nu; j++)
                 if ((unsigned char)uniq[i] > (unsigned char)uniq[j]) { char t = uniq[i]; uniq[i] = uniq[j]; uniq[j] = t; }
+        // cppcheck-suppress uninitvar // only the first nu bytes, filled above, are read
         return ray_str(uniq, (size_t)nu);
     }
 
@@ -4605,7 +4606,6 @@ ray_t* differ_vec_eager(ray_t* x) {
 typedef struct {
     uint64_t sum_i;
     double   sum_f;
-    double   sum_sq_f;
     int64_t  count;
 } ts_mprefix_state_t;
 
@@ -4615,7 +4615,6 @@ typedef struct {
     ray_pool_t* pool;
     uint64_t* prefix_i;
     double* prefix_f;
-    double* prefix_sq_f;
     int64_t* prefix_count;
     ts_mprefix_state_t* summary;
     ts_mprefix_state_t* carry;
@@ -4684,27 +4683,21 @@ static void ts_mprefix_scan_fn(void* vctx, uint32_t worker_id, int64_t start, in
 
         uint64_t sum_i = 0;
         double sum_f = 0.0;
-        double sum_sq_f = 0.0;
         int64_t count = 0;
         for (int64_t r = lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             bool nn = !(c->has_nulls && ray_vec_is_null(c->src, r));
             if (nn) {
                 if (c->prefix_i) sum_i += (uint64_t)ts_read_as_i64(c->src, r);
-                if (c->prefix_f || c->prefix_sq_f) {
-                    double v = ts_read_as_f64(c->src, r);
-                    if (c->prefix_f) sum_f += v;
-                    if (c->prefix_sq_f) sum_sq_f += v * v;
-                }
+                if (c->prefix_f) sum_f += ts_read_as_f64(c->src, r);
                 count++;
             }
             if (c->prefix_i)      c->prefix_i[r + 1] = sum_i;
             if (c->prefix_f)      c->prefix_f[r + 1] = sum_f;
-            if (c->prefix_sq_f)   c->prefix_sq_f[r + 1] = sum_sq_f;
             if (c->prefix_count)  c->prefix_count[r + 1] = count;
         }
         c->summary[b] = (ts_mprefix_state_t){
-            .sum_i = sum_i, .sum_f = sum_f, .sum_sq_f = sum_sq_f, .count = count
+            .sum_i = sum_i, .sum_f = sum_f, .count = count
         };
     }
 }
@@ -4722,7 +4715,6 @@ static void ts_mprefix_adjust_fn(void* vctx, uint32_t worker_id, int64_t start, 
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             if (c->prefix_i)      c->prefix_i[r + 1] += carry.sum_i;
             if (c->prefix_f)      c->prefix_f[r + 1] += carry.sum_f;
-            if (c->prefix_sq_f)   c->prefix_sq_f[r + 1] += carry.sum_sq_f;
             if (c->prefix_count)  c->prefix_count[r + 1] += carry.count;
         }
     }
@@ -4755,21 +4747,6 @@ static void ts_mprefix_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
                 }
                 break;
             }
-            case OP_MVAR:
-            case OP_MDEV: {
-                int64_t cnt = c->prefix_count[hi] - c->prefix_count[lo];
-                if (cnt <= 0) {
-                    ray_vec_set_null(c->dst, r, true);
-                } else {
-                    double sum = c->prefix_f[hi] - c->prefix_f[lo];
-                    double sum_sq = c->prefix_sq_f[hi] - c->prefix_sq_f[lo];
-                    double mean = sum / (double)cnt;
-                    double var = sum_sq / (double)cnt - mean * mean;
-                    if (var < 0.0) var = 0.0;
-                    ((double*)out)[r] = ray_f64_fin(c->opcode == OP_MDEV ? sqrt(var) : var);
-                }
-                break;
-            }
         }
     }
 }
@@ -4783,16 +4760,15 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 
     int64_t nblocks = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
     int64_t entries = n + 1;
-    ray_t *pi_hdr = NULL, *pf_hdr = NULL, *psq_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
+    ray_t *pi_hdr = NULL, *pf_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
     uint64_t* prefix_i = NULL;
     double* prefix_f = NULL;
-    double* prefix_sq_f = NULL;
     int64_t* prefix_count = NULL;
 
     bool need_i = (opcode == OP_MSUM && out_type == RAY_I64);
-    bool need_sq = (opcode == OP_MVAR || opcode == OP_MDEV);
-    bool need_f = (opcode == OP_MAVG || need_sq || (opcode == OP_MSUM && out_type == RAY_F64));
-    bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT || need_sq);
+    bool need_f = (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64));
+    bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT);
+    bool has_nulls = ray_vec_may_have_nulls(x);
 
     if (need_i) {
         if (ts_size_overflows(entries, sizeof(uint64_t))) { ray_release(out); return ray_error("oom", NULL); }
@@ -4806,20 +4782,10 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         }
         prefix_f = (double*)scratch_calloc(&pf_hdr, (size_t)entries * sizeof(double));
     }
-    if (need_sq) {
-        if (ts_size_overflows(entries, sizeof(double))) {
-            if (pi_hdr) scratch_free(pi_hdr);
-            if (pf_hdr) scratch_free(pf_hdr);
-            ray_release(out);
-            return ray_error("oom", NULL);
-        }
-        prefix_sq_f = (double*)scratch_calloc(&psq_hdr, (size_t)entries * sizeof(double));
-    }
     if (need_count) {
         if (ts_size_overflows(entries, sizeof(int64_t))) {
             if (pi_hdr) scratch_free(pi_hdr);
             if (pf_hdr) scratch_free(pf_hdr);
-            if (psq_hdr) scratch_free(psq_hdr);
             ray_release(out);
             return ray_error("oom", NULL);
         }
@@ -4827,10 +4793,9 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     }
     ts_mprefix_state_t* summary = (ts_mprefix_state_t*)scratch_calloc(&sum_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
     ts_mprefix_state_t* carry = (ts_mprefix_state_t*)scratch_calloc(&carry_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
-    if ((need_i && !prefix_i) || (need_f && !prefix_f) || (need_sq && !prefix_sq_f) || (need_count && !prefix_count) || !summary || !carry) {
+    if ((need_i && !prefix_i) || (need_f && !prefix_f) || (need_count && !prefix_count) || !summary || !carry) {
         if (pi_hdr) scratch_free(pi_hdr);
         if (pf_hdr) scratch_free(pf_hdr);
-        if (psq_hdr) scratch_free(psq_hdr);
         if (pc_hdr) scratch_free(pc_hdr);
         if (sum_hdr) scratch_free(sum_hdr);
         if (carry_hdr) scratch_free(carry_hdr);
@@ -4841,11 +4806,11 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     ray_pool_t* pool = ray_pool_get();
     ts_mprefix_ctx_t ctx = {
         .src = x, .dst = out, .pool = pool,
-        .prefix_i = prefix_i, .prefix_f = prefix_f, .prefix_sq_f = prefix_sq_f,
+        .prefix_i = prefix_i, .prefix_f = prefix_f,
         .prefix_count = prefix_count,
         .summary = summary, .carry = carry,
         .opcode = opcode,
-        .has_nulls = ray_vec_may_have_nulls(x),
+        .has_nulls = has_nulls,
         .window = window
     };
 
@@ -4858,7 +4823,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         carry[b] = run;
         run.sum_i += summary[b].sum_i;
         run.sum_f += summary[b].sum_f;
-        run.sum_sq_f += summary[b].sum_sq_f;
         run.count += summary[b].count;
     }
 
@@ -4869,7 +4833,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 
     if (pi_hdr) scratch_free(pi_hdr);
     if (pf_hdr) scratch_free(pf_hdr);
-    if (psq_hdr) scratch_free(psq_hdr);
     if (pc_hdr) scratch_free(pc_hdr);
     scratch_free(sum_hdr);
     scratch_free(carry_hdr);
@@ -4878,7 +4841,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 cancelled:
     if (pi_hdr) scratch_free(pi_hdr);
     if (pf_hdr) scratch_free(pf_hdr);
-    if (psq_hdr) scratch_free(psq_hdr);
     if (pc_hdr) scratch_free(pc_hdr);
     scratch_free(sum_hdr);
     scratch_free(carry_hdr);
@@ -4902,6 +4864,188 @@ static inline int64_t ts_task_lo(int64_t n, int64_t task, int64_t ntasks) {
     int64_t q = n / ntasks;
     int64_t r = n % ntasks;
     return q * task + (r * task) / ntasks;
+}
+
+typedef struct {
+    int64_t count;
+    double mean;
+    double m2;
+} ts_mvar_state_t;
+
+typedef struct {
+    double value;
+    bool nonnull;
+    ts_mvar_state_t aggregate;
+} ts_mvar_item_t;
+
+typedef struct {
+    ray_t* src;
+    ray_t* dst;
+    ray_pool_t* pool;
+    uint16_t opcode;
+    bool has_nulls;
+    int64_t window;
+    int64_t ntasks;
+    _Atomic(int) oom;
+} ts_mvar_ctx_t;
+
+/* Merge two adjacent Welford summaries without forming x*x.  The factor is
+ * applied before the second multiplication so finite variances near DBL_MAX
+ * do not overflow merely because the two group means have opposite signs. */
+static ts_mvar_state_t ts_mvar_merge(ts_mvar_state_t a, ts_mvar_state_t b) {
+    if (a.count == 0) return b;
+    if (b.count == 0) return a;
+    double total = (double)a.count + (double)b.count;
+    double delta = b.mean - a.mean;
+    double weight = (double)b.count / total;
+    /* Release builds permit reassociation.  Keep the range-saving order
+     * explicit across separate volatile evaluations: forming delta*delta
+     * first can overflow even when the scaled between-group term is finite. */
+    volatile double scaled_delta = delta * ((double)a.count / total);
+    volatile double pair_term = delta * scaled_delta;
+    double correction = pair_term * (double)b.count;
+    return (ts_mvar_state_t){
+        .count = a.count + b.count,
+        .mean = a.mean + delta * weight,
+        .m2 = a.m2 + b.m2 + correction
+    };
+}
+
+static ts_mvar_state_t ts_mvar_singleton(double value, bool nonnull) {
+    return (ts_mvar_state_t){
+        .count = nonnull ? 1 : 0,
+        .mean = nonnull ? value : 0.0,
+        .m2 = 0.0
+    };
+}
+
+static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_mvar_ctx_t* c = (ts_mvar_ctx_t*)vctx;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+
+    int64_t n = c->src->len;
+    for (int64_t task = start; task < end; task++) {
+        int64_t lo = ts_task_lo(n, task, c->ntasks);
+        int64_t hi = ts_task_lo(n, task + 1, c->ntasks);
+        if (lo >= hi) continue;
+        int64_t scan_lo = (lo >= c->window - 1) ? (lo - c->window + 1) : 0;
+        int64_t cap = c->window < hi - scan_lo ? c->window : hi - scan_lo;
+        if (cap < 1) cap = 1;
+        if (ts_size_overflows(cap, sizeof(ts_mvar_item_t))) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+
+        /* The two stacks contain at most cap items together. Incoming grows
+         * from the left, outgoing from the right; transfer copies a popped
+         * item before replacing its slot. No extra cell is needed: expiration
+         * precedes the next push when the window is full. */
+        ray_t* queue_hdr = NULL;
+        ts_mvar_item_t* items = (ts_mvar_item_t*)scratch_alloc(
+            &queue_hdr, (size_t)cap * sizeof(ts_mvar_item_t));
+        if (!items) {
+            if (queue_hdr) scratch_free(queue_hdr);
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+
+        int64_t in_len = 0, out_len = 0, queue_len = 0;
+        for (int64_t r = scan_lo; r < hi; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - scan_lo)) {
+                scratch_free(queue_hdr);
+                return;
+            }
+
+            if (queue_len == c->window) {
+                if (out_len == 0) {
+                    int64_t transferred = 0;
+                    while (in_len > 0) {
+                        if (ts_morsel_checkpoint(c->pool, transferred++)) {
+                            scratch_free(queue_hdr);
+                            return;
+                        }
+                        ts_mvar_item_t item = items[--in_len];
+                        ts_mvar_state_t one = ts_mvar_singleton(item.value, item.nonnull);
+                        item.aggregate = out_len == 0 ? one :
+                            ts_mvar_merge(one, items[cap - out_len].aggregate);
+                        items[cap - ++out_len] = item;
+                    }
+                }
+                out_len--;
+                queue_len--;
+            }
+
+            bool nonnull = !(c->has_nulls && ray_vec_is_null(c->src, r));
+            double value = nonnull ? ts_read_as_f64(c->src, r) : 0.0;
+            ts_mvar_state_t one = ts_mvar_singleton(value, nonnull);
+            items[in_len] = (ts_mvar_item_t){
+                .value = value,
+                .nonnull = nonnull,
+                .aggregate = in_len == 0 ? one :
+                    ts_mvar_merge(items[in_len - 1].aggregate, one)
+            };
+            in_len++;
+            queue_len++;
+
+            if (r >= lo) {
+                ts_mvar_state_t state = {0};
+                if (out_len > 0) state = items[cap - out_len].aggregate;
+                if (in_len > 0) state = ts_mvar_merge(state, items[in_len - 1].aggregate);
+                if (state.count == 0) {
+                    ray_vec_set_null(c->dst, r, true);
+                } else if (state.count == 1) {
+                    ((double*)ray_data(c->dst))[r] = 0.0;
+                } else {
+                    double variance = state.m2 / (double)state.count;
+                    if (variance < 0.0) variance = 0.0;
+                    ((double*)ray_data(c->dst))[r] = ray_f64_fin(
+                        c->opcode == OP_MDEV ? sqrt(variance) : variance);
+                }
+            }
+        }
+        scratch_free(queue_hdr);
+    }
+}
+
+static ray_t* moving_variance_vec_eager(ray_t* x, uint16_t opcode,
+                                        int64_t window, int8_t out_type) {
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(out_type, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t workers = pool ? pool->n_workers + 1 : 1;
+    int64_t overlap_tasks = (n - 1) / window + 1;
+    if (overlap_tasks < 1) overlap_tasks = 1;
+    uint32_t ntasks = workers;
+    if ((int64_t)ntasks > overlap_tasks) ntasks = (uint32_t)overlap_tasks;
+    if (ntasks < 1) ntasks = 1;
+    if (n < RAY_PARALLEL_THRESHOLD) ntasks = 1;
+
+    ts_mvar_ctx_t ctx = {
+        .src = x, .dst = out, .pool = pool,
+        .opcode = opcode,
+        .has_nulls = ray_vec_may_have_nulls(x),
+        .window = window,
+        .ntasks = (int64_t)ntasks
+    };
+    atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
+
+    if (ntasks == 1) ts_mvar_task_fn(&ctx, 0, 0, 1);
+    else             ray_pool_dispatch_n(pool, ts_mvar_task_fn, &ctx, ntasks);
+
+    if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
+        ray_release(out);
+        return ray_error("oom", NULL);
+    }
+    if (pool_cancelled(pool)) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
+    return out;
 }
 
 static bool ts_mminmax_better(ts_mminmax_ctx_t* c, int64_t a, int64_t b) {
@@ -5040,6 +5184,8 @@ ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
     int8_t out_type = ts_moving_out_type(opcode, x->type);
     if (opcode == OP_MMIN || opcode == OP_MMAX)
         return moving_minmax_vec_eager(x, opcode, window, out_type);
+    if (opcode == OP_MVAR || opcode == OP_MDEV)
+        return moving_variance_vec_eager(x, opcode, window, out_type);
     return moving_prefix_vec_eager(x, opcode, window, out_type);
 }
 

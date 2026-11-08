@@ -5594,6 +5594,7 @@ static inline int32_t agg_sh_gid(agg_sh_ctx_t* c, agg_sh_t* sh, const agg_view_t
     uint32_t nk = c->n_keys;
     int64_t w[nk];
     for (uint32_t k = 0; k < nk; k++) w[k] = agg_vkey(v, c->rr->key_types, k, r);
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
     return agg_sh_find_or_insert_words(sh, w, c->vts, c->off, c->n_aggs, r);
 }
 
@@ -10928,10 +10929,120 @@ done:
     return result ? result : ray_error("oom", NULL);
 }
 
+/* The lexical ranks of the positions a SYM MIN / MAX names, for a column
+ * whose FILE dictionary is cold.  Compared group by group, the strings are
+ * read in row order, each where a row first names it: one page fault and a
+ * window of read-ahead per string, and in a page cache smaller than the
+ * dictionary the same pages are read again.  Read here instead once, in
+ * position order (the named entries asked for ahead where they are dense),
+ * copied and sorted, the groups compare ranks.  Not built (the strings are
+ * compared as before) when the copies would pass AGG_SYM_RANK_BYTES or a
+ * row names a position past the file. */
+#define AGG_SYM_RANK_BYTES ((uint64_t)64 << 20)
+#define AGG_SYM_RANK_SPAN  65536   /* positions one read-ahead decision covers */
+
+typedef struct {
+    int64_t*  ids;    /* the named positions, ascending */
+    uint32_t* rank;   /* rank[j]: the lexical rank of ids[j] */
+    int64_t   n;
+} agg_sym_rank_t;
+
+typedef struct { uint64_t off; uint32_t len; uint32_t j; const char* base; } agg_sym_rank_ent_t;
+
+static int agg_sym_rank_cmp(const void* a, const void* b) {
+    const agg_sym_rank_ent_t* x = a;
+    const agg_sym_rank_ent_t* y = b;
+    uint32_t m = x->len < y->len ? x->len : y->len;
+    int c = m ? memcmp(x->base + x->off, y->base + y->off, m) : 0;
+    return c ? c : (x->len > y->len) - (x->len < y->len);
+}
+
+static void agg_sym_rank_free(agg_sym_rank_t* r) {
+    ray_free_raw(r->ids); ray_free_raw(r->rank);
+    r->ids = NULL; r->rank = NULL; r->n = 0;
+}
+
+static bool agg_sym_rank_build(ray_t* src, const int64_t* rows, int64_t nrows, agg_sym_rank_t* out) {
+    ray_sym_domain_raw_t raw;
+    if (!ray_sym_domain_raw_pin(ray_sym_vec_domain(src), &raw) || !raw.ib ||
+        !ray_sym_domain_raw_cold(&raw)) return false;
+    const void* data = ray_data(src);
+    uint8_t* held = ray_calloc_raw((size_t)raw.count);
+    if (!held) return false;
+    int64_t n = 0;
+    for (int64_t i = 0; i < nrows; i++) {
+        int64_t c = ray_read_sym(data, rows[i], src->type, src->attrs);
+        if (c < 0 || c >= raw.count) { ray_free_raw(held); return false; }
+        if (!held[c]) { held[c] = 1; n++; }
+    }
+    agg_sym_rank_ent_t* ent = NULL;
+    char* bytes = NULL;
+    uint64_t blen = 0, bcap = 0;
+    bool ok = false;
+    out->ids = ray_alloc_raw((size_t)n * sizeof(int64_t));
+    out->rank = ray_alloc_raw((size_t)n * sizeof(uint32_t));
+    ent = ray_alloc_raw((size_t)n * sizeof(*ent));
+    if (!out->ids || !out->rank || !ent) goto done;
+    out->n = 0;
+    for (int64_t c = 0; c < raw.count; c++) if (held[c]) out->ids[out->n++] = c;
+    int64_t span_end = -1;
+    for (int64_t j = 0; j < n; j++) {
+        int64_t c = out->ids[j];
+        if (c >= span_end) {
+            /* the named positions of the next span: asked for whole when
+             * they are dense enough that the span's pages are most read */
+            span_end = c + AGG_SYM_RANK_SPAN;
+            int64_t k = j;
+            while (k < n && out->ids[k] < span_end) k++;
+            int64_t kb = (c / RAY_SYM_INDEX_STRIDE), ke = (out->ids[k - 1] / RAY_SYM_INDEX_STRIDE) + 1;
+            if ((k - j) * 32 >= AGG_SYM_RANK_SPAN && ke * RAY_SYM_INDEX_STRIDE < raw.count)
+                ray_vm_advise_willneed((void*)(raw.map + raw.ib[kb].off),
+                                       (size_t)(raw.ib[ke].off - raw.ib[kb].off));
+        }
+        if ((j & 65535) == 0 && ray_interrupted()) goto done;
+        size_t sl = 0;
+        const char* sp = ray_sym_domain_raw_str(&raw, c, &sl);
+        if (!sp) goto done;
+        if (blen + sl > AGG_SYM_RANK_BYTES) goto done;
+        if (blen + sl > bcap) {
+            uint64_t nc = bcap ? bcap * 2 : 1 << 20;
+            while (nc < blen + sl) nc *= 2;
+            char* nb = ray_realloc_raw(bytes, (size_t)nc);
+            if (!nb) goto done;
+            bytes = nb; bcap = nc;
+        }
+        if (sl) memcpy(bytes + blen, sp, sl);   /* position 0, the empty symbol, has no bytes */
+        ent[j] = (agg_sym_rank_ent_t){blen, (uint32_t)sl, (uint32_t)j, NULL};
+        blen += sl;
+    }
+    for (int64_t j = 0; j < n; j++) ent[j].base = bytes;
+    qsort(ent, (size_t)n, sizeof(*ent), agg_sym_rank_cmp);
+    uint32_t rk = 0;
+    for (int64_t j = 0; j < n; j++) {
+        if (j && agg_sym_rank_cmp(&ent[j - 1], &ent[j])) rk++;
+        out->rank[ent[j].j] = rk;
+    }
+    ok = true;
+done:
+    ray_free_raw(held); ray_free_raw(ent); ray_free_raw(bytes);
+    if (!ok) agg_sym_rank_free(out);
+    return ok;
+}
+
+static inline uint32_t agg_sym_rank_of(const agg_sym_rank_t* r, int64_t id) {
+    int64_t lo = 0, hi = r->n - 1;
+    while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (r->ids[mid] < id) lo = mid + 1; else hi = mid;
+    }
+    return r->rank[lo];
+}
+
 typedef struct {
     ray_t* src;
     uint16_t kind;
     ray_group_sym_view_t symbols;
+    const agg_sym_rank_t* rank;   /* NULL: compare the strings */
 } agg_index_winners_t;
 static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
     agg_index_winners_t* c = raw;
@@ -10980,7 +11091,10 @@ static int64_t agg_index_winner(void* raw, const int64_t* rows, int64_t count) {
         int64_t ir = ray_read_sym(data, r, c->src->type, c->src->attrs);
         int64_t ib = ray_read_sym(data, best, c->src->type, c->src->attrs);
         int cmp;
-        if (vocab_ok && ir >= 0 && ib >= 0 && ir < vocab.count && ib < vocab.count) {
+        if (c->rank) {
+            uint32_t a = agg_sym_rank_of(c->rank, ir), b = agg_sym_rank_of(c->rank, ib);
+            cmp = (a > b) - (a < b);
+        } else if (vocab_ok && ir >= 0 && ib >= 0 && ir < vocab.count && ib < vocab.count) {
             size_t lr, lb;
             const char* pr = ray_sym_domain_raw_str(&vocab, ir, &lr);
             const char* pb = ray_sym_domain_raw_str(&vocab, ib, &lb);
@@ -11126,10 +11240,14 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 /* Native first/last and lexical SYM extrema retain the source
                  * column's domain by gathering winning original row indices. */
                 int64_t* winners = cursor;
-                agg_index_winners_t work = {src, kind, {0}};
+                agg_index_winners_t work = {src, kind, {0}, NULL};
+                agg_sym_rank_t rank = {0};
                 if (src->type == RAY_SYM)
                     ray_sym_strings_borrow(&work.symbols.strings, &work.symbols.count);
+                if (src->type == RAY_SYM && (kind == OP_MIN || kind == OP_MAX) &&
+                    agg_sym_rank_build(src, rows, nrows, &rank)) work.rank = &rank;
                 ray_group_winners(agg_index_winner, &work, rows, offsets, counts, ng, winners);
+                agg_sym_rank_free(&rank);
                 if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
                 ray_profile_tick("indexed: selected winning rows");
                 col = ray_group_gather(src, winners, ng);

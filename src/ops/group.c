@@ -9739,17 +9739,23 @@ static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict 
      * one row-order chain (a vector add is lane-wise) */
     typedef double sc_v2d __attribute__((vector_size(16)));
     sc_v2d v0, v1, v2, v3;
+    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
     memcpy(&v0, &s->l[0], 16); memcpy(&v1, &s->l[2], 16);
+    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
     memcpy(&v2, &s->l[4], 16); memcpy(&v3, &s->l[6], 16);
     SC_F64_PIN(v0); SC_F64_PIN(v1); SC_F64_PIN(v2); SC_F64_PIN(v3);
     for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
         sc_v2d x0, x1, x2, x3;
+        // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
         memcpy(&x0, d + i, 16);     memcpy(&x1, d + i + 2, 16);
+        // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
         memcpy(&x2, d + i + 4, 16); memcpy(&x3, d + i + 6, 16);
         v0 += x0; v1 += x1; v2 += x2; v3 += x3;
         SC_F64_PIN(v0); SC_F64_PIN(v1); SC_F64_PIN(v2); SC_F64_PIN(v3);
     }
+    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
     memcpy(&s->l[0], &v0, 16); memcpy(&s->l[2], &v1, 16);
+    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
     memcpy(&s->l[4], &v2, 16); memcpy(&s->l[6], &v3, 16);
 #else
     for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)

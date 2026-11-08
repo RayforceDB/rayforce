@@ -567,13 +567,13 @@ static test_result_t test_sym_distinct_cancel_at_dispatch(void) {
 static test_result_t test_count_runs_route(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    (void)ray_test_rm_rf("/tmp/rayforce_test_count_runs");
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_count_runs"));
     /* 1.2M rows: runs of 5 over 60011 keys, each seen in 4 runs (the last
      * few keys in 3); k sparse 64-bit, h the same as I32, z zeros for the
      * radix twin, n a key with nulls, s a SYM of the key (the null symbol
      * among its 13 values), t a key of its own (3 values in runs of 7, so
      * a run of k holds two of t and a k meets every t), u keys without runs */
-    ray_t* r = ray_eval_str(
+    ray_t* r = ray_eval_str(ray_test_tmp(
         "(set ci (til 1200000))"
         "(set cg (% (div ci 5) 60011))"
         "(set cy (as 'SYMBOL (map (fn [j] (if (== j 4) \"\" (format \"y%\" j))) (til 13))))"
@@ -581,7 +581,7 @@ static test_result_t test_count_runs_route(void) {
         " (* ci 0) (+ (* cg 7919000003) (at [0 0 0 0Nl 0 0 0] (% cg 7))) (at cy (% cg 13))"
         " (% (div ci 7) 3) (% (* ci 2654435761) 1000000007))))"
         "(.db.splayed.set \"" CRUN_DIR "\" CR {compress: true})"
-        "(set CM (.db.splayed.get \"" CRUN_DIR "\"))");
+        "(set CM (.db.splayed.get \"" CRUN_DIR "\"))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
@@ -647,7 +647,7 @@ static test_result_t test_count_runs_route(void) {
         }
     r = ray_eval_str("(set CM 0)");
     if (r) ray_release(r);
-    (void)ray_test_rm_rf("/tmp/rayforce_test_count_runs");
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_count_runs"));
     PASS();
 }
 
@@ -656,7 +656,10 @@ static test_result_t test_count_runs_route(void) {
  * as a cancel request or the pool's flag alone, answers `cancel` over
  * blocks filled with garbage, never counts or keys from buffers the skipped
  * tasks did not write; armed past the last dispatch, the answer.  The
- * radix twin (a SUM beside the count) shares the emit. */
+ * radix twin (a SUM beside the count) shares the emit.  A cancel request
+ * is armed before each dispatch until the run that answers (the one armed
+ * past the last dispatch: every later one runs the same, uncancelled), the
+ * pool's flag alone before each of those dispatches and once past them. */
 static test_result_t test_count_runs_cancel_at_dispatch(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -676,9 +679,9 @@ static test_result_t test_count_runs_cancel_at_dispatch(void) {
     };
     ray_heap_test_scribble(true);
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
-        int cancelled = 0, answered = 0;
+        int cancelled = 0, answered = 0, last = 24;
         for (int mode = 0; mode < 2; mode++)
-            for (int k = 1; k <= 24; k++) {
+            for (int k = 1; k <= last; k++) {
                 ray_pool_test_cancel_at((uint32_t)k, mode == 1);
                 ray_t* got = ray_eval_str(cases[ci].q);
                 ray_pool_test_cancel_at(0, false);
@@ -703,6 +706,7 @@ static test_result_t test_count_runs_cancel_at_dispatch(void) {
                 TEST_ASSERT_FMT(ok, "case %zu mode %d, cancel before dispatch %d: %lld, want %lld", ci, mode, k,
                                 v, (long long)cases[ci].want);
                 answered++;
+                if (mode == 0) { last = k; break; }
             }
         if (cancelled == 0 || answered == 0) ray_heap_test_scribble(false);
         TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "case %zu: %d cancelled, %d answered", ci, cancelled, answered);
@@ -3640,13 +3644,13 @@ static test_result_t test_radix_topn_waves_gen2(void) {
 #define PFS_DIR  PFS_ROOT "/t/"
 
 static bool pfs_evict(void) {
-    DIR* d = opendir(PFS_DIR);
+    DIR* d = opendir(ray_test_tmp(PFS_DIR));
     if (!d) return false;
     bool ok = true;
     char path[512];
     for (struct dirent* e; (e = readdir(d)); ) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        snprintf(path, sizeof path, "%s%s", PFS_DIR, e->d_name);
+        snprintf(path, sizeof path, "%s%s", ray_test_tmp(PFS_DIR), e->d_name);
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
         if (fdatasync(fd) != 0 || posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0) ok = false;
@@ -3669,18 +3673,18 @@ static bool pfs_col_resident(const char* name) {
 static test_result_t test_select_read_ahead_mapped(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    (void)ray_test_rm_rf(PFS_ROOT);
-    ray_t* r = ray_eval_str(
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+    ray_t* r = ray_eval_str(ray_test_tmp(
         "(set pfs_i (til 400000))"
         "(set pfs_t (table [k d g u v] (list (div pfs_i 1000) (+ 2013.07.01 (div pfs_i 50000))"
         " (as 'I16 (% pfs_i 50)) (% (* pfs_i 7919) 1000003) (as 'I32 (% pfs_i 977)))))"
         "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
-        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
     if (!pfs_evict() || pfs_col_resident("u")) {
-        (void)ray_test_rm_rf(PFS_ROOT);
+        (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
         SKIP("page cache eviction has no effect here");
     }
 
@@ -3725,7 +3729,7 @@ static test_result_t test_select_read_ahead_mapped(void) {
     agg_test_no_wide_dense(false);
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
-    (void)ray_test_rm_rf(PFS_ROOT);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
     PASS();
 }
 
@@ -3737,18 +3741,18 @@ static test_result_t test_select_read_ahead_mapped(void) {
 static test_result_t test_select_read_ahead_sparse_filter(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    (void)ray_test_rm_rf(PFS_ROOT);
-    ray_t* r = ray_eval_str(
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+    ray_t* r = ray_eval_str(ray_test_tmp(
         "(set pfs_i (til 400000))"
         "(set pfs_t (table [u w s] (list (% (* pfs_i 7919) 1000003) (* pfs_i 3)"
         " (as 'SYM (map (fn [k] (format \"s%\" (% k 10000))) pfs_i)))))"
         "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
-        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
     if (!pfs_evict() || pfs_col_resident("w")) {
-        (void)ray_test_rm_rf(PFS_ROOT);
+        (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
         SKIP("page cache eviction has no effect here");
     }
     static const struct { const char* q; bool whole; } cases[] = {
@@ -3784,7 +3788,7 @@ static test_result_t test_select_read_ahead_sparse_filter(void) {
     }
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
-    (void)ray_test_rm_rf(PFS_ROOT);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
     PASS();
 }
 
@@ -3809,23 +3813,23 @@ static long cd_major_faults(void) {
 static test_result_t test_cd_gate_read_ahead(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
-    (void)ray_test_rm_rf(PFS_ROOT);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
     enum { FAULTS_MAX = 64 };
 
     /* w: 16 MB (4,096 pages); k, x, t: 32 MB each; t is the row number,
      * sorted, with the chunk-zone index a splayed column carries */
     enum { N = 4194304 };
-    ray_t* r = ray_eval_str(
+    ray_t* r = ray_eval_str(ray_test_tmp(
         "(set pfs_i (til 4194304))"
         "(set pfs_t (table [w k x t] (list (as 'I32 (% pfs_i 977)) (% pfs_i 1000)"
         " (% (* pfs_i 7919) 2000003) pfs_i)))"
         "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
-        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
     if (!pfs_evict() || pfs_col_resident("w")) {
-        (void)ray_test_rm_rf(PFS_ROOT);
+        (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
         SKIP("page cache eviction has no effect here");
     }
     ray_t* m = ray_eval_str("pfs_m");
@@ -3908,7 +3912,7 @@ static test_result_t test_cd_gate_read_ahead(void) {
     ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
-    (void)ray_test_rm_rf(PFS_ROOT);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
 
     /* The gate over a selection sparser than a row per page: the pages of
      * the sampled rows alone are asked for.  k3 (272 MB, 66,406 pages; a
@@ -3918,13 +3922,13 @@ static test_result_t test_cd_gate_read_ahead(void) {
      * many-groups mark — so the count is confirmed in full, over the half
      * of the column the estimate never touched. */
     enum { N3 = 34000000, SEL3 = 33000 };
-    r = ray_eval_str(
+    r = ray_eval_str(ray_test_tmp(
         "(set pfs_j (til 34000000))"
         "(set pfs_t (table [k3 x3] (list (% (* pfs_j 7919) 1000000) (as 'U8 (% pfs_j 200)))))"
         "(set pfs_j 0)"
         "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
         "(set pfs_t 0)"
-        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))");
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
@@ -3954,7 +3958,7 @@ static test_result_t test_cd_gate_read_ahead(void) {
     ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
-    (void)ray_test_rm_rf(PFS_ROOT);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
     PASS();
 }
 #endif
@@ -4155,11 +4159,18 @@ static test_result_t test_card_estimate(void) {
     PASS();
 }
 
-static int cdb_pair_cmp(const void* a, const void* b) {
-    const int64_t* x = (const int64_t*)a;
-    const int64_t* y = (const int64_t*)b;
-    if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
-    return x[1] < y[1] ? -1 : x[1] > y[1];
+/* Sorts n (group, value) pairs packed in a word each (the group above the
+ * value's 12 bits, the whole under 2^44): LSD radix, four passes of 11-bit
+ * digits, which leave the order in a; tmp holds n words. */
+static void cdb_pair_sort(uint64_t* a, uint64_t* tmp, int64_t n) {
+    static int64_t cnt[2048];
+    for (int shift = 0; shift < 40; shift += 11) {
+        memset(cnt, 0, sizeof cnt);
+        for (int64_t i = 0; i < n; i++) cnt[a[i] >> shift & 2047]++;
+        for (int64_t d = 0, at = 0; d < 2048; d++) { int64_t c = cnt[d]; cnt[d] = at; at += c; }
+        for (int64_t i = 0; i < n; i++) tmp[cnt[a[i] >> shift & 2047]++] = a[i];
+        uint64_t* t = a; a = tmp; tmp = t;
+    }
 }
 
 #define CDB_MAX_ROUNDS_TEST 5   /* the kernel's CDB_MAX_ROUNDS (3) and the rounding of its take */
@@ -4187,7 +4198,7 @@ static test_result_t test_cd_bounded_rounds(void) {
     ray_t* gid_hdr = ray_alloc((size_t)n_max * sizeof(int64_t));
     ray_t* expect_hdr = ray_alloc((size_t)2100002 * sizeof(int64_t));
     TEST_ASSERT_TRUE(pairs_hdr && gid_hdr && expect_hdr);
-    int64_t* pairs = (int64_t*)ray_data(pairs_hdr);
+    uint64_t* pk = (uint64_t*)ray_data(pairs_hdr);   /* the pairs, then the sort's scratch */
     int64_t* row_gid = (int64_t*)ray_data(gid_hdr);
     int64_t* expect = (int64_t*)ray_data(expect_hdr);
     for (int shape = 0; shape < 5; shape++) {
@@ -4217,13 +4228,13 @@ static test_result_t test_cd_bounded_rounds(void) {
             else ((int64_t*)ray_data(val))[i] = v;
             int64_t gid = k == NULL_I64 ? ng : k == ng ? -1 : ng - 1 - k;
             row_gid[i] = gid;
-            if (gid >= 0) { pairs[np * 2] = gid; pairs[np * 2 + 1] = v; np++; }
+            /* a value 0..3000, or the null as 3001 */
+            if (gid >= 0) pk[np++] = (uint64_t)gid << 12 | (uint64_t)(i % 89 == 0 ? 3001 : v);
         }
-        qsort(pairs, (size_t)np, 2 * sizeof(int64_t), cdb_pair_cmp);
+        cdb_pair_sort(pk, pk + n_max, np);
         memset(expect, 0, (size_t)(ng + 2) * sizeof(int64_t));
         for (int64_t i = 0; i < np; i++)
-            if (i == 0 || pairs[i * 2] != pairs[i * 2 - 2] || pairs[i * 2 + 1] != pairs[i * 2 - 1])
-                expect[pairs[i * 2]]++;
+            if (i == 0 || pk[i] != pk[i - 1]) expect[pk[i] >> 12]++;
 
         for (int run = 0; run < 3; run++) {
             if (shared && run == 1) continue;
@@ -4448,7 +4459,7 @@ static test_result_t test_cd_bounded_edges(void) {
  * map's slices are built for it (no kernel round), however short memory
  * is.  The first query counts in more than one round. */
 static test_result_t test_cd_bounded_select(void) {
-    ray_t* setup = ray_eval_str(
+    ray_t* setup = ray_eval_str(ray_test_tmp(
         "(do (set i (til 300000))"
         " (set T (table [k v s a] (list (at (concat [0N] (til 96)) (% i 97)) (at (concat [0N] (til 2999)) (% (* i 7919) 3000))"
         "   (at ['p 'q 'r 's 't 'u 'v] (% (* i 13) 7)) (% i 5))))"
@@ -4467,7 +4478,7 @@ static test_result_t test_cd_bounded_select(void) {
         " (.db.splayed.set \"/tmp/rayforce_test_cdb/r/2024.01.01/t/\" (table [k v] (list (% m 10) (% m 1000))))"
         " (.db.splayed.set \"/tmp/rayforce_test_cdb/r/2024.01.02/t/\" (table [k v] (list (% m 10) (+ 500 (% m 1000)))))"
         " (.db.splayed.set \"/tmp/rayforce_test_cdb/r/2024.01.03/t/\" (table [k] (list (% m 10))))"
-        " (set R (.db.parted.get \"/tmp/rayforce_test_cdb/r/\" 't)) 0)");
+        " (set R (.db.parted.get \"/tmp/rayforce_test_cdb/r/\" 't)) 0)"));
     TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
     static const struct { const char* query; const char* oracle; bool kernel; } q[] = {
         { "(at (select {u: (count (distinct v)) s: (sum a) from: T by: k asc: k}) 'u)",
@@ -4536,7 +4547,7 @@ static test_result_t test_cd_bounded_select(void) {
         TEST_ASSERT_EQ_I(tot->i64, 42940);
         ray_release(tot);
     }
-    ray_t* rm = ray_eval_str("(do (set P 0) (set R 0) (.sys.exec \"rm -rf /tmp/rayforce_test_cdb\"))");
+    ray_t* rm = ray_eval_str(ray_test_tmp("(do (set P 0) (set R 0) (.sys.exec \"rm -rf /tmp/rayforce_test_cdb\"))"));
     if (rm) ray_release(rm);
     PASS();
 }
@@ -4594,6 +4605,26 @@ static test_result_t test_cd_bounded_filtered(void) {
     PASS();
 }
 
+/* (div (til n) m) as an I64 vector filled directly: the sorted 10 M-row
+ * keys below, which the integer `div` over 10 M rows made in half a second
+ * each.  cdr_same checks a fill against its Rayfall form over the first
+ * 1,048,576 rows (cr for c10). */
+static ray_t* cdr_div(int64_t n, int64_t m) {
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = i / m;
+    return v;
+}
+static bool cdr_same(ray_t* v, const char* form) {
+    ray_t* w = ray_eval_str(form);
+    bool ok = w && !RAY_IS_ERR(w) && w->type == RAY_I64 && w->len <= v->len &&
+              memcmp(ray_data(w), ray_data(v), (size_t)w->len * sizeof(int64_t)) == 0;
+    if (w && RAY_IS_ERR(w)) ray_error_free(w); else if (w) ray_release(w);
+    return ok;
+}
+
 /* The route gate for a grouped distinct count (ray_cd_two_pass_preferred,
  * #756): the two-pass rewrite (true) against the slice dedup (false), from
  * the estimates above over 1,048,576 rows.  Each case turns on one rule. */
@@ -4636,8 +4667,10 @@ static test_result_t test_cd_route(void) {
     TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
     ray_release(k[0]); ray_release(x);
     /* the same two over a sorted key, read through the blocks */
-    k[0] = ray_eval_str("(div c10 19)");
-    x = ray_eval_str("(div c10 38)");
+    k[0] = cdr_div(10000000, 19);   /* (div c10 19) */
+    x = cdr_div(10000000, 38);      /* (div c10 38) */
+    TEST_ASSERT_NOT_NULL(k[0]); TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_TRUE(cdr_same(k[0], "(div cr 19)") && cdr_same(x, "(div cr 38)"));
     TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 10000000, 0, 28));
     ray_release(x);
     x = ray_eval_str("c10");
