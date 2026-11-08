@@ -150,6 +150,8 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 !!! note "Coercion rules"
 
     - **i64 + f64 → f64:** Arithmetic between integers and floats promotes to float.
+    - **f32 op f32 → f32:** `+ - * %` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with an i64, i32, or f64 operand widens to f64. An f32 result that overflows or is not finite is null.
+    - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
     - **bool → i64:** Booleans coerce to 1/0 in arithmetic contexts.
     - **i64 → bool:** In boolean contexts (if, cond), 0 is false, non-zero is true.
     - **Narrower → wider:** Comparisons across numeric types promote the narrower operand.
@@ -159,6 +161,14 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 ; Integer + float promotes to float
 (+ 1 2.0)               ; 3.0
 (* 3 1.5)               ; 4.5
+
+; f32 stays f32 against f32, widens against anything else
+(type (+ (as 'F32 [1.5 2.5]) (as 'F32 [1.0 1.0])))  ; 'F32
+(type (+ (as 'F32 [1.5 2.5]) 1))                    ; 'F64
+(type (min (as 'F32 [1.5 2.5])))                    ; 'f32
+(type (sum (as 'F32 [1.5 2.5])))                    ; 'f64
+(mins (as 'F32 [2.5 -3.5 0Nf 1.25]))                ; [2.5e -3.5e -3.5e -3.5e]
+(fill 0.0 (as 'F32 [2.5 0Nf]))                      ; [2.5e 0.0e]
 
 ; Boolean in arithmetic
 (+ 10 true)              ; 11
