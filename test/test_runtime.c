@@ -1501,7 +1501,7 @@ static test_result_t test_syscov_hopen_domain_errors(void) {
 static test_result_t test_syscov_hopen_with_credentials(void) {
     /* connection to non-existent server; covers the user/password extraction
      * branch (lines 799-807) even though the connect attempt fails with io */
-    TEST_ASSERT_TRUE(eval_err("(.ipc.open \"127.0.0.1:19999:user:pass\")", "io"));
+    TEST_ASSERT_TRUE(eval_err("(.ipc.open \"127.0.0.1:19974:user:pass\")", "io"));
     PASS();
 }
 
