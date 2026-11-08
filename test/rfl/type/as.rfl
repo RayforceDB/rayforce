@@ -789,3 +789,22 @@
 (count (at ASQR 1)) -- 3
 (type (at (at ASQR 1) 0)) -- 'i64
 (select {r: (as 'LIST v) from: (table [v] (list [1 2 3]))}) !- type
+;; the verb decides the evaluation strategy. select evaluates per row, so a
+;; column of atoms is rejected (above); update evaluates the whole column, so
+;; the same expression boxes it into a LIST column of atoms
+(set ASU (update {w: (as 'LIST v) from: (table [k v] (list [1 1 2] [10 20 30]))}))
+(type (at ASU 'w)) -- 'LIST
+(count (at ASU 'w)) -- 3
+(type (at (at ASU 'w) 0)) -- 'i64
+(at (at ASU 'w) 2) -- 30
+;; under where: the update expression must give a typed vector, so the LIST
+;; column is refused
+(update {w: (as 'LIST v) from: (table [k v] (list [1 1 2] [10 20 30])) where: (> v 15)}) !- type
+;; select by: gives one LIST per group, each holding that group's boxed cells
+(set ASB (select {r: (as 'LIST v) from: (table [k v] (list [1 1 2] [10 20 30])) by: k}))
+(type (at ASB 'r)) -- 'LIST
+(count (at ASB 'r)) -- 2
+(type (at (at ASB 'r) 0)) -- 'LIST
+(count (at (at ASB 'r) 0)) -- 2
+(count (at (at ASB 'r) 1)) -- 1
+(type (at (at (at ASB 'r) 0) 0)) -- 'i64
