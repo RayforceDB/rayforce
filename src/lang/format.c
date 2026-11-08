@@ -1092,6 +1092,7 @@ static ray_t* fmt_enc_window(fmt_buf_t* b, ray_t* tbl, int64_t ci, int64_t nrows
     if (height > FMT_TABLE_MAX_HEIGHT) return NULL;
     for (int64_t r = 0; r < height; r++) ids[r] = r < half ? r : nrows - height + r;
     ray_t* out = NULL;
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
     ray_t* err = ray_col_gather_enc(enc, NULL, true, ids, height, &out);
     if (err) {
         const char* code = ray_err_code(err);

@@ -142,7 +142,7 @@ static test_result_t test_float_bodies(void) {
     TEST_ASSERT_TRUE(memcmp(v, out, sizeof v) == 0);
     bp->len = 0;
     uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
-    ray_enc_dict_t dict = { dv, 4 };
+    ray_enc_dict_t dict = { dv, 4, NULL, 0 };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(i * 7) % 4];
     TEST_ASSERT_TRUE(ray_enc_body_size(RAY_ENC_DICT, v, RAY_ENC_VEC, K64F, &dict) > 0);
     TEST_ASSERT_TRUE(ray_enc_write_as(RAY_ENC_DICT, v, RAY_ENC_VEC, K64F, &dict, bp, &c));
@@ -407,7 +407,7 @@ static test_result_t test_float_choice(void) {
     TEST_ASSERT_EQ_I(choice_enc(v, RAY_ENC_VEC, 64, NULL, NULL, 0, &ch), 0);
     TEST_ASSERT_EQ_I(ch.enc, RAY_ENC_RLE);
     uint64_t dv[4] = { db(-3.5), NEG0_64, db(0.0), db(2.25) };
-    ray_enc_dict_t dict = { dv, 4 };
+    ray_enc_dict_t dict = { dv, 4, NULL, 0 };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = dv[(uint32_t)(i * 2654435761u) >> 30];
     TEST_ASSERT_EQ_I(choice_enc(v, RAY_ENC_VEC, 64, &dict, NULL, 0, &ch), 0);
     TEST_ASSERT_EQ_I(ch.enc, RAY_ENC_DICT);
@@ -1667,8 +1667,14 @@ static test_result_t test_part_zero_sign(void) {
     PASS();
 }
 
-/* The P5 exit gate: every shape x length x forced encoding x width, NaN
- * payloads and both zeros included, saved and loaded bit-exact. */
+/* The P5 exit gate: every shape x forced encoding x width at every vector
+ * edge (0, 1, 1023..1025) and across the chunk edge (65537: a full chunk 0
+ * and a one-row chunk 1), NaN payloads and both zeros included, saved and
+ * loaded bit-exact.  The two in-chunk edges 65535 (a short last vector) and
+ * 65536 (exactly one chunk) take half the shapes each, alternating with the
+ * width, so every (shape, width) still meets one of them under every
+ * encoding: a full product there repeats the same codec bodies over 64 Ki
+ * rows and was most of this test's time. */
 static void sweep_fill(int shape, int8_t type, int64_t n, void* out) {
     uint64_t s = 0x9E3779B97F4A7C15ull + (uint64_t)shape;
     for (int64_t i = 0; i < n; i++) {
@@ -1705,6 +1711,7 @@ static test_result_t test_sweep_bit_exact(void) {
     for (size_t t = 0; t < 2; t++)
         for (int shape = 0; shape < 6; shape++)
             for (size_t l = 0; l < sizeof lens / sizeof lens[0]; l++) {
+                if ((lens[l] == 65535 || lens[l] == 65536) && (size_t)(shape + t + (lens[l] & 1)) % 2) continue;
                 fl_vec = ray_vec_new(types[t], lens[l]); fl_vec->len = lens[l];
                 sweep_fill(shape, types[t], lens[l], ray_data(fl_vec));
                 fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
@@ -1715,7 +1722,7 @@ static test_result_t test_sweep_bit_exact(void) {
                 }
                 fl_drop();
             }
-    TEST_ASSERT_EQ_I(runs, 2 * 6 * 8 * 5);
+    TEST_ASSERT_EQ_I(runs, 2 * 6 * (6 + 1) * 5);                 /* 65535 / 65536: half the shapes each */
     PASS();
 }
 
@@ -1790,7 +1797,7 @@ static test_result_t test_fast_equals_reference(void) {
             TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_RLE, v, n, bmp, NULL, NULL, "rle"), "%s", fe_what);
             /* DICT over FOR_BP codes and over RLE codes */
             for (int k = 0; k < 40; k++) dvals[k] = fe_bits(ty, -20.0 + 0.75 * k);
-            ray_enc_dict_t dict = { dvals, 40 };
+            ray_enc_dict_t dict = { dvals, 40, NULL, 0 };
             for (int i = 0; i < n; i++) v[i] = dvals[(i * 7) % 40];
             TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &dict, NULL, "dict for_bp codes"), "%s", fe_what);
             for (int i = 0; i < n; i++) v[i] = dvals[(i / 50 * 3) % 40];
@@ -1833,7 +1840,7 @@ static test_result_t test_fast_equals_reference(void) {
             {
                 static uint64_t idv[5];
                 idv[0] = ninf; idv[1] = fe_bits(ty, -1.0); idv[2] = fe_bits(ty, 0.5); idv[3] = fe_bits(ty, 7.0); idv[4] = pinf;
-                ray_enc_dict_t idict = { idv, 5 };
+                ray_enc_dict_t idict = { idv, 5, NULL, 0 };
                 for (int i = 0; i < n; i++) v[i] = idv[(i * 3) % 5];
                 TEST_ASSERT_FMT(!fe_case(ty, RAY_ENC_DICT, v, n, bmp, &idict, NULL, "dict +-inf"), "%s", fe_what);
             }

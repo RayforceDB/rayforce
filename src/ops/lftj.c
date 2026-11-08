@@ -157,6 +157,7 @@ bool lftj_build_default_plan(lftj_enum_ctx_t* ctx,
             src_vars[r] = 0;
             dst_vars[r] = 1;
         }
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         return lftj_build_plan(ctx, rels, n_rels, n_vars, src_vars, dst_vars);
     } else if (n_vars == 4 && n_rels == 6) {
         /* 4-clique: rels[0]=a→b, rels[1]=a→c, rels[2]=a→d,
@@ -174,6 +175,7 @@ bool lftj_build_default_plan(lftj_enum_ctx_t* ctx,
             src_vars[r] = r;
             dst_vars[r] = r + 1;
         }
+        // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
         return lftj_build_plan(ctx, rels, n_rels, n_vars, src_vars, dst_vars);
     }
 
