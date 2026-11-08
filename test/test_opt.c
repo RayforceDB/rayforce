@@ -832,6 +832,57 @@ static test_result_t test_filter_reorder_selectivity(void) {
 }
 
 /*
+ * Test: a negated substring scan is ordered as a substring scan.  NOT over
+ * LIKE costs the LIKE it negates, so it does not run before a plain LIKE as
+ * if it were a cheap compare.
+ *
+ * Chain built: FILTER(not(like(b)), FILTER(like(a), SCAN(a)))
+ * Expected after reorder: inner predicate = like(a), outer = not(like(b)).
+ */
+static test_result_t test_filter_reorder_not_like(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t a_data[] = {ray_sym_intern("xa", 2), ray_sym_intern("ya", 2),
+                        ray_sym_intern("xb", 2), ray_sym_intern("yb", 2)};
+    int64_t b_data[] = {a_data[2], a_data[3], a_data[0], a_data[1]};
+    ray_t* a_vec = ray_vec_from_raw(RAY_SYM, a_data, n);
+    ray_t* b_vec = ray_vec_from_raw(RAY_SYM, b_data, n);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("a", 1), a_vec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("b", 1), b_vec);
+    ray_release(a_vec);
+    ray_release(b_vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* base   = ray_scan(g, "a");
+    ray_op_t* like_a = ray_like(g, ray_scan(g, "a"), ray_const_str(g, "x*", 2));
+    ray_op_t* not_b  = ray_not(g, ray_like(g, ray_scan(g, "b"), ray_const_str(g, "*a", 2)));
+
+    ray_op_t* filt_inner = ray_filter(g, base, like_a);
+    ray_op_t* filt_outer = ray_filter(g, filt_inner, not_b);
+
+    uint32_t like_a_id = like_a->id;
+    uint32_t not_b_id = not_b->id;
+
+    ray_op_t* opt = ray_optimize(g, filt_outer);
+    TEST_ASSERT_NOT_NULL(opt);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
+    ray_op_t* inner = op_child(g, opt, 0);
+    TEST_ASSERT_EQ_I(inner->opcode, OP_FILTER);
+
+    TEST_ASSERT_EQ_I(inner->in_id[1], like_a_id);
+    TEST_ASSERT_EQ_I(opt->in_id[1], not_b_id);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
  * Test: predicate pushdown past projection.
  *
  * Build: FILTER(id1 = 1, PROJECT([id1, v1], SCAN))
@@ -3288,6 +3339,7 @@ const test_entry_t opt_entries[] = {
     { "opt/filter_and_split", test_filter_and_split, NULL, NULL },
     { "opt/filter_reorder_dag", test_filter_reorder_dag, NULL, NULL },
     { "opt/filter_reorder_sel", test_filter_reorder_selectivity, NULL, NULL },
+    { "opt/filter_reorder_not_like", test_filter_reorder_not_like, NULL, NULL },
     { "opt/pushdown_select", test_pushdown_past_select, NULL, NULL },
     { "opt/pushdown_group", test_pushdown_past_group, NULL, NULL },
     { "opt/projection_pushdown", test_projection_pushdown, NULL, NULL },

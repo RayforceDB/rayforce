@@ -1,0 +1,21 @@
+;; timestamp_literal.rfl — a malformed timestamp literal now names the field
+;; it expected, instead of a bare `error: parse`.  The accepted and rejected
+;; forms are unchanged: the fractional second stays required (see
+;; parse_branch_cov.rfl), this only improves the diagnostic.
+
+;; ── the valid form still parses ──
+(type 2024.01.15D12:30:45.000000000) -- 'timestamp
+2024.01.15D12:30:45.000000000 -- 2024.01.15D12:30:45.000000000
+
+;; ── a malformed literal is still a parse error (behaviour unchanged) ──
+(parse "2024.01.01D12") !- parse
+(parse "2024.01.01D1234") !- parse
+(parse "2024.01.01D12:34:") !- parse
+(parse "2024.01.01D12:30:45") !- parse
+(parse "2024.01.01D99:00:00.0") !- parse
+
+;; ── but the message now names the field (was an empty "error: parse") ──
+(try (eval (parse "2024.01.01D1234")) (fn [e] (get e 'msg))) -- "timestamp literal: expected ':' after the hour"
+(try (eval (parse "2024.01.01D12:34:")) (fn [e] (get e 'msg))) -- "timestamp literal: expected two digits for the second"
+(try (eval (parse "2024.01.01D12:30:45")) (fn [e] (get e 'msg))) -- "timestamp literal: expected '.' and fractional seconds after the second"
+(try (eval (parse "2024.01.01D99:00:00.0")) (fn [e] (get e 'msg))) -- "invalid time 99:00:00"

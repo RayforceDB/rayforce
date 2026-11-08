@@ -4076,6 +4076,7 @@ ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, 
         for (int64_t c = 0; c < ncols && !found; c++) found = ray_table_col_name(tbl, c) == keys[k];
         if (!found) return NULL;
     }
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
     ray_t* ktbl = sel_compact(g, tbl, sel, keys, (int)n_sort);
     if (!ktbl || RAY_IS_ERR(ktbl)) return ktbl;
     ray_t* key_cols[16];

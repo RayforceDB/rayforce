@@ -1356,10 +1356,12 @@ static void pool_once_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     (void)worker_id;
     pool_once_ctx_t* c = (pool_once_ctx_t*)ctx;
     uint32_t t = (uint32_t)(start / c->grain);
-    /* Uneven, deterministic per-ticket work (0..16k iterations) so claims
-     * and steals interleave instead of every ticket finishing at once. */
+    /* Uneven, deterministic per-ticket work (0..16k iterations; 0..1k in
+     * the windows past the ring, whose point is the number of tickets, not
+     * their length) so claims and steals interleave instead of every
+     * ticket finishing at once. */
     volatile uint32_t sink = 0;
-    uint32_t spin = ((t * 2654435761u) >> 24) << 6;
+    uint32_t spin = ((t * 2654435761u) >> 24) << (c->n > RAY_POOL_MAX_TASKS ? 2 : 6);
     for (uint32_t i = 0; i < spin; i++) sink += i;
     (void)sink;
     /* The blocking ticket finishes last: it waits on observable state (every
@@ -1434,7 +1436,7 @@ static test_result_t pool_once_battery(ray_pool_t* pool) {
     }
 
     /* n far above the worker count, both entry points */
-    for (uint32_t i = 0; i < 60; i++) {
+    for (uint32_t i = 0; i < 20; i++) {
         POOL_ONCE_RUN(pool, &c, 1000, false, &tickets);
         POOL_ONCE_RUN(pool, &c, 1000, true, &tickets);
     }

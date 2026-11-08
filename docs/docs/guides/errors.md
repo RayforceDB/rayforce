@@ -23,10 +23,20 @@ Both arguments are passed unevaluated (`try` is a special form). The handler is 
 (try
   (+ 1 "hello")
   (fn [err] (println "caught:" err)))
-; caught: 0
+; caught: {code:type msg:"cannot add i64 and str"}
 ```
 
-When an error occurs without an explicit `raise`, the handler receives a default value of `0`.
+When an error occurs without an explicit `raise`, the handler receives a dict of what the engine raised: `code`, the error's class as a symbol (`'type`, `'io`, `'name`, ...), and `msg`, its message as a string (`""` when the error carries none). The REPL prints the same error as `error: type: cannot add i64 and str`. Inside a function the handler gets the same dict as at the top level, so a long-running process can report what failed and carry on:
+
+```lisp
+(set safe (fn [f x]
+  (try (f x)
+    (fn [e] (dict ['error] (list (format "%: %" (at e 'code) (at e 'msg))))))))
+(safe (fn [x] (+ x 'a)) 1)
+; => {error:"type: cannot add i64 and sym"}
+```
+
+If the dict itself can't be built because memory has run out, the handler gets `null` instead.
 
 !!! note "Division by zero is not an error"
 
@@ -411,7 +421,7 @@ If a computed column expression fails inside `select`, the entire select produce
 
 | Pattern | Syntax | Behavior |
 |---|---|---|
-| Catch errors | `(try expr handler)` | Calls handler with error value on failure |
+| Catch errors | `(try expr handler)` | On failure, calls handler with the raised value, or `{code msg}` for an engine error |
 | Raise error | `(raise value)` | Triggers error, value passed to nearest try handler |
 | Test for null | `(nil? x)` | Returns `true` for any null form, `false` otherwise |
 | Typed null int | `0Ni` | Propagates through arithmetic |

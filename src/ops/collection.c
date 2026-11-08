@@ -607,6 +607,215 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
 }
 
 /* ══════════════════════════════════════════
+ * GUID membership
+ *
+ * An open-addressing table of 16-byte keys stored in place, for `in` over
+ * guid cells without the hashset's per-row type dispatch.  The all-zero
+ * key is the null guid; it doubles as the empty-slot marker, so the table
+ * keeps it in a flag of its own.
+ *
+ * A guid cell is null when its 16 bytes are zero, whether or not its vector
+ * carries HAS_NULLS: producers can write the zero payload without the flag
+ * (ray_vec_append does).  RAY_ATOM_IS_NULL, the scalar == and the query's
+ * null-row masks read the bytes, and so does this table.  `in` therefore
+ * answers as == does, cell for cell: a zero cell is in a set that holds a
+ * zero cell, whichever vector carries the flag.
+ * ══════════════════════════════════════════ */
+
+typedef struct {
+    uint64_t* keys;      /* 2 words a slot; {0, 0} = empty */
+    int64_t   mask;      /* slots - 1; slots is a power of 2 */
+    bool      has_null;
+} guid_set_t;
+
+#ifdef DEBUG
+static _Atomic int64_t g_in_guid_fail_at;   /* test hook: fail the nth allocation */
+void ray_in_guid_test_fail_alloc(int64_t nth) { atomic_store(&g_in_guid_fail_at, nth); }
+#endif
+static void* in_guid_calloc(size_t size) {
+#ifdef DEBUG
+    int64_t v = atomic_load(&g_in_guid_fail_at);
+    while (v > 0)
+        if (atomic_compare_exchange_weak(&g_in_guid_fail_at, &v, v - 1))
+            return v == 1 ? NULL : ray_calloc_raw(size);
+#endif
+    return ray_calloc_raw(size);
+}
+
+/* A table for up to n keys, load factor at most 0.5. */
+static bool guid_set_init(guid_set_t* gs, int64_t n) {
+    int64_t cap = 16;
+    while (cap < n * 2) cap <<= 1;
+    gs->keys = (uint64_t*)in_guid_calloc((size_t)cap * 16);
+    gs->mask = cap - 1;
+    gs->has_null = false;
+    return gs->keys != NULL;
+}
+
+/* The slot holding the non-null key (lo, hi) at p, or ~slot (negative) of
+ * the empty slot it would take. */
+static inline int64_t guid_set_slot(const guid_set_t* gs, const uint8_t* p,
+                                    uint64_t lo, uint64_t hi) {
+    int64_t s = (int64_t)(ray_hash_bytes(p, 16) & (uint64_t)gs->mask);
+    for (;;) {
+        const uint64_t* k = gs->keys + 2 * s;
+        if (k[0] == lo && k[1] == hi) return s;
+        if ((k[0] | k[1]) == 0) return ~s;
+        s = (s + 1) & gs->mask;
+    }
+}
+
+/* Add the key at p; true if it was not there yet. */
+static bool guid_set_add(guid_set_t* gs, const uint8_t* p) {
+    uint64_t lo, hi;
+    memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+    if ((lo | hi) == 0) {
+        bool fresh = !gs->has_null;
+        gs->has_null = true;
+        return fresh;
+    }
+    int64_t s = guid_set_slot(gs, p, lo, hi);
+    if (s >= 0) return false;
+    uint64_t* k = gs->keys + 2 * ~s;
+    k[0] = lo; k[1] = hi;
+    return true;
+}
+
+typedef struct {
+    const guid_set_t* gs;
+    const uint8_t*    cells;
+    bool*             out;
+} guid_in_ctx_t;
+
+static void guid_in_probe_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    guid_in_ctx_t* c = (guid_in_ctx_t*)raw;
+    for (int64_t i = start; i < end; i++) {
+        const uint8_t* p = c->cells + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        c->out[i] = (lo | hi) ? guid_set_slot(c->gs, p, lo, hi) >= 0
+                              : c->gs->has_null;
+    }
+}
+
+/* The scan of the set when the table holds the needles: a set cell that
+ * matches a needle marks the needle's slot.  Workers stop once every
+ * distinct needle is marked; which worker marks a slot first does not
+ * change the answer. */
+typedef struct {
+    const guid_set_t* gs;
+    const uint8_t*    set;
+    _Atomic uint8_t*  seen;       /* one a slot */
+    _Atomic(bool)     null_seen;
+    _Atomic(int64_t)  found;      /* distinct needles marked */
+    int64_t           distinct;
+} guid_scan_ctx_t;
+
+static void guid_in_scan_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    guid_scan_ctx_t* c = (guid_scan_ctx_t*)raw;
+    for (int64_t j = start; j < end; j++) {
+        if (((j - start) & 1023) == 0 &&
+            atomic_load_explicit(&c->found, memory_order_relaxed) >= c->distinct)
+            return;
+        const uint8_t* p = c->set + j * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        if ((lo | hi) == 0) {
+            if (c->gs->has_null &&
+                !atomic_exchange_explicit(&c->null_seen, true, memory_order_relaxed))
+                atomic_fetch_add_explicit(&c->found, 1, memory_order_relaxed);
+            continue;
+        }
+        int64_t s = guid_set_slot(c->gs, p, lo, hi);
+        if (s >= 0 &&
+            !atomic_load_explicit(&c->seen[s], memory_order_relaxed) &&
+            !atomic_exchange_explicit(&c->seen[s], 1, memory_order_relaxed))
+            atomic_fetch_add_explicit(&c->found, 1, memory_order_relaxed);
+    }
+}
+
+/* out[i]: is cell i of the guid vector `val` among the m guids at `set`?
+ * The table holds the smaller side.  The set: one probe a row.  The
+ * needles: one scan of the set, which stops once every distinct needle has
+ * been seen.  Either loop is pool-parallel.
+ *
+ * The answer, an "oom" error, or "cancel" when a cancel cut a dispatch
+ * short; never a fallback.  The hashset takes a zero cell for null only in
+ * a vector that carries HAS_NULLS, so it could answer differently for the
+ * same bytes. */
+static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
+    int64_t n = val->len;
+    const uint8_t* vd = (const uint8_t*)ray_data(val);
+    guid_set_t gs;
+    if (!guid_set_init(&gs, m <= n ? m : n)) return ray_error("oom", NULL);
+    ray_t* result = ray_vec_new(RAY_BOOL, n);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_free_raw(gs.keys);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = n;
+    bool* out = (bool*)ray_data(result);
+    if (m <= n) {
+        for (int64_t j = 0; j < m; j++) guid_set_add(&gs, set + j * 16);
+        guid_in_ctx_t ctx = { .gs = &gs, .cells = vd, .out = out };
+        ray_pool_t* pool = ray_pool_get();
+        bool par = pool && n >= RAY_PARALLEL_THRESHOLD;
+        if (par)
+            ray_pool_dispatch(pool, guid_in_probe_fn, &ctx, n);
+        else
+            guid_in_probe_fn(&ctx, 0, 0, n);
+        ray_free_raw(gs.keys);
+        /* A cancel skips the tasks not yet started: no answer. */
+        if (par && pool_cancelled(pool)) {
+            ray_release(result);
+            return ray_error("cancel", "interrupted");
+        }
+        return result;
+    }
+    _Atomic uint8_t* seen = in_guid_calloc((size_t)(gs.mask + 1) * sizeof(*seen));
+    if (!seen) {
+        ray_free_raw(gs.keys);
+        ray_release(result);
+        return ray_error("oom", NULL);
+    }
+    int64_t distinct = 0;
+    for (int64_t i = 0; i < n; i++)
+        if (guid_set_add(&gs, vd + i * 16)) distinct++;
+    guid_scan_ctx_t sc = { .gs = &gs, .set = set, .seen = seen,
+                           .distinct = distinct };
+    atomic_init(&sc.null_seen, false);
+    atomic_init(&sc.found, 0);
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && m >= RAY_PARALLEL_THRESHOLD;
+    if (par)
+        ray_pool_dispatch(pool, guid_in_scan_fn, &sc, m);
+    else
+        guid_in_scan_fn(&sc, 0, 0, m);
+    /* A cancel skips the tasks not yet started: the seen marks are short. */
+    if (par && pool_cancelled(pool)) {
+        ray_free_raw((void*)seen);
+        ray_free_raw(gs.keys);
+        ray_release(result);
+        return ray_error("cancel", "interrupted");
+    }
+    bool null_seen = atomic_load_explicit(&sc.null_seen, memory_order_relaxed);
+    for (int64_t i = 0; i < n; i++) {
+        const uint8_t* p = vd + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        out[i] = (lo | hi)
+            ? atomic_load_explicit(&seen[guid_set_slot(&gs, p, lo, hi)],
+                                   memory_order_relaxed) != 0
+            : null_seen;
+    }
+    ray_free_raw((void*)seen);
+    ray_free_raw(gs.keys);
+    return result;
+}
+
+/* ══════════════════════════════════════════
  * Higher-order functions
  * ══════════════════════════════════════════ */
 
@@ -628,6 +837,33 @@ static ray_t* iter_elem_owned(ray_t* coll, int64_t i) {
     ray_t* e = iter_elem(coll, i, &owned);
     if (!owned && !RAY_IS_ERR(e)) ray_retain(e);
     return e;
+}
+
+/* An exact-type atom that can be represented in a vector. BOOL/U8 have
+ * no vector null: a native typed-null atom of either type stays boxed. */
+static bool map_vector_atom(ray_t* value) {
+    if (value->type >= 0 || !ray_is_vector_type(-value->type)) return false;
+    /* These I64 atoms own opaque resources. A raw integer cell cannot
+     * carry their tags or finalizers, including after a typed prefix. */
+    if (value->type == -RAY_I64 &&
+        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)))
+        return false;
+    return !((value->type == -RAY_BOOL || value->type == -RAY_U8) &&
+             RAY_ATOM_IS_NULL(value));
+}
+
+/* Rebox only the completed prefix, without invoking the callback again.
+ * Reserve the full result length so fallback needs no further list growth.
+ * On failure the caller still owns prefix. */
+static ray_t* map_box_prefix(ray_t* prefix, int64_t capacity) {
+    ray_t* list = ray_list_new(capacity);
+    if (RAY_IS_ERR(list)) return list;
+    for (int64_t i = 0; i < prefix->len; i++) {
+        ray_t* value = iter_elem_owned(prefix, i);
+        if (RAY_IS_ERR(value)) { ray_release(list); return value; }
+        ((ray_t**)ray_data(list))[list->len++] = value;
+    }
+    return list;
 }
 
 /* (map fn val vec) — apply binary fn(val, elem) to each element of vec.
@@ -656,28 +892,56 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     }
 
     int64_t len = ray_len(coll);
-    ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) return ray_error("oom", NULL);
-    result->type = RAY_LIST;
-    result->len = len;
-    ray_t** out = (ray_t**)ray_data(result);
+    if (len == 0) return ray_list_new(0);  /* no callback result to infer */
+    ray_t* result = NULL;
     for (int64_t i = 0; i < len; i++) {
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
-        if (RAY_IS_ERR(elem))  out[i] = elem;
-        else if (n == 2)       out[i] = call_fn1(fn, elem);
-        else                   out[i] = call_fn2(fn, val, elem);
+        ray_t* value;
+        if (RAY_IS_ERR(elem))  value = elem;
+        else if (n == 2)      value = call_fn1(fn, elem);
+        else                  value = call_fn2(fn, val, elem);
         if (owned) ray_release(elem);
-        /* Materialise a lazy result (e.g. the lambda returned
-         * (count (distinct x)) — distinct/count of a vec is lazy).  A LIST
-         * of unforced lazy nodes breaks every downstream consumer that
-         * doesn't force per element (sum, ==, +). */
-        if (ray_is_lazy(out[i])) out[i] = ray_lazy_materialize(out[i]);
-        if (RAY_IS_ERR(out[i])) {
-            ray_t* err = out[i];
-            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result);
-            return err;
+        /* Force each result before choosing its representation, as the
+         * previous list collector did for lazy callback results. */
+        if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
+        if (RAY_IS_ERR(value)) { ray_release(result); return value; }
+
+        /* Once heterogeneous, stay boxed without rechecking atom types. */
+        if (result && result->type == RAY_LIST) {
+            ((ray_t**)ray_data(result))[result->len++] = value;
+            continue;
+        }
+        bool atom = map_vector_atom(value);
+        if (!result) {
+            result = atom ? ray_vec_new(-value->type, len) : ray_list_new(len);
+            if (RAY_IS_ERR(result)) { ray_release(value); return result; }
+        } else if (result->type != RAY_LIST &&
+                   (!atom || value->type != -result->type)) {
+            ray_t* list = map_box_prefix(result, len);
+            ray_release(result);
+            if (RAY_IS_ERR(list)) { ray_release(value); return list; }
+            result = list;
+        }
+
+        if (result->type == RAY_LIST) {
+            ((ray_t**)ray_data(result))[result->len++] = value; /* transfer */
+        } else if (result->type == RAY_STR) {
+            ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), ray_str_len(value));
+            ray_release(value);
+            if (RAY_IS_ERR(next)) { ray_release(result); return next; }
+            result = next;
+        } else {
+            /* Capacity is reserved, SYM atoms have runtime ids and the
+             * destination is a fresh runtime-domain vector. Exact type
+             * agreement above prevents any numeric promotion. */
+            result->len++;
+            int status = store_typed_elem(result, i, value);
+            ray_release(value);
+            if (status != 0) {
+                ray_release(result);
+                return ray_error("type", "map: cannot store callback result");
+            }
         }
     }
     return result;
@@ -1484,6 +1748,7 @@ ray_t* ray_distinct_fn(ray_t* x) {
         for (int i = 0; i < nu - 1; i++)
             for (int j = i + 1; j < nu; j++)
                 if ((unsigned char)uniq[i] > (unsigned char)uniq[j]) { char t = uniq[i]; uniq[i] = uniq[j]; uniq[j] = t; }
+        // cppcheck-suppress uninitvar // only the first nu bytes, filled above, are read
         return ray_str(uniq, (size_t)nu);
     }
 
@@ -1538,9 +1803,8 @@ ray_t* ray_distinct_fn(ray_t* x) {
 
 /* (in val vec) — check membership */
 /* One element of a collection left operand.  A string element is one whole
- * value: the lone-string arms of ray_in_fn answer per character, which is
- * right for a string atom on its own but not for a row of a collection —
- * (in ["p" "qq"] (list "qq" "zz")) answered [[false] [false false]].  A
+ * value, including when the left operand itself is a string and the right
+ * operand is a list.  Only string-in-string checks are per character.  A
  * string set (vector) already compares whole strings in ray_in_fn. */
 static ray_t* in_row(ray_t* elem, ray_t* vec) {
     if (elem->type == -RAY_STR && ray_is_atom(vec))
@@ -1582,7 +1846,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
         return r;
     }
     /* A string column's cell, bound for one row of a query, is one value:
-     * the per-character arms below are for a lone string literal. */
+     * the string-in-string arm below is for a lone string literal. */
     if (val->type == -RAY_STR && (val->attrs & RAY_ATTR_STR_CELL) &&
         (ray_is_atom(vec) || vec->type == RAY_LIST))
         return in_row(val, vec);
@@ -1607,26 +1871,9 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     /* Scalar in scalar: equality check */
     if (ray_is_atom(val) && ray_is_atom(vec))
         return make_bool(atom_eq(val, vec) ? 1 : 0);
-    /* STR in LIST: for each char of val, check membership in list elements */
-    if (ray_is_atom(val) && (-val->type) == RAY_STR && (vec->type == RAY_LIST)) {
-        const char* vp = ray_str_ptr(val);
-        size_t vlen = ray_str_len(val);
-        ray_t* result = ray_vec_new(RAY_BOOL, (int64_t)vlen);
-        if (RAY_IS_ERR(result)) return result;
-        result->len = (int64_t)vlen;
-        bool* out_b = (bool*)ray_data(result);
-        ray_t** list_elems = (ray_t**)ray_data(vec);
-        int64_t list_len = ray_len(vec);
-        for (size_t i = 0; i < vlen; i++) {
-            out_b[i] = false;
-            ray_t* ch = ray_str(&vp[i], 1);
-            for (int64_t j = 0; j < list_len; j++) {
-                if (atom_eq(ch, list_elems[j])) { out_b[i] = true; break; }
-            }
-            ray_release(ch);
-        }
-        return result;
-    }
+    /* STR in LIST: the string is one scalar needle, as for SYM in LIST. */
+    if (val->type == -RAY_STR && vec->type == RAY_LIST)
+        return in_row(val, vec);
     /* Vector val: map in over each element */
     if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
@@ -1657,6 +1904,12 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             ray_release(sv);
             return r;
         }
+        /* A guid vector against one guid: a set of one key. */
+        if (val->type == RAY_GUID && vec->type == -RAY_GUID) {
+            static const uint8_t null_guid[16] = {0};
+            return in_guid(val, vec->obj ? (const uint8_t*)ray_data(vec->obj)
+                                         : null_guid, 1);
+        }
         /* Hash-based fast path: both sides are typed vecs of compatible
          * shape and the result is a row-aligned bool vec.  Build a
          * hashset over `vec` once, probe per element of `val`.  Was
@@ -1683,6 +1936,12 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
                 }
                 ray_free_raw(pos);
             }
+            /* Guid cells: in_guid's typed table, their only route.  The
+             * kernel below declines guids, and the hashset dispatched on
+             * type for every row: ~10 ns a row against ~1 for an I64
+             * column. */
+            if (val->type == RAY_GUID && vec->type == RAY_GUID)
+                return in_guid(val, (const uint8_t*)ray_data(vec), vec->len);
             /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
              * ints, pool-parallel — the same engine the fused WHERE path
              * uses.  Gated off null-bearing operands: this hashset path
@@ -1796,6 +2055,17 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     }
     /* Typed vector: search without boxing */
     if (ray_is_vec(vec) && ray_is_atom(val)) {
+        /* A guid in a guid vector: compare the cells' bytes in place, a
+         * null guid matching a zero cell, flagged or not (GUID membership
+         * above). */
+        if (val->type == -RAY_GUID && vec->type == RAY_GUID) {
+            static const uint8_t null_guid[16] = {0};
+            const uint8_t* key = val->obj ? (const uint8_t*)ray_data(val->obj) : null_guid;
+            const uint8_t* cells = (const uint8_t*)ray_data(vec);
+            for (int64_t i = 0; i < vec->len; i++)
+                if (memcmp(cells + i * 16, key, 16) == 0) return make_bool(1);
+            return make_bool(0);
+        }
         int64_t len = vec->len;
         bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
@@ -4334,7 +4604,6 @@ ray_t* differ_vec_eager(ray_t* x) {
 typedef struct {
     uint64_t sum_i;
     double   sum_f;
-    double   sum_sq_f;
     int64_t  count;
 } ts_mprefix_state_t;
 
@@ -4344,7 +4613,6 @@ typedef struct {
     ray_pool_t* pool;
     uint64_t* prefix_i;
     double* prefix_f;
-    double* prefix_sq_f;
     int64_t* prefix_count;
     ts_mprefix_state_t* summary;
     ts_mprefix_state_t* carry;
@@ -4413,27 +4681,21 @@ static void ts_mprefix_scan_fn(void* vctx, uint32_t worker_id, int64_t start, in
 
         uint64_t sum_i = 0;
         double sum_f = 0.0;
-        double sum_sq_f = 0.0;
         int64_t count = 0;
         for (int64_t r = lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             bool nn = !(c->has_nulls && ray_vec_is_null(c->src, r));
             if (nn) {
                 if (c->prefix_i) sum_i += (uint64_t)ts_read_as_i64(c->src, r);
-                if (c->prefix_f || c->prefix_sq_f) {
-                    double v = ts_read_as_f64(c->src, r);
-                    if (c->prefix_f) sum_f += v;
-                    if (c->prefix_sq_f) sum_sq_f += v * v;
-                }
+                if (c->prefix_f) sum_f += ts_read_as_f64(c->src, r);
                 count++;
             }
             if (c->prefix_i)      c->prefix_i[r + 1] = sum_i;
             if (c->prefix_f)      c->prefix_f[r + 1] = sum_f;
-            if (c->prefix_sq_f)   c->prefix_sq_f[r + 1] = sum_sq_f;
             if (c->prefix_count)  c->prefix_count[r + 1] = count;
         }
         c->summary[b] = (ts_mprefix_state_t){
-            .sum_i = sum_i, .sum_f = sum_f, .sum_sq_f = sum_sq_f, .count = count
+            .sum_i = sum_i, .sum_f = sum_f, .count = count
         };
     }
 }
@@ -4451,7 +4713,6 @@ static void ts_mprefix_adjust_fn(void* vctx, uint32_t worker_id, int64_t start, 
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             if (c->prefix_i)      c->prefix_i[r + 1] += carry.sum_i;
             if (c->prefix_f)      c->prefix_f[r + 1] += carry.sum_f;
-            if (c->prefix_sq_f)   c->prefix_sq_f[r + 1] += carry.sum_sq_f;
             if (c->prefix_count)  c->prefix_count[r + 1] += carry.count;
         }
     }
@@ -4484,21 +4745,6 @@ static void ts_mprefix_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
                 }
                 break;
             }
-            case OP_MVAR:
-            case OP_MDEV: {
-                int64_t cnt = c->prefix_count[hi] - c->prefix_count[lo];
-                if (cnt <= 0) {
-                    ray_vec_set_null(c->dst, r, true);
-                } else {
-                    double sum = c->prefix_f[hi] - c->prefix_f[lo];
-                    double sum_sq = c->prefix_sq_f[hi] - c->prefix_sq_f[lo];
-                    double mean = sum / (double)cnt;
-                    double var = sum_sq / (double)cnt - mean * mean;
-                    if (var < 0.0) var = 0.0;
-                    ((double*)out)[r] = ray_f64_fin(c->opcode == OP_MDEV ? sqrt(var) : var);
-                }
-                break;
-            }
         }
     }
 }
@@ -4512,16 +4758,15 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 
     int64_t nblocks = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
     int64_t entries = n + 1;
-    ray_t *pi_hdr = NULL, *pf_hdr = NULL, *psq_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
+    ray_t *pi_hdr = NULL, *pf_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
     uint64_t* prefix_i = NULL;
     double* prefix_f = NULL;
-    double* prefix_sq_f = NULL;
     int64_t* prefix_count = NULL;
 
     bool need_i = (opcode == OP_MSUM && out_type == RAY_I64);
-    bool need_sq = (opcode == OP_MVAR || opcode == OP_MDEV);
-    bool need_f = (opcode == OP_MAVG || need_sq || (opcode == OP_MSUM && out_type == RAY_F64));
-    bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT || need_sq);
+    bool need_f = (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64));
+    bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT);
+    bool has_nulls = ray_vec_may_have_nulls(x);
 
     if (need_i) {
         if (ts_size_overflows(entries, sizeof(uint64_t))) { ray_release(out); return ray_error("oom", NULL); }
@@ -4535,20 +4780,10 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         }
         prefix_f = (double*)scratch_calloc(&pf_hdr, (size_t)entries * sizeof(double));
     }
-    if (need_sq) {
-        if (ts_size_overflows(entries, sizeof(double))) {
-            if (pi_hdr) scratch_free(pi_hdr);
-            if (pf_hdr) scratch_free(pf_hdr);
-            ray_release(out);
-            return ray_error("oom", NULL);
-        }
-        prefix_sq_f = (double*)scratch_calloc(&psq_hdr, (size_t)entries * sizeof(double));
-    }
     if (need_count) {
         if (ts_size_overflows(entries, sizeof(int64_t))) {
             if (pi_hdr) scratch_free(pi_hdr);
             if (pf_hdr) scratch_free(pf_hdr);
-            if (psq_hdr) scratch_free(psq_hdr);
             ray_release(out);
             return ray_error("oom", NULL);
         }
@@ -4556,10 +4791,9 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     }
     ts_mprefix_state_t* summary = (ts_mprefix_state_t*)scratch_calloc(&sum_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
     ts_mprefix_state_t* carry = (ts_mprefix_state_t*)scratch_calloc(&carry_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
-    if ((need_i && !prefix_i) || (need_f && !prefix_f) || (need_sq && !prefix_sq_f) || (need_count && !prefix_count) || !summary || !carry) {
+    if ((need_i && !prefix_i) || (need_f && !prefix_f) || (need_count && !prefix_count) || !summary || !carry) {
         if (pi_hdr) scratch_free(pi_hdr);
         if (pf_hdr) scratch_free(pf_hdr);
-        if (psq_hdr) scratch_free(psq_hdr);
         if (pc_hdr) scratch_free(pc_hdr);
         if (sum_hdr) scratch_free(sum_hdr);
         if (carry_hdr) scratch_free(carry_hdr);
@@ -4570,11 +4804,11 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     ray_pool_t* pool = ray_pool_get();
     ts_mprefix_ctx_t ctx = {
         .src = x, .dst = out, .pool = pool,
-        .prefix_i = prefix_i, .prefix_f = prefix_f, .prefix_sq_f = prefix_sq_f,
+        .prefix_i = prefix_i, .prefix_f = prefix_f,
         .prefix_count = prefix_count,
         .summary = summary, .carry = carry,
         .opcode = opcode,
-        .has_nulls = ray_vec_may_have_nulls(x),
+        .has_nulls = has_nulls,
         .window = window
     };
 
@@ -4587,7 +4821,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         carry[b] = run;
         run.sum_i += summary[b].sum_i;
         run.sum_f += summary[b].sum_f;
-        run.sum_sq_f += summary[b].sum_sq_f;
         run.count += summary[b].count;
     }
 
@@ -4598,7 +4831,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 
     if (pi_hdr) scratch_free(pi_hdr);
     if (pf_hdr) scratch_free(pf_hdr);
-    if (psq_hdr) scratch_free(psq_hdr);
     if (pc_hdr) scratch_free(pc_hdr);
     scratch_free(sum_hdr);
     scratch_free(carry_hdr);
@@ -4607,7 +4839,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 cancelled:
     if (pi_hdr) scratch_free(pi_hdr);
     if (pf_hdr) scratch_free(pf_hdr);
-    if (psq_hdr) scratch_free(psq_hdr);
     if (pc_hdr) scratch_free(pc_hdr);
     scratch_free(sum_hdr);
     scratch_free(carry_hdr);
@@ -4631,6 +4862,188 @@ static inline int64_t ts_task_lo(int64_t n, int64_t task, int64_t ntasks) {
     int64_t q = n / ntasks;
     int64_t r = n % ntasks;
     return q * task + (r * task) / ntasks;
+}
+
+typedef struct {
+    int64_t count;
+    double mean;
+    double m2;
+} ts_mvar_state_t;
+
+typedef struct {
+    double value;
+    bool nonnull;
+    ts_mvar_state_t aggregate;
+} ts_mvar_item_t;
+
+typedef struct {
+    ray_t* src;
+    ray_t* dst;
+    ray_pool_t* pool;
+    uint16_t opcode;
+    bool has_nulls;
+    int64_t window;
+    int64_t ntasks;
+    _Atomic(int) oom;
+} ts_mvar_ctx_t;
+
+/* Merge two adjacent Welford summaries without forming x*x.  The factor is
+ * applied before the second multiplication so finite variances near DBL_MAX
+ * do not overflow merely because the two group means have opposite signs. */
+static ts_mvar_state_t ts_mvar_merge(ts_mvar_state_t a, ts_mvar_state_t b) {
+    if (a.count == 0) return b;
+    if (b.count == 0) return a;
+    double total = (double)a.count + (double)b.count;
+    double delta = b.mean - a.mean;
+    double weight = (double)b.count / total;
+    /* Release builds permit reassociation.  Keep the range-saving order
+     * explicit across separate volatile evaluations: forming delta*delta
+     * first can overflow even when the scaled between-group term is finite. */
+    volatile double scaled_delta = delta * ((double)a.count / total);
+    volatile double pair_term = delta * scaled_delta;
+    double correction = pair_term * (double)b.count;
+    return (ts_mvar_state_t){
+        .count = a.count + b.count,
+        .mean = a.mean + delta * weight,
+        .m2 = a.m2 + b.m2 + correction
+    };
+}
+
+static ts_mvar_state_t ts_mvar_singleton(double value, bool nonnull) {
+    return (ts_mvar_state_t){
+        .count = nonnull ? 1 : 0,
+        .mean = nonnull ? value : 0.0,
+        .m2 = 0.0
+    };
+}
+
+static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_mvar_ctx_t* c = (ts_mvar_ctx_t*)vctx;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+
+    int64_t n = c->src->len;
+    for (int64_t task = start; task < end; task++) {
+        int64_t lo = ts_task_lo(n, task, c->ntasks);
+        int64_t hi = ts_task_lo(n, task + 1, c->ntasks);
+        if (lo >= hi) continue;
+        int64_t scan_lo = (lo >= c->window - 1) ? (lo - c->window + 1) : 0;
+        int64_t cap = c->window < hi - scan_lo ? c->window : hi - scan_lo;
+        if (cap < 1) cap = 1;
+        if (ts_size_overflows(cap, sizeof(ts_mvar_item_t))) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+
+        /* The two stacks contain at most cap items together. Incoming grows
+         * from the left, outgoing from the right; transfer copies a popped
+         * item before replacing its slot. No extra cell is needed: expiration
+         * precedes the next push when the window is full. */
+        ray_t* queue_hdr = NULL;
+        ts_mvar_item_t* items = (ts_mvar_item_t*)scratch_alloc(
+            &queue_hdr, (size_t)cap * sizeof(ts_mvar_item_t));
+        if (!items) {
+            if (queue_hdr) scratch_free(queue_hdr);
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+
+        int64_t in_len = 0, out_len = 0, queue_len = 0;
+        for (int64_t r = scan_lo; r < hi; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - scan_lo)) {
+                scratch_free(queue_hdr);
+                return;
+            }
+
+            if (queue_len == c->window) {
+                if (out_len == 0) {
+                    int64_t transferred = 0;
+                    while (in_len > 0) {
+                        if (ts_morsel_checkpoint(c->pool, transferred++)) {
+                            scratch_free(queue_hdr);
+                            return;
+                        }
+                        ts_mvar_item_t item = items[--in_len];
+                        ts_mvar_state_t one = ts_mvar_singleton(item.value, item.nonnull);
+                        item.aggregate = out_len == 0 ? one :
+                            ts_mvar_merge(one, items[cap - out_len].aggregate);
+                        items[cap - ++out_len] = item;
+                    }
+                }
+                out_len--;
+                queue_len--;
+            }
+
+            bool nonnull = !(c->has_nulls && ray_vec_is_null(c->src, r));
+            double value = nonnull ? ts_read_as_f64(c->src, r) : 0.0;
+            ts_mvar_state_t one = ts_mvar_singleton(value, nonnull);
+            items[in_len] = (ts_mvar_item_t){
+                .value = value,
+                .nonnull = nonnull,
+                .aggregate = in_len == 0 ? one :
+                    ts_mvar_merge(items[in_len - 1].aggregate, one)
+            };
+            in_len++;
+            queue_len++;
+
+            if (r >= lo) {
+                ts_mvar_state_t state = {0};
+                if (out_len > 0) state = items[cap - out_len].aggregate;
+                if (in_len > 0) state = ts_mvar_merge(state, items[in_len - 1].aggregate);
+                if (state.count == 0) {
+                    ray_vec_set_null(c->dst, r, true);
+                } else if (state.count == 1) {
+                    ((double*)ray_data(c->dst))[r] = 0.0;
+                } else {
+                    double variance = state.m2 / (double)state.count;
+                    if (variance < 0.0) variance = 0.0;
+                    ((double*)ray_data(c->dst))[r] = ray_f64_fin(
+                        c->opcode == OP_MDEV ? sqrt(variance) : variance);
+                }
+            }
+        }
+        scratch_free(queue_hdr);
+    }
+}
+
+static ray_t* moving_variance_vec_eager(ray_t* x, uint16_t opcode,
+                                        int64_t window, int8_t out_type) {
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(out_type, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t workers = pool ? pool->n_workers + 1 : 1;
+    int64_t overlap_tasks = (n - 1) / window + 1;
+    if (overlap_tasks < 1) overlap_tasks = 1;
+    uint32_t ntasks = workers;
+    if ((int64_t)ntasks > overlap_tasks) ntasks = (uint32_t)overlap_tasks;
+    if (ntasks < 1) ntasks = 1;
+    if (n < RAY_PARALLEL_THRESHOLD) ntasks = 1;
+
+    ts_mvar_ctx_t ctx = {
+        .src = x, .dst = out, .pool = pool,
+        .opcode = opcode,
+        .has_nulls = ray_vec_may_have_nulls(x),
+        .window = window,
+        .ntasks = (int64_t)ntasks
+    };
+    atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
+
+    if (ntasks == 1) ts_mvar_task_fn(&ctx, 0, 0, 1);
+    else             ray_pool_dispatch_n(pool, ts_mvar_task_fn, &ctx, ntasks);
+
+    if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
+        ray_release(out);
+        return ray_error("oom", NULL);
+    }
+    if (pool_cancelled(pool)) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
+    return out;
 }
 
 static bool ts_mminmax_better(ts_mminmax_ctx_t* c, int64_t a, int64_t b) {
@@ -4768,6 +5181,8 @@ ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
     int8_t out_type = ts_moving_out_type(opcode, x->type);
     if (opcode == OP_MMIN || opcode == OP_MMAX)
         return moving_minmax_vec_eager(x, opcode, window, out_type);
+    if (opcode == OP_MVAR || opcode == OP_MDEV)
+        return moving_variance_vec_eager(x, opcode, window, out_type);
     return moving_prefix_vec_eager(x, opcode, window, out_type);
 }
 

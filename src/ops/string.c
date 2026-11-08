@@ -45,6 +45,9 @@
  * lower row counts. */
 #define LIKE_PAR_MIN_ROWS_STR  200000
 #define LIKE_PAR_MIN_ROWS_SYM  100000
+/* The dictionary sweep's rows: fewer name at most as many entries, which
+ * cost no more read in row order, so the residency probe is not paid. */
+#define LIKE_SWEEP_MIN_ROWS    65536
 
 /* SYM-LIKE row worker: one pass over the rows.  lut[sid] is 0 while the
  * symbol is unresolved, 1 for "no match", 2 for "match".  A worker that
@@ -84,10 +87,22 @@ typedef struct {
     const uint32_t* sel_offs;
     const uint16_t* sel_idx;
     uint32_t        sel_n_segs;
+    /* Dictionary sweep, pass 1: the rows only mark the codes they name
+     * (lut 0 -> 3) and resolve nothing; see like_sweep_fn. */
+    bool            mark;
+    /* Dictionary sweep, pass 2: walk the dictionary from its end. */
+    bool            sweep_rev;
 } like_rows_ctx_t;
 
 static inline uint8_t like_rows_resolve(const like_rows_ctx_t* x, uint64_t sid) {
     uint8_t st = __atomic_load_n(&x->lut[sid], __ATOMIC_RELAXED);
+    if (x->mark) {
+        /* only the file's entries are swept; one appended past them stays
+         * unresolved and is resolved in the row pass */
+        if (!st && (int64_t)sid < x->raw.count)
+            __atomic_store_n(&x->lut[sid], (uint8_t)3, __ATOMIC_RELAXED);
+        return 0;
+    }
     if (st) return (uint8_t)(st - 1);
     const char* sp = NULL;
     size_t sl = 0;
@@ -186,6 +201,45 @@ static void like_rows_fn(void* vctx, uint32_t worker_id,
 }
 #undef LIKE_ROW_W
 #undef LIKE_ROW
+
+/* Dictionary sweep, pass 2 (FILE domain, pinned raw view): resolves every
+ * code pass 1 marked, in ascending code order.  The codes of a task are a
+ * contiguous run of the symfile, so the kernel reads it ahead (MADV_WILLNEED
+ * for the run) instead of faulting it in row order, and a page is read once
+ * however many rows name its strings.  [start, end) is a code range. */
+static void like_sweep_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    like_rows_ctx_t* x = (like_rows_ctx_t*)vctx;
+    uint8_t* lut = x->lut;
+    if (end > (int64_t)x->dict_n) end = (int64_t)x->dict_n;
+    if (x->sweep_rev) {   /* the task ranges tile [0, dict_n); mirror them */
+        int64_t lo = (int64_t)x->dict_n - end, hi = (int64_t)x->dict_n - start;
+        start = lo; end = hi;
+    }
+    if (end > x->raw.count) end = x->raw.count;
+    if (start >= end) return;
+    /* Marked codes, estimated from every 16th: the run is asked for ahead
+     * when they are dense enough that most of its pages are read anyway.
+     * The last block has no next offset; its tail is left to read-ahead. */
+    int64_t need = 0;
+    for (int64_t i = start; i < end; i += 16) need += (lut[i] == 3);
+    need *= 16;
+    int64_t kl = start / RAY_SYM_INDEX_STRIDE;
+    int64_t kh = (end - 1) / RAY_SYM_INDEX_STRIDE + 1;
+    if (need * 32 >= end - start && x->raw.ib && kh * RAY_SYM_INDEX_STRIDE < x->raw.count)
+        ray_vm_advise_willneed((void*)(x->raw.map + x->raw.ib[kl].off),
+                               (size_t)(x->raw.ib[kh].off - x->raw.ib[kl].off));
+    for (int64_t sid = start; sid < end; sid++) {
+        if (lut[sid] != 3) continue;
+        size_t sl = 0;
+        const char* sp = ray_sym_domain_raw_str(&x->raw, sid, &sl);
+        uint8_t m = x->empty_match;
+        if (sp)
+            m = (x->use_simple ? ray_glob_match_compiled(x->pc, sp, sl)
+                               : ray_glob_match(sp, sl, x->pat_str, x->pat_len)) ? 1 : 0;
+        lut[sid] = (uint8_t)(m + 1);
+    }
+}
 
 /* Worker for the RAY_STR-LIKE parallel path.  Each task scans its
  * row range against the (pre-compiled) glob pattern; rows are
@@ -469,9 +523,35 @@ ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
                 rctx.sel_idx    = ray_rowsel_idx(selection);
                 rctx.sel_n_segs = sm->n_segs;
             }
+            int64_t work = len;
+            if (selection) work = ray_rowsel_meta(selection)->total_pass;
             rctx.raw_ok = dom ? ray_sym_domain_raw_pin(dom, &rctx.raw) : false;
             ray_pool_t* pool = ray_pool_get();
-            if (ray_pool_par_dispatch_ok(pool, len, LIKE_PAR_MIN_ROWS_SYM)) {
+            bool par = ray_pool_par_dispatch_ok(pool, len, LIKE_PAR_MIN_ROWS_SYM);
+            /* A big FILE dictionary: mark the codes the rows name, resolve
+             * them in dictionary order, then fill the rows from the table. */
+            if (rctx.raw_ok && dict_n >= 65536 && work >= LIKE_SWEEP_MIN_ROWS &&
+                ray_sym_domain_raw_cold(&rctx.raw)) {
+                rctx.mark = true;
+                if (par) ray_pool_dispatch(pool, like_rows_fn, &rctx, len);
+                else like_rows_fn(&rctx, 0, 0, len);
+                rctx.mark = false;
+                /* Successive sweeps of one dictionary alternate direction: when
+                 * the dictionary is larger than the page cache, the pages the
+                 * last sweep read last are still cached when the next one
+                 * starts there, instead of every pass evicting what the next
+                 * needs first. */
+                {
+                    static _Atomic(uintptr_t) last_dom;
+                    static _Atomic int last_rev;
+                    uintptr_t d = (uintptr_t)dom;
+                    rctx.sweep_rev = (atomic_exchange(&last_dom, d) == d) && !atomic_load(&last_rev);
+                    atomic_store(&last_rev, rctx.sweep_rev ? 1 : 0);
+                }
+                if (par) ray_pool_dispatch_grain(pool, like_sweep_fn, &rctx, dict_n, 8 * RAY_MORSEL_ELEMS);
+                else like_sweep_fn(&rctx, 0, 0, dict_n);
+            }
+            if (par) {
                 ray_pool_dispatch(pool, like_rows_fn, &rctx, len);
             } else {
                 like_rows_fn(&rctx, 0, 0, len);
@@ -849,7 +929,8 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
 typedef struct {
     const ray_str_t* elems;
     const char* pool_data;
-    const ray_strpat_t* pattern;
+    const char* needle;
+    size_t needle_len;
     int64_t* dst;
     ray_pool_t* pool;
     _Atomic(int) any_null;
@@ -867,7 +948,7 @@ static void str_find_parts_task(void* vctx, uint32_t worker_id,
         const char* sp = ray_str_t_ptr(&c->elems[i], c->pool_data);
         size_t sl = c->elems[i].len;
         size_t pos = 0;
-        bool found = ray_strpat_find(c->pattern, sp, sl, &pos);
+        bool found = ray_str_find_literal(sp, sl, c->needle, c->needle_len, &pos);
         c->dst[i] = found ? (int64_t)pos : NULL_I64;
         if (!found) any_null = true;
     }
@@ -934,7 +1015,8 @@ static void sym_reader_at(const sym_reader_t* r, int64_t pos,
 
 typedef struct {
     sym_reader_t         rd;
-    const ray_strpat_t*  pattern;
+    const char*          needle;
+    size_t               needle_len;
     int64_t*             dst;
     ray_pool_t*          pool;
     _Atomic(int)         any_null;
@@ -954,7 +1036,7 @@ static void str_find_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_
             const char* sp; size_t sl;
             sym_reader_at(&c->rd, ray_read_sym(base, i, RAY_SYM, attrs), &sp, &sl);
             size_t pos = 0;
-            bool found = ray_strpat_find(c->pattern, sp, sl, &pos);
+            bool found = ray_str_find_literal(sp, sl, c->needle, c->needle_len, &pos);
             c->dst[i] = found ? (int64_t)pos : NULL_I64;
             if (!found) any_null = true;
         }
@@ -971,7 +1053,7 @@ static void str_find_sym_task(void* vctx, uint32_t worker_id, int64_t lo, int64_
         sym_reader_block(&c->rd, ids, n, sp, sl);
         for (int j = 0; j < n; j++) {
             size_t pos = 0;
-            bool found = ray_strpat_find(c->pattern, sp[j], sl[j], &pos);
+            bool found = ray_str_find_literal(sp[j], sl[j], c->needle, c->needle_len, &pos);
             c->dst[b + j] = found ? (int64_t)pos : NULL_I64;
             if (!found) any_null = true;
         }
@@ -1008,12 +1090,6 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         ray_release(pat_v);
         return ray_error("type", "str-find: pattern must be string or symbol atom");
     }
-    ray_strpat_t search;
-    if (!ray_strpat_compile(pattern, pattern_len, &search)) {
-        ray_release(input);
-        ray_release(pat_v);
-        return ray_error("domain", "str-find: '*' is not supported in search patterns");
-    }
 
     if (input->type != RAY_STR && input->type != RAY_SYM) {
         ray_release(input);
@@ -1039,7 +1115,8 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
         str_find_parts_ctx_t ctx = {
             .elems = elems,
             .pool_data = pool_data,
-            .pattern = &search,
+            .needle = pattern,
+            .needle_len = pattern_len,
             .dst = dst,
             .pool = pool
         };
@@ -1066,7 +1143,8 @@ ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
     /* SYM: the rows in parallel, each string read from its domain. */
     {
         ray_pool_t* pool = nrows >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
-        str_find_sym_ctx_t ctx = { .pattern = &search, .dst = dst, .pool = pool };
+        str_find_sym_ctx_t ctx = { .needle = pattern, .needle_len = pattern_len,
+                                   .dst = dst, .pool = pool };
         sym_reader_init(&ctx.rd, input);
         atomic_init(&ctx.any_null, 0);
         if (pool && ray_pool_total_workers(pool) >= 2)
@@ -1337,6 +1415,7 @@ static void substr_sym_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         int64_t ids[64]; const char* sp[64]; size_t sl[64];
         int n = 0;
         while (bits) { ids[n++] = w * 64 + __builtin_ctzll(bits); bits &= bits - 1; }
+        // cppcheck-suppress uninitvar // bits is nonzero here, so the loop above fills ids[0, n)
         sym_reader_block(&c->rd, ids, n, sp, sl);
         for (int j = 0; j < n; j++, k++) {
             if ((size_t)c->st >= sl[j]) {

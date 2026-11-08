@@ -1,0 +1,102 @@
+;; @requires: posix
+;; @requires: linux
+;; Fast transports — a connection between two processes on one host moves
+;; from TCP to shared-memory rings once both sides agree (core/ipc.c,
+;; core/shm.c); the frames stay the same, only the bytes' road changes.
+;;
+;; Spawns a server on port 19986 (fixed; `make test` is sequential, so it
+;; cannot collide with another suite's server) and asserts:
+;;   - a plain .ipc.open on a loopback address lands on `shm`, and the
+;;     server sees the same connection as `shm` from its side;
+;;   - sync, async and nested round trips cross the rings, including
+;;     messages larger than a ring (16 MB a direction) both ways;
+;;   - `transport: 'tcp` keeps a connection on TCP, and `'rdma` fails the
+;;     open with `io` where there is no device (both peers are local, so a
+;;     device would not be offered anyway);
+;;   - (.ipc.transport) reads and sets the process policy, and a server
+;;     whose policy is `tcp` leaves every connection on TCP;
+;;   - the peer's going is still noticed: closing the server's end closes
+;;     the client's handle.
+;;
+;; Readiness probe: completes a real handshake (see log_journal.rfl).
+
+(.sys.exec "pkill -KILL -f '[r]ayforce -p 19986' 2>/dev/null; true")
+(.sys.exec "rm -f /tmp/rftest_xport_policy.rfl")
+
+(.sys.exec "./rayforce -p 19986 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19986 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; ── the default lands on shared memory ──────────────────────────────
+(set h (.ipc.open "127.0.0.1:19986"))
+(>= h 0) -- true
+(get (.ipc.handle h) 'transport) -- 'shm
+(get (.ipc.handle h) 'inbound) -- false
+;; the server's view of the same connection
+(.ipc.send h "(get (.ipc.handle (.ipc.handle)) 'transport)") -- 'shm
+(.ipc.send h "(get (.ipc.handle (.ipc.handle)) 'inbound)") -- true
+
+;; ── frames cross the rings ──────────────────────────────────────────
+(.ipc.send h "(+ 1 2)") -- 3
+(.ipc.send h (list 'sum (til 1000))) -- 499500
+(.ipc.post h "(set zz 5)")
+(.ipc.send h "zz") -- 5
+;; larger than a ring (16 MB) each way: 3M longs is 24 MB
+(set big (til 3000000))
+(.ipc.send h (list 'count big)) -- 3000000
+(count (.ipc.send h "(til 3000000)")) -- 3000000
+(last (.ipc.send h "(til 3000000)")) -- 2999999
+;; a table
+(.ipc.send h "(set T (table [a b] (list (til 100000) (as 'SYM (til 100000)))))")
+(count (.ipc.send h "T")) -- 100000
+;; many small round trips in a row
+(set n 0)
+(set i 0)
+(while (< i 2000) (set n (+ n (.ipc.send h (list '+ i 1)))) (set i (+ i 1)))
+n -- 2001000
+
+;; ── explicit transport choices ──────────────────────────────────────
+(set t (.ipc.open "127.0.0.1:19986" (dict ['transport] ['tcp])))
+(get (.ipc.handle t) 'transport) -- 'tcp
+(.ipc.send t "(+ 2 2)") -- 4
+(.ipc.close t)
+(set t (.ipc.open "127.0.0.1:19986" (dict ['transport] ['shm])))
+(get (.ipc.handle t) 'transport) -- 'shm
+(.ipc.close t)
+(.ipc.open "127.0.0.1:19986" (dict ['transport] ['rdma])) !- io
+(.ipc.open "127.0.0.1:19986" (dict ['transport] ['bogus])) !- domain
+(.ipc.open "127.0.0.1:19986" (dict ['transport] [1])) !- domain
+
+;; ── the process policy ──────────────────────────────────────────────
+(.ipc.transport) -- 'auto
+(.ipc.transport 'tcp) -- 'tcp
+(set t (.ipc.open "127.0.0.1:19986"))
+(get (.ipc.handle t) 'transport) -- 'tcp
+(.ipc.close t)
+(.ipc.transport 'auto) -- 'auto
+(.ipc.transport 'nope) !- domain
+;; a server that refuses: its policy says tcp
+(.ipc.send h "(.ipc.transport 'tcp)") -- 'tcp
+(set t (.ipc.open "127.0.0.1:19986"))
+(get (.ipc.handle t) 'transport) -- 'tcp
+(.ipc.close t)
+(.ipc.open "127.0.0.1:19986" (dict ['transport] ['shm])) !- io
+(.ipc.send h "(.ipc.transport 'auto)") -- 'auto
+;; and the earlier connection stayed where it was
+(get (.ipc.handle h) 'transport) -- 'shm
+
+;; ── the peer's going is noticed through the socket ──────────────────
+(set closed 0)
+(set .ipc.on.close (fn [x] (set closed (+ closed 1))))
+(set t (.ipc.open "127.0.0.1:19986"))
+(get (.ipc.handle t) 'transport) -- 'shm
+;; the server kicks the connection from its side
+(.ipc.send h (list '.ipc.close (.ipc.send t "(.ipc.handle)")))
+;; the next send on the kicked handle fails and the close hook has run
+(.ipc.send t "1") !- io
+closed -- 1
+(set .ipc.on.close null)
+
+(.ipc.close h)
+
+;; ── teardown ────────────────────────────────────────────────────────
+(.sys.exec "pkill -TERM -f '[r]ayforce -p 19986' 2>/dev/null; for i in $(seq 50); do pgrep -f '[r]ayforce -p 19986' >/dev/null || exit 0; sleep 0.1; done; pkill -KILL -f '[r]ayforce -p 19986'; true")

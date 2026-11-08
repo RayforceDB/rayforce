@@ -7,6 +7,8 @@ rayforce
 rayforce.test
 build/
 build_*/
+# `make install-headers` staging tree (see Makefile)
+install/
 .DS_Store
 *.swp
 gmon.out
@@ -54,6 +56,8 @@ compile_commands.json
 rayforce.tsan
 rayforce.test.tsan
 rayforce.test.rel
+rayforce.test.fast
+*.times
 
 # Fuzzing: grown corpus and crash artifacts stay local; only fuzz/seeds/ is committed
 fuzz/corpus/

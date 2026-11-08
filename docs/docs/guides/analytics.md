@@ -329,14 +329,14 @@ Here the lambda squares each element and adds it to the running total: 9 + 16 + 
 (count v)  ; 5 — total length including nulls
 ```
 
-All built-in aggregation functions (`sum`, `avg`, `min`, `max`, `med`) skip null values automatically. The `count` function returns the total vector length including nulls.
+All built-in aggregation functions (`sum`, `avg`, `min`, `max`, `med`) skip null values automatically. The `count` function returns the total vector length including nulls. `first` and `last` skip nulls on I64, F64 and F32 vectors and inside `select ... by:`; a direct call on a list or on another vector type takes the element positionally, so `(last (list 1 2 0Nl))` is `0Nl`.
 
 Use `nil?` to check for null values:
 
 ```lisp
 (nil? 0Nl)            ; true
 (nil? 42)             ; false
-(map nil? (list 10 0Nl 30))  ; (false true false)
+(map nil? (list 10 0Nl 30))  ; [false true false]
 ```
 
 Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), `0Np` (timestamp).
