@@ -70,3 +70,17 @@
 (at (select {mx: (max x) mn: (min x) f: (first x) l: (last x) from: TA by: g asc: g}) 'l) -- (as 'F32 [0Nf 0Nf])
 (at (select {f: (first x) l: (last x) mx: (max x) from: TA}) 'f) -- (as 'F32 [0Nf])
 (at (select {f: (first x) l: (last x) mx: (max x) from: TA}) 'mx) -- (as 'F32 [0Nf])
+
+;; Scalars: an F32 atom built by (as 'F32 x) is accepted by every elementwise
+;; unary verb inside a query, as the I32 equivalents are.
+(set T2 (table [x] (list (as 'F32 [1.5 2.0]))))
+(at (select {a: (neg (as 'F32 2.5)) from: T2}) 'a) -- (as 'F32 [-2.5 -2.5])
+(at (select {a: (abs (as 'F32 -2.5)) from: T2}) 'a) -- (as 'F32 [2.5 2.5])
+(at (select {a: (floor (as 'F32 2.5)) from: T2}) 'a) -- (as 'F32 [2.0 2.0])
+(at (select {a: (ceil (as 'F32 2.5)) from: T2}) 'a) -- (as 'F32 [3.0 3.0])
+(at (select {a: (sqrt (as 'F32 4.0)) from: T2}) 'a) -- [2.0 2.0]
+(at (select {a: (as 'F64 (as 'F32 2.5)) from: T2}) 'a) -- [2.5 2.5]
+(at (select {a: (as 'I64 (as 'F32 2.5)) from: T2}) 'a) -- [2 2]
+(at (select {a: (* x (neg (as 'F32 2.5))) from: T2}) 'a) -- (as 'F32 [-3.75 -5.0])
+(type (at (select {a: (* x (neg (as 'F32 2.5))) from: T2}) 'a)) -- 'F32
+(at (select {a: (neg (as 'I32 2)) from: T2}) 'a) -- [-2 -2]
