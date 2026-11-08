@@ -3982,7 +3982,7 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
 }
 
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * collection builtin (distinct, asc, desc, reverse, where, enlist) that
+ * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
  * has no bucket for these — they are neither element-wise ops nor
  * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
@@ -4056,7 +4056,10 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
            (l == 5 && memcmp(p, "where", 5) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
-           (l == 4 && memcmp(p, "desc", 4) == 0);
+           (l == 4 && memcmp(p, "desc", 4) == 0) ||
+           (l == 4 && memcmp(p, "iasc", 4) == 0) ||
+           (l == 5 && memcmp(p, "idesc", 5) == 0) ||
+           (l == 4 && memcmp(p, "rank", 4) == 0);
 }
 
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
