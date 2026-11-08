@@ -289,7 +289,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | lazy/DAG | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | lazy/DAG | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
-| `deltas` | unary | lazy/DAG | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `deltas` | unary | lazy/DAG | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIME, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | lazy/DAG | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
 | `fills` | unary | lazy/DAG | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | lazy/DAG | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |

@@ -322,7 +322,13 @@ Number of elements. Counts total vector length, including nulls.
 
 Arithmetic mean. The mean of a TIMESPAN vector is a TIMESPAN, rounded to the
 nanosecond (half away from zero); `avgs` and `mavg` of a TIMESPAN vector
-are TIMESPAN vectors as well.
+are TIMESPAN vectors as well. The mean of a vector is computed from an exact
+128-bit total, so it is exact to the nanosecond; the grouped, scan and moving
+forms go through F64 and are exact up to 2^53 nanoseconds (about 104 days).
+
+A TIMESPAN vector is also accepted by `sums`, `mins`, `maxs`, `msum`, `mmin`,
+`mmax`, `avgs`, `mavg`, `mdev` and `deltas`, and answers a TIMESPAN;
+`ratios` accepts it and answers F64.
 
 ```lisp
 (avg [2 4 6])  ; 4.0
@@ -354,8 +360,10 @@ Median value.
 
 For a TIMESPAN vector, the median is a TIMESPAN: a median of durations is a
 duration. An even-sized input takes the midpoint of the two middle values,
-rounded to the nanosecond (half away from zero). `SELECT` uses the same result
-type, as do `quantile` and `percentile`.
+rounded to the nanosecond (half away from zero); an odd-sized input answers one
+of its values. `SELECT` uses the same result type, as do `quantile` and
+`percentile`. The endpoints are taken from the integer values, so a median
+or quantile of a vector is exact at any magnitude.
 
 ```lisp
 (med [0D01:00:00 0D02:00:00])  ; 0D01:30:00.000000000
