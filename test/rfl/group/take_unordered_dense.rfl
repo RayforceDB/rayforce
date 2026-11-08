@@ -81,4 +81,18 @@
 ;; before an unordered take; the strategy's slot order is not row order.
 (eqt (select {from: Fp by: {ku: u} c: (count v) take: 3}) (select {from: F by: {ku: u} c: (count v) take: 3})) -- true
 (eqt (select {from: Fp by: {ku: (% u 7)} c: (count v) take: 3}) (select {from: F by: {ku: (% u 7)} c: (count v) take: 3})) -- true
+;; More deferred by-dict shapes (multi-key, range take, where:) answer like the
+;; flat table; so do BOOL keys, which the take must not be pushed ahead of.
+(eqt (select {from: Fp by: {ku: u kw: w} c: (count v) take: 3}) (select {from: F by: {ku: u kw: w} c: (count v) take: 3})) -- true
+(eqt (select {from: Fp by: {ku: u} c: (count v) take: [2 3]}) (select {from: F by: {ku: u} c: (count v) take: [2 3]})) -- true
+(eqt (select {from: Fp where: (> v 10) by: {ku: (% u 7)} c: (count v) take: 3}) (select {from: F where: (> v 10) by: {ku: (% u 7)} c: (count v) take: 3})) -- true
+;; a renamed BOOL key (first row true) keeps first-seen order, not key order
+(set Tb (table [u v bl] (list (til 12) (til 12) (< (til 12) 4))))
+(.sys.exec "rm -rf rf_test_firstn_bool")
+(.db.splayed.set "rf_test_firstn_bool/1/t/" (take Tb [0 6]))
+(.db.splayed.set "rf_test_firstn_bool/2/t/" (take Tb [6 6]))
+(set Tbp (.db.parted.get "rf_test_firstn_bool/" 't))
+(at (at (select {from: Tbp by: {kb: bl} c: (count v) take: 1}) 'kb) 0) -- true
+(eqt (select {from: Tbp by: {kb: bl} c: (count v) take: 1}) (select {from: Tb by: {kb: bl} c: (count v) take: 1})) -- true
+(.sys.exec "rm -rf rf_test_firstn_bool") -- 0
 (.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0
