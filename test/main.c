@@ -1678,8 +1678,10 @@ int main(int argc, char** argv) {
             if (!g_census) { fprintf(stderr, "cannot open census file\n"); return 2; }
         } else if ((strcmp(argv[i], "--jobs") == 0 || strcmp(argv[i], "-j") == 0) && i + 1 < argc) {
             jobs = atoi(argv[++i]);
+#if defined(_SC_NPROCESSORS_ONLN)   /* hidden by _POSIX_C_SOURCE on macOS */
             if (jobs <= 0) jobs = (int)sysconf(_SC_NPROCESSORS_ONLN);
-            if (jobs <= 0) jobs = 1;
+#endif
+            if (jobs <= 0) jobs = 4;
         } else if (strcmp(argv[i], "--quick") == 0) {
             quick = true;
         } else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
