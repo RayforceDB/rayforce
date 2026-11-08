@@ -28,12 +28,20 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 2.5e-3      ; small value
 ```
 
-Rayfall has no infinity values or infinity literals. Non-finite floating
-results (positive or negative infinity and NaN) become the floating null
-`0Nf`; `nil?` reports true for them. For example, `(/ 1 0)` and `(exp 1000)`
-both return `0Nf`. A floating overflow therefore cannot be distinguished
-from missing data after the operation. Check inputs or bounds before the
-operation if that distinction matters.
+F64 has no infinity values or infinity literals. Non-finite F64 results
+(positive or negative infinity and NaN) become the floating null `0Nf`; for
+atoms and the element-wise vector kernels `nil?` reports true for them. For
+example, `(/ 1 0)` and `(exp 1000)` both return `0Nf`. An F64 overflow
+therefore cannot be distinguished from missing data after the operation. Check
+inputs or bounds before the operation if that distinction matters.
+
+Two exceptions. F32 arithmetic keeps IEEE infinities: `(+ 3e38e 3e38e)` prints
+`infe`, and `nil?` is false for it. And not every vector kernel flags the null
+it produces: `(sums [1e308 1e308])` prints `[1.00e+308 nan]` and
+`(nil? (sums [1e308 1e308]))` is `[false false]`, although
+`(nil? (at (sums [1e308 1e308]) 1))` is true. This is the same class of
+problem as the I64 case in
+[#841](https://github.com/RayforceDB/rayforce/issues/841).
 
 ### Booleans
 

@@ -47,10 +47,13 @@ Finite values beyond the F32 range saturate just as casts do. F32 values
 print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.
 
-Floating values have a null sentinel but no positive or negative infinity
-value. Non-finite arithmetic results are returned as null, so an overflowed
-result is treated as missing by null-aware operations such as `fill` and
-aggregates. This differs from systems that retain IEEE infinities as values.
+F64 values have a null sentinel but no positive or negative infinity value.
+Non-finite F64 arithmetic results are returned as null, so an overflowed result
+is treated as missing by null-aware operations such as `fill` and aggregates.
+This differs from systems that retain IEEE infinities as values. F32
+arithmetic does not do this: an overflowing F32 result keeps the IEEE infinity
+and prints as `infe` or `-infe`, which `nil?` and `fill` do not treat as null
+(for example `(* 1e38e 10e)` is `infe`).
 
 Casting F32 to STR instead produces plain numeric text without the literal
 suffix (for example, `(as 'STR 1.5e)` returns `"1.5"`). It uses nine
