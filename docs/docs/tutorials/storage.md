@@ -201,6 +201,22 @@ original table and `r` the table loaded back from a splayed directory, and a
 The second form returns `false` if any element differs. A flat column needs
 only one level: `(all (== (at t 'seq) (at r 'seq)))`.
 
+This form assumes both sides have the same shape and comparable types:
+
+- Different lengths raise an error instead of returning `false`. A different
+  inner length gives `length: binary op: operand lengths must match, got 2 and 3`,
+  and a different row count gives `length: EQ: operand lengths must match, got 2 and 1`.
+- Different types either raise or compare equal. A symbol against a string
+  gives `type: =: incomparable operand types, got sym and str`, while `2`
+  against `2.0` gives `true`, so the form does not tell integers from floats.
+
+Check `count` and `type` first when the shapes may differ:
+
+```lisp
+(== (count [1 2]) (count [1 2 3]))   ; false: lengths differ, do not compare
+(== (type [1 2]) (type [1.0 2.0]))   ; false: 'I64 versus 'F64
+```
+
 ## 6. Splayed and Partitioned Tables
 
 Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format — faster than CSV and preserving exact types. Three functions cover on-disk tables:
