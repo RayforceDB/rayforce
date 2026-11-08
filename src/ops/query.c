@@ -28699,6 +28699,7 @@ static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
     case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
                         ok = is_int; break;
     case RAY_F64:       ok = (at == -RAY_F64 || is_int); break;
+    case RAY_F32:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_DATE:      ok = (at == -RAY_DATE); break;
     case RAY_TIME:      ok = (at == -RAY_TIME); break;
     case RAY_TIMESTAMP: ok = (at == -RAY_TIMESTAMP); break;
@@ -29763,6 +29764,13 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             scratch_free(kw_hdr); scratch_free(kci_hdr);
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(ka_t));
+        }
+        if (kt == RAY_F32) {
+            /* the match scan below reads F64 or integer cells only; an F32
+             * key would be compared through its neighbours' bytes */
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return ray_error("type", "upsert: unsupported key column type %s", ray_type_name(kt));
         }
         key_sym_want[k] = -1;
         if (kt == RAY_SYM) {

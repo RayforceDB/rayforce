@@ -1,0 +1,39 @@
+;; Keyed upsert into a table with an F32 payload column.  It always failed
+;; with "upsert: unsupported column type F32" while insert (#1016) accepted
+;; the same column.  An F32, F64 or integer atom is narrowed into the cell,
+;; a null stays null, a non-numeric value is rejected and an F32 KEY column
+;; (which the key match cannot compare) is refused rather than mis-matched.
+
+;; in place: update an existing key, append a new one
+(set u (table [k f] (list (til 3) (as 'F32 [1.5 2.5 3.5]))))
+(upsert 'u 1 (list 1 7.25)) -- 'u
+(upsert 'u 1 (list 9 4)) -- 'u
+(upsert 'u 1 (list 0 0.5e)) -- 'u
+(type (get u 'f)) -- 'F32
+(at u 'k) -- [0 1 2 9]
+(as 'F64 (get u 'f)) -- [0.5 7.25 3.5 4.0]
+
+;; a null F32 payload is a null
+(upsert 'u 1 (list 2 0Ne)) -- 'u
+(nil? (at (get u 'f) 2)) -- true
+
+;; multi-row payload with repeated keys
+(set m (table [k f] (list (til 3) (as 'F32 [1.5 2.5 3.5]))))
+(upsert 'm 1 (list [1 5 5] [10.5 20.5 30.5])) -- 'm
+(at m 'k) -- [0 1 2 5]
+(as 'F64 (get m 'f)) -- [1.5 10.5 3.5 30.5]
+
+;; functional form leaves the original untouched
+(set o (table [k f] (list (til 2) (as 'F32 [1.5 2.5]))))
+(set n (upsert o 1 (list 1 9.5)))
+(as 'F64 (get o 'f)) -- [1.5 2.5]
+(as 'F64 (get n 'f)) -- [1.5 9.5]
+
+;; non-numeric value rejected, table untouched
+(upsert 'u 1 (list 1 'x)) !- type
+(count u) -- 4
+
+;; an F32 key column is refused, not mis-matched into duplicate rows
+(set fk (table [f v] (list (as 'F32 [1.5 2.5]) (til 2))))
+(upsert 'fk 1 (list 2.5 7)) !- type
+(count fk) -- 2
