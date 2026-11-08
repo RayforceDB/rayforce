@@ -13,3 +13,10 @@
 ((fn [t] (select {m: (sum a) from: (select {from: T by: [a c]}) where: (>= a t)})) 2) -- (table [m] (list [20]))
 (set thr 2)
 (select {m: (sum a) from: (select {from: T by: [a c]}) where: (>= a thr)}) -- (table [m] (list [20]))
+;; a list or dict holding a lambda stays callable through first/at/value
+(set fs (list f))
+(select {m: (sum ((first fs) a)) from: (select {from: T by: [a c]})}) -- (table [m] (list [231]))
+(select {m: (sum ((at fs 0) a)) from: (select {from: T by: [a c]})}) -- (table [m] (list [231]))
+(set fd (dict [k] (list f)))
+(select {m: (sum ((first (value fd)) a)) from: (select {from: T by: [a c]})}) -- (table [m] (list [231]))
+((fn [l] (select {m: (sum ((first l) a)) from: (select {from: T by: [a c]})})) (list f)) -- (table [m] (list [231]))

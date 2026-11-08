@@ -14148,10 +14148,15 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
     return collect_col_refs_walk(expr, tbl, out_syms, max_out, n, false);
 }
 
-/* A value that can be applied, and so may read columns by name at run time. */
-static bool val_is_callable(const ray_t* v) {
-    return v->type == RAY_LAMBDA || v->type == RAY_UNARY ||
-           v->type == RAY_BINARY || v->type == RAY_VARY;
+/* A bound value that cannot hold anything applicable: an atom or a typed
+ * vector.  A LIST, DICT or TABLE may contain a lambda that reads columns by
+ * name when called (`(first fs)`, `(at fs 0)`), so containers, callables and
+ * anything unrecognised do not qualify (the simple rule, not a recursive
+ * scan of the container). */
+static bool val_holds_no_callable(const ray_t* v) {
+    if (v->type < 0) return true;
+    return ray_is_vec((ray_t*)v) && v->type != RAY_LIST && v->type != RAY_DICT &&
+           v->type != RAY_TABLE;
 }
 
 /* Can evaluating `e` reach a column of `tbl` only by naming it?  True when
@@ -14166,11 +14171,13 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
         /* a lexical local wins over a column of its name (query locals never
          * shadow one): it may be a callable reading anything */
         ray_t* lex = ray_env_get_lexical_local(e->i64);
-        if (lex) return !val_is_callable(lex);   /* a plain value reads no column */
+        if (lex) return val_holds_no_callable(lex);   /* a plain value reads no column */
         if (tbl && tbl_has_col(tbl, e->i64)) return true;
         /* Before evaluating a nested from: there is no table to inspect.
          * An unbound plain name can only be a column; bound callables need
-         * the checks below so user lambdas cannot hide column reads. */
+         * the checks below so user lambdas cannot hide column reads.  This
+         * relies on collect_syms (proj_compute_keep) naming every such symbol
+         * in the keep set. */
         if (!tbl && !ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64) &&
             !ray_env_get_local(e->i64)) return true;
         if (ray_sym_is_dotted(e->i64)) {
@@ -14179,11 +14186,11 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
             return tbl && nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
         }
         ray_t* loc = ray_env_get_local(e->i64);
-        if (loc) return !val_is_callable(loc);
+        if (loc) return val_holds_no_callable(loc);
         ray_t* fn = ray_env_get(e->i64);
         if (!fn) return false;                       /* unbound: unknown */
         if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY)
-            return !val_is_callable(fn);         /* a global value, or a lambda */
+            return val_holds_no_callable(fn);    /* a global value; a lambda or container declines */
         /* eval and resolve read names from text or symbols at run time,
          * whatever name they are reached by */
         if (fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn)

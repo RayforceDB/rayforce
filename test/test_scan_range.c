@@ -5356,6 +5356,11 @@ static test_result_t test_parted_eval_group_keep(void) {
         "(do (set fu (fn [z] (+ z u))) (select {m: (sum (fu g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
         "(do (set cn count) (select {m: (cn k) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
         "((fn [f] (select {m: (sum (f g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})})) (fn [z] (+ z u)))",
+        /* a container that holds a lambda is callable through first/at/value */
+        "(do (set fu (fn [z] (+ z u))) (set fs (list fu)) (select {m: (sum ((first fs) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "(do (set fu (fn [z] (+ z u))) (set fs (list fu)) (select {m: (sum ((at fs 0) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "(do (set fu (fn [z] (+ z u))) (set fd (dict [a] (list fu))) (select {m: (sum ((first (value fd)) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "((fn [l] (select {m: (sum ((first l) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})})) (list (fn [z] (+ z u))))",
         "(select {m: (sum (eval (quote (+ g u)))) from: (select {from: T where: (> v 3) by: {g: g s: s}})})",
         "(select {m: (sum (resolve 'u)) from: (select {from: T where: (> v 3) by: {g: g s: s}})})",
         NULL,
