@@ -29765,12 +29765,11 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(ka_t));
         }
-        if (kt == RAY_F32) {
-            /* the match scan below reads F64 or integer cells only; an F32
-             * key would be compared through its neighbours' bytes */
+        if (kt == RAY_GUID && key_atom->type != -RAY_GUID) {
+            int8_t ka_t = key_atom->type;            /* capture BEFORE free */
             scratch_free(kw_hdr); scratch_free(kci_hdr);
             ray_release(tbl); ray_release(key_sym); ray_release(row);
-            return ray_error("type", "upsert: unsupported key column type %s", ray_type_name(kt));
+            return ray_error("type", "upsert: key column is guid but key value is %s", ray_type_name(ka_t));
         }
         key_sym_want[k] = -1;
         if (kt == RAY_SYM) {
@@ -29806,15 +29805,17 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 size_t rl = 0;
                 const char* rs = ray_str_vec_get(key_col, r, &rl);
                 if (rl != nl || (nl > 0 && (!rs || !ns || memcmp(rs, ns, nl) != 0))) match = 0;
+            } else if (kt == RAY_F32) {
+                /* by value, the atom narrowed as the payload is; NaN (a null
+                 * key) never matches, like an F64 key */
+                float needle = (float)as_f64(key_atom);
+                if (((const float*)ray_data(key_col))[r] != needle) match = 0;
+            } else if (kt == RAY_GUID) {
+                if (!upsert_cell_eq_atom(key_col, r, key_atom)) match = 0;
             } else {
-                int64_t needle = elem_as_i64(key_atom);
-                int64_t existing = (kt == RAY_I64 || kt == RAY_TIMESTAMP) ?
-                    ((int64_t*)ray_data(key_col))[r] :
-                    (kt == RAY_I32 || kt == RAY_DATE || kt == RAY_TIME) ?
-                    (int64_t)((int32_t*)ray_data(key_col))[r] :
-                    (kt == RAY_BOOL) ? (int64_t)((uint8_t*)ray_data(key_col))[r] :
-                    ((int64_t*)ray_data(key_col))[r];
-                if (existing != needle) match = 0;
+                /* integer family through its storage width: a 1/2/4-byte
+                 * cell read as int64 would match its neighbours' bytes */
+                if (upsert_int_cell(key_col, r) != upsert_atom_int(key_atom)) match = 0;
             }
         }
         if (match) { match_row = r; break; }

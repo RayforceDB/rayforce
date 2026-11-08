@@ -2,7 +2,7 @@
 ;; with "upsert: unsupported column type F32" while insert (#1016) accepted
 ;; the same column.  An F32, F64 or integer atom is narrowed into the cell,
 ;; a null stays null, a non-numeric value is rejected and an F32 KEY column
-;; (which the key match cannot compare) is refused rather than mis-matched.
+;; matches by value (see upsert_keys_splayed.rfl for the splayed side).
 
 ;; in place: update an existing key, append a new one
 (set u (table [k f] (list (til 3) (as 'F32 [1.5 2.5 3.5]))))
@@ -33,7 +33,17 @@
 (upsert 'u 1 (list 1 'x)) !- type
 (count u) -- 4
 
-;; an F32 key column is refused, not mis-matched into duplicate rows
+;; an F32 key column matches by value: update on a hit, append on a miss;
+;; an F64 or integer key atom is narrowed to F32 first
 (set fk (table [f v] (list (as 'F32 [1.5 2.5]) (til 2))))
-(upsert 'fk 1 (list 2.5 7)) !- type
+(upsert 'fk 1 (list 2.5 7)) -- 'fk
 (count fk) -- 2
+(at fk 'v) -- [0 7]
+(upsert 'fk 1 (list 2 8)) -- 'fk
+(count fk) -- 3
+(upsert 'fk 1 (list 1.5e 9)) -- 'fk
+(at fk 'v) -- [9 7 8]
+;; a null F32 key never matches (like an F64 key): it appends
+(upsert 'fk 1 (list 0Ne 1)) -- 'fk
+(upsert 'fk 1 (list 0Ne 2)) -- 'fk
+(count fk) -- 5
