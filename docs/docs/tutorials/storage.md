@@ -178,12 +178,28 @@ restored
 The deserialized table is identical to the original — all types, column names, and values are preserved.
 
 `ser` bytes are a transport representation, not a canonical encoding for value
-equality or content hashes. A symbol atom's serialized flags include whether it
-was written as a quoted literal. A generic LIST column loaded from splayed
-storage reconstructs its symbol atoms without that parser flag, so the original
-and loaded values can compare equal while their `ser` byte vectors differ. Use
-value equality to compare them; do not use a digest of `ser` as a value identity
-check across storage round trips.
+equality or content hashes. Equal values built different ways can serialize
+differently, so do not use a digest of `ser` as a value identity check. For
+example, a symbol atom's serialized flags include whether it was written as a
+quoted literal: `(ser 'x)` and `(ser (as 'SYMBOL "x"))` differ at byte 17
+(`0x20` versus `0x00`) although the two symbols are equal. A generic LIST
+column loaded from splayed storage reconstructs its symbol atoms without that
+flag, so the original and loaded values can compare equal while their `ser`
+byte vectors differ.
+
+To compare values, use `==` and reduce its result, because `==` is element-wise
+and returns a collection of booleans rather than one boolean. For a nested
+column such as a LIST of lists, reduce once per level of nesting. With `t` the
+original table and `r` the table loaded back from a splayed directory, and a
+`payload` column of `(list (list 1 'x) (list 2 'y))`:
+
+```lisp
+(== (at t 'payload) (at r 'payload))              ; [[true true] [true true]]
+(all (map all (== (at t 'payload) (at r 'payload))))  ; true: one boolean
+```
+
+The second form returns `false` if any element differs. A flat column needs
+only one level: `(all (== (at t 'seq) (at r 'seq)))`.
 
 ## 6. Splayed and Partitioned Tables
 
