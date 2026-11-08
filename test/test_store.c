@@ -74,7 +74,8 @@
 #include <sys/wait.h>
 #endif
 
-#define TMP_COL_PATH  "/tmp/rayforce_test_col.dat"
+#define TMP_COL_PATH_LIT  "/tmp/rayforce_test_col.dat"
+#define TMP_COL_PATH ray_test_tmp(TMP_COL_PATH_LIT)   /* per-process root: -j workers never share it */
 #define TMP_SPLAY_DIR "/tmp/rayforce_test_splay"
 
 /* ---- Setup / Teardown -------------------------------------------------- */
@@ -7155,7 +7156,8 @@ static test_result_t test_stream_str_hash_persisted(void) {
 /* A second ray_read_parted of the same root returns the very same segment
  * vectors for partitions whose files did not change, loads a replaced
  * partition afresh, and ray_parted_cache_clear forgets everything. */
-#define TMP_PARTED_ROOT "/tmp/rayforce_test_parted_remount"
+#define TMP_PARTED_ROOT_LIT "/tmp/rayforce_test_parted_remount"
+#define TMP_PARTED_ROOT ray_test_tmp(TMP_PARTED_ROOT_LIT)   /* per-process root: -j workers never share it */
 static ray_t* parted_remount_part(int64_t base) {
     int64_t raw[3] = { base, base + 1, base + 2 };
     ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
@@ -7166,12 +7168,12 @@ static ray_t* parted_remount_part(int64_t base) {
 }
 static test_result_t test_parted_remount_reuse(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
-    TEST_ASSERT_EQ_I(ray_test_mkdir_p(TMP_PARTED_ROOT "/2024.01.01"), 0);
-    TEST_ASSERT_EQ_I(ray_test_mkdir_p(TMP_PARTED_ROOT "/2024.01.02"), 0);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(ray_test_tmp(TMP_PARTED_ROOT_LIT "/2024.01.01")), 0);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(ray_test_tmp(TMP_PARTED_ROOT_LIT "/2024.01.02")), 0);
     ray_t* a = parted_remount_part(10);
     ray_t* b = parted_remount_part(20);
-    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/2024.01.01/t", NULL), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "/2024.01.02/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(a, ray_test_tmp(TMP_PARTED_ROOT_LIT "/2024.01.01/t"), NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, ray_test_tmp(TMP_PARTED_ROOT_LIT "/2024.01.02/t"), NULL), RAY_OK);
 
     ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
@@ -7186,7 +7188,7 @@ static test_result_t test_parted_remount_reuse(void) {
 
     /* Replace the second partition: a fresh vector there, the first kept. */
     ray_t* c = parted_remount_part(30);
-    TEST_ASSERT_EQ_I(ray_splay_save(c, TMP_PARTED_ROOT "/2024.01.02/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(c, ray_test_tmp(TMP_PARTED_ROOT_LIT "/2024.01.02/t"), NULL), RAY_OK);
     ray_t* m3 = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(m3 && !RAY_IS_ERR(m3));
     ray_t** s3 = (ray_t**)ray_data(ray_table_get_col_idx(m3, 1));
@@ -7243,7 +7245,7 @@ static test_result_t test_parted_cache_gc(void) {
     memset(ray_data(nums), 0, 16384 * sizeof(int64_t));
     src = ray_table_add_col(src, ray_sym_intern("n", 1), nums);
     ray_release(nums);
-    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"), NULL), RAY_OK);
     ray_mem_stats_t before, mounted, after;
     ray_mem_stats(&before);
     ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
@@ -7285,8 +7287,8 @@ static test_result_t parted_rebuilt_symbols(bool collect) {
     for (int i = 0; i < 3; i++) {
         (void)ray_test_rm_rf(TMP_PARTED_ROOT);
         ray_t* src = parted_symbol_part(values[i]);
-        TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
-                                        TMP_PARTED_ROOT "/.sym"), RAY_OK);
+        TEST_ASSERT_EQ_I(ray_splay_save(src, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"),
+                                        ray_test_tmp(TMP_PARTED_ROOT_LIT "/.sym")), RAY_OK);
         ray_release(src);
         ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
         TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
@@ -7314,20 +7316,20 @@ static test_result_t test_parted_rebuilt_write_without_gc(void) {
  * reader. Both parted and splayed reads must discard unused cached domains. */
 static test_result_t parted_rebuilt_read_without_gc(bool parted) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
-    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PARTED_ROOT_LIT "_next"));
     ray_t* a = parted_symbol_part("aa");
     ray_t* b = parted_symbol_part("xx");
-    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t",
-                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "_next/1/t",
-                                    TMP_PARTED_ROOT "_next/.sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(a, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "/.sym")), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, ray_test_tmp(TMP_PARTED_ROOT_LIT "_next/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "_next/.sym")), RAY_OK);
     ray_t* old = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(old && !RAY_IS_ERR(old));
     ray_release(old);
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
-    TEST_ASSERT_EQ_I(rename(TMP_PARTED_ROOT "_next", TMP_PARTED_ROOT), 0);
+    TEST_ASSERT_EQ_I(rename(ray_test_tmp(TMP_PARTED_ROOT_LIT "_next"), TMP_PARTED_ROOT), 0);
     ray_t* fresh = parted ? ray_read_parted(TMP_PARTED_ROOT, "t")
-                          : ray_read_splayed(TMP_PARTED_ROOT "/1/t", TMP_PARTED_ROOT "/.sym");
+                          : ray_read_splayed(ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"), ray_test_tmp(TMP_PARTED_ROOT_LIT "/.sym"));
     TEST_ASSERT_TRUE(fresh && !RAY_IS_ERR(fresh));
     ray_t* seg = ray_table_get_col_idx(fresh, parted ? 1 : 0);
     if (parted) seg = ((ray_t**)ray_data(seg))[0];
@@ -7352,20 +7354,20 @@ static test_result_t test_parted_rebuilt_splayed_without_gc(void) {
 /* Opening an unrelated domain must preserve partitions held by a live view. */
 static test_result_t test_parted_live_domain_open(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
-    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PARTED_ROOT_LIT "_next"));
     ray_t* a = parted_symbol_part("aa");
     ray_t* b = parted_symbol_part("xx");
-    TEST_ASSERT_EQ_I(ray_splay_save(a, TMP_PARTED_ROOT "/1/t",
-                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save(b, TMP_PARTED_ROOT "_next/1/t",
-                                    TMP_PARTED_ROOT "_next/.sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(a, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "/.sym")), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(b, ray_test_tmp(TMP_PARTED_ROOT_LIT "_next/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "_next/.sym")), RAY_OK);
     ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
     ray_t* seg = ((ray_t**)ray_data(ray_table_get_col_idx(view, 1)))[0];
     TEST_ASSERT_EQ_I(ray_atomic_load(&seg->rc), 2);
 
-    ray_t* other = ray_read_splayed(TMP_PARTED_ROOT "_next/1/t",
-                                    TMP_PARTED_ROOT "_next/.sym");
+    ray_t* other = ray_read_splayed(ray_test_tmp(TMP_PARTED_ROOT_LIT "_next/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "_next/.sym"));
     TEST_ASSERT_TRUE(other && !RAY_IS_ERR(other));
     TEST_ASSERT_EQ_I(ray_atomic_load(&seg->rc), 2);
     ray_t* remount = ray_read_parted(TMP_PARTED_ROOT, "t");
@@ -7380,19 +7382,19 @@ static test_result_t test_parted_live_domain_open(void) {
     ray_release(a); ray_release(b);
     ray_parted_cache_clear();
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
-    (void)ray_test_rm_rf(TMP_PARTED_ROOT "_next");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PARTED_ROOT_LIT "_next"));
     PASS();
 }
 
 static test_result_t test_parted_missing_symfile(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* src = parted_symbol_part("aa");
-    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
-                                    TMP_PARTED_ROOT "/.sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "/.sym")), RAY_OK);
     ray_release(src);
     ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(view && !RAY_IS_ERR(view));
-    TEST_ASSERT_EQ_I(unlink(TMP_PARTED_ROOT "/.sym"), 0);
+    TEST_ASSERT_EQ_I(unlink(ray_test_tmp(TMP_PARTED_ROOT_LIT "/.sym")), 0);
     ray_t* missing = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_ERR_CODE_MSG(missing, "sym", "no symfile resolved");
     ray_error_free(missing);
@@ -7407,8 +7409,8 @@ static test_result_t test_parted_missing_symfile(void) {
 static test_result_t test_parted_symfile_name_in_error(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* src = parted_symbol_part("aa");
-    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t",
-                                    TMP_PARTED_ROOT "/sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"),
+                                    ray_test_tmp(TMP_PARTED_ROOT_LIT "/sym")), RAY_OK);
     ray_release(src);
     ray_t* view = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_ERR_CODE_MSG(view, "sym", "<dir>/.sym");
@@ -7433,11 +7435,11 @@ static test_result_t test_parted_restored_mtime(void) {
     ray_t* src = ray_table_new(1);
     src = ray_table_add_col(src, ray_sym_intern("v", 1), items);
     ray_release(items);
-    TEST_ASSERT_EQ_I(ray_splay_save(src, TMP_PARTED_ROOT "/1/t", NULL), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save(src, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"), NULL), RAY_OK);
     ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
     ray_t* s1 = ((ray_t**)ray_data(ray_table_get_col_idx(m1, 1)))[0];
-    const char* path = TMP_PARTED_ROOT "/1/t/v";
+    const char* path = ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t/v");
     struct stat st;
     TEST_ASSERT_EQ_I(stat(path, &st), 0);
     struct timespec times[2];
@@ -7481,17 +7483,17 @@ static test_result_t test_parted_generation_and_sweep(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* a = parted_remount_part(10);
     ray_t* b = parted_remount_part(20);
-    TEST_ASSERT_EQ_I(ray_splay_save_mode(a, TMP_PARTED_ROOT "/1/t", NULL, RAY_COMPRESS_OFF), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_splay_save_mode(b, TMP_PARTED_ROOT "/2/t", NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(a, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"), NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(b, ray_test_tmp(TMP_PARTED_ROOT_LIT "/2/t"), NULL, RAY_COMPRESS_OFF), RAY_OK);
     ray_t* m1 = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(m1 && !RAY_IS_ERR(m1));
     ray_t** s1 = (ray_t**)ray_data(ray_table_get_col_idx(m1, 1));
-    TEST_ASSERT_EQ_I(ray_splay_save_mode(b, TMP_PARTED_ROOT "/1/t/.generations/g-1", NULL, RAY_COMPRESS_OFF), RAY_OK);
-    FILE* f = fopen(TMP_PARTED_ROOT "/1/t/.current", "wb");
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(b, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t/.generations/g-1"), NULL, RAY_COMPRESS_OFF), RAY_OK);
+    FILE* f = fopen(ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t/.current"), "wb");
     TEST_ASSERT_NOT_NULL(f);
     TEST_ASSERT_TRUE(fputs(".generations/g-1\n", f) >= 0);
     TEST_ASSERT_EQ_I(fclose(f), 0);
-    (void)ray_test_rm_rf(TMP_PARTED_ROOT "/2");
+    (void)ray_test_rm_rf(ray_test_tmp(TMP_PARTED_ROOT_LIT "/2"));
     ray_t* m2 = ray_read_parted(TMP_PARTED_ROOT, "t");
     TEST_ASSERT_TRUE(m2 && !RAY_IS_ERR(m2));
     ray_t* s2 = ((ray_t**)ray_data(ray_table_get_col_idx(m2, 1)))[0];
@@ -7634,7 +7636,7 @@ static test_result_t parted_cache_recency(void) {
     ray_t* old3 = views[3];
     ray_retain(old3);
     ray_t* c = parted_remount_part(70);
-    TEST_ASSERT_EQ_I(ray_splay_save_mode(c, TMP_PARTED_ROOT "/1/t3", NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(c, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t3"), NULL, RAY_COMPRESS_OFF), RAY_OK);
     ray_release(c);
     TEST_ASSERT_TRUE(parted_cache_remount(views, 3, &reused));
     TEST_ASSERT_FALSE(reused);
@@ -7684,7 +7686,7 @@ static void parted_mount_thread(void* arg) {
 static test_result_t test_parted_concurrent_mounts(void) {
     (void)ray_test_rm_rf(TMP_PARTED_ROOT);
     ray_t* src = parted_remount_part(10);
-    TEST_ASSERT_EQ_I(ray_splay_save_mode(src, TMP_PARTED_ROOT "/1/t", NULL, RAY_COMPRESS_OFF), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_splay_save_mode(src, ray_test_tmp(TMP_PARTED_ROOT_LIT "/1/t"), NULL, RAY_COMPRESS_OFF), RAY_OK);
     atomic_int ready = 0;
     atomic_bool go = false;
     parted_thread_t ctx[4];

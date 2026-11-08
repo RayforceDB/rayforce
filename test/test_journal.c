@@ -3156,8 +3156,10 @@ static test_result_t test_journal_open_releases_lock_on_long_base(void) {
     TEST_ASSERT_TRUE(dir[0] != '\0');
     /* The lengths below are what the kernel sees: on macOS /tmp is a
      * symlink to /private/tmp, and a path that fits only before that
-     * expansion fails with ENAMETOOLONG instead of reaching open_append. */
-    char path[1100];
+     * expansion fails with ENAMETOOLONG instead of reaching open_append.
+     * realpath(3) writes up to PATH_MAX bytes: a smaller buffer aborts
+     * under _FORTIFY_SOURCE. */
+    char path[4096];
     if (!realpath(dir, path)) snprintf(path, sizeof(path), "%s", dir);
     while (strlen(path) + 201 < 1010) {
         size_t n = strlen(path);

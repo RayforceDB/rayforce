@@ -8,7 +8,10 @@
 (set n 600000)
 (set i (til n))
 (set t (+ 1000000 (* 7 (% i 300000))))
-(set s (as 'SYMBOL (map (fn [j] (if (== 0 (% j 3)) "" (format "p%" (% j 101)))) i)))
+;; s: "" when i%3 is 0, else "p<i%101>" (built by gather, not a per-row lambda)
+(set s (at (as 'SYMBOL (concat (list "") (map (fn [k] (format "p%" k)) (til 101)))) (* (as 'I64 (!= 0 (% i 3))) (+ 1 (% i 101)))))
+(set ck (+ 130500 (til 1000)))
+(all (== (as 'STR (at s ck)) (as 'STR (as 'SYMBOL (map (fn [j] (if (== 0 (% j 3)) "" (format "p%" (% j 101)))) ck))))) -- true
 (set v (% (* i 13) 1000))
 (.csv.write (table [t s v] (list t s v)) "rf_test_zprune.csv") -- 0
 (set T (.csv.splayed [t s v] [I64 SYM I64] "rf_test_zprune.csv" "rf_test_zprune/"))
@@ -30,7 +33,10 @@
 ;; nulls sort first under asc (their chunks are never skipped) and last
 ;; under desc
 (.sys.exec "rm -rf rf_test_zprune_n") -- 0
-(set kn (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N (+ 5 (% j 300000)))) i)))
+;; kn: null where j%1000 is 0 or 131072 <= j < 196608, else 5 + j%300000 (a gather
+;; of row n, the null, for those rows)
+(set kn (at (concat (+ 5 (% i 300000)) (as 'I64 (list 0Ni))) (+ i (* (as 'I64 (or (== 0 (% i 1000)) (and (>= i 131072) (< i 196608)))) (- n i)))))
+(all (== (as 'STR (at kn ck)) (as 'STR (as 'I64 (map (fn [j] (if (or (== 0 (% j 1000)) (and (>= j 131072) (< j 196608))) 0N (+ 5 (% j 300000)))) ck))))) -- true
 (.db.splayed.set "rf_test_zprune_n/" (table [kn v] (list kn v)))
 (set TN (.db.splayed.get "rf_test_zprune_n/"))
 (set TNm (table [kn v] (list kn v)))

@@ -294,12 +294,15 @@ static ray_t* parse_number(ray_parser_t *p) {
         /* Check for timestamp separator 'D' */
         if (*p->pos == 'D') {
             p->pos++; /* skip D */
-            /* Parse HH:MM:SS.nnnnnnnnn */
+            /* Parse HH:MM:SS.nnnnnnnnn.  Each malformed arm names what it
+             * expected: the field checks previously all returned an empty
+             * `parse` error, so a mistyped timestamp gave a bare "error:
+             * parse" with no position or reason. */
             if (!(p->pos[0] >= '0' && p->pos[0] <= '9' &&
                   p->pos[1] >= '0' && p->pos[1] <= '9'))
-                return ray_error("parse", NULL);
+                return ray_error("parse", "timestamp literal: expected two digits for the hour after 'D'");
             int hh = (p->pos[0] - '0') * 10 + (p->pos[1] - '0'); p->pos += 2;
-            if (*p->pos != ':') return ray_error("parse", NULL);
+            if (*p->pos != ':') return ray_error("parse", "timestamp literal: expected ':' after the hour");
             p->pos++;
             /* Each field must be two ASCII digits.  The minute/second reads
              * previously trusted p->pos[0..1] without checking, so a
@@ -307,14 +310,16 @@ static ray_t* parse_number(ray_parser_t *p) {
              * the source buffer.  The digit test also stops at the NUL
              * terminator, so it doubles as the bounds check. */
             if (!(p->pos[0] >= '0' && p->pos[0] <= '9' && p->pos[1] >= '0' && p->pos[1] <= '9'))
-                return ray_error("parse", NULL);
+                return ray_error("parse", "timestamp literal: expected two digits for the minute");
             int mi = (p->pos[0] - '0') * 10 + (p->pos[1] - '0'); p->pos += 2;
-            if (*p->pos != ':') return ray_error("parse", NULL);
+            if (*p->pos != ':') return ray_error("parse", "timestamp literal: expected ':' after the minute");
             p->pos++;
             if (!(p->pos[0] >= '0' && p->pos[0] <= '9' && p->pos[1] >= '0' && p->pos[1] <= '9'))
-                return ray_error("parse", NULL);
+                return ray_error("parse", "timestamp literal: expected two digits for the second");
             int ss = (p->pos[0] - '0') * 10 + (p->pos[1] - '0'); p->pos += 2;
-            if (*p->pos != '.') return ray_error("parse", NULL);
+            /* The fractional second is required, as the suite pins; name it. */
+            if (*p->pos != '.')
+                return ray_error("parse", "timestamp literal: expected '.' and fractional seconds after the second");
             p->pos++;
             if (hh > 23 || mi > 59 || ss > 59)
                 return ray_error("parse", "invalid time %02d:%02d:%02d", hh, mi, ss);
