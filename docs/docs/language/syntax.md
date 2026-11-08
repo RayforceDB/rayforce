@@ -20,9 +20,14 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 I64 `+`, `-`, `*`, `sum`, and `sums` use wrapping arithmetic, including their
 vector and query forms. The result wraps modulo 2^64 and is interpreted as a
 signed I64; it does not raise an overflow error. The minimum I64 bit pattern
-is reserved for the null sentinel, so a wrapped result equal to that pattern
-prints as `0Nl`. For example, `(+ 9223372036854775807 2)` is
-`-9223372036854775807`, while `(+ 9223372036854775807 1)` is `0Nl`.
+is reserved for the null sentinel. For atoms, a wrapped result equal to that
+pattern is the null `0Nl`: `(+ 9223372036854775807 2)` is
+`-9223372036854775807`, while `(+ 9223372036854775807 1)` is `0Nl`. Vector and
+query results (including `sums` and a `select` column) land on the same bit
+pattern but are not flagged as null: `(nil? (+ [9223372036854775807] 1))` is
+`[false]` even though the element prints as `-9223372036854775808`. Do not
+rely on `nil?` to detect overflow in vectors; see
+[#841](https://github.com/RayforceDB/rayforce/issues/841).
 
 Casting an out-of-range F64 with `as 'I64` clamps to the nearest non-null I64
 bound: `(as 'I64 1e19)` is `9223372036854775807`, and
