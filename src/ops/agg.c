@@ -81,6 +81,48 @@ static void nth_element_dbl(double* a, int64_t lo, int64_t hi, int64_t k) {
     }
 }
 
+static int i64_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+
+/* nth_element_dbl over int64 values: a[k] ends up the kth-smallest, exactly,
+ * where a double would round values above 2^53. */
+static void nth_element_i64(int64_t* a, int64_t lo, int64_t hi, int64_t k) {
+    int depth_limit = 0;
+    for (int64_t r = hi - lo + 1; r > 0; r >>= 1) depth_limit++;
+    depth_limit *= 2;
+    while (hi - lo > 16) {
+        if (depth_limit-- <= 0) {
+            qsort(a + lo, (size_t)(hi - lo + 1), sizeof(int64_t), i64_cmp);
+            return;
+        }
+        int64_t mid = lo + ((hi - lo) >> 1);
+        if (a[lo] > a[mid]) { int64_t t = a[lo]; a[lo] = a[mid]; a[mid] = t; }
+        if (a[lo] > a[hi])  { int64_t t = a[lo]; a[lo] = a[hi];  a[hi]  = t; }
+        if (a[mid] > a[hi]) { int64_t t = a[mid]; a[mid] = a[hi]; a[hi] = t; }
+        { int64_t t = a[mid]; a[mid] = a[hi - 1]; a[hi - 1] = t; }
+        int64_t pivot = a[hi - 1];
+        int64_t i = lo, j = hi - 1;
+        for (;;) {
+            while (a[++i] < pivot) {}
+            while (a[--j] > pivot) {}
+            if (i >= j) break;
+            int64_t t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+        { int64_t t = a[i]; a[i] = a[hi - 1]; a[hi - 1] = t; }
+        if      (k < i) hi = i - 1;
+        else if (k > i) lo = i + 1;
+        else            return;
+    }
+    for (int64_t i = lo + 1; i <= hi; i++) {
+        int64_t key = a[i];
+        int64_t j = i - 1;
+        while (j >= lo && a[j] > key) { a[j + 1] = a[j]; j--; }
+        a[j + 1] = key;
+    }
+}
+
 /* ══════════════════════════════════════════
  * Aggregation builtins
  * ══════════════════════════════════════════ */
@@ -858,17 +900,96 @@ ray_t* ray_count_fn(ray_t* x) {
     return make_i64(ray_len(x));
 }
 
+/* The 128-bit total (hi, lo) divided by n (0 < n < 2^63), rounded half away
+ * from zero.  The quotient is a mean or a midpoint of int64 values, so it
+ * fits an int64. */
+static int64_t i128_div_round(int64_t hi, uint64_t lo, int64_t n) {
+    bool neg = hi < 0;
+    uint64_t mh = (uint64_t)hi, ml = lo;
+    if (neg) { ml = ~ml + 1; mh = ~mh + (ml == 0 ? 1 : 0); }
+    uint64_t un = (uint64_t)n, q = 0, r = 0;
+    for (int b = 127; b >= 0; b--) {
+        r = (r << 1) | (b >= 64 ? (mh >> (b - 64)) & 1 : (ml >> b) & 1);
+        q <<= 1;
+        if (r >= un) { r -= un; q |= 1; }
+    }
+    if (r >= un - r) q++;
+    return neg ? (int64_t)(0 - q) : (int64_t)q;
+}
+
+/* The mean (mode 0), median (mode 1) or q-quantile (mode 2) of a TIMESPAN
+ * vector, to the nanosecond: the integer total is exact (128 bits), and the
+ * order statistics come from the int64 values, never through a double, so a
+ * duration above 2^53 ns (about 104 days) is not rounded and a median of an
+ * odd count is one of the inputs.  Null cells are skipped; no value at all
+ * is a null duration. */
+static ray_t* timespan_vec_stat(ray_t* x, int mode, double q) {
+    int64_t len = x->len;
+    const int64_t* d = (const int64_t*)ray_data(x);
+    bool has_nulls = ray_vec_may_have_nulls(x);
+    if (mode == 0) {
+        int64_t hi = 0, cnt = 0;
+        uint64_t lo = 0;
+        for (int64_t i = 0; i < len; i++) {
+            if (has_nulls && d[i] == NULL_I64) continue;
+            ray_i128_add(&hi, &lo, d[i]);
+            cnt++;
+        }
+        if (cnt == 0) return ray_typed_null(-RAY_TIMESPAN);
+        return ray_timespan(i128_div_round(hi, lo, cnt));
+    }
+    if (len == 0) return ray_typed_null(-RAY_TIMESPAN);
+    ray_t* scratch = ray_alloc((size_t)len * sizeof(int64_t));
+    if (!scratch) return ray_error("oom", NULL);
+    scratch->type = RAY_I64;
+    int64_t* a = (int64_t*)ray_data(scratch);
+    int64_t n = 0;
+    for (int64_t i = 0; i < len; i++)
+        if (!has_nulls || d[i] != NULL_I64) a[n++] = d[i];
+    scratch->len = n;
+    if (n == 0) { ray_release(scratch); return ray_typed_null(-RAY_TIMESPAN); }
+
+    int64_t v;
+    if (mode == 1) {
+        int64_t k = n / 2;
+        nth_element_i64(a, 0, n - 1, k);
+        if (n % 2 == 1) v = a[k];
+        else {
+            int64_t upper = a[k];
+            nth_element_i64(a, 0, k - 1, k - 1);
+            int64_t hi = 0; uint64_t lo = 0;
+            ray_i128_add(&hi, &lo, a[k - 1]);
+            ray_i128_add(&hi, &lo, upper);
+            v = i128_div_round(hi, lo, 2);
+        }
+    } else if (n == 1 || q <= 0.0) {
+        nth_element_i64(a, 0, n - 1, 0);
+        v = a[0];
+    } else if (q >= 1.0) {
+        nth_element_i64(a, 0, n - 1, n - 1);
+        v = a[n - 1];
+    } else {
+        double pos = q * (double)(n - 1);
+        int64_t lower_i = (int64_t)pos;
+        double frac = pos - (double)lower_i;
+        nth_element_i64(a, 0, n - 1, lower_i);
+        v = a[lower_i];
+        if (frac > 0.0) {
+            nth_element_i64(a, lower_i + 1, n - 1, lower_i + 1);
+            /* the endpoints are exact; only the fractional step is a double */
+            uint64_t gap = (uint64_t)a[lower_i + 1] - (uint64_t)v;
+            uint64_t step = (uint64_t)(frac * (double)gap + 0.5);
+            if (step > gap) step = gap;
+            v = (int64_t)((uint64_t)v + step);
+        }
+    }
+    ray_release(scratch);
+    return ray_timespan(v);
+}
+
 ray_t* ray_avg_fn(ray_t* x) {
     if (x->type == -RAY_TIMESPAN) { ray_retain(x); return x; }
-    if (x->type == RAY_TIMESPAN) {
-        ray_t* counts = ray_vec_from_raw(RAY_I64, ray_data(x), x->len);
-        if (RAY_IS_ERR(counts)) return counts;
-        counts->attrs |= x->attrs & RAY_ATTR_HAS_NULLS;
-        ray_t* result = ray_avg_fn(counts);
-        ray_release(counts);
-        if (result && ray_is_lazy(result)) result = ray_lazy_materialize(result);
-        return ray_timespan_of_f64_atom(result);
-    }
+    if (x->type == RAY_TIMESPAN) return timespan_vec_stat(x, 0, 0.0);
 
     if (ray_is_lazy(x)) AGG_LAZY(x, OP_AVG);
     if (RAY_IS_PARTED(x->type)) return agg_parted_avg(x);
@@ -1242,8 +1363,8 @@ ray_t* ray_med_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
     /* the median of one duration is that duration (a null stays null) */
     if (x->type == -RAY_TIMESPAN) { ray_retain(x); return x; }
-    ray_t* r = med_f64(x);
-    return x->type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
+    if (x->type == RAY_TIMESPAN) return timespan_vec_stat(x, 1, 0.0);
+    return med_f64(x);
 }
 
 ray_t* ray_mode_fn(ray_t* x) {
@@ -1407,8 +1528,8 @@ static ray_t* quantile_f64(ray_t* x, double q, const char* name) {
 static ray_t* quantile_core(ray_t* x, double q, const char* name) {
     if (!x || RAY_IS_ERR(x)) return x;
     if (x->type == -RAY_TIMESPAN) { ray_retain(x); return x; }
-    ray_t* r = quantile_f64(x, q, name);
-    return x->type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
+    if (x->type == RAY_TIMESPAN) return timespan_vec_stat(x, 2, q);
+    return quantile_f64(x, q, name);
 }
 
 ray_t* ray_quantile_fn(ray_t* x, ray_t* q_obj) {

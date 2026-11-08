@@ -92,6 +92,24 @@
 (as 'I64 (at Rn 'm)) -- [3600000000000 10800000000000]
 (at Rn 'c) -- [2 2]
 
+;; exact to the nanosecond above 2^53 ns (about 104 days), where a double
+;; would round: the total is an exact 128-bit sum and the order statistics
+;; are int64 values
+(set Big (enlist 300D00:00:00.000000001 300D00:00:00.000000003 300D00:00:00.000000007))
+(as 'I64 (med Big)) -- 25920000000000003
+(as 'I64 (avg (enlist 300D00:00:00.000000001 300D00:00:00.000000003))) -- 25920000000000002
+(as 'I64 (avg (as 'TIMESPAN [9223372036854775806 9223372036854775806]))) -- 9223372036854775806
+(as 'I64 (quantile Big 0.0)) -- 25920000000000001
+(as 'I64 (quantile Big 1.0)) -- 25920000000000007
+(as 'I64 (quantile Big 0.5)) -- 25920000000000003
+(as 'I64 (quantile Big 0.75)) -- 25920000000000005
+
+;; halves round away from zero, as before
+(as 'I64 (med (enlist 300D00:00:00.000000001 300D00:00:00.000000002))) -- 25920000000000002
+(as 'I64 (med (as 'TIMESPAN [-3 -4]))) -- -4
+(as 'I64 (avg (as 'TIMESPAN [-3 -4]))) -- -4
+(as 'I64 (avg (as 'TIMESPAN [3 4]))) -- 4
+
 ;; an ungrouped query skips a null duration, as the same function on the
 ;; extracted vector does
 (set Nu (table [sp] (list (enlist 0D01:00:00 0Nn 0D03:00:00))))
