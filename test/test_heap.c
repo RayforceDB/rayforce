@@ -602,7 +602,11 @@ static test_result_t test_gc_reclaim_oversized_pool(void) {
      * buddy pool entirely — they are mmap'd at their EXACT page-rounded size
      * (the direct path), so they never create an oversized pool to GC-reclaim.
      * Verify the new contract: a big alloc bumps direct_bytes by ~exactly its
-     * size (not a power-of-2 block), grows no pool, and releases exactly. */
+     * size (not a power-of-2 block), grows no pool, and releases exactly.
+     * Released direct mappings are cached process-wide; one a test before
+     * left there (larger than 64 MB) would serve this request whole, so
+     * start from an empty cache: the contract is about a fresh mapping. */
+    ray_heap_direct_cache_drain();
     ray_t* small = ray_alloc(64);
     TEST_ASSERT_NOT_NULL(small);
 

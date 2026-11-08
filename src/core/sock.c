@@ -436,6 +436,17 @@ void ray_sock_set_oob_owner(ray_sock_t s)
  * Returns 1 if an urgent byte was present (and taken), 0 otherwise.  Used to
  * ask "did THIS connection request a cancel?" — so a cancel from one client
  * can never affect another client's query.  Async-signal-safe (recv). */
+int ray_sock_peek_oob(ray_sock_t s)
+{
+#ifndef RAY_OS_WINDOWS
+    unsigned char b;
+    return recv((int)s, &b, 1, MSG_OOB | MSG_PEEK) == 1 ? (int)b : -1;
+#else
+    (void)s;
+    return -1;
+#endif
+}
+
 int ray_sock_take_oob(ray_sock_t s)
 {
 #ifndef RAY_OS_WINDOWS

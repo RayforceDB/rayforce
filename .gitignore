@@ -56,6 +56,8 @@ compile_commands.json
 rayforce.tsan
 rayforce.test.tsan
 rayforce.test.rel
+rayforce.test.fast
+*.times
 
 # Fuzzing: grown corpus and crash artifacts stay local; only fuzz/seeds/ is committed
 fuzz/corpus/

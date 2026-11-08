@@ -65,13 +65,30 @@ static inline double ray_enc_fval(uint64_t b, int T) {
     if (T == 32) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); return (double)f; }
     double d; memcpy(&d, &b, 8); return d;
 }
-int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k);
+static inline int64_t ray_enc_logical(uint64_t bits, ray_enc_kind_t k) {
+    if (k.T == 64) return (int64_t)bits;
+    const uint64_t m = (1ull << k.T) - 1;
+    bits &= m;
+    return k.is_signed && (bits >> (k.T - 1)) & 1 ? (int64_t)(bits | ~m) : (int64_t)bits;
+}
+/* The unsigned key of a T-bit pattern whose order is the kind order: the
+ * sign bit flipped on a signed kind; on a float kind a non-negative value
+ * takes the sign bit and a negative one is inverted, so -0.0 comes before
+ * +0.0 (defined on non-NaN patterns only, see ray_enc_lt). */
+static inline uint64_t ray_enc_okey(uint64_t bits, ray_enc_kind_t k) {
+    const uint64_t m = k.T == 64 ? ~0ull : (1ull << k.T) - 1, sb = 1ull << (k.T - 1);
+    bits &= m;
+    if (k.is_float) return bits ^ ((bits & sb) ? m : sb);
+    return k.is_signed ? bits ^ sb : bits;
+}
 /* a < b in kind order; on a float kind this is dictionary order: numeric
  * on the value (F32 widened), -0.0 before +0.0.  The float order is defined
  * on non-NaN values only (a NaN is not ordered, so it breaks a sort or a
  * binary search): float callers (training, dict_codes, stats) must drop
  * NaN / null rows first. */
-bool    ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k);
+static inline bool ray_enc_lt(uint64_t a, uint64_t b, ray_enc_kind_t k) {
+    return ray_enc_okey(a, k) < ray_enc_okey(b, k);
+}
 
 /* One vector of input: T-bit patterns, null bitmap (bit i set = row i
  * null, bitmap-carrying types only) and the null count (in-band nulls of
@@ -131,7 +148,13 @@ typedef enum {
     RAY_ENC_SLOT_FSST_LENGTHS  /* kind U32: RAW, FOR_BP */
 } ray_enc_slot_t;
 
-typedef struct { const uint64_t* v; uint32_t n; } ray_enc_dict_t;
+/* A value dictionary: n distinct T-bit patterns in kind order; ix, when
+ * not NULL, its hash index (ray_enc_dict_index): code + 1 by slot, 0 empty,
+ * mask + 1 slots. */
+typedef struct { const uint64_t* v; uint32_t n; const uint32_t* ix; uint64_t mask; } ray_enc_dict_t;
+/* The hash index of n patterns for ray_enc_dict_t.ix (*mask set), or NULL
+ * out of memory; ray_free_raw frees it. */
+uint32_t* ray_enc_dict_index(const uint64_t* v, uint32_t n, uint64_t* mask);
 typedef struct { uint8_t enc, width; int64_t bytes; } ray_enc_choice_t;
 
 ray_enc_choice_t ray_enc_choose(const uint64_t* v, int n, ray_enc_kind_t k,
