@@ -59,6 +59,17 @@
 (nil? (at (at (update {r: (dev sp) by: g from: U}) 'r) 4)) -- true
 (at (as 'I64 (at (update {r: (stddev sp) by: g from: U}) 'r)) 2) -- (at (as 'I64 (at (select {r: (stddev sp) by: g from: U}) 'r)) 1)
 
+;; an ungrouped select centers the deviation too: a constant column of hours
+;; is exactly 0, and a spread of nanoseconds on hour-long values is not lost
+(set K (table [sp] (list (enlist 0D05:00:00 0D05:00:00 0D05:00:00))))
+(as 'I64 (at (select {r: (stddev sp) from: K}) 'r)) -- [0]
+(as 'I64 (at (select {r: (dev sp) from: K}) 'r)) -- [0]
+(as 'I64 (at (select {r: (stddev_pop sp) from: K}) 'r)) -- [0]
+(set J (table [sp] (list (as 'TIMESPAN (+ 3600000000000 (til 11))))))
+(as 'I64 (at (select {r: (stddev sp) from: J}) 'r)) -- (enlist (as 'I64 (stddev (at J 'sp))))
+(as 'I64 (at (select {r: (dev sp) from: J}) 'r)) -- (enlist (as 'I64 (dev (at J 'sp))))
+(as 'I64 (at (select {r: (stddev sp) from: J}) 'r)) -- [3]
+
 ;; values more than 2^63 apart: the centered difference does not wrap
 (set Wd (table [v] (list [-9000000000000000000 9000000000000000000 0])))
 (< (abs (- (at (at (update {r: (stddev v) from: Wd}) 'r) 0) (stddev (at Wd 'v)))) 1000000000000.0) -- true

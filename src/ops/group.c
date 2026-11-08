@@ -9582,6 +9582,12 @@ struct scalar_ctx_s {
      * silently alias past that many aggregates. */
     const bool*    agg_int_null_has;
     int64_t*       agg_int_null_sentinel;
+    /* Per agg: the value an integer VAR/STDDEV input is centered on (0: none).
+     * Variance is shift-invariant, and squares of the raw values lose it to
+     * cancellation once they exceed 2^53 (a constant column of hours of
+     * nanoseconds would not come out as 0).  One value for the whole scan, so
+     * the chunk and worker accumulators merge by plain addition. */
+    const int64_t* var_shift;
     /* Range reads (R-WALK).  A plain context (staged false) reads whole
      * columns: row_base 0, srcs/plain/piece_attrs/fail unused.  A staged
      * one (some input is generation 2) runs each task through
@@ -10113,6 +10119,13 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
                     if (nn) nn[a]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
+                /* a variance input is centered (see var_shift); every other
+                 * aggregate has shift 0 */
+                int64_t sh = c->var_shift ? c->var_shift[a] : 0;
+                if (sh) {
+                    fv = red_shift_diff(iv, sh);
+                    iv = (int64_t)((uint64_t)iv - (uint64_t)sh);
+                }
                 if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, iv);
                 else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
                 if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
@@ -16062,7 +16075,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Keyless path serves unbounded n_aggs — VLAs here scale with the query,
          * so carve exactly (8-byte arrays first). */
         ray_t* sc_vla_hdr = NULL;
-        size_t sc_vla_bytes = (size_t)vla_aggs * (4 * sizeof(void*) + sizeof(int64_t)
+        size_t sc_vla_bytes = (size_t)vla_aggs * (4 * sizeof(void*) + 2 * sizeof(int64_t)
                                                   + sizeof(int8_t) + sizeof(bool));
         uint8_t* sc_blk = (uint8_t*)scratch_alloc(&sc_vla_hdr, sc_vla_bytes);
         if (!sc_blk) {
@@ -16079,7 +16092,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         const void**    sc_plain       = (const void**)(sc_srcs + vla_aggs);       /* staged only */
         const ray_str_t** sc_agg_str = (const ray_str_t**)(sc_plain + vla_aggs);
         int64_t  *sc_int_null_sentinel = (int64_t*)(sc_agg_str + vla_aggs);
-        int8_t   *agg_types            = (int8_t*)(sc_int_null_sentinel + vla_aggs);
+        int64_t  *sc_var_shift         = sc_int_null_sentinel + vla_aggs;
+        int8_t   *agg_types            = (int8_t*)(sc_var_shift + vla_aggs);
         /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
          * with no fixed cap, so a fixed-width bitmask would silently alias
          * once n_aggs exceeded its bit width. */
@@ -16454,6 +16468,24 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
             }
         }
+        /* Center each integer VAR/STDDEV input on its first non-null cell.  A
+         * staged input (read by range) keeps shift 0. */
+        for (uint32_t a = 0; a < n_aggs; a++) {
+            sc_var_shift[a] = 0;
+            uint16_t vop = ext->agg_ops[a];
+            if (!(vop == OP_VAR || vop == OP_VAR_POP || vop == OP_STDDEV || vop == OP_STDDEV_POP))
+                continue;
+            if (!agg_ptrs[a] || !agg_vecs[a] || agg_strlen[a] || group_fp_type(agg_types[a]))
+                continue;
+            int64_t lim = agg_vecs[a]->len < 4096 ? agg_vecs[a]->len : 4096;
+            for (int64_t r = 0; r < lim; r++) {
+                int64_t v = scalar_i64_at(agg_ptrs[a], agg_types[a], r);
+                if (sc_int_null_has[a] && v == sc_int_null_sentinel[a]) continue;
+                sc_var_shift[a] = v;
+                break;
+            }
+        }
+
         scalar_ctx_t sc_ctx = {
             .agg_ptrs   = agg_ptrs,
             .agg_types  = agg_types,
@@ -16473,6 +16505,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .rowsel     = rowsel,
             .agg_int_null_has = sc_int_null_has,
             .agg_int_null_sentinel = sc_int_null_sentinel,
+            .var_shift  = sc_var_shift,
             .row_base   = 0,
             .srcs       = sc_staged ? sc_srcs : NULL,
             .plain      = sc_staged ? sc_plain : NULL,
