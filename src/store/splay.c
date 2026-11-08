@@ -1528,6 +1528,15 @@ static ray_err_t splay_hash_append(const char* path, ray_t* col) {
     if (err != RAY_ERR_NYI) return err;
     ray_t* hi = ray_idx_hash_fn(col);
     if (!hi || RAY_IS_ERR(hi)) { if (hi) ray_error_free(hi); return RAY_ERR_OOM; }
+    /* The fresh HASH root does not inherit the UNIQUE marker `col` carries
+     * (the in-place builder copies it from the same source).  The caller
+     * has already verified it; propagate it, never re-scan.  A column
+     * without the marker is left exactly as built. */
+    if ((col->attrs & RAY_ATTR_HAS_INDEX) && col->index && !RAY_IS_ERR(col->index) &&
+        (ray_index_payload(col->index)->markers & RAY_MARK_UNIQUE) &&
+        (hi->attrs & RAY_ATTR_HAS_INDEX) && hi->index && !RAY_IS_ERR(hi->index) &&
+        ray_index_payload(hi->index)->kind == RAY_IDX_HASH)
+        ray_index_payload(hi->index)->markers |= RAY_MARK_UNIQUE;
     err = (hi->attrs & RAY_ATTR_HAS_INDEX)
         ? ray_col_append_index(path, ray_index_payload(hi->index), hi->len, hi->type)
         : RAY_ERR_IO;
@@ -1583,6 +1592,21 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                 if (n > 0 && n < (int)sizeof(path)) {
                     ray_t* fc = ray_col_load(path);  /* file-local codes */
                     if (fc && !RAY_IS_ERR(fc)) {
+                        /* UNIQUE is a property of the saved values: file-local
+                         * positions are a one-to-one renaming of the ids, so
+                         * it carries over.  order_sym does not: it is a
+                         * runtime symbol id and a generation-0 region holds
+                         * no name to resolve it by, so it stays unset. */
+                        ray_index_t* six = ray_index_payload(col->index);
+                        if ((six->markers & RAY_MARK_UNIQUE) && six->built_for_len == col->len) {
+                            /* re-checked on the saved values: a failed
+                             * check leaves the hash without the marker */
+                            ray_t* tag = ray_sym(ray_sym_intern("unique", 6));
+                            ray_t* u = (tag && !RAY_IS_ERR(tag)) ? ray_attr_set_fn(tag, fc) : NULL;
+                            if (tag && !RAY_IS_ERR(tag)) ray_release(tag);
+                            if (u && !RAY_IS_ERR(u)) { ray_release(fc); fc = u; }
+                            else if (u) ray_error_free(u);
+                        }
                         (void)splay_hash_append(path, fc);  /* hash over file-local */
                         ray_release(fc);
                     } else if (fc) {

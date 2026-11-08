@@ -230,14 +230,52 @@ ray_t* ray_log_write_fn(ray_t* expr) {
     return err_to_ray(e, "io");
 }
 
-ray_t* ray_log_replay_fn(ray_t* path) {
+/* Prepare the private report BEFORE evaluating any journal entry.  A result-
+ * construction failure must not first apply the log and then hide its counts.
+ * The dictionary owns both vectors; its two I64 cells are filled after replay. */
+static ray_t* replay_report_new(void) {
+    static const char* names[2] = { "entries", "eval_errors" };
+    int64_t ids[2];
+    const int64_t zero[2] = { 0, 0 };
+    for (int i = 0; i < 2; ++i) {
+        ids[i] = ray_sym_intern(names[i], strlen(names[i]));
+        if (ids[i] < 0) return ray_error("oom", NULL);
+    }
+    ray_t* keys = ray_vec_from_raw(RAY_SYM, ids, 2);
+    if (!keys) return ray_error("oom", NULL);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_vec_from_raw(RAY_I64, zero, 2);
+    if (!vals || RAY_IS_ERR(vals)) {
+        ray_release(keys);
+        return vals ? vals : ray_error("oom", NULL);
+    }
+    return ray_dict_new(keys, vals); /* consumes both refs, also on error */
+}
+
+static ray_t* log_replay_impl(ray_t* path, bool reporting) {
     char p[1024];
     if (!str_to_cpath(path, p, sizeof(p)))
-        return ray_error("type", ".log.replay expects a string path");
+        return ray_error("type", reporting
+                         ? ".log.replay_report expects a string path"
+                         : ".log.replay expects a string path");
 
+    ray_t* report = NULL;
+    if (reporting) {
+        report = replay_report_new();
+        if (RAY_IS_ERR(report)) return report;
+    }
     int64_t chunks = 0, errs = 0;
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
     ray_journal_replay(p, &chunks, &errs, &status);
+    if (report) {
+        if (status == RAY_JREPLAY_OK) {
+            int64_t* counts = (int64_t*)ray_data(ray_dict_vals(report));
+            counts[0] = chunks;
+            counts[1] = errs;
+            return report;
+        }
+        ray_release(report);
+    }
     switch (status) {
     case RAY_JREPLAY_OK:
         return ray_i64(chunks);
@@ -269,6 +307,14 @@ ray_t* ray_log_replay_fn(ray_t* path) {
                          p, (long long)chunks);
     }
     return ray_error("internal", "unknown replay status");
+}
+
+ray_t* ray_log_replay_fn(ray_t* path) {
+    return log_replay_impl(path, false);
+}
+
+ray_t* ray_log_replay_report_fn(ray_t* path) {
+    return log_replay_impl(path, true);
 }
 
 /* (.log.validate "path") -> (chunks; valid_bytes) — a 2-list. */

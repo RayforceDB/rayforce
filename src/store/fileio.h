@@ -51,6 +51,16 @@ ray_err_t ray_file_lock_sh(ray_fd_t fd);
 ray_err_t ray_file_trylock_ex(ray_fd_t fd);
 ray_err_t ray_file_unlock(ray_fd_t fd);
 ray_err_t ray_file_sync(ray_fd_t fd);
+/* True when RAYFORCE_NO_FSYNC is set to a non-empty value other than "0":
+ * every durability flush (fsync, directory fsync, msync(MS_SYNC),
+ * FlushFileBuffers) becomes a no-op.  Test-suite knob only -- writes still
+ * happen and are visible to readers, they just are not forced to media.
+ * Read once per process. */
+bool ray_fsync_disabled(void);
+#ifndef RAY_OS_WINDOWS
+/* fsync(fd) unless ray_fsync_disabled(); returns fsync's result (0 = ok). */
+int  ray_fsync_fd(int fd);
+#endif
 ray_err_t ray_file_sync_dir(const char* path);
 ray_err_t ray_file_rename(const char* old_path, const char* new_path);
 /* Publish a new path without replacing any existing destination, including
