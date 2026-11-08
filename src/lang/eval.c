@@ -743,6 +743,7 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
         case RAY_U8:        return ray_u8(0);
         case RAY_BOOL:      return make_bool(0);
         case RAY_F64:       return make_f64(0.0);
+        case RAY_F32:       return ray_f32(0.0f);
         case RAY_DATE:      return ray_date(0);
         case RAY_TIME:      return ray_time(0);
         case RAY_TIMESPAN: return ray_timespan(0);

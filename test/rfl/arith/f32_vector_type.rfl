@@ -163,3 +163,20 @@
 (at (select {a: (sum (as 'F32 2.5)) from: TB by: n}) 'a) -- [2.5 2.5 2.5 2.5]
 (at (select {a: (first (neg (as 'F32 2.5))) from: TB where: (> n 2) by: n}) 'a) -- (as 'F32 [-2.5 -2.5])
 (nil? (at (select {a: (max (as 'F32 0Nf)) from: TB by: n}) 'a)) -- [true true true true]
+
+;; Empty F32 operands keep the F32 result type, as empty F64 operands keep F64.
+(set e32 (as 'F32 []))
+(type (- e32 e32)) -- 'F32
+(type (+ e32 (as 'F32 1.0))) -- 'F32
+(type (* (as 'F32 1.0) e32)) -- 'F32
+(type (% e32 e32)) -- 'F32
+(type (/ e32 e32)) -- 'F64
+(type (+ e32 1)) -- 'F64
+(type (neg e32)) -- 'F32
+(type (abs e32)) -- 'F32
+(type (floor e32)) -- 'F32
+(type (ceil e32)) -- 'F32
+(type (round e32)) -- 'F32
+(type (fill (as 'F32 0.0) e32)) -- 'F32
+(type (max e32 e32)) -- 'F32
+(type (- (as 'F64 []) (as 'F64 []))) -- 'F64
