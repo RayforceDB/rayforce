@@ -4398,7 +4398,7 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
     bool fp = in_type == RAY_F64 || in_type == RAY_F32;
     ray_t* sym_src = in_type == RAY_SYM ? input : NULL;
     switch (opcode) {
-        case OP_SUM:   return fp ? ray_f64(ray_f64_fin(m->sum_f)) : (in_type == RAY_TIME ? ray_time(m->sum_i) : in_type == RAY_TIMESPAN ? ray_timespan(m->sum_i) : ray_i64(m->sum_i));
+        case OP_SUM:   return fp ? ray_f64(ray_f64_fin(m->sum_f)) : (in_type == RAY_TIME ? ray_time(m->sum_i) : ray_i64(m->sum_i));
         case OP_PROD:  return fp ? ray_f64(ray_f64_fin(m->prod_f)) : ray_i64(m->prod_i);
         case OP_ALL:   return ray_bool(m->zero_count == 0);
         case OP_ANY:   return ray_bool(m->cnt > m->zero_count);
@@ -4407,11 +4407,7 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
         /* COUNT returns total length including nulls — matches ray_count_fn's
          * "count all elements" semantics, not SQL's COUNT(col) non-null count. */
         case OP_COUNT: return ray_i64(scan_n);
-        case OP_AVG: {
-            ray_t* r = m->cnt > 0 ? ray_f64(ray_f64_fin(fp ? m->sum_f / m->cnt : ray_i128_to_f64(m->sum_hi, (uint64_t)m->sum_i) / m->cnt)) : ray_typed_null(-RAY_F64);
-            /* the mean of durations is a duration */
-            return in_type == RAY_TIMESPAN ? ray_timespan_of_f64_atom(r) : r;
-        }
+        case OP_AVG:   return m->cnt > 0 ? ray_f64(ray_f64_fin(fp ? m->sum_f / m->cnt : ray_i128_to_f64(m->sum_hi, (uint64_t)m->sum_i) / m->cnt)) : ray_typed_null(-RAY_F64);
         case OP_FIRST: return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->first_f) : reduction_i64_result(m->first_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_LAST:  return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->last_f) : reduction_i64_result(m->last_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_VAR: case OP_VAR_POP:
@@ -19786,9 +19782,11 @@ v2_emit:;
                     out_type = RAY_BOOL; break;
                 case OP_COUNT: out_type = RAY_I64; break;
                 case OP_SUM:
-                    /* sum preserves TIME and TIMESPAN; see sum_int_out_type. */
+                    /* sum preserves TIME (duration-like); other integer
+                     * families widen to I64.  DATE/TIMESTAMP rejected at
+                     * type-admission. */
                     out_type = is_f64 ? RAY_F64
-                             : sum_int_out_type(agg_col ? agg_col->type : 0);
+                             : (agg_col && agg_col->type == RAY_TIME ? RAY_TIME : RAY_I64);
                     break;
                 case OP_PROD:
                     out_type = is_f64 ? RAY_F64 : RAY_I64; break;
