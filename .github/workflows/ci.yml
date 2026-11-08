@@ -55,26 +55,6 @@ jobs:
       # Debug legs execute the suite (tier: see TEST_TIER above); release legs
       # verify optimized artifacts. Runtime tests under release FP flags use
       # the separate `make test-release` profile, not the debug suite below.
-      # TEMPORARY diagnostic (to be removed): macOS-only enccol failure.
-      - name: Diagnose macOS enccol failure
-        if: matrix.os == 'macos-latest' && matrix.target == 'debug'
-        continue-on-error: true
-        run: |
-          clang --version | head -1
-          t=enccol/runs_kernel_equal
-          base='-fPIC -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter -std=c17 -g -march=native -DDEBUG -fno-omit-frame-pointer'
-          run_variant() {
-            find src test -name '*.fast.o' -delete
-            make -j3 test CC=clang TEST_FILTER=__none__ "FAST_CFLAGS=$base $1" "LIBS=-lm $2" > /dev/null 2>&1 || { echo "== $3: build failed"; return; }
-            echo "== $3"; RAYFORCE_CORES=2 RAYFORCE_NO_FSYNC=1 ./rayforce.test.fast -f $t 2>&1 | grep -E "runtime error|ERROR|#[0-4] |FAIL|fast kernel|=== " | head -12
-          }
-          run_variant "-O1" "" "O1"
-          run_variant "-O1 -fno-strict-aliasing" "" "O1 no-strict-aliasing"
-          run_variant "-O2" "" "O2"
-          run_variant "-O0" "" "O0"
-          run_variant "-O1 -fsanitize=undefined -fno-sanitize-recover=all" "-fsanitize=undefined" "O1 UBSan"
-          run_variant "-O1 -fsanitize=address" "-fsanitize=address" "O1 ASan"
-
       - name: Test (${{ env.TEST_TIER }})
         if: matrix.target == 'debug'
         run: make ${{ env.TEST_TIER }} CC=${{ matrix.compiler }}
