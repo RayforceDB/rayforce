@@ -183,6 +183,75 @@ static test_result_t test_f32_extrema_routes(void) {
     PASS();
 }
 
+/* Same F32 and F64 inputs at a size where route 2 takes the radix finalizer
+ * (radix_phase3_fn) and route 0 the v2 emitters: 400k rows, 100k groups.
+ * Every F32 answer must be an F32 column holding the F64 answer narrowed,
+ * with nulls in the same places.  The last two groups carry an infinite
+ * element: it is the null, never a value clamped to +-3.40e+38. */
+static test_result_t test_f32_extrema_large_routes(void) {
+    const int64_t n = 400000, groups = 100000;
+    ray_t* g = ray_vec_new(RAY_I64, n + 4); g->len = n + 4;
+    ray_t* xf = ray_vec_new(RAY_F32, n + 4); xf->len = n + 4;
+    ray_t* xd = ray_vec_new(RAY_F64, n + 4); xd->len = n + 4;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(g))[i] = (i * 7919) % groups;
+        double v = (double)((i * 31) % 2003) - 1000.0 + 0.25;
+        bool nul = i % 11 == 0;
+        ((float*)ray_data(xf))[i] = nul ? NAN : (float)v;
+        ((double*)ray_data(xd))[i] = nul ? NAN : v;
+        if (nul) { ray_vec_set_null(xf, i, true); ray_vec_set_null(xd, i, true); }
+    }
+    /* group `groups`: {+inf, 2.0}; group `groups + 1`: {-inf, +inf} */
+    const double tail[4] = { INFINITY, 2.0, -INFINITY, INFINITY };
+    for (int k = 0; k < 4; k++) {
+        ((int64_t*)ray_data(g))[n + k] = groups + k / 2;
+        ((float*)ray_data(xf))[n + k] = (float)tail[k];
+        ((double*)ray_data(xd))[n + k] = tail[k];
+    }
+    ray_t* tf = ray_table_new(2);
+    tf = ray_table_add_col(tf, ray_sym_intern("g", 1), g);
+    tf = ray_table_add_col(tf, ray_sym_intern("x", 1), xf);
+    ray_t* td = ray_table_new(2);
+    td = ray_table_add_col(td, ray_sym_intern("g", 1), g);
+    td = ray_table_add_col(td, ray_sym_intern("x", 1), xd);
+    ray_release(g); ray_release(xf); ray_release(xd);
+    ray_env_set(ray_sym_intern("f32big", 6), tf);
+    ray_env_set(ray_sym_intern("f64big", 6), td);
+    ray_release(tf); ray_release(td);
+    static const char* const names[] = { "min", "max", "first", "last" };
+    for (int route = 0; route <= 2; route++) {
+        ray_group_test_route(route);
+        ray_t* got[2];
+        for (int w = 0; w < 2; w++) {
+            ray_t* r = ray_eval_str(w == 0
+                ? "(select {mn:(min x) mx:(max x) f:(first x) l:(last x) from:f32big by:g asc:g})"
+                : "(select {mn:(min x) mx:(max x) f:(first x) l:(last x) from:f64big by:g asc:g})");
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "route %d width %d failed", route, w);
+            got[w] = r;
+        }
+        ray_group_test_route(0);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got[0]), groups + 2);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got[1]), groups + 2);
+        int64_t bad = 0;
+        for (int c = 1; c <= 4; c++) {
+            ray_t* cf = ray_table_get_col_idx(got[0], c);
+            ray_t* cd = ray_table_get_col_idx(got[1], c);
+            TEST_ASSERT_FMT(cf && cf->type == RAY_F32, "route %d %s: type %d", route, names[c - 1], cf ? cf->type : -1);
+            TEST_ASSERT_EQ_I(cd->type, RAY_F64);
+            const float* df = ray_data(cf);
+            const double* dd = ray_data(cd);
+            for (int64_t i = 0; i < cf->len; i++) {
+                bool nf = ray_vec_is_null(cf, i), nd = ray_vec_is_null(cd, i);
+                if (nf != nd || (!nf && (double)df[i] != dd[i])) bad++;
+                if (c <= 2 && !nf && fabsf(df[i]) > 1.0e6f) bad++;   /* min/max: no clamped inf */
+            }
+        }
+        TEST_ASSERT_FMT(bad == 0, "route %d: %lld mismatches against the F64 answers", route, (long long)bad);
+        ray_release(got[0]); ray_release(got[1]);
+    }
+    PASS();
+}
+
 /* Exercise the direct serial emitter against scalar language semantics,
  * including states with no rows, no live rows, and wrapped/null results. */
 static test_result_t test_native_streaming_output(void) {
@@ -4734,6 +4803,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
+    { "agg_contract/f32_extrema_large_routes", test_f32_extrema_large_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },

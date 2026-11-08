@@ -59,3 +59,14 @@
 (type (+ w (as 'F32 1.0))) -- 'F32
 (+ [1e308 1.0] [1e308 1.0]) -- [0Nf 2.0]
 (at (select {x: (+ w w) from: (table [w] (list w))}) 'x) -- (as 'F32 [0Nf 2.0 0Nf 4.0])
+
+;; Grouped and ungrouped extrema over an overflowed (null) F32 element are
+;; the other elements' answer, or null when none remain, never +-3.40e+38.
+(set TI (table [g x] (list [0 0 1 1] (+ w w))))
+(at (select {mx: (max x) mn: (min x) f: (first x) l: (last x) from: TI by: g asc: g}) 'mx) -- (as 'F32 [2.0 4.0])
+(at (select {mx: (max x) mn: (min x) f: (first x) l: (last x) from: TI by: g asc: g}) 'f) -- (as 'F32 [2.0 4.0])
+(set TA (table [g x] (list [0 1] (+ (as 'F32 [3.0e38 3.0e38]) (as 'F32 [3.0e38 3.0e38])))))
+(at (select {mx: (max x) mn: (min x) f: (first x) l: (last x) from: TA by: g asc: g}) 'mx) -- (as 'F32 [0Nf 0Nf])
+(at (select {mx: (max x) mn: (min x) f: (first x) l: (last x) from: TA by: g asc: g}) 'l) -- (as 'F32 [0Nf 0Nf])
+(at (select {f: (first x) l: (last x) mx: (max x) from: TA}) 'f) -- (as 'F32 [0Nf])
+(at (select {f: (first x) l: (last x) mx: (max x) from: TA}) 'mx) -- (as 'F32 [0Nf])

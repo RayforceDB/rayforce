@@ -4352,7 +4352,7 @@ static ray_t* reduction_extreme_result(int8_t op_out_type, int8_t in_type, bool 
     /* Single-null float model: min/max of finite inputs is finite, but guard
      * against an ±Inf init sentinel surfacing as a value. */
     if (out_type == RAY_F64) return ray_f64(ray_f64_fin(fval));
-    if (out_type == RAY_F32) return ray_f32((float)fval);
+    if (out_type == RAY_F32) return ray_f32(ray_f64_to_f32_fin(fval));
     return reduction_i64_result(ival, out_type, out_type == RAY_SYM ? src : NULL);
 }
 
@@ -4806,7 +4806,7 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type) {
         if (t == RAY_F32 && (opcode == OP_MIN || opcode == OP_MAX)) {
             ray_t* narrowed = RAY_ATOM_IS_NULL(dir)
                 ? ray_typed_null(-RAY_F32)
-                : ray_f32(ray_cast_f64_to_f32_null(dir->f64));
+                : ray_f32(ray_f64_to_f32_fin(dir->f64));
             ray_release(dir);
             return narrowed;
         }
@@ -7639,7 +7639,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                      * pearson sqrt(≤0)/0-0, etc.) to the output null.  HAS_NULLS is set
                      * by grp_finalize_nulls(agg_outs[a].vec) after dispatch. */
                     if (ao->out_type == RAY_F32)
-                        ((float*)(void*)ao->dst)[di] = ray_cast_f64_to_f32_null(v);
+                        ((float*)(void*)ao->dst)[di] = ray_f64_to_f32_fin(v);
                     else
                         ((double*)(void*)ao->dst)[di] = ray_f64_fin(v);
                 } else {
@@ -8742,7 +8742,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                  * null bit; a grp_finalize_nulls(new_col) scan below flips
                  * HAS_NULLS for any sentinel produced here. */
                 if (out_type == RAY_F32)
-                    ((float*)ray_data(new_col))[gi] = ray_cast_f64_to_f32_null(v);
+                    ((float*)ray_data(new_col))[gi] = ray_f64_to_f32_fin(v);
                 else
                     ((double*)ray_data(new_col))[gi] = ray_f64_fin(v);
             } else {
@@ -8833,7 +8833,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
         /* Single-null float model: flip HAS_NULLS if the F64 store loop above
          * canonicalized any non-finite aggregate to NULL_F64 (e.g. overflow)
          * without an explicit ray_vec_set_null. */
-        if (new_col->type == RAY_F64) grp_finalize_nulls(new_col);
+        if (new_col->type == RAY_F64 || new_col->type == RAY_F32) grp_finalize_nulls(new_col);
         *result = ray_table_add_col(*result, name_id, new_col);
         ray_release(new_col);
     }
@@ -20462,7 +20462,7 @@ sequential_fallback:;
                 /* Single-null float model: canonicalize a non-finite computed
                  * aggregate to the output null (HAS_NULLS via the scan below). */
                 if (out_type == RAY_F32)
-                    ((float*)ray_data(new_col))[gi] = ray_cast_f64_to_f32_null(v);
+                    ((float*)ray_data(new_col))[gi] = ray_f64_to_f32_fin(v);
                 else
                     ((double*)ray_data(new_col))[gi] = ray_f64_fin(v);
             } else {
@@ -20551,7 +20551,7 @@ sequential_fallback:;
         }
         /* Single-null float model: flip HAS_NULLS if a non-finite F64 aggregate
          * was canonicalized to NULL_F64 above without an explicit set_null. */
-        if (new_col->type == RAY_F64) grp_finalize_nulls(new_col);
+        if (new_col->type == RAY_F64 || new_col->type == RAY_F32) grp_finalize_nulls(new_col);
         result = ray_table_add_col(result, name_id, new_col);
         ray_release(new_col);
     }

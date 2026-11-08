@@ -344,7 +344,7 @@ static const agg_vtable_t MAX_F64 = {
 
 static float ext_f32_final_result(const void* s) {
     const ext_f64_state* st = s;
-    return st->cnt ? ray_cast_f64_to_f32_null(st->v) : NULL_F32;
+    return st->cnt ? ray_f64_to_f32_fin(st->v) : NULL_F32;
 }
 AGG_SCALAR_FINAL(ext_f32_final, float, ray_f32, value != value)
 
