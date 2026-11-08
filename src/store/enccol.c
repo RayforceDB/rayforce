@@ -1982,6 +1982,8 @@ typedef struct {
 
 static _Atomic(int64_t) g_interrupt_after;     /* test hook, see enccol.h */
 void ray_enccol_test_interrupt_after(int64_t nth) { atomic_store(&g_interrupt_after, nth); }
+static _Atomic(bool) g_hold_decode;            /* test hook, see enccol.h */
+void ray_enccol_test_hold_decode(bool on) { atomic_store(&g_hold_decode, on); }
 
 /* One task per chunk.  Every failure, cancellation included, goes into the
  * task's own fixed-size result from this thread's state; the coordinator
@@ -1997,6 +1999,7 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
          * reported (lowest) failure: stop decoding them.  Lower chunks
          * still run, so the result stays deterministic. */
         if (c > atomic_load_explicit(&x->lowest_failed, memory_order_relaxed)) continue;
+        while (atomic_load_explicit(&g_hold_decode, memory_order_acquire)) ray_enc_yield();
         if (ray_interrupted()) {
             ray_enc_snap_set(&r->snap, "cancel", "column %s: interrupted", e->path);
             r->failed = true;

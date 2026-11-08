@@ -52,7 +52,8 @@ release. Or build [from source](#quick-start) below — zero dependencies, just
 ```bash
 make            # debug build (ASan + UBSan)
 make release    # optimized build
-make test       # run full test suite
+make test       # fast suite: no sanitizers, parallel (dev loop, PRs into dev)
+make test-full  # every test under ASan + UBSan (release PRs)
 ./rayforce      # start the Rayfall REPL
 ```
 

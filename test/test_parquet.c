@@ -1541,7 +1541,7 @@ static test_result_t test_pq_train_prefix(void) {
         if (!pq_same_file(a,b)) bad++;
         for (int k = 0; k < 2; k++) {
             pq_remove_native(dir[k],names,3);
-            snprintf(partial,sizeof(partial),"%s.parquet-partial",dir[k]);
+            snprintf(partial,sizeof(partial),"%.179s.parquet-partial",dir[k]);
             pq_remove_native(partial,names,3);
         }
         unlink(src);
@@ -1992,7 +1992,9 @@ static test_result_t test_pq_sym_grouped_fail_leaks(void) {
     snprintf(src, sizeof(src), "/tmp/rayforce-pq-fleak-%d.parquet", (int)getpid());
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-fleak-%d", (int)getpid());
     snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
-    TEST_ASSERT_TRUE(pq_synth(src, 20000, 9, pq_synth_mixed));
+    /* three row groups of about 1500 rows: a chunk's dedupe grows past its
+     * first 1024 strings, and the I32 column ends in a scalar tail */
+    TEST_ASSERT_TRUE(pq_synth(src, 4510, 3, pq_synth_mixed));
     int64_t tids[] = {ray_sym_intern("I32",3), ray_sym_intern("SYM",3), ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
     const char* names[] = {"x","s","t"};
