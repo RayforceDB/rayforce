@@ -195,7 +195,10 @@ head to call it can send the function value instead (for example,
 `(list in 1 2)`) or send a source string.
 
 The rule a frame follows is recorded in the journal frame's own header, as the
-flag `0x10` (`RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS`). This is a journal-only marker:
+flag `0x10` (`RAY_IPC_FLAG_LITERAL_SYMBOL_ARGS`). The server sets it on every
+auto-journaled sync frame, string requests included, not only on frames that
+carry request lists; a string frame replays the same either way. This is a
+journal-only marker:
 the live wire version is unchanged, so live peers are unaffected and only replay
 reads it. Every release after v3.0.2 writes the flag and replays each frame
 under the rule its header records, so a frame written by an earlier version —

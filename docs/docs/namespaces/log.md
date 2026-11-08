@@ -123,7 +123,7 @@ Errors are precise enough to distinguish recovery strategies:
 | `oom` / `io` | Resource exhaustion / read failure. | Retry. |
 
 !!! note "Older servers and flagged frames"
-    Frames that carry IPC request lists are written with header flag `0x10`, which records that a nested list headed by a symbol is data (see [IPC & Serialization](../storage/ipc.md#expression-payloads)). Servers older than the first release after v3.0.2 do not recognise the flag and replay such a frame under the old rule, so an entry can replay to a different stored value. Do not replay a journal that holds flagged frames on an older server.
+    Every auto-journaled sync frame is written with header flag `0x10` (string requests included), which records that a nested list headed by a symbol in a request list is data (see [IPC & Serialization](../storage/ipc.md#expression-payloads)). Servers older than the first release after v3.0.2 do not recognise the flag and replay such a frame under the old rule, so an entry can replay to a different stored value. Do not replay a journal that holds flagged frames on an older server.
 
 ```lisp
 (.log.replay "/tmp/rayforce-journal.log")
