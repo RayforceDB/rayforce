@@ -547,6 +547,124 @@ static bool pq_synth(const char* path, int64_t rows, int64_t groups, pq_synth_fn
     ray_sys_free(at); ray_sys_free(sz); ray_sys_free(dat);
     return ok;
 }
+/* A Parquet file for the OPTIONAL bulk-decode test: `groups` row groups of
+ * a (INT32), b (INT64), c (DOUBLE), every column optional; PLAIN,
+ * uncompressed, one v1 data page per chunk.  mode: 0 all present; 1 the
+ * second-to-last group has every 17th row null and the last group all null;
+ * 2 all null; 3 all present with the native null sentinels at row 0. */
+static bool pq_synth_optional(const char* path, int64_t rows, int64_t groups, int mode, bool v2) {
+    static const char* names[3] = {"a","b","c"};
+    static const int phys[3] = {1,2,5};
+    pq_buf f = {0}, page = {0}, levels = {0}, values = {0};
+    int64_t* at = (int64_t*)ray_sys_alloc((size_t)groups * 3 * sizeof(*at));
+    int64_t* sz = (int64_t*)ray_sys_alloc((size_t)groups * 3 * sizeof(*sz));
+    if (!at || !sz) { ray_sys_free(at); ray_sys_free(sz); return false; }
+    pb_bytes(&f, "PAR1", 4);
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t lo = rows * g / groups, hi = rows * (g + 1) / groups, n = hi - lo;
+        for (int c = 0; c < 3; c++) {
+            levels.n = values.n = page.n = 0;
+            int64_t nulls = 0;
+            int64_t groups8 = (n + 7) / 8;
+            pb_var(&levels, (uint64_t)(groups8 * 2 + 1));  /* one bit-packed run */
+            uint8_t bits = 0;
+            for (int64_t k = 0; k < groups8 * 8; k++) {
+                int64_t r = lo + k;
+                bool present = k < n;
+                if (present && mode == 1 && g == groups-2 && r % 17 == 0) present = false;
+                if (present && mode == 1 && g == groups-1) present = false;
+                if (mode == 2) present = false;
+                if (present) {
+                    bits |= (uint8_t)(1u << (k & 7));
+                    if (c == 0) {
+                        int32_t x = mode == 3 && k == 0 ? INT32_MIN : (int32_t)r;
+                        pb_bytes(&values, &x, 4);
+                    } else if (c == 1) {
+                        int64_t x = mode == 3 && k == 0 ? INT64_MIN : (int64_t)r * INT64_C(10000000001);
+                        pb_bytes(&values, &x, 8);
+                    } else {
+                        uint64_t nan = UINT64_C(0x7ff8000000000000), u;
+                        double x = (double)r * 0.5;
+                        if (mode == 3 && k == 0) memcpy(&x, &nan, 8);
+                        memcpy(&u, &x, 8); pb_bytes(&values, &u, 8);
+                    }
+                }
+                if (!present && k < n) nulls++;
+                if ((k & 7) == 7) { pb_byte(&levels, bits); bits = 0; }
+            }
+            uint32_t ln = (uint32_t)levels.n;
+            int last = 0; int64_t start = (int64_t)f.n;
+            if (v2) {
+                int64_t size = (int64_t)levels.n + (int64_t)values.n;
+                pb_i(&f, &last, 1, PB_I32, 3);
+                pb_i(&f, &last, 2, PB_I32, size);
+                pb_i(&f, &last, 3, PB_I32, size);
+                pb_field(&f, &last, 8, PB_STRUCT);
+                { int l = 0; pb_i(&f, &l, 1, PB_I32, n); pb_i(&f, &l, 2, PB_I32, nulls);
+                  pb_i(&f, &l, 3, PB_I32, n); pb_i(&f, &l, 4, PB_I32, 0);
+                  pb_i(&f, &l, 5, PB_I32, (int64_t)levels.n); pb_i(&f, &l, 6, PB_I32, 0);
+                  pb_field(&f, &l, 7, 2); pb_byte(&f, 0); }
+                pb_byte(&f, 0);
+                pb_bytes(&f, levels.p, levels.n); pb_bytes(&f, values.p, values.n);
+            } else {
+                pb_bytes(&page, &ln, 4); pb_bytes(&page, levels.p, levels.n);
+                pb_bytes(&page, values.p, values.n);
+                pb_i(&f, &last, 1, PB_I32, 0);
+                pb_i(&f, &last, 2, PB_I32, (int64_t)page.n);
+                pb_i(&f, &last, 3, PB_I32, (int64_t)page.n);
+                pb_field(&f, &last, 5, PB_STRUCT);
+                { int l = 0; pb_i(&f, &l, 1, PB_I32, n); pb_i(&f, &l, 2, PB_I32, 0);
+                  pb_i(&f, &l, 3, PB_I32, 3); pb_i(&f, &l, 4, PB_I32, 3); pb_byte(&f, 0); }
+                pb_byte(&f, 0);
+                pb_bytes(&f, page.p, page.n);
+            }
+            at[g * 3 + c] = start; sz[g * 3 + c] = (int64_t)f.n - start;
+        }
+    }
+    int64_t footer = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 4, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 3); pb_byte(&f, 0); }
+    for (int c = 0; c < 3; c++) {
+        int l = 0; pb_i(&f, &l, 1, PB_I32, phys[c]); pb_i(&f, &l, 3, PB_I32, 1);
+        pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, names[c], 1); pb_byte(&f, 0);
+    }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, (int)groups, PB_STRUCT);
+    for (int64_t g = 0; g < groups; g++) {
+        int64_t n = rows * (g + 1) / groups - rows * g / groups, total = 0;
+        int l = 0;
+        pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 3, PB_STRUCT);
+        for (int c = 0; c < 3; c++) {
+            int64_t i = g * 3 + c;
+            int lc = 0;
+            pb_i(&f, &lc, 2, PB_I64, at[i]);
+            pb_field(&f, &lc, 3, PB_STRUCT);
+            { int lm = 0; pb_i(&f, &lm, 1, PB_I32, phys[c]);
+              pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3);
+              pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, names[c], 1);
+              pb_i(&f, &lm, 4, PB_I32, 0); pb_i(&f, &lm, 5, PB_I64, n);
+              pb_i(&f, &lm, 6, PB_I64, sz[i]); pb_i(&f, &lm, 7, PB_I64, sz[i]);
+              pb_i(&f, &lm, 9, PB_I64, at[i]); pb_byte(&f, 0); }
+            pb_byte(&f, 0);
+            total += sz[i];
+        }
+        pb_i(&f, &l, 2, PB_I64, total); pb_i(&f, &l, 3, PB_I64, n); pb_byte(&f, 0);
+    }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad && !page.bad && !levels.bad && !values.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p); ray_sys_free(page.p); ray_sys_free(levels.p); ray_sys_free(values.p);
+    ray_sys_free(at); ray_sys_free(sz);
+    return ok;
+}
 /* The columns s and t of an import as strings: true when every row is
  * fn's (a null and "" both the empty symbol). */
 static bool pq_synth_check(const char* dir, int64_t rows, pq_synth_fn fn) {
@@ -582,6 +700,131 @@ static bool pq_same_file(const char* a, const char* b) {
     if (fa) fclose(fa);
     if (fb) fclose(fb);
     return ok;
+}
+static test_result_t test_pq_optional_bulk(void) {
+    char path[160];
+    int64_t batches[] = {1,2,3,7,8,9,16,17,4095,4096,4097,8193,65536};
+    int64_t mixed_batches[] = {1,4096,4097,65536};
+    /* All-present OPTIONAL pages through every batch and SIMD-width edge,
+     * in both the v1 and v2 page layouts. */
+    for (int v = 0; v < 2; v++) {
+        snprintf(path,sizeof(path),"/tmp/rayforce-pq-opbulk-%d-v%d.parquet",(int)getpid(),v);
+        TEST_ASSERT_TRUE(pq_synth_optional(path,8193,2,0,v != 0));
+        for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++) {
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,batches[b],&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+                int64_t nr = ray_table_nrows(t);
+                ray_t* a = ray_table_get_col_idx(t,0);
+                ray_t* bb = ray_table_get_col_idx(t,1);
+                ray_t* c = ray_table_get_col_idx(t,2);
+                TEST_ASSERT_FALSE(a->attrs & RAY_ATTR_HAS_NULLS);
+                TEST_ASSERT_FALSE(bb->attrs & RAY_ATTR_HAS_NULLS);
+                TEST_ASSERT_FALSE(c->attrs & RAY_ATTR_HAS_NULLS);
+                for (int64_t i = 0; i < nr; i++) {
+                    int64_t row = total + i;
+                    TEST_ASSERT_EQ_I(((int32_t*)ray_data(a))[i],(int32_t)row);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(bb))[i],row*INT64_C(10000000001));
+                    TEST_ASSERT_TRUE(((double*)ray_data(c))[i] == (double)row*0.5);
+                    TEST_ASSERT_FALSE(ray_vec_is_null(a,i));
+                    TEST_ASSERT_FALSE(ray_vec_is_null(bb,i));
+                    TEST_ASSERT_FALSE(ray_vec_is_null(c,i));
+                }
+                total += nr;
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,8193);
+            ray_parquet_close(r);
+        }
+        unlink(path);
+    }
+    /* Page 0 all present, page 1 every 17th null, page 2 all null; both
+     * page layouts. */
+    for (int v = 0; v < 2; v++) {
+        snprintf(path,sizeof(path),"/tmp/rayforce-pq-opbulk-mixed-%d-v%d.parquet",(int)getpid(),v);
+        TEST_ASSERT_TRUE(pq_synth_optional(path,12291,3,1,v != 0));
+        for (size_t b = 0; b < sizeof(mixed_batches)/sizeof(mixed_batches[0]); b++) {
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,mixed_batches[b],&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+                int64_t nr = ray_table_nrows(t);
+                ray_t* a = ray_table_get_col_idx(t,0);
+                ray_t* bb = ray_table_get_col_idx(t,1);
+                ray_t* c = ray_table_get_col_idx(t,2);
+                for (int64_t i = 0; i < nr; i++) {
+                    int64_t row = total + i;
+                    bool null = row >= 8194 || (row >= 4097 && row % 17 == 0);
+                    TEST_ASSERT_EQ_I(ray_vec_is_null(a,i),null);
+                    TEST_ASSERT_EQ_I(ray_vec_is_null(bb,i),null);
+                    TEST_ASSERT_EQ_I(ray_vec_is_null(c,i),null);
+                    if (null) continue;
+                    TEST_ASSERT_EQ_I(((int32_t*)ray_data(a))[i],(int32_t)row);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(bb))[i],row*INT64_C(10000000001));
+                    TEST_ASSERT_TRUE(((double*)ray_data(c))[i] == (double)row*0.5);
+                }
+                total += nr;
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,12291);
+            ray_parquet_close(r);
+        }
+        unlink(path);
+    }
+    /* All-null pages keep the per-value path. */
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-opbulk-null-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth_optional(path,4097,2,2,false));
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,4096,&r));
+    int64_t total = 0;
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        int64_t nr = ray_table_nrows(t);
+        for (int c = 0; c < 3; c++)
+            for (int64_t i = 0; i < nr; i++)
+                TEST_ASSERT_TRUE(ray_vec_is_null(ray_table_get_col_idx(t,c),i));
+        total += nr; ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(total,4097);
+    ray_parquet_close(r);
+    unlink(path);
+    /* Sentinel collisions: non-strict yields nulls; strict refuses them. */
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-opbulk-sentinel-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth_optional(path,5,1,3,false));
+    r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,5,&r));
+    ray_t* t = ray_parquet_next(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_NOT_NULL(t);
+    for (int c = 0; c < 3; c++) {
+        ray_t* v = ray_table_get_col_idx(t,c);
+        TEST_ASSERT_TRUE(ray_vec_is_null(v,0));
+        TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
+        for (int64_t i = 1; i < 5; i++) TEST_ASSERT_FALSE(ray_vec_is_null(v,i));
+    }
+    ray_release(t); ray_parquet_close(r);
+    int64_t keys[] = {ray_sym_intern("strict",6)};
+    ray_t* vals = ray_list_new(1);
+    TEST_ASSERT_NOT_NULL(vals);
+    ((ray_t**)ray_data(vals))[0] = ray_bool(true); vals->len = 1;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,1),vals);
+    ray_t* strict = ray_parquet_read(path,opts);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(strict));
+    TEST_ASSERT_TRUE(ray_err_code(strict) && !strcmp(ray_err_code(strict),"parquet"));
+    ray_error_free(strict);
+    ray_release(opts);
+    unlink(path);
+    PASS();
 }
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
@@ -4241,6 +4484,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
     {"parquet/snappy",test_pq_snappy,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
+    {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/read_metadata",test_pq_read_meta,pq_setup,pq_teardown},
     {"parquet/corrupt",test_pq_corrupt,pq_setup,pq_teardown},
     {"parquet/native",test_pq_native,pq_setup,pq_teardown},
