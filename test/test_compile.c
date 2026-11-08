@@ -35,6 +35,7 @@
 #include "lang/env.h"
 #include "lang/parse.h"
 #include "ops/ops.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
@@ -736,6 +737,101 @@ static test_result_t test_compile_large_const_pool(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * 13b. A constant is addressed with at most two bytes (OP_LOADCONST_W, and
+ *      the operand of OP_PATHGET).  A pool past 0xFFFF constants would read
+ *      constant 70000 as constant 4464, so add_constant refuses the index
+ *      and the function stays on the tree walker, which is right.
+ *      The bodies are lists of atoms, built here and handed to ray_fn.
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* A function of `params` and the body `body[0..nbody)` (borrowed), bound to
+ * the global `name`, returning the lambda for LAMBDA_IS_COMPILED once it
+ * has been called. */
+static ray_t* pool_fn(const char* name, const char* params, ray_t** body, int64_t nbody) {
+    ray_t** args = (ray_t**)malloc((size_t)(nbody + 1) * sizeof *args);
+    if (!args) return NULL;
+    args[0] = ray_eval_str(params);
+    for (int64_t i = 0; i < nbody; i++) args[1 + i] = body[i];
+    ray_t* fn = ray_fn(args, nbody + 1);
+    ray_release(args[0]);
+    free(args);
+    if (!fn || RAY_IS_ERR(fn)) return fn;
+    ray_env_set(ray_sym_intern(name, strlen(name)), fn);
+    return fn;
+}
+
+/* `n` distinct integer literals from `lo` appended to body[*at]. */
+static void pool_lits(ray_t** body, int64_t* at, int64_t lo, int64_t n) {
+    for (int64_t i = 0; i < n; i++) body[(*at)++] = ray_i64(lo + i);
+}
+
+/* (fn [] <nlit distinct literals> 123456789): nlit + 1 constants. */
+static test_result_t pool_loadconst_w(int64_t nlit, bool compiled) {
+    ray_t** body = (ray_t**)malloc((size_t)(nlit + 1) * sizeof *body);
+    TEST_ASSERT_NOT_NULL(body);
+    int64_t at = 0;
+    pool_lits(body, &at, 3000000, nlit);
+    body[at++] = ray_i64(123456789);
+    ray_t* fn = pool_fn("pool_lw", "[]", body, at);
+    free(body);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fn));
+    EVAL_I64("(pool_lw)", 123456789);
+    TEST_ASSERT((LAMBDA_IS_COMPILED(fn) != 0) == compiled,
+                compiled ? "a pool within 0x10000 constants compiles"
+                         : "a pool past 0xFFFF constants stays on the tree walker");
+    PASS();
+}
+
+/* (fn [d] <na literals> d.a <nb literals> d.v): na + nb + 2 constants, d.v
+ * the last, so its index is na + nb + 1. */
+static test_result_t pool_pathget(int64_t na, int64_t nb, bool compiled) {
+    ray_t** body = (ray_t**)malloc((size_t)(na + nb + 2) * sizeof *body);
+    TEST_ASSERT_NOT_NULL(body);
+    int64_t at = 0;
+    pool_lits(body, &at, 3000000, na);
+    body[at++] = ray_sym(ray_sym_intern("d.a", 3));
+    pool_lits(body, &at, 4000000, nb);
+    body[at++] = ray_sym(ray_sym_intern("d.v", 3));
+    ray_t* fn = pool_fn("pool_pg", "[d]", body, at);
+    free(body);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fn));
+    EVAL_I64("(pool_pg (dict [a v] (list 7 42)))", 42);
+    TEST_ASSERT((LAMBDA_IS_COMPILED(fn) != 0) == compiled,
+                compiled ? "a pool within 0x10000 constants compiles"
+                         : "a pool past 0xFFFF constants stays on the tree walker");
+    PASS();
+}
+
+/* 0x10000 constants fit in the indexes 0..0xFFFF; one more does not. */
+static test_result_t test_compile_pool_loadconst_w_at_limit(void) { return pool_loadconst_w(0xFFFF, true); }
+static test_result_t test_compile_pool_loadconst_w_over(void)     { return pool_loadconst_w(0x10000, false); }
+static test_result_t test_compile_pool_pathget_at_limit(void)     { return pool_pathget(4464, 0x10000 - 4464 - 2, true); }
+static test_result_t test_compile_pool_pathget_over(void)         { return pool_pathget(4464, 65535, false); }
+
+/* Past 64 constants add_constant finds a shared one through an index. The
+ * pool must hold exactly what the scan it replaces would: each distinct
+ * integer, float, bool and symbol once, however often it is repeated. */
+static test_result_t test_compile_pool_shares_constants(void) {
+    enum { N = 300 };
+    ray_t* body[4 * N + 4];
+    int64_t at = 0;
+    for (int round = 0; round < 3; round++)          /* every value 3 times */
+        for (int i = 0; i < N; i++) body[at++] = ray_i64(1000 + i);
+    for (int i = 0; i < 100; i++) body[at++] = ray_f64(0.5 + i);
+    for (int i = 0; i < 100; i++) body[at++] = ray_f64(0.5 + i);
+    body[at++] = ray_bool(true);
+    body[at++] = ray_bool(false);
+    body[at++] = ray_bool(true);
+    body[at++] = ray_i64(1000);                       /* last: the result */
+    ray_t* fn = pool_fn("pool_sh", "[]", body, at);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fn));
+    EVAL_I64("(pool_sh)", 1000);
+    TEST_ASSERT(LAMBDA_IS_COMPILED(fn), "compiled");
+    TEST_ASSERT_EQ_I(LAMBDA_CONSTS(fn)->len, N + 100 + 2);   /* 300 ints, 100 floats, true, false */
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * 14. Many symbols in body — forces OP_RESOLVE_W path (lines 409-413)
  *     Need > 256 distinct symbol entries in the const pool.
  *     We do this by having a big lambda with many unique variable refs.
@@ -1101,6 +1197,11 @@ const test_entry_t compile_entries[] = {
     { "compile/binary_wrong_arity",  test_compile_binary_wrong_arity,  compile_setup, compile_teardown },
     { "compile/lambda_call",         test_compile_lambda_call,         compile_setup, compile_teardown },
     { "compile/large_const_pool",    test_compile_large_const_pool,    compile_setup, compile_teardown },
+    { "compile/pool_loadconst_w_at_limit", test_compile_pool_loadconst_w_at_limit, compile_setup, compile_teardown },
+    { "compile/pool_loadconst_w_over",     test_compile_pool_loadconst_w_over,     compile_setup, compile_teardown },
+    { "compile/pool_pathget_at_limit",     test_compile_pool_pathget_at_limit,     compile_setup, compile_teardown },
+    { "compile/pool_pathget_over",         test_compile_pool_pathget_over,         compile_setup, compile_teardown },
+    { "compile/pool_shares_constants",     test_compile_pool_shares_constants,     compile_setup, compile_teardown },
     { "compile/many_symbols",        test_compile_many_symbols,        compile_setup, compile_teardown },
     { "compile/code_buffer_grow",    test_compile_code_buffer_grow,    compile_setup, compile_teardown },
     { "compile/if_with_else",        test_compile_if_with_else,        compile_setup, compile_teardown },

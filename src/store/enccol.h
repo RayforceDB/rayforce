@@ -312,6 +312,10 @@ void   ray_enccol_test_fail_index_parse(bool on);
 /* interrupt_after: the nth chunk decoded successfully from now on calls
  * ray_request_interrupt() (0 disables), exercising the per-chunk poll. */
 void   ray_enccol_test_interrupt_after(int64_t nth);
+/* hold_decode: while on, a materialization's chunk tasks wait before their
+ * per-chunk interrupt poll, so a test can line waiters up on a running
+ * attempt and interrupt it whatever the machine's speed. */
+void   ray_enccol_test_hold_decode(bool on);
 /* Parted materialization: 0 auto, 1 always on the coordinator, 2 always per-segment tasks. */
 void   ray_enccol_test_parted_mode(int mode);
 /* Encoded column objects alive (opened, not yet freed). */

@@ -196,6 +196,22 @@ bool ray_raise_render(char* buf, size_t cap) {
 void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
 
+bool ray_fn_is_local_mutator(const ray_t* fn) {
+    if (!fn || fn->type != RAY_VARY) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
+    return f == ray_insert || f == ray_insert_fn || f == ray_alter_fn;
+}
+
+/* The head `hd` of a call, which evaluated to the mutator `head`, is the
+ * literal insert or alter or a global alias of one: an unquoted symbol bound
+ * in no local frame, whose global binding is that mutator.  Any other head
+ * (a parameter, a let, a dotted head, a computed head) makes the mutator an
+ * ordinary callee, as compile_call treats it. */
+static bool mutator_head_is_global(const ray_t* hd, const ray_t* head) {
+    if (!hd || hd->type != -RAY_SYM || (hd->attrs & ATTR_QUOTED)) return false;
+    return !ray_env_get_local(hd->i64) && ray_env_get_global(hd->i64) == head;
+}
+
 static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
@@ -489,6 +505,99 @@ ray_t* ray_raise_fn(ray_t* val) {
     return ray_error("domain", NULL);
 }
 
+/* The errors both engines raise for the same mistake, so that their text,
+ * which a `try` handler reads as msg, doesn't depend on whether the code
+ * was compiled. */
+static ray_t* undefined_name_error(int64_t sym) {
+    ray_t* s = ray_sym_str(sym);   /* borrowed */
+    if (!s) return ray_error("name", NULL);
+    return ray_error("name", "'%.*s' undefined", (int)ray_str_len(s), ray_str_ptr(s));
+}
+
+static ray_t* head_not_callable_error(int8_t type) {
+    return ray_error("type", "head is not callable, got %s", ray_type_name(type));
+}
+
+/* Dispose of a construction temporary that was not handed on: an error is
+ * freed (errors are not refcounted, so ray_release would leave it
+ * allocated), anything else released. */
+static void try_drop(ray_t* v) {
+    if (RAY_IS_ERR(v)) ray_error_free(v);
+    else ray_release(v);
+}
+
+/* The value a `try` handler receives for an error the engine raised
+ * itself (a (raise x) hands it x): the dict
+ * {code: 'type msg: "cannot add i64 and sym"}, the code and message the
+ * REPL prints for the error, msg "" when it carries none.  Called before
+ * the error is freed or the handler runs, since msg is usually
+ * ray_error_msg(), the thread's last error message.  null, which takes no
+ * allocation, if the dict cannot be built. */
+static ray_t* try_error_value(const char* code, const char* msg) {
+    if (!code) code = "error";
+    if (!msg) msg = "";
+    /* The keys' ids hold for the symbol table's lifetime: one lookup each
+     * per table, not per catch.  An epoch of 0 is no table yet. */
+    static _Thread_local uint64_t key_epoch;
+    static _Thread_local int64_t kc, km;
+    ray_t *sm, *sc = NULL, *keys = NULL, *vals = NULL, *d;
+    int64_t kv;
+    /* The message first: a failure below makes an error of its own,
+     * which overwrites the thread's last message. */
+    sm = ray_str(msg, strlen(msg));
+    if (RAY_IS_ERR(sm)) goto fail;
+    uint64_t epoch = ray_sym_epoch();
+    if (key_epoch != epoch || !epoch) {
+        kc = ray_sym_intern("code", 4);
+        km = ray_sym_intern("msg", 3);
+        if (kc < 0 || km < 0) { key_epoch = 0; goto fail; }
+        key_epoch = epoch;
+    }
+    kv = ray_sym_intern(code, strlen(code));
+    if (kv < 0) goto fail;
+    sc = ray_sym(kv);
+    if (RAY_IS_ERR(sc)) goto fail;
+    keys = ray_sym_vec_new(RAY_SYM_W64, 2);
+    if (RAY_IS_ERR(keys)) goto fail;
+    vals = ray_list_new(2);
+    if (RAY_IS_ERR(vals)) goto fail;
+    /* Filled in place, vals taking sc and sm over: nothing between the
+     * allocations above and the dict's own can fail. */
+    ((int64_t*)ray_data(keys))[0] = kc;
+    ((int64_t*)ray_data(keys))[1] = km;
+    keys->len = 2;
+    ((ray_t**)ray_data(vals))[0] = sc;
+    ((ray_t**)ray_data(vals))[1] = sm;   /* not-a-table */
+    vals->len = 2;
+    d = ray_dict_new(keys, vals);   /* consumes keys and vals, failing too */
+    if (!RAY_IS_ERR(d)) return d;
+    ray_error_free(d);
+    return RAY_NULL_OBJ;
+fail:
+    try_drop(sm);
+    try_drop(sc);
+    try_drop(keys);
+    try_drop(vals);
+    return RAY_NULL_OBJ;
+}
+
+#ifdef DEBUG
+ray_t* ray_try_error_value_for_test(const char* code, const char* msg) {
+    return try_error_value(code, msg);
+}
+#endif
+
+/* True when a `try` handler expression is a plain value: not a name or a
+ * symbol (either can resolve to a function), not a call, not a function.
+ * Such a handler is the result as it stands, so the error value it would
+ * be handed is never read and need not be built.  Shared with the
+ * compiler, which gives it a trap that pushes none (OP_TRAPV). */
+bool ray_try_handler_is_value(ray_t* h) {
+    if (!h || RAY_IS_ERR(h)) return false;
+    return h->type != -RAY_SYM && h->type != RAY_LIST &&
+           h->type != RAY_LAMBDA && h->type != RAY_UNARY;
+}
+
 /* Dispatch a `try` handler value against the error value.  A *callable*
  * handler (a lambda or a unary builtin) is invoked with the error and its
  * result returned; ANY other value is returned as-is as a fallback result.
@@ -535,10 +644,13 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     if (!RAY_IS_ERR(result)) return result;
     if (is_return_marker(result)) return result;   /* a `return` is not an error */
 
-    /* Get error value (set by raise, or default for runtime errors) */
+    /* Get error value (set by raise, or the engine error's code and
+     * message, which a plain-value handler never reads) */
     ray_t* err_val = __VM->raise_val;
     __VM->raise_val = NULL;
-    if (!err_val) err_val = make_i64(0);
+    if (!err_val)
+        err_val = ray_try_handler_is_value(handler_expr) ? RAY_NULL_OBJ
+                : try_error_value(ray_err_code(result), ray_error_msg());
     /* The caught error itself goes no further: errors are not refcounted,
      * so ray_release would leave it allocated.  Nor does the trace its
      * unwind recorded. */
@@ -2559,7 +2671,8 @@ typedef struct {
                        * and differ in the middle */
     int64_t nbody;
     ray_t*  mentioned; /* the symbols the body mentions (I64 vector) */
-    bool    dynamic;   /* the body uses eval or resolve: every capture counts */
+    bool    dynamic;   /* the body uses eval or resolve, or a mutator with a
+                        * computed target: every capture counts */
     bool    failed;    /* the body did not compile: its closures stay interpreted */
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
@@ -3009,19 +3122,27 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         return ray_error("arity", "expected %" PRId64 " args, got %" PRId64, param_count, argc);
 
     bool has_closure = LAMBDA_CLOSURE(lambda) != NULL;
+    /* A query helper's call frame caches source columns on demand, above
+     * its table_from.  It sits below the frame that binds self, the
+     * parameters and the body's lets, so none of those is ever taken for
+     * a column: the captures' frame for a closure, an empty call frame
+     * otherwise, as a compiled helper keeps its locals in VM slots. */
+    bool call_frame = has_closure || query;
     if (has_closure && ray_env_push_capture(LAMBDA_CLOSURE(lambda), LAMBDA_CAPROWS(lambda),
                                             LAMBDA_CAPQ(lambda)) != RAY_OK)
         return ray_error("oom", NULL);
     if (query && has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
+    if (query && !has_closure &&
+        ray_env_push_call_scope(ray_query_helper_table(), named) != RAY_OK)
+        return ray_error("oom", NULL);
     if (ray_env_push_scope() != RAY_OK) {
-        if (has_closure) ray_env_pop_scope();
+        if (call_frame) ray_env_pop_scope();
         return ray_error("oom", NULL);
     }
     /* Closures made inside the body capture down to this call's frames
-     * (its captures and parameters), never the caller's locals. */
-    ray_env_mark_lexical_scope(has_closure ? 1 : 0);
-
-    if (query && !has_closure) ray_env_mark_call_scope(ray_query_helper_table(), named);
+     * (its captures or columns, and its parameters), never the caller's
+     * locals. */
+    ray_env_mark_lexical_scope(call_frame ? 1 : 0);
 
     /* Bind 'self' to the current lambda for recursion */
     if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
@@ -3037,7 +3158,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             arg = ray_lazy_materialize(arg);
             if (!arg || RAY_IS_ERR(arg)) {
                 ray_env_pop_scope();
-                if (has_closure) ray_env_pop_scope();
+                if (call_frame) ray_env_pop_scope();
                 return arg ? arg : ray_error("type", NULL);
             }
         }
@@ -3064,7 +3185,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
             }
             __VM->lambda_depth--;
             ray_env_pop_scope();
-            if (has_closure) ray_env_pop_scope();
+            if (call_frame) ray_env_pop_scope();
             return result;
         }
     }
@@ -3072,7 +3193,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     if (out_rows) *out_rows = g_eval_rows;   /* the body's last value's provenance */
 
     ray_env_pop_scope();
-    if (has_closure) ray_env_pop_scope();
+    if (call_frame) ray_env_pop_scope();
     return result;
 }
 
@@ -3219,6 +3340,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_LOADCONST_W] = &&op_loadconst_w,
         [OP_RESOLVE_W]  = &&op_resolve_w,
         [OP_TRAP]       = &&op_trap,
+        [OP_TRAPV]      = &&op_trapv,
         [OP_TRAP_END]   = &&op_trap_end,
         [OP_STOREGLOBAL]   = &&op_storeglobal,
         [OP_STOREGLOBAL_W] = &&op_storeglobal_w,
@@ -3234,6 +3356,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL1R]        = &&op_call1r,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
+        [OP_PATHGET]       = &&op_pathget,
     };
 
     /* Arity check before allocating VM state */
@@ -3379,7 +3502,7 @@ op_resolve: {
         }
     }
     ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
-    if (!val) goto vm_error_name;
+    if (!val) { vm_err_obj = undefined_name_error(name_obj->i64); goto vm_error; }
     /* env_resolve returns an owned ref (rc >= 1); no extra retain needed.
      * It can also return a real error (e.g. nyi from a parted-target link
      * deref inside the dotted walker) — surface that as a VM error rather
@@ -3395,7 +3518,7 @@ op_resolve_w: {
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;
     ray_t *val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
-    if (!val) goto vm_error_name;
+    if (!val) { vm_err_obj = undefined_name_error(name_obj->i64); goto vm_error; }
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
     PUSHR(val, val_rows);
     DISPATCH();
@@ -3593,6 +3716,24 @@ op_calln: {
     DISPATCH();
 }
 
+op_pathget: {
+    /* A dotted name whose head is a local: the head was loaded as the name
+     * alone loads (compile_dotted_local); walk the rest. */
+    uint16_t pidx = (uint16_t)((code[ip] << 8) | code[ip + 1]);
+    ip += 2;
+    ray_t *phead = POP();
+    ray_t *pname = cpool[pidx];
+    ray_t *pv = ray_env_path_get(phead, pname->i64);
+    ray_release(phead);
+    if (RAY_UNLIKELY(!pv)) {
+        vm_err_obj = undefined_name_error(pname->i64);
+        goto vm_error;
+    }
+    if (RAY_IS_ERR(pv)) { vm_err_obj = pv; goto vm_error; }
+    PUSHR(pv, 0);
+    DISPATCH();
+}
+
 op_callf: {
     uint8_t n = code[ip++];
     if (n > 64) goto vm_error;
@@ -3762,7 +3903,7 @@ unary_done:
         }
         default:
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
-            result = ray_error("type", "apply: head is not callable, got %s", ray_type_name(fn_obj->type));
+            result = head_not_callable_error(fn_obj->type);
             break;
         }
         uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
@@ -3889,14 +4030,16 @@ op_ret: {
     DISPATCH();
 }
 
+op_trapv:   /* the handler is a plain value: it reads no error value */
 op_trap: {
+    bool value = code[ip - 1] == OP_TRAPV;
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     if (vm.tp >= VM_TRAP_SIZE) goto vm_error_limit;
     vm.ts[vm.tp++] = (vm_trap_t){
         .rp = vm.rp, .sp = vm.sp, .handler_ip = ip + offset,
         .fn = vm.fn, .fp = vm.fp, .n_locals = n_locals,
-        .scope_depth = ray_env_scope_depth()
+        .scope_depth = ray_env_scope_depth(), .value = value
     };
     ray_retain(vm.fn);
     DISPATCH();
@@ -4070,7 +4213,7 @@ op_loadenvg: {
     ray_t *name_obj = cpool[idx];
     uint8_t val_rows = 0;
     val = ray_env_resolve_compiled(name_obj->i64, &val_rows);
-    if (!val) goto vm_error_name;
+    if (!val) { vm_err_obj = undefined_name_error(name_obj->i64); goto vm_error; }
     if (RAY_IS_ERR(val)) { vm_err_obj = val; goto vm_error; }
     PUSHR(val, val_rows);
     DISPATCH();
@@ -4199,14 +4342,23 @@ vm_error_cleanup: {
 
         /* Get error value.  If __VM->raise_val is set, a user (raise x)
          * just ran — its value is the real payload the handler must
-         * see.  Otherwise the handler gets 0, as ray_try_fn gives it for
-         * a runtime error.  vm_err_obj, the error itself (the sentinel
-         * ray_raise_fn returns, or a builtin's or the VM's own), goes no
-         * further: errors are not refcounted, so ray_release would leave
-         * it allocated. */
+         * see.  Otherwise the handler gets the error's code and message,
+         * as ray_try_fn gives it: vm_err_obj's when there is one, else
+         * the VM's own (vm_err_str, vm_err_detail), the error an untrapped
+         * exit would make.  A trap armed by OP_TRAPV, whose handler is a
+         * plain value, takes none.  vm_err_obj, the error itself (the
+         * sentinel ray_raise_fn returns, or a builtin's or the VM's own),
+         * goes no further: errors are not refcounted, so ray_release would
+         * leave it allocated. */
         ray_t *err_val = __VM->raise_val;
         __VM->raise_val = NULL;
-        if (!err_val) err_val = make_i64(0);
+        if (trap.value) {
+            ray_release(err_val);
+            err_val = NULL;
+        } else if (!err_val)
+            err_val = vm_err_obj && RAY_IS_ERR(vm_err_obj)
+                ? try_error_value(ray_err_code(vm_err_obj), ray_error_msg())
+                : try_error_value(vm_err_str, vm_err_detail);
         if (vm_err_obj) {
             if (RAY_IS_ERR(vm_err_obj)) ray_error_free(vm_err_obj);
             else ray_release(vm_err_obj);
@@ -4222,7 +4374,7 @@ vm_error_cleanup: {
         code = (uint8_t *)ray_data(LAMBDA_BC(vm.fn));
         cpool = (ray_t **)ray_data(LAMBDA_CONSTS(vm.fn));
         ip = trap.handler_ip;
-        PUSH(err_val);
+        if (!trap.value) PUSH(err_val);
         DISPATCH();
     }
 
@@ -4767,6 +4919,9 @@ static void ray_register_builtins(void) {
     /* Transmit backlog policy: read, set the process default, or override
      * one connection.  Privileged — it decides when a peer is dropped. */
     register_vary(  ".ipc.txlimit", RAY_FN_RESTRICTED, ray_ipc_txlimit_fn);
+    /* Transport policy: which faster road a connection may move to.
+     * Privileged — it decides what this process offers its peers. */
+    register_vary(  ".ipc.transport", RAY_FN_RESTRICTED, ray_ipc_transport_fn);
 
     /* Multicast/pub-sub over IPC.  Subscriptions are allowed under
      * restricted IPC; publishing stays privileged. */
@@ -4791,8 +4946,10 @@ static void ray_register_builtins(void) {
      * startup; these builtins expose the same machinery to Rayfall code
      * for manual control (open from a script, snapshot on demand, etc). */
     register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
+    register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
     register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
     register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
+    register_unary(".log.replay_report", RAY_FN_RESTRICTED, ray_log_replay_report_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
     register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
     register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);
@@ -5049,14 +5206,7 @@ ray_t* ray_eval(ray_t* obj) {
             uint8_t val_rows = 0;   /* a query's column binding, or a helper's */
             ray_t* val = ray_env_resolve_rows(obj->i64, &val_rows);
             if (!val) {
-                ray_t* ns = ray_sym_str(obj->i64);
-                if (ns) {
-                    ret = ray_error("name", "'%.*s' undefined",
-                                    (int)ray_str_len(ns), ray_str_ptr(ns));
-                    ray_release(ns);
-                } else {
-                    ret = ray_error("name", NULL);
-                }
+                ret = undefined_name_error(obj->i64);
                 goto out;
             }
             /* env_resolve may also return a real error (e.g. nyi from a
@@ -5120,14 +5270,7 @@ ray_t* ray_eval(ray_t* obj) {
                 ray_retain(obj);
                 ret = obj; goto out;
             }
-            ray_t* ns = ray_sym_str(head->i64);
-            if (ns) {
-                ret = ray_error("name", "'%.*s' undefined",
-                                (int)ray_str_len(ns), ray_str_ptr(ns));
-                ray_release(ns);
-            } else {
-                ret = ray_error("name", NULL);
-            }
+            ret = undefined_name_error(head->i64);
             ray_release(head);
             goto out;
         }
@@ -5381,7 +5524,13 @@ ray_t* ray_eval(ray_t* obj) {
         case RAY_VARY: {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_vary_fn fn = (ray_vary_fn)(uintptr_t)head->i64;
-            if (head->attrs & RAY_FN_SPECIAL_FORM) {
+            /* insert or alter reached through any head but the literal name
+             * or a global alias: an ordinary call, its operands evaluated
+             * first, and its quoted target is no binding of this function. */
+            bool callee_mutator = (head->attrs & RAY_FN_SPECIAL_FORM) &&
+                                  ray_fn_is_local_mutator(head) &&
+                                  !mutator_head_is_global(elems[0], head);
+            if ((head->attrs & RAY_FN_SPECIAL_FORM) && !callee_mutator) {
                 /* A control form returns one of its operands; any other
                  * form (a query, a table op) builds a new value. */
                 bool inherits = form_inherits_rows(head);
@@ -5411,6 +5560,7 @@ ray_t* ray_eval(ray_t* obj) {
                 if (err) { ray_release(head); ret = err; goto out; }
             }
             ray_release(head);
+            if (callee_mutator) ray_env_mutator_callee_arm();
             ray_t* result = fn(args, argc);
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             ret = result; goto out;
@@ -5455,7 +5605,7 @@ ray_t* ray_eval(ray_t* obj) {
                 ray_retain(obj);
                 ret = obj; goto out;
             }
-            ret = ray_error("type", "eval: head of list is not callable, got %s", ray_type_name(head_type)); goto out;
+            ret = head_not_callable_error(head_type); goto out;
         }
     }
 

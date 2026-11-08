@@ -10,6 +10,30 @@
 (mvar 2 [1 3 5 7]) -- [0.0 1.0 1.0 1.0]
 (mdev 2 [1 3 5 7]) -- [0.0 1.0 1.0 1.0]
 
+;; Variance uses mergeable Welford summaries: a large common offset must not
+;; erase the spread or create noise in a constant/one-element window.
+(mdev 1 [3.6e12 7.2e12]) -- [0.0 0.0]
+(mvar 1 [1e12 0.0 1.0 2.0]) -- [0.0 0.0 0.0 0.0]
+(mdev 1 [1e12 0.0 1.0 2.0]) -- [0.0 0.0 0.0 0.0]
+(mvar 9223372036854775807 [1.0]) -- [0.0]
+(set shifted_mv (mvar 3 (+ 1e12 (as 'F64 (til 6)))))
+(at shifted_mv 1) -- 0.25
+(> (last shifted_mv) 0.66) -- true
+(< (last shifted_mv) 0.67) -- true
+(set shifted_md (mdev 3 (+ 1000000000.0 (* 0.1 (as 'F64 (til 6))))))
+(> (last shifted_md) 0.08) -- true
+(< (last shifted_md) 0.09) -- true
+(set shifted_Tm (table [x] (list (+ 1e12 (as 'F64 (til 6))))))
+(set shifted_qv (at (select {from: shifted_Tm v: (mvar 3 x)}) 'v))
+(> (last shifted_qv) 0.66) -- true
+(< (last shifted_qv) 0.67) -- true
+(set extreme_mv (mvar 2 [6.703903964971299e153 -6.703903964971299e153 0.0 0.0]))
+(> (at extreme_mv 1) 4e307) -- true
+(< (at extreme_mv 1) 5e307) -- true
+(> (at extreme_mv 2) 1e307) -- true
+(< (at extreme_mv 2) 2e307) -- true
+(last extreme_mv) -- 0.0
+
 ;; Nulls are skipped. msum uses zero for all-null windows; mavg/min/max
 ;; return typed nulls when the current window has no non-null values.
 (set Mv (as 'I64 (list 0N 1 0N 3)))

@@ -150,6 +150,12 @@ ray_t*    ray_scratch_realloc(ray_t* v, size_t new_data_size);
 
 ray_t*    ray_cow(ray_t* v);
 
+#ifdef DEBUG
+/* Test seam: ray_alloc on this thread returns NULL for `count` calls,
+ * starting with the nth from now; nth 0 disarms. */
+void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
+#endif
+
 /* ===== Memory Statistics ===== */
 
 typedef struct {
@@ -250,6 +256,10 @@ void     ray_heap_push_pending(ray_heap_t* heap);
 void     ray_heap_drain_pending(void);
 uint8_t  ray_order_for_size(size_t data_size);
 void     ray_mem_stats(ray_mem_stats_t* out);
+/* Test driver: restart this thread's heap peak (peak_bytes) at its current
+ * footprint.  Heaps are recycled and merged, so without it a test's
+ * peak-bytes would carry whatever ran earlier in the same process. */
+void     ray_mem_peak_reset_for_test(void);
 bool     ray_mem_trace_begin(void);
 void     ray_mem_trace_end(ray_mem_trace_t* out);
 
