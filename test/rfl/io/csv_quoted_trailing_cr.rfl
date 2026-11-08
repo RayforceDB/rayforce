@@ -1,0 +1,22 @@
+;; @requires: posix
+;; A quoted last field whose content ends in '\r' keeps it.  The reader used to
+;; strip a trailing '\r' from the last column's decoded text to tolerate CRLF
+;; endings, but the scanner never includes the row terminator in a field, so
+;; the strip only ever removed real data from quoted fields ("\r", "q\r").
+(.sys.exec "rm -rf rf_test_csvcr_spl") -- 0
+(.sys.exec "printf 'id,t,u\n1,x,\"\r\"\n2,\"a\r\",y\n3,b,\"\r\n\"\n4,z,\"q\r\"\n' > rf_test_csvcr.csv") -- 0
+(set T (.csv.read [I64 STR STR] "rf_test_csvcr.csv"))
+(count T) -- 4
+(at T 't) -- ["x" "a\r" "b" "z"]
+(at T 'u) -- ["\r" "y" "\r\n" "q\r"]
+;; write -> read round trip is exact
+(.csv.write T "rf_test_csvcr_out.csv") -- 0
+(set U (.csv.read [I64 STR STR] "rf_test_csvcr_out.csv"))
+(at U 'u) -- ["\r" "y" "\r\n" "q\r"]
+;; CRLF row endings are still not part of the last field
+(.sys.exec "printf 'id,u\r\n1,\"x\"\r\n2,y\r\n' > rf_test_csvcr_crlf.csv") -- 0
+(at (.csv.read [I64 STR] "rf_test_csvcr_crlf.csv") 'u) -- ["x" "y"]
+;; schema-driven splayed import goes through the same scanner
+(set S (.csv.splayed [I64 STR STR] "rf_test_csvcr.csv" "rf_test_csvcr_spl"))
+(at S 'u) -- ["\r" "y" "\r\n" "q\r"]
+(.sys.exec "rm -rf rf_test_csvcr_spl rf_test_csvcr.csv rf_test_csvcr_out.csv rf_test_csvcr_crlf.csv") -- 0
