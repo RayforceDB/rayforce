@@ -204,11 +204,24 @@ int64_t ray_group_test_minmax_staged_rows(void) {
  * Reduction execution
  * ============================================================================ */
 
+#define REDUCE_ACC_SHIFTED_SQ(acc, v) do { \
+    if (!(acc)->shift_set) { (acc)->shift_i = (v); (acc)->shift_set = true; } \
+    double dv_ = (double)(int64_t)((uint64_t)(v) - (uint64_t)(acc)->shift_i); \
+    (acc)->sum_c += dv_; (acc)->sum_sq_c += dv_ * dv_; \
+} while (0)
+
 typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
-    int64_t sum_i, min_i, max_i, prod_i, first_i, last_i, sum_sq_i;
+    int64_t sum_i, min_i, max_i, prod_i, first_i, last_i;
     /* f64 sum of the integer stream (variance / stddev of integers). */
     double sum_d;
+    /* Variance / stddev of integers: sums of (x - shift_i) and its square,
+     * the shift being the first value this accumulator saw.  Squares of the
+     * raw values lose the variance to cancellation (a constant column of
+     * hour-long durations would not come out as 0). */
+    double sum_c, sum_sq_c;
+    int64_t shift_i;
+    bool shift_set;
     /* High word of the exact 128-bit sum of the integer stream; sum_i is
      * its low word.  AVG of an integer column divides this exact total,
      * so the mean is the same bits whatever the morsel split and equals
@@ -223,8 +236,9 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_f = 0; acc->min_f = DBL_MAX; acc->max_f = -DBL_MAX;
     acc->prod_f = 1.0; acc->first_f = 0; acc->last_f = 0; acc->sum_sq_f = 0;
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
-    acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
+    acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0;
     acc->sum_d = 0; acc->sum_hi = 0;
+    acc->sum_c = 0; acc->sum_sq_c = 0; acc->shift_i = 0; acc->shift_set = false;
     acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
 }
 
@@ -440,12 +454,12 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             T raw = d[row]; \
             if ((HAS_NULLS) && raw == (T)(NULL_SENT)) continue; \
             int64_t v = (int64_t)raw; \
-            /* sum/sum_sq may overflow on signed arithmetic — use defined \
+            /* sum may overflow on signed arithmetic — use defined \
              * unsigned wrap (same semantic, no UBSan whine). */ \
             if ((NEEDS) & RED_NEED_SUM) \
                 (acc)->sum_i = (int64_t)((uint64_t)(acc)->sum_i + (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_SQ) \
-                (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
+                REDUCE_ACC_SHIFTED_SQ(acc, v); \
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
@@ -478,7 +492,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if ((NEEDS) & RED_NEED_SUM) \
                 (acc)->sum_i = (int64_t)((uint64_t)(acc)->sum_i + (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_SQ) \
-                (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
+                REDUCE_ACC_SHIFTED_SQ(acc, v); \
             if ((NEEDS) & RED_NEED_PROD) \
                 (acc)->prod_i = (int64_t)((uint64_t)(acc)->prod_i * (uint64_t)v); \
             if ((NEEDS) & RED_NEED_SUM_D) (acc)->sum_d += (double)v; \
@@ -819,8 +833,18 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
             dst->sum_sq_f += src->sum_sq_f;
         } else {
             dst->sum_d += src->sum_d;
-            dst->sum_sq_i = (int64_t)((uint64_t)dst->sum_sq_i +
-                                      (uint64_t)src->sum_sq_i);
+            if (src->shift_set) {
+                if (!dst->shift_set) {
+                    dst->shift_i = src->shift_i; dst->shift_set = true;
+                    dst->sum_c = src->sum_c; dst->sum_sq_c = src->sum_sq_c;
+                } else {
+                    /* src's sums re-expressed about dst's shift */
+                    double d = (double)(int64_t)((uint64_t)src->shift_i - (uint64_t)dst->shift_i);
+                    double n = (double)src->cnt;
+                    dst->sum_c += src->sum_c + n * d;
+                    dst->sum_sq_c += src->sum_sq_c + 2 * d * src->sum_c + n * d * d;
+                }
+            }
         }
         dst->cnt += src->cnt;
         break;
@@ -4393,10 +4417,13 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
         case OP_VAR: case OP_VAR_POP:
         case OP_STDDEV: case OP_STDDEV_POP: {
             bool insufficient = (opcode == OP_VAR || opcode == OP_STDDEV) ? m->cnt <= 1 : m->cnt <= 0;
-            if (insufficient) return ray_typed_null(-RAY_F64);
+            /* the standard deviation of durations is a duration, null or not */
+            bool dur_dev = in_type == RAY_TIMESPAN && (opcode == OP_STDDEV || opcode == OP_STDDEV_POP);
+            if (insufficient)
+                return dur_dev ? ray_typed_null(-RAY_TIMESPAN) : ray_typed_null(-RAY_F64);
             double mean, var_pop;
             if (fp) { mean = m->sum_f / m->cnt; var_pop = m->sum_sq_f / m->cnt - mean * mean; }
-            else { mean = m->sum_d / m->cnt; var_pop = (double)m->sum_sq_i / m->cnt - mean * mean; }
+            else { mean = m->sum_c / m->cnt; var_pop = m->sum_sq_c / m->cnt - mean * mean; }
             if (var_pop < 0) var_pop = 0;
             double val;
             if (opcode == OP_VAR_POP) val = var_pop;
@@ -4404,9 +4431,7 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
             else if (opcode == OP_STDDEV_POP) val = sqrt(var_pop);
             else val = sqrt(var_pop * m->cnt / (m->cnt - 1));
             ray_t* r = ray_f64(ray_f64_fin(val));
-            /* the standard deviation of durations is a duration */
-            return in_type == RAY_TIMESPAN && (opcode == OP_STDDEV || opcode == OP_STDDEV_POP)
-                   ? ray_timespan_of_f64_atom(r) : r;
+            return dur_dev ? ray_timespan_of_f64_atom(r) : r;
         }
         default:       return ray_error("nyi", NULL);
     }
