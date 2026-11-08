@@ -42,24 +42,31 @@ ancestor of `dev`. It also has to happen *after* the release PR merges, because
 the commit doesn't exist before then.
 
 The Release workflow's **merge-back** job does this with
-`.github/release-merge-back.sh`, pushing with the `PAT` secret. A manual dispatch
-skips the job. If it fails (red job, with the reason in the error annotation) or
-was skipped, do it by hand:
+`.github/release-merge-back.sh`, run from the release commit and pushing with the
+`PAT` secret. A manual dispatch skips the job. If the job failed only because it
+could not push, or was skipped, run the same helper by hand with the release PR's
+own SHAs, so it applies the same checks:
 
 ```sh
+pr=N                      # the release PR
+ver=X.Y.Z
+release=$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid)
+head=$(gh pr view "$pr" --json headRefOid -q .headRefOid)
 git fetch origin
-git switch dev && git pull --ff-only
-git merge --no-ff -s ours origin/master \
-  -m "chore: merge master back into dev after the vX.Y.Z release (#N)"
-git diff origin/dev --stat   # must print nothing
-git push origin dev
+git worktree add --detach /tmp/merge-back "$release"
+cp /tmp/merge-back/.github/release-merge-back.sh /tmp/merge-back.sh
+(cd /tmp/merge-back && bash /tmp/merge-back.sh "$ver" "$pr" "$release" "$head")
+git worktree remove /tmp/merge-back
 ```
 
-If you push this through a PR, merge it with a merge commit: a squash loses the
-ancestry. `-s ours` is correct because `dev` already contains everything the
-release shipped, so the empty `git diff` proves the merge changed no files. If
-`master` ever carries a hotfix that isn't on `dev`, the job stops with an error
-instead of merging; drop `-s ours` and do a normal merge.
+The helper does a `-s ours` merge, which is correct only when `dev` already
+contains everything the release shipped. It checks that first: the release
+commit must have the same tree as the PR head, and `dev` must contain the PR
+head. If either check fails (the error annotation says which), `master` carries
+changes of its own, such as a hotfix, and a `-s ours` merge would silently drop
+them. Do not work around it: merge `master` into `dev` normally through a PR,
+review the diff, and land it with a merge commit, since a squash loses the
+ancestry.
 
 That's the whole ritual. **Never edit the version in source to make a release** —
 the tag is authoritative.

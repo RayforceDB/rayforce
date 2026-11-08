@@ -190,10 +190,13 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # The helper runs from the release commit, not from whatever dev holds
+      # when the job starts: the release is immutable and was reviewed as part
+      # of the release PR, and dev is the branch the helper is about to write.
       # GITHUB_TOKEN can't push past dev's required checks; the PAT's owner can.
       - uses: actions/checkout@v5
         with:
-          ref: dev
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           token: ${{ secrets.PAT }}
 
@@ -207,7 +210,10 @@ jobs:
           set -euo pipefail
           git config user.name  "rayforce-release"
           git config user.email "release@rayforcedb.com"
-          bash .github/release-merge-back.sh "$VERSION" "$PR" "$RELEASE_SHA" "$HEAD_SHA"
+          # The helper switches the working tree to dev, so run a copy that
+          # the switch can't replace while bash is still reading it.
+          cp .github/release-merge-back.sh "$RUNNER_TEMP/merge-back.sh"
+          bash "$RUNNER_TEMP/merge-back.sh" "$VERSION" "$PR" "$RELEASE_SHA" "$HEAD_SHA"
 
   # Post the release announcement to Zulip (#Announcements > Rayforce) once the
   # release is public. Best-effort: skipped when ZULIP_API_KEY isn't configured,
