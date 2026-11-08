@@ -1735,11 +1735,19 @@ static test_result_t test_cancel_waiter(void) {
         cwait_t p = { c, "" }, w = { c, "" };
         ray_thread_t tp, tw;
         ray_thread_create(&tp, cancel_wait_thread, &p);
-        while (atomic_load(&e->once.state) != RAY_ENC_ONCE_RUNNING) ray_enc_yield();
-        ray_thread_create(&tw, cancel_wait_thread, &w);
-        while (ray_enc_once_waiters(&e->once) < 1) ray_enc_yield();
-        ray_request_interrupt();
-        ray_thread_join(tp); ray_thread_join(tw);
+        /* Every wait also ends once the attempt has left RUNNING: a decode
+         * that finishes first is a lost race, never a hang. */
+        int st;
+        while ((st = atomic_load(&e->once.state)) == RAY_ENC_ONCE_IDLE) ray_enc_yield();
+        bool waiter = st == RAY_ENC_ONCE_RUNNING;
+        if (waiter) {
+            ray_thread_create(&tw, cancel_wait_thread, &w);
+            while (ray_enc_once_waiters(&e->once) < 1 &&
+                   atomic_load(&e->once.state) == RAY_ENC_ONCE_RUNNING) ray_enc_yield();
+            if (ray_enc_once_waiters(&e->once) >= 1) ray_request_interrupt();
+        }
+        ray_thread_join(tp);
+        if (waiter) ray_thread_join(tw);
         ray_clear_interrupt();
         TEST_ASSERT_STR_EQ(w.code, p.code);                 /* the waiter gets the attempt's result */
         cancelled = strcmp(p.code, "cancel") == 0;

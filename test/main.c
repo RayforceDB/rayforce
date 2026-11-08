@@ -1421,6 +1421,7 @@ typedef struct {
     int64_t log_pos;     /* log offset where the job in flight started    */
     double  t0;          /* wall-clock dispatch time (ms)                 */
     bool    retire;      /* it left spill pools: exits, a fresh one follows */
+    bool    timed_out;   /* killed for running one test past --timeout */
     int*    hist;        /* every job this process ran, in order (replay) */
     int     nhist, hist_cap;
 } worker_t;
@@ -1620,6 +1621,8 @@ static void replay_note(const worker_t* me, int job) {
            before, before == 1 ? "" : "s", g_argv0, path);
 }
 
+static double g_test_timeout_ms = 600e3;   /* --timeout: per test, -j only */
+
 static int run_parallel(int nworkers, const char* times_path,
                         int* pass, int* fail, int* skip) {
     signal(SIGPIPE, SIG_IGN);
@@ -1661,6 +1664,13 @@ static int run_parallel(int nworkers, const char* times_path,
 
     while (alive > 0) {
         results_drain(&P, 200);
+        /* a test that hangs takes its worker down, not the run */
+        for (int k = 0; k < P.nw; k++)
+            if (P.w[k].pid > 0 && P.w[k].job >= 0 && !P.w[k].timed_out &&
+                now_ms() - P.w[k].t0 > g_test_timeout_ms) {
+                P.w[k].timed_out = true;
+                kill(P.w[k].pid, SIGKILL);
+            }
         for (int k = 0; k < P.nw; k++) {
             worker_t* me = &P.w[k];
             if (me->pid <= 0) continue;
@@ -1672,7 +1682,8 @@ static int run_parallel(int nworkers, const char* times_path,
             /* results it wrote just before exiting are still in the pipe */
             results_drain(&P, 0);
             char why[96];
-            if (WIFSIGNALED(st)) snprintf(why, sizeof why, "killed by signal %d (%s)", WTERMSIG(st), strsignal(WTERMSIG(st)));
+            if (me->timed_out)   snprintf(why, sizeof why, "killed: the test ran past --timeout %g s", g_test_timeout_ms / 1e3);
+            else if (WIFSIGNALED(st)) snprintf(why, sizeof why, "killed by signal %d (%s)", WTERMSIG(st), strsignal(WTERMSIG(st)));
             else                 snprintf(why, sizeof why, "exited with status %d", WEXITSTATUS(st));
             bool crashed = me->job >= 0;
             if (crashed) {
@@ -1740,12 +1751,19 @@ int main(int argc, char** argv) {
             if (jobs <= 0) jobs = 4;
         } else if (strcmp(argv[i], "--quick") == 0) {
             quick = true;
+        } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+#if !defined(_WIN32)
+            g_test_timeout_ms = atof(argv[i + 1]) * 1e3;
+            if (g_test_timeout_ms <= 0) g_test_timeout_ms = 1e12;
+#endif
+            i++;
         } else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
             replay = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [-f SUBSTR] [-j N] [--quick] [--census PATH]\n", argv[0]);
             printf("  -f, --filter SUBSTR   Only run tests whose name contains SUBSTR.\n");
             printf("  -j, --jobs N          Run tests in N worker processes (0 = one per CPU).\n");
+            printf("  --timeout SEC         With -j: fail a test that runs longer (default 600; 0 = none).\n");
             printf("  --quick               Leave out the equivalence pass and the slow tests\n");
             printf("                        listed in quick_skip (test/main.c).\n");
             printf("  --replay FILE         Run the tests named in FILE (one a line), in that order,\n");
