@@ -3640,6 +3640,9 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     }
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
+        /* The message is left in the error slot for the caller to raise. */
+        ray_error_free(ray_error("limit", "csv.splayed: header has too many columns, got %d (max %d)",
+                                 ncols, CSV_MAX_COLS));
         return RAY_ERR_LIMIT;
     }
     if ((col_types_in && n_types != ncols) ||
@@ -4053,6 +4056,9 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     }
     if (ncols > CSV_MAX_COLS) {
         ray_vm_unmap_file(buf, file_size);
+        /* The message is left in the error slot for the caller to raise. */
+        ray_error_free(ray_error("limit", "csv.parted: header has too many columns, got %d (max %d)",
+                                 ncols, CSV_MAX_COLS));
         return RAY_ERR_LIMIT;
     }
     if ((col_types_in && n_types != ncols) ||

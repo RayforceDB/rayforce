@@ -24,7 +24,7 @@ Signatures:
 
 Returns: a `table`. Empty fields use the selected type's missing-input behavior. Sentinel-nullable columns record nulls with `RAY_ATTR_HAS_NULLS`; `SYM`/`STR` fields collapse to ordinary empty values and those columns do not acquire `RAY_ATTR_HAS_NULLS` from them.
 
-Errors: `type` (bad arg), `domain` (path is null / too long, or zero columns), `io` (open/read failure), `limit` (>256 columns).
+Errors: `type` (bad arg), `domain` (path is null / too long, or zero columns), `io` (open/read failure), `limit` (a header with more than 256 columns; the message names the count, e.g. `csv read: header has too many columns, got 300 (max 256)`).
 
 Examples:
 
@@ -75,7 +75,7 @@ Use this when the CSV is too large to fit in memory but you want to query it lik
 ;; big is now a splayed table mmap'd from /tmp/rayforce-huge/.
 ```
 
-Errors propagate from the CSV parser (`type`, `domain`, `limit`) and from the splayed writer (`io`, `oom`).
+Errors propagate from the CSV parser (`type`, `domain`, `limit`) and from the splayed writer (`io`, `oom`). A header with more than 256 columns is a `limit` error, `csv.splayed: header has too many columns, got 300 (max 256)`, raised before anything is written to `out_dir`.
 
 ## `.csv.parted` { #csv-parted }
 
@@ -88,6 +88,8 @@ Signatures (with optional rows-per-part):
 - `(.csv.parted {compress: true} ...)` — any arrangement above may start with an options dict. `compress` true writes generation-2 (compressed) files where eligible, false generation 0; absent inherits per file (generation 2 when the existing destination file is generation 2). Unknown keys, a non-bool value or a second options dict are a `domain` error. Linked and nested/list columns are always written uncompressed. A compressed string column persists its dictionary index, as a generation-0 one does.
 
 Streams the CSV into `db_root/<partition-number>/tbl_name/`. Returns the parted table loaded back from disk. A new root is staged at `<db_root>.csv-partial` and published after the shared dictionary flush; staging from an import that failed after writing a partition is retained for diagnosis, and a retry into the same root fails with an `io` error naming the directory to remove. A failure before the first partition (an unreadable or empty source, a type vector that does not match) leaves nothing behind. Existing roots retain per-partition update behavior. Bulk writes require an external file and directory sync for durability.
+
+A header with more than 256 columns is a `limit` error, `csv.parted: header has too many columns, got 300 (max 256)`, raised before anything is written: no staging directory is left and an existing root is unchanged.
 
 Constraints on `tbl_name`: must not start with `.`, must not contain `/` or `\\` or `..`.
 

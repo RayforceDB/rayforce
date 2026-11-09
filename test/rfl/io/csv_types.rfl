@@ -480,7 +480,22 @@
 (.sys.exec "rm -rf rf_test_csv_types_parted rf_test_csv_types_parted_q rf_test_csv_types_parted2") -- 0
 
 ;; A header with more than 256 columns is a `limit` error (documented cap),
-;; not `range`.
-(.sys.exec "awk 'BEGIN{for(i=1;i<=300;i++) printf \"%sc%d\", (i>1?\",\":\"\"), i; printf \"\\n\"; for(i=1;i<=300;i++) printf \"%s1\", (i>1?\",\":\"\"); printf \"\\n\"}' > rf_test_csv_wide300.csv") -- 0
+;; not `range`, from all three loaders; each names the count and the cap.
+;; 256 columns is still accepted.
+(.sys.exec "for n in 256 257 300; do awk -v n=$n 'BEGIN{for(i=1;i<=n;i++) printf \"%sc%d\", (i>1?\",\":\"\"), i; printf \"\\n\"; for(i=1;i<=n;i++) printf \"%s1\", (i>1?\",\":\"\"); printf \"\\n\"}' > rf_test_csv_wide$n.csv; done") -- 0
+(count (key (.csv.read "rf_test_csv_wide256.csv"))) -- 256
 (.csv.read "rf_test_csv_wide300.csv") !- limit
-(.sys.exec "rm -f rf_test_csv_wide300.csv") -- 0
+(try (.csv.read "rf_test_csv_wide257.csv") (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "limit: csv read: header has too many columns, got 257 (max 256)"
+(try (.csv.read [c1 c2] [I64 I64] "rf_test_csv_wide300.csv") (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "limit: csv read: header has too many columns, got 300 (max 256)"
+(try (.csv.splayed "rf_test_csv_wide300.csv" "rf_test_csv_wide_sp") (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "limit: csv.splayed: header has too many columns, got 300 (max 256)"
+(try (.csv.parted "rf_test_csv_wide300.csv" "rf_test_csv_wide_pt" 't) (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "limit: csv.parted: header has too many columns, got 300 (max 256)"
+(.sys.exec "test ! -e rf_test_csv_wide_sp && test ! -e rf_test_csv_wide_pt && test ! -e rf_test_csv_wide_pt.csv-partial") -- 0
+;; An existing destination is left as it was.
+(.sys.exec "printf 'a,b\n1,2\n' > rf_test_csv_wide2.csv") -- 0
+(count (.csv.splayed "rf_test_csv_wide2.csv" "rf_test_csv_wide_sp")) -- 1
+(.csv.splayed "rf_test_csv_wide300.csv" "rf_test_csv_wide_sp") !- limit
+(key (.db.splayed.get "rf_test_csv_wide_sp/")) -- [a b]
+(count (.csv.parted "rf_test_csv_wide2.csv" "rf_test_csv_wide_pt" 't)) -- 1
+(.csv.parted "rf_test_csv_wide300.csv" "rf_test_csv_wide_pt" 't) !- limit
+(count (.db.parted.get "rf_test_csv_wide_pt" 't)) -- 1
+(.sys.exec "rm -rf rf_test_csv_wide2.csv rf_test_csv_wide256.csv rf_test_csv_wide257.csv rf_test_csv_wide300.csv rf_test_csv_wide_sp rf_test_csv_wide_pt rf_test_csv_wide_pt.csv-partial") -- 0

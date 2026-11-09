@@ -647,6 +647,16 @@ static int csv_valid_table_name(const char* name) {
            !strchr(name, '/') && !strchr(name, '\\') && !strstr(name, "..");
 }
 
+/* The loaders return a bare code; the column cap also leaves its message
+ * ("got N (max 256)") in the error slot, which is kept here. */
+static ray_t* csv_loader_error(ray_err_t err) {
+    const char* m = err == RAY_ERR_LIMIT ? ray_error_msg() : NULL;
+    if (!m) return ray_error(ray_err_code_str(err), NULL);
+    char msg[256];
+    snprintf(msg, sizeof msg, "%s", m);
+    return ray_error(ray_err_code_str(err), "%s", msg);
+}
+
 static const char* csv_default_sym_path(const char* dir, char* buf, size_t bufsz) {
     int n = snprintf(buf, bufsz, "%s/.sym", dir);
     if (n < 0 || (size_t)n >= bufsz) return NULL;
@@ -719,7 +729,7 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
                                               types_arg, ncols,
                                               names_arg, ncols,
                                               dir, 0, mode);
-    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    if (err != RAY_OK) return csv_loader_error(err);
 
     char sym_path[1024];
     const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
@@ -825,7 +835,7 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         if (stat(dest, &st) != 0 && stat(staging, &st) == 0)
             return ray_error(ray_err_code_str(err), "csv.parted: import failed; partial output retained in %s",
                              staging);
-        return ray_error(ray_err_code_str(err), NULL);
+        return csv_loader_error(err);
     }
 
     ray_t* out = ray_read_parted(root, table_name);
