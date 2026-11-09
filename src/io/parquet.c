@@ -46,6 +46,10 @@
 #endif
 
 #define PQ_BATCH 65536
+/* The OPTIONAL certification prepass is admitted only when the caller's
+ * request can pull at least this many rows from the page: below that the
+ * per-value path is cheaper (measured crossover between 16384 and 32768). */
+#define PQ_CERT_MIN 16384
 #define PQ_MAX_PART_ROWS 1048576
 #define PQ_MAX_COLS 4096
 #define PQ_MAX_PAGE (64u * 1024u * 1024u)
@@ -904,7 +908,7 @@ static bool pq_optional_bulk(const pq_schema* s) {
            (s->physical == 2 && s->type == RAY_I64) ||
            (s->physical == 5 && s->type == RAY_F64);
 }
-static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
+static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t admit) {
     while (c->chunk.p < c->chunk.end) {
         pq_span f[10];
         c->page_all_present = false;
@@ -968,10 +972,14 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
         if (encoding != 0 && encoding != 2 && encoding != 8) return "unsupported value encoding (supported: plain, dictionary, RLE booleans)";
         c->encoding = (int)encoding; c->page_left = count;
         if (!encoding && c->optional && pq_optional_bulk(s)) {
-            pq_rle saved = c->defs;
-            const char* lerr = pq_levels_present(&c->defs,count,&c->page_all_present);
-            if (lerr) { c->defs = saved; return lerr; }
-            if (!c->page_all_present) c->defs = saved;
+            int64_t reach = skip ? *skip : admit;
+            if (reach > count) reach = count;
+            if (reach >= PQ_CERT_MIN) {
+                pq_rle saved = c->defs;
+                const char* lerr = pq_levels_present(&c->defs,count,&c->page_all_present);
+                if (lerr) { c->defs = saved; return lerr; }
+                if (!c->page_all_present) c->defs = saved;
+            }
         }
         if (encoding) {
             if (!c->have_dict || s->physical == 0) return "missing or invalid dictionary";
@@ -1103,7 +1111,7 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
     int64_t* ids = scratch->ids; int64_t* positions = scratch->positions;
     for (int64_t at = 0; at < rows;) {
         if (ray_interrupted()) return "scan interrupted";
-        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-at); if (err) return err; }
         int64_t n = rows-at < c->page_left ? rows-at : c->page_left, count = 0;
         if (n > 8192) n = 8192;
         for (int64_t i = 0; i < n; i++) {
@@ -1166,7 +1174,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
     if (v->type == RAY_STR) memset(ray_data(v),0,(size_t)rows*sizeof(ray_str_t));
     for (int64_t i = 0; i < rows; i++) {
         if (!(i&1023) && ray_interrupted()) return "scan interrupted";
-        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-i); if (err) return err; }
         if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
             uint32_t id = c->ids.value;
             if (id >= c->dict_count) return "dictionary index out of range";
@@ -1264,7 +1272,7 @@ static const char* pq_discard(pq_column* c, pq_schema* s, int64_t rows) {
     while (rows) {
         if (ray_interrupted()) return "scan interrupted";
         if (!c->page_left) {
-            const char* err = pq_page(c,s,&rows);
+            const char* err = pq_page(c,s,&rows,rows);
             if (err) return err;
             if (!rows) break;
         }
@@ -2941,7 +2949,7 @@ static bool pq_g_emit(pq_gtask* k, uint32_t local, int64_t run) {
 static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask* k) {
     for (int64_t at = 0; at < rows;) {
         if (ray_interrupted()) return "scan interrupted";
-        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-at); if (err) return err; }
         if (c->have_dict && !k->dmapped) {
             if (k->dcap < c->dict_count) {
                 uint32_t* m = ray_realloc_raw(k->dmap,(size_t)c->dict_count*sizeof(*k->dmap));
