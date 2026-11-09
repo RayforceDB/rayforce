@@ -31,6 +31,7 @@
 #include "ops/ops.h"    /* RAY_LAZY, ray_lazy_materialize */
 #include "ops/internal.h"
 #include "mem/heap.h"
+#include "core/numparse.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -256,19 +257,56 @@ static void fmt_u8(fmt_buf_t* b, uint8_t val) {
 }
 
 
-static void fmt_i16(fmt_buf_t* b, int16_t val) {
+static void fmt_i16(fmt_buf_t* b, int16_t val, int mode) {
     fmt_printf(b, "%d", (int)val);
+    if (mode == RAY_FMT_ROUNDTRIP) fmt_putc(b, 'h');
 }
 
-static void fmt_i32(fmt_buf_t* b, int32_t val) {
+static void fmt_i32(fmt_buf_t* b, int32_t val, int mode) {
     fmt_printf(b, "%d", (int)val);
+    if (mode == RAY_FMT_ROUNDTRIP) fmt_putc(b, 'i');
 }
 
 static void fmt_i64(fmt_buf_t* b, int64_t val) {
     fmt_printf(b, "%" PRId64, val);
 }
 
-static void fmt_f64(fmt_buf_t* b, double val) {
+static bool same_f64(double a, double b) {
+    uint64_t ua, ub;
+    memcpy(&ua, &a, sizeof ua);
+    memcpy(&ub, &b, sizeof ub);
+    return ua == ub;
+}
+
+static bool same_f32(float a, float b) {
+    uint32_t ua, ub;
+    memcpy(&ua, &a, sizeof ua);
+    memcpy(&ub, &b, sizeof ub);
+    return ua == ub;
+}
+
+static void fmt_f64(fmt_buf_t* b, double val, int mode) {
+    if (mode == RAY_FMT_ROUNDTRIP) {
+        char tmp[32];
+        int n = 0;
+        if (isfinite(val)) {
+            for (int digits = 1; digits <= 17; digits++) {
+                n = snprintf(tmp, sizeof(tmp), "%.*g", digits, val);
+                if (n <= 0 || n >= (int)sizeof(tmp)) break;
+                double parsed = 0.0;
+                if (ray_parse_f64(tmp, (size_t)n, &parsed) == (size_t)n &&
+                    same_f64(parsed, val)) break;
+            }
+        } else {
+            b->err = true;
+            b->err_msg = "cannot represent non-finite f64";
+            return;
+        }
+        if (n <= 0 || n >= (int)sizeof(tmp)) { b->err = true; b->err_msg = "cannot format f64"; return; }
+        fmt_putn(b, tmp, n);
+        if (isfinite(val) && !strchr(tmp, '.') && !strchr(tmp, 'e') && !strchr(tmp, 'E')) fmt_puts(b, ".0");
+        return;
+    }
     val = clear_neg_zero(val);
     if (val == 0.0) {
         /* Zero: format as "0.0" (after trailing-zero strip) */
@@ -309,8 +347,29 @@ static void fmt_f64(fmt_buf_t* b, double val) {
     fmt_putn(b, tmp, (int32_t)n);
 }
 
-static void fmt_f32(fmt_buf_t* b, float val) {
-    fmt_f64(b, (double)val);
+static void fmt_f32(fmt_buf_t* b, float val, int mode) {
+    if (mode == RAY_FMT_ROUNDTRIP) {
+        char tmp[32];
+        int n = 0;
+        if (isfinite(val)) {
+            for (int digits = 1; digits <= 9; digits++) {
+                n = snprintf(tmp, sizeof(tmp), "%.*g", digits, (double)val);
+                if (n <= 0 || n >= (int)sizeof(tmp)) break;
+                double parsed = 0.0;
+                if (ray_parse_f64(tmp, (size_t)n, &parsed) == (size_t)n &&
+                    same_f32((float)parsed, val)) break;
+            }
+        } else {
+            b->err = true;
+            b->err_msg = "cannot represent non-finite f32";
+            return;
+        }
+        if (n <= 0 || n >= (int)sizeof(tmp)) { b->err = true; b->err_msg = "cannot format f32"; return; }
+        fmt_putn(b, tmp, n);
+        fmt_putc(b, 'e');
+        return;
+    }
+    fmt_f64(b, (double)val, mode);
     fmt_putc(b, 'e');
 }
 
@@ -345,6 +404,23 @@ static void fmt_sym_atom(fmt_buf_t* b, ray_t* s) {
  * CELLS resolve through the column's domain via ray_sym_vec_cell. */
 static void fmt_sym(fmt_buf_t* b, int64_t sym_id) {
     fmt_sym_atom(b, ray_sym_str(sym_id));
+}
+
+static void fmt_str_quoted(fmt_buf_t* b, const char* s, size_t len, bool escape);
+
+/* A bare symbol name is an environment lookup when evaluated.  Round-trip
+ * output therefore uses the explicit string-to-SYM constructor, which also
+ * admits names that are not valid identifiers.  The empty symbol keeps its
+ * canonical quote literal. */
+static void fmt_sym_roundtrip(fmt_buf_t* b, int64_t sym_id) {
+    ray_t* s = ray_sym_str(sym_id);
+    if (!s || RAY_IS_ERR(s) || ray_str_len(s) == 0) {
+        fmt_putc(b, '\'');
+        return;
+    }
+    fmt_puts(b, "(as 'SYM ");
+    fmt_str_quoted(b, ray_str_ptr(s), ray_str_len(s), true);
+    fmt_putc(b, ')');
 }
 
 /* ===== Date/time/timestamp helpers ===== */
@@ -429,8 +505,12 @@ static void fmt_str_quoted(fmt_buf_t* b, const char* p, size_t n, bool escape) {
     fmt_putc(b, '"');
 }
 
-static void fmt_str_atom(fmt_buf_t* b, ray_t* obj, int full) {
-    fmt_str_quoted(b, ray_str_ptr(obj), ray_str_len(obj), !full);
+static bool fmt_escape_strings(int mode) {
+    return mode == RAY_FMT_COMPACT || mode == RAY_FMT_ROUNDTRIP;
+}
+
+static void fmt_str_atom(fmt_buf_t* b, ray_t* obj, int mode) {
+    fmt_str_quoted(b, ray_str_ptr(obj), ray_str_len(obj), fmt_escape_strings(mode));
 }
 
 /* ===== Forward declarations ===== */
@@ -463,7 +543,7 @@ const char* ray_fmt_null_literal(int8_t type) {
 
 /* ===== Vector element formatter ===== */
 
-static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, bool compact) {
+static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, int mode) {
     /* Check for null.  STR is the exception — a string element has no
      * distinct null (empty and null are the same value), so it renders
      * as "" via the RAY_STR case below rather than a 0Nc literal. */
@@ -476,11 +556,11 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, bool compact) {
     case RAY_BOOL:      fmt_bool(b, ((bool*)ray_data(vec))[idx]); break;
     case RAY_U8:        fmt_u8(b, ((uint8_t*)ray_data(vec))[idx]); break;
 
-    case RAY_I16:       fmt_i16(b, ((int16_t*)ray_data(vec))[idx]); break;
-    case RAY_I32:       fmt_i32(b, ((int32_t*)ray_data(vec))[idx]); break;
+    case RAY_I16:       fmt_i16(b, ((int16_t*)ray_data(vec))[idx], mode); break;
+    case RAY_I32:       fmt_i32(b, ((int32_t*)ray_data(vec))[idx], mode); break;
     case RAY_I64:       fmt_i64(b, ((int64_t*)ray_data(vec))[idx]); break;
-    case RAY_F32:       fmt_f32(b, ((float*)ray_data(vec))[idx]); break;
-    case RAY_F64:       fmt_f64(b, ((double*)ray_data(vec))[idx]); break;
+    case RAY_F32:       fmt_f32(b, ((float*)ray_data(vec))[idx], mode); break;
+    case RAY_F64:       fmt_f64(b, ((double*)ray_data(vec))[idx], mode); break;
     case RAY_DATE:      fmt_date(b, ((int32_t*)ray_data(vec))[idx]); break;
     case RAY_TIME:      fmt_time(b, ((int32_t*)ray_data(vec))[idx]); break;
     case RAY_TIMESPAN: fmt_timespan(b, ((int64_t*)ray_data(vec))[idx]); break;
@@ -492,11 +572,13 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, bool compact) {
     case RAY_STR: {
         size_t slen = 0;
         const char* p = ray_str_vec_get(vec, idx, &slen);
-        fmt_str_quoted(b, p ? p : "", p ? slen : 0, compact);
+        fmt_str_quoted(b, p ? p : "", p ? slen : 0, fmt_escape_strings(mode));
         break;
     }
     case RAY_GUID:
+        if (mode == RAY_FMT_ROUNDTRIP) fmt_puts(b, "(as 'GUID \"");
         fmt_guid(b, ((uint8_t*)ray_data(vec)) + idx * 16);
+        if (mode == RAY_FMT_ROUNDTRIP) fmt_puts(b, "\")");
         break;
     case RAY_LIST: {
         ray_t* child = ((ray_t**)ray_data(vec))[idx];
@@ -521,8 +603,34 @@ static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, bool compact) {
 
 /* ===== Vector formatter ===== */
 
-static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, bool compact) {
+static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, int mode) {
     int64_t len = ray_len(vec);
+    if (mode == RAY_FMT_ROUNDTRIP && vec->type == RAY_SYM) {
+        fmt_puts(b, "(as 'SYM (list");
+        for (int64_t i = 0; i < len; i++) {
+            ray_t* s = ray_sym_vec_cell(vec, i);
+            fmt_putc(b, ' ');
+            fmt_str_quoted(b, s ? ray_str_ptr(s) : "",
+                           s ? ray_str_len(s) : 0, true);
+        }
+        fmt_puts(b, "))");
+        return;
+    }
+    if (mode == RAY_FMT_ROUNDTRIP && vec->type == RAY_GUID) {
+        fmt_puts(b, "(as 'GUID (list");
+        for (int64_t i = 0; i < len; i++) {
+            fmt_putc(b, ' ');
+            fmt_raw_elem(b, vec, i, mode);
+        }
+        fmt_puts(b, "))");
+        return;
+    }
+    if (mode == RAY_FMT_ROUNDTRIP && len == 0) {
+        fmt_puts(b, "(as '");
+        fmt_puts(b, ray_type_name(vec->type));
+        fmt_puts(b, " [])");
+        return;
+    }
     if (len == 0) { fmt_puts(b, "[]"); return; }
 
     fmt_puts(b, "[");
@@ -532,7 +640,7 @@ static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, bool compact) {
         if (i > 0) fmt_putc(b, ' ');
 
         int32_t before = b->len;
-        fmt_raw_elem(b, vec, i, compact);
+        fmt_raw_elem(b, vec, i, mode);
 
         /* Width limiting: check if we exceeded the limit */
         if (limit > 0 && (b->len - start_len) > limit) {
@@ -573,7 +681,7 @@ static void fmt_list(fmt_buf_t* b, ray_t* list, int mode) {
      * test suite and value-equality (fmt_eq, mode 0) rely on.  REPL display
      * (mode 1) instead always uses parens, so a generic list is visually
      * distinct from a real typed vector. */
-    if (mode != 1) {
+    if (mode != RAY_FMT_REPL && mode != RAY_FMT_ROUNDTRIP) {
         ray_t** items = (ray_t**)ray_data(list);
         if (items && items[0] && !RAY_IS_ERR(items[0]) && ray_is_atom(items[0])) {
             int8_t first_type = items[0]->type;
@@ -597,12 +705,12 @@ static void fmt_list(fmt_buf_t* b, ray_t* list, int mode) {
 
     /* mode 0 = compact/round-trippable: the "(list ...)" prefix is required.
      * mode 1 = REPL display: "(...)" matching rayforce 1 output */
-    if (mode == 0)
+    if (mode == RAY_FMT_COMPACT || mode == RAY_FMT_ROUNDTRIP)
         fmt_puts(b, "(list ");
     else
         fmt_puts(b, "(");
 
-    int64_t max_elems = (mode == 1) ? FMT_LIST_MAX_HEIGHT : len;
+    int64_t max_elems = (mode == RAY_FMT_REPL) ? FMT_LIST_MAX_HEIGHT : len;
     int64_t show = len < max_elems ? len : max_elems;
 
     for (int64_t i = 0; i < show; i++) {
@@ -744,9 +852,17 @@ static void fmt_dict(fmt_buf_t* b, ray_t* dict, int mode) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     int64_t npairs = keys ? keys->len : 0;
+    if (mode == RAY_FMT_ROUNDTRIP) {
+        fmt_puts(b, "(dict ");
+        fmt_obj(b, keys, mode);
+        fmt_putc(b, ' ');
+        fmt_obj(b, vals, mode);
+        fmt_putc(b, ')');
+        return;
+    }
     if (npairs == 0) { fmt_puts(b, "{}"); return; }
 
-    int64_t max_pairs = (mode == 1) ? FMT_LIST_MAX_HEIGHT : npairs;
+    int64_t max_pairs = (mode == RAY_FMT_REPL) ? FMT_LIST_MAX_HEIGHT : npairs;
     int64_t show = npairs < max_pairs ? npairs : max_pairs;
 
     fmt_puts(b, "{");
@@ -977,11 +1093,11 @@ static void fmt_missing_cell(fmt_buf_t* b, int8_t type) {
 }
 
 /* Write row ri's cell; false when the column has no such row. */
-static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri, bool compact) {
+static bool fmt_col_write(fmt_buf_t* b, fmt_col_t* c, int64_t ri, int mode) {
     ray_t* v = NULL;
     int64_t at = 0;
     switch (fmt_col_cell(c, ri, &v, &at)) {
-    case FMT_CELL_AT:      fmt_raw_elem(b, v, at, compact); return true;
+    case FMT_CELL_AT:      fmt_raw_elem(b, v, at, mode); return true;
     case FMT_CELL_MISSING: fmt_missing_cell(b, c->type); return true;
     default:               return false;
     }
@@ -995,22 +1111,55 @@ static ray_t* fmt_col_elem(fmt_col_t* c, int64_t ri) {
     return ((ray_t**)ray_data(v))[at];
 }
 
-/* A parted column of `nrows` rows in compact mode (0), exactly as fmt_obj
- * writes the flat column: fmt_vector unlimited, or fmt_list for LIST. */
-static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows) {
+/* A parted column of `nrows` rows in an unlimited structural mode, exactly
+ * as fmt_obj writes the flat column: fmt_vector, or fmt_list for LIST. */
+static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows, int mode) {
+    if (mode == RAY_FMT_ROUNDTRIP && c->type == RAY_SYM) {
+        fmt_puts(b, "(as 'SYM (list");
+        for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+            ray_t* v = NULL;
+            int64_t at = 0;
+            ray_t* s = fmt_col_cell(c, ri, &v, &at) == FMT_CELL_AT
+                ? ray_sym_vec_cell(v, at) : NULL;
+            fmt_putc(b, ' ');
+            fmt_str_quoted(b, s ? ray_str_ptr(s) : "",
+                           s ? ray_str_len(s) : 0, true);
+        }
+        fmt_puts(b, "))");
+        return;
+    }
+    /* Match fmt_vector's round-trippable representation exactly.  GUID
+     * vectors cannot use the generic [...] spelling because that loses the
+     * vector type when the value is parsed again. */
+    if (mode == RAY_FMT_ROUNDTRIP && c->type == RAY_GUID) {
+        fmt_puts(b, "(as 'GUID (list");
+        for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
+            fmt_putc(b, ' ');
+            if (!fmt_col_write(b, c, ri, mode)) fmt_missing_cell(b, c->type);
+        }
+        fmt_puts(b, "))");
+        return;
+    }
+    if (mode == RAY_FMT_ROUNDTRIP && c->type != RAY_LIST && nrows == 0) {
+        fmt_puts(b, "(as '");
+        fmt_puts(b, ray_type_name(c->type));
+        fmt_puts(b, " [])");
+        return;
+    }
     if (c->type != RAY_LIST) {
         if (nrows == 0) { fmt_puts(b, "[]"); return; }
         fmt_putc(b, '[');
         for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
             if (ri > 0) fmt_putc(b, ' ');
-            if (!fmt_col_write(b, c, ri, true)) fmt_missing_cell(b, c->type);
+            if (!fmt_col_write(b, c, ri, mode)) fmt_missing_cell(b, c->type);
         }
         fmt_putc(b, ']');
         return;
     }
     if (nrows == 0) { fmt_puts(b, "()"); return; }
     ray_t* first = fmt_col_elem(c, 0);
-    bool homogeneous = first && !RAY_IS_ERR(first) && ray_is_atom(first);
+    bool homogeneous = mode != RAY_FMT_ROUNDTRIP && first &&
+                       !RAY_IS_ERR(first) && ray_is_atom(first);
     for (int64_t ri = 1; homogeneous && ri < nrows; ri++) {
         ray_t* e = fmt_col_elem(c, ri);
         if (!e || RAY_IS_ERR(e) || e->type != first->type) homogeneous = false;
@@ -1018,7 +1167,7 @@ static void fmt_col_compact(fmt_buf_t* b, fmt_col_t* c, int64_t nrows) {
     fmt_puts(b, homogeneous ? "[" : "(list ");
     for (int64_t ri = 0; ri < nrows && !b->err; ri++) {
         if (ri > 0) fmt_putc(b, ' ');
-        fmt_obj(b, fmt_col_elem(c, ri), 0);
+        fmt_obj(b, fmt_col_elem(c, ri), mode);
     }
     fmt_putc(b, homogeneous ? ']' : ')');
 }
@@ -1040,7 +1189,7 @@ typedef struct {
 static void fmt_stream_cell(fmt_buf_t* tmp, fmt_col_t* col, int64_t ri,
                             const char** s, int32_t* len) {
     tmp->len = 0;
-    if (!fmt_col_write(tmp, col, ri, false)) { *s = "NA"; *len = 2; return; }
+    if (!fmt_col_write(tmp, col, ri, RAY_FMT_SHOW)) { *s = "NA"; *len = 2; return; }
     *s = tmp->buf;
     *len = tmp->len;   /* whole cell: tmp grows, unlike the REPL's fixed grid */
 }
@@ -1217,19 +1366,27 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
 
     ray_t* part_counts = fmt_part_counts(tbl);   /* NULL unless parted */
 
-    /* Compact mode: round-trippable (table [names] (list col1 col2 ...)) */
-    if (mode == 0) {
-        fmt_puts(b, "(table [");
+    /* Structural modes: (table [names] (list col1 col2 ...)). */
+    if (mode == RAY_FMT_COMPACT || mode == RAY_FMT_ROUNDTRIP) {
+        fmt_puts(b, mode == RAY_FMT_ROUNDTRIP
+                        ? "(table (as 'SYM (list"
+                        : "(table [");
         for (int64_t i = 0; i < ncols; i++) {
-            if (i > 0) fmt_putc(b, ' ');
+            if (mode != RAY_FMT_ROUNDTRIP && i > 0) fmt_putc(b, ' ');
             int64_t name_id = ray_table_col_name(tbl, i);
             ray_t* name_str = ray_sym_str(name_id);
-            if (name_str && !RAY_IS_ERR(name_str)) {
+            if (mode == RAY_FMT_ROUNDTRIP) {
+                fmt_putc(b, ' ');
+                fmt_str_quoted(b,
+                               name_str && !RAY_IS_ERR(name_str) ? ray_str_ptr(name_str) : "",
+                               name_str && !RAY_IS_ERR(name_str) ? ray_str_len(name_str) : 0,
+                               true);
+            } else if (name_str && !RAY_IS_ERR(name_str)) {
                 fmt_putn(b, ray_str_ptr(name_str), (int64_t)ray_str_len(name_str));
-                ray_release(name_str);
             }
+            if (name_str && !RAY_IS_ERR(name_str)) ray_release(name_str);
         }
-        fmt_puts(b, "] (list ");
+        fmt_puts(b, mode == RAY_FMT_ROUNDTRIP ? ")) (list " : "] (list ");
         for (int64_t i = 0; i < ncols; i++) {
             if (i > 0) fmt_putc(b, ' ');
             ray_t* col = fmt_col_idx(b, tbl, i);
@@ -1237,7 +1394,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             if (fmt_col_is_parted(col)) {
                 fmt_col_t cur;
                 fmt_col_init(&cur, col, part_counts);
-                fmt_col_compact(b, &cur, nrows);
+                fmt_col_compact(b, &cur, nrows, mode);
             } else if (col) {
                 fmt_obj(b, col, mode);
             }
@@ -1247,11 +1404,11 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
     }
 
     /* Full mode (1) and show mode (2) */
-    if (mode == 2 && b->sink) { fmt_table_stream(b, tbl); return; }
+    if (mode == RAY_FMT_SHOW && b->sink) { fmt_table_stream(b, tbl); return; }
     int64_t table_width  = ncols;
     int64_t table_height = nrows;
 
-    if (mode == 1) {
+    if (mode == RAY_FMT_REPL) {
         if (table_width > FMT_TABLE_MAX_WIDTH)
             table_width = FMT_TABLE_MAX_WIDTH;
         if (table_height > FMT_TABLE_MAX_HEIGHT)
@@ -1379,7 +1536,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
             fmt_buf_t tmp;
             fmt_init(&tmp);
-            if (ri < col_len && fmt_col_write(&tmp, &cur, ri, false)) {
+            if (ri < col_len && fmt_col_write(&tmp, &cur, ri, RAY_FMT_SHOW)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
@@ -1404,7 +1561,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             }
             fmt_buf_t tmp;
             fmt_init(&tmp);
-            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx, false)) {
+            if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx, RAY_FMT_SHOW)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
                 cell->str[clen] = '\0';
@@ -1587,6 +1744,11 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
 static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
     if (!obj || RAY_IS_NULL(obj)) { fmt_puts(b, "null"); return; } /* keep !obj: ray_fmt(NULL) is a public entry point, receives genuine-absence C NULL, not a value; also renders list/dict elements, which may be C NULL */
     if (RAY_IS_ERR(obj)) {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support error values";
+            return;
+        }
         char code[8] = {0};
         memcpy(code, obj->sdata, obj->slen < 7 ? obj->slen : 7);
         fmt_puts(b, "error: ");
@@ -1607,23 +1769,30 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         case RAY_BOOL: fmt_bool(b, obj->b8); break;
         case RAY_U8:   fmt_u8(b, obj->u8); break;
 
-        case RAY_I16:  fmt_i16(b, obj->i16); break;
-        case RAY_I32:  fmt_i32(b, obj->i32); break;
+        case RAY_I16:  fmt_i16(b, obj->i16, mode); break;
+        case RAY_I32:  fmt_i32(b, obj->i32, mode); break;
         case RAY_I64:  fmt_i64(b, obj->i64); break;
-        case RAY_F32:       fmt_f32(b, (float)obj->f64); break;
-        case RAY_F64:       fmt_f64(b, obj->f64); break;
+        case RAY_F32:       fmt_f32(b, (float)obj->f64, mode); break;
+        case RAY_F64:       fmt_f64(b, obj->f64, mode); break;
         case RAY_DATE:      fmt_date(b, obj->i32); break;
         case RAY_TIME:      fmt_time(b, obj->i32); break;
         case RAY_TIMESPAN: fmt_timespan(b, obj->i64); break;
         case RAY_TIMESTAMP: fmt_timestamp(b, obj->i64); break;
-        case RAY_SYM:  fmt_sym(b, obj->i64); break;
-        case RAY_STR:  fmt_str_atom(b, obj, mode > 0); break;
-        case RAY_GUID: fmt_guid(b, obj->obj ? (const uint8_t*)ray_data(obj->obj) : (const uint8_t*)ray_data(obj)); break;
+        case RAY_SYM:
+            if (mode == RAY_FMT_ROUNDTRIP) fmt_sym_roundtrip(b, obj->i64);
+            else fmt_sym(b, obj->i64);
+            break;
+        case RAY_STR:  fmt_str_atom(b, obj, mode); break;
+        case RAY_GUID:
+            if (mode == RAY_FMT_ROUNDTRIP) fmt_puts(b, "(as 'GUID \"");
+            fmt_guid(b, obj->obj ? (const uint8_t*)ray_data(obj->obj) : (const uint8_t*)ray_data(obj));
+            if (mode == RAY_FMT_ROUNDTRIP) fmt_puts(b, "\")");
+            break;
         default:       fmt_puts(b, "?"); break;
         }
     } else if (ray_is_vec(obj)) {
-        int limit = (mode == 1) ? g_row_width : -1;
-        fmt_vector(b, obj, limit, mode == 0);
+        int limit = (mode == RAY_FMT_REPL) ? g_row_width : -1;
+        fmt_vector(b, obj, limit, mode);
     } else if (type == RAY_LIST) {
         fmt_list(b, obj, mode);
     } else if (type == RAY_TABLE) {
@@ -1631,8 +1800,18 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
     } else if (type == RAY_DICT) {
         fmt_dict(b, obj, mode);
     } else if (type == RAY_LAMBDA) {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support callable values";
+            return;
+        }
         fmt_puts(b, "lambda");
     } else if (type == RAY_UNARY || type == RAY_BINARY || type == RAY_VARY) {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support callable values";
+            return;
+        }
         /* Render function objects with angle brackets so a fn is
          * visually distinct from a sym or string.  Without them,
          * `.os` printed as `{getenv:.os.getenv …}` — looked like
@@ -1652,6 +1831,11 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         if (concrete) ray_release(concrete);
         return;
     } else {
+        if (mode == RAY_FMT_ROUNDTRIP) {
+            b->err = true;
+            b->err_msg = "repr does not support this value type";
+            return;
+        }
         fmt_printf(b, "<%s>", ray_type_name(type));
     }
 }

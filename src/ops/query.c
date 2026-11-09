@@ -3981,8 +3981,16 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
     return columns != 0;
 }
 
+/* Is `fn`, the current binding of a head symbol, the builtin unary `native`
+ * (or no binding at all)?  A name can be rebound to another native, so the
+ * object type alone does not identify the verb: compare its callback. */
+static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
+    return !fn || (fn->type == RAY_UNARY &&
+                   (ray_unary_fn)(uintptr_t)fn->i64 == native);
+}
+
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * collection builtin (distinct, asc, desc, reverse, where, enlist) that
+ * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
  * has no bucket for these — they are neither element-wise ops nor
  * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
@@ -4056,7 +4064,15 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
            (l == 5 && memcmp(p, "where", 5) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
-           (l == 4 && memcmp(p, "desc", 4) == 0);
+           (l == 4 && memcmp(p, "desc", 4) == 0) ||
+           /* grade/rank: only while the name is still the builtin, so a
+            * rebound `rank` keeps its per-row projection semantics. */
+           (l == 4 && memcmp(p, "iasc", 4) == 0 &&
+            head_is_builtin_unary(fn, ray_iasc_fn)) ||
+           (l == 5 && memcmp(p, "idesc", 5) == 0 &&
+            head_is_builtin_unary(fn, ray_idesc_fn)) ||
+           (l == 4 && memcmp(p, "rank", 4) == 0 &&
+            head_is_builtin_unary(fn, ray_rank_fn));
 }
 
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
@@ -24454,8 +24470,9 @@ by_dict_done:
                 col->len = n_groups;
                 int64_t* out = (int64_t*)ray_data(col);
                 int64_t bias = dep_key_biases[dk];
+                /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
                 for (int64_t i = 0; i < n_groups; i++)
-                    out[i] = key_col_read_i64(base_col, i) + bias;
+                    out[i] = (int64_t)((uint64_t)key_col_read_i64(base_col, i) + (uint64_t)bias);
                 result = ray_table_add_col(result, dep_key_names[dk], col);
                 ray_release(col);
                 if (RAY_IS_ERR(result)) {
@@ -28729,6 +28746,7 @@ static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
     case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
                         ok = is_int; break;
     case RAY_F64:       ok = (at == -RAY_F64 || is_int); break;
+    case RAY_F32:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_DATE:      ok = (at == -RAY_DATE); break;
     case RAY_TIME:      ok = (at == -RAY_TIME); break;
     case RAY_TIMESTAMP: ok = (at == -RAY_TIMESTAMP); break;
@@ -29794,6 +29812,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(ka_t));
         }
+        if (kt == RAY_GUID && key_atom->type != -RAY_GUID) {
+            int8_t ka_t = key_atom->type;            /* capture BEFORE free */
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return ray_error("type", "upsert: key column is guid but key value is %s", ray_type_name(ka_t));
+        }
         key_sym_want[k] = -1;
         if (kt == RAY_SYM) {
             if (ray_sym_vec_domain(key_col) == ray_sym_runtime_domain()) {
@@ -29828,15 +29852,17 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 size_t rl = 0;
                 const char* rs = ray_str_vec_get(key_col, r, &rl);
                 if (rl != nl || (nl > 0 && (!rs || !ns || memcmp(rs, ns, nl) != 0))) match = 0;
+            } else if (kt == RAY_F32) {
+                /* by value, the atom narrowed as the payload is; NaN (a null
+                 * key) never matches, like an F64 key */
+                float needle = (float)as_f64(key_atom);
+                if (((const float*)ray_data(key_col))[r] != needle) match = 0;
+            } else if (kt == RAY_GUID) {
+                if (!upsert_cell_eq_atom(key_col, r, key_atom)) match = 0;
             } else {
-                int64_t needle = elem_as_i64(key_atom);
-                int64_t existing = (kt == RAY_I64 || kt == RAY_TIMESTAMP) ?
-                    ((int64_t*)ray_data(key_col))[r] :
-                    (kt == RAY_I32 || kt == RAY_DATE || kt == RAY_TIME) ?
-                    (int64_t)((int32_t*)ray_data(key_col))[r] :
-                    (kt == RAY_BOOL) ? (int64_t)((uint8_t*)ray_data(key_col))[r] :
-                    ((int64_t*)ray_data(key_col))[r];
-                if (existing != needle) match = 0;
+                /* integer family through its storage width: a 1/2/4-byte
+                 * cell read as int64 would match its neighbours' bytes */
+                if (upsert_int_cell(key_col, r) != upsert_atom_int(key_atom)) match = 0;
             }
         }
         if (match) { match_row = r; break; }
