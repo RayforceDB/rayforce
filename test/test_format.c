@@ -1746,7 +1746,7 @@ static test_result_t test_fmt_pp_scalar_passthrough(void) {
 static test_result_t test_fmt_times_binding(void) {
     ray_t* q = ray_eval_str("(quote (times [i 3] (set r (+ r i))))");
     TEST_ASSERT_FALSE(!q || RAY_IS_ERR(q));
-    for (int mode = 0; mode <= 2; mode++) {
+    for (int mode = RAY_FMT_COMPACT; mode <= RAY_FMT_SHOW; mode++) {
         ray_t* s = ray_fmt(q, mode);
         TEST_ASSERT_FALSE(!s || RAY_IS_ERR(s));
         TEST_ASSERT_NOT_NULL(strstr(ray_str_ptr(s), "[i 3]"));
@@ -1783,7 +1783,8 @@ static size_t fmt_write_to_buf(ray_t* obj, char* buf, size_t cap) {
 static test_result_t test_fmt_table_parted(void) {
     ray_t* r = ray_eval_str(ray_test_tmp(
         "(do (.sys.exec \"rm -rf /tmp/rfl_fmt_parted\")"
-        " (set T (table [i s t] (list (til 10) (take ['a 'b 'c] 10) (as 'STR (til 10)))))"
+        " (set g (as 'GUID \"01234567-89ab-cdef-0123-456789abcdef\"))"
+        " (set T (table [i s t g gl] (list (til 10) (take ['a 'b 'c] 10) (as 'STR (til 10)) (take g 10) (take (list g) 10))))"
         " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.01/t/\" T)"
         " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.02/t/\" (update {i: (+ i 10) from: T}))"
         " (.db.splayed.set \"/tmp/rfl_fmt_parted/2024.01.03/t/\" (update {i: (+ i 20) from: T}))"
@@ -1796,7 +1797,7 @@ static test_result_t test_fmt_table_parted(void) {
         "(select {from: (.db.parted.get \"/tmp/rfl_fmt_parted/\" 't) where: (>= i 0)})"));
     TEST_ASSERT_FALSE(!flat || RAY_IS_ERR(flat));
 
-    for (int mode = 0; mode <= 2; mode++) {
+    for (int mode = RAY_FMT_COMPACT; mode <= RAY_FMT_ROUNDTRIP; mode++) {
         ray_t* fp = ray_fmt(parted, mode);
         ray_t* ff = ray_fmt(flat, mode);
         TEST_ASSERT_FALSE(!fp || RAY_IS_ERR(fp));
@@ -1935,6 +1936,26 @@ static test_result_t test_lang_print_nulls(void) {
     PASS();
 }
 
+static test_result_t test_lang_print_values(void) {
+    static const uint8_t guid[16] = {
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    };
+    char buf[96];
+    ray_t* g = ray_guid(guid);
+    TEST_ASSERT_FALSE(!g || RAY_IS_ERR(g));
+    TEST_ASSERT_TRUE(lang_print_to_buf(g, buf, sizeof(buf)) > 0);
+    TEST_ASSERT_STR_EQ(buf, "01234567-89ab-cdef-0123-456789abcdef");
+    ray_release(g);
+
+    ray_t* i = ray_i32(5);
+    TEST_ASSERT_FALSE(!i || RAY_IS_ERR(i));
+    TEST_ASSERT_TRUE(lang_print_to_buf(i, buf, sizeof(buf)) > 0);
+    TEST_ASSERT_STR_EQ(buf, "5");
+    ray_release(i);
+    PASS();
+}
+
 static test_result_t test_fmt_table_parted_ragged(void) {
     test_result_t res = fmt_ragged_case(2);
     if (res.status != TEST_PASS) return res;
@@ -2054,5 +2075,6 @@ const test_entry_t format_entries[] = {
     { "format/table/parted", test_fmt_table_parted, fmt_setup_full, fmt_teardown_full },
     { "format/table/parted_ragged", test_fmt_table_parted_ragged, fmt_setup_full, fmt_teardown_full },
     { "format/lang_print/nulls", test_lang_print_nulls, fmt_setup_full, fmt_teardown_full },
+    { "format/lang_print/values", test_lang_print_values, fmt_setup_full, fmt_teardown_full },
     { NULL, NULL, NULL, NULL },
 };
