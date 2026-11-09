@@ -854,10 +854,12 @@ static test_result_t test_pq_optional_bulk(void) {
     TEST_ASSERT_NULL(ray_parquet_open(path,NULL,20000,&r));
 #if defined(DEBUG)
     ray_parquet_test_cert_interrupt_after(0);
-    TEST_ASSERT_TRUE(ray_parquet_test_cert_levels() >= 20000);
 #endif
     ray_t* t = ray_parquet_next(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_NOT_NULL(t);
+#if defined(DEBUG)
+    TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(), 20000);
+#endif
     for (int c = 0; c < 3; c++) {
         ray_t* v = ray_table_get_col_idx(t,c);
         TEST_ASSERT_TRUE(ray_vec_is_null(v,0));
