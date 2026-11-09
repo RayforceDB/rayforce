@@ -859,12 +859,12 @@ ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a) {
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_PROD, a, (a->out_type == RAY_F64 || a->out_type == RAY_F32) ? RAY_F64 : RAY_I64); }
 ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ALL, a, RAY_BOOL); }
 ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ANY, a, RAY_BOOL); }
-ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MIN, a, a->out_type == RAY_F32 ? RAY_F64 : a->out_type); }
-ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MAX, a, a->out_type == RAY_F32 ? RAY_F64 : a->out_type); }
+ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MIN, a, a->out_type); }
+ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MAX, a, a->out_type); }
 ray_op_t* ray_count(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_COUNT, a, RAY_I64); }
-ray_op_t* ray_avg(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_AVG, a, RAY_F64); }
-ray_op_t* ray_first(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_FIRST, a, a->out_type == RAY_F32 ? RAY_F64 : a->out_type); }
-ray_op_t* ray_last(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_LAST, a, a->out_type == RAY_F32 ? RAY_F64 : a->out_type); }
+ray_op_t* ray_avg(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_AVG, a, mean_out_type(a->out_type)); }
+ray_op_t* ray_first(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_FIRST, a, a->out_type); }
+ray_op_t* ray_last(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_LAST, a, a->out_type); }
 ray_op_t* ray_count_distinct(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_COUNT_DISTINCT, a, RAY_I64); }
 ray_op_t* ray_distinct_op(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_DISTINCT, a, a->out_type); }
 ray_op_t* ray_asc_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, OP_ASC, a, a->out_type); }
@@ -874,22 +874,22 @@ ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, O
 ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_LEAD, a, a->out_type); }
 ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a) {
     int8_t t = a->out_type;
-    return make_unary(g, OP_DELTAS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
+    return make_unary(g, OP_DELTAS, a, deltas_out_type(t));
 }
 ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_RATIOS, a, RAY_F64); }
 ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_FILLS, a, a->out_type); }
 ray_op_t* ray_sums_op(ray_graph_t* g, ray_op_t* a) {
     int8_t t = a->out_type;
-    return make_unary(g, OP_SUMS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
+    return make_unary(g, OP_SUMS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t));
 }
-ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_AVGS, a, RAY_F64); }
+ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_AVGS, a, mean_out_type(a->out_type)); }
 ray_op_t* ray_mins_op(ray_graph_t* g, ray_op_t* a) {
     int8_t t = a->out_type;
-    return make_unary(g, OP_MINS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t);
+    return make_unary(g, OP_MINS, a, t);
 }
 ray_op_t* ray_maxs_op(ray_graph_t* g, ray_op_t* a) {
     int8_t t = a->out_type;
-    return make_unary(g, OP_MAXS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t);
+    return make_unary(g, OP_MAXS, a, t);
 }
 ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a) {
     int8_t t = a->out_type;
@@ -898,18 +898,18 @@ ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a) {
 ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_DIFFER, a, RAY_BOOL); }
 ray_op_t* ray_msum_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     int8_t t = a->out_type;
-    return make_unary_param(g, OP_MSUM, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64, window);
+    return make_unary_param(g, OP_MSUM, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t), window);
 }
 ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
-    return make_unary_param(g, OP_MAVG, a, RAY_F64, window);
+    return make_unary_param(g, OP_MAVG, a, mean_out_type(a->out_type), window);
 }
 ray_op_t* ray_mmin_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     int8_t t = a->out_type;
-    return make_unary_param(g, OP_MMIN, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t, window);
+    return make_unary_param(g, OP_MMIN, a, t, window);
 }
 ray_op_t* ray_mmax_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     int8_t t = a->out_type;
-    return make_unary_param(g, OP_MMAX, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t, window);
+    return make_unary_param(g, OP_MMAX, a, t, window);
 }
 ray_op_t* ray_mcount_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     return make_unary_param(g, OP_MCOUNT, a, RAY_I64, window);
@@ -918,10 +918,10 @@ ray_op_t* ray_mvar_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
     return make_unary_param(g, OP_MVAR, a, RAY_F64, window);
 }
 ray_op_t* ray_mdev_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
-    return make_unary_param(g, OP_MDEV, a, RAY_F64, window);
+    return make_unary_param(g, OP_MDEV, a, mean_out_type(a->out_type), window);
 }
-ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, RAY_F64); }
-ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, RAY_F64); }
+ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, mean_out_type(a->out_type)); }
+ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, mean_out_type(a->out_type)); }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
 ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_VAR_POP, a, RAY_F64); }
 
@@ -2082,7 +2082,7 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
             out_type = RAY_F64; break;
         case OP_MINS:
         case OP_MAXS:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : prev->out_type;
+            out_type = prev->out_type;
             break;
         case OP_DIFFER:
             out_type = RAY_BOOL; break;
@@ -2122,7 +2122,7 @@ ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
             break;
         case OP_MMIN:
         case OP_MMAX:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : prev->out_type;
+            out_type = prev->out_type;
             break;
         default:
             out_type = prev->out_type; break;

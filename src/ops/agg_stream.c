@@ -342,6 +342,12 @@ static const agg_vtable_t MAX_F64 = {
     .merge = max_f64_merge, .finalize = ext_f64_final, .finalize_value = ext_f64_final_value,
 };
 
+static float ext_f32_final_result(const void* s) {
+    const ext_f64_state* st = s;
+    return st->cnt ? ray_f64_to_f32_fin(st->v) : NULL_F32;
+}
+AGG_SCALAR_FINAL(ext_f32_final, float, ray_f32, value != value)
+
 /* ---- avg, F64 -------------------------------------------------------- */
 typedef struct { double sum; int64_t cnt; } avg_f64_state;
 static void avg_f64_init(void* s) { ((avg_f64_state*)s)->sum = 0.0; ((avg_f64_state*)s)->cnt = 0; }
@@ -1353,9 +1359,9 @@ static void min_f32_native_update(void* base, size_t stride, const uint32_t* gid
 }
 
 static const agg_vtable_t MIN_F32_NATIVE = {
-    .state_size = sizeof(ext_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .state_size = sizeof(ext_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F32,
     .init = min_f64_init, .update_batch = min_f32_native_update,
-    .merge = min_f64_merge, .finalize = ext_f64_final, .finalize_value = ext_f64_final_value,
+    .merge = min_f64_merge, .finalize = ext_f32_final, .finalize_value = ext_f32_final_value,
 };
 
 static void max_f32_native_update(void* base, size_t stride, const uint32_t* gids,
@@ -1370,9 +1376,9 @@ static void max_f32_native_update(void* base, size_t stride, const uint32_t* gid
 }
 
 static const agg_vtable_t MAX_F32_NATIVE = {
-    .state_size = sizeof(ext_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .state_size = sizeof(ext_f64_state), .kind = ACC_STREAMING, .out_type = RAY_F32,
     .init = max_f64_init, .update_batch = max_f32_native_update,
-    .merge = max_f64_merge, .finalize = ext_f64_final, .finalize_value = ext_f64_final_value,
+    .merge = max_f64_merge, .finalize = ext_f32_final, .finalize_value = ext_f32_final_value,
 };
 
 static void avg_f32_native_update(void* base, size_t stride, const uint32_t* gids,
