@@ -143,7 +143,7 @@ void ray_lang_print(FILE* fp, ray_t* val) {
          * vector types (I16/I32/F64/SYM/...), DICT, GUID, temporal, etc.
          * Without this println on (println 5i) printed "<type:-4>" — a
          * debug placeholder, not the value. */
-        ray_t* s = ray_fmt(val, 0);
+        ray_t* s = ray_fmt(val, RAY_FMT_COMPACT);
         if (s && !RAY_IS_ERR(s)) {
             fprintf(fp, "%.*s", (int)ray_str_len(s), ray_str_ptr(s));
             ray_release(s);
@@ -227,7 +227,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 tlen = snprintf(tmp, sizeof(tmp), "'?");
             } else {
                 /* Fall back to ray_fmt */
-                ray_t* formatted = ray_fmt(a, 0);
+                ray_t* formatted = ray_fmt(a, RAY_FMT_COMPACT);
                 if (formatted && !RAY_IS_ERR(formatted)) {
                     const char* sp = ray_str_ptr(formatted);
                     size_t sl = ray_str_len(formatted);
@@ -379,6 +379,11 @@ ray_t* ray_format_fn(ray_t** args, int64_t n) {
     /* No placeholders: return fmt as-is */
     ray_retain(args[0]);
     return args[0];
+}
+
+/* (repr value) — source text that parses back to the same value. */
+ray_t* ray_repr_fn(ray_t* value) {
+    return ray_fmt(value, RAY_FMT_ROUNDTRIP);
 }
 
 /* (resolve 'name) — check if name exists in env, return value or null.
@@ -1426,7 +1431,7 @@ ray_t* cast_str_atom(ray_t* val) {
     }
     /* Fallback: use ray_fmt for any other atom type */
     if (ray_is_atom(val)) {
-        ray_t* formatted = ray_fmt(val, 0);
+        ray_t* formatted = ray_fmt(val, RAY_FMT_COMPACT);
         if (formatted && !RAY_IS_ERR(formatted)) return formatted;
         if (formatted) ray_release(formatted);
     }
@@ -1787,7 +1792,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Temporal/guid atom -> symbol: use ray_fmt for formatting */
         if (ray_is_atom(val) && (is_temporal(val) || val->type == -RAY_GUID)) {
-            ray_t* formatted = ray_fmt(val, 0);
+            ray_t* formatted = ray_fmt(val, RAY_FMT_COMPACT);
             if (formatted && !RAY_IS_ERR(formatted)) {
                 const char* sp = ray_str_ptr(formatted);
                 size_t slen = ray_str_len(formatted);
