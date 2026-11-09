@@ -1,0 +1,48 @@
+;; A generation-0 splayed save keeps UNIQUE on a SYM hash index.  The index
+;; is rebuilt over the file-local column (ids differ from the runtime ids),
+;; and that rebuild used to start a fresh root: the reloaded column came back
+;; grouped but no longer unique.  Answers are checked against the saved
+;; column, with the global symbol domain polluted first so file-local and
+;; runtime ids differ.
+(.sys.exec "rm -rf /tmp/rfl_sym_uniq_persist")
+(set junk ['z0 'z1 'z2 'z3 'z4 'z5 'z6 'z7 'z8 'z9 'p 'q 'r 's 't 'u 'w 'x 'y])
+
+(set U (.attr.set 'grouped (.attr.set 'unique (as 'SYM (map (fn [i] (as 'SYM (as 'STR i))) (til 600))))))
+(set N (.attr.set 'grouped (take ['a 'b 'c 'd] 600)))
+(set T (table [u n v] (list U N (til 600))))
+(.attr.get (at T 'u)) -- '[unique grouped]
+(.attr.get (at T 'n)) -- '[grouped]
+
+;; per-column symfiles (default) and a shared symfile
+(.db.splayed.set "/tmp/rfl_sym_uniq_persist/a/" T {compress: false})
+(.db.splayed.set "/tmp/rfl_sym_uniq_persist/b/" T "/tmp/rfl_sym_uniq_persist/b.sym" {compress: false})
+(set A (.db.splayed.get "/tmp/rfl_sym_uniq_persist/a/"))
+(set B (.db.splayed.get "/tmp/rfl_sym_uniq_persist/b/" "/tmp/rfl_sym_uniq_persist/b.sym"))
+
+;; UNIQUE kept, kind kept
+(.attr.get (at A 'u)) -- '[unique grouped]
+(.attr.get (at B 'u)) -- '[unique grouped]
+(at (.idx.info (at A 'u)) 'kind) -- 'hash
+(at (.idx.info (at B 'u)) 'kind) -- 'hash
+
+;; a non-unique column does not become unique
+(.attr.get (at A 'n)) -- '[grouped]
+(.attr.get (at B 'n)) -- '[grouped]
+
+;; answers through the reloaded index: hits, and a symbol never saved
+(sum (at (select {from: A where: (== u '300)}) 'v)) -- 300
+(sum (at (select {from: A where: (== u '599)}) 'v)) -- 599
+(count (at (select {from: A where: (== u 'nosuch)}) 'v)) -- 0
+(sum (at (select {from: B where: (== u '300)}) 'v)) -- 300
+(count (at (select {from: B where: (== u 'nosuch)}) 'v)) -- 0
+(sum (at (select {from: A where: (in u ['7 '8 'nosuch])}) 'v)) -- 15
+(count (at (select {from: A where: (== n 'a)}) 'v)) -- 150
+(count (at (select {from: A where: (== n 'z)}) 'v)) -- 0
+(at (at A 'u) 300) -- '300
+(find (at A 'u) ['300 'nosuch '0]) -- [300 0N 0]
+
+;; control: a generation-2 save already recorded it in the file header
+(.db.splayed.set "/tmp/rfl_sym_uniq_persist/c/" T {compress: true})
+(set C (.db.splayed.get "/tmp/rfl_sym_uniq_persist/c/"))
+(.attr.get (at C 'u)) -- '[unique grouped]
+(.attr.get (at C 'n)) -- '[grouped]

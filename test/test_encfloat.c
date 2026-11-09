@@ -1667,8 +1667,14 @@ static test_result_t test_part_zero_sign(void) {
     PASS();
 }
 
-/* The P5 exit gate: every shape x length x forced encoding x width, NaN
- * payloads and both zeros included, saved and loaded bit-exact. */
+/* The P5 exit gate: every shape x forced encoding x width at every vector
+ * edge (0, 1, 1023..1025) and across the chunk edge (65537: a full chunk 0
+ * and a one-row chunk 1), NaN payloads and both zeros included, saved and
+ * loaded bit-exact.  The two in-chunk edges 65535 (a short last vector) and
+ * 65536 (exactly one chunk) take half the shapes each, alternating with the
+ * width, so every (shape, width) still meets one of them under every
+ * encoding: a full product there repeats the same codec bodies over 64 Ki
+ * rows and was most of this test's time. */
 static void sweep_fill(int shape, int8_t type, int64_t n, void* out) {
     uint64_t s = 0x9E3779B97F4A7C15ull + (uint64_t)shape;
     for (int64_t i = 0; i < n; i++) {
@@ -1705,6 +1711,7 @@ static test_result_t test_sweep_bit_exact(void) {
     for (size_t t = 0; t < 2; t++)
         for (int shape = 0; shape < 6; shape++)
             for (size_t l = 0; l < sizeof lens / sizeof lens[0]; l++) {
+                if ((lens[l] == 65535 || lens[l] == 65536) && (size_t)(shape + t + (lens[l] & 1)) % 2) continue;
                 fl_vec = ray_vec_new(types[t], lens[l]); fl_vec->len = lens[l];
                 sweep_fill(shape, types[t], lens[l], ray_data(fl_vec));
                 fl_vec->attrs |= RAY_ATTR_HAS_NULLS;
@@ -1715,7 +1722,7 @@ static test_result_t test_sweep_bit_exact(void) {
                 }
                 fl_drop();
             }
-    TEST_ASSERT_EQ_I(runs, 2 * 6 * 8 * 5);
+    TEST_ASSERT_EQ_I(runs, 2 * 6 * (6 + 1) * 5);                 /* 65535 / 65536: half the shapes each */
     PASS();
 }
 
