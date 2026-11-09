@@ -1798,7 +1798,7 @@ ray_err_t ray_obj_save(ray_t* obj, const char* path) {
         return RAY_ERR_IO;
     }
 #ifndef RAY_OS_WINDOWS
-    if (fsync(fileno(f)) != 0) {
+    if (ray_fsync_fd(fileno(f)) != 0) {
         fclose(f); ray_release(bytes);
         if (owned) ray_release(obj);
         return RAY_ERR_IO;

@@ -25,7 +25,7 @@
 ;; helper is a python3 script (as parquet_writer_shapes.rfl uses one).
 
 (.sys.exec "pkill -KILL -f '[r]ayforce -p 19987' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_pid")
+(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_held.go /tmp/rftest_xport_pid")
 (.sys.exec "printf '%s\\n' '(set n 0)' '(set .ipc.on.open (fn [h] (.ipc.post h \"(pong 0)\")))' '(set ping (fn [k] (do (set n k) (if (< k 400) (.ipc.post (.ipc.handle) (format \"(pong %)\" (+ k 1)))) k)))' > /tmp/rftest_xport_edges.rfl")
 
 (.sys.exec "./rayforce -p 19987 /tmp/rftest_xport_edges.rfl </dev/null >/dev/null 2>&1 & echo $! > /tmp/rftest_xport_pid")
@@ -54,7 +54,7 @@ m -- 400
 ;; ── the side channel says no ────────────────────────────────────────
 ;; A helper holds every slot of the server's side channel; the next
 ;; client is turned away there, after the offer, and stays on TCP.
-(.sys.exec "printf '%s\\n' 'import socket, sys, time' 'pid = sys.argv[1]' 'names = [l.split()[-1] for l in open(\"/proc/net/unix\") if (\"@rayforce-shm.\" + pid + \".\") in l]' 'ss = []' 'for i in range(64): ss.append(socket.socket(socket.AF_UNIX)); ss[-1].connect(chr(0) + names[0][1:])' 'time.sleep(0.5)' 'open(sys.argv[2], \"w\").write(\"ok\")' 'time.sleep(float(sys.argv[3]))' > /tmp/rftest_xport_hold.py")
+(.sys.exec "printf '%s\\n' 'import os, socket, sys, time' 'pid = sys.argv[1]' 'names = [l.split()[-1] for l in open(\"/proc/net/unix\") if (\"@rayforce-shm.\" + pid + \".\") in l]' 'ss = []' 'for i in range(64): ss.append(socket.socket(socket.AF_UNIX)); ss[-1].connect(chr(0) + names[0][1:])' 'time.sleep(0.5)' 'open(sys.argv[2], \"w\").write(\"ok\")' 'end = time.time() + float(sys.argv[3])' 'while time.time() < end and not os.path.exists(sys.argv[2] + \".go\"): time.sleep(0.05)' > /tmp/rftest_xport_hold.py")
 (.sys.exec "python3 /tmp/rftest_xport_hold.py $(cat /tmp/rftest_xport_pid) /tmp/rftest_xport_held 9 >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 50); do [ -f /tmp/rftest_xport_held ] && exit 0; sleep 0.1; done; exit 1") -- 0
 (set c (.ipc.open "127.0.0.1:19987"))
@@ -63,12 +63,16 @@ m -- 400
 (.ipc.close c)
 (.ipc.open "127.0.0.1:19987" (dict ['transport] ['shm])) !- io
 ;; idlers that show no token within 5 s are dropped at the next accept:
-;; with the helper still holding its connections, a client gets the rings
+;; with the helper still holding its connections, a client gets the rings.
+;; One accept after the 5 s, not a retry loop: the ring budget below needs
+;; every one of the server's 63 rings, so no extra handshake may race it.
 (.sys.exec "sleep 5.5")
 (set c (.ipc.open "127.0.0.1:19987"))
 (get (.ipc.handle c) 'transport) -- 'shm
 (.ipc.close c)
-;; the helper gone, the slots are free again
+;; the helper gone (released now rather than at its 9 s bound), the
+;; slots are free again
+(.sys.exec "pkill -0 -f '[r]ftest_xport_hold' && touch /tmp/rftest_xport_held.go; true")
 (.sys.exec "for i in $(seq 50); do pgrep -f '[r]ftest_xport_hold' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
 (set c (open-shm))
 (get (.ipc.handle c) 'transport) -- 'shm
@@ -102,5 +106,5 @@ m -- 400
 (.ipc.send c (list 'count (til 6000000))) !- io
 
 ;; ── teardown ────────────────────────────────────────────────────────
-(.sys.exec "pkill -KILL -f '[r]ayforce -p 19987' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_pid")
+(.sys.exec "pkill -KILL -f '[r]ayforce -p 19987' 2>/dev/null; pkill -KILL -f '[r]ftest_xport_hold' 2>/dev/null; true")
+(.sys.exec "rm -f /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_held.go /tmp/rftest_xport_pid")

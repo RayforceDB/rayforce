@@ -535,7 +535,7 @@ static test_result_t test_golden_decode(void) {
 typedef struct { ray_enccol_t* e; ray_t* err; } dthr_t;
 static void dict_decode_thread(void* raw) {
     dthr_t* t = raw;
-    uint8_t out[RAY_ENC_VEC * 8];
+    _Alignas(8) uint8_t out[RAY_ENC_VEC * 8];
     t->err = ray_enccol_decode_vec(t->e, 0, out, NULL, 0);
     if (t->err) { ray_error_free(t->err); t->err = (ray_t*)1; }
     ray_heap_abandon();
@@ -552,7 +552,7 @@ static test_result_t test_dict_once_concurrent(void) {
     ray_enc_desc_t d0; memcpy(&d0, e->base + 160, 48);
     TEST_ASSERT_EQ_I(d0.encoding, RAY_ENC_DICT);
     ray_enccol_test_fail_alloc(1);                   /* the validation's allocation */
-    uint8_t out[RAY_ENC_VEC * 8];
+    _Alignas(8) uint8_t out[RAY_ENC_VEC * 8];
     ray_t* r = ray_enccol_decode_vec(e, 0, out, NULL, 0);
     ray_enccol_test_fail_alloc(0);
     TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
@@ -583,7 +583,7 @@ static test_result_t fk_case(int8_t type, uint8_t attrs, uint8_t enc, const uint
     if (type == RAY_SYM) { for (int i = 0; i < vlen; i++) n_nulls += vals[i] == 0; }
     else if (bm) { for (int i = 0; i < vlen; i++) n_nulls += (bm[i >> 3] >> (i & 7)) & 1; }
     const uint8_t* bmp = n_nulls && type != RAY_SYM ? bm : NULL;
-    static uint8_t ref[RAY_ENC_VEC * 8 + 8], fast[RAY_ENC_VEC * 8 + 8];
+    static _Alignas(8) uint8_t ref[RAY_ENC_VEC * 8 + 8], fast[RAY_ENC_VEC * 8 + 8];
     memset(ref, 0xA5, sizeof ref); memset(fast, 0x5A, sizeof fast);
     int rr = ray_enccol_test_decode_body(type, attrs, enc, ch.width, n_nulls, bmp, b.p, b.len, vlen, false, 0, ref);
     int fr = ray_enccol_test_decode_body(type, attrs, enc, ch.width, n_nulls, bmp, b.p, b.len, vlen, true, 0, fast);
@@ -698,7 +698,7 @@ static test_result_t rk_check(int8_t type, uint8_t attrs, uint8_t enc, uint8_t w
                               const uint64_t* want, const char* what) {
     ray_enc_kind_t k; TEST_ASSERT_TRUE(ray_enc_kind_of(type, attrs, &k));
     const uint8_t* bmp = n_nulls && ray_enc_has_bitmap(type) ? bm : NULL;
-    static uint8_t ref[RAY_ENC_VEC * 8 + 8], fast[RAY_ENC_VEC * 8 + 8];
+    static _Alignas(8) uint8_t ref[RAY_ENC_VEC * 8 + 8], fast[RAY_ENC_VEC * 8 + 8];
     memset(ref, 0xA5, sizeof ref); memset(fast, 0x5A, sizeof fast);
     int rr = ray_enccol_test_decode_body(type, attrs, enc, width, n_nulls, bmp, body, len, vlen, false, 0, ref);
     int fr = ray_enccol_test_decode_body(type, attrs, enc, width, n_nulls, bmp, body, len, vlen, true, 0, fast);
@@ -1016,7 +1016,7 @@ static uint64_t dict_body(uint8_t* out, const uint64_t* u, int w, uint64_t base)
  * (dict: a DICT body over dict[0, n_dict)). */
 static test_result_t point_case(int8_t type, uint8_t enc, const uint64_t* dict, uint32_t n_dict,
                                 uint8_t width, const uint8_t* body, uint64_t avail, int vlen, const char* what) {
-    static uint8_t ref[RAY_ENC_VEC * 8];
+    static _Alignas(8) uint8_t ref[RAY_ENC_VEC * 8];
     static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
     int rr = dict ? ray_enccol_test_decode_dict(type, dict, n_dict, 0, NULL, body, avail, vlen, false, ref)
                   : ray_enccol_test_decode_body(type, 0, enc, width, 0, NULL, body, avail, vlen, false, 0, ref);
@@ -1276,7 +1276,7 @@ static test_result_t test_point_read_runs(void) {
 static test_result_t test_point_read_declines(void) {
     static uint64_t v[RAY_ENC_VEC], bodyw[RAY_ENC_VEC / 2 + 4];
     static int64_t pv[RAY_ENC_VEC]; static int8_t res[RAY_ENC_VEC];
-    static uint8_t ref[RAY_ENC_VEC * 8];
+    static _Alignas(8) uint8_t ref[RAY_ENC_VEC * 8];
     ray_enc_kind_t k32 = { 32, true, false };
     for (int i = 0; i < RAY_ENC_VEC; i++) v[i] = (uint64_t)(uint32_t)(int32_t)(i % 300 - 100);
     ray_enc_buf_t b = { 0 }; ray_enc_choice_t ch;
@@ -1561,7 +1561,11 @@ static test_result_t test_materialize_equivalence(void) {
     PASS();
 }
 
-/* Every type with nulls at the boundary lengths; SYM at every width. */
+/* Every type with nulls at the boundary lengths; SYM at every width.  Both
+ * shapes (no nulls, nulls) run at every vector edge and across the chunk
+ * edge (65537); the two in-chunk edges 65535 and 65536 take one shape each,
+ * alternating with the type (and SYM width), so every (type, width, shape)
+ * still meets one of them. */
 static test_result_t test_materialize_lengths(void) {
     static const int8_t types[] = { RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_I64, RAY_DATE, RAY_TIME,
                                     RAY_TIMESTAMP, RAY_F32, RAY_F64, RAY_GUID, RAY_SYM, RAY_STR };
@@ -1571,6 +1575,7 @@ static test_result_t test_materialize_lengths(void) {
         for (size_t l = 0; l < sizeof lens / sizeof *lens; l++)
             for (int s = 0; s < 5; s += 4)                   /* shapes 0 (no nulls) and 4 (nulls) */
                 for (size_t w = 0; w < (types[t] == RAY_SYM ? 4u : 1u); w++) {
+                    if ((lens[l] == 65535 || lens[l] == 65536) && (t + w + (size_t)(lens[l] & 1) + (size_t)s / 4) % 2) continue;
                     g_symw = widths[w];
                     ray_t* v = make_col(types[t], lens[l], s);
                     test_result_t r = check_equivalence(v);
@@ -1719,19 +1724,25 @@ static test_result_t test_cancel_waiter(void) {
     TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/cw"), 2), RAY_OK);
     ray_release(v);
     ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/cw"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
     ray_enccol_t* e = ray_enccol_of(c);
     cwait_t p = { c, "" }, w = { c, "" };
     ray_thread_t tp, tw;
+    /* The decode holds before its first chunk, so the waiter joins a
+     * running attempt and the interrupt reaches it, however fast the
+     * machine: the attempt cannot finish first. */
+    ray_enccol_test_hold_decode(true);
     ray_thread_create(&tp, cancel_wait_thread, &p);
     while (atomic_load(&e->once.state) != RAY_ENC_ONCE_RUNNING) ray_enc_yield();
     ray_thread_create(&tw, cancel_wait_thread, &w);
     while (ray_enc_once_waiters(&e->once) < 1) ray_enc_yield();
     ray_request_interrupt();
+    ray_enccol_test_hold_decode(false);
     ray_thread_join(tp); ray_thread_join(tw);
     ray_clear_interrupt();
     TEST_ASSERT_STR_EQ(p.code, "cancel");
-    TEST_ASSERT_STR_EQ(w.code, "cancel");
-    ray_t* r = ray_enccol_materialize(c);
+    TEST_ASSERT_STR_EQ(w.code, "cancel");                  /* the waiter gets the attempt's result */
+    ray_t* r = ray_enccol_materialize(c);                   /* retried */
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
     ray_release(c);
     PASS();

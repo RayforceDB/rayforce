@@ -12,7 +12,10 @@
 ;; Server lifecycle is shell-driven like ipc_diff.rfl (by pid, so no pattern
 ;; can match the shell that runs it): a second rayforce
 ;; on port 19976 whose script sleeps, so the listener is up (-p binds
-;; before the script runs) and nobody serves the handshake.
+;; before the script runs) and nobody serves the handshake.  The sleep it
+;; shells out to inherits the listening socket, so the teardown kills the
+;; server's children (and theirs) before the server, or the port would
+;; stay open until the sleep ends.
 (.sys.exec "[ -f /tmp/rfl_ipc_deaf.pid ] && kill $(cat /tmp/rfl_ipc_deaf.pid) 2>/dev/null; rm -f /tmp/rfl_ipc_deaf.pid; true")
 (.sys.exec "printf '(.sys.exec \"sleep 6\")\n' > /tmp/rfl_ipc_deaf.rfl")
 (.sys.exec "./rayforce -p 19976 /tmp/rfl_ipc_deaf.rfl </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_ipc_deaf.pid")
@@ -34,4 +37,4 @@
 ;; a host that does not resolve is neither
 (.sys.exec "./rayforce /tmp/rfl_ipc_c3.rfl </dev/null 2>&1 | grep -q 'error: io: connect failed: no-such-host.invalid:19975: '") -- 0
 
-(.sys.exec "kill $(cat /tmp/rfl_ipc_deaf.pid) 2>/dev/null; for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19976) 2>/dev/null' || break; sleep 0.1; done; rm -f /tmp/rfl_ipc_deaf.pid /tmp/rfl_ipc_deaf.rfl /tmp/rfl_ipc_c1.rfl /tmp/rfl_ipc_c2.rfl /tmp/rfl_ipc_c3.rfl; true")
+(.sys.exec "p=$(cat /tmp/rfl_ipc_deaf.pid); for c in $(pgrep -P $p); do pkill -KILL -P $c; kill -KILL $c; done 2>/dev/null; kill $p 2>/dev/null; for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19976) 2>/dev/null' || break; sleep 0.1; done; rm -f /tmp/rfl_ipc_deaf.pid /tmp/rfl_ipc_deaf.rfl /tmp/rfl_ipc_c1.rfl /tmp/rfl_ipc_c2.rfl /tmp/rfl_ipc_c3.rfl; true")

@@ -354,12 +354,13 @@ ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
     if (g_journal.mode == RAY_JOURNAL_SYNC) {
         if (fflush(g_journal.fp) != 0) return RAY_ERR_IO;
 #ifndef RAY_OS_WINDOWS
-        if (fsync(fileno(g_journal.fp)) != 0) return RAY_ERR_IO;
+        if (ray_fsync_fd(fileno(g_journal.fp)) != 0) return RAY_ERR_IO;
 #else
         /* FlushFileBuffers returns 0 (FALSE) on failure — surface it as an I/O
          * error like the fsync path above, so SYNC mode's durability guarantee
          * isn't silently dropped on Windows. */
-        if (!FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(g_journal.fp))))
+        if (!ray_fsync_disabled() &&
+            !FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(g_journal.fp))))
             return RAY_ERR_IO;
 #endif
     }
@@ -933,9 +934,10 @@ ray_err_t ray_journal_sync(void) {
     if (g_journal.mode == RAY_JOURNAL_SYNC) return RAY_OK;
     if (fflush(g_journal.fp) != 0) return RAY_ERR_IO;
 #ifndef RAY_OS_WINDOWS
-    if (fsync(fileno(g_journal.fp)) != 0) return RAY_ERR_IO;
+    if (ray_fsync_fd(fileno(g_journal.fp)) != 0) return RAY_ERR_IO;
 #else
-    FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(g_journal.fp)));
+    if (!ray_fsync_disabled())
+        FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(g_journal.fp)));
 #endif
     return RAY_OK;
 }

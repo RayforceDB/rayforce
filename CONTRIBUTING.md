@@ -21,6 +21,22 @@ for you to fix.
 
 See [RELEASE.md](RELEASE.md) for how releases are cut.
 
+## Scope and coordination
+
+Before starting, check existing issues and pull requests for related work. If
+someone is already working on the same outcome, coordinate in that thread and
+build on the existing effort rather than opening a competing fix. State the
+intended scope so contributors and reviewers know what is being taken on.
+
+Keep one coherent user-visible outcome in one PR, including its implementation
+and regression tests. Track related missing cases in a checklist rather than
+opening a separate issue and PR for each case; use focused commits to organize
+the work internally. Keep the PR in draft while the agreed scope is incomplete,
+and address review feedback in the same PR. When consolidating existing PRs,
+link them and account for their changes and unresolved reviews before closing
+the superseded ones. Leave already-merged work alone, and do not bundle unrelated
+changes merely to reduce the PR count.
+
 ## Opening a pull request
 
 1. Branch off the latest `dev`.
@@ -32,7 +48,17 @@ See [RELEASE.md](RELEASE.md) for how releases are cut.
 
    ```sh
    make            # builds (debug: ASan + UBSan)
-   make test       # runs the test suite
+   make test       # fast suite (no sanitizers, all cores); `make test-full`
+                   # runs every test under ASan + UBSan, as release PRs do
+   ```
+
+   Tests run in parallel worker processes, each running many tests in turn.
+   A test that fails only after some other test ran in the same process
+   prints a reproduce line; run it to replay that exact sequence in one
+   process, then trim the file it names down to the culprit:
+
+   ```sh
+   ./rayforce.test.fast --replay /tmp/rayforce_replay.<pid>.<n>
    ```
 
 4. Open the PR against **`dev`**. CI runs on every pull request (there are no

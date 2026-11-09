@@ -185,6 +185,19 @@ ray> (get d 'x)
 10
 ```
 
+`(alter 'name set key val)` amends a global dict binding by key.  An existing key gets the new value and a missing key is added.  A vector of keys sets each one: if `val` is a vector or list of the same length, the values are assigned pairwise, otherwise `val` goes to every key.  Another binding that shares the dict keeps its old contents.
+
+```lisp
+ray> (set d (dict [1 2] [10 20]))
+ray> (alter 'd set 1 99)
+ray> (alter 'd set 3 30)
+ray> d
+{1:99 2:20 3:30}
+ray> (alter 'd set [2 4] [0 40])
+ray> d
+{1:99 2:0 3:30 4:40}
+```
+
 Dictionaries are used extensively in Rayfall for passing named arguments to query forms like `select` and `update`:
 
 ```lisp
