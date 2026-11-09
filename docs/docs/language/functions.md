@@ -447,7 +447,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `type` | unary | Get type name of a value | `(type 42)` → `i64` |
-| `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
+| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`) | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
@@ -551,7 +551,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |

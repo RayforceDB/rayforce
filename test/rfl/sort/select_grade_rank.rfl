@@ -1,0 +1,57 @@
+;; iasc / idesc / rank in a keyless select projection evaluate once over the
+;; whole column, like asc / desc / reverse.  They used to run once per row and
+;; fail with "iasc expects a vector" on the single cell.
+(set T (table [a] (list [3 0N 1 2])))
+(at (select {from: T r: (iasc a)}) 'r) -- (iasc [3 0N 1 2])
+(at (select {from: T r: (idesc a)}) 'r) -- (idesc [3 0N 1 2])
+(at (select {from: T r: (rank a)}) 'r) -- (rank [3 0N 1 2])
+(at (select {from: T r: (rank (neg a))}) 'r) -- (rank (neg [3 0N 1 2]))
+(at (update {from: T r: (iasc a)}) 'r) -- (iasc [3 0N 1 2])
+(set G (table [g a] (list [1 1 1 1] [3 0N 1 2])))
+(at (at (select {from: G by: g r: (rank a)}) 'r) 0) -- (rank [3 0N 1 2])
+
+;; A name rebound to another native must keep per-row projection semantics:
+;; whole-column admission checks the callback, not just the native type.
+;; State is restored from a saved copy of the builtin afterwards.
+(set rank_orig rank)
+(set rank count)
+(set rank_obs_count (at (select {from: (table [a] (list [3 1 2]))  r: (rank a)}) 'r))
+(set rank reverse)
+(set rank_obs_rev (at (select {from: (table [a] (list [3 1 2]))  r: (rank a)}) 'r))
+(set rank rank_orig)
+rank_obs_count -- [1 1 1]
+rank_obs_rev -- [3 1 2]
+(at (select {from: T r: (rank a)}) 'r) -- (rank [3 0N 1 2])
+
+;; Same save/rebind/restore regression for iasc and idesc.
+(set iasc_orig iasc)
+(set iasc count)
+(set iasc_obs_count (at (select {from: (table [a] (list [3 1 2]))  r: (iasc a)}) 'r))
+(set iasc reverse)
+(set iasc_obs_rev (at (select {from: (table [a] (list [3 1 2]))  r: (iasc a)}) 'r))
+(set iasc iasc_orig)
+iasc_obs_count -- [1 1 1]
+iasc_obs_rev -- [3 1 2]
+(at (select {from: T r: (iasc a)}) 'r) -- (iasc [3 0N 1 2])
+(set idesc_orig idesc)
+(set idesc count)
+(set idesc_obs_count (at (select {from: (table [a] (list [3 1 2]))  r: (idesc a)}) 'r))
+(set idesc reverse)
+(set idesc_obs_rev (at (select {from: (table [a] (list [3 1 2]))  r: (idesc a)}) 'r))
+(set idesc idesc_orig)
+idesc_obs_count -- [1 1 1]
+idesc_obs_rev -- [3 1 2]
+(at (select {from: T r: (idesc a)}) 'r) -- (idesc [3 0N 1 2])
+
+;; An ungrouped aggregate over a grade/rank sees the whole column (these
+;; used to fail with "rank expects a vector"), also under where:.
+(set U (table [a] (list [3 1 2 5])))
+(at (select {from: U r: (sum (rank a))}) 'r) -- [6]
+(at (select {from: U r: (first (iasc a))}) 'r) -- [1]
+(at (select {from: U r: (max (idesc a))}) 'r) -- [3]
+(at (select {from: U r: (count (rank a))}) 'r) -- [4]
+(at (select {from: U r: (sum (rank a)) where: (< a 5)}) 'r) -- [3]
+(at (select {from: U r: (first (iasc a)) where: (< a 5)}) 'r) -- [1]
+(at (select {from: U r: (max (idesc a)) where: (< a 5)}) 'r) -- [2]
+(at (select {from: U r: (count (rank a)) where: (< a 5)}) 'r) -- [3]
+(at (select {from: U r: (iasc a) where: (< a 5)}) 'r) -- [1 2 0]

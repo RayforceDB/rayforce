@@ -177,6 +177,46 @@ restored
 
 The deserialized table is identical to the original — all types, column names, and values are preserved.
 
+`ser` bytes are a transport representation, not a canonical encoding for value
+equality or content hashes. Equal values built different ways can serialize
+differently, so do not use a digest of `ser` as a value identity check. For
+example, a symbol atom's serialized flags include whether it was written as a
+quoted literal: `(ser 'x)` and `(ser (as 'SYMBOL "x"))` differ at byte 17
+(`0x20` versus `0x00`) although the two symbols are equal. A generic LIST
+column loaded from splayed storage reconstructs its symbol atoms without that
+flag, so the original and loaded values can compare equal while their `ser`
+byte vectors differ.
+
+To compare values, use `==` and reduce its result, because `==` is element-wise
+and returns a collection of booleans rather than one boolean. For a nested
+column such as a LIST of lists, reduce once per level of nesting. With `t` the
+original table and `r` the table loaded back from a splayed directory, and a
+`payload` column of `(list (list 1 'x) (list 2 'y))`:
+
+```lisp
+(== (at t 'payload) (at r 'payload))              ; [[true true] [true true]]
+(all (map all (== (at t 'payload) (at r 'payload))))  ; true: one boolean
+```
+
+The second form returns `false` if any element differs. A flat column needs
+only one level: `(all (== (at t 'seq) (at r 'seq)))`.
+
+This form assumes both sides have the same shape and comparable types:
+
+- Different lengths raise an error instead of returning `false`. A different
+  inner length gives `length: binary op: operand lengths must match, got 2 and 3`,
+  and a different row count gives `length: EQ: operand lengths must match, got 2 and 1`.
+- Different types either raise or compare equal. A symbol against a string
+  gives `type: =: incomparable operand types, got sym and str`, while `2`
+  against `2.0` gives `true`, so the form does not tell integers from floats.
+
+Check `count` and `type` first when the shapes may differ:
+
+```lisp
+(== (count [1 2]) (count [1 2 3]))   ; false: lengths differ, do not compare
+(== (type [1 2]) (type [1.0 2.0]))   ; false: 'I64 versus 'F64
+```
+
 ## 6. Splayed and Partitioned Tables
 
 Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format — faster than CSV and preserving exact types. Three functions cover on-disk tables:

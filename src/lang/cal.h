@@ -41,47 +41,38 @@ static inline int date_leap_year(int year) {
     return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
 }
 
-static inline int64_t date_years_by_days(int yy) {
-    return (int64_t)yy * 365 + yy / 4 - yy / 100 + yy / 400;
-}
+/* Days from 1970-01-01 to 2000-01-01 (RAY_DATE_EPOCH). */
+#define RAY_DATE_EPOCH_UNIX_DAYS 10957
 
-/* Decode: days-since-epoch → year/month/day */
+/* Decode: days-since-epoch → year/month/day.
+ * Howard Hinnant's civil_from_days (floor-correct for negative years, so
+ * year 0 and below agree with the year/month/day extractors in temporal.c). */
 static inline void date_to_ymd(int32_t days, int* y, int* m, int* d) {
-    /* int64 throughout: days near INT32_MAX overflow int32 after the epoch
-     * offset (e.g. (as 'DATE 2147483646)), producing garbage years. */
-    int64_t offset = (int64_t)days + date_years_by_days(RAY_DATE_EPOCH - 1);
-    double approx = (double)offset / 365.2425;
-    int32_t years = (int32_t)(approx >= 0.0 ? approx + 0.5 : approx - 0.5);
+    int64_t z = (int64_t)days + RAY_DATE_EPOCH_UNIX_DAYS + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    uint64_t doe = (uint64_t)(z - era * 146097);
+    uint64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint64_t mp = (5 * doy + 2) / 153;
+    int64_t yy = (int64_t)yoe + era * 400;
+    int mo = (int)(mp < 10 ? mp + 3 : mp - 9);
 
-    if (date_years_by_days(years) > offset)
-        years -= 1;
-
-    int64_t rem = offset - date_years_by_days(years);
-    int yy = years + 1;
-    int leap = date_leap_year(yy);
-    int mid = 0;
-
-    for (mid = 12; mid > 0; mid--)
-        if (MONTHDAYS[leap][mid] != 0 && rem / (int32_t)MONTHDAYS[leap][mid] != 0)
-            break;
-
-    if (mid == 12 || mid < 0)
-        mid = 0;
-
-    *y = yy;
-    *m = 1 + mid % 12;
-    *d = 1 + (int)(rem - (int32_t)MONTHDAYS[leap][mid]);
+    *y = (int)(yy + (mo <= 2));
+    *m = mo;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
 }
 
-/* Encode: year/month/day → days-since-epoch */
+/* Encode: year/month/day → days-since-epoch (Hinnant days_from_civil). */
 static inline int32_t ymd_to_date(int year, int month, int day) {
-    int yy = (year > 0) ? year - 1 : 0;
-    int64_t ydays = date_years_by_days(yy);
-    int leap = date_leap_year(year);
-    int mm = (month > 0) ? month - 1 : 0;
-    if (mm > 12) mm = 12;  /* defensive: never index past the 13-wide table */
-    int64_t mdays = (int32_t)MONTHDAYS[leap][mm];
-    return (int32_t)(ydays - date_years_by_days(RAY_DATE_EPOCH - 1) + mdays + day - 1);
+    int64_t y = (int64_t)year - (month <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t mp = month > 2 ? month - 3 : month + 9;
+    if (mp < 0) mp = 0;  /* defensive: month is validated by callers */
+    if (mp > 11) mp = 11;
+    int64_t doy = (153 * mp + 2) / 5 + day - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int32_t)(era * 146097 + doe - 719468 - RAY_DATE_EPOCH_UNIX_DAYS);
 }
 
 #endif /* RAY_CAL_H */
