@@ -978,6 +978,31 @@ static test_result_t test_csv_no_header(void) {
     PASS();
 }
 
+/* header=false with a UTF-8 BOM: the BOM is not part of the first cell. */
+static test_result_t test_csv_no_header_bom(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "wb");
+    TEST_ASSERT_TRUE(f != NULL);
+    fprintf(f, "\xEF\xBB\xBF" "10,20\n30,40\n");
+    fclose(f);
+
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, ',', false, NULL, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 2);
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_I64);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[0], 10);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Read of a non-existent path returns an error. */
 static test_result_t test_csv_read_missing_file(void) {
     ray_heap_init();
@@ -2509,6 +2534,7 @@ const test_entry_t csv_entries[] = {
     { "csv/infer_promotions", test_csv_infer_promotions, NULL, NULL },
     { "csv/tab_delimiter", test_csv_tab_delimiter, NULL, NULL },
     { "csv/no_header", test_csv_no_header, NULL, NULL },
+    { "csv/no_header_bom", test_csv_no_header_bom, NULL, NULL },
     { "csv/read_missing_file", test_csv_read_missing_file, NULL, NULL },
     { "csv/write_bad_path", test_csv_write_bad_path, NULL, NULL },
     { "csv/invalid_schema_type", test_csv_invalid_schema_type, NULL, NULL },

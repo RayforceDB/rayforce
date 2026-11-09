@@ -1,5 +1,6 @@
 ;; A UTF-8 byte-order mark at the very start of a CSV is not data: it must
 ;; not become part of the first column name or the first headerless cell.
+;; .csv.read, .csv.splayed and .csv.parted each skip it.
 
 ;; Header, auto-typed.
 (.sys.exec "printf '\\357\\273\\277id,txt\\n1,a\\n2,b\\n' > rf_test_csv_bom_a.csv") -- 0
@@ -19,6 +20,33 @@
 (count H) -- 2
 (at (at H 'x) 0) -- 1
 
+;; Explicit names and a file whose header matches them after the BOM: the
+;; header is recognised and skipped, not read as a data row.
+(.sys.exec "printf '\\357\\273\\277x,y\\n1,a\\n' > rf_test_csv_bom_m.csv") -- 0
+(set M (.csv.read ['x 'y] [I64 SYMBOL] "rf_test_csv_bom_m.csv"))
+(count M) -- 1
+(at (at M 'x) 0) -- 1
+
+;; Quoted first header field, tab delimiter, CRLF line ends.
+(.sys.exec "printf '\\357\\273\\277\"id\",txt\\n1,a\\n' > rf_test_csv_bom_q.csv") -- 0
+(key (.csv.read "rf_test_csv_bom_q.csv")) -- ['id 'txt]
+(.sys.exec "printf '\\357\\273\\277id\\ttxt\\n1\\ta\\n' > rf_test_csv_bom_t.csv") -- 0
+(key (.csv.read "rf_test_csv_bom_t.csv")) -- ['id 'txt]
+(.sys.exec "printf '\\357\\273\\277id,txt\\r\\n1,a\\r\\n' > rf_test_csv_bom_c.csv") -- 0
+(set C (.csv.read "rf_test_csv_bom_c.csv"))
+(key C) -- ['id 'txt]
+(at (at C 'txt) 0) -- 'a
+
+;; A file that is only a BOM reads like one that is only a line end.
+(.sys.exec "printf '\\357\\273\\277' > rf_test_csv_bom_o.csv") -- 0
+(.sys.exec "printf '\\n' > rf_test_csv_bom_e.csv") -- 0
+(key (.csv.read "rf_test_csv_bom_o.csv")) -- (key (.csv.read "rf_test_csv_bom_e.csv"))
+(.csv.splayed "rf_test_csv_bom_o.csv" "rf_test_csv_bom_sp_o/") !- domain
+
+;; Only a full EF BB BF is a BOM: a two-byte prefix stays in the name.
+(.sys.exec "printf '\\357\\273id\\n1\\n' > rf_test_csv_bom_p.csv") -- 0
+(in 'id (key (.csv.read "rf_test_csv_bom_p.csv"))) -- false
+
 ;; Large (parallel) path, with BOM.
 (.sys.exec "{ printf '\\357\\273\\277id,v\\n'; seq 1 20000 | sed 's/$/,7/'; } > rf_test_csv_bom_big.csv") -- 0
 (set Big (.csv.read "rf_test_csv_bom_big.csv"))
@@ -29,12 +57,23 @@
 (key BigT) -- ['id 'v]
 (count BigT) -- 20000
 
-;; .csv.splayed shares the BOM handling.
+;; .csv.splayed: header, and explicit names with a matching header.
 (set S (.csv.splayed "rf_test_csv_bom_a.csv" "rf_test_csv_bom_sp/"))
 (key S) -- ['id 'txt]
+(set SM (.csv.splayed ['x 'y] [I64 SYMBOL] "rf_test_csv_bom_m.csv" "rf_test_csv_bom_sp_m/"))
+(count SM) -- 1
+(at (at SM 'x) 0) -- 1
+
+;; .csv.parted: header, and explicit names with a matching header.
+(set P (.csv.parted "rf_test_csv_bom_a.csv" "rf_test_csv_bom_pt" 't))
+(key P) -- ['part 'id 'txt]
+(count P) -- 2
+(set PM (.csv.parted ['x 'y] [I64 SYMBOL] "rf_test_csv_bom_m.csv" "rf_test_csv_bom_pt_m" 't))
+(count PM) -- 1
+(at (at PM 'x) 0) -- 1
 
 ;; A file without a BOM is unaffected.
 (.sys.exec "printf 'a,b\\n1,2\\n' > rf_test_csv_bom_n.csv") -- 0
 (key (.csv.read "rf_test_csv_bom_n.csv")) -- ['a 'b]
 
-(.sys.exec "rm -rf rf_test_csv_bom_sp rf_test_csv_bom_a.csv rf_test_csv_bom_h.csv rf_test_csv_bom_big.csv rf_test_csv_bom_n.csv") -- 0
+(.sys.exec "rm -rf rf_test_csv_bom_sp rf_test_csv_bom_sp_m rf_test_csv_bom_sp_o rf_test_csv_bom_pt rf_test_csv_bom_pt_m rf_test_csv_bom_pt.csv-partial rf_test_csv_bom_pt_m.csv-partial rf_test_csv_bom_*.csv") -- 0

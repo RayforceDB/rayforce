@@ -3039,7 +3039,10 @@ static const char* csv_skip_matching_header(const char* p, const char* buf_end,
  * ray_read_csv_opts — main CSV parser
  * -------------------------------------------------------------------------- */
 
-/* Length of a leading UTF-8 byte-order mark (EF BB BF), else 0. */
+/* Length of a leading UTF-8 byte-order mark (EF BB BF), else 0.  Header
+ * and data parsing start after it; delimiter detection and the column count
+ * may start at the file's first byte, since the BOM bytes are none of
+ * , \t " \r \n. */
 static inline size_t csv_bom_len(const char* buf, size_t size) {
     return (size >= 3 && (unsigned char)buf[0] == 0xEF &&
             (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) ? 3 : 0;
@@ -3090,7 +3093,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
      * was considered but adds complexity for a rare edge case. */
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* p = body; p < buf_end && *p != '\n'; p++) {
+        for (const char* p = buf; p < buf_end && *p != '\n'; p++) {
             if (*p == ',') commas++;
             if (*p == '\t') tabs++;
         }
@@ -3100,7 +3103,7 @@ static ray_t* csv_read_named_opts_inner(const char* path, char delimiter, bool h
     /* ---- 4. Count columns from first line ---- */
     int ncols = 1;
     {
-        const char* p = body;
+        const char* p = buf;
         bool in_quote = false;
         while (p < buf_end && (in_quote || (*p != '\n' && *p != '\r'))) {
             if (*p == '"') in_quote = !in_quote;
@@ -3631,7 +3634,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* q = body; q < buf_end && *q != '\n'; q++) {
+        for (const char* q = buf; q < buf_end && *q != '\n'; q++) {
             if (*q == ',') commas++;
             if (*q == '\t') tabs++;
         }
@@ -3640,7 +3643,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
 
     int ncols = 1;
     {
-        const char* q = body;
+        const char* q = buf;
         bool in_quote = false;
         while (q < buf_end && (in_quote || (*q != '\n' && *q != '\r'))) {
             if (*q == '"') in_quote = !in_quote;
@@ -4046,7 +4049,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
 
     if (delimiter == 0) {
         int commas = 0, tabs = 0;
-        for (const char* q = body; q < buf_end && *q != '\n'; q++) {
+        for (const char* q = buf; q < buf_end && *q != '\n'; q++) {
             if (*q == ',') commas++;
             if (*q == '\t') tabs++;
         }
@@ -4055,7 +4058,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
 
     int ncols = 1;
     {
-        const char* q = body;
+        const char* q = buf;
         bool in_quote = false;
         while (q < buf_end && (in_quote || (*q != '\n' && *q != '\r'))) {
             if (*q == '"') in_quote = !in_quote;
