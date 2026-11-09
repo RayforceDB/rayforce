@@ -2267,10 +2267,6 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
             char* dyn_esc = NULL;
             p = scan_field(p, buf_end, ctx->delim, &fld, &flen, esc_buf, &dyn_esc);
 
-            /* Strip trailing \r from last field of row */
-            if (c == ctx->n_cols - 1 && flen > 0 && fld[flen - 1] == '\r')
-                flen--;
-
             switch (ctx->col_types[c]) {
                 case CSV_TYPE_BOOL: {
                     /* BOOL is non-nullable; fast_bool returns 0 for
@@ -2462,10 +2458,6 @@ static bool csv_parse_serial(const char* buf, size_t buf_size,
             char* dyn_esc = NULL;
             p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn_esc);
 
-            /* Strip trailing \r from last field of row */
-            if (c == n_cols - 1 && flen > 0 && fld[flen - 1] == '\r')
-                flen--;
-
             switch (col_types[c]) {
                 case CSV_TYPE_BOOL: {
                     /* BOOL is non-nullable. */
@@ -2641,7 +2633,6 @@ static bool csv_auto_scan_rows(const char* buf, const char* buf_end,
             size_t flen;
             char* dyn_esc = NULL;
             p = scan_field(p, buf_end, delim, &fld, &flen, esc_buf, &dyn_esc);
-            if (c == ncols - 1 && flen > 0 && fld[flen - 1] == '\r') flen--;
             if (resolved_types[c] == RAY_CSV_AUTO_TAG) {
                 bool is_null;
                 int64_t v = fast_i64(fld, flen, &is_null);

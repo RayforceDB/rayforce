@@ -743,6 +743,7 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
         case RAY_U8:        return ray_u8(0);
         case RAY_BOOL:      return make_bool(0);
         case RAY_F64:       return make_f64(0.0);
+        case RAY_F32:       return ray_f32(0.0f);
         case RAY_DATE:      return ray_date(0);
         case RAY_TIME:      return ray_time(0);
         case RAY_TIMESPAN: return ray_timespan(0);
@@ -1256,7 +1257,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         /* Classify operands: numeric/temporal vectors or scalars */
         int8_t lt = left_coll ? left->type : -(left->type);
         int8_t rt = right_coll ? right->type : -(right->type);
-        #define IS_NUM_TYPE(t) ((t)==RAY_I64||(t)==RAY_F64||(t)==RAY_I32||(t)==RAY_I16|| \
+        #define IS_NUM_TYPE(t) ((t)==RAY_I64||(t)==RAY_F64||(t)==RAY_F32||(t)==RAY_I32||(t)==RAY_I16|| \
                                 (t)==RAY_U8||(t)==RAY_DATE||(t)==RAY_TIME||(t)==RAY_TIMESTAMP)
         #define IS_POW_TYPE(t) ((t)==RAY_BOOL||(t)==RAY_U8||(t)==RAY_I16||(t)==RAY_I32|| \
                                 (t)==RAY_I64||(t)==RAY_F64)
@@ -1299,6 +1300,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     if (l_num_scalar) {
                         if (left->type == -RAY_F64)
                             lop = ray_const_f64(g, left->f64);
+                        else if (left->type == -RAY_F32)
+                            lop = ray_const_atom(g, left);
                         else {
                             int64_t sv = as_i64(left);
                             lop = ray_const_i64(g, sv);
@@ -1311,6 +1314,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     if (r_num_scalar) {
                         if (right->type == -RAY_F64)
                             rop = ray_const_f64(g, right->f64);
+                        else if (right->type == -RAY_F32)
+                            rop = ray_const_atom(g, right);
                         else {
                             int64_t sv = as_i64(right);
                             rop = ray_const_i64(g, sv);
@@ -1678,7 +1683,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
 
     /* SLOW PATH: per-element scalar loop (fallback for mixed types, temporal, etc.) */
     if (!force_boxed &&
-        (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
+        (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
          out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
          out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN)) {
         ray_t* vec = ray_vec_new(out_type, len);
@@ -1827,7 +1832,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     int8_t out_type = -(e0->type);
 
     /* Try typed vector path for numeric/bool/temporal output */
-    if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
+    if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
         out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
         out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN) {
         ray_t* vec = ray_vec_new(out_type, len);

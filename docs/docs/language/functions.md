@@ -83,8 +83,8 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `any` | unary, aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise minimum of two values | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
-| `max` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise maximum of two values | `(max [3 9 1] 5)` → `[5 9 5]` |
+| `min` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise minimum of two values; f32 input answers f32 | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
+| `max` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise maximum of two values; f32 input answers f32 | `(max [3 9 1] 5)` → `[5 9 5]` |
 | `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
 | `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
@@ -183,24 +183,24 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
-| `fill` | binary, atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
+| `fill` | binary, atomic | Replace null values; the replacement is the first argument; f32 input stays f32 | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | Reverse order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
-| `deltas` | unary | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `deltas` | unary | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIME, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
 | `fills` | unary | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
 | `avgs` | unary | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
-| `mins` | unary | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
-| `maxs` | unary | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
+| `mins` | unary | Running minimum; f32 input stays f32 | `(mins [3 1 2])` → `[3 1 1]` |
+| `maxs` | unary | Running maximum; f32 input stays f32 | `(maxs [3 1 2])` → `[3 3 3]` |
 | `prds` | unary | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
 | `differ` | unary | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
 | `msum` | binary | Moving sum over trailing N rows; nulls are skipped | `(msum 3 [1 2 3 4])` → `[1 3 6 9]` |
 | `mavg` | binary | Moving average over trailing N rows and non-null values | `(mavg 3 [1 2 3 4])` → `[1.0 1.5 2.0 3.0]` |
-| `mmin` | binary | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
-| `mmax` | binary | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
+| `mmin` | binary | Moving minimum over trailing N rows; f32 input stays f32 | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
+| `mmax` | binary | Moving maximum over trailing N rows; f32 input stays f32 | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
 | `mcount` | binary | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
 | `mvar` | binary | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
@@ -324,6 +324,10 @@ A non-empty functional insert returns a new logical table view; the quoted-symbo
 `upsert` is not supported on parted tables. Materialize a flat table or use an application-level update strategy when key-based replacement is required.
 
 `upsert` into a named flat table (`(upsert 'book 'px row)`) writes matched rows in place and appends new keys, so its cost is proportional to the payload rather than to the rows already present. A multi-row payload (a table, or a list of column vectors) is applied in one pass; a key repeated inside the payload resolves to its last row. A single-row `upsert` locates its row through a `.idx.hash` index on the key column when one is attached and fresh, and by one scan of the key column otherwise. A payload with a mistyped value is rejected before anything is written.
+
+The key column may be `BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID`; a key is matched by value, and the same key updates on a flat in-memory table and on a splayed or mapped one. A `SYM` or `GUID` key column needs a `SYM` or `GUID` key value, and a `STR` key column a `STR` one (otherwise a `type` error). A null `F32`, `F64`, `DATE` or `TIME` key never matches, so it always appends a row; a null `I16`, `I32`, `I64`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID` key matches an existing null key. `F32` keys are compared by a scan of the key column rather than through the hashed fast path.
+
+Payload values are narrowed into the column they land in: an `F32` column accepts `F32`, `F64` and integer atoms (a null stays null), and an `F64` column accepts `F64` and integer atoms. A `BOOL` value into a float column is a `type` error, and the table is left unchanged.
 
 `update` with `where:` into a named flat table writes the matched rows in place: the predicate is resolved through a fresh `.idx.hash` index on the column when it is a plain equality (`(== sym 'AAPL)`), elementwise update expressions (arithmetic, comparisons, and other atomic builtins over columns and literals) are evaluated over the matched rows only, and the results are scattered into the live columns. Any other expression, such as one with an aggregate, an order-dependent function like `deltas`, or a free variable, is evaluated over the whole table as before, so both spellings of `from:` agree. A mistyped or wrong-length value is rejected before anything is written.
 
