@@ -83,8 +83,8 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `any` | unary, aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise minimum of two values | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
-| `max` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise maximum of two values | `(max [3 9 1] 5)` → `[5 9 5]` |
+| `min` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise minimum of two values; f32 input answers f32 | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
+| `max` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise maximum of two values; f32 input answers f32 | `(max [3 9 1] 5)` → `[5 9 5]` |
 | `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
 | `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
@@ -183,7 +183,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
-| `fill` | binary, atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
+| `fill` | binary, atomic | Replace null values; the replacement is the first argument; f32 input stays f32 | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | Reverse order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
@@ -193,14 +193,14 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `fills` | unary | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
 | `avgs` | unary | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
-| `mins` | unary | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
-| `maxs` | unary | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
+| `mins` | unary | Running minimum; f32 input stays f32 | `(mins [3 1 2])` → `[3 1 1]` |
+| `maxs` | unary | Running maximum; f32 input stays f32 | `(maxs [3 1 2])` → `[3 3 3]` |
 | `prds` | unary | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
 | `differ` | unary | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
 | `msum` | binary | Moving sum over trailing N rows; nulls are skipped | `(msum 3 [1 2 3 4])` → `[1 3 6 9]` |
 | `mavg` | binary | Moving average over trailing N rows and non-null values | `(mavg 3 [1 2 3 4])` → `[1.0 1.5 2.0 3.0]` |
-| `mmin` | binary | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
-| `mmax` | binary | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
+| `mmin` | binary | Moving minimum over trailing N rows; f32 input stays f32 | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
+| `mmax` | binary | Moving maximum over trailing N rows; f32 input stays f32 | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
 | `mcount` | binary | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
 | `mvar` | binary | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |

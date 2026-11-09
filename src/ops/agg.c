@@ -476,7 +476,7 @@ bool ray_zone_int_sum128(ray_t* x, int64_t* hi_out, uint64_t* lo_out, int64_t* n
  * (collection.c).  The builtins below answer it as they answer the column:
  * on its bound source (ray_reduce_src: the directory, or range reads), with
  * the column's type-error messages, and with the out type the vector path
- * gives (ray_min_op / ray_max_op: F32 answers F64).  first / last read row
+ * gives.  first / last read row
  * 0 / len - 1 itself for the types they read with collection_elem (SYM,
  * STR, GUID: by forcing the column).  *done false: not a column reference,
  * or an op the source does not serve (the caller appends it: the lazy is
@@ -526,7 +526,7 @@ static ray_t* colref_answer(ray_t* x, uint16_t op, bool* done) {
             }
         } else {
             int8_t out = 0;
-            if (op == OP_MIN || op == OP_MAX) out = t == RAY_F32 ? RAY_F64 : t;   /* ray_min_op */
+            if (op == OP_MIN || op == OP_MAX) out = t;
             else if (op == OP_SUM || op == OP_PROD) out = (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
             else if (op == OP_AVG) out = RAY_F64;
             r = ray_reduce_src(&src, op, out);
@@ -893,6 +893,9 @@ ray_t* ray_min_fn(ray_t* x) {
                     double mn = INFINITY;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (mins[g] < mn) mn = mins[g];
+                    /* the F32 zone is held as doubles: answer at the column's width */
+                    if (x->type == RAY_F32)
+                        return mn == INFINITY ? ray_typed_null(-RAY_F32) : ray_f32(ray_f64_to_f32_fin(mn));
                     if (mn == INFINITY) return ray_typed_null(-RAY_F64);
                     return make_f64(mn);
                 } else {
@@ -961,6 +964,9 @@ ray_t* ray_max_fn(ray_t* x) {
                     double mx = -INFINITY;
                     for (uint32_t g = 0; g < n_chunks; g++)
                         if (maxs[g] > mx) mx = maxs[g];
+                    /* the F32 zone is held as doubles: answer at the column's width */
+                    if (x->type == RAY_F32)
+                        return mx == -INFINITY ? ray_typed_null(-RAY_F32) : ray_f32(ray_f64_to_f32_fin(mx));
                     if (mx == -INFINITY) return ray_typed_null(-RAY_F64);
                     return make_f64(mx);
                 } else {
