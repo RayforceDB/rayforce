@@ -608,10 +608,16 @@ static int run_pty_with_input(const char* input, int use_poll)
     int flags = fcntl(master_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
 
-    /* Tiny startup delay so the child's term setup runs before our
-     * first byte lands — protects against losing the leading char
-     * to whatever cooked-mode default forkpty handed the child. */
-    usleep(80 * 1000);
+    /* The REPL puts the terminal in raw mode with TCSAFLUSH before it
+     * prints anything, discarding what was typed before: wait for its
+     * first output (5 s at most), then type. */
+    for (int waited = 0; waited < 5000; waited += 10) {
+        char buf[1024];
+        ssize_t n = read(master_fd, buf, sizeof(buf));
+        if (n > 0) break;
+        if (n < 0 && errno != EAGAIN && errno != EINTR) break;
+        usleep(10 * 1000);
+    }
 
     if (input && *input) {
         const char* sigint_marker = strchr(input, '\x01');
@@ -624,7 +630,28 @@ static int run_pty_with_input(const char* input, int use_poll)
             else break;
         }
         if (sigint_marker) {
-            usleep(120 * 1000);
+            /* Signal once the line editor has echoed the end of what was
+             * typed (5 s at most): the REPL has read it by then. */
+            size_t tl = (size_t)(end - input) < 4 ? (size_t)(end - input) : 4;
+            char seen_buf[8192];
+            size_t seen_len = 0;
+            for (int waited = 0; waited < 5000; waited += 10) {
+                char buf[1024];
+                ssize_t n = read(master_fd, buf, sizeof(buf));
+                if (n > 0) {
+                    if (seen_len + (size_t)n > sizeof(seen_buf)) seen_len = 0;
+                    memcpy(seen_buf + seen_len, buf, (size_t)n);
+                    seen_len += (size_t)n;
+                    bool echoed = false;
+                    for (size_t i = 0; i + tl <= seen_len && !echoed; i++)
+                        echoed = memcmp(seen_buf + i, end - tl, tl) == 0;
+                    if (echoed) break;
+                } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+                    break;
+                } else {
+                    usleep(10 * 1000);
+                }
+            }
             kill(pid, SIGINT);
             usleep(80 * 1000);
             const char* tail = sigint_marker + 1;
@@ -2708,14 +2735,15 @@ static test_result_t test_repl_pty_remote_master_close(void) {
     PASS();
 }
 
-/* SIGINT during eval — exercises lines 741-748 in eval_and_print.
- * The test sends a long-running expression (sum of a large til vector),
- * then fires SIGINT after a delay that falls inside the eval window.
- * After the interrupt, the child gets `:q\n` to exit cleanly.
+/* SIGINT during eval — the interrupt branch of eval_and_print.  The test
+ * sends an expression that runs until interrupted, fires SIGINT once the
+ * expression's own output shows it is running, then sends `:q\n`.
  *
- * Separate helper from run_pty_with_input because we need a longer
- * pre-SIGINT delay (400 ms) to reliably land inside ray_eval(). */
+ * Returns the child's exit code, -signum when a signal ended it, -1 when
+ * no pty could be made, or one of the codes below. */
 #ifndef RAY_OS_WINDOWS
+enum { PTY_EVAL_TIMEOUT = -100, PTY_EVAL_NO_MARKER = -101, PTY_EVAL_NO_START = -102 };
+
 static int run_pty_sigint_during_eval(int use_poll)
 {
     int master_fd = -1;
@@ -2736,14 +2764,33 @@ static int run_pty_sigint_during_eval(int use_poll)
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
 
     /* Synchronise via observable PTY output rather than absolute sleeps.
-     * The eval is wrapped in `(do (println "EVALSTART") <work>)`: the
-     * marker bytes appear on master_fd as soon as the eval is past the
-     * println, which means <work> is now the in-flight expression.  We
-     * then deliver SIGINT, knowing the child is genuinely inside eval
-     * regardless of CPU speed or memory size — no resource-dependent
-     * timing assumption. */
+     * The marker is computed, so the pty's echo of the typed expression
+     * (before the REPL takes the terminal and installs its handler) does
+     * not hold it: seen, it was printed by the eval, which then loops until
+     * the interrupt ends it — no assumption on how long work takes. */
     const char* expr =
-        "(do (println \"EVALSTART\") (sum (til 100000)))\n";
+        "(do (println (concat \"EVAL\" \"START\")) (while true (+ 1 1)))\n";
+
+    /* The REPL puts the terminal in raw mode with TCSAFLUSH before it
+     * prints anything, discarding what was typed before: wait for its
+     * first output, then type. */
+    {
+        bool out = false;
+        for (int waited = 0; waited < 5000 && !out; waited += 10) {
+            char buf[1024];
+            ssize_t n = read(master_fd, buf, sizeof(buf));
+            if (n > 0) out = true;
+            else if (n < 0 && errno != EAGAIN && errno != EINTR) break;
+            else usleep(10 * 1000);
+        }
+        if (!out) {
+            kill(pid, SIGKILL);
+            int s; waitpid(pid, &s, 0);
+            close(master_fd);
+            return PTY_EVAL_NO_START;
+        }
+    }
+
     size_t elen = strlen(expr), etotal = 0;
     while (etotal < elen) {
         ssize_t w = write(master_fd, expr + etotal, elen - etotal);
@@ -2783,22 +2830,19 @@ static int run_pty_sigint_during_eval(int use_poll)
             if (!seen) usleep(10 * 1000);
         }
         if (!seen) {
-            /* Marker never arrived — child not in eval.  Bail cleanly. */
+            /* Marker never arrived — child not in eval. */
             kill(pid, SIGKILL);
             int s; waitpid(pid, &s, 0);
             close(master_fd);
-            return -1;
+            return PTY_EVAL_NO_MARKER;
         }
     }
 
-    /* Eval is in flight (we observed the marker; sum (til 100000) is
-     * either allocating, filling, or summing — all interruptible
-     * sync points downstream of println). */
+    /* Eval is in flight: the loop after the marker runs until interrupted. */
     kill(pid, SIGINT);
 
-    /* Drain whatever follows; let the SIGINT recovery print "^C\n"
-     * and re-prompt before we send :q.  10 short reads with 10ms
-     * apart = up to 100ms — plenty for any healthy machine. */
+    /* Drain what is already there.  The :q typed next waits in the tty
+     * until the REPL, back from the interrupted eval, reads it. */
     { char buf[4096]; for (int i=0;i<10;i++) { ssize_t n=read(master_fd,buf,sizeof(buf)); if(n<=0)break; usleep(10*1000); } }
 
     const char* quit_cmd = ":q\n";
@@ -2817,7 +2861,7 @@ static int run_pty_sigint_during_eval(int use_poll)
         if (r == pid) goto done_sigint_eval;
         usleep(100 * 1000);
     }
-    kill(pid, SIGKILL); waitpid(pid, &status, 0); close(master_fd); return -2;
+    kill(pid, SIGKILL); waitpid(pid, &status, 0); close(master_fd); return PTY_EVAL_TIMEOUT;
 
 done_sigint_eval:
     close(master_fd);
@@ -2828,11 +2872,16 @@ done_sigint_eval:
 #endif
 
 /* SIGINT during eval (poll mode).  Expected: child handles SIGINT, returns
- * to prompt, accepts :q, exits cleanly (rc=0).  A timeout (rc=-2) is the
- * :q lost: a SIGINT served after the bytes typed behind it clears them. */
+ * to prompt, accepts :q, exits cleanly (rc=0).  A timeout is the eval not
+ * interrupted or the :q lost (a SIGINT served after the bytes typed behind
+ * it clears them). */
 static test_result_t test_repl_pty_sigint_during_eval(void) {
 #ifndef RAY_OS_WINDOWS
     int rc = run_pty_sigint_during_eval(1);
+    TEST_ASSERT_FMT(rc != PTY_EVAL_TIMEOUT, "child still running 4 s after :q");
+    TEST_ASSERT_FMT(rc != PTY_EVAL_NO_START, "REPL printed nothing in 5 s");
+    TEST_ASSERT_FMT(rc != PTY_EVAL_NO_MARKER, "eval output never showed the marker");
+    TEST_ASSERT_FMT(rc >= -1, "child ended by signal %d", -rc);
     TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
 #endif
     PASS();
