@@ -325,6 +325,10 @@ A non-empty functional insert returns a new logical table view; the quoted-symbo
 
 `upsert` into a named flat table (`(upsert 'book 'px row)`) writes matched rows in place and appends new keys, so its cost is proportional to the payload rather than to the rows already present. A multi-row payload (a table, or a list of column vectors) is applied in one pass; a key repeated inside the payload resolves to its last row. A single-row `upsert` locates its row through a `.idx.hash` index on the key column when one is attached and fresh, and by one scan of the key column otherwise. A payload with a mistyped value is rejected before anything is written.
 
+The key column may be `BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID`; a key is matched by value, and the same key updates on a flat in-memory table and on a splayed or mapped one. A `SYM` or `GUID` key column needs a `SYM` or `GUID` key value, and a `STR` key column a `STR` one (otherwise a `type` error). A null `F32`, `F64`, `DATE` or `TIME` key never matches, so it always appends a row; a null `I16`, `I32`, `I64`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID` key matches an existing null key. `F32` keys are compared by a scan of the key column rather than through the hashed fast path.
+
+Payload values are narrowed into the column they land in: an `F32` column accepts `F32`, `F64` and integer atoms (a null stays null), and an `F64` column accepts `F64` and integer atoms. A `BOOL` value into a float column is a `type` error, and the table is left unchanged.
+
 `update` with `where:` into a named flat table writes the matched rows in place: the predicate is resolved through a fresh `.idx.hash` index on the column when it is a plain equality (`(== sym 'AAPL)`), elementwise update expressions (arithmetic, comparisons, and other atomic builtins over columns and literals) are evaluated over the matched rows only, and the results are scattered into the live columns. Any other expression, such as one with an aggregate, an order-dependent function like `deltas`, or a free variable, is evaluated over the whole table as before, so both spellings of `from:` agree. A mistyped or wrong-length value is rejected before anything is written.
 
 ## Joins
@@ -447,7 +451,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `type` | unary | Get type name of a value | `(type 42)` → `i64` |
-| `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
+| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`) | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
@@ -551,7 +555,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |

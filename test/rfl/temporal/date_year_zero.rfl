@@ -1,0 +1,29 @@
+;; DATE print/parse around year 0 and negative years must agree with the
+;; yyyy/mm/dd extractors (proleptic Gregorian; year 0 is a leap year).
+
+(+ 0001.01.01 -1i) -- 0000.12.31
+(+ 0001.01.01 -2i) -- 0000.12.30
+(+ 0001.01.01 -365i) -- 0000.01.02
+(+ 0001.01.01 -366i) -- 0000.01.01
+(+ 0000.03.01 -1i) -- 0000.02.29
+
+;; parse side: 0000.12.31 is exactly one day before 0001.01.01
+(- 0001.01.01 0000.12.31) -- 1i
+(- 0001.01.01 0000.01.01) -- 366i
+(as 'DATE "0000.02.29") -- 0000.02.29
+
+;; extractors and printer agree
+(yyyy (+ 0001.01.01 -1i)) -- 0
+(mm (+ 0001.01.01 -1i)) -- 12
+(dd (+ 0001.01.01 -1i)) -- 31
+(dd (+ 0000.03.01 -1i)) -- 29
+
+;; printed text and an integer anchor: both sides of the DATE comparisons
+;; above go through the same decoder, so pin the decoder with fixed strings
+;; and an absolute day number (independently derived: 0000.01.01 is 730485
+;; days before 2000.01.01).
+(as 'STR (+ 0001.01.01 -1i)) -- "0000.12.31"
+(as 'STR 0000.02.29) -- "0000.02.29"
+(as 'STR (+ 0000.01.01 -1i)) -- "-001.12.31"
+(as 'STR (+ 0000.03.01 -1462i)) -- "-004.02.29"
+(as 'I32 0000.01.01) -- -730485

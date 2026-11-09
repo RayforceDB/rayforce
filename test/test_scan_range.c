@@ -5402,6 +5402,16 @@ static test_result_t test_parted_eval_group_keep(void) {
         /* q12: the inner implicit group feeds an outer that reads g, s, h */
         { "(select {c: (count h) from: (select {from: T where: (!= u 0) by: {g: g s: s h: h}}) "
           "by: {g: g s: s} desc: c take: 10})", 0, "kvdb" },
+        /* A multi-key outer by: is a literal SYM vector; it must not
+         * disable the nested projection hint. */
+        { "(select {c: (count (distinct h)) from: (select {from: T where: (!= u 0) by: [g s h]}) "
+          "by: [g s] desc: c take: 10})", 0, "kvdb" },
+        /* An outer filter on a bound non-callable value (a lambda parameter,
+         * a global) cannot read a column: the nested hint stays narrow. */
+        { "((fn [thr] (select {c: (count h) from: (select {from: T where: (!= u 0) by: {g: g s: s h: h}}) "
+          "where: (>= h thr) by: {g: g s: s} desc: c take: 10})) 0)", 0, "kvdb" },
+        { "(do (set thr 0) (select {c: (count h) from: (select {from: T where: (!= u 0) by: {g: g s: s h: h}}) "
+          "where: (>= h thr) by: {g: g s: s} desc: c take: 10}))", 0, "kvdb" },
         /* q14: key g, distinct k; u in the where: only */
         { "(select {g: g u: (count (distinct k)) from: T where: (!= u 0) by: g desc: u take: 10})", 0, "vdsbh" },
         /* q23: four outputs over s, h, k; g and v in the where: only */
@@ -5428,6 +5438,18 @@ static test_result_t test_parted_eval_group_keep(void) {
         "(select {u: (count (distinct h)) from: T where: (> v 3) by: (% k 3)})",
         "(select {g: g u: (count (distinct k)) from: T where: (> u 250) by: g})",
         "(select {m: (max u) from: (select {from: T where: (> v 3) by: {g: g s: s}}) by: g})",
+        /* a callable bound to a name keeps every column: a global lambda, a
+         * builtin alias, a lambda parameter, eval, resolve, a quoted name */
+        "(do (set fu (fn [z] (+ z u))) (select {m: (sum (fu g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "(do (set cn count) (select {m: (cn k) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "((fn [f] (select {m: (sum (f g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})})) (fn [z] (+ z u)))",
+        /* a container that holds a lambda is callable through first/at/value */
+        "(do (set fu (fn [z] (+ z u))) (set fs (list fu)) (select {m: (sum ((first fs) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "(do (set fu (fn [z] (+ z u))) (set fs (list fu)) (select {m: (sum ((at fs 0) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "(do (set fu (fn [z] (+ z u))) (set fd (dict [a] (list fu))) (select {m: (sum ((first (value fd)) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})}))",
+        "((fn [l] (select {m: (sum ((first l) g)) from: (select {from: T where: (> v 3) by: {g: g s: s}})})) (list (fn [z] (+ z u))))",
+        "(select {m: (sum (eval (quote (+ g u)))) from: (select {from: T where: (> v 3) by: {g: g s: s}})})",
+        "(select {m: (sum (resolve 'u)) from: (select {from: T where: (> v 3) by: {g: g s: s}})})",
         NULL,
     };
     for (int i = 0; all[i]; i++) {

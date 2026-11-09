@@ -17,6 +17,24 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 1000000     ; no separators needed
 ```
 
+I64 `+`, `-`, `*`, `sum`, and `sums` use wrapping arithmetic, including their
+vector and query forms. The result wraps modulo 2^64 and is interpreted as a
+signed I64; it does not raise an overflow error. The minimum I64 bit pattern
+is reserved for the null sentinel. For atoms, a wrapped result equal to that
+pattern is the null `0Nl`: `(+ 9223372036854775807 2)` is
+`-9223372036854775807`, while `(+ 9223372036854775807 1)` is `0Nl`. Vector and
+query results (including `sums` and a `select` column) land on the same bit
+pattern but are not flagged as null: `(nil? (+ [9223372036854775807] 1))` is
+`[false]` even though the element prints as `-9223372036854775808`. Do not
+rely on `nil?` to detect overflow in vectors; see
+[#841](https://github.com/RayforceDB/rayforce/issues/841).
+
+Casting an out-of-range F64 with `as 'I64` clamps to the nearest non-null I64
+bound: `(as 'I64 1e19)` is `9223372036854775807`, and
+`(as 'I64 -1e19)` is `-9223372036854775807`. These operations do not detect
+overflow; check bounds explicitly when a wrapped or clamped value is not
+acceptable for the application.
+
 ### Floats
 
 64-bit IEEE 754 double-precision floating point.
@@ -27,6 +45,21 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 1e6         ; scientific notation
 2.5e-3      ; small value
 ```
+
+F64 has no infinity values or infinity literals. Non-finite F64 results
+(positive or negative infinity and NaN) become the floating null `0Nf`; for
+atoms and the element-wise vector kernels `nil?` reports true for them. For
+example, `(/ 1 0)` and `(exp 1000)` both return `0Nf`. An F64 overflow
+therefore cannot be distinguished from missing data after the operation. Check
+inputs or bounds before the operation if that distinction matters.
+
+Two exceptions. F32 arithmetic keeps IEEE infinities: `(+ 3e38e 3e38e)` prints
+`infe`, and `nil?` is false for it. And not every vector kernel flags the null
+it produces: `(sums [1e308 1e308])` prints `[1.00e+308 nan]` and
+`(nil? (sums [1e308 1e308]))` is `[false false]`, although
+`(nil? (at (sums [1e308 1e308]) 1))` is true. This is the same class of
+problem as the I64 case in
+[#841](https://github.com/RayforceDB/rayforce/issues/841).
 
 ### Booleans
 

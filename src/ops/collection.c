@@ -1255,13 +1255,19 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
         bool* mb = (bool*)ray_data(mask);
         int64_t count = 0;
         for (int64_t i = 0; i < mlen; i++) if (mb[i]) count++;
-        char buf[8192];
-        if ((size_t)count > sizeof(buf)) return ray_error("limit", NULL);
+        char sbuf[8192];
+        char* buf = sbuf;
+        if ((size_t)count > sizeof(sbuf)) {
+            buf = ray_alloc_raw((size_t)count);
+            if (!buf) return ray_error("oom", NULL);
+        }
         int64_t j = 0;
         for (int64_t i = 0; i < mlen; i++) {
             if (mb[i]) buf[j++] = sp[i];
         }
-        return ray_str(buf, (size_t)count);
+        ray_t* r = ray_str(buf, (size_t)count);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
     }
 
     /* Fast path: typed vector + typed bool mask */
@@ -2707,10 +2713,16 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     if (ray_is_atom(vec) && vec->type == -RAY_STR && ray_str_len(vec) == 1 && ray_is_atom(n_obj) && is_numeric(n_obj)) {
         int64_t n = as_i64(n_obj);
         int64_t count = n < 0 ? -n : n;
-        char buf[8192];
-        if (count > (int64_t)sizeof(buf)) return ray_error("limit", NULL);
+        char sbuf[8192];
+        char* buf = sbuf;
+        if (count > (int64_t)sizeof(sbuf)) {
+            buf = ray_alloc_raw((size_t)count);
+            if (!buf) return ray_error("oom", NULL);
+        }
         for (int64_t i = 0; i < count; i++) buf[i] = vec->sdata[0];
-        return ray_str(buf, (size_t)count);
+        ray_t* r = ray_str(buf, (size_t)count);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
     }
     /* Scalar take: (take value n) → repeat value n times */
     if (ray_is_atom(vec) && (-vec->type) != RAY_STR && ray_is_atom(n_obj) && is_numeric(n_obj)) {
@@ -2730,10 +2742,14 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         int64_t slen = (int64_t)ray_str_len(vec);
         int64_t n = as_i64(n_obj);
         int64_t abs_n = n < 0 ? -n : n;
-        char buf[8192];
-        if (abs_n > (int64_t)sizeof(buf)) return ray_error("limit", NULL);
         if (slen == 0) {
             return ray_str("", 0);
+        }
+        char sbuf[8192];
+        char* buf = sbuf;
+        if (abs_n > (int64_t)sizeof(sbuf)) {
+            buf = ray_alloc_raw((size_t)abs_n);
+            if (!buf) return ray_error("oom", NULL);
         }
         if (n >= 0) {
             for (int64_t i = 0; i < abs_n; i++) buf[i] = s[i % slen];
@@ -2744,7 +2760,9 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                 buf[i] = s[si];
             }
         }
-        return ray_str(buf, (size_t)abs_n);
+        ray_t* r = ray_str(buf, (size_t)abs_n);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
     }
     /* Table take: apply take to each column */
     if (vec->type == RAY_TABLE && is_numeric(n_obj)) {
@@ -3505,17 +3523,26 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         if (is_collection(idx)) {
             /* Multiple indices → build string from chars */
             int64_t idxlen = ray_len(idx);
-            char buf[8192];
-            if ((size_t)idxlen > sizeof(buf)) return ray_error("limit", NULL);
+            char sbuf[8192];
+            char* buf = sbuf;
+            if ((size_t)idxlen > sizeof(sbuf)) {
+                buf = ray_alloc_raw((size_t)idxlen);
+                if (!buf) return ray_error("oom", NULL);
+            }
             for (int64_t j = 0; j < idxlen; j++) {
                 int alloc = 0;
                 ray_t* ie = collection_elem(idx, j, &alloc);
                 int64_t k = as_i64(ie);
                 if (alloc) ray_release(ie);
-                if (k < 0 || (size_t)k >= slen) return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
+                if (k < 0 || (size_t)k >= slen) {
+                    if (buf != sbuf) ray_free_raw(buf);
+                    return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
+                }
                 buf[j] = s[k];
             }
-            return ray_str(buf, (size_t)idxlen);
+            ray_t* r = ray_str(buf, (size_t)idxlen);
+            if (buf != sbuf) ray_free_raw(buf);
+            return r;
         }
         int64_t i = as_i64(idx);
         if (i < 0 || (size_t)i >= slen) return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)i, (long long)slen);

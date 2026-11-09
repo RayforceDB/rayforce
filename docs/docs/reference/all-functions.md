@@ -610,7 +610,7 @@ Type checking, casting, null testing, and object inspection.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `type` | unary | — | Get the type name of a value | `(type 42)` → `i64` |
-| `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
+| `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N v4 GUIDs, seeded from the OS (`(guid 0)` → `[]`) | `(guid 1)` |
@@ -620,6 +620,7 @@ Type checking, casting, null testing, and object inspection.
 (type [1 2 3])              ; I64
 (type "hello")              ; str
 (as 'f64 [1 2 3])          ; [1.0 2.0 3.0]
+(type (as 'LIST [1 2]))    ; LIST (two i64 atoms; a LIST is returned unchanged)
 (nil? 0Ni)                   ; true
 
 ; Generate a batch of GUIDs
@@ -725,7 +726,7 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory; optional `{compress: bool}` | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | — | Load splayed table from a directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |
