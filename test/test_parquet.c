@@ -873,7 +873,8 @@ static test_result_t test_pq_optional_bulk(void) {
 }
 /* A cancellation requested while the bulk gate certifies a large all-present
  * page is observed inside that scan, before any value is copied: the first
- * read reports "cancel" and the scan stops at the next coarse checkpoint. */
+ * read reports "cancel" and the scan stops at the next coarse checkpoint.
+ * The request passes the admission rule so certification actually runs. */
 static test_result_t test_pq_cert_cancel(void) {
 #if !defined(DEBUG)
     SKIP("debug builds expose the certification seam");
@@ -883,7 +884,7 @@ static test_result_t test_pq_cert_cancel(void) {
     TEST_ASSERT_TRUE(pq_synth_optional(path,65536,1,0,false));
     ray_clear_interrupt();
     ray_parquet_t* r = NULL;
-    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,1,&r));
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,65536,&r));
     ray_parquet_test_cert_interrupt_after(1);
     ray_t* res = ray_parquet_next(r);
     ray_clear_interrupt();
@@ -893,6 +894,53 @@ static test_result_t test_pq_cert_cancel(void) {
     ray_error_free(res);
     ray_parquet_close(r);
     unlink(path);
+    PASS();
+#endif
+}
+/* Certification is admitted at the batch boundary only when the request can
+ * amortize it. The seam reports the last scan's level count, so a read that
+ * skipped certification is distinguishable from one that certified the page. */
+static test_result_t test_pq_cert_admission(void) {
+#if !defined(DEBUG)
+    SKIP("debug builds expose the certification seam");
+#else
+    char big[160], page[160];
+    snprintf(big,sizeof(big),"/tmp/rayforce-pq-cert-admit-big-%d.parquet",(int)getpid());
+    snprintf(page,sizeof(page),"/tmp/rayforce-pq-cert-admit-page-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth_optional(big,200000,1,0,false));
+    TEST_ASSERT_TRUE(pq_synth_optional(page,65536,1,0,false));
+    ray_clear_interrupt();
+    /* A known seam value that neither small-batch read below can produce. */
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(page,NULL,65536,&r));
+    ray_t* t = ray_parquet_next(r);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t),65536);
+    ray_release(t); ray_parquet_close(r);
+    TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(),65536);
+    /* One row, and one row below the threshold: no certification at all. */
+    int64_t small[] = {1,16383};
+    for (int k = 0; k < 2; k++) {
+        r = NULL;
+        TEST_ASSERT_NULL(ray_parquet_open(big,NULL,small[k],&r));
+        t = ray_parquet_next(r);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_nrows(t),small[k]);
+        ray_release(t); ray_parquet_close(r);
+        TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(),65536);
+    }
+    /* At the threshold the same 200000-row page certifies in full. */
+    int64_t admitted[] = {16384,65536};
+    for (int k = 0; k < 2; k++) {
+        r = NULL;
+        TEST_ASSERT_NULL(ray_parquet_open(big,NULL,admitted[k],&r));
+        t = ray_parquet_next(r);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_table_nrows(t),admitted[k]);
+        ray_release(t); ray_parquet_close(r);
+        TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(),200000);
+    }
+    unlink(big); unlink(page);
     PASS();
 #endif
 }
@@ -4556,6 +4604,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},
+    {"parquet/cert_admission",test_pq_cert_admission,pq_setup,pq_teardown},
     {"parquet/read_metadata",test_pq_read_meta,pq_setup,pq_teardown},
     {"parquet/corrupt",test_pq_corrupt,pq_setup,pq_teardown},
     {"parquet/native",test_pq_native,pq_setup,pq_teardown},
