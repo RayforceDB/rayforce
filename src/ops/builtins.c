@@ -1507,6 +1507,10 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         else if (cast_match(tn, tl, "TIMESTAMP") || cast_match(tn, tl, "timestamp")) tt = -RAY_TIMESTAMP;
         else if (cast_match(tn, tl, "GUID") || cast_match(tn, tl, "guid")) tt = -RAY_GUID;
         else if (cast_match(tn, tl, "STR") || cast_match(tn, tl, "str")) { ray_release(s2); return ray_str("", 0); }
+        else if (cast_match(tn, tl, "LIST")) {
+            ray_release(s2);
+            return ray_error("type", "as: cannot cast %s to list", ray_type_name(val->type));
+        }
         ray_release(s2);
         if (tt == -RAY_U8) return ray_u8(0);
         if (tt == -RAY_BOOL) {
@@ -2177,6 +2181,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_U8);
         return ray_error("type", "as: cannot cast %s to u8", ray_type_name(val->type));
+    }
+    /* Cast to LIST: a typed vector is boxed into a LIST of atoms (null cells
+     * stay typed null atoms); a LIST is returned unchanged.  There is no
+     * one-item list for an atom, a dict or a table: those are rejected. */
+    if (cast_match(tname, tlen, "LIST")) {
+        ray_release(s);
+        if (val->type == RAY_LIST || ray_is_vec(val)) return to_boxed_list(val);
+        return ray_error("type", "as: cannot cast %s to list", ray_type_name(val->type));
     }
     /* Cast to DICT */
     if (cast_match(tname, tlen, "DICT")) {

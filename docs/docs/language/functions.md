@@ -447,7 +447,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `type` | unary | Get type name of a value | `(type 42)` → `i64` |
-| `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
+| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`) | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
