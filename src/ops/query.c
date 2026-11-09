@@ -3981,8 +3981,16 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
     return columns != 0;
 }
 
+/* Is `fn`, the current binding of a head symbol, the builtin unary `native`
+ * (or no binding at all)?  A name can be rebound to another native, so the
+ * object type alone does not identify the verb: compare its callback. */
+static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
+    return !fn || (fn->type == RAY_UNARY &&
+                   (ray_unary_fn)(uintptr_t)fn->i64 == native);
+}
+
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * collection builtin (distinct, asc, desc, reverse, where, enlist) that
+ * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
  * has no bucket for these — they are neither element-wise ops nor
  * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
@@ -4056,7 +4064,15 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
            (l == 5 && memcmp(p, "where", 5) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
-           (l == 4 && memcmp(p, "desc", 4) == 0);
+           (l == 4 && memcmp(p, "desc", 4) == 0) ||
+           /* grade/rank: only while the name is still the builtin, so a
+            * rebound `rank` keeps its per-row projection semantics. */
+           (l == 4 && memcmp(p, "iasc", 4) == 0 &&
+            head_is_builtin_unary(fn, ray_iasc_fn)) ||
+           (l == 5 && memcmp(p, "idesc", 5) == 0 &&
+            head_is_builtin_unary(fn, ray_idesc_fn)) ||
+           (l == 4 && memcmp(p, "rank", 4) == 0 &&
+            head_is_builtin_unary(fn, ray_rank_fn));
 }
 
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
