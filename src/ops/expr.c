@@ -3598,6 +3598,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         }
         if (op->opcode == OP_NEG) return ray_neg_fn(input);
         if (op->opcode == OP_ABS) return ray_abs_fn(input);
+        if (op->opcode == OP_NOT) return ray_not_fn(input);
         if (op->opcode != OP_ISNULL) return ray_error("type", "unsupported duration unary operation");
     }
 
