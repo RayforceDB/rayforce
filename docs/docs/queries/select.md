@@ -118,8 +118,8 @@ its argument resolves first, so `(enlist 'price)` enlists the `price` column.
 ### Whole-column projections
 
 A projection may be a whole-column verb — `distinct`, `asc`, `desc`,
-`reverse`, or `where` — applied to a column. Unlike a per-row computed
-expression, these consume the entire column and return a vector, so the
+`reverse`, `iasc`, `idesc`, `rank`, or `where` — applied to a column. Unlike a
+per-row computed expression, these consume the entire column and return a vector, so the
 result's row count can differ from the source table (`distinct` in particular
 collapses duplicates, `where` keeps the positions of the true rows):
 
@@ -147,6 +147,9 @@ The positions `where` returns count those rows, not the table's:
 ; 0
 ; 1
 ; 2
+
+(set g (table [k v] (list [1 1 2 2 2] [10 20 40 30 50])))
+(select {i: (iasc v) from: g where: (> k 1)})   ; i: [1 0 2]
 ```
 
 Because a whole-column verb changes the row count, it cannot be mixed with a
@@ -204,7 +207,8 @@ select them first:
 ```
 
 The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
-`desc`, `reverse`, `where`) are different: they see the surviving rows only.
+`desc`, `reverse`, `iasc`, `idesc`, `rank`, `where`) are different: they see the
+surviving rows only.
 
 ### Group-by Aggregation
 

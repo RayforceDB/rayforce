@@ -77,6 +77,13 @@ static inline float ray_cast_f64_to_f32_null(double v) {
     return (float)v;
 }
 
+/* A computed F32 result (aggregate extreme, first/last) follows the single-null
+ * float model instead: past FLT_MAX or non-finite is the null, never a
+ * clamped value that is not in the column.  NaN fails the comparison. */
+static inline float ray_f64_to_f32_fin(double v) {
+    return (v <= (double)FLT_MAX && v >= -(double)FLT_MAX) ? (float)v : NULL_F32;
+}
+
 static inline uint8_t ray_cast_f64_to_u8_null(double v) {
     if (v != v || v <= 0.0) return 0;
     if (v >= (double)UINT8_MAX) return UINT8_MAX;

@@ -49,8 +49,21 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 | `span % span`, `span * span` | Type error |
 | Comparisons with another span or an integer count | BOOL |
 | `sum spans` | TIMESPAN; skips nulls |
-| `avg spans` | F64 nanoseconds; skips nulls |
+| `avg spans`, `med spans`, `quantile spans p` | TIMESPAN, rounded to the nanosecond (half away from zero); skip nulls |
+| `dev`, `stddev`, `stddev_pop`, `mdev` | TIMESPAN; a variance is a squared duration and stays F64 |
 | `min`, `max`, `first`, `last` | Preserve TIMESPAN |
+| `sums`, `mins`, `maxs`, `msum`, `mmin`, `mmax`, `deltas` | TIMESPAN |
+| `avgs`, `mavg` | TIMESPAN, rounded to the nanosecond |
+| `ratios` | F64 |
+| `not span` | BOOL; true for a zero or null duration, element-wise over a vector |
+
+`avg`, `med` and `quantile` of a vector are exact to the nanosecond at any
+magnitude: the total is summed in 128 bits and the order statistics are
+taken from the integer values. The grouped aggregates, `avgs`, `mavg`,
+`mdev` and the deviations compute in F64 and round back, so they are exact
+up to 2^53 nanoseconds (about 104 days) per value.
+
+Inside a query the same functions give the same answers, nulls included.
 
 On empty or all-null duration vectors, `min` returns `0Wn` and `max`
 returns `-0Wn`.
