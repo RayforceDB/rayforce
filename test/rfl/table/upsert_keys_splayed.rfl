@@ -1,0 +1,84 @@
+;; Keyed upsert on a splayed (mapped) table.  The fast path declines there,
+;; so the legacy match scan runs; it used to read I16 / U8 / GUID key cells
+;; as int64 (neighbouring cells, never matching) and append a duplicate row
+;; instead of updating.  Each key type must update on a hit and append on a
+;; miss, exactly as the in-memory table does.
+(.sys.exec "rm -rf /tmp/rfl_ups_keys/") -- 0
+
+;; I16
+(set t (table [k v] (list (as 'I16 [1 2 3]) [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/i16/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/i16/"))
+(upsert 's 1 (list (as 'I16 1) 99)) -- 's
+(count s) -- 3
+(at s 'v) -- [99 20 30]
+(upsert 's 1 (list (as 'I16 3) 77)) -- 's
+(at s 'v) -- [99 20 77]
+(upsert 's 1 (list (as 'I16 9) 5)) -- 's
+(count s) -- 4
+(at s 'k) -- (as 'I16 [1 2 3 9])
+(upsert 't 1 (list (as 'I16 1) 99)) -- 't
+(at t 'v) -- [99 20 30]
+
+;; U8
+(set t (table [k v] (list (as 'U8 [1 2 3]) [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/u8/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/u8/"))
+(upsert 's 1 (list (as 'U8 2) 99)) -- 's
+(count s) -- 3
+(at s 'v) -- [10 99 30]
+(upsert 's 1 (list (as 'U8 200) 5)) -- 's
+(count s) -- 4
+
+;; GUID
+(set gv (guid 3))
+(set t (table [k v] (list gv [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/guid/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/guid/"))
+;; a non-guid value against a guid key is a type error, table untouched.
+;; This must run on the freshly loaded table: after a successful in-place
+;; upsert it is in memory and the fast path's own error would answer.
+(upsert 's 1 (list 1 5)) !- type
+(count s) -- 3
+(upsert 's 1 (list (at gv 1) 99)) -- 's
+(count s) -- 3
+(at s 'v) -- [10 99 30]
+(upsert 's 1 (list (at (guid 1) 0) 5)) -- 's
+(count s) -- 4
+
+;; SYM and STR key columns, a mistyped key value, on freshly loaded tables
+(set t (table [k v] (list ['a 'b 'c] [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/sym/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/sym/"))
+(upsert 's 1 (list 1 5)) !- type
+(count s) -- 3
+(set t (table [k v] (list (list "a" "b" "c") [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/str/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/str/"))
+(upsert 's 1 (list 1 5)) !- type
+(count s) -- 3
+
+;; F32 (matches by value; an F64 atom is narrowed first; null never matches)
+(set t (table [k v] (list (as 'F32 [1.5 2.5 3.5]) [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/f32/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/f32/"))
+(upsert 's 1 (list (as 'F32 2.5) 99)) -- 's
+(count s) -- 3
+(at s 'v) -- [10 99 30]
+(upsert 's 1 (list 3.5 88)) -- 's
+(count s) -- 3
+(at s 'v) -- [10 99 88]
+(upsert 's 1 (list 9.5 5)) -- 's
+(count s) -- 4
+(upsert 's 1 (list 0Ne 6)) -- 's
+(upsert 's 1 (list 0Ne 7)) -- 's
+(count s) -- 6
+
+;; I32 control: the width that already worked
+(set t (table [k v] (list (as 'I32 [1 2 3]) [10 20 30])))
+(.db.splayed.set "/tmp/rfl_ups_keys/i32/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keys/i32/"))
+(upsert 's 1 (list (as 'I32 2) 99)) -- 's
+(count s) -- 3
+
+(.sys.exec "rm -rf /tmp/rfl_ups_keys/") -- 0
