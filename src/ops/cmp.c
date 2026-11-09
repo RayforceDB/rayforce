@@ -499,6 +499,13 @@ ray_t* ray_not_fn(ray_t* x) {
         r->len = n;
         return r;
     }
+    /* `not` has no meaning for the cells of a STR, SYM or GUID vector.  It
+     * used to fall through to the atom rule and answer one boolean for the
+     * whole vector; raise instead, as the compiled `not` does. */
+    if (ray_is_vec(x) && (x->type == RAY_STR || x->type == RAY_SYM ||
+                          x->type == RAY_GUID))
+        return ray_error("type", "not: expects a numeric argument, got %s",
+                         ray_type_name(x->type));
     /* A LIST, element by element: a nested list recurses, and all-boolean
      * results make a B8 vector. */
     if (is_list(x)) {
