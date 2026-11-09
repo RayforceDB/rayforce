@@ -2362,7 +2362,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     scratch_free(ix_first_hdr);
     scratch_free(pv_first_hdr);
     ray_progress_update("pivot", "scatter", 0, (uint64_t)pv_count);
-    bool val_is_f64 = vcol->type == RAY_F64;
+    /* The group accumulators hold F32 and F64 values alike in F64 lanes;
+     * min / max / first / last of an F32 column are F32 cells. */
+    bool val_is_f64 = vcol->type == RAY_F64 || vcol->type == RAY_F32;
     int8_t out_agg_type;
     switch (agg_op) {
         case OP_AVG:   out_agg_type = RAY_F64; break;
@@ -2504,7 +2506,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 int64_t nn = (ly.off_nn && s >= 0)
                     ? ((const int64_t*)(const void*)(row + ly.off_nn))[s] : cnt;
 
-            if (out_agg_type == RAY_F64) {
+            if (out_agg_type == RAY_F64 || out_agg_type == RAY_F32) {
                 double v;
                 switch (agg_op) {
                     case OP_SUM:
@@ -2539,7 +2541,11 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 /* Single-null float model: canonicalize non-finite (avg
                  * division, sum overflow) to NULL_F64; HAS_NULLS set by the
                  * scan below before new_col is added to the result. */
-                ((double*)ray_data(new_col))[r] = ray_f64_fin(v);
+                v = ray_f64_fin(v);
+                if (out_agg_type == RAY_F32)
+                    ((float*)ray_data(new_col))[r] = v != v ? NULL_F32 : (float)v;
+                else
+                    ((double*)ray_data(new_col))[r] = v;
             } else {
                 int64_t v;
                 int64_t int_null = agg_int_null_sentinel_for(out_agg_type);
@@ -2604,6 +2610,12 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 memcpy(&fv, &pval, 8);
                 fv = clear_neg_zero(fv);
                 len = snprintf(buf, sizeof(buf), "%g", fv);
+            } else if (pt == RAY_F32) {
+                /* the key holds the float's bits */
+                uint32_t bits = (uint32_t)pval;
+                float f;
+                memcpy(&f, &bits, 4);
+                len = snprintf(buf, sizeof(buf), "%g", clear_neg_zero((double)f));
             } else if (pt == RAY_BOOL) {
                 len = snprintf(buf, sizeof(buf), "%s", pval ? "true" : "false");
             } else if (pt == RAY_I64 || pt == RAY_I32 || pt == RAY_I16 ||
