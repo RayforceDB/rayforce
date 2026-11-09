@@ -2827,15 +2827,13 @@ done_sigint_eval:
 }
 #endif
 
-/* SIGINT during eval (poll mode) — exercises lines 741-748.
- * Expected: child handles SIGINT, returns to prompt, accepts :q, exits
- * cleanly (rc=0).  Timeout (rc=-2) is acceptable under heavy CI load.
- * Any other exit code is a real bug worth investigating. */
+/* SIGINT during eval (poll mode).  Expected: child handles SIGINT, returns
+ * to prompt, accepts :q, exits cleanly (rc=0).  A timeout (rc=-2) is the
+ * :q lost: a SIGINT served after the bytes typed behind it clears them. */
 static test_result_t test_repl_pty_sigint_during_eval(void) {
 #ifndef RAY_OS_WINDOWS
     int rc = run_pty_sigint_during_eval(1);
-    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
-                    "unexpected child exit: %d", rc);
+    TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
 #endif
     PASS();
 }

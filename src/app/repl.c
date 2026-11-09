@@ -1007,6 +1007,14 @@ static ray_t* repl_read(ray_poll_t* poll, ray_selector_t* sel)
     ray_repl_t* repl = (ray_repl_t*)sel->data;
     ray_term_t* term = repl->term;
 
+    /* A SIGINT the loop has not served yet came before this byte: its pipe
+     * may be served after stdin in the same wakeup, which would clear what
+     * was typed after it. */
+    if (ray_term_interrupted()) {
+        ray_term_sigint_drain();
+        repl_clear_line(term);
+    }
+
     int64_t sz = ray_term_getc(term);
     if (sz <= 0) {
         if (sz == -2) {
