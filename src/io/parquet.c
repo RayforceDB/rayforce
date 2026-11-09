@@ -48,7 +48,10 @@
 #define PQ_BATCH 65536
 /* The OPTIONAL certification prepass is admitted only when the caller's
  * request can pull at least this many rows from the page: below that the
- * per-value path is cheaper (measured crossover between 16384 and 32768). */
+ * per-value path measured cheaper on the probe workload (200k/65k single-
+ * column pages: crossover near 18,700 and 6,500 rows respectively). The
+ * threshold is a workload heuristic - the crossing scales with page rows,
+ * so no fixed value is a universal amortization bound. */
 #define PQ_CERT_MIN 16384
 #define PQ_MAX_PART_ROWS 1048576
 #define PQ_MAX_COLS 4096

@@ -844,18 +844,25 @@ static test_result_t test_pq_optional_bulk(void) {
     TEST_ASSERT_EQ_I(total,4097);
     ray_parquet_close(r);
     unlink(path);
-    /* Sentinel collisions: non-strict yields nulls; strict refuses them. */
+    /* Sentinel collisions: non-strict yields nulls; strict refuses them.
+     * The page must pass admission (>= PQ_CERT_MIN rows) so this exercises
+     * the OPTIONAL bulk sentinel/HAS_NULLS route, not the per-value path;
+     * the seam counter proves certification actually ran. */
     snprintf(path,sizeof(path),"/tmp/rayforce-pq-opbulk-sentinel-%d.parquet",(int)getpid());
-    TEST_ASSERT_TRUE(pq_synth_optional(path,5,1,3,false));
+    TEST_ASSERT_TRUE(pq_synth_optional(path,20000,1,3,false));
     r = NULL;
-    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,5,&r));
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,20000,&r));
+#if defined(DEBUG)
+    ray_parquet_test_cert_interrupt_after(0);
+    TEST_ASSERT_TRUE(ray_parquet_test_cert_levels() >= 20000);
+#endif
     ray_t* t = ray_parquet_next(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_NOT_NULL(t);
     for (int c = 0; c < 3; c++) {
         ray_t* v = ray_table_get_col_idx(t,c);
         TEST_ASSERT_TRUE(ray_vec_is_null(v,0));
         TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
-        for (int64_t i = 1; i < 5; i++) TEST_ASSERT_FALSE(ray_vec_is_null(v,i));
+        for (int64_t i = 1; i < 20000; i++) TEST_ASSERT_FALSE(ray_vec_is_null(v,i));
     }
     ray_release(t); ray_parquet_close(r);
     int64_t keys[] = {ray_sym_intern("strict",6)};
