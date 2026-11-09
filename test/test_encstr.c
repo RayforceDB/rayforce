@@ -2466,6 +2466,69 @@ static test_result_t test_idict_first_touch_race(void) {
     PASS();
 }
 
+/* The automatic DICT is kept exactly when the file with it is no larger
+ * than the generation-0 payload, 16 B per row plus every pooled byte
+ * (#1094).  Each column is written twice through the column writer: once
+ * keeping the DICT whatever it costs (that file's size), once deciding.  The
+ * sweep crosses the bound in steps smaller than the region's padding, so a
+ * size estimate that leaves the padding out keeps a DICT that does not fit. */
+static uint64_t st_kif_write(ray_t* v, bool keep, uint8_t* kind, uint64_t* bound) {
+    FILE* f = fopen(STP("/kif"), "wb+");
+    if (!f) return 0;
+    ray_encw_t w; memset(&w, 0, sizeof w);
+    ray_encw_test_keep_dict(keep);
+    const char* pool = v->str_pool ? (const char*)ray_data(v->str_pool) : NULL;
+    ray_err_t e = ray_encw_begin(&w, f, RAY_STR, 0, v->len, 0, RAY_IDX_DICT, 0);
+    if (e == RAY_OK) e = ray_encw_chunk(&w, ray_data(v), pool, v->len);
+    if (e == RAY_OK) e = ray_encw_finish(&w);
+    ray_encw_test_keep_dict(false);
+    uint64_t size = 0;
+    ray_enc_hdr_t eh;
+    if (e == RAY_OK && fseek(f, 32, SEEK_SET) == 0 && fread(&eh, 1, sizeof eh, f) == sizeof eh &&
+        fseek(f, 0, SEEK_END) == 0) {
+        long end = ftell(f);
+        if (end > 0) {
+            size = (uint64_t)end;
+            *kind = eh.index_kind;
+            *bound = 16ull * (uint64_t)v->len + w.str_occ_bytes;
+        }
+    }
+    ray_encw_free(&w);
+    fclose(f);
+    return size;
+}
+
+static test_result_t test_idict_kept_iff_fits(void) {
+    static const int lens[] = { 13, 20, 33 };
+    int kept = 0, dropped = 0;
+    for (int li = 0; li < 3; li++) {
+        for (int k = 1; k <= 256; k++) {
+            ray_t* v = ray_vec_new(RAY_STR, 256);
+            for (int i = 0; i < 256 && v && !RAY_IS_ERR(v); i++) {
+                char b[40];
+                snprintf(b, sizeof b, "%0*d", lens[li], i % k);
+                v = ray_str_vec_append(v, b, (size_t)lens[li]);
+            }
+            TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+            uint8_t kind_with = 0, kind = 0;
+            uint64_t bound = 0, bound2 = 0;
+            uint64_t with = st_kif_write(v, true, &kind_with, &bound);
+            uint64_t size = st_kif_write(v, false, &kind, &bound2);
+            ray_release(v);
+            TEST_ASSERT_TRUE(with > 0 && size > 0);
+            TEST_ASSERT_EQ_I(kind_with, RAY_IDX_DICT);
+            bool fits = with <= bound;
+            TEST_ASSERT_FMT(kind == (fits ? RAY_IDX_DICT : 0),
+                            "%d-byte strings, %d distinct: %llu bytes with the DICT against %llu, index kind %d",
+                            lens[li], k, (unsigned long long)with, (unsigned long long)bound, kind);
+            TEST_ASSERT_EQ_U(size, fits ? with : size);
+            if (fits) kept++; else dropped++;
+        }
+    }
+    TEST_ASSERT_TRUE(kept > 0 && dropped > 0);            /* the sweep crosses the bound */
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
@@ -2511,5 +2574,6 @@ const test_entry_t encstr_entries[] = {
     { "encstr/idict_filter_parted", test_idict_filter_parted, st_q_setup, st_q_teardown },
     { "encstr/idict_filter_in",   test_idict_filter_in, st_q_setup, st_q_teardown },
     { "encstr/idict_filter_parted_mixed", test_idict_filter_parted_mixed, st_q_setup, st_q_teardown },
+    { "encstr/idict_kept_iff_fits",  test_idict_kept_iff_fits,  st_setup,   st_teardown },
     { NULL, NULL, NULL, NULL },
 };

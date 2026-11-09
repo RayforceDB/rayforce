@@ -2965,6 +2965,7 @@ static test_result_t test_dict_write_layout(void) {
     TEST_ASSERT_EQ_U(d.bytes_len, 7);
     for (int i = 16 + 48; i < 96; i++) TEST_ASSERT_EQ_I(b[i], 0);   /* kind-area tail, root padding */
     TEST_ASSERT_EQ_U(n, ix_p32((uint64_t)d.bytes + 7));
+    TEST_ASSERT_EQ_U(ray_enc_dict_region_bytes(s.len, s.n_distinct, s.bytes_len), n);   /* the size encw decides on */
     uint64_t last; memcpy(&last, b + d.offs + 4 * 8, 8);
     TEST_ASSERT_EQ_U(last, 7);                                      /* the terminal offset */
     TEST_ASSERT_TRUE(memcmp(b + d.bytes, "abbdddd", 7) == 0);

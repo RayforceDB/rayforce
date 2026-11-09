@@ -1185,17 +1185,19 @@ static ray_err_t encw_side(ray_encw_t* w, uint64_t* side_off, uint64_t* side_len
 }
 
 /* The automatic STR DICT stores a second copy of every distinct string, plus
- * its codes and offsets.  It is kept only while the column written so far
- * plus that region stays no larger than the generation-0 payload (16 B
- * descriptor per row plus every pooled byte): a distinct-heavy column (raw
- * messages, payloads) would otherwise save at about twice its raw size,
- * though every vector fell back to raw (#1094).  Low- and mixed-cardinality
- * columns, whose encoding is small, keep it. */
+ * its codes and offsets.  It is kept only while the file with it (the column
+ * written so far, padded to the region, plus the region exactly as
+ * ray_enc_dict_write lays it out) stays no larger than the generation-0
+ * payload (16 B descriptor per row plus every pooled byte): a distinct-heavy
+ * column (raw messages, payloads) would otherwise save at about twice its
+ * raw size, though every vector fell back to raw (#1094).  Low-cardinality
+ * columns, whose encoding and region are small, keep it. */
 static bool encw_dict_unpaid(const ray_encw_t* w) {
     if (atomic_load(&g_encw_keep_dict)) return false;
     const ray_dict_acc_t* a = w->idict;
-    uint64_t region = 96 + 4ull * (uint64_t)w->len + 12ull * (uint64_t)a->n_distinct + 8 + a->pool_len;
-    return w->pos + region > 16ull * (uint64_t)w->len + w->str_occ_bytes;
+    uint64_t region = ray_enc_dict_region_bytes(w->len, a->n_distinct, a->pool_len);
+    uint64_t bound = 16ull * (uint64_t)w->len + w->str_occ_bytes;
+    return region > bound || ray_enc_pad32(w->pos) > bound - region;
 }
 
 ray_err_t ray_encw_finish(ray_encw_t* w) {

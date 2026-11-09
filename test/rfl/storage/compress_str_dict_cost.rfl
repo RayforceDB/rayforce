@@ -1,9 +1,9 @@
-;; @requires: posix  (byte counts run through a POSIX shell via .sys.exec)
 ;; A generation-2 save does not persist the automatic STR DICT when the encoded
 ;; column plus the region would exceed the generation-0 payload (#1094): a
 ;; distinct-heavy long-text column stays raw-sized with compress: true, with
 ;; no index, and reads and filters as before.  A low-cardinality column keeps
-;; its DICT.
+;; its DICT.  Every generation-2 writer decides per file: an explicit
+;; index: true, a re-save, a loaded table, each partition and .csv.splayed.
 (.sys.exec "rm -rf /tmp/rf_test_strdict_cost") -- 0
 (set n 70000)
 (set i (til n))
@@ -13,7 +13,9 @@
 (set lo (as 'STR (map (fn [j] (format "k%" (% j 977))) i)))
 (set t (table [r s] (list big lo)))
 (.db.splayed.set "/tmp/rf_test_strdict_cost/raw/" t {compress: false index: false})
+(.db.splayed.set "/tmp/rf_test_strdict_cost/g0/" t {compress: false})
 (.db.splayed.set "/tmp/rf_test_strdict_cost/z/" t {compress: true})
+(.db.splayed.set "/tmp/rf_test_strdict_cost/zi/" t {compress: true index: true})
 (.db.splayed.set "/tmp/rf_test_strdict_cost/zni/" t {compress: true index: false})
 (set Z (.db.splayed.get "/tmp/rf_test_strdict_cost/z/"))
 (set N (.db.splayed.get "/tmp/rf_test_strdict_cost/zni/"))
@@ -25,10 +27,16 @@
 ;; low cardinality: the DICT stays
 (at (.idx.info Z 's) 'index) -- 'dict
 (at (.idx.info N 's) 'index) -- 'none
+;; an explicit index: true is the default and does not override the rule
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/zi/") 'r) 'index) -- 'none
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/zi/") 's) 'index) -- 'dict
+;; generation 0 is not affected
+(at (at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/g0/") 'r) 'index) 'kind) -- 'dict
 
-;; the compressed column is not meaningfully larger than the raw one
-(.sys.exec "test $(find /tmp/rf_test_strdict_cost/z -name r -type f -exec cat {} + | wc -c | tr -d ' ') -le $(( $(find /tmp/rf_test_strdict_cost/raw -name r -type f -exec cat {} + | wc -c | tr -d ' ') * 105 / 100 ))") -- 0
-(.sys.exec "test $(find /tmp/rf_test_strdict_cost/z -name r -type f -exec cat {} + | wc -c | tr -d ' ') -eq $(find /tmp/rf_test_strdict_cost/zni -name r -type f -exec cat {} + | wc -c | tr -d ' ')") -- 0
+;; the compressed column is not meaningfully larger than the raw one, and
+;; is the index: false file byte for byte in size
+(<= (.fs.size "/tmp/rf_test_strdict_cost/z/r") (/ (* 105 (.fs.size "/tmp/rf_test_strdict_cost/raw/r")) 100)) -- true
+(== (.fs.size "/tmp/rf_test_strdict_cost/z/r") (.fs.size "/tmp/rf_test_strdict_cost/zni/r")) -- true
 
 ;; values and queries are unchanged without the index
 (all (== (at Z 'r) big)) -- true
@@ -36,5 +44,34 @@
 (count (select {from: Z where: (== r (at big 12345))})) -- 1
 (count (distinct (at Z 'r))) -- n
 (count (select {from: Z where: (== s "k5")})) -- (count (select {from: t where: (== s "k5")}))
+
+;; distinct short strings (inline, 16 B a row raw) lose the DICT the same way
+(set ids (as 'STR (map (fn [j] (format "id%" j)) i)))
+(set u (table [d s] (list ids lo)))
+(.db.splayed.set "/tmp/rf_test_strdict_cost/u/" u {compress: true})
+(set U (.db.splayed.get "/tmp/rf_test_strdict_cost/u/"))
+(at (.idx.info U 'd) 'index) -- 'none
+(at (.idx.info U 's) 'index) -- 'dict
+(count (select {from: U where: (== d "id4242")})) -- 1
+;; a re-save over the generation-2 directory inherits generation 2 and
+;; decides again; so does saving the loaded table to a new directory
+(.db.splayed.set "/tmp/rf_test_strdict_cost/u/" u)
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/u/") 'd) 'gen) -- 2
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/u/") 'd) 'index) -- 'none
+(.db.splayed.set "/tmp/rf_test_strdict_cost/u2/" U)
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/u2/") 'd) 'index) -- 'none
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/u2/") 's) 'index) -- 'dict
+;; each partition decides for its own rows
+(.db.splayed.set "/tmp/rf_test_strdict_cost/pt/2024.01.01/t/" (table [v] (list lo)) {compress: true})
+(.db.splayed.set "/tmp/rf_test_strdict_cost/pt/2024.01.02/t/" (table [v] (list ids)) {compress: true})
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/pt/2024.01.01/t/") 'v) 'index) -- 'dict
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/pt/2024.01.02/t/") 'v) 'index) -- 'none
+(set P (.db.parted.get "/tmp/rf_test_strdict_cost/pt/" 't))
+(count (select {from: P where: (== v "id4242")})) -- 1
+(count (select {from: P where: (== v "k5")})) -- (count (select {from: t where: (== s "k5")}))
+;; the CSV streaming writer applies the same rule
+(.csv.write (table [d] (list ids)) "/tmp/rf_test_strdict_cost/ids.csv")
+(.csv.splayed {compress: true} [STR] "/tmp/rf_test_strdict_cost/ids.csv" "/tmp/rf_test_strdict_cost/csv/")
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_cost/csv/") 'd) 'index) -- 'none
 
 (.sys.exec "rm -rf /tmp/rf_test_strdict_cost") -- 0

@@ -389,6 +389,15 @@ ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes)
     return NULL;
 }
 
+/* The writer's layout above, sized without writing (test_encidx pins the two
+ * equal). */
+uint64_t ray_enc_dict_region_bytes(int64_t len, int64_t n_distinct, uint64_t bytes_len) {
+    const uint64_t nd = (uint64_t)n_distinct;
+    uint64_t cb[4] = { (uint64_t)len * 4, nd * 4, (nd + 1) * 8, bytes_len };
+    ei_layout_t L;
+    return ei_layout(4, cb, 0, &L) ? L.end : UINT64_MAX;
+}
+
 /* ===== Reading a region we wrote =====
  *
  * The region is taken as written: the root names every child's offset and
