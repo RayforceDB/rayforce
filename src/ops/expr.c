@@ -1122,6 +1122,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                      (s2 != 0xFF && op_child(g, node, 1)->out_type == RAY_SYM)))
                     EXPR_BAIL(EXPR_BAIL_OTHER);
 
+                /* A SYM lane is an intern id, not a number: `not` over it has
+                 * no meaning.  Leave it to the typed fallback, which raises
+                 * the type error whatever the column holds. */
+                if (op == OP_NOT && op_child(g, node, 0)->out_type == RAY_SYM)
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
+
                 /* Determine output type */
                 if (op == OP_CAST)
                     ot = node->out_type;

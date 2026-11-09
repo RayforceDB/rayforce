@@ -1,0 +1,66 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; .db.splayed.set {durable: false} takes the bulk path: no fsync, so a crash
+;; may lose or tear the write; the renames stay atomic and the data reads back
+;; the same.  true, the default, is the durable write as before.
+(.sys.exec "rm -rf /tmp/rf_test_durable_opt") -- 0
+(set n 70000)
+(set i (til n))
+(set t (table [s v y] (list (as 'STR (map (fn [j] (format "k%" (% j 977))) i)) (% (* i 7919) 1000003) (as 'SYMBOL (map (fn [j] (format "s%" (% j 13))) i)))))
+
+;; round trip, durable false and true
+(.db.splayed.set "/tmp/rf_test_durable_opt/a/" t {durable: false})
+(.db.splayed.set "/tmp/rf_test_durable_opt/b/" t {durable: true})
+(.db.splayed.set "/tmp/rf_test_durable_opt/c/" t)
+(set A (.db.splayed.get "/tmp/rf_test_durable_opt/a/"))
+(set B (.db.splayed.get "/tmp/rf_test_durable_opt/b/"))
+(set C (.db.splayed.get "/tmp/rf_test_durable_opt/c/"))
+(count A) -- 70000
+(all (== (at A 'v) (at t 'v))) -- true
+(all (== (at A 's) (at t 's))) -- true
+(all (== (at A 'y) (at t 'y))) -- true
+(all (== (at A 'v) (at B 'v))) -- true
+(all (== (at C 'y) (at B 'y))) -- true
+
+;; combined with compress and index, and with symfile 'column
+(.db.splayed.set "/tmp/rf_test_durable_opt/d/" t {durable: false compress: true})
+(.db.splayed.set "/tmp/rf_test_durable_opt/e/" t {durable: false index: false})
+(.db.splayed.set "/tmp/rf_test_durable_opt/f/" t {durable: false compress: true index: false symfile: 'column})
+(.db.splayed.set "/tmp/rf_test_durable_opt/g/" t {symfile: 'column durable: true})
+(set D (.db.splayed.get "/tmp/rf_test_durable_opt/d/"))
+(set E (.db.splayed.get "/tmp/rf_test_durable_opt/e/"))
+(set F (.db.splayed.get "/tmp/rf_test_durable_opt/f/"))
+(set G (.db.splayed.get "/tmp/rf_test_durable_opt/g/"))
+(at (.idx.info D 'v) 'gen) -- 2
+(at (.idx.info D 'v) 'index) -- 'chunk_zone
+(nil? (.idx.info (at E 'v))) -- true
+(at (.idx.info F 's) 'index) -- 'none
+(all (== (at D 's) (at t 's))) -- true
+(all (== (at E 'y) (at t 'y))) -- true
+(all (== (at F 'y) (at t 'y))) -- true
+(all (== (at F 'v) (at G 'v))) -- true
+(.sys.exec "test -f /tmp/rf_test_durable_opt/f/.y.sym") -- 0
+
+;; overwrite of an existing directory, in both directions
+(set u (table [s v y] (list (as 'STR (map (fn [j] (format "z%" (% j 31))) i)) (+ 1 (til n)) (as 'SYMBOL (map (fn [j] (format "q%" (% j 7))) i)))))
+(.db.splayed.set "/tmp/rf_test_durable_opt/a/" u {durable: false})
+(set A2 (.db.splayed.get "/tmp/rf_test_durable_opt/a/"))
+(all (== (at A2 'v) (at u 'v))) -- true
+(all (== (at A2 'y) (at u 'y))) -- true
+(.db.splayed.set "/tmp/rf_test_durable_opt/a/" t {durable: true})
+(set A3 (.db.splayed.get "/tmp/rf_test_durable_opt/a/"))
+(all (== (at A3 'v) (at t 'v))) -- true
+(all (== (at A3 's) (at t 's))) -- true
+(.db.splayed.set "/tmp/rf_test_durable_opt/b/" u {durable: false compress: true})
+(all (== (at (.db.splayed.get "/tmp/rf_test_durable_opt/b/") 'v) (at u 'v))) -- true
+
+;; after a symbol path, as a partition of a parted table is written
+(.db.splayed.set "/tmp/rf_test_durable_opt/p/2026.01.01/t/" t "/tmp/rf_test_durable_opt/p/.sym" {durable: false})
+(count (.db.parted.get "/tmp/rf_test_durable_opt/p" 't)) -- 70000
+
+;; a non-bool is a domain error; an unknown option is still one and names durable
+(.db.splayed.set "/tmp/rf_test_durable_opt/x/" t {durable: 1}) !- domain
+(.db.splayed.set "/tmp/rf_test_durable_opt/x/" t {durable: 'no}) !- domain
+(.db.splayed.set "/tmp/rf_test_durable_opt/x/" t {durable: "false"}) !- domain
+(.db.splayed.set "/tmp/rf_test_durable_opt/x/" t {bogus: true}) !- domain
+(.sys.exec "test -e /tmp/rf_test_durable_opt/x") -- 1
+(.sys.exec "rm -rf /tmp/rf_test_durable_opt") -- 0

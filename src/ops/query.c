@@ -24440,8 +24440,9 @@ by_dict_done:
                 col->len = n_groups;
                 int64_t* out = (int64_t*)ray_data(col);
                 int64_t bias = dep_key_biases[dk];
+                /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
                 for (int64_t i = 0; i < n_groups; i++)
-                    out[i] = key_col_read_i64(base_col, i) + bias;
+                    out[i] = (int64_t)((uint64_t)key_col_read_i64(base_col, i) + (uint64_t)bias);
                 result = ray_table_add_col(result, dep_key_names[dk], col);
                 ray_release(col);
                 if (RAY_IS_ERR(result)) {
