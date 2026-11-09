@@ -648,7 +648,9 @@ static int csv_valid_table_name(const char* name) {
 }
 
 /* The loaders return a bare code; the column cap also leaves its message
- * ("got N (max 256)") in the error slot, which is kept here. */
+ * ("got N (max 256)") in the error slot, which is kept here.  Callers clear
+ * the slot before the loader runs, so a message left by an earlier error is
+ * never attached to this one. */
 static ray_t* csv_loader_error(ray_err_t err) {
     const char* m = err == RAY_ERR_LIMIT ? ray_error_msg() : NULL;
     if (!m) return ray_error(ray_err_code_str(err), NULL);
@@ -725,6 +727,7 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
         }
     }
 
+    ray_error_clear();   /* csv_loader_error may use only this call's message */
     ray_err_t err = ray_csv_save_splayed_mode(path, 0, header,
                                               types_arg, ncols,
                                               names_arg, ncols,
@@ -826,6 +829,7 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         return ray_error("io", "csv.parted: %s is left from an earlier failed import; remove it to retry",
                          staging);
 
+    ray_error_clear();   /* csv_loader_error may use only this call's message */
     ray_err_t err = ray_csv_save_parted_mode(path, 0, header,
                                               types_arg, ncols,
                                               names_arg, ncols,
