@@ -277,9 +277,15 @@ static ray_t* parse_number(ray_parser_t *p) {
         p->pos += 2;
 
         /* Two ASCII digits admit month/day up to 99; reject anything
-         * outside the calendar range before encoding.  ymd_to_date indexes
-         * MONTHDAYS[leap][month-1], so an unvalidated month (e.g. the
-         * literal 2024.81.03) reads off the end of that table. */
+         * outside the calendar range before encoding.  ymd_to_date is
+         * closed-form (days_from_civil) and clamps the March-based month
+         * index (month - 3, or month + 9 for Jan/Feb) to 0..11.  An
+         * out-of-range month therefore does not fail: it spills into the
+         * following year (2024.13.03 -> 2025.01.03), and from month 15 up
+         * the mp > 11 clamp pins it to February of the following year
+         * (2024.81.03 -> 2025.02.03); below month -9 the mp < 0 clamp pins
+         * it to March of the previous year.  Keep this
+         * check so such literals are a parse error instead. */
         if (month < 1 || month > 12 || day < 1 || day > 31)
             return ray_error("parse", "invalid date %04d.%02d.%02d: month must be 1-12, day 1-31", year, month, day);
 
@@ -571,22 +577,35 @@ static ray_t* parse_name(ray_parser_t *p) {
 static ray_t* parse_vector(ray_parser_t *p) {
     advance(p, 1); /* skip [ */
 
-    /* Collect parsed elements into a temporary array.  This lives on the
-     * HEAP, not the stack: parse_expr recurses back into parse_vector for
-     * each element, so a stack-resident 4096-pointer buffer (32 KB) per
-     * frame would let a nested "[[[[..." input exhaust the C stack.  A
-     * heap buffer keeps the recursive frame small (see RAY_PARSE_MAX_DEPTH). */
-    ray_t* elems_buf = ray_alloc(4096 * sizeof(ray_t*));
-    if (RAY_IS_ERR(elems_buf)) return elems_buf;
+    /* Keep the temporary array on the heap: nested vectors recurse into
+     * parse_expr.  Grow it with the literal instead of limiting a printed
+     * vector to 4096 elements. */
+    int32_t cap = 64;
+    ray_t* elems_buf = ray_alloc((size_t)cap * sizeof(ray_t*));
+    if (!elems_buf || RAY_IS_ERR(elems_buf)) return elems_buf ? elems_buf : ray_error("oom", NULL);
     ray_t** elems = (ray_t**)ray_data(elems_buf);
     int32_t count = 0;
 
     skip_ws_and_comments(p);
     while (*p->pos && *p->pos != ']') {
-        if (count >= 4096) {
-            for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+        if (count == cap) {
+            if (cap > INT32_MAX / 2) {
+                for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+                ray_free(elems_buf);
+                return ray_error("limit", "vector literal exceeds supported length");
+            }
+            int32_t next_cap = cap * 2;
+            ray_t* grown = ray_alloc((size_t)next_cap * sizeof(ray_t*));
+            if (!grown || RAY_IS_ERR(grown)) {
+                for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+                ray_free(elems_buf);
+                return grown ? grown : ray_error("oom", NULL);
+            }
+            memcpy(ray_data(grown), elems, (size_t)count * sizeof(ray_t*));
             ray_free(elems_buf);
-            return ray_error("limit", NULL);
+            elems_buf = grown;
+            elems = (ray_t**)ray_data(elems_buf);
+            cap = next_cap;
         }
         ray_t* elem = parse_expr(p);
         if (RAY_IS_ERR(elem)) {

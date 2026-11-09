@@ -118,7 +118,7 @@ typedef enum { RAY_SYMFILE_SHARED = 0, RAY_SYMFILE_COLUMN = 1 } ray_symfile_t;
  * loaded STR column is written without one. */
 ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
                                 ray_compress_t mode, ray_symfile_t layout,
-                                bool auto_index);
+                                bool auto_index, bool durable);
 /* The `symfile` option of an options dict (NULL or no key: SHARED): the
  * symbol 'shared or 'column, anything else a domain error.  Returns NULL or
  * an owned error. */
@@ -126,6 +126,11 @@ ray_t*    ray_symfile_opt_parse(ray_t* opts, ray_symfile_t* layout);
 /* The `index` option of an options dict (NULL or no key: true): true or
  * false, anything else a domain error.  Returns NULL or an owned error. */
 ray_t*    ray_splay_index_opt_parse(ray_t* opts, bool* auto_index);
+/* The `durable` option of an options dict (NULL or no key: true): true or
+ * false, anything else a domain error.  false is the bulk path: no fsync of
+ * a column file, the symfile or a directory, so a crash may lose or tear the
+ * write; the renames stay atomic, a reader still sees whole files. */
+ray_t*    ray_splay_durable_opt_parse(ray_t* opts, bool* durable);
 /* `<dir>/.<name>.sym` into out; false when it does not fit. */
 bool      ray_splay_col_sym_path(char* out, size_t cap, const char* dir,
                                  const char* name, size_t name_len);
