@@ -125,15 +125,22 @@ Replaces all occurrences of `from` with `to`. The `from` and `to` arguments must
 
 ### split
 
-**`(split str delimiter)`** — binary · element-wise
+**`(split str delimiter)`** — binary · atom/vector/list
 
-Splits each string element by the given delimiter and returns a list of string vectors. Each element in the result is a vector of the split parts. Null input produces null output.
+Splits a string or symbol atom on a literal string delimiter and returns a list of the string parts. A STR or SYM vector, or a list of string and symbol atoms, is split element-wise: the result is a list holding one list of parts per element. An empty string (the STR/SYM null) gives one empty part, and an empty delimiter returns the whole string as one part. The delimiter must be a string atom; anything else is a `type` error. With an integer index vector instead of a delimiter, `split` cuts the string, vector or list itself at those positions.
 
 ```lisp
 (split "a,b,c" ",")
+; ("a" "b" "c")
 
-(split "hello world" " ")
+(split ["a,b" "" "c"] ",")
+; (("a" "b") ("") ("c"))
+
+(split "hello" [0 2])
+; ("he" "llo")
 ```
+
+Inside `select` and `update`, `(split col ",")` gives one list of parts per row. Under `by:` each group gets a list with one list of parts per row of the group.
 
 ### str-find
 

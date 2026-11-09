@@ -881,15 +881,24 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         }
         return result;
     }
-    /* STR / SYM vector input with a string delimiter: element-wise, one
-     * split result (a list of parts) per input element. */
-    if ((str->type == RAY_STR || str->type == RAY_SYM) && delim->type == -RAY_STR) {
+    /* STR / SYM vector, or a list of string / symbol atoms, with a string
+     * delimiter: element-wise, one split result (a list of parts) per
+     * input element. */
+    if (str->type == RAY_STR || str->type == RAY_SYM || str->type == RAY_LIST) {
+        if (delim->type != -RAY_STR)
+            return ray_error("type", "split: expected str delimiter, got %s", ray_type_name(delim->type));
         ray_t* out = ray_list_new(str->len);
         if (RAY_IS_ERR(out)) return out;
         for (int64_t i = 0; i < str->len; i++) {
             int alloc = 0;
             ray_t* e = collection_elem(str, i, &alloc);
             if (!e || RAY_IS_ERR(e)) { ray_release(out); return e ? e : ray_error("oom", NULL); }
+            if (e->type != -RAY_STR && e->type != -RAY_SYM) {
+                int8_t et = e->type;
+                if (alloc) ray_release(e);
+                ray_release(out);
+                return ray_error("type", "split: expected str or sym input, got %s", ray_type_name(et));
+            }
             ray_t* r = ray_split_fn(e, delim);
             if (alloc) ray_release(e);
             if (RAY_IS_ERR(r)) { ray_release(out); return r; }

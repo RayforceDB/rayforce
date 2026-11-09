@@ -75,3 +75,39 @@
 (split ["a,b" "" ",x"] ",") -- (list (list "a" "b") (list "") (list "" "x"))
 (split ['a_b 'c] "_") -- (list (list "a" "b") (list "c"))
 (count (split (take ["a,b"] 0) ",")) -- 0
+;; A null SYM element splits like "": one empty part, no error.
+(split (as 'SYM ["a_b" ""]) "_") -- (list (list "a" "b") (list ""))
+;; A list of string / symbol atoms splits the same way, so the result of
+;; one split can be split again.
+(split (list "a,b" 'c,d) ",") -- (list (list "a" "b") (list "c" "d"))
+(split (split "a,b;c" ";") ",") -- (list (list "a" "b") (list "c"))
+(count (split (list) ",")) -- 0
+(split (list "a" 1) ",") !- type
+(at (try (split (list "a" 1) ",") (fn [e] e)) 'msg) -- "split: expected str or sym input, got i64"
+(at (try (split (list "a" (list "b")) ",") (fn [e] e)) 'msg) -- "split: expected str or sym input, got LIST"
+;; A vector or list with a non-string delimiter names the delimiter, as
+;; the atom form does; an empty vector is checked too.
+(at (try (split "a" 'x) (fn [e] e)) 'msg) -- "split: expected str delimiter, got sym"
+(at (try (split ["a,b"] 'x) (fn [e] e)) 'msg) -- "split: expected str delimiter, got sym"
+(at (try (split ['a_b] 1) (fn [e] e)) 'msg) -- "split: expected str delimiter, got i64"
+(at (try (split (list "a") [","]) (fn [e] e)) 'msg) -- "split: expected str delimiter, got STR"
+(split (take ["a"] 0) 1) !- type
+;; Multi-character and empty delimiters per element, and a long vector.
+(split ["a::b" "c::d::e"] "::") -- (list (list "a" "b") (list "c" "d" "e"))
+(split ["abc" ""] "") -- (list (list "abc") (list ""))
+(count (split (take ["a,b" "c"] 70000) ",")) -- 70000
+(at (split (take ["a,b" "c"] 70000) ",") 69999) -- (list "c")
+;; Inside a query: `update` and `by:` hand split the whole STR column (or
+;; a group of it); a keyless select evaluates it per row.
+(set SplitT (table [a s] (list [1 1 2] ["x,y" "z" ""])))
+(at (select {from: SplitT r: (split s ",")}) 'r) -- (list (list "x" "y") (list "z") (list ""))
+(at (update {from: SplitT r: (split s ",")}) 'r) -- (list (list "x" "y") (list "z") (list ""))
+(at (select {from: SplitT r: (split s ",") by: a}) 'r) -- (list (list (list "x" "y") (list "z")) (list (list "")))
+(at (select {from: SplitT where: (> a 1) r: (split s ",") by: a}) 'r) -- (list (list (list "")))
+;; A parted STR column, grouped across partitions.
+(.sys.exec "rm -rf /tmp/rfl_split_parted")
+(.db.splayed.set "/tmp/rfl_split_parted/2024.01.01/t/" SplitT)
+(.db.splayed.set "/tmp/rfl_split_parted/2024.01.02/t/" SplitT)
+(set SplitP (.db.parted.get "/tmp/rfl_split_parted/" 't))
+(at (select {from: SplitP r: (split s ",") by: a}) 'r) -- (list (list (list "x" "y") (list "z") (list "x" "y") (list "z")) (list (list "") (list "")))
+(.sys.exec "rm -rf /tmp/rfl_split_parted")
