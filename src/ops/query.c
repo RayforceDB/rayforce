@@ -17600,9 +17600,9 @@ static bool select_from_is_join(ray_t* from_expr) {
     return f == ray_left_join_fn || f == ray_inner_join_fn || f == ray_full_join_fn;
 }
 
-/* A by: key that is another key's column plus or minus a number, as `ip1:
- * (- ClientIP 1)` beside `ClientIP: ClientIP`, splits no group that column
- * does not: the rows of a group agree on the column, so on the key.  The
+/* A by: key that is another key's column plus or minus a number, as
+ * `ip1: (- ip 1)` beside `ip: ip`, splits no group that column does not:
+ * the rows of a group agree on the column, so on the key.  The
  * grouping runs without such keys and they are computed on its groups
  * after, so each row hashes, scatters and compares fewer key bytes, and a
  * grouping the memory gate (hh_grouping_outgrows) would send to two passes
@@ -17628,6 +17628,16 @@ static bool select_dep_mentions(ray_t* e, const int64_t* syms, int n) {
     return false;
 }
 
+/* Can `col` (of type `t`) plus or minus the constant `c` wrap a value onto
+ * the I64 null sentinel while the column holds nulls?  Computed on the
+ * groups, the key may then lack the null flag that a key computed over
+ * every group has, and show the sentinel as a number (#841).  Only an I64
+ * column, or a constant past 2^62 on a narrower one, can wrap there. */
+static bool select_dep_may_hit_null(ray_t* tbl, int64_t col, int8_t t, ray_t* c) {
+    if (c->type != -RAY_I64 || !ray_table_col_has_nulls(tbl, col)) return false;
+    return t == RAY_I64 || c->i64 > ((int64_t)1 << 62) || c->i64 < -((int64_t)1 << 62);
+}
+
 static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan) {
     ray_t* by = dict_get(dict, "by");
     if (!by || by->type != RAY_DICT || dict_get(dict, "nearest")) return NULL;
@@ -17641,6 +17651,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
     if (nb < 2 || nb > SELECT_DEP_MAX_KEYS) return NULL;
     ray_t** bvals = (ray_t**)ray_data(bv);
     int64_t alias[SELECT_DEP_MAX_KEYS], col[SELECT_DEP_MAX_KEYS], dropped[SELECT_DEP_MAX_KEYS];
+    int8_t ctype[SELECT_DEP_MAX_KEYS];   /* a key on a column: the column's type */
     int base[SELECT_DEP_MAX_KEYS];   /* a dropped key: the key whose column it reads; else -1 */
     ray_t* op[SELECT_DEP_MAX_KEYS];  /* a dropped key: the + or - its head names now */
     int cside[SELECT_DEP_MAX_KEYS];  /* a dropped key: its operand that names the column */
@@ -17654,7 +17665,7 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
         if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) || !sym_names_col(tbl, v->i64) ||
             !ray_table_col_meta(tbl, v->i64, &m)) continue;
         int8_t t = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
-        if (t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64) col[i] = v->i64;
+        if (t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64) { col[i] = v->i64; ctype[i] = t; }
     }
     static const char* const addsub[] = { "+", "-" };
     for (int64_t i = 0; i < nb; i++) {
@@ -17673,7 +17684,9 @@ static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan)
              * a key the grouping computes does not */
             if (c->type != -RAY_I64 && c->type != -RAY_F64) continue;
             for (int64_t j = 0; j < nb && base[i] < 0; j++)
-                if (j != i && col[j] == s->i64) { base[i] = (int)j; cside[i] = side; }
+                if (j != i && col[j] == s->i64 && !select_dep_may_hit_null(tbl, col[j], ctype[j], c)) {
+                    base[i] = (int)j; cside[i] = side;
+                }
         }
         if (base[i] >= 0) dropped[n_drop++] = alias[i];
     }
