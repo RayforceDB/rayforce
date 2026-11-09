@@ -260,7 +260,8 @@ Logical OR, element by element on collections, as `and` is.
 
 ### `(not x)` — atomic
 
-Logical NOT. Flips boolean values.
+Logical NOT. Flips boolean values. A STR, SYM or GUID vector is a `type`
+error: `not` has no meaning for those cells.
 
 ```lisp
 (not true)  ; false
