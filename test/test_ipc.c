@@ -2565,6 +2565,7 @@ typedef struct {
     uint16_t     port;
     bool         drain;     /* false: never read past the handshake */
     volatile int saw_eof;
+    volatile int gave_up;   /* !drain: the client's send is over, read on */
     ray_thread_t tid;
 } silent_peer_t;
 
@@ -2579,7 +2580,9 @@ static void silent_peer_thread(void* arg) {
     if (recv((int)c, hs, 2, MSG_WAITALL) == 2) {
         uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
         send((int)c, resp, 2, 0);
-        if (!p->drain) ray_test_sleep_ms(1500);  /* window fills meanwhile */
+        /* window fills meanwhile; read on once the send gave up (1.5 s at most) */
+        if (!p->drain)
+            for (int i = 0; i < 150 && !p->gave_up; i++) ray_test_sleep_ms(10);
         uint8_t buf[65536];
         for (;;) {
             ssize_t n = recv((int)c, buf, sizeof(buf), 0);
@@ -2669,6 +2672,7 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     int64_t t0 = ray_time_now_ms();
     ray_t* r = ray_ipc_send_timeout(h, big, 300);
     int64_t took = ray_time_now_ms() - t0;
+    peer.gave_up = 1;
     ray_release(big);
     TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_err_from_obj(r), RAY_ERR_IO);
@@ -3356,7 +3360,9 @@ static test_result_t cancel_mid_query_moved_link(uint16_t port, bool refuse_firs
 }
 
 static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
-    return cancel_mid_query_moved_link(19986, false);
+    /* 19866: its own port (19986 is rfl/io/ipc_transport.rfl's server,
+     * which may run at the same time). */
+    return cancel_mid_query_moved_link(19866, false);
 }
 
 static test_result_t test_ipc_cancel_after_refused_send_moved_link(void) {

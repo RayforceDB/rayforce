@@ -1370,7 +1370,62 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         if (!idx || RAY_IS_ERR(idx)) { ray_release(name_sym); return idx ? idx : ray_error("type", "alter set: index argument evaluated to null"); }
         ray_t* val = ray_eval(args[3]);
         if (!val || RAY_IS_ERR(val)) { ray_release(idx); ray_release(name_sym); return val ? val : ray_error("type", "alter set: value argument evaluated to null"); }
-        if (!ray_is_vec(var) && var->type != RAY_LIST) { int8_t vt = var->type; ray_release(idx); ray_release(val); ray_release(name_sym); return ray_error("type", "alter set: target must be a vector or list, got %s", ray_type_name(vt)); }
+        /* A dict is addressed by key, not position: `idx` is a key atom or
+         * a vector/list of keys, each written with ray_dict_upsert (an
+         * existing key is replaced, a missing one is added).  A value
+         * vector or list as long as the keys is assigned pairwise;
+         * anything else is written to every key, as for vectors. */
+        if (var->type == RAY_DICT) {
+            bool many = ray_is_vec(idx) || idx->type == RAY_LIST;
+            int64_t nkeys = many ? ray_len(idx) : 1;
+            bool pairwise = many && (ray_is_vec(val) || val->type == RAY_LIST) &&
+                            ray_len(val) == nkeys;
+            /* ray_dict_upsert consumes its dict and copies anything shared
+             * before writing; the caller keeps its own reference to var. */
+            ray_retain(var);
+            ray_t* d = var;
+            for (int64_t k = 0; k < nkeys; k++) {
+                int ka = 0, va = 0;
+                ray_t* key = many ? collection_elem(idx, k, &ka) : idx;
+                /* Extraction errors are owned, even when the helper's
+                 * allocated flag is zero. Transfer them, not a new type
+                 * error; do not extract a value after a failed key. */
+                if (!key || RAY_IS_ERR(key)) {
+                    ray_release(d); ray_release(idx); ray_release(val); ray_release(name_sym);
+                    return key ? key : ray_error("oom", NULL);
+                }
+                if (!ray_is_atom(key)) {
+                    ray_t* err = ray_error("type", "alter set: dict key must be an atom, got %s", ray_type_name(key->type));
+                    if (ka) ray_release(key);
+                    ray_release(d); ray_release(idx); ray_release(val); ray_release(name_sym);
+                    return err;
+                }
+                ray_t* v = pairwise ? collection_elem(val, k, &va) : val;
+                if (!v || RAY_IS_ERR(v)) {
+                    if (ka) ray_release(key);
+                    ray_release(d); ray_release(idx); ray_release(val); ray_release(name_sym);
+                    return v ? v : ray_error("oom", NULL);
+                }
+                ray_t* nd = ray_dict_upsert(d, key, v);
+                if (ka) ray_release(key);
+                if (va) ray_release(v);
+                /* Upsert consumes d on success or owned error. Its NULL
+                 * return is a failed header COW, which retains our ref. */
+                if (!nd) { ray_release(d); nd = ray_error("oom", NULL); }
+                if (RAY_IS_ERR(nd)) { ray_release(idx); ray_release(val); ray_release(name_sym); return nd; }
+                d = nd;
+            }
+            ray_release(idx); ray_release(val);
+            ray_err_t bind_err = ray_env_target_set(target, d);
+            ray_release(d);
+            if (bind_err != RAY_OK) {
+                ray_release(name_sym);
+                return ray_error(ray_err_code_str(bind_err), "alter: cannot publish target");
+            }
+            /* In-place amend returns the symbol, not the altered value. */
+            return name_sym;
+        }
+        if (!ray_is_vec(var) && var->type != RAY_LIST) { int8_t vt = var->type; ray_release(idx); ray_release(val); ray_release(name_sym); return ray_error("type", "alter set: target must be a vector, list or dict, got %s", ray_type_name(vt)); }
 
         /* For LIST types, build a new list with replaced elements */
         if (var->type == RAY_LIST) {

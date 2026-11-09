@@ -55,6 +55,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 /* Every path below goes through ray_test_tmp (a per-process root). */
 /* Written as "/tmp/..." in the sources: every use goes through
@@ -1263,10 +1267,69 @@ static void sr_bind_f32(const char* name, int64_t n, int64_t null_every, float s
     ray_env_set(ray_sym_intern(name, strlen(name)), v);
     ray_release(v);
 }
+/* Copy directory `src` into `dst` (created), recursively: a generation-2
+ * table keeps its columns under .generations/.  False on any failure, and
+ * always on Windows. */
+static bool sr_copy_dir(const char* src, const char* dst) {
+#if defined(_WIN32)
+    (void)src; (void)dst;
+    return false;
+#else
+    if (ray_test_mkdir_p(dst) != 0) return false;
+    DIR* d = opendir(src);
+    if (!d) return false;
+    bool ok = true;
+    static char buf[1 << 16];
+    for (struct dirent* e; ok && (e = readdir(d)); ) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char ps[1024], pd[1024];
+        snprintf(ps, sizeof ps, "%s/%s", src, e->d_name);
+        snprintf(pd, sizeof pd, "%s/%s", dst, e->d_name);
+        struct stat st;
+        if (stat(ps, &st) != 0) { ok = false; break; }
+        if (S_ISDIR(st.st_mode)) { ok = sr_copy_dir(ps, pd); continue; }
+        FILE* in = fopen(ps, "rb");
+        FILE* out = in ? fopen(pd, "wb") : NULL;
+        ok = in && out;
+        for (size_t n; ok && (n = fread(buf, 1, sizeof buf, in)) > 0; ) ok = fwrite(buf, 1, n, out) == n;
+        if (in && ferror(in)) ok = false;
+        if (in) fclose(in);
+        if (out && fclose(out) != 0) ok = false;
+    }
+    closedir(d);
+    return ok;
+#endif
+}
+/* The g0 / g2 files are the same bytes in every test: the first srr_setup
+ * of a process writes them and keeps a copy outside sr_root (under the
+ * process's own scratch root, which the runner removes); later setups in
+ * the same process copy them back instead of building and encoding S
+ * again.  S itself is used by nothing else.  The symbols building and
+ * writing it interned are recorded and interned again, in order, so every
+ * later intern (and every table load) gets the same id as when S is
+ * built; a count that differs falls back to building it.  i and ef are
+ * bound in every runtime. */
+#define SR_GCACHE "/tmp/rayforce_scanrange_fixture"
+static char**   sr_s_names;   /* symbols S's evaluation interned, in order */
+static uint32_t sr_s_from, sr_s_to;   /* the symbol count before / after it */
 static void srr_setup(void) {
     sr_rt_setup();
     sr_eval_ok("(set i (til 200000))");
     sr_bind_f32("ef", 200000, 17, 0.5);
+    FILE* mark = fopen(ray_test_tmp(SR_GCACHE "/ok"), "rb");
+    if (mark) {
+        fclose(mark);
+        bool same = ray_sym_count() == sr_s_from;
+        for (uint32_t q = 0; same && q < sr_s_to - sr_s_from; q++)
+            (void)ray_sym_intern(sr_s_names[q], strlen(sr_s_names[q]));
+        same = same && ray_sym_count() == sr_s_to;
+        if (same && sr_copy_dir(ray_test_tmp(SR_GCACHE "/g2"), ray_test_tmp(SR_G2)) &&
+            sr_copy_dir(ray_test_tmp(SR_GCACHE "/g0"), ray_test_tmp(SR_G0)))
+            return;
+        (void)ray_test_rm_rf(ray_test_tmp(SR_G2));
+        (void)ray_test_rm_rf(ray_test_tmp(SR_G0));
+    }
+    uint32_t from = ray_sym_count();
     sr_eval_ok("(set S (table [k g v f d s b u h e] (list i (as 'I16 (% i 7)) "
                "(as 'I32 (map (fn [j] (if (== 0 (% j 10)) 0N (- (* 3 j) 7))) i)) "
                "(as 'F64 (map (fn [j] (if (== 0 (% j 13)) 0N j)) i)) (as 'DATE (% i 900)) "
@@ -1274,6 +1337,28 @@ static void srr_setup(void) {
                "ef)))");
     sr_eval_ok("(.db.splayed.set \"" SR_G2 "\" S {compress: true})");
     sr_eval_ok("(.db.splayed.set \"" SR_G0 "\" S {compress: false})");
+    uint32_t to = ray_sym_count();
+    if (mark) return;                         /* a fallback: keep the cache as it is */
+    char** names = (char**)calloc(to - from + 1, sizeof *names);
+    bool ok = names != NULL;
+    for (uint32_t q = from; ok && q < to; q++) {
+        ray_t* x = ray_sym_str(q);
+        size_t n = x ? ray_str_len(x) : 0;
+        ok = x && (names[q - from] = (char*)malloc(n + 1));
+        if (ok) { memcpy(names[q - from], ray_str_ptr(x), n); names[q - from][n] = '\0'; }
+    }
+    (void)ray_test_rm_rf(ray_test_tmp(SR_GCACHE));
+    if (ok && sr_copy_dir(ray_test_tmp(SR_G2), ray_test_tmp(SR_GCACHE "/g2")) &&
+        sr_copy_dir(ray_test_tmp(SR_G0), ray_test_tmp(SR_GCACHE "/g0")) &&
+        (mark = fopen(ray_test_tmp(SR_GCACHE "/ok"), "wb"))) {
+        fclose(mark);
+        for (uint32_t q = 0; sr_s_names && q < sr_s_to - sr_s_from; q++) free(sr_s_names[q]);
+        free(sr_s_names);
+        sr_s_names = names; sr_s_from = from; sr_s_to = to;
+    } else if (names) {
+        for (uint32_t q = 0; q < to - from; q++) free(names[q]);
+        free(names);
+    }
 }
 static void srr_teardown(void) { ray_idx_lazy_clear(); sr_rt_teardown(); }
 
