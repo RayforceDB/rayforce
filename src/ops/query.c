@@ -18346,6 +18346,10 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 }
             }
         }
+        /* An unordered take pushed into the group needs first-seen order, which
+         * a BOOL key (emitted in key order, fixed up afterwards) cannot give on
+         * the deferred route: such a key stays on the eager path. */
+        bool take_wants_order = take_expr && !has_sort && !nearest_expr;
         if (by_input_parted && n_out > 0) {
             bool defer_ok = true;
             for (int64_t i = 0; i + 1 < dict_n && defer_ok; i += 2) {
@@ -18370,14 +18374,20 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 }
                 if (v && v->type == RAY_LIST) {   /* computed expr: one the planner lowers */
                     ray_graph_t* pg = ray_graph_new(tbl);
-                    bool lowers = pg && compile_expr_dag(pg, v) != NULL;
+                    ray_op_t* kop = pg ? compile_expr_dag(pg, v) : NULL;
+                    bool lowers = kop != NULL;
+                    /* BOOL (or unknown) output type: see take_wants_order */
+                    if (lowers && take_wants_order &&
+                        (kop->out_type == RAY_BOOL || kop->out_type == 0))
+                        lowers = false;
                     if (pg) ray_graph_free(pg);
                     if (!lowers) defer_ok = false;
                     continue;
                 }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
                     if (!tbl_has_col(tbl, v->i64) ||
-                        !query_key_type_streamable(tbl_col_base_type(tbl, v->i64))) {
+                        !query_key_type_streamable(tbl_col_base_type(tbl, v->i64)) ||
+                        (take_wants_order && tbl_col_base_type(tbl, v->i64) == RAY_BOOL)) {
                         defer_ok = false; break;
                     }
                     continue;
@@ -23049,7 +23059,8 @@ by_dict_done:
     take_pre_t take_pre = {0};   /* decoded take: value, reused by apply_sort_take */
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
                             && !post_group_where_expr && !has_list_agg
-                            && !group_keys_have_bool(by_expr, tbl));
+                            && (parted_bydict_deferred
+                                || !group_keys_have_bool(by_expr, tbl)));
     if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
