@@ -45,6 +45,14 @@ ray_t* ray_parquet_parted(const char* path, const char* root, const char* table)
  * Exposed internally for codec regression tests. */
 bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t size);
 
+/* Test seams: the nth coarse checkpoint of an optional-page certification
+ * scan requests an interrupt, and the last scan's certified level count
+ * shows how far it ran. Debug builds only. */
+#if defined(DEBUG)
+void    ray_parquet_test_cert_interrupt_after(int64_t nth);
+int64_t ray_parquet_test_cert_levels(void);
+#endif
+
 /* Returns NULL for a non-Parquet source; otherwise an owned table/error.
  * complete=true means a streaming aggregate already answered the query. */
 ray_t* ray_parquet_select_source(ray_t* source, ray_t* query, bool* complete);
