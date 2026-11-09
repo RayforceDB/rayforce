@@ -970,6 +970,34 @@ static bool handle_command(ray_repl_t* repl, const char* str, size_t len) {
 
 /* ===== Interactive mode — poll-driven ===== */
 
+/* SIGINT at the prompt: drop the line being typed and prompt again. */
+static void repl_clear_line(ray_term_t* term) {
+    ray_term_clear_interrupt();
+    ray_eval_clear_interrupt();
+    term->comp_cycling = 0;
+    term->esc_state = 0;
+    term->buf_len = 0;
+    term->buf_pos = 0;
+    term->multiline_len = 0;
+#if !defined(RAY_OS_WINDOWS)
+    { ssize_t r_ = write(STDOUT_FILENO, "^C\n", 3); (void)r_; }
+#endif
+    ray_term_prompt(term);
+    fflush(stdout);
+}
+
+/* read_fn of the SIGINT pipe: a signal that came while the loop waited.
+ * One an evaluation already answered (it clears the flag) leaves the line
+ * alone. */
+static ray_t* repl_sigint(ray_poll_t* poll, ray_selector_t* sel)
+{
+    (void)poll;
+    ray_repl_t* repl = (ray_repl_t*)sel->data;
+    ray_term_sigint_drain();
+    if (ray_term_interrupted()) repl_clear_line(repl->term);
+    return NULL;
+}
+
 /* repl_read callback: called when stdin has data.
  * Reads one byte via term_getc, feeds it to term_feed.
  * Returns a ray_t* string when a line is complete, NULL otherwise. */
@@ -982,19 +1010,7 @@ static ray_t* repl_read(ray_poll_t* poll, ray_selector_t* sel)
     int64_t sz = ray_term_getc(term);
     if (sz <= 0) {
         if (sz == -2) {
-            /* SIGINT — clear line and re-prompt */
-            ray_term_clear_interrupt();
-            ray_eval_clear_interrupt();
-            term->comp_cycling = 0;
-            term->esc_state = 0;
-            term->buf_len = 0;
-            term->buf_pos = 0;
-            term->multiline_len = 0;
-#if !defined(RAY_OS_WINDOWS)
-            { ssize_t r_ = write(STDOUT_FILENO, "^C\n", 3); (void)r_; }
-#endif
-            ray_term_prompt(term);
-            fflush(stdout);
+            repl_clear_line(term);
             return NULL;
         }
         /* EOF (Ctrl-D).  Inside a remote session, treat as
@@ -1096,6 +1112,19 @@ static void run_interactive(ray_repl_t* repl) {
 
         repl->id = ray_poll_register(repl->poll, &reg);
 
+        /* SIGINT wakes the loop through its pipe: no read() of stdin is
+         * blocked in it to fail with EINTR. */
+        int sfd = ray_term_sigint_fd();
+        if (sfd >= 0) {
+            ray_term_sigint_drain();
+            ray_poll_reg_t sreg = {0};
+            sreg.fd      = sfd;
+            sreg.type    = RAY_SEL_STDIN;
+            sreg.read_fn = repl_sigint;
+            sreg.data    = repl;
+            ray_poll_register(repl->poll, &sreg);
+        }
+
         ray_term_begin(term);
         ray_poll_run(repl->poll);
     } else {
@@ -1105,18 +1134,7 @@ static void run_interactive(ray_repl_t* repl) {
             int64_t sz = ray_term_getc(term);
             if (sz <= 0) {
                 if (sz == -2) {
-                    ray_term_clear_interrupt();
-                    ray_eval_clear_interrupt();
-                    term->comp_cycling = 0;
-                    term->esc_state = 0;
-                    term->buf_len = 0;
-                    term->buf_pos = 0;
-                    term->multiline_len = 0;
-#if !defined(RAY_OS_WINDOWS)
-                    { ssize_t r_ = write(STDOUT_FILENO, "^C\n", 3); (void)r_; }
-#endif
-                    ray_term_prompt(term);
-                    fflush(stdout);
+                    repl_clear_line(term);
                     continue;
                 }
                 break;

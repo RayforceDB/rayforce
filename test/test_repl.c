@@ -782,13 +782,11 @@ static test_result_t test_repl_pty_no_poll_ctrl_d(void) {
  * before it get typed, SIGINT fires, then the trailing :q\n quits. */
 static test_result_t test_repl_pty_sigint(void) {
 #ifndef RAY_OS_WINDOWS
-    /* If the SIGINT does not clear the line, "(garbage:q" is still an
-     * open expression: ")" closes it (an error is printed) and the second
-     * :q quits, so the child exits instead of running into the helper's
-     * 5 s timeout.  If it does clear the line, the first :q quits. */
-    int rc = run_pty_with_input("(garbage\x01:q\n)\n:q\n", 1);
-    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
-                    "unexpected child exit: %d", rc);
+    /* The SIGINT clears the line, so :q quits.  Left in place, "(garbage:q"
+     * is an open expression that waits for more input until the helper's
+     * 5 s timeout (-2). */
+    int rc = run_pty_with_input("(garbage\x01:q\n", 1);
+    TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
 #endif
     PASS();
 }
@@ -798,8 +796,7 @@ static test_result_t test_repl_pty_sigint(void) {
 static test_result_t test_repl_pty_no_poll_sigint(void) {
 #ifndef RAY_OS_WINDOWS
     int rc = run_pty_with_input("(garbage\x01:q\n", 0);
-    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
-                    "unexpected child exit: %d", rc);
+    TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
 #endif
     PASS();
 }
