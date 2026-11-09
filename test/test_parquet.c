@@ -1145,9 +1145,11 @@ static void* pq_plain_str_cancel_thread(void* p) {
     ray_request_interrupt();
     return NULL;
 }
-/* A cancel requested while a batch of strings decodes is observed at the
- * next coarse checkpoint; the reader then refuses further batches and a
- * fresh reader decodes the whole file. */
+/* A cancel requested while a batch of strings decodes is observed at
+ * the next next() entry (the first batch completes; mid-decode
+ * interruption at the per-1024 checkpoint is unchanged by this patch
+ * and not witnessed by this test); the reader then refuses further
+ * batches and a fresh reader decodes the whole file. */
 static test_result_t test_pq_plain_str_cancel(void) {
     char path[160];
     const int64_t rows = 131072;
