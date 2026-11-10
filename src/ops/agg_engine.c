@@ -4142,7 +4142,7 @@ static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t e
              * partitions, blk[64 * q + g]: slot g's bits of those partitions */
             uint64_t blk[RAY_POOL_INIT_TASKS / 2 > 64 ? RAY_POOL_INIT_TASKS / 2 : 64];
             int64_t parts = (int64_t)1 << c->bits, ps = c->part_slots;
-            int64_t owords = (c->slots + 63) / 64, n = 0, j = c->at[t];
+            int64_t owords = (c->slots + 63) / 64, n = 0, j = c->pass ? c->at[t] : 0;
             int64_t groups = (parts + 63) / 64;
             for (int64_t w = w0; w < w1; w++) {
                 int64_t g0 = w * 64, len = ps - g0 < 64 ? ps - g0 : 64;
