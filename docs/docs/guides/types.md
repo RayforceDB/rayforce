@@ -38,6 +38,7 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'time` | Time | Milliseconds since midnight |
 | `'timestamp` | Timestamp | Nanoseconds since 2000-01-01T00:00:00 |
 | `'timespan` | Duration | Signed count of nanoseconds |
+| `'LIST` | Generic list | Boxes a typed vector into a `LIST` of atoms (see [Vector casts](#as-function)) |
 | `'guid` | GUID | 16-byte unique identifier |
 
 F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
@@ -46,6 +47,18 @@ F32 vectors require a suffix on each non-null element: `[1e 2e 0Ne]`.
 Finite values beyond the F32 range saturate just as casts do. F32 values
 print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.
+
+F64 values have a null sentinel but no positive or negative infinity value.
+Non-finite F64 arithmetic results are returned as null, so an overflowed result
+is treated as missing by null-aware operations such as `fill` and aggregates,
+except where a vector kernel does not flag the null it produces: `(sums [1e308 1e308])`
+ends in a null that `fill` replaces but `nil?` does not report, and `avg` and `sum` of it
+return `0Nf` instead of skipping it (see the exceptions in
+[Floats](../language/syntax.md#floats)).
+This differs from systems that retain IEEE infinities as values. F32
+arithmetic does not do this: an overflowing F32 result keeps the IEEE infinity
+and prints as `infe` or `-infe`, which `nil?` and `fill` do not treat as null
+(for example `(* 1e38e 10e)` is `infe`).
 
 Casting F32 to STR instead produces plain numeric text without the literal
 suffix (for example, `(as 'STR 1.5e)` returns `"1.5"`). It uses nine
@@ -99,7 +112,29 @@ significant digits so casting the string back to F32 preserves the value.
 (as 'timestamp "2024-01-15T12:30:00.000")  ; 2024.01.15D12:30:00.000000000
 ```
 
-**Vector casts:** `as` maps element-wise over vectors.
+**Vector casts:** for the numeric, string and temporal targets, `as` maps
+element-wise over vectors.
+
+`'LIST` is the exception: it is not element-wise. It boxes the whole vector into
+a `LIST` of atoms, null cells staying typed null atoms. A `LIST` is returned
+unchanged, and an atom, a dict or a table is a `type` error
+(`as: cannot cast i64 to list`, `as: cannot cast DICT to list`,
+`as: cannot cast TABLE to list`).
+
+```lisp
+(as 'LIST [1 2])      ; (1 2), a LIST of two i64 atoms
+(as 'LIST 1)          ; type error: as: cannot cast i64 to list
+```
+
+In a query the verb decides how `as 'LIST` is evaluated, so the same
+expression can succeed or fail. With `T: (table [k v] (list [1 1 2] [10 20 30]))`:
+
+| Query | Evaluation | Result |
+|---|---|---|
+| `(select {r: (as 'LIST v) from: T})` | per row | `type` error `as: cannot cast i64 to list`, since each cell is an atom |
+| `(select {r: (as 'LIST v) from: T by: k})` | per group | one `LIST` per group, holding that group's boxed cells |
+| `(update {w: (as 'LIST v) from: T})` | whole column | `w` is a `LIST` column of i64 atoms |
+| `(update {w: (as 'LIST v) from: T where: (> v 15)})` | whole column | `type` error `update: a new column under where: must be a typed vector, got LIST` |
 
 Casting to `STR` produces a flat string vector from a vector or a LIST of
 atoms. Each outer element must convert to one string atom. A nested vector or
@@ -150,6 +185,8 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 !!! note "Coercion rules"
 
     - **i64 + f64 → f64:** Arithmetic between integers and floats promotes to float.
+    - **f32 op f32 → f32:** `+ - * %` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with an i64, i32, or f64 operand widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
+    - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
     - **bool → i64:** Booleans coerce to 1/0 in arithmetic contexts.
     - **i64 → bool:** In boolean contexts (if, cond), 0 is false, non-zero is true.
     - **Narrower → wider:** Comparisons across numeric types promote the narrower operand.
@@ -159,6 +196,15 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 ; Integer + float promotes to float
 (+ 1 2.0)               ; 3.0
 (* 3 1.5)               ; 4.5
+
+; f32 stays f32 against f32, widens against anything else
+(type (+ (as 'F32 [1.5 2.5]) (as 'F32 [1.0 1.0])))  ; 'F32
+(type (+ (as 'F32 [1.5 2.5]) 1))                    ; 'F64
+(* 3e38e 3e38e)                                     ; 0Ne
+(type (min (as 'F32 [1.5 2.5])))                    ; 'f32
+(type (sum (as 'F32 [1.5 2.5])))                    ; 'f64
+(mins (as 'F32 [2.5 -3.5 0Nf 1.25]))                ; [2.5e -3.5e -3.5e -3.5e]
+(fill 0.0 (as 'F32 [2.5 0Nf]))                      ; [2.5e 0.0e]
 
 ; Boolean in arithmetic
 (+ 10 true)              ; 11

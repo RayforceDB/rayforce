@@ -1122,6 +1122,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                      (s2 != 0xFF && op_child(g, node, 1)->out_type == RAY_SYM)))
                     EXPR_BAIL(EXPR_BAIL_OTHER);
 
+                /* A SYM lane is an intern id, not a number: `not` over it has
+                 * no meaning.  Leave it to the typed fallback, which raises
+                 * the type error whatever the column holds. */
+                if (op == OP_NOT && op_child(g, node, 0)->out_type == RAY_SYM)
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
+
                 /* Determine output type */
                 if (op == OP_CAST)
                     ot = node->out_type;
@@ -3592,11 +3598,45 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         }
         if (op->opcode == OP_NEG) return ray_neg_fn(input);
         if (op->opcode == OP_ABS) return ray_abs_fn(input);
+        if (op->opcode == OP_NOT) return ray_not_fn(input);
         if (op->opcode != OP_ISNULL) return ray_error("type", "unsupported duration unary operation");
     }
 
     (void)g;
     if (!input || RAY_IS_ERR(input)) return input;
+    if (ray_is_atom(input)) {
+        /* A scalar operand (an F32 atom has no literal form, so it only
+         * arises from (as 'F32 x)) answers as the scalar builtin does. */
+        switch (op->opcode) {
+            case OP_CAST: {
+                const char* name = ray_type_name(op->out_type);
+                ray_t* target = ray_sym(ray_sym_intern(name, strlen(name)));
+                if (!target || RAY_IS_ERR(target)) return target ? target : ray_error("oom", NULL);
+                ray_t* result = ray_cast_fn(target, input);
+                ray_release(target);
+                return result;
+            }
+            case OP_NEG:        return ray_neg_fn(input);
+            case OP_ABS:        return ray_abs_fn(input);
+            case OP_NOT:        return ray_not_fn(input);
+            case OP_SQRT:       return ray_sqrt_fn(input);
+            case OP_LOG:        return ray_log_fn(input);
+            case OP_EXP:        return ray_exp_fn(input);
+            case OP_CEIL:       return ray_ceil_fn(input);
+            case OP_FLOOR:      return ray_floor_fn(input);
+            case OP_ROUND:      return ray_round_fn(input);
+            case OP_ISNULL:     return ray_nil_fn(input);
+            case OP_SIN:        return ray_sin_fn(input);
+            case OP_ASIN:       return ray_asin_fn(input);
+            case OP_COS:        return ray_cos_fn(input);
+            case OP_ACOS:       return ray_acos_fn(input);
+            case OP_TAN:        return ray_tan_fn(input);
+            case OP_ATAN:       return ray_atan_fn(input);
+            case OP_RECIPROCAL: return ray_reciprocal_fn(input);
+            case OP_SIGNUM:     return ray_signum_fn(input);
+            default: break;
+        }
+    }
     if (!ray_is_vec(input)) return ray_error("type", "expr eval: unary op expects a vector, got %s", ray_type_name(input->type));
     int64_t len = input->len;
     int8_t in_type = input->type;

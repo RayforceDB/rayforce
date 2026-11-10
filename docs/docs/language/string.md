@@ -177,6 +177,22 @@ ray> (format "% + % = %" 1 2 3)
 "1 + 2 = 3"
 ```
 
+### repr
+
+**`(repr value)`** — unary
+
+Returns Rayfall source text that parses back to the same value. Unlike
+`format`, `repr` preserves narrow integer types, floating-point bits (including
+negative zero), and GUID types.
+
+```lisp
+ray> (repr [1i 2i])
+"[1i 2i]"
+
+ray> (eval (parse (repr [1i 2i])))
+[1 2]
+```
+
 ## String Operations in the DAG
 
 When using the C API, string operations are available as DAG opcodes. These are fused into morsel-driven execution alongside arithmetic and comparison operations.
