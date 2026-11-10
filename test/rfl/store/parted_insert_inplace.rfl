@@ -1,0 +1,110 @@
+;; #921: (insert 't key rows) into the LAST partition of a parted table
+;; appends into the active segments in place when the binding is the sole
+;; owner of the table and those segments are private heap vectors, instead
+;; of copying the whole partition on every call.  These tests pin that the
+;; in-place path and the rebuild give identical tables, that the rebuild
+;; still runs when a gate misses, and that a view taken before an insert
+;; keeps its own rows.
+(.sys.exec "rm -rf /tmp/rfl_pins_inplace")
+(set root "/tmp/rfl_pins_inplace/db")
+(set symf "/tmp/rfl_pins_inplace/db/.sym")
+(set mk (fn [n o] (table ['id 'px 's 'x 'f 'dt] (list (+ o (til n)) (as 'F64 (+ o (til n))) (take ['aa 'bb 'cc] n) (map (fn [i] (format "row-%" (+ o i))) (til n)) (== 0 (% (til n) 2)) (+ 2026.01.01 (til n))))))
+(.db.splayed.set (format "%/2026.08.03/t/" root) (mk 4 0) symf)
+(.db.splayed.set (format "%/2026.08.04/t/" root) (mk 3 100) symf)
+
+;; ── in place equals the rebuild ──────────────────────────────────────────
+;; A is grown through its binding; B by value, which always rebuilds.
+(set A (.db.parted.get root 't))
+(set B (.db.parted.get root 't))
+(set k 2026.08.04)
+(set grow (fn [rows] (do (insert 'A k rows) (set 'B (insert B k rows)) (count A))))
+;; the first insert copies the mapped segment; every later one appends
+(grow (mk 5 200)) -- 12
+(grow (mk 5 300)) -- 17
+;; a batch with a long string (pooled), symbols new to the FILE domain,
+;; and a scalar broadcast across it
+(grow (list [400 401] 9.5 ['zz 'yy] ["a string well past the inline limit" ""] [true false] 2026.02.02)) -- 19
+;; one row of atoms
+(grow (list 500 5.5 'aa "one" true 2026.03.03)) -- 20
+;; a dict reorders its columns
+(grow {dt: [2026.04.04] f: [false] x: ["d"] s: ['qq] px: [6.5] id: [600]}) -- 21
+;; nulls: typed in a vector, generic as an atom
+(grow (list [0Nl 700] [0Nf 7.5] [' 'aa] ["" "n"] [true true] [0Nd 2026.05.05])) -- 23
+(grow (list 800 null null null false null)) -- 24
+(== (at A 'id) (at B 'id)) -- (take [true] 24)
+(sum (!= (at A 'px) (at B 'px))) -- 0
+(== (at A 's) (at B 's)) -- (take [true] 24)
+(== (at A 'x) (at B 'x)) -- (take [true] 24)
+(== (at A 'f) (at B 'f)) -- (take [true] 24)
+(== (at A 'dt) (at B 'dt)) -- (take [true] 24)
+(== (at A 'date) (at B 'date)) -- (take [true] 24)
+;; the appended cells read back
+(at (select {from: A where: (== id 400)}) 'x) -- (list "a string well past the inline limit")
+(at (select {from: A where: (== id 401)}) 's) -- ['yy]
+(at (select {from: A where: (== id 600)}) 's) -- ['qq]
+(at (select {from: A where: (== id 401)}) 'px) -- [9.5]
+;; null hints follow the appended cells
+(count (select {from: A where: (nil? id)})) -- (count (select {from: B where: (nil? id)}))
+(count (select {from: A where: (nil? id)})) -- 1
+(count (select {from: A where: (nil? px)})) -- 2
+(count (select {from: A where: (nil? dt)})) -- 2
+(count (select {from: A where: (nil? s)})) -- 2
+(count (select {from: A where: (== x "")})) -- 3
+(sum (at A 'id)) -- (sum (at B 'id))
+;; history is untouched
+(count (select {from: A where: (== date 2026.08.03)})) -- 4
+(at (select {from: A where: (== date 2026.08.03)}) 'id) -- [0 1 2 3]
+
+;; ── an insert returns the target symbol and an empty batch is a no-op ────
+(insert 'A k (mk 1 900)) -- 'A
+(insert 'A k (take (mk 1 0) 0)) -- 'A
+(count A) -- 25
+
+;; ── the cost no longer follows the rows held ─────────────────────────────
+(insert 'A k (mk 200000 1000)) -- 'A
+(set one (mk 100 5000000))
+(insert 'A k one) -- 'A
+(< (at (.mem.ts (insert 'A k one)) 'allocated-bytes) 262144) -- true
+(count A) -- 200225
+
+;; ── a view taken before an insert keeps its own rows ─────────────────────
+(set V A)
+(insert 'A k (mk 2 6000000)) -- 'A
+(count A) -- 200227
+(count V) -- 200225
+(sum (at V 'id)) -- (- (sum (at A 'id)) 12000001)
+;; the rebuild left A private again: growing it does not reach V
+(insert 'A k (mk 2 7000000)) -- 'A
+(count A) -- 200229
+(count V) -- 200225
+(set V 0)
+
+;; a held column keeps its length too
+(set H (at A 'id))
+(insert 'A k (mk 3 8000000)) -- 'A
+(count H) -- 200229
+(count (at A 'id)) -- 200232
+(set H 0)
+
+;; ── a refused insert leaves the binding untouched ────────────────────────
+(insert 'A k (list [1 2] [1.5] ['aa 'bb] ["p" "q"] [true false] [2026.01.01 2026.01.02])) !- length
+(insert 'A k (list [1] [1.5] ['aa] ["p"] [true] ['oops])) !- type
+(insert 'A 2026.08.03 (mk 1 0)) !- domain
+(count A) -- 200232
+
+;; ── a later key starts a new partition, which then grows in place ────────
+(insert 'A 2026.08.05 (mk 2 9000000)) -- 'A
+(insert 'A 2026.08.05 (mk 2 9000100)) -- 'A
+(insert 'A 2026.08.05 (list 9000200 1.5 'brand-new "tail" false 2026.06.06)) -- 'A
+(count A) -- 200237
+(at (select {from: A where: (== date 2026.08.05)}) 'id) -- [9000000 9000001 9000100 9000101 9000200]
+(at (select {from: A where: (== date 2026.08.05)}) 's) -- ['aa 'bb 'aa 'bb 'brand-new]
+(insert 'A k (mk 1 0)) !- domain
+
+;; ── the grown partition persists and reloads as it reads ─────────────────
+(set day (select {from: A where: (== date 2026.08.05) id: id px: px s: s x: x f: f dt: dt}))
+(.db.splayed.set (format "%/2026.08.05/t/" root) day symf)
+(set R (.db.parted.get root 't))
+(at (select {from: R where: (== date 2026.08.05)}) 's) -- ['aa 'bb 'aa 'bb 'brand-new]
+(at (select {from: R where: (== date 2026.08.05)}) 'x) -- (list "row-9000000" "row-9000001" "row-9000100" "row-9000101" "tail")
+(.sys.exec "rm -rf /tmp/rfl_pins_inplace") -- 0

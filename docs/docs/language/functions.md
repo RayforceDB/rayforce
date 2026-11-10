@@ -290,7 +290,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 `insert` has two table forms:
 
 - `(insert target rows)` is the ordinary two-argument form. It returns a new flat table, or rebinds and returns a quoted target symbol such as `'trades`, which names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it. The row payload can be a list, table, or dictionary, as described by the target's physical columns.
-- `(insert parted partition-key rows)` grows the in-memory live tail of a parted table and returns a fresh logical view, leaving `parted` unchanged. Quote a symbol — `(insert 'parted partition-key rows)` — to rebind that symbol to the fresh view and return the symbol. A validated zero-row batch is a no-op and returns the existing view without rebinding. This is distinct from the three-argument positional form for vectors and lists, where the second argument is an insertion index.
+- `(insert parted partition-key rows)` grows the in-memory live tail of a parted table and returns a fresh logical view, leaving `parted` unchanged. Quote a symbol — `(insert 'parted partition-key rows)` — to grow the table that symbol is bound to and return the symbol; when the binding is the only holder of the table, a same-key insert appends to the current partition in place. A validated zero-row batch is a no-op and returns the existing view without rebinding. This is distinct from the three-argument positional form for vectors and lists, where the second argument is an insertion index.
 
 ```lisp
 ; Append a row to a table
