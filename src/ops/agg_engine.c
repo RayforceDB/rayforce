@@ -11251,16 +11251,6 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
                 ray_profile_tick("indexed: selected winning rows");
                 col = ray_group_gather(src, winners, ng);
-                /* F32 reduction results follow the existing F64 contract. */
-                if (col && !RAY_IS_ERR(col) && src->type == RAY_F32) {
-                    ray_t* widened = ray_vec_new(RAY_F64, ng);
-                    if (widened && !RAY_IS_ERR(widened)) {
-                        widened->len = ng;
-                        for (int64_t i = 0; i < ng; i++) ((double*)ray_data(widened))[i] = ((float*)ray_data(col))[i];
-                        widened->attrs |= col->attrs & RAY_ATTR_HAS_NULLS;
-                    }
-                    ray_release(col); col = widened;
-                }
             }
         } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);

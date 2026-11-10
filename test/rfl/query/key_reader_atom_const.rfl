@@ -73,6 +73,14 @@
 ;; sum(k + 32400000) = 10 + 4*32400000 = 129600010.
 (sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 09:00:00.000)}}) 'a)) -- 129600010
 
+;; Overflow at the I64 edge wraps as the plain `+`/`-` do, with no signed
+;; overflow in the dep column (UBSan stops the debug build on one).
+(set Tw (table [k v] (list [9223372036854775806 1 -9223372036854775807] [1 2 3])))
+(at (select {c: (count v) from: Tw by: {k: k a: (+ k 5i)} asc: k}) 'a) -- (+ (asc (at Tw 'k)) 5i)
+(at (select {c: (count v) from: Tw by: {k: k a: (- k 5i)} asc: k}) 'a) -- (- (asc (at Tw 'k)) 5i)
+(at (select {c: (count v) from: Tw by: {k: k a: (+ k 5)} asc: k}) 'a) -- [-9223372036854775802 6 -9223372036854775805]
+(at (select {c: (count v) from: Tw by: {k: k a: (- k 5)} asc: k}) 'a) -- [9223372036854775804 -4 9223372036854775801]
+
 ;; ============================================================
 ;; Part B — query_key_reader_read via eval-level multi-key + take
 ;; ============================================================
