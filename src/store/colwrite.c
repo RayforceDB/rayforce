@@ -138,10 +138,22 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
                        ? (const char*)ray_data(owner->str_pool) : NULL;
     ray_encw_t w;
     ray_err_t e = ray_encw_begin(&w, f, vec->type, vec->attrs, vec->len, sc, ik, cf);
+    /* A hash an append left first-row-only is not what a file may hold: the
+     * region is a complete one, built from the values (owned; the writer
+     * borrows it until ray_encw_free). */
+    ray_t* full = NULL;
     if (e == RAY_OK && region) {
-        ray_enc_idx_src_t is = { vec->index, vec->type, vec->attrs, vec->len, NULL, 0 };
-        is.order_name = colw_order_name(vec->index, &is.order_len);
-        ray_encw_set_index(&w, &is);
+        ray_t* root = vec->index;
+        if (ray_index_hash_first_only(vec)) {
+            full = ray_index_hash_rebuild(vec);
+            if (!full) e = RAY_ERR_OOM;
+            root = full;
+        }
+        if (e == RAY_OK) {
+            ray_enc_idx_src_t is = { root, vec->type, vec->attrs, vec->len, NULL, 0 };
+            is.order_name = colw_order_name(root, &is.order_len);
+            ray_encw_set_index(&w, &is);
+        }
     }
     if (e == RAY_OK) e = ray_encw_chunks(&w, data, esz, pool);
     /* colw_region_msg reads the thread-local message: clear it first, so a
@@ -149,6 +161,7 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
     if (e == RAY_OK && region) ray_error_clear();
     if (e == RAY_OK && (e = ray_encw_finish(&w)) != RAY_OK && region) colw_region_msg(path);
     ray_encw_free(&w);
+    if (full) ray_release(full);
     if (fclose(f) != 0 && e == RAY_OK) e = RAY_ERR_IO;
     if (e != RAY_OK) { remove(tmp); return e; }             /* nothing of this write remains */
     return colw_publish(tmp, path, durable);
