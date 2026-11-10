@@ -1463,12 +1463,40 @@ static bool enc_point_resident(const ray_enccol_t* e, int64_t r) {
  * disk ~8 ms each, a second per thousand rows); asked for together, each
  * round waits about once.  A warm column costs three probes: the first,
  * middle and last rows (the first chunks alone are often in already, read
- * by an earlier probe of the column). */
+ * by an earlier probe of the column).  Each range is widened to its
+ * ENC_WANT_WIN window of the file and touching windows go out as one: the
+ * window a page fault reads around anyway, so the bytes match the faults',
+ * while exact ranges sent each sparse sample's few pages as a request of
+ * their own (a two-key share sample sent 4.6x the query's requests). */
+#define ENC_WANT_WIN ((uint64_t)128 << 10)
+
+typedef struct { const ray_enccol_t* e; uint64_t lo, hi; } enc_want_t;
+
+static void enc_want_flush(enc_want_t* w) {
+    if (w->hi > w->lo) ray_vm_advise_willneed((void*)(w->e->base + w->lo), (size_t)(w->hi - w->lo));
+    w->lo = w->hi = 0;
+}
+
+/* File bytes [off, off + n) wanted, rounded out to windows. */
+static void enc_want(enc_want_t* w, uint64_t off, uint64_t n) {
+    if (!n) return;                     /* a payload-free vector reads nothing */
+    uint64_t a = off & ~(ENC_WANT_WIN - 1), b = (off + n + ENC_WANT_WIN - 1) & ~(ENC_WANT_WIN - 1);
+    if (b > w->e->size) b = w->e->size;
+    if (w->hi > w->lo && a <= w->hi && b >= w->lo) {
+        if (a < w->lo) w->lo = a;
+        if (b > w->hi) w->hi = b;
+        return;
+    }
+    enc_want_flush(w);
+    w->lo = a; w->hi = b;
+}
+
 void ray_enccol_want_points(const ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base) {
     if (n <= 0 || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || !ray_pool_scan_on()) return;
     if (enc_point_resident(e, rows[0] - base) && enc_point_resident(e, rows[n / 2] - base) &&
         enc_point_resident(e, rows[n - 1] - base)) return;
     ray_enc_dirent_t de;
+    enc_want_t w = { e, 0, 0 };
     for (int64_t q = 0, last = -1; q < n; q++) {
         int64_t r = rows[q] - base;
         int64_t c = r / RAY_ENC_CHUNK;
@@ -1476,16 +1504,18 @@ void ray_enccol_want_points(const ray_enccol_t* e, const int64_t* rows, int64_t 
         last = c;
         dirent_at(e, c, &de);
         int64_t nv = (chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC;
-        ray_vm_advise_willneed((void*)(e->base + de.offset), (size_t)nv * sizeof(ray_enc_desc_t));
+        enc_want(&w, de.offset, (uint64_t)nv * sizeof(ray_enc_desc_t));
     }
+    enc_want_flush(&w);
     for (int64_t q = 0; q < n; q++) {
         int64_t r = rows[q] - base;
         if (r < 0 || r >= e->len) continue;
         int64_t c = r / RAY_ENC_CHUNK;
         const ray_enc_desc_t* d = &ray_enccol_descs(e, c)[r % RAY_ENC_CHUNK / RAY_ENC_VEC];
         dirent_at(e, c, &de);
-        ray_vm_advise_willneed((void*)(e->base + de.offset + d->payload_off), (size_t)d->payload_bytes);
+        enc_want(&w, de.offset + d->payload_off, d->payload_bytes);
     }
+    enc_want_flush(&w);
 }
 
 /* ---- Batched point reads: the rows of one vector, its body read once ----
