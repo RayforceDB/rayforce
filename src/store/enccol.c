@@ -1432,6 +1432,17 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     ray_enc_dirent_t de; dirent_at(e, c, &de);
     const int64_t rows = chunk_rows(e, c);
     const int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    /* A RAW vector's row in place: through the cursor, the vector's view
+     * (ray_enccol_raw_view) first reads its chunk's RAW payloads whole, a
+     * chunk per sampled row of a cold column */
+    const size_t esz = (size_t)k.T / 8;
+    if (d->encoding == RAY_ENC_RAW && !d->n_nulls && !(d->flags & RAY_ENC_DESC_TRAILER) &&
+        esz == ray_enccol_esz(e) && (uint64_t)(i + 1) * esz <= d->payload_bytes) {
+        uint64_t x = 0;
+        memcpy(&x, e->base + de.offset + d->payload_off + (size_t)i * esz, esz);   /* little-endian */
+        *out = ray_enc_logical(x, k);
+        return 1;
+    }
     return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, vlen, i, k, out, err);
 }
 

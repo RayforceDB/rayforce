@@ -12801,6 +12801,12 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
                 int64_t samples = end - start < 1024 ? end - start : 1024;
                 int64_t lo = INT64_MAX, hi = INT64_MIN;
+                if (ks->rr.staged) {
+                    int64_t wr[1024];
+                    for (int64_t i = 0; i < samples; i++)
+                        wr[i] = start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1));
+                    agg_want_points(&ks->rr, 1, wr, samples);
+                }
                 for (int64_t i = 0; i < samples && !terr; i++) {
                     int64_t r = start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1));
                     int64_t v = agg_key_at(&ks->rr, &tcs, 0, r, &terr);

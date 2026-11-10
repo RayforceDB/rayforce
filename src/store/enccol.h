@@ -159,7 +159,7 @@ int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
 /* Row `row` of a single-file integer column (not SYM), read from its packed
  * vector without decoding the vector: a FOR_BP vector, DICT over a FOR_BP
  * code child, CONST or RLE (the row's run found by binary search, no row
- * expanded), with no nulls.  1 served (*out: the value widened to int64,
+ * expanded), or RAW (the row in place), with no nulls.  1 served (*out: the value widened to int64,
  * as the decode would hold it), 0 declined (read the vector by range), -1
  * an owned error in *err (the dictionary's oom). */
 int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err);
