@@ -743,6 +743,7 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
         case RAY_U8:        return ray_u8(0);
         case RAY_BOOL:      return make_bool(0);
         case RAY_F64:       return make_f64(0.0);
+        case RAY_F32:       return ray_f32(0.0f);
         case RAY_DATE:      return ray_date(0);
         case RAY_TIME:      return ray_time(0);
         case RAY_TIMESPAN: return ray_timespan(0);
@@ -1256,7 +1257,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         /* Classify operands: numeric/temporal vectors or scalars */
         int8_t lt = left_coll ? left->type : -(left->type);
         int8_t rt = right_coll ? right->type : -(right->type);
-        #define IS_NUM_TYPE(t) ((t)==RAY_I64||(t)==RAY_F64||(t)==RAY_I32||(t)==RAY_I16|| \
+        #define IS_NUM_TYPE(t) ((t)==RAY_I64||(t)==RAY_F64||(t)==RAY_F32||(t)==RAY_I32||(t)==RAY_I16|| \
                                 (t)==RAY_U8||(t)==RAY_DATE||(t)==RAY_TIME||(t)==RAY_TIMESTAMP)
         #define IS_POW_TYPE(t) ((t)==RAY_BOOL||(t)==RAY_U8||(t)==RAY_I16||(t)==RAY_I32|| \
                                 (t)==RAY_I64||(t)==RAY_F64)
@@ -1299,6 +1300,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     if (l_num_scalar) {
                         if (left->type == -RAY_F64)
                             lop = ray_const_f64(g, left->f64);
+                        else if (left->type == -RAY_F32)
+                            lop = ray_const_atom(g, left);
                         else {
                             int64_t sv = as_i64(left);
                             lop = ray_const_i64(g, sv);
@@ -1311,6 +1314,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     if (r_num_scalar) {
                         if (right->type == -RAY_F64)
                             rop = ray_const_f64(g, right->f64);
+                        else if (right->type == -RAY_F32)
+                            rop = ray_const_atom(g, right);
                         else {
                             int64_t sv = as_i64(right);
                             rop = ray_const_i64(g, sv);
@@ -1678,7 +1683,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
 
     /* SLOW PATH: per-element scalar loop (fallback for mixed types, temporal, etc.) */
     if (!force_boxed &&
-        (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
+        (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
          out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
          out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN)) {
         ray_t* vec = ray_vec_new(out_type, len);
@@ -1827,7 +1832,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     int8_t out_type = -(e0->type);
 
     /* Try typed vector path for numeric/bool/temporal output */
-    if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_I32 ||
+    if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
         out_type == RAY_I16 || out_type == RAY_BOOL || out_type == RAY_U8 ||
         out_type == RAY_DATE || out_type == RAY_TIME || out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN) {
         ray_t* vec = ray_vec_new(out_type, len);
@@ -4779,6 +4784,7 @@ static void ray_register_builtins(void) {
     register_vary("println",    RAY_FN_NONE, ray_println_fn);
     register_vary("show",       RAY_FN_NONE, ray_show_fn);
     register_vary("format",     RAY_FN_NONE, ray_format_fn);
+    register_unary("repr",      RAY_FN_NONE, ray_repr_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
@@ -5588,8 +5594,16 @@ ray_t* ray_eval(ray_t* obj) {
                 goto out;
             }
             int64_t argc = n - 1;
-            if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
-            ray_t* args[64];
+            /* A printed LIST can contain arbitrarily many cells.  Keep the
+             * usual stack path and arity guard for other variadic calls. */
+            if (argc > 64 && fn != ray_list_fn) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
+            ray_t* stack_args[64];
+            ray_t** args = stack_args;
+            if (argc > 64) {
+                if ((uint64_t)argc > SIZE_MAX / sizeof(ray_t*)) { ray_release(head); ret = ray_error("limit", NULL); goto out; }
+                args = ray_alloc_raw((size_t)argc * sizeof(ray_t*));
+                if (!args) { ray_release(head); ret = ray_error("oom", NULL); goto out; }
+            }
             int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
@@ -5597,6 +5611,7 @@ ray_t* ray_eval(ray_t* obj) {
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
+                    if (args != stack_args) ray_free_raw(args);
                     ray_release(head);
                     ret = err; goto out;
                 }
@@ -5605,12 +5620,13 @@ ray_t* ray_eval(ray_t* obj) {
                  : any_rows && ray_active_query_table() && vm_fn_rowwise(head) ? any_rows : 0;
             if (!(head->attrs & RAY_FN_LAZY_AWARE)) {
                 ray_t* err = materialize_owned_args(args, argc);
-                if (err) { ray_release(head); ret = err; goto out; }
+                if (err) { if (args != stack_args) ray_free_raw(args); ray_release(head); ret = err; goto out; }
             }
             ray_release(head);
             if (callee_mutator) ray_env_mutator_callee_arm();
             ray_t* result = fn(args, argc);
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
+            if (args != stack_args) ray_free_raw(args);
             ret = result; goto out;
         }
         case RAY_LAMBDA: {

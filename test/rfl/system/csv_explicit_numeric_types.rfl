@@ -29,10 +29,10 @@
 (type (wavg (at T 'i32) (at T 'f32b))) -- 'f64
 (set G (select {mx: (max f32a) wa: (wavg i32 f32b) by: {k: i16} from: T}))
 (count G) -- 3
-(type (at G 'mx)) -- 'F64
+(type (at G 'mx)) -- 'F32
 (type (at G 'wa)) -- 'F64
 (set G1 (select {mx: (max f32a) wa: (wavg i32 f32b) from: T where: (== i16 32000)}))
-(at (at G1 'mx) 0) -- 1.25
+(at (at G1 'mx) 0) -- 1.25e
 (at (at G1 'wa) 0) -- 0.25
 (at (at T 'i32) 0) -- 100000
 (at (at T 'i16) 1) -- -300

@@ -1,0 +1,30 @@
+;; The type a scan or an aggregate declares in the query plan is what the
+;; operator above it is planned with: an average or a deviation over it is a
+;; duration only when its input is declared a duration.
+(set T (table [sp ts dt] (list (enlist 0D01:00:00 0D02:00:00 0D06:00:00) (as 'TIMESTAMP [1000000000 5000000000 9000000000]) (as 'DATE [1 5 9]))))
+
+;; the scans that keep a duration
+(type (at (select {r: (avg (deltas sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (sums sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (msum 2 sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (avgs sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (mavg 2 sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (mdev 2 sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev (deltas sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev (msum 2 sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev (avgs sp)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev (mavg 2 sp)) from: T}) 'r)) -- 'TIMESPAN
+
+;; the difference of two TIMESTAMPs is a duration, of two DATEs a count of days
+(type (at (select {r: (avg (deltas ts)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (deltas dt)) from: T}) 'r)) -- 'F64
+
+;; the aggregates that answer a duration, used as a value in a query
+(type (at (select {r: (avg (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (- sp (stddev sp))) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (avg (- sp (stddev_pop sp))) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (stddev_pop (- sp (avg sp))) from: T}) 'r)) -- 'TIMESPAN
+
+;; a comparison is no duration
+(type (at (select {r: (avg (> sp (avg sp))) from: T}) 'r)) -- 'F64

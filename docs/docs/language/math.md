@@ -260,7 +260,8 @@ Logical OR, element by element on collections, as `and` is.
 
 ### `(not x)` — atomic
 
-Logical NOT. Flips boolean values.
+Logical NOT. Flips boolean values. A STR, SYM or GUID vector is a `type`
+error: `not` has no meaning for those cells.
 
 ```lisp
 (not true)  ; false
@@ -319,7 +320,15 @@ Number of elements. Counts total vector length, including nulls.
 
 ### `(avg x)` — aggregate
 
-Arithmetic mean.
+Arithmetic mean. The mean of a TIMESPAN vector is a TIMESPAN, rounded to the
+nanosecond (half away from zero); `avgs` and `mavg` of a TIMESPAN vector
+are TIMESPAN vectors as well. The mean of a vector is computed from an exact
+128-bit total, so it is exact to the nanosecond; the grouped, scan and moving
+forms go through F64 and are exact up to 2^53 nanoseconds (about 104 days).
+
+A TIMESPAN vector is also accepted by `sums`, `mins`, `maxs`, `msum`, `mmin`,
+`mmax`, `avgs`, `mavg`, `mdev` and `deltas`, and answers a TIMESPAN;
+`ratios` accepts it and answers F64.
 
 ```lisp
 (avg [2 4 6])  ; 4.0
@@ -349,17 +358,22 @@ Median value.
 (med [1 3 5 7 9])  ; 5.0
 ```
 
-For a TIMESPAN vector, the result is an F64 number of **nanoseconds**,
-including fractional nanoseconds for an even-sized input. `SELECT` uses the
-same result type; it does not round the median back into a duration.
+For a TIMESPAN vector, the median is a TIMESPAN: a median of durations is a
+duration. An even-sized input takes the midpoint of the two middle values,
+rounded to the nanosecond (half away from zero); an odd-sized input answers one
+of its values. `SELECT` uses the same result type, as do `quantile` and
+`percentile`. The endpoints are taken from the integer values, so a median
+or quantile of a vector is exact at any magnitude.
 
 ```lisp
-(med [0D01:00:00 0D02:00:00])  ; 5400000000000.0
+(med [0D01:00:00 0D02:00:00])  ; 0D01:30:00.000000000
 ```
 
 ### `(dev x)` — aggregate
 
-Population standard deviation.
+Population standard deviation. The standard deviation of a TIMESPAN vector
+(`dev`, `stddev`, `stddev_pop`, `mdev`) is a TIMESPAN, rounded to the
+nanosecond; a variance of durations is a squared duration and stays F64.
 
 ```lisp
 (dev [2 4 4 4 5 5 7 9])  ; 2.0
