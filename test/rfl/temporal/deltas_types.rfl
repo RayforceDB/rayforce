@@ -1,0 +1,33 @@
+;; `deltas` has the type `-` answers between consecutive elements.
+(set t (enlist 2024.01.02D09:30:00.000000000 2024.01.03D10:30:00.000000000 0Np 2024.01.05D00:00:00.000000000))
+(type (deltas t)) -- 'TIMESPAN
+(type (- (at t 1) (at t 0))) -- 'timespan
+(as 'I64 (at (deltas t) 1)) -- 90000000000000
+(nil? (deltas t)) -- [true false true true]
+
+(set tm (enlist 09:30:00.000 10:30:00.000 12:00:00.000))
+(type (deltas tm)) -- 'TIME
+(type (- (at tm 1) (at tm 0))) -- 'time
+(as 'I64 (at (deltas tm) 1)) -- 3600000
+(as 'I64 (at (deltas tm) 2)) -- 5400000
+(nil? (deltas tm)) -- [true false false]
+
+(set dt (enlist 2024.01.02 2024.01.05 2024.01.04))
+(type (deltas dt)) -- 'I32
+(type (- (at dt 1) (at dt 0))) -- 'i32
+(as 'I64 (at (deltas dt) 1)) -- 3
+(as 'I64 (at (deltas dt) 2)) -- -1
+(nil? (deltas dt)) -- [true false false]
+
+;; durations stay durations; the other integer families and floats are unchanged
+(type (deltas (enlist 0D01:00:00 0D03:00:00))) -- 'TIMESPAN
+(type (deltas [1 4 2])) -- 'I64
+(type (deltas [1i 4i])) -- 'I64
+(type (deltas [1.0 4.0])) -- 'F64
+
+;; one element, and inside a query
+(type (deltas (take dt 1))) -- 'I32
+(set T (table [d s] (list dt (enlist 0D01:00:00 0D03:00:00 0D04:00:00))))
+(type (at (select {r: (deltas d) from: T}) 'r)) -- 'I32
+(type (at (select {r: (deltas s) from: T}) 'r)) -- 'TIMESPAN
+(as 'I64 (at (select {r: (deltas d) from: T}) 'r)) -- [-9223372036854775808 3 -1]

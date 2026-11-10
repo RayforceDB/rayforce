@@ -77,4 +77,32 @@
 (set Pfull (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i)}))
 (eqt (select {from: Fp by: [u s] c: (count u) sv: (sum v) f: (min i) take: 10}) (take (xasc Pfull 'f) 10)) -- true
 (eqt (xasc Pfull 'f) (xasc (select {from: F by: [u s] c: (count u) sv: (sum v) f: (min i)}) 'f)) -- true
+;; A deferred by-dict key on parted input must keep first-seen group order
+;; before an unordered take; the strategy's slot order is not row order.
+(eqt (select {from: Fp by: {ku: u} c: (count v) take: 3}) (select {from: F by: {ku: u} c: (count v) take: 3})) -- true
+(eqt (select {from: Fp by: {ku: (% u 7)} c: (count v) take: 3}) (select {from: F by: {ku: (% u 7)} c: (count v) take: 3})) -- true
+;; More deferred by-dict shapes (multi-key, range take, where:) answer like the
+;; flat table; so do BOOL keys, which the take must not be pushed ahead of.
+(eqt (select {from: Fp by: {ku: u kw: w} c: (count v) take: 3}) (select {from: F by: {ku: u kw: w} c: (count v) take: 3})) -- true
+(eqt (select {from: Fp by: {ku: u} c: (count v) take: [2 3]}) (select {from: F by: {ku: u} c: (count v) take: [2 3]})) -- true
+(eqt (select {from: Fp where: (> v 10) by: {ku: (% u 7)} c: (count v) take: 3}) (select {from: F where: (> v 10) by: {ku: (% u 7)} c: (count v) take: 3})) -- true
+;; a renamed BOOL key (first row true) keeps first-seen order, not key order
+(set Tb (table [u v bl] (list (til 12) (til 12) (< (til 12) 4))))
+(.sys.exec "rm -rf rf_test_firstn_bool")
+(.db.splayed.set "rf_test_firstn_bool/1/t/" (take Tb [0 6]))
+(.db.splayed.set "rf_test_firstn_bool/2/t/" (take Tb [6 6]))
+(set Tbp (.db.parted.get "rf_test_firstn_bool/" 't))
+(at (at (select {from: Tbp by: {kb: bl} c: (count v) take: 1}) 'kb) 0) -- true
+(eqt (select {from: Tbp by: {kb: bl} c: (count v) take: 1}) (select {from: Tb by: {kb: bl} c: (count v) take: 1})) -- true
+;; a renamed BOOL column inside a multi-key dict: key order and first-seen order
+;; differ (u 4..11 reach false after true), so the take must stay eager
+(eqt (select {from: Tbp by: {kb: bl ku: u} c: (count v) take: 3}) (select {from: Tb by: {kb: bl ku: u} c: (count v) take: 3})) -- true
+(eqt (select {from: Tbp by: {ku: (% u 3) kb: bl} c: (count v) take: 3}) (select {from: Tb by: {ku: (% u 3) kb: bl} c: (count v) take: 3})) -- true
+;; a computed BOOL key (alone, and inside a multi-key dict) is emitted in key
+;; order; the take must still give the first-seen groups, true first here
+(at (at (select {from: Tbp by: {kb: (< u 4)} c: (count v) take: 1}) 'kb) 0) -- true
+(eqt (select {from: Tbp by: {kb: (< u 4)} c: (count v) take: 1}) (select {from: Tb by: {kb: (< u 4)} c: (count v) take: 1})) -- true
+(eqt (select {from: Tbp by: {kb: (< u 4) ku: (% u 3)} c: (count v) take: 2}) (select {from: Tb by: {kb: (< u 4) ku: (% u 3)} c: (count v) take: 2})) -- true
+(eqt (select {from: Tbp by: {ku: (% u 3) kb: (< u 4)} c: (count v) take: 3}) (select {from: Tb by: {ku: (% u 3) kb: (< u 4)} c: (count v) take: 3})) -- true
+(.sys.exec "rm -rf rf_test_firstn_bool") -- 0
 (.sys.exec "rm -rf rf_test_firstn_take rf_test_firstn_parted") -- 0

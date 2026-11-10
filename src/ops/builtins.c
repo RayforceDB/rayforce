@@ -143,7 +143,7 @@ void ray_lang_print(FILE* fp, ray_t* val) {
          * vector types (I16/I32/F64/SYM/...), DICT, GUID, temporal, etc.
          * Without this println on (println 5i) printed "<type:-4>" — a
          * debug placeholder, not the value. */
-        ray_t* s = ray_fmt(val, 0);
+        ray_t* s = ray_fmt(val, RAY_FMT_COMPACT);
         if (s && !RAY_IS_ERR(s)) {
             fprintf(fp, "%.*s", (int)ray_str_len(s), ray_str_ptr(s));
             ray_release(s);
@@ -227,7 +227,7 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 tlen = snprintf(tmp, sizeof(tmp), "'?");
             } else {
                 /* Fall back to ray_fmt */
-                ray_t* formatted = ray_fmt(a, 0);
+                ray_t* formatted = ray_fmt(a, RAY_FMT_COMPACT);
                 if (formatted && !RAY_IS_ERR(formatted)) {
                     const char* sp = ray_str_ptr(formatted);
                     size_t sl = ray_str_len(formatted);
@@ -379,6 +379,11 @@ ray_t* ray_format_fn(ray_t** args, int64_t n) {
     /* No placeholders: return fmt as-is */
     ray_retain(args[0]);
     return args[0];
+}
+
+/* (repr value) — source text that parses back to the same value. */
+ray_t* ray_repr_fn(ray_t* value) {
+    return ray_fmt(value, RAY_FMT_ROUNDTRIP);
 }
 
 /* (resolve 'name) — check if name exists in env, return value or null.
@@ -1426,7 +1431,7 @@ ray_t* cast_str_atom(ray_t* val) {
     }
     /* Fallback: use ray_fmt for any other atom type */
     if (ray_is_atom(val)) {
-        ray_t* formatted = ray_fmt(val, 0);
+        ray_t* formatted = ray_fmt(val, RAY_FMT_COMPACT);
         if (formatted && !RAY_IS_ERR(formatted)) return formatted;
         if (formatted) ray_release(formatted);
     }
@@ -1502,6 +1507,10 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         else if (cast_match(tn, tl, "TIMESTAMP") || cast_match(tn, tl, "timestamp")) tt = -RAY_TIMESTAMP;
         else if (cast_match(tn, tl, "GUID") || cast_match(tn, tl, "guid")) tt = -RAY_GUID;
         else if (cast_match(tn, tl, "STR") || cast_match(tn, tl, "str")) { ray_release(s2); return ray_str("", 0); }
+        else if (cast_match(tn, tl, "LIST")) {
+            ray_release(s2);
+            return ray_error("type", "as: cannot cast %s to list", ray_type_name(val->type));
+        }
         ray_release(s2);
         if (tt == -RAY_U8) return ray_u8(0);
         if (tt == -RAY_BOOL) {
@@ -1787,7 +1796,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         }
         /* Temporal/guid atom -> symbol: use ray_fmt for formatting */
         if (ray_is_atom(val) && (is_temporal(val) || val->type == -RAY_GUID)) {
-            ray_t* formatted = ray_fmt(val, 0);
+            ray_t* formatted = ray_fmt(val, RAY_FMT_COMPACT);
             if (formatted && !RAY_IS_ERR(formatted)) {
                 const char* sp = ray_str_ptr(formatted);
                 size_t slen = ray_str_len(formatted);
@@ -2172,6 +2181,14 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_U8);
         return ray_error("type", "as: cannot cast %s to u8", ray_type_name(val->type));
+    }
+    /* Cast to LIST: a typed vector is boxed into a LIST of atoms (null cells
+     * stay typed null atoms); a LIST is returned unchanged.  There is no
+     * one-item list for an atom, a dict or a table: those are rejected. */
+    if (cast_match(tname, tlen, "LIST")) {
+        ray_release(s);
+        if (val->type == RAY_LIST || ray_is_vec(val)) return to_boxed_list(val);
+        return ray_error("type", "as: cannot cast %s to list", ray_type_name(val->type));
     }
     /* Cast to DICT */
     if (cast_match(tname, tlen, "DICT")) {
@@ -2593,6 +2610,11 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n) {
         case RAY_F64: {
             double* d = (double*)ray_data(vec);
             for (int64_t i = 0; i < n; i++) d[i] = args[i]->f64;
+            break;
+        }
+        case RAY_F32: {
+            float* d = (float*)ray_data(vec);
+            for (int64_t i = 0; i < n; i++) d[i] = (float)args[i]->f64;
             break;
         }
         case RAY_I32: case RAY_DATE: case RAY_TIME: {
@@ -3774,6 +3796,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             ((int64_t*)ray_data(result))[0] = a->i64; break;
         case RAY_F64:
             ((double*)ray_data(result))[0] = a->f64; break;
+        case RAY_F32:   /* an F32 atom holds its value in the f64 slot */
+            ((float*)ray_data(result))[0] = (float)a->f64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)ray_data(result))[0] = a->i32; break;
         case RAY_I16:
@@ -3825,6 +3849,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             ((int64_t*)ray_data(result))[na] = b->i64; break;
         case RAY_F64:
             ((double*)ray_data(result))[na] = b->f64; break;
+        case RAY_F32:
+            ((float*)ray_data(result))[na] = (float)b->f64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)ray_data(result))[na] = b->i32; break;
         case RAY_I16:
@@ -3861,6 +3887,10 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         case RAY_F64:
             ((double*)ray_data(result))[0] = a->f64;
             ((double*)ray_data(result))[1] = b->f64;
+            break;
+        case RAY_F32:
+            ((float*)ray_data(result))[0] = (float)a->f64;
+            ((float*)ray_data(result))[1] = (float)b->f64;
             break;
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             ((int32_t*)ray_data(result))[0] = a->i32;

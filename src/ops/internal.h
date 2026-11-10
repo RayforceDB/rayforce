@@ -183,6 +183,34 @@ static inline int64_t sym_intern_safe(const char* s, size_t len) {
     return id >= 0 ? id : 0;
 }
 
+/* Result type of `deltas`: the type `-` answers between consecutive elements.
+ * A difference of two TIMESTAMPs is a TIMESPAN, of two TIMEs a TIME and of two
+ * DATEs an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64
+ * and every other integer family I64. */
+static inline int8_t deltas_out_type(int8_t t) {
+    switch (t) {
+        case RAY_F32: case RAY_F64:      return RAY_F64;
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: return RAY_TIMESPAN;
+        case RAY_TIME:                   return RAY_TIME;
+        case RAY_DATE:                   return RAY_I32;
+        default:                         return RAY_I64;
+    }
+}
+
+/* Result type of the additive scans (sums, msum) over an integer-lane
+ * input: a TIMESPAN stays a TIMESPAN, as `sum` and `-` keep it; every other
+ * integer-lane input answers I64 counts.  Float inputs answer F64 and are not
+ * routed here. */
+static inline int8_t scan_int_out_type(int8_t t) {
+    return t == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_I64;
+}
+
+/* Result type of a mean or median (avg, avgs, mavg, med): F64, except that the
+ * mean of durations is a duration. */
+static inline int8_t mean_out_type(int8_t t) {
+    return t == RAY_TIMESPAN ? RAY_TIMESPAN : RAY_F64;
+}
+
 /* ══════════════════════════════════════════
  * Unified column read/write helpers
  * ══════════════════════════════════════════ */
@@ -1654,6 +1682,12 @@ ray_t* distinct_radix_first_ids(ray_t* input);
  * returned as RAY_IS_ERR ray_t*. */
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups);
+
+/* Mean and median of durations are durations: round an F64 atom / vector of
+ * nanosecond counts to a TIMESPAN one (consumes its argument; nulls stay
+ * null, errors pass through).  See agg.c. */
+ray_t* ray_timespan_of_f64_atom(ray_t* r);
+ray_t* ray_timespan_of_f64_vec(ray_t* col);
 
 /* Parallel exact median per group via ray_pool_dispatch_n.  idx_buf is
  * the group-contiguous row-index layout produced by the upstream
