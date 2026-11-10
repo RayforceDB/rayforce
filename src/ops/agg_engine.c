@@ -2744,12 +2744,17 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
     int64_t mn[16], mx[16];
     for (uint32_t k = 0; k < nk; k++) { mn[k] = INT64_MAX; mx[k] = INT64_MIN; }
     const int64_t np = bc->n_sel < AGG_SEL_PROBE_ROWS ? bc->n_sel : AGG_SEL_PROBE_ROWS;
+    int64_t prow[AGG_SEL_PROBE_ROWS];
+    for (int64_t i = 0; i < np; i++) {
+        agg_sel_cursor_t cur;
+        int64_t o = bc->n_sel / np * i;
+        agg_sel_cursor_init(&cur, bc->sel, bc->sel_prefix, o, o + 1);
+        if (agg_sel_cursor_next(&cur, &prow[i]) != 1) return false;
+    }
+    agg_want_points(krr, nk, prow, np);   /* the rows' pages, asked for together */
     bool ok = true;
     for (int64_t i = 0; i < np && ok; i++) {
-        int64_t o = bc->n_sel / np * i, row;
-        agg_sel_cursor_t cur;
-        agg_sel_cursor_init(&cur, bc->sel, bc->sel_prefix, o, o + 1);
-        if (agg_sel_cursor_next(&cur, &row) != 1) { ok = false; break; }
+        int64_t row = prow[i];
         for (uint32_t k = 0; k < nk; k++) {
             /* in place, or a point read; a declined one skips the row for
              * this key (fewer rows only weaken the bound: nothing decodes) */
@@ -11328,6 +11333,10 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     if (!d.staged && ray_col_cold(keys[0]))
         for (int i = 0; i < SAMPLES; i++)
             ray_col_want_row(keys[0], i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+    if (d.staged) {   /* values holds the rows until the first group: map has no entry yet */
+        for (int i = 0; i < SAMPLES; i++) values[i] = i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step);
+        agg_want_points(&d.rr, 1, values, SAMPLES);
+    }
     for (int i = 0; i < SAMPLES && !*err; i++) {
         uint64_t jitter = ray_hash_i64(i);
         int64_t row = i * step + jitter % step;
