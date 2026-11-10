@@ -575,6 +575,13 @@ static inline int64_t agg_key_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k,
     if ((*err = ray_col_cursor_at(&cs->cur[k], r, &v)) != NULL) return 0;
     return agg_read_key_i64_raw(rr->key_types[k], v->attrs, v->data, r - v->start);
 }
+/* The staged keys' pages that agg_key_at of rows[0, n) touches, asked
+ * for ahead (ray_col_src_want_points): a sampler's strided rows of a cold
+ * key then wait about once, not once per row. */
+static void agg_want_points(const agg_rr_t* rr, uint32_t n_keys, const int64_t* rows, int64_t n) {
+    for (uint32_t k = 0; k < n_keys; k++)
+        if (rr->srcs[k]) ray_col_src_want_points(rr->srcs[k], rows, n);
+}
 static inline const void* agg_elem_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t i, int64_t r, ray_t** err) {
     if (!rr->srcs[i]) return rr->plain[i] ? (const char*)rr->plain[i] + (size_t)r * rr->esz[i] : NULL;
     const ray_col_range_t* v;
@@ -1411,6 +1418,11 @@ static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows
     if (!rr->staged && ray_col_cold(key_col))
         for (int i = 0; i < SAMPLES; i++)
             ray_col_want_row(key_col, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+    if (rr->staged) {
+        int64_t wrow[SAMPLES];
+        for (int i = 0; i < SAMPLES; i++) wrow[i] = i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step);
+        agg_want_points(rr, 1, wrow, SAMPLES);
+    }
     for (int i = 0; i < SAMPLES && !*err; i++) {
         int64_t v = agg_key_at(rr, &cs, 0, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step), err);
         if (*err) break;
@@ -10236,6 +10248,7 @@ static void agg_ts_sample_staged_fn(void* vctx, uint32_t wid, int64_t start, int
             }
             rows[nr++] = r;
         }
+        agg_want_points(rr, n_keys, rows, nr);
         agg_curs_t cs; cs.cur = NULL;
         ray_t* err = NULL;
         /* the slice's tuples, key-major: kv[k * nr + a] (the task's one scratch) */
@@ -10339,6 +10352,17 @@ static bool agg_ts_precheck_declines(const agg_rr_t* krr, ray_t** key_cols, uint
                     int64_t pos = i * pstep + (int64_t)(ray_hash_i64(i + 7919) % (uint64_t)pstep);
                     if (pos < nrows) ray_col_want_row(key_cols[k], pos);
                 }
+    if (krr->staged) {    /* both stages' rows */
+        int64_t prow[AGG_TS_PRE_SAMPLE2], np = 0;
+        for (int64_t i = 0; i < AGG_TS_PRE_SAMPLE2; i++) {
+            uint64_t jit = ray_hash_i64(i + 7919);
+            int64_t pos = i * pstep + (int64_t)(jit % (uint64_t)pstep), r = pos;
+            if (pos >= nrows) break;
+            if (sel && !agg_ts_sel_row_at(sflags, soffsets, sidx, pos, jit >> 32, &r)) continue;
+            prow[np++] = r;
+        }
+        agg_want_points(krr, n_keys, prow, np);
+    }
     int64_t d = 0, n = 0;
     bool declined = false;
     for (int64_t phase = 0; phase < ratio && !declined; phase++) {
@@ -11798,6 +11822,11 @@ static void agg_firstn_share_fn(void* raw, uint32_t wid, int64_t start, int64_t 
         if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, key, ray_error("oom", NULL)); continue; }
         ray_t* err = NULL;
         for (int64_t i = i0; i < i1 && !err; i++) {
+            if ((i - i0) % 512 == 0) {    /* the next rows' pages, asked for together */
+                int64_t wr[512], nw = 0;
+                for (int64_t w = i; w < i1 && nw < 512; w++) wr[nw++] = w * c->step;
+                agg_want_points(rr, rr->n_keys, wr, nw);
+            }
             for (uint32_t k = 0; k < rr->n_keys && !err; k++) kv[k] = agg_key_at(rr, &cs, k, i * c->step, &err);
             if (!err && agg_firstn_probe(c->set, kv, agg_firstn_hash(kv, rr->n_keys), false) >= 0) hits++;
         }

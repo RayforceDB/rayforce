@@ -227,6 +227,10 @@ int  ray_col_src_point_i64(ray_col_src_t* s, int64_t row, int64_t* out, ray_t** 
  * (ray_enccol_points_i64): 1 every row served into out, 0 declined (read
  * the vector through a cursor; out partly written), -1 an owned *err. */
 int  ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, ray_t** err);
+/* Ask ahead for the pages ray_col_src_point_i64 of rows[0, n) touches
+ * (ray_enccol_want_points per run of rows in one segment); nothing for
+ * rows a cursor reads.  Ascending rows group into fewest runs. */
+void ray_col_src_want_points(ray_col_src_t* s, const int64_t* rows, int64_t n);
 /* ray_col_src_points_i64 for a gather (ray_enccol_gather_points): SYM ids
  * and vectors with a null bitmap served too, nul[q] 1 for a bitmap null. */
 int  ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, uint8_t* nul,
