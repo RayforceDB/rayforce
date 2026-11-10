@@ -1446,26 +1446,31 @@ int ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err
     return point_read(e, d, e->base + de.offset + d->payload_off, d->payload_bytes, vlen, i, k, out, err);
 }
 
+/* Row r's descriptor and vector body are in memory. */
+static bool enc_point_resident(const ray_enccol_t* e, int64_t r) {
+    if (r < 0 || r >= e->len) return true;
+    ray_enc_dirent_t de;
+    dirent_at(e, r / RAY_ENC_CHUNK, &de);
+    const ray_enc_desc_t* d = &ray_enccol_descs(e, r / RAY_ENC_CHUNK)[r % RAY_ENC_CHUNK / RAY_ENC_VEC];
+    return ray_vm_resident(d, sizeof *d) &&
+           ray_vm_resident(e->base + de.offset + d->payload_off, (size_t)d->payload_bytes);
+}
+
 /* The pages point reads of rows[q] - base, q in [0, n), touch, asked for
  * ahead in two rounds: every chunk's descriptors, then each row's vector
  * body, which its descriptor locates.  Read as they are met, the strided
  * rows of a sampler each waited on their own page fault (on a network
  * disk ~8 ms each, a second per thousand rows); asked for together, each
- * round waits about once.  A warm column costs one probe. */
+ * round waits about once.  A warm column costs three probes: the first,
+ * middle and last rows (the first chunks alone are often in already, read
+ * by an earlier probe of the column). */
 void ray_enccol_want_points(const ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base) {
     if (n <= 0 || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || !ray_pool_scan_on()) return;
-    int64_t r = rows[0] - base;
-    if (r < 0 || r >= e->len) return;
-    /* warm: the first row's descriptor and body are in memory (a sampler
-     * after another over the same chunks finds the descriptors in but its
-     * own rows' bodies not) */
+    if (enc_point_resident(e, rows[0] - base) && enc_point_resident(e, rows[n / 2] - base) &&
+        enc_point_resident(e, rows[n - 1] - base)) return;
     ray_enc_dirent_t de;
-    dirent_at(e, r / RAY_ENC_CHUNK, &de);
-    const ray_enc_desc_t* d0 = &ray_enccol_descs(e, r / RAY_ENC_CHUNK)[r % RAY_ENC_CHUNK / RAY_ENC_VEC];
-    if (ray_vm_resident(d0, sizeof *d0) &&
-        ray_vm_resident(e->base + de.offset + d0->payload_off, (size_t)d0->payload_bytes)) return;
     for (int64_t q = 0, last = -1; q < n; q++) {
-        r = rows[q] - base;
+        int64_t r = rows[q] - base;
         int64_t c = r / RAY_ENC_CHUNK;
         if (r < 0 || r >= e->len || c == last) continue;
         last = c;
@@ -1474,7 +1479,7 @@ void ray_enccol_want_points(const ray_enccol_t* e, const int64_t* rows, int64_t 
         ray_vm_advise_willneed((void*)(e->base + de.offset), (size_t)nv * sizeof(ray_enc_desc_t));
     }
     for (int64_t q = 0; q < n; q++) {
-        r = rows[q] - base;
+        int64_t r = rows[q] - base;
         if (r < 0 || r >= e->len) continue;
         int64_t c = r / RAY_ENC_CHUNK;
         const ray_enc_desc_t* d = &ray_enccol_descs(e, c)[r % RAY_ENC_CHUNK / RAY_ENC_VEC];
