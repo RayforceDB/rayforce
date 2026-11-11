@@ -70,9 +70,12 @@ Calling it again on the same thread reuses unchanged partitions while the earlie
 
 Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`), symbol-domain opens and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
 
-Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
+Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column, and for predicates on a data column whose partitions carry statistics (see below).
 
-The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
+The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; `YYYY.MM.DD.HH.MM.SS` names (a real calendar date and a time of day, seconds precision, a year whose nanoseconds fit `int64` — about 1708 to 2292) give a `timestamp` `part` column, in chronological order; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A set that mixes these forms, or holds an impossible date, time or year, is a `sym` set. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
+
+!!! note "Compatibility"
+    `YYYY.MM.DD.HH.MM.SS` names used to load as a `sym` `part` column; they now load as `timestamp`. Mixed sets are unchanged.
 
 ```lisp
 (set dbroot "/tmp/rayforce-parted-db")
@@ -90,6 +93,18 @@ The directory names decide the key type and the partition order. `YYYY.MM.DD` na
 ```
 
 Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string or name not a sym), `name` (sym ID unknown).
+
+### Pruning by partition statistics
+
+A `where:` comparison of a parted integer or temporal data column with a literal (`== != < <= > >= in`, alone or as a conjunct of a top-level `and`) prunes the partitions whose statistics decide it false for every row: a partition's non-null minimum and maximum, from the chunk directory of a column saved with `compress: true` or the chunk zone of a plain column of 65,536 rows or more. The rule is the one row-level zone skipping uses, so a null (which ranks below every value) keeps its partition for `<` and `<=`, and a partition without statistics is always kept. A time-series table partitioned by day therefore answers `(> Time 2024.01.16D12:00:00.000)` from the partitions of `2024.01.16` and later, with no declaration about how `Time` relates to the key; a late row in the live tail, a renamed column and a null are all found, because the statistics describe the rows themselves.
+
+```lisp
+(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 {compress: true})
+(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 {compress: true})
+(set trades (.db.parted.get dbroot 'trades))
+;; Only the partitions whose time range reaches past the literal are read
+(select {from: trades where: (> time 2024.01.16D12:00:00.000)})
+```
 
 ### In-memory live-tail inserts
 

@@ -1,0 +1,174 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; src/store/part.c, src/ops/query.c, src/ops/opt.c — timestamp partition
+;; keys (YYYY.MM.DD.HH.MM.SS directories, RAY_MC_TIMESTAMP) and partition
+;; pruning by the partitions' own statistics: a predicate on a parted data
+;; column drops a partition only when its chunk directory (a generation-2
+;; column) or chunk zone decides the comparison false for every row.  The
+;; fixtures are written with compress: true so every partition carries a
+;; directory; results are compared with the same root read as plain
+;; (generation 0, no statistics below one chunk), which never prunes.
+;;
+;; Fixture roots use the /tmp/rfl_part_* prefix (see part.rfl).  Pre- and
+;; post-cleanup is mandatory: stale sym.lk / .d files from a prior run
+;; cause "error: corrupt" on the second open.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_ts_ovf /tmp/rfl_part_ps /tmp/rfl_part_ps0 /tmp/rfl_part_psn /tmp/rfl_part_psx /tmp/rfl_part_psi")
+
+(set O {compress: true})
+;; Three partitions of a Time/v table whose Time values rise with the key.
+(set PA (table [Time v] (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2])))
+(set PB (table [Time v] (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] [3 4])))
+(set PC (table [Time v] (list [2024.01.17D01:00:00.000] [5])))
+
+;; ────────────── timestamp partition keys: RAY_MC_TIMESTAMP ──────────────
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.15.10.00.00/t/" PA)
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.16.00.00.00/t/" PB)
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.17.00.00.00/t/" PC)
+(set Pts (.db.parted.get "/tmp/rfl_part_ts/" 't))
+;; the key column is 'part (only date keys are named 'date), typed TIMESTAMP
+(key Pts) -- ['part 'Time 'v]
+(count Pts) -- 5
+(at Pts 'part) -- [2024.01.15D10:00:00.000 2024.01.15D10:00:00.000 2024.01.16D00:00:00.000 2024.01.16D00:00:00.000 2024.01.17D00:00:00.000]
+;; prune by the key with a timestamp literal
+(at (select {from: Pts where: (>= part 2024.01.15D10:30:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pts where: (>= part 2024.01.16D00:00:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pts where: (< part 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Pts where: (== part 2024.01.17D00:00:00.000)}) 'v) -- [5]
+;; a date literal is rescaled to the key's units
+(at (select {from: Pts where: (>= part 2024.01.16)}) 'v) -- [3 4 5]
+(at (select {from: Pts where: (== part 2024.01.16)}) 'v) -- [3 4]
+(at (select {from: Pts where: (> part 2024.01.16)}) 'v) -- [5]
+
+;; live tail: a later timestamp key opens a new in-memory partition
+(insert 'Pts 2024.01.17D06:00:00.000 (table [Time v] (list [2024.01.17D06:30:00.000] [6])))
+(count Pts) -- 6
+(last (at Pts 'part)) -- 2024.01.17D06:00:00.000
+(at (select {from: Pts where: (>= part 2024.01.17D06:00:00.000)}) 'v) -- [6]
+;; an earlier key is rejected, as is a key of another type
+(insert 'Pts 2024.01.16D00:00:00.000 (table [Time v] (list [2024.01.16D00:00:00.000] [7]))) !- domain
+(insert 'Pts 2024.01.18 (table [Time v] (list [2024.01.18D00:00:00.000] [7]))) !- type
+
+;; a mixed set (one timestamp name, one date name) stays SYM
+(.db.splayed.set "/tmp/rfl_part_ts_mixed/2024.01.15.10.00.00/t/" PA)
+(.db.splayed.set "/tmp/rfl_part_ts_mixed/2024.01.16/t/" PB)
+(set Pmix (.db.parted.get "/tmp/rfl_part_ts_mixed/" 't))
+(key Pmix) -- ['part 'Time 'v]
+(at Pmix 'part) -- (as 'sym ["2024.01.15.10.00.00" "2024.01.15.10.00.00" "2024.01.16" "2024.01.16"])
+
+;; a calendar- or clock-impossible name is not a timestamp: the set is SYM
+(.db.splayed.set "/tmp/rfl_part_ts_bad/2024.02.31.00.00.00/t/" PA)
+(.db.splayed.set "/tmp/rfl_part_ts_bad/2024.03.01.24.00.00/t/" PB)
+(set Pbad (.db.parted.get "/tmp/rfl_part_ts_bad/" 't))
+(at Pbad 'part) -- (as 'sym ["2024.02.31.00.00.00" "2024.02.31.00.00.00" "2024.03.01.24.00.00" "2024.03.01.24.00.00"])
+
+;; a year whose nanoseconds do not fit int64 (outside about 1708-2292) is
+;; not a timestamp either: the set is SYM, keys kept literal and in order
+(.db.splayed.set "/tmp/rfl_part_ts_ovf/2024.01.15.00.00.00/t/" (table [v] (list [1])))
+(.db.splayed.set "/tmp/rfl_part_ts_ovf/2300.01.01.00.00.00/t/" (table [v] (list [2])))
+(.db.splayed.set "/tmp/rfl_part_ts_ovf/1700.01.01.00.00.00/t/" (table [v] (list [3])))
+(set Povf (.db.parted.get "/tmp/rfl_part_ts_ovf/" 't))
+(key Povf) -- ['part 'v]
+(at Povf 'part) -- (as 'sym ["1700.01.01.00.00.00" "2024.01.15.00.00.00" "2300.01.01.00.00.00"])
+(at Povf 'v) -- [3 1 2]
+
+;; ────────────── pruning by partition statistics: date keys ──────────────
+(.db.splayed.set "/tmp/rfl_part_ps/2024.01.15/t/" PA O)
+(.db.splayed.set "/tmp/rfl_part_ps/2024.01.16/t/" PB O)
+(.db.splayed.set "/tmp/rfl_part_ps/2024.01.17/t/" PC O)
+(set Pps (.db.parted.get "/tmp/rfl_part_ps/" 't))
+(key Pps) -- ['date 'Time 'v]
+(count Pps) -- 5
+;; every comparison, with t inside a partition's range ...
+(at (select {from: Pps where: (> Time 2024.01.16D12:00:00.000)}) 'v) -- [5]
+(at (select {from: Pps where: (>= Time 2024.01.16D12:00:00.000)}) 'v) -- [4 5]
+(at (select {from: Pps where: (< Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3]
+(at (select {from: Pps where: (<= Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3 4]
+(at (select {from: Pps where: (== Time 2024.01.16D12:00:00.000)}) 'v) -- [4]
+(at (select {from: Pps where: (!= Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3 5]
+(at (select {from: Pps where: (in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])}) 'v) -- [2 5]
+;; ... exactly on a partition's extremum ...
+(at (select {from: Pps where: (> Time 2024.01.16D00:00:00.000)}) 'v) -- [4 5]
+(at (select {from: Pps where: (>= Time 2024.01.16D00:00:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pps where: (< Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Pps where: (<= Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2 3]
+(at (select {from: Pps where: (== Time 2024.01.16D00:00:00.000)}) 'v) -- [3]
+;; ... before every value and after every value
+(at (select {from: Pps where: (< Time 2024.01.01D00:00:00.000)}) 'v) -- []
+(at (select {from: Pps where: (>= Time 2024.01.01D00:00:00.000)}) 'v) -- [1 2 3 4 5]
+(at (select {from: Pps where: (> Time 2024.02.01D00:00:00.000)}) 'v) -- []
+(at (select {from: Pps where: (<= Time 2024.02.01D00:00:00.000)}) 'v) -- [1 2 3 4 5]
+(at (select {from: Pps where: (== Time 2024.01.01D00:00:00.000)}) 'v) -- []
+;; the literal on the left, a date literal, a predicate on an integer
+;; column, a conjunction with the key, the count fast path
+(at (select {from: Pps where: (< 2024.01.16D12:00:00.000 Time)}) 'v) -- [5]
+(at (select {from: Pps where: (>= Time 2024.01.16)}) 'v) -- [3 4 5]
+(at (select {from: Pps where: (>= v 3)}) 'Time) -- [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000 2024.01.17D01:00:00.000]
+(at (select {from: Pps where: (in v [1 5])}) 'v) -- [1 5]
+(at (select {from: Pps where: (and (>= Time 2024.01.15D20:00:00.000) (< date 2024.01.17))}) 'v) -- [2 3 4]
+(at (select {from: Pps where: (and (>= v 2) (< Time 2024.01.17))}) 'v) -- [2 3 4]
+(count (select {from: Pps where: (< Time 2024.01.15D12:00:00.000)})) -- 1
+(sum (at (select {from: Pps where: (> Time 2024.01.16D06:00:00.000)}) 'v)) -- 9
+;; by: over a pruned predicate
+(select {s: (sum v) by: Time from: Pps where: (> Time 2024.01.16D00:00:00.000)}) -- (table [Time s] (list [2024.01.16D12:00:00.000 2024.01.17D01:00:00.000] [4 5]))
+(at (select {n: (count v) by: date from: Pps where: (>= Time 2024.01.16D12:00:00.000)}) 'n) -- [1 1]
+;; the same root as plain columns (no statistics) answers the same
+(.db.splayed.set "/tmp/rfl_part_ps0/2024.01.15/t/" PA)
+(.db.splayed.set "/tmp/rfl_part_ps0/2024.01.16/t/" PB)
+(.db.splayed.set "/tmp/rfl_part_ps0/2024.01.17/t/" PC)
+(set Pps0 (.db.parted.get "/tmp/rfl_part_ps0/" 't))
+(at (select {from: Pps0 where: (> Time 2024.01.16D12:00:00.000)}) 'v) -- [5]
+(at (select {from: Pps0 where: (< Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Pps0 where: (in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])}) 'v) -- [2 5]
+
+;; a null ranks below every value: `<` keeps the partition holding it
+(.db.splayed.set "/tmp/rfl_part_psn/2024.01.15/t/" PA O)
+(.db.splayed.set "/tmp/rfl_part_psn/2024.01.16/t/" (table [Time v] (list [2024.01.16D00:00:00.000 0Np 2024.01.16D12:00:00.000] [3 4 5])) O)
+(.db.splayed.set "/tmp/rfl_part_psn/2024.01.17/t/" (table [Time v] (list [2024.01.17D01:00:00.000] [6])) O)
+(set Ppsn (.db.parted.get "/tmp/rfl_part_psn/" 't))
+(at (select {from: Ppsn where: (< Time 2024.01.15D12:00:00.000)}) 'v) -- [1 4]
+(count (select {from: Ppsn where: (< Time 2024.01.15D12:00:00.000)})) -- 2
+(at (select {from: Ppsn where: (<= Time 2024.01.15D20:00:00.000)}) 'v) -- [1 2 4]
+(at (select {from: Ppsn where: (> Time 2024.01.16D06:00:00.000)}) 'v) -- [5 6]
+(at (select {from: Ppsn where: (== Time 2024.01.17D01:00:00.000)}) 'v) -- [6]
+(at (select {from: Ppsn where: (!= Time 2024.01.17D01:00:00.000)}) 'v) -- [1 2 3 4 5]
+
+;; a late row in the live tail is found: statistics describe the rows,
+;; not a contract between the column and the key
+(insert 'Pps 2024.01.18 (table [Time v] (list [2024.01.16D23:00:00.000] [9])))
+(at (select {from: Pps where: (< Time 2024.01.16D23:30:00.000)}) 'v) -- [1 2 3 4 9]
+(at (select {from: Pps where: (> Time 2024.01.16D12:00:00.000)}) 'v) -- [5 9]
+
+;; renaming columns moves the statistics with the data
+(.db.splayed.set "/tmp/rfl_part_psx/2024.01.15/t/" (table [Time Other v] (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [2024.01.20D00:00:00.000 2024.01.20D00:00:00.000] [1 2])) O)
+(.db.splayed.set "/tmp/rfl_part_psx/2024.01.16/t/" (table [Time Other v] (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] [2024.01.10D00:00:00.000 2024.01.10D00:00:00.000] [3 4])) O)
+(.db.splayed.set "/tmp/rfl_part_psx/2024.01.17/t/" (table [Time Other v] (list [2024.01.17D01:00:00.000] [2024.01.10D00:00:00.000] [5])) O)
+(set Ppsx (.db.parted.get "/tmp/rfl_part_psx/" 't))
+(at (select {from: (xcol Ppsx [date Other Time v]) where: (> Time 2024.01.18D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: (xcol Ppsx [date Other Time v]) where: (< Time 2024.01.12D00:00:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Ppsx where: (> Other 2024.01.18D00:00:00.000)}) 'v) -- [1 2]
+
+;; ────────────── pruning by partition statistics: timestamp and integer keys ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_ts")
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.15.10.00.00/t/" PA O)
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.16.00.00.00/t/" PB O)
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.17.00.00.00/t/" PC O)
+(set Ptsc (.db.parted.get "/tmp/rfl_part_ts/" 't))
+(at (select {from: Ptsc where: (> Time 2024.01.16D12:00:00.000)}) 'v) -- [5]
+(at (select {from: Ptsc where: (< Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Ptsc where: (== Time 2024.01.16D12:00:00.000)}) 'v) -- [4]
+(at (select {from: Ptsc where: (in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])}) 'v) -- [2 5]
+(at (select {from: Ptsc where: (and (> part 2024.01.15D12:00:00.000) (< Time 2024.01.17))}) 'v) -- [3 4]
+(.db.splayed.set "/tmp/rfl_part_psi/100/t/" (table [k v] (list [100 150] [1 2])) O)
+(.db.splayed.set "/tmp/rfl_part_psi/200/t/" (table [k v] (list [200 250] [3 4])) O)
+(.db.splayed.set "/tmp/rfl_part_psi/300/t/" (table [k v] (list [300] [5])) O)
+(set Ppsi (.db.parted.get "/tmp/rfl_part_psi/" 't))
+(at (select {from: Ppsi where: (>= k 160)}) 'v) -- [3 4 5]
+(at (select {from: Ppsi where: (== k 150)}) 'v) -- [2]
+(at (select {from: Ppsi where: (== k 160)}) 'v) -- []
+(at (select {from: Ppsi where: (< k 200)}) 'v) -- [1 2]
+(at (select {from: Ppsi where: (in k [100 300])}) 'v) -- [1 5]
+(at (select {from: Ppsi where: (> k 250)}) 'k) -- [300]
+
+;; ────────────── cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_ts_ovf /tmp/rfl_part_ps /tmp/rfl_part_ps0 /tmp/rfl_part_psn /tmp/rfl_part_psx /tmp/rfl_part_psi")

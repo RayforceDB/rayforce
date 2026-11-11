@@ -4616,66 +4616,92 @@ static test_result_t test_eval_insert_parted_e2e(void) {
     return result;
 }
 
-/* ---- Test: a select over a bound column prunes partitions before fetch -- */
+/* ---- Test: a select prunes partitions by their statistics before fetch -- */
 
-static test_result_t test_eval_select_parted_bound_impl(const char* root) {
-    char dir[1024], sym_path[1024];
-    int ns = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
-    TEST_ASSERT(ns > 0 && (size_t)ns < sizeof(sym_path), "format sym path");
+static test_result_t test_eval_select_parted_stats_impl(const char* root) {
+    /* Three generation-2 partitions (compress: true writes a chunk directory
+     * per column); Time rises with the day except for the null in the
+     * second partition, which ranks below every value. */
     const char* days[] = { "2024.01.15", "2024.01.16", "2024.01.17" };
     const char* rows[] = {
-        "(table ['Time 'v] (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2]))",
-        "(table ['Time 'v] (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] [3 4]))",
-        "(table ['Time 'v] (list [2024.01.17D01:00:00.000] [5]))",
+        "(list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2])",
+        "(list [2024.01.16D00:00:00.000 0Np 2024.01.16D12:00:00.000] [3 4 5])",
+        "(list [2024.01.17D01:00:00.000] [6])",
     };
-    for (int i = 0; i < 3; i++) {
-        int n = snprintf(dir, sizeof(dir), "%s/%s/t", root, days[i]);
-        TEST_ASSERT(n > 0 && (size_t)n < sizeof(dir), "format partition path");
-        TEST_ASSERT(lang_parted_insert_save_table(rows[i], dir, sym_path), "create parted fixture");
-    }
-
     char src[1400];
-    int n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't {bound: 'Time}))", root);
+    for (int i = 0; i < 3; i++) {
+        int n = snprintf(src, sizeof(src),
+                         "(.db.splayed.set \"%s/%s/t/\" (table ['Time 'v] %s) {compress: true})",
+                         root, days[i], rows[i]);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+        ray_t* w = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        ray_release(w);
+    }
+    int n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't))", root);
     TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
     ray_t* setup = ray_eval_str(src);
     TEST_ASSERT_NOT_NULL(setup);
     TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
     ray_release(setup);
 
-    /* The literal lies in the last partition: the two before it are pruned. */
-    uint64_t runs0, parts0, runs1, parts1;
-    ray_query_test_part_prune(&runs0, &parts0);
-    ray_t* r = ray_eval_str("(at (select {from: p where: (> Time 2024.01.17D00:30:00.000)}) 'v)");
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->type, RAY_I64);
-    TEST_ASSERT_EQ_I(r->len, 1);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[0], 5);
-    ray_release(r);
-    ray_query_test_part_prune(&runs1, &parts1);
-    TEST_ASSERT_EQ_U(runs1 - runs0, 1);
-    TEST_ASSERT_EQ_U(parts1 - parts0, 2);
+    /* query, expected v values, partitions the pre-fetch pruning drops */
+    struct { const char* where; const char* want; uint64_t pruned; } cases[] = {
+        { "(> Time 2024.01.17D00:30:00.000)",  "[6]",           2 },
+        { "(>= Time 2024.01.16D12:00:00.000)", "[5 6]",         1 },
+        { "(< Time 2024.01.15D12:00:00.000)",  "[1 4]",         1 },   /* the null's partition stays */
+        { "(<= Time 2024.01.15D20:00:00.000)", "[1 2 4]",       1 },
+        { "(== Time 2024.01.17D01:00:00.000)", "[6]",           2 },
+        { "(== Time 2024.01.16D06:00:00.000)", "[]",            2 },   /* one pruned partition stands in */
+        { "(!= Time 2024.01.17D01:00:00.000)", "[1 2 3 4 5]",   1 },   /* a one-value partition equal to it */
+        { "(in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])", "[2 6]", 1 },
+        { "(> 2024.01.16D20:00:00.000 Time)",  "[1 2 3 4 5]",   1 },   /* the literal on the left */
+        { "(and (>= v 3) (< Time 2024.01.17D00:00:00.000))", "[3 4 5]", 2 },   /* two columns' statistics */
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        n = snprintf(src, sizeof(src), "(at (select {from: p where: %s}) 'v)", cases[i].where);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format select");
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_t* want = ray_eval_str(cases[i].want);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_EQ_I(r->len, want->len);
+        for (int64_t k = 0; k < r->len; k++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[k], ((int64_t*)ray_data(want))[k]);
+        ray_release(r);
+        ray_release(want);
+        ray_query_test_part_prune(&runs1, &parts1);
+        TEST_ASSERT_EQ_U(runs1 - runs0, cases[i].pruned ? 1 : 0);
+        TEST_ASSERT_EQ_U(parts1 - parts0, cases[i].pruned);
+    }
 
-    /* A predicate the bound cannot prune (!=) leaves the counters alone. */
-    r = ray_eval_str("(count (select {from: p where: (!= Time 2024.01.17D01:00:00.000)}))");
+    /* The same answers as the plain scan: the count fast path and a sum. */
+    ray_t* r = ray_eval_str("(count (select {from: p where: (< Time 2024.01.15D12:00:00.000)}))");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->i64, 4);
+    TEST_ASSERT_EQ_I(r->i64, 2);
     ray_release(r);
-    ray_query_test_part_prune(&runs0, &parts0);
-    TEST_ASSERT_EQ_U(runs0, runs1);
+    r = ray_eval_str("(sum (at (select {from: p where: (> Time 2024.01.16D06:00:00.000)}) 'v))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 11);
+    ray_release(r);
     PASS();
 }
 
-static test_result_t test_eval_select_parted_bound(void) {
+static test_result_t test_eval_select_parted_stats(void) {
     char root[512];
     int n = snprintf(root, sizeof(root),
-                     "/tmp/rayforce_lang_parted_bound_%ld",
+                     "/tmp/rayforce_lang_parted_stats_%ld",
                      (long)getpid());
     if (n <= 0 || (size_t)n >= sizeof(root))
         return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
     lang_parted_insert_rm_rf(root);
-    test_result_t result = test_eval_select_parted_bound_impl(root);
+    test_result_t result = test_eval_select_parted_stats_impl(root);
     lang_parted_insert_rm_rf(root);
     return result;
 }
@@ -12234,7 +12260,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
-    { "lang/eval/select_parted_bound", test_eval_select_parted_bound, lang_setup, lang_teardown },
+    { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },

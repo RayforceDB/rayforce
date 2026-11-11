@@ -27,6 +27,8 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
+#include "ops/idxop.h"      /* ray_index_attach_chunk_zone — a segment's statistics */
+#include "ops/opt.h"        /* ray_part_seg_stats */
 #include "store/csr.h"
 #include <string.h>
 
@@ -1144,90 +1146,101 @@ static test_result_t test_partition_pruning_mask(void) {
 }
 
 /*
- * Test: a predicate on the table's bound column prunes partitions.
+ * Test: a predicate on a parted data column prunes by the partitions'
+ * statistics.
  *
- * 3 partitions keyed by DATE values [d, d+1, d+2]; the TIMESTAMP column t is
- * the bound column (every row of partition k has t in [k, next key)).
- * Filter: t > d+1 at noon.  Expected seg_mask: bits 1,2 set (the partition
- * holding the literal and every later one), bit 0 clear — on the scan of t
- * itself, the only parted scan of the plan.
+ * 4 partitions keyed by I64 [100, 200, 300, 400]; the TIMESTAMP column t
+ * holds 256 rows per partition in [1000 p, 1000 p + 255] with a chunk zone
+ * attached (chunk_log2 8: one chunk per segment), partition 2 also holding a
+ * null.  Every comparison's seg_mask is the set of partitions whose range
+ * cannot be excluded; a null ranks below every value, so `<` / `<=` keep the
+ * partition with the null wherever its range lies.
  */
-static test_result_t test_partition_pruning_bound(void) {
+static test_result_t test_partition_pruning_stats(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    const int32_t d = 8780;
-    ray_t* key_values = ray_vec_new(RAY_DATE, 3);
+    ray_t* key_values = ray_vec_new(RAY_I64, 4);
     TEST_ASSERT_NOT_NULL(key_values);
-    key_values->len = 3;
-    int32_t keys[] = {d, d + 1, d + 2};
+    key_values->len = 4;
+    int64_t keys[] = {100, 200, 300, 400};
     memcpy(ray_data(key_values), keys, sizeof(keys));
-
-    ray_t* row_counts = ray_vec_new(RAY_I64, 3);
+    ray_t* row_counts = ray_vec_new(RAY_I64, 4);
     TEST_ASSERT_NOT_NULL(row_counts);
-    row_counts->len = 3;
-    int64_t counts[] = {2, 2, 2};
+    row_counts->len = 4;
+    int64_t counts[] = {256, 256, 256, 256};
     memcpy(ray_data(row_counts), counts, sizeof(counts));
-
-    int64_t sym_date = ray_sym_intern("date", 4);
-    int64_t sym_t    = ray_sym_intern("t", 1);
-
     ray_t* mapcommon = ray_alloc(2 * sizeof(ray_t*));
     TEST_ASSERT_NOT_NULL(mapcommon);
     mapcommon->type = RAY_MAPCOMMON;
     mapcommon->len = 2;
-    mapcommon->attrs = RAY_MC_DATE;
+    mapcommon->attrs = RAY_MC_I64;
     memset(mapcommon->aux, 0, 16);
-    ray_mapcommon_set_bound(mapcommon, sym_t);
-    TEST_ASSERT_EQ_I(ray_mapcommon_bound(mapcommon), sym_t);
     ((ray_t**)ray_data(mapcommon))[0] = key_values;
     ((ray_t**)ray_data(mapcommon))[1] = row_counts;
 
-    const int64_t day = 86400000000000LL;
-    ray_t* t_parted = ray_alloc(3 * sizeof(ray_t*));
+    ray_t* t_parted = ray_alloc(4 * sizeof(ray_t*));
     TEST_ASSERT_NOT_NULL(t_parted);
     t_parted->type = RAY_PARTED_BASE + RAY_TIMESTAMP;
-    t_parted->len = 3;
-    for (int i = 0; i < 3; i++) {
-        ray_t* seg = ray_vec_new(RAY_TIMESTAMP, 2);
+    t_parted->len = 4;
+    for (int i = 0; i < 4; i++) {
+        ray_t* seg = ray_vec_new(RAY_TIMESTAMP, 256);
         TEST_ASSERT_NOT_NULL(seg);
-        seg->len = 2;
+        seg->len = 256;
         int64_t* v = (int64_t*)ray_data(seg);
-        v[0] = (d + i) * day;
-        v[1] = (d + i) * day + day / 4;
+        for (int j = 0; j < 256; j++) v[j] = 1000 * i + j;
+        if (i == 2) ray_vec_set_null(seg, 7, true);
+        ray_t* r = ray_index_attach_chunk_zone(&seg, 8);
+        TEST_ASSERT_TRUE(r == NULL || !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(ray_index_kind(seg), RAY_IDX_CHUNK_ZONE);
         ((ray_t**)ray_data(t_parted))[i] = seg;
     }
+    int64_t mn, mx;
+    bool has_nulls, all_null;
+    TEST_ASSERT_TRUE(ray_part_seg_stats(((ray_t**)ray_data(t_parted))[2], &mn, &mx, &has_nulls, &all_null));
+    TEST_ASSERT_EQ_I(mn, 2000);
+    TEST_ASSERT_EQ_I(mx, 2255);
+    TEST_ASSERT_TRUE(has_nulls && !all_null);
 
     ray_t* tbl = ray_table_new(2);
-    tbl = ray_table_add_col(tbl, sym_date, mapcommon);
-    tbl = ray_table_add_col(tbl, sym_t, t_parted);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("pkey", 4), mapcommon);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("t", 1), t_parted);
 
-    /* FILTER(SCAN(t), GT(SCAN(t), CONST(d+1 at noon))) */
-    ray_graph_t* g = ray_graph_new(tbl);
-    TEST_ASSERT_NOT_NULL(g);
-    ray_op_t* scan_t = ray_scan(g, "t");
-    ray_t* lit = ray_timestamp((d + 1) * day + day / 2);
-    ray_op_t* c_lit = ray_const_atom(g, lit);
-    ray_release(lit);
-    ray_op_t* pred = ray_gt(g, scan_t, c_lit);
-    ray_op_t* filt = ray_filter(g, scan_t, pred);
-    ray_op_t* opt = ray_optimize(g, filt);
-    TEST_ASSERT_NOT_NULL(opt);
-
-    ray_op_ext_t* t_ext = NULL;
-    for (uint32_t i = 0; i < g->ext_count; i++) {
-        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == scan_t->id) {
-            t_ext = g->ext_nodes[i];
-            break;
+    /* op, literal, expected mask (NULL expected: no mask attached) */
+    struct { ray_op_t* (*op)(ray_graph_t*, ray_op_t*, ray_op_t*); int64_t lit; uint64_t mask; bool none; } cases[] = {
+        { ray_gt, 1100, 0xE, false },       /* p1 [1000,1255] straddles; p0 excluded */
+        { ray_ge, 1255, 0xE, false },
+        { ray_ge, 1256, 0xC, false },
+        { ray_lt, 2100, 0x7, false },       /* p2 has a null: kept by `<` whatever its range */
+        { ray_lt, 1000, 0x5, false },       /* p0 all-pass; p2 kept for its null; p1, p3 excluded */
+        { ray_le, 255,  0x5, false },
+        { ray_eq, 3000, 0x8, false },
+        { ray_eq, 1500, 0x0, false },       /* in no range: every partition dropped */
+        { ray_ne, 3000, 0xF, true },        /* a range of more than one value: undecided */
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* scan_t = ray_scan(g, "t");
+        ray_t* lit = ray_timestamp(cases[i].lit);
+        ray_op_t* c_lit = ray_const_atom(g, lit);
+        ray_release(lit);
+        ray_op_t* filt = ray_filter(g, scan_t, cases[i].op(g, scan_t, c_lit));
+        TEST_ASSERT_NOT_NULL(ray_optimize(g, filt));
+        ray_op_ext_t* t_ext = NULL;
+        for (uint32_t e = 0; e < g->ext_count; e++)
+            if (g->ext_nodes[e] && g->ext_nodes[e]->base.id == scan_t->id) { t_ext = g->ext_nodes[e]; break; }
+        TEST_ASSERT_NOT_NULL(t_ext);
+        if (cases[i].none) {
+            TEST_ASSERT_EQ_PTR(t_ext->seg_mask, NULL);
+        } else {
+            TEST_ASSERT_NOT_NULL(t_ext->seg_mask);
+            TEST_ASSERT_EQ_I(t_ext->seg_mask_count, 4);
+            TEST_ASSERT_EQ_U(t_ext->seg_mask[0], cases[i].mask);
         }
+        ray_graph_free(g);
     }
-    TEST_ASSERT_NOT_NULL(t_ext);
-    TEST_ASSERT_NOT_NULL(t_ext->seg_mask);
-    TEST_ASSERT_EQ_I(t_ext->seg_mask_count, 3);
-    uint64_t expected = (1ULL << 1) | (1ULL << 2);
-    TEST_ASSERT_TRUE(t_ext->seg_mask[0] == expected);
 
-    ray_graph_free(g);
     ray_release(mapcommon);
     ray_release(t_parted);
     ray_release(tbl);
@@ -3438,7 +3451,7 @@ const test_entry_t opt_entries[] = {
     { "opt/projection_pushdown", test_projection_pushdown, NULL, NULL },
     { "opt/partition_pruning", test_partition_pruning_smoke, NULL, NULL },
     { "opt/partition_pruning_mask", test_partition_pruning_mask, NULL, NULL },
-    { "opt/partition_pruning_bound", test_partition_pruning_bound, NULL, NULL },
+    { "opt/partition_pruning_stats", test_partition_pruning_stats, NULL, NULL },
     { "opt/partition_pruning_in", test_partition_pruning_in, NULL, NULL },
     { "opt/partition_pruning_not_in", test_partition_pruning_not_in, NULL, NULL },
     { "opt/partition_pruning_in_type_mismatch", test_partition_pruning_in_type_mismatch, NULL, NULL },
