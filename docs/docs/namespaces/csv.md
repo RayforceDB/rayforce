@@ -20,7 +20,9 @@ Signatures:
 
 - `(.csv.read "path")` — auto-detect column types from the header + a content sample.
 - `(.csv.read [types] "path")` — types is a SYM vector naming `B8`, `I64`, `F64`, `STR`, `SYMBOL`, `F32`, `DATE`, `TIME`, `TIMESTAMP`, `GUID` (case-insensitive). One entry per column.
-- `(.csv.read [names] [types] "path")` — also override the column names. With explicit names the input is assumed to have **no header row**.
+- `(.csv.read [names] [types] "path")` — also override the column names. With explicit names the input is assumed to have **no header row**; a first line whose fields equal the names is taken as a header and skipped.
+
+A leading UTF-8 byte-order mark (`EF BB BF`, written by Excel and others) is skipped, so it does not become part of the first column name or first cell; a header that matches explicit names is still recognised after it. Only one UTF-8 BOM at the very start of the file is skipped; a UTF-16 BOM is not recognised and the file is read as bytes. A file holding only a BOM reads like one holding only a line end. `.csv.splayed` and `.csv.parted` skip it the same way.
 
 Returns: a `table`. Empty fields use the selected type's missing-input behavior. Sentinel-nullable columns record nulls with `RAY_ATTR_HAS_NULLS`; `SYM`/`STR` fields collapse to ordinary empty values and those columns do not acquire `RAY_ATTR_HAS_NULLS` from them.
 
@@ -48,7 +50,7 @@ The reader memory-maps the input, splits it into chunks, parses chunks in parall
 
 ## `.csv.write` { #csv-write }
 
-Signature: `(.csv.write tbl "path")`. Writes `tbl` with a header row and comma delimiter. Returns `0` on success.
+Signature: `(.csv.write tbl "path")`. Writes `tbl` with a header row and comma delimiter, without a byte-order mark. Returns `0` on success.
 
 Errors: `type` (tbl isn't a table, path isn't a string), `domain` (empty path), `io` on write failure.
 
