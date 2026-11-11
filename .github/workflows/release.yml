@@ -6,6 +6,7 @@ name: Release
 # compile time (make ... RAY_VERSION=X.Y.Z) and publishes a GitHub Release. No
 # source file is bumped and nothing is pushed to the protected master branch —
 # only a tag ref and a release, which GITHUB_TOKEN can do without a bypass token.
+# The one push is the merge-back job, which updates dev and needs the PAT secret.
 # Non-release merges to master (title not vX.Y.Z) are ignored.
 #
 # IMPORTANT: a DRAFT release does NOT create its git tag yet — the tag is only
@@ -178,6 +179,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: gh release edit "v${{ needs.prepare.outputs.version }}" --draft=false
+
+  # Merge the release commit back into dev, so the next release PR isn't out of
+  # date with master or full of phantom conflicts after a squash. It needs only
+  # `prepare`: the commit is on master whether or not the build succeeds. It is
+  # NOT best-effort: a failure here blocks the next release, so it must show red.
+  # Manual dispatch has no PR head to verify against, so it skips this job.
+  merge-back:
+    needs: prepare
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # The helper runs from the release commit, not from whatever dev holds
+      # when the job starts: the release is immutable and was reviewed as part
+      # of the release PR, and dev is the branch the helper is about to write.
+      # GITHUB_TOKEN can't push past dev's required checks; the PAT's owner can.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Merge the release into dev
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PR: ${{ github.event.pull_request.number }}
+          RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  "rayforce-release"
+          git config user.email "release@rayforcedb.com"
+          # The helper switches the working tree to dev, so run a copy that
+          # the switch can't replace while bash is still reading it.
+          cp .github/release-merge-back.sh "$RUNNER_TEMP/merge-back.sh"
+          bash "$RUNNER_TEMP/merge-back.sh" "$VERSION" "$PR" "$RELEASE_SHA" "$HEAD_SHA"
 
   # Post the release announcement to Zulip (#Announcements > Rayforce) once the
   # release is public. Best-effort: skipped when ZULIP_API_KEY isn't configured,
