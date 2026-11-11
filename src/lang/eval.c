@@ -1856,12 +1856,25 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
             ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
             if (alloc) ray_release(e);
             if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+            if (elem->type >= 0) {
+                /* A nested collection after an atom: the typed vector cannot
+                 * hold it.  Start over as a boxed list. */
+                ray_release(elem);
+                ray_release(vec);
+                int alloc_r = 0;
+                ray_t* e_r = collection_elem(arg, 0, &alloc_r);
+                e0 = RAY_IS_ERR(e_r) ? e_r : atomic_unary_elem(fn, e_r);
+                if (alloc_r) ray_release(e_r);
+                if (RAY_IS_ERR(e0)) return e0;
+                goto boxed;
+            }
             store_typed_elem(vec, i, elem);
             ray_release(elem);
         }
         return vec;
     }
 
+boxed:;
     /* Fallback: boxed list for non-numeric output */
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
     if (!result) { ray_release(e0); return ray_error("oom", NULL); }
