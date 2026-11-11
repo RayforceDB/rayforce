@@ -632,13 +632,22 @@ For common time-series scans, prefer the built-in DAG forms. They avoid per-row 
 
 The moving forms take a positive integer window first. Constant windows inside query projections lower to DAG operations; dynamic windows still evaluate as ordinary function calls.
 
-### `(apply f ...args)`
+### `(apply f a b)`
 
-Apply function `f` to the given arguments.
+Call the binary function `f` on the elements of two collections taken in step:
+`f(a_0, b_0)`, `f(a_1, b_1)`, and so on. The result is as long as the shorter
+collection, and is collected as `map`'s is (a typed vector while the results are
+atoms of one vector type, otherwise a list). Two atoms call `f` once; an atom
+beside a collection is a `type` error. It takes exactly three arguments.
 
 ```lisp
-(apply + 1 2)  ; 3
+(apply + 1 2)                      ; 3
+(apply + [1 2 3] [10 20 30])       ; [11 22 33]
+(apply + [1 2 3 4] [10 20])        ; [11 22]
+(apply concat ["a" "b"] ["x" "y"]) ; ["ax" "by"]
 ```
+
+To hold one operand fixed instead, use `(map f val v)` or `map-right`.
 
 ### `(filter vec mask)`
 

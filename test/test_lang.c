@@ -1151,11 +1151,12 @@ static test_result_t test_eval_apply(void) {
     ray_t* result = ray_eval_str("(apply + [1 2] [3 4])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    /* the results are atoms of one type: a typed vector, as map's are */
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 2);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 4);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 6);
+    int64_t* elems = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(elems[0], 4);
+    TEST_ASSERT_EQ_I(elems[1], 6);
     ray_release(result);
     PASS();
 }
