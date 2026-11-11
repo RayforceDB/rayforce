@@ -361,8 +361,10 @@ ray_t* ray_mmu_fn(ray_t* a, ray_t* b) {
  * with vector extensions: the autovectoriser does not find this shape. */
 typedef double lin_v4d __attribute__((vector_size(32), aligned(8)));
 typedef float  lin_v4f __attribute__((vector_size(16), aligned(4)));
-static inline lin_v4d ld4_f64(const double* p) { return *(const lin_v4d*)p; }
-static inline lin_v4d ld4_f32(const float* p)  { return __builtin_convertvector(*(const lin_v4f*)p, lin_v4d); }
+/* Macros, not functions: a 32-byte vector passed or returned by value changes
+ * the ABI without AVX (-Wpsabi, an error under -Werror on baseline x86-64). */
+#define ld4_f64(p) (*(const lin_v4d*)(p))
+#define ld4_f32(p) __builtin_convertvector(*(const lin_v4f*)(p), lin_v4d)
 
 #define DEF_TILE(SUF, T)                                                      \
 static __attribute__((noinline)) void tile4_##SUF(const T* const* a, const T* const* b, \
