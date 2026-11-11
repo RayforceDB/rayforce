@@ -1,0 +1,80 @@
+;; mmu, inv and lsq over lists of numeric rows.
+
+(mmu (list [1.0 2.0] [3.0 4.0]) (list [5.0 6.0] [7.0 8.0])) -- (list [19.0 22.0] [43.0 50.0])
+(mmu [1.0 2.0] (list [1.0 2.0] [3.0 4.0])) -- [7.0 10.0]
+(mmu (list [1.0 2.0] [3.0 4.0]) [1.0 2.0]) -- [5.0 11.0]
+(mmu [1.0 2.0] [3.0 4.0]) -- 11.0
+(mmu [1 2] (list [1 2] [3 4])) -- [7.0 10.0]
+(mmu (list [1.0 2.0 3.0] [4.0 5.0 6.0]) (list [1.0] [0.0] [1.0])) -- (list [4.0] [10.0])
+
+(inv (list [1.0 2.0] [3.0 4.0])) -- (list [-2.0 1.0] [1.5 -0.5])
+(inv (list [0.0 1.0] [1.0 0.0])) -- (list [0.0 1.0] [1.0 0.0])
+(inv (inv (list [2.0 1.0] [1.0 3.0]))) -- (list [2.0 1.0] [1.0 3.0])
+
+(lsq (list [1.0 2.0] [3.0 4.0]) (list [2.0 1.0] [1.0 3.0])) -- (list [0.2 0.6] [1.0 1.0])
+(lsq [1.0 2.0] (list [2.0 1.0] [1.0 3.0])) -- [0.2 0.6]
+
+;; over-determined: the exact solution of a consistent system is recovered
+(lsq [4.0 6.0 8.0 10.0] (list [1.0 1.0 1.0 1.0] [1.0 2.0 3.0 4.0])) -- [2.0 2.0]
+
+;; errors
+(inv (list [1.0 2.0] [2.0 4.0])) !- domain
+(inv (list [1.0 2.0 3.0] [4.0 5.0 6.0])) !- length
+(mmu (list [1.0 2.0]) (list [1.0 2.0 3.0])) !- length
+(mmu 1.0 [1.0]) !- type
+(lsq [1.0 2.0] (list [1.0 2.0] [2.0 4.0])) !- domain
+
+(flip (list [1.0 2.0 3.0] [4.0 5.0 6.0])) -- (list [1.0 4.0] [2.0 5.0] [3.0 6.0])
+(flip (flip (list [1.0 2.0] [3.0 4.0]))) -- (list [1.0 2.0] [3.0 4.0])
+(flip [1.0 2.0]) !- type
+
+;; F32: all-F32 operands give F32 results; any other mix gives F64
+(type (at (mmu (as 'F32 [1.0 2.0]) (list (as 'F32 [1.0 0.0]) (as 'F32 [0.0 1.0]))) 0)) -- 'f32
+(type (mmu (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0])) (as 'F32 [1.0 1.0]))) -- 'F32
+(type (mmu (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0])) [1.0 1.0])) -- 'F64
+(mmu (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0])) (as 'F32 [1.0 1.0])) -- (as 'F32 [3.0 7.0])
+(type (at (inv (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0]))) 0)) -- 'F32
+(type (at (flip (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0]))) 0)) -- 'F32
+(inv (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0]))) -- (list (as 'F32 [-2.0 1.0]) (as 'F32 [1.5 -0.5]))
+(mmu (list [1 2] [3 4]) [1 1]) -- [3.0 7.0]
+
+;; large shared dimension takes the threaded paths; the sums are exact here
+(set ones (+ 1.0 (* 0.0 (as 'F64 (til 1000000)))))
+(set X (list ones (* 2.0 ones)))
+(mmu X (flip X)) -- (list [1000000.0 2000000.0] [2000000.0 4000000.0])
+(mmu X ones) -- [1000000.0 2000000.0]
+(mmu [1.0 2.0] X) -- (* 5.0 ones)
+(set X32 (list (as 'F32 ones) (as 'F32 (* 2.0 ones))))
+(mmu X32 (flip X32)) -- (list (as 'F32 [1000000.0 2000000.0]) (as 'F32 [2000000.0 4000000.0]))
+;; row split: a result too large for the small-C path
+(set W (map (fn [i] (+ 1.0 (* 0.0 (as 'F64 (til 100))))) (til 80)))
+(at (at (mmu W (flip W)) 79) 79) -- 100.0
+
+;; gram: x mmu flip x
+(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0])) -- (list [14.0 32.0] [32.0 77.0])
+(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0])) -- (mmu (list [1.0 2.0 3.0] [4.0 5.0 6.0]) (flip (list [1.0 2.0 3.0] [4.0 5.0 6.0])))
+(gram (list [1 2] [3 4])) -- (list [5.0 11.0] [11.0 25.0])
+(type (at (gram (list (as 'F32 [1.0 2.0]) (as 'F32 [3.0 4.0]))) 0)) -- 'F32
+(gram [1.0 2.0]) !- type
+(gram X) -- (list [1000000.0 2000000.0] [2000000.0 4000000.0])
+(gram X32) -- (list (as 'F32 [1000000.0 2000000.0]) (as 'F32 [2000000.0 4000000.0]))
+(gram W) -- (mmu W (flip W))
+
+;; gram on shapes that are not a multiple of the 4x4 tile
+(set gdiff (fn [g m] (sum (map (fn [d] (inner-prod d d)) (- g m)))))
+(set V (map (fn [i] (+ (* 0.5 (as 'F64 (til 5000))) (* 1.0 i))) (til 7)))
+(< (gdiff (gram V) (mmu V (flip V))) 1.0) -- true
+(count (gram V)) -- 7
+(set V5 (take V 5))
+(< (gdiff (gram V5) (mmu V5 (flip V5))) 1.0) -- true
+(set V4 (take V 4))
+(< (gdiff (gram V4) (mmu V4 (flip V4))) 1.0) -- true
+(set V9 (map (fn [i] (+ (* 0.25 (as 'F64 (til 3000))) (* 1.0 i))) (til 9)))
+(< (gdiff (gram V9) (mmu V9 (flip V9))) 1.0) -- true
+(at (at (gram (take V 3)) 2) 0) -- (at (at (gram (take V 3)) 0) 2)
+
+;; square lsq on a non-symmetric matrix with non-unit pivots agrees with b mmu inv a
+(set NA (list [2.0 1.0 0.5] [1.0 3.0 1.0] [0.0 1.0 4.0]))
+(set NB (list [1.0 2.0 3.0] [4.0 5.0 6.0]))
+(< (gdiff (lsq NB NA) (mmu NB (inv NA))) 1e-20) -- true
+(lsq (list [1.0 2.0] [3.0 4.0]) (list [0.0 1.0] [1.0 0.0])) -- (list [2.0 1.0] [4.0 3.0])
