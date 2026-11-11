@@ -3981,8 +3981,16 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
     return columns != 0;
 }
 
+/* Is `fn`, the current binding of a head symbol, the builtin unary `native`
+ * (or no binding at all)?  A name can be rebound to another native, so the
+ * object type alone does not identify the verb: compare its callback. */
+static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
+    return !fn || (fn->type == RAY_UNARY &&
+                   (ray_unary_fn)(uintptr_t)fn->i64 == native);
+}
+
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * collection builtin (distinct, asc, desc, reverse, where, enlist) that
+ * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
  * has no bucket for these — they are neither element-wise ops nor
  * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
@@ -4056,7 +4064,15 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
            (l == 5 && memcmp(p, "where", 5) == 0) ||
            (l == 7 && memcmp(p, "reverse", 7) == 0) ||
            (l == 3 && memcmp(p, "asc", 3) == 0) ||
-           (l == 4 && memcmp(p, "desc", 4) == 0);
+           (l == 4 && memcmp(p, "desc", 4) == 0) ||
+           /* grade/rank: only while the name is still the builtin, so a
+            * rebound `rank` keeps its per-row projection semantics. */
+           (l == 4 && memcmp(p, "iasc", 4) == 0 &&
+            head_is_builtin_unary(fn, ray_iasc_fn)) ||
+           (l == 5 && memcmp(p, "idesc", 5) == 0 &&
+            head_is_builtin_unary(fn, ray_idesc_fn)) ||
+           (l == 4 && memcmp(p, "rank", 4) == 0 &&
+            head_is_builtin_unary(fn, ray_rank_fn));
 }
 
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
@@ -14164,6 +14180,17 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
     return collect_col_refs_walk(expr, tbl, out_syms, max_out, n, false);
 }
 
+/* A bound value that cannot hold anything applicable: an atom or a typed
+ * vector.  A LIST, DICT or TABLE may contain a lambda that reads columns by
+ * name when called (`(first fs)`, `(at fs 0)`), so containers, callables and
+ * anything unrecognised do not qualify (the simple rule, not a recursive
+ * scan of the container). */
+static bool val_holds_no_callable(const ray_t* v) {
+    if (v->type < 0) return true;
+    return ray_is_vec((ray_t*)v) && v->type != RAY_LIST && v->type != RAY_DICT &&
+           v->type != RAY_TABLE;
+}
+
 /* Can evaluating `e` reach a column of `tbl` only by naming it?  True when
  * the tree holds nothing but literals (no symbols among them), column names
  * and names of global builtins other than eval and resolve: a lambda (bound or literal
@@ -14175,17 +14202,27 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
         if (e->attrs & ATTR_QUOTED) return false;
         /* a lexical local wins over a column of its name (query locals never
          * shadow one): it may be a callable reading anything */
-        if (ray_env_has_lexical_local(e->i64)) return false;
-        if (tbl_has_col(tbl, e->i64)) return true;
+        ray_t* lex = ray_env_get_lexical_local(e->i64);
+        if (lex) return val_holds_no_callable(lex);   /* a plain value reads no column */
+        if (tbl && tbl_has_col(tbl, e->i64)) return true;
+        /* Before evaluating a nested from: there is no table to inspect.
+         * An unbound plain name can only be a column; bound callables need
+         * the checks below so user lambdas cannot hide column reads.  This
+         * relies on collect_syms (proj_compute_keep) naming every such symbol
+         * in the keep set. */
+        if (!tbl && !ray_sym_is_dotted(e->i64) && !ray_env_get(e->i64) &&
+            !ray_env_get_local(e->i64)) return true;
         if (ray_sym_is_dotted(e->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(e->i64, &segs);
-            return nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
+            return tbl && nsegs >= 1 && !ray_env_has_lexical_local(segs[0]) && tbl_has_col(tbl, segs[0]);
         }
-        if (ray_env_get_local(e->i64)) return false;
+        ray_t* loc = ray_env_get_local(e->i64);
+        if (loc) return val_holds_no_callable(loc);
         ray_t* fn = ray_env_get(e->i64);
-        if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
-            return false;
+        if (!fn) return false;                       /* unbound: unknown */
+        if (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY)
+            return val_holds_no_callable(fn);    /* a global value; a lambda or container declines */
         /* eval and resolve read names from text or symbols at run time,
          * whatever name they are reached by */
         if (fn->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)fn->i64 == ray_eval_builtin_fn)
@@ -14363,6 +14400,7 @@ static int64_t proj_keep_bound(ray_t* dict) {
  * value exprs, so it references only named columns), collect the column syms its
  * non-`from` clauses reference.  Returns false (→ carry all) for an implicit-all
  * select, which references every column. */
+static bool eval_group_keep_ok(ray_t* e, ray_t* tbl);
 static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
     int64_t from_id    = dict_key_id(dict, "from");
     int64_t where_id   = dict_key_id(dict, "where");
@@ -14382,6 +14420,14 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
         if (kid != where_id && kid != by_id && kid != take_id &&
             kid != asc_id && kid != desc_id && kid != nearest_id)
             has_value_expr = true;                   /* an explicit projection */
+        /* A SYM vector is a literal set of named keys (by:/sort keys),
+         * not a callable that can read an unlisted column. */
+        ray_t* clause = pv[i + 1];
+        if ((!clause || clause->type != RAY_SYM) &&
+            !eval_group_keep_ok(clause, NULL)) {
+            DICT_VIEW_CLOSE(pv);
+            return false;
+        }
         n = collect_syms(pv[i + 1], out, max, n);
     }
     DICT_VIEW_CLOSE(pv);  /* pv dead past the clause scan */
@@ -17600,6 +17646,216 @@ static bool select_from_is_join(ray_t* from_expr) {
     return f == ray_left_join_fn || f == ray_inner_join_fn || f == ray_full_join_fn;
 }
 
+/* A by: key that is another key's column plus or minus a number, as
+ * `ip1: (- ip 1)` beside `ip: ip`, splits no group that column does not:
+ * the rows of a group agree on the column, so on the key.  The
+ * grouping runs without such keys and they are computed on its groups
+ * after, so each row hashes, scatters and compares fewer key bytes, and a
+ * grouping the memory gate (hh_grouping_outgrows) would send to two passes
+ * may fit.  Taken only for an integer column and an I64 or F64 constant
+ * (exact equality: the key of a group is the key of each of its rows; the
+ * types the grouping itself gives such a key) when no clause or output
+ * names a dropped key.  NULL when the shape does not apply; else the
+ * select's result (or its error). */
+#define SELECT_DEP_MAX_KEYS 15
+
+/* select_expr_mentions, the names of a SYM vector too (`asc: [j]`) */
+static bool select_dep_mentions(ray_t* e, const int64_t* syms, int n) {
+    if (!e) return false;
+    if (e->type == RAY_SYM) {
+        for (int64_t i = 0; i < e->len; i++)
+            for (int k = 0; k < n; k++) if (sym_cell_runtime_id(e, i) == syms[k]) return true;
+        return false;
+    }
+    if (e->type != RAY_LIST) return select_expr_mentions(e, syms, n);
+    ray_t** el = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++)
+        if (select_dep_mentions(el[i], syms, n)) return true;
+    return false;
+}
+
+/* Can `col` (of type `t`) plus or minus the constant `c` wrap a value onto
+ * the I64 null sentinel while the column holds nulls?  Computed on the
+ * groups, the key may then lack the null flag that a key computed over
+ * every group has, and show the sentinel as a number (#841).  Only an I64
+ * column, or a constant past 2^62 on a narrower one, can wrap there. */
+static bool select_dep_may_hit_null(ray_t* tbl, int64_t col, int8_t t, ray_t* c) {
+    if (c->type != -RAY_I64 || !ray_table_col_has_nulls(tbl, col)) return false;
+    return t == RAY_I64 || c->i64 > ((int64_t)1 << 62) || c->i64 < -((int64_t)1 << 62);
+}
+
+static ray_t* select_drop_dependent_keys(ray_t* dict, ray_t* tbl, unsigned plan) {
+    ray_t* by = dict_get(dict, "by");
+    if (!by || by->type != RAY_DICT || dict_get(dict, "nearest")) return NULL;
+    /* code a clause runs (a named lambda, eval, ...) may read a dropped key
+     * by name, which no scan of the clauses below sees */
+    if (clauses_run_code(dict, tbl, true)) return NULL;
+    ray_t* bk = ray_dict_keys(by);
+    ray_t* bv = ray_dict_vals(by);
+    if (!bk || bk->type != RAY_SYM || !bv || bv->type != RAY_LIST) return NULL;
+    int64_t nb = ray_dict_len(by);
+    if (nb < 2 || nb > SELECT_DEP_MAX_KEYS) return NULL;
+    ray_t** bvals = (ray_t**)ray_data(bv);
+    int64_t alias[SELECT_DEP_MAX_KEYS], col[SELECT_DEP_MAX_KEYS], dropped[SELECT_DEP_MAX_KEYS];
+    int8_t ctype[SELECT_DEP_MAX_KEYS];   /* a key on a column: the column's type */
+    int base[SELECT_DEP_MAX_KEYS];   /* a dropped key: the key whose column it reads; else -1 */
+    ray_t* op[SELECT_DEP_MAX_KEYS];  /* a dropped key: the + or - its head names now */
+    int cside[SELECT_DEP_MAX_KEYS];  /* a dropped key: its operand that names the column */
+    int n_drop = 0;
+    for (int64_t i = 0; i < nb; i++) {
+        alias[i] = sym_cell_runtime_id(bk, i);
+        col[i] = -1;
+        base[i] = -1;
+        ray_t* v = bvals[i];
+        ray_col_meta_t m;
+        if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) || !sym_names_col(tbl, v->i64) ||
+            !ray_table_col_meta(tbl, v->i64, &m)) continue;
+        int8_t t = RAY_IS_PARTED(m.type) ? (int8_t)RAY_PARTED_BASETYPE(m.type) : m.type;
+        if (t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64) { col[i] = v->i64; ctype[i] = t; }
+    }
+    static const char* const addsub[] = { "+", "-" };
+    for (int64_t i = 0; i < nb; i++) {
+        ray_t* v = bvals[i];
+        if (!v || v->type != RAY_LIST || v->len != 3 || (v->attrs & ATTR_QUOTED)) continue;
+        ray_t** el = (ray_t**)ray_data(v);
+        if (!el[0] || el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) continue;
+        op[i] = sym_binding(el[0]->i64);
+        if (!builtin_named(op[i], addsub, 2) || op[i]->type != RAY_BINARY ||
+            !(op[i]->attrs & RAY_FN_ATOMIC)) continue;
+        for (int side = 1; side <= 2 && base[i] < 0; side++) {
+            ray_t* s = el[side];
+            ray_t* c = el[3 - side];
+            if (!s || s->type != -RAY_SYM || (s->attrs & ATTR_QUOTED) || !c) continue;
+            /* a narrower constant would keep a narrow column narrow, which
+             * a key the grouping computes does not */
+            if (c->type != -RAY_I64 && c->type != -RAY_F64) continue;
+            for (int64_t j = 0; j < nb && base[i] < 0; j++)
+                if (j != i && col[j] == s->i64 && !select_dep_may_hit_null(tbl, col[j], ctype[j], c)) {
+                    base[i] = (int)j; cside[i] = side;
+                }
+        }
+        if (base[i] >= 0) dropped[n_drop++] = alias[i];
+    }
+    if (!n_drop) return NULL;
+    /* nor may a by: value read a dropped key by its name */
+    for (int64_t j = 0; j < nb; j++)
+        if (select_dep_mentions(bvals[j], dropped, n_drop)) return NULL;
+    /* A dropped key's name is its own: no column of the table (the by-dict
+     * rejects such an alias), no other key, output or clause. */
+    for (int k = 0; k < n_drop; k++) {
+        if (tbl_has_col(tbl, dropped[k])) return NULL;
+        for (int64_t j = 0; j < nb; j++)
+            if (alias[j] == dropped[k] && base[j] < 0) return NULL;
+        for (int j = 0; j < k; j++) if (dropped[j] == dropped[k]) return NULL;
+    }
+    /* The groups' columns are read back by name: a lexical local of a key's
+     * name would hide its column. */
+    for (int64_t j = 0; j < nb; j++)
+        if (ray_env_get_lexical_local(alias[j])) return NULL;
+    int64_t from_id = ray_sym_intern("from", 4), by_id = ray_sym_intern("by", 2);
+    int64_t where_id = ray_sym_intern("where", 5), take_id = ray_sym_intern("take", 4);
+    int64_t asc_id = ray_sym_intern("asc", 3), desc_id = ray_sym_intern("desc", 4);
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t** vals = (ray_t**)ray_data(ray_dict_vals(dict));
+    int64_t nd = ray_dict_len(dict), n_out = 0;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid == from_id || kid == by_id) continue;
+        if (select_dep_mentions(vals[i], dropped, n_drop)) return NULL;
+        if (kid == where_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
+        for (int64_t j = 0; j < nb; j++) if (alias[j] == kid) return NULL;
+        if (ray_env_get_lexical_local(kid)) return NULL;
+        n_out++;
+    }
+    /* With no outputs a grouped select keeps every source column, which
+     * the groups no longer carry. */
+    if (!n_out) return NULL;
+
+    /* The grouping runs its clauses, which may rebind a name: the + or -
+     * each dropped key's head names now is held for after it. */
+    for (int64_t i = 0; i < nb; i++) if (base[i] >= 0) ray_retain(op[i]);
+
+    /* the grouping, by the other keys */
+    ray_t* nk = ray_vec_new(RAY_SYM, nb - n_drop);
+    ray_t* nv = ray_list_new((int32_t)(nb - n_drop));
+    for (int64_t i = 0; i < nb && nk && !RAY_IS_ERR(nk) && nv && !RAY_IS_ERR(nv); i++) {
+        if (base[i] >= 0) continue;
+        ((int64_t*)ray_data(nk))[nk->len++] = alias[i];
+        nv = ray_list_append(nv, bvals[i]);
+    }
+    ray_t* r = NULL;
+    if (!nk || RAY_IS_ERR(nk) || !nv || RAY_IS_ERR(nv)) {
+        if (nk && !RAY_IS_ERR(nk)) ray_release(nk);
+        if (nv && !RAY_IS_ERR(nv)) ray_release(nv);
+        r = ray_error("oom", NULL);
+        goto done;
+    }
+    ray_t* nby = ray_dict_new(nk, nv);
+    if (!nby || RAY_IS_ERR(nby)) { r = nby ? nby : ray_error("oom", NULL); goto done; }
+    ray_t* inner = select_dict_with_from(dict, tbl);
+    ray_t* by_key = ray_sym(by_id);
+    if (inner && !RAY_IS_ERR(inner) && by_key && !RAY_IS_ERR(by_key))
+        inner = ray_dict_upsert(inner, by_key, nby);
+    else if (inner && !RAY_IS_ERR(inner)) { ray_release(inner); inner = NULL; }
+    if (by_key && !RAY_IS_ERR(by_key)) ray_release(by_key);
+    ray_release(nby);
+    if (!inner || RAY_IS_ERR(inner)) { r = inner ? inner : ray_error("oom", NULL); goto done; }
+    ray_t* grouped = ray_select_impl(&inner, 1, plan);
+    ray_release(inner);
+    if (!grouped || RAY_IS_ERR(grouped) || grouped->type != RAY_TABLE) { r = grouped; goto done; }
+    /* a dropped key, from its base key's column in the groups */
+    for (int64_t i = 0; i < nb; i++) {
+        if (base[i] < 0) continue;
+        ray_t* bc = ray_table_col(grouped, alias[base[i]]);
+        ray_t* c = ((ray_t**)ray_data(bvals[i]))[3 - cside[i]];
+        /* as the evaluator applies it: the opcode's kernel widens a narrow
+         * column, a constant on either side */
+        ray_binary_fn f = (ray_binary_fn)(uintptr_t)op[i]->i64;
+        ray_t* v = !bc ? ray_error("schema", NULL) : RAY_IS_ERR(bc) ? bc
+                 : atomic_map_binary_op(f, RAY_FN_OPCODE(op[i]), cside[i] == 1 ? bc : c, cside[i] == 1 ? c : bc);
+        if (v && !RAY_IS_ERR(v)) { grouped = ray_table_add_col(grouped, alias[i], v); ray_release(v); }
+        else { ray_release(grouped); grouped = v ? v : ray_error("oom", NULL); }
+        if (RAY_IS_ERR(grouped)) { r = grouped; goto done; }
+    }
+
+    /* over the groups: the keys in their order, then the outputs */
+    ray_t* ok = ray_vec_new(RAY_SYM, 1 + nb + n_out);
+    ray_t* ov = ray_list_new((int32_t)(1 + nb + n_out));
+    if (ok && !RAY_IS_ERR(ok)) ((int64_t*)ray_data(ok))[ok->len++] = from_id;
+    if (ov && !RAY_IS_ERR(ov)) ov = ray_list_append(ov, grouped);
+    ray_release(grouped);
+    for (int64_t i = 0; i < nb + nd && ok && !RAY_IS_ERR(ok) && ov && !RAY_IS_ERR(ov); i++) {
+        int64_t name;
+        ray_t* e;
+        if (i >= nb) {
+            name = sym_cell_runtime_id(keys, i - nb);
+            if (name == from_id || name == by_id || name == where_id || name == take_id ||
+                name == asc_id || name == desc_id) continue;
+            e = ray_sym(name);
+        } else {
+            name = alias[i];
+            e = ray_sym(name);
+        }
+        if (!e || RAY_IS_ERR(e)) { ray_release(ov); ov = e ? e : ray_error("oom", NULL); break; }
+        ((int64_t*)ray_data(ok))[ok->len++] = name;
+        ov = ray_list_append(ov, e);
+        ray_release(e);
+    }
+    if (!ok || RAY_IS_ERR(ok) || !ov || RAY_IS_ERR(ov)) {
+        if (ok && !RAY_IS_ERR(ok)) ray_release(ok);
+        if (ov && !RAY_IS_ERR(ov)) { ray_release(ov); ov = NULL; }
+        r = ov ? ov : ray_error("oom", NULL);
+        goto done;
+    }
+    ray_t* outer = ray_dict_new(ok, ov);
+    if (!outer || RAY_IS_ERR(outer)) { r = outer ? outer : ray_error("oom", NULL); goto done; }
+    r = ray_select_impl(&outer, 1, plan);
+    ray_release(outer);
+done:
+    for (int64_t i = 0; i < nb; i++) if (base[i] >= 0) ray_release(op[i]);
+    return r;
+}
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     select_owned_t own = {0};
     ray_t* r = ray_select_body(args, n, plan, &own);
@@ -17682,6 +17938,11 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
             if (RAY_IS_ERR(pruned)) return pruned;
             tbl = pruned;
         }
+    }
+
+    {
+        ray_t* r = select_drop_dependent_keys(dict, tbl, plan);
+        if (r) { ray_release(tbl); return r; }
     }
 
     /* The top N groups by a count, exactly, without grouping every row. */
@@ -18300,6 +18561,10 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 }
             }
         }
+        /* An unordered take pushed into the group needs first-seen order, which
+         * a BOOL key (emitted in key order, fixed up afterwards) cannot give on
+         * the deferred route: such a key stays on the eager path. */
+        bool take_wants_order = take_expr && !has_sort && !nearest_expr;
         if (by_input_parted && n_out > 0) {
             bool defer_ok = true;
             for (int64_t i = 0; i + 1 < dict_n && defer_ok; i += 2) {
@@ -18324,14 +18589,20 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 }
                 if (v && v->type == RAY_LIST) {   /* computed expr: one the planner lowers */
                     ray_graph_t* pg = ray_graph_new(tbl);
-                    bool lowers = pg && compile_expr_dag(pg, v) != NULL;
+                    ray_op_t* kop = pg ? compile_expr_dag(pg, v) : NULL;
+                    bool lowers = kop != NULL;
+                    /* BOOL (or unknown) output type: see take_wants_order */
+                    if (lowers && take_wants_order &&
+                        (kop->out_type == RAY_BOOL || kop->out_type == 0))
+                        lowers = false;
                     if (pg) ray_graph_free(pg);
                     if (!lowers) defer_ok = false;
                     continue;
                 }
                 if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
                     if (!tbl_has_col(tbl, v->i64) ||
-                        !query_key_type_streamable(tbl_col_base_type(tbl, v->i64))) {
+                        !query_key_type_streamable(tbl_col_base_type(tbl, v->i64)) ||
+                        (take_wants_order && tbl_col_base_type(tbl, v->i64) == RAY_BOOL)) {
                         defer_ok = false; break;
                     }
                     continue;
@@ -23003,7 +23274,8 @@ by_dict_done:
     take_pre_t take_pre = {0};   /* decoded take: value, reused by apply_sort_take */
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
                             && !post_group_where_expr && !has_list_agg
-                            && !group_keys_have_bool(by_expr, tbl));
+                            && (parted_bydict_deferred
+                                || !group_keys_have_bool(by_expr, tbl)));
     if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
@@ -24424,8 +24696,9 @@ by_dict_done:
                 col->len = n_groups;
                 int64_t* out = (int64_t*)ray_data(col);
                 int64_t bias = dep_key_biases[dk];
+                /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
                 for (int64_t i = 0; i < n_groups; i++)
-                    out[i] = key_col_read_i64(base_col, i) + bias;
+                    out[i] = (int64_t)((uint64_t)key_col_read_i64(base_col, i) + (uint64_t)bias);
                 result = ray_table_add_col(result, dep_key_names[dk], col);
                 ray_release(col);
                 if (RAY_IS_ERR(result)) {
@@ -28179,6 +28452,12 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                         if (cells[k]) ray_release(cells[k]);
                 }
                 col->len = nrows;
+                /* An append extended the column's hash index over the rows
+                 * just undone (ray_index_append_extend): drop it. */
+                if (ray_index_has(col) && ray_index_payload(col->index)->built_for_len != nrows) {
+                    ray_t* d = ray_index_drop(&col);
+                    if (d && !RAY_IS_ERR(d)) slots[c] = d;
+                }
             }
         } else {
             /* insert appends without consulting keys, and in ascending row
@@ -28337,6 +28616,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             new_col = append_atom_to_col(new_col, row_elems[c]);
         }
         if (RAY_IS_ERR(new_col)) { ray_release(result); INSERT_REBUILD_FREE(); return new_col; }
+
+        /* The rebuilt column holds orig_col's rows, then the new ones: its
+         * hash index extended over them, as concat carries one
+         * (ray_index_carry_append; best-effort). */
+        if (ray_index_has(orig_col)) ray_index_carry_append(orig_col, new_col);
 
         result = ray_table_add_col(result, col_name, new_col);
         ray_release(new_col);
@@ -28699,6 +28983,7 @@ static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
     case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
                         ok = is_int; break;
     case RAY_F64:       ok = (at == -RAY_F64 || is_int); break;
+    case RAY_F32:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_DATE:      ok = (at == -RAY_DATE); break;
     case RAY_TIME:      ok = (at == -RAY_TIME); break;
     case RAY_TIMESTAMP: ok = (at == -RAY_TIMESTAMP); break;
@@ -28785,6 +29070,13 @@ static void upsert_rollback_appends(ray_t** slots, int64_t ncols, int64_t nrows0
                 if (cells[k]) ray_release(cells[k]);
         }
         col->len = nrows0;
+        /* An append extended the column's hash index over the rows just
+         * undone (ray_index_append_extend): drop it, as insert's rollback
+         * does. */
+        if (ray_index_has(col) && ray_index_payload(col->index)->built_for_len != nrows0) {
+            ray_t* d = ray_index_drop(&col);
+            if (d && !RAY_IS_ERR(d)) slots[c] = d;
+        }
     }
 }
 
@@ -29051,8 +29343,16 @@ static ray_t* upsert_apply_vectors(ray_t** slots, int64_t ncols,
         if (!buf) { err = ray_error("oom", NULL); goto out; }
         memset(buf, 0, (size_t)napp * 16);
         for (int64_t c = 0; c < ncols; c++) {
-            /* Grow the column by napp zeroed cells in one step (and drop
-             * its index), then gather the new rows straight into the tail. */
+            /* Grow the column by napp zeroed cells in one step, then gather
+             * the new rows straight into the tail.  An append extends a
+             * hash index over the cells it writes, the zeros here, so the
+             * index goes first. */
+            if (ray_index_has(slots[c])) {
+                ray_t* col = slots[c];
+                col = ray_index_drop(&col);
+                if (!col || RAY_IS_ERR(col)) { err = col ? col : ray_error("oom", NULL); goto out; }
+                slots[c] = col;
+            }
             int64_t tail = slots[c]->len;
             ray_t* res = ray_vec_append_raw(slots[c], buf, napp);
             if (RAY_IS_ERR(res)) { err = res; goto out; }
@@ -29764,6 +30064,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(ka_t));
         }
+        if (kt == RAY_GUID && key_atom->type != -RAY_GUID) {
+            int8_t ka_t = key_atom->type;            /* capture BEFORE free */
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return ray_error("type", "upsert: key column is guid but key value is %s", ray_type_name(ka_t));
+        }
         key_sym_want[k] = -1;
         if (kt == RAY_SYM) {
             if (ray_sym_vec_domain(key_col) == ray_sym_runtime_domain()) {
@@ -29798,15 +30104,17 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 size_t rl = 0;
                 const char* rs = ray_str_vec_get(key_col, r, &rl);
                 if (rl != nl || (nl > 0 && (!rs || !ns || memcmp(rs, ns, nl) != 0))) match = 0;
+            } else if (kt == RAY_F32) {
+                /* by value, the atom narrowed as the payload is; NaN (a null
+                 * key) never matches, like an F64 key */
+                float needle = (float)as_f64(key_atom);
+                if (((const float*)ray_data(key_col))[r] != needle) match = 0;
+            } else if (kt == RAY_GUID) {
+                if (!upsert_cell_eq_atom(key_col, r, key_atom)) match = 0;
             } else {
-                int64_t needle = elem_as_i64(key_atom);
-                int64_t existing = (kt == RAY_I64 || kt == RAY_TIMESTAMP) ?
-                    ((int64_t*)ray_data(key_col))[r] :
-                    (kt == RAY_I32 || kt == RAY_DATE || kt == RAY_TIME) ?
-                    (int64_t)((int32_t*)ray_data(key_col))[r] :
-                    (kt == RAY_BOOL) ? (int64_t)((uint8_t*)ray_data(key_col))[r] :
-                    ((int64_t*)ray_data(key_col))[r];
-                if (existing != needle) match = 0;
+                /* integer family through its storage width: a 1/2/4-byte
+                 * cell read as int64 would match its neighbours' bytes */
+                if (upsert_int_cell(key_col, r) != upsert_atom_int(key_atom)) match = 0;
             }
         }
         if (match) { match_row = r; break; }

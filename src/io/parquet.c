@@ -46,6 +46,13 @@
 #endif
 
 #define PQ_BATCH 65536
+/* The OPTIONAL certification prepass is admitted only when the caller's
+ * request can pull at least this many rows from the page: below that the
+ * per-value path measured cheaper on the probe workload (200k/65k single-
+ * column pages: crossover near 18,700 and 6,500 rows respectively). The
+ * threshold is a workload heuristic - the crossing scales with page rows,
+ * so no fixed value is a universal amortization bound. */
+#define PQ_CERT_MIN 16384
 #define PQ_MAX_PART_ROWS 1048576
 #define PQ_MAX_COLS 4096
 #define PQ_MAX_PAGE (64u * 1024u * 1024u)
@@ -253,6 +260,54 @@ static bool pq_rle_next(pq_rle* r, uint32_t* out) {
 static bool pq_rle_done(const pq_rle* r) {
     return !r->c.bad && r->c.p == r->c.end && (!r->left || (r->packed && r->left < 8));
 }
+#if defined(DEBUG)
+/* Test seams for the certification phase: the nth coarse checkpoint from now
+ * on requests an interrupt (0 disables), and the last scan's certified level
+ * count lets a test verify the scan stopped early. Debug builds only. */
+static _Atomic(int64_t) g_cert_interrupt_after;
+static _Atomic(int64_t) g_cert_levels;
+void ray_parquet_test_cert_interrupt_after(int64_t nth) {
+    atomic_store_explicit(&g_cert_interrupt_after,nth,memory_order_relaxed);
+}
+int64_t ray_parquet_test_cert_levels(void) {
+    return atomic_load_explicit(&g_cert_levels,memory_order_relaxed);
+}
+#endif
+/* Every one of the next `n` definition levels is present. The cursor advances
+ * exactly as pq_rle_next would; the caller restores its saved copy on false.
+ * Coarse checkpoints bound the scan's work between interrupts; an interrupted
+ * scan reports through the reader's error path. */
+static const char* pq_levels_present(pq_rle* defs, int64_t n, bool* all) {
+    int64_t i = 0;
+    for (; i < n; i++) {
+        if (!(i & 4095)) {
+            if (ray_interrupted()) {
+#if defined(DEBUG)
+                atomic_store_explicit(&g_cert_levels,i,memory_order_relaxed);
+#endif
+                return "scan interrupted";
+            }
+#if defined(DEBUG)
+            int64_t k = atomic_load_explicit(&g_cert_interrupt_after,memory_order_relaxed);
+            while (k > 0 && !atomic_compare_exchange_weak(&g_cert_interrupt_after,&k,k-1)) {}
+            if (k == 1) ray_request_interrupt();
+#endif
+        }
+        uint32_t present;
+        if (!pq_rle_next(defs,&present) || present != 1) {
+#if defined(DEBUG)
+            atomic_store_explicit(&g_cert_levels,i,memory_order_relaxed);
+#endif
+            *all = false;
+            return NULL;
+        }
+    }
+#if defined(DEBUG)
+    atomic_store_explicit(&g_cert_levels,n,memory_order_relaxed);
+#endif
+    *all = true;
+    return NULL;
+}
 
 typedef struct {
     int64_t name;
@@ -282,6 +337,7 @@ typedef struct {
     int codec, encoding;
     bool have_dict, optional;
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
+    bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
 } pq_column;
 /* A cursor is used by one decoder at a time. Flush each PLAIN batch before
  * advancing pages, so dictionary decoding may reuse the same heap scratch. */
@@ -848,9 +904,17 @@ static bool pq_dict_page(pq_column* c, pq_schema* s, const pq_span* f, const uin
     int64_t encoding = pq_get(h[2],-1);
     return (encoding == 0 || encoding == 2) && pq_dictionary(c,s,payload,(size_t)size,(size_t)raw,*count);
 }
-static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
+/* The PLAIN layouts the OPTIONAL bulk gate copies without conversion: the
+ * existing integer bulk path's pairs plus DOUBLE. */
+static bool pq_optional_bulk(const pq_schema* s) {
+    return (s->physical == 1 && s->type == RAY_I32 && (s->converted == -1 || s->converted == 17)) ||
+           (s->physical == 2 && s->type == RAY_I64) ||
+           (s->physical == 5 && s->type == RAY_F64);
+}
+static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t admit) {
     while (c->chunk.p < c->chunk.end) {
         pq_span f[10];
+        c->page_all_present = false;
         int64_t raw, size;
         const uint8_t* payload;
         const char* perr = pq_page_take(&c->chunk,f,&raw,&size,&payload);
@@ -910,6 +974,16 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip) {
         }
         if (encoding != 0 && encoding != 2 && encoding != 8) return "unsupported value encoding (supported: plain, dictionary, RLE booleans)";
         c->encoding = (int)encoding; c->page_left = count;
+        if (!encoding && c->optional && pq_optional_bulk(s)) {
+            int64_t reach = skip ? *skip : admit;
+            if (reach > count) reach = count;
+            if (reach >= PQ_CERT_MIN) {
+                pq_rle saved = c->defs;
+                const char* lerr = pq_levels_present(&c->defs,count,&c->page_all_present);
+                if (lerr) { c->defs = saved; return lerr; }
+                if (!c->page_all_present) c->defs = saved;
+            }
+        }
         if (encoding) {
             if (!c->have_dict || s->physical == 0) return "missing or invalid dictionary";
             unsigned width = pq_byte(&c->values);
@@ -977,8 +1051,9 @@ static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uin
 }
 /* PLAIN signed integers can go straight into native blocks. SSE2 handles
  * copy and sentinel detection together; scalar code also handles big endian. */
-static void pq_plain_int(ray_t* v, int64_t row, const uint8_t* p, int64_t n) {
+static bool pq_plain_int(ray_t* v, int64_t row, const uint8_t* p, int64_t n) {
     int64_t i = 0;
+    bool nulls = false;
     size_t width = v->type == RAY_I32 ? 4 : 8;
     uint8_t* dst = (uint8_t*)ray_data(v)+(size_t)row*width;
 #if defined(__SSE2__)
@@ -987,19 +1062,43 @@ static void pq_plain_int(ray_t* v, int64_t row, const uint8_t* p, int64_t n) {
         __m128i x = _mm_loadu_si128((const __m128i*)(p+(size_t)i*width));
         _mm_storeu_si128((__m128i*)(dst+(size_t)i*width),x);
         int mask = _mm_movemask_epi8(_mm_cmpeq_epi32(x,sentinel));
-        if ((width == 4 && mask) || (width == 8 && ((mask&255) == 255 || (mask>>8) == 255)))
-            v->attrs |= RAY_ATTR_HAS_NULLS;
+        if ((width == 4 && mask) || (width == 8 && ((mask&255) == 255 || (mask>>8) == 255))) {
+            v->attrs |= RAY_ATTR_HAS_NULLS; nulls = true;
+        }
     }
 #endif
     for (; i < n; i++) {
         if (width == 4) {
             int32_t x = (int32_t)pq_u32(p+(size_t)i*4); memcpy(dst+(size_t)i*4,&x,4);
-            if (x == INT32_MIN) v->attrs |= RAY_ATTR_HAS_NULLS;
+            if (x == INT32_MIN) { v->attrs |= RAY_ATTR_HAS_NULLS; nulls = true; }
         } else {
             int64_t x = (int64_t)pq_u64(p+(size_t)i*8); memcpy(dst+(size_t)i*8,&x,8);
-            if (x == INT64_MIN) v->attrs |= RAY_ATTR_HAS_NULLS;
+            if (x == INT64_MIN) { v->attrs |= RAY_ATTR_HAS_NULLS; nulls = true; }
         }
     }
+    return nulls;
+}
+/* PLAIN doubles copy straight into native blocks; a NaN is the native null
+ * sentinel, so the copied values decide the attribute and the strict check. */
+static bool pq_plain_double(ray_t* v, int64_t row, const uint8_t* p, int64_t n) {
+    double* dst = (double*)ray_data(v)+(size_t)row;
+    bool nulls = false;
+#if defined(__SSE2__)
+    memcpy(dst,p,(size_t)n*sizeof(double));
+#else
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t u = pq_u64(p+(size_t)i*8);
+        memcpy(dst+i,&u,sizeof(u));
+    }
+#endif
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t bits;
+        memcpy(&bits,dst+i,sizeof(bits));
+        if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
+            (bits & UINT64_C(0x000fffffffffffff))) { nulls = true; break; }
+    }
+    if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+    return nulls;
 }
 /* Native dictionary ids go directly to file-domain symbol positions. PLAIN
  * pages intern bounded batches before their decompression buffer is reused. */
@@ -1015,7 +1114,7 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
     int64_t* ids = scratch->ids; int64_t* positions = scratch->positions;
     for (int64_t at = 0; at < rows;) {
         if (ray_interrupted()) return "scan interrupted";
-        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-at); if (err) return err; }
         int64_t n = rows-at < c->page_left ? rows-at : c->page_left, count = 0;
         if (n > 8192) n = 8192;
         for (int64_t i = 0; i < n; i++) {
@@ -1078,7 +1177,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
     if (v->type == RAY_STR) memset(ray_data(v),0,(size_t)rows*sizeof(ray_str_t));
     for (int64_t i = 0; i < rows; i++) {
         if (!(i&1023) && ray_interrupted()) return "scan interrupted";
-        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-i); if (err) return err; }
         if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
             uint32_t id = c->ids.value;
             if (id >= c->dict_count) return "dictionary index out of range";
@@ -1117,6 +1216,14 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             if (!pq_take(&c->values,(uint64_t)n*(s->physical == 1 ? 4 : 8),&p)) return "truncated numeric data";
             pq_plain_int(v,i,p,n);
             if (s->strict && (v->attrs & RAY_ATTR_HAS_NULLS)) return "nonnull integer collides with native null";
+            c->page_left -= n-1; c->chunk_left -= n-1; i += n-1;
+        } else if (c->optional && c->page_all_present) {
+            int64_t n = rows-i < c->page_left ? rows-i : c->page_left;
+            if (n > 4096) n = 4096; /* Keep cancellation responsive. */
+            const uint8_t* p;
+            if (!pq_take(&c->values,(uint64_t)n*(s->physical == 1 ? 4 : 8),&p)) return "truncated numeric data";
+            bool collides = s->physical == 5 ? pq_plain_double(v,i,p,n) : pq_plain_int(v,i,p,n);
+            if (s->strict && collides) return PQ_PUT_FAIL;
             c->page_left -= n-1; c->chunk_left -= n-1; i += n-1;
         } else {
             uint32_t present = 1;
@@ -1168,7 +1275,7 @@ static const char* pq_discard(pq_column* c, pq_schema* s, int64_t rows) {
     while (rows) {
         if (ray_interrupted()) return "scan interrupted";
         if (!c->page_left) {
-            const char* err = pq_page(c,s,&rows);
+            const char* err = pq_page(c,s,&rows,rows);
             if (err) return err;
             if (!rows) break;
         }
@@ -2845,7 +2952,7 @@ static bool pq_g_emit(pq_gtask* k, uint32_t local, int64_t run) {
 static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask* k) {
     for (int64_t at = 0; at < rows;) {
         if (ray_interrupted()) return "scan interrupted";
-        if (!c->page_left) { const char* err = pq_page(c,s,NULL); if (err) return err; }
+        if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-at); if (err) return err; }
         if (c->have_dict && !k->dmapped) {
             if (k->dcap < c->dict_count) {
                 uint32_t* m = ray_realloc_raw(k->dmap,(size_t)c->dict_count*sizeof(*k->dmap));

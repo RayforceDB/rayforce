@@ -4614,8 +4614,77 @@ static test_result_t test_index_hash_eq_rowsel_stale(void) {
     PASS();
 }
 
+/* An append stages a key word, a row and a narrow slot for each group it
+ * adds, and a new group is a key the index lacks.  A one-byte key has at
+ * most 256 values and a two-byte one 65536, so appending 1M rows to an
+ * indexed U8 or I16 column stages no more groups than that, not 20 bytes
+ * for every row appended (a count whose bytes can also wrap a 32-bit
+ * size_t).  The extended index answers every value's first row. */
+static test_result_t test_index_hash_append_narrow_scratch(void) {
+    ray_heap_init();
+    const int64_t add = INT64_C(1) << 20;
+    struct { int8_t type; int esz; int64_t vals; } cases[] = {
+        { RAY_U8, 1, 256 },
+        { RAY_I16, 2, 65536 },
+    };
+    int64_t* first = (int64_t*)malloc(65536 * sizeof(int64_t));
+    uint8_t* buf = (uint8_t*)malloc((size_t)add * 2);
+    TEST_ASSERT_TRUE(first && buf);
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        int8_t t = cases[c].type;
+        int esz = cases[c].esz;
+        int64_t vals = cases[c].vals;
+        /* the first rows 5 and 9; then every value in a stride, less the
+         * I16 null, which would drop the index */
+        ray_t* v = ray_vec_new(t, 2);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+        int16_t init16[2] = { 5, 9 };
+        uint8_t init8[2] = { 5, 9 };
+        v = ray_vec_append_raw(v, esz == 1 ? (const void*)init8 : (const void*)init16, 2);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+        ray_t* r = ray_index_attach_hash(&v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_HASH);
+        for (int64_t x = 0; x < vals; x++) first[x] = -1;
+        first[5] = 0;
+        first[9] = 1;
+        int64_t groups = 2;
+        for (int64_t i = 0; i < add; i++) {
+            int64_t x = (i * 37 + 11) % vals;
+            if (esz == 2 && (int16_t)(uint16_t)x == INT16_MIN) x = 3;
+            if (esz == 1) buf[i] = (uint8_t)x;
+            else { int16_t y = (int16_t)(uint16_t)x; memcpy(buf + i * 2, &y, 2); }
+            if (first[x] < 0) { first[x] = 2 + i; groups++; }
+        }
+        ray_mem_trace_t mt;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        ray_t* w = ray_vec_append_raw(v, buf, add);
+        ray_mem_trace_end(&mt);
+        TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+        TEST_ASSERT_EQ_I(w->len, add + 2);
+        TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_HASH);
+        TEST_ASSERT_EQ_I(ray_index_payload(w->index)->u.hash.n_groups, groups);
+        TEST_ASSERT_FMT(mt.peak_live_bytes <= (uint64_t)add * (uint64_t)esz * 6,
+                        "type %d: peak %llu bytes appending %lld rows of %d bytes", t,
+                        (unsigned long long)mt.peak_live_bytes, (long long)add, esz);
+        int64_t bad = 0;
+        for (int64_t x = 0; x < vals; x++) {
+            int64_t key = esz == 1 ? x : (int64_t)(int16_t)(uint16_t)x;
+            if (esz == 2 && key == INT16_MIN) continue;
+            if (ray_index_find_row(w, key) != first[x]) bad++;
+        }
+        TEST_ASSERT_EQ_I(bad, 0);
+        ray_release(w);
+    }
+    free(first);
+    free(buf);
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t index_entries[] = {
     { "index/attach_drop_no_nulls",          test_index_attach_drop_no_nulls,          NULL, NULL },
+    { "index/hash_append_narrow_scratch",    test_index_hash_append_narrow_scratch,   NULL, NULL },
     { "index/attach_drop_with_inline_nulls", test_index_attach_drop_with_inline_nulls, NULL, NULL },
     { "index/attach_drop_large_sentinel_nulls", test_index_attach_drop_large_sentinel_nulls, NULL, NULL },
     { "index/replace_existing",              test_index_replace_existing,              NULL, NULL },

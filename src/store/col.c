@@ -1332,10 +1332,22 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
                 fclose(f); remove(tmp_path); return RAY_ERR_IO;
             }
             ray_index_t* ix = ray_index_payload(vec->index);
+            /* A hash an append left first-row-only is not what a file may
+             * hold: write a complete one, built from the values. */
+            ray_t* full = NULL;
+            if (ray_index_hash_first_only(vec)) {
+                full = ray_index_hash_rebuild(vec);
+                if (!full) { fclose(f); remove(tmp_path); return RAY_ERR_OOM; }
+                ix = ray_index_payload(full);
+            }
             int64_t rsize = ray_index_inline_size(ix);
             uint8_t* rbuf = (uint8_t*)ray_calloc_raw((size_t)(1) * ((size_t)rsize));
-            if (!rbuf) { fclose(f); remove(tmp_path); return RAY_ERR_OOM; }
+            if (!rbuf) {
+                if (full) ray_release(full);
+                fclose(f); remove(tmp_path); return RAY_ERR_OOM;
+            }
             ray_index_inline_write(rbuf, ix);
+            if (full) ray_release(full);
             size_t rw = fwrite(rbuf, 1, (size_t)rsize, f);
             ray_free_raw(rbuf);
             if (rw != (size_t)rsize) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }

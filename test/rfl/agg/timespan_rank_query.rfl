@@ -1,39 +1,44 @@
-;; MED retains the existing native F64-nanosecond contract, not duration rounding.
+;; MED, QUANTILE and PERCENTILE of durations are durations, rounded to the
+;; nanosecond (half away from zero).
 (set H973 (table [s] (list [0D01:00:00 0D02:00:00])))
-(med (at H973 's)) -- 5400000000000.0
-(type (med (at H973 's))) -- 'f64
-(type (at (select {m: (med s) from: H973}) 'm)) -- 'F64
-(at (select {m: (med s) from: H973}) 'm) -- [5400000000000.0]
+(type (med (at H973 's))) -- 'timespan
+(as 'I64 (med (at H973 's))) -- 5400000000000
+(type (at (select {m: (med s) from: H973}) 'm)) -- 'TIMESPAN
+(as 'I64 (at (select {m: (med s) from: H973}) 'm)) -- [5400000000000]
 (set T973 (table [g s] (list [0 1 0 1 2 2 3 3] (as 'TIMESPAN [1 2 3 4 0Nl 0Nl -4 -1]))))
-(med (at T973 's)) -- 1.5
-(at (select {m: (med s) from: T973}) 'm) -- [1.5]
-(at (select {s: (med s) from: T973}) 's) -- [1.5]
-(at (select {m: (med s) from: T973 where: (< g 2)}) 'm) -- [2.5]
-(at (select {m: (med s) from: T973 where: (in g [0 3])}) 'm) -- [0.0]
+(as 'I64 (med (at T973 's))) -- 2
+(as 'I64 (at (select {m: (med s) from: T973}) 'm)) -- [2]
+(as 'I64 (at (select {s: (med s) from: T973}) 's)) -- [2]
+(as 'I64 (at (select {m: (med s) from: T973 where: (< g 2)}) 'm)) -- [3]
+(as 'I64 (at (select {m: (med s) from: T973 where: (in g [0 3])}) 'm)) -- [0]
 (set G973 (select {m: (med s) from: T973 by: g asc: g}))
 (at G973 'g) -- [0 1 2 3]
-(type (at G973 'm)) -- 'F64
-(at G973 'm) -- [2.0 3.0 0Nf -2.5]
+(type (at G973 'm)) -- 'TIMESPAN
+(as 'I64 (at G973 'm)) -- [2 3 0Nl -3]
 (nil? (at G973 'm)) -- [false false true false]
 (at (select {m: (med s) c: (count s) from: T973 by: g asc: g}) 'c) -- [2 2 2 2]
-(at (select {m: (med s) c: (count s) from: T973 by: g asc: g}) 'm) -- [2.0 3.0 0Nf -2.5]
+(as 'I64 (at (select {m: (med s) c: (count s) from: T973 by: g asc: g}) 'm)) -- [2 3 0Nl -3]
 (set S973 (table [s] (list (as 'TIMESPAN [7]))))
-(at (select {m: (med s) from: S973}) 'm) -- [7.0]
+(as 'I64 (at (select {m: (med s) from: S973}) 'm)) -- [7]
 (set N973 (table [s] (list [0Nn 0Nn])))
-(type (at (select {m: (med s) from: N973}) 'm)) -- 'F64
+(type (at (select {m: (med s) from: N973}) 'm)) -- 'TIMESPAN
 (nil? (at (select {m: (med s) from: N973}) 'm)) -- [true]
 (set P973 (table [s] (list (as 'TIMESPAN [-4 -1]))))
-(at (select {m: (med s) from: P973}) 'm) -- [-2.5]
+(as 'I64 (at (select {m: (med s) from: P973}) 'm)) -- [-3]
 ;; The shared reader must also honor caller-supplied grouped quantile metadata.
-(at (select {q: (quantile s 0.25) from: T973 by: g asc: g}) 'q) -- [1.5 2.5 0Nf -3.25]
-(at (select {q: (percentile s 25) from: T973 by: g asc: g}) 'q) -- [1.5 2.5 0Nf -3.25]
-;; Numeric controls and native atom admission are unchanged.
+(type (at (select {q: (quantile s 0.25) from: T973 by: g asc: g}) 'q)) -- 'TIMESPAN
+(as 'I64 (at (select {q: (quantile s 0.25) from: T973 by: g asc: g}) 'q)) -- [2 3 0Nl -3]
+(as 'I64 (at (select {q: (percentile s 25) from: T973 by: g asc: g}) 'q)) -- [2 3 0Nl -3]
+;; Numeric controls are unchanged; the median of one duration is that duration.
 (at (select {m: (med v) from: (table [v] (list [1 2]))}) 'm) -- [1.5]
-(med 0D01:00:00) !- type
-(med (take [1D] 0)) -- 0Nf
+(type (med 0D01:00:00)) -- 'timespan
+(as 'I64 (med 0D01:00:00)) -- 3600000000000
+(nil? (med 0Nn)) -- true
+(nil? (med (take [1D] 0))) -- true
+(type (med (take [1D] 0))) -- 'timespan
 
 ;; Bounded larger groups exercise the existing rank dispatch geometry.
 (set I973 (til 65539))
 (set L973 (table [g s] (list (% I973 7) (as 'TIMESPAN (- (% I973 511) 255)))))
-(type (at (select {m: (med s) from: L973 by: g asc: g}) 'm)) -- 'F64
-(at (select {m: (med s) from: L973 by: g asc: g}) 'm) -- [-3.0 -2.0 -1.0 0.0 1.0 2.0 3.0]
+(type (at (select {m: (med s) from: L973 by: g asc: g}) 'm)) -- 'TIMESPAN
+(as 'I64 (at (select {m: (med s) from: L973 by: g asc: g}) 'm)) -- [-3 -2 -1 0 1 2 3]

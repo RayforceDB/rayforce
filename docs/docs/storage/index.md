@@ -345,6 +345,8 @@ A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/
 
 A save also builds indexes of its own for columns of at least 65 536 rows: a dictionary for a string column and a chunk zone (per-chunk min/max) for a numeric or temporal one. `{index: false}` builds neither, in either generation, for a table that is never queried by value (read by partition, by position or whole); the write is faster and the files are smaller. It governs only what the save builds. An index the column already carries is written as it always is: one you built (`.idx.hash`, `.idx.sort`, `.idx.bloom`), or a chunk zone a loaded column brought from its file, as when a table read from one splayed store is saved to another. A dictionary is only ever built, never carried over from the source, so `{index: false}` leaves a loaded string column without one. A column without an index reads as it does after a save of a short one. `true`, the default, builds the automatic indexes; a non-bool value is a `domain` error. `compress`, `symfile` and `index` combine in one dict: `{compress: true index: false}`.
 
+`{durable: false}` skips every fsync of the save (column files, symbol files, directories), the path `.csv.splayed` and the Parquet import already take; `true`, the default, syncs as before. The write still goes through temporary files and atomic renames, so a reader sees whole files; a crash or power loss may lose the write or leave it torn. For a table that is republished often and can be rebuilt from its source. A non-bool value is a `domain` error; it combines with the other options: `{durable: false compress: true}`.
+
 ### Compressed floating-point environment
 
 Generation-2 compressed F32/F64 I/O requires **default floating-point controls** on every calling/executing thread: round-to-nearest (`FE_TONEAREST`), masked FP exceptions, and gradual underflow (FTZ and DAZ disabled). Embedders must maintain those controls during calls. Rayforce does not silently change or normalize them; sticky exception status flags need not be clear and arithmetic may set them. Detected unsupported controls produce `fpenv` (`RAY_ERR_FPENV` in C), not a corruption error. Restore supported controls before retrying the same mapped column; an environment failure is transient, not permanently cached.
@@ -463,3 +465,23 @@ it appears in a table schema. Upgrade readers before writing duration
 columns to shared storage. Existing column tags and format generations
 retain their meanings. Parquet logical time and duration mappings are
 separate from this column format.
+
+## GUID hash index compatibility
+
+A splayed save persists a hash index on a GUID column (`.idx.hash`,
+`grouped`) in both format generations, so the index is there after a
+load. Readers built before GUID hash indexes, v3.0.1 among them, treat
+the two generations differently:
+
+- **Generation 0.** They decline the index and load the column without
+  it; every answer is the same.
+- **Generation 2** (`{compress: true}`). They open the table and read its
+  other columns, but reading the GUID column fails with
+  `corrupt: index kind 1 is not admitted on type GUID`. The values on
+  disk are intact; only the index is unknown to them.
+
+Upgrade readers before writing indexed GUID columns to shared
+generation-2 storage, or save the column without its index
+(`.idx.drop`). Hash indexes on other column types, including one an
+append extended, keep the format older readers read. Existing column
+tags and format generations retain their meanings.
