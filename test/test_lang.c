@@ -4616,6 +4616,70 @@ static test_result_t test_eval_insert_parted_e2e(void) {
     return result;
 }
 
+/* ---- Test: a select over a bound column prunes partitions before fetch -- */
+
+static test_result_t test_eval_select_parted_bound_impl(const char* root) {
+    char dir[1024], sym_path[1024];
+    int ns = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(ns > 0 && (size_t)ns < sizeof(sym_path), "format sym path");
+    const char* days[] = { "2024.01.15", "2024.01.16", "2024.01.17" };
+    const char* rows[] = {
+        "(table ['Time 'v] (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2]))",
+        "(table ['Time 'v] (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] [3 4]))",
+        "(table ['Time 'v] (list [2024.01.17D01:00:00.000] [5]))",
+    };
+    for (int i = 0; i < 3; i++) {
+        int n = snprintf(dir, sizeof(dir), "%s/%s/t", root, days[i]);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(dir), "format partition path");
+        TEST_ASSERT(lang_parted_insert_save_table(rows[i], dir, sym_path), "create parted fixture");
+    }
+
+    char src[1400];
+    int n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't {bound: 'Time}))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    /* The literal lies in the last partition: the two before it are pruned. */
+    uint64_t runs0, parts0, runs1, parts1;
+    ray_query_test_part_prune(&runs0, &parts0);
+    ray_t* r = ray_eval_str("(at (select {from: p where: (> Time 2024.01.17D00:30:00.000)}) 'v)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_I64);
+    TEST_ASSERT_EQ_I(r->len, 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[0], 5);
+    ray_release(r);
+    ray_query_test_part_prune(&runs1, &parts1);
+    TEST_ASSERT_EQ_U(runs1 - runs0, 1);
+    TEST_ASSERT_EQ_U(parts1 - parts0, 2);
+
+    /* A predicate the bound cannot prune (!=) leaves the counters alone. */
+    r = ray_eval_str("(count (select {from: p where: (!= Time 2024.01.17D01:00:00.000)}))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 4);
+    ray_release(r);
+    ray_query_test_part_prune(&runs0, &parts0);
+    TEST_ASSERT_EQ_U(runs0, runs1);
+    PASS();
+}
+
+static test_result_t test_eval_select_parted_bound(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_bound_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_select_parted_bound_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
 /* ---- Test: live FILE-domain symbols persist only at explicit rollover - */
 
 static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
@@ -12170,6 +12234,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/select_parted_bound", test_eval_select_parted_bound, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },

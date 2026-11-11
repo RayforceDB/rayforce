@@ -1144,6 +1144,99 @@ static test_result_t test_partition_pruning_mask(void) {
 }
 
 /*
+ * Test: a predicate on the table's bound column prunes partitions.
+ *
+ * 3 partitions keyed by DATE values [d, d+1, d+2]; the TIMESTAMP column t is
+ * the bound column (every row of partition k has t in [k, next key)).
+ * Filter: t > d+1 at noon.  Expected seg_mask: bits 1,2 set (the partition
+ * holding the literal and every later one), bit 0 clear — on the scan of t
+ * itself, the only parted scan of the plan.
+ */
+static test_result_t test_partition_pruning_bound(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int32_t d = 8780;
+    ray_t* key_values = ray_vec_new(RAY_DATE, 3);
+    TEST_ASSERT_NOT_NULL(key_values);
+    key_values->len = 3;
+    int32_t keys[] = {d, d + 1, d + 2};
+    memcpy(ray_data(key_values), keys, sizeof(keys));
+
+    ray_t* row_counts = ray_vec_new(RAY_I64, 3);
+    TEST_ASSERT_NOT_NULL(row_counts);
+    row_counts->len = 3;
+    int64_t counts[] = {2, 2, 2};
+    memcpy(ray_data(row_counts), counts, sizeof(counts));
+
+    int64_t sym_date = ray_sym_intern("date", 4);
+    int64_t sym_t    = ray_sym_intern("t", 1);
+
+    ray_t* mapcommon = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(mapcommon);
+    mapcommon->type = RAY_MAPCOMMON;
+    mapcommon->len = 2;
+    mapcommon->attrs = RAY_MC_DATE;
+    memset(mapcommon->aux, 0, 16);
+    ray_mapcommon_set_bound(mapcommon, sym_t);
+    TEST_ASSERT_EQ_I(ray_mapcommon_bound(mapcommon), sym_t);
+    ((ray_t**)ray_data(mapcommon))[0] = key_values;
+    ((ray_t**)ray_data(mapcommon))[1] = row_counts;
+
+    const int64_t day = 86400000000000LL;
+    ray_t* t_parted = ray_alloc(3 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(t_parted);
+    t_parted->type = RAY_PARTED_BASE + RAY_TIMESTAMP;
+    t_parted->len = 3;
+    for (int i = 0; i < 3; i++) {
+        ray_t* seg = ray_vec_new(RAY_TIMESTAMP, 2);
+        TEST_ASSERT_NOT_NULL(seg);
+        seg->len = 2;
+        int64_t* v = (int64_t*)ray_data(seg);
+        v[0] = (d + i) * day;
+        v[1] = (d + i) * day + day / 4;
+        ((ray_t**)ray_data(t_parted))[i] = seg;
+    }
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, sym_date, mapcommon);
+    tbl = ray_table_add_col(tbl, sym_t, t_parted);
+
+    /* FILTER(SCAN(t), GT(SCAN(t), CONST(d+1 at noon))) */
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* scan_t = ray_scan(g, "t");
+    ray_t* lit = ray_timestamp((d + 1) * day + day / 2);
+    ray_op_t* c_lit = ray_const_atom(g, lit);
+    ray_release(lit);
+    ray_op_t* pred = ray_gt(g, scan_t, c_lit);
+    ray_op_t* filt = ray_filter(g, scan_t, pred);
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* t_ext = NULL;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == scan_t->id) {
+            t_ext = g->ext_nodes[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(t_ext);
+    TEST_ASSERT_NOT_NULL(t_ext->seg_mask);
+    TEST_ASSERT_EQ_I(t_ext->seg_mask_count, 3);
+    uint64_t expected = (1ULL << 1) | (1ULL << 2);
+    TEST_ASSERT_TRUE(t_ext->seg_mask[0] == expected);
+
+    ray_graph_free(g);
+    ray_release(mapcommon);
+    ray_release(t_parted);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
  * Test: partition pruning works for OP_IN predicates.
  *
  * 4 partitions keyed by I64 values [100, 200, 300, 400].
@@ -3345,6 +3438,7 @@ const test_entry_t opt_entries[] = {
     { "opt/projection_pushdown", test_projection_pushdown, NULL, NULL },
     { "opt/partition_pruning", test_partition_pruning_smoke, NULL, NULL },
     { "opt/partition_pruning_mask", test_partition_pruning_mask, NULL, NULL },
+    { "opt/partition_pruning_bound", test_partition_pruning_bound, NULL, NULL },
     { "opt/partition_pruning_in", test_partition_pruning_in, NULL, NULL },
     { "opt/partition_pruning_not_in", test_partition_pruning_not_in, NULL, NULL },
     { "opt/partition_pruning_in_type_mismatch", test_partition_pruning_in_type_mismatch, NULL, NULL },

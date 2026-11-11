@@ -1,0 +1,145 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; src/store/part.c, src/ops/opt.c, src/ops/query.c, src/ops/system.c —
+;; timestamp partition keys (YYYY.MM.DD.HH.MM.SS directories, RAY_MC_TIMESTAMP)
+;; and the `bound` option of .db.parted.get: a data column whose every row
+;; in partition k lies in [k, next key), so a predicate on it prunes
+;; partitions like one on the key.
+;;
+;; Fixture roots use the /tmp/rfl_part_* prefix (see part.rfl).  Pre- and
+;; post-cleanup is mandatory: stale sym.lk / .d files from a prior run
+;; cause "error: corrupt" on the second open.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_bound_date /tmp/rfl_part_bound_ts /tmp/rfl_part_bound_int")
+
+;; Three partitions of a Time/v table; the Time values of each lie in its
+;; partition's interval, under both the date and the timestamp layout.
+(set BT-A (table [Time v] (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2])))
+(set BT-B (table [Time v] (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] [3 4])))
+(set BT-C (table [Time v] (list [2024.01.17D01:00:00.000] [5])))
+
+;; ────────────── timestamp partition keys: RAY_MC_TIMESTAMP ──────────────
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.15.10.00.00/t/" BT-A)
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.16.00.00.00/t/" BT-B)
+(.db.splayed.set "/tmp/rfl_part_ts/2024.01.17.00.00.00/t/" BT-C)
+(set Pts (.db.parted.get "/tmp/rfl_part_ts/" 't))
+;; the key column is 'part (only date keys are named 'date), typed TIMESTAMP
+(key Pts) -- ['part 'Time 'v]
+(count Pts) -- 5
+(at Pts 'part) -- [2024.01.15D10:00:00.000 2024.01.15D10:00:00.000 2024.01.16D00:00:00.000 2024.01.16D00:00:00.000 2024.01.17D00:00:00.000]
+;; prune by the key with a timestamp literal
+(at (select {from: Pts where: (>= part 2024.01.15D10:30:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pts where: (>= part 2024.01.16D00:00:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pts where: (< part 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Pts where: (== part 2024.01.17D00:00:00.000)}) 'v) -- [5]
+;; a date literal is rescaled to the key's units
+(at (select {from: Pts where: (>= part 2024.01.16)}) 'v) -- [3 4 5]
+(at (select {from: Pts where: (== part 2024.01.16)}) 'v) -- [3 4]
+(at (select {from: Pts where: (> part 2024.01.16)}) 'v) -- [5]
+
+;; live tail: a later timestamp key opens a new in-memory partition
+(insert 'Pts 2024.01.17D06:00:00.000 (table [Time v] (list [2024.01.17D06:30:00.000] [6])))
+(count Pts) -- 6
+(last (at Pts 'part)) -- 2024.01.17D06:00:00.000
+(at (select {from: Pts where: (>= part 2024.01.17D06:00:00.000)}) 'v) -- [6]
+;; an earlier key is rejected, as is a key of another type
+(insert 'Pts 2024.01.16D00:00:00.000 (table [Time v] (list [2024.01.16D00:00:00.000] [7]))) !- domain
+(insert 'Pts 2024.01.18 (table [Time v] (list [2024.01.18D00:00:00.000] [7]))) !- type
+
+;; a mixed set (one timestamp name, one date name) stays SYM
+(.db.splayed.set "/tmp/rfl_part_ts_mixed/2024.01.15.10.00.00/t/" BT-A)
+(.db.splayed.set "/tmp/rfl_part_ts_mixed/2024.01.16/t/" BT-B)
+(set Pmix (.db.parted.get "/tmp/rfl_part_ts_mixed/" 't))
+(key Pmix) -- ['part 'Time 'v]
+(at Pmix 'part) -- (as 'sym ["2024.01.15.10.00.00" "2024.01.15.10.00.00" "2024.01.16" "2024.01.16"])
+
+;; a calendar- or clock-impossible name is not a timestamp: the set is SYM
+(.db.splayed.set "/tmp/rfl_part_ts_bad/2024.02.31.00.00.00/t/" BT-A)
+(.db.splayed.set "/tmp/rfl_part_ts_bad/2024.03.01.24.00.00/t/" BT-B)
+(set Pbad (.db.parted.get "/tmp/rfl_part_ts_bad/" 't))
+(at Pbad 'part) -- (as 'sym ["2024.02.31.00.00.00" "2024.02.31.00.00.00" "2024.03.01.24.00.00" "2024.03.01.24.00.00"])
+
+;; ────────────── bound column over date keys ──────────────
+(.db.splayed.set "/tmp/rfl_part_bound_date/2024.01.15/t/" BT-A)
+(.db.splayed.set "/tmp/rfl_part_bound_date/2024.01.16/t/" BT-B)
+(.db.splayed.set "/tmp/rfl_part_bound_date/2024.01.17/t/" BT-C)
+(set Pbd (.db.parted.get "/tmp/rfl_part_bound_date/" 't {bound: 'Time}))
+(key Pbd) -- ['date 'Time 'v]
+(count Pbd) -- 5
+;; the two-argument form is unchanged
+(count (.db.parted.get "/tmp/rfl_part_bound_date/" 't)) -- 5
+;; every comparison, with t inside a partition's interval ...
+(at (select {from: Pbd where: (> Time 2024.01.16D12:00:00.000)}) 'v) -- [5]
+(at (select {from: Pbd where: (>= Time 2024.01.16D12:00:00.000)}) 'v) -- [4 5]
+(at (select {from: Pbd where: (< Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3]
+(at (select {from: Pbd where: (<= Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3 4]
+(at (select {from: Pbd where: (== Time 2024.01.16D12:00:00.000)}) 'v) -- [4]
+(at (select {from: Pbd where: (!= Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3 5]
+(at (select {from: Pbd where: (in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])}) 'v) -- [2 5]
+;; ... exactly on a key ...
+(at (select {from: Pbd where: (> Time 2024.01.16D00:00:00.000)}) 'v) -- [4 5]
+(at (select {from: Pbd where: (>= Time 2024.01.16D00:00:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pbd where: (< Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Pbd where: (<= Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2 3]
+(at (select {from: Pbd where: (== Time 2024.01.16D00:00:00.000)}) 'v) -- [3]
+;; ... before the first key and after the last
+(at (select {from: Pbd where: (< Time 2024.01.01D00:00:00.000)}) 'v) -- []
+(at (select {from: Pbd where: (>= Time 2024.01.01D00:00:00.000)}) 'v) -- [1 2 3 4 5]
+(at (select {from: Pbd where: (> Time 2024.02.01D00:00:00.000)}) 'v) -- []
+(at (select {from: Pbd where: (<= Time 2024.02.01D00:00:00.000)}) 'v) -- [1 2 3 4 5]
+(at (select {from: Pbd where: (== Time 2024.01.01D00:00:00.000)}) 'v) -- []
+;; the literal on the left, a date literal, a conjunction with the key
+(at (select {from: Pbd where: (< 2024.01.16D12:00:00.000 Time)}) 'v) -- [5]
+(at (select {from: Pbd where: (>= Time 2024.01.16)}) 'v) -- [3 4 5]
+(at (select {from: Pbd where: (and (>= Time 2024.01.15D20:00:00.000) (< date 2024.01.17))}) 'v) -- [2 3 4]
+;; by: over a bound predicate
+(select {s: (sum v) by: Time from: Pbd where: (> Time 2024.01.16D00:00:00.000)}) -- (table [Time s] (list [2024.01.16D12:00:00.000 2024.01.17D01:00:00.000] [4 5]))
+(at (select {n: (count v) by: date from: Pbd where: (>= Time 2024.01.16D12:00:00.000)}) 'n) -- [1 1]
+
+;; mount errors: unknown column, incompatible type, unknown option
+(.db.parted.get "/tmp/rfl_part_bound_date/" 't {bound: 'nope}) !- domain
+(.db.parted.get "/tmp/rfl_part_bound_date/" 't {bound: 'v}) !- domain
+(.db.parted.get "/tmp/rfl_part_bound_date/" 't {bnd: 'Time}) !- domain
+(.db.parted.get "/tmp/rfl_part_bound_date/" 't {bound: "Time"}) !- domain
+(.db.parted.get "/tmp/rfl_part_bound_date/" 't 'Time) !- domain
+
+;; ────────────── bound column over timestamp keys ──────────────
+(set Pbt (.db.parted.get "/tmp/rfl_part_ts/" 't {bound: 'Time}))
+(key Pbt) -- ['part 'Time 'v]
+(at (select {from: Pbt where: (> Time 2024.01.16D12:00:00.000)}) 'v) -- [5]
+(at (select {from: Pbt where: (>= Time 2024.01.16D12:00:00.000)}) 'v) -- [4 5]
+(at (select {from: Pbt where: (< Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3]
+(at (select {from: Pbt where: (<= Time 2024.01.16D12:00:00.000)}) 'v) -- [1 2 3 4]
+(at (select {from: Pbt where: (== Time 2024.01.16D12:00:00.000)}) 'v) -- [4]
+(at (select {from: Pbt where: (in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])}) 'v) -- [2 5]
+(at (select {from: Pbt where: (>= Time 2024.01.16D00:00:00.000)}) 'v) -- [3 4 5]
+(at (select {from: Pbt where: (< Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+(at (select {from: Pbt where: (< Time 2024.01.01D00:00:00.000)}) 'v) -- []
+(at (select {from: Pbt where: (> Time 2024.02.01D00:00:00.000)}) 'v) -- []
+(at (select {from: Pbt where: (> Time 2024.01.16)}) 'v) -- [4 5]
+;; the bound survives a live-tail insert
+(insert 'Pbt 2024.01.17D06:00:00.000 (table [Time v] (list [2024.01.17D06:30:00.000] [6])))
+(at (select {from: Pbt where: (>= Time 2024.01.17D06:00:00.000)}) 'v) -- [6]
+(at (select {from: Pbt where: (< Time 2024.01.16D00:00:00.000)}) 'v) -- [1 2]
+;; a SYM key refuses a bound
+(.db.parted.get "/tmp/rfl_part_ts_mixed/" 't {bound: 'Time}) !- domain
+
+;; ────────────── bound column over integer keys ──────────────
+(.db.splayed.set "/tmp/rfl_part_bound_int/100/t/" (table [k v] (list [100 150] [1 2])))
+(.db.splayed.set "/tmp/rfl_part_bound_int/200/t/" (table [k v] (list [200 250] [3 4])))
+(.db.splayed.set "/tmp/rfl_part_bound_int/300/t/" (table [k v] (list [300] [5])))
+(set Pbi (.db.parted.get "/tmp/rfl_part_bound_int/" 't {bound: 'k}))
+(at (select {from: Pbi where: (>= k 160)}) 'v) -- [3 4 5]
+(at (select {from: Pbi where: (>= k 200)}) 'v) -- [3 4 5]
+(at (select {from: Pbi where: (== k 150)}) 'v) -- [2]
+(at (select {from: Pbi where: (== k 160)}) 'v) -- []
+(at (select {from: Pbi where: (< k 200)}) 'v) -- [1 2]
+(at (select {from: Pbi where: (in k [100 300])}) 'v) -- [1 5]
+;; a timestamp column cannot bound an integer key
+(.db.splayed.set "/tmp/rfl_part_bound_int/100/u/" BT-A)
+(.db.splayed.set "/tmp/rfl_part_bound_int/200/u/" BT-B)
+(.db.splayed.set "/tmp/rfl_part_bound_int/300/u/" BT-C)
+(.db.parted.get "/tmp/rfl_part_bound_int/" 'u {bound: 'Time}) !- domain
+
+;; ────────────── cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_bound_date /tmp/rfl_part_bound_ts /tmp/rfl_part_bound_int")

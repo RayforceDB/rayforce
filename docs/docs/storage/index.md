@@ -216,6 +216,8 @@ A partition may hold fewer columns than the first one, as long as the columns it
 
 The query optimizer recognizes predicates on the `MAPCOMMON` column and eliminates entire partitions from the scan plan. This means a query filtering on a single date in a year of data only touches 1/365th of the files on disk — with zero per-row cost for the pruned partitions.
 
+A table mounted with a bound column, `(.db.parted.get "db" 'trades {bound: 'time})`, prunes on predicates over that column as well: every row of the partition with key `k` has `time` in `[k, next key)`, so `(> time 2024.01.16D12:00:00.000)` reads the partition of `2024.01.16` and the later ones only. Partition directories may also be named `YYYY.MM.DD.HH.MM.SS`, which gives a `timestamp` partition key. See [`.db.parted.get`](../namespaces/db.md#db-parted-get).
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.
