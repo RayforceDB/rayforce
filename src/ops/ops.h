@@ -25,7 +25,6 @@
 #define RAY_OPS_H
 
 #include <rayforce.h>
-#include <string.h>
 #include "store/hnsw.h"  /* ray_hnsw_metric_t, ray_hnsw_t */
 
 #ifdef __cplusplus
@@ -82,15 +81,6 @@ void     ray_cancel_reset(void);
 #define RAY_MC_DATE   1   /* YYYY.MM.DD partition directories */
 #define RAY_MC_I64    2   /* pure integer partition keys */
 #define RAY_MC_TIMESTAMP 3 /* YYYY.MM.DD.HH.MM.SS partition directories */
-
-/* The bound column of a MAPCOMMON (every row of partition k has it in
- * [k, next key)): its sym id + 1 in aux[8..15], 0 when none. */
-static inline int64_t ray_mapcommon_bound(const ray_t* mc) {
-    int64_t v; memcpy(&v, mc->aux + 8, sizeof v); return v - 1;
-}
-static inline void ray_mapcommon_set_bound(ray_t* mc, int64_t sym) {
-    int64_t v = sym + 1; memcpy(mc->aux + 8, &v, sizeof v);
-}
 
 #define RAY_IS_PARTED(t)       ((t) >= RAY_PARTED_BASE && (t) < RAY_MAPCOMMON)
 #define RAY_PARTED_BASETYPE(t) ((t) - RAY_PARTED_BASE)
