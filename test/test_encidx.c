@@ -2432,6 +2432,17 @@ static test_result_t test_admitted_roundtrip(void) {
     ray_t* sp = ix_roundtrip(sv, NULL, 0);
     TEST_ASSERT_TRUE(sp && ix_children_equal(ray_index_payload(sv->index), ray_index_payload(sp->index)));
     ray_release(sp); ray_release(sv);
+    /* GUID HASH: keyed on the bytes like STR, the zero guid a key */
+    ray_t* g = ray_vec_new(RAY_GUID, 600);
+    g->len = 600;
+    uint8_t* gd = (uint8_t*)ray_data(g);
+    memset(gd, 0, 600 * 16);
+    for (int i = 0; i < 600; i++) { uint64_t k = (uint64_t)(i % 37); memcpy(gd + i * 16 + 3, &k, 8); }
+    ray_t* gv = with_index(g, ray_index_attach_hash);
+    ray_t* gp = ix_roundtrip(gv, NULL, 0);
+    TEST_ASSERT_TRUE(gp && ix_children_equal(ray_index_payload(gv->index), ray_index_payload(gp->index)));
+    TEST_ASSERT_EQ_I(ray_index_payload(gp->index)->u.hash.n_groups, 37);
+    ray_release(gp); ray_release(gv);
     TEST_ASSERT_EQ_I(done, 10 * 4 + 2);          /* ten numeric types x four kinds, SYM HASH and PART */
     PASS();
 }
@@ -2464,7 +2475,7 @@ static test_result_t test_admission_through_all(void) {
             if (we) ray_error_free(we);
             ray_release(root);
         }
-    TEST_ASSERT_EQ_I(rejected, 13 * 4 - (10 * 4 + 3));     /* every pair test_admitted_roundtrip does not build */
+    TEST_ASSERT_EQ_I(rejected, 13 * 4 - (10 * 4 + 4));     /* every pair test_admitted_roundtrip does not build */
     PASS();
 }
 
