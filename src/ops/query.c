@@ -26828,7 +26828,7 @@ static int parted_key_cells_cmp(ray_t* keys, int64_t a, int64_t b,
         if (av == NULL_I32 || bv == NULL_I32) { *valid = false; return 0; }
         return (av > bv) - (av < bv);
     }
-    if (keys->type == RAY_I64) {
+    if (keys->type == RAY_I64 || keys->type == RAY_TIMESTAMP) {
         int64_t av = ((int64_t*)ray_data(keys))[a];
         int64_t bv = ((int64_t*)ray_data(keys))[b];
         if (av == NULL_I64 || bv == NULL_I64) { *valid = false; return 0; }
@@ -26857,7 +26857,7 @@ static int parted_key_atom_cmp(ray_t* key, ray_t* keys, int64_t cell,
         if (cv == NULL_I32 || RAY_ATOM_IS_NULL(key)) { *valid = false; return 0; }
         return (key->i32 > cv) - (key->i32 < cv);
     }
-    if (keys->type == RAY_I64) {
+    if (keys->type == RAY_I64 || keys->type == RAY_TIMESTAMP) {
         int64_t cv = ((int64_t*)ray_data(keys))[cell];
         if (cv == NULL_I64 || RAY_ATOM_IS_NULL(key)) { *valid = false; return 0; }
         return (key->i64 > cv) - (key->i64 < cv);
@@ -26924,15 +26924,16 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
     ray_t* mc = (ray_table_col_meta_idx(tbl, 0, &mm) && mm.type == RAY_MAPCOMMON && !mm.enc)
               ? ray_table_col_idx(tbl, 0) : NULL;
     if (!mc || mc->type != RAY_MAPCOMMON || mc->len != 2 ||
-        mc->attrs > RAY_MC_I64)
+        mc->attrs > RAY_MC_TIMESTAMP)
         return ray_error("type", "insert: three-argument table form requires a canonical .db.parted.get table");
 
     ray_t** mp = (ray_t**)ray_data(mc);
     ray_t* keys = mp[0];
     ray_t* counts = mp[1];
-    int8_t key_type = mc->attrs == RAY_MC_DATE ? RAY_DATE
-                    : mc->attrs == RAY_MC_I64  ? RAY_I64
-                    :                            RAY_SYM;
+    int8_t key_type = mc->attrs == RAY_MC_DATE      ? RAY_DATE
+                    : mc->attrs == RAY_MC_TIMESTAMP ? RAY_TIMESTAMP
+                    : mc->attrs == RAY_MC_I64       ? RAY_I64
+                    :                                 RAY_SYM;
     uint8_t key_attrs = key_type == RAY_SYM ? RAY_SYM_W64 : 0;
     if (!keys || RAY_IS_ERR(keys) || keys->type != key_type ||
         keys->attrs != key_attrs ||
@@ -26969,7 +26970,7 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
         } else if (key_type == RAY_DATE) {
             if (((int32_t*)ray_data(keys))[0] == NULL_I32)
                 return ray_error("corrupt", "insert: MAPCOMMON contains a null partition key");
-        } else if (key_type == RAY_I64) {
+        } else if (key_type == RAY_I64 || key_type == RAY_TIMESTAMP) {
             if (((int64_t*)ray_data(keys))[0] == NULL_I64)
                 return ray_error("corrupt", "insert: MAPCOMMON contains a null partition key");
         } else {

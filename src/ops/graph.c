@@ -508,13 +508,15 @@ static int8_t cmp_temporal_type(ray_graph_t* g, ray_op_t* x) {
     int8_t t = x->out_type;
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     if (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP) return t;
-    /* A date-partitioned table's key scans as MAPCOMMON over DATE values. */
+    /* A date- or timestamp-partitioned table's key scans as MAPCOMMON over
+     * DATE or TIMESTAMP values. */
     if (t == RAY_MAPCOMMON && x->opcode == OP_SCAN && g->table) {
         ray_op_ext_t* ext = find_ext(g, x->id);
         ray_col_meta_t m;
-        if (ext && ray_table_col_meta(g->table, ext->sym, &m)
-            && m.type == RAY_MAPCOMMON && m.attrs == RAY_MC_DATE)
-            return RAY_DATE;
+        if (ext && ray_table_col_meta(g->table, ext->sym, &m) && m.type == RAY_MAPCOMMON) {
+            if (m.attrs == RAY_MC_DATE) return RAY_DATE;
+            if (m.attrs == RAY_MC_TIMESTAMP) return RAY_TIMESTAMP;
+        }
     }
     return 0;
 }
