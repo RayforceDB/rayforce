@@ -1,0 +1,40 @@
+;; Unary atomic verbs (neg abs round floor ceil sqrt log exp) apply through a
+;; list of vectors, as the binary arithmetic verbs do.
+
+(abs (list [-1.0 2.0] [3.0 -4.0])) -- (list [1.0 2.0] [3.0 4.0])
+(neg (list [1.0 -2.0] [3.0 4.0])) -- (list [-1.0 2.0] [-3.0 -4.0])
+(sqrt (list [1.0 4.0] [9.0 16.0])) -- (list [1.0 2.0] [3.0 4.0])
+(floor (list [1.5 2.5] [3.5 4.5])) -- (list [1.0 2.0] [3.0 4.0])
+(ceil (list [1.5 2.5] [3.5 4.5])) -- (list [2.0 3.0] [4.0 5.0])
+(round (list [1.4 2.6] [-1.4 -2.6])) -- (list [1.0 3.0] [-1.0 -3.0])
+(exp (list [0.0 0.0] [0.0 0.0])) -- (list [1.0 1.0] [1.0 1.0])
+(log (list [1.0 1.0] [1.0 1.0])) -- (list [0.0 0.0] [0.0 0.0])
+
+;; integer rows keep their type
+(abs (list [-1 2] [3 -4])) -- (list [1 2] [3 4])
+(neg (list [1 -2] [3 4])) -- (list [-1 2] [-3 -4])
+
+;; ragged rows, rows of different numeric types, deeper nesting
+(abs (list [-1.0] [2.0 -3.0 4.0])) -- (list [1.0] [2.0 3.0 4.0])
+(abs (list [-1 2] [3.5 -4.0])) -- (list [1 2] [3.5 4.0])
+(abs (list (list [-1.0] [2.0]) [3.0 -4.0])) -- (list (list [1.0] [2.0]) [3.0 4.0])
+
+;; a bare atom beside a vector
+(abs (list [-1.0 2.0] -5.0)) -- (list [1.0 2.0] 5.0)
+
+;; nulls stay null
+(nil? (at (at (abs (list [-1 0Nl] [3 -4])) 0) 1)) -- true
+(nil? (at (at (sqrt (list [4.0 0Nf] [9.0])) 0) 1)) -- true
+
+;; same result as mapping the flat verb over each row
+(abs (list [-1.0 2.0] [3.0 -4.0])) -- (list (abs [-1.0 2.0]) (abs [3.0 -4.0]))
+(abs (abs (list [-1.0 2.0] [3.0 -4.0]))) -- (abs (list [-1.0 2.0] [3.0 -4.0]))
+
+;; atoms and flat vectors are unchanged
+(abs [-1.0 2.0]) -- [1.0 2.0]
+(abs -3) -- 3
+(count (abs (list))) -- 0
+
+;; a non-numeric element names its own type
+(abs (list "ab" [1.0])) !- type
+(neg (list (list "ab") [1.0])) !- type

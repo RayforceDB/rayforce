@@ -1795,8 +1795,17 @@ ray_t* ray_list_collapse_bool(ray_t* list) {
     return vec;
 }
 
+/* One element of a collection mapped by an atomic unary function.  A nested
+ * collection (the rows of a list of vectors) is mapped in turn, as the binary
+ * atomic path does, instead of being handed whole to a function that only
+ * takes atoms. */
+static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
+    return is_collection(e) ? atomic_map_unary(fn, e) : fn(e);
+}
+
 /* Map a unary function element-wise over a collection.
- * Produces typed vectors when output is numeric/bool, boxed lists otherwise. */
+ * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
+ * a nested collection maps to a collection of the same shape. */
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
 
@@ -1825,7 +1834,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     /* Probe first element to determine output type */
     int alloc0 = 0;
     ray_t* e0_in = collection_elem(arg, 0, &alloc0);
-    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : fn(e0_in);
+    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : atomic_unary_elem(fn, e0_in);
     if (alloc0) ray_release(e0_in);
     if (RAY_IS_ERR(e0)) return e0;
 
@@ -1844,7 +1853,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
         for (int64_t i = 1; i < len; i++) {
             int alloc = 0;
             ray_t* e = collection_elem(arg, i, &alloc);
-            ray_t* elem = RAY_IS_ERR(e) ? e : fn(e);
+            ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
             if (alloc) ray_release(e);
             if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
             store_typed_elem(vec, i, elem);
@@ -1864,7 +1873,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     for (int64_t i = 1; i < len; i++) {
         int alloc = 0;
         ray_t* e = collection_elem(arg, i, &alloc);
-        ray_t* elem = RAY_IS_ERR(e) ? e : fn(e);
+        ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
         if (alloc) ray_release(e);
         if (RAY_IS_ERR(elem)) {
             /* Trim to the initialized prefix — see atomic_map_binary_op:
