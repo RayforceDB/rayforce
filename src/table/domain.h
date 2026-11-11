@@ -336,14 +336,18 @@ const char* ray_sym_domain_path(ray_sym_domain_t* dom);
  * own persistence). */
 ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable);
 
-/* Append the entries interned since the last flush to the symfile in place
- * (header count rewritten after the records), instead of rewriting the
- * whole file through a tmp + rename.  For a symfile one writer builds
- * alone, such as a converter's staging domain, flushed as it grows so the
- * last flush writes only the tail.  Same `.lk` lock as
- * ray_sym_domain_flush; the file must still have the persisted size.
- * `durable` also syncs the file and its directory, even when nothing new
- * was interned. */
+/* Append the entries interned since the last flush to the symfile in place,
+ * instead of rewriting the whole file through a tmp + rename: the cost
+ * follows the new entries, not the file.  The header count is the commit
+ * point: the records are written first, synced (`durable`), and only then
+ * the count is written and synced, so a power loss leaves the old count
+ * or a count whose records are all there.  Records past the header count
+ * (a torn append's tail) are ignored by an open and written over by the
+ * next append.  Same `.lk` lock as ray_sym_domain_flush; the file must
+ * still have the persisted size.  No-op (RAY_OK, no write, no sync) when
+ * nothing new was interned; `durable` syncs the file and its directory
+ * only when new entries were written, or earlier non-durable flushes left
+ * some unsynced. */
 ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable);
 
 /* Rewrite the plain symfile at `path` compressed: each string coded with an

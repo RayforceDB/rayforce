@@ -3455,6 +3455,117 @@ static test_result_t test_per_column_symfiles(void) {
     PASS();
 }
 
+/* A save that adds one symbol to a big shared symfile appends it: the same
+ * inode, the bytes before the old end untouched, the header count one up.
+ * A save that adds none leaves the file as it is and does not write it (a
+ * read-only one is no obstacle).  A torn append's tail past the count is no
+ * obstacle either: the next save cuts it.  The per-column layout, whose
+ * symfiles are born with each published generation, takes the same saves
+ * and reads back the same. */
+static ray_t* sym_set_table(int n, const char* extra) {
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W64, n + 1);
+    if (RAY_IS_ERR(col)) return NULL;
+    char nm[48];
+    for (int i = 0; i < n; i++) {
+        int l = snprintf(nm, sizeof nm, "appset_%d", i);
+        ((int64_t*)ray_data(col))[i] = ray_sym_intern(nm, (size_t)l);
+    }
+    col->len = n;
+    if (extra) {
+        ((int64_t*)ray_data(col))[n] = ray_sym_intern(extra, strlen(extra));
+        col->len = n + 1;
+    }
+    ray_t* t = ray_table_add_col(ray_table_new(1), ray_sym_intern("s", 1), col);
+    ray_release(col);
+    return t;
+}
+static bool sym_set_reads_back(const char* dir, const char* sym, int n, const char* last) {
+    ray_t* l = ray_read_splayed(dir, sym);
+    if (RAY_IS_ERR(l)) return false;
+    ray_t* lc = ray_table_get_col_idx(l, 0);
+    bool ok = lc && lc->type == RAY_SYM && lc->len == n + 1;
+    ray_t* e = ok ? ray_sym_vec_cell(lc, n) : NULL;
+    ray_t* m = ok ? ray_sym_vec_cell(lc, 777) : NULL;
+    ok = ok && e && m && ray_str_len(e) == strlen(last) && !memcmp(ray_str_ptr(e), last, strlen(last)) &&
+         ray_str_len(m) == 10 && !memcmp(ray_str_ptr(m), "appset_777", 10);
+    ray_release(l);
+    return ok;
+}
+static test_result_t test_save_symfile_appends(void) {
+    enum { N = 20000 };
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE_LIT "/symapp_sh");
+    char sym[512], lk[520];
+    snprintf(sym, sizeof sym, "%s/.sym", dir);
+    snprintf(lk, sizeof lk, "%s.lk", sym);
+    rm_rf(dir);
+    ray_t* t0 = sym_set_table(N, NULL);
+    ray_t* t1 = sym_set_table(N, "appset_new");
+    ray_t* t2 = sym_set_table(N, "appset_newer");
+    TEST_ASSERT_TRUE(t0 && t1 && t2);
+    TEST_ASSERT_EQ_I(ray_splay_save(t0, dir, sym), RAY_OK);
+    struct stat s0, s1, s2;
+    TEST_ASSERT_EQ_I(stat(sym, &s0), 0);
+    TEST_ASSERT_EQ_I(symfile_count(sym), N + 1);
+    FILE* f = fopen(sym, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t* before = (uint8_t*)ray_sys_alloc((size_t)s0.st_size);
+    TEST_ASSERT_NOT_NULL(before);
+    TEST_ASSERT_EQ_I(fread(before, 1, (size_t)s0.st_size, f), (size_t)s0.st_size);
+    fclose(f);
+
+    /* no new symbol: the file is not written */
+    TEST_ASSERT_EQ_I(chmod(sym, 0444), 0);
+    TEST_ASSERT_EQ_I(ray_splay_save(t0, dir, sym), RAY_OK);
+    TEST_ASSERT_EQ_I(chmod(sym, 0644), 0);
+    TEST_ASSERT_EQ_I(stat(sym, &s1), 0);
+    TEST_ASSERT_TRUE(s0.st_ino == s1.st_ino);
+    TEST_ASSERT_EQ_I(s0.st_size, s1.st_size);
+
+    /* one new symbol: appended */
+    TEST_ASSERT_EQ_I(ray_splay_save(t1, dir, sym), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(sym, &s2), 0);
+    TEST_ASSERT_TRUE(s0.st_ino == s2.st_ino);
+    TEST_ASSERT_EQ_I((long)s2.st_size, (long)s0.st_size + 4 + 10);
+    TEST_ASSERT_EQ_I(symfile_count(sym), N + 2);
+    uint8_t* after = (uint8_t*)ray_sys_alloc((size_t)s2.st_size);
+    TEST_ASSERT_NOT_NULL(after);
+    f = fopen(sym, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(fread(after, 1, (size_t)s2.st_size, f), (size_t)s2.st_size);
+    fclose(f);
+    TEST_ASSERT_EQ_I(memcmp(before + 12, after + 12, (size_t)s0.st_size - 12), 0);
+    ray_sys_free(before); ray_sys_free(after);
+    TEST_ASSERT_TRUE(sym_set_reads_back(dir, sym, N, "appset_new"));
+
+    /* a torn append's tail, then another new symbol */
+    f = fopen(sym, "ab");
+    TEST_ASSERT_NOT_NULL(f);
+    const uint8_t junk[] = { 4,0,0,0,'j','u','n','k', 7,0,0,0,'x' };
+    TEST_ASSERT_EQ_I(fwrite(junk, 1, sizeof junk, f), sizeof junk);
+    fclose(f);
+    TEST_ASSERT_EQ_I(ray_splay_save(t2, dir, sym), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(sym, &s1), 0);
+    TEST_ASSERT_EQ_I((long)s1.st_size, (long)s2.st_size + 4 + 12);
+    TEST_ASSERT_EQ_I(symfile_count(sym), N + 3);
+    TEST_ASSERT_TRUE(sym_set_reads_back(dir, sym, N, "appset_newer"));
+    rm_rf(dir);
+    unlink(lk);
+
+    /* per-column symfiles: the same saves, the same reads */
+    dir = ray_test_tmp(TMP_SPLAY_BASE_LIT "/symapp_col");
+    rm_rf(dir);
+    ray_t* ts[3] = { t0, t1, t2 };
+    const char* last[3] = { "appset_1", "appset_new", "appset_newer" };
+    for (int k = 0; k < 3; k++) {
+        TEST_ASSERT_EQ_I(ray_splay_save_layout(ts[k], dir, sym, RAY_COMPRESS_OFF,
+                                               RAY_SYMFILE_COLUMN, true, true), RAY_OK);
+        if (k) TEST_ASSERT_TRUE(sym_set_reads_back(dir, NULL, N, last[k]));
+    }
+    ray_release(t0); ray_release(t1); ray_release(t2);
+    rm_rf(dir);
+    PASS();
+}
+
 const test_entry_t splay_entries[] = {
 #ifndef _WIN32
     { "splay/generation_prune_unlinks_symlink", test_generation_prune_unlinks_symlink, splay_setup, splay_teardown },
@@ -3518,5 +3629,6 @@ const test_entry_t splay_entries[] = {
     { "splay/csv_quote_mode_per_file",    test_csv_splayed_quote_mode_per_file, splay_setup, splay_teardown },
     { "splay/save_hash_in_place",         test_save_hash_in_place,              splay_setup, splay_teardown },
     { "splay/per_column_symfiles",        test_per_column_symfiles,             splay_setup, splay_teardown },
+    { "splay/save_symfile_appends",       test_save_symfile_appends,            splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };
