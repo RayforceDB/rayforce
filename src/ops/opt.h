@@ -36,5 +36,9 @@ ray_op_ext_t*  find_ext(ray_graph_t* g, uint32_t node_id);
  * opt.c); false when the comparison cannot prune. */
 bool           ray_part_prune_mask(ray_t* key_values, uint16_t cmp_op,
                                    bool swapped, ray_t* lit, uint64_t* mask);
+/* The same for a comparison against the table's bound column (every row of
+ * partition k has it in [k, next key)). */
+bool           ray_part_prune_bound_mask(ray_t* key_values, uint16_t cmp_op,
+                                         bool swapped, ray_t* lit, uint64_t* mask);
 
 #endif /* RAY_OPT_H */

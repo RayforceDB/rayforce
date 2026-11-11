@@ -2187,6 +2187,111 @@ bool ray_part_prune_mask(ray_t* key_values, uint16_t cmp_op, bool swapped,
     return true;
 }
 
+/* Partition key p of a DATE/I32/TIME (4-byte) or 8-byte key vector. */
+static int64_t part_key_at(ray_t* key_values, int64_t p) {
+    if (key_values->type == RAY_DATE || key_values->type == RAY_I32 || key_values->type == RAY_TIME) {
+        int32_t v32;
+        memcpy(&v32, (char*)ray_data(key_values) + p * sizeof(int32_t), sizeof(int32_t));
+        return v32;
+    }
+    int64_t v;
+    memcpy(&v, (char*)ray_data(key_values) + p * sizeof(int64_t), sizeof(int64_t));
+    return v;
+}
+
+/* Literal value `v` of type `lt` in the units of key type `kt`, rounded
+ * down (or up when `up`) as graph.c does for mixed temporal units; false
+ * when the types are not comparable (temporal against integer). */
+static bool bound_lit_in_key_units(int64_t v, int8_t lt, int8_t kt, bool up, int64_t* out) {
+    bool lt_tmp = lt == RAY_DATE || lt == RAY_TIME || lt == RAY_TIMESTAMP;
+    bool kt_tmp = kt == RAY_DATE || kt == RAY_TIME || kt == RAY_TIMESTAMP;
+    if (lt_tmp != kt_tmp) return false;
+    if (!lt_tmp) { *out = v; return true; }
+    int64_t lu = lt == RAY_DATE ? 86400000000000LL : lt == RAY_TIME ? 1000000LL : 1;
+    int64_t ku = kt == RAY_DATE ? 86400000000000LL : kt == RAY_TIME ? 1000000LL : 1;
+    int64_t ns;
+    if (__builtin_mul_overflow(v, lu, &ns)) ns = v < 0 ? INT64_MIN + 1 : INT64_MAX;   /* saturate */
+    int64_t q = ns / ku, r = ns % ku;
+    if (r != 0 && (up ? r > 0 : r < 0)) q += up ? 1 : -1;
+    *out = q;
+    return true;
+}
+
+/* Index of the greatest key <= q, or 0 when q is below every key. */
+static int64_t bound_floor_key(ray_t* key_values, int64_t q) {
+    int64_t i = 0;
+    for (int64_t p = 0; p < key_values->len; p++)
+        if (part_key_at(key_values, p) <= q) i = p;
+    return i;
+}
+
+/* Partitions that can hold a row with `bound cmp_op lit` (`lit cmp_op
+ * bound` when swapped) set their bit in `mask`, given that every row of
+ * partition k has bound in [k, next key) and the last partition is
+ * unbounded above:
+ *   bound >= t, bound > t  →  key >= floor_key(t)
+ *   bound <= t             →  key <= t
+ *   bound <  t             →  key <  t
+ *   bound == t             →  key == floor_key(t)
+ *   bound in S             →  key in {floor_key(s) : s in S}
+ * where floor_key(t) is the greatest key <= t, or the first key when none
+ * is.  False when the comparison cannot prune (!=, not in, a type-class
+ * mismatch or an unsupported literal). */
+bool ray_part_prune_bound_mask(ray_t* key_values, uint16_t cmp_op, bool swapped,
+                               ray_t* lit, uint64_t* mask) {
+    int8_t kt = key_values->type;
+    int8_t lt = lit->type < 0 ? (int8_t)(-lit->type) : lit->type;
+    if (kt == RAY_SYM || lt == RAY_SYM) return false;
+    bool narrow32 = (lt == RAY_I32 || lt == RAY_DATE || lt == RAY_TIME);
+    bool wide64   = (lt == RAY_I64 || lt == RAY_TIMESTAMP);
+    if (!narrow32 && !wide64) return false;
+    if (cmp_op == OP_NE || cmp_op == OP_NOT_IN) return false;
+    if (swapped) {
+        if (cmp_op == OP_IN) return false;
+        if (cmp_op == OP_LT) cmp_op = OP_GT;
+        else if (cmp_op == OP_GT) cmp_op = OP_LT;
+        else if (cmp_op == OP_LE) cmp_op = OP_GE;
+        else if (cmp_op == OP_GE) cmp_op = OP_LE;
+    }
+    int64_t n_parts = key_values->len;
+    if (cmp_op == OP_IN) {
+        if (lit->type <= 0) return false;
+        bool has_nulls = ray_vec_may_have_nulls(lit);
+        for (int64_t i = 0; i < lit->len; i++) {
+            if (has_nulls && ray_vec_is_null(lit, i)) continue;
+            int64_t v, q;
+            if (narrow32) { int32_t v32; memcpy(&v32, (char*)ray_data(lit) + i * 4, 4); v = v32; }
+            else memcpy(&v, (char*)ray_data(lit) + i * 8, 8);
+            if (!bound_lit_in_key_units(v, lt, kt, false, &q)) return false;
+            int64_t p = bound_floor_key(key_values, q);
+            mask[p / 64] |= (1ULL << (p % 64));
+        }
+        return true;
+    }
+    int64_t v;
+    if (lit->type < 0) {
+        if (RAY_ATOM_IS_NULL(lit)) return false;
+        v = narrow32 ? lit->i32 : lit->i64;
+    } else if (lit->len == 1) {
+        if (narrow32) { int32_t v32; memcpy(&v32, ray_data(lit), 4); v = v32; }
+        else memcpy(&v, ray_data(lit), 8);
+    } else return false;
+    int64_t q;
+    if (!bound_lit_in_key_units(v, lt, kt, cmp_op == OP_LT, &q)) return false;
+    if (cmp_op == OP_LT || cmp_op == OP_LE) {
+        for (int64_t p = 0; p < n_parts; p++) {
+            int64_t k = part_key_at(key_values, p);
+            if (cmp_op == OP_LT ? k < q : k <= q) mask[p / 64] |= (1ULL << (p % 64));
+        }
+        return true;
+    }
+    int64_t f = bound_floor_key(key_values, q);
+    if (cmp_op == OP_EQ) { mask[f / 64] |= (1ULL << (f % 64)); return true; }
+    if (cmp_op != OP_GT && cmp_op != OP_GE) return false;
+    for (int64_t p = f; p < n_parts; p++) mask[p / 64] |= (1ULL << (p % 64));
+    return true;
+}
+
 static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
     if (!g || !root) return;
     (void)root;
@@ -2218,7 +2323,9 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             scan_node = rhs; const_node = lhs; swapped = true;
         } else continue;
 
-        if (scan_node->out_type != RAY_MAPCOMMON) continue;
+        /* A scan of a data column (its base type: scan_out_type) prunes only
+         * as the table's bound column. */
+        bool on_bound = scan_node->out_type != RAY_MAPCOMMON;
 
         ray_op_ext_t* scan_ext = find_ext(g, scan_node->id);
         if (!scan_ext) continue;
@@ -2234,10 +2341,20 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         if (!tbl) continue;
 
         ray_col_meta_t mm;
-        if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
-        ray_t* mc_col = ray_table_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
-        if (!mc_col) continue;
-        if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
+        ray_t* mc_col = NULL;
+        if (on_bound) {
+            for (int64_t c = 0; c < ray_table_ncols(tbl) && !mc_col; c++) {
+                if (!ray_table_col_meta_idx(tbl, c, &mm) || mm.type != RAY_MAPCOMMON) continue;
+                ray_t* col = ray_table_col_idx(tbl, c);     /* MAPCOMMON: plain slot, no decode */
+                if (col && !RAY_IS_ERR(col) && ray_mapcommon_bound(col) == scan_ext->sym) mc_col = col;
+            }
+            if (!mc_col) continue;
+        } else {
+            if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
+            mc_col = ray_table_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
+            if (!mc_col) continue;
+            if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
+        }
 
         /* Extract constant value */
         ray_op_ext_t* const_ext = find_ext(g, const_node->id);
@@ -2256,7 +2373,8 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         uint32_t n_words = (uint32_t)((n_parts + 63) / 64);
         uint64_t* mask = (uint64_t*)ray_calloc_raw(n_words * sizeof(uint64_t));
         if (!mask) continue;
-        if (!ray_part_prune_mask(key_values, cmp_op, swapped, lit, mask)) {
+        if (!(on_bound ? ray_part_prune_bound_mask(key_values, cmp_op, swapped, lit, mask)
+                       : ray_part_prune_mask(key_values, cmp_op, swapped, lit, mask))) {
             ray_free_raw(mask);
             continue;
         }
@@ -2269,7 +2387,6 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         for (uint32_t s = 0; s < g->node_count; s++) {
             ray_op_t* sn = &g->nodes[s];
             if (sn->flags & OP_FLAG_DEAD || sn->opcode != OP_SCAN) continue;
-            if (sn == scan_node) continue;
 
             ray_op_ext_t* sn_ext = find_ext(g, sn->id);
             if (!sn_ext) continue;

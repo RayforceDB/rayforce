@@ -1476,6 +1476,9 @@ uint64_t ray_exec_test_in_single_within(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: selects whose parted source was pruned before fetch,
+ * and the partitions they dropped, since process start. */
+void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);
 /* query.c test hook: rows of data[0, n) of `type` (BOOL, U8, I16, I32,
  * I64, DATE, TIME, TIMESTAMP) for which `x op rhs` holds, op 1..6 = == !=
  * < <= > >=; ref: through the reference widening compare instead of the

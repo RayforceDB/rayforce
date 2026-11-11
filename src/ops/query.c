@@ -16698,26 +16698,42 @@ static bool prune_is_and(ray_t* head) {
     return op && ray_str_len(op) == 3 && memcmp(ray_str_ptr(op), "and", 3) == 0;
 }
 
+/* The column an unquoted name in a where names, or -1. */
+static int64_t prune_col_name(ray_t* x) {
+    return x && x->type == -RAY_SYM && !(x->attrs & ATTR_QUOTED) ? x->i64 : -1;
+}
+
 /* AND into `acc` the partitions the where expression `e` can pass, for
  * every recognised comparison of the key column `key_id` (values `kv`)
- * with a literal of the key's exact type; anything else keeps every
- * partition.  `tmp` is scratch of the same width. */
-static void prune_where_mask(ray_t* e, int64_t key_id, ray_t* kv,
+ * with a literal of the key's exact type, or of the bound column
+ * `bound_id` (-1: none) with a literal (ray_part_prune_bound_mask);
+ * anything else keeps every partition.  `tmp` is scratch of the same
+ * width. */
+static void prune_where_mask(ray_t* e, int64_t key_id, int64_t bound_id, ray_t* kv,
                              uint64_t* acc, uint64_t* tmp, int64_t n_words) {
     if (!e || e->type != RAY_LIST || ray_len(e) < 2) return;
     ray_t** x = (ray_t**)ray_data(e);
     int64_t n = ray_len(e);
     if (prune_is_and(x[0])) {
         for (int64_t i = 1; i < n; i++)
-            prune_where_mask(x[i], key_id, kv, acc, tmp, n_words);
+            prune_where_mask(x[i], key_id, bound_id, kv, acc, tmp, n_words);
         return;
     }
     uint16_t op = prune_cmp_op(x[0]);
     if (!op || n != 3) return;
     ray_t* l = x[1];
     ray_t* r = x[2];
-    bool l_key = l && l->type == -RAY_SYM && !(l->attrs & ATTR_QUOTED) && l->i64 == key_id;
-    bool r_key = r && r->type == -RAY_SYM && !(r->attrs & ATTR_QUOTED) && r->i64 == key_id;
+    int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
+    bool l_key = l_col == key_id, r_key = r_col == key_id;
+    if (bound_id >= 0 && l_key == r_key && (l_col == bound_id) != (r_col == bound_id)) {
+        bool r_bound = r_col == bound_id;
+        ray_t* lit = r_bound ? l : r;
+        if (!lit || lit->type == -RAY_SYM || lit->type == RAY_LIST) return;   /* a name or an expression */
+        memset(tmp, 0, (size_t)n_words * sizeof(uint64_t));
+        if (!ray_part_prune_bound_mask(kv, op, r_bound, lit, tmp)) return;
+        for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
+        return;
+    }
     if (l_key == r_key) return;
     ray_t* lit = l_key ? r : l;
     if (!lit) return;
@@ -16772,6 +16788,18 @@ static ray_t* prune_stand_in_seg(ray_t* seg) {
     return v;
 }
 
+/* The stand-in row of the bound column `v` holds partition p's key in the
+ * column's units (the key's type, a TIMESTAMP over a DATE key, or I64), so
+ * it fails every bound predicate the partition's rows failed. */
+static void prune_stand_in_bound(ray_t* v, ray_t* kv, int64_t p) {
+    int64_t k = kv->type == RAY_DATE ? ((int32_t*)ray_data(kv))[p] : ((int64_t*)ray_data(kv))[p];
+    if (v->type == RAY_DATE) { ((int32_t*)ray_data(v))[0] = (int32_t)k; return; }
+    if (v->type == RAY_TIMESTAMP && kv->type == RAY_DATE &&
+        __builtin_mul_overflow(k, 86400000000000LL, &k))
+        k = k < 0 ? INT64_MIN + 1 : INT64_MAX;                     /* saturate */
+    ((int64_t*)ray_data(v))[0] = k;
+}
+
 /* Segment p of parted column c without a decode (NULL: a ragged gap). */
 static ray_t* prune_seg(ray_t* tbl, int64_t c, int64_t p) {
     ray_t* enc = ray_table_get_col_enc_idx(tbl, c);
@@ -16786,9 +16814,12 @@ static ray_t* prune_seg(ray_t* tbl, int64_t c, int64_t p) {
  * Kept segments are retained, never decoded (an encoded column stays
  * encoded). */
 static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n_parts,
-                                     int64_t n_keep, int64_t stand) {
+                                     int64_t n_keep, int64_t stand, int64_t key_col) {
     int64_t n_out = n_keep + 1;
     int64_t ncols = ray_table_ncols(tbl);
+    ray_t* key_mc = ray_table_col_idx(tbl, key_col);            /* MAPCOMMON: plain */
+    ray_t* key_kv = ((ray_t**)ray_data(key_mc))[0];
+    int64_t bound_id = ray_mapcommon_bound(key_mc);
     ray_t* out = ray_table_new(ncols);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     for (int64_t c = 0; c < ncols; c++) {
@@ -16856,6 +16887,7 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
                         ray_release(nw); ray_release(out);
                         return seg ? seg : ray_error("oom", NULL);
                     }
+                    if (name == bound_id) prune_stand_in_bound(seg, key_kv, p);
                 }
                 any_enc |= seg && seg->type == RAY_ENCCOL;
                 segs[nw->len++] = seg;
@@ -16960,6 +16992,14 @@ static bool prune_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     return true;
 }
 
+/* Counts the selects whose source was pruned, and the partitions they
+ * dropped, since process start (test hook). */
+static _Atomic(uint64_t) g_part_prune_runs, g_part_prune_parts;
+void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts) {
+    *runs = atomic_load_explicit(&g_part_prune_runs, memory_order_relaxed);
+    *pruned_parts = atomic_load_explicit(&g_part_prune_parts, memory_order_relaxed);
+}
+
 /* The pruned source for the select `dict` (where: `where`) over the parted
  * table `tbl`; NULL when tbl is not a whole parted table (one MAPCOMMON key,
  * every other column parted over the same partitions), the shape may read
@@ -16970,6 +17010,7 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     int64_t ncols = ray_table_ncols(tbl);
     int64_t key_id = -1;
     int64_t key_col = -1;
+    int64_t bound_id = -1;
     ray_t* kv = NULL;
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
@@ -16983,9 +17024,11 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
         kv = mp[0];
         key_id = ray_table_col_name(tbl, c);
         key_col = c;
+        bound_id = ray_mapcommon_bound(mc);
     }
     if (!kv || kv->len <= 0) return NULL;
     if (ray_env_has_lexical_local(key_id)) return NULL;          /* a formal shadows the key */
+    if (bound_id >= 0 && ray_env_has_lexical_local(bound_id)) bound_id = -1;
     /* the widths ray_part_prune_mask reads: 4-byte DATE/I32/TIME keys, 8 otherwise */
     bool narrow = kv->type == RAY_DATE || kv->type == RAY_I32 || kv->type == RAY_TIME;
     if (ray_sym_elem_size(kv->type, kv->attrs) != (narrow ? 4 : 8)) return NULL;
@@ -17002,7 +17045,7 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     if (!acc) return NULL;                                       /* no pruning: the full source is correct */
     uint64_t* tmp = acc + n_words;
     for (int64_t w = 0; w < n_words; w++) acc[w] = ~0ULL;
-    prune_where_mask(where, key_id, kv, acc, tmp, n_words);
+    prune_where_mask(where, key_id, bound_id, kv, acc, tmp, n_words);
     int64_t n_keep = 0;
     int64_t stand = -1;                                          /* the first pruned partition */
     for (int64_t p = 0; p < n_parts; p++) {
@@ -17022,8 +17065,12 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     }
     ray_t* out = NULL;
     if (ok && n_keep < n_parts && stand >= 0 && prune_shape_ok(dict, tbl, where))
-        out = parted_keep_partitions(tbl, acc, n_parts, n_keep, stand);
+        out = parted_keep_partitions(tbl, acc, n_parts, n_keep, stand, key_col);
     ray_free_raw(acc);
+    if (out && !RAY_IS_ERR(out)) {
+        atomic_fetch_add_explicit(&g_part_prune_runs, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_part_prune_parts, (uint64_t)(n_parts - n_keep), memory_order_relaxed);
+    }
     return out;
 }
 
@@ -27640,7 +27687,7 @@ static ray_t* build_parted_mapcommon(parted_insert_view_t* v,
     mc->type = RAY_MAPCOMMON;
     mc->len = 2;
     mc->attrs = v->mapcommon->attrs;
-    memset(mc->aux, 0, 16);
+    memcpy(mc->aux, v->mapcommon->aux, 16);   /* keeps the bound column */
     ((ray_t**)ray_data(mc))[0] = keys;   /* transfer ownership */
     ((ray_t**)ray_data(mc))[1] = counts;   /* not-a-table */
     return mc;
