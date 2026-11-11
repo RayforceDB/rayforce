@@ -73,8 +73,22 @@ static bool is_date_dir(const char* name) {
     return strlen(name) == 10 && is_date_text(name);
 }
 
-/* Validate YYYY.MM.DD.HH.MM.SS: exactly 19 chars, a real calendar date and
- * a time of day.  Fixed width, so string order is chronological. */
+static int32_t parse_date_dir(const char* name);
+
+/* Parse "YYYY.MM.DD.HH.MM.SS" → nanoseconds since 2000-01-01; false when
+ * the value does not fit int64 (years outside about 1708-2292). */
+static bool parse_ts_dir(const char* name, int64_t* out) {
+    int64_t secs = ((name[11]-'0')*10 + (name[12]-'0')) * 3600
+                 + ((name[14]-'0')*10 + (name[15]-'0')) * 60
+                 +  (name[17]-'0')*10 + (name[18]-'0');
+    int64_t v;
+    return !__builtin_add_overflow((int64_t)parse_date_dir(name) * 86400, secs, &v) &&
+           !__builtin_mul_overflow(v, 1000000000LL, out);
+}
+
+/* Validate YYYY.MM.DD.HH.MM.SS: exactly 19 chars, a real calendar date, a
+ * time of day and a value that fits a TIMESTAMP.  Fixed width, so string
+ * order is chronological. */
 static bool is_ts_dir(const char* name) {
     if (strlen(name) != 19) return false;
     if (name[10] != '.' || name[13] != '.' || name[16] != '.') return false;
@@ -86,7 +100,8 @@ static bool is_ts_dir(const char* name) {
     int hour = (name[11] - '0') * 10 + (name[12] - '0');
     int min  = (name[14] - '0') * 10 + (name[15] - '0');
     int sec  = (name[17] - '0') * 10 + (name[18] - '0');
-    return hour <= 23 && min <= 59 && sec <= 59;
+    int64_t ns;
+    return hour <= 23 && min <= 59 && sec <= 59 && parse_ts_dir(name, &ns);
 }
 
 /* Digit-only name: integer-shaped.  Names get here through the digit/dot
@@ -152,14 +167,6 @@ static int32_t parse_date_dir(const char* name) {
     uint64_t doy = (153 * (m > 2 ? (uint64_t)m-3 : (uint64_t)m+9) + 2)/5 + (uint64_t)d - 1;
     uint64_t doe = yoe*365 + yoe/4 - yoe/100 + doy;
     return (int32_t)(era * 146097 + (int64_t)doe - 719468 - 10957);
-}
-
-/* Parse "YYYY.MM.DD.HH.MM.SS" → nanoseconds since 2000-01-01. */
-static int64_t parse_ts_dir(const char* name) {
-    int64_t secs = ((name[11]-'0')*10 + (name[12]-'0')) * 3600
-                 + ((name[14]-'0')*10 + (name[15]-'0')) * 60
-                 +  (name[17]-'0')*10 + (name[18]-'0');
-    return ((int64_t)parse_date_dir(name) * 86400 + secs) * 1000000000LL;
 }
 
 /* --------------------------------------------------------------------------
@@ -967,7 +974,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         } else if (mc_type == RAY_MC_TIMESTAMP) {
             int64_t* kv_data = (int64_t*)ray_data(key_values);
             for (int64_t p = 0; p < part_count; p++) {
-                kv_data[p] = parse_ts_dir(part_dirs[p]);
+                parse_ts_dir(part_dirs[p], &kv_data[p]);   /* fit checked by is_ts_dir */
                 rc_data[p] = ray_table_nrows(part_tables[p]);
             }
         } else if (mc_type == RAY_MC_I64) {

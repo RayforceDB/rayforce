@@ -64,7 +64,7 @@ Returns a `table` with every column memory-mapped. Generation-0 columns are read
 
 ## `.db.parted.get` { #db-parted-get }
 
-Signature: `(.db.parted.get "db_root" 'tbl_name)` or `(.db.parted.get "db_root" 'tbl_name {bound: 'col})`. The table name **must** be a quoted symbol atom (e.g. `'trades`), not a string. The optional third argument is an options dict; `bound` is the only option (see below).
+Signature: `(.db.parted.get "db_root" 'tbl_name)`. The table name **must** be a quoted symbol atom (e.g. `'trades`), not a string.
 
 Calling it again on the same thread reuses unchanged partitions while the earlier view is still held. The loader checks the resolved generation directory and each schema/column file's device, inode, size, modification time and change time. New or changed partitions are loaded afresh; disappeared partitions are dropped. An earlier view keeps its rows when a writer publishes a replacement generation.
 
@@ -72,10 +72,7 @@ Each thread caches at most 1024 partition tables, evicting the least recently mo
 
 Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
 
-The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; `YYYY.MM.DD.HH.MM.SS` names (a real calendar date and a time of day, seconds precision) give a `timestamp` `part` column, in chronological order; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A set that mixes these forms is a `sym` set. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
-
-!!! note "Compatibility"
-    `YYYY.MM.DD.HH.MM.SS` names used to load as a `sym` `part` column; they now load as `timestamp`, with the literal name recoverable as the timestamp's text. Mixed sets are unchanged.
+The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
 
 ```lisp
 (set dbroot "/tmp/rayforce-parted-db")
@@ -92,22 +89,7 @@ The directory names decide the key type and the partition order. `YYYY.MM.DD` na
 (select {from: trades where: (== date 2024.01.15)})
 ```
 
-Errors: `domain` (arity not 2 or 3, `tbl_name` invalid, or a bad options dict), `type` (root not a string or name not a sym), `name` (sym ID unknown).
-
-### Bound column
-
-`{bound: 'col}` names a data column that respects the partitioning: **every row of the partition with key `k` has `col` in `[k, next key)`, and the last partition is unbounded above.** With it, a `where:` predicate on `col` prunes partitions the way a predicate on the key does — `(> Time 2024.01.16D12:00:00.000)` over a date-partitioned table reads the partition of `2024.01.16` and the later ones only. `>=`, `>`, `<=`, `<`, `==` and `in` prune; `!=` and `not in` do not. A literal of another temporal type is rescaled to the key's units. The row filter still runs over the partitions kept.
-
-The engine trusts the invariant like it trusts the `parted` attribute: a violated invariant can drop rows from a result (rows that live outside their partition's interval), but never adds a row that fails the predicate.
-
-At mount, the column must exist in the table's physical schema and compare with the key: the same type (a `timestamp` column over `YYYY.MM.DD.HH.MM.SS` keys, an `int64` column over integer keys), or a `timestamp` column over `date` keys. Otherwise the mount fails with `domain`, naming the column and the two types. A `sym` key refuses a bound. An unknown option key or a value that is not a column name is `domain`.
-
-```lisp
-;; Time rises within each day's partition, so it bounds the day
-(set trades (.db.parted.get dbroot 'trades {bound: 'Time}))
-;; Only 2024.01.16 and later partitions are read
-(select {from: trades where: (> Time 2024.01.16D12:00:00.000)})
-```
+Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string or name not a sym), `name` (sym ID unknown).
 
 ### In-memory live-tail inserts
 

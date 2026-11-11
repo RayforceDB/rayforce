@@ -286,12 +286,10 @@ ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
     return ray_read_splayed(dir, sym_path);
 }
 
-/* (.db.parted.get "db_root" `table_name), (... {bound: 'col}) -- load
- * partitioned table; bound names the data column whose every row in
- * partition k lies in [k, next key), so predicates on it prune partitions. */
+/* (.db.parted.get "db_root" `table_name) -- load partitioned table */
 ray_t* ray_get_parted_fn(ray_t** args, int64_t n) {
-    if (n != 2 && n != 3)
-        return ray_error("domain", ".db.parted.get expects 2 or 3 arguments, got %lld", (long long)n);
+    if (n != 2)
+        return ray_error("domain", ".db.parted.get expects 2 arguments, got %lld", (long long)n);
 
     char root[1024];
     if (!str_to_cpath(args[0], root, sizeof(root)))
@@ -310,59 +308,7 @@ ray_t* ray_get_parted_fn(ray_t** args, int64_t n) {
     memcpy(name, ray_str_ptr(name_atom), nlen);
     name[nlen] = '\0';
 
-    /* options: bound (a column name) */
-    int64_t bound = -1;
-    if (n == 3) {
-        ray_t* opts = args[2];
-        if (!opts || opts->type != RAY_DICT)
-            return ray_error("domain", ".db.parted.get: argument 3 must be an options dict, got %s",
-                             opts ? ray_type_name(opts->type) : "null");
-        ray_t* okeys = ray_dict_keys(opts);
-        for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
-            ray_t* k = ray_sym_vec_cell(okeys, i);
-            if (!k || ray_str_len(k) != 5 || memcmp(ray_str_ptr(k), "bound", 5) != 0)
-                return ray_error("domain", "unknown option '%.*s' (bound is accepted)",
-                                 k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
-        }
-        ray_t* key = ray_sym(ray_sym_intern("bound", 5));
-        if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
-        ray_t* v = ray_dict_get(opts, key);
-        ray_release(key);
-        if (v && RAY_IS_ERR(v)) return v;
-        if (v) {
-            bool is_name = v->type == -RAY_SYM;
-            if (is_name) bound = v->i64;
-            int8_t vt = v->type;
-            ray_release(v);
-            if (!is_name)
-                return ray_error("domain", "bound must be a column name, got %s", ray_type_name(vt));
-        }
-    }
-
-    ray_t* tbl = ray_read_parted(root, name);
-    if (bound < 0 || !tbl || RAY_IS_ERR(tbl)) return tbl;
-
-    /* The bound column exists and compares with the key: the same type, or
-     * a TIMESTAMP over DATE keys. */
-    ray_t* mc = ray_table_col_idx(tbl, 0);
-    ray_col_meta_t bm;
-    ray_t* bname = ray_sym_str(bound);
-    int bn = bname ? (int)ray_str_len(bname) : 1;
-    const char* bs = bname ? ray_str_ptr(bname) : "?";
-    if (!ray_table_col_meta(tbl, bound, &bm) || !RAY_IS_PARTED(bm.type)) {
-        ray_release(tbl);
-        return ray_error("domain", ".db.parted.get: bound column '%.*s' is not a column of the table", bn, bs);
-    }
-    int8_t kt = ((ray_t**)ray_data(mc))[0]->type;
-    int8_t bt = (int8_t)RAY_PARTED_BASETYPE(bm.type);
-    bool ok = (kt != RAY_SYM && bt == kt) || (kt == RAY_DATE && bt == RAY_TIMESTAMP);
-    if (!ok) {
-        ray_release(tbl);
-        return ray_error("domain", ".db.parted.get: bound column '%.*s' of type %s cannot bound a %s partition key",
-                         bn, bs, ray_type_name(bt), ray_type_name(kt));
-    }
-    ray_mapcommon_set_bound(mc, bound);
-    return tbl;
+    return ray_read_parted(root, name);
 }
 
 /* (.db.parted.tables "db_root") → sym vector of table names available under
