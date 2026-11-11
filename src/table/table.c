@@ -324,6 +324,12 @@ ray_t* ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s) {
 #define PARTED_TEXT_NULLS_KNOWN 0x01
 #define PARTED_TEXT_NULLS_HAS   0x02
 
+void ray_parted_text_nulls_forget(ray_t* wrapper) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+    if (base == RAY_SYM || base == RAY_STR)
+        __atomic_store_n(&wrapper->aux[0], 0, __ATOMIC_RELAXED);
+}
+
 bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     ray_t* c = tbl_slot_by_name(tbl, name_id);
     if (!c) return false;
@@ -334,9 +340,11 @@ bool ray_table_col_has_nulls(ray_t* tbl, int64_t name_id) {
     if (RAY_IS_PARTED(c->type)) {             /* the wrapper carries no flag: ask each segment */
         /* A text wrapper caches its answer in aux[0] (PARTED_TEXT_NULLS_*):
          * the segment scans run once per wrapper, not on every planning
-         * call.  A wrapper is never edited in place (an insert builds a new
-         * one, aux zeroed) and its loaded segments are read-only.  The byte
-         * is written with the same value by any racing caller. */
+         * call.  A rebuilding insert makes a new wrapper, aux zeroed; an
+         * in-place one, the wrapper's only holder, drops the answer with
+         * ray_parted_text_nulls_forget before it appends.  Loaded segments
+         * are read-only.  The byte is written with the same value by any
+         * racing caller. */
         int8_t base = (int8_t)RAY_PARTED_BASETYPE(c->type);
         bool text_base = base == RAY_SYM || base == RAY_STR;
         if (text_base) {

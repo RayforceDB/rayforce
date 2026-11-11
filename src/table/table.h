@@ -89,6 +89,9 @@ ray_t*  ray_table_parted_seg_idx(ray_t* tbl, int64_t idx, int64_t s);
 
 /* Null presence from metadata; never materializes. */
 bool    ray_table_col_has_nulls(ray_t* tbl, int64_t name_id);
+/* A parted SYM/STR wrapper about to have a segment appended to in place:
+ * drop the null presence ray_table_col_has_nulls cached on it. */
+void    ray_parted_text_nulls_forget(ray_t* wrapper);
 
 /* The table's column list for an in-place value write, or NULL when the
  * table is not a table or any slot holds a RAY_ENCCOL (callers then take

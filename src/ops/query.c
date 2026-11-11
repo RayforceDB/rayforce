@@ -27856,6 +27856,7 @@ static ray_t* insert_parted_rows_inplace(ray_t* tbl, parted_insert_view_t* v,
         ray_t* wrapper = slots[c + 1];
         ray_t** slot = &((ray_t**)ray_data(wrapper))[last];
         int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+        ray_parted_text_nulls_forget(wrapper);   /* the appended cells may be null */
         err = append_parted_payload_inplace(slot, base, pv[c], batch);
         if (!err && base != RAY_LIST && base != RAY_SYM)
             finalize_parted_tail_nulls(*slot, old_len);

@@ -107,4 +107,21 @@
 (set R (.db.parted.get root 't))
 (at (select {from: R where: (== date 2026.08.05)}) 's) -- ['aa 'bb 'aa 'bb 'brand-new]
 (at (select {from: R where: (== date 2026.08.05)}) 'x) -- (list "row-9000000" "row-9000001" "row-9000100" "row-9000101" "tail")
+;; ── text nulls appended in place are seen by later queries ───────────────
+;; The planner caches whether a parted SYM/STR column has nulls.  Query N
+;; while s and x have none, append nulls in place, and query again.
+(set N (.db.parted.get root 't))
+(insert 'N 2026.08.05 (mk 2 9000300)) -- 'N
+(count (select {from: N where: (nil? s)})) -- 0
+(count (select {from: N where: (== x "")})) -- 0
+(count (select {from: N where: (< s 'bb)})) -- 6
+(at (select {m: (first (asc s)) from: N}) 'm) -- ['aa]
+(at (select {m: (first (asc x)) from: N}) 'm) -- ["row-0"]
+(insert 'N 2026.08.05 (list [1 2 3] 1.5 [' 'aa '] ["" "n" ""] true 2026.07.07)) -- 'N
+(count (select {from: N where: (nil? s)})) -- 2
+(count (select {from: N where: (== x "")})) -- 2
+(count (select {from: N where: (< s 'bb)})) -- 9
+(nil? (at (select {m: (first (asc s)) from: N}) 'm)) -- [true]
+(at (select {m: (first (asc x)) from: N}) 'm) -- [""]
+(select {c: (count id) from: N by: s where: (== date 2026.08.05)}) -- (table ['s 'c] (list ['aa 'bb 'brand-new '] [4 3 1 2]))
 (.sys.exec "rm -rf /tmp/rfl_pins_inplace") -- 0

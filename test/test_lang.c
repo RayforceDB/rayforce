@@ -5695,6 +5695,70 @@ static test_result_t test_eval_insert_parted_inplace_rollback(void) {
     return result;
 }
 
+/* ---- Test: an in-place parted insert of text nulls is seen by the planner --
+ * ray_table_col_has_nulls caches its answer for a parted SYM/STR column on
+ * the column's wrapper, and the in-place insert keeps that wrapper.  Ask
+ * while the columns have no nulls, append a null symbol and then an empty
+ * string in place, and ask again after each. */
+static test_result_t test_eval_insert_parted_inplace_text_nulls_impl(const char* root) {
+    char day[1024], sym_path[1024], load[1400];
+    int n1 = snprintf(day, sizeof(day), "%s/2024.01.02/trades", root);
+    int n2 = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n1 > 0 && (size_t)n1 < sizeof(day) &&
+                n2 > 0 && (size_t)n2 < sizeof(sym_path), "format fixture paths");
+    TEST_ASSERT(lang_parted_insert_save_table(
+        "(table ['id 'acct 'note] (list [1 2] ['a 'b] [\"one\" \"two\"]))",
+        day, sym_path), "create parted fixture");
+    /* the first insert leaves private heap segments for the next to grow */
+    int n = snprintf(load, sizeof(load),
+                     "(do (set pn (.db.parted.get \"%s\" 'trades)) "
+                     "    (insert 'pn 2024.01.02 (list [3] ['c] [\"three\"])) 0)", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(load), "format load");
+    ASSERT_EQ(load, "0");
+    int64_t pn_id = ray_sym_intern("pn", 2);
+    int64_t acct = ray_sym_intern("acct", 4), note = ray_sym_intern("note", 4);
+    ray_t* bound = ray_env_get(pn_id);               /* borrowed */
+
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+    ASSERT_EQ("(at (select {m: (first (asc acct)) n: (first (asc note)) from: pn}) 'm)", "['a]");
+
+    /* no nulls in the batch: still none */
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [4] ['d] [\"four\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+
+    /* a null symbol only: the STR column stays null-free */
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [5] (take [' 'a] 1) [\"five\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);   /* grown in place */
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [6] ['e] [\"\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, note));
+
+    ASSERT_EQ("(count (select {from: pn where: (nil? acct)}))", "1");
+    ASSERT_EQ("(count (select {from: pn where: (nil? note)}))", "1");
+    ASSERT_EQ("(nil? (at (at (select {m: (first (asc acct)) from: pn}) 'm) 0))", "true");
+    ASSERT_EQ("(at (select {n: (first (asc note)) from: pn}) 'n)", "[\"\"]");
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace_text_nulls(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_tn_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_text_nulls_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
 /* ---- Test: upsert (update existing row) ---- */
 static test_result_t test_eval_upsert(void) {
     /* Upsert by 'name key — row with name=2 exists, update it */
@@ -12437,6 +12501,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/parted_list_column", test_eval_parted_list_column, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_inplace", test_eval_insert_parted_inplace, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_inplace_rollback", test_eval_insert_parted_inplace_rollback, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace_text_nulls", test_eval_insert_parted_inplace_text_nulls, lang_setup, lang_teardown },
     { "lang/eval/upsert", test_eval_upsert, lang_setup, lang_teardown },
     { "lang/eval/upsert_f64_key", test_eval_upsert_f64_key, lang_setup, lang_teardown },
     { "lang/eval/upsert_str_key", test_eval_upsert_str_key, lang_setup, lang_teardown },
