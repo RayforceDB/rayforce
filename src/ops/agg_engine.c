@@ -2751,6 +2751,7 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
         agg_sel_cursor_init(&cur, bc->sel, bc->sel_prefix, o, o + 1);
         if (agg_sel_cursor_next(&cur, &prow[i]) != 1) return false;
     }
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
     agg_want_points(krr, nk, prow, np);   /* the rows' pages, asked for together */
     bool ok = true;
     for (int64_t i = 0; i < np && ok; i++) {
@@ -11834,6 +11835,7 @@ static void agg_firstn_share_fn(void* raw, uint32_t wid, int64_t start, int64_t 
             if ((i - i0) % 512 == 0) {    /* the next rows' pages, asked for together */
                 int64_t wr[512], nw = 0;
                 for (int64_t w = i; w < i1 && nw < 512; w++) wr[nw++] = w * c->step;
+                // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
                 agg_want_points(rr, rr->n_keys, wr, nw);
             }
             for (uint32_t k = 0; k < rr->n_keys && !err; k++) kv[k] = agg_key_at(rr, &cs, k, i * c->step, &err);
@@ -12814,6 +12816,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     int64_t wr[1024];
                     for (int64_t i = 0; i < samples; i++)
                         wr[i] = start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1));
+                    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
                     agg_want_points(&ks->rr, 1, wr, samples);
                 }
                 for (int64_t i = 0; i < samples && !terr; i++) {
