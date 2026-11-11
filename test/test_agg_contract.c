@@ -1960,6 +1960,41 @@ static test_result_t test_count_distinct_typed_routes(void) {
     PASS();
 }
 
+/* Pairs that repeat on neighbouring rows (runs of 4, as in a column
+ * clustered by its key) but never at distant ones: the sample sees the runs
+ * and preaggregates; all-distinct pairs do not.  Counts and first rows are
+ * exact either way. */
+static test_result_t test_count_distinct_adjacent_runs(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    const int64_t n = 262144, nk = 1024;
+    for (int runs = 0; runs < 2; runs++) {
+        ray_t* k = ray_vec_new(RAY_I64, n);
+        ray_t* v = ray_vec_new(RAY_I64, n);
+        TEST_ASSERT_NOT_NULL(k); TEST_ASSERT_NOT_NULL(v);
+        k->len = v->len = n;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t g = runs ? i / 4 : i;
+            ((int64_t*)ray_data(k))[i] = g % nk;
+            ((int64_t*)ray_data(v))[i] = g;
+        }
+        uint64_t before = ray_cd_test_preaggregated();
+        ray_t* result = ray_cd_fused(k, v, n);
+        TEST_ASSERT_FMT(result && !RAY_IS_ERR(result), "count-distinct declined, runs %d", runs);
+        TEST_ASSERT_EQ_I(ray_cd_test_preaggregated() - before, (uint64_t)runs);
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), nk);
+        int64_t* keys = ray_data(ray_table_get_col_idx(result, 0));
+        int64_t* counts = ray_data(ray_table_get_col_idx(result, 1));
+        int64_t* firsts = ray_data(ray_table_get_col_idx(result, 2));
+        for (int64_t i = 0; i < nk; i++) {
+            TEST_ASSERT_EQ_I(keys[i], i);
+            TEST_ASSERT_EQ_I(counts[i], (runs ? n / 4 : n) / nk);
+            TEST_ASSERT_EQ_I(firsts[i], runs ? 4 * i : i);
+        }
+        ray_release(result); ray_release(k); ray_release(v);
+    }
+    PASS();
+}
+
 /* Independent membership/order/reduction oracle for the parallel shared
  * directory and row slices. A dominant null key crosses many reduction tasks. */
 static test_result_t test_wide_count_distinct(void) {
@@ -4895,6 +4930,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },
     { "agg_contract/fused_typed_comparisons", test_fused_typed_comparisons, contract_setup, contract_teardown },
     { "agg_contract/count_distinct_typed_routes", test_count_distinct_typed_routes, contract_setup, contract_teardown },
+    { "agg_contract/count_distinct_adjacent_runs", test_count_distinct_adjacent_runs, contract_setup, contract_teardown },
     { "agg_contract/indexed_parallel_layout", test_indexed_parallel_layout, contract_setup, contract_teardown },
     { "agg_contract/wide_count_distinct", test_wide_count_distinct, contract_setup, contract_teardown },
     { "agg_contract/parallel_wide_consumers", test_parallel_wide_consumers, contract_setup, contract_teardown },
