@@ -767,7 +767,10 @@ static test_result_t test_admission_matrix(void) {
     TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_PART, RAY_STR));
     TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_BLOOM, RAY_STR));
     TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_NONE, RAY_GUID));
-    TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_HASH, RAY_GUID));
+    TEST_ASSERT_TRUE(ray_index_kind_admits(RAY_IDX_HASH, RAY_GUID));
+    TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_SORT, RAY_GUID));
+    TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_BLOOM, RAY_GUID));
+    TEST_ASSERT_FALSE(ray_index_kind_admits(RAY_IDX_PART, RAY_GUID));
     PASS();
 }
 

@@ -23,8 +23,9 @@ The executor consults indexes at five sites.  Each site has a specific consumpti
 | `.idx.hash` / `part` backing | `where key IN …` + `group by key` | Resolve only the requested key slices and aggregate them directly, skipping filter scan and group discovery. Part slices stream as contiguous ranges. |
 | `.idx.sort` | ORDER BY — single ascending key | The pre-built permutation is reused directly rather than re-sorting.  Descending ORDER BY falls back to recompute (reversing the perm would swap tie-group positions relative to stable DESC sort). |
 | `.idx.sort` | `distinct` | Walk the sort permutation once to collect first-occurrence row ids per distinct value — O(n) with no hash table.  SYM/GUID/STR columns fall back. |
-| `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family, `SYM` and `STR` needles against a column of the same family; float and cross-family needles fall through to the scan.  A **vector** of needles probes once per needle — nothing is built per call. |
+| `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family, `SYM`, `STR` and `GUID` needles against a column of the same family; float and cross-family needles fall through to the scan.  A `GUID` index keys every row by its bytes, the null guid included, so a `GUID` column with nulls keeps its index and a null needle finds a null cell, as on the scan.  A **vector** of needles probes once per needle — nothing is built per call. |
 | `.idx.hash` | `in` — `(in needles v)` with `v` indexed, and `(at d keys)` on a dict keyed by an indexed vector | One probe per needle, same type matrix as `find`.  Without an index, `find` / `in` hash whichever side is smaller and scan the other once. |
+| `.idx.hash` | `distinct`, `count` of `distinct` — `GUID` columns | The hash's groups are the distinct guids and each group's first row is that guid's first occurrence: `distinct` gathers them in first-appearance order, `(count (distinct v))` is the group count.  Without an index a `GUID` `distinct` dedups on the 16 bytes (in parallel on large columns). |
 
 ### Eligibility conditions (uniform)
 
@@ -35,7 +36,7 @@ All five sites apply the same prechecks before consulting an index:
 - **Not parted / not MAPCOMMON:** parted and MAPCOMMON columns skip routing at the filter and IN sites.
 - **Default table:** filter and IN sites only route columns from the query's default table (non-default table references are skipped).
 
-Mutation auto-drops the attached index — the in-place mutators (`(insert 'v val)`, `(alter 'v set i val)`) call `ray_index_drop()` before writing, so a mutated column always has `HAS_INDEX` clear afterward.  Reattach explicitly after the write.  The one append that keeps a hash index is `concat` (and `(alter 'v concat vals)`, which rebinds to a `concat` result) when every appended key is new — see [Common Workflows](#common-workflows).
+A write to existing rows (`(alter 'v set i val)`, an `update`) drops the attached index, so the column has `HAS_INDEX` clear afterward; reattach explicitly after the write.  An append keeps a hash index and drops any other kind: `insert` (into a vector or a table's column, in place or not), `concat` and `(alter 'v concat vals)` extend the hash over the appended rows — see [Mutation Drops the Index](#mutation-drops-the-index).
 
 ### Fallback guarantee
 
@@ -94,7 +95,7 @@ Each kind has a one-arg attach builtin.  Attaching is idempotent — if a differ
 
 `(.idx.zone v)   (.idx.hash v)   (.idx.sort v)   (.idx.bloom v)`
 
-Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` **additionally** accepts `RAY_SYM` (keyed on domain ids) and `RAY_STR` (keyed on a 64-bit hash of the bytes, payload compared on every hit).  `RAY_SYM` / `RAY_STR` on the non-hash kinds is deferred to v2.
+Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` **additionally** accepts `RAY_SYM` (keyed on domain ids), `RAY_STR` and `RAY_GUID` (each keyed on a 64-bit hash of the bytes, payload compared on every hit).  `RAY_SYM` / `RAY_STR` / `RAY_GUID` on the non-hash kinds is deferred to v2.
 
 ### Examples
 
@@ -134,7 +135,9 @@ Indexed columns participate in normal operations transparently.  `(sum vh)`, `(a
 
 ### Mutation Drops the Index
 
-The Rayfall in-place mutators — `(insert 'v val)` for append and `(alter 'v set i val)` for set — invalidate the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent `(.idx.has?)` calls return false; reattach the index after the write if you want index routing on the updated column.  `(alter 'v concat val)` rebinds `v` to `(concat v val)`, so a hash index survives it when every appended key is new (see below).
+A write to existing rows — `(alter 'v set i val)` — invalidates the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent `(.idx.has?)` calls return false; reattach the index after the write if you want index routing on the updated column.
+
+An append keeps a **hash** index (any other kind is dropped): `(insert 'v x)` of one value, `(insert 't rows)` on a table's indexed column, their non-quoted forms, `concat` and `(alter 'v concat vals)` extend it over the new rows, probing each once — the old rows are not rehashed.  `(insert 'v vals)` of several values into a plain vector, quoted or not, builds a fresh vector without the index (`(alter 'v concat vals)` appends them and keeps it), and an insert at a position, `(insert 'v i vals)`, is a write that drops it.  A new key becomes a group of its own.  A key the hash already holds is not added to its group (that would re-lay every row): the hash is left first-row-only, `.idx.info` reports `first_only: true`, and it still answers `find`, `in`, a dict lookup and `distinct` — every other consult reads the column, and a save writes a complete hash built from the values.  `.idx.hash` or `.attr.set 'grouped` rebuilds a complete one.  A null appended to a column other than a guid one drops the hash.  An append to a column whose hash is shared (another binding holds it, or it was loaded from a file) copies it once.
 
 ```lisp
 (set v [5 1 9 3 7])
@@ -142,6 +145,13 @@ The Rayfall in-place mutators — `(insert 'v val)` for append and `(alter 'v se
 (.idx.has? vz)              ; ⇒ true
 (alter 'vz set 0 100)
 (.idx.has? vz)              ; ⇒ false
+
+(set t (table [k] (list (.idx.hash [10 20 30]))))
+(insert 't (table [k] (list [40])))
+(.idx.has? (at t 'k))                          ; ⇒ true   — a new key: a group of its own
+(insert 't (table [k] (list [20])))
+(at (.idx.info (at t 'k)) 'first_only)         ; ⇒ true   — a repeat
+(find (at t 'k) [20 40])                       ; ⇒ [1 3]  — still through the hash
 ```
 
 ### Coexistence with Linked Columns
@@ -163,7 +173,7 @@ An accelerator index uses bytes 0–7 of the column's [nullmap union](https://gi
 (set v (.idx.drop v))         ; optional early release; mutators auto-drop
 ```
 
-An append of new keys keeps the hash: `(concat v [7000 7007])` carries the index over (see [Attributes — Conservative Propagation](attributes.md#conservative-propagation)); an appended repeat drops it as before.
+An append keeps the hash: `(concat v [7000 7007])` carries the index over, and so does `(insert 'v 7014)` in place; an appended repeat leaves it first-row-only, still serving `find` and `in` (see [Mutation Drops the Index](#mutation-drops-the-index)).
 
 ### Range scans on a stable column
 
@@ -210,7 +220,7 @@ This design has three useful properties:
 
 ## Caveats and Limits
 
-- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids).  `RAY_STR` — and `RAY_SYM` on the zone/sort/bloom kinds — is not yet supported: the `sym_dict` / `str_pool` pointers in aux bytes 8–15 collide with the index layout and the displacement sweep is pending.
+- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids), `RAY_STR` and `RAY_GUID` (indexing a hash of each row's bytes).  `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the zone/sort/bloom kinds are not yet supported.
 - **One slot per column.**  A column carries at most one index kind at a time.  Calling a different kind's attach replaces the existing one.  Multiple indexes per column are deferred — the slot can point to a list-of-indexes in v2 if real workloads want both eq and range fast paths.
 - **In-memory only.**  Indexes do not persist across `ray_col_save` / `ray_col_load`; users rebuild explicitly after a load.  Unlike the HNSW handle (see [Vector Search](../graph/vector-search.md)), which has dedicated `hnsw-save` / `hnsw-load` builtins for explicit persistence, `.idx.*` has no on-disk format at all — rebuild is the only option.
 - **Float equality not indexed.**  Hash-EQ and hash-IN routes are integer-family only — float equality has NaN / -0 semantics that the unfused compare kernel handles; the index paths intentionally don't replicate that.
