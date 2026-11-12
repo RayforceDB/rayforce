@@ -56,7 +56,7 @@ static const struct {
     { RAY_I16, { RAY_I64, RAY_I64, RAY_F64, RAY_I16, RAY_I16, RAY_I16, RAY_I16, RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_I32, { RAY_I64, RAY_I64, RAY_F64, RAY_I32, RAY_I32, RAY_I32, RAY_I32, RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_I64, { RAY_I64, RAY_I64, RAY_F64, RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
-    { RAY_F32, { RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
+    { RAY_F32, { RAY_I64, RAY_F64, RAY_F64, RAY_F32, RAY_F32, RAY_F32, RAY_F32, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_F64, { RAY_I64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_F64, RAY_BOOL, RAY_BOOL, RAY_F64 } },
     { RAY_DATE, { RAY_I64, 0, RAY_F64, RAY_DATE, RAY_DATE, RAY_DATE, RAY_DATE, 0, RAY_F64, RAY_F64, RAY_F64, RAY_F64, 0, 0, RAY_F64 } },
     { RAY_TIME, { RAY_I64, RAY_TIME, RAY_F64, RAY_TIME, RAY_TIME, RAY_TIME, RAY_TIME, 0, RAY_F64, RAY_F64, RAY_F64, RAY_F64, 0, 0, RAY_F64 } },
@@ -150,6 +150,124 @@ static test_result_t test_unary_contracts(void) {
             }
             ray_release(got);
         }
+    }
+    PASS();
+}
+
+/* F32 extrema keep their width through every grouped execution family, not
+ * only the default v2 route.  Routes 1 and 2 force the legacy direct-array
+ * and hash/radix ladders used by mapped, selected, and fallback queries. */
+static test_result_t test_f32_extrema_routes(void) {
+    ray_t* init = ray_eval_str(
+        "(set f32rt (table [g x] (list [0 0 1 1] (as 'F32 [2.5 0Nf -3.5 4.5]))))");
+    TEST_ASSERT_NOT_NULL(init); TEST_ASSERT_FALSE(RAY_IS_ERR(init)); ray_release(init);
+    const float expected[][2] = {{2.5f, -3.5f}, {2.5f, 4.5f},
+                                 {2.5f, -3.5f}, {2.5f, 4.5f}};
+    for (int route = 0; route <= 2; route++) {
+        ray_group_test_route(route);
+        ray_t* got = ray_eval_str(
+            "(select {mn:(min x) mx:(max x) f:(first x) l:(last x) "
+            "from:f32rt by:g asc:g})");
+        ray_group_test_route(0);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "F32 grouped route %d failed", route);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got), 2);
+        for (int c = 0; c < 4; c++) {
+            ray_t* col = ray_table_get_col_idx(got, c + 1);
+            TEST_ASSERT_FMT(col && col->type == RAY_F32,
+                            "F32 grouped route %d column %d type", route, c);
+            const float* d = ray_data(col);
+            TEST_ASSERT_TRUE(d[0] == expected[c][0] && d[1] == expected[c][1]);
+        }
+        ray_release(got);
+    }
+    PASS();
+}
+
+/* A NaN payload whose HAS_NULLS bit was lost (a producer that skipped the
+ * flag) must not pin an extreme at NaN: the reduction kernel itself skips
+ * it, so no scalar shortcut is needed in front of the DAG. */
+static test_result_t test_f32_extrema_unflagged_nan(void) {
+    const int64_t n = 20000;
+    ray_t* v = ray_vec_new(RAY_F32, n); v->len = n;
+    float* d = ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = (float)((i * 37) % 1000) - 400.0f;
+    d[0] = NAN; d[7] = NAN;
+    TEST_ASSERT_FALSE(v->attrs & RAY_ATTR_HAS_NULLS);
+    ray_env_set(ray_sym_intern("f32unflagged", 12), v);
+    ray_release(v);
+    ray_t* mn = ray_eval_str("(min f32unflagged)");
+    ray_t* mx = ray_eval_str("(max f32unflagged)");
+    TEST_ASSERT_FMT(mn && mn->type == -RAY_F32 && mn->f64 == -400.0, "min: %s", mn ? "wrong value" : "null");
+    TEST_ASSERT_FMT(mx && mx->type == -RAY_F32 && mx->f64 == 599.0, "max: %s", mx ? "wrong value" : "null");
+    ray_release(mn); ray_release(mx);
+    PASS();
+}
+
+/* Same F32 and F64 inputs at a size where route 2 takes the radix finalizer
+ * (radix_phase3_fn) and route 0 the v2 emitters: 400k rows, 100k groups.
+ * Every F32 answer must be an F32 column holding the F64 answer narrowed,
+ * with nulls in the same places.  The last two groups carry an infinite
+ * element: it is the null, never a value clamped to +-3.40e+38. */
+static test_result_t test_f32_extrema_large_routes(void) {
+    const int64_t n = 400000, groups = 100000;
+    ray_t* g = ray_vec_new(RAY_I64, n + 4); g->len = n + 4;
+    ray_t* xf = ray_vec_new(RAY_F32, n + 4); xf->len = n + 4;
+    ray_t* xd = ray_vec_new(RAY_F64, n + 4); xd->len = n + 4;
+    for (int64_t i = 0; i < n; i++) {
+        ((int64_t*)ray_data(g))[i] = (i * 7919) % groups;
+        double v = (double)((i * 31) % 2003) - 1000.0 + 0.25;
+        bool nul = i % 11 == 0;
+        ((float*)ray_data(xf))[i] = nul ? NAN : (float)v;
+        ((double*)ray_data(xd))[i] = nul ? NAN : v;
+        if (nul) { ray_vec_set_null(xf, i, true); ray_vec_set_null(xd, i, true); }
+    }
+    /* group `groups`: {+inf, 2.0}; group `groups + 1`: {-inf, +inf} */
+    const double tail[4] = { INFINITY, 2.0, -INFINITY, INFINITY };
+    for (int k = 0; k < 4; k++) {
+        ((int64_t*)ray_data(g))[n + k] = groups + k / 2;
+        ((float*)ray_data(xf))[n + k] = (float)tail[k];
+        ((double*)ray_data(xd))[n + k] = tail[k];
+    }
+    ray_t* tf = ray_table_new(2);
+    tf = ray_table_add_col(tf, ray_sym_intern("g", 1), g);
+    tf = ray_table_add_col(tf, ray_sym_intern("x", 1), xf);
+    ray_t* td = ray_table_new(2);
+    td = ray_table_add_col(td, ray_sym_intern("g", 1), g);
+    td = ray_table_add_col(td, ray_sym_intern("x", 1), xd);
+    ray_release(g); ray_release(xf); ray_release(xd);
+    ray_env_set(ray_sym_intern("f32big", 6), tf);
+    ray_env_set(ray_sym_intern("f64big", 6), td);
+    ray_release(tf); ray_release(td);
+    static const char* const names[] = { "min", "max", "first", "last" };
+    for (int route = 0; route <= 2; route++) {
+        ray_group_test_route(route);
+        ray_t* got[2];
+        for (int w = 0; w < 2; w++) {
+            ray_t* r = ray_eval_str(w == 0
+                ? "(select {mn:(min x) mx:(max x) f:(first x) l:(last x) from:f32big by:g asc:g})"
+                : "(select {mn:(min x) mx:(max x) f:(first x) l:(last x) from:f64big by:g asc:g})");
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "route %d width %d failed", route, w);
+            got[w] = r;
+        }
+        ray_group_test_route(0);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got[0]), groups + 2);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got[1]), groups + 2);
+        int64_t bad = 0;
+        for (int c = 1; c <= 4; c++) {
+            ray_t* cf = ray_table_get_col_idx(got[0], c);
+            ray_t* cd = ray_table_get_col_idx(got[1], c);
+            TEST_ASSERT_FMT(cf && cf->type == RAY_F32, "route %d %s: type %d", route, names[c - 1], cf ? cf->type : -1);
+            TEST_ASSERT_EQ_I(cd->type, RAY_F64);
+            const float* df = ray_data(cf);
+            const double* dd = ray_data(cd);
+            for (int64_t i = 0; i < cf->len; i++) {
+                bool nf = ray_vec_is_null(cf, i), nd = ray_vec_is_null(cd, i);
+                if (nf != nd || (!nf && (double)df[i] != dd[i])) bad++;
+                if (c <= 2 && !nf && fabsf(df[i]) > 1.0e6f) bad++;   /* min/max: no clamped inf */
+            }
+        }
+        TEST_ASSERT_FMT(bad == 0, "route %d: %lld mismatches against the F64 answers", route, (long long)bad);
+        ray_release(got[0]); ray_release(got[1]);
     }
     PASS();
 }
@@ -969,9 +1087,11 @@ static test_result_t test_dense_strategies(void) {
                     } else {
                         for (int a = 0; a < 2; a++) {
                             ray_t* col = ray_table_get_col_idx(out, a + 1);
-                            TEST_ASSERT_EQ_I(col->type, type == RAY_F32 ? RAY_F64 : type);
+                            TEST_ASSERT_EQ_I(col->type, type);
                             if (floating) {
-                                double got = ((double*)ray_data(col))[row];
+                                double got = type == RAY_F32
+                                    ? ((float*)ray_data(col))[row]
+                                    : ((double*)ray_data(col))[row];
                                 TEST_ASSERT_TRUE(mn[index] == INT64_MAX ? isnan(got) : got == (a ? mx[index] : mn[index]));
                                 continue;
                             }
@@ -1493,7 +1613,7 @@ static test_result_t test_timespan_rank_admission(void) {
     PASS();
 }
 
-/* Native F64 nanoseconds, NULL publication, empty groups, explicit reversed
+/* Median and quantile as durations, NULL publication, empty groups, explicit reversed
  * row indices and an actual offset SLICE (not merely a negative TAKE). */
 static test_result_t test_timespan_rank_slice(void) {
     ray_t* parent = ray_eval_str("(as 'TIMESPAN [123 0Nl 1 2 0Nl -4 -1 0Nl 0Nl 456])");
@@ -1511,10 +1631,12 @@ static test_result_t test_timespan_rank_slice(void) {
                 ? ray_quantile_per_group_buf(slice, indexed ? reversed : identity, offsets, counts, 4, 0.25)
                 : ray_median_per_group_buf(slice, indexed ? reversed : identity, offsets, counts, 4);
             TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "duration rank slice result");
-            TEST_ASSERT_EQ_I(out->type, RAY_F64);
+            /* a median or quantile of durations is a duration, rounded half
+             * away from zero (1.25 -> 1, 1.5 -> 2, -2.5 and -3.25 -> -3) */
+            TEST_ASSERT_EQ_I(out->type, RAY_TIMESPAN);
             TEST_ASSERT_EQ_I(out->len, 4);
-            TEST_ASSERT_EQ_F(((double*)ray_data(out))[0], quantile ? 1.25 : 1.5, 0.0);
-            TEST_ASSERT_EQ_F(((double*)ray_data(out))[1], quantile ? -3.25 : -2.5, 0.0);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[0], quantile ? 1 : 2);
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[1], -3);
             TEST_ASSERT_TRUE(out->attrs & RAY_ATTR_HAS_NULLS);
             TEST_ASSERT_TRUE(ray_vec_is_null(out, 2));
             TEST_ASSERT_TRUE(ray_vec_is_null(out, 3));
@@ -4774,6 +4896,9 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/native_binary_output", test_native_binary_output, contract_setup, contract_teardown },
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
+    { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
+    { "agg_contract/f32_extrema_unflagged_nan", test_f32_extrema_unflagged_nan, contract_setup, contract_teardown },
+    { "agg_contract/f32_extrema_large_routes", test_f32_extrema_large_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },

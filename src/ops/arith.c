@@ -136,7 +136,7 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
                          ray_type_name(a->type), ray_type_name(b->type));
     /* Null propagation */
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return null_for_promoted(a, b);
-    if (both_f32_atoms(a, b)) return ray_f32((float)(as_f64(a) + as_f64(b)));
+    if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(as_f64(a) + as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) + as_f64(b));
     int8_t rt = promote_int_type(a, b);
     /* Wrap on overflow (defined) rather than signed-overflow UB, matching the
@@ -226,7 +226,7 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
     if (is_float_op(a, b)) {
         double r = as_f64(a) - as_f64(b);
         if (r == 0.0) r = 0.0; /* normalize -0.0 to +0.0 */
-        if (both_f32_atoms(a, b)) return ray_f32((float)r);
+        if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(r));
         return make_f64(r);
     }
     int8_t rt = promote_int_type(a, b);
@@ -264,7 +264,7 @@ ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
                          ray_type_name(a->type), ray_type_name(b->type));
     /* Null propagation */
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return null_for_promoted(a, b);
-    if (both_f32_atoms(a, b)) return ray_f32((float)(as_f64(a) * as_f64(b)));
+    if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(as_f64(a) * as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) * as_f64(b));
     int8_t rt = promote_int_type(a, b);
     /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
@@ -375,7 +375,7 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
         double result = av - bv * floor(av / bv);
         /* Snap tiny residual to 0 */
         if (fabs(result) < 1e-12 || fabs(result - fabs(bv)) < 1e-12) result = bv > 0 ? 0.0 : -0.0;
-        if (both_f32_atoms(a, b)) return ray_f32((float)result);
+        if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(result));
         if (b->type == -RAY_F64 || a->type == -RAY_F64 ||
             b->type == -RAY_F32 || a->type == -RAY_F32) return make_f64(result);
         if (b->type == -RAY_I32) return make_i32((int32_t)(int64_t)result);
