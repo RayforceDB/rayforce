@@ -210,6 +210,11 @@ ray_t*    ray_env_get_compiled(int64_t sym_id);
 void      ray_env_mark_eval_window(void);
 ray_err_t ray_env_push_query_scope(void);
 void ray_env_pop_scope(void);
+/* Run code in isolation from the frames now on the stack: until the
+ * matching end it sees only frames pushed after the begin, then the
+ * globals.  Pass the end what the begin returned. */
+int32_t   ray_env_isolate_begin(void);
+void      ray_env_isolate_end(int32_t saved);
 int32_t   ray_env_scope_depth(void);
 /* True when a query scope frame sits at index >= depth: a nested query has
  * bound its own columns since the frame that was at depth-1 was pushed. */

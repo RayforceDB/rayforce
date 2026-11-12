@@ -1014,6 +1014,21 @@ ray_t* ray_query_helper_table(void);
 /* Owned: the source column `sym` names, or its cell during a per-row
  * evaluation; NULL when it names none. */
 ray_t* ray_query_helper_value(int64_t sym);
+/* The evaluation state of the query in progress on this thread.  Suspend
+ * saves and clears it, so code run until the matching resume evaluates as
+ * outside any query (no columns, no literal rule, no helper frames); a
+ * query it runs itself sets and restores its own state as usual. */
+typedef struct {
+    ray_t*  table;
+    ray_t*  source;
+    ray_t*  group_idx;
+    int64_t row;
+    ray_t*  row_tbl;
+    int32_t row_depth;
+    void*   dependencies;
+} ray_query_state_t;
+void ray_query_suspend(ray_query_state_t* saved);
+void ray_query_resume(const ray_query_state_t* saved);
 /* A builtin the planner lowers row by row: its result over a column-derived
  * operand is itself column-derived. */
 bool ray_query_rowwise_builtin(int64_t sym_id);

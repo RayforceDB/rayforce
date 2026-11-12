@@ -1945,8 +1945,10 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             ray_t* gv = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(head->i64)
                                                   : ray_env_get(head->i64);
             /* Not a closure: its captures are not in the planner's scope,
-             * and a captured name would resolve to a column or a global. */
-            if (gv && gv->type == RAY_LAMBDA && !LAMBDA_CLOSURE(gv)) {
+             * and a captured name would resolve to a column or a global.
+             * Not trusted (.sys.trust): restricted code calls one isolated
+             * from the query, so it is always called. */
+            if (gv && gv->type == RAY_LAMBDA && !LAMBDA_CLOSURE(gv) && !LAMBDA_TRUSTED(gv)) {
                 ray_t* formals  = LAMBDA_PARAMS(gv);
                 ray_t* body_lst = LAMBDA_BODY(gv);
                 if (formals && body_lst && body_lst->type == RAY_LIST &&
@@ -2809,6 +2811,10 @@ static bool key_bind_params(ray_t* params, ray_t** args, int64_t nargs, uint8_t 
  * a value: its parameters are unknown values (a call through one is an
  * effect). */
 static bool key_lambda_call_pure(ray_t* lam, ray_t** args, int64_t nargs, int depth, const key_pure_ctx_t* caller) {
+    /* A trusted lambda (.sys.trust) is opaque: called by restricted code,
+     * it runs isolated from the query, so its body does not say what the
+     * call reads.  An effect. */
+    if (LAMBDA_TRUSTED(lam)) return false;
     ray_t* body = LAMBDA_BODY(lam);
     if (!body || body->type != RAY_LIST) return false;
     key_bind_t binds[KEY_PURE_MAX_BIND];
@@ -3311,8 +3317,10 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
         ray_t* fn = ray_env_get(es[0]->i64);
         /* A closure's body reads its captures; inlined, those names would
          * resolve to columns or globals instead.  Never inline one, however
-         * often it has been called (a closure compiles on its second call). */
-        if (fn && fn->type == RAY_LAMBDA && !LAMBDA_CLOSURE(fn)) {
+         * often it has been called (a closure compiles on its second call).
+         * Nor a trusted lambda (.sys.trust), which restricted code calls
+         * isolated from the query. */
+        if (fn && fn->type == RAY_LAMBDA && !LAMBDA_CLOSURE(fn) && !LAMBDA_TRUSTED(fn)) {
             ray_t* bodies = LAMBDA_BODY(fn);
             if (bodies && bodies->type == RAY_LIST && bodies->len == 1) {
                 params = LAMBDA_PARAMS(fn);
@@ -3418,6 +3426,32 @@ static _Thread_local int32_t g_active_query_row_depth = 0;
 ray_t* ray_active_query_table(void) { return g_active_query_table; }
 ray_t* ray_query_helper_table(void) {
     return g_query_source_table ? g_query_source_table : g_active_query_table;
+}
+
+void ray_query_suspend(ray_query_state_t* saved) {
+    *saved = (ray_query_state_t){
+        .table = g_active_query_table, .source = g_query_source_table,
+        .group_idx = g_active_query_group_idx, .row = g_active_query_row,
+        .row_tbl = g_active_query_row_tbl, .row_depth = g_active_query_row_depth,
+        .dependencies = g_query_dependencies,
+    };
+    g_active_query_table = NULL;
+    g_query_source_table = NULL;
+    g_active_query_group_idx = NULL;
+    g_active_query_row = -1;
+    g_active_query_row_tbl = NULL;
+    g_active_query_row_depth = 0;
+    g_query_dependencies = NULL;
+}
+
+void ray_query_resume(const ray_query_state_t* saved) {
+    g_active_query_table = saved->table;
+    g_query_source_table = saved->source;
+    g_active_query_group_idx = saved->group_idx;
+    g_active_query_row = saved->row;
+    g_active_query_row_tbl = saved->row_tbl;
+    g_active_query_row_depth = saved->row_depth;
+    g_query_dependencies = (query_dependency_cache_t*)saved->dependencies;
 }
 
 

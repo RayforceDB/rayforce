@@ -237,11 +237,12 @@ static inline bool fn_is_restricted(ray_t* fn_obj) {
 }
 
 /* A lambda the server marked with .sys.trust, called by restricted code:
- * its body runs with the restriction lifted.  call_lambda_impl lifts it
- * and puts it back around a call it runs to completion in a C frame of
- * its own, so the restriction is back however the body ended (an error,
- * a raise, a return); the VM never pushes such a call as a frame of its
- * own executor. */
+ * its body runs with the restriction lifted, isolated from the caller's
+ * scope frames and query.  call_lambda_impl lifts and isolates it, and
+ * puts both back, around a call it runs to completion in a C frame of its
+ * own, so they are back however the body ended (an error, a raise, a
+ * return); the VM never pushes such a call as a frame of its own
+ * executor. */
 static inline bool lambda_lifts(ray_t* lambda) {
     return LAMBDA_TRUSTED(lambda) && __VM->restricted;
 }
@@ -550,7 +551,8 @@ static ray_t* head_not_callable_error(int8_t type) {
 
 /* (.sys.trust f), (.sys.trust 'name), (.sys.trust ['a 'b]): mark lambdas
  * trusted.  A call to one from restricted code (-U) runs its body, and
- * whatever the body calls, with the restriction lifted (lambda_lifts).
+ * whatever the body calls, with the restriction lifted and isolated from
+ * the caller's scope frames and query (lambda_lifts).
  * The builtin is restricted itself, so only unrestricted code, a boot
  * script, can mark.  The mark lives on the lambda object: ser/de and IPC
  * do not carry it, a closure the body makes does not get it, and a lambda
@@ -3191,10 +3193,20 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
     if (RAY_UNLIKELY(lambda_lifts(lambda))) {
+        /* Isolated as well as lifted: the body sees its arguments, its
+         * captures and the globals, as it would called at the top level.
+         * The caller's locals, eval windows and query stay hidden, so a
+         * restricted caller cannot rebind a name the body reads. */
+        ray_query_state_t query_state;
+        ray_query_suspend(&query_state);
+        int32_t scope_base = ray_env_isolate_begin();
+        bool restricted = __VM->restricted;
         __VM->restricted = false;
-        ray_t* result = call_lambda_impl(lambda, call_args, argc, query, row_args,
-                                         named, out_rows);
-        __VM->restricted = true;
+        ray_t* result = call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
+        __VM->restricted = restricted;
+        ray_env_isolate_end(scope_base);
+        ray_query_resume(&query_state);
+        if (out_rows) *out_rows = -1;   /* computed outside the query */
         return result;
     }
     if (out_rows) *out_rows = -1;

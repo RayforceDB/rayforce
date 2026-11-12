@@ -8368,15 +8368,17 @@ static bool restricted_expr_gives(const char* expr, const char* expected) {
     ray_t* got = eval_restricted_expr(expr);
     ray_t* want = ray_eval_str(expected);
     bool same = false;
-    if (got && want && !RAY_IS_ERR(got) && !RAY_IS_ERR(want)) {
-        ray_t* gs = ray_fmt(got, 0);
+    ray_t* gs = got && !RAY_IS_ERR(got) ? ray_fmt(got, 0) : NULL;
+    if (gs && want && !RAY_IS_ERR(want)) {
         ray_t* ws = ray_fmt(want, 0);
-        same = gs && ws && ray_str_len(gs) == ray_str_len(ws) &&
+        same = ws && ray_str_len(gs) == ray_str_len(ws) &&
                memcmp(ray_str_ptr(gs), ray_str_ptr(ws), ray_str_len(ws)) == 0;
-        if (gs) ray_release(gs);
         if (ws) ray_release(ws);
     }
-    if (!same) fprintf(stderr, "  restricted eval of %s is not %s\n", expr, expected);
+    if (!same)
+        fprintf(stderr, "  restricted eval of %s is %.*s, not %s\n", expr,
+                gs ? (int)ray_str_len(gs) : 5, gs ? ray_str_ptr(gs) : "error", expected);
+    if (gs) ray_release(gs);
     for (int i = 0; i < 2; i++) {
         ray_t* v = i ? want : got;
         if (v && RAY_IS_ERR(v)) ray_error_free(v);
@@ -8452,6 +8454,79 @@ static test_result_t test_eval_restricted_trusted_lambda(void) {
 
     /* Unrestricted, a trusted lambda is an ordinary call. */
     ASSERT_EQ("(__rf787_put 11)", "11");
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
+/* #787: a trusted lambda called by restricted code runs isolated from its
+ * caller.  The names its body reads, and the names read by what it calls,
+ * resolve to its own bindings and the globals: a local, an eval window
+ * or a query column of the caller cannot rebind one, whether the name
+ * holds data, a helper or a builtin.  The caller's bindings are back
+ * after the call. */
+static test_result_t test_eval_restricted_trusted_isolated(void) {
+    ASSERT_EQ("(do (set __rf787_v 1)"
+              "    (set __rf787_h (fn [] 10))"
+              "    (set __rf787_read (fn [] __rf787_v))"
+              "    (set __rf787_callh (fn [] (__rf787_h)))"
+              "    (set __rf787_cnt (fn [] (count [1 2 3])))"
+              "    (set __rf787_via (fn [] (__rf787_read)))"
+              "    (set __rf787_sum (fn [x] (+ x __rf787_v)))"
+              "    (set __rf787_peek (fn [] __rf787_v))"
+              "    (set __rf787_ev (fn [] (eval (parse \"(__rf787_peek)\"))))"
+              "    (set __rf787_vec [1 2])"
+              "    (set __rf787_app (fn [x] (alter '__rf787_vec concat x)))"
+              "    (set __rf787_t (table [a __rf787_v] (list [1 2] [5 6])))"
+              "    (count (.sys.trust ['__rf787_read '__rf787_callh '__rf787_cnt"
+              "                        '__rf787_via '__rf787_sum '__rf787_ev '__rf787_app])))", "7");
+
+    /* A local of the request's top level. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_read))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_h (fn [] 66)) (__rf787_callh))", "10"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let count (fn [x] 66)) (__rf787_cnt))", "3"));
+    /* ... seen by neither a helper the trusted body calls nor a higher-order call. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_via))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (map __rf787_sum [1 2]))", "[2 3]"));
+    /* ... nor through a resolve that compiled code (the untrusted
+     * __rf787_peek) cached under that local. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (__rf787_peek) (__rf787_read))", "1"));
+    /* An eval window, and a closure's frame on its first call. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "((fn [] (eval (parse \"(do (let __rf787_v 99) (__rf787_read))\"))))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(((fn [k] (fn [] (let __rf787_v 99) (__rf787_read))) 0))", "1"));
+    /* A query column: a helper called from a query reads the source
+     * column by free name, unrestricted callers' trusted lambdas included
+     * (the planner calls a trusted lambda, never inlines it); restricted
+     * code's trusted lambda reads the global. */
+    ASSERT_EQ("(at (select {x: (__rf787_via) from: __rf787_t}) 'x)", "[5 6]");
+    ASSERT_EQ("(at (select {x: (__rf787_sum a) from: __rf787_t}) 'x)", "[6 8]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_read) from: __rf787_t}) 'x)", "[1 1]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_via) from: __rf787_t}) 'x)", "[1 1]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_sum a) from: __rf787_t}) 'x)", "[2 3]"));
+    /* What the trusted body calls is no query helper either: text it
+     * evaluates calls __rf787_peek from the tree walker. */
+    ASSERT_EQ("(at (select {x: (__rf787_ev) from: __rf787_t}) 'x)", "[5 6]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_ev) from: __rf787_t}) 'x)", "[1 1]"));
+
+    /* An in-place mutation by name targets the global, not the caller's
+     * local of that name. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_vec [7]) (__rf787_app 3) __rf787_vec)", "[7]"));
+    ASSERT_EQ("__rf787_vec", "[1 2 3]");
+
+    /* The caller's bindings are visible again once the call returns. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (__rf787_read) __rf787_v)", "99"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (+ (__rf787_read) __rf787_v) from: __rf787_t}) 'x)", "[6 7]"));
     TEST_ASSERT_FALSE(ray_eval_get_restricted());
     PASS();
 }
@@ -12769,6 +12844,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
     { "lang/eval/restricted_trusted_lambda", test_eval_restricted_trusted_lambda, lang_setup, lang_teardown },
+    { "lang/eval/restricted_trusted_isolated", test_eval_restricted_trusted_isolated, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

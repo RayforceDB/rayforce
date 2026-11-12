@@ -897,7 +897,8 @@ static test_result_t test_ipc_poll_public_restricted(void) {
  * #787: a -U server whose read verb asks a peer for its half.  The verb is
  * marked with .sys.trust, so a restricted client calling it gets the peer's
  * answer, while the same client opening a connection itself, or calling the
- * unmarked twin of the verb, is refused.
+ * unmarked twin of the verb, is refused.  The verb reads the server's peer
+ * address even when the client binds that name itself.
  */
 static test_result_t test_ipc_restricted_trusted_verb(void) {
     ray_test_server_t peer, srv;
@@ -922,9 +923,10 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
     TEST_ASSERT((h) >= (0), "restricted client h >= 0");
 
     const char* asks[] = { "(__rf787_count)", "(__rf787_count_plain)",
-                           "(.ipc.open __rf787_peer)", "(do (__rf787_count) (set '__rf787_x 1))" };
-    ray_t* got[4];
-    for (int i = 0; i < 4; i++) {
+                           "(.ipc.open __rf787_peer)", "(do (__rf787_count) (set '__rf787_x 1))",
+                           "(do (let __rf787_peer \"127.0.0.1:1\") (__rf787_count))" };
+    ray_t* got[5];
+    for (int i = 0; i < 5; i++) {
         ray_t* msg = ray_str(asks[i], strlen(asks[i]));
         got[i] = ray_ipc_send(h, msg);
         ray_release(msg);
@@ -933,11 +935,13 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
     ray_test_server_stop(&srv);
     ray_test_server_stop(&peer);
 
-    TEST_ASSERT_NOT_NULL(got[0]);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(got[0]));
-    TEST_ASSERT_EQ_I(got[0]->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(got[0]->i64, 3);
-    ray_release(got[0]);
+    for (int i = 0; i < 5; i += 4) {
+        TEST_ASSERT_NOT_NULL(got[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got[i]));
+        TEST_ASSERT_EQ_I(got[i]->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(got[i]->i64, 3);
+        ray_release(got[i]);
+    }
     for (int i = 1; i < 4; i++) {
         TEST_ASSERT_NOT_NULL(got[i]);
         TEST_ASSERT_TRUE(RAY_IS_ERR(got[i]));

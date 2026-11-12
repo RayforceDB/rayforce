@@ -155,7 +155,7 @@ int32_t ray_env_scope_depth(void) { return __VM ? __VM->scope_depth : 0; }
 
 bool ray_env_query_scope_above(int32_t depth) {
     if (!__VM) return false;
-    for (int32_t d = depth < 0 ? 0 : depth; d < __VM->scope_depth; d++)
+    for (int32_t d = depth < __VM->scope_base ? __VM->scope_base : depth; d < __VM->scope_depth; d++)
         if (__VM->scope_stack[d].kind == RAY_SCOPE_QUERY) return true;
     return false;
 }
@@ -191,7 +191,7 @@ static int32_t env_frame_lexical_count(const ray_scope_frame_t* f) {
  * scope; otherwise the nearest window is, and none below it. */
 static ray_t* env_lexical_local_impl(int64_t sym_id, bool in_callee) {
     if (!__VM) return NULL;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
         if (f->lexical) in_callee = true;
@@ -215,7 +215,7 @@ ray_t* ray_env_get_lexical_local_callee(int64_t sym_id) {
 
 int32_t ray_env_lexical_scope_depth(int64_t sym_id) {
     if (!__VM) return -1;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) continue;
         int32_t n = env_frame_lexical_count(f);
@@ -239,7 +239,7 @@ static _Thread_local uint32_t g_query_serial;
 
 uint32_t ray_env_query_serial(void) {
     if (!__VM) return 0;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--)
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--)
         if (__VM->scope_stack[d].kind == RAY_SCOPE_QUERY) return __VM->scope_stack[d].serial;
     return 0;
 }
@@ -256,9 +256,9 @@ static int64_t g_self_sym = -1;
 ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     if (flags_out) *flags_out = NULL;
     if (serial_out) *serial_out = 0;
-    if (!__VM || __VM->scope_depth == 0) return NULL;
+    if (!__VM || __VM->scope_depth <= __VM->scope_base) return NULL;
     int64_t capacity = 0;
-    for (int32_t d = 0; d < __VM->scope_depth; d++)
+    for (int32_t d = __VM->scope_base; d < __VM->scope_depth; d++)
         capacity += __VM->scope_stack[d].count;
     if (capacity == 0) return NULL;
 
@@ -289,7 +289,7 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     /* Top-to-bottom flattening preserves ordinary lexical lookup: the first
      * occurrence of a name is the value visible at closure creation.  `self`
      * is never captured: inside the closure it is the closure itself. */
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++) {
             if (!f->vals[i] || f->keys[i] == g_self_sym) continue;
@@ -419,6 +419,7 @@ ray_err_t ray_env_init(void) {
     for (size_t i = 0; i < sizeof(g_env_slot_filter) / sizeof(g_env_slot_filter[0]); i++)
         atomic_store_explicit(&g_env_slot_filter[i], 0, memory_order_relaxed);
     __VM->scope_depth = 0;
+    __VM->scope_base = 0;
     /* The IPC hook sym IDs are interned lazily on first probe via
      * `ipc_hook_syms_ensure`.  We deliberately do NOT pre-intern here:
      * single-char operator names (`+`, `-`, `*`, …) are registered just
@@ -435,6 +436,7 @@ ray_err_t ray_env_init(void) {
 void ray_env_destroy(void) {
     env_globals_moved();
     /* Pop any remaining scopes */
+    __VM->scope_base = 0;
     while (__VM->scope_depth > 0) ray_env_pop_scope();
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.vals[i]) ray_release(g_env.vals[i]);
@@ -513,7 +515,7 @@ static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee
          * that query's frame belongs to an outer context and is plain data
          * for the inner one. */
         bool outer = false;
-        for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+        for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             if (f->lexical) in_callee = true;
             if (f->eval_window && in_callee) continue;
@@ -540,7 +542,7 @@ static ray_t* env_lookup_flat_impl(int64_t sym_id, uint8_t* rows, bool in_callee
 
 ray_t* ray_env_get_local(int64_t sym_id) {
     if (!__VM) return NULL;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++)
             if (f->keys[i] == sym_id) return f->vals[i];
@@ -635,7 +637,7 @@ ray_t* ray_env_resolve_compiled(int64_t sym_id, uint8_t* rows) {
      * call-frame cases.  Anything else takes the general walk. */
     if (__VM) {
         bool plain = true;
-        for (int32_t d = __VM->scope_depth - 1; d >= 0 && plain; d--) {
+        for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base && plain; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             if (f->kind != RAY_SCOPE_LEXICAL) { plain = false; break; }
             if (f->eval_window) continue;
@@ -734,7 +736,7 @@ RAY_INLINE ray_t* env_walk_path(ray_t* v, const int64_t* segs, int n) {
          * pushed into scope by the select fallback) must not shadow
          * the globally-registered accessor function. */
         ray_t* fn = NULL;
-        for (int32_t d = __VM->scope_depth - 1; d >= 0 && !fn; d--) {
+        for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base && !fn; d--) {
             ray_scope_frame_t* f = &__VM->scope_stack[d];
             for (int32_t k = 0; k < f->count; k++) {
                 if (f->keys[k] == segs[i] && f->vals[k]
@@ -935,7 +937,7 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
 }
 
 ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows) {
-    if (!__VM || ray_sym_is_dotted(sym_id) || __VM->scope_depth <= 0) return ray_env_set_local(sym_id, val);
+    if (!__VM || ray_sym_is_dotted(sym_id) || __VM->scope_depth <= __VM->scope_base) return ray_env_set_local(sym_id, val);
     if (ray_sym_is_reserved(sym_id) && !ray_sym_is_ipc_hook(sym_id)) return RAY_ERR_RESERVED;
     /* Not a frame the restricted request opened (see ray_env_set_local). */
     if (__VM->restricted && __VM->scope_depth <= __VM->restricted_base) return RAY_ERR_ACCESS;
@@ -947,7 +949,7 @@ ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows) {
 int ray_env_binding_rows(int64_t sym_id) {
     if (!__VM) return -1;
     bool outer = false;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++)
             if (f->keys[i] == sym_id) return outer ? 0 : f->rows[i];
@@ -961,7 +963,7 @@ int ray_env_binding_rows(int64_t sym_id) {
  * query frame.  A nested query's own frame ends the helper's reach. */
 bool ray_env_in_query_helper(bool* named) {
     if (!__VM) return false;
-    for (int32_t d = __VM->scope_depth - 1; d >= 0; d--) {
+    for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->kind == RAY_SCOPE_QUERY) return false;
         if (f->kind == RAY_SCOPE_CALL && f->table) {
@@ -1155,7 +1157,7 @@ bool ray_env_dotted_sole(int64_t sym_id, ray_t* leaf) {
 }
 
 static ray_t* lookup_top_frame(int64_t sym_id) {
-    if (__VM->scope_depth <= 0) return NULL;
+    if (__VM->scope_depth <= __VM->scope_base) return NULL;
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
     for (int32_t i = 0; i < f->count; i++) {
         if (f->keys[i] == sym_id) return f->vals[i];
@@ -1207,17 +1209,18 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
 static ray_err_t target_flat(int64_t name, bool via_callee, int32_t* scope, ray_t** value) {
     bool in_callee = false;
     int32_t d = __VM ? __VM->scope_depth - 1 : -1;
+    int32_t base = __VM ? __VM->scope_base : 0;
     if (via_callee) {
         /* Past the frames of the function making the call: down to and
          * including the one that bounds it. */
-        while (d >= 0) {
+        while (d >= base) {
             bool bound = __VM->scope_stack[d].lexical;
             d--;
             if (bound) break;
         }
         in_callee = true;
     }
-    for (; d >= 0; d--) {
+    for (; d >= base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         if (f->lexical) in_callee = true;
         if (f->eval_window && in_callee) continue;
@@ -1395,7 +1398,7 @@ void ray_env_mark_lexical_scope(int32_t below) {
     if (!__VM) return;
     env_frames_moved();
     int32_t d = __VM->scope_depth - 1 - below;
-    if (d >= 0) __VM->scope_stack[d].lexical = 1;
+    if (d >= __VM->scope_base) __VM->scope_stack[d].lexical = 1;
 }
 
 ray_err_t ray_env_push_scope(void) {
@@ -1429,11 +1432,28 @@ void ray_env_pop_scope(void) {
     f->table_from = 0;
 }
 
+/* Hide every frame now on the stack until the matching
+ * ray_env_isolate_end: lookups, bindings, mutation targets and closure
+ * captures see only the frames pushed after this point, then the
+ * globals, as at the top level.  Returns the base to hand back. */
+int32_t ray_env_isolate_begin(void) {
+    int32_t saved = __VM->scope_base;
+    __VM->scope_base = __VM->scope_depth;
+    env_frames_moved();   /* a cached resolve may name a hidden binding */
+    return saved;
+}
+
+void ray_env_isolate_end(int32_t saved) {
+    while (__VM->scope_depth > __VM->scope_base) ray_env_pop_scope();
+    __VM->scope_base = saved;
+    env_frames_moved();
+}
+
 /* The top frame is a compiled frame's window around `eval` or `resolve`
  * (see ray_scope_frame_t.eval_window). */
 void ray_env_mark_eval_window(void) {
     env_frames_moved();
-    if (__VM && __VM->scope_depth > 0)
+    if (__VM && __VM->scope_depth > __VM->scope_base)
         __VM->scope_stack[__VM->scope_depth - 1].eval_window = 1;
 }
 
@@ -1476,7 +1496,7 @@ ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
  * code drops it with this frame — names must be introduced lexically
  * for the compiler to allocate a slot, same as before). */
 void ray_env_scope_sync(const int64_t* syms, int32_t n, ray_t** slots) {
-    if (__VM->scope_depth > 0) {
+    if (__VM->scope_depth > __VM->scope_base) {
         ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
         for (int32_t i = 0; i < n; i++) {
             if (syms[i] < 0) continue;
@@ -1602,7 +1622,7 @@ ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val) {
      * or `do` of the request's own stays allowed. */
     if (__VM->restricted && __VM->scope_depth <= __VM->restricted_base)
         return RAY_ERR_ACCESS;
-    if (__VM->scope_depth <= 0) return ray_env_set(sym_id, val);
+    if (__VM->scope_depth <= __VM->scope_base) return ray_env_set(sym_id, val);
     if (ray_sym_is_dotted(sym_id)) {
         return env_set_dotted(sym_id, val, lookup_top_frame, env_bind_local, -1);
     }

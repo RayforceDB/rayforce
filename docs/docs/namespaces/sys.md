@@ -402,6 +402,8 @@ Under `-U` a restricted connection may not call a restricted builtin or write a 
 - The mark is on the lambda object, not on the name: binding the name to a new lambda leaves the new one unmarked.
 - It does not travel: a copy made by `ser`/`de` or sent over IPC has none, and neither does a closure the trusted body makes and returns.
 - A name resolves as evaluating it would. Each name must hold a lambda; if one does not, nothing is marked.
+- Called by restricted code, the body also runs isolated from its caller, as if called at the top level. The names it reads, and the names read by what it calls, resolve to its arguments, its own captures and the globals. A local, an `eval` window or a query column of the caller is never one of them, so a request cannot rebind a name the body reads, and an in-place `alter` or `insert` by name in the body targets the global.
+- In a query, a trusted lambda is always called, never inlined by the planner. Called by restricted code, it runs outside the query: it gets the arguments the query evaluated for it and does not read source columns by free name, as an ordinary helper does.
 - The lift covers the whole call: the body and everything it calls run unrestricted. A trusted lambda must treat its arguments as data, since a function it is passed and calls, or an expression it evaluates, runs unrestricted too. The same holds for a trusted `.ipc.on.*` hook: trusting an `.ipc.on.sync` that evaluates the message lifts the restriction from every request.
 
 Errors: `type` (an argument that is neither a lambda nor symbols, or a name bound to something other than a lambda), `name` (an unbound name), `access` (called from restricted code).
