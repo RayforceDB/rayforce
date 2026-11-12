@@ -34,8 +34,14 @@
 #define FMT_DEFAULT_PRECISION  2
 #define FMT_PP_MAX_ROWS       20   /* max pairs/elems shown in broken pp form */
 
-/* Format a ray_t value into a new ray_t string (RAY_STR atom).
- * mode: 0 = compact, 1 = full (REPL), 2 = show (no limits) */
+enum {
+    RAY_FMT_COMPACT   = 0, /* historical compact representation */
+    RAY_FMT_REPL      = 1, /* concise interactive display */
+    RAY_FMT_SHOW      = 2, /* display without row/column limits */
+    RAY_FMT_ROUNDTRIP = 3, /* parseable, type- and value-preserving */
+};
+
+/* Format a ray_t value into a new ray_t string (RAY_STR atom). */
 ray_t* ray_fmt(ray_t* obj, int mode);
 
 /* REPL pretty-printer: like ray_fmt(obj, 1) but dicts/lists that would
