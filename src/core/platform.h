@@ -175,9 +175,23 @@ void  ray_vm_advise_willneed(void* ptr, size_t size);
  * read a mapped column they sample. */
 uint64_t ray_vm_willneed_bytes(void);
 /* Start writing back bytes [off, off+len) of open file `fd` without waiting
- * (Linux sync_file_range WRITE; a no-op elsewhere): a later fsync then
- * finds them on disk. */
+ * (Linux sync_file_range WRITE, issued by a background thread on a
+ * descriptor of its own; a no-op elsewhere): a later fsync then finds them
+ * on disk.  The descriptors the background thread holds, these and those
+ * of ray_file_writebehind_begin, number at most RAY_FILE_WB_FDS; past that
+ * the caller starts the writeback itself. */
+#define RAY_FILE_WB_FDS 256
 void  ray_file_writeback_start(int fd, int64_t off, int64_t len);
+/* Write-behind of a file written once and not read again soon (Linux; a
+ * no-op elsewhere): _begin opens `path` and starts writing all its pages
+ * back, returning the descriptor (-1: none, also with RAY_FILE_WB_FDS
+ * held); _end hands it over to have the writeback waited for, the pages
+ * dropped from the page cache and the descriptor closed, so the cache
+ * keeps what is read again instead.  Both
+ * return at once: the background thread of ray_file_writeback_start does
+ * the work, in order. */
+int   ray_file_writebehind_begin(const char* path);
+void  ray_file_writebehind_end(int fd);
 /* The I/O counters the converters' traces read: bytes read from and
  * written to storage, written bytes whose writeback was cancelled, read and
  * write calls, and major faults; of the process, or of the calling thread

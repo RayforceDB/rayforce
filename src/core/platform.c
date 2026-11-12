@@ -250,12 +250,131 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
         madvise((void*)a, end - a < chunk ? end - a : chunk, MADV_WILLNEED);
 }
 
+#if defined(__linux__)
+/* Writeback requests, served by one thread off the callers' path.  On a
+ * device whose writes the block layer throttles (blk-wbt), sync_file_range
+ * WRITE over a large range blocks until most of it is submitted, so a
+ * caller that only meant to start it (a pass's coordinator, the pool idle
+ * behind it) would wait as long as the writing.  A request holds its own
+ * descriptor, and the descriptors held here (queued, or handed out by
+ * ray_file_writebehind_begin) stay within RAY_FILE_WB_FDS: past it a start
+ * is done by the caller, a write-behind not begun.  With the queue full the
+ * caller does the work itself. */
+enum { WB_START, WB_END };
+typedef struct { int kind, fd; int64_t off, len; } wb_req_t;
+#define WB_RING RAY_FILE_WB_FDS
+static wb_req_t        wb_ring[WB_RING];
+static _Atomic int     wb_fds;             /* descriptors held, <= RAY_FILE_WB_FDS */
+static int64_t         wb_head, wb_tail;   /* under wb_mu */
+static bool            wb_running;
+static pthread_mutex_t wb_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  wb_cv = PTHREAD_COND_INITIALIZER;
+
+static void wb_do(const wb_req_t* r) {
+    if (r->kind == WB_START) {
+        (void)sync_file_range(r->fd, (off64_t)r->off, (off64_t)r->len, SYNC_FILE_RANGE_WRITE);
+    } else {
+        (void)sync_file_range(r->fd, 0, 0, SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                                           SYNC_FILE_RANGE_WAIT_AFTER);
+        (void)posix_fadvise(r->fd, 0, 0, POSIX_FADV_DONTNEED);
+    }
+    close(r->fd);
+    atomic_fetch_sub_explicit(&wb_fds, 1, memory_order_relaxed);
+}
+
+/* `n` more descriptors held, if that stays within RAY_FILE_WB_FDS. */
+static bool wb_take(int n) {
+    int c = atomic_load_explicit(&wb_fds, memory_order_relaxed);
+    do {
+        if (c + n > RAY_FILE_WB_FDS) return false;
+    } while (!atomic_compare_exchange_weak_explicit(&wb_fds, &c, c + n, memory_order_relaxed,
+                                                    memory_order_relaxed));
+    return true;
+}
+
+static void* wb_thread(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&wb_mu);
+        while (wb_head == wb_tail) pthread_cond_wait(&wb_cv, &wb_mu);
+        wb_req_t r = wb_ring[wb_head % WB_RING];
+        wb_head++;
+        pthread_mutex_unlock(&wb_mu);
+        wb_do(&r);
+    }
+    return NULL;
+}
+
+/* Around a fork: the child starts with an empty queue and no thread (it
+ * starts its own on its first request); the requests it inherits are the
+ * parent's to serve, and their descriptors are closed.  Its mutex and
+ * condition are made anew: the copied condition still counts the parent's
+ * thread among its waiters, and a signal would wait for that thread
+ * forever. */
+static void wb_fork_prepare(void) { pthread_mutex_lock(&wb_mu); }
+static void wb_fork_parent(void) { pthread_mutex_unlock(&wb_mu); }
+static void wb_fork_child(void) {
+    for (int64_t i = wb_head; i < wb_tail; i++) close(wb_ring[i % WB_RING].fd);
+    atomic_fetch_sub_explicit(&wb_fds, (int)(wb_tail - wb_head), memory_order_relaxed);
+    wb_head = wb_tail = 0;
+    wb_running = false;
+    (void)pthread_mutex_init(&wb_mu, NULL);
+    (void)pthread_cond_init(&wb_cv, NULL);
+}
+static pthread_once_t wb_once = PTHREAD_ONCE_INIT;
+static void wb_init(void) { (void)pthread_atfork(wb_fork_prepare, wb_fork_parent, wb_fork_child); }
+
+/* Queue `r` (its descriptor the queue's from here on), or do it now. */
+static void wb_push(wb_req_t r) {
+    (void)pthread_once(&wb_once, wb_init);
+    pthread_mutex_lock(&wb_mu);
+    if (!wb_running) {
+        pthread_t t;
+        pthread_attr_t a;
+        if (pthread_attr_init(&a) == 0) {
+            (void)pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+            wb_running = pthread_create(&t, &a, wb_thread, NULL) == 0;
+            pthread_attr_destroy(&a);
+        }
+    }
+    bool queued = wb_running && wb_tail - wb_head < WB_RING;
+    if (queued) { wb_ring[wb_tail % WB_RING] = r; wb_tail++; pthread_cond_signal(&wb_cv); }
+    pthread_mutex_unlock(&wb_mu);
+    if (!queued) wb_do(&r);
+}
+#endif
+
 void ray_file_writeback_start(int fd, int64_t off, int64_t len) {
 #if defined(__linux__)
-    if (fd >= 0 && off >= 0 && len > 0)
-        (void)sync_file_range(fd, (off64_t)off, (off64_t)len, SYNC_FILE_RANGE_WRITE);
+    if (fd < 0 || off < 0 || len <= 0) return;
+    int own = wb_take(1) ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -2;
+    if (own >= 0) { wb_push((wb_req_t){ WB_START, own, off, len }); return; }
+    if (own == -1) atomic_fetch_sub_explicit(&wb_fds, 1, memory_order_relaxed);
+    (void)sync_file_range(fd, (off64_t)off, (off64_t)len, SYNC_FILE_RANGE_WRITE);
 #else
     (void)fd; (void)off; (void)len;
+#endif
+}
+
+int ray_file_writebehind_begin(const char* path) {
+#if defined(__linux__)
+    if (!wb_take(2)) return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int own = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (own >= 0) wb_push((wb_req_t){ WB_START, own, 0, 0 });   /* 0: to the end */
+    atomic_fetch_sub_explicit(&wb_fds, (fd < 0) + (own < 0), memory_order_relaxed);
+    return fd;
+#else
+    (void)path;
+    return -1;
+#endif
+}
+
+void ray_file_writebehind_end(int fd) {
+#if defined(__linux__)
+    if (fd >= 0) wb_push((wb_req_t){ WB_END, fd, 0, 0 });
+#else
+    (void)fd;
 #endif
 }
 
@@ -1248,6 +1367,8 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
 }
 
 void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
+int  ray_file_writebehind_begin(const char* path) { (void)path; return -1; }
+void ray_file_writebehind_end(int fd) { (void)fd; }
 
 void ray_sleep_ms(int ms) { Sleep((DWORD)ms); }
 
@@ -1519,6 +1640,8 @@ void ray_vm_advise_willneed(void* ptr, size_t size) {
     if (ptr && size) atomic_fetch_add_explicit(&vm_willneed_bytes, size, memory_order_relaxed);
 }
 void ray_file_writeback_start(int fd, int64_t off, int64_t len) { (void)fd; (void)off; (void)len; }
+int  ray_file_writebehind_begin(const char* path) { (void)path; return -1; }
+void ray_file_writebehind_end(int fd) { (void)fd; }
 void ray_sleep_ms(int ms)                          { (void)ms; }
 bool ray_vm_resident(const void* ptr, size_t size)  { (void)ptr; (void)size; return true; }
 size_t ray_vm_resident_end(const void* ptr, size_t size) { (void)ptr; return size; }

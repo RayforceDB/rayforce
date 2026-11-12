@@ -3462,6 +3462,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     pq_chunked* chk = NULL;   /* [ncols] the pass's chunked columns (pq_direct_work.chunked) */
     pq_cbuf* cbuf = NULL;     /* [nspare] pq_direct_work.cbuf */
     pq_symb psb = {0};   /* the grouped pass column's vector bounds (pq_symb) */
+    int* wbf = NULL;     /* [ncols] the column files written back behind the passes (ray_file_writebehind_begin) */
+    int64_t nwbf = 0;
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !pick || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
@@ -3550,6 +3552,11 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * final sync; column by column the passes end their files anyway and
      * the extra I/O requests only slow the decode. */
     work.writeback = !colwise;
+    /* Column by column, a pass's closed columns go to disk while the next
+     * pass runs and, once written back, leave the page cache (a pass later),
+     * which then keeps the Parquet file's pages that later passes read
+     * instead of output that no pass reads again.  Best effort. */
+    if (colwise) wbf = ray_alloc_raw((size_t)r->ncols*sizeof(*wbf));
 #if defined(DEBUG)
     work.reverse = getenv("RAY_PQ_DIRECT_REVERSE") != NULL;   /* the suite: positions not in task order */
 #endif
@@ -3882,6 +3889,18 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
         }
         pq_symb_free(&psb);
+        if (wbf && !err) {
+            int64_t earlier = nwbf;
+            for (int64_t i = 0; i < work.npass; i++) {
+                const ray_col_stream_t* w = &writers[work.pass[i]];
+                if (w->type == RAY_SYM && w->gen != 2) continue;   /* not closed yet (its header at the end) */
+                int fd = ray_file_writebehind_begin(w->path);
+                if (fd >= 0) wbf[nwbf++] = fd;
+            }
+            for (int64_t i = 0; i < earlier; i++) ray_file_writebehind_end(wbf[i]);
+            memmove(wbf,wbf+earlier,(size_t)(nwbf-earlier)*sizeof(*wbf));
+            nwbf -= earlier;
+        }
         /* the workers' page and dictionary buffers grown past PQ_SPARE_MAX
          * for this pass's columns go with the pass */
         for (int64_t i = 0; i < nspare; i++) {
@@ -3924,6 +3943,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
     }
 done:
+    for (int64_t i = 0; i < nwbf; i++) ray_file_writebehind_end(wbf[i]);
+    ray_free_raw(wbf);
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
     ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order);

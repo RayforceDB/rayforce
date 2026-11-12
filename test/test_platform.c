@@ -168,6 +168,80 @@ static test_result_t test_cgroup_stat_flush(void) {
     PASS();
 }
 
+#ifdef RAY_OS_LINUX
+#include <dirent.h>
+/* Descriptors open in this process (the directory's own among them). */
+static int plat_nfds(void) {
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int n = 0;
+    while (readdir(d)) n++;
+    closedir(d);
+    return n;
+}
+#endif
+
+/* Write-behind holds at most RAY_FILE_WB_FDS descriptors: past them a file
+ * is not begun (-1) and a start is done by the caller.  The background
+ * thread closes every one it was handed, and the files keep what was
+ * written. */
+static test_result_t test_file_writebehind_fds(void) {
+#ifdef RAY_OS_LINUX
+    enum { N = RAY_FILE_WB_FDS + 44 };
+    char dir[64], path[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce_wb_%d", (int)getpid());
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "a directory of our own");
+    int base = plat_nfds(), peak = 0, begun = 0;
+    static int fds[N];
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "f%d", i);
+        plat_write(dir, name, "written once");
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+        fds[i] = ray_file_writebehind_begin(path);
+        begun += fds[i] >= 0;
+        int n = plat_nfds() - base;
+        if (n > peak) peak = n;
+    }
+    for (int i = 0; i < N; i++) ray_file_writebehind_end(fds[i]);
+    snprintf(path, sizeof(path), "%s/f0", dir);
+    int wfd = open(path, O_WRONLY);
+    for (int k = 0; k < 4 * RAY_FILE_WB_FDS; k++) {
+        ray_file_writeback_start(wfd, 0, 12);
+        int n = plat_nfds() - base;
+        if (n > peak) peak = n;
+    }
+    close(wfd);
+    int left = 0;
+    for (int t = 0; t < 1000 && (left = plat_nfds() - base) > 0; t++) ray_sleep_ms(10);
+    /* the bound is free again: a whole round more is begun */
+    int again = 0;
+    for (int i = 0; i < RAY_FILE_WB_FDS / 2; i++) {
+        snprintf(path, sizeof(path), "%s/f%d", dir, i);
+        fds[i] = ray_file_writebehind_begin(path);
+        again += fds[i] >= 0;
+    }
+    for (int i = 0; i < RAY_FILE_WB_FDS / 2; i++) ray_file_writebehind_end(fds[i]);
+    int same = 0;
+    for (int i = 0; i < N; i++) {
+        char name[16], buf[32] = {0};
+        snprintf(name, sizeof(name), "f%d", i);
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0 && read(fd, buf, sizeof(buf) - 1) == 12 && !strcmp(buf, "written once")) same++;
+        if (fd >= 0) close(fd);
+        plat_unlink(dir, name);
+    }
+    rmdir(dir);
+    TEST_ASSERT(begun > 0 && begun < N, "write-behind begun up to the bound");
+    TEST_ASSERT(peak <= RAY_FILE_WB_FDS + 1, "no more descriptors held than the bound");
+    TEST_ASSERT(left <= 0, "every descriptor handed over closed");
+    TEST_ASSERT_EQ_I(again, RAY_FILE_WB_FDS / 2);
+    TEST_ASSERT_EQ_I(same, N);
+#endif
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 #ifdef RAY_OS_LINUX
@@ -295,6 +369,7 @@ const test_entry_t platform_entries[] = {
     { "platform/cgroup_stat_flush", test_cgroup_stat_flush, NULL, NULL },
     { "platform/cgroup_cpu_quota", test_cgroup_cpu_quota, NULL, NULL },
     { "platform/cpu_set_count_wide_mask", test_cpu_set_count_wide_mask, NULL, NULL },
+    { "platform/file_writebehind_fds", test_file_writebehind_fds, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
