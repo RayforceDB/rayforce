@@ -3164,6 +3164,18 @@ static test_result_t test_vec_grow_slice_sym_widths(void) {
     PASS();
 }
 
+/* `v` (unsliced, no longer sorted) carries a complete hash index over its
+ * n rows {1, 2, 9} in some order, found through the index. */
+static bool grow_hash_extended(ray_t* v, int64_t n) {
+    if ((v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_SORTED)) || ray_index_kind(v) != RAY_IDX_HASH ||
+        ray_index_hash_first_only(v) || ray_index_payload(v->index)->built_for_len != n)
+        return false;
+    const int64_t* d = (const int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        if (ray_index_find_row(v, d[i]) != i) return false;
+    return ray_index_find_row(v, 7) == -1;
+}
+
 /* Header-reuse equivalence, not a guarantee about arena payload lifetimes. */
 static test_result_t test_vec_grow_ordinary_cow_modes(void) {
     bool saved_sync = ray_rc_sync;
@@ -3190,8 +3202,11 @@ static test_result_t test_vec_grow_ordinary_cow_modes(void) {
         /* len2 fits the original and copied block with one added cell, so a
          * successful shared COW cannot be followed by a second growth failure. */
         bool wrote = ok && grow_slice_owned(&v, op, 1, &extra, 1);
+        /* An append keeps the hash, extended over the new key (a shared one
+         * copied first); an insertion in the middle drops it.  Either way
+         * the sorted marker goes. */
         ok = wrote && grow_slice_values(v, op == 2 ? inserted : appended, 3) &&
-            set_slice_plain(v) && v->rc == 1 &&
+            (op == 2 ? set_slice_plain(v) : grow_hash_extended(v, 3)) && v->rc == 1 &&
             ((uintptr_t)v == old_address) == !shared;
         if (alias) ok = ok && alias->rc == 1 && grow_slice_values(alias, raw, 2) &&
             alias->attrs == attrs && (uintptr_t)alias->index == index_address;

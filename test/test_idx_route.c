@@ -2896,7 +2896,115 @@ static test_result_t test_find_sorted_i64_extremes(void) {
     PASS();
 }
 
+
+/* ─── GUID hash index: the routes that consult it ───────────────────── */
+
+/* A GUID index answers find (an atom, a vector of needles), in, distinct
+ * and count distinct, with the zero guid a key like any other.  The scan
+ * gives the same answers, so only the counters show a route that has
+ * fallen back to it: each call must consult the index and hit, on a
+ * complete index and on one an appended repeat left first-row-only. */
+static void guid_bytes(uint8_t* out, int k) {
+    memset(out, 0, 16);
+    if (k > 0) { out[0] = (uint8_t)k; out[7] = 0xA5; out[15] = (uint8_t)(0x30 + k); }
+}
+
+static bool guid_route_hit(idx_site_t site, uint64_t c0, uint64_t h0) {
+    return ray_idx_consults[site] - c0 == 1 && ray_idx_hits[site] - h0 == 1;
+}
+
+static test_result_t test_guid_index_routes(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    /* rows: keys 1 2 1 3 0 2 (0 is the zero guid) */
+    const int keys[] = { 1, 2, 1, 3, 0, 2 };
+    uint8_t cells[6 * 16];
+    for (int i = 0; i < 6; i++) guid_bytes(cells + i * 16, keys[i]);
+    ray_t* v = ray_vec_from_raw(RAY_GUID, cells, 6);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_HASH);
+    /* needles: 3, 4 (absent), 0, 1 */
+    const int nk[] = { 3, 4, 0, 1 };
+    uint8_t ncells[4 * 16];
+    for (int i = 0; i < 4; i++) guid_bytes(ncells + i * 16, nk[i]);
+    ray_t* needles = ray_vec_from_raw(RAY_GUID, ncells, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(needles));
+    uint8_t b3[16];
+    guid_bytes(b3, 3);
+    ray_t* atom = ray_guid(b3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(atom));
+
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            /* append a repeat of key 2: the index is kept, first-row-only */
+            uint8_t b2[16];
+            guid_bytes(b2, 2);
+            v = ray_vec_append(v, b2);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+            TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_HASH);
+            TEST_ASSERT_TRUE(ray_index_hash_first_only(v));
+        }
+        uint64_t c0 = ray_idx_consults[IDX_SITE_FIND], h0 = ray_idx_hits[IDX_SITE_FIND];
+        ray_t* fa = ray_find_fn(v, atom);
+        TEST_ASSERT_FMT(guid_route_hit(IDX_SITE_FIND, c0, h0), "pass %d: atom find missed the index", pass);
+        TEST_ASSERT_TRUE(fa && !RAY_IS_ERR(fa) && fa->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(fa->i64, 3);
+        ray_release(fa);
+
+        c0 = ray_idx_consults[IDX_SITE_FIND]; h0 = ray_idx_hits[IDX_SITE_FIND];
+        ray_t* fv = ray_find_fn(v, needles);
+        TEST_ASSERT_FMT(guid_route_hit(IDX_SITE_FIND, c0, h0), "pass %d: vector find missed the index", pass);
+        TEST_ASSERT_TRUE(fv && !RAY_IS_ERR(fv) && fv->type == RAY_I64 && fv->len == 4);
+        const int64_t* f = (const int64_t*)ray_data(fv);
+        TEST_ASSERT_EQ_I(f[0], 3);
+        TEST_ASSERT_EQ_I(f[1], NULL_I64);
+        TEST_ASSERT_EQ_I(f[2], 4);
+        TEST_ASSERT_EQ_I(f[3], 0);
+        ray_release(fv);
+
+        c0 = ray_idx_consults[IDX_SITE_IN]; h0 = ray_idx_hits[IDX_SITE_IN];
+        ray_t* in = ray_in_fn(needles, v);
+        TEST_ASSERT_FMT(guid_route_hit(IDX_SITE_IN, c0, h0), "pass %d: in missed the index", pass);
+        TEST_ASSERT_TRUE(in && !RAY_IS_ERR(in) && in->type == RAY_BOOL && in->len == 4);
+        const bool* b = (const bool*)ray_data(in);
+        TEST_ASSERT_TRUE(b[0] && !b[1] && b[2] && b[3]);
+        ray_release(in);
+
+        c0 = ray_idx_consults[IDX_SITE_DISTINCT]; h0 = ray_idx_hits[IDX_SITE_DISTINCT];
+        ray_t* d = distinct_vec_eager(v);
+        TEST_ASSERT_FMT(guid_route_hit(IDX_SITE_DISTINCT, c0, h0), "pass %d: distinct missed the index", pass);
+        TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && d->type == RAY_GUID && d->len == 4);
+        /* first-appearance order: 1 2 3 0 */
+        const int dk[] = { 1, 2, 3, 0 };
+        for (int i = 0; i < 4; i++) {
+            uint8_t want[16];
+            guid_bytes(want, dk[i]);
+            TEST_ASSERT_TRUE(memcmp((const uint8_t*)ray_data(d) + i * 16, want, 16) == 0);
+        }
+        ray_release(d);
+
+        /* the count from the groups, not distinct's rows counted */
+        c0 = ray_idx_consults[IDX_SITE_COUNT_DISTINCT]; h0 = ray_idx_hits[IDX_SITE_COUNT_DISTINCT];
+        uint64_t dc0 = ray_idx_consults[IDX_SITE_DISTINCT];
+        ray_t* cd = exec_count_distinct(NULL, NULL, v);
+        TEST_ASSERT_FMT(guid_route_hit(IDX_SITE_COUNT_DISTINCT, c0, h0), "pass %d: count distinct missed the index", pass);
+        TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_DISTINCT] - dc0), 0);
+        TEST_ASSERT_TRUE(cd && !RAY_IS_ERR(cd) && cd->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cd->i64, 4);
+        ray_release(cd);
+    }
+    ray_release(atom);
+    ray_release(needles);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
+    { "idx_route/guid_index_routes",         test_guid_index_routes,         NULL, NULL },
     { "idx_route/find_sorted_i64_views", test_find_sorted_i64_views, NULL, NULL },
     { "idx_route/find_sorted_i64_extremes", test_find_sorted_i64_extremes, NULL, NULL },
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },

@@ -174,3 +174,19 @@
 (nil? (at (at Pz 'x) 0)) -- false
 ;; (B,'y) is missing -> null
 (nil? (at (at Pz 'y) 1)) -- true
+
+;; ── F32 value column: min / max / first / last are F32 cells, sum and avg F64 ──
+(set Tf (table [g h x] (list [0 0 1 1 0] ['a 'b 'a 'b 'a] (as 'F32 [2.5 0Nf -3.5 4.5 1.0]))))
+(pivot Tf 'g 'h 'x max) -- (table [g a b] (list [0 1] (as 'F32 [2.5 -3.5]) (as 'F32 [0Nf 4.5])))
+(pivot Tf 'g 'h 'x min) -- (table [g a b] (list [0 1] (as 'F32 [1.0 -3.5]) (as 'F32 [0Nf 4.5])))
+(pivot Tf 'g 'h 'x first) -- (table [g a b] (list [0 1] (as 'F32 [2.5 -3.5]) (as 'F32 [0Nf 4.5])))
+(pivot Tf 'g 'h 'x last) -- (table [g a b] (list [0 1] (as 'F32 [1.0 -3.5]) (as 'F32 [0Nf 4.5])))
+(set Uf (table [g h x] (list (at Tf 'g) (at Tf 'h) (as 'F64 (at Tf 'x)))))
+(pivot Tf 'g 'h 'x sum) -- (pivot Uf 'g 'h 'x sum)
+(pivot Tf 'g 'h 'x avg) -- (pivot Uf 'g 'h 'x avg)
+;; a missing cell is the F32 null
+(set Tm (table [g h x] (list [0 0 1] ['a 'b 'a] (as 'F32 [2.5 1.5 -3.5]))))
+(nil? (at (at (pivot Tm 'g 'h 'x max) 'b) 1)) -- true
+;; an F32 pivot column names its columns by value, as an F64 one does
+(set Tk (table [g h x] (list [0 0 1] (as 'F32 [0.5 1.5 0.5]) [1 2 3])))
+(key (pivot Tk 'g 'h 'x sum)) -- (key (pivot (table [g h x] (list [0 0 1] [0.5 1.5 0.5] [1 2 3])) 'g 'h 'x sum))

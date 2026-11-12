@@ -4084,27 +4084,85 @@ static void agg_occ_first_fn(void* raw, uint32_t wid, int64_t start, int64_t end
     }
 }
 
+/* The index of the partitioned slab (agg_dense_partitioned: partition
+ * `bits` low bits of the slot, part_slots indexes each) that holds `slot`. */
+static inline int64_t agg_part_index(int64_t slot, int64_t part_slots, uint32_t bits) {
+    return (slot & (((int64_t)1 << bits) - 1)) * part_slots + (slot >> bits);
+}
+
 /* The occupied slots of a bitmap in ascending order: tasks count the set bits
  * of their word ranges, a prefix places them, and each task writes its
- * range's slots at its place.  1 when out holds them, 0 when the counts do
- * not add up to ng (the caller collects serially), -1 when the query was
- * cancelled under a dispatch: the pool skips the tickets of a cancelled
- * query, so the counts, or out, were never written. */
+ * range's slots at its place.  With bits, the bitmap is a partitioned slab's
+ * (agg_part_index) and words counts blocks of 64 slots of a partition: a
+ * block's bits are read once from every partition, and its slots written in
+ * ascending slot order as their slab indexes, so the groups come out in the
+ * order one slab gives, whatever the partition count.  1 when out holds
+ * them, 0 when the counts do not add up to ng (the caller collects
+ * serially), -1 when the query was cancelled under a dispatch: the pool
+ * skips the tickets of a cancelled query, so the counts, or out, were never
+ * written. */
 typedef struct {
     const uint64_t* occ;
     int64_t*        out;
     int64_t*        at;        /* [tasks + 1]: counts, then first positions */
     int64_t         words;
+    int64_t         slots;
+    int64_t         part_slots;
+    uint32_t        bits;
     uint32_t        tasks;
     int             pass;      /* 0: count, 1: write */
 } agg_occ_collect_ctx_t;
+
+/* n (<= 64) bits of occ from bit position pos */
+static inline uint64_t agg_occ_bits(const uint64_t* occ, int64_t words, int64_t pos, int64_t n) {
+    int64_t w = pos >> 6, o = pos & 63;
+    uint64_t v = occ[w] >> o;
+    if (o && w + 1 < words) v |= occ[w + 1] << (64 - o);
+    return n < 64 ? v & (((uint64_t)1 << n) - 1) : v;
+}
+
+/* a[r] bit c -> a[c] bit r (bit 0 the low bit) */
+static void agg_transpose64(uint64_t a[64]) {
+    uint64_t m = 0x00000000FFFFFFFFull;
+    for (int j = 32; j != 0; j >>= 1, m ^= m << j)
+        for (int k = 0; k < 64; k = (k + j + 1) & ~j) {
+            uint64_t t = ((a[k] >> j) ^ a[k + j]) & m;
+            a[k + j] ^= t;
+            a[k] ^= t << j;
+        }
+}
 
 static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_occ_collect_ctx_t* c = raw;
     for (int64_t t = start; t < end; t++) {
-        int64_t w0 = c->words / c->tasks * t;
-        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        int64_t w0 = c->words * t / c->tasks, w1 = c->words * (t + 1) / c->tasks;
+        if (c->bits) {
+            /* blk[p]: the block's bits of partition p; transposed per 64
+             * partitions, blk[64 * q + g]: slot g's bits of those partitions */
+            uint64_t blk[RAY_POOL_INIT_TASKS / 2 > 64 ? RAY_POOL_INIT_TASKS / 2 : 64];
+            int64_t parts = (int64_t)1 << c->bits, ps = c->part_slots;
+            int64_t owords = (c->slots + 63) / 64, n = 0, j = c->pass ? c->at[t] : 0;
+            int64_t groups = (parts + 63) / 64;
+            for (int64_t w = w0; w < w1; w++) {
+                int64_t g0 = w * 64, len = ps - g0 < 64 ? ps - g0 : 64;
+                uint64_t any = 0;
+                for (int64_t p = 0; p < groups * 64; p++)
+                    any |= blk[p] = p < parts ? agg_occ_bits(c->occ, owords, p * ps + g0, len) : 0;
+                if (!any) continue;
+                if (c->pass == 0) {
+                    for (int64_t p = 0; p < parts; p++) n += __builtin_popcountll(blk[p]);
+                    continue;
+                }
+                for (int64_t q = 0; q < groups; q++) agg_transpose64(blk + 64 * q);
+                for (int64_t g = 0; g < len; g++)
+                    for (int64_t q = 0; q < groups; q++)
+                        for (uint64_t b = blk[64 * q + g]; b; b &= b - 1)
+                            c->out[j++] = (64 * q + __builtin_ctzll(b)) * ps + g0 + g;
+            }
+            if (c->pass == 0) c->at[t] = n;
+            continue;
+        }
         if (c->pass == 0) {
             int64_t n = 0;
             for (int64_t w = w0; w < w1; w++) n += __builtin_popcountll(c->occ[w]);
@@ -4117,15 +4175,18 @@ static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t e
     }
 }
 
-static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots, int64_t ng, int64_t* out) {
-    int64_t words = (slots + 63) / 64;
+static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots, int64_t ng, int64_t* out,
+                           int64_t part_slots, uint32_t bits) {
+    /* with bits, blocks of 64 slots of a partition */
+    int64_t words = bits ? (part_slots + 63) / 64 : (slots + 63) / 64;
     uint32_t tasks = ray_pool_par_dispatch_ok(pool, slots, RAY_PARALLEL_THRESHOLD)
                    ? ray_pool_total_workers(pool) * 4 : 1;
     if ((int64_t)tasks > words) tasks = (uint32_t)(words > 0 ? words : 1);
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     int64_t* at = ray_alloc_raw(((size_t)tasks + 1) * sizeof(int64_t));
     if (!at) return 0;
-    agg_occ_collect_ctx_t c = { .occ = occ, .out = out, .at = at, .words = words, .tasks = tasks, .pass = 0 };
+    agg_occ_collect_ctx_t c = { .occ = occ, .out = out, .at = at, .words = words, .slots = slots,
+                                .part_slots = part_slots, .bits = bits, .tasks = tasks, .pass = 0 };
     if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_collect_fn, &c, tasks);
     else agg_occ_collect_fn(&c, 0, 0, 1);
     if (agg_cancelled()) { ray_free_raw(at); return -1; }
@@ -4229,7 +4290,10 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
-    int collected = occ && !first_row_ordered ? agg_occ_collect(pool, occ, total_slots, ng, occupied_slot) : 0;
+    /* A partitioned slab's groups in slot order, as one slab gives them. */
+    uint32_t part_bits = key_plan ? key_bits : 0;
+    int collected = occ && !first_row_ordered
+        ? agg_occ_collect(pool, occ, total_slots, ng, occupied_slot, key_part_slots, part_bits) : 0;
     if (collected < 0) {
         ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
         agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
@@ -4238,11 +4302,13 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     }
     if (!collected) {
       int64_t i = 0;
-      for (int64_t s = 0; s < total_slots; s++)
-          if (occ ? (occ[s >> 6] >> (s & 63)) & 1 : gfirst[s] != INT64_MAX) {
-              if (first_row_ordered) first_row_ordered[i] = gfirst[s];
-              occupied_slot[i] = s; i++;
+      for (int64_t s = 0; s < total_slots; s++) {
+          int64_t x = part_bits ? agg_part_index(s, key_part_slots, part_bits) : s;
+          if (occ ? (occ[x >> 6] >> (x & 63)) & 1 : gfirst[x] != INT64_MAX) {
+              if (first_row_ordered) first_row_ordered[i] = gfirst[x];
+              occupied_slot[i] = x; i++;
           }
+      }
     }
     /* Bounded emit (HEAD(GROUP) hint): the N groups with the smallest first
      * row ARE the first N groups in first-seen order.  Select them with an
@@ -11251,16 +11317,6 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
                 ray_profile_tick("indexed: selected winning rows");
                 col = ray_group_gather(src, winners, ng);
-                /* F32 reduction results follow the existing F64 contract. */
-                if (col && !RAY_IS_ERR(col) && src->type == RAY_F32) {
-                    ray_t* widened = ray_vec_new(RAY_F64, ng);
-                    if (widened && !RAY_IS_ERR(widened)) {
-                        widened->len = ng;
-                        for (int64_t i = 0; i < ng; i++) ((double*)ray_data(widened))[i] = ((float*)ray_data(col))[i];
-                        widened->attrs |= col->attrs & RAY_ATTR_HAS_NULLS;
-                    }
-                    ray_release(col); col = widened;
-                }
             }
         } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);

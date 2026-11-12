@@ -175,8 +175,8 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
-| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values, in their promoted type (null lowest) | `(min [3 9 1] [2 10 4])` → `[2 9 1]`, `(min 1 2.5)` → `1.0` |
-| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values, in their promoted type (null lowest) | `(max [3 9 1] 5)` → `[5 9 5]`, `(max [2 0] true)` → `[2 1]` |
+| `min` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise minimum of two values, in their promoted type (null lowest); f32 input answers f32 | `(min [3 9 1] [2 10 4])` → `[2 9 1]`, `(min 1 2.5)` → `1.0` |
+| `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values, in their promoted type (null lowest); f32 input answers f32 | `(max [3 9 1] 5)` → `[5 9 5]`, `(max [2 0] true)` → `[2 1]` |
 | `first` | unary | — | First element of a vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `1` |
 | `last` | unary | — | Last element of a vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally, `(at v (- (count v) 1))` | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `2` |
 | `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
@@ -284,24 +284,24 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `cross` | binary | — | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | — | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
-| `fill` | binary | atomic | Replace null values; the replacement is the first argument | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
+| `fill` | binary | atomic | Replace null values; the replacement is the first argument; f32 input stays f32 | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | — | Reverse element order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | lazy/DAG | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | lazy/DAG | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
-| `deltas` | unary | lazy/DAG | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `deltas` | unary | lazy/DAG | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIME, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | lazy/DAG | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
 | `fills` | unary | lazy/DAG | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | lazy/DAG | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
 | `avgs` | unary | lazy/DAG | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
-| `mins` | unary | lazy/DAG | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
-| `maxs` | unary | lazy/DAG | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
+| `mins` | unary | lazy/DAG | Running minimum; f32 input stays f32 | `(mins [3 1 2])` → `[3 1 1]` |
+| `maxs` | unary | lazy/DAG | Running maximum; f32 input stays f32 | `(maxs [3 1 2])` → `[3 3 3]` |
 | `prds` | unary | lazy/DAG | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
 | `differ` | unary | lazy/DAG | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
 | `msum` | binary | lazy/DAG | Moving sum over trailing N rows; nulls are skipped | `(msum 3 [1 2 3 4])` → `[1 3 6 9]` |
 | `mavg` | binary | lazy/DAG | Moving average over trailing N rows and non-null values | `(mavg 3 [1 2 3 4])` → `[1.0 1.5 2.0 3.0]` |
-| `mmin` | binary | lazy/DAG | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
-| `mmax` | binary | lazy/DAG | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
+| `mmin` | binary | lazy/DAG | Moving minimum over trailing N rows; f32 input stays f32 | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
+| `mmax` | binary | lazy/DAG | Moving maximum over trailing N rows; f32 input stays f32 | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
 | `mcount` | binary | lazy/DAG | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
 | `mvar` | binary | lazy/DAG | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `mdev` | binary | lazy/DAG | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
@@ -610,7 +610,7 @@ Type checking, casting, null testing, and object inspection.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `type` | unary | — | Get the type name of a value | `(type 42)` → `i64` |
-| `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
+| `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N v4 GUIDs, seeded from the OS (`(guid 0)` → `[]`) | `(guid 1)` |
@@ -620,6 +620,7 @@ Type checking, casting, null testing, and object inspection.
 (type [1 2 3])              ; I64
 (type "hello")              ; str
 (as 'f64 [1 2 3])          ; [1.0 2.0 3.0]
+(type (as 'LIST [1 2]))    ; LIST (two i64 atoms; a LIST is returned unchanged)
 (nil? 0Ni)                   ; true
 
 ; Generate a batch of GUIDs

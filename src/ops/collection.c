@@ -607,19 +607,19 @@ static bool find_needle_side_ok(ray_t* hay, ray_t* nd) {
 }
 
 /* ══════════════════════════════════════════
- * GUID membership
+ * GUID membership and find
  *
- * An open-addressing table of 16-byte keys stored in place, for `in` over
- * guid cells without the hashset's per-row type dispatch.  The all-zero
- * key is the null guid; it doubles as the empty-slot marker, so the table
- * keeps it in a flag of its own.
+ * An open-addressing table of 16-byte keys stored in place, for `in` and
+ * `find` over guid cells without the hashset's per-row type dispatch.  The
+ * all-zero key is the null guid; it doubles as the empty-slot marker, so
+ * the table keeps it in a flag of its own.
  *
  * A guid cell is null when its 16 bytes are zero, whether or not its vector
  * carries HAS_NULLS: producers can write the zero payload without the flag
  * (ray_vec_append does).  RAY_ATOM_IS_NULL, the scalar == and the query's
- * null-row masks read the bytes, and so does this table.  `in` therefore
- * answers as == does, cell for cell: a zero cell is in a set that holds a
- * zero cell, whichever vector carries the flag.
+ * null-row masks read the bytes, and so does this table.  `in` and `find`
+ * therefore answer as == does, cell for cell: a zero cell is in, and is
+ * found in, a vector that holds a zero cell, whichever carries the flag.
  * ══════════════════════════════════════════ */
 
 typedef struct {
@@ -646,7 +646,9 @@ static void* in_guid_calloc(size_t size) {
 static bool guid_set_init(guid_set_t* gs, int64_t n) {
     int64_t cap = 16;
     while (cap < n * 2) cap <<= 1;
-    gs->keys = (uint64_t*)in_guid_calloc((size_t)cap * 16);
+    /* 16 bytes a slot: more than a size_t holds (a 32-bit target) is out
+     * of memory */
+    gs->keys = (uint64_t)cap <= SIZE_MAX / 16 ? (uint64_t*)in_guid_calloc((size_t)cap * 16) : NULL;
     gs->mask = cap - 1;
     gs->has_null = false;
     return gs->keys != NULL;
@@ -813,6 +815,76 @@ static ray_t* in_guid(ray_t* val, const uint8_t* set, int64_t m) {
     ray_free_raw((void*)seen);
     ray_free_raw(gs.keys);
     return result;
+}
+
+/* out[i]: the first row of the guid vector `hay` holding the 16 bytes of
+ * needle i, NULL_I64 on a miss.  The bytes alone, as in_guid: a zero cell
+ * finds the first zero cell whichever vector carries HAS_NULLS, as a hash
+ * index on `hay` (which keys the zero guid like any other) answers.  The
+ * table holds the smaller side, as in find_hash_needles: the haystack's
+ * first row a key, probed once a needle; or the needles, with one scan of
+ * the haystack that stops once every distinct needle has a row.  `first`
+ * holds row + 1 a slot, 0 while there is none.
+ *
+ * NULL, or an "oom" error; never a fallback to the hashset, which takes a
+ * zero cell for null only in a vector that carries HAS_NULLS. */
+static ray_t* find_guid(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    int64_t n = hay->len, m = nd->len;
+    const uint8_t* hd = (const uint8_t*)ray_data(hay);
+    const uint8_t* ndd = (const uint8_t*)ray_data(nd);
+    bool by_needles = m < n;
+    guid_set_t gs;
+    if (!guid_set_init(&gs, by_needles ? m : n)) return ray_error("oom", NULL);
+    int64_t* first = (int64_t*)in_guid_calloc((size_t)(gs.mask + 1) * sizeof(int64_t));
+    if (!first) { ray_free_raw(gs.keys); return ray_error("oom", NULL); }
+    int64_t null_first = 0;   /* row + 1 of the first zero cell */
+    if (by_needles) {
+        int64_t distinct = 0, found = 0;
+        for (int64_t i = 0; i < m; i++)
+            if (guid_set_add(&gs, ndd + i * 16)) distinct++;
+        for (int64_t r = 0; r < n && found < distinct; r++) {
+            const uint8_t* p = hd + r * 16;
+            uint64_t lo, hi;
+            memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+            if ((lo | hi) == 0) {
+                if (gs.has_null && !null_first) { null_first = r + 1; found++; }
+                continue;
+            }
+            int64_t s = guid_set_slot(&gs, p, lo, hi);
+            if (s >= 0 && !first[s]) { first[s] = r + 1; found++; }
+        }
+    } else {
+        for (int64_t r = 0; r < n; r++) {
+            const uint8_t* p = hd + r * 16;
+            uint64_t lo, hi;
+            memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+            if ((lo | hi) == 0) {
+                if (!null_first) null_first = r + 1;
+                continue;
+            }
+            int64_t s = guid_set_slot(&gs, p, lo, hi);
+            if (s < 0) {
+                uint64_t* k = gs.keys + 2 * ~s;
+                k[0] = lo; k[1] = hi;
+                first[~s] = r + 1;
+            }
+        }
+    }
+    for (int64_t i = 0; i < m; i++) {
+        const uint8_t* p = ndd + i * 16;
+        uint64_t lo, hi;
+        memcpy(&lo, p, 8); memcpy(&hi, p + 8, 8);
+        int64_t row = null_first;
+        if (lo | hi) {
+            int64_t s = guid_set_slot(&gs, p, lo, hi);
+            row = s >= 0 ? first[s] : 0;
+        }
+        if (row) out[i] = row - 1;
+        else { out[i] = NULL_I64; *any_null = true; }
+    }
+    ray_free_raw(first);
+    ray_free_raw(gs.keys);
+    return NULL;
 }
 
 /* ══════════════════════════════════════════
@@ -1255,13 +1327,19 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
         bool* mb = (bool*)ray_data(mask);
         int64_t count = 0;
         for (int64_t i = 0; i < mlen; i++) if (mb[i]) count++;
-        char buf[8192];
-        if ((size_t)count > sizeof(buf)) return ray_error("limit", NULL);
+        char sbuf[8192];
+        char* buf = sbuf;
+        if ((size_t)count > sizeof(sbuf)) {
+            buf = ray_alloc_raw((size_t)count);
+            if (!buf) return ray_error("oom", NULL);
+        }
         int64_t j = 0;
         for (int64_t i = 0; i < mlen; i++) {
             if (mb[i]) buf[j++] = sp[i];
         }
-        return ray_str(buf, (size_t)count);
+        ray_t* r = ray_str(buf, (size_t)count);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
     }
 
     /* Fast path: typed vector + typed bool mask */
@@ -1545,6 +1623,20 @@ ray_t* distinct_vec_eager(ray_t* x) {
         }
     }
 
+    /* A guid hash index: its groups are the distinct guids, each one's
+     * first row in first-appearance order (ray_index_hash_first_rows). */
+    if (x->type == RAY_GUID && ray_index_has(x)) {
+        ray_idx_consults[IDX_SITE_DISTINCT]++;
+        ray_t* ids = ray_index_hash_first_rows(x);
+        if (ids) {
+            ray_idx_hits[IDX_SITE_DISTINCT]++;
+            ray_idx_note_use(x);
+            ray_t* result = gather_by_idx(x, (int64_t*)ray_data(ids), ray_len(ids));
+            ray_release(ids);
+            return result;
+        }
+    }
+
     int64_t idx_stack[256];
     int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_alloc_raw((size_t)len * sizeof(int64_t));
     if (!idx) return ray_error("oom", NULL);
@@ -1601,8 +1693,8 @@ ray_t* distinct_vec_eager(ray_t* x) {
     /* Parallel radix kernel for large fixed-width columns — same
      * partition scheme as exec_count_distinct, producing the same row-id
      * set the hashset pass below would (one first-occurrence id per
-     * value).  NULL means the kernel declined (type, size, or pool) and
-     * the hashset handles it.  Either way the ids flow into the shared
+     * value).  NULL means the kernel declined (type, size, pool, or
+     * memory) and the hashset handles it.  Either way the ids flow into the shared
      * sort + gather tail, so result semantics are identical. */
     int64_t count = 0;
     ray_t* rids = distinct_radix_first_ids(x);
@@ -1614,6 +1706,21 @@ ray_t* distinct_vec_eager(ray_t* x) {
         count = ray_len(rids);
         memcpy(idx, ray_data(rids), (size_t)count * sizeof(int64_t));
         ray_release(rids);
+    } else if (x->type == RAY_GUID && len < (1 << 16)) {
+        /* a column too short for the guid kernel: in_guid's table of
+         * 16-byte keys, without the hashset's per-row type dispatch; it
+         * takes the zero guid once, as the hashset does.  A longer one the
+         * kernel declined, short of memory, takes the hashset, at 8 bytes
+         * a slot to this table's 16. */
+        guid_set_t gs;
+        if (!guid_set_init(&gs, len)) {
+            if (idx != idx_stack) ray_free_raw(idx);
+            return ray_error("oom", NULL);
+        }
+        const uint8_t* gd = (const uint8_t*)ray_data(x);
+        for (int64_t i = 0; i < len; i++)
+            if (guid_set_add(&gs, gd + i * 16)) idx[count++] = i;
+        ray_free_raw(gs.keys);
     } else {
         hashset_t hs;
         if (!hashset_init(&hs, x, len)) {
@@ -2707,10 +2814,16 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     if (ray_is_atom(vec) && vec->type == -RAY_STR && ray_str_len(vec) == 1 && ray_is_atom(n_obj) && is_numeric(n_obj)) {
         int64_t n = as_i64(n_obj);
         int64_t count = n < 0 ? -n : n;
-        char buf[8192];
-        if (count > (int64_t)sizeof(buf)) return ray_error("limit", NULL);
+        char sbuf[8192];
+        char* buf = sbuf;
+        if (count > (int64_t)sizeof(sbuf)) {
+            buf = ray_alloc_raw((size_t)count);
+            if (!buf) return ray_error("oom", NULL);
+        }
         for (int64_t i = 0; i < count; i++) buf[i] = vec->sdata[0];
-        return ray_str(buf, (size_t)count);
+        ray_t* r = ray_str(buf, (size_t)count);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
     }
     /* Scalar take: (take value n) → repeat value n times */
     if (ray_is_atom(vec) && (-vec->type) != RAY_STR && ray_is_atom(n_obj) && is_numeric(n_obj)) {
@@ -2730,10 +2843,14 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         int64_t slen = (int64_t)ray_str_len(vec);
         int64_t n = as_i64(n_obj);
         int64_t abs_n = n < 0 ? -n : n;
-        char buf[8192];
-        if (abs_n > (int64_t)sizeof(buf)) return ray_error("limit", NULL);
         if (slen == 0) {
             return ray_str("", 0);
+        }
+        char sbuf[8192];
+        char* buf = sbuf;
+        if (abs_n > (int64_t)sizeof(sbuf)) {
+            buf = ray_alloc_raw((size_t)abs_n);
+            if (!buf) return ray_error("oom", NULL);
         }
         if (n >= 0) {
             for (int64_t i = 0; i < abs_n; i++) buf[i] = s[i % slen];
@@ -2744,7 +2861,9 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                 buf[i] = s[si];
             }
         }
-        return ray_str(buf, (size_t)abs_n);
+        ray_t* r = ray_str(buf, (size_t)abs_n);
+        if (buf != sbuf) ray_free_raw(buf);
+        return r;
     }
     /* Table take: apply take to each column */
     if (vec->type == RAY_TABLE && is_numeric(n_obj)) {
@@ -3505,17 +3624,26 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         if (is_collection(idx)) {
             /* Multiple indices → build string from chars */
             int64_t idxlen = ray_len(idx);
-            char buf[8192];
-            if ((size_t)idxlen > sizeof(buf)) return ray_error("limit", NULL);
+            char sbuf[8192];
+            char* buf = sbuf;
+            if ((size_t)idxlen > sizeof(sbuf)) {
+                buf = ray_alloc_raw((size_t)idxlen);
+                if (!buf) return ray_error("oom", NULL);
+            }
             for (int64_t j = 0; j < idxlen; j++) {
                 int alloc = 0;
                 ray_t* ie = collection_elem(idx, j, &alloc);
                 int64_t k = as_i64(ie);
                 if (alloc) ray_release(ie);
-                if (k < 0 || (size_t)k >= slen) return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
+                if (k < 0 || (size_t)k >= slen) {
+                    if (buf != sbuf) ray_free_raw(buf);
+                    return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)k, (long long)slen);
+                }
                 buf[j] = s[k];
             }
-            return ray_str(buf, (size_t)idxlen);
+            ray_t* r = ray_str(buf, (size_t)idxlen);
+            if (buf != sbuf) ray_free_raw(buf);
+            return r;
         }
         int64_t i = as_i64(idx);
         if (i < 0 || (size_t)i >= slen) return ray_error("domain", "at: string index %lld out of range for length %lld", (long long)i, (long long)slen);
@@ -3624,10 +3752,11 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         /* Both sides typed vecs, in order of preference:
          *   1. an attached hash index on the haystack: one probe per needle,
          *      nothing built per call;
-         *   2. sparse sorted, null-free I64: exact batched lower_bound;
-         *   3. fewer needles than rows: hash the needles, scan the haystack
+         *   2. guid cells: find_guid's typed table, their only route;
+         *   3. sparse sorted, null-free I64: exact batched lower_bound;
+         *   4. fewer needles than rows: hash the needles, scan the haystack
          *      once (find_hash_needles);
-         *   4. hash the haystack, probe the needles (mirrors ray_in_fn). */
+         *   5. hash the haystack, probe the needles (mirrors ray_in_fn). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
             bool done = false;
             if (ray_index_has(vec)) {
@@ -3637,6 +3766,11 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     ray_idx_note_use(vec);
                     done = true;
                 }
+            }
+            if (!done && vec->type == RAY_GUID && val->type == RAY_GUID) {
+                ray_t* err = find_guid(vec, val, out, &any_null);
+                if (err) { ray_release(result); return err; }
+                done = true;
             }
             /* Keep tiny and dense probes on the existing hash/scan routes.
              * This sparse admission avoids their sampled crossover region. */
@@ -3678,13 +3812,14 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         bool has_nulls = ray_vec_may_have_nulls(vec);
         bool val_null = RAY_ATOM_IS_NULL(val);
 
-        /* Hash-index fast path: an integer-family, symbol or string needle
-         * against an indexed column of the same family (ray_index_find_atom
-         * owns the type matrix).  Float and cross-family needles fall
-         * through to the scan (the scan owns promotion semantics; we do
-         * not replicate them here). */
+        /* Hash-index fast path: an integer-family, symbol, string or guid
+         * needle against an indexed column of the same family
+         * (ray_index_find_atom owns the type matrix).  Float and cross-family
+         * needles fall through to the scan (the scan owns promotion
+         * semantics; we do not replicate them here).  A guid index keys
+         * every row by its bytes, so the column's nulls do not matter. */
         if (!val_null && ray_is_atom(val) && ray_index_has(vec) &&
-            (!has_nulls || vec->type == RAY_SYM)) {
+            (!has_nulls || vec->type == RAY_SYM || vec->type == RAY_GUID)) {
             ray_idx_consults[IDX_SITE_FIND]++;
             int64_t row = ray_index_find_atom(vec, val);
             if (row >= -1) {   /* -2 means not eligible — fall through */
@@ -3694,6 +3829,18 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     return ray_typed_null(-RAY_I64);
                 return make_i64(row);
             }
+        }
+
+        /* A guid in a guid vector: compare the cells' bytes in place, a
+         * null guid finding the first zero cell, flagged or not (GUID
+         * membership and find above). */
+        if (vec->type == RAY_GUID && val->type == -RAY_GUID) {
+            static const uint8_t null_guid[16] = {0};
+            const uint8_t* key = val->obj ? (const uint8_t*)ray_data(val->obj) : null_guid;
+            const uint8_t* cells = (const uint8_t*)ray_data(vec);
+            for (int64_t i = 0; i < len; i++)
+                if (memcmp(cells + i * 16, key, 16) == 0) return make_i64(i);
+            return ray_typed_null(-RAY_I64);
         }
 
         if (has_nulls) {
@@ -3916,7 +4063,7 @@ static bool ts_delta_type(int8_t t) {
     switch (t) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
         case RAY_F32: case RAY_F64:
-        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN:
             return true;
         default:
             return false;
@@ -3926,7 +4073,7 @@ static bool ts_delta_type(int8_t t) {
 static bool ts_ratio_type(int8_t t) {
     switch (t) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
-        case RAY_F32: case RAY_F64:
+        case RAY_F32: case RAY_F64: case RAY_TIMESPAN:
             return true;
         default:
             return false;
@@ -3964,16 +4111,19 @@ static void ts_deltas_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t 
             out[r] = ray_f64_fin(cur - prev);
         }
     } else {
-        int64_t* out = (int64_t*)ray_data(c->dst);
+        /* the lane of the result: 8 bytes, or 4 for a TIME or DATE difference */
+        void* out = ray_data(c->dst);
+        int8_t ot = c->dst->type;
+        int64_t null_v = ot == RAY_TIME || ot == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64;
         for (int64_t r = start + 1; r < end + 1; r++) {
             if (ts_morsel_checkpoint(c->pool, r - (start + 1))) return;
             if (c->has_nulls && (ray_vec_is_null(src, r) || ray_vec_is_null(src, r - 1))) {
-                out[r] = NULL_I64;
+                write_col_i64(out, r, null_v, ot, c->dst->attrs);
                 continue;
             }
             int64_t cur = read_col_i64(d, r, t, src->attrs);
             int64_t prev = read_col_i64(d, r - 1, t, src->attrs);
-            out[r] = (int64_t)((uint64_t)cur - (uint64_t)prev);
+            write_col_i64(out, r, (int64_t)((uint64_t)cur - (uint64_t)prev), ot, c->dst->attrs);
         }
     }
 }
@@ -3992,14 +4142,15 @@ ray_t* deltas_vec_eager(ray_t* x) {
         return ray_error("type", "deltas expects a numeric or temporal vector, got %s", ray_type_name(x->type));
 
     int64_t n = x->len;
-    int8_t out_type = (x->type == RAY_F64 || x->type == RAY_F32) ? RAY_F64 : RAY_I64;
+    int8_t out_type = deltas_out_type(x->type);
     ray_t* out = ray_vec_new(out_type, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
     if (n == 0) return out;
     out->attrs |= RAY_ATTR_HAS_NULLS;
     if (out_type == RAY_F64) ((double*)ray_data(out))[0] = NULL_F64;
-    else                     ((int64_t*)ray_data(out))[0] = NULL_I64;
+    else write_col_i64(ray_data(out), 0, out_type == RAY_TIME || out_type == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64,
+                       out_type, out->attrs);
     if (n == 1) return out;
 
     ray_pool_t* pool = ray_pool_get();
@@ -4259,8 +4410,11 @@ static bool ts_numeric_type(int8_t t) {
 
 static bool ts_running_type(uint16_t opcode, int8_t t) {
     if (opcode == OP_MINS || opcode == OP_MAXS) {
-        return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+        return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME ||
+               t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
     }
+    if (opcode == OP_SUMS) return ts_numeric_type(t) || t == RAY_TIMESPAN;
+    if (opcode == OP_AVGS) return ts_numeric_type(t) || t == RAY_TIMESPAN;
     return ts_numeric_type(t);
 }
 
@@ -4269,11 +4423,12 @@ static int8_t ts_running_out_type(uint16_t opcode, int8_t t) {
         case OP_AVGS:
             return RAY_F64;
         case OP_SUMS:
+            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t);
         case OP_PRDS:
             return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
         case OP_MINS:
         case OP_MAXS:
-            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t;
+            return t;
         default:
             return RAY_I64;
     }
@@ -4400,12 +4555,14 @@ static void ts_run_write(ray_t* out, int64_t row, const ts_run_state_t* s,
             return;
         case OP_MINS:
             if (!s->seen) { ray_vec_set_null(out, row, true); return; }
-            if (is_float) ((double*)d)[row] = ray_f64_fin(s->min_f);
+            if (out->type == RAY_F32) ((float*)d)[row] = isfinite(s->min_f) ? (float)s->min_f : NULL_F32;
+            else if (is_float) ((double*)d)[row] = ray_f64_fin(s->min_f);
             else write_col_i64(d, row, s->min_i, out->type, out->attrs);
             return;
         case OP_MAXS:
             if (!s->seen) { ray_vec_set_null(out, row, true); return; }
-            if (is_float) ((double*)d)[row] = ray_f64_fin(s->max_f);
+            if (out->type == RAY_F32) ((float*)d)[row] = isfinite(s->max_f) ? (float)s->max_f : NULL_F32;
+            else if (is_float) ((double*)d)[row] = ray_f64_fin(s->max_f);
             else write_col_i64(d, row, s->max_i, out->type, out->attrs);
             return;
     }
@@ -4517,6 +4674,8 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
     }
     scratch_free(summary_hdr);
     scratch_free(carry_hdr);
+    /* the running mean of durations is a duration */
+    if (opcode == OP_AVGS && x->type == RAY_TIMESPAN) return ray_timespan_of_f64_vec(out);
     return out;
 }
 
@@ -4640,9 +4799,13 @@ static bool ts_moving_type(uint16_t opcode, int8_t t) {
             return true;
         case OP_MMIN:
         case OP_MMAX:
-            return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
-        case OP_MVAR:
+            return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME ||
+                   t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+        case OP_MSUM:
+        case OP_MAVG:
         case OP_MDEV:
+            return ts_numeric_type(t) || t == RAY_TIMESPAN;
+        case OP_MVAR:
             return ts_numeric_type(t);
         default:
             return ts_numeric_type(t);
@@ -4658,10 +4821,10 @@ static int8_t ts_moving_out_type(uint16_t opcode, int8_t t) {
         case OP_MDEV:
             return RAY_F64;
         case OP_MSUM:
-            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
+            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : scan_int_out_type(t);
         case OP_MMIN:
         case OP_MMAX:
-            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t;
+            return t;
         default:
             return RAY_I64;
     }
@@ -4763,7 +4926,7 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     double* prefix_f = NULL;
     int64_t* prefix_count = NULL;
 
-    bool need_i = (opcode == OP_MSUM && out_type == RAY_I64);
+    bool need_i = (opcode == OP_MSUM && out_type != RAY_F64);
     bool need_f = (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64));
     bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT);
     bool has_nulls = ray_vec_may_have_nulls(x);
@@ -5059,7 +5222,8 @@ static bool ts_mminmax_better(ts_mminmax_ctx_t* c, int64_t a, int64_t b) {
 
 static void ts_mminmax_write(ts_mminmax_ctx_t* c, int64_t out_row, int64_t src_row) {
     void* out = ray_data(c->dst);
-    if (c->is_float) ((double*)out)[out_row] = ray_f64_fin(ts_read_as_f64(c->src, src_row));
+    if (c->src->type == RAY_F32) ((float*)out)[out_row] = ((const float*)ray_data(c->src))[src_row];
+    else if (c->is_float) ((double*)out)[out_row] = ray_f64_fin(ts_read_as_f64(c->src, src_row));
     else write_col_i64(out, out_row, ts_read_as_i64(c->src, src_row), c->dst->type, c->dst->attrs);
 }
 
@@ -5181,9 +5345,13 @@ ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
     int8_t out_type = ts_moving_out_type(opcode, x->type);
     if (opcode == OP_MMIN || opcode == OP_MMAX)
         return moving_minmax_vec_eager(x, opcode, window, out_type);
-    if (opcode == OP_MVAR || opcode == OP_MDEV)
-        return moving_variance_vec_eager(x, opcode, window, out_type);
-    return moving_prefix_vec_eager(x, opcode, window, out_type);
+    ray_t* out = (opcode == OP_MVAR || opcode == OP_MDEV)
+        ? moving_variance_vec_eager(x, opcode, window, out_type)
+        : moving_prefix_vec_eager(x, opcode, window, out_type);
+    /* the moving mean and deviation of durations are durations */
+    if ((opcode == OP_MAVG || opcode == OP_MDEV) && x->type == RAY_TIMESPAN)
+        return ray_timespan_of_f64_vec(out);
+    return out;
 }
 
 static ray_t* ts_start_lazy_unary(ray_t* x, ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
