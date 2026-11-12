@@ -892,6 +892,61 @@ static test_result_t test_ipc_poll_public_restricted(void) {
     PASS();
 }
 
+/* ---- test_ipc_restricted_trusted_verb ---------------------------------- */
+/*
+ * #787: a -U server whose read verb asks a peer for its half.  The verb is
+ * marked with .sys.trust, so a restricted client calling it gets the peer's
+ * answer, while the same client opening a connection itself, or calling the
+ * unmarked twin of the verb, is refused.
+ */
+static test_result_t test_ipc_restricted_trusted_verb(void) {
+    ray_test_server_t peer, srv;
+    RAY_TEST_SERVER_START(peer);
+    RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
+
+    char boot[512];
+    snprintf(boot, sizeof boot,
+             "(do (set __rf787_peer \"127.0.0.1:%u\")"
+             "    (set __rf787_count (fn [] (let h (.ipc.open __rf787_peer))"
+             "                              (let r (.ipc.send h \"(count (til 3))\"))"
+             "                              (.ipc.close h) r))"
+             "    (set __rf787_count_plain (fn [] (.ipc.open __rf787_peer)))"
+             "    (.sys.trust '__rf787_count) 0)",
+             (unsigned)peer.port);
+    ray_t* b = ray_eval_str(boot);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+    ray_release(b);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "restricted client h >= 0");
+
+    const char* asks[] = { "(__rf787_count)", "(__rf787_count_plain)",
+                           "(.ipc.open __rf787_peer)", "(do (__rf787_count) (set '__rf787_x 1))" };
+    ray_t* got[4];
+    for (int i = 0; i < 4; i++) {
+        ray_t* msg = ray_str(asks[i], strlen(asks[i]));
+        got[i] = ray_ipc_send(h, msg);
+        ray_release(msg);
+    }
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_test_server_stop(&peer);
+
+    TEST_ASSERT_NOT_NULL(got[0]);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(got[0]));
+    TEST_ASSERT_EQ_I(got[0]->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(got[0]->i64, 3);
+    ray_release(got[0]);
+    for (int i = 1; i < 4; i++) {
+        TEST_ASSERT_NOT_NULL(got[i]);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(got[i]));
+        TEST_ASSERT_STR_EQ(ray_err_code(got[i]), "access");
+        ray_release(got[i]);
+    }
+    PASS();
+}
+
 /* ---- test_ipc_poll_auth_creds_path ------------------------------------- */
 /*
  * Poll-based auth happy path — exercises ipc_read_creds (lines 503-541) and
@@ -3574,6 +3629,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/close_hook_vmless_thread",   test_ipc_close_hook_on_vmless_thread,     ipc_setup, ipc_teardown },
     { "ipc/poll_based_listen",          test_ipc_poll_based_listen,              ipc_setup, ipc_teardown },
     { "ipc/poll_public_restricted",     test_ipc_poll_public_restricted,         ipc_setup, ipc_teardown },
+    { "ipc/restricted_trusted_verb",    test_ipc_restricted_trusted_verb,        ipc_setup, ipc_teardown },
     { "ipc/poll_auth_creds_path",        test_ipc_poll_auth_creds_path,           ipc_setup, ipc_teardown },
     { "ipc/poll_auth_reject",           test_ipc_poll_auth_reject,               ipc_setup, ipc_teardown },
     { "ipc/poll_handshake_version_mismatch", test_ipc_poll_handshake_version_mismatch, ipc_setup, ipc_teardown },

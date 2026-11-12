@@ -23,8 +23,8 @@
 (type .fs) -- 'DICT
 (type .ipc) -- 'DICT
 (type .csv) -- 'DICT
-(count .sys) -- 12
-;; gc, exec, build, mem, info, cmd, timeit, listen, env, args, prof, querylog
+(count .sys) -- 13
+;; gc, exec, build, mem, info, cmd, timeit, listen, trust, env, args, prof, querylog
 (count .os) -- 2
 ;; getenv, setenv
 (count .fs) -- 2

@@ -236,6 +236,16 @@ static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
 
+/* A lambda the server marked with .sys.trust, called by restricted code:
+ * its body runs with the restriction lifted.  call_lambda_impl lifts it
+ * and puts it back around a call it runs to completion in a C frame of
+ * its own, so the restriction is back however the body ended (an error,
+ * a raise, a return); the VM never pushes such a call as a frame of its
+ * own executor. */
+static inline bool lambda_lifts(ray_t* lambda) {
+    return LAMBDA_TRUSTED(lambda) && __VM->restricted;
+}
+
 static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
     if (fn == ray_min_fn) return ray_min2_fn;
     if (fn == ray_max_fn) return ray_max2_fn;
@@ -536,6 +546,43 @@ static ray_t* undefined_name_error(int64_t sym) {
 
 static ray_t* head_not_callable_error(int8_t type) {
     return ray_error("type", "head is not callable, got %s", ray_type_name(type));
+}
+
+/* (.sys.trust f), (.sys.trust 'name), (.sys.trust ['a 'b]): mark lambdas
+ * trusted.  A call to one from restricted code (-U) runs its body, and
+ * whatever the body calls, with the restriction lifted (lambda_lifts).
+ * The builtin is restricted itself, so only unrestricted code, a boot
+ * script, can mark.  The mark lives on the lambda object: ser/de and IPC
+ * do not carry it, a closure the body makes does not get it, and a lambda
+ * a request builds has none.  A name resolves as evaluating it would; each
+ * must hold a lambda, or none is marked.  Returns its argument. */
+ray_t* ray_sys_trust_fn(ray_t* x) {
+    if (x->type == RAY_LAMBDA) {
+        LAMBDA_TRUSTED(x) = 1;
+        ray_retain(x);
+        return x;
+    }
+    if (x->type != -RAY_SYM && x->type != RAY_SYM)
+        return ray_error("type", ".sys.trust: expected a lambda or the names of lambdas, got %s",
+                         ray_type_name(x->type));
+    int64_t n = x->type == -RAY_SYM ? 1 : x->len;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int64_t i = 0; i < n; i++) {
+            int64_t id = x->type == -RAY_SYM ? x->i64
+                                             : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
+            ray_t* fn = ray_env_get(id);   /* borrowed */
+            if (pass == 1) { LAMBDA_TRUSTED(fn) = 1; continue; }
+            if (!fn) return undefined_name_error(id);
+            if (fn->type != RAY_LAMBDA) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                return ray_error("type", ".sys.trust: '%.*s' is %s, not a lambda",
+                                 s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "",
+                                 ray_type_name(fn->type));
+            }
+        }
+    }
+    ray_retain(x);
+    return x;
 }
 
 /* Dispose of a construction temporary that was not handed on: an error is
@@ -3143,6 +3190,13 @@ static inline bool lambda_wants_compile(ray_t* lambda) {
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
+    if (RAY_UNLIKELY(lambda_lifts(lambda))) {
+        __VM->restricted = false;
+        ray_t* result = call_lambda_impl(lambda, call_args, argc, query, row_args,
+                                         named, out_rows);
+        __VM->restricted = true;
+        return result;
+    }
     if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
@@ -3250,6 +3304,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 }
 
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
+    if (RAY_UNLIKELY(lambda_lifts(lambda)))
+        return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
     if (lambda_wants_compile(lambda)) lambda_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
     return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
@@ -3802,8 +3858,10 @@ op_callf: {
     ray_t *fn_obj = POP();
 
     /* Compiled lambda: push frame, switch to callee bytecode.  A lambda
-     * made inside a query stays on the tree walker (see call_lambda_impl). */
-    if (fn_obj->type == RAY_LAMBDA) {
+     * made inside a query stays on the tree walker (see call_lambda_impl),
+     * and a trusted one called by restricted code goes there too, to run
+     * lifted in a frame of its own (lambda_lifts). */
+    if (fn_obj->type == RAY_LAMBDA && !lambda_lifts(fn_obj)) {
         if (lambda_wants_compile(fn_obj))
             lambda_compile(fn_obj);
 
@@ -3947,7 +4005,8 @@ unary_done:
             break;
         case RAY_LAMBDA: {
             /* An uncompiled lambda (a closure): interpreted, with the
-             * arguments' row provenance when a query is active. */
+             * arguments' row provenance when a query is active.  A trusted
+             * lambda under restriction also comes here, compiled or not. */
             bool in_query = ray_active_query_table() != NULL;
             result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
@@ -4945,6 +5004,7 @@ static void ray_register_builtins(void) {
     register_unary(".sys.cmd",    RAY_FN_RESTRICTED, ray_syscmd_string_dispatch_fn);
     register_vary (".sys.timeit", RAY_FN_NONE,       ray_sys_timeit_fn);
     register_unary(".sys.listen", RAY_FN_RESTRICTED, ray_sys_listen_fn);
+    register_unary(".sys.trust",  RAY_FN_RESTRICTED, ray_sys_trust_fn);
     register_vary (".sys.env",    RAY_FN_NONE,       ray_sys_env_fn);
     register_vary (".sys.args",   RAY_FN_NONE,       ray_sys_args_fn);
 

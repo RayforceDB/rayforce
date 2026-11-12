@@ -657,6 +657,9 @@ ray_t* ray_syscmd_string_dispatch_fn(ray_t* x);
 ray_t* ray_sys_listen_fn(ray_t* x);
 ray_t* ray_sys_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_sys_env_fn(ray_t** args, int64_t n);
+/* `.sys.trust` — mark lambdas a restricted (-U) caller may run with the
+ * restriction lifted (lang/eval.c). */
+ray_t* ray_sys_trust_fn(ray_t* x);
 ray_t* ray_getenv_fn(ray_t* x);
 /* Filesystem metadata under .fs.* (issue #36).  Lean two: size +
  * directory-list.  Existence/is-file/is-dir reachable via try on

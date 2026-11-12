@@ -148,14 +148,18 @@ enum {
  *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
  *   data[9] = uint32_t capq       (serial of the query frame the closure was
  *                                  made under, 0 if none; never serialized)
+ *   data[10] = uint32_t trusted   (set by .sys.trust: a restricted caller
+ *                                  may run the body unrestricted; never
+ *                                  serialized, never given to a closure)
  */
-#define LAMBDA_SLOTS 10
+#define LAMBDA_SLOTS 11
 
 /* The slots that hold no reference, and the last one that does.  The free
  * walk in mem/heap.c drops slots 0 .. LAMBDA_SLOT_CAPROWS but n_locals. */
 #define LAMBDA_SLOT_NLOCALS   4
 #define LAMBDA_SLOT_CAPROWS   8
 #define LAMBDA_SLOT_CAPQ      9
+#define LAMBDA_SLOT_TRUSTED   10
 
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
@@ -169,6 +173,7 @@ enum {
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 #define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
 #define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
+#define LAMBDA_TRUSTED(lam)   (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_TRUSTED]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 

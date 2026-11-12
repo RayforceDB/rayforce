@@ -8362,6 +8362,100 @@ static test_result_t test_eval_restricted_server_state_ops(void) {
     PASS();
 }
 
+/* Whether the restricted eval of `expr` prints as the plain eval of
+ * `expected` does. */
+static bool restricted_expr_gives(const char* expr, const char* expected) {
+    ray_t* got = eval_restricted_expr(expr);
+    ray_t* want = ray_eval_str(expected);
+    bool same = false;
+    if (got && want && !RAY_IS_ERR(got) && !RAY_IS_ERR(want)) {
+        ray_t* gs = ray_fmt(got, 0);
+        ray_t* ws = ray_fmt(want, 0);
+        same = gs && ws && ray_str_len(gs) == ray_str_len(ws) &&
+               memcmp(ray_str_ptr(gs), ray_str_ptr(ws), ray_str_len(ws)) == 0;
+        if (gs) ray_release(gs);
+        if (ws) ray_release(ws);
+    }
+    if (!same) fprintf(stderr, "  restricted eval of %s is not %s\n", expr, expected);
+    for (int i = 0; i < 2; i++) {
+        ray_t* v = i ? want : got;
+        if (v && RAY_IS_ERR(v)) ray_error_free(v);
+        else if (v) ray_release(v);
+    }
+    return same;
+}
+
+/* #787: a lambda marked with .sys.trust runs its body unrestricted when
+ * restricted code calls it, by every call path, and the restriction is
+ * back once the call ends, however it ends.  The caller's own code, a
+ * closure the body makes and a copy of the lambda through ser/de stay
+ * restricted, and only unrestricted code can mark. */
+static test_result_t test_eval_restricted_trusted_lambda(void) {
+    ASSERT_EQ("(do (set __rf787_n 0)"
+              "    (set __rf787_put (fn [x] (set __rf787_n x)))"
+              "    (set __rf787_plain (fn [x] (set __rf787_n x)))"
+              "    (set __rf787_boom (fn [] (set __rf787_n 4) (raise \"boom\")))"
+              "    (set __rf787_mk (fn [k] (fn [x] (set __rf787_n (+ x k)))))"
+              "    (set __rf787_down (fn [n] (if (<= n 0) (set __rf787_n -1) (self (- n 1)))))"
+              "    (set __rf787_cl ((fn [k] (fn [x] (set __rf787_n (+ x k)))) 100))"
+              "    (.sys.trust ['__rf787_put '__rf787_boom '__rf787_mk '__rf787_down])"
+              "    (type (.sys.trust __rf787_cl)))", "(type (fn [] 0))");
+
+    /* The trusted body writes a global: called from the request's top
+     * level, from its compiled code, and through a higher-order builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_put 5)", "5"));
+    ASSERT_EQ("__rf787_n", "5");
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (__rf787_put 6)))", "6"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(map __rf787_put [7 8])", "[7 8]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (map __rf787_put [1 9])))", "[1 9]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_down 3)", "-1"));
+    /* A trusted closure, interpreted on its first call and compiled after. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_cl 1)", "101"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_cl 2)", "102"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (__rf787_cl 3)))", "103"));
+
+    /* The same body unmarked, and the request's own write, are refused. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (__rf787_plain 1)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(set __rf787_n 1)"));
+
+    /* The restriction is back after the trusted call returns. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(do (__rf787_put 2) (set __rf787_n 3))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (__rf787_put 2) (set __rf787_n 3)))"));
+    ASSERT_EQ("__rf787_n", "2");
+
+    /* ... and after it fails: the caller's handler runs restricted. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(try (__rf787_boom) (fn [e] 7))", "7"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(try (__rf787_boom) (fn [e] (set __rf787_n 5)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [] (try (__rf787_boom) (fn [e] (set __rf787_n 5)))))"));
+    ASSERT_EQ("__rf787_n", "4");
+
+    /* The mark stays on the object: a closure the trusted body makes and a
+     * copy through ser/de have none. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((__rf787_mk 1) 2)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((de (ser __rf787_put)) 6)"));
+
+    /* Restricted code cannot mark, so the unmarked twin stays refused. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.sys.trust '__rf787_plain)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.sys.trust __rf787_plain)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (.sys.trust __rf787_plain)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+
+    /* Only lambdas are marked, and a list with one bad name marks none. */
+    ASSERT_ER_CODE("(.sys.trust 1)", "type");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_unbound)", "name");
+    ASSERT_ER_CODE("(.sys.trust 'count)", "type");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_plain '__rf787_n])", "type");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+
+    /* Unrestricted, a trusted lambda is an ordinary call. */
+    ASSERT_EQ("(__rf787_put 11)", "11");
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
 /* --- self-recursive lambda via recursion (tests op_calls path) --- */
 static test_result_t test_eval_self_recursion_direct(void) {
     /* Direct recursion using named function — compiler may use op_calls */
@@ -12674,6 +12768,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
+    { "lang/eval/restricted_trusted_lambda", test_eval_restricted_trusted_lambda, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

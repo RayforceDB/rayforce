@@ -3,7 +3,7 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, `.sys.listen`, and `.sys.querylog.enable` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, or change server-wide logging behaviour. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
@@ -21,6 +21,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
 | [`.sys.listen`](#sys-listen) | unary | restricted | Bind an IPC listener on a TCP port. |
+| [`.sys.trust`](#sys-trust) | unary | restricted | Let restricted (`-U`) callers run these lambdas with the restriction lifted. |
 | [`.sys.timeit`](#sys-timeit) | variadic (0–1) | — | Toggle / set the per-expression profiler. |
 
 ## `.sys.args` { #sys-args }
@@ -377,6 +378,33 @@ Errors: `type` (port not an int / not parseable from string), `domain` (port out
 (.sys.listen 5000)
 ;; => 12  (listener id)
 ```
+
+## `.sys.trust` { #sys-trust }
+
+Signature: `(.sys.trust f)`, `(.sys.trust 'name)` or `(.sys.trust ['a 'b])`. Marks lambdas as trusted and returns its argument.
+
+Under `-U` a restricted connection may not call a restricted builtin or write a global, and the rule covers everything its request evaluates, including the server's own functions that the request calls. A call to a trusted lambda is the exception: its body runs with the restriction lifted, and the restriction is back as soon as the call returns or fails. A `-U` server can so keep read verbs that need a restricted builtin themselves, such as a read that asks another process for its half over `.ipc.send`, while its clients stay read-only:
+
+```lisp
+;; boot script of a server started with -U
+(set peer (.ipc.open "127.0.0.1:5001"))
+(set peer_count (fn [] (.ipc.send peer (parse "(count (til 3))"))))
+(.sys.trust 'peer_count)
+```
+
+```text
+;; a client of that server
+(.ipc.send h "(peer_count)")                     ;; => 3
+(.ipc.send h "(.ipc.send peer (parse \"1\"))")   ;; => error: access
+```
+
+- Only unrestricted code can mark: `.sys.trust` is restricted itself, so it runs in a boot script, at the REPL or inside a trusted body, never in a restricted request.
+- The mark is on the lambda object, not on the name: binding the name to a new lambda leaves the new one unmarked.
+- It does not travel: a copy made by `ser`/`de` or sent over IPC has none, and neither does a closure the trusted body makes and returns.
+- A name resolves as evaluating it would. Each name must hold a lambda; if one does not, nothing is marked.
+- The lift covers the whole call: the body and everything it calls run unrestricted. A trusted lambda must treat its arguments as data, since a function it is passed and calls, or an expression it evaluates, runs unrestricted too. The same holds for a trusted `.ipc.on.*` hook: trusting an `.ipc.on.sync` that evaluates the message lifts the restriction from every request.
+
+Errors: `type` (an argument that is neither a lambda nor symbols, or a name bound to something other than a lambda), `name` (an unbound name), `access` (called from restricted code).
 
 ## `.sys.timeit` { #sys-timeit }
 

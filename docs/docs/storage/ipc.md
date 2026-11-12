@@ -116,6 +116,8 @@ Attempting a restricted operation returns an `"access"` error:
 !!! note "Security note"
     Restriction applies to all dispatch paths including higher-order functions. `(map .sys.exec ["echo hi"])` is also blocked in restricted mode.
 
+The rule covers everything a request evaluates, the server's own functions included. A server verb that must call a restricted builtin itself, such as `.ipc.send` to a peer, can be marked with [`.sys.trust`](../namespaces/sys.md#sys-trust) in the boot script: a restricted client that calls it runs that verb's body unrestricted, and nothing else it sends.
+
 ## Client Builtins
 
 Connect to a running server and send queries from Rayfall:
