@@ -3034,6 +3034,94 @@ static test_result_t test_pq_sym_direct_caps(void) {
     PASS();
 #endif
 }
+/* Generation 2 with the symbol columns seeded (the caps test's second file,
+ * its memory set by RAY_PQ_SYM_RAM): their chunks are encoded in the tasks
+ * and written in order (chunked), nothing staged, and the files are the
+ * staged ones byte for byte (on one worker), in one pass and column by
+ * column, with row groups that cross encoding chunks; every row reads back,
+ * on four workers too. */
+static test_result_t test_pq_sym_seeded_chunked(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[3][160], a[240], b[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqsc-%d.parquet", (int)getpid());
+    for (int k = 0; k < 3; k++) snprintf(dir[k], sizeof(dir[k]), "/tmp/rayforce-pqsc-%d-%d", (int)getpid(), k);
+    const char* fnames[3] = {"x","p","q"};
+    const char* nm[2] = {"p","q"};
+    const char* stage[3] = {NULL, "file", "mem"};
+    int64_t tids[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    /* p forty strings, q ten, both with nulls */
+    pq_synth_fn fns[2] = {pqx_lowcard, pqx_card10};
+    unsigned fl[2] = {PQX_DICT, PQX_DICT};
+    int64_t rows = 140000;   /* three encoding chunks over five row groups */
+    TEST_ASSERT_TRUE(pqx_synth(src, rows, 5, 2, nm, fns, fl));
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    pq_set_symmode("direct");
+    ray_t* res = pq_traced_import(src, dir[0], types, trace, cap);
+    pq_sym_env_clear();
+    TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+    pq_remove_native(dir[0], fnames, 3);
+    double bp = pq_trace_line_num(trace, "parquet symcol: col=p ", "vocab_bytes");
+    double bq = pq_trace_line_num(trace, "parquet symcol: col=q ", "vocab_bytes");
+    char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)((bp > bq ? bp : bq) * 64));
+    int bad = 0;
+    for (int run = 0; run < 4; run++) {
+        /* bit 0 column by column, bit 1 four workers */
+        int cores = run & 2 ? 4 : 1;
+        for (int k = 0; k < 3; k++) {
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+            if (run & 1) pq_set_layout("1");
+            pq_set_env("RAY_PQ_SYM_RAM", ramv);
+            pq_set_env("RAY_PQ_STAGE", stage[k]);
+            res = pq_traced_import(src, dir[k], opts, trace, cap);
+            pq_sym_env_clear();
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  %d/%d: import failed: %s\n", run, k, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                bad++; continue;
+            }
+            ray_release(res);
+            /* by default x, p and q chunked; under RAY_PQ_STAGE none */
+            bool seeded = strstr(trace, "parquet symseed:") != NULL;
+            double chunked = pq_trace_sum(trace, "chunked", NULL);
+            if (!seeded || chunked != (k == 0 ? 3 : 0)) {
+                fprintf(stderr, "  %d/%d: %s, %.0f columns chunked\n", run, k, seeded ? "seeded" : "not seeded", chunked);
+                bad++;
+            }
+            int nulls[2] = {-1, -1};   /* HAS_NULLS: both hold nulls */
+            if (!pqx_check(dir[k], rows, 2, nm, fns, "seeded chunked", nulls)) bad++;
+            if (nulls[0] != 1 || nulls[1] != 1) { fprintf(stderr, "  %d/%d: HAS_NULLS p %d, q %d\n", run, k, nulls[0], nulls[1]); bad++; }
+        }
+        for (int k = 1; cores == 1 && k < 3; k++)
+            for (int f = 0; f < 4; f++) {
+                const char* fn = f < 3 ? fnames[f] : ".sym";
+                snprintf(a, sizeof(a), "%s/%s", dir[0], fn);
+                snprintf(b, sizeof(b), "%s/%s", dir[k], fn);
+                if (!pq_same_file(a, b)) { fprintf(stderr, "  %d: %s differs under %s\n", run, fn, stage[k]); bad++; }
+            }
+        for (int k = 0; k < 3; k++) pq_remove_native(dir[k], fnames, 3);
+    }
+    unlink(src);
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(opts); ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
 /* A file of no row groups, forced grouped: imported, no rows; a step
  * failing (resolve still runs, over no tasks) reports its error, publishes
  * nothing and keeps no memory, run after run. */
@@ -4644,6 +4732,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_vocab_bound",test_pq_sym_vocab_bound,pq_setup,pq_teardown},
     {"parquet/sym_grouped_empty",test_pq_sym_grouped_empty,pq_setup,pq_teardown},
     {"parquet/sym_direct_caps",test_pq_sym_direct_caps,pq_setup,pq_teardown},
+    {"parquet/sym_seeded_chunked",test_pq_sym_seeded_chunked,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif
