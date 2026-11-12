@@ -3251,7 +3251,7 @@ static bool pq_symb_init(pq_symb* b, int64_t rows) {
 }
 
 static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* imp, int64_t c,
-                           int groups, int64_t budget, int64_t workers, bool trace, pq_symb* sb) {
+                           int groups, int par, int64_t budget, int64_t workers, bool trace, pq_symb* sb) {
     ray_parquet_t* r = dw->parent;
     ray_pool_t* pool = ray_pool_get();
     pq_gwork w = {.dw = dw, .c = c, .g = g, .imp = imp, .hmask = UINT64_MAX, .sb = sb};
@@ -3290,7 +3290,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     if (ray_interrupted()) goto out;
     if (trace) { io1 = pq_io_now(); t1 = ray_profile_now_ns(); }
     /* the verdicts, group by group */
-    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_g_error(dw->parent,"symbol dictionary allocation or file growth failed",-1); goto out; }
+    if (pq_g_inject("p2") || !ray_symgrp_resolve(g,par)) { dw->errors[0] = pq_g_error(dw->parent,"symbol dictionary allocation or file growth failed",-1); goto out; }
     if (trace) { io2 = pq_io_now(); t2 = ray_profile_now_ns(); }
     /* second decode, window by window: the candidates' records of a window
      * (from earlier passes and windows) in half the budget */
@@ -3766,12 +3766,20 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
              * are too: under RAY_PQ_SYM_ORDER=shards, which numbers the new
              * strings group by group, the positions depend on it (the
              * default order does not) */
-            int groups = 1;
+            int groups = 1, par = 1;
             const char* e = getenv("RAY_PQ_SYM_GROUPS");
             if (e && *e && strtol(e,NULL,10) > 0) groups = (int)strtol(e,NULL,10);
             else {
                 int64_t need = (ray_symgrp_entries(pg) + r->rows) * 24;
                 while (groups < RAY_SYMGRP_MAX && need / groups > budget / 4) groups *= 2;
+                /* The rows orders resolve their groups side by side
+                 * (ray_symgrp_resolve): more of them, so the workers share
+                 * them, as many at once as the quarter held one before. */
+                if (so == RAY_SYMGRP_ROWS || so == RAY_SYMGRP_ROWS_FLAT) {
+                    int mem = groups;
+                    while (groups < RAY_SYMGRP_MAX && groups < 4 * workers) groups *= 2;
+                    par = groups / mem;
+                }
             }
             /* the column's prefix bounds from the strings the second decode
              * walks; RAY_PQ_SYM_BOUNDS=dict leaves them to its writer, which
@@ -3779,7 +3787,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             ray_col_stream_t* sw = &writers[work.pass[0]];
             const char* be = getenv("RAY_PQ_SYM_BOUNDS");
             bool bounds = sw->gen == 2 && !(be && !strcmp(be,"dict")) && pq_symb_init(&psb,r->rows);
-            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,budget,workers,trace,bounds ? &psb : NULL);
+            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,par,budget,workers,trace,bounds ? &psb : NULL);
             if (bounds) {
                 sw->sym_bmn = (const uint32_t*)psb.mn; sw->sym_bmx = (const uint32_t*)psb.mx;
                 sw->sym_bhas = (const uint8_t*)psb.has;
