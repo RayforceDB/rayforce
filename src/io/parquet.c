@@ -2827,8 +2827,7 @@ static bool pq_g_wflush1(pq_gtask* k, int a) {
 }
 static bool pq_g_wflush(pq_gtask* k) { return pq_g_wflush1(k,0) && pq_g_wflush1(k,1); }
 /* ROWS*: record `pos` at `off`, run a's next: through the run's buffer,
- * written with pwrite in large requests (the mapping's pages are never
- * faulted in to be overwritten). */
+ * written to the file in large pieces (ray_symimp_write). */
 static bool pq_g_record(pq_gtask* k, int a, int64_t pos, int64_t off, const char* s, uint32_t len) {
     ray_symimp_place(k->w->imp,pos,off);
     if (k->wlen[a] && k->woff[a] + k->wlen[a] != off && !pq_g_wflush1(k,a)) return false;

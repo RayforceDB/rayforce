@@ -400,6 +400,16 @@ void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off) {
 }
 
 bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n) {
+    /* Through the mapping: the range was reserved, so the file covers it.
+     * A buffered write to one file holds its inode lock, and the kernel
+     * throttles a writer for dirty pages while it holds it, so the tasks
+     * writing their records at once would wait on the one throttled;
+     * faults on the shared mapping take no such lock, and each writer is
+     * throttled on its own. */
+    if (off >= 0 && (uint64_t)off + n <= (uint64_t)m->reserve) {
+        memcpy(m->map + off, buf, n);
+        return true;
+    }
     const char* p = (const char*)buf;
     while (n) {
         ssize_t w = pwrite(m->fd, p, n, (off_t)off);
