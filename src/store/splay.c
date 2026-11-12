@@ -129,6 +129,21 @@ ray_t* ray_splay_index_opt_parse(ray_t* opts, bool* auto_index) {
     return ok ? NULL : ray_error("domain", "index must be true or false");
 }
 
+ray_t* ray_splay_durable_opt_parse(ray_t* opts, bool* durable) {
+    *durable = true;
+    if (!opts || opts->type != RAY_DICT) return NULL;
+    ray_t* key = ray_sym(ray_sym_intern("durable", 7));
+    if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
+    ray_t* v = ray_dict_get(opts, key);
+    ray_release(key);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) return v;
+    bool ok = v->type == -RAY_BOOL;
+    if (ok) *durable = v->b8 != 0;
+    ray_release(v);
+    return ok ? NULL : ray_error("domain", "durable must be true or false");
+}
+
 /* --------------------------------------------------------------------------
  * ray_splay_save — save a table to a splayed table directory
  * -------------------------------------------------------------------------- */
@@ -1185,8 +1200,8 @@ ray_err_t ray_splay_save_bulk_mode(ray_t* tbl, const char* dir, const char* sym_
 
 ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
                                 ray_compress_t mode, ray_symfile_t layout,
-                                bool auto_index) {
-    return splay_save_impl(tbl, dir, sym_path, true, mode, layout == RAY_SYMFILE_COLUMN,
+                                bool auto_index, bool durable) {
+    return splay_save_impl(tbl, dir, sym_path, durable, mode, layout == RAY_SYMFILE_COLUMN,
                            auto_index);
 }
 
@@ -1613,9 +1628,17 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                 char path[1024];
                 int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
                                  (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                if (n > 0 && n < (int)sizeof(path))
-                    (void)ray_col_append_index(path, ray_index_payload(col->index),
+                /* a first-row-only hash (an append repeated a key) is
+                 * written as the complete one its values give.  If that
+                 * can't be built (OOM, cancel) the column is saved without
+                 * an index, best effort here as the append is, and a
+                 * reload answers by scanning. */
+                bool partial = ray_index_hash_first_only(col);
+                ray_t* full = partial ? ray_index_hash_rebuild(col) : NULL;
+                if (n > 0 && n < (int)sizeof(path) && (full || !partial))
+                    (void)ray_col_append_index(path, ray_index_payload(full ? full : col->index),
                                                col->len, RAY_STR);
+                if (full) ray_release(full);
             }
             return;
         }

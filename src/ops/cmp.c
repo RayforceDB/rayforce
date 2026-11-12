@@ -477,7 +477,7 @@ ray_t* ray_not_fn(ray_t* x) {
                           x->type == RAY_I32 || x->type == RAY_I64 ||
                           x->type == RAY_F32 || x->type == RAY_F64 ||
                           x->type == RAY_DATE || x->type == RAY_TIME ||
-                          x->type == RAY_TIMESTAMP)) {
+                          x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN)) {
         int64_t n = x->len;
         ray_t* r = ray_vec_new(RAY_BOOL, n);
         if (RAY_IS_ERR(r)) return r;
@@ -499,6 +499,13 @@ ray_t* ray_not_fn(ray_t* x) {
         r->len = n;
         return r;
     }
+    /* `not` has no meaning for the cells of a STR, SYM or GUID vector.  It
+     * used to fall through to the atom rule and answer one boolean for the
+     * whole vector; raise instead, as the compiled `not` does. */
+    if (ray_is_vec(x) && (x->type == RAY_STR || x->type == RAY_SYM ||
+                          x->type == RAY_GUID))
+        return ray_error("type", "not: expects a numeric argument, got %s",
+                         ray_type_name(x->type));
     /* A LIST, element by element: a nested list recurses, and all-boolean
      * results make a B8 vector. */
     if (is_list(x)) {

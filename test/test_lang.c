@@ -1270,6 +1270,119 @@ static test_result_t test_eval_in_guid_unflagged_nulls(void) {
     PASS();
 }
 
+/* ---- Test: guid `find` reads a zero cell's bytes, not the hint ----
+ * As for `in` (test_eval_in_guid_unflagged_nulls): a zero cell finds a zero
+ * cell whichever vector carries HAS_NULLS, with the table over either side,
+ * for one guid, and through a dict.  A hash index keys the zero guid like
+ * any other, so the same calls on an indexed vector give the same rows. */
+static test_result_t test_eval_find_guid_unflagged_nulls(void) {
+    static const uint8_t g1[16] = {1}, g2[16] = {2}, g3[16] = {3}, z[16] = {0};
+    uint8_t raw[32];
+    memcpy(raw, g1, 16);
+    memcpy(raw + 16, z, 16);
+    ray_t* f = ray_vec_from_raw(RAY_GUID, raw, 2);           /* g1 0, flagged */
+    ray_t* f1 = ray_vec_from_raw(RAY_GUID, z, 1);            /* 0, flagged */
+    ray_t* u = ray_vec_new(RAY_GUID, 3);                     /* g2 g3 0 */
+    u = ray_vec_append(u, g2);
+    u = ray_vec_append(u, g3);
+    u = ray_vec_append(u, z);
+    ray_t* u1 = ray_vec_append(ray_vec_new(RAY_GUID, 1), z); /* 0 */
+    TEST_ASSERT_TRUE(f && !RAY_IS_ERR(f) && f1 && !RAY_IS_ERR(f1));
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u1 && !RAY_IS_ERR(u1));
+    TEST_ASSERT_TRUE((f->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((f1->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((u->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    TEST_ASSERT_TRUE((u1->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    ray_env_set(ray_sym_intern("_gf", 3), f);
+    ray_env_set(ray_sym_intern("_gf1", 4), f1);
+    ray_env_set(ray_sym_intern("_gu", 3), u);
+    ray_env_set(ray_sym_intern("_gu1", 4), u1);
+
+    /* One zero cell each way round. */
+    ASSERT_EQ("(find _gf1 _gu1)", "[0]");
+    ASSERT_EQ("(find _gu1 _gf1)", "[0]");
+    /* As many needles as rows or more: the table over the haystack. */
+    ASSERT_EQ("(find _gf _gu)", "[0N 0N 1]");
+    ASSERT_EQ("(find _gu1 _gf)", "[0N 0]");
+    /* Fewer needles: the table over the needles. */
+    ASSERT_EQ("(find _gu _gf)", "[0N 2]");
+    ASSERT_EQ("(find _gf _gu1)", "[1]");
+    /* One guid. */
+    ASSERT_EQ("(find _gu 0Ng)", "2");
+    ASSERT_EQ("(find _gu (at _gf 1))", "2");
+    ASSERT_EQ("(find _gf (at _gu 2))", "1");
+    ASSERT_EQ("(find _gu1 (at _gf1 0))", "0");
+    /* An indexed haystack gives the same rows. */
+    ASSERT_EQ("(find (.idx.hash _gf1) _gu1)", "[0]");
+    ASSERT_EQ("(find (.idx.hash _gu1) _gf1)", "[0]");
+    ASSERT_EQ("(find (.idx.hash _gf) _gu)", "[0N 0N 1]");
+    ASSERT_EQ("(find (.idx.hash _gu) _gf)", "[0N 2]");
+    ASSERT_EQ("(find (.idx.hash _gu) 0Ng)", "2");
+    /* A dict keyed by the vector: one key, and a batch through find. */
+    ASSERT_EQ("(at (dict _gu [10 20 30]) 0Ng)", "30");
+    ASSERT_EQ("(at (dict _gu [10 20 30]) (at _gf 1))", "30");
+    ASSERT_EQ("(at (dict _gf [10 20]) (at _gu 2))", "20");
+    ASSERT_EQ("(at (dict _gu [10 20 30]) _gf)", "(list 0N 30)");
+    ASSERT_EQ("(at (dict _gf [10 20]) _gu)", "(list 0N 0N 20)");
+    ASSERT_EQ("(at (dict (.idx.hash _gu) [10 20 30]) _gf)", "(list 0N 30)");
+    ASSERT_EQ("(at (dict (.idx.hash _gu) [10 20 30]) 0Ng)", "30");
+    /* remove finds its key the same way. */
+    ASSERT_EQ("(count (remove (dict _gu [10 20 30]) 0Ng))", "2");
+
+    ray_release(f);
+    ray_release(f1);
+    ray_release(u);
+    ray_release(u1);
+    PASS();
+}
+
+/* ---- Test: a failed guid `find` scratch allocation answers "oom" ----
+ * find_guid does not fall back to the hashset either.  Fail the key table,
+ * then the first rows, with the table over the needles and over the
+ * haystack: each attempt returns "oom" and frees what it took, and the
+ * next call answers. */
+static test_result_t test_eval_find_guid_oom(void) {
+    ray_t* h = ray_eval_str("(set _gh (guid 64))");
+    ray_t* p = ray_eval_str("(set _gp (concat (at _gh [3 5]) (guid 1)))");
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && p && !RAY_IS_ERR(p));
+    struct { ray_t* vec; ray_t* val; int64_t nth; int64_t hits; } cases[] = {
+        { h, p, 1, 2 },   /* the key table, over the needles */
+        { h, p, 2, 2 },   /* the first rows, over the needles */
+        { p, h, 1, 2 },   /* the key table, over the haystack */
+        { p, h, 2, 2 },   /* the first rows, over the haystack */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* r = ray_find_fn(cases[c].vec, cases[c].val);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_error_clear();
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_in_guid_test_fail_alloc(cases[c].nth);
+        r = ray_find_fn(cases[c].vec, cases[c].val);
+        ray_in_guid_test_fail_alloc(0);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %zu: no error", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %zu: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = ray_find_fn(cases[c].vec, cases[c].val);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64);
+        TEST_ASSERT_EQ_I(r->len, cases[c].val->len);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++)
+            hits += ((int64_t*)ray_data(r))[i] != NULL_I64;
+        TEST_ASSERT_EQ_I(hits, cases[c].hits);
+        ray_release(r);
+    }
+    ray_release(h);
+    ray_release(p);
+    PASS();
+}
+
 /* ---- Test: a failed guid `in` scratch allocation answers "oom" ----
  * in_guid does not fall back to the hashset, which reads the null hint
  * (test_eval_in_guid_unflagged_nulls).  Fail the key table on either side,
@@ -1314,6 +1427,279 @@ static test_result_t test_eval_in_guid_oom(void) {
     ray_release(h);
     ray_release(p);
     ray_release(g);
+    PASS();
+}
+
+/* Whether expressions a and b evaluate to the same guid vector, byte for
+ * byte. */
+static bool guid_vec_same(const char* a, const char* b) {
+    ray_t* x = ray_eval_str(a);
+    ray_t* y = ray_eval_str(b);
+    bool same = x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y)
+             && x->type == RAY_GUID && y->type == RAY_GUID && x->len == y->len
+             && memcmp(ray_data(x), ray_data(y), (size_t)x->len * 16) == 0;
+    if (x) { if (RAY_IS_ERR(x)) ray_error_free(x); else ray_release(x); }
+    if (y) { if (RAY_IS_ERR(y)) ray_error_free(y); else ray_release(y); }
+    return same;
+}
+
+/* ---- Test: guid distinct's memory follows the column, not the workers ----
+ * Every repeat of a guid lands in that guid's partition, so a column of one
+ * value, or mostly of the zero guid, puts nearly every row in one
+ * partition.  A worker's table is capped by the mean partition, not that
+ * one: the kernel's peak, for the row ids and for the count, stays within
+ * four times the column whatever the worker count (16 bytes a row for the
+ * scatter, a byte for the marks, the workers' tables within the column's
+ * size, each block rounded up to a power of 2).  Sized by the longest
+ * partition, each worker's table took 32 bytes a row.  Lengths just under
+ * a power of 2 keep the scatter's blocks from rounding up. */
+static test_result_t test_eval_distinct_guid_skewed(void) {
+    struct { const char* set; int64_t len; int64_t nids; int64_t ids[5]; } cases[] = {
+        /* the zero guid but for four at the end */
+        { "(set _gk (concat (take [0Ng] 262076) (guid 4)))", 262080, 5,
+          { 0, 262076, 262077, 262078, 262079 } },
+        /* one guid throughout */
+        { "(set _gk (take (guid 1) 131008))", 131008, 1, { 0 } },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* v = ray_eval_str(cases[c].set);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->type == RAY_GUID);
+        TEST_ASSERT_EQ_I(v->len, cases[c].len);
+        uint64_t col = (uint64_t)v->len * 16;
+        ray_t* r = distinct_radix_first_ids(v);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = distinct_radix_first_ids(v);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64);
+        TEST_ASSERT_EQ_I(r->len, cases[c].nids);
+        for (int64_t i = 0; i < cases[c].nids; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[i], cases[c].ids[i]);
+        ray_release(r);
+        TEST_ASSERT_FMT(tr.peak_live_bytes <= 4 * col,
+                        "case %zu, row ids: peak %llu bytes, column %llu", c,
+                        (unsigned long long)tr.peak_live_bytes, (unsigned long long)col);
+
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = exec_count_distinct(NULL, NULL, v);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, cases[c].nids);
+        ray_release(r);
+        TEST_ASSERT_FMT(tr.peak_live_bytes <= 4 * col,
+                        "case %zu, count: peak %llu bytes, column %llu", c,
+                        (unsigned long long)tr.peak_live_bytes, (unsigned long long)col);
+        ray_release(v);
+    }
+    ray_t* g4 = ray_eval_str("(set _gd4 (guid 4))");
+    TEST_ASSERT_TRUE(g4 && !RAY_IS_ERR(g4));
+    bool nul = guid_vec_same("(distinct (concat (take [0Ng] 262076) _gd4))",
+                             "(concat [0Ng] _gd4)");
+    bool one = guid_vec_same("(distinct (take (at _gd4 [2]) 131008))", "(at _gd4 [2])");
+    ray_release(g4);
+    TEST_ASSERT_TRUE(nul);
+    TEST_ASSERT_TRUE(one);
+    PASS();
+}
+
+/* ---- Test: a partition past its worker's table grows a table of its own ----
+ * With a worker's table capped at 32 slots, every partition of 50000
+ * distinct guids, the zero guid, then the same 50000 again outgrows it and
+ * doubles a table of its own over and over.  The row ids, the count and
+ * distinct's answer are the uncapped kernel's. */
+static test_result_t test_eval_distinct_guid_table_growth(void) {
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 100001);
+    for (int capped = 0; capped < 2; capped++) {
+        ray_distinct_guid_test_table_cap(capped ? 32 : 0);
+        ray_t* ids = distinct_radix_first_ids(v);
+        ray_t* cnt = exec_count_distinct(NULL, NULL, v);
+        bool same = guid_vec_same("(distinct _gv)", "(concat _gd [0Ng])");
+        ray_distinct_guid_test_table_cap(0);
+        TEST_ASSERT_TRUE(ids && !RAY_IS_ERR(ids) && ids->type == RAY_I64);
+        TEST_ASSERT_EQ_I(ids->len, 50001);
+        int64_t off = -1;   /* the first id out of place */
+        for (int64_t i = 0; i < ids->len && off < 0; i++)
+            if (((int64_t*)ray_data(ids))[i] != i) off = i;
+        ray_release(ids);
+        TEST_ASSERT_FMT(off < 0, "capped %d: id %lld out of place", capped, (long long)off);
+        TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cnt->i64, 50001);
+        ray_release(cnt);
+        TEST_ASSERT_FMT(same, "capped %d: distinct differs", capped);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- Test: guid distinct short of memory declines to the hashset ----
+ * Fail each of the kernel's allocations in turn: its counts, the scatter's
+ * buffers, the marks, the workers' tables, and (the table capped at 32
+ * slots) a partition's own on a worker.  Each time the kernel frees what it
+ * took and declines, and distinct and its count still answer. */
+static test_result_t test_eval_distinct_guid_oom(void) {
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    ray_t* r = distinct_radix_first_ids(v);   /* warm up */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    const int64_t nths[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 40 };
+    for (size_t c = 0; c < sizeof(nths) / sizeof(nths[0]); c++) {
+        long long nth = (long long)nths[c];
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        ray_distinct_guid_test_table_cap(32);
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        r = distinct_radix_first_ids(v);
+        ray_distinct_guid_test_fail_alloc(0);
+        ray_mem_trace_end(&tr);
+        bool declined = r == NULL;
+        if (r && !RAY_IS_ERR(r)) ray_release(r);
+        else if (r) ray_error_free(r);
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        bool same = guid_vec_same("(distinct _gv)", "(concat _gd [0Ng])");
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        ray_t* cnt = exec_count_distinct(NULL, NULL, v);
+        ray_distinct_guid_test_fail_alloc(0);
+        ray_distinct_guid_test_table_cap(0);
+        TEST_ASSERT_FMT(declined, "nth %lld: the kernel did not decline", nth);
+        TEST_ASSERT_FMT(tr.net_bytes == 0, "nth %lld: %lld bytes kept", nth,
+                        (long long)tr.net_bytes);
+        TEST_ASSERT_FMT(same, "nth %lld: distinct differs", nth);
+        TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cnt->i64, 50001);
+        ray_release(cnt);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- Test: a cancelled guid distinct answers "cancel", never the hashset ----
+ * The kernel declines to the hashset when it is short of memory, but not
+ * when it is cancelled.  Cancel each of its three dispatches in turn (the
+ * histogram, the scatter, the partitions), by a cancel request and by the
+ * pool's flag alone: the row ids and the count each answer "cancel" and
+ * free what they took, and once cleared, each answers. */
+static test_result_t test_eval_distinct_guid_cancel(void) {
+    if (!ray_pool_get()) SKIP("no pool to dispatch to");
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    for (int count = 0; count < 2; count++) {
+        ray_t* r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));   /* warm up */
+        ray_release(r);
+        for (int pool_only = 0; pool_only < 2; pool_only++) {
+            for (uint32_t k = 1; k <= 3; k++) {
+                ray_mem_trace_t tr;
+                TEST_ASSERT_TRUE(ray_mem_trace_begin());
+                ray_pool_test_cancel_at(k, pool_only);
+                r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                bool is_cancel = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "cancel") == 0;
+                if (r && RAY_IS_ERR(r)) ray_error_free(r);
+                else if (r) ray_release(r);
+                ray_error_clear();
+                ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(is_cancel, "%s, dispatch %u, pool flag %d: %s",
+                                count ? "count" : "row ids", k, pool_only,
+                                r ? "not cancel" : "declined");
+                TEST_ASSERT_FMT(tr.net_bytes == 0, "%s, dispatch %u: %lld bytes kept",
+                                count ? "count" : "row ids", k, (long long)tr.net_bytes);
+            }
+        }
+        r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(count ? r->i64 : r->len, 50001);
+        ray_release(r);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* The i64 atom an expression evaluates to, or INT64_MIN. */
+static int64_t rb_eval_i64(const char* e) {
+    ray_t* r = ray_eval_str(e);
+    int64_t v = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 ? r->i64 : INT64_MIN;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return v;
+}
+
+/* ---- Test: a failed in-place insert or upsert leaves the key's index right ----
+ * An in-place insert appends column by column, and the append of an indexed
+ * key extends its hash over the new rows.  When a later column's append
+ * then fails, the rollback truncates every column and must drop that
+ * extension, or the index would cover rows that are gone.  Fail each
+ * allocation of a 200-row insert, and of a 200-row upsert whose I32 payload
+ * takes the row-at-a-time path (its rollback is upsert_rollback_appends),
+ * in turn: 200 rows outgrow both columns' capacity, so the value column's
+ * growth can fail after the key's index was extended.  After a failure the
+ * key has its 100 rows, or all of them when only the call's result could
+ * not be allocated; either way it is unindexed or indexed over exactly its
+ * rows, and find agrees with the plain column.  Some failure must be the
+ * rollback dropping an extended index.  The call is parsed once and only
+ * its evaluation fails allocations. */
+static test_result_t test_eval_insert_upsert_rollback_index(void) {
+    const char* reset = "(set _rt (table ['k 'v] (list (.idx.hash (til 100)) (til 100))))";
+    struct { const char* op; int64_t grown; } cases[] = {
+        { "(insert '_rt (table ['k 'v] (list (+ 2000 (til 200)) (til 200))))", 300 },
+        { "(upsert '_rt 'k (table ['k 'v] (list (as 'i32 (+ 2000 (til 200))) (as 'i32 (til 200)))))", 300 },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* op = ray_parse(cases[c].op);
+        TEST_ASSERT_TRUE(op && !RAY_IS_ERR(op));
+        /* the allocations of a run that succeeds bound the sweep */
+        ray_t* r = ray_eval_str(reset);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = ray_eval(op);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at _rt 'k))"), cases[c].grown);
+        int64_t failed = 0, dropped = 0;
+        for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
+            r = ray_eval_str(reset);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            ray_release(r);
+            ray_alloc_fail_set_for_test(nth, 1);
+            r = ray_eval(op);
+            ray_alloc_fail_set_for_test(0, 0);
+            bool err = r && RAY_IS_ERR(r);
+            if (err) ray_error_free(r); else if (r) ray_release(r);
+            ray_error_clear();
+            int64_t n = rb_eval_i64("(count (at _rt 'k))");
+            TEST_ASSERT_FMT(n == cases[c].grown || (err && n == 100),
+                            "case %zu, allocation %lld: %lld rows after %s", c,
+                            (long long)nth, (long long)n, err ? "a failure" : "a success");
+            int64_t has = rb_eval_i64("(as 'i64 (.idx.has? (at _rt 'k)))");
+            if (has == 1) {
+                int64_t len = rb_eval_i64("(at (.idx.info (at _rt 'k)) 'length)");
+                TEST_ASSERT_FMT(len == n, "case %zu, allocation %lld: the index covers %lld of %lld rows",
+                                c, (long long)nth, (long long)len, (long long)n);
+            } else if (err && n == 100) {
+                dropped++;
+            }
+            if (err) failed++;
+            ASSERT_EQ("(find (at _rt 'k) [2000 5 2199 99 -1])",
+                      "(find (.idx.drop (at _rt 'k)) [2000 5 2199 99 -1])");
+        }
+        ray_release(op);
+        TEST_ASSERT_FMT(failed > 0, "case %zu: no allocation failed the call", c);
+        TEST_ASSERT_FMT(dropped > 0, "case %zu: no rollback dropped an extended index", c);
+    }
     PASS();
 }
 
@@ -11686,7 +12072,14 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/in", test_eval_in, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_guid_nulls", test_eval_select_where_in_guid_nulls, lang_setup, lang_teardown },
     { "lang/eval/in_guid_unflagged_nulls", test_eval_in_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/find_guid_unflagged_nulls", test_eval_find_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/find_guid_oom", test_eval_find_guid_oom, lang_setup, lang_teardown },
     { "lang/eval/in_guid_oom", test_eval_in_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_skewed", test_eval_distinct_guid_skewed, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_table_growth", test_eval_distinct_guid_table_growth, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_oom", test_eval_distinct_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
+    { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
