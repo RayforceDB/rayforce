@@ -132,8 +132,9 @@ static test_result_t publication_budget_edges(void) {
         const char* names[] = {text}; size_t lengths[] = {strlen(text)};
         uint32_t before = ray_sym_count();
         ray_read_budget_t b;
-        /* Ledger, candidate plan, dedup map, input bytes, string chunk. */
-        size_t exact = sizeof(b) + 5 * page;
+        /* Ledger, candidate plan, dedup map and input bytes.  The names fit the
+         * arena's head chunk, so no string chunk is prepared or charged. */
+        size_t exact = sizeof(b) + 4 * page;
         TEST_ASSERT_TRUE(ray_read_budget_init(&b, exact + delta));
         int64_t id = -99;
         bool ok = ray_sym_publish_values(&b, names, lengths, 1, UINT32_MAX, &id);
@@ -197,11 +198,70 @@ static test_result_t publication_concurrent(void) {
     PASS();
 }
 
+
+/* Publications that add names must not strand the arena's head chunk: a loop
+ * that alternates them with ordinary interns keeps using the same chunk. */
+static test_result_t publication_keeps_head_chunk_usable(void) {
+    size_t chunks0 = ray_sym_test_arena_chunks();
+    for (int cycle = 0; cycle < 400; cycle++) {
+        char a[48], c[48];
+        int an = snprintf(a, sizeof a, "published-%d-with-some-length", cycle);
+        int cn = snprintf(c, sizeof c, "ordinary-%d-with-some-length", cycle);
+        const char* strings[] = { a };
+        size_t lengths[] = { (size_t)an };
+        int64_t id;
+        ray_read_budget_t b;
+        TEST_ASSERT_TRUE(ray_read_budget_init(&b, 2u << 20));
+        TEST_ASSERT_TRUE(ray_sym_publish_values(&b, strings, lengths, 1, UINT32_MAX, &id));
+        ray_read_budget_close(&b);
+        TEST_ASSERT_EQ_U(b.live, 0);
+        TEST_ASSERT_EQ_I(ray_sym_find(a, (size_t)an), id);
+        TEST_ASSERT(ray_sym_intern(c, (size_t)cn) >= 0, "ordinary intern");
+    }
+    /* 800 names of about 100 bytes of arena each fit in the first chunks; the
+     * old behaviour made one chunk per publication and one per intern */
+    TEST_ASSERT(ray_sym_test_arena_chunks() <= chunks0 + 2, "chunk count stays bounded");
+    PASS();
+}
+
+/* A publication larger than the free head chunk adopts one chunk, charged to
+ * the reader's budget, and leaves it usable for the interns that follow. */
+static test_result_t publication_adopts_a_usable_chunk(void) {
+    enum { N = 40 };
+    static char names[N][64 * 1024];
+    const char* ptrs[N]; size_t lengths[N];
+    for (int i = 0; i < N; i++) {
+        memset(names[i], 'a' + i % 26, sizeof names[i] - 16);
+        snprintf(names[i] + sizeof names[i] - 16, 16, "%d", i);
+        ptrs[i] = names[i]; lengths[i] = strlen(names[i]);
+    }
+    size_t chunks0 = ray_sym_test_arena_chunks();
+    int64_t ids[N];
+    ray_read_budget_t b;
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 8u << 20));
+    TEST_ASSERT_TRUE(ray_sym_publish_values(&b, ptrs, lengths, N, UINT32_MAX, ids));
+    TEST_ASSERT(b.peak > (size_t)N * 64 * 1024, "the chunk is charged");
+    ray_read_budget_close(&b);
+    TEST_ASSERT_EQ_U(b.live, 0);
+    TEST_ASSERT(ray_sym_test_arena_chunks() <= chunks0 + 1, "one chunk adopted");
+    for (int i = 0; i < N; i++) TEST_ASSERT_EQ_I(ray_sym_find(ptrs[i], lengths[i]), ids[i]);
+    size_t chunks1 = ray_sym_test_arena_chunks();
+    for (int i = 0; i < 50; i++) {
+        char nm[32];
+        int n = snprintf(nm, sizeof nm, "after-adopt-%d", i);
+        TEST_ASSERT(ray_sym_intern(nm, (size_t)n) >= 0, "intern");
+    }
+    TEST_ASSERT_EQ_U(ray_sym_test_arena_chunks(), chunks1);   /* served by the adopted chunk */
+    PASS();
+}
+
 const test_entry_t sym_publish_entries[] = {
     {"reader_proof/publication_faults", publication_faults, setup, teardown},
     {"reader_proof/publication_recheck", publication_recheck, setup, teardown},
     {"reader_proof/publication_fixup", publication_fixup, setup, teardown},
     {"reader_proof/publication_budget_edges", publication_budget_edges, setup, teardown},
     {"reader_proof/publication_concurrent", publication_concurrent, setup, teardown},
+    {"reader_proof/publication_keeps_head_chunk_usable", publication_keeps_head_chunk_usable, setup, teardown},
+    {"reader_proof/publication_adopts_a_usable_chunk", publication_adopts_a_usable_chunk, setup, teardown},
     {NULL, NULL, NULL, NULL}
 };

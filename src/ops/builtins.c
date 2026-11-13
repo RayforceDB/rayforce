@@ -391,7 +391,7 @@ ray_t* ray_repr_fn(ray_t** args, int64_t n) {
     if (n == 2) {
         if (!args[1] || args[1]->type != -RAY_I64) return ray_error("type", "repr: the byte limit must be an integer");
         limit = args[1]->i64;
-        if (limit <= 0 || limit == INT64_MIN) return ray_error("domain", "repr: the byte limit must be positive");
+        if (limit <= 0) return ray_error("domain", "repr: the byte limit must be positive");
     }
     return ray_fmt_limited(args[0], RAY_FMT_ROUNDTRIP, limit);
 }

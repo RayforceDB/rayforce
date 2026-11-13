@@ -193,6 +193,7 @@ static inline size_t ray_sym_bytes_upper(size_t len) {
 uintptr_t ray_sym_test_lock_addr(void);
 uintptr_t ray_sym_test_table_addr(void);
 size_t    ray_sym_test_table_size(void);
+size_t    ray_sym_test_arena_chunks(void);
 uintptr_t ray_sym_test_inited_addr(void);
 
 typedef struct ray_read_budget ray_read_budget_t;
