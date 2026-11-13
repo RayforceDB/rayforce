@@ -2649,7 +2649,25 @@ static test_result_t test_domain_flush_append_in_place(void) {
     PASS();
 }
 
-#ifndef _WIN32
+static int64_t ix_mtime_ns(const struct stat* st) {
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+    /* Darwin's POSIX namespace exposes seconds/nanoseconds separately. */
+    return (int64_t)st->st_mtime * 1000000000 + st->st_mtimensec;
+#elif defined(__APPLE__)
+    return (int64_t)st->st_mtimespec.tv_sec * 1000000000 + st->st_mtimespec.tv_nsec;
+#else
+    return (int64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec;
+#endif
+}
+static int64_t ix_ctime_ns(const struct stat* st) {
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+    return (int64_t)st->st_ctime * 1000000000 + st->st_ctimensec;
+#elif defined(__APPLE__)
+    return (int64_t)st->st_ctimespec.tv_sec * 1000000000 + st->st_ctimespec.tv_nsec;
+#else
+    return (int64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec;
+#endif
+}
 /* The header count of the symfile at `p`, or -1. */
 static int64_t dom_app_count(const char* p) {
     int64_t c = -1;
@@ -2658,6 +2676,7 @@ static int64_t dom_app_count(const char* p) {
     if (f) fclose(f);
     return c;
 }
+#ifndef _WIN32
 /* Child half of test_domain_append_failed: 0, or the first failed check. */
 static int dom_app_failed_child(const char* p, const char* q, long size0, int64_t n0) {
     struct rlimit lim, low;
@@ -2675,10 +2694,30 @@ static int dom_app_failed_child(const char* p, const char* q, long size0, int64_
     }
     low.rlim_cur = (rlim_t)size0 + 4096;
     if (setrlimit(RLIMIT_FSIZE, &low) != 0) return 5;
+    /* a later status-change time than the append that made the file: the
+     * filesystem's clock past the file's (a probe file's time moved on) */
+    {
+        struct stat fs, ps;
+        char tick[512];
+        snprintf(tick, sizeof(tick), "%s.tick", p);
+        if (stat(p, &fs) != 0) return 24;
+        for (int i = 0; i < 100000; i++) {
+            FILE* t = fopen(tick, "wb");
+            if (t) fclose(t);
+            if (stat(tick, &ps) == 0 && ix_ctime_ns(&ps) != ix_ctime_ns(&fs)) break;
+        }
+        (void)remove(tick);
+    }
     if (ray_sym_domain_flush_append(d, true) == RAY_OK) return 6;
     struct stat st;
     if (stat(p, &st) != 0 || (long)st.st_size != size0) return 7;
     if (dom_app_count(p) != n0) return 8;
+    /* the failure rewrote the header and cut the file back, moving its
+     * times: the still-cached domain takes it as its own file, not a
+     * replacement */
+    ray_sym_domain_t* cached = ray_sym_domain_open(p);
+    if (cached != d) return 23;
+    ray_sym_domain_release(cached);
     if (setrlimit(RLIMIT_FSIZE, &lim) != 0) return 9;
     if (ray_sym_domain_flush_append(d, true) != RAY_OK) return 10;
     ray_sym_domain_release(d);
@@ -2814,6 +2853,292 @@ static test_result_t test_domain_torn_append(void) {
     /* records short of the count are corruption, not a tail to ignore */
     TEST_ASSERT_EQ_I(truncate(p, st.st_size - 3), 0);
     TEST_ASSERT_NULL(ray_sym_domain_open(p));
+    dom_app_clean(p);
+    PASS();
+}
+
+/* What another process's append does to the symfile at `p`: the file is cut
+ * to `keep` bytes when keep >= 0 (a torn tail goes), the records of `strs`
+ * are written after the last one, and the header count follows. */
+static bool dom_raw_append(const char* p, const char* const* strs, int k, long keep) {
+    int64_t c = dom_app_count(p);
+    FILE* f = fopen(p, "rb+");
+    if (!f || c < 0) { if (f) fclose(f); return false; }
+    bool ok = true;
+    if (keep >= 0) ok = fflush(f) == 0 && ftruncate(fileno(f), (off_t)keep) == 0;
+    ok = ok && fseek(f, 0, SEEK_END) == 0;
+    for (int i = 0; ok && i < k; i++) {
+        uint32_t l = (uint32_t)strlen(strs[i]);
+        ok = fwrite(&l, 4, 1, f) == 1 && fwrite(strs[i], 1, l, f) == l;
+    }
+    c += k;
+    ok = ok && fseek(f, 4, SEEK_SET) == 0 && fwrite(&c, 8, 1, f) == 1;
+    return fclose(f) == 0 && ok;
+}
+
+/* A reader that opens (or catches up) a symfile while another process
+ * appends gets one whole version of it: the count of the file as it was
+ * when the reader took the file's size, never a later count over a mapping
+ * that stops short of its records.  The hook appends and counts three
+ * (then two) records right after the mapping is taken. */
+static const char* g_race_strs[3];
+static int g_race_k, g_race_armed;
+static void dom_race_hook(int ev, const char* path) {
+    if (ev != RAY_SYM_DOMAIN_EV_MAPPED || !g_race_armed) return;
+    g_race_armed = 0;
+    (void)dom_raw_append(path, g_race_strs, g_race_k, -1);
+}
+static test_result_t test_domain_append_during_map(void) {
+    const char* p = ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_race");
+    dom_app_clean(p);
+    char buf[64];
+    ray_sym_domain_t* d = ray_sym_domain_open_or_create(p);
+    TEST_ASSERT_NOT_NULL(d);
+    for (int i = 0; i < 1000; i++) {
+        int l = snprintf(buf, sizeof(buf), "base-%d", i);
+        TEST_ASSERT_TRUE(ray_sym_domain_intern(d, buf, (size_t)l) >= 0);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+    int64_t n0 = ray_sym_domain_count(d);
+    ray_sym_domain_release(d);
+
+    /* open: the appended records are not in this reader's version */
+    g_race_strs[0] = "race-a"; g_race_strs[1] = "race-b"; g_race_strs[2] = "race-c";
+    g_race_k = 3; g_race_armed = 1;
+    ray_sym_domain_test_hook(dom_race_hook);
+    d = ray_sym_domain_open(p);
+    ray_sym_domain_test_hook(NULL);
+    TEST_ASSERT_EQ_I(g_race_armed, 0);
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "base-999", 8), 1000);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "race-a", 6), -1);
+
+    /* catching up with growth, while more is appended: the growth that
+     * was counted when the file was mapped, not the later one */
+    const char* ext[1] = { "ext-a" };
+    TEST_ASSERT_TRUE(dom_raw_append(p, ext, 1, -1));
+    g_race_strs[0] = "late-a"; g_race_strs[1] = "late-b";
+    g_race_k = 2; g_race_armed = 1;
+    ray_sym_domain_test_hook(dom_race_hook);
+    ray_sym_domain_t* d2 = ray_sym_domain_open(p);
+    ray_sym_domain_test_hook(NULL);
+    TEST_ASSERT_EQ_I(g_race_armed, 0);
+    TEST_ASSERT_TRUE(d2 == d);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0 + 4);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "race-c", 6), n0 + 2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "ext-a", 5), n0 + 3);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "late-a", 6), -1);
+    ray_sym_domain_release(d2);
+
+    /* the next reader has all of it */
+    d2 = ray_sym_domain_open(p);
+    TEST_ASSERT_TRUE(d2 == d);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0 + 6);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "late-b", 6), n0 + 5);
+    ray_sym_domain_release(d2);
+    ray_sym_domain_release(d);
+    dom_app_clean(p);
+    PASS();
+}
+
+/* A process holding a domain opened over a torn tail survives what another
+ * process does to the file next: it cuts the tail and appends a record
+ * longer or shorter than the tail, or replaces the file by a whole one; or
+ * this process appends first (cutting the tail itself).  And it survives a
+ * tail left while it holds the domain, whose own next append cuts it.  The
+ * opened image ends at its counted records, not at its file size. */
+static test_result_t test_domain_held_torn_tail(void) {
+    const char* p = ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_heldtorn");
+    char buf[64], tp[256];
+    snprintf(tp, sizeof(tp), "%s.new", p);
+    const uint8_t junk[] = { 5,0,0,0,'j','u','n','k','z' };
+    const char* longer[1] = { "a-record-longer-than-the-torn-tail" };
+    const char* shorter[1] = { "x" };
+    for (int phase = 0; phase < 5; phase++) {
+        dom_app_clean(p);
+        ray_sym_domain_t* d = ray_sym_domain_open_or_create(p);
+        TEST_ASSERT_NOT_NULL(d);
+        for (int i = 0; i < 1000; i++) {
+            int l = snprintf(buf, sizeof(buf), "base-%d", i);
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(d, buf, (size_t)l) >= 0);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+        int64_t n0 = ray_sym_domain_count(d);
+        ray_sym_domain_release(d);
+        struct stat st;
+        TEST_ASSERT_EQ_I(stat(p, &st), 0);
+        long good = (long)st.st_size;
+        FILE* f;
+        if (phase < 4) {   /* opened with a tail */
+            f = fopen(p, "ab");
+            TEST_ASSERT_NOT_NULL(f);
+            TEST_ASSERT_EQ_I(fwrite(junk, 1, sizeof junk, f), sizeof junk);
+            fclose(f);
+        }
+        d = ray_sym_domain_open(p);
+        TEST_ASSERT_NOT_NULL(d);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0);
+        const char* added = NULL;
+        int64_t cnt = n0;
+        if (phase == 0 || phase == 1) {          /* another process cuts the tail and appends */
+            added = phase ? shorter[0] : longer[0];
+            TEST_ASSERT_TRUE(dom_raw_append(p, phase ? shorter : longer, 1, good));
+            cnt = n0 + 1;
+        } else if (phase == 2) {                 /* this process appends (cuts), then another */
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "own", 3) >= 0);
+            TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+            added = "other";
+            const char* o[1] = { added };
+            TEST_ASSERT_TRUE(dom_raw_append(p, o, 1, -1));
+            cnt = n0 + 2;
+        } else if (phase == 3) {                 /* another process replaces the file by a whole one */
+            added = "r3";
+            uint8_t* img = NULL; long n = 0;
+            TEST_ASSERT_TRUE(dom_file_bytes(p, &img, &n));
+            f = fopen(tp, "wb");
+            TEST_ASSERT_NOT_NULL(f);
+            TEST_ASSERT_EQ_I(fwrite(img, 1, (size_t)good, f), (size_t)good);
+            fclose(f);
+            ray_sys_free(img);
+            const char* o[1] = { added };
+            TEST_ASSERT_TRUE(dom_raw_append(tp, o, 1, -1));
+            TEST_ASSERT_EQ_I(rename(tp, p), 0);
+            cnt = n0 + 1;
+        } else {                                 /* a tail left while it is held */
+            f = fopen(p, "ab");
+            TEST_ASSERT_NOT_NULL(f);
+            TEST_ASSERT_EQ_I(fwrite(junk, 1, sizeof junk, f), sizeof junk);
+            fclose(f);
+        }
+        ray_sym_domain_t* d2 = ray_sym_domain_open(p);
+        TEST_ASSERT_TRUE(d2 == d);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(d), cnt);
+        if (added) TEST_ASSERT_EQ_I(ray_sym_domain_find(d, added, strlen(added)), cnt - 1);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "junkz", 5), -1);
+        ray_sym_domain_release(d2);
+
+        /* its own next append, which cuts a tail that is left */
+        TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "after", 5) >= 0);
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+        TEST_ASSERT_EQ_I(stat(p, &st), 0);
+        if (phase == 4) TEST_ASSERT_EQ_I((long)st.st_size, good + 4 + 5);
+        ray_sym_domain_release(d);
+        d = ray_sym_domain_open(p);
+        TEST_ASSERT_NOT_NULL(d);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(d), cnt + 1);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "after", 5), cnt);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "junkz", 5), -1);
+        ray_sym_domain_release(d);
+    }
+    dom_app_clean(p);
+    char z[260];
+    snprintf(z, sizeof(z), "%s.new", p);
+    unlink(z);
+    PASS();
+}
+
+/* The sync calls of a flush_append, in order (the hook's record). */
+static int g_sync_ev[16], g_sync_n;
+static void dom_sync_hook(int ev, const char* path) {
+    (void)path;
+    if (ev != RAY_SYM_DOMAIN_EV_MAPPED && g_sync_n < 16) g_sync_ev[g_sync_n++] = ev;
+}
+static bool dom_sync_seq(int n, const int* want) {
+    bool ok = g_sync_n == n;
+    for (int i = 0; ok && i < n; i++) ok = g_sync_ev[i] == want[i];
+    g_sync_n = 0;
+    return ok;
+}
+
+/* The durability of an append: a durable one syncs the records before the
+ * count is written and the file again after (the directory too, once: the
+ * first durable one after a file that nothing has synced); a non-durable
+ * one syncs nothing, and a later durable flush with nothing new, on the
+ * same open domain, syncs what it left. */
+static test_result_t test_domain_append_sync_order(void) {
+    enum { SF = RAY_SYM_DOMAIN_EV_SYNC_FILE, CT = RAY_SYM_DOMAIN_EV_COUNT, SD = RAY_SYM_DOMAIN_EV_SYNC_DIR };
+    const char* p = ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_sync");
+    dom_app_clean(p);
+    char buf[64];
+    ray_sym_domain_t* d = ray_sym_domain_open_or_create(p);
+    TEST_ASSERT_NOT_NULL(d);
+    for (int i = 0; i < 100; i++) {
+        int l = snprintf(buf, sizeof(buf), "base-%d", i);
+        TEST_ASSERT_TRUE(ray_sym_domain_intern(d, buf, (size_t)l) >= 0);
+    }
+    /* a file made non-durably: nothing synced yet */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, false), RAY_OK);
+    g_sync_n = 0;
+    ray_sym_domain_test_hook(dom_sync_hook);
+
+    /* a non-durable append writes the count and syncs nothing */
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "nd-1", 4) >= 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, false), RAY_OK);
+    TEST_ASSERT_TRUE(dom_sync_seq(1, (const int[]){ CT }));
+    /* nothing new, durable: the unsynced bytes and the directory entry */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+    TEST_ASSERT_TRUE(dom_sync_seq(2, (const int[]){ SF, SD }));
+    /* now there is nothing left to sync */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+    TEST_ASSERT_TRUE(dom_sync_seq(0, NULL));
+    /* a durable append: records, count, file; the directory is not touched */
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "d-1", 3) >= 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+    TEST_ASSERT_TRUE(dom_sync_seq(3, (const int[]){ SF, CT, SF }));
+    ray_sym_domain_test_hook(NULL);
+    ray_sym_domain_release(d);
+
+    /* a durable append to a file nothing had synced: the directory as well */
+    dom_app_clean(p);
+    d = ray_sym_domain_open_or_create(p);
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "x-0", 3) >= 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, false), RAY_OK);
+    g_sync_n = 0;
+    ray_sym_domain_test_hook(dom_sync_hook);
+    TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "x-1", 3) >= 0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+    TEST_ASSERT_TRUE(dom_sync_seq(4, (const int[]){ SF, CT, SF, SD }));
+    ray_sym_domain_test_hook(NULL);
+    ray_sym_domain_release(d);
+    dom_app_clean(p);
+    PASS();
+}
+
+/* ray_sym_domain_compress over a symfile with a torn tail: the bytes past
+ * the counted records are ignored, the file is compressed and reads back
+ * with exactly its counted entries. */
+static test_result_t test_domain_compress_torn_tail(void) {
+    const char* p = ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_zctorn");
+    dom_app_clean(p);
+    char buf[64];
+    ray_sym_domain_t* d = ray_sym_domain_open_or_create(p);
+    TEST_ASSERT_NOT_NULL(d);
+    for (int i = 0; i < 5000; i++) {
+        int l = snprintf(buf, sizeof(buf), "compress-me-please-%d", i);
+        TEST_ASSERT_TRUE(ray_sym_domain_intern(d, buf, (size_t)l) >= 0);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+    int64_t n0 = ray_sym_domain_count(d);
+    ray_sym_domain_release(d);
+    FILE* f = fopen(p, "ab");
+    TEST_ASSERT_NOT_NULL(f);
+    const uint8_t junk[] = { 5,0,0,0,'j','u','n','k','z', 9,0,0,0,'p' };
+    TEST_ASSERT_EQ_I(fwrite(junk, 1, sizeof junk, f), sizeof junk);
+    fclose(f);
+
+    TEST_ASSERT_EQ_I(ray_sym_domain_compress(p), RAY_OK);
+    uint8_t* img = NULL; long n = 0;
+    TEST_ASSERT_TRUE(dom_file_bytes(p, &img, &n));
+    TEST_ASSERT_TRUE(n >= 4 && !memcmp(img, "STRZ", 4));
+    ray_sys_free(img);
+    d = ray_sym_domain_open(p);
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "compress-me-please-4999", 23), 5000);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "junkz", 5), -1);
+    ray_sym_domain_release(d);
     dom_app_clean(p);
     PASS();
 }
@@ -3340,25 +3665,6 @@ static inline int64_t ix_cap(int64_t count) { int64_t n = ix_nblk(count); return
 
 static inline size_t ix_bytes(int64_t count) { return IXH + 64 * (size_t)ix_cap(count); }
 /* A file's modification and status-change times in nanoseconds. */
-static int64_t ix_mtime_ns(const struct stat* st) {
-#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
-    /* Darwin's POSIX namespace exposes seconds/nanoseconds separately. */
-    return (int64_t)st->st_mtime * 1000000000 + st->st_mtimensec;
-#elif defined(__APPLE__)
-    return (int64_t)st->st_mtimespec.tv_sec * 1000000000 + st->st_mtimespec.tv_nsec;
-#else
-    return (int64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec;
-#endif
-}
-static int64_t ix_ctime_ns(const struct stat* st) {
-#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
-    return (int64_t)st->st_ctime * 1000000000 + st->st_ctimensec;
-#elif defined(__APPLE__)
-    return (int64_t)st->st_ctimespec.tv_sec * 1000000000 + st->st_ctimespec.tv_nsec;
-#else
-    return (int64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec;
-#endif
-}
 /* Claim an index for a file's current identity, as one written for that
  * very file is. */
 static void ix_stamp(uint8_t* ix, const char* path) {
@@ -4079,6 +4385,7 @@ static test_result_t test_domain_index_scenarios(void) {
         test_domain_open_basic, test_domain_raw_pin, test_domain_extend_reopen_flat,
         test_domain_extend_after_flush, test_domain_flush_append,
         test_domain_flush_append_in_place, test_domain_torn_append,
+        test_domain_append_during_map, test_domain_held_torn_tail,
         test_domain_open_position0_validation, test_domain_intern_batch,
     };
     for (size_t k = 0; k < sizeof runs / sizeof runs[0]; k++) {
@@ -4110,6 +4417,10 @@ const test_entry_t domain_entries[] = {
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },
     { "domain/flush_append_in_place", test_domain_flush_append_in_place, domain_setup, domain_teardown },
     { "domain/torn_append", test_domain_torn_append, domain_setup, domain_teardown },
+    { "domain/append_during_map", test_domain_append_during_map, domain_setup, domain_teardown },
+    { "domain/held_torn_tail", test_domain_held_torn_tail, domain_setup, domain_teardown },
+    { "domain/append_sync_order", test_domain_append_sync_order, domain_setup, domain_teardown },
+    { "domain/compress_torn_tail", test_domain_compress_torn_tail, domain_setup, domain_teardown },
     { "domain/append_failed", test_domain_append_failed, domain_setup, domain_teardown },
     { "domain/import_dict", test_domain_import_dict, domain_setup, domain_teardown },
     { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },

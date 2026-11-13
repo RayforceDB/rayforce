@@ -315,6 +315,15 @@ enum {
 };
 void ray_sym_domain_batch_cancel_for_test(int phase);
 #endif
+/* Tests: fn(event, path) is called at points of a symfile's open and
+ * append that a test steers or observes; NULL disarms (ray_test_hooks_off). */
+enum {
+    RAY_SYM_DOMAIN_EV_MAPPED    = 1,   /* a symfile was just mapped, before its count is used (open, reopen after growth) */
+    RAY_SYM_DOMAIN_EV_SYNC_FILE = 2,   /* the symfile is about to be synced to media */
+    RAY_SYM_DOMAIN_EV_COUNT     = 3,   /* the header count of an append was just written */
+    RAY_SYM_DOMAIN_EV_SYNC_DIR  = 4    /* the symfile's directory is about to be synced */
+};
+void ray_sym_domain_test_hook(void (*fn)(int event, const char* path));
 /* The same with hashes[i] = ray_hash_bytes of strs[i], all 64 bits: the
  * import dictionary keys on them (the 32-bit entry point hashes its strings
  * again for it); the other domains take their low 32 bits. */

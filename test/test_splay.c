@@ -3491,6 +3491,64 @@ static bool sym_set_reads_back(const char* dir, const char* sym, int n, const ch
     ray_release(l);
     return ok;
 }
+/* A process holding a table survives a torn tail another process left in the
+ * shared symfile: it reads again, saves a new symbol (the save cuts the
+ * tail) and reads it, and the held table still shows its own cells. */
+static ray_t* sym_pair_table(const char* a, const char* b) {
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W64, 2);
+    if (RAY_IS_ERR(col)) return NULL;
+    ((int64_t*)ray_data(col))[0] = ray_sym_intern(a, strlen(a));
+    ((int64_t*)ray_data(col))[1] = ray_sym_intern(b, strlen(b));
+    col->len = 2;
+    ray_t* t = ray_table_add_col(ray_table_new(1), ray_sym_intern("s", 1), col);
+    ray_release(col);
+    return t;
+}
+static bool sym_pair_is(ray_t* t, const char* a, const char* b) {
+    ray_t* c = t && !RAY_IS_ERR(t) ? ray_table_get_col_idx(t, 0) : NULL;
+    if (!c || c->type != RAY_SYM || c->len != 2) return false;
+    ray_t* x = ray_sym_vec_cell(c, 0);
+    ray_t* y = ray_sym_vec_cell(c, 1);
+    return x && y && ray_str_len(x) == strlen(a) && !memcmp(ray_str_ptr(x), a, strlen(a)) &&
+           ray_str_len(y) == strlen(b) && !memcmp(ray_str_ptr(y), b, strlen(b));
+}
+static test_result_t test_save_symfile_held_torn_tail(void) {
+    const char* dir = ray_test_tmp(TMP_SPLAY_BASE_LIT "/symapp_held");
+    char sym[512], lk[520];
+    snprintf(sym, sizeof sym, "%s/.sym", dir);
+    snprintf(lk, sizeof lk, "%s.lk", sym);
+    rm_rf(dir);
+    ray_t* t0 = sym_pair_table("a", "b");
+    ray_t* t1 = sym_pair_table("c", "a");
+    TEST_ASSERT_TRUE(t0 && t1);
+    TEST_ASSERT_EQ_I(ray_splay_save(t0, dir, sym), RAY_OK);
+    ray_t* held = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(sym_pair_is(held, "a", "b"));
+    struct stat s0, s1;
+    TEST_ASSERT_EQ_I(stat(sym, &s0), 0);
+
+    FILE* f = fopen(sym, "ab");
+    TEST_ASSERT_NOT_NULL(f);
+    const uint8_t junk[] = { 5,0,0,0,'j','u','n','k','z' };
+    TEST_ASSERT_EQ_I(fwrite(junk, 1, sizeof junk, f), sizeof junk);
+    fclose(f);
+    ray_t* again = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(sym_pair_is(again, "a", "b"));
+    ray_release(again);
+
+    TEST_ASSERT_EQ_I(ray_splay_save(t1, dir, sym), RAY_OK);
+    TEST_ASSERT_EQ_I(stat(sym, &s1), 0);
+    TEST_ASSERT_EQ_I((long)s1.st_size, (long)s0.st_size + 4 + 1);   /* the tail is cut */
+    TEST_ASSERT_EQ_I(symfile_count(sym), 4);                         /* "", a, b, c */
+    ray_t* fresh = ray_read_splayed(dir, sym);
+    TEST_ASSERT_TRUE(sym_pair_is(fresh, "c", "a"));
+    TEST_ASSERT_TRUE(sym_pair_is(held, "a", "b"));
+    ray_release(fresh); ray_release(held);
+    ray_release(t0); ray_release(t1);
+    rm_rf(dir);
+    unlink(lk);
+    PASS();
+}
 static test_result_t test_save_symfile_appends(void) {
     enum { N = 20000 };
     const char* dir = ray_test_tmp(TMP_SPLAY_BASE_LIT "/symapp_sh");
@@ -3630,5 +3688,6 @@ const test_entry_t splay_entries[] = {
     { "splay/save_hash_in_place",         test_save_hash_in_place,              splay_setup, splay_teardown },
     { "splay/per_column_symfiles",        test_per_column_symfiles,             splay_setup, splay_teardown },
     { "splay/save_symfile_appends",       test_save_symfile_appends,            splay_setup, splay_teardown },
+    { "splay/save_symfile_held_torn_tail", test_save_symfile_held_torn_tail,    splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

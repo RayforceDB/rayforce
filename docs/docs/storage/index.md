@@ -224,6 +224,12 @@ The global symbol intern table maps strings to integer IDs. When saving data to 
 
 A table's symbol file, which `.db.splayed.set` and the importers write, is append-only: new symbols are appended to the end of the file without rewriting existing entries, so a symbol's position never changes and updates are incremental. One process writes a database at a time: a writer whose view of the file is out of date fails with `RAY_ERR_CORRUPT` instead of overwriting another writer's symbols (see [Running Several Instances](../guides/instances.md)).
 
+The file is a header (the `STRL` magic and the number of symbols) followed by one record per symbol, a 4-byte length and the bytes.
+
+The first write of a symbol file builds it under a temporary name and renames it into place. Every later `.db.splayed.set` that brings new symbols appends their records to the existing file, in place, and then writes the new count into the header; a save with no new symbols does not write the file. The header count is the commit point: the records are written first (and, in a durable save, synced to media before the count is written), so a crash leaves either the old count, or a count whose records are all there. Records past the count, left by an append that did not finish, are a torn tail: opening the file ignores them, and the next append cuts them off before it writes its own records. A file that holds fewer records than its count says is damaged and fails with a `corrupt` error.
+
+A process that opens the file while another appends to it reads the symbols the header counted when it opened the file, never a count over records it cannot see.
+
 The C functions below work on the runtime's global symbol table instead. `ray_sym_save` writes the whole table to a temporary file and renames it over the target, and `ray_sym_load` merges a file into the running table.
 
 | Function | Description |
@@ -345,7 +351,7 @@ A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/
 
 A save also builds indexes of its own for columns of at least 65 536 rows: a dictionary for a string column and a chunk zone (per-chunk min/max) for a numeric or temporal one. `{index: false}` builds neither, in either generation, for a table that is never queried by value (read by partition, by position or whole); the write is faster and the files are smaller. It governs only what the save builds. An index the column already carries is written as it always is: one you built (`.idx.hash`, `.idx.sort`, `.idx.bloom`), or a chunk zone a loaded column brought from its file, as when a table read from one splayed store is saved to another. A dictionary is only ever built, never carried over from the source, so `{index: false}` leaves a loaded string column without one. A column without an index reads as it does after a save of a short one. `true`, the default, builds the automatic indexes; a non-bool value is a `domain` error. `compress`, `symfile` and `index` combine in one dict: `{compress: true index: false}`.
 
-`{durable: false}` skips every fsync of the save (column files, symbol files, directories), the path `.csv.splayed` and the Parquet import already take; `true`, the default, syncs as before. The write still goes through temporary files and atomic renames, so a reader sees whole files; a crash or power loss may lose the write or leave it torn. For a table that is republished often and can be rebuilt from its source. A non-bool value is a `domain` error; it combines with the other options: `{durable: false compress: true}`.
+`{durable: false}` skips every fsync of the save (column files, symbol files, directories), the path `.csv.splayed` and the Parquet import already take; `true`, the default, syncs as before. Column files are still written through temporary files and atomic renames, so a reader sees whole files; the shared symbol file is appended to in place, as described under [Append-Only .sym Files](#append-only-sym-files). A crash or power loss may lose the write or leave it torn. For a table that is republished often and can be rebuilt from its source. A non-bool value is a `domain` error; it combines with the other options: `{durable: false compress: true}`.
 
 ### Compressed floating-point environment
 

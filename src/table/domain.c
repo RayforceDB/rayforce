@@ -1271,6 +1271,50 @@ void ray_sym_domain_index_remove(const char* path) {
     if (path && dom_ix_name(ip, sizeof(ip), path, "")) (void)remove(ip);
 }
 
+static _Atomic(void (*)(int, const char*)) g_dom_test_hook;
+
+void ray_sym_domain_test_hook(void (*fn)(int event, const char* path)) {
+    atomic_store_explicit(&g_dom_test_hook, fn, memory_order_relaxed);
+}
+
+static inline void dom_event(int ev, const char* path) {
+    void (*fn)(int, const char*) = atomic_load_explicit(&g_dom_test_hook, memory_order_relaxed);
+    if (fn) fn(ev, path);
+}
+
+/* The header count of the symfile at `path`, or -1, and its inode.  Read
+ * BEFORE the file is mapped: an append in place writes its records before
+ * it writes the count, so a mapping of the same inode taken after this
+ * read covers the records of the count read here, where the count in the
+ * mapped header may already be a later append's, over a mapping that stops
+ * short of its records.  The caller parses by this count when the mapping
+ * is of that inode (dom_map_count); a file renamed in between was written
+ * whole, and its own header's count holds, as it does when this read
+ * failed. */
+static int64_t dom_header_count(const char* path, uint64_t* ino) {
+    uint8_t h[12];
+    *ino = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0) *ino = (uint64_t)st.st_ino;
+    size_t n = fread(h, 1, sizeof(h), f);
+    fclose(f);
+    int64_t c = -1;
+    if (n == sizeof(h)) memcpy(&c, h + 4, 8);
+    return c;
+}
+
+/* The count to parse the mapping `m` (id `id`) by: dom_header_count's when
+ * it read the mapped inode (or no identity is kept here), else the mapped
+ * header's. */
+static int64_t dom_map_count(const uint8_t* m, const ray_file_id_t* id, int64_t hcount, uint64_t hino) {
+    if (hcount >= 0 && (!id->valid || id->ino == hino)) return hcount;
+    int64_t c;
+    memcpy(&c, m + 4, 8);
+    return c;
+}
+
 /* The block table of the mapped image of `d` (its `count` entries per the
  * header): from the index file when it is this file's, else by one walk of
  * the `count` records (read with explicit reads, dom_src_t), the index then
@@ -1340,21 +1384,21 @@ static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
 static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     if (d->z) return false;   /* a compressed file grows only by this process's flushes */
     int64_t count = atomic_load_explicit(&d->count, memory_order_relaxed);
-    if (st_size < d->disk_size) return false;       /* shrunk: rewritten */
+    if (st_size < d->disk_end) return false;        /* shrunk below its records: rewritten */
     if (count != d->disk_count) return false;       /* our tail is dirty */
 
+    uint64_t hino;
+    int64_t fresh_count = dom_header_count(d->path, &hino);   /* before the map: see there */
     size_t map_size = 0;
     ray_file_id_t nid;
     void* map = ray_vm_map_file_id(d->path, &map_size, &nid);
     if (!map) return false;
+    dom_event(RAY_SYM_DOMAIN_EV_MAPPED, d->path);
     const uint8_t* nbase = (const uint8_t*)map;     /* new image bytes */
 
-    int64_t fresh_count = -1;
     bool ok = map_size >= 12 && dom_rd32(nbase) == DOMAIN_STRL_MAGIC;
-    if (ok) {
-        memcpy(&fresh_count, nbase + 4, 8);
-        ok = fresh_count >= count && fresh_count <= (int64_t)UINT32_MAX;
-    }
+    if (ok) fresh_count = dom_map_count(nbase, &nid, fresh_count, hino);
+    if (ok) ok = fresh_count >= count && fresh_count <= (int64_t)UINT32_MAX;
 
     /* Position-0 reservation also holds for externally grown files: the
      * first record of a non-empty file must be the empty string. */
@@ -1715,12 +1759,15 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         /* Mapped, not read: the records are reached through checkpoints
          * (the sparse record index above), from the index file when it is
          * valid, so opening reads only the index and the records after it. */
+        uint64_t hino;
+        int64_t hcount = dom_header_count(rpath, &hino);   /* before the map: see there */
         d->map = ray_vm_map_file_id(rpath, &d->map_size, &d->map_id);
         d->disk_id = d->map_id;
+        if (d->map) dom_event(RAY_SYM_DOMAIN_EV_MAPPED, rpath);
         int64_t count = -1;
         const uint8_t* m = (const uint8_t*)d->map;
         if (m && d->map_size >= 12 && dom_rd32(m) == DOMAIN_STRL_MAGIC)
-            memcpy(&count, m + 4, 8);
+            count = dom_map_count(m, &d->map_id, hcount, hino);
         if (m && d->map_size >= DOM_Z_REC0 && dom_rd32(m) == DOMAIN_STRZ_MAGIC) {
             /* a compressed file: its symbol table (and the encoder's index,
              * for appends) is copied out of the header */
@@ -1730,7 +1777,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
                 memcpy(d->z, m + 12, DOM_Z_TAB);
                 ray_fsst_index_build(d->z, d->zix);
                 d->rec0 = DOM_Z_REC0;
-                memcpy(&count, m + 4, 8);
+                count = dom_map_count(m, &d->map_id, hcount, hino);
             }
         }
         if (count < 0 || count > (int64_t)UINT32_MAX || !dom_index_image(d, count)) {
@@ -2954,8 +3001,14 @@ static bool dom_ftruncate(FILE* f, int64_t len) {
 #endif
 }
 
+static ray_err_t dom_sync_dir(const char* path) {
+    dom_event(RAY_SYM_DOMAIN_EV_SYNC_DIR, path);
+    return ray_file_sync_dir(path);
+}
+
 /* Sync the file at `path` to media. */
 static ray_err_t dom_sync_path(const char* path) {
+    dom_event(RAY_SYM_DOMAIN_EV_SYNC_FILE, path);
     ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE);
     if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
     ray_err_t err = ray_file_sync(fd);
@@ -3000,7 +3053,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         /* all written; the earlier non-durable flushes' bytes are synced now */
         if (durable && sync_count != disk_count) {
             err = dom_sync_path(dom->path);
-            if (err == RAY_OK) err = ray_file_sync_dir(dom->path);
+            if (err == RAY_OK) err = dom_sync_dir(dom->path);
             if (err == RAY_OK) {
                 dom_lock();
                 dom->sync_count = disk_count;
@@ -3076,6 +3129,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         if (!dom_fseek(f, 4) || fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0) err = RAY_ERR_IO;
         else counted = true;
     }
+    if (counted) dom_event(RAY_SYM_DOMAIN_EV_COUNT, dom->path);
     /* Failed before the count: the file goes back to what it was, the old
      * count over the old records and the new bytes cut (best effort), so a
      * retry finds it at its persisted size. */
@@ -3090,7 +3144,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
      * by the first durable flush after a non-durable or a new file's. */
     if (err == RAY_OK && durable) {
         err = dom_sync_path(dom->path);
-        if (err == RAY_OK && (disk_count == 0 || sync_count == 0)) err = ray_file_sync_dir(dom->path);
+        if (err == RAY_OK && (disk_count == 0 || sync_count == 0)) err = dom_sync_dir(dom->path);
     }
     /* Once the count is written the file holds the new records: the state
      * follows it even when a sync after fails (the entries left unsynced, so
@@ -3110,8 +3164,15 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
         dom_unlock();
         if (ck && err == RAY_OK) dom_flush_index(dom, count, size);
     } else if (cut) {
+        /* The header rewrite and the cut moved the file's times: the file as
+         * it is now, at the persisted size again, is the persisted one (a
+         * cached open compares the path against this identity). */
+        struct stat cut_st;
+        bool whole = stat(dom->path, &cut_st) == 0 && (size_t)cut_st.st_size == disk_end;
+        ray_file_id_t cut_id = dom_stat_id(whole ? &cut_st : NULL);
         dom_lock();
         dom->disk_size = disk_end;
+        if (whole) dom->disk_id = cut_id;
         dom_unlock();
     }
     dom_ck_free(&tail);
