@@ -495,8 +495,81 @@ static test_result_t reads_after_a_persisted_sym_load(void) {
     PASS();
 }
 
+/* The data-node budget counts occurrences in the VALUE, not in the syntax that
+ * wrote it: every scalar, every vector element and every container (a vector,
+ * a list, a dict, a table) counts one.  node_count() states that rule over the
+ * returned value, independently of the reader's own counter, and each text is
+ * read at exactly that cap (succeeds) and one below it (a limit error).  Two
+ * spellings of the same value must therefore cost the same. */
+static size_t node_count(ray_t* v) {
+    if (!v || v->type < 0 || v->type == RAY_NULL) return 1;            /* a scalar, null */
+    if (v->type == RAY_LIST) {
+        size_t n = 1;
+        for (int64_t i = 0; i < v->len; i++) n += node_count(((ray_t**)ray_data(v))[i]);
+        return n;
+    }
+    if (v->type == RAY_DICT) return 1 + node_count(ray_dict_keys(v)) + node_count(ray_dict_vals(v));
+    if (v->type == RAY_TABLE) {
+        ray_t** slots = (ray_t**)ray_data(v);            /* the schema, then the columns */
+        return 1 + ((size_t)slots[0]->len + 1) + node_count(slots[1]);
+    }
+    return (size_t)v->len + 1;                                          /* a typed vector */
+}
+
+static size_t node_cost(const char* text) {
+    ray_read_limits_t l = ray_read_limits_default();
+    ray_t* r = ray_read_value(text, strlen(text), &l);
+    if (RAY_IS_ERR(r)) { drop(r); return 0; }
+    size_t want = node_count(r);
+    ray_release(r);
+    return want;
+}
+
+static bool reads_within(const char* text, size_t cap) {
+    ray_read_limits_t l = ray_read_limits_default();
+    l.max_nodes = cap;
+    ray_t* r = ray_read_value(text, strlen(text), &l);
+    bool ok = !RAY_IS_ERR(r);
+    if (!ok && !is_err(r, "limit")) { drop(r); return true; }   /* a wrong error kind fails the caller's assert */
+    drop(r);
+    return ok;
+}
+
+static test_result_t node_count_contract(void) {
+    static const struct { const char* text; size_t nodes; } cases[] = {
+        { "1", 1 }, { "null", 1 }, { "\"a string well past the inline limit\"", 1 }, { "'one", 1 },
+        { "[1 2 3]", 4 }, { "(as 'I64 [])", 1 }, { "['a 'b]", 3 }, { "[\"\" \"x\"]", 3 },
+        { "(as 'SYM (list \"x\" \"\"))", 3 },
+        { "(as 'GUID \"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\")", 1 },
+        { "()", 1 }, { "(list)", 1 }, { "(list 1 2)", 3 }, { "(list [1 2] (list 3))", 6 },
+        /* the two spellings of one dictionary cost the same: keys 3, values 3, the dict 1 */
+        { "(dict ['a 'b] (list 1 2))", 7 }, { "{a: 1 b: 2}", 7 },
+        { "(dict [\"a\" \"b\"] (list 1 2))", 7 }, { "{\"a\": 1 \"b\": 2}", 7 },
+        { "(dict (list) (list))", 3 }, { "{}", 3 },
+        /* keys 3, values list 1 + [1 2] 3 + (list 1) 2, the dict 1 */
+        { "{a: [1 2] b: (list 1)}", 10 }, { "(dict ['a 'b] (list [1 2] (list 1)))", 10 },
+        /* inner dict 5 (keys 2, values 2, dict 1); outer: keys 2, values list 1 + 5, dict 1 */
+        { "{a: {b: 1}}", 9 }, { "(dict ['a] (list (dict ['b] (list 1))))", 9 },
+        /* the table 1, its names 3, its columns: list 1 + [1 2] 3 + (list 1 "x") 3 */
+        { "(table (as 'SYM (list \"c1\" \"c2\")) (list [1 2] (list 1 \"x\")))", 11 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        const char* t = cases[i].text;
+        size_t want = cases[i].nodes;
+        char msg[160];
+        snprintf(msg, sizeof msg, "node cost of %.100s", t);
+        TEST_ASSERT(node_cost(t) == want, msg);   /* the table is the rule applied to the value */
+        snprintf(msg, sizeof msg, "reads at exactly its cost: %.100s", t);
+        TEST_ASSERT(reads_within(t, want), msg);
+        snprintf(msg, sizeof msg, "refused one node below its cost: %.100s", t);
+        TEST_ASSERT(!reads_within(t, want - 1), msg);
+    }
+    PASS();
+}
+
 const test_entry_t readval_entries[] = {
     {"readval/limit_edges", limit_edges, setup, teardown},
+    {"readval/node_count_contract", node_count_contract, setup, teardown},
     {"readval/faults_leave_nothing", faults_leave_nothing, setup, teardown},
     {"readval/release_returns_everything", release_returns_everything, setup, teardown},
     {"readval/rejected_reads_add_no_symbols", rejected_reads_add_no_symbols, setup, teardown},

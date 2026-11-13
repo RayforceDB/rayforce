@@ -117,10 +117,17 @@ Override any of them with a dictionary: `(read-value s {nodes: 5000 alloc: 10485
 |---|---|---|
 | `input` | 8 MiB | encoded bytes of the text, checked before anything is read |
 | `depth` | 128 | nesting depth, the root value being depth 1. Never above 1024, whatever is asked |
-| `nodes` | 1,000,000 | data occurrences: every scalar, vector element and container |
+| `nodes` | 1,000,000 | data occurrences in the value: every scalar, every vector element, and every container (vector, list, dict, table) |
 | `grammar` | 1,000,000 | syntax nodes: every token, call and type tag |
 | `symbol-bytes` | 1 MiB | decoded bytes of every symbol occurrence, repeated names included |
 | `alloc` | 64 MiB | peak live bytes the reader owns: the input copy, staging buffers, symbol staging and every value |
+
+`nodes` counts the value that is read, not the syntax that wrote it: a vector
+of `n` elements costs `n + 1`, a list `1` plus its items, a dict `1` plus its
+keys and its values, a table `1` plus its column names (`n + 1`) and its columns.
+So `{a: 1 b: 2}` and `(dict ['a 'b] (list 1 2))` cost the same, 7: the keys `3`, the
+values `3`, the dict `1`. A bare name used as a dict key counts as an element of the
+key vector, not as a value of its own.
 
 `alloc` is charged by the allocator's actual block size, headers included, and a
 growing buffer is charged for the old and the new block together. It is **not**
