@@ -1,0 +1,1 @@
+(table (as 'SYM (list "a" "b")) (list [1 2] ["x" "a long string over twelve"]))

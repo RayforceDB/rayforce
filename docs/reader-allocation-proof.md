@@ -1,8 +1,8 @@
 # Reader-local allocation admission proof (#994)
 
-This is an internal C proof, not a Rayfall builtin or a data reader. It does
-not select syntax, adopt numerical defaults, change `format`/`fmt_eq`, or
-claim full reader conformance. It starts from upstream `dev` at `e463902f`.
+This is the internal allocation ledger that `read-value`
+([reader](language/read-value.md), `src/lang/readval.c`) builds on. It is not
+itself a Rayfall builtin. It does not change `format`/`fmt_eq`. It starts from upstream `dev` at `e463902f`.
 
 ## Boundary
 

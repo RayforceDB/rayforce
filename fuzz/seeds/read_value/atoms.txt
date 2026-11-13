@@ -1,0 +1,1 @@
+(list 1 2h 3i 1.5e 2.5 0x07 true "s" 'sym 2024.01.02 0Nl null)

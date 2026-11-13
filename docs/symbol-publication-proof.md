@@ -1,4 +1,6 @@
-# Whole-document value-symbol publication proof (#994)
+# Whole-document value-symbol publication (#994)
+
+`read-value` publishes the symbols it staged through this entry point.
 
 `ray_sym_publish_values` is a separate internal C entry point, not a change to
 existing partial-batch intern semantics. It uses the explicit allocation

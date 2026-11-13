@@ -1,0 +1,235 @@
+;; read-value reads the data text `repr` writes, and the literal forms around
+;; it, without evaluating anything.  Round trips are checked on the type, the
+;; count and the stored bytes, not on printed output.
+(set rt (fn [v] (read-value (repr v))))
+(set same (fn [a b] (and (== (count (ser a)) (count (ser b))) (all (== (ser a) (ser b))))))
+
+;; ---- scalars: type and exact value ----------------------------------------
+(type (rt true)) -- 'b8
+(type (rt 0x07)) -- 'u8
+(type (rt 2h)) -- 'i16
+(type (rt 3i)) -- 'i32
+(type (rt 9223372036854775807)) -- 'i64
+(rt 9223372036854775807) -- 9223372036854775807
+(rt 9007199254740993) -- 9007199254740993
+(type (rt 1.5e)) -- 'f32
+(rt 1.5e) -- 1.5e
+(rt 0.1) -- 0.1
+(rt (+ 0.1 0.2)) -- 0.30000000000000004
+(rt 5e-324) -- 5e-324
+(rt 1.7976931348623157e308) -- 1.7976931348623157e308
+(type (rt 2024.01.02)) -- 'date
+(type (rt 12:34:56.789)) -- 'time
+(type (rt 2024.01.02D01:02:03.000000004)) -- 'timestamp
+(rt 2024.01.02D01:02:03.000000004) -- 2024.01.02D01:02:03.000000004
+(type (rt 0D01:00:00)) -- 'timespan
+(rt 0Wn) -- 0Wn
+(type (rt 0Nl)) -- 'i64
+(nil? (rt 0Nl)) -- true
+(nil? (rt 0Ni)) -- true
+(nil? (rt 0Nf)) -- true
+(nil? (rt 0Ne)) -- true
+(type (rt 0Nh)) -- 'i16
+(type (rt 0Nd)) -- 'date
+(type (rt 0Nn)) -- 'timespan
+
+;; Signed zero keeps its sign bit, at both widths.
+(same (rt -0.0) -0.0) -- true
+(same (rt -0.0) 0.0) -- false
+(same (rt -0.0e) -0.0e) -- true
+(same (rt -0.0e) 0.0e) -- false
+
+;; ---- strings and symbols ---------------------------------------------------
+(rt "plain") -- "plain"
+(rt "") -- ""
+(count (rt "a\"b\\c\nd\te")) -- 9
+(rt "a\"b\\c") -- "a\"b\\c"
+(count (rt "nul\000in")) -- 6
+(same (rt "nul\000in") "nul\000in") -- true
+(rt "quote \" and (list 1) and \\") -- "quote \" and (list 1) and \\"
+(rt "a long string, well past the inline limit") -- "a long string, well past the inline limit"
+(type (rt 'abc)) -- 'sym
+(rt 'abc) -- 'abc
+(== (rt (as 'SYM "with space")) (as 'SYM "with space")) -- true
+(== (rt (as 'SYM "1; (list")) (as 'SYM "1; (list")) -- true
+(== (rt (as 'SYM "true")) (as 'SYM "true")) -- true
+(type (rt (as 'SYM ""))) -- 'sym
+(read-value "'abc") -- 'abc
+(read-value "'a.b-c_9") -- 'a.b-c_9
+
+;; ---- vectors ---------------------------------------------------------------
+(type (rt [1 2 3])) -- 'I64
+(type (rt [1h 2h])) -- 'I16
+(type (rt [1i 2i])) -- 'I32
+(type (rt [0x01 0x02])) -- 'U8
+(type (rt [true false])) -- 'B8
+(type (rt [1.5e 2.5e])) -- 'F32
+(type (rt [1.5 2.5])) -- 'F64
+(type (rt [2024.01.02 2024.01.03])) -- 'DATE
+(type (rt ["a" "bb"])) -- 'STR
+(type (rt (as 'SYM ["a" "b"]))) -- 'SYM
+(same (rt [1 0N 3]) [1 0N 3]) -- true
+(same (rt [1.5 0Nf -0.0]) [1.5 0Nf -0.0]) -- true
+(same (rt ["" "a" "a long string over twelve" "x"]) ["" "a" "a long string over twelve" "x"]) -- true
+(same (rt (as 'SYM ["" "a" "a b"])) (as 'SYM ["" "a" "a b"])) -- true
+(set g3 (guid 3))
+(same (rt g3) g3) -- true
+(same (rt (as 'GUID (list 0Ng (as 'GUID "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")))) (as 'GUID (list 0Ng (as 'GUID "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")))) -- true
+(same (rt [0Wn 1D00:00:00.000000000]) [0Wn 1D00:00:00.000000000]) -- true
+
+;; Empty vectors keep their element type; there is no untyped empty vector.
+(type (rt (as 'I64 []))) -- 'I64
+(type (rt (as 'I16 []))) -- 'I16
+(type (rt (as 'F32 []))) -- 'F32
+(type (rt (as 'SYM []))) -- 'SYM
+(type (rt (as 'STR []))) -- 'STR
+(type (rt (as 'GUID []))) -- 'GUID
+(type (rt (as 'TIMESPAN []))) -- 'TIMESPAN
+(count (rt (as 'B8 []))) -- 0
+(read-value "[]") !- parse
+
+;; ---- containers ------------------------------------------------------------
+(type (rt (list))) -- 'LIST
+(count (rt (list))) -- 0
+(type (rt (list 1 2))) -- 'LIST
+(type (rt (list 1.5 2.5))) -- 'LIST
+(type (rt (list (list) (list 1)))) -- 'LIST
+(same (rt (list 1 "x" 'a [1h 2h] (list))) (list 1 "x" 'a [1h 2h] (list))) -- true
+(type (first (rt (list [1h 2h])))) -- 'I16
+(type (rt (dict ['a 'b] [1 2]))) -- 'DICT
+(type (rt (dict ['a 'b] (list 1 2)))) -- 'DICT
+(type (value (rt (dict ['a 'b] [1 2])))) -- 'LIST
+(type (value (read-value "(dict ['a 'b] [1 2])"))) -- 'I64
+(type (value (rt (dict ['a 'b] (list 1 2))))) -- 'LIST
+(same (rt (dict ['a 'b] [1 2])) (dict ['a 'b] [1 2])) -- true
+(same (rt (dict [1 2] [3 4])) (dict [1 2] [3 4])) -- true
+(same (rt (dict ["k" "j"] (list 1 "x"))) (dict ["k" "j"] (list 1 "x"))) -- true
+(same (rt (dict ['a] (list (dict ['b] [1])))) (dict ['a] (list (dict ['b] [1])))) -- true
+(type (key (rt (dict (as 'I64 []) (as 'I64 []))))) -- 'I64
+(count (rt (dict (as 'SYM []) (list)))) -- 0
+
+;; Dictionary and table order, duplicates and column kinds are preserved.
+(key (rt (dict ['b 'a 'b] [1 2 3]))) -- ['b 'a 'b]
+(same (rt (table [a b] (list [1 2] ["x" "y"]))) (table [a b] (list [1 2] ["x" "y"]))) -- true
+(type (rt (table [a] (list [1])))) -- 'TABLE
+(count (rt (table [a b] (list [1 2 3] [4 5 6])))) -- 3
+
+;; A zero-row table keeps its schema, including LIST columns, without
+;; inference; a zero-column table has no rows.
+(type (at (rt (table [a b] (list (as 'I64 []) (list)))) 'a)) -- 'I64
+(type (at (rt (table [a b] (list (as 'I64 []) (list)))) 'b)) -- 'LIST
+(count (rt (table [a b] (list (as 'I64 []) (list))))) -- 0
+(type (at (rt (table [a] (list (as 'F32 [])))) 'a)) -- 'F32
+(count (key (rt (table [] (list))))) -- 0
+(count (rt (table [] (list)))) -- 0
+(read-value "(table (as 'SYM (list \"a\" \"b\")) (list [1 2] [1 2 3]))") !- domain
+(read-value "(table (as 'SYM (list \"a\")) (list [1] [2]))") !- domain
+(read-value "(table [a] [1])") !- domain
+
+;; ---- generic null ----------------------------------------------------------
+(read-value "null") -- null
+(type (first (read-value "(list null 1)"))) -- 'null
+(repr null) -- "null"
+
+;; ---- hand-written forms ----------------------------------------------------
+(type (read-value "['a 'b]")) -- 'SYM
+(type (read-value "[a b]")) -- 'SYM
+(read-value "{a: 1 b: \"x\"}") -- {a:1 b:"x"}
+(type (key (read-value "{a: 1 b: 2}"))) -- 'SYM
+(type (key (read-value "{\"k\": 1 \"j\": 2}"))) -- 'STR
+(count (read-value "{}")) -- 0
+(read-value "{a: {b: [1 2]}}") -- {a:{b:[1 2]}}
+(read-value "  (list 1 ; one\n 2)  ; two\n") -- (list 1 2)
+(read-value "(list 1 (list 2 (list 3)))") -- (list 1 (list 2 (list 3)))
+
+;; ---- nothing is evaluated --------------------------------------------------
+(set marker 0)
+(read-value "(set marker 1)") !- parse
+marker -- 0
+(read-value "(+ 1 2)") !- parse
+(read-value "(list (+ 1 2))") !- parse
+(read-value "x") !- parse
+(read-value "marker") !- parse
+(read-value "(fn [x] x)") !- parse
+(read-value "(do 1)") !- parse
+(read-value "(.sys.exec \"true\")") !- parse
+(read-value "(quote (list 1))") !- parse
+(read-value "(read-value \"1\")") !- parse
+(read-value "(as 'I64 [1])") !- parse
+(read-value "(as 'FOO [])") !- parse
+(read-value "(as I64 [])") !- parse
+(read-value "(list 1) (list 2)") !- parse
+(read-value "1 2") !- parse
+(read-value "") !- parse
+(read-value "   ") !- parse
+(read-value "; only a comment") !- parse
+
+;; Rebinding the constructor names changes nothing: they are not looked up.
+(set list0 list)
+(set dict0 dict)
+(set table0 table)
+(set as0 as)
+(set list (fn [& xs] 99))
+(set dict (fn [& xs] 99))
+(set table (fn [& xs] 99))
+(set as (fn [& xs] 99))
+(count (read-value "(list 1 2 3)")) -- 3
+(type (read-value "(dict ['a] [1])")) -- 'DICT
+(type (read-value "(table [a] (list [1]))")) -- 'TABLE
+(type (read-value "(as 'I64 [])")) -- 'I64
+(set list list0)
+(set dict dict0)
+(set table table0)
+(set as as0)
+
+;; ---- malformed and out-of-domain input -------------------------------------
+(read-value "(list 1") !- parse
+(read-value "[1 2") !- parse
+(read-value "\"abc") !- parse
+(read-value "[1 2.5]") !- parse
+(read-value "[1h 2i]") !- parse
+(read-value "[1 \"a\"]") !- parse
+(read-value "['a \"a\"]") !- parse
+(read-value "[null]") !- parse
+(read-value "\"\\q\"") !- parse
+(read-value "'a'") !- parse
+(read-value "1e999") !- parse
+(read-value "99999999999999999999") !- parse
+(read-value "-9223372036854775808") !- parse
+(read-value "1.5e99999e") !- parse
+(read-value "40000h") !- domain
+(read-value "2024.13.01") !- parse
+(read-value "1 ") -- 1
+(read-value "(dict [1] [1 2])") !- domain
+(read-value "(dict 1 2)") !- domain
+(read-value 5) !- type
+(read-value) !- arity
+
+;; Failed reads add no symbols.
+(set before (.sys.info))
+(read-value "(list 'unreadsym1 (list 'unreadsym2 x))") !- parse
+(read-value "(table (as 'SYM (list \"unreadsym3\")) (list [1] [2]))") !- domain
+(nil? (resolve 'unreadsym1)) -- true
+
+;; ---- limits ----------------------------------------------------------------
+(read-limits) -- {input:8388608 depth:128 nodes:1000000 grammar:1000000 symbol-bytes:1048576 alloc:67108864}
+(read-value "(list 1 2)" {input: 5}) !- limit
+(read-value "(list 1 2)" {input: 10}) -- (list 1 2)
+(read-value "(list (list (list 1)))" {depth: 3}) !- limit
+(read-value "(list (list (list 1)))" {depth: 4}) -- (list (list (list 1)))
+(read-value "[1 2 3 4]" {nodes: 4}) !- limit
+(read-value "[1 2 3 4]" {nodes: 5}) -- [1 2 3 4]
+(read-value "[1 2 3 4]" {grammar: 4}) !- limit
+(read-value "(as 'SYM [\"abcd\"])" {symbol-bytes: 3}) !- limit
+(read-value "(as 'SYM [\"abc\"])" {symbol-bytes: 3}) -- (as 'SYM ["abc"])
+(read-value "[1 2 3]" {alloc: 100}) !- limit
+(read-value "[1 2 3]" {nope: 1}) !- domain
+(read-value "[1 2 3]" {input: -1}) !- domain
+(read-value "[1 2 3]" 5) !- type
+(read-value "1" {depth: 100000}) -- 1
+
+;; The writer's byte limit fails explicitly instead of truncating.
+(repr [1 2 3] 5) !- limit
+(repr [1 2 3] 7) -- "[1 2 3]"
+(repr [1 2 3] 0) !- domain
+(repr (fn [x] x)) !- format

@@ -55,6 +55,8 @@ typedef struct {
                          * only for modes that never read back what they
                          * appended (mode 2) */
     bool    io_err;     /* err was a failed write to sink */
+    int64_t limit;      /* when non-zero, output beyond this many bytes is an error */
+    bool    over_limit; /* err was the byte limit */
     bool    flushed;    /* some output already reached sink */
     char    cause_code[16];   /* code of the error that stopped a column from loading */
     char    cause_msg[192];   /* its detail (names the column file) */
@@ -77,6 +79,8 @@ static void fmt_init(fmt_buf_t* b) {
     b->sink    = NULL;
     b->io_err  = false;
     b->flushed = false;
+    b->limit   = 0;
+    b->over_limit = false;
     b->cause_code[0] = '\0';
     b->cause_msg[0]  = '\0';
     b->block   = ray_alloc(256);
@@ -118,6 +122,10 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
         b->flushed = true;
     }
     int64_t need = (int64_t)b->len + extra;
+    if (b->limit && need > b->limit) {
+        b->err = true; b->over_limit = true; b->err_msg = "output exceeds the byte limit";
+        return;
+    }
     if (need <= (int64_t)b->cap) return;
     if (need > (int64_t)INT32_MAX) {
         /* int32 buffer ceiling: the doubling loop and cap field are int32, so
@@ -192,6 +200,11 @@ static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
     if (b->err) {
+        if (b->over_limit) {
+            int64_t lim = b->limit;
+            fmt_destroy(b);
+            return ray_error("limit", "repr: output exceeds the limit of %lld bytes", (long long)lim);
+        }
         ray_t* e = b->cause_code[0]
             ? ray_error(b->cause_code, "%s: %s", b->err_msg, b->cause_msg)
             : ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
@@ -1843,6 +1856,14 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
 ray_t* ray_fmt(ray_t* obj, int mode) {
     fmt_buf_t b;
     fmt_init(&b);
+    fmt_obj(&b, obj, mode);
+    return fmt_to_str(&b);
+}
+
+ray_t* ray_fmt_limited(ray_t* obj, int mode, int64_t max_bytes) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    b.limit = max_bytes;
     fmt_obj(&b, obj, mode);
     return fmt_to_str(&b);
 }

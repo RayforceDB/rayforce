@@ -38,6 +38,7 @@
 #include "vec/str.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
+#include "lang/readval.h"
 #include "core/pool.h"
 #include "core/types.h"
 #include "io/csv.h"
@@ -381,9 +382,79 @@ ray_t* ray_format_fn(ray_t** args, int64_t n) {
     return args[0];
 }
 
-/* (repr value) — source text that parses back to the same value. */
-ray_t* ray_repr_fn(ray_t* value) {
-    return ray_fmt(value, RAY_FMT_ROUNDTRIP);
+/* (repr value [max-bytes]) — source text that parses back to the same value,
+ * and that read-value reads without evaluating it.  Output beyond max-bytes
+ * (default 8 MiB) is a "limit" error, never a truncated string. */
+ray_t* ray_repr_fn(ray_t** args, int64_t n) {
+    if (n < 1 || n > 2) return ray_error("arity", "repr: expects a value and an optional byte limit, got %lld arguments", (long long)n);
+    int64_t limit = (int64_t)8 << 20;
+    if (n == 2) {
+        if (!args[1] || args[1]->type != -RAY_I64) return ray_error("type", "repr: the byte limit must be an integer");
+        limit = args[1]->i64;
+        if (limit <= 0 || limit == INT64_MIN) return ray_error("domain", "repr: the byte limit must be positive");
+    }
+    return ray_fmt_limited(args[0], RAY_FMT_ROUNDTRIP, limit);
+}
+
+/* ---- (read-value text [limits]) and (read-limits) ----
+ * The data-only reader (lang/readval.h): the text `repr` writes, and the
+ * literal forms around it, become one value without evaluating anything. */
+static const struct { const char* name; size_t off; } read_limit_names[] = {
+    {"input",        offsetof(ray_read_limits_t, max_input)},
+    {"depth",        offsetof(ray_read_limits_t, max_depth)},
+    {"nodes",        offsetof(ray_read_limits_t, max_nodes)},
+    {"grammar",      offsetof(ray_read_limits_t, max_grammar)},
+    {"symbol-bytes", offsetof(ray_read_limits_t, max_symbol_bytes)},
+    {"alloc",        offsetof(ray_read_limits_t, max_alloc)},
+};
+#define READ_LIMIT_COUNT (sizeof read_limit_names / sizeof *read_limit_names)
+
+ray_t* ray_read_limits_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", "read-limits: expects no arguments, got %lld", (long long)n);
+    ray_read_limits_t lim = ray_read_limits_default();
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, (int64_t)READ_LIMIT_COUNT);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_vec_new(RAY_I64, (int64_t)READ_LIMIT_COUNT);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    for (size_t i = 0; i < READ_LIMIT_COUNT; i++) {
+        int64_t id = ray_sym_intern(read_limit_names[i].name, strlen(read_limit_names[i].name));
+        int64_t v = (int64_t)*(size_t*)((char*)&lim + read_limit_names[i].off);
+        keys = ray_vec_append(keys, &id);
+        if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
+        vals = ray_vec_append(vals, &v);
+        if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    }
+    return ray_dict_new(keys, vals);
+}
+
+ray_t* ray_read_value_fn(ray_t** args, int64_t n) {
+    if (n < 1 || n > 2) return ray_error("arity", "read-value: expects text and optional limits, got %lld arguments", (long long)n);
+    if (!args[0] || args[0]->type != -RAY_STR)
+        return ray_error("type", "read-value: text must be a string, got %s", args[0] ? ray_type_name(args[0]->type) : "null");
+    ray_read_limits_t lim = ray_read_limits_default();
+    if (n == 2) {
+        ray_t* d = args[1];
+        if (!d || d->type != RAY_DICT) return ray_error("type", "read-value: limits must be a dict, got %s", d ? ray_type_name(d->type) : "null");
+        ray_t* keys = ray_dict_keys(d);
+        ray_t* vals = ray_dict_vals(d);
+        if (keys->type != RAY_SYM) return ray_error("type", "read-value: limit names must be symbols");
+        for (int64_t i = 0; i < keys->len; i++) {
+            ray_t* kn = ray_sym_vec_cell(keys, i);
+            size_t found = READ_LIMIT_COUNT;
+            for (size_t j = 0; j < READ_LIMIT_COUNT; j++)
+                if (kn && strlen(read_limit_names[j].name) == ray_str_len(kn) &&
+                    memcmp(read_limit_names[j].name, ray_str_ptr(kn), ray_str_len(kn)) == 0) found = j;
+            if (found == READ_LIMIT_COUNT) return ray_error("domain", "read-value: unknown limit '%.*s'", kn ? (int)ray_str_len(kn) : 0, kn ? ray_str_ptr(kn) : "");
+            int64_t v;
+            if (vals->type == RAY_I64) v = ((int64_t*)ray_data(vals))[i];
+            else if (vals->type == RAY_LIST && ((ray_t**)ray_data(vals))[i]->type == -RAY_I64) v = ((ray_t**)ray_data(vals))[i]->i64;
+            else return ray_error("type", "read-value: limits must be integers");
+            if (v < 0 || v == INT64_MIN) return ray_error("domain", "read-value: limits must not be negative");
+            *(size_t*)((char*)&lim + read_limit_names[found].off) = (size_t)v;
+        }
+    }
+    return ray_read_value(ray_str_ptr(args[0]), ray_str_len(args[0]), &lim);
 }
 
 /* (resolve 'name) — check if name exists in env, return value or null.

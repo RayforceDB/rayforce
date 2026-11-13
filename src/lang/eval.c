@@ -4831,7 +4831,9 @@ static void ray_register_builtins(void) {
     register_vary("println",    RAY_FN_NONE, ray_println_fn);
     register_vary("show",       RAY_FN_NONE, ray_show_fn);
     register_vary("format",     RAY_FN_NONE, ray_format_fn);
-    register_unary("repr",      RAY_FN_NONE, ray_repr_fn);
+    register_vary("repr",      RAY_FN_NONE, ray_repr_fn);
+    register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
+    register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
