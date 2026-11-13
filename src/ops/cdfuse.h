@@ -43,6 +43,11 @@
  * numeric/temporal/SYM types, including nulls. Float keys in `k` are
  * canonical bit encodings; callers restore the source logical type. */
 ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows);
+/* Test hook: ray_cd_fused calls so far whose sample turned on the
+ * source-local preaggregation of repeated pairs. */
+uint64_t ray_cd_test_preaggregated(void);
+/* Test hook: the row sample i (of 1024) reads, for nrows > 1024. */
+int64_t ray_cd_test_sample_row(int64_t nrows, int i);
 
 /* The route for a `(count (distinct X))` grouped by K_cols[0..n_K) over
  * the nrows rows of `rows` (a selection's survivors, sampled from
