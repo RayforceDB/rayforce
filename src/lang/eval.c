@@ -5087,6 +5087,11 @@ static void ray_register_builtins(void) {
     register_binary("inner-prod",  RAY_FN_NONE, ray_inner_prod_fn);
     register_binary("l2-dist",     RAY_FN_NONE, ray_l2_dist_fn);
     register_unary ("norm",        RAY_FN_NONE, ray_norm_fn);
+    register_binary("mmu",         RAY_FN_NONE, ray_mmu_fn);
+    register_binary("lsq",         RAY_FN_NONE, ray_lsq_fn);
+    register_unary ("inv",         RAY_FN_NONE, ray_inv_fn);
+    register_unary ("flip",        RAY_FN_NONE, ray_flip_mat_fn);
+    register_unary ("gram",        RAY_FN_NONE, ray_gram_fn);
     register_vary  ("knn",         RAY_FN_NONE, ray_knn_fn);
     register_vary  ("hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
     register_vary  ("ann",         RAY_FN_NONE, ray_ann_fn);

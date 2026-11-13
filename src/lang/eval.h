@@ -430,6 +430,11 @@ ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
  * the raw mathematical dot product. */
 ray_t* ray_cos_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_inner_prod_fn(ray_t* a, ray_t* b);
+ray_t* ray_mmu_fn(ray_t* a, ray_t* b);
+ray_t* ray_lsq_fn(ray_t* b, ray_t* a);
+ray_t* ray_inv_fn(ray_t* x);
+ray_t* ray_flip_mat_fn(ray_t* x);
+ray_t* ray_gram_fn(ray_t* x);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_norm_fn(ray_t* x);
 ray_t* ray_knn_fn(ray_t** args, int64_t n);
