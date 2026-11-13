@@ -6,6 +6,13 @@
 #include <assert.h>
 
 #define READ_RECORDS 64
+/* meta_work is a test-only measure of the ledger's own bookkeeping: counted in
+ * DEBUG builds, never in release allocations and entry searches. */
+#ifdef DEBUG
+#define READ_META_WORK(b) ((b)->meta_work++)
+#else
+#define READ_META_WORK(b) ((void)0)
+#endif
 /* One ledger entry.  A free entry has a NULL ptr and keeps the next free entry
  * in the space its charge uses while it is occupied. */
 struct ray_read_record {
@@ -52,7 +59,7 @@ static bool acquire_fails(ray_read_budget_t* b) {
  * a released entry is pushed back, so no page is ever searched. */
 static read_record_t* slot(ray_read_budget_t* b) {
     if (b->closed || b->status != RAY_READ_OK) return NULL;
-    b->meta_work++;
+    READ_META_WORK(b);
     if (b->free_slot) return b->free_slot;
     size_t charge;
     if (!ray_sys_charge(sizeof(ray_read_records_t), &charge) || !reserve(b, charge)) return NULL;
@@ -114,7 +121,7 @@ static void remove_record(ray_read_budget_t* b, void* p, bool sys, bool transfer
     for (ray_read_records_t* c = b->records; c; c = c->next) {
         for (size_t i = 0; i < READ_RECORDS; i++) {
             read_record_t* r = &c->entries[i];
-            b->meta_work++;
+            READ_META_WORK(b);
             if (r->ptr != p || r->sys != sys) continue;
             if (!transfer) {
                 /* A parent or external alias can keep this block alive.
