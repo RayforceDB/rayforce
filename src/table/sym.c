@@ -1617,3 +1617,17 @@ done:
     ray_read_sys_free(b, text); ray_read_sys_free(b, seen); ray_read_sys_free(b, plan);
     return ok;
 }
+
+/* Names a mapped symbol file still backs only by the mapping are already part
+ * of the table: loading them changes no id and adds no name, so it is not a
+ * speculative intern.  ray_sym_publish_values refuses to inspect a table in
+ * that state; a reader calls this first. */
+bool ray_sym_materialize_lazy(void) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return false;
+    sym_lock();
+    bool ok = true;
+    if (g_sym.lazy_map && g_sym.lazy_next_id < g_sym.lazy_count)
+        ok = sym_lazy_materialize_to_locked(g_sym.lazy_count - 1);
+    sym_unlock();
+    return ok;
+}

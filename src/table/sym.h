@@ -200,6 +200,9 @@ typedef struct ray_read_budget ray_read_budget_t;
  * Inputs are copied before locking; outputs remain unchanged on failure.
  * max_symbols is a host total-count cap checked under the commit lock.
  * Caller must prebuild all fallible result/fixup work before publication. */
+/* Loads any names a mapped symbol file still backs only by the mapping, so a
+ * publication can inspect the whole table.  Adds no name and changes no id. */
+bool ray_sym_materialize_lazy(void);
 bool ray_sym_publish_values(ray_read_budget_t* budget,
                             const char* const* strings, const size_t* lengths,
                             size_t count, uint32_t max_symbols, int64_t* out_ids);
