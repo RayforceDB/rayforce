@@ -2344,12 +2344,7 @@ RAY_INLINE ray_t* pq_decode_rows_mode(pq_direct_work* w, pq_column* spare, int64
             ray_release(batch); break;
         }
         if (bcol->len) memcpy(dst + (size_t)*got * esz, ray_data(bcol), (size_t)bcol->len * esz);
-        if (type == RAY_SYM) {
-            /* HAS_NULLS from a position 0 among them, as ray_col_stream_append
-             * decides it for positions (not from the batch's flag) */
-            const uint32_t* p = (const uint32_t*)(dst + (size_t)*got * esz);
-            for (int64_t i = 0; i < bcol->len && !*flagged; i++) if (!p[i]) *flagged = true;
-        } else if (bcol->attrs & RAY_ATTR_HAS_NULLS) *flagged = true;
+        if (bcol->attrs & RAY_ATTR_HAS_NULLS) *flagged = true;
         *got += bcol->len;
         ray_release(batch);
     }
@@ -3980,6 +3975,7 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     ray_col_stream_t* writers = NULL; int64_t opened = 0, parts = 0;
     ray_err_t e = RAY_OK; ray_sym_domain_t* domain = NULL;
     ray_sym_domain_t** cdoms = NULL;   /* symfile 'column: column c's own domain, or NULL */
+    int64_t wb_errs = ray_file_writeback_errors();   /* the write-behinds' failures before */
     err = pq_import_types(r,types);
     if (err) goto done;
     err = pq_stage(r,dir,staging,sizeof(staging),false);
@@ -4121,6 +4117,9 @@ finish_columns:
         e = ray_file_sync(fd); ray_file_close(fd);
         if (e != RAY_OK) goto io_fail;
     }
+    /* a write-behind's waits take its file's write error, which the sync
+     * above then misses */
+    if (ray_file_writeback_errors() != wb_errs) { e = RAY_ERR_IO; goto io_fail; }
     if (trace) { fprintf(stderr,"parquet phase: schema+sync=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     e = ray_file_sync_dir(file);
     if (e != RAY_OK) goto io_fail;

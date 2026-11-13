@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #ifdef RAY_OS_LINUX
 #include <sched.h>
 #endif
@@ -212,8 +213,8 @@ static test_result_t test_file_writebehind_fds(void) {
         if (n > peak) peak = n;
     }
     close(wfd);
-    int left = 0;
-    for (int t = 0; t < 1000 && (left = plat_nfds() - base) > 0; t++) ray_sleep_ms(10);
+    (void)ray_file_writeback_errors();   /* every request served */
+    int left = plat_nfds() - base;
     /* the bound is free again: a whole round more is begun */
     int again = 0;
     for (int i = 0; i < RAY_FILE_WB_FDS / 2; i++) {
@@ -238,6 +239,90 @@ static test_result_t test_file_writebehind_fds(void) {
     TEST_ASSERT(left <= 0, "every descriptor handed over closed");
     TEST_ASSERT_EQ_I(again, RAY_FILE_WB_FDS / 2);
     TEST_ASSERT_EQ_I(same, N);
+#endif
+    PASS();
+}
+
+#ifdef RAY_OS_LINUX
+/* Threads of this process. */
+static int plat_nthreads(void) {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) n += e->d_name[0] != '.';
+    closedir(d);
+    return n;
+}
+#endif
+
+/* A failed writeback is counted, once every request is served, and the
+ * background thread has ended by then: a pipe (no writeback) and, with
+ * the hook, a write-behind of a file. */
+static test_result_t test_file_writeback_errors(void) {
+#ifdef RAY_OS_LINUX
+    int64_t e0 = ray_file_writeback_errors();
+    int threads = plat_nthreads();
+    int p[2];
+    TEST_ASSERT(pipe(p) == 0, "a pipe");
+    ray_file_writeback_start(p[1], 0, 1);
+    int64_t e1 = ray_file_writeback_errors();
+    /* joined: the kernel drops its task a moment after it wakes the joiner */
+    int after = plat_nthreads();
+    for (int i = 0; i < 100000 && after > threads; i++) { sched_yield(); after = plat_nthreads(); }
+    close(p[0]); close(p[1]);
+    TEST_ASSERT_EQ_I(e1 - e0, 1);
+    TEST_ASSERT_EQ_I(after, threads);
+#ifdef DEBUG
+    char dir[64], path[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce_wbe_%d", (int)getpid());
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "a directory of our own");
+    plat_write(dir, "f", "written once");
+    snprintf(path, sizeof(path), "%s/f", dir);
+    ray_file_writeback_test_fail(true);
+    int fd = ray_file_writebehind_begin(path);
+    ray_file_writebehind_end(fd);
+    int64_t e2 = ray_file_writeback_errors();
+    ray_file_writeback_test_fail(false);
+    plat_unlink(dir, "f");
+    rmdir(dir);
+    TEST_ASSERT(fd >= 0, "write-behind begun");
+    TEST_ASSERT_EQ_I(e2 - e1, 2);
+#endif
+#endif
+    PASS();
+}
+
+/* A fork while the background thread serves a request: the child closes
+ * that request's descriptor as well as the queued ones (the parent's to
+ * serve), and the parent's are all closed once they are served. */
+static test_result_t test_file_writeback_fork(void) {
+#if defined(RAY_OS_LINUX) && defined(DEBUG)
+    char dir[64], path[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce_wbk_%d", (int)getpid());
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "a directory of our own");
+    plat_write(dir, "f", "written once");
+    snprintf(path, sizeof(path), "%s/f", dir);
+    (void)ray_file_writeback_errors();
+    int base = plat_nfds();
+    ray_file_writeback_test_hold(true);
+    int fd = ray_file_writebehind_begin(path);   /* its start served, held there */
+    if (fd >= 0) ray_file_writeback_test_wait_held();
+    ray_file_writebehind_end(fd);                /* queued behind it */
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) _exit(plat_nfds() == base ? 0 : 1);
+    int status = 0;
+    pid_t got = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    ray_file_writeback_test_hold(false);
+    (void)ray_file_writeback_errors();
+    int left = plat_nfds() - base;
+    plat_unlink(dir, "f");
+    rmdir(dir);
+    TEST_ASSERT(fd >= 0, "write-behind begun");
+    TEST_ASSERT(got == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "the child holds no descriptor of the parent's requests");
+    TEST_ASSERT_EQ_I(left, 0);
 #endif
     PASS();
 }
@@ -370,6 +455,8 @@ const test_entry_t platform_entries[] = {
     { "platform/cgroup_cpu_quota", test_cgroup_cpu_quota, NULL, NULL },
     { "platform/cpu_set_count_wide_mask", test_cpu_set_count_wide_mask, NULL, NULL },
     { "platform/file_writebehind_fds", test_file_writebehind_fds, NULL, NULL },
+    { "platform/file_writeback_errors", test_file_writeback_errors, NULL, NULL },
+    { "platform/file_writeback_fork", test_file_writeback_fork, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

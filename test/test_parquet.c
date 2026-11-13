@@ -1056,6 +1056,46 @@ static test_result_t test_pq_native_dictionary(void) {
     ray_release(types);
     PASS();
 }
+/* A failed write-behind fails a column-by-column import: its waits take
+ * the file's write error, which the sync before publishing then misses,
+ * so the import checks the failures counted (the hook fails every
+ * request).  Nothing is published, and the same import succeeds without
+ * the hook. */
+static test_result_t test_pq_writebehind_failed(void) {
+#if !defined(DEBUG) || !defined(RAY_OS_LINUX)
+    SKIP("a debug-build hook; write-behind is Linux's");
+#else
+    const char* names[] = {"x","name","flag","wide","day","ts","f"};
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    char dir[160], partial[200];
+    snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-wbf-%d",(int)getpid());
+    snprintf(partial,sizeof(partial),"%s.parquet-partial",dir);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    pq_set_layout("1");
+    ray_file_writeback_test_fail(true);
+    ray_t* failed = ray_parquet_splayed_typed(FIX "flat-0-v1.parquet",dir,types);
+    ray_file_writeback_test_fail(false);
+    struct stat st;
+    bool published = stat(dir,&st) == 0, staged = stat(partial,&st) == 0;
+    (void)ray_test_rm_rf(partial);
+    ray_t* result = ray_parquet_splayed_typed(FIX "flat-0-v1.parquet",dir,types);
+    pq_set_layout(NULL);
+    bool ok = result && !RAY_IS_ERR(result) && result->i64 == 18;
+    bool err = failed && RAY_IS_ERR(failed);
+    if (failed) { if (RAY_IS_ERR(failed)) ray_error_free(failed); else ray_release(failed); }
+    if (result) { if (RAY_IS_ERR(result)) ray_error_free(result); else ray_release(result); }
+    pq_remove_native(dir,names,7);
+    ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT(err, "the import fails");
+    TEST_ASSERT(!published, "nothing published");
+    TEST_ASSERT(staged, "the staging directory retained");
+    TEST_ASSERT(ok, "the same import succeeds without the hook");
+    PASS();
+#endif
+}
 static test_result_t test_pq_native_edges(void) {
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,3);
@@ -4733,6 +4773,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_grouped_empty",test_pq_sym_grouped_empty,pq_setup,pq_teardown},
     {"parquet/sym_direct_caps",test_pq_sym_direct_caps,pq_setup,pq_teardown},
     {"parquet/sym_seeded_chunked",test_pq_sym_seeded_chunked,pq_setup,pq_teardown},
+    {"parquet/writebehind_failed",test_pq_writebehind_failed,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif

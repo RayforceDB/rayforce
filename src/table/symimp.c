@@ -85,7 +85,7 @@ struct ray_symimp_s {
                                     * size and the shard tables */
     int64_t  count;
     int64_t  tail;                 /* bytes of records + header */
-    int64_t  fsize;                /* the file's current length */
+    _Atomic(int64_t) fsize;        /* the file's current length */
     int64_t  synced;               /* bytes whose writeback was started */
     int64_t  ix_count, ix_tail;    /* the last durable sync's: its index is
                                     * written at free when nothing came after */
@@ -400,13 +400,14 @@ void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off) {
 }
 
 bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n) {
-    /* Through the mapping: the range was reserved, so the file covers it.
-     * A buffered write to one file holds its inode lock, and the kernel
-     * throttles a writer for dirty pages while it holds it, so the tasks
-     * writing their records at once would wait on the one throttled;
-     * faults on the shared mapping take no such lock, and each writer is
-     * throttled on its own. */
-    if (off >= 0 && (uint64_t)off + n <= (uint64_t)m->reserve) {
+    /* Through the mapping where the file covers the range (a reserved
+     * range, every caller's): a buffered write to one file holds its inode
+     * lock, and the kernel throttles a writer for dirty pages while it
+     * holds it, so the tasks writing their records at once would wait on
+     * the one throttled; faults on the shared mapping take no such lock,
+     * and each writer is throttled on its own.  Past the file's length a
+     * store would fault, so that goes through pwrite. */
+    if (off >= 0 && (uint64_t)off + n <= (uint64_t)atomic_load_explicit(&m->fsize, memory_order_relaxed)) {
         memcpy(m->map + off, buf, n);
         return true;
     }

@@ -192,6 +192,23 @@ void  ray_file_writeback_start(int fd, int64_t off, int64_t len);
  * the work, in order. */
 int   ray_file_writebehind_begin(const char* path);
 void  ray_file_writebehind_end(int fd);
+/* Writeback requests failed so far, process-wide, once the background
+ * thread has served every request (it waits for that, and the thread has
+ * ended when it returns).  The waits of a write-behind's end take the
+ * file's pending write error, so a later fsync of the file reports none:
+ * a writer that handed files over checks this did not grow before it
+ * trusts them. */
+int64_t ray_file_writeback_errors(void);
+#ifdef DEBUG
+/* Test hooks (C tests only): with hold on, the background thread stops at
+ * the next request it takes, before its writeback, until hold is turned
+ * off; wait_held returns once it has stopped there.  With fail on, every
+ * request counts as failed in ray_file_writeback_errors.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_file_writeback_test_hold(bool on);
+void ray_file_writeback_test_wait_held(void);
+void ray_file_writeback_test_fail(bool on);
+#endif
 /* The I/O counters the converters' traces read: bytes read from and
  * written to storage, written bytes whose writeback was cancelled, read and
  * write calls, and major faults; of the process, or of the calling thread
