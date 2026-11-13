@@ -10,7 +10,8 @@ that column.
 `set` binds a global name. `let` binds in the current frame: the top level, a
 function call, or an interpreted `do` block. Function parameters are local to
 that call. At the top level `let` binds a global, so a restricted IPC request
-(`-U`) is refused it with `access`, as it is `set`.
+(`-U`) is refused it with `access`, as it is `set`; a restricted request
+binds only in frames it opens itself.
 
 ```lisp
 (set x 10)

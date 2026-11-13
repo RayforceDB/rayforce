@@ -454,10 +454,10 @@ static ray_err_t journal_replay_from(const char*           path,
          * this a `-U` client's writes silently elevate to full privilege
          * across crash-restart, since replay runs in the main thread with
          * no IPC connection context. */
-        bool prev_restricted = ray_eval_get_restricted();
-        ray_eval_set_restricted(hdr.flags & RAY_IPC_FLAG_RESTRICTED);
+        ray_restrict_save_t prev_restricted;
+        ray_eval_restrict_enter(hdr.flags & RAY_IPC_FLAG_RESTRICTED, &prev_restricted);
         ray_t* result = eval_one(msg);
-        ray_eval_set_restricted(prev_restricted);
+        ray_eval_restrict_leave(&prev_restricted);
         ray_release(msg);
 
         if (result && RAY_IS_ERR(result)) {

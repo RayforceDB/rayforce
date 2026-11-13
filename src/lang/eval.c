@@ -193,8 +193,30 @@ bool ray_raise_render(char* buf, size_t cap) {
  * Restricted-mode check
  * ══════════════════════════════════════════ */
 
-void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
+void ray_eval_set_restricted(bool on) {
+    if (!__VM) return;
+    __VM->restricted = on;
+    __VM->restricted_base = on ? __VM->scope_depth : 0;
+}
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
+
+/* A request is evaluated in the restriction of the connection it came on.
+ * It may arrive while server code is inside a frame (a request a peer
+ * pushes back during a sync send), so the frames already open are recorded
+ * as not the request's own: env.c refuses a restricted binding into them
+ * as it does into the global frame.  Restores both on leave. */
+void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s) {
+    s->restricted = __VM && __VM->restricted;
+    s->base = __VM ? __VM->restricted_base : 0;
+    if (!__VM) return;
+    __VM->restricted = on;
+    __VM->restricted_base = __VM->scope_depth;
+}
+void ray_eval_restrict_leave(const ray_restrict_save_t* s) {
+    if (!__VM) return;
+    __VM->restricted = s->restricted;
+    __VM->restricted_base = s->base;
+}
 
 bool ray_fn_is_local_mutator(const ray_t* fn) {
     if (!fn || fn->type != RAY_VARY) return false;
@@ -2467,7 +2489,11 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
         val = ray_lazy_materialize(val);
     if (RAY_IS_ERR(val)) return val;
     ray_err_t err = ray_env_set_local_rows(name_obj->i64, val, rows);
-    if (err != RAY_OK) { ray_release(val); return ray_error(ray_err_code_str(err), NULL); }
+    if (err != RAY_OK) {
+        ray_release(val);
+        return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
+                                     : ray_error(ray_err_code_str(err), NULL);
+    }
     return val;
 }
 
@@ -2657,6 +2683,7 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
             if (RAY_IS_ERR(idx)) return idx;
             ray_err_t e = ray_env_set_local_rows(name, idx, 0);
             ray_release(idx);
+            if (e == RAY_ERR_ACCESS) return ray_error("access", "restricted");
             if (e != RAY_OK) return ray_error(ray_err_code_str(e), NULL);
         }
         for (int64_t i = 1; i < n; i++) {
