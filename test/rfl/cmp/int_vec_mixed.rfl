@@ -87,3 +87,21 @@
 (count (where (== LN LN))) -- 200000
 (count (where (< 0N LN))) -- 199996
 
+(set FN (+ F 0.0))
+(alter 'FN set [0 65535 65536 199999] 0Nf)
+(set F32N (as 'F32 FN))
+(set SC (take [1.5] M))
+(set SI (take [7] M))
+(count (where (!= (== FN 1.5) (== FN SC)))) -- 0
+(count (where (!= (<  FN 1.5) (<  FN SC)))) -- 0
+(count (where (!= (<= FN 1.5) (<= FN SC)))) -- 0
+(count (where (!= (>  FN 1.5) (>  FN SC)))) -- 0
+(count (where (!= (>= FN 1.5) (>= FN SC)))) -- 0
+(count (where (!= (!= FN 1.5) (!= FN SC)))) -- 0
+(count (where (!= (<  FN 7) (<  FN (as 'F64 SI))))) -- 0
+(count (where (!= (== F32N 1.5) (== (as 'F64 F32N) SC)))) -- 0
+(count (where (!= (<  F32N 7) (<  (as 'F64 F32N) (as 'F64 SI))))) -- 0
+(count (where (!= (<= LN 1.5) (<= (as 'F64 LN) SC)))) -- 0
+(count (where (!= (>  IN 7.5) (>  (as 'F64 IN) (take [7.5] M))))) -- 0
+(count (where (!= (== U 100.0) (== (as 'F64 U) (take [100.0] M))))) -- 0
+(count (where (== FN 1.5))) -- (count (where (== (as 'F64 (as 'F32 FN)) 1.5)))

@@ -4341,6 +4341,55 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         #undef BR_FAST_WIDE
     }
 
+    /* Fast path: float or integer column against a float scalar (or a float
+     * column against an integer scalar) → bool comparison, in double.  The
+     * generic float arm below reads the scalar through the whole reader chain
+     * for every row (0.31 ms per million rows, 2.5x the vector-vector one).
+     * Null-as-minimum, with the scalar not null: a NaN column cell (the F64 /
+     * F32 null) is smaller than every value, so it is true for < and <= and
+     * false for the rest except <>; integer null sentinels are corrected by the
+     * caller's null pass, as for the other kernels.  A null scalar keeps the
+     * generic arm. */
+    if (out_type == RAY_BOOL && !l_scalar && r_scalar &&
+        (op->opcode == OP_EQ || op->opcode == OP_NE ||
+         op->opcode == OP_LT || op->opcode == OP_LE ||
+         op->opcode == OP_GT || op->opcode == OP_GE) &&
+        (lhs->type == RAY_F64 || lhs->type == RAY_F32 ||
+         (BR_INT_VEC(lhs->type) && r_scalar_float)))
+    {
+        double sv = r_scalar_float ? r_f64 : (double)r_i64;
+        if (sv == sv) {
+            int64_t l_off = start;
+            void* l_data = resolve_vec_data(lhs, &l_off);
+            uint8_t l_esz = ray_elem_size(lhs->type);
+            const uint8_t* lbase = (const uint8_t*)l_data + l_off * l_esz;
+            uint8_t* odst = (uint8_t*)dst;
+            uint16_t opc = op->opcode;
+
+            #define BR_FS(T)                                                    \
+                do {                                                            \
+                    const T* d = (const T*)lbase;                               \
+                    switch (opc) {                                              \
+                    case OP_EQ: for (int64_t i = 0; i < n; i++) odst[i] = ((double)d[i] == sv); break; \
+                    case OP_NE: for (int64_t i = 0; i < n; i++) { double x = (double)d[i]; odst[i] = (x != sv); } break; \
+                    case OP_LT: for (int64_t i = 0; i < n; i++) { double x = (double)d[i]; odst[i] = (x != x) | (x < sv); } break; \
+                    case OP_LE: for (int64_t i = 0; i < n; i++) { double x = (double)d[i]; odst[i] = (x != x) | (x <= sv); } break; \
+                    case OP_GT: for (int64_t i = 0; i < n; i++) odst[i] = ((double)d[i] >  sv); break; \
+                    case OP_GE: for (int64_t i = 0; i < n; i++) odst[i] = ((double)d[i] >= sv); break; \
+                    }                                                           \
+                } while (0)
+
+            if (lhs->type == RAY_F64)                     BR_FS(double);
+            else if (lhs->type == RAY_F32)                BR_FS(float);
+            else if (l_esz == 8)                          BR_FS(int64_t);
+            else if (l_esz == 4)                          BR_FS(int32_t);
+            else if (l_esz == 2)                          BR_FS(int16_t);
+            else                                          BR_FS(uint8_t);
+            #undef BR_FS
+            return;
+        }
+    }
+
     /* Fast path: integer-family vector against integer-family vector (any
      * widths) → bool comparison.  The generic chain below reads every operand
      * through a run of per-element pointer tests, 2.7 - 4.3 ns per row; here a
