@@ -4362,7 +4362,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             int64_t l_off = start;
             void* l_data = resolve_vec_data(lhs, &l_off);
             uint8_t l_esz = ray_elem_size(lhs->type);
-            const uint8_t* lbase = (const uint8_t*)l_data + l_off * l_esz;
+            /* a void* base: it is read as double and float as well as integers */
+            const void* lbase = (const char*)l_data + l_off * l_esz;
             uint8_t* odst = (uint8_t*)dst;
             uint16_t opc = op->opcode;
 
