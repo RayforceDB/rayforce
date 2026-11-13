@@ -209,8 +209,11 @@ static test_result_t slot_search_is_linear(void) {
     ray_t* root = ray_read_list(&b, kids, N);
     TEST_ASSERT_NOT_NULL(root);
     TEST_ASSERT_EQ_I(b.status, RAY_READ_OK);
-    /* one free-entry request per block, none of them a page walk */
+#ifdef DEBUG
+    /* one free-entry request per block, none of them a page walk (meta_work is
+     * counted in DEBUG builds only) */
     TEST_ASSERT(b.meta_work <= 2 * (size_t)(N + 1), "free-entry search is not linear");
+#endif
     ray_read_budget_close(&b);
     TEST_ASSERT_EQ_U(b.live, 0);
     PASS();

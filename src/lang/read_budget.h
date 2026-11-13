@@ -20,7 +20,8 @@ typedef struct ray_read_budget {
     ray_read_record_t* free_slot;
     /* Ledger entries examined so far (one per free-slot request, one per entry
      * walked to find a released block): a deterministic measure of the
-     * context's own bookkeeping work, bounded by the tests. */
+     * context's own bookkeeping work, bounded by the tests.  Counted in DEBUG
+     * builds only; it stays zero in a release build. */
     size_t meta_work;
 } ray_read_budget_t;
 
