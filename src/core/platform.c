@@ -351,7 +351,10 @@ static void wb_reap(void) {
  * child's copy of it releases it; the condition is made anew: the copied
  * one may count the parent's waiters, and a signal would wait for them
  * forever. */
-static void wb_fork_prepare(void) { pthread_mutex_lock(&wb_mu); }
+static void wb_fork_prepare(void) {
+    pthread_mutex_lock(&wb_mu);
+    wb_reap();   /* an ended thread is gone before the fork */
+}
 static void wb_fork_parent(void) { pthread_mutex_unlock(&wb_mu); }
 static void wb_fork_child(void) {
     int n = (int)(wb_tail - wb_head);
@@ -367,8 +370,18 @@ static void wb_fork_child(void) {
     (void)pthread_cond_init(&wb_cv, NULL);
     pthread_mutex_unlock(&wb_mu);
 }
+/* At exit an ended thread is joined: one that served the last request of
+ * the process is otherwise left unjoined (a leak to TSan). */
+static void wb_atexit(void) {
+    pthread_mutex_lock(&wb_mu);
+    wb_reap();
+    pthread_mutex_unlock(&wb_mu);
+}
 static pthread_once_t wb_once = PTHREAD_ONCE_INIT;
-static void wb_init(void) { (void)pthread_atfork(wb_fork_prepare, wb_fork_parent, wb_fork_child); }
+static void wb_init(void) {
+    (void)pthread_atfork(wb_fork_prepare, wb_fork_parent, wb_fork_child);
+    (void)atexit(wb_atexit);
+}
 
 /* Queue `r` (its descriptor the queue's from here on), or do it now. */
 static void wb_push(wb_req_t r) {

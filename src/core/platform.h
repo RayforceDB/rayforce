@@ -197,7 +197,8 @@ void  ray_file_writebehind_end(int fd);
  * ended when it returns).  The waits of a write-behind's end take the
  * file's pending write error, so a later fsync of the file reports none:
  * a writer that handed files over checks this did not grow before it
- * trusts them. */
+ * trusts them.  ray_runtime_destroy calls it, so no thread is left behind
+ * a runtime. */
 int64_t ray_file_writeback_errors(void);
 #ifdef DEBUG
 /* Test hooks (C tests only): with hold on, the background thread stops at

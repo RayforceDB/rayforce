@@ -252,7 +252,7 @@ static int plat_wb_threads(void) {
     struct dirent* e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        char path[64], comm[32] = {0};
+        char path[sizeof("/proc/self/task/") + sizeof(e->d_name) + sizeof("/comm")], comm[32] = {0};
         snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
         FILE* f = fopen(path, "r");
         if (!f) continue;   /* a task that ended meanwhile */
