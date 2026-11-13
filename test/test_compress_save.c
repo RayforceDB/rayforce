@@ -4512,6 +4512,121 @@ static test_result_t test_select_parted_prunes_fetch(void) {
     PASS();
 }
 
+/* Row-local additions must really create the narrowed source, not just
+ * return equal answers through the old full scan. The top-level OR used by
+ * the reference cannot derive a necessary mask (unlike an OR below AND).
+ * No timing assertion, encoded-materialization count or physical-I/O claim. */
+static test_result_t test_select_parted_prunes_local_shapes(void) {
+    static const struct { const char* output; const char* pred; int64_t rows; bool pruned; } qs[] = {
+        { "a: a", "(and (== date 2024.01.02) (not (< a 8)))", 2998, true },
+        { "a: a", "(and (== date 2024.01.02) (or (< a 8) (> a 11992)))", 3, true },
+        { "by: b f: (first a) l: (last a)", "(== date 2024.01.02)", 3000, true },
+        { "c: (count (distinct a))", "(== date 2024.01.02)", 1, true },
+        { "q: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, true },
+        { "q: (if (< a 8) a 0Nl)", "(== date 2024.01.02)", 3000, true },
+        { "q: (if (< a 8) a 0)", "(> date 2024.01.03)", 0, true },
+        { "q: (if (< a 8) a 0)", "(>= date 2024.01.01)", 9000, false },
+        { "a: a", "(and (>= date 2024.01.02) (> a (avg a)))", 3300, false },
+        { "by: b s: (sum (if (< a 8) a 0))", "(== date 2024.01.02)", 3000, false },
+        { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, false },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/local%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make(path, gen ? 7 : 0, false);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            char q[512], ref[768];
+            snprintf(q, sizeof q, "(select {from: t where: %s %s})", qs[i].pred, qs[i].output);
+            snprintf(ref, sizeof ref, "(select {from: t where: (or %s %s) %s})",
+                     qs[i].pred, qs[i].pred, qs[i].output);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+#ifdef DEBUG
+            uint64_t created = ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* u = ray_eval_str(ref);
+            bool structural = true;
+#ifdef DEBUG
+            structural = created == (uint64_t)qs[i].pruned &&
+                         ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          ray_table_nrows(r) == qs[i].rows && sp_same(r, u);
+            drop_out(r); drop_out(u);
+            if (!values || !structural) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structural, "gen %d case %zu: values=%d structural=%d: %s",
+                                gen, i, (int)values, (int)structural, q);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* Canonical-looking heads with lexical bindings, quoted heads and opaque
+ * effectful helpers remain conservative. Compare the same query without a
+ * necessary mask; do not assume scalar rebinding dictates query lowering. */
+static test_result_t test_select_parted_prunes_head_bindings(void) {
+    static const struct { const char* names; const char* args; const char* pred; const char* output; } qs[] = {
+        { "not", "not", "(and (== date 2024.01.02) (not (< a 8)))", "a: a" },
+        { "if", "if", "(== date 2024.01.02)", "q: (if (< a 8) a 0)" },
+        { "first", "first", "(== date 2024.01.02)", "by: b f: (first a) l: (last a)" },
+        { "count distinct", "count distinct", "(== date 2024.01.02)", "c: (count (distinct a))" },
+        { "", "", "(== date 2024.01.02)", "s: ('sum a)" },
+        { "f", "(fn [x] (do (set _prune_hits (+ _prune_hits 1)) x))", "(== date 2024.01.02)", "a: (f a)" },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/heads%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make(path, gen ? 7 : 0, false);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            char q[1024], ref[1536];
+            snprintf(q, sizeof q, "((fn [%s] (select {from: t where: %s %s})) %s)",
+                     qs[i].names, qs[i].pred, qs[i].output, qs[i].args);
+            snprintf(ref, sizeof ref, "((fn [%s] (select {from: t where: (or %s %s) %s})) %s)",
+                     qs[i].names, qs[i].pred, qs[i].pred, qs[i].output, qs[i].args);
+            drop_out(ray_eval_str("(set _prune_hits 0)"));
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+#ifdef DEBUG
+            uint64_t created = ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* u = ray_eval_str(ref);
+            bool structural = true;
+#ifdef DEBUG
+            structural = created == 0 && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && sp_same(r, u);
+#ifdef DEBUG
+            structural = structural && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            drop_out(r); drop_out(u);
+            bool effect = true;
+            if (i == 5) {
+                ray_t* seen = ray_eval_str("(> _prune_hits 0)");
+                effect = seen && !RAY_IS_ERR(seen) && seen->type == -RAY_BOOL && seen->b8;
+                drop_out(seen);
+            }
+            if (!values || !structural || !effect) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structural && effect, "head gen %d case %zu: values=%d structural=%d effect=%d: %s",
+                                gen, i, (int)values, (int)structural, (int)effect, q);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
 /* Pruned answers (or errors) equal the unpruned scan's, on generation 0 and
  * 2, for every shape and prunable predicate (nothing surviving included);
  * generation 0 decodes nothing.  On these even partitions that includes the
@@ -4586,6 +4701,233 @@ static test_result_t test_select_parted_prunes_mixed(void) {
 
 /* A lambda formal named like the key shadows it: the where compares the
  * formal, so nothing is pruned and the answer is the whole table's. */
+/* Head names present as real parted columns are not canonical call heads
+ * for pruning. LAST, absent from the schema, is a positive control so an
+ * unrelated source-shape rejection cannot satisfy all the assertions. */
+static ray_t* pdb_make_head_columns(const char* root, unsigned gen2) {
+    static const char* const names[] = { "not", "if", "first", "distinct" };
+    for (int p = 0; p < 3; p++) {
+        char dir[256]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+        ray_t* t = ray_table_new(6);
+        ray_t* a = i64_col(3000, 3 + p);
+        ray_t* b = i64_col(3000, 5);
+        for (int64_t i = 0; i < 3000; i++) ((int64_t*)ray_data(b))[i] += p;
+        t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+        if (t && !RAY_IS_ERR(t)) t = ray_table_add_col(t, ray_sym_intern("b", 1), b);
+        for (size_t i = 0; i < sizeof names / sizeof names[0] && t && !RAY_IS_ERR(t); i++)
+            t = ray_table_add_col(t, ray_sym_intern(names[i], strlen(names[i])), a);
+        ray_release(a); ray_release(b);
+        if (!t || RAY_IS_ERR(t)) { drop_out(t); return NULL; }
+        ray_err_t e = ray_splay_save_mode(t, dir, NULL,
+            (gen2 >> p) & 1 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+        ray_release(t);
+        if (e != RAY_OK) return NULL;
+    }
+    ray_t* t = ray_read_parted(root, "t");
+    if (t && RAY_IS_ERR(t)) { ray_error_free(t); return NULL; }
+    return t;
+}
+static test_result_t test_select_parted_prunes_table_heads(void) {
+    static const struct { const char* pred; const char* output; uint64_t expected; } qs[] = {
+        { "(and (== date 2024.01.02) (not (< a 8)))", "a: a", 0 },
+        { "(== date 2024.01.02)", "q: (if (< a 8) a b)", 0 },
+        { "(== date 2024.01.02)", "by: b q: (first a)", 0 },
+        { "(== date 2024.01.02)", "q: (count (distinct a))", 0 },
+        { "(== date 2024.01.02)", "by: b q: (last a)", 1 },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256]; snprintf(path, sizeof path, "%s/tableheads%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make_head_columns(path, gen ? 7 : 0);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            char q[512], ref[768];
+            snprintf(q, sizeof q, "(select {from: t where: %s %s})", qs[i].pred, qs[i].output);
+            snprintf(ref, sizeof ref, "(select {from: t where: (or %s %s) %s})",
+                     qs[i].pred, qs[i].pred, qs[i].output);
+            uint64_t created = 0, reference = 0;
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+#ifdef DEBUG
+            created = ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* u = ray_eval_str(ref);
+            /* Shadowed call heads may be rejected by ordinary evaluation. Preserve
+             * its error category, rather than inventing scalar-namespace semantics.
+             * LAST must still succeed, proving that this source can be pruned. */
+            bool values = r && u && RAY_IS_ERR(r) && RAY_IS_ERR(u)
+                ? strcmp(ray_err_code(r), ray_err_code(u)) == 0
+                : r && u && !RAY_IS_ERR(r) && !RAY_IS_ERR(u) &&
+                  r->type == RAY_TABLE && u->type == RAY_TABLE && sp_same(r, u);
+            if (i == 4 && (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE)) values = false;
+            bool structural = true;
+#ifdef DEBUG
+            reference = ray_query_test_parted_pruned_sources(true);
+            structural = created == qs[i].expected && reference == 0;
+#endif
+            drop_out(r); drop_out(u);
+            if (!values || !structural) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structural,
+                    "table head gen %d case %zu: values=%d created=%llu expected=%llu reference=%llu: %s",
+                    gen, i, (int)values, (unsigned long long)created,
+                    (unsigned long long)qs[i].expected, (unsigned long long)reference, q);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* Build genuine compact-width runtime SYM clause keys, not a forged header.
+ * The parsed clause expressions remain unevaluated; the public SELECT entry
+ * receives a normal dictionary value. */
+static ray_t* pdb_select_key_width(const char* clauses, uint8_t width) {
+    ray_t* d = ray_eval_str(clauses);
+    if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+    ray_t* old_keys = ray_dict_keys(d);
+    ray_t* vals = ray_dict_vals(d);
+    if (d->type != RAY_DICT || !old_keys || old_keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) {
+        ray_release(d);
+        return ray_error("type", "compact clause fixture: expected dictionary");
+    }
+    ray_t* keys = ray_sym_vec_new(width, old_keys->len);
+    if (!keys || RAY_IS_ERR(keys)) { ray_release(d); return keys ? keys : ray_error("oom", NULL); }
+    for (int64_t i = 0; i < old_keys->len; i++) {
+        int64_t id = ray_vec_get_sym_id(old_keys, i);
+        if (id <= 0 || (uint64_t)id >= UINT16_MAX) {
+            ray_release(keys); ray_release(d);
+            return ray_error("domain", "compact clause fixture: runtime id outside W16 range");
+        }
+        if (width == RAY_SYM_W16) ((uint16_t*)ray_data(keys))[i] = (uint16_t)id;
+        else ((uint32_t*)ray_data(keys))[i] = (uint32_t)id;
+    }
+    keys->len = old_keys->len; /* freshly allocated initialized cells, all non-NULL */
+    ray_retain(vals);
+    ray_t* compact = ray_dict_new(keys, vals); /* consumes both sides */
+    ray_release(d);
+    if (!compact || RAY_IS_ERR(compact)) return compact ? compact : ray_error("oom", NULL);
+    ray_t* r = ray_select(&compact, 1);
+    ray_release(compact);
+    return r;
+}
+
+static test_result_t test_select_parted_prunes_dictionary_key_widths(void) {
+    static const uint8_t widths[] = { RAY_SYM_W16, RAY_SYM_W32 };
+    for (int gen = 0; gen <= 1; gen++) {
+        char path[256]; snprintf(path, sizeof(path), "%s/compact_keys%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make(path, gen ? 7u : 0u, false);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t wi = 0; wi < sizeof(widths)/sizeof(widths[0]); wi++) {
+            for (int alias = 0; alias <= 1; alias++) {
+                const char* name = alias ? "a" : "q";
+                char actual[256], reference[320];
+                snprintf(actual, sizeof(actual), "{%s:(if (< a 8) a 0) from:t where:(== date 2024.01.02)}", name);
+                snprintf(reference, sizeof(reference), "{%s:(if (< a 8) a 0) from:t where:(or (== date 2024.01.02) (== date 2024.01.02))}", name);
+#ifdef DEBUG
+                ray_query_test_parted_pruned_sources(true);
+#endif
+                ray_t* r = pdb_select_key_width(actual, widths[wi]);
+                uint64_t created = 0, ref_created = 0;
+#ifdef DEBUG
+                created = ray_query_test_parted_pruned_sources(true);
+#endif
+                ray_t* u = pdb_select_key_width(reference, widths[wi]);
+#ifdef DEBUG
+                ref_created = ray_query_test_parted_pruned_sources(true);
+#endif
+                bool values = r && u && !RAY_IS_ERR(r) && !RAY_IS_ERR(u) &&
+                              r->type == RAY_TABLE && u->type == RAY_TABLE && sp_same(r, u);
+                bool structural = true;
+#ifdef DEBUG
+                structural = created == (alias ? 0u : 1u) && ref_created == 0;
+#endif
+                drop_out(r); drop_out(u);
+                if (!values || !structural) {
+                    sp_bind(NULL); ray_release(t);
+                    TEST_ASSERT_FMT(false, "compact query keys gen=%d width=%u alias=%d values=%d created=%llu reference=%llu",
+                                    gen, (unsigned)widths[wi], alias, values,
+                                    (unsigned long long)created, (unsigned long long)ref_created);
+                }
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* TAKE is evaluated after pruning admission. Preserve the unpruned query's
+ * effective behavior and exactly-once effect even if TAKE changes a head. */
+static test_result_t test_select_parted_prunes_take_head_effects(void) {
+    for (int gen = 0; gen <= 1; gen++) {
+        char path[256]; snprintf(path, sizeof(path), "%s/take_heads%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make(path, gen ? 7u : 0u, false);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (int which = 0; which < 2; which++) {
+            const char* head = which ? "first" : "not";
+            const char* output = which ? "(first a)" : "(sum a)";
+            const char* by = which ? " by:date" : "";
+            const char* where = which ? "(== date 2024.01.02)" : "(and (== date 2024.01.02) (not (< a 4)))";
+            const char* replacement = which ? "(fn [_x] (count (at t 'a)))" : "(fn [_x] _x)";
+            char setup[256], restore[128], effect[512], actual[1024], reference[1280];
+            snprintf(setup, sizeof(setup), "(do (set _prune_saved_head %s) (set _prune_take_hits 0))", head);
+            snprintf(restore, sizeof(restore), "(set %s _prune_saved_head)", head);
+            snprintf(effect, sizeof(effect), "(do (set _prune_take_hits (+ _prune_take_hits 1)) (set %s %s) 1)", head, replacement);
+            snprintf(actual, sizeof(actual), "(select {q:%s from:t where:%s%s take:%s})", output, where, by, effect);
+            snprintf(reference, sizeof(reference), "(select {q:%s from:t where:(or %s %s)%s take:%s})", output, where, where, by, effect);
+            ray_t* init = ray_eval_str(setup);
+            bool ready = init && !RAY_IS_ERR(init);
+            drop_out(init);
+#ifdef DEBUG
+            ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ready ? ray_eval_str(actual) : NULL;
+            /* Demand under the changed binding, before restoring the head. */
+            ray_t* r_wire = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE ? ray_ser(r) : NULL;
+            uint64_t created = 0, ref_created = 0;
+#ifdef DEBUG
+            created = ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* reset = ray_eval_str(restore);
+            bool restored = reset && !RAY_IS_ERR(reset);
+            drop_out(reset);
+            ray_t* u = ready && restored ? ray_eval_str(reference) : NULL;
+            ray_t* u_wire = u && !RAY_IS_ERR(u) && u->type == RAY_TABLE ? ray_ser(u) : NULL;
+#ifdef DEBUG
+            ref_created = ray_query_test_parted_pruned_sources(true);
+#endif
+            reset = ray_eval_str(restore);
+            restored = restored && reset && !RAY_IS_ERR(reset);
+            drop_out(reset);
+            ray_t* hits = ray_eval_str("_prune_take_hits");
+            bool values = r && u && !RAY_IS_ERR(r) && !RAY_IS_ERR(u) &&
+                          r->type == RAY_TABLE && u->type == RAY_TABLE &&
+                          r_wire && u_wire && !RAY_IS_ERR(r_wire) && !RAY_IS_ERR(u_wire) &&
+                          r_wire->len == u_wire->len &&
+                          memcmp(ray_data(r_wire), ray_data(u_wire), (size_t)r_wire->len) == 0 && sp_same(r, u);
+            bool once_each = hits && !RAY_IS_ERR(hits) && hits->type == -RAY_I64 && hits->i64 == 2;
+            bool structural = true;
+#ifdef DEBUG
+            structural = created == 1 && ref_created == 0;
+#endif
+            drop_out(r_wire); drop_out(u_wire);
+            drop_out(r); drop_out(u); drop_out(hits);
+            if (!ready || !restored || !values || !once_each || !structural) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(false, "take head gen=%d head=%s ready=%d restored=%d values=%d once=%d created=%llu reference=%llu",
+                                gen, head, ready, restored, values, once_each,
+                                (unsigned long long)created, (unsigned long long)ref_created);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
 static test_result_t test_select_parted_prunes_shadow(void) {
     ray_t* t = pdb_make(ray_test_tmp(CS_TMP "/sh"), 7, false);
     TEST_ASSERT_NOT_NULL(t);
@@ -5022,7 +5364,12 @@ const test_entry_t compress_entries[] = {
     { "compress/select_decodes_referenced_only", test_select_decodes_referenced_only, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_local_shapes", test_select_parted_prunes_local_shapes, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_mixed",   test_select_parted_prunes_mixed,   rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_table_heads", test_select_parted_prunes_table_heads, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_dictionary_key_widths", test_select_parted_prunes_dictionary_key_widths, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_take_head_effects", test_select_parted_prunes_take_head_effects, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_shadow",  test_select_parted_prunes_shadow,  rt_setup, rt_teardown },
     { "compress/select_parted_prunes_none",    test_select_parted_prunes_none,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_by_key_uneven", test_select_parted_prunes_by_key_uneven, rt_setup, rt_teardown },

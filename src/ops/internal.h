@@ -1470,6 +1470,10 @@ uint64_t ray_exec_test_refine_in(void);
  * statistics before running (exec_filter_chain_prune), and the selection
  * segments (vectors) they dropped, since process start. */
 void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
+#ifdef DEBUG
+/* Successful query-level narrowed-source constructions, not physical reads. */
+uint64_t ray_query_test_parted_pruned_sources(bool reset);
+#endif
 /* exec.c test hook: later `in` conjuncts over a single-file generation-2
  * column answered by range (in_sel_single_within) since process start. */
 uint64_t ray_exec_test_in_single_within(void);
