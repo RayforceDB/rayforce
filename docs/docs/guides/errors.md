@@ -150,7 +150,7 @@ Internally, `raise` stores your value and triggers a domain error. The `try` han
 
 ### Access Errors (Restricted Mode)
 
-In restricted evaluation mode (used for IPC), certain functions are blocked:
+In restricted evaluation mode (used for IPC), certain functions are blocked, and so is any binding outside a frame the request opened itself (a top-level `let` or `times` loop variable):
 
 ```text
 ; on a restricted server connection:

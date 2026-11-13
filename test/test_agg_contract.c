@@ -963,6 +963,45 @@ static test_result_t test_narrow_extrema_limits(void) {
  * A frequent null key stresses contention/skew; one live key has no valid
  * aggregate values. Native widths, mixed COUNT, binary inputs, and repeated
  * scratch reuse all pass through the common output stage. */
+/* The group order of a dense grouping does not depend on the core count
+ * (#1154): partitioned across workers, it is the order one slab gives. */
+static test_result_t test_dense_partition_order(void) {
+    ray_t* setup = ray_eval_str("(set order_i (til 1000000)) (set order_g (% (* order_i 17) 80000)) "
+        "(set order_t (table [k b v] (list (as 'I32 (+ (* order_g 2) (div order_g 4))) (< order_g 3) (as 'TIME order_g))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    const char* queries[] = {
+        "(select {from:order_t by:k s:(min v)})",
+        "(select {from:order_t by:{b:b k:k} s:(min v)})",
+        "(select {from:order_t by:{b:b k:k} s:(min v) where:(> v 100)})",
+    };
+    for (size_t q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
+        ray_t* first = NULL;
+        /* 8 workers split into 32 partitions, 20 into 128 */
+        const uint32_t pools[] = {1, 8, 20};
+        for (size_t p = 0; p < 3; p++) {
+            ray_pool_destroy();
+            TEST_ASSERT_EQ_I(ray_pool_init_total(pools[p]), RAY_OK);
+            agg_route_reset();
+            ray_t* r = ray_eval_str(queries[q]);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            if (pools[p] > 1)
+                TEST_ASSERT_EQ_I(agg_route_stats().dense_strategy, AGG_DENSE_PARTITIONED);
+            if (!first) { first = r; continue; }
+            TEST_ASSERT_EQ_I(ray_table_nrows(r), ray_table_nrows(first));
+            for (int64_t c = 0; c < ray_table_ncols(r); c++) {
+                ray_t* a = ray_table_get_col_idx(first, c);
+                ray_t* b = ray_table_get_col_idx(r, c);
+                TEST_ASSERT_EQ_I(a->type, b->type);
+                TEST_ASSERT_FMT(memcmp(ray_data(a), ray_data(b), (size_t)a->len * col_esz(a)) == 0,
+                                "%s: column %lld differs between 1 and %u workers", queries[q], (long long)c, pools[p]);
+            }
+            ray_release(r);
+        }
+        ray_release(first);
+    }
+    PASS();
+}
+
 static test_result_t test_dense_strategies(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -5022,6 +5061,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/count_runs_route", test_count_runs_route, contract_setup, contract_teardown },
     { "agg_contract/count_runs_cancel_at_dispatch", test_count_runs_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
+    { "agg_contract/dense_partition_order", test_dense_partition_order, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
