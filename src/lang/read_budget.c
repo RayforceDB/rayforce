@@ -6,7 +6,14 @@
 #include <assert.h>
 
 #define READ_RECORDS 64
-typedef struct { void* ptr; size_t charge; bool sys; } read_record_t;
+/* One ledger entry.  A free entry has a NULL ptr and keeps the next free entry
+ * in the space its charge uses while it is occupied. */
+struct ray_read_record {
+    void* ptr;
+    union { size_t charge; ray_read_record_t* next_free; };
+    bool sys;
+};
+typedef ray_read_record_t read_record_t;
 struct ray_read_records {
     ray_read_records_t* next;
     size_t charge;
@@ -39,11 +46,14 @@ static bool acquire_fails(ray_read_budget_t* b) {
     return b->attempts++ == b->fail_after;
 }
 
+/* A free ledger entry, not yet taken: it stays at the head of the free list
+ * until commit() fills it, so a request that fails after asking for one leaves
+ * the list untouched.  O(1): a new page is threaded onto the list whole, and
+ * a released entry is pushed back, so no page is ever searched. */
 static read_record_t* slot(ray_read_budget_t* b) {
     if (b->closed || b->status != RAY_READ_OK) return NULL;
-    for (ray_read_records_t* c = b->records; c; c = c->next)
-        for (size_t i = 0; i < READ_RECORDS; i++)
-            if (!c->entries[i].ptr) return &c->entries[i];
+    b->meta_work++;
+    if (b->free_slot) return b->free_slot;
     size_t charge;
     if (!ray_sys_charge(sizeof(ray_read_records_t), &charge) || !reserve(b, charge)) return NULL;
     ray_read_records_t* c = acquire_fails(b) ? NULL : ray_sys_alloc(sizeof(*c));
@@ -51,7 +61,21 @@ static read_record_t* slot(ray_read_budget_t* b) {
     c->next = b->records;
     c->charge = charge;
     b->records = c;
-    return &c->entries[0];
+    for (size_t i = 0; i < READ_RECORDS; i++) {
+        c->entries[i].ptr = NULL;
+        c->entries[i].next_free = i + 1 < READ_RECORDS ? &c->entries[i + 1] : NULL;
+    }
+    b->free_slot = &c->entries[0];
+    return b->free_slot;
+}
+
+/* Fill the entry slot() returned. */
+static void commit(ray_read_budget_t* b, read_record_t* r, void* p, size_t charge, bool sys) {
+    assert(r == b->free_slot);
+    b->free_slot = r->next_free;
+    r->ptr = p;
+    r->charge = charge;
+    r->sys = sys;
 }
 
 void* ray_read_sys_alloc(ray_read_budget_t* b, size_t bytes) {
@@ -62,7 +86,7 @@ void* ray_read_sys_alloc(ray_read_budget_t* b, size_t bytes) {
     if (!reserve(b, charge)) return NULL;
     void* p = acquire_fails(b) ? NULL : ray_sys_alloc(bytes);
     if (!p) { b->live -= charge; b->status = RAY_READ_OOM; return NULL; }
-    *r = (read_record_t){p, charge, true};
+    commit(b, r, p, charge, true);
     return p;
 }
 
@@ -78,15 +102,19 @@ ray_t* ray_read_alloc(ray_read_budget_t* b, size_t bytes) {
     assert(actual == charge);
     v->type = RAY_U8;
     v->len = 0;
-    *r = (read_record_t){v, charge, false};
+    commit(b, r, v, charge, false);
     return v;
 }
 
+/* Finding the entry of a released block walks the pages: the reader releases a
+ * block through here a handful of times per run (buffer growth, symbol
+ * publication), never once per value, so the walk is not on a per-value path. */
 static void remove_record(ray_read_budget_t* b, void* p, bool sys, bool transfer) {
     if (!p) return;
     for (ray_read_records_t* c = b->records; c; c = c->next) {
         for (size_t i = 0; i < READ_RECORDS; i++) {
             read_record_t* r = &c->entries[i];
+            b->meta_work++;
             if (r->ptr != p || r->sys != sys) continue;
             if (!transfer) {
                 /* A parent or external alias can keep this block alive.
@@ -97,6 +125,8 @@ static void remove_record(ray_read_budget_t* b, void* p, bool sys, bool transfer
             }
             b->live -= r->charge;
             r->ptr = NULL;
+            r->next_free = b->free_slot;
+            b->free_slot = r;
             return;
         }
     }
@@ -125,6 +155,7 @@ void ray_read_budget_close(ray_read_budget_t* b) {
         c = next;
     }
     b->records = NULL;
+    b->free_slot = NULL;
     /* A failed init owns no stack-context charge. */
     if (b->live) { assert(b->live == sizeof(*b)); b->live = 0; }
 }
