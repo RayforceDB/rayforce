@@ -27,11 +27,12 @@
 #include "mem/sys.h"
 
 /* ==========================================================================
- *  Dense linear algebra builtins: mmu, inv, lsq, flip
+ *  Dense linear algebra builtins: mmu, inv, lsq, flip, gram
  *
  *  A matrix is a RAY_LIST of equal-length numeric vectors, one per row; a
  *  bare numeric vector is a vector operand.  F64 and F32 rows are used in
- *  place; I32/I64 rows are widened to double.
+ *  place; I32/I64 rows are widened to double, their nulls becoming NaN (the
+ *  F64 null), so integer rows behave like F64 rows.
  *
  *  Result type: F32 when every operand is F32, else F64.  All arithmetic
  *  accumulates in double, so F32 only halves the memory traffic and the
@@ -69,8 +70,18 @@ static void lin_widen(ray_t* v, double* dst) {
     void* s = ray_data(v);
     switch (v->type) {
         case RAY_F32: for (int64_t i = 0; i < n; i++) dst[i] = ((float*)s)[i]; break;
-        case RAY_I32: for (int64_t i = 0; i < n; i++) dst[i] = ((int32_t*)s)[i]; break;
-        default:      for (int64_t i = 0; i < n; i++) dst[i] = (double)((int64_t*)s)[i]; break;
+        case RAY_I32:
+            for (int64_t i = 0; i < n; i++) {
+                int32_t x = ((int32_t*)s)[i];
+                dst[i] = x == NULL_I32 ? NULL_F64 : (double)x;
+            }
+            break;
+        default:
+            for (int64_t i = 0; i < n; i++) {
+                int64_t x = ((int64_t*)s)[i];
+                dst[i] = x == NULL_I64 ? NULL_F64 : (double)x;
+            }
+            break;
     }
 }
 
@@ -124,6 +135,23 @@ static ray_t* lin_load(const char* op, ray_t* x, lin_t* m, bool f32) {
     return lin_bind(m, (ray_t* const*)ray_data(x), x->len, c);
 }
 
+/* True when any element of a double-bound matrix is a null or not finite.
+ * inv and lsq refuse such input: a null is missing data, not a singularity. */
+static bool lin_nonfinite(const lin_t* m) {
+    for (int64_t i = 0; i < m->r; i++) {
+        const double* p = (const double*)m->rp[i];
+        for (int64_t j = 0; j < m->c; j++) if (!isfinite(p[j])) return true;
+    }
+    return false;
+}
+
+/* Largest absolute element of a row-major n x n (or r x c) double array. */
+static double lin_maxabs(const double* a, int64_t cnt) {
+    double mx = 0.0;
+    for (int64_t i = 0; i < cnt; i++) mx = fmax(mx, fabs(a[i]));
+    return mx;
+}
+
 /* Dense row-major double copy of a double-bound matrix. */
 static double* lin_flat(const lin_t* m) {
     double* d = (double*)ray_calloc_raw((size_t)m->r * (size_t)m->c * sizeof(double));
@@ -141,7 +169,7 @@ static ray_t* lin_vec_out(const double* d, int64_t n, bool f32) {
         float* o = (float*)ray_data(v);
         for (int64_t i = 0; i < n; i++) {
             double x = d[i];
-            if (__builtin_fabs(x) <= DBL_MAX) o[i] = (float)x;
+            if (__builtin_fabs(x) <= (double)FLT_MAX) o[i] = (float)x;
             else { o[i] = NULL_F32; v->attrs |= RAY_ATTR_HAS_NULLS; }
         }
     } else {
@@ -279,7 +307,6 @@ static bool lin_gemm(const lin_t* A, const lin_t* B, double* C,
         gemm_ctx_t g = { .A = A, .B = B, .C = C, .r = r, .k = k, .c = c, .f32 = A->f32 };
         int64_t nw = (int64_t)ray_pool_total_workers(pool);
         g.ksplit = B->is_vec || r * c <= LIN_SMALL_C;
-        ray_t* hdr = NULL;
         int64_t nt;
         if (g.ksplit) {
             nt = k / LIN_KCHUNK_MIN;
@@ -297,7 +324,6 @@ static bool lin_gemm(const lin_t* A, const lin_t* B, double* C,
             if (nt < 2) par = false;
             else { g.rchunk = (r + nt - 1) / nt; nt = (r + g.rchunk - 1) / g.rchunk; }
         }
-        (void)hdr;
         if (par) {
             ray_pool_dispatch_n(pool, gemm_task, &g, (uint32_t)nt);
             if (g.ksplit) {
@@ -496,6 +522,9 @@ ray_t* ray_gram_fn(ray_t* x) {
 /* In-place Gauss-Jordan with partial pivoting; a is n x n, inv gets A^-1.
  * Returns false when the matrix is singular. */
 static bool lin_invert(double* a, double* inv, int64_t n) {
+    /* a pivot at or below n*eps times the largest element is rounding noise:
+     * the matrix is singular to working precision (same rule as the QR path) */
+    double tol = (double)n * DBL_EPSILON * lin_maxabs(a, n * n);
     for (int64_t i = 0; i < n; i++)
         for (int64_t j = 0; j < n; j++) inv[i * n + j] = (i == j);
     for (int64_t k = 0; k < n; k++) {
@@ -503,7 +532,7 @@ static bool lin_invert(double* a, double* inv, int64_t n) {
         double best = fabs(a[k * n + k]);
         for (int64_t i = k + 1; i < n; i++)
             if (fabs(a[i * n + k]) > best) { best = fabs(a[i * n + k]); p = i; }
-        if (!(best > 0.0) || !isfinite(best)) return false;
+        if (!(best > tol)) return false;
         if (p != k)
             for (int64_t j = 0; j < n; j++) {
                 double t = a[k * n + j]; a[k * n + j] = a[p * n + j]; a[p * n + j] = t;
@@ -530,8 +559,12 @@ ray_t* ray_inv_fn(ray_t* x) {
     ray_t* e;
     if ((e = lin_load("inv", x, &A, false))) return e;
     ray_t* out;
-    if (A.is_vec || A.r != A.c) {
+    if (A.is_vec) {
+        out = ray_error("type", "inv: expects a square matrix (list of numeric rows)");
+    } else if (A.r != A.c) {
         out = ray_error("length", "inv: expects a square matrix");
+    } else if (lin_nonfinite(&A)) {
+        out = ray_error("domain", "inv: input contains a null");
     } else {
         int64_t n = A.r;
         double* I = (double*)ray_calloc_raw((size_t)n * (size_t)n * sizeof(double));
@@ -606,12 +639,13 @@ static __attribute__((noinline)) void lin_axpy(double* y, const double* x, doubl
  * the work of forming the inverse, and no inverse is formed.  Returns false
  * when M is singular. */
 static bool lin_lu_solve(double* M, double* R, double* W, int64_t n, int64_t k) {
+    double tol = (double)n * DBL_EPSILON * lin_maxabs(M, n * n);   /* as in lin_invert */
     for (int64_t c = 0; c < n; c++) {
         int64_t p = c;
         double best = fabs(M[c * n + c]);
         for (int64_t i = c + 1; i < n; i++)
             if (fabs(M[i * n + c]) > best) { best = fabs(M[i * n + c]); p = i; }
-        if (!(best > 0.0) || !isfinite(best)) return false;
+        if (!(best > tol)) return false;
         if (p != c) {
             for (int64_t j = 0; j < n; j++) { double t = M[c * n + j]; M[c * n + j] = M[p * n + j]; M[p * n + j] = t; }
             for (int64_t j = 0; j < k; j++) { double t = R[c * k + j]; R[c * k + j] = R[p * k + j]; R[p * k + j] = t; }
@@ -647,6 +681,7 @@ ray_t* ray_lsq_fn(ray_t* b, ray_t* a) {
     if (A.is_vec) { out = ray_error("type", "lsq: right operand must be a matrix"); goto done; }
     if (B.c != m) { out = ray_error("length", "lsq: shape mismatch, %lld columns vs %lld", (long long)B.c, (long long)m); goto done; }
     if (m < n) { out = ray_error("length", "lsq: system is under-determined"); goto done; }
+    if (lin_nonfinite(&A) || lin_nonfinite(&B)) { out = ray_error("domain", "lsq: input contains a null"); goto done; }
     {
         int64_t k = B.r;
         /* Z a = b  <=>  a^T Z^T = b^T: M = a^T (m x n), R = b^T (m x k) */
@@ -682,19 +717,56 @@ done:
     return out;
 }
 
-/* (flip m): transpose of a matrix (list of rows -> list of columns). */
+/* Transpose of rows that all have type T: the elements are moved as they are,
+ * so a null stays the type's own null.  A column holds a null only if its
+ * source elements did; the attribute is set from the data. */
+static ray_t* lin_flip_same(ray_t* x, int64_t r, int64_t c) {
+    uint8_t ty = ray_list_get(x, 0)->type;
+    size_t w = ty == RAY_I64 ? 8 : 4;
+    ray_t* L = ray_list_new(c);
+    if (!L || RAY_IS_ERR(L)) return ray_error("oom", NULL);
+    for (int64_t j = 0; j < c; j++) {
+        ray_t* v = ray_vec_new(ty, r);
+        if (!v || RAY_IS_ERR(v)) { ray_release(L); return ray_error("oom", NULL); }
+        v->len = r;
+        char* o = (char*)ray_data(v);
+        bool nulls = false;
+        for (int64_t i = 0; i < r; i++) {
+            ray_t* row = ray_list_get(x, i);
+            memcpy(o + (size_t)i * w, (const char*)ray_data(row) + (size_t)j * w, w);
+            if (ray_vec_is_null(row, j)) nulls = true;
+        }
+        if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+        L = ray_list_append(L, v);
+        ray_release(v);
+        if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
+    }
+    return L;
+}
+
+/* (flip m): transpose of a matrix (list of rows -> list of columns).  A
+ * transpose does no arithmetic, so rows of one type keep it; rows of mixed
+ * types widen to F64. */
 ray_t* ray_flip_mat_fn(ray_t* x) {
     lin_t A;
     ray_t* e;
     if ((e = lin_load("flip", x, &A, false))) return e;
     if (A.is_vec) { lin_free(&A); return ray_error("type", "flip: expects a matrix (list of numeric rows)"); }
-    double* T = (double*)ray_calloc_raw((size_t)A.r * (size_t)A.c * sizeof(double));
+    int64_t r = A.r, c = A.c;
+    uint8_t ty = ray_list_get(x, 0)->type;
+    bool same = true;
+    for (int64_t i = 1; i < r; i++) if (ray_list_get(x, i)->type != ty) same = false;
+    if (same && ty != RAY_F64) {
+        lin_free(&A);
+        return lin_flip_same(x, r, c);
+    }
+    double* T = (double*)ray_calloc_raw((size_t)r * (size_t)c * sizeof(double));
     ray_t* out;
     if (!T) out = ray_error("oom", NULL);
     else {
-        for (int64_t i = 0; i < A.r; i++)
-            for (int64_t j = 0; j < A.c; j++) T[j * A.r + i] = ((const double*)A.rp[i])[j];
-        out = lin_out(T, A.c, A.r, lin_all_f32(x));
+        for (int64_t i = 0; i < r; i++)
+            for (int64_t j = 0; j < c; j++) T[j * r + i] = ((const double*)A.rp[i])[j];
+        out = lin_out(T, c, r, false);
         ray_free_raw(T);
     }
     lin_free(&A);

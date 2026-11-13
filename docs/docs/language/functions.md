@@ -122,6 +122,20 @@ The examples below use this small in-memory table:
          hi: (max price) lo: (min price) n: (count price)})
 ```
 
+## Linear Algebra
+
+A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf`. `inv` and `lsq` raise `domain` for an input that holds a null.
+
+| Function | Type | Description | Example |
+|---|---|---|---|
+| `mmu` | binary | Matrix product: matrix × matrix, matrix × vector, vector × matrix; two vectors give their dot product (an F64 atom) | `(mmu (list [1.0 2.0] [3.0 4.0]) [1.0 1.0])` → `[3.0 7.0]` |
+| `inv` | unary | Inverse of a square matrix; a singular matrix raises `domain` | `(inv (list [1.0 2.0] [3.0 4.0]))` → `[[-2.0 1.0] [1.5 -0.5]]` |
+| `lsq` | binary | `(lsq b a)` is `b mmu inv a` for a square `a`; for an `a` with more columns than rows, the least-squares solution; a rank-deficient `a` raises `domain` | `(lsq [1.0 2.0] (list [2.0 1.0] [1.0 3.0]))` → `[0.2 0.6]` |
+| `flip` | unary | Transpose of a matrix; rows of one type keep it, mixed rows widen to F64 | `(flip (list [1 2 3] [4 5 6]))` → `[[1 4] [2 5] [3 6]]` |
+| `gram` | unary | `x mmu flip x` without forming the transpose | `(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0]))` → `[[14.0 32.0] [32.0 77.0]]` |
+
+The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom). A result outside the range of its type is null. See the [analytics cookbook](../guides/analytics.md#linear-regression) for a regression with `lsq` and `gram`.
+
 ## Higher-Order Functions
 
 Functions that take other functions as arguments.

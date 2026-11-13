@@ -78,3 +78,53 @@
 (set NB (list [1.0 2.0 3.0] [4.0 5.0 6.0]))
 (< (gdiff (lsq NB NA) (mmu NB (inv NA))) 1e-20) -- true
 (lsq (list [1.0 2.0] [3.0 4.0]) (list [0.0 1.0] [1.0 0.0])) -- (list [2.0 1.0] [4.0 3.0])
+
+;; integer nulls widen to the F64 null, like F64 nulls
+(mmu (list [1 0N] [3 4]) [1 1]) -- [0Nf 7.0]
+(mmu (list [1i 0Ni] [3i 4i]) [1i 1i]) -- [0Nf 7.0]
+(mmu (list [1.0 0Nf] [3.0 4.0]) [1.0 1.0]) -- [0Nf 7.0]
+(flip (list [1 0N])) -- (list [1] [0N])
+(flip (list [1i 0Ni])) -- (list [1i] [0Ni])
+(flip (list [1.0 0Nf])) -- (list [1.0] [0Nf])
+(gram (list [1 0N])) -- (list [0Nf])
+(gram (list [1i 0Ni])) -- (list [0Nf])
+(gram (list [1.0 0Nf])) -- (list [0Nf])
+;; inv and lsq refuse a null: it is missing data, not a singularity
+(inv (list [1 0N] [3 4])) !- domain
+(inv (list [1i 0Ni] [3i 4i])) !- domain
+(inv (list [1.0 0Nf] [3.0 4.0])) !- domain
+(lsq [1.0 2.0] (list [1 0N] [3 4])) !- domain
+(lsq [1.0 2.0] (list [1i 0Ni] [3i 4i])) !- domain
+(lsq [1.0 2.0] (list [1.0 0Nf] [3.0 4.0])) !- domain
+(lsq [1 0N] (list [1.0 2.0] [3.0 4.0])) !- domain
+(lsq [1.0 0Nf 2.0 3.0] (list [1.0 1.0 1.0 1.0] [1.0 2.0 3.0 4.0])) !- domain
+
+;; numerically singular matrices are domain errors, not huge garbage
+(inv (list [0.1 0.2 0.3] [0.4 0.5 0.6] [0.7 0.8 0.9])) !- domain
+(lsq [1.0 2.0 3.0] (list [0.1 0.2 0.3] [0.4 0.5 0.6] [0.7 0.8 0.9])) !- domain
+(inv (list [0.0 0.0] [0.0 0.0])) !- domain
+;; over-determined and rank deficient
+(lsq [1.0 2.0 3.0 4.0] (list [1.0 2.0 3.0 4.0] [2.0 4.0 6.0 8.0])) !- domain
+;; the column norm overflows
+(lsq [1.0 1.0] (list [1e200 1e200])) !- domain
+;; the tolerance is relative: a small but well-conditioned matrix inverts
+(inv (list [1e-10 0.0] [0.0 2e-10])) -- (list [1e10 0.0] [0.0 5e9])
+
+;; a result outside the range of its type is null, F32 as well as F64
+(mmu (list (as 'F32 [3e38 3e38])) (as 'F32 [1.0 1.0])) -- (as 'F32 [0Nf])
+(gram (list (as 'F32 [1e30 1e30]))) -- (list (as 'F32 [0Nf]))
+(mmu (list [1e200 1e200]) [1e200 1e200]) -- [0Nf]
+(gram (list [1e200 1e200])) -- (list [0Nf])
+
+;; error classes: a vector operand is a type error, a non-square matrix a length error
+(inv [5.0]) !- type
+(inv (list [1.0 2.0 3.0] [4.0 5.0 6.0])) !- length
+
+;; flip keeps the element type; mixed rows widen to F64
+(type (at (flip (list [1 2] [3 4])) 0)) -- 'I64
+(flip (list [1 2] [3 4])) -- (list [1 3] [2 4])
+(type (at (flip (list [1i 2i] [3i 4i])) 0)) -- 'I32
+(flip (list [1i 2i] [3i 4i])) -- (list [1i 3i] [2i 4i])
+(type (at (flip (list [1.0 2.0] [3.0 4.0])) 0)) -- 'F64
+(type (at (flip (list [1 2] [3.0 4.0])) 0)) -- 'F64
+(flip (list [1 2] [3.0 4.0])) -- (list [1.0 3.0] [2.0 4.0])

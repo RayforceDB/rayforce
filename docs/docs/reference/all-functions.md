@@ -14,11 +14,10 @@
 | [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (13) | [Table Operations](#table-ops) (20) |
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
-| [Linear Algebra](#linalg) (5) | | |
-| [String](#string-ops) (11) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
-| [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
-| [Storage](#storage) (5) | [IPC](#ipc) (10) | [EAV Triple Store](#eav) (5) |
-| [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
+| [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (3) |
+| [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (15) |
+| [Serialization](#serialization) (2) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
+| [EAV Triple Store](#eav) (5) | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) |
 
 The examples below use these small in-memory fixtures where a table is needed:
 
@@ -214,14 +213,14 @@ Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a ro
 
 ## Linear Algebra { #linalg }
 
-A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened. The result is F32 when every operand is F32, otherwise F64; sums accumulate in double either way. Singular and rank-deficient inputs raise a `domain` error, shape mismatches a `length` error.
+A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); sums accumulate in double either way, and a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
 
 | Function | Type | Attr | Description | Example |
 |---|---|---|---|---|
 | `mmu` | binary | — | Matrix product: matrix × matrix, matrix × vector, vector × matrix; two vectors give their dot product | `(mmu (list [1.0 2.0] [3.0 4.0]) [1.0 1.0])` → `[3.0 7.0]` |
 | `inv` | unary | — | Inverse of a square matrix | `(inv (list [1.0 2.0] [3.0 4.0]))` → `[[-2.0 1.0] [1.5 -0.5]]` |
 | `lsq` | binary | — | `(lsq b a)` is `b mmu inv a` for a square `a`; for an `a` with more columns than rows, the least-squares solution | `(lsq [1.0 2.0] (list [2.0 1.0] [1.0 3.0]))` → `[0.2 0.6]` |
-| `flip` | unary | — | Transpose of a matrix | `(flip (list [1.0 2.0 3.0] [4.0 5.0 6.0]))` → `[[1.0 4.0] [2.0 5.0] [3.0 6.0]]` |
+| `flip` | unary | — | Transpose of a matrix; rows of one type keep it, mixed rows widen to F64 | `(flip (list [1 2 3] [4 5 6]))` → `[[1 4] [2 5] [3 6]]` |
 | `gram` | unary | — | `x mmu flip x` without forming the transpose; symmetric, computed on the upper triangle | `(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0]))` → `[[14.0 32.0] [32.0 77.0]]` |
 
 ## Higher-Order Functions { #higher-order }
