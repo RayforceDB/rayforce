@@ -212,7 +212,7 @@ Use `-U` instead of `-u` to enable authentication with read-only restrictions:
 ./rayforce -p 5000 -U secretpass
 ```
 
-In read-only mode, clients can run queries and read data, but mutating operations (`set`, `insert`, `upsert`, `update`, file writes, system commands) are blocked. The server returns an error if a restricted builtin is called.
+In read-only mode, clients can run queries and read data, but mutating operations (`set`, a top-level `let`, `insert`, `upsert`, `update`, file writes, system commands) are blocked; a `let` inside the request's own lambda or `do` still binds a local. The server returns an error if a restricted builtin is called.
 
 !!! note "Reference"
 
