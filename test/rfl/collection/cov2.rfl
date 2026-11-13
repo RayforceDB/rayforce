@@ -261,7 +261,7 @@
 ;; apply arity error
 (try (apply + 1) (fn [e] "err")) -- "err"
 
-;; apply with typed vecs works (apply does element-wise on lists)
+;; apply pairs two collections element by element and returns a typed vector
 (at (apply + (list 1 2 3) (list 10 20 30)) 1) -- 22
 
 ;; apply error propagation

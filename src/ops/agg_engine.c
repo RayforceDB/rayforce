@@ -575,6 +575,13 @@ static inline int64_t agg_key_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t k,
     if ((*err = ray_col_cursor_at(&cs->cur[k], r, &v)) != NULL) return 0;
     return agg_read_key_i64_raw(rr->key_types[k], v->attrs, v->data, r - v->start);
 }
+/* The staged keys' pages that agg_key_at of rows[0, n) touches, asked
+ * for ahead (ray_col_src_want_points): a sampler's strided rows of a cold
+ * key then wait about once, not once per row. */
+static void agg_want_points(const agg_rr_t* rr, uint32_t n_keys, const int64_t* rows, int64_t n) {
+    for (uint32_t k = 0; k < n_keys; k++)
+        if (rr->srcs[k]) ray_col_src_want_points(rr->srcs[k], rows, n);
+}
 static inline const void* agg_elem_at(const agg_rr_t* rr, agg_curs_t* cs, uint32_t i, int64_t r, ray_t** err) {
     if (!rr->srcs[i]) return rr->plain[i] ? (const char*)rr->plain[i] + (size_t)r * rr->esz[i] : NULL;
     const ray_col_range_t* v;
@@ -1411,6 +1418,11 @@ static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows
     if (!rr->staged && ray_col_cold(key_col))
         for (int i = 0; i < SAMPLES; i++)
             ray_col_want_row(key_col, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+    if (rr->staged) {
+        int64_t wrow[SAMPLES];
+        for (int i = 0; i < SAMPLES; i++) wrow[i] = i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step);
+        agg_want_points(rr, 1, wrow, SAMPLES);
+    }
     for (int i = 0; i < SAMPLES && !*err; i++) {
         int64_t v = agg_key_at(rr, &cs, 0, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step), err);
         if (*err) break;
@@ -2732,12 +2744,18 @@ static bool agg_sel_bounds_impossible(const agg_sel_bounds_ctx_t* bc) {
     int64_t mn[16], mx[16];
     for (uint32_t k = 0; k < nk; k++) { mn[k] = INT64_MAX; mx[k] = INT64_MIN; }
     const int64_t np = bc->n_sel < AGG_SEL_PROBE_ROWS ? bc->n_sel : AGG_SEL_PROBE_ROWS;
+    int64_t prow[AGG_SEL_PROBE_ROWS];
+    for (int64_t i = 0; i < np; i++) {
+        agg_sel_cursor_t cur;
+        int64_t o = bc->n_sel / np * i;
+        agg_sel_cursor_init(&cur, bc->sel, bc->sel_prefix, o, o + 1);
+        if (agg_sel_cursor_next(&cur, &prow[i]) != 1) return false;
+    }
+    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
+    agg_want_points(krr, nk, prow, np);   /* the rows' pages, asked for together */
     bool ok = true;
     for (int64_t i = 0; i < np && ok; i++) {
-        int64_t o = bc->n_sel / np * i, row;
-        agg_sel_cursor_t cur;
-        agg_sel_cursor_init(&cur, bc->sel, bc->sel_prefix, o, o + 1);
-        if (agg_sel_cursor_next(&cur, &row) != 1) { ok = false; break; }
+        int64_t row = prow[i];
         for (uint32_t k = 0; k < nk; k++) {
             /* in place, or a point read; a declined one skips the row for
              * this key (fewer rows only weaken the bound: nothing decodes) */
@@ -4084,27 +4102,85 @@ static void agg_occ_first_fn(void* raw, uint32_t wid, int64_t start, int64_t end
     }
 }
 
+/* The index of the partitioned slab (agg_dense_partitioned: partition
+ * `bits` low bits of the slot, part_slots indexes each) that holds `slot`. */
+static inline int64_t agg_part_index(int64_t slot, int64_t part_slots, uint32_t bits) {
+    return (slot & (((int64_t)1 << bits) - 1)) * part_slots + (slot >> bits);
+}
+
 /* The occupied slots of a bitmap in ascending order: tasks count the set bits
  * of their word ranges, a prefix places them, and each task writes its
- * range's slots at its place.  1 when out holds them, 0 when the counts do
- * not add up to ng (the caller collects serially), -1 when the query was
- * cancelled under a dispatch: the pool skips the tickets of a cancelled
- * query, so the counts, or out, were never written. */
+ * range's slots at its place.  With bits, the bitmap is a partitioned slab's
+ * (agg_part_index) and words counts blocks of 64 slots of a partition: a
+ * block's bits are read once from every partition, and its slots written in
+ * ascending slot order as their slab indexes, so the groups come out in the
+ * order one slab gives, whatever the partition count.  1 when out holds
+ * them, 0 when the counts do not add up to ng (the caller collects
+ * serially), -1 when the query was cancelled under a dispatch: the pool
+ * skips the tickets of a cancelled query, so the counts, or out, were never
+ * written. */
 typedef struct {
     const uint64_t* occ;
     int64_t*        out;
     int64_t*        at;        /* [tasks + 1]: counts, then first positions */
     int64_t         words;
+    int64_t         slots;
+    int64_t         part_slots;
+    uint32_t        bits;
     uint32_t        tasks;
     int             pass;      /* 0: count, 1: write */
 } agg_occ_collect_ctx_t;
+
+/* n (<= 64) bits of occ from bit position pos */
+static inline uint64_t agg_occ_bits(const uint64_t* occ, int64_t words, int64_t pos, int64_t n) {
+    int64_t w = pos >> 6, o = pos & 63;
+    uint64_t v = occ[w] >> o;
+    if (o && w + 1 < words) v |= occ[w + 1] << (64 - o);
+    return n < 64 ? v & (((uint64_t)1 << n) - 1) : v;
+}
+
+/* a[r] bit c -> a[c] bit r (bit 0 the low bit) */
+static void agg_transpose64(uint64_t a[64]) {
+    uint64_t m = 0x00000000FFFFFFFFull;
+    for (int j = 32; j != 0; j >>= 1, m ^= m << j)
+        for (int k = 0; k < 64; k = (k + j + 1) & ~j) {
+            uint64_t t = ((a[k] >> j) ^ a[k + j]) & m;
+            a[k + j] ^= t;
+            a[k] ^= t << j;
+        }
+}
 
 static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     agg_occ_collect_ctx_t* c = raw;
     for (int64_t t = start; t < end; t++) {
-        int64_t w0 = c->words / c->tasks * t;
-        int64_t w1 = t + 1 == (int64_t)c->tasks ? c->words : c->words / c->tasks * (t + 1);
+        int64_t w0 = c->words * t / c->tasks, w1 = c->words * (t + 1) / c->tasks;
+        if (c->bits) {
+            /* blk[p]: the block's bits of partition p; transposed per 64
+             * partitions, blk[64 * q + g]: slot g's bits of those partitions */
+            uint64_t blk[RAY_POOL_INIT_TASKS / 2 > 64 ? RAY_POOL_INIT_TASKS / 2 : 64];
+            int64_t parts = (int64_t)1 << c->bits, ps = c->part_slots;
+            int64_t owords = (c->slots + 63) / 64, n = 0, j = c->pass ? c->at[t] : 0;
+            int64_t groups = (parts + 63) / 64;
+            for (int64_t w = w0; w < w1; w++) {
+                int64_t g0 = w * 64, len = ps - g0 < 64 ? ps - g0 : 64;
+                uint64_t any = 0;
+                for (int64_t p = 0; p < groups * 64; p++)
+                    any |= blk[p] = p < parts ? agg_occ_bits(c->occ, owords, p * ps + g0, len) : 0;
+                if (!any) continue;
+                if (c->pass == 0) {
+                    for (int64_t p = 0; p < parts; p++) n += __builtin_popcountll(blk[p]);
+                    continue;
+                }
+                for (int64_t q = 0; q < groups; q++) agg_transpose64(blk + 64 * q);
+                for (int64_t g = 0; g < len; g++)
+                    for (int64_t q = 0; q < groups; q++)
+                        for (uint64_t b = blk[64 * q + g]; b; b &= b - 1)
+                            c->out[j++] = (64 * q + __builtin_ctzll(b)) * ps + g0 + g;
+            }
+            if (c->pass == 0) c->at[t] = n;
+            continue;
+        }
         if (c->pass == 0) {
             int64_t n = 0;
             for (int64_t w = w0; w < w1; w++) n += __builtin_popcountll(c->occ[w]);
@@ -4117,15 +4193,18 @@ static void agg_occ_collect_fn(void* raw, uint32_t wid, int64_t start, int64_t e
     }
 }
 
-static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots, int64_t ng, int64_t* out) {
-    int64_t words = (slots + 63) / 64;
+static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots, int64_t ng, int64_t* out,
+                           int64_t part_slots, uint32_t bits) {
+    /* with bits, blocks of 64 slots of a partition */
+    int64_t words = bits ? (part_slots + 63) / 64 : (slots + 63) / 64;
     uint32_t tasks = ray_pool_par_dispatch_ok(pool, slots, RAY_PARALLEL_THRESHOLD)
                    ? ray_pool_total_workers(pool) * 4 : 1;
     if ((int64_t)tasks > words) tasks = (uint32_t)(words > 0 ? words : 1);
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     int64_t* at = ray_alloc_raw(((size_t)tasks + 1) * sizeof(int64_t));
     if (!at) return 0;
-    agg_occ_collect_ctx_t c = { .occ = occ, .out = out, .at = at, .words = words, .tasks = tasks, .pass = 0 };
+    agg_occ_collect_ctx_t c = { .occ = occ, .out = out, .at = at, .words = words, .slots = slots,
+                                .part_slots = part_slots, .bits = bits, .tasks = tasks, .pass = 0 };
     if (tasks > 1) ray_pool_dispatch_n(pool, agg_occ_collect_fn, &c, tasks);
     else agg_occ_collect_fn(&c, 0, 0, 1);
     if (agg_cancelled()) { ray_free_raw(at); return -1; }
@@ -4229,7 +4308,10 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
         return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     }
-    int collected = occ && !first_row_ordered ? agg_occ_collect(pool, occ, total_slots, ng, occupied_slot) : 0;
+    /* A partitioned slab's groups in slot order, as one slab gives them. */
+    uint32_t part_bits = key_plan ? key_bits : 0;
+    int collected = occ && !first_row_ordered
+        ? agg_occ_collect(pool, occ, total_slots, ng, occupied_slot, key_part_slots, part_bits) : 0;
     if (collected < 0) {
         ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
         agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
@@ -4238,11 +4320,13 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     }
     if (!collected) {
       int64_t i = 0;
-      for (int64_t s = 0; s < total_slots; s++)
-          if (occ ? (occ[s >> 6] >> (s & 63)) & 1 : gfirst[s] != INT64_MAX) {
-              if (first_row_ordered) first_row_ordered[i] = gfirst[s];
-              occupied_slot[i] = s; i++;
+      for (int64_t s = 0; s < total_slots; s++) {
+          int64_t x = part_bits ? agg_part_index(s, key_part_slots, part_bits) : s;
+          if (occ ? (occ[x >> 6] >> (x & 63)) & 1 : gfirst[x] != INT64_MAX) {
+              if (first_row_ordered) first_row_ordered[i] = gfirst[x];
+              occupied_slot[i] = x; i++;
           }
+      }
     }
     /* Bounded emit (HEAD(GROUP) hint): the N groups with the smallest first
      * row ARE the first N groups in first-seen order.  Select them with an
@@ -10236,6 +10320,7 @@ static void agg_ts_sample_staged_fn(void* vctx, uint32_t wid, int64_t start, int
             }
             rows[nr++] = r;
         }
+        agg_want_points(rr, n_keys, rows, nr);
         agg_curs_t cs; cs.cur = NULL;
         ray_t* err = NULL;
         /* the slice's tuples, key-major: kv[k * nr + a] (the task's one scratch) */
@@ -10339,6 +10424,17 @@ static bool agg_ts_precheck_declines(const agg_rr_t* krr, ray_t** key_cols, uint
                     int64_t pos = i * pstep + (int64_t)(ray_hash_i64(i + 7919) % (uint64_t)pstep);
                     if (pos < nrows) ray_col_want_row(key_cols[k], pos);
                 }
+    if (krr->staged) {    /* both stages' rows */
+        int64_t prow[AGG_TS_PRE_SAMPLE2], np = 0;
+        for (int64_t i = 0; i < AGG_TS_PRE_SAMPLE2; i++) {
+            uint64_t jit = ray_hash_i64(i + 7919);
+            int64_t pos = i * pstep + (int64_t)(jit % (uint64_t)pstep), r = pos;
+            if (pos >= nrows) break;
+            if (sel && !agg_ts_sel_row_at(sflags, soffsets, sidx, pos, jit >> 32, &r)) continue;
+            prow[np++] = r;
+        }
+        agg_want_points(krr, n_keys, prow, np);
+    }
     int64_t d = 0, n = 0;
     bool declined = false;
     for (int64_t phase = 0; phase < ratio && !declined; phase++) {
@@ -11304,6 +11400,10 @@ static bool agg_shared_sample(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
     if (!d.staged && ray_col_cold(keys[0]))
         for (int i = 0; i < SAMPLES; i++)
             ray_col_want_row(keys[0], i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step));
+    if (d.staged) {   /* values holds the rows until the first group: map has no entry yet */
+        for (int i = 0; i < SAMPLES; i++) values[i] = i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step);
+        agg_want_points(&d.rr, 1, values, SAMPLES);
+    }
     for (int i = 0; i < SAMPLES && !*err; i++) {
         uint64_t jitter = ray_hash_i64(i);
         int64_t row = i * step + jitter % step;
@@ -11798,6 +11898,12 @@ static void agg_firstn_share_fn(void* raw, uint32_t wid, int64_t start, int64_t 
         if (!agg_curs_init(&cs, rr)) { ray_scan_fail_note(rr->fail, key, ray_error("oom", NULL)); continue; }
         ray_t* err = NULL;
         for (int64_t i = i0; i < i1 && !err; i++) {
+            if ((i - i0) % 512 == 0) {    /* the next rows' pages, asked for together */
+                int64_t wr[512], nw = 0;
+                for (int64_t w = i; w < i1 && nw < 512; w++) wr[nw++] = w * c->step;
+                // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
+                agg_want_points(rr, rr->n_keys, wr, nw);
+            }
             for (uint32_t k = 0; k < rr->n_keys && !err; k++) kv[k] = agg_key_at(rr, &cs, k, i * c->step, &err);
             if (!err && agg_firstn_probe(c->set, kv, agg_firstn_hash(kv, rr->n_keys), false) >= 0) hits++;
         }
@@ -12772,6 +12878,13 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 int64_t end = w + 1 == dense_workers ? nrows : nrows / dense_workers * (w + 1);
                 int64_t samples = end - start < 1024 ? end - start : 1024;
                 int64_t lo = INT64_MAX, hi = INT64_MIN;
+                if (ks->rr.staged) {
+                    int64_t wr[1024];
+                    for (int64_t i = 0; i < samples; i++)
+                        wr[i] = start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1));
+                    // cppcheck-suppress uninitvar // the loop above fills every slot the count passed with it reads; with a zero count nothing is read
+                    agg_want_points(&ks->rr, 1, wr, samples);
+                }
                 for (int64_t i = 0; i < samples && !terr; i++) {
                     int64_t r = start + i * ((end - start - 1) / (samples > 1 ? samples - 1 : 1));
                     int64_t v = agg_key_at(&ks->rr, &tcs, 0, r, &terr);

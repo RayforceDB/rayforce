@@ -122,14 +122,28 @@ The examples below use this small in-memory table:
          hi: (max price) lo: (min price) n: (count price)})
 ```
 
+## Linear Algebra
+
+A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf`. `inv` and `lsq` raise `domain` for an input that holds a null.
+
+| Function | Type | Description | Example |
+|---|---|---|---|
+| `mmu` | binary | Matrix product: matrix × matrix, matrix × vector, vector × matrix; two vectors give their dot product (an F64 atom) | `(mmu (list [1.0 2.0] [3.0 4.0]) [1.0 1.0])` → `[3.0 7.0]` |
+| `inv` | unary | Inverse of a square matrix; a singular matrix raises `domain` | `(inv (list [1.0 2.0] [3.0 4.0]))` → `[[-2.0 1.0] [1.5 -0.5]]` |
+| `lsq` | binary | `(lsq b a)` is `b mmu inv a` for a square `a`; for an `a` with more columns than rows, the least-squares solution; a rank-deficient `a` raises `domain` | `(lsq [1.0 2.0] (list [2.0 1.0] [1.0 3.0]))` → `[0.2 0.6]` |
+| `flip` | unary | Transpose of a matrix; rows of one type keep it, mixed rows widen to F64 | `(flip (list [1 2 3] [4 5 6]))` → `[[1 4] [2 5] [3 6]]` |
+| `gram` | unary | `x mmu flip x` without forming the transpose | `(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0]))` → `[[14.0 32.0] [32.0 77.0]]` |
+
+The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom). A result outside the range of its type is null. See the [analytics cookbook](../guides/analytics.md#linear-regression) for a regression with `lsq` and `gram`.
+
 ## Higher-Order Functions
 
 Functions that take other functions as arguments.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `map` | variadic | Apply function to each element; same-type atom results form a typed vector, otherwise a list | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
-| `pmap` | variadic | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `map` | variadic | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments, else `domain` | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `pmap` | variadic | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments, else `domain` | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
@@ -138,11 +152,11 @@ Functions that take other functions as arguments.
 | `scan` | variadic | Running fold (returns all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-left` | variadic | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-right` | variadic | Right-to-left running fold (returns a list) | `(scan-right + (enlist 1 2 3))` → `(6 5 3)` |
-| `apply` | variadic | Zip-apply function pairwise over two lists | `(apply + (enlist 1 2) (enlist 3 4))` → `(4 6)` |
+| `apply` | variadic | `(apply f a b)` calls `f` on the elements of two collections taken in step, `f(a_0, b_0)`, `f(a_1, b_1)`, ...; the result is as long as the shorter one and is collected as `map`'s is. Two atoms call `f` once. Exactly 3 arguments, else `domain` | `(apply + [1 2 3] [10 20 30])` → `[11 22 33]` |
 | `map-left` | variadic | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
 | `map-right` | variadic | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
-`map` and `pmap` return a typed vector when every result is an atom of
+`map`, `pmap` and `apply` return a typed vector when every result is an atom of
 exactly the same vector-supported type, including strings, symbols and
 representable typed nulls. Native boolean/byte null atoms remain boxed
 because those vector types are non-nullable. Opaque graph, HNSW index and
@@ -290,7 +304,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 `insert` has two table forms:
 
 - `(insert target rows)` is the ordinary two-argument form. It returns a new flat table, or rebinds and returns a quoted target symbol such as `'trades`, which names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it. The row payload can be a list, table, or dictionary, as described by the target's physical columns.
-- `(insert parted partition-key rows)` grows the in-memory live tail of a parted table and returns a fresh logical view, leaving `parted` unchanged. Quote a symbol — `(insert 'parted partition-key rows)` — to rebind that symbol to the fresh view and return the symbol. A validated zero-row batch is a no-op and returns the existing view without rebinding. This is distinct from the three-argument positional form for vectors and lists, where the second argument is an insertion index.
+- `(insert parted partition-key rows)` grows the in-memory live tail of a parted table and returns a fresh logical view, leaving `parted` unchanged. Quote a symbol — `(insert 'parted partition-key rows)` — to grow the table that symbol is bound to and return the symbol; when the binding is the only holder of the table, a same-key insert appends to the current partition in place. A validated zero-row batch is a no-op and returns the existing view without rebinding. This is distinct from the three-argument positional form for vectors and lists, where the second argument is an insertion index.
 
 ```lisp
 ; Append a row to a table
@@ -316,7 +330,9 @@ For a parted target, `rows` must match the physical data-column schema exactly i
 
 The partition key must equal the current last key, which grows that live segment, or be strictly later, which starts a new live segment. Earlier keys — including an existing historical partition — are immutable and cannot be inserted into. Existing partition metadata must already be strictly increasing in logical key order; integer directory names are ordered by value (`1`, `2`, `10` — no zero-padding needed), so only two spellings of one value (`1` and `01`) violate this, and they are rejected as `corrupt`. Every historical physical segment must be present. A missing segment in the last partition can be repaired only by a non-empty same-key append; it blocks an empty insert or a move to a later key. `BOOL`/`U8` cannot be null-backfilled when that missing segment already represents existing rows, but a missing zero-row segment needs no backfill.
 
-A non-empty functional insert returns a new logical table view; the quoted-symbol form publishes that view by rebinding the symbol. Historical mmap segments are retained without copying, while a segment receiving rows becomes heap-backed. Queries and values that already retained the previous table continue to see that snapshot; subsequent resolution of a rebound target symbol sees the newly appended rows. A non-empty same-key append rebuilds partition metadata and copies the active segment; a later key materializes a new tail instead. Batch incoming rows to avoid repeatedly copying a growing intraday segment.
+A non-empty functional insert returns a new logical table view and always copies the active segment. Historical mmap segments are retained without copying, while a segment receiving rows becomes heap-backed. Queries and values that already retained the previous table continue to see that snapshot; resolving the target symbol after the insert sees the newly appended rows.
+
+A same-key insert through a quoted symbol appends to the active segment in place when the binding is the only holder of the table: the symbol keeps the same table, and the cost follows the rows appended, not the rows the partition already holds. It copies the active segment and rebinds the symbol instead when the table or one of its columns is held elsewhere (a snapshot bound to another name, a query still running over it), and on the first insert after `.db.parted.get`, whose active segment is still the mapped file. The copy belongs to the binding alone, so the next insert appends in place again. A later key materializes a new tail. A failed insert leaves the table with the rows it had.
 
 !!! warning "Live-tail insert is not persistence"
     Parted `insert` changes memory only. It does not modify partition directories, column files, `.d`, or `.sym`; process exit loses an unpersisted tail. Persist the completed physical partition explicitly at rollover, then reload the parted table if it should return to a fully mmap-backed view. See [`.db.parted.get`](../namespaces/db.md#db-parted-get) for the production pattern.
@@ -518,7 +534,7 @@ spills exactly as it did before.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
-| `let` | binary, special | Bind value to local variable | `(let y (+ x 1))` |
+| `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
 | `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |

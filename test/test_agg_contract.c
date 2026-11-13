@@ -18,6 +18,7 @@
 #include "lang/env.h"
 #include "table/sym.h"
 #include "store/enccol.h"   /* ray_enccol_of: decoded bytes of a generation-2 column */
+#include "store/col.h"      /* ray_col_save_gen */
 #include <math.h>
 #include <stdlib.h>
 
@@ -962,6 +963,45 @@ static test_result_t test_narrow_extrema_limits(void) {
  * A frequent null key stresses contention/skew; one live key has no valid
  * aggregate values. Native widths, mixed COUNT, binary inputs, and repeated
  * scratch reuse all pass through the common output stage. */
+/* The group order of a dense grouping does not depend on the core count
+ * (#1154): partitioned across workers, it is the order one slab gives. */
+static test_result_t test_dense_partition_order(void) {
+    ray_t* setup = ray_eval_str("(set order_i (til 1000000)) (set order_g (% (* order_i 17) 80000)) "
+        "(set order_t (table [k b v] (list (as 'I32 (+ (* order_g 2) (div order_g 4))) (< order_g 3) (as 'TIME order_g))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    const char* queries[] = {
+        "(select {from:order_t by:k s:(min v)})",
+        "(select {from:order_t by:{b:b k:k} s:(min v)})",
+        "(select {from:order_t by:{b:b k:k} s:(min v) where:(> v 100)})",
+    };
+    for (size_t q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
+        ray_t* first = NULL;
+        /* 8 workers split into 32 partitions, 20 into 128 */
+        const uint32_t pools[] = {1, 8, 20};
+        for (size_t p = 0; p < 3; p++) {
+            ray_pool_destroy();
+            TEST_ASSERT_EQ_I(ray_pool_init_total(pools[p]), RAY_OK);
+            agg_route_reset();
+            ray_t* r = ray_eval_str(queries[q]);
+            TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            if (pools[p] > 1)
+                TEST_ASSERT_EQ_I(agg_route_stats().dense_strategy, AGG_DENSE_PARTITIONED);
+            if (!first) { first = r; continue; }
+            TEST_ASSERT_EQ_I(ray_table_nrows(r), ray_table_nrows(first));
+            for (int64_t c = 0; c < ray_table_ncols(r); c++) {
+                ray_t* a = ray_table_get_col_idx(first, c);
+                ray_t* b = ray_table_get_col_idx(r, c);
+                TEST_ASSERT_EQ_I(a->type, b->type);
+                TEST_ASSERT_FMT(memcmp(ray_data(a), ray_data(b), (size_t)a->len * col_esz(a)) == 0,
+                                "%s: column %lld differs between 1 and %u workers", queries[q], (long long)c, pools[p]);
+            }
+            ray_release(r);
+        }
+        ray_release(first);
+    }
+    PASS();
+}
+
 static test_result_t test_dense_strategies(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -1956,6 +1996,61 @@ static test_result_t test_count_distinct_typed_routes(void) {
             TEST_ASSERT_TRUE(firsts[i] > previous); previous = firsts[i];
         }
         ray_release(result); ray_release(k); ray_release(v);
+    }
+    PASS();
+}
+
+/* Pairs that repeat on neighbouring rows (runs of 4, as in a column
+ * clustered by its key) but never at distant ones: the sample sees the runs
+ * and preaggregates; all-distinct pairs do not.  Counts and first rows are
+ * exact either way. */
+static test_result_t test_count_distinct_adjacent_runs(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(2), RAY_OK);
+    const int64_t n = 262144, nk = 1024;
+    for (int runs = 0; runs < 2; runs++) {
+        ray_t* k = ray_vec_new(RAY_I64, n);
+        ray_t* v = ray_vec_new(RAY_I64, n);
+        TEST_ASSERT_NOT_NULL(k); TEST_ASSERT_NOT_NULL(v);
+        k->len = v->len = n;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t g = runs ? i / 4 : i;
+            ((int64_t*)ray_data(k))[i] = g % nk;
+            ((int64_t*)ray_data(v))[i] = g;
+        }
+        uint64_t before = ray_cd_test_preaggregated();
+        ray_t* result = ray_cd_fused(k, v, n);
+        TEST_ASSERT_FMT(result && !RAY_IS_ERR(result), "count-distinct declined, runs %d", runs);
+        TEST_ASSERT_EQ_I(ray_cd_test_preaggregated() - before, (uint64_t)runs);
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), nk);
+        int64_t* keys = ray_data(ray_table_get_col_idx(result, 0));
+        int64_t* counts = ray_data(ray_table_get_col_idx(result, 1));
+        int64_t* firsts = ray_data(ray_table_get_col_idx(result, 2));
+        for (int64_t i = 0; i < nk; i++) {
+            TEST_ASSERT_EQ_I(keys[i], i);
+            TEST_ASSERT_EQ_I(counts[i], (runs ? n / 4 : n) / nk);
+            TEST_ASSERT_EQ_I(firsts[i], runs ? 4 * i : i);
+        }
+        ray_release(result); ray_release(k); ray_release(v);
+    }
+    PASS();
+}
+
+/* The repetition sample reads each sampled row and the next, and takes its
+ * 1024 samples from equal shards of rows [0, nrows - 1): every sample leaves
+ * a next row inside the column.  A step of nrows / 1024 breaks that for the
+ * last shard (its jitter can reach row nrows - 1 when nrows = 1024 * step;
+ * with the fixed hash that needs step to divide ray_hash_i64(1023) + 1, a
+ * number no column here reaches, so the shard bound is what is pinned:
+ * the last sample lies inside the first 1024 * ((nrows - 1) / 1024) rows). */
+static test_result_t test_cd_sample_rows_in_bounds(void) {
+    for (int64_t n = 1025; n <= 1024 * 8192; n += (n < 70000) ? 1 : 1024) {
+        int64_t m = (n < 70000) ? n : n - n % 1024;
+        int64_t bound = 1024 * ((m - 1) / 1024);
+        for (int i = 1023; i >= 1022; i--) {
+            int64_t r = ray_cd_test_sample_row(m, i);
+            TEST_ASSERT_FMT(r >= 0 && r + 1 < m && r < bound,
+                            "nrows %lld sample %d row %lld", (long long)m, i, (long long)r);
+        }
     }
     PASS();
 }
@@ -3794,6 +3889,102 @@ static test_result_t test_select_read_ahead_sparse_filter(void) {
     PASS();
 }
 
+/* Ask-ahead of the aggregation and top-k paths over an evicted generation-2
+ * table: the gathers and samplers of a grouped query, and the output gather
+ * of a top-k, each add to the bytes asked for (ray_vm_willneed_bytes).  The
+ * results do not change with the asks, so only this I/O-side count pins
+ * them.  Each query runs against the mapped table and the in-memory one and
+ * must return the same rows. */
+static ray_err_t pfs_write_gen2(const char* dir, ray_t* tbl) {
+    if (ray_test_mkdir_p(dir) != 0) return RAY_ERR_IO;
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* names = ray_vec_new(RAY_STR, nc);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* nm = ray_sym_str(ray_table_col_name(tbl, c));
+        char p[512]; snprintf(p, sizeof p, "%s/%.*s", dir, (int)ray_str_len(nm), ray_str_ptr(nm));
+        ray_err_t e = ray_col_save_gen(ray_table_get_col_idx(tbl, c), p, 2);
+        if (e != RAY_OK) { ray_release(names); return e; }
+        names = ray_str_vec_append(names, ray_str_ptr(nm), ray_str_len(nm));
+    }
+    char p[512]; snprintf(p, sizeof p, "%s/.d", dir);
+    ray_err_t e = ray_col_save(names, p);
+    ray_release(names);
+    return e;
+}
+
+static bool pfs_ask_ahead_case(const char* q, uint64_t* asked) {
+    char qm[512], qt[512];
+    const char* x = strstr(q, "X");
+    snprintf(qm, sizeof qm, "%.*spfs_m%s", (int)(x - q), q, x + 1);
+    snprintf(qt, sizeof qt, "%.*spfs_t%s", (int)(x - q), q, x + 1);
+    /* a fresh load: a column an earlier query decoded stays cached */
+    ray_t* ld = ray_eval_str(ray_test_tmp("(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
+    if (!ld || RAY_IS_ERR(ld)) return false;
+    ray_release(ld);
+    if (!pfs_evict()) return false;
+    uint64_t b0 = ray_vm_willneed_bytes();
+    ray_t* got = ray_eval_str(qm);
+    *asked = ray_vm_willneed_bytes() - b0;
+    ray_t* want = ray_eval_str(qt);
+    bool ok = got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want);
+    if (ok) {
+        ray_t* fg = ray_fmt(got, 0);
+        ray_t* fw = ray_fmt(want, 0);
+        ok = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+             memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fw)) == 0;
+        if (fg) ray_release(fg);
+        if (fw) ray_release(fw);
+    }
+    if (got) { if (RAY_IS_ERR(got)) ray_error_free(got); else ray_release(got); }
+    if (want) { if (RAY_IS_ERR(want)) ray_error_free(want); else ray_release(want); }
+    return ok;
+}
+
+static test_result_t test_agg_topk_ask_ahead(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+    enum { N = 2097152 };
+    ray_t* r = ray_eval_str(
+        "(set pfs_i (til 2097152))"
+        "(set pfs_t (table [k x y] (list (% pfs_i 4001) (% (* pfs_i 7919) 2000003) (% (* pfs_i 104729) 1000003))))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* t = ray_eval_str("pfs_t");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(pfs_write_gen2(ray_test_tmp(PFS_DIR), t), RAY_OK);
+    ray_release(t);
+    r = ray_eval_str(ray_test_tmp("(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* m = ray_eval_str("pfs_m");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_t* xc = ray_table_get_col_enc(m, ray_sym_intern("x", 1));
+    TEST_ASSERT_TRUE(xc && xc->type == RAY_ENCCOL);
+    ray_enccol_t* xe = ray_enccol_of(xc);
+    TEST_ASSERT_NOT_NULL(xe);
+    bool cold = pfs_evict() && !ray_vm_resident(xe->base, xe->size);
+    ray_release(m);
+    if (!cold) {
+        (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+        SKIP("page cache eviction has no effect here");
+    }
+
+    static const struct { const char* q; const char* what; } cases[] = {
+        { "(select {from:X by:x c:(count y) where:(> y 500000)})", "grouped query, one key" },
+        { "(select {from:X by:[x y] c:(count k) where:(> k 3000)})", "grouped query, two keys" },
+        { "(select {from:X where:(> k 3990) asc:x take:5})", "top-k output gather" },
+        { "(select {from:X asc:x take:5})", "top-k take" },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        uint64_t asked = 0;
+        TEST_ASSERT_FMT(pfs_ask_ahead_case(cases[c].q, &asked), "%s: mapped result differs", cases[c].what);
+        TEST_ASSERT_FMT(asked > 0, "%s: nothing asked for ahead", cases[c].what);
+    }
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+    PASS();
+}
+
 /* The route gate of a distinct count (#760) samples before the select
  * runs: the rows a where: keeps (query_cd_gate_where_rows), the key and
  * value columns at them (agg_group_card_sample), and a key column whole
@@ -4870,6 +5061,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/count_runs_route", test_count_runs_route, contract_setup, contract_teardown },
     { "agg_contract/count_runs_cancel_at_dispatch", test_count_runs_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/narrow_extrema_limits", test_narrow_extrema_limits, contract_setup, contract_teardown },
+    { "agg_contract/dense_partition_order", test_dense_partition_order, contract_setup, contract_teardown },
     { "agg_contract/dense_strategies", test_dense_strategies, contract_setup, contract_teardown },
     { "agg_contract/first_n_heavy_dense", test_first_n_heavy_dense, contract_setup, contract_teardown },
     { "agg_contract/dense_symbol_output", test_dense_symbol_output, contract_setup, contract_teardown },
@@ -4895,6 +5087,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/wide_key_routes", test_wide_key_routes, contract_setup, contract_teardown },
     { "agg_contract/fused_typed_comparisons", test_fused_typed_comparisons, contract_setup, contract_teardown },
     { "agg_contract/count_distinct_typed_routes", test_count_distinct_typed_routes, contract_setup, contract_teardown },
+    { "agg_contract/count_distinct_adjacent_runs", test_count_distinct_adjacent_runs, contract_setup, contract_teardown },
+    { "agg_contract/cd_sample_rows_in_bounds", test_cd_sample_rows_in_bounds, contract_setup, contract_teardown },
     { "agg_contract/indexed_parallel_layout", test_indexed_parallel_layout, contract_setup, contract_teardown },
     { "agg_contract/wide_count_distinct", test_wide_count_distinct, contract_setup, contract_teardown },
     { "agg_contract/parallel_wide_consumers", test_parallel_wide_consumers, contract_setup, contract_teardown },
@@ -4907,6 +5101,7 @@ const test_entry_t agg_contract_entries[] = {
 #if defined(__linux__)
     { "agg_contract/select_read_ahead_mapped", test_select_read_ahead_mapped, contract_setup, contract_teardown },
     { "agg_contract/select_read_ahead_sparse_filter", test_select_read_ahead_sparse_filter, contract_setup, contract_teardown },
+    { "agg_contract/agg_topk_ask_ahead", test_agg_topk_ask_ahead, contract_setup, contract_teardown },
     { "agg_contract/cd_gate_read_ahead", test_cd_gate_read_ahead, contract_setup, contract_teardown },
 #endif
     { NULL, NULL, NULL, NULL },

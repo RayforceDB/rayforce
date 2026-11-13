@@ -284,6 +284,9 @@ bool   ray_raise_render(char* buf, size_t cap);
 /* Restricted mode: when true, builtins with RAY_FN_RESTRICTED are blocked. */
 void ray_eval_set_restricted(bool on);
 bool ray_eval_get_restricted(void);
+typedef struct { bool restricted; int32_t base; } ray_restrict_save_t;
+void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s);
+void ray_eval_restrict_leave(const ray_restrict_save_t* s);
 
 /* ===== Rayfall Builtin Functions ===== */
 
@@ -427,6 +430,11 @@ ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
  * the raw mathematical dot product. */
 ray_t* ray_cos_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_inner_prod_fn(ray_t* a, ray_t* b);
+ray_t* ray_mmu_fn(ray_t* a, ray_t* b);
+ray_t* ray_lsq_fn(ray_t* b, ray_t* a);
+ray_t* ray_inv_fn(ray_t* x);
+ray_t* ray_flip_mat_fn(ray_t* x);
+ray_t* ray_gram_fn(ray_t* x);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_norm_fn(ray_t* x);
 ray_t* ray_knn_fn(ray_t** args, int64_t n);
