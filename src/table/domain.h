@@ -321,7 +321,8 @@ enum {
     RAY_SYM_DOMAIN_EV_MAPPED    = 1,   /* a symfile was just mapped, before its count is used (open, reopen after growth) */
     RAY_SYM_DOMAIN_EV_SYNC_FILE = 2,   /* the symfile is about to be synced to media */
     RAY_SYM_DOMAIN_EV_COUNT     = 3,   /* the header count of an append was just written */
-    RAY_SYM_DOMAIN_EV_SYNC_DIR  = 4    /* the symfile's directory is about to be synced */
+    RAY_SYM_DOMAIN_EV_SYNC_DIR  = 4,   /* the symfile's directory is about to be synced */
+    RAY_SYM_DOMAIN_EV_HEADER    = 5    /* a symfile's header count was just read, before it is mapped */
 };
 void ray_sym_domain_test_hook(void (*fn)(int event, const char* path));
 /* The same with hashes[i] = ray_hash_bytes of strs[i], all 64 bits: the

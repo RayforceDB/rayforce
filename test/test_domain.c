@@ -2942,6 +2942,90 @@ static test_result_t test_domain_append_during_map(void) {
     PASS();
 }
 
+/* An open that reads the count before another process's append and maps
+ * after it (the hook below appends there) takes the appended records in as
+ * bytes past its count.  They are that process's committed records: the
+ * next reopen here takes them in, an append from here goes after them, and
+ * an append made before any reopen fails instead of cutting them.  Mode 1
+ * appends whole between the count read and the map; mode 2 writes the
+ * records there and their count right after the map. */
+static int g_hdr_mode;
+static void dom_hdr_hook(int ev, const char* path) {
+    static const char* strs[3] = { "race-a", "race-b", "race-c" };
+    if (ev == RAY_SYM_DOMAIN_EV_HEADER && g_hdr_mode == 1) {
+        g_hdr_mode = 0;
+        (void)dom_raw_append(path, strs, 3, -1);
+    } else if (ev == RAY_SYM_DOMAIN_EV_HEADER && g_hdr_mode == 2) {
+        g_hdr_mode = 3;
+        FILE* f = fopen(path, "ab");
+        if (!f) return;
+        for (int i = 0; i < 3; i++) {
+            uint32_t l = (uint32_t)strlen(strs[i]);
+            (void)fwrite(&l, 4, 1, f);
+            (void)fwrite(strs[i], 1, l, f);
+        }
+        fclose(f);
+    } else if (ev == RAY_SYM_DOMAIN_EV_MAPPED && g_hdr_mode == 3) {
+        g_hdr_mode = 0;
+        int64_t c = dom_app_count(path) + 3;
+        FILE* f = fopen(path, "rb+");
+        if (!f) return;
+        if (fseek(f, 4, SEEK_SET) == 0) (void)fwrite(&c, 8, 1, f);
+        fclose(f);
+    }
+}
+static test_result_t test_domain_append_before_map(void) {
+    const char* p = ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_hdrrace");
+    char buf[64];
+    for (int phase = 0; phase < 3; phase++) {
+        dom_app_clean(p);
+        ray_sym_domain_t* d = ray_sym_domain_open_or_create(p);
+        TEST_ASSERT_NOT_NULL(d);
+        for (int i = 0; i < 1000; i++) {
+            int l = snprintf(buf, sizeof(buf), "base-%d", i);
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(d, buf, (size_t)l) >= 0);
+        }
+        TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+        int64_t n0 = ray_sym_domain_count(d);
+        ray_sym_domain_release(d);
+
+        g_hdr_mode = phase == 1 ? 2 : 1;
+        ray_sym_domain_test_hook(dom_hdr_hook);
+        d = ray_sym_domain_open(p);
+        ray_sym_domain_test_hook(NULL);
+        TEST_ASSERT_EQ_I(g_hdr_mode, 0);
+        TEST_ASSERT_NOT_NULL(d);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0);
+        TEST_ASSERT_EQ_I(dom_app_count(p), n0 + 3);
+
+        if (phase < 2) {
+            /* the next reopen takes the other process's records in */
+            ray_sym_domain_t* d2 = ray_sym_domain_open(p);
+            TEST_ASSERT_TRUE(d2 == d);
+            ray_sym_domain_release(d2);
+            TEST_ASSERT_EQ_I(ray_sym_domain_count(d), n0 + 3);
+            TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "race-a", 6), n0);
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "own", 3) >= 0);
+            TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_OK);
+        } else {
+            /* an append before any reopen: refused, the file untouched */
+            TEST_ASSERT_TRUE(ray_sym_domain_intern(d, "own", 3) >= 0);
+            TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(d, true), RAY_ERR_CORRUPT);
+        }
+        ray_sym_domain_release(d);
+
+        d = ray_sym_domain_open(p);
+        TEST_ASSERT_NOT_NULL(d);
+        TEST_ASSERT_EQ_I(ray_sym_domain_count(d), phase < 2 ? n0 + 4 : n0 + 3);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "race-a", 6), n0);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "race-c", 6), n0 + 2);
+        TEST_ASSERT_EQ_I(ray_sym_domain_find(d, "own", 3), phase < 2 ? n0 + 3 : -1);
+        ray_sym_domain_release(d);
+    }
+    dom_app_clean(p);
+    PASS();
+}
+
 /* A process holding a domain opened over a torn tail survives what another
  * process does to the file next: it cuts the tail and appends a record
  * longer or shorter than the tail, or replaces the file by a whole one; or
@@ -4385,7 +4469,7 @@ static test_result_t test_domain_index_scenarios(void) {
         test_domain_open_basic, test_domain_raw_pin, test_domain_extend_reopen_flat,
         test_domain_extend_after_flush, test_domain_flush_append,
         test_domain_flush_append_in_place, test_domain_torn_append,
-        test_domain_append_during_map, test_domain_held_torn_tail,
+        test_domain_append_during_map, test_domain_append_before_map, test_domain_held_torn_tail,
         test_domain_open_position0_validation, test_domain_intern_batch,
     };
     for (size_t k = 0; k < sizeof runs / sizeof runs[0]; k++) {
@@ -4418,6 +4502,7 @@ const test_entry_t domain_entries[] = {
     { "domain/flush_append_in_place", test_domain_flush_append_in_place, domain_setup, domain_teardown },
     { "domain/torn_append", test_domain_torn_append, domain_setup, domain_teardown },
     { "domain/append_during_map", test_domain_append_during_map, domain_setup, domain_teardown },
+    { "domain/append_before_map", test_domain_append_before_map, domain_setup, domain_teardown },
     { "domain/held_torn_tail", test_domain_held_torn_tail, domain_setup, domain_teardown },
     { "domain/append_sync_order", test_domain_append_sync_order, domain_setup, domain_teardown },
     { "domain/compress_torn_tail", test_domain_compress_torn_tail, domain_setup, domain_teardown },

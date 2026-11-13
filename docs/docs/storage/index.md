@@ -228,7 +228,7 @@ The file is a header (the `STRL` magic and the number of symbols) followed by on
 
 The first write of a symbol file builds it under a temporary name and renames it into place. Every later `.db.splayed.set` that brings new symbols appends their records to the existing file, in place, and then writes the new count into the header; a save with no new symbols does not write the file. The header count is the commit point: the records are written first (and, in a durable save, synced to media before the count is written), so a crash leaves either the old count, or a count whose records are all there. Records past the count, left by an append that did not finish, are a torn tail: opening the file ignores them, and the next append cuts them off before it writes its own records. A file that holds fewer records than its count says is damaged and fails with a `corrupt` error.
 
-A process that opens the file while another appends to it reads the symbols the header counted when it opened the file, never a count over records it cannot see.
+A process that opens the file while another appends to it reads the symbols the header counted when it opened the file, never a count over records it cannot see. The records appended meanwhile are read at its next open of the file. An append cuts only bytes that no count covers: when the header no longer holds the count the process last read, its append fails with a `corrupt` error and leaves the file as it is.
 
 The C functions below work on the runtime's global symbol table instead. `ray_sym_save` writes the whole table to a temporary file and renames it over the target, and `ray_sym_load` merges a file into the running table.
 

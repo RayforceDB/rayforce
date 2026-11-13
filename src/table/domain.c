@@ -1389,6 +1389,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 
     uint64_t hino;
     int64_t fresh_count = dom_header_count(d->path, &hino);   /* before the map: see there */
+    dom_event(RAY_SYM_DOMAIN_EV_HEADER, d->path);
     size_t map_size = 0;
     ray_file_id_t nid;
     void* map = ray_vm_map_file_id(d->path, &map_size, &nid);
@@ -1724,9 +1725,18 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
             ray_file_id_t current_id = dom_stat_id(exists ? &st : NULL);
             /* A same-size replacement has no appended records to adopt.
              * Its old ids may now name different strings: fail loudly. */
-            bool replaced_same_size = cur_size == d->disk_size &&
+            /* Bytes past the counted records (disk_end) taken in at open or
+             * at an extend are a torn append's tail, or the records of
+             * another process's append that wrote its count only after the
+             * count here was read: with its count in the header the file
+             * has grown by them, though its size has not. */
+            uint64_t hino;
+            bool counted_tail = cur_size == d->disk_size && d->disk_size > d->disk_end &&
+                                dom_header_count(rpath, &hino) != d->disk_count;
+            bool replaced_same_size = !counted_tail && cur_size == d->disk_size &&
                                       dom_file_id_changed(&d->disk_id, &current_id);
             if (replaced_same_size ||
+                (counted_tail && !dom_extend_from_file_locked(d, cur_size)) ||
                 (cur_size != d->disk_size &&
                  !dom_extend_from_file_locked(d, cur_size))) {
                 dom_unlock();
@@ -1761,6 +1771,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
          * valid, so opening reads only the index and the records after it. */
         uint64_t hino;
         int64_t hcount = dom_header_count(rpath, &hino);   /* before the map: see there */
+        dom_event(RAY_SYM_DOMAIN_EV_HEADER, rpath);
         d->map = ray_vm_map_file_id(rpath, &d->map_size, &d->map_id);
         d->disk_id = d->map_id;
         if (d->map) dom_event(RAY_SYM_DOMAIN_EV_MAPPED, rpath);
@@ -3077,6 +3088,19 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     }
     FILE* f = fopen(dom->path, "rb+");
     if (!f) { ray_file_unlock(lock_fd); ray_file_close(lock_fd); return RAY_ERR_IO; }
+    /* The header must still count what this domain persisted: the bytes past
+     * disk_end are cut below as a torn tail, and with a later count they are
+     * another process's committed records (its append wrote them before this
+     * domain's open read the count, and its count after). */
+    uint32_t fmagic = 0;
+    int64_t fcount = -1;
+    if (fread(&fmagic, 4, 1, f) != 1 || fread(&fcount, 8, 1, f) != 1 ||
+        fmagic != (dom->z ? DOMAIN_STRZ_MAGIC : DOMAIN_STRL_MAGIC) || fcount != disk_count) {
+        fclose(f);
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_ERR_CORRUPT;   /* another writer */
+    }
     size_t size = disk_end;
     if (disk_size > disk_end && !dom_ftruncate(f, (int64_t)disk_end)) {
         err = RAY_ERR_IO;   /* the tail of a torn append goes before the new records */
