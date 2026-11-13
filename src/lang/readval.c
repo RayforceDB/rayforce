@@ -317,7 +317,6 @@ static bool scan_lit(rd_t* rd, ray_scalar_lit_t* l) {
     }
     rd->p = pos;
     if (!token_end(rd)) { fail_at(rd, "unexpected character directly after a literal"); return false; }
-    if (l->type == -RAY_GUID) { rd->p = start; fail_at(rd, "a GUID null is written 0Ng inside (as 'GUID (list ...))"); return false; }
     if (l->widened) { rd->p = start; fail_at(rd, "integer literal out of the I64 range"); return false; }
     if (l->nonfinite) { rd->p = start; fail_at(rd, "float literal out of range"); return false; }
     if (!l->null) {
@@ -857,8 +856,13 @@ static ray_t* read_value(rd_t* rd) {
     } else if (is_digit(c) || (c == '-' && is_digit(rd->p[1]))) {
         ray_scalar_lit_t lit;
         if (scan_lit(rd, &lit)) {
-            ray_t* a = new_atom(rd, (int8_t)lit.type);
-            if (a) { set_lit(a, &lit); out = a; }
+            if (lit.type == -RAY_GUID) {   /* 0Ng: the null GUID atom */
+                static const uint8_t zero[16] = {0};
+                out = guid_atom(rd, zero, true);
+            } else {
+                ray_t* a = new_atom(rd, (int8_t)lit.type);
+                if (a) { set_lit(a, &lit); out = a; }
+            }
         }
     } else if (is_alpha(c)) {
         const char* s = rd->p;

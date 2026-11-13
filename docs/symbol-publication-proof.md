@@ -17,13 +17,18 @@ changes. Support for that state remains future work.
 
 All candidate strings, replacement hash/strings/sidecar arrays and arena
 storage are allocated and charged before changing any global table pointer,
-name or ID. Replacement arrays are built in private storage. String atoms are
-prepared in one private, fully owned chunk. Any preparation failure frees this
-work; no capacity expansion is retained by the global table.
+name or ID. Replacement arrays are built in private storage. When the symbol
+arena's head chunk has room for every new name, nothing is allocated for them;
+otherwise one new chunk, sized for the names plus a default chunk of slack, is
+allocated and charged here. Any preparation failure frees this work; no capacity
+expansion is retained by the global table.
 
-Commit swaps only prepared storage, inserts prebuilt atoms, adopts the full
-chunk and writes the output IDs. It has no allocator call or failure return
-remaining. Global symbols are published as values: no dotted-segment creation
+Commit swaps only prepared storage, adopts the prepared chunk (empty, as the new
+head, when one was needed), bump-allocates the name atoms from the head chunk,
+and writes the output IDs. The head chunk's room was checked under the lock, so
+it has no allocator call or failure return remaining. The head chunk stays
+usable by later interns: a loop that alternates publications with ordinary
+interns does not strand a chunk per iteration. Global symbols are published as values: no dotted-segment creation
 is performed. Existing name-resolution interning may populate dotted metadata
 later through its unchanged ordinary path.
 
@@ -34,8 +39,8 @@ work before treating this as a production decoder. Host lifetime/admission
 policy remains separate from the reader's allocation limit. The ceiling applies
 to this publication; ordinary existing intern entry points are not retrofitted
 with a global quota. A host requiring that quota must coordinate all callers.
-One staged, page-rounded arena chunk is adopted per successful transaction
-that adds names; small-batch amortization needs performance work.
+A chunk is adopted only when the head chunk is too full, so chunk growth follows
+the arena's own policy rather than the number of publications.
 
 ## Focused evidence
 

@@ -28,6 +28,11 @@
 (nil? (rt 0Nl)) -- true
 (nil? (rt 0Ni)) -- true
 (nil? (rt 0Nf)) -- true
+(type (rt 0Ng)) -- 'guid
+(nil? (rt 0Ng)) -- true
+(same (rt 0Ng) 0Ng) -- true
+(type (first (rt (list 0Ng 1)))) -- 'guid
+(read-value "[0Ng]") !- parse
 (nil? (rt 0Ne)) -- true
 (type (rt 0Nh)) -- 'i16
 (type (rt 0Nd)) -- 'date

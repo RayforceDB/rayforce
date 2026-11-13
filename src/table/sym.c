@@ -116,6 +116,7 @@ static inline void sym_unlock(void) {
 uintptr_t ray_sym_test_lock_addr(void)   { return (uintptr_t)&g_sym_lock_line.v; }
 uintptr_t ray_sym_test_table_addr(void)  { return (uintptr_t)&g_sym; }
 size_t    ray_sym_test_table_size(void)  { return sizeof g_sym; }
+size_t    ray_sym_test_arena_chunks(void) { return ray_arena_chunk_count(g_sym.arena); }
 uintptr_t ray_sym_test_inited_addr(void) { return (uintptr_t)&g_sym_inited; }
 
 /* String atoms for the global sym table live in its arena (off the per-thread
@@ -1459,12 +1460,12 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
         size_t length, canonical;
         uint32_t hash;
         int64_t id;
-        ray_t* atom;
     } candidate_t;
     candidate_t* plan = NULL;
     size_t* seen = NULL;
     char* text = NULL;
-    void* arena_storage = NULL;
+    void* new_chunk = NULL;
+    size_t new_chunk_bytes = 0;
     uint64_t* buckets = NULL;
     ray_t** names = NULL;
     uint64_t* dotted = NULL;
@@ -1569,17 +1570,14 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
         memcpy(scanned, g_sym.scanned, old_words * sizeof(*scanned));
         memcpy(segments, g_sym.segments, (size_t)g_sym.str_count * sizeof(*segments));
     }
-    if (arena_bytes) {
-        size_t overhead = ray_arena_chunk_header_bytes();
-        if (arena_bytes > SIZE_MAX - overhead) { b->status = RAY_READ_LIMIT; goto done; }
-        arena_storage = ray_read_sys_alloc(b, overhead + arena_bytes);
-        if (!arena_storage) goto done;
-        char* at = (char*)arena_storage + overhead;
-        for (size_t i = 0; i < count; i++) {
-            if (plan[i].canonical != i || (uint64_t)plan[i].id < g_sym.str_count) continue;
-            plan[i].atom = ray_arena_str_at(at, plan[i].text, plan[i].length);
-            at += ray_arena_str_bytes(plan[i].length);
-        }
+    if (arena_bytes && ray_arena_head_free(g_sym.arena) < arena_bytes) {
+        /* The head chunk cannot take the new names.  Prepare the next head
+         * chunk here, where its charge and its failure are still allowed; it is
+         * adopted empty, so later interns keep bump-allocating from it. */
+        new_chunk_bytes = ray_arena_new_chunk_bytes(g_sym.arena, arena_bytes);
+        if (!new_chunk_bytes) { b->status = RAY_READ_LIMIT; goto done; }
+        new_chunk = ray_read_sys_alloc(b, new_chunk_bytes);
+        if (!new_chunk) goto done;
     }
     /* All allocation, validation and host admission is complete. Neither the
      * existing IDs nor any table pointer has changed yet. Commit cannot fail. */
@@ -1596,22 +1594,25 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
         ray_read_sys_transfer(b, scanned); ray_read_sys_transfer(b, segments);
         names = NULL; dotted = NULL; scanned = NULL; segments = NULL;
     }
-    for (size_t i = 0; i < count; i++) {
-        if (!plan[i].atom) continue;
-        g_sym.strings[plan[i].id] = plan[i].atom;
-        ht_insert(g_sym.buckets, g_sym.bucket_cap, plan[i].hash, (uint32_t)plan[i].id);
+    if (new_chunk) {
+        ray_arena_adopt_chunk(g_sym.arena, new_chunk, new_chunk_bytes);
+        ray_read_sys_transfer(b, new_chunk); new_chunk = NULL;
     }
-    if (arena_storage) {
-        ray_arena_adopt_full_chunk(g_sym.arena, arena_storage,
-                                  ray_arena_chunk_header_bytes() + arena_bytes);
-        ray_read_sys_transfer(b, arena_storage); arena_storage = NULL;
+    /* The head chunk now has room for every new name (checked above), so the
+     * allocation below cannot fail. */
+    for (size_t i = 0; i < count; i++) {
+        if (plan[i].canonical != i || (uint64_t)plan[i].id < g_sym.str_count) continue;
+        void* at = ray_arena_alloc_raw(g_sym.arena, ray_arena_str_bytes(plan[i].length));
+        assert(at);
+        g_sym.strings[plan[i].id] = ray_arena_str_at(at, plan[i].text, plan[i].length);
+        ht_insert(g_sym.buckets, g_sym.bucket_cap, plan[i].hash, (uint32_t)plan[i].id);
     }
     g_sym.str_count = target_count;
     for (size_t i = 0; i < count; i++) out_ids[i] = plan[plan[i].canonical].id;
     ok = true;
 done:
     if (locked) sym_unlock();
-    ray_read_sys_free(b, arena_storage);
+    ray_read_sys_free(b, new_chunk);
     ray_read_sys_free(b, buckets); ray_read_sys_free(b, names);
     ray_read_sys_free(b, dotted); ray_read_sys_free(b, scanned); ray_read_sys_free(b, segments);
     ray_read_sys_free(b, text); ray_read_sys_free(b, seen); ray_read_sys_free(b, plan);
