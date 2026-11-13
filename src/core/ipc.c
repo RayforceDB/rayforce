@@ -1437,8 +1437,8 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         return NULL;
     }
 
-    bool prev_restricted = ray_eval_get_restricted();
-    ray_eval_set_restricted(cd->restricted);
+    ray_restrict_save_t prev_restricted;
+    ray_eval_restrict_enter(cd->restricted, &prev_restricted);
 
     /* Expose this connection's selector id to `.ipc.handle` (and its
      * poll to handle resolution) for the duration of any hook that
@@ -1493,7 +1493,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     }
 
     ipc_ctx_set(prev_handle, prev_poll);
-    ray_eval_set_restricted(prev_restricted);
+    ray_eval_restrict_leave(&prev_restricted);
     ray_poll_buf_free(payload);
 
     /* Send response for sync messages.  The eval may have closed this

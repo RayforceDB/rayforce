@@ -1049,6 +1049,36 @@ static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uin
     else if (s->strict) return PQ_PUT_FAIL;
     return NULL;
 }
+/* A PLAIN BYTE_ARRAY value into a batch-owned STR vector, without the
+ * public setter's per-value COW and bounds checks.  `v` is the vector this
+ * decode call just allocated: refcount 1, no slice view, and a string pool
+ * that no other vector references, so there is nothing to copy or share.
+ * The descriptor and pool are built exactly as ray_str_vec_set builds them -
+ * same union layout, 4-byte prefix, cached hash, pool growth through
+ * ray_str_pool_reserve - which is what keeps the bytes private to the batch
+ * and valid after the next read and after the reader closes.  `elem` was
+ * zeroed by the caller, so an empty value is already the canonical STR null.
+ * A failed reservation returns the caller's conversion-failure text, as the
+ * public setter's failure does through pq_put_value. */
+static ray_err_t pq_str_plain_put(ray_t* v, int64_t row, const uint8_t* p, uint32_t len) {
+    ray_str_t* elem = &((ray_str_t*)ray_data(v))[row];
+    if (len <= RAY_STR_INLINE_MAX) {
+        elem->len = len;
+        if (len) memcpy(elem->data, p, len);
+        return RAY_OK;
+    }
+    int64_t off = 0;
+    ray_err_t pe = ray_str_pool_reserve(&v->str_pool, len, &off);
+    if (pe != RAY_OK) return pe;
+    char* pool_base = (char*)ray_data(v->str_pool);
+    memcpy(pool_base + off, p, len);
+    elem->len = len;
+    memcpy(elem->prefix, p, 4);
+    elem->pool_off = (uint32_t)off;
+    ray_str_t_cache_hash(elem, pool_base);
+    v->str_pool->len = off + (int64_t)len;
+    return RAY_OK;
+}
 /* PLAIN signed integers can go straight into native blocks. SSE2 handles
  * copy and sentinel detection together; scalar code also handles big endian. */
 static bool pq_plain_int(ray_t* v, int64_t row, const uint8_t* p, int64_t n) {
@@ -1253,8 +1283,19 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                 } else if (!pq_take(&c->values,(s->physical == 1 || s->physical == 4) ? 4 : 8,&p)) return "truncated numeric data";
                 if (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
                 if (len > PQ_MAX_PAGE) return PQ_PUT_FAIL;
-                const char* perr = pq_put_value(&v,i,s,p,len);
-                if (perr) return perr;
+                if (s->physical == 6 && !c->encoding) {
+                    /* PLAIN bytes land in the batch directly; definition
+                     * traversal, null/empty and strict rules are unchanged. */
+                    if (s->strict && s->converted == 0 && !pq_utf8(p,len)) return PQ_PUT_FAIL;
+                    if (pq_str_plain_put(v,i,p,len) != RAY_OK) return PQ_PUT_FAIL;
+                    if (!len) {
+                        v->attrs |= RAY_ATTR_HAS_NULLS;
+                        if (s->strict) return PQ_PUT_FAIL;
+                    }
+                } else {
+                    const char* perr = pq_put_value(&v,i,s,p,len);
+                    if (perr) return perr;
+                }
                 *out = v;
             }
         }

@@ -7913,6 +7913,103 @@ static bool restricted_expr_returns_access(const char* expr) {
     return access;
 }
 
+/* A top-level `let` binds a global, so a restricted request may not run
+ * one, as it may not run `set`: otherwise it could rebind a name other
+ * code reads, or install a connection hook.  A `let` inside a lambda or
+ * `do` binds a local and stays allowed. */
+static test_result_t test_eval_restricted_let_global(void) {
+    int64_t g = ray_sym_intern("__rf_rlg_global", 15);
+    int64_t fresh = ray_sym_intern("__rf_rlg_fresh", 14);
+    ray_t* hook_before = ray_env_get(ray_sym_intern(".ipc.on.close", 13));
+    ray_t* seven = ray_i64(7);
+    TEST_ASSERT_EQ_I(ray_env_set(g, seven), RAY_OK);
+    ray_release(seven);
+
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(let __rf_rlg_global 9)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(let __rf_rlg_fresh 1)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(let __rf_rlg_global (fn [] 9))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(let .ipc.on.close (fn [h] 0))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(eval (parse \"(let __rf_rlg_global 9)\"))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(times [__rf_rlg_fresh 2] 0)"));
+    ray_t* kept = ray_env_get(g);
+    TEST_ASSERT_NOT_NULL(kept);
+    TEST_ASSERT_EQ_I(kept->i64, 7);
+    TEST_ASSERT_NULL(ray_env_get(fresh));
+    TEST_ASSERT(ray_env_get(ray_sym_intern(".ipc.on.close", 13)) == hook_before,
+                "restricted let left .ipc.on.close as it was");
+
+    /* Local bindings are untouched by the restriction. */
+    ray_t* r = eval_restricted_expr("(do (let __rf_rlg_fresh 5) (+ __rf_rlg_fresh 1))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 6);
+    ray_release(r);
+    r = eval_restricted_expr("((fn [x] (let y (* x 2)) y) 4)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 8);
+    ray_release(r);
+    TEST_ASSERT_NULL(ray_env_get(fresh));
+
+    /* Unrestricted, a top-level `let` still binds the global. */
+    r = ray_eval_str("(let __rf_rlg_fresh 3)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    kept = ray_env_get(fresh);
+    TEST_ASSERT_NOT_NULL(kept);
+    TEST_ASSERT_EQ_I(kept->i64, 3);
+    PASS();
+}
+
+/* A request can be evaluated while server code waits inside a frame (a
+ * request a peer pushes back during a sync send).  It binds only in frames
+ * it opens itself: a `let` that would land in the waiting code's frame is
+ * refused, while the request's own `do` frame still takes one. */
+static test_result_t test_eval_restricted_let_server_frame(void) {
+    int64_t v = ray_sym_intern("__rf_rlf_v", 10);
+    int64_t hook = ray_sym_intern(".ipc.on.close", 13);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    ray_t* one = ray_i64(1);
+    TEST_ASSERT_EQ_I(ray_env_set_local(v, one), RAY_OK);
+    ray_release(one);
+    ray_t* hook_before = ray_env_get(hook);
+
+    ray_restrict_save_t saved;
+    ray_eval_restrict_enter(true, &saved);
+    ray_t* r_let  = ray_eval_str("(let __rf_rlf_v 99)");
+    ray_t* r_hook = ray_eval_str("(let .ipc.on.close (fn [h] 0))");
+    ray_t* r_loop = ray_eval_str("(times [__rf_rlf_v 2] 0)");
+    ray_t* r_own  = ray_eval_str("(do (let __rf_rlf_w 2) (+ __rf_rlf_w 1))");
+    ray_eval_restrict_leave(&saved);
+    bool restored = !ray_eval_get_restricted();
+    ray_t* cur = ray_env_get(v);
+    int64_t cur_v = cur ? cur->i64 : -1;
+    bool hook_kept = ray_env_get(hook) == hook_before;
+    ray_env_pop_scope();
+
+    bool let_refused  = RAY_IS_ERR(r_let)  && strcmp(ray_err_code(r_let), "access") == 0;
+    bool hook_refused = RAY_IS_ERR(r_hook) && strcmp(ray_err_code(r_hook), "access") == 0;
+    bool loop_refused = RAY_IS_ERR(r_loop) && strcmp(ray_err_code(r_loop), "access") == 0;
+    bool own_ok = r_own && !RAY_IS_ERR(r_own) && r_own->i64 == 3;
+    ray_t* rs[] = { r_let, r_hook, r_loop, r_own };
+    for (int i = 0; i < 4; i++) {
+        if (!rs[i]) continue;
+        if (RAY_IS_ERR(rs[i])) ray_error_free(rs[i]); else ray_release(rs[i]);
+    }
+    TEST_ASSERT_TRUE(restored);
+    TEST_ASSERT_TRUE(let_refused);
+    TEST_ASSERT_TRUE(hook_refused);
+    TEST_ASSERT_TRUE(loop_refused);
+    TEST_ASSERT_TRUE(own_ok);
+    TEST_ASSERT_EQ_I(cur_v, 1);
+    TEST_ASSERT_TRUE(hook_kept);
+    PASS();
+}
+
 static test_result_t test_eval_restricted_parquet(void) {
     TEST_ASSERT_TRUE(restricted_expr_returns_access(
         "(.parquet.splayed \"missing\" \"unused\")"));
@@ -12323,6 +12420,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_time", test_eval_table_list_col_time, lang_setup, lang_teardown },
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
+    { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
+    { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },
     { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },

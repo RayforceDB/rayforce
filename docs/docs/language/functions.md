@@ -518,7 +518,7 @@ spills exactly as it did before.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
-| `let` | binary, special | Bind value to local variable | `(let y (+ x 1))` |
+| `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
 | `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
