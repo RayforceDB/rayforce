@@ -785,7 +785,11 @@ static ray_t* read_dict_literal(rd_t* rd) {
         if (!buf_push(rd, &rd->kids, &val, sizeof val)) return NULL;
         n++;
     }
-    if (!DATA(rd, 2)) return NULL;
+    /* The same occurrences as (dict KEYS (list VALS)): the dict, the key
+     * vector (a container and its n elements; string keys were counted one by
+     * one as they were read) and the value list.  The values counted as they
+     * were read. */
+    if (!DATA(rd, kind == 2 ? 3 : n + 3)) return NULL;
     ray_t* keys;
     if (kind == 1) {
         keys = build_sym_vec(rd, n, (const size_t*)rd->ks.p + sbase);
