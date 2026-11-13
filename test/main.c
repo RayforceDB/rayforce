@@ -1543,7 +1543,7 @@ static void worker_main(pool_t* P, int cmd_fd, int log_fd) {
 /* Fork worker k with a fresh log.  False when it cannot be started. */
 static bool worker_spawn(pool_t* P, int k) {
     worker_t* me = &P->w[k];
-    char path[128];
+    char path[sizeof g_tmp_root + 64];
     snprintf(path, sizeof path, "%s/worker%d.%d.log", g_tmp_root, k, P->next);
     int log_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (log_fd < 0) { perror(path); return false; }
