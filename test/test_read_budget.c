@@ -192,6 +192,58 @@ static test_result_t retained_child_reclaim(void) {
     PASS();
 }
 
+/* The ledger's own bookkeeping is linear in the blocks it holds: the free-entry
+ * search used to walk every full record page on each request, so a flat list of
+ * N live scalars cost about N^2 / 64 entry tests.  meta_work counts the entries
+ * examined, so this bounds the work, not a wall-clock time. */
+static test_result_t slot_search_is_linear(void) {
+    enum { N = 8192 };
+    ray_read_budget_t b;
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, (size_t)1 << 26));
+    static ray_t* kids[N];
+    const int64_t one = 7;
+    for (int i = 0; i < N; i++) {
+        kids[i] = ray_read_i64(&b, &one, 1);
+        TEST_ASSERT_NOT_NULL(kids[i]);
+    }
+    ray_t* root = ray_read_list(&b, kids, N);
+    TEST_ASSERT_NOT_NULL(root);
+    TEST_ASSERT_EQ_I(b.status, RAY_READ_OK);
+    /* one free-entry request per block, none of them a page walk */
+    TEST_ASSERT(b.meta_work <= 2 * (size_t)(N + 1), "free-entry search is not linear");
+    ray_read_budget_close(&b);
+    TEST_ASSERT_EQ_U(b.live, 0);
+    PASS();
+}
+
+/* A released entry is reused before a new record page is allocated. */
+static test_result_t slot_reuse(void) {
+    ray_read_budget_t b;
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 65536));
+    ray_t* first = ray_read_alloc(&b, 0);
+    TEST_ASSERT_NOT_NULL(first);
+    size_t with_page = b.live;
+    ray_read_release(&b, first);
+    size_t released = b.live;
+    TEST_ASSERT(released < with_page, "release refunds the block");
+    for (int round = 0; round < 3 * 64; round++) {
+        ray_t* v = ray_read_alloc(&b, 0);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_EQ_U(b.live, with_page);          /* no second page */
+        ray_read_release(&b, v);
+        TEST_ASSERT_EQ_U(b.live, released);
+    }
+    /* a failed request leaves the free entry for the next one */
+    size_t base = b.live, charge;
+    TEST_ASSERT_TRUE(ray_alloc_charge(80, &charge));
+    b.limit = base + charge - 1;
+    TEST_ASSERT_NULL(ray_read_alloc(&b, 80));
+    TEST_ASSERT_EQ_I(b.status, RAY_READ_LIMIT);
+    ray_read_budget_close(&b);
+    TEST_ASSERT_EQ_U(b.live, 0);
+    PASS();
+}
+
 const test_entry_t read_budget_entries[] = {
     {"reader_proof/budget_edges", budget_edges, setup, teardown},
     {"reader_proof/transitive_ownership", transitive_ownership, setup, teardown},
@@ -200,5 +252,7 @@ const test_entry_t read_budget_entries[] = {
     {"reader_proof/oversized_cache", oversized_cache, setup, teardown},
     {"reader_proof/retained_child_admission", retained_child_admission, setup, teardown},
     {"reader_proof/retained_child_reclaim", retained_child_reclaim, setup, teardown},
+    {"reader_proof/slot_search_is_linear", slot_search_is_linear, setup, teardown},
+    {"reader_proof/slot_reuse", slot_reuse, setup, teardown},
     {NULL, NULL, NULL, NULL}
 };

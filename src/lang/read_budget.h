@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 typedef struct ray_read_records ray_read_records_t;
+typedef struct ray_read_record ray_read_record_t;
 typedef enum { RAY_READ_OK, RAY_READ_LIMIT, RAY_READ_OOM, RAY_READ_INVALID } ray_read_status_t;
 /* Internal proof context, not a Rayfall API. Values are borrowed until retained
  * by the caller. close releases the context's refs, including transitive work.
@@ -14,6 +15,13 @@ typedef struct ray_read_budget {
     ray_read_status_t status;
     bool closed;
     ray_read_records_t* records;
+    /* Head of the free ledger entries, threaded through the record pages, so
+     * finding a free entry is O(1) however many blocks are live. */
+    ray_read_record_t* free_slot;
+    /* Ledger entries examined so far (one per free-slot request, one per entry
+     * walked to find a released block): a deterministic measure of the
+     * context's own bookkeeping work, bounded by the tests. */
+    size_t meta_work;
 } ray_read_budget_t;
 
 bool ray_read_budget_init(ray_read_budget_t* b, size_t limit);
