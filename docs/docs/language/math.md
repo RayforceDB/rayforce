@@ -592,6 +592,21 @@ same type form a typed vector; anything else forms a list.
 (map (fn [x] (* x x)) [1 2 3])  ; [1 4 9]
 ```
 
+### `(map f val x)`
+
+The three-argument form holds one operand fixed: it calls `f(val, elem)` for
+each element of `x`, passing `val` whole every time. A collection `val` gives
+one row per element, as `map-right` does. Results are collected as in
+`(map f x)`.
+
+```lisp
+(map + 100 [1 2 3])                  ; [101 102 103]
+(map + [1 2 3] [10 20])              ; [[11 12 13] [21 22 23]]
+```
+
+`map` takes exactly 2 or 3 arguments and raises `domain` otherwise; the
+extra arguments are not ignored.
+
 ### `(fold f init x)`
 
 Left fold. Accumulate over `x` starting from `init` using binary function `f`.
@@ -667,7 +682,11 @@ provide parallel lambda evaluation.
 
 ```lisp
 (pmap (fn [x] (* x x)) [1 2 3])  ; [1 4 9], evaluated sequentially
+(pmap + 100 [1 2 3])             ; [101 102 103]
 ```
+
+It takes the same forms as `map`: exactly 2 or 3 arguments (`(pmap f x)` or
+`(pmap f val x)`), and `domain` otherwise.
 
 Eligible vector builtins and query operators can use the morsel-driven thread
 pool **inside** a callback; that is separate from scheduling callbacks in

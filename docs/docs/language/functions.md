@@ -128,8 +128,8 @@ Functions that take other functions as arguments.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `map` | variadic | Apply function to each element; same-type atom results form a typed vector, otherwise a list | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
-| `pmap` | variadic | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `map` | variadic | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments, else `domain` | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `pmap` | variadic | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments, else `domain` | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
@@ -138,11 +138,11 @@ Functions that take other functions as arguments.
 | `scan` | variadic | Running fold (returns all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-left` | variadic | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-right` | variadic | Right-to-left running fold (returns a list) | `(scan-right + (enlist 1 2 3))` → `(6 5 3)` |
-| `apply` | variadic | Zip-apply function pairwise over two lists | `(apply + (enlist 1 2) (enlist 3 4))` → `(4 6)` |
+| `apply` | variadic | `(apply f a b)` calls `f` on the elements of two collections taken in step, `f(a_0, b_0)`, `f(a_1, b_1)`, ...; the result is as long as the shorter one and is collected as `map`'s is. Two atoms call `f` once. Exactly 3 arguments, else `domain` | `(apply + [1 2 3] [10 20 30])` → `[11 22 33]` |
 | `map-left` | variadic | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
 | `map-right` | variadic | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
-`map` and `pmap` return a typed vector when every result is an atom of
+`map`, `pmap` and `apply` return a typed vector when every result is an atom of
 exactly the same vector-supported type, including strings, symbols and
 representable typed nulls. Native boolean/byte null atoms remain boxed
 because those vector types are non-nullable. Opaque graph, HNSW index and

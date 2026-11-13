@@ -218,7 +218,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `map` | variadic | — | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (a collection `val` gives one row per element; same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
-| `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
