@@ -38,7 +38,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <pthread.h>
 #ifdef RAY_OS_LINUX
 #include <sched.h>
 #endif
@@ -245,16 +244,30 @@ static test_result_t test_file_writebehind_fds(void) {
 }
 
 #ifdef RAY_OS_LINUX
-static void* plat_noop_thread(void* a) { return a; }
-
-/* Threads of this process. */
-static int plat_nthreads(void) {
+/* Threads of this process running the write-behind loop (named "ray-wb"). */
+static int plat_wb_threads(void) {
     DIR* d = opendir("/proc/self/task");
     if (!d) return -1;
     int n = 0;
     struct dirent* e;
-    while ((e = readdir(d))) n += e->d_name[0] != '.';
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char path[64], comm[32] = {0};
+        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;   /* a task that ended meanwhile */
+        if (fgets(comm, sizeof(comm), f) && !strcmp(comm, "ray-wb\n")) n++;
+        fclose(f);
+    }
     closedir(d);
+    return n;
+}
+
+/* No write-behind thread left: one joined drops its task a moment after it
+ * wakes the joiner. */
+static int plat_wb_threads_left(void) {
+    int n = plat_wb_threads();
+    for (int i = 0; i < 100000 && n > 0; i++) { sched_yield(); n = plat_wb_threads(); }
     return n;
 }
 #endif
@@ -265,22 +278,14 @@ static int plat_nthreads(void) {
 static test_result_t test_file_writeback_errors(void) {
 #ifdef RAY_OS_LINUX
     int64_t e0 = ray_file_writeback_errors();
-    /* a sanitizer runtime starts a thread of its own at the process's first
-     * thread create: one made and joined here, so it is in the baseline */
-    pthread_t t;
-    TEST_ASSERT(pthread_create(&t, NULL, plat_noop_thread, NULL) == 0, "a thread");
-    pthread_join(t, NULL);
-    int threads = plat_nthreads();
     int p[2];
     TEST_ASSERT(pipe(p) == 0, "a pipe");
     ray_file_writeback_start(p[1], 0, 1);
     int64_t e1 = ray_file_writeback_errors();
-    /* joined: the kernel drops its task a moment after it wakes the joiner */
-    int after = plat_nthreads();
-    for (int i = 0; i < 100000 && after > threads; i++) { sched_yield(); after = plat_nthreads(); }
+    int left = plat_wb_threads_left();
     close(p[0]); close(p[1]);
     TEST_ASSERT_EQ_I(e1 - e0, 1);
-    TEST_ASSERT_EQ_I(after, threads);
+    TEST_ASSERT_EQ_I(left, 0);
 #ifdef DEBUG
     char dir[64], path[128];
     snprintf(dir, sizeof(dir), "/tmp/rayforce_wbe_%d", (int)getpid());
@@ -288,14 +293,21 @@ static test_result_t test_file_writeback_errors(void) {
     plat_write(dir, "f", "written once");
     snprintf(path, sizeof(path), "%s/f", dir);
     ray_file_writeback_test_fail(true);
+    ray_file_writeback_test_hold(true);
     int fd = ray_file_writebehind_begin(path);
     ray_file_writebehind_end(fd);
+    ray_file_writeback_test_wait_held();
+    int serving = plat_wb_threads();   /* the thread, found by its name */
+    ray_file_writeback_test_hold(false);
     int64_t e2 = ray_file_writeback_errors();
     ray_file_writeback_test_fail(false);
+    left = plat_wb_threads_left();
     plat_unlink(dir, "f");
     rmdir(dir);
     TEST_ASSERT(fd >= 0, "write-behind begun");
+    TEST_ASSERT_EQ_I(serving, 1);
     TEST_ASSERT_EQ_I(e2 - e1, 2);
+    TEST_ASSERT_EQ_I(left, 0);
 #endif
 #endif
     PASS();

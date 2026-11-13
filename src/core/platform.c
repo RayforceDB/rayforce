@@ -311,6 +311,7 @@ static bool wb_take(int n) {
  * wb_mu: a fork finds it either open and in wb_cur or closed. */
 static void* wb_thread(void* arg) {
     (void)arg;
+    (void)pthread_setname_np(pthread_self(), "ray-wb");   /* named for tools, and tests */
     pthread_mutex_lock(&wb_mu);
     while (wb_head != wb_tail) {
         wb_req_t r = wb_ring[wb_head % WB_RING];
