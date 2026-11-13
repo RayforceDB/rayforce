@@ -198,14 +198,21 @@ static const char* try_parse_time(const char* start, int32_t *ms_out) {
 }
 
 /* ── Number parsing (with hex, nulls, typed suffixes, date/time/timestamp) ── */
-static ray_t* parse_number(ray_parser_t *p) {
+/* Result of scanning one number-like literal, before it becomes a boxed atom.
+ * ray_parse_scalar_literal (parse.h) exposes the same scan to readers that must
+ * not evaluate or allocate per token. */
+#define LIT_INT(T, V)  do { out->type = (T); out->i = (int64_t)(V); return NULL; } while (0)
+#define LIT_NULL(T)    do { out->type = (T); out->null = true; return NULL; } while (0)
+
+static ray_t* scan_number(ray_parser_t *p, ray_scalar_lit_t *out) {
+    memset(out, 0, sizeof *out);
     const char *start = p->pos;
     int is_neg = 0;
     if (*p->pos == '-') { is_neg = 1; p->pos++; }
 
     if (p->pos[0] == '0' && p->pos[1] == 'W' && p->pos[2] == 'n') {
         p->pos += 3;
-        return ray_timespan(is_neg ? -INT64_MAX : INT64_MAX);
+        LIT_INT(-RAY_TIMESPAN, is_neg ? -INT64_MAX : INT64_MAX);
     }
 
     /* Hex literal: 0x.. */
@@ -215,22 +222,22 @@ static ray_t* parse_number(ray_parser_t *p) {
         size_t n = ray_parse_u64_hex(p->pos, SIZE_MAX, &v);
         if (n == 0) return ray_error("parse", NULL);
         p->pos += n;
-        return ray_u8((uint8_t)v);
+        LIT_INT(-RAY_U8, (uint8_t)v);
     }
 
     /* Null literal: 0N{h,i,d,t,p,l,f,e,g} or bare 0N (defaults to i64 null). */
     if (!is_neg && p->pos[0] == '0' && p->pos[1] == 'N') {
         switch (p->pos[2]) {
-        case 'h': p->pos += 3; return ray_typed_null(-RAY_I16);
-        case 'i': p->pos += 3; return ray_typed_null(-RAY_I32);
-        case 'd': p->pos += 3; return ray_typed_null(-RAY_DATE);
-        case 't': p->pos += 3; return ray_typed_null(-RAY_TIME);
-        case 'p': p->pos += 3; return ray_typed_null(-RAY_TIMESTAMP);
-        case 'n': p->pos += 3; return ray_typed_null(-RAY_TIMESPAN);
-        case 'l': p->pos += 3; return ray_typed_null(-RAY_I64);
-        case 'f': p->pos += 3; return ray_typed_null(-RAY_F64);
-        case 'e': p->pos += 3; return ray_typed_null(-RAY_F32);
-        case 'g': p->pos += 3; return ray_typed_null(-RAY_GUID);
+        case 'h': p->pos += 3; LIT_NULL(-RAY_I16);
+        case 'i': p->pos += 3; LIT_NULL(-RAY_I32);
+        case 'd': p->pos += 3; LIT_NULL(-RAY_DATE);
+        case 't': p->pos += 3; LIT_NULL(-RAY_TIME);
+        case 'p': p->pos += 3; LIT_NULL(-RAY_TIMESTAMP);
+        case 'n': p->pos += 3; LIT_NULL(-RAY_TIMESPAN);
+        case 'l': p->pos += 3; LIT_NULL(-RAY_I64);
+        case 'f': p->pos += 3; LIT_NULL(-RAY_F64);
+        case 'e': p->pos += 3; LIT_NULL(-RAY_F32);
+        case 'g': p->pos += 3; LIT_NULL(-RAY_GUID);
         /* SYM has no typed null and no `0Ns` literal.  The empty symbol
          * (sym 0) is written `'` (parse_symbol below). */
         }
@@ -240,7 +247,7 @@ static ray_t* parse_number(ray_parser_t *p) {
         if (!((c2 >= 'a' && c2 <= 'z') || (c2 >= 'A' && c2 <= 'Z') ||
               (c2 >= '0' && c2 <= '9') || c2 == '_')) {
             p->pos += 2;
-            return ray_typed_null(-RAY_I64);
+            LIT_NULL(-RAY_I64);
         }
     }
 
@@ -254,7 +261,7 @@ static ray_t* parse_number(ray_parser_t *p) {
         if (!ray_parse_timespan(start, &consumed, &ns))
             return ray_error("domain", "parse: invalid or out-of-range timespan");
         p->pos = start + consumed;
-        return ray_timespan(ns);
+        LIT_INT(-RAY_TIMESPAN, ns);
     }
 
 
@@ -340,10 +347,10 @@ static ray_t* parse_number(ray_parser_t *p) {
                 return ray_error("parse", "timestamp year out of representable range");
             int64_t day_ns = (int64_t)days * PARSE_NSECS_IN_DAY;
             int64_t time_ns = ((int64_t)hh * 3600 + mi * 60 + ss) * 1000000000LL + (int64_t)nanos;
-            return ray_timestamp(day_ns + time_ns);
+            LIT_INT(-RAY_TIMESTAMP, day_ns + time_ns);
         }
 
-        return ray_date(days);
+        LIT_INT(-RAY_DATE, days);
     }
 
     /* Time literal: HH:MM:SS.mmm (detected by colon after 2 digits from digit-start) */
@@ -351,7 +358,7 @@ static ray_t* parse_number(ray_parser_t *p) {
         p->pos = start; /* reset — let try_parse_time handle sign */
         int32_t ms;
         const char* end = try_parse_time(start, &ms);
-        if (end) { p->pos = end; return ray_time(ms); }
+        if (end) { p->pos = end; LIT_INT(-RAY_TIME, ms); }
         /* Not a valid time — fall through to regular number parsing */
         p->pos = start;
         if (is_neg) p->pos++;
@@ -386,7 +393,10 @@ plain_number:;
         double v = 0.0;
         if (ray_parse_f64(start, span, &v) == 0)
             return ray_error("parse", NULL);
-        return is_f32 ? ray_f32(ray_cast_f64_to_f32_null(v)) : ray_f64(v);
+        out->nonfinite = !isfinite(v);
+        if (is_f32) { out->type = -RAY_F32; out->f = (double)ray_cast_f64_to_f32_null(v); }
+        else        { out->type = -RAY_F64; out->f = v; }
+        return NULL;
     }
 
     /* Integer parse — overflow signalled by `n == 0` (digits present but
@@ -398,22 +408,57 @@ plain_number:;
         double fv = 0.0;
         if (ray_parse_f64(start, span, &fv) == 0)
             return ray_error("parse", NULL);
-        return ray_f64(fv);
+        out->type = -RAY_F64; out->f = fv;
+        out->widened = true;
+        out->nonfinite = !isfinite(fv);
+        return NULL;
     }
 
     /* Type suffix: h (i16), i (i32) */
     if (*p->pos == 'h') {
         p->pos++;
         if (v < -32767 || v > 32767) return ray_error("domain", "parse: i16 literal out of range [-32767,32767], got %lld", (long long)v);
-        return ray_i16((int16_t)v);
+        LIT_INT(-RAY_I16, v);
     }
     if (*p->pos == 'i') {
         p->pos++;
         if (v < -2147483647LL || v > 2147483647LL) return ray_error("domain", "parse: i32 literal out of range [-2147483647,2147483647], got %lld", (long long)v);
-        return ray_i32((int32_t)v);
+        LIT_INT(-RAY_I32, v);
     }
 
-    return ray_i64(v);
+    LIT_INT(-RAY_I64, v);
+}
+
+/* A literal's boxed atom, as the parser builds it. */
+static ray_t* lit_atom(const ray_scalar_lit_t *l) {
+    if (l->null) return ray_typed_null(l->type);
+    switch (l->type) {
+    case -RAY_U8:        return ray_u8((uint8_t)l->i);
+    case -RAY_I16:       return ray_i16((int16_t)l->i);
+    case -RAY_I32:       return ray_i32((int32_t)l->i);
+    case -RAY_I64:       return ray_i64(l->i);
+    case -RAY_F32:       return ray_f32((float)l->f);
+    case -RAY_F64:       return ray_f64(l->f);
+    case -RAY_DATE:      return ray_date((int32_t)l->i);
+    case -RAY_TIME:      return ray_time((int32_t)l->i);
+    case -RAY_TIMESTAMP: return ray_timestamp(l->i);
+    case -RAY_TIMESPAN:  return ray_timespan(l->i);
+    default:             return ray_error("parse", NULL);
+    }
+}
+
+static ray_t* parse_number(ray_parser_t *p) {
+    ray_scalar_lit_t lit;
+    ray_t* err = scan_number(p, &lit);
+    if (err) return err;
+    return lit_atom(&lit);
+}
+
+ray_t* ray_parse_scalar_literal(const char** pos, ray_scalar_lit_t* out) {
+    ray_parser_t p = { .src = *pos, .pos = *pos, .line = 0, .col = 0, .nfo = NULL };
+    ray_t* err = scan_number(&p, out);
+    if (!err) *pos = p.pos;
+    return err;
 }
 
 /* ── String parsing with escape sequence decoding ── */
