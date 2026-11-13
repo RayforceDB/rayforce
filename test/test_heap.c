@@ -4980,6 +4980,8 @@ static test_result_t test_relieve_needed(void) {
     workers = workers && relieve_worker_pool(&w);
     uint32_t w0 = relieve_worker_pools();
     int64_t c0 = ray_heap_anon_committed();
+    ray_pool_t* diag_pool = workers ? ray_pool_live() : NULL;
+    uint32_t diag_workers = diag_pool ? diag_pool->n_workers : 0;
     const size_t big = (size_t)48 << 20;
 
     /* A large block spills: the workers' empty pools go. */
@@ -4994,11 +4996,13 @@ static test_result_t test_relieve_needed(void) {
     /* The repeat: the large block fits that room, then the workers take
      * their pools back — up to the watermark, no spill: relieved again. */
     d = ray_alloc(big);
+    size_t diag_map = d && ray_is_direct(d) ? ray_direct_map_size(d) : 0;
     bool fit = d && !ray_direct_file_backed(d);
     if (d) ray_free(d);
     ray_heap_direct_cache_drain();
-    relieve_worker_pool(&w);
-    bool back = relieve_worker_pools() == w0;
+    bool diag_refill_ran = relieve_worker_pool(&w);
+    uint32_t diag_refill_pools = relieve_worker_pools();
+    bool back = diag_refill_pools == w0;
     ray_heap_relieve();
     bool again = relieve_worker_pools() == w1;
 
@@ -5054,7 +5058,12 @@ static test_result_t test_relieve_needed(void) {
     if (!workers) SKIP("no pool worker");
     if (!spilled || !spill) SKIP("no spill file");
     TEST_ASSERT(took, "a spill relieved the workers' empty pools");
-    TEST_ASSERT(fit && back, "the repeat's large block fit, the workers took their pools back");
+    TEST_ASSERT_FMT(fit && back,
+                    "fit && back: the repeat's large block fit, the workers took their pools back "
+                    "(fit=%d back=%d workers=%u w0=%u w1=%u refill_pools=%u "
+                    "refill_ran=%d committed_start=%lld repeat_map=%llu again=%d)",
+                    (int)fit, (int)back, diag_workers, w0, w1, diag_refill_pools,
+                    (int)diag_refill_ran, (long long)c0, (unsigned long long)diag_map, (int)again);
     TEST_ASSERT(again, "and its boundary relieved again");
     TEST_ASSERT(pools_only, "room gone to pools only: not relieved");
     TEST_ASSERT(spilled2, "a spill to start over");
