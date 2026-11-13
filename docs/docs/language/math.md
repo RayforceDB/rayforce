@@ -592,6 +592,21 @@ same type form a typed vector; anything else forms a list.
 (map (fn [x] (* x x)) [1 2 3])  ; [1 4 9]
 ```
 
+### `(map f val x)`
+
+The three-argument form holds one operand fixed: it calls `f(val, elem)` for
+each element of `x`, passing `val` whole every time. A collection `val` gives
+one row per element, as `map-right` does. Results are collected as in
+`(map f x)`.
+
+```lisp
+(map + 100 [1 2 3])                  ; [101 102 103]
+(map + [1 2 3] [10 20])              ; [[11 12 13] [21 22 23]]
+```
+
+`map` takes exactly 2 or 3 arguments and raises `domain` otherwise; the
+extra arguments are not ignored.
+
 ### `(fold f init x)`
 
 Left fold. Accumulate over `x` starting from `init` using binary function `f`.
@@ -632,13 +647,22 @@ For common time-series scans, prefer the built-in DAG forms. They avoid per-row 
 
 The moving forms take a positive integer window first. Constant windows inside query projections lower to DAG operations; dynamic windows still evaluate as ordinary function calls.
 
-### `(apply f ...args)`
+### `(apply f a b)`
 
-Apply function `f` to the given arguments.
+Call the binary function `f` on the elements of two collections taken in step:
+`f(a_0, b_0)`, `f(a_1, b_1)`, and so on. The result is as long as the shorter
+collection, and is collected as `map`'s is (a typed vector while the results are
+atoms of one vector type, otherwise a list). Two atoms call `f` once; an atom
+beside a collection is a `type` error. It takes exactly three arguments.
 
 ```lisp
-(apply + 1 2)  ; 3
+(apply + 1 2)                      ; 3
+(apply + [1 2 3] [10 20 30])       ; [11 22 33]
+(apply + [1 2 3 4] [10 20])        ; [11 22]
+(apply concat ["a" "b"] ["x" "y"]) ; ["ax" "by"]
 ```
+
+To hold one operand fixed instead, use `(map f val v)` or `map-right`.
 
 ### `(filter vec mask)`
 
@@ -658,7 +682,11 @@ provide parallel lambda evaluation.
 
 ```lisp
 (pmap (fn [x] (* x x)) [1 2 3])  ; [1 4 9], evaluated sequentially
+(pmap + 100 [1 2 3])             ; [101 102 103]
 ```
+
+It takes the same forms as `map`: exactly 2 or 3 arguments (`(pmap f x)` or
+`(pmap f val x)`), and `domain` otherwise.
 
 Eligible vector builtins and query operators can use the morsel-driven thread
 pool **inside** a callback; that is separate from scheduling callbacks in

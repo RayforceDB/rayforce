@@ -1,0 +1,22 @@
+;; (map fn vec) maps fn over the elements of vec.
+;; (map fn val vec) calls fn(val, elem) for each element of vec; val is passed
+;; whole on every call, so it is the same as map-right.  Any other argument
+;; count is an error.
+
+(map (fn [x] (* x 2)) [1 2 3]) -- [2 4 6]
+(map + 100 [1 2 3]) -- [101 102 103]
+(map (fn [a b] (* a b)) 2 [1 2 3]) -- [2 4 6]
+
+;; a collection as val is passed whole: one row of results per element of vec
+(map + [1 2 3] [10 20 30]) -- (list [11 12 13] [21 22 23] [31 32 33])
+(map + [1 2 3] [10 20 30]) -- (map-right + [1 2 3] [10 20 30])
+
+;; both atoms: one call
+(map + 1 2) -- 3
+
+;; wrong argument counts
+(map + [1 2 3] [10 20 30] [100 200 300]) !- domain
+(map (fn [a b c] (+ a (+ b c))) 1 2 3 [4 5]) !- domain
+(pmap + [1 2 3] [10 20 30] [100 200 300]) !- domain
+(map +) !- domain
+(pmap +) !- domain
