@@ -4707,7 +4707,8 @@ static test_result_t test_select_parted_prunes_mixed(void) {
 static ray_t* pdb_make_head_columns(const char* root, unsigned gen2) {
     static const char* const names[] = { "not", "if", "first", "distinct" };
     for (int p = 0; p < 3; p++) {
-        char dir[256]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+        /* The caller has a 256-byte root; leave room for the date suffix. */
+        char dir[512]; snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
         ray_t* t = ray_table_new(6);
         ray_t* a = i64_col(3000, 3 + p);
         ray_t* b = i64_col(3000, 5);
