@@ -590,7 +590,7 @@ static bool lin_qr_solve(double* M, double* R, double* W, int64_t m, int64_t n, 
         double nrm = 0.0;
         for (int64_t i = j; i < m; i++) nrm += M[i * n + j] * M[i * n + j];
         nrm = sqrt(nrm);
-        if (!(nrm > 0.0) || !isfinite(nrm)) { ok = false; break; }
+        if (!(nrm > 0.0)) { ok = false; break; }
         if (M[j * n + j] > 0.0) nrm = -nrm;
         /* v = x - nrm*e1 stored in column j (below and on the diagonal) */
         M[j * n + j] -= nrm;
