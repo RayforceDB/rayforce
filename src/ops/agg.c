@@ -367,6 +367,31 @@ static ray_t* agg_truth_vec(ray_t* x, int want_all) {
         return ray_error("type", want_all ? "all expects a numeric vector, got %s"
                                           : "any expects a numeric vector, got %s",
                          ray_type_name(x->type));
+    if (x->type == RAY_BOOL || x->type == RAY_U8) {
+        /* A byte vector holds no null: any is "some byte is non-zero", all
+         * is "no byte is zero".  Eight bytes at a time, stopping at the first
+         * word that decides it (a mask guard like (any (nil? v)) runs at memory
+         * speed), with the interrupt polled once per 64K bytes. */
+        const uint8_t* d = (const uint8_t*)ray_data(x);
+        int64_t n = x->len;
+        const uint64_t lo = 0x0101010101010101ULL, hi = 0x8080808080808080ULL;
+        for (int64_t blk = 0; blk < n; blk += 65536) {
+            if (ray_interrupted())
+                return ray_error("cancel", "interrupted");
+            int64_t end = blk + 65536 < n ? blk + 65536 : n;
+            int64_t i = blk;
+            for (; i + 8 <= end; i += 8) {
+                uint64_t w;
+                memcpy(&w, d + i, 8);
+                if (want_all ? (((w - lo) & ~w & hi) != 0) : (w != 0))
+                    return ray_bool(!want_all);
+            }
+            for (; i < end; i++)
+                if (want_all ? d[i] == 0 : d[i] != 0)
+                    return ray_bool(!want_all);
+        }
+        return ray_bool(want_all);
+    }
     bool has_nulls = ray_vec_may_have_nulls(x);
     int64_t seen = 0, truthy = 0;
     for (int64_t i = 0; i < x->len; i++) {

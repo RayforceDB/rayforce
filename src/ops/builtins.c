@@ -2719,15 +2719,103 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
     return ray_dict_new(keys, vlist);
 }
 
+/* One pass of `nil?` over rows [lo, hi) of a typed vector's payload: a tight,
+ * single-type loop per element width (the compiler vectorises the numeric
+ * ones), the same sentinels ray_raw_is_null reads.  BOOL and U8 hold no null. */
+typedef struct {
+    const void* base;     /* payload of the vector (slice-resolved) */
+    uint8_t*    out;      /* one BOOL per element */
+    int8_t      type;
+    uint8_t     attrs;    /* SYM width class, from the owning vector */
+} nil_ctx_t;
+
+static void nil_range_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const nil_ctx_t* c = (const nil_ctx_t*)vctx;
+    uint8_t* o = c->out;
+    switch (c->type) {
+    case RAY_F64: {
+        const double* p = (const double*)c->base;
+        for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] != p[i]);
+        break;
+    }
+    case RAY_F32: {
+        const float* p = (const float*)c->base;
+        for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] != p[i]);
+        break;
+    }
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: {
+        const int64_t* p = (const int64_t*)c->base;
+        for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == NULL_I64);
+        break;
+    }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: {
+        const int32_t* p = (const int32_t*)c->base;
+        for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == NULL_I32);
+        break;
+    }
+    case RAY_I16: {
+        const int16_t* p = (const int16_t*)c->base;
+        for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == NULL_I16);
+        break;
+    }
+    case RAY_SYM:
+        switch (c->attrs & RAY_SYM_W_MASK) {
+        case RAY_SYM_W8: {
+            const uint8_t* p = (const uint8_t*)c->base;
+            for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == 0);
+            break;
+        }
+        case RAY_SYM_W16: {
+            const uint16_t* p = (const uint16_t*)c->base;
+            for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == 0);
+            break;
+        }
+        case RAY_SYM_W32: {
+            const uint32_t* p = (const uint32_t*)c->base;
+            for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == 0);
+            break;
+        }
+        default: {
+            const int64_t* p = (const int64_t*)c->base;
+            for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i] == 0);
+            break;
+        }
+        }
+        break;
+    case RAY_STR: {
+        const ray_str_t* p = (const ray_str_t*)c->base;
+        for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(p[i].len == 0);
+        break;
+    }
+    case RAY_GUID: {
+        /* GUID null = 16 zero bytes */
+        const uint8_t* p = (const uint8_t*)c->base;
+        for (int64_t i = lo; i < hi; i++) {
+            uint64_t w[2];
+            memcpy(w, p + i * 16, 16);
+            o[i] = (uint8_t)((w[0] | w[1]) == 0);
+        }
+        break;
+    }
+    default:
+        memset(o + lo, 0, (size_t)(hi - lo));
+        break;
+    }
+}
+
 /* (nil? x) -> true if x is null.
  *
  * Element-wise over a vector or a boxed list: one BOOL per element, the
  * same answer the query path's OP_ISNULL gives per row, so `nil?` means
  * the same thing inside and outside a query (#485).  Nulls are in-band
- * (sentinels, the empty symbol, the empty string), so ray_vec_is_null
- * decides per element regardless of the HAS_NULLS hint.  A list element
- * that is not an atom is not null.  Atoms, the null object, and any
- * other container (a table, a dict) answer for the object itself. */
+ * (sentinels, the empty symbol, the empty string).  A numeric vector whose
+ * HAS_NULLS hint is clear holds no null (the gate ray_vec_is_null applies
+ * per element), so it is answered with one memset; SYM and STR carry their
+ * null as an empty payload whatever the hint says, so they are always
+ * read.  Larger vectors are read in parallel.  A list element that is not
+ * an atom is not null.  Atoms, the null object, and any other container
+ * (a table, a dict) answer for the object itself. */
 ray_t* ray_nil_fn(ray_t* x) {
     RAY_ASSERT_VALUE(x);
     if (RAY_IS_NULL(x)) return ray_bool(true);
@@ -2742,9 +2830,19 @@ ray_t* ray_nil_fn(ray_t* x) {
             for (int64_t i = 0; i < n; i++)
                 o[i] = (uint8_t)(!e[i] || RAY_IS_NULL(e[i]) ||
                                  (ray_is_atom(e[i]) && RAY_ATOM_IS_NULL(e[i])));
+        } else if (!ray_vec_may_have_nulls(x)) {
+            memset(o, 0, (size_t)n);
         } else {
-            for (int64_t i = 0; i < n; i++)
-                o[i] = (uint8_t)ray_vec_is_null(x, i);
+            const ray_t* root = x;                 /* the owner of the width class */
+            while ((root->attrs & RAY_ATTR_SLICE) && root->slice_parent)
+                root = root->slice_parent;
+            nil_ctx_t c = { .base = ray_data(x), .out = o, .type = x->type,
+                            .attrs = root->attrs };
+            ray_pool_t* pool = ray_pool_get();
+            if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD))
+                ray_pool_dispatch(pool, nil_range_fn, &c, n);
+            else
+                nil_range_fn(&c, 0, 0, n);
         }
         out->len = n;
         return out;

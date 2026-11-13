@@ -1117,6 +1117,90 @@ static void symcmp_eq_run(symcmp_ctx_t* ctx, int64_t n) {
         symcmp_eq_fn(ctx, 0, 0, n);
 }
 
+/* B8 comparison (== <> < <= > >=) of two B8 vectors, or a B8 vector and a B8
+ * atom.  A byte is truthy when non-zero, as in and / or / not.  The typed DAG
+ * path does not take BOOL, so without this the comparison fell to the boxed
+ * per-element loop (a BOOL atom allocated per row).  `b` is NULL when the
+ * right operand is the atom `bv`; the caller mirrors the operator when the
+ * atom is on the left. */
+typedef struct {
+    const uint8_t* a;
+    const uint8_t* b;
+    uint8_t*       out;
+    uint8_t        bv;
+    uint16_t       op;
+} boolcmp_ctx_t;
+
+static void boolcmp_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const boolcmp_ctx_t* c = (const boolcmp_ctx_t*)vctx;
+    const uint8_t* a = c->a;
+    const uint8_t* b = c->b;
+    uint8_t* o = c->out;
+    uint8_t bv = c->bv;
+#define BOOLCMP_CASE(OPC, CMP)                                                     \
+    case OPC:                                                                      \
+        if (b) for (int64_t i = lo; i < hi; i++)                                   \
+                   o[i] = (uint8_t)((a[i] != 0) CMP (b[i] != 0));                  \
+        else   for (int64_t i = lo; i < hi; i++)                                   \
+                   o[i] = (uint8_t)((a[i] != 0) CMP bv);                           \
+        break;
+    switch (c->op) {
+        BOOLCMP_CASE(OP_EQ, ==)
+        BOOLCMP_CASE(OP_NE, !=)
+        BOOLCMP_CASE(OP_LT, <)
+        BOOLCMP_CASE(OP_LE, <=)
+        BOOLCMP_CASE(OP_GT, >)
+        BOOLCMP_CASE(OP_GE, >=)
+    default: break;
+    }
+#undef BOOLCMP_CASE
+}
+
+/* The operator that gives the same answer with its operands swapped. */
+static uint16_t boolcmp_mirror(uint16_t op) {
+    switch (op) {
+    case OP_LT: return OP_GT;
+    case OP_LE: return OP_GE;
+    case OP_GT: return OP_LT;
+    case OP_GE: return OP_LE;
+    default:    return op;
+    }
+}
+
+/* NULL when the operands are not a B8 vector against a B8 vector or a non-null
+ * B8 atom; otherwise the BOOL result vector (possibly an error). */
+static ray_t* bool_cmp_fast(uint16_t op, ray_t* left, ray_t* right) {
+    bool lv = ray_is_vec(left)  && left->type  == RAY_BOOL;
+    bool rv = ray_is_vec(right) && right->type == RAY_BOOL;
+    bool la = left->type  == -RAY_BOOL && !RAY_ATOM_IS_NULL(left);
+    bool ra = right->type == -RAY_BOOL && !RAY_ATOM_IS_NULL(right);
+    if (!((lv && rv) || (lv && ra) || (la && rv))) return NULL;
+    ray_t* vec  = lv ? left : right;
+    int64_t n = vec->len;
+    ray_t* out = ray_vec_new(RAY_BOOL, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    boolcmp_ctx_t c = { .out = (uint8_t*)ray_data(out), .b = NULL, .bv = 0, .op = op };
+    if (lv && rv) {
+        c.a = (const uint8_t*)ray_data(left);
+        c.b = (const uint8_t*)ray_data(right);
+    } else if (lv) {
+        c.a = (const uint8_t*)ray_data(left);
+        c.bv = right->b8 != 0;
+    } else {
+        c.a = (const uint8_t*)ray_data(right);
+        c.bv = left->b8 != 0;
+        c.op = boolcmp_mirror(op);
+    }
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && n >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, boolcmp_fn, &c, n);
+    else
+        boolcmp_fn(&c, 0, 0, n);
+    out->len = n;
+    return out;
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
@@ -1370,6 +1454,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                 }
             }
         }
+    /* B8 comparisons: both operands B8 (the DAG path above takes no BOOL). */
+    if (!force_boxed && dag_opcode >= OP_EQ && dag_opcode <= OP_GE && out_type == RAY_BOOL) {
+        ray_t* r = bool_cmp_fast(dag_opcode, left, right);
+        if (r) { ray_release(e0); return r; }
+    }
     /* R7 fast path: (== or !=) of SYM-vec against a SYM atom.
      *
      * The DAG path above doesn't handle SYM (IS_NUM_TYPE excludes it),
