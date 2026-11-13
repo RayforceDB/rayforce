@@ -75,6 +75,7 @@
 #include "store/serde.h"
 #include "mem/sys.h"
 #include "store/journal.h"
+#include "lang/env.h"
 #include "ops/ops.h"
 
 /* `.ipc.post` C wrapper — declared in src/lang/internal.h; forward-
@@ -855,6 +856,33 @@ static test_result_t test_ipc_poll_public_restricted(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(denied));
     TEST_ASSERT_STR_EQ(ray_err_code(denied), "access");
     ray_release(denied);
+
+    /* A request's top-level `let` would bind a global: refused like `set`,
+     * for a plain name and for a connection hook alike.  A `let` inside
+     * `do` stays local and runs. */
+    ray_t* hook_before = ray_env_get(ray_sym_intern(".ipc.on.close", 13));
+    const char* lets[] = { "(let __rf_ipc_let_global 1)",
+                           "(let .ipc.on.close (fn [h] 0))" };
+    for (size_t i = 0; i < sizeof(lets) / sizeof(lets[0]); i++) {
+        ray_t* q = ray_str(lets[i], strlen(lets[i]));
+        ray_t* res = ray_ipc_send(h, q);
+        ray_release(q);
+        TEST_ASSERT_NOT_NULL(res);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(res));
+        TEST_ASSERT_STR_EQ(ray_err_code(res), "access");
+        ray_release(res);
+    }
+    TEST_ASSERT_NULL(ray_env_get(ray_sym_intern("__rf_ipc_let_global", 19)));
+    TEST_ASSERT(ray_env_get(ray_sym_intern(".ipc.on.close", 13)) == hook_before,
+                "restricted let left .ipc.on.close as it was");
+    const char* local = "(do (let y 20) (+ y 1))";
+    ray_t* lq = ray_str(local, strlen(local));
+    ray_t* lres = ray_ipc_send(h, lq);
+    ray_release(lq);
+    TEST_ASSERT_NOT_NULL(lres);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lres));
+    TEST_ASSERT_EQ_I(lres->i64, 21);
+    ray_release(lres);
 
     ray_ipc_close(h);
     poll_stop(poll, port);

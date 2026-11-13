@@ -116,16 +116,19 @@
 (try (apply + (list 1 2) 42) (fn [e] "err")) -- "err"
 
 ;; Normal apply (zip two lists)
-(apply + (list 1 2 3) (list 10 20 30)) -- (list 11 22 33)
+(apply + (list 1 2 3) (list 10 20 30)) -- [11 22 33]
+(type (apply + (list 1 2 3) (list 10 20 30))) -- 'I64
 
 ;; Apply with lazy args (line 610)
-(apply + (reverse (list 1 2 3)) (list 10 20 30)) -- (list 13 22 31)
+(apply + (reverse (list 1 2 3)) (list 10 20 30)) -- [13 22 31]
+(type (apply + (reverse (list 1 2 3)) (list 10 20 30))) -- 'I64
 
 ;; Apply error propagation (lines 638-641)
 (try (apply (fn [a b] (if (> a 1) (raise 66) (+ a b))) (list 0 1 2) (list 10 20 30)) (fn [e] e)) -- 66
 
 ;; Apply with mismatched lengths → truncates to shorter
-(apply + (list 1 2) (list 10 20 30)) -- (list 11 22)
+(apply + (list 1 2) (list 10 20 30)) -- [11 22]
+(type (apply + (list 1 2) (list 10 20 30))) -- 'I64
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; Section 7: atom_eq edge cases (lines 654-711)

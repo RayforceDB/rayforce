@@ -358,6 +358,30 @@ Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (
 
     - **Do not use `pmap` as a parallel task scheduler.** It is currently a sequential alias for `map`, including for large inputs and expensive lambdas. Builtins inside a callback may use workers independently, but the callback invocations themselves remain sequential. For independent backtest configurations or other Rayfall task sweeps, use separate processes with an explicit per-process worker budget; see [Multiple Instances](instances.md).
 
+## 11. Linear Regression { #linear-regression }
+
+**Problem:** Fit `y = a + b·x` to six observations.
+
+A matrix is a list of rows, so the design matrix holds one row per regressor: a row of ones for the intercept and a row of `x`.
+
+```lisp
+(set x [1.0 2.0 3.0 4.0 5.0 6.0])
+(set y [3.1 4.9 7.2 8.8 11.1 13.0])
+(set A (list [1.0 1.0 1.0 1.0 1.0 1.0] x))
+
+(lsq y A)   ; [1.05 1.99]   intercept, slope
+```
+
+`lsq` solves the least-squares problem by QR factorization and raises `domain` when the regressors are linearly dependent. The same coefficients come from the normal equations, which `gram` forms without building the transpose:
+
+```lisp
+(gram A)                          ; [[6.0 21.0] [21.0 91.0]]   A mmu flip A
+(mmu A y)                         ; [48.1 203.2]
+(mmu (inv (gram A)) (mmu A y))    ; [1.05 1.99]
+```
+
+Prefer `lsq`: forming the normal equations squares the condition number, so nearly dependent regressors lose precision there first. Integer columns are accepted and widened to F64.
+
 ## Next Steps
 
 - [**Data Persistence**](storage.md) — Columnar files, splayed tables, partitioned storage

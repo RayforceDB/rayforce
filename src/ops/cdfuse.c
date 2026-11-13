@@ -152,19 +152,31 @@ static bool cdf_repeat(cdf_recent_t* recent, uint64_t hash, int64_t key, int64_t
     entry->key = key; entry->value = value; entry->used = true;
     return false;
 }
+/* Sample i of 1024 (nrows > 1024): a row of the i-th of 1024 equal shards
+ * of rows [0, nrows - 1), so the samples are distinct rows and each has a
+ * next row (rows `row` and `row + 1` are read). */
 static inline int64_t cdf_sample_row(int64_t nrows, int i) {
-    int64_t step = nrows / 1024;
+    int64_t step = (nrows - 1) / 1024;
     return i * step + ray_hash_i64(i) % step;
 }
+/* Preaggregation pays when a pair recurs within the recent table's reach:
+ * a pair seen again at a distant sample (a hot pair), or a pair equal to
+ * the one on the next row (runs, as in a column clustered by the key). */
+static _Atomic(uint64_t) g_cdf_preaggregated;
+uint64_t ray_cd_test_preaggregated(void) { return atomic_load(&g_cdf_preaggregated); }
+int64_t ray_cd_test_sample_row(int64_t nrows, int i) { return cdf_sample_row(nrows, i); }
 static bool cdf_sample_repetition(const cdf_p1_ctx_t* c) {
-    if (c->nrows < 1024) return false;
+    if (c->nrows <= 1024) return false;
     cdf_recent_t recent[64] = {{0}};
     int repeats = 0;
     for (int i = 0; i < 1024; i++) {
         int64_t row = cdf_sample_row(c->nrows, i);
         int64_t key = cdf_read(c->kdata, row, c->ktype, c->kattrs);
         int64_t value = cdf_read(c->vdata, row, c->vtype, c->vattrs);
-        repeats += cdf_repeat(recent, cdf_pair_hash(key, value), key, value);
+        if (cdf_repeat(recent, cdf_pair_hash(key, value), key, value) ||
+            (cdf_read(c->kdata, row + 1, c->ktype, c->kattrs) == key &&
+             cdf_read(c->vdata, row + 1, c->vtype, c->vattrs) == value))
+            repeats++;
     }
     return repeats >= 128;
 }
@@ -689,7 +701,7 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         .nrows = nrows,
         .oom = 0, .rows_done = 0,
     };
-    if (nrows >= 1024) {
+    if (nrows > 1024) {
         bool kc = ray_col_cold(key_col), vc = ray_col_cold(val_col);
         for (int i = 0; (kc || vc) && i < 1024; i++) {
             if (kc) ray_col_want_row(key_col, cdf_sample_row(nrows, i));
@@ -697,7 +709,10 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
         }
     }
     p1.dedup = cdf_sample_repetition(&p1);
-    if (p1.dedup) ray_profile_tick("count-distinct: source preaggregation");
+    if (p1.dedup) {
+        atomic_fetch_add_explicit(&g_cdf_preaggregated, 1, memory_order_relaxed);
+        ray_profile_tick("count-distinct: source preaggregation");
+    }
     ray_profile_tick("count-distinct: prepared");
     ray_pool_dispatch_n(pool, cdf_p1_hist, &p1, nw);
     if (atomic_load(&p1.oom) || atomic_load(&p1.rows_done) != nrows) {

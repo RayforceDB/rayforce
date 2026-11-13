@@ -48,17 +48,17 @@ Finite values beyond the F32 range saturate just as casts do. F32 values
 print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.
 
-F64 values have a null sentinel but no positive or negative infinity value.
-Non-finite F64 arithmetic results are returned as null, so an overflowed result
-is treated as missing by null-aware operations such as `fill` and aggregates,
-except where a vector kernel does not flag the null it produces: `(sums [1e308 1e308])`
-ends in a null that `fill` replaces but `nil?` does not report, and `avg` and `sum` of it
-return `0Nf` instead of skipping it (see the exceptions in
-[Floats](../language/syntax.md#floats)).
-This differs from systems that retain IEEE infinities as values. F32
-arithmetic does not do this: an overflowing F32 result keeps the IEEE infinity
-and prints as `infe` or `-infe`, which `nil?` and `fill` do not treat as null
-(for example `(* 1e38e 10e)` is `infe`).
+F64 and F32 values have a null sentinel but no positive or negative infinity
+value. Non-finite arithmetic results are returned as null (`0Nf`, `0Ne`), so an
+overflowed result is treated as missing by null-aware operations such as `fill`
+and aggregates, except where a vector kernel does not flag the null it produces:
+`(sums [1e308 1e308])` ends in a null that `fill` replaces but `nil?` does not
+report, and `avg` and `sum` of it return `0Nf` instead of skipping it (see the
+exception in [Floats](../language/syntax.md#floats)).
+This differs from systems that retain IEEE infinities as values. An overflowing
+F32 result is null just as an F64 one is: `(* 1e38e 10e)` is `0Ne`, and `nil?`
+is true for it. Only an explicit `as 'F32` cast or an F32 literal saturates at
+the F32 limits.
 
 Casting F32 to STR instead produces plain numeric text without the literal
 suffix (for example, `(as 'STR 1.5e)` returns `"1.5"`). It uses nine
