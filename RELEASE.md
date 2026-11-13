@@ -28,27 +28,45 @@ truth for the version** — no version literal is ever hand-edited in source.
      at compile time (`make dist RAY_VERSION=X.Y.Z`),
    - packages `rayforce-X.Y.Z-<os>-<arch>.tar.gz` + a `.sha256` checksum,
    - publishes a GitHub Release with a feature-oriented changelog and the
-     artifacts.
-5. **Merge `master` back into `dev`** right after the release PR merges:
+     artifacts,
+   - merges the release commit back into `dev`, without changing any files.
 
-   ```sh
-   git fetch origin
-   git switch dev && git pull --ff-only
-   git merge --no-ff -s ours origin/master \
-     -m "chore: merge master back into dev after the vX.Y.Z release (#N)"
-   git diff origin/dev --stat   # must print nothing
-   git push origin dev
-   ```
+### Merge-back into `dev`
 
-   Merging the release PR leaves a squash or merge commit on `master` that `dev`
-   doesn't contain. `master` requires branches to be up to date before merging,
-   so without this step the next release PR is blocked as "out of date with the
-   base". After a squash, it also shows conflicts that aren't real. Copying the
-   release commit onto `dev` doesn't help: only a merge makes `master`'s commit
-   an ancestor of `dev`. `-s ours` is correct because `dev` already contains
-   everything the release shipped, so the empty `git diff` proves the merge
-   changed no files. If `master` ever carries a hotfix that isn't on `dev`,
-   drop `-s ours` and do a normal merge instead.
+Merging the release PR leaves a squash or merge commit on `master` that `dev`
+doesn't contain. `master` requires branches to be up to date before merging, so
+without a merge-back the next release PR is blocked as "out of date with the
+base". After a squash, it also shows conflicts that aren't real. Copying the
+release commit onto `dev` doesn't help: only a merge makes `master`'s commit an
+ancestor of `dev`. It also has to happen *after* the release PR merges, because
+the commit doesn't exist before then.
+
+The Release workflow's **merge-back** job does this with
+`.github/release-merge-back.sh`, run from the release commit and pushing with the
+`PAT` secret. A manual dispatch skips the job. If the job failed only because it
+could not push, or was skipped, run the same helper by hand with the release PR's
+own SHAs, so it applies the same checks:
+
+```sh
+pr=N                      # the release PR
+ver=X.Y.Z
+release=$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid)
+head=$(gh pr view "$pr" --json headRefOid -q .headRefOid)
+git fetch origin
+git worktree add --detach /tmp/merge-back "$release"
+cp /tmp/merge-back/.github/release-merge-back.sh /tmp/merge-back.sh
+(cd /tmp/merge-back && bash /tmp/merge-back.sh "$ver" "$pr" "$release" "$head")
+git worktree remove /tmp/merge-back
+```
+
+The helper does a `-s ours` merge, which is correct only when `dev` already
+contains everything the release shipped. It checks that first: the release
+commit must have the same tree as the PR head, and `dev` must contain the PR
+head. If either check fails (the error annotation says which), `master` carries
+changes of its own, such as a hotfix, and a `-s ours` merge would silently drop
+them. Do not work around it: merge `master` into `dev` normally through a PR,
+review the diff, and land it with a merge commit, since a squash loses the
+ancestry.
 
 That's the whole ritual. **Never edit the version in source to make a release** —
 the tag is authoritative.

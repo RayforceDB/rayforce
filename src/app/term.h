@@ -204,6 +204,12 @@ void ray_term_install_signals(ray_term_t* term);
 int  ray_term_interrupted(void);
 void ray_term_clear_interrupt(void);
 
+/* Read end of a pipe the SIGINT handler writes a byte to (created on first
+ * call; -1 where unsupported), for a poll loop to wake on; and a drain of
+ * the bytes it holds. */
+int  ray_term_sigint_fd(void);
+void ray_term_sigint_drain(void);
+
 /* Temporarily enable ISIG so Ctrl-C generates SIGINT during eval.
  * Call ray_term_eval_end() to restore raw mode after eval returns. */
 void ray_term_eval_begin(ray_term_t* term);

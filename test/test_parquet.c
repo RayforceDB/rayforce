@@ -16,6 +16,7 @@
 #include "store/part.h"
 #include "store/splay.h"
 #include "ops/idxop.h"
+#include "vec/str.h"        /* ray_str_t: the pooled-descriptor checks */
 #include "core/runtime.h"   /* ray_error_msg: the skeptic probes */
 #include "core/profile.h"   /* ray_profile_now_ns: pq_pool's bounded wait */
 #include "core/crc32.h"     /* ray_crc32: page checksums of the made files */
@@ -953,6 +954,244 @@ static test_result_t test_pq_cert_admission(void) {
     PASS();
 #endif
 }
+/* PLAIN OPTIONAL BYTE_ARRAY values through every string representation:
+ * null, empty, 3-byte and 12-byte inline, 13-byte and 200-byte pooled. */
+static const char* pq_plain_str_widths(int64_t r, char* buf, uint32_t* len) {
+    switch (r % 6) {
+    case 0: return NULL;
+    case 1: *len = 0; return "";
+    case 2: memcpy(buf,"abc",3); *len = 3; return buf;
+    case 3: memcpy(buf,"twelve-bytes",12); *len = 12; return buf;
+    case 4: memcpy(buf,"thirteen-byte",13); *len = 13; return buf;
+    default: {
+        for (int i = 0; i < 200; i++) buf[i] = (char)('a' + (int)((r + i) % 26));
+        *len = 200; return buf;
+    }
+    }
+}
+/* Every value present, inline and pooled, valid UTF-8. */
+static const char* pq_plain_str_valid(int64_t r, char* buf, uint32_t* len) {
+    if (r % 2 == 0) {
+        for (int i = 0; i < 200; i++) buf[i] = (char)('a' + (int)((r + i) % 26));
+        *len = 200; return buf;
+    }
+    memcpy(buf,"inline-value",12); *len = 12; return buf;
+}
+/* A pooled value and an inline one before invalid UTF-8 at row 3, so a
+ * strict read fails after the batch's string pool already holds bytes. */
+static const char* pq_plain_str_badutf(int64_t r, char* buf, uint32_t* len) {
+    uint8_t bad[] = {0xe2,0x82};
+    switch (r % 4) {
+    case 0: memcpy(buf,"thirteen-byte",13); *len = 13; return buf;
+    case 1: memcpy(buf,"abc",3); *len = 3; return buf;
+    case 2: memcpy(buf,"twelve-bytes",12); *len = 12; return buf;
+    default: memcpy(buf,bad,sizeof(bad)); *len = (uint32_t)sizeof(bad); return buf;
+    }
+}
+/* Every value is the non-null empty string. */
+static const char* pq_plain_str_empty(int64_t r, char* buf, uint32_t* len) {
+    (void)r; (void)buf; *len = 0; return "";
+}
+/* Every s-column value of batch t is fn's row `base+i` (a null and "" both
+ * read as length 0), and the in-band null test agrees with the length. */
+static bool pq_plain_str_batch(ray_t* t, int64_t base, int64_t rows, pq_synth_fn fn) {
+    ray_t* s = ray_table_get_col_idx(t,1);
+    char buf[256];
+    for (int64_t i = 0; i < ray_table_nrows(t); i++) {
+        uint32_t len = 0;
+        const char* want = pq_synth_row(fn,1,base+i,rows,buf,&len);
+        if (!want) len = 0;
+        size_t got = 0;
+        const char* p = ray_str_vec_get(s,i,&got);
+        if (got != len || (len && memcmp(p,want,len))) return false;
+        if (ray_vec_is_null(s,i) != (len == 0)) return false;
+    }
+    return true;
+}
+static ray_t* pq_strict_options(void) {
+    int64_t keys[] = {ray_sym_intern("strict",6)};
+    ray_t* vals = ray_list_new(1);
+    if (!vals) return NULL;
+    ((ray_t**)ray_data(vals))[0] = ray_bool(true); vals->len = 1;
+    return ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,1),vals);
+}
+/* A retained batch keeps inline and pooled strings valid across the next
+ * reads and the reader close, and a later mutation of a retained column
+ * copy-outs the pool instead of touching the batch's bytes. */
+static test_result_t test_pq_plain_str_ownership(void) {
+    char path[160];
+    const int64_t rows = 4096;
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-plainstr-own-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(path,rows,2,pq_plain_str_widths));
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,100,&r));
+    ray_t* kept = ray_parquet_next(r);
+    TEST_ASSERT_TRUE(kept && !RAY_IS_ERR(kept));
+    TEST_ASSERT_EQ_I(ray_table_nrows(kept),100);
+    TEST_ASSERT_TRUE(pq_plain_str_batch(kept,0,rows,pq_plain_str_widths));
+    ray_t* col = ray_table_get_col_idx(kept,1);
+    ray_str_t* d = (ray_str_t*)ray_data(col);
+    TEST_ASSERT_TRUE(d[4].len == 13 && !ray_str_is_inline(&d[4]));
+    TEST_ASSERT_TRUE(d[5].len == 200 && !ray_str_is_inline(&d[5]));
+    TEST_ASSERT_NOT_NULL(col->str_pool);
+    TEST_ASSERT_TRUE(d[4].hash32 != 0 && d[5].hash32 != 0);
+    int64_t total = 100;
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(pq_plain_str_batch(t,total,rows,pq_plain_str_widths));
+        total += ray_table_nrows(t);
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(total,rows);
+    ray_parquet_close(r);
+    /* Later reads and the close must not reach the retained batch's bytes. */
+    TEST_ASSERT_TRUE(pq_plain_str_batch(kept,0,rows,pq_plain_str_widths));
+    /* The retain makes the column refcount > 1, so ray_str_vec_set copies
+     * header and pool; the test owns the returned vector, the table keeps
+     * the original. */
+    ray_retain(col);
+    ray_t* mod = ray_str_vec_set(col,4,"replacement-that-is-pooled",26);
+    TEST_ASSERT_TRUE(mod && !RAY_IS_ERR(mod));
+    TEST_ASSERT_TRUE(mod != col);
+    TEST_ASSERT_TRUE(mod->str_pool != col->str_pool);
+    size_t n = 0; const char* p = ray_str_vec_get(mod,4,&n);
+    TEST_ASSERT_EQ_I(n,26);
+    TEST_ASSERT_TRUE(!memcmp(p,"replacement-that-is-pooled",26));
+    TEST_ASSERT_TRUE(pq_plain_str_batch(kept,0,rows,pq_plain_str_widths));
+    ray_release(mod);
+    ray_release(kept);
+    unlink(path);
+    PASS();
+}
+/* Null/empty/strict/conversion semantics of the PLAIN string lane across
+ * partial batches; a strict rejection happens after the pool is built. */
+static test_result_t test_pq_plain_str_semantics(void) {
+    char path[160], valid[160], bad[160], empty[160];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-plainstr-sem-%d.parquet",(int)getpid());
+    snprintf(valid,sizeof(valid),"/tmp/rayforce-pq-plainstr-valid-%d.parquet",(int)getpid());
+    snprintf(bad,sizeof(bad),"/tmp/rayforce-pq-plainstr-badutf-%d.parquet",(int)getpid());
+    snprintf(empty,sizeof(empty),"/tmp/rayforce-pq-plainstr-empty-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(path,4096,2,pq_plain_str_widths));
+    int64_t batches[] = {1,7,100,4096};
+    for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++) {
+        ray_parquet_t* r = NULL;
+        TEST_ASSERT_NULL(ray_parquet_open(path,NULL,batches[b],&r));
+        int64_t total = 0;
+        for (;;) {
+            ray_t* t = ray_parquet_next(r);
+            if (!t) break;
+            TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+            TEST_ASSERT_TRUE(pq_plain_str_batch(t,total,4096,pq_plain_str_widths));
+            total += ray_table_nrows(t);
+            if (!total || total == ray_table_nrows(t)) {
+                TEST_ASSERT_TRUE(ray_table_get_col_idx(t,1)->attrs & RAY_ATTR_HAS_NULLS);
+            }
+            ray_release(t);
+        }
+        TEST_ASSERT_EQ_I(total,4096);
+        ray_parquet_close(r);
+    }
+    /* A batch of only empty strings: the in-band null written by the PLAIN
+     * path must still mark the vector HAS_NULLS. */
+    TEST_ASSERT_TRUE(pq_synth(empty,64,2,pq_plain_str_empty));
+    ray_parquet_t* er = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(empty,NULL,7,&er));
+    ray_t* et = ray_parquet_next(er);
+    TEST_ASSERT_TRUE(et && !RAY_IS_ERR(et));
+    TEST_ASSERT_TRUE(ray_table_get_col_idx(et,1)->attrs & RAY_ATTR_HAS_NULLS);
+    for (int64_t i = 0; i < ray_table_nrows(et); i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(ray_table_get_col_idx(et,1),i));
+    ray_release(et);
+    ray_parquet_close(er);
+    unlink(empty);
+    /* Strict refuses a non-null empty string (the in-band STR null). */
+    ray_t* opts = pq_strict_options();
+    TEST_ASSERT_NOT_NULL(opts);
+    ray_t* e = ray_parquet_read(path,opts);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_err_code(e) && !strcmp(ray_err_code(e),"parquet"));
+    ray_error_free(e);
+    unlink(path);
+    /* Strict accepts every present, valid value (inline and pooled). */
+    TEST_ASSERT_TRUE(pq_synth(valid,4096,2,pq_plain_str_valid));
+    ray_t* t = ray_parquet_read(valid,opts);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(pq_plain_str_batch(t,0,4096,pq_plain_str_valid));
+    TEST_ASSERT_FALSE(ray_table_get_col_idx(t,1)->attrs & RAY_ATTR_HAS_NULLS);
+    ray_release(t);
+    unlink(valid);
+    /* Non-strict keeps invalid bytes; strict refuses them after the batch
+     * already owns a pooled value. */
+    TEST_ASSERT_TRUE(pq_synth(bad,4096,2,pq_plain_str_badutf));
+    t = ray_parquet_read(bad,NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(pq_plain_str_batch(t,0,4096,pq_plain_str_badutf));
+    ray_release(t);
+    e = ray_parquet_read(bad,opts);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_err_code(e) && !strcmp(ray_err_code(e),"parquet"));
+    ray_error_free(e);
+    unlink(bad);
+    ray_release(opts);
+    PASS();
+}
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+static void* pq_plain_str_cancel_thread(void* p) {
+    long ms = (long)(intptr_t)p;
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts,NULL);
+    ray_request_interrupt();
+    return NULL;
+}
+/* A cancel requested while a batch of strings decodes is observed at
+ * the next next() entry (the first batch completes; mid-decode
+ * interruption at the per-1024 checkpoint is unchanged by this patch
+ * and not witnessed by this test); the reader then refuses further
+ * batches and a fresh reader decodes the whole file. */
+static test_result_t test_pq_plain_str_cancel(void) {
+    char path[160];
+    const int64_t rows = 131072;
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-plainstr-cancel-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(path,rows,2,pq_plain_str_valid));
+    ray_clear_interrupt();
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,65536,&r));
+    pthread_t th;
+    TEST_ASSERT_EQ_I(pthread_create(&th,NULL,pq_plain_str_cancel_thread,(void*)(intptr_t)1),0);
+    ray_t* t = ray_parquet_next(r);
+    pthread_join(th,NULL);
+    if (t && RAY_IS_ERR(t)) {
+        TEST_ASSERT_TRUE(ray_err_code(t) && !strcmp(ray_err_code(t),"cancel"));
+        ray_error_free(t);
+    } else {
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_release(t);
+        ray_t* t2 = ray_parquet_next(r);
+        TEST_ASSERT_TRUE(t2 && RAY_IS_ERR(t2));
+        TEST_ASSERT_TRUE(ray_err_code(t2) && !strcmp(ray_err_code(t2),"cancel"));
+        ray_error_free(t2);
+    }
+    ray_clear_interrupt();
+    ray_parquet_close(r);
+    r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,65536,&r));
+    int64_t total = 0;
+    for (;;) {
+        t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(pq_plain_str_batch(t,total,rows,pq_plain_str_valid));
+        total += ray_table_nrows(t);
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(total,rows);
+    ray_parquet_close(r);
+    unlink(path);
+    PASS();
+}
+#endif
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
@@ -4614,6 +4853,11 @@ const test_entry_t parquet_entries[] = {
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},
     {"parquet/cert_admission",test_pq_cert_admission,pq_setup,pq_teardown},
+    {"parquet/plain_str_ownership",test_pq_plain_str_ownership,pq_setup,pq_teardown},
+    {"parquet/plain_str_semantics",test_pq_plain_str_semantics,pq_setup,pq_teardown},
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    {"parquet/plain_str_cancel",test_pq_plain_str_cancel,pq_setup,pq_teardown},
+#endif
     {"parquet/read_metadata",test_pq_read_meta,pq_setup,pq_teardown},
     {"parquet/corrupt",test_pq_corrupt,pq_setup,pq_teardown},
     {"parquet/native",test_pq_native,pq_setup,pq_teardown},
