@@ -109,6 +109,7 @@
 #include <errno.h>
 #if defined(RAY_OS_WINDOWS)
 #include <process.h>
+#include <io.h>                    /* _chsize_s: dom_ftruncate */
 #define dom_pid() ((unsigned long long)_getpid())
 #else
 #include <unistd.h>
@@ -272,6 +273,9 @@ struct ray_sym_domain_s {
      * created domain with no file yet). */
     void*     map;
     size_t    map_size;
+    size_t    map_end;     /* where the mapping's `base_count` records end: the
+                            * header count is authoritative, so bytes past it
+                            * (a torn append's tail) are ignored */
     ray_file_id_t map_id;  /* the mapped file's identity (from its descriptor) */
     int64_t   base_count;  /* entries that came from the mapping */
 
@@ -280,6 +284,10 @@ struct ray_sym_domain_s {
      * file at that point (cache-hit revalidation key). */
     int64_t   disk_count;
     size_t    disk_size;
+    size_t    disk_end;    /* where the `disk_count` records end (<= disk_size) */
+    int64_t   sync_count;  /* entries known to be synced to media: a durable
+                            * append flush with nothing new and nothing
+                            * unsynced writes and syncs nothing */
     ray_file_id_t disk_id; /* identity of the last persisted image, not map */
 
     /* FILE: published vocabulary — (atoms, count) pair.  atoms[i] is the
@@ -1263,11 +1271,56 @@ void ray_sym_domain_index_remove(const char* path) {
     if (path && dom_ix_name(ip, sizeof(ip), path, "")) (void)remove(ip);
 }
 
+static _Atomic(void (*)(int, const char*)) g_dom_test_hook;
+
+void ray_sym_domain_test_hook(void (*fn)(int event, const char* path)) {
+    atomic_store_explicit(&g_dom_test_hook, fn, memory_order_relaxed);
+}
+
+static inline void dom_event(int ev, const char* path) {
+    void (*fn)(int, const char*) = atomic_load_explicit(&g_dom_test_hook, memory_order_relaxed);
+    if (fn) fn(ev, path);
+}
+
+/* The header count of the symfile at `path`, or -1, and its inode.  Read
+ * BEFORE the file is mapped: an append in place writes its records before
+ * it writes the count, so a mapping of the same inode taken after this
+ * read covers the records of the count read here, where the count in the
+ * mapped header may already be a later append's, over a mapping that stops
+ * short of its records.  The caller parses by this count when the mapping
+ * is of that inode (dom_map_count); a file renamed in between was written
+ * whole, and its own header's count holds, as it does when this read
+ * failed. */
+static int64_t dom_header_count(const char* path, uint64_t* ino) {
+    uint8_t h[12];
+    *ino = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0) *ino = (uint64_t)st.st_ino;
+    size_t n = fread(h, 1, sizeof(h), f);
+    fclose(f);
+    int64_t c = -1;
+    if (n == sizeof(h)) memcpy(&c, h + 4, 8);
+    return c;
+}
+
+/* The count to parse the mapping `m` (id `id`) by: dom_header_count's when
+ * it read the mapped inode (or no identity is kept here), else the mapped
+ * header's. */
+static int64_t dom_map_count(const uint8_t* m, const ray_file_id_t* id, int64_t hcount, uint64_t hino) {
+    if (hcount >= 0 && (!id->valid || id->ino == hino)) return hcount;
+    int64_t c;
+    memcpy(&c, m + 4, 8);
+    return c;
+}
+
 /* The block table of the mapped image of `d` (its `count` entries per the
  * header): from the index file when it is this file's, else by one walk of
- * all the records (read with explicit reads, dom_src_t), the index then
- * written for the file.  False when a read of the file fails, when its
- * records do not end at its end (a truncated file), or on OOM. */
+ * the `count` records (read with explicit reads, dom_src_t), the index then
+ * written for the file.  Bytes past the last record are ignored (a torn
+ * append's tail).  False when a read of the file fails, when the records
+ * run past its end (a truncated file), or on OOM. */
 static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
     const uint8_t* map = (const uint8_t*)d->map;
     size_t size = d->map_size;
@@ -1281,24 +1334,25 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
     } else {
         b = dom_blk_new(count, true);
         if (!b) return false;
-        b->end = size;
         size_t o = d->rec0;
         dom_src_t src;
         if (!dom_src_open(&src, d->path, &d->map_id, size)) src = dom_src_map(map, size);
-        bool walked = dom_blk_walk_src(&src, b, 0, &o, d->z) && o == size;
+        bool walked = dom_blk_walk_src(&src, b, 0, &o, d->z) && o <= size;
         dom_src_close(&src);
         if (!walked) { ray_sys_free(b); return false; }
+        b->end = o;
     }
     d->blk = b;
+    d->map_end = b->end;
     d->ix_used = have;
     d->ix_count = have ? count : 0;
     d->ix_end = have ? size : 0;
     d->ix_covered = have ? count : 0;
-    if (!have && count > 0 && size >= dom_ix_min()) {
+    if (!have && count > 0 && b->end >= dom_ix_min()) {
         dom_blk_save(d->path, map, size, b, &d->map_id);
         d->ix_count = count;
-        d->ix_end = size;
-    } else if (!have && size < dom_ix_min()) {
+        d->ix_end = b->end;
+    } else if (!have && b->end < dom_ix_min()) {
         ray_sym_domain_index_remove(d->path);   /* one left by a larger file of the name */
     }
     return true;
@@ -1330,21 +1384,22 @@ static ray_t* dom_atom_at_locked(ray_sym_domain_t* d, int64_t pos) {
 static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     if (d->z) return false;   /* a compressed file grows only by this process's flushes */
     int64_t count = atomic_load_explicit(&d->count, memory_order_relaxed);
-    if (st_size < d->disk_size) return false;       /* shrunk: rewritten */
+    if (st_size < d->disk_end) return false;        /* shrunk below its records: rewritten */
     if (count != d->disk_count) return false;       /* our tail is dirty */
 
+    uint64_t hino;
+    int64_t fresh_count = dom_header_count(d->path, &hino);   /* before the map: see there */
+    dom_event(RAY_SYM_DOMAIN_EV_HEADER, d->path);
     size_t map_size = 0;
     ray_file_id_t nid;
     void* map = ray_vm_map_file_id(d->path, &map_size, &nid);
     if (!map) return false;
+    dom_event(RAY_SYM_DOMAIN_EV_MAPPED, d->path);
     const uint8_t* nbase = (const uint8_t*)map;     /* new image bytes */
 
-    int64_t fresh_count = -1;
     bool ok = map_size >= 12 && dom_rd32(nbase) == DOMAIN_STRL_MAGIC;
-    if (ok) {
-        memcpy(&fresh_count, nbase + 4, 8);
-        ok = fresh_count >= count && fresh_count <= (int64_t)UINT32_MAX;
-    }
+    if (ok) fresh_count = dom_map_count(nbase, &nid, fresh_count, hino);
+    if (ok) ok = fresh_count >= count && fresh_count <= (int64_t)UINT32_MAX;
 
     /* Position-0 reservation also holds for externally grown files: the
      * first record of a non-empty file must be the empty string. */
@@ -1377,19 +1432,19 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
         if (!nb) {
             nb = dom_blk_new(fresh_count, true);
             if (!nb) { ok = false; break; }
-            nb->end = map_size;
             size_t o = 12;
             dom_src_t src;
             if (!dom_src_open(&src, d->path, &nid, map_size)) src = dom_src_map(nbase, map_size);
-            bool walked = dom_blk_walk_src(&src, nb, 0, &o, NULL) && o == map_size;
+            bool walked = dom_blk_walk_src(&src, nb, 0, &o, NULL) && o <= map_size;
             dom_src_close(&src);
             if (!walked) { ray_sys_free(nb); nb = NULL; ok = false; break; }
+            nb->end = o;
         }
         from_ix = pass == 0;
         bool good = true;
         if (d->base_count > 0) {
             int64_t full = d->base_count / DOM_IX_STRIDE;
-            good = map_size >= d->map_size;
+            good = nb->end >= d->map_end;
             for (int64_t k = 0; good && k < full; k++)
                 good = nb->ib[k].off == ob->ib[k].off && dom_blk_lim(nb, k) == dom_blk_lim(ob, k) &&
                        memcmp(nb->ib[k].len, ob->ib[k].len, sizeof(nb->ib[k].len)) == 0;
@@ -1397,16 +1452,16 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
                 good = nb->ib[full].len[i - full * DOM_IX_STRIDE] == ob->ib[full].len[i - full * DOM_IX_STRIDE];
             if (good && full < ob->n) {
                 uint64_t at = ob->ib[full].off;
-                good = at <= d->map_size && at <= map_size && nb->ib[full].off == at &&
-                       memcmp(nbase + at, obase + at, d->map_size - (size_t)at) == 0;
+                good = at <= d->map_end && at <= map_size && nb->ib[full].off == at &&
+                       memcmp(nbase + at, obase + at, d->map_end - (size_t)at) == 0;
             }
             if (good) {
-                size_t hb = d->map_size - 12 < DOM_IX_HEAD ? d->map_size - 12 : DOM_IX_HEAD;
+                size_t hb = d->map_end - 12 < DOM_IX_HEAD ? d->map_end - 12 : DOM_IX_HEAD;
                 good = memcmp(nbase + 12, obase + 12, hb) == 0;
             }
         }
         /* the entries this process flushed past the mapping, in order */
-        size_t ro = d->base_count > 0 ? d->map_size : 12;
+        size_t ro = d->base_count > 0 ? d->map_end : 12;
         for (int64_t i = d->base_count; good && i < count; i++) {
             ray_t* a = dom_slot_get(cur, i);
             good = a && (i % DOM_IX_STRIDE || nb->ib[i / DOM_IX_STRIDE].off == ro) &&
@@ -1441,6 +1496,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
              * retires instead.  Retiring until the domain dies here was
              * #717: a replica never lets its domain die. */
             dom_blk_t* old_blk = d->blk;
+            size_t nend = nb->end;
             d->blk = nb;
             d->map_id = nid;
             d->disk_id = nid;
@@ -1454,6 +1510,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             size_t old_map_size = d->map_size;
             d->map = map;
             d->map_size = map_size;
+            d->map_end = nend;
             d->base_count = fresh_count;
             /* every flushed entry is in the mapping now */
             dom_ck_free(&d->wck);
@@ -1463,6 +1520,8 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             atomic_store_explicit(&d->count, fresh_count, memory_order_release);
             d->disk_count = fresh_count;
             d->disk_size = st_size;
+            d->disk_end = nend;
+            d->sync_count = fresh_count;
             /* The new snapshot record must be published before the old
              * generation goes.  When its allocation fails the old record
              * stays published and still points at the old checkpoints and
@@ -1517,7 +1576,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
 
     /* Failure, or nothing actually new (size-only change): drop the fresh
      * table and the new mapping; keep the existing image. */
-    if (ok && fresh_count == count) { d->disk_size = st_size; d->disk_id = nid; }
+    if (ok && fresh_count == count) { d->disk_size = st_size; d->disk_end = nb->end; d->disk_id = nid; }
     ray_sys_free(nb);
     if (nixm) ray_vm_unmap_file(nixm, nixs);
     ray_vm_unmap_file(map, map_size);
@@ -1666,9 +1725,18 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
             ray_file_id_t current_id = dom_stat_id(exists ? &st : NULL);
             /* A same-size replacement has no appended records to adopt.
              * Its old ids may now name different strings: fail loudly. */
-            bool replaced_same_size = cur_size == d->disk_size &&
+            /* Bytes past the counted records (disk_end) taken in at open or
+             * at an extend are a torn append's tail, or the records of
+             * another process's append that wrote its count only after the
+             * count here was read: with its count in the header the file
+             * has grown by them, though its size has not. */
+            uint64_t hino;
+            bool counted_tail = cur_size == d->disk_size && d->disk_size > d->disk_end &&
+                                dom_header_count(rpath, &hino) != d->disk_count;
+            bool replaced_same_size = !counted_tail && cur_size == d->disk_size &&
                                       dom_file_id_changed(&d->disk_id, &current_id);
             if (replaced_same_size ||
+                (counted_tail && !dom_extend_from_file_locked(d, cur_size)) ||
                 (cur_size != d->disk_size &&
                  !dom_extend_from_file_locked(d, cur_size))) {
                 dom_unlock();
@@ -1701,12 +1769,16 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         /* Mapped, not read: the records are reached through checkpoints
          * (the sparse record index above), from the index file when it is
          * valid, so opening reads only the index and the records after it. */
+        uint64_t hino;
+        int64_t hcount = dom_header_count(rpath, &hino);   /* before the map: see there */
+        dom_event(RAY_SYM_DOMAIN_EV_HEADER, rpath);
         d->map = ray_vm_map_file_id(rpath, &d->map_size, &d->map_id);
         d->disk_id = d->map_id;
+        if (d->map) dom_event(RAY_SYM_DOMAIN_EV_MAPPED, rpath);
         int64_t count = -1;
         const uint8_t* m = (const uint8_t*)d->map;
         if (m && d->map_size >= 12 && dom_rd32(m) == DOMAIN_STRL_MAGIC)
-            memcpy(&count, m + 4, 8);
+            count = dom_map_count(m, &d->map_id, hcount, hino);
         if (m && d->map_size >= DOM_Z_REC0 && dom_rd32(m) == DOMAIN_STRZ_MAGIC) {
             /* a compressed file: its symbol table (and the encoder's index,
              * for appends) is copied out of the header */
@@ -1716,7 +1788,7 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
                 memcpy(d->z, m + 12, DOM_Z_TAB);
                 ray_fsst_index_build(d->z, d->zix);
                 d->rec0 = DOM_Z_REC0;
-                memcpy(&count, m + 4, 8);
+                count = dom_map_count(m, &d->map_id, hcount, hino);
             }
         }
         if (count < 0 || count > (int64_t)UINT32_MAX || !dom_index_image(d, count)) {
@@ -1732,6 +1804,8 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
         (void)dom_publish_raw_snap(d, false);
         d->disk_count = count;
         d->disk_size = d->map_size;
+        d->disk_end = d->map_end;
+        d->sync_count = count;
     }
     /* create && !exists: empty domain — vocabulary appears via intern
      * ("" seeded at position 0) and reaches disk on first flush. */
@@ -2760,7 +2834,7 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     size_t  disk_size  = dom->disk_size;
     int64_t base_count = dom->base_count;
     const uint8_t* bmap = (const uint8_t*)dom->map;
-    size_t  bsize = dom->map_size;
+    size_t  bsize = dom->map_end;
     dom_dir_t* dir = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
     dom_unlock();
     if (count == disk_count) {
@@ -2887,6 +2961,7 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     dom_lock();
     dom->disk_count = count;
     dom->disk_size = written_size;
+    dom->disk_end = written_size;
     dom->disk_id = persisted_id;
     dom_ck_free(&dom->wck);
     dom->wck = tail;
@@ -2901,6 +2976,10 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
             return err;
         }
     }
+    /* durable: all on media; else a new file that nothing has synced */
+    dom_lock();
+    dom->sync_count = durable ? count : 0;
+    dom_unlock();
 
     dom_flush_index(dom, count, written_size);
     ray_file_unlock(lock_fd);
@@ -2923,16 +3002,44 @@ static bool dom_fseek(FILE* f, int64_t off) {
 #endif
 }
 
+/* Cut the file of `f` to `len` bytes. */
+static bool dom_ftruncate(FILE* f, int64_t len) {
+    if (fflush(f) != 0) return false;
+#ifdef RAY_OS_WINDOWS
+    return _chsize_s(_fileno(f), len) == 0;
+#else
+    return ftruncate(fileno(f), (off_t)len) == 0;
+#endif
+}
+
+static ray_err_t dom_sync_dir(const char* path) {
+    dom_event(RAY_SYM_DOMAIN_EV_SYNC_DIR, path);
+    return ray_file_sync_dir(path);
+}
+
+/* Sync the file at `path` to media. */
+static ray_err_t dom_sync_path(const char* path) {
+    dom_event(RAY_SYM_DOMAIN_EV_SYNC_FILE, path);
+    ray_fd_t fd = ray_file_open(path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+    if (fd == RAY_FD_INVALID) return RAY_ERR_IO;
+    ray_err_t err = ray_file_sync(fd);
+    ray_file_close(fd);
+    return err;
+}
+
 ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     if (!dom) return RAY_ERR_TYPE;
     if (dom->kind == DOM_RUNTIME) return RAY_OK;
     if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
     if (!dom->path) return RAY_ERR_DOMAIN;
 
+    /* Nothing to write, and (durable) nothing written earlier left unsynced:
+     * no write and no sync. */
     dom_lock();
-    bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count;
+    bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count ||
+                 (durable && dom->sync_count != dom->disk_count);
     dom_unlock();
-    if (!dirty && !durable) return RAY_OK;
+    if (!dirty) return RAY_OK;
 
     char lock_path[1024];
     if (snprintf(lock_path, sizeof(lock_path), "%s.lk", dom->path) >= (int)sizeof(lock_path))
@@ -2949,34 +3056,55 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     int64_t count = atomic_load_explicit(&dom->count, memory_order_relaxed);
     int64_t disk_count = dom->disk_count;
     size_t  disk_size  = dom->disk_size;
+    size_t  disk_end   = dom->disk_end;
+    int64_t sync_count = dom->sync_count;
     dom_dir_t* dir = atomic_load_explicit(&dom->atoms, memory_order_relaxed);
     dom_unlock();
-    if (count == disk_count && !durable) {
+    if (count == disk_count) {
+        /* all written; the earlier non-durable flushes' bytes are synced now */
+        if (durable && sync_count != disk_count) {
+            err = dom_sync_path(dom->path);
+            if (err == RAY_OK) err = dom_sync_dir(dom->path);
+            if (err == RAY_OK) {
+                dom_lock();
+                dom->sync_count = disk_count;
+                dom_unlock();
+            }
+        }
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
-        return RAY_OK;
+        return err;
     }
 
     /* The file must still be the persisted size: anything else is another
-     * writer. */
+     * writer.  A new file is made whole and renamed in (ray_sym_domain_flush):
+     * a failure then leaves no file, where one made in place would be left
+     * holding no count. */
     struct stat st;
-    bool exists = stat(dom->path, &st) == 0;
-    if (disk_count == 0 ? (exists && st.st_size > 0)
-                        : (!exists || (size_t)st.st_size != disk_size)) {
+    if (disk_count == 0 || stat(dom->path, &st) != 0 || (size_t)st.st_size != disk_size) {
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
-        return RAY_ERR_CORRUPT;
+        return disk_count == 0 ? ray_sym_domain_flush(dom, durable) : RAY_ERR_CORRUPT;
     }
-    if (disk_count == 0) ray_sym_domain_index_remove(dom->path);   /* a new file */
-    FILE* f = fopen(dom->path, disk_count == 0 ? "wb+" : "rb+");
+    FILE* f = fopen(dom->path, "rb+");
     if (!f) { ray_file_unlock(lock_fd); ray_file_close(lock_fd); return RAY_ERR_IO; }
-    size_t size = disk_size;
-    uint32_t magic = DOMAIN_STRL_MAGIC;
-    if (disk_count == 0) {
-        int64_t zero = 0;
-        if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&zero, 8, 1, f) != 1) err = RAY_ERR_IO;
-        size = 12;
-    } else if (!dom_fseek(f, (int64_t)disk_size)) {
+    /* The header must still count what this domain persisted: the bytes past
+     * disk_end are cut below as a torn tail, and with a later count they are
+     * another process's committed records (its append wrote them before this
+     * domain's open read the count, and its count after). */
+    uint32_t fmagic = 0;
+    int64_t fcount = -1;
+    if (fread(&fmagic, 4, 1, f) != 1 || fread(&fcount, 8, 1, f) != 1 ||
+        fmagic != (dom->z ? DOMAIN_STRZ_MAGIC : DOMAIN_STRL_MAGIC) || fcount != disk_count) {
+        fclose(f);
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_ERR_CORRUPT;   /* another writer */
+    }
+    size_t size = disk_end;
+    if (disk_size > disk_end && !dom_ftruncate(f, (int64_t)disk_end)) {
+        err = RAY_ERR_IO;   /* the tail of a torn append goes before the new records */
+    } else if (!dom_fseek(f, (int64_t)disk_end)) {
         err = RAY_ERR_IO;
     }
     dom_ck_t tail = {0};
@@ -3014,34 +3142,62 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     if (err == RAY_OK && wn && fwrite(wb, 1, wn, f) != wn) err = RAY_ERR_IO;
     ray_sys_free(wb);
     ray_sys_free(zb);
-    /* the count goes in last, once the records it covers are written */
-    if (err == RAY_OK && (fflush(f) != 0 || !dom_fseek(f, 4) ||
-                          fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0))
-        err = RAY_ERR_IO;
+    /* The count is the commit point: a durable flush has the records on
+     * media before it is written, so a power loss leaves either the old
+     * count (the records past it are ignored by the next open) or a count
+     * whose records are all there. */
+    if (err == RAY_OK && fflush(f) != 0) err = RAY_ERR_IO;
+    if (err == RAY_OK && durable) err = dom_sync_path(dom->path);
+    bool counted = false, cut = false;
+    if (err == RAY_OK) {
+        if (!dom_fseek(f, 4) || fwrite(&count, 8, 1, f) != 1 || fflush(f) != 0) err = RAY_ERR_IO;
+        else counted = true;
+    }
+    if (counted) dom_event(RAY_SYM_DOMAIN_EV_COUNT, dom->path);
+    /* Failed before the count: the file goes back to what it was, the old
+     * count over the old records and the new bytes cut (best effort), so a
+     * retry finds it at its persisted size. */
+    if (err != RAY_OK && !counted)
+        cut = dom_fseek(f, 4) && fwrite(&disk_count, 8, 1, f) == 1 && dom_ftruncate(f, (int64_t)disk_end);
     /* start writing the new records back now, so a later durable flush
      * waits for little */
     if (err == RAY_OK && !durable)
-        ray_file_writeback_start(fileno(f), (int64_t)disk_size, (int64_t)(size - disk_size));
+        ray_file_writeback_start(fileno(f), (int64_t)disk_end, (int64_t)(size - disk_end));
     if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    /* The directory entry changes only when the file is made: synced once,
+     * by the first durable flush after a non-durable or a new file's. */
     if (err == RAY_OK && durable) {
-        ray_fd_t fd = ray_file_open(dom->path, RAY_OPEN_READ | RAY_OPEN_WRITE);
-        if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
-        else { err = ray_file_sync(fd); ray_file_close(fd); }
-        if (err == RAY_OK) err = ray_file_sync_dir(dom->path);
+        err = dom_sync_path(dom->path);
+        if (err == RAY_OK && (disk_count == 0 || sync_count == 0)) err = dom_sync_dir(dom->path);
     }
-    if (err == RAY_OK) {
+    /* Once the count is written the file holds the new records: the state
+     * follows it even when a sync after fails (the entries left unsynced, so
+     * a durable retry syncs them). */
+    if (counted) {
         struct stat persisted_st;
         ray_file_id_t persisted_id = dom_stat_id(stat(dom->path, &persisted_st) == 0 ? &persisted_st : NULL);
+        bool ck = true;
         dom_lock();
         dom->disk_count = count;
         dom->disk_size = size;
+        dom->disk_end = size;
+        if (err == RAY_OK && durable) dom->sync_count = count;
         dom->disk_id = persisted_id;
-        for (int64_t k = 0; err == RAY_OK && k < tail.n; k++)
-            if (!dom_ck_push(&dom->wck, tail.v[k])) err = RAY_ERR_OOM;
-        if (err != RAY_OK) dom_ck_free(&dom->wck);   /* no index from here on */
+        for (int64_t k = 0; ck && k < tail.n; k++) ck = dom_ck_push(&dom->wck, tail.v[k]);
+        if (!ck) dom_ck_free(&dom->wck);   /* no index from here on (the index is a cache) */
         dom_unlock();
-        if (err == RAY_OK) dom_flush_index(dom, count, size);
-        err = RAY_OK;   /* the symfile is written; the index is a cache */
+        if (ck && err == RAY_OK) dom_flush_index(dom, count, size);
+    } else if (cut) {
+        /* The header rewrite and the cut moved the file's times: the file as
+         * it is now, at the persisted size again, is the persisted one (a
+         * cached open compares the path against this identity). */
+        struct stat cut_st;
+        bool whole = stat(dom->path, &cut_st) == 0 && (size_t)cut_st.st_size == disk_end;
+        ray_file_id_t cut_id = dom_stat_id(whole ? &cut_st : NULL);
+        dom_lock();
+        dom->disk_size = disk_end;
+        if (whole) dom->disk_id = cut_id;
+        dom_unlock();
     }
     dom_ck_free(&tail);
     ray_file_unlock(lock_fd);
@@ -3123,7 +3279,7 @@ ray_err_t ray_sym_domain_compress(const char* path) {
         size_t o = 12;
         dom_src_t src;
         if (b && !dom_src_open(&src, rpath, &id, size)) src = dom_src_map(map, size);
-        bool walked = b && dom_blk_walk_src(&src, b, 0, &o, NULL) && o == size;
+        bool walked = b && dom_blk_walk_src(&src, b, 0, &o, NULL) && o <= size;
         if (b) dom_src_close(&src);
         if (!walked) {
             ray_sys_free(b);
@@ -3131,13 +3287,13 @@ ray_err_t ray_sym_domain_compress(const char* path) {
             ray_sys_free(rpath);
             return b ? RAY_ERR_IO : RAY_ERR_OOM;
         }
-        b->end = size;
+        b->end = o;
     }
     ray_err_t err = RAY_OK;
     int64_t n = b->n;
 
     /* the training sample: every record of every sb-th block, some 1 MiB */
-    int64_t sb = (int64_t)((size - 12) >> 20);
+    int64_t sb = (int64_t)((b->end - 12) >> 20);
     if (sb < 1) sb = 1;
     int64_t sn = 0, scap = ((n + sb - 1) / sb) * DOM_IX_STRIDE;
     const uint8_t** sp = (const uint8_t**)ray_sys_alloc((size_t)scap * sizeof(*sp));
@@ -3177,12 +3333,12 @@ ray_err_t ray_sym_domain_compress(const char* path) {
          * written in order */
         ray_pool_t* pool = ray_pool_get();
         uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
-        int64_t cb = (int64_t)(((uint64_t)(2u << 20) * (uint64_t)n) / (size - 12));
+        int64_t cb = (int64_t)(((uint64_t)(2u << 20) * (uint64_t)n) / (b->end - 12));
         if (cb < 1) cb = 1;
         int64_t wn = 2 * (int64_t)nw < 64 ? 2 * (int64_t)nw : 64;
         dom_zc_ctx_t x;
         memset(&x, 0, sizeof(x));
-        x.map = map; x.ib = b->ib; x.n = n; x.count = count; x.cb = cb; x.end = size;
+        x.map = map; x.ib = b->ib; x.n = n; x.count = count; x.cb = cb; x.end = b->end;
         x.t = t; x.ix = tix;
         x.out = (uint8_t**)ray_sys_alloc((size_t)wn * sizeof(uint8_t*));
         x.cap = (size_t*)ray_sys_alloc((size_t)wn * sizeof(size_t));

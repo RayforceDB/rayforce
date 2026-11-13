@@ -56,6 +56,7 @@
 #include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
 #include "store/col.h"      /* ray_store_test_force_compress — equivalence pass */
 #include "store/enccol.h"   /* ray_test_hooks_off */
+#include "table/domain.h"   /* ray_sym_domain_test_hook */
 #include "mem/heap.h"       /* ray_heap_test_scribble */
 #include "store/encw.h"
 #include "ops/colbind.h"
@@ -964,6 +965,7 @@ void ray_test_hooks_off(void) {
     ray_heap_test_scribble(false);
     ray_file_writeback_test_hold(false);
     ray_file_writeback_test_fail(false);
+    ray_sym_domain_test_hook(NULL);
     ray_alloc_fail_set_for_test(0, 0);
     agg_test_force_smallhash(false);
     agg_test_no_wide_dense(false);
