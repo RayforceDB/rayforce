@@ -175,9 +175,41 @@ void  ray_vm_advise_willneed(void* ptr, size_t size);
  * read a mapped column they sample. */
 uint64_t ray_vm_willneed_bytes(void);
 /* Start writing back bytes [off, off+len) of open file `fd` without waiting
- * (Linux sync_file_range WRITE; a no-op elsewhere): a later fsync then
- * finds them on disk. */
+ * (Linux sync_file_range WRITE, issued by a background thread on a
+ * descriptor of its own; a no-op elsewhere): a later fsync then finds them
+ * on disk.  The descriptors the background thread holds, these and those
+ * of ray_file_writebehind_begin, number at most RAY_FILE_WB_FDS; past that
+ * the caller starts the writeback itself. */
+#define RAY_FILE_WB_FDS 256
 void  ray_file_writeback_start(int fd, int64_t off, int64_t len);
+/* Write-behind of a file written once and not read again soon (Linux; a
+ * no-op elsewhere): _begin opens `path` and starts writing all its pages
+ * back, returning the descriptor (-1: none, also with RAY_FILE_WB_FDS
+ * held); _end hands it over to have the writeback waited for, the pages
+ * dropped from the page cache and the descriptor closed, so the cache
+ * keeps what is read again instead.  Both
+ * return at once: the background thread of ray_file_writeback_start does
+ * the work, in order. */
+int   ray_file_writebehind_begin(const char* path);
+void  ray_file_writebehind_end(int fd);
+/* Writeback requests failed so far, process-wide, once the background
+ * thread has served every request (it waits for that, and the thread has
+ * ended when it returns).  The waits of a write-behind's end take the
+ * file's pending write error, so a later fsync of the file reports none:
+ * a writer that handed files over checks this did not grow before it
+ * trusts them.  ray_runtime_destroy calls it, so no thread is left behind
+ * a runtime. */
+int64_t ray_file_writeback_errors(void);
+#ifdef DEBUG
+/* Test hooks (C tests only): with hold on, the background thread stops at
+ * the next request it takes, before its writeback, until hold is turned
+ * off; wait_held returns once it has stopped there.  With fail on, every
+ * request counts as failed in ray_file_writeback_errors.  Disarmed by
+ * ray_test_hooks_off. */
+void ray_file_writeback_test_hold(bool on);
+void ray_file_writeback_test_wait_held(void);
+void ray_file_writeback_test_fail(bool on);
+#endif
 /* The I/O counters the converters' traces read: bytes read from and
  * written to storage, written bytes whose writeback was cancelled, read and
  * write calls, and major faults; of the process, or of the calling thread

@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #ifdef RAY_OS_LINUX
 #include <sched.h>
 #endif
@@ -168,6 +169,184 @@ static test_result_t test_cgroup_stat_flush(void) {
     PASS();
 }
 
+#ifdef RAY_OS_LINUX
+#include <dirent.h>
+/* Descriptors open in this process (the directory's own among them). */
+static int plat_nfds(void) {
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int n = 0;
+    while (readdir(d)) n++;
+    closedir(d);
+    return n;
+}
+#endif
+
+/* Write-behind holds at most RAY_FILE_WB_FDS descriptors: past them a file
+ * is not begun (-1) and a start is done by the caller.  The background
+ * thread closes every one it was handed, and the files keep what was
+ * written. */
+static test_result_t test_file_writebehind_fds(void) {
+#ifdef RAY_OS_LINUX
+    enum { N = RAY_FILE_WB_FDS + 44 };
+    char dir[64], path[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce_wb_%d", (int)getpid());
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "a directory of our own");
+    int base = plat_nfds(), peak = 0, begun = 0;
+    static int fds[N];
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "f%d", i);
+        plat_write(dir, name, "written once");
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+        fds[i] = ray_file_writebehind_begin(path);
+        begun += fds[i] >= 0;
+        int n = plat_nfds() - base;
+        if (n > peak) peak = n;
+    }
+    for (int i = 0; i < N; i++) ray_file_writebehind_end(fds[i]);
+    snprintf(path, sizeof(path), "%s/f0", dir);
+    int wfd = open(path, O_WRONLY);
+    for (int k = 0; k < 4 * RAY_FILE_WB_FDS; k++) {
+        ray_file_writeback_start(wfd, 0, 12);
+        int n = plat_nfds() - base;
+        if (n > peak) peak = n;
+    }
+    close(wfd);
+    (void)ray_file_writeback_errors();   /* every request served */
+    int left = plat_nfds() - base;
+    /* the bound is free again: a whole round more is begun */
+    int again = 0;
+    for (int i = 0; i < RAY_FILE_WB_FDS / 2; i++) {
+        snprintf(path, sizeof(path), "%s/f%d", dir, i);
+        fds[i] = ray_file_writebehind_begin(path);
+        again += fds[i] >= 0;
+    }
+    for (int i = 0; i < RAY_FILE_WB_FDS / 2; i++) ray_file_writebehind_end(fds[i]);
+    int same = 0;
+    for (int i = 0; i < N; i++) {
+        char name[16], buf[32] = {0};
+        snprintf(name, sizeof(name), "f%d", i);
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0 && read(fd, buf, sizeof(buf) - 1) == 12 && !strcmp(buf, "written once")) same++;
+        if (fd >= 0) close(fd);
+        plat_unlink(dir, name);
+    }
+    rmdir(dir);
+    TEST_ASSERT(begun > 0 && begun < N, "write-behind begun up to the bound");
+    TEST_ASSERT(peak <= RAY_FILE_WB_FDS + 1, "no more descriptors held than the bound");
+    TEST_ASSERT(left <= 0, "every descriptor handed over closed");
+    TEST_ASSERT_EQ_I(again, RAY_FILE_WB_FDS / 2);
+    TEST_ASSERT_EQ_I(same, N);
+#endif
+    PASS();
+}
+
+#ifdef RAY_OS_LINUX
+/* Threads of this process running the write-behind loop (named "ray-wb"). */
+static int plat_wb_threads(void) {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char path[sizeof("/proc/self/task/") + sizeof(e->d_name) + sizeof("/comm")], comm[32] = {0};
+        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;   /* a task that ended meanwhile */
+        if (fgets(comm, sizeof(comm), f) && !strcmp(comm, "ray-wb\n")) n++;
+        fclose(f);
+    }
+    closedir(d);
+    return n;
+}
+
+/* No write-behind thread left: one joined drops its task a moment after it
+ * wakes the joiner. */
+static int plat_wb_threads_left(void) {
+    int n = plat_wb_threads();
+    for (int i = 0; i < 100000 && n > 0; i++) { sched_yield(); n = plat_wb_threads(); }
+    return n;
+}
+#endif
+
+/* A failed writeback is counted, once every request is served, and the
+ * background thread has ended by then: a pipe (no writeback) and, with
+ * the hook, a write-behind of a file. */
+static test_result_t test_file_writeback_errors(void) {
+#ifdef RAY_OS_LINUX
+    int64_t e0 = ray_file_writeback_errors();
+    int p[2];
+    TEST_ASSERT(pipe(p) == 0, "a pipe");
+    ray_file_writeback_start(p[1], 0, 1);
+    int64_t e1 = ray_file_writeback_errors();
+    int left = plat_wb_threads_left();
+    close(p[0]); close(p[1]);
+    TEST_ASSERT_EQ_I(e1 - e0, 1);
+    TEST_ASSERT_EQ_I(left, 0);
+#ifdef DEBUG
+    char dir[64], path[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce_wbe_%d", (int)getpid());
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "a directory of our own");
+    plat_write(dir, "f", "written once");
+    snprintf(path, sizeof(path), "%s/f", dir);
+    ray_file_writeback_test_fail(true);
+    ray_file_writeback_test_hold(true);
+    int fd = ray_file_writebehind_begin(path);
+    ray_file_writebehind_end(fd);
+    ray_file_writeback_test_wait_held();
+    int serving = plat_wb_threads();   /* the thread, found by its name */
+    ray_file_writeback_test_hold(false);
+    int64_t e2 = ray_file_writeback_errors();
+    ray_file_writeback_test_fail(false);
+    left = plat_wb_threads_left();
+    plat_unlink(dir, "f");
+    rmdir(dir);
+    TEST_ASSERT(fd >= 0, "write-behind begun");
+    TEST_ASSERT_EQ_I(serving, 1);
+    TEST_ASSERT_EQ_I(e2 - e1, 2);
+    TEST_ASSERT_EQ_I(left, 0);
+#endif
+#endif
+    PASS();
+}
+
+/* A fork while the background thread serves a request: the child closes
+ * that request's descriptor as well as the queued ones (the parent's to
+ * serve), and the parent's are all closed once they are served. */
+static test_result_t test_file_writeback_fork(void) {
+#if defined(RAY_OS_LINUX) && defined(DEBUG)
+    char dir[64], path[128];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce_wbk_%d", (int)getpid());
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "a directory of our own");
+    plat_write(dir, "f", "written once");
+    snprintf(path, sizeof(path), "%s/f", dir);
+    (void)ray_file_writeback_errors();
+    int base = plat_nfds();
+    ray_file_writeback_test_hold(true);
+    int fd = ray_file_writebehind_begin(path);   /* its start served, held there */
+    if (fd >= 0) ray_file_writeback_test_wait_held();
+    ray_file_writebehind_end(fd);                /* queued behind it */
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) _exit(plat_nfds() == base ? 0 : 1);
+    int status = 0;
+    pid_t got = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    ray_file_writeback_test_hold(false);
+    (void)ray_file_writeback_errors();
+    int left = plat_nfds() - base;
+    plat_unlink(dir, "f");
+    rmdir(dir);
+    TEST_ASSERT(fd >= 0, "write-behind begun");
+    TEST_ASSERT(got == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "the child holds no descriptor of the parent's requests");
+    TEST_ASSERT_EQ_I(left, 0);
+#endif
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 #ifdef RAY_OS_LINUX
@@ -295,6 +474,9 @@ const test_entry_t platform_entries[] = {
     { "platform/cgroup_stat_flush", test_cgroup_stat_flush, NULL, NULL },
     { "platform/cgroup_cpu_quota", test_cgroup_cpu_quota, NULL, NULL },
     { "platform/cpu_set_count_wide_mask", test_cpu_set_count_wide_mask, NULL, NULL },
+    { "platform/file_writebehind_fds", test_file_writebehind_fds, NULL, NULL },
+    { "platform/file_writeback_errors", test_file_writeback_errors, NULL, NULL },
+    { "platform/file_writeback_fork", test_file_writeback_fork, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

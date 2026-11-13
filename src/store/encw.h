@@ -153,8 +153,10 @@ ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const cha
  * meanwhile: a put moves the writer); ray_encw_put writes the part of chunk
  * chunk_i.  The file is
  * byte for byte what ray_encw_chunk chunk by chunk writes.  Not for STR
- * (its STR_DICT entries and DICT index follow row order) or SYM (prefix
- * bounds).  A part starts zeroed and may be reused; ray_encw_part_free
+ * (its STR_DICT entries and DICT index follow row order).  SYM reads each
+ * vector's prefix bounds from its domain (ray_encw_set_sym_domain before
+ * training), so only positions under the domain's count then get them.
+ * A part starts zeroed and may be reused; ray_encw_part_free
  * releases its buffers. */
 typedef struct {
     ray_encw_t       w;        /* a shallow copy of the writer: the trained structures are shared */
