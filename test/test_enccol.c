@@ -1465,7 +1465,16 @@ static test_result_t test_want_points(void) {
     for (int q = 0; q < NR; q++) rows[q] = (int64_t)q * (n / NR) + 5;
     bool cold = false;
 #if defined(__linux__)
-    cold = ray_pool_scan_on() && !ray_vm_resident(e->base, e->size);   /* the eviction took */
+    {   /* the helper's own admission: it asks ahead unless the first, middle and last
+         * rows' descriptors and bodies are all in memory, so a descriptor of those
+         * rows absent from memory is a witness that cannot fail on pages elsewhere */
+        const int64_t probe[3] = { rows[0], rows[NR / 2], rows[NR - 1] };
+        for (int q = 0; q < 3; q++) {
+            const ray_enc_desc_t* d = &ray_enccol_descs(e, probe[q] / RAY_ENC_CHUNK)[probe[q] % RAY_ENC_CHUNK / RAY_ENC_VEC];
+            if (!ray_vm_resident(d, sizeof *d)) cold = true;
+        }
+        cold = cold && ray_pool_scan_on();
+    }
 #endif
     uint64_t b0 = ray_vm_willneed_bytes();
     ray_enccol_want_points(e, rows, NR, 0);

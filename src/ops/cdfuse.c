@@ -164,6 +164,7 @@ static inline int64_t cdf_sample_row(int64_t nrows, int i) {
  * the one on the next row (runs, as in a column clustered by the key). */
 static _Atomic(uint64_t) g_cdf_preaggregated;
 uint64_t ray_cd_test_preaggregated(void) { return atomic_load(&g_cdf_preaggregated); }
+int64_t ray_cd_test_sample_row(int64_t nrows, int i) { return cdf_sample_row(nrows, i); }
 static bool cdf_sample_repetition(const cdf_p1_ctx_t* c) {
     if (c->nrows <= 1024) return false;
     cdf_recent_t recent[64] = {{0}};
