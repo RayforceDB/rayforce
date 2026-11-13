@@ -2328,6 +2328,10 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
  * of the next `prefetch` row groups (up to `ahead_bytes`), so the reads are
  * in flight together while it decodes.  RAY_PQ_PREFETCH sets the depth
  * (default 2, 0 turns it off). */
+/* A chunked column's cell in the tasks' buffers: a SYM column's positions
+ * at W32. */
+static size_t pq_chunked_esz(int8_t type) { return type == RAY_SYM ? 4 : ray_elem_size(type); }
+
 static void pq_prefetch_chunks(pq_direct_work* w, int64_t g, int64_t c) {
     ray_parquet_t* r = w->parent;
     int64_t ahead = 0;
@@ -2356,7 +2360,7 @@ RAY_INLINE ray_t* pq_decode_rows_mode(pq_direct_work* w, pq_column* spare, int64
     r->selected[0] = (int32_t)c; r->nselected = r->noutput = 1;
     if (spare) pq_trade_buffers(&r->cursors[0],spare);
     int8_t type = w->writers[c].type;
-    size_t esz = ray_elem_size(type);
+    size_t esz = pq_chunked_esz(type);
     ray_t* err = NULL;
     for (;;) {
         if (prefix) {
@@ -2370,7 +2374,9 @@ RAY_INLINE ray_t* pq_decode_rows_mode(pq_direct_work* w, pq_column* spare, int64
         if (RAY_IS_ERR(batch)) { err = batch; break; }
         ray_t* bcol = ray_table_col_idx(batch,0);
         if (bcol && RAY_IS_ERR(bcol)) { err = bcol; ray_release(batch); break; }
-        if (!bcol || bcol->type != type || (bcol->attrs & RAY_ATTR_SLICE)) {
+        if (!bcol || bcol->type != type || (bcol->attrs & RAY_ATTR_SLICE) ||
+            (type == RAY_SYM && (ray_sym_vec_domain(bcol) != w->writers[c].dom ||
+                                 (bcol->attrs & RAY_SYM_W_MASK) != RAY_SYM_W32))) {
             err = ray_error(ray_err_code_str(RAY_ERR_TYPE),"parquet: direct column write failed");
             ray_release(batch); break;
         }
@@ -2857,8 +2863,7 @@ static bool pq_g_wflush1(pq_gtask* k, int a) {
 }
 static bool pq_g_wflush(pq_gtask* k) { return pq_g_wflush1(k,0) && pq_g_wflush1(k,1); }
 /* ROWS*: record `pos` at `off`, run a's next: through the run's buffer,
- * written with pwrite in large requests (the mapping's pages are never
- * faulted in to be overwritten). */
+ * written to the file in large pieces (ray_symimp_write). */
 static bool pq_g_record(pq_gtask* k, int a, int64_t pos, int64_t off, const char* s, uint32_t len) {
     ray_symimp_place(k->w->imp,pos,off);
     if (k->wlen[a] && k->woff[a] + k->wlen[a] != off && !pq_g_wflush1(k,a)) return false;
@@ -3281,7 +3286,7 @@ static bool pq_symb_init(pq_symb* b, int64_t rows) {
 }
 
 static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* imp, int64_t c,
-                           int groups, int64_t budget, int64_t workers, bool trace, pq_symb* sb) {
+                           int groups, int par, int64_t budget, int64_t workers, bool trace, pq_symb* sb) {
     ray_parquet_t* r = dw->parent;
     ray_pool_t* pool = ray_pool_get();
     pq_gwork w = {.dw = dw, .c = c, .g = g, .imp = imp, .hmask = UINT64_MAX, .sb = sb};
@@ -3320,7 +3325,7 @@ static void pq_sym_grouped(pq_direct_work* dw, ray_symgrp_t* g, ray_symimp_t* im
     if (ray_interrupted()) goto out;
     if (trace) { io1 = pq_io_now(); t1 = ray_profile_now_ns(); }
     /* the verdicts, group by group */
-    if (pq_g_inject("p2") || !ray_symgrp_resolve(g)) { dw->errors[0] = pq_g_error(dw->parent,"symbol dictionary allocation or file growth failed",-1); goto out; }
+    if (pq_g_inject("p2") || !ray_symgrp_resolve(g,par)) { dw->errors[0] = pq_g_error(dw->parent,"symbol dictionary allocation or file growth failed",-1); goto out; }
     if (trace) { io2 = pq_io_now(); t2 = ray_profile_now_ns(); }
     /* second decode, window by window: the candidates' records of a window
      * (from earlier passes and windows) in half the budget */
@@ -3437,7 +3442,10 @@ static bool pq_chunked_init(pq_chunked* k, ray_col_stream_t* s) {
     memset(k,0,sizeof(*k));
     atomic_flag_clear(&k->lock);
     int64_t n = s->ew->n_chunks;
-    k->s = s; k->n_chunks = n; k->esz = ray_elem_size(s->type);
+    k->s = s; k->n_chunks = n; k->esz = pq_chunked_esz(s->type);
+    /* a SYM column's prefix bounds: the positions the domain holds as its
+     * pass starts (its strings seeded before the passes) */
+    if (s->type == RAY_SYM) ray_encw_set_sym_domain(s->ew,s->dom);
     k->part = ray_calloc_raw((size_t)(n+1)*sizeof(*k->part));
     k->ready = ray_calloc_raw((size_t)(n+1)*sizeof(*k->ready));
     k->edge = ray_calloc_raw((size_t)(n+1)*sizeof(*k->edge));
@@ -3490,6 +3498,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     pq_chunked* chk = NULL;   /* [ncols] the pass's chunked columns (pq_direct_work.chunked) */
     pq_cbuf* cbuf = NULL;     /* [nspare] pq_direct_work.cbuf */
     pq_symb psb = {0};   /* the grouped pass column's vector bounds (pq_symb) */
+    int* wbf = NULL;     /* [ncols] the column files written back behind the passes (ray_file_writebehind_begin) */
+    int64_t nwbf = 0;
     if (!offsets || !nulls || !locks || !errors || !lo || !hi || !bytes || !vocab || !donly || !pick || !order) { err = ray_error("oom",NULL); goto done; }
     for (int64_t c = 0; c < r->ncols; c++) {
         size_t size = writers[c].type == RAY_SYM ? 4 : ray_elem_size(writers[c].type);
@@ -3558,7 +3568,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * of row groups.  RAY_PQ_STAGE stages them as before. */
     int64_t nchunked = 0;
     for (int64_t c = 0; c < r->ncols && !stage; c++) {
-        if (!ray_col_stream_chunked_ok(&writers[c])) continue;
+        if (writers[c].type == RAY_SYM || !ray_col_stream_chunked_ok(&writers[c])) continue;
         ray_err_t ce = ray_col_stream_chunked_begin(&writers[c],r->rows);
         if (ce != RAY_OK) { err = ray_error(ray_err_code_str(ce),"parquet: column writer"); goto done; }
         nchunked++;
@@ -3578,6 +3588,11 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * final sync; column by column the passes end their files anyway and
      * the extra I/O requests only slow the decode. */
     work.writeback = !colwise;
+    /* Column by column, a pass's closed columns go to disk while the next
+     * pass runs and, once written back, leave the page cache (a pass later),
+     * which then keeps the Parquet file's pages that later passes read
+     * instead of output that no pass reads again.  Best effort. */
+    if (colwise) wbf = ray_alloc_raw((size_t)r->ncols*sizeof(*wbf));
 #if defined(DEBUG)
     work.reverse = getenv("RAY_PQ_DIRECT_REVERSE") != NULL;   /* the suite: positions not in task order */
 #endif
@@ -3701,6 +3716,22 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         seeded = pq_imp_count(writers,order,nnum,r->ncols);
         if (trace) fprintf(stderr,"parquet symseed: cols=%lld groups=%lld entries=%lld ms=%.1f\n",(long long)(nd-nnum),
                            (long long)r->ngroups,(long long)entries,(double)(ray_profile_now_ns()-ts)/1e6);
+        /* The seeded columns' positions are the dictionary's before their
+         * pass: their chunks are encoded in the tasks and written in order
+         * as the numeric ones are (pq_chunked), nothing staged. */
+        for (int64_t i = nnum; !stage && i < nd; i++) {
+            int64_t c = order[i];
+            if (!pick[c] || !ray_col_stream_chunked_ok(&writers[c])) continue;
+            ray_err_t ce = ray_col_stream_chunked_begin(&writers[c],r->rows);
+            if (ce != RAY_OK) { err = ray_error(ray_err_code_str(ce),"parquet: column writer"); goto done; }
+            nchunked++;
+        }
+        if (nchunked && !chk) {
+            chk = ray_calloc_raw((size_t)r->ncols*sizeof(*chk));
+            cbuf = nspare ? ray_calloc_raw((size_t)nspare*sizeof(*cbuf)) : NULL;   /* best effort, as spare */
+            if (!chk) { err = ray_error("oom",NULL); goto done; }
+            work.cbuf = cbuf;
+        }
     }
     if (trace && simp && !bounded) pq_vocab_bounds(r,order,nnum,r->ncols,vocab,donly);   /* for the trace */
     if (trace && simp)
@@ -3777,12 +3808,20 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
              * are too: under RAY_PQ_SYM_ORDER=shards, which numbers the new
              * strings group by group, the positions depend on it (the
              * default order does not) */
-            int groups = 1;
+            int groups = 1, par = 1;
             const char* e = getenv("RAY_PQ_SYM_GROUPS");
             if (e && *e && strtol(e,NULL,10) > 0) groups = (int)strtol(e,NULL,10);
             else {
                 int64_t need = (ray_symgrp_entries(pg) + r->rows) * 24;
                 while (groups < RAY_SYMGRP_MAX && need / groups > budget / 4) groups *= 2;
+                /* The rows orders resolve their groups side by side
+                 * (ray_symgrp_resolve): more of them, so the workers share
+                 * them, as many at once as the quarter held one before. */
+                if (so == RAY_SYMGRP_ROWS || so == RAY_SYMGRP_ROWS_FLAT) {
+                    int mem = groups;
+                    while (groups < RAY_SYMGRP_MAX && groups < 4 * workers) groups *= 2;
+                    par = groups / mem;
+                }
             }
             /* the column's prefix bounds from the strings the second decode
              * walks; RAY_PQ_SYM_BOUNDS=dict leaves them to its writer, which
@@ -3790,7 +3829,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             ray_col_stream_t* sw = &writers[work.pass[0]];
             const char* be = getenv("RAY_PQ_SYM_BOUNDS");
             bool bounds = sw->gen == 2 && !(be && !strcmp(be,"dict")) && pq_symb_init(&psb,r->rows);
-            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,budget,workers,trace,bounds ? &psb : NULL);
+            pq_sym_grouped(&work,pg,pimp,work.pass[0],groups,par,budget,workers,trace,bounds ? &psb : NULL);
             if (bounds) {
                 sw->sym_bmn = (const uint32_t*)psb.mn; sw->sym_bmx = (const uint32_t*)psb.mx;
                 sw->sym_bhas = (const uint8_t*)psb.has;
@@ -3886,6 +3925,18 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             if (e != RAY_OK) { err = ray_error(ray_err_code_str(e),"parquet: column close failed"); break; }
         }
         pq_symb_free(&psb);
+        if (wbf && !err) {
+            int64_t earlier = nwbf;
+            for (int64_t i = 0; i < work.npass; i++) {
+                const ray_col_stream_t* w = &writers[work.pass[i]];
+                if (w->type == RAY_SYM && w->gen != 2) continue;   /* not closed yet (its header at the end) */
+                int fd = ray_file_writebehind_begin(w->path);
+                if (fd >= 0) wbf[nwbf++] = fd;
+            }
+            for (int64_t i = 0; i < earlier; i++) ray_file_writebehind_end(wbf[i]);
+            memmove(wbf,wbf+earlier,(size_t)(nwbf-earlier)*sizeof(*wbf));
+            nwbf -= earlier;
+        }
         /* the workers' page and dictionary buffers grown past PQ_SPARE_MAX
          * for this pass's columns go with the pass */
         for (int64_t i = 0; i < nspare; i++) {
@@ -3928,6 +3979,8 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             err = ray_error(ray_err_code_str((ray_err_t)atomic_load(&symf.err)),"parquet: cannot flush symbol file");
     }
 done:
+    for (int64_t i = 0; i < nwbf; i++) ray_file_writebehind_end(wbf[i]);
+    ray_free_raw(wbf);
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
     ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order);
@@ -3963,6 +4016,7 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     ray_col_stream_t* writers = NULL; int64_t opened = 0, parts = 0;
     ray_err_t e = RAY_OK; ray_sym_domain_t* domain = NULL;
     ray_sym_domain_t** cdoms = NULL;   /* symfile 'column: column c's own domain, or NULL */
+    int64_t wb_errs = ray_file_writeback_errors();   /* the write-behinds' failures before */
     err = pq_import_types(r,types);
     if (err) goto done;
     err = pq_stage(r,dir,staging,sizeof(staging),false);
@@ -4104,6 +4158,9 @@ finish_columns:
         e = ray_file_sync(fd); ray_file_close(fd);
         if (e != RAY_OK) goto io_fail;
     }
+    /* a write-behind's waits take its file's write error, which the sync
+     * above then misses */
+    if (ray_file_writeback_errors() != wb_errs) { e = RAY_ERR_IO; goto io_fail; }
     if (trace) { fprintf(stderr,"parquet phase: schema+sync=%.1fms\n",(double)(ray_profile_now_ns()-tp)/1e6); tp = ray_profile_now_ns(); }
     e = ray_file_sync_dir(file);
     if (e != RAY_OK) goto io_fail;
