@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #ifdef RAY_OS_LINUX
 #include <sched.h>
 #endif
@@ -244,6 +245,8 @@ static test_result_t test_file_writebehind_fds(void) {
 }
 
 #ifdef RAY_OS_LINUX
+static void* plat_noop_thread(void* a) { return a; }
+
 /* Threads of this process. */
 static int plat_nthreads(void) {
     DIR* d = opendir("/proc/self/task");
@@ -262,6 +265,11 @@ static int plat_nthreads(void) {
 static test_result_t test_file_writeback_errors(void) {
 #ifdef RAY_OS_LINUX
     int64_t e0 = ray_file_writeback_errors();
+    /* a sanitizer runtime starts a thread of its own at the process's first
+     * thread create: one made and joined here, so it is in the baseline */
+    pthread_t t;
+    TEST_ASSERT(pthread_create(&t, NULL, plat_noop_thread, NULL) == 0, "a thread");
+    pthread_join(t, NULL);
     int threads = plat_nthreads();
     int p[2];
     TEST_ASSERT(pipe(p) == 0, "a pipe");
