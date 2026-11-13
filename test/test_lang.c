@@ -5608,8 +5608,20 @@ static test_result_t test_eval_insert_parted_inplace(void) {
 /* ---- Test: a failed in-place parted insert leaves the partition as it was --
  * The in-place insert appends column by column.  Fail each allocation of a
  * 300-row batch over I64, SYM, STR and LIST columns in turn: the call
- * either lands every row or none, the columns keep one length, and the
- * same batch lands on the next try. */
+ * either lands every row or none, the columns keep one length, a failed
+ * call gives back every reference it took on the batch's LIST cells, and
+ * the same batch lands on the next try. */
+/* The summed reference counts of the cells of _pb's LIST column. */
+static int64_t lang_parted_inplace_cell_refs(void) {
+    ray_t* brk = ray_eval_str("(at _pb 'brk)");
+    if (!brk || RAY_IS_ERR(brk) || brk->type != RAY_LIST) return -1;
+    int64_t refs = 0;
+    ray_t** cells = (ray_t**)ray_data(brk);
+    for (int64_t i = 0; i < brk->len; i++) refs += cells[i] ? (int64_t)cells[i]->rc : 0;
+    ray_release(brk);
+    return refs;
+}
+
 static test_result_t test_eval_insert_parted_inplace_rollback_impl(const char* root) {
     char day[1024], sym_path[1024], reset[1400];
     int n1 = snprintf(day, sizeof(day), "%s/2024.01.02/trades", root);
@@ -5650,6 +5662,8 @@ static test_result_t test_eval_insert_parted_inplace_rollback_impl(const char* r
     int64_t failed = 0;
     for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
         ASSERT_EQ(reset, "0");
+        int64_t refs = lang_parted_inplace_cell_refs();
+        TEST_ASSERT_TRUE(refs >= 300);
         ray_alloc_fail_set_for_test(nth, 1);
         r = ray_eval(op);
         ray_alloc_fail_set_for_test(0, 0);
@@ -5667,6 +5681,10 @@ static test_result_t test_eval_insert_parted_inplace_rollback_impl(const char* r
         TEST_ASSERT_EQ_I(rb_eval_i64("(sum (at pq 'id))"), err ? 6 : full);
         if (!err) continue;
         failed++;
+        TEST_ASSERT_FMT(lang_parted_inplace_cell_refs() == refs,
+                        "allocation %lld: LIST cells keep %lld references, had %lld",
+                        (long long)nth, (long long)lang_parted_inplace_cell_refs(),
+                        (long long)refs);
         ASSERT_EQ("(at pq 'note)", "[\"one\" \"two\" \"three\"]");
         ASSERT_EQ("(at pq 'brk)", "(list [0 1] [2 3 4] [5])");
         r = ray_eval(op);
