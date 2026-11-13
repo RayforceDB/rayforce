@@ -1482,6 +1482,103 @@ static test_result_t test_journal_snapshot_function_binding_recovers(void) {
     PASS();
 }
 
+/* 7f. #787: a snapshot keeps its lambdas' .sys.trust marks.  A trusted verb
+ * and its unmarked twin are snapshotted, then two restricted requests are
+ * logged after the snapshot.  Recovery, in a process where neither is
+ * bound, restores the mark before it replays the log: the trusted verb's
+ * write replays as it ran, the twin's is refused again.  Outside the
+ * snapshot the mark is neither written nor read. */
+static bool jrn_log_restricted(const char* text) {
+    ray_t* msg = ray_str(text, strlen(text));
+    if (!msg || RAY_IS_ERR(msg)) return false;
+    int64_t psize = ray_serde_size(msg);
+    uint8_t* buf = psize > 0 ? (uint8_t*)ray_sys_alloc((size_t)psize) : NULL;
+    bool ok = buf && ray_ser_raw(buf, msg) == psize;
+    ray_release(msg);
+    if (ok) {
+        ray_ipc_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.prefix  = RAY_SERDE_PREFIX;
+        hdr.version = RAY_SERDE_WIRE_VERSION;
+        hdr.flags   = RAY_IPC_FLAG_RESTRICTED;
+        hdr.size    = psize;
+        ok = ray_journal_write_bytes(&hdr, buf, psize) == RAY_OK;
+    }
+    if (buf) ray_sys_free(buf);
+    return ok;
+}
+
+static ray_t* jrn_eval_restricted(const char* text) {
+    ray_restrict_save_t saved;
+    ray_eval_restrict_enter(true, &saved);
+    ray_t* r = ray_eval_str(text);
+    ray_eval_restrict_leave(&saved);
+    return r;
+}
+
+static test_result_t test_journal_snapshot_keeps_trust(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_trust");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str("(do (set jrn_tr_kv 0)"
+                            "    (set jrn_tr_put (fn [v] (set jrn_tr_kv v) v))"
+                            "    (set jrn_tr_plain (fn [v] (set jrn_tr_kv v) v))"
+                            "    (.sys.trust 'jrn_tr_put) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+    TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 6)"));
+    TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_plain 7)"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* A fresh process: nothing bound, nothing marked. */
+    const char* names[] = { "jrn_tr_kv", "jrn_tr_put", "jrn_tr_plain" };
+    ray_t* zero = ray_i64(0);
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero), RAY_OK);
+    ray_release(zero);
+
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    cleanup_base(base);
+    ray_t* kv = ray_env_get_global(ray_sym_intern("jrn_tr_kv", 9));
+    TEST_ASSERT_NOT_NULL(kv);
+    TEST_ASSERT_EQ_I(kv->i64, 6);
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+
+    /* Restored: the verb is trusted again, the twin still is not. */
+    ray_t* put = jrn_eval_restricted("(jrn_tr_put 8)");
+    ray_t* plain = jrn_eval_restricted("(jrn_tr_plain 9)");
+    bool put_ok = put && !RAY_IS_ERR(put) && put->i64 == 8;
+    bool plain_refused = plain && RAY_IS_ERR(plain) && strcmp(ray_err_code(plain), "access") == 0;
+    if (put && RAY_IS_ERR(put)) ray_error_free(put); else if (put) ray_release(put);
+    if (plain && RAY_IS_ERR(plain)) ray_error_free(plain); else if (plain) ray_release(plain);
+    TEST_ASSERT_TRUE(put_ok);
+    TEST_ASSERT_TRUE(plain_refused);
+
+    /* Outside a snapshot the bit is not written, and a frame carrying it
+     * marks nothing. */
+    ray_t* fn = ray_env_get_global(ray_sym_intern("jrn_tr_put", 10));
+    TEST_ASSERT_TRUE(fn && fn->type == RAY_LAMBDA && LAMBDA_TRUSTED(fn));
+    ray_t* plain_bytes = ray_ser(fn);
+    bool prev = ray_serde_keep_trust(true);
+    ray_t* marked_bytes = ray_ser(fn);
+    ray_t* from_plain = ray_de(plain_bytes);
+    ray_serde_keep_trust(prev);
+    ray_t* from_marked = ray_de(marked_bytes);
+    bool plain_unmarked = from_plain && !RAY_IS_ERR(from_plain) &&
+                          from_plain->type == RAY_LAMBDA && !LAMBDA_TRUSTED(from_plain);
+    bool marked_unmarked = from_marked && !RAY_IS_ERR(from_marked) &&
+                           from_marked->type == RAY_LAMBDA && !LAMBDA_TRUSTED(from_marked);
+    ray_t* objs[] = { plain_bytes, marked_bytes, from_plain, from_marked };
+    for (int i = 0; i < 4; i++) {
+        if (objs[i] && RAY_IS_ERR(objs[i])) ray_error_free(objs[i]);
+        else if (objs[i]) ray_release(objs[i]);
+    }
+    TEST_ASSERT_TRUE(plain_unmarked);
+    TEST_ASSERT_TRUE(marked_unmarked);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  8. is_open
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -3282,6 +3379,7 @@ const test_entry_t journal_entries[] = {
     { "journal/open_with_qdb",             test_journal_open_with_qdb,             jrn_setup, jrn_teardown },
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
+    { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */

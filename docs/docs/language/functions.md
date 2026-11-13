@@ -552,6 +552,7 @@ spills exactly as it did before.
 | `parse` | unary | Parse string into Rayfall expression | `(parse "(+ 1 2)")` |
 | `.sys.gc` | variadic (0–1) | Trigger garbage collection, returns `0`; mode `1` also releases free pages now, best effort | `(.sys.gc)`, `(.sys.gc 1)` |
 | `.sys.exec` | unary | Execute shell command, return exit code | `(.sys.exec "ls -la")` |
+| `.sys.trust` | unary, restricted | Mark lambdas a restricted (`-U`) caller may run with the restriction lifted, isolated from the caller. Returns its argument. See [`.sys.trust`](../namespaces/sys.md#sys-trust). | `(.sys.trust 'peer_count)` |
 | `.os.getenv` | unary | Get environment variable | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | Set environment variable | `(.os.setenv "KEY" "value")` |
 | `exit` | unary | Exit with status code | `(exit 0)` |

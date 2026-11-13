@@ -2813,7 +2813,8 @@ static bool key_bind_params(ray_t* params, ray_t** args, int64_t nargs, uint8_t 
 static bool key_lambda_call_pure(ray_t* lam, ray_t** args, int64_t nargs, int depth, const key_pure_ctx_t* caller) {
     /* A trusted lambda (.sys.trust) is opaque: called by restricted code,
      * it runs isolated from the query, so its body does not say what the
-     * call reads.  An effect. */
+     * call reads.  An effect, which also keeps query_inline_walk from
+     * expanding it into the query. */
     if (LAMBDA_TRUSTED(lam)) return false;
     ray_t* body = LAMBDA_BODY(lam);
     if (!body || body->type != RAY_LIST) return false;
@@ -3318,9 +3319,9 @@ static ray_t* query_inline_walk(ray_t* expr, ray_t* tbl,
         /* A closure's body reads its captures; inlined, those names would
          * resolve to columns or globals instead.  Never inline one, however
          * often it has been called (a closure compiles on its second call).
-         * Nor a trusted lambda (.sys.trust), which restricted code calls
-         * isolated from the query. */
-        if (fn && fn->type == RAY_LAMBDA && !LAMBDA_CLOSURE(fn) && !LAMBDA_TRUSTED(fn)) {
+         * A trusted lambda never gets here: key_lambda_call_pure counts its
+         * call an effect, and no expression with an effect is expanded. */
+        if (fn && fn->type == RAY_LAMBDA && !LAMBDA_CLOSURE(fn)) {
             ray_t* bodies = LAMBDA_BODY(fn);
             if (bodies && bodies->type == RAY_LIST && bodies->len == 1) {
                 params = LAMBDA_PARAMS(fn);

@@ -110,17 +110,18 @@ typedef struct {
      * active query's rows: the expression needed row-by-row evaluation. */
     int32_t          rows_cond;
     int32_t          scope_depth;
-    /* The lowest scope frame lookups and bindings reach.  Frames below it
-     * belong to the caller of a lambda run in isolation (a trusted lambda
-     * under -U, see ray_env_isolate_begin) and are invisible to it. */
-    int32_t          scope_base;
     bool             restricted; /* -U connection on this stack */
     /* scope_depth when the restricted request began: frames at or below
      * it belong to the code it was dispatched from, not to the request */
     int32_t          restricted_base;
+    int32_t          id;
     ray_t           *nfo;        /* source-info of the eval in progress (borrowed) */
     void            *heap;
-    int32_t          id;
+    /* The lowest scope frame lookups and bindings reach.  Frames below it
+     * belong to the caller of a lambda run in isolation (a trusted lambda
+     * under -U, see ray_env_isolate_begin) and are invisible to it.  Read
+     * by the scope walks only, so it stays out of the hot block above. */
+    int32_t          scope_base;
     /* ── warm: per-dispatch context (core/ipc.c saves/restores) */
     int64_t          ipc_handle; /* connection handle of the hook/eval on this stack; -1 = none */
     void            *ipc_poll;   /* opaque ray_poll_t* that dispatched it; NULL = none */

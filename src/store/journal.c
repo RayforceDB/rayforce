@@ -620,7 +620,12 @@ ray_err_t ray_journal_recover(const char* base) {
     if (file_exists(qdb_path)) {
         bool prev_in_replay = g_journal.in_replay;
         g_journal.in_replay = true;
+        /* The snapshot is the server's own data: its lambdas keep their
+         * .sys.trust marks, so a logged request that called a trusted
+         * verb replays as it ran (see ray_serde_keep_trust). */
+        bool prev_trust = ray_serde_keep_trust(true);
         ray_t* snap = ray_obj_load(qdb_path);
+        ray_serde_keep_trust(prev_trust);
         g_journal.in_replay = prev_in_replay;
 
         if (!snap || RAY_IS_ERR(snap)) {
@@ -1119,8 +1124,11 @@ ray_err_t ray_journal_snapshot(void) {
         return RAY_ERR_DOMAIN;
     }
 
-    /* ray_obj_save writes prefix-headered bytes (same wire framing). */
+    /* ray_obj_save writes prefix-headered bytes (same wire framing).  The
+     * lambdas keep their .sys.trust marks, which recovery restores. */
+    bool prev_trust = ray_serde_keep_trust(true);
     ray_err_t e = ray_obj_save(snap, qdb_tmp);
+    ray_serde_keep_trust(prev_trust);
     ray_release(snap);
     if (e != RAY_OK) {
         /* Don't leave a half-written .qdb.tmp behind to confuse the

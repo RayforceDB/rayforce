@@ -8445,6 +8445,19 @@ static test_result_t test_eval_restricted_trusted_lambda(void) {
     TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (.sys.trust __rf787_plain)))"));
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
 
+    /* A name means the global bound to it, never a local of the caller,
+     * whether the caller is compiled or tree-walked. */
+    ASSERT_EQ("(do (set __rf787_gf (fn [] (set __rf787_n 21)))"
+              "    (set __rf787_gg (fn [] (set __rf787_n 22)))"
+              "    (set __rf787_gf2 (fn [] (set __rf787_n 23)))"
+              "    (set __rf787_gg2 (fn [] (set __rf787_n 24)))"
+              "    ((fn [] (let __rf787_gf __rf787_gg) (.sys.trust '__rf787_gf)))"
+              "    (do (let __rf787_gf2 __rf787_gg2) (.sys.trust '__rf787_gf2)) 0)", "0");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf)", "21"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg)"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf2)", "23"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg2)"));
+
     /* Only lambdas are marked, and a list with one bad name marks none. */
     ASSERT_ER_CODE("(.sys.trust 1)", "type");
     ASSERT_ER_CODE("(.sys.trust '__rf787_unbound)", "name");
@@ -8476,9 +8489,15 @@ static test_result_t test_eval_restricted_trusted_isolated(void) {
               "    (set __rf787_ev (fn [] (eval (parse \"(__rf787_peek)\"))))"
               "    (set __rf787_vec [1 2])"
               "    (set __rf787_app (fn [x] (alter '__rf787_vec concat x)))"
+              "    (set __rf787_rde (fn [] (eval (parse \"__rf787_v\"))))"
+              "    (set __rf787_rdh (fn [] (eval (parse \"(__rf787_h)\"))))"
+              "    (set __rf787_vec3 [1 2 3])"
+              "    (set __rf787_dotcnt (fn [] __rf787_vec3.count))"
               "    (set __rf787_t (table [a __rf787_v] (list [1 2] [5 6])))"
               "    (count (.sys.trust ['__rf787_read '__rf787_callh '__rf787_cnt"
-              "                        '__rf787_via '__rf787_sum '__rf787_ev '__rf787_app])))", "7");
+              "                        '__rf787_via '__rf787_sum '__rf787_ev '__rf787_app"
+              "                        '__rf787_rde '__rf787_rdh '__rf787_dotcnt])))", "10");
+    ASSERT_EQ("(__rf787_dotcnt)", "3");
 
     /* A local of the request's top level. */
     TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_read))", "1"));
@@ -8493,6 +8512,12 @@ static test_result_t test_eval_restricted_trusted_isolated(void) {
      * __rf787_peek) cached under that local. */
     TEST_ASSERT_TRUE(restricted_expr_gives(
         "(do (let __rf787_v 99) (__rf787_peek) (__rf787_read))", "1"));
+    /* ... nor text the trusted body evaluates, reading the name or
+     * calling it, nor a dotted accessor it applies. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_rde))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_h (fn [] 9)) (__rf787_rdh))", "10"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let count first) (__rf787_dotcnt))", "3"));
     /* An eval window, and a closure's frame on its first call. */
     TEST_ASSERT_TRUE(restricted_expr_gives(
         "((fn [] (eval (parse \"(do (let __rf787_v 99) (__rf787_read))\"))))", "1"));
@@ -8527,7 +8552,112 @@ static test_result_t test_eval_restricted_trusted_isolated(void) {
         "(do (let __rf787_v 99) (__rf787_read) __rf787_v)", "99"));
     TEST_ASSERT_TRUE(restricted_expr_gives(
         "(at (select {x: (+ (__rf787_read) __rf787_v) from: __rf787_t}) 'x)", "[6 7]"));
+    /* ... and so is the query: a helper the request calls after the
+     * trusted call reads the source column by free name again. */
+    ASSERT_EQ("(at (select {x: (do (__rf787_peek) (eval (parse \"(__rf787_peek)\")))"
+              " from: __rf787_t}) 'x)", "[5 6]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (do (__rf787_read) (eval (parse \"(__rf787_peek)\")))"
+        " from: __rf787_t}) 'x)", "[5 6]"));
     TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
+/* #787: ray_env_isolate_begin hides every frame on the stack, whatever the
+ * walk: a query frame, a query helper's call frame and two lexical frames
+ * of a caller are invisible to lookups, bindings, captures, the query
+ * probes and the frame markers until ray_env_isolate_end, which leaves the
+ * caller's frames as they were. */
+static test_result_t test_env_isolate_hides_frames(void) {
+#define SYM(s) ray_sym_intern(s, strlen(s))
+    int64_t x = SYM("__rf787_iso_x"), w = SYM("__rf787_iso_w");
+    int64_t y = SYM("__rf787_iso_y"), y2 = SYM("__rf787_iso_y2");
+    int64_t cnt = SYM("count"), dot = SYM("__rf787_iso_v.count");
+#undef SYM
+    ray_t* setup = ray_eval_str("(do (set __rf787_iso_x 1) (set __rf787_iso_v [1 2 3]) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* tbl = ray_eval_str("(table [__rf787_iso_x] (list [7]))");
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    ray_t* first = ray_env_get_global(ray_sym_intern("first", 5));
+    TEST_ASSERT_NOT_NULL(first);
+
+    /* The caller: a query, a helper's call frame over its table, then a
+     * frame binding x and one binding w and `count` (as `first`). */
+    int base = ray_env_scope_depth();
+    TEST_ASSERT_EQ_I(ray_env_push_query_scope(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_call_scope(tbl, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    ray_t* v99 = ray_i64(99), *v5 = ray_i64(5), *v6 = ray_i64(6), *v8 = ray_i64(8);
+    TEST_ASSERT_EQ_I(ray_env_set_local(x, v99), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set_local(w, v5), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set_local(cnt, first), RAY_OK);
+    ray_t* got = ray_env_get(x);
+    bool caller_sees = got && got->i64 == 99 && ray_env_in_query_helper(NULL) &&
+                       ray_env_query_serial() != 0 && ray_env_query_scope_above(base);
+
+    int32_t saved = ray_env_isolate_begin();
+    got = ray_env_get(x);
+    bool get_global = got && got->i64 == 1;
+    bool no_local = ray_env_get_local(x) == NULL && ray_env_get_lexical_local(x) == NULL &&
+                    ray_env_lexical_scope_depth(x) == -1 && ray_env_binding_rows(x) == -1;
+    bool no_query = ray_env_query_serial() == 0 && !ray_env_query_scope_above(base) &&
+                    !ray_env_in_query_helper(NULL);
+    ray_t* cap = ray_env_capture_locals();
+    bool no_capture = cap == NULL;
+    if (cap && !RAY_IS_ERR(cap)) ray_release(cap);
+    ray_t* res = ray_env_resolve(x);
+    bool resolve_global = res && !RAY_IS_ERR(res) && res->i64 == 1;
+    if (res && !RAY_IS_ERR(res)) ray_release(res);
+    /* x.count: the dotted accessor is the global `count`, not the caller's. */
+    res = ray_env_resolve(dot);
+    bool accessor_global = res && !RAY_IS_ERR(res) && res->i64 == 3;
+    if (res && !RAY_IS_ERR(res)) ray_release(res);
+    ray_env_target_t target;
+    ray_t* tv = NULL;
+    bool target_global = ray_env_target_resolve(x, &target, &tv) == RAY_OK && target.scope == -1;
+    /* With no frame of its own open, a binding is global, as at the top
+     * level, and the markers leave the caller's top frame alone. */
+    bool bind_global = ray_env_set_local(y, v6) == RAY_OK &&
+                       ray_env_set_local_rows(y2, v8, 0) == RAY_OK;
+    ray_env_mark_lexical_scope(0);
+    ray_env_mark_eval_window();
+    ray_env_isolate_end(saved);
+
+    got = ray_env_get(x);
+    bool caller_back = got && got->i64 == 99 && ray_env_scope_depth() == base + 4;
+    ray_t* gw = ray_env_get_compiled(w);          /* no eval window on w's frame */
+    bool not_window = gw && gw->i64 == 5;
+    cap = ray_env_capture_locals();               /* no lexical mark on w's frame */
+    bool captures_x = false;
+    if (cap && !RAY_IS_ERR(cap)) {
+        ray_t* keys = ray_dict_keys(cap);
+        for (int64_t i = 0; keys && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == x) captures_x = true;
+        ray_release(cap);
+    }
+    bool frames_unbound = ray_env_get_local(y) == NULL && ray_env_get_local(y2) == NULL;
+    for (int i = 0; i < 4; i++) ray_env_pop_scope();
+    ray_t* gy = ray_env_get_global(y), *gy2 = ray_env_get_global(y2);
+    bool globals_bound = gy && gy->i64 == 6 && gy2 && gy2->i64 == 8;
+    ray_release(v99); ray_release(v5); ray_release(v6); ray_release(v8);
+    ray_release(tbl);
+
+    TEST_ASSERT_TRUE(caller_sees);
+    TEST_ASSERT_TRUE(get_global);
+    TEST_ASSERT_TRUE(no_local);
+    TEST_ASSERT_TRUE(no_query);
+    TEST_ASSERT_TRUE(no_capture);
+    TEST_ASSERT_TRUE(resolve_global);
+    TEST_ASSERT_TRUE(accessor_global);
+    TEST_ASSERT_TRUE(target_global);
+    TEST_ASSERT_TRUE(bind_global);
+    TEST_ASSERT_TRUE(caller_back);
+    TEST_ASSERT_TRUE(not_window);
+    TEST_ASSERT_TRUE(captures_x);
+    TEST_ASSERT_TRUE(frames_unbound);
+    TEST_ASSERT_TRUE(globals_bound);
     PASS();
 }
 
@@ -12845,6 +12975,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
     { "lang/eval/restricted_trusted_lambda", test_eval_restricted_trusted_lambda, lang_setup, lang_teardown },
     { "lang/eval/restricted_trusted_isolated", test_eval_restricted_trusted_isolated, lang_setup, lang_teardown },
+    { "lang/env/isolate_hides_frames", test_env_isolate_hides_frames, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

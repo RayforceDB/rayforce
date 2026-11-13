@@ -149,8 +149,9 @@ enum {
  *   data[9] = uint32_t capq       (serial of the query frame the closure was
  *                                  made under, 0 if none; never serialized)
  *   data[10] = uint32_t trusted   (set by .sys.trust: a restricted caller
- *                                  may run the body unrestricted; never
- *                                  serialized, never given to a closure)
+ *                                  may run the body unrestricted; written
+ *                                  only to a journal snapshot, never given
+ *                                  to a closure)
  */
 #define LAMBDA_SLOTS 11
 

@@ -684,6 +684,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.mem.objsize` | unary | — | Logical bytes retained by an object graph; shared children count once | `(.mem.objsize value)` |
 | `.mem.ts` | special form | — | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict | `(.mem.ts (select {from: trades}))` |
 | `.sys.exec` | variadic | restricted | Execute a shell command; exit code, or `{code, out}` with `'out` | `(.sys.exec "ls -la" 'out)` |
+| `.sys.trust` | unary | restricted | Mark lambdas a restricted (`-U`) caller may run with the restriction lifted, isolated from the caller; returns its argument | `(.sys.trust 'peer_count)` |
 | `.os.getenv` | unary | restricted | Get environment variable value | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |
 | `.sys.args` | nullary | — | Application arguments as a typed dict; `user` subdict holds post-`--` args | `(.sys.args)` |

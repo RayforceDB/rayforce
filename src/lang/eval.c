@@ -555,9 +555,12 @@ static ray_t* head_not_callable_error(int8_t type) {
  * the caller's scope frames and query (lambda_lifts).
  * The builtin is restricted itself, so only unrestricted code, a boot
  * script, can mark.  The mark lives on the lambda object: ser/de and IPC
- * do not carry it, a closure the body makes does not get it, and a lambda
- * a request builds has none.  A name resolves as evaluating it would; each
- * must hold a lambda, or none is marked.  Returns its argument. */
+ * do not carry it (a journal snapshot does, ray_serde_keep_trust), a
+ * closure the body makes does not get it, and a lambda a request builds
+ * has none.  A name means the global bound to it, as at
+ * the top level (a dotted name walks global dicts), never a local of the
+ * caller; each must hold a lambda, or none is marked.  Returns its
+ * argument. */
 ray_t* ray_sys_trust_fn(ray_t* x) {
     if (x->type == RAY_LAMBDA) {
         LAMBDA_TRUSTED(x) = 1;
@@ -568,21 +571,27 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
         return ray_error("type", ".sys.trust: expected a lambda or the names of lambdas, got %s",
                          ray_type_name(x->type));
     int64_t n = x->type == -RAY_SYM ? 1 : x->len;
-    for (int pass = 0; pass < 2; pass++) {
+    /* Look the names up with every frame hidden, as at the top level. */
+    int32_t scope_base = ray_env_isolate_begin();
+    ray_t* err = NULL;
+    for (int pass = 0; pass < 2 && !err; pass++) {
         for (int64_t i = 0; i < n; i++) {
             int64_t id = x->type == -RAY_SYM ? x->i64
                                              : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
             ray_t* fn = ray_env_get(id);   /* borrowed */
             if (pass == 1) { LAMBDA_TRUSTED(fn) = 1; continue; }
-            if (!fn) return undefined_name_error(id);
+            if (!fn) { err = undefined_name_error(id); break; }
             if (fn->type != RAY_LAMBDA) {
                 ray_t* s = ray_sym_str(id);   /* borrowed */
-                return ray_error("type", ".sys.trust: '%.*s' is %s, not a lambda",
-                                 s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "",
-                                 ray_type_name(fn->type));
+                err = ray_error("type", ".sys.trust: '%.*s' is %s, not a lambda",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "",
+                                ray_type_name(fn->type));
+                break;
             }
         }
     }
+    ray_env_isolate_end(scope_base);
+    if (err) return err;
     ray_retain(x);
     return x;
 }
@@ -3192,6 +3201,7 @@ static inline bool lambda_wants_compile(ray_t* lambda) {
 static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
+    if (out_rows) *out_rows = -1;
     if (RAY_UNLIKELY(lambda_lifts(lambda))) {
         /* Isolated as well as lifted: the body sees its arguments, its
          * captures and the globals, as it would called at the top level.
@@ -3206,10 +3216,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         __VM->restricted = restricted;
         ray_env_isolate_end(scope_base);
         ray_query_resume(&query_state);
-        if (out_rows) *out_rows = -1;   /* computed outside the query */
         return result;
     }
-    if (out_rows) *out_rows = -1;
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
     /* Lazy compilation (see lambda_wants_compile); a closure's captures

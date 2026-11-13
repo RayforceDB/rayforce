@@ -102,6 +102,8 @@ Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null.
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
 
+A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log, so a logged request of a restricted (`-U`) client that called a trusted verb replays as it ran. Recovery runs before the boot script: a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only here; `ser`, `de` and IPC never carry it.
+
 Errors: `domain` (no journal open), `io`.
 
 ## `.log.roll` { #log-roll }

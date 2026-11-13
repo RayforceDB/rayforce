@@ -898,7 +898,9 @@ static test_result_t test_ipc_poll_public_restricted(void) {
  * marked with .sys.trust, so a restricted client calling it gets the peer's
  * answer, while the same client opening a connection itself, or calling the
  * unmarked twin of the verb, is refused.  The verb reads the server's peer
- * address even when the client binds that name itself.
+ * address even when the client binds that name itself, and the helper it
+ * calls stays the server's: a request that tries to rebind the helper is
+ * refused, and the next request's call of the verb gets the helper's value.
  */
 static test_result_t test_ipc_restricted_trusted_verb(void) {
     ray_test_server_t peer, srv;
@@ -912,7 +914,9 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
              "                              (let r (.ipc.send h \"(count (til 3))\"))"
              "                              (.ipc.close h) r))"
              "    (set __rf787_count_plain (fn [] (.ipc.open __rf787_peer)))"
-             "    (.sys.trust '__rf787_count) 0)",
+             "    (set __rf787_helper (fn [] 7))"
+             "    (set __rf787_use_helper (fn [] (__rf787_helper)))"
+             "    (.sys.trust ['__rf787_count '__rf787_use_helper]) 0)",
              (unsigned)peer.port);
     ray_t* b = ray_eval_str(boot);
     TEST_ASSERT_NOT_NULL(b);
@@ -922,12 +926,21 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
     int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "restricted client h >= 0");
 
-    const char* asks[] = { "(__rf787_count)", "(__rf787_count_plain)",
-                           "(.ipc.open __rf787_peer)", "(do (__rf787_count) (set '__rf787_x 1))",
-                           "(do (let __rf787_peer \"127.0.0.1:1\") (__rf787_count))" };
-    ray_t* got[5];
-    for (int i = 0; i < 5; i++) {
-        ray_t* msg = ray_str(asks[i], strlen(asks[i]));
+    /* Each line is a request of its own; want -1 means `access`. */
+    static const struct { const char* ask; int64_t want; } reqs[] = {
+        { "(__rf787_count)", 3 },
+        { "(__rf787_count_plain)", -1 },
+        { "(.ipc.open __rf787_peer)", -1 },
+        { "(do (__rf787_count) (set '__rf787_x 1))", -1 },
+        { "(do (let __rf787_peer \"127.0.0.1:1\") (__rf787_count))", 3 },
+        { "(let __rf787_helper (fn [] 66))", -1 },
+        { "(set __rf787_helper (fn [] 66))", -1 },
+        { "(__rf787_use_helper)", 7 },
+    };
+    enum { NREQ = sizeof reqs / sizeof reqs[0] };
+    ray_t* got[NREQ];
+    for (int i = 0; i < NREQ; i++) {
+        ray_t* msg = ray_str(reqs[i].ask, strlen(reqs[i].ask));
         got[i] = ray_ipc_send(h, msg);
         ray_release(msg);
     }
@@ -935,19 +948,16 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
     ray_test_server_stop(&srv);
     ray_test_server_stop(&peer);
 
-    for (int i = 0; i < 5; i += 4) {
-        TEST_ASSERT_NOT_NULL(got[i]);
-        TEST_ASSERT_FALSE(RAY_IS_ERR(got[i]));
-        TEST_ASSERT_EQ_I(got[i]->type, -RAY_I64);
-        TEST_ASSERT_EQ_I(got[i]->i64, 3);
-        ray_release(got[i]);
+    int bad = 0;
+    for (int i = 0; i < NREQ; i++) {
+        bool ok = got[i] && (reqs[i].want < 0
+            ? RAY_IS_ERR(got[i]) && strcmp(ray_err_code(got[i]), "access") == 0
+            : !RAY_IS_ERR(got[i]) && got[i]->type == -RAY_I64 && got[i]->i64 == reqs[i].want);
+        if (!ok) { bad++; fprintf(stderr, "  request %s: unexpected answer\n", reqs[i].ask); }
+        if (got[i] && RAY_IS_ERR(got[i])) ray_error_free(got[i]);
+        else if (got[i]) ray_release(got[i]);
     }
-    for (int i = 1; i < 4; i++) {
-        TEST_ASSERT_NOT_NULL(got[i]);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(got[i]));
-        TEST_ASSERT_STR_EQ(ray_err_code(got[i]), "access");
-        ray_release(got[i]);
-    }
+    TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
 

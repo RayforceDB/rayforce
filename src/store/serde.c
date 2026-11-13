@@ -94,7 +94,18 @@
  * RAY_FN_COMPILED, not "has nulls".  Only params/body cross the wire, so
  * compiled metadata must be stripped and rebuilt by the receiving runtime. */
 #define RAY_SERDE_LAMBDA_HAS_CLOSURE ((uint8_t)0x01)
+/* The lambda is trusted (.sys.trust).  Written and read only while
+ * ray_serde_keep_trust is on; a reader that predates it ignores the bit. */
+#define RAY_SERDE_LAMBDA_TRUSTED     ((uint8_t)0x02)
 #define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK RAY_SERDE_LAMBDA_HAS_CLOSURE
+
+static _Thread_local bool g_serde_keep_trust;
+
+bool ray_serde_keep_trust(bool on) {
+    bool prev = g_serde_keep_trust;
+    g_serde_keep_trust = on;
+    return prev;
+}
 
 /* Helper: strlen with bounds */
 static size_t safe_strlen(const uint8_t* buf, int64_t max) {
@@ -1029,7 +1040,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LAMBDA: {
-        buf[0] = LAMBDA_CLOSURE(obj) ? RAY_SERDE_LAMBDA_HAS_CLOSURE : 0;
+        buf[0] = (LAMBDA_CLOSURE(obj) ? RAY_SERDE_LAMBDA_HAS_CLOSURE : 0) |
+                 (g_serde_keep_trust && LAMBDA_TRUSTED(obj) ? RAY_SERDE_LAMBDA_TRUSTED : 0);
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
@@ -1572,6 +1584,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         ((ray_t**)ray_data(lambda))[0] = params;
         ((ray_t**)ray_data(lambda))[1] = body;   /* not-a-table */
         LAMBDA_CLOSURE(lambda) = closure;
+        if (g_serde_keep_trust && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED))
+            LAMBDA_TRUSTED(lambda) = 1;
         return lambda;
     }
 

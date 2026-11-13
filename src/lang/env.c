@@ -256,9 +256,9 @@ static int64_t g_self_sym = -1;
 ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     if (flags_out) *flags_out = NULL;
     if (serial_out) *serial_out = 0;
-    if (!__VM || __VM->scope_depth <= __VM->scope_base) return NULL;
+    if (!__VM || __VM->scope_depth == 0) return NULL;
     int64_t capacity = 0;
-    for (int32_t d = __VM->scope_base; d < __VM->scope_depth; d++)
+    for (int32_t d = 0; d < __VM->scope_depth; d++)
         capacity += __VM->scope_stack[d].count;
     if (capacity == 0) return NULL;
 
@@ -419,7 +419,6 @@ ray_err_t ray_env_init(void) {
     for (size_t i = 0; i < sizeof(g_env_slot_filter) / sizeof(g_env_slot_filter[0]); i++)
         atomic_store_explicit(&g_env_slot_filter[i], 0, memory_order_relaxed);
     __VM->scope_depth = 0;
-    __VM->scope_base = 0;
     /* The IPC hook sym IDs are interned lazily on first probe via
      * `ipc_hook_syms_ensure`.  We deliberately do NOT pre-intern here:
      * single-char operator names (`+`, `-`, `*`, …) are registered just
@@ -436,7 +435,6 @@ ray_err_t ray_env_init(void) {
 void ray_env_destroy(void) {
     env_globals_moved();
     /* Pop any remaining scopes */
-    __VM->scope_base = 0;
     while (__VM->scope_depth > 0) ray_env_pop_scope();
     for (int32_t i = 0; i < g_env.count; i++) {
         if (g_env.vals[i]) ray_release(g_env.vals[i]);
@@ -1157,7 +1155,7 @@ bool ray_env_dotted_sole(int64_t sym_id, ray_t* leaf) {
 }
 
 static ray_t* lookup_top_frame(int64_t sym_id) {
-    if (__VM->scope_depth <= __VM->scope_base) return NULL;
+    if (__VM->scope_depth <= 0) return NULL;
     ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
     for (int32_t i = 0; i < f->count; i++) {
         if (f->keys[i] == sym_id) return f->vals[i];
@@ -1213,7 +1211,7 @@ static ray_err_t target_flat(int64_t name, bool via_callee, int32_t* scope, ray_
     if (via_callee) {
         /* Past the frames of the function making the call: down to and
          * including the one that bounds it. */
-        while (d >= base) {
+        while (d >= 0) {
             bool bound = __VM->scope_stack[d].lexical;
             d--;
             if (bound) break;
@@ -1496,7 +1494,7 @@ ray_err_t ray_env_scope_bind(const int64_t* syms, int32_t n, ray_t** slots,
  * code drops it with this frame — names must be introduced lexically
  * for the compiler to allocate a slot, same as before). */
 void ray_env_scope_sync(const int64_t* syms, int32_t n, ray_t** slots) {
-    if (__VM->scope_depth > __VM->scope_base) {
+    if (__VM->scope_depth > 0) {
         ray_scope_frame_t* f = &__VM->scope_stack[__VM->scope_depth - 1];
         for (int32_t i = 0; i < n; i++) {
             if (syms[i] < 0) continue;
