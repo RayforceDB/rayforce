@@ -1926,6 +1926,39 @@ boxed:;
  * Higher-order functions: map, pmap, fold, scan, filter, apply
  * ══════════════════════════════════════════ */
 
+/* Calling a variadic builtin or a special form with values (map, fold, scan,
+ * apply, ... hand their function its arguments already evaluated).
+ *
+ * An ordinary variadic builtin takes values: the same call the evaluator
+ * makes for (f x y).  A special form takes its argument expressions and
+ * evaluates them itself, so handed values it would evaluate them again (a
+ * boxed list value would run as a call); `and` and `or` are the exceptions,
+ * because the evaluator's own element-wise binary forms, ray_and_fn and
+ * ray_or_fn, give the same answer for values that are already evaluated, and
+ * a single value is their identity. */
+static bool fn_is_vary(const ray_t* fn, ray_vary_fn f) {
+    return fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == f;
+}
+
+static ray_t* special_form_value_error(const ray_t* fn) {
+    return ray_error("type", "call: '%s' is a special form: it takes its arguments unevaluated, "
+                             "so it cannot be applied to values", ray_fn_name(fn));
+}
+
+/* An ordinary variadic builtin applied to `n` borrowed values. */
+static ray_t* call_vary_values(ray_t* fn, ray_t* const* args, int64_t n) {
+    if (fn->attrs & RAY_FN_SPECIAL_FORM) return special_form_value_error(fn);
+    ray_t* own[2];
+    for (int64_t i = 0; i < n; i++) { ray_retain(args[i]); own[i] = args[i]; }
+    if (!(fn->attrs & RAY_FN_LAZY_AWARE)) {
+        ray_t* err = materialize_owned_args(own, n);   /* releases them all on error */
+        if (err) return err;
+    }
+    ray_t* r = ((ray_vary_fn)(uintptr_t)fn->i64)(own, n);
+    for (int64_t i = 0; i < n; i++) ray_release(own[i]);
+    return r;
+}
+
 /* Helper: call a function object with 1 arg, returning result.
  * Handles UNARY, BINARY, LAMBDA types. Does not release fn or arg. */
 ray_t* call_fn1(ray_t* fn, ray_t* arg) {
@@ -1952,14 +1985,29 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
         ray_t* args[1] = { arg };
         return call_lambda(fn, args, 1);
     }
+    if (fn->type == RAY_BINARY)
+        return ray_error("arity", "call: '%s' expects 2 arguments, got 1", ray_fn_name(fn));
+    if (fn->type == RAY_VARY) {
+        if (fn_is_vary(fn, ray_and_vary_fn) || fn_is_vary(fn, ray_or_vary_fn)) {
+            /* (and x) is (or x) is x */
+            ray_t* a = arg;
+            ray_retain(a);
+            if (ray_is_lazy(a)) a = ray_lazy_materialize(a);   /* consumes our ref */
+            return a ? a : ray_error("type", NULL);
+        }
+        return call_vary_values(fn, &arg, 1);
+    }
     return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
 }
 
 /* Helper: call a function object with 2 args. Does not release fn or args. */
 ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
     if (fn_is_restricted(fn)) return ray_error("access", "restricted");
-    if (fn->type == RAY_BINARY) {
-        ray_binary_fn f = (ray_binary_fn)(uintptr_t)fn->i64;
+    ray_binary_fn bin = NULL;
+    if (fn->type == RAY_BINARY)                  bin = (ray_binary_fn)(uintptr_t)fn->i64;
+    else if (fn_is_vary(fn, ray_and_vary_fn))    bin = ray_and_fn;
+    else if (fn_is_vary(fn, ray_or_vary_fn))     bin = ray_or_fn;
+    if (bin) {
         ray_t* la = a;
         ray_t* lb = b;
         bool owned_a = false, owned_b = false;
@@ -1982,9 +2030,9 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
         }
         ray_t* r;
         if ((fn->attrs & RAY_FN_ATOMIC) && (is_collection(la) || is_collection(lb)))
-            r = atomic_map_binary(f, la, lb);
+            r = atomic_map_binary(bin, la, lb);
         else
-            r = f(la, lb);
+            r = bin(la, lb);
         if (owned_a) ray_release(la);
         if (owned_b) ray_release(lb);
         return r;
@@ -2023,6 +2071,10 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
         }
         /* Legacy helper behavior for unary functions without an overload. */
         return f(a);
+    }
+    if (fn->type == RAY_VARY) {
+        ray_t* args[2] = { a, b };
+        return call_vary_values(fn, args, 2);
     }
     return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
 }
