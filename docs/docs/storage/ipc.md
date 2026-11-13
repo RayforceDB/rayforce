@@ -100,7 +100,7 @@ In restricted mode, specific builtins that write files, mutate state, or control
 | IPC chaining | `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post` |
 
 !!! note "Scope"
-    Restricted mode blocks every builtin registered with `RAY_FN_RESTRICTED` (the table above is a representative subset). It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
+    Restricted mode blocks every builtin registered with `RAY_FN_RESTRICTED` (the table above is a representative subset). A request cannot bind a global either: a top-level `let`, which binds in the global frame, is refused with `access` just as `set` is, so a client cannot rebind a name other code reads or install a [connection hook](ipc-hooks.md). A `let` inside a lambda or a `do` block binds a local and is allowed. It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
 
 Attempting a restricted operation returns an `"access"` error:
 

@@ -1591,7 +1591,15 @@ ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val) {
      * user-settable here too, matching the global `ray_env_set` path. */
     if (ray_sym_is_reserved(sym_id) && !ray_sym_is_ipc_hook(sym_id))
         return RAY_ERR_RESERVED;
-    if (__VM->scope_depth <= 0) return ray_env_set(sym_id, val);
+    /* With no frame open the binding is a global.  A restricted request
+     * may not write one — `set` is refused for the same reason — so a
+     * top-level `let` (or a loop variable bound at top level) cannot
+     * rebind a name other code reads, nor install a connection hook.
+     * Inside a lambda or `do` the binding stays local and is allowed. */
+    if (__VM->scope_depth <= 0) {
+        if (__VM->restricted) return RAY_ERR_ACCESS;
+        return ray_env_set(sym_id, val);
+    }
     if (ray_sym_is_dotted(sym_id)) {
         return env_set_dotted(sym_id, val, lookup_top_frame, env_bind_local, -1);
     }

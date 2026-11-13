@@ -68,7 +68,7 @@ Anything that isn't a callable lambda is treated as "no hook installed", so a st
 
 ## Restricted Mode
 
-Hooks run under the same restricted-mode flag the inbound message would otherwise see — a `.ipc.on.sync` installed on a `-U` server cannot escalate privilege; the blocked-builtins list in [Authentication](ipc.md#authentication) applies inside the hook body too.
+`.ipc.on.sync` and `.ipc.on.async` run under the same restricted-mode flag the inbound message would otherwise see: on a `-U` server the blocked-builtins list in [Authentication](ipc.md#authentication) applies inside the hook body too. `.ipc.on.open`, `.ipc.on.close` and `.ipc.on.auth` run as server code, outside any request. On a `-U` server only the server itself can install a hook: a restricted request can run neither `set` nor a top-level `let`, the two ways to bind a hook name.
 
 ## Reading the Current Handle
 

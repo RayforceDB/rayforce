@@ -588,3 +588,5 @@ if (RAY_IS_ERR(result)) {
 | `RAY_ERR_LIMIT` | 14 | Limit exceeded |
 | `RAY_ERR_RESERVED` | 15 | Reserved name |
 | `RAY_ERR_VERSION` | 16 | Version mismatch |
+| `RAY_ERR_FPENV` | 17 | Unsupported floating-point controls |
+| `RAY_ERR_ACCESS` | 18 | Refused in restricted mode |
