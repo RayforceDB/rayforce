@@ -27,6 +27,9 @@
 #include "lang/format.h"  /* ray_type_name (error context) */
 #include "core/pool.h"    /* ray_pool_dispatch — parallel extract/truncate */
 #include <time.h>
+#if defined(RAY_OS_WINDOWS)
+#include <windows.h>
+#endif
 
 /* ============================================================================
  * ray_temporal_extract — standalone extract, usable outside the DAG.
@@ -889,11 +892,28 @@ static time_t ray_epoch_offset(void) {
     return (time_t)946684800;
 }
 
+/* Wall clock in nanoseconds since the Unix epoch, at the system clock's
+ * full resolution.  time(NULL) only ticks once a second, which left every
+ * clock read below with a zero sub-second part. */
+static int64_t unix_now_ns(void) {
+#if defined(RAY_OS_WINDOWS)
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    /* 100 ns ticks since 1601-01-01; 116444736000000000 of them to 1970. */
+    uint64_t ticks = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (int64_t)(ticks - 116444736000000000ULL) * 100;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
+}
+
 /* Current UTC wall-clock as a RAY_TIMESTAMP value (ns since 2000-01-01).
  * The one place the epoch conversion lives; internal callers (query log, …)
  * reuse it rather than re-deriving the offset. */
 int64_t ray_timestamp_now_ns(void) {
-    return ((int64_t)time(NULL) - (int64_t)ray_epoch_offset()) * 1000000000LL;
+    return unix_now_ns() - (int64_t)ray_epoch_offset() * 1000000000LL;
 }
 
 /* (date 'local) or (date 'global) — returns current date as DATE atom.
@@ -936,23 +956,27 @@ ray_t* ray_time_clock_fn(ray_t* arg) {
             return ray_temporal_truncate(arg, RAY_EXTRACT_SECOND);
     }
     bool local = !is_global_arg(arg);
-    time_t now = time(NULL);
+    int64_t now_ns = unix_now_ns();
+    time_t now = (time_t)(now_ns / 1000000000LL);
     struct tm* t = local ? localtime(&now) : gmtime(&now);
     if (!t) return ray_error("domain", "time: failed to get current time");
 
-    int32_t ms = t->tm_hour * 3600000 + t->tm_min * 60000 + t->tm_sec * 1000;
-    return ray_time((int64_t)ms);
+    int64_t ms = (int64_t)t->tm_hour * 3600000 + (int64_t)t->tm_min * 60000
+               + (int64_t)t->tm_sec * 1000 + (now_ns % 1000000000LL) / 1000000LL;
+    return ray_time(ms);
 }
 
 /* (timestamp 'local) or (timestamp 'global) — returns current timestamp (ns since 2000.01.01) */
 ray_t* ray_timestamp_clock_fn(ray_t* arg) {
     bool local = !is_global_arg(arg);
-    time_t now = time(NULL);
-    struct tm* t = local ? localtime(&now) : gmtime(&now);
-    if (!t) return ray_error("domain", "timestamp: failed to get current time");
-
+    int64_t now_ns = unix_now_ns();
+    int64_t sub_ns = now_ns % 1000000000LL;
     if (!local)
-        return ray_timestamp(ray_timestamp_now_ns());
+        return ray_timestamp(now_ns - (int64_t)ray_epoch_offset() * 1000000000LL);
+
+    time_t now = (time_t)(now_ns / 1000000000LL);
+    struct tm* t = localtime(&now);
+    if (!t) return ray_error("domain", "timestamp: failed to get current time");
 
     /* Local wall clock as a timestamp: the broken-down local fields read
      * as UTC (timegm).  mktime converts them straight back to the same
@@ -960,5 +984,5 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
     struct tm lt = *t;
     lt.tm_isdst = 0;
     int64_t secs = (int64_t)timegm(&lt) - ray_epoch_offset();
-    return ray_timestamp(secs * 1000000000LL);
+    return ray_timestamp(secs * 1000000000LL + sub_ns);
 }

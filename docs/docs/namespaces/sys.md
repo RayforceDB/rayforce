@@ -94,13 +94,13 @@ peer can check a stale cursor against:
 (format "%-%-%" (get (.sys.info) 'hostname)
                 (get (.sys.info) 'pid)
                 (timestamp 'global))
-;; => "tp-prod-01-48213-2026.09.18D10:05:59.000000000"
+;; => "tp-prod-01-48213-2026.09.18D10:05:59.482917304"
 ```
 
 That identity is worth preferring over a random token because it is
 diagnosable: reading it back tells you which host and which process produced
-it. Note `(timestamp 'global)` is second-resolution, so pid is what separates
-two starts within the same second.
+it. `(timestamp 'global)` carries the system clock's sub-second part, so two
+starts rarely share a stamp; pid is what still separates them when they do.
 
 If `hostname` cannot be obtained, it reports `""` rather than failing the whole
 call — one unavailable field should not cost the caller the others.
