@@ -1483,11 +1483,14 @@ static test_result_t test_journal_snapshot_function_binding_recovers(void) {
 }
 
 /* 7f. #787: a snapshot keeps its lambdas' .sys.trust marks.  A trusted verb
- * and its unmarked twin are snapshotted, then two restricted requests are
- * logged after the snapshot.  Recovery, in a process where neither is
- * bound, restores the mark before it replays the log: the trusted verb's
- * write replays as it ran, the twin's is refused again.  Outside the
- * snapshot the mark is neither written nor read. */
+ * and its unmarked twin are snapshotted, then three restricted requests are
+ * logged after the snapshot, as a live server logs them: the verb's call,
+ * which ran lifted (its note follows it), the twin's, and a call of the
+ * verb that was refused live (no note, as when its trust was revoked
+ * after the snapshot).  Recovery, in a process where neither is bound,
+ * restores the mark before it replays the log: only the call that ran
+ * lifted live runs lifted again.  Outside the snapshot the mark is
+ * neither written nor read. */
 static bool jrn_log_restricted(const char* text) {
     ray_t* msg = ray_str(text, strlen(text));
     if (!msg || RAY_IS_ERR(msg)) return false;
@@ -1501,6 +1504,29 @@ static bool jrn_log_restricted(const char* text) {
         hdr.prefix  = RAY_SERDE_PREFIX;
         hdr.version = RAY_SERDE_WIRE_VERSION;
         hdr.flags   = RAY_IPC_FLAG_RESTRICTED;
+        hdr.size    = psize;
+        ok = ray_journal_write_bytes(&hdr, buf, psize) == RAY_OK;
+    }
+    if (buf) ray_sys_free(buf);
+    return ok;
+}
+
+/* The note a live server writes after a restricted request whose trusted
+ * calls ran lifted (RAY_IPC_MSG_JNOTE): their lambdas' identities. */
+static bool jrn_log_note(const int64_t* ids, int64_t n) {
+    ray_t* v = ray_vec_from_raw(RAY_I64, ids, n);
+    if (!v || RAY_IS_ERR(v)) return false;
+    int64_t psize = ray_serde_size(v);
+    uint8_t* buf = psize > 0 ? (uint8_t*)ray_sys_alloc((size_t)psize) : NULL;
+    bool ok = buf && ray_ser_raw(buf, v) == psize;
+    ray_release(v);
+    if (ok) {
+        ray_ipc_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.prefix  = RAY_SERDE_PREFIX;
+        hdr.version = RAY_SERDE_WIRE_VERSION;
+        hdr.endian  = RAY_SERDE_ENDIAN;
+        hdr.msgtype = RAY_IPC_MSG_JNOTE;
         hdr.size    = psize;
         ok = ray_journal_write_bytes(&hdr, buf, psize) == RAY_OK;
     }
@@ -1527,8 +1553,13 @@ static test_result_t test_journal_snapshot_keeps_trust(void) {
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
     ray_release(r);
     TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+    ray_t* live_put = ray_env_get_global(ray_sym_intern("jrn_tr_put", 10));
+    TEST_ASSERT_NOT_NULL(live_put);
+    int64_t put_id = ray_eval_lambda_identity(live_put);
     TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 6)"));
+    TEST_ASSERT_TRUE(jrn_log_note(&put_id, 1));
     TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_plain 7)"));
+    TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 8)"));
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
 
     /* A fresh process: nothing bound, nothing marked. */
@@ -1576,6 +1607,32 @@ static test_result_t test_journal_snapshot_keeps_trust(void) {
     }
     TEST_ASSERT_TRUE(plain_unmarked);
     TEST_ASSERT_TRUE(marked_unmarked);
+    PASS();
+}
+
+/* 7g. #787: a journal note is no entry.  The note after a restricted frame
+ * belongs to it, and one with no request right before it (left by a roll
+ * or a snapshot between the two) is skipped: replay counts and evaluates
+ * the requests only. */
+static test_result_t test_journal_lift_note_not_an_entry(void) {
+    char base[256]; make_base(base, sizeof(base), "lift_note");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    int64_t ids[2] = { 1, 2 };
+    TEST_ASSERT_TRUE(jrn_log_note(&ids[0], 1));
+    TEST_ASSERT_TRUE(jrn_log_restricted("(+ 1 2)"));
+    TEST_ASSERT_TRUE(jrn_log_note(&ids[1], 1));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    int64_t chunks = -1, errs = -1;
+    ray_jreplay_status_t status = RAY_JREPLAY_OK;
+    ray_err_t e = ray_journal_replay(lpath, &chunks, &errs, &status);
+    cleanup_base(base);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
     PASS();
 }
 
@@ -3380,6 +3437,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },
+    { "journal/lift_note_not_an_entry",    test_journal_lift_note_not_an_entry,    jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */

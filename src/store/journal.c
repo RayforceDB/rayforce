@@ -288,6 +288,33 @@ static bool decompress_if_needed(const ray_ipc_header_t* hdr,
 
 /* Evaluate a deserialized message exactly as eval_payload would: string
  * payloads run through ray_eval_str, everything else through ray_eval. */
+/* The note right after a restricted frame, when the next frame is one: an
+ * owned I64 vector of the identities of the trusted calls that ran lifted
+ * live (RAY_IPC_MSG_JNOTE).  Otherwise NULL, with the file where it was;
+ * a damaged note is left for the frame loop to report. */
+static ray_t* read_lift_note(FILE* f) {
+    long pos = ftell(f);
+    if (pos < 0) return NULL;
+    ray_t* note = NULL;
+    ray_ipc_header_t nh;
+    if (read_full(f, &nh, sizeof(nh)) == sizeof(nh) &&
+        nh.prefix == RAY_SERDE_PREFIX && nh.version == RAY_SERDE_WIRE_VERSION &&
+        nh.endian == RAY_SERDE_ENDIAN && nh.msgtype == RAY_IPC_MSG_JNOTE &&
+        !(nh.flags & RAY_IPC_FLAG_COMPRESSED) && nh.size > 0 && nh.size <= 256LL*1024*1024) {
+        uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)nh.size);
+        if (buf && read_full(f, buf, (size_t)nh.size) == (size_t)nh.size) {
+            int64_t len = nh.size;
+            ray_t* v = ray_de_raw(buf, &len);
+            if (v && !RAY_IS_ERR(v) && v->type == RAY_I64) note = v;
+            else if (v && RAY_IS_ERR(v)) ray_error_free(v);
+            else if (v) ray_release(v);
+        }
+        if (buf) ray_sys_free(buf);
+    }
+    if (!note && fseek(f, pos, SEEK_SET) != 0) return NULL;
+    return note;
+}
+
 static ray_t* eval_one(ray_t* msg) {
     if (!msg || RAY_IS_ERR(msg)) return msg;
     if (msg->type == -RAY_STR) {
@@ -449,15 +476,28 @@ static ray_err_t journal_replay_from(const char*           path,
             status = RAY_JREPLAY_DESER;
             break;
         }
+        /* A note whose request is not right before it (a roll or a
+         * snapshot in between) is not an entry. */
+        if (hdr.msgtype == RAY_IPC_MSG_JNOTE) { ray_release(msg); continue; }
 
         /* Re-impose the sender's restricted state for THIS frame.  Without
          * this a `-U` client's writes silently elevate to full privilege
          * across crash-restart, since replay runs in the main thread with
-         * no IPC connection context. */
+         * no IPC connection context.  A restricted frame's trusted calls
+         * run lifted only as recorded live: the note after it lists them,
+         * and without one none does. */
+        bool restricted = hdr.flags & RAY_IPC_FLAG_RESTRICTED;
+        ray_t* note = restricted ? read_lift_note(f) : NULL;
+        ray_lift_log_t lifts;
+        if (restricted)
+            ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) : NULL,
+                                note ? note->len : 0);
         ray_restrict_save_t prev_restricted;
-        ray_eval_restrict_enter(hdr.flags & RAY_IPC_FLAG_RESTRICTED, &prev_restricted);
+        ray_eval_restrict_enter(restricted, &prev_restricted);
         ray_t* result = eval_one(msg);
         ray_eval_restrict_leave(&prev_restricted);
+        if (restricted) ray_eval_lift_done(&lifts);
+        if (note) ray_release(note);
         ray_release(msg);
 
         if (result && RAY_IS_ERR(result)) {

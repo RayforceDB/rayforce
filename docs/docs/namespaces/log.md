@@ -102,7 +102,12 @@ Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null.
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
 
-A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log, so a logged request of a restricted (`-U`) client that called a trusted verb replays as it ran. Recovery runs before the boot script: a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only here; `ser`, `de` and IPC never carry it.
+A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live. After a journaled restricted request whose trusted calls ran lifted, the server writes a note listing their lambdas, identified by their serialized form. On replay a call runs lifted only if its lambda is marked and is the next one its request's note lists; a request with no note replays with no lifted call. When a verb's mark changed between the snapshot and the restart:
+
+- **Trust removed after the snapshot** (the boot script no longer marks the verb): the snapshot still marks it during replay, but a call that was refused live has no note entry and is refused again.
+- **Trust added after the snapshot**: replay finds the verb unmarked, or not bound at all if the boot script defines it, so a call that ran lifted live is refused on replay until a snapshot holds the verb marked. Take a snapshot after changing what the boot script trusts.
+
+A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer. Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it, and a note is written only by the server's own journal.
 
 Errors: `domain` (no journal open), `io`.
 

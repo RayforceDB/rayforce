@@ -961,6 +961,111 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
     PASS();
 }
 
+/* ---- test_ipc_restricted_trusted_replay -------------------------------- */
+/*
+ * #787: journal replay lifts exactly the trusted calls that ran lifted live.
+ * Three runs of one -U server on one journal:
+ *   1. boot A trusts put, good and snap; a client's (put 5) runs, (snap)
+ *      writes the snapshot, which holds all three marked;
+ *   2. boot B redefines all three and trusts only good and snap: (put 6) is
+ *      refused, (good 7) runs, (do (good 8) (put 9)) runs good, then is
+ *      refused at put, and a map runs good on each of 10 values;
+ *   3. recovery alone: the snapshot still marks put, but replay refuses
+ *      what was refused live, so kv stays 5, and replays the 10 calls of
+ *      the map, so kv2 is 19.
+ */
+static void ipc_rm_journal(const char* jbase);
+
+static bool rf787_replay_reqs(uint16_t port, const char* const* asks, const int64_t* wants, int n) {
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    if (h < 0) return false;
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        ray_t* msg = ray_str(asks[i], strlen(asks[i]));
+        ray_t* got = ray_ipc_send(h, msg);
+        ray_release(msg);
+        bool ok = got && (wants[i] < 0
+            ? RAY_IS_ERR(got) && strcmp(ray_err_code(got), "access") == 0
+            : !RAY_IS_ERR(got) && got->type == -RAY_I64 && got->i64 == wants[i]);
+        if (!ok) { bad++; fprintf(stderr, "  request %s: unexpected answer\n", asks[i]); }
+        if (got && RAY_IS_ERR(got)) ray_error_free(got);
+        else if (got) ray_release(got);
+    }
+    ray_ipc_close(h);
+    return bad == 0;
+}
+
+static int64_t rf787_replay_global(const char* name) {
+    ray_t* v = ray_env_get_global(ray_sym_intern(name, strlen(name)));
+    return v && v->type == -RAY_I64 ? v->i64 : -1;
+}
+
+static void rf787_replay_fresh(void) {
+    const char* names[] = { "__rf787_kv", "__rf787_kv2", "__rf787_put", "__rf787_good", "__rf787_snap" };
+    ray_t* zero = ray_i64(0);
+    for (int i = 0; i < 5; i++) (void)ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero);
+    ray_release(zero);
+}
+
+static test_result_t test_ipc_restricted_trusted_replay(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_trust_replay");
+    ipc_rm_journal(jbase);
+    const char* defs =
+        "(set __rf787_put (fn [v] (set __rf787_kv v) v))"
+        "(set __rf787_good (fn [v] (set __rf787_kv2 v) v))"
+        "(set __rf787_snap (fn [] (.log.snapshot) 0))";
+    char boot_a[512], boot_b[512];
+    snprintf(boot_a, sizeof boot_a, "(do (set __rf787_kv 0) (set __rf787_kv2 0) %s"
+             " (.sys.trust ['__rf787_put '__rf787_good '__rf787_snap]) 0)", defs);
+    snprintf(boot_b, sizeof boot_b, "(do %s (.sys.trust ['__rf787_good '__rf787_snap]) 0)", defs);
+
+    /* Run 1: boot A. */
+    rf787_replay_fresh();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* b = ray_eval_str(boot_a);
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b));
+    ray_release(b);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
+    const char* asks1[] = { "(__rf787_put 5)", "(__rf787_snap)" };
+    const int64_t wants1[] = { 5, 0 };
+    bool run1 = rf787_replay_reqs(srv.port, asks1, wants1, 2);
+    ray_test_server_stop(&srv);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(run1);
+
+    /* Run 2: recover, then boot B, which no longer trusts put. */
+    rf787_replay_fresh();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_EQ_I(rf787_replay_global("__rf787_kv"), 5);
+    b = ray_eval_str(boot_b);
+    TEST_ASSERT_TRUE(b && !RAY_IS_ERR(b));
+    ray_release(b);
+    RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
+    const char* asks2[] = { "(__rf787_put 6)", "(__rf787_good 7)", "(do (__rf787_good 8) (__rf787_put 9))",
+                            "(last (map __rf787_good (+ 10 (til 10))))" };
+    const int64_t wants2[] = { -1, 7, -1, 19 };
+    bool run2 = rf787_replay_reqs(srv.port, asks2, wants2, 4);
+    ray_test_server_stop(&srv);
+    int64_t kv_live = rf787_replay_global("__rf787_kv"), kv2_live = rf787_replay_global("__rf787_kv2");
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(run2);
+    TEST_ASSERT_EQ_I(kv_live, 5);
+    TEST_ASSERT_EQ_I(kv2_live, 19);
+
+    /* Run 3: recovery alone replays run 2 as it ran. */
+    rf787_replay_fresh();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    int64_t kv = rf787_replay_global("__rf787_kv"), kv2 = rf787_replay_global("__rf787_kv2");
+    bool restored = !ray_eval_get_restricted();
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+    TEST_ASSERT_EQ_I(kv, 5);
+    TEST_ASSERT_EQ_I(kv2, 19);
+    TEST_ASSERT_TRUE(restored);
+    PASS();
+}
+
 /* ---- test_ipc_poll_auth_creds_path ------------------------------------- */
 /*
  * Poll-based auth happy path — exercises ipc_read_creds (lines 503-541) and
@@ -3644,6 +3749,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/poll_based_listen",          test_ipc_poll_based_listen,              ipc_setup, ipc_teardown },
     { "ipc/poll_public_restricted",     test_ipc_poll_public_restricted,         ipc_setup, ipc_teardown },
     { "ipc/restricted_trusted_verb",    test_ipc_restricted_trusted_verb,        ipc_setup, ipc_teardown },
+    { "ipc/restricted_trusted_replay",  test_ipc_restricted_trusted_replay,      ipc_setup, ipc_teardown },
     { "ipc/poll_auth_creds_path",        test_ipc_poll_auth_creds_path,           ipc_setup, ipc_teardown },
     { "ipc/poll_auth_reject",           test_ipc_poll_auth_reject,               ipc_setup, ipc_teardown },
     { "ipc/poll_handshake_version_mismatch", test_ipc_poll_handshake_version_mismatch, ipc_setup, ipc_teardown },
