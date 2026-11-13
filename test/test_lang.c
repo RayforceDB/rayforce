@@ -5533,6 +5533,251 @@ static test_result_t test_eval_parted_list_column(void) {
     return result;
 }
 
+/* ---- Test: a parted insert grows the last partition in place (#921) -----
+ * Through a sole binding, once the active segments are private heap
+ * vectors, a same-key insert appends into them: the table and its
+ * wrappers keep their identity.  Every physical type gives the bytes the
+ * by-value rebuild gives. */
+static test_result_t test_eval_insert_parted_inplace_impl(const char* root) {
+    TEST_ASSERT(lang_parted_wide_fixture(root), "create wide parted fixture");
+    TEST_ASSERT(lang_parted_wide_bind_payloads(), "bind typed payload vectors");
+    char src[1400];
+    int n = snprintf(src, sizeof(src),
+                     "(do (set wa (.db.parted.get \"%s\" 'wide)) "
+                     "    (set wb (.db.parted.get \"%s\" 'wide)) 0)", root, root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format wide parted get");
+    ASSERT_EQ(src, "0");
+
+    static const char* const vec_rows =
+        "(list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+        "      wide_f64v wide_dv wide_tmv wide_tsv wide_gv)";
+    static const char* const null_rows =
+        "(list true 0x07 0Nh 0Ni 0Ne 0Nf 0Nd 0Nt 0Np 0Ng)";
+    int64_t wa_id = ray_sym_intern("wa", 2);
+    ray_t* held = NULL;
+    for (int step = 0; step < 6; step++) {
+        const char* rows = step == 3 ? null_rows : vec_rows;
+        ray_t* before = ray_env_get(wa_id);          /* borrowed */
+        n = snprintf(src, sizeof(src),
+                     "(do (insert 'wa 2024.01.02 %s) "
+                     "    (set wb (insert wb 2024.01.02 %s)) 0)", rows, rows);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format wide insert");
+        ASSERT_EQ(src, "0");
+        ray_t* after = ray_env_get(wa_id);           /* borrowed */
+        /* step 0 copies the mapped segments; step 5 finds a second holder */
+        if (step == 0 || step == 5) TEST_ASSERT_TRUE(after != before);
+        else TEST_ASSERT_EQ_PTR(after, before);
+        if (step == 4) { held = after; ray_retain(held); }
+    }
+    ASSERT_EQ("(count wa)", "(count wb)");
+    TEST_ASSERT_EQ_I(ray_table_nrows(held), ray_table_nrows(ray_env_get(wa_id)) - 2);
+
+    ray_t* wa = ray_eval_str("wa");
+    ray_t* wb = ray_eval_str("wb");
+    TEST_ASSERT_TRUE(wa && !RAY_IS_ERR(wa) && wb && !RAY_IS_ERR(wb));
+    ray_t* ca = lang_parted_insert_counts(wa);
+    ray_t* cb = lang_parted_insert_counts(wb);
+    TEST_ASSERT_TRUE(ca && cb && ca->len == 2 && cb->len == 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ca))[1], ((int64_t*)ray_data(cb))[1]);
+    for (int i = 0; i < LANG_WIDE_NCOLS; i++) {
+        ray_t* a = ((ray_t**)ray_data(lang_parted_insert_col(wa, lang_parted_wide_names[i])))[1];
+        ray_t* b = ((ray_t**)ray_data(lang_parted_insert_col(wb, lang_parted_wide_names[i])))[1];
+        TEST_ASSERT_FMT(a->type == b->type && a->len == b->len,
+                        "%s: type/length differ", lang_parted_wide_names[i]);
+        TEST_ASSERT_FMT((a->attrs & RAY_ATTR_HAS_NULLS) == (b->attrs & RAY_ATTR_HAS_NULLS),
+                        "%s: null hint differs", lang_parted_wide_names[i]);
+        size_t esz = ray_sym_elem_size(a->type, a->attrs);
+        TEST_ASSERT_FMT(memcmp(ray_data(a), ray_data(b), (size_t)a->len * esz) == 0,
+                        "%s: cells differ", lang_parted_wide_names[i]);
+    }
+    ray_release(wa); ray_release(wb); ray_release(held);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: a failed in-place parted insert leaves the partition as it was --
+ * The in-place insert appends column by column.  Fail each allocation of a
+ * 300-row batch over I64, SYM, STR and LIST columns in turn: the call
+ * either lands every row or none, the columns keep one length, a failed
+ * call gives back every reference it took on the batch's LIST cells, and
+ * the same batch lands on the next try. */
+/* The summed reference counts of the cells of _pb's LIST column. */
+static int64_t lang_parted_inplace_cell_refs(void) {
+    ray_t* brk = ray_eval_str("(at _pb 'brk)");
+    if (!brk || RAY_IS_ERR(brk) || brk->type != RAY_LIST) return -1;
+    int64_t refs = 0;
+    ray_t** cells = (ray_t**)ray_data(brk);
+    for (int64_t i = 0; i < brk->len; i++) refs += cells[i] ? (int64_t)cells[i]->rc : 0;
+    ray_release(brk);
+    return refs;
+}
+
+static test_result_t test_eval_insert_parted_inplace_rollback_impl(const char* root) {
+    char day[1024], sym_path[1024], reset[1400];
+    int n1 = snprintf(day, sizeof(day), "%s/2024.01.02/trades", root);
+    int n2 = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n1 > 0 && (size_t)n1 < sizeof(day) &&
+                n2 > 0 && (size_t)n2 < sizeof(sym_path), "format fixture paths");
+    TEST_ASSERT(lang_parted_insert_save_table(
+        "(table ['id 'acct 'note 'brk] "
+        "       (list [1 2] ['a 'b] [\"one\" \"two\"] (list [0 1] [2 3 4])))",
+        day, sym_path), "create parted fixture");
+    ASSERT_EQ("(do (set _pb (table ['id 'acct 'note 'brk] (list (+ 100 (til 300)) "
+              "      (take ['a 'zed] 300) "
+              "      (take [\"a string well past the inline limit\" \"s\"] 300) "
+              "      (map (fn [i] (til (% i 3))) (til 300))))) "
+              "    (set _p1 (table ['id 'acct 'note 'brk] "
+              "      (list [3] ['a] [\"three\"] (list [5])))) 0)", "0");
+    /* the first insert leaves private heap segments for the batch to grow */
+    int n = snprintf(reset, sizeof(reset),
+                     "(do (set pq (.db.parted.get \"%s\" 'trades)) "
+                     "    (insert 'pq 2024.01.02 _p1) 0)", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(reset), "format reset");
+    ray_t* op = ray_parse("(insert 'pq 2024.01.02 _pb)");
+    TEST_ASSERT_TRUE(op && !RAY_IS_ERR(op));
+    int64_t pq_id = ray_sym_intern("pq", 2);
+
+    ASSERT_EQ(reset, "0");
+    ray_t* bound = ray_env_get(pq_id);               /* borrowed */
+    ray_mem_trace_t tr;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    ray_t* r = ray_eval(op);
+    ray_mem_trace_end(&tr);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_EQ_PTR(ray_env_get(pq_id), bound);   /* grown in place */
+    TEST_ASSERT_EQ_I(rb_eval_i64("(count pq)"), 303);
+    int64_t full = rb_eval_i64("(sum (at pq 'id))");
+
+    int64_t failed = 0;
+    for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
+        ASSERT_EQ(reset, "0");
+        int64_t refs = lang_parted_inplace_cell_refs();
+        TEST_ASSERT_TRUE(refs >= 300);
+        ray_alloc_fail_set_for_test(nth, 1);
+        r = ray_eval(op);
+        ray_alloc_fail_set_for_test(0, 0);
+        bool err = r && RAY_IS_ERR(r);
+        if (err) ray_error_free(r); else if (r) ray_release(r);
+        ray_error_clear();
+        int64_t rows = rb_eval_i64("(count pq)");
+        TEST_ASSERT_FMT(rows == 303 || (err && rows == 3),
+                        "allocation %lld: %lld rows after %s", (long long)nth,
+                        (long long)rows, err ? "a failure" : "a success");
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'id))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'acct))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'note))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'brk))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(sum (at pq 'id))"), err ? 6 : full);
+        if (!err) continue;
+        failed++;
+        TEST_ASSERT_FMT(lang_parted_inplace_cell_refs() == refs,
+                        "allocation %lld: LIST cells keep %lld references, had %lld",
+                        (long long)nth, (long long)lang_parted_inplace_cell_refs(),
+                        (long long)refs);
+        ASSERT_EQ("(at pq 'note)", "[\"one\" \"two\" \"three\"]");
+        ASSERT_EQ("(at pq 'brk)", "(list [0 1] [2 3 4] [5])");
+        r = ray_eval(op);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count pq)"), 303);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(sum (at pq 'id))"), full);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (select {from: pq where: (== acct 'zed)}))"), 150);
+        ASSERT_EQ("(get (at pq 'brk) 302)", "[0 1]");
+    }
+    ray_release(op);
+    TEST_ASSERT_FMT(failed > 0, "no allocation failed the call (%lld tried)",
+                    (long long)tr.alloc_count);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace_rollback(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_rb_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_rollback_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: an in-place parted insert of text nulls is seen by the planner --
+ * ray_table_col_has_nulls caches its answer for a parted SYM/STR column on
+ * the column's wrapper, and the in-place insert keeps that wrapper.  Ask
+ * while the columns have no nulls, append a null symbol and then an empty
+ * string in place, and ask again after each. */
+static test_result_t test_eval_insert_parted_inplace_text_nulls_impl(const char* root) {
+    char day[1024], sym_path[1024], load[1400];
+    int n1 = snprintf(day, sizeof(day), "%s/2024.01.02/trades", root);
+    int n2 = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n1 > 0 && (size_t)n1 < sizeof(day) &&
+                n2 > 0 && (size_t)n2 < sizeof(sym_path), "format fixture paths");
+    TEST_ASSERT(lang_parted_insert_save_table(
+        "(table ['id 'acct 'note] (list [1 2] ['a 'b] [\"one\" \"two\"]))",
+        day, sym_path), "create parted fixture");
+    /* the first insert leaves private heap segments for the next to grow */
+    int n = snprintf(load, sizeof(load),
+                     "(do (set pn (.db.parted.get \"%s\" 'trades)) "
+                     "    (insert 'pn 2024.01.02 (list [3] ['c] [\"three\"])) 0)", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(load), "format load");
+    ASSERT_EQ(load, "0");
+    int64_t pn_id = ray_sym_intern("pn", 2);
+    int64_t acct = ray_sym_intern("acct", 4), note = ray_sym_intern("note", 4);
+    ray_t* bound = ray_env_get(pn_id);               /* borrowed */
+
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+    ASSERT_EQ("(at (select {m: (first (asc acct)) n: (first (asc note)) from: pn}) 'm)", "['a]");
+
+    /* no nulls in the batch: still none */
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [4] ['d] [\"four\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+
+    /* a null symbol only: the STR column stays null-free */
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [5] (take [' 'a] 1) [\"five\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);   /* grown in place */
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [6] ['e] [\"\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, note));
+
+    ASSERT_EQ("(count (select {from: pn where: (nil? acct)}))", "1");
+    ASSERT_EQ("(count (select {from: pn where: (nil? note)}))", "1");
+    ASSERT_EQ("(nil? (at (at (select {m: (first (asc acct)) from: pn}) 'm) 0))", "true");
+    ASSERT_EQ("(at (select {n: (first (asc note)) from: pn}) 'n)", "[\"\"]");
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace_text_nulls(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_tn_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_text_nulls_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
 /* ---- Test: upsert (update existing row) ---- */
 static test_result_t test_eval_upsert(void) {
     /* Upsert by 'name key — row with name=2 exists, update it */
@@ -12273,6 +12518,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_physical_types", test_eval_insert_parted_physical_types, lang_setup, lang_teardown },
     { "lang/eval/parted_list_column", test_eval_parted_list_column, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace", test_eval_insert_parted_inplace, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace_rollback", test_eval_insert_parted_inplace_rollback, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace_text_nulls", test_eval_insert_parted_inplace_text_nulls, lang_setup, lang_teardown },
     { "lang/eval/upsert", test_eval_upsert, lang_setup, lang_teardown },
     { "lang/eval/upsert_f64_key", test_eval_upsert_f64_key, lang_setup, lang_teardown },
     { "lang/eval/upsert_str_key", test_eval_upsert_str_key, lang_setup, lang_teardown },
