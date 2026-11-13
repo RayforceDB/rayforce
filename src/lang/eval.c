@@ -193,11 +193,9 @@ bool ray_raise_render(char* buf, size_t cap) {
  * Restricted-mode check
  * ══════════════════════════════════════════ */
 
-void ray_eval_set_restricted(bool on) {
-    if (!__VM) return;
-    __VM->restricted = on;
-    __VM->restricted_base = on ? __VM->scope_depth : 0;
-}
+/* The flag alone; the frames a request may bind in are recorded by
+ * ray_eval_restrict_enter, which is how a request is evaluated. */
+void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
 
 /* A request is evaluated in the restriction of the connection it came on.
