@@ -583,11 +583,10 @@ typedef struct ray_graph {
     const uint32_t* sel_alias_ids;
     int             sel_alias_n;
 
-    /* Set by compile_expr_dag when it declines an expression that can
-     * only fail (arithmetic on a symbol column).  A caller with an
-     * evaluation fallback ignores it — the evaluator raises the same
-     * error; one without reports it instead of a generic compile
-     * failure.  Owned; released by ray_graph_free. */
+    /* First known lowering failure: semantic error or allocation/limit
+     * failure. Unsupported syntax alone leaves this NULL. Owned; released
+     * by ray_graph_free unless detached by the caller. A returned node does
+     * not clear it; classification probes must report it before routing. */
     ray_t*          compile_err;
 
     /* > 0 while compile_expr_dag is inside a branch of `if`/`cond`.  The
