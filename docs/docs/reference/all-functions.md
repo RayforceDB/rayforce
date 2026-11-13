@@ -217,8 +217,8 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `map` | variadic | — | Apply function to each element; same-type atom results form a typed vector, otherwise a list | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
-| `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `map` | variadic | — | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (a collection `val` gives one row per element; same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-while` | variadic | — | Fold that stops when the accumulator fails pred | `(fold-while (fn [a] (< a 100)) + 0 (til 1000))` → `105` |
@@ -227,7 +227,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 | `scan-left` | variadic | — | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-right` | variadic | — | Right-to-left running fold (returns a list) | `(scan-right + (enlist 1 2 3))` → `(6 5 3)` |
 | `filter` | binary | — | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
-| `apply` | variadic | — | Zip-apply function pairwise over lists | `(apply + (enlist 1 2) (enlist 3 4))` → `(4 6)` |
+| `apply` | variadic | — | `(apply f a b)` calls `f` on the elements of two collections taken in step, `f(a_0, b_0)`, `f(a_1, b_1)`, ...; the result is as long as the shorter one. Results are collected as `map`'s are. Two atoms call `f` once. Exactly 3 arguments | `(apply + [1 2 3] [10 20 30])` → `[11 22 33]` |
 | `map-left` | variadic | — | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
 | `map-right` | variadic | — | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 | `prior` | variadic | — | Apply a binary fn to each element and its predecessor (first paired with itself); returns a list | `(prior - [1 3 6 10])` → `(0 2 3 4)` |
@@ -380,11 +380,11 @@ Special forms receive their arguments unevaluated. These are the core language p
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
-| `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
+| `let` | binary | special | Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
 | `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
-| `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass; returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
+| `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass (at the top level a global, refused for a restricted caller); returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
 | `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |

@@ -111,6 +111,9 @@ typedef struct {
     int32_t          rows_cond;
     int32_t          scope_depth;
     bool             restricted; /* -U connection on this stack */
+    /* scope_depth when the restricted request began: frames at or below
+     * it belong to the code it was dispatched from, not to the request */
+    int32_t          restricted_base;
     int32_t          id;
     ray_t           *nfo;        /* source-info of the eval in progress (borrowed) */
     void            *heap;

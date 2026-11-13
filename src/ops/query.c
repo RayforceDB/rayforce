@@ -27843,6 +27843,23 @@ static ray_t* intern_parted_payload_symbols(ray_t* tbl,
     return NULL;
 }
 
+static ray_t* fill_parted_sym_segment(parted_insert_view_t* v,
+                                      ray_t* payload, ray_t* seg,
+                                      int64_t old_len, int64_t batch) {
+    for (int64_t r = 0; r < batch; r++) {
+        const char* s = NULL; size_t slen = 0;
+        int64_t src_r = parted_value_is_scalar(payload) ? 0 : r;
+        if (!parted_sym_payload_bytes(payload, src_r, &s, &slen))
+            return ray_error("corrupt", "insert: could not resolve a staged SYM payload cell");
+        int64_t pos = ray_sym_domain_find(v->sym_dom, s, slen);
+        if (pos < 0)
+            return ray_error("corrupt", "insert: staged SYM is absent after domain intern");
+        ray_write_sym(ray_data(seg), old_len + r, (uint64_t)pos,
+                      RAY_SYM, seg->attrs);
+    }
+    return NULL;
+}
+
 static ray_t* fill_parted_payload_symbols(ray_t* tbl,
                                           parted_insert_view_t* v,
                                           ray_t* vals,
@@ -27855,24 +27872,165 @@ static ray_t* fill_parted_payload_symbols(ray_t* tbl,
         ray_col_meta_t wm;
         ray_table_col_meta_idx(tbl, c + 1, &wm);             /* validated wrapper */
         if (RAY_PARTED_BASETYPE(wm.type) != RAY_SYM) continue;
-        ray_t* payload = pv[c];
-        ray_t* seg = sv[c];
-        for (int64_t r = 0; r < batch; r++) {
-            const char* s = NULL; size_t slen = 0;
-            int64_t src_r = parted_value_is_scalar(payload) ? 0 : r;
-            if (!parted_sym_payload_bytes(payload, src_r, &s, &slen))
-                return ray_error("corrupt", "insert: could not resolve a staged SYM payload cell");
-            int64_t pos = ray_sym_domain_find(v->sym_dom, s, slen);
-            if (pos < 0)
-                return ray_error("corrupt", "insert: staged SYM is absent after domain intern");
-            ray_write_sym(ray_data(seg), old_len + r, (uint64_t)pos,
-                          RAY_SYM, seg->attrs);
-        }
+        ray_t* err = fill_parted_sym_segment(v, pv[c], sv[c], old_len, batch);
+        if (err) return err;
     }
     return NULL;
 }
 
-static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
+/* A heap block this insert may write: one reference, no mapping, no view. */
+static bool parted_block_private(const ray_t* v) {
+    return v && !RAY_IS_ERR(v) && v->rc == 1 && v->mmod == 0 &&
+           !(v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_ARENA));
+}
+
+/* Mark HAS_NULLS from the cells appended at [from, len): the prefix was
+ * finalized when its segment was built, so only the batch is scanned. */
+static void finalize_parted_tail_nulls(ray_t* vec, int64_t from) {
+    if ((vec->attrs & RAY_ATTR_HAS_NULLS) ||
+        vec->type == RAY_BOOL || vec->type == RAY_U8) return;
+    const void* d = ray_data(vec);
+    for (int64_t r = from; r < vec->len; r++) {
+        if (ray_raw_is_null(vec->type, vec->attrs, d, r)) {
+            vec->attrs |= RAY_ATTR_HAS_NULLS;
+            return;
+        }
+    }
+}
+
+/* Append one prevalidated payload to a private active segment.  The helpers
+ * leave the vector they were passed alive on failure, so *slot always holds
+ * a valid segment, grown or not. */
+static ray_t* append_parted_payload_inplace(ray_t** slot, int8_t base,
+                                            ray_t* payload, int64_t batch) {
+    ray_t* seg = *slot;
+    ray_t* res = seg;
+    if (base == RAY_LIST) {
+        bool boxed = payload->type == RAY_LIST;       /* else one cell, broadcast */
+        ray_t** cells = boxed ? (ray_t**)ray_data(payload) : NULL;
+        for (int64_t r = 0; r < batch; r++) {
+            res = ray_list_append(seg, boxed ? cells[r] : payload);
+            if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+            *slot = seg = res;
+        }
+        return NULL;
+    }
+    if (base == RAY_SYM) {
+        /* Positions are written after the domain intern; hold their place
+         * with the reserved empty symbol. */
+        static const int64_t zeros[256] = {0};
+        for (int64_t done = 0; done < batch; ) {
+            int64_t n = batch - done < 256 ? batch - done : 256;
+            res = ray_vec_append_raw(seg, zeros, n);
+            if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+            *slot = seg = res;
+            done += n;
+        }
+        return NULL;
+    }
+    if (parted_value_is_scalar(payload)) {
+        for (int64_t r = 0; r < batch; r++) {
+            res = append_parted_atom(seg, base, payload);
+            if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+            *slot = seg = res;
+        }
+    } else if (base == RAY_STR) {
+        for (int64_t r = 0; r < batch; r++) {
+            size_t slen = 0;
+            const char* sp = ray_str_vec_get(payload, r, &slen);
+            res = ray_str_vec_append(seg, sp ? sp : "", sp ? slen : 0);
+            if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+            *slot = seg = res;
+        }
+    } else {
+        res = ray_vec_append_raw(seg, ray_data(payload), batch);
+        if (!res || RAY_IS_ERR(res)) return res ? res : ray_error("oom", NULL);
+        *slot = seg = res;
+    }
+    return NULL;
+}
+
+/* Grow the last partition in place (#921).  The rebuild in
+ * insert_parted_rows copies the active segment of every column on every
+ * call, so a feed of small batches pays the rows already held, not the rows
+ * appended.  When the binding is the sole owner of the table, of its
+ * MAPCOMMON row counts, of each column's wrapper and of each active
+ * segment, and those segments are plain heap vectors, append the batch into
+ * them and bump the partition's row count instead.
+ *
+ * Returns NULL with *taken false when a gate misses (nothing was touched;
+ * the caller rebuilds): a reader holding the previous view, the first
+ * insert after `.db.parted.get` (the active segment is the mapped file), a
+ * segment carrying an index.  With *taken true the result is the retained
+ * table, or an error after the appended lengths were rolled back, so the
+ * table keeps its pre-insert value; as in the flat-table path, capacity
+ * already grown and symbols already interned are not undone. */
+static ray_t* insert_parted_rows_inplace(ray_t* tbl, parted_insert_view_t* v,
+                                         ray_t* vals, int64_t old_len,
+                                         int64_t batch, bool* taken) {
+    *taken = false;
+    ray_t* cols = ray_table_cols_inplace(tbl);           /* NULL: an encoded slot */
+    if (!cols || cols->rc != 1 || cols->len != v->ncols) return NULL;
+    ray_t** slots = (ray_t**)ray_data(cols);
+    if (slots[0] != v->mapcommon ||
+        !parted_block_private(v->mapcommon) ||
+        !parted_block_private(v->row_counts)) return NULL;
+    int64_t last = v->nparts - 1;
+    for (int64_t c = 0; c < v->ndata; c++) {
+        ray_t* wrapper = slots[c + 1];
+        if (!parted_block_private(wrapper) || !RAY_IS_PARTED(wrapper->type))
+            return NULL;
+        ray_t* seg = ((ray_t**)ray_data(wrapper))[last];
+        /* An index would have to follow the SYM cells through their
+         * placeholder; the rebuild drops it, and the next insert lands here. */
+        if (!parted_block_private(seg) || (seg->attrs & RAY_ATTR_HAS_INDEX))
+            return NULL;
+        if (seg->type == RAY_SYM &&
+            ((seg->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64 ||
+             ray_sym_vec_domain(seg) != v->sym_dom))
+            return NULL;
+    }
+    *taken = true;
+
+    ray_t** pv = (ray_t**)ray_data(vals);
+    ray_t* err = NULL;
+    for (int64_t c = 0; c < v->ndata && !err; c++) {
+        ray_t* wrapper = slots[c + 1];
+        ray_t** slot = &((ray_t**)ray_data(wrapper))[last];
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+        ray_parted_text_nulls_forget(wrapper);   /* the appended cells may be null */
+        err = append_parted_payload_inplace(slot, base, pv[c], batch);
+        if (!err && base != RAY_LIST && base != RAY_SYM)
+            finalize_parted_tail_nulls(*slot, old_len);
+    }
+    /* Every allocation is done; the domain grows last, as in the rebuild. */
+    if (!err) err = intern_parted_payload_symbols(tbl, v, vals, batch);
+    for (int64_t c = 0; c < v->ndata && !err; c++) {
+        ray_t* wrapper = slots[c + 1];
+        if (RAY_PARTED_BASETYPE(wrapper->type) != RAY_SYM) continue;
+        err = fill_parted_sym_segment(v, pv[c], ((ray_t**)ray_data(wrapper))[last],
+                                      old_len, batch);
+    }
+    if (err) {
+        for (int64_t c = 0; c < v->ndata; c++) {
+            ray_t* seg = ((ray_t**)ray_data(slots[c + 1]))[last];
+            if (seg->type == RAY_LIST) {
+                ray_t** cells = (ray_t**)ray_data(seg);
+                for (int64_t r = old_len; r < seg->len; r++)
+                    if (cells[r]) ray_release(cells[r]);
+            }
+            seg->len = old_len;
+        }
+        return err;
+    }
+    ((int64_t*)ray_data(v->row_counts))[last] += batch;
+    ray_retain(tbl);
+    return tbl;
+}
+
+/* `sole`: the caller's binding and its one local reference are the only
+ * holders of tbl, so the last partition may grow in place. */
+static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows, bool sole) {
     parted_insert_view_t v;
     ray_t* err = validate_parted_insert_target(tbl, &v);
     if (err) return err;
@@ -27917,6 +28075,15 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
          (uint64_t)v.nparts + 1u > SIZE_MAX / sizeof(ray_t*))) {
         ray_release(vals);
         return ray_error("oom", NULL);
+    }
+
+    if (sole && !new_partition && !v.active_missing) {
+        bool taken = false;
+        ray_t* grown = insert_parted_rows_inplace(tbl, &v, vals, old_len, batch, &taken);
+        if (taken) {
+            ray_release(vals);
+            return grown;
+        }
     }
 
     ray_t* staged = ray_list_new(v.ndata);
@@ -28287,7 +28454,9 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 return success ? success : ray_error("oom", NULL);
             }
         }
-        ray_t* result = insert_parted_rows(tbl, partition_key, rows);
+        /* Decided after the operands ran: they may have taken a view. */
+        bool sole = inplace_sym >= 0 && ray_env_target_sole(&target, tbl, 1);
+        ray_t* result = insert_parted_rows(tbl, partition_key, rows, sole);
         ray_release(rows);
         ray_release(partition_key);
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {

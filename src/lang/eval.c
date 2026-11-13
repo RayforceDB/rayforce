@@ -193,8 +193,28 @@ bool ray_raise_render(char* buf, size_t cap) {
  * Restricted-mode check
  * ══════════════════════════════════════════ */
 
+/* The flag alone; the frames a request may bind in are recorded by
+ * ray_eval_restrict_enter, which is how a request is evaluated. */
 void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
+
+/* A request is evaluated in the restriction of the connection it came on.
+ * It may arrive while server code is inside a frame (a request a peer
+ * pushes back during a sync send), so the frames already open are recorded
+ * as not the request's own: env.c refuses a restricted binding into them
+ * as it does into the global frame.  Restores both on leave. */
+void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s) {
+    s->restricted = __VM && __VM->restricted;
+    s->base = __VM ? __VM->restricted_base : 0;
+    if (!__VM) return;
+    __VM->restricted = on;
+    __VM->restricted_base = __VM->scope_depth;
+}
+void ray_eval_restrict_leave(const ray_restrict_save_t* s) {
+    if (!__VM) return;
+    __VM->restricted = s->restricted;
+    __VM->restricted_base = s->base;
+}
 
 bool ray_fn_is_local_mutator(const ray_t* fn) {
     if (!fn || fn->type != RAY_VARY) return false;
@@ -1795,8 +1815,17 @@ ray_t* ray_list_collapse_bool(ray_t* list) {
     return vec;
 }
 
+/* One element of a collection mapped by an atomic unary function.  A nested
+ * collection (the rows of a list of vectors) is mapped in turn, as the binary
+ * atomic path does, instead of being handed whole to a function that only
+ * takes atoms. */
+static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
+    return is_collection(e) ? atomic_map_unary(fn, e) : fn(e);
+}
+
 /* Map a unary function element-wise over a collection.
- * Produces typed vectors when output is numeric/bool, boxed lists otherwise. */
+ * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
+ * a nested collection maps to a collection of the same shape. */
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
 
@@ -1825,7 +1854,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     /* Probe first element to determine output type */
     int alloc0 = 0;
     ray_t* e0_in = collection_elem(arg, 0, &alloc0);
-    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : fn(e0_in);
+    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : atomic_unary_elem(fn, e0_in);
     if (alloc0) ray_release(e0_in);
     if (RAY_IS_ERR(e0)) return e0;
 
@@ -1844,15 +1873,28 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
         for (int64_t i = 1; i < len; i++) {
             int alloc = 0;
             ray_t* e = collection_elem(arg, i, &alloc);
-            ray_t* elem = RAY_IS_ERR(e) ? e : fn(e);
+            ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
             if (alloc) ray_release(e);
             if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+            if (elem->type >= 0) {
+                /* A nested collection after an atom: the typed vector cannot
+                 * hold it.  Start over as a boxed list. */
+                ray_release(elem);
+                ray_release(vec);
+                int alloc_r = 0;
+                ray_t* e_r = collection_elem(arg, 0, &alloc_r);
+                e0 = RAY_IS_ERR(e_r) ? e_r : atomic_unary_elem(fn, e_r);
+                if (alloc_r) ray_release(e_r);
+                if (RAY_IS_ERR(e0)) return e0;
+                goto boxed;
+            }
             store_typed_elem(vec, i, elem);
             ray_release(elem);
         }
         return vec;
     }
 
+boxed:;
     /* Fallback: boxed list for non-numeric output */
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
     if (!result) { ray_release(e0); return ray_error("oom", NULL); }
@@ -1864,7 +1906,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     for (int64_t i = 1; i < len; i++) {
         int alloc = 0;
         ray_t* e = collection_elem(arg, i, &alloc);
-        ray_t* elem = RAY_IS_ERR(e) ? e : fn(e);
+        ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
         if (alloc) ray_release(e);
         if (RAY_IS_ERR(elem)) {
             /* Trim to the initialized prefix — see atomic_map_binary_op:
@@ -2445,7 +2487,11 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
         val = ray_lazy_materialize(val);
     if (RAY_IS_ERR(val)) return val;
     ray_err_t err = ray_env_set_local_rows(name_obj->i64, val, rows);
-    if (err != RAY_OK) { ray_release(val); return ray_error(ray_err_code_str(err), NULL); }
+    if (err != RAY_OK) {
+        ray_release(val);
+        return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
+                                     : ray_error(ray_err_code_str(err), NULL);
+    }
     return val;
 }
 
@@ -2635,6 +2681,7 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
             if (RAY_IS_ERR(idx)) return idx;
             ray_err_t e = ray_env_set_local_rows(name, idx, 0);
             ray_release(idx);
+            if (e == RAY_ERR_ACCESS) return ray_error("access", "restricted");
             if (e != RAY_OK) return ray_error(ray_err_code_str(e), NULL);
         }
         for (int64_t i = 1; i < n; i++) {

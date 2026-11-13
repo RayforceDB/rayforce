@@ -937,6 +937,8 @@ static ray_err_t env_bind_local(int64_t sym_id, ray_t* val) {
 ray_err_t ray_env_set_local_rows(int64_t sym_id, ray_t* val, uint8_t rows) {
     if (!__VM || ray_sym_is_dotted(sym_id) || __VM->scope_depth <= 0) return ray_env_set_local(sym_id, val);
     if (ray_sym_is_reserved(sym_id) && !ray_sym_is_ipc_hook(sym_id)) return RAY_ERR_RESERVED;
+    /* Not a frame the restricted request opened (see ray_env_set_local). */
+    if (__VM->restricted && __VM->scope_depth <= __VM->restricted_base) return RAY_ERR_ACCESS;
     return env_frame_bind_rows(&__VM->scope_stack[__VM->scope_depth - 1], sym_id, val, rows);
 }
 
@@ -1591,6 +1593,15 @@ ray_err_t ray_env_set_local(int64_t sym_id, ray_t* val) {
      * user-settable here too, matching the global `ray_env_set` path. */
     if (ray_sym_is_reserved(sym_id) && !ray_sym_is_ipc_hook(sym_id))
         return RAY_ERR_RESERVED;
+    /* A restricted request binds only in frames it opened itself.  With
+     * none open the binding would go to the global frame (`set` is refused
+     * for the same reason), or, for a request evaluated while server code
+     * waits inside a frame, into that code's frame: either way it would
+     * rebind a name other code reads.  restricted_base is the depth the
+     * request began at (ray_eval_restrict_enter).  A `let` inside a lambda
+     * or `do` of the request's own stays allowed. */
+    if (__VM->restricted && __VM->scope_depth <= __VM->restricted_base)
+        return RAY_ERR_ACCESS;
     if (__VM->scope_depth <= 0) return ray_env_set(sym_id, val);
     if (ray_sym_is_dotted(sym_id)) {
         return env_set_dotted(sym_id, val, lookup_top_frame, env_bind_local, -1);

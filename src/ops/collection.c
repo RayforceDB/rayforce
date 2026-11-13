@@ -938,10 +938,61 @@ static ray_t* map_box_prefix(ray_t* prefix, int64_t capacity) {
     return list;
 }
 
-/* (map fn val vec) — apply binary fn(val, elem) to each element of vec.
- * Also supports (map fn vec) for unary mapping. */
+/* Append one callback result to a map-style result under construction.
+ *
+ * *pres is NULL until the first result: a typed vector while the results are
+ * atoms of one vector type, a boxed list from the first one that is not.  The
+ * result takes `value` in every case.  Returns NULL, or an error with *pres
+ * released and cleared. */
+static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len) {
+    ray_t* result = *pres;
+    /* Once heterogeneous, stay boxed without rechecking atom types. */
+    if (result && result->type == RAY_LIST) {
+        ((ray_t**)ray_data(result))[result->len++] = value;
+        return NULL;
+    }
+    bool atom = map_vector_atom(value);
+    if (!result) {
+        result = atom ? ray_vec_new(-value->type, len) : ray_list_new(len);
+        if (RAY_IS_ERR(result)) { ray_release(value); *pres = NULL; return result; }
+    } else if (result->type != RAY_LIST &&
+               (!atom || value->type != -result->type)) {
+        ray_t* list = map_box_prefix(result, len);
+        ray_release(result);
+        if (RAY_IS_ERR(list)) { ray_release(value); *pres = NULL; return list; }
+        result = list;
+    }
+
+    if (result->type == RAY_LIST) {
+        ((ray_t**)ray_data(result))[result->len++] = value; /* transfer */
+    } else if (result->type == RAY_STR) {
+        ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), ray_str_len(value));
+        ray_release(value);
+        if (RAY_IS_ERR(next)) { ray_release(result); *pres = NULL; return next; }
+        result = next;
+    } else {
+        /* Capacity is reserved, SYM atoms have runtime ids and the
+         * destination is a fresh runtime-domain vector. Exact type
+         * agreement above prevents any numeric promotion. */
+        result->len++;
+        int status = store_typed_elem(result, i, value);
+        ray_release(value);
+        if (status != 0) {
+            ray_release(result);
+            *pres = NULL;
+            return ray_error("type", "map: cannot store callback result");
+        }
+    }
+    *pres = result;
+    return NULL;
+}
+
+/* (map fn val vec) — apply binary fn(val, elem) to each element of vec; val is
+ * passed whole on every call, whatever it is (so it is the same as map-right).
+ * Also supports (map fn vec) for unary mapping.  Any other argument count is
+ * an error: the extra arguments would be dropped without a word. */
 ray_t* ray_map_fn(ray_t** args, int64_t n) {
-    if (n < 2) return ray_error("domain", "map: requires at least 2 args (fn and vec), got %lld", (long long)n);
+    if (n < 2 || n > 3) return ray_error("domain", "map: requires 2 or 3 args (fn and vec, or fn, val and vec), got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++)
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
@@ -979,42 +1030,8 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
         if (RAY_IS_ERR(value)) { ray_release(result); return value; }
 
-        /* Once heterogeneous, stay boxed without rechecking atom types. */
-        if (result && result->type == RAY_LIST) {
-            ((ray_t**)ray_data(result))[result->len++] = value;
-            continue;
-        }
-        bool atom = map_vector_atom(value);
-        if (!result) {
-            result = atom ? ray_vec_new(-value->type, len) : ray_list_new(len);
-            if (RAY_IS_ERR(result)) { ray_release(value); return result; }
-        } else if (result->type != RAY_LIST &&
-                   (!atom || value->type != -result->type)) {
-            ray_t* list = map_box_prefix(result, len);
-            ray_release(result);
-            if (RAY_IS_ERR(list)) { ray_release(value); return list; }
-            result = list;
-        }
-
-        if (result->type == RAY_LIST) {
-            ((ray_t**)ray_data(result))[result->len++] = value; /* transfer */
-        } else if (result->type == RAY_STR) {
-            ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), ray_str_len(value));
-            ray_release(value);
-            if (RAY_IS_ERR(next)) { ray_release(result); return next; }
-            result = next;
-        } else {
-            /* Capacity is reserved, SYM atoms have runtime ids and the
-             * destination is a fresh runtime-domain vector. Exact type
-             * agreement above prevents any numeric promotion. */
-            result->len++;
-            int status = store_typed_elem(result, i, value);
-            ray_release(value);
-            if (status != 0) {
-                ray_release(result);
-                return ray_error("type", "map: cannot store callback result");
-            }
-        }
+        ray_t* bad = map_collect(&result, value, i, len);
+        if (bad) return bad;
     }
     return result;
 }
@@ -1413,46 +1430,48 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
     return result;
 }
 
-/* (apply fn vec1 vec2) — zip-apply fn element-wise over two vectors */
+/* (apply fn left right) — apply binary fn to the elements of two collections
+ * taken in step: fn(left_0, right_0), fn(left_1, right_1), ...  The result is
+ * as long as the shorter collection.  Two atoms call fn once.  Results are
+ * collected as map's are: a typed vector while they are atoms of one vector
+ * type, else a list.  Exactly three arguments: more would be dropped without
+ * a word.  Elements are read in place, never boxed up front. */
 ray_t* ray_apply_fn(ray_t** args, int64_t n) {
-    if (n < 3) return ray_error("domain", "apply: requires at least 3 args (fn and two vecs), got %lld", (long long)n);
+    if (n != 3) return ray_error("domain", "apply: requires exactly 3 args (fn, left, right), got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++)
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
+    ray_t* a = args[1];
+    ray_t* b = args[2];
+    if (RAY_IS_ERR(a)) return a;
+    if (RAY_IS_ERR(b)) return b;
 
     /* If both args are scalars, just call fn(a, b) once */
-    if (ray_is_atom(args[1]) && ray_is_atom(args[2]))
-        return call_fn2(fn, args[1], args[2]);
+    if (ray_is_atom(a) && ray_is_atom(b))
+        return call_fn2(fn, a, b);
+    if (!is_collection(a) || !is_collection(b))
+        return ray_error("type", "apply: operands must both be collections or both atoms, got %s and %s",
+                         ray_type_name(a->type), ray_type_name(b->type));
 
-    ray_t *_bx1 = NULL, *_bx2 = NULL;
-    ray_t* vec1 = unbox_vec_arg(args[1], &_bx1);
-    if (RAY_IS_ERR(vec1)) return vec1;
-    ray_t* vec2 = unbox_vec_arg(args[2], &_bx2);
-    if (RAY_IS_ERR(vec2)) { if (_bx1) ray_release(_bx1); return vec2; }
-    if (!is_list(vec1) || !is_list(vec2)) { if (_bx1) ray_release(_bx1); if (_bx2) ray_release(_bx2); return ray_error("type", "apply: both vec args must be lists, got %s and %s", ray_type_name(vec1->type), ray_type_name(vec2->type)); }
-    int64_t len1 = ray_len(vec1);
-    int64_t len2 = ray_len(vec2);
+    int64_t len1 = ray_len(a);
+    int64_t len2 = ray_len(b);
     int64_t len = len1 < len2 ? len1 : len2;
+    if (len == 0) return ray_list_new(0);   /* no callback result to infer */
 
-    ray_t* result = ray_alloc(len * sizeof(ray_t*));
-    if (!result) { if (_bx1) ray_release(_bx1); if (_bx2) ray_release(_bx2); return ray_error("oom", NULL); }
-    result->type = RAY_LIST;
-    result->len = len;
-    ray_t** out = (ray_t**)ray_data(result);
-    ray_t** e1 = (ray_t**)ray_data(vec1);
-    ray_t** e2 = (ray_t**)ray_data(vec2);
-
+    ray_t* result = NULL;
     for (int64_t i = 0; i < len; i++) {
-        out[i] = call_fn2(fn, e1[i], e2[i]);
-        if (RAY_IS_ERR(out[i])) {
-            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
-            result->len = 0; ray_release(result); if (_bx1) ray_release(_bx1); if (_bx2) ray_release(_bx2);
-            return out[i];
-        }
+        int owned_a = 0, owned_b = 0;
+        ray_t* ea = iter_elem(a, i, &owned_a);
+        ray_t* eb = RAY_IS_ERR(ea) ? ea : iter_elem(b, i, &owned_b);
+        ray_t* value = RAY_IS_ERR(eb) ? eb : call_fn2(fn, ea, eb);
+        if (owned_a) ray_release(ea);
+        if (owned_b) ray_release(eb);
+        if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
+        if (RAY_IS_ERR(value)) { ray_release(result); return value; }
+        ray_t* bad = map_collect(&result, value, i, len);
+        if (bad) return bad;
     }
-    if (_bx1) ray_release(_bx1);
-    if (_bx2) ray_release(_bx2);
     return result;
 }
 
