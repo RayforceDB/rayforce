@@ -3062,6 +3062,100 @@ static bool relieve_mincore(void) {
     return relieve_resident(page + 4096) >= 0;
 }
 
+/* Relief visits this heap and the singleton pool's quiescent workers.
+ * Account their independently inspected mappings, not an unexplained
+ * global residual. The dispatcher runs this test without pool lifecycle
+ * changes or other allocator work during the snapshots. */
+typedef struct {
+    ray_heap_t* own;
+    int64_t own_bytes, worker_bytes, global_bytes;
+    uint64_t worker_signature;
+    uint32_t workers;
+    bool valid;
+} relieve_maps_t;
+
+static int64_t relieve_heap_mapping_bytes(ray_heap_t* h) {
+    int64_t bytes = 0;
+    /* heap_add_pool allocates strlen(swap_path)+64 for each spill path;
+     * sys.c adds its 32-byte header and rounds to 4096. This test-specific
+     * bound is below the 1 MiB sys spill threshold, so a path is anonymous.
+     * Do not use this as a generic sys allocation size accessor. */
+    _Static_assert(sizeof(h->swap_path) + 64 + 32 <= 4096, "spill path fits one sys page");
+    for (uint32_t p = 0; p < h->pool_count; p++) {
+        const ray_pool_entry_t* pe = &h->pools[p];
+        if (!pe->backed) bytes += (int64_t)BSIZEOF(pe->pool_order);
+        if (pe->swap_path) bytes += 4096;
+    }
+    return bytes;
+}
+
+static void relieve_worker_maps(ray_heap_t* h, void* ctx) {
+    relieve_maps_t* s = (relieve_maps_t*)ctx;
+    if (h == s->own) { s->valid = false; return; }
+    s->worker_bytes += relieve_heap_mapping_bytes(h);
+    s->workers++;
+    s->worker_signature = (s->worker_signature ^ (uint64_t)(uintptr_t)h)
+                       * UINT64_C(1099511628211);
+}
+
+static relieve_maps_t relieve_maps(ray_heap_t* h) {
+    relieve_maps_t s = { .own = h, .worker_signature = UINT64_C(14695981039346656037),
+        .valid = atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0 };
+    if (!s.valid) return s;
+    s.own_bytes = relieve_heap_mapping_bytes(h);
+    ray_pool_each_worker_heap(relieve_worker_maps, &s);
+    s.global_bytes = ray_heap_anon_committed();
+    return s;
+}
+
+static bool relieve_maps_balance(relieve_maps_t before, relieve_maps_t after) {
+    return before.valid && after.valid && before.own == after.own
+        && before.workers == after.workers
+        && before.worker_signature == after.worker_signature
+        && before.global_bytes - after.global_bytes
+            == before.own_bytes - after.own_bytes + before.worker_bytes - after.worker_bytes;
+}
+
+/* Pure inventory-delta checks: the real pressure test below independently
+ * reads these quantities from the caller and published worker heaps. */
+static test_result_t test_relieve_mapping_accounting(void) {
+    TEST_ASSERT(ray_tl_heap != NULL, "heap initialized");
+    relieve_maps_t before = { .own = ray_tl_heap,
+        .own_bytes = 5 * RELIEVE_POOL, .worker_bytes = 2 * RELIEVE_POOL,
+        .global_bytes = 9 * RELIEVE_POOL, .worker_signature = UINT64_C(42),
+        .workers = 1, .valid = true };
+    relieve_maps_t after = before;
+    after.own_bytes = RELIEVE_POOL;
+    after.global_bytes -= 4 * RELIEVE_POOL;
+    TEST_ASSERT(relieve_maps_balance(before, after), "caller-only contraction balances");
+    after.worker_bytes -= RELIEVE_POOL;
+    after.global_bytes -= RELIEVE_POOL;
+    TEST_ASSERT(relieve_maps_balance(before, after), "independent worker contraction balances");
+
+    relieve_maps_t changed = after;
+    changed.global_bytes -= RELIEVE_POOL;
+    TEST_ASSERT(!relieve_maps_balance(before, changed), "unexplained global decrease fails");
+    changed = after;
+    changed.global_bytes += RELIEVE_POOL;
+    TEST_ASSERT(!relieve_maps_balance(before, changed), "unexplained global increase fails");
+    changed = after;
+    changed.own = NULL;
+    TEST_ASSERT(!relieve_maps_balance(before, changed), "caller identity must match");
+    changed = after;
+    changed.workers++;
+    TEST_ASSERT(!relieve_maps_balance(before, changed), "worker count must match");
+    changed = after;
+    changed.worker_signature ^= UINT64_C(1);
+    TEST_ASSERT(!relieve_maps_balance(before, changed), "worker identity fingerprint must match");
+    changed = after;
+    changed.valid = false;
+    TEST_ASSERT(!relieve_maps_balance(before, changed), "after snapshot must be quiescent");
+    changed = before;
+    changed.valid = false;
+    TEST_ASSERT(!relieve_maps_balance(changed, after), "before snapshot must be quiescent");
+    PASS();
+}
+
 /* A query that needed several pools leaves them mapped and counted after it
  * frees everything, so the next one sees the watermark reached.  Pressure
  * alone parks the empty pools — all but the heap's last, mapped and
@@ -3082,24 +3176,35 @@ static test_result_t test_relieve_under_pressure(void) {
     for (int i = 0; i < N; i++) blocks[i] = ray_alloc(sz);
     for (int i = 0; i < N; i++) if (blocks[i]) ray_free(blocks[i]);
     uint32_t pools = h->pool_count;
-    int64_t kept = ray_heap_anon_committed();
+    ray_heap_direct_cache_drain();
+    relieve_maps_t kept = relieve_maps(h);
 
     /* No pressure: nothing is handed back or parked. */
     int64_t r0 = ray_heap_relieve();
-    bool idle = r0 == 0 && ray_heap_anon_committed() == kept
+    relieve_maps_t idle_maps = relieve_maps(h);
+    bool idle = r0 == 0 && relieve_maps_balance(kept, idle_maps)
+             && idle_maps.own_bytes == kept.own_bytes
              && h->pool_count == pools && relieve_parked(h) == 0;
 
     /* Pressure, no spill: every pool but the last is parked. */
     relieve_pressure(RELIEVE_POOL);
     ray_heap_relieve();
-    bool parked = h->pool_count == pools && ray_heap_anon_committed() == kept
+    relieve_maps_t parked_maps = relieve_maps(h);
+    bool parked = h->pool_count == pools && relieve_maps_balance(kept, parked_maps)
+               && parked_maps.own_bytes == kept.own_bytes
                && relieve_parked(h) == (int)pools - 1;
 
     /* A spill: every pool but the last goes. */
     bool spill = relieve_spill_elsewhere(&e);
+    relieve_maps_t after_spill = relieve_maps(h);
+    bool spill_balanced = relieve_maps_balance(parked_maps, after_spill)
+        && after_spill.own_bytes == parked_maps.own_bytes
+        && after_spill.worker_bytes == parked_maps.worker_bytes;
     ray_heap_relieve();
+    relieve_maps_t final_maps = relieve_maps(h);
     bool shrank = h->pool_count == 1 && relieve_parked(h) == 0
-               && ray_heap_anon_committed() == kept - (int64_t)(pools - 1) * RELIEVE_POOL;
+               && spill_balanced && relieve_maps_balance(kept, final_maps)
+               && kept.own_bytes - final_maps.own_bytes == (int64_t)(pools - 1) * RELIEVE_POOL;
 
     /* The heap still allocates after its pools went away. */
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
@@ -3109,6 +3214,8 @@ static test_result_t test_relieve_under_pressure(void) {
     relieve_env_end(&e, h, NULL);
     if (!spill) SKIP("no spill file");
     TEST_ASSERT(pools >= 4, "64 blocks of 2 MB took several pools");
+    TEST_ASSERT(kept.valid && kept.own_bytes == (int64_t)pools * RELIEVE_POOL,
+                "fresh caller pools are anonymous; mapping snapshots are quiescent");
     TEST_ASSERT(idle, "no pressure, nothing handed back");
     TEST_ASSERT(parked, "pressure alone parked every empty pool but the last");
     TEST_ASSERT(shrank, "after a spill every empty pool but the last went");
@@ -4873,6 +4980,8 @@ static test_result_t test_relieve_needed(void) {
     workers = workers && relieve_worker_pool(&w);
     uint32_t w0 = relieve_worker_pools();
     int64_t c0 = ray_heap_anon_committed();
+    ray_pool_t* diag_pool = workers ? ray_pool_live() : NULL;
+    uint32_t diag_workers = diag_pool ? diag_pool->n_workers : 0;
     const size_t big = (size_t)48 << 20;
 
     /* A large block spills: the workers' empty pools go. */
@@ -4887,11 +4996,13 @@ static test_result_t test_relieve_needed(void) {
     /* The repeat: the large block fits that room, then the workers take
      * their pools back — up to the watermark, no spill: relieved again. */
     d = ray_alloc(big);
+    size_t diag_map = d && ray_is_direct(d) ? ray_direct_map_size(d) : 0;
     bool fit = d && !ray_direct_file_backed(d);
     if (d) ray_free(d);
     ray_heap_direct_cache_drain();
-    relieve_worker_pool(&w);
-    bool back = relieve_worker_pools() == w0;
+    bool diag_refill_ran = relieve_worker_pool(&w);
+    uint32_t diag_refill_pools = relieve_worker_pools();
+    bool back = diag_refill_pools == w0;
     ray_heap_relieve();
     bool again = relieve_worker_pools() == w1;
 
@@ -4947,7 +5058,12 @@ static test_result_t test_relieve_needed(void) {
     if (!workers) SKIP("no pool worker");
     if (!spilled || !spill) SKIP("no spill file");
     TEST_ASSERT(took, "a spill relieved the workers' empty pools");
-    TEST_ASSERT(fit && back, "the repeat's large block fit, the workers took their pools back");
+    TEST_ASSERT_FMT(fit && back,
+                    "fit && back: the repeat's large block fit, the workers took their pools back "
+                    "(fit=%d back=%d workers=%u w0=%u w1=%u refill_pools=%u "
+                    "refill_ran=%d committed_start=%lld repeat_map=%llu again=%d)",
+                    (int)fit, (int)back, diag_workers, w0, w1, diag_refill_pools,
+                    (int)diag_refill_ran, (long long)c0, (unsigned long long)diag_map, (int)again);
     TEST_ASSERT(again, "and its boundary relieved again");
     TEST_ASSERT(pools_only, "room gone to pools only: not relieved");
     TEST_ASSERT(spilled2, "a spill to start over");
@@ -6403,6 +6519,7 @@ const test_entry_t heap_entries[] = {
     { "heap/sys_alloc_watermark", test_sys_alloc_watermark, heap_setup, heap_teardown },
     { "heap/sys_alloc_zero_fill", test_sys_alloc_zero_fill, heap_setup, heap_teardown },
     { "heap/raw_discard", test_raw_discard, heap_setup, heap_teardown },
+    { "heap/relieve_mapping_accounting", test_relieve_mapping_accounting, heap_setup, heap_teardown },
     { "heap/relieve_under_pressure", test_relieve_under_pressure, heap_setup, heap_teardown },
     { "heap/relieve_needs_room",       test_relieve_needs_room,          heap_setup, heap_teardown },
     { "heap/relieve_drains_flushes",   test_relieve_drains_and_flushes,  heap_setup, heap_teardown },
