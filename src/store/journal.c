@@ -288,31 +288,68 @@ static bool decompress_if_needed(const ray_ipc_header_t* hdr,
 
 /* Evaluate a deserialized message exactly as eval_payload would: string
  * payloads run through ray_eval_str, everything else through ray_eval. */
-/* The note right after a restricted frame, when the next frame is one: an
- * owned I64 vector of the identities of the trusted calls that ran lifted
- * live (RAY_IPC_MSG_JNOTE).  Otherwise NULL, with the file where it was;
- * a damaged note is left for the frame loop to report. */
-static ray_t* read_lift_note(FILE* f) {
-    long pos = ftell(f);
-    if (pos < 0) return NULL;
-    ray_t* note = NULL;
-    ray_ipc_header_t nh;
-    if (read_full(f, &nh, sizeof(nh)) == sizeof(nh) &&
-        nh.prefix == RAY_SERDE_PREFIX && nh.version == RAY_SERDE_WIRE_VERSION &&
-        nh.endian == RAY_SERDE_ENDIAN && nh.msgtype == RAY_IPC_MSG_JNOTE &&
-        !(nh.flags & RAY_IPC_FLAG_COMPRESSED) && nh.size > 0 && nh.size <= 256LL*1024*1024) {
-        uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)nh.size);
-        if (buf && read_full(f, buf, (size_t)nh.size) == (size_t)nh.size) {
-            int64_t len = nh.size;
-            ray_t* v = ray_de_raw(buf, &len);
-            if (v && !RAY_IS_ERR(v) && v->type == RAY_I64) note = v;
-            else if (v && RAY_IS_ERR(v)) ray_error_free(v);
-            else if (v) ray_release(v);
+/* The notes of a log (RAY_IPC_MSG_JNOTE): after a restricted request
+ * whose trusted calls ran lifted, the server writes an I64 vector of the
+ * log generation and offset of that request's frame, then the identities
+ * of those calls.  A note names its request, so frames logged between the
+ * two (requests a peer pushed back while a trusted body waited on it) do
+ * not come between them.  Collected in one pass before replay. */
+typedef struct { int64_t off; ray_t* note; } lift_note_t;
+typedef struct { lift_note_t* v; int64_t n, cap; } lift_notes_t;
+
+static void lift_notes_free(lift_notes_t* ns) {
+    for (int64_t i = 0; i < ns->n; i++) ray_release(ns->v[i].note);
+    if (ns->v) ray_sys_free(ns->v);
+    *ns = (lift_notes_t){0};
+}
+
+/* Reads from the current position to the end, or to the first frame that
+ * does not parse, which the replay loop reports; leaves the position where
+ * it was.  False when memory ran out. */
+static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
+    *ns = (lift_notes_t){0};
+    long start = ftell(f);
+    if (start < 0) return true;
+    bool ok = true;
+    for (;;) {
+        ray_ipc_header_t h;
+        if (read_full(f, &h, sizeof(h)) != sizeof(h)) break;
+        if (h.prefix != RAY_SERDE_PREFIX || h.version != RAY_SERDE_WIRE_VERSION ||
+            h.endian != RAY_SERDE_ENDIAN || h.size <= 0 || h.size > 256LL*1024*1024) break;
+        if (h.msgtype != RAY_IPC_MSG_JNOTE || (h.flags & RAY_IPC_FLAG_COMPRESSED)) {
+            if (fseek(f, (long)h.size, SEEK_CUR) != 0) break;
+            continue;
         }
-        if (buf) ray_sys_free(buf);
+        uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)h.size);
+        if (!buf) { ok = false; break; }
+        if (read_full(f, buf, (size_t)h.size) != (size_t)h.size) { ray_sys_free(buf); break; }
+        int64_t len = h.size;
+        ray_t* v = ray_de_raw(buf, &len);
+        ray_sys_free(buf);
+        if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); continue; }
+        const int64_t* d = (const int64_t*)ray_data(v);
+        if (v->type != RAY_I64 || v->len < 2 || d[0] != gen) { ray_release(v); continue; }
+        if (ns->n == ns->cap) {
+            int64_t cap = ns->cap ? ns->cap * 2 : 16;
+            lift_note_t* nv = (lift_note_t*)ray_sys_alloc((size_t)cap * sizeof(lift_note_t));
+            if (!nv) { ray_release(v); ok = false; break; }
+            if (ns->n) memcpy(nv, ns->v, (size_t)ns->n * sizeof(lift_note_t));
+            if (ns->v) ray_sys_free(ns->v);
+            ns->v = nv;
+            ns->cap = cap;
+        }
+        ns->v[ns->n++] = (lift_note_t){ d[1], v };
     }
-    if (!note && fseek(f, pos, SEEK_SET) != 0) return NULL;
-    return note;
+    if (fseek(f, start, SEEK_SET) != 0) ok = false;
+    if (!ok) lift_notes_free(ns);
+    return ok;
+}
+
+/* The note of the request whose frame starts at `off` (borrowed), or NULL. */
+static ray_t* lift_notes_find(const lift_notes_t* ns, int64_t off) {
+    for (int64_t i = 0; i < ns->n; i++)
+        if (ns->v[i].off == off) return ns->v[i].note;
+    return NULL;
 }
 
 static ray_t* eval_one(ray_t* msg) {
@@ -350,6 +387,18 @@ void ray_journal_info(ray_journal_info_t* out) {
         if (end >= 0) out->bytes = (int64_t)end;
         else out->bytes_ok = false;
     }
+}
+
+/* Where the next frame will be appended: the live log's generation and
+ * byte offset.  False when nothing would be written (no journal, or a
+ * replay in progress). */
+bool ray_journal_position(int64_t* gen, int64_t* off) {
+    if (!g_journal.fp || g_journal.in_replay) return false;
+    long pos = ftell(g_journal.fp);   /* the stream is unbuffered */
+    if (pos < 0) return false;
+    *gen = g_journal.log_gen;
+    *off = (int64_t)pos;
+    return true;
 }
 
 ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
@@ -419,6 +468,15 @@ static ray_err_t journal_replay_from(const char*           path,
         return RAY_ERR_IO;
     }
 
+    int64_t log_gen = 0;
+    jlog_probe(path, &log_gen);
+    lift_notes_t notes;
+    if (!lift_notes_collect(f, log_gen, &notes)) {
+        fclose(f);
+        if (out_status) *out_status = RAY_JREPLAY_OOM;
+        return RAY_ERR_OOM;
+    }
+
     bool prev_in_replay = g_journal.in_replay;
     g_journal.in_replay = true;
 
@@ -432,6 +490,7 @@ static ray_err_t journal_replay_from(const char*           path,
          * this must NOT be treated as a truncatable BADTAIL. */
         if (ray_interrupted()) { status = RAY_JREPLAY_CANCEL; break; }
 
+        long frame_off = ftell(f);
         ray_ipc_header_t hdr;
         size_t r = read_full(f, &hdr, sizeof(hdr));
         if (r == 0) break;                          /* clean EOF */
@@ -476,28 +535,27 @@ static ray_err_t journal_replay_from(const char*           path,
             status = RAY_JREPLAY_DESER;
             break;
         }
-        /* A note whose request is not right before it (a roll or a
-         * snapshot in between) is not an entry. */
+        /* A note is not an entry: its request, if this log holds it,
+         * found it by offset. */
         if (hdr.msgtype == RAY_IPC_MSG_JNOTE) { ray_release(msg); continue; }
 
         /* Re-impose the sender's restricted state for THIS frame.  Without
          * this a `-U` client's writes silently elevate to full privilege
          * across crash-restart, since replay runs in the main thread with
          * no IPC connection context.  A restricted frame's trusted calls
-         * run lifted only as recorded live: the note after it lists them,
-         * and without one none does. */
+         * run lifted only as recorded live: its note lists them, and
+         * without one none does. */
         bool restricted = hdr.flags & RAY_IPC_FLAG_RESTRICTED;
-        ray_t* note = restricted ? read_lift_note(f) : NULL;
+        ray_t* note = restricted ? lift_notes_find(&notes, (int64_t)frame_off) : NULL;
         ray_lift_log_t lifts;
         if (restricted)
-            ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) : NULL,
-                                note ? note->len : 0);
+            ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) + 2 : NULL,
+                                note ? note->len - 2 : 0);
         ray_restrict_save_t prev_restricted;
         ray_eval_restrict_enter(restricted, &prev_restricted);
         ray_t* result = eval_one(msg);
         ray_eval_restrict_leave(&prev_restricted);
         if (restricted) ray_eval_lift_done(&lifts);
-        if (note) ray_release(note);
         ray_release(msg);
 
         if (result && RAY_IS_ERR(result)) {
@@ -513,6 +571,7 @@ static ray_err_t journal_replay_from(const char*           path,
         chunks++;
     }
 
+    lift_notes_free(&notes);
     fclose(f);
     g_journal.in_replay = prev_in_replay;
 
@@ -724,6 +783,9 @@ ray_err_t ray_journal_recover(const char* base) {
              * env_bind_global_impl, so do NOT explicitly retain here
              * (would leak one ref per binding). */
             ray_err_t e = ray_env_set(sym_id, v);
+            /* A verb trusted by name: its identity includes that name. */
+            if (e == RAY_OK && v->type == RAY_LAMBDA && (LAMBDA_TRUSTED(v) & 1))
+                ray_eval_lambda_trust(v, sym_id);
             if (e != RAY_OK) {
                 fprintf(stderr, "log: WARN  snapshot bind for sym %lld failed (%d)\n",
                         (long long)sym_id, (int)e);

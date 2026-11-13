@@ -102,12 +102,25 @@ Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null.
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
 
-A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live. After a journaled restricted request whose trusted calls ran lifted, the server writes a note listing their lambdas, identified by their serialized form. On replay a call runs lifted only if its lambda is marked and is the next one its request's note lists; a request with no note replays with no lifted call. When a verb's mark changed between the snapshot and the restart:
+A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
 
-- **Trust removed after the snapshot** (the boot script no longer marks the verb): the snapshot still marks it during replay, but a call that was refused live has no note entry and is refused again.
+- After a journaled restricted request whose trusted calls ran lifted, the server writes a note. The note names its request by the request's position in the log, so requests logged in between (ones a peer sent back while a trusted body waited on it) do not part the two. It lists the lifted calls in order, each by the verb's identity: a hash of the global name it was trusted under, its parameters and its body, computed once by `.sys.trust`.
+- On replay a call runs lifted only if its lambda is marked and is the next one its request's note lists. A request with no note replays with no lifted call.
+
+When a verb's mark changed between the snapshot and the restart:
+
+- **Trust removed after the snapshot** (the boot script no longer marks the verb): the snapshot still marks it during replay, but a call that was refused live is in no note and is refused again. That holds when another verb of the same text is still trusted, since a note entry names the verb.
 - **Trust added after the snapshot**: replay finds the verb unmarked, or not bound at all if the boot script defines it, so a call that ran lifted live is refused on replay until a snapshot holds the verb marked. Take a snapshot after changing what the boot script trusts.
+- **The verb's name, parameters or body changed after the snapshot**: its identity changed with them, so calls logged since are refused on replay until a snapshot holds the new verb.
 
-A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer. Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it, and a note is written only by the server's own journal.
+Limits:
+
+- The identity includes the name only for a verb trusted by name and bound directly to that global. A lambda trusted as a value, or one reached through a dict or a second name, replays lifted only when the snapshot holds it under the same identity; otherwise its calls are refused on replay.
+- If the note cannot be written (disk full, I/O error), the request answers `io`, but its trusted calls already ran and their writes are in effect in the running process. Replay will refuse them, so the state after a restart lacks those writes.
+- A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer.
+- A binary that predates notes reads each one as an extra log entry: the note evaluates to its vector of integers, changes nothing and is counted among the replayed entries. Such a binary also loads the snapshot's lambdas unmarked.
+
+Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
 
 Errors: `domain` (no journal open), `io`.
 

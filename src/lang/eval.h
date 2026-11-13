@@ -148,10 +148,12 @@ enum {
  *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
  *   data[9] = uint32_t capq       (serial of the query frame the closure was
  *                                  made under, 0 if none; never serialized)
- *   data[10] = uint32_t trusted   (set by .sys.trust: a restricted caller
- *                                  may run the body unrestricted; written
- *                                  only to a journal snapshot, never given
- *                                  to a closure)
+ *   data[10] = uint64_t trusted   (0, or the identity .sys.trust gave the
+ *                                  lambda: a restricted caller may run the
+ *                                  body unrestricted.  Bit 0 says it was
+ *                                  trusted by name.  Kept only through a
+ *                                  journal snapshot, never given to a
+ *                                  closure; see ray_eval_lambda_trust)
  */
 #define LAMBDA_SLOTS 11
 
@@ -174,7 +176,7 @@ enum {
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 #define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
 #define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
-#define LAMBDA_TRUSTED(lam)   (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_TRUSTED]))
+#define LAMBDA_TRUSTED(lam)   (*((uint64_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_TRUSTED]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 
@@ -294,15 +296,20 @@ typedef struct { bool restricted; int32_t base; } ray_restrict_save_t;
 void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s);
 void ray_eval_restrict_leave(const ray_restrict_save_t* s);
 
+/* Mark `lambda` trusted (#787).  Its identity, kept in LAMBDA_TRUSTED, is
+ * a hash of the global name it is trusted under (`name`, -1 when trusted
+ * as a value), its parameters and its body: computed once here, the same
+ * in every process, and different for two verbs of the same text. */
+void ray_eval_lambda_trust(ray_t* lambda, int64_t name);
+
 /* The trusted calls of one journaled restricted request (#787), so that
  * replay lifts exactly the calls that ran lifted live.  The IPC path
  * records into a log around a request it journals: each call that runs
- * lifted appends the identity of its lambda (ray_eval_lambda_identity).
- * Replay checks against the identities its journal note holds: a call
- * runs lifted only if its lambda is the next one recorded, so a call
- * refused live (its trust revoked after the snapshot replay restores)
- * stays refused.  Logs nest; each begin is paired with ray_eval_lift_done
- * on the same thread. */
+ * lifted appends the identity of its lambda.  Replay checks against the
+ * identities the request's journal note holds: a call runs lifted only if
+ * its lambda is the next one recorded, so a call refused live (its trust
+ * revoked after the snapshot replay restores) stays refused.  Logs nest;
+ * each begin is paired with ray_eval_lift_done on the same thread. */
 typedef struct ray_lift_log {
     bool     check;             /* replay: match, else record */
     bool     failed;            /* record: an identity could not be kept */
@@ -314,7 +321,6 @@ typedef struct ray_lift_log {
 void    ray_eval_lift_record(ray_lift_log_t* log);
 void    ray_eval_lift_check(ray_lift_log_t* log, const int64_t* ids, int64_t n);
 void    ray_eval_lift_done(ray_lift_log_t* log);
-int64_t ray_eval_lambda_identity(ray_t* lambda);
 
 /* ===== Rayfall Builtin Functions ===== */
 

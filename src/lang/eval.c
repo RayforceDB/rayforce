@@ -236,21 +236,27 @@ void ray_eval_lift_done(ray_lift_log_t* log) {
     log->ids = log->inline_ids;
 }
 
-/* A lambda's identity across restarts: an FNV-1a hash of its serialized
- * form (parameters, body, captures), without its .sys.trust mark. */
-int64_t ray_eval_lambda_identity(ray_t* lambda) {
-    bool prev = ray_serde_keep_trust(false);
-    ray_t* bytes = ray_ser(lambda);
-    ray_serde_keep_trust(prev);
-    if (!bytes || RAY_IS_ERR(bytes)) {
-        if (bytes) ray_error_free(bytes);
-        return 0;
-    }
+static uint64_t trust_hash(uint64_t h, const void* bytes, int64_t n) {
+    const uint8_t* p = (const uint8_t*)bytes;
+    for (int64_t i = 0; i < n; i++) { h ^= p[i]; h *= UINT64_C(0x100000001b3); }
+    return h;
+}
+
+void ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
-    const uint8_t* p = (const uint8_t*)ray_data(bytes);
-    for (int64_t i = 0; i < bytes->len; i++) { h ^= p[i]; h *= UINT64_C(0x100000001b3); }
-    ray_release(bytes);
-    return (int64_t)h;
+    ray_t* ns = name >= 0 ? ray_sym_str(name) : NULL;   /* borrowed */
+    if (ns) h = trust_hash(h, ray_str_ptr(ns), (int64_t)ray_str_len(ns));
+    h = trust_hash(h, "", 1);   /* the name ends here */
+    ray_t* parts[2] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda) };
+    for (int i = 0; i < 2; i++) {
+        ray_t* bytes = parts[i] ? ray_ser(parts[i]) : NULL;
+        if (bytes && !RAY_IS_ERR(bytes)) {
+            h = trust_hash(h, ray_data(bytes), bytes->len);
+            ray_release(bytes);
+        } else if (bytes) ray_error_free(bytes);
+    }
+    /* Never 0, which means untrusted; bit 0 is "trusted by name". */
+    LAMBDA_TRUSTED(lambda) = (h << 2) | 2 | (name >= 0 ? 1 : 0);
 }
 
 /* Whether a trusted call of restricted code may run lifted, given the
@@ -260,7 +266,7 @@ int64_t ray_eval_lambda_identity(ray_t* lambda) {
 static bool lift_permitted(ray_t* lambda) {
     ray_lift_log_t* log = g_lift_log;
     if (!log) return true;
-    int64_t id = ray_eval_lambda_identity(lambda);
+    int64_t id = (int64_t)LAMBDA_TRUSTED(lambda);
     if (log->check) {
         if (log->next < log->n && log->ids[log->next] == id) { log->next++; return true; }
         return false;
@@ -625,7 +631,7 @@ static ray_t* head_not_callable_error(int8_t type) {
  * argument. */
 ray_t* ray_sys_trust_fn(ray_t* x) {
     if (x->type == RAY_LAMBDA) {
-        LAMBDA_TRUSTED(x) = 1;
+        ray_eval_lambda_trust(x, -1);
         ray_retain(x);
         return x;
     }
@@ -641,7 +647,7 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
             int64_t id = x->type == -RAY_SYM ? x->i64
                                              : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
             ray_t* fn = ray_env_get(id);   /* borrowed */
-            if (pass == 1) { LAMBDA_TRUSTED(fn) = 1; continue; }
+            if (pass == 1) { ray_eval_lambda_trust(fn, id); continue; }
             if (!fn) { err = undefined_name_error(id); break; }
             if (fn->type != RAY_LAMBDA) {
                 ray_t* s = ray_sym_str(id);   /* borrowed */

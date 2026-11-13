@@ -718,10 +718,17 @@ static ray_t* deser_frame(uint8_t* payload, size_t payload_len, uint8_t flags)
 }
 
 /* Journal the note of a restricted request whose trusted calls ran lifted:
- * the identities of their lambdas, in call order (RAY_IPC_MSG_JNOTE). */
-static ray_err_t journal_lift_note(const int64_t* ids, int64_t n) {
-    ray_t* v = ray_vec_from_raw(RAY_I64, ids, n);
+ * the log generation and offset of the request's own frame, which tie the
+ * note to it whatever was logged in between, then the identities of those
+ * calls' lambdas, in call order (RAY_IPC_MSG_JNOTE). */
+static ray_err_t journal_lift_note(int64_t gen, int64_t off, const int64_t* ids, int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I64, n + 2);
     if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return RAY_ERR_OOM; }
+    int64_t* d = (int64_t*)ray_data(v);
+    d[0] = gen;
+    d[1] = off;
+    memcpy(d + 2, ids, (size_t)n * sizeof(int64_t));
+    v->len = n + 2;
     int64_t size = ray_serde_size(v);
     uint8_t* buf = size > 0 ? (uint8_t*)ray_sys_alloc((size_t)size) : NULL;
     ray_err_t e = RAY_ERR_OOM;
@@ -766,7 +773,10 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
      * accept it".  Silently evaluating un-logged mutations defeats
      * the entire durability premise of `-l`/`-L`. */
     bool auto_journaled = false;
+    bool have_pos = false;
+    int64_t req_gen = 0, req_off = 0;
     if (ray_journal_is_open() && hdr->msgtype == RAY_IPC_MSG_SYNC) {
+        have_pos = ray_journal_position(&req_gen, &req_off);
         ray_ipc_header_t log_hdr = *hdr;
         if (ray_eval_get_restricted())
             log_hdr.flags |= RAY_IPC_FLAG_RESTRICTED;
@@ -780,7 +790,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     /* A journaled restricted request records which trusted calls ran
      * lifted; the note written after it lets replay lift exactly those. */
     ray_lift_log_t lifts;
-    bool record_lifts = auto_journaled && ray_eval_get_restricted();
+    bool record_lifts = auto_journaled && have_pos && ray_eval_get_restricted();
     if (record_lifts) ray_eval_lift_record(&lifts);
 
     /* Query-statistics ring: bracket the eval so the server records one
@@ -873,7 +883,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         result = ray_lazy_materialize(result);  /* consumes the retain */
 
     if (record_lifts) {
-        ray_err_t ne = lifts.n > 0 ? journal_lift_note(lifts.ids, lifts.n) : RAY_OK;
+        ray_err_t ne = lifts.n > 0 ? journal_lift_note(req_gen, req_off, lifts.ids, lifts.n) : RAY_OK;
         ray_eval_lift_done(&lifts);
         if (ne != RAY_OK) {
             /* The calls ran lifted, but replay would refuse them. */
@@ -1388,6 +1398,8 @@ static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel)
     if (cd->hdr.prefix != RAY_SERDE_PREFIX ||
         cd->hdr.version != RAY_SERDE_WIRE_VERSION ||
         cd->hdr.endian != RAY_SERDE_ENDIAN ||
+        /* A journal note exists only in a log the server wrote. */
+        cd->hdr.msgtype == RAY_IPC_MSG_JNOTE ||
         !ray_ipc_body_size_ok(cd->hdr.size)) {
         ray_poll_deregister(poll, sel->id);
         return NULL;

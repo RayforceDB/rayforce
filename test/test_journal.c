@@ -1485,9 +1485,9 @@ static test_result_t test_journal_snapshot_function_binding_recovers(void) {
 /* 7f. #787: a snapshot keeps its lambdas' .sys.trust marks.  A trusted verb
  * and its unmarked twin are snapshotted, then three restricted requests are
  * logged after the snapshot, as a live server logs them: the verb's call,
- * which ran lifted (its note follows it), the twin's, and a call of the
- * verb that was refused live (no note, as when its trust was revoked
- * after the snapshot).  Recovery, in a process where neither is bound,
+ * which ran lifted (its note names it, two frames later), the twin's, and
+ * a call of the verb that was refused live (no note, as when its trust
+ * was revoked after the snapshot).  Recovery, in a process where neither is bound,
  * restores the mark before it replays the log: only the call that ran
  * lifted live runs lifted again.  Outside the snapshot the mark is
  * neither written nor read. */
@@ -1512,9 +1512,13 @@ static bool jrn_log_restricted(const char* text) {
 }
 
 /* The note a live server writes after a restricted request whose trusted
- * calls ran lifted (RAY_IPC_MSG_JNOTE): their lambdas' identities. */
-static bool jrn_log_note(const int64_t* ids, int64_t n) {
-    ray_t* v = ray_vec_from_raw(RAY_I64, ids, n);
+ * calls ran lifted (RAY_IPC_MSG_JNOTE): the generation and offset of the
+ * request's frame, then the calls' identities. */
+static bool jrn_log_note(int64_t gen, int64_t off, const int64_t* ids, int64_t n) {
+    int64_t raw[18] = { gen, off };
+    if (n > 16) return false;
+    memcpy(raw + 2, ids, (size_t)n * sizeof(int64_t));
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, n + 2);
     if (!v || RAY_IS_ERR(v)) return false;
     int64_t psize = ray_serde_size(v);
     uint8_t* buf = psize > 0 ? (uint8_t*)ray_sys_alloc((size_t)psize) : NULL;
@@ -1555,11 +1559,18 @@ static test_result_t test_journal_snapshot_keeps_trust(void) {
     TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
     ray_t* live_put = ray_env_get_global(ray_sym_intern("jrn_tr_put", 10));
     TEST_ASSERT_NOT_NULL(live_put);
-    int64_t put_id = ray_eval_lambda_identity(live_put);
+    int64_t put_id = (int64_t)LAMBDA_TRUSTED(live_put);
+    int64_t gen = 0, off = 0;
+    TEST_ASSERT_TRUE(ray_journal_position(&gen, &off));
     TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 6)"));
-    TEST_ASSERT_TRUE(jrn_log_note(&put_id, 1));
+    /* Frames logged between a request and its note do not part them. */
     TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_plain 7)"));
+    int64_t gen3 = 0, off3 = 0;
+    TEST_ASSERT_TRUE(ray_journal_position(&gen3, &off3));
     TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 8)"));
+    TEST_ASSERT_TRUE(jrn_log_note(gen, off, &put_id, 1));
+    /* A note of another log generation names no request of this log. */
+    TEST_ASSERT_TRUE(jrn_log_note(gen3 + 1, off3, &put_id, 1));
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
 
     /* A fresh process: nothing bound, nothing marked. */
@@ -1610,18 +1621,21 @@ static test_result_t test_journal_snapshot_keeps_trust(void) {
     PASS();
 }
 
-/* 7g. #787: a journal note is no entry.  The note after a restricted frame
- * belongs to it, and one with no request right before it (left by a roll
- * or a snapshot between the two) is skipped: replay counts and evaluates
- * the requests only. */
+/* 7g. #787: a journal note is no entry.  One that names a request of this
+ * log, one that names no frame and one of another log generation (left by
+ * a roll or a snapshot between a request and its note) are all skipped:
+ * replay counts and evaluates the requests only. */
 static test_result_t test_journal_lift_note_not_an_entry(void) {
     char base[256]; make_base(base, sizeof(base), "lift_note");
     char lpath[270]; log_path(lpath, sizeof(lpath), base);
     TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
     int64_t ids[2] = { 1, 2 };
-    TEST_ASSERT_TRUE(jrn_log_note(&ids[0], 1));
+    int64_t gen = 0, off = 0;
+    TEST_ASSERT_TRUE(jrn_log_note(0, 0, &ids[0], 1));
+    TEST_ASSERT_TRUE(ray_journal_position(&gen, &off));
     TEST_ASSERT_TRUE(jrn_log_restricted("(+ 1 2)"));
-    TEST_ASSERT_TRUE(jrn_log_note(&ids[1], 1));
+    TEST_ASSERT_TRUE(jrn_log_note(gen, off, &ids[1], 1));
+    TEST_ASSERT_TRUE(jrn_log_note(gen + 1, off, &ids[1], 1));
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
 
     int64_t chunks = -1, errs = -1;
