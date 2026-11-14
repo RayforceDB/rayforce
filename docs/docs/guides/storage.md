@@ -215,7 +215,7 @@ Splayed table loading can also use mmap internally. For most analytics workloads
 ## Parquet input
 
 Rayforce's Parquet reader is implemented in C, including the Thrift Compact
-Protocol parser and Snappy decoder. It adds no library dependencies. The same
+Protocol parser and the Snappy and LZ4 decoders. It adds no library dependencies. The same
 batch decoder serves materialized reads, streaming callbacks, and native
 conversion.
 
@@ -319,7 +319,8 @@ table operations.
 ### Supported input and limits
 
 - One local, unencrypted file with a flat schema.
-- Uncompressed and raw Snappy column chunks.
+- Uncompressed, raw Snappy and LZ4 column chunks (LZ4_RAW, and the deprecated
+  Hadoop-framed LZ4 codec); other codecs are refused with an error listing the supported ones.
 - Data pages v1 and v2; PLAIN and dictionary encoding, including the legacy
   dictionary tag and dictionary-to-plain fallback within a chunk; RLE-encoded
   BOOLEAN values (the v2 default of common writers). Zero-row row groups are
@@ -373,7 +374,7 @@ run in parallel for batches of at least 4,096 rows. `-c 1` uses one execution
 participant; other core settings use the configured pool without a four-core cap.
 Buffers and output vectors use Rayforce's block allocator. Required PLAIN signed
 integers use SSE2 copy/null detection where available, with a scalar fallback.
-Repeated dictionary runs fill native blocks in bulk. Snappy back references use
+Repeated dictionary runs fill native blocks in bulk. Snappy and LZ4 back references use
 bounded block copies. Packed dictionary IDs remain scalar. A standalone `like`
 predicate can filter decoded batches; string Bloom probes, fully deferred output
 decoding, and streaming grouped queries remain future work.

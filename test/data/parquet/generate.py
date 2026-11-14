@@ -49,6 +49,21 @@ def snappy(data):
         tag = bytes([(59+nb) << 2]) + n.to_bytes(nb, 'little')
     return var(len(data)) + tag + data
 
+def lz4(data):
+    """Literal-only valid LZ4 block; matches are covered by C codec tests."""
+    n = len(data)
+    if n < 15: return bytes([n << 4]) + data
+    r = n - 15
+    return bytes([0xF0]) + b'\xff' * (r // 255) + bytes([r % 255]) + data
+
+def lz4_hadoop(data):
+    """Hadoop's framing of one block: big-endian uncompressed, compressed sizes."""
+    block = lz4(data)
+    return len(data).to_bytes(4, 'big') + len(block).to_bytes(4, 'big') + block
+
+# Parquet CompressionCodec: 1 Snappy, 5 LZ4 (Hadoop framing), 7 LZ4_RAW.
+COMPRESS = {1: snappy, 5: lz4_hadoop, 7: lz4}
+
 def rle(values, width):
     return b''.join(var(2) + x.to_bytes((width+7)//8, 'little') for x in values)
 
@@ -87,7 +102,7 @@ class Page(bytes):
 
 def page(kind, header, body, codec=1, prefix=b'', compressed=True, crc=False):
     import zlib  # stdlib, fixture checksums only
-    payload = prefix + (snappy(body) if codec and compressed else body)
+    payload = prefix + (COMPRESS[codec](body) if codec and compressed else body)
     f = [(1,I32,kind),(2,I32,len(prefix)+len(body)),(3,I32,len(payload))]
     if crc:
         chk = zlib.crc32(payload)
@@ -214,7 +229,7 @@ if __name__ == '__main__':
     root=Path(__file__).parent
     specs=[('x',1,True,None),('name',6,True,0),('flag',0,True,None),('wide',2,False,None),('day',1,False,6),('ts',2,False,10),('f',5,True,None)]
     rows=[[1,None,3,4,5,None,7,8,9],['alpha','a long string over twelve bytes',None,'','alpha','beta','gamma','delta','z'],[True,None,False,True,False,True,None,False,True],list(range(100,109)),list(range(10957,10966)),[946684800000000+i for i in range(9)],[1.25,None,-2.,3.,4.,5.,6.,7.,8.]]
-    for codec in (0,1):
+    for codec in (0,1,5,7):
         for v2 in (False,True):
             write(root/f'flat-{codec}-v{2 if v2 else 1}.parquet',specs,[rows,rows],codec,v2,crc=True)
     write(root/'legacy.parquet',specs,[rows,rows],legacy=True)
