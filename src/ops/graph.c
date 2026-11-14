@@ -35,6 +35,15 @@
 
 #define GRAPH_INIT_CAP 4096
 
+/* Keep the first owned failure. NULL here means a known allocation failed,
+ * not an unsupported lowering. Errors are not refcounted literals. */
+static void graph_compile_failure(ray_graph_t* g, ray_t* err) {
+    if (!g->compile_err)
+        g->compile_err = err ? err : ray_error("oom", NULL);
+    else if (err && err != g->compile_err)
+        ray_error_free(err);
+}
+
 /* Graph edges are stable uint32 node ids (indices into g->nodes), so a
    realloc of g->nodes needs no pointer fixups — the former graph_fix_ptr /
    graph_fixup_ptrs / graph_fixup_ext_ptrs machinery is gone entirely. */
@@ -45,11 +54,14 @@ ray_op_t* graph_alloc_node(ray_graph_t* g) {
     if (g->node_count >= g->node_cap) {
         /* H2: Overflow guard — if node_cap is already > UINT32_MAX/2,
            doubling would wrap around to a smaller value. */
-        if (g->node_cap > UINT32_MAX / 2) return NULL;
+        if (g->node_cap > UINT32_MAX / 2) {
+            graph_compile_failure(g, ray_error("limit", "graph node capacity exhausted"));
+            return NULL;
+        }
         uint32_t new_cap = g->node_cap * 2;
         ray_op_t* new_nodes = (ray_op_t*)ray_realloc_raw(g->nodes,
                                                       new_cap * sizeof(ray_op_t));
-        if (!new_nodes) return NULL;
+        if (!new_nodes) { graph_compile_failure(g, NULL); return NULL; }
         g->nodes = new_nodes;
         g->node_cap = new_cap;
     }
@@ -64,17 +76,25 @@ ray_op_t* graph_alloc_node(ray_graph_t* g) {
 ray_op_ext_t* graph_alloc_ext_node_ex(ray_graph_t* g, size_t extra) {
     /* Extended nodes are 64 bytes; extra bytes appended for inline arrays */
     ray_op_ext_t* ext = (ray_op_ext_t*)ray_calloc_raw(sizeof(ray_op_ext_t) + extra);
-    if (!ext) return NULL;
+    if (!ext) { graph_compile_failure(g, NULL); return NULL; }
     ext->base.in_id[0] = ext->base.in_id[1] = RAY_OP_NONE;
     ext->third_in = RAY_OP_NONE;
 
     /* Also add a placeholder in the nodes array for ID tracking */
     if (g->node_count >= g->node_cap) {
-        if (g->node_cap > UINT32_MAX / 2) { ray_free_raw(ext); return NULL; }
+        if (g->node_cap > UINT32_MAX / 2) {
+            ray_free_raw(ext);
+            graph_compile_failure(g, ray_error("limit", "graph node capacity exhausted"));
+            return NULL;
+        }
         uint32_t new_cap = g->node_cap * 2;
         ray_op_t* new_nodes = (ray_op_t*)ray_realloc_raw(g->nodes,
                                                       new_cap * sizeof(ray_op_t));
-        if (!new_nodes) { ray_free_raw(ext); return NULL; }
+        if (!new_nodes) {
+            ray_free_raw(ext);
+            graph_compile_failure(g, NULL);
+            return NULL;
+        }
         g->nodes = new_nodes;
         g->node_cap = new_cap;
     }
@@ -88,11 +108,21 @@ ray_op_ext_t* graph_alloc_ext_node_ex(ray_graph_t* g, size_t extra) {
 
     /* Track ext node for cleanup */
     if (g->ext_count >= g->ext_cap) {
-        if (g->ext_cap > UINT32_MAX / 2) { g->node_count--; ray_free_raw(ext); return NULL; }
+        if (g->ext_cap > UINT32_MAX / 2) {
+            g->node_count--;
+            ray_free_raw(ext);
+            graph_compile_failure(g, ray_error("limit", "graph extended-node capacity exhausted"));
+            return NULL;
+        }
         uint32_t new_cap = g->ext_cap == 0 ? 16 : g->ext_cap * 2;
         ray_op_ext_t** new_exts = (ray_op_ext_t**)ray_realloc_raw(g->ext_nodes,
                                                                new_cap * sizeof(ray_op_ext_t*));
-        if (!new_exts) { g->node_count--; ray_free_raw(ext); return NULL; }
+        if (!new_exts) {
+            g->node_count--;
+            ray_free_raw(ext);
+            graph_compile_failure(g, NULL);
+            return NULL;
+        }
         g->ext_nodes = new_exts;
         g->ext_cap = new_cap;
     }
@@ -252,6 +282,16 @@ ray_op_t* ray_scan(ray_graph_t* g, const char* col_name) {
     return &g->nodes[ext->base.id];
 }
 
+/* The ext stays tracked for graph_free, but must never own an error as
+ * a literal or publish a successful OP_CONST with a missing value. */
+static bool graph_literal_ok(ray_graph_t* g, ray_op_ext_t* ext) {
+    if (ext->literal && !RAY_IS_ERR(ext->literal)) return true;
+    ray_t* err = ext->literal;
+    ext->literal = NULL;
+    graph_compile_failure(g, err);
+    return false;
+}
+
 ray_op_t* ray_const_f64(ray_graph_t* g, double val) {
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
@@ -260,8 +300,7 @@ ray_op_t* ray_const_f64(ray_graph_t* g, double val) {
     ext->base.arity = 0;
     ext->base.out_type = RAY_F64;
     ext->literal = ray_f64(val);
-    /* L4: null/error check on allocation result */
-    if (!ext->literal || RAY_IS_ERR(ext->literal)) ext->literal = NULL;
+    if (!graph_literal_ok(g, ext)) return NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -275,8 +314,7 @@ ray_op_t* ray_const_i64(ray_graph_t* g, int64_t val) {
     ext->base.arity = 0;
     ext->base.out_type = RAY_I64;
     ext->literal = ray_i64(val);
-    /* L4: null/error check on allocation result */
-    if (!ext->literal || RAY_IS_ERR(ext->literal)) ext->literal = NULL;
+    if (!graph_literal_ok(g, ext)) return NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -290,8 +328,7 @@ ray_op_t* ray_const_bool(ray_graph_t* g, bool val) {
     ext->base.arity = 0;
     ext->base.out_type = RAY_BOOL;
     ext->literal = ray_bool(val);
-    /* L4: null/error check on allocation result */
-    if (!ext->literal || RAY_IS_ERR(ext->literal)) ext->literal = NULL;
+    if (!graph_literal_ok(g, ext)) return NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -305,8 +342,7 @@ ray_op_t* ray_const_str(ray_graph_t* g, const char* s, size_t len) {
     ext->base.arity = 0;
     ext->base.out_type = RAY_SYM;   /* string constants resolve to SYM at exec time */
     ext->literal = ray_str(s, len);
-    /* L4: null/error check on allocation result */
-    if (!ext->literal || RAY_IS_ERR(ext->literal)) ext->literal = NULL;
+    if (!graph_literal_ok(g, ext)) return NULL;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];

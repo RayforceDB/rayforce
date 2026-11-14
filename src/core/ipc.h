@@ -84,6 +84,11 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 /* An upgrade record (below): the payload is the record's bytes, not a
  * serialized value, and is never evaluated or journaled. */
 #define RAY_IPC_MSG_UPGRADE 3
+/* A journal note: written by the server after a journaled restricted
+ * request whose trusted calls ran lifted, never sent on the wire.  Its
+ * payload is an I64 vector of those lambdas' identities, in call order;
+ * replay pairs it with the frame right before it (ray_lift_log_t). */
+#define RAY_IPC_MSG_JNOTE   4
 
 /* ===== Transports =====
  *

@@ -89,6 +89,13 @@ ray_t*  ray_de(ray_t* bytes);
 const char* ray_serde_fail_code(void);
 void ray_serde_fail_clear(void);              /* call before ray_serde_size */
 
+/* Whether a lambda's .sys.trust mark is written and read, on this thread.
+ * Off by default, so ser/de, IPC and journal entries never carry it: a
+ * frame from anywhere else cannot mark a lambda.  The journal turns it on
+ * around writing and loading its snapshot, the server's own data.
+ * Returns the previous setting. */
+bool ray_serde_keep_trust(bool on);
+
 /* File I/O: save/load any object in binary format */
 ray_err_t ray_obj_save(ray_t* obj, const char* path);
 ray_t*    ray_obj_load(const char* path);
