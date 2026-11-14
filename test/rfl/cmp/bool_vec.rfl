@@ -1,0 +1,49 @@
+;; bool_vec.rfl — comparisons of B8 vectors (#1190).
+;;
+;; The typed vector path takes no BOOL, so `(== v v)` on a B8 vector fell to
+;; the boxed per-element loop (a BOOL atom per row, about 100x slower than the
+;; same comparison on an I64 vector).  A B8 vector against a B8 vector or a
+;; B8 atom now has its own kernel, parallel above 65,536 rows.  The answers
+;; are the per-element ones: a byte is truthy when non-zero, and false < true.
+
+(set A [true true false false])
+(set B [true false true false])
+
+;; ── vector against vector, every operator ──
+(== A B) -- [true false false true]
+(!= A B) -- [false true true false]
+(<  A B) -- [false false true false]
+(<= A B) -- [true false true true]
+(>  A B) -- [false true false false]
+(>= A B) -- [true true false true]
+(type (== A B)) -- 'B8
+
+;; ── vector against atom, on either side (the operator is mirrored) ──
+(== A true) -- [true true false false]
+(== true A) -- [true true false false]
+(!= A true) -- [false false true true]
+(<  A true) -- [false false true true]
+(<  true A) -- [false false false false]
+(>  true A) -- [false false true true]
+(<= true A) -- [true true false false]
+(>= false A) -- [false false true true]
+(>= A false) -- [true true true true]
+
+;; ── the answer is the per-element one, past the parallel threshold ──
+(set N 200000)
+(set P (> (% (til N) 3) 0))
+(set Q (> (% (til N) 5) 1))
+(count (where (== P Q))) -- (count (where (== (as 'I64 P) (as 'I64 Q))))
+(count (where (!= P Q))) -- (count (where (!= (as 'I64 P) (as 'I64 Q))))
+(count (where (<  P Q))) -- (count (where (<  (as 'I64 P) (as 'I64 Q))))
+(count (where (<= P Q))) -- (count (where (<= (as 'I64 P) (as 'I64 Q))))
+(count (where (>  P Q))) -- (count (where (>  (as 'I64 P) (as 'I64 Q))))
+(count (where (>= P Q))) -- (count (where (>= (as 'I64 P) (as 'I64 Q))))
+(count (where (== P true))) -- (count (where P))
+(count (where (!= false P))) -- (count (where P))
+(== P P) -- (> (til N) -1)
+
+;; ── a slice, an empty vector, and a length mismatch ──
+(== (drop P 65535) (drop Q 65535)) -- (== (as 'B8 (drop (as 'I64 P) 65535)) (as 'B8 (drop (as 'I64 Q) 65535)))
+(== (as 'B8 []) (as 'B8 [])) -- (as 'B8 [])
+(== [true false] [true]) !- length
