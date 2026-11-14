@@ -227,6 +227,20 @@
 (type (time 'global))                          -- 'time
 (type (timestamp 'global))                     -- 'timestamp
 
+;; The clock reads carry the system clock's sub-second part rather than
+;; a whole-second value with a zero fraction.  Five samples: the odds of
+;; every one landing exactly on a second (timestamp) or a millisecond
+;; (time) boundary are 1e-45 / 1e-15, so the assertion is stable.
+(set clock-ts (list (as 'i64 (timestamp 'global)) (as 'i64 (timestamp 'global)) (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 0))))
+(any (!= 0 (% (as 'i64 clock-ts) 1000000000)))  -- true
+(set clock-tm (list (as 'i64 (time 'global)) (as 'i64 (time 'global)) (as 'i64 (time 'local)) (as 'i64 (time 'local)) (as 'i64 (time 0))))
+(any (!= 0 (% (as 'i64 clock-tm) 1000)))        -- true
+;; `time` and `timestamp` read the same clock: their sub-second parts
+;; agree to within a few ms, or differ by nearly a whole second when the
+;; two (non-atomic) reads straddle a second boundary.
+(set clock-gap (abs (- (% (as 'i64 (timestamp 'global)) 1000000000) (* 1000000 (% (as 'i64 (time 'global)) 1000)))))
+(or (< clock-gap 50000000) (> clock-gap 950000000)) -- true
+
 ;; ═══════════════════════════════════════════════════════════════════
 ;;       8.  Duration arithmetic — DATE / TIMESTAMP differences
 ;; ═══════════════════════════════════════════════════════════════════

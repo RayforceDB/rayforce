@@ -605,8 +605,8 @@ Temporal constructors. Pass `0` to get the current clock value. Cross-temporal c
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `date` | unary | — | Current date, or extract date from timestamp | `(date 0)` → today's date |
-| `time` | unary | — | Current time, or extract time from timestamp | `(time 0)` → current time |
-| `timestamp` | unary | — | Current timestamp (nanosecond precision) | `(timestamp 0)` |
+| `time` | unary | — | Current wall-clock time (millisecond resolution), or extract time from timestamp | `(time 0)` → current time |
+| `timestamp` | unary | — | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
 
 ```lisp
 ; Get current date/time
