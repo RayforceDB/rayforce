@@ -33,7 +33,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.os.getenv`, `.os.setenv`
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
 - `.repl.connect`, `.repl.disconnect`
-- `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`
+- `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.trust`
 - `.time.timer.set`, `.time.timer.del`
 
 `.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, `.mem.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.

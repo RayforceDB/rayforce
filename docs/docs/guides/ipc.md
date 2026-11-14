@@ -214,6 +214,23 @@ Use `-U` instead of `-u` to enable authentication with read-only restrictions:
 
 In read-only mode, clients can run queries and read data, but mutating operations (`set`, a top-level `let`, `insert`, `upsert`, `update`, file writes, system commands) are blocked; a `let` inside the request's own lambda or `do` still binds a local. The server returns an error if a restricted builtin is called.
 
+The rule covers the server's own functions too. A read verb that needs a restricted builtin itself, such as one that asks another process for its half over `.ipc.send`, can be marked with [`.sys.trust`](../namespaces/sys.md#sys-trust) in the server's boot script. A client calling it runs its body unrestricted, isolated from the client's own bindings, while everything else the client sends stays read-only:
+
+```lisp
+;; boot script of the -U server
+(set peer (.ipc.open "127.0.0.1:5001"))
+(set peer_count (fn [] (.ipc.send peer "(count (til 3))")))
+(.sys.trust 'peer_count)
+```
+
+```lisp
+;; a client of that server
+(.ipc.send h "(peer_count)")                 ;; => 3
+(.ipc.send h "(.ipc.send peer \"(+ 1 2)\")")   ;; => error: access
+```
+
+A trusted verb must treat its arguments as data: a function it is passed and calls, or an expression it evaluates, runs unrestricted too.
+
 !!! note "Reference"
 
     See the [IPC & Serialization](../storage/ipc.md) reference page for the full list of restricted builtins in read-only mode.

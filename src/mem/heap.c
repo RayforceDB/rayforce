@@ -2500,11 +2500,13 @@ RAY_INLINE bool ray_free_walks(const ray_t* v) {
 
 /* How many leading data slots of a walked container are owned references:
  * the ones ray_release_owned_refs drops for its kind. */
-_Static_assert(LAMBDA_SLOT_CAPQ == LAMBDA_SLOTS - 1 &&
+_Static_assert(LAMBDA_SLOT_TRUSTED == LAMBDA_SLOTS - 1 &&
+               LAMBDA_SLOT_CAPQ == LAMBDA_SLOT_TRUSTED - 1 &&
                LAMBDA_SLOT_CAPROWS == LAMBDA_SLOT_CAPQ - 1 &&
                LAMBDA_SLOT_NLOCALS < LAMBDA_SLOT_CAPROWS,
                "the free walk drops lambda slots 0..CAPROWS except NLOCALS, "
-               "the references ray_release_owned_refs drops");
+               "the references ray_release_owned_refs drops; the slots after "
+               "CAPROWS hold none");
 
 RAY_INLINE int64_t ray_free_walk_width(const ray_t* v) {
     if (v->type == RAY_LIST)   return v->len;
