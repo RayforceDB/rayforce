@@ -102,6 +102,28 @@ Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null.
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
 
+A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
+
+- After a journaled restricted request whose trusted calls ran lifted, the server writes a note. The note names its request by the request's position in the log, so requests logged in between (ones a peer sent back while a trusted body waited on it) do not part the two. It lists the lifted calls in order, each by the verb's identity: a hash of the global name it was trusted under, its parameters, its body and its captures, computed once by `.sys.trust`. A captured lambda counts by its own parameters, body and captures, not by whether it is trusted.
+- On replay a call runs lifted only if its lambda is marked and is the next one its request's note lists. A request with no note replays with no lifted call.
+
+When a verb's mark changed between the snapshot and the restart:
+
+- **Trust removed after the snapshot** (the boot script no longer marks the verb): the snapshot still marks it during replay, but a call that was refused live is in no note and is refused again. That holds when another verb of the same text is still trusted, since a note entry names the verb.
+- **Trust added after the snapshot**: replay finds the verb unmarked, or not bound at all if the boot script defines it, so a call that ran lifted live is refused on replay until a snapshot holds the verb marked. Take a snapshot after changing what the boot script trusts.
+- **The verb's name, parameters, body or captures changed after the snapshot**: its identity changed with them, so calls logged since are refused on replay until a snapshot holds the new verb.
+
+Limits:
+
+- The identity includes the name only for a verb trusted by name and bound directly to that global. A lambda trusted as a value has the identity of its parameters, body and captures alone: two closures of one factory differ by their captures, but two such lambdas that are the same in all three share an identity, so trust verbs by name when one of a pair may later be revoked.
+- One lambda is trusted under one name. `.sys.trust` refuses a second name for the same object with `domain`, since recovery would give each binding its own identity. A trusted lambda also bound to a second name without `.sys.trust`, or held in a dict, runs lifted live through either, but a call made through the second name or the dict is refused on replay.
+- A trusted call that rolls the log itself (`.log.roll`, or `.log.snapshot`) leaves its request in the old log and its note in the new one, where it names nothing: that request's lift record is dropped. A snapshot already holds what the call wrote before it; after a bare roll the old log is no longer replayed at startup at all.
+- If the note cannot be written (disk full, I/O error), the request answers `io`, but its trusted calls already ran and their writes are in effect in the running process. Replay will refuse them, so the state after a restart lacks those writes.
+- A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer.
+- A binary that predates notes reads each one as an extra log entry: the note evaluates to its vector of integers, changes nothing and is counted among the replayed entries. Such a binary also loads the snapshot's lambdas unmarked.
+
+Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
+
 Errors: `domain` (no journal open), `io`.
 
 ## `.log.roll` { #log-roll }

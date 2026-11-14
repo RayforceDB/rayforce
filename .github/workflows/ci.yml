@@ -52,6 +52,16 @@ jobs:
         if: matrix.target == 'release' && matrix.compiler == 'gcc'
         run: make -j2 lib CC=${{ matrix.compiler }}
 
+      # The shared library is what a run-time host loads. Linking an example
+      # against it and running that proves the symbols are exported and the
+      # runtime starts from a library, which no other leg exercises.
+      - name: Build shared library and run an example against it
+        if: matrix.target == 'release'
+        run: |
+          make -j2 shared CC=${{ matrix.compiler }}
+          ${{ matrix.compiler }} -O2 -Iinclude -Isrc examples/analytics.c -L. -lrayforce -lm -lpthread -Wl,-rpath,"$PWD" -o analytics-shared
+          ./analytics-shared
+
       # Debug legs execute the suite (tier: see TEST_TIER above); release legs
       # verify optimized artifacts. Runtime tests under release FP flags use
       # the separate `make test-release` profile, not the debug suite below.
