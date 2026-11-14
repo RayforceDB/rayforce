@@ -242,21 +242,28 @@ static uint64_t trust_hash(uint64_t h, const void* bytes, int64_t n) {
     return h;
 }
 
-void ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
+/* The identity `lambda` has when trusted under `name` (-1: as a value). */
+static uint64_t trust_identity(ray_t* lambda, int64_t name) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
     ray_t* ns = name >= 0 ? ray_sym_str(name) : NULL;   /* borrowed */
     if (ns) h = trust_hash(h, ray_str_ptr(ns), (int64_t)ray_str_len(ns));
     h = trust_hash(h, "", 1);   /* the name ends here */
-    ray_t* parts[2] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda) };
-    for (int i = 0; i < 2; i++) {
+    /* The captures too: closures of one factory differ only in them. */
+    ray_t* parts[3] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda), LAMBDA_CLOSURE(lambda) };
+    for (int i = 0; i < 3; i++) {
         ray_t* bytes = parts[i] ? ray_ser(parts[i]) : NULL;
         if (bytes && !RAY_IS_ERR(bytes)) {
             h = trust_hash(h, ray_data(bytes), bytes->len);
             ray_release(bytes);
         } else if (bytes) ray_error_free(bytes);
+        h = trust_hash(h, &i, sizeof i);   /* the part ends here */
     }
     /* Never 0, which means untrusted; bit 0 is "trusted by name". */
-    LAMBDA_TRUSTED(lambda) = (h << 2) | 2 | (name >= 0 ? 1 : 0);
+    return (h << 2) | 2 | (name >= 0 ? 1 : 0);
+}
+
+void ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
+    LAMBDA_TRUSTED(lambda) = trust_identity(lambda, name);
 }
 
 /* Whether a trusted call of restricted code may run lifted, given the
@@ -631,7 +638,8 @@ static ray_t* head_not_callable_error(int8_t type) {
  * argument. */
 ray_t* ray_sys_trust_fn(ray_t* x) {
     if (x->type == RAY_LAMBDA) {
-        ray_eval_lambda_trust(x, -1);
+        /* Already trusted under a name: it keeps that identity. */
+        if (!(LAMBDA_TRUSTED(x) & 1)) ray_eval_lambda_trust(x, -1);
         ray_retain(x);
         return x;
     }
@@ -654,6 +662,20 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
                 err = ray_error("type", ".sys.trust: '%.*s' is %s, not a lambda",
                                 s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "",
                                 ray_type_name(fn->type));
+                break;
+            }
+            /* One object, one name: its identity includes the name, and
+             * recovery gives each binding the identity of its own name, so
+             * a second name would not replay. */
+            bool second = (LAMBDA_TRUSTED(fn) & 1) && LAMBDA_TRUSTED(fn) != trust_identity(fn, id);
+            for (int64_t k = 0; k < i && !second; k++) {
+                int64_t prev = ray_read_sym(ray_data(x), k, RAY_SYM, x->attrs);
+                second = prev != id && ray_env_get(prev) == fn;
+            }
+            if (second) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("domain", ".sys.trust: the lambda '%.*s' holds is trusted under another name",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
                 break;
             }
         }

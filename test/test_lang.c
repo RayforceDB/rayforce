@@ -8458,6 +8458,16 @@ static test_result_t test_eval_restricted_trusted_lambda(void) {
     TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf2)", "23"));
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg2)"));
 
+    /* One object is trusted under one name: a second name is refused, in
+     * one list (which then marks none) or later; the first name may be
+     * trusted again, and trusting the object as a value keeps its name. */
+    ASSERT_EQ("(do (set __rf787_one (fn [] (set __rf787_n 31))) (set __rf787_two __rf787_one) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_one '__rf787_two])", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_one)"));
+    ASSERT_EQ("(do (.sys.trust '__rf787_one) (.sys.trust '__rf787_one) (.sys.trust __rf787_one) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_two)", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_two)", "31"));
+
     /* Only lambdas are marked, and a list with one bad name marks none. */
     ASSERT_ER_CODE("(.sys.trust 1)", "type");
     ASSERT_ER_CODE("(.sys.trust '__rf787_unbound)", "name");

@@ -303,6 +303,11 @@ static void lift_notes_free(lift_notes_t* ns) {
     *ns = (lift_notes_t){0};
 }
 
+static int lift_note_cmp(const void* a, const void* b) {
+    int64_t x = ((const lift_note_t*)a)->off, y = ((const lift_note_t*)b)->off;
+    return x < y ? -1 : x > y;
+}
+
 /* Reads from the current position to the end, or to the first frame that
  * does not parse, which the replay loop reports; leaves the position where
  * it was.  False when memory ran out. */
@@ -342,14 +347,20 @@ static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
     }
     if (fseek(f, start, SEEK_SET) != 0) ok = false;
     if (!ok) lift_notes_free(ns);
+    /* By offset, for the lookup: a nested request's note precedes its
+     * outer request's, so the log does not hold them in that order. */
+    else if (ns->n > 1) qsort(ns->v, (size_t)ns->n, sizeof(lift_note_t), lift_note_cmp);
     return ok;
 }
 
 /* The note of the request whose frame starts at `off` (borrowed), or NULL. */
 static ray_t* lift_notes_find(const lift_notes_t* ns, int64_t off) {
-    for (int64_t i = 0; i < ns->n; i++)
-        if (ns->v[i].off == off) return ns->v[i].note;
-    return NULL;
+    int64_t lo = 0, hi = ns->n;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (ns->v[mid].off < off) lo = mid + 1; else hi = mid;
+    }
+    return lo < ns->n && ns->v[lo].off == off ? ns->v[lo].note : NULL;
 }
 
 static ray_t* eval_one(ray_t* msg) {

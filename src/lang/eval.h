@@ -298,8 +298,9 @@ void ray_eval_restrict_leave(const ray_restrict_save_t* s);
 
 /* Mark `lambda` trusted (#787).  Its identity, kept in LAMBDA_TRUSTED, is
  * a hash of the global name it is trusted under (`name`, -1 when trusted
- * as a value), its parameters and its body: computed once here, the same
- * in every process, and different for two verbs of the same text. */
+ * as a value), its parameters, its body and its captures: computed once
+ * here, the same in every process, and different for two verbs of the
+ * same text or two closures of one factory. */
 void ray_eval_lambda_trust(ray_t* lambda, int64_t name);
 
 /* The trusted calls of one journaled restricted request (#787), so that

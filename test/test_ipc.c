@@ -976,6 +976,10 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
  * tw and tw2 are the same text, trusted by boot A, and boot B trusts only
  * tw: a request that calls tw2 (refused, caught) and then tw replays the
  * same way, since a note entry names the verb, not only its text.
+ * w1 and w2 are closures of one factory, trusted as values by boot A, and
+ * boot B trusts only w1: their captures tell them apart.  chg is trusted
+ * by both boots but boot B gives it another body: its run-2 call is
+ * refused on replay, where the snapshot holds the old verb.
  */
 static void ipc_rm_journal(const char* jbase);
 
@@ -1005,9 +1009,10 @@ static int64_t rf787_replay_global(const char* name) {
 
 static void rf787_replay_fresh(void) {
     const char* names[] = { "__rf787_kv", "__rf787_kv2", "__rf787_kv3", "__rf787_put", "__rf787_good",
-                            "__rf787_snap", "__rf787_tw", "__rf787_tw2" };
+                            "__rf787_snap", "__rf787_tw", "__rf787_tw2", "__rf787_kv4", "__rf787_kv5",
+                            "__rf787_mk", "__rf787_w1", "__rf787_w2", "__rf787_chg" };
     ray_t* zero = ray_i64(0);
-    for (int i = 0; i < 8; i++) (void)ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero);
+    for (int i = 0; i < 14; i++) (void)ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero);
     ray_release(zero);
 }
 
@@ -1019,12 +1024,19 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
         "(set __rf787_good (fn [v] (set __rf787_kv2 v) v))"
         "(set __rf787_snap (fn [] (.log.snapshot) 0))"
         "(set __rf787_tw (fn [v] (set __rf787_kv3 v) v))"
-        "(set __rf787_tw2 (fn [v] (set __rf787_kv3 v) v))";
-    char boot_a[768], boot_b[768];
-    snprintf(boot_a, sizeof boot_a, "(do (set __rf787_kv 0) (set __rf787_kv2 0) (set __rf787_kv3 0) %s"
-             " (.sys.trust ['__rf787_put '__rf787_good '__rf787_snap '__rf787_tw '__rf787_tw2]) 0)", defs);
+        "(set __rf787_tw2 (fn [v] (set __rf787_kv3 v) v))"
+        "(set __rf787_mk (fn [k] (fn [v] (set __rf787_kv4 (+ v k)) v)))";
+    char boot_a[1536], boot_b[1536];
+    snprintf(boot_a, sizeof boot_a, "(do (set __rf787_kv 0) (set __rf787_kv2 0) (set __rf787_kv3 0)"
+             " (set __rf787_kv4 0) (set __rf787_kv5 0) %s"
+             " (set __rf787_w1 (.sys.trust (__rf787_mk 0))) (set __rf787_w2 (.sys.trust (__rf787_mk 100)))"
+             " (set __rf787_chg (fn [v] (set __rf787_kv5 v) v))"
+             " (.sys.trust ['__rf787_put '__rf787_good '__rf787_snap '__rf787_tw '__rf787_tw2 '__rf787_chg]) 0)",
+             defs);
     snprintf(boot_b, sizeof boot_b,
-             "(do %s (.sys.trust ['__rf787_good '__rf787_snap '__rf787_tw]) 0)", defs);
+             "(do %s (set __rf787_w1 (.sys.trust (__rf787_mk 0))) (set __rf787_w2 (__rf787_mk 100))"
+             " (set __rf787_chg (fn [v] (set __rf787_kv5 (* v 10)) v))"
+             " (.sys.trust ['__rf787_good '__rf787_snap '__rf787_tw '__rf787_chg]) 0)", defs);
 
     /* Run 1: boot A. */
     rf787_replay_fresh();
@@ -1034,9 +1046,9 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
     ray_release(b);
     ray_test_server_t srv;
     RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
-    const char* asks1[] = { "(__rf787_put 5)", "(__rf787_snap)" };
-    const int64_t wants1[] = { 5, 0 };
-    bool run1 = rf787_replay_reqs(srv.port, asks1, wants1, 2);
+    const char* asks1[] = { "(__rf787_put 5)", "(__rf787_chg 5)", "(__rf787_snap)" };
+    const int64_t wants1[] = { 5, 5, 0 };
+    bool run1 = rf787_replay_reqs(srv.port, asks1, wants1, 3);
     ray_test_server_stop(&srv);
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     TEST_ASSERT_TRUE(run1);
@@ -1051,29 +1063,36 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
     RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
     const char* asks2[] = { "(__rf787_put 6)", "(__rf787_good 7)", "(do (__rf787_good 8) (__rf787_put 9))",
                             "(last (map __rf787_good (+ 10 (til 10))))", "(__rf787_tw2 6)",
-                            "(do (try (__rf787_tw2 7) (fn [e] 0)) (__rf787_tw 8))" };
-    const int64_t wants2[] = { -1, 7, -1, 19, -1, 8 };
-    bool run2 = rf787_replay_reqs(srv.port, asks2, wants2, 6);
+                            "(do (try (__rf787_tw2 7) (fn [e] 0)) (__rf787_tw 8))",
+                            "(do (try (__rf787_w2 7) (fn [e] 0)) (__rf787_w1 8))", "(__rf787_chg 6)" };
+    const int64_t wants2[] = { -1, 7, -1, 19, -1, 8, 8, 6 };
+    bool run2 = rf787_replay_reqs(srv.port, asks2, wants2, 8);
     ray_test_server_stop(&srv);
     int64_t kv_live = rf787_replay_global("__rf787_kv"), kv2_live = rf787_replay_global("__rf787_kv2");
     int64_t kv3_live = rf787_replay_global("__rf787_kv3");
+    int64_t kv4_live = rf787_replay_global("__rf787_kv4"), kv5_live = rf787_replay_global("__rf787_kv5");
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     TEST_ASSERT_TRUE(run2);
     TEST_ASSERT_EQ_I(kv_live, 5);
     TEST_ASSERT_EQ_I(kv2_live, 19);
     TEST_ASSERT_EQ_I(kv3_live, 8);
+    TEST_ASSERT_EQ_I(kv4_live, 8);
+    TEST_ASSERT_EQ_I(kv5_live, 60);
 
     /* Run 3: recovery alone replays run 2 as it ran. */
     rf787_replay_fresh();
     TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
     int64_t kv = rf787_replay_global("__rf787_kv"), kv2 = rf787_replay_global("__rf787_kv2");
     int64_t kv3 = rf787_replay_global("__rf787_kv3");
+    int64_t kv4 = rf787_replay_global("__rf787_kv4"), kv5 = rf787_replay_global("__rf787_kv5");
     bool restored = !ray_eval_get_restricted();
     (void)ray_journal_purge();
     ipc_rm_journal(jbase);
     TEST_ASSERT_EQ_I(kv, 5);
     TEST_ASSERT_EQ_I(kv2, 19);
     TEST_ASSERT_EQ_I(kv3, 8);
+    TEST_ASSERT_EQ_I(kv4, 8);
+    TEST_ASSERT_EQ_I(kv5, 5);   /* the changed verb's call is refused on replay */
     TEST_ASSERT_TRUE(restored);
     PASS();
 }

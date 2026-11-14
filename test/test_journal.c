@@ -1650,6 +1650,44 @@ static test_result_t test_journal_lift_note_not_an_entry(void) {
     PASS();
 }
 
+/* 7h. #787: a request finds its note wherever the log holds it.  4000
+ * restricted calls of a trusted verb are logged, then their notes in the
+ * reverse order; recovery lifts every one. */
+static test_result_t test_journal_lift_notes_any_order(void) {
+    enum { N = 4000 };
+    char base[256]; make_base(base, sizeof(base), "lift_many");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str("(do (set jrn_ln_c 0) (set jrn_ln_inc (fn [] (set jrn_ln_c (+ jrn_ln_c 1))))"
+                            "    (.sys.trust 'jrn_ln_inc) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+    ray_t* inc = ray_env_get_global(ray_sym_intern("jrn_ln_inc", 10));
+    TEST_ASSERT_NOT_NULL(inc);
+    int64_t id = (int64_t)LAMBDA_TRUSTED(inc);
+    int64_t* offs = (int64_t*)ray_sys_alloc(N * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(offs);
+    int64_t gen = 0;
+    bool ok = true;
+    for (int i = 0; i < N && ok; i++)
+        ok = ray_journal_position(&gen, &offs[i]) && jrn_log_restricted("(jrn_ln_inc)");
+    for (int i = N - 1; i >= 0 && ok; i--) ok = jrn_log_note(gen, offs[i], &id, 1);
+    ray_sys_free(offs);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(ok);
+
+    ray_t* zero = ray_i64(0);
+    (void)ray_env_set(ray_sym_intern("jrn_ln_c", 8), zero);
+    (void)ray_env_set(ray_sym_intern("jrn_ln_inc", 10), zero);
+    ray_release(zero);
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    cleanup_base(base);
+    ray_t* c = ray_env_get_global(ray_sym_intern("jrn_ln_c", 8));
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQ_I(c->i64, N);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  8. is_open
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -3452,6 +3490,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },
     { "journal/lift_note_not_an_entry",    test_journal_lift_note_not_an_entry,    jrn_setup, jrn_teardown },
+    { "journal/lift_notes_any_order",      test_journal_lift_notes_any_order,      jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */
