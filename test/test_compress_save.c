@@ -4527,6 +4527,7 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         { "q: (if (< a 8) a 0)", "(> date 2024.01.03)", 0, true },
         { "q: (if (< a 8) a 0)", "(>= date 2024.01.01)", 9000, false },
         { "a: a", "(and (>= date 2024.01.02) (> a (avg a)))", 3300, false },
+        { "a: a", "(and (== date 2024.01.02) (== (and (> a 0) (< a 12000)) true))", 2999, true },
         { "by: b s: (sum (if (< a 8) a 0))", "(== date 2024.01.02)", 3000, true },
         { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, false },
     };
@@ -4561,6 +4562,54 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
                 sp_bind(NULL); ray_release(t);
                 TEST_ASSERT_FMT(values && structural, "gen %d case %zu: values=%d structural=%d: %s",
                                 gen, i, (int)values, (int)structural, q);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* Ordinary pruning predates the bounded IF/group grammars. Wide WHERE
+ * trees and deep atomic output trees must not inherit those proof limits. */
+static test_result_t test_select_parted_prunes_ordinary_uncapped(void) {
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/ordinary_limits%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make(path, gen ? 7 : 0, false);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        char wide[4096] = "(and (== date 2024.01.02)";
+        for (int i = 0; i < 45; i++) strcat(wide, " (>= a 0)");
+        strcat(wide, ")");
+        char deep[4096] = "";
+        for (int i = 0; i < 40; i++) strcat(deep, "(+ 0 ");
+        strcat(deep, "a");
+        for (int i = 0; i < 40; i++) strcat(deep, ")");
+        for (int kind = 0; kind < 2; kind++) {
+            const char* pred = kind ? "(== date 2024.01.02)" : wide;
+            const char* expr = kind ? deep : "a";
+            char q[12288], ref[16384];
+            snprintf(q, sizeof q, "(select {from: t where: %s q: %s})", pred, expr);
+            snprintf(ref, sizeof ref, "(select {from: t where: (or %s %s) q: %s})", pred, pred, expr);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            structure = ray_query_test_parted_pruned_sources(true) == 1;
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          ray_table_nrows(r) == 3000 && sp_same(r, u);
+            drop_out(r); drop_out(u);
+            if (!structure || !values) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(structure && values, "ordinary gen=%d kind=%d values=%d structure=%d",
+                                gen, kind, (int)values, (int)structure);
             }
         }
         sp_bind(NULL); ray_release(t);
@@ -4628,6 +4677,203 @@ static void pdb_grouped_if_bind(ray_t* t) {
     ray_env_set(ray_sym_intern(name, sizeof name - 1), t);
 }
 
+/* Construct shallow balanced trees for the visit edge, or one-sided
+ * trees for the depth edge. Both branches yield the same source values. */
+static size_t pdb_if_tree(char* out, size_t cap, int nodes, bool chain, int extra_not) {
+    if (!nodes) {
+        if (cap < 2) return SIZE_MAX;
+        memcpy(out, "a", 2); return 1;
+    }
+    const char* condition = extra_not == 1 ? "(not (> x 0))" :
+                            extra_not == 2 ? "(not (not (> x 0)))" : "(> x 0)";
+    int k = snprintf(out, cap, "(if %s ", condition);
+    if (k < 0 || (size_t)k >= cap) return SIZE_MAX;
+    size_t n = (size_t)k;
+    int left = chain ? nodes - 1 : (nodes - 1) / 2;
+    size_t used = pdb_if_tree(out + n, cap - n, left, chain, 0);
+    if (used == SIZE_MAX || used + 2 >= cap - n) return SIZE_MAX;
+    n += used; out[n++] = ' ';
+    used = pdb_if_tree(out + n, cap - n, nodes - 1 - left, chain, 0);
+    if (used == SIZE_MAX || used + 2 > cap - n) return SIZE_MAX;
+    n += used; out[n++] = ')'; out[n] = 0; return n;
+}
+
+static test_result_t test_select_parted_prunes_if_limits(void) {
+    static const struct { int nodes; bool chain; int extra_not; bool pruned; } cases[] = {
+        /* 42 IFs: 42 projections + 42 conditions + 43 leaves = 127.
+         * One/two extra NOTs reach exactly 128/129 visits. */
+        { 42, false, 1, true }, { 42, false, 2, false },
+        { 32, true, 0, true }, { 33, true, 0, false },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/if_limits%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make_grouped_if(path, gen != 0);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t)); sp_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char expr[8192], q[10000], ref[11000];
+            size_t written = pdb_if_tree(expr, sizeof expr, cases[i].nodes,
+                                         cases[i].chain, cases[i].extra_not);
+            if (written == SIZE_MAX) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_TRUE(written != SIZE_MAX);
+            }
+            snprintf(q, sizeof q, "(select {from:t where:(== date 2024.01.02) q:%s})", expr);
+            snprintf(ref, sizeof ref, "(select {from:t where:(or (== date 2024.01.02) (== date 2024.01.02)) q:%s})", expr);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            structure = ray_query_test_parted_pruned_sources(true) == (uint64_t)cases[i].pruned;
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            ray_t* expected = ray_eval_str("[10 20 0Nl 40 0Nl 2 0Nl 4]");
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 8 &&
+                          sp_same(r, u) && expected && !RAY_IS_ERR(expected);
+            ray_t* col = values ? ray_table_col(r, ray_sym_intern("q", 1)) : NULL;
+            values = values && col && !RAY_IS_ERR(col) && t29_same(col, expected);
+            if (col && RAY_IS_ERR(col)) ray_error_free(col);
+            drop_out(expected); drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "IF limits gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* SYM conditions in the separate ungrouped IF proof. A tick name that
+ * resolves to a source column is not a literal, even when values agree. */
+static test_result_t test_select_parted_prunes_if_symbols(void) {
+    static const struct { const char* cond; const char* expected; bool pruned; } cases[] = {
+        { "(== act 'Accepted)", "[1 0 0 1 1 0 0 1]", true },
+        { "(!= act 'Accepted)", "[0 1 1 0 0 1 1 0]", true },
+        { "(== act 'act)", NULL, false },
+        { "(== 'act act)", NULL, false },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/if_symbols%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make_grouped_if(path, gen != 0);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char q[768], ref[1024];
+            snprintf(q, sizeof q, "(select {from: t where: (== date 2024.01.02) q: (if %s 1 0)})", cases[i].cond);
+            snprintf(ref, sizeof ref, "(select {from: t where: (or (== date 2024.01.02) (== date 2024.01.02)) q: (if %s 1 0)})", cases[i].cond);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            structure = ray_query_test_parted_pruned_sources(true) == (uint64_t)cases[i].pruned;
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          ray_table_nrows(r) == 8 && sp_same(r, u);
+            ray_t* expected = cases[i].expected ? ray_eval_str(cases[i].expected) : NULL;
+            if (cases[i].expected) {
+                values = values && expected && !RAY_IS_ERR(expected);
+                ray_t* col = values ? ray_table_col(r, ray_sym_intern("q", 1)) : NULL;
+                values = values && col && !RAY_IS_ERR(col) && t29_same(col, expected);
+                if (col && RAY_IS_ERR(col)) ray_error_free(col);
+            }
+            drop_out(expected); drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "if symbols gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* Separate output-count and condition-depth edges, with an independent
+ * successful two-group result and no-mask comparison on both sides. */
+static test_result_t test_select_parted_prunes_group_limits(void) {
+    static const struct { int outputs, not_depth, refs_edge; bool pruned; } cases[] = {
+        { 32, 0, 0, true }, { 33, 0, 0, false },
+        { 1, 24, 0, true }, { 1, 25, 0, false },
+        /* Four initial visits/refs, then 32 seven-visit/ref outputs.
+         * 28/29 extra NOT heads reach 256/257 for both counters. These
+         * pin the shared edge, not which counter rejects first. */
+        { 32, 0, 28, true }, { 32, 0, 29, false },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/group_limits%d", ray_test_tmp(CS_TMP), gen);
+        ray_t* t = pdb_make_grouped_if(path, gen != 0);
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char cond[2048] = "", outs[16384] = "", q[20000], ref[22000];
+            size_t at = 0, out_at = 0;
+            for (int k = 0; k < cases[i].not_depth; k++)
+                at += (size_t)snprintf(cond + at, sizeof cond - at, "(not ");
+            at += (size_t)snprintf(cond + at, sizeof cond - at, "(> x 0)");
+            for (int k = 0; k < cases[i].not_depth; k++)
+                at += (size_t)snprintf(cond + at, sizeof cond - at, ")");
+            for (int k = 0; k < cases[i].outputs; k++) {
+                const char* c = cases[i].refs_edge ?
+                    (k < cases[i].refs_edge ? "(not (> x x))" : "(> x x)") : cond;
+                out_at += (size_t)snprintf(outs + out_at, sizeof outs - out_at,
+                                          " q%d:(sum (if %s a %s))", k, c,
+                                          cases[i].refs_edge ? "b" : "0");
+            }
+            snprintf(q, sizeof q, "(select {from:t where:(== date 2024.01.02) by:g%s})", outs);
+            snprintf(ref, sizeof ref, "(select {from:t where:(or (== date 2024.01.02) (== date 2024.01.02)) by:g%s})", outs);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            structure = ray_query_test_parted_pruned_sources(true) == (uint64_t)cases[i].pruned;
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          ray_table_nrows(r) == 2 && sp_same(r, u);
+            ray_t* expected = ray_eval_str(cases[i].not_depth % 2 ? "[10 0]" : "[60 6]");
+            values = values && expected && !RAY_IS_ERR(expected);
+            for (int k = 0; values && k < cases[i].outputs; k++) {
+                char name[24]; snprintf(name, sizeof name, "q%d", k);
+                ray_t* col = ray_table_col(r, ray_sym_intern(name, strlen(name)));
+                ray_t* edge_expected = cases[i].refs_edge ?
+                    ray_eval_str(k < cases[i].refs_edge ? "[70 6]" : "[600 20]") : NULL;
+                ray_t* want = cases[i].refs_edge ? edge_expected : expected;
+                values = col && !RAY_IS_ERR(col) && want && !RAY_IS_ERR(want) && t29_same(col, want);
+                drop_out(edge_expected);
+                if (col && RAY_IS_ERR(col)) ray_error_free(col);
+            }
+            drop_out(expected); drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "group limits gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
 /* These statements check the new restricted grouped admission, not general
  * IF locality. Duplicated top-level OR supplies a no-necessary-mask reference;
  * exact independent values additionally pin NULL skipping and literal capture. */
@@ -4666,6 +4912,9 @@ static test_result_t test_select_parted_prunes_grouped_if(void) {
         { "(== date 2024.01.02)",
           "s:(sum (if true a b)) t:(sum (if true b a))",
           {70, 6, 600, 20}, false, false },
+        { "(== date 2024.01.02)",
+          "s:(sum (if (and (> x 0) (< x 2) (== x 1)) a b)) t:(sum (if (or (> x 0) (== x 0) (< x 0)) a b))",
+          {420, 22, 70, 6}, false, false },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];
@@ -4935,8 +5184,6 @@ static test_result_t test_select_parted_prunes_mixed(void) {
     PASS();
 }
 
-/* A lambda formal named like the key shadows it: the where compares the
- * formal, so nothing is pruned and the answer is the whole table's. */
 /* Head names present as real parted columns are not canonical call heads
  * for pruning. LAST, absent from the schema, is a positive control so an
  * unrelated source-shape rejection cannot satisfy all the assertions. */
@@ -5165,6 +5412,8 @@ static test_result_t test_select_parted_prunes_take_head_effects(void) {
     PASS();
 }
 
+/* A lambda formal named like the key shadows it: the where compares the
+ * formal, so nothing is pruned and the answer is the whole table's. */
 static test_result_t test_select_parted_prunes_shadow(void) {
     ray_t* t = pdb_make(ray_test_tmp(CS_TMP "/sh"), 7, false);
     TEST_ASSERT_NOT_NULL(t);
@@ -5602,8 +5851,12 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_local_shapes", test_select_parted_prunes_local_shapes, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_ordinary_uncapped", test_select_parted_prunes_ordinary_uncapped, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if", test_select_parted_prunes_grouped_if, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_group_limits", test_select_parted_prunes_group_limits, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_if_symbols", test_select_parted_prunes_if_symbols, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_if_limits", test_select_parted_prunes_if_limits, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if_captures", test_select_parted_prunes_grouped_if_captures, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_mixed",   test_select_parted_prunes_mixed,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_table_heads", test_select_parted_prunes_table_heads, rt_setup, rt_teardown },

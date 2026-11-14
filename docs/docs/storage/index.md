@@ -214,7 +214,24 @@ A partition may hold fewer columns than the first one, as long as the columns it
 
 ### Partition Pruning
 
-The query optimizer recognizes predicates on the `MAPCOMMON` column and eliminates entire partitions from the scan plan. This means a query filtering on a single date in a year of data only touches 1/365th of the files on disk — with zero per-row cost for the pruned partitions.
+The optimizer can derive a necessary partition mask from literal comparisons or literal `in` sets on the virtual `MAPCOMMON` partition column. It applies that mask only when the remaining query shape is safe to evaluate over the retained partitions. The original `where` still runs. This is not a guarantee that every query with a date bound prunes, nor a count of physical file opens or reads.
+
+Ordinary row-local atomic expressions retain their uncapped admission walk. Canonical nested `and`/`or`, restricted `not` conditions, grouped unary `first`/`last`, and output `count(distinct column)` can retain pruning too. Call heads shadowed by lexical bindings or source columns are not assumed to be the corresponding builtin.
+
+Two additional IF shapes have deliberately bounded proofs:
+
+- **Ungrouped:** one fresh output, `from` and `where`, no `by`, and an explicit ELSE. Branches must be I64 columns or literals, or nested `if` expressions with explicit ELSE. Conditions use BOOL literals, I64 comparisons or SYM equality/inequality, with canonical `and`/`or` and unary `not`. The proof allows 128 visits and depth 32. Quoted SYM names that resolve to source columns decline this proof.
+- **Grouped:** one bare I64 group key and up to 32 fresh outputs, each `sum(if condition then else)` with explicit ELSE and I64 branches. Conditions must depend on a column; supported predicates include I64 comparisons and SYM equality/inequality against one unambiguous non-NULL literal. The shared proof allows 256 visits, depth 24 and 256 recorded references. Output names must not capture referenced source or literal names.
+
+These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, wider grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
+
+```clojure
+;; A supported narrow grouped shape; the literal date bound selects partitions.
+(select {from: trades where: (== date 2024.01.02) by: account
+         qty_ok: (sum (if (> qty 0) qty 0))})
+```
+
+The example assumes `account` and `qty` are I64 columns. A declined proof changes optimization, not permission to substitute a different query result.
 
 ## Symbol Table Persistence
 
