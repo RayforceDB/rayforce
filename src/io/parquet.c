@@ -2136,7 +2136,7 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
     if (!pq_dest(root,dest,sizeof(dest))) return pq_error("invalid or too long destination path");
     root = dest;
     ray_parquet_t* first = NULL; ray_t* err = NULL;
-    char staging[1100], sym[1200]; int64_t parts = 0, rows = 0;
+    char staging[1100] = "", sym[1200] = ""; int64_t parts = 0, rows = 0;
     ray_sym_domain_t* domain = NULL;
     for (size_t i = 0; i < npaths && !err; i++) {
         ray_parquet_t* r = NULL;
