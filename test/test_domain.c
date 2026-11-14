@@ -3590,6 +3590,38 @@ static test_result_t test_domain_import_dict_reserve(void) {
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 }
+/* ray_symimp_write past the file's length: through pwrite (a store through
+ * the mapping there would fault), the file grown to hold it; inside the
+ * length, through the mapping.  Both read back from the file. */
+static test_result_t test_domain_import_write_past_size(void) {
+    const char* p = ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_impw");
+    unlink(p);
+    ray_sym_domain_t* dom = ray_sym_domain_create_import(p);
+    if (!dom) SKIP("import dictionary unsupported here");
+    ray_symimp_t* imp = ray_sym_domain_import(dom);
+    TEST_ASSERT_NOT_NULL(imp);
+    struct stat st;
+    TEST_ASSERT_EQ_I(stat(p, &st), 0);
+    int64_t in = (int64_t)st.st_size - 64, past = (int64_t)st.st_size + 4096;
+    TEST_ASSERT_TRUE(in > 64);
+    TEST_ASSERT_TRUE(ray_symimp_write(imp, in, "inside", 6));
+    TEST_ASSERT_TRUE(ray_symimp_write(imp, past, "past-size", 9));
+    TEST_ASSERT_EQ_I(stat(p, &st), 0);
+    TEST_ASSERT_EQ_I((long)st.st_size, (long)(past + 9));
+    char a[8] = {0}, b[16] = {0};
+    int fd = open(p, O_RDONLY);
+    TEST_ASSERT_TRUE(fd >= 0);
+    ssize_t ra = pread(fd, a, 6, (off_t)in), rb = pread(fd, b, 9, (off_t)past);
+    close(fd);
+    TEST_ASSERT_EQ_I(ra, 6);
+    TEST_ASSERT_EQ_I(rb, 9);
+    TEST_ASSERT_STR_EQ(a, "inside");
+    TEST_ASSERT_STR_EQ(b, "past-size");
+    ray_sym_domain_release(dom);
+    unlink(p);
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_impw.lk"));
+    PASS();
+}
 /* Skeptic probe (pqio round 4).  Rounds of the reservation against lookups
  * in flight (two threads finding the 64K strings batch after batch), as in
  * import_dict_reserve: how often the reservation kept the shard tables (a
@@ -4511,6 +4543,7 @@ const test_entry_t domain_entries[] = {
     { "domain/import_dict_reclaim", test_domain_import_dict_reclaim, domain_setup, domain_teardown },
     { "domain/import_dict_tags", test_domain_import_dict_tags, domain_setup, domain_teardown },
     { "domain/import_dict_reserve", test_domain_import_dict_reserve, domain_setup, domain_teardown },
+    { "domain/import_write_past_size", test_domain_import_write_past_size, domain_setup, domain_teardown },
     { "domain/sk4_reserve_kept_freed", test_domain_sk4_reserve_kept_freed, domain_setup, domain_teardown },
     { "domain/runtime_identity",        test_domain_runtime_identity,        domain_setup, domain_teardown },
     { "domain/runtime_delegation",      test_domain_runtime_delegation,      domain_setup, domain_teardown },
