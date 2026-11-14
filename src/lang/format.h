@@ -44,6 +44,10 @@ enum {
 /* Format a ray_t value into a new ray_t string (RAY_STR atom). */
 ray_t* ray_fmt(ray_t* obj, int mode);
 
+/* As ray_fmt, but output beyond max_bytes (when positive) is a "limit" error,
+ * not a truncated string. */
+ray_t* ray_fmt_limited(ray_t* obj, int mode, int64_t max_bytes);
+
 /* REPL pretty-printer: like ray_fmt(obj, 1) but dicts/lists that would
  * exceed the row width break across multiple indented lines (JSON-style).
  * Used only for top-level REPL display — ray_fmt stays single-line. */

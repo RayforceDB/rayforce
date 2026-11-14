@@ -49,13 +49,15 @@ int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
 
 /* Per-process scratch root.  Every "/tmp/..." path a test names goes
  * through ray_test_tmp(), which returns the string with each "/tmp" path
- * prefix moved under this process's own root (/tmp/rayforce_t.<pid>,
- * created at startup and removed at exit), so two suites running on one
+ * prefix moved under this process's own root ($TMPDIR/rayforce_t.<pid>,
+ * default /tmp, created at startup and removed at exit), so two suites running on one
  * host never share a file.  The argument may be a whole Rayfall source or
  * shell line: every "/tmp" path inside it moves.  The result is interned
  * and valid for the life of the process.  .rfl files get the same rewrite
  * when they are read.  Call it from the test thread only. */
 const char* ray_test_tmp(const char* s);
+/* Immutable startup snapshot; later fixture environment changes do not move it. */
+const char* ray_test_tmp_root(void);
 
 /* Disarm every global store / decode / bind test hook and clear a pending
  * interrupt request.  Teardowns of suites that arm hooks call it, so a test

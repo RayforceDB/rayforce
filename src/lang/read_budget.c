@@ -1,0 +1,229 @@
+#include "lang/read_budget.h"
+#include "mem/heap.h"
+#include "mem/sys.h"
+#include <string.h>
+#include <stdint.h>
+#include <assert.h>
+
+#define READ_RECORDS 64
+/* meta_work is a test-only measure of the ledger's own bookkeeping: counted in
+ * DEBUG builds, never in release allocations and entry searches. */
+#ifdef DEBUG
+#define READ_META_WORK(b) ((b)->meta_work++)
+#else
+#define READ_META_WORK(b) ((void)0)
+#endif
+/* One ledger entry.  A free entry has a NULL ptr and keeps the next free entry
+ * in the space its charge uses while it is occupied. */
+struct ray_read_record {
+    void* ptr;
+    union { size_t charge; ray_read_record_t* next_free; };
+    bool sys;
+};
+typedef ray_read_record_t read_record_t;
+struct ray_read_records {
+    ray_read_records_t* next;
+    size_t charge;
+    read_record_t entries[READ_RECORDS];
+};
+
+bool ray_read_budget_init(ray_read_budget_t* b, size_t limit) {
+    memset(b, 0, sizeof(*b));
+    b->limit = limit;
+    b->fail_after = SIZE_MAX;
+    if (limit < sizeof(*b)) { b->status = RAY_READ_LIMIT; return false; }
+    b->live = b->peak = sizeof(*b);
+    return true;
+}
+
+static bool reserve(ray_read_budget_t* b, size_t charge) {
+    if (b->closed || b->status != RAY_READ_OK) return false;
+    if (b->live > b->limit || charge > b->limit - b->live) {
+        b->status = RAY_READ_LIMIT;
+        return false;
+    }
+    b->live += charge;
+    if (b->live > b->peak) b->peak = b->live;
+    return true;
+}
+
+static bool acquire_fails(ray_read_budget_t* b) {
+    /* Context-local fault injection after admission, before acquisition.
+     * The ordinary allocator and all unrelated callers are untouched. */
+    return b->attempts++ == b->fail_after;
+}
+
+/* A free ledger entry, not yet taken: it stays at the head of the free list
+ * until commit() fills it, so a request that fails after asking for one leaves
+ * the list untouched.  O(1): a new page is threaded onto the list whole, and
+ * a released entry is pushed back, so no page is ever searched. */
+static read_record_t* slot(ray_read_budget_t* b) {
+    if (b->closed || b->status != RAY_READ_OK) return NULL;
+    READ_META_WORK(b);
+    if (b->free_slot) return b->free_slot;
+    size_t charge;
+    if (!ray_sys_charge(sizeof(ray_read_records_t), &charge) || !reserve(b, charge)) return NULL;
+    ray_read_records_t* c = acquire_fails(b) ? NULL : ray_sys_alloc(sizeof(*c));
+    if (!c) { b->live -= charge; b->status = RAY_READ_OOM; return NULL; }
+    c->next = b->records;
+    c->charge = charge;
+    b->records = c;
+    for (size_t i = 0; i < READ_RECORDS; i++) {
+        c->entries[i].ptr = NULL;
+        c->entries[i].next_free = i + 1 < READ_RECORDS ? &c->entries[i + 1] : NULL;
+    }
+    b->free_slot = &c->entries[0];
+    return b->free_slot;
+}
+
+/* Fill the entry slot() returned. */
+static void commit(ray_read_budget_t* b, read_record_t* r, void* p, size_t charge, bool sys) {
+    assert(r == b->free_slot);
+    b->free_slot = r->next_free;
+    r->ptr = p;
+    r->charge = charge;
+    r->sys = sys;
+}
+
+void* ray_read_sys_alloc(ray_read_budget_t* b, size_t bytes) {
+    read_record_t* r = slot(b);
+    size_t charge;
+    if (!r) return NULL;
+    if (!ray_sys_charge(bytes, &charge)) { b->status = RAY_READ_LIMIT; return NULL; }
+    if (!reserve(b, charge)) return NULL;
+    void* p = acquire_fails(b) ? NULL : ray_sys_alloc(bytes);
+    if (!p) { b->live -= charge; b->status = RAY_READ_OOM; return NULL; }
+    commit(b, r, p, charge, true);
+    return p;
+}
+
+ray_t* ray_read_alloc(ray_read_budget_t* b, size_t bytes) {
+    read_record_t* r = slot(b);
+    size_t charge;
+    if (!r) return NULL;
+    if (!ray_alloc_charge(bytes, &charge)) { b->status = RAY_READ_LIMIT; return NULL; }
+    if (!reserve(b, charge)) return NULL;
+    size_t actual = 0;
+    ray_t* v = acquire_fails(b) ? NULL : ray_alloc_admitted(bytes, charge, &actual);
+    if (!v) { b->live -= charge; b->status = RAY_READ_OOM; return NULL; }
+    assert(actual == charge);
+    v->type = RAY_U8;
+    v->len = 0;
+    commit(b, r, v, charge, false);
+    return v;
+}
+
+/* Finding the entry of a released block walks the pages: the reader releases a
+ * block through here a handful of times per run (buffer growth, symbol
+ * publication), never once per value, so the walk is not on a per-value path. */
+static void remove_record(ray_read_budget_t* b, void* p, bool sys, bool transfer) {
+    if (!p) return;
+    for (ray_read_records_t* c = b->records; c; c = c->next) {
+        for (size_t i = 0; i < READ_RECORDS; i++) {
+            read_record_t* r = &c->entries[i];
+            READ_META_WORK(b);
+            if (r->ptr != p || r->sys != sys) continue;
+            if (!transfer) {
+                /* A parent or external alias can keep this block alive.
+                 * Keep our ledger ref AND its charge until uniquely owned.
+                 * Closing the scope is the only unconditional release. */
+                if (!sys && ray_atomic_load(&((ray_t*)p)->rc) != 1) return;
+                if (sys) ray_sys_free(p); else ray_release(p);
+            }
+            b->live -= r->charge;
+            r->ptr = NULL;
+            r->next_free = b->free_slot;
+            b->free_slot = r;
+            return;
+        }
+    }
+    assert(!"reader block not owned by this context");
+}
+
+void ray_read_sys_free(ray_read_budget_t* b, void* p) { remove_record(b, p, true, false); }
+void ray_read_sys_transfer(ray_read_budget_t* b, void* p) { remove_record(b, p, true, true); }
+void ray_read_release(ray_read_budget_t* b, ray_t* p) { remove_record(b, p, false, false); }
+
+void ray_read_budget_close(ray_read_budget_t* b) {
+    /* Teardown refunds all charges, so no later/reentrant admission is valid. */
+    b->closed = true; /* Preserve the original failure status for diagnostics. */
+    ray_read_records_t* c = b->records;
+    while (c) {
+        ray_read_records_t* next = c->next;
+        for (size_t i = 0; i < READ_RECORDS; i++) {
+            read_record_t* r = &c->entries[i];
+            if (r->ptr) {
+                if (r->sys) ray_sys_free(r->ptr); else ray_release(r->ptr);
+                b->live -= r->charge;
+            }
+        }
+        b->live -= c->charge;
+        ray_sys_free(c);
+        c = next;
+    }
+    b->records = NULL;
+    b->free_slot = NULL;
+    /* A failed init owns no stack-context charge. */
+    if (b->live) { assert(b->live == sizeof(*b)); b->live = 0; }
+}
+
+ray_t* ray_read_string(ray_read_budget_t* b, const char* s, size_t n) {
+    if ((!s && n) || n > INT64_MAX || n == SIZE_MAX) { b->status = RAY_READ_INVALID; return NULL; }
+    ray_t* chars = NULL;
+    if (n >= 7) {
+        chars = ray_read_alloc(b, n + 1);
+        if (!chars) return NULL;
+        chars->len = (int64_t)n;
+        memcpy(ray_data(chars), s, n);
+        ((char*)ray_data(chars))[n] = 0;
+    }
+    ray_t* v = ray_read_alloc(b, 0);
+    if (!v) { ray_read_release(b, chars); return NULL; }
+    v->type = -RAY_STR;
+    if (chars) { ray_retain(chars); v->obj = chars; }
+    else {
+        v->slen = (uint8_t)n;
+        if (n) memcpy(v->sdata, s, n);
+        v->sdata[n] = 0;
+    }
+    return v;
+}
+
+ray_t* ray_read_i64(ray_read_budget_t* b, const int64_t* values, size_t n) {
+    if ((!values && n) || n > INT64_MAX || n > SIZE_MAX / sizeof(int64_t)) {
+        b->status = RAY_READ_INVALID; return NULL;
+    }
+    ray_t* v = ray_read_alloc(b, n * sizeof(int64_t));
+    if (!v) return NULL;
+    v->type = RAY_I64;
+    v->len = (int64_t)n;
+    if (n) memcpy(ray_data(v), values, n * sizeof(int64_t));
+    for (size_t i = 0; i < n; i++) if (values[i] == INT64_MIN) v->attrs |= RAY_ATTR_HAS_NULLS;
+    return v;
+}
+
+ray_t* ray_read_list(ray_read_budget_t* b, ray_t* const* values, size_t n) {
+    if ((!values && n) || n > INT64_MAX || n > SIZE_MAX / sizeof(ray_t*)) {
+        b->status = RAY_READ_INVALID; return NULL;
+    }
+    for (size_t i = 0; i < n; i++)
+        if (!values[i] || RAY_IS_ERR(values[i])) { b->status = RAY_READ_INVALID; return NULL; }
+    ray_t* v = ray_read_alloc(b, n * sizeof(ray_t*));
+    if (!v) return NULL;
+    v->type = RAY_LIST;
+    for (size_t i = 0; i < n; i++) {
+        ray_retain(values[i]); ((ray_t**)ray_data(v))[i] = values[i];
+    }
+    v->len = (int64_t)n;
+    return v;
+}
+
+void* ray_read_sys_resize(ray_read_budget_t* b, void* old, size_t old_bytes, size_t bytes) {
+    /* Old remains owned/charged until replacement succeeds. The explicit
+     * proof API receives the valid source length, not allocation capacity. */
+    void* p = ray_read_sys_alloc(b, bytes);
+    if (!p) return NULL;
+    if (old && old_bytes && bytes) memcpy(p, old, old_bytes < bytes ? old_bytes : bytes);
+    ray_read_sys_free(b, old);
+    return p;
+}

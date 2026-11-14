@@ -121,6 +121,7 @@ nav:
           - Functions Reference: docs/language/functions.md
           - Math Operations: docs/language/math.md
           - String Operations: docs/language/string.md
+          - Reading Data Text: docs/language/read-value.md
           - Control Flow: docs/language/control-flow.md
           - REPL Reference: docs/language/repl.md
       - Namespaces:

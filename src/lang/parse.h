@@ -36,4 +36,22 @@ ray_t* ray_parse(const char* source);
  * object (created via ray_nfo_create in lang/nfo.h). */
 ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo);
 
+/* One number-like literal (integers with h/i suffix, floats with e suffix,
+ * hex bytes, typed nulls 0Nx, dates, times, timestamps, timespans) scanned
+ * from the NUL-terminated text at *pos into a plain C value; no atom is
+ * allocated.  Returns NULL and advances *pos on success, otherwise the same
+ * parse/domain error ray_parse reports.  `widened` marks integer text that
+ * overflowed I64 and was promoted to F64; `nonfinite` marks float text that
+ * overflowed a double (the value in `f` is then not a language value). */
+typedef struct {
+    int8_t  type;       /* atom type tag (negative): -RAY_I64, -RAY_F32, ... */
+    bool    null;       /* a typed null literal (0Nx, bare 0N)               */
+    bool    widened;
+    bool    nonfinite;
+    int64_t i;          /* integer, date, time, timestamp and timespan value */
+    double  f;          /* F64 value; an F32 is held as its float, widened   */
+} ray_scalar_lit_t;
+
+ray_t* ray_parse_scalar_literal(const char** pos, ray_scalar_lit_t* out);
+
 #endif /* RAY_PARSE_H */

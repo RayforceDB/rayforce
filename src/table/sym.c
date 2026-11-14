@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include "lang/read_budget.h"
 #include <errno.h>
 #include "ops/hash.h"
 
@@ -115,6 +116,7 @@ static inline void sym_unlock(void) {
 uintptr_t ray_sym_test_lock_addr(void)   { return (uintptr_t)&g_sym_lock_line.v; }
 uintptr_t ray_sym_test_table_addr(void)  { return (uintptr_t)&g_sym; }
 size_t    ray_sym_test_table_size(void)  { return sizeof g_sym; }
+size_t    ray_sym_test_arena_chunks(void) { return ray_arena_chunk_count(g_sym.arena); }
 uintptr_t ray_sym_test_inited_addr(void) { return (uintptr_t)&g_sym_inited; }
 
 /* String atoms for the global sym table live in its arena (off the per-thread
@@ -1446,4 +1448,187 @@ ray_err_t ray_sym_load(const char* path) {
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
     return RAY_OK;
+}
+
+/* Whole-document value publication proof. Existing partial batch entry points
+ * keep their semantics. Reader state never becomes the active global table. */
+bool ray_sym_publish_values(ray_read_budget_t* b,
+                            const char* const* strings, const size_t* lengths,
+                            size_t count, uint32_t max_symbols, int64_t* out_ids) {
+    typedef struct {
+        const char* text;
+        size_t length, canonical;
+        uint32_t hash;
+        int64_t id;
+    } candidate_t;
+    candidate_t* plan = NULL;
+    size_t* seen = NULL;
+    char* text = NULL;
+    void* new_chunk = NULL;
+    size_t new_chunk_bytes = 0;
+    uint64_t* buckets = NULL;
+    ray_t** names = NULL;
+    uint64_t* dotted = NULL;
+    uint64_t* scanned = NULL;
+    sym_segs_t* segments = NULL;
+    bool locked = false, ok = false;
+    size_t text_bytes = 0, slots = 1;
+    if (b->closed || b->status != RAY_READ_OK) return false;
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire) ||
+        (count && (!strings || !lengths || !out_ids)) || count > UINT32_MAX / 2) {
+        b->status = RAY_READ_INVALID; return false;
+    }
+    if (!count) return true;
+    for (size_t i = 0; i < count; i++) {
+        if ((!strings[i] && lengths[i]) || lengths[i] > INT64_MAX ||
+            lengths[i] > SIZE_MAX - 128 || lengths[i] > SIZE_MAX - text_bytes) {
+            b->status = RAY_READ_INVALID; return false;
+        }
+        text_bytes += lengths[i];
+    }
+    while (slots < count * 2) {
+        if (slots > SIZE_MAX / 2) { b->status = RAY_READ_LIMIT; return false; }
+        slots *= 2;
+    }
+    if (count > SIZE_MAX / sizeof(*plan) || slots > SIZE_MAX / sizeof(*seen)) {
+        b->status = RAY_READ_LIMIT; return false;
+    }
+    plan = ray_read_sys_alloc(b, count * sizeof(*plan));
+    seen = ray_read_sys_alloc(b, slots * sizeof(*seen));
+    text = ray_read_sys_alloc(b, text_bytes);
+    if (!plan || !seen || !text) goto done;
+    size_t offset = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (lengths[i]) memcpy(text + offset, strings[i], lengths[i]);
+        plan[i].text = text + offset;
+        plan[i].length = lengths[i];
+        plan[i].hash = (uint32_t)ray_hash_bytes(plan[i].text, plan[i].length);
+        offset += lengths[i];
+        size_t slot = plan[i].hash & (slots - 1);
+        while (seen[slot]) {
+            size_t j = seen[slot] - 1;
+            if (plan[i].hash == plan[j].hash && plan[i].length == plan[j].length &&
+                memcmp(plan[i].text, plan[j].text, plan[i].length) == 0) break;
+            slot = (slot + 1) & (slots - 1);
+        }
+        plan[i].canonical = seen[slot] ? seen[slot] - 1 : i;
+        if (!seen[slot]) seen[slot] = i + 1;
+    }
+    sym_lock();
+    locked = true;
+    /* Lazy materialization itself allocates/interns. Do not hide it in an
+     * allegedly side-effect-free inspection phase. This proof rejects it. */
+    if (g_sym.lazy_map && g_sym.lazy_next_id < g_sym.lazy_count) {
+        b->status = RAY_READ_INVALID; goto done;
+    }
+    uint32_t target_count = g_sym.str_count;
+    size_t arena_bytes = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (plan[i].canonical != i) continue;
+        plan[i].id = sym_probe(plan[i].hash, plan[i].text, plan[i].length);
+        if (plan[i].id >= 0) continue;
+        if (target_count == UINT32_MAX || target_count >= max_symbols) {
+            b->status = RAY_READ_LIMIT; goto done;
+        }
+        plan[i].id = target_count++;
+        size_t bytes = ray_arena_str_bytes(plan[i].length);
+        if (bytes > SIZE_MAX - arena_bytes) { b->status = RAY_READ_LIMIT; goto done; }
+        arena_bytes += bytes;
+    }
+    if (target_count > max_symbols) { b->status = RAY_READ_LIMIT; goto done; }
+    uint32_t bucket_cap = g_sym.bucket_cap, str_cap = g_sym.str_cap;
+    while ((uint64_t)target_count * 100 >= (uint64_t)bucket_cap * 70) {
+        if (bucket_cap > UINT32_MAX / 2) { b->status = RAY_READ_LIMIT; goto done; }
+        bucket_cap *= 2;
+    }
+    while (str_cap < target_count) {
+        if (str_cap > UINT32_MAX / 2) { b->status = RAY_READ_LIMIT; goto done; }
+        str_cap *= 2;
+    }
+    if (bucket_cap != g_sym.bucket_cap) {
+        buckets = ray_read_sys_alloc(b, (size_t)bucket_cap * sizeof(*buckets));
+        if (!buckets) goto done;
+        for (uint32_t i = 0; i < g_sym.bucket_cap; i++) {
+            uint64_t e = g_sym.buckets[i];
+            if (e) ht_insert(buckets, bucket_cap, (uint32_t)(e >> 32), (uint32_t)e - 1);
+        }
+    }
+    if (str_cap != g_sym.str_cap) {
+        if ((uint64_t)str_cap * sizeof(*names) > SIZE_MAX ||
+            (uint64_t)str_cap * sizeof(*segments) > SIZE_MAX) {
+            b->status = RAY_READ_LIMIT; goto done;
+        }
+        size_t words = ((size_t)str_cap + 63) / 64;
+        names = ray_read_sys_alloc(b, (size_t)str_cap * sizeof(*names));
+        dotted = ray_read_sys_alloc(b, words * sizeof(*dotted));
+        scanned = ray_read_sys_alloc(b, words * sizeof(*scanned));
+        segments = ray_read_sys_alloc(b, (size_t)str_cap * sizeof(*segments));
+        if (!names || !dotted || !scanned || !segments) goto done;
+        size_t old_words = ((size_t)g_sym.str_cap + 63) / 64;
+        memcpy(names, g_sym.strings, (size_t)g_sym.str_count * sizeof(*names));
+        memcpy(dotted, g_sym.dotted, old_words * sizeof(*dotted));
+        memcpy(scanned, g_sym.scanned, old_words * sizeof(*scanned));
+        memcpy(segments, g_sym.segments, (size_t)g_sym.str_count * sizeof(*segments));
+    }
+    if (arena_bytes && ray_arena_head_free(g_sym.arena) < arena_bytes) {
+        /* The head chunk cannot take the new names.  Prepare the next head
+         * chunk here, where its charge and its failure are still allowed; it is
+         * adopted empty, so later interns keep bump-allocating from it. */
+        new_chunk_bytes = ray_arena_new_chunk_bytes(g_sym.arena, arena_bytes);
+        if (!new_chunk_bytes) { b->status = RAY_READ_LIMIT; goto done; }
+        new_chunk = ray_read_sys_alloc(b, new_chunk_bytes);
+        if (!new_chunk) goto done;
+    }
+    /* All allocation, validation and host admission is complete. Neither the
+     * existing IDs nor any table pointer has changed yet. Commit cannot fail. */
+    if (buckets) {
+        ray_sys_free(g_sym.buckets); g_sym.buckets = buckets; g_sym.bucket_cap = bucket_cap;
+        ray_read_sys_transfer(b, buckets); buckets = NULL;
+    }
+    if (names) {
+        ray_sys_free(g_sym.strings); ray_sys_free(g_sym.dotted);
+        ray_sys_free(g_sym.scanned); ray_sys_free(g_sym.segments);
+        g_sym.strings = names; g_sym.dotted = dotted;
+        g_sym.scanned = scanned; g_sym.segments = segments; g_sym.str_cap = str_cap;
+        ray_read_sys_transfer(b, names); ray_read_sys_transfer(b, dotted);
+        ray_read_sys_transfer(b, scanned); ray_read_sys_transfer(b, segments);
+        names = NULL; dotted = NULL; scanned = NULL; segments = NULL;
+    }
+    if (new_chunk) {
+        ray_arena_adopt_chunk(g_sym.arena, new_chunk, new_chunk_bytes);
+        ray_read_sys_transfer(b, new_chunk); new_chunk = NULL;
+    }
+    /* The head chunk now has room for every new name (checked above), so the
+     * allocation below cannot fail. */
+    for (size_t i = 0; i < count; i++) {
+        if (plan[i].canonical != i || (uint64_t)plan[i].id < g_sym.str_count) continue;
+        void* at = ray_arena_alloc_raw(g_sym.arena, ray_arena_str_bytes(plan[i].length));
+        assert(at);
+        g_sym.strings[plan[i].id] = ray_arena_str_at(at, plan[i].text, plan[i].length);
+        ht_insert(g_sym.buckets, g_sym.bucket_cap, plan[i].hash, (uint32_t)plan[i].id);
+    }
+    g_sym.str_count = target_count;
+    for (size_t i = 0; i < count; i++) out_ids[i] = plan[plan[i].canonical].id;
+    ok = true;
+done:
+    if (locked) sym_unlock();
+    ray_read_sys_free(b, new_chunk);
+    ray_read_sys_free(b, buckets); ray_read_sys_free(b, names);
+    ray_read_sys_free(b, dotted); ray_read_sys_free(b, scanned); ray_read_sys_free(b, segments);
+    ray_read_sys_free(b, text); ray_read_sys_free(b, seen); ray_read_sys_free(b, plan);
+    return ok;
+}
+
+/* Names a mapped symbol file still backs only by the mapping are already part
+ * of the table: loading them changes no id and adds no name, so it is not a
+ * speculative intern.  ray_sym_publish_values refuses to inspect a table in
+ * that state; a reader calls this first. */
+bool ray_sym_materialize_lazy(void) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return false;
+    sym_lock();
+    bool ok = true;
+    if (g_sym.lazy_map && g_sym.lazy_next_id < g_sym.lazy_count)
+        ok = sym_lazy_materialize_to_locked(g_sym.lazy_count - 1);
+    sym_unlock();
+    return ok;
 }

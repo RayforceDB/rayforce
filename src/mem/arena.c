@@ -235,3 +235,36 @@ void ray_arena_destroy(ray_arena_t* arena) {
     }
     ray_sys_free(arena);
 }
+
+size_t ray_arena_head_free(const ray_arena_t* arena) {
+    if (!arena || !arena->chunks) return 0;
+    return arena->chunks->cap - arena->chunks->used;
+}
+
+size_t ray_arena_new_chunk_bytes(const ray_arena_t* arena, size_t need) {
+    size_t hdr = ARENA_ALIGN_UP(sizeof(ray_arena_chunk_t));
+    /* Room for `need` plus a default chunk's worth of slack: a chunk that the
+     * request exactly fills would be stranded by the very next allocation. */
+    size_t cap = arena->chunk_size;
+    if (need > cap / 2) {
+        size_t want = ARENA_ALIGN_UP(need);
+        if (want > SIZE_MAX - cap) return 0;
+        cap = want + cap;
+    }
+    return cap > SIZE_MAX - hdr ? 0 : hdr + cap;
+}
+
+void ray_arena_adopt_chunk(ray_arena_t* arena, void* storage, size_t bytes) {
+    ray_arena_chunk_t* c = storage;
+    c->cap = bytes - ARENA_ALIGN_UP(sizeof(ray_arena_chunk_t));
+    c->used = 0;
+    c->next = arena->chunks;
+    arena->chunks = c;
+    (void)arena_next_cap(arena, c->cap);   /* the growth ray_arena_alloc would have made */
+}
+
+size_t ray_arena_chunk_count(const ray_arena_t* arena) {
+    size_t n = 0;
+    for (const ray_arena_chunk_t* c = arena ? arena->chunks : NULL; c; c = c->next) n++;
+    return n;
+}

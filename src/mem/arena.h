@@ -72,5 +72,17 @@ void ray_arena_reset(ray_arena_t* arena);
 
 /* Destroy arena — free all backing memory. */
 void ray_arena_destroy(ray_arena_t* arena);
+/* Transactional growth for a caller that must not fail after it has started
+ * committing.  ray_arena_head_free is what the head chunk can still serve;
+ * when that is too little, the caller allocates ray_arena_new_chunk_bytes(need)
+ * itself (so the allocation can be charged and failed in advance) and hands it
+ * to ray_arena_adopt_chunk at commit.  The adopted chunk becomes the head,
+ * empty and usable, and the next chunk size advances exactly as it would have
+ * for ray_arena_alloc.  ray_arena_new_chunk_bytes is 0 when the size overflows. */
+size_t ray_arena_head_free(const ray_arena_t* arena);
+size_t ray_arena_new_chunk_bytes(const ray_arena_t* arena, size_t need);
+void   ray_arena_adopt_chunk(ray_arena_t* arena, void* storage, size_t bytes);
+/* Number of chunks, for tests and diagnostics. */
+size_t ray_arena_chunk_count(const ray_arena_t* arena);
 
 #endif /* RAY_ARENA_H */
