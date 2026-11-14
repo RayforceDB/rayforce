@@ -292,3 +292,24 @@ if __name__ == '__main__':
           [[[1,None,2],['hello','\u00a2\u20ac\U0001f30d',None]]])
     for i,bad in enumerate([b'\x80',b'\xc0\x80',b'\xe0\x80\x80',b'\xed\xa0\x80',b'\xf4\x90\x80\x80',b'\xf5\x80\x80\x80',b'\xe2\x82',b'\xe2x\x80']):
         write(root/f'strict-utf8-{i}.parquet',[('s',6,False,0)],[[[bad]]],dictionary=i%2==0)
+    # UINT_64 (converted type 14) is read as I64 and refuses a value above
+    # INT64_MAX. Values are the two's-complement bit patterns of the unsigned
+    # ones: -1 is 2**64-1, -2**63 is 2**63 (the I64 null sentinel's pattern).
+    # One column per decode path: required PLAIN (bulk copy), optional with
+    # every value present (bulk copy), optional with nulls (value by value),
+    # and, with a dictionary, the value-by-value path.
+    good=list(range(9))+[2**63-1]
+    for dictionary in (False,True):
+        write(root/f'uint64-{int(dictionary)}.parquet',[('req',2,False,14),('opt',2,True,14),('nul',2,True,14)],
+              [[good,good,[None if i%3==0 else x for i,x in enumerate(good)]]],dictionary=dictionary)
+        for kind,bad in (('max',-1),('edge',-2**63)):
+            vals=good[:-1]+[bad]
+            for shape,col in (('req',('c',2,False,14)),('opt',('c',2,True,14)),('nul',('c',2,True,14))):
+                v=[None if shape=='nul' and i%3==0 and i<9 else x for i,x in enumerate(vals)]
+                write(root/f'uint64-{kind}-{shape}-{int(dictionary)}.parquet',[col],[[v]],dictionary=dictionary)
+    # An OPTIONAL page of at least 16384 rows with every value present takes
+    # the bulk copy: three such pages per column. 'ok' holds in range values,
+    # 'bad' ends with 2**64-1.
+    n=3*16384
+    write(root/'uint64-bulk.parquet',[('ok',2,True,14),('bad',2,True,14)],
+          [[list(range(n)),list(range(n-1))+[-1]]],codec=0,dictionary=False)

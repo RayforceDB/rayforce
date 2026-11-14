@@ -180,6 +180,61 @@ static test_result_t test_pq_lz4(void) {
     TEST_ASSERT_TRUE(ray_parquet_lz4_hadoop(NULL,0,dst,0));
     PASS();
 }
+/* UINT_64 reads as I64; a value above INT64_MAX (2**64-1, or 2**63, whose
+ * pattern is the I64 null sentinel) fails the read on every decode path. */
+static test_result_t test_pq_uint64(void) {
+    for (int dict = 0; dict < 2; dict++) {
+        char path[128]; snprintf(path,sizeof(path),FIX "uint64-%d.parquet",dict);
+        for (int batch = 0; batch <= 4; batch++) {  /* 0: whole file; else partial batches */
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,batch ? batch*3 : 100,&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_ncols(t),3);
+                for (int c = 0; c < 3; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t,c)->type,RAY_I64);
+                for (int64_t row = 0; row < ray_table_nrows(t); row++, total++) {
+                    int64_t want = total < 9 ? total : INT64_MAX;
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t,0)))[row],want);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t,1)))[row],want);
+                    ray_t* nul = ray_table_get_col_idx(t,2);
+                    if (total % 3 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(nul,row));
+                    else TEST_ASSERT_EQ_I(((int64_t*)ray_data(nul))[row],want);
+                }
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,10);
+            ray_parquet_close(r);
+        }
+        ray_t* t = ray_parquet_read(path,NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),10); ray_release(t);
+        const char* kinds[] = {"max","edge"}; const char* shapes[] = {"req","opt","nul"};
+        for (int k = 0; k < 2; k++) for (int sh = 0; sh < 3; sh++) {
+            snprintf(path,sizeof(path),FIX "uint64-%s-%s-%d.parquet",kinds[k],shapes[sh],dict);
+            ray_t* bad = ray_parquet_read(path,NULL);
+            if (!RAY_IS_ERR(bad)) fprintf(stderr,"  %s: read without an error\n",path);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+            TEST_ASSERT_TRUE(ray_err_code(bad) && !strcmp(ray_err_code(bad),"parquet"));
+            ray_error_free(bad);
+        }
+    }
+    /* Pages of 16384 rows with every value present take the bulk copy; the
+     * projection reads the in range column alone, then the failing one. */
+    const int64_t ok = ray_sym_intern("ok",2), bad = ray_sym_intern("bad",3);
+    ray_t* cols = ray_vec_from_raw(RAY_SYM,&ok,1);
+    ray_t* t = ray_parquet_read(FIX "uint64-bulk.parquet",cols);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),3*16384);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t,0)))[3*16384-1],3*16384-1);
+    ray_release(t); ray_release(cols);
+    cols = ray_vec_from_raw(RAY_SYM,&bad,1);
+    t = ray_parquet_read(FIX "uint64-bulk.parquet",cols);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_error_free(t); ray_release(cols);
+    t = ray_parquet_read(FIX "uint64-bulk.parquet",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_error_free(t);
+    PASS();
+}
 static test_result_t test_pq_matrix(void) {
     const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
                            FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet"};
@@ -5133,6 +5188,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
     {"parquet/snappy",test_pq_snappy,pq_setup,pq_teardown},
     {"parquet/lz4",test_pq_lz4,pq_setup,pq_teardown},
+    {"parquet/uint64",test_pq_uint64,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

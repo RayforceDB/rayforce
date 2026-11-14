@@ -512,8 +512,9 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
         if (phys != 2) return false;
         s->type = RAY_TIMESTAMP; s->scale = conv == 9 ? 1000000 : 1000;
     } else if (conv >= 11 && conv <= 18) {
-        if (conv == 14) return false; /* UINT64 has no lossless native counterpart. */
-        if (phys != (conv == 18 ? 2 : 1)) return false;
+        if (phys != (conv == 14 || conv == 18 ? 2 : 1)) return false;
+        /* UINT64 reads as I64; a value above INT64_MAX has no native
+         * representation and fails the read (pq_put_value, pq_u64_fits). */
         if (conv == 13) s->type = RAY_I64;
         else if (conv == 11 || conv == 15) s->type = RAY_I16;
         /* I16 annotation stays I32: preserve -32768 without a sentinel collision. */
@@ -1074,6 +1075,15 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
 }
 
 #define PQ_PUT_FAIL "value conversion or allocation failed"
+#define PQ_U64_RANGE "UINT64 value above INT64_MAX has no native representation"
+/* After a bulk copy into I64 slots [row, row+n): an unsigned value above
+ * INT64_MAX reads as a negative one. */
+static bool pq_u64_fits(const ray_t* v, int64_t row, int64_t n) {
+    const int64_t* x = (const int64_t*)ray_data((ray_t*)v)+row;
+    int64_t any = 0;
+    for (int64_t i = 0; i < n; i++) any |= x[i];
+    return any >= 0;
+}
 /* Convert one value into row `row`; NULL, or the reason it failed. */
 static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p, uint32_t len) {
     ray_t* v = *vp;
@@ -1089,6 +1099,7 @@ static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uin
             (s->converted == 12 && x > UINT16_MAX) ||
             (s->converted == 15 && (x < INT8_MIN || x > INT8_MAX)) ||
             (s->converted == 16 && (x < INT16_MIN || x > INT16_MAX))) return PQ_PUT_FAIL;
+        if (s->converted == 14 && x < 0) return PQ_U64_RANGE;
         if (s->type == RAY_DATE && __builtin_sub_overflow(x,PQ_EPOCH_DAYS,&x)) return PQ_PUT_FAIL;
         int64_t raw = x;
         if (s->type == RAY_TIMESTAMP &&
@@ -1323,6 +1334,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             const uint8_t* p;
             if (!pq_take(&c->values,(uint64_t)n*(s->physical == 1 ? 4 : 8),&p)) return "truncated numeric data";
             pq_plain_int(v,i,p,n);
+            if (s->converted == 14 && !pq_u64_fits(v,i,n)) return PQ_U64_RANGE;
             if (s->strict && (v->attrs & RAY_ATTR_HAS_NULLS)) return "nonnull integer collides with native null";
             c->page_left -= n-1; c->chunk_left -= n-1; i += n-1;
         } else if (c->optional && c->page_all_present) {
@@ -1331,6 +1343,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             const uint8_t* p;
             if (!pq_take(&c->values,(uint64_t)n*(s->physical == 1 ? 4 : 8),&p)) return "truncated numeric data";
             bool collides = s->physical == 5 ? pq_plain_double(v,i,p,n) : pq_plain_int(v,i,p,n);
+            if (s->converted == 14 && !pq_u64_fits(v,i,n)) return PQ_U64_RANGE;
             if (s->strict && collides) return PQ_PUT_FAIL;
             c->page_left -= n-1; c->chunk_left -= n-1; i += n-1;
         } else {

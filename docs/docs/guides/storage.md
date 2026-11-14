@@ -330,11 +330,12 @@ table operations.
   checksum validation.
 - BOOLEAN, INT32, INT64, FLOAT, DOUBLE, and BYTE_ARRAY physical types. Strings
   become STR vectors. Nullable booleans become I16 so nulls are representable.
-- UTF8, DATE, signed integers, UINT8/16/32, and millisecond/microsecond/nanosecond
+- UTF8, DATE, signed integers, UINT8/16/32/64, and millisecond/microsecond/nanosecond
   TIMESTAMP annotations. Narrow signed annotations may use a wider native type
-  to preserve values otherwise reserved as a null sentinel. UINT64, decimal,
-  INT96, nested/repeated data, fixed byte arrays, and other annotations are
-  rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is validated when
+  to preserve values otherwise reserved as a null sentinel. UINT64 reads as
+  I64, and a value above INT64_MAX (which has no native representation) fails
+  the read. Decimal, INT96, nested/repeated data, fixed byte arrays, and other
+  annotations are rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is validated when
   `strict: true` is enabled.
 - Parquet dates/timestamps are converted from the Unix epoch to Rayforce's
   2000 epoch. Timestamp timezone annotations are not retained as separate
