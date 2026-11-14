@@ -8568,6 +8568,16 @@ static test_result_t test_eval_restricted_trusted_lambda(void) {
     ASSERT_ER_CODE("(.sys.trust '__rf787_two)", "domain");
     TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_two)", "31"));
 
+    /* A dotted name is refused: a lambda held in a dict is trusted as a
+     * value. */
+    ASSERT_EQ("(do (set __rf787_ns (dict ['f] (list (fn [] (set __rf787_n 51))))) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_ns.f)", "domain");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_plain '__rf787_ns.f])", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_ns.f)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+    ASSERT_EQ("(type (.sys.trust __rf787_ns.f))", "(type (fn [] 0))");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_ns.f)", "51"));
+
     /* A lambda that cannot be serialized has no identity and is refused,
      * as a value and by name, and stays untrusted. */
     ASSERT_EQ("(do (set __rf787_noser (fn [] (set __rf787_n 41))) 0)", "0");

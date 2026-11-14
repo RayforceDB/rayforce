@@ -982,6 +982,7 @@ static test_result_t test_ipc_restricted_trusted_verb(void) {
  * refused on replay, where the snapshot holds the old verb.  wc is a
  * closure trusted as a value that captures the trusted inner: its identity
  * is the same live and when the snapshot loads it, so its call replays.
+ * ns.v is a verb held in a dict, trusted as a value: it replays too.
  */
 static void ipc_rm_journal(const char* jbase);
 
@@ -1013,9 +1014,9 @@ static void rf787_replay_fresh(void) {
     const char* names[] = { "__rf787_kv", "__rf787_kv2", "__rf787_kv3", "__rf787_put", "__rf787_good",
                             "__rf787_snap", "__rf787_tw", "__rf787_tw2", "__rf787_kv4", "__rf787_kv5",
                             "__rf787_mk", "__rf787_w1", "__rf787_w2", "__rf787_chg", "__rf787_kv6",
-                            "__rf787_inner", "__rf787_wc" };
+                            "__rf787_inner", "__rf787_wc", "__rf787_kv7", "__rf787_ns" };
     ray_t* zero = ray_i64(0);
-    for (int i = 0; i < 17; i++) (void)ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero);
+    for (int i = 0; i < 19; i++) (void)ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero);
     ray_release(zero);
 }
 
@@ -1030,10 +1031,11 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
         "(set __rf787_tw2 (fn [v] (set __rf787_kv3 v) v))"
         "(set __rf787_mk (fn [k] (fn [v] (set __rf787_kv4 (+ v k)) v)))"
         "(set __rf787_inner (fn [x] x)) (.sys.trust '__rf787_inner)"
-        "(set __rf787_wc (.sys.trust ((fn [g] (fn [v] (set __rf787_kv6 (g v)) v)) __rf787_inner)))";
+        "(set __rf787_wc (.sys.trust ((fn [g] (fn [v] (set __rf787_kv6 (g v)) v)) __rf787_inner)))"
+        "(set __rf787_ns (dict ['v] (list (fn [x] (set __rf787_kv7 x) x)))) (.sys.trust __rf787_ns.v)";
     char boot_a[2048], boot_b[2048];
     snprintf(boot_a, sizeof boot_a, "(do (set __rf787_kv 0) (set __rf787_kv2 0) (set __rf787_kv3 0)"
-             " (set __rf787_kv4 0) (set __rf787_kv5 0) (set __rf787_kv6 0) %s"
+             " (set __rf787_kv4 0) (set __rf787_kv5 0) (set __rf787_kv6 0) (set __rf787_kv7 0) %s"
              " (set __rf787_w1 (.sys.trust (__rf787_mk 0))) (set __rf787_w2 (.sys.trust (__rf787_mk 100)))"
              " (set __rf787_chg (fn [v] (set __rf787_kv5 v) v))"
              " (.sys.trust ['__rf787_put '__rf787_good '__rf787_snap '__rf787_tw '__rf787_tw2 '__rf787_chg]) 0)",
@@ -1070,9 +1072,9 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
                             "(last (map __rf787_good (+ 10 (til 10))))", "(__rf787_tw2 6)",
                             "(do (try (__rf787_tw2 7) (fn [e] 0)) (__rf787_tw 8))",
                             "(do (try (__rf787_w2 7) (fn [e] 0)) (__rf787_w1 8))", "(__rf787_chg 6)",
-                            "(__rf787_wc 5)" };
-    const int64_t wants2[] = { -1, 7, -1, 19, -1, 8, 8, 6, 5 };
-    bool run2 = rf787_replay_reqs(srv.port, asks2, wants2, 9);
+                            "(__rf787_wc 5)", "(__rf787_ns.v 4)" };
+    const int64_t wants2[] = { -1, 7, -1, 19, -1, 8, 8, 6, 5, 4 };
+    bool run2 = rf787_replay_reqs(srv.port, asks2, wants2, 10);
     ray_test_server_stop(&srv);
     int64_t kv_live = rf787_replay_global("__rf787_kv"), kv2_live = rf787_replay_global("__rf787_kv2");
     int64_t kv3_live = rf787_replay_global("__rf787_kv3");
@@ -1091,7 +1093,7 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
     int64_t kv = rf787_replay_global("__rf787_kv"), kv2 = rf787_replay_global("__rf787_kv2");
     int64_t kv3 = rf787_replay_global("__rf787_kv3");
     int64_t kv4 = rf787_replay_global("__rf787_kv4"), kv5 = rf787_replay_global("__rf787_kv5");
-    int64_t kv6 = rf787_replay_global("__rf787_kv6");
+    int64_t kv6 = rf787_replay_global("__rf787_kv6"), kv7 = rf787_replay_global("__rf787_kv7");
     bool restored = !ray_eval_get_restricted();
     (void)ray_journal_purge();
     ipc_rm_journal(jbase);
@@ -1101,6 +1103,7 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
     TEST_ASSERT_EQ_I(kv4, 8);
     TEST_ASSERT_EQ_I(kv5, 5);   /* the changed verb's call is refused on replay */
     TEST_ASSERT_EQ_I(kv6, 5);
+    TEST_ASSERT_EQ_I(kv7, 4);
     TEST_ASSERT_TRUE(restored);
     PASS();
 }

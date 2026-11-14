@@ -1650,6 +1650,54 @@ static test_result_t test_journal_lift_note_not_an_entry(void) {
     PASS();
 }
 
+/* 7i. #787: a log with no preamble is generation 0, and its notes name
+ * that generation: replay reads the generation from the log it replays. */
+static test_result_t test_journal_lift_note_headerless_log(void) {
+    char base[256]; make_base(base, sizeof(base), "lift_legacy");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    ray_t* r = ray_eval_str("(do (set jrn_lg_kv 0) (set jrn_lg_put (fn [v] (set jrn_lg_kv v) v))"
+                            "    (.sys.trust 'jrn_lg_put) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* put = ray_env_get_global(ray_sym_intern("jrn_lg_put", 10));
+    TEST_ASSERT_NOT_NULL(put);
+    int64_t note[3] = { 0, 0, (int64_t)LAMBDA_TRUSTED(put) };
+    ray_t* frames[2] = { ray_str("(jrn_lg_put 3)", 14), ray_vec_from_raw(RAY_I64, note, 3) };
+    FILE* f = fopen(lpath, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; i++) {
+        int64_t psize = ray_serde_size(frames[i]);
+        uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
+        ok = buf && ray_ser_raw(buf, frames[i]) == psize;
+        ray_ipc_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.prefix  = RAY_SERDE_PREFIX;
+        hdr.version = RAY_SERDE_WIRE_VERSION;
+        hdr.endian  = RAY_SERDE_ENDIAN;
+        hdr.flags   = i == 0 ? RAY_IPC_FLAG_RESTRICTED : 0;
+        hdr.msgtype = i == 0 ? RAY_IPC_MSG_SYNC : RAY_IPC_MSG_JNOTE;
+        hdr.size    = psize;
+        ok = ok && fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
+             fwrite(buf, 1, (size_t)psize, f) == (size_t)psize;
+        if (buf) ray_sys_free(buf);
+        ray_release(frames[i]);
+    }
+    fclose(f);
+    TEST_ASSERT_TRUE(ok);
+
+    int64_t chunks = -1, errs = -1;
+    ray_jreplay_status_t status = RAY_JREPLAY_OK;
+    ray_err_t e = ray_journal_replay(lpath, &chunks, &errs, &status);
+    cleanup_base(base);
+    TEST_ASSERT_EQ_I(e, RAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
+    ray_t* kv = ray_env_get_global(ray_sym_intern("jrn_lg_kv", 9));
+    TEST_ASSERT_TRUE(kv && kv->i64 == 3);
+    PASS();
+}
+
 /* 7h. #787: a request finds its note wherever the log holds it.  4000
  * restricted calls of a trusted verb are logged, then their notes in the
  * reverse order; recovery lifts every one. */
@@ -3491,6 +3539,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },
     { "journal/lift_note_not_an_entry",    test_journal_lift_note_not_an_entry,    jrn_setup, jrn_teardown },
     { "journal/lift_notes_any_order",      test_journal_lift_notes_any_order,      jrn_setup, jrn_teardown },
+    { "journal/lift_note_headerless_log",  test_journal_lift_note_headerless_log,  jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */

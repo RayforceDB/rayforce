@@ -645,8 +645,8 @@ static ray_t* head_not_callable_error(int8_t type) {
  * do not carry it (a journal snapshot does, ray_serde_keep_trust), a
  * closure the body makes does not get it, and a lambda a request builds
  * has none.  A name means the global bound to it, as at
- * the top level (a dotted name walks global dicts), never a local of the
- * caller; each must hold a lambda, or none is marked.  Returns its
+ * the top level, never a local of the caller, and is not dotted; each
+ * must hold a lambda, or none is marked.  Returns its
  * argument. */
 ray_t* ray_sys_trust_fn(ray_t* x) {
     if (x->type == RAY_LAMBDA) {
@@ -686,6 +686,15 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
             /* One object, one name: its identity includes the name, and
              * recovery gives each binding the identity of its own name, so
              * a second name would not replay. */
+            /* A dotted name's lambda sits in a dict, which a snapshot loads
+             * without the name: its identity would not survive recovery.
+             * Such a lambda is trusted as a value. */
+            if (ray_sym_is_dotted(id)) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("domain", ".sys.trust: '%.*s' is a dotted name; trust the lambda as a value",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
+                break;
+            }
             idents[i] = trust_identity(fn, id);
             if (!idents[i]) {
                 ray_t* s = ray_sym_str(id);   /* borrowed */

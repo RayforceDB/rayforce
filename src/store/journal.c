@@ -228,6 +228,22 @@ static int64_t jlog_probe(const char* path, int64_t* out_gen) {
     return RAY_JLOG_PREAMBLE;
 }
 
+/* The generation of an open log, 0 when it has no preamble; the position
+ * is left where it was.  False on a read or seek failure. */
+static bool jlog_gen_of(FILE* f, int64_t* out_gen) {
+    *out_gen = 0;
+    long pos = ftell(f);
+    if (pos < 0 || fseek(f, 0, SEEK_SET) != 0) return false;
+    uint8_t pre[RAY_JLOG_PREAMBLE];
+    size_t r = fread(pre, 1, sizeof(pre), f);
+    bool failed = ferror(f) != 0;
+    clearerr(f);
+    if (fseek(f, pos, SEEK_SET) != 0 || failed) return false;
+    if (r == sizeof(pre) && memcmp(pre, RAY_JLOG_MAGIC, 8) == 0)
+        memcpy(out_gen, pre + 8, sizeof(*out_gen));
+    return true;
+}
+
 /* Generation ids need only be distinct across the rolls of one journal;
  * wall-clock ms with a low sequence salt is ample. */
 static int64_t jlog_fresh_gen(void) {
@@ -405,6 +421,9 @@ void ray_journal_info(ray_journal_info_t* out) {
  * replay in progress). */
 bool ray_journal_position(int64_t* gen, int64_t* off) {
     if (!g_journal.fp || g_journal.in_replay) return false;
+    /* An append stream that has not been written since it was opened
+     * reports the start of the file on some platforms: go to the end. */
+    if (fseek(g_journal.fp, 0, SEEK_END) != 0) return false;
     long pos = ftell(g_journal.fp);   /* the stream is unbuffered */
     if (pos < 0) return false;
     *gen = g_journal.log_gen;
@@ -479,8 +498,14 @@ static ray_err_t journal_replay_from(const char*           path,
         return RAY_ERR_IO;
     }
 
+    /* The generation the log's notes must name, read from the file being
+     * replayed; a log with no preamble is generation 0. */
     int64_t log_gen = 0;
-    jlog_probe(path, &log_gen);
+    if (!jlog_gen_of(f, &log_gen)) {
+        fclose(f);
+        if (out_status) *out_status = RAY_JREPLAY_IO;
+        return RAY_ERR_IO;
+    }
     lift_notes_t notes;
     if (!lift_notes_collect(f, log_gen, &notes)) {
         fclose(f);
