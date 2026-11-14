@@ -159,6 +159,106 @@ static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
+/* ---- Group classifier owned-error versus unsupported fallback ---- */
+static void group_probe_test_dispose(ray_t* value) {
+    if (value && RAY_IS_ERR(value)) ray_error_free(value);
+    else if (value) ray_release(value);
+}
+
+static bool group_probe_test_i64s(ray_t* value, const int64_t* expected, int64_t n) {
+    return value && !RAY_IS_ERR(value) && value->type == RAY_I64 &&
+           ray_len(value) == n &&
+           memcmp(ray_data(value), expected, (size_t)n * sizeof(int64_t)) == 0;
+}
+
+static bool group_probe_test_compound_values(ray_t* value) {
+    const int64_t c[] = {330}, s[] = {120};
+    return value && !RAY_IS_ERR(value) && value->type == RAY_TABLE &&
+           ray_table_ncols(value) == 3 && ray_table_nrows(value) == 1 &&
+           group_probe_test_i64s(ray_table_get_col_idx(value, 1), c, 1) &&
+           group_probe_test_i64s(ray_table_get_col_idx(value, 2), s, 1);
+}
+
+static test_result_t test_query_group_classifier_owned_oom(void) {
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    ray_t* value = ray_eval_str(
+        "(set _giT (table [g x a b] (list [7 7] [-1 1] [10 20] [100 200])))");
+    bool setup_ok = value && !RAY_IS_ERR(value);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(setup_ok, "group classifier input setup");
+
+    /* c is decomposed before s is classified, so both owned-error exits
+     * must release an already-created compound rewrite. */
+    const char* query = "(select {from:_giT by:g c:(+ (sum a) (sum b))"
+                        " s:(sum (if (> x 0) a b))})";
+    value = ray_eval_str(query);
+    bool healthy = group_probe_test_compound_values(value);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    bool owned_oom[2], recovered[2];
+    for (int target = 1; target <= 2; target++) {
+        ray_group_dag_probe_fail_set_for_test(target);
+        value = ray_eval_str(query);
+        /* Always reset before inspecting/disposing or making assertions. */
+        ray_group_dag_probe_fail_set_for_test(0);
+        const char* code = value && RAY_IS_ERR(value) ? ray_err_code(value) : NULL;
+        owned_oom[target - 1] = code && strcmp(code, "oom") == 0;
+        group_probe_test_dispose(value);
+
+        value = ray_eval_str(query);
+        recovered[target - 1] = group_probe_test_compound_values(value);
+        group_probe_test_dispose(value);
+    }
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(healthy, "healthy grouped compound c=330 and SUM(IF)=120");
+#ifdef DEBUG
+    TEST_ASSERT(owned_oom[0], "first temporary lowering must return owned oom, not success 30");
+    TEST_ASSERT(owned_oom[1], "second temporary lowering must return owned oom, not success 30");
+    TEST_ASSERT(recovered[0] && recovered[1], "next grouped query works after each owned error");
+#endif
+    PASS();
+}
+
+static test_result_t test_query_group_classifier_membership_fallback(void) {
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    ray_t* value = ray_eval_str(
+        "(do (set _giU (table [g s] (list [1 1 2 2] ['a 'b 'a 'c])))"
+        " (set _giSet (list 'a 'b)))");
+    bool setup_ok = value && !RAY_IS_ERR(value);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(setup_ok, "unsupported membership input setup");
+
+    /* Global LIST membership genuinely declines DAG lowering.  It must
+     * still evaluate per group, and must see replacement of that LIST. */
+    const char* query = "(at (select {from:_giU by:g n:(sum (in s _giSet))}) 'n)";
+    const int64_t ab[] = {2, 1}, ac[] = {1, 2};
+    value = ray_eval_str(query);
+    bool first_ok = group_probe_test_i64s(value, ab, 2);
+    group_probe_test_dispose(value);
+    value = ray_eval_str("(set _giSet (list 'a 'c))");
+    bool replaced = value && !RAY_IS_ERR(value);
+    group_probe_test_dispose(value);
+    value = ray_eval_str(query);
+    bool second_ok = group_probe_test_i64s(value, ac, 2);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(first_ok, "unsupported LIST membership fallback yields [2 1]");
+    TEST_ASSERT(replaced && second_ok, "fallback sees replaced global LIST and yields [1 2]");
+    PASS();
+}
 
 /* ---- Test: query helper row provenance survives a runtime re-init ----
  * The row-wise builtin tables and the per-object verdict cache behind the
@@ -12685,6 +12785,8 @@ static test_result_t test_dotted_local_read_slot(void) {
 }
 
 const test_entry_t lang_entries[] = {
+    { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
+    { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },

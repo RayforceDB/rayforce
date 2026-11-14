@@ -94,8 +94,9 @@ int64_t ray_symimp_index_bytes(ray_symimp_t* m);
  * are freed then, unless a lookup is in flight). */
 bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0);
 void ray_symimp_put(ray_symimp_t* m, int64_t pos, int64_t off, const char* s, uint32_t len);
-/* Or written by the caller with ray_symimp_write (pwrite: no page of the
- * mapping is faulted in for it), its offset noted with ray_symimp_place. */
+/* Or written by the caller with ray_symimp_write (into the mapping: its
+ * writers do not queue on the file's inode lock), its offset noted with
+ * ray_symimp_place. */
 void ray_symimp_place(ray_symimp_t* m, int64_t pos, int64_t off);
 bool ray_symimp_write(ray_symimp_t* m, int64_t off, const void* buf, size_t n);
 /* Start writing back file bytes [off, off + len): records the caller has

@@ -1521,6 +1521,15 @@ static ray_t* graph_take_compile_err(ray_graph_t* g) {
     return e;
 }
 
+/* Keep the first owned failure. NULL here means a known allocation failed,
+ * not an unsupported lowering. Errors are not refcounted literals. */
+static void graph_compile_failure(ray_graph_t* g, ray_t* err) {
+    if (!g->compile_err)
+        g->compile_err = err ? err : ray_error("oom", NULL);
+    else if (err && err != g->compile_err)
+        ray_error_free(err);
+}
+
 static int const_str_expr_len(ray_t* expr, size_t* out_len) {
     if (!expr || !out_len) return 0;
     if (expr->type == -RAY_STR && !(expr->attrs & ATTR_QUOTED)) {
@@ -1560,7 +1569,10 @@ static ray_op_t* compile_const_str_expr(ray_graph_t* g, ray_t* expr) {
     ray_t* heap_buf = NULL;
     if (len > sizeof(stack_buf)) {
         heap_buf = ray_alloc(len);
-        if (!heap_buf) return NULL;
+        if (!heap_buf || RAY_IS_ERR(heap_buf)) {
+            graph_compile_failure(g, heap_buf);
+            return NULL;
+        }
         buf = (char*)ray_data(heap_buf);
     }
     size_t off = 0;
@@ -2125,6 +2137,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
         if (fname_len == 6 && memcmp(fname, "concat", 6) == 0) {
             ray_op_t* folded = compile_const_str_expr(g, expr);
             if (folded) return folded;
+            if (g->compile_err) return NULL;
             /* One node for up to 255 operands, the executor's limit. */
             if (n < 2 || n - 1 > 255) return NULL;
             uint32_t arg_ids[255];
@@ -2146,10 +2159,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                      (args[0]->out_type != RAY_SYM && args[0]->out_type != RAY_STR) ||
                      (args[1]->out_type != RAY_SYM && args[1]->out_type != RAY_STR))) {
                     ray_t* value = ray_concat_fn(a->literal, b->literal);
-                    if (!value) return NULL;
-                    if (RAY_IS_ERR(value)) {
-                        if (!g->compile_err) g->compile_err = value;
-                        else ray_error_free(value);
+                    if (!value || RAY_IS_ERR(value)) {
+                        graph_compile_failure(g, value);
                         return NULL;
                     }
                     /* The typed membership executor cannot consume a boxed
@@ -2466,7 +2477,10 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 if ((ctor == ray_in || ctor == ray_not_in) &&
                     left->opcode != OP_CONST && left->out_type == RAY_STR) {
                     ray_t* sv = in_str_set_const(g, elems[2]);
-                    if (sv && RAY_IS_ERR(sv)) { ray_error_free(sv); return NULL; }
+                    if (sv && RAY_IS_ERR(sv)) {
+                        graph_compile_failure(g, sv);
+                        return NULL;
+                    }
                     if (sv) { right = ray_const_vec(g, sv); ray_release(sv); if (!right) return NULL; }
                 }
                 /* A set held in a global list (or another value no const
@@ -4242,7 +4256,20 @@ static bool expr_contains_temporal_arith(ray_t* expr, ray_t* tbl) {
     return false;
 }
 
-static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl) {
+#ifdef DEBUG
+/* Count temporary lowerings, not outputs: non-aggregate compounds do not
+ * enter this probe.  Zero disables it; state is private to the test thread. */
+static _Thread_local int g_group_dag_probe_fail_target;
+void ray_group_dag_probe_fail_set_for_test(int invocation) {
+    g_group_dag_probe_fail_target = invocation > 0 ? invocation : 0;
+    ray_alloc_fail_set_for_test(0, 0);
+}
+#endif
+
+/* out_err receives an owned failure, distinct from unsupported syntax.
+ * A probe failure must not select the whole-column fallback. */
+static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl, ray_t** out_err) {
+    *out_err = NULL;
     if (!is_group_dag_agg_expr(expr, tbl)) return 0;
 
     ray_t** elems = (ray_t**)ray_data(expr);
@@ -4270,10 +4297,22 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl) {
      * types and literals; it runs no user expression. */
     if (agg_arg && agg_arg->type == RAY_LIST) {
         ray_graph_t* g = ray_graph_new(tbl);
-        if (!g) return 1;
+        if (!g) { *out_err = ray_error("oom", NULL); return 0; }
+#ifdef DEBUG
+        bool inject = g_group_dag_probe_fail_target > 0 &&
+                      --g_group_dag_probe_fail_target == 0;
+        /* Graph creation must succeed first.  Fail a real allocation during
+         * lowering, then disarm before taking/freeing its owned error. */
+        if (inject) ray_alloc_fail_set_for_test(1, 1);
+#endif
         ray_op_t* op_in = compile_expr_dag(g, agg_arg);
+#ifdef DEBUG
+        if (inject) ray_alloc_fail_set_for_test(0, 0);
+#endif
+        int supported = op_in != NULL;
+        *out_err = graph_take_compile_err(g);
         ray_graph_free(g);
-        if (!op_in) return 0;
+        if (*out_err || !supported) return 0;
     }
     return 1;
 }
@@ -21397,7 +21436,16 @@ by_dict_done:
                         "select by: output `%.*s` aggregates an aggregate of the group",
                         nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
                 }
-                if (is_group_dag_agg_expr_dag_safe(expr, tbl)) {
+                ray_t* classifier_err = NULL;
+                int dag_safe = is_group_dag_agg_expr_dag_safe(expr, tbl, &classifier_err);
+                if (classifier_err) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return classifier_err;
+                }
+                if (dag_safe) {
                     /* dag-aggs claim output slots in order.  Not a flat
                      * forcer. */
                     n_grp_agg_outputs++;
@@ -21729,7 +21777,16 @@ by_dict_done:
             if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
 
             ray_t* val_expr = dict_elems[i + 1];
-            if (is_group_dag_agg_expr_dag_safe(val_expr, tbl)) {
+            ray_t* classifier_err = NULL;
+            int dag_safe = is_group_dag_agg_expr_dag_safe(val_expr, tbl, &classifier_err);
+            if (classifier_err) {
+                for (int ci = 0; ci < n_compound; ci++)
+                    ray_release(compound_rw[ci]);
+                ray_graph_free(g); ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return classifier_err;
+            }
+            if (dag_safe) {
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
                 uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
                 ray_t* agg_arg = agg_elems[1];
@@ -21749,6 +21806,8 @@ by_dict_done:
                 agg_ins[n_aggs] = compile_expr_dag(g, agg_arg);
                 agg_in_ids[n_aggs] = agg_ins[n_aggs] ? agg_ins[n_aggs]->id : RAY_OP_NONE;
                 if (!agg_ins[n_aggs]) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
                     ray_t* cerr = graph_take_compile_err(g);
                     ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
                     return cerr ? cerr : ray_error("domain", "select by: failed to compile aggregation argument");

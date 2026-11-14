@@ -56,6 +56,12 @@
 int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
                       int64_t* out);
 
+#ifdef DEBUG
+/* Fail the first allocation in the nth temporary grouped-aggregate lowering
+ * on this thread.  Zero resets/disarms both the target and allocator seam. */
+void ray_group_dag_probe_fail_set_for_test(int invocation);
+#endif
+
 /* True if every leaf is constant or reduced to a scalar. */
 bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
 bool op_tree_is_atom(ray_graph_t* g, uint32_t id);

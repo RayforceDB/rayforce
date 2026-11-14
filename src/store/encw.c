@@ -1048,7 +1048,7 @@ ray_err_t ray_encw_chunks(ray_encw_t* w, const void* data, size_t esz, const cha
 }
 
 ray_err_t ray_encw_train(ray_encw_t* w, const void* data, int64_t n) {
-    if (w->type == RAY_STR || w->type == RAY_SYM) return RAY_ERR_NYI;
+    if (w->type == RAY_STR) return RAY_ERR_NYI;
     if (w->chunk_i != 0 || w->n_chunks == 0) return RAY_ERR_RANGE;
     int64_t want = w->len < RAY_ENC_CHUNK ? w->len : RAY_ENC_CHUNK;
     if (n != want) return RAY_ERR_RANGE;
@@ -1057,7 +1057,7 @@ ray_err_t ray_encw_train(ray_encw_t* w, const void* data, int64_t n) {
 }
 
 ray_err_t ray_encw_encode(const ray_encw_t* w, int64_t c, const void* data, ray_encw_part_t* p) {
-    if (w->type == RAY_STR || w->type == RAY_SYM) return RAY_ERR_NYI;
+    if (w->type == RAY_STR) return RAY_ERR_NYI;
     if (c < 0 || c >= w->n_chunks) return RAY_ERR_RANGE;
     int64_t n = w->len - c * RAY_ENC_CHUNK;
     if (n > RAY_ENC_CHUNK) n = RAY_ENC_CHUNK;
