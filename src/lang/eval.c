@@ -242,7 +242,9 @@ static uint64_t trust_hash(uint64_t h, const void* bytes, int64_t n) {
     return h;
 }
 
-/* The identity `lambda` has when trusted under `name` (-1: as a value). */
+/* The identity `lambda` has when trusted under `name` (-1: as a value),
+ * or 0 when a part of it cannot be serialized: it then has none, since two
+ * lambdas differing only in that part would share one. */
 static uint64_t trust_identity(ray_t* lambda, int64_t name) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
     ray_t* ns = name >= 0 ? ray_sym_str(name) : NULL;   /* borrowed */
@@ -250,20 +252,30 @@ static uint64_t trust_identity(ray_t* lambda, int64_t name) {
     h = trust_hash(h, "", 1);   /* the name ends here */
     /* The captures too: closures of one factory differ only in them. */
     ray_t* parts[3] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda), LAMBDA_CLOSURE(lambda) };
-    for (int i = 0; i < 3; i++) {
+    /* Without the snapshot's trust bits, whoever asks: a captured trusted
+     * lambda hashes the same live and while a snapshot loads. */
+    bool keep = ray_serde_keep_trust(false);
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; i++) {
         ray_t* bytes = parts[i] ? ray_ser(parts[i]) : NULL;
         if (bytes && !RAY_IS_ERR(bytes)) {
             h = trust_hash(h, ray_data(bytes), bytes->len);
             ray_release(bytes);
-        } else if (bytes) ray_error_free(bytes);
+        } else if (parts[i]) {
+            if (bytes) ray_error_free(bytes);
+            ok = false;
+        }
         h = trust_hash(h, &i, sizeof i);   /* the part ends here */
     }
+    ray_serde_keep_trust(keep);
+    if (!ok) return 0;
     /* Never 0, which means untrusted; bit 0 is "trusted by name". */
     return (h << 2) | 2 | (name >= 0 ? 1 : 0);
 }
 
-void ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
+bool ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
     LAMBDA_TRUSTED(lambda) = trust_identity(lambda, name);
+    return LAMBDA_TRUSTED(lambda) != 0;
 }
 
 /* Whether a trusted call of restricted code may run lifted, given the
@@ -639,7 +651,11 @@ static ray_t* head_not_callable_error(int8_t type) {
 ray_t* ray_sys_trust_fn(ray_t* x) {
     if (x->type == RAY_LAMBDA) {
         /* Already trusted under a name: it keeps that identity. */
-        if (!(LAMBDA_TRUSTED(x) & 1)) ray_eval_lambda_trust(x, -1);
+        if (!(LAMBDA_TRUSTED(x) & 1)) {
+            uint64_t ident = trust_identity(x, -1);
+            if (!ident) return ray_error("domain", ".sys.trust: the lambda cannot be serialized, so it has no identity");
+            LAMBDA_TRUSTED(x) = ident;
+        }
         ray_retain(x);
         return x;
     }
@@ -650,12 +666,15 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
     /* Look the names up with every frame hidden, as at the top level. */
     int32_t scope_base = ray_env_isolate_begin();
     ray_t* err = NULL;
+    uint64_t ident_buf[16];
+    uint64_t* idents = n <= 16 ? ident_buf : (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
+    if (!idents) { ray_env_isolate_end(scope_base); return ray_error("oom", NULL); }
     for (int pass = 0; pass < 2 && !err; pass++) {
         for (int64_t i = 0; i < n; i++) {
             int64_t id = x->type == -RAY_SYM ? x->i64
                                              : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
             ray_t* fn = ray_env_get(id);   /* borrowed */
-            if (pass == 1) { ray_eval_lambda_trust(fn, id); continue; }
+            if (pass == 1) { LAMBDA_TRUSTED(fn) = idents[i]; continue; }
             if (!fn) { err = undefined_name_error(id); break; }
             if (fn->type != RAY_LAMBDA) {
                 ray_t* s = ray_sym_str(id);   /* borrowed */
@@ -667,7 +686,14 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
             /* One object, one name: its identity includes the name, and
              * recovery gives each binding the identity of its own name, so
              * a second name would not replay. */
-            bool second = (LAMBDA_TRUSTED(fn) & 1) && LAMBDA_TRUSTED(fn) != trust_identity(fn, id);
+            idents[i] = trust_identity(fn, id);
+            if (!idents[i]) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("domain", ".sys.trust: the lambda '%.*s' holds cannot be serialized, so it has no identity",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
+                break;
+            }
+            bool second = (LAMBDA_TRUSTED(fn) & 1) && LAMBDA_TRUSTED(fn) != idents[i];
             for (int64_t k = 0; k < i && !second; k++) {
                 int64_t prev = ray_read_sym(ray_data(x), k, RAY_SYM, x->attrs);
                 second = prev != id && ray_env_get(prev) == fn;
@@ -681,6 +707,7 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
         }
     }
     ray_env_isolate_end(scope_base);
+    if (idents != ident_buf) ray_sys_free(idents);
     if (err) return err;
     ray_retain(x);
     return x;

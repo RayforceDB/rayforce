@@ -796,7 +796,7 @@ ray_err_t ray_journal_recover(const char* base) {
             ray_err_t e = ray_env_set(sym_id, v);
             /* A verb trusted by name: its identity includes that name. */
             if (e == RAY_OK && v->type == RAY_LAMBDA && (LAMBDA_TRUSTED(v) & 1))
-                ray_eval_lambda_trust(v, sym_id);
+                (void)ray_eval_lambda_trust(v, sym_id);
             if (e != RAY_OK) {
                 fprintf(stderr, "log: WARN  snapshot bind for sym %lld failed (%d)\n",
                         (long long)sym_id, (int)e);

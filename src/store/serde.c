@@ -1589,8 +1589,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         ((ray_t**)ray_data(lambda))[1] = body;   /* not-a-table */
         LAMBDA_CLOSURE(lambda) = closure;
         if (g_serde_keep_trust && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED)) {
-            ray_eval_lambda_trust(lambda, -1);
-            if (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED_NAMED) LAMBDA_TRUSTED(lambda) |= 1;
+            if (ray_eval_lambda_trust(lambda, -1) && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED_NAMED))
+                LAMBDA_TRUSTED(lambda) |= 1;
         }
         return lambda;
     }

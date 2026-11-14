@@ -300,8 +300,9 @@ void ray_eval_restrict_leave(const ray_restrict_save_t* s);
  * a hash of the global name it is trusted under (`name`, -1 when trusted
  * as a value), its parameters, its body and its captures: computed once
  * here, the same in every process, and different for two verbs of the
- * same text or two closures of one factory. */
-void ray_eval_lambda_trust(ray_t* lambda, int64_t name);
+ * same text or two closures of one factory.  False, leaving the lambda
+ * untrusted, when a part of it cannot be serialized. */
+bool ray_eval_lambda_trust(ray_t* lambda, int64_t name);
 
 /* The trusted calls of one journaled restricted request (#787), so that
  * replay lifts exactly the calls that ran lifted live.  The IPC path

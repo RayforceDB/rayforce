@@ -8468,6 +8468,29 @@ static test_result_t test_eval_restricted_trusted_lambda(void) {
     ASSERT_ER_CODE("(.sys.trust '__rf787_two)", "domain");
     TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_two)", "31"));
 
+    /* A lambda that cannot be serialized has no identity and is refused,
+     * as a value and by name, and stays untrusted. */
+    ASSERT_EQ("(do (set __rf787_noser (fn [] (set __rf787_n 41))) 0)", "0");
+    {
+        int64_t sym = ray_sym_intern("__rf787_noser", 13);
+        ray_t* fn = ray_env_get_global(sym);
+        ray_t* name = ray_sym(sym);
+        TEST_ASSERT_TRUE(fn && name && !RAY_IS_ERR(name));
+        ray_t* args[2] = { fn, name };
+        bool refused = true;
+        for (int i = 0; i < 2; i++) {
+            ray_alloc_fail_set_for_test(1, 1);
+            ray_t* r = ray_sys_trust_fn(args[i]);
+            ray_alloc_fail_set_for_test(0, 0);
+            refused = refused && r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "domain") == 0 &&
+                      !LAMBDA_TRUSTED(fn);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        }
+        ray_release(name);
+        TEST_ASSERT_TRUE(refused);
+    }
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_noser)"));
+
     /* Only lambdas are marked, and a list with one bad name marks none. */
     ASSERT_ER_CODE("(.sys.trust 1)", "type");
     ASSERT_ER_CODE("(.sys.trust '__rf787_unbound)", "name");

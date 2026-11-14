@@ -104,7 +104,7 @@ Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals se
 
 A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
 
-- After a journaled restricted request whose trusted calls ran lifted, the server writes a note. The note names its request by the request's position in the log, so requests logged in between (ones a peer sent back while a trusted body waited on it) do not part the two. It lists the lifted calls in order, each by the verb's identity: a hash of the global name it was trusted under, its parameters, its body and its captures, computed once by `.sys.trust`.
+- After a journaled restricted request whose trusted calls ran lifted, the server writes a note. The note names its request by the request's position in the log, so requests logged in between (ones a peer sent back while a trusted body waited on it) do not part the two. It lists the lifted calls in order, each by the verb's identity: a hash of the global name it was trusted under, its parameters, its body and its captures, computed once by `.sys.trust`. A captured lambda counts by its own parameters, body and captures, not by whether it is trusted.
 - On replay a call runs lifted only if its lambda is marked and is the next one its request's note lists. A request with no note replays with no lifted call.
 
 When a verb's mark changed between the snapshot and the restart:
