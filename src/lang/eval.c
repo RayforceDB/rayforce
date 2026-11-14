@@ -1485,8 +1485,13 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
 
         /* Div/mod: only I64×I64 (executor has floor-div semantics for I64) */
         if (is_idiv && !(lt == RAY_I64 && rt == RAY_I64)) can_dag = 0;
-        /* Comparisons: same-type only (cross-type promotion loses type info) */
-        if (is_cmp && lt != rt) can_dag = 0;
+        /* Comparisons of different numeric types run through the DAG as well:
+         * the result is a BOOL, so there is no type tag to lose, and the
+         * kernels compare integer-family operands as int64 and anything with a
+         * float as double, as ray_eq_fn and friends do.  A temporal operand of
+         * a different type is still refused just below.  (Same-type-only
+         * sent (== u8vec 7), an integer literal against a narrower or float
+         * vector, to the boxed per-element loop: 24 - 37 ms per million rows.) */
         /* Cross-type temporal: DAG promote() loses type tag (int+TIMESTAMP→I64 not TIMESTAMP).
          * POW rejects temporals entirely; its scalar builtin treats power as
          * a numeric-only operation and returns F64. */
@@ -1499,37 +1504,57 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         if (can_dag) {
                 ray_graph_t* g = ray_graph_new(NULL);
                 if (g) {
+                    /* A scalar on the left of a comparison with a vector is
+                     * the mirrored comparison with the scalar on the right
+                     * ((< 7 v) is (> v 7)), the shape the typed kernels
+                     * broadcast.  Null-as-minimum is symmetric, so the
+                     * answer is the same. */
+                    ray_t* dl = left;
+                    ray_t* dr = right;
+                    int dl_scalar = l_num_scalar, dr_scalar = r_num_scalar;
+                    uint16_t dop = dag_opcode;
+                    if (is_cmp && l_num_scalar && r_num_vec) {
+                        dl = right; dr = left;
+                        dl_scalar = r_num_scalar; dr_scalar = l_num_scalar;
+                        switch (dag_opcode) {
+                        case OP_LT: dop = OP_GT; break;
+                        case OP_LE: dop = OP_GE; break;
+                        case OP_GT: dop = OP_LT; break;
+                        case OP_GE: dop = OP_LE; break;
+                        default: break;
+                        }
+                    }
                     /* Build left operand node */
                     ray_op_t* lop = NULL;
-                    if (l_num_scalar) {
-                        if (left->type == -RAY_F64)
-                            lop = ray_const_f64(g, left->f64);
-                        else if (left->type == -RAY_F32)
-                            lop = ray_const_atom(g, left);
+                    if (dl_scalar) {
+                        if (dl->type == -RAY_F64)
+                            lop = ray_const_f64(g, dl->f64);
+                        else if (dl->type == -RAY_F32)
+                            lop = ray_const_atom(g, dl);
                         else {
-                            int64_t sv = as_i64(left);
+                            int64_t sv = as_i64(dl);
                             lop = ray_const_i64(g, sv);
-                            if (lop) lop->out_type = -(left->type);
+                            if (lop) lop->out_type = -(dl->type);
                         }
                     } else {
-                        lop = ray_const_vec(g, left);
+                        lop = ray_const_vec(g, dl);
                     }
                     ray_op_t* rop = NULL;
-                    if (r_num_scalar) {
-                        if (right->type == -RAY_F64)
-                            rop = ray_const_f64(g, right->f64);
-                        else if (right->type == -RAY_F32)
-                            rop = ray_const_atom(g, right);
+                    if (dr_scalar) {
+                        if (dr->type == -RAY_F64)
+                            rop = ray_const_f64(g, dr->f64);
+                        else if (dr->type == -RAY_F32)
+                            rop = ray_const_atom(g, dr);
                         else {
-                            int64_t sv = as_i64(right);
+                            int64_t sv = as_i64(dr);
                             rop = ray_const_i64(g, sv);
-                            if (rop) rop->out_type = -(right->type);
+                            if (rop) rop->out_type = -(dr->type);
                         }
                     } else {
-                        rop = ray_const_vec(g, right);
+                        rop = ray_const_vec(g, dr);
                     }
                     if (lop && rop) {
-                        ray_op_t* root = ray_binop(g, dag_opcode, lop, rop);
+                        ray_op_t* root = ray_binop(g, dop, lop, rop);
                         if (root) {
                             if (is_idiv) root->out_type = RAY_I64;
                             ray_t* result = ray_execute(g, root);

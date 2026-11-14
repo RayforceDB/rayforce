@@ -1,0 +1,107 @@
+;; int_vec_mixed.rfl — comparisons of integer and float vectors of any types
+;; and widths, against vectors and against literals on either side (#1192).
+;;
+;; Operands of different types used to take the boxed per-element loop
+;; (24 - 37 ms per million rows); same-type integer vectors read each operand
+;; through a chain of per-element pointer tests; a scalar on the left was not
+;; broadcast.  All three now run typed kernels.  The oracle for every case is
+;; the scalar comparison, element by element, which this change did not touch:
+;; nulls are the minimum and equal each other, integer-family operands compare
+;; as int64 and anything with a float as double.
+
+(set N 64)
+(set K (til N))
+(set BASE (% (* K 5) 9))
+(set OPS (list (fn [a b] (== a b)) (fn [a b] (!= a b)) (fn [a b] (< a b)) (fn [a b] (<= a b)) (fn [a b] (> a b)) (fn [a b] (>= a b))))
+(set NROPS 6)
+(set ref (fn [f v w] (map (fn [k] (f (at v k) (at w k))) K)))
+(set refs (fn [f v s] (map (fn [k] (f (at v k) s)) K)))
+(set refl (fn [f s v] (map (fn [k] (f s (at v k))) K)))
+(set ok (fn [got want] (== (sum (as 'I64 (== got want))) (count want))))
+(ok [true false] [true true]) -- false
+(ok [true false] [true false]) -- true
+
+;; a typed vector of BASE with nulls on rows 3, 10 and 63 where the type has one
+(set mk (fn [t n] (do (let v (as t BASE)) (if (== n 1) (alter 'v set [3 10 63] (at (as t [0N]) 0)) 0) v)))
+
+(set TYPES ['U8 'I16 'I32 'I64 'F32 'F64])
+(set pairs (fn [f] (map (fn [ta] (map (fn [tb] (f ta tb)) TYPES)) TYPES)))
+
+;; ── vector against vector, every pair of types, every operator, with and without nulls ──
+;; (U8 has no null: the alter of a U8 vector is skipped by building it null-free)
+(set chkvv (fn [ta tb] (do (let va (if (== ta 'U8) (as ta BASE) (mk ta 1))) (let vb (if (== tb 'U8) (as tb (reverse BASE)) (mk tb 1))) (let vb (if (== tb 'U8) vb (do (alter 'vb set [5] (at (as tb [7]) 0)) vb))) (sum (map (fn [f] (if (ok (f va vb) (ref f va vb)) 0 1)) OPS)))))
+(sum (raze (pairs chkvv))) -- 0
+
+;; null-free operands, the memset-free arms
+(set chkvv0 (fn [ta tb] (do (let va (as ta BASE)) (let vb (as tb (reverse BASE))) (sum (map (fn [f] (if (ok (f va vb) (ref f va vb)) 0 1)) OPS)))))
+(sum (raze (pairs chkvv0))) -- 0
+
+;; ── vector against a literal, on either side, including out-of-range literals ──
+(set LITS (list 4 -1 300 70000 3000000000 4.0 4.5 -0.5))
+(set chkvs (fn [ta s] (do (let va (mk ta (if (== ta 'U8) 0 1))) (sum (map (fn [f] (+ (if (ok (f va s) (refs f va s)) 0 1) (if (ok (f s va) (refl f s va)) 0 1))) OPS)))))
+(sum (raze (map (fn [ta] (map (fn [s] (chkvs ta s)) LITS)) TYPES))) -- 0
+
+;; the answers named in #1192
+(== (as 'U8 [44 7 200]) 300) -- [false false false]
+(!= (as 'U8 [44 7 200]) 300) -- [true true true]
+(< (as 'U8 [44 7 200]) 300) -- [true true true]
+(> (as 'U8 [44 7 200]) -1) -- [true true true]
+(== (as 'I16 [44 -200]) 65580) -- [false false]
+(== 7 (as 'I32 [7 8])) -- [true false]
+(< 7 (as 'I64 [6 7 8])) -- [false false true]
+(<= 7 (as 'I64 [6 7 8])) -- [false true true]
+(> 7 (as 'U8 [6 7 8])) -- [true false false]
+(>= 7 (as 'U8 [6 7 8])) -- [true true false]
+(== (as 'I32 [1 2 3]) (as 'I64 [1 5 3])) -- [true false true]
+(< (as 'I16 [1 2 3]) (as 'F64 [1.5 2.0 2.5])) -- [true false false]
+
+;; null is the minimum, mirrored or not, in memory
+(set NV (as 'I32 [1 0N 3]))
+(< 2 NV) -- [false false true]
+(> 2 NV) -- [true true false]
+(== 0N NV) -- [false true false]
+(< NV (as 'I64 [1 0N 9])) -- [false false true]
+(== NV (as 'I64 [1 0N 9])) -- [true true false]
+
+;; ── past the parallel threshold: against the same comparison on promoted operands ──
+(set M 200000)
+(set J (til M))
+(set U (as 'U8 (% J 200)))
+(set S (as 'I16 (- (% J 3000) 1500)))
+(set I (as 'I32 (- (% J 100000) 50000)))
+(set L (- (% J 70000) 35000))
+(set F (/ (as 'F64 L) 7.0))
+(set LN (+ L 0))
+(alter 'LN set [0 65535 65536 199999] 0N)
+(set IN (as 'I32 LN))
+(count (where (!= (== U S) (== (as 'I64 U) (as 'I64 S))))) -- 0
+(count (where (!= (<  S I) (<  (as 'I64 S) (as 'I64 I))))) -- 0
+(count (where (!= (<= I L) (<= (as 'I64 I) L)))) -- 0
+(count (where (!= (>  U L) (>  (as 'I64 U) L)))) -- 0
+(count (where (!= (>= S F) (>= (as 'F64 S) F)))) -- 0
+(count (where (!= (== LN IN) (== LN (as 'I64 IN))))) -- 0
+(count (where (!= (<  IN LN) (<  (as 'I64 IN) LN)))) -- 0
+(count (where (!= (== U 100) (== (as 'I64 U) 100)))) -- 0
+(count (where (!= (< 100 U) (> (as 'I64 U) 100)))) -- 0
+(count (where (!= (<= 7 I) (>= (as 'I64 I) 7)))) -- 0
+(count (where (== LN LN))) -- 200000
+(count (where (< 0N LN))) -- 199996
+
+(set FN (+ F 0.0))
+(alter 'FN set [0 65535 65536 199999] 0Nf)
+(set F32N (as 'F32 FN))
+(set SC (take [1.5] M))
+(set SI (take [7] M))
+(count (where (!= (== FN 1.5) (== FN SC)))) -- 0
+(count (where (!= (<  FN 1.5) (<  FN SC)))) -- 0
+(count (where (!= (<= FN 1.5) (<= FN SC)))) -- 0
+(count (where (!= (>  FN 1.5) (>  FN SC)))) -- 0
+(count (where (!= (>= FN 1.5) (>= FN SC)))) -- 0
+(count (where (!= (!= FN 1.5) (!= FN SC)))) -- 0
+(count (where (!= (<  FN 7) (<  FN (as 'F64 SI))))) -- 0
+(count (where (!= (== F32N 1.5) (== (as 'F64 F32N) SC)))) -- 0
+(count (where (!= (<  F32N 7) (<  (as 'F64 F32N) (as 'F64 SI))))) -- 0
+(count (where (!= (<= LN 1.5) (<= (as 'F64 LN) SC)))) -- 0
+(count (where (!= (>  IN 7.5) (>  (as 'F64 IN) (take [7.5] M))))) -- 0
+(count (where (!= (== U 100.0) (== (as 'F64 U) (take [100.0] M))))) -- 0
+(count (where (== FN 1.5))) -- (count (where (== (as 'F64 (as 'F32 FN)) 1.5)))

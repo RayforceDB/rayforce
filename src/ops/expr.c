@@ -4220,6 +4220,11 @@ static void par_binary_str_fn(void* ctx, uint32_t worker_id, int64_t start, int6
  * with the relaxed-atomic OR of HAS_NULLS other workers perform below.
  * The pointer is stable for the whole op, so resolving it up front is
  * both correct and one fewer branch per morsel. */
+/* Integer-family vector types the typed BOOL comparison kernels in binary_range
+ * read directly: no SYM (its ids are a domain, not a value), no BOOL. */
+#define BR_INT_VEC(t) ((t) == RAY_I64 || (t) == RAY_TIMESTAMP || (t) == RAY_I32 || \
+                       (t) == RAY_DATE || (t) == RAY_TIME || (t) == RAY_I16 || (t) == RAY_U8)
+
 static void binary_range(ray_op_t* op, int8_t out_type,
                          ray_t* lhs, ray_t* rhs, ray_t* result, void* rdata,
                          bool l_scalar, bool r_scalar,
@@ -4276,6 +4281,23 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 }                                                               \
             } while (0)
 
+        /* A non-SYM integer column of a narrower width than its scalar (a U8
+         * column against an I64 literal) compares in int64: casting the
+         * scalar down to the column's width would wrap an out-of-range one,
+         * (== u8col 300) matching the rows equal to 44. */
+        #define BR_FAST_WIDE(T)                                                 \
+            do {                                                                \
+                const T* d = (const T*)lbase;                                   \
+                switch (opc) {                                                  \
+                case OP_EQ: for (int64_t i = 0; i < n; i++) odst[i] = ((int64_t)d[i] == cv); break; \
+                case OP_NE: for (int64_t i = 0; i < n; i++) odst[i] = ((int64_t)d[i] != cv); break; \
+                case OP_LT: for (int64_t i = 0; i < n; i++) odst[i] = ((int64_t)d[i] <  cv); break; \
+                case OP_LE: for (int64_t i = 0; i < n; i++) odst[i] = ((int64_t)d[i] <= cv); break; \
+                case OP_GT: for (int64_t i = 0; i < n; i++) odst[i] = ((int64_t)d[i] >  cv); break; \
+                case OP_GE: for (int64_t i = 0; i < n; i++) odst[i] = ((int64_t)d[i] >= cv); break; \
+                }                                                               \
+            } while (0)
+
         if (l_esz == 8) {
             if (RAY_IS_SYM(lhs->type)) {
                 BR_FAST(int64_t, d[i]);
@@ -4301,21 +4323,143 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 }
                 BR_FAST(uint32_t, (int64_t)d[i]);
             } else {
-                BR_FAST(int32_t, (int64_t)d[i]);
+                BR_FAST_WIDE(int32_t);
             }
             return;
         } else if (l_esz == 2) {
             if (RAY_IS_SYM(lhs->type)) {
                 BR_FAST(uint16_t, (int64_t)d[i]);
             } else {
-                BR_FAST(int16_t, (int64_t)d[i]);
+                BR_FAST_WIDE(int16_t);
             }
             return;
         } else if (l_esz == 1) {
-            BR_FAST(uint8_t, (int64_t)d[i]);
+            BR_FAST_WIDE(uint8_t);
             return;
         }
         #undef BR_FAST
+        #undef BR_FAST_WIDE
+    }
+
+    /* Fast path: float or integer column against a float scalar (or a float
+     * column against an integer scalar) → bool comparison, in double.  The
+     * generic float arm below reads the scalar through the whole reader chain
+     * for every row (0.31 ms per million rows, 2.5x the vector-vector one).
+     * Null-as-minimum, with the scalar not null: a NaN column cell (the F64 /
+     * F32 null) is smaller than every value, so it is true for < and <= and
+     * false for the rest except <>; integer null sentinels are corrected by the
+     * caller's null pass, as for the other kernels.  A null scalar keeps the
+     * generic arm. */
+    if (out_type == RAY_BOOL && !l_scalar && r_scalar &&
+        (op->opcode == OP_EQ || op->opcode == OP_NE ||
+         op->opcode == OP_LT || op->opcode == OP_LE ||
+         op->opcode == OP_GT || op->opcode == OP_GE) &&
+        (lhs->type == RAY_F64 || lhs->type == RAY_F32 ||
+         (BR_INT_VEC(lhs->type) && r_scalar_float)))
+    {
+        double sv = r_scalar_float ? r_f64 : (double)r_i64;
+        if (sv == sv) {
+            int64_t l_off = start;
+            void* l_data = resolve_vec_data(lhs, &l_off);
+            uint8_t l_esz = ray_elem_size(lhs->type);
+            /* a void* base: it is read as double and float as well as integers */
+            const void* lbase = (const char*)l_data + l_off * l_esz;
+            uint8_t* odst = (uint8_t*)dst;
+            uint16_t opc = op->opcode;
+
+            #define BR_FS(T)                                                    \
+                do {                                                            \
+                    const T* d = (const T*)lbase;                               \
+                    switch (opc) {                                              \
+                    case OP_EQ: for (int64_t i = 0; i < n; i++) odst[i] = ((double)d[i] == sv); break; \
+                    case OP_NE: for (int64_t i = 0; i < n; i++) { double x = (double)d[i]; odst[i] = (x != sv); } break; \
+                    case OP_LT: for (int64_t i = 0; i < n; i++) { double x = (double)d[i]; odst[i] = (x != x) | (x < sv); } break; \
+                    case OP_LE: for (int64_t i = 0; i < n; i++) { double x = (double)d[i]; odst[i] = (x != x) | (x <= sv); } break; \
+                    case OP_GT: for (int64_t i = 0; i < n; i++) odst[i] = ((double)d[i] >  sv); break; \
+                    case OP_GE: for (int64_t i = 0; i < n; i++) odst[i] = ((double)d[i] >= sv); break; \
+                    }                                                           \
+                } while (0)
+
+            if (lhs->type == RAY_F64)                     BR_FS(double);
+            else if (lhs->type == RAY_F32)                BR_FS(float);
+            else if (l_esz == 8)                          BR_FS(int64_t);
+            else if (l_esz == 4)                          BR_FS(int32_t);
+            else if (l_esz == 2)                          BR_FS(int16_t);
+            else                                          BR_FS(uint8_t);
+            #undef BR_FS
+            return;
+        }
+    }
+
+    /* Fast path: integer-family vector against integer-family vector (any
+     * widths) → bool comparison.  The generic chain below reads every operand
+     * through a run of per-element pointer tests, 2.7 - 4.3 ns per row; here a
+     * pair of equal widths is one typed loop, and unequal widths are widened
+     * to int64 a block at a time so the compare is still one typed loop.
+     * Null rows are fixed up by the caller afterwards, as for the scalar
+     * path above. */
+    if (out_type == RAY_BOOL && !l_scalar && !r_scalar &&
+        (op->opcode == OP_EQ || op->opcode == OP_NE ||
+         op->opcode == OP_LT || op->opcode == OP_LE ||
+         op->opcode == OP_GT || op->opcode == OP_GE) &&
+        BR_INT_VEC(lhs->type) && BR_INT_VEC(rhs->type))
+    {
+        int64_t l_off = start, r_off = start;
+        void* l_data = resolve_vec_data(lhs, &l_off);
+        void* r_data = resolve_vec_data(rhs, &r_off);
+        uint8_t l_esz = ray_elem_size(lhs->type), r_esz = ray_elem_size(rhs->type);
+        const uint8_t* lbase = (const uint8_t*)l_data + l_off * l_esz;
+        const uint8_t* rbase = (const uint8_t*)r_data + r_off * r_esz;
+        uint8_t* odst = (uint8_t*)dst;
+        uint16_t opc = op->opcode;
+
+        #define BR_VV(T, A, B, OFF)                                             \
+            do {                                                                \
+                const T* a_ = (A); const T* b_ = (B);                           \
+                uint8_t* o_ = odst + (OFF);                                     \
+                int64_t m_ = cnt_;                                              \
+                switch (opc) {                                                  \
+                case OP_EQ: for (int64_t i = 0; i < m_; i++) o_[i] = (a_[i] == b_[i]); break; \
+                case OP_NE: for (int64_t i = 0; i < m_; i++) o_[i] = (a_[i] != b_[i]); break; \
+                case OP_LT: for (int64_t i = 0; i < m_; i++) o_[i] = (a_[i] <  b_[i]); break; \
+                case OP_LE: for (int64_t i = 0; i < m_; i++) o_[i] = (a_[i] <= b_[i]); break; \
+                case OP_GT: for (int64_t i = 0; i < m_; i++) o_[i] = (a_[i] >  b_[i]); break; \
+                case OP_GE: for (int64_t i = 0; i < m_; i++) o_[i] = (a_[i] >= b_[i]); break; \
+                }                                                               \
+            } while (0)
+
+        if (l_esz == r_esz) {
+            int64_t cnt_ = n;
+            if (l_esz == 8)      BR_VV(int64_t, (const int64_t*)lbase, (const int64_t*)rbase, 0);
+            else if (l_esz == 4) BR_VV(int32_t, (const int32_t*)lbase, (const int32_t*)rbase, 0);
+            else if (l_esz == 2) BR_VV(int16_t, (const int16_t*)lbase, (const int16_t*)rbase, 0);
+            else                 BR_VV(uint8_t, (const uint8_t*)lbase, (const uint8_t*)rbase, 0);
+        } else {
+            int64_t abuf[1024], bbuf[1024];
+            for (int64_t k = 0; k < n; k += 1024) {
+                int64_t cnt_ = n - k < 1024 ? n - k : 1024;
+                const int64_t* a_p; const int64_t* b_p;
+                if (l_esz == 8) a_p = (const int64_t*)lbase + k;
+                else {
+                    for (int64_t i = 0; i < cnt_; i++)
+                        abuf[i] = l_esz == 4 ? (int64_t)((const int32_t*)lbase)[k + i]
+                                : l_esz == 2 ? (int64_t)((const int16_t*)lbase)[k + i]
+                                :              (int64_t)lbase[k + i];
+                    a_p = abuf;
+                }
+                if (r_esz == 8) b_p = (const int64_t*)rbase + k;
+                else {
+                    for (int64_t i = 0; i < cnt_; i++)
+                        bbuf[i] = r_esz == 4 ? (int64_t)((const int32_t*)rbase)[k + i]
+                                : r_esz == 2 ? (int64_t)((const int16_t*)rbase)[k + i]
+                                :              (int64_t)rbase[k + i];
+                    b_p = bbuf;
+                }
+                BR_VV(int64_t, a_p, b_p, k);
+            }
+        }
+        #undef BR_VV
+        return;
     }
 
     /* Fast path: integer-vec vs integer-scalar arithmetic with
