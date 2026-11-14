@@ -138,6 +138,8 @@ else ifeq ($(UNAME_S),Linux)
   # host that has it (glibc before 2.34 keeps dlopen in its own library).
   LIBS            = -lm -lpthread -ldl
   RELEASE_LDFLAGS = -Wl,--gc-sections -Wl,--as-needed
+  SHARED_LIB      = lib$(TARGET).so
+  SHARED_LDFLAGS  = -shared -Wl,-soname,$(SHARED_LIB) -Wl,--as-needed
   # The remote-memory transport (src/core/rdma.c) needs the verbs headers
   # to build; without them it compiles to "never available" and every
   # connection stays on TCP or shared memory.  VERBS_INC points at an
@@ -153,6 +155,8 @@ else ifeq ($(UNAME_S),Linux)
 else
   LIBS            = -lm
   RELEASE_LDFLAGS = -Wl,-dead_strip
+  SHARED_LIB      = lib$(TARGET).dylib
+  SHARED_LDFLAGS  = -dynamiclib -install_name @rpath/$(SHARED_LIB)
 endif
 
 DEBUG_LDFLAGS   = -fsanitize=address,undefined
@@ -319,6 +323,16 @@ lib: $(LIB_LIB_OBJ)
 	rm -f lib$(TARGET).a
 	$(AR) rc lib$(TARGET).a $(LIB_LIB_OBJ)
 
+# Shared library: the objects of the static one, linked for a host that loads
+# the engine at run time (a binding over a foreign-function interface) and so
+# cannot link an archive. Every public symbol is exported, as in the archive.
+# It is one build of one commit: like the staged headers below, it promises no
+# ABI from one revision to the next. Not built on Windows, where SHARED_LIB is
+# unset: the target then says so instead of linking something unnamed.
+shared: $(LIB_LIB_OBJ)
+	@if [ -z "$(SHARED_LIB)" ]; then echo "make shared: not supported on this platform" >&2; exit 1; fi
+	$(CC) $(LIB_CFLAGS) $(SHARED_LDFLAGS) -o $(SHARED_LIB) $(LIB_LIB_OBJ) $(LIBS)
+
 # Install-headers staging root. Mirrors the source layout under include/ so
 # the headers' own quoted includes ("ops/ops.h", "store/hnsw.h") resolve
 # with -I on this root alone. Kept out of include/ so a staged tree never
@@ -333,16 +347,18 @@ lib: $(LIB_LIB_OBJ)
 INSTALL_INCLUDE ?=
 STAGE_ROOT = $(if $(INSTALL_INCLUDE),$(INSTALL_INCLUDE),$(if $(DESTDIR),$(DESTDIR)/include,install/include))
 
-# Release tarball: build the optimized binary and package it as
-# dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256 checksum.
+# Release tarball: build the optimized binary and the shared library and
+# package them as dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256
+# checksum. The library and rayforce.h in one archive are what an embedder
+# that loads the engine at run time needs, built from the same commit.
 # Used by .github/workflows/release.yml (which passes RAY_VERSION=X.Y.Z) and
 # runnable locally. VERSION comes from the tag/override resolved at the top.
-dist: release
+dist: release shared
 	@mkdir -p dist
 	@os=$$(uname -s | tr 'A-Z' 'a-z'); arch=$$(uname -m); \
 	 name=$(TARGET)-$(VERSION)-$$os-$$arch; stage=dist/$$name; \
 	 mkdir -p $$stage; \
-	 cp $(TARGET) LICENSE README.md include/rayforce.h $$stage/; \
+	 cp $(TARGET) $(SHARED_LIB) LICENSE README.md include/rayforce.h $$stage/; \
 	 tar -czf dist/$$name.tar.gz -C dist $$name; \
 	 rm -rf $$stage; \
 	 ( cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum $$name.tar.gz || shasum -a 256 $$name.tar.gz; } > $$name.tar.gz.sha256 ); \
@@ -647,6 +663,7 @@ cppcheck:
 
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIB_LIB_OBJ)
+	-rm -f lib$(TARGET).so lib$(TARGET).dylib
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
 	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) \
 	       $(NDEBUG_LIB_OBJ) $(NDEBUG_MAIN_OBJ) $(NDEBUG_TEST_OBJ) \
@@ -665,7 +682,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib shared dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.
