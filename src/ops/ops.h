@@ -80,6 +80,7 @@ void     ray_cancel_reset(void);
 #define RAY_MC_SYM    0   /* opaque partition key strings */
 #define RAY_MC_DATE   1   /* YYYY.MM.DD partition directories */
 #define RAY_MC_I64    2   /* pure integer partition keys */
+#define RAY_MC_TIMESTAMP 3 /* YYYY.MM.DD.HH.MM.SS partition directories */
 
 #define RAY_IS_PARTED(t)       ((t) >= RAY_PARTED_BASE && (t) < RAY_MAPCOMMON)
 #define RAY_PARTED_BASETYPE(t) ((t) - RAY_PARTED_BASE)

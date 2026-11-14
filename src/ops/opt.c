@@ -2218,7 +2218,9 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
             scan_node = rhs; const_node = lhs; swapped = true;
         } else continue;
 
-        if (scan_node->out_type != RAY_MAPCOMMON) continue;
+        /* A scan of a data column (its base type: scan_out_type) prunes by
+         * the partitions' statistics. */
+        bool on_stats = scan_node->out_type != RAY_MAPCOMMON;
 
         ray_op_ext_t* scan_ext = find_ext(g, scan_node->id);
         if (!scan_ext) continue;
@@ -2234,29 +2236,39 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         if (!tbl) continue;
 
         ray_col_meta_t mm;
-        if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
-        ray_t* mc_col = ray_table_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
-        if (!mc_col) continue;
-        if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
+        ray_t* mc_col = NULL;                              /* the MAPCOMMON, or the parted slot */
+        ray_t* key_values = NULL;
+        int64_t n_parts = 0;
+        if (on_stats) {
+            if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || !RAY_IS_PARTED(mm.type)) continue;
+            mc_col = mm.enc ? mm.enc : ray_table_col(tbl, scan_ext->sym);   /* plain wrapper: no decode */
+            if (!mc_col) continue;
+            if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
+            n_parts = mm.n_segs;
+        } else {
+            if (!ray_table_col_meta(tbl, scan_ext->sym, &mm) || mm.type != RAY_MAPCOMMON) continue;
+            mc_col = ray_table_col(tbl, scan_ext->sym);   /* MAPCOMMON: plain slot, no decode */
+            if (!mc_col) continue;
+            if (RAY_IS_ERR(mc_col)) { ray_error_free(mc_col); continue; }
+            /* Read partition keys from MAPCOMMON: [key_values, row_counts] */
+            if (mc_col->len < 2) continue;
+            key_values = ((ray_t**)ray_data(mc_col))[0];
+            if (!key_values) continue;
+            n_parts = key_values->len;
+        }
+        if (n_parts <= 0) continue;
 
         /* Extract constant value */
         ray_op_ext_t* const_ext = find_ext(g, const_node->id);
         if (!const_ext || !const_ext->literal) continue;
         ray_t* lit = const_ext->literal;
 
-        /* Read partition keys from MAPCOMMON: [key_values, row_counts] */
-        if (mc_col->len < 2) continue;
-        ray_t** mc_ptrs = (ray_t**)ray_data(mc_col);
-        ray_t* key_values = mc_ptrs[0];
-        if (!key_values) continue;
-        int64_t n_parts = key_values->len;
-        if (n_parts <= 0) continue;
-
         /* Allocate seg_mask bitmap */
         uint32_t n_words = (uint32_t)((n_parts + 63) / 64);
         uint64_t* mask = (uint64_t*)ray_calloc_raw(n_words * sizeof(uint64_t));
         if (!mask) continue;
-        if (!ray_part_prune_mask(key_values, cmp_op, swapped, lit, mask)) {
+        if (!(on_stats ? ray_part_prune_stats_mask(mc_col, cmp_op, swapped, lit, mask)
+                       : ray_part_prune_mask(key_values, cmp_op, swapped, lit, mask))) {
             ray_free_raw(mask);
             continue;
         }
@@ -2269,7 +2281,6 @@ static void pass_partition_pruning(ray_graph_t* g, ray_op_t* root) {
         for (uint32_t s = 0; s < g->node_count; s++) {
             ray_op_t* sn = &g->nodes[s];
             if (sn->flags & OP_FLAG_DEAD || sn->opcode != OP_SCAN) continue;
-            if (sn == scan_node) continue;
 
             ray_op_ext_t* sn_ext = find_ext(g, sn->id);
             if (!sn_ext) continue;

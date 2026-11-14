@@ -16737,27 +16737,193 @@ static bool prune_is_and(ray_t* head) {
     return op && ray_str_len(op) == 3 && memcmp(ray_str_ptr(op), "and", 3) == 0;
 }
 
+/* The statistics of parted segment `seg` of an integer or temporal column:
+ * the extrema of its non-null rows, whether it holds a null, whether every
+ * row is null.  From a single-file generation-2 segment's chunk directory,
+ * or a plain segment's attached chunk zone.  False when the segment carries
+ * none (a plain segment without a zone, a missing or synthetic one, a chunk
+ * with non-null rows but no extrema). */
+bool ray_part_seg_stats(ray_t* seg, int64_t* mn, int64_t* mx, bool* has_nulls, bool* all_null) {
+    if (!seg || RAY_IS_ERR(seg)) return false;
+    *mn = INT64_MAX; *mx = INT64_MIN; *has_nulls = false;
+    bool any = false;
+    if (seg->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of(seg);
+        if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || !zone_dir_type(e->type)) return false;
+        for (int64_t c = 0; c < e->n_chunks; c++) {
+            ray_enc_chunk_stat_t st;
+            ray_enccol_chunk_stat(e, c, &st);
+            if (st.null_count > 0) *has_nulls = true;
+            if (!st.has_minmax) {
+                if ((int64_t)st.null_count < st.rows) return false;   /* rows without extrema */
+                continue;
+            }
+            if (st.min < *mn) *mn = st.min;
+            if (st.max > *mx) *mx = st.max;
+            any = true;
+        }
+    } else {
+        if (!ray_is_vec(seg) || !zone_dir_type(seg->type) || ray_index_kind(seg) != RAY_IDX_CHUNK_ZONE)
+            return false;
+        ray_index_t* ix = ray_index_payload(seg->index);
+        if (ix->built_for_len != seg->len || ix->u.chunk_zone.is_f64) return false;
+        const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+        const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+        const uint8_t* nb = (const uint8_t*)ray_data(ix->u.chunk_zone.null_bits);
+        for (uint32_t c = 0; c < ix->u.chunk_zone.n_chunks; c++) {
+            if ((nb[c >> 3] >> (c & 7)) & 1u) *has_nulls = true;
+            if (mins[c] > maxs[c]) continue;                /* an all-null chunk */
+            if (mins[c] < *mn) *mn = mins[c];
+            if (maxs[c] > *mx) *mx = maxs[c];
+            any = true;
+        }
+    }
+    *all_null = !any;
+    return true;
+}
+
+/* `lit` is comparable with a column of type ct as its raw logical value:
+ * an integer-family literal for an integer column, the same type for a
+ * temporal one (zp_lit_ok's rule). */
+static bool part_stats_lit_ok(int8_t ct, int8_t lt) {
+    bool lint = lt == RAY_BOOL || lt == RAY_U8 || lt == RAY_I16 || lt == RAY_I32 || lt == RAY_I64;
+    if (ct == RAY_DATE || ct == RAY_TIME || ct == RAY_TIMESTAMP) return lt == ct;
+    return zone_dir_type(ct) && lint;
+}
+
+/* Partitions of the parted column `col` (a plain wrapper or a parted
+ * RAY_ENCCOL) that may hold a row passing `col cmp_op lit` (`lit cmp_op col`
+ * when swapped) set their bit in `mask` (zeroed by the caller): a partition
+ * is dropped only when its statistics (ray_part_seg_stats) decide the
+ * comparison false for every row, by the rule row-level zone skipping uses
+ * (zone_cmp_core: nulls rank below every value), and a partition without
+ * statistics is kept.  False when nothing can be dropped: a type the
+ * statistics do not order, an unsupported literal, `not in`, or no
+ * partition decided. */
+bool ray_part_prune_stats_mask(ray_t* col, uint16_t cmp_op, bool swapped, ray_t* lit, uint64_t* mask) {
+    if (!col || !lit) return false;
+    ray_t* wrapper = col;
+    int8_t ct;
+    if (col->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of(col);
+        if (!e || e->kind != RAY_ENCCOL_PARTED || !e->wrapper) return false;
+        wrapper = e->wrapper;
+        ct = e->type;
+    } else {
+        if (!RAY_IS_PARTED(col->type)) return false;
+        ct = (int8_t)RAY_PARTED_BASETYPE(col->type);
+    }
+    if (!zone_dir_type(ct)) return false;
+    if (cmp_op == OP_NOT_IN || (swapped && cmp_op == OP_IN)) return false;
+    if (swapped) {
+        if (cmp_op == OP_LT) cmp_op = OP_GT;
+        else if (cmp_op == OP_GT) cmp_op = OP_LT;
+        else if (cmp_op == OP_LE) cmp_op = OP_GE;
+        else if (cmp_op == OP_GE) cmp_op = OP_LE;
+    }
+    int64_t set[32];
+    int nset = 0;
+    int64_t cval = 0;
+    if (cmp_op == OP_IN) {
+        if (lit->type <= 0 || !part_stats_lit_ok(ct, lit->type) || lit->len > 32) return false;
+        for (int64_t i = 0; i < lit->len; i++) {
+            if (ray_vec_is_null(lit, i)) return false;      /* a null member: left to the filter */
+            set[nset++] = read_col_i64(ray_data(lit), i, lit->type, lit->attrs);
+        }
+    } else if (lit->type < 0) {
+        if (RAY_ATOM_IS_NULL(lit) || !part_stats_lit_ok(ct, (int8_t)-lit->type)) return false;
+        cval = read_col_i64(&lit->i64, 0, (int8_t)-lit->type, 0);
+    } else if (lit->len == 1 && part_stats_lit_ok(ct, lit->type)) {
+        if (ray_vec_is_null(lit, 0)) return false;
+        cval = read_col_i64(ray_data(lit), 0, lit->type, lit->attrs);
+    } else return false;
+
+    bool pruned = false;
+    for (int64_t p = 0; p < wrapper->len; p++) {
+        ray_t* seg = col->type == RAY_ENCCOL ? ray_enccol_seg(col, p) : ((ray_t**)ray_data(wrapper))[p];
+        int64_t mn, mx;
+        bool has_nulls, all_null;
+        int d = -1;
+        if (ray_part_seg_stats(seg, &mn, &mx, &has_nulls, &all_null)) {
+            if (cmp_op == OP_IN) {
+                if (!all_null) {
+                    d = 0;                                  /* a null row is in no set */
+                    for (int i = 0; i < nset && d == 0; i++)
+                        if (set[i] >= mn && set[i] <= mx) d = -1;
+                }
+            } else {
+                d = zone_cmp_core(mn, mx, true, has_nulls, all_null, cmp_op, cval);
+            }
+        }
+        if (d == 0) pruned = true;
+        else mask[p / 64] |= (1ULL << (p % 64));
+    }
+    return pruned;
+}
+
+/* The column an unquoted name in a where names, or -1. */
+static int64_t prune_col_name(ray_t* x) {
+    return x && x->type == -RAY_SYM && !(x->attrs & ATTR_QUOTED) ? x->i64 : -1;
+}
+
+/* The index of parted data column `name` of `tbl` (not the key, not
+ * shadowed by a lexical local), or -1. */
+static int64_t prune_stats_col(ray_t* tbl, int64_t name) {
+    if (name < 0 || ray_env_has_lexical_local(name)) return -1;
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        if (ray_table_col_name(tbl, c) != name) continue;
+        ray_col_meta_t m;
+        return ray_table_col_meta_idx(tbl, c, &m) && RAY_IS_PARTED(m.type) ? c : -1;
+    }
+    return -1;
+}
+
+/* The columns whose statistics pruned a partition (prune_where_mask), so
+ * the stand-in row can take their minimum: at most PRUNE_STAT_COLS of
+ * them, a conjunct past that keeps every partition. */
+#define PRUNE_STAT_COLS 8
+typedef struct { int64_t col[PRUNE_STAT_COLS]; int n; } prune_stat_cols_t;
+
 /* AND into `acc` the partitions the where expression `e` can pass, for
  * every recognised comparison of the key column `key_id` (values `kv`)
- * with a literal of the key's exact type; anything else keeps every
+ * with a literal of the key's exact type, or of a parted data column with
+ * a literal (ray_part_prune_stats_mask); anything else keeps every
  * partition.  `tmp` is scratch of the same width. */
-static void prune_where_mask(ray_t* e, int64_t key_id, ray_t* kv,
-                             uint64_t* acc, uint64_t* tmp, int64_t n_words) {
+static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
+                             uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
     if (!e || e->type != RAY_LIST || ray_len(e) < 2) return;
     ray_t** x = (ray_t**)ray_data(e);
     int64_t n = ray_len(e);
     if (prune_is_and(x[0])) {
         for (int64_t i = 1; i < n; i++)
-            prune_where_mask(x[i], key_id, kv, acc, tmp, n_words);
+            prune_where_mask(x[i], tbl, key_id, kv, acc, tmp, n_words, sc);
         return;
     }
     uint16_t op = prune_cmp_op(x[0]);
     if (!op || n != 3) return;
     ray_t* l = x[1];
     ray_t* r = x[2];
-    bool l_key = l && l->type == -RAY_SYM && !(l->attrs & ATTR_QUOTED) && l->i64 == key_id;
-    bool r_key = r && r->type == -RAY_SYM && !(r->attrs & ATTR_QUOTED) && r->i64 == key_id;
-    if (l_key == r_key) return;
+    int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
+    bool l_key = l_col == key_id, r_key = r_col == key_id;
+    if (l_key == r_key) {
+        /* a data column against a literal: its partitions' statistics */
+        if ((l_col >= 0) == (r_col >= 0)) return;
+        ray_t* lit = r_col >= 0 ? l : r;
+        int64_t c = prune_stats_col(tbl, r_col >= 0 ? r_col : l_col);
+        if (c < 0 || !lit || lit->type == -RAY_SYM || lit->type == RAY_LIST) return;   /* a name or an expression */
+        int k = 0;
+        while (k < sc->n && sc->col[k] != c) k++;
+        if (k == sc->n && sc->n == PRUNE_STAT_COLS) return;
+        ray_t* slot = ray_table_get_col_enc_idx(tbl, c);
+        if (!slot) slot = ray_table_col_idx(tbl, c);                 /* plain wrapper: no decode */
+        if (!slot || RAY_IS_ERR(slot)) return;
+        memset(tmp, 0, (size_t)n_words * sizeof(uint64_t));
+        if (!ray_part_prune_stats_mask(slot, op, r_col >= 0, lit, tmp)) return;
+        for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
+        if (k == sc->n) sc->col[sc->n++] = c;
+        return;
+    }
     ray_t* lit = l_key ? r : l;
     if (!lit) return;
     if (op == OP_IN) {
@@ -16818,6 +16984,22 @@ static ray_t* prune_seg(ray_t* tbl, int64_t c, int64_t p) {
                : ((ray_t**)ray_data(ray_table_col_idx(tbl, c)))[p];   /* plain wrapper */
 }
 
+/* The stand-in row of a column whose statistics pruned partitions holds
+ * partition p's minimum: a value its rows share the verdict of, so the
+ * row fails the comparison that dropped p.  A partition without
+ * statistics was not dropped by this column; its cell stays zero. */
+static void prune_stand_in_min(ray_t* v, ray_t* seg) {
+    int64_t mn, mx;
+    bool has_nulls, all_null;
+    if (!ray_part_seg_stats(seg, &mn, &mx, &has_nulls, &all_null) || all_null) return;
+    switch (ray_type_sizes[(uint8_t)v->type]) {
+    case 1: *(uint8_t*)ray_data(v) = (uint8_t)mn; break;
+    case 2: *(int16_t*)ray_data(v) = (int16_t)mn; break;
+    case 4: *(int32_t*)ray_data(v) = (int32_t)mn; break;
+    default: *(int64_t*)ray_data(v) = mn; break;
+    }
+}
+
 /* A copy of the parted table `tbl` holding the partitions set in `keep`
  * (n_keep of them) and, at its place in partition order, the stand-in for
  * pruned partition `stand`: its key, one row, prune_stand_in_seg cells
@@ -16825,7 +17007,7 @@ static ray_t* prune_seg(ray_t* tbl, int64_t c, int64_t p) {
  * Kept segments are retained, never decoded (an encoded column stays
  * encoded). */
 static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n_parts,
-                                     int64_t n_keep, int64_t stand) {
+                                     int64_t n_keep, int64_t stand, const prune_stat_cols_t* sc) {
     int64_t n_out = n_keep + 1;
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* out = ray_table_new(ncols);
@@ -16895,6 +17077,8 @@ static ray_t* parted_keep_partitions(ray_t* tbl, const uint64_t* keep, int64_t n
                         ray_release(nw); ray_release(out);
                         return seg ? seg : ray_error("oom", NULL);
                     }
+                    for (int k = 0; k < sc->n; k++)
+                        if (sc->col[k] == c) prune_stand_in_min(seg, prune_seg(tbl, c, p));
                 }
                 any_enc |= seg && seg->type == RAY_ENCCOL;
                 segs[nw->len++] = seg;
@@ -16999,6 +17183,14 @@ static bool prune_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     return true;
 }
 
+/* Counts the selects whose source was pruned, and the partitions they
+ * dropped, since process start (test hook). */
+static _Atomic(uint64_t) g_part_prune_runs, g_part_prune_parts;
+void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts) {
+    *runs = atomic_load_explicit(&g_part_prune_runs, memory_order_relaxed);
+    *pruned_parts = atomic_load_explicit(&g_part_prune_parts, memory_order_relaxed);
+}
+
 /* The pruned source for the select `dict` (where: `where`) over the parted
  * table `tbl`; NULL when tbl is not a whole parted table (one MAPCOMMON key,
  * every other column parted over the same partitions), the shape may read
@@ -17041,7 +17233,8 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     if (!acc) return NULL;                                       /* no pruning: the full source is correct */
     uint64_t* tmp = acc + n_words;
     for (int64_t w = 0; w < n_words; w++) acc[w] = ~0ULL;
-    prune_where_mask(where, key_id, kv, acc, tmp, n_words);
+    prune_stat_cols_t sc = { .n = 0 };
+    prune_where_mask(where, tbl, key_id, kv, acc, tmp, n_words, &sc);
     int64_t n_keep = 0;
     int64_t stand = -1;                                          /* the first pruned partition */
     for (int64_t p = 0; p < n_parts; p++) {
@@ -17061,8 +17254,12 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
     }
     ray_t* out = NULL;
     if (ok && n_keep < n_parts && stand >= 0 && prune_shape_ok(dict, tbl, where))
-        out = parted_keep_partitions(tbl, acc, n_parts, n_keep, stand);
+        out = parted_keep_partitions(tbl, acc, n_parts, n_keep, stand, &sc);
     ray_free_raw(acc);
+    if (out && !RAY_IS_ERR(out)) {
+        atomic_fetch_add_explicit(&g_part_prune_runs, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_part_prune_parts, (uint64_t)(n_parts - n_keep), memory_order_relaxed);
+    }
     return out;
 }
 
@@ -26887,7 +27084,7 @@ static int parted_key_cells_cmp(ray_t* keys, int64_t a, int64_t b,
         if (av == NULL_I32 || bv == NULL_I32) { *valid = false; return 0; }
         return (av > bv) - (av < bv);
     }
-    if (keys->type == RAY_I64) {
+    if (keys->type == RAY_I64 || keys->type == RAY_TIMESTAMP) {
         int64_t av = ((int64_t*)ray_data(keys))[a];
         int64_t bv = ((int64_t*)ray_data(keys))[b];
         if (av == NULL_I64 || bv == NULL_I64) { *valid = false; return 0; }
@@ -26916,7 +27113,7 @@ static int parted_key_atom_cmp(ray_t* key, ray_t* keys, int64_t cell,
         if (cv == NULL_I32 || RAY_ATOM_IS_NULL(key)) { *valid = false; return 0; }
         return (key->i32 > cv) - (key->i32 < cv);
     }
-    if (keys->type == RAY_I64) {
+    if (keys->type == RAY_I64 || keys->type == RAY_TIMESTAMP) {
         int64_t cv = ((int64_t*)ray_data(keys))[cell];
         if (cv == NULL_I64 || RAY_ATOM_IS_NULL(key)) { *valid = false; return 0; }
         return (key->i64 > cv) - (key->i64 < cv);
@@ -26983,15 +27180,16 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
     ray_t* mc = (ray_table_col_meta_idx(tbl, 0, &mm) && mm.type == RAY_MAPCOMMON && !mm.enc)
               ? ray_table_col_idx(tbl, 0) : NULL;
     if (!mc || mc->type != RAY_MAPCOMMON || mc->len != 2 ||
-        mc->attrs > RAY_MC_I64)
+        mc->attrs > RAY_MC_TIMESTAMP)
         return ray_error("type", "insert: three-argument table form requires a canonical .db.parted.get table");
 
     ray_t** mp = (ray_t**)ray_data(mc);
     ray_t* keys = mp[0];
     ray_t* counts = mp[1];
-    int8_t key_type = mc->attrs == RAY_MC_DATE ? RAY_DATE
-                    : mc->attrs == RAY_MC_I64  ? RAY_I64
-                    :                            RAY_SYM;
+    int8_t key_type = mc->attrs == RAY_MC_DATE      ? RAY_DATE
+                    : mc->attrs == RAY_MC_TIMESTAMP ? RAY_TIMESTAMP
+                    : mc->attrs == RAY_MC_I64       ? RAY_I64
+                    :                                 RAY_SYM;
     uint8_t key_attrs = key_type == RAY_SYM ? RAY_SYM_W64 : 0;
     if (!keys || RAY_IS_ERR(keys) || keys->type != key_type ||
         keys->attrs != key_attrs ||
@@ -27028,7 +27226,7 @@ static ray_t* validate_parted_insert_target(ray_t* tbl,
         } else if (key_type == RAY_DATE) {
             if (((int32_t*)ray_data(keys))[0] == NULL_I32)
                 return ray_error("corrupt", "insert: MAPCOMMON contains a null partition key");
-        } else if (key_type == RAY_I64) {
+        } else if (key_type == RAY_I64 || key_type == RAY_TIMESTAMP) {
             if (((int64_t*)ray_data(keys))[0] == NULL_I64)
                 return ray_error("corrupt", "insert: MAPCOMMON contains a null partition key");
         } else {
