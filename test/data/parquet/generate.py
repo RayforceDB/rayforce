@@ -49,6 +49,21 @@ def snappy(data):
         tag = bytes([(59+nb) << 2]) + n.to_bytes(nb, 'little')
     return var(len(data)) + tag + data
 
+def lz4(data):
+    """Literal-only valid LZ4 block; matches are covered by C codec tests."""
+    n = len(data)
+    if n < 15: return bytes([n << 4]) + data
+    r = n - 15
+    return bytes([0xF0]) + b'\xff' * (r // 255) + bytes([r % 255]) + data
+
+def lz4_hadoop(data):
+    """Hadoop's framing of one block: big-endian uncompressed, compressed sizes."""
+    block = lz4(data)
+    return len(data).to_bytes(4, 'big') + len(block).to_bytes(4, 'big') + block
+
+# Parquet CompressionCodec: 1 Snappy, 5 LZ4 (Hadoop framing), 7 LZ4_RAW.
+COMPRESS = {1: snappy, 5: lz4_hadoop, 7: lz4}
+
 def rle(values, width):
     return b''.join(var(2) + x.to_bytes((width+7)//8, 'little') for x in values)
 
@@ -87,7 +102,7 @@ class Page(bytes):
 
 def page(kind, header, body, codec=1, prefix=b'', compressed=True, crc=False):
     import zlib  # stdlib, fixture checksums only
-    payload = prefix + (snappy(body) if codec and compressed else body)
+    payload = prefix + (COMPRESS[codec](body) if codec and compressed else body)
     f = [(1,I32,kind),(2,I32,len(prefix)+len(body)),(3,I32,len(payload))]
     if crc:
         chk = zlib.crc32(payload)
@@ -214,7 +229,7 @@ if __name__ == '__main__':
     root=Path(__file__).parent
     specs=[('x',1,True,None),('name',6,True,0),('flag',0,True,None),('wide',2,False,None),('day',1,False,6),('ts',2,False,10),('f',5,True,None)]
     rows=[[1,None,3,4,5,None,7,8,9],['alpha','a long string over twelve bytes',None,'','alpha','beta','gamma','delta','z'],[True,None,False,True,False,True,None,False,True],list(range(100,109)),list(range(10957,10966)),[946684800000000+i for i in range(9)],[1.25,None,-2.,3.,4.,5.,6.,7.,8.]]
-    for codec in (0,1):
+    for codec in (0,1,5,7):
         for v2 in (False,True):
             write(root/f'flat-{codec}-v{2 if v2 else 1}.parquet',specs,[rows,rows],codec,v2,crc=True)
     write(root/'legacy.parquet',specs,[rows,rows],legacy=True)
@@ -277,3 +292,24 @@ if __name__ == '__main__':
           [[[1,None,2],['hello','\u00a2\u20ac\U0001f30d',None]]])
     for i,bad in enumerate([b'\x80',b'\xc0\x80',b'\xe0\x80\x80',b'\xed\xa0\x80',b'\xf4\x90\x80\x80',b'\xf5\x80\x80\x80',b'\xe2\x82',b'\xe2x\x80']):
         write(root/f'strict-utf8-{i}.parquet',[('s',6,False,0)],[[[bad]]],dictionary=i%2==0)
+    # UINT_64 (converted type 14) is read as I64 and refuses a value above
+    # INT64_MAX. Values are the two's-complement bit patterns of the unsigned
+    # ones: -1 is 2**64-1, -2**63 is 2**63 (the I64 null sentinel's pattern).
+    # One column per decode path: required PLAIN (bulk copy), optional with
+    # every value present (bulk copy), optional with nulls (value by value),
+    # and, with a dictionary, the value-by-value path.
+    good=list(range(9))+[2**63-1]
+    for dictionary in (False,True):
+        write(root/f'uint64-{int(dictionary)}.parquet',[('req',2,False,14),('opt',2,True,14),('nul',2,True,14)],
+              [[good,good,[None if i%3==0 else x for i,x in enumerate(good)]]],dictionary=dictionary)
+        for kind,bad in (('max',-1),('edge',-2**63)):
+            vals=good[:-1]+[bad]
+            for shape,col in (('req',('c',2,False,14)),('opt',('c',2,True,14)),('nul',('c',2,True,14))):
+                v=[None if shape=='nul' and i%3==0 and i<9 else x for i,x in enumerate(vals)]
+                write(root/f'uint64-{kind}-{shape}-{int(dictionary)}.parquet',[col],[[v]],dictionary=dictionary)
+    # An OPTIONAL page of at least 16384 rows with every value present takes
+    # the bulk copy: three such pages per column. 'ok' holds in range values,
+    # 'bad' ends with 2**64-1.
+    n=3*16384
+    write(root/'uint64-bulk.parquet',[('ok',2,True,14),('bad',2,True,14)],
+          [[list(range(n)),list(range(n-1))+[-1]]],codec=0,dictionary=False)

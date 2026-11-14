@@ -45,6 +45,11 @@ ray_t* ray_parquet_parted(const char* path, const char* root, const char* table)
  * Exposed internally for codec regression tests. */
 bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t size);
 
+/* Raw LZ4 block (Parquet LZ4_RAW), and Hadoop-framed LZ4 (Parquet's LZ4):
+ * exact input/output lengths required. Exposed for codec regression tests. */
+bool ray_parquet_lz4(const uint8_t* src, size_t len, uint8_t* dst, size_t size);
+bool ray_parquet_lz4_hadoop(const uint8_t* src, size_t len, uint8_t* dst, size_t size);
+
 /* Test seams: the nth coarse checkpoint of an optional-page certification
  * scan requests an interrupt, and the last scan's certified level count
  * shows how far it ran. Debug builds only. */

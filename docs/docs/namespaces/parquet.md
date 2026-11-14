@@ -1,8 +1,8 @@
 # `.parquet.*` — Parquet input and native conversion
 
 Read or query a local Parquet file, process it in batches, or convert it to
-Rayforce's native splayed or partitioned layout. The reader and Snappy decoder
-are implemented in C without third-party library dependencies.
+Rayforce's native splayed or partitioned layout. The reader and the Snappy and LZ4
+decoders are implemented in C without third-party library dependencies.
 
 !!! note "Restricted under `-U`"
     All six functions are restricted for IPC peers under a `-U` server and

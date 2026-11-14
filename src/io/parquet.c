@@ -73,6 +73,7 @@ static uint32_t pq_u32(const uint8_t* p) {
     return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
 }
 static uint64_t pq_u64(const uint8_t* p) { return pq_u32(p) | (uint64_t)pq_u32(p+4)<<32; }
+static uint32_t pq_be32(const uint8_t* p) { return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
 static uint8_t pq_byte(pq_cur* c) {
     if (c->p == c->end) { c->bad = true; return 0; }
     return *c->p++;
@@ -222,6 +223,83 @@ bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t siz
         }
     }
     return !c.bad && at == size && c.p == c.end;
+}
+
+/* A literal or match length that continues in extra bytes: 255 adds on and
+ * asks for another byte, anything less ends it. */
+static bool pq_lz4_extend(const uint8_t** ip, const uint8_t* end, size_t* n) {
+    uint8_t b;
+    do {
+        if (*ip == end) return false;
+        b = *(*ip)++;
+        *n += b;   /* at most 255 per input byte: cannot overflow */
+    } while (b == 255);
+    return true;
+}
+
+/* Raw LZ4 block (Parquet LZ4_RAW), lz4_Block_format.md: sequences of a token
+ * (literal count in the high nibble, match length - 4 in the low one, 15
+ * continuing in extra bytes), the literals, a 2-byte little-endian offset
+ * and the match; the last sequence holds literals only. Exact input and
+ * output lengths required, like ray_parquet_snappy. */
+bool ray_parquet_lz4(const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
+    const uint8_t* ip = src, *end = src+len; size_t at = 0;
+    if (!len) return !size;
+    for (;;) {
+        if (ip == end) return false;
+        unsigned token = *ip++;
+        size_t lit = token >> 4;
+        if (lit == 15 && !pq_lz4_extend(&ip,end,&lit)) return false;
+        if (lit > (size_t)(end-ip) || lit > size-at) return false;
+        if (lit) memcpy(dst+at,ip,lit);
+        ip += lit; at += lit;
+        if (ip == end) return at == size;
+        if (end-ip < 2) return false;
+        size_t off = (size_t)ip[0] | (size_t)ip[1] << 8, n = token & 15;
+        ip += 2;
+        if (n == 15 && !pq_lz4_extend(&ip,end,&n)) return false;
+        n += 4;
+        if (!off || off > at || n > size-at) return false;
+        /* As in ray_parquet_snappy: only initialized, nonoverlapping spans,
+         * the span doubling for a repeat shorter than the match. */
+        size_t copied = 0;
+        while (copied < n) {
+            size_t step = n-copied < off ? n-copied : off;
+            memcpy(dst+at+copied,dst+at+copied-off,step);
+            copied += step;
+            if (copied >= off) off += off;
+        }
+        at += n;
+    }
+}
+
+/* Parquet's deprecated LZ4 codec (5): Hadoop's framing, a big-endian
+ * uncompressed size and a big-endian compressed size before each raw block,
+ * repeated to the end of the page. */
+bool ray_parquet_lz4_hadoop(const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
+    size_t at = 0;
+    while (len) {
+        if (len < 8) return false;
+        size_t usize = (size_t)pq_be32(src), csize = (size_t)pq_be32(src+4);
+        src += 8; len -= 8;
+        if (csize > len || usize > size-at || !ray_parquet_lz4(src,csize,dst+at,usize)) return false;
+        at += usize; src += csize; len -= csize;
+    }
+    return at == size;
+}
+
+/* Page and dictionary compression by Parquet's CompressionCodec: 0 none,
+ * 1 Snappy, 5 LZ4 (Hadoop framing, with the raw block some writers store
+ * under that name accepted too), 7 LZ4_RAW. */
+#define PQ_CODEC_ERR "unsupported compression codec (supported: uncompressed, Snappy, LZ4)"
+static bool pq_codec_supported(int64_t codec) { return codec == 0 || codec == 1 || codec == 5 || codec == 7; }
+static bool pq_decompress(int codec, const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
+    switch (codec) {
+    case 1: return ray_parquet_snappy(src,len,dst,size);
+    case 5: return ray_parquet_lz4_hadoop(src,len,dst,size) || ray_parquet_lz4(src,len,dst,size);
+    case 7: return ray_parquet_lz4(src,len,dst,size);
+    default: return false;
+    }
 }
 
 /* Hybrid RLE/bit-packed streams, resumed across batch boundaries. */
@@ -434,8 +512,9 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
         if (phys != 2) return false;
         s->type = RAY_TIMESTAMP; s->scale = conv == 9 ? 1000000 : 1000;
     } else if (conv >= 11 && conv <= 18) {
-        if (conv == 14) return false; /* UINT64 has no lossless native counterpart. */
-        if (phys != (conv == 18 ? 2 : 1)) return false;
+        if (phys != (conv == 14 || conv == 18 ? 2 : 1)) return false;
+        /* UINT64 reads as I64; a value above INT64_MAX has no native
+         * representation and fails the read (pq_put_value, pq_u64_fits). */
         if (conv == 13) s->type = RAY_I64;
         else if (conv == 11 || conv == 15) s->type = RAY_I16;
         /* I16 annotation stays I32: preserve -32768 without a sentinel collision. */
@@ -716,9 +795,9 @@ static int64_t pq_dict_max_len(ray_parquet_t* r, pq_span meta) {
     if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE ||
         (uint64_t)size > (uint64_t)(c.end-c.p)) return 0;
     const uint8_t* p = c.p; uint8_t* buf = NULL;
-    if (codec == 1) {
+    if (codec == 1 || codec == 5 || codec == 7) {
         buf = ray_alloc_raw((size_t)(raw ? raw : 1));
-        if (!buf || !ray_parquet_snappy(c.p,(size_t)size,buf,(size_t)raw)) { ray_free_raw(buf); return 0; }
+        if (!buf || !pq_decompress((int)codec,c.p,(size_t)size,buf,(size_t)raw)) { ray_free_raw(buf); return 0; }
         p = buf;
     } else if (raw != size) return 0;
     int64_t max = 0;
@@ -805,7 +884,7 @@ static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
         if (!pq_fields(c->metadata,mf,17)) { err = "invalid column metadata"; break; }
         int64_t offset = pq_get(mf[9],-1), dict = pq_get(mf[11],-1), bytes = pq_get(mf[7],-1);
         int64_t codec = pq_get(mf[4],-1);
-        if (codec != 0 && codec != 1) { err = "unsupported compression codec (supported: uncompressed, Snappy)"; break; }
+        if (!pq_codec_supported(codec)) { err = PQ_CODEC_ERR; break; }
         if (dict >= 0) { if (dict > offset) { err = "dictionary follows data"; break; } offset = dict; }
         if (offset < 4 || bytes < 0 || (uint64_t)offset > r->data_end || (uint64_t)bytes > r->data_end-(size_t)offset) {
             err = "column chunk outside file data"; break;
@@ -824,7 +903,7 @@ static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, 
     if (decoded > PQ_MAX_PAGE) return false;
     if (!compressed || !c->codec) { if (n != decoded) return false; *out = p; return true; }
     if (!pq_reserve(&c->page,&c->page_cap,decoded)) return false;
-    if (!ray_parquet_snappy(p,n,c->page,decoded)) return false;
+    if (!pq_decompress(c->codec,p,n,c->page,decoded)) return false;
     *out = c->page; return true;
 }
 /* A dictionary page of `size` bytes in the file, `n` decoded: decompressed
@@ -833,7 +912,7 @@ static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, 
 static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, size_t size, size_t n, int64_t count) {
     if (c->have_dict || count < 0 || (uint64_t)count > PQ_MAX_PAGE/sizeof(pq_string)) return false;
     if (!pq_reserve(&c->dict,&c->dict_cap,n)) return false;
-    if (c->codec) { if (!ray_parquet_snappy(payload,size,c->dict,n)) return false; }
+    if (c->codec) { if (!pq_decompress(c->codec,payload,size,c->dict,n)) return false; }
     else if (size != n) return false;
     else if (n) memcpy(c->dict,payload,n);
     c->dict_count = count; c->have_dict = true;
@@ -996,6 +1075,15 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
 }
 
 #define PQ_PUT_FAIL "value conversion or allocation failed"
+#define PQ_U64_RANGE "UINT64 value above INT64_MAX has no native representation"
+/* After a bulk copy into I64 slots [row, row+n): an unsigned value above
+ * INT64_MAX reads as a negative one. */
+static bool pq_u64_fits(const ray_t* v, int64_t row, int64_t n) {
+    const int64_t* x = (const int64_t*)ray_data((ray_t*)v)+row;
+    int64_t any = 0;
+    for (int64_t i = 0; i < n; i++) any |= x[i];
+    return any >= 0;
+}
 /* Convert one value into row `row`; NULL, or the reason it failed. */
 static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uint8_t* p, uint32_t len) {
     ray_t* v = *vp;
@@ -1011,6 +1099,7 @@ static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uin
             (s->converted == 12 && x > UINT16_MAX) ||
             (s->converted == 15 && (x < INT8_MIN || x > INT8_MAX)) ||
             (s->converted == 16 && (x < INT16_MIN || x > INT16_MAX))) return PQ_PUT_FAIL;
+        if (s->converted == 14 && x < 0) return PQ_U64_RANGE;
         if (s->type == RAY_DATE && __builtin_sub_overflow(x,PQ_EPOCH_DAYS,&x)) return PQ_PUT_FAIL;
         int64_t raw = x;
         if (s->type == RAY_TIMESTAMP &&
@@ -1245,6 +1334,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             const uint8_t* p;
             if (!pq_take(&c->values,(uint64_t)n*(s->physical == 1 ? 4 : 8),&p)) return "truncated numeric data";
             pq_plain_int(v,i,p,n);
+            if (s->converted == 14 && !pq_u64_fits(v,i,n)) return PQ_U64_RANGE;
             if (s->strict && (v->attrs & RAY_ATTR_HAS_NULLS)) return "nonnull integer collides with native null";
             c->page_left -= n-1; c->chunk_left -= n-1; i += n-1;
         } else if (c->optional && c->page_all_present) {
@@ -1253,6 +1343,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             const uint8_t* p;
             if (!pq_take(&c->values,(uint64_t)n*(s->physical == 1 ? 4 : 8),&p)) return "truncated numeric data";
             bool collides = s->physical == 5 ? pq_plain_double(v,i,p,n) : pq_plain_int(v,i,p,n);
+            if (s->converted == 14 && !pq_u64_fits(v,i,n)) return PQ_U64_RANGE;
             if (s->strict && collides) return PQ_PUT_FAIL;
             c->page_left -= n-1; c->chunk_left -= n-1; i += n-1;
         } else {
@@ -2284,7 +2375,7 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
                 if (!pq_fields(cols[c],mf,17)) { err = "invalid column metadata"; break; }
                 int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
                 int64_t bytes = pq_get(mf[7],-1);
-                if (codec != 0 && codec != 1) { err = "unsupported compression codec (supported: uncompressed, Snappy)"; break; }
+                if (!pq_codec_supported(codec)) { err = PQ_CODEC_ERR; break; }
                 /* the decoder's bounds (pq_start_group): the chunk from its
                  * dictionary page for total_compressed_size bytes, whatever
                  * data_page_offset says past it */
