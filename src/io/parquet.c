@@ -2019,7 +2019,7 @@ static void pq_write_group(void* ptr, uint32_t worker, int64_t start, int64_t en
     }
 }
 static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* table,
-                              bool durable, int64_t* parts) {
+                              bool durable, int64_t base, int64_t* parts) {
     *parts = 0;
     int64_t ng = r->ngroups;
     int64_t* offsets = ray_alloc_raw((size_t)(ng+1)*sizeof(*offsets));
@@ -2031,12 +2031,13 @@ static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* ta
         if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
         int64_t rows = pq_get(fields[3],-1);
         if (rows < 0) { err = pq_error("invalid row group row count"); goto done; }
-        offsets[g] = *parts;
+        if (base > INT64_MAX-*parts) { err = pq_error("too many partitions"); goto done; }
+        offsets[g] = base+*parts;
         int64_t n = rows ? 1+(rows-1)/pq_group_batch(r,g) : 1;
-        if (*parts > INT64_MAX-n) { err = pq_error("too many partitions"); goto done; }
+        if (*parts > INT64_MAX-base-n) { err = pq_error("too many partitions"); goto done; }
         *parts += n;
     }
-    if (!ng) { *parts = 1; err = pq_write_reader(r,root,table,0,durable); goto done; }
+    if (!ng) { *parts = 1; err = pq_write_reader(r,root,table,base,durable); goto done; }
     pq_task_msg emsg;
     pq_task_msg_reset(&emsg);
     pq_native_work work = {r,root,table,offsets,errors,durable,&emsg};
@@ -2112,46 +2113,74 @@ static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char*
     }
     return NULL;
 }
-ray_t* ray_parquet_parted_typed(const char* path, const char* root, const char* table, ray_t* types) {
+/* The files of one import share a table: the same columns, in order, with the
+ * same native types after the import's type conversions. */
+static ray_t* pq_same_schema(const ray_parquet_t* a, const ray_parquet_t* b, size_t file) {
+    if (a->ncols != b->ncols)
+        return ray_error("parquet","parquet: file %zu has %lld columns, the first has %lld",file+1,(long long)b->ncols,(long long)a->ncols);
+    for (int64_t c = 0; c < a->ncols; c++) {
+        const pq_schema* x = &a->schema[c]; const pq_schema* y = &b->schema[c];
+        if (x->name != y->name || x->type != y->type || x->native_symbol != y->native_symbol)
+            return ray_error("parquet","parquet: column %lld of file %zu (%s) differs from the first file's (%s)",
+                             (long long)c+1,file+1,ray_str_ptr(ray_sym_str(y->name)),ray_str_ptr(ray_sym_str(x->name)));
+    }
+    return NULL;
+}
+ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const char* root, const char* table, ray_t* types) {
 #ifdef RAY_FUZZING
     return ray_error("restricted","Parquet imports disabled under fuzzing");
 #endif
+    if (!npaths) return pq_error("no file to import");
     if (!pq_safe_name(table)) return pq_error("invalid destination table name");
     char dest[1024];
     if (!pq_dest(root,dest,sizeof(dest))) return pq_error("invalid or too long destination path");
     root = dest;
-    ray_parquet_t* r = NULL; ray_t* err = ray_parquet_open(path,NULL,PQ_BATCH,&r);
-    if (err) return err;
-    char staging[1100], sym[1200]; int64_t parts;
+    ray_parquet_t* first = NULL; ray_t* err = NULL;
+    char staging[1100], sym[1200]; int64_t parts = 0, rows = 0;
     ray_sym_domain_t* domain = NULL;
-    err = pq_import_types(r,types);
-    if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
-    if (!err) err = pq_stage(r,root,staging,sizeof(staging),true);
-    if (err) goto done;
-    /* Global runtime interning is not worker-safe. Decode symbols straight
-     * into the shared, synchronized file domain, as in direct splayed loads. */
-    for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol) {
-        if (!domain) {
-            snprintf(sym,sizeof(sym),"%s/.sym",staging);
-            domain = ray_sym_domain_open_or_create(sym);
-            if (!domain || ray_sym_domain_intern(domain,"",0) != 0) {
-                err = ray_error("oom",NULL); goto done;
+    for (size_t i = 0; i < npaths && !err; i++) {
+        ray_parquet_t* r = NULL;
+        err = ray_parquet_open(paths[i],NULL,PQ_BATCH,&r);
+        if (err) break;
+        err = pq_import_types(r,types);
+        if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
+        if (!err && !i) err = pq_stage(r,root,staging,sizeof(staging),true);
+        if (!err && i) err = pq_same_schema(first,r,i);
+        if (!err) {
+            /* Global runtime interning is not worker-safe. Decode symbols
+             * straight into the shared, synchronized file domain, as in direct
+             * splayed loads: one for all the files, so their ids agree. */
+            for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol) {
+                if (!domain) {
+                    snprintf(sym,sizeof(sym),"%s/.sym",staging);
+                    domain = ray_sym_domain_open_or_create(sym);
+                    if (!domain || ray_sym_domain_intern(domain,"",0) != 0) { err = ray_error("oom",NULL); break; }
+                }
+                r->schema[c].import_domain = domain;
             }
         }
-        r->schema[c].import_domain = domain;
+        int64_t n = 0;
+        if (!err) err = pq_write_groups(r,staging,table,true,parts,&n);
+        if (!err) {
+            if (n > INT64_MAX-parts || r->rows > INT64_MAX-rows) err = pq_error("too many partitions or rows");
+            else { parts += n; rows += r->rows; }
+        }
+        if (!i) first = r; else ray_parquet_close(r);
     }
-    err = pq_write_groups(r,staging,table,true,&parts);
     if (!err && domain) {
         /* Every partition header must be covered by the final vocabulary
          * before publication, including symbols added by other group tasks. */
         ray_err_t e = ray_sym_domain_flush(domain,true);
         if (e != RAY_OK) err = ray_error(ray_err_code_str(e),"parquet: cannot flush symbol file");
     }
-    if (!err) err = pq_sync_partitions(r,staging,table,parts);
-    if (!err) err = pq_publish(staging,root,r->rows);
-done:
+    if (!err) err = pq_sync_partitions(first,staging,table,parts);
+    if (!err) err = pq_publish(staging,root,rows);
     if (domain) ray_sym_domain_release(domain);
-    ray_parquet_close(r); return err;
+    if (first) ray_parquet_close(first);
+    return err;
+}
+ray_t* ray_parquet_parted_typed(const char* path, const char* root, const char* table, ray_t* types) {
+    return ray_parquet_parted_files(&path,1,root,table,types);
 }
 ray_t* ray_parquet_parted(const char* path, const char* root, const char* table) {
     return ray_parquet_parted_typed(path,root,table,NULL);
@@ -4180,7 +4209,7 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
      * merge never retains an entire row group or the full input in RAM. */
     snprintf(spool,sizeof(spool),"%s/.groups",staging);
     e = ray_mkdir(spool); if (e != RAY_OK) goto io_fail;
-    err = pq_write_groups(r,spool,"batch",false,&parts);
+    err = pq_write_groups(r,spool,"batch",false,0,&parts);
     if (err) goto done;
     for (int64_t part = 0; part < parts; part++) {
         if (ray_interrupted()) { e = RAY_ERR_CANCEL; goto io_fail; }
@@ -4306,11 +4335,26 @@ ray_t* ray_parquet_splayed_fn(ray_t** args, int64_t n) {
 ray_t* ray_parquet_parted_fn(ray_t** args, int64_t n) {
     if (n >= 2 && args[0] && args[0]->type == RAY_DICT && args[1] && args[1]->type == RAY_DICT)
         return ray_error("domain","parquet: a second options dict");
-    if (n != 3 && n != 4) return ray_error("arity","parquet.parted: [types] path root table-name");
-    const char* p = pq_path_arg(args[n-3]); const char* root = pq_path_arg(args[n-2]);
+    if (n != 3 && n != 4) return ray_error("arity","parquet.parted: [types] path-or-paths root table-name");
+    ray_t* src = args[n-3];
+    const char* one = pq_path_arg(src);
+    const char* const* paths = &one; size_t np = 1;
+    const char** many = NULL;
+    if (!one && src && src->type == RAY_LIST && src->len > 0) {
+        many = ray_alloc_raw((size_t)src->len*sizeof(*many));
+        if (!many) return ray_error("oom",NULL);
+        for (int64_t i = 0; i < src->len; i++) {
+            many[i] = pq_path_arg(ray_list_get(src,i));
+            if (!many[i]) { ray_free_raw(many); return ray_error("type","parquet.parted: every path must be a nonempty string"); }
+        }
+        paths = (const char* const*)many; np = (size_t)src->len;
+    } else if (!one) return ray_error("type","parquet.parted: expected a path or a list of paths");
+    const char* root = pq_path_arg(args[n-2]);
     ray_t* name = args[n-1]->type == -RAY_SYM ? ray_sym_str(args[n-1]->i64) : args[n-1];
     const char* table = pq_path_arg(name);
-    return p && root && table ? ray_parquet_parted_typed(p,root,table,n == 4 ? args[0] : NULL) : ray_error("type","parquet.parted: expected paths and table name");
+    ray_t* res = root && table ? ray_parquet_parted_files(paths,np,root,table,n == 4 ? args[0] : NULL) : ray_error("type","parquet.parted: expected paths and table name");
+    if (many) ray_free_raw(many);
+    return res;
 }
 ray_t* ray_parquet_each_fn(ray_t** args, int64_t n) {
     if (n != 2 && n != 3) return ray_error("arity","parquet.each: [columns] path callback");

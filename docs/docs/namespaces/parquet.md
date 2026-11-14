@@ -103,6 +103,19 @@ order. The default maximum partition size is 65,536 rows. `rows` accepts
 (set events (.db.parted.get "/tmp/events-db" 'events))
 ```
 
+`.parquet.parted` also takes a list of paths in place of the path. The files
+are concatenated in order into one table: partitions continue across the files,
+string columns imported as `SYM` share one vocabulary, and the files must have the
+same columns, in order, with the same native types after the import's type
+conversions (a column that differs is refused, naming it). This is how the
+several files of one export, one per instrument and definition segment, become
+a single on-disk table:
+
+```lisp
+(.parquet.parted {types: [I16 I32 I64 SYM TIMESTAMP F64 F64 F64 F64 F64] compress: true}
+  (list "btc-1.parquet" "btc-2.parquet" "eth-1.parquet") "/tmp/ohlcv-db" 'ohlcv)
+```
+
 Both native conversions require an existing parent directory and a new
 destination. They write to `<destination>.parquet-partial`, sync the completed
 output, and publish it without replacing an existing destination. Failed staging

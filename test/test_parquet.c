@@ -20,6 +20,7 @@
 #include "core/runtime.h"   /* ray_error_msg: the skeptic probes */
 #include "core/profile.h"   /* ray_profile_now_ns: pq_pool's bounded wait */
 #include "core/crc32.h"     /* ray_crc32: page checksums of the made files */
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -276,6 +277,65 @@ static test_result_t test_pq_decimal(void) {
         ray_t* e = ray_parquet_read(bad[i],NULL);
         TEST_ASSERT_TRUE(RAY_IS_ERR(e)); ray_error_free(e);
     }
+    PASS();
+}
+/* Several files import into one partitioned table, in order: partitions
+ * continue across the files, the files share one symbol vocabulary, and files
+ * with different columns refuse (leaving the staging directory, as any failed
+ * import does). */
+static void pq_rm_rf(const char* path) {
+    DIR* d = opendir(path);
+    if (!d) { unlink(path); return; }
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name,".") || !strcmp(e->d_name,"..")) continue;
+        char child[1400]; snprintf(child,sizeof(child),"%s/%s",path,e->d_name);
+        pq_rm_rf(child);
+    }
+    closedir(d); rmdir(path);
+}
+static test_result_t test_pq_parted_files(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    const char* two[] = {FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet"};
+    char root[160], sym[200], leaf[220];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-%d",(int)getpid());
+    ray_t* n = ray_parquet_parted_files(two,2,root,"hits",types);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,36); ray_release(n);
+    ray_t* t = ray_read_parted(root,"hits");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),36); TEST_ASSERT_EQ_I(ray_table_ncols(t),8); /* the seven columns and part */
+    ray_release(t);
+    /* Partitions continue across the files, and a string of the second file
+     * is the symbol the first file's same string got. */
+    snprintf(sym,sizeof(sym),"%s/.sym",root);
+    int parts = 0; int64_t rows = 0; ray_t* firstname = NULL; ray_t* lastname = NULL;
+    for (;; parts++) {
+        snprintf(leaf,sizeof(leaf),"%s/%d/hits",root,parts);
+        if (access(leaf,F_OK) != 0) break;
+        ray_t* p = ray_read_splayed(leaf,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(p));
+        rows += ray_table_nrows(p);
+        ray_t* col = ray_table_get_col_idx(p,1);
+        TEST_ASSERT_EQ_I(col->type,RAY_SYM);
+        if (!parts) firstname = ray_sym_vec_cell(col,1);
+        lastname = ray_sym_vec_cell(col,1);
+        TEST_ASSERT_TRUE(ray_str_len(firstname) == ray_str_len(lastname));
+        ray_release(p);
+    }
+    TEST_ASSERT_TRUE(parts >= 2 && parts%2 == 0);
+    TEST_ASSERT_EQ_I(rows,36);
+    pq_rm_rf(root);
+    /* Files that are not one table refuse. */
+    const char* mixed[] = {FIX "flat-1-v1.parquet",FIX "uint64-0.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-mixed-%d",(int)getpid());
+    n = ray_parquet_parted_files(mixed,2,root,"hits",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n)); ray_release(n);
+    TEST_ASSERT_TRUE(access(root,F_OK) != 0);
+    char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial);
+    /* No files is no import. */
+    n = ray_parquet_parted_files(two,0,root,"hits",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n)); ray_release(n);
+    ray_release(types);
     PASS();
 }
 static test_result_t test_pq_matrix(void) {
@@ -5233,6 +5293,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/lz4",test_pq_lz4,pq_setup,pq_teardown},
     {"parquet/uint64",test_pq_uint64,pq_setup,pq_teardown},
     {"parquet/decimal",test_pq_decimal,pq_setup,pq_teardown},
+    {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

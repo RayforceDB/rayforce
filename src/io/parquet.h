@@ -38,6 +38,10 @@ ray_t* ray_parquet_read(const char* path, ray_t* options);
  * mode rejects decoded null/value collisions and invalid annotated UTF-8. */
 ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types);
 ray_t* ray_parquet_parted_typed(const char* path, const char* root, const char* table, ray_t* types);
+/* The same for several files, concatenated in order into one table: partitions
+ * continue across files, symbols share one vocabulary, and the files must have
+ * the same columns and native types. */
+ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const char* root, const char* table, ray_t* types);
 ray_t* ray_parquet_splayed(const char* path, const char* dir);
 ray_t* ray_parquet_parted(const char* path, const char* root, const char* table);
 
