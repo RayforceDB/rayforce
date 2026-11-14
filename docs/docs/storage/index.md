@@ -225,7 +225,7 @@ Two additional IF shapes have deliberately bounded proofs:
 
 These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, wider grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
 
-```clojure
+```lisp
 ;; A supported narrow grouped shape; the literal date bound selects partitions.
 (select {from: trades where: (== date 2024.01.02) by: account
          qty_ok: (sum (if (> qty 0) qty 0))})
