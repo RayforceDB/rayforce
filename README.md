@@ -172,6 +172,30 @@ for its own release links). On MinGW, link the winsock libraries as well:
 `-lws2_32 -lmswsock -lkernel32 -ladvapi32`, with the same section-GC flag
 the toolchain accepts.
 
+### Shared library (`make shared`)
+
+`make shared` links the same objects into a shared library,
+`librayforce.so` (`librayforce.dylib` on macOS), for a host that loads
+the engine at run time and cannot link an archive: a binding over a
+foreign-function interface from Python, a JavaScript runtime, the JVM
+and the like. It exports every public symbol and depends on nothing
+beyond libc and libm. The release archives carry it next to the binary
+and `rayforce.h`, all built from one commit.
+
+```sh
+make shared
+cc -O2 -Iinclude -Isrc examples/analytics.c -L. -lrayforce \
+   -lm -lpthread -o analytics
+LD_LIBRARY_PATH=. ./analytics
+```
+
+Like the staged headers below, it is one build of one revision and
+promises no ABI from one revision to the next: load the library and
+read the header of the same commit. A host that reads values through
+the header's layout rather than through accessor functions can check
+that with `ray_git_commit()`. The runtime belongs to the thread that
+created it, and a process has one. Not built on Windows yet.
+
 ### Staged headers (`make install-headers`)
 
 `make install-headers` copies the headers a C client needs into a staging
