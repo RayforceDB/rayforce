@@ -391,6 +391,7 @@ typedef struct {
     int64_t name;
     int physical, optional, converted, type;
     int64_t scale; /* TIMESTAMP multiplier to ns */
+    double dec_div; /* DECIMAL: 10^scale, the divisor of the stored integer */
     bool native_symbol, strict;
     ray_sym_domain_t* import_domain; /* borrowed from import or scan owner */
 } pq_schema;
@@ -471,7 +472,8 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
     int64_t phys, rep;
     if (!pq_num(f[1], &phys) || !pq_num(f[3], &rep) || rep < 0 || rep > 1 || f[5].type) return false;
     s->physical = (int)phys; s->optional = (int)rep;
-    s->converted = (int)pq_get(f[6], -1); s->scale = 1;
+    s->converted = (int)pq_get(f[6], -1); s->scale = 1; s->dec_div = 1;
+    int64_t dscale = pq_get(f[7], -1), dprec = pq_get(f[8], -1); /* DECIMAL annotation */
     switch (phys) {
     case 0: s->type = rep ? RAY_I16 : RAY_BOOL; break;
     case 1: s->type = RAY_I32; break;
@@ -504,11 +506,22 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
             if (units != 1) return false;
             s->scale = unit[1].type ? 1000000 : unit[2].type ? 1000 : 1;
             conv = -2; s->type = RAY_TIMESTAMP;
+        } else if (found == 5) {
+            pq_span dec[3];
+            if (!pq_fields(logical[5], dec, 3) || !pq_num(dec[1], &dscale) || !pq_num(dec[2], &dprec)) return false;
+            conv = 5;
         } else return false;
     }
     if (conv == 0) { if (phys != 6) return false; }
     else if (conv == 6) { if (phys != 1) return false; s->type = RAY_DATE; }
-    else if (conv == 9 || conv == 10) {
+    else if (conv == 5) {
+        /* DECIMAL on INT32/INT64 reads as F64: stored / 10^scale, one correctly
+         * rounded division of an exactly converted integer, so exact up to 2^53. */
+        if (phys != 1 && phys != 2) return false;
+        if (dscale < 0 || dscale > 18 || dprec < 1 || dprec > (phys == 1 ? 9 : 18) || dscale > dprec) return false;
+        s->type = RAY_F64; s->dec_div = 1;
+        for (int64_t i = 0; i < dscale; i++) s->dec_div *= 10;
+    } else if (conv == 9 || conv == 10) {
         if (phys != 2) return false;
         s->type = RAY_TIMESTAMP; s->scale = conv == 9 ? 1000000 : 1000;
     } else if (conv >= 11 && conv <= 18) {
@@ -1099,6 +1112,7 @@ static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uin
             (s->converted == 12 && x > UINT16_MAX) ||
             (s->converted == 15 && (x < INT8_MIN || x > INT8_MAX)) ||
             (s->converted == 16 && (x < INT16_MIN || x > INT16_MAX))) return PQ_PUT_FAIL;
+        if (s->converted == 5) { ((double*)ray_data(v))[row] = (double)x / s->dec_div; break; }
         if (s->converted == 14 && x < 0) return PQ_U64_RANGE;
         if (s->type == RAY_DATE && __builtin_sub_overflow(x,PQ_EPOCH_DAYS,&x)) return PQ_PUT_FAIL;
         int64_t raw = x;

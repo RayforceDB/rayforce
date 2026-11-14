@@ -235,6 +235,49 @@ static test_result_t test_pq_uint64(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_error_free(t);
     PASS();
 }
+/* DECIMAL on INT32/INT64 reads as F64, stored / 10^scale: as the converted type
+ * or the logical type, required or optional, plain or dictionary encoded, at
+ * any batch size. Byte-array decimals and a scale above the precision refuse. */
+static test_result_t test_pq_decimal(void) {
+    const int64_t px[] = {INT64_C(7189430000000),INT64_C(7182430000000),1,-5,0,123456789,INT64_C(1)<<53,-(INT64_C(1)<<53),INT64_C(99999999999999999),5};
+    const int32_t qty[] = {246092,70909,0,-7,1,999999999,-999999999,3,4,5};
+    for (int logical = 0; logical < 2; logical++) for (int dict = 0; dict < 2; dict++) {
+        char path[128]; snprintf(path,sizeof(path),FIX "decimal-%d-%d.parquet",logical,dict);
+        for (int batch = 1; batch <= 4; batch++) {
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,batch*3,&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_ncols(t),3);
+                for (int c = 0; c < 3; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t,c)->type,RAY_F64);
+                for (int64_t row = 0; row < ray_table_nrows(t); row++, total++) {
+                    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[row] == (double)px[total]/1e9);
+                    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,1)))[row] == (double)qty[total]/1e3);
+                    ray_t* opt = ray_table_get_col_idx(t,2);
+                    if (total % 3 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(opt,row));
+                    else TEST_ASSERT_TRUE(((double*)ray_data(opt))[row] == (double)px[total]/1e2);
+                }
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,10);
+            ray_parquet_close(r);
+        }
+    }
+    /* The price at scale 9 is the decimal itself, not a nearby double. */
+    ray_t* t = ray_parquet_read(FIX "decimal-1-0.parquet",NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[0] == 7189.43);
+    ray_release(t);
+    const char* bad[] = {FIX "decimal-binary.parquet",FIX "decimal-bad-scale.parquet"};
+    for (int i = 0; i < 2; i++) {
+        ray_t* e = ray_parquet_read(bad[i],NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(e)); ray_error_free(e);
+    }
+    PASS();
+}
 static test_result_t test_pq_matrix(void) {
     const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
                            FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet"};
@@ -5189,6 +5232,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/snappy",test_pq_snappy,pq_setup,pq_teardown},
     {"parquet/lz4",test_pq_lz4,pq_setup,pq_teardown},
     {"parquet/uint64",test_pq_uint64,pq_setup,pq_teardown},
+    {"parquet/decimal",test_pq_decimal,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

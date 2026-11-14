@@ -334,9 +334,13 @@ table operations.
   TIMESTAMP annotations. Narrow signed annotations may use a wider native type
   to preserve values otherwise reserved as a null sentinel. UINT64 reads as
   I64, and a value above INT64_MAX (which has no native representation) fails
-  the read. Decimal, INT96, nested/repeated data, fixed byte arrays, and other
-  annotations are rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is validated when
-  `strict: true` is enabled.
+  the read. DECIMAL on an INT32 (precision up to 9) or INT64 (up to 18) column
+  reads as F64, the stored integer divided by 10^scale: one correctly rounded
+  division, exact for stored values below 2^53, whether the file carries the
+  converted type or the logical type, and null where the column is null. INT96,
+  decimals on byte arrays, nested/repeated data, fixed byte arrays, and other
+  annotations are rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is
+  validated when `strict: true` is enabled.
 - Parquet dates/timestamps are converted from the Unix epoch to Rayforce's
   2000 epoch. Timestamp timezone annotations are not retained as separate
   metadata. Unannotated integer columns remain integers.

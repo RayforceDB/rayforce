@@ -116,7 +116,13 @@ def write(path, specs, groups, codec=1, v2=False, dictionary=True, crc=False, le
     schema = [[(3,I32,0),(4,BINARY,'schema'),(5,I32,len(specs))]]
     for name,pt,optional,converted in specs:
         s = [(1,I32,pt),(3,I32,int(optional)),(4,BINARY,name)]
-        if converted is not None: s.append((6,I32,converted))
+        if isinstance(converted,tuple):
+            # ('decimal', scale, precision, logical): DECIMAL on an integer column,
+            # as the converted type, and also as the logical type when asked.
+            _, dscale, dprec, logical = converted
+            s += [(6,I32,5),(7,I32,dscale),(8,I32,dprec)]
+            if logical: s.append((10,STRUCT,[(5,STRUCT,[(1,I32,dscale),(2,I32,dprec)])]))
+        elif converted is not None: s.append((6,I32,converted))
         schema.append(s)
     rowgroups=[]
     for group in groups:
@@ -313,3 +319,18 @@ if __name__ == '__main__':
     n=3*16384
     write(root/'uint64-bulk.parquet',[('ok',2,True,14),('bad',2,True,14)],
           [[list(range(n)),list(range(n-1))+[-1]]],codec=0,dictionary=False)
+    # DECIMAL on INT32/INT64 reads as F64 (stored / 10**scale): required, optional
+    # with nulls, converted type only and with the logical type, plain and
+    # dictionary encoded. Prices at scale 9, a quantity at scale 3, a negative
+    # value and zero.
+    px=[7189430000000,7182430000000,1,-5,0,123456789,2**53,-2**53,99999999999999999,5]
+    qty=[246092,70909,0,-7,1,999999999,-999999999,3,4,5]
+    opt=[None if i%3==0 else x for i,x in enumerate(px)]
+    for logical in (False,True):
+        for dictionary in (False,True):
+            specs_dec=[('px',2,False,('decimal',9,18,logical)),('qty',1,False,('decimal',3,9,logical)),('opt',2,True,('decimal',2,18,logical))]
+            write(root/f'decimal-{int(logical)}-{int(dictionary)}.parquet',specs_dec,[[px,qty,opt]],dictionary=dictionary)
+    # Refused: a decimal on a byte array (fixed or variable length), whose
+    # values are no integers, and a scale above the precision.
+    write(root/'decimal-binary.parquet',[('d',6,False,('decimal',2,10,True))],[[[b'\x01',b'\x02']]],dictionary=False)
+    write(root/'decimal-bad-scale.parquet',[('d',2,False,('decimal',5,3,True))],[[[1,2,3]]],dictionary=False)
