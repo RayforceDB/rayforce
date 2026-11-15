@@ -1,0 +1,95 @@
+;; nil_vector_kernels.rfl — `nil?` over every vector type, past the parallel
+;; threshold (#1190).
+;;
+;; `nil?` used to call ray_vec_is_null once per element on one thread
+;; (about 1.5 ns each, for every type).  It now answers a vector with no
+;; HAS_NULLS hint with one memset and reads the rest with a typed loop,
+;; split over the worker pool above 64 morsels (65,536 rows).  The nulls
+;; below sit on the first row, on both sides of the 65,536-row boundary, in
+;; the middle and on the last row, so a chunk edge cannot hide one.
+
+(set N 200000)
+(set I (til N))
+(set IX [0 65535 65536 99999 199999])
+
+;; ── numeric and temporal: null-free first (the memset arm), then with nulls ──
+(set V (+ I 0))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0N)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (as 'I32 I))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Ni)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (as 'I16 (% I 1000)))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Nh)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (/ (as 'F64 I) 7.0))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Nf)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (as 'F32 (/ (as 'F64 I) 7.0)))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Ne)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (as 'DATE (% I 10000)))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Nd)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (as 'TIME I))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Nt)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (as 'TIMESTAMP I))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Np)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+;; every element null, and a NaN that is not the canonical null is null too
+(count (where (nil? (+ (/ (as 'F64 I) 7.0) 0Nf)))) -- 200000
+(count (where (nil? (/ (* 0.0 (as 'F64 I)) 0.0)))) -- 200000
+
+;; ── GUID, SYM (every width class) and STR: null is an empty payload ──
+(set V (guid N))
+(count (where (nil? V))) -- 0
+(alter 'V set IX 0Ng)
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (take [a b c] N))
+(count (where (nil? V))) -- 0
+(alter 'V set IX ')
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+(set V (take (as 'STR [x yy zzz]) N))
+(count (where (nil? V))) -- 0
+(alter 'V set IX "")
+(where (nil? V)) -- [0 65535 65536 99999 199999]
+
+;; ── B8 and U8 hold no null ──
+(count (where (nil? (> I 5)))) -- 0
+(count (where (nil? (as 'U8 (% I 200))))) -- 0
+
+;; ── a slice answers for its own window, and sees its parent's hint ──
+(set V (+ I 0))
+(alter 'V set IX 0N)
+(where (nil? (drop V 65535))) -- [0 1 34464 134464]
+(where (nil? (take V 65536))) -- [0 65535]
+(count (where (nil? (drop V 100000)))) -- 1
+(count (where (nil? (take (drop V 100000) 50000)))) -- 0
+
+;; ── small and empty vectors take the serial arm ──
+(nil? (as 'F64 [])) -- (as 'B8 [])
+(nil? (as 'SYM [])) -- (as 'B8 [])
+(nil? [1.0 0Nf]) -- [false true]
+
+;; ── the answer is the query path's ──
+(set T (table [v] (list V)))
+(at (select {n: (nil? v) from: T}) 'n) -- (nil? V)
