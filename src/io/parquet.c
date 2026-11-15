@@ -183,6 +183,19 @@ static bool pq_element(pq_cur* c, uint8_t t, pq_span* s) {
 }
 static ray_t* pq_error(const char* msg) { return ray_error("parquet", "%s", msg); }
 
+/* An LZ77 match: n bytes at d copied from d-off, 0 < off <= bytes already
+ * written. Only initialized, nonoverlapping spans are copied; a repeat
+ * shorter than the match doubles its span, so libc's vector copy applies. */
+static void pq_copy_match(uint8_t* d, size_t off, size_t n) {
+    size_t copied = 0;
+    while (copied < n) {
+        size_t step = n-copied < off ? n-copied : off;
+        memcpy(d+copied,d+copied-off,step);
+        copied += step;
+        if (copied >= off) off += off;
+    }
+}
+
 bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
     pq_cur c = {src, src+len, false}; uint64_t expected = pq_var(&c); size_t at = 0;
     if (c.bad || expected != size) return false;
@@ -210,15 +223,7 @@ bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t siz
                 n = 1+(tag>>2);
             }
             if (c.bad || !off || off > at || n > size-at) return false;
-            /* Copy only initialized, nonoverlapping spans. Small offsets grow
-             * geometrically, allowing libc's vector copy even for repeats. */
-            size_t copied = 0;
-            while (copied < n) {
-                size_t step = n-copied < off ? n-copied : off;
-                memcpy(dst+at+copied,dst+at+copied-off,step);
-                copied += step;
-                if (copied >= off) off += off;
-            }
+            pq_copy_match(dst+at,off,n);
             at += n;
         }
     }
@@ -226,13 +231,16 @@ bool ray_parquet_snappy(const uint8_t* src, size_t len, uint8_t* dst, size_t siz
 }
 
 /* A literal or match length that continues in extra bytes: 255 adds on and
- * asks for another byte, anything less ends it. */
+ * asks for another byte, anything less ends it. A length above a page
+ * (PQ_MAX_PAGE) cannot be valid and is refused as it grows, so the sum never
+ * wraps, whatever the width of size_t. */
 static bool pq_lz4_extend(const uint8_t** ip, const uint8_t* end, size_t* n) {
     uint8_t b;
     do {
         if (*ip == end) return false;
         b = *(*ip)++;
-        *n += b;   /* at most 255 per input byte: cannot overflow */
+        *n += b;
+        if (*n > PQ_MAX_PAGE) return false;
     } while (b == 255);
     return true;
 }
@@ -260,22 +268,18 @@ bool ray_parquet_lz4(const uint8_t* src, size_t len, uint8_t* dst, size_t size) 
         if (n == 15 && !pq_lz4_extend(&ip,end,&n)) return false;
         n += 4;
         if (!off || off > at || n > size-at) return false;
-        /* As in ray_parquet_snappy: only initialized, nonoverlapping spans,
-         * the span doubling for a repeat shorter than the match. */
-        size_t copied = 0;
-        while (copied < n) {
-            size_t step = n-copied < off ? n-copied : off;
-            memcpy(dst+at+copied,dst+at+copied-off,step);
-            copied += step;
-            if (copied >= off) off += off;
-        }
+        pq_copy_match(dst+at,off,n);
         at += n;
     }
 }
 
 /* Parquet's deprecated LZ4 codec (5): Hadoop's framing, a big-endian
  * uncompressed size and a big-endian compressed size before each raw block,
- * repeated to the end of the page. */
+ * repeated to the end of the page. One compressed chunk per frame only: the
+ * framing also allows several [compressed size][chunk] pairs under one
+ * uncompressed size (a write larger than the writer's buffer), but the size
+ * each chunk decodes to is not stored, so that needs a decoder that returns
+ * the length it produced. Such a frame is refused (pq_lz4_multichunk names it). */
 bool ray_parquet_lz4_hadoop(const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
     size_t at = 0;
     while (len) {
@@ -288,9 +292,20 @@ bool ray_parquet_lz4_hadoop(const uint8_t* src, size_t len, uint8_t* dst, size_t
     return at == size;
 }
 
+/* Does this look like a frame of several chunks: the first chunk ends short
+ * of the page and another [compressed size][chunk] pair fills it exactly? */
+static bool pq_lz4_multichunk(const uint8_t* src, size_t len) {
+    if (len < 12) return false;
+    size_t csize = (size_t)pq_be32(src+4);
+    if (csize > len-12) return false;
+    size_t rest = len-8-csize;   /* >= 4 */
+    return (size_t)pq_be32(src+8+csize) == rest-4 && rest > 4;
+}
+
 /* Page and dictionary compression by Parquet's CompressionCodec: 0 none,
  * 1 Snappy, 5 LZ4 (Hadoop framing, with the raw block some writers store
  * under that name accepted too), 7 LZ4_RAW. */
+#define PQ_MULTICHUNK_ERR "LZ4 page is a multi-chunk Hadoop frame (not supported)"
 #define PQ_CODEC_ERR "unsupported compression codec (supported: uncompressed, Snappy, LZ4)"
 static bool pq_codec_supported(int64_t codec) { return codec == 0 || codec == 1 || codec == 5 || codec == 7; }
 static bool pq_decompress(int codec, const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
@@ -393,6 +408,7 @@ typedef struct {
     int64_t scale; /* TIMESTAMP multiplier to ns */
     double dec_div; /* DECIMAL: 10^scale, the divisor of the stored integer */
     bool native_symbol, strict;
+    const char* refusal; /* why pq_schema_type refused a DECIMAL, else NULL */
     ray_sym_domain_t* import_domain; /* borrowed from import or scan owner */
 } pq_schema;
 typedef struct { const uint8_t* p; uint32_t n; } pq_string;
@@ -415,6 +431,7 @@ typedef struct {
     uint64_t bool_bit;
     int codec, encoding;
     bool have_dict, optional;
+    bool lz4_multichunk;   /* the last page failed to unpack and looks like a multi-chunk LZ4 frame */
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
 } pq_column;
@@ -517,8 +534,9 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
     else if (conv == 5) {
         /* DECIMAL on INT32/INT64 reads as F64: stored / 10^scale, one correctly
          * rounded division of an exactly converted integer, so exact up to 2^53. */
-        if (phys != 1 && phys != 2) return false;
-        if (dscale < 0 || dscale > 18 || dprec < 1 || dprec > (phys == 1 ? 9 : 18) || dscale > dprec) return false;
+        if (phys != 1 && phys != 2) { s->refusal = "DECIMAL is read on INT32 and INT64 columns only"; return false; }
+        if (dscale < 0 || dscale > dprec) { s->refusal = "DECIMAL scale must be between 0 and its precision"; return false; }
+        if (dprec < 1 || dprec > (phys == 1 ? 9 : 18) || dscale > 18) { s->refusal = "DECIMAL precision is beyond its physical type (9 digits on INT32, 18 on INT64)"; return false; }
         s->type = RAY_F64; s->dec_div = 1;
         for (int64_t i = 0; i < dscale; i++) s->dec_div *= 10;
     } else if (conv == 9 || conv == 10) {
@@ -574,13 +592,20 @@ ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ra
     r->ncols = (int64_t)ns-1;
     r->schema = ray_calloc_raw((size_t)r->ncols*sizeof(*r->schema));
     if (!r->schema) { err = "schema allocation failed"; goto fail; }
-    pq_span root, sf[11];
+    pq_span root, sf[11]; char why[200];
     if (!pq_element(&sc, 12, &root) || !pq_fields(root,sf,11) || pq_get(sf[5],-1) != r->ncols || sf[1].type) goto fail;
     err = "unsupported or malformed schema (only flat primitive columns are supported)";
     for (int64_t i = 0; i < r->ncols; i++) {
         pq_span se; const uint8_t* name; size_t len;
         if (!pq_element(&sc,12,&se) || !pq_fields(se,sf,11) || !pq_binary(sf[4],&name,&len) ||
-            !len || len > 1024 || memchr(name,0,len) || !pq_schema_type(&r->schema[i],sf)) goto fail;
+            !len || len > 1024 || memchr(name,0,len)) goto fail;
+        if (!pq_schema_type(&r->schema[i],sf)) {
+            if (r->schema[i].refusal) {
+                snprintf(why,sizeof why,"column %.*s: %s",(int)(len < 100 ? len : 100),(const char*)name,r->schema[i].refusal);
+                err = why;
+            }
+            goto fail;
+        }
         r->schema[i].name = ray_sym_intern((const char*)name,len);
         if (r->schema[i].name < 0) goto fail;
         for (int64_t j = 0; j < i; j++) if (r->schema[j].name == r->schema[i].name) goto fail;
@@ -808,7 +833,7 @@ static int64_t pq_dict_max_len(ray_parquet_t* r, pq_span meta) {
     if (raw < 0 || raw > PQ_MAX_PAGE || size < 0 || size > PQ_MAX_PAGE ||
         (uint64_t)size > (uint64_t)(c.end-c.p)) return 0;
     const uint8_t* p = c.p; uint8_t* buf = NULL;
-    if (codec == 1 || codec == 5 || codec == 7) {
+    if (codec && pq_codec_supported(codec)) {
         buf = ray_alloc_raw((size_t)(raw ? raw : 1));
         if (!buf || !pq_decompress((int)codec,c.p,(size_t)size,buf,(size_t)raw)) { ray_free_raw(buf); return 0; }
         p = buf;
@@ -916,7 +941,10 @@ static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, 
     if (decoded > PQ_MAX_PAGE) return false;
     if (!compressed || !c->codec) { if (n != decoded) return false; *out = p; return true; }
     if (!pq_reserve(&c->page,&c->page_cap,decoded)) return false;
-    if (!pq_decompress(c->codec,p,n,c->page,decoded)) return false;
+    if (!pq_decompress(c->codec,p,n,c->page,decoded)) {
+        c->lz4_multichunk = c->codec == 5 && pq_lz4_multichunk(p,n);
+        return false;
+    }
     *out = c->page; return true;
 }
 /* A dictionary page of `size` bytes in the file, `n` decoded: decompressed
@@ -1034,7 +1062,7 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
         if (kind == 0) {
             if (!pq_fields(f[5],h,9) || !pq_num(h[1],&count) || !pq_num(h[2],&encoding) ||
                 (c->optional && pq_get(h[3],-1) != 3) ||
-                !pq_unpack(c,payload,(size_t)size,(size_t)raw,true,&data)) return "invalid v1 data page";
+                !pq_unpack(c,payload,(size_t)size,(size_t)raw,true,&data)) return c->lz4_multichunk ? PQ_MULTICHUNK_ERR : "invalid v1 data page";
             c->values = (pq_cur){data,data+raw,false};
             if (c->optional) {
                 const uint8_t* p; const uint8_t* levels;
@@ -1049,7 +1077,7 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
                 !pq_num(h[6],&rl) || dl < 0 || rl != 0 || dl > size || dl > raw ||
                 (!c->optional && dl) || (h[7].type && h[7].type != 1 && h[7].type != 2)) return "invalid v2 data page";
             c->defs = (pq_rle){.c={payload,payload+dl,false},.width=1};
-            if (!pq_unpack(c,payload+dl,(size_t)(size-dl),(size_t)(raw-dl),h[7].type != 2,&data)) return "invalid v2 compressed values";
+            if (!pq_unpack(c,payload+dl,(size_t)(size-dl),(size_t)(raw-dl),h[7].type != 2,&data)) return c->lz4_multichunk ? PQ_MULTICHUNK_ERR : "invalid v2 compressed values";
             c->values = (pq_cur){data,data+raw-dl,false};
             c->expected_nulls = nulls;
         } else return "unsupported page type";
@@ -2115,14 +2143,27 @@ static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char*
 }
 /* The files of one import share a table: the same columns, in order, with the
  * same native types after the import's type conversions. */
-static ray_t* pq_same_schema(const ray_parquet_t* a, const ray_parquet_t* b, size_t file) {
+static ray_t* pq_same_ncols(const ray_parquet_t* a, const ray_parquet_t* b) {
     if (a->ncols != b->ncols)
-        return ray_error("parquet","parquet: file %zu has %lld columns, the first has %lld",file+1,(long long)b->ncols,(long long)a->ncols);
+        return ray_error("parquet","%lld columns, the first file has %lld",(long long)b->ncols,(long long)a->ncols);
+    return NULL;
+}
+static ray_t* pq_same_schema(const ray_parquet_t* a, const ray_parquet_t* b) {
+    ray_t* e = pq_same_ncols(a,b);
+    if (e) return e;
     for (int64_t c = 0; c < a->ncols; c++) {
         const pq_schema* x = &a->schema[c]; const pq_schema* y = &b->schema[c];
-        if (x->name != y->name || x->type != y->type || x->native_symbol != y->native_symbol)
-            return ray_error("parquet","parquet: column %lld of file %zu (%s) differs from the first file's (%s)",
-                             (long long)c+1,file+1,ray_str_ptr(ray_sym_str(y->name)),ray_str_ptr(ray_sym_str(x->name)));
+        const char* what = x->name != y->name ? "name" : x->type != y->type ? "type" : x->native_symbol != y->native_symbol ? "import type" : NULL;
+        if (!what) continue;
+        const char* yn = ray_str_ptr(ray_sym_str(y->name));
+        if (!strcmp(what,"name"))
+            return ray_error("parquet","column %lld is %s, the first file has %s",
+                             (long long)c+1,yn,ray_str_ptr(ray_sym_str(x->name)));
+        if (!strcmp(what,"type"))
+            return ray_error("parquet","column %lld (%s): type %s, the first file has %s",
+                             (long long)c+1,yn,ray_type_name(y->type),ray_type_name(x->type));
+        return ray_error("parquet","column %lld (%s): imported as %s, the first file has it as %s",
+                         (long long)c+1,yn,y->native_symbol ? "SYM" : "a string",x->native_symbol ? "SYM" : "a string");
     }
     return NULL;
 }
@@ -2141,11 +2182,13 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
     for (size_t i = 0; i < npaths && !err; i++) {
         ray_parquet_t* r = NULL;
         err = ray_parquet_open(paths[i],NULL,PQ_BATCH,&r);
-        if (err) break;
-        err = pq_import_types(r,types);
+        /* A different column count is the file's fault, whatever the types
+         * vector says: name it before the vector is checked against it. */
+        if (!err && i) err = pq_same_ncols(first,r);
+        if (!err) err = pq_import_types(r,types);
         if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
         if (!err && !i) err = pq_stage(r,root,staging,sizeof(staging),true);
-        if (!err && i) err = pq_same_schema(first,r,i);
+        if (!err && i) err = pq_same_schema(first,r);
         if (!err) {
             /* Global runtime interning is not worker-safe. Decode symbols
              * straight into the shared, synchronized file domain, as in direct
@@ -2165,7 +2208,14 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
             if (n > INT64_MAX-parts || r->rows > INT64_MAX-rows) err = pq_error("too many partitions or rows");
             else { parts += n; rows += r->rows; }
         }
-        if (!i) first = r; else ray_parquet_close(r);
+        if (err && i) {   /* the first file is the import; later ones are named */
+            char code[32], msg[512];
+            snprintf(code,sizeof code,"%s",ray_err_code(err));
+            snprintf(msg,sizeof msg,"%s",ray_error_msg() ? ray_error_msg() : "");
+            ray_error_free(err);
+            err = ray_error(code,"file %zu (%s): %s",i+1,paths[i],msg);
+        }
+        if (!i) first = r; else if (r) ray_parquet_close(r);
     }
     if (!err && domain) {
         /* Every partition header must be covered by the final vocabulary

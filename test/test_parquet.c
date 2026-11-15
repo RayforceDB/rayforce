@@ -329,9 +329,31 @@ static test_result_t test_pq_parted_files(void) {
     const char* mixed[] = {FIX "flat-1-v1.parquet",FIX "uint64-0.parquet"};
     snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-mixed-%d",(int)getpid());
     n = ray_parquet_parted_files(mixed,2,root,"hits",NULL);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(n)); ray_release(n);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && strstr(ray_error_msg(),"uint64-0.parquet") &&
+                     strstr(ray_error_msg(),"3 columns, the first file has 7"));
+    ray_error_free(n);
     TEST_ASSERT_TRUE(access(root,F_OK) != 0);
     char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial);
+    /* Same column count, another column: the message names the file and the column. */
+    char partial2[200];
+    const char* renamed[] = {FIX "decimal-0-0.parquet",FIX "uint64-0.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-renamed-%d",(int)getpid());
+    n = ray_parquet_parted_files(renamed,2,root,"hits",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && strstr(ray_error_msg(),"column 1 is req, the first file has px"));
+    ray_error_free(n);
+    snprintf(partial2,sizeof(partial2),"%s.parquet-partial",root); pq_rm_rf(partial2);
+    /* A types vector does not hide a file with another column count. */
+    int64_t three[] = {ray_sym_intern("F64",3),ray_sym_intern("F64",3),ray_sym_intern("F64",3)};
+    ray_t* t3 = ray_vec_from_raw(RAY_SYM,three,3);
+    const char* counts[] = {FIX "decimal-0-0.parquet",FIX "flat-1-v1.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-counts-%d",(int)getpid());
+    n = ray_parquet_parted_files(counts,2,root,"hits",t3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && strstr(ray_error_msg(),"7 columns, the first file has 3"));
+    ray_error_free(n); ray_release(t3);
+    snprintf(partial2,sizeof(partial2),"%s.parquet-partial",root); pq_rm_rf(partial2);
     /* No files is no import. */
     n = ray_parquet_parted_files(two,0,root,"hits",NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(n)); ray_release(n);
@@ -340,10 +362,10 @@ static test_result_t test_pq_parted_files(void) {
 }
 static test_result_t test_pq_matrix(void) {
     const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
-                           FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet"};
+                           FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet",FIX "flat-5raw-v1.parquet",FIX "flat-5raw-v2.parquet"};
     int64_t expect[] = {1,NULL_I32,3,4,5,NULL_I32,7,8,9};
     const char* strings[] = {"alpha","a long string over twelve bytes","","","alpha","beta","gamma","delta","z"};
-    for (int file = 0; file < 11; file++) for (int batch = 1; batch <= 11; batch++) {
+    for (int file = 0; file < 13; file++) for (int batch = 1; batch <= 11; batch++) {
         ray_parquet_t* r = NULL;
         ray_t* err = ray_parquet_open(names[file],NULL,batch,&r);
         TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);

@@ -51,6 +51,11 @@ Materialize all columns, a projection vector, or a read configured with
 The whole result remains in memory. Typed `SYM` text uses a private dictionary
 that remains valid for as long as returned vectors retain it.
 
+Column types: `UINT64` reads as `I64`, and a value above `INT64_MAX`
+(including 2^63) fails the read. `DECIMAL` on an `INT32` or `INT64` column
+reads as `F64`, the stored integer divided by 10^scale; a decimal on a byte
+array is refused.
+
 ## `.parquet.scan` { #parquet-scan }
 
 Create a descriptor for `select`. Each query reopens the file and infers eligible

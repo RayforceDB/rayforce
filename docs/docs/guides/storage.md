@@ -318,9 +318,11 @@ table operations.
 
 ### Supported input and limits
 
-- One local, unencrypted file with a flat schema.
+- Local, unencrypted files with a flat schema: one file, or for `.parquet.parted`
+  a list of files with the same columns that become one table.
 - Uncompressed, raw Snappy and LZ4 column chunks (LZ4_RAW, and the deprecated
-  Hadoop-framed LZ4 codec); other codecs are refused with an error listing the supported ones.
+  Hadoop-framed LZ4 codec, one compressed chunk per frame); other codecs are
+  refused with an error listing the supported ones.
 - Data pages v1 and v2; PLAIN and dictionary encoding, including the legacy
   dictionary tag and dictionary-to-plain fallback within a chunk; RLE-encoded
   BOOLEAN values (the v2 default of common writers). Zero-row row groups are
@@ -385,7 +387,7 @@ predicate can filter decoded batches; string Bloom probes, fully deferred output
 decoding, and streaming grouped queries remain future work.
 
 Both `.parquet.splayed [types] path directory` and
-`.parquet.parted [types] path root table-name` return the imported row count.
+`.parquet.parted [types] path-or-paths root table-name` return the imported row count.
 An options dict in place of the type vector may add `compress: true` for
 compressed (generation-2) column files; `.csv.splayed` and `.csv.parted` take
 `{compress: true}` as a leading argument.

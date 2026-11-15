@@ -63,6 +63,7 @@ def lz4_hadoop(data):
 
 # Parquet CompressionCodec: 1 Snappy, 5 LZ4 (Hadoop framing), 7 LZ4_RAW.
 COMPRESS = {1: snappy, 5: lz4_hadoop, 7: lz4}
+RAW5 = False   # write the raw block under codec 5, as some writers do
 
 def rle(values, width):
     return b''.join(var(2) + x.to_bytes((width+7)//8, 'little') for x in values)
@@ -102,7 +103,7 @@ class Page(bytes):
 
 def page(kind, header, body, codec=1, prefix=b'', compressed=True, crc=False):
     import zlib  # stdlib, fixture checksums only
-    payload = prefix + (COMPRESS[codec](body) if codec and compressed else body)
+    payload = prefix + ((lz4 if codec == 5 and RAW5 else COMPRESS[codec])(body) if codec and compressed else body)
     f = [(1,I32,kind),(2,I32,len(prefix)+len(body)),(3,I32,len(payload))]
     if crc:
         chk = zlib.crc32(payload)
@@ -238,6 +239,10 @@ if __name__ == '__main__':
     for codec in (0,1,5,7):
         for v2 in (False,True):
             write(root/f'flat-{codec}-v{2 if v2 else 1}.parquet',specs,[rows,rows],codec,v2,crc=True)
+    RAW5 = True   # codec 5 holding a raw block
+    for v2 in (False,True):
+        write(root/f'flat-5raw-v{2 if v2 else 1}.parquet',specs,[rows,rows],5,v2,crc=True)
+    RAW5 = False
     write(root/'legacy.parquet',specs,[rows,rows],legacy=True)
     write(root/'v2-uncompressed.parquet',specs,[rows,rows],v2=True,compress_v2=False)
     write(root/'no-statistics.parquet',specs,[rows,rows],statistics=False)
