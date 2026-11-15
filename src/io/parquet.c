@@ -680,12 +680,27 @@ static const char* pq_str_delta_done(pq_column* c) {
     if (c->payload.p != c->payload.end) return "excess delta values";
     return NULL;
 }
-/* One reconstructed DBA value copied into the direct symbol read's arena:
- * the 8,192 collected pointers must all survive until interning, which a
- * single rebuild buffer cannot provide. */
+/* The direct symbol read's collection arena: one collected batch of
+ * reconstructed DELTA_BYTE_ARRAY values, copied because their pointers must
+ * all survive until interning and a single rebuild buffer cannot provide
+ * that.  Its bound is the string pool's own (PQ_POOL_MAX), not PQ_MAX_PAGE:
+ * prefix expansion makes a valid page decode to a collection far larger than
+ * the page's encoded size, and the plain batch read of the same page fills a
+ * pool at that same bound. */
+static bool pq_reserve_arena(uint8_t** buf, size_t* cap, size_t n) {
+    if (n > (size_t)PQ_POOL_MAX) return false;
+    if (!n) n = 1;
+    if (n <= *cap) return true;
+    size_t nc = *cap ? *cap : 4096;
+    while (nc < n) nc = nc > (size_t)PQ_POOL_MAX/2 ? (size_t)PQ_POOL_MAX : nc*2;
+    void* p = ray_realloc_raw(*buf, nc);
+    if (!p) return false;
+    *buf = p; *cap = nc; return true;
+}
+/* One reconstructed DBA value copied into that arena. */
 static const char* pq_sym_arena_put(pq_column* c, const uint8_t* p, uint32_t len, size_t* off) {
     if ((uint64_t)c->sym_arena_len + len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
-    if (!pq_reserve(&c->sym_arena,&c->sym_arena_cap,c->sym_arena_len + len)) return "symbol scratch allocation failed";
+    if (!pq_reserve_arena(&c->sym_arena,&c->sym_arena_cap,c->sym_arena_len + len)) return "symbol scratch allocation failed";
     *off = c->sym_arena_len;
     if (len) memcpy(c->sym_arena + c->sym_arena_len,p,len);
     c->sym_arena_len += len;
@@ -4118,6 +4133,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     int64_t* vocab = ray_calloc_raw((size_t)r->ncols*sizeof(*vocab));   /* pq_vocab_bounds */
     uint8_t* donly = ray_calloc_raw((size_t)r->ncols);   /* pq_vocab_bounds */
     uint8_t* pick = ray_calloc_raw((size_t)r->ncols);    /* the direct ones of a grouped import */
+    uint8_t* dba = NULL;   /* [ncols] chunks name DELTA_BYTE_ARRAY */
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
@@ -4290,17 +4306,53 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     }
 #endif
     simp = nnum < r->ncols ? ray_sym_domain_import(writers[order[nnum]].dom) : NULL;
-    /* DELTA_BYTE_ARRAY columns go grouped unconditionally: prefix expansion
-     * breaks the direct import's metadata-derived vocabulary bound, and the
-     * grouped import's own arena bounds the reconstruction. */
+    /* DELTA_BYTE_ARRAY columns go grouped: prefix expansion breaks the direct
+     * import's metadata-derived vocabulary bound, and the grouped import's
+     * own arena bounds the reconstruction.  The other symbol columns keep the
+     * import's normal per-column path: a dictionary-only column whose bound
+     * holds goes direct and is seeded, as it would with no DELTA column in
+     * the import (CR 3.7: the direct path stays for PLAIN and DICTIONARY
+     * columns, where the bound holds). */
     bool force_grouped = false;
-    if (simp) for (int64_t i = nnum; i < r->ncols; i++)
-        if (pq_chunk_names(r,order[i],7)) { force_grouped = true; break; }
-    if (force_grouped) mode = PQ_SYM_GROUPED;
+    dba = ray_calloc_raw((size_t)r->ncols);
+    if (simp && dba) for (int64_t i = nnum; i < r->ncols; i++) {
+        int64_t c = order[i];
+        if (pq_chunk_names(r,c,7)) { dba[c] = 1; force_grouped = true; }
+    }
+    if (simp && !dba) { err = ray_error("oom",NULL); goto done; }
     int64_t nd = r->ncols;   /* order[nnum, nd): direct symbol columns, [nd, ncols): grouped */
     bool bounded = false;    /* vocab[] filled (pq_vocab_bounds) */
     bool seed = false;       /* direct columns of a grouped import: pq_seed_dicts */
-    if (mode == PQ_SYM_AUTO && simp) {
+    if (force_grouped) {
+        mode = PQ_SYM_GROUPED;
+        pq_vocab_bounds(r,order,nnum,r->ncols,vocab,donly); bounded = true;
+        /* the direct ones among the columns NOT forced grouped: dictionary
+         * pages and ids only, so their seeding keeps their positions the
+         * workers'.  Unknown memory (sram <= 0) takes every such column, as
+         * the AUTO decision goes direct for everything then. */
+        int64_t sum = 0, ndirect = 0;
+        for (;;) {
+            int64_t best = -1;
+            for (int64_t i = nnum; i < r->ncols; i++) {
+                int64_t c = order[i];
+                if (dba[c] || pick[c] || !donly[c]) continue;
+                if (best < 0 || vocab[c] < vocab[best]) best = c;
+            }
+            if (best < 0) break;
+            if (sram > 0 && (vocab[best] > sram / 64 || vocab[best] > sram / 16 - sum)) break;
+            sum += vocab[best]; pick[best] = 1; ndirect++;
+        }
+        seed = ndirect > 0;
+        /* direct first, each part by size as before (a stable split) */
+        int64_t at = nnum;
+        for (int64_t i = nnum; i < r->ncols; i++) {
+            int64_t c = order[i];
+            if (!pick[c]) continue;
+            for (int64_t j = i; j > at; j--) order[j] = order[j-1];
+            order[at++] = c;
+        }
+        nd = at;
+    } else if (mode == PQ_SYM_AUTO && simp) {
         int64_t text = 0;
         for (int64_t i = nnum; i < r->ncols; i++) text = bytes[order[i]] > INT64_MAX - text ? INT64_MAX : text + bytes[order[i]];
         mode = sram > 0 && text > sram / 4 ? PQ_SYM_GROUPED : PQ_SYM_DIRECT;
@@ -4356,8 +4408,13 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
             g_imp_probe[i].encoding = pq_chunk_value_encoding(r,i);
             g_imp_probe[i].grouped = -1;
         }
+        /* a symbol column reports the path it took, which a forced-grouped
+         * import can differ on from column to column */
         for (int64_t i = nnum; i < r->ncols; i++)
-            if (order[i] < PQ_MAX_COLS) g_imp_probe[order[i]].grouped = i < nd ? 0 : 1;
+            if (order[i] < PQ_MAX_COLS) {
+                g_imp_probe[order[i]].grouped = i < nd ? 0 : 1;
+                g_imp_probe[order[i]].mode = i < nd ? PQ_SYM_DIRECT : PQ_SYM_GROUPED;
+            }
         atomic_store_explicit(&g_imp_probe_n,r->ncols,memory_order_relaxed);
     } else atomic_store_explicit(&g_imp_probe_n,0,memory_order_relaxed);
 #endif
@@ -4638,7 +4695,7 @@ done:
     ray_free_raw(wbf);
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
-    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order);
+    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order); ray_free_raw(dba);
     if (prefetched) ray_free_raw((void*)prefetched);
     for (int64_t i = 0; i < nspare; i++) {
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
