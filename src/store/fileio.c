@@ -301,6 +301,8 @@ extern int syncfs(int fd);   /* glibc declares it under _GNU_SOURCE only */
 #endif
 bool ray_file_sync_tree(const char* root) {
     if (!root) return false;
+    struct stat st;   /* a missing tree is an error even when fsync is off */
+    if (stat(root,&st) != 0) return false;
     if (ray_fsync_disabled()) return true;
 #ifdef __linux__
     int fd = open(root, O_RDONLY);
