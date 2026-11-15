@@ -26,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <assert.h>
 #include <sys/stat.h>
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
 #include <pthread.h>
@@ -6197,13 +6198,19 @@ static void pq_dpb_head(pq_buf* b, int64_t total, int64_t first) {
     pb_var(b, 128); pb_var(b, 4); pb_var(b, (uint64_t)total); pb_zz(b, first);
 }
 static unsigned pq_dpb_width(uint64_t x) { unsigned n = 0; while (x) { n++; x >>= 1; } return n; }
+/* Least-significant-bit-first packing, one bit at a time.  A 64-bit
+ * accumulator cannot hold a wide value shifted by a nonzero bit offset, so
+ * widths above 56 dropped their high bits; the offset is unavoidable in a
+ * miniblock, so the packer emits bits instead of words. */
 static void pq_dpb_pack(pq_buf* b, const uint64_t* v, int n, unsigned width) {
     if (!width) return;
+    assert(width <= 64);
     uint64_t acc = 0; unsigned bits = 0;
-    for (int i = 0; i < n; i++) {
-        acc |= v[i] << bits; bits += width;
-        while (bits >= 8) { pb_byte(b, (uint8_t)acc); acc >>= 8; bits -= 8; }
-    }
+    for (int i = 0; i < n; i++)
+        for (unsigned k = 0; k < width; k++) {
+            acc |= (uint64_t)((v[i] >> k) & 1u) << bits;
+            if (++bits == 8) { pb_byte(b, (uint8_t)acc); acc = 0; bits = 0; }
+        }
     if (bits) pb_byte(b, (uint8_t)acc);
 }
 static void pq_dpb_write(pq_buf* b, const int64_t* v, int n) {
@@ -6211,10 +6218,15 @@ static void pq_dpb_write(pq_buf* b, const int64_t* v, int n) {
     for (int start = 1; start < n; start += 128) {
         int m = n-start < 128 ? n-start : 128;
         int64_t d[128], mn = INT64_MAX;
-        for (int i = 0; i < m; i++) { d[i] = v[start+i]-v[start+i-1]; if (d[i] < mn) mn = d[i]; }
+        /* Wrapping subtraction: an extreme value pair is representable in the
+         * unsigned remainder but not in a signed difference. */
+        for (int i = 0; i < m; i++) {
+            d[i] = (int64_t)((uint64_t)v[start+i] - (uint64_t)v[start+i-1]);
+            if (d[i] < mn) mn = d[i];
+        }
         pb_zz(b, mn);
         uint64_t rem[128]; unsigned width[4] = {0,0,0,0};
-        for (int i = 0; i < m; i++) rem[i] = (uint64_t)(d[i]-mn);
+        for (int i = 0; i < m; i++) rem[i] = (uint64_t)d[i] - (uint64_t)mn;
         for (int mi = 0; mi < 4; mi++) {
             uint64_t mx = 0;
             for (int i = mi*32; i < m && i < mi*32+32; i++) if (rem[i] > mx) mx = rem[i];
@@ -6242,6 +6254,44 @@ static void pq_ids_packed(pq_buf* b, const uint8_t* ids, int n, unsigned width) 
     for (int g = 0; g < groups; g++)
         for (int i = 0; i < 8; i++) v[cnt++] = ids[g*8+i < n ? g*8+i : n-1];
     pq_dpb_pack(b, v, cnt, width);   /* the bit packer is encoding-agnostic */
+}
+/* A one-page INT64 DELTA file whose stream the packer builds; the decoded
+ * values must match.  Width 63 crosses byte boundaries and width 64 fills a
+ * miniblock, so both reach the packer's full-width path. */
+static bool pq_dpb_width_case(const char* tag, const int64_t* v, int n, const int64_t* want) {
+    pq_buf s = {0};
+    pq_dpb_write(&s, v, n);
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-dpb-%s-%d.parquet", tag, (int)getpid());
+    bool ok = pq_delta_synth(path, 2, s.p, s.n, n);
+    ray_sys_free(s.p);
+    ray_error_clear();
+    ray_t* t = ok ? ray_parquet_read(path, NULL) : NULL;
+    ok = ok && t && !RAY_IS_ERR(t) && ray_table_nrows(t) == n;
+    if (ok) {
+        ray_t* col = ray_table_get_col_idx(t, 0);
+        const int64_t* got = (const int64_t*)ray_data(col);
+        for (int i = 0; i < n; i++)
+            if (got[i] != want[i]) {
+                fprintf(stderr, "  dpb %s row %d: %lld want %lld\n", tag, i,
+                        (long long)got[i], (long long)want[i]);
+                ok = false;
+            }
+    } else if (t && RAY_IS_ERR(t)) {
+        fprintf(stderr, "  dpb %s: %s / %s\n", tag,
+                ray_err_code(t) ? ray_err_code(t) : "(no code)",
+                ray_error_msg() ? ray_error_msg() : "(no message)");
+    }
+    if (t) { if (RAY_IS_ERR(t)) ray_error_free(t); else ray_release(t); }
+    unlink(path);
+    return ok;
+}
+static test_result_t test_pq_delta_dpb_width(void) {
+    static const int64_t v63[] = {0, 0, INT64_MAX};
+    static const int64_t v64[] = {0, INT64_MIN, -1};
+    TEST_ASSERT_TRUE(pq_dpb_width_case("w63", v63, 3, v63));
+    TEST_ASSERT_TRUE(pq_dpb_width_case("w64", v64, 3, v64));
+    PASS();
 }
 static void pq_page_v1(pq_buf* f, const pq_buf* body, int encoding, int64_t rows) {
     int last = 0;
@@ -7104,6 +7154,7 @@ static test_result_t test_pq_delta_symbol_mixed(void) {
 }
 const test_entry_t parquet_entries[] = {
     {"parquet/delta_binary_packed",test_pq_delta_binary_packed,pq_setup,pq_teardown},
+    {"parquet/delta_dpb_width",test_pq_delta_dpb_width,pq_setup,pq_teardown},
     {"parquet/delta_strings",test_pq_delta_strings,pq_setup,pq_teardown},
     {"parquet/delta_transitions",test_pq_delta_transitions,pq_setup,pq_teardown},
     {"parquet/delta_symbol_import",test_pq_delta_symbol_import,pq_setup,pq_teardown},
