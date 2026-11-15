@@ -6319,7 +6319,8 @@ static void pq_plain_str(pq_buf* b, const char* s) {
     pb_bytes(b, &n, 4); pb_bytes(b, s, n);
 }
 /* A one-column file whose single chunk holds a dictionary page and the given
- * v1 data pages in order: the PLAIN/dictionary/DELTA transitions. */
+ * v1 data pages in order: dictionary, PLAIN, DELTA, dictionary again, then
+ * PLAIN, so both transition directions are decoded. */
 static bool pq_write_transitions(const char* path) {
     pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
     int64_t dict_off = (int64_t)f.n;
@@ -6337,11 +6338,16 @@ static bool pq_write_transitions(const char* path) {
       pq_dpb_write(&b, pre, 4); pq_dpb_write(&b, suf, 4);
       pb_bytes(&b, "alphaX", 6); pb_bytes(&b, "Y", 1); pb_bytes(&b, "betaZ", 5); pb_bytes(&b, "W", 1);
       pq_page_v1(&f, &b, 7, 4); ray_sys_free(b.p); }
+    /* A dictionary data page after the DELTA page: leaving DELTA state for the
+     * seeded dictionary ids. */
+    { pq_buf b = {0}; pq_levels_all(&b, 4); pb_byte(&b, 1);
+      static const uint8_t ids[] = {1,0,1,0}; pq_ids_packed(&b, ids, 4, 1);
+      pq_page_v1(&f, &b, 8, 4); ray_sys_free(b.p); }
     { pq_buf b = {0}; pq_levels_all(&b, 2);
       pq_plain_str(&b, "tail1"); pq_plain_str(&b, "tail2");
       pq_page_v1(&f, &b, 0, 2); ray_sys_free(b.p); }
     int64_t size = (int64_t)f.n - dict_off;
-    int64_t footer = (int64_t)f.n, rows = 14;
+    int64_t footer = (int64_t)f.n, rows = 18;
     int last = 0;
     pb_i(&f, &last, 1, PB_I32, 1);
     pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
@@ -6504,7 +6510,8 @@ static bool pq_transitions_check(int64_t batch) {
     snprintf(path, sizeof(path), "/tmp/rayforce-pq-transitions-%d.parquet", (int)getpid());
     if (!pq_write_transitions(path)) return false;
     static const char* want[] = {"alpha","beta","alpha","beta","plain","x","plain","x",
-                                 "alphaX","alphaY","betaZ","betaW","tail1","tail2"};
+                                 "alphaX","alphaY","betaZ","betaW",
+                                 "beta","alpha","beta","alpha","tail1","tail2"};
     ray_parquet_t* r = NULL;
     ray_t* err = ray_parquet_open(path, NULL, batch, &r);
     bool ok = !err;
@@ -6520,15 +6527,15 @@ static bool pq_transitions_check(int64_t batch) {
         ray_t* col = ray_table_get_col_idx(t, 0);
         for (int64_t i = 0; ok && i < ray_table_nrows(t); i++, at++) {
             size_t n = 0; const char* p = ray_str_vec_get(col, i, &n);
-            if (at >= 14 || n != strlen(want[at]) || (n && memcmp(p, want[at], n))) {
+            if (at >= 18 || n != strlen(want[at]) || (n && memcmp(p, want[at], n))) {
                 fprintf(stderr, "  transitions row %lld: %.*s want %s\n", (long long)at,
-                        (int)n, p ? p : "", at < 14 ? want[at] : "?");
+                        (int)n, p ? p : "", at < 18 ? want[at] : "?");
                 ok = false;
             }
         }
         ray_release(t);
     }
-    if (ok && at != 14) { fprintf(stderr, "  transitions rows %lld/14\n", (long long)at); ok = false; }
+    if (ok && at != 18) { fprintf(stderr, "  transitions rows %lld/18\n", (long long)at); ok = false; }
     if (r) ray_parquet_close(r);
     unlink(path);
     return ok;
