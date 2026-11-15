@@ -28,6 +28,10 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "fileio.h"
+#ifdef __linux__
+#include <sys/utsname.h>
+#include <stdio.h>
+#endif
 
 #include <limits.h>
 
@@ -297,14 +301,27 @@ ray_err_t ray_file_sync_dir(const char* path) {
 }
 
 #ifdef __linux__
-extern int syncfs(int fd);   /* glibc declares it under _GNU_SOURCE only */
+/* syncfs reports a writeback error only from Linux 5.8; before, it fails for a
+ * bad descriptor alone, and a lost write would go unseen. */
+static bool sync_tree_reports_errors(void) {
+    struct utsname u;
+    int major = 0, minor = 0;
+    if (uname(&u) != 0 || sscanf(u.release,"%d.%d",&major,&minor) != 2) return false;
+    return major > 5 || (major == 5 && minor >= 8);
+}
 #endif
+/* Flush everything written under root with one call, where that call reports
+ * a failed write. False: not done, the caller syncs each file (a missing tree,
+ * an old kernel, another OS). */
 bool ray_file_sync_tree(const char* root) {
     if (!root) return false;
     struct stat st;   /* a missing tree is an error even when fsync is off */
     if (stat(root,&st) != 0) return false;
     if (ray_fsync_disabled()) return true;
 #ifdef __linux__
+    static int reports = -1;   /* a benign race: every thread computes the same */
+    if (reports < 0) reports = sync_tree_reports_errors();
+    if (!reports) return false;
     int fd = open(root, O_RDONLY);
     if (fd < 0) return false;
     int rc = syncfs(fd);
