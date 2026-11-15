@@ -127,7 +127,7 @@ Identifies which columns are actually needed by the query and pushes projection 
 
 ### 9. Partition Pruning
 
-For partitioned tables, analyzes filter predicates to determine which partitions can be skipped entirely. A predicate like `date > '2024-01-01'` on a date-partitioned table eliminates all partition directories before that date without scanning them. The pruning pass produces a `seg_mask` bitmap that the executor uses during [block offloading](offloading.md) to skip pruned segments entirely.
+For partitioned tables, derives a necessary mask from supported literal predicates on the partition key and checks whether the remaining query shape is local to the retained partitions. Unsupported or nonlocal shapes keep the original source. The residual filter still runs; this is not a universal physical-I/O guarantee. See [Partition Pruning](../storage/index.md#partition-pruning) for supported forms and proof limits, and [block offloading](offloading.md) for later segment work.
 
 ### 10. Dead Code Elimination (DCE)
 

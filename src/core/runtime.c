@@ -22,6 +22,7 @@
  */
 
 #include "runtime.h"
+#include "core/platform.h"   /* ray_file_writeback_errors — the writeback thread joined */
 #include "core/profile.h"   /* g_ray_profile rings — dropped on destroy */
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -484,6 +485,9 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     ray_parted_cache_clear();
     ray_sym_destroy();
     ray_heap_destroy();
+
+    /* the writebacks the runtime handed over served, their thread joined */
+    (void)ray_file_writeback_errors();
 
     ray_sys_free(rt);
 }
