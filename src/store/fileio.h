@@ -62,6 +62,11 @@ bool ray_fsync_disabled(void);
 int  ray_fsync_fd(int fd);
 #endif
 ray_err_t ray_file_sync_dir(const char* path);
+/* Flush everything written under root with one call, where the host can: the
+ * whole filesystem holding root (Linux syncfs). True when it did, false where it
+ * cannot (other hosts, a bad path, a failed flush), so the caller falls back to
+ * syncing each file. True without flushing under ray_fsync_disabled(). */
+bool ray_file_sync_tree(const char* root);
 ray_err_t ray_file_rename(const char* old_path, const char* new_path);
 /* Publish a new path without replacing any existing destination, including
  * an empty directory.  Uses the host's no-replace rename; where the host or

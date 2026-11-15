@@ -390,6 +390,20 @@ static test_result_t test_pq_lz4_multichunk(void) {
     char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial); pq_rm_rf(root);
     PASS();
 }
+/* A staged import tree is flushed with one call where the host has one (Linux
+ * syncfs), and a bad path is refused, so the caller falls back to syncing each
+ * file. */
+static test_result_t test_pq_sync_tree(void) {
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-sync-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(mkdir(dir,0755),0);
+#ifdef __linux__
+    TEST_ASSERT_TRUE(ray_file_sync_tree(dir));
+#endif
+    TEST_ASSERT_FALSE(ray_file_sync_tree("/nonexistent-rayforce-dir/x"));
+    TEST_ASSERT_FALSE(ray_file_sync_tree(NULL));
+    rmdir(dir);
+    PASS();
+}
 static test_result_t test_pq_matrix(void) {
     const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
                            FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet",FIX "flat-5raw-v1.parquet",FIX "flat-5raw-v2.parquet"};
@@ -5347,6 +5361,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/decimal",test_pq_decimal,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
+    {"parquet/sync_tree",test_pq_sync_tree,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

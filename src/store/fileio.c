@@ -148,6 +148,12 @@ ray_err_t ray_file_sync_dir(const char* path) {
     return RAY_OK;
 }
 
+bool ray_file_sync_tree(const char* root) {
+    /* FlushFileBuffers is per handle: no one-call equivalent. */
+    (void)root;
+    return false;
+}
+
 ray_err_t ray_file_rename(const char* old_path, const char* new_path) {
     if (!old_path || !new_path) return RAY_ERR_IO;
     /* MOVEFILE_WRITE_THROUGH flushes the rename to disk before returning,
@@ -288,6 +294,23 @@ ray_err_t ray_file_sync_dir(const char* path) {
     int rc = fsync(fd);
     close(fd);
     return (rc == 0) ? RAY_OK : RAY_ERR_IO;
+}
+
+#ifdef __linux__
+extern int syncfs(int fd);   /* glibc declares it under _GNU_SOURCE only */
+#endif
+bool ray_file_sync_tree(const char* root) {
+    if (!root) return false;
+    if (ray_fsync_disabled()) return true;
+#ifdef __linux__
+    int fd = open(root, O_RDONLY);
+    if (fd < 0) return false;
+    int rc = syncfs(fd);
+    close(fd);
+    return rc == 0;
+#else
+    return false;
+#endif
 }
 
 ray_err_t ray_file_rename(const char* old_path, const char* new_path) {

@@ -2125,6 +2125,11 @@ static ray_t* pq_publish(const char* staging, const char* root, int64_t rows) {
     return ray_i64(rows);
 }
 static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char* table, int64_t parts) {
+    /* One flush of the staged tree where the host has one: a table of many small
+     * files otherwise spends its time in thousands of sequential fsyncs (14,900
+     * for 16 million rows in 1,145 files, about 55 s). Publication still syncs the
+     * staging root and renames it into place. */
+    if (ray_file_sync_tree(root)) return NULL;
     char path[1600], leaf[1400];
     for (int64_t part = 0; part < parts; part++) {
         if (ray_interrupted()) return ray_error("cancel","parquet conversion interrupted");
