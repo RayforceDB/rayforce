@@ -251,8 +251,8 @@ static bool pq_lz4_extend(const uint8_t** ip, const uint8_t* end, size_t* n) {
  * and the match; the last sequence holds literals only. Exact input and
  * output lengths required, like ray_parquet_snappy. */
 bool ray_parquet_lz4(const uint8_t* src, size_t len, uint8_t* dst, size_t size) {
-    const uint8_t* ip = src, *end = src+len; size_t at = 0;
     if (!len) return !size;
+    const uint8_t* ip = src, *end = src+len; size_t at = 0;
     for (;;) {
         if (ip == end) return false;
         unsigned token = *ip++;
