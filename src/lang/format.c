@@ -242,6 +242,10 @@ const char* ray_type_name(int8_t type) {
     case RAY_DICT:      return "DICT";
     case RAY_LIST:      return "LIST";
     case RAY_INDEX:     return "INDEX";
+    case RAY_LAMBDA:    return "LAMBDA";
+    case RAY_UNARY:     return "UNARY";
+    case RAY_BINARY:    return "BINARY";
+    case RAY_VARY:      return "VARY";
     default:            return "?";
     }
 }
