@@ -4225,6 +4225,22 @@ static void par_binary_str_fn(void* ctx, uint32_t worker_id, int64_t start, int6
 #define BR_INT_VEC(t) ((t) == RAY_I64 || (t) == RAY_TIMESTAMP || (t) == RAY_I32 || \
                        (t) == RAY_DATE || (t) == RAY_TIME || (t) == RAY_I16 || (t) == RAY_U8)
 
+/* A byte column against a scalar that fits a byte. Its own function, with the
+ * source and destination restrict-qualified: inside binary_range both are
+ * uint8_t* the compiler cannot prove disjoint, and whether it vectorises the
+ * loop then depends on the rest of that function. */
+__attribute__((noinline)) static void br_u8_scalar(const uint8_t* restrict d, uint8_t* restrict o,
+                                                   int64_t n, uint8_t cvt, uint16_t opc) {
+    switch (opc) {
+    case OP_EQ: for (int64_t i = 0; i < n; i++) o[i] = (d[i] == cvt); break;
+    case OP_NE: for (int64_t i = 0; i < n; i++) o[i] = (d[i] != cvt); break;
+    case OP_LT: for (int64_t i = 0; i < n; i++) o[i] = (d[i] <  cvt); break;
+    case OP_LE: for (int64_t i = 0; i < n; i++) o[i] = (d[i] <= cvt); break;
+    case OP_GT: for (int64_t i = 0; i < n; i++) o[i] = (d[i] >  cvt); break;
+    case OP_GE: for (int64_t i = 0; i < n; i++) o[i] = (d[i] >= cvt); break;
+    }
+}
+
 static void binary_range(ray_op_t* op, int8_t out_type,
                          ray_t* lhs, ray_t* rhs, ray_t* result, void* rdata,
                          bool l_scalar, bool r_scalar,
@@ -4338,7 +4354,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             }
             return;
         } else if (l_esz == 1) {
-            if (cv >= 0 && cv <= UINT8_MAX) BR_FAST(uint8_t, d[i]);
+            if (cv >= 0 && cv <= UINT8_MAX) br_u8_scalar((const uint8_t*)lbase, odst, n, (uint8_t)cv, opc);
             else BR_FAST_WIDE(uint8_t);
             return;
         }
