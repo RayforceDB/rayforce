@@ -325,6 +325,21 @@ typedef struct {
     uint32_t value;
     unsigned width;
 } pq_rle;
+/* DELTA_BINARY_PACKED decode state. The raw code stays in c->encoding; this
+ * state is reset at every data page and advances one value at a time. */
+typedef struct {
+    pq_cur c;                 /* the value stream, advanced as bodies are taken */
+    const uint8_t* widths;    /* the current block's miniblock width bytes */
+    const uint8_t* body;      /* the current miniblock body */
+    uint64_t block_size, miniblocks, per_block;
+    uint64_t total, read;     /* header count, values produced */
+    uint64_t block_left;      /* deltas left in this block */
+    uint64_t mini;            /* next miniblock in this block */
+    uint64_t body_left, bit;  /* position in the current miniblock body */
+    int64_t last, min_delta;
+    unsigned width;
+    bool active;
+} pq_delta;
 static bool pq_rle_next(pq_rle* r, uint32_t* out) {
     if (!r->left) {
         uint64_t h = pq_var(&r->c);
@@ -351,7 +366,10 @@ static bool pq_rle_next(pq_rle* r, uint32_t* out) {
     r->left--; return true;
 }
 static bool pq_rle_done(const pq_rle* r) {
-    return !r->c.bad && r->c.p == r->c.end && (!r->left || (r->packed && r->left < 8));
+    /* A bit-packed run may over-declare its last group: the page's row count
+     * bounds decoding, so values left in the final run are padding (the spec
+     * pads to 8; some writers pad to the whole run, DuckDB among them). */
+    return !r->c.bad && r->c.p == r->c.end && (!r->left || r->packed);
 }
 #if defined(DEBUG)
 /* Test seams for the certification phase: the nth coarse checkpoint from now
@@ -364,6 +382,17 @@ void ray_parquet_test_cert_interrupt_after(int64_t nth) {
 }
 int64_t ray_parquet_test_cert_levels(void) {
     return atomic_load_explicit(&g_cert_levels,memory_order_relaxed);
+}
+/* Test seams for the DELTA value phase: the nth coarse checkpoint from now
+ * on requests an interrupt (0 disables), and the last interrupted phase's
+ * decoded count shows how far it ran. Debug builds only. */
+static _Atomic(int64_t) g_delta_interrupt_after;
+static _Atomic(int64_t) g_delta_values;
+void ray_parquet_test_delta_interrupt_after(int64_t nth) {
+    atomic_store_explicit(&g_delta_interrupt_after,nth,memory_order_relaxed);
+}
+int64_t ray_parquet_test_delta_values(void) {
+    return atomic_load_explicit(&g_delta_values,memory_order_relaxed);
 }
 #endif
 /* Every one of the next `n` definition levels is present. The cursor advances
@@ -434,7 +463,89 @@ typedef struct {
     bool lz4_multichunk;   /* the last page failed to unpack and looks like a multi-chunk LZ4 frame */
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
+    pq_delta delta;
 } pq_column;
+
+/* Read one value from the page's DELTA_BINARY_PACKED stream, reconstructing
+ * the two's-complement wrapping values of the physical type. The stream is
+ * consumed lazily: only the miniblocks whose values are asked for are read.
+ * Coarse checkpoints every 4096 values bound the work between interrupts. */
+static const char* pq_delta_next(pq_delta* d, const pq_schema* s, int64_t* out) {
+    if (d->read >= d->total) return "delta value count exceeds the stream header";
+    if (!(d->read & 4095)) {
+        if (ray_interrupted()) return "scan interrupted";
+#if defined(DEBUG)
+        int64_t k = atomic_load_explicit(&g_delta_interrupt_after,memory_order_relaxed);
+        while (k > 0 && !atomic_compare_exchange_weak(&g_delta_interrupt_after,&k,k-1)) {}
+        if (k == 1) ray_request_interrupt();
+#endif
+        if (ray_interrupted()) {
+#if defined(DEBUG)
+            atomic_store_explicit(&g_delta_values,d->read,memory_order_relaxed);
+#endif
+            return "scan interrupted";
+        }
+    }
+    if (d->read++ == 0) { *out = d->last; return NULL; }
+    if (!d->block_left) {
+        d->min_delta = pq_int(&d->c);
+        if (d->c.bad) return "truncated delta block header";
+        if (!pq_take(&d->c,d->miniblocks,&d->widths)) return "truncated delta miniblock widths";
+        d->block_left = d->block_size; d->mini = 0; d->body_left = 0;
+    }
+    if (!d->body_left) {
+        if (d->mini >= d->miniblocks) return "truncated delta miniblock";
+        d->width = d->widths[d->mini++];
+        if (d->width > (s->physical == 1 ? 32u : 64u)) return "invalid delta bit width";
+        uint64_t bytes = ((uint64_t)d->width*d->per_block + 7)/8;
+        if (!pq_take(&d->c,bytes,&d->body)) return "truncated delta miniblock";
+        d->body_left = d->per_block; d->bit = 0;
+    }
+    uint64_t rem = 0;
+    if (d->width) {
+        const uint8_t* p = d->body + (d->bit >> 3);
+        unsigned off = (unsigned)(d->bit & 7);
+        unsigned nb = (off + d->width + 7)/8;
+        uint64_t lo = 0;
+        for (unsigned i = 0; i < nb && i < 8; i++) lo |= (uint64_t)p[i] << (8*i);
+        rem = lo >> off;
+        if (nb > 8) rem |= (uint64_t)p[8] << (64 - off);
+        if (d->width < 64) rem &= (UINT64_C(1) << d->width) - 1;
+    }
+    d->bit += d->width; d->body_left--; d->block_left--;
+    uint64_t delta = (uint64_t)d->min_delta + rem;
+    if (s->physical == 1) { uint32_t v = (uint32_t)d->last + (uint32_t)delta; d->last = (int32_t)v; }
+    else { uint64_t v = (uint64_t)d->last + delta; d->last = (int64_t)v; }
+    *out = d->last;
+    return NULL;
+}
+/* The page's stream header: block size, miniblock count, total value count
+ * and the first value. The bodies are read on demand. */
+static const char* pq_delta_init(pq_delta* d, const pq_schema* s, pq_cur* v) {
+    memset(d,0,sizeof(*d));
+    d->c = *v;
+    uint64_t block = pq_var(&d->c), minis = pq_var(&d->c), total = pq_var(&d->c);
+    d->last = pq_int(&d->c);
+    if (d->c.bad) return "truncated delta header";
+    if (!block || block % 128 || block > INT32_MAX || !minis || minis > block ||
+        block % minis || !(block/minis) || (block/minis) % 32) return "invalid delta block size";
+    d->block_size = block; d->miniblocks = minis; d->per_block = block/minis;
+    d->total = total; d->active = true;
+    if (s->physical != 1 && s->physical != 2) return "unsupported value encoding (supported: plain, dictionary, RLE booleans, delta binary packed)";
+    return NULL;
+}
+/* Page exhaustion: the decoded count is the header's total (the present
+ * values), and the stream ends at the page boundary after the permitted
+ * miniblock padding. */
+static const char* pq_delta_done(pq_column* c) {
+    pq_delta* d = &c->delta;
+    if (!d->active) return NULL;
+    c->values = d->c;
+    if (d->read != d->total)
+        return d->read < d->total ? "truncated delta values" : "delta value count exceeds the stream header";
+    if (c->values.p != c->values.end) return "excess delta values";
+    return NULL;
+}
 /* A cursor is used by one decoder at a time. Flush each PLAIN batch before
  * advancing pages, so dictionary decoding may reuse the same heap scratch. */
 static pq_symbol_scratch* pq_symbols(pq_column* c) {
@@ -930,6 +1041,7 @@ static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
         c->chunk = (pq_cur){r->map+offset,r->map+offset+bytes,false};
         c->codec = (int)codec; c->page_left = 0; c->chunk_left = r->group_left;
         c->have_dict = false; c->dict_count = 0; c->optional = r->schema[r->selected[i]].optional;
+        c->delta.active = false;
         ray_free_raw(c->strings); c->strings = NULL;
         ray_free_raw(c->symbol_ids); c->symbol_ids = NULL;
     }
@@ -1040,6 +1152,7 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
     while (c->chunk.p < c->chunk.end) {
         pq_span f[10];
         c->page_all_present = false;
+        c->delta.active = false;
         int64_t raw, size;
         const uint8_t* payload;
         const char* perr = pq_page_take(&c->chunk,f,&raw,&size,&payload);
@@ -1097,8 +1210,18 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
             c->bool_rle = true; c->encoding = 0; c->page_left = count;
             return NULL;
         }
-        if (encoding != 0 && encoding != 2 && encoding != 8) return "unsupported value encoding (supported: plain, dictionary, RLE booleans)";
+        /* Stage 1 admits DELTA_BINARY_PACKED on INT32 and INT64 columns only. */
+        bool delta = encoding == 5;
+        if (delta && s->physical != 1 && s->physical != 2)
+            return "unsupported value encoding (supported: plain, dictionary, RLE booleans, delta binary packed)";
+        if (encoding != 0 && encoding != 2 && encoding != 8 && !delta)
+            return "unsupported value encoding (supported: plain, dictionary, RLE booleans, delta binary packed)";
         c->encoding = (int)encoding; c->page_left = count;
+        if (delta) {
+            const char* derr = pq_delta_init(&c->delta,s,&c->values);
+            if (derr) return derr;
+            return NULL;
+        }
         if (!encoding && c->optional && pq_optional_bulk(s)) {
             int64_t reach = skip ? *skip : admit;
             if (reach > count) reach = count;
@@ -1284,6 +1407,14 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
         int64_t n = rows-at < c->page_left ? rows-at : c->page_left, count = 0;
         if (n > 8192) n = 8192;
         for (int64_t i = 0; i < n; i++) {
+            if (c->delta.active) {
+                uint32_t present = 1;
+                if (c->optional && (!pq_rle_next(&c->defs,&present) || present > 1)) return "invalid definition levels";
+                if (!present) { dst[at+i] = 0; v->attrs |= RAY_ATTR_HAS_NULLS; c->page_nulls++; continue; }
+                /* Stage 1 admits DELTA on INT32/INT64 columns only; a symbol
+                 * column cannot carry this encoding (the page gate refuses it). */
+                return "unsupported value encoding (delta on a symbol column)";
+            }
             if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
                 uint32_t id = c->ids.value;
                 if (id >= c->dict_count || !c->symbol_ids) return "invalid symbol dictionary index";
@@ -1328,7 +1459,8 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
         if (!c->page_left) {
             if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
-            if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
+            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
             else if (c->values.p != c->values.end) return "excess string values";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }
@@ -1344,7 +1476,24 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
     for (int64_t i = 0; i < rows; i++) {
         if (!(i&1023) && ray_interrupted()) return "scan interrupted";
         if (!c->page_left) { const char* err = pq_page(c,s,NULL,rows-i); if (err) return err; }
-        if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
+        if (c->delta.active) {
+            uint32_t present = 1;
+            if (c->optional && (!pq_rle_next(&c->defs,&present) || present > 1)) return "invalid definition levels";
+            if (!present) {
+                if (ray_vec_set_null_checked(v,i,true) != RAY_OK) return "unrepresentable null";
+                c->page_nulls++;
+            } else {
+                int64_t x;
+                const char* derr = pq_delta_next(&c->delta,s,&x);
+                if (derr) return derr;
+                uint8_t buf[8];
+                if (s->physical == 1) { int32_t y = (int32_t)x; memcpy(buf,&y,4); }
+                else memcpy(buf,&x,8);
+                const char* perr = pq_put_value(&v,i,s,buf,s->physical == 1 ? 4 : 8);
+                if (perr) return perr;
+                *out = v;
+            }
+        } else if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
             uint32_t id = c->ids.value;
             if (id >= c->dict_count) return "dictionary index out of range";
             int64_t n = rows-i < c->page_left ? rows-i : c->page_left;
@@ -1441,7 +1590,8 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
         if (!c->page_left) {
             if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
-            if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
+            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
             else if (c->bool_rle) { if (!pq_rle_done(&c->ids)) return "excess RLE boolean data"; }
             else if (s->physical == 0) { if ((c->bool_bit+7)/8 != (uint64_t)(c->values.end-c->values.p)) return "excess boolean data"; }
             else if (c->values.p != c->values.end) return "excess plain data";
@@ -2382,6 +2532,41 @@ static int pq_value_pages(pq_span stats) {
     }
     return any;
 }
+#if defined(DEBUG)
+/* The value encoding named by a column chunk's encoding stats (the first
+ * code that is not an index, level or dictionary encoding), -1 when it
+ * cannot be read. The import-decision seam reports it; page headers are
+ * parsed later, so the footer's list is what the decision point can see. */
+static int64_t pq_chunk_value_encoding(ray_parquet_t* r, int64_t c) {
+    pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
+    int64_t rows = 0, enc = -1;
+    if (cols && r->ngroups > 0 && c >= 0 && c < r->ncols && pq_group_columns(r,0,cols,&rows,NULL)) {
+        pq_span mf[17];
+        if (pq_fields(cols[c],mf,17) && mf[13].type == 9) {
+            pq_cur p = {mf[13].p,mf[13].end,false}; uint8_t et;
+            uint64_t n = pq_list(&p,&et);
+            if (!p.bad && et == 4) for (uint64_t i = 0; i < n && !p.bad; i++) {
+                int64_t e = pq_int(&p);
+                if (e != 0 && e != 2 && e != 3 && e != 8) { enc = e; break; }
+            }
+        }
+    }
+    ray_free_raw(cols);
+    return enc;
+}
+/* Test seam: the import decision's chosen mode, and per column the value
+ * encoding its chunk metadata names and whether the column went grouped.
+ * Filled where the mode is final (before any pass); debug builds only. */
+typedef struct { int64_t mode, encoding, grouped; } pq_imp_probe;
+static pq_imp_probe g_imp_probe[PQ_MAX_COLS];
+static _Atomic(int64_t) g_imp_probe_n;
+void ray_parquet_test_import_seam(int64_t col, int64_t* mode, int64_t* encoding, int64_t* grouped) {
+    int64_t n = atomic_load_explicit(&g_imp_probe_n,memory_order_relaxed);
+    if (!mode || !encoding || !grouped) return;
+    if (col < 0 || col >= n) { *mode = *encoding = *grouped = -1; return; }
+    *mode = g_imp_probe[col].mode; *encoding = g_imp_probe[col].encoding; *grouped = g_imp_probe[col].grouped;
+}
+#endif
 /* Sums and products of a footer's sizes, which are the file's word: never
  * negative, saturating at INT64_MAX instead of wrapping. */
 static inline int64_t pq_sat_add(int64_t a, int64_t b) {
@@ -3203,6 +3388,13 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
         int64_t n = rows-at < c->page_left ? rows-at : c->page_left;
         for (int64_t i = 0; i < n; i++) {
             uint32_t local;
+            if (c->delta.active) {
+                uint32_t present = 1;
+                if (c->optional && (!pq_rle_next(&c->defs,&present) || present > 1)) return "invalid definition levels";
+                if (!present) { c->page_nulls++; if (!pq_g_emit(k,0,1)) return "symbol code write failed"; continue; }
+                /* Stage 1 admits DELTA on INT32/INT64 columns only. */
+                return "unsupported value encoding (delta on a symbol column)";
+            }
             if (!c->optional && c->encoding && c->ids.left && !c->ids.packed) {
                 uint32_t id = c->ids.value;
                 if (id >= c->dict_count || !k->dmapped) return "invalid symbol dictionary index";
@@ -3235,7 +3427,8 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
         if (!c->page_left) {
             if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
-            if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
+            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
             else if (c->values.p != c->values.end) return "excess string values";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }
@@ -3897,6 +4090,18 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         grouped = true;
         if (nd == r->ncols) nd = nnum;   /* forced: every symbol column grouped */
     } else nd = r->ncols;
+#if defined(DEBUG)
+    if (simp) {
+        for (int64_t i = 0; i < r->ncols && i < PQ_MAX_COLS; i++) {
+            g_imp_probe[i].mode = (int64_t)mode;
+            g_imp_probe[i].encoding = pq_chunk_value_encoding(r,i);
+            g_imp_probe[i].grouped = -1;
+        }
+        for (int64_t i = nnum; i < r->ncols; i++)
+            if (order[i] < PQ_MAX_COLS) g_imp_probe[order[i]].grouped = i < nd ? 0 : 1;
+        atomic_store_explicit(&g_imp_probe_n,r->ncols,memory_order_relaxed);
+    } else atomic_store_explicit(&g_imp_probe_n,0,memory_order_relaxed);
+#endif
     int64_t seeded = -1, seed0 = 0;   /* the trace's: the dictionary's count after the seeding, and before */
     if (seed) {
         int64_t ts = trace ? ray_profile_now_ns() : 0, entries = 0;
