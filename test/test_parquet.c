@@ -6463,6 +6463,17 @@ static test_result_t test_pq_delta_errors(void) {
         s.n = 0;
         pq_dpb_head(&s, 1, 0); pq_dpb_head(&s, 2, 0);
         TEST_ASSERT_TRUE(pq_delta_error_enc("dba-counts", 2, s.p, s.n, 6, 7, "invalid delta length count"));
+        /* A stream header whose total exceeds the page row count: the
+         * load-time dpre/dlen count checks, one case each. */
+        s.n = 0;
+        pq_delta_head(&s, 2);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-over", 1, s.p, s.n, 6, 6, "invalid delta length count"));
+        s.n = 0;
+        pq_delta_head(&s, 2);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-pre-over", 1, s.p, s.n, 6, 7, "invalid delta length count"));
+        s.n = 0;
+        pq_delta_head(&s, 1); pq_delta_head(&s, 2);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-suf-over", 1, s.p, s.n, 6, 7, "invalid delta length count"));
         s.n = 0;
         pq_dpb_head(&s, 1, 0); pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x7f);
         TEST_ASSERT_TRUE(pq_delta_error_enc("dba-trail", 1, s.p, s.n, 6, 7, "excess delta values"));
