@@ -6617,7 +6617,37 @@ static test_result_t test_pq_delta_symbol_import(void) {
  * whole pages) and `name` BYTE_ARRAY DELTA_BYTE_ARRAY on a 700-row page grid.
  * A range read skips pages without decoding, then decodes intermediate pages,
  * so both codecs' page state resets across the skipped pages; the off-grid
- * `name` pages make pq_discard drop a PARTIAL page, advancing DBA history. */
+ * `name` pages make pq_discard drop a PARTIAL page, advancing DBA history.
+ * Each name page starts a chain and every later value reuses a nonzero
+ * prefix of the previous one, so a decoder that loses the chain across that
+ * partial discard yields wrong text (or a prefix error). */
+
+/* Row i's value in that chain: the previous value's first k bytes plus a
+ * four-digit suffix, with k a function of i.  `page_first` resets the chain
+ * (its value has prefix 0).  Writes through val and returns the new length;
+ * `pre` and `suf` are what the DELTA streams record. */
+static int pq_skip_step(int64_t i, int64_t page_first, char* val, size_t prev_len,
+                        int64_t* pre, int64_t* suf) {
+    int k = i == page_first ? 0 : 6 + (int)(i % 9);
+    if ((size_t)k > prev_len) k = (int)prev_len;
+    char suffix[8];
+    int sl = snprintf(suffix, sizeof(suffix), "%04d", (int)(i % 10000));
+    memcpy(val + k, suffix, (size_t)sl);
+    *pre = k; *suf = sl;
+    return k + sl;
+}
+/* The value a correct reader returns for row `row` of that chain. */
+static bool pq_skip_row_value(int64_t row, char* out, size_t cap, size_t* out_len) {
+    int64_t first = row - row % 700;   /* the fixture's name page grid */
+    char val[32]; size_t len = 0;
+    for (int64_t i = first; i <= row; i++) {
+        int64_t k, sl;
+        len = (size_t)pq_skip_step(i, first, val, len, &k, &sl);
+    }
+    if (len + 1 > cap) return false;
+    memcpy(out, val, len); out[len] = 0; *out_len = len;
+    return true;
+}
 static bool pq_write_skip(const char* path) {
     enum { PAGES = 10, ROWS = 1000, TOTAL = PAGES*ROWS };
     int64_t page_off[PAGES], page_sz[PAGES];
@@ -6639,12 +6669,19 @@ static bool pq_write_skip(const char* path) {
     for (int64_t first = 0; first < TOTAL; ) {
         int64_t n = TOTAL-first < 700 ? TOTAL-first : 700;
         int64_t pre[700], suf[700];
-        for (int64_t i = 0; i < n; i++) { pre[i] = 0; suf[i] = 8; }
         pq_buf body = {0};
-        pq_dpb_write(&body, pre, (int)n); pq_dpb_write(&body, suf, (int)n);
+        char val[32]; size_t len = 0;
         for (int64_t i = 0; i < n; i++) {
-            char s[32]; snprintf(s, sizeof(s), "row_%04d", (int)(first+i));
-            pb_bytes(&body, s, 8);
+            int64_t k, sl;
+            len = (size_t)pq_skip_step(first+i, first, val, len, &k, &sl);
+            pre[i] = k; suf[i] = sl;
+        }
+        pq_dpb_write(&body, pre, (int)n); pq_dpb_write(&body, suf, (int)n);
+        len = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t k, sl;
+            len = (size_t)pq_skip_step(first+i, first, val, len, &k, &sl);
+            pb_bytes(&body, val+k, (size_t)sl);
         }
         pq_page_v1(&f, &body, 7, n);
         ray_sys_free(body.p);
@@ -6740,10 +6777,11 @@ static test_result_t test_pq_delta_skip(void) {
         ray_t* nmc = ray_table_get_col_idx(t, 1);
         for (int64_t i = 0; i < ray_table_nrows(t); i++, count++) {
             TEST_ASSERT_EQ_I(((int64_t*)ray_data(idc))[i], 2500+count);
-            char want[16]; int wn = snprintf(want, sizeof(want), "row_%04d", (int)(2500+count));
+            char want[32]; size_t wn = 0;
+            TEST_ASSERT_TRUE(pq_skip_row_value(2500+count, want, sizeof(want), &wn));
             size_t len = 0; const char* s = ray_str_vec_get(nmc, i, &len);
-            TEST_ASSERT_EQ_I(len, (size_t)wn);
-            TEST_ASSERT_TRUE(!memcmp(s, want, (size_t)wn));
+            TEST_ASSERT_EQ_I(len, wn);
+            TEST_ASSERT_TRUE(!memcmp(s, want, wn));
         }
         ray_release(t);
     }
@@ -6763,15 +6801,297 @@ static test_result_t test_pq_delta_skip(void) {
         ray_t* nmc = ray_table_get_col_idx(t, 1);
         for (int64_t i = 0; i < ray_table_nrows(t); i++, count++) {
             TEST_ASSERT_EQ_I(((int64_t*)ray_data(idc))[i], count);
-            char want[16]; int wn = snprintf(want, sizeof(want), "row_%04d", (int)count);
+            char want[32]; size_t wn = 0;
+            TEST_ASSERT_TRUE(pq_skip_row_value(count, want, sizeof(want), &wn));
             size_t len = 0; const char* s = ray_str_vec_get(nmc, i, &len);
-            TEST_ASSERT_EQ_I(len, (size_t)wn);
-            TEST_ASSERT_TRUE(!memcmp(s, want, (size_t)wn));
+            TEST_ASSERT_EQ_I(len, wn);
+            TEST_ASSERT_TRUE(!memcmp(s, want, wn));
         }
         ray_release(t);
     }
     TEST_ASSERT_EQ_I(count, 10000);
     ray_parquet_close(r);
+    unlink(path);
+    PASS();
+}
+/* A 2,000-value DELTA_BYTE_ARRAY page whose values share a 40,960-byte
+ * prefix plus a ten-byte suffix: one collected batch reconstructs 81,940,000
+ * bytes from a ~90 KB encoded page (prefix expansion).  Valid per DuckDB
+ * (2,000 rows, length 40,970); the native SYM scan must not refuse it at the
+ * 64 MiB page bound. */
+static bool pq_write_bigprefix(const char* path, int64_t rows, int64_t P) {
+    pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
+    int64_t data_off = (int64_t)f.n;
+    pq_buf b = {0};
+    pq_levels_all(&b, rows);
+    int64_t* pre = (int64_t*)ray_sys_alloc((size_t)rows*sizeof(int64_t));
+    int64_t* suf = (int64_t*)ray_sys_alloc((size_t)rows*sizeof(int64_t));
+    char* val = (char*)ray_sys_alloc((size_t)(P+10));
+    bool ok = pre && suf && val;
+    if (ok) {
+        for (int64_t i = 0; i < rows; i++) { pre[i] = i ? P : 0; suf[i] = i ? 10 : P+10; }
+        pq_dpb_write(&b, pre, (int)rows);
+        pq_dpb_write(&b, suf, (int)rows);
+        memset(val, 'P', (size_t)P);
+        for (int64_t i = 0; i < rows; i++) {
+            char tail[24]; snprintf(tail, sizeof(tail), "%010lld", (long long)i);
+            memcpy(val+P, tail, 10);
+            if (i == 0) pb_bytes(&b, val, (size_t)(P+10));
+            else pb_bytes(&b, val+P, 10);
+        }
+        pq_page_v1(&f, &b, 7, rows);
+    }
+    ray_sys_free(val); ray_sys_free(pre); ray_sys_free(suf); ray_sys_free(b.p);
+    if (!ok) { ray_sys_free(f.p); return false; }
+    int64_t size = (int64_t)f.n - data_off;
+    int64_t footer = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 1); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 1);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "name", 4);
+      pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    { int l = 0;
+      pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+      { int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, data_off);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 6);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 7);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "name", 4);
+          pb_i(&f, &lm, 4, PB_I32, 0);
+          pb_i(&f, &lm, 5, PB_I64, rows);
+          pb_i(&f, &lm, 6, PB_I64, size);
+          pb_i(&f, &lm, 7, PB_I64, size);
+          pb_i(&f, &lm, 9, PB_I64, data_off); pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      pb_i(&f, &l, 2, PB_I64, size); pb_i(&f, &l, 3, PB_I64, rows); pb_byte(&f, 0); }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    return ok;
+}
+static bool pq_bigprefix_values(ray_t* t, int64_t rows, int64_t P) {
+    ray_t* col = ray_table_get_col_idx(t, 0);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < rows; i++) {
+        size_t len = 0; const char* p = NULL; ray_t* atom = NULL;
+        if (col->type == RAY_SYM) {
+            atom = ray_sym_vec_cell(col, i);
+            if (atom) { p = ray_str_ptr(atom); len = ray_str_len(atom); }
+        } else p = ray_str_vec_get(col, i, &len);
+        char tail[24]; int tn = snprintf(tail, sizeof(tail), "%010lld", (long long)i);
+        if (!p || len != (size_t)(P+10) || memcmp(p, "PPPP", 4) ||
+            memcmp(p+P, tail, (size_t)tn)) bad++;
+        if (atom) ray_release(atom);
+    }
+    if (bad) fprintf(stderr, "  delta bigprefix: %lld bad values\n", (long long)bad);
+    return bad == 0;
+}
+static test_result_t test_pq_delta_bigprefix(void) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-dbig-%d.parquet", (int)getpid());
+    const int64_t rows = 2000, P = 40960;
+    TEST_ASSERT_TRUE(pq_write_bigprefix(path, rows, P));
+    ray_error_clear();
+    /* The plain batch read fills its pool at the pool bound: the control. */
+    ray_t* plain = ray_parquet_read(path, NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(plain));
+    TEST_ASSERT_EQ_I(ray_table_nrows(plain), rows);
+    TEST_ASSERT_TRUE(pq_bigprefix_values(plain, rows, P));
+    ray_release(plain);
+    /* The failing path: the typed native SYM scan. Its collection arena must
+     * admit the prefix-expanded batch, not the 64 MiB page bound. */
+    int64_t sym = ray_sym_intern("SYM",3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM, &sym, 1);
+    int64_t key = ray_sym_intern("types",5);
+    ray_t* vals = ray_list_new(1);
+    TEST_ASSERT_NOT_NULL(vals);
+    ((ray_t**)ray_data(vals))[0] = types; vals->len = 1;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, &key, 1), vals);
+    TEST_ASSERT_NOT_NULL(opts);
+    ray_t* scan = ray_parquet_read(path, opts);
+    ray_release(opts);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(scan));
+    TEST_ASSERT_EQ_I(ray_table_nrows(scan), rows);
+    TEST_ASSERT_TRUE(pq_bigprefix_values(scan, rows, P));
+    ray_release(scan);
+    unlink(path);
+    PASS();
+}
+/* A two-column file for the import decision: `dba` is DELTA_BYTE_ARRAY
+ * (shared prefix plus a four-digit suffix, values of 18 bytes) and `dict` is
+ * RLE_DICTIONARY over 200 entries.  The DELTA column must go grouped; the
+ * dictionary column's metadata bound holds, so it keeps the direct path and
+ * its dictionary is seeded.  Both columns are optional, one v1 page each. */
+static bool pq_write_mixed(const char* path) {
+    enum { ROWS = 4000, ENTRIES = 200, WIDTH = 8 };
+    pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
+    int64_t dba_off = (int64_t)f.n;
+    { pq_buf b = {0}; pq_levels_all(&b, ROWS);
+      int64_t pre[ROWS], suf[ROWS];
+      for (int64_t i = 0; i < ROWS; i++) {
+          if (i == 0) { pre[i] = 0; suf[i] = 18; }
+          else { pre[i] = 14; suf[i] = 4; }
+      }
+      pq_dpb_write(&b, pre, ROWS); pq_dpb_write(&b, suf, ROWS);
+      char val[32];
+      for (int64_t i = 0; i < ROWS; i++) {
+          int n = snprintf(val, sizeof(val), "shared-prefix-%04d", (int)(i % 10000));
+          if (i == 0) pb_bytes(&b, val, (size_t)n);
+          else pb_bytes(&b, val+14, 4);
+      }
+      pq_page_v1(&f, &b, 7, ROWS); ray_sys_free(b.p); }
+    int64_t dba_size = (int64_t)f.n - dba_off;
+    int64_t dict_off = (int64_t)f.n;
+    { pq_buf d = {0};
+      for (int i = 0; i < ENTRIES; i++) {
+          char s[16]; snprintf(s, sizeof(s), "dict-%03d", i);
+          pq_plain_str(&d, s);
+      }
+      pq_page_dict(&f, &d, ENTRIES); ray_sys_free(d.p); }
+    int64_t data_off = (int64_t)f.n;
+    { pq_buf b = {0}; pq_levels_all(&b, ROWS); pb_byte(&b, WIDTH);
+      uint8_t* ids = (uint8_t*)ray_sys_alloc(ROWS);
+      bool ok = ids != NULL;
+      for (int64_t i = 0; ok && i < ROWS; i++) ids[i] = (uint8_t)(i % ENTRIES);
+      /* pq_ids_packed packs one run of at most 512 values (its stack array):
+       * successive bit-packed runs are legal in one hybrid stream. */
+      for (int64_t at = 0; ok && at < ROWS; at += 512) {
+          int cnt = ROWS-at < 512 ? (int)(ROWS-at) : 512;
+          pq_ids_packed(&b, ids+at, cnt, WIDTH);
+      }
+      ray_sys_free(ids);
+      pq_page_v1(&f, &b, 8, ROWS); ray_sys_free(b.p);
+      if (!ok) { ray_sys_free(f.p); return false; } }
+    int64_t data_size = (int64_t)f.n - data_off;
+    int64_t dict_size = data_off - dict_off;
+    int64_t chunk_size = data_size + dict_size;
+    int64_t footer = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 3, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 2); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 1);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "dba", 3);
+      pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 1);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "dict", 4);
+      pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, ROWS);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    { int l = 0;
+      pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+      { int lc = 0; pb_i(&f, &lc, 2, PB_I64, dba_off); pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 6);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 7);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "dba", 3);
+          pb_i(&f, &lm, 4, PB_I32, 0); pb_i(&f, &lm, 5, PB_I64, ROWS);
+          pb_i(&f, &lm, 6, PB_I64, dba_size); pb_i(&f, &lm, 7, PB_I64, dba_size);
+          pb_i(&f, &lm, 9, PB_I64, dba_off);
+          /* encoding_stats: a DATA_PAGE carrying DELTA_BYTE_ARRAY values */
+          pb_field(&f, &lm, 13, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+          { int le = 0; pb_i(&f, &le, 1, PB_I32, 0); pb_i(&f, &le, 2, PB_I32, 7);
+            pb_i(&f, &le, 3, PB_I32, 1); pb_byte(&f, 0); }
+          pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      { int lc = 0; pb_i(&f, &lc, 2, PB_I64, dict_off); pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 6);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 3, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); pb_zz(&f, 8);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "dict", 4);
+          pb_i(&f, &lm, 4, PB_I32, 0); pb_i(&f, &lm, 5, PB_I64, ROWS);
+          pb_i(&f, &lm, 6, PB_I64, chunk_size); pb_i(&f, &lm, 7, PB_I64, chunk_size);
+          pb_i(&f, &lm, 9, PB_I64, data_off); pb_i(&f, &lm, 11, PB_I64, dict_off);
+          /* encoding_stats: the dictionary page and a dictionary-encoded
+           * data page say no data page holds values itself */
+          pb_field(&f, &lm, 13, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+          { int le = 0; pb_i(&f, &le, 1, PB_I32, 2); pb_i(&f, &le, 2, PB_I32, 0);
+            pb_i(&f, &le, 3, PB_I32, 1); pb_byte(&f, 0); }
+          { int le = 0; pb_i(&f, &le, 1, PB_I32, 0); pb_i(&f, &le, 2, PB_I32, 8);
+            pb_i(&f, &le, 3, PB_I32, 1); pb_byte(&f, 0); }
+          pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      pb_i(&f, &l, 2, PB_I64, chunk_size + dba_size);
+      pb_i(&f, &l, 3, PB_I64, ROWS); pb_byte(&f, 0); }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    return ok;
+}
+static bool pq_mixed_cell(ray_t* col, int64_t row, const char* want, int wn) {
+    size_t len = 0; const char* p = NULL; ray_t* atom = NULL;
+    if (col->type == RAY_SYM) {
+        atom = ray_sym_vec_cell(col, row);
+        if (atom) { p = ray_str_ptr(atom); len = ray_str_len(atom); }
+    } else p = ray_str_vec_get(col, row, &len);
+    bool ok = p && len == (size_t)wn && !memcmp(p, want, (size_t)wn);
+    if (atom) ray_release(atom);
+    return ok;
+}
+static test_result_t test_pq_delta_symbol_mixed(void) {
+    char path[160], dir[200], domain[220];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-dmix-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-dmix-%d", (int)getpid());
+    snprintf(domain, sizeof(domain), "%s/.sym", dir);
+    TEST_ASSERT_TRUE(pq_write_mixed(path));
+    int64_t sym = ray_sym_intern("SYM",3);
+    int64_t types2[2] = {sym, sym};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, types2, 2);
+    pq_set_symmode(NULL);
+    ray_t* res = ray_parquet_splayed_typed(path, dir, types);
+    pq_set_symmode(NULL);
+    if (res && RAY_IS_ERR(res))
+        fprintf(stderr, "  delta mixed import: %s / %s\n",
+                ray_err_code(res) ? ray_err_code(res) : "(no code)",
+                ray_error_msg() ? ray_error_msg() : "(no message)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(res->i64, 4000);
+    ray_release(res);
+#if defined(DEBUG)
+    /* Per-column decision: the DELTA column grouped, the dictionary column
+     * direct (seeded), which the pre-fix whole-import grouping could not do. */
+    int64_t m = -1, e = -1, g = -1;
+    ray_parquet_test_import_seam(0, &m, &e, &g);
+    TEST_ASSERT_EQ_I(g, 1);
+    TEST_ASSERT_EQ_I(m, 2);
+    TEST_ASSERT_EQ_I(e, 7);
+    ray_parquet_test_import_seam(1, &m, &e, &g);
+    TEST_ASSERT_EQ_I(g, 0);
+    TEST_ASSERT_EQ_I(m, 1);
+    TEST_ASSERT_EQ_I(e, -1);
+#endif
+    ray_t* tbl = ray_read_splayed(dir, domain);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_table_nrows(tbl), 4000);
+    ray_t* a = ray_table_get_col_idx(tbl, 0);
+    ray_t* b = ray_table_get_col_idx(tbl, 1);
+    for (int64_t i = 0; i < 4000; i++) {
+        char want[32];
+        int wn = snprintf(want, sizeof(want), "shared-prefix-%04d", (int)(i % 10000));
+        TEST_ASSERT_TRUE(pq_mixed_cell(a, i, want, wn));
+        wn = snprintf(want, sizeof(want), "dict-%03d", (int)(i % 200));
+        TEST_ASSERT_TRUE(pq_mixed_cell(b, i, want, wn));
+    }
+    ray_release(tbl);
+    const char* names[] = {"dba","dict"};
+    pq_remove_native(dir, names, 2);
     unlink(path);
     PASS();
 }
@@ -6781,6 +7101,8 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_transitions",test_pq_delta_transitions,pq_setup,pq_teardown},
     {"parquet/delta_symbol_import",test_pq_delta_symbol_import,pq_setup,pq_teardown},
     {"parquet/delta_skip",test_pq_delta_skip,pq_setup,pq_teardown},
+    {"parquet/delta_bigprefix",test_pq_delta_bigprefix,pq_setup,pq_teardown},
+    {"parquet/delta_symbol_mixed",test_pq_delta_symbol_mixed,pq_setup,pq_teardown},
     {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
