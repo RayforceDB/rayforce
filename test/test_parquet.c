@@ -6614,9 +6614,10 @@ static test_result_t test_pq_delta_symbol_import(void) {
 }
 /* A two-column file of ten 1,000-row v1 data pages per chunk: `id` INT64
  * DELTA_BINARY_PACKED (with a ColumnIndex/OffsetIndex so a range excludes
- * whole pages) and `name` BYTE_ARRAY DELTA_BYTE_ARRAY.  A range read skips
- * pages without decoding, then decodes intermediate pages, so both codecs'
- * page state is reset across the skipped pages. */
+ * whole pages) and `name` BYTE_ARRAY DELTA_BYTE_ARRAY on a 700-row page grid.
+ * A range read skips pages without decoding, then decodes intermediate pages,
+ * so both codecs' page state resets across the skipped pages; the off-grid
+ * `name` pages make pq_discard drop a PARTIAL page, advancing DBA history. */
 static bool pq_write_skip(const char* path) {
     enum { PAGES = 10, ROWS = 1000, TOTAL = PAGES*ROWS };
     int64_t page_off[PAGES], page_sz[PAGES];
