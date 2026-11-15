@@ -1,8 +1,8 @@
 # `.parquet.*` — Parquet input and native conversion
 
 Read or query a local Parquet file, process it in batches, or convert it to
-Rayforce's native splayed or partitioned layout. The reader and Snappy decoder
-are implemented in C without third-party library dependencies.
+Rayforce's native splayed or partitioned layout. The reader and the Snappy and LZ4
+decoders are implemented in C without third-party library dependencies.
 
 !!! note "Restricted under `-U`"
     All six functions are restricted for IPC peers under a `-U` server and
@@ -50,6 +50,11 @@ Materialize all columns, a projection vector, or a read configured with
 
 The whole result remains in memory. Typed `SYM` text uses a private dictionary
 that remains valid for as long as returned vectors retain it.
+
+Column types: `UINT64` reads as `I64`, and a value above `INT64_MAX`
+(including 2^63) fails the read. `DECIMAL` on an `INT32` or `INT64` column
+reads as `F64`, the stored integer divided by 10^scale; a decimal on a byte
+array is refused.
 
 ## `.parquet.scan` { #parquet-scan }
 
@@ -101,6 +106,19 @@ order. The default maximum partition size is 65,536 rows. `rows` accepts
 (.parquet.parted {types: [I64 SYM] rows: 262144}
   "events.parquet" "/tmp/events-db" 'events)
 (set events (.db.parted.get "/tmp/events-db" 'events))
+```
+
+`.parquet.parted` also takes a list of paths in place of the path. The files
+are concatenated in order into one table: partitions continue across the files,
+string columns imported as `SYM` share one vocabulary, and the files must have the
+same columns, in order, with the same native types after the import's type
+conversions (a column that differs is refused, naming it). This is how the
+several files of one export, one per instrument and definition segment, become
+a single on-disk table:
+
+```lisp
+(.parquet.parted {types: [I16 I32 I64 SYM TIMESTAMP F64 F64 F64 F64 F64] compress: true}
+  (list "btc-1.parquet" "btc-2.parquet" "eth-1.parquet") "/tmp/ohlcv-db" 'ohlcv)
 ```
 
 Both native conversions require an existing parent directory and a new

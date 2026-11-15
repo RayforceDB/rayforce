@@ -130,6 +130,17 @@
 (.parquet.splayed [DATE TIMESTAMP SYM] "test/data/parquet/unix.parquet" "unused") !- parquet
 (.parquet.parted [DATE TIMESTAMP SYM] "test/data/parquet/unix.parquet" "unused" 'hits) !- parquet
 
+;; The list form: files concatenated in order into one partitioned table.
+(.sys.exec "rm -rf rf_test_pq_list_parted rf_test_pq_list_parted.parquet-partial") -- 0
+(.parquet.parted (list "test/data/parquet/empty-group.parquet" "test/data/parquet/empty-group.parquet") "rf_test_pq_list_parted" 'e) -- 10
+(count (select {from: (.db.parted.get "rf_test_pq_list_parted" 'e)})) -- 10
+(sum (at (select {from: (.db.parted.get "rf_test_pq_list_parted" 'e)}) 'x)) -- 26
+(.sys.exec "rm -rf rf_test_pq_list_parted") -- 0
+(.parquet.parted (list) "rf_test_pq_list_parted" 'e) !- type
+(.parquet.parted (list "test/data/parquet/empty-group.parquet" 1) "rf_test_pq_list_parted" 'e) !- type
+(.parquet.parted (list "test/data/parquet/empty-group.parquet" "test/data/parquet/unix.parquet") "rf_test_pq_list_parted" 'e) !- parquet
+(.sys.exec "rm -rf rf_test_pq_list_parted rf_test_pq_list_parted.parquet-partial") -- 0
+
 ;; Explicit types use private dictionaries that survive reader closure.
 (set pq-typed (.parquet.read {types: [UNIX_DATE UNIX_SECONDS SYM]} "test/data/parquet/unix.parquet"))
 (type (at pq-typed 's)) -- 'SYM
