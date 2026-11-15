@@ -8462,6 +8462,348 @@ static test_result_t test_eval_restricted_server_state_ops(void) {
     PASS();
 }
 
+/* Whether the restricted eval of `expr` prints as the plain eval of
+ * `expected` does. */
+static bool restricted_expr_gives(const char* expr, const char* expected) {
+    ray_t* got = eval_restricted_expr(expr);
+    ray_t* want = ray_eval_str(expected);
+    bool same = false;
+    ray_t* gs = got && !RAY_IS_ERR(got) ? ray_fmt(got, 0) : NULL;
+    if (gs && want && !RAY_IS_ERR(want)) {
+        ray_t* ws = ray_fmt(want, 0);
+        same = ws && ray_str_len(gs) == ray_str_len(ws) &&
+               memcmp(ray_str_ptr(gs), ray_str_ptr(ws), ray_str_len(ws)) == 0;
+        if (ws) ray_release(ws);
+    }
+    if (!same)
+        fprintf(stderr, "  restricted eval of %s is %.*s, not %s\n", expr,
+                gs ? (int)ray_str_len(gs) : 5, gs ? ray_str_ptr(gs) : "error", expected);
+    if (gs) ray_release(gs);
+    for (int i = 0; i < 2; i++) {
+        ray_t* v = i ? want : got;
+        if (v && RAY_IS_ERR(v)) ray_error_free(v);
+        else if (v) ray_release(v);
+    }
+    return same;
+}
+
+/* #787: a lambda marked with .sys.trust runs its body unrestricted when
+ * restricted code calls it, by every call path, and the restriction is
+ * back once the call ends, however it ends.  The caller's own code, a
+ * closure the body makes and a copy of the lambda through ser/de stay
+ * restricted, and only unrestricted code can mark. */
+static test_result_t test_eval_restricted_trusted_lambda(void) {
+    ASSERT_EQ("(do (set __rf787_n 0)"
+              "    (set __rf787_put (fn [x] (set __rf787_n x)))"
+              "    (set __rf787_plain (fn [x] (set __rf787_n x)))"
+              "    (set __rf787_boom (fn [] (set __rf787_n 4) (raise \"boom\")))"
+              "    (set __rf787_mk (fn [k] (fn [x] (set __rf787_n (+ x k)))))"
+              "    (set __rf787_down (fn [n] (if (<= n 0) (set __rf787_n -1) (self (- n 1)))))"
+              "    (set __rf787_cl ((fn [k] (fn [x] (set __rf787_n (+ x k)))) 100))"
+              "    (.sys.trust ['__rf787_put '__rf787_boom '__rf787_mk '__rf787_down])"
+              "    (type (.sys.trust __rf787_cl)))", "(type (fn [] 0))");
+
+    /* The trusted body writes a global: called from the request's top
+     * level, from its compiled code, and through a higher-order builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_put 5)", "5"));
+    ASSERT_EQ("__rf787_n", "5");
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (__rf787_put 6)))", "6"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(map __rf787_put [7 8])", "[7 8]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (map __rf787_put [1 9])))", "[1 9]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_down 3)", "-1"));
+    /* A trusted closure, interpreted on its first call and compiled after. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_cl 1)", "101"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_cl 2)", "102"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (__rf787_cl 3)))", "103"));
+
+    /* The same body unmarked, and the request's own write, are refused. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (__rf787_plain 1)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(set __rf787_n 1)"));
+
+    /* The restriction is back after the trusted call returns. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(do (__rf787_put 2) (set __rf787_n 3))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (__rf787_put 2) (set __rf787_n 3)))"));
+    ASSERT_EQ("__rf787_n", "2");
+
+    /* ... and after it fails: the caller's handler runs restricted. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(try (__rf787_boom) (fn [e] 7))", "7"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(try (__rf787_boom) (fn [e] (set __rf787_n 5)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [] (try (__rf787_boom) (fn [e] (set __rf787_n 5)))))"));
+    ASSERT_EQ("__rf787_n", "4");
+
+    /* The mark stays on the object: a closure the trusted body makes and a
+     * copy through ser/de have none. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((__rf787_mk 1) 2)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((de (ser __rf787_put)) 6)"));
+
+    /* Restricted code cannot mark, so the unmarked twin stays refused. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.sys.trust '__rf787_plain)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.sys.trust __rf787_plain)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (.sys.trust __rf787_plain)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+
+    /* A name means the global bound to it, never a local of the caller,
+     * whether the caller is compiled or tree-walked. */
+    ASSERT_EQ("(do (set __rf787_gf (fn [] (set __rf787_n 21)))"
+              "    (set __rf787_gg (fn [] (set __rf787_n 22)))"
+              "    (set __rf787_gf2 (fn [] (set __rf787_n 23)))"
+              "    (set __rf787_gg2 (fn [] (set __rf787_n 24)))"
+              "    ((fn [] (let __rf787_gf __rf787_gg) (.sys.trust '__rf787_gf)))"
+              "    (do (let __rf787_gf2 __rf787_gg2) (.sys.trust '__rf787_gf2)) 0)", "0");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf)", "21"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg)"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf2)", "23"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg2)"));
+
+    /* One object is trusted under one name: a second name is refused, in
+     * one list (which then marks none) or later; the first name may be
+     * trusted again, and trusting the object as a value keeps its name. */
+    ASSERT_EQ("(do (set __rf787_one (fn [] (set __rf787_n 31))) (set __rf787_two __rf787_one) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_one '__rf787_two])", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_one)"));
+    ASSERT_EQ("(do (.sys.trust '__rf787_one) (.sys.trust '__rf787_one) (.sys.trust __rf787_one) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_two)", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_two)", "31"));
+
+    /* A dotted name is refused: a lambda held in a dict is trusted as a
+     * value. */
+    ASSERT_EQ("(do (set __rf787_ns (dict ['f] (list (fn [] (set __rf787_n 51))))) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_ns.f)", "domain");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_plain '__rf787_ns.f])", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_ns.f)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+    ASSERT_EQ("(type (.sys.trust __rf787_ns.f))", "(type (fn [] 0))");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_ns.f)", "51"));
+
+    /* A lambda that cannot be serialized has no identity and is refused,
+     * as a value and by name, and stays untrusted. */
+    ASSERT_EQ("(do (set __rf787_noser (fn [] (set __rf787_n 41))) 0)", "0");
+    {
+        int64_t sym = ray_sym_intern("__rf787_noser", 13);
+        ray_t* fn = ray_env_get_global(sym);
+        ray_t* name = ray_sym(sym);
+        TEST_ASSERT_TRUE(fn && name && !RAY_IS_ERR(name));
+        ray_t* args[2] = { fn, name };
+        bool refused = true;
+        for (int i = 0; i < 2; i++) {
+            ray_alloc_fail_set_for_test(1, 1);
+            ray_t* r = ray_sys_trust_fn(args[i]);
+            ray_alloc_fail_set_for_test(0, 0);
+            refused = refused && r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "domain") == 0 &&
+                      !LAMBDA_TRUSTED(fn);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        }
+        ray_release(name);
+        TEST_ASSERT_TRUE(refused);
+    }
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_noser)"));
+
+    /* Only lambdas are marked, and a list with one bad name marks none. */
+    ASSERT_ER_CODE("(.sys.trust 1)", "type");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_unbound)", "name");
+    ASSERT_ER_CODE("(.sys.trust 'count)", "type");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_plain '__rf787_n])", "type");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+
+    /* Unrestricted, a trusted lambda is an ordinary call. */
+    ASSERT_EQ("(__rf787_put 11)", "11");
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
+/* #787: a trusted lambda called by restricted code runs isolated from its
+ * caller.  The names its body reads, and the names read by what it calls,
+ * resolve to its own bindings and the globals: a local, an eval window
+ * or a query column of the caller cannot rebind one, whether the name
+ * holds data, a helper or a builtin.  The caller's bindings are back
+ * after the call. */
+static test_result_t test_eval_restricted_trusted_isolated(void) {
+    ASSERT_EQ("(do (set __rf787_v 1)"
+              "    (set __rf787_h (fn [] 10))"
+              "    (set __rf787_read (fn [] __rf787_v))"
+              "    (set __rf787_callh (fn [] (__rf787_h)))"
+              "    (set __rf787_cnt (fn [] (count [1 2 3])))"
+              "    (set __rf787_via (fn [] (__rf787_read)))"
+              "    (set __rf787_sum (fn [x] (+ x __rf787_v)))"
+              "    (set __rf787_peek (fn [] __rf787_v))"
+              "    (set __rf787_ev (fn [] (eval (parse \"(__rf787_peek)\"))))"
+              "    (set __rf787_vec [1 2])"
+              "    (set __rf787_app (fn [x] (alter '__rf787_vec concat x)))"
+              "    (set __rf787_rde (fn [] (eval (parse \"__rf787_v\"))))"
+              "    (set __rf787_rdh (fn [] (eval (parse \"(__rf787_h)\"))))"
+              "    (set __rf787_vec3 [1 2 3])"
+              "    (set __rf787_dotcnt (fn [] __rf787_vec3.count))"
+              "    (set __rf787_t (table [a __rf787_v] (list [1 2] [5 6])))"
+              "    (count (.sys.trust ['__rf787_read '__rf787_callh '__rf787_cnt"
+              "                        '__rf787_via '__rf787_sum '__rf787_ev '__rf787_app"
+              "                        '__rf787_rde '__rf787_rdh '__rf787_dotcnt])))", "10");
+    ASSERT_EQ("(__rf787_dotcnt)", "3");
+
+    /* A local of the request's top level. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_read))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_h (fn [] 66)) (__rf787_callh))", "10"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let count (fn [x] 66)) (__rf787_cnt))", "3"));
+    /* ... seen by neither a helper the trusted body calls nor a higher-order call. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_via))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (map __rf787_sum [1 2]))", "[2 3]"));
+    /* ... nor through a resolve that compiled code (the untrusted
+     * __rf787_peek) cached under that local. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (__rf787_peek) (__rf787_read))", "1"));
+    /* ... nor text the trusted body evaluates, reading the name or
+     * calling it, nor a dotted accessor it applies. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_rde))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_h (fn [] 9)) (__rf787_rdh))", "10"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let count first) (__rf787_dotcnt))", "3"));
+    /* An eval window, and a closure's frame on its first call. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "((fn [] (eval (parse \"(do (let __rf787_v 99) (__rf787_read))\"))))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(((fn [k] (fn [] (let __rf787_v 99) (__rf787_read))) 0))", "1"));
+    /* A query column: a helper called from a query reads the source
+     * column by free name, unrestricted callers' trusted lambdas included
+     * (the planner calls a trusted lambda, never inlines it); restricted
+     * code's trusted lambda reads the global. */
+    ASSERT_EQ("(at (select {x: (__rf787_via) from: __rf787_t}) 'x)", "[5 6]");
+    ASSERT_EQ("(at (select {x: (__rf787_sum a) from: __rf787_t}) 'x)", "[6 8]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_read) from: __rf787_t}) 'x)", "[1 1]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_via) from: __rf787_t}) 'x)", "[1 1]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_sum a) from: __rf787_t}) 'x)", "[2 3]"));
+    /* What the trusted body calls is no query helper either: text it
+     * evaluates calls __rf787_peek from the tree walker. */
+    ASSERT_EQ("(at (select {x: (__rf787_ev) from: __rf787_t}) 'x)", "[5 6]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_ev) from: __rf787_t}) 'x)", "[1 1]"));
+
+    /* An in-place mutation by name targets the global, not the caller's
+     * local of that name. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_vec [7]) (__rf787_app 3) __rf787_vec)", "[7]"));
+    ASSERT_EQ("__rf787_vec", "[1 2 3]");
+
+    /* The caller's bindings are visible again once the call returns. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (__rf787_read) __rf787_v)", "99"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (+ (__rf787_read) __rf787_v) from: __rf787_t}) 'x)", "[6 7]"));
+    /* ... and so is the query: a helper the request calls after the
+     * trusted call reads the source column by free name again. */
+    ASSERT_EQ("(at (select {x: (do (__rf787_peek) (eval (parse \"(__rf787_peek)\")))"
+              " from: __rf787_t}) 'x)", "[5 6]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (do (__rf787_read) (eval (parse \"(__rf787_peek)\")))"
+        " from: __rf787_t}) 'x)", "[5 6]"));
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
+/* #787: ray_env_isolate_begin hides every frame on the stack, whatever the
+ * walk: a query frame, a query helper's call frame and two lexical frames
+ * of a caller are invisible to lookups, bindings, captures, the query
+ * probes and the frame markers until ray_env_isolate_end, which leaves the
+ * caller's frames as they were. */
+static test_result_t test_env_isolate_hides_frames(void) {
+#define SYM(s) ray_sym_intern(s, strlen(s))
+    int64_t x = SYM("__rf787_iso_x"), w = SYM("__rf787_iso_w");
+    int64_t y = SYM("__rf787_iso_y"), y2 = SYM("__rf787_iso_y2");
+    int64_t cnt = SYM("count"), dot = SYM("__rf787_iso_v.count");
+#undef SYM
+    ray_t* setup = ray_eval_str("(do (set __rf787_iso_x 1) (set __rf787_iso_v [1 2 3]) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* tbl = ray_eval_str("(table [__rf787_iso_x] (list [7]))");
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    ray_t* first = ray_env_get_global(ray_sym_intern("first", 5));
+    TEST_ASSERT_NOT_NULL(first);
+
+    /* The caller: a query, a helper's call frame over its table, then a
+     * frame binding x and one binding w and `count` (as `first`). */
+    int base = ray_env_scope_depth();
+    TEST_ASSERT_EQ_I(ray_env_push_query_scope(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_call_scope(tbl, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    ray_t* v99 = ray_i64(99), *v5 = ray_i64(5), *v6 = ray_i64(6), *v8 = ray_i64(8);
+    TEST_ASSERT_EQ_I(ray_env_set_local(x, v99), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set_local(w, v5), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set_local(cnt, first), RAY_OK);
+    ray_t* got = ray_env_get(x);
+    bool caller_sees = got && got->i64 == 99 && ray_env_in_query_helper(NULL) &&
+                       ray_env_query_serial() != 0 && ray_env_query_scope_above(base);
+
+    int32_t saved = ray_env_isolate_begin();
+    got = ray_env_get(x);
+    bool get_global = got && got->i64 == 1;
+    bool no_local = ray_env_get_local(x) == NULL && ray_env_get_lexical_local(x) == NULL &&
+                    ray_env_lexical_scope_depth(x) == -1 && ray_env_binding_rows(x) == -1;
+    bool no_query = ray_env_query_serial() == 0 && !ray_env_query_scope_above(base) &&
+                    !ray_env_in_query_helper(NULL);
+    ray_t* cap = ray_env_capture_locals();
+    bool no_capture = cap == NULL;
+    if (cap && !RAY_IS_ERR(cap)) ray_release(cap);
+    ray_t* res = ray_env_resolve(x);
+    bool resolve_global = res && !RAY_IS_ERR(res) && res->i64 == 1;
+    if (res && !RAY_IS_ERR(res)) ray_release(res);
+    /* x.count: the dotted accessor is the global `count`, not the caller's. */
+    res = ray_env_resolve(dot);
+    bool accessor_global = res && !RAY_IS_ERR(res) && res->i64 == 3;
+    if (res && !RAY_IS_ERR(res)) ray_release(res);
+    ray_env_target_t target;
+    ray_t* tv = NULL;
+    bool target_global = ray_env_target_resolve(x, &target, &tv) == RAY_OK && target.scope == -1;
+    /* With no frame of its own open, a binding is global, as at the top
+     * level, and the markers leave the caller's top frame alone. */
+    bool bind_global = ray_env_set_local(y, v6) == RAY_OK &&
+                       ray_env_set_local_rows(y2, v8, 0) == RAY_OK;
+    ray_env_mark_lexical_scope(0);
+    ray_env_mark_eval_window();
+    ray_env_isolate_end(saved);
+
+    got = ray_env_get(x);
+    bool caller_back = got && got->i64 == 99 && ray_env_scope_depth() == base + 4;
+    ray_t* gw = ray_env_get_compiled(w);          /* no eval window on w's frame */
+    bool not_window = gw && gw->i64 == 5;
+    cap = ray_env_capture_locals();               /* no lexical mark on w's frame */
+    bool captures_x = false;
+    if (cap && !RAY_IS_ERR(cap)) {
+        ray_t* keys = ray_dict_keys(cap);
+        for (int64_t i = 0; keys && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == x) captures_x = true;
+        ray_release(cap);
+    }
+    bool frames_unbound = ray_env_get_local(y) == NULL && ray_env_get_local(y2) == NULL;
+    for (int i = 0; i < 4; i++) ray_env_pop_scope();
+    ray_t* gy = ray_env_get_global(y), *gy2 = ray_env_get_global(y2);
+    bool globals_bound = gy && gy->i64 == 6 && gy2 && gy2->i64 == 8;
+    ray_release(v99); ray_release(v5); ray_release(v6); ray_release(v8);
+    ray_release(tbl);
+
+    TEST_ASSERT_TRUE(caller_sees);
+    TEST_ASSERT_TRUE(get_global);
+    TEST_ASSERT_TRUE(no_local);
+    TEST_ASSERT_TRUE(no_query);
+    TEST_ASSERT_TRUE(no_capture);
+    TEST_ASSERT_TRUE(resolve_global);
+    TEST_ASSERT_TRUE(accessor_global);
+    TEST_ASSERT_TRUE(target_global);
+    TEST_ASSERT_TRUE(bind_global);
+    TEST_ASSERT_TRUE(caller_back);
+    TEST_ASSERT_TRUE(not_window);
+    TEST_ASSERT_TRUE(captures_x);
+    TEST_ASSERT_TRUE(frames_unbound);
+    TEST_ASSERT_TRUE(globals_bound);
+    PASS();
+}
+
 /* --- self-recursive lambda via recursion (tests op_calls path) --- */
 static test_result_t test_eval_self_recursion_direct(void) {
     /* Direct recursion using named function — compiler may use op_calls */
@@ -12776,6 +13118,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
+    { "lang/eval/restricted_trusted_lambda", test_eval_restricted_trusted_lambda, lang_setup, lang_teardown },
+    { "lang/eval/restricted_trusted_isolated", test_eval_restricted_trusted_isolated, lang_setup, lang_teardown },
+    { "lang/env/isolate_hides_frames", test_env_isolate_hides_frames, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

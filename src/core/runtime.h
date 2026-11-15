@@ -117,6 +117,11 @@ typedef struct {
     int32_t          id;
     ray_t           *nfo;        /* source-info of the eval in progress (borrowed) */
     void            *heap;
+    /* The lowest scope frame lookups and bindings reach.  Frames below it
+     * belong to the caller of a lambda run in isolation (a trusted lambda
+     * under -U, see ray_env_isolate_begin) and are invisible to it.  Read
+     * by the scope walks only, so it stays out of the hot block above. */
+    int32_t          scope_base;
     /* ── warm: per-dispatch context (core/ipc.c saves/restores) */
     int64_t          ipc_handle; /* connection handle of the hook/eval on this stack; -1 = none */
     void            *ipc_poll;   /* opaque ray_poll_t* that dispatched it; NULL = none */
