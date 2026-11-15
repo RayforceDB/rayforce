@@ -4308,11 +4308,10 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     simp = nnum < r->ncols ? ray_sym_domain_import(writers[order[nnum]].dom) : NULL;
     /* DELTA_BYTE_ARRAY columns go grouped: prefix expansion breaks the direct
      * import's metadata-derived vocabulary bound, and the grouped import's
-     * own arena bounds the reconstruction.  The other symbol columns keep the
-     * import's normal per-column path: a dictionary-only column whose bound
-     * holds goes direct and is seeded, as it would with no DELTA column in
-     * the import (CR 3.7: the direct path stays for PLAIN and DICTIONARY
-     * columns, where the bound holds). */
+     * own arena bounds the reconstruction.  A DICTIONARY-only column beside
+     * them keeps the direct path, its bound permitting: its dictionary pages
+     * are seeded, so its positions do not depend on worker order.  PLAIN
+     * columns go grouped because they have no dictionary to seed. */
     bool force_grouped = false;
     dba = ray_calloc_raw((size_t)r->ncols);
     if (simp && dba) for (int64_t i = nnum; i < r->ncols; i++) {
