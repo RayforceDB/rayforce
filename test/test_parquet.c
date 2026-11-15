@@ -6540,13 +6540,24 @@ static test_result_t test_pq_delta_transitions(void) {
     PASS();
 }
 /* The batch path owns its strings: a retained batch survives the next read
- * and the reader close (section 3.3). */
-static bool pq_delta_keep_batch(const char* fixture) {
+ * and the reader close (section 3.3).  The long-prefix family's values are
+ * above the 12-byte STR inline limit, so its retained batch is pool-backed. */
+static bool pq_keep_value(const char* fixture, int64_t row, const char* p, size_t len) {
+    if (!strcmp(fixture, "dba-prefix-long.parquet")) {
+        char tail[16]; int tn = snprintf(tail, sizeof(tail), "%04d", (int)row);
+        if (len != 65540 || memcmp(p+65536, tail, (size_t)tn)) return false;
+        for (size_t i = 0; i < 65536; i++) if (p[i] != 'P') return false;
+        return true;
+    }
+    char want[32]; int wn = snprintf(want, sizeof(want), "track_%03d", (int)(row % 500));
+    return (int)len == wn && !memcmp(p, want, len);
+}
+static bool pq_delta_keep_batch(const char* fixture, int64_t batch) {
     char path[220];
     snprintf(path, sizeof(path), "%s%s", DELTA_FIX, fixture);
     ray_parquet_t* r = NULL;
     ray_error_clear();
-    ray_t* err = ray_parquet_open(path, NULL, 1000, &r);
+    ray_t* err = ray_parquet_open(path, NULL, batch, &r);
     if (err || !r) { if (err) ray_error_free(err); return false; }
     ray_t* kept = ray_parquet_next(r);
     bool ok = kept && !RAY_IS_ERR(kept);
@@ -6559,11 +6570,10 @@ static bool pq_delta_keep_batch(const char* fixture) {
     if (ok) {
         ray_t* col = ray_table_get_col_idx(kept, 0);
         for (int64_t i = 0; ok && i < ray_table_nrows(kept); i++) {
-            char want[32]; int n = snprintf(want, sizeof(want), "track_%03d", (int)(i % 500));
             size_t len = 0; const char* p = ray_str_vec_get(col, i, &len);
-            if ((int)len != n || memcmp(p, want, len)) {
-                fprintf(stderr, "  delta lifetime %s row %lld: %.*s want %s\n",
-                        fixture, (long long)i, (int)len, p ? p : "", want);
+            if (!pq_keep_value(fixture, i, p, len)) {
+                fprintf(stderr, "  delta lifetime %s row %lld: bad value\n",
+                        fixture, (long long)i);
                 ok = false;
             }
         }
@@ -6594,8 +6604,9 @@ static test_result_t test_pq_delta_strings(void) {
     TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "value conversion or allocation failed"));
     ray_error_free(se);
     /* The returned strings stay valid after the next read and after close. */
-    TEST_ASSERT_TRUE(pq_delta_keep_batch("dlba-v1.parquet"));
-    TEST_ASSERT_TRUE(pq_delta_keep_batch("dba-v1.parquet"));
+    TEST_ASSERT_TRUE(pq_delta_keep_batch("dlba-v1.parquet", 1000));
+    TEST_ASSERT_TRUE(pq_delta_keep_batch("dba-v1.parquet", 1000));
+    TEST_ASSERT_TRUE(pq_delta_keep_batch("dba-prefix-long.parquet", 64));
 #if defined(DEBUG)
     /* The page-local lengths walk is interruptible at its 4,096-value cadence:
      * the third checkpoint stops a 10,000-value page at 8,192 lengths. */
