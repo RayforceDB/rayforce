@@ -311,7 +311,3 @@ name_anchors first track_0 track_1 track_2 track_3 track_4 track_5 track_6 track
 name_anchors last track_996 track_997 track_998 track_999
 
 fixture unsupported-bss.parquet
-rows 8
-nulls 0
-physical INT32
-encoding BYTE_STREAM_SPLIT

@@ -3,6 +3,8 @@
 # Writer probe (2026-11-15): DuckDB 1.5.6 writes DELTA_LENGTH_BYTE_ARRAY, not
 # DELTA_BYTE_ARRAY, for string columns, so the dba-* fixtures stay pyarrow.
 # duckdb-deflevel exercises DuckDB's over-declared definition-level stream.
+# unsupported-bss.parquet is refusal-only: the read refuses its
+# BYTE_STREAM_SPLIT page before any decode, so expected.txt records no oracle.
 # fixture rows row_groups physical converted encodings page_kind writer sha256 size
 dba-empty.parquet 8 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 parquet-cpp-arrow version 26.0.1 edf21f0a8760da273e2d0f2e9bf39334e5a0d00dd58fea87ddb3e3705d66dd91 419
 dba-nulls-v2.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 6 parquet-cpp-arrow version 26.0.1 704f40f327e7219e908f247ccbe5114dc05deed63532149761e8c0aaf4eea9b3 18890
