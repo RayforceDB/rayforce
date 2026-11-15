@@ -215,7 +215,7 @@ Splayed table loading can also use mmap internally. For most analytics workloads
 ## Parquet input
 
 Rayforce's Parquet reader is implemented in C, including the Thrift Compact
-Protocol parser and Snappy decoder. It adds no library dependencies. The same
+Protocol parser and the Snappy and LZ4 decoders. It adds no library dependencies. The same
 batch decoder serves materialized reads, streaming callbacks, and native
 conversion.
 
@@ -318,8 +318,11 @@ table operations.
 
 ### Supported input and limits
 
-- One local, unencrypted file with a flat schema.
-- Uncompressed and raw Snappy column chunks.
+- Local, unencrypted files with a flat schema: one file, or for `.parquet.parted`
+  a list of files with the same columns that become one table.
+- Uncompressed, raw Snappy and LZ4 column chunks (LZ4_RAW, and the deprecated
+  Hadoop-framed LZ4 codec, one compressed chunk per frame); other codecs are
+  refused with an error listing the supported ones.
 - Data pages v1 and v2; PLAIN and dictionary encoding, including the legacy
   dictionary tag and dictionary-to-plain fallback within a chunk; RLE-encoded
   BOOLEAN values (the v2 default of common writers). Zero-row row groups are
@@ -329,12 +332,17 @@ table operations.
   checksum validation.
 - BOOLEAN, INT32, INT64, FLOAT, DOUBLE, and BYTE_ARRAY physical types. Strings
   become STR vectors. Nullable booleans become I16 so nulls are representable.
-- UTF8, DATE, signed integers, UINT8/16/32, and millisecond/microsecond/nanosecond
+- UTF8, DATE, signed integers, UINT8/16/32/64, and millisecond/microsecond/nanosecond
   TIMESTAMP annotations. Narrow signed annotations may use a wider native type
-  to preserve values otherwise reserved as a null sentinel. UINT64, decimal,
-  INT96, nested/repeated data, fixed byte arrays, and other annotations are
-  rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is validated when
-  `strict: true` is enabled.
+  to preserve values otherwise reserved as a null sentinel. UINT64 reads as
+  I64, and a value above INT64_MAX (which has no native representation) fails
+  the read. DECIMAL on an INT32 (precision up to 9) or INT64 (up to 18) column
+  reads as F64, the stored integer divided by 10^scale: one correctly rounded
+  division, exact for stored values below 2^53, whether the file carries the
+  converted type or the logical type, and null where the column is null. INT96,
+  decimals on byte arrays, nested/repeated data, fixed byte arrays, and other
+  annotations are rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is
+  validated when `strict: true` is enabled.
 - Parquet dates/timestamps are converted from the Unix epoch to Rayforce's
   2000 epoch. Timestamp timezone annotations are not retained as separate
   metadata. Unannotated integer columns remain integers.
@@ -373,13 +381,13 @@ run in parallel for batches of at least 4,096 rows. `-c 1` uses one execution
 participant; other core settings use the configured pool without a four-core cap.
 Buffers and output vectors use Rayforce's block allocator. Required PLAIN signed
 integers use SSE2 copy/null detection where available, with a scalar fallback.
-Repeated dictionary runs fill native blocks in bulk. Snappy back references use
+Repeated dictionary runs fill native blocks in bulk. Snappy and LZ4 back references use
 bounded block copies. Packed dictionary IDs remain scalar. A standalone `like`
 predicate can filter decoded batches; string Bloom probes, fully deferred output
 decoding, and streaming grouped queries remain future work.
 
 Both `.parquet.splayed [types] path directory` and
-`.parquet.parted [types] path root table-name` return the imported row count.
+`.parquet.parted [types] path-or-paths root table-name` return the imported row count.
 An options dict in place of the type vector may add `compress: true` for
 compressed (generation-2) column files; `.csv.splayed` and `.csv.parted` take
 `{compress: true}` as a leading argument.
