@@ -6881,8 +6881,14 @@ static bool pq_write_bigprefix(const char* path, int64_t rows, int64_t P) {
     ray_sys_free(f.p);
     return ok;
 }
+/* Every byte of every value, against the writer's own composition: a 'P'
+ * prefix of P bytes plus the ten-digit zero-padded row index.  Comparing a
+ * head and tail window leaves the middle unread; this compares it all. */
 static bool pq_bigprefix_values(ray_t* t, int64_t rows, int64_t P) {
     ray_t* col = ray_table_get_col_idx(t, 0);
+    char* want = (char*)ray_sys_alloc((size_t)(P+10));
+    if (!want) return false;
+    memset(want, 'P', (size_t)P);
     int64_t bad = 0;
     for (int64_t i = 0; i < rows; i++) {
         size_t len = 0; const char* p = NULL; ray_t* atom = NULL;
@@ -6891,10 +6897,11 @@ static bool pq_bigprefix_values(ray_t* t, int64_t rows, int64_t P) {
             if (atom) { p = ray_str_ptr(atom); len = ray_str_len(atom); }
         } else p = ray_str_vec_get(col, i, &len);
         char tail[24]; int tn = snprintf(tail, sizeof(tail), "%010lld", (long long)i);
-        if (!p || len != (size_t)(P+10) || memcmp(p, "PPPP", 4) ||
-            memcmp(p+P, tail, (size_t)tn)) bad++;
+        memcpy(want+P, tail, (size_t)tn);
+        if (!p || len != (size_t)(P+10) || memcmp(p, want, (size_t)(P+10))) bad++;
         if (atom) ray_release(atom);
     }
+    ray_sys_free(want);
     if (bad) fprintf(stderr, "  delta bigprefix: %lld bad values\n", (long long)bad);
     return bad == 0;
 }
