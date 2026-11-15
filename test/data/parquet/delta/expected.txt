@@ -281,6 +281,17 @@ values
 6 N
 7 N
 
+fixture duckdb-deflevel.parquet
+rows 1000
+nulls 334
+minlen 2
+maxlen 4
+totallen 2592
+distinct 666
+digest 8e7cb75063493f5e801ad03e5340f426
+anchors first v1 v2 v4 v5 v7 v8 v10 v11
+anchors last v994 v995 v997 v998
+
 fixture duckdb-v2-mixed.parquet
 rows 100000
 nulls 0

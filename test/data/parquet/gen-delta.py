@@ -22,6 +22,9 @@ Value formulas (10,000 rows unless stated):
   dba-empty (8 rows)                                 ["", "a", "", "ab", "", "abc", "", ""]
   unsupported-bss (8 rows)                           id = 0..7, BYTE_STREAM_SPLIT
   duckdb-v2-mixed (100,000 rows)                     the DuckDB COPY at the end of main()
+  duckdb-deflevel (1,000 rows)                       id = 0..999, name = 'v' || id, null when
+      range % 3 == 0; DuckDB-written, definition-level stream over-declared
+      (the PQ_DEF_STRICT counterfactual fails with 'excess definition levels')
 
 Page layouts: data_page_version 1.0 except the *-v2page and dbp-i32-nulls-v2,
 dbp-i32-overflow and dba-nulls-v2 files (2.0); use_dictionary=False;
@@ -151,6 +154,17 @@ def main():
     # RLE_DICTIONARY BYTE_ARRAY column, DATA_PAGE v1 headers.
     sql = ("COPY (SELECT range::BIGINT AS id, 'track_' || (range % 1000) AS name "
            "FROM range(100000)) TO '" + os.path.join(OUT, "duckdb-v2-mixed.parquet") +
+           "' (FORMAT parquet, COMPRESSION uncompressed, PARQUET_VERSION V2);")
+    subprocess.run(["duckdb", "-c", sql], check=True)
+
+    # DuckDB's definition-level streams over-declare the final bit-packed run.
+    # The probe: DuckDB 1.5.6 writes DELTA_LENGTH_BYTE_ARRAY, not
+    # DELTA_BYTE_ARRAY, for a unique-string column (parquet_metadata), so the
+    # DBA fixtures above stay pyarrow-written.  This file exercises the
+    # definition-level tolerance half (PQ_DEF_STRICT makes it fail).
+    sql = ("COPY (SELECT CASE WHEN range % 3 = 0 THEN NULL "
+           "ELSE 'v' || range::VARCHAR END AS name, range::BIGINT AS id FROM range(1000)) TO '"
+           + os.path.join(OUT, "duckdb-deflevel.parquet") +
            "' (FORMAT parquet, COMPRESSION uncompressed, PARQUET_VERSION V2);")
     subprocess.run(["duckdb", "-c", sql], check=True)
 

@@ -5536,6 +5536,13 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
     const char* srows = pq_expect_get(&e, "rows");
     int64_t want_rows = srows ? strtoll(srows, NULL, 10) : -1;
     if (want_rows < 0) { fprintf(stderr, "  delta %s: no rows field\n", fixture); return false; }
+    /* dba-prefix-long records the repeated prefix and the per-row suffix
+     * instead of a 32-byte anchor token; its anchor rows are checked whole. */
+    int64_t long_pre = -1; char long_char = 0;
+    { const char* s = pq_expect_get(&e, "prefix_len"); if (s) long_pre = strtoll(s, NULL, 10); }
+    { const char* s = pq_expect_get(&e, "prefix_char"); if (s && s[0]) long_char = s[0]; }
+    bool long_first[8], long_last[4], long_bad = false;
+    memset(long_first, 0, sizeof(long_first)); memset(long_last, 0, sizeof(long_last));
     char pfx[16], key[64];
     snprintf(pfx, sizeof(pfx), "%s%s", prefix, prefix[0] ? "_" : "");
     /* The suffix width is the recorded anchor_suffix token's width. */
@@ -5577,6 +5584,22 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
             size_t len = 0;
             const char* sp = ray_str_vec_get(colv, i, &len);
             bool isnull = ray_vec_is_null(colv, i);
+            if (e.nv) {   /* the full-value section of a small fixture */
+                char tok[64];
+                if (isnull) snprintf(tok, sizeof(tok), "N");
+                else {
+                    size_t take = len < sizeof(tok)-1 ? len : sizeof(tok)-1;
+                    if (take) memcpy(tok, sp, take);
+                    tok[take] = '\0';
+                }
+                if (seen >= e.nv || strcmp(e.vval[seen], tok)) {
+                    fprintf(stderr, "  delta %s value row %lld: %s want %s\n", fixture,
+                            (long long)seen, isnull ? "N" : tok,
+                            seen < e.nv ? e.vval[seen] : "(none)");
+                    failed = true;
+                    break;
+                }
+            }
             if (!first_tok) pq_md5_update(&md, "|", 1);
             first_tok = false;
             if (isnull) { nulls++; pq_md5_update(&md, "NULL", 4); continue; }
@@ -5592,6 +5615,13 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
             if (nrefs < want_rows) {
                 refs[nrefs].s = copy; refs[nrefs].len = len; nrefs++;
             } else { free(copy); continue; }   /* a surplus row fails the count check */
+            if (long_pre >= 0) {   /* the long-prefix anchor, whole values */
+                bool lok = (int64_t)len == long_pre + (int64_t)suffix_w;
+                for (int64_t k = 0; lok && k < long_pre; k++) if (sp[k] != long_char) lok = false;
+                if (!lok) long_bad = true;
+                if (nrefs <= PQ_ANCHOR) long_first[nrefs-1] = lok;
+                long_last[nrefs & 3] = lok;
+            }
             if (nrefs <= PQ_ANCHOR) {
                 if (len <= 31) { memcpy(af[nrefs - 1], sp, len); af[nrefs - 1][len] = '\0'; }
                 else long_value = true;
@@ -5713,6 +5743,12 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
             ok = pq_tokens_equal(a, got, ng);
             if (!ok) fprintf(stderr, "  delta %s col %d: %sanchor suffix values (last)\n", fixture, col, pfx);
         }
+    }
+    if (ok && long_pre >= 0) {
+        ok = !long_bad;
+        for (int i = 0; ok && i < PQ_ANCHOR && i < (int)nrefs; i++) ok = long_first[i];
+        if (ok && nrefs >= 4) for (int k = 0; k < 4; k++) if (!long_last[k]) ok = false;
+        if (!ok) fprintf(stderr, "  delta %s col %d: long-prefix anchor rows\n", fixture, col);
     }
     for (int64_t i = 0; i < nrefs; i++) free((void*)refs[i].s);
     free(refs);
@@ -5873,7 +5909,7 @@ static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
 /* The test writer for delta_errors: one REQUIRED column, one DELTA data page
  * whose value stream is the crafted bytes. The page header stays consistent
  * with the file; only the codec stream is malformed. */
-static bool pq_delta_synth(const char* path, int physical, const uint8_t* stream, size_t n, int64_t rows) {
+static bool pq_delta_synth_enc(const char* path, int physical, int encoding, const uint8_t* stream, size_t n, int64_t rows) {
     pq_buf f = {0};
     pb_bytes(&f, "PAR1", 4);
     int64_t start = (int64_t)f.n;
@@ -5882,7 +5918,7 @@ static bool pq_delta_synth(const char* path, int physical, const uint8_t* stream
     pb_i(&f, &last, 2, PB_I32, (int64_t)n);
     pb_i(&f, &last, 3, PB_I32, (int64_t)n);
     pb_field(&f, &last, 5, PB_STRUCT);
-    { int l = 0; pb_i(&f, &l, 1, PB_I32, rows); pb_i(&f, &l, 2, PB_I32, 5);
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, rows); pb_i(&f, &l, 2, PB_I32, encoding);
       pb_i(&f, &l, 3, PB_I32, 3); pb_i(&f, &l, 4, PB_I32, 3); pb_byte(&f, 0); }
     pb_byte(&f, 0);
     pb_bytes(&f, stream, n);
@@ -5922,6 +5958,9 @@ static bool pq_delta_synth(const char* path, int physical, const uint8_t* stream
     if (out && fclose(out)) ok = false;
     ray_sys_free(f.p);
     return ok;
+}
+static bool pq_delta_synth(const char* path, int physical, const uint8_t* stream, size_t n, int64_t rows) {
+    return pq_delta_synth_enc(path,physical,5,stream,n,rows);
 }
 /* The v2 counterpart: an OPTIONAL column, definition levels in the page
  * body, and a declared null count the crafted case can make disagree. */
@@ -6005,6 +6044,34 @@ static bool pq_delta_error(const char* fixture, int64_t rows, const uint8_t* str
                 ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
                      msg && strstr(msg, want) != NULL;
                 if (!ok) fprintf(stderr, "  delta error %s: got %s / %s\n", fixture,
+                                 ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
+            }
+            ray_error_free(t);
+        }
+    }
+    if (r) ray_parquet_close(r);
+    unlink(path);
+    return ok;
+}
+static bool pq_delta_error_enc(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
+                               int physical, int encoding, const char* want) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-strerr-%s-%d.parquet", fixture, (int)getpid());
+    if (!pq_delta_synth_enc(path, physical, encoding, stream, n, rows)) return false;
+    ray_error_clear();
+    ray_parquet_t* r = NULL;
+    ray_t* e = ray_parquet_open(path, NULL, 65536, &r);
+    bool ok = !e && r;
+    if (e) ray_error_free(e);
+    if (ok) {
+        ray_t* t = ray_parquet_next(r);
+        ok = t && RAY_IS_ERR(t);
+        if (t) {
+            if (ok) {
+                const char* msg = ray_error_msg();
+                ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
+                     msg && strstr(msg, want) != NULL;
+                if (!ok) fprintf(stderr, "  delta str error %s: got %s / %s\n", fixture,
                                  ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
             }
             ray_error_free(t);
@@ -6123,6 +6190,146 @@ static test_result_t test_pq_delta_binary_packed(void) {
 #endif
     PASS();
 }
+/* ---- Stage 2: DELTA byte-array streams ------------------------------------
+ * A minimal DELTA_BINARY_PACKED encoder, enough to build fixture pages and
+ * malformed streams in the test tree. */
+static void pq_dpb_head(pq_buf* b, int64_t total, int64_t first) {
+    pb_var(b, 128); pb_var(b, 4); pb_var(b, (uint64_t)total); pb_zz(b, first);
+}
+static unsigned pq_dpb_width(uint64_t x) { unsigned n = 0; while (x) { n++; x >>= 1; } return n; }
+static void pq_dpb_pack(pq_buf* b, const uint64_t* v, int n, unsigned width) {
+    if (!width) return;
+    uint64_t acc = 0; unsigned bits = 0;
+    for (int i = 0; i < n; i++) {
+        acc |= v[i] << bits; bits += width;
+        while (bits >= 8) { pb_byte(b, (uint8_t)acc); acc >>= 8; bits -= 8; }
+    }
+    if (bits) pb_byte(b, (uint8_t)acc);
+}
+static void pq_dpb_write(pq_buf* b, const int64_t* v, int n) {
+    pq_dpb_head(b, n, v[0]);
+    for (int start = 1; start < n; start += 128) {
+        int m = n-start < 128 ? n-start : 128;
+        int64_t d[128], mn = INT64_MAX;
+        for (int i = 0; i < m; i++) { d[i] = v[start+i]-v[start+i-1]; if (d[i] < mn) mn = d[i]; }
+        pb_zz(b, mn);
+        uint64_t rem[128]; unsigned width[4] = {0,0,0,0};
+        for (int i = 0; i < m; i++) rem[i] = (uint64_t)(d[i]-mn);
+        for (int mi = 0; mi < 4; mi++) {
+            uint64_t mx = 0;
+            for (int i = mi*32; i < m && i < mi*32+32; i++) if (rem[i] > mx) mx = rem[i];
+            width[mi] = pq_dpb_width(mx); pb_byte(b, (uint8_t)width[mi]);
+        }
+        for (int mi = 0; mi < 4; mi++) {
+            uint64_t v32[32] = {0}; int cnt = 0;
+            for (int i = mi*32; i < m && i < mi*32+32; i++) v32[cnt++] = rem[i];
+            if (cnt) pq_dpb_pack(b, v32, 32, width[mi]);
+        }
+    }
+}
+/* One all-present definition-level stream, 4-byte length prefixed. */
+static void pq_levels_all(pq_buf* b, int64_t rows) {
+    pq_buf lv = {0};
+    pb_var(&lv, (uint64_t)rows << 1); pb_byte(&lv, 1);   /* level 1: present */
+    uint32_t n = (uint32_t)lv.n;
+    pb_bytes(b, &n, 4); pb_bytes(b, lv.p, lv.n);
+    ray_sys_free(lv.p);
+}
+static void pq_ids_packed(pq_buf* b, const uint8_t* ids, int n, unsigned width) {
+    int groups = (n+7)/8;
+    pb_var(b, (uint64_t)((groups<<1)|1));
+    uint64_t v[8*64]; int cnt = 0;
+    for (int g = 0; g < groups; g++)
+        for (int i = 0; i < 8; i++) v[cnt++] = ids[g*8+i < n ? g*8+i : n-1];
+    pq_dpb_pack(b, v, cnt, width);   /* the bit packer is encoding-agnostic */
+}
+static void pq_page_v1(pq_buf* f, const pq_buf* body, int encoding, int64_t rows) {
+    int last = 0;
+    pb_i(f, &last, 1, PB_I32, 0);
+    pb_i(f, &last, 2, PB_I32, (int64_t)body->n);
+    pb_i(f, &last, 3, PB_I32, (int64_t)body->n);
+    pb_field(f, &last, 5, PB_STRUCT);
+    { int l = 0; pb_i(f, &l, 1, PB_I32, rows); pb_i(f, &l, 2, PB_I32, encoding);
+      pb_i(f, &l, 3, PB_I32, 3); pb_i(f, &l, 4, PB_I32, 3); pb_byte(f, 0); }
+    pb_byte(f, 0);
+    pb_bytes(f, body->p, body->n);
+}
+static void pq_page_dict(pq_buf* f, const pq_buf* body, int64_t entries) {
+    int last = 0;
+    pb_i(f, &last, 1, PB_I32, 2);
+    pb_i(f, &last, 2, PB_I32, (int64_t)body->n);
+    pb_i(f, &last, 3, PB_I32, (int64_t)body->n);
+    pb_field(f, &last, 7, PB_STRUCT);
+    { int l = 0; pb_i(f, &l, 1, PB_I32, entries); pb_i(f, &l, 2, PB_I32, 0); pb_byte(f, 0); }
+    pb_byte(f, 0);
+    pb_bytes(f, body->p, body->n);
+}
+static void pq_plain_str(pq_buf* b, const char* s) {
+    uint32_t n = (uint32_t)strlen(s);
+    pb_bytes(b, &n, 4); pb_bytes(b, s, n);
+}
+/* A one-column file whose single chunk holds a dictionary page and the given
+ * v1 data pages in order: the PLAIN/dictionary/DELTA transitions. */
+static bool pq_write_transitions(const char* path) {
+    pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
+    int64_t dict_off = (int64_t)f.n;
+    { pq_buf d = {0}; pq_plain_str(&d, "alpha"); pq_plain_str(&d, "beta");
+      pq_page_dict(&f, &d, 2); ray_sys_free(d.p); }
+    int64_t data_off = (int64_t)f.n;
+    { pq_buf b = {0}; pq_levels_all(&b, 4); pb_byte(&b, 1);
+      static const uint8_t ids[] = {0,1,0,1}; pq_ids_packed(&b, ids, 4, 1);
+      pq_page_v1(&f, &b, 8, 4); ray_sys_free(b.p); }
+    { pq_buf b = {0}; pq_levels_all(&b, 4);
+      pq_plain_str(&b, "plain"); pq_plain_str(&b, "x"); pq_plain_str(&b, "plain"); pq_plain_str(&b, "x");
+      pq_page_v1(&f, &b, 0, 4); ray_sys_free(b.p); }
+    { pq_buf b = {0}; pq_levels_all(&b, 4);
+      int64_t pre[] = {0,5,0,4}, suf[] = {6,1,5,1};
+      pq_dpb_write(&b, pre, 4); pq_dpb_write(&b, suf, 4);
+      pb_bytes(&b, "alphaX", 6); pb_bytes(&b, "Y", 1); pb_bytes(&b, "betaZ", 5); pb_bytes(&b, "W", 1);
+      pq_page_v1(&f, &b, 7, 4); ray_sys_free(b.p); }
+    { pq_buf b = {0}; pq_levels_all(&b, 2);
+      pq_plain_str(&b, "tail1"); pq_plain_str(&b, "tail2");
+      pq_page_v1(&f, &b, 0, 2); ray_sys_free(b.p); }
+    int64_t size = (int64_t)f.n - dict_off;
+    int64_t footer = (int64_t)f.n, rows = 14;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 1); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 1);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "name", 4);
+      pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    { int l = 0;
+      pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+      { int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, data_off);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 6);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 4, PB_I32);
+          pb_zz(&f, 0); pb_zz(&f, 2); pb_zz(&f, 8); pb_zz(&f, 7);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "name", 4);
+          pb_i(&f, &lm, 4, PB_I32, 0);
+          pb_i(&f, &lm, 5, PB_I64, rows);
+          pb_i(&f, &lm, 6, PB_I64, size);
+          pb_i(&f, &lm, 7, PB_I64, size);
+          pb_i(&f, &lm, 9, PB_I64, data_off);
+          pb_i(&f, &lm, 11, PB_I64, dict_off); pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      pb_i(&f, &l, 2, PB_I64, size); pb_i(&f, &l, 3, PB_I64, rows); pb_byte(&f, 0); }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    return ok;
+}
 static test_result_t test_pq_delta_errors(void) {
     pq_buf b = {0};
     /* Truncated header varint. */
@@ -6174,6 +6381,43 @@ static test_result_t test_pq_delta_errors(void) {
         ray_sys_free(s.p);
     }
     ray_sys_free(b.p);
+    /* DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY stream defects. */
+    {
+        pq_buf s = {0};
+        pb_byte(&s, 0x80);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-header", 1, s.p, s.n, 6, 6, "truncated delta header"));
+        s.n = 0;
+        pq_dpb_head(&s, 2, 0); pb_zz(&s, 1); pb_byte(&s, 8); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-body", 2, s.p, s.n, 6, 6, "truncated delta miniblock"));
+        s.n = 0;
+        pq_dpb_head(&s, 2, 0); pb_zz(&s, 0); pb_byte(&s, 33); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-width", 2, s.p, s.n, 6, 6, "invalid delta bit width"));
+        s.n = 0;
+        pq_dpb_head(&s, 1, 100);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-length", 1, s.p, s.n, 6, 6, "delta length exceeds the page"));
+        s.n = 0;
+        pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x7f);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-trail", 1, s.p, s.n, 6, 6, "excess delta values"));
+        s.n = 0;
+        pq_dpb_head(&s, 1, 0);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-count", 2, s.p, s.n, 6, 6, "delta value count exceeds the stream header"));
+        ray_sys_free(s.p);
+    }
+    {
+        pq_buf s = {0};
+        pq_dpb_head(&s, 1, 1); pq_dpb_head(&s, 1, 0);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-prefix", 1, s.p, s.n, 6, 7, "delta prefix exceeds the previous value"));
+        s.n = 0;
+        pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x80);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-suffix-header", 1, s.p, s.n, 6, 7, "truncated delta header"));
+        s.n = 0;
+        pq_dpb_head(&s, 1, 0); pq_dpb_head(&s, 2, 0);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-counts", 2, s.p, s.n, 6, 7, "invalid delta length count"));
+        s.n = 0;
+        pq_dpb_head(&s, 1, 0); pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x7f);
+        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-trail", 1, s.p, s.n, 6, 7, "excess delta values"));
+        ray_sys_free(s.p);
+    }
     PASS();
 }
 static test_result_t test_pq_delta_refusal(void) {
@@ -6193,8 +6437,349 @@ static test_result_t test_pq_delta_refusal(void) {
     PASS();
 }
 
+/* The transitions file's values, in file order. */
+static bool pq_transitions_check(int64_t batch) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-transitions-%d.parquet", (int)getpid());
+    if (!pq_write_transitions(path)) return false;
+    static const char* want[] = {"alpha","beta","alpha","beta","plain","x","plain","x",
+                                 "alphaX","alphaY","betaZ","betaW","tail1","tail2"};
+    ray_parquet_t* r = NULL;
+    ray_t* err = ray_parquet_open(path, NULL, batch, &r);
+    bool ok = !err;
+    if (err) ray_error_free(err);
+    int64_t at = 0;
+    while (ok) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        if (RAY_IS_ERR(t)) {
+            fprintf(stderr, "  transitions read: %s / %s\n", ray_err_code(t), ray_error_msg());
+            ray_error_free(t); ok = false; break;
+        }
+        ray_t* col = ray_table_get_col_idx(t, 0);
+        for (int64_t i = 0; ok && i < ray_table_nrows(t); i++, at++) {
+            size_t n = 0; const char* p = ray_str_vec_get(col, i, &n);
+            if (at >= 14 || n != strlen(want[at]) || (n && memcmp(p, want[at], n))) {
+                fprintf(stderr, "  transitions row %lld: %.*s want %s\n", (long long)at,
+                        (int)n, p ? p : "", at < 14 ? want[at] : "?");
+                ok = false;
+            }
+        }
+        ray_release(t);
+    }
+    if (ok && at != 14) { fprintf(stderr, "  transitions rows %lld/14\n", (long long)at); ok = false; }
+    if (r) ray_parquet_close(r);
+    unlink(path);
+    return ok;
+}
+static test_result_t test_pq_delta_transitions(void) {
+    int64_t batches[] = {1, 3, 5, 14, 65536};
+    for (size_t i = 0; i < sizeof(batches)/sizeof(batches[0]); i++)
+        TEST_ASSERT_TRUE(pq_transitions_check(batches[i]));
+    PASS();
+}
+/* The batch path owns its strings: a retained batch survives the next read
+ * and the reader close (section 3.3). */
+static bool pq_delta_keep_batch(const char* fixture) {
+    char path[220];
+    snprintf(path, sizeof(path), "%s%s", DELTA_FIX, fixture);
+    ray_parquet_t* r = NULL;
+    ray_error_clear();
+    ray_t* err = ray_parquet_open(path, NULL, 1000, &r);
+    if (err || !r) { if (err) ray_error_free(err); return false; }
+    ray_t* kept = ray_parquet_next(r);
+    bool ok = kept && !RAY_IS_ERR(kept);
+    if (ok) {
+        ray_t* next = ray_parquet_next(r);
+        if (next && RAY_IS_ERR(next)) { ray_error_free(next); ok = false; }
+        else if (next) ray_release(next);
+    }
+    ray_parquet_close(r);
+    if (ok) {
+        ray_t* col = ray_table_get_col_idx(kept, 0);
+        for (int64_t i = 0; ok && i < ray_table_nrows(kept); i++) {
+            char want[32]; int n = snprintf(want, sizeof(want), "track_%03d", (int)(i % 500));
+            size_t len = 0; const char* p = ray_str_vec_get(col, i, &len);
+            if ((int)len != n || memcmp(p, want, len)) {
+                fprintf(stderr, "  delta lifetime %s row %lld: %.*s want %s\n",
+                        fixture, (long long)i, (int)len, p ? p : "", want);
+                ok = false;
+            }
+        }
+    }
+    if (kept) ray_release(kept);
+    return ok;
+}
+static test_result_t test_pq_delta_strings(void) {
+    static const char* fixtures[] = {
+        "dlba-v1.parquet", "dlba-v2page.parquet", "dba-v1.parquet",
+        "dba-v2page.parquet", "dba-nulls-v2.parquet", "dba-empty.parquet",
+        "dba-prefix-long.parquet", "duckdb-deflevel.parquet",
+    };
+    int64_t batches[] = {3, 4096, 65536};
+    for (size_t i = 0; i < sizeof(fixtures)/sizeof(fixtures[0]); i++)
+        for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++)
+            TEST_ASSERT_TRUE(pq_delta_check(fixtures[i], RAY_STR, batches[b]));
+    TEST_ASSERT_TRUE(pq_delta_check("dba-v1.parquet", RAY_STR, 1));
+    TEST_ASSERT_TRUE(pq_delta_check("dba-nulls-v2.parquet", RAY_STR, 7));
+    /* Strict mode refuses the first empty BYTE_ARRAY value (PQ_PUT_FAIL). */
+    ray_error_clear();
+    ray_t* opts = pq_strict_options();
+    TEST_ASSERT_NOT_NULL(opts);
+    ray_t* se = ray_parquet_read(DELTA_FIX "dba-empty.parquet", opts);
+    ray_release(opts);
+    TEST_ASSERT_TRUE(se && RAY_IS_ERR(se));
+    TEST_ASSERT_TRUE(ray_err_code(se) && !strcmp(ray_err_code(se), "parquet"));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "value conversion or allocation failed"));
+    ray_error_free(se);
+    /* The returned strings stay valid after the next read and after close. */
+    TEST_ASSERT_TRUE(pq_delta_keep_batch("dlba-v1.parquet"));
+    TEST_ASSERT_TRUE(pq_delta_keep_batch("dba-v1.parquet"));
+#if defined(DEBUG)
+    /* The page-local lengths walk is interruptible at its 4,096-value cadence:
+     * the third checkpoint stops a 10,000-value page at 8,192 lengths. */
+    ray_clear_interrupt();
+    ray_parquet_t* cr = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "dlba-v1.parquet", NULL, 65536, &cr));
+    ray_parquet_test_delta_interrupt_after(3);
+    ray_t* ct = ray_parquet_next(cr);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(ct && RAY_IS_ERR(ct));
+    TEST_ASSERT_TRUE(ray_err_code(ct) && !strcmp(ray_err_code(ct), "cancel"));
+    TEST_ASSERT_TRUE(ray_parquet_test_delta_values() > 4096 &&
+                     ray_parquet_test_delta_values() <= 8192);
+    ray_error_free(ct);
+    ray_parquet_close(cr);
+#endif
+    PASS();
+}
+/* The symbol import's decision for a DELTA string column: DELTA_BYTE_ARRAY is
+ * grouped regardless of the forced mode; DELTA_LENGTH_BYTE_ARRAY takes either. */
+static test_result_t test_pq_delta_symbol_import(void) {
+    int64_t sym = ray_sym_intern("SYM",3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
+    struct { const char* fix; const char* mode; int enc; int grouped; int64_t rows; } runs[] = {
+        {"dba-v1.parquet","direct",7,1,10000},
+        {"dba-v1.parquet","grouped",7,1,10000},
+        {"dba-prefix-long.parquet","grouped",7,1,512},
+        {"dlba-v1.parquet","direct",6,0,10000},
+        {"dlba-v1.parquet","grouped",6,1,10000},
+    };
+    const char* names[] = {"name"};
+    for (size_t i = 0; i < sizeof(runs)/sizeof(runs[0]); i++) {
+        char src[220], dir[200], domain[220];
+        snprintf(src, sizeof(src), "%s%s", DELTA_FIX, runs[i].fix);
+        snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-dsym-%d-%zu", (int)getpid(), i);
+        snprintf(domain, sizeof(domain), "%s/.sym", dir);
+        pq_set_symmode(runs[i].mode);
+        ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+        pq_set_symmode(NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT_EQ_I(res->i64, runs[i].rows);
+        ray_release(res);
+#if defined(DEBUG)
+        int64_t m = -1, e = -1, g = -1;
+        ray_parquet_test_import_seam(0, &m, &e, &g);
+        TEST_ASSERT_EQ_I(e, runs[i].enc);
+        TEST_ASSERT_EQ_I(g, runs[i].grouped);
+        TEST_ASSERT_EQ_I(m, runs[i].grouped ? 2 : 1);
+#endif
+        ray_t* tbl = ray_read_splayed(dir, domain);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+        TEST_ASSERT_EQ_I(ray_table_nrows(tbl), runs[i].rows);
+        ray_t* col = ray_table_get_col_idx(tbl, 0);
+        TEST_ASSERT_EQ_I(col->type, RAY_SYM);
+        int64_t spots[] = {0, runs[i].rows/2, runs[i].rows-1};
+        for (int k = 0; k < 3; k++) {
+            int64_t row = spots[k];
+            ray_t* atom = ray_sym_vec_cell(col, row);
+            TEST_ASSERT_NOT_NULL(atom);
+            const char* text = ray_str_ptr(atom); size_t len = ray_str_len(atom);
+            if (runs[i].enc == 7 && runs[i].rows == 512) {
+                char tail[16]; int tn = snprintf(tail, sizeof(tail), "%04d", (int)row);
+                TEST_ASSERT_EQ_I(len, 65540);
+                TEST_ASSERT_TRUE(!memcmp(text, "PPPP", 4) && !memcmp(text+65532, "PPPP", 4));
+                TEST_ASSERT_TRUE(!memcmp(text+65536, tail, (size_t)tn));
+            } else {
+                char want[32]; int wn = snprintf(want, sizeof(want), "track_%03d", (int)(row % 500));
+                TEST_ASSERT_EQ_I(len, (size_t)wn);
+                TEST_ASSERT_TRUE(!memcmp(text, want, (size_t)wn));
+            }
+        }
+        ray_release(tbl);
+        pq_remove_native(dir, names, 1);
+    }
+    ray_release(types);
+    PASS();
+}
+/* A two-column file of ten 1,000-row v1 data pages per chunk: `id` INT64
+ * DELTA_BINARY_PACKED (with a ColumnIndex/OffsetIndex so a range excludes
+ * whole pages) and `name` BYTE_ARRAY DELTA_BYTE_ARRAY.  A range read skips
+ * pages without decoding, then decodes intermediate pages, so both codecs'
+ * page state is reset across the skipped pages. */
+static bool pq_write_skip(const char* path) {
+    enum { PAGES = 10, ROWS = 1000, TOTAL = PAGES*ROWS };
+    int64_t page_off[PAGES], page_sz[PAGES];
+    pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
+    int64_t id_off = (int64_t)f.n;
+    for (int p = 0; p < PAGES; p++) {
+        int64_t v[ROWS];
+        for (int i = 0; i < ROWS; i++) v[i] = p*ROWS+i;
+        pq_buf body = {0}; pq_dpb_write(&body, v, ROWS);
+        page_off[p] = (int64_t)f.n; pq_page_v1(&f, &body, 5, ROWS);
+        page_sz[p] = (int64_t)f.n - page_off[p];
+        ray_sys_free(body.p);
+    }
+    int64_t id_size = (int64_t)f.n - id_off;
+    int64_t name_off = (int64_t)f.n;
+    /* 700-row pages, deliberately not the id column's 1,000: an interval on
+     * the id grid then discards a PARTIAL byte-array page, so pq_discard
+     * decodes and drops part of a page and the DBA history still advances. */
+    for (int64_t first = 0; first < TOTAL; ) {
+        int64_t n = TOTAL-first < 700 ? TOTAL-first : 700;
+        int64_t pre[700], suf[700];
+        for (int64_t i = 0; i < n; i++) { pre[i] = 0; suf[i] = 8; }
+        pq_buf body = {0};
+        pq_dpb_write(&body, pre, (int)n); pq_dpb_write(&body, suf, (int)n);
+        for (int64_t i = 0; i < n; i++) {
+            char s[32]; snprintf(s, sizeof(s), "row_%04d", (int)(first+i));
+            pb_bytes(&body, s, 8);
+        }
+        pq_page_v1(&f, &body, 7, n);
+        ray_sys_free(body.p);
+        first += n;
+    }
+    int64_t name_size = (int64_t)f.n - name_off;
+    int64_t oi_off = (int64_t)f.n;
+    { pq_buf oi = {0}; int last = 0;
+      pb_field(&oi, &last, 1, PB_LIST); pb_list(&oi, PAGES, PB_STRUCT);
+      for (int p = 0; p < PAGES; p++) {
+          int l = 0; pb_i(&oi, &l, 1, PB_I64, page_off[p]);
+          pb_i(&oi, &l, 2, PB_I32, page_sz[p]);
+          pb_i(&oi, &l, 3, PB_I64, p*ROWS); pb_byte(&oi, 0);
+      }
+      pb_byte(&oi, 0);
+      pb_bytes(&f, oi.p, oi.n); ray_sys_free(oi.p); }
+    int64_t oi_len = (int64_t)f.n - oi_off;
+    int64_t ci_off = (int64_t)f.n;
+    { pq_buf ci = {0}; int last = 0;
+      pb_field(&ci, &last, 1, PB_LIST); pb_list(&ci, PAGES, 1);
+      for (int p = 0; p < PAGES; p++) pb_byte(&ci, 2);   /* compact bool false */
+      pb_field(&ci, &last, 2, PB_LIST); pb_list(&ci, PAGES, PB_BIN);
+      for (int p = 0; p < PAGES; p++) { int64_t mn = p*ROWS; pb_bin(&ci, (const char*)&mn, 8); }
+      pb_field(&ci, &last, 3, PB_LIST); pb_list(&ci, PAGES, PB_BIN);
+      for (int p = 0; p < PAGES; p++) { int64_t mx = p*ROWS+ROWS-1; pb_bin(&ci, (const char*)&mx, 8); }
+      pb_i(&ci, &last, 4, PB_I32, 1);
+      pb_byte(&ci, 0);
+      pb_bytes(&f, ci.p, ci.n); ray_sys_free(ci.p); }
+    int64_t ci_len = (int64_t)f.n - ci_off;
+    int64_t footer = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 3, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 2); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 2); pb_i(&f, &l, 3, PB_I32, 0);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "id", 2); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, 6); pb_i(&f, &l, 3, PB_I32, 0);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "name", 4);
+      pb_i(&f, &l, 6, PB_I32, 0); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, TOTAL);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    { int l = 0;
+      pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+      { int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, id_off);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 2);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 1, PB_I32); pb_zz(&f, 5);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "id", 2);
+          pb_i(&f, &lm, 4, PB_I32, 0); pb_i(&f, &lm, 5, PB_I64, TOTAL);
+          pb_i(&f, &lm, 6, PB_I64, id_size); pb_i(&f, &lm, 7, PB_I64, id_size);
+          pb_i(&f, &lm, 9, PB_I64, id_off); pb_byte(&f, 0); }
+        pb_i(&f, &lc, 4, PB_I64, oi_off); pb_i(&f, &lc, 5, PB_I32, oi_len);
+        pb_i(&f, &lc, 6, PB_I64, ci_off); pb_i(&f, &lc, 7, PB_I32, ci_len);
+        pb_byte(&f, 0); }
+      { int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, name_off);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 6);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 1, PB_I32); pb_zz(&f, 7);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "name", 4);
+          pb_i(&f, &lm, 4, PB_I32, 0); pb_i(&f, &lm, 5, PB_I64, TOTAL);
+          pb_i(&f, &lm, 6, PB_I64, name_size); pb_i(&f, &lm, 7, PB_I64, name_size);
+          pb_i(&f, &lm, 9, PB_I64, name_off); pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      pb_i(&f, &l, 2, PB_I64, id_size+name_size); pb_i(&f, &l, 3, PB_I64, TOTAL); pb_byte(&f, 0); }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    return ok;
+}
+static test_result_t test_pq_delta_skip(void) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-dskip-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_write_skip(path));
+    int64_t id = ray_sym_intern("id",2);
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path, NULL, 65536, &r));
+    TEST_ASSERT_NULL(ray_parquet_range(r, id, 2500, 3499));
+    int64_t count = 0;
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        ray_t* idc = ray_table_get_col_idx(t, 0);
+        ray_t* nmc = ray_table_get_col_idx(t, 1);
+        for (int64_t i = 0; i < ray_table_nrows(t); i++, count++) {
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(idc))[i], 2500+count);
+            char want[16]; int wn = snprintf(want, sizeof(want), "row_%04d", (int)(2500+count));
+            size_t len = 0; const char* s = ray_str_vec_get(nmc, i, &len);
+            TEST_ASSERT_EQ_I(len, (size_t)wn);
+            TEST_ASSERT_TRUE(!memcmp(s, want, (size_t)wn));
+        }
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(count, 1000);
+    TEST_ASSERT_TRUE(ray_parquet_pages_skipped(r) >= 8);
+    TEST_ASSERT_EQ_I(ray_parquet_groups_skipped(r), 0);
+    ray_parquet_close(r);
+    /* A whole-file read proves the per-page DELTA reset after the skips. */
+    r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path, NULL, 777, &r));
+    count = 0;
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        ray_t* idc = ray_table_get_col_idx(t, 0);
+        ray_t* nmc = ray_table_get_col_idx(t, 1);
+        for (int64_t i = 0; i < ray_table_nrows(t); i++, count++) {
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(idc))[i], count);
+            char want[16]; int wn = snprintf(want, sizeof(want), "row_%04d", (int)count);
+            size_t len = 0; const char* s = ray_str_vec_get(nmc, i, &len);
+            TEST_ASSERT_EQ_I(len, (size_t)wn);
+            TEST_ASSERT_TRUE(!memcmp(s, want, (size_t)wn));
+        }
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(count, 10000);
+    ray_parquet_close(r);
+    unlink(path);
+    PASS();
+}
 const test_entry_t parquet_entries[] = {
     {"parquet/delta_binary_packed",test_pq_delta_binary_packed,pq_setup,pq_teardown},
+    {"parquet/delta_strings",test_pq_delta_strings,pq_setup,pq_teardown},
+    {"parquet/delta_transitions",test_pq_delta_transitions,pq_setup,pq_teardown},
+    {"parquet/delta_symbol_import",test_pq_delta_symbol_import,pq_setup,pq_teardown},
+    {"parquet/delta_skip",test_pq_delta_skip,pq_setup,pq_teardown},
     {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
