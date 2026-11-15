@@ -528,6 +528,38 @@ static test_result_t test_pq_sync_fallback(void) {
     ray_release(types);
     PASS();
 }
+/* More files than one batch (PQ_FILE_BATCH = 32) import in parallel and still make
+ * one table: every row, partitions numbered in file order, one symbol vocabulary. */
+static test_result_t test_pq_parted_many_files(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    enum { FILES = 70 };
+    const char* files[FILES];
+    for (int i = 0; i < FILES; i++) files[i] = FIX "flat-1-v2.parquet";
+    char root[160], sym[200], leaf[220];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-many-%d",(int)getpid());
+    ray_t* n = ray_parquet_parted_files(files,FILES,root,"hits",types);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,FILES*18); ray_release(n);
+    ray_t* t = ray_read_parted(root,"hits");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),FILES*18); ray_release(t);
+    snprintf(sym,sizeof(sym),"%s/.sym",root);
+    int parts = 0; int64_t rows = 0;
+    for (;; parts++) {
+        snprintf(leaf,sizeof(leaf),"%s/%d/hits",root,parts);
+        if (access(leaf,F_OK) != 0) break;
+        ray_t* p = ray_read_splayed(leaf,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(p));
+        rows += ray_table_nrows(p);
+        /* The same string in every file is one symbol: its length is the same wherever it landed. */
+        TEST_ASSERT_EQ_I(ray_str_len(ray_sym_vec_cell(ray_table_get_col_idx(p,1),1)),31);
+        ray_release(p);
+    }
+    TEST_ASSERT_TRUE(parts >= FILES && parts%FILES == 0);
+    TEST_ASSERT_EQ_I(rows,FILES*18);
+    pq_rm_rf(root);
+    ray_release(types);
+    PASS();
+}
 static test_result_t test_pq_matrix(void) {
     const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
                            FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet",FIX "flat-5raw-v1.parquet",FIX "flat-5raw-v2.parquet"};
@@ -5487,6 +5519,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/decimal-rounding",test_pq_decimal_rounding,pq_setup,pq_teardown},
     {"parquet/unsupported-columns",test_pq_unsupported_columns,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
+    {"parquet/parted_many_files",test_pq_parted_many_files,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
     {"parquet/sync_tree",test_pq_sync_tree,pq_setup,pq_teardown},
     {"parquet/sync_fallback",test_pq_sync_fallback,pq_setup,pq_teardown},

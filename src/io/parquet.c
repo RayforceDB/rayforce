@@ -2062,11 +2062,15 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
     }
     return NULL;
 }
+/* The row groups of one or several readers, written as a single list of tasks so
+ * that the groups of many small files run in parallel, not file by file. */
 typedef struct {
-    ray_parquet_t* parent;
+    ray_parquet_t* const* parents; /* the readers */
+    int64_t* const* offsets;       /* per reader: the partition of each row group */
+    const int64_t* starts;         /* per reader: its first task; nparents+1 entries */
+    int nparents;
     const char *root, *table;
-    int64_t *offsets;
-    ray_t** errors;
+    ray_t** errors;                /* per task */
     bool durable;
     pq_task_msg* emsg;             /* the failed tasks' messages */
 } pq_native_work;
@@ -2147,48 +2151,83 @@ static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* ta
 }
 static void pq_write_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_native_work* w = ptr;
-    for (int64_t g = start; g < end; g++) {
-        ray_parquet_t* r = pq_group_reader(w->parent,g,w->parent->nselected);
-        if (!r) { w->errors[g] = ray_error("oom",NULL); pq_task_msg_note(w->emsg,g); continue; }
-        w->errors[g] = pq_write_reader(r,w->root,w->table,w->offsets[g],w->durable);
-        if (w->errors[g]) pq_task_msg_note(w->emsg,g);
+    for (int64_t t = start; t < end; t++) {
+        int f = 0;
+        while (t >= w->starts[f+1]) f++;
+        int64_t g = t-w->starts[f];
+        ray_parquet_t* r = pq_group_reader(w->parents[f],g,w->parents[f]->nselected);
+        if (!r) { w->errors[t] = ray_error("oom",NULL); pq_task_msg_note(w->emsg,t); continue; }
+        w->errors[t] = pq_write_reader(r,w->root,w->table,w->offsets[f][g],w->durable);
+        if (w->errors[t]) pq_task_msg_note(w->emsg,t);
         ray_parquet_close(r);
     }
 }
-static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* table,
-                              bool durable, int64_t base, int64_t* parts) {
+/* The partitions of one reader's row groups, numbered from base: offsets (ng+1
+ * entries) gets each group's first partition and parts how many there are. A
+ * reader with no row group still writes its one (empty) partition. */
+static ray_t* pq_plan_groups(ray_parquet_t* r, int64_t base, int64_t* offsets, int64_t* parts) {
     *parts = 0;
-    int64_t ng = r->ngroups;
-    int64_t* offsets = ray_alloc_raw((size_t)(ng+1)*sizeof(*offsets));
-    ray_t** errors = ray_calloc_raw((size_t)(ng+1)*sizeof(*errors));
-    ray_t* err = NULL;
-    if (!offsets || !errors) { err = ray_error("oom",NULL); goto done; }
-    for (int64_t g = 0; g < ng; g++) {
+    for (int64_t g = 0; g < r->ngroups; g++) {
         pq_span fields[8];
-        if (!pq_fields(r->groups[g],fields,8)) { err = pq_error("invalid row group"); goto done; }
+        if (!pq_fields(r->groups[g],fields,8)) return pq_error("invalid row group");
         int64_t rows = pq_get(fields[3],-1);
-        if (rows < 0) { err = pq_error("invalid row group row count"); goto done; }
-        if (base > INT64_MAX-*parts) { err = pq_error("too many partitions"); goto done; }
+        if (rows < 0) return pq_error("invalid row group row count");
+        if (base > INT64_MAX-*parts) return pq_error("too many partitions");
         offsets[g] = base+*parts;
         int64_t n = rows ? 1+(rows-1)/pq_group_batch(r,g) : 1;
-        if (*parts > INT64_MAX-base-n) { err = pq_error("too many partitions"); goto done; }
+        if (*parts > INT64_MAX-base-n) return pq_error("too many partitions");
         *parts += n;
     }
-    if (!ng) { *parts = 1; err = pq_write_reader(r,root,table,base,durable); goto done; }
-    pq_task_msg emsg;
-    pq_task_msg_reset(&emsg);
-    pq_native_work work = {r,root,table,offsets,errors,durable,&emsg};
-    ray_pool_t* pool = pq_group_pool(r);
-    if (pool) {
-        /* dispatch uses a bounded ring; tasks claim groups dynamically. */
-        ray_pool_dispatch_n(pool,pq_write_group,&work,(uint32_t)ng);
-    } else pq_write_group(&work,0,0,ng);
-    for (int64_t g = 0; g < ng; g++) if (errors[g]) {
-        if (!err) err = pq_task_msg_raise(&emsg,g,errors[g]); else ray_error_free(errors[g]);
+    if (!r->ngroups) *parts = 1;
+    return NULL;
+}
+/* Write the row groups of nrs readers, planned by pq_plan_groups, in parallel across
+ * all of them. On failure, *failed is the reader owning the first failed task. */
+static ray_t* pq_write_readers(ray_parquet_t* const* rs, int64_t* const* offs, int nrs,
+                               const char* root, const char* table, bool durable,
+                               const int64_t* bases, int* failed) {
+    ray_t* err = NULL; *failed = -1;
+    int64_t* starts = ray_alloc_raw((size_t)(nrs+1)*sizeof(*starts));
+    if (!starts) return ray_error("oom",NULL);
+    starts[0] = 0;
+    for (int f = 0; f < nrs; f++) starts[f+1] = starts[f]+rs[f]->ngroups;
+    int64_t total = starts[nrs];
+    for (int f = 0; f < nrs && !err; f++)   /* a reader with no row group has one empty partition */
+        if (!rs[f]->ngroups) err = pq_write_reader(rs[f],root,table,bases[f],durable);
+    if (err) { ray_free_raw(starts); return err; }
+    ray_t** errors = ray_calloc_raw((size_t)(total+1)*sizeof(*errors));
+    if (!errors) { ray_free_raw(starts); return ray_error("oom",NULL); }
+    if (total) {
+        pq_task_msg emsg;
+        pq_task_msg_reset(&emsg);
+        pq_native_work work = {rs,offs,starts,nrs,root,table,errors,durable,&emsg};
+        ray_pool_t* pool = total > 1 ? ray_pool_get() : NULL;
+        if (!ray_pool_par_dispatch_ok(pool,total,2)) pool = NULL;
+        if (pool) {
+            /* dispatch uses a bounded ring; tasks claim groups dynamically. */
+            ray_pool_dispatch_n(pool,pq_write_group,&work,(uint32_t)total);
+        } else pq_write_group(&work,0,0,total);
+        for (int64_t t = 0; t < total; t++) if (errors[t]) {
+            if (!err) {
+                int f = 0; while (t >= starts[f+1]) f++;
+                *failed = f;
+                err = pq_task_msg_raise(&emsg,t,errors[t]);
+            } else ray_error_free(errors[t]);
+        }
     }
     if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
-done:
-    ray_free_raw(offsets); ray_free_raw(errors); return err;
+    ray_free_raw(errors); ray_free_raw(starts);
+    return err;
+}
+static ray_t* pq_write_groups(ray_parquet_t* r, const char* root, const char* table,
+                              bool durable, int64_t base, int64_t* parts) {
+    int64_t* offsets = ray_alloc_raw((size_t)(r->ngroups+1)*sizeof(*offsets));
+    if (!offsets) return ray_error("oom",NULL);
+    ray_t* err = pq_plan_groups(r,base,offsets,parts);
+    int failed;
+    if (!err) err = pq_write_readers(&r,&offsets,1,root,table,durable,&base,&failed);
+    ray_free_raw(offsets);
+    return err;
 }
 /* The destination without trailing separators, as .csv.parted takes it:
  * "out/" must stage in "out.parquet-partial", not "out/.parquet-partial". */
@@ -2288,6 +2327,21 @@ static ray_t* pq_same_schema(const ray_parquet_t* a, const ray_parquet_t* b) {
     }
     return NULL;
 }
+/* A failure in a file after the first names the file; the first file is the
+ * import itself. */
+static void pq_name_file(ray_t** err, size_t i, const char* path) {
+    if (!*err || !i) return;
+    char code[32], msg[512];
+    snprintf(code,sizeof code,"%s",ray_err_code(*err));
+    const char* inner = ray_error_msg() ? ray_error_msg() : "";
+    if (!strncmp(inner,"parquet: ",9)) inner += 9;   /* the code supplies it */
+    snprintf(msg,sizeof msg,"%s",inner);
+    ray_error_free(*err);
+    *err = ray_error(code,"file %zu (%s): %s",i+1,path,msg);
+}
+/* Files opened together by one multi-file import: bounded, so a very long list
+ * keeps few files and mappings open at once. */
+#define PQ_FILE_BATCH 32
 ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const char* root, const char* table, ray_t* types) {
 #ifdef RAY_FUZZING
     return ray_error("restricted","Parquet imports disabled under fuzzing");
@@ -2301,48 +2355,63 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
     char staging[1100] = "", sym[1200] = ""; int64_t parts = 0, rows = 0;
     int tree = RAY_SYNC_TREE_NONE;   /* the flush of the staged tree, opened before its first write */
     ray_sym_domain_t* domain = NULL;
-    for (size_t i = 0; i < npaths && !err; i++) {
-        ray_parquet_t* r = NULL;
-        err = ray_parquet_open(paths[i],NULL,PQ_BATCH,&r);
-        /* A different column count is the file's fault, whatever the types
-         * vector says: name it before the vector is checked against it. */
-        if (!err && i) err = pq_same_ncols(first,r);
-        if (!err) err = pq_import_types(r,types);
-        if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
-        if (!err && !i) {
-            err = pq_stage(r,root,staging,sizeof(staging),true);
-            if (!err) tree = ray_file_sync_tree_begin(staging);
-        }
-        if (!err && i) err = pq_same_schema(first,r);
-        if (!err) {
-            /* Global runtime interning is not worker-safe. Decode symbols
-             * straight into the shared, synchronized file domain, as in direct
-             * splayed loads: one for all the files, so their ids agree. */
-            for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol) {
-                if (!domain) {
-                    snprintf(sym,sizeof(sym),"%s/.sym",staging);
-                    domain = ray_sym_domain_open_or_create(sym);
-                    if (!domain || ray_sym_domain_intern(domain,"",0) != 0) { err = ray_error("oom",NULL); break; }
-                }
-                r->schema[c].import_domain = domain;
+    /* The files go in batches: a batch's readers are open together and the row
+     * groups of all of them run as one list of tasks, so many small files (one
+     * row group each) keep every worker busy instead of one file at a time. The
+     * batch is bounded so that files and mappings stay few. */
+    for (size_t i0 = 0; i0 < npaths && !err; i0 += PQ_FILE_BATCH) {
+        size_t nb = npaths-i0 < PQ_FILE_BATCH ? npaths-i0 : PQ_FILE_BATCH;
+        ray_parquet_t* rs[PQ_FILE_BATCH] = {0};
+        int64_t* offs[PQ_FILE_BATCH] = {0}, bases[PQ_FILE_BATCH] = {0};
+        size_t opened = 0;
+        for (size_t k = 0; k < nb && !err; k++) {
+            size_t i = i0+k;
+            ray_parquet_t* r = NULL;
+            err = ray_parquet_open(paths[i],NULL,PQ_BATCH,&r);
+            rs[k] = r; if (r) opened = k+1;
+            if (!i) first = r;
+            /* A different column count is the file's fault, whatever the types
+             * vector says: name it before the vector is checked against it. */
+            if (!err && i) err = pq_same_ncols(first,r);
+            if (!err) err = pq_import_types(r,types);
+            if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
+            if (!err && !i) {
+                err = pq_stage(r,root,staging,sizeof(staging),true);
+                if (!err) tree = ray_file_sync_tree_begin(staging);
             }
+            if (!err && i) err = pq_same_schema(first,r);
+            if (!err) {
+                /* Global runtime interning is not worker-safe. Decode symbols
+                 * straight into the shared, synchronized file domain, as in direct
+                 * splayed loads: one for all the files, so their ids agree. */
+                for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].native_symbol) {
+                    if (!domain) {
+                        snprintf(sym,sizeof(sym),"%s/.sym",staging);
+                        domain = ray_sym_domain_open_or_create(sym);
+                        if (!domain || ray_sym_domain_intern(domain,"",0) != 0) { err = ray_error("oom",NULL); break; }
+                    }
+                    r->schema[c].import_domain = domain;
+                }
+            }
+            int64_t n = 0;
+            if (!err) {
+                offs[k] = ray_alloc_raw((size_t)(r->ngroups+1)*sizeof(**offs));
+                if (!offs[k]) err = ray_error("oom",NULL);
+            }
+            if (!err) err = pq_plan_groups(r,parts,offs[k],&n);
+            if (!err) {
+                if (n > INT64_MAX-parts || r->rows > INT64_MAX-rows) err = pq_error("too many partitions or rows");
+                else { bases[k] = parts; parts += n; rows += r->rows; }
+            }
+            if (err) pq_name_file(&err,i,paths[i]);
         }
-        int64_t n = 0;
-        if (!err) err = pq_write_groups(r,staging,table,true,parts,&n);
         if (!err) {
-            if (n > INT64_MAX-parts || r->rows > INT64_MAX-rows) err = pq_error("too many partitions or rows");
-            else { parts += n; rows += r->rows; }
+            int failed;
+            err = pq_write_readers(rs,offs,(int)nb,staging,table,true,bases,&failed);
+            if (err) pq_name_file(&err,i0+(size_t)failed,paths[i0+(size_t)failed]);
         }
-        if (err && i) {   /* the first file is the import; later ones are named */
-            char code[32], msg[512];
-            snprintf(code,sizeof code,"%s",ray_err_code(err));
-            const char* inner = ray_error_msg() ? ray_error_msg() : "";
-            if (!strncmp(inner,"parquet: ",9)) inner += 9;   /* the code supplies it */
-            snprintf(msg,sizeof msg,"%s",inner);
-            ray_error_free(err);
-            err = ray_error(code,"file %zu (%s): %s",i+1,paths[i],msg);
-        }
-        if (!i) first = r; else if (r) ray_parquet_close(r);
+        for (size_t k = 0; k < nb; k++) ray_free_raw(offs[k]);
+        for (size_t k = 0; k < opened; k++) if (rs[k] && rs[k] != first) ray_parquet_close(rs[k]);
     }
     if (!err && domain) {
         /* Every partition header must be covered by the final vocabulary
