@@ -2570,7 +2570,10 @@ static int64_t pq_chunk_value_encoding(ray_parquet_t* r, int64_t c) {
             uint64_t n = pq_list(&p,&et);
             if (!p.bad && et == 5) for (uint64_t i = 0; i < n && !p.bad; i++) {
                 int64_t e = pq_int(&p);
-                if (e != 0 && e != 2 && e != 3 && e != 8) { enc = e; break; }
+                /* 0 PLAIN, 2 PLAIN_DICTIONARY, 3 RLE, 4 BIT_PACKED (a
+                 * deprecated level encoding) and 8 RLE_DICTIONARY say
+                 * nothing about the value encoding. */
+                if (e != 0 && e != 2 && e != 3 && e != 4 && e != 8) { enc = e; break; }
             }
         }
     }
