@@ -5436,7 +5436,7 @@ static bool pq_expect_load(pq_expect* e, const char* fixture) {
     while (fgets(line, sizeof(line), f)) {
         pq_trim(line);
         if (!line[0] || line[0] == '#') continue;
-        char k[32], v[300], key[32], dir[16], rest[300];
+        char k[32], v[300], key[64], dir[16], rest[300];
         v[0] = '\0';
         if (sscanf(line, "%31s %299[^\n]", k, v) < 1) continue;
         if (!strcmp(k, "fixture")) {
@@ -5454,11 +5454,17 @@ static bool pq_expect_load(pq_expect* e, const char* fixture) {
         }
         /* `anchors first|last` and `anchor_suffix first|last` are two-token
          * keys: the direction belongs to the key, not to the value list, so
-         * the stored value is the anchor values alone. */
+         * the stored value is the anchor values alone. A non-empty record
+         * prefix carries the same shape (`name_anchors first ...`). */
         const char* val = v;
-        if (!strcmp(k, "anchors") || !strcmp(k, "anchor_suffix")) {
+        size_t kl = strlen(k);
+        bool is_anchor = !strcmp(k, "anchors") ||
+                         (kl > 7 && !strcmp(k + kl - 7, "anchors"));
+        bool is_suffix = !strcmp(k, "anchor_suffix") ||
+                         (kl > 13 && !strcmp(k + kl - 13, "anchor_suffix"));
+        if (is_anchor || is_suffix) {
             if (sscanf(v, "%15s %299[^\n]", dir, rest) != 2) continue;
-            snprintf(key, sizeof(key), "%.13s %.15s", k, dir);
+            snprintf(key, sizeof(key), "%s %.15s", k, dir);
             val = rest;
         } else snprintf(key, sizeof(key), "%.31s", k);
         if (e->nkv < 40) {
@@ -5515,9 +5521,9 @@ static void pq_suffix_token(const char* s, size_t len, size_t width, char out[32
 }
 /* One string column's reader-visible values against the expected block.
  * `prefix` selects the record-key family: "" reads minlen/maxlen/totallen/
- * distinct/digest, the anchors and the anchor suffix; "name" reads
- * name_minlen/... and compares no anchors (the mixed fixture records no
- * name anchor). The digest is MD5 over the UTF-8 values in row order,
+ * distinct/digest, the anchors and the anchor suffix; "name" reads the same
+ * families under name_ (the mixed fixture records both columns' anchors).
+ * The digest is MD5 over the UTF-8 values in row order,
  * joined by "|", with NULL as the null token. An empty BYTE_ARRAY value is
  * the STR native null (reader null policy), so it hashes as NULL and is
  * outside the length aggregates. */
@@ -5651,23 +5657,25 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
         if (!ok) fprintf(stderr, "  delta %s col %d: %sdigest %s want %s\n",
                          fixture, col, pfx, hex, want ? want : "(none)");
     }
-    if (ok && !prefix[0]) {
-        const char* a = pq_expect_get(&e, "anchors first");
+    if (ok) {
+        snprintf(key, sizeof(key), "%sanchors first", pfx);
+        const char* a = pq_expect_get(&e, key);
         if (a) {
             char got[PQ_ANCHOR][32];
             int ng = 0;
             if (long_value) {
                 ok = false;
-                fprintf(stderr, "  delta %s: anchor value exceeds the 31-byte token; use anchor_suffix\n", fixture);
+                fprintf(stderr, "  delta %s col %d: %sanchors first exceeds the 31-byte token; use anchor_suffix\n", fixture, col, pfx);
             } else {
                 for (int i = 0; i < PQ_ANCHOR && i < (int)nrefs; i++) snprintf(got[ng++], 32, "%s", af[i]);
                 ok = pq_tokens_equal(a, got, ng);
-                if (!ok) fprintf(stderr, "  delta %s: first anchors\n", fixture);
+                if (!ok) fprintf(stderr, "  delta %s col %d: %sanchor values (first)\n", fixture, col, pfx);
             }
         }
     }
-    if (ok && !prefix[0]) {
-        const char* a = pq_expect_get(&e, "anchors last");
+    if (ok) {
+        snprintf(key, sizeof(key), "%sanchors last", pfx);
+        const char* a = pq_expect_get(&e, key);
         if (a) {
             char got[4][32];
             int ng = 0;
@@ -5677,21 +5685,23 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
                 if (al[idx][0]) snprintf(got[ng++], 32, "%s", al[idx]);
             }
             ok = pq_tokens_equal(a, got, ng);
-            if (!ok) fprintf(stderr, "  delta %s: last anchors\n", fixture);
+            if (!ok) fprintf(stderr, "  delta %s col %d: %sanchor values (last)\n", fixture, col, pfx);
         }
     }
-    if (ok && !prefix[0]) {
-        const char* a = pq_expect_get(&e, "anchor_suffix first");
+    if (ok) {
+        snprintf(key, sizeof(key), "%sanchor_suffix first", pfx);
+        const char* a = pq_expect_get(&e, key);
         if (a) {
             char got[PQ_ANCHOR][32];
             int ng = 0;
             for (int i = 0; i < PQ_ANCHOR && i < (int)nrefs; i++) snprintf(got[ng++], 32, "%s", sf_first[i]);
             ok = pq_tokens_equal(a, got, ng);
-            if (!ok) fprintf(stderr, "  delta %s: first anchor suffix\n", fixture);
+            if (!ok) fprintf(stderr, "  delta %s col %d: %sanchor suffix values (first)\n", fixture, col, pfx);
         }
     }
-    if (ok && !prefix[0]) {
-        const char* a = pq_expect_get(&e, "anchor_suffix last");
+    if (ok) {
+        snprintf(key, sizeof(key), "%sanchor_suffix last", pfx);
+        const char* a = pq_expect_get(&e, key);
         if (a) {
             char got[4][32];
             int ng = 0;
@@ -5701,7 +5711,7 @@ static bool pq_delta_string_check(const char* fixture, int col, const char* pref
                 if (sf_last[idx][0]) snprintf(got[ng++], 32, "%s", sf_last[idx]);
             }
             ok = pq_tokens_equal(a, got, ng);
-            if (!ok) fprintf(stderr, "  delta %s: last anchor suffix\n", fixture);
+            if (!ok) fprintf(stderr, "  delta %s col %d: %sanchor suffix values (last)\n", fixture, col, pfx);
         }
     }
     for (int64_t i = 0; i < nrefs; i++) free((void*)refs[i].s);

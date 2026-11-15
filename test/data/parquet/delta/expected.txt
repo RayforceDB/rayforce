@@ -289,11 +289,15 @@ max 99999
 sum 4999950000
 distinct 100000
 digest 3060746cbe732b323fa88dd827b8d63c
+anchors first 0 1 2 3 4 5 6 7
+anchors last 99996 99997 99998 99999
 name_minlen 7
 name_maxlen 9
 name_totallen 889000
 name_distinct 1000
 name_digest c01bdb617f71dacd96623af9b994b2c0
+name_anchors first track_0 track_1 track_2 track_3 track_4 track_5 track_6 track_7
+name_anchors last track_996 track_997 track_998 track_999
 
 fixture unsupported-bss.parquet
 rows 8
