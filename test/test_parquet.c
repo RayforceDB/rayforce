@@ -335,6 +335,15 @@ static test_result_t test_pq_parted_files(void) {
     ray_error_free(n);
     TEST_ASSERT_TRUE(access(root,F_OK) != 0);
     char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial);
+    /* An error opening a later file is not prefixed twice. */
+    const char* missing[] = {FIX "flat-1-v1.parquet",FIX "no-such-file.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-missing-%d",(int)getpid());
+    n = ray_parquet_parted_files(missing,2,root,"hits",types);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && !strstr(ray_error_msg(),"parquet: file 2") &&
+                     !strstr(ray_error_msg(),"): parquet:"));
+    ray_error_free(n);
+    snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial);
     /* Same column count, another column: the message names the file and the column. */
     char partial2[200];
     const char* renamed[] = {FIX "decimal-0-0.parquet",FIX "uint64-0.parquet"};
@@ -358,6 +367,27 @@ static test_result_t test_pq_parted_files(void) {
     n = ray_parquet_parted_files(two,0,root,"hits",NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(n)); ray_release(n);
     ray_release(types);
+    PASS();
+}
+/* A Hadoop LZ4 frame of several chunks is refused naming the frame, on the
+ * data-page path (PLAIN), the dictionary-page path, and the symbol import. */
+static test_result_t test_pq_lz4_multichunk(void) {
+    const char* files[] = {FIX "multichunk-plain.parquet",FIX "multichunk-dict.parquet"};
+    for (int i = 0; i < 2; i++) {
+        ray_t* t = ray_parquet_read(files[i],NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"multi-chunk Hadoop frame"));
+        ray_error_free(t);
+    }
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    char root[128]; snprintf(root,sizeof(root),"/tmp/rayforce-pq-multichunk-%d",(int)getpid());
+    ray_t* n = ray_parquet_parted_files(&files[1],1,root,"hits",types);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"multi-chunk Hadoop frame"));
+    ray_error_free(n); ray_release(types);
+    char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial); pq_rm_rf(root);
     PASS();
 }
 static test_result_t test_pq_matrix(void) {
@@ -5316,6 +5346,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/uint64",test_pq_uint64,pq_setup,pq_teardown},
     {"parquet/decimal",test_pq_decimal,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
+    {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

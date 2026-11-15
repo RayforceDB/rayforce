@@ -63,6 +63,15 @@ def lz4_hadoop(data):
 
 # Parquet CompressionCodec: 1 Snappy, 5 LZ4 (Hadoop framing), 7 LZ4_RAW.
 COMPRESS = {1: snappy, 5: lz4_hadoop, 7: lz4}
+def lz4_hadoop_multi(data):
+    """One frame of two chunks: the uncompressed size, then two [compressed size][chunk] pairs."""
+    h = len(data)//2
+    out = len(data).to_bytes(4, 'big')
+    for part in (data[:h], data[h:]):
+        block = lz4(part)
+        out += len(block).to_bytes(4, 'big') + block
+    return out
+MULTI5 = False  # write two-chunk frames under codec 5 (the reader refuses them)
 RAW5 = False   # write the raw block under codec 5, as some writers do
 
 def rle(values, width):
@@ -103,7 +112,7 @@ class Page(bytes):
 
 def page(kind, header, body, codec=1, prefix=b'', compressed=True, crc=False):
     import zlib  # stdlib, fixture checksums only
-    payload = prefix + ((lz4 if codec == 5 and RAW5 else COMPRESS[codec])(body) if codec and compressed else body)
+    payload = prefix + ((lz4_hadoop_multi if codec == 5 and MULTI5 else lz4 if codec == 5 and RAW5 else COMPRESS[codec])(body) if codec and compressed else body)
     f = [(1,I32,kind),(2,I32,len(prefix)+len(body)),(3,I32,len(payload))]
     if crc:
         chk = zlib.crc32(payload)
@@ -243,6 +252,10 @@ if __name__ == '__main__':
     for v2 in (False,True):
         write(root/f'flat-5raw-v{2 if v2 else 1}.parquet',specs,[rows,rows],5,v2,crc=True)
     RAW5 = False
+    MULTI5 = True   # codec 5 holding two-chunk frames: refused, naming the frame
+    write(root/'multichunk-dict.parquet',specs,[rows],5)
+    write(root/'multichunk-plain.parquet',specs,[rows],5,dictionary=False)
+    MULTI5 = False
     write(root/'legacy.parquet',specs,[rows,rows],legacy=True)
     write(root/'v2-uncompressed.parquet',specs,[rows,rows],v2=True,compress_v2=False)
     write(root/'no-statistics.parquet',specs,[rows,rows],statistics=False)

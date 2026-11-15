@@ -953,7 +953,12 @@ static bool pq_unpack(pq_column* c, const uint8_t* p, size_t n, size_t decoded, 
 static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, size_t size, size_t n, int64_t count) {
     if (c->have_dict || count < 0 || (uint64_t)count > PQ_MAX_PAGE/sizeof(pq_string)) return false;
     if (!pq_reserve(&c->dict,&c->dict_cap,n)) return false;
-    if (c->codec) { if (!pq_decompress(c->codec,payload,size,c->dict,n)) return false; }
+    if (c->codec) {
+        if (!pq_decompress(c->codec,payload,size,c->dict,n)) {
+            c->lz4_multichunk = c->codec == 5 && pq_lz4_multichunk(payload,size);
+            return false;
+        }
+    }
     else if (size != n) return false;
     else if (n) memcpy(c->dict,payload,n);
     c->dict_count = count; c->have_dict = true;
@@ -1056,7 +1061,7 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
         const uint8_t* data = NULL; pq_span h[9]; int64_t count, encoding;
         c->bool_bit = 0; c->bool_rle = false; c->page_nulls = 0; c->expected_nulls = -1;
         if (kind == 2) {
-            if (!pq_dict_page(c,s,f,payload,size,raw,&count)) return "invalid dictionary page";
+            if (!pq_dict_page(c,s,f,payload,size,raw,&count)) return c->lz4_multichunk ? PQ_MULTICHUNK_ERR : "invalid dictionary page";
             continue;
         }
         if (kind == 0) {
@@ -2211,7 +2216,9 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
         if (err && i) {   /* the first file is the import; later ones are named */
             char code[32], msg[512];
             snprintf(code,sizeof code,"%s",ray_err_code(err));
-            snprintf(msg,sizeof msg,"%s",ray_error_msg() ? ray_error_msg() : "");
+            const char* inner = ray_error_msg() ? ray_error_msg() : "";
+            if (!strncmp(inner,"parquet: ",9)) inner += 9;   /* the code supplies it */
+            snprintf(msg,sizeof msg,"%s",inner);
             ray_error_free(err);
             err = ray_error(code,"file %zu (%s): %s",i+1,paths[i],msg);
         }
@@ -2495,7 +2502,7 @@ static const char* pq_seed_dicts(ray_parquet_t* r, const int64_t* order, int64_t
                 col.codec = (int)codec;
                 pq_schema sch = r->schema[c];
                 if (!sch.import_domain) err = "symbol column without an import dictionary";
-                else if (!pq_dict_page(&col,&sch,f,payload,size,raw,&count)) err = "invalid dictionary page";
+                else if (!pq_dict_page(&col,&sch,f,payload,size,raw,&count)) err = col.lz4_multichunk ? PQ_MULTICHUNK_ERR : "invalid dictionary page";
                 else *entries += count;
                 ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); ray_free_raw(col.symbols);
             }
