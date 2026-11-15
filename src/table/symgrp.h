@@ -33,9 +33,10 @@
  *   1. every task (a row group's chunk) deduplicates its strings exactly and
  *      hands its distinct ones over as (hash, length, local id) only; no
  *      string bytes are kept between the steps;
- *   2. ray_symgrp_resolve goes through the hash groups one at a time, the
- *      group's index (every earlier string's hash, length and position, kept
- *      in append-only logs) the only table it holds, and gives each staged
+ *   2. ray_symgrp_resolve goes through the hash groups, one at a time or a
+ *      few side by side, a group's index (every earlier string's hash,
+ *      length and position, kept in append-only logs) the only table it
+ *      holds for the group, and gives each staged
  *      string a verdict: a new string at a position of its own, or a
  *      candidate for an earlier string of equal hash and length;
  *   3. the tasks decode again, write the new strings' records where step 2
@@ -125,8 +126,10 @@ bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask);
 bool ray_symgrp_stage(ray_symgrp_t* g, int64_t t, int64_t n, const ray_symgrp_fp_t* fp,
                       const uint32_t* counts);
 /* Step 2.  Reserves the new strings' records in the symbol file and appends
- * them to the index logs. */
-bool ray_symgrp_resolve(ray_symgrp_t* g);
+ * them to the index logs.  Up to `par` groups' tables at once, on the pool
+ * (the rows orders only, whose positions do not depend on the order the
+ * groups go in); 1: one group at a time. */
+bool ray_symgrp_resolve(ray_symgrp_t* g, int par);
 /* Step 3: task t's verdicts, res[local] for local ids 1..n (n as staged). */
 int64_t ray_symgrp_task_size(const ray_symgrp_t* g, int64_t t);
 bool ray_symgrp_task(const ray_symgrp_t* g, int64_t t, ray_symgrp_res_t* res);

@@ -84,8 +84,8 @@ bool ray_col_stream_stage_mem(ray_col_stream_t* w) {
 }
 
 bool ray_col_stream_chunked_ok(const ray_col_stream_t* w) {
-    return w->gen == 2 && w->type != RAY_STR && w->type != RAY_SYM && ray_encw_type_supported(w->type) &&
-           w->fp && !w->in_mem && !w->ew && !w->rows;
+    return w->gen == 2 && w->type != RAY_STR && (w->type != RAY_SYM || w->dom) &&
+           ray_encw_type_supported(w->type) && w->fp && !w->in_mem && !w->ew && !w->rows;
 }
 
 ray_err_t ray_col_stream_chunked_begin(ray_col_stream_t* w, int64_t rows) {
@@ -391,10 +391,13 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
 
 /* A chunked column (ray_col_stream_chunked_begin), every chunk put: the
  * headers take HAS_NULLS from had_nulls, as stream_finish_gen2's writer
- * takes it from the attrs it begins with (no chunk's encoding reads it). */
+ * takes it from the attrs it begins with (no chunk's encoding reads it),
+ * and a SYM column's header the domain's count. */
 static ray_err_t stream_finish_chunked(ray_col_stream_t* w, bool durable) {
     stream_drop_index(w);
     w->ew->attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
+    /* SYM: the domain's count now, as stream_finish_gen2 saves it */
+    if (w->type == RAY_SYM) w->ew->sym_count = (uint32_t)ray_sym_domain_count(w->dom);
     ray_err_t err = ray_encw_finish(w->ew);
     stream_drop_chunked(w);
     if (fclose(w->fp) != 0 && err == RAY_OK) err = RAY_ERR_IO;

@@ -70,7 +70,7 @@ Calling it again on the same thread reuses unchanged partitions while the earlie
 
 Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`), symbol-domain opens and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
 
-Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
+Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Supported `select` shapes can prune partitions using literal bounds on the virtual column; see [Partition Pruning](../storage/index.md#partition-pruning) for admission limits and conservative declines.
 
 The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
 
@@ -85,7 +85,7 @@ The directory names decide the key type and the partition order. `YYYY.MM.DD` na
 (.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile)
 (set trades (.db.parted.get dbroot 'trades))
 
-;; Partition prune — only the matching day's files are touched.
+;; A supported partition predicate; physical I/O depends on the query and storage.
 (select {from: trades where: (== date 2024.01.15)})
 ```
 

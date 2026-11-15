@@ -56,6 +56,12 @@
 int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
                       int64_t* out);
 
+#ifdef DEBUG
+/* Fail the first allocation in the nth temporary grouped-aggregate lowering
+ * on this thread.  Zero resets/disarms both the target and allocator seam. */
+void ray_group_dag_probe_fail_set_for_test(int invocation);
+#endif
+
 /* True if every leaf is constant or reduced to a scalar. */
 bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
 bool op_tree_is_atom(ray_graph_t* g, uint32_t id);
@@ -1470,6 +1476,10 @@ uint64_t ray_exec_test_refine_in(void);
  * statistics before running (exec_filter_chain_prune), and the selection
  * segments (vectors) they dropped, since process start. */
 void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
+#ifdef DEBUG
+/* Successful query-level narrowed-source constructions, not physical reads. */
+uint64_t ray_query_test_parted_pruned_sources(bool reset);
+#endif
 /* exec.c test hook: later `in` conjuncts over a single-file generation-2
  * column answered by range (in_sel_single_within) since process start. */
 uint64_t ray_exec_test_in_single_within(void);
