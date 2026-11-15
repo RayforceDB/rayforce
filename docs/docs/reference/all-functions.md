@@ -621,7 +621,7 @@ Type checking, casting, null testing, and object inspection.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `type` | unary | — | Get the type name of a value | `(type 42)` → `i64` |
+| `type` | unary | — | Get the type name of a value; a function value answers `UNARY`, `BINARY`, `VARY` or `LAMBDA` | `(type 42)` → `i64` |
 | `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
@@ -631,6 +631,7 @@ Type checking, casting, null testing, and object inspection.
 ; Type checking and casting
 (type [1 2 3])              ; I64
 (type "hello")              ; str
+(type +)                   ; BINARY (function values: UNARY, BINARY, VARY, LAMBDA)
 (as 'f64 [1 2 3])          ; [1.0 2.0 3.0]
 (type (as 'LIST [1 2]))    ; LIST (two i64 atoms; a LIST is returned unchanged)
 (nil? 0Ni)                   ; true
