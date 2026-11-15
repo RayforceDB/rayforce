@@ -366,9 +366,16 @@ static bool pq_rle_next(pq_rle* r, uint32_t* out) {
     r->left--; return true;
 }
 static bool pq_rle_done(const pq_rle* r) {
-    /* A bit-packed run may over-declare its last group: the page's row count
-     * bounds decoding, so values left in the final run are padding (the spec
-     * pads to 8; some writers pad to the whole run, DuckDB among them). */
+    /* Bit-packed groups are 8-aligned, so a page count that is not a multiple
+     * of 8 leaves fewer than 8 padded values in the final group: one padded
+     * group, never more. */
+    return !r->c.bad && r->c.p == r->c.end && (!r->left || (r->packed && r->left < 8));
+}
+/* The writer-tolerance form: some writers pad a final bit-packed run to the
+ * whole run rather than to 8 values (DuckDB does on its hybrid streams), and
+ * the page's row count bounds decoding, so values left in that run are
+ * padding. Used only for streams the file's writer emits (pq_hybrid_done). */
+static bool pq_rle_done_padded(const pq_rle* r) {
     return !r->c.bad && r->c.p == r->c.end && (!r->left || r->packed);
 }
 #if defined(DEBUG)
@@ -463,8 +470,15 @@ typedef struct {
     bool lz4_multichunk;   /* the last page failed to unpack and looks like a multi-chunk LZ4 frame */
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
+    bool pad_final_run;  /* the writer over-declares a hybrid stream's final bit-packed run */
     pq_delta delta;
 } pq_column;
+/* End-of-page check for a hybrid (bit-packed / RLE) stream. The strict rule
+ * holds for every writer that pads to one group of 8; only a file whose
+ * created_by names the padding writer gets the looser final-run tolerance. */
+static bool pq_hybrid_done(const pq_column* c, const pq_rle* r) {
+    return c->pad_final_run ? pq_rle_done_padded(r) : pq_rle_done(r);
+}
 
 /* Read one value from the page's DELTA_BINARY_PACKED stream, reconstructing
  * the two's-complement wrapping values of the physical type. The stream is
@@ -569,6 +583,7 @@ struct ray_parquet {
     pq_interval* excluded;
     int64_t nexcluded, exclude_pos, group_rows, bloom_skipped, parallel_batches;
     bool failed, emitted, borrowed, filter_nulls;
+    bool duckdb_writer;   /* created_by names DuckDB: its hybrid streams pad to the whole final run */
     uint8_t compress;     /* the import's compress option (ray_compress_t; 0 = absent) */
     bool symcol;          /* the import's symfile 'column option: a symbol file per column */
 };
@@ -697,6 +712,12 @@ ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ra
     pq_span f[10];
     if (!pq_fields((pq_span){r->map+r->data_end,r->map+r->size-8,12}, f, 10) ||
         pq_get(f[1], -1) < 1 || !pq_num(f[3], &r->rows) || r->rows < 0 || f[2].type != 9 || f[4].type != 9 || f[8].type || f[9].type) goto fail;
+    /* FileMetaData field 6, created_by: it gates the one writer tolerance.
+     * DuckDB pads a hybrid stream's final bit-packed run to the whole run;
+     * every other stream keeps the strict one-padded-group rule. */
+    { const uint8_t* created = NULL; size_t created_n = 0;
+      r->duckdb_writer = pq_binary(f[6],&created,&created_n) && created_n >= 6 &&
+                         !memcmp(created,"DuckDB",6); }
     pq_cur sc = {f[2].p,f[2].end,false}; uint8_t st;
     uint64_t ns = pq_list(&sc, &st);
     if (sc.bad || st != 12 || ns < 2 || ns > PQ_MAX_COLS+1) goto fail;
@@ -1041,7 +1062,7 @@ static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
         c->chunk = (pq_cur){r->map+offset,r->map+offset+bytes,false};
         c->codec = (int)codec; c->page_left = 0; c->chunk_left = r->group_left;
         c->have_dict = false; c->dict_count = 0; c->optional = r->schema[r->selected[i]].optional;
-        c->delta.active = false;
+        c->delta.active = false; c->pad_final_run = r->duckdb_writer;
         ray_free_raw(c->strings); c->strings = NULL;
         ray_free_raw(c->symbol_ids); c->symbol_ids = NULL;
     }
@@ -1457,10 +1478,10 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
         }
         at += n; c->page_left -= n; c->chunk_left -= n;
         if (!c->page_left) {
-            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
+            if (c->optional && !pq_hybrid_done(c,&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
-            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            else if (c->encoding) { if (!pq_hybrid_done(c,&c->ids)) return "excess dictionary indices"; }
             else if (c->values.p != c->values.end) return "excess string values";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }
@@ -1588,10 +1609,10 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
         }
         c->page_left--; c->chunk_left--;
         if (!c->page_left) {
-            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
+            if (c->optional && !pq_hybrid_done(c,&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
-            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            else if (c->encoding) { if (!pq_hybrid_done(c,&c->ids)) return "excess dictionary indices"; }
             else if (c->bool_rle) { if (!pq_rle_done(&c->ids)) return "excess RLE boolean data"; }
             else if (s->physical == 0) { if ((c->bool_bit+7)/8 != (uint64_t)(c->values.end-c->values.p)) return "excess boolean data"; }
             else if (c->values.p != c->values.end) return "excess plain data";
@@ -1854,6 +1875,7 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->filter_nulls = parent->filter_nulls;
     r->compress = parent->compress;
     r->symcol = parent->symcol;
+    r->duckdb_writer = parent->duckdb_writer;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
@@ -2533,8 +2555,9 @@ static int pq_value_pages(pq_span stats) {
     return any;
 }
 #if defined(DEBUG)
-/* The value encoding named by a column chunk's encoding stats (the first
- * code that is not an index, level or dictionary encoding), -1 when it
+/* The value encoding named by a column chunk's `encodings` list
+ * (ColumnMetaData field 2, required list<Encoding>, element type I32): the
+ * first code that is not a PLAIN, dictionary or level encoding. -1 when it
  * cannot be read. The import-decision seam reports it; page headers are
  * parsed later, so the footer's list is what the decision point can see. */
 static int64_t pq_chunk_value_encoding(ray_parquet_t* r, int64_t c) {
@@ -2542,10 +2565,10 @@ static int64_t pq_chunk_value_encoding(ray_parquet_t* r, int64_t c) {
     int64_t rows = 0, enc = -1;
     if (cols && r->ngroups > 0 && c >= 0 && c < r->ncols && pq_group_columns(r,0,cols,&rows,NULL)) {
         pq_span mf[17];
-        if (pq_fields(cols[c],mf,17) && mf[13].type == 9) {
-            pq_cur p = {mf[13].p,mf[13].end,false}; uint8_t et;
+        if (pq_fields(cols[c],mf,17) && mf[2].type == 9) {
+            pq_cur p = {mf[2].p,mf[2].end,false}; uint8_t et;
             uint64_t n = pq_list(&p,&et);
-            if (!p.bad && et == 4) for (uint64_t i = 0; i < n && !p.bad; i++) {
+            if (!p.bad && et == 5) for (uint64_t i = 0; i < n && !p.bad; i++) {
                 int64_t e = pq_int(&p);
                 if (e != 0 && e != 2 && e != 3 && e != 8) { enc = e; break; }
             }
@@ -3425,10 +3448,10 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
         }
         at += n; c->page_left -= n; c->chunk_left -= n;
         if (!c->page_left) {
-            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
+            if (c->optional && !pq_hybrid_done(c,&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
-            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
+            else if (c->encoding) { if (!pq_hybrid_done(c,&c->ids)) return "excess dictionary indices"; }
             else if (c->values.p != c->values.end) return "excess string values";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }

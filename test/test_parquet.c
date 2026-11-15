@@ -5416,7 +5416,7 @@ static void pq_md5_token(pq_md5* m, bool first, bool isnull, int64_t v) {
 /* One fixture's block in expected.txt. */
 typedef struct {
     char name[64];
-    char key[40][16];
+    char key[40][32];
     char val[40][300];
     int nkv;
     char vval[80][64];
@@ -5436,7 +5436,8 @@ static bool pq_expect_load(pq_expect* e, const char* fixture) {
     while (fgets(line, sizeof(line), f)) {
         pq_trim(line);
         if (!line[0] || line[0] == '#') continue;
-        char k[32], v[300];
+        char k[32], v[300], key[32], dir[16], rest[300];
+        v[0] = '\0';
         if (sscanf(line, "%31s %299[^\n]", k, v) < 1) continue;
         if (!strcmp(k, "fixture")) {
             if (in) break;
@@ -5451,9 +5452,18 @@ static bool pq_expect_load(pq_expect* e, const char* fixture) {
                 snprintf(e->vval[e->nv++], sizeof(e->vval[0]), "%.63s", vv);
             continue;
         }
+        /* `anchors first|last` and `anchor_suffix first|last` are two-token
+         * keys: the direction belongs to the key, not to the value list, so
+         * the stored value is the anchor values alone. */
+        const char* val = v;
+        if (!strcmp(k, "anchors") || !strcmp(k, "anchor_suffix")) {
+            if (sscanf(v, "%15s %299[^\n]", dir, rest) != 2) continue;
+            snprintf(key, sizeof(key), "%.13s %.15s", k, dir);
+            val = rest;
+        } else snprintf(key, sizeof(key), "%.31s", k);
         if (e->nkv < 40) {
-            snprintf(e->key[e->nkv], sizeof(e->key[0]), "%.15s", k);
-            snprintf(e->val[e->nkv], sizeof(e->val[0]), "%.299s", v);
+            snprintf(e->key[e->nkv], sizeof(e->key[0]), "%.31s", key);
+            snprintf(e->val[e->nkv], sizeof(e->val[0]), "%.299s", val);
             e->nkv++;
         }
     }
@@ -5535,6 +5545,11 @@ static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
                 failed = true;
             }
             pq_md5_token(&md, seen == 0, isnull, v);
+            /* The row-window rings record every row, a null row as "N": the
+             * anchor block selects them when its recorded list carries a null
+             * token (section 6.2's reader-visible anchor exception). */
+            if (nrawf < 8) snprintf(raw_first[nrawf++], 32, "%.31s", tok);
+            snprintf(raw_last[seen & 3], 32, "%.31s", tok);
             if (isnull) { nulls++; continue; }
             if (!nvals) { min = max = sum = v; }
             else {
@@ -5542,9 +5557,7 @@ static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
                 if (v > max) max = v;
                 sum += v;
             }
-            vals[nvals++] = v;
-            if (nrawf < 8) snprintf(raw_first[nrawf++], 32, "%.31s", tok);
-            snprintf(raw_last[seen & 3], 32, "%.31s", tok);
+            if (nvals < want_rows) vals[nvals++] = v;   /* a surplus row fails the count */
             if (nnnf < 8) snprintf(nn_first[nnnf++], 32, "%.31s", tok);
             snprintf(nn_last[nvals & 3], 32, "%.31s", tok);
         }
@@ -5614,7 +5627,9 @@ static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
                     if (raw_last[idx][0]) snprintf(got[ng++], 32, "%.31s", raw_last[idx]);
                 }
             } else {
-                int start = nvals >= 4 ? (int)(nvals & 3) : 0;
+                /* nn_last is addressed by the 1-based value count, so the
+                 * oldest slot of the last four sits at (nvals+1) & 3. */
+                int start = nvals >= 4 ? (int)((nvals + 1) & 3) : 0;
                 for (int k = 0; k < 4; k++) {
                     int idx = (start + k) & 3;
                     if (nn_last[idx][0]) snprintf(got[ng++], 32, "%.31s", nn_last[idx]);
@@ -5858,16 +5873,19 @@ static test_result_t test_pq_delta_binary_packed(void) {
     ray_error_free(se);
 #if defined(DEBUG)
     /* The value phase is interruptible between coarse checkpoints; the seam
-     * fires one inside the 100,000-row DELTA page. */
+     * fires at its THIRD checkpoint inside the 100,000-row DELTA page, so the
+     * recorded count proves the 4,096-value cadence ran (a reader that checked
+     * once at page start records 0 and fails this bound). */
     ray_clear_interrupt();
     ray_parquet_t* cr = NULL;
     TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "duckdb-v2-mixed.parquet", NULL, 65536, &cr));
-    ray_parquet_test_delta_interrupt_after(1);
+    ray_parquet_test_delta_interrupt_after(3);
     ray_t* ct = ray_parquet_next(cr);
     ray_clear_interrupt();
     TEST_ASSERT_TRUE(ct && RAY_IS_ERR(ct));
     TEST_ASSERT_TRUE(ray_err_code(ct) && !strcmp(ray_err_code(ct), "cancel"));
-    TEST_ASSERT_TRUE(ray_parquet_test_delta_values() <= 4096);
+    TEST_ASSERT_TRUE(ray_parquet_test_delta_values() > 4096 &&
+                     ray_parquet_test_delta_values() <= 8192);
     ray_error_free(ct);
     ray_parquet_close(cr);
 #endif
@@ -5902,6 +5920,18 @@ static test_result_t test_pq_delta_errors(void) {
     /* A block size that is not a multiple of 128. */
     pb_var(&b, 100); pb_var(&b, 4); pb_var(&b, 2); pb_zz(&b, 0);
     TEST_ASSERT_TRUE(pq_delta_error("block-size", 2, b.p, b.n, 2, "invalid delta block size"));
+    b.n = 0;
+    /* A miniblock count that divides the block but not into 32-value units. */
+    pb_var(&b, 128); pb_var(&b, 8); pb_var(&b, 2); pb_zz(&b, 0);
+    TEST_ASSERT_TRUE(pq_delta_error("minis", 2, b.p, b.n, 2, "invalid delta block size"));
+    b.n = 0;
+    /* A truncated miniblock-widths array: the block header's widths are cut. */
+    pq_delta_head(&b, 2); pb_zz(&b, 0);
+    TEST_ASSERT_TRUE(pq_delta_error("widths", 2, b.p, b.n, 2, "truncated delta miniblock widths"));
+    b.n = 0;
+    /* DELTA on a physical type outside INT32/INT64 is refused at the page gate. */
+    pq_delta_head(&b, 2);
+    TEST_ASSERT_TRUE(pq_delta_error("physical", 2, b.p, b.n, 5, "unsupported value encoding"));
     /* A v2 page whose declared null count disagrees with the levels. */
     b.n = 0;
     {
