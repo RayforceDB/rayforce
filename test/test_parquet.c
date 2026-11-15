@@ -56,6 +56,7 @@ static ray_err_t pq_pool(int cores) {
     return e;
 }
 #define FIX "test/data/parquet/"
+#define DELTA_FIX "test/data/parquet/delta/"
 
 static test_result_t test_pq_snappy(void) {
     uint8_t dst[256];
@@ -5327,7 +5328,613 @@ static test_result_t test_pq_stage_early_sym_count(void) {
     PASS();
 }
 
+/* ===== DELTA encoding fixtures ===== */
+
+/* MD5 (RFC 1321) for the canonical-stream digest. Test-local: the reader
+ * itself has no hash dependency. */
+typedef struct { uint32_t h[4]; uint64_t bytes; uint8_t buf[64]; size_t n; } pq_md5;
+static uint32_t pq_md5_rot(uint32_t x, unsigned c) { return (x << c) | (x >> (32 - c)); }
+static void pq_md5_block(pq_md5* m, const uint8_t* p) {
+    static const uint32_t K[64] = {
+        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
+    static const unsigned S[64] = {
+        7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+        5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+        4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+        6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+    uint32_t w[16];
+    for (int i = 0; i < 16; i++)
+        w[i] = (uint32_t)p[4*i] | (uint32_t)p[4*i+1]<<8 | (uint32_t)p[4*i+2]<<16 | (uint32_t)p[4*i+3]<<24;
+    uint32_t a = m->h[0], b = m->h[1], c = m->h[2], d = m->h[3];
+    for (int i = 0; i < 64; i++) {
+        uint32_t f, g;
+        if (i < 16) { f = (b & c) | (~b & d); g = (uint32_t)i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (uint32_t)(5*i + 1) & 15; }
+        else if (i < 48) { f = b ^ c ^ d; g = (uint32_t)(3*i + 5) & 15; }
+        else { f = c ^ (b | ~d); g = (uint32_t)(7*i) & 15; }
+        uint32_t x = d; d = c; c = b;
+        b = b + pq_md5_rot(a + f + K[i] + w[g], S[i]);
+        a = x;
+    }
+    m->h[0] += a; m->h[1] += b; m->h[2] += c; m->h[3] += d;
+}
+static void pq_md5_init(pq_md5* m) {
+    m->h[0] = 0x67452301; m->h[1] = 0xefcdab89; m->h[2] = 0x98badcfe; m->h[3] = 0x10325476;
+    m->bytes = 0; m->n = 0;
+}
+static void pq_md5_update(pq_md5* m, const void* data, size_t n) {
+    const uint8_t* p = data;
+    m->bytes += n;
+    while (n) {
+        size_t k = 64 - m->n < n ? 64 - m->n : n;
+        memcpy(m->buf + m->n, p, k);
+        m->n += k; p += k; n -= k;
+        if (m->n == 64) { pq_md5_block(m, m->buf); m->n = 0; }
+    }
+}
+static void pq_md5_final(pq_md5* m, uint8_t out[16]) {
+    uint64_t bits = m->bytes * 8;
+    uint8_t pad = 0x80;
+    pq_md5_update(m, &pad, 1);
+    uint8_t zero = 0;
+    while (m->n != 56) pq_md5_update(m, &zero, 1);
+    uint8_t len[8];
+    for (int i = 0; i < 8; i++) len[i] = (uint8_t)(bits >> (8*i));
+    pq_md5_update(m, len, 8);
+    for (int i = 0; i < 4; i++) {
+        out[4*i] = (uint8_t)m->h[i];
+        out[4*i+1] = (uint8_t)(m->h[i] >> 8);
+        out[4*i+2] = (uint8_t)(m->h[i] >> 16);
+        out[4*i+3] = (uint8_t)(m->h[i] >> 24);
+    }
+}
+static void pq_md5_hex(const pq_md5* m, char out[33]) {
+    static const char* hex = "0123456789abcdef";
+    uint8_t d[16];
+    pq_md5 copy = *m;
+    pq_md5_final(&copy, d);
+    for (int i = 0; i < 16; i++) { out[2*i] = hex[d[i] >> 4]; out[2*i+1] = hex[d[i] & 15]; }
+    out[32] = '\0';
+}
+static void pq_md5_token(pq_md5* m, bool first, bool isnull, int64_t v) {
+    char tok[32];
+    if (!first) pq_md5_update(m, ",", 1);
+    if (isnull) pq_md5_update(m, "NULL", 4);
+    else {
+        int n = snprintf(tok, sizeof(tok), "%lld", (long long)v);
+        pq_md5_update(m, tok, (size_t)n);
+    }
+}
+
+/* One fixture's block in expected.txt. */
+typedef struct {
+    char name[64];
+    char key[40][16];
+    char val[40][300];
+    int nkv;
+    char vval[80][64];
+    int nv;
+} pq_expect;
+static void pq_trim(char* s) {
+    size_t n = strlen(s);
+    while (n && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
+}
+static bool pq_expect_load(pq_expect* e, const char* fixture) {
+    memset(e, 0, sizeof(*e));
+    FILE* f = fopen(DELTA_FIX "expected.txt", "rb");
+    if (!f) return false;
+    char line[512];
+    bool in = false;
+    bool invals = false;
+    while (fgets(line, sizeof(line), f)) {
+        pq_trim(line);
+        if (!line[0] || line[0] == '#') continue;
+        char k[32], v[300];
+        if (sscanf(line, "%31s %299[^\n]", k, v) < 1) continue;
+        if (!strcmp(k, "fixture")) {
+            if (in) break;
+            if (!strcmp(v, fixture)) { in = true; snprintf(e->name, sizeof(e->name), "%.63s", v); }
+            continue;
+        }
+        if (!in) continue;
+        if (!strcmp(k, "values")) { invals = true; continue; }
+        if (invals) {
+            char row[8], vv[64];
+            if (sscanf(line, "%7s %63s", row, vv) == 2 && e->nv < 80)
+                snprintf(e->vval[e->nv++], sizeof(e->vval[0]), "%.63s", vv);
+            continue;
+        }
+        if (e->nkv < 40) {
+            snprintf(e->key[e->nkv], sizeof(e->key[0]), "%.15s", k);
+            snprintf(e->val[e->nkv], sizeof(e->val[0]), "%.299s", v);
+            e->nkv++;
+        }
+    }
+    fclose(f);
+    return e->name[0] != '\0';
+}
+static const char* pq_expect_get(const pq_expect* e, const char* key) {
+    for (int i = 0; i < e->nkv; i++) if (!strcmp(e->key[i], key)) return e->val[i];
+    return NULL;
+}
+static int pq_split_tokens(const char* s, char out[][32], int max) {
+    char tmp[300];
+    snprintf(tmp, sizeof(tmp), "%s", s);
+    int n = 0;
+    char* save = NULL;
+    for (char* t = strtok_r(tmp, " ", &save); t && n < max; t = strtok_r(NULL, " ", &save))
+        snprintf(out[n++], 32, "%.31s", t);
+    return n;
+}
+static bool pq_tokens_equal(const char* want, char got[][32], int ngot) {
+    char w[16][32];
+    int nw = pq_split_tokens(want, w, 16);
+    if (nw != ngot) return false;
+    for (int i = 0; i < nw; i++) if (strcmp(w[i], got[i])) return false;
+    return true;
+}
+static int pq_i64_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+/* Decode one fixture through the reader at `batch` rows and compare every
+ * reader-visible aggregate, the canonical digest and the anchors with the
+ * expected.txt block. */
+static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
+    pq_expect e;
+    if (!pq_expect_load(&e, fixture)) {
+        fprintf(stderr, "  delta %s: no expected block\n", fixture);
+        return false;
+    }
+    const char* srows = pq_expect_get(&e, "rows");
+    int64_t want_rows = srows ? strtoll(srows, NULL, 10) : -1;
+    if (want_rows < 0) { fprintf(stderr, "  delta %s: no rows field\n", fixture); return false; }
+    ray_parquet_t* r = NULL;
+    ray_error_clear();
+    char path[256];
+    snprintf(path, sizeof(path), "%s%s", DELTA_FIX, fixture);
+    ray_t* err = ray_parquet_open(path, NULL, batch, &r);
+    if (err || !r) {
+        fprintf(stderr, "  delta %s open: %s\n", fixture, err ? ray_err_code(err) : "null");
+        if (err) ray_error_free(err);
+        return false;
+    }
+    int64_t* vals = (int64_t*)malloc((size_t)want_rows * sizeof(int64_t));
+    if (!vals) { ray_parquet_close(r); return false; }
+    pq_md5 md; pq_md5_init(&md);
+    int64_t seen = 0, nulls = 0, nvals = 0, min = 0, max = 0, sum = 0;
+    char raw_first[8][32], raw_last[4][32], nn_first[8][32], nn_last[4][32];
+    int nrawf = 0, nnnf = 0;
+    memset(raw_last, 0, sizeof(raw_last)); memset(nn_last, 0, sizeof(nn_last));
+    bool failed = false;
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        if (RAY_IS_ERR(t)) { failed = true; fprintf(stderr, "  delta %s read: %s / %s\n", fixture,
+            ray_err_code(t) ? ray_err_code(t) : "(no code)", ray_error_msg() ? ray_error_msg() : "(no message)");
+            ray_error_free(t); break; }
+        ray_t* col = ray_table_get_col_idx(t, 0);
+        int64_t nr = ray_table_nrows(t);
+        for (int64_t i = 0; i < nr; i++, seen++) {
+            bool isnull = ray_vec_is_null(col, i);
+            int64_t v = 0;
+            if (!isnull) v = type == RAY_I64 ? ((int64_t*)ray_data(col))[i] : ((int32_t*)ray_data(col))[i];
+            char tok[32];
+            if (isnull) snprintf(tok, sizeof(tok), "N");
+            else snprintf(tok, sizeof(tok), "%lld", (long long)v);
+            if (e.nv && seen < e.nv && strcmp(e.vval[seen], isnull ? "N" : tok)) {
+                fprintf(stderr, "  delta %s value row %lld: %s want %s\n", fixture,
+                        (long long)seen, isnull ? "N" : tok, e.vval[seen]);
+                failed = true;
+            }
+            pq_md5_token(&md, seen == 0, isnull, v);
+            if (isnull) { nulls++; continue; }
+            if (!nvals) { min = max = sum = v; }
+            else {
+                if (v < min) min = v;
+                if (v > max) max = v;
+                sum += v;
+            }
+            vals[nvals++] = v;
+            if (nrawf < 8) snprintf(raw_first[nrawf++], 32, "%.31s", tok);
+            snprintf(raw_last[seen & 3], 32, "%.31s", tok);
+            if (nnnf < 8) snprintf(nn_first[nnnf++], 32, "%.31s", tok);
+            snprintf(nn_last[nvals & 3], 32, "%.31s", tok);
+        }
+        ray_release(t);
+    }
+    ray_parquet_close(r);
+    bool ok = !failed && seen == want_rows;
+    if (!ok) fprintf(stderr, "  delta %s batch %lld: rows %lld/%lld failed=%d\n",
+                     fixture, (long long)batch, (long long)seen, (long long)want_rows, (int)failed);
+    if (ok) {
+        const char* sn = pq_expect_get(&e, "nulls");
+        ok = sn && nulls == strtoll(sn, NULL, 10);
+        if (!ok) fprintf(stderr, "  delta %s: nulls %lld\n", fixture, (long long)nulls);
+    }
+    if (ok) {
+        const char* s = pq_expect_get(&e, "min");
+        if (s && strcmp(s, "-")) ok = min == strtoll(s, NULL, 10);
+        if (ok) { s = pq_expect_get(&e, "max"); if (s && strcmp(s, "-")) ok = max == strtoll(s, NULL, 10); }
+        if (ok) { s = pq_expect_get(&e, "sum"); if (s && strcmp(s, "-")) ok = sum == strtoll(s, NULL, 10); }
+        if (!ok) fprintf(stderr, "  delta %s: min/max/sum %lld %lld %lld\n",
+                         fixture, (long long)min, (long long)max, (long long)sum);
+    }
+    if (ok) {
+        qsort(vals, (size_t)nvals, sizeof(*vals), pq_i64_cmp);
+        int64_t distinct = 0;
+        for (int64_t i = 0; i < nvals; i++) if (!i || vals[i] != vals[i-1]) distinct++;
+        const char* s = pq_expect_get(&e, "distinct");
+        ok = s && distinct == strtoll(s, NULL, 10);
+        if (!ok) fprintf(stderr, "  delta %s: distinct %lld\n", fixture, (long long)distinct);
+    }
+    if (ok) {
+        char hex[33]; pq_md5_hex(&md, hex);
+        const char* want = pq_expect_get(&e, "digest");
+        ok = want && !strcmp(hex, want);
+        if (!ok) fprintf(stderr, "  delta %s: digest %s want %s\n", fixture, hex, want ? want : "(none)");
+    }
+    /* Anchors: a list holding N is read row by row; otherwise it is the
+     * first/last non-null values, as 6.2 records them. */
+    if (ok) {
+        const char* a = pq_expect_get(&e, "anchors first");
+        if (a) {
+            char want[16][32];
+            int nw = pq_split_tokens(a, want, 16);
+            bool has_null = false;
+            for (int i = 0; i < nw; i++) if (!strcmp(want[i], "N")) has_null = true;
+            char got[8][32];
+            int ng = 0;
+            if (has_null) { for (int i = 0; i < nrawf && i < 8; i++) snprintf(got[ng++], 32, "%.31s", raw_first[i]); }
+            else { for (int i = 0; i < nnnf && i < 8; i++) snprintf(got[ng++], 32, "%.31s", nn_first[i]); }
+            ok = pq_tokens_equal(a, got, ng);
+            if (!ok) fprintf(stderr, "  delta %s: first anchors\n", fixture);
+        }
+    }
+    if (ok) {
+        const char* a = pq_expect_get(&e, "anchors last");
+        if (a) {
+            char want[16][32];
+            int nw = pq_split_tokens(a, want, 16);
+            bool has_null = false;
+            for (int i = 0; i < nw; i++) if (!strcmp(want[i], "N")) has_null = true;
+            char got[4][32];
+            int ng = 0;
+            if (has_null) {
+                int start = seen >= 4 ? (int)(seen & 3) : 0;
+                for (int k = 0; k < 4; k++) {
+                    int idx = (start + k) & 3;
+                    if (raw_last[idx][0]) snprintf(got[ng++], 32, "%.31s", raw_last[idx]);
+                }
+            } else {
+                int start = nvals >= 4 ? (int)(nvals & 3) : 0;
+                for (int k = 0; k < 4; k++) {
+                    int idx = (start + k) & 3;
+                    if (nn_last[idx][0]) snprintf(got[ng++], 32, "%.31s", nn_last[idx]);
+                }
+            }
+            ok = pq_tokens_equal(a, got, ng);
+            if (!ok) fprintf(stderr, "  delta %s: last anchors\n", fixture);
+        }
+    }
+    free(vals);
+    return ok;
+}
+
+/* The test writer for delta_errors: one REQUIRED column, one DELTA data page
+ * whose value stream is the crafted bytes. The page header stays consistent
+ * with the file; only the codec stream is malformed. */
+static bool pq_delta_synth(const char* path, int physical, const uint8_t* stream, size_t n, int64_t rows) {
+    pq_buf f = {0};
+    pb_bytes(&f, "PAR1", 4);
+    int64_t start = (int64_t)f.n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 0);
+    pb_i(&f, &last, 2, PB_I32, (int64_t)n);
+    pb_i(&f, &last, 3, PB_I32, (int64_t)n);
+    pb_field(&f, &last, 5, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, rows); pb_i(&f, &l, 2, PB_I32, 5);
+      pb_i(&f, &l, 3, PB_I32, 3); pb_i(&f, &l, 4, PB_I32, 3); pb_byte(&f, 0); }
+    pb_byte(&f, 0);
+    pb_bytes(&f, stream, n);
+    int64_t size = (int64_t)f.n - start;
+    int64_t footer = (int64_t)f.n;
+    last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 1); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, physical); pb_i(&f, &l, 3, PB_I32, 0);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "id", 2); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    { int l = 0;
+      pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+      { int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, start);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, physical);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 1, PB_I32); pb_zz(&f, 5);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "id", 2);
+          pb_i(&f, &lm, 4, PB_I32, 0);
+          pb_i(&f, &lm, 5, PB_I64, rows);
+          pb_i(&f, &lm, 6, PB_I64, size);
+          pb_i(&f, &lm, 7, PB_I64, size);
+          pb_i(&f, &lm, 9, PB_I64, start); pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      pb_i(&f, &l, 2, PB_I64, size); pb_i(&f, &l, 3, PB_I64, rows); pb_byte(&f, 0); }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    return ok;
+}
+/* The v2 counterpart: an OPTIONAL column, definition levels in the page
+ * body, and a declared null count the crafted case can make disagree. */
+static bool pq_delta_synth_v2(const char* path, int physical, const uint8_t* stream, size_t n,
+                              int64_t rows, const uint8_t* levels, size_t levels_n,
+                              int64_t declared_nulls) {
+    pq_buf f = {0};
+    pb_bytes(&f, "PAR1", 4);
+    int64_t start = (int64_t)f.n;
+    int64_t body_n = (int64_t)levels_n + (int64_t)n;
+    int last = 0;
+    pb_i(&f, &last, 1, PB_I32, 3);
+    pb_i(&f, &last, 2, PB_I32, body_n);
+    pb_i(&f, &last, 3, PB_I32, body_n);
+    pb_field(&f, &last, 8, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, rows); pb_i(&f, &l, 2, PB_I32, declared_nulls);
+      pb_i(&f, &l, 3, PB_I32, rows); pb_i(&f, &l, 4, PB_I32, 5);
+      pb_i(&f, &l, 5, PB_I32, (int64_t)levels_n); pb_i(&f, &l, 6, PB_I32, 0);
+      pb_field(&f, &l, 7, 1); pb_byte(&f, 0); }
+    pb_byte(&f, 0);
+    pb_bytes(&f, levels, levels_n);
+    pb_bytes(&f, stream, n);
+    int64_t size = (int64_t)f.n - start;
+    int64_t footer = (int64_t)f.n;
+    last = 0;
+    pb_i(&f, &last, 1, PB_I32, 1);
+    pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
+    { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
+      pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 1); pb_byte(&f, 0); }
+    { int l = 0; pb_i(&f, &l, 1, PB_I32, physical); pb_i(&f, &l, 3, PB_I32, 1);
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "id", 2); pb_byte(&f, 0); }
+    pb_i(&f, &last, 3, PB_I64, rows);
+    pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+    { int l = 0;
+      pb_field(&f, &l, 1, PB_LIST); pb_list(&f, 1, PB_STRUCT);
+      { int lc = 0;
+        pb_i(&f, &lc, 2, PB_I64, start);
+        pb_field(&f, &lc, 3, PB_STRUCT);
+        { int lm = 0; pb_i(&f, &lm, 1, PB_I32, physical);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 1, PB_I32); pb_zz(&f, 5);
+          pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "id", 2);
+          pb_i(&f, &lm, 4, PB_I32, 0);
+          pb_i(&f, &lm, 5, PB_I64, rows);
+          pb_i(&f, &lm, 6, PB_I64, size);
+          pb_i(&f, &lm, 7, PB_I64, size);
+          pb_i(&f, &lm, 9, PB_I64, start); pb_byte(&f, 0); }
+        pb_byte(&f, 0); }
+      pb_i(&f, &l, 2, PB_I64, size); pb_i(&f, &l, 3, PB_I64, rows); pb_byte(&f, 0); }
+    pb_field(&f, &last, 6, PB_BIN); pb_bin(&f, "rayforce test", 13);
+    pb_byte(&f, 0);
+    uint32_t flen = (uint32_t)(f.n - (size_t)footer);
+    pb_bytes(&f, &flen, 4); pb_bytes(&f, "PAR1", 4);
+    bool ok = !f.bad;
+    FILE* out = ok ? fopen(path, "wb") : NULL;
+    ok = out && fwrite(f.p, 1, f.n, out) == f.n;
+    if (out && fclose(out)) ok = false;
+    ray_sys_free(f.p);
+    return ok;
+}
+/* A crafted DELTA stream: header (block 128, four miniblocks) and the
+ * caller's body bytes. */
+static void pq_delta_head(pq_buf* b, uint64_t total) {
+    pb_var(b, 128); pb_var(b, 4); pb_var(b, total); pb_zz(b, 0);
+}
+static bool pq_delta_error(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
+                           int physical, const char* want) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-err-%s-%d.parquet", fixture, (int)getpid());
+    if (!pq_delta_synth(path, physical, stream, n, rows)) return false;
+    ray_error_clear();
+    ray_parquet_t* r = NULL;
+    ray_t* e = ray_parquet_open(path, NULL, 65536, &r);
+    bool ok = !e && r;
+    if (e) ray_error_free(e);
+    if (ok) {
+        ray_t* t = ray_parquet_next(r);
+        ok = t && RAY_IS_ERR(t);
+        if (t) {
+            if (ok) {
+                const char* msg = ray_error_msg();
+                ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
+                     msg && strstr(msg, want) != NULL;
+                if (!ok) fprintf(stderr, "  delta error %s: got %s / %s\n", fixture,
+                                 ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
+            }
+            ray_error_free(t);
+        }
+    }
+    if (r) ray_parquet_close(r);
+    unlink(path);
+    return ok;
+}
+static bool pq_delta_error_v2(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
+                              const uint8_t* levels, size_t levels_n) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-v2err-%s-%d.parquet", fixture, (int)getpid());
+    if (!pq_delta_synth_v2(path, 1, stream, n, rows, levels, levels_n, 0)) return false;
+    ray_error_clear();
+    ray_parquet_t* r = NULL;
+    ray_t* e = ray_parquet_open(path, NULL, 65536, &r);
+    bool ok = !e && r;
+    if (e) ray_error_free(e);
+    if (ok) {
+        ray_t* t = ray_parquet_next(r);
+        ok = t && RAY_IS_ERR(t);
+        if (t) {
+            if (ok) {
+                const char* msg = ray_error_msg();
+                ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
+                     msg && strstr(msg, "v2 null count mismatch") != NULL;
+                if (!ok) fprintf(stderr, "  delta v2 error %s: got %s / %s\n", fixture,
+                                 ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
+            }
+            ray_error_free(t);
+        }
+    }
+    if (r) ray_parquet_close(r);
+    unlink(path);
+    return ok;
+}
+static test_result_t test_pq_delta_binary_packed(void) {
+    static const struct { const char* name; int type; } fixtures[] = {
+        {"dbp-i64-v1.parquet", RAY_I64},
+        {"dbp-i64-v2page.parquet", RAY_I64},
+        {"dbp-i32-v1.parquet", RAY_I32},
+        {"dbp-i32-nulls-v2.parquet", RAY_I32},
+        {"dbp-i32-date.parquet", RAY_DATE},
+        {"dbp-i32-overflow.parquet", RAY_I32},
+        {"dbp-allnull.parquet", RAY_I32},
+        {"dbp-i64-required.parquet", RAY_I64},
+        {"dbp-i64-2page.parquet", RAY_I64},
+        {"dbp-i64-multirg.parquet", RAY_I64},
+        {"dbp-i64-snappy.parquet", RAY_I64},
+        {"duckdb-v2-mixed.parquet", RAY_I64},
+    };
+    int64_t batches[] = {3, 4096, 65536};
+    for (size_t i = 0; i < sizeof(fixtures)/sizeof(fixtures[0]); i++)
+        for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++)
+            TEST_ASSERT_TRUE(pq_delta_check(fixtures[i].name, fixtures[i].type, batches[b]));
+    /* A one-row batch crosses page and row-group boundaries repeatedly. */
+    TEST_ASSERT_TRUE(pq_delta_check("dbp-i64-2page.parquet", RAY_I64, 1));
+    TEST_ASSERT_TRUE(pq_delta_check("dbp-i64-multirg.parquet", RAY_I64, 1));
+#if defined(DEBUG)
+    /* A certifying PLAIN read primes the seam; the DELTA page must not run
+     * the certification prepass or its counter would move. */
+    char plain[160];
+    snprintf(plain, sizeof(plain), "/tmp/rayforce-pq-delta-cert-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_synth_optional(plain, 20000, 1, 0, false));
+    ray_parquet_t* pr = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(plain, NULL, 65536, &pr));
+    ray_t* pt = ray_parquet_next(pr);
+    TEST_ASSERT_TRUE(pt && !RAY_IS_ERR(pt));
+    TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(), 20000);
+    ray_release(pt); ray_parquet_close(pr); unlink(plain);
+    int64_t id = ray_sym_intern("id", 2);
+    ray_t* idcols = ray_vec_from_raw(RAY_SYM, &id, 1);
+    ray_error_clear();
+    ray_parquet_t* dr = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "duckdb-v2-mixed.parquet", idcols, 65536, &dr));
+    ray_t* dt = ray_parquet_next(dr);
+    TEST_ASSERT_TRUE(dt && !RAY_IS_ERR(dt));
+    TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(), 20000);
+    TEST_ASSERT_EQ_I(ray_table_nrows(dt), 65536);
+    ray_release(dt); ray_parquet_close(dr); ray_release(idcols);
+#endif
+    /* Strict mode refuses the first native sentinel (row 0). */
+    ray_error_clear();
+    ray_t* opts = pq_strict_options();
+    TEST_ASSERT_NOT_NULL(opts);
+    ray_t* se = ray_parquet_read(DELTA_FIX "dbp-i32-overflow.parquet", opts);
+    ray_release(opts);
+    TEST_ASSERT_TRUE(se && RAY_IS_ERR(se));
+    TEST_ASSERT_TRUE(ray_err_code(se) && !strcmp(ray_err_code(se), "parquet"));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_TRUE(msg && strstr(msg, "value conversion or allocation failed"));
+    ray_error_free(se);
+#if defined(DEBUG)
+    /* The value phase is interruptible between coarse checkpoints; the seam
+     * fires one inside the 100,000-row DELTA page. */
+    ray_clear_interrupt();
+    ray_parquet_t* cr = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "duckdb-v2-mixed.parquet", NULL, 65536, &cr));
+    ray_parquet_test_delta_interrupt_after(1);
+    ray_t* ct = ray_parquet_next(cr);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(ct && RAY_IS_ERR(ct));
+    TEST_ASSERT_TRUE(ray_err_code(ct) && !strcmp(ray_err_code(ct), "cancel"));
+    TEST_ASSERT_TRUE(ray_parquet_test_delta_values() <= 4096);
+    ray_error_free(ct);
+    ray_parquet_close(cr);
+#endif
+    PASS();
+}
+static test_result_t test_pq_delta_errors(void) {
+    pq_buf b = {0};
+    /* Truncated header varint. */
+    pb_byte(&b, 0x80);
+    TEST_ASSERT_TRUE(pq_delta_error("header", 1, b.p, b.n, 2, "truncated delta header"));
+    b.n = 0;
+    /* Truncated block header varint. */
+    pq_delta_head(&b, 2); pb_byte(&b, 0x80);
+    TEST_ASSERT_TRUE(pq_delta_error("block", 2, b.p, b.n, 2, "truncated delta block header"));
+    b.n = 0;
+    /* Truncated miniblock body. */
+    pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 8); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
+    TEST_ASSERT_TRUE(pq_delta_error("body", 2, b.p, b.n, 2, "truncated delta miniblock"));
+    b.n = 0;
+    /* A width wider than the physical type. */
+    pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 33); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
+    TEST_ASSERT_TRUE(pq_delta_error("width", 2, b.p, b.n, 1, "invalid delta bit width"));
+    b.n = 0;
+    /* The header count is below the values the rows require. */
+    pq_delta_head(&b, 1);
+    TEST_ASSERT_TRUE(pq_delta_error("count", 2, b.p, b.n, 2, "delta value count exceeds the stream header"));
+    b.n = 0;
+    /* Trailing body bytes after the last decoded value. */
+    pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
+    TEST_ASSERT_TRUE(pq_delta_error("trail", 2, b.p, b.n, 2, "excess delta values"));
+    b.n = 0;
+    /* A block size that is not a multiple of 128. */
+    pb_var(&b, 100); pb_var(&b, 4); pb_var(&b, 2); pb_zz(&b, 0);
+    TEST_ASSERT_TRUE(pq_delta_error("block-size", 2, b.p, b.n, 2, "invalid delta block size"));
+    /* A v2 page whose declared null count disagrees with the levels. */
+    b.n = 0;
+    {
+        static const uint8_t levels[] = {0x03, 0x02};   /* one group, row 1 present */
+        pq_buf s = {0};
+        pq_delta_head(&s, 1);
+        TEST_ASSERT_TRUE(pq_delta_error_v2("nulls", 2, s.p, s.n, levels, sizeof(levels)));
+        ray_sys_free(s.p);
+    }
+    ray_sys_free(b.p);
+    PASS();
+}
+static test_result_t test_pq_delta_refusal(void) {
+    ray_error_clear();
+    ray_parquet_t* r = NULL;
+    ray_t* e = ray_parquet_open(DELTA_FIX "unsupported-bss.parquet", NULL, 65536, &r);
+    TEST_ASSERT_NULL(e);
+    TEST_ASSERT_NOT_NULL(r);
+    ray_t* t = ray_parquet_next(r);
+    TEST_ASSERT_TRUE(t && RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(ray_err_code(t) && !strcmp(ray_err_code(t), "parquet"));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_TRUE(msg && !strncmp(msg, "unsupported value encoding", 26));
+    TEST_ASSERT_TRUE(!strstr(msg, "parquet: "));
+    ray_error_free(t);
+    ray_parquet_close(r);
+    PASS();
+}
+
 const test_entry_t parquet_entries[] = {
+    {"parquet/delta_binary_packed",test_pq_delta_binary_packed,pq_setup,pq_teardown},
+    {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
+    {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
     {"parquet/sk4_unsure_small_text",test_pq_sk4_unsure_small_text,pq_setup,pq_teardown},
