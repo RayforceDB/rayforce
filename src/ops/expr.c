@@ -4282,9 +4282,11 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             } while (0)
 
         /* A non-SYM integer column of a narrower width than its scalar (a U8
-         * column against an I64 literal) compares in int64: casting the
-         * scalar down to the column's width would wrap an out-of-range one,
-         * (== u8col 300) matching the rows equal to 44. */
+         * column against an I64 literal) whose scalar does not fit the column
+         * compares in int64: casting the scalar down to the column's width
+         * would wrap it, (== u8col 300) matching the rows equal to 44. A
+         * scalar that fits takes BR_FAST, the native-width compare, which has
+         * twice or four times the lanes. */
         #define BR_FAST_WIDE(T)                                                 \
             do {                                                                \
                 const T* d = (const T*)lbase;                                   \
@@ -4323,18 +4325,21 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 }
                 BR_FAST(uint32_t, (int64_t)d[i]);
             } else {
-                BR_FAST_WIDE(int32_t);
+                if (cv >= INT32_MIN && cv <= INT32_MAX) BR_FAST(int32_t, d[i]);
+                else BR_FAST_WIDE(int32_t);
             }
             return;
         } else if (l_esz == 2) {
             if (RAY_IS_SYM(lhs->type)) {
                 BR_FAST(uint16_t, (int64_t)d[i]);
             } else {
-                BR_FAST_WIDE(int16_t);
+                if (cv >= INT16_MIN && cv <= INT16_MAX) BR_FAST(int16_t, d[i]);
+                else BR_FAST_WIDE(int16_t);
             }
             return;
         } else if (l_esz == 1) {
-            BR_FAST_WIDE(uint8_t);
+            if (cv >= 0 && cv <= UINT8_MAX) BR_FAST(uint8_t, d[i]);
+            else BR_FAST_WIDE(uint8_t);
             return;
         }
         #undef BR_FAST
