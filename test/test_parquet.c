@@ -5494,10 +5494,227 @@ static int pq_i64_cmp(const void* a, const void* b) {
     int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
     return x < y ? -1 : x > y ? 1 : 0;
 }
+/* One heap copy per non-null string, sorted by content for the distinct
+ * count (qsort needs a context-free comparator, so each value owns its
+ * bytes). */
+typedef struct { const char* s; size_t len; } pq_strref;
+static int pq_strref_cmp(const void* a, const void* b) {
+    const pq_strref* x = (const pq_strref*)a;
+    const pq_strref* y = (const pq_strref*)b;
+    size_t n = x->len < y->len ? x->len : y->len;
+    int c = n ? memcmp(x->s, y->s, n) : 0;
+    if (c) return c;
+    return x->len < y->len ? -1 : x->len > y->len ? 1 : 0;
+}
+/* The trailing `width` bytes of a value, or the whole value when shorter:
+ * the distinguishing suffix expected.txt records for a long-prefix page. */
+static void pq_suffix_token(const char* s, size_t len, size_t width, char out[32]) {
+    size_t take = len < width ? len : width;
+    if (take) memcpy(out, s + len - take, take);
+    out[take] = '\0';
+}
+/* One string column's reader-visible values against the expected block.
+ * `prefix` selects the record-key family: "" reads minlen/maxlen/totallen/
+ * distinct/digest, the anchors and the anchor suffix; "name" reads
+ * name_minlen/... and compares no anchors (the mixed fixture records no
+ * name anchor). The digest is MD5 over the UTF-8 values in row order,
+ * joined by "|", with NULL as the null token. An empty BYTE_ARRAY value is
+ * the STR native null (reader null policy), so it hashes as NULL and is
+ * outside the length aggregates. */
+static bool pq_delta_string_check(const char* fixture, int col, const char* prefix, int64_t batch) {
+    pq_expect e;
+    if (!pq_expect_load(&e, fixture)) {
+        fprintf(stderr, "  delta %s: no expected block\n", fixture);
+        return false;
+    }
+    const char* srows = pq_expect_get(&e, "rows");
+    int64_t want_rows = srows ? strtoll(srows, NULL, 10) : -1;
+    if (want_rows < 0) { fprintf(stderr, "  delta %s: no rows field\n", fixture); return false; }
+    char pfx[16], key[64];
+    snprintf(pfx, sizeof(pfx), "%s%s", prefix, prefix[0] ? "_" : "");
+    /* The suffix width is the recorded anchor_suffix token's width. */
+    snprintf(key, sizeof(key), "%sanchor_suffix first", pfx);
+    size_t suffix_w = 0;
+    const char* asf = pq_expect_get(&e, key);
+    if (asf) { char tok[16][32]; if (pq_split_tokens(asf, tok, 16) > 0) suffix_w = strlen(tok[0]); }
+    char path[256];
+    snprintf(path, sizeof(path), "%s%s", DELTA_FIX, fixture);
+    ray_parquet_t* r = NULL;
+    ray_error_clear();
+    ray_t* err = ray_parquet_open(path, NULL, batch, &r);
+    if (err || !r) {
+        fprintf(stderr, "  delta %s open: %s\n", fixture, err ? ray_err_code(err) : "null");
+        if (err) ray_error_free(err);
+        return false;
+    }
+    pq_strref* refs = (pq_strref*)malloc((size_t)(want_rows > 0 ? want_rows : 1) * sizeof(*refs));
+    if (!refs) { ray_parquet_close(r); return false; }
+    pq_md5 md; pq_md5_init(&md);
+    int64_t seen = 0, nulls = 0, nrefs = 0, minlen = 0, maxlen = 0, totallen = 0;
+    bool first_tok = true, long_value = false, failed = false;
+    enum { PQ_ANCHOR = 8 };
+    char af[PQ_ANCHOR][32], al[4][32], sf_first[PQ_ANCHOR][32], sf_last[4][32];
+    memset(al, 0, sizeof(al)); memset(sf_last, 0, sizeof(sf_last));
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        if (RAY_IS_ERR(t)) { failed = true; fprintf(stderr, "  delta %s read: %s / %s\n", fixture,
+            ray_err_code(t) ? ray_err_code(t) : "(no code)", ray_error_msg() ? ray_error_msg() : "(no message)");
+            ray_error_free(t); break; }
+        ray_t* colv = ray_table_get_col_idx(t, col);
+        int64_t nr = ray_table_nrows(t);
+        if (!colv || colv->type != RAY_STR) {
+            fprintf(stderr, "  delta %s col %d: not a string column\n", fixture, col);
+            failed = true;
+        }
+        for (int64_t i = 0; !failed && i < nr; i++, seen++) {
+            size_t len = 0;
+            const char* sp = ray_str_vec_get(colv, i, &len);
+            bool isnull = ray_vec_is_null(colv, i);
+            if (!first_tok) pq_md5_update(&md, "|", 1);
+            first_tok = false;
+            if (isnull) { nulls++; pq_md5_update(&md, "NULL", 4); continue; }
+            if (!sp) { failed = true; fprintf(stderr, "  delta %s col %d: unreadable value\n", fixture, col); break; }
+            pq_md5_update(&md, sp, len);
+            if (nrefs == 0) { minlen = maxlen = (int64_t)len; totallen = 0; }
+            if ((int64_t)len < minlen) minlen = (int64_t)len;
+            if ((int64_t)len > maxlen) maxlen = (int64_t)len;
+            totallen += (int64_t)len;
+            char* copy = (char*)malloc(len);
+            if (!copy) { failed = true; break; }
+            memcpy(copy, sp, len);
+            if (nrefs < want_rows) {
+                refs[nrefs].s = copy; refs[nrefs].len = len; nrefs++;
+            } else { free(copy); continue; }   /* a surplus row fails the count check */
+            if (nrefs <= PQ_ANCHOR) {
+                if (len <= 31) { memcpy(af[nrefs - 1], sp, len); af[nrefs - 1][len] = '\0'; }
+                else long_value = true;
+                if (suffix_w) pq_suffix_token(sp, len, suffix_w, sf_first[nrefs - 1]);
+            }
+            if (suffix_w) pq_suffix_token(sp, len, suffix_w, sf_last[nrefs & 3]);
+            if (len <= 31) { memcpy(al[nrefs & 3], sp, len); al[nrefs & 3][len] = '\0'; }
+            else al[nrefs & 3][0] = '\0';
+        }
+        ray_release(t);
+    }
+    ray_parquet_close(r);
+    bool ok = !failed && seen == want_rows;
+    if (!ok) fprintf(stderr, "  delta %s batch %lld: rows %lld/%lld failed=%d\n",
+                     fixture, (long long)batch, (long long)seen, (long long)want_rows, (int)failed);
+    if (ok && !prefix[0]) {
+        const char* sn = pq_expect_get(&e, "nulls");
+        if (sn) {
+            ok = nulls == strtoll(sn, NULL, 10);
+            if (!ok) fprintf(stderr, "  delta %s: nulls %lld want %s\n", fixture, (long long)nulls, sn);
+        }
+    }
+    if (ok) {
+        snprintf(key, sizeof(key), "%sminlen", pfx);
+        const char* s = pq_expect_get(&e, key);
+        if (s && strcmp(s, "-")) {
+            ok = minlen == strtoll(s, NULL, 10);
+            if (!ok) fprintf(stderr, "  delta %s col %d: %sminlen %lld want %s\n", fixture, col, pfx, (long long)minlen, s);
+        }
+    }
+    if (ok) {
+        snprintf(key, sizeof(key), "%smaxlen", pfx);
+        const char* s = pq_expect_get(&e, key);
+        if (s && strcmp(s, "-")) {
+            ok = maxlen == strtoll(s, NULL, 10);
+            if (!ok) fprintf(stderr, "  delta %s col %d: %smaxlen %lld want %s\n", fixture, col, pfx, (long long)maxlen, s);
+        }
+    }
+    if (ok) {
+        snprintf(key, sizeof(key), "%stotallen", pfx);
+        const char* s = pq_expect_get(&e, key);
+        if (s && strcmp(s, "-")) {
+            ok = totallen == strtoll(s, NULL, 10);
+            if (!ok) fprintf(stderr, "  delta %s col %d: %stotallen %lld want %s\n", fixture, col, pfx, (long long)totallen, s);
+        }
+    }
+    if (ok && nrefs) {
+        qsort(refs, (size_t)nrefs, sizeof(*refs), pq_strref_cmp);
+        int64_t distinct = 0;
+        for (int64_t i = 0; i < nrefs; i++)
+            if (!i || pq_strref_cmp(&refs[i-1], &refs[i])) distinct++;
+        snprintf(key, sizeof(key), "%sdistinct", pfx);
+        const char* s = pq_expect_get(&e, key);
+        ok = s && distinct == strtoll(s, NULL, 10);
+        if (!ok) fprintf(stderr, "  delta %s col %d: %sdistinct %lld want %s\n",
+                         fixture, col, pfx, (long long)distinct, s ? s : "(none)");
+    }
+    if (ok) {
+        char hex[33]; pq_md5_hex(&md, hex);
+        snprintf(key, sizeof(key), "%sdigest", pfx);
+        const char* want = pq_expect_get(&e, key);
+        ok = want && !strcmp(hex, want);
+        if (!ok) fprintf(stderr, "  delta %s col %d: %sdigest %s want %s\n",
+                         fixture, col, pfx, hex, want ? want : "(none)");
+    }
+    if (ok && !prefix[0]) {
+        const char* a = pq_expect_get(&e, "anchors first");
+        if (a) {
+            char got[PQ_ANCHOR][32];
+            int ng = 0;
+            if (long_value) {
+                ok = false;
+                fprintf(stderr, "  delta %s: anchor value exceeds the 31-byte token; use anchor_suffix\n", fixture);
+            } else {
+                for (int i = 0; i < PQ_ANCHOR && i < (int)nrefs; i++) snprintf(got[ng++], 32, "%s", af[i]);
+                ok = pq_tokens_equal(a, got, ng);
+                if (!ok) fprintf(stderr, "  delta %s: first anchors\n", fixture);
+            }
+        }
+    }
+    if (ok && !prefix[0]) {
+        const char* a = pq_expect_get(&e, "anchors last");
+        if (a) {
+            char got[4][32];
+            int ng = 0;
+            int start = nrefs >= 4 ? (int)((nrefs + 1) & 3) : 0;
+            for (int k = 0; k < 4; k++) {
+                int idx = (start + k) & 3;
+                if (al[idx][0]) snprintf(got[ng++], 32, "%s", al[idx]);
+            }
+            ok = pq_tokens_equal(a, got, ng);
+            if (!ok) fprintf(stderr, "  delta %s: last anchors\n", fixture);
+        }
+    }
+    if (ok && !prefix[0]) {
+        const char* a = pq_expect_get(&e, "anchor_suffix first");
+        if (a) {
+            char got[PQ_ANCHOR][32];
+            int ng = 0;
+            for (int i = 0; i < PQ_ANCHOR && i < (int)nrefs; i++) snprintf(got[ng++], 32, "%s", sf_first[i]);
+            ok = pq_tokens_equal(a, got, ng);
+            if (!ok) fprintf(stderr, "  delta %s: first anchor suffix\n", fixture);
+        }
+    }
+    if (ok && !prefix[0]) {
+        const char* a = pq_expect_get(&e, "anchor_suffix last");
+        if (a) {
+            char got[4][32];
+            int ng = 0;
+            int start = nrefs >= 4 ? (int)((nrefs + 1) & 3) : 0;
+            for (int k = 0; k < 4; k++) {
+                int idx = (start + k) & 3;
+                if (sf_last[idx][0]) snprintf(got[ng++], 32, "%s", sf_last[idx]);
+            }
+            ok = pq_tokens_equal(a, got, ng);
+            if (!ok) fprintf(stderr, "  delta %s: last anchor suffix\n", fixture);
+        }
+    }
+    for (int64_t i = 0; i < nrefs; i++) free((void*)refs[i].s);
+    free(refs);
+    return ok;
+}
 /* Decode one fixture through the reader at `batch` rows and compare every
  * reader-visible aggregate, the canonical digest and the anchors with the
- * expected.txt block. */
+ * expected.txt block. The RAY_STR call is the same comparison over a string
+ * column 0, so a Stage 2 string fixture entry reaches the anchor_suffix
+ * check without new test code. */
 static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
+    if (type == RAY_STR) return pq_delta_string_check(fixture, 0, "", batch);
     pq_expect e;
     if (!pq_expect_load(&e, fixture)) {
         fprintf(stderr, "  delta %s: no expected block\n", fixture);
@@ -5837,6 +6054,11 @@ static test_result_t test_pq_delta_binary_packed(void) {
     /* A one-row batch crosses page and row-group boundaries repeatedly. */
     TEST_ASSERT_TRUE(pq_delta_check("dbp-i64-2page.parquet", RAY_I64, 1));
     TEST_ASSERT_TRUE(pq_delta_check("dbp-i64-multirg.parquet", RAY_I64, 1));
+    /* The mixed fixture's `name` column (BYTE_ARRAY RLE_DICTIONARY) is a
+     * pre-existing Stage 1 encoding; its recorded name_* oracle is compared
+     * at the same batch sizes as the DELTA id column. */
+    for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++)
+        TEST_ASSERT_TRUE(pq_delta_string_check("duckdb-v2-mixed.parquet", 1, "name", batches[b]));
 #if defined(DEBUG)
     /* A certifying PLAIN read primes the seam; the DELTA page must not run
      * the certification prepass or its counter would move. */
