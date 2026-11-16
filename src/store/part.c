@@ -53,8 +53,7 @@
  * 2024.02.31 through; parse_date_dir then silently normalised them into a
  * different real day (2024.03.02) — a mislabelled partition key.  Validate the
  * day against the leap-aware length of its month instead. */
-static bool is_date_dir(const char* name) {
-    if (strlen(name) != 10) return false;
+static bool is_date_text(const char* name) {
     if (name[4] != '.' || name[7] != '.') return false;
     for (int i = 0; i < 10; i++) {
         if (i == 4 || i == 7) continue;
@@ -68,6 +67,41 @@ static bool is_date_dir(const char* name) {
     int leap = date_leap_year(year);
     int dim  = (int)(MONTHDAYS[leap][month] - MONTHDAYS[leap][month - 1]);
     return day <= dim;
+}
+
+static bool is_date_dir(const char* name) {
+    return strlen(name) == 10 && is_date_text(name);
+}
+
+static int32_t parse_date_dir(const char* name);
+
+/* Parse "YYYY.MM.DD.HH.MM.SS" → nanoseconds since 2000-01-01; false when
+ * the value does not fit int64 (years outside about 1708-2292). */
+static bool parse_ts_dir(const char* name, int64_t* out) {
+    int64_t secs = ((name[11]-'0')*10 + (name[12]-'0')) * 3600
+                 + ((name[14]-'0')*10 + (name[15]-'0')) * 60
+                 +  (name[17]-'0')*10 + (name[18]-'0');
+    int64_t v;
+    return !__builtin_add_overflow((int64_t)parse_date_dir(name) * 86400, secs, &v) &&
+           !__builtin_mul_overflow(v, 1000000000LL, out);
+}
+
+/* Validate YYYY.MM.DD.HH.MM.SS: exactly 19 chars, a real calendar date, a
+ * time of day and a value that fits a TIMESTAMP.  Fixed width, so string
+ * order is chronological. */
+static bool is_ts_dir(const char* name) {
+    if (strlen(name) != 19) return false;
+    if (name[10] != '.' || name[13] != '.' || name[16] != '.') return false;
+    for (int i = 11; i < 19; i++) {
+        if (i == 13 || i == 16) continue;
+        if (name[i] < '0' || name[i] > '9') return false;
+    }
+    if (!is_date_text(name)) return false;
+    int hour = (name[11] - '0') * 10 + (name[12] - '0');
+    int min  = (name[14] - '0') * 10 + (name[15] - '0');
+    int sec  = (name[17] - '0') * 10 + (name[18] - '0');
+    int64_t ns;
+    return hour <= 23 && min <= 59 && sec <= 59 && parse_ts_dir(name, &ns);
 }
 
 /* Digit-only name: integer-shaped.  Names get here through the digit/dot
@@ -90,8 +124,9 @@ static bool parse_int_dir(const char* s, int64_t* out) {
 }
 
 /* Classify a partition set by its directory names into the MAPCOMMON key
- * type: all YYYY.MM.DD → DATE; all digit-only and within int64 → I64;
- * anything else → SYM (opaque names in string order).
+ * type: all YYYY.MM.DD → DATE; all YYYY.MM.DD.HH.MM.SS → TIMESTAMP; all
+ * digit-only and within int64 → I64; anything else → SYM (opaque names in
+ * string order).
  *
  * A digit-only name past int64 in an otherwise all-integer set is
  * RAY_ERR_CORRUPT with *out_bad = its index rather than a fall-back to SYM:
@@ -101,16 +136,18 @@ static bool parse_int_dir(const char* s, int64_t* out) {
  * is as valid there as any other. */
 static ray_err_t infer_mc_type(char** part_dirs, int64_t part_count,
                                uint8_t* out_type, int64_t* out_bad) {
-    bool all_date = true, all_digits = true;
+    bool all_date = true, all_ts = true, all_digits = true;
     int64_t unfit = -1;                  /* first digit-only name past int64 */
-    for (int64_t i = 0; i < part_count && (all_date || all_digits); i++) {
+    for (int64_t i = 0; i < part_count && (all_date || all_ts || all_digits); i++) {
         const char* name = part_dirs[i];
         if (all_date && !is_date_dir(name)) all_date = false;
+        if (all_ts && !is_ts_dir(name)) all_ts = false;
         if (all_digits && !is_digits(name)) all_digits = false;
         int64_t v;
         if (all_digits && unfit < 0 && !parse_int_dir(name, &v)) unfit = i;
     }
     if (all_date) { *out_type = RAY_MC_DATE; return RAY_OK; }
+    if (all_ts) { *out_type = RAY_MC_TIMESTAMP; return RAY_OK; }
     if (!all_digits) { *out_type = RAY_MC_SYM; return RAY_OK; }
     if (unfit >= 0) { *out_bad = unfit; return RAY_ERR_CORRUPT; }
     *out_type = RAY_MC_I64;
@@ -169,7 +206,7 @@ static int int_name_cmp(const void* a, const void* b) {
  * collect_part_dirs — scan db_root for partition directories
  *
  * Collects directory names that match digit/dot pattern, classifies the set
- * (*out_mc_type: RAY_MC_DATE / I64 / SYM) and sorts it into partition-key
+ * (*out_mc_type: RAY_MC_DATE / TIMESTAMP / I64 / SYM) and sorts it into partition-key
  * order — by value for an integer set, else by name.  Every consumer relies
  * on that order: ray_read_parted emits the MAPCOMMON keys in it (and query
  * paths take DATE keys as ascending), ray_parted_tables and ray_parted_fill
@@ -913,9 +950,10 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* ---- MAPCOMMON column (first) ---- */
     {
         /* key_values type matches inferred partition key type */
-        int8_t kv_type = (mc_type == RAY_MC_DATE) ? RAY_DATE
-                       : (mc_type == RAY_MC_I64)  ? RAY_I64
-                       :                           RAY_SYM;
+        int8_t kv_type = (mc_type == RAY_MC_DATE)      ? RAY_DATE
+                       : (mc_type == RAY_MC_TIMESTAMP) ? RAY_TIMESTAMP
+                       : (mc_type == RAY_MC_I64)       ? RAY_I64
+                       :                                RAY_SYM;
         ray_t* key_values = ray_vec_new(kv_type, part_count);
         ray_t* row_counts = ray_vec_new(RAY_I64, part_count);
         if (!key_values || RAY_IS_ERR(key_values) ||
@@ -931,6 +969,12 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             int32_t* kv_data = (int32_t*)ray_data(key_values);
             for (int64_t p = 0; p < part_count; p++) {
                 kv_data[p] = parse_date_dir(part_dirs[p]);
+                rc_data[p] = ray_table_nrows(part_tables[p]);
+            }
+        } else if (mc_type == RAY_MC_TIMESTAMP) {
+            int64_t* kv_data = (int64_t*)ray_data(key_values);
+            for (int64_t p = 0; p < part_count; p++) {
+                parse_ts_dir(part_dirs[p], &kv_data[p]);   /* fit checked by is_ts_dir */
                 rc_data[p] = ray_table_nrows(part_tables[p]);
             }
         } else if (mc_type == RAY_MC_I64) {
