@@ -1,7 +1,7 @@
 # Reader-visible expected values for the DELTA fixtures.
-# Source: rayforce-cr-1188.md Appendix A (captured 2026-11-14/15 with
-# DuckDB 1.5.6), plus dbp-i32-date.parquet captured at generation with
-# pyarrow 26.0.1. Values apply the reader's null policy: a stored value
+# Oracle values recorded from DuckDB 1.5.6 and pyarrow 26.0.1 during
+# fixture development; manifest.txt records the writer and encoding
+# metadata. Values apply the reader's null policy: a stored value
 # equal to the native sentinel (INT32_MIN, INT64_MIN, any NaN) or an
 # empty BYTE_ARRAY value is a native null. "N" is the null token; "-"
 # means the field is empty (an all-null fixture has no min, max or sum).

@@ -30,8 +30,8 @@ Page layouts: data_page_version 1.0 except the *-v2page and dbp-i32-nulls-v2,
 dbp-i32-overflow and dba-nulls-v2 files (2.0); use_dictionary=False;
 compression none except dbp-i64-snappy (Snappy); dbp-i64-2page uses
 data_page_size=128, write_batch_size=1024, row_group_size=10000;
-dbp-i64-multirg uses row_group_size=2500. See rayforce-cr-1188.md section
-6.6 for the fixture list and Appendix A for the recorded oracle values.
+dbp-i64-multirg uses row_group_size=2500. expected.txt in the output
+directory records the oracle values these fixtures must reproduce.
 """
 import datetime
 import os
