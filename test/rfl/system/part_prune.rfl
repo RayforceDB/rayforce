@@ -13,7 +13,7 @@
 ;; cause "error: corrupt" on the second open.
 
 ;; ────────────── pre-flight cleanup ──────────────
-(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_ts_ovf /tmp/rfl_part_ps /tmp/rfl_part_ps0 /tmp/rfl_part_psn /tmp/rfl_part_psx /tmp/rfl_part_psi")
+(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_ts_ovf /tmp/rfl_part_ps /tmp/rfl_part_ps0 /tmp/rfl_part_psn /tmp/rfl_part_psx /tmp/rfl_part_psi /tmp/rfl_part_psin /tmp/rfl_part_psa")
 
 (set O {compress: true})
 ;; Three partitions of a Time/v table whose Time values rise with the key.
@@ -133,6 +133,38 @@
 (at (select {from: Ppsn where: (== Time 2024.01.17D01:00:00.000)}) 'v) -- [6]
 (at (select {from: Ppsn where: (!= Time 2024.01.17D01:00:00.000)}) 'v) -- [1 2 3 4 5]
 
+;; a null literal is left to the filter: no partition is dropped, the
+;; null row is found (the guard on the literal in ray_part_prune_stats_mask)
+(at (select {from: Ppsn where: (== Time 0Np)}) 'v) -- [4]
+(count (select {from: Ppsn where: (== Time 0Np)})) -- 1
+(at (select {from: Ppsn where: (!= Time 0Np)}) 'v) -- [1 2 3 5 6]
+;; ... as is a null member of an `in` set (which no row matches) and a
+;; one-element null vector
+(at (select {from: Ppsn where: (in Time [2024.01.17D01:00:00.000 0Np])}) 'v) -- [6]
+(at (select {from: Ppsn where: (== Time [0Np])}) 'v) -- [4]
+;; the same over an integer column with a null in the middle partition
+(.db.splayed.set "/tmp/rfl_part_psin/100/t/" (table [k v] (list [100 150] [1 2])) O)
+(.db.splayed.set "/tmp/rfl_part_psin/200/t/" (table [k v] (list [200 0Nl 250] [3 4 5])) O)
+(.db.splayed.set "/tmp/rfl_part_psin/300/t/" (table [k v] (list [300] [6])) O)
+(set Ppsin (.db.parted.get "/tmp/rfl_part_psin/" 't))
+(at (select {from: Ppsin where: (== k 0Nl)}) 'v) -- [4]
+(at (select {from: Ppsin where: (in k [300 0Nl])}) 'v) -- [6]
+(at (select {from: Ppsin where: (< k 150)}) 'v) -- [1 4]
+(at (select {from: Ppsin where: (> k 220)}) 'v) -- [5 6]
+
+;; a partition of nulls only has no extrema: `<` and `<=` keep it, `==`
+;; and `>` drop it, `in` finds nothing in it
+(.db.splayed.set "/tmp/rfl_part_psa/2024.01.15/t/" PA O)
+(.db.splayed.set "/tmp/rfl_part_psa/2024.01.16/t/" (table [Time v] (list [0Np 0Np] [3 4])) O)
+(.db.splayed.set "/tmp/rfl_part_psa/2024.01.17/t/" PC O)
+(set Ppsa (.db.parted.get "/tmp/rfl_part_psa/" 't))
+(at (select {from: Ppsa where: (< Time 2024.01.15D12:00:00.000)}) 'v) -- [1 3 4]
+(at (select {from: Ppsa where: (<= Time 2024.01.17D01:00:00.000)}) 'v) -- [1 2 3 4 5]
+(at (select {from: Ppsa where: (> Time 2024.01.15D20:00:00.000)}) 'v) -- [5]
+(at (select {from: Ppsa where: (== Time 2024.01.17D01:00:00.000)}) 'v) -- [5]
+(at (select {from: Ppsa where: (in Time [2024.01.15D10:00:00.000 2024.01.17D01:00:00.000])}) 'v) -- [1 5]
+(at (select {from: Ppsa where: (== Time 0Np)}) 'v) -- [3 4]
+
 ;; a late row in the live tail is found: statistics describe the rows,
 ;; not a contract between the column and the key
 (insert 'Pps 2024.01.18 (table [Time v] (list [2024.01.16D23:00:00.000] [9])))
@@ -171,4 +203,4 @@
 (at (select {from: Ppsi where: (> k 250)}) 'k) -- [300]
 
 ;; ────────────── cleanup ──────────────
-(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_ts_ovf /tmp/rfl_part_ps /tmp/rfl_part_ps0 /tmp/rfl_part_psn /tmp/rfl_part_psx /tmp/rfl_part_psi")
+(.sys.exec "rm -rf /tmp/rfl_part_ts /tmp/rfl_part_ts_mixed /tmp/rfl_part_ts_bad /tmp/rfl_part_ts_ovf /tmp/rfl_part_ps /tmp/rfl_part_ps0 /tmp/rfl_part_psn /tmp/rfl_part_psx /tmp/rfl_part_psi /tmp/rfl_part_psin /tmp/rfl_part_psa")

@@ -1250,6 +1250,128 @@ static test_result_t test_partition_pruning_stats(void) {
 }
 
 /*
+ * Test: the guards of ray_part_seg_stats are load-bearing.  A chunk zone
+ * built for another row count (a segment appended to after the zone was
+ * attached, as the live tail is) describes rows that are not there, so
+ * the segment has no statistics and its partition is kept whatever the
+ * zone says; a chunk of nulls only contributes no extrema and a segment
+ * of nulls only has none, which `==` and `>` leave to the filter.
+ */
+static test_result_t test_partition_pruning_stats_guards(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* p0: 256 rows with a zone, then 44 rows past the zone's maximum */
+    ray_t* grown = ray_vec_new(RAY_TIMESTAMP, 300);
+    TEST_ASSERT_NOT_NULL(grown);
+    grown->len = 256;
+    int64_t* gv = (int64_t*)ray_data(grown);
+    for (int j = 0; j < 256; j++) gv[j] = 1000 + j;
+    ray_t* r = ray_index_attach_chunk_zone(&grown, 8);
+    TEST_ASSERT_TRUE(r == NULL || !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_kind(grown), RAY_IDX_CHUNK_ZONE);
+    int64_t mn, mx;
+    bool has_nulls, all_null;
+    TEST_ASSERT_TRUE(ray_part_seg_stats(grown, &mn, &mx, &has_nulls, &all_null));
+    TEST_ASSERT_EQ_I(mn, 1000);
+    TEST_ASSERT_EQ_I(mx, 1255);
+    gv = (int64_t*)ray_data(grown);
+    for (int j = 256; j < 300; j++) gv[j] = 9000 + j;
+    grown->len = 300;
+    TEST_ASSERT_FALSE(ray_part_seg_stats(grown, &mn, &mx, &has_nulls, &all_null));
+
+    /* p1: two chunks, the second all null; p2: nulls only */
+    ray_t* mixed = ray_vec_new(RAY_TIMESTAMP, 512);
+    TEST_ASSERT_NOT_NULL(mixed);
+    mixed->len = 512;
+    int64_t* mv = (int64_t*)ray_data(mixed);
+    for (int j = 0; j < 512; j++) mv[j] = 2000 + j;
+    for (int j = 256; j < 512; j++) ray_vec_set_null(mixed, j, true);
+    r = ray_index_attach_chunk_zone(&mixed, 8);
+    TEST_ASSERT_TRUE(r == NULL || !RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(ray_part_seg_stats(mixed, &mn, &mx, &has_nulls, &all_null));
+    TEST_ASSERT_EQ_I(mn, 2000);
+    TEST_ASSERT_EQ_I(mx, 2255);
+    TEST_ASSERT_TRUE(has_nulls && !all_null);
+    ray_t* nulls = ray_vec_new(RAY_TIMESTAMP, 256);
+    TEST_ASSERT_NOT_NULL(nulls);
+    nulls->len = 256;
+    for (int j = 0; j < 256; j++) ray_vec_set_null(nulls, j, true);
+    r = ray_index_attach_chunk_zone(&nulls, 8);
+    TEST_ASSERT_TRUE(r == NULL || !RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(ray_part_seg_stats(nulls, &mn, &mx, &has_nulls, &all_null));
+    TEST_ASSERT_TRUE(has_nulls && all_null);
+
+    ray_t* key_values = ray_vec_new(RAY_I64, 3);
+    TEST_ASSERT_NOT_NULL(key_values);
+    key_values->len = 3;
+    int64_t keys[] = {100, 200, 300};
+    memcpy(ray_data(key_values), keys, sizeof(keys));
+    ray_t* row_counts = ray_vec_new(RAY_I64, 3);
+    TEST_ASSERT_NOT_NULL(row_counts);
+    row_counts->len = 3;
+    int64_t counts[] = {300, 512, 256};
+    memcpy(ray_data(row_counts), counts, sizeof(counts));
+    ray_t* mapcommon = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(mapcommon);
+    mapcommon->type = RAY_MAPCOMMON;
+    mapcommon->len = 2;
+    mapcommon->attrs = RAY_MC_I64;
+    memset(mapcommon->aux, 0, 16);
+    ((ray_t**)ray_data(mapcommon))[0] = key_values;
+    ((ray_t**)ray_data(mapcommon))[1] = row_counts;
+    ray_t* t_parted = ray_alloc(3 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(t_parted);
+    t_parted->type = RAY_PARTED_BASE + RAY_TIMESTAMP;
+    t_parted->len = 3;
+    ((ray_t**)ray_data(t_parted))[0] = grown;
+    ((ray_t**)ray_data(t_parted))[1] = mixed;
+    ((ray_t**)ray_data(t_parted))[2] = nulls;
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("pkey", 4), mapcommon);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("t", 1), t_parted);
+
+    /* p0 is always kept: its zone is stale.  p2 is kept by every
+     * comparison: nulls only decide nothing. */
+    struct { ray_op_t* (*op)(ray_graph_t*, ray_op_t*, ray_op_t*); int64_t lit; uint64_t mask; } cases[] = {
+        { ray_gt, 8000, 0x5 },       /* the appended rows pass; p1's maximum is 2255 */
+        { ray_eq, 9300, 0x5 },
+        { ray_lt, 1000, 0x7 },       /* p1 holds nulls, which rank below every value */
+        { ray_eq, 2100, 0x7 },
+        { ray_gt, 3000, 0x5 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* scan_t = ray_scan(g, "t");
+        ray_t* lit = ray_timestamp(cases[i].lit);
+        ray_op_t* c_lit = ray_const_atom(g, lit);
+        ray_release(lit);
+        ray_op_t* filt = ray_filter(g, scan_t, cases[i].op(g, scan_t, c_lit));
+        TEST_ASSERT_NOT_NULL(ray_optimize(g, filt));
+        ray_op_ext_t* t_ext = NULL;
+        for (uint32_t e = 0; e < g->ext_count; e++)
+            if (g->ext_nodes[e] && g->ext_nodes[e]->base.id == scan_t->id) { t_ext = g->ext_nodes[e]; break; }
+        TEST_ASSERT_NOT_NULL(t_ext);
+        if (cases[i].mask == 0x7) {
+            TEST_ASSERT_EQ_PTR(t_ext->seg_mask, NULL);
+        } else {
+            TEST_ASSERT_NOT_NULL(t_ext->seg_mask);
+            TEST_ASSERT_EQ_I(t_ext->seg_mask_count, 3);
+            TEST_ASSERT_EQ_U(t_ext->seg_mask[0], cases[i].mask);
+        }
+        ray_graph_free(g);
+    }
+
+    ray_release(mapcommon);
+    ray_release(t_parted);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
  * Test: partition pruning works for OP_IN predicates.
  *
  * 4 partitions keyed by I64 values [100, 200, 300, 400].
@@ -3452,6 +3574,7 @@ const test_entry_t opt_entries[] = {
     { "opt/partition_pruning", test_partition_pruning_smoke, NULL, NULL },
     { "opt/partition_pruning_mask", test_partition_pruning_mask, NULL, NULL },
     { "opt/partition_pruning_stats", test_partition_pruning_stats, NULL, NULL },
+    { "opt/partition_pruning_stats_guards", test_partition_pruning_stats_guards, NULL, NULL },
     { "opt/partition_pruning_in", test_partition_pruning_in, NULL, NULL },
     { "opt/partition_pruning_not_in", test_partition_pruning_not_in, NULL, NULL },
     { "opt/partition_pruning_in_type_mismatch", test_partition_pruning_in_type_mismatch, NULL, NULL },
