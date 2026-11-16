@@ -16,7 +16,7 @@
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
 | [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (3) |
 | [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (15) |
-| [Serialization](#serialization) (2) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
+| [Serialization](#serialization) (5) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
 | [EAV Triple Store](#eav) (5) | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) |
 
 The examples below use these small in-memory fixtures where a table is needed:
@@ -77,7 +77,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
-`substr`, `replace`
+`substr`, `replace`, `repr`, `read-value`, `read-limits`
 
 ## Arithmetic
 
@@ -723,6 +723,9 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 |---|---|---|---|---|
 | `ser` | unary | — | Serialize any value to binary format (byte vector) | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
+| `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
+| `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
+| `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
 
 ```lisp
 ; Round-trip serialization

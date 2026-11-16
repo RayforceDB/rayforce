@@ -153,6 +153,11 @@ whole value has been read and checked. A rejected read, whatever the reason,
 adds no symbols. A successful read adds exactly the names that were new, in one
 step under the symbol lock; other threads never see a partial set.
 
+A dotted name such as `'a.b` is published the way the language interns it: its
+segments (`a` and `b`) become symbols too, and the name carries its dotted
+data, so resolving it does not depend on which path interned it first. The
+segments count against the symbol ceiling.
+
 ## Compatibility
 
 No cross-version promise is made yet. Text written by one release is not

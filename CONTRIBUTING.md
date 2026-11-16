@@ -106,6 +106,9 @@ than running it. C tests use `#ifndef RAY_OS_WINDOWS` / `SKIP(...)` for the
 same purpose. Prefer the shell-free helpers `ray_test_rm_rf` /
 `ray_test_mkdir_p` (`test/test.h`) over `system("rm -rf …")` in C tests.
 
+The test driver puts its scratch files under the directory `TMPDIR` names, so set
+it to an existing disk-backed directory to keep them off a RAM-backed `/tmp`.
+
 ### Windows
 
 Build with the MSYS2 CLANG64 (or MINGW64) toolchain — `pacman -S
@@ -145,13 +148,3 @@ legs.
 - **Nightly** (`.github/workflows/nightly.yml`): deep randomized stress, the full
   suite under TSan, long fuzz runs, and a server soak (`scripts/soak.sh`) that
   kill/restarts the server and watches resident memory for leaks.
-
-### Reader boundary proofs
-
-The internal #994 experiments are documented separately:
-[reader-local allocation](docs/reader-allocation-proof.md) and
-[whole-document symbol publication](docs/symbol-publication-proof.md).
-Run only their tests with `make test TEST_FILTER=reader_proof`. Set `TMPDIR`
-to an existing disk-backed directory to place test scratch there.
-These proofs do not expose a complete Rayfall data reader or change ordinary
-partial-batch symbol interning semantics.
