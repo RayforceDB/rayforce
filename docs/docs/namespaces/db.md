@@ -99,11 +99,17 @@ Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string o
 A `where:` comparison of a parted integer or temporal data column with a literal (`== != < <= > >= in`, alone or as a conjunct of a top-level `and`) prunes the partitions whose statistics decide it false for every row: a partition's non-null minimum and maximum, from the chunk directory of a column saved with `compress: true` or the chunk zone of a plain column of 65,536 rows or more. The rule is the one row-level zone skipping uses, so a null (which ranks below every value) keeps its partition for `<` and `<=`, and a partition without statistics is always kept. A time-series table partitioned by day therefore answers `(> Time 2024.01.16D12:00:00.000)` from the partitions of `2024.01.16` and later, with no declaration about how `Time` relates to the key; a late row in the live tail, a renamed column and a null are all found, because the statistics describe the rows themselves.
 
 ```lisp
-(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 {compress: true})
-(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 {compress: true})
+(set jan15 (table ['time 'sym 'price]
+             (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] ['AAPL 'GOOG] [150.5 2800.0])))
+(set jan16 (table ['time 'sym 'price]
+             (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] ['MSFT 'AAPL] [410.0 151.0])))
+(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 symfile {compress: true})
+(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile {compress: true})
 (set trades (.db.parted.get dbroot 'trades))
-;; Only the partitions whose time range reaches past the literal are read
-(select {from: trades where: (> time 2024.01.16D12:00:00.000)})
+;; 2024.01.15 ends at 20:00: its statistics decide the comparison false,
+;; and only 2024.01.16 is read
+(select {from: trades where: (> time 2024.01.16D06:00:00.000)})
+;; one row: date 2024.01.16, time 2024.01.16D12:00:00.000, sym AAPL, price 151.0
 ```
 
 ### In-memory live-tail inserts

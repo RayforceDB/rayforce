@@ -164,7 +164,7 @@ The loader:
 1. Loads the shared `.sym` file from `db_root`
 2. Discovers partition directories (sorted numerically): `YYYY.MM.DD` for a `date` key, `YYYY.MM.DD.HH.MM.SS` for a `timestamp` key, digit-only names for an `int64` key
 3. Loads each partition as a splayed table
-4. Adds a virtual `Date` column from the directory name
+4. Adds a virtual key column from the directory name: `date` for `YYYY.MM.DD` names, `part` (typed `timestamp` or `int64`) otherwise
 5. Concatenates all partitions into a single table
 
 This is the recommended layout for time-series data that grows continuously. New partitions can be added without rewriting existing data.
