@@ -1,5 +1,5 @@
 #include "test.h"
-#include "lang/read_budget.h"
+#include "mem/read_budget.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "mem/arena.h"

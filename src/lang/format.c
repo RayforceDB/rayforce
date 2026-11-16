@@ -177,6 +177,13 @@ static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
 
     if (n < 0) return; /* encoding error */
 
+    /* The byte limit is checked here too: text that fits the current capacity
+     * never reaches fmt_ensure, where the other writers check it. */
+    if (b->limit && (int64_t)b->len + n > b->limit) {
+        b->err = true; b->over_limit = true; b->err_msg = "output exceeds the byte limit";
+        return;
+    }
+
     if (n < avail) {
         b->len += n;
         return;

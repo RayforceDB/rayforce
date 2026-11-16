@@ -14,7 +14,7 @@
  * leaves the intern table as it found it.
  */
 #include "lang/readval.h"
-#include "lang/read_budget.h"
+#include "mem/read_budget.h"
 #include "lang/parse.h"
 #include "lang/eval.h"          /* ATTR_QUOTED */
 #include "table/sym.h"
@@ -91,6 +91,7 @@ static void* fail_budget(rd_t* rd) {
     case RAY_READ_LIMIT:
         return fail(rd, "limit", "read-value: construction allocation limit of %zu bytes exceeded", rd->lim.max_alloc);
     case RAY_READ_OOM:     return fail(rd, "oom", "read-value: out of memory");
+    case RAY_READ_SYM_LAZY: return fail(rd, "oom", "read-value: the persisted symbol table could not be loaded");
     default:               return fail(rd, "domain", "read-value: input cannot be represented");
     }
 }
@@ -191,7 +192,14 @@ static bool read_string(rd_t* rd) {
     for (;;) {
         if (at_end(rd)) { fail_at(rd, "unterminated string"); return false; }
         char c = *rd->p++;
-        if (c == '"') return true;
+        if (c == '"') {
+            /* ray_str_t holds a 32-bit length: a longer string has no value. */
+            if (rd->scratch.len > UINT32_MAX) {
+                fail(rd, "limit", "read-value: string longer than 4 GiB");
+                return false;
+            }
+            return true;
+        }
         if (c == '\\') {
             if (at_end(rd)) { fail_at(rd, "unterminated string"); return false; }
             char e = *rd->p++;
@@ -290,7 +298,10 @@ static void set_lit(ray_t* v, const ray_scalar_lit_t* l) {
     switch (l->type) {
     case -RAY_U8:  v->u8 = (uint8_t)l->i; break;
     case -RAY_I16: v->i16 = (int16_t)l->i; break;
-    case -RAY_I32: case -RAY_DATE: case -RAY_TIME: v->i32 = (int32_t)l->i; break;
+    case -RAY_I32: v->i32 = (int32_t)l->i; break;
+    /* DATE and TIME atoms hold their 32-bit value sign-extended over the whole
+     * i64, as ray_date and ray_time store it, and arithmetic reads the i64. */
+    case -RAY_DATE: case -RAY_TIME: v->i64 = (int64_t)(int32_t)l->i; break;
     case -RAY_F32: case -RAY_F64: v->f64 = l->f; break;
     default: v->i64 = l->i; break;
     }
@@ -307,7 +318,7 @@ static bool scan_lit(rd_t* rd, ray_scalar_lit_t* l) {
         const char* m = ray_error_msg();
         const char* c = ray_err_code(err);
         char msg[128];
-        snprintf(msg, sizeof msg, "%s", m && *m ? m : c);
+        snprintf(msg, sizeof msg, "%s", m && *m ? m : "invalid literal");
         bool domain = c && strcmp(c, "domain") == 0;
         ray_error_free(err);
         ray_error_clear();
@@ -934,7 +945,16 @@ ray_t* ray_read_value(const char* text, size_t len, const ray_read_limits_t* lim
         if (!strs || !lens || !ids) { fail_budget(&rd); return rd_error(&rd); }
         const sref_t* refs = (const sref_t*)rd.srefs.p;
         for (size_t i = 0; i < nsym; i++) { strs[i] = (const char*)rd.sbuf.p + refs[i].off; lens[i] = refs[i].len; }
-        if (!ray_sym_publish_values(&rd.bud, strs, lens, nsym, rd.lim.max_symbols, ids)) {
+        bool published = ray_sym_publish_values(&rd.bud, strs, lens, nsym, rd.lim.max_symbols, ids);
+        if (!published && rd.bud.status == RAY_READ_SYM_LAZY) {
+            /* Another thread loaded a symbol file between the two calls. */
+            rd.bud.status = RAY_READ_OK;
+            if (ray_sym_materialize_lazy())
+                published = ray_sym_publish_values(&rd.bud, strs, lens, nsym, rd.lim.max_symbols, ids);
+            else
+                rd.bud.status = RAY_READ_SYM_LAZY;
+        }
+        if (!published) {
             if (rd.bud.status == RAY_READ_LIMIT) fail(&rd, "limit", "read-value: symbol table limit exceeded");
             else fail_budget(&rd);
             return rd_error(&rd);

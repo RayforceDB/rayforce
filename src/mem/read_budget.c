@@ -1,4 +1,4 @@
-#include "lang/read_budget.h"
+#include "mem/read_budget.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include <string.h>
@@ -106,7 +106,10 @@ ray_t* ray_read_alloc(ray_read_budget_t* b, size_t bytes) {
     size_t actual = 0;
     ray_t* v = acquire_fails(b) ? NULL : ray_alloc_admitted(bytes, charge, &actual);
     if (!v) { b->live -= charge; b->status = RAY_READ_OOM; return NULL; }
-    assert(actual == charge);
+    /* The allocator decides the size on its own: the charge must be what the
+     * block really occupies, as a direct mapping or a buddy block. */
+    assert(actual == charge && charge == (ray_is_direct(v) ? ray_direct_map_size(v)
+                                                           : BSIZEOF(v->order)));
     v->type = RAY_U8;
     v->len = 0;
     commit(b, r, v, charge, false);

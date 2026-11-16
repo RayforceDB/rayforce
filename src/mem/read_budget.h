@@ -6,7 +6,8 @@
 
 typedef struct ray_read_records ray_read_records_t;
 typedef struct ray_read_record ray_read_record_t;
-typedef enum { RAY_READ_OK, RAY_READ_LIMIT, RAY_READ_OOM, RAY_READ_INVALID } ray_read_status_t;
+typedef enum { RAY_READ_OK, RAY_READ_LIMIT, RAY_READ_OOM, RAY_READ_INVALID,
+                RAY_READ_SYM_LAZY /* the symbol table still has names only a mapped file backs */ } ray_read_status_t;
 /* Internal proof context, not a Rayfall API. Values are borrowed until retained
  * by the caller. close releases the context's refs, including transitive work.
  * No global allocator hook or ambient budget is installed. */

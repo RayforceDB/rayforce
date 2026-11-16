@@ -32,7 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-#include "lang/read_budget.h"
+#include "mem/read_budget.h"
 #include <errno.h>
 #include "ops/hash.h"
 
@@ -45,6 +45,7 @@
 #define SYM_LOAD_FACTOR  0.7
 #define SYM_STRL_MAGIC   0x4C525453U  /* "STRL" */
 #define SYM_LAZY_LOAD_MIN_BYTES (64u * 1024u * 1024u)
+static size_t g_lazy_load_min_bytes = SYM_LAZY_LOAD_MIN_BYTES;   /* a test seam moves it */
 
 /* Cached segment list for a dotted sym: nsegs sym_ids that together make up
  * the dotted path.  segs is arena-allocated (same lifetime as sym table). */
@@ -118,6 +119,8 @@ uintptr_t ray_sym_test_table_addr(void)  { return (uintptr_t)&g_sym; }
 size_t    ray_sym_test_table_size(void)  { return sizeof g_sym; }
 size_t    ray_sym_test_arena_chunks(void) { return ray_arena_chunk_count(g_sym.arena); }
 uintptr_t ray_sym_test_inited_addr(void) { return (uintptr_t)&g_sym_inited; }
+/* Sets the file size from which ray_sym_load maps lazily; 0 restores the default. */
+void      ray_sym_test_set_lazy_min_bytes(size_t bytes) { g_lazy_load_min_bytes = bytes ? bytes : SYM_LAZY_LOAD_MIN_BYTES; }
 
 /* String atoms for the global sym table live in its arena (off the per-thread
  * buddy heap) — see ray_arena_str in mem/arena.c. */
@@ -1336,7 +1339,7 @@ ray_err_t ray_sym_load(const char* path) {
         return RAY_ERR_CORRUPT;
     }
 
-    if (mapped_size >= SYM_LAZY_LOAD_MIN_BYTES) {
+    if (mapped_size >= g_lazy_load_min_bytes) {
         sym_lock();
         uint32_t current = g_sym.str_count;
         uint32_t disk_u = (uint32_t)disk_count;
@@ -1450,18 +1453,75 @@ ray_err_t ray_sym_load(const char* path) {
     return RAY_OK;
 }
 
+/* The segments of a dotted name, by the rules sym_cache_segments and the
+ * intern path apply: a trailing dot, or a leading dot with no other, makes a
+ * plain name, as does an empty segment; segment 0 of `.a.b` keeps its leading
+ * dot. Returns false for a plain name. offs and lens may be NULL to count. */
+static bool sym_split_dotted(const char* str, size_t len, uint8_t* nsegs,
+                             size_t* offs, size_t* lens) {
+    if (!len || !memchr(str, '.', len) || str[len - 1] == '.') return false;
+    bool leading = str[0] == '.';
+    if (leading && !memchr(str + 1, '.', len - 1)) return false;
+    size_t sep = 0;
+    for (size_t i = leading ? 1 : 0; i < len; i++)
+        if (str[i] == '.') sep++;
+    if (sep + 1 > 255) return false;
+    size_t at = 0;
+    for (size_t k = 0; k <= sep; k++) {
+        size_t skip = (k == 0 && leading) ? 1 : 0;
+        const char* dot = at + skip < len
+            ? (const char*)memchr(str + at + skip, '.', len - at - skip) : NULL;
+        size_t seg = dot ? (size_t)(dot - (str + at)) : len - at;
+        if (!seg) return false;
+        if (offs) { offs[k] = at; lens[k] = seg; }
+        at += seg + 1;
+    }
+    *nsegs = (uint8_t)(sep + 1);
+    return true;
+}
+
+/* One name a published document asks for, or a segment of one. */
+typedef struct {
+    const char* text;
+    size_t length, canonical;   /* canonical: first candidate with this text */
+    uint32_t hash;
+    int64_t id;
+    bool cache;                 /* new, or not yet scanned: needs its dotted data */
+} sym_candidate_t;
+
+/* The slot of `seen` holding the candidate with this text, or the empty slot
+ * it would take. */
+static size_t sym_candidate_slot(const sym_candidate_t* plan, const size_t* seen,
+                                 size_t slots, uint32_t hash, const char* text,
+                                 size_t length) {
+    size_t slot = hash & (slots - 1);
+    while (seen[slot]) {
+        const sym_candidate_t* c = &plan[seen[slot] - 1];
+        if (c->hash == hash && c->length == length && !memcmp(c->text, text, length)) break;
+        slot = (slot + 1) & (slots - 1);
+    }
+    return slot;
+}
+
+static void sym_candidate_add(sym_candidate_t* plan, size_t* seen, size_t slots,
+                              size_t i, const char* text, size_t length) {
+    plan[i].text = text;
+    plan[i].length = length;
+    plan[i].hash = (uint32_t)ray_hash_bytes(text, length);
+    size_t slot = sym_candidate_slot(plan, seen, slots, plan[i].hash, text, length);
+    plan[i].canonical = seen[slot] ? seen[slot] - 1 : i;
+    if (!seen[slot]) seen[slot] = i + 1;
+}
+
 /* Whole-document value publication proof. Existing partial batch entry points
- * keep their semantics. Reader state never becomes the active global table. */
+ * keep their semantics. Reader state never becomes the active global table.
+ * A dotted name is published with its segments and its dotted data, exactly as
+ * the ordinary intern path leaves it, so resolving it does not depend on which
+ * path interned it first. The segments count against max_symbols. */
 bool ray_sym_publish_values(ray_read_budget_t* b,
                             const char* const* strings, const size_t* lengths,
                             size_t count, uint32_t max_symbols, int64_t* out_ids) {
-    typedef struct {
-        const char* text;
-        size_t length, canonical;
-        uint32_t hash;
-        int64_t id;
-    } candidate_t;
-    candidate_t* plan = NULL;
+    sym_candidate_t* plan = NULL;
     size_t* seen = NULL;
     char* text = NULL;
     void* new_chunk = NULL;
@@ -1472,7 +1532,9 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
     uint64_t* scanned = NULL;
     sym_segs_t* segments = NULL;
     bool locked = false, ok = false;
-    size_t text_bytes = 0, slots = 1;
+    size_t text_bytes = 0, slots = 1, total = count;
+    size_t offs[255], lens[255];
+    uint8_t nsegs;
     if (b->closed || b->status != RAY_READ_OK) return false;
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire) ||
         (count && (!strings || !lengths || !out_ids)) || count > UINT32_MAX / 2) {
@@ -1485,57 +1547,65 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
             b->status = RAY_READ_INVALID; return false;
         }
         text_bytes += lengths[i];
+        if (sym_split_dotted(strings[i], lengths[i], &nsegs, NULL, NULL)) total += nsegs;
+        if (total > UINT32_MAX / 2) { b->status = RAY_READ_LIMIT; return false; }
     }
-    while (slots < count * 2) {
+    while (slots < total * 2) {
         if (slots > SIZE_MAX / 2) { b->status = RAY_READ_LIMIT; return false; }
         slots *= 2;
     }
-    if (count > SIZE_MAX / sizeof(*plan) || slots > SIZE_MAX / sizeof(*seen)) {
+    if (total > SIZE_MAX / sizeof(*plan) || slots > SIZE_MAX / sizeof(*seen)) {
         b->status = RAY_READ_LIMIT; return false;
     }
-    plan = ray_read_sys_alloc(b, count * sizeof(*plan));
+    plan = ray_read_sys_alloc(b, total * sizeof(*plan));
     seen = ray_read_sys_alloc(b, slots * sizeof(*seen));
     text = ray_read_sys_alloc(b, text_bytes);
     if (!plan || !seen || !text) goto done;
-    size_t offset = 0;
+    size_t offset = 0, next = count;
     for (size_t i = 0; i < count; i++) {
         if (lengths[i]) memcpy(text + offset, strings[i], lengths[i]);
-        plan[i].text = text + offset;
-        plan[i].length = lengths[i];
-        plan[i].hash = (uint32_t)ray_hash_bytes(plan[i].text, plan[i].length);
+        sym_candidate_add(plan, seen, slots, i, text + offset, lengths[i]);
         offset += lengths[i];
-        size_t slot = plan[i].hash & (slots - 1);
-        while (seen[slot]) {
-            size_t j = seen[slot] - 1;
-            if (plan[i].hash == plan[j].hash && plan[i].length == plan[j].length &&
-                memcmp(plan[i].text, plan[j].text, plan[i].length) == 0) break;
-            slot = (slot + 1) & (slots - 1);
-        }
-        plan[i].canonical = seen[slot] ? seen[slot] - 1 : i;
-        if (!seen[slot]) seen[slot] = i + 1;
+    }
+    /* The segments follow the names, so a name keeps the first candidate. */
+    for (size_t i = 0; i < count; i++) {
+        if (!sym_split_dotted(plan[i].text, plan[i].length, &nsegs, offs, lens)) continue;
+        for (uint8_t k = 0; k < nsegs; k++)
+            sym_candidate_add(plan, seen, slots, next++, plan[i].text + offs[k], lens[k]);
     }
     sym_lock();
     locked = true;
     /* Lazy materialization itself allocates/interns. Do not hide it in an
      * allegedly side-effect-free inspection phase. This proof rejects it. */
     if (g_sym.lazy_map && g_sym.lazy_next_id < g_sym.lazy_count) {
-        b->status = RAY_READ_INVALID; goto done;
+        b->status = RAY_READ_SYM_LAZY; goto done;
     }
     uint32_t target_count = g_sym.str_count;
     size_t arena_bytes = 0;
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < total; i++) {
         if (plan[i].canonical != i) continue;
         plan[i].id = sym_probe(plan[i].hash, plan[i].text, plan[i].length);
-        if (plan[i].id >= 0) continue;
-        if (target_count == UINT32_MAX || target_count >= max_symbols) {
-            b->status = RAY_READ_LIMIT; goto done;
+        if (plan[i].id >= 0) {
+            uint32_t id = (uint32_t)plan[i].id;
+            plan[i].cache = !(g_sym.scanned[id >> 6] & ((uint64_t)1 << (id & 63)));
+        } else {
+            if (target_count == UINT32_MAX || target_count >= max_symbols) {
+                b->status = RAY_READ_LIMIT; goto done;
+            }
+            plan[i].id = target_count++;
+            plan[i].cache = true;
+            size_t bytes = ray_arena_str_bytes(plan[i].length);
+            if (bytes > SIZE_MAX - arena_bytes) { b->status = RAY_READ_LIMIT; goto done; }
+            arena_bytes += bytes;
         }
-        plan[i].id = target_count++;
-        size_t bytes = ray_arena_str_bytes(plan[i].length);
-        if (bytes > SIZE_MAX - arena_bytes) { b->status = RAY_READ_LIMIT; goto done; }
-        arena_bytes += bytes;
+        if (plan[i].cache &&
+            sym_split_dotted(plan[i].text, plan[i].length, &nsegs, NULL, NULL)) {
+            /* The segments array of the name, as the intern path reserves it. */
+            size_t bytes = ((size_t)32 + (size_t)nsegs * sizeof(int64_t) + 31) & ~(size_t)31;
+            if (bytes > SIZE_MAX - arena_bytes) { b->status = RAY_READ_LIMIT; goto done; }
+            arena_bytes += bytes;
+        }
     }
-    if (target_count > max_symbols) { b->status = RAY_READ_LIMIT; goto done; }
     uint32_t bucket_cap = g_sym.bucket_cap, str_cap = g_sym.str_cap;
     while ((uint64_t)target_count * 100 >= (uint64_t)bucket_cap * 70) {
         if (bucket_cap > UINT32_MAX / 2) { b->status = RAY_READ_LIMIT; goto done; }
@@ -1600,12 +1670,33 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
     }
     /* The head chunk now has room for every new name (checked above), so the
      * allocation below cannot fail. */
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < total; i++) {
         if (plan[i].canonical != i || (uint64_t)plan[i].id < g_sym.str_count) continue;
         void* at = ray_arena_alloc_raw(g_sym.arena, ray_arena_str_bytes(plan[i].length));
         assert(at);
         g_sym.strings[plan[i].id] = ray_arena_str_at(at, plan[i].text, plan[i].length);
         ht_insert(g_sym.buckets, g_sym.bucket_cap, plan[i].hash, (uint32_t)plan[i].id);
+    }
+    /* Every segment is a candidate, so its id is known: settle the dotted data
+     * of each name that has none yet, which is what the intern path does. */
+    for (size_t i = 0; i < total; i++) {
+        if (plan[i].canonical != i || !plan[i].cache) continue;
+        uint32_t id = (uint32_t)plan[i].id;
+        if (sym_split_dotted(plan[i].text, plan[i].length, &nsegs, offs, lens)) {
+            int64_t* segs = (int64_t*)ray_arena_alloc(g_sym.arena,
+                                                      (size_t)nsegs * sizeof(int64_t));
+            assert(segs);
+            for (uint8_t k = 0; k < nsegs; k++) {
+                const char* seg = plan[i].text + offs[k];
+                uint32_t h = (uint32_t)ray_hash_bytes(seg, lens[k]);
+                size_t slot = sym_candidate_slot(plan, seen, slots, h, seg, lens[k]);
+                segs[k] = plan[plan[seen[slot] - 1].canonical].id;
+            }
+            g_sym.segments[id].nsegs = nsegs;
+            g_sym.segments[id].segs  = segs;
+            g_sym.dotted[id >> 6] |= (uint64_t)1 << (id & 63);
+        }
+        g_sym.scanned[id >> 6] |= (uint64_t)1 << (id & 63);
     }
     g_sym.str_count = target_count;
     for (size_t i = 0; i < count; i++) out_ids[i] = plan[plan[i].canonical].id;

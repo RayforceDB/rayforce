@@ -195,6 +195,7 @@ uintptr_t ray_sym_test_table_addr(void);
 size_t    ray_sym_test_table_size(void);
 size_t    ray_sym_test_arena_chunks(void);
 uintptr_t ray_sym_test_inited_addr(void);
+void      ray_sym_test_set_lazy_min_bytes(size_t bytes);
 
 typedef struct ray_read_budget ray_read_budget_t;
 /* Explicit proof: all-or-nothing value symbols, no dotted-segment creation.

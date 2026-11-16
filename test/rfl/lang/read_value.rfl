@@ -211,10 +211,10 @@ marker -- 0
 (read-value) !- arity
 
 ;; Failed reads add no symbols.
-(set before (.sys.info))
+(set before (get (.sys.info) 'sym-count))
 (read-value "(list 'unreadsym1 (list 'unreadsym2 x))") !- parse
 (read-value "(table (as 'SYM (list \"unreadsym3\")) (list [1] [2]))") !- domain
-(nil? (resolve 'unreadsym1)) -- true
+(== (get (.sys.info) 'sym-count) before) -- true
 
 ;; ---- limits ----------------------------------------------------------------
 (read-limits) -- {input:8388608 depth:128 nodes:1000000 grammar:1000000 symbol-bytes:1048576 alloc:67108864}
@@ -238,3 +238,39 @@ marker -- 0
 (repr [1 2 3] 7) -- "[1 2 3]"
 (repr [1 2 3] 0) !- domain
 (repr (fn [x] x)) !- format
+;; ---- review follow-ups ------------------------------------------------------
+;; DATE and TIME atoms keep their 32-bit value sign-extended, so arithmetic on
+;; a negative one agrees with the literal.
+(+ 2024.01.01D00:00:00.000 (read-value "-00:00:01.000")) -- (+ 2024.01.01D00:00:00.000 -00:00:01.000)
+(+ (read-value "1999.12.31") 00:00:01.000) -- (+ 1999.12.31 00:00:01.000)
+(== (read-value "1999.12.31") 1999.12.31) -- true
+(+ (rt 1999.12.31) 00:00:01.000) -- (+ 1999.12.31 00:00:01.000)
+
+;; A dict's keys are all names or all strings.
+(read-value "{\"a\": 1 b: 2}") !- parse
+(read-value "{a: 1 \"b\": 2}") !- parse
+
+;; A raw NUL in the text is refused (the string escape puts a real one in).
+(read-value "1\0002") !- parse
+
+;; Literals the scanner refuses.
+(read-value "1_000") !- parse
+(read-value "08:00") !- parse
+(read-value "1.") !- parse
+
+;; A parser error without a message is reported with a fixed text.
+(read-value "0xZZ") !- parse
+
+;; An empty limits dict overrides nothing.
+(read-value "(list 1 2)" {}) -- (list 1 2)
+
+;; A name read as data resolves the same as one interned the ordinary way.
+(set qq {ww: 42})
+(resolve (read-value "'qq.ww")) -- 42
+
+;; The byte limit of repr holds for numbers and times too.
+(repr 12345 3) !- limit
+(repr 12345 5) -- "12345"
+(repr 2024.01.02 3) !- limit
+(repr 0x1f 2) !- limit
+(repr true 2) !- limit

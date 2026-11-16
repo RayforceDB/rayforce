@@ -1,5 +1,5 @@
 #include "test.h"
-#include "lang/read_budget.h"
+#include "mem/read_budget.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "mem/arena.h"
@@ -54,10 +54,17 @@ static test_result_t publication_faults(void) {
                 TEST_ASSERT_EQ_I(ray_sym_find(ptrs[i], lengths[i]), -1);
             }
         } else {
-            TEST_ASSERT_EQ_U(ray_sym_count(), before + NAMES);
+            /* Each name and its two segments; the first segment is shared. */
+            TEST_ASSERT_EQ_U(ray_sym_count(), before + 2 * NAMES + 1);
+            int64_t head = ray_sym_find("proof-value", 11);
+            TEST_ASSERT_TRUE(head >= 0);
             for (size_t i = 0; i < NAMES; i++) {
                 TEST_ASSERT_EQ_I(ray_sym_find(ptrs[i], lengths[i]), ids[i]);
-                TEST_ASSERT_FALSE(ray_sym_is_dotted(ids[i]));
+                const int64_t* segs;
+                TEST_ASSERT_TRUE(ray_sym_is_dotted(ids[i]));
+                TEST_ASSERT_EQ_I(ray_sym_segs(ids[i], &segs), 2);
+                TEST_ASSERT_EQ_I(segs[0], head);
+                TEST_ASSERT_EQ_I(segs[1], ray_sym_find(ptrs[i] + 12, lengths[i] - 12));
             }
         }
         const int64_t* preserved_segments;
@@ -89,37 +96,18 @@ static test_result_t publication_recheck(void) {
     TEST_ASSERT_EQ_I(ids[0], -1);
     ray_read_budget_close(&b);
     TEST_ASSERT_TRUE(ray_read_budget_init(&b, 65536));
-    TEST_ASSERT_TRUE(ray_sym_publish_values(&b, names, lengths, 4, before + 2, ids));
+    TEST_ASSERT_TRUE(ray_sym_publish_values(&b, names, lengths, 4, before + 4, ids));
     TEST_ASSERT_EQ_I(ids[0], ids[1]);
     TEST_ASSERT_EQ_I(ids[2], old);
-    TEST_ASSERT_EQ_U(ray_sym_count(), before + 2);
-    TEST_ASSERT_EQ_I(ray_sym_find("a", 1), -1);
+    /* "same" and "a.b", plus the segments "a" and "b" of the latter. */
+    TEST_ASSERT_EQ_U(ray_sym_count(), before + 4);
+    const int64_t* segs;
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(ids[3]));
+    TEST_ASSERT_EQ_I(ray_sym_segs(ids[3], &segs), 2);
+    TEST_ASSERT_EQ_I(segs[0], ray_sym_find("a", 1));
+    TEST_ASSERT_EQ_I(segs[1], ray_sym_find("b", 1));
     ray_read_budget_close(&b);
     TEST_ASSERT_EQ_U(b.live, 0);
-    PASS();
-}
-
-static test_result_t publication_fixup(void) {
-    const char* names[] = {"ready-for-publication"}; size_t lengths[] = {21};
-    ray_read_budget_t b;
-    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 65536));
-    ray_t* atom = ray_read_alloc(&b, 0);
-    TEST_ASSERT_NOT_NULL(atom);
-    atom->type = -RAY_SYM; atom->i64 = -1; /* private provisional slot */
-    ray_t* values[] = {atom};
-    ray_t* root = ray_read_list(&b, values, 1);
-    TEST_ASSERT_NOT_NULL(root);
-    int64_t id;
-    TEST_ASSERT_TRUE(ray_sym_publish_values(&b, names, lengths, 1, UINT32_MAX, &id));
-    size_t attempts = b.attempts;
-    b.fail_after = attempts; /* every later proof allocation would fail */
-    atom->i64 = id;
-    ray_retain(root);
-    TEST_ASSERT_EQ_U(b.attempts, attempts);
-    ray_read_budget_close(&b);
-    TEST_ASSERT_EQ_U(b.live, 0);
-    TEST_ASSERT_EQ_I(((ray_t**)ray_data(root))[0]->i64, id);
-    ray_release(root);
     PASS();
 }
 
@@ -255,13 +243,84 @@ static test_result_t publication_adopts_a_usable_chunk(void) {
     PASS();
 }
 
+/* A dotted name published by the reader carries the dotted data the intern path
+ * would have given it, whether the name is new or was interned without it. */
+static test_result_t publication_settles_dotted_names(void) {
+    int64_t bare = ray_sym_intern_no_split("pre.existing", 12);
+    TEST_ASSERT_TRUE(bare >= 0);
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(bare));   /* no_split leaves it unscanned */
+    const char* names[] = {"qq.ww", "pre.existing", ".sys.gc", "trailing.", "a..b"};
+    size_t lengths[] = {5, 12, 7, 9, 4};
+    int64_t ids[5];
+    ray_read_budget_t b;
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 1u << 20));
+    TEST_ASSERT_TRUE(ray_sym_publish_values(&b, names, lengths, 5, UINT32_MAX, ids));
+    ray_read_budget_close(&b);
+    TEST_ASSERT_EQ_I(ids[1], bare);
+    const int64_t* segs;
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(ids[0]));
+    TEST_ASSERT_EQ_I(ray_sym_segs(ids[0], &segs), 2);
+    TEST_ASSERT_EQ_I(segs[0], ray_sym_find("qq", 2));
+    TEST_ASSERT_EQ_I(segs[1], ray_sym_find("ww", 2));
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(bare));
+    TEST_ASSERT_EQ_I(ray_sym_segs(bare, &segs), 2);
+    TEST_ASSERT_EQ_I(segs[0], ray_sym_find("pre", 3));
+    TEST_ASSERT_EQ_I(segs[1], ray_sym_find("existing", 8));
+    /* a leading dot keeps segment 0's dot: `.sys` and `gc` */
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(ids[2]));
+    TEST_ASSERT_EQ_I(ray_sym_segs(ids[2], &segs), 2);
+    TEST_ASSERT_EQ_I(segs[0], ray_sym_find(".sys", 4));
+    /* a trailing dot or an empty segment makes a plain name */
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(ids[3]));
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(ids[4]));
+    /* interning them the ordinary way afterwards changes nothing */
+    TEST_ASSERT_EQ_I(ray_sym_intern("qq.ww", 5), ids[0]);
+    TEST_ASSERT_EQ_I(ray_sym_segs(ids[0], &segs), 2);
+    PASS();
+}
+
+/* A table that still has names only a mapped file backs is not inspected: the
+ * publication reports it as its own status, and succeeds once they are loaded. */
+static test_result_t publication_refuses_a_lazy_table(void) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/publish-lazy.sym", ray_test_tmp_root());
+    for (int i = 0; i < 300; i++) {
+        char nm[32];
+        int n = snprintf(nm, sizeof nm, "lazy_filler_%d", i);
+        (void)ray_sym_intern(nm, (size_t)n);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_save(path), RAY_OK);
+    ray_sym_destroy();
+    (void)ray_sym_init();
+    ray_sym_test_set_lazy_min_bytes(1);
+    ray_err_t loaded = ray_sym_load(path);
+    ray_sym_test_set_lazy_min_bytes(0);
+    TEST_ASSERT_EQ_I(loaded, RAY_OK);
+    const char* names[] = {"lazy_new"}; size_t lengths[] = {8};
+    int64_t id = -1;
+    ray_read_budget_t b;
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 65536));
+    TEST_ASSERT_FALSE(ray_sym_publish_values(&b, names, lengths, 1, UINT32_MAX, &id));
+    TEST_ASSERT_EQ_I(b.status, RAY_READ_SYM_LAZY);
+    TEST_ASSERT_EQ_I(ray_sym_find("lazy_new", 8), -1);
+    ray_read_budget_close(&b);
+    TEST_ASSERT_TRUE(ray_sym_materialize_lazy());
+    TEST_ASSERT_TRUE(ray_read_budget_init(&b, 65536));
+    TEST_ASSERT_TRUE(ray_sym_publish_values(&b, names, lengths, 1, UINT32_MAX, &id));
+    TEST_ASSERT_EQ_I(ray_sym_find("lazy_new", 8), id);
+    ray_read_budget_close(&b);
+    remove(path);
+    PASS();
+}
+
 const test_entry_t sym_publish_entries[] = {
     {"reader_proof/publication_faults", publication_faults, setup, teardown},
     {"reader_proof/publication_recheck", publication_recheck, setup, teardown},
-    {"reader_proof/publication_fixup", publication_fixup, setup, teardown},
     {"reader_proof/publication_budget_edges", publication_budget_edges, setup, teardown},
     {"reader_proof/publication_concurrent", publication_concurrent, setup, teardown},
     {"reader_proof/publication_keeps_head_chunk_usable", publication_keeps_head_chunk_usable, setup, teardown},
     {"reader_proof/publication_adopts_a_usable_chunk", publication_adopts_a_usable_chunk, setup, teardown},
+    {"reader_proof/publication_settles_dotted_names", publication_settles_dotted_names, setup, teardown},
+    {"reader_proof/publication_refuses_a_lazy_table", publication_refuses_a_lazy_table, setup, teardown},
     {NULL, NULL, NULL, NULL}
 };

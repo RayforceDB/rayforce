@@ -438,7 +438,8 @@ ray_t* ray_read_value_fn(ray_t** args, int64_t n) {
         if (!d || d->type != RAY_DICT) return ray_error("type", "read-value: limits must be a dict, got %s", d ? ray_type_name(d->type) : "null");
         ray_t* keys = ray_dict_keys(d);
         ray_t* vals = ray_dict_vals(d);
-        if (keys->type != RAY_SYM) return ray_error("type", "read-value: limit names must be symbols");
+        /* The language's {} has LIST keys: an empty dict overrides nothing. */
+        if (keys->len > 0 && keys->type != RAY_SYM) return ray_error("type", "read-value: limit names must be symbols");
         for (int64_t i = 0; i < keys->len; i++) {
             ray_t* kn = ray_sym_vec_cell(keys, i);
             size_t found = READ_LIMIT_COUNT;

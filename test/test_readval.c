@@ -483,7 +483,10 @@ static test_result_t reads_after_a_persisted_sym_load(void) {
     TEST_ASSERT_EQ_I(ray_sym_save(path), RAY_OK);
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_I(ray_sym_load(path), RAY_OK);
+    ray_sym_test_set_lazy_min_bytes(1);   /* map this small file lazily, as a big one is */
+    ray_err_t loaded = ray_sym_load(path);
+    ray_sym_test_set_lazy_min_bytes(0);
+    TEST_ASSERT_EQ_I(loaded, RAY_OK);
     const char* t = "(list 'persisted_a 'persisted_b)";
     uint32_t before = ray_sym_count();
     ray_t* r = ray_read_value(t, strlen(t), NULL);
@@ -525,14 +528,15 @@ static size_t node_cost(const char* text) {
     return want;
 }
 
-static bool reads_within(const char* text, size_t cap) {
+typedef enum { READ_OK, READ_LIMIT, READ_OTHER } read_outcome_t;
+
+static read_outcome_t reads_within(const char* text, size_t cap) {
     ray_read_limits_t l = ray_read_limits_default();
     l.max_nodes = cap;
     ray_t* r = ray_read_value(text, strlen(text), &l);
-    bool ok = !RAY_IS_ERR(r);
-    if (!ok && !is_err(r, "limit")) { drop(r); return true; }   /* a wrong error kind fails the caller's assert */
+    read_outcome_t o = !RAY_IS_ERR(r) ? READ_OK : is_err(r, "limit") ? READ_LIMIT : READ_OTHER;
     drop(r);
-    return ok;
+    return o;
 }
 
 static test_result_t node_count_contract(void) {
@@ -560,9 +564,9 @@ static test_result_t node_count_contract(void) {
         snprintf(msg, sizeof msg, "node cost of %.100s", t);
         TEST_ASSERT(node_cost(t) == want, msg);   /* the table is the rule applied to the value */
         snprintf(msg, sizeof msg, "reads at exactly its cost: %.100s", t);
-        TEST_ASSERT(reads_within(t, want), msg);
+        TEST_ASSERT(reads_within(t, want) == READ_OK, msg);
         snprintf(msg, sizeof msg, "refused one node below its cost: %.100s", t);
-        TEST_ASSERT(!reads_within(t, want - 1), msg);
+        TEST_ASSERT(reads_within(t, want - 1) == READ_LIMIT, msg);
     }
     PASS();
 }
