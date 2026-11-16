@@ -5811,7 +5811,8 @@ static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
             pq_md5_token(&md, seen == 0, isnull, v);
             /* The row-window rings record every row, a null row as "N": the
              * anchor block selects them when its recorded list carries a null
-             * token (section 6.2's reader-visible anchor exception). */
+             * token. The anchor blocks are reader-visible by design, carrying
+             * recorded first/last values rather than internal metadata. */
             if (nrawf < 8) snprintf(raw_first[nrawf++], 32, "%.31s", tok);
             snprintf(raw_last[seen & 3], 32, "%.31s", tok);
             if (isnull) { nulls++; continue; }
