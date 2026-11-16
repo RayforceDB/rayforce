@@ -506,55 +506,87 @@ static bool hashset_insert(hashset_t* hs, int64_t i) {
     return true;
 }
 
-/* Exact batched find for verified-sorted, null-free I64 vectors only.
- * Metadata admission never scans either payload. ray_data makes slice
- * accesses and answers relative to the searched window. Decline writes nothing. */
-static __attribute__((noinline)) bool find_sorted_i64(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
-    if (hay->type != RAY_I64 || nd->type != RAY_I64 || hay->len < 2 ||
+#ifdef DEBUG
+static _Thread_local uint64_t find_sorted_runs;
+/* Completed synchronous typed sorted kernels, not index/hash lookups. */
+uint64_t ray_find_test_sorted_runs(bool reset) {
+    uint64_t n = find_sorted_runs;
+    if (reset) find_sorted_runs = 0;
+    return n;
+}
+#define FIND_SORTED_NOTE_RUN() (++find_sorted_runs)
+#else
+#define FIND_SORTED_NOTE_RUN() ((void)0)
+#endif
+
+#define DEFINE_SORTED_FIND(NAME, CELL) \
+static __attribute__((noinline)) bool NAME(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) { \
+    const CELL* h = (const CELL*)ray_data(hay); \
+    const CELL* q = (const CELL*)ray_data(nd); \
+    int64_t n = hay->len, m = nd->len, j = 0; \
+    /* Eight independent [lo,hi) searches, with no padded probe reads. */ \
+    for (; m - j >= 8; j += 8) { \
+        int64_t lo[8], hi[8]; \
+        CELL key[8]; \
+        for (int lane = 0; lane < 8; lane++) { \
+            lo[lane] = 0; \
+            hi[lane] = n; \
+            key[lane] = q[j + lane]; \
+        } \
+        bool work; \
+        do { \
+            work = false; \
+            for (int lane = 0; lane < 8; lane++) { \
+                if (lo[lane] < hi[lane]) { \
+                    work = true; \
+                    int64_t mid = lo[lane] + (hi[lane] - lo[lane]) / 2; \
+                    if (h[mid] < key[lane]) lo[lane] = mid + 1; \
+                    else hi[lane] = mid; \
+                } \
+            } \
+        } while (work); \
+        for (int lane = 0; lane < 8; lane++) { \
+            int64_t pos = lo[lane]; \
+            if (pos < n && h[pos] == key[lane]) out[j + lane] = pos; \
+            else { out[j + lane] = NULL_I64; *any_null = true; } \
+        } \
+    } \
+    /* Scalar tail uses the same typed lower_bound and exact equality. */ \
+    for (; j < m; j++) { \
+        int64_t lo = 0, hi = n; \
+        while (lo < hi) { \
+            int64_t mid = lo + (hi - lo) / 2; \
+            if (h[mid] < q[j]) lo = mid + 1; \
+            else hi = mid; \
+        } \
+        if (lo < n && h[lo] == q[j]) out[j] = lo; \
+        else { out[j] = NULL_I64; *any_null = true; } \
+    } \
+    FIND_SORTED_NOTE_RUN(); \
+    return true; \
+}
+
+DEFINE_SORTED_FIND(find_sorted_u8, uint8_t)
+DEFINE_SORTED_FIND(find_sorted_i16, int16_t)
+DEFINE_SORTED_FIND(find_sorted_i32, int32_t)
+DEFINE_SORTED_FIND(find_sorted_i64, int64_t)
+#undef DEFINE_SORTED_FIND
+#undef FIND_SORTED_NOTE_RUN
+
+/* Same-type integer payloads only. Verify metadata once, outside the typed
+ * lower-bound loops; declines leave output untouched. ray_data keeps views
+ * and returned positions relative to the searched window. */
+static bool find_sorted_integer(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    if (hay->type != nd->type || hay->len < 2 ||
         !ray_attr_is_sorted(hay) || ray_vec_may_have_nulls(hay) ||
         ray_vec_may_have_nulls(nd)) return false;
-
-    const int64_t* h = (const int64_t*)ray_data(hay);
-    const int64_t* q = (const int64_t*)ray_data(nd);
-    int64_t n = hay->len, m = nd->len, j = 0;
-    /* Eight independent [lo,hi) searches, with no padded probe reads. */
-    for (; m - j >= 8; j += 8) {
-        int64_t lo[8], hi[8], key[8];
-        for (int lane = 0; lane < 8; lane++) {
-            lo[lane] = 0;
-            hi[lane] = n;
-            key[lane] = q[j + lane];
-        }
-        bool work;
-        do {
-            work = false;
-            for (int lane = 0; lane < 8; lane++) {
-                if (lo[lane] < hi[lane]) {
-                    work = true;
-                    int64_t mid = lo[lane] + (hi[lane] - lo[lane]) / 2;
-                    if (h[mid] < key[lane]) lo[lane] = mid + 1;
-                    else hi[lane] = mid;
-                }
-            }
-        } while (work);
-        for (int lane = 0; lane < 8; lane++) {
-            int64_t pos = lo[lane];
-            if (pos < n && h[pos] == key[lane]) out[j + lane] = pos;
-            else { out[j + lane] = NULL_I64; *any_null = true; }
-        }
+    switch (hay->type) {
+        case RAY_U8:  return find_sorted_u8(hay, nd, out, any_null);
+        case RAY_I16: return find_sorted_i16(hay, nd, out, any_null);
+        case RAY_I32: return find_sorted_i32(hay, nd, out, any_null);
+        case RAY_I64: return find_sorted_i64(hay, nd, out, any_null);
+        default:      return false;
     }
-    /* Scalar tail uses the same signed lower_bound and exact equality. */
-    for (; j < m; j++) {
-        int64_t lo = 0, hi = n;
-        while (lo < hi) {
-            int64_t mid = lo + (hi - lo) / 2;
-            if (h[mid] < q[j]) lo = mid + 1;
-            else hi = mid;
-        }
-        if (lo < n && h[lo] == q[j]) out[j] = lo;
-        else { out[j] = NULL_I64; *any_null = true; }
-    }
-    return true;
 }
 
 /* Vector-needle find with the NEEDLES hashed and the haystack scanned once:
@@ -3772,7 +3804,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
          *   1. an attached hash index on the haystack: one probe per needle,
          *      nothing built per call;
          *   2. guid cells: find_guid's typed table, their only route;
-         *   3. sparse sorted, null-free I64: exact batched lower_bound;
+         *   3. sparse sorted, same-type null-free integers: exact lower_bound;
          *   4. fewer needles than rows: hash the needles, scan the haystack
          *      once (find_hash_needles);
          *   5. hash the haystack, probe the needles (mirrors ray_in_fn). */
@@ -3794,7 +3826,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             /* Keep tiny and dense probes on the existing hash/scan routes.
              * This sparse admission avoids their sampled crossover region. */
             if (!done && vec->len >= 4096 && vlen <= vec->len / 8)
-                done = find_sorted_i64(vec, val, out, &any_null);
+                done = find_sorted_integer(vec, val, out, &any_null);
             if (!done && find_needle_side_ok(vec, val))
                 done = find_hash_needles(vec, val, out, &any_null);
             if (!done) {

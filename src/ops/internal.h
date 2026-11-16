@@ -1477,6 +1477,8 @@ uint64_t ray_exec_test_refine_in(void);
  * segments (vectors) they dropped, since process start. */
 void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
 #ifdef DEBUG
+/* Completed synchronous sorted-find kernels; no release instrumentation. */
+uint64_t ray_find_test_sorted_runs(bool reset);
 /* Successful query-level narrowed-source constructions, not physical reads. */
 uint64_t ray_query_test_parted_pruned_sources(bool reset);
 #endif

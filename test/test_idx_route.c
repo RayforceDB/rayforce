@@ -2897,6 +2897,294 @@ static test_result_t test_find_sorted_i64_extremes(void) {
 }
 
 
+/* Test-only typed access. Avoid interpreting narrow payloads as I64. */
+static void sorted_find_test_store(void* data, int8_t type, int64_t i, int64_t value) {
+    switch (type) {
+        case RAY_U8:  ((uint8_t*)data)[i] = (uint8_t)value; break;
+        case RAY_I16: ((int16_t*)data)[i] = (int16_t)value; break;
+        case RAY_I32: ((int32_t*)data)[i] = (int32_t)value; break;
+        default:      ((int64_t*)data)[i] = value; break;
+    }
+}
+
+static int64_t sorted_find_test_load(const void* data, int8_t type, int64_t i) {
+    switch (type) {
+        case RAY_U8:  return ((const uint8_t*)data)[i];
+        case RAY_I16: return ((const int16_t*)data)[i];
+        case RAY_I32: return ((const int32_t*)data)[i];
+        default:      return ((const int64_t*)data)[i];
+    }
+}
+
+/* These two fixtures own all live values in function-scope slots so a
+ * failed assertion can dispose them before tearing down symbols/the heap. */
+static void sorted_find_test_dispose(ray_t** owner) {
+    if (*owner) {
+        if (RAY_IS_ERR(*owner)) ray_error_free(*owner);
+        else ray_release(*owner);
+        *owner = NULL;
+    }
+}
+
+#define SORTED_FIND_CHECK(cond, msg) do {                              \
+    if (!(cond)) {                                                     \
+        snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,           \
+                 "%s:%d: %s: %s", __FILE__, __LINE__, #cond, (msg));      \
+        outcome = (test_result_t){ TEST_FAIL, ray_test_fail_buf };      \
+        goto cleanup;                                                 \
+    }                                                                 \
+} while (0)
+
+#define SORTED_FIND_CHECK_EQ_I(a, b) do {                              \
+    long long _a = (long long)(a), _b = (long long)(b);                  \
+    if (_a != _b) {                                                   \
+        snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,           \
+                 "%s:%d: %s != %s  (got %lld, expected %lld)",           \
+                 __FILE__, __LINE__, #a, #b, _a, _b);                   \
+        outcome = (test_result_t){ TEST_FAIL, ray_test_fail_buf };      \
+        goto cleanup;                                                 \
+    }                                                                 \
+} while (0)
+
+/* Independent linear first-match oracle across widths, both-sided views,
+ * duplicate boundaries and batched/scalar-tail/dense/tiny fallback sizes.
+ * Answers alone are not proof of the selected execution route. */
+static test_result_t test_find_sorted_integer_widths(void) {
+    test_result_t outcome = { TEST_PASS, NULL };
+    ray_t *hp = NULL, *qp = NULL, *h = NULL, *tag = NULL;
+    ray_t *marked = NULL, *q = NULL, *result = NULL;
+    ray_heap_init();
+    (void)ray_sym_init();
+    const int8_t types[] = { RAY_U8, RAY_I16, RAY_I32, RAY_I64 };
+    const int64_t sizes[] = { 4095, 4096, 4097 };
+    const int64_t batches[] = { 0, 1, 7, 8, 9, 17, 512, 513 };
+    union { int64_t aligned[4120]; uint8_t raw[4120 * 8]; } payload;
+    union { int64_t aligned[520]; uint8_t raw[520 * 8]; } needles;
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int8_t type = types[t];
+        for (int64_t i = 0; i < 4120; i++) {
+            int64_t value = type == RAY_U8 ? (i * 64 / 4120) * 4 : (i / 3) * 2 - 1500;
+            sorted_find_test_store(payload.raw, type, i, value);
+        }
+        if (type != RAY_U8) {
+            int64_t lo = type == RAY_I16 ? INT16_MIN + 1 :
+                         type == RAY_I32 ? INT32_MIN + 1LL : INT64_MIN + 1;
+            int64_t hi = type == RAY_I16 ? INT16_MAX : type == RAY_I32 ? INT32_MAX : INT64_MAX;
+            sorted_find_test_store(payload.raw, type, 0, lo);
+            sorted_find_test_store(payload.raw, type, 4119, hi);
+        }
+        for (int64_t i = 0; i < 520; i++) {
+            /* Include duplicate probes, unsigned high bits, hits and misses. */
+            int64_t value = type == RAY_U8 ? (i % 9 == 0 ? 255 : (i * 37) % 256) :
+                            (i % 7 == 0 ? -1 : ((i * 97) % 1500) * 2 - 1500);
+            sorted_find_test_store(needles.raw, type, i, value);
+        }
+        hp = ray_vec_from_raw(type, payload.raw, 4120);
+        qp = ray_vec_from_raw(type, needles.raw, 520);
+        SORTED_FIND_CHECK(hp && !RAY_IS_ERR(hp), "width haystack parent");
+        SORTED_FIND_CHECK(qp && !RAY_IS_ERR(qp), "width needle parent");
+        for (size_t ns = 0; ns < sizeof(sizes) / sizeof(sizes[0]); ns++) {
+            h = ray_vec_slice(hp, 13, sizes[ns]);
+            SORTED_FIND_CHECK(h && !RAY_IS_ERR(h), "width haystack slice");
+            tag = ray_sym(ray_sym_intern("sorted", 6));
+            SORTED_FIND_CHECK(tag && !RAY_IS_ERR(tag), "sorted tag");
+            marked = ray_attr_set_fn(tag, h);
+            sorted_find_test_dispose(&tag); sorted_find_test_dispose(&h);
+            h = marked; marked = NULL;
+            SORTED_FIND_CHECK(h && !RAY_IS_ERR(h), "mark width haystack");
+            for (size_t nb = 0; nb < sizeof(batches) / sizeof(batches[0]); nb++) {
+                int64_t m = batches[nb];
+                q = ray_vec_slice(qp, 5, m);
+                SORTED_FIND_CHECK(q && !RAY_IS_ERR(q), "width needle slice");
+                uint8_t ha = h->attrs, qa = q->attrs;
+                int64_t hr = h->rc, qr = q->rc, hpr = hp->rc, qpr = qp->rc;
+#ifdef DEBUG
+                uint64_t route_before = ray_find_test_sorted_runs(false);
+#endif
+                result = ray_find_fn(h, q);
+#ifdef DEBUG
+                SORTED_FIND_CHECK_EQ_I(ray_find_test_sorted_runs(false) - route_before,
+                                 h->len >= 4096 && q->len <= h->len / 8 ? 1 : 0);
+#endif
+                SORTED_FIND_CHECK(result && !RAY_IS_ERR(result), "width vector find");
+                SORTED_FIND_CHECK_EQ_I(result->type, RAY_I64);
+                SORTED_FIND_CHECK_EQ_I(result->len, m);
+                bool any_null = false;
+                for (int64_t j = 0; j < m; j++) {
+                    int64_t expected = NULL_I64;
+                    int64_t key = sorted_find_test_load(needles.raw, type, 5 + j);
+                    for (int64_t i = 0; i < sizes[ns]; i++) {
+                        if (sorted_find_test_load(payload.raw, type, 13 + i) == key) {
+                            expected = i; break;
+                        }
+                    }
+                    SORTED_FIND_CHECK_EQ_I(((const int64_t*)ray_data(result))[j], expected);
+                    any_null |= expected == NULL_I64;
+                }
+                SORTED_FIND_CHECK_EQ_I(!!(result->attrs & RAY_ATTR_HAS_NULLS), any_null);
+                SORTED_FIND_CHECK_EQ_I(h->attrs, ha); SORTED_FIND_CHECK_EQ_I(q->attrs, qa);
+                SORTED_FIND_CHECK_EQ_I(h->rc, hr); SORTED_FIND_CHECK_EQ_I(q->rc, qr);
+                SORTED_FIND_CHECK_EQ_I(hp->rc, hpr); SORTED_FIND_CHECK_EQ_I(qp->rc, qpr);
+                sorted_find_test_dispose(&result); sorted_find_test_dispose(&q);
+            }
+            sorted_find_test_dispose(&h);
+        }
+        SORTED_FIND_CHECK(memcmp(ray_data(hp), payload.raw, (size_t)(4120 * ray_type_sizes[(uint8_t)type])) == 0,
+                    "width haystack unchanged");
+        SORTED_FIND_CHECK(memcmp(ray_data(qp), needles.raw, (size_t)(520 * ray_type_sizes[(uint8_t)type])) == 0,
+                    "width needles unchanged");
+        sorted_find_test_dispose(&hp); sorted_find_test_dispose(&qp);
+    }
+cleanup:
+    sorted_find_test_dispose(&result); sorted_find_test_dispose(&q);
+    sorted_find_test_dispose(&marked); sorted_find_test_dispose(&tag);
+    sorted_find_test_dispose(&h);
+    sorted_find_test_dispose(&qp); sorted_find_test_dispose(&hp);
+    ray_sym_destroy(); ray_heap_destroy();
+    return outcome;
+}
+
+/* Borrow inputs; release every returned value, including owned errors. */
+static bool sorted_find_test_oracle(ray_t* h, ray_t* q, bool sorted_route, bool indexed) {
+    if (!h || !q || RAY_IS_ERR(h) || RAY_IS_ERR(q)) return false;
+    uint64_t c0 = ray_idx_consults[IDX_SITE_FIND], i0 = ray_idx_hits[IDX_SITE_FIND];
+#ifdef DEBUG
+    uint64_t s0 = ray_find_test_sorted_runs(false);
+#else
+    (void)sorted_route;
+#endif
+    uint64_t ha = h->attrs, qa = q->attrs;
+    int64_t hr = h->rc, qr = q->rc;
+    ray_t* r = ray_find_fn(h, q);
+    bool ok = r && !RAY_IS_ERR(r);
+    if (ok) ok = r->type == RAY_I64 && r->len == q->len;
+    bool missed = false;
+    if (ok) {
+        for (int64_t j = 0; j < q->len; j++) {
+            int64_t wanted = sorted_find_test_load(ray_data(q), q->type, j);
+            int64_t at = NULL_I64;
+            for (int64_t i = 0; i < h->len; i++) {
+                if (sorted_find_test_load(ray_data(h), h->type, i) == wanted) { at = i; break; }
+            }
+            if (((int64_t*)ray_data(r))[j] != at) ok = false;
+            if (at == NULL_I64) missed = true;
+        }
+        if (!!(r->attrs & RAY_ATTR_HAS_NULLS) != missed) ok = false;
+    }
+#ifdef DEBUG
+    if (ray_find_test_sorted_runs(false) - s0 != (uint64_t)sorted_route) ok = false;
+#endif
+    if (indexed && (ray_idx_consults[IDX_SITE_FIND] - c0 != 1 ||
+                    ray_idx_hits[IDX_SITE_FIND] - i0 != 1)) ok = false;
+    if (!indexed && (ray_idx_consults[IDX_SITE_FIND] != c0 || ray_idx_hits[IDX_SITE_FIND] != i0)) ok = false;
+    if (ha != h->attrs || qa != q->attrs || hr != h->rc || qr != q->rc) ok = false;
+    if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+    return ok;
+}
+
+static test_result_t test_find_sorted_integer_contracts(void) {
+    test_result_t outcome = { TEST_PASS, NULL };
+    ray_t *h = NULL, *q = NULL, *ix = NULL;
+    ray_t *parent = NULL, *view = NULL, *nested = NULL;
+    ray_heap_init(); (void)ray_sym_init();
+    const int8_t types[] = { RAY_U8, RAY_I16, RAY_I32, RAY_I64 };
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int8_t type = types[t];
+        int64_t raw[4100] = {0}, needles[8] = {0};
+        int64_t low = type == RAY_I16 ? INT16_MIN + 1 :
+                      type == RAY_I32 ? (int64_t)INT32_MIN + 1 : INT64_MIN + 1;
+        int64_t high = type == RAY_I16 ? INT16_MAX : type == RAY_I32 ? INT32_MAX : INT64_MAX;
+        for (int i = 0; i < 4096; i++)
+            sorted_find_test_store(raw, type, i, type == RAY_U8 ? i / 16 : i - 2048);
+        if (type != RAY_U8) {
+            sorted_find_test_store(raw, type, 0, low);
+            sorted_find_test_store(raw, type, 4095, high);
+        }
+        const int64_t keys[] = { type == RAY_U8 ? 0 : low,
+                                type == RAY_U8 ? 127 : low + 1,
+                                type == RAY_U8 ? 128 : -1,
+                                type == RAY_U8 ? 254 : 0,
+                                type == RAY_U8 ? 255 : high - 1,
+                                type == RAY_U8 ? 129 : high };
+        for (int j = 0; j < 6; j++) sorted_find_test_store(needles, type, j, keys[j]);
+        h = ray_vec_from_raw(type, raw, 4096);
+        q = ray_vec_from_raw(type, needles, 6);
+        SORTED_FIND_CHECK(h && q && !RAY_IS_ERR(h) && !RAY_IS_ERR(q), "integer contract setup");
+        /* The constructed payload is sorted; do not clear a NULL hint. */
+        h->attrs |= RAY_ATTR_SORTED;
+        bool ordered = sorted_find_test_oracle(h, q, true, false);
+        h->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+        bool unmarked = sorted_find_test_oracle(h, q, false, false);
+        h->attrs |= RAY_ATTR_SORTED;
+        /* Attached HASH must retain priority even though sorted admission fits. */
+        ix = ray_idx_hash_fn(h);
+        bool indexed = ix && !RAY_IS_ERR(ix) && sorted_find_test_oracle(ix, q, false, true);
+        sorted_find_test_dispose(&ix);
+        sorted_find_test_dispose(&h); sorted_find_test_dispose(&q);
+        SORTED_FIND_CHECK(ordered && unmarked && indexed, "typed extrema, U8 high bits and index priority");
+
+        if (type != RAY_U8) {
+            int64_t null = type == RAY_I16 ? NULL_I16 : type == RAY_I32 ? NULL_I32 : NULL_I64;
+            sorted_find_test_store(raw, type, 0, null);
+            h = ray_vec_from_raw(type, raw, 4096);
+            q = ray_vec_from_raw(type, needles, 6);
+            SORTED_FIND_CHECK(h && q && !RAY_IS_ERR(h) && !RAY_IS_ERR(q), "nullable setup");
+            h->attrs |= RAY_ATTR_SORTED;
+            bool nullable_h = sorted_find_test_oracle(h, q, false, false);
+            sorted_find_test_dispose(&h); sorted_find_test_dispose(&q);
+            /* Nullable needle alone also declines. */
+            sorted_find_test_store(raw, type, 0, low);
+            sorted_find_test_store(needles, type, 0, null);
+            h = ray_vec_from_raw(type, raw, 4096); q = ray_vec_from_raw(type, needles, 6);
+            SORTED_FIND_CHECK(h && q && !RAY_IS_ERR(h) && !RAY_IS_ERR(q), "nullable needle setup");
+            h->attrs |= RAY_ATTR_SORTED;
+            bool nullable_q = sorted_find_test_oracle(h, q, false, false);
+            sorted_find_test_dispose(&h); sorted_find_test_dispose(&q);
+            /* Search a genuinely ordered nested view excluding its parent's NULL.
+             * Conservative parent hint must still keep it off the sorted route. */
+            for (int i = 0; i < 4100; i++) sorted_find_test_store(raw, type, i, i);
+            sorted_find_test_store(raw, type, 0, null);
+            for (int j = 0; j < 6; j++) sorted_find_test_store(needles, type, j, j * 700);
+            parent = ray_vec_from_raw(type, raw, 4100);
+            SORTED_FIND_CHECK(parent && !RAY_IS_ERR(parent), "nested view setup");
+            view = ray_vec_slice(parent, 1, 4098);
+            SORTED_FIND_CHECK(view && !RAY_IS_ERR(view), "nested view setup");
+            nested = ray_vec_slice(view, 1, 4096);
+            SORTED_FIND_CHECK(nested && !RAY_IS_ERR(nested), "nested view setup");
+            q = ray_vec_from_raw(type, needles, 6);
+            SORTED_FIND_CHECK(parent && view && nested && q && !RAY_IS_ERR(parent) &&
+                        !RAY_IS_ERR(view) && !RAY_IS_ERR(nested) && !RAY_IS_ERR(q), "nested view setup");
+            nested->attrs |= RAY_ATTR_SORTED;
+            bool parent_hint = sorted_find_test_oracle(nested, q, false, false);
+            bool unchanged = memcmp(ray_data(parent), raw, (size_t)4100 * ray_type_sizes[(uint8_t)type]) == 0;
+            sorted_find_test_dispose(&q); sorted_find_test_dispose(&nested);
+            sorted_find_test_dispose(&view); sorted_find_test_dispose(&parent);
+            SORTED_FIND_CHECK(nullable_h && nullable_q && parent_hint && unchanged, "NULL and nested-parent fallback contracts");
+        }
+    }
+    /* Mixed width remains existing coercing fallback, never a typed kernel. */
+    int32_t hd[4096]; for (int i = 0; i < 4096; i++) hd[i] = i / 2;
+    int64_t qd[] = { 0, 2047, 2048, -1 };
+    h = ray_vec_from_raw(RAY_I32, hd, 4096);
+    q = ray_vec_from_raw(RAY_I64, qd, 4);
+    SORTED_FIND_CHECK(h && q && !RAY_IS_ERR(h) && !RAY_IS_ERR(q), "mixed setup");
+    h->attrs |= RAY_ATTR_SORTED;
+    bool mixed = sorted_find_test_oracle(h, q, false, false);
+    sorted_find_test_dispose(&h); sorted_find_test_dispose(&q);
+    SORTED_FIND_CHECK(mixed, "mixed-width find preserves fallback");
+cleanup:
+    /* ix and h are distinct owning refs even when pointer-equal. */
+    sorted_find_test_dispose(&ix);
+    sorted_find_test_dispose(&q); sorted_find_test_dispose(&h);
+    sorted_find_test_dispose(&nested); sorted_find_test_dispose(&view);
+    sorted_find_test_dispose(&parent);
+    ray_sym_destroy(); ray_heap_destroy();
+    return outcome;
+}
+
+#undef SORTED_FIND_CHECK_EQ_I
+#undef SORTED_FIND_CHECK
+
 /* ─── GUID hash index: the routes that consult it ───────────────────── */
 
 /* A GUID index answers find (an atom, a vector of needles), in, distinct
@@ -3005,6 +3293,8 @@ static test_result_t test_guid_index_routes(void) {
 
 const test_entry_t idx_route_entries[] = {
     { "idx_route/guid_index_routes",         test_guid_index_routes,         NULL, NULL },
+    { "idx_route/find_sorted_integer_widths", test_find_sorted_integer_widths, NULL, NULL },
+    { "idx_route/find_sorted_integer_contracts", test_find_sorted_integer_contracts, NULL, NULL },
     { "idx_route/find_sorted_i64_views", test_find_sorted_i64_views, NULL, NULL },
     { "idx_route/find_sorted_i64_extremes", test_find_sorted_i64_extremes, NULL, NULL },
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
