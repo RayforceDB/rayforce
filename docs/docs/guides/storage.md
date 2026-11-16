@@ -162,14 +162,14 @@ db/
 The loader:
 
 1. Loads the shared `.sym` file from `db_root`
-2. Discovers date directories (sorted numerically)
+2. Discovers partition directories (sorted numerically): `YYYY.MM.DD` for a `date` key, `YYYY.MM.DD.HH.MM.SS` for a `timestamp` key, digit-only names for an `int64` key
 3. Loads each partition as a splayed table
 4. Adds a virtual `Date` column from the directory name
 5. Concatenates all partitions into a single table
 
 This is the recommended layout for time-series data that grows continuously. New partitions can be added without rewriting existing data.
 
-For datasets larger than available RAM, Rayforce can process partitioned tables one segment at a time using **block offloading** — streaming through partitions without loading them all at once. The optimizer's partition pruning pass can skip entire partitions that don't match filter predicates. See [Block Offloading](../architecture/offloading.md) for details.
+For datasets larger than available RAM, Rayforce can process partitioned tables one segment at a time using **block offloading** — streaming through partitions without loading them all at once. The optimizer's partition pruning pass can skip entire partitions that don't match filter predicates, on the key and, from the partitions' statistics, on a data column (see [`.db.parted.get`](../namespaces/db.md#db-parted-get)). See [Block Offloading](../architecture/offloading.md) for details.
 
 ## 6. Memory-Mapped I/O { #mmap }
 
