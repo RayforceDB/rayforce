@@ -487,7 +487,6 @@ typedef struct {
     size_t rebuild_cap, rebuild_len;
     uint8_t* sym_arena;
     size_t sym_arena_cap, sym_arena_len;
-    int64_t str_seen;    /* values decoded from the page's streams */
     int str_delta;       /* 0, or the page's DELTA byte-array code (6, 7) */
 } pq_column;
 /* End-of-page check for a hybrid (bit-packed / RLE) stream. The strict rule
@@ -630,7 +629,7 @@ static const char* pq_str_delta_page(pq_column* c, const pq_schema* s, int enc, 
         if (!err) err = pq_delta_init(&c->dlen,s,&suffix);
     } else err = pq_delta_init(&c->dlen,s,&start);
     if (err) return err;
-    c->str_delta = enc; c->str_seen = 0; c->rebuild_len = 0;
+    c->str_delta = enc; c->rebuild_len = 0;
     return NULL;
 }
 /* One present value from the page's streams: a DLBA length plus payload
@@ -646,7 +645,7 @@ static const char* pq_str_delta_next(pq_column* c, const pq_schema* s, const uin
         uint64_t n = (uint64_t)x;
         if (n > (uint64_t)(c->payload.end - c->payload.p)) return "delta length exceeds the page";
         *p = c->payload.p; *len = (uint32_t)n;
-        c->payload.p += n; c->str_seen++;
+        c->payload.p += n;
         return NULL;
     }
     /* DBA: the prefix lengths are the first stream, the suffix lengths the
@@ -663,7 +662,7 @@ static const char* pq_str_delta_next(pq_column* c, const pq_schema* s, const uin
         return "delta length exceeds the page";
     if (!pq_reserve(&c->rebuild,&c->rebuild_cap,(size_t)n)) return "delta byte array allocation failed";
     if (suf) memcpy(c->rebuild + pre,c->payload.p,(size_t)suf);
-    c->payload.p += suf; c->rebuild_len = (size_t)n; c->str_seen++;
+    c->payload.p += suf; c->rebuild_len = (size_t)n;
     *p = c->rebuild; *len = (uint32_t)n;
     return NULL;
 }
@@ -1210,8 +1209,7 @@ static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
         c->codec = (int)codec; c->page_left = 0; c->chunk_left = r->group_left;
         c->have_dict = false; c->dict_count = 0; c->optional = r->schema[r->selected[i]].optional;
         c->delta.active = false; c->pad_final_run = r->duckdb_writer;
-        c->dlen.active = false; c->dpre.active = false;
-        c->str_delta = 0; c->str_seen = 0; c->rebuild_len = 0; c->sym_arena_len = 0;
+        c->str_delta = 0; c->rebuild_len = 0; c->sym_arena_len = 0;
         c->payload_start = NULL; c->suffix_start = NULL;
         ray_free_raw(c->strings); c->strings = NULL;
         ray_free_raw(c->symbol_ids); c->symbol_ids = NULL;
@@ -1324,7 +1322,7 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
         pq_span f[10];
         c->page_all_present = false;
         c->delta.active = false;
-        c->str_delta = 0; c->str_seen = 0; c->rebuild_len = 0;
+        c->str_delta = 0; c->rebuild_len = 0;
         c->payload_start = NULL; c->suffix_start = NULL;
         c->sym_arena_len = 0;
         int64_t raw, size;
