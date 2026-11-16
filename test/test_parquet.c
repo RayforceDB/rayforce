@@ -6642,6 +6642,26 @@ static test_result_t test_pq_delta_strings(void) {
 #endif
     PASS();
 }
+#if defined(DEBUG)
+/* PQ_DEF_STRICT restores the strict definition-level end rule, refusing the
+ * DuckDB fixture's over-declared final run. The clean read after clearing the
+ * variable proves the tolerance branch is taken otherwise. */
+static test_result_t test_pq_delta_def_strict(void) {
+    ray_error_clear();
+    pq_set_env("PQ_DEF_STRICT", "1");
+    ray_t* se = ray_parquet_read(DELTA_FIX "duckdb-deflevel.parquet", NULL);
+    pq_set_env("PQ_DEF_STRICT", NULL);
+    TEST_ASSERT_TRUE(se && RAY_IS_ERR(se));
+    TEST_ASSERT_TRUE(ray_err_code(se) && !strcmp(ray_err_code(se), "parquet"));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "excess definition levels (column name)"));
+    ray_error_free(se);
+    ray_error_clear();
+    ray_t* t = ray_parquet_read(DELTA_FIX "duckdb-deflevel.parquet", NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_release(t);
+    PASS();
+}
+#endif
 /* The symbol import's decision for a DELTA string column: DELTA_BYTE_ARRAY is
  * grouped regardless of the forced mode; DELTA_LENGTH_BYTE_ARRAY takes either. */
 static test_result_t test_pq_delta_symbol_import(void) {
@@ -7195,6 +7215,9 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_binary_packed",test_pq_delta_binary_packed,pq_setup,pq_teardown},
     {"parquet/delta_dpb_width",test_pq_delta_dpb_width,pq_setup,pq_teardown},
     {"parquet/delta_strings",test_pq_delta_strings,pq_setup,pq_teardown},
+#if defined(DEBUG)
+    {"parquet/delta_def_strict",test_pq_delta_def_strict,pq_setup,pq_teardown},
+#endif
     {"parquet/delta_transitions",test_pq_delta_transitions,pq_setup,pq_teardown},
     {"parquet/delta_symbol_import",test_pq_delta_symbol_import,pq_setup,pq_teardown},
     {"parquet/delta_skip",test_pq_delta_skip,pq_setup,pq_teardown},
