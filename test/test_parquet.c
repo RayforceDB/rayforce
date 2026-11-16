@@ -6319,8 +6319,9 @@ static void pq_plain_str(pq_buf* b, const char* s) {
     pb_bytes(b, &n, 4); pb_bytes(b, s, n);
 }
 /* A one-column file whose single chunk holds a dictionary page and the given
- * v1 data pages in order: dictionary, PLAIN, DELTA, dictionary again, then
- * PLAIN, so both transition directions are decoded. */
+ * v1 data pages in order: dictionary, PLAIN, DELTA_LENGTH_BYTE_ARRAY,
+ * DELTA_BYTE_ARRAY, dictionary again, then PLAIN, so the DELTA string codecs'
+ * shared length stream is re-initialised across the 6 -> 7 boundary. */
 static bool pq_write_transitions(const char* path) {
     pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
     int64_t dict_off = (int64_t)f.n;
@@ -6333,6 +6334,14 @@ static bool pq_write_transitions(const char* path) {
     { pq_buf b = {0}; pq_levels_all(&b, 4);
       pq_plain_str(&b, "plain"); pq_plain_str(&b, "x"); pq_plain_str(&b, "plain"); pq_plain_str(&b, "x");
       pq_page_v1(&f, &b, 0, 4); ray_sys_free(b.p); }
+    /* A DLBA page immediately before the DBA page: both codecs share `dlen`,
+     * but here it holds whole lengths rather than suffix lengths, so a stale
+     * stream would surface in the next page's reconstruction. */
+    { pq_buf b = {0}; pq_levels_all(&b, 4);
+      int64_t len[] = {1,2,3,4};
+      pq_dpb_write(&b, len, 4);
+      pb_bytes(&b, "a", 1); pb_bytes(&b, "bb", 2); pb_bytes(&b, "ccc", 3); pb_bytes(&b, "dddd", 4);
+      pq_page_v1(&f, &b, 6, 4); ray_sys_free(b.p); }
     { pq_buf b = {0}; pq_levels_all(&b, 4);
       int64_t pre[] = {0,5,0,4}, suf[] = {6,1,5,1};
       pq_dpb_write(&b, pre, 4); pq_dpb_write(&b, suf, 4);
@@ -6347,7 +6356,7 @@ static bool pq_write_transitions(const char* path) {
       pq_plain_str(&b, "tail1"); pq_plain_str(&b, "tail2");
       pq_page_v1(&f, &b, 0, 2); ray_sys_free(b.p); }
     int64_t size = (int64_t)f.n - dict_off;
-    int64_t footer = (int64_t)f.n, rows = 18;
+    int64_t footer = (int64_t)f.n, rows = 22;
     int last = 0;
     pb_i(&f, &last, 1, PB_I32, 1);
     pb_field(&f, &last, 2, PB_LIST); pb_list(&f, 2, PB_STRUCT);
@@ -6364,8 +6373,8 @@ static bool pq_write_transitions(const char* path) {
         pb_i(&f, &lc, 2, PB_I64, data_off);
         pb_field(&f, &lc, 3, PB_STRUCT);
         { int lm = 0; pb_i(&f, &lm, 1, PB_I32, 6);
-          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 4, PB_I32);
-          pb_zz(&f, 0); pb_zz(&f, 2); pb_zz(&f, 8); pb_zz(&f, 7);
+          pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 5, PB_I32);
+          pb_zz(&f, 0); pb_zz(&f, 2); pb_zz(&f, 8); pb_zz(&f, 7); pb_zz(&f, 6);
           pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, "name", 4);
           pb_i(&f, &lm, 4, PB_I32, 0);
           pb_i(&f, &lm, 5, PB_I64, rows);
@@ -6510,6 +6519,7 @@ static bool pq_transitions_check(int64_t batch) {
     snprintf(path, sizeof(path), "/tmp/rayforce-pq-transitions-%d.parquet", (int)getpid());
     if (!pq_write_transitions(path)) return false;
     static const char* want[] = {"alpha","beta","alpha","beta","plain","x","plain","x",
+                                 "a","bb","ccc","dddd",
                                  "alphaX","alphaY","betaZ","betaW",
                                  "beta","alpha","beta","alpha","tail1","tail2"};
     ray_parquet_t* r = NULL;
@@ -6527,15 +6537,15 @@ static bool pq_transitions_check(int64_t batch) {
         ray_t* col = ray_table_get_col_idx(t, 0);
         for (int64_t i = 0; ok && i < ray_table_nrows(t); i++, at++) {
             size_t n = 0; const char* p = ray_str_vec_get(col, i, &n);
-            if (at >= 18 || n != strlen(want[at]) || (n && memcmp(p, want[at], n))) {
+            if (at >= 22 || n != strlen(want[at]) || (n && memcmp(p, want[at], n))) {
                 fprintf(stderr, "  transitions row %lld: %.*s want %s\n", (long long)at,
-                        (int)n, p ? p : "", at < 18 ? want[at] : "?");
+                        (int)n, p ? p : "", at < 22 ? want[at] : "?");
                 ok = false;
             }
         }
         ray_release(t);
     }
-    if (ok && at != 18) { fprintf(stderr, "  transitions rows %lld/18\n", (long long)at); ok = false; }
+    if (ok && at != 22) { fprintf(stderr, "  transitions rows %lld/22\n", (long long)at); ok = false; }
     if (r) ray_parquet_close(r);
     unlink(path);
     return ok;
