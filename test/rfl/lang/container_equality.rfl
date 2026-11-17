@@ -1,0 +1,75 @@
+;; Dictionary alignment, union order and both scalar operand orders.
+(== {a: 1 b: 2} {b: 2 a: 3}) -- {a:false b:true}
+(== {b: 2 c: 3} {a: 1 b: 2}) -- {b:true c:false a:false}
+(== {a: 1} {b: 1}) -- {a:false b:false}
+(== {} {}) -- {}
+(== {} {a: 1}) -- {a:false}
+(== {a: 1} {}) -- {a:false}
+(== {} 1) -- {}
+(== 1 {}) -- {}
+(== {a: 1 b: 2} 1i) -- {a:true b:false}
+(== 1i {a: 1 b: 2}) -- {a:true b:false}
+(== {a: 0Nl b: 1} 0Nf) -- {a:true b:false}
+(== null {a: 0Nl b: 1}) -- {a:true b:false}
+(== {a: 0Nl b: 1} null) -- {a:true b:false}
+(== {a: "a" b: "b"} "a") -- {a:true b:false}
+(== 'a {a: 'a b: 'b}) -- {a:true b:false}
+(== {a: true b: false} true) -- {a:true b:false}
+;; Numeric, string, and temporal keys use dictionary lookup semantics.
+(== (dict [1 2] [10 20]) (dict [2 3] [20 30])) -- (dict [1 2 3] [false true false])
+(== (dict ["x" "y"] [1 2]) (dict ["y" "z"] [2 3])) -- (dict ["x" "y" "z"] [false true false])
+(== (dict [2024.01.01 2024.01.02] [1 2]) (dict [2024.01.02] [2])) -- (dict [2024.01.01 2024.01.02] [false true])
+;; Nested values preserve their own shape and promotion rules.
+(== {a: [1 2]} {a: [1i 3i]}) -- {a:[true false]}
+(== {a: {x: 1 y: 2}} {a: {y: 2 z: 3}}) -- {a:{x:false y:true z:false}}
+(== {a: [1 2]} 1) -- {a:[true false]}
+(== {a: [1 2]} {a: [1]}) !- length
+(== {a: 'x} 1) !- type
+(== {a: 1} [1]) !- type
+(== [1] {a: 1}) !- type
+;; Tables: multiple columns, nulls, promotion, reverse scalar broadcast.
+(set T (table [a b] (list [1 2 0Nl] [1.0 3.0 0Nf])))
+(set M (table [a b] (list [true false false] [true false false])))
+(identical (== T 1) M) -- true
+(identical (== 1 T) M) -- true
+(== T null) -- (table [a b] (list [false false true] [false false true]))
+(== null T) -- (table [a b] (list [false false true] [false false true]))
+(== T T) -- (table [a b] (list [true true true] [true true true]))
+(== T (table [a b] (list [1i 3i 0Ni] [1.0 2.0 0Nf]))) -- (table [a b] (list [true false true] [true false true]))
+(== T (table [b a] (list [1 2 3] [1 2 3]))) !- length
+(== T (table [a] (list [1 2 3]))) !- length
+(== T (table [a b] (list [1] [1]))) !- length
+(== T {a: 1}) !- type
+(== {a: 1} T) !- type
+(== T [1 2 3]) !- type
+(== [1 2 3] T) !- type
+(== (table [a] (list (til 0))) 1) -- (table [a] (list (as 'B8 (til 0))))
+(== (table [a] (list ["a" "b"])) "a") -- (table [a] (list [true false]))
+(== 'a (table [a] (list ['a 'b]))) -- (table [a] (list [true false]))
+;; Compiled dispatch and serialization must agree with direct evaluation.
+(set ceq (fn [x y] (== x y)))
+(identical (ceq T 1) M) -- true
+(identical (ceq 1 T) M) -- true
+(ceq {a: 1} {a: 1i}) -- {a:true}
+(ceq T (table [z] (list [1]))) !- length
+(identical (== (de (ser T)) 1) M) -- true
+(identical T (de (ser T))) -- true
+;; Strict identity distinguishes shape, type, order and content.
+(identical {} {}) -- true
+(identical {} {a: 1}) -- false
+(identical (dict [1] [1]) (dict [1i] [1])) -- false
+(identical (table [a] (list (til 0))) (table [a] (list (as 'F64 (til 0))))) -- false
+(identical T (table [b a] (list [1 2 0Nl] [1.0 3.0 0Nf]))) -- false
+(identical (list {a: 1}) (list {a: 1i})) -- false
+;; Temporal promotion and typed nulls remain element-wise == semantics.
+(== {a: 2024.01.01} {a: 2024.01.01D00:00:00.000000000}) -- {a:true}
+(== (table [d] (list [2024.01.01 2024.01.02])) (table [d] (list [2024.01.01D00:00:00.000000000 2024.01.03D00:00:00.000000000]))) -- (table [d] (list [true false]))
+(== {a: 0Nf b: -0.0} {a: 0Nl b: 0.0}) -- {a:true b:true}
+(== {a: {x: 1}} 1) -- {a:{x:true}}
+;; Errors after an earlier successful column/value exercise cleanup paths.
+(== {a: 1 b: 'x} 1) !- type
+(== (table [a b] (list [1 2] ['x 'y])) 1) !- type
+;; Inputs remain intact after successful and failed operations.
+(identical T (de (ser T))) -- true
+(count T) -- 3
+(key T) -- [a b]

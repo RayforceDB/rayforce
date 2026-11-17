@@ -737,3 +737,6 @@ described in [Multiple Instances](../guides/instances.md).
 
 !!! note "Auto-mapping"
     Arithmetic, comparison, and logic functions automatically map over vectors element-wise. You do not need explicit `map` calls for these — `(+ [1 2 3] 10)` works directly.
+
+For equality, mixing a dictionary with a table is a `type` error in either
+operand order; a dictionary's keys are not interpreted as table columns.

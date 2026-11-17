@@ -1,0 +1,14 @@
+;; @requires: posix
+;; Persisted columns must compare by values, including file-domain symbols.
+(set eqdir (concat (.os.getenv "TMPDIR") "/container-equality-store/"))
+(set S (table [n s text] (list [1 2 0Nl] ['x 'y '] ["x" "y" ""])))
+(.db.splayed.set eqdir S)
+(set R (.db.splayed.get eqdir))
+(identical R S) -- true
+(identical (== R S) (== S S)) -- true
+(identical (== S R) (== S S)) -- true
+(identical (== R R) (== S S)) -- true
+(identical (== (at R 's) 'x) (== (at S 's) 'x)) -- true
+(identical (at R 's) (at S 's)) -- true
+(identical (at R 'text) (at S 'text)) -- true
+(identical R (de (ser S))) -- true

@@ -239,7 +239,8 @@ ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, 
  * atomic mapper, including numeric promotion and nested lists. */
 static ray_t* eq_container(ray_t* a, ray_t* b) {
     bool tables = a->type == RAY_TABLE || b->type == RAY_TABLE;
-    ray_t* shape = (a->type == RAY_TABLE || a->type == RAY_DICT) ? a : b;
+    ray_t* shape = tables ? (a->type == RAY_TABLE ? a : b)
+                          : (a->type == RAY_DICT ? a : b);
     ray_t* other = shape == a ? b : a;
     if (tables) {
         if (other->type != RAY_TABLE && !ray_is_atom(other))
