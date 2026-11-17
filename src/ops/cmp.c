@@ -23,6 +23,7 @@
 
 #include "lang/internal.h"
 #include "ops/ops.h"   /* RAY_LAZY, ray_is_lazy, ray_lazy_materialize */
+#include "ops/internal.h" /* ray_table_col_value */
 #include "lang/format.h"   /* ray_type_name (error context) */
 
 #include <assert.h>
@@ -235,6 +236,12 @@ ray_t* ray_min2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_lte_fn(a, 
 ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, b)); }
 
 
+/* Use the language column accessor: stored PARTED and MAPCOMMON columns
+ * need flattening before ordinary equality kernels can consume them. */
+static ray_t* equality_column(ray_t* table, int64_t c) {
+    return ray_table_col_value(table, ray_table_col_name(table, c));
+}
+
 /* Keep equality's container shape while delegating cells to the existing
  * atomic mapper, including numeric promotion and nested lists. */
 static ray_t* eq_container(ray_t* a, ray_t* b) {
@@ -256,13 +263,18 @@ static ray_t* eq_container(ray_t* a, ray_t* b) {
         ray_t* out = ray_table_new(nc);
         if (!out || RAY_IS_ERR(out)) return out;
         for (int64_t c = 0; c < nc; c++) {
-            ray_t* x = ray_table_col_idx(shape, c);
-            ray_t* y = other->type == RAY_TABLE ? ray_table_col_idx(other, c) : other;
+            ray_t* x = equality_column(shape, c);
+            ray_t* y = other->type == RAY_TABLE ? equality_column(other, c) : other;
+            if (other->type != RAY_TABLE) ray_retain(y);
             if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) {
                 ray_release(out);
-                return RAY_IS_ERR(x) ? x : RAY_IS_ERR(y) ? y : ray_error("type", "==: unreadable column");
+                ray_t* err = RAY_IS_ERR(x) ? x : RAY_IS_ERR(y) ? y : ray_error("type", "==: unreadable column");
+                if (x && x != err) ray_release(x);
+                if (y && y != err) ray_release(y);
+                return err;
             }
             ray_t* col = atomic_map_binary_op(ray_eq_fn, OP_EQ, x, y);
+            ray_release(x); ray_release(y);
             if (!col || RAY_IS_ERR(col)) { ray_release(out); return col; }
             out = ray_table_add_col(out, ray_table_col_name(shape, c), col);
             ray_release(col);
@@ -632,12 +644,13 @@ ray_t* ray_identical_fn(ray_t* a, ray_t* b) {
             ray_table_nrows(a) != ray_table_nrows(b)) return make_bool(0);
         for (int64_t c = 0; c < ray_table_ncols(a); c++) {
             if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return make_bool(0);
-            ray_t* x = ray_table_col_idx(a, c);
-            ray_t* y = ray_table_col_idx(b, c);
-            if (RAY_IS_ERR(x)) { if (RAY_IS_ERR(y)) ray_error_free(y); return x; }
-            if (RAY_IS_ERR(y)) return y;
-            if (!x || !y) { if (x != y) return make_bool(0); continue; }
+            ray_t* x = equality_column(a, c);
+            ray_t* y = equality_column(b, c);
+            if (RAY_IS_ERR(x)) { if (y) ray_release(y); return x; }
+            if (RAY_IS_ERR(y)) { if (x) ray_release(x); return y; }
+            if (!x || !y) { ray_release(x); ray_release(y); return make_bool(0); }
             ray_t* equal = ray_identical_fn(x, y);
+            ray_release(x); ray_release(y);
             if (!equal || RAY_IS_ERR(equal) || !equal->b8) return equal;
             ray_release(equal);
         }

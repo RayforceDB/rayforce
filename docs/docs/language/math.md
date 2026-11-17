@@ -740,3 +740,6 @@ described in [Multiple Instances](../guides/instances.md).
 
 For equality, mixing a dictionary with a table is a `type` error in either
 operand order; a dictionary's keys are not interpreted as table columns.
+
+Table equality and identity read stored columns as values: encoded and
+partitioned columns are materialized, including virtual partition columns.
