@@ -235,7 +235,82 @@ ray_t* ray_min2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_lte_fn(a, 
 ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, b)); }
 
 
+/* Keep equality's container shape while delegating cells to the existing
+ * atomic mapper, including numeric promotion and nested lists. */
+static ray_t* eq_container(ray_t* a, ray_t* b) {
+    bool tables = a->type == RAY_TABLE || b->type == RAY_TABLE;
+    ray_t* shape = (a->type == RAY_TABLE || a->type == RAY_DICT) ? a : b;
+    ray_t* other = shape == a ? b : a;
+    if (tables) {
+        if (other->type != RAY_TABLE && !ray_is_atom(other))
+            return ray_error("type", "==: table expects a table or atom");
+        int64_t nc = ray_table_ncols(shape);
+        if (other->type == RAY_TABLE) {
+            if (nc != ray_table_ncols(other) || ray_table_nrows(shape) != ray_table_nrows(other))
+                return ray_error("length", "==: table shapes differ");
+            for (int64_t c = 0; c < nc; c++)
+                if (ray_table_col_name(shape, c) != ray_table_col_name(other, c))
+                    return ray_error("length", "==: table column names differ");
+        }
+        ray_t* out = ray_table_new(nc);
+        if (!out || RAY_IS_ERR(out)) return out;
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* x = ray_table_col_idx(shape, c);
+            ray_t* y = other->type == RAY_TABLE ? ray_table_col_idx(other, c) : other;
+            if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) {
+                ray_release(out);
+                return RAY_IS_ERR(x) ? x : RAY_IS_ERR(y) ? y : ray_error("type", "==: unreadable column");
+            }
+            ray_t* col = atomic_map_binary_op(ray_eq_fn, OP_EQ, x, y);
+            if (!col || RAY_IS_ERR(col)) { ray_release(out); return col; }
+            out = ray_table_add_col(out, ray_table_col_name(shape, c), col);
+            ray_release(col);
+            if (!out || RAY_IS_ERR(out)) return out;
+        }
+        return out;
+    }
+    if (other->type != RAY_DICT && !ray_is_atom(other))
+        return ray_error("type", "==: dictionary expects a dictionary or atom");
+    ray_t* keys = ray_dict_keys(shape);
+    ray_t* vals = ray_dict_vals(shape);
+    ray_t* result = ray_list_new(keys->len);
+    if (!result || RAY_IS_ERR(result)) return result;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int ok = 0, ov = 0;
+        ray_t* key = collection_elem(keys, i, &ok);
+        ray_t* x = collection_elem(vals, i, &ov);
+        ray_t* y = other->type == RAY_DICT ? ray_dict_get(other, key) : other;
+        ray_t* value = y ? atomic_map_binary_op(ray_eq_fn, OP_EQ, x, y) : make_bool(0);
+        if (ok) ray_release(key);
+        if (ov) ray_release(x);
+        if (other->type == RAY_DICT && y) ray_release(y);
+        if (!value || RAY_IS_ERR(value)) { ray_release(result); return value; }
+        result = ray_list_append(result, value);
+        ray_release(value);
+        if (!result || RAY_IS_ERR(result)) return result;
+    }
+    ray_retain(keys);
+    ray_t* out = ray_dict_new(keys, result);
+    if (!out || RAY_IS_ERR(out) || other->type != RAY_DICT) return out;
+    ray_t* more = ray_dict_keys(other);
+    for (int64_t i = 0; i < more->len; i++) {
+        int owned = 0;
+        ray_t* key = collection_elem(more, i, &owned);
+        ray_t* found = ray_dict_get(shape, key);
+        if (!found) {
+            ray_t* no = make_bool(0);
+            out = ray_dict_upsert(out, key, no);
+            ray_release(no);
+        } else ray_release(found);
+        if (owned) ray_release(key);
+        if (!out || RAY_IS_ERR(out)) return out;
+    }
+    return out;
+}
+
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
+    if (a->type == RAY_DICT || b->type == RAY_DICT || a->type == RAY_TABLE || b->type == RAY_TABLE)
+        return eq_container(a, b);
     if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_EQ, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
@@ -524,4 +599,64 @@ ray_t* ray_not_fn(ray_t* x) {
         return ray_list_collapse_bool(out);
     }
     return make_bool(is_truthy(x) ? 0 : 1);
+}
+
+/* Whole-value equality deliberately does not use numeric promotion. */
+ray_t* ray_identical_fn(ray_t* a, ray_t* b) {
+    if (ray_is_lazy(a) || ray_is_lazy(b)) {
+        ray_retain(a); ray_retain(b);
+        ray_t* x = ray_is_lazy(a) ? ray_lazy_materialize(a) : a;
+        ray_t* y = ray_is_lazy(b) ? ray_lazy_materialize(b) : b;
+        if (!x || RAY_IS_ERR(x)) { ray_release(y); return x; }
+        if (!y || RAY_IS_ERR(y)) { ray_release(x); return y; }
+        ray_t* result = ray_identical_fn(x, y);
+        ray_release(x); ray_release(y);
+        return result;
+    }
+    if (a->type != b->type) return make_bool(0);
+    if (a == b) return make_bool(1);
+    if (a->type >= RAY_LAMBDA) {
+        if (a->type == RAY_UNARY || a->type == RAY_BINARY || a->type == RAY_VARY)
+            return make_bool(a->i64 == b->i64);
+        return make_bool(0);
+    }
+    if (a->type == RAY_DICT) {
+        ray_t* keys = ray_identical_fn(ray_dict_keys(a), ray_dict_keys(b));
+        if (!keys || RAY_IS_ERR(keys) || !keys->b8) return keys;
+        ray_release(keys);
+        return ray_identical_fn(ray_dict_vals(a), ray_dict_vals(b));
+    }
+    if (a->type == RAY_TABLE) {
+        if (ray_table_ncols(a) != ray_table_ncols(b) ||
+            ray_table_nrows(a) != ray_table_nrows(b)) return make_bool(0);
+        for (int64_t c = 0; c < ray_table_ncols(a); c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return make_bool(0);
+            ray_t* x = ray_table_col_idx(a, c);
+            ray_t* y = ray_table_col_idx(b, c);
+            if (RAY_IS_ERR(x)) { if (RAY_IS_ERR(y)) ray_error_free(y); return x; }
+            if (RAY_IS_ERR(y)) return y;
+            if (!x || !y) { if (x != y) return make_bool(0); continue; }
+            ray_t* equal = ray_identical_fn(x, y);
+            if (!equal || RAY_IS_ERR(equal) || !equal->b8) return equal;
+            ray_release(equal);
+        }
+        return make_bool(1);
+    }
+    if (a->type == RAY_LIST || ray_is_vec(a)) {
+        if (a->len != b->len) return make_bool(0);
+        for (int64_t i = 0; i < a->len; i++) {
+            int oa = 0, ob = 0;
+            ray_t* x = collection_elem(a, i, &oa);
+            ray_t* y = collection_elem(b, i, &ob);
+            ray_t* equal = ray_identical_fn(x, y);
+            if (oa) ray_release(x);
+            if (ob) ray_release(y);
+            if (!equal || RAY_IS_ERR(equal)) return equal;
+            int yes = equal->b8;
+            ray_release(equal);
+            if (!yes) return make_bool(0);
+        }
+        return make_bool(1);
+    }
+    return ray_eq_fn(a, b);
 }

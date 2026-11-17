@@ -184,6 +184,33 @@ Equal. Works on all types including strings and symbols.
 (== [1 2 3] 2)  ; [false true false]
 ```
 
+Dictionaries retain their keys and compare values by key. When keys differ,
+the result contains the left keys followed by new right keys; a key present
+on only one side compares `false`. An atom broadcasts over dictionary values.
+Tables compare cell by cell, returning boolean columns. Table column names
+and order and row counts must agree, otherwise `==` raises `length`. An atom
+broadcasts over all cells. Other comparisons and arithmetic keep their
+existing behavior.
+
+### `(identical a b)`
+
+Returns one boolean for whole-value identity: the same type, shape and
+contents recursively. Numeric types are never promoted. Type and length
+mismatches return `false`. Lists and typed vectors are distinct types.
+Nulls match only the same type; floating values compare exactly, with NaNs
+matching NaNs and negative zero matching positive zero. Strings compare by
+bytes and symbols by text. Storage attributes and indexes do not matter.
+Dictionary keys and values must agree in order; tables must have the same
+column names in order and identical columns. Lazy values are evaluated.
+Builtins match the same builtin; lambdas match only the same function object.
+
+```clojure
+(identical [1 2] [1 2])  ; true
+(identical 1 1i)        ; false
+(identical (list 1 2) [1 2]) ; false
+(== {a: 1 b: 2} 1)     ; {a:true b:false}
+```
+
 ### `(!= a b)` — atomic
 
 Not equal.

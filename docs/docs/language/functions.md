@@ -59,6 +59,7 @@ All comparison operators are **atomic** and return boolean results.
 | `<` | binary | Less than | `(< 3 5)` → `true` |
 | `>=` | binary | Greater than or equal | `(>= 5 5)` → `true` |
 | `<=` | binary | Less than or equal | `(<= 3 5)` → `true` |
+| `identical` | binary | Same type, shape and contents | `(identical 1 1i)` → `false` |
 | `==` | binary | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | Check which vector elements fall within a range | `(within [1 5 10] [3 7])` → `[false true false]` |
