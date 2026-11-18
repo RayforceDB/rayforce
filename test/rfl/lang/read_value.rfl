@@ -276,6 +276,7 @@ marker -- 0
 (repr true 2) !- limit
 
 ;; Constructor keywords and GUID nulls require token boundaries.
+(read-value "(as 'GUID (list0Ng))") !- parse
 (read-value "(as 'GUID (list0Ng0Ng))") !- parse
 (read-value "(as 'GUID (list 0Ng0Ng))") !- parse
 (read-value "(as'I64 [])") !- parse
