@@ -82,6 +82,16 @@ int64_t ray_serde_size(ray_t* obj);
  * Buffer must have at least ray_serde_size(obj) bytes. */
 int64_t ray_ser_raw(uint8_t* buf, ray_t* obj);
 
+/* An error record carries the thread's last error message (ray_error_msg).
+ * A new error raised between the size pass and the write pass of one
+ * serialization (an encoded column that fails to decode, ...) would change
+ * that text, and the write pass would then write a different length than
+ * the size pass reserved.  ray_serde_msg_hold takes the text once; until
+ * the matching ray_serde_msg_release both passes write that copy.  Holds
+ * nest: the outermost one takes the text. */
+void    ray_serde_msg_hold(void);
+void    ray_serde_msg_release(void);
+
 /* Deserialize object from buffer. Returns reconstructed ray_t*.
  * *len is updated to reflect bytes consumed. */
 ray_t*  ray_de_raw(uint8_t* buf, int64_t* len);

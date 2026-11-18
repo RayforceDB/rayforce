@@ -5267,6 +5267,39 @@ static test_result_t test_serde_builtin_name_roundtrip(void) {
 
 /* ---- serde coverage: ERROR object roundtrip ------------------------------ */
 
+/* An error raised between the size pass and the write pass changes the
+ * thread's last error message.  Held, both passes write the same text and
+ * length; unheld, the write pass would write the new, longer text into a
+ * buffer sized for the old one. */
+static test_result_t test_serde_error_msg_held(void) {
+    ray_t* e = ray_error("domain", "short");
+    TEST_ASSERT_NOT_NULL(e); TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+
+    ray_serde_msg_hold();
+    int64_t size = ray_serde_size(e);
+    ray_t* later = ray_error("type", "a much longer message raised after the size pass");
+    uint8_t buf[512];
+    TEST_ASSERT_TRUE(size > 0 && size <= (int64_t)sizeof buf);
+    int64_t wrote = ray_ser_raw(buf, e);
+    ray_serde_msg_release();
+    TEST_ASSERT_EQ_I(wrote, size);
+    int64_t len = wrote;
+    ray_t* back = ray_de_raw(buf, &len);
+    TEST_ASSERT_NOT_NULL(back); TEST_ASSERT_TRUE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(len, 0);
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "short");
+    ray_error_free(back);
+
+    /* Unheld, the size follows whatever error was raised last. */
+    ray_error_free(later);
+    later = ray_error("type", "a much longer message raised after the size pass");
+    TEST_ASSERT_TRUE(ray_serde_size(e) > size);
+
+    ray_error_free(later);
+    ray_error_free(e);
+    PASS();
+}
+
 static test_result_t test_serde_error_roundtrip(void) {
     /* Build an error object and round-trip it through ser/de */
     ray_t* e = ray_error("domain", "custom failure: the whole sentence");
@@ -8591,6 +8624,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_function_types",       test_serde_function_types,       NULL,        NULL           },
     { "store/serde_builtin_name_roundtrip", test_serde_builtin_name_roundtrip, NULL,     NULL           },
     { "store/serde_error_roundtrip",      test_serde_error_roundtrip,      store_setup, store_teardown },
+    { "store/serde_error_msg_held",      test_serde_error_msg_held,      store_setup, store_teardown },
     { "store/serde_large_null_vec",       test_serde_large_null_vec,       store_setup, store_teardown },
     { "store/serde_f32_atom",             test_serde_f32_atom_and_edge_cases, store_setup, store_teardown },
     { "store/serde_lambda_roundtrip",     test_serde_lambda_roundtrip,     store_setup, store_teardown },
