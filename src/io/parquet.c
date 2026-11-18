@@ -2856,10 +2856,12 @@ static int64_t pq_meta_value_encoding(pq_span meta) {
  * O(row groups x cols) rather than O(symbol cols x row groups x cols).
  * `enc0`, when asked for, receives every column's value encoding from row
  * group 0 - the debug seam's per-column report, computed here so it does not
- * re-parse the group per column. Zero-row groups are groups the decoder
+ * re-parse the group per column, and -1 when group 0 is never read, as the
+ * deleted per-column parse reported. Zero-row groups are groups the decoder
  * leaves out; their chunks do not decide the mode. */
 static void pq_chunk_names(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to,
                            int64_t code, uint8_t* found, int64_t* enc0) {
+    if (enc0) for (int64_t c = 0; c < r->ncols; c++) enc0[c] = -1;
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
     if (!cols) return;
     int64_t left = 0;
