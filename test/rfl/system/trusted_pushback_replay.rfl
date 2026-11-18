@@ -19,7 +19,7 @@
 (write "/tmp/rftest_trustpush/client2.rfl" "(set h (.ipc.open \"127.0.0.1:19959:u:pw\"))\n(set c (try (.ipc.send h \"kv\") (fn [e] -1)))\n(write \"/tmp/rftest_trustpush/out2\" (format \"%\" c))\n(exit 0)\n")
 
 (.sys.exec "./rayforce -p 19958 /tmp/rftest_trustpush/peer.rfl </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19958 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19958 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 ;; Run 1: the trusted verb runs, with a pushed request inside it.
 (.sys.exec "./rayforce -p 19959 -U pw -l /tmp/rftest_trustpush/J /tmp/rftest_trustpush/boot.rfl </dev/null >/tmp/rftest_trustpush/srv1.log 2>&1 &")

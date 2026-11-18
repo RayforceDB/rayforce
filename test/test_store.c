@@ -5105,6 +5105,20 @@ static test_result_t test_serde_de_error_paths(void) {
         TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
         ray_release(r); ray_release(w);
     }
+    /* Error record advertises message bytes that are not present. */
+    {
+        ray_t* e = ray_error("domain", "truncated diagnostic");
+        ray_t* w = ray_ser(e);
+        TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(w);
+        hdr->size--;
+        w->len--;
+        ray_t* r = ray_de(w);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "truncated message"));
+        ray_error_free(r); ray_release(w); ray_error_free(e);
+    }
     PASS();
 }
 
@@ -5253,12 +5267,45 @@ static test_result_t test_serde_builtin_name_roundtrip(void) {
 
 /* ---- serde coverage: ERROR object roundtrip ------------------------------ */
 
-static test_result_t test_serde_error_roundtrip(void) {
-    /* Build an error object and round-trip it through ser/de */
-    ray_t* e = ray_error("domain", NULL);
+/* An error raised between the size pass and the write pass changes the
+ * thread's last error message.  Held, both passes write the same text and
+ * length; unheld, the write pass would write the new, longer text into a
+ * buffer sized for the old one. */
+static test_result_t test_serde_error_msg_held(void) {
+    ray_t* e = ray_error("domain", "short");
     TEST_ASSERT_NOT_NULL(e); TEST_ASSERT_TRUE(RAY_IS_ERR(e));
 
-    /* ray_ser handles IS_ERR: writes 1+8 bytes */
+    ray_serde_msg_hold();
+    int64_t size = ray_serde_size(e);
+    ray_t* later = ray_error("type", "a much longer message raised after the size pass");
+    uint8_t buf[512];
+    TEST_ASSERT_TRUE(size > 0 && size <= (int64_t)sizeof buf);
+    int64_t wrote = ray_ser_raw(buf, e);
+    ray_serde_msg_release();
+    TEST_ASSERT_EQ_I(wrote, size);
+    int64_t len = wrote;
+    ray_t* back = ray_de_raw(buf, &len);
+    TEST_ASSERT_NOT_NULL(back); TEST_ASSERT_TRUE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(len, 0);
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "short");
+    ray_error_free(back);
+
+    /* Unheld, the size follows whatever error was raised last. */
+    ray_error_free(later);
+    later = ray_error("type", "a much longer message raised after the size pass");
+    TEST_ASSERT_TRUE(ray_serde_size(e) > size);
+
+    ray_error_free(later);
+    ray_error_free(e);
+    PASS();
+}
+
+static test_result_t test_serde_error_roundtrip(void) {
+    /* Build an error object and round-trip it through ser/de */
+    ray_t* e = ray_error("domain", "custom failure: the whole sentence");
+    TEST_ASSERT_NOT_NULL(e); TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+
+    /* ray_ser handles IS_ERR: writes the code and diagnostic text. */
     ray_t* w = ray_ser(e);
     TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
 
@@ -5266,8 +5313,25 @@ static test_result_t test_serde_error_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(b);
     /* The deserialized form is a RAY_ERROR object */
     TEST_ASSERT_TRUE(RAY_IS_ERR(b));
+    TEST_ASSERT_STR_EQ(ray_err_code(b), "domain");
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "custom failure: the whole sentence");
 
-    ray_release(b); ray_release(w); ray_release(e);
+    ray_error_free(b); ray_release(w); ray_error_free(e);
+
+    /* A version-3 error record carried only its fixed eight-byte category.
+     * Existing persisted objects must still load after the v4 upgrade. */
+    e = ray_error("domain", "old message was not on the wire");
+    w = ray_ser(e);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(w);
+    hdr->version = RAY_SERDE_WIRE_VERSION_MIN;
+    hdr->size = 1 + 8;
+    w->len = (int64_t)sizeof(*hdr) + hdr->size;
+    b = ray_de(w);
+    TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_TRUE(RAY_IS_ERR(b));
+    TEST_ASSERT_STR_EQ(ray_err_code(b), "domain");
+    TEST_ASSERT_NULL(ray_error_msg());
+    ray_error_free(b); ray_release(w); ray_error_free(e);
     PASS();
 }
 
@@ -5363,7 +5427,7 @@ static test_result_t test_serde_f32_atom_and_edge_cases(void) {
          * object with type==RAY_ERROR. Directly test via ray_ser which calls
          * serde_size internally. */
         int64_t sz = ray_serde_size(e);
-        TEST_ASSERT_EQ_I(sz, 1 + 8);
+        TEST_ASSERT_EQ_I(sz, 1 + 8 + 1);
         ray_release(e);
     }
     /* safe_strlen: trigger the no-null path (line 77) by crafting a raw
@@ -6458,19 +6522,19 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
     uint8_t bad_hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
     TEST_ASSERT(((int)ray_sock_send(s, bad_hs, 2)) >= (0), "(int)ray_sock_send(s, bad_hs, 2) >= 0");
 
-    /* Server should refuse — EOF on recv indicates the connection was
-     * closed before any payload bytes reached us.  If the check is
-     * missing, the server would write its own handshake response here
-     * and the test would observe 2 bytes instead. */
-    uint8_t resp[2] = { 0xff, 0xff };
+    /* Server should refuse: it replies with its own version byte, so the
+     * client can report the mismatch, then closes before any framed
+     * payload.  Read until EOF; exactly those two bytes must arrive. */
+    uint8_t resp[8] = { 0xff, 0xff };
     int64_t got = 0;
-    /* Give the server thread a small number of polling cycles to react. */
-    for (int attempt = 0; attempt < 100 && got < 2; attempt++) {
-        int64_t n = ray_sock_recv(s, resp + got, (size_t)(2 - got));
+    for (int attempt = 0; attempt < 100 && got < (int64_t)sizeof(resp); attempt++) {
+        int64_t n = ray_sock_recv(s, resp + got, sizeof(resp) - (size_t)got);
         if (n <= 0) break;
         got += n;
     }
-    TEST_ASSERT(((int)got) < (2), "(int)got < 2");  /* never got a full response */
+    TEST_ASSERT_EQ_I(got, 2);
+    TEST_ASSERT_EQ_I(resp[0], RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(resp[1], 0x00);
     ray_sock_close(s);
 
     /* A subsequent well-behaved client must still succeed, proving the
@@ -8560,6 +8624,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_function_types",       test_serde_function_types,       NULL,        NULL           },
     { "store/serde_builtin_name_roundtrip", test_serde_builtin_name_roundtrip, NULL,     NULL           },
     { "store/serde_error_roundtrip",      test_serde_error_roundtrip,      store_setup, store_teardown },
+    { "store/serde_error_msg_held",      test_serde_error_msg_held,      store_setup, store_teardown },
     { "store/serde_large_null_vec",       test_serde_large_null_vec,       store_setup, store_teardown },
     { "store/serde_f32_atom",             test_serde_f32_atom_and_edge_cases, store_setup, store_teardown },
     { "store/serde_lambda_roundtrip",     test_serde_lambda_roundtrip,     store_setup, store_teardown },
