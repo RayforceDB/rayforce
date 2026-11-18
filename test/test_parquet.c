@@ -6027,15 +6027,24 @@ static bool pq_delta_synth_v2(const char* path, int physical, const uint8_t* str
 static void pq_delta_head(pq_buf* b, uint64_t total) {
     pb_var(b, 128); pb_var(b, 4); pb_var(b, total); pb_zz(b, 0);
 }
-static bool pq_delta_error(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
-                           int physical, const char* want) {
+/* A crafted DELTA stream must be refused with `want` in the message. `enc`
+ * names the synthesizer: -1 a DELTA_BINARY_PACKED value page of `physical`
+ * (pq_delta_synth); 6 or 7 a DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY page
+ * (pq_delta_synth_enc); `levels` a v2 page whose recorded null count
+ * disagrees with its definition levels (pq_delta_synth_v2). */
+static bool pq_delta_reject(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
+                            int physical, int encoding, const uint8_t* levels, size_t levels_n,
+                            const char* want) {
     char path[160];
-    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-err-%s-%d.parquet", fixture, (int)getpid());
-    if (!pq_delta_synth(path, physical, stream, n, rows)) return false;
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-reject-%s-%d.parquet", fixture, (int)getpid());
+    bool ok = levels ? pq_delta_synth_v2(path, 1, stream, n, rows, levels, levels_n, 0)
+            : encoding >= 0 ? pq_delta_synth_enc(path, physical, encoding, stream, n, rows)
+            : pq_delta_synth(path, physical, stream, n, rows);
+    if (!ok) return false;
     ray_error_clear();
     ray_parquet_t* r = NULL;
     ray_t* e = ray_parquet_open(path, NULL, 65536, &r);
-    bool ok = !e && r;
+    ok = !e && r;
     if (e) ray_error_free(e);
     if (ok) {
         ray_t* t = ray_parquet_next(r);
@@ -6045,63 +6054,7 @@ static bool pq_delta_error(const char* fixture, int64_t rows, const uint8_t* str
                 const char* msg = ray_error_msg();
                 ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
                      msg && strstr(msg, want) != NULL;
-                if (!ok) fprintf(stderr, "  delta error %s: got %s / %s\n", fixture,
-                                 ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
-            }
-            ray_error_free(t);
-        }
-    }
-    if (r) ray_parquet_close(r);
-    unlink(path);
-    return ok;
-}
-static bool pq_delta_error_enc(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
-                               int physical, int encoding, const char* want) {
-    char path[160];
-    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-strerr-%s-%d.parquet", fixture, (int)getpid());
-    if (!pq_delta_synth_enc(path, physical, encoding, stream, n, rows)) return false;
-    ray_error_clear();
-    ray_parquet_t* r = NULL;
-    ray_t* e = ray_parquet_open(path, NULL, 65536, &r);
-    bool ok = !e && r;
-    if (e) ray_error_free(e);
-    if (ok) {
-        ray_t* t = ray_parquet_next(r);
-        ok = t && RAY_IS_ERR(t);
-        if (t) {
-            if (ok) {
-                const char* msg = ray_error_msg();
-                ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
-                     msg && strstr(msg, want) != NULL;
-                if (!ok) fprintf(stderr, "  delta str error %s: got %s / %s\n", fixture,
-                                 ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
-            }
-            ray_error_free(t);
-        }
-    }
-    if (r) ray_parquet_close(r);
-    unlink(path);
-    return ok;
-}
-static bool pq_delta_error_v2(const char* fixture, int64_t rows, const uint8_t* stream, size_t n,
-                              const uint8_t* levels, size_t levels_n) {
-    char path[160];
-    snprintf(path, sizeof(path), "/tmp/rayforce-pq-delta-v2err-%s-%d.parquet", fixture, (int)getpid());
-    if (!pq_delta_synth_v2(path, 1, stream, n, rows, levels, levels_n, 0)) return false;
-    ray_error_clear();
-    ray_parquet_t* r = NULL;
-    ray_t* e = ray_parquet_open(path, NULL, 65536, &r);
-    bool ok = !e && r;
-    if (e) ray_error_free(e);
-    if (ok) {
-        ray_t* t = ray_parquet_next(r);
-        ok = t && RAY_IS_ERR(t);
-        if (t) {
-            if (ok) {
-                const char* msg = ray_error_msg();
-                ok = ray_err_code(t) && !strcmp(ray_err_code(t), "parquet") &&
-                     msg && strstr(msg, "v2 null count mismatch") != NULL;
-                if (!ok) fprintf(stderr, "  delta v2 error %s: got %s / %s\n", fixture,
+                if (!ok) fprintf(stderr, "  delta reject %s: got %s / %s\n", fixture,
                                  ray_err_code(t) ? ray_err_code(t) : "(no code)", msg ? msg : "(no message)");
             }
             ray_error_free(t);
@@ -6158,7 +6111,7 @@ static test_result_t test_pq_delta_binary_packed(void) {
     ray_t* dt = ray_parquet_next(dr);
     TEST_ASSERT_TRUE(dt && !RAY_IS_ERR(dt));
     TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(), 20000);
-    TEST_ASSERT_EQ_I(ray_table_nrows(dt), 65536);
+    TEST_ASSERT_EQ_I(ray_table_nrows(dt), 21000);
     ray_release(dt); ray_parquet_close(dr); ray_release(idcols);
 #endif
     /* Strict mode refuses the first native sentinel (row 0). */
@@ -6174,7 +6127,7 @@ static test_result_t test_pq_delta_binary_packed(void) {
     ray_error_free(se);
 #if defined(DEBUG)
     /* The value phase is interruptible between coarse checkpoints; the seam
-     * fires at its THIRD checkpoint inside the 100,000-row DELTA page, so the
+     * fires at its THIRD checkpoint inside the 21,000-row DELTA page, so the
      * recorded count proves the 4,096-value cadence ran (a reader that checked
      * once at page start records 0 and fails this bound). */
     ray_clear_interrupt();
@@ -6400,50 +6353,62 @@ static test_result_t test_pq_delta_errors(void) {
     pq_buf b = {0};
     /* Truncated header varint. */
     pb_byte(&b, 0x80);
-    TEST_ASSERT_TRUE(pq_delta_error("header", 1, b.p, b.n, 2, "truncated delta header"));
+    TEST_ASSERT_TRUE(pq_delta_reject("header", 1, b.p, b.n, 2, -1, NULL, 0, "truncated delta header"));
     b.n = 0;
     /* Truncated block header varint. */
     pq_delta_head(&b, 2); pb_byte(&b, 0x80);
-    TEST_ASSERT_TRUE(pq_delta_error("block", 2, b.p, b.n, 2, "truncated delta block header"));
+    TEST_ASSERT_TRUE(pq_delta_reject("block", 2, b.p, b.n, 2, -1, NULL, 0, "truncated delta block header"));
     b.n = 0;
     /* Truncated miniblock body. */
     pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 8); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
-    TEST_ASSERT_TRUE(pq_delta_error("body", 2, b.p, b.n, 2, "truncated delta miniblock"));
+    TEST_ASSERT_TRUE(pq_delta_reject("body", 2, b.p, b.n, 2, -1, NULL, 0, "truncated delta miniblock"));
     b.n = 0;
     /* A width wider than the physical type. */
     pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 33); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
-    TEST_ASSERT_TRUE(pq_delta_error("width", 2, b.p, b.n, 1, "invalid delta bit width"));
+    TEST_ASSERT_TRUE(pq_delta_reject("width", 2, b.p, b.n, 1, -1, NULL, 0, "invalid delta bit width"));
     b.n = 0;
     /* The header count is below the values the rows require. */
     pq_delta_head(&b, 1);
-    TEST_ASSERT_TRUE(pq_delta_error("count", 2, b.p, b.n, 2, "delta value count exceeds the stream header"));
+    TEST_ASSERT_TRUE(pq_delta_reject("count", 2, b.p, b.n, 2, -1, NULL, 0, "delta value count exceeds the stream header"));
     b.n = 0;
     /* Trailing body bytes after the last decoded value. */
     pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
-    TEST_ASSERT_TRUE(pq_delta_error("trail", 2, b.p, b.n, 2, "excess delta values"));
+    TEST_ASSERT_TRUE(pq_delta_reject("trail", 2, b.p, b.n, 2, -1, NULL, 0, "excess delta values"));
     b.n = 0;
     /* A block size that is not a multiple of 128. */
     pb_var(&b, 100); pb_var(&b, 4); pb_var(&b, 2); pb_zz(&b, 0);
-    TEST_ASSERT_TRUE(pq_delta_error("block-size", 2, b.p, b.n, 2, "invalid delta block size"));
+    TEST_ASSERT_TRUE(pq_delta_reject("block-size", 2, b.p, b.n, 2, -1, NULL, 0, "invalid delta block size"));
     b.n = 0;
     /* A miniblock count that divides the block but not into 32-value units. */
     pb_var(&b, 128); pb_var(&b, 8); pb_var(&b, 2); pb_zz(&b, 0);
-    TEST_ASSERT_TRUE(pq_delta_error("minis", 2, b.p, b.n, 2, "invalid delta block size"));
+    TEST_ASSERT_TRUE(pq_delta_reject("minis", 2, b.p, b.n, 2, -1, NULL, 0, "invalid delta block size"));
     b.n = 0;
     /* A truncated miniblock-widths array: the block header's widths are cut. */
     pq_delta_head(&b, 2); pb_zz(&b, 0);
-    TEST_ASSERT_TRUE(pq_delta_error("widths", 2, b.p, b.n, 2, "truncated delta miniblock widths"));
+    TEST_ASSERT_TRUE(pq_delta_reject("widths", 2, b.p, b.n, 2, -1, NULL, 0, "truncated delta miniblock widths"));
     b.n = 0;
     /* DELTA on a physical type outside INT32/INT64 is refused at the page gate. */
     pq_delta_head(&b, 2);
-    TEST_ASSERT_TRUE(pq_delta_error("physical", 2, b.p, b.n, 5, "unsupported value encoding"));
+    TEST_ASSERT_TRUE(pq_delta_reject("physical", 2, b.p, b.n, 5, -1, NULL, 0, "unsupported value encoding"));
+    /* A zigzag varint that does not fit the 32-bit physical type is refused,
+     * not truncated (Arrow's rule): the header's first value and each
+     * block's min delta, for INT32 data and the byte-array length streams. */
+    b.n = 0;
+    pq_dpb_head(&b, 1, INT64_C(2147483648));
+    TEST_ASSERT_TRUE(pq_delta_reject("first32", 1, b.p, b.n, 1, -1, NULL, 0, "delta first value out of range"));
+    b.n = 0;
+    pq_delta_head(&b, 2); pb_zz(&b, INT64_C(2147483648));
+    TEST_ASSERT_TRUE(pq_delta_reject("mindelta32", 2, b.p, b.n, 1, -1, NULL, 0, "delta min-delta out of range"));
+    b.n = 0;
+    pq_dpb_head(&b, 1, INT64_C(-2147483649));
+    TEST_ASSERT_TRUE(pq_delta_reject("dlba-first32", 1, b.p, b.n, 6, 6, NULL, 0, "delta first value out of range"));
     /* A v2 page whose declared null count disagrees with the levels. */
     b.n = 0;
     {
         static const uint8_t levels[] = {0x03, 0x02};   /* one group, row 1 present */
         pq_buf s = {0};
         pq_delta_head(&s, 1);
-        TEST_ASSERT_TRUE(pq_delta_error_v2("nulls", 2, s.p, s.n, levels, sizeof(levels)));
+        TEST_ASSERT_TRUE(pq_delta_reject("nulls", 2, s.p, s.n, 1, -1, levels, sizeof(levels), "v2 null count mismatch"));
         ray_sys_free(s.p);
     }
     ray_sys_free(b.p);
@@ -6451,48 +6416,48 @@ static test_result_t test_pq_delta_errors(void) {
     {
         pq_buf s = {0};
         pb_byte(&s, 0x80);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-header", 1, s.p, s.n, 6, 6, "truncated delta header"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-header", 1, s.p, s.n, 6, 6, NULL, 0, "truncated delta header"));
         s.n = 0;
         pq_dpb_head(&s, 2, 0); pb_zz(&s, 1); pb_byte(&s, 8); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-body", 2, s.p, s.n, 6, 6, "truncated delta miniblock"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-body", 2, s.p, s.n, 6, 6, NULL, 0, "truncated delta miniblock"));
         s.n = 0;
         pq_dpb_head(&s, 2, 0); pb_zz(&s, 0); pb_byte(&s, 33); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-width", 2, s.p, s.n, 6, 6, "invalid delta bit width"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-width", 2, s.p, s.n, 6, 6, NULL, 0, "invalid delta bit width"));
         s.n = 0;
         pq_dpb_head(&s, 1, 100);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-length", 1, s.p, s.n, 6, 6, "delta length exceeds the page"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-length", 1, s.p, s.n, 6, 6, NULL, 0, "delta length exceeds the page"));
         s.n = 0;
         pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x7f);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-trail", 1, s.p, s.n, 6, 6, "excess delta values"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-trail", 1, s.p, s.n, 6, 6, NULL, 0, "excess delta values"));
         s.n = 0;
         pq_dpb_head(&s, 1, 0);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-count", 2, s.p, s.n, 6, 6, "delta value count exceeds the stream header"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-count", 2, s.p, s.n, 6, 6, NULL, 0, "delta value count exceeds the stream header"));
         ray_sys_free(s.p);
     }
     {
         pq_buf s = {0};
         pq_dpb_head(&s, 1, 1); pq_dpb_head(&s, 1, 0);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-prefix", 1, s.p, s.n, 6, 7, "delta prefix exceeds the previous value"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dba-prefix", 1, s.p, s.n, 6, 7, NULL, 0, "delta prefix exceeds the previous value"));
         s.n = 0;
         pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x80);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-suffix-header", 1, s.p, s.n, 6, 7, "truncated delta header"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dba-suffix-header", 1, s.p, s.n, 6, 7, NULL, 0, "truncated delta header"));
         s.n = 0;
         pq_dpb_head(&s, 1, 0); pq_dpb_head(&s, 2, 0);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-counts", 2, s.p, s.n, 6, 7, "invalid delta length count"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dba-counts", 2, s.p, s.n, 6, 7, NULL, 0, "invalid delta length count"));
         /* A stream header whose total exceeds the page row count: the
          * load-time dpre/dlen count checks, one case each. */
         s.n = 0;
         pq_delta_head(&s, 2);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dlba-over", 1, s.p, s.n, 6, 6, "invalid delta length count"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dlba-over", 1, s.p, s.n, 6, 6, NULL, 0, "invalid delta length count"));
         s.n = 0;
         pq_delta_head(&s, 2);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-pre-over", 1, s.p, s.n, 6, 7, "invalid delta length count"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dba-pre-over", 1, s.p, s.n, 6, 7, NULL, 0, "invalid delta length count"));
         s.n = 0;
         pq_delta_head(&s, 1); pq_delta_head(&s, 2);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-suf-over", 1, s.p, s.n, 6, 7, "invalid delta length count"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dba-suf-over", 1, s.p, s.n, 6, 7, NULL, 0, "invalid delta length count"));
         s.n = 0;
         pq_dpb_head(&s, 1, 0); pq_dpb_head(&s, 1, 0); pb_byte(&s, 0x7f);
-        TEST_ASSERT_TRUE(pq_delta_error_enc("dba-trail", 1, s.p, s.n, 6, 7, "excess delta values"));
+        TEST_ASSERT_TRUE(pq_delta_reject("dba-trail", 1, s.p, s.n, 6, 7, NULL, 0, "excess delta values"));
         ray_sys_free(s.p);
     }
     PASS();
@@ -6627,10 +6592,11 @@ static test_result_t test_pq_delta_strings(void) {
     TEST_ASSERT_TRUE(pq_delta_keep_batch("dba-prefix-long.parquet", 64));
 #if defined(DEBUG)
     /* The page-local lengths walk is interruptible at its 4,096-value cadence:
-     * the third checkpoint stops a 10,000-value page at 8,192 lengths. */
+     * the third checkpoint stops a 10,000-value DBA page at 8,192 lengths
+     * (the trimmed dlba pair is 1,000 values, below the cadence). */
     ray_clear_interrupt();
     ray_parquet_t* cr = NULL;
-    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "dlba-v1.parquet", NULL, 65536, &cr));
+    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "dba-v1.parquet", NULL, 65536, &cr));
     ray_parquet_test_delta_interrupt_after(3);
     ray_t* ct = ray_parquet_next(cr);
     ray_clear_interrupt();
@@ -6672,8 +6638,8 @@ static test_result_t test_pq_delta_symbol_import(void) {
         {"dba-v1.parquet","direct",7,1,10000},
         {"dba-v1.parquet","grouped",7,1,10000},
         {"dba-prefix-long.parquet","grouped",7,1,512},
-        {"dlba-v1.parquet","direct",6,0,10000},
-        {"dlba-v1.parquet","grouped",6,1,10000},
+        {"dlba-v1.parquet","direct",6,0,1000},
+        {"dlba-v1.parquet","grouped",6,1,1000},
     };
     const char* names[] = {"name"};
     for (size_t i = 0; i < sizeof(runs)/sizeof(runs[0]); i++) {
@@ -6720,6 +6686,53 @@ static test_result_t test_pq_delta_symbol_import(void) {
         pq_remove_native(dir, names, 1);
     }
     ray_release(types);
+    PASS();
+}
+/* A DELTA_BYTE_ARRAY page whose footer does not name the encoding (the
+ * synthesizer lists only PLAIN): the import decision cannot see the prefix
+ * expansion, so the column takes the direct path and the collection arena
+ * holds every reconstructed value.  Row 0 is 65,536 'P's plus "0000"; each
+ * later row repeats the whole prefix with no suffix, so `rows` x 65,540
+ * bytes accumulate before the collection is interned. */
+static bool pq_arena_synth(const char* path, int64_t rows) {
+    pq_buf s = {0};
+    int64_t* pre = ray_alloc_raw((size_t)rows*sizeof(*pre));
+    int64_t* suf = ray_alloc_raw((size_t)rows*sizeof(*suf));
+    if (!pre || !suf) { ray_free_raw(pre); ray_free_raw(suf); return false; }
+    pre[0] = 0; suf[0] = 65540;
+    for (int64_t i = 1; i < rows; i++) { pre[i] = 65540; suf[i] = 0; }
+    pq_dpb_write(&s, pre, (int)rows);
+    pq_dpb_write(&s, suf, (int)rows);
+    for (int64_t i = 0; i < 65536; i++) pb_byte(&s, 'P');
+    pb_bytes(&s, "0000", 4);
+    bool ok = pq_delta_synth_enc(path, 6, 7, s.p, s.n, rows);
+    ray_sys_free(s.p); ray_free_raw(pre); ray_free_raw(suf);
+    return ok;
+}
+/* The collection arena is bounded by the memory budget the engine was given
+ * (-m; here the heap watermark): 512 long values are ~32 MiB, and a 64 MiB
+ * budget allows the arena a sixteenth of it, so the import refuses the
+ * expansion instead of committing up to the 4 GiB pool ceiling.  The
+ * unconstrained read of a long-prefix page is dba-prefix-long's. */
+static test_result_t test_pq_delta_arena_bound(void) {
+    char src[160], dir[160];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-arena-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-arena-%d", (int)getpid());
+    TEST_ASSERT_TRUE(pq_arena_synth(src, 512));
+    int64_t sym = ray_sym_intern("SYM",3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
+    ray_heap_set_anon_watermark(64 << 20);
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    ray_heap_set_anon_watermark(0);
+    bool refused = res && RAY_IS_ERR(res) &&
+                   ray_err_code(res) && !strcmp(ray_err_code(res), "parquet") &&
+                   ray_error_msg() &&
+                   strstr(ray_error_msg(), "delta byte array expansion exceeds the memory budget");
+    if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+    pq_rm_rf(dir);
+    unlink(src);
+    ray_release(types);
+    TEST_ASSERT_TRUE(refused);
     PASS();
 }
 /* A two-column file of ten 1,000-row v1 data pages per chunk: `id` INT64
@@ -7225,6 +7238,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_bigprefix",test_pq_delta_bigprefix,pq_setup,pq_teardown},
     {"parquet/delta_symbol_mixed",test_pq_delta_symbol_mixed,pq_setup,pq_teardown},
     {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
+    {"parquet/delta_arena_bound",test_pq_delta_arena_bound,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},

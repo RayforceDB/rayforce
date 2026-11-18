@@ -16,12 +16,15 @@ Value formulas (10,000 rows unless stated):
       C = [INT32_MIN, INT32_MAX, INT32_MIN+1, INT32_MAX-1, 0, -1, 1,
            INT32_MIN+2, INT32_MAX-2, INT32_MIN+3, INT32_MAX-3, -2, 2]
   dbp-allnull (64 rows)                              id = null
-  dlba/dba-v1/v2page                                 s = "track_%03d" % (i % 500)
+  dlba-v1/v2page (1,000 rows)                        s = "track_%03d" % (i % 500)
+  dba-v1/v2page (10,000 rows)                        s = "track_%03d" % (i % 500)
   dba-nulls-v2                                       s = "track_%03d" % (i % 500), null when i % 13 == 0
   dba-prefix-long (512 rows)                         s = "P"*65536 + "%04d" % i
   dba-empty (8 rows)                                 ["", "a", "", "ab", "", "abc", "", ""]
   unsupported-bss (8 rows)                           id = 0..7, BYTE_STREAM_SPLIT
-  duckdb-v2-mixed (100,000 rows)                     the DuckDB COPY at the end of main()
+  duckdb-v2-mixed (21,000 rows)                      the DuckDB COPY at the end of main()
+      (just past the reader's 4,096-value interrupt checkpoint and the
+      16,384-row certification-admission threshold)
   duckdb-deflevel (1,000 rows)                       id = 0..999, name = 'v' || id, null when
       range % 3 == 0; DuckDB-written, definition-level stream over-declared
       (the PQ_DEF_STRICT counterfactual fails with 'excess definition levels')
@@ -127,10 +130,12 @@ def main():
     write("dbp-i64-snappy.parquet", pa.table({"id": ints(10000, pa.int64())}),
           compression="snappy", encoding={"id": DELTA_BINARY_PACKED})
 
-    # DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY string fixtures.
-    write("dlba-v1.parquet", pa.table({"name": strings(10000)}),
+    # DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY string fixtures.  The
+    # DLBA pair is trimmed to 1,000 rows: enough to cross the 128-value
+    # miniblock and 32-row batch seams the small-batch checks exercise.
+    write("dlba-v1.parquet", pa.table({"name": strings(1000)}),
           encoding={"name": DELTA_LENGTH_BYTE_ARRAY})
-    write("dlba-v2page.parquet", pa.table({"name": strings(10000)}),
+    write("dlba-v2page.parquet", pa.table({"name": strings(1000)}),
           version="2.0", encoding={"name": DELTA_LENGTH_BYTE_ARRAY})
     write("dba-v1.parquet", pa.table({"name": strings(10000)}),
           encoding={"name": DELTA_BYTE_ARRAY})
@@ -151,9 +156,12 @@ def main():
           encoding={"id": BYTE_STREAM_SPLIT})
 
     # DuckDB 1.5.6 mixed file: INT64 DELTA_BINARY_PACKED plus a
-    # RLE_DICTIONARY BYTE_ARRAY column, DATA_PAGE v1 headers.
+    # RLE_DICTIONARY BYTE_ARRAY column, DATA_PAGE v1 headers.  21,000 rows:
+    # just past the reader's 4,096-value interrupt checkpoint (the value
+    # phase's third checkpoint fires) and its 16,384-row certification
+    # admission threshold, and well inside one 65,536-row batch.
     sql = ("COPY (SELECT range::BIGINT AS id, 'track_' || (range % 1000) AS name "
-           "FROM range(100000)) TO '" + os.path.join(OUT, "duckdb-v2-mixed.parquet") +
+           "FROM range(21000)) TO '" + os.path.join(OUT, "duckdb-v2-mixed.parquet") +
            "' (FORMAT parquet, COMPRESSION uncompressed, PARQUET_VERSION V2);")
     subprocess.run(["duckdb", "-c", sql], check=True)
 

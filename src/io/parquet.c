@@ -472,6 +472,8 @@ typedef struct {
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
     bool pad_final_run;  /* the writer over-declares a hybrid stream's final bit-packed run */
+    bool def_strict;     /* debug builds: PQ_DEF_STRICT was set when the reader opened */
+    uint64_t arena_limit; /* the DELTA_BYTE_ARRAY collection arena's ceiling (pq_arena_limit) */
     pq_delta delta;
     /* DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY state, reset at every data
      * page.  `dlen` holds the lengths (DLBA) or the suffix lengths (DBA),
@@ -495,18 +497,29 @@ typedef struct {
 static bool pq_hybrid_done(const pq_column* c, const pq_rle* r) {
     return c->pad_final_run ? pq_rle_done_padded(r) : pq_rle_done(r);
 }
-/* Definition-level streams use a different end-of-page rule from the
- * dictionary-id stream in a writer-tolerant file: the over-declared final run
- * is the tolerance this fixture branch exercises.  PQ_DEF_STRICT (debug
- * builds) restores the strict rule for the tolerance counterfactual. */
+/* The end-of-page rule for a definition-level stream is the same one the
+ * dictionary-id stream uses (pq_hybrid_done): in a writer-tolerant file both
+ * accept the over-declared final bit-packed run that is the tolerance this
+ * fixture branch exercises.  PQ_DEF_STRICT (debug builds) restores the strict
+ * rule for the tolerance counterfactual; the reader reads it once at open
+ * (pq_cursor_budget), not at every page end. */
 static bool pq_def_done(const pq_column* c, const pq_rle* r) {
 #if defined(DEBUG)
-    if (getenv("PQ_DEF_STRICT")) return pq_rle_done(r);
+    if (c->def_strict) return pq_rle_done(r);
 #endif
     return pq_hybrid_done(c,r);
 }
 
 #define PQ_DELTA_SUPPORTED "unsupported value encoding (supported: plain, dictionary, RLE booleans, delta binary packed, delta length byte array, delta byte array)"
+/* A zigzag varint that does not fit the column's 32-bit physical type is
+ * refused rather than silently truncated (Arrow's rule): for INT32 data
+ * (physical 1) and for the DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY length
+ * streams (physical 6) the header's first value and every block's min delta
+ * must lie in INT32_MIN..INT32_MAX.  The values themselves wrap in 32-bit
+ * arithmetic, as the writer's own deltas do. */
+static bool pq_delta_fits32(const pq_schema* s, int64_t v) {
+    return (s->physical != 1 && s->physical != 6) || (v >= INT32_MIN && v <= INT32_MAX);
+}
 /* Read one value from the page's DELTA_BINARY_PACKED stream, reconstructing
  * the two's-complement wrapping values of the physical type. The stream is
  * consumed lazily: only the miniblocks whose values are asked for are read.
@@ -531,6 +544,7 @@ static const char* pq_delta_next(pq_delta* d, const pq_schema* s, int64_t* out) 
     if (!d->block_left) {
         d->min_delta = pq_int(&d->c);
         if (d->c.bad) return "truncated delta block header";
+        if (!pq_delta_fits32(s,d->min_delta)) return "delta min-delta out of range";
         if (!pq_take(&d->c,d->miniblocks,&d->widths)) return "truncated delta miniblock widths";
         d->block_left = d->block_size; d->mini = 0; d->body_left = 0;
     }
@@ -568,6 +582,7 @@ static const char* pq_delta_init(pq_delta* d, const pq_schema* s, pq_cur* v) {
     uint64_t block = pq_var(&d->c), minis = pq_var(&d->c), total = pq_var(&d->c);
     d->last = pq_int(&d->c);
     if (d->c.bad) return "truncated delta header";
+    if (!pq_delta_fits32(s,d->last)) return "delta first value out of range";
     if (!block || block % 128 || block > INT32_MAX || !minis || minis > block ||
         block % minis || !(block/minis) || (block/minis) % 32) return "invalid delta block size";
     d->block_size = block; d->miniblocks = minis; d->per_block = block/minis;
@@ -682,24 +697,34 @@ static const char* pq_str_delta_done(pq_column* c) {
 /* The direct symbol read's collection arena: one collected batch of
  * reconstructed DELTA_BYTE_ARRAY values, copied because their pointers must
  * all survive until interning and a single rebuild buffer cannot provide
- * that.  Its bound is the string pool's own (PQ_POOL_MAX), not PQ_MAX_PAGE:
- * prefix expansion makes a valid page decode to a collection far larger than
- * the page's encoded size, and the plain batch read of the same page fills a
- * pool at that same bound. */
-static bool pq_reserve_arena(uint8_t** buf, size_t* cap, size_t n) {
-    if (n > (size_t)PQ_POOL_MAX) return false;
+ * that.  Its ceiling is the string pool's own (PQ_POOL_MAX) but no more than
+ * a sixteenth of the memory the engine was given (ray_heap_mem_budget: the
+ * -m budget when the user set one, else the machine's limit): prefix
+ * expansion makes a valid page decode to a collection far larger than the
+ * page's encoded size, so the growth follows what the user allowed the
+ * engine to use, not the format's ceiling alone (review probe: one long
+ * suffix, then thousands of prefix-only rows).  The same sixteenth is the
+ * share the direct symbol columns' vocabularies stay within. */
+static uint64_t pq_arena_limit(void) {
+    int64_t budget = ray_heap_mem_budget();
+    if (budget <= 0 || (uint64_t)budget/16 > PQ_POOL_MAX) return PQ_POOL_MAX;
+    return (uint64_t)budget/16;
+}
+static bool pq_reserve_arena(uint8_t** buf, size_t* cap, uint64_t limit, size_t n) {
+    if (n > limit) return false;
     if (!n) n = 1;
     if (n <= *cap) return true;
     size_t nc = *cap ? *cap : 4096;
-    while (nc < n) nc = nc > (size_t)PQ_POOL_MAX/2 ? (size_t)PQ_POOL_MAX : nc*2;
+    while (nc < n) nc = nc > (size_t)limit/2 ? (size_t)limit : nc*2;
     void* p = ray_realloc_raw(*buf, nc);
     if (!p) return false;
     *buf = p; *cap = nc; return true;
 }
 /* One reconstructed DBA value copied into that arena. */
 static const char* pq_sym_arena_put(pq_column* c, const uint8_t* p, uint32_t len, size_t* off) {
-    if ((uint64_t)c->sym_arena_len + len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
-    if (!pq_reserve_arena(&c->sym_arena,&c->sym_arena_cap,c->sym_arena_len + len)) return "symbol scratch allocation failed";
+    uint64_t limit = c->arena_limit ? c->arena_limit : PQ_POOL_MAX;
+    if ((uint64_t)c->sym_arena_len + len > limit) return "delta byte array expansion exceeds the memory budget";
+    if (!pq_reserve_arena(&c->sym_arena,&c->sym_arena_cap,limit,c->sym_arena_len + len)) return "symbol scratch allocation failed";
     *off = c->sym_arena_len;
     if (len) memcpy(c->sym_arena + c->sym_arena_len,p,len);
     c->sym_arena_len += len;
@@ -710,6 +735,15 @@ static const char* pq_sym_arena_put(pq_column* c, const uint8_t* p, uint32_t len
 static pq_symbol_scratch* pq_symbols(pq_column* c) {
     if (!c->symbols) c->symbols = ray_alloc_raw(sizeof(*c->symbols));
     return c->symbols;
+}
+/* A cursor's budget-derived state, set when the reader (or a forked reader)
+ * is created: the DELTA_BYTE_ARRAY arena's ceiling, and in debug builds the
+ * PQ_DEF_STRICT override - read once per reader, not at every page end. */
+static void pq_cursor_budget(pq_column* c) {
+    c->arena_limit = pq_arena_limit();
+#if defined(DEBUG)
+    c->def_strict = getenv("PQ_DEF_STRICT") != NULL;
+#endif
 }
 typedef struct { int64_t lo, hi; } pq_interval;
 struct ray_parquet {
@@ -912,6 +946,7 @@ ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ra
     r->selected = ray_alloc_raw((size_t)r->ncols*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->ncols*sizeof(*r->cursors));
     if (!r->selected || !r->cursors) goto fail;
+    for (int64_t i = 0; i < r->ncols; i++) pq_cursor_budget(&r->cursors[i]);
     err = "unknown or duplicate projection column";
     for (int64_t i = 0; i < r->nselected; i++) {
         ray_t* cs = columns ? ray_sym_vec_cell(columns,i) : NULL;
@@ -2081,6 +2116,7 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
     if (!r->selected || !r->cursors) { ray_parquet_close(r); return NULL; }
+    for (int64_t i = 0; i < r->nselected; i++) pq_cursor_budget(&r->cursors[i]);
     memcpy(r->selected,parent->selected,(size_t)r->nselected*sizeof(*r->selected));
     return r;
 }
@@ -2756,31 +2792,6 @@ static int pq_value_pages(pq_span stats) {
     return any;
 }
 #if defined(DEBUG)
-/* The value encoding named by a column chunk's `encodings` list
- * (ColumnMetaData field 2, required list<Encoding>, element type I32): the
- * first code that is not a PLAIN, dictionary or level encoding. -1 when it
- * cannot be read. The import-decision seam reports it; page headers are
- * parsed later, so the footer's list is what the decision point can see. */
-static int64_t pq_chunk_value_encoding(ray_parquet_t* r, int64_t c) {
-    pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
-    int64_t rows = 0, enc = -1;
-    if (cols && r->ngroups > 0 && c >= 0 && c < r->ncols && pq_group_columns(r,0,cols,&rows,NULL)) {
-        pq_span mf[17];
-        if (pq_fields(cols[c],mf,17) && mf[2].type == 9) {
-            pq_cur p = {mf[2].p,mf[2].end,false}; uint8_t et;
-            uint64_t n = pq_list(&p,&et);
-            if (!p.bad && et == 5) for (uint64_t i = 0; i < n && !p.bad; i++) {
-                int64_t e = pq_int(&p);
-                /* 0 PLAIN, 2 PLAIN_DICTIONARY, 3 RLE, 4 BIT_PACKED (a
-                 * deprecated level encoding) and 8 RLE_DICTIONARY say
-                 * nothing about the value encoding. */
-                if (e != 0 && e != 2 && e != 3 && e != 4 && e != 8) { enc = e; break; }
-            }
-        }
-    }
-    ray_free_raw(cols);
-    return enc;
-}
 /* Test seam: the import decision's chosen mode, and per column the value
  * encoding its chunk metadata names and whether the column went grouped.
  * Filled where the mode is final (before any pass); debug builds only. */
@@ -2794,28 +2805,71 @@ void ray_parquet_test_import_seam(int64_t col, int64_t* mode, int64_t* encoding,
     *mode = g_imp_probe[col].mode; *encoding = g_imp_probe[col].encoding; *grouped = g_imp_probe[col].grouped;
 }
 #endif
-/* Whether any row group's chunk for column c names value encoding `code` in
- * its required `encodings` list (ColumnMetaData field 2). The import decision
- * uses it for DELTA_BYTE_ARRAY, whose prefix expansion breaks the direct
- * import's vocabulary bound. */
-static bool pq_chunk_names(ray_parquet_t* r, int64_t c, int64_t code) {
+/* A column chunk's `encodings` list (ColumnMetaData field 2, required
+ * list<Encoding>, element type I32). */
+static bool pq_meta_encodings(pq_span meta, pq_cur* p, uint64_t* n) {
+    pq_span mf[17];
+    if (!pq_fields(meta,mf,17) || mf[2].type != 9) return false;
+    *p = (pq_cur){mf[2].p,mf[2].end,false};
+    uint8_t et;
+    *n = pq_list(p,&et);
+    return !p->bad && et == 5;
+}
+/* Whether the chunk names value encoding `code` in that list. */
+static bool pq_meta_names(pq_span meta, int64_t code) {
+    pq_cur p; uint64_t n;
+    if (!pq_meta_encodings(meta,&p,&n)) return false;
+    for (uint64_t i = 0; i < n && !p.bad; i++)
+        if (pq_int(&p) == code) return true;
+    return false;
+}
+/* The value encoding named by the chunk's `encodings` list: the first code
+ * that is not a PLAIN, dictionary or level encoding. -1 when it cannot be
+ * read. Page headers are parsed later, so the footer's list is what the
+ * import-decision seam can see. */
+static int64_t pq_meta_value_encoding(pq_span meta) {
+    pq_cur p; uint64_t n;
+    if (!pq_meta_encodings(meta,&p,&n)) return -1;
+    for (uint64_t i = 0; i < n && !p.bad; i++) {
+        int64_t e = pq_int(&p);
+        /* 0 PLAIN, 2 PLAIN_DICTIONARY, 3 RLE, 4 BIT_PACKED (a deprecated
+         * level encoding) and 8 RLE_DICTIONARY say nothing about the value
+         * encoding. */
+        if (e != 0 && e != 2 && e != 3 && e != 4 && e != 8) return e;
+    }
+    return -1;
+}
+/* Which of the symbol columns order[from, to) have a row group whose chunk
+ * names value encoding `code` in its required `encodings` list: in `found`,
+ * one flag per schema column. The import decision uses it for
+ * DELTA_BYTE_ARRAY, whose prefix expansion breaks the direct import's
+ * vocabulary bound. ONE pass over the row groups: each group's column chunk
+ * metadata is parsed once (pq_group_columns) and every column still to decide
+ * reads its own encodings list from that array, so the cost is
+ * O(row groups x cols) rather than O(symbol cols x row groups x cols).
+ * `enc0`, when asked for, receives every column's value encoding from row
+ * group 0 - the debug seam's per-column report, computed here so it does not
+ * re-parse the group per column. Zero-row groups are groups the decoder
+ * leaves out; their chunks do not decide the mode. */
+static void pq_chunk_names(ray_parquet_t* r, const int64_t* order, int64_t from, int64_t to,
+                           int64_t code, uint8_t* found, int64_t* enc0) {
     pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
-    bool found = false;
-    if (!cols) return false;
-    for (int64_t g = 0; g < r->ngroups && !found; g++) {
+    if (!cols) return;
+    int64_t left = 0;
+    for (int64_t i = from; i < to; i++) if (!found[order[i]]) left++;
+    for (int64_t g = 0; g < r->ngroups && left; g++) {
         int64_t rows = 0;
         if (!pq_group_columns(r,g,cols,&rows,NULL)) break;
+        if (!g && enc0)
+            for (int64_t c = 0; c < r->ncols; c++) enc0[c] = pq_meta_value_encoding(cols[c]);
         if (rows == 0) continue;
-        pq_span mf[17];
-        if (!pq_fields(cols[c],mf,17) || mf[2].type != 9) continue;
-        pq_cur p = {mf[2].p,mf[2].end,false}; uint8_t et;
-        uint64_t n = pq_list(&p,&et);
-        if (p.bad || et != 5) continue;
-        for (uint64_t i = 0; i < n && !p.bad; i++)
-            if (pq_int(&p) == code) { found = true; break; }
+        for (int64_t i = from; i < to && left; i++) {
+            int64_t c = order[i];
+            if (found[c] || !pq_meta_names(cols[c],code)) continue;
+            found[c] = 1; left--;
+        }
     }
     ray_free_raw(cols);
-    return found;
 }
 /* Sums and products of a footer's sizes, which are the file's word: never
  * negative, saturating at INT64_MAX instead of wrapping. */
@@ -4132,6 +4186,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     uint8_t* donly = ray_calloc_raw((size_t)r->ncols);   /* pq_vocab_bounds */
     uint8_t* pick = ray_calloc_raw((size_t)r->ncols);    /* the direct ones of a grouped import */
     uint8_t* dba = NULL;   /* [ncols] chunks name DELTA_BYTE_ARRAY */
+    int64_t* enc0 = NULL;   /* debug builds: every column's row-group-0 value encoding */
     int64_t* order = ray_alloc_raw((size_t)r->ncols*sizeof(*order));
     _Atomic uint8_t* prefetched = NULL;
     pq_column* spare = NULL;   /* pq_direct_work.spare */
@@ -4312,9 +4367,12 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * columns go grouped because they have no dictionary to seed. */
     bool force_grouped = false;
     dba = ray_calloc_raw((size_t)r->ncols);
-    if (simp && dba) for (int64_t i = nnum; i < r->ncols; i++) {
-        int64_t c = order[i];
-        if (pq_chunk_names(r,c,7)) { dba[c] = 1; force_grouped = true; }
+#if defined(DEBUG)
+    if (simp && dba) enc0 = ray_calloc_raw((size_t)r->ncols*sizeof(*enc0));
+#endif
+    if (simp && dba) {
+        pq_chunk_names(r,order,nnum,r->ncols,7,dba,enc0);
+        for (int64_t i = nnum; i < r->ncols; i++) if (dba[order[i]]) force_grouped = true;
     }
     if (simp && !dba) { err = ray_error("oom",NULL); goto done; }
     int64_t nd = r->ncols;   /* order[nnum, nd): direct symbol columns, [nd, ncols): grouped */
@@ -4402,7 +4460,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
     if (simp) {
         for (int64_t i = 0; i < r->ncols && i < PQ_MAX_COLS; i++) {
             g_imp_probe[i].mode = (int64_t)mode;
-            g_imp_probe[i].encoding = pq_chunk_value_encoding(r,i);
+            g_imp_probe[i].encoding = enc0 ? enc0[i] : -1;
             g_imp_probe[i].grouped = -1;
         }
         /* a symbol column reports the path it took, which a forced-grouped
@@ -4692,7 +4750,7 @@ done:
     ray_free_raw(wbf);
     for (int64_t c = 0; c < r->ncols; c++) r->schema[c].import_domain = NULL;
     ray_free_raw(offsets); ray_free_raw(nulls); ray_free_raw(locks); ray_free_raw(errors);
-    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order); ray_free_raw(dba);
+    ray_free_raw(lo); ray_free_raw(hi); ray_free_raw(bytes); ray_free_raw(vocab); ray_free_raw(donly); ray_free_raw(pick); ray_free_raw(order); ray_free_raw(dba); ray_free_raw(enc0);
     if (prefetched) ray_free_raw((void*)prefetched);
     for (int64_t i = 0; i < nspare; i++) {
         ray_free_raw(spare[i].page); ray_free_raw(spare[i].dict); ray_free_raw(spare[i].symbols);
