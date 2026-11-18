@@ -6629,6 +6629,57 @@ static test_result_t test_pq_delta_def_strict(void) {
     PASS();
 }
 #endif
+/* The DuckDB writer over-declares the final bit-packed run of its hybrid
+ * streams, so a file whose created_by names DuckDB loads through the
+ * tolerance while the same bytes under another writer's name keep the strict
+ * rule. Copies src to dst with created_by's first six bytes replaced by `tag`
+ * (six bytes). */
+static bool pq_copy_with_created_by(const char* src, const char* dst, const char* tag) {
+    FILE* in = fopen(src, "rb");
+    if (!in || strlen(tag) != 6) { if (in) fclose(in); return false; }
+    bool ok = !fseek(in, 0, SEEK_END);
+    long n = ok ? ftell(in) : -1;
+    ok = ok && n > 0 && !fseek(in, 0, SEEK_SET);
+    uint8_t* buf = ok ? (uint8_t*)ray_sys_alloc((size_t)n) : NULL;
+    ok = buf && fread(buf, 1, (size_t)n, in) == (size_t)n;
+    fclose(in);
+    size_t at = (size_t)-1;
+    for (long i = 0; ok && i + 6 <= n; i++)
+        if (!memcmp(buf + i, "DuckDB", 6)) {
+            if (at != (size_t)-1) { ok = false; break; }   /* one writer name only */
+            at = (size_t)i;
+        }
+    ok = ok && at != (size_t)-1;
+    if (ok) {
+        memcpy(buf + at, tag, 6);
+        FILE* out = fopen(dst, "wb");
+        ok = out && fwrite(buf, 1, (size_t)n, out) == (size_t)n;
+        if (out && fclose(out)) ok = false;
+    }
+    ray_sys_free(buf);
+    return ok;
+}
+/* The tolerance covers the dictionary-id stream, not only the definition
+ * levels: duckdb-v2-mixed's id stream over-declares its final bit-packed run,
+ * and this copy changes nothing but created_by. */
+static test_result_t test_pq_duckdb_dict_tolerance(void) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-duckdb-ids-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_copy_with_created_by(DELTA_FIX "duckdb-v2-mixed.parquet", path, "duckdb"));
+    ray_error_clear();
+    ray_t* e = ray_parquet_read(path, NULL);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_err_code(e) && !strcmp(ray_err_code(e), "parquet"));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "excess dictionary indices (column name)"));
+    ray_error_free(e);
+    ray_error_clear();
+    ray_t* t = ray_parquet_read(DELTA_FIX "duckdb-v2-mixed.parquet", NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 21000);
+    ray_release(t);
+    unlink(path);
+    PASS();
+}
 /* The symbol import's decision for a DELTA string column: DELTA_BYTE_ARRAY is
  * grouped regardless of the forced mode; DELTA_LENGTH_BYTE_ARRAY takes either. */
 static test_result_t test_pq_delta_symbol_import(void) {
@@ -7279,6 +7330,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
     {"parquet/delta_arena_bound",test_pq_delta_arena_bound,pq_setup,pq_teardown},
     {"parquet/delta_arena_floor",test_pq_delta_arena_floor,pq_setup,pq_teardown},
+    {"parquet/duckdb_dict_tolerance",test_pq_duckdb_dict_tolerance,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
