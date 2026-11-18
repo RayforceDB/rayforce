@@ -316,6 +316,14 @@ Version 4 extends an error payload from its eight-byte category field to
 3 error records remain readable as category-only errors so persisted objects
 and journals survive the upgrade.
 
+The compatibility is one way. Journals, `.qdb` snapshots and serialized
+objects written by a version 4 binary cannot be read by a version 3 binary,
+and v3 and v4 peers refuse each other at the handshake. Upgrade every
+process that talks to another at the same time, and do not roll back to a
+version 3 binary after it has written a log or snapshot: archive them first.
+A version 3 binary that reads a version 4 journal reports a bad tail and
+suggests truncating it; the log is not damaged, so do not truncate it.
+
 A receiver admits a positive wire body of at most 256 MiB. The decoded
 serialized body is also limited to 256 MiB: compression does not raise this
 limit. An oversized response is replaced with an `io` error rather than a
