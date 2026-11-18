@@ -1124,7 +1124,10 @@ static test_result_t test_ipc_poll_auth_creds_path(void) {
     ray_poll_t* poll = ray_poll_create();
     TEST_ASSERT_NOT_NULL(poll);
 
-    strcpy(poll->auth_secret, "pollpass");
+    ray_poll_auth_set(poll, "pollpass", true);
+    TEST_ASSERT_TRUE(ray_poll_auth_restricted(poll));
+    TEST_ASSERT_TRUE(ray_poll_auth_check(poll, (const uint8_t*)"user:pollpass", 13));
+    TEST_ASSERT_FALSE(ray_poll_auth_check(poll, (const uint8_t*)"user:wrong", 10));
 
     int64_t listener_id = ray_ipc_listen(poll, 0);
     TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
@@ -1162,7 +1165,11 @@ static test_result_t test_ipc_poll_auth_reject(void) {
     ray_poll_t* poll = ray_poll_create();
     TEST_ASSERT_NOT_NULL(poll);
 
-    strcpy(poll->auth_secret, "secret");
+    ray_poll_auth_set(poll, "secret", false);
+    TEST_ASSERT_FALSE(ray_poll_auth_check(poll, (const uint8_t*)"", 0));
+    TEST_ASSERT_FALSE(ray_poll_auth_check(poll, (const uint8_t*)"user:", 5));
+    TEST_ASSERT_TRUE(ray_poll_auth_check(poll, (const uint8_t*)"secret", 6));
+    TEST_ASSERT_TRUE(ray_poll_auth_check(poll, (const uint8_t*)":secret", 7));
 
     int64_t listener_id = ray_ipc_listen(poll, 0);
     TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
