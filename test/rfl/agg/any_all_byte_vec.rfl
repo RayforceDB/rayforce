@@ -1,0 +1,43 @@
+;; any_all_byte_vec.rfl — `any` / `all` over B8 and U8 vectors (#1190).
+;;
+;; A byte vector holds no null, so these read eight bytes at a time and stop at
+;; the first word that decides.  The deciding byte is placed on every lane of a
+;; word, in the tail that is not a whole word, across the 65,536-byte block
+;; the interrupt is polled on, and at both ends.
+
+(set N 200000)
+(set Z (> (til N) N))                          ;; all false
+(set T (> (til N) -1))                         ;; all true
+(any Z) -- false
+(all Z) -- false
+(any T) -- true
+(all T) -- true
+
+;; one true among falses, at every lane of a word and around the block edges
+(set P [0 1 2 3 4 5 6 7 8 63999 65535 65536 65537 131071 131072 199992 199999])
+(count (where (map (fn [k] (do (let v (+ Z 0)) (alter 'v set k true) (any v))) P))) -- 17
+;; one false among trues
+(count (where (map (fn [k] (do (let v (+ T 0)) (alter 'v set k false) (all v))) P))) -- 0
+(count (where (map (fn [k] (do (let v (+ T 0)) (alter 'v set k false) (any v))) P))) -- 17
+
+;; U8: any non-zero byte is truthy, whatever its value
+(any (as 'U8 (take [0] N))) -- false
+(all (as 'U8 (take [1 2 255] N))) -- true
+(all (as 'U8 (take [1 2 0] N))) -- false
+(any (as 'U8 (take [0 0 128] N))) -- true
+
+;; short vectors (no whole word), empty vectors
+(any [false false false]) -- false
+(any [false false true]) -- true
+(all [true true false]) -- false
+(all [true true true]) -- true
+(any (as 'B8 [])) -- false
+(all (as 'B8 [])) -- true
+
+;; a slice
+(set V (+ Z 0))
+(alter 'V set 100 true)
+(any (drop V 101)) -- false
+(any (drop V 100)) -- true
+(any (take V 100)) -- false
+(all (drop (+ T 0) 3)) -- true

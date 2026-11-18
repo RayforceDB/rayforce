@@ -286,8 +286,8 @@ captured_x -- 77
 ;; Construct the lambda only — calling it isn't required to hit the
 ;; ray_fn walk branch we want.
 (set fn_param_mixed (fn (list a 5) 99))
-;; ray_type_name has no LAMBDA case → returns '?
-(type fn_param_mixed) -- '?
+;; ray_type_name names the LAMBDA kind (it returned '? before #1194)
+(type fn_param_mixed) -- 'LAMBDA
 ;; The lambda is well-formed: 3 "params" (list, a, 5) → call with 3 args
 ;; returns the body value 99.
 (fn_param_mixed 'list 1 2) -- 99

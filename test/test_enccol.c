@@ -45,7 +45,10 @@
 #include "lang/eval.h"
 #include "ops/colgather.h"     /* ray_col_gather_span */
 #include "ops/cdfuse.h"        /* ray_cd_bounded, ray_cd_bounded_all */
+#include "core/platform.h"
+#include "core/pool.h"
 #include <math.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1390,6 +1393,108 @@ static test_result_t test_point_read_column(void) {
     PASS();
 }
 
+/* RAW vectors are point-read in place: full-range values (negatives for
+ * the narrow kinds) come back widened as the source holds them. */
+static test_result_t test_point_raw(void) {
+    static const int8_t types[3] = { RAY_I64, RAY_I32, RAY_I16 };
+    const int64_t n = 140000;
+    g_seed = 0x9e3779b97f4a7c15ull;
+    for (int t = 0; t < 3; t++) {
+        ray_t* v = ray_vec_new(types[t], n); v->len = n;
+        for (int64_t i = 0; i < n; i++) {
+            uint64_t x = rng();
+            if (types[t] == RAY_I64) { int64_t y = (int64_t)x; if (y == NULL_I64) y = 1; ((int64_t*)ray_data(v))[i] = y; }
+            else if (types[t] == RAY_I32) { int32_t y = (int32_t)(uint32_t)(x >> 32); if (y == NULL_I32) y = 1; ((int32_t*)ray_data(v))[i] = y; }
+            else { int16_t y = (int16_t)x; if (y == NULL_I16) y = 1; ((int16_t*)ray_data(v))[i] = y; }
+        }
+        const char* path = ray_test_tmp(ENCCOL_TMP "/praw");
+        TEST_ASSERT_EQ_I(ray_col_save_gen(v, path, 2), RAY_OK);
+        ray_t* c = ray_col_mmap(path);
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+        ray_enccol_t* e = ray_enccol_of(c);
+        TEST_ASSERT_NOT_NULL(e);
+        int64_t raw_rows = 0;
+        for (int64_t at = 0; at < n; at += RAY_ENC_VEC)
+            raw_rows += ray_enccol_descs(e, at / RAY_ENC_CHUNK)[at % RAY_ENC_CHUNK / RAY_ENC_VEC].encoding == RAY_ENC_RAW;
+        TEST_ASSERT_FMT(raw_rows > 0, "type %d: no RAW vector", types[t]);
+        ray_t* m = ray_enccol_materialize(c);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && m->len == n);
+        int64_t served = 0;
+        for (int64_t r = 0; r < n; r += 7) {
+            const bool is_raw = ray_enccol_descs(e, r / RAY_ENC_CHUNK)[r % RAY_ENC_CHUNK / RAY_ENC_VEC].encoding == RAY_ENC_RAW;
+            int64_t x = 0; ray_t* err = NULL;
+            int pr = ray_enccol_point_i64(e, r, &x, &err);
+            TEST_ASSERT_FMT(pr >= 0 && !err, "type %d row %lld: %d", types[t], (long long)r, pr);
+            if (is_raw) TEST_ASSERT_FMT(pr == 1, "type %d row %lld: RAW declined", types[t], (long long)r);
+            if (pr == 1) {
+                served += is_raw;
+                TEST_ASSERT_FMT(x == gen0_at(types[t], ray_data(m), (int)r), "type %d row %lld", types[t], (long long)r);
+                TEST_ASSERT_FMT(x == gen0_at(types[t], ray_data(v), (int)r), "type %d row %lld vs source", types[t], (long long)r);
+            }
+        }
+        TEST_ASSERT_TRUE(served > 0);
+        ray_release(m); ray_release(c); ray_release(v);
+    }
+    PASS();
+}
+
+/* Asking ahead for strided point reads of an evicted column adds to the
+ * bytes asked for; once the column is read in, asking again adds none;
+ * the values do not change. */
+static test_result_t test_want_points(void) {
+    const int64_t n = 300000;
+    ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
+    g_seed = 0x2545f4914f6cdd1dull;
+    for (int64_t i = 0; i < n; i++) { int64_t y = (int64_t)rng(); if (y == NULL_I64) y = 1; ((int64_t*)ray_data(v))[i] = y; }
+    const char* path = ray_test_tmp(ENCCOL_TMP "/wpts");
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, path, 2), RAY_OK);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        fsync(fd);
+#if defined(__linux__)
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+        close(fd);
+    }
+    ray_t* c = ray_col_mmap(path);
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    ray_enccol_t* e = ray_enccol_of(c);
+    TEST_ASSERT_NOT_NULL(e);
+    enum { NR = 64 };
+    int64_t rows[NR];
+    for (int q = 0; q < NR; q++) rows[q] = (int64_t)q * (n / NR) + 5;
+    bool cold = false;
+#if defined(__linux__)
+    {   /* the helper's own admission: it asks ahead unless the first, middle and last
+         * rows' descriptors and bodies are all in memory, so a descriptor of those
+         * rows absent from memory is a witness that cannot fail on pages elsewhere */
+        const int64_t probe[3] = { rows[0], rows[NR / 2], rows[NR - 1] };
+        for (int q = 0; q < 3; q++) {
+            const ray_enc_desc_t* d = &ray_enccol_descs(e, probe[q] / RAY_ENC_CHUNK)[probe[q] % RAY_ENC_CHUNK / RAY_ENC_VEC];
+            if (!ray_vm_resident(d, sizeof *d)) cold = true;
+        }
+        cold = cold && ray_pool_scan_on();
+    }
+#endif
+    uint64_t b0 = ray_vm_willneed_bytes();
+    ray_enccol_want_points(e, rows, NR, 0);
+    if (cold) TEST_ASSERT_TRUE(ray_vm_willneed_bytes() > b0);
+    for (int q = 0; q < NR; q++) {
+        int64_t x = 0; ray_t* err = NULL;
+        int pr = ray_enccol_point_i64(e, rows[q], &x, &err);
+        TEST_ASSERT_TRUE(pr >= 0 && !err);
+        if (pr == 1) TEST_ASSERT_EQ_I(x, ((int64_t*)ray_data(v))[rows[q]]);
+    }
+    ray_t* m = ray_enccol_materialize(c);
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m) && m->len == n);
+    TEST_ASSERT_TRUE(memcmp(ray_data(m), ray_data(v), (size_t)n * 8) == 0);
+    b0 = ray_vm_willneed_bytes();
+    ray_enccol_want_points(e, rows, NR, 0);
+    TEST_ASSERT_TRUE(ray_vm_willneed_bytes() == b0);
+    ray_release(m); ray_release(c); ray_release(v);
+    PASS();
+}
+
 /* The scratch references the column it counts for: freeing it after its
  * source and column are released is safe and still counts (ASan). */
 static test_result_t test_scratch_outlives_source(void) {
@@ -2476,6 +2581,8 @@ const test_entry_t enccol_entries[] = {
     { "enccol/decode_kept_budget",    test_decode_kept_budget,    enccol_setup, enccol_teardown },
     { "enccol/gather_span_bounded_read_window", test_gather_span_bounded_read_window, enccol_setup, enccol_teardown },
     { "enccol/cache_trim_at_boundary", test_cache_trim_at_boundary, enccol_setup, enccol_teardown },
+    { "enccol/point_raw",           test_point_raw,           enccol_setup, enccol_teardown },
+    { "enccol/want_points",         test_want_points,         enccol_setup, enccol_teardown },
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },
     { "enccol/load_version",        test_load_version,        enccol_setup, enccol_teardown },
     { "enccol/sym_requires_domain", test_sym_requires_domain, enccol_setup, enccol_teardown },

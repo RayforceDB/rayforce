@@ -80,6 +80,7 @@ void     ray_cancel_reset(void);
 #define RAY_MC_SYM    0   /* opaque partition key strings */
 #define RAY_MC_DATE   1   /* YYYY.MM.DD partition directories */
 #define RAY_MC_I64    2   /* pure integer partition keys */
+#define RAY_MC_TIMESTAMP 3 /* YYYY.MM.DD.HH.MM.SS partition directories */
 
 #define RAY_IS_PARTED(t)       ((t) >= RAY_PARTED_BASE && (t) < RAY_MAPCOMMON)
 #define RAY_PARTED_BASETYPE(t) ((t) - RAY_PARTED_BASE)
@@ -583,11 +584,10 @@ typedef struct ray_graph {
     const uint32_t* sel_alias_ids;
     int             sel_alias_n;
 
-    /* Set by compile_expr_dag when it declines an expression that can
-     * only fail (arithmetic on a symbol column).  A caller with an
-     * evaluation fallback ignores it — the evaluator raises the same
-     * error; one without reports it instead of a generic compile
-     * failure.  Owned; released by ray_graph_free. */
+    /* First known lowering failure: semantic error or allocation/limit
+     * failure. Unsupported syntax alone leaves this NULL. Owned; released
+     * by ray_graph_free unless detached by the caller. A returned node does
+     * not clear it; classification probes must report it before routing. */
     ray_t*          compile_err;
 
     /* > 0 while compile_expr_dag is inside a branch of `if`/`cond`.  The
@@ -1014,6 +1014,21 @@ ray_t* ray_query_helper_table(void);
 /* Owned: the source column `sym` names, or its cell during a per-row
  * evaluation; NULL when it names none. */
 ray_t* ray_query_helper_value(int64_t sym);
+/* The evaluation state of the query in progress on this thread.  Suspend
+ * saves and clears it, so code run until the matching resume evaluates as
+ * outside any query (no columns, no literal rule, no helper frames); a
+ * query it runs itself sets and restores its own state as usual. */
+typedef struct {
+    ray_t*  table;
+    ray_t*  source;
+    ray_t*  group_idx;
+    int64_t row;
+    ray_t*  row_tbl;
+    int32_t row_depth;
+    void*   dependencies;
+} ray_query_state_t;
+void ray_query_suspend(ray_query_state_t* saved);
+void ray_query_resume(const ray_query_state_t* saved);
 /* A builtin the planner lowers row by row: its result over a column-derived
  * operand is itself column-derived. */
 bool ray_query_rowwise_builtin(int64_t sym_id);

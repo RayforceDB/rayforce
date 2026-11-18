@@ -147,6 +147,10 @@ ray_err_t ray_journal_roll(void);
  * old (now archived) log. */
 ray_err_t ray_journal_snapshot(void);
 
+/* Where the next frame will be appended: the live log's generation and
+ * byte offset.  False when nothing would be written. */
+bool ray_journal_position(int64_t* gen, int64_t* off);
+
 /* Force fflush + fsync on the active journal.  No-op (RAY_OK) when no
  * journal is open or when in RAY_JOURNAL_SYNC mode (where every write
  * already syncs). */

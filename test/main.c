@@ -36,6 +36,7 @@
 #include "test.h"
 #include "ops/agg_engine.h"   /* --census: agg_route_stats */
 #include "core/pool.h"         /* ray_pool_test_ring_fail */
+#include "core/platform.h"     /* ray_file_writeback_test_hold */
 #include "mem/heap.h"          /* ray_alloc_fail_set_for_test */
 #include "test_rfl.h"
 
@@ -55,6 +56,7 @@
 #include "store/fileio.h"   /* ray_mkdir_p — ray_test_mkdir_p */
 #include "store/col.h"      /* ray_store_test_force_compress — equivalence pass */
 #include "store/enccol.h"   /* ray_test_hooks_off */
+#include "table/domain.h"   /* ray_sym_domain_test_hook */
 #include "mem/heap.h"       /* ray_heap_test_scribble */
 #include "store/encw.h"
 #include "ops/colbind.h"
@@ -956,9 +958,14 @@ void ray_test_hooks_off(void) {
     ray_group_test_fail_scalar_alloc(0);
     ray_group_test_scalar_grain(0);
     ray_in_guid_test_fail_alloc(0);
+    ray_distinct_guid_test_fail_alloc(0);
+    ray_distinct_guid_test_table_cap(0);
     ray_pool_test_ring_fail(0);
     ray_pool_test_cancel_at(0, false);
     ray_heap_test_scribble(false);
+    ray_file_writeback_test_hold(false);
+    ray_file_writeback_test_fail(false);
+    ray_sym_domain_test_hook(NULL);
     ray_alloc_fail_set_for_test(0, 0);
     agg_test_force_smallhash(false);
     agg_test_no_wide_dense(false);

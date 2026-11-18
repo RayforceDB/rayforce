@@ -31,10 +31,12 @@
 #include "store/part.h"
 #include "store/splay.h"
 #include "store/enccol.h"
+#include "store/encfmt.h"
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -159,6 +161,106 @@ static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
+/* ---- Group classifier owned-error versus unsupported fallback ---- */
+static void group_probe_test_dispose(ray_t* value) {
+    if (value && RAY_IS_ERR(value)) ray_error_free(value);
+    else if (value) ray_release(value);
+}
+
+static bool group_probe_test_i64s(ray_t* value, const int64_t* expected, int64_t n) {
+    return value && !RAY_IS_ERR(value) && value->type == RAY_I64 &&
+           ray_len(value) == n &&
+           memcmp(ray_data(value), expected, (size_t)n * sizeof(int64_t)) == 0;
+}
+
+static bool group_probe_test_compound_values(ray_t* value) {
+    const int64_t c[] = {330}, s[] = {120};
+    return value && !RAY_IS_ERR(value) && value->type == RAY_TABLE &&
+           ray_table_ncols(value) == 3 && ray_table_nrows(value) == 1 &&
+           group_probe_test_i64s(ray_table_get_col_idx(value, 1), c, 1) &&
+           group_probe_test_i64s(ray_table_get_col_idx(value, 2), s, 1);
+}
+
+static test_result_t test_query_group_classifier_owned_oom(void) {
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    ray_t* value = ray_eval_str(
+        "(set _giT (table [g x a b] (list [7 7] [-1 1] [10 20] [100 200])))");
+    bool setup_ok = value && !RAY_IS_ERR(value);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(setup_ok, "group classifier input setup");
+
+    /* c is decomposed before s is classified, so both owned-error exits
+     * must release an already-created compound rewrite. */
+    const char* query = "(select {from:_giT by:g c:(+ (sum a) (sum b))"
+                        " s:(sum (if (> x 0) a b))})";
+    value = ray_eval_str(query);
+    bool healthy = group_probe_test_compound_values(value);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    bool owned_oom[2], recovered[2];
+    for (int target = 1; target <= 2; target++) {
+        ray_group_dag_probe_fail_set_for_test(target);
+        value = ray_eval_str(query);
+        /* Always reset before inspecting/disposing or making assertions. */
+        ray_group_dag_probe_fail_set_for_test(0);
+        const char* code = value && RAY_IS_ERR(value) ? ray_err_code(value) : NULL;
+        owned_oom[target - 1] = code && strcmp(code, "oom") == 0;
+        group_probe_test_dispose(value);
+
+        value = ray_eval_str(query);
+        recovered[target - 1] = group_probe_test_compound_values(value);
+        group_probe_test_dispose(value);
+    }
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(healthy, "healthy grouped compound c=330 and SUM(IF)=120");
+#ifdef DEBUG
+    TEST_ASSERT(owned_oom[0], "first temporary lowering must return owned oom, not success 30");
+    TEST_ASSERT(owned_oom[1], "second temporary lowering must return owned oom, not success 30");
+    TEST_ASSERT(recovered[0] && recovered[1], "next grouped query works after each owned error");
+#endif
+    PASS();
+}
+
+static test_result_t test_query_group_classifier_membership_fallback(void) {
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    ray_t* value = ray_eval_str(
+        "(do (set _giU (table [g s] (list [1 1 2 2] ['a 'b 'a 'c])))"
+        " (set _giSet (list 'a 'b)))");
+    bool setup_ok = value && !RAY_IS_ERR(value);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(setup_ok, "unsupported membership input setup");
+
+    /* Global LIST membership genuinely declines DAG lowering.  It must
+     * still evaluate per group, and must see replacement of that LIST. */
+    const char* query = "(at (select {from:_giU by:g n:(sum (in s _giSet))}) 'n)";
+    const int64_t ab[] = {2, 1}, ac[] = {1, 2};
+    value = ray_eval_str(query);
+    bool first_ok = group_probe_test_i64s(value, ab, 2);
+    group_probe_test_dispose(value);
+    value = ray_eval_str("(set _giSet (list 'a 'c))");
+    bool replaced = value && !RAY_IS_ERR(value);
+    group_probe_test_dispose(value);
+    value = ray_eval_str(query);
+    bool second_ok = group_probe_test_i64s(value, ac, 2);
+    group_probe_test_dispose(value);
+#ifdef DEBUG
+    ray_group_dag_probe_fail_set_for_test(0);
+#endif
+    TEST_ASSERT(first_ok, "unsupported LIST membership fallback yields [2 1]");
+    TEST_ASSERT(replaced && second_ok, "fallback sees replaced global LIST and yields [1 2]");
+    PASS();
+}
 
 /* ---- Test: query helper row provenance survives a runtime re-init ----
  * The row-wise builtin tables and the per-object verdict cache behind the
@@ -1151,11 +1253,12 @@ static test_result_t test_eval_apply(void) {
     ray_t* result = ray_eval_str("(apply + [1 2] [3 4])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    /* the results are atoms of one type: a typed vector, as map's are */
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 2);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 4);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 6);
+    int64_t* elems = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(elems[0], 4);
+    TEST_ASSERT_EQ_I(elems[1], 6);
     ray_release(result);
     PASS();
 }
@@ -1270,6 +1373,119 @@ static test_result_t test_eval_in_guid_unflagged_nulls(void) {
     PASS();
 }
 
+/* ---- Test: guid `find` reads a zero cell's bytes, not the hint ----
+ * As for `in` (test_eval_in_guid_unflagged_nulls): a zero cell finds a zero
+ * cell whichever vector carries HAS_NULLS, with the table over either side,
+ * for one guid, and through a dict.  A hash index keys the zero guid like
+ * any other, so the same calls on an indexed vector give the same rows. */
+static test_result_t test_eval_find_guid_unflagged_nulls(void) {
+    static const uint8_t g1[16] = {1}, g2[16] = {2}, g3[16] = {3}, z[16] = {0};
+    uint8_t raw[32];
+    memcpy(raw, g1, 16);
+    memcpy(raw + 16, z, 16);
+    ray_t* f = ray_vec_from_raw(RAY_GUID, raw, 2);           /* g1 0, flagged */
+    ray_t* f1 = ray_vec_from_raw(RAY_GUID, z, 1);            /* 0, flagged */
+    ray_t* u = ray_vec_new(RAY_GUID, 3);                     /* g2 g3 0 */
+    u = ray_vec_append(u, g2);
+    u = ray_vec_append(u, g3);
+    u = ray_vec_append(u, z);
+    ray_t* u1 = ray_vec_append(ray_vec_new(RAY_GUID, 1), z); /* 0 */
+    TEST_ASSERT_TRUE(f && !RAY_IS_ERR(f) && f1 && !RAY_IS_ERR(f1));
+    TEST_ASSERT_TRUE(u && !RAY_IS_ERR(u) && u1 && !RAY_IS_ERR(u1));
+    TEST_ASSERT_TRUE((f->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((f1->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((u->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    TEST_ASSERT_TRUE((u1->attrs & RAY_ATTR_HAS_NULLS) == 0);
+    ray_env_set(ray_sym_intern("_gf", 3), f);
+    ray_env_set(ray_sym_intern("_gf1", 4), f1);
+    ray_env_set(ray_sym_intern("_gu", 3), u);
+    ray_env_set(ray_sym_intern("_gu1", 4), u1);
+
+    /* One zero cell each way round. */
+    ASSERT_EQ("(find _gf1 _gu1)", "[0]");
+    ASSERT_EQ("(find _gu1 _gf1)", "[0]");
+    /* As many needles as rows or more: the table over the haystack. */
+    ASSERT_EQ("(find _gf _gu)", "[0N 0N 1]");
+    ASSERT_EQ("(find _gu1 _gf)", "[0N 0]");
+    /* Fewer needles: the table over the needles. */
+    ASSERT_EQ("(find _gu _gf)", "[0N 2]");
+    ASSERT_EQ("(find _gf _gu1)", "[1]");
+    /* One guid. */
+    ASSERT_EQ("(find _gu 0Ng)", "2");
+    ASSERT_EQ("(find _gu (at _gf 1))", "2");
+    ASSERT_EQ("(find _gf (at _gu 2))", "1");
+    ASSERT_EQ("(find _gu1 (at _gf1 0))", "0");
+    /* An indexed haystack gives the same rows. */
+    ASSERT_EQ("(find (.idx.hash _gf1) _gu1)", "[0]");
+    ASSERT_EQ("(find (.idx.hash _gu1) _gf1)", "[0]");
+    ASSERT_EQ("(find (.idx.hash _gf) _gu)", "[0N 0N 1]");
+    ASSERT_EQ("(find (.idx.hash _gu) _gf)", "[0N 2]");
+    ASSERT_EQ("(find (.idx.hash _gu) 0Ng)", "2");
+    /* A dict keyed by the vector: one key, and a batch through find. */
+    ASSERT_EQ("(at (dict _gu [10 20 30]) 0Ng)", "30");
+    ASSERT_EQ("(at (dict _gu [10 20 30]) (at _gf 1))", "30");
+    ASSERT_EQ("(at (dict _gf [10 20]) (at _gu 2))", "20");
+    ASSERT_EQ("(at (dict _gu [10 20 30]) _gf)", "(list 0N 30)");
+    ASSERT_EQ("(at (dict _gf [10 20]) _gu)", "(list 0N 0N 20)");
+    ASSERT_EQ("(at (dict (.idx.hash _gu) [10 20 30]) _gf)", "(list 0N 30)");
+    ASSERT_EQ("(at (dict (.idx.hash _gu) [10 20 30]) 0Ng)", "30");
+    /* remove finds its key the same way. */
+    ASSERT_EQ("(count (remove (dict _gu [10 20 30]) 0Ng))", "2");
+
+    ray_release(f);
+    ray_release(f1);
+    ray_release(u);
+    ray_release(u1);
+    PASS();
+}
+
+/* ---- Test: a failed guid `find` scratch allocation answers "oom" ----
+ * find_guid does not fall back to the hashset either.  Fail the key table,
+ * then the first rows, with the table over the needles and over the
+ * haystack: each attempt returns "oom" and frees what it took, and the
+ * next call answers. */
+static test_result_t test_eval_find_guid_oom(void) {
+    ray_t* h = ray_eval_str("(set _gh (guid 64))");
+    ray_t* p = ray_eval_str("(set _gp (concat (at _gh [3 5]) (guid 1)))");
+    TEST_ASSERT_TRUE(h && !RAY_IS_ERR(h) && p && !RAY_IS_ERR(p));
+    struct { ray_t* vec; ray_t* val; int64_t nth; int64_t hits; } cases[] = {
+        { h, p, 1, 2 },   /* the key table, over the needles */
+        { h, p, 2, 2 },   /* the first rows, over the needles */
+        { p, h, 1, 2 },   /* the key table, over the haystack */
+        { p, h, 2, 2 },   /* the first rows, over the haystack */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* r = ray_find_fn(cases[c].vec, cases[c].val);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_error_clear();
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_in_guid_test_fail_alloc(cases[c].nth);
+        r = ray_find_fn(cases[c].vec, cases[c].val);
+        ray_in_guid_test_fail_alloc(0);
+        TEST_ASSERT_FMT(r && RAY_IS_ERR(r), "case %zu: no error", c);
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "oom");
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "case %zu: %zu bytes before, %zu after", c,
+                        m0.bytes_allocated, m1.bytes_allocated);
+        r = ray_find_fn(cases[c].vec, cases[c].val);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64);
+        TEST_ASSERT_EQ_I(r->len, cases[c].val->len);
+        int64_t hits = 0;
+        for (int64_t i = 0; i < r->len; i++)
+            hits += ((int64_t*)ray_data(r))[i] != NULL_I64;
+        TEST_ASSERT_EQ_I(hits, cases[c].hits);
+        ray_release(r);
+    }
+    ray_release(h);
+    ray_release(p);
+    PASS();
+}
+
 /* ---- Test: a failed guid `in` scratch allocation answers "oom" ----
  * in_guid does not fall back to the hashset, which reads the null hint
  * (test_eval_in_guid_unflagged_nulls).  Fail the key table on either side,
@@ -1314,6 +1530,279 @@ static test_result_t test_eval_in_guid_oom(void) {
     ray_release(h);
     ray_release(p);
     ray_release(g);
+    PASS();
+}
+
+/* Whether expressions a and b evaluate to the same guid vector, byte for
+ * byte. */
+static bool guid_vec_same(const char* a, const char* b) {
+    ray_t* x = ray_eval_str(a);
+    ray_t* y = ray_eval_str(b);
+    bool same = x && y && !RAY_IS_ERR(x) && !RAY_IS_ERR(y)
+             && x->type == RAY_GUID && y->type == RAY_GUID && x->len == y->len
+             && memcmp(ray_data(x), ray_data(y), (size_t)x->len * 16) == 0;
+    if (x) { if (RAY_IS_ERR(x)) ray_error_free(x); else ray_release(x); }
+    if (y) { if (RAY_IS_ERR(y)) ray_error_free(y); else ray_release(y); }
+    return same;
+}
+
+/* ---- Test: guid distinct's memory follows the column, not the workers ----
+ * Every repeat of a guid lands in that guid's partition, so a column of one
+ * value, or mostly of the zero guid, puts nearly every row in one
+ * partition.  A worker's table is capped by the mean partition, not that
+ * one: the kernel's peak, for the row ids and for the count, stays within
+ * four times the column whatever the worker count (16 bytes a row for the
+ * scatter, a byte for the marks, the workers' tables within the column's
+ * size, each block rounded up to a power of 2).  Sized by the longest
+ * partition, each worker's table took 32 bytes a row.  Lengths just under
+ * a power of 2 keep the scatter's blocks from rounding up. */
+static test_result_t test_eval_distinct_guid_skewed(void) {
+    struct { const char* set; int64_t len; int64_t nids; int64_t ids[5]; } cases[] = {
+        /* the zero guid but for four at the end */
+        { "(set _gk (concat (take [0Ng] 262076) (guid 4)))", 262080, 5,
+          { 0, 262076, 262077, 262078, 262079 } },
+        /* one guid throughout */
+        { "(set _gk (take (guid 1) 131008))", 131008, 1, { 0 } },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* v = ray_eval_str(cases[c].set);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->type == RAY_GUID);
+        TEST_ASSERT_EQ_I(v->len, cases[c].len);
+        uint64_t col = (uint64_t)v->len * 16;
+        ray_t* r = distinct_radix_first_ids(v);   /* warm up */
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = distinct_radix_first_ids(v);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64);
+        TEST_ASSERT_EQ_I(r->len, cases[c].nids);
+        for (int64_t i = 0; i < cases[c].nids; i++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[i], cases[c].ids[i]);
+        ray_release(r);
+        TEST_ASSERT_FMT(tr.peak_live_bytes <= 4 * col,
+                        "case %zu, row ids: peak %llu bytes, column %llu", c,
+                        (unsigned long long)tr.peak_live_bytes, (unsigned long long)col);
+
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = exec_count_distinct(NULL, NULL, v);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, cases[c].nids);
+        ray_release(r);
+        TEST_ASSERT_FMT(tr.peak_live_bytes <= 4 * col,
+                        "case %zu, count: peak %llu bytes, column %llu", c,
+                        (unsigned long long)tr.peak_live_bytes, (unsigned long long)col);
+        ray_release(v);
+    }
+    ray_t* g4 = ray_eval_str("(set _gd4 (guid 4))");
+    TEST_ASSERT_TRUE(g4 && !RAY_IS_ERR(g4));
+    bool nul = guid_vec_same("(distinct (concat (take [0Ng] 262076) _gd4))",
+                             "(concat [0Ng] _gd4)");
+    bool one = guid_vec_same("(distinct (take (at _gd4 [2]) 131008))", "(at _gd4 [2])");
+    ray_release(g4);
+    TEST_ASSERT_TRUE(nul);
+    TEST_ASSERT_TRUE(one);
+    PASS();
+}
+
+/* ---- Test: a partition past its worker's table grows a table of its own ----
+ * With a worker's table capped at 32 slots, every partition of 50000
+ * distinct guids, the zero guid, then the same 50000 again outgrows it and
+ * doubles a table of its own over and over.  The row ids, the count and
+ * distinct's answer are the uncapped kernel's. */
+static test_result_t test_eval_distinct_guid_table_growth(void) {
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 100001);
+    for (int capped = 0; capped < 2; capped++) {
+        ray_distinct_guid_test_table_cap(capped ? 32 : 0);
+        ray_t* ids = distinct_radix_first_ids(v);
+        ray_t* cnt = exec_count_distinct(NULL, NULL, v);
+        bool same = guid_vec_same("(distinct _gv)", "(concat _gd [0Ng])");
+        ray_distinct_guid_test_table_cap(0);
+        TEST_ASSERT_TRUE(ids && !RAY_IS_ERR(ids) && ids->type == RAY_I64);
+        TEST_ASSERT_EQ_I(ids->len, 50001);
+        int64_t off = -1;   /* the first id out of place */
+        for (int64_t i = 0; i < ids->len && off < 0; i++)
+            if (((int64_t*)ray_data(ids))[i] != i) off = i;
+        ray_release(ids);
+        TEST_ASSERT_FMT(off < 0, "capped %d: id %lld out of place", capped, (long long)off);
+        TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cnt->i64, 50001);
+        ray_release(cnt);
+        TEST_ASSERT_FMT(same, "capped %d: distinct differs", capped);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- Test: guid distinct short of memory declines to the hashset ----
+ * Fail each of the kernel's allocations in turn: its counts, the scatter's
+ * buffers, the marks, the workers' tables, and (the table capped at 32
+ * slots) a partition's own on a worker.  Each time the kernel frees what it
+ * took and declines, and distinct and its count still answer. */
+static test_result_t test_eval_distinct_guid_oom(void) {
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    ray_t* r = distinct_radix_first_ids(v);   /* warm up */
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    const int64_t nths[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 40 };
+    for (size_t c = 0; c < sizeof(nths) / sizeof(nths[0]); c++) {
+        long long nth = (long long)nths[c];
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        ray_distinct_guid_test_table_cap(32);
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        r = distinct_radix_first_ids(v);
+        ray_distinct_guid_test_fail_alloc(0);
+        ray_mem_trace_end(&tr);
+        bool declined = r == NULL;
+        if (r && !RAY_IS_ERR(r)) ray_release(r);
+        else if (r) ray_error_free(r);
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        bool same = guid_vec_same("(distinct _gv)", "(concat _gd [0Ng])");
+        ray_distinct_guid_test_fail_alloc(nths[c]);
+        ray_t* cnt = exec_count_distinct(NULL, NULL, v);
+        ray_distinct_guid_test_fail_alloc(0);
+        ray_distinct_guid_test_table_cap(0);
+        TEST_ASSERT_FMT(declined, "nth %lld: the kernel did not decline", nth);
+        TEST_ASSERT_FMT(tr.net_bytes == 0, "nth %lld: %lld bytes kept", nth,
+                        (long long)tr.net_bytes);
+        TEST_ASSERT_FMT(same, "nth %lld: distinct differs", nth);
+        TEST_ASSERT_TRUE(cnt && !RAY_IS_ERR(cnt) && cnt->type == -RAY_I64);
+        TEST_ASSERT_EQ_I(cnt->i64, 50001);
+        ray_release(cnt);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- Test: a cancelled guid distinct answers "cancel", never the hashset ----
+ * The kernel declines to the hashset when it is short of memory, but not
+ * when it is cancelled.  Cancel each of its three dispatches in turn (the
+ * histogram, the scatter, the partitions), by a cancel request and by the
+ * pool's flag alone: the row ids and the count each answer "cancel" and
+ * free what they took, and once cleared, each answers. */
+static test_result_t test_eval_distinct_guid_cancel(void) {
+    if (!ray_pool_get()) SKIP("no pool to dispatch to");
+    ray_t* d = ray_eval_str("(set _gd (guid 50000))");
+    ray_t* v = ray_eval_str("(set _gv (concat (concat _gd [0Ng]) _gd))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && v && !RAY_IS_ERR(v));
+    for (int count = 0; count < 2; count++) {
+        ray_t* r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));   /* warm up */
+        ray_release(r);
+        for (int pool_only = 0; pool_only < 2; pool_only++) {
+            for (uint32_t k = 1; k <= 3; k++) {
+                ray_mem_trace_t tr;
+                TEST_ASSERT_TRUE(ray_mem_trace_begin());
+                ray_pool_test_cancel_at(k, pool_only);
+                r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                bool is_cancel = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "cancel") == 0;
+                if (r && RAY_IS_ERR(r)) ray_error_free(r);
+                else if (r) ray_release(r);
+                ray_error_clear();
+                ray_mem_trace_end(&tr);
+                TEST_ASSERT_FMT(is_cancel, "%s, dispatch %u, pool flag %d: %s",
+                                count ? "count" : "row ids", k, pool_only,
+                                r ? "not cancel" : "declined");
+                TEST_ASSERT_FMT(tr.net_bytes == 0, "%s, dispatch %u: %lld bytes kept",
+                                count ? "count" : "row ids", k, (long long)tr.net_bytes);
+            }
+        }
+        r = count ? exec_count_distinct(NULL, NULL, v) : distinct_radix_first_ids(v);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(count ? r->i64 : r->len, 50001);
+        ray_release(r);
+    }
+    ray_release(d);
+    ray_release(v);
+    PASS();
+}
+
+/* The i64 atom an expression evaluates to, or INT64_MIN. */
+static int64_t rb_eval_i64(const char* e) {
+    ray_t* r = ray_eval_str(e);
+    int64_t v = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 ? r->i64 : INT64_MIN;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return v;
+}
+
+/* ---- Test: a failed in-place insert or upsert leaves the key's index right ----
+ * An in-place insert appends column by column, and the append of an indexed
+ * key extends its hash over the new rows.  When a later column's append
+ * then fails, the rollback truncates every column and must drop that
+ * extension, or the index would cover rows that are gone.  Fail each
+ * allocation of a 200-row insert, and of a 200-row upsert whose I32 payload
+ * takes the row-at-a-time path (its rollback is upsert_rollback_appends),
+ * in turn: 200 rows outgrow both columns' capacity, so the value column's
+ * growth can fail after the key's index was extended.  After a failure the
+ * key has its 100 rows, or all of them when only the call's result could
+ * not be allocated; either way it is unindexed or indexed over exactly its
+ * rows, and find agrees with the plain column.  Some failure must be the
+ * rollback dropping an extended index.  The call is parsed once and only
+ * its evaluation fails allocations. */
+static test_result_t test_eval_insert_upsert_rollback_index(void) {
+    const char* reset = "(set _rt (table ['k 'v] (list (.idx.hash (til 100)) (til 100))))";
+    struct { const char* op; int64_t grown; } cases[] = {
+        { "(insert '_rt (table ['k 'v] (list (+ 2000 (til 200)) (til 200))))", 300 },
+        { "(upsert '_rt 'k (table ['k 'v] (list (as 'i32 (+ 2000 (til 200))) (as 'i32 (til 200)))))", 300 },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* op = ray_parse(cases[c].op);
+        TEST_ASSERT_TRUE(op && !RAY_IS_ERR(op));
+        /* the allocations of a run that succeeds bound the sweep */
+        ray_t* r = ray_eval_str(reset);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        ray_mem_trace_t tr;
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        r = ray_eval(op);
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at _rt 'k))"), cases[c].grown);
+        int64_t failed = 0, dropped = 0;
+        for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
+            r = ray_eval_str(reset);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            ray_release(r);
+            ray_alloc_fail_set_for_test(nth, 1);
+            r = ray_eval(op);
+            ray_alloc_fail_set_for_test(0, 0);
+            bool err = r && RAY_IS_ERR(r);
+            if (err) ray_error_free(r); else if (r) ray_release(r);
+            ray_error_clear();
+            int64_t n = rb_eval_i64("(count (at _rt 'k))");
+            TEST_ASSERT_FMT(n == cases[c].grown || (err && n == 100),
+                            "case %zu, allocation %lld: %lld rows after %s", c,
+                            (long long)nth, (long long)n, err ? "a failure" : "a success");
+            int64_t has = rb_eval_i64("(as 'i64 (.idx.has? (at _rt 'k)))");
+            if (has == 1) {
+                int64_t len = rb_eval_i64("(at (.idx.info (at _rt 'k)) 'length)");
+                TEST_ASSERT_FMT(len == n, "case %zu, allocation %lld: the index covers %lld of %lld rows",
+                                c, (long long)nth, (long long)len, (long long)n);
+            } else if (err && n == 100) {
+                dropped++;
+            }
+            if (err) failed++;
+            ASSERT_EQ("(find (at _rt 'k) [2000 5 2199 99 -1])",
+                      "(find (.idx.drop (at _rt 'k)) [2000 5 2199 99 -1])");
+        }
+        ray_release(op);
+        TEST_ASSERT_FMT(failed > 0, "case %zu: no allocation failed the call", c);
+        TEST_ASSERT_FMT(dropped > 0, "case %zu: no rollback dropped an extended index", c);
+    }
     PASS();
 }
 
@@ -4230,6 +4719,178 @@ static test_result_t test_eval_insert_parted_e2e(void) {
     return result;
 }
 
+/* ---- Test: a select prunes partitions by their statistics before fetch -- */
+
+static test_result_t test_eval_select_parted_stats_impl(const char* root) {
+    /* Three generation-2 partitions (compress: true writes a chunk directory
+     * per column); Time rises with the day except for the null in the
+     * second partition, which ranks below every value. */
+    const char* days[] = { "2024.01.15", "2024.01.16", "2024.01.17" };
+    const char* rows[] = {
+        "(list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2])",
+        "(list [2024.01.16D00:00:00.000 0Np 2024.01.16D12:00:00.000] [3 4 5])",
+        "(list [2024.01.17D01:00:00.000] [6])",
+    };
+    char src[1400];
+    for (int i = 0; i < 3; i++) {
+        int n = snprintf(src, sizeof(src),
+                         "(.db.splayed.set \"%s/%s/t/\" (table ['Time 'v] %s) {compress: true})",
+                         root, days[i], rows[i]);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+        ray_t* w = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        ray_release(w);
+    }
+    int n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    /* query, expected v values, partitions the pre-fetch pruning drops */
+    struct { const char* where; const char* want; uint64_t pruned; } cases[] = {
+        { "(> Time 2024.01.17D00:30:00.000)",  "[6]",           2 },
+        { "(>= Time 2024.01.16D12:00:00.000)", "[5 6]",         1 },
+        { "(< Time 2024.01.15D12:00:00.000)",  "[1 4]",         1 },   /* the null's partition stays */
+        { "(<= Time 2024.01.15D20:00:00.000)", "[1 2 4]",       1 },
+        { "(== Time 2024.01.17D01:00:00.000)", "[6]",           2 },
+        { "(== Time 2024.01.16D06:00:00.000)", "[]",            2 },   /* one pruned partition stands in */
+        { "(!= Time 2024.01.17D01:00:00.000)", "[1 2 3 4 5]",   1 },   /* a one-value partition equal to it */
+        { "(in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])", "[2 6]", 1 },
+        { "(> 2024.01.16D20:00:00.000 Time)",  "[1 2 3 4 5]",   1 },   /* the literal on the left */
+        { "(and (>= v 3) (< Time 2024.01.17D00:00:00.000))", "[3 4 5]", 2 },   /* two columns' statistics */
+        { "(== Time 0Np)",                     "[4]",           0 },   /* a null literal: left to the filter, nothing pruned */
+        { "(== Time [0Np])",                   "[4]",           0 },
+        { "(in Time [2024.01.17D01:00:00.000 0Np])", "[6]",     0 },   /* a null member of the set likewise */
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        n = snprintf(src, sizeof(src), "(at (select {from: p where: %s}) 'v)", cases[i].where);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format select");
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_t* want = ray_eval_str(cases[i].want);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_EQ_I(r->len, want->len);
+        for (int64_t k = 0; k < r->len; k++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[k], ((int64_t*)ray_data(want))[k]);
+        ray_release(r);
+        ray_release(want);
+        ray_query_test_part_prune(&runs1, &parts1);
+        TEST_ASSERT_EQ_U(runs1 - runs0, cases[i].pruned ? 1 : 0);
+        TEST_ASSERT_EQ_U(parts1 - parts0, cases[i].pruned);
+    }
+
+    /* The same answers as the plain scan: the count fast path and a sum. */
+    ray_t* r = ray_eval_str("(count (select {from: p where: (< Time 2024.01.15D12:00:00.000)}))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 2);
+    ray_release(r);
+    r = ray_eval_str("(sum (at (select {from: p where: (> Time 2024.01.16D06:00:00.000)}) 'v))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 11);
+    ray_release(r);
+    PASS();
+}
+
+/* ---- Test: a chunk with rows but no extrema disables its partition's statistics -- */
+
+/* Flags bit 0 (RAY_ENC_STAT_ABSENT) of chunk `chunk` of the generation-2
+ * column file at `path`: the writer sets it for an integer or temporal
+ * chunk only when every row is null, so this makes a chunk the writer
+ * cannot: rows, no extrema. */
+static bool lang_patch_chunk_stat_absent(const char* path, int chunk) {
+    FILE* f = fopen(path, "r+b");
+    if (!f) return false;
+    long off = RAY_ENC_DIR_OFF + (long)chunk * (long)sizeof(ray_enc_dirent_t) + (long)offsetof(ray_enc_dirent_t, flags);
+    uint32_t flags = 0;
+    bool ok = fseek(f, off, SEEK_SET) == 0 && fread(&flags, sizeof flags, 1, f) == 1;
+    flags |= RAY_ENC_STAT_ABSENT;
+    ok = ok && fseek(f, off, SEEK_SET) == 0 && fwrite(&flags, sizeof flags, 1, f) == 1;
+    return fclose(f) == 0 && ok;
+}
+
+static test_result_t test_eval_select_parted_stats_absent_impl(const char* root) {
+    /* Two partitions of an int64 column: the first a single chunk 0..999,
+     * the second two chunks (65536 rows a chunk) 0..69999, whose second
+     * chunk is then marked as carrying no extrema.  That partition has no
+     * statistics any more: a predicate past the first chunk's maximum
+     * must still find the rows of the second. */
+    char src[600];
+    int n = snprintf(src, sizeof(src), "(.db.splayed.set \"%s/1/t/\" (table ['k] (list (til 1000))) {compress: true})", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+    ray_t* w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    n = snprintf(src, sizeof(src), "(.db.splayed.set \"%s/2/t/\" (table ['k] (list (til 70000))) {compress: true})", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+    w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    n = snprintf(src, sizeof(src), "%s/2/t/k", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format column path");
+    TEST_ASSERT(lang_patch_chunk_stat_absent(src, 1), "patch the second chunk's flags");
+    n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+
+    /* partition 1 (maximum 999) is pruned; partition 2 is kept and answers */
+    ray_t* r = ray_eval_str("(count (select {from: p where: (> k 69000)}))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 999);
+    ray_release(r);
+    uint64_t runs0, parts0, runs1, parts1;
+    ray_query_test_part_prune(&runs0, &parts0);
+    r = ray_eval_str("(at (select {from: p where: (== k 69999)}) 'k)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[0], 69999);
+    ray_release(r);
+    ray_query_test_part_prune(&runs1, &parts1);
+    TEST_ASSERT_EQ_U(runs1 - runs0, 1);
+    TEST_ASSERT_EQ_U(parts1 - parts0, 1);
+    PASS();
+}
+
+static test_result_t test_eval_select_parted_stats_absent(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_stats_absent_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_select_parted_stats_absent_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+static test_result_t test_eval_select_parted_stats(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_stats_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_select_parted_stats_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
 /* ---- Test: live FILE-domain symbols persist only at explicit rollover - */
 
 static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
@@ -5142,6 +5803,251 @@ static test_result_t test_eval_parted_list_column(void) {
         return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
     lang_parted_insert_rm_rf(root);
     test_result_t result = test_eval_parted_list_column_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: a parted insert grows the last partition in place (#921) -----
+ * Through a sole binding, once the active segments are private heap
+ * vectors, a same-key insert appends into them: the table and its
+ * wrappers keep their identity.  Every physical type gives the bytes the
+ * by-value rebuild gives. */
+static test_result_t test_eval_insert_parted_inplace_impl(const char* root) {
+    TEST_ASSERT(lang_parted_wide_fixture(root), "create wide parted fixture");
+    TEST_ASSERT(lang_parted_wide_bind_payloads(), "bind typed payload vectors");
+    char src[1400];
+    int n = snprintf(src, sizeof(src),
+                     "(do (set wa (.db.parted.get \"%s\" 'wide)) "
+                     "    (set wb (.db.parted.get \"%s\" 'wide)) 0)", root, root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format wide parted get");
+    ASSERT_EQ(src, "0");
+
+    static const char* const vec_rows =
+        "(list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+        "      wide_f64v wide_dv wide_tmv wide_tsv wide_gv)";
+    static const char* const null_rows =
+        "(list true 0x07 0Nh 0Ni 0Ne 0Nf 0Nd 0Nt 0Np 0Ng)";
+    int64_t wa_id = ray_sym_intern("wa", 2);
+    ray_t* held = NULL;
+    for (int step = 0; step < 6; step++) {
+        const char* rows = step == 3 ? null_rows : vec_rows;
+        ray_t* before = ray_env_get(wa_id);          /* borrowed */
+        n = snprintf(src, sizeof(src),
+                     "(do (insert 'wa 2024.01.02 %s) "
+                     "    (set wb (insert wb 2024.01.02 %s)) 0)", rows, rows);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format wide insert");
+        ASSERT_EQ(src, "0");
+        ray_t* after = ray_env_get(wa_id);           /* borrowed */
+        /* step 0 copies the mapped segments; step 5 finds a second holder */
+        if (step == 0 || step == 5) TEST_ASSERT_TRUE(after != before);
+        else TEST_ASSERT_EQ_PTR(after, before);
+        if (step == 4) { held = after; ray_retain(held); }
+    }
+    ASSERT_EQ("(count wa)", "(count wb)");
+    TEST_ASSERT_EQ_I(ray_table_nrows(held), ray_table_nrows(ray_env_get(wa_id)) - 2);
+
+    ray_t* wa = ray_eval_str("wa");
+    ray_t* wb = ray_eval_str("wb");
+    TEST_ASSERT_TRUE(wa && !RAY_IS_ERR(wa) && wb && !RAY_IS_ERR(wb));
+    ray_t* ca = lang_parted_insert_counts(wa);
+    ray_t* cb = lang_parted_insert_counts(wb);
+    TEST_ASSERT_TRUE(ca && cb && ca->len == 2 && cb->len == 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ca))[1], ((int64_t*)ray_data(cb))[1]);
+    for (int i = 0; i < LANG_WIDE_NCOLS; i++) {
+        ray_t* a = ((ray_t**)ray_data(lang_parted_insert_col(wa, lang_parted_wide_names[i])))[1];
+        ray_t* b = ((ray_t**)ray_data(lang_parted_insert_col(wb, lang_parted_wide_names[i])))[1];
+        TEST_ASSERT_FMT(a->type == b->type && a->len == b->len,
+                        "%s: type/length differ", lang_parted_wide_names[i]);
+        TEST_ASSERT_FMT((a->attrs & RAY_ATTR_HAS_NULLS) == (b->attrs & RAY_ATTR_HAS_NULLS),
+                        "%s: null hint differs", lang_parted_wide_names[i]);
+        size_t esz = ray_sym_elem_size(a->type, a->attrs);
+        TEST_ASSERT_FMT(memcmp(ray_data(a), ray_data(b), (size_t)a->len * esz) == 0,
+                        "%s: cells differ", lang_parted_wide_names[i]);
+    }
+    ray_release(wa); ray_release(wb); ray_release(held);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: a failed in-place parted insert leaves the partition as it was --
+ * The in-place insert appends column by column.  Fail each allocation of a
+ * 300-row batch over I64, SYM, STR and LIST columns in turn: the call
+ * either lands every row or none, the columns keep one length, a failed
+ * call gives back every reference it took on the batch's LIST cells, and
+ * the same batch lands on the next try. */
+/* The summed reference counts of the cells of _pb's LIST column. */
+static int64_t lang_parted_inplace_cell_refs(void) {
+    ray_t* brk = ray_eval_str("(at _pb 'brk)");
+    if (!brk || RAY_IS_ERR(brk) || brk->type != RAY_LIST) return -1;
+    int64_t refs = 0;
+    ray_t** cells = (ray_t**)ray_data(brk);
+    for (int64_t i = 0; i < brk->len; i++) refs += cells[i] ? (int64_t)cells[i]->rc : 0;
+    ray_release(brk);
+    return refs;
+}
+
+static test_result_t test_eval_insert_parted_inplace_rollback_impl(const char* root) {
+    char day[1024], sym_path[1024], reset[1400];
+    int n1 = snprintf(day, sizeof(day), "%s/2024.01.02/trades", root);
+    int n2 = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n1 > 0 && (size_t)n1 < sizeof(day) &&
+                n2 > 0 && (size_t)n2 < sizeof(sym_path), "format fixture paths");
+    TEST_ASSERT(lang_parted_insert_save_table(
+        "(table ['id 'acct 'note 'brk] "
+        "       (list [1 2] ['a 'b] [\"one\" \"two\"] (list [0 1] [2 3 4])))",
+        day, sym_path), "create parted fixture");
+    ASSERT_EQ("(do (set _pb (table ['id 'acct 'note 'brk] (list (+ 100 (til 300)) "
+              "      (take ['a 'zed] 300) "
+              "      (take [\"a string well past the inline limit\" \"s\"] 300) "
+              "      (map (fn [i] (til (% i 3))) (til 300))))) "
+              "    (set _p1 (table ['id 'acct 'note 'brk] "
+              "      (list [3] ['a] [\"three\"] (list [5])))) 0)", "0");
+    /* the first insert leaves private heap segments for the batch to grow */
+    int n = snprintf(reset, sizeof(reset),
+                     "(do (set pq (.db.parted.get \"%s\" 'trades)) "
+                     "    (insert 'pq 2024.01.02 _p1) 0)", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(reset), "format reset");
+    ray_t* op = ray_parse("(insert 'pq 2024.01.02 _pb)");
+    TEST_ASSERT_TRUE(op && !RAY_IS_ERR(op));
+    int64_t pq_id = ray_sym_intern("pq", 2);
+
+    ASSERT_EQ(reset, "0");
+    ray_t* bound = ray_env_get(pq_id);               /* borrowed */
+    ray_mem_trace_t tr;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    ray_t* r = ray_eval(op);
+    ray_mem_trace_end(&tr);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_EQ_PTR(ray_env_get(pq_id), bound);   /* grown in place */
+    TEST_ASSERT_EQ_I(rb_eval_i64("(count pq)"), 303);
+    int64_t full = rb_eval_i64("(sum (at pq 'id))");
+
+    int64_t failed = 0;
+    for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
+        ASSERT_EQ(reset, "0");
+        int64_t refs = lang_parted_inplace_cell_refs();
+        TEST_ASSERT_TRUE(refs >= 300);
+        ray_alloc_fail_set_for_test(nth, 1);
+        r = ray_eval(op);
+        ray_alloc_fail_set_for_test(0, 0);
+        bool err = r && RAY_IS_ERR(r);
+        if (err) ray_error_free(r); else if (r) ray_release(r);
+        ray_error_clear();
+        int64_t rows = rb_eval_i64("(count pq)");
+        TEST_ASSERT_FMT(rows == 303 || (err && rows == 3),
+                        "allocation %lld: %lld rows after %s", (long long)nth,
+                        (long long)rows, err ? "a failure" : "a success");
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'id))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'acct))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'note))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (at pq 'brk))"), rows);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(sum (at pq 'id))"), err ? 6 : full);
+        if (!err) continue;
+        failed++;
+        TEST_ASSERT_FMT(lang_parted_inplace_cell_refs() == refs,
+                        "allocation %lld: LIST cells keep %lld references, had %lld",
+                        (long long)nth, (long long)lang_parted_inplace_cell_refs(),
+                        (long long)refs);
+        ASSERT_EQ("(at pq 'note)", "[\"one\" \"two\" \"three\"]");
+        ASSERT_EQ("(at pq 'brk)", "(list [0 1] [2 3 4] [5])");
+        r = ray_eval(op);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count pq)"), 303);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(sum (at pq 'id))"), full);
+        TEST_ASSERT_EQ_I(rb_eval_i64("(count (select {from: pq where: (== acct 'zed)}))"), 150);
+        ASSERT_EQ("(get (at pq 'brk) 302)", "[0 1]");
+    }
+    ray_release(op);
+    TEST_ASSERT_FMT(failed > 0, "no allocation failed the call (%lld tried)",
+                    (long long)tr.alloc_count);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace_rollback(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_rb_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_rollback_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: an in-place parted insert of text nulls is seen by the planner --
+ * ray_table_col_has_nulls caches its answer for a parted SYM/STR column on
+ * the column's wrapper, and the in-place insert keeps that wrapper.  Ask
+ * while the columns have no nulls, append a null symbol and then an empty
+ * string in place, and ask again after each. */
+static test_result_t test_eval_insert_parted_inplace_text_nulls_impl(const char* root) {
+    char day[1024], sym_path[1024], load[1400];
+    int n1 = snprintf(day, sizeof(day), "%s/2024.01.02/trades", root);
+    int n2 = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n1 > 0 && (size_t)n1 < sizeof(day) &&
+                n2 > 0 && (size_t)n2 < sizeof(sym_path), "format fixture paths");
+    TEST_ASSERT(lang_parted_insert_save_table(
+        "(table ['id 'acct 'note] (list [1 2] ['a 'b] [\"one\" \"two\"]))",
+        day, sym_path), "create parted fixture");
+    /* the first insert leaves private heap segments for the next to grow */
+    int n = snprintf(load, sizeof(load),
+                     "(do (set pn (.db.parted.get \"%s\" 'trades)) "
+                     "    (insert 'pn 2024.01.02 (list [3] ['c] [\"three\"])) 0)", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(load), "format load");
+    ASSERT_EQ(load, "0");
+    int64_t pn_id = ray_sym_intern("pn", 2);
+    int64_t acct = ray_sym_intern("acct", 4), note = ray_sym_intern("note", 4);
+    ray_t* bound = ray_env_get(pn_id);               /* borrowed */
+
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+    ASSERT_EQ("(at (select {m: (first (asc acct)) n: (first (asc note)) from: pn}) 'm)", "['a]");
+
+    /* no nulls in the batch: still none */
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [4] ['d] [\"four\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+
+    /* a null symbol only: the STR column stays null-free */
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [5] (take [' 'a] 1) [\"five\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);   /* grown in place */
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_FALSE(ray_table_col_has_nulls(bound, note));
+
+    ASSERT_EQ("(insert 'pn 2024.01.02 (list [6] ['e] [\"\"]))", "'pn");
+    TEST_ASSERT_EQ_PTR(ray_env_get(pn_id), bound);
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, acct));
+    TEST_ASSERT_TRUE(ray_table_col_has_nulls(bound, note));
+
+    ASSERT_EQ("(count (select {from: pn where: (nil? acct)}))", "1");
+    ASSERT_EQ("(count (select {from: pn where: (nil? note)}))", "1");
+    ASSERT_EQ("(nil? (at (at (select {m: (first (asc acct)) from: pn}) 'm) 0))", "true");
+    ASSERT_EQ("(at (select {n: (first (asc note)) from: pn}) 'n)", "[\"\"]");
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_inplace_text_nulls(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_inplace_tn_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_inplace_text_nulls_impl(root);
     lang_parted_insert_rm_rf(root);
     return result;
 }
@@ -7526,6 +8432,103 @@ static bool restricted_expr_returns_access(const char* expr) {
     return access;
 }
 
+/* A top-level `let` binds a global, so a restricted request may not run
+ * one, as it may not run `set`: otherwise it could rebind a name other
+ * code reads, or install a connection hook.  A `let` inside a lambda or
+ * `do` binds a local and stays allowed. */
+static test_result_t test_eval_restricted_let_global(void) {
+    int64_t g = ray_sym_intern("__rf_rlg_global", 15);
+    int64_t fresh = ray_sym_intern("__rf_rlg_fresh", 14);
+    ray_t* hook_before = ray_env_get(ray_sym_intern(".ipc.on.close", 13));
+    ray_t* seven = ray_i64(7);
+    TEST_ASSERT_EQ_I(ray_env_set(g, seven), RAY_OK);
+    ray_release(seven);
+
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(let __rf_rlg_global 9)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(let __rf_rlg_fresh 1)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(let __rf_rlg_global (fn [] 9))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(let .ipc.on.close (fn [h] 0))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(eval (parse \"(let __rf_rlg_global 9)\"))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(times [__rf_rlg_fresh 2] 0)"));
+    ray_t* kept = ray_env_get(g);
+    TEST_ASSERT_NOT_NULL(kept);
+    TEST_ASSERT_EQ_I(kept->i64, 7);
+    TEST_ASSERT_NULL(ray_env_get(fresh));
+    TEST_ASSERT(ray_env_get(ray_sym_intern(".ipc.on.close", 13)) == hook_before,
+                "restricted let left .ipc.on.close as it was");
+
+    /* Local bindings are untouched by the restriction. */
+    ray_t* r = eval_restricted_expr("(do (let __rf_rlg_fresh 5) (+ __rf_rlg_fresh 1))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 6);
+    ray_release(r);
+    r = eval_restricted_expr("((fn [x] (let y (* x 2)) y) 4)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 8);
+    ray_release(r);
+    TEST_ASSERT_NULL(ray_env_get(fresh));
+
+    /* Unrestricted, a top-level `let` still binds the global. */
+    r = ray_eval_str("(let __rf_rlg_fresh 3)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    kept = ray_env_get(fresh);
+    TEST_ASSERT_NOT_NULL(kept);
+    TEST_ASSERT_EQ_I(kept->i64, 3);
+    PASS();
+}
+
+/* A request can be evaluated while server code waits inside a frame (a
+ * request a peer pushes back during a sync send).  It binds only in frames
+ * it opens itself: a `let` that would land in the waiting code's frame is
+ * refused, while the request's own `do` frame still takes one. */
+static test_result_t test_eval_restricted_let_server_frame(void) {
+    int64_t v = ray_sym_intern("__rf_rlf_v", 10);
+    int64_t hook = ray_sym_intern(".ipc.on.close", 13);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    ray_t* one = ray_i64(1);
+    TEST_ASSERT_EQ_I(ray_env_set_local(v, one), RAY_OK);
+    ray_release(one);
+    ray_t* hook_before = ray_env_get(hook);
+
+    ray_restrict_save_t saved;
+    ray_eval_restrict_enter(true, &saved);
+    ray_t* r_let  = ray_eval_str("(let __rf_rlf_v 99)");
+    ray_t* r_hook = ray_eval_str("(let .ipc.on.close (fn [h] 0))");
+    ray_t* r_loop = ray_eval_str("(times [__rf_rlf_v 2] 0)");
+    ray_t* r_own  = ray_eval_str("(do (let __rf_rlf_w 2) (+ __rf_rlf_w 1))");
+    ray_eval_restrict_leave(&saved);
+    bool restored = !ray_eval_get_restricted();
+    ray_t* cur = ray_env_get(v);
+    int64_t cur_v = cur ? cur->i64 : -1;
+    bool hook_kept = ray_env_get(hook) == hook_before;
+    ray_env_pop_scope();
+
+    bool let_refused  = RAY_IS_ERR(r_let)  && strcmp(ray_err_code(r_let), "access") == 0;
+    bool hook_refused = RAY_IS_ERR(r_hook) && strcmp(ray_err_code(r_hook), "access") == 0;
+    bool loop_refused = RAY_IS_ERR(r_loop) && strcmp(ray_err_code(r_loop), "access") == 0;
+    bool own_ok = r_own && !RAY_IS_ERR(r_own) && r_own->i64 == 3;
+    ray_t* rs[] = { r_let, r_hook, r_loop, r_own };
+    for (int i = 0; i < 4; i++) {
+        if (!rs[i]) continue;
+        if (RAY_IS_ERR(rs[i])) ray_error_free(rs[i]); else ray_release(rs[i]);
+    }
+    TEST_ASSERT_TRUE(restored);
+    TEST_ASSERT_TRUE(let_refused);
+    TEST_ASSERT_TRUE(hook_refused);
+    TEST_ASSERT_TRUE(loop_refused);
+    TEST_ASSERT_TRUE(own_ok);
+    TEST_ASSERT_EQ_I(cur_v, 1);
+    TEST_ASSERT_TRUE(hook_kept);
+    PASS();
+}
+
 static test_result_t test_eval_restricted_parquet(void) {
     TEST_ASSERT_TRUE(restricted_expr_returns_access(
         "(.parquet.splayed \"missing\" \"unused\")"));
@@ -7630,6 +8633,348 @@ static test_result_t test_eval_restricted_server_state_ops(void) {
     } else {
         ray_release(normal);
     }
+    PASS();
+}
+
+/* Whether the restricted eval of `expr` prints as the plain eval of
+ * `expected` does. */
+static bool restricted_expr_gives(const char* expr, const char* expected) {
+    ray_t* got = eval_restricted_expr(expr);
+    ray_t* want = ray_eval_str(expected);
+    bool same = false;
+    ray_t* gs = got && !RAY_IS_ERR(got) ? ray_fmt(got, 0) : NULL;
+    if (gs && want && !RAY_IS_ERR(want)) {
+        ray_t* ws = ray_fmt(want, 0);
+        same = ws && ray_str_len(gs) == ray_str_len(ws) &&
+               memcmp(ray_str_ptr(gs), ray_str_ptr(ws), ray_str_len(ws)) == 0;
+        if (ws) ray_release(ws);
+    }
+    if (!same)
+        fprintf(stderr, "  restricted eval of %s is %.*s, not %s\n", expr,
+                gs ? (int)ray_str_len(gs) : 5, gs ? ray_str_ptr(gs) : "error", expected);
+    if (gs) ray_release(gs);
+    for (int i = 0; i < 2; i++) {
+        ray_t* v = i ? want : got;
+        if (v && RAY_IS_ERR(v)) ray_error_free(v);
+        else if (v) ray_release(v);
+    }
+    return same;
+}
+
+/* #787: a lambda marked with .sys.trust runs its body unrestricted when
+ * restricted code calls it, by every call path, and the restriction is
+ * back once the call ends, however it ends.  The caller's own code, a
+ * closure the body makes and a copy of the lambda through ser/de stay
+ * restricted, and only unrestricted code can mark. */
+static test_result_t test_eval_restricted_trusted_lambda(void) {
+    ASSERT_EQ("(do (set __rf787_n 0)"
+              "    (set __rf787_put (fn [x] (set __rf787_n x)))"
+              "    (set __rf787_plain (fn [x] (set __rf787_n x)))"
+              "    (set __rf787_boom (fn [] (set __rf787_n 4) (raise \"boom\")))"
+              "    (set __rf787_mk (fn [k] (fn [x] (set __rf787_n (+ x k)))))"
+              "    (set __rf787_down (fn [n] (if (<= n 0) (set __rf787_n -1) (self (- n 1)))))"
+              "    (set __rf787_cl ((fn [k] (fn [x] (set __rf787_n (+ x k)))) 100))"
+              "    (.sys.trust ['__rf787_put '__rf787_boom '__rf787_mk '__rf787_down])"
+              "    (type (.sys.trust __rf787_cl)))", "(type (fn [] 0))");
+
+    /* The trusted body writes a global: called from the request's top
+     * level, from its compiled code, and through a higher-order builtin. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_put 5)", "5"));
+    ASSERT_EQ("__rf787_n", "5");
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (__rf787_put 6)))", "6"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(map __rf787_put [7 8])", "[7 8]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (map __rf787_put [1 9])))", "[1 9]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_down 3)", "-1"));
+    /* A trusted closure, interpreted on its first call and compiled after. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_cl 1)", "101"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_cl 2)", "102"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("((fn [] (__rf787_cl 3)))", "103"));
+
+    /* The same body unmarked, and the request's own write, are refused. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (__rf787_plain 1)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(set __rf787_n 1)"));
+
+    /* The restriction is back after the trusted call returns. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(do (__rf787_put 2) (set __rf787_n 3))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (__rf787_put 2) (set __rf787_n 3)))"));
+    ASSERT_EQ("__rf787_n", "2");
+
+    /* ... and after it fails: the caller's handler runs restricted. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(try (__rf787_boom) (fn [e] 7))", "7"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "(try (__rf787_boom) (fn [e] (set __rf787_n 5)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(
+        "((fn [] (try (__rf787_boom) (fn [e] (set __rf787_n 5)))))"));
+    ASSERT_EQ("__rf787_n", "4");
+
+    /* The mark stays on the object: a closure the trusted body makes and a
+     * copy through ser/de have none. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((__rf787_mk 1) 2)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((de (ser __rf787_put)) 6)"));
+
+    /* Restricted code cannot mark, so the unmarked twin stays refused. */
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.sys.trust '__rf787_plain)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.sys.trust __rf787_plain)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("((fn [] (.sys.trust __rf787_plain)))"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+
+    /* A name means the global bound to it, never a local of the caller,
+     * whether the caller is compiled or tree-walked. */
+    ASSERT_EQ("(do (set __rf787_gf (fn [] (set __rf787_n 21)))"
+              "    (set __rf787_gg (fn [] (set __rf787_n 22)))"
+              "    (set __rf787_gf2 (fn [] (set __rf787_n 23)))"
+              "    (set __rf787_gg2 (fn [] (set __rf787_n 24)))"
+              "    ((fn [] (let __rf787_gf __rf787_gg) (.sys.trust '__rf787_gf)))"
+              "    (do (let __rf787_gf2 __rf787_gg2) (.sys.trust '__rf787_gf2)) 0)", "0");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf)", "21"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg)"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_gf2)", "23"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_gg2)"));
+
+    /* One object is trusted under one name: a second name is refused, in
+     * one list (which then marks none) or later; the first name may be
+     * trusted again, and trusting the object as a value keeps its name. */
+    ASSERT_EQ("(do (set __rf787_one (fn [] (set __rf787_n 31))) (set __rf787_two __rf787_one) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_one '__rf787_two])", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_one)"));
+    ASSERT_EQ("(do (.sys.trust '__rf787_one) (.sys.trust '__rf787_one) (.sys.trust __rf787_one) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_two)", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_two)", "31"));
+
+    /* A dotted name is refused: a lambda held in a dict is trusted as a
+     * value. */
+    ASSERT_EQ("(do (set __rf787_ns (dict ['f] (list (fn [] (set __rf787_n 51))))) 0)", "0");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_ns.f)", "domain");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_plain '__rf787_ns.f])", "domain");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_ns.f)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+    ASSERT_EQ("(type (.sys.trust __rf787_ns.f))", "(type (fn [] 0))");
+    TEST_ASSERT_TRUE(restricted_expr_gives("(__rf787_ns.f)", "51"));
+
+    /* A lambda that cannot be serialized has no identity and is refused,
+     * as a value and by name, and stays untrusted. */
+    ASSERT_EQ("(do (set __rf787_noser (fn [] (set __rf787_n 41))) 0)", "0");
+    {
+        int64_t sym = ray_sym_intern("__rf787_noser", 13);
+        ray_t* fn = ray_env_get_global(sym);
+        ray_t* name = ray_sym(sym);
+        TEST_ASSERT_TRUE(fn && name && !RAY_IS_ERR(name));
+        ray_t* args[2] = { fn, name };
+        bool refused = true;
+        for (int i = 0; i < 2; i++) {
+            ray_alloc_fail_set_for_test(1, 1);
+            ray_t* r = ray_sys_trust_fn(args[i]);
+            ray_alloc_fail_set_for_test(0, 0);
+            refused = refused && r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "domain") == 0 &&
+                      !LAMBDA_TRUSTED(fn);
+            if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+        }
+        ray_release(name);
+        TEST_ASSERT_TRUE(refused);
+    }
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_noser)"));
+
+    /* Only lambdas are marked, and a list with one bad name marks none. */
+    ASSERT_ER_CODE("(.sys.trust 1)", "type");
+    ASSERT_ER_CODE("(.sys.trust '__rf787_unbound)", "name");
+    ASSERT_ER_CODE("(.sys.trust 'count)", "type");
+    ASSERT_ER_CODE("(.sys.trust ['__rf787_plain '__rf787_n])", "type");
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(__rf787_plain 1)"));
+
+    /* Unrestricted, a trusted lambda is an ordinary call. */
+    ASSERT_EQ("(__rf787_put 11)", "11");
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
+/* #787: a trusted lambda called by restricted code runs isolated from its
+ * caller.  The names its body reads, and the names read by what it calls,
+ * resolve to its own bindings and the globals: a local, an eval window
+ * or a query column of the caller cannot rebind one, whether the name
+ * holds data, a helper or a builtin.  The caller's bindings are back
+ * after the call. */
+static test_result_t test_eval_restricted_trusted_isolated(void) {
+    ASSERT_EQ("(do (set __rf787_v 1)"
+              "    (set __rf787_h (fn [] 10))"
+              "    (set __rf787_read (fn [] __rf787_v))"
+              "    (set __rf787_callh (fn [] (__rf787_h)))"
+              "    (set __rf787_cnt (fn [] (count [1 2 3])))"
+              "    (set __rf787_via (fn [] (__rf787_read)))"
+              "    (set __rf787_sum (fn [x] (+ x __rf787_v)))"
+              "    (set __rf787_peek (fn [] __rf787_v))"
+              "    (set __rf787_ev (fn [] (eval (parse \"(__rf787_peek)\"))))"
+              "    (set __rf787_vec [1 2])"
+              "    (set __rf787_app (fn [x] (alter '__rf787_vec concat x)))"
+              "    (set __rf787_rde (fn [] (eval (parse \"__rf787_v\"))))"
+              "    (set __rf787_rdh (fn [] (eval (parse \"(__rf787_h)\"))))"
+              "    (set __rf787_vec3 [1 2 3])"
+              "    (set __rf787_dotcnt (fn [] __rf787_vec3.count))"
+              "    (set __rf787_t (table [a __rf787_v] (list [1 2] [5 6])))"
+              "    (count (.sys.trust ['__rf787_read '__rf787_callh '__rf787_cnt"
+              "                        '__rf787_via '__rf787_sum '__rf787_ev '__rf787_app"
+              "                        '__rf787_rde '__rf787_rdh '__rf787_dotcnt])))", "10");
+    ASSERT_EQ("(__rf787_dotcnt)", "3");
+
+    /* A local of the request's top level. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_read))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_h (fn [] 66)) (__rf787_callh))", "10"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let count (fn [x] 66)) (__rf787_cnt))", "3"));
+    /* ... seen by neither a helper the trusted body calls nor a higher-order call. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_via))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (map __rf787_sum [1 2]))", "[2 3]"));
+    /* ... nor through a resolve that compiled code (the untrusted
+     * __rf787_peek) cached under that local. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (__rf787_peek) (__rf787_read))", "1"));
+    /* ... nor text the trusted body evaluates, reading the name or
+     * calling it, nor a dotted accessor it applies. */
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let __rf787_v 99) (__rf787_rde))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_h (fn [] 9)) (__rf787_rdh))", "10"));
+    TEST_ASSERT_TRUE(restricted_expr_gives("(do (let count first) (__rf787_dotcnt))", "3"));
+    /* An eval window, and a closure's frame on its first call. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "((fn [] (eval (parse \"(do (let __rf787_v 99) (__rf787_read))\"))))", "1"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(((fn [k] (fn [] (let __rf787_v 99) (__rf787_read))) 0))", "1"));
+    /* A query column: a helper called from a query reads the source
+     * column by free name, unrestricted callers' trusted lambdas included
+     * (the planner calls a trusted lambda, never inlines it); restricted
+     * code's trusted lambda reads the global. */
+    ASSERT_EQ("(at (select {x: (__rf787_via) from: __rf787_t}) 'x)", "[5 6]");
+    ASSERT_EQ("(at (select {x: (__rf787_sum a) from: __rf787_t}) 'x)", "[6 8]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_read) from: __rf787_t}) 'x)", "[1 1]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_via) from: __rf787_t}) 'x)", "[1 1]"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_sum a) from: __rf787_t}) 'x)", "[2 3]"));
+    /* What the trusted body calls is no query helper either: text it
+     * evaluates calls __rf787_peek from the tree walker. */
+    ASSERT_EQ("(at (select {x: (__rf787_ev) from: __rf787_t}) 'x)", "[5 6]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (__rf787_ev) from: __rf787_t}) 'x)", "[1 1]"));
+
+    /* An in-place mutation by name targets the global, not the caller's
+     * local of that name. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_vec [7]) (__rf787_app 3) __rf787_vec)", "[7]"));
+    ASSERT_EQ("__rf787_vec", "[1 2 3]");
+
+    /* The caller's bindings are visible again once the call returns. */
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(do (let __rf787_v 99) (__rf787_read) __rf787_v)", "99"));
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (+ (__rf787_read) __rf787_v) from: __rf787_t}) 'x)", "[6 7]"));
+    /* ... and so is the query: a helper the request calls after the
+     * trusted call reads the source column by free name again. */
+    ASSERT_EQ("(at (select {x: (do (__rf787_peek) (eval (parse \"(__rf787_peek)\")))"
+              " from: __rf787_t}) 'x)", "[5 6]");
+    TEST_ASSERT_TRUE(restricted_expr_gives(
+        "(at (select {x: (do (__rf787_read) (eval (parse \"(__rf787_peek)\")))"
+        " from: __rf787_t}) 'x)", "[5 6]"));
+    TEST_ASSERT_FALSE(ray_eval_get_restricted());
+    PASS();
+}
+
+/* #787: ray_env_isolate_begin hides every frame on the stack, whatever the
+ * walk: a query frame, a query helper's call frame and two lexical frames
+ * of a caller are invisible to lookups, bindings, captures, the query
+ * probes and the frame markers until ray_env_isolate_end, which leaves the
+ * caller's frames as they were. */
+static test_result_t test_env_isolate_hides_frames(void) {
+#define SYM(s) ray_sym_intern(s, strlen(s))
+    int64_t x = SYM("__rf787_iso_x"), w = SYM("__rf787_iso_w");
+    int64_t y = SYM("__rf787_iso_y"), y2 = SYM("__rf787_iso_y2");
+    int64_t cnt = SYM("count"), dot = SYM("__rf787_iso_v.count");
+#undef SYM
+    ray_t* setup = ray_eval_str("(do (set __rf787_iso_x 1) (set __rf787_iso_v [1 2 3]) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    ray_t* tbl = ray_eval_str("(table [__rf787_iso_x] (list [7]))");
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    ray_t* first = ray_env_get_global(ray_sym_intern("first", 5));
+    TEST_ASSERT_NOT_NULL(first);
+
+    /* The caller: a query, a helper's call frame over its table, then a
+     * frame binding x and one binding w and `count` (as `first`). */
+    int base = ray_env_scope_depth();
+    TEST_ASSERT_EQ_I(ray_env_push_query_scope(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_call_scope(tbl, false), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    ray_t* v99 = ray_i64(99), *v5 = ray_i64(5), *v6 = ray_i64(6), *v8 = ray_i64(8);
+    TEST_ASSERT_EQ_I(ray_env_set_local(x, v99), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_push_scope(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set_local(w, v5), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_set_local(cnt, first), RAY_OK);
+    ray_t* got = ray_env_get(x);
+    bool caller_sees = got && got->i64 == 99 && ray_env_in_query_helper(NULL) &&
+                       ray_env_query_serial() != 0 && ray_env_query_scope_above(base);
+
+    int32_t saved = ray_env_isolate_begin();
+    got = ray_env_get(x);
+    bool get_global = got && got->i64 == 1;
+    bool no_local = ray_env_get_local(x) == NULL && ray_env_get_lexical_local(x) == NULL &&
+                    ray_env_lexical_scope_depth(x) == -1 && ray_env_binding_rows(x) == -1;
+    bool no_query = ray_env_query_serial() == 0 && !ray_env_query_scope_above(base) &&
+                    !ray_env_in_query_helper(NULL);
+    ray_t* cap = ray_env_capture_locals();
+    bool no_capture = cap == NULL;
+    if (cap && !RAY_IS_ERR(cap)) ray_release(cap);
+    ray_t* res = ray_env_resolve(x);
+    bool resolve_global = res && !RAY_IS_ERR(res) && res->i64 == 1;
+    if (res && !RAY_IS_ERR(res)) ray_release(res);
+    /* x.count: the dotted accessor is the global `count`, not the caller's. */
+    res = ray_env_resolve(dot);
+    bool accessor_global = res && !RAY_IS_ERR(res) && res->i64 == 3;
+    if (res && !RAY_IS_ERR(res)) ray_release(res);
+    ray_env_target_t target;
+    ray_t* tv = NULL;
+    bool target_global = ray_env_target_resolve(x, &target, &tv) == RAY_OK && target.scope == -1;
+    /* With no frame of its own open, a binding is global, as at the top
+     * level, and the markers leave the caller's top frame alone. */
+    bool bind_global = ray_env_set_local(y, v6) == RAY_OK &&
+                       ray_env_set_local_rows(y2, v8, 0) == RAY_OK;
+    ray_env_mark_lexical_scope(0);
+    ray_env_mark_eval_window();
+    ray_env_isolate_end(saved);
+
+    got = ray_env_get(x);
+    bool caller_back = got && got->i64 == 99 && ray_env_scope_depth() == base + 4;
+    ray_t* gw = ray_env_get_compiled(w);          /* no eval window on w's frame */
+    bool not_window = gw && gw->i64 == 5;
+    cap = ray_env_capture_locals();               /* no lexical mark on w's frame */
+    bool captures_x = false;
+    if (cap && !RAY_IS_ERR(cap)) {
+        ray_t* keys = ray_dict_keys(cap);
+        for (int64_t i = 0; keys && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == x) captures_x = true;
+        ray_release(cap);
+    }
+    bool frames_unbound = ray_env_get_local(y) == NULL && ray_env_get_local(y2) == NULL;
+    for (int i = 0; i < 4; i++) ray_env_pop_scope();
+    ray_t* gy = ray_env_get_global(y), *gy2 = ray_env_get_global(y2);
+    bool globals_bound = gy && gy->i64 == 6 && gy2 && gy2->i64 == 8;
+    ray_release(v99); ray_release(v5); ray_release(v6); ray_release(v8);
+    ray_release(tbl);
+
+    TEST_ASSERT_TRUE(caller_sees);
+    TEST_ASSERT_TRUE(get_global);
+    TEST_ASSERT_TRUE(no_local);
+    TEST_ASSERT_TRUE(no_query);
+    TEST_ASSERT_TRUE(no_capture);
+    TEST_ASSERT_TRUE(resolve_global);
+    TEST_ASSERT_TRUE(accessor_global);
+    TEST_ASSERT_TRUE(target_global);
+    TEST_ASSERT_TRUE(bind_global);
+    TEST_ASSERT_TRUE(caller_back);
+    TEST_ASSERT_TRUE(not_window);
+    TEST_ASSERT_TRUE(captures_x);
+    TEST_ASSERT_TRUE(frames_unbound);
+    TEST_ASSERT_TRUE(globals_bound);
     PASS();
 }
 
@@ -11624,6 +12969,8 @@ static test_result_t test_dotted_local_read_slot(void) {
 }
 
 const test_entry_t lang_entries[] = {
+    { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
+    { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
     { "lang/env/scope_private_slots", test_env_scope_private_slots, lang_setup, lang_teardown },
@@ -11686,7 +13033,14 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/in", test_eval_in, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_guid_nulls", test_eval_select_where_in_guid_nulls, lang_setup, lang_teardown },
     { "lang/eval/in_guid_unflagged_nulls", test_eval_in_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/find_guid_unflagged_nulls", test_eval_find_guid_unflagged_nulls, lang_setup, lang_teardown },
+    { "lang/eval/find_guid_oom", test_eval_find_guid_oom, lang_setup, lang_teardown },
     { "lang/eval/in_guid_oom", test_eval_in_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_skewed", test_eval_distinct_guid_skewed, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_table_growth", test_eval_distinct_guid_table_growth, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_oom", test_eval_distinct_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
+    { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
@@ -11777,11 +13131,16 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
+    { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_physical_types", test_eval_insert_parted_physical_types, lang_setup, lang_teardown },
     { "lang/eval/parted_list_column", test_eval_parted_list_column, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace", test_eval_insert_parted_inplace, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace_rollback", test_eval_insert_parted_inplace_rollback, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_inplace_text_nulls", test_eval_insert_parted_inplace_text_nulls, lang_setup, lang_teardown },
     { "lang/eval/upsert", test_eval_upsert, lang_setup, lang_teardown },
     { "lang/eval/upsert_f64_key", test_eval_upsert_f64_key, lang_setup, lang_teardown },
     { "lang/eval/upsert_str_key", test_eval_upsert_str_key, lang_setup, lang_teardown },
@@ -11929,10 +13288,15 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_time", test_eval_table_list_col_time, lang_setup, lang_teardown },
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
+    { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
+    { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },
     { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
     { "lang/eval/restricted_lambda_bypass", test_eval_restricted_lambda_bypass, lang_setup, lang_teardown },
     { "lang/eval/restricted_server_state_ops", test_eval_restricted_server_state_ops, lang_setup, lang_teardown },
+    { "lang/eval/restricted_trusted_lambda", test_eval_restricted_trusted_lambda, lang_setup, lang_teardown },
+    { "lang/eval/restricted_trusted_isolated", test_eval_restricted_trusted_isolated, lang_setup, lang_teardown },
+    { "lang/env/isolate_hides_frames", test_env_isolate_hides_frames, lang_setup, lang_teardown },
     { "lang/eval/self_recursion_direct", test_eval_self_recursion_direct, lang_setup, lang_teardown },
     { "lang/eval/nested_lambda_calls", test_eval_nested_lambda_calls, lang_setup, lang_teardown },
     { "lang/eval/vm_empty_ret", test_eval_vm_empty_ret, lang_setup, lang_teardown },

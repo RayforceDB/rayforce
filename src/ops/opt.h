@@ -36,5 +36,14 @@ ray_op_ext_t*  find_ext(ray_graph_t* g, uint32_t node_id);
  * opt.c); false when the comparison cannot prune. */
 bool           ray_part_prune_mask(ray_t* key_values, uint16_t cmp_op,
                                    bool swapped, ray_t* lit, uint64_t* mask);
+/* The same for a comparison against a parted data column, decided by the
+ * partitions' statistics (see query.c); a partition without statistics is
+ * kept.  False when no partition can be dropped. */
+bool           ray_part_prune_stats_mask(ray_t* col, uint16_t cmp_op, bool swapped,
+                                         ray_t* lit, uint64_t* mask);
+/* The non-null extrema of one parted segment, from its chunk directory or
+ * attached chunk zone; false when it carries none. */
+bool           ray_part_seg_stats(ray_t* seg, int64_t* mn, int64_t* mx,
+                                  bool* has_nulls, bool* all_null);
 
 #endif /* RAY_OPT_H */

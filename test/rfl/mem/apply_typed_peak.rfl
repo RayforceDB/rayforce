@@ -1,0 +1,9 @@
+;; apply reads typed vector operands in place and collects typed results.
+;; Boxing both inputs into lists up front costs about 5 vectors' worth at this
+;; size (one boxed atom per element, twice); in place it is input + result.
+(set n 200000)
+(set input (til n))
+(set output (apply + input input))
+(type output) -- 'I64
+(sum output) -- 39999800000
+(< (at (.sys.mem) 'peak-bytes) (* 4 (* 8 n))) -- true

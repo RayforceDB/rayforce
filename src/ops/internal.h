@@ -56,6 +56,12 @@
 int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
                       int64_t* out);
 
+#ifdef DEBUG
+/* Fail the first allocation in the nth temporary grouped-aggregate lowering
+ * on this thread.  Zero resets/disarms both the target and allocator seam. */
+void ray_group_dag_probe_fail_set_for_test(int invocation);
+#endif
+
 /* True if every leaf is constant or reduced to a scalar. */
 bool op_tree_is_scalar(ray_graph_t* g, uint32_t id);
 bool op_tree_is_atom(ray_graph_t* g, uint32_t id);
@@ -1470,12 +1476,21 @@ uint64_t ray_exec_test_refine_in(void);
  * statistics before running (exec_filter_chain_prune), and the selection
  * segments (vectors) they dropped, since process start. */
 void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
+#ifdef DEBUG
+/* Completed synchronous sorted-find kernels; no release instrumentation. */
+uint64_t ray_find_test_sorted_runs(bool reset);
+/* Successful query-level narrowed-source constructions, not physical reads. */
+uint64_t ray_query_test_parted_pruned_sources(bool reset);
+#endif
 /* exec.c test hook: later `in` conjuncts over a single-file generation-2
  * column answered by range (in_sel_single_within) since process start. */
 uint64_t ray_exec_test_in_single_within(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: selects whose parted source was pruned before fetch,
+ * and the partitions they dropped, since process start. */
+void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);
 /* query.c test hook: rows of data[0, n) of `type` (BOOL, U8, I16, I32,
  * I64, DATE, TIME, TIMESTAMP) for which `x op rhs` holds, op 1..6 = == !=
  * < <= > >=; ref: through the reference widening compare instead of the
@@ -1642,6 +1657,12 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type);
 void ray_group_test_route(int route);
 /* Fail the next scalar chunk-buffer allocation, then disarm automatically. */
 void ray_group_test_fail_scalar_alloc(int fail);
+/* Test hooks (C tests only) for the guid distinct kernel: fail its nth
+ * scratch allocation, a worker's table included (0 = off); cap a worker's
+ * table at `slots` (32 or more, rounded down to a power of 2; 0 = off).
+ * Disarmed by ray_test_hooks_off. */
+void ray_distinct_guid_test_fail_alloc(int64_t nth);
+void ray_distinct_guid_test_table_cap(int64_t slots);
 /* Test hook (C tests only): the scalar route's chunk walk (scalar_chunk_fn)
  * runs serially in tasks of `rows` rows, any cut (as ray_pool_dispatch's
  * grain after its ring clamp); 0 dispatches as usual.  Disarmed by

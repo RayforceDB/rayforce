@@ -83,10 +83,24 @@ static inline void term_write(const void* buf, size_t len) {
 
 static volatile sig_atomic_t g_interrupted = 0;
 static ray_term_t* g_active_term = NULL;
+#if !defined(RAY_OS_WINDOWS)
+/* SIGINT's self-pipe: the handler writes a byte to it, so a poll loop that
+ * watches the read end wakes for a signal that lands while no read() of
+ * stdin is blocked (the poll REPL reads stdin only once it is readable). */
+static int g_sigint_pipe[2] = { -1, -1 };
+#endif
 
 static void signal_handler(int sig) {
     g_interrupted = 1;
     ray_eval_request_interrupt();
+#if !defined(RAY_OS_WINDOWS)
+    if (sig == SIGINT && g_sigint_pipe[1] >= 0) {
+        int saved = errno;
+        ssize_t r = write(g_sigint_pipe[1], "", 1);
+        (void)r;
+        errno = saved;
+    }
+#endif
 #if defined(RAY_OS_WINDOWS)
     if (sig == SIGTERM) {
 #else
@@ -125,6 +139,33 @@ int ray_term_interrupted(void) {
 
 void ray_term_clear_interrupt(void) {
     g_interrupted = 0;
+}
+
+int ray_term_sigint_fd(void) {
+#if defined(RAY_OS_WINDOWS)
+    return -1;
+#else
+    if (g_sigint_pipe[0] < 0) {
+        int p[2];
+        if (pipe(p) != 0) return -1;
+        for (int i = 0; i < 2; i++) {
+            int fl = fcntl(p[i], F_GETFL, 0);
+            if (fl >= 0) fcntl(p[i], F_SETFL, fl | O_NONBLOCK);
+            fcntl(p[i], F_SETFD, FD_CLOEXEC);
+        }
+        g_sigint_pipe[0] = p[0];
+        g_sigint_pipe[1] = p[1];   /* last: the handler writes only to a set-up pipe */
+    }
+    return g_sigint_pipe[0];
+#endif
+}
+
+void ray_term_sigint_drain(void) {
+#if !defined(RAY_OS_WINDOWS)
+    char buf[64];
+    if (g_sigint_pipe[0] >= 0)
+        while (read(g_sigint_pipe[0], buf, sizeof buf) > 0) {}
+#endif
 }
 
 void ray_term_install_signals(ray_term_t* term) {

@@ -659,7 +659,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
                 goto out;
             }
             ray_err_t merr = splay_merge_vocab(col, cdoms[c]);
-            if (merr == RAY_OK && flush_sym) merr = ray_sym_domain_flush(cdoms[c], durable);
+            if (merr == RAY_OK && flush_sym) merr = ray_sym_domain_flush_append(cdoms[c], durable);
             if (merr != RAY_OK) { ret = merr; goto out; }
         }
     } else if (table_has_sym_cols(tbl)) {
@@ -668,7 +668,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         if (!dom) { ret = RAY_ERR_IO; goto out; }
 
         /* Empty-vocabulary seeding: a 0-row SYM table merges nothing
-         * below, and ray_sym_domain_flush no-ops at count == disk_count
+         * below, and the flush no-ops at count == disk_count
          * (0 == 0 for a freshly created domain) — no symfile would be
          * written and the table would be unloadable (loud "sym" on
          * load).  Seed the position-0 "" up front so the flush always
@@ -691,7 +691,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
             if (merr != RAY_OK) { ret = merr; goto out; }
         }
 
-        ray_err_t sym_err = flush_sym ? ray_sym_domain_flush(dom, durable) : RAY_OK;
+        ray_err_t sym_err = flush_sym ? ray_sym_domain_flush_append(dom, durable) : RAY_OK;
         if (sym_err != RAY_OK) { ret = sym_err; goto out; }
     }
 
@@ -1628,9 +1628,17 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                 char path[1024];
                 int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
                                  (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                if (n > 0 && n < (int)sizeof(path))
-                    (void)ray_col_append_index(path, ray_index_payload(col->index),
+                /* a first-row-only hash (an append repeated a key) is
+                 * written as the complete one its values give.  If that
+                 * can't be built (OOM, cancel) the column is saved without
+                 * an index, best effort here as the append is, and a
+                 * reload answers by scanning. */
+                bool partial = ray_index_hash_first_only(col);
+                ray_t* full = partial ? ray_index_hash_rebuild(col) : NULL;
+                if (n > 0 && n < (int)sizeof(path) && (full || !partial))
+                    (void)ray_col_append_index(path, ray_index_payload(full ? full : col->index),
                                                col->len, RAY_STR);
+                if (full) ray_release(full);
             }
             return;
         }

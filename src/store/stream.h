@@ -62,12 +62,16 @@ ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name
  * staging file kept, for any other writer or where the host has no memory
  * files. */
 bool ray_col_stream_stage_mem(ray_col_stream_t* w);
-/* Generation 2, a numeric or temporal column (not SYM, not STR), before the
- * first append: no payload is staged.  The staging file becomes the column
+/* Generation 2, a numeric, temporal or SYM column (not STR; SYM over its
+ * domain, positions written at W32), before the first append: no payload
+ * is staged.  The staging file becomes the column
  * file, written by w->ew: the caller trains it on chunk 0's rows
  * (ray_encw_train), encodes chunks where their rows are (ray_encw_encode)
  * and puts them in chunk order (ray_encw_put); it sets had_nulls (a null in
  * any chunk, or a flagged source) before finish, which writes the headers.
+ * A SYM column's prefix bounds come from the domain the caller gives the
+ * writer (ray_encw_set_sym_domain) before it trains: positions past the
+ * domain's count then get none.
  * Appends are refused.  `rows` is the column's length.  ray_col_stream_chunked_ok
  * says whether the writer can. */
 bool      ray_col_stream_chunked_ok(const ray_col_stream_t* w);

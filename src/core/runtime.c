@@ -22,6 +22,7 @@
  */
 
 #include "runtime.h"
+#include "core/platform.h"   /* ray_file_writeback_errors — the writeback thread joined */
 #include "core/profile.h"   /* g_ray_profile rings — dropped on destroy */
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -115,6 +116,7 @@ const char* ray_err_code_str(ray_err_t e) {
         [RAY_ERR_RESERVED] = "reserve",
         [RAY_ERR_VERSION] = "version",
         [RAY_ERR_FPENV]   = "fpenv",
+        [RAY_ERR_ACCESS]  = "access",
     };
     if ((unsigned)e >= sizeof(codes)/sizeof(codes[0])) return "error";
     return codes[e];
@@ -135,6 +137,7 @@ ray_err_t ray_err_from_obj(ray_t* err) {
         {"reserve", 7, RAY_ERR_RESERVED},
         {"version", 7, RAY_ERR_VERSION},
         {"fpenv",   5, RAY_ERR_FPENV},
+        {"access",  6, RAY_ERR_ACCESS},
     };
     for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
         if (n == map[i].len && memcmp(s, map[i].s, n) == 0) return map[i].e;
@@ -482,6 +485,9 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
     ray_parted_cache_clear();
     ray_sym_destroy();
     ray_heap_destroy();
+
+    /* the writebacks the runtime handed over served, their thread joined */
+    (void)ray_file_writeback_errors();
 
     ray_sys_free(rt);
 }

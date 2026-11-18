@@ -212,6 +212,19 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
         if (r >= -1) return r;
     }
 
+    /* Guid keys: the bytes alone, as `find` and `in` compare guid cells.  A
+     * null key finds the first zero cell whether or not the keys carry
+     * HAS_NULLS, which a producer may leave unset (ray_vec_append does). */
+    if (kt == RAY_GUID) {
+        static const uint8_t null_guid[16] = {0};
+        const uint8_t* kp = key_atom->obj ? (const uint8_t*)ray_data(key_atom->obj)
+                                          : null_guid;
+        const uint8_t* a = (const uint8_t*)ray_data(keys);
+        for (int64_t i = 0; i < n; i++)
+            if (memcmp(a + i * 16, kp, 16) == 0) return i;
+        return -1;
+    }
+
     /* Null-aware probe: a null key atom matches only null slots; a non-null
      * key atom must match a non-null slot of equal value.  Without this, a
      * group dict containing both `0Nl` and `0` keys (now produced as
@@ -313,17 +326,7 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
             }
             return -1;
         }
-        case RAY_GUID: {
-            const uint8_t* a = (const uint8_t*)base;
-            const uint8_t* kp = key_atom->obj ? (const uint8_t*)ray_data(key_atom->obj) : NULL;
-            if (!kp) return -1;
-            for (int64_t i = 0; i < n; i++) {
-                if (keys_have_nulls && ray_vec_is_null(keys, i)) continue;
-                if (memcmp(a + i * 16, kp, 16) == 0) return i;
-            }
-            return -1;
-        }
-        default:
+        default:   /* RAY_GUID left above */
             return -1;
     }
 #undef DICT_FIND_LOOP

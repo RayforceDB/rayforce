@@ -1,0 +1,118 @@
+;; GUID hash index (issue #920): .idx.hash / grouped on a GUID vector, the
+;; find / in / dict lookups it answers, the concat carry, and its splayed
+;; round trips in generation 0 and 2.
+;;
+;; A guid index keys every row by its 16 bytes, the zero guid among them, as
+;; find and in compare guid cells.  Every indexed answer is cross-checked
+;; against the same call on the plain vector.
+
+;; ─────────────────────────── attach: .idx.hash and grouped ─────────────────
+(set g (guid 6))
+(set h (at g [0 1 0 2 3 1]))                       ;; keys a b a c d b
+(set gi (.idx.hash h))
+(.idx.has? gi) -- true
+(at (.idx.info gi) 'kind) -- 'hash
+(at (.idx.info gi) 'n_keys) -- 6
+(at (.idx.info gi) 'n_groups) -- 4
+(.attr.get (.attr.set 'grouped h)) -- ['grouped]
+;; the other kinds stay numeric-only
+(.idx.zone h) !- nyi
+(.idx.sort h) !- nyi
+(.idx.bloom h) !- nyi
+
+;; ─────────────────────────── find / in with a vector of needles ────────────
+(set probes (at g [3 0 5 1 2 0]))                  ;; d a (absent) b c a
+(find gi probes) -- [4 0 0N 1 3 0]
+(find gi probes) -- (find h probes)
+(in probes gi) -- [true true false true true true]
+(in probes gi) -- (in probes h)
+;; scalar find answers through the index too
+(find gi (at g 2)) -- 3
+(find gi (at g 5)) -- 0N
+;; needles of another type keep the scan's answer
+(find gi [1 2]) -- (find h [1 2])
+(in [1 2] gi) -- (in [1 2] h)
+(find gi 7) -- (find h 7)
+
+;; ─────────────────────────── the zero guid is a key like any other ─────────
+(set hz (concat h [0Ng]))
+(set gz (.idx.hash hz))
+(at (.idx.info gz) 'n_keys) -- 7
+(find gz [0Ng]) -- [6]
+(find gz [0Ng]) -- (find hz [0Ng])
+(find gz 0Ng) -- 6
+(in (concat [0Ng] (at g [5 2])) gz) -- [true false true]
+(in (concat [0Ng] (at g [5 2])) gz) -- (in (concat [0Ng] (at g [5 2])) hz)
+;; a null needle against a column without one: a miss, as on the scan
+(find gi [0Ng]) -- [0N]
+(find gi [0Ng]) -- (find h [0Ng])
+(in [0Ng] gi) -- [false]
+
+;; ─────────────────────────── many rows, repeated keys ──────────────────────
+(set big (guid 70000))
+(set bh (concat big (take big 100)))
+(set bi (.idx.hash bh))
+(at (.idx.info bi) 'n_groups) -- 70000
+(set bp (concat (at big [69999 0 5 99 100]) (guid 3)))
+(find bi bp) -- [69999 0 5 99 100 0N 0N 0N]
+(find bi bp) -- (find bh bp)
+(in bp bi) -- (in bp bh)
+(sum (find bi big)) -- (sum (til 70000))
+
+;; ─────────────────────────── dict lookup through the keys' index ───────────
+(set d (dict gi [1 2 3 4 5 6]))
+(at d (at g 2)) -- 4
+(at d (at g 5)) -- 0N
+(at d (at g [2 0 5])) -- (list 4 1 0N)
+(at d (at g [2 0 5])) -- (at (dict h [1 2 3 4 5 6]) (at g [2 0 5]))
+
+;; ─────────────────────────── concat keeps the index for new keys ───────────
+(set c1 (concat gi (at g [4])))
+(.idx.has? c1) -- true
+(find c1 (at g [4 0 5])) -- [6 0 0N]
+(find c1 (at g [4 0 5])) -- (find (concat h (at g [4])) (at g [4 0 5]))
+;; a repeated key leaves it first-row-only (see ops/idx_append.rfl)
+(at (.idx.info (concat gi (at g [0]))) 'first_only) -- true
+(find (concat gi (at g [0])) (at g [0 2])) -- [0 3]
+
+;; ─────────────────────────── distinct: from the index, and without one ─────
+;; first-appearance order, the zero guid one value among the others
+(distinct gi) -- (at g [0 1 2 3])
+(distinct h) -- (at g [0 1 2 3])
+(count (distinct gi)) -- 4
+(count (distinct h)) -- 4
+(distinct gz) -- (concat (at g [0 1 2 3]) [0Ng])
+(distinct hz) -- (concat (at g [0 1 2 3]) [0Ng])
+(count (distinct gz)) -- 5
+;; a first-row-only index still answers: its missing rows are repeats
+(set gf (concat gi (at g [5 0 4])))
+(at (.idx.info gf) 'first_only) -- true
+(distinct gf) -- (at g [0 1 2 3 5 4])
+(count (distinct gf)) -- 6
+;; past 65536 rows: the parallel kernel unindexed, the groups indexed
+(set dh (concat big (concat (take big 100) (concat [0Ng] big))))
+(distinct dh) -- (concat big [0Ng])
+(count (distinct dh)) -- 70001
+(set di (.idx.hash dh))
+(distinct di) -- (concat big [0Ng])
+(count (distinct di)) -- 70001
+(distinct (concat [0Ng] dh)) -- (concat [0Ng] big)
+
+;; ─────────────────────────── a query filter keeps the scan's answer ────────
+(set T (table ['k 'v] (list gi [1 2 3 4 5 6])))
+(at (select {from: T where: (in k (at g [2 5]))}) 'v) -- [4]
+(at (select {from: T where: (in k (at g [1 3]))}) 'v) -- [2 5 6]
+
+;; ─────────────────────────── splayed round trips, generation 0 and 2 ───────
+(.sys.exec "rm -rf /tmp/rf-idx-guid")
+(.db.splayed.set "/tmp/rf-idx-guid/g0/" T)
+(.db.splayed.set "/tmp/rf-idx-guid/g2/" T {compress: true})
+(set l0 (at (.db.splayed.get "/tmp/rf-idx-guid/g0/") 'k))
+(.idx.has? l0) -- true
+(find l0 probes) -- [4 0 0N 1 3 0]
+(in probes l0) -- [true true false true true true]
+(set C2 (.db.splayed.get "/tmp/rf-idx-guid/g2/"))
+(at (.idx.info C2 'k) 'index) -- 'hash
+(find (at C2 'k) probes) -- [4 0 0N 1 3 0]
+(in probes (at C2 'k)) -- [true true false true true true]
+(.sys.exec "rm -rf /tmp/rf-idx-guid")

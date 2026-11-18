@@ -214,7 +214,26 @@ A partition may hold fewer columns than the first one, as long as the columns it
 
 ### Partition Pruning
 
-The query optimizer recognizes predicates on the `MAPCOMMON` column and eliminates entire partitions from the scan plan. This means a query filtering on a single date in a year of data only touches 1/365th of the files on disk — with zero per-row cost for the pruned partitions.
+The optimizer can derive a necessary partition mask from literal comparisons or literal `in` sets on the virtual `MAPCOMMON` partition column. It applies that mask only when the remaining query shape is safe to evaluate over the retained partitions. The original `where` still runs. This is not a guarantee that every query with a date bound prunes, nor a count of physical file opens or reads.
+
+Ordinary row-local atomic expressions retain their uncapped admission walk. Canonical nested `and`/`or`, restricted `not` conditions, grouped unary `first`/`last`, and output `count(distinct column)` can retain pruning too. Call heads shadowed by lexical bindings or source columns are not assumed to be the corresponding builtin.
+
+Two additional IF shapes have deliberately bounded proofs:
+
+- **Ungrouped:** one fresh output, `from` and `where`, no `by`, and an explicit ELSE. Branches must be I64 columns or literals, or nested `if` expressions with explicit ELSE. Conditions use BOOL literals, I64 comparisons or SYM equality/inequality, with canonical `and`/`or` and unary `not`. The proof allows 128 visits and depth 32. Quoted SYM names that resolve to source columns decline this proof.
+- **Grouped:** one bare I64 group key and up to 32 fresh outputs, each `sum(if condition then else)` with explicit ELSE and I64 branches. Conditions must depend on a column; supported predicates include I64 comparisons and SYM equality/inequality against one unambiguous non-NULL literal. The shared proof allows 256 visits, depth 24 and 256 recorded references. Output names must not capture referenced source or literal names.
+
+These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, wider grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
+
+```lisp
+;; A supported narrow grouped shape; the literal date bound selects partitions.
+(select {from: trades where: (== date 2024.01.02) by: account
+         qty_ok: (sum (if (> qty 0) qty 0))})
+```
+
+The example assumes `account` and `qty` are I64 columns. A declined proof changes optimization, not permission to substitute a different query result.
+
+A predicate on a parted integer or temporal data column prunes as well, by the partitions' statistics: the non-null minimum and maximum of a column saved with `compress: true` (its chunk directory) or of a plain column of 65,536 rows or more (its chunk zone). A partition is dropped only when they decide the comparison false for every row, by the rule row-level zone skipping uses, so nulls are kept and a partition without statistics is kept. `(> time 2024.01.16D12:00:00.000)` over a date-partitioned table thus reads the partitions whose `time` range reaches past the literal and no other. Partition directories may also be named `YYYY.MM.DD.HH.MM.SS`, which gives a `timestamp` partition key. See [`.db.parted.get`](../namespaces/db.md#db-parted-get).
 
 ## Symbol Table Persistence
 
@@ -223,6 +242,12 @@ The global symbol intern table maps strings to integer IDs. When saving data to 
 ### Append-Only .sym Files
 
 A table's symbol file, which `.db.splayed.set` and the importers write, is append-only: new symbols are appended to the end of the file without rewriting existing entries, so a symbol's position never changes and updates are incremental. One process writes a database at a time: a writer whose view of the file is out of date fails with `RAY_ERR_CORRUPT` instead of overwriting another writer's symbols (see [Running Several Instances](../guides/instances.md)).
+
+The file is a header (the `STRL` magic and the number of symbols) followed by one record per symbol, a 4-byte length and the bytes.
+
+The first write of a symbol file builds it under a temporary name and renames it into place. Every later `.db.splayed.set` that brings new symbols appends their records to the existing file, in place, and then writes the new count into the header; a save with no new symbols does not write the file. The header count is the commit point: the records are written first (and, in a durable save, synced to media before the count is written), so a crash leaves either the old count, or a count whose records are all there. Records past the count, left by an append that did not finish, are a torn tail: opening the file ignores them, and the next append cuts them off before it writes its own records. A file that holds fewer records than its count says is damaged and fails with a `corrupt` error.
+
+A process that opens the file while another appends to it reads the symbols the header counted when it opened the file, never a count over records it cannot see. The records appended meanwhile are read at its next open of the file. An append cuts only bytes that no count covers: when the header no longer holds the count the process last read, its append fails with a `corrupt` error and leaves the file as it is.
 
 The C functions below work on the runtime's global symbol table instead. `ray_sym_save` writes the whole table to a temporary file and renames it over the target, and `ray_sym_load` merges a file into the running table.
 
@@ -345,7 +370,7 @@ A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/
 
 A save also builds indexes of its own for columns of at least 65 536 rows: a dictionary for a string column and a chunk zone (per-chunk min/max) for a numeric or temporal one. `{index: false}` builds neither, in either generation, for a table that is never queried by value (read by partition, by position or whole); the write is faster and the files are smaller. It governs only what the save builds. An index the column already carries is written as it always is: one you built (`.idx.hash`, `.idx.sort`, `.idx.bloom`), or a chunk zone a loaded column brought from its file, as when a table read from one splayed store is saved to another. A dictionary is only ever built, never carried over from the source, so `{index: false}` leaves a loaded string column without one. A column without an index reads as it does after a save of a short one. `true`, the default, builds the automatic indexes; a non-bool value is a `domain` error. `compress`, `symfile` and `index` combine in one dict: `{compress: true index: false}`.
 
-`{durable: false}` skips every fsync of the save (column files, symbol files, directories), the path `.csv.splayed` and the Parquet import already take; `true`, the default, syncs as before. The write still goes through temporary files and atomic renames, so a reader sees whole files; a crash or power loss may lose the write or leave it torn. For a table that is republished often and can be rebuilt from its source. A non-bool value is a `domain` error; it combines with the other options: `{durable: false compress: true}`.
+`{durable: false}` skips every fsync of the save (column files, symbol files, directories), the path `.csv.splayed` and the Parquet import already take; `true`, the default, syncs as before. Column files are still written through temporary files and atomic renames, so a reader sees whole files; the shared symbol file is appended to in place, as described under [Append-Only .sym Files](#append-only-sym-files). A crash or power loss may lose the write or leave it torn. For a table that is republished often and can be rebuilt from its source. A non-bool value is a `domain` error; it combines with the other options: `{durable: false compress: true}`.
 
 ### Compressed floating-point environment
 
@@ -465,3 +490,23 @@ it appears in a table schema. Upgrade readers before writing duration
 columns to shared storage. Existing column tags and format generations
 retain their meanings. Parquet logical time and duration mappings are
 separate from this column format.
+
+## GUID hash index compatibility
+
+A splayed save persists a hash index on a GUID column (`.idx.hash`,
+`grouped`) in both format generations, so the index is there after a
+load. Readers built before GUID hash indexes, v3.0.1 among them, treat
+the two generations differently:
+
+- **Generation 0.** They decline the index and load the column without
+  it; every answer is the same.
+- **Generation 2** (`{compress: true}`). They open the table and read its
+  other columns, but reading the GUID column fails with
+  `corrupt: index kind 1 is not admitted on type GUID`. The values on
+  disk are intact; only the index is unknown to them.
+
+Upgrade readers before writing indexed GUID columns to shared
+generation-2 storage, or save the column without its index
+(`.idx.drop`). Hash indexes on other column types, including one an
+append extended, keep the format older readers read. Existing column
+tags and format generations retain their meanings.

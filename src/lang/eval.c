@@ -193,8 +193,115 @@ bool ray_raise_render(char* buf, size_t cap) {
  * Restricted-mode check
  * ══════════════════════════════════════════ */
 
+/* The flag alone; the frames a request may bind in are recorded by
+ * ray_eval_restrict_enter, which is how a request is evaluated. */
 void ray_eval_set_restricted(bool on) { if (__VM) __VM->restricted = on; }
 bool ray_eval_get_restricted(void)    { return __VM && __VM->restricted; }
+
+/* A request is evaluated in the restriction of the connection it came on.
+ * It may arrive while server code is inside a frame (a request a peer
+ * pushes back during a sync send), so the frames already open are recorded
+ * as not the request's own: env.c refuses a restricted binding into them
+ * as it does into the global frame.  Restores both on leave. */
+void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s) {
+    s->restricted = __VM && __VM->restricted;
+    s->base = __VM ? __VM->restricted_base : 0;
+    if (!__VM) return;
+    __VM->restricted = on;
+    __VM->restricted_base = __VM->scope_depth;
+}
+void ray_eval_restrict_leave(const ray_restrict_save_t* s) {
+    if (!__VM) return;
+    __VM->restricted = s->restricted;
+    __VM->restricted_base = s->base;
+}
+
+/* The lift log of the request in progress on this thread (see eval.h),
+ * NULL when none: then every trusted call runs lifted. */
+static _Thread_local ray_lift_log_t* g_lift_log;
+
+void ray_eval_lift_record(ray_lift_log_t* log) {
+    *log = (ray_lift_log_t){ .ids = log->inline_ids, .cap = 8, .prev = g_lift_log };
+    g_lift_log = log;
+}
+
+void ray_eval_lift_check(ray_lift_log_t* log, const int64_t* ids, int64_t n) {
+    *log = (ray_lift_log_t){ .check = true, .ids = (int64_t*)ids, .n = n, .prev = g_lift_log };
+    g_lift_log = log;
+}
+
+void ray_eval_lift_done(ray_lift_log_t* log) {
+    g_lift_log = log->prev;
+    if (!log->check && log->ids != log->inline_ids) ray_sys_free(log->ids);
+    log->ids = log->inline_ids;
+}
+
+static uint64_t trust_hash(uint64_t h, const void* bytes, int64_t n) {
+    const uint8_t* p = (const uint8_t*)bytes;
+    for (int64_t i = 0; i < n; i++) { h ^= p[i]; h *= UINT64_C(0x100000001b3); }
+    return h;
+}
+
+/* The identity `lambda` has when trusted under `name` (-1: as a value),
+ * or 0 when a part of it cannot be serialized: it then has none, since two
+ * lambdas differing only in that part would share one. */
+static uint64_t trust_identity(ray_t* lambda, int64_t name) {
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    ray_t* ns = name >= 0 ? ray_sym_str(name) : NULL;   /* borrowed */
+    if (ns) h = trust_hash(h, ray_str_ptr(ns), (int64_t)ray_str_len(ns));
+    h = trust_hash(h, "", 1);   /* the name ends here */
+    /* The captures too: closures of one factory differ only in them. */
+    ray_t* parts[3] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda), LAMBDA_CLOSURE(lambda) };
+    /* Without the snapshot's trust bits, whoever asks: a captured trusted
+     * lambda hashes the same live and while a snapshot loads. */
+    bool keep = ray_serde_keep_trust(false);
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; i++) {
+        ray_t* bytes = parts[i] ? ray_ser(parts[i]) : NULL;
+        if (bytes && !RAY_IS_ERR(bytes)) {
+            h = trust_hash(h, ray_data(bytes), bytes->len);
+            ray_release(bytes);
+        } else if (parts[i]) {
+            if (bytes) ray_error_free(bytes);
+            ok = false;
+        }
+        h = trust_hash(h, &i, sizeof i);   /* the part ends here */
+    }
+    ray_serde_keep_trust(keep);
+    if (!ok) return 0;
+    /* Never 0, which means untrusted; bit 0 is "trusted by name". */
+    return (h << 2) | 2 | (name >= 0 ? 1 : 0);
+}
+
+bool ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
+    LAMBDA_TRUSTED(lambda) = trust_identity(lambda, name);
+    return LAMBDA_TRUSTED(lambda) != 0;
+}
+
+/* Whether a trusted call of restricted code may run lifted, given the
+ * request's lift log: recording keeps its identity (and refuses the lift
+ * when it cannot, so that replay, which will find no record, agrees);
+ * checking lets it run lifted only as the next call recorded live. */
+static bool lift_permitted(ray_t* lambda) {
+    ray_lift_log_t* log = g_lift_log;
+    if (!log) return true;
+    int64_t id = (int64_t)LAMBDA_TRUSTED(lambda);
+    if (log->check) {
+        if (log->next < log->n && log->ids[log->next] == id) { log->next++; return true; }
+        return false;
+    }
+    if (log->n == log->cap) {
+        int64_t cap = log->cap * 2;
+        int64_t* ids = (int64_t*)ray_sys_alloc((size_t)cap * sizeof(int64_t));
+        if (!ids) { log->failed = true; return false; }
+        memcpy(ids, log->ids, (size_t)log->n * sizeof(int64_t));
+        if (log->ids != log->inline_ids) ray_sys_free(log->ids);
+        log->ids = ids;
+        log->cap = cap;
+    }
+    log->ids[log->n++] = id;
+    return true;
+}
 
 bool ray_fn_is_local_mutator(const ray_t* fn) {
     if (!fn || fn->type != RAY_VARY) return false;
@@ -214,6 +321,17 @@ static bool mutator_head_is_global(const ray_t* hd, const ray_t* head) {
 
 static inline bool fn_is_restricted(ray_t* fn_obj) {
     return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
+}
+
+/* A lambda the server marked with .sys.trust, called by restricted code:
+ * its body runs with the restriction lifted, isolated from the caller's
+ * scope frames and query.  call_lambda_impl lifts and isolates it, and
+ * puts both back, around a call it runs to completion in a C frame of its
+ * own, so they are back however the body ended (an error, a raise, a
+ * return); the VM never pushes such a call as a frame of its own
+ * executor. */
+static inline bool lambda_lifts(ray_t* lambda) {
+    return LAMBDA_TRUSTED(lambda) && __VM->restricted;
 }
 
 static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
@@ -516,6 +634,92 @@ static ray_t* undefined_name_error(int64_t sym) {
 
 static ray_t* head_not_callable_error(int8_t type) {
     return ray_error("type", "head is not callable, got %s", ray_type_name(type));
+}
+
+/* (.sys.trust f), (.sys.trust 'name), (.sys.trust ['a 'b]): mark lambdas
+ * trusted.  A call to one from restricted code (-U) runs its body, and
+ * whatever the body calls, with the restriction lifted and isolated from
+ * the caller's scope frames and query (lambda_lifts).
+ * The builtin is restricted itself, so only unrestricted code, a boot
+ * script, can mark.  The mark lives on the lambda object: ser/de and IPC
+ * do not carry it (a journal snapshot does, ray_serde_keep_trust), a
+ * closure the body makes does not get it, and a lambda a request builds
+ * has none.  A name means the global bound to it, as at
+ * the top level, never a local of the caller, and is not dotted; each
+ * must hold a lambda, or none is marked.  Returns its
+ * argument. */
+ray_t* ray_sys_trust_fn(ray_t* x) {
+    if (x->type == RAY_LAMBDA) {
+        /* Already trusted under a name: it keeps that identity. */
+        if (!(LAMBDA_TRUSTED(x) & 1)) {
+            uint64_t ident = trust_identity(x, -1);
+            if (!ident) return ray_error("domain", ".sys.trust: the lambda cannot be serialized, so it has no identity");
+            LAMBDA_TRUSTED(x) = ident;
+        }
+        ray_retain(x);
+        return x;
+    }
+    if (x->type != -RAY_SYM && x->type != RAY_SYM)
+        return ray_error("type", ".sys.trust: expected a lambda or the names of lambdas, got %s",
+                         ray_type_name(x->type));
+    int64_t n = x->type == -RAY_SYM ? 1 : x->len;
+    /* Look the names up with every frame hidden, as at the top level. */
+    int32_t scope_base = ray_env_isolate_begin();
+    ray_t* err = NULL;
+    uint64_t ident_buf[16];
+    uint64_t* idents = n <= 16 ? ident_buf : (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
+    if (!idents) { ray_env_isolate_end(scope_base); return ray_error("oom", NULL); }
+    for (int pass = 0; pass < 2 && !err; pass++) {
+        for (int64_t i = 0; i < n; i++) {
+            int64_t id = x->type == -RAY_SYM ? x->i64
+                                             : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
+            ray_t* fn = ray_env_get(id);   /* borrowed */
+            if (pass == 1) { LAMBDA_TRUSTED(fn) = idents[i]; continue; }
+            if (!fn) { err = undefined_name_error(id); break; }
+            if (fn->type != RAY_LAMBDA) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("type", ".sys.trust: '%.*s' is %s, not a lambda",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "",
+                                ray_type_name(fn->type));
+                break;
+            }
+            /* One object, one name: its identity includes the name, and
+             * recovery gives each binding the identity of its own name, so
+             * a second name would not replay. */
+            /* A dotted name's lambda sits in a dict, which a snapshot loads
+             * without the name: its identity would not survive recovery.
+             * Such a lambda is trusted as a value. */
+            if (ray_sym_is_dotted(id)) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("domain", ".sys.trust: '%.*s' is a dotted name; trust the lambda as a value",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
+                break;
+            }
+            idents[i] = trust_identity(fn, id);
+            if (!idents[i]) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("domain", ".sys.trust: the lambda '%.*s' holds cannot be serialized, so it has no identity",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
+                break;
+            }
+            bool second = (LAMBDA_TRUSTED(fn) & 1) && LAMBDA_TRUSTED(fn) != idents[i];
+            for (int64_t k = 0; k < i && !second; k++) {
+                int64_t prev = ray_read_sym(ray_data(x), k, RAY_SYM, x->attrs);
+                second = prev != id && ray_env_get(prev) == fn;
+            }
+            if (second) {
+                ray_t* s = ray_sym_str(id);   /* borrowed */
+                err = ray_error("domain", ".sys.trust: the lambda '%.*s' holds is trusted under another name",
+                                s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "");
+                break;
+            }
+        }
+    }
+    ray_env_isolate_end(scope_base);
+    if (idents != ident_buf) ray_sys_free(idents);
+    if (err) return err;
+    ray_retain(x);
+    return x;
 }
 
 /* Dispose of a construction temporary that was not handed on: an error is
@@ -1097,6 +1301,90 @@ static void symcmp_eq_run(symcmp_ctx_t* ctx, int64_t n) {
         symcmp_eq_fn(ctx, 0, 0, n);
 }
 
+/* B8 comparison (== <> < <= > >=) of two B8 vectors, or a B8 vector and a B8
+ * atom.  A byte is truthy when non-zero, as in and / or / not.  The typed DAG
+ * path does not take BOOL, so without this the comparison fell to the boxed
+ * per-element loop (a BOOL atom allocated per row).  `b` is NULL when the
+ * right operand is the atom `bv`; the caller mirrors the operator when the
+ * atom is on the left. */
+typedef struct {
+    const uint8_t* a;
+    const uint8_t* b;
+    uint8_t*       out;
+    uint8_t        bv;
+    uint16_t       op;
+} boolcmp_ctx_t;
+
+static void boolcmp_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const boolcmp_ctx_t* c = (const boolcmp_ctx_t*)vctx;
+    const uint8_t* a = c->a;
+    const uint8_t* b = c->b;
+    uint8_t* o = c->out;
+    uint8_t bv = c->bv;
+#define BOOLCMP_CASE(OPC, CMP)                                                     \
+    case OPC:                                                                      \
+        if (b) for (int64_t i = lo; i < hi; i++)                                   \
+                   o[i] = (uint8_t)((a[i] != 0) CMP (b[i] != 0));                  \
+        else   for (int64_t i = lo; i < hi; i++)                                   \
+                   o[i] = (uint8_t)((a[i] != 0) CMP bv);                           \
+        break;
+    switch (c->op) {
+        BOOLCMP_CASE(OP_EQ, ==)
+        BOOLCMP_CASE(OP_NE, !=)
+        BOOLCMP_CASE(OP_LT, <)
+        BOOLCMP_CASE(OP_LE, <=)
+        BOOLCMP_CASE(OP_GT, >)
+        BOOLCMP_CASE(OP_GE, >=)
+    default: break;
+    }
+#undef BOOLCMP_CASE
+}
+
+/* The operator that gives the same answer with its operands swapped. */
+static uint16_t boolcmp_mirror(uint16_t op) {
+    switch (op) {
+    case OP_LT: return OP_GT;
+    case OP_LE: return OP_GE;
+    case OP_GT: return OP_LT;
+    case OP_GE: return OP_LE;
+    default:    return op;
+    }
+}
+
+/* NULL when the operands are not a B8 vector against a B8 vector or a non-null
+ * B8 atom; otherwise the BOOL result vector (possibly an error). */
+static ray_t* bool_cmp_fast(uint16_t op, ray_t* left, ray_t* right) {
+    bool lv = ray_is_vec(left)  && left->type  == RAY_BOOL;
+    bool rv = ray_is_vec(right) && right->type == RAY_BOOL;
+    bool la = left->type  == -RAY_BOOL && !RAY_ATOM_IS_NULL(left);
+    bool ra = right->type == -RAY_BOOL && !RAY_ATOM_IS_NULL(right);
+    if (!((lv && rv) || (lv && ra) || (la && rv))) return NULL;
+    ray_t* vec  = lv ? left : right;
+    int64_t n = vec->len;
+    ray_t* out = ray_vec_new(RAY_BOOL, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    boolcmp_ctx_t c = { .out = (uint8_t*)ray_data(out), .b = NULL, .bv = 0, .op = op };
+    if (lv && rv) {
+        c.a = (const uint8_t*)ray_data(left);
+        c.b = (const uint8_t*)ray_data(right);
+    } else if (lv) {
+        c.a = (const uint8_t*)ray_data(left);
+        c.bv = right->b8 != 0;
+    } else {
+        c.a = (const uint8_t*)ray_data(right);
+        c.bv = left->b8 != 0;
+        c.op = boolcmp_mirror(op);
+    }
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && n >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, boolcmp_fn, &c, n);
+    else
+        boolcmp_fn(&c, 0, 0, n);
+    out->len = n;
+    return out;
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
@@ -1281,8 +1569,13 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
 
         /* Div/mod: only I64×I64 (executor has floor-div semantics for I64) */
         if (is_idiv && !(lt == RAY_I64 && rt == RAY_I64)) can_dag = 0;
-        /* Comparisons: same-type only (cross-type promotion loses type info) */
-        if (is_cmp && lt != rt) can_dag = 0;
+        /* Comparisons of different numeric types run through the DAG as well:
+         * the result is a BOOL, so there is no type tag to lose, and the
+         * kernels compare integer-family operands as int64 and anything with a
+         * float as double, as ray_eq_fn and friends do.  A temporal operand of
+         * a different type is still refused just below.  (Same-type-only
+         * sent (== u8vec 7), an integer literal against a narrower or float
+         * vector, to the boxed per-element loop: 24 - 37 ms per million rows.) */
         /* Cross-type temporal: DAG promote() loses type tag (int+TIMESTAMP→I64 not TIMESTAMP).
          * POW rejects temporals entirely; its scalar builtin treats power as
          * a numeric-only operation and returns F64. */
@@ -1295,37 +1588,57 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         if (can_dag) {
                 ray_graph_t* g = ray_graph_new(NULL);
                 if (g) {
+                    /* A scalar on the left of a comparison with a vector is
+                     * the mirrored comparison with the scalar on the right
+                     * ((< 7 v) is (> v 7)), the shape the typed kernels
+                     * broadcast.  Null-as-minimum is symmetric, so the
+                     * answer is the same. */
+                    ray_t* dl = left;
+                    ray_t* dr = right;
+                    int dl_scalar = l_num_scalar, dr_scalar = r_num_scalar;
+                    uint16_t dop = dag_opcode;
+                    if (is_cmp && l_num_scalar && r_num_vec) {
+                        dl = right; dr = left;
+                        dl_scalar = r_num_scalar; dr_scalar = l_num_scalar;
+                        switch (dag_opcode) {
+                        case OP_LT: dop = OP_GT; break;
+                        case OP_LE: dop = OP_GE; break;
+                        case OP_GT: dop = OP_LT; break;
+                        case OP_GE: dop = OP_LE; break;
+                        default: break;
+                        }
+                    }
                     /* Build left operand node */
                     ray_op_t* lop = NULL;
-                    if (l_num_scalar) {
-                        if (left->type == -RAY_F64)
-                            lop = ray_const_f64(g, left->f64);
-                        else if (left->type == -RAY_F32)
-                            lop = ray_const_atom(g, left);
+                    if (dl_scalar) {
+                        if (dl->type == -RAY_F64)
+                            lop = ray_const_f64(g, dl->f64);
+                        else if (dl->type == -RAY_F32)
+                            lop = ray_const_atom(g, dl);
                         else {
-                            int64_t sv = as_i64(left);
+                            int64_t sv = as_i64(dl);
                             lop = ray_const_i64(g, sv);
-                            if (lop) lop->out_type = -(left->type);
+                            if (lop) lop->out_type = -(dl->type);
                         }
                     } else {
-                        lop = ray_const_vec(g, left);
+                        lop = ray_const_vec(g, dl);
                     }
                     ray_op_t* rop = NULL;
-                    if (r_num_scalar) {
-                        if (right->type == -RAY_F64)
-                            rop = ray_const_f64(g, right->f64);
-                        else if (right->type == -RAY_F32)
-                            rop = ray_const_atom(g, right);
+                    if (dr_scalar) {
+                        if (dr->type == -RAY_F64)
+                            rop = ray_const_f64(g, dr->f64);
+                        else if (dr->type == -RAY_F32)
+                            rop = ray_const_atom(g, dr);
                         else {
-                            int64_t sv = as_i64(right);
+                            int64_t sv = as_i64(dr);
                             rop = ray_const_i64(g, sv);
-                            if (rop) rop->out_type = -(right->type);
+                            if (rop) rop->out_type = -(dr->type);
                         }
                     } else {
-                        rop = ray_const_vec(g, right);
+                        rop = ray_const_vec(g, dr);
                     }
                     if (lop && rop) {
-                        ray_op_t* root = ray_binop(g, dag_opcode, lop, rop);
+                        ray_op_t* root = ray_binop(g, dop, lop, rop);
                         if (root) {
                             if (is_idiv) root->out_type = RAY_I64;
                             ray_t* result = ray_execute(g, root);
@@ -1350,6 +1663,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                 }
             }
         }
+    /* B8 comparisons: both operands B8 (the DAG path above takes no BOOL). */
+    if (!force_boxed && dag_opcode >= OP_EQ && dag_opcode <= OP_GE && out_type == RAY_BOOL) {
+        ray_t* r = bool_cmp_fast(dag_opcode, left, right);
+        if (r) { ray_release(e0); return r; }
+    }
     /* R7 fast path: (== or !=) of SYM-vec against a SYM atom.
      *
      * The DAG path above doesn't handle SYM (IS_NUM_TYPE excludes it),
@@ -1795,8 +2113,17 @@ ray_t* ray_list_collapse_bool(ray_t* list) {
     return vec;
 }
 
+/* One element of a collection mapped by an atomic unary function.  A nested
+ * collection (the rows of a list of vectors) is mapped in turn, as the binary
+ * atomic path does, instead of being handed whole to a function that only
+ * takes atoms. */
+static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
+    return is_collection(e) ? atomic_map_unary(fn, e) : fn(e);
+}
+
 /* Map a unary function element-wise over a collection.
- * Produces typed vectors when output is numeric/bool, boxed lists otherwise. */
+ * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
+ * a nested collection maps to a collection of the same shape. */
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
 
@@ -1825,7 +2152,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     /* Probe first element to determine output type */
     int alloc0 = 0;
     ray_t* e0_in = collection_elem(arg, 0, &alloc0);
-    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : fn(e0_in);
+    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : atomic_unary_elem(fn, e0_in);
     if (alloc0) ray_release(e0_in);
     if (RAY_IS_ERR(e0)) return e0;
 
@@ -1844,15 +2171,28 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
         for (int64_t i = 1; i < len; i++) {
             int alloc = 0;
             ray_t* e = collection_elem(arg, i, &alloc);
-            ray_t* elem = RAY_IS_ERR(e) ? e : fn(e);
+            ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
             if (alloc) ray_release(e);
             if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+            if (elem->type >= 0) {
+                /* A nested collection after an atom: the typed vector cannot
+                 * hold it.  Start over as a boxed list. */
+                ray_release(elem);
+                ray_release(vec);
+                int alloc_r = 0;
+                ray_t* e_r = collection_elem(arg, 0, &alloc_r);
+                e0 = RAY_IS_ERR(e_r) ? e_r : atomic_unary_elem(fn, e_r);
+                if (alloc_r) ray_release(e_r);
+                if (RAY_IS_ERR(e0)) return e0;
+                goto boxed;
+            }
             store_typed_elem(vec, i, elem);
             ray_release(elem);
         }
         return vec;
     }
 
+boxed:;
     /* Fallback: boxed list for non-numeric output */
     ray_t* result = ray_alloc(len * sizeof(ray_t*));
     if (!result) { ray_release(e0); return ray_error("oom", NULL); }
@@ -1864,7 +2204,7 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     for (int64_t i = 1; i < len; i++) {
         int alloc = 0;
         ray_t* e = collection_elem(arg, i, &alloc);
-        ray_t* elem = RAY_IS_ERR(e) ? e : fn(e);
+        ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
         if (alloc) ray_release(e);
         if (RAY_IS_ERR(elem)) {
             /* Trim to the initialized prefix — see atomic_map_binary_op:
@@ -1883,6 +2223,39 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
 /* ══════════════════════════════════════════
  * Higher-order functions: map, pmap, fold, scan, filter, apply
  * ══════════════════════════════════════════ */
+
+/* Calling a variadic builtin or a special form with values (map, fold, scan,
+ * apply, ... hand their function its arguments already evaluated).
+ *
+ * An ordinary variadic builtin takes values: the same call the evaluator
+ * makes for (f x y).  A special form takes its argument expressions and
+ * evaluates them itself, so handed values it would evaluate them again (a
+ * boxed list value would run as a call); `and` and `or` are the exceptions,
+ * because the evaluator's own element-wise binary forms, ray_and_fn and
+ * ray_or_fn, give the same answer for values that are already evaluated, and
+ * a single value is their identity. */
+static bool fn_is_vary(const ray_t* fn, ray_vary_fn f) {
+    return fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == f;
+}
+
+static ray_t* special_form_value_error(const ray_t* fn) {
+    return ray_error("type", "call: '%s' is a special form: it takes its arguments unevaluated, "
+                             "so it cannot be applied to values", ray_fn_name(fn));
+}
+
+/* An ordinary variadic builtin applied to `n` borrowed values. */
+static ray_t* call_vary_values(ray_t* fn, ray_t* const* args, int64_t n) {
+    if (fn->attrs & RAY_FN_SPECIAL_FORM) return special_form_value_error(fn);
+    ray_t* own[2];
+    for (int64_t i = 0; i < n; i++) { ray_retain(args[i]); own[i] = args[i]; }
+    if (!(fn->attrs & RAY_FN_LAZY_AWARE)) {
+        ray_t* err = materialize_owned_args(own, n);   /* releases them all on error */
+        if (err) return err;
+    }
+    ray_t* r = ((ray_vary_fn)(uintptr_t)fn->i64)(own, n);
+    for (int64_t i = 0; i < n; i++) ray_release(own[i]);
+    return r;
+}
 
 /* Helper: call a function object with 1 arg, returning result.
  * Handles UNARY, BINARY, LAMBDA types. Does not release fn or arg. */
@@ -1910,14 +2283,29 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
         ray_t* args[1] = { arg };
         return call_lambda(fn, args, 1);
     }
+    if (fn->type == RAY_BINARY)
+        return ray_error("arity", "call: '%s' expects 2 arguments, got 1", ray_fn_name(fn));
+    if (fn->type == RAY_VARY) {
+        if (fn_is_vary(fn, ray_and_vary_fn) || fn_is_vary(fn, ray_or_vary_fn)) {
+            /* (and x) is (or x) is x */
+            ray_t* a = arg;
+            ray_retain(a);
+            if (ray_is_lazy(a)) a = ray_lazy_materialize(a);   /* consumes our ref */
+            return a ? a : ray_error("type", NULL);
+        }
+        return call_vary_values(fn, &arg, 1);
+    }
     return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
 }
 
 /* Helper: call a function object with 2 args. Does not release fn or args. */
 ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
     if (fn_is_restricted(fn)) return ray_error("access", "restricted");
-    if (fn->type == RAY_BINARY) {
-        ray_binary_fn f = (ray_binary_fn)(uintptr_t)fn->i64;
+    ray_binary_fn bin = NULL;
+    if (fn->type == RAY_BINARY)                  bin = (ray_binary_fn)(uintptr_t)fn->i64;
+    else if (fn_is_vary(fn, ray_and_vary_fn))    bin = ray_and_fn;
+    else if (fn_is_vary(fn, ray_or_vary_fn))     bin = ray_or_fn;
+    if (bin) {
         ray_t* la = a;
         ray_t* lb = b;
         bool owned_a = false, owned_b = false;
@@ -1940,9 +2328,9 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
         }
         ray_t* r;
         if ((fn->attrs & RAY_FN_ATOMIC) && (is_collection(la) || is_collection(lb)))
-            r = atomic_map_binary(f, la, lb);
+            r = atomic_map_binary(bin, la, lb);
         else
-            r = f(la, lb);
+            r = bin(la, lb);
         if (owned_a) ray_release(la);
         if (owned_b) ray_release(lb);
         return r;
@@ -1981,6 +2369,10 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
         }
         /* Legacy helper behavior for unary functions without an overload. */
         return f(a);
+    }
+    if (fn->type == RAY_VARY) {
+        ray_t* args[2] = { a, b };
+        return call_vary_values(fn, args, 2);
     }
     return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
 }
@@ -2445,7 +2837,11 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
         val = ray_lazy_materialize(val);
     if (RAY_IS_ERR(val)) return val;
     ray_err_t err = ray_env_set_local_rows(name_obj->i64, val, rows);
-    if (err != RAY_OK) { ray_release(val); return ray_error(ray_err_code_str(err), NULL); }
+    if (err != RAY_OK) {
+        ray_release(val);
+        return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
+                                     : ray_error(ray_err_code_str(err), NULL);
+    }
     return val;
 }
 
@@ -2635,6 +3031,7 @@ ray_t* ray_times_fn(ray_t** args, int64_t n) {
             if (RAY_IS_ERR(idx)) return idx;
             ray_err_t e = ray_env_set_local_rows(name, idx, 0);
             ray_release(idx);
+            if (e == RAY_ERR_ACCESS) return ray_error("access", "restricted");
             if (e != RAY_OK) return ray_error(ray_err_code_str(e), NULL);
         }
         for (int64_t i = 1; i < n; i++) {
@@ -3097,6 +3494,22 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
     if (out_rows) *out_rows = -1;
+    if (RAY_UNLIKELY(lambda_lifts(lambda)) && lift_permitted(lambda)) {
+        /* Isolated as well as lifted: the body sees its arguments, its
+         * captures and the globals, as it would called at the top level.
+         * The caller's locals, eval windows and query stay hidden, so a
+         * restricted caller cannot rebind a name the body reads. */
+        ray_query_state_t query_state;
+        ray_query_suspend(&query_state);
+        int32_t scope_base = ray_env_isolate_begin();
+        bool restricted = __VM->restricted;
+        __VM->restricted = false;
+        ray_t* result = call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
+        __VM->restricted = restricted;
+        ray_env_isolate_end(scope_base);
+        ray_query_resume(&query_state);
+        return result;
+    }
     /* A lambda called inside a named helper's body is that body's text. */
     if (query && !named) named = ray_eval_query_helper_literals();
     /* Lazy compilation (see lambda_wants_compile); a closure's captures
@@ -3203,6 +3616,8 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
 }
 
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
+    if (RAY_UNLIKELY(lambda_lifts(lambda)))
+        return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
     if (lambda_wants_compile(lambda)) lambda_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
     return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
@@ -3755,8 +4170,10 @@ op_callf: {
     ray_t *fn_obj = POP();
 
     /* Compiled lambda: push frame, switch to callee bytecode.  A lambda
-     * made inside a query stays on the tree walker (see call_lambda_impl). */
-    if (fn_obj->type == RAY_LAMBDA) {
+     * made inside a query stays on the tree walker (see call_lambda_impl),
+     * and a trusted one called by restricted code goes there too, to run
+     * lifted in a frame of its own (lambda_lifts). */
+    if (fn_obj->type == RAY_LAMBDA && !lambda_lifts(fn_obj)) {
         if (lambda_wants_compile(fn_obj))
             lambda_compile(fn_obj);
 
@@ -3900,7 +4317,8 @@ unary_done:
             break;
         case RAY_LAMBDA: {
             /* An uncompiled lambda (a closure): interpreted, with the
-             * arguments' row provenance when a query is active. */
+             * arguments' row provenance when a query is active.  A trusted
+             * lambda under restriction also comes here, compiled or not. */
             bool in_query = ray_active_query_table() != NULL;
             result = call_lambda_impl(fn_obj, fn_args, n, in_query, args_bits, true, &lambda_rows);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
@@ -4898,6 +5316,7 @@ static void ray_register_builtins(void) {
     register_unary(".sys.cmd",    RAY_FN_RESTRICTED, ray_syscmd_string_dispatch_fn);
     register_vary (".sys.timeit", RAY_FN_NONE,       ray_sys_timeit_fn);
     register_unary(".sys.listen", RAY_FN_RESTRICTED, ray_sys_listen_fn);
+    register_unary(".sys.trust",  RAY_FN_RESTRICTED, ray_sys_trust_fn);
     register_vary (".sys.env",    RAY_FN_NONE,       ray_sys_env_fn);
     register_vary (".sys.args",   RAY_FN_NONE,       ray_sys_args_fn);
 
@@ -5040,6 +5459,11 @@ static void ray_register_builtins(void) {
     register_binary("inner-prod",  RAY_FN_NONE, ray_inner_prod_fn);
     register_binary("l2-dist",     RAY_FN_NONE, ray_l2_dist_fn);
     register_unary ("norm",        RAY_FN_NONE, ray_norm_fn);
+    register_binary("mmu",         RAY_FN_NONE, ray_mmu_fn);
+    register_binary("lsq",         RAY_FN_NONE, ray_lsq_fn);
+    register_unary ("inv",         RAY_FN_NONE, ray_inv_fn);
+    register_unary ("flip",        RAY_FN_NONE, ray_flip_mat_fn);
+    register_unary ("gram",        RAY_FN_NONE, ray_gram_fn);
     register_vary  ("knn",         RAY_FN_NONE, ray_knn_fn);
     register_vary  ("hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
     register_vary  ("ann",         RAY_FN_NONE, ray_ann_fn);

@@ -148,14 +148,21 @@ enum {
  *   data[8] = ray_t* caprows      (RAY_U8 row flag per capture, or NULL)
  *   data[9] = uint32_t capq       (serial of the query frame the closure was
  *                                  made under, 0 if none; never serialized)
+ *   data[10] = uint64_t trusted   (0, or the identity .sys.trust gave the
+ *                                  lambda: a restricted caller may run the
+ *                                  body unrestricted.  Bit 0 says it was
+ *                                  trusted by name.  Kept only through a
+ *                                  journal snapshot, never given to a
+ *                                  closure; see ray_eval_lambda_trust)
  */
-#define LAMBDA_SLOTS 10
+#define LAMBDA_SLOTS 11
 
 /* The slots that hold no reference, and the last one that does.  The free
  * walk in mem/heap.c drops slots 0 .. LAMBDA_SLOT_CAPROWS but n_locals. */
 #define LAMBDA_SLOT_NLOCALS   4
 #define LAMBDA_SLOT_CAPROWS   8
 #define LAMBDA_SLOT_CAPQ      9
+#define LAMBDA_SLOT_TRUSTED   10
 
 #define RAY_FN_COMPILED  0x40   /* lambda has been compiled to bytecode */
 
@@ -169,6 +176,7 @@ enum {
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 #define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
 #define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
+#define LAMBDA_TRUSTED(lam)   (*((uint64_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_TRUSTED]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
 
@@ -284,6 +292,37 @@ bool   ray_raise_render(char* buf, size_t cap);
 /* Restricted mode: when true, builtins with RAY_FN_RESTRICTED are blocked. */
 void ray_eval_set_restricted(bool on);
 bool ray_eval_get_restricted(void);
+typedef struct { bool restricted; int32_t base; } ray_restrict_save_t;
+void ray_eval_restrict_enter(bool on, ray_restrict_save_t* s);
+void ray_eval_restrict_leave(const ray_restrict_save_t* s);
+
+/* Mark `lambda` trusted (#787).  Its identity, kept in LAMBDA_TRUSTED, is
+ * a hash of the global name it is trusted under (`name`, -1 when trusted
+ * as a value), its parameters, its body and its captures: computed once
+ * here, the same in every process, and different for two verbs of the
+ * same text or two closures of one factory.  False, leaving the lambda
+ * untrusted, when a part of it cannot be serialized. */
+bool ray_eval_lambda_trust(ray_t* lambda, int64_t name);
+
+/* The trusted calls of one journaled restricted request (#787), so that
+ * replay lifts exactly the calls that ran lifted live.  The IPC path
+ * records into a log around a request it journals: each call that runs
+ * lifted appends the identity of its lambda.  Replay checks against the
+ * identities the request's journal note holds: a call runs lifted only if
+ * its lambda is the next one recorded, so a call refused live (its trust
+ * revoked after the snapshot replay restores) stays refused.  Logs nest;
+ * each begin is paired with ray_eval_lift_done on the same thread. */
+typedef struct ray_lift_log {
+    bool     check;             /* replay: match, else record */
+    bool     failed;            /* record: an identity could not be kept */
+    int64_t* ids;               /* record: owned when ids != inline_ids */
+    int64_t  n, cap, next;
+    int64_t  inline_ids[8];
+    struct ray_lift_log* prev;
+} ray_lift_log_t;
+void    ray_eval_lift_record(ray_lift_log_t* log);
+void    ray_eval_lift_check(ray_lift_log_t* log, const int64_t* ids, int64_t n);
+void    ray_eval_lift_done(ray_lift_log_t* log);
 
 /* ===== Rayfall Builtin Functions ===== */
 
@@ -351,7 +390,7 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n);
 ray_t* ray_distinct_fn(ray_t* x);
 ray_t* ray_in_fn(ray_t* val, ray_t* vec);
 #ifdef DEBUG
-void   ray_in_guid_test_fail_alloc(int64_t nth);   /* tests: fail the nth guid `in` scratch allocation (0 = off) */
+void   ray_in_guid_test_fail_alloc(int64_t nth);   /* tests: fail the nth guid `in` or `find` scratch allocation (0 = off) */
 #endif
 ray_t* ray_in_eval_fn(ray_t* val, ray_t* vec);
 /* Query text concat; str_out: a STR atom operand is a STR column's cell.
@@ -427,6 +466,11 @@ ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
  * the raw mathematical dot product. */
 ray_t* ray_cos_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_inner_prod_fn(ray_t* a, ray_t* b);
+ray_t* ray_mmu_fn(ray_t* a, ray_t* b);
+ray_t* ray_lsq_fn(ray_t* b, ray_t* a);
+ray_t* ray_inv_fn(ray_t* x);
+ray_t* ray_flip_mat_fn(ray_t* x);
+ray_t* ray_gram_fn(ray_t* x);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_norm_fn(ray_t* x);
 ray_t* ray_knn_fn(ray_t** args, int64_t n);

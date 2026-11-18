@@ -1871,16 +1871,18 @@ static bool cq_child(const char* prefix, const char* script, long* cores, long* 
  * --cpus would set) sizes its default pool to 2 threads, or fewer when a
  * quota above the scope is tighter: the same child in a scope without a
  * quota gives that bound.  cores still counts every allowed CPU.  Skipped
- * where no systemd user manager makes scopes, and without ./rayforce (the
- * TSan job builds only the test binary). */
+ * where no systemd user manager makes scopes or applies CPUQuota=, and without
+ * ./rayforce (the TSan job builds only the test binary). */
 static test_result_t test_cpu_quota_child(void) {
 #if !defined(__linux__)
     SKIP("cgroup CPU quotas are Linux-only");
 #else
     if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
     if (system("command -v systemd-run >/dev/null 2>&1 && "
-               "systemd-run --user --scope -q true >/dev/null 2>&1") != 0)
-        SKIP("no systemd user manager to make a scope with a CPU quota");
+               "systemd-run --user --scope -q -p CPUQuota=150% sh -c '"
+               "f=/sys/fs/cgroup$(grep ^0:: /proc/self/cgroup | cut -d: -f3-)/cpu.max; "
+               "test -r \"$f\" && ! grep -q \"^max\" \"$f\"' >/dev/null 2>&1") != 0)
+        SKIP("the systemd user manager does not apply CPUQuota (cpu controller not delegated)");
     char script[128];
     snprintf(script, sizeof(script), "/tmp/rayforce_cq_%d.rfl", (int)getpid());
     FILE* f = fopen(script, "w");

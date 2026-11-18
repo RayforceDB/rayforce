@@ -1,0 +1,55 @@
+;; vary_callable.rfl — map, fold, scan and friends can call a variadic builtin,
+;; and `and` / `or` (#1194, #1189).
+;;
+;; call_fn1 / call_fn2 knew only UNARY, BINARY and LAMBDA, so `(fold or false v)`
+;; and `(map enlist v)` failed with "expected a callable function, got ?".  An
+;; ordinary variadic builtin is now called with the values it is given; `and`
+;; and `or` use their element-wise binary forms (their special-form shape takes
+;; unevaluated expressions); the other special forms, and a binary builtin given
+;; one argument, fail with a message that names the function.
+
+;; ── and / or as the function of a fold or scan ──
+(fold or false [true false]) -- true
+(fold or false [false false]) -- false
+(fold and true [true false]) -- false
+(fold and true [true true]) -- true
+(fold or false (list [false true] [true false] [false false])) -- [true true]
+(fold and true (list [true true] [true false])) -- [true false]
+(scan or [false true false false]) -- [false true true true]
+(scan and [true true false true]) -- [true true false false]
+
+;; the same as the lambda that was the workaround
+(fold or false [false false true]) -- (fold (fn [a b] (or a b)) false [false false true])
+(fold and true [true true false]) -- (fold (fn [a b] (and a b)) true [true true false])
+(scan or [false true false]) -- (scan (fn [a b] (or a b)) [false true false])
+
+;; one value is their identity; the values are not evaluated a second time
+(map and [true false]) -- [true false]
+(map or [1 0]) -- [1 0]
+(set a 5)
+(map or [a 'a]) -- [a 'a]
+(fold or false (list 'a 'b)) -- true
+
+;; ── other variadic builtins ──
+(map enlist [1 2]) -- (list [1] [2])
+(map list [1 2]) -- (list (list 1) (list 2))
+(fold list 0 [1 2]) -- (fold (fn [a b] (list a b)) 0 [1 2])
+(scan list [1 2 3]) -- (scan (fn [a b] (list a b)) [1 2 3])
+(map (fn [x] x) (map enlist [1 2])) -- (list [1] [2])
+
+;; ── errors that name the function ──
+(fold if 0 [1 2]) !- type
+(map do [1 2]) !- type
+(map + [1 2]) !- arity
+(at (try (fold if 0 [1 2]) (fn [e] e)) 'msg) -- "call: 'if' is a special form: it takes its arguments unevaluated, so it cannot be applied to values"
+(at (try (map do [1 2]) (fn [e] e)) 'msg) -- "call: 'do' is a special form: it takes its arguments unevaluated, so it cannot be applied to values"
+(at (try (fold select 0 [1 2]) (fn [e] e)) 'msg) -- "call: 'select' is a special form: it takes its arguments unevaluated, so it cannot be applied to values"
+(at (try (map + [1 2]) (fn [e] e)) 'msg) -- "call: '+' expects 2 arguments, got 1"
+(map abs [-1 2]) -- [1 2]
+
+;; ── the type name of every function kind ──
+(type or) -- 'VARY
+(type enlist) -- 'VARY
+(type +) -- 'BINARY
+(type abs) -- 'UNARY
+(type (fn [x] x)) -- 'LAMBDA

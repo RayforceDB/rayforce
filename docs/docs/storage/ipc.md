@@ -100,7 +100,7 @@ In restricted mode, specific builtins that write files, mutate state, or control
 | IPC chaining | `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post` |
 
 !!! note "Scope"
-    Restricted mode blocks every builtin registered with `RAY_FN_RESTRICTED` (the table above is a representative subset). It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
+    Restricted mode blocks every builtin registered with `RAY_FN_RESTRICTED` (the table above is a representative subset). A request binds only in frames it opens itself: a top-level `let` or `times` loop variable, which would bind in the global frame, is refused with `access` just as `set` is, and so is one in a request the server evaluates while its own code waits inside a frame (a request a peer sends back during a sync `.ipc.send`), which would bind into that code's frame. A client therefore cannot rebind a name other code reads or install a [connection hook](ipc-hooks.md). A `let` inside the request's own lambda or `do` block binds a local and is allowed. It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
 
 Attempting a restricted operation returns an `"access"` error:
 
@@ -115,6 +115,8 @@ Attempting a restricted operation returns an `"access"` error:
 
 !!! note "Security note"
     Restriction applies to all dispatch paths including higher-order functions. `(map .sys.exec ["echo hi"])` is also blocked in restricted mode.
+
+The rule covers everything a request evaluates, the server's own functions included. A server verb that must call a restricted builtin itself, such as `.ipc.send` to a peer, can be marked with [`.sys.trust`](../namespaces/sys.md#sys-trust) in the boot script: a restricted client that calls it runs that verb's body unrestricted, and nothing else it sends. The body runs isolated from the request, so the client's own bindings cannot rebind a name it reads. With `-l`/`-L` the mark survives a restart through the journal snapshot, and replay lifts a request's trusted calls only as they ran live (see [`.log.snapshot`](../namespaces/log.md#log-snapshot)).
 
 ## Client Builtins
 

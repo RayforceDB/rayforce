@@ -32,7 +32,7 @@ Signatures:
 
 `symfile` (dict option, `{symfile: 'shared}` or `{symfile: 'column}`): `'shared`, the default, writes one symbol file for every `SYM` column; `'column` gives each `SYM` column its own, `.<column>.sym` next to the column file (in the generation being written), holding that column's vocabulary only. `.db.splayed.get` resolves a column over its own symbol file whenever it has one. `'column` together with an explicit `sym_path`, or for a partition of a parted table, is a `domain` error; so is any other value.
 
-`durable` (dict option, `{durable: true}` or `{durable: false}`): `true`, the default, keeps the existing durable save: a column file, a symbol file or a directory that this write changes is fsynced before the write reports success (a clean symbol domain with nothing new to write is already on disk and is not rewritten). `false` takes the bulk path (the one `.csv.splayed` and the Parquet import use): none of the column files, symbol files or directories is fsynced. Files are still written under temporary names and renamed into place, so the rename stays atomic and a reader still sees whole files; but after a crash or power loss the write may be lost or torn (part new, part old, or files missing data). Use it for a table that is republished often and can be rebuilt from its source. It combines with `compress`, `symfile` and `index`: `{durable: false compress: true}`. A non-bool value is a `domain` error.
+`durable` (dict option, `{durable: true}` or `{durable: false}`): `true`, the default, keeps the existing durable save: a column file, a symbol file or a directory that this write changes is fsynced before the write reports success (a clean symbol domain with nothing new to write is already on disk and is not rewritten). `false` takes the bulk path (the one `.csv.splayed` and the Parquet import use): none of the column files, symbol files or directories is fsynced. Column files are still written under temporary names and renamed into place, so the rename stays atomic and a reader still sees whole files. The shared symbol file is not rewritten when it already exists: new symbols are appended to it in place (see [Append-Only .sym Files](../storage/index.md#append-only-sym-files)), and only its first write goes through a temporary name and a rename. After a crash or power loss the write may be lost or torn (part new, part old, or files missing data). Use it for a table that is republished often and can be rebuilt from its source. It combines with `compress`, `symfile` and `index`: `{durable: false compress: true}`. A non-bool value is a `domain` error.
 
 Compressed F32/F64 writes and whole-column materialization require default FP controls (nearest rounding, masked exceptions, no FTZ/DAZ) on every calling/executing thread. Rayforce never silently normalizes the host's controls. Detected unsupported controls return `fpenv`; restore supported controls before retrying. Detection is not a complete portable validator: see [the compressed floating-point environment contract](../storage/index.md#compressed-floating-point-environment) for conservative refusal scope, platform-specific checks, and embedder responsibilities.
 
@@ -70,9 +70,12 @@ Calling it again on the same thread reuses unchanged partitions while the earlie
 
 Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`), symbol-domain opens and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
 
-Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
+Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Supported `select` shapes can prune partitions using literal bounds on the virtual column, and on a data column whose partitions carry statistics (see below); see [Partition Pruning](../storage/index.md#partition-pruning) for admission limits and conservative declines.
 
-The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
+The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; `YYYY.MM.DD.HH.MM.SS` names (a real calendar date and a time of day, seconds precision, a year whose nanoseconds fit `int64` — about 1708 to 2292) give a `timestamp` `part` column, in chronological order; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A set that mixes these forms, or holds an impossible date, time or year, is a `sym` set. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
+
+!!! note "Compatibility"
+    `YYYY.MM.DD.HH.MM.SS` names used to load as a `sym` `part` column; they now load as `timestamp`. Mixed sets are unchanged.
 
 ```lisp
 (set dbroot "/tmp/rayforce-parted-db")
@@ -85,11 +88,29 @@ The directory names decide the key type and the partition order. `YYYY.MM.DD` na
 (.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile)
 (set trades (.db.parted.get dbroot 'trades))
 
-;; Partition prune — only the matching day's files are touched.
+;; A supported partition predicate; physical I/O depends on the query and storage.
 (select {from: trades where: (== date 2024.01.15)})
 ```
 
 Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string or name not a sym), `name` (sym ID unknown).
+
+### Pruning by partition statistics
+
+A `where:` comparison of a parted integer or temporal data column with a literal (`== != < <= > >= in`, alone or as a conjunct of a top-level `and`) prunes the partitions whose statistics decide it false for every row: a partition's non-null minimum and maximum, from the chunk directory of a column saved with `compress: true` or the chunk zone of a plain column of 65,536 rows or more. The rule is the one row-level zone skipping uses, so a null (which ranks below every value) keeps its partition for `<` and `<=`, and a partition without statistics is always kept. A time-series table partitioned by day therefore answers `(> Time 2024.01.16D12:00:00.000)` from the partitions of `2024.01.16` and later, with no declaration about how `Time` relates to the key; a late row in the live tail, a renamed column and a null are all found, because the statistics describe the rows themselves.
+
+```lisp
+(set jan15 (table ['time 'sym 'price]
+             (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] ['AAPL 'GOOG] [150.5 2800.0])))
+(set jan16 (table ['time 'sym 'price]
+             (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] ['MSFT 'AAPL] [410.0 151.0])))
+(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 symfile {compress: true})
+(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile {compress: true})
+(set trades (.db.parted.get dbroot 'trades))
+;; 2024.01.15 ends at 20:00: its statistics decide the comparison false,
+;; and only 2024.01.16 is read
+(select {from: trades where: (> time 2024.01.16D06:00:00.000)})
+;; one row: date 2024.01.16, time 2024.01.16D12:00:00.000, sym AAPL, price 151.0
+```
 
 ### In-memory live-tail inserts
 
@@ -99,7 +120,9 @@ The row payload describes the physical splayed schema only: omit the virtual `da
 
 The key may equal the table's last partition key, growing the current segment, or be strictly later, starting a new current segment. Inserts into any earlier or non-last partition are rejected; historical partitions are immutable. The loaded partition keys must already be strictly increasing in their logical type. Integer directory names are ordered by value, so `1`, `2`, `10` need no zero-padding; two spellings of one value (`1` and `01`) load as equal keys and are rejected here as `corrupt`. All historical physical segments must be present. A missing segment in the last partition can be repaired only by a non-empty same-key append; until repaired it blocks advancing the key. Missing `BOOL`/`U8` cannot be null-backfilled when the partition already has rows, but a zero-row segment needs no backfill.
 
-For a non-empty insert, the quoted-symbol form rebinds the target to the new logical view. Existing historical mmap segments are retained, while a segment receiving live rows becomes heap-backed. Queries and values that already retained the previous table remain stable snapshots; queries that resolve the symbol after the rebind see the new rows. Same-key growth rebuilds partition metadata and copies only the active segment; a later key builds a new tail. Batch incoming rows to avoid repeatedly copying a growing intraday segment.
+For a non-empty insert, the quoted-symbol form leaves the target bound to the grown view. Existing historical mmap segments are retained, while a segment receiving live rows becomes heap-backed. Queries and values that already retained the previous table remain stable snapshots; queries that resolve the symbol after the rebind see the new rows. The first same-key insert copies the active segment off its mapped file; a later key builds a new tail.
+
+Once the current partition is heap-backed, a same-key insert through a quoted symbol appends in place: when the binding is the only holder of the table, the batch lands in the existing segments with amortized growth, so the cost follows the rows appended, not the rows the partition already holds. The binding keeps the same table. If anything else holds the table or one of its columns — a snapshot bound to another name, a query still running over it — the insert copies the active segment instead and rebinds. The copy is a table of the binding's own, so the next insert appends in place again; the snapshot keeps its rows either way. By-value `(insert parted …)` always copies. A failed insert leaves the table with the rows it had.
 
 !!! warning "Memory only — no implicit durability"
     Live-tail insert does **not** create or change any on-disk partition, column, `.d`, or `.sym` file. An unpersisted tail is lost when the process exits. `upsert` is not supported on parted tables.

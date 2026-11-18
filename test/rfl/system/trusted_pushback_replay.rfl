@@ -1,0 +1,40 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; #787: a trusted verb whose body waits on a sync `.ipc.send` serves the
+;; requests its peer sends back meanwhile.  Such a pushed request is logged
+;; between the verb's request and that request's journal note, so the note
+;; names its request by log offset: after a restart the verb's write
+;; replays, as it ran.
+;;
+;; The peer (port 19958, unrestricted) answers `(bounce)` by sending a
+;; request back over the same connection.  The server (port 19959,
+;; `-U pw -l`) trusts `slowput`, which calls the peer and then writes `kv`,
+;; and `snap`.  A client sends `(snap)`, then `(slowput 5)`.  The server is
+;; then restarted with a boot script that leaves `kv` alone; replay, which
+;; reaches the peer again, must leave `kv` = 5.
+
+(.sys.exec "pkill -KILL -f '[r]ayforce -p 1995[89]' 2>/dev/null; rm -rf /tmp/rftest_trustpush; mkdir -p /tmp/rftest_trustpush; true") -- 0
+(write "/tmp/rftest_trustpush/peer.rfl" "(set bounce (fn [] (.ipc.send (.ipc.handle) \"(+ 1 1)\")))\n")
+(write "/tmp/rftest_trustpush/boot.rfl" "(set slowput (fn [v] (let h (.ipc.open \"127.0.0.1:19958\")) (.ipc.send h \"(bounce)\") (.ipc.close h) (set kv v) v))\n(set snap (fn [] (.log.snapshot) 0))\n(.sys.trust ['slowput 'snap])\n")
+(write "/tmp/rftest_trustpush/client1.rfl" "(set h (.ipc.open \"127.0.0.1:19959:u:pw\"))\n(set a (.ipc.send h \"(snap)\"))\n(set b (try (.ipc.send h \"(slowput 5)\") (fn [e] -1)))\n(set c (try (.ipc.send h \"kv\") (fn [e] -1)))\n(write \"/tmp/rftest_trustpush/out1\" (format \"% % %\" a b c))\n(exit 0)\n")
+(write "/tmp/rftest_trustpush/client2.rfl" "(set h (.ipc.open \"127.0.0.1:19959:u:pw\"))\n(set c (try (.ipc.send h \"kv\") (fn [e] -1)))\n(write \"/tmp/rftest_trustpush/out2\" (format \"%\" c))\n(exit 0)\n")
+
+(.sys.exec "./rayforce -p 19958 /tmp/rftest_trustpush/peer.rfl </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19958 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; Run 1: the trusted verb runs, with a pushed request inside it.
+(.sys.exec "./rayforce -p 19959 -U pw -l /tmp/rftest_trustpush/J /tmp/rftest_trustpush/boot.rfl </dev/null >/tmp/rftest_trustpush/srv1.log 2>&1 &")
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19959 2>/dev/null' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "./rayforce /tmp/rftest_trustpush/client1.rfl </dev/null >/dev/null 2>&1") -- 0
+(.sys.exec "grep -qx '0 5 5' /tmp/rftest_trustpush/out1") -- 0
+(.sys.exec "pkill -TERM -f '[r]ayforce -p 19959' 2>/dev/null; for i in $(seq 50); do pgrep -f '[r]ayforce -p 19959' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; Run 2: recovery replays the verb's request with its note, past the
+;; pushed request logged between the two.
+(.sys.exec "./rayforce -p 19959 -U pw -l /tmp/rftest_trustpush/J /tmp/rftest_trustpush/boot.rfl </dev/null >/tmp/rftest_trustpush/srv2.log 2>&1 &")
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19959 2>/dev/null' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "./rayforce /tmp/rftest_trustpush/client2.rfl </dev/null >/dev/null 2>&1") -- 0
+(.sys.exec "grep -qx '5' /tmp/rftest_trustpush/out2") -- 0
+(.sys.exec "grep -q '(0 eval errors)' /tmp/rftest_trustpush/srv2.log") -- 0
+
+(.sys.exec "pkill -TERM -f '[r]ayforce -p 1995[89]' 2>/dev/null; for i in $(seq 50); do pgrep -f '[r]ayforce -p 1995[89]' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "rm -rf /tmp/rftest_trustpush; true") -- 0

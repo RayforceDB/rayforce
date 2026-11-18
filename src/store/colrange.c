@@ -786,6 +786,16 @@ int ray_col_src_points_i64(ray_col_src_t* s, const int64_t* rows, int64_t n, int
     return e ? ray_enccol_points_i64(e, rows, n, s0, out, err) : 0;
 }
 
+void ray_col_src_want_points(ray_col_src_t* s, const int64_t* rows, int64_t n) {
+    for (int64_t q = 0; q < n;) {
+        int64_t s0, s1, a = q;
+        ray_enccol_t* e = src_point_col(s, rows[q], &s0, &s1);
+        if (!e) { q++; continue; }
+        while (++q < n && rows[q] >= s0 && rows[q] < s1) {}
+        ray_enccol_want_points(e, rows + a, q - a, s0);
+    }
+}
+
 int ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, uint8_t* nul,
                               ray_t** err) {
     *err = NULL;

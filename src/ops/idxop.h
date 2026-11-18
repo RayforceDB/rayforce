@@ -43,6 +43,9 @@
  * or a stale sorted marker is a wrong-answer bug (e.g. an asof-join that
  * trusts a false ordering claim).  Operators that build a fresh result
  * vector get this for free (fresh vectors start at attrs==0, no index).
+ * The one exception is an append that grows the vector in place: it keeps
+ * a hash index and extends it over the new rows (ray_index_append_take /
+ * ray_index_append_extend, below), as concat carries one onto its result.
  */
 
 #include <stdio.h>   /* FILE: ray_index_inline_write_file */
@@ -103,6 +106,14 @@ typedef enum {
  * table built before it.  Fixed for the life of the table: a rebuild picks
  * its own. */
 #define RAY_MARK_HASH_HIGH 0x04
+/* Hash index an append left holding each key's FIRST row only: an appended
+ * row that repeated a key already held was not added to its group (adding
+ * it would re-lay the CSR rows, O(n) per append).  Every key, and the first
+ * row of each, is still exact, so find / in / dict lookup and distinct read
+ * it (ray_index_find_*, ray_index_hash_first_rows); every other consumer
+ * goes through idx_fresh, which treats it as stale.  A save rebuilds it from
+ * the values, so it never reaches a file.  Cleared only by a rebuild. */
+#define RAY_MARK_FIRST_ONLY 0x08
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
 typedef struct {
@@ -268,7 +279,8 @@ typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
     IDX_SITE_FILTER_PART, IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND,
     IDX_SITE_SORT, IDX_SITE_DISTINCT, IDX_SITE_ASOF,
-    IDX_SITE_FILTER_EQRANGE, IDX_SITE_GROUP_SLICE, IDX_SITE_ASOF_ORDERED, IDX_SITE__N
+    IDX_SITE_FILTER_EQRANGE, IDX_SITE_GROUP_SLICE, IDX_SITE_ASOF_ORDERED,
+    IDX_SITE_COUNT_DISTINCT, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
@@ -755,37 +767,73 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
  *   -2    → not eligible; caller falls back to the scan.
  *
  * Uses idx_fresh_nonull: null-bearing columns fall back (-2) so the
- * scan correctly surfaces null-equality searches. */
+ * scan correctly surfaces null-equality searches.  A first-row-only index
+ * (RAY_MARK_FIRST_ONLY) answers: the first row is all it returns. */
 int64_t ray_index_find_row(ray_t* col, int64_t key);
 
 /* ===== Hash-index find: one atom / a vector of needles =====
  *
  * ray_index_find_atom: like ray_index_find_row but keyed by an ATOM, so it
- * also serves SYM columns (the symbol re-expressed in the column's domain)
- * and STR columns (the bytes).  Same contract: >= 0 first row, -1 provably
- * absent, -2 not eligible (no fresh null-free hash index, null / float /
- * cross-family needle) — caller falls back to the scan.
+ * also serves SYM columns (the symbol re-expressed in the column's domain),
+ * STR and GUID columns (the bytes).  Same contract: >= 0 first row, -1
+ * provably absent, -2 not eligible (no fresh null-free hash index, null /
+ * float / cross-family needle) — caller falls back to the scan.
  *
  * ray_index_find_vec: one probe per needle of the typed vector `needles`
  * into `out[needles->len]` (first matching row, NULL_I64 on a miss; a null
- * needle misses — the index is only consulted on null-free columns).
+ * needle misses — the index is only consulted on null-free columns — but a
+ * GUID index holds every row and a null guid needle probes its bytes).
  * Returns 1 when handled, 0 when not eligible (out is then unspecified and
  * the caller builds its own hash).  Integer-family needles for an
- * integer-family column, SYM for SYM (any domain), STR for STR. */
+ * integer-family column, SYM for SYM (any domain), STR for STR, GUID for
+ * GUID.  Both read a first-row-only index (RAY_MARK_FIRST_ONLY). */
 int64_t ray_index_find_atom(ray_t* col, ray_t* atom);
 int ray_index_find_vec(ray_t* col, ray_t* needles, int64_t* out, bool* any_miss);
 
 /* ===== Hash-index carry across an append =====
  *
- * `dst` is a fresh (rc=1, unsliced, unindexed, null-free) vector whose first
- * src->len rows are src's rows and whose tail is appended rows.  When src
- * carries a fresh null-free hash index and every appended row is a NEW key,
- * dst gets an equivalent index in O(groups + appended) without re-hashing the
- * old rows; markers (`unique`) and the within-group order symbol carry over.
- * A repeated key, a float column, a SYM domain change or OOM leave dst
- * unindexed (the caller re-attaches if it wants one).  Best-effort: never
- * fails the append. */
+ * `dst` is a fresh (rc=1, unsliced, unindexed) vector whose first src->len
+ * rows are src's rows and whose tail is appended rows.  When src carries a
+ * fresh hash index (null-free unless SYM or GUID), dst gets one extended
+ * over the tail in O(groups + appended) without re-hashing the old rows
+ * (ray_index_append_extend's rules: a new key adds a group, a repeated key
+ * leaves the index first-row-only).  A STR column, a SYM domain change, a
+ * null appended to a numeric column or OOM leave dst unindexed (the caller
+ * re-attaches if it wants one).  Best-effort: never fails the append. */
 void ray_index_carry_append(ray_t* src, ray_t* dst);
+
+/* ===== Hash index kept through an in-place append =====
+ *
+ * An append that grows a vector in place (ray_vec_append, ray_vec_append_raw)
+ * keeps its hash index instead of dropping it:
+ *
+ *   ray_t* ix = ray_index_append_take(v);   // before v grows
+ *   ... v grows from n0 rows ...
+ *   ray_index_append_extend(v, ix, n0);      // after its rows are written
+ *
+ * ray_index_append_take detaches v's hash index (v is then unindexed) and
+ * returns it as an index the caller owns and may grow — v's own when it was
+ * the sole, heap-resident holder, else a private copy (one O(groups + rows)
+ * copy, after which appends are O(appended)).  NULL when v carries no fresh
+ * hash index the append can keep (another kind, STR, stale, OOM); v's index,
+ * if any, is then still attached for the caller to drop.
+ *
+ * ray_index_append_extend probes each appended row once: a new key becomes
+ * a new single-row group; a key already held leaves the index
+ * RAY_MARK_FIRST_ONLY (and clears `unique` and the within-group order).  A
+ * null appended to a numeric column, or OOM, releases the index instead (v
+ * stays unindexed, as every append left it before).  Never fails the append. */
+ray_t* ray_index_append_take(ray_t* v);
+void   ray_index_append_extend(ray_t* v, ray_t* idx, int64_t n0);
+
+/* Is `col`'s attached index a hash that an append left first-row-only? */
+bool ray_index_hash_first_only(const ray_t* col);
+
+/* A complete hash index over `col`'s values, for a writer that must not
+ * persist the first-row-only one `col` carries: an owned, unattached
+ * RAY_INDEX block whose saved aux is the attached index's (`col` itself is
+ * left as it is).  NULL when `col` carries no hash, or on OOM / cancel. */
+ray_t* ray_index_hash_rebuild(ray_t* col);
 
 /* Row ids borrowed from a hash index: 64-bit, or unsigned 32-bit when the
  * index was built narrow (any column below 2^32 rows).  Read with
@@ -897,6 +945,20 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col);
  * Returns NULL if not eligible (no sort index, stale, null-bearing) or on
  * OOM.  The caller is responsible for releasing the returned vector. */
 ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count);
+
+/* ===== Hash-index distinct (GUID) =====
+ *
+ * A GUID hash keys every row, the zero guid included, so its groups are the
+ * column's distinct values and each group's first row is that value's first
+ * occurrence — also in a first-row-only index (RAY_MARK_FIRST_ONLY), whose
+ * missing rows are repeats.
+ *
+ * ray_index_hash_first_rows: a RAY_I64 vector of those first rows in
+ * ascending order (distinct's first-appearance order), or NULL when `col`
+ * is not a GUID vector with a fresh hash index, or on OOM.
+ * ray_index_hash_distinct_count: the number of groups, or -1 likewise. */
+ray_t*  ray_index_hash_first_rows(ray_t* col);
+int64_t ray_index_hash_distinct_count(ray_t* col);
 
 /* ===== Internal helpers (used by retain/release/detach in heap.c
  * and by mutation paths in vec.c) ===== */

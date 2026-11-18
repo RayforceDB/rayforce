@@ -3,7 +3,7 @@
 Semantic properties stamped onto columns — `sorted`, `unique`, `grouped`, `parted`.  Where an [accelerator index](indexes.md) is a *physical* structure (a hash table, a permutation), a column attribute is an *assertion about meaning*: this column is non-descending, these values are distinct.  The `.attr.*` family layers over the same storage as `.idx.*`, but its contract is semantic, not structural.
 
 !!! note "v1 status"
-    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `parted` are numeric (`parted` also takes symbols); `unique` and `grouped` take numeric, symbol and string columns.
+    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `parted` are numeric (`parted` also takes symbols); `unique` and `grouped` take numeric, symbol and string columns, and `grouped` also takes guid columns.
 
 ## Why Attributes Are Separate from Indexes
 
@@ -110,7 +110,7 @@ But a column holds at most one backing index — setting `grouped` or `parted` r
 
 Attributes propagate **conservatively**.  Only operations that trivially preserve the values — a refcount / copy-on-write copy, a plain rebind — keep the attributes.  *Any* transform that could change ordering, length, or values (arithmetic, `filter` / `where`, `reverse`, reordering `take`) **drops** them.  This keeps the invariant honest: a held attribute always reflects the current bytes.
 
-One append shape is the exception.  `(concat v rows)` and `(concat v atom)` on a `grouped` vector keep the hash (and a `unique` marker) when **every appended key is new** — the existing groups are copied and each appended row becomes a group of its own, so an append-only keyed vector never pays a rebuild.  An appended row that repeats a key, a null, or a symbol from another domain leaves the result a plain vector, exactly as before; `sorted` is always dropped by `concat`.
+An append is the exception.  `(concat v rows)`, `(concat v atom)`, `(alter 'v concat rows)`, an `insert` of one value into a `grouped` vector and an `insert` of rows into a table's `grouped` column (in place or not) keep the hash.  An `insert` of several values into a vector builds a fresh, unattributed one; `concat` keeps the attribute.  With the hash kept, each appended row with a **new** key becomes a group of its own, so an append-only keyed vector never pays a rebuild, and `unique` stays.  An appended row that **repeats** a key the hash already holds is not added to that key's group, which would cost a re-lay of every row: the hash is left first-row-only (`.idx.info` reports `first_only: true`).  It still answers `find`, `in`, a dict lookup and `distinct` — a key's first row and its presence are exact — but `grouped` and `unique` are no longer claimed, every other consult reads the column, and a save writes a complete hash built from the values.  `.attr.set 'grouped` rebuilds a complete one.  A null appended (to any column but a guid one, whose hash keys the null guid), or a symbol from another domain, leaves the result a plain vector, as before; `sorted` is always dropped by an append.
 
 ```lisp
 ; Arithmetic drops the marker (and a backing index).
@@ -121,9 +121,11 @@ One append shape is the exception.  `(concat v rows)` and `(concat v atom)` on a
 (.attr.get (reverse (.attr.set 'sorted [1 2 3])))               ; ⇒ no attributes
 (.attr.get (concat (.attr.set 'sorted [1 2 3]) [0 1]))          ; ⇒ no attributes
 
-; An append of NEW keys carries a hash index (and `unique`); a repeat drops it.
+; An append of NEW keys carries a hash index (and `unique`); a repeat leaves
+; it first-row-only: no longer `grouped`, still used by find / in.
 (.attr.get (concat (.attr.set 'unique (.attr.set 'grouped [1 2 3])) [4 5]))   ; ⇒ ['unique 'grouped]
 (.attr.get (concat (.attr.set 'grouped [1 2 3]) [3]))                          ; ⇒ no attributes
+(at (.idx.info (concat (.attr.set 'grouped [1 2 3]) [3])) 'first_only)         ; ⇒ true
 
 ; Plain rebind preserves.
 (set _s (.attr.set 'sorted [1 2 3]))

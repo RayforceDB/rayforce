@@ -118,6 +118,26 @@ static inline void vec_drop_index_inplace(ray_t* v) {
     if (!mapped) ray_release(idx);
 }
 
+/* An append that grows `v` in place keeps a hash index: it is taken off v
+ * before v grows and extended over the appended rows after (see
+ * ray_index_append_take).  Any other index is dropped, as any other
+ * mutation drops it.  Returns the taken index, or NULL. */
+static inline ray_t* vec_take_index_for_append(ray_t* v) {
+    v->attrs &= (uint8_t)~RAY_ATTR_SORTED;
+    if (!(v->attrs & RAY_ATTR_HAS_INDEX)) return NULL;
+    ray_t* keep = ray_index_append_take(v);
+    if (!keep) vec_drop_index_inplace(v);
+    return keep;
+}
+
+/* The append failed: `vec` (the caller's vector itself, or a copy about to
+ * be released) gets back the index taken from it, unchanged. */
+static inline void vec_index_untake(ray_t* vec, const ray_t* original, ray_t* keep) {
+    if (!keep) return;
+    if (vec == original) ray_index_append_extend(vec, keep, vec->len);
+    else ray_release(keep);
+}
+
 /* --------------------------------------------------------------------------
  * Capacity helpers
  *
@@ -280,8 +300,10 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
         if (!vec || RAY_IS_ERR(vec)) return vec;
     }
 
-    /* Append changes len + writes data; any attached index is now stale. */
-    vec_drop_index_inplace(vec);
+    /* Append changes len + writes data: a hash index is extended over the
+     * new row, any other index is now stale. */
+    ray_t* keep = vec_take_index_for_append(vec);
+    int64_t n0 = vec->len;
 
     int64_t cap = vec_capacity(vec);
 
@@ -289,6 +311,7 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
     if (vec->len >= cap) {
         ray_t* new_vec = ray_cell_grow_one(vec, esz);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
+            vec_index_untake(vec, original, keep);
             if (vec != original) ray_release(vec);
             return new_vec ? new_vec : ray_error("oom", NULL);
         }
@@ -302,6 +325,7 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
         ray_read_sym(elem, 0, RAY_SYM, vec->attrs) == 0)
         vec->attrs |= RAY_ATTR_HAS_NULLS;
     vec->len++;
+    if (keep) ray_index_append_extend(vec, keep, n0);
 
     return vec;
 
@@ -311,8 +335,9 @@ ray_t* ray_vec_append(ray_t* vec, const void* elem) {
  * ray_vec_append_raw
  *
  * Append `count` raw elements with one capacity reserve and one memcpy.
- * Same contract as ray_vec_append (COW when shared, index drop, amortized
- * geometric growth, original left alive on failure), minus the
+ * Same contract as ray_vec_append (COW when shared, a hash index extended
+ * over the new rows and any other index dropped, amortized geometric
+ * growth, original left alive on failure), minus the
  * per-element call overhead — this is the batch-ingest primitive.
  *
  * The raw cells are copied verbatim, sentinels included; the caller
@@ -344,7 +369,9 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
         if (!vec || RAY_IS_ERR(vec)) return vec;
     }
 
-    vec_drop_index_inplace(vec);
+    /* a hash index is extended over the new rows, any other one dropped */
+    ray_t* keep = vec_take_index_for_append(vec);
+    int64_t n0 = vec->len;
 
     int64_t cap = vec_capacity(vec);
 
@@ -354,6 +381,7 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
             goto fail;
         ray_t* new_vec = ray_scratch_realloc(vec, new_data_size);
         if (!new_vec || RAY_IS_ERR(new_vec)) {
+            vec_index_untake(vec, original, keep);
             if (vec != original) ray_release(vec);
             return new_vec ? new_vec : ray_error("oom", NULL);
         }
@@ -362,9 +390,11 @@ ray_t* ray_vec_append_raw(ray_t* vec, const void* src, int64_t count) {
 
     memcpy((char*)ray_data(vec) + (size_t)vec->len * esz, src, (size_t)count * esz);
     vec->len += count;
+    if (keep) ray_index_append_extend(vec, keep, n0);
     return vec;
 
 fail:
+    vec_index_untake(vec, original, keep);
     if (vec != original) ray_release(vec);
     return ray_error("oom", NULL);
 }

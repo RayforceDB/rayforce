@@ -24,6 +24,7 @@
 #include "symgrp.h"
 #include "symimp.h"
 #include "ops/hash.h"
+#include "core/pool.h"
 
 #if defined(RAY_OS_LINUX) || defined(RAY_OS_MACOS) || defined(__linux__) || defined(__APPLE__)
 
@@ -166,9 +167,6 @@ struct ray_symgrp_s {
     int64_t            aend, rend;        /* ROWS*: the ends of the runs met again and of the others */
     int64_t*           offb;              /* [2 ntasks]: ROWS*, a task's records (the
                                            * others, then those met again) */
-    uint32_t*          gslots;            /* step 2's group table, sized for the largest */
-    sg_ent_t*          gent;
-    sg_own_t*          gnew;
     /* the window */
     uint32_t*          spos;              /* loaded positions, ascending */
     uint32_t*          slen;              /* their records' lengths */
@@ -353,17 +351,30 @@ static inline uint32_t sg_ref_pos(const ray_symgrp_t* g, uint64_t v) {
     return sg_rows(g) ? sg_rank_pos(g, (int64_t)(v >> 32), (uint32_t)v) : g->pos_of[v];
 }
 
+/* A group's tables, sized for the pass's largest group (one set, or one a
+ * worker where the groups resolve side by side), and its counts. */
+typedef struct {
+    uint32_t* slots; sg_ent_t* ent; sg_own_t* nw;
+    int64_t old, refs, loaded;
+} sg_gbuf_t;
+
+/* The task's counts and bitmaps, which every group adds to: atomic, as the
+ * groups of a ROWS* pass resolve side by side (sg_resolve_par). */
+static inline void sg_add(int64_t* p, int64_t v) { __atomic_fetch_add(p, v, __ATOMIC_RELAXED); }
+static inline uint64_t sg_or(uint64_t* p, uint64_t v) { return __atomic_fetch_or(p, v, __ATOMIC_RELAXED); }
+
 /* Step 2, one hash group: its log entries (the logs it spans) in a table,
- * then every task's staged strings of the group in task order. */
-static bool sg_resolve_group(ray_symgrp_t* g, int gi, sg_list_t* owners, int64_t* next_id) {
+ * then every task's staged strings of the group in task order.  A group
+ * writes only its own verdicts; what it adds to its tasks' counts and
+ * bitmaps commutes, so the groups of a ROWS* pass may go in any order. */
+static bool sg_resolve_group(ray_symgrp_t* g, int gi, sg_gbuf_t* b, sg_list_t* owners, int64_t* next_id) {
     int ng = 1 << g->lg, per = RAY_SYMGRP_MAX / ng;
     int64_t ne = 0, ns = 0;
     for (int l = gi * per; l < (gi + 1) * per; l++) ne += g->logs[l].n;
     for (int64_t t = 0; t < g->ntasks; t++) ns += g->tasks[t].seg[gi + 1] - g->tasks[t].seg[gi];
     if (!ns) return true;
     uint64_t cap = sg_group_cap(ne, ns), mask = cap - 1;
-    /* the pass's group buffers, sized for its largest group (sg_resolve) */
-    uint32_t* slots = g->gslots; sg_ent_t* ent = g->gent; sg_own_t* nw = g->gnew;
+    uint32_t* slots = b->slots; sg_ent_t* ent = b->ent; sg_own_t* nw = b->nw;
     memset(slots, 0, (size_t)cap * sizeof(uint32_t));
     bool ok = true, rows = sg_rows(g), split = g->order == RAY_SYMGRP_ROWS;
     int64_t e = 0;
@@ -402,9 +413,8 @@ static bool sg_resolve_group(ray_symgrp_t* g, int gi, sg_list_t* owners, int64_t
                          * with the others a later window may compare with */
                         sg_task_t* ot = &g->tasks[o->t];
                         uint64_t bit = UINT64_C(1) << (o->local & 63);
-                        if (split && o->t != (uint32_t)t && !(ot->again[o->local >> 6] & bit)) {
-                            ot->again[o->local >> 6] |= bit;
-                            ot->nagain++; ot->abytes += 4 + (int64_t)o->len;
+                        if (split && o->t != (uint32_t)t && !(sg_or(&ot->again[o->local >> 6], bit) & bit)) {
+                            sg_add(&ot->nagain, 1); sg_add(&ot->abytes, 4 + (int64_t)o->len);
                         }
                         break;
                     }
@@ -412,15 +422,15 @@ static bool sg_resolve_group(ray_symgrp_t* g, int gi, sg_list_t* owners, int64_t
                 s = (s + 1) & mask;
             }
             if (w) {
-                k->cand += 4 + (int64_t)f->len;
-                if (SG_KIND(w) == RAY_SYMGRP_OLD) g->st.old++; else g->st.refs++;
+                sg_add(&k->cand, 4 + (int64_t)f->len);
+                if (SG_KIND(w) == RAY_SYMGRP_OLD) b->old++; else b->refs++;
             } else {
                 nw[nn] = (sg_own_t){f->h, f->len, (uint32_t)t, f->local, cnt};
                 slots[s] = (uint32_t)(ne + nn + 1);
                 w = SG_WORD(RAY_SYMGRP_NEW, rows ? 0 : *next_id + nn);
                 nn++;
-                k->owned++; k->bytes += 4 + (int64_t)f->len;
-                if (k->own) k->own[f->local >> 6] |= UINT64_C(1) << (f->local & 63);
+                sg_add(&k->owned, 1); sg_add(&k->bytes, 4 + (int64_t)f->len);
+                if (k->own) sg_or(&k->own[f->local >> 6], UINT64_C(1) << (f->local & 63));
             }
             k->r[i] = w;
         }
@@ -430,12 +440,23 @@ static bool sg_resolve_group(ray_symgrp_t* g, int gi, sg_list_t* owners, int64_t
         sg_own_t* o = (sg_own_t*)sg_push(owners, sizeof(sg_own_t));
         if (!o) ok = false; else *o = nw[i];
     }
-    *next_id += nn;
-    g->st.log_loaded += ne;
+    if (next_id) *next_id += nn;
+    b->loaded += ne;
     return ok;
 }
 
-bool ray_symgrp_resolve(ray_symgrp_t* g) {
+/* ROWS*: the groups side by side on the pool, task i on tables b[i],
+ * taking the next group until none is left. */
+typedef struct { ray_symgrp_t* g; sg_gbuf_t* b; int ng; _Atomic(int) next; } sg_par_t;
+static void sg_resolve_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    sg_par_t* x = (sg_par_t*)raw;
+    for (int64_t i = start; i < end; i++)
+        for (int gi; (gi = atomic_fetch_add_explicit(&x->next, 1, memory_order_relaxed)) < x->ng; )
+            (void)sg_resolve_group(x->g, gi, &x->b[i], NULL, NULL);
+}
+
+bool ray_symgrp_resolve(ray_symgrp_t* g, int par) {
     int ng = 1 << g->lg, per = RAY_SYMGRP_MAX / ng;
     sg_list_t owners = {0};
     int64_t nown = 0, bytes = 0;
@@ -452,13 +473,36 @@ bool ray_symgrp_resolve(ray_symgrp_t* g) {
         if (ne > ne_max) ne_max = ne;
         if (ns > ns_max) ns_max = ns;
     }
-    g->gslots = (uint32_t*)ray_sys_alloc((size_t)cap * sizeof(uint32_t));
-    g->gent = (sg_ent_t*)ray_sys_alloc((size_t)ne_max * sizeof(sg_ent_t));
-    g->gnew = (sg_own_t*)ray_sys_alloc((size_t)ns_max * sizeof(sg_own_t));
-    ok = g->gslots && g->gent && g->gnew;
-    for (int gi = 0; ok && gi < ng; gi++) ok = sg_resolve_group(g, gi, &owners, &nown);
-    ray_sys_free(g->gslots); ray_sys_free(g->gent); ray_sys_free(g->gnew);
-    g->gslots = NULL; g->gent = NULL; g->gnew = NULL;
+    /* ROWS* positions come from the tasks' bitmaps, not the order the groups
+     * resolve in: their groups go side by side, a worker's tables its own
+     * (each sized for the largest group).  The other orders number the new
+     * strings group by group, in turn. */
+    ray_pool_t* pool = ray_pool_get();
+    int64_t nb = sg_rows(g) && ng > 1 && pool ? (int64_t)ray_pool_total_workers(pool) : 1;
+    if (nb > par) nb = par;
+    if (nb > ng) nb = ng;
+    if (nb > 1 && !ray_pool_par_dispatch_ok(pool, nb, 2)) nb = 1;
+    sg_gbuf_t* gb = (sg_gbuf_t*)ray_sys_alloc((size_t)nb * sizeof(sg_gbuf_t));   /* zero-filled */
+    ok = gb != NULL;
+    for (int64_t i = 0; ok && i < nb; i++) {
+        gb[i].slots = (uint32_t*)ray_sys_alloc((size_t)cap * sizeof(uint32_t));
+        gb[i].ent = (sg_ent_t*)ray_sys_alloc((size_t)ne_max * sizeof(sg_ent_t));
+        gb[i].nw = (sg_own_t*)ray_sys_alloc((size_t)ns_max * sizeof(sg_own_t));
+        ok = gb[i].slots && gb[i].ent && gb[i].nw;
+    }
+    if (ok && nb > 1) {
+        sg_par_t x = { .g = g, .b = gb, .ng = ng };
+        atomic_init(&x.next, 0);
+        ray_pool_dispatch_n(pool, sg_resolve_task, &x, (uint32_t)nb);
+        for (int64_t t = 0; t < g->ntasks; t++) nown += g->tasks[t].owned;
+    } else {
+        for (int gi = 0; ok && gi < ng; gi++) ok = sg_resolve_group(g, gi, &gb[0], &owners, &nown);
+    }
+    for (int64_t i = 0; gb && i < nb; i++) {
+        g->st.old += gb[i].old; g->st.refs += gb[i].refs; g->st.log_loaded += gb[i].loaded;
+        ray_sys_free(gb[i].slots); ray_sys_free(gb[i].ent); ray_sys_free(gb[i].nw);
+    }
+    ray_sys_free(gb);
     g->st.groups += ng;
     for (int64_t t = 0; t < g->ntasks; t++) bytes += g->tasks[t].bytes;
     g->nown = nown; g->st.owners += nown;
@@ -989,7 +1033,7 @@ void ray_symgrp_free(ray_symgrp_t* g) { (void)g; }
 bool ray_symgrp_begin(ray_symgrp_t* g, int64_t ntasks, int groups, int64_t workers) { (void)g; (void)ntasks; (void)groups; (void)workers; return false; }
 bool ray_symgrp_adopt(ray_symgrp_t* g, uint64_t hmask) { (void)g; (void)hmask; return false; }
 bool ray_symgrp_stage(ray_symgrp_t* g, int64_t t, int64_t n, const ray_symgrp_fp_t* fp, const uint32_t* counts) { (void)g; (void)t; (void)n; (void)fp; (void)counts; return false; }
-bool ray_symgrp_resolve(ray_symgrp_t* g) { (void)g; return false; }
+bool ray_symgrp_resolve(ray_symgrp_t* g, int par) { (void)g; (void)par; return false; }
 int64_t ray_symgrp_task_size(const ray_symgrp_t* g, int64_t t) { (void)g; (void)t; return 0; }
 bool ray_symgrp_task(const ray_symgrp_t* g, int64_t t, ray_symgrp_res_t* res) { (void)g; (void)t; (void)res; return false; }
 int64_t ray_symgrp_task_off(const ray_symgrp_t* g, int64_t t, bool again) { (void)g; (void)t; (void)again; return -1; }

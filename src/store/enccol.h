@@ -159,10 +159,13 @@ int    ray_enccol_decode_wide(ray_enccol_t* e, int64_t c, int j, const ray_enc_d
 /* Row `row` of a single-file integer column (not SYM), read from its packed
  * vector without decoding the vector: a FOR_BP vector, DICT over a FOR_BP
  * code child, CONST or RLE (the row's run found by binary search, no row
- * expanded), with no nulls.  1 served (*out: the value widened to int64,
+ * expanded), or RAW (the row in place), with no nulls.  1 served (*out: the value widened to int64,
  * as the decode would hold it), 0 declined (read the vector by range), -1
  * an owned error in *err (the dictionary's oom). */
 int    ray_enccol_point_i64(ray_enccol_t* e, int64_t row, int64_t* out, ray_t** err);
+/* Ask ahead for the pages point reads of rows[q] - base, q in [0, n),
+ * touch (out-of-range rows skipped); nothing for a resident column. */
+void   ray_enccol_want_points(const ray_enccol_t* e, const int64_t* rows, int64_t n, int64_t base);
 /* ray_enccol_point_i64 of rows rows[q] - base, q in [0, n): ascending
  * rows of one vector, its body read once (CONST / RLE: the runs parsed
  * once, not once per row).  1: every row served into out; 0: declined (as

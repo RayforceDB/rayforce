@@ -16,9 +16,11 @@
 #include "store/part.h"
 #include "store/splay.h"
 #include "ops/idxop.h"
+#include "vec/str.h"        /* ray_str_t: the pooled-descriptor checks */
 #include "core/runtime.h"   /* ray_error_msg: the skeptic probes */
 #include "core/profile.h"   /* ray_profile_now_ns: pq_pool's bounded wait */
 #include "core/crc32.h"     /* ray_crc32: page checksums of the made files */
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,11 +85,317 @@ static test_result_t test_pq_snappy(void) {
     }
     PASS();
 }
+static void pqt_be32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+
+static test_result_t test_pq_lz4(void) {
+    uint8_t dst[512], expect[512];
+    /* Literals only. */
+    const uint8_t lit[] = {0x50,'h','e','l','l','o'};
+    TEST_ASSERT_TRUE(ray_parquet_lz4(lit,sizeof(lit),dst,5));
+    TEST_ASSERT_TRUE(!memcmp(dst,"hello",5));
+    /* 'ab', then a match at offset 2 whose length continues in an extra byte
+     * (4 + 15 + 21 = 40), then the last sequence's 'xyzzy'. */
+    const uint8_t ext[] = {0x2F,'a','b',2,0,21, 0x50,'x','y','z','z','y'};
+    for (int i = 0; i < 42; i++) expect[i] = i & 1 ? 'b' : 'a';
+    memcpy(expect+42,"xyzzy",5);
+    TEST_ASSERT_TRUE(ray_parquet_lz4(ext,sizeof(ext),dst,47));
+    TEST_ASSERT_TRUE(!memcmp(dst,expect,47));
+    uint8_t extout[47]; memcpy(extout,expect,47);
+    /* Offset 1: a run of 100 copies of the one byte before it. */
+    const uint8_t run[] = {0x1F,'a',1,0,81, 0x50,'1','2','3','4','5'};
+    TEST_ASSERT_TRUE(ray_parquet_lz4(run,sizeof(run),dst,106));
+    for (int i = 0; i < 101; i++) TEST_ASSERT_EQ_I(dst[i],'a');
+    TEST_ASSERT_TRUE(!memcmp(dst+101,"12345",5));
+    /* 300 literals: the count continues over 255 + 30. */
+    uint8_t big[310], bigout[300];
+    big[0] = 0xF0; big[1] = 0xFF; big[2] = 0x1E;
+    for (int i = 0; i < 300; i++) big[3+i] = bigout[i] = (uint8_t)(i*7+3);
+    TEST_ASSERT_TRUE(ray_parquet_lz4(big,303,dst,300));
+    TEST_ASSERT_TRUE(!memcmp(dst,bigout,300));
+    /* Every offset up to 128 against every match length 4..68: disjoint and
+     * overlapping copies over a nonperiodic 128-byte prefix, with and without
+     * the length's extra byte. */
+    for (int off = 1; off <= 128; off++) for (int n = 4; n <= 68; n++) {
+        uint8_t enc[160]; size_t at = 0;
+        enc[at++] = (uint8_t)(0xF0 | (n-4 < 15 ? n-4 : 15)); enc[at++] = 128-15;
+        for (int i = 0; i < 128; i++) enc[at++] = expect[i] = (uint8_t)(i*31+i/7);
+        enc[at++] = (uint8_t)off; enc[at++] = 0;
+        if (n-4 >= 15) enc[at++] = (uint8_t)(n-4-15);
+        enc[at++] = 0x10; enc[at++] = 'Z';
+        for (int i = 0; i < n; i++) expect[128+i] = expect[128+i-off];
+        expect[128+n] = 'Z';
+        TEST_ASSERT_TRUE(ray_parquet_lz4(enc,at,dst,(size_t)(129+n)));
+        TEST_ASSERT_TRUE(!memcmp(dst,expect,(size_t)(129+n)));
+    }
+    /* The input and output lengths must both be exact: no proper prefix and
+     * no other size decodes. */
+    struct { const uint8_t* b; size_t len, size; } valid[] = {{ext,sizeof(ext),47},{run,sizeof(run),106},{big,303,300},{lit,sizeof(lit),5}};
+    for (size_t k = 0; k < sizeof(valid)/sizeof(*valid); k++) {
+        for (size_t i = 0; i < valid[k].len; i++) TEST_ASSERT_FALSE(ray_parquet_lz4(valid[k].b,i,dst,valid[k].size));
+        TEST_ASSERT_FALSE(ray_parquet_lz4(valid[k].b,valid[k].len,dst,valid[k].size-1));
+        TEST_ASSERT_FALSE(ray_parquet_lz4(valid[k].b,valid[k].len,dst,valid[k].size+1));
+    }
+    /* Malformed blocks. */
+    const uint8_t zero_offset[] = {0x10,'a',0,0, 0x50,'1','2','3','4','5'};
+    TEST_ASSERT_FALSE(ray_parquet_lz4(zero_offset,sizeof(zero_offset),dst,10));
+    const uint8_t far_offset[] = {0x10,'a',2,0, 0x50,'1','2','3','4','5'};
+    TEST_ASSERT_FALSE(ray_parquet_lz4(far_offset,sizeof(far_offset),dst,10));
+    const uint8_t short_literals[] = {0x50,'a','b'};
+    TEST_ASSERT_FALSE(ray_parquet_lz4(short_literals,sizeof(short_literals),dst,5));
+    const uint8_t no_count[] = {0xF0};
+    TEST_ASSERT_FALSE(ray_parquet_lz4(no_count,sizeof(no_count),dst,100));
+    const uint8_t cut_count[] = {0xF0,0xFF};
+    TEST_ASSERT_FALSE(ray_parquet_lz4(cut_count,sizeof(cut_count),dst,100));
+    const uint8_t no_offset[] = {0x10,'a',1};
+    TEST_ASSERT_FALSE(ray_parquet_lz4(no_offset,sizeof(no_offset),dst,5));
+    const uint8_t ends_on_match[] = {0x10,'a',1,0};   /* no last, literals-only, sequence */
+    TEST_ASSERT_FALSE(ray_parquet_lz4(ends_on_match,sizeof(ends_on_match),dst,5));
+    /* A count that runs on for the whole input names more than the output holds. */
+    uint8_t endless[1001]; endless[0] = 0xF0; memset(endless+1,0xFF,1000);
+    TEST_ASSERT_FALSE(ray_parquet_lz4(endless,sizeof(endless),dst,10));
+    /* Nothing: no bytes, or one empty sequence. */
+    const uint8_t empty[] = {0};
+    TEST_ASSERT_TRUE(ray_parquet_lz4(NULL,0,dst,0));
+    TEST_ASSERT_TRUE(ray_parquet_lz4(empty,1,dst,0));
+    TEST_ASSERT_FALSE(ray_parquet_lz4(NULL,0,dst,1));
+    TEST_ASSERT_FALSE(ray_parquet_lz4(empty,1,dst,1));
+
+    /* Hadoop framing: sizes before each block, frames repeated. */
+    uint8_t framed[64];
+    pqt_be32(framed,47); pqt_be32(framed+4,sizeof(ext)); memcpy(framed+8,ext,sizeof(ext));
+    size_t flen = 8+sizeof(ext);
+    TEST_ASSERT_TRUE(ray_parquet_lz4_hadoop(framed,flen,dst,47));
+    TEST_ASSERT_TRUE(!memcmp(dst,extout,47));
+    pqt_be32(framed+flen,5); pqt_be32(framed+flen+4,sizeof(lit)); memcpy(framed+flen+8,lit,sizeof(lit));
+    size_t two = flen+8+sizeof(lit);
+    TEST_ASSERT_TRUE(ray_parquet_lz4_hadoop(framed,two,dst,52));
+    TEST_ASSERT_TRUE(!memcmp(dst+47,"hello",5));
+    for (size_t i = 0; i < two; i++) if (i != flen) TEST_ASSERT_FALSE(ray_parquet_lz4_hadoop(framed,i,dst,52));
+    TEST_ASSERT_FALSE(ray_parquet_lz4_hadoop(framed,two,dst,51));
+    TEST_ASSERT_FALSE(ray_parquet_lz4_hadoop(framed,two,dst,53));
+    pqt_be32(framed,46);                                              /* a size that is not the block's */
+    TEST_ASSERT_FALSE(ray_parquet_lz4_hadoop(framed,flen,dst,46));
+    pqt_be32(framed,47); pqt_be32(framed+4,(uint32_t)sizeof(ext)+1);  /* a block size past the page */
+    TEST_ASSERT_FALSE(ray_parquet_lz4_hadoop(framed,flen,dst,47));
+    TEST_ASSERT_FALSE(ray_parquet_lz4_hadoop(ext,sizeof(ext),dst,47)); /* a raw block is no frame */
+    TEST_ASSERT_TRUE(ray_parquet_lz4_hadoop(NULL,0,dst,0));
+    PASS();
+}
+/* UINT_64 reads as I64; a value above INT64_MAX (2**64-1, or 2**63, whose
+ * pattern is the I64 null sentinel) fails the read on every decode path. */
+static test_result_t test_pq_uint64(void) {
+    for (int dict = 0; dict < 2; dict++) {
+        char path[128]; snprintf(path,sizeof(path),FIX "uint64-%d.parquet",dict);
+        for (int batch = 0; batch <= 4; batch++) {  /* 0: whole file; else partial batches */
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,batch ? batch*3 : 100,&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_ncols(t),3);
+                for (int c = 0; c < 3; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t,c)->type,RAY_I64);
+                for (int64_t row = 0; row < ray_table_nrows(t); row++, total++) {
+                    int64_t want = total < 9 ? total : INT64_MAX;
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t,0)))[row],want);
+                    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t,1)))[row],want);
+                    ray_t* nul = ray_table_get_col_idx(t,2);
+                    if (total % 3 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(nul,row));
+                    else TEST_ASSERT_EQ_I(((int64_t*)ray_data(nul))[row],want);
+                }
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,10);
+            ray_parquet_close(r);
+        }
+        ray_t* t = ray_parquet_read(path,NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),10); ray_release(t);
+        const char* kinds[] = {"max","edge"}; const char* shapes[] = {"req","opt","nul"};
+        for (int k = 0; k < 2; k++) for (int sh = 0; sh < 3; sh++) {
+            snprintf(path,sizeof(path),FIX "uint64-%s-%s-%d.parquet",kinds[k],shapes[sh],dict);
+            ray_t* bad = ray_parquet_read(path,NULL);
+            if (!RAY_IS_ERR(bad)) fprintf(stderr,"  %s: read without an error\n",path);
+            TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+            TEST_ASSERT_TRUE(ray_err_code(bad) && !strcmp(ray_err_code(bad),"parquet"));
+            ray_error_free(bad);
+        }
+    }
+    /* Pages of 16384 rows with every value present take the bulk copy; the
+     * projection reads the in range column alone, then the failing one. */
+    const int64_t ok = ray_sym_intern("ok",2), bad = ray_sym_intern("bad",3);
+    ray_t* cols = ray_vec_from_raw(RAY_SYM,&ok,1);
+    ray_t* t = ray_parquet_read(FIX "uint64-bulk.parquet",cols);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),3*16384);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(ray_table_get_col_idx(t,0)))[3*16384-1],3*16384-1);
+    ray_release(t); ray_release(cols);
+    cols = ray_vec_from_raw(RAY_SYM,&bad,1);
+    t = ray_parquet_read(FIX "uint64-bulk.parquet",cols);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_error_free(t); ray_release(cols);
+    t = ray_parquet_read(FIX "uint64-bulk.parquet",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); ray_error_free(t);
+    PASS();
+}
+/* DECIMAL on INT32/INT64 reads as F64, stored / 10^scale: as the converted type
+ * or the logical type, required or optional, plain or dictionary encoded, at
+ * any batch size. Byte-array decimals and a scale above the precision refuse. */
+static test_result_t test_pq_decimal(void) {
+    const int64_t px[] = {INT64_C(7189430000000),INT64_C(7182430000000),1,-5,0,123456789,INT64_C(1)<<53,-(INT64_C(1)<<53),INT64_C(99999999999999999),5};
+    const int32_t qty[] = {246092,70909,0,-7,1,999999999,-999999999,3,4,5};
+    for (int logical = 0; logical < 2; logical++) for (int dict = 0; dict < 2; dict++) {
+        char path[128]; snprintf(path,sizeof(path),FIX "decimal-%d-%d.parquet",logical,dict);
+        for (int batch = 1; batch <= 4; batch++) {
+            ray_parquet_t* r = NULL;
+            ray_t* err = ray_parquet_open(path,NULL,batch*3,&r);
+            TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
+            int64_t total = 0;
+            for (;;) {
+                ray_t* t = ray_parquet_next(r);
+                if (!t) break;
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_ncols(t),3);
+                for (int c = 0; c < 3; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t,c)->type,RAY_F64);
+                for (int64_t row = 0; row < ray_table_nrows(t); row++, total++) {
+                    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[row] == (double)px[total]/1e9);
+                    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,1)))[row] == (double)qty[total]/1e3);
+                    ray_t* opt = ray_table_get_col_idx(t,2);
+                    if (total % 3 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(opt,row));
+                    else TEST_ASSERT_TRUE(((double*)ray_data(opt))[row] == (double)px[total]/1e2);
+                }
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,10);
+            ray_parquet_close(r);
+        }
+    }
+    /* The price at scale 9 is the decimal itself, not a nearby double. */
+    ray_t* t = ray_parquet_read(FIX "decimal-1-0.parquet",NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[0] == 7189.43);
+    ray_release(t);
+    const char* bad[] = {FIX "decimal-binary.parquet",FIX "decimal-bad-scale.parquet"};
+    for (int i = 0; i < 2; i++) {
+        ray_t* e = ray_parquet_read(bad[i],NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(e)); ray_error_free(e);
+    }
+    PASS();
+}
+/* Several files import into one partitioned table, in order: partitions
+ * continue across the files, the files share one symbol vocabulary, and files
+ * with different columns refuse (leaving the staging directory, as any failed
+ * import does). */
+static void pq_rm_rf(const char* path) {
+    DIR* d = opendir(path);
+    if (!d) { unlink(path); return; }
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name,".") || !strcmp(e->d_name,"..")) continue;
+        char child[1400]; snprintf(child,sizeof(child),"%s/%s",path,e->d_name);
+        pq_rm_rf(child);
+    }
+    closedir(d); rmdir(path);
+}
+static test_result_t test_pq_parted_files(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    const char* two[] = {FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet"};
+    char root[160], sym[200], leaf[220];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-%d",(int)getpid());
+    ray_t* n = ray_parquet_parted_files(two,2,root,"hits",types);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,36); ray_release(n);
+    ray_t* t = ray_read_parted(root,"hits");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),36); TEST_ASSERT_EQ_I(ray_table_ncols(t),8); /* the seven columns and part */
+    ray_release(t);
+    /* Partitions continue across the files, and a string of the second file
+     * is the symbol the first file's same string got. */
+    snprintf(sym,sizeof(sym),"%s/.sym",root);
+    int parts = 0; int64_t rows = 0; ray_t* firstname = NULL; ray_t* lastname = NULL;
+    for (;; parts++) {
+        snprintf(leaf,sizeof(leaf),"%s/%d/hits",root,parts);
+        if (access(leaf,F_OK) != 0) break;
+        ray_t* p = ray_read_splayed(leaf,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(p));
+        rows += ray_table_nrows(p);
+        ray_t* col = ray_table_get_col_idx(p,1);
+        TEST_ASSERT_EQ_I(col->type,RAY_SYM);
+        if (!parts) firstname = ray_sym_vec_cell(col,1);
+        lastname = ray_sym_vec_cell(col,1);
+        TEST_ASSERT_TRUE(ray_str_len(firstname) == ray_str_len(lastname));
+        ray_release(p);
+    }
+    TEST_ASSERT_TRUE(parts >= 2 && parts%2 == 0);
+    TEST_ASSERT_EQ_I(rows,36);
+    pq_rm_rf(root);
+    /* Files that are not one table refuse. */
+    const char* mixed[] = {FIX "flat-1-v1.parquet",FIX "uint64-0.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-mixed-%d",(int)getpid());
+    n = ray_parquet_parted_files(mixed,2,root,"hits",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && strstr(ray_error_msg(),"uint64-0.parquet") &&
+                     strstr(ray_error_msg(),"3 columns, the first file has 7"));
+    ray_error_free(n);
+    TEST_ASSERT_TRUE(access(root,F_OK) != 0);
+    char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial);
+    /* An error opening a later file is not prefixed twice. */
+    const char* missing[] = {FIX "flat-1-v1.parquet",FIX "no-such-file.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-missing-%d",(int)getpid());
+    n = ray_parquet_parted_files(missing,2,root,"hits",types);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && !strstr(ray_error_msg(),"parquet: file 2") &&
+                     !strstr(ray_error_msg(),"): parquet:"));
+    ray_error_free(n);
+    snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial);
+    /* Same column count, another column: the message names the file and the column. */
+    char partial2[200];
+    const char* renamed[] = {FIX "decimal-0-0.parquet",FIX "uint64-0.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-renamed-%d",(int)getpid());
+    n = ray_parquet_parted_files(renamed,2,root,"hits",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && strstr(ray_error_msg(),"column 1 is req, the first file has px"));
+    ray_error_free(n);
+    snprintf(partial2,sizeof(partial2),"%s.parquet-partial",root); pq_rm_rf(partial2);
+    /* A types vector does not hide a file with another column count. */
+    int64_t three[] = {ray_sym_intern("F64",3),ray_sym_intern("F64",3),ray_sym_intern("F64",3)};
+    ray_t* t3 = ray_vec_from_raw(RAY_SYM,three,3);
+    const char* counts[] = {FIX "decimal-0-0.parquet",FIX "flat-1-v1.parquet"};
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-files-counts-%d",(int)getpid());
+    n = ray_parquet_parted_files(counts,2,root,"hits",t3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"file 2 (") && strstr(ray_error_msg(),"7 columns, the first file has 3"));
+    ray_error_free(n); ray_release(t3);
+    snprintf(partial2,sizeof(partial2),"%s.parquet-partial",root); pq_rm_rf(partial2);
+    /* No files is no import. */
+    n = ray_parquet_parted_files(two,0,root,"hits",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n)); ray_release(n);
+    ray_release(types);
+    PASS();
+}
+/* A Hadoop LZ4 frame of several chunks is refused naming the frame, on the
+ * data-page path (PLAIN), the dictionary-page path, and the symbol import. */
+static test_result_t test_pq_lz4_multichunk(void) {
+    const char* files[] = {FIX "multichunk-plain.parquet",FIX "multichunk-dict.parquet"};
+    for (int i = 0; i < 2; i++) {
+        ray_t* t = ray_parquet_read(files[i],NULL);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"multi-chunk Hadoop frame"));
+        ray_error_free(t);
+    }
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    char root[128]; snprintf(root,sizeof(root),"/tmp/rayforce-pq-multichunk-%d",(int)getpid());
+    ray_t* n = ray_parquet_parted_files(&files[1],1,root,"hits",types);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"multi-chunk Hadoop frame"));
+    ray_error_free(n); ray_release(types);
+    char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial); pq_rm_rf(root);
+    PASS();
+}
 static test_result_t test_pq_matrix(void) {
-    const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet"};
+    const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
+                           FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet",FIX "flat-5raw-v1.parquet",FIX "flat-5raw-v2.parquet"};
     int64_t expect[] = {1,NULL_I32,3,4,5,NULL_I32,7,8,9};
     const char* strings[] = {"alpha","a long string over twelve bytes","","","alpha","beta","gamma","delta","z"};
-    for (int file = 0; file < 7; file++) for (int batch = 1; batch <= 11; batch++) {
+    for (int file = 0; file < 13; file++) for (int batch = 1; batch <= 11; batch++) {
         ray_parquet_t* r = NULL;
         ray_t* err = ray_parquet_open(names[file],NULL,batch,&r);
         TEST_ASSERT_NULL(err); TEST_ASSERT_NOT_NULL(r);
@@ -953,6 +1261,244 @@ static test_result_t test_pq_cert_admission(void) {
     PASS();
 #endif
 }
+/* PLAIN OPTIONAL BYTE_ARRAY values through every string representation:
+ * null, empty, 3-byte and 12-byte inline, 13-byte and 200-byte pooled. */
+static const char* pq_plain_str_widths(int64_t r, char* buf, uint32_t* len) {
+    switch (r % 6) {
+    case 0: return NULL;
+    case 1: *len = 0; return "";
+    case 2: memcpy(buf,"abc",3); *len = 3; return buf;
+    case 3: memcpy(buf,"twelve-bytes",12); *len = 12; return buf;
+    case 4: memcpy(buf,"thirteen-byte",13); *len = 13; return buf;
+    default: {
+        for (int i = 0; i < 200; i++) buf[i] = (char)('a' + (int)((r + i) % 26));
+        *len = 200; return buf;
+    }
+    }
+}
+/* Every value present, inline and pooled, valid UTF-8. */
+static const char* pq_plain_str_valid(int64_t r, char* buf, uint32_t* len) {
+    if (r % 2 == 0) {
+        for (int i = 0; i < 200; i++) buf[i] = (char)('a' + (int)((r + i) % 26));
+        *len = 200; return buf;
+    }
+    memcpy(buf,"inline-value",12); *len = 12; return buf;
+}
+/* A pooled value and an inline one before invalid UTF-8 at row 3, so a
+ * strict read fails after the batch's string pool already holds bytes. */
+static const char* pq_plain_str_badutf(int64_t r, char* buf, uint32_t* len) {
+    uint8_t bad[] = {0xe2,0x82};
+    switch (r % 4) {
+    case 0: memcpy(buf,"thirteen-byte",13); *len = 13; return buf;
+    case 1: memcpy(buf,"abc",3); *len = 3; return buf;
+    case 2: memcpy(buf,"twelve-bytes",12); *len = 12; return buf;
+    default: memcpy(buf,bad,sizeof(bad)); *len = (uint32_t)sizeof(bad); return buf;
+    }
+}
+/* Every value is the non-null empty string. */
+static const char* pq_plain_str_empty(int64_t r, char* buf, uint32_t* len) {
+    (void)r; (void)buf; *len = 0; return "";
+}
+/* Every s-column value of batch t is fn's row `base+i` (a null and "" both
+ * read as length 0), and the in-band null test agrees with the length. */
+static bool pq_plain_str_batch(ray_t* t, int64_t base, int64_t rows, pq_synth_fn fn) {
+    ray_t* s = ray_table_get_col_idx(t,1);
+    char buf[256];
+    for (int64_t i = 0; i < ray_table_nrows(t); i++) {
+        uint32_t len = 0;
+        const char* want = pq_synth_row(fn,1,base+i,rows,buf,&len);
+        if (!want) len = 0;
+        size_t got = 0;
+        const char* p = ray_str_vec_get(s,i,&got);
+        if (got != len || (len && memcmp(p,want,len))) return false;
+        if (ray_vec_is_null(s,i) != (len == 0)) return false;
+    }
+    return true;
+}
+static ray_t* pq_strict_options(void) {
+    int64_t keys[] = {ray_sym_intern("strict",6)};
+    ray_t* vals = ray_list_new(1);
+    if (!vals) return NULL;
+    ((ray_t**)ray_data(vals))[0] = ray_bool(true); vals->len = 1;
+    return ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,1),vals);
+}
+/* A retained batch keeps inline and pooled strings valid across the next
+ * reads and the reader close, and a later mutation of a retained column
+ * copy-outs the pool instead of touching the batch's bytes. */
+static test_result_t test_pq_plain_str_ownership(void) {
+    char path[160];
+    const int64_t rows = 4096;
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-plainstr-own-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(path,rows,2,pq_plain_str_widths));
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,100,&r));
+    ray_t* kept = ray_parquet_next(r);
+    TEST_ASSERT_TRUE(kept && !RAY_IS_ERR(kept));
+    TEST_ASSERT_EQ_I(ray_table_nrows(kept),100);
+    TEST_ASSERT_TRUE(pq_plain_str_batch(kept,0,rows,pq_plain_str_widths));
+    ray_t* col = ray_table_get_col_idx(kept,1);
+    ray_str_t* d = (ray_str_t*)ray_data(col);
+    TEST_ASSERT_TRUE(d[4].len == 13 && !ray_str_is_inline(&d[4]));
+    TEST_ASSERT_TRUE(d[5].len == 200 && !ray_str_is_inline(&d[5]));
+    TEST_ASSERT_NOT_NULL(col->str_pool);
+    TEST_ASSERT_TRUE(d[4].hash32 != 0 && d[5].hash32 != 0);
+    int64_t total = 100;
+    for (;;) {
+        ray_t* t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(pq_plain_str_batch(t,total,rows,pq_plain_str_widths));
+        total += ray_table_nrows(t);
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(total,rows);
+    ray_parquet_close(r);
+    /* Later reads and the close must not reach the retained batch's bytes. */
+    TEST_ASSERT_TRUE(pq_plain_str_batch(kept,0,rows,pq_plain_str_widths));
+    /* The retain makes the column refcount > 1, so ray_str_vec_set copies
+     * header and pool; the test owns the returned vector, the table keeps
+     * the original. */
+    ray_retain(col);
+    ray_t* mod = ray_str_vec_set(col,4,"replacement-that-is-pooled",26);
+    TEST_ASSERT_TRUE(mod && !RAY_IS_ERR(mod));
+    TEST_ASSERT_TRUE(mod != col);
+    TEST_ASSERT_TRUE(mod->str_pool != col->str_pool);
+    size_t n = 0; const char* p = ray_str_vec_get(mod,4,&n);
+    TEST_ASSERT_EQ_I(n,26);
+    TEST_ASSERT_TRUE(!memcmp(p,"replacement-that-is-pooled",26));
+    TEST_ASSERT_TRUE(pq_plain_str_batch(kept,0,rows,pq_plain_str_widths));
+    ray_release(mod);
+    ray_release(kept);
+    unlink(path);
+    PASS();
+}
+/* Null/empty/strict/conversion semantics of the PLAIN string lane across
+ * partial batches; a strict rejection happens after the pool is built. */
+static test_result_t test_pq_plain_str_semantics(void) {
+    char path[160], valid[160], bad[160], empty[160];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-plainstr-sem-%d.parquet",(int)getpid());
+    snprintf(valid,sizeof(valid),"/tmp/rayforce-pq-plainstr-valid-%d.parquet",(int)getpid());
+    snprintf(bad,sizeof(bad),"/tmp/rayforce-pq-plainstr-badutf-%d.parquet",(int)getpid());
+    snprintf(empty,sizeof(empty),"/tmp/rayforce-pq-plainstr-empty-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(path,4096,2,pq_plain_str_widths));
+    int64_t batches[] = {1,7,100,4096};
+    for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++) {
+        ray_parquet_t* r = NULL;
+        TEST_ASSERT_NULL(ray_parquet_open(path,NULL,batches[b],&r));
+        int64_t total = 0;
+        for (;;) {
+            ray_t* t = ray_parquet_next(r);
+            if (!t) break;
+            TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+            TEST_ASSERT_TRUE(pq_plain_str_batch(t,total,4096,pq_plain_str_widths));
+            total += ray_table_nrows(t);
+            if (!total || total == ray_table_nrows(t)) {
+                TEST_ASSERT_TRUE(ray_table_get_col_idx(t,1)->attrs & RAY_ATTR_HAS_NULLS);
+            }
+            ray_release(t);
+        }
+        TEST_ASSERT_EQ_I(total,4096);
+        ray_parquet_close(r);
+    }
+    /* A batch of only empty strings: the in-band null written by the PLAIN
+     * path must still mark the vector HAS_NULLS. */
+    TEST_ASSERT_TRUE(pq_synth(empty,64,2,pq_plain_str_empty));
+    ray_parquet_t* er = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(empty,NULL,7,&er));
+    ray_t* et = ray_parquet_next(er);
+    TEST_ASSERT_TRUE(et && !RAY_IS_ERR(et));
+    TEST_ASSERT_TRUE(ray_table_get_col_idx(et,1)->attrs & RAY_ATTR_HAS_NULLS);
+    for (int64_t i = 0; i < ray_table_nrows(et); i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(ray_table_get_col_idx(et,1),i));
+    ray_release(et);
+    ray_parquet_close(er);
+    unlink(empty);
+    /* Strict refuses a non-null empty string (the in-band STR null). */
+    ray_t* opts = pq_strict_options();
+    TEST_ASSERT_NOT_NULL(opts);
+    ray_t* e = ray_parquet_read(path,opts);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_err_code(e) && !strcmp(ray_err_code(e),"parquet"));
+    ray_error_free(e);
+    unlink(path);
+    /* Strict accepts every present, valid value (inline and pooled). */
+    TEST_ASSERT_TRUE(pq_synth(valid,4096,2,pq_plain_str_valid));
+    ray_t* t = ray_parquet_read(valid,opts);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(pq_plain_str_batch(t,0,4096,pq_plain_str_valid));
+    TEST_ASSERT_FALSE(ray_table_get_col_idx(t,1)->attrs & RAY_ATTR_HAS_NULLS);
+    ray_release(t);
+    unlink(valid);
+    /* Non-strict keeps invalid bytes; strict refuses them after the batch
+     * already owns a pooled value. */
+    TEST_ASSERT_TRUE(pq_synth(bad,4096,2,pq_plain_str_badutf));
+    t = ray_parquet_read(bad,NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(pq_plain_str_batch(t,0,4096,pq_plain_str_badutf));
+    ray_release(t);
+    e = ray_parquet_read(bad,opts);
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    TEST_ASSERT_TRUE(ray_err_code(e) && !strcmp(ray_err_code(e),"parquet"));
+    ray_error_free(e);
+    unlink(bad);
+    ray_release(opts);
+    PASS();
+}
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+static void* pq_plain_str_cancel_thread(void* p) {
+    long ms = (long)(intptr_t)p;
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts,NULL);
+    ray_request_interrupt();
+    return NULL;
+}
+/* A cancel requested while a batch of strings decodes is observed at
+ * the next next() entry (the first batch completes; mid-decode
+ * interruption at the per-1024 checkpoint is unchanged by this patch
+ * and not witnessed by this test); the reader then refuses further
+ * batches and a fresh reader decodes the whole file. */
+static test_result_t test_pq_plain_str_cancel(void) {
+    char path[160];
+    const int64_t rows = 131072;
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-plainstr-cancel-%d.parquet",(int)getpid());
+    TEST_ASSERT_TRUE(pq_synth(path,rows,2,pq_plain_str_valid));
+    ray_clear_interrupt();
+    ray_parquet_t* r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,65536,&r));
+    pthread_t th;
+    TEST_ASSERT_EQ_I(pthread_create(&th,NULL,pq_plain_str_cancel_thread,(void*)(intptr_t)1),0);
+    ray_t* t = ray_parquet_next(r);
+    pthread_join(th,NULL);
+    if (t && RAY_IS_ERR(t)) {
+        TEST_ASSERT_TRUE(ray_err_code(t) && !strcmp(ray_err_code(t),"cancel"));
+        ray_error_free(t);
+    } else {
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        ray_release(t);
+        ray_t* t2 = ray_parquet_next(r);
+        TEST_ASSERT_TRUE(t2 && RAY_IS_ERR(t2));
+        TEST_ASSERT_TRUE(ray_err_code(t2) && !strcmp(ray_err_code(t2),"cancel"));
+        ray_error_free(t2);
+    }
+    ray_clear_interrupt();
+    ray_parquet_close(r);
+    r = NULL;
+    TEST_ASSERT_NULL(ray_parquet_open(path,NULL,65536,&r));
+    int64_t total = 0;
+    for (;;) {
+        t = ray_parquet_next(r);
+        if (!t) break;
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_TRUE(pq_plain_str_batch(t,total,rows,pq_plain_str_valid));
+        total += ray_table_nrows(t);
+        ray_release(t);
+    }
+    TEST_ASSERT_EQ_I(total,rows);
+    ray_parquet_close(r);
+    unlink(path);
+    PASS();
+}
+#endif
 static test_result_t test_pq_group_native(void) {
     const char* names[] = {"x","y","s"};
     int64_t tids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
@@ -1055,6 +1601,46 @@ static test_result_t test_pq_native_dictionary(void) {
     }
     ray_release(types);
     PASS();
+}
+/* A failed write-behind fails a column-by-column import: its waits take
+ * the file's write error, which the sync before publishing then misses,
+ * so the import checks the failures counted (the hook fails every
+ * request).  Nothing is published, and the same import succeeds without
+ * the hook. */
+static test_result_t test_pq_writebehind_failed(void) {
+#if !defined(DEBUG) || !defined(RAY_OS_LINUX)
+    SKIP("a debug-build hook; write-behind is Linux's");
+#else
+    const char* names[] = {"x","name","flag","wide","day","ts","f"};
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    char dir[160], partial[200];
+    snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-wbf-%d",(int)getpid());
+    snprintf(partial,sizeof(partial),"%s.parquet-partial",dir);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    pq_set_layout("1");
+    ray_file_writeback_test_fail(true);
+    ray_t* failed = ray_parquet_splayed_typed(FIX "flat-0-v1.parquet",dir,types);
+    ray_file_writeback_test_fail(false);
+    struct stat st;
+    bool published = stat(dir,&st) == 0, staged = stat(partial,&st) == 0;
+    (void)ray_test_rm_rf(partial);
+    ray_t* result = ray_parquet_splayed_typed(FIX "flat-0-v1.parquet",dir,types);
+    pq_set_layout(NULL);
+    bool ok = result && !RAY_IS_ERR(result) && result->i64 == 18;
+    bool err = failed && RAY_IS_ERR(failed);
+    if (failed) { if (RAY_IS_ERR(failed)) ray_error_free(failed); else ray_release(failed); }
+    if (result) { if (RAY_IS_ERR(result)) ray_error_free(result); else ray_release(result); }
+    pq_remove_native(dir,names,7);
+    ray_release(types);
+    ray_pool_destroy();
+    TEST_ASSERT(err, "the import fails");
+    TEST_ASSERT(!published, "nothing published");
+    TEST_ASSERT(staged, "the staging directory retained");
+    TEST_ASSERT(ok, "the same import succeeds without the hook");
+    PASS();
+#endif
 }
 static test_result_t test_pq_native_edges(void) {
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("I64",3),ray_sym_intern("SYM",3)};
@@ -2495,7 +3081,9 @@ static test_result_t test_pq_sym_grouped_collision_determinism(void) {
  * column snappy-compressed (a greedy LZ over 2-byte offsets). */
 enum { PQX_DICT = 1, PQX_FALLBACK = 2, PQX_SNAPPY = 4, PQX_LATE = 8, PQX_NOSTATS = 16,
        PQX_LIESTATS = 32, PQX_ZSTD = 64, PQX_HUGERAW = 128, PQX_ZERORAW = 256, PQX_BADDICT = 512,
-       PQX_FARDATA = 1024, PQX_INDICT = 2048, PQX_CRC = 4096, PQX_CRCFLIP = 8192 };   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
+       PQX_FARDATA = 1024, PQX_INDICT = 2048, PQX_CRC = 4096, PQX_CRCFLIP = 8192,
+       PQX_LZ4 = 16384, PQX_LZ4H = 32768 };   /* PQX_LZ4: every page of the column an LZ4_RAW block (codec 7);
+                                               * PQX_LZ4H: Hadoop-framed (codec 5) */   /* PQX_ZERORAW: total_uncompressed_size 0; PQX_BADDICT: the dictionary page encoded 3 */
                                              /* PQX_CRC: page checksums; PQX_CRCFLIP: and the last row group's dictionary
                                               * page with a byte flipped past its checksum (pqx_page, pqx_crc) */
                                              /* PQX_FARDATA: data_page_offset past the file's data; PQX_INDICT:
@@ -2544,6 +3132,55 @@ static void pqx_snappy(pq_buf* o, const uint8_t* s, size_t n) {
     }
     if (n > lit) pqx_lit(o, s + lit, n - lit);   /* no literal of no data (s may be NULL) */
 }
+/* The LZ4 sequence (lz4_Block_format.md): `nlit` literals and then, unless
+ * mlen is 0 (the last sequence), a match of mlen bytes at offset off. */
+static void pqx_lz4_len(pq_buf* o, size_t n) {
+    while (n >= 255) { pb_byte(o, 255); n -= 255; }
+    pb_byte(o, (uint8_t)n);
+}
+static void pqx_lz4_seq(pq_buf* o, const uint8_t* lit, size_t nlit, size_t off, size_t mlen) {
+    size_t m = mlen ? mlen - 4 : 0;
+    pb_byte(o, (uint8_t)((nlit < 15 ? nlit : 15) << 4 | (m < 15 ? m : 15)));
+    if (nlit >= 15) pqx_lz4_len(o, nlit - 15);
+    if (nlit) pb_bytes(o, lit, nlit);
+    if (!mlen) return;
+    uint16_t x = (uint16_t)off; pb_bytes(o, &x, 2);
+    if (m >= 15) pqx_lz4_len(o, m - 15);
+}
+/* A greedy LZ4 block, matches of 4 bytes or more over 2-byte offsets; like
+ * real encoders it starts none in the last 12 bytes and ends the last 5 on
+ * literals. */
+static void pqx_lz4(pq_buf* o, const uint8_t* s, size_t n) {
+    int32_t tab[4096];
+    for (int i = 0; i < 4096; i++) tab[i] = -1;
+    size_t lit = 0, i = 0;
+    while (i + 12 <= n) {
+        uint32_t v; memcpy(&v, s + i, 4);
+        uint32_t h = (v * 2654435761u) >> 20;
+        int32_t c = tab[h]; tab[h] = (int32_t)i;
+        if (c >= 0 && i - (size_t)c <= 65535 && !memcmp(s + c, s + i, 4)) {
+            size_t len = 4, most = n - 5 - i;
+            while (len < most && s[(size_t)c + len] == s[i + len]) len++;
+            pqx_lz4_seq(o, s + lit, i - lit, i - (size_t)c, len);
+            i += len; lit = i;
+        } else i++;
+    }
+    pqx_lz4_seq(o, n ? s + lit : s, n - lit, 0, 0);
+}
+/* Hadoop's framing of one block: big-endian uncompressed and compressed sizes. */
+static void pqx_lz4_hadoop(pq_buf* o, const uint8_t* s, size_t n) {
+    pq_buf z = {0};
+    pqx_lz4(&z, s, n);
+    uint8_t h[8];
+    for (int k = 0; k < 4; k++) { h[k] = (uint8_t)(n >> (24 - 8*k)); h[4+k] = (uint8_t)(z.n >> (24 - 8*k)); }
+    pb_bytes(o, h, 8);
+    pb_bytes(o, z.p, z.n);
+    if (z.bad) o->bad = true;
+}
+/* A column's footer codec from its PQX_ flags. */
+static int pqx_codec(unsigned fl) {
+    return (fl & PQX_ZSTD) ? 6 : (fl & PQX_SNAPPY) ? 1 : (fl & PQX_LZ4) ? 7 : (fl & PQX_LZ4H) ? 5 : 0;
+}
 /* pqx_page's checksums (PQX_CRC, PQX_CRCFLIP): 0 none; 1 each page's
  * CRC-32 in its header (PageHeader 4); 2 that, and a dictionary page's
  * first string has one byte flipped after its checksum was taken (a page
@@ -2563,10 +3200,13 @@ static char pqx_flipped[256];
 static uint32_t pqx_flipped_len = 0;
 /* A page (kind 0 a v1 data page, 2 the dictionary): header and payload,
  * compressed when snappy; *raw adds what total_uncompressed_size counts. */
-static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int enc, bool snappy, int64_t* raw) {
+static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int enc, int codec, int64_t* raw) {
     pq_buf z = {0};
     const pq_buf* pay = body;
-    if (snappy) { pqx_snappy(&z, body->p, body->n); pay = &z; if (z.bad) f->bad = true; }
+    if (codec == 1) pqx_snappy(&z, body->p, body->n);
+    else if (codec == 7) pqx_lz4(&z, body->p, body->n);
+    else if (codec == 5) pqx_lz4_hadoop(&z, body->p, body->n);
+    if (codec) { pay = &z; if (z.bad) f->bad = true; }
     size_t h0 = f->n;
     int last = 0;
     pb_i(f, &last, 1, PB_I32, kind);
@@ -2587,7 +3227,7 @@ static void pqx_page(pq_buf* f, int kind, const pq_buf* body, int64_t count, int
     size_t at = f->n;
     pb_bytes(f, pay->p, pay->n);
     if (pqx_crc == 3 && kind == 0 && pay->n > 0 && !f->bad) f->p[at + pay->n - 1] ^= 0x20;
-    if (pqx_crc == 2 && kind == 2 && !snappy && pay->n > 5 && !f->bad) {
+    if (pqx_crc == 2 && kind == 2 && !codec && pay->n > 5 && !f->bad) {
         uint32_t len; memcpy(&len, pay->p, 4);
         if (len > 0 && len < sizeof(pqx_flipped) && 4 + (size_t)len <= pay->n) {
             f->p[at + 4] ^= 0x20;   /* the first string's first byte, its case flipped */
@@ -2629,7 +3269,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 for (int64_t r = lo; r < hi; r++) { int32_t x = (int32_t)r; pb_bytes(&v, &x, 4); }
                 dpo[i] = (int64_t)f.n;
                 pqx_crc = pqx_xflip == -2 ? 0 : pqx_xflip == g ? 3 : 1;
-                pqx_page(&f, 0, &v, hi - lo, 0, false, &rawt[i]);
+                pqx_page(&f, 0, &v, hi - lo, 0, 0, &rawt[i]);
                 if (v.bad) f.bad = true;
                 ray_sys_free(v.p);
                 stored[i] = (int64_t)f.n - start[i];
@@ -2638,7 +3278,8 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
             unsigned fl = flags[c - 1];
             unsigned pf = c == 1 && g < 16 ? pqx_pfault[g] : 0;
             pqx_crc = !(fl & PQX_CRC) ? 0 : ((fl & PQX_CRCFLIP) && g == groups - 1) || (pf & PQX_PF_CRCFLIP) ? 2 : 1;
-            bool snappy = (fl & PQX_SNAPPY) != 0, dicted = (fl & (PQX_DICT | PQX_FALLBACK)) != 0;
+            int codec = (fl & PQX_ZSTD) ? 0 : pqx_codec(fl);
+            bool dicted = (fl & (PQX_DICT | PQX_FALLBACK)) != 0;
             pq_synth_fn fn = fns[c - 1];
             int64_t mid = !dicted ? lo : (fl & PQX_FALLBACK) && hi - lo >= 2 ? lo + (hi - lo) * ((fl & PQX_LATE) ? 7 : 4) / 8 : hi;
             pq_buf dict = {0}, doff = {0};
@@ -2650,7 +3291,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                     uint32_t o = (uint32_t)dict.n; pb_bytes(&doff, &o, 4); pb_bytes(&dict, &len, 4); pb_bytes(&dict, s, len);
                 }
                 dio[i] = (int64_t)f.n;
-                pqx_page(&f, 2, &dict, (int64_t)(doff.n / 4), (fl & PQX_BADDICT) || (pf & PQX_PF_BADDICT) ? 3 : 0, snappy, &rawt[i]);
+                pqx_page(&f, 2, &dict, (int64_t)(doff.n / 4), (fl & PQX_BADDICT) || (pf & PQX_PF_BADDICT) ? 3 : 0, codec, &rawt[i]);
             }
             dpo[i] = (int64_t)f.n;
             for (int part = 0; part < 2; part++) {
@@ -2680,7 +3321,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
                 uint32_t ln = (uint32_t)levels.n;
                 pb_bytes(&body, &ln, 4); pb_bytes(&body, levels.p, levels.n); pb_bytes(&body, values.p, values.n);
                 if (levels.bad || values.bad || body.bad) f.bad = true;
-                pqx_page(&f, 0, &body, b - a, ids ? 8 : 0, snappy, &rawt[i]);
+                pqx_page(&f, 0, &body, b - a, ids ? 8 : 0, codec, &rawt[i]);
                 ray_sys_free(levels.p); ray_sys_free(values.p); ray_sys_free(body.p);
             }
             if (g == pqx_empty && dicted) dpo[i] = 0;   /* no data page: pyarrow writes offset 0 */
@@ -2717,7 +3358,7 @@ static bool pqx_synth(const char* path, int64_t rows, int64_t groups, int n, con
             if (dio[i] >= 0) { pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 3, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); pb_zz(&f, 8); }
             else { pb_field(&f, &lm, 2, PB_LIST); pb_list(&f, 2, PB_I32); pb_zz(&f, 0); pb_zz(&f, 3); }
             pb_field(&f, &lm, 3, PB_LIST); pb_list(&f, 1, PB_BIN); pb_bin(&f, nm, strlen(nm));
-            pb_i(&f, &lm, 4, PB_I32, c && (flags[c - 1] & PQX_ZSTD) ? 6 : c && (flags[c - 1] & PQX_SNAPPY) ? 1 : 0);
+            pb_i(&f, &lm, 4, PB_I32, c ? pqx_codec(flags[c - 1]) : 0);
             pb_i(&f, &lm, 5, PB_I64, cnt);
             pb_i(&f, &lm, 6, PB_I64, c && (flags[c - 1] & PQX_HUGERAW) ? INT64_MAX - 4096
                                      : c && (flags[c - 1] & PQX_ZERORAW) ? 0 : rawt[i]);
@@ -2864,6 +3505,9 @@ static test_result_t test_pq_sym_vocab_bound(void) {
     TEST_ASSERT_EQ_I(pq_pool(2), RAY_OK);
     static const struct { const char* what; pq_synth_fn fn; unsigned flags; int64_t rows; bool small; } cases[] = {
         {"snappy dictionary", pqx_prefixed, PQX_DICT | PQX_SNAPPY, 20000, false},
+        {"lz4 dictionary", pqx_prefixed, PQX_DICT | PQX_LZ4, 20000, false},
+        {"lz4 hadoop dictionary", pqx_prefixed, PQX_DICT | PQX_LZ4H, 20000, false},
+        {"lz4 PLAIN", pqx_late, PQX_LZ4, 16000, false},
         {"late PLAIN fallback", pqx_late, PQX_FALLBACK | PQX_LATE, 16000, false},
         {"late PLAIN fallback, no stats", pqx_late, PQX_FALLBACK | PQX_LATE | PQX_NOSTATS, 16000, false},
         {"PLAIN", pqx_late, 0, 16000, false},
@@ -3030,6 +3674,94 @@ static test_result_t test_pq_sym_direct_caps(void) {
     ray_pool_destroy();
     ray_sys_free(trace);
     ray_release(types);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+#endif
+}
+/* Generation 2 with the symbol columns seeded (the caps test's second file,
+ * its memory set by RAY_PQ_SYM_RAM): their chunks are encoded in the tasks
+ * and written in order (chunked), nothing staged, and the files are the
+ * staged ones byte for byte (on one worker), in one pass and column by
+ * column, with row groups that cross encoding chunks; every row reads back,
+ * on four workers too. */
+static test_result_t test_pq_sym_seeded_chunked(void) {
+#if !defined(DEBUG)
+    SKIP("the memory the decision assumes is a debug-build knob");
+#else
+    pq_sym_env_clear();
+    char src[160], dir[3][160], a[240], b[240];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pqsc-%d.parquet", (int)getpid());
+    for (int k = 0; k < 3; k++) snprintf(dir[k], sizeof(dir[k]), "/tmp/rayforce-pqsc-%d-%d", (int)getpid(), k);
+    const char* fnames[3] = {"x","p","q"};
+    const char* nm[2] = {"p","q"};
+    const char* stage[3] = {NULL, "file", "mem"};
+    int64_t tids[3] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 3);
+    int64_t keys[2] = {ray_sym_intern("types",5), ray_sym_intern("compress",8)};
+    ray_t* values = ray_list_new(2);
+    ray_retain(types);
+    ((ray_t**)ray_data(values))[0] = types;
+    ((ray_t**)ray_data(values))[1] = ray_bool(true);
+    values->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM, keys, 2), values);
+    /* p forty strings, q ten, both with nulls */
+    pq_synth_fn fns[2] = {pqx_lowcard, pqx_card10};
+    unsigned fl[2] = {PQX_DICT, PQX_DICT};
+    int64_t rows = 140000;   /* three encoding chunks over five row groups */
+    TEST_ASSERT_TRUE(pqx_synth(src, rows, 5, 2, nm, fns, fl));
+    size_t cap = (size_t)1 << 16;
+    char* trace = (char*)ray_sys_alloc(cap);
+    TEST_ASSERT_TRUE(trace != NULL);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    pq_set_symmode("direct");
+    ray_t* res = pq_traced_import(src, dir[0], types, trace, cap);
+    pq_sym_env_clear();
+    TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
+    pq_remove_native(dir[0], fnames, 3);
+    double bp = pq_trace_line_num(trace, "parquet symcol: col=p ", "vocab_bytes");
+    double bq = pq_trace_line_num(trace, "parquet symcol: col=q ", "vocab_bytes");
+    char ramv[32]; snprintf(ramv, sizeof(ramv), "%lld", (long long)((bp > bq ? bp : bq) * 64));
+    int bad = 0;
+    for (int run = 0; run < 4; run++) {
+        /* bit 0 column by column, bit 1 four workers */
+        int cores = run & 2 ? 4 : 1;
+        for (int k = 0; k < 3; k++) {
+            TEST_ASSERT_EQ_I(pq_pool(cores), RAY_OK);
+            if (run & 1) pq_set_layout("1");
+            pq_set_env("RAY_PQ_SYM_RAM", ramv);
+            pq_set_env("RAY_PQ_STAGE", stage[k]);
+            res = pq_traced_import(src, dir[k], opts, trace, cap);
+            pq_sym_env_clear();
+            if (!res || RAY_IS_ERR(res)) {
+                fprintf(stderr, "  %d/%d: import failed: %s\n", run, k, res ? ray_err_code(res) : "null");
+                if (res) ray_error_free(res);
+                bad++; continue;
+            }
+            ray_release(res);
+            /* by default x, p and q chunked; under RAY_PQ_STAGE none */
+            bool seeded = strstr(trace, "parquet symseed:") != NULL;
+            double chunked = pq_trace_sum(trace, "chunked", NULL);
+            if (!seeded || chunked != (k == 0 ? 3 : 0)) {
+                fprintf(stderr, "  %d/%d: %s, %.0f columns chunked\n", run, k, seeded ? "seeded" : "not seeded", chunked);
+                bad++;
+            }
+            int nulls[2] = {-1, -1};   /* HAS_NULLS: both hold nulls */
+            if (!pqx_check(dir[k], rows, 2, nm, fns, "seeded chunked", nulls)) bad++;
+            if (nulls[0] != 1 || nulls[1] != 1) { fprintf(stderr, "  %d/%d: HAS_NULLS p %d, q %d\n", run, k, nulls[0], nulls[1]); bad++; }
+        }
+        for (int k = 1; cores == 1 && k < 3; k++)
+            for (int f = 0; f < 4; f++) {
+                const char* fn = f < 3 ? fnames[f] : ".sym";
+                snprintf(a, sizeof(a), "%s/%s", dir[0], fn);
+                snprintf(b, sizeof(b), "%s/%s", dir[k], fn);
+                if (!pq_same_file(a, b)) { fprintf(stderr, "  %d: %s differs under %s\n", run, fn, stage[k]); bad++; }
+            }
+        for (int k = 0; k < 3; k++) pq_remove_native(dir[k], fnames, 3);
+    }
+    unlink(src);
+    ray_pool_destroy();
+    ray_sys_free(trace);
+    ray_release(opts); ray_release(types);
     TEST_ASSERT_EQ_I(bad, 0);
     PASS();
 #endif
@@ -4610,10 +5342,20 @@ const test_entry_t parquet_entries[] = {
     {"parquet/small_stack",test_pq_small_stack,NULL,NULL},
     {"parquet/parted_symbols",test_pq_parted_symbols,pq_setup,pq_teardown},
     {"parquet/snappy",test_pq_snappy,pq_setup,pq_teardown},
+    {"parquet/lz4",test_pq_lz4,pq_setup,pq_teardown},
+    {"parquet/uint64",test_pq_uint64,pq_setup,pq_teardown},
+    {"parquet/decimal",test_pq_decimal,pq_setup,pq_teardown},
+    {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
+    {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},
     {"parquet/cert_admission",test_pq_cert_admission,pq_setup,pq_teardown},
+    {"parquet/plain_str_ownership",test_pq_plain_str_ownership,pq_setup,pq_teardown},
+    {"parquet/plain_str_semantics",test_pq_plain_str_semantics,pq_setup,pq_teardown},
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    {"parquet/plain_str_cancel",test_pq_plain_str_cancel,pq_setup,pq_teardown},
+#endif
     {"parquet/read_metadata",test_pq_read_meta,pq_setup,pq_teardown},
     {"parquet/corrupt",test_pq_corrupt,pq_setup,pq_teardown},
     {"parquet/native",test_pq_native,pq_setup,pq_teardown},
@@ -4644,6 +5386,8 @@ const test_entry_t parquet_entries[] = {
     {"parquet/sym_vocab_bound",test_pq_sym_vocab_bound,pq_setup,pq_teardown},
     {"parquet/sym_grouped_empty",test_pq_sym_grouped_empty,pq_setup,pq_teardown},
     {"parquet/sym_direct_caps",test_pq_sym_direct_caps,pq_setup,pq_teardown},
+    {"parquet/sym_seeded_chunked",test_pq_sym_seeded_chunked,pq_setup,pq_teardown},
+    {"parquet/writebehind_failed",test_pq_writebehind_failed,pq_setup,pq_teardown},
 #if defined(__linux__)
     {"parquet/chunk_flush_error",test_pq_chunk_flush_error,pq_setup,pq_teardown},
 #endif

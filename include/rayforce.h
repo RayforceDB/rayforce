@@ -123,7 +123,8 @@ typedef enum {
     RAY_ERR_LIMIT,
     RAY_ERR_RESERVED,
     RAY_ERR_VERSION,
-    RAY_ERR_FPENV                 /* unsupported floating-point controls */
+    RAY_ERR_FPENV,                /* unsupported floating-point controls */
+    RAY_ERR_ACCESS                /* refused in restricted mode */
 } ray_err_t;
 
 #define RAY_IS_ERR(p)    ((p) != NULL && (uintptr_t)(p) > 31 && ((ray_t*)(p))->type == RAY_ERROR)

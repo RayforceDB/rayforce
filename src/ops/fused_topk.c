@@ -137,6 +137,22 @@ static void fpk_unpin_keys(fpk_keyspec_t* keys, uint32_t n) {
         if (keys[i].raw_ok) { ray_sym_domain_raw_unpin(keys[i].raw.dom); keys[i].raw_ok = 0; }
 }
 
+/* The output rows' pages of every generation-2 output column, asked for
+ * before the first gather: on a cold table the gathers, one column after
+ * another, then wait about once in all instead of once per column.  The
+ * columns are bound here (the gathers find the binds); a failed bind is
+ * returned, as the gather loop would. */
+static ray_t* fpk_want_out_rows(ray_graph_t* g, ray_t* tbl, const int64_t* out_col_syms, uint32_t n_out,
+                                const int64_t* rows, int64_t n) {
+    for (uint32_t c = 0; c < n_out; c++) {
+        ray_t* err = NULL;
+        ray_col_src_t* s = ray_graph_bind_col(g, tbl, out_col_syms[c], &err);
+        if (err) return err;
+        if (s && ray_col_src_encoded(s)) ray_col_src_want_points(s, rows, n);
+    }
+    return NULL;
+}
+
 /* A single-file generation-2 first key: the zone arrays of fpk_par_ctx_t
  * come from its directory, zstat[c] is chunk c's FPK_* class, and the
  * vectors of a surviving chunk are pruned from their descriptors (src, e). */
@@ -1306,9 +1322,9 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         if (result) ray_error_free(result);
         return NULL;                     /* decline: the unfused path runs (as before) */
     }
-    int build_ok = 1;
-    ray_t* gerr = NULL;                  /* a failed bind or plain request: returned */
-    for (uint32_t c = 0; c < n_out; c++) {
+    ray_t* gerr = fpk_want_out_rows(g, tbl, out_col_syms, n_out, global_idx, global_n);   /* a failed bind or plain request: returned */
+    int build_ok = gerr == NULL;
+    for (uint32_t c = 0; build_ok && c < n_out; c++) {
         int64_t cs    = out_col_syms[c];
         int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
         ray_col_src_t* ssrc = ray_graph_bind_col(g, tbl, cs, &gerr);
@@ -1572,9 +1588,9 @@ ray_t* ray_fused_take_select(ray_t* tbl,
         if (result) ray_error_free(result);
         return NULL;                     /* decline: the unfused path runs (as before) */
     }
-    int build_ok = 1;
-    ray_t* gerr = NULL;                  /* a failed bind or plain request: returned */
-    for (uint32_t c = 0; c < n_out; c++) {
+    ray_t* gerr = fpk_want_out_rows(g, tbl, out_col_syms, n_out, out, out_n);   /* a failed bind or plain request: returned */
+    int build_ok = gerr == NULL;
+    for (uint32_t c = 0; build_ok && c < n_out; c++) {
         int64_t cs    = out_col_syms[c];
         int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
         ray_col_src_t* ssrc = ray_graph_bind_col(g, tbl, cs, &gerr);
