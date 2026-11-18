@@ -57,7 +57,7 @@ typedef enum {
 
 typedef enum {
     RAY_JREPLAY_OK      = 0,
-    RAY_JREPLAY_BADTAIL = 1, /* truncated frame / bad magic / version mismatch — framing broken */
+    RAY_JREPLAY_BADTAIL = 1, /* truncated frame / bad magic — framing broken                    */
     RAY_JREPLAY_IO      = 2, /* file open / read I/O failure                                    */
     RAY_JREPLAY_OOM     = 3, /* allocation failed mid-replay — transient, retryable             */
     RAY_JREPLAY_DESER   = 4, /* header valid but ray_de_raw rejected the payload                */

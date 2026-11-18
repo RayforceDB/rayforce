@@ -46,7 +46,7 @@ Options dict keys (all optional; keys must be symbols):
 
 Keepalive only probes while none of our data is waiting for acknowledgement. Passing an explicit `keepalive` budget also bounds how long sent data may stay unacknowledged (`TCP_USER_TIMEOUT` on Linux), which catches a peer that vanishes mid-request. The cost is that a live peer which stops **reading** for that long also counts as dead: a large request to a server busy with something else, for example. The default does not set this bound. In that case a peer that vanishes with our data in flight is dropped by the operating system's retransmission limit, which is about 15 minutes on Linux. The budget is applied in whole seconds for the probe schedule. Platforms without these socket options skip them.
 
-The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged. The second byte also carries the transport capability each side offers; see [Transports](../storage/ipc.md#transports) for how a connection then moves off TCP, and `(.ipc.handle h)` to see where it landed.
+The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged; the server first replies with its own version, so `.ipc.open` raises `io` with `wire version mismatch`. The second byte also carries the transport capability each side offers; see [Transports](../storage/ipc.md#transports) for how a connection then moves off TCP, and `(.ipc.handle h)` to see where it landed.
 
 ```text
 ;; Unauthenticated

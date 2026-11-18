@@ -1195,6 +1195,8 @@ static test_result_t test_ipc_poll_auth_reject(void) {
     PASS();
 }
 
+static int wire_recv_exact(ray_sock_t s, void* buf, size_t n);
+
 /* ---- test_ipc_poll_handshake_version_mismatch --------------------------- */
 /*
  * Poll-based API: ipc_read_handshake version mismatch path (line 481-484).
@@ -1225,11 +1227,11 @@ static test_result_t test_ipc_poll_handshake_version_mismatch(void) {
     uint8_t bad_hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
     ray_sock_send(s, bad_hs, 2);
 
-    /* Server should close the connection — recv returns <= 0 */
-    sleep_ms(50);
-    uint8_t buf[4] = { 0 };
-    int64_t n = ray_sock_recv(s, buf, sizeof(buf));
-    TEST_ASSERT((int)n <= 0, "connection was closed by server");
+    /* Server answers with its own version byte, then closes. */
+    uint8_t buf[2] = { 0 };
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, buf, 2), 0);
+    TEST_ASSERT_EQ_I(buf[0], RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, buf, 1), -1);
     ray_sock_close(s);
 
     /* A correct client should still work after the bad handshake */
@@ -3098,7 +3100,8 @@ static test_result_t test_ipc_wire_async_no_reply(void) {
     PASS();
 }
 
-/* A peer speaking another wire version is dropped without a reply. */
+/* A v3 handshake to a v4 listener gets `04 00` back before the close,
+ * so the v3 client reports a wire version mismatch, not a reset. */
 static test_result_t test_ipc_wire_version_mismatch_drops(void) {
     ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
     test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
@@ -3106,13 +3109,15 @@ static test_result_t test_ipc_wire_version_mismatch_drops(void) {
 
     ray_sock_t s = ray_sock_connect("127.0.0.1", port, 2000);
     TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
-    uint8_t hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
+    /* A v3 peer, the version before this one. */
+    uint8_t hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION - 1), 0x00 };
     ray_sock_send(s, hs, 2);
 
-    /* The server deregisters instead of answering: readable with 0 bytes
-     * (EOF) rather than a 2-byte handshake reply. */
     uint8_t resp[2];
-    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 2), -1);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 2), 0);
+    TEST_ASSERT_EQ_I(resp[0], RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(resp[1], 0x00);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 1), -1);
 
     ray_sock_close(s);
     wire_stop_server(poll, port, vm, tid);
@@ -3760,8 +3765,7 @@ static test_result_t test_ipc_oversize_response_error(void) {
     }
     ray_t* r = ray_ipc_send_timeout(h, q, 2000);
     ray_release(q);
-    /* Native v3 error frames carry the code, not the thread-local message.
-     * The following same-handle request distinguishes a clean error reply
+    /* The following same-handle request distinguishes a clean error reply
      * from a peer rejecting an oversized frame and closing the stream. */
     bool limit_error = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
     if (RAY_IS_ERR(r)) ray_error_free(r);
@@ -3785,7 +3789,72 @@ static test_result_t test_ipc_oversize_response_error(void) {
     PASS();
 }
 
+/* A server-side diagnostic must cross the native IPC boundary with its error
+ * category.  Before wire v4 only the category was encoded, leaving callers
+ * with no explanation of the remote failure. */
+static test_result_t test_ipc_error_message_roundtrip(void) {
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    if (h < 0) {
+        ray_test_server_stop(&srv);
+        TEST_ASSERT(false, "connect for remote error response");
+    }
+
+    const char* expr = "(raise \"custom failure: the whole sentence\")";
+    ray_t* q = ray_str(expr, strlen(expr));
+    ray_t* r = ray_ipc_send_timeout(h, q, 2000);
+    ray_release(q);
+
+    bool is_error = r && RAY_IS_ERR(r);
+    bool has_message = is_error && ray_error_msg() &&
+                       strcmp(ray_error_msg(), "custom failure: the whole sentence") == 0;
+    if (is_error) ray_error_free(r);
+    else if (r) ray_release(r);
+
+    q = ray_str(expr, strlen(expr));
+    r = ray_ipc_send_verbose(h, q);
+    ray_release(q);
+    /* A nested wire error aborts list deserialization and is returned as the
+     * top-level client error; its diagnostic must survive verbose wrapping. */
+    bool verbose_error = r && RAY_IS_ERR(r);
+    bool verbose_message = verbose_error && ray_error_msg() &&
+                           strcmp(ray_error_msg(), "custom failure: the whole sentence") == 0;
+    if (verbose_error) ray_error_free(r);
+    else if (r) ray_release(r);
+
+    /* A later raw expression LIST must not inherit the preceding request's
+     * pending raise text.  This route calls ray_eval directly, not
+     * ray_eval_str, and therefore exercises the IPC evaluation boundary. */
+    ray_t* call = ray_list_new(2);
+    ray_t* fn = ray_sym(ray_sym_intern("read-bytes", 10));
+    const char* missing = "/tmp/rayforce-ipc-pending-raise-must-not-exist";
+    ray_t* path = ray_str(missing, strlen(missing));
+    ray_list_append(call, fn);
+    ray_list_append(call, path);
+    ray_release(fn);
+    ray_release(path);
+    r = ray_ipc_send_timeout(h, call, 2000);
+    ray_release(call);
+    bool unrelated_io = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
+    bool no_inherited_message = unrelated_io && ray_error_msg() == NULL;
+    if (unrelated_io) ray_error_free(r);
+    else if (r) ray_release(r);
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+
+    TEST_ASSERT_TRUE(is_error);
+    TEST_ASSERT_FMT(has_message, "remote message: %s", ray_error_msg() ? ray_error_msg() : "(null)");
+    TEST_ASSERT_TRUE(verbose_error);
+    TEST_ASSERT_FMT(verbose_message, "verbose remote message: %s",
+                    ray_error_msg() ? ray_error_msg() : "(null)");
+    TEST_ASSERT_TRUE(unrelated_io);
+    TEST_ASSERT_TRUE(no_inherited_message);
+    PASS();
+}
+
 const test_entry_t ipc_entries[] = {
+    { "ipc/error_message_roundtrip", test_ipc_error_message_roundtrip, ipc_setup, ipc_teardown },
     { "ipc/oversize_response_error", test_ipc_oversize_response_error, ipc_setup, ipc_teardown },
     { "ipc/size_admission_boundaries", test_ipc_size_admission_boundaries, ipc_setup, ipc_teardown },
     { "ipc/oversize_shared_value_refused", test_ipc_oversize_shared_value_refused, ipc_setup, ipc_teardown },

@@ -1667,7 +1667,10 @@ static ray_t* alter_target(ray_t** args, int64_t n,
 
 /* (del name) — delete variable from environment (special form, unevaluated arg) */
 ray_t* ray_del_fn(ray_t** args, int64_t n) {
-    if (n < 1) return ray_error("arity", "del expects 1 argument, got %lld", (long long)n);
+    /* Exactly one argument.  Surplus arguments used to be discarded, so
+     * `(del trades 'col)` — which reads as dropping a table column — unbound
+     * `trades` and silently ignored 'col.  Refuse rather than half-apply. */
+    if (n != 1) return ray_error("arity", "del expects 1 argument, got %lld", (long long)n);
     ray_t* name = args[0];
     if (name->type != -RAY_SYM)
         return ray_error("type", "del expects a symbol, got %s", ray_type_name(name->type));

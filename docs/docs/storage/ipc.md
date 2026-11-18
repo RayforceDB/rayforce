@@ -31,7 +31,7 @@ The server runs in the same thread as the REPL. IPC connections are processed be
 
 ## Handshake
 
-Every IPC connection opens with a 2-byte exchange before any framed payload flows: `{ wire_version, capabilities }`. The client sends its `RAY_SERDE_WIRE_VERSION` and its capabilities; the server replies with its own wire version and a byte whose low bit is `0x01` if password auth is required, `0x00` otherwise. Either side will drop the connection if the peer's first byte doesn't match — this is what prevents a new peer from ever writing a newer-format payload to a peer that couldn't parse it.
+Every IPC connection opens with a 2-byte exchange before any framed payload flows: `{ wire_version, capabilities }`. The client sends its `RAY_SERDE_WIRE_VERSION` and its capabilities; the server replies with its own wire version and a byte whose low bit is `0x01` if password auth is required, `0x00` otherwise. Either side will drop the connection if the peer's first byte doesn't match — this is what prevents a new peer from ever writing a newer-format payload to a peer that couldn't parse it. Since v4, a server that drops a client this way first replies `{ its wire_version, 0x00 }` and logs both versions, so the client reports `wire version mismatch` rather than a connection reset. A v3 server drops without a reply, so a v4 client connecting to it sees the connection reset.
 
 The high four bits of the second byte are capabilities. A client that can move a connection off TCP sets `0x10` (`RAY_IPC_CAP_XPORT`); a server that can too answers with the bit set, in the same byte as the auth flag. A server only ever sets capability bits when the client advertised some, so an older client, which sends a zero and refuses any reply byte but `0x00` or `0x01`, never sees one; an older server ignores the client's byte and answers as before, so a newer client simply stays on TCP. See [Transports](#transports).
 
@@ -290,7 +290,7 @@ Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, follow
 | Offset | Size | Field | Description |
 |---|---|---|---|
 | 0 | 4 bytes | `prefix` | Magic bytes `0xcefadefa` — identifies Rayforce binary data |
-| 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `3`). Decoupled from `RAY_VERSION_MAJOR`. A receiver that sees a different byte here rejects the payload with a `version` error instead of attempting to parse it. |
+| 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `4`). Decoupled from `RAY_VERSION_MAJOR`. Readers accept version 3 for existing serialized objects and journals; live IPC peers still require an exact handshake match before exchanging frames. |
 | 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). Bit 3 (`0x08`, `RAY_IPC_FLAG_CANCEL_SEEN`): on a reply over a shared-memory or RDMA connection, the server has taken a cancel byte since its last reply (see the transports above). |
 | 6 | 1 byte | `endian` | Endianness: `0` = little-endian |
 | 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response, `3` = upgrade (a transport record, never evaluated or journaled; see [Transports](#transports)) |
@@ -301,7 +301,7 @@ The corresponding C struct:
 ```c
 typedef struct ray_ipc_header_t {
     uint32_t prefix;     /* RAY_SERDE_PREFIX (0xcefadefa) */
-    uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 3) */
+    uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 4) */
     uint8_t  flags;      /* bit0 compressed, bit1 restricted (journal), bit2 verbose */
     uint8_t  endian;     /* 0 = little-endian */
     uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response, 3 = upgrade */
@@ -310,6 +310,29 @@ typedef struct ray_ipc_header_t {
 ```
 
 The header is exactly 16 bytes, enforced by a compile-time static assertion.
+
+Version 4 extends an error payload from its eight-byte category field to
+`category[8]`, a one-byte message length, and up to 255 message bytes. Version
+3 error records remain readable as category-only errors so persisted objects
+and journals survive the upgrade.
+
+The compatibility is one way. Journals, `.qdb` snapshots and serialized
+objects written by a version 4 binary cannot be read by a version 3 binary,
+and v3 and v4 peers refuse each other at the handshake. A v3 client
+connecting to a v4 server reports `wire version mismatch`, and the server
+logs both versions; a v4 client connecting to a v3 server sees the
+connection reset.
+
+**Upgrading from v3.** Upgrade all peers together:
+
+- Stop every process that talks to another, upgrade them all, then start
+  them again. A v3 and a v4 process cannot be connected.
+- Do not run a version 3 binary on a journal or snapshot that a version 4
+  binary has written. To keep a way back, archive the v3 files before the
+  first start of v4.
+- A version 3 binary that opens a version 4 journal reports a bad tail and
+  suggests truncating it. Do not truncate it: the log is valid, and the
+  truncation would delete its records.
 
 A receiver admits a positive wire body of at most 256 MiB. The decoded
 serialized body is also limited to 256 MiB: compression does not raise this
@@ -326,7 +349,8 @@ payload allocation. These per-message limits are not a process-memory budget.
 ### Wire-version history
 
 - **v2** — atoms serialized as `type(1) + value-bytes`. Typed-null atoms (`0Nl`, `0Nf`, …) lost their null bit on round-trip.
-- **v3** (current) — atoms serialized as `type(1) + flags(1) + value-bytes`. Bit 0 of `flags` carries the typed-null marker; `(de (ser 0Nl))` now returns `0Nl`. The [handshake byte](#handshake) advertises the same version so peers speaking different wire versions are closed before any payload is exchanged.
+- **v3** — atoms serialized as `type(1) + flags(1) + value-bytes`. Bit 0 of `flags` carries the typed-null marker; `(de (ser 0Nl))` now returns `0Nl`. The [handshake byte](#handshake) advertises the same version so peers speaking different wire versions are closed before any payload is exchanged.
+- **v4** (current) — error records carry `category[8]`, a one-byte message length and up to 255 message bytes, so an error sent over IPC or written to a journal keeps its message. v4 reads v3 objects and journals; live peers must both be v4.
 
 Because the version field is checked symmetrically on send and receive, a v3 peer will refuse to connect to a v2 peer (and vice versa) rather than silently mis-parsing.
 
