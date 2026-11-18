@@ -594,7 +594,6 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
                           uint8_t extra_flags)
 {
     ray_serde_fail_clear();
-    ray_t* fallback = NULL;
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -603,12 +602,8 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
      * (issue #285).  ray_error frames serialize, so the substitute always
      * goes out unless even that fails — in which case there is nothing we
      * can put on the wire and we drop as before. */
+    ray_t* fallback = NULL;
     if (!ray_ipc_body_size_ok(ser_size)) {
-        if (fallback) {
-            ray_error_free(fallback);
-            fallback = NULL;
-            result = NULL;
-        }
         if (ser_size > RAY_IPC_BODY_MAX_BYTES) {
             fallback = ray_error("io", "IPC result exceeds the 256 MiB decoded payload limit");
         } else {
