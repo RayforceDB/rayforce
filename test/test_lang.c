@@ -6930,6 +6930,29 @@ static test_result_t test_dotted_del_nested(void) {
     PASS();
 }
 
+/* (del t 'col) reads as dropping a column.  del unbinds names only, so a
+ * surplus argument must be refused rather than silently discarded: the old
+ * behaviour unbound `t` and ignored 'col, and the caller saw success. */
+static test_result_t test_del_rejects_surplus_args(void) {
+    ray_eval_str("(set __dela (table [a b] (list [1 2] [10 20])))");
+
+    ASSERT_ER_CODE("(del __dela 'b)", "arity");
+    ASSERT_ER_CODE("(del __dela 'b 'c)", "arity");
+    ASSERT_ER_CODE("(del)", "arity");
+
+    /* The half-applied case is the one to guard: the binding must survive a
+     * refused call, so a caller that meant "drop a column" gets an error
+     * instead of a silently unbound table. */
+    ASSERT_EQ("(count __dela)", "2");
+
+    /* One argument still unbinds, and returns 0. */
+    ASSERT_EQ("(del __dela)", "0");
+    ray_t* gone = ray_eval_str("__dela");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(gone));
+    ray_error_free(gone);
+    PASS();
+}
+
 static test_result_t test_dotted_del_cascade(void) {
     /* Deleting the only key in a namespace removes the namespace itself. */
     ray_eval_str("(set __cascns.only 5)");
@@ -13184,6 +13207,7 @@ const test_entry_t lang_entries[] = {
     { "lang/dotted/flat_binding_wins", test_dotted_flat_binding_wins, lang_setup, lang_teardown },
     { "lang/dotted/del_removes_key", test_dotted_del_removes_key, lang_setup, lang_teardown },
     { "lang/dotted/del_nested", test_dotted_del_nested, lang_setup, lang_teardown },
+    { "lang/dotted/del_rejects_surplus_args", test_del_rejects_surplus_args, lang_setup, lang_teardown },
     { "lang/dotted/del_cascade", test_dotted_del_cascade, lang_setup, lang_teardown },
     { "lang/dotted/table_column", test_dotted_table_column, lang_setup, lang_teardown },
     { "lang/dotted/temporal_atom", test_dotted_temporal_atom, lang_setup, lang_teardown },

@@ -264,7 +264,8 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
 | `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
 | `alter` | variadic, special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector (for a dict, `idx` is a key or a vector of keys: an existing key is replaced, a missing one is added), `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
-| `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
+| `del` | unary, special | Unbind one variable or dotted-path leaf and return `0`; deleting the last leaf of a dotted path removes the intermediate dicts too. Not a table operation: extra arguments raise `arity` | `(del cfg.db.host)` |
+| `delete` | unary, special | Remove the rows a predicate matches: `{from: 't where: p}` removes them in place, `{from: t where: p}` returns a new table. Both clauses are required | `(delete {from: 'trades where: (> price 100)})` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 
 `xkey` returns a dictionary keyed by unique key column value(s). Duplicate keys are a domain error; use `xgroup` to get a dictionary whose values are grouped table slices. Passing a typed vector of keys to `at` performs a batch lookup and returns a list of the corresponding values.
