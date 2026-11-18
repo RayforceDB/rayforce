@@ -200,39 +200,6 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 static int64_t g_tx_limit_bytes  = RAY_IPC_TX_DEFAULT_BYTES;
 static int64_t g_tx_limit_frames = 0;   /* unlimited */
 
-/* Constant-time comparison — prevents timing side-channel on password. */
-static bool ct_eq(const void* a, const void* b, size_t len) {
-    const volatile uint8_t* x = a;
-    const volatile uint8_t* y = b;
-    volatile uint8_t diff = 0;
-    for (size_t i = 0; i < len; i++)
-        diff |= x[i] ^ y[i];
-    return diff == 0;
-}
-
-/* Validate credential buffer against secret. Returns true if password matches.
- * creds is "user:password\0" with length cred_len.
- * secret MUST point to a char[256] buffer (zero-padded beyond the password).
- * Compares pw against the full 256-byte secret buffer in constant time.
- * No strlen, no secret-length-dependent copies. */
-static bool validate_creds(const uint8_t* buf, uint8_t cred_len,
-                           const char* secret) {
-    if (cred_len == 0) return false;
-    const char* creds = (const char*)buf;
-    const char* colon = memchr(creds, ':', cred_len);
-    const char* pw = colon ? colon + 1 : creds;
-    size_t pw_len = colon ? (size_t)(cred_len - (pw - creds)) : cred_len;
-    if (pw_len > 0 && pw[pw_len - 1] == '\0') pw_len--;
-    if (pw_len > 255) pw_len = 255;
-
-    /* Zero-pad pw into a 256-byte buffer, then compare all 256 bytes
-     * against the secret buffer (also 256 bytes, zero-padded at init).
-     * Matching passwords produce identical 256-byte buffers. */
-    uint8_t pw_buf[256] = {0};
-    memcpy(pw_buf, pw, pw_len);
-    return ct_eq(pw_buf, secret, 256);
-}
-
 /* ===== Connection hooks (.ipc.on.*) =====
  *
  * Five user-settable lambdas that intercept the connection lifecycle.
@@ -1414,8 +1381,7 @@ static ray_t* ipc_read_creds(ray_poll_t* poll, ray_selector_t* sel)
 
     ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
 
-    bool ok = validate_creds(sel->rx.buf->data + 1, cred_len,
-                             poll->auth_secret);
+    bool ok = ray_poll_auth_check(poll, sel->rx.buf->data + 1, cred_len);
 
     /* Secondary user-defined check via `.ipc.on.auth`.  Only consulted
      * when the constant-time secret compare already passed — this hook
