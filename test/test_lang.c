@@ -4785,6 +4785,39 @@ static test_result_t test_eval_select_parted_stats_impl(const char* root) {
         TEST_ASSERT_EQ_U(parts1 - parts0, cases[i].pruned);
     }
 
+    /* A name bound to a constant prunes as the constant written out does:
+     * a global, a `let`, a lambda's argument; an atom anywhere, a typed
+     * vector as the set of an `in`.  A name beside a literal conjunct does
+     * not cost that conjunct its pruning.  A vector compared by position
+     * is no constant: nothing is pruned, the rows still line up. */
+    struct { const char* src; const char* want; uint64_t pruned; } bound[] = {
+        { "(do (set lo 2024.01.16D12:00:00.000) (at (select {from: p where: (>= Time lo)}) 'v))", "[5 6]", 1 },
+        { "(do (let hi 2024.01.15D20:00:00.000) (at (select {from: p where: (<= Time hi)}) 'v))", "[1 2 4]", 1 },
+        { "((fn [t] (at (select {from: p where: (> Time t)}) 'v)) 2024.01.17D00:30:00.000)", "[6]", 2 },
+        { "(do (set ts [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000]) (at (select {from: p where: (in Time ts)}) 'v))", "[2 6]", 1 },
+        { "(do (let vs [6 1]) (at (select {from: p where: (and (> Time 2024.01.17D00:30:00.000) (in v vs))}) 'v))", "[6]", 2 },
+        { "(do (let d 2024.01.17) (at (select {from: p where: (== date d)}) 'v))", "[6]", 2 },
+        { "(do (let d 2024.01.16) (let vs [3 5 6]) (at (select {from: p where: (and (>= date d) (in v vs))}) 'v))", "[3 5 6]", 1 },
+        { "(do (set vv [1 0 3 0 5 6]) (at (select {from: p where: (and (> Time 2024.01.15D12:00:00.000) (== v vv))}) 'v))", "[3 5 6]", 0 },
+    };
+    for (size_t i = 0; i < sizeof bound / sizeof bound[0]; i++) {
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        ray_t* r = ray_eval_str(bound[i].src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_t* want = ray_eval_str(bound[i].want);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_EQ_I(r->len, want->len);
+        for (int64_t k = 0; k < r->len; k++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[k], ((int64_t*)ray_data(want))[k]);
+        ray_release(r);
+        ray_release(want);
+        ray_query_test_part_prune(&runs1, &parts1);
+        TEST_ASSERT_EQ_U(runs1 - runs0, bound[i].pruned ? 1 : 0);
+        TEST_ASSERT_EQ_U(parts1 - parts0, bound[i].pruned);
+    }
+
     /* The same answers as the plain scan: the count fast path and a sum. */
     ray_t* r = ray_eval_str("(count (select {from: p where: (< Time 2024.01.15D12:00:00.000)}))");
     TEST_ASSERT_NOT_NULL(r);
