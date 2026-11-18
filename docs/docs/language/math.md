@@ -190,7 +190,10 @@ on only one side compares `false`. An atom broadcasts over dictionary values.
 Tables compare cell by cell, returning boolean columns. Table column names
 and order and row counts must agree, otherwise `==` raises `length`. An atom
 broadcasts over all cells. Other comparisons and arithmetic keep their
-existing behavior.
+existing behavior. In particular, `!=` still rejects dictionaries and tables.
+Nonempty dictionary key vector types must match; different key types raise `type`.
+Identical key vectors (including duplicate keys) compare values positionally;
+otherwise keys align by lookup, using the first matching occurrence.
 
 ### `(identical a b)`
 

@@ -30,3 +30,14 @@
 (set compare (fn [x y] (list (== x y) (identical x y))))
 (identical (at (compare {a: 1} {a: 1i}) 0) {a: true}) -- true
 (at (compare {a: 1} {a: 1i}) 1) -- false
+
+;; Typed kernels retain null, signed-zero and slice semantics.
+(identical [0Nf -0.0 1.0] [0Nf 0.0 1.0]) -- true
+(identical (as 'F32 [0Nf -0.0 1.0]) (as 'F32 [0Nf 0.0 1.0])) -- true
+(identical [0Nl 1] [1 0Nl]) -- false
+(identical (drop [0 1 2 3] 1) [1 2 3]) -- true
+(identical ["aa" "bb"] ["aa" "bc"]) -- false
+(identical [a b] [a c]) -- false
+(identical (til 1000000) (+ (til 1000000) 0)) -- true
+(identical (== {} {a: 1}) {a: false}) -- true
+(identical (== {a: 1} {}) {a: false}) -- true

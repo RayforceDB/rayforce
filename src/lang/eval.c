@@ -1386,7 +1386,8 @@ static ray_t* bool_cmp_fast(uint16_t op, ray_t* left, ray_t* right) {
 }
 
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
-    if (fn == ray_eq_fn && (left->type == RAY_DICT || right->type == RAY_DICT ||
+    if (fn == ray_eq_fn && left && right && !RAY_IS_ERR(left) && !RAY_IS_ERR(right) &&
+        (left->type == RAY_DICT || right->type == RAY_DICT ||
                             left->type == RAY_TABLE || right->type == RAY_TABLE))
         return fn(left, right);
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||

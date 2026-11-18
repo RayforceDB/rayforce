@@ -73,3 +73,26 @@
 (identical T (de (ser T))) -- true
 (count T) -- 3
 (key T) -- [a b]
+
+;; Aligned duplicate keys compare values positionally.
+(== (dict [a a] [1 2]) (dict [a a] [1 2])) -- (dict [a a] [true true])
+(== (dict [a a] [1 2]) (dict [a a] [1 3])) -- (dict [a a] [true false])
+;; Keyed tables use LIST keys, including composite key rows.
+(set ka (xkey (table [k v] (list [1 2] [10 20])) 'k))
+(set kb (xkey (table [k v] (list [2 3] [20 30])) 'k))
+(key (== ka kb)) -- (list 1 2 3)
+(value (== ka kb)) -- (list false {v: true} false)
+(key (== kb ka)) -- (list 2 3 1)
+(value (== kb ka)) -- (list {v: true} false false)
+(set kc (xkey (table [k j v] (list [1 2] [a b] [10 20])) [k j]))
+(set kd (xkey (table [k j v] (list [1 2] [a c] [10 20])) [k j]))
+(key (== kc kd)) -- (list (list 1 'a) (list 2 'b) (list 2 'c))
+(value (== kc kd)) -- (list {v: true} false false)
+(== {a: 1 b: 2} (dict [1 2] [1 2])) !- type
+(== (dict [1 2] [1 2]) {a: 1 b: 2}) !- type
+;; Reordered and one-sided large key sets exercise batched matching.
+(set eqkeys (til 40000))
+(set eqrev (reverse eqkeys))
+(all (value (== (dict eqkeys eqkeys) (dict eqrev eqrev)))) -- true
+(count (key (== (dict eqkeys eqkeys) (dict (+ eqkeys 1) (+ eqkeys 1))))) -- 40001
+(!= {a: 1} {a: 1}) !- type
