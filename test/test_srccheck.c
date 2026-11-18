@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include "test.h"
 #include "table/table.h"
 #include "vec/vec.h"
@@ -168,14 +169,18 @@ static test_result_t test_cols_inplace_plain(void) {
  * Rayfall or shell line, the bare root; an already-moved path and a path
  * that merely contains "/tmp" elsewhere are left alone.  The root exists. */
 static test_result_t test_tmp_paths_per_process(void) {
-    char root[64];
-    snprintf(root, sizeof root, "/tmp/rayforce_t.%ld", (long)getpid());
-    char want[256];
+    const char* root = ray_test_tmp_root();
+    char want[12544];
     snprintf(want, sizeof want, "%s/rayforce_x/a", root);
-    TEST_ASSERT_STR_EQ(ray_test_tmp("/tmp/rayforce_x/a"), want);
-    TEST_ASSERT_STR_EQ(ray_test_tmp(want), want);
+    /* Compare complete paths, but keep diagnostics independent of their
+     * potentially large length (GCC -Werror=format-truncation). */
+    TEST_ASSERT(strcmp(ray_test_tmp("/tmp/rayforce_x/a"), want) == 0,
+                "plain path moved under selected scratch root");
+    TEST_ASSERT(strcmp(ray_test_tmp(want), want) == 0,
+                "already-moved path unchanged");
     snprintf(want, sizeof want, "(.db.splayed.set \"%s/t\" T) rm -rf %s/u; cd %s", root, root, root);
-    TEST_ASSERT_STR_EQ(ray_test_tmp("(.db.splayed.set \"/tmp/t\" T) rm -rf /tmp/u; cd /tmp"), want);
+    TEST_ASSERT(strcmp(ray_test_tmp("(.db.splayed.set \"/tmp/t\" T) rm -rf /tmp/u; cd /tmp"), want) == 0,
+                "embedded paths moved under selected scratch root");
     TEST_ASSERT_STR_EQ(ray_test_tmp("/var/tmp/x /tmpx rf_tmp/y"), "/var/tmp/x /tmpx rf_tmp/y");
     TEST_ASSERT_TRUE(ray_test_tmp("/tmp/rayforce_x/a") == ray_test_tmp("/tmp/rayforce_x/a"));
     struct stat st;

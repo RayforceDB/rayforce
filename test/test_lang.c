@@ -31,10 +31,12 @@
 #include "store/part.h"
 #include "store/splay.h"
 #include "store/enccol.h"
+#include "store/encfmt.h"
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -4717,6 +4719,178 @@ static test_result_t test_eval_insert_parted_e2e(void) {
     return result;
 }
 
+/* ---- Test: a select prunes partitions by their statistics before fetch -- */
+
+static test_result_t test_eval_select_parted_stats_impl(const char* root) {
+    /* Three generation-2 partitions (compress: true writes a chunk directory
+     * per column); Time rises with the day except for the null in the
+     * second partition, which ranks below every value. */
+    const char* days[] = { "2024.01.15", "2024.01.16", "2024.01.17" };
+    const char* rows[] = {
+        "(list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] [1 2])",
+        "(list [2024.01.16D00:00:00.000 0Np 2024.01.16D12:00:00.000] [3 4 5])",
+        "(list [2024.01.17D01:00:00.000] [6])",
+    };
+    char src[1400];
+    for (int i = 0; i < 3; i++) {
+        int n = snprintf(src, sizeof(src),
+                         "(.db.splayed.set \"%s/%s/t/\" (table ['Time 'v] %s) {compress: true})",
+                         root, days[i], rows[i]);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+        ray_t* w = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+        ray_release(w);
+    }
+    int n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    /* query, expected v values, partitions the pre-fetch pruning drops */
+    struct { const char* where; const char* want; uint64_t pruned; } cases[] = {
+        { "(> Time 2024.01.17D00:30:00.000)",  "[6]",           2 },
+        { "(>= Time 2024.01.16D12:00:00.000)", "[5 6]",         1 },
+        { "(< Time 2024.01.15D12:00:00.000)",  "[1 4]",         1 },   /* the null's partition stays */
+        { "(<= Time 2024.01.15D20:00:00.000)", "[1 2 4]",       1 },
+        { "(== Time 2024.01.17D01:00:00.000)", "[6]",           2 },
+        { "(== Time 2024.01.16D06:00:00.000)", "[]",            2 },   /* one pruned partition stands in */
+        { "(!= Time 2024.01.17D01:00:00.000)", "[1 2 3 4 5]",   1 },   /* a one-value partition equal to it */
+        { "(in Time [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000])", "[2 6]", 1 },
+        { "(> 2024.01.16D20:00:00.000 Time)",  "[1 2 3 4 5]",   1 },   /* the literal on the left */
+        { "(and (>= v 3) (< Time 2024.01.17D00:00:00.000))", "[3 4 5]", 2 },   /* two columns' statistics */
+        { "(== Time 0Np)",                     "[4]",           0 },   /* a null literal: left to the filter, nothing pruned */
+        { "(== Time [0Np])",                   "[4]",           0 },
+        { "(in Time [2024.01.17D01:00:00.000 0Np])", "[6]",     0 },   /* a null member of the set likewise */
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        n = snprintf(src, sizeof(src), "(at (select {from: p where: %s}) 'v)", cases[i].where);
+        TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format select");
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_t* want = ray_eval_str(cases[i].want);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_EQ_I(r->len, want->len);
+        for (int64_t k = 0; k < r->len; k++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[k], ((int64_t*)ray_data(want))[k]);
+        ray_release(r);
+        ray_release(want);
+        ray_query_test_part_prune(&runs1, &parts1);
+        TEST_ASSERT_EQ_U(runs1 - runs0, cases[i].pruned ? 1 : 0);
+        TEST_ASSERT_EQ_U(parts1 - parts0, cases[i].pruned);
+    }
+
+    /* The same answers as the plain scan: the count fast path and a sum. */
+    ray_t* r = ray_eval_str("(count (select {from: p where: (< Time 2024.01.15D12:00:00.000)}))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 2);
+    ray_release(r);
+    r = ray_eval_str("(sum (at (select {from: p where: (> Time 2024.01.16D06:00:00.000)}) 'v))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 11);
+    ray_release(r);
+    PASS();
+}
+
+/* ---- Test: a chunk with rows but no extrema disables its partition's statistics -- */
+
+/* Flags bit 0 (RAY_ENC_STAT_ABSENT) of chunk `chunk` of the generation-2
+ * column file at `path`: the writer sets it for an integer or temporal
+ * chunk only when every row is null, so this makes a chunk the writer
+ * cannot: rows, no extrema. */
+static bool lang_patch_chunk_stat_absent(const char* path, int chunk) {
+    FILE* f = fopen(path, "r+b");
+    if (!f) return false;
+    long off = RAY_ENC_DIR_OFF + (long)chunk * (long)sizeof(ray_enc_dirent_t) + (long)offsetof(ray_enc_dirent_t, flags);
+    uint32_t flags = 0;
+    bool ok = fseek(f, off, SEEK_SET) == 0 && fread(&flags, sizeof flags, 1, f) == 1;
+    flags |= RAY_ENC_STAT_ABSENT;
+    ok = ok && fseek(f, off, SEEK_SET) == 0 && fwrite(&flags, sizeof flags, 1, f) == 1;
+    return fclose(f) == 0 && ok;
+}
+
+static test_result_t test_eval_select_parted_stats_absent_impl(const char* root) {
+    /* Two partitions of an int64 column: the first a single chunk 0..999,
+     * the second two chunks (65536 rows a chunk) 0..69999, whose second
+     * chunk is then marked as carrying no extrema.  That partition has no
+     * statistics any more: a predicate past the first chunk's maximum
+     * must still find the rows of the second. */
+    char src[600];
+    int n = snprintf(src, sizeof(src), "(.db.splayed.set \"%s/1/t/\" (table ['k] (list (til 1000))) {compress: true})", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+    ray_t* w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    n = snprintf(src, sizeof(src), "(.db.splayed.set \"%s/2/t/\" (table ['k] (list (til 70000))) {compress: true})", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+    w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    n = snprintf(src, sizeof(src), "%s/2/t/k", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format column path");
+    TEST_ASSERT(lang_patch_chunk_stat_absent(src, 1), "patch the second chunk's flags");
+    n = snprintf(src, sizeof(src), "(set p (.db.parted.get \"%s\" 't))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+
+    /* partition 1 (maximum 999) is pruned; partition 2 is kept and answers */
+    ray_t* r = ray_eval_str("(count (select {from: p where: (> k 69000)}))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 999);
+    ray_release(r);
+    uint64_t runs0, parts0, runs1, parts1;
+    ray_query_test_part_prune(&runs0, &parts0);
+    r = ray_eval_str("(at (select {from: p where: (== k 69999)}) 'k)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[0], 69999);
+    ray_release(r);
+    ray_query_test_part_prune(&runs1, &parts1);
+    TEST_ASSERT_EQ_U(runs1 - runs0, 1);
+    TEST_ASSERT_EQ_U(parts1 - parts0, 1);
+    PASS();
+}
+
+static test_result_t test_eval_select_parted_stats_absent(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_stats_absent_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_select_parted_stats_absent_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+static test_result_t test_eval_select_parted_stats(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_stats_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_select_parted_stats_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
 /* ---- Test: live FILE-domain symbols persist only at explicit rollover - */
 
 static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
@@ -6753,6 +6927,29 @@ static test_result_t test_dotted_del_nested(void) {
     ASSERT_EQ("(count __abc.b)", "1");
     ray_t* r = ray_eval_str("__abc.b.c");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* (del t 'col) reads as dropping a column.  del unbinds names only, so a
+ * surplus argument must be refused rather than silently discarded: the old
+ * behaviour unbound `t` and ignored 'col, and the caller saw success. */
+static test_result_t test_del_rejects_surplus_args(void) {
+    ray_eval_str("(set __dela (table [a b] (list [1 2] [10 20])))");
+
+    ASSERT_ER_CODE("(del __dela 'b)", "arity");
+    ASSERT_ER_CODE("(del __dela 'b 'c)", "arity");
+    ASSERT_ER_CODE("(del)", "arity");
+
+    /* The half-applied case is the one to guard: the binding must survive a
+     * refused call, so a caller that meant "drop a column" gets an error
+     * instead of a silently unbound table. */
+    ASSERT_EQ("(count __dela)", "2");
+
+    /* One argument still unbinds, and returns 0. */
+    ASSERT_EQ("(del __dela)", "0");
+    ray_t* gone = ray_eval_str("__dela");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(gone));
+    ray_error_free(gone);
     PASS();
 }
 
@@ -12957,6 +13154,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
+    { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
@@ -13008,6 +13207,7 @@ const test_entry_t lang_entries[] = {
     { "lang/dotted/flat_binding_wins", test_dotted_flat_binding_wins, lang_setup, lang_teardown },
     { "lang/dotted/del_removes_key", test_dotted_del_removes_key, lang_setup, lang_teardown },
     { "lang/dotted/del_nested", test_dotted_del_nested, lang_setup, lang_teardown },
+    { "lang/dotted/del_rejects_surplus_args", test_del_rejects_surplus_args, lang_setup, lang_teardown },
     { "lang/dotted/del_cascade", test_dotted_del_cascade, lang_setup, lang_teardown },
     { "lang/dotted/table_column", test_dotted_table_column, lang_setup, lang_teardown },
     { "lang/dotted/temporal_atom", test_dotted_temporal_atom, lang_setup, lang_teardown },

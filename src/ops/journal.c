@@ -182,7 +182,16 @@ ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
  * If the journal isn't open, ERROR rather than silently no-op — a
  * silent no-op would lie to the user about durability ("I logged
  * your change") when in fact nothing was persisted. */
+static ray_t* log_write_held(ray_t* expr);
+
 ray_t* ray_log_write_fn(ray_t* expr) {
+    ray_serde_msg_hold();
+    ray_t* r = log_write_held(expr);
+    ray_serde_msg_release();
+    return r;
+}
+
+static ray_t* log_write_held(ray_t* expr) {
     if (!ray_journal_is_open())
         return ray_error("noopen", ".log.write: no journal open (start with -l/-L)");
     if (ray_ipc_auto_journal_eval())

@@ -24,7 +24,7 @@
 (.sys.exec "rm -f /tmp/rftest_xport_policy.rfl")
 
 (.sys.exec "./rayforce -p 19986 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19986 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19986 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 ;; ── the default lands on shared memory ──────────────────────────────
 (set h (.ipc.open "127.0.0.1:19986"))
