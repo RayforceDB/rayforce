@@ -805,10 +805,12 @@ ray_t* ray_identical_fn(ray_t* a, ray_t* b) {
             }
             bool same;
             if (a->type == RAY_F64) {
-                double x = ((const double*)ad)[i], y = ((const double*)bd)[i];
+                const double* xa = ray_data(a), *xb = ray_data(b);
+                double x = xa[i], y = xb[i];
                 same = x == y || (isnan(x) && isnan(y));
             } else if (a->type == RAY_F32) {
-                float x = ((const float*)ad)[i], y = ((const float*)bd)[i];
+                const float* xa = ray_data(a), *xb = ray_data(b);
+                float x = xa[i], y = xb[i];
                 same = x == y || (isnan(x) && isnan(y));
             } else if (a->type == RAY_SYM) {
                 same = sym_cell_runtime_id(a, i) == sym_cell_runtime_id(b, i);

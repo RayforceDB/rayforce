@@ -107,3 +107,7 @@
 (value (== ks kn)) -- (list {v: true} false false)
 (set km (xkey (table [k j v] (list [00:00:01.000 00:00:03.000] [a c] [10 30])) [k j]))
 (value (== ks km)) -- (list {v: true} false false)
+
+;; Unaligned duplicate keys use the first matching right occurrence.
+(== (dict [a a b] [1 2 3]) (dict [a a c] [1 2 3])) -- (dict [a a b c] [true false false false])
+(== (dict [a a b] [1 2 3]) (dict [a c] [2 3])) -- (dict [a a b c] [false true false false])

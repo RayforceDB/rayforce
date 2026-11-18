@@ -193,7 +193,9 @@ broadcasts over all cells. Other comparisons and arithmetic keep their
 existing behavior. In particular, `!=` still rejects dictionaries and tables.
 Nonempty dictionary key vector types must match; different key types raise `type`.
 Identical key vectors (including duplicate keys) compare values positionally;
-otherwise keys align by lookup, using the first matching occurrence.
+otherwise each left value compares with the first right value for its key,
+including repeated left keys. For example, `[a a b]` versus `[a a c]` with
+values `[1 2 3]` on both sides yields `{a:true a:false b:false c:false}`.
 Keyed-table comparisons support single and composite keys, including durations.
 
 ### `(identical a b)`
