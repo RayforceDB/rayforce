@@ -349,14 +349,8 @@ int main(int argc, char** argv) {
      * the same event loop the REPL/server is driving. */
     if (poll) ray_runtime_set_poll(poll);
 
-    if (poll && auth_pw) {
-        size_t pw_len = strlen(auth_pw);
-        if (pw_len >= sizeof(poll->auth_secret))
-            pw_len = sizeof(poll->auth_secret) - 1;
-        memcpy(poll->auth_secret, auth_pw, pw_len);
-        poll->auth_secret[pw_len] = '\0';
-        ray_poll_set_restricted(poll, auth_restricted);
-    }
+    if (poll && auth_pw)
+        ray_poll_auth_set(poll, auth_pw, auth_restricted);
 
     /* Open journal BEFORE the IPC listener accepts any connection.
      * Replay must complete with a stable global env, and any badtail
