@@ -3083,6 +3083,7 @@ uint64_t ray_atom_hash(ray_t* a) {
         case -RAY_SYM:       return ray_hash_i64(a->i64);
         case -RAY_DATE:
         case -RAY_TIME:      return ray_hash_i64((int64_t)a->i32);
+        case -RAY_TIMESPAN:
         case -RAY_TIMESTAMP: return ray_hash_i64(a->i64);
         case -RAY_GUID: {
             const uint8_t* g = a->obj

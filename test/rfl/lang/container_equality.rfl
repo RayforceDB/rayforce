@@ -96,3 +96,14 @@
 (all (value (== (dict eqkeys eqkeys) (dict eqrev eqrev)))) -- true
 (count (key (== (dict eqkeys eqkeys) (dict (+ eqkeys 1) (+ eqkeys 1))))) -- 40001
 (!= {a: 1} {a: 1}) !- type
+
+;; Composite duration keys stay scalar keys during batched matching.
+(set ks (xkey (table [k j v] (list [0D00:00:01 0D00:00:02] [a b] [10 20])) [k j]))
+(set kt (xkey (table [k j v] (list [0D00:00:01 0D00:00:02] [a c] [10 20])) [k j]))
+(key (== ks kt)) -- (list (list 0D00:00:01 'a) (list 0D00:00:02 'b) (list 0D00:00:02 'c))
+(value (== ks kt)) -- (list {v: true} false false)
+;; Duration lookup also agrees with numeric and TIME representations.
+(set kn (xkey (table [k j v] (list [1000000000 3000000000] [a c] [10 30])) [k j]))
+(value (== ks kn)) -- (list {v: true} false false)
+(set km (xkey (table [k j v] (list [00:00:01.000 00:00:03.000] [a c] [10 30])) [k j]))
+(value (== ks km)) -- (list {v: true} false false)

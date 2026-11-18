@@ -194,6 +194,7 @@ existing behavior. In particular, `!=` still rejects dictionaries and tables.
 Nonempty dictionary key vector types must match; different key types raise `type`.
 Identical key vectors (including duplicate keys) compare values positionally;
 otherwise keys align by lookup, using the first matching occurrence.
+Keyed-table comparisons support single and composite keys, including durations.
 
 ### `(identical a b)`
 
