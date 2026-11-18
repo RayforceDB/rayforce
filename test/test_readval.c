@@ -352,12 +352,14 @@ static ray_t* rvalue(int depth) {
     size_t k = below(depth > 0 ? 6 : 3);
     if (k <= 1) return rvec(vt[below(sizeof vt)], below(5) == 0 ? 0 : 1 + below(6));
     if (k == 2) {
-        switch (below(6)) {
+        switch (below(8)) {
         case 0: return ray_i64((int64_t)rnd() | 1);
         case 1: return ray_f64(below(2) ? -0.0 : 1.0 / (double)(1 + below(1000)));
         case 2: { char b[30]; size_t n = rtext(b, sizeof b, false); return ray_str(b, n); }
         case 3: return ray_bool(below(2));
         case 4: return ray_i16((int16_t)below(1000));
+        case 5: return ray_date((int64_t)below(2000000) - 600000);
+        case 6: return ray_time(-(int64_t)(1 + below(86400000)));
         default: return RAY_NULL_OBJ;
         }
     }
@@ -406,7 +408,8 @@ static bool identical(ray_t* a, ray_t* b) {
         case -RAY_BOOL: case -RAY_U8: return a->u8 == b->u8;
         case -RAY_I16: return a->i16 == b->i16;
         case -RAY_SYM: return a->i64 == b->i64;
-        case -RAY_I32: case -RAY_DATE: case -RAY_TIME: return a->i32 == b->i32;
+        case -RAY_I32: return a->i32 == b->i32;
+        case -RAY_DATE: case -RAY_TIME: return a->i64 == b->i64;
         default: return a->i64 == b->i64;
         }
     }
@@ -443,6 +446,56 @@ static bool identical(ray_t* a, ray_t* b) {
     size_t es = ray_type_sizes[(uint8_t)t];
     return memcmp(ray_data(a), ray_data(b), (size_t)a->len * es) == 0;
 }
+
+/* RFL's error formatter prints only the code. Inspect the actual message
+ * here so later trailing-input checks cannot mask removal of these rules. */
+static test_result_t rejection_messages(void) {
+    static const struct { const char* text; size_t len; const char* message; } cases[] = {
+        { "1_000", 5, "directly after a literal" },
+        { "08:00", 5, "directly after a literal" },
+        { "1.", 2, "directly after a literal" },
+        { "1\0" "2", 3, "NUL byte" },
+        { "0xZZ", 4, "invalid literal" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        ray_t* value = ray_read_value(cases[i].text, cases[i].len, NULL);
+        TEST_ASSERT(is_err(value, "parse"), "malformed literal must raise parse");
+        TEST_ASSERT(strstr(ray_error_msg(), cases[i].message) != NULL,
+                    "the intended rejection rule must supply the message");
+        ray_error_free(value);
+    }
+    PASS();
+}
+
+static test_result_t temporal_atom_identity(void) {
+    ray_t* values[] = { ray_date(-1), ray_time(-1000) };
+    for (size_t i = 0; i < sizeof values / sizeof *values; i++) {
+        ray_t* original = values[i];
+        ray_t* text = ray_fmt_limited(original, RAY_FMT_ROUNDTRIP, 128);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(text));
+        ray_t* back = ray_read_value(ray_str_ptr(text), ray_str_len(text), NULL);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+        TEST_ASSERT(identical(original, back), "negative temporal atom must preserve all 64 bits");
+        back->i64 = (int64_t)(uint32_t)back->i32;
+        TEST_ASSERT(!identical(original, back), "identity must detect missing sign extension");
+        ray_release(back); ray_release(text); ray_release(original);
+    }
+    PASS();
+}
+
+#ifdef DEBUG
+static test_result_t printf_growth_limit(void) {
+    ray_t* text = ray_fmt_test_printf_growth(5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(text));
+    TEST_ASSERT_EQ_U(ray_str_len(text), 5);
+    TEST_ASSERT(memcmp(ray_str_ptr(text), "12345", 5) == 0, "exact-limit write survives growth");
+    ray_release(text);
+    text = ray_fmt_test_printf_growth(4);
+    TEST_ASSERT(is_err(text, "limit"), "cap-1 must fail with limit");
+    ray_error_free(text);
+    PASS();
+}
+#endif
 
 static test_result_t random_round_trip(void) {
     size_t bad = 0, total = 0;
@@ -580,6 +633,11 @@ const test_entry_t readval_entries[] = {
     {"readval/symbols_commit_once_complete", symbols_commit_once_complete, setup, teardown},
     {"readval/large_values", large_values, setup, teardown},
     {"readval/deep_nesting_is_bounded", deep_nesting_is_bounded, setup, teardown},
+    {"readval/rejection_messages", rejection_messages, setup, teardown},
+    {"readval/temporal_atom_identity", temporal_atom_identity, setup, teardown},
+#ifdef DEBUG
+    {"readval/printf_growth_limit", printf_growth_limit, setup, teardown},
+#endif
     {"readval/random_round_trip", random_round_trip, setup, teardown},
     {"readval/reads_after_a_persisted_sym_load", reads_after_a_persisted_sym_load, setup, teardown},
     {NULL, NULL, NULL, NULL}

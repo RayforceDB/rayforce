@@ -222,6 +222,7 @@ static ray_t* scan_number(ray_parser_t *p, ray_scalar_lit_t *out) {
         size_t n = ray_parse_u64_hex(p->pos, SIZE_MAX, &v);
         if (n == 0) return ray_error("parse", NULL);
         p->pos += n;
+        out->byte_out_of_range = is_neg || v > UINT8_MAX;
         LIT_INT(-RAY_U8, (uint8_t)v);
     }
 
@@ -393,7 +394,7 @@ plain_number:;
         double v = 0.0;
         if (ray_parse_f64(start, span, &v) == 0)
             return ray_error("parse", NULL);
-        out->nonfinite = !isfinite(v);
+        out->nonfinite = !isfinite(v) || (is_f32 && fabs(v) >= 0x1.ffffffp127);
         if (is_f32) { out->type = -RAY_F32; out->f = (double)ray_cast_f64_to_f32_null(v); }
         else        { out->type = -RAY_F64; out->f = v; }
         return NULL;

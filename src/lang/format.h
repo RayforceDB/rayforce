@@ -48,6 +48,11 @@ ray_t* ray_fmt(ray_t* obj, int mode);
  * not a truncated string. */
 ray_t* ray_fmt_limited(ray_t* obj, int mode, int64_t max_bytes);
 
+#ifdef DEBUG
+/* Test seam for printf growth at an exact output limit. */
+ray_t* ray_fmt_test_printf_growth(int64_t max_bytes);
+#endif
+
 /* REPL pretty-printer: like ray_fmt(obj, 1) but dicts/lists that would
  * exceed the row width break across multiple indented lines (JSON-style).
  * Used only for top-level REPL display — ray_fmt stays single-line. */

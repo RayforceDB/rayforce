@@ -78,7 +78,7 @@ Things worth knowing:
 |---|---|
 | a name, any other call, a lambda, an assignment, `eval`, `(.sys.exec ...)` | `parse` |
 | a second value, a missing closer, an unterminated string, an unknown escape | `parse` |
-| a character literal such as `'a'`, an integer beyond `I64`, a float beyond its width | `parse` |
+| a character literal such as `'a'`, an integer beyond `I64`, a float beyond its width, a negative hex byte or a hex byte above `0xff` | `parse` |
 | a table whose names and columns differ in count, columns of different lengths, a dict with unequal key and value counts | `domain` |
 | any [limit](#limits) exceeded | `limit`, naming the budget |
 
@@ -87,8 +87,9 @@ returned.
 
 ## Identity
 
-For every value `repr` can write, `(read-value (repr v))` has the same type,
-the same container kind, the same length, and the same stored values:
+For data values whose `DATE` years are in 0001–9999, `(read-value (repr v))`
+has the same type, the same container kind, the same length, and the same
+stored values:
 
 - integers of every width, without a trip through floating point, including
   values above 2^53 and every typed null;
@@ -100,6 +101,9 @@ the same container kind, the same length, and the same stored values:
 - `GUID`, temporal types to the nanosecond, the generic null;
 - `LIST`, `DICT` and `TABLE` recursively: key and value kinds, order, empty
   shapes, zero-row typed and `LIST` columns, zero-column tables.
+
+`DATE` values outside years 0001–9999, including when nested, are excluded:
+`repr` writes their year text, but the reader's date grammar does not accept it.
 
 Not part of identity: reference counts, allocator addresses, cache and index
 flags, and whether a `SYM` atom is marked as a quoted literal (the reader always

@@ -274,3 +274,24 @@ marker -- 0
 (repr 2024.01.02 3) !- limit
 (repr 0x1f 2) !- limit
 (repr true 2) !- limit
+
+;; Constructor keywords and GUID nulls require token boundaries.
+(read-value "(as 'GUID (list0Ng0Ng))") !- parse
+(read-value "(as 'GUID (list 0Ng0Ng))") !- parse
+(read-value "(as'I64 [])") !- parse
+(read-value "(as 'GUID (list (as'GUID \"00000000-0000-0000-0000-000000000001\")))") !- parse
+(read-value "(as 'GUID (list (as 'GUIDx \"00000000-0000-0000-0000-000000000001\")))") !- parse
+;; Lossy byte and float literals are refused, including in vectors.
+(read-value "0x1ff") !- parse
+(read-value "-0x05") !- parse
+(read-value "3.5e38e") !- parse
+(read-value "-3.5e38e") !- parse
+(read-value "[0x1ff]") !- parse
+(read-value "[3.5e38e]") !- parse
+(same (read-value "3.4028235e+38e") 3.4028235e+38e) -- true
+(same (rt 3.4028235e+38e) 3.4028235e+38e) -- true
+(read-value "3.4028235677973366e38e") !- parse
+(read-value "-3.4028235677973366e38e") !- parse
+(same (read-value "3.4028235677973362e38e") 3.4028235e+38e) -- true
+(read-value "0xff") -- 0xff
+(read-value "0x0001") -- 0x01

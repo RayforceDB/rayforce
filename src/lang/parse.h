@@ -42,12 +42,14 @@ ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo);
  * allocated.  Returns NULL and advances *pos on success, otherwise the same
  * parse/domain error ray_parse reports.  `widened` marks integer text that
  * overflowed I64 and was promoted to F64; `nonfinite` marks float text that
- * overflowed a double (the value in `f` is then not a language value). */
+ * overflowed their own width; `byte_out_of_range` marks negative or oversized
+ * hex byte text. These flags let data readers reject lossy conversions. */
 typedef struct {
     int8_t  type;       /* atom type tag (negative): -RAY_I64, -RAY_F32, ... */
     bool    null;       /* a typed null literal (0Nx, bare 0N)               */
     bool    widened;
     bool    nonfinite;
+    bool    byte_out_of_range;
     int64_t i;          /* integer, date, time, timestamp and timespan value */
     double  f;          /* F64 value; an F32 is held as its float, widened   */
 } ray_scalar_lit_t;

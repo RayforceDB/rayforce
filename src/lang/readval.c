@@ -185,6 +185,13 @@ static bool token_end(rd_t* rd) {
            c == ')' || c == ']' || c == '}' || c == ';';
 }
 
+/* Calls may touch self-delimiting containers or strings, as in the
+ * language parser, but a quote cannot be glued to the constructor name. */
+static bool call_token_end(rd_t* rd) {
+    return token_end(rd) || *rd->p == '(' || *rd->p == '[' ||
+           *rd->p == '{' || *rd->p == '"';
+}
+
 /* Decodes the string literal at rd->p into rd->scratch (not NUL-terminated). */
 static bool read_string(rd_t* rd) {
     rd->p++;  /* opening quote */
@@ -329,6 +336,7 @@ static bool scan_lit(rd_t* rd, ray_scalar_lit_t* l) {
     rd->p = pos;
     if (!token_end(rd)) { fail_at(rd, "unexpected character directly after a literal"); return false; }
     if (l->widened) { rd->p = start; fail_at(rd, "integer literal out of the I64 range"); return false; }
+    if (l->byte_out_of_range) { rd->p = start; fail_at(rd, "hex byte literal out of range"); return false; }
     if (l->nonfinite) { rd->p = start; fail_at(rd, "float literal out of range"); return false; }
     if (!l->null) {
         bool bad = false;
@@ -602,6 +610,7 @@ static ray_t* read_guid_list(rd_t* rd) {
     skip_ws(rd);
     if (strncmp(rd->p, "list", 4) != 0) return fail_at(rd, "expected (list ...) of GUIDs");
     rd->p += 4;
+    if (!call_token_end(rd)) return fail_at(rd, "unexpected character after list");
     if (!GRAM(rd, 2)) return NULL;
     size_t n = 0;
     rd->cells.len = 0;
@@ -614,6 +623,7 @@ static ray_t* read_guid_list(rd_t* rd) {
         if (!GRAM(rd, 1)) return NULL;
         if (strncmp(rd->p, "0Ng", 3) == 0) {
             rd->p += 3;
+            if (!token_end(rd)) return fail_at(rd, "unexpected character directly after a literal");
             nulls = true;
         } else {
             if (*rd->p != '(') return fail_at(rd, "expected (as 'GUID \"...\") or 0Ng");
@@ -621,9 +631,11 @@ static ray_t* read_guid_list(rd_t* rd) {
             skip_ws(rd);
             if (strncmp(rd->p, "as", 2) != 0) return fail_at(rd, "expected (as 'GUID \"...\")");
             rd->p += 2;
+            if (!call_token_end(rd)) return fail_at(rd, "unexpected character after as");
             skip_ws(rd);
             if (strncmp(rd->p, "'GUID", 5) != 0) return fail_at(rd, "expected 'GUID");
             rd->p += 5;
+            if (!call_token_end(rd)) return fail_at(rd, "unexpected character after 'GUID");
             skip_ws(rd);
             if (*rd->p != '"') return fail_at(rd, "expected a GUID string");
             if (!GRAM(rd, 3) || !read_string(rd)) return NULL;
@@ -844,7 +856,8 @@ static ray_t* read_value(rd_t* rd) {
             const char* h = rd->p;
             while (!at_end(rd) && (is_alpha(*rd->p) || is_digit(*rd->p) || *rd->p == '_' || *rd->p == '-')) rd->p++;
             size_t hn = (size_t)(rd->p - h);
-            if (hn == 4 && !memcmp(h, "list", 4)) out = read_list_body(rd);
+            if (!call_token_end(rd)) out = fail_at(rd, "unexpected character after a constructor");
+            else if (hn == 4 && !memcmp(h, "list", 4)) out = read_list_body(rd);
             else if (hn == 4 && !memcmp(h, "dict", 4)) out = read_dict_call(rd);
             else if (hn == 5 && !memcmp(h, "table", 5)) out = read_table_call(rd);
             else if (hn == 2 && !memcmp(h, "as", 2)) out = read_as(rd);

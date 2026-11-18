@@ -107,7 +107,7 @@ static void fmt_destroy(fmt_buf_t* b) {
 /* extra is int64 so a >2GiB length from a call site reaches the ceiling check
  * intact instead of wrapping int32 first (a length in [2^31,2^32) used to wrap
  * negative and, via the fast path below, sneak past as a no-grow "fit"). */
-static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
+static void fmt_ensure_space(fmt_buf_t* b, int64_t extra, bool terminator) {
     if (b->err) return;
     /* Guard a negative/oversize request BEFORE the fast-path return: for a
      * negative extra, need = len + extra < len <= cap, so the fast path would
@@ -126,6 +126,8 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
         b->err = true; b->over_limit = true; b->err_msg = "output exceeds the byte limit";
         return;
     }
+    /* vsnprintf needs a NUL slot that is not part of the output limit. */
+    if (terminator) need++;
     if (need <= (int64_t)b->cap) return;
     if (need > (int64_t)INT32_MAX) {
         /* int32 buffer ceiling: the doubling loop and cap field are int32, so
@@ -149,6 +151,10 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
     b->block = new_block;
     b->buf   = new_buf;
     b->cap   = (int32_t)new_cap;   /* new_cap <= INT32_MAX by the clamp above */
+}
+
+static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
+    fmt_ensure_space(b, extra, false);
 }
 
 static void fmt_putc(fmt_buf_t* b, char c) {
@@ -190,7 +196,7 @@ static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
     }
 
     /* Need more space — grow and retry */
-    fmt_ensure(b, (int64_t)n + 1);
+    fmt_ensure_space(b, n, true);
     if (b->err) return;
     va_start(ap, fmt);
     vsnprintf(b->buf + b->len, (size_t)(b->cap - b->len), fmt, ap);
@@ -222,6 +228,20 @@ static ray_t* fmt_to_str(fmt_buf_t* b) {
     fmt_destroy(b);
     return result;
 }
+
+#ifdef DEBUG
+/* Exercise the printf growth path directly: language repr values usually
+ * finish with a delimiter, so they do not expose its exact-limit boundary. */
+ray_t* ray_fmt_test_printf_growth(int64_t limit) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    if (b.err) return fmt_to_str(&b);
+    b.cap = 5;
+    b.limit = limit;
+    fmt_printf(&b, "%d", 12345);
+    return fmt_to_str(&b);
+}
+#endif
 
 /* ===== Static globals ===== */
 
