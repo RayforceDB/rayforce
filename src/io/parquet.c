@@ -62,6 +62,7 @@
  * metadata underestimates its strings. */
 #define PQ_POOL_TARGET (64u * 1024u * 1024u)
 #define PQ_POOL_MAX    ((uint64_t)UINT32_MAX)
+#define PQ_ARENA_MIN   ((uint64_t)1 << 20)   /* pq_arena_limit's floor */
 #define PQ_MAX_FOOTER (64u * 1024u * 1024u)
 #define PQ_EPOCH_DAYS 10957
 #define PQ_EPOCH_NS INT64_C(946684800000000000)
@@ -703,12 +704,17 @@ static const char* pq_str_delta_done(pq_column* c) {
  * expansion makes a valid page decode to a collection far larger than the
  * page's encoded size, so the growth follows what the user allowed the
  * engine to use, not the format's ceiling alone (review probe: one long
- * suffix, then thousands of prefix-only rows).  The same sixteenth is the
- * share the direct symbol columns' vocabularies stay within. */
+ * suffix, then thousands of prefix-only rows).  The cap is per column cursor
+ * and resets with each row group; the vocabulary curb below divides the
+ * machine limit instead, so the two sixteenths agree only when -m is unset.
+ * PQ_ARENA_MIN keeps a budget below 16 bytes from returning 0, which the
+ * arena would otherwise read as unset. */
 static uint64_t pq_arena_limit(void) {
     int64_t budget = ray_heap_mem_budget();
-    if (budget <= 0 || (uint64_t)budget/16 > PQ_POOL_MAX) return PQ_POOL_MAX;
-    return (uint64_t)budget/16;
+    if (budget <= 0) return PQ_POOL_MAX;
+    uint64_t cap = (uint64_t)budget/16;
+    if (cap < PQ_ARENA_MIN) cap = PQ_ARENA_MIN;
+    return cap > PQ_POOL_MAX ? PQ_POOL_MAX : cap;
 }
 static bool pq_reserve_arena(uint8_t** buf, size_t* cap, uint64_t limit, size_t n) {
     if (n > limit) return false;
@@ -720,9 +726,10 @@ static bool pq_reserve_arena(uint8_t** buf, size_t* cap, uint64_t limit, size_t 
     if (!p) return false;
     *buf = p; *cap = nc; return true;
 }
-/* One reconstructed DBA value copied into that arena. */
+/* One reconstructed DBA value copied into that arena.  The floor makes a
+ * stored limit always at least PQ_ARENA_MIN, so it is authoritative. */
 static const char* pq_sym_arena_put(pq_column* c, const uint8_t* p, uint32_t len, size_t* off) {
-    uint64_t limit = c->arena_limit ? c->arena_limit : PQ_POOL_MAX;
+    uint64_t limit = c->arena_limit;
     if ((uint64_t)c->sym_arena_len + len > limit) return "delta byte array expansion exceeds the memory budget";
     if (!pq_reserve_arena(&c->sym_arena,&c->sym_arena_cap,limit,c->sym_arena_len + len)) return "symbol scratch allocation failed";
     *off = c->sym_arena_len;

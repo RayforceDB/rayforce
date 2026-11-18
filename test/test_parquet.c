@@ -6735,6 +6735,45 @@ static test_result_t test_pq_delta_arena_bound(void) {
     TEST_ASSERT_TRUE(refused);
     PASS();
 }
+/* The arena floor: a budget below 16 bytes divides to 0, which must not read as
+ * "unset" and restore the 4 GiB pool ceiling. The floor is 1 MiB, so a 15-byte
+ * budget still refuses a ~32 MiB expansion and still admits the half-megabyte
+ * one. */
+static test_result_t test_pq_delta_arena_floor(void) {
+    char src[160], small[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-floor-%d.parquet", (int)getpid());
+    snprintf(small, sizeof(small), "/tmp/rayforce-pq-floor-small-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-floor-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    int64_t sym = ray_sym_intern("SYM",3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
+    TEST_ASSERT_TRUE(pq_arena_synth(src, 512));
+    ray_heap_set_anon_watermark(15);
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    ray_heap_set_anon_watermark(0);
+    bool refused = res && RAY_IS_ERR(res) &&
+                   ray_err_code(res) && !strcmp(ray_err_code(res), "parquet") &&
+                   ray_error_msg() &&
+                   strstr(ray_error_msg(), "delta byte array expansion exceeds the memory budget");
+    if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+    pq_rm_rf(dir);
+    pq_rm_rf(partial);
+    TEST_ASSERT_TRUE(refused);
+    TEST_ASSERT_TRUE(pq_arena_synth(small, 8));
+    ray_heap_set_anon_watermark(15);
+    res = ray_parquet_splayed_typed(small, dir, types);
+    ray_heap_set_anon_watermark(0);
+    bool loaded = res && !RAY_IS_ERR(res);
+    if (!loaded && res && RAY_IS_ERR(res))
+        fprintf(stderr, "  floor load: %s: %s\n", ray_err_code(res), ray_error_msg());
+    if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+    pq_rm_rf(dir);
+    pq_rm_rf(partial);
+    unlink(src); unlink(small);
+    ray_release(types);
+    TEST_ASSERT_TRUE(loaded);
+    PASS();
+}
 /* A two-column file of ten 1,000-row v1 data pages per chunk: `id` INT64
  * DELTA_BINARY_PACKED (with a ColumnIndex/OffsetIndex so a range excludes
  * whole pages) and `name` BYTE_ARRAY DELTA_BYTE_ARRAY on a 700-row page grid.
@@ -7239,6 +7278,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_symbol_mixed",test_pq_delta_symbol_mixed,pq_setup,pq_teardown},
     {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
     {"parquet/delta_arena_bound",test_pq_delta_arena_bound,pq_setup,pq_teardown},
+    {"parquet/delta_arena_floor",test_pq_delta_arena_floor,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},
