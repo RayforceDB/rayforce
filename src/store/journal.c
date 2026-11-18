@@ -335,7 +335,7 @@ static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
     for (;;) {
         ray_ipc_header_t h;
         if (read_full(f, &h, sizeof(h)) != sizeof(h)) break;
-        if (h.prefix != RAY_SERDE_PREFIX || h.version != RAY_SERDE_WIRE_VERSION ||
+        if (h.prefix != RAY_SERDE_PREFIX || !ray_serde_wire_version_supported(h.version) ||
             h.endian != RAY_SERDE_ENDIAN || h.size <= 0 || h.size > 256LL*1024*1024) break;
         if (h.msgtype != RAY_IPC_MSG_JNOTE || (h.flags & RAY_IPC_FLAG_COMPRESSED)) {
             if (fseek(f, (long)h.size, SEEK_CUR) != 0) break;
@@ -345,7 +345,7 @@ static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
         if (!buf) { ok = false; break; }
         if (read_full(f, buf, (size_t)h.size) != (size_t)h.size) { ray_sys_free(buf); break; }
         int64_t len = h.size;
-        ray_t* v = ray_de_raw(buf, &len);
+        ray_t* v = ray_de_raw_version(buf, &len, h.version);
         ray_sys_free(buf);
         if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); continue; }
         const int64_t* d = (const int64_t*)ray_data(v);
