@@ -193,6 +193,21 @@ static inline size_t ray_sym_bytes_upper(size_t len) {
 uintptr_t ray_sym_test_lock_addr(void);
 uintptr_t ray_sym_test_table_addr(void);
 size_t    ray_sym_test_table_size(void);
+size_t    ray_sym_test_arena_chunks(void);
 uintptr_t ray_sym_test_inited_addr(void);
+void      ray_sym_test_set_lazy_min_bytes(size_t bytes);
+
+typedef struct ray_read_budget ray_read_budget_t;
+/* Loads any names a mapped symbol file still backs only by the mapping, so a
+ * publication can inspect the whole table.  Adds no name and changes no id. */
+bool ray_sym_materialize_lazy(void);
+/* Publish value symbols and their dotted-name segments all-or-nothing.
+ * Inputs are copied before locking; outputs remain unchanged on failure.
+ * Every new name, including dotted segments, counts against the host's
+ * max_symbols total-count cap, checked under the commit lock.
+ * Caller must prebuild all fallible result/fixup work before publication. */
+bool ray_sym_publish_values(ray_read_budget_t* budget,
+                            const char* const* strings, const size_t* lengths,
+                            size_t count, uint32_t max_symbols, int64_t* out_ids);
 
 #endif /* RAY_SYM_H */

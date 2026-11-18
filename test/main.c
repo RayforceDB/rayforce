@@ -194,6 +194,9 @@ extern const test_entry_t stress_matrix_entries[];
 extern const test_entry_t stress_random_entries[];
 extern const test_entry_t str_entries[];
 extern const test_entry_t sym_entries[];
+extern const test_entry_t read_budget_entries[];
+extern const test_entry_t readval_entries[];
+extern const test_entry_t sym_publish_entries[];
 extern const test_entry_t text_null_entries[];
 extern const test_entry_t sys_entries[];
 extern const test_entry_t table_entries[];
@@ -245,6 +248,7 @@ static const test_entry_t* const compiled_groups[] = {
     stress_eval_entries,
     stress_matrix_entries,
     stress_random_entries,
+    read_budget_entries, readval_entries, sym_publish_entries,
     text_null_entries, str_entries,      sym_entries,      sys_entries,      table_entries,
     term_entries,     traverse_entries,
     types_entries,    vec_entries,      window_entries,
@@ -974,7 +978,7 @@ void ray_test_hooks_off(void) {
 
 /* ---- Per-process scratch root (declared in test.h) ---- */
 
-static char   g_tmp_root[64];   /* "/tmp/rayforce_t.<pid>", set in main() */
+static char   g_tmp_root[4096];   /* TMPDIR/rayforce_t.<pid>, default /tmp, set in main() */
 static size_t g_tmp_root_len;
 
 /* A "/tmp" path starts at s[i]: "/tmp" as a whole path component, not part
@@ -1028,6 +1032,8 @@ static char* tmp_strdup(const char* s) {
     if (!d) { fprintf(stderr, "ray_test_tmp: out of memory\n"); abort(); }
     return memcpy(d, s, n);
 }
+
+const char* ray_test_tmp_root(void) { return g_tmp_root; }
 
 const char* ray_test_tmp(const char* s) {
     if (!s) return s;
@@ -1300,7 +1306,12 @@ static test_status_t run_job(const test_job_t* j, int* pass, int* fail, int* ski
 /* Point this process's scratch root at /tmp/rayforce_t.<pid> and create it.
  * A forked worker calls it again so no two processes share a file. */
 static int tmp_root_init(void) {
-    snprintf(g_tmp_root, sizeof g_tmp_root, "/tmp/rayforce_t.%ld", (long)getpid());
+    const char* test_tmp = getenv("TMPDIR");
+    if (!test_tmp || !*test_tmp) test_tmp = "/tmp";
+    int tmp_len = snprintf(g_tmp_root, sizeof g_tmp_root, "%s/rayforce_t.%ld", test_tmp, (long)getpid());
+    if (tmp_len < 0 || (size_t)tmp_len >= sizeof g_tmp_root) {
+        fprintf(stderr, "TMPDIR path too long\n"); return -1;
+    }
     (void)ray_test_rm_rf(g_tmp_root);                    /* a dead run's leftovers under a reused pid */
     if (ray_test_mkdir_p(g_tmp_root) != 0) { fprintf(stderr, "cannot create %s\n", g_tmp_root); return -1; }
     g_tmp_root_len = strlen(g_tmp_root);
@@ -1537,7 +1548,7 @@ static void worker_main(pool_t* P, int cmd_fd, int log_fd) {
 /* Fork worker k with a fresh log.  False when it cannot be started. */
 static bool worker_spawn(pool_t* P, int k) {
     worker_t* me = &P->w[k];
-    char path[128];
+    char path[sizeof g_tmp_root + 64];
     snprintf(path, sizeof path, "%s/worker%d.%d.log", g_tmp_root, k, P->next);
     int log_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (log_fd < 0) { perror(path); return false; }

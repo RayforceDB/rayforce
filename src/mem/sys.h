@@ -48,6 +48,7 @@
  * mapping, anonymous or over a new preallocated spill file, never one taken
  * from a cache of freed blocks.  A cache added here must zero what it hands
  * out.  ray_sys_realloc keeps no such promise for the bytes it adds. */
+bool ray_sys_charge(size_t size, size_t* charge);
 void* ray_sys_alloc(size_t size);
 void* ray_sys_realloc(void* ptr, size_t new_size);
 void  ray_sys_free(void* ptr);
