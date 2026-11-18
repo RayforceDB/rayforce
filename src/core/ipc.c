@@ -1345,8 +1345,17 @@ static ray_t* ipc_read_handshake(ray_poll_t* poll, ray_selector_t* sel)
     /* Refuse peers speaking a different wire version BEFORE we commit to
      * exchanging any serialized payloads.  Without this check a new
      * server would happily send v3-layout values to a v2 client, which
-     * would misparse every atom after the version-bump byte. */
+     * would misparse every atom after the version-bump byte.
+     *
+     * Reply with our own version byte before the drop: the client checks
+     * the first reply byte (v3 clients do too), so it reports a wire
+     * version mismatch instead of a connection reset. */
     if (sel->rx.buf->data[0] != RAY_SERDE_WIRE_VERSION) {
+        fprintf(stderr, "ipc: dropping peer with wire version %u "
+                        "(this server speaks %u)\n",
+                (unsigned)sel->rx.buf->data[0], (unsigned)RAY_SERDE_WIRE_VERSION);
+        uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+        ray_sock_send((ray_sock_t)sel->fd, resp, 2);
         ray_poll_deregister(poll, sel->id);
         return NULL;
     }

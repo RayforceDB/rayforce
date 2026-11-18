@@ -1195,6 +1195,8 @@ static test_result_t test_ipc_poll_auth_reject(void) {
     PASS();
 }
 
+static int wire_recv_exact(ray_sock_t s, void* buf, size_t n);
+
 /* ---- test_ipc_poll_handshake_version_mismatch --------------------------- */
 /*
  * Poll-based API: ipc_read_handshake version mismatch path (line 481-484).
@@ -1225,11 +1227,11 @@ static test_result_t test_ipc_poll_handshake_version_mismatch(void) {
     uint8_t bad_hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
     ray_sock_send(s, bad_hs, 2);
 
-    /* Server should close the connection — recv returns <= 0 */
-    sleep_ms(50);
-    uint8_t buf[4] = { 0 };
-    int64_t n = ray_sock_recv(s, buf, sizeof(buf));
-    TEST_ASSERT((int)n <= 0, "connection was closed by server");
+    /* Server answers with its own version byte, then closes. */
+    uint8_t buf[2] = { 0 };
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, buf, 2), 0);
+    TEST_ASSERT_EQ_I(buf[0], RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, buf, 1), -1);
     ray_sock_close(s);
 
     /* A correct client should still work after the bad handshake */
@@ -3098,7 +3100,8 @@ static test_result_t test_ipc_wire_async_no_reply(void) {
     PASS();
 }
 
-/* A peer speaking another wire version is dropped without a reply. */
+/* A v3 handshake to a v4 listener gets `04 00` back before the close,
+ * so the v3 client reports a wire version mismatch, not a reset. */
 static test_result_t test_ipc_wire_version_mismatch_drops(void) {
     ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
     test_result_t sr = wire_start_server(&poll, &port, &vm, &tid);
@@ -3106,13 +3109,15 @@ static test_result_t test_ipc_wire_version_mismatch_drops(void) {
 
     ray_sock_t s = ray_sock_connect("127.0.0.1", port, 2000);
     TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
-    uint8_t hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
+    /* A v3 peer, the version before this one. */
+    uint8_t hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION - 1), 0x00 };
     ray_sock_send(s, hs, 2);
 
-    /* The server deregisters instead of answering: readable with 0 bytes
-     * (EOF) rather than a 2-byte handshake reply. */
     uint8_t resp[2];
-    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 2), -1);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 2), 0);
+    TEST_ASSERT_EQ_I(resp[0], RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(resp[1], 0x00);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, resp, 1), -1);
 
     ray_sock_close(s);
     wire_stop_server(poll, port, vm, tid);

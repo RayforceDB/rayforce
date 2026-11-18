@@ -6522,19 +6522,19 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
     uint8_t bad_hs[2] = { (uint8_t)(RAY_SERDE_WIRE_VERSION + 1), 0x00 };
     TEST_ASSERT(((int)ray_sock_send(s, bad_hs, 2)) >= (0), "(int)ray_sock_send(s, bad_hs, 2) >= 0");
 
-    /* Server should refuse — EOF on recv indicates the connection was
-     * closed before any payload bytes reached us.  If the check is
-     * missing, the server would write its own handshake response here
-     * and the test would observe 2 bytes instead. */
-    uint8_t resp[2] = { 0xff, 0xff };
+    /* Server should refuse: it replies with its own version byte, so the
+     * client can report the mismatch, then closes before any framed
+     * payload.  Read until EOF; exactly those two bytes must arrive. */
+    uint8_t resp[8] = { 0xff, 0xff };
     int64_t got = 0;
-    /* Give the server thread a small number of polling cycles to react. */
-    for (int attempt = 0; attempt < 100 && got < 2; attempt++) {
-        int64_t n = ray_sock_recv(s, resp + got, (size_t)(2 - got));
+    for (int attempt = 0; attempt < 100 && got < (int64_t)sizeof(resp); attempt++) {
+        int64_t n = ray_sock_recv(s, resp + got, sizeof(resp) - (size_t)got);
         if (n <= 0) break;
         got += n;
     }
-    TEST_ASSERT(((int)got) < (2), "(int)got < 2");  /* never got a full response */
+    TEST_ASSERT_EQ_I(got, 2);
+    TEST_ASSERT_EQ_I(resp[0], RAY_SERDE_WIRE_VERSION);
+    TEST_ASSERT_EQ_I(resp[1], 0x00);
     ray_sock_close(s);
 
     /* A subsequent well-behaved client must still succeed, proving the
