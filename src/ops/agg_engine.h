@@ -128,6 +128,7 @@ typedef struct {
     bool topn_native;               /* last v2 run selected the emit filter's top-N itself */
     int64_t topn_kept;              /* groups kept by that selection (ties included) */
     uint64_t first_n;               /* unordered take: N answered by the first-N pre-pass */
+    uint64_t first_n_sel;           /* ...of which read a where: selection in place */
     uint32_t ts_tasks;              /* last table-stack run: phase-1 tasks */
     uint32_t ts_scatter_tasks;      /* ...of which switched to raw scatter */
     uint64_t ts_tables;             /* ...tables created across all tasks */

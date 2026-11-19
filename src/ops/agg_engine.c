@@ -12510,6 +12510,7 @@ pick:
     }
     if (!RAY_IS_ERR(res)) {
         route_stats.first_n++;
+        if (sel) route_stats.first_n_sel++;
         ray_profile_tick("group: first-N keys");
     }
 
