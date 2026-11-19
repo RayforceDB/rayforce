@@ -1749,7 +1749,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
          * segments: emit a scan for the head column, then for each
          * subsequent segment look up the name's registered DAG-level
          * emitter and chain it.  `col.ss` → scan(col) → extract(SS),
-         * `col.date` → scan(col) → date_trunc(DAY), etc.  Segment
+         * `col.month` → scan(col) → date_trunc(MONTH), etc.  Segment
          * resolution uses the same name table as the runtime
          * `(ss col)` form, so adding a new accessor means registering
          * one unary builtin (temporal or otherwise) — no bespoke sym
@@ -1777,6 +1777,14 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 int trunc_kind = ray_temporal_trunc_from_sym(segs[i]);
                 if (trunc_kind >= 0) {
                     op = ray_date_trunc(g, op, trunc_kind);
+                    if (!op) return NULL;
+                    continue;
+                }
+                /* `.date` / `.time` answer a DATE / TIME (not a truncation:
+                 * the truncate op answers a TIMESTAMP). */
+                int64_t whole = ray_temporal_whole_from_sym(segs[i]);
+                if (whole >= 0) {
+                    op = ray_extract(g, op, whole);
                     if (!op) return NULL;
                     continue;
                 }
@@ -2088,6 +2096,31 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             ray_op_t* r = ray_sub(g, col, m);
             if (!r || !temporal) return r;
             return ray_cast(g, r, temporal);
+        }
+
+        /* (trunc 'unit x) — calendar / clock truncation, in x's own type.
+         * The unit is a quoted symbol, 'month or (quote month); an unknown
+         * unit, or a column whose type the unit does not fit, declines the
+         * compile so the evaluator raises the error. */
+        if (fname_len == 5 && memcmp(fname, "trunc", 5) == 0) {
+            if (n != 3) return NULL;
+            ray_t* u = elems[1];
+            bool quoted = u && u->type == -RAY_SYM && (u->attrs & ATTR_QUOTED);
+            if (!quoted && u && u->type == RAY_LIST && u->len == 2) {
+                ray_t** ue = (ray_t**)ray_data(u);
+                ray_t* qs = (ue[0] && ue[0]->type == -RAY_SYM) ? ray_sym_str(ue[0]->i64) : NULL;
+                if (qs && ray_str_len(qs) == 5 && memcmp(ray_str_ptr(qs), "quote", 5) == 0) {
+                    u = ue[1];
+                    quoted = u && u->type == -RAY_SYM;
+                }
+            }
+            if (!quoted) return NULL;
+            ray_t* us = ray_sym_str(u->i64);
+            int unit = us ? ray_temporal_unit_from_name(ray_str_ptr(us), ray_str_len(us)) : -1;
+            if (unit < 0) return NULL;
+            ray_op_t* col = compile_expr_dag(g, elems[2]);
+            if (!col) return NULL;
+            return ray_date_trunc(g, col, unit);
         }
 
         /* (if c1 r1 c2 r2 ... else) — condition/result pairs with a

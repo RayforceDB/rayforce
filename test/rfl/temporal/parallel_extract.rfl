@@ -82,7 +82,7 @@
 
 ;; Truncate over the same nullable column.
 (nil? (at (date NB) 163843)) -- true
-(at (date NB) 163841)        -- 2000.01.02D00:00:00.000000000
+(at (date NB) 163841) -- 2000.01.02
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 3: the DAG ops (exec_extract / exec_date_trunc)
@@ -104,7 +104,7 @@
 (min (at (select {s: (second ts) from: TN}) 's)) -- 0
 
 (nil? (at (at (select {s: ts.date from: TN}) 's) 163840)) -- true
-(at (at (select {s: ts.time from: TN}) 's) 163841)        -- 2000.01.02D21:30:41.000000000
+(at (at (select {s: ts.time from: TN}) 's) 163841) -- 21:30:41.000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 4: sub-threshold columns stay serial and must agree
