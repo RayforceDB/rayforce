@@ -234,16 +234,16 @@
 ;; SECOND
 (at (at (select {s: d.time from: DDT_nn}) 's) 0) !- type
 
-;; YEAR
-(at (at (select {s: d.year from: DDT_nn}) 's) 0) -- 2024.01.01D00:00:00.000000000
-(at (at (select {s: d.year from: DDT_nn}) 's) 2) -- 1999.01.01D00:00:00.000000000
+;; YEAR — a DATE truncates to a DATE
+(at (at (select {s: d.year from: DDT_nn}) 's) 0) -- 2024.01.01
+(at (at (select {s: d.year from: DDT_nn}) 's) 2) -- 1999.01.01
 
 ;; MONTH
-(at (at (select {s: d.month from: DDT_nn}) 's) 0) -- 2024.03.01D00:00:00.000000000
-(at (at (select {s: d.month from: DDT_nn}) 's) 2) -- 1999.12.01D00:00:00.000000000
+(at (at (select {s: d.month from: DDT_nn}) 's) 0) -- 2024.03.01
+(at (at (select {s: d.month from: DDT_nn}) 's) 2) -- 1999.12.01
 
-;; HOUR — DATE has no time-of-day so hour truncate gives midnight
-(at (at (select {s: d.hour from: DDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+;; HOUR — a DATE has no time of day to truncate
+(at (at (select {s: d.hour from: DDT_nn}) 's) 0) !- type
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 9: exec_date_trunc DATE_TRUNC_INNER(0,1) — non-null TIME
@@ -260,15 +260,13 @@
 (at (at (select {s: t.time from: TMT_nn}) 's) 1) -- 12:30:45.789
 (at (at (select {s: t.time from: TMT_nn}) 's) 2) -- 23:59:59.999
 
-;; YEAR — TIME epoch is 2000-01-01, year trunc → 2000-01-01
-(at (at (select {s: t.year from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+;; YEAR / MONTH — a TIME has no date to truncate
+(at (at (select {s: t.year from: TMT_nn}) 's) 0) !- type
+(at (at (select {s: t.month from: TMT_nn}) 's) 0) !- type
 
-;; MONTH — TIME epoch is Jan 2000, month trunc → 2000-01-01
-(at (at (select {s: t.month from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
-
-;; HOUR
-(at (at (select {s: t.hour from: TMT_nn}) 's) 0) -- 2000.01.01D01:00:00.000000000
-(at (at (select {s: t.hour from: TMT_nn}) 's) 1) -- 2000.01.01D12:00:00.000000000
+;; HOUR — a TIME truncates to a TIME
+(at (at (select {s: t.hour from: TMT_nn}) 's) 0) -- 01:00:00.000
+(at (at (select {s: t.hour from: TMT_nn}) 's) 1) -- 12:00:00.000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 10: exec_date_trunc DATE_TRUNC_INNER(1,0) — null-bearing TIMESTAMP
@@ -321,18 +319,18 @@
 (at (at (select {s: d.time from: DDT_wn}) 's) 1) !- type
 
 ;; YEAR
-(at (at (select {s: d.year from: DDT_wn}) 's) 0) -- 2024.01.01D00:00:00.000000000
-(at (at (select {s: d.year from: DDT_wn}) 's) 1) -- 0Np
-(at (at (select {s: d.year from: DDT_wn}) 's) 2) -- 1999.01.01D00:00:00.000000000
+(at (at (select {s: d.year from: DDT_wn}) 's) 0) -- 2024.01.01
+(at (at (select {s: d.year from: DDT_wn}) 's) 1) -- 0Nd
+(at (at (select {s: d.year from: DDT_wn}) 's) 2) -- 1999.01.01
 
 ;; MONTH
-(at (at (select {s: d.month from: DDT_wn}) 's) 0) -- 2024.03.01D00:00:00.000000000
-(at (at (select {s: d.month from: DDT_wn}) 's) 1) -- 0Np
-(at (at (select {s: d.month from: DDT_wn}) 's) 2) -- 1999.12.01D00:00:00.000000000
+(at (at (select {s: d.month from: DDT_wn}) 's) 0) -- 2024.03.01
+(at (at (select {s: d.month from: DDT_wn}) 's) 1) -- 0Nd
+(at (at (select {s: d.month from: DDT_wn}) 's) 2) -- 1999.12.01
 
 ;; HOUR
-(at (at (select {s: d.hour from: DDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
-(at (at (select {s: d.hour from: DDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: d.hour from: DDT_wn}) 's) 0) !- type
+(at (at (select {s: d.hour from: DDT_wn}) 's) 1) !- type
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 12: exec_date_trunc DATE_TRUNC_INNER(1,1) — null-bearing TIME
@@ -349,26 +347,20 @@
 (at (at (select {s: t.time from: TMT_wn}) 's) 2) -- 23:59:59.000
 
 ;; YEAR
-(at (at (select {s: t.year from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
-(at (at (select {s: t.year from: TMT_wn}) 's) 1) -- 0Np
+(at (at (select {s: t.year from: TMT_wn}) 's) 0) !- type
 
 ;; MONTH
-(at (at (select {s: t.month from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
-(at (at (select {s: t.month from: TMT_wn}) 's) 1) -- 0Np
+(at (at (select {s: t.month from: TMT_wn}) 's) 0) !- type
 
 ;; HOUR
-(at (at (select {s: t.hour from: TMT_wn}) 's) 0) -- 2000.01.01D01:00:00.000000000
-(at (at (select {s: t.hour from: TMT_wn}) 's) 1) -- 0Np
+(at (at (select {s: t.hour from: TMT_wn}) 's) 0) -- 01:00:00.000
+(at (at (select {s: t.hour from: TMT_wn}) 's) 1) -- 0Nt
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 13: Standalone ray_temporal_truncate — atom MONTH/HOUR/YEAR
 ;; ════════════════════════════════════════════════════════════════════
-;; The atom path of ray_temporal_truncate only distinguishes kind==DAY
-;; vs "else" (which uses SECOND bucket).  The (date X) and (time X)
-;; unary builtins use DAY and SECOND respectively.  The .year/.month/.hour
-;; dotted truncates go through exec_date_trunc (DAG path), not the
-;; standalone path.  So the standalone atom truncate only has DAY and
-;; SECOND buckets — already covered by parse_format.rfl and extract.rfl.
+;; The standalone truncate is reachable as (trunc 'unit x) for every unit and
+;; type; trunc.rfl covers it.  This section kept its number for the others.
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 14: Standalone ray_temporal_truncate — vector with pre-epoch
@@ -448,13 +440,11 @@
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 21: ray_temporal_truncate atom — MONTH/HOUR/YEAR kind
 ;; ════════════════════════════════════════════════════════════════════
-;; The standalone atom truncate (line 255) only distinguishes DAY vs else.
-;; For MONTH/HOUR/YEAR, the else branch runs (using SECOND bucket).
-;; These ARE reachable indirectly: nothing calls ray_temporal_truncate
-;; with MONTH/HOUR/YEAR for atoms in current code paths.
-;; This is covered only by exec_date_trunc (DAG path).
-;; Documenting as: standalone atom MONTH/HOUR/YEAR truncate paths
-;; are unreachable from RFL.
+;; The standalone atom truncate answers every unit in the input's own type
+;; (trunc.rfl); the dotted .year / .month / .hour go through the same kernel.
+(trunc 'year 2024.03.15) -- 2024.01.01
+(trunc 'month 2024.03.15D14:30:00.000000000) -- 2024.03.01D00:00:00.000000000
+(trunc 'hour 14:30:00.000) -- 14:00:00.000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 22: ray_temporal_extract — null atom for TIME type

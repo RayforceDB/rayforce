@@ -393,6 +393,8 @@ ds.doy           ; [1 167 366]
 
 Recognised temporal segments: `yyyy`, `mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`, plus `date` and `time`, which answer the whole `date` and the whole `time` of a `timestamp` (a `date` for `.date`, a `time` for `.time`; a `date` is its own `.date` and a `time` its own `.time`; a `.time` of a `date` and a `.date` of a `time` are type errors). Null input rows propagate to null output rows — the null sentinel bit pattern is not decoded as a bogus calendar value.
 
+Inside a query, the truncation units are dotted segments too: `ts.year`, `ts.quarter`, `ts.month`, `ts.week`, `ts.day`, `ts.hour` and `ts.second` floor to the start of the unit and keep the column's type (see [Calendar/Clock Truncation](functions.md#calendarclock-truncation)). At top level, `(trunc 'month d)` is the spelling.
+
 ### Reserved `.*` Namespace
 
 Symbols whose name starts with `.` are a reserved system namespace populated at startup by builtin registration. Typing one of these at the REPL returns the namespace dict for introspection:

@@ -202,6 +202,10 @@ void     ray_cancel_reset(void);
  * vector (a TIMESTAMP in, the same DATE or TIME out), never I64. */
 #define RAY_EXTRACT_DATE    9
 #define RAY_EXTRACT_TIME    10
+/* Truncation-only units (OP_DATE_TRUNC, (trunc 'unit x)); the year, month,
+ * day, hour, minute and second units above double as truncation units. */
+#define RAY_TRUNC_QUARTER   11
+#define RAY_TRUNC_WEEK      12
 
 /* Opcodes — Reductions (pipeline breakers) */
 #define OP_SUM          50

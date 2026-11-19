@@ -63,17 +63,24 @@
 (nil? (at Td 2)) -- false
 
 ;; ── DAG date_trunc YEAR / MONTH arms (the re-multiply path) ──────────
-;; d.year of a large-magnitude negative DATE used to overflow the second
-;; days_from_civil(...) * µs-per-day multiply; it must null, not UB.
+;; A DATE truncates to a DATE in days, so a large-magnitude DATE no longer
+;; passes through the µs / ns domain and nothing overflows: the result is the
+;; period start, never after the input.  Only a period that starts below the
+;; DATE range (the lowest days) is null, not a wrapped value.
 (set Tn (table [d] (list (as 'DATE [-106751991 8840 200000000]))))
 (set Ty (at (select {v: d.year from: Tn}) 'v))
-(nil? (at Ty 0)) -- true
-(at Ty 1) -- 2024.01.01D00:00:00.000000000
-(nil? (at Ty 2)) -- true
+(type Ty) -- 'DATE
+(nil? (at Ty 0)) -- false
+(<= (at Ty 0) (at (at Tn 'd) 0)) -- true
+(at Ty 1) -- 2024.01.01
+(nil? (at Ty 2)) -- false
+(<= (at Ty 2) (at (at Tn 'd) 2)) -- true
 (set Tmo (at (select {v: d.month from: Tn}) 'v))
-(nil? (at Tmo 0)) -- true
-(at Tmo 1) -- 2024.03.01D00:00:00.000000000
-(nil? (at Tmo 2)) -- true
+(nil? (at Tmo 0)) -- false
+(at Tmo 1) -- 2024.03.01
+(nil? (at Tmo 2)) -- false
+(nil? (trunc 'year (as 'DATE -2147483647))) -- true
+(nil? (trunc 'year (as 'DATE 2147483647))) -- false
 
 ;; ── (date <temporal>) ───────────────────────────────────────────────
 ;; A TIMESTAMP answers the DATE of its day; a DATE is itself, however far
