@@ -168,6 +168,22 @@ For a partitioned join `(asof-join [Key Time] L R)`, if the single numeric equal
 (asof-join [ID Time] Lgp Rgp)
 ```
 
+## Exact `find` on a `sorted` Vector
+
+`find` on a `sorted` `U8`, `I16`, `I32` or `I64` vector without nulls uses binary search instead of a scan, when the needle has the vector's own type:
+
+- **An atom** takes one lower-bound search once the vector is longer than 64 rows; a shorter vector is scanned, which is cheaper at that size.
+- **A vector of needles** of the same type runs eight searches side by side when the vector has at least 4096 rows and there is at most one needle per eight rows; denser needle sets keep the hash route.
+
+A duplicated value answers its first position, and a missing value answers `0Nl`, exactly as the scan does. An attached hash index (`.idx.hash`, `grouped`) is consulted first. A needle of another width (`(find v32 7)` with an `I64` atom against an `I32` vector), a float on either side, a null needle and a vector holding nulls keep the scan or hash route and its numeric comparison. A `take` of a `sorted` vector does not carry `sorted` over, so its result is scanned unless it is stamped again.
+
+```lisp
+(set s (.attr.set 'sorted (asc (concat (til 100) [5 5 50]))))
+(find s 50)                ; ⇒ 52 (the first of rows 52-53)
+(find s 100)               ; ⇒ 0Nl
+(find s [5 50 100])        ; ⇒ [5 52 0Nl] (too few rows for the vector route; same answer)
+```
+
 ## Caveats and Limits
 
 - **Type support.** `sorted` accepts numeric types; `parted` numeric and `SYM`. `unique` and `grouped` accept numeric, `SYM` and `STR` — a `STR` hash is keyed on a 64-bit hash of the bytes with the payload compared on every hit, so a content-keyed column (a digest) carries an index like any other.  A `STR` `grouped` column persists its hash through a splayed save in place of the automatic string dictionary (one index per column).

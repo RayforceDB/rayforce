@@ -3182,6 +3182,207 @@ cleanup:
     return outcome;
 }
 
+/* Atom needle: the answer against an independent `want`, plus which route
+ * ran -- 0 boxed fallback (or index), 1 SORTED lower_bound, 2 typed scan.
+ * Borrows h and a; releases the result, owned errors included. */
+static bool sorted_find_atom_check(ray_t* h, ray_t* a, int64_t want, int route, bool indexed) {
+    if (!h || !a || RAY_IS_ERR(h) || RAY_IS_ERR(a)) return false;
+    uint64_t c0 = ray_idx_consults[IDX_SITE_FIND], i0 = ray_idx_hits[IDX_SITE_FIND];
+#ifdef DEBUG
+    uint64_t s0 = ray_find_test_sorted_runs(false), t0 = ray_find_test_typed_scans(false);
+#else
+    (void)route;
+#endif
+    uint8_t ha = h->attrs;
+    int64_t hr = h->rc, ar = a->rc;
+    ray_t* r = ray_find_fn(h, a);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_I64;
+    if (ok) ok = want == NULL_I64 ? RAY_ATOM_IS_NULL(r) : (!RAY_ATOM_IS_NULL(r) && r->i64 == want);
+#ifdef DEBUG
+    if (ray_find_test_sorted_runs(false) - s0 != (uint64_t)(route == 1)) ok = false;
+    if (ray_find_test_typed_scans(false) - t0 != (uint64_t)(route == 2)) ok = false;
+#endif
+    if (indexed && (ray_idx_consults[IDX_SITE_FIND] - c0 != 1 ||
+                    ray_idx_hits[IDX_SITE_FIND] - i0 != 1)) ok = false;
+    if (!indexed && (ray_idx_consults[IDX_SITE_FIND] != c0 || ray_idx_hits[IDX_SITE_FIND] != i0)) ok = false;
+    if (ha != h->attrs || hr != h->rc || ar != a->rc) ok = false;
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    return ok;
+}
+
+static ray_t* sorted_find_test_atom(int8_t type, int64_t v) {
+    switch (type) {
+        case RAY_U8:  return ray_u8((uint8_t)v);
+        case RAY_I16: return ray_i16((int16_t)v);
+        case RAY_I32: return ray_i32((int32_t)v);
+        default:      return ray_i64(v);
+    }
+}
+
+/* Linear first match of an in-range key over `len` stored cells. */
+static int64_t sorted_find_test_first(const void* data, int8_t type, int64_t off, int64_t len, int64_t key) {
+    for (int64_t i = 0; i < len; i++)
+        if (sorted_find_test_load(data, type, off + i) == key) return i;
+    return NULL_I64;
+}
+
+/* Scalar-atom find: a same-type, non-null atom against a SORTED null-free
+ * haystack takes one lower_bound (present, first duplicate, misses below,
+ * above and between, extremes, empty/one-row, a marked view); an unmarked
+ * one takes the typed scan.  Hash index, nullable haystacks, null atoms,
+ * mixed widths and floats keep the existing route and answer. */
+static test_result_t test_find_sorted_atom(void) {
+    test_result_t outcome = { TEST_PASS, NULL };
+    ray_t *hp = NULL, *h = NULL, *a = NULL, *ix = NULL, *tag = NULL, *view = NULL;
+    ray_heap_init(); (void)ray_sym_init();
+    const int8_t types[] = { RAY_U8, RAY_I16, RAY_I32, RAY_I64 };
+    union { int64_t aligned[4120]; uint8_t raw[4120 * 8]; } payload;
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int8_t type = types[t];
+        for (int64_t i = 0; i < 4120; i++)
+            sorted_find_test_store(payload.raw, type, i,
+                type == RAY_U8 ? 4 + (i * 60 / 4120) * 4 : (i / 3) * 2 - 1500);
+        int64_t first = sorted_find_test_load(payload.raw, type, 0);
+        int64_t last = sorted_find_test_load(payload.raw, type, 4119);
+        /* present (row 0, last, interior duplicate, U8 high bit), missing
+         * below, above and between two present values. */
+        const int64_t keys[] = { first, last, type == RAY_U8 ? 128 : 0,
+                                 type == RAY_U8 ? 200 : -2,
+                                 type == RAY_U8 ? 0 : -1501,
+                                 type == RAY_U8 ? 255 : last + 1,
+                                 type == RAY_U8 ? 129 : -1 };
+        hp = ray_vec_from_raw(type, payload.raw, 4120);
+        SORTED_FIND_CHECK(hp && !RAY_IS_ERR(hp), "atom haystack");
+        tag = ray_sym(ray_sym_intern("sorted", 6));
+        SORTED_FIND_CHECK(tag && !RAY_IS_ERR(tag), "sorted tag");
+        h = ray_attr_set_fn(tag, hp);   /* borrows hp; copies, hp stays unmarked */
+        SORTED_FIND_CHECK(h && !RAY_IS_ERR(h) && ray_attr_is_sorted(h), "mark atom haystack");
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            int64_t want = sorted_find_test_first(payload.raw, type, 0, 4120, keys[k]);
+            SORTED_FIND_CHECK(k >= 4 ? want == NULL_I64 : want != NULL_I64, "fixture key class");
+            if (k == 2 || k == 3)
+                SORTED_FIND_CHECK(want > 0 && sorted_find_test_load(payload.raw, type, want + 1) == keys[k],
+                                  "interior key has a later duplicate");
+            a = sorted_find_test_atom(type, keys[k]);
+            SORTED_FIND_CHECK(sorted_find_atom_check(h, a, want, 1, false), "sorted atom find");
+            /* The same payload unmarked takes the typed scan, same answer. */
+            SORTED_FIND_CHECK(sorted_find_atom_check(hp, a, want, 2, false), "unsorted atom find");
+            sorted_find_test_dispose(&a);
+        }
+        /* A marked view answers view-relative positions; an unmarked view
+         * (slicing does not inherit SORTED) scans. */
+        view = ray_vec_slice(h, 100, 4000);
+        SORTED_FIND_CHECK(view && !RAY_IS_ERR(view) && (view->attrs & RAY_ATTR_SLICE), "atom view");
+        a = sorted_find_test_atom(type, keys[2]);
+        int64_t vwant = sorted_find_test_first(payload.raw, type, 100, 4000, keys[2]);
+        SORTED_FIND_CHECK(vwant != NULL_I64, "view key present");
+        SORTED_FIND_CHECK(!ray_attr_is_sorted(view), "slice does not inherit SORTED");
+        SORTED_FIND_CHECK(sorted_find_atom_check(view, a, vwant, 2, false),
+                          "unmarked view atom find");
+        ray_t* marked = ray_attr_set_fn(tag, view);
+        sorted_find_test_dispose(&view);
+        view = marked;
+        SORTED_FIND_CHECK(view && !RAY_IS_ERR(view) && ray_attr_is_sorted(view) &&
+                          (view->attrs & RAY_ATTR_SLICE), "mark atom view");
+        SORTED_FIND_CHECK(sorted_find_atom_check(view, a, vwant, 1, false), "sorted view atom find");
+        sorted_find_test_dispose(&a);
+        a = sorted_find_test_atom(type, first);   /* below the view's window */
+        SORTED_FIND_CHECK(sorted_find_test_first(payload.raw, type, 100, 4000, first) == NULL_I64,
+                          "view excludes row 0's value");
+        SORTED_FIND_CHECK(sorted_find_atom_check(view, a, NULL_I64, 1, false), "view miss below");
+        sorted_find_test_dispose(&a); sorted_find_test_dispose(&view);
+        /* A null atom keeps the existing answer, with no kernel. */
+        a = ray_typed_null(-type);
+        SORTED_FIND_CHECK(sorted_find_atom_check(h, a, NULL_I64, 0, false), "null atom");
+        sorted_find_test_dispose(&a);
+        /* The attached hash keeps precedence over the sorted marker. */
+        ix = ray_idx_hash_fn(h);
+        SORTED_FIND_CHECK(ix && !RAY_IS_ERR(ix) && ray_attr_is_sorted(ix) && ray_index_has(ix),
+                          "indexed sorted haystack");
+        a = sorted_find_test_atom(type, keys[2]);
+        SORTED_FIND_CHECK(sorted_find_atom_check(ix, a, sorted_find_test_first(payload.raw, type, 0, 4120, keys[2]),
+                                                 0, true), "index precedence");
+        sorted_find_test_dispose(&a); sorted_find_test_dispose(&ix);
+        sorted_find_test_dispose(&h); sorted_find_test_dispose(&hp);
+        /* Empty, one-row and extreme-valued sorted haystacks: at or below
+         * 64 rows (FIND_ATOM_SORTED_MIN) a sorted haystack scans. */
+        int64_t low = type == RAY_U8 ? 0 : type == RAY_I16 ? INT16_MIN + 1 :
+                      type == RAY_I32 ? (int64_t)INT32_MIN + 1 : INT64_MIN + 1;
+        int64_t high = type == RAY_U8 ? 255 : type == RAY_I16 ? INT16_MAX :
+                       type == RAY_I32 ? INT32_MAX : INT64_MAX;
+        int64_t ext[5] = {0};
+        sorted_find_test_store(ext, type, 0, low);
+        sorted_find_test_store(ext, type, 1, type == RAY_U8 ? 1 : -1);
+        sorted_find_test_store(ext, type, 2, high);
+        sorted_find_test_store(ext, type, 3, high);
+        for (int64_t len = 0; len <= 4; len++) {
+            h = ray_vec_from_raw(type, ext, len);
+            SORTED_FIND_CHECK(h && !RAY_IS_ERR(h), "extreme haystack");
+            h->attrs |= RAY_ATTR_SORTED;
+            const int64_t ek[] = { low, high, high - 1, type == RAY_U8 ? 1 : -1 };
+            for (int k = 0; k < 4; k++) {
+                a = sorted_find_test_atom(type, ek[k]);
+                SORTED_FIND_CHECK(sorted_find_atom_check(h, a, sorted_find_test_first(ext, type, 0, len, ek[k]), 2, false),
+                                  "extreme atom find");
+                sorted_find_test_dispose(&a);
+            }
+            sorted_find_test_dispose(&h);
+        }
+        /* The length threshold: 64 rows scan, 65 take the lower_bound;
+         * both find the first of the duplicated last value. */
+        for (int64_t len = 64; len <= 65; len++) {
+            h = ray_vec_from_raw(type, payload.raw, len);
+            SORTED_FIND_CHECK(h && !RAY_IS_ERR(h), "threshold haystack");
+            h->attrs |= RAY_ATTR_SORTED;
+            int64_t key = sorted_find_test_load(payload.raw, type, len - 1);
+            a = sorted_find_test_atom(type, key);
+            SORTED_FIND_CHECK(sorted_find_atom_check(h, a, sorted_find_test_first(payload.raw, type, 0, len, key),
+                                                     len > 64 ? 1 : 2, false), "threshold atom find");
+            sorted_find_test_dispose(&a); sorted_find_test_dispose(&h);
+        }
+        if (type != RAY_U8) {
+            /* Nullable haystack (a NULL sorts first): existing route. */
+            int64_t null = type == RAY_I16 ? NULL_I16 : type == RAY_I32 ? NULL_I32 : NULL_I64;
+            sorted_find_test_store(payload.raw, type, 0, null);
+            h = ray_vec_from_raw(type, payload.raw, 4120);
+            SORTED_FIND_CHECK(h && !RAY_IS_ERR(h) && ray_vec_may_have_nulls(h), "nullable haystack");
+            h->attrs |= RAY_ATTR_SORTED;
+            a = sorted_find_test_atom(type, 0);
+            SORTED_FIND_CHECK(sorted_find_atom_check(h, a, sorted_find_test_first(payload.raw, type, 0, 4120, 0), 0, false),
+                              "nullable haystack declines");
+            sorted_find_test_dispose(&a); sorted_find_test_dispose(&h);
+        }
+        sorted_find_test_dispose(&tag);
+    }
+    /* Mixed widths keep the coercing fallback: I64 atom in I32, I32 atom in
+     * I64, I64 atom in U8; floats on either side never take the kernel. */
+    {
+        int32_t d32[4096]; int64_t d64[4096]; uint8_t d8[4096]; double df[4096];
+        for (int i = 0; i < 4096; i++) { d32[i] = i / 2; d64[i] = i / 2; d8[i] = (uint8_t)(i / 16); df[i] = i / 2; }
+        struct { int8_t ht; const void* d; int64_t want; } mix[] = {
+            { RAY_I32, d32, 1000 }, { RAY_I64, d64, 1000 }, { RAY_U8, d8, 16 * 100 },
+            { RAY_I64, d64, 1000 }, { RAY_F64, df, 1000 },
+        };
+        for (int c = 0; c < 5; c++) {
+            h = ray_vec_from_raw(mix[c].ht, mix[c].d, 4096);
+            SORTED_FIND_CHECK(h && !RAY_IS_ERR(h), "mixed haystack");
+            h->attrs |= RAY_ATTR_SORTED;
+            a = c == 0 ? ray_i64(500) : c == 1 ? ray_i32(500) : c == 2 ? ray_i64(100) : ray_f64(500.0);
+            SORTED_FIND_CHECK(sorted_find_atom_check(h, a, mix[c].want, 0, false), "mixed/float fallback");
+            sorted_find_test_dispose(&a);
+            a = c == 0 ? ray_i64(4096) : c == 1 ? ray_i32(4096) : c == 2 ? ray_i64(256) : ray_f64(0.5);
+            SORTED_FIND_CHECK(sorted_find_atom_check(h, a, NULL_I64, 0, false), "mixed/float miss");
+            sorted_find_test_dispose(&a); sorted_find_test_dispose(&h);
+        }
+    }
+cleanup:
+    sorted_find_test_dispose(&a); sorted_find_test_dispose(&ix);
+    sorted_find_test_dispose(&view); sorted_find_test_dispose(&tag);
+    sorted_find_test_dispose(&h); sorted_find_test_dispose(&hp);
+    ray_sym_destroy(); ray_heap_destroy();
+    return outcome;
+}
+
 #undef SORTED_FIND_CHECK_EQ_I
 #undef SORTED_FIND_CHECK
 
@@ -3295,6 +3496,7 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/guid_index_routes",         test_guid_index_routes,         NULL, NULL },
     { "idx_route/find_sorted_integer_widths", test_find_sorted_integer_widths, NULL, NULL },
     { "idx_route/find_sorted_integer_contracts", test_find_sorted_integer_contracts, NULL, NULL },
+    { "idx_route/find_sorted_atom",       test_find_sorted_atom,       NULL, NULL },
     { "idx_route/find_sorted_i64_views", test_find_sorted_i64_views, NULL, NULL },
     { "idx_route/find_sorted_i64_extremes", test_find_sorted_i64_extremes, NULL, NULL },
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
