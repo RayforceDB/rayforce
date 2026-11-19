@@ -444,6 +444,27 @@ static size_t heap_rss_kb(void) {
 #endif
 }
 
+/* 1 if the page holding p is resident, 0 if not, -1 if this platform cannot
+ * tell (macOS releases with MADV_FREE, which leaves pages resident until the
+ * kernel wants them). */
+static int relieve_resident(const void* p) {
+#if defined(__linux__)
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)p & ~(uintptr_t)(ps - 1);
+    unsigned char v = 0;
+    if (mincore((void*)a, (size_t)ps, &v) != 0) return -1;
+    return v & 1;
+#else
+    (void)p;
+    return -1;
+#endif
+}
+
+static bool relieve_mincore(void) {
+    static char page[8192];
+    return relieve_resident(page + 4096) >= 0;
+}
+
 static test_result_t test_idle_decay_releases_pages(void) {
     /* Threshold 0 means "release at the first maintenance point after any
      * work", so the test asserts the mechanism without sleeping on a clock. */
@@ -457,25 +478,33 @@ static test_result_t test_idle_decay_releases_pages(void) {
     if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
     memset(ray_data(v), 0xA5, big);          /* fault every page in */
 
+    const char* probe = (const char*)v + (8u << 20);
+    int res0 = relieve_resident(probe);
     size_t rss_live = heap_rss_kb();
     ray_free(v);
 
     /* One collector pass can only age a freshly inserted block (attrs 0 -> 1),
-     * never release it. */
+     * never release it.  Aggregate RSS is not this block's state: pass 5 may
+     * first release older free blocks, because its cursor and budget are
+     * deliberately incremental. */
     ray_heap_gc();
-    size_t rss_gc = heap_rss_kb();
+    int res1 = relieve_resident(probe);
 
     ray_heap_note_activity();
     int64_t released = ray_heap_decay();
+    int res2 = relieve_resident(probe);
     size_t rss_decay = heap_rss_kb();
 
     ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
 
     TEST_ASSERT(released >= 1, "the decay sweep released at least one block");
+    if (relieve_mincore()) {
+        TEST_ASSERT(res0 == 1, "the written block was resident");
+        TEST_ASSERT(res1 == 1, "collector alone keeps this block resident");
+        TEST_ASSERT(res2 == 0, "decay handed this block back");
+    }
     if (rss_live > 0) {
         size_t half = (big / 1024) / 2;
-        TEST_ASSERT(rss_gc + half > rss_live,
-                    "collector alone keeps the freed block resident");
         TEST_ASSERT(rss_decay + half < rss_live,
                     "decay handed most of the freed block back");
     }
@@ -3038,30 +3067,6 @@ static int relieve_parked(ray_heap_t* h) {
     return n == h->parked ? (int)n : -1;
 }
 
-/* 1 if the page holding p is resident, 0 if not, -1 if this platform cannot
- * tell (macOS releases with MADV_FREE, which leaves pages resident until the
- * kernel wants them). */
-static int relieve_resident(const void* p) {
-#if defined(__linux__)
-    long ps = sysconf(_SC_PAGESIZE);
-    uintptr_t a = (uintptr_t)p & ~(uintptr_t)(ps - 1);
-    unsigned char v = 0;
-    if (mincore((void*)a, (size_t)ps, &v) != 0) return -1;
-    return v & 1;
-#else
-    (void)p;
-    return -1;
-#endif
-}
-
-/* Whether residency can be read here at all (mincore): the checks of it
- * are skipped where it cannot be — never because the page looked at is
- * gone, which reads as -1 and fails them. */
-static bool relieve_mincore(void) {
-    static char page[8192];
-    return relieve_resident(page + 4096) >= 0;
-}
-
 /* Relief visits this heap and the singleton pool's quiescent workers.
  * Account their independently inspected mappings, not an unexplained
  * global residual. The dispatcher runs this test without pool lifecycle
@@ -5330,8 +5335,11 @@ static test_result_t test_anon_watermark_spill(void) {
      * anonymous instead of spilling. */
     ray_heap_direct_cache_drain();
     int64_t base = ray_heap_anon_committed();
-    /* Headroom for exactly one ~40 MB block, not two. */
-    ray_heap_set_anon_watermark(base + 48 * 1024 * 1024);
+    /* Each direct map is 41.94 MiB including its header and page rounding.
+     * Base 42 MiB: above the first allocation alone, below two of them.
+     * The old 48 MiB ceiling exceeded two maps with an empty heap, so it
+     * legitimately let the second allocation stay anonymous. */
+    ray_heap_set_anon_watermark(base + 42 * 1024 * 1024);
 
     ray_t* a = ray_alloc(sz);
     bool a_file = a ? ray_direct_file_backed(a) : true;   /* expect anon (RAM) */
