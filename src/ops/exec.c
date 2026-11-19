@@ -2946,9 +2946,14 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * would still materialize the expression over ALL rows (expr_eval_full)
  * and only then skip non-selected entries.  Gather the referenced columns
  * once (sel_compact keep-set) and group the dense survivors with no
- * selection instead.  Every other group stays on the lazy path: exec_group
- * reads the selection in place on all its routes, and gathering every
- * column of a wide table first costs more than the group itself (#736).
+ * selection instead.  Every other group stays on the lazy path and reads
+ * the selection in place; gathering every column of a wide table first
+ * costs more than the group itself (#736).  The lazy path is also the
+ * language's row domain for an input that reads other rows (`sums`,
+ * `deltas`, `mavg` and the rest): it runs over the whole table and the
+ * group keeps the selected rows of it (#916, docs: running functions under
+ * where:), so such an input must not be compacted first.  collect_scan_syms
+ * declines it, as it declines a vector constant.
  * On success *tbl and *owned_tbl name the compacted table and the selection
  * is dropped; any decline or failure leaves both and the selection as
  * they were. */

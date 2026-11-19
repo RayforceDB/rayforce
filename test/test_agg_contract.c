@@ -3338,6 +3338,127 @@ static int wave_open_fds(void) {
 }
 #endif
 
+/* first_n_same_table, but F64 cells within a relative 1e-9: a parallel
+ * float sum may round its last bit differently from run to run. */
+static bool od_same_table(ray_t* a, ray_t* b) {
+    if (first_n_same_table(a, b)) return true;
+    if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b)) return false;
+    if (a->type != RAY_TABLE || b->type != RAY_TABLE) return false;
+    int64_t nc = ray_table_ncols(a), nr = ray_table_nrows(a);
+    if (nc != ray_table_ncols(b) || nr != ray_table_nrows(b)) return false;
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* x = ray_table_get_col_idx(a, c);
+        ray_t* y = ray_table_get_col_idx(b, c);
+        if (!x || !y || x->type != y->type || x->len != y->len) return false;
+        if (x->type != RAY_F64) {
+            if (memcmp(ray_data(x), ray_data(y), (size_t)nr * col_esz(x)) != 0) return false;
+            continue;
+        }
+        const double* xv = (const double*)ray_data(x);
+        const double* yv = (const double*)ray_data(y);
+        for (int64_t r = 0; r < nr; r++) {
+            if (isnan(xv[r]) && isnan(yv[r])) continue;
+            if (!(fabs(xv[r] - yv[r]) <= 1e-9 * fmax(1.0, fabs(xv[r])))) return false;
+        }
+    }
+    return true;
+}
+
+/* A group input that reads other rows than its own (a running, moving or
+ * shift function) runs over the whole table, rows the where: drops
+ * included, and the group keeps the selected rows of it (#916; the docs'
+ * running functions under where:).  An unordered take must not change
+ * that: dev compacted the table first under a take, so `(max (sums i))`
+ * by k answered [21 30] with take: 2 and [36 45] without.  Every function,
+ * keyed and keyless, with and without a take, small and over the first-N
+ * threshold, against the same function stored as a column of the whole
+ * table first. */
+/* Every row of the keyed take `got` (keys in column 0, the aggregate in
+ * column 1) is the row of the same key in `all`, F64 within a relative
+ * 1e-9.  Which N groups a take keeps over such an input is not checked:
+ * it keeps the first N in key order, not in first-seen order, on dev too. */
+static bool od_take_rows_in(ray_t* got, ray_t* all, int64_t n) {
+    if (!got || !all || RAY_IS_ERR(got) || RAY_IS_ERR(all)) return false;
+    if (got->type != RAY_TABLE || all->type != RAY_TABLE || ray_table_nrows(got) != n) return false;
+    ray_t* gk = ray_table_get_col_idx(got, 0);
+    ray_t* gs = ray_table_get_col_idx(got, 1);
+    ray_t* ak = ray_table_get_col_idx(all, 0);
+    ray_t* as = ray_table_get_col_idx(all, 1);
+    if (gk->type != RAY_I64 || ak->type != RAY_I64 || gs->type != as->type ||
+        (gs->type != RAY_I64 && gs->type != RAY_F64)) return false;
+    for (int64_t r = 0; r < n; r++) {
+        int64_t k = ((const int64_t*)ray_data(gk))[r], j = 0;
+        while (j < ak->len && ((const int64_t*)ray_data(ak))[j] != k) j++;
+        if (j == ak->len) return false;
+        if (gs->type == RAY_I64) {
+            if (((const int64_t*)ray_data(gs))[r] != ((const int64_t*)ray_data(as))[j]) return false;
+        } else {
+            double x = ((const double*)ray_data(gs))[r], y = ((const double*)ray_data(as))[j];
+            if (!(isnan(x) && isnan(y)) && !(fabs(x - y) <= 1e-9 * fmax(1.0, fabs(x)))) return false;
+        }
+    }
+    return true;
+}
+
+static test_result_t test_group_where_order_dependent(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set od_s (table [k i] (list [0 1 0 1 0 1 0 1 0 1] (til 10)))) "
+        "(set od_n (til 200000)) "
+        "(set od_b (table [k i] (list (% (* od_n 7919) 40) (+ 1 (% od_n 997)))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    /* aggregate, the function it reads */
+    static const char* aggs[][2] = {
+        { "max", "(sums i)" }, { "sum", "(deltas i)" }, { "sum", "(mavg 2 i)" },
+        { "sum", "(msum 2 i)" }, { "sum", "(ratios i)" }, { "sum", "(mmin 2 i)" },
+        { "sum", "(mcount 2 i)" }, { "sum", "(mdev 2 i)" }, { "sum", "(* (sums i) 2)" },
+    };
+    static const char* tabs[][2] = {
+        { "od_s", "(> i 5)" },
+        { "od_b", "(> i 600)" },                 /* scattered, 40% */
+        { "od_b", "(< (% i 10) 2)" },            /* scattered, sparse */
+    };
+    /* keyed take, keyed (in key order), keyless take, keyless */
+    static const char* forms[] = {
+        "(select {from:%s where:%s by:k s:(%s %s) take:5})",
+        "(xasc (select {from:%s where:%s by:k s:(%s %s)}) 'k)",
+        "(select {from:%s where:%s s:(%s %s) take:1})",
+        "(select {from:%s where:%s s:(%s %s)})",
+    };
+    for (size_t t = 0; t < sizeof(tabs) / sizeof(tabs[0]); t++) {
+        for (size_t a = 0; a < sizeof(aggs) / sizeof(aggs[0]); a++) {
+            char buf[256];
+            snprintf(buf, sizeof buf, "(set od_x (update {from:%s x:%s}))", tabs[t][0], aggs[a][1]);
+            ray_t* x = ray_eval_str(buf);
+            TEST_ASSERT_FMT(x && !RAY_IS_ERR(x), "%s: failed", buf);
+            ray_release(x);
+            for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]); f++) {
+                char q[512], u[512];
+                snprintf(q, sizeof q, forms[f], tabs[t][0], tabs[t][1], aggs[a][0], aggs[a][1]);
+                snprintf(u, sizeof u, forms[f], "od_x", tabs[t][1], aggs[a][0], "x");
+                /* the keyed take against the keyed select without one */
+                if (f == 0) snprintf(u, sizeof u, forms[1], "od_x", tabs[t][1], aggs[a][0], "x");
+                ray_t* got = ray_eval_str(q);
+                ray_t* want = ray_eval_str(u);
+                TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want), "%s: error", q);
+                TEST_ASSERT_FMT(f == 0 ? od_take_rows_in(got, want, t == 0 ? 2 : 5) : od_same_table(want, got),
+                                "%s: differs from the whole-table column", q);
+                ray_release(got); ray_release(want);
+            }
+        }
+    }
+    /* the reported shape itself: the take keeps the answer of the select
+     * without one */
+    ray_t* r = ray_eval_str("(at (select {from:od_s where:(> i 5) by:k s:(max (sums i)) take:2}) 's)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_I64 && r->len == 2);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(r))[0], 36);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(r))[1], 45);
+    ray_release(r);
+    ray_release(ray_eval_str("(set od_s 0) (set od_b 0) (set od_x 0) (set od_n 0)"));
+    PASS();
+}
+
 /* Unordered take: N under a where: on the key of a parted table (#736).
  * The where: filters the rows before the group instead of the group result
  * (the deferred key filter), so the take reaches the group and the
@@ -5250,6 +5371,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take_where", test_first_n_take_where, contract_setup, contract_teardown },
     { "agg_contract/first_n_take_key_where_parted", test_first_n_take_key_where_parted, contract_setup, contract_teardown },
+    { "agg_contract/group_where_order_dependent", test_group_where_order_dependent, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
     { "agg_contract/timespan_rank_admission", test_timespan_rank_admission, contract_setup, contract_teardown },
