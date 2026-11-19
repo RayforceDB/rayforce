@@ -3248,85 +3248,94 @@ static void key_select(uint64_t* keys, int64_t* idx, int64_t n, int64_t k) {
 }
 
 /* ---- Chunked top-k over encoded keys ----
- * Each pool task encodes its rows and keeps those that beat its worker's
- * threshold, the K-th smallest (key, row) pair the worker has kept so far,
- * in the worker's buffer of `cap` (> K) pairs.  A full buffer is cut back
- * to its K smallest (key_select, O(cap)), which raises the threshold.  So a
- * row that beats the threshold costs O(1) amortized instead of a log2(K)
- * heap sift: a key rising along the rows under desc: (every row beats it)
- * is a linear pass.  The threshold compares the row too, so tasks may run
- * in any order and on any worker: a tie keeps the lower row.  After the
- * barrier each worker cuts its candidates to K and sorts them, and a merge
- * of the workers' sorted lists takes the first K. */
+ * The rows are cut into nb contiguous ranges, one pool task and one buffer
+ * of `cap` (> K) pairs each.  A task encodes its rows a block at a time and
+ * keeps those that beat its threshold, the K-th smallest (key, row) pair it
+ * has kept so far.  A full buffer is cut back to its K smallest
+ * (key_select, O(cap)), which raises the threshold.  So a row that beats
+ * the threshold costs O(1) amortized instead of a log2(K) heap sift: a key
+ * rising along the rows under desc: (every row beats it) is a linear pass.
+ * The threshold compares the row too, so a tie keeps the lower row.  At its
+ * end a task cuts its candidates to K and sorts them, and a merge of the
+ * tasks' sorted lists takes the first K.  nb is bounded so the buffers
+ * hold at most `nrows` pairs (topk_sel_run). */
 typedef struct {
     radix_encode_ctx_t enc;
-    int64_t   k, cap;
-    uint64_t* bk;        /* [workers * cap] candidate keys */
-    int64_t*  bi;        /* [workers * cap] candidate rows */
-    int64_t*  cnt;       /* [workers] candidates kept */
-    uint64_t* tk;        /* [workers] threshold key */
-    int64_t*  ti;        /* [workers] threshold row */
+    int64_t   nrows, k, cap, nb;
+    uint64_t* bk;        /* [nb * cap] candidate keys */
+    int64_t*  bi;        /* [nb * cap] candidate rows */
+    int64_t*  cnt;       /* [nb] candidates kept, sorted */
 } topk_sel_ctx_t;
 
 static void topk_sel_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
     topk_sel_ctx_t* c = (topk_sel_ctx_t*)arg;
-    radix_encode_fn(&c->enc, wid, start, end);
-    const uint64_t* keys = c->enc.keys;
-    uint64_t* bk = c->bk + (size_t)wid * (size_t)c->cap;
-    int64_t*  bi = c->bi + (size_t)wid * (size_t)c->cap;
-    int64_t n = c->cnt[wid], k = c->k, cap = c->cap, ti = c->ti[wid];
-    uint64_t tk = c->tk[wid];
-    for (int64_t i = start; i < end; i++) {
-        uint64_t key = keys[i];
-        if (RAY_LIKELY(key > tk || (key == tk && i > ti))) continue;
-        bk[n] = key; bi[n] = i;
-        if (RAY_UNLIKELY(++n == cap)) {
-            key_select(bk, bi, n, k);
-            n = k;
-            tk = bk[0]; ti = bi[0];
-            for (int64_t j = 1; j < k; j++)
-                if (TOPK_PAIR_GT(bk[j], bi[j], tk, ti)) { tk = bk[j]; ti = bi[j]; }
+    for (int64_t t = start; t < end; t++) {
+        int64_t lo = c->nrows * t / c->nb, hi = c->nrows * (t + 1) / c->nb;
+        const uint64_t* keys = c->enc.keys;
+        uint64_t* bk = c->bk + (size_t)t * (size_t)c->cap;
+        int64_t*  bi = c->bi + (size_t)t * (size_t)c->cap;
+        int64_t n = 0, k = c->k, cap = c->cap, ti = INT64_MAX;
+        uint64_t tk = UINT64_MAX;
+        for (int64_t b = lo; b < hi; b += RAY_PARALLEL_THRESHOLD) {
+            if (ray_interrupted()) { c->cnt[t] = 0; return; }   /* the caller sees the cancel */
+            int64_t e = b + RAY_PARALLEL_THRESHOLD < hi ? b + RAY_PARALLEL_THRESHOLD : hi;
+            radix_encode_fn(&c->enc, wid, b, e);
+            for (int64_t i = b; i < e; i++) {
+                uint64_t key = keys[i];
+                if (RAY_LIKELY(key > tk || (key == tk && i > ti))) continue;
+                bk[n] = key; bi[n] = i;
+                if (RAY_UNLIKELY(++n == cap)) {
+                    key_select(bk, bi, n, k);
+                    n = k;
+                    tk = bk[0]; ti = bi[0];
+                    for (int64_t j = 1; j < k; j++)
+                        if (TOPK_PAIR_GT(bk[j], bi[j], tk, ti)) { tk = bk[j]; ti = bi[j]; }
+                }
+            }
         }
-    }
-    c->cnt[wid] = n; c->tk[wid] = tk; c->ti[wid] = ti;
-}
-
-/* A worker's candidates: cut to K, sorted ascending. */
-static void topk_sel_sort_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    topk_sel_ctx_t* c = (topk_sel_ctx_t*)arg;
-    for (int64_t w = start; w < end; w++) {
-        uint64_t* bk = c->bk + (size_t)w * (size_t)c->cap;
-        int64_t*  bi = c->bi + (size_t)w * (size_t)c->cap;
-        int64_t n = c->cnt[w];
-        if (n > c->k) { key_select(bk, bi, n, c->k); n = c->k; }
+        if (n > k) { key_select(bk, bi, n, k); n = k; }
         key_introsort(bk, bi, n);
-        c->cnt[w] = n;
+        c->cnt[t] = n;
     }
 }
 
 #ifdef DEBUG
 static _Atomic(uint64_t) g_topk_chunked;   /* test hook: pool-dispatched top-k selections */
+static _Atomic(int64_t)  g_topk_pairs;     /* test hook: the last selection's buffer pairs */
 uint64_t ray_sort_test_topk_chunked(void) { return atomic_load_explicit(&g_topk_chunked, memory_order_relaxed); }
+int64_t ray_sort_test_topk_pairs(void) { return atomic_load_explicit(&g_topk_pairs, memory_order_relaxed); }
 #endif
 
 /* The K (key, row)-smallest rows of `col` by its radix encoding, in order,
- * into out[0..k).  0, or -1 on OOM, -2 when the pool's dispatch was
- * cancelled (its outputs are partial). */
+ * into out[0..k).  0, or -1 on OOM, -2 when the query was cancelled (the
+ * outputs are partial). */
 static int topk_sel_run(ray_t* col, uint8_t desc, uint8_t nf, int64_t nrows,
                         int64_t k, int64_t* out) {
     ray_pool_t* pool = ray_pool_get();
-    bool par = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
-    int64_t nw = par ? (int64_t)ray_pool_total_workers(pool) : 1;
     /* Room for K + max(K, 512): a cut every K rows at worst for large K
      * (O(1) a row), and at least 512 rows between cuts for small K, where a
      * cut every few rows would cost more than a heap sift. */
     int64_t cap = k + (k > 512 ? k : 512);
+    /* One range per worker while the buffers stay within nrows pairs (16
+     * bytes a row beside the keys' 8): a K near the rows takes fewer
+     * ranges, down to one.  A buffer needs no more than its range's rows,
+     * plus one so it never fills. */
+    int64_t nb = 1;
+    if (ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD)) {
+        nb = nrows / cap;
+        if (nb > (int64_t)ray_pool_total_workers(pool)) nb = (int64_t)ray_pool_total_workers(pool);
+        if (nb < 1) nb = 1;
+    }
+    int64_t span = (nrows + nb - 1) / nb + 1;
+    if (cap > span) cap = span;
+#ifdef DEBUG
+    atomic_store_explicit(&g_topk_pairs, nb * cap, memory_order_relaxed);
+#endif
     ray_t *keys_hdr = NULL, *buf_hdr = NULL, *st_hdr = NULL;
     uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr, (size_t)nrows * sizeof(uint64_t));
-    char* buf = (char*)scratch_alloc(&buf_hdr, (size_t)nw * (size_t)cap * 16);
-    char* st = (char*)scratch_alloc(&st_hdr, (size_t)nw * 24);
-    if (!keys || !buf || !st) {
+    char* buf = (char*)scratch_alloc(&buf_hdr, (size_t)nb * (size_t)cap * 16);
+    int64_t* cnt = (int64_t*)scratch_alloc(&st_hdr, (size_t)nb * sizeof(int64_t));
+    if (!keys || !buf || !cnt) {
         if (keys_hdr) scratch_free(keys_hdr);
         if (buf_hdr) scratch_free(buf_hdr);
         if (st_hdr) scratch_free(st_hdr);
@@ -3345,32 +3354,30 @@ static int topk_sel_run(ray_t* col, uint8_t desc, uint8_t nf, int64_t nrows,
             .enum_rank   = NULL,
             .n_keys      = 1,
         },
-        .k = k, .cap = cap,
-        .bk = (uint64_t*)buf, .bi = (int64_t*)(buf + (size_t)nw * (size_t)cap * 8),
-        .cnt = (int64_t*)st, .tk = (uint64_t*)(st + (size_t)nw * 8), .ti = (int64_t*)(st + (size_t)nw * 16),
+        .nrows = nrows, .k = k, .cap = cap, .nb = nb,
+        .bk = (uint64_t*)buf, .bi = (int64_t*)(buf + (size_t)nb * (size_t)cap * 8),
+        .cnt = cnt,
     };
-    for (int64_t w = 0; w < nw; w++) { c.cnt[w] = 0; c.tk[w] = UINT64_MAX; c.ti[w] = INT64_MAX; }
-    if (par) {
-        ray_pool_dispatch(pool, topk_sel_fn, &c, nrows);
-        if (!pool_cancelled(pool)) ray_pool_dispatch_n(pool, topk_sel_sort_fn, &c, (uint32_t)nw);
-        if (pool_cancelled(pool)) { scratch_free(keys_hdr); scratch_free(buf_hdr); scratch_free(st_hdr); return -2; }
+    for (int64_t t = 0; t < nb; t++) cnt[t] = 0;
+    if (nb > 1) {
+        ray_pool_dispatch_n(pool, topk_sel_fn, &c, (uint32_t)nb);
 #ifdef DEBUG
         atomic_fetch_add_explicit(&g_topk_chunked, 1, memory_order_relaxed);
 #endif
     } else {
-        topk_sel_fn(&c, 0, 0, nrows);
-        topk_sel_sort_fn(&c, 0, 0, 1);
+        topk_sel_fn(&c, 0, 0, 1);
     }
+    if (pool_cancelled(pool)) { scratch_free(keys_hdr); scratch_free(buf_hdr); scratch_free(st_hdr); return -2; }
     scratch_free(keys_hdr);
-    /* Merge the workers' sorted lists: a min-heap of workers on their next
+    /* Merge the ranges' sorted lists: a min-heap of ranges on their next
      * candidate (ties: the lower row, so the order is the full sort's). */
     ray_t* hp_hdr = NULL;
-    int64_t* hp = (int64_t*)scratch_alloc(&hp_hdr, (size_t)nw * 2 * sizeof(int64_t));
+    int64_t* hp = (int64_t*)scratch_alloc(&hp_hdr, (size_t)nb * 2 * sizeof(int64_t));
     if (!hp) { scratch_free(buf_hdr); scratch_free(st_hdr); return -1; }
-    int64_t* pos = hp + nw;                  /* per worker: its next candidate */
-    const int64_t* end = c.cnt;              /* per worker: its candidate count */
+    int64_t* pos = hp + nb;                  /* per range: its next candidate */
+    const int64_t* end = c.cnt;              /* per range: its candidate count */
     int64_t nh = 0;
-    for (int64_t w = 0; w < nw; w++) {
+    for (int64_t w = 0; w < nb; w++) {
         pos[w] = 0;
         if (end[w] > 0) hp[nh++] = w;
     }

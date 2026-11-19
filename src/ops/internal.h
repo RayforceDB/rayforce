@@ -1636,6 +1636,8 @@ uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered
 #ifdef DEBUG
 /* Single-key top-k selections run on the pool (topk_sel_run). */
 uint64_t ray_sort_test_topk_chunked(void);
+/* Buffer pairs (ranges x room) the last single-key top-k selection reserved. */
+int64_t ray_sort_test_topk_pairs(void);
 /* Parted columns sel_compact gathered on the pool (sel_parted_gather). */
 uint64_t ray_filter_test_parted_runs(void);
 #endif

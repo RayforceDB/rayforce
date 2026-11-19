@@ -3176,6 +3176,90 @@ static test_result_t test_sort_head_late_chunked(void) {
     PASS();
 }
 
+/* Cancellation through the pooled top-k (#1122): the late route over a
+ * parted table (its key gathered on the pool, the selection, the winners'
+ * gather) and top/bot over a long vector run once per dispatch they make,
+ * with the cancel landing right before that dispatch
+ * (ray_pool_test_cancel_at): a cancel request, then the pool's flag alone.
+ * Each run answers `cancel` or the uncancelled answer, and a cancelled run
+ * leaves no block of the calling thread's heap behind (the cancel error
+ * handed through ray_topk_table is freed, not released).  Then the
+ * selection's buffers stay within the rows for a K near them. */
+static int64_t aw_live_blocks(void) {
+    ray_mem_stats_t st;
+    ray_mem_stats(&st);
+    return (int64_t)st.alloc_count - (int64_t)st.free_count;
+}
+
+static test_result_t test_topk_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    for (int p = 0; p < 2; p++) {
+        char q[400];
+        snprintf(q, sizeof q, "(set X (+ %d (til 40000)))", p * 40000);
+        aw_eval_ok(q);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/tkx/2024.01.0%d/t/\" (table [r up] (list X X)) \"" AW_TMP "/tkx/.sym\")", p + 1);
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set T (.db.parted.get \"" AW_TMP "/tkx\" 't))");
+    aw_eval_ok("(set V (til 200000))");
+    static const struct { const char* q; const char* ok; } qs[] = {
+        { "(select {from: T where: (> (% r 10) 0) desc: up take: 8192})",
+          "(all (== (at Q 'r) (take (reverse (at (select {from: T where: (> (% r 10) 0)}) 'r)) 8192)))" },
+        { "(top V 8192)", "(all (== Q (take (reverse V) 8192)))" },
+        { "(bot (reverse V) 5)", "(all (== Q (til 5)))" },
+    };
+    int cancelled = 0, answered = 0;
+    for (size_t i = 0; i < sizeof qs / sizeof *qs; i++)
+        for (int mode = 0; mode < 2; mode++)
+            for (int k = 1; k <= 24; k++) {
+                ray_heap_gc();
+                int64_t live0 = aw_live_blocks();
+                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_t* got = aw_eval(qs[i].q);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                TEST_ASSERT_NOT_NULL(got);
+                if (RAY_IS_ERR(got)) {
+                    bool is_cancel = strcmp(ray_err_code(got), "cancel") == 0;
+                    ray_error_free(got);
+                    ray_heap_gc();
+                    int64_t live = aw_live_blocks() - live0;
+                    TEST_ASSERT_FMT(is_cancel, "%s, mode %d, cancel before dispatch %d: an error other than cancel", qs[i].q, mode, k);
+                    TEST_ASSERT_FMT(live == 0, "%s, mode %d, cancel before dispatch %d: %lld blocks left", qs[i].q, mode, k, (long long)live);
+                    cancelled++;
+                    continue;
+                }
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                ray_t* v = ray_eval_str(qs[i].ok);
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: not the answer", qs[i].q, mode, k);
+                answered++;
+            }
+    TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
+    /* the buffers: one range per worker at K 8192 of 200000 rows, fewer as
+     * K nears the rows, never more pairs than the rows (plus one a range) */
+    static const int64_t big[] = { 8192, 60000, 150000, 199999 };
+    for (size_t i = 0; i < sizeof big / sizeof *big; i++) {
+        char q[200];
+        snprintf(q, sizeof q, "(set Q (top V %lld))", (long long)big[i]);
+        uint64_t c0 = ray_sort_test_topk_chunked();
+        aw_eval_ok(q);
+        int64_t pairs = ray_sort_test_topk_pairs();
+        TEST_ASSERT_FMT(pairs > big[i] && pairs <= 200000 + 8, "top %lld: %lld buffer pairs", (long long)big[i], (long long)pairs);
+        TEST_ASSERT_FMT((ray_sort_test_topk_chunked() > c0) == (big[i] == 8192), "top %lld: pool use", (long long)big[i]);
+        snprintf(q, sizeof q, "(all (== Q (take (reverse V) %lld)))", (long long)big[i]);
+        ray_t* v = ray_eval_str(q);
+        bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+        if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+        TEST_ASSERT_FMT(ok, "top %lld: not the full sort's first rows", (long long)big[i]);
+    }
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set T 0)"); aw_eval_ok("(set V 0)"); aw_eval_ok("(set X 0)");
+    PASS();
+}
+
 /* First-n on runs: keys whose vectors are run views (h: runs of 11; s: a
  * SYM in runs of 7, every 13th run "", the in-band null) are probed once
  * per span of equal tuples, without decoding (agg_firstn_runs).  h decodes
@@ -5719,6 +5803,7 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_sym_points",  test_gather_sym_points,  aw_setup, aw_teardown },
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
+    { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },
