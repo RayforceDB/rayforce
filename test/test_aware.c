@@ -3117,7 +3117,8 @@ static test_result_t test_sort_head_late(void) {
  * I64, f: F64).  At K 1 and 8192 the late route answers on the pool; at 8193
  * the full sort does.  Every answer's row ids are the first K of the full
  * sort over the same rows in memory, materialized before the take so no
- * top-k answers it (ties by row, nulls where the sort puts them).
+ * top-k answers it (ties by row, nulls where the sort puts them).  The
+ * keys without nulls are compacted from the partitions on the pool too.
  * The other caller, top/bot, is test/rfl/sort/topk_chunked.rfl. */
 /* Q's row ids are the first k of the full sort held in R0. */
 static bool aw_rows_same(const char* q, int64_t k) {
@@ -3159,12 +3160,16 @@ static test_result_t test_sort_head_late_chunked(void) {
             aw_eval_ok(q);
             for (size_t j = 0; j < sizeof ks / sizeof *ks; j++) {
                 snprintf(q, sizeof q, "(select {from: T where: (> (%% r 10) 0) %s: %s take: %lld})", dir, keys[k], (long long)ks[j]);
-                uint64_t h0 = ray_sort_test_late_heads(), c0 = ray_sort_test_topk_chunked();
+                uint64_t h0 = ray_sort_test_late_heads(), c0 = ray_sort_test_topk_chunked(), g0 = ray_filter_test_parted_runs();
                 bool same = aw_rows_same(q, ks[j]);
                 uint64_t late = ray_sort_test_late_heads() - h0, chunked = ray_sort_test_topk_chunked() - c0;
+                uint64_t gathered = ray_filter_test_parted_runs() - g0;
                 TEST_ASSERT_FMT(same, "%s: differs from the full sort's first rows", q);
                 TEST_ASSERT_FMT(late == (ks[j] <= 8192 ? 1u : 0u), "%s: %llu late heads", q, (unsigned long long)late);
                 TEST_ASSERT_FMT(chunked >= (ks[j] <= 8192 && workers ? 1u : 0u), "%s: top-k not on the pool", q);
+                /* the key's 72000 rows compacted on the pool (keys with nulls stay serial) */
+                bool nulls = keys[k][0] == 'n' || keys[k][0] == 'f';
+                TEST_ASSERT_FMT(gathered >= (workers && !nulls ? 1u : 0u), "%s: key not gathered on the pool", q);
             }
         }
     aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set T 0)"); aw_eval_ok("(set F 0)"); aw_eval_ok("(set X 0)");
