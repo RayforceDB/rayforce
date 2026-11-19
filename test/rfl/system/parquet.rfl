@@ -221,3 +221,24 @@
 (count (.db.splayed.get "/tmp/rfl_parquet_rows/0/hits")) -- 70003
 (sum (at (.db.splayed.get "/tmp/rfl_parquet_rows/0/hits") 'x)) -- 2450175003
 (.sys.exec "rm -rf /tmp/rfl_parquet_rows")
+;; Columns the reader cannot read (an INT96, a FIXED_LEN_BYTE_ARRAY without a
+;; DECIMAL annotation) do not make the file unreadable: a projection and a query
+;; that never name them read the rest, the metadata describes every column with
+;; the reason, and naming one is an error that says which and why.
+(set pq-u "test/data/parquet/unsupported-columns.parquet")
+(sum (at (.parquet.read [id amount] pq-u) 'id)) -- 6
+(count (.parquet.meta pq-u)) -- 5
+(sum (map (fn [x] (if (== x 'unsupported) 1 0)) (at (.parquet.meta pq-u) 'ray_type))) -- 2
+(sum (at (select {from: (.parquet.scan pq-u) id: id}) 'id)) -- 6
+(sum (at (select {from: (.parquet.scan pq-u) s: (sum amount)}) 's)) -- 1.25
+(.parquet.read [id i96] pq-u) !- parquet
+(.parquet.read pq-u) !- parquet
+(select {from: (.parquet.scan pq-u) i: i96}) !- parquet
+(select {from: (.parquet.scan pq-u)}) !- parquet
+;; Nested columns (a LIST, a STRUCT and a MAP, beside flat ones) are skipped over.
+(set pq-n "test/data/parquet/nested.parquet")
+(sum (at (.parquet.read [a b z] pq-n) 'z)) -- 20
+(sum (at (select {from: (.parquet.scan pq-n) z: z}) 'z)) -- 20
+(count (.parquet.meta pq-n)) -- 6
+(.parquet.read [a l] pq-n) !- parquet
+(.parquet.read pq-n) !- parquet
