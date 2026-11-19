@@ -3307,6 +3307,67 @@ static int wave_open_fds(void) {
 }
 #endif
 
+/* Unordered take: N under a where: on the key of a parted table (#736).
+ * The where: filters the rows before the group instead of the group result
+ * (the deferred key filter), so the take reaches the group and the
+ * first-N pre-pass answers it rather than aggregating every group.
+ * Each answer equals the unfused form (the where: materialized first, then
+ * grouped). */
+static test_result_t test_first_n_take_key_where_parted(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_agg_kw_parted_%lld", wave_pid());
+    (void)ray_test_rm_rf(dir);
+    ray_t* setup = ray_eval_str(
+        "(set kw_i (til 200000)) "
+        "(set kw_t (table [k s v] (list (% (* kw_i 7919) 60000) "
+        "(as 'SYM (as 'STR (% (* kw_i 31) 5000))) (% kw_i 1000))))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    char store_src[512];
+    snprintf(store_src, sizeof store_src,
+        "(.db.splayed.set \"%s/1/t/\" (take kw_t 100000)) "
+        "(.db.splayed.set \"%s/2/t/\" (take kw_t -100000)) "
+        "(set kw_p (.db.parted.get \"%s/\" 't))", dir, dir, dir);
+    setup = ray_eval_str(store_src);
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    static const struct { const char* q; const char* w; const char* u; } shapes[] = {
+        { "(select {from:kw_p where:(!= k 0) by:k c:(count v) sv:(sum v) take:10})",
+          "(!= k 0)", "(select {from:kw_w by:k c:(count v) sv:(sum v) take:10})" },
+        { "(select {from:kw_p where:(> k 30000) by:k c:(count v) take:25})",
+          "(> k 30000)", "(select {from:kw_w by:k c:(count v) take:25})" },
+        { "(select {from:kw_p where:(!= s '0) by:s c:(count v) mx:(max v) take:10})",
+          "(!= s '0)", "(select {from:kw_w by:s c:(count v) mx:(max v) take:10})" },
+    };
+    for (size_t q = 0; q < sizeof(shapes) / sizeof(shapes[0]); q++) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "(set kw_w (select {from:kw_p where:%s}))", shapes[q].w);
+        ray_t* w = ray_eval_str(buf);
+        TEST_ASSERT_FMT(w && !RAY_IS_ERR(w), "%s: where: alone failed", shapes[q].w);
+        ray_release(w);
+        ray_t* unfused = ray_eval_str(shapes[q].u);
+        agg_route_reset();
+        ray_t* got = ray_eval_str(shapes[q].q);
+        agg_route_stats_t st = agg_route_stats();
+        TEST_ASSERT_FMT(unfused && !RAY_IS_ERR(unfused) && got && !RAY_IS_ERR(got),
+                        "%s: error", shapes[q].q);
+        TEST_ASSERT_FMT(st.first_n == 1, "%s: first-N ran %d times, expected 1",
+                        shapes[q].q, (int)st.first_n);
+        TEST_ASSERT_FMT(first_n_same_table(unfused, got), "%s: differs from the unfused form",
+                        shapes[q].q);
+        ray_release(unfused); ray_release(got);
+    }
+    /* an ordered take sorts every group first: the key filter stays deferred */
+    ray_t* ord = ray_eval_str("(select {from:kw_p where:(!= k 0) by:k c:(count v) desc:k take:3})");
+    TEST_ASSERT_TRUE(ord && !RAY_IS_ERR(ord) && ord->type == RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ord), 3);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(ray_table_get_col_idx(ord, 0)))[0], 59999);
+    ray_release(ord);
+    ray_release(ray_eval_str("(set kw_p 0) (set kw_w 0) (set kw_t 0) (set kw_i 0)"));
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* Radix wave knobs of one run: payload bytes per wave (0 = from the heap,
  * < 0 = the unreduced one-pass oracle) and how later waves are fed (0 = by
  * bytes moved, 1 = re-scan, 2 = spill file). */
@@ -5148,6 +5209,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_unordered_take", test_dense_unordered_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take", test_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/first_n_take_where", test_first_n_take_where, contract_setup, contract_teardown },
+    { "agg_contract/first_n_take_key_where_parted", test_first_n_take_key_where_parted, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
     { "agg_contract/timespan_rank_admission", test_timespan_rank_admission, contract_setup, contract_teardown },

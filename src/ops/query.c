@@ -19774,8 +19774,13 @@ by_dict_done:
 
     /* Not without outputs: the deferred filter runs on the aggregated
      * result, which a no-output select does not reach; it filters the rows
-     * first, as for any other key. */
+     * first, as for any other key.  Nor under an unordered take: a deferred
+     * filter keeps the take out of the group (group_take_push), which then
+     * aggregates every group to keep N of them; filtering the rows first
+     * lets the group stop at the first N, as it does without a where:
+     * (#736). */
     if (where_expr && by_expr && !nearest_expr && n_out > 0 &&
+        !(take_expr && !has_sort) &&
         can_defer_single_key_where(by_expr, where_expr, tbl)) {
         post_group_where_expr = where_expr;
         where_expr = NULL;
