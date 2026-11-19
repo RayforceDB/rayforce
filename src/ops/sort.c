@@ -3568,9 +3568,11 @@ ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
 /* (top vec n)  / (bot vec n) — partial-sort first N largest/smallest
  * elements of a numeric vector, returning a typed vec of the same
  * type as the input (or LIST/SYM passthrough via the comparator
- * heap).  O(N log K) when K << len via the same bounded-heap path
- * that ray_topk_table uses; falls back to full-sort + take when the
- * heap path declines (k >= len, unsupported types). */
+ * heap).  O(N + K log K) when K < len via the same selection that
+ * ray_topk_table uses (topk_indices_single, on the pool for long
+ * vectors); a cancelled query answers `cancel`.  Falls back to
+ * full-sort + take when the selection declines (k >= len, unsupported
+ * types). */
 ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
     if (!v) return ray_error("type", "top/bot: expected a vector, got null");
     if (ray_is_lazy(v)) v = ray_lazy_materialize(v);
@@ -3579,13 +3581,13 @@ ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
     if (k <= 0) return ray_vec_new(v->type, 0);
 
     /* k >= len → just full-sort the input.  Doesn't lose perf vs the
-     * heap path (k log k bookkeeping) since the heap path needs the
-     * full sort anyway when k == len. */
+     * selection (k log k bookkeeping) since it needs the full sort
+     * anyway when k == len. */
     if (k >= len) {
         return desc ? ray_desc_fn(v) : ray_asc_fn(v);
     }
 
-    /* Try the bounded-heap fast path.  It takes the placement from the
+    /* Try the selection fast path.  It takes the placement from the
      * shared rule, because the k >= len branch above hands the whole job
      * to the full sort, which uses that rule: spelling out a different
      * one here would put a null-bearing vector's nulls at one end while
@@ -3767,13 +3769,13 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     if (ncols > 4096) return ray_error("nyi", NULL); /* stack safety */
     uint32_t n_sort = ext->sort.n_cols;
 
-    /* ---- Top-K bounded-heap shortcut ----
+    /* ---- Top-K shortcut ----
      * Triggered by the SORT+HEAD fusion (HEAD passes limit > 0).  When
      * K is well below nrows (K << n) and every sort key is a direct
-     * OP_SCAN of a column on `tbl`, run a heap-based partial selection
-     * in O(n log K + K log K) instead of the full O(n log n) sort.
-     * Single key → radix-encoded fast path; multi-key → comparator
-     * heap (still O(n log K) in compares, big win when K << n).
+     * OP_SCAN of a column on `tbl`, run a partial selection instead of
+     * the full O(n log n) sort.  Single key → radix-encoded selection
+     * on the pool (topk_indices_single, O(n + K log K)); multi-key →
+     * comparator heap (O(n log K) in compares, big win when K << n).
      * Falls through to the full sort whenever the topk path returns
      * NULL (unsupported type, computed-key sort, etc.).  Bounded to
      * n_sort <= 16: the shortcut's key_cols/nfs scratch below is a
