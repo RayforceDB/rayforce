@@ -184,6 +184,26 @@ The shared symbol table lives in the parted root (`db/`) as the dotfile
 per table name (`db/<date>/<table>/cols`). Partitions have no own symfile and
 encode their SYM columns (e.g. `sym`) against the shared `.sym`.
 
+### Writing a Partitioned Database from Rayfall
+
+There is no `.db.parted.set`. The supported way to write a partitioned database is to save each partition's table with `.db.splayed.set` into `<root>/<partition>/<table>`, passing the root's one shared symbol file. `.db.parted.get` then loads the result.
+
+```lisp
+(set root "/data/db")
+(set symfile (format "%/.sym" root))
+(.db.splayed.set (format "%/0/ohlcv" root) t0 symfile)
+(.db.splayed.set (format "%/1/ohlcv" root) t1 symfile)
+(.db.parted.get root 'ohlcv)              ; adds the `part` column
+```
+
+What this guarantees:
+
+- **Directories.** `.db.splayed.set` creates the partition directory and any missing parents; nothing needs to exist beforehand.
+- **Partition names.** Any name `.db.parted.get` accepts is a partition: dates (`2024.01.15`), timestamps (`YYYY.MM.DD.HH.MM.SS`) or plain integers. Integer names need not start at 0, be consecutive or be zero-padded; they are ordered by value (`1`, `2`, `10`), and the `part` column is `I64`. See [`.db.parted.get`](../namespaces/db.md#db-parted-get) for the full rule and for how mixed names are handled.
+- **Shared symbol file.** Pass the same `sym_path` (conventionally `<root>/.sym`) for every partition and every table of the root. `SYM` columns of all partitions then share one vocabulary, which is what the loader reads (see [Symbol Table Persistence](#symbol-table-persistence)). New symbols append to the file, so partitions can be written one at a time, in any order.
+- **Pruning.** A predicate on the key (`(== part 7)`, `(> date 2024.01.15)`) prunes from the directory names alone; it needs no `compress` option. `compress: true` matters only for pruning on a *data* column, whose per-partition minimum and maximum are kept for compressed columns and for plain columns of 65,536 rows or more.
+- **Tables in every partition.** Write each table into every partition. A table that appears in later partitions only, because it was added midway, is handled by `.db.parted.fill`, which gives every partition that lacks a table an empty copy of it. It does not change existing data and a repeat call is a no-op.
+
 ### Loading Partitioned Data
 
 The `ray_read_parted()` function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with [parted columns](../data-types/collections.md#partitioned-columns) and a virtual `MAPCOMMON` date column.
