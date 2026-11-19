@@ -198,6 +198,10 @@ void     ray_cancel_reset(void);
 #define RAY_EXTRACT_DOW     6
 #define RAY_EXTRACT_DOY     7
 #define RAY_EXTRACT_EPOCH   8
+/* The whole date / time of day, not a field: the result is a DATE / TIME
+ * vector (a TIMESTAMP in, the same DATE or TIME out), never I64. */
+#define RAY_EXTRACT_DATE    9
+#define RAY_EXTRACT_TIME    10
 
 /* Opcodes — Reductions (pipeline breakers) */
 #define OP_SUM          50

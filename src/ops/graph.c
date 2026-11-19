@@ -1481,7 +1481,8 @@ ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field) {
     ext->base.opcode = OP_EXTRACT;
     ext->base.arity = 1;
     ext->base.in_id[0] = col->id;
-    ext->base.out_type = RAY_I64;
+    ext->base.out_type = field == RAY_EXTRACT_DATE ? RAY_DATE
+                       : field == RAY_EXTRACT_TIME ? RAY_TIME : RAY_I64;
     ext->base.est_rows = est;
     ext->sym = field;
 

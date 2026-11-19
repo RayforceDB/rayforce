@@ -200,12 +200,12 @@
 (set TDT_nn (table [ts] (list [2024.03.15D14:27:31.500000000 1999.12.31D23:59:59.500000000])))
 
 ;; DAY bucket (.date)
-(at (at (select {s: ts.date from: TDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
-(at (at (select {s: ts.date from: TDT_nn}) 's) 1) -- 1999.12.31D00:00:00.000000000
+(at (at (select {s: ts.date from: TDT_nn}) 's) 0) -- 2024.03.15
+(at (at (select {s: ts.date from: TDT_nn}) 's) 1) -- 1999.12.31
 
 ;; SECOND bucket (.time)
-(at (at (select {s: ts.time from: TDT_nn}) 's) 0) -- 2024.03.15D14:27:31.000000000
-(at (at (select {s: ts.time from: TDT_nn}) 's) 1) -- 1999.12.31D23:59:59.000000000
+(at (at (select {s: ts.time from: TDT_nn}) 's) 0) -- 14:27:31.500
+(at (at (select {s: ts.time from: TDT_nn}) 's) 1) -- 23:59:59.500
 
 ;; YEAR bucket (.year)
 (at (at (select {s: ts.year from: TDT_nn}) 's) 0) -- 2024.01.01D00:00:00.000000000
@@ -228,11 +228,11 @@
 (set DDT_nn (table [d] (list [2024.03.15 2024.07.04 1999.12.31])))
 
 ;; DAY
-(at (at (select {s: d.date from: DDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
-(at (at (select {s: d.date from: DDT_nn}) 's) 2) -- 1999.12.31D00:00:00.000000000
+(at (at (select {s: d.date from: DDT_nn}) 's) 0) -- 2024.03.15
+(at (at (select {s: d.date from: DDT_nn}) 's) 2) -- 1999.12.31
 
 ;; SECOND
-(at (at (select {s: d.time from: DDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: d.time from: DDT_nn}) 's) 0) !- type
 
 ;; YEAR
 (at (at (select {s: d.year from: DDT_nn}) 's) 0) -- 2024.01.01D00:00:00.000000000
@@ -253,12 +253,12 @@
 (set TMT_nn (table [t] (list [01:02:03.500 12:30:45.789 23:59:59.999])))
 
 ;; DAY — TIME has no date component, truncates to epoch midnight
-(at (at (select {s: t.date from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+(at (at (select {s: t.date from: TMT_nn}) 's) 0) !- type
 
 ;; SECOND — strips sub-second
-(at (at (select {s: t.time from: TMT_nn}) 's) 0) -- 2000.01.01D01:02:03.000000000
-(at (at (select {s: t.time from: TMT_nn}) 's) 1) -- 2000.01.01D12:30:45.000000000
-(at (at (select {s: t.time from: TMT_nn}) 's) 2) -- 2000.01.01D23:59:59.000000000
+(at (at (select {s: t.time from: TMT_nn}) 's) 0) -- 01:02:03.500
+(at (at (select {s: t.time from: TMT_nn}) 's) 1) -- 12:30:45.789
+(at (at (select {s: t.time from: TMT_nn}) 's) 2) -- 23:59:59.999
 
 ;; YEAR — TIME epoch is 2000-01-01, year trunc → 2000-01-01
 (at (at (select {s: t.year from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
@@ -282,13 +282,13 @@
 ;; row 0 = 2024-03-15T14:27:31; row 1 = null; row 2 = 1999-12-31T23:30:00
 
 ;; DAY
-(at (at (select {s: ts.date from: TDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
-(at (at (select {s: ts.date from: TDT_wn}) 's) 1) -- 0Np
-(at (at (select {s: ts.date from: TDT_wn}) 's) 2) -- 1999.12.31D00:00:00.000000000
+(at (at (select {s: ts.date from: TDT_wn}) 's) 0) -- 2024.03.15
+(at (at (select {s: ts.date from: TDT_wn}) 's) 1) -- 0Nd
+(at (at (select {s: ts.date from: TDT_wn}) 's) 2) -- 1999.12.31
 
 ;; SECOND
-(at (at (select {s: ts.time from: TDT_wn}) 's) 0) -- 2024.03.15D14:27:31.000000000
-(at (at (select {s: ts.time from: TDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: ts.time from: TDT_wn}) 's) 0) -- 14:27:31.000
+(at (at (select {s: ts.time from: TDT_wn}) 's) 1) -- 0Nt
 
 ;; YEAR
 (at (at (select {s: ts.year from: TDT_wn}) 's) 0) -- 2024.01.01D00:00:00.000000000
@@ -312,13 +312,13 @@
 ;; row 0 = 2024-03-15; row 1 = null; row 2 = 1999-12-31
 
 ;; DAY
-(at (at (select {s: d.date from: DDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
-(at (at (select {s: d.date from: DDT_wn}) 's) 1) -- 0Np
-(at (at (select {s: d.date from: DDT_wn}) 's) 2) -- 1999.12.31D00:00:00.000000000
+(at (at (select {s: d.date from: DDT_wn}) 's) 0) -- 2024.03.15
+(at (at (select {s: d.date from: DDT_wn}) 's) 1) -- 0Nd
+(at (at (select {s: d.date from: DDT_wn}) 's) 2) -- 1999.12.31
 
 ;; SECOND
-(at (at (select {s: d.time from: DDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
-(at (at (select {s: d.time from: DDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: d.time from: DDT_wn}) 's) 0) !- type
+(at (at (select {s: d.time from: DDT_wn}) 's) 1) !- type
 
 ;; YEAR
 (at (at (select {s: d.year from: DDT_wn}) 's) 0) -- 2024.01.01D00:00:00.000000000
@@ -340,13 +340,13 @@
 (set TMT_wn (table [t] (list (as 'TIME [3723000 0N 86399000]))))
 
 ;; DAY
-(at (at (select {s: t.date from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
-(at (at (select {s: t.date from: TMT_wn}) 's) 1) -- 0Np
+(at (at (select {s: t.date from: TMT_wn}) 's) 0) !- type
+(at (at (select {s: t.date from: TMT_wn}) 's) 1) !- type
 
 ;; SECOND
-(at (at (select {s: t.time from: TMT_wn}) 's) 0) -- 2000.01.01D01:02:03.000000000
-(at (at (select {s: t.time from: TMT_wn}) 's) 1) -- 0Np
-(at (at (select {s: t.time from: TMT_wn}) 's) 2) -- 2000.01.01D23:59:59.000000000
+(at (at (select {s: t.time from: TMT_wn}) 's) 0) -- 01:02:03.000
+(at (at (select {s: t.time from: TMT_wn}) 's) 1) -- 0Nt
+(at (at (select {s: t.time from: TMT_wn}) 's) 2) -- 23:59:59.000
 
 ;; YEAR
 (at (at (select {s: t.year from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
@@ -376,8 +376,8 @@
 ;; r < 0 branches in standalone truncate vector path (non-DAG).
 ;; Pre-epoch TIMESTAMP vector via (date V) and (time V).
 
-(date [1999.12.31D12:30:45.500000000 2024.03.15D14:00:00.000000000]) -- [1999.12.31D00:00:00.000000000 2024.03.15D00:00:00.000000000]
-(time [1999.12.31D12:30:45.500000000 2024.03.15D14:00:00.000000000]) -- [1999.12.31D12:30:45.000000000 2024.03.15D14:00:00.000000000]
+(date [1999.12.31D12:30:45.500000000 2024.03.15D14:00:00.000000000]) -- [1999.12.31 2024.03.15]
+(time [1999.12.31D12:30:45.500000000 2024.03.15D14:00:00.000000000]) -- [12:30:45.500 14:00:00.000]
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 15: Standalone ray_temporal_extract — type error branches
@@ -435,15 +435,15 @@
 ;; Covers lines 304-321 of ray_temporal_truncate (TIMESTAMP, nulls).
 ;; 763828051000000000 ns = 2024-03-15T14:27:31
 ;; -1800000000000 ns = 1999-12-31T23:30:00
-(date (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [2024.03.15D00:00:00.000000000 0Np 1999.12.31D00:00:00.000000000]
-(time (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [2024.03.15D14:27:31.000000000 0Np 1999.12.31D23:30:00.000000000]
+(date (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [2024.03.15 0Nd 1999.12.31]
+(time (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [14:27:31.000 0Nt 23:30:00.000]
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 20: Standalone truncate — DATE/TIME vectors, no nulls
 ;; ════════════════════════════════════════════════════════════════════
 ;; Lines 297-303 (DATE/TIME, no nulls).
-(date [2024.03.15 1999.12.31 2000.01.01]) -- [2024.03.15D00:00:00.000000000 1999.12.31D00:00:00.000000000 2000.01.01D00:00:00.000000000]
-(time [12:30:45.500 00:00:00.000 23:59:59.999]) -- [2000.01.01D12:30:45.000000000 2000.01.01D00:00:00.000000000 2000.01.01D23:59:59.000000000]
+(date [2024.03.15 1999.12.31 2000.01.01]) -- [2024.03.15 1999.12.31 2000.01.01]
+(time [12:30:45.500 00:00:00.000 23:59:59.999]) -- [12:30:45.500 00:00:00.000 23:59:59.999]
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 21: ray_temporal_truncate atom — MONTH/HOUR/YEAR kind

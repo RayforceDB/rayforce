@@ -364,14 +364,25 @@ ray_t* ray_extract_dd_fn(ray_t* x)     { return ray_temporal_extract(x, RAY_EXTR
 ray_t* ray_extract_dow_fn(ray_t* x)    { return ray_temporal_extract(x, RAY_EXTRACT_DOW); }
 ray_t* ray_extract_doy_fn(ray_t* x)    { return ray_temporal_extract(x, RAY_EXTRACT_DOY); }
 
+int ray_temporal_whole_from_sym(int64_t sym_id) {
+    ray_t* s = ray_sym_str(sym_id);
+    if (!s) return -1;
+    const char* p = ray_str_ptr(s);
+    size_t n = ray_str_len(s);
+    if (!p || n != 4) return -1;
+    if (memcmp(p, "date", 4) == 0) return RAY_EXTRACT_DATE;
+    if (memcmp(p, "time", 4) == 0) return RAY_EXTRACT_TIME;
+    return -1;
+}
+
 int ray_temporal_trunc_from_sym(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
     if (!s) return -1;
     const char* p = ray_str_ptr(s);
     size_t n = ray_str_len(s);
     if (!p) return -1;
-    if (n == 4 && memcmp(p, "date",  4) == 0) return RAY_EXTRACT_DAY;
-    if (n == 4 && memcmp(p, "time",  4) == 0) return RAY_EXTRACT_SECOND;
+    /* "date" / "time" are not truncations: they answer a DATE / TIME
+     * (ray_temporal_whole_from_sym). */
     if (n == 5 && memcmp(p, "month", 5) == 0) return RAY_EXTRACT_MONTH;
     if (n == 4 && memcmp(p, "hour",  4) == 0) return RAY_EXTRACT_HOUR;
     if (n == 4 && memcmp(p, "year",  4) == 0) return RAY_EXTRACT_YEAR;
@@ -603,6 +614,11 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
     if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
 
     int64_t field = ext->sym;
+    if (field == RAY_EXTRACT_DATE || field == RAY_EXTRACT_TIME) {
+        ray_t* r = ray_temporal_to(field == RAY_EXTRACT_DATE ? RAY_DATE : RAY_TIME, input);
+        ray_release(input);
+        return r;
+    }
     /* A literal (`(year 2020.01.01)`) arrives as an atom, whose len field
      * aliases its value: the date became a vector of 7305 rows.  The atom
      * path of the builtin answers it as one value. */
@@ -916,16 +932,37 @@ int64_t ray_timestamp_now_ns(void) {
     return unix_now_ns() - (int64_t)ray_epoch_offset() * 1000000000LL;
 }
 
+/* The DATE (`want == RAY_DATE`) or TIME (`RAY_TIME`) of a temporal value or
+ * vector: a DATE or TIME is itself, a TIMESTAMP answers the date or the
+ * time of day of its instant, nulls stay null.  Anything else, including a
+ * TIME asked for its date and a DATE asked for its time of day (neither
+ * carries the other), is a type error.  Goes through `as`, so `(date x)`,
+ * `(time x)`, `x.date`, `x.time` and `(as 'DATE x)` share one kernel and
+ * agree on values, nulls and slices.  `x` is borrowed. */
+ray_t* ray_temporal_to(int8_t want, ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    int8_t t = x->type < 0 ? (int8_t)-x->type : x->type;
+    const char* name = want == RAY_DATE ? "date" : "time";
+    if (t != want && t != RAY_TIMESTAMP)
+        return ray_error("type", "%s: expected %s, got %s", name,
+                         want == RAY_DATE ? "date/timestamp" : "time/timestamp",
+                         ray_type_name(x->type));
+    ray_t* type_sym = ray_sym(ray_sym_intern(want == RAY_DATE ? "DATE" : "TIME", 4));
+    ray_t* r = ray_cast_fn(type_sym, x);
+    ray_release(type_sym);
+    return r;
+}
+
 /* (date 'local) or (date 'global) — returns current date as DATE atom.
- * Overloaded: if arg is a DATE / TIME / TIMESTAMP value or vector,
- * returns `arg` truncated to the day boundary (RAY_TIMESTAMP result).
+ * Overloaded: a DATE is returned as is and a TIMESTAMP (atom or vector) is
+ * answered as the DATE of its day.  A TIME carries no day: type error.
  * This lets `(date ts)` and `ts.date` both flow through the registered
  * unary builtin with no special-case detour. */
 ray_t* ray_date_clock_fn(ray_t* arg) {
     if (arg) {
         int8_t t = arg->type < 0 ? (int8_t)-arg->type : arg->type;
         if (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP)
-            return ray_temporal_truncate(arg, RAY_EXTRACT_DAY);
+            return ray_temporal_to(RAY_DATE, arg);
     }
     bool local = !is_global_arg(arg);
     time_t now = time(NULL);
@@ -947,13 +984,14 @@ ray_t* ray_date_clock_fn(ray_t* arg) {
 }
 
 /* (time 'local) or (time 'global) — returns current time as TIME atom.
- * Overloaded same way as ray_date_clock_fn: temporal argument ⇒
- * truncate to second boundary (RAY_TIMESTAMP); symbol / default ⇒ clock. */
+ * Overloaded the same way: a TIME is returned as is and a TIMESTAMP is
+ * answered as the TIME of its day.  A DATE carries no time of day: type
+ * error. */
 ray_t* ray_time_clock_fn(ray_t* arg) {
     if (arg) {
         int8_t t = arg->type < 0 ? (int8_t)-arg->type : arg->type;
         if (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP)
-            return ray_temporal_truncate(arg, RAY_EXTRACT_SECOND);
+            return ray_temporal_to(RAY_TIME, arg);
     }
     bool local = !is_global_arg(arg);
     int64_t now_ns = unix_now_ns();

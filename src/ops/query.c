@@ -1749,7 +1749,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
          * segments: emit a scan for the head column, then for each
          * subsequent segment look up the name's registered DAG-level
          * emitter and chain it.  `col.ss` → scan(col) → extract(SS),
-         * `col.date` → scan(col) → date_trunc(DAY), etc.  Segment
+         * `col.month` → scan(col) → date_trunc(MONTH), etc.  Segment
          * resolution uses the same name table as the runtime
          * `(ss col)` form, so adding a new accessor means registering
          * one unary builtin (temporal or otherwise) — no bespoke sym
@@ -1777,6 +1777,14 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 int trunc_kind = ray_temporal_trunc_from_sym(segs[i]);
                 if (trunc_kind >= 0) {
                     op = ray_date_trunc(g, op, trunc_kind);
+                    if (!op) return NULL;
+                    continue;
+                }
+                /* `.date` / `.time` answer a DATE / TIME (not a truncation:
+                 * the truncate op answers a TIMESTAMP). */
+                int64_t whole = ray_temporal_whole_from_sym(segs[i]);
+                if (whole >= 0) {
+                    op = ray_extract(g, op, whole);
                     if (!op) return NULL;
                     continue;
                 }

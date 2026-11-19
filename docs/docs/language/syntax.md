@@ -391,7 +391,7 @@ ds.doy           ; [1 167 366]
 (select {from: ts_table by: Ts.hh})     ; group by hour of day
 ```
 
-Recognised temporal segments: `yyyy`, `mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`, plus the two truncations `date` (drop time-of-day) and `time` (drop date). Null input rows propagate to null output rows — the null sentinel bit pattern is not decoded as a bogus calendar value.
+Recognised temporal segments: `yyyy`, `mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`, plus `date` and `time`, which answer the whole `date` and the whole `time` of a `timestamp` (a `date` for `.date`, a `time` for `.time`; a `date` is its own `.date` and a `time` its own `.time`; a `.time` of a `date` and a `.date` of a `time` are type errors). Null input rows propagate to null output rows — the null sentinel bit pattern is not decoded as a bogus calendar value.
 
 ### Reserved `.*` Namespace
 

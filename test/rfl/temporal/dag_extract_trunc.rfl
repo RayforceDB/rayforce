@@ -55,23 +55,23 @@
 ;; TIMESTAMP column with embedded null routed through `.date` (DAY bucket).
 ;; Drives DATE_TRUNC_INNER(1, 0).
 (set Tts (table [ts] (list (as 'TIMESTAMP [86400000000000 0N 172800000000000]))))
-(at (at (select {s: ts.date from: Tts}) 's) 0)          -- 2000.01.02D00:00:00.000000000
-(at (at (select {s: ts.date from: Tts}) 's) 1)          -- 0Np
-(at (at (select {s: ts.time from: Tts}) 's) 1)          -- 0Np
+(at (at (select {s: ts.date from: Tts}) 's) 0) -- 2000.01.02
+(at (at (select {s: ts.date from: Tts}) 's) 1) -- 0Nd
+(at (at (select {s: ts.time from: Tts}) 's) 1) -- 0Nt
 
 ;; DATE column with embedded null routed through `.date`.  IN32=1,
 ;; HAS_NULLS=1; DAY bucket trivially preserves day-aligned input.
 (set Tdd (table [d] (list (as 'DATE [8766 0N 8767]))))
-(at (at (select {s: d.date from: Tdd}) 's) 0)           -- 2024.01.01D00:00:00.000000000
-(at (at (select {s: d.date from: Tdd}) 's) 1)           -- 0Np
+(at (at (select {s: d.date from: Tdd}) 's) 0) -- 2024.01.01
+(at (at (select {s: d.date from: Tdd}) 's) 1) -- 0Nd
 
 ;; TIME column with embedded null routed through `.time` (SECOND bucket).
 ;; IN32=1, HAS_NULLS=1, in_type=RAY_TIME — drives the `* 1000` arm of the
 ;; DATE_TRUNC_INNER ternary that was previously dark.
 (set Ttt (table [t] (list (as 'TIME [3723000 0N 86399999]))))
-(at (at (select {s: t.time from: Ttt}) 's) 0)           -- 2000.01.01D01:02:03.000000000
-(at (at (select {s: t.time from: Ttt}) 's) 1)           -- 0Np
-(at (at (select {s: t.time from: Ttt}) 's) 2)           -- 2000.01.01D23:59:59.000000000
+(at (at (select {s: t.time from: Ttt}) 's) 0) -- 01:02:03.000
+(at (at (select {s: t.time from: Ttt}) 's) 1) -- 0Nt
+(at (at (select {s: t.time from: Ttt}) 's) 2) -- 23:59:59.999
 
 ;; Pre-epoch DATE inside a select to exercise the `us < 0` correction
 ;; in EXTRACT_INNER's `days_since_2000` block (year-decompose branch).
@@ -151,9 +151,9 @@
 ;; SECOND bucket: r=-500000 µs (< 0) → floor 1999-12-31T23:59:59.000000000
 ;; Exercises DT_USEC_PER_DAY and DT_USEC_PER_SEC true arms in DATE_TRUNC_INNER(0,0).
 (set TpreT2 (table [ts] (list [1999.12.31D23:59:59.500000000 1999.12.31D00:00:00.000000000])))
-(at (at (select {s: ts.date from: TpreT2}) 's) 0)          -- 1999.12.31D00:00:00.000000000
-(at (at (select {s: ts.date from: TpreT2}) 's) 1)          -- 1999.12.31D00:00:00.000000000
-(at (at (select {s: ts.time from: TpreT2}) 's) 0)          -- 1999.12.31D23:59:59.000000000
+(at (at (select {s: ts.date from: TpreT2}) 's) 0) -- 1999.12.31
+(at (at (select {s: ts.date from: TpreT2}) 's) 1) -- 1999.12.31
+(at (at (select {s: ts.time from: TpreT2}) 's) 0) -- 23:59:59.500
 
 ;; ─── ray_temporal_trunc_from_sym: return -1 path (line 234) ──────────────
 ;; A dotted temporal field that is NOT in the recognised set
@@ -209,10 +209,10 @@
 ;; SECOND r=-500000 µs (< 0) → floor 1999-12-31T12:30:45.000000000
 ;; Exercises DT_USEC_PER_DAY and DT_USEC_PER_SEC true arms in DATE_TRUNC_INNER(1,0).
 (set TpreT3 (table [ts] (list (as 'TIMESTAMP [-41354500000000 0N 86400000000000]))))
-(at (at (select {s: ts.date from: TpreT3}) 's) 0)   -- 1999.12.31D00:00:00.000000000
-(at (at (select {s: ts.date from: TpreT3}) 's) 1)   -- 0Np
-(at (at (select {s: ts.time from: TpreT3}) 's) 0)   -- 1999.12.31D12:30:45.000000000
-(at (at (select {s: ts.time from: TpreT3}) 's) 1)   -- 0Np
+(at (at (select {s: ts.date from: TpreT3}) 's) 0) -- 1999.12.31
+(at (at (select {s: ts.date from: TpreT3}) 's) 1) -- 0Nd
+(at (at (select {s: ts.time from: TpreT3}) 's) 0) -- 12:30:45.500
+(at (at (select {s: ts.time from: TpreT3}) 's) 1) -- 0Nt
 
 ;; ──────────────── New trunc fields: .year .month .hour ─────────────────────
 ;; Three new RFL bindings (ray_temporal_trunc_from_sym):

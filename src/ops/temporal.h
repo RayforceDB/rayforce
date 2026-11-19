@@ -59,13 +59,23 @@ int ray_temporal_field_from_sym(int64_t sym_id);
  * time-of-day (`kind == 1`, i.e. microseconds within the current day).
  * Returns a freshly-allocated RAY_TIMESTAMP-typed ray_t* (caller-owned);
  * nulls in the input propagate to nulls in the output.  `kind` uses
- * RAY_EXTRACT_DAY (for `.date`) or RAY_EXTRACT_SECOND (for `.time`) so
- * the set of codes stays consistent with exec_date_trunc.  Returns
+ * RAY_EXTRACT_DAY or RAY_EXTRACT_SECOND so the set of codes stays
+ * consistent with exec_date_trunc.  Returns
  * ray_error("type", ...) if input isn't a supported temporal type. */
 ray_t* ray_temporal_truncate(ray_t* input, int kind);
 
+/* The DATE / TIME (`want` = RAY_DATE / RAY_TIME) of a temporal atom or
+ * vector; see the definition.  `x` is borrowed, the result caller-owned. */
+ray_t* ray_temporal_to(int8_t want, ray_t* x);
+
+/* Dotted-segment sym → RAY_EXTRACT_DATE for `date`, RAY_EXTRACT_TIME for
+ * `time`, -1 for any other segment. */
+int ray_temporal_whole_from_sym(int64_t sym_id);
+
 /* Dotted-segment sym → truncate kind (see above).  Returns -1 if the
- * segment isn't one of the truncate-flavoured names (`date` / `time`). */
+ * segment isn't one of the truncate-flavoured names (`month` / `hour` /
+ * `year`); `date` and `time` are not truncations, they answer a DATE and
+ * a TIME (see ray_date_clock_fn). */
 int ray_temporal_trunc_from_sym(int64_t sym_id);
 
 /* Unary builtins: thin wrappers over ray_temporal_extract with the
