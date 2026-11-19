@@ -30,8 +30,10 @@
 #include "fileio.h"
 #ifdef __linux__
 #include <sys/utsname.h>
+#include <sys/vfs.h>
 #include <stdio.h>
 #endif
+#include <stdatomic.h>
 
 #include <limits.h>
 
@@ -152,11 +154,11 @@ ray_err_t ray_file_sync_dir(const char* path) {
     return RAY_OK;
 }
 
-bool ray_file_sync_tree(const char* root) {
-    /* FlushFileBuffers is per handle: no one-call equivalent. */
-    (void)root;
-    return false;
-}
+/* FlushFileBuffers is per handle: no one-call equivalent. */
+int ray_file_sync_tree_begin(const char* root) { (void)root; return RAY_SYNC_TREE_NONE; }
+bool ray_file_sync_tree_end(int handle) { return handle == RAY_SYNC_TREE_SKIP; }
+void ray_file_sync_tree_abort(int handle) { (void)handle; }
+void ray_file_sync_tree_force_fallback(bool on) { (void)on; }
 
 ray_err_t ray_file_rename(const char* old_path, const char* new_path) {
     if (!old_path || !new_path) return RAY_ERR_IO;
@@ -300,6 +302,10 @@ ray_err_t ray_file_sync_dir(const char* path) {
     return (rc == 0) ? RAY_OK : RAY_ERR_IO;
 }
 
+static _Atomic bool sync_tree_forced_fallback = false;
+void ray_file_sync_tree_force_fallback(bool on) {
+    atomic_store_explicit(&sync_tree_forced_fallback,on,memory_order_relaxed);
+}
 #ifdef __linux__
 /* syncfs reports a writeback error only from Linux 5.8; before, it fails for a
  * bad descriptor alone, and a lost write would go unseen. */
@@ -309,27 +315,55 @@ static bool sync_tree_reports_errors(void) {
     if (uname(&u) != 0 || sscanf(u.release,"%d.%d",&major,&minor) != 2) return false;
     return major > 5 || (major == 5 && minor >= 8);
 }
+/* The local filesystems whose sync_fs writes everything back and reports a failed
+ * write. Any other (FUSE answers 0 without asking its server, NFS, overlay and
+ * network filesystems differ) takes the per-file path, which is always right and
+ * only slower. */
+static bool sync_tree_local_fs(int fd) {
+    struct statfs sf;
+    if (fstatfs(fd,&sf) != 0) return false;
+    switch ((unsigned long)sf.f_type) {
+    case 0xEF53UL:       /* ext2/3/4 */
+    case 0x58465342UL:   /* xfs */
+    case 0x9123683EUL:   /* btrfs */
+    case 0xF2F52010UL:   /* f2fs */
+    case 0x01021994UL:   /* tmpfs */
+        return true;
+    default:
+        return false;
+    }
+}
 #endif
-/* Flush everything written under root with one call, where that call reports
- * a failed write. False: not done, the caller syncs each file (a missing tree,
- * an old kernel, another OS). */
-bool ray_file_sync_tree(const char* root) {
-    if (!root) return false;
+int ray_file_sync_tree_begin(const char* root) {
+    if (!root) return RAY_SYNC_TREE_NONE;
+    if (atomic_load_explicit(&sync_tree_forced_fallback,memory_order_relaxed)) return RAY_SYNC_TREE_NONE;
     struct stat st;   /* a missing tree is an error even when fsync is off */
-    if (stat(root,&st) != 0) return false;
-    if (ray_fsync_disabled()) return true;
+    if (stat(root,&st) != 0) return RAY_SYNC_TREE_NONE;
+    if (ray_fsync_disabled()) return RAY_SYNC_TREE_SKIP;
 #ifdef __linux__
-    static int reports = -1;   /* a benign race: every thread computes the same */
-    if (reports < 0) reports = sync_tree_reports_errors();
-    if (!reports) return false;
-    int fd = open(root, O_RDONLY);
-    if (fd < 0) return false;
-    int rc = syncfs(fd);
-    close(fd);
+    if (!sync_tree_reports_errors()) return RAY_SYNC_TREE_NONE;
+    int fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return RAY_SYNC_TREE_NONE;
+    if (!sync_tree_local_fs(fd)) { close(fd); return RAY_SYNC_TREE_NONE; }
+    return fd;
+#else
+    return RAY_SYNC_TREE_NONE;
+#endif
+}
+bool ray_file_sync_tree_end(int handle) {
+    if (handle == RAY_SYNC_TREE_SKIP) return true;
+    if (handle < 0) return false;
+#ifdef __linux__
+    int rc = syncfs(handle);
+    close(handle);
     return rc == 0;
 #else
+    close(handle);
     return false;
 #endif
+}
+void ray_file_sync_tree_abort(int handle) {
+    if (handle >= 0) close(handle);
 }
 
 ray_err_t ray_file_rename(const char* old_path, const char* new_path) {

@@ -434,10 +434,20 @@ The importer writes
 exact native numeric zone indexes while each decoded batch is resident (F32
 currently excluded). STR pools stay local to each partition. Typed SYM imports
 use a shared file dictionary. Group decoding and independent partition writes
-remain parallel; the dictionary is flushed once after workers finish. Column
-files are then synced, followed by each leaf and partition directory, before
-the staged root is published. This avoids syncing a directory after every
-individual column rename while preserving durability at publication.
+remain parallel; the dictionary is flushed once after workers finish. The
+staged tree is then made durable before the root is published. On Linux 5.8 and
+later, on ext4, xfs, btrfs, f2fs or tmpfs, one `syncfs` flushes the filesystem
+holding it: the importer opens the staging directory before its first write, so
+a writeback error is reported whoever else has run `syncfs` meanwhile. That flush
+waits for all the dirty data of the filesystem, other processes' included, so on
+a busy shared volume it can take longer than the import's own data needs, and it
+is neither a check that every column file exists nor interruptible: the writers
+report their own errors and cancellation. On other hosts, other filesystems
+(FUSE and network mounts, whose `syncfs` does not ask the server to persist
+anything), and when the flush fails, every column file, leaf and partition
+directory is synced in turn instead, which finds a failed write itself. This
+avoids syncing a directory after every individual column rename while preserving
+durability at publication.
 
 Parquet conversions write to `<destination>.parquet-partial` and publish the
 result after successful writes. Existing destinations or staging directories
