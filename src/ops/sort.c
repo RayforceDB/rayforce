@@ -3179,10 +3179,10 @@ static ray_t* topk_indices_cmp_single(ray_t* col, uint8_t desc, uint8_t nf,
 }
 
 /* --------------------------------------------------------------------------
- * Top-K bounded-heap selection on a single sort key.
+ * Top-K selection on a single sort key.
  *
- * Replaces a full O(n log n) sort + take-K with O(n log K + K log K) when
- * K << n.  At plan time, the apply_sort_take / projection paths detect
+ * Replaces a full O(n log n) sort + take-K with an O(n + K log K) selection
+ * when K << n.  At plan time, the apply_sort_take / projection paths detect
  * "single sort key + small atom take" and call this in lieu of OP_SORT +
  * OP_HEAD.  Multi-key, take-range, or take-K-near-n cases keep the
  * existing fused sort+limit path (which is already O(n log n) bounded
@@ -3190,27 +3190,216 @@ static ray_t* topk_indices_cmp_single(ray_t* col, uint8_t desc, uint8_t nf,
  *
  * Implementation: encode each row's key to a uint64 (same encoding
  * radix_encode_fn uses, so smaller key = earlier in ASC order, with DESC
- * already pre-flipped).  Maintain a max-heap of K (key, original_idx)
- * pairs; for each row r > K, if r's encoded key is smaller than the
- * heap-top key, replace the top and sift down.  After the scan, sort
- * the K (key, idx) pairs by key ascending — the result is the top-K
- * indices in the user's requested order.
+ * already pre-flipped) and keep the K (key, row)-smallest rows, chunked
+ * over the pool (topk_sel_run); the K are returned sorted by (key, row),
+ * the order of a full sort.
  *
  * Supported types: I64, I32, I16, U8, BOOL, F64, DATE, TIME,
  * TIMESTAMP, plus SYM, STR, and GUID via a comparator heap.  Returns
  * NULL on any unsupported configuration so the caller's fallback path
  * handles it.
  * -------------------------------------------------------------------------- */
-/* Max-heap ordering for the radix bounded top-k: the "greater" (worse)
- * candidate has the larger encoded key, or an equal key with the LARGER
- * original row index.  Carrying the row index as the tie-break makes the heap
- * root the (key, position)-worst element, so evicting it keeps the (key,
- * position)-smallest k — a STABLE top-k that retains the lower original
- * position on ties, matching the full-sort path (key_lt) and key_heapsort's
- * final ordering.  Without the index tie-break the root among equal keys was
- * arbitrary and eviction could drop the row that should have been kept. */
+/* The "greater" (worse) of two candidates has the larger encoded key, or an
+ * equal key with the LARGER original row index.  Carrying the row index as
+ * the tie-break makes the selection keep the (key, position)-smallest k — a
+ * STABLE top-k that retains the lower original position on ties, matching
+ * the full-sort path (key_lt). */
 #define TOPK_PAIR_GT(ka, ia, kb, ib) \
     ((ka) > (kb) || ((ka) == (kb) && (ia) > (ib)))
+
+/* Move the k (key, idx)-smallest of n pairs to [0, k), in any order
+ * (quickselect on key_lt, introsort past the depth bound; the last one or
+ * two places by a linear scan each, a short tail by insertion sort). */
+static void key_select(uint64_t* keys, int64_t* idx, int64_t n, int64_t k) {
+    int64_t lo = 0, hi = n;
+    int depth = 0;
+    for (int64_t nn = n; nn > 1; nn >>= 1) depth++;
+    depth *= 2;
+    while (hi - lo > 32 && k - lo > 2) {
+        if (depth-- == 0) { key_introsort(keys + lo, idx + lo, hi - lo); return; }
+        int64_t mid = lo + (hi - lo) / 2, last = hi - 1, pi;
+        bool ab = key_lt(keys[lo], idx[lo], keys[mid], idx[mid]);
+        bool bc = key_lt(keys[mid], idx[mid], keys[last], idx[last]);
+        bool ac = key_lt(keys[lo], idx[lo], keys[last], idx[last]);
+        if (ab) pi = bc ? mid : (ac ? last : lo);
+        else    pi = ac ? lo  : (bc ? last : mid);
+        uint64_t pk = keys[pi]; keys[pi] = keys[last]; keys[last] = pk;
+        int64_t  pv = idx[pi];  idx[pi]  = idx[last];  idx[last]  = pv;
+        int64_t p = lo;
+        for (int64_t i = lo; i < last; i++)
+            if (key_lt(keys[i], idx[i], pk, pv)) {
+                uint64_t tk = keys[i]; keys[i] = keys[p]; keys[p] = tk;
+                int64_t  ti = idx[i];  idx[i]  = idx[p];  idx[p]  = ti;
+                p++;
+            }
+        keys[last] = keys[p]; keys[p] = pk;
+        idx[last]  = idx[p];  idx[p]  = pv;
+        if (p == k || p + 1 == k) return;
+        if (k < p) hi = p; else lo = p + 1;
+    }
+    if (k - lo > 2) { key_insertion_sort(keys + lo, idx + lo, hi - lo); return; }
+    for (int64_t i = lo; i < k; i++) {
+        int64_t m = i;
+        for (int64_t j = i + 1; j < hi; j++)
+            if (key_lt(keys[j], idx[j], keys[m], idx[m])) m = j;
+        uint64_t tk = keys[i]; keys[i] = keys[m]; keys[m] = tk;
+        int64_t  ti = idx[i];  idx[i]  = idx[m];  idx[m]  = ti;
+    }
+}
+
+/* ---- Chunked top-k over encoded keys ----
+ * Each pool task encodes its rows and keeps those that beat its worker's
+ * threshold, the K-th smallest (key, row) pair the worker has kept so far,
+ * in the worker's buffer of `cap` (> K) pairs.  A full buffer is cut back
+ * to its K smallest (key_select, O(cap)), which raises the threshold.  So a
+ * row that beats the threshold costs O(1) amortized instead of a log2(K)
+ * heap sift: a key rising along the rows under desc: (every row beats it)
+ * is a linear pass.  The threshold compares the row too, so tasks may run
+ * in any order and on any worker: a tie keeps the lower row.  After the
+ * barrier each worker cuts its candidates to K and sorts them, and a merge
+ * of the workers' sorted lists takes the first K. */
+typedef struct {
+    radix_encode_ctx_t enc;
+    int64_t   k, cap;
+    uint64_t* bk;        /* [workers * cap] candidate keys */
+    int64_t*  bi;        /* [workers * cap] candidate rows */
+    int64_t*  cnt;       /* [workers] candidates kept */
+    uint64_t* tk;        /* [workers] threshold key */
+    int64_t*  ti;        /* [workers] threshold row */
+} topk_sel_ctx_t;
+
+static void topk_sel_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
+    topk_sel_ctx_t* c = (topk_sel_ctx_t*)arg;
+    radix_encode_fn(&c->enc, wid, start, end);
+    const uint64_t* keys = c->enc.keys;
+    uint64_t* bk = c->bk + (size_t)wid * (size_t)c->cap;
+    int64_t*  bi = c->bi + (size_t)wid * (size_t)c->cap;
+    int64_t n = c->cnt[wid], k = c->k, cap = c->cap, ti = c->ti[wid];
+    uint64_t tk = c->tk[wid];
+    for (int64_t i = start; i < end; i++) {
+        uint64_t key = keys[i];
+        if (RAY_LIKELY(key > tk || (key == tk && i > ti))) continue;
+        bk[n] = key; bi[n] = i;
+        if (RAY_UNLIKELY(++n == cap)) {
+            key_select(bk, bi, n, k);
+            n = k;
+            tk = bk[0]; ti = bi[0];
+            for (int64_t j = 1; j < k; j++)
+                if (TOPK_PAIR_GT(bk[j], bi[j], tk, ti)) { tk = bk[j]; ti = bi[j]; }
+        }
+    }
+    c->cnt[wid] = n; c->tk[wid] = tk; c->ti[wid] = ti;
+}
+
+/* A worker's candidates: cut to K, sorted ascending. */
+static void topk_sel_sort_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    topk_sel_ctx_t* c = (topk_sel_ctx_t*)arg;
+    for (int64_t w = start; w < end; w++) {
+        uint64_t* bk = c->bk + (size_t)w * (size_t)c->cap;
+        int64_t*  bi = c->bi + (size_t)w * (size_t)c->cap;
+        int64_t n = c->cnt[w];
+        if (n > c->k) { key_select(bk, bi, n, c->k); n = c->k; }
+        key_introsort(bk, bi, n);
+        c->cnt[w] = n;
+    }
+}
+
+#ifdef DEBUG
+static _Atomic(uint64_t) g_topk_chunked;   /* test hook: pool-dispatched top-k selections */
+uint64_t ray_sort_test_topk_chunked(void) { return atomic_load_explicit(&g_topk_chunked, memory_order_relaxed); }
+#endif
+
+/* The K (key, row)-smallest rows of `col` by its radix encoding, in order,
+ * into out[0..k).  0, or -1 on OOM, -2 when the pool's dispatch was
+ * cancelled (its outputs are partial). */
+static int topk_sel_run(ray_t* col, uint8_t desc, uint8_t nf, int64_t nrows,
+                        int64_t k, int64_t* out) {
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+    int64_t nw = par ? (int64_t)ray_pool_total_workers(pool) : 1;
+    /* Room for K + max(K, 512): a cut every K rows at worst for large K
+     * (O(1) a row), and at least 512 rows between cuts for small K, where a
+     * cut every few rows would cost more than a heap sift. */
+    int64_t cap = k + (k > 512 ? k : 512);
+    ray_t *keys_hdr = NULL, *buf_hdr = NULL, *st_hdr = NULL;
+    uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr, (size_t)nrows * sizeof(uint64_t));
+    char* buf = (char*)scratch_alloc(&buf_hdr, (size_t)nw * (size_t)cap * 16);
+    char* st = (char*)scratch_alloc(&st_hdr, (size_t)nw * 24);
+    if (!keys || !buf || !st) {
+        if (keys_hdr) scratch_free(keys_hdr);
+        if (buf_hdr) scratch_free(buf_hdr);
+        if (st_hdr) scratch_free(st_hdr);
+        return -1;
+    }
+    topk_sel_ctx_t c = {
+        .enc = {
+            .keys        = keys,
+            .indices     = NULL,
+            .data        = ray_data(col),
+            .col         = col,
+            .type        = col->type,
+            .col_attrs   = col->attrs,
+            .desc        = desc != 0,
+            .nulls_first = nf != 0,
+            .enum_rank   = NULL,
+            .n_keys      = 1,
+        },
+        .k = k, .cap = cap,
+        .bk = (uint64_t*)buf, .bi = (int64_t*)(buf + (size_t)nw * (size_t)cap * 8),
+        .cnt = (int64_t*)st, .tk = (uint64_t*)(st + (size_t)nw * 8), .ti = (int64_t*)(st + (size_t)nw * 16),
+    };
+    for (int64_t w = 0; w < nw; w++) { c.cnt[w] = 0; c.tk[w] = UINT64_MAX; c.ti[w] = INT64_MAX; }
+    if (par) {
+        ray_pool_dispatch(pool, topk_sel_fn, &c, nrows);
+        if (!pool_cancelled(pool)) ray_pool_dispatch_n(pool, topk_sel_sort_fn, &c, (uint32_t)nw);
+        if (pool_cancelled(pool)) { scratch_free(keys_hdr); scratch_free(buf_hdr); scratch_free(st_hdr); return -2; }
+#ifdef DEBUG
+        atomic_fetch_add_explicit(&g_topk_chunked, 1, memory_order_relaxed);
+#endif
+    } else {
+        topk_sel_fn(&c, 0, 0, nrows);
+        topk_sel_sort_fn(&c, 0, 0, 1);
+    }
+    scratch_free(keys_hdr);
+    /* Merge the workers' sorted lists: a min-heap of workers on their next
+     * candidate (ties: the lower row, so the order is the full sort's). */
+    ray_t* hp_hdr = NULL;
+    int64_t* hp = (int64_t*)scratch_alloc(&hp_hdr, (size_t)nw * 2 * sizeof(int64_t));
+    if (!hp) { scratch_free(buf_hdr); scratch_free(st_hdr); return -1; }
+    int64_t* pos = hp + nw;                  /* per worker: its next candidate */
+    const int64_t* end = c.cnt;              /* per worker: its candidate count */
+    int64_t nh = 0;
+    for (int64_t w = 0; w < nw; w++) {
+        pos[w] = 0;
+        if (end[w] > 0) hp[nh++] = w;
+    }
+#define TOPK_HEAD_LT(a, b) key_lt(c.bk[(size_t)(a) * (size_t)cap + (size_t)pos[a]], c.bi[(size_t)(a) * (size_t)cap + (size_t)pos[a]], \
+                                  c.bk[(size_t)(b) * (size_t)cap + (size_t)pos[b]], c.bi[(size_t)(b) * (size_t)cap + (size_t)pos[b]])
+#define TOPK_HEAD_SIFT(root) do { \
+        int64_t r_ = (root); \
+        for (;;) { \
+            int64_t m_ = r_, l_ = 2 * r_ + 1; \
+            if (l_ < nh && TOPK_HEAD_LT(hp[l_], hp[m_])) m_ = l_; \
+            if (l_ + 1 < nh && TOPK_HEAD_LT(hp[l_ + 1], hp[m_])) m_ = l_ + 1; \
+            if (m_ == r_) break; \
+            int64_t t_ = hp[r_]; hp[r_] = hp[m_]; hp[m_] = t_; r_ = m_; \
+        } \
+    } while (0)
+    for (int64_t h = nh / 2; h > 0; h--) TOPK_HEAD_SIFT(h - 1);
+    for (int64_t o = 0; o < k; o++) {
+        int64_t w = hp[0];
+        out[o] = c.bi[(size_t)w * (size_t)cap + (size_t)pos[w]];
+        if (++pos[w] == end[w]) hp[0] = hp[--nh];
+        if (nh > 0) TOPK_HEAD_SIFT(0);
+    }
+#undef TOPK_HEAD_SIFT
+#undef TOPK_HEAD_LT
+    scratch_free(hp_hdr);
+    scratch_free(buf_hdr);
+    scratch_free(st_hdr);
+    return 0;
+}
 
 static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
                                   int64_t nrows, int64_t k) {
@@ -3230,97 +3419,14 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     if (type == RAY_SYM || type == RAY_STR || type == RAY_GUID)
         return topk_indices_cmp_single(col, desc, nf, nrows, k);
 
-    /* Encode all rows to a single uint64 key array. */
-    ray_t* keys_hdr = NULL;
-    uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr,
-        (size_t)nrows * sizeof(uint64_t));
-    if (!keys) return NULL;
-
-    radix_encode_ctx_t enc = {
-        .keys        = keys,
-        .indices     = NULL,
-        .data        = ray_data(col),
-        .col         = col,
-        .type        = type,
-        .col_attrs   = col->attrs,
-        .desc        = desc != 0,
-        .nulls_first = nf != 0,
-        .enum_rank   = NULL,
-        .n_keys      = 1,
-    };
-    /* Single-threaded encode is plenty for the heap pass that follows;
-     * radix_encode_fn handles the type/desc/nulls dispatch correctly. */
-    radix_encode_fn(&enc, 0, 0, nrows);
-
-    /* Max-heap of K (key, idx) pairs.  Stored in two parallel arrays
-     * for cache locality on the comparison path. */
-    ray_t* hk_hdr = NULL;
-    ray_t* hi_hdr = NULL;
-    uint64_t* hk = (uint64_t*)scratch_alloc(&hk_hdr, (size_t)k * sizeof(uint64_t));
-    int64_t*  hi = (int64_t*)scratch_alloc(&hi_hdr, (size_t)k * sizeof(int64_t));
-    if (!hk || !hi) {
-        if (hk_hdr) scratch_free(hk_hdr);
-        if (hi_hdr) scratch_free(hi_hdr);
-        scratch_free(keys_hdr);
-        return NULL;
-    }
-
-    /* Seed with the first K rows. */
-    for (int64_t i = 0; i < k; i++) { hk[i] = keys[i]; hi[i] = i; }
-
-    /* Heapify (build max-heap on (hk,hi) pairs). */
-    for (int64_t i = k / 2 - 1; i >= 0; i--) {
-        int64_t idx = i;
-        for (;;) {
-            int64_t largest = idx;
-            int64_t l = 2 * idx + 1, r = 2 * idx + 2;
-            if (l < k && TOPK_PAIR_GT(hk[l], hi[l], hk[largest], hi[largest])) largest = l;
-            if (r < k && TOPK_PAIR_GT(hk[r], hi[r], hk[largest], hi[largest])) largest = r;
-            if (largest == idx) break;
-            uint64_t tk = hk[idx]; hk[idx] = hk[largest]; hk[largest] = tk;
-            int64_t  ti = hi[idx]; hi[idx] = hi[largest]; hi[largest] = ti;
-            idx = largest;
-        }
-    }
-
-    /* Scan remaining rows, push when the new key is strictly smaller than the
-     * heap-top key.  Scan indices increase monotonically and every heap slot
-     * holds an index below the current one, so an equal-key row is always the
-     * higher position and correctly skipped; only a strictly-smaller key
-     * displaces the (key,position)-worst root.  Sift the new root down. */
-    for (int64_t i = k; i < nrows; i++) {
-        if (keys[i] >= hk[0]) continue;
-        hk[0] = keys[i];
-        hi[0] = i;
-        int64_t idx = 0;
-        for (;;) {
-            int64_t largest = idx;
-            int64_t l = 2 * idx + 1, r = 2 * idx + 2;
-            if (l < k && TOPK_PAIR_GT(hk[l], hi[l], hk[largest], hi[largest])) largest = l;
-            if (r < k && TOPK_PAIR_GT(hk[r], hi[r], hk[largest], hi[largest])) largest = r;
-            if (largest == idx) break;
-            uint64_t tk = hk[idx]; hk[idx] = hk[largest]; hk[largest] = tk;
-            int64_t  ti = hi[idx]; hi[idx] = hi[largest]; hi[largest] = ti;
-            idx = largest;
-        }
-    }
-
-    /* The heap contains the K best (smallest key) rows but unsorted.
-     * Sort by key ascending so the gather order matches a full sort. */
-    key_heapsort(hk, hi, k);
-
-    /* Build the result I64 vec of indices. */
     ray_t* result = ray_vec_new(RAY_I64, k);
-    if (!result || RAY_IS_ERR(result)) {
-        scratch_free(hk_hdr); scratch_free(hi_hdr);
-        scratch_free(keys_hdr);
-        return result ? result : ray_error("oom", NULL);
-    }
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
     result->len = k;
-    memcpy(ray_data(result), hi, (size_t)k * sizeof(int64_t));
-
-    scratch_free(hk_hdr); scratch_free(hi_hdr);
-    scratch_free(keys_hdr);
+    int rc = topk_sel_run(col, desc, nf, nrows, k, (int64_t*)ray_data(result));
+    if (rc) {
+        ray_release(result);
+        return rc == -2 ? ray_error("cancel", NULL) : NULL;   /* OOM: the full sort's turn */
+    }
     return result;
 }
 #undef TOPK_PAIR_GT
@@ -3418,7 +3524,7 @@ ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
     }
 
     ray_t* idx = topk_indices_single(col, desc, nf, nrows, k);
-    if (!idx) return NULL;
+    if (!idx || RAY_IS_ERR(idx)) return idx;
     return topk_gather_rows(tbl, idx, k);
 }
 

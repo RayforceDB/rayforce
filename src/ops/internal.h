@@ -1633,6 +1633,10 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
  * the shape is not the top-k shortcut's (compact the table and sort). */
 ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit);
 uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered */
+#ifdef DEBUG
+/* Single-key top-k selections run on the pool (topk_sel_run). */
+uint64_t ray_sort_test_topk_chunked(void);
+#endif
 
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);

@@ -3110,6 +3110,67 @@ static test_result_t test_sort_head_late(void) {
     PASS();
 }
 
+/* Issue #1122: the late route's top-k runs on the
+ * pool, a selection per task and a merge.  72000 selected rows of two
+ * partitions are nine tasks; keys rising (up, i: I32), falling (dn),
+ * constant (c), in runs of 3000 across the task edges (d), with nulls (n:
+ * I64, f: F64).  At K 1 and 8192 the late route answers on the pool; at 8193
+ * the full sort does.  Every answer's row ids are the first K of the full
+ * sort over the same rows in memory, materialized before the take so no
+ * top-k answers it (ties by row, nulls where the sort puts them).
+ * The other caller, top/bot, is test/rfl/sort/topk_chunked.rfl. */
+/* Q's row ids are the first k of the full sort held in R0. */
+static bool aw_rows_same(const char* q, int64_t k) {
+    char buf[400];
+    snprintf(buf, sizeof buf, "(set Q %s)", q); aw_eval_ok(buf);
+    snprintf(buf, sizeof buf, "(set R (take R0 %lld))", (long long)k); aw_eval_ok(buf);
+    ray_t* v = ray_eval_str("(and (== (count Q) (count R)) (all (== (at Q 'r) (at R 'r))))");
+    bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+    if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+    return ok;
+}
+
+static test_result_t test_sort_head_late_chunked(void) {
+#define AW_TKC_COLS(R) "(table [r up dn c d n f i] (list " R " " R " (- 0 " R ") (+ 7 (* 0 " R ")) (div " R " 3000) " \
+    "(+ (% (* " R " 7919) 1000) (at [0 0N] (+ 0 (== 0 (% " R " 97))))) " \
+    "(+ (* 0.5 (% " R " 5000)) (at [0.0 0Nf] (+ 0 (== 0 (% " R " 89))))) (as 'I32 " R ")))"
+    for (int p = 0; p < 2; p++) {
+        char q[1200];
+        /* the columns read their rows from X */
+        snprintf(q, sizeof q, "(set X (table [r] (list (+ %d (til 40000)))))", p * 40000);
+        aw_eval_ok(q);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/tkc/2024.01.0%d/t/\" %s \"" AW_TMP "/tkc/.sym\" {compress: false})",
+                 p + 1, AW_TKC_COLS("(at X 'r)"));
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set X (table [r] (list (til 80000))))");
+    aw_eval_ok("(set F " AW_TKC_COLS("(at X 'r)") ")");
+    aw_eval_ok("(set T (.db.parted.get \"" AW_TMP "/tkc\" 't))");
+#undef AW_TKC_COLS
+    static const char* const keys[] = { "up", "dn", "c", "d", "n", "f", "i" };
+    static const int64_t ks[] = { 1, 8192, 8193 };
+    ray_pool_t* pool = ray_pool_get();
+    const bool workers = pool && pool->n_workers > 0;
+    char q[300];
+    for (size_t k = 0; k < sizeof keys / sizeof *keys; k++)
+        for (int d = 0; d < 2; d++) {
+            const char* dir = d ? "desc" : "asc";
+            snprintf(q, sizeof q, "(set R0 (select {from: F where: (> (%% r 10) 0) %s: %s}))", dir, keys[k]);
+            aw_eval_ok(q);
+            for (size_t j = 0; j < sizeof ks / sizeof *ks; j++) {
+                snprintf(q, sizeof q, "(select {from: T where: (> (%% r 10) 0) %s: %s take: %lld})", dir, keys[k], (long long)ks[j]);
+                uint64_t h0 = ray_sort_test_late_heads(), c0 = ray_sort_test_topk_chunked();
+                bool same = aw_rows_same(q, ks[j]);
+                uint64_t late = ray_sort_test_late_heads() - h0, chunked = ray_sort_test_topk_chunked() - c0;
+                TEST_ASSERT_FMT(same, "%s: differs from the full sort's first rows", q);
+                TEST_ASSERT_FMT(late == (ks[j] <= 8192 ? 1u : 0u), "%s: %llu late heads", q, (unsigned long long)late);
+                TEST_ASSERT_FMT(chunked >= (ks[j] <= 8192 && workers ? 1u : 0u), "%s: top-k not on the pool", q);
+            }
+        }
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set T 0)"); aw_eval_ok("(set F 0)"); aw_eval_ok("(set X 0)");
+    PASS();
+}
+
 /* First-n on runs: keys whose vectors are run views (h: runs of 11; s: a
  * SYM in runs of 7, every 13th run "", the in-band null) are probed once
  * per span of equal tuples, without decoding (agg_firstn_runs).  h decodes
@@ -4854,7 +4915,7 @@ static test_result_t test_pool_clamp(void) {
     static test_result_t (*const fns[])(void) = {
         test_scalar_route_mixed, test_eq_runs_lack, test_filter_encoded_leaves, test_scalar_route_stats,
         test_count_on_runs, test_group_count_on_runs, test_topk_prune_cases,
-        test_gather_sym_points, test_sort_head_late, test_group_topn_ties, test_group_topn_nulls,
+        test_gather_sym_points, test_sort_head_late, test_sort_head_late_chunked, test_group_topn_ties, test_group_topn_nulls,
         test_group_topn_affine, test_group_affine_nulls,
     };
     static const uint32_t caps[] = { 7, 3 };
@@ -5652,6 +5713,7 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_raw_points",  test_gather_raw_points,  aw_setup, aw_teardown },
     { "aware/gather_sym_points",  test_gather_sym_points,  aw_setup, aw_teardown },
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
+    { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },
