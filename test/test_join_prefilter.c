@@ -387,12 +387,33 @@ static test_result_t test_jp_file_domain(void) {
     TEST_ASSERT(lv && lv->type == RAY_SYM, "splayed SYM key");
     TEST_ASSERT(ray_sym_vec_domain(lv) != ray_sym_runtime_domain(),
                 "splayed SYM key is in a file domain");
-    TEST_ASSERT((lv->attrs & RAY_SYM_W_MASK) != RAY_SYM_W64, "splayed SYM key is narrow");
+    TEST_ASSERT_EQ_I(lv->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);   /* the W8 reader */
     ray_t* rv = ray_table_col(rf, ray_sym_intern("instrument", 10));
     TEST_ASSERT(rv && ray_sym_vec_domain(rv) == ray_sym_vec_domain(lv),
                 "both splayed tables share one domain");
+    /* The same FILE-domain ids widened to W64: an 8-byte column that still
+     * needs translation, so it must not take the untranslated 8-byte probe
+     * variant (join_pf_single64 requires !lut). */
+    int64_t nl = ray_table_nrows(lf);
+    ray_t* w64 = ray_sym_vec_new(RAY_SYM_W64, nl);
+    TEST_ASSERT(w64 && !RAY_IS_ERR(w64), "W64 column");
+    w64->len = nl;
+    for (int64_t i = 0; i < nl; i++)
+        ray_write_sym(ray_data(w64), i,
+                      (uint64_t)ray_read_sym(ray_data(lv), i, RAY_SYM, lv->attrs),
+                      RAY_SYM, w64->attrs);
+    ray_sym_vec_adopt_domain(w64, lv);
+    TEST_ASSERT(ray_sym_vec_domain(w64) == ray_sym_vec_domain(lv), "W64 keeps the file domain");
+    ray_t* lw = jp_add(ray_table_new(1), "instrument", w64);
+    jp_bind("LW", lw);
     jp_bind("LF", lf);
     jp_bind("RF", rf);
+
+    int64_t rows_w = 0;
+    JP_DIFF("(inner-join [instrument] LW R)", 1, rows_w);
+    TEST_ASSERT(rows_w > 0, "W64 file-domain keys match runtime keys");
+    JP_DIFF("(left-join [instrument] LW R)", 1, rows_w);
+    TEST_ASSERT_EQ_I(rows_w, JP_NL);
 
     int64_t rows = 0, rows_f = 0;
     JP_DIFF("(inner-join [venue instrument] LF R)", 1, rows);
@@ -427,6 +448,77 @@ static test_result_t test_jp_int_offset(void) {
     PASS();
 }
 
+/* One integer key column of `type` (I16, DATE, TIME, U8, BOOL) holding
+ * vals[0..n), with a null at every row where nulls[r] is set. */
+static ray_t* jp_int_vec(int8_t type, const int64_t* vals, const bool* nulls, int64_t n) {
+    ray_t* v = ray_vec_new(type, n ? n : 1);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    for (int64_t r = 0; r < n; r++) {
+        switch (type) {
+        case RAY_I16: ((int16_t*)ray_data(v))[r] = (int16_t)vals[r]; break;
+        case RAY_DATE: case RAY_TIME: case RAY_I32:
+                      ((int32_t*)ray_data(v))[r] = (int32_t)vals[r]; break;
+        default:      ((uint8_t*)ray_data(v))[r] = (uint8_t)vals[r]; break;
+        }
+    }
+    for (int64_t r = 0; r < n; r++)
+        if (nulls && nulls[r]) ray_vec_set_null(v, r, true);
+    return v;
+}
+
+/* Every cell width the filter reads, besides SYM (two_key_mixed_widths,
+ * file_domain) and I64 (int_offset).  Signed classes carry negative values
+ * and a null on both sides: a null must find the right side's null, a
+ * negative must find its match, so reading the cells at the wrong width or
+ * signedness changes the answer.  U8 and BOOL cannot hold a null. */
+static test_result_t test_jp_width_classes(void) {
+    static const int8_t types[] = { RAY_I16, RAY_DATE, RAY_TIME, RAY_U8, RAY_BOOL };
+    int64_t* lv = malloc(JP_NL * sizeof *lv);
+    bool*    ln = malloc(JP_NL * sizeof *ln);
+    TEST_ASSERT(lv && ln, "fixture allocation");
+    for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
+        int8_t ty = types[t];
+        bool sgn = ty != RAY_U8 && ty != RAY_BOOL;
+        for (int64_t r = 0; r < JP_NL; r++) {
+            lv[r] = ty == RAY_BOOL ? r % 2 : sgn ? r % 97 - 10 : r % 97;
+            ln[r] = sgn && r % 11 == 0;
+        }
+        static const int64_t rv_s[] = { 3, 50, -5, 0 };
+        static const bool    rn_s[] = { false, false, false, true };
+        static const int64_t rv_u[] = { 3, 50 };
+        static const int64_t rv_b[] = { 1 };
+        const int64_t* rv = ty == RAY_BOOL ? rv_b : sgn ? rv_s : rv_u;
+        int64_t rn = ty == RAY_BOOL ? 1 : sgn ? 4 : 2;
+        int64_t* px = malloc(JP_NL * sizeof *px);
+        TEST_ASSERT(px, "px");
+        for (int64_t r = 0; r < JP_NL; r++) px[r] = r;
+        ray_t* lt = ray_table_new(2);
+        lt = jp_add(lt, "k", jp_int_vec(ty, lv, ln, JP_NL));
+        lt = jp_add(lt, "px", ray_vec_from_raw(RAY_I64, px, JP_NL));
+        ray_t* rt = ray_table_new(2);
+        rt = jp_add(rt, "k", jp_int_vec(ty, rv, sgn ? rn_s : NULL, rn));
+        rt = jp_add(rt, "w", ray_vec_from_raw(RAY_I64, px, rn));
+        free(px);
+        TEST_ASSERT_EQ_I(ray_table_get_col_idx(lt, 0)->type, ty);
+        jp_bind("L", lt);
+        jp_bind("R", rt);
+
+        int64_t rows = 0, want = 0;
+        for (int64_t r = 0; r < JP_NL; r++) {
+            if (ln[r]) { want += sgn; continue; }       /* null finds the null */
+            for (int64_t j = 0; j < rn; j++)
+                if (!(sgn && rn_s[j]) && rv[j] == lv[r]) want++;
+        }
+        JP_DIFF("(inner-join [k] L R)", 1, rows);
+        TEST_ASSERT_EQ_I(rows, want);
+        JP_DIFF("(left-join [k] L R)", 1, rows);
+        TEST_ASSERT_EQ_I(rows, JP_NL);
+    }
+    free(lv); free(ln);
+    PASS();
+}
+
 /* The knob alone turns the filter off. */
 static test_result_t test_jp_knob(void) {
     jp_bind("L", jp_left(JP_NL, RAY_SYM_W16, RAY_SYM_W16, 0));
@@ -456,6 +548,7 @@ const test_entry_t join_prefilter_entries[] = {
     { "join_prefilter/all_match",            test_jp_all_match,            jp_setup, jp_teardown },
     { "join_prefilter/file_domain",          test_jp_file_domain,          jp_setup, jp_teardown },
     { "join_prefilter/int_offset",           test_jp_int_offset,           jp_setup, jp_teardown },
+    { "join_prefilter/width_classes",        test_jp_width_classes,        jp_setup, jp_teardown },
     { "join_prefilter/knob",                 test_jp_knob,                 jp_setup, jp_teardown },
     { NULL, NULL, NULL, NULL },
 };
