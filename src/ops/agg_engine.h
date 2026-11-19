@@ -129,6 +129,7 @@ typedef struct {
     int64_t topn_kept;              /* groups kept by that selection (ties included) */
     uint64_t first_n;               /* unordered take: N answered by the first-N pre-pass */
     uint64_t first_n_sel;           /* ...of which read a where: selection in place */
+    uint64_t key_where_deferred;    /* key where: filters moved after the group (parted key) */
     uint32_t ts_tasks;              /* last table-stack run: phase-1 tasks */
     uint32_t ts_scatter_tasks;      /* ...of which switched to raw scatter */
     uint64_t ts_tables;             /* ...tables created across all tasks */
@@ -146,6 +147,7 @@ typedef struct {
 enum { AGG_RADIX_P1_TWO_PASS = 1, AGG_RADIX_P1_FUSED_RECORDS, AGG_RADIX_P1_FUSED_COMPACT };
 void agg_route_reset(void);
 void agg_route_note_key_domain(void);
+void agg_route_note_key_where_deferred(void);
 void agg_route_note_vocab_order(void);
 void agg_route_note_da_lazy(uint64_t skipped_chunks);
 agg_route_stats_t agg_route_stats(void);

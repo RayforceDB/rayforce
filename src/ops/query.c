@@ -19784,6 +19784,7 @@ by_dict_done:
         can_defer_single_key_where(by_expr, where_expr, tbl)) {
         post_group_where_expr = where_expr;
         where_expr = NULL;
+        agg_route_note_key_where_deferred();
     }
 
     /* OP_FILTERED_GROUP has been retired.  The (select … where … by …)
