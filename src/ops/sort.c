@@ -3782,14 +3782,14 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
                 uint8_t desc = ext->sort.desc ? ext->sort.desc[0] : 0;
                 ray_t* topk_res = ray_topk_table(tbl, key_cols[0], desc, topk_key_nf(ext, 0), limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
-                if (topk_res && RAY_IS_ERR(topk_res)) ray_release(topk_res);
+                if (topk_res && RAY_IS_ERR(topk_res)) ray_error_free(topk_res);
             } else {
                 uint8_t nfs[16];
                 for (uint32_t k = 0; k < n_sort; k++) nfs[k] = topk_key_nf(ext, k);
                 ray_t* topk_res = ray_topk_table_multi(tbl, key_cols,
                     ext->sort.desc, nfs, n_sort, limit);
                 if (topk_res && !RAY_IS_ERR(topk_res)) return topk_res;
-                if (topk_res && RAY_IS_ERR(topk_res)) ray_release(topk_res);
+                if (topk_res && RAY_IS_ERR(topk_res)) ray_error_free(topk_res);
             }
             /* topk_res == NULL → unsupported config, fall through. */
         }
