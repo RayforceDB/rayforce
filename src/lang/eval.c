@@ -5185,6 +5185,7 @@ static void ray_register_builtins(void) {
      * allocation) and recurses through atomic_map_binary for the rare
      * (collection, collection) zip case. */
     register_binary("xbar",    RAY_FN_NONE,   ray_xbar_fn);
+    register_binary("trunc",   RAY_FN_NONE,   ray_trunc_fn);
 
     /* Join operations */
     register_vary("left-join",   RAY_FN_NONE, ray_left_join_fn);
