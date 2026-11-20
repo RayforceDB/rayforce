@@ -985,8 +985,8 @@ static bool group_keys_have_bool(ray_t* by_expr, ray_t* tbl) {
  *
  * Top-K fast path: when there is exactly one sort key (a single column
  * name), an atom take with K << nrows, and the result is a flat table
- * with no LIST columns, dispatch to ray_topk_table — bounded-heap
- * selection in O(n log K) instead of full sort + gather. */
+ * with no LIST columns, dispatch to ray_topk_table — a partial
+ * selection instead of full sort + gather. */
 /* The sort keys a select names in asc:/desc: — a symbol atom or a symbol
  * vector each.  Calls fn(name, ctx) per key; stops early on nonzero. */
 static int select_for_each_sort_key(ray_t** dict_elems, int64_t dict_n,
