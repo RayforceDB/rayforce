@@ -3183,8 +3183,9 @@ static test_result_t test_sort_head_late_chunked(void) {
  * (ray_pool_test_cancel_at): a cancel request, then the pool's flag alone.
  * Each run answers `cancel` or the uncancelled answer, and a cancelled run
  * leaves no block of the calling thread's heap behind (the cancel error
- * handed through ray_topk_table is freed, not released).  Then the
- * selection's buffers stay within the rows for a K near them. */
+ * handed through ray_topk_table is freed, not released); top V 60000
+ * selects in place.  Then the selection's buffers stay under half the
+ * rows, and a K past that selects in place. */
 static int64_t aw_live_blocks(void) {
     ray_mem_stats_t st;
     ray_mem_stats(&st);
@@ -3207,6 +3208,7 @@ static test_result_t test_topk_cancel_at_dispatch(void) {
         { "(select {from: T where: (> (% r 10) 0) desc: up take: 8192})",
           "(all (== (at Q 'r) (take (reverse (at (select {from: T where: (> (% r 10) 0)}) 'r)) 8192)))" },
         { "(top V 8192)", "(all (== Q (take (reverse V) 8192)))" },
+        { "(top V 60000)", "(all (== Q (take (reverse V) 60000)))" },
         { "(bot (reverse V) 5)", "(all (== Q (til 5)))" },
     };
     int cancelled = 0, answered = 0;
@@ -3239,17 +3241,21 @@ static test_result_t test_topk_cancel_at_dispatch(void) {
                 answered++;
             }
     TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
-    /* the buffers: one range per worker at K 8192 of 200000 rows, fewer as
-     * K nears the rows, never more pairs than the rows (plus one a range) */
-    static const int64_t big[] = { 8192, 60000, 150000, 199999 };
+    /* the buffers: one range per worker at K 8192 of 200000 rows (4 x
+     * 16384 pairs); from K 12500 on (4 x 25000 pairs, half the rows) the
+     * selection runs in place, no buffers, still a range per worker */
+    static const int64_t big[] = { 8192, 12499, 12500, 60000, 150000, 199999 };
     for (size_t i = 0; i < sizeof big / sizeof *big; i++) {
         char q[200];
         snprintf(q, sizeof q, "(set Q (top V %lld))", (long long)big[i]);
-        uint64_t c0 = ray_sort_test_topk_chunked();
+        uint64_t c0 = ray_sort_test_topk_chunked(), p0 = ray_sort_test_topk_inplace();
         aw_eval_ok(q);
         int64_t pairs = ray_sort_test_topk_pairs();
-        TEST_ASSERT_FMT(pairs > big[i] && pairs <= 200000 + 8, "top %lld: %lld buffer pairs", (long long)big[i], (long long)pairs);
-        TEST_ASSERT_FMT((ray_sort_test_topk_chunked() > c0) == (big[i] == 8192), "top %lld: pool use", (long long)big[i]);
+        bool place = big[i] >= 12500;
+        TEST_ASSERT_FMT(place ? pairs == 0 : pairs > big[i] && pairs <= 100000,
+                        "top %lld: %lld buffer pairs", (long long)big[i], (long long)pairs);
+        TEST_ASSERT_FMT((ray_sort_test_topk_inplace() > p0) == place, "top %lld: in place", (long long)big[i]);
+        TEST_ASSERT_FMT(ray_sort_test_topk_chunked() > c0, "top %lld: pool use", (long long)big[i]);
         snprintf(q, sizeof q, "(all (== Q (take (reverse V) %lld)))", (long long)big[i]);
         ray_t* v = ray_eval_str(q);
         bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
@@ -3257,6 +3263,62 @@ static test_result_t test_topk_cancel_at_dispatch(void) {
         TEST_ASSERT_FMT(ok, "top %lld: not the full sort's first rows", (long long)big[i]);
     }
     aw_eval_ok("(set Q 0)"); aw_eval_ok("(set T 0)"); aw_eval_ok("(set V 0)"); aw_eval_ok("(set X 0)");
+    PASS();
+}
+
+/* The in-place top-k (#1122): a K near the rows selects within the keys
+ * and a row index array, one range per worker (70000 rows at K 8192, 4
+ * workers: 17500-row ranges), or one range off the pool (20000 rows at K
+ * 8000); K 1 keeps buffers.  Keys in runs of 3000 across the range edges
+ * (d), constant (c), with nulls (n: I64, f: F64), rising (up) and falling
+ * (dn).  ray_topk_table (the select shortcut's table route; an in-memory
+ * select takes the fused top-k) answers rows whose ids are the full sort's
+ * first K, asc and desc (ties by row, nulls where the sort puts them), and
+ * top/bot over the key's vector answer its sorted values. */
+static test_result_t test_topk_inplace(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const char* const keys[] = { "d", "c", "n", "f", "up", "dn" };
+    static const struct { int64_t rows, k; bool place, pool; } cs[] = {
+        { 70000, 8192, true, true }, { 70000, 1, false, true }, { 20000, 8000, true, false },
+    };
+    char q[600];
+    for (size_t j = 0; j < sizeof cs / sizeof *cs; j++) {
+        snprintf(q, sizeof q, "(set X (til %lld))", (long long)cs[j].rows);
+        aw_eval_ok(q);
+        aw_eval_ok("(set F (table [r d c n f up dn] (list X (div X 3000) (+ 7 (* 0 X)) "
+                   "(+ (% (* X 7919) 1000) (at [0 0N] (+ 0 (== 0 (% X 97))))) "
+                   "(+ (* 0.5 (% X 5000)) (at [0.0 0Nf] (+ 0 (== 0 (% X 89))))) X (- 0 X))))");
+        ray_t* tbl = ray_eval_str("F");
+        TEST_ASSERT_FMT(tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE, "F: %s", ray_error_msg());
+        for (size_t k = 0; k < sizeof keys / sizeof *keys; k++)
+            for (int d = 0; d < 2; d++) {
+                const char* dir = d ? "desc" : "asc";
+                snprintf(q, sizeof q, "(set R0 (select {from: F %s: %s}))", dir, keys[k]);
+                aw_eval_ok(q);
+                ray_t* col = ray_table_col(tbl, ray_sym_intern(keys[k], strlen(keys[k])));
+                TEST_ASSERT_FMT(col && !RAY_IS_ERR(col), "F.%s", keys[k]);
+                uint64_t p0 = ray_sort_test_topk_inplace(), c0 = ray_sort_test_topk_chunked();
+                ray_t* got = ray_topk_table(tbl, col, (uint8_t)d, sort_nulls_first((uint8_t)d), cs[j].k);
+                uint64_t placed = ray_sort_test_topk_inplace() - p0, pooled = ray_sort_test_topk_chunked() - c0;
+                TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%lld rows, %s %s: no top-k", (long long)cs[j].rows, dir, keys[k]);
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                snprintf(q, sizeof q, "(set R (take R0 %lld))", (long long)cs[j].k);
+                aw_eval_ok(q);
+                snprintf(q, sizeof q, "(and (== (count Q) (count R)) (all (== (at Q 'r) (at R 'r))) "
+                         "(all (== (%s (at F '%s) %lld) (at R '%s))))", d ? "top" : "bot", keys[k], (long long)cs[j].k, keys[k]);
+                ray_t* v = ray_eval_str(q);
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                TEST_ASSERT_FMT(ok, "%lld rows, %s %s take %lld: not the full sort's first rows",
+                                (long long)cs[j].rows, dir, keys[k], (long long)cs[j].k);
+                TEST_ASSERT_FMT(placed == (cs[j].place ? 1u : 0u), "%lld rows, %s %s: in place", (long long)cs[j].rows, dir, keys[k]);
+                TEST_ASSERT_FMT((pooled > 0) == cs[j].pool, "%lld rows, %s %s: pool use", (long long)cs[j].rows, dir, keys[k]);
+            }
+        ray_release(tbl);
+    }
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R 0)"); aw_eval_ok("(set R0 0)"); aw_eval_ok("(set F 0)"); aw_eval_ok("(set X 0)");
     PASS();
 }
 
@@ -5804,6 +5866,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
+    { "aware/topk_inplace", test_topk_inplace, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },
     { "aware/sparse_walk_points", test_sparse_walk_points, aw_setup, aw_teardown },
