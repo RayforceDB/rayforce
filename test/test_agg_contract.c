@@ -5617,9 +5617,9 @@ static test_result_t test_cd_route_key_proj(void) {
  * Keys whose first-seen order is not their key order (k*7919 mod m), with
  * and without a where:, a key with nulls, a SYM key, a composite key, a
  * take past the group count (2000 over 40 groups; 200000 over kl's 150003
- * at 300,000 rows, past the pick's small set: every group, in first-seen
- * order, as `(count x)` gives them), and a key whose 4th group first shows
- * past the small set's row budget (kl, take 5).  Flat at 3,000 and 300,000
+ * at 300,000 rows, with the pick's small set off: every group, in
+ * first-seen order, as `(count x)` gives them), and a key whose 4th group
+ * first shows past the small set's row budget (kl, take 5).  Flat at 3,000 and 300,000
  * rows, and parted (which the rewrite declines).  The answer is the
  * groups' keys and counts ordered by first selected row, the count taken
  * over an expression (not the rewrite's shape); `(count x)` under the same
@@ -5699,6 +5699,8 @@ static test_result_t test_cd_first_n_take(void) {
                                     fck ? ray_str_ptr(fck) : "", fwk ? ray_str_ptr(fwk) : "");
                     if (fwk) ray_release(fwk);
                     if (fck) ray_release(fck);
+                    /* 200000 finds every group's first row, past the small set */
+                    ray_query_test_cd_firstn_set_max(takes[n] == 200000 ? 0 : -1);
                     for (int r = 0; r < (parted ? 1 : 2); r++) {   /* the gate, the rewrite; parted: never the rewrite */
                         snprintf(q, sizeof q, "(do (set R (select {from: Tf%s by: %s u: (count (distinct x))"
                                  " take: %d})) (list %s (at R 'u)))", wh[w], ks[k].by, takes[n], ks[k].cols);
@@ -5721,6 +5723,7 @@ static test_result_t test_cd_first_n_take(void) {
                                         fg ? ray_str_ptr(fg) : "", fw ? ray_str_ptr(fw) : "");
                         if (fg) ray_release(fg);
                     }
+                    ray_query_test_cd_firstn_set_max(-1);
                     if (fw) ray_release(fw);
                 }
             }
@@ -5742,7 +5745,8 @@ static test_result_t test_cd_first_n_take(void) {
  * (ray_heap_test_scribble): each run is `cancel` leaving no block behind,
  * or the answer, never a pick read from unwritten buffers (a permutation
  * of garbage indexed the first rows out of bounds).  The small set (take
- * 5), past it (100000 of 150000 groups) and every group (200000).  No
+ * 5 and 100000 of 150000 groups), and with it off 100000 and every group
+ * (200000).  No
  * where: until the gate's sample of it checks for a cancel (#1246).
  * Pinned at 8 workers. */
 /* Blocks live over every heap: a worker's block the main thread frees
@@ -5762,16 +5766,19 @@ static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
     ray_t* setup = ray_eval_str("(set zi (til 150000))"
         " (set Tz (table [kh k2 x i] (list (% (* zi 7919) 200003) (% zi 7) (% zi 1000) (% zi 997))))");
     TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
-    static const char* const qs[] = {
-        "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 5})",
-        "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 100000})",
-        "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 200000})",
+    /* cap: the small set's (-1: the default; 0: every group's first row) */
+    static const struct { const char* q; int64_t cap; } qs[] = {
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 5})", -1 },
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 100000})", -1 },
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 100000})", 0 },
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 200000})", 0 },
     };
     int cancelled = 0, answered = 0;
     for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
         ray_query_test_cd_route(1);
-        ray_t* ref = ray_eval_str(qs[i]);
-        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref) && ref->type == RAY_TABLE, "%s", qs[i]);
+        ray_query_test_cd_firstn_set_max(qs[i].cap);
+        ray_t* ref = ray_eval_str(qs[i].q);
+        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref) && ref->type == RAY_TABLE, "%s", qs[i].q);
         ray_t* fr = ray_fmt(ref, 0);
         ray_release(ref);
         ray_heap_test_scribble(true);
@@ -5784,7 +5791,7 @@ static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
                 ray_heap_gc();
                 int64_t live0 = cdn_live_blocks();
                 ray_pool_test_cancel_at((uint32_t)k, mode == 1);
-                ray_t* got = ray_eval_str(qs[i]);
+                ray_t* got = ray_eval_str(qs[i].q);
                 ray_pool_test_cancel_at(0, false);
                 ray_clear_interrupt();
                 atomic_store_explicit(&ray_pool_get()->cancelled, 0, memory_order_relaxed);
@@ -5794,11 +5801,11 @@ static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
                     ray_error_free(got);
                     ray_heap_gc();
                     int64_t live = cdn_live_blocks() - live0;
-                    if (!ok || live) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); }
+                    if (!ok || live) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); ray_query_test_cd_firstn_set_max(-1); }
                     TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: an error other than cancel",
-                                    qs[i], mode, k);
+                                    qs[i].q, mode, k);
                     TEST_ASSERT_FMT(live == 0, "%s, mode %d, cancel before dispatch %d: %lld blocks left",
-                                    qs[i], mode, k, (long long)live);
+                                    qs[i].q, mode, k, (long long)live);
                     cancelled++;
                     continue;
                 }
@@ -5807,8 +5814,8 @@ static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
                 ok = fg && fr && ray_str_len(fg) == ray_str_len(fr) &&
                      memcmp(ray_str_ptr(fg), ray_str_ptr(fr), ray_str_len(fr)) == 0;
                 if (fg) ray_release(fg);
-                if (!ok) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); }
-                TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: not the answer", qs[i], mode, k);
+                if (!ok) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); ray_query_test_cd_firstn_set_max(-1); }
+                TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: not the answer", qs[i].q, mode, k);
                 answered++;
                 if (mode == 0) { last = k - 1; break; }
             }
@@ -5816,6 +5823,7 @@ static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
         if (fr) ray_release(fr);
     }
     ray_query_test_cd_route(0);
+    ray_query_test_cd_firstn_set_max(-1);
     TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
     ray_t* r = ray_eval_str("(set Tz 0) (set zi 0)");
     if (r) ray_release(r);

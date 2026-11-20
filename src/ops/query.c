@@ -11438,9 +11438,18 @@ void ray_query_test_cd_route(int route) { g_cd_gate_force = route; }
  *     found in parallel (the result's keys hashed into a table of result
  *     rows, the selected rows probed against it, an atomic min per group)
  *     and the groups are sorted by it: about one more grouping pass.
+ * The set's cap, measured over 10M rows and 10M groups: take 524288 in
+ * 173 ms from the set, 222 on the full path (dev 165); past it the set
+ * stops paying (take 1M of 2M groups under a where:: 85 ms against 26).
+ * A scan that runs out of budget costs about 15 ms over the full path
+ * alone (take 262144 over keys first seen past 4M rows).
  * Keys read as int64 (agg_key_i64_type); SYM cells of different domains
  * are compared as runtime ids. */
-#define CD_FIRSTN_SET_MAX 65536
+#define CD_FIRSTN_SET_MAX 524288
+static int64_t g_cd_firstn_set_max = CD_FIRSTN_SET_MAX;
+void ray_query_test_cd_firstn_set_max(int64_t cap) {
+    g_cd_firstn_set_max = cap < 0 ? CD_FIRSTN_SET_MAX : cap;
+}
 
 typedef struct {
     ray_t*      col;
@@ -11651,7 +11660,7 @@ static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_
     /* A cancelled dispatch skips the tasks it has not started: each output
      * is read only after a check, and a cancel answers `cancel`. */
 #define CD_FIRSTN_CHECK() do { if (pool_cancelled(pool)) goto cancel; } while (0)
-    if (want <= CD_FIRSTN_SET_MAX) {
+    if (want <= g_cd_firstn_set_max) {
         c.bits = 4;
         while (((int64_t)1 << c.bits) < want * 2) c.bits++;
         size_t cap = (size_t)1 << c.bits;
