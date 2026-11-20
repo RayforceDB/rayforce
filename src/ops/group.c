@@ -14545,19 +14545,66 @@ static bool group_const_input_spreads(ray_graph_t* g, ray_op_t* in, int64_t nrow
     return ray_is_atom(lit) || (ray_is_vec(lit) && (lit->len == 1 || lit->len == nrows));
 }
 
-/* v2 bridge for expression agg inputs — see the call site in
- * exec_group_run.  Returns the v2 result (or an error), or NULL when the
- * shape is ineligible and the caller should continue on the legacy path. */
-/* Does the expression `in` read an encoded column of `tbl` (or columns it
- * cannot name)? */
-static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
-    int64_t syms[64];
-    int n = group_expr_src_syms(g, in->id, syms, 64);
-    if (n < 0) return true;
-    for (int i = 0; i < n; i++) if (ray_table_get_col_enc(tbl, syms[i])) return true;
+/* Does any scan under `in` read a table other than the default one, or is
+ * the subtree too large to walk?  Every opcode is walked, row-local or not. */
+static bool grp_expr_scans_other(ray_graph_t* g, uint32_t root_id) {
+    uint32_t nc = g->node_count;
+    if (nc > 4096 || root_id >= nc) return true;
+    uint32_t stack[64];
+    int sp = 0;
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+    stack[sp++] = root_id;
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        if (nid >= nc || visited[nid]) continue;
+        visited[nid] = true;
+        ray_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+        if (node->opcode == OP_SCAN) {
+            ray_op_ext_t* sx = find_ext(g, nid);
+            if (!sx) return true;
+            uint16_t tbl_id = 0;
+            memcpy(&tbl_id, sx->base.pad, sizeof(uint16_t));
+            if (tbl_id != 0) return true;
+            continue;
+        }
+        for (int i = 0; i < node->arity && i < 2; i++) {
+            if (node->in_id[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return true;
+            stack[sp++] = node->in_id[i];
+        }
+        ray_op_ext_t* nx = find_ext(g, nid);
+        if (nx && nx->third_in != RAY_OP_NONE && nx->third_in != 0) {
+            if (sp >= 64) return true;
+            stack[sp++] = nx->third_in;
+        }
+    }
     return false;
 }
 
+/* Does the expression `in` read an encoded column of `tbl` (or a column it
+ * cannot place)?  An input that reads other rows than its own (a running,
+ * moving or shift function) names no source columns here: it is refused
+ * only when some column of the table is encoded, or a scan under it reads
+ * another table.  Otherwise the executor materializes it over the whole
+ * table (#916) and v2 groups it, first-N pre-pass included (#1234). */
+static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
+    int64_t syms[64];
+    int n = group_expr_src_syms(g, in->id, syms, 64);
+    if (n >= 0) {
+        for (int i = 0; i < n; i++) if (ray_table_get_col_enc(tbl, syms[i])) return true;
+        return false;
+    }
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++)
+        if (ray_table_get_col_enc(tbl, ray_table_col_name(tbl, c))) return true;
+    return grp_expr_scans_other(g, in->id);
+}
+
+/* v2 bridge for expression agg inputs — see the call site in
+ * exec_group_run.  Returns the v2 result (or an error), or NULL when the
+ * shape is ineligible and the caller should continue on the legacy path. */
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                   int64_t group_limit) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;

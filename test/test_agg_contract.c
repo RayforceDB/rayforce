@@ -3477,6 +3477,112 @@ static test_result_t test_group_where_order_dependent(void) {
     PASS();
 }
 
+/* An unordered keyed take keeps the first N groups in first-seen order
+ * (pipeline.md) when a group input is a running function too (#1234).  It
+ * used to fall to the legacy path, which emits the groups in key order,
+ * because the expression bridge could not name the function's columns.  Flat
+ * and parted, with and without a where:, at sizes that take the parallel
+ * routes.  The kept keys are the first N distinct keys of the materialized
+ * where:, and each kept group's value is the whole-table answer (#916): the
+ * same function stored as a column first, then grouped. */
+static test_result_t test_first_n_take_running_input(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_agg_fs_run_%lld", wave_pid());
+    (void)ray_test_rm_rf(dir);
+    char src[1024];
+    snprintf(src, sizeof src,
+        "(set fs_n (til 200000)) "
+        "(set fs_t (table [k h v i] (list (%% (* fs_n 7919) 40) (%% (* fs_n 7919) 60000) "
+        "(%% fs_n 27) (+ 1 (%% fs_n 997))))) "
+        "(.db.splayed.set \"%s/1/t/\" (take fs_t 100000)) "
+        "(.db.splayed.set \"%s/2/t/\" (take fs_t -100000)) "
+        "(set fs_p (.db.parted.get \"%s/\" 't))", dir, dir, dir);
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    /* aggregate, the input it reads, and whether that input is an integer
+     * (the first-N pre-pass serves integer inputs; a float sum regroups) */
+    static const struct { const char* agg; const char* in; bool ints; } aggs[] = {
+        { "max", "(sums i)", true }, { "sum", "(deltas i)", true }, { "sum", "(mavg 2 i)", false },
+    };
+    /* where: ("" for none), and whether the selected rows reach the first-N
+     * pre-pass's parallel threshold */
+    static const struct { const char* w; bool fn; } wh[] = {
+        { "", true }, { " where:(> i 600)", true }, { " where:(== v 5)", false },
+        { " where:(> k 3)", true },
+    };
+    static const char* keys[] = { "k", "h" };
+    static const char* tabs[] = { "fs_t", "fs_p" };
+    for (size_t a = 0; a < sizeof(aggs) / sizeof(aggs[0]); a++) {
+        char buf[512];
+        snprintf(buf, sizeof buf, "(set fs_x (update {from:fs_t x:%s}))", aggs[a].in);
+        ray_t* x = ray_eval_str(buf);
+        TEST_ASSERT_FMT(x && !RAY_IS_ERR(x), "%s: failed", buf);
+        ray_release(x);
+        for (size_t w = 0; w < sizeof(wh) / sizeof(wh[0]); w++)
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            /* first-seen keys of the materialized where: */
+            snprintf(buf, sizeof buf,
+                "(set fs_w (select {from:fs_t%s})) "
+                "(set fs_w (update {from:fs_w rid:(til (count fs_w))})) "
+                "(take (at (xasc (select {from:fs_w by:%s f:(min rid)}) 'f) '%s) 5)",
+                wh[w].w, keys[k], keys[k]);
+            ray_t* first = ray_eval_str(buf);
+            TEST_ASSERT_FMT(first && !RAY_IS_ERR(first) && first->type == RAY_I64 && first->len == 5,
+                            "%s: oracle failed", buf);
+            /* the whole-table answer of every group */
+            snprintf(buf, sizeof buf, "(select {from:fs_x%s by:%s s:(%s x)})",
+                     wh[w].w, keys[k], aggs[a].agg);
+            ray_t* all = ray_eval_str(buf);
+            for (size_t t = 0; t < sizeof(tabs) / sizeof(tabs[0]); t++) {
+                char q[512];
+                snprintf(q, sizeof q, "(select {from:%s%s by:%s s:(%s %s) take:5})",
+                         tabs[t], wh[w].w, keys[k], aggs[a].agg, aggs[a].in);
+                agg_route_reset();
+                ray_t* got = ray_eval_str(q);
+                agg_route_stats_t st = agg_route_stats();
+                TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE, "%s: error", q);
+                TEST_ASSERT_FMT(od_take_rows_in(got, all, 5), "%s: differs from the whole-table column", q);
+                const int64_t* gk = (const int64_t*)ray_data(ray_table_get_col_idx(got, 0));
+                for (int r = 0; r < 5; r++)
+                    TEST_ASSERT_FMT(gk[r] == ((const int64_t*)ray_data(first))[r],
+                                    "%s: group %d is %lld, first-seen is %lld", q, r,
+                                    (long long)gk[r], (long long)((const int64_t*)ray_data(first))[r]);
+                uint64_t v2 = 0;
+                for (int r = AGG_ROUTE_V2_SERIAL_DENSE; r < AGG_ROUTE_COUNT; r++) v2 += st.routes[r];
+                TEST_ASSERT_FMT(st.routes[AGG_ROUTE_LEGACY] == 0 && v2 > 0, "%s: legacy path ran", q);
+                /* 40 groups hold too large a share of the rows for the
+                 * pre-pass: the full run selects their first N itself */
+                bool fn = wh[w].fn && k == 1 && aggs[a].ints;
+                TEST_ASSERT_FMT(!fn || st.first_n == 1, "%s: first-N ran %d times, expected 1",
+                                q, (int)st.first_n);
+                ray_release(got);
+            }
+            ray_release(all);
+            ray_release(first);
+        }
+    }
+    /* An encoded column keeps the legacy path (the bridge would decode the
+     * table's columns whole); its answer is still the whole-table one. */
+    snprintf(src, sizeof src,
+        "(.db.splayed.set \"%s/c/\" fs_t \"%s/c.sym\" {compress: true}) "
+        "(set fs_c (.db.splayed.get \"%s/c/\" \"%s/c.sym\")) "
+        "(set fs_x (update {from:fs_t x:(sums i)}))", dir, dir, dir, dir);
+    setup = ray_eval_str(src);
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    ray_t* all = ray_eval_str("(select {from:fs_x where:(> i 600) by:h s:(max x)})");
+    agg_route_reset();
+    ray_t* got = ray_eval_str("(select {from:fs_c where:(> i 600) by:h s:(max (sums i)) take:5})");
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    TEST_ASSERT_TRUE(agg_route_stats().routes[AGG_ROUTE_LEGACY] >= 1);
+    TEST_ASSERT_TRUE(od_take_rows_in(got, all, 5));
+    ray_release(got); ray_release(all);
+    ray_release(ray_eval_str("(set fs_t 0) (set fs_p 0) (set fs_c 0) (set fs_x 0) (set fs_w 0) (set fs_n 0)"));
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* Unordered take: N under a where: on the key of a parted table (#736).
  * The where: filters the rows before the group instead of the group result
  * (the deferred key filter), so the take reaches the group and the
@@ -5715,6 +5821,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/first_n_take_where", test_first_n_take_where, contract_setup, contract_teardown },
     { "agg_contract/first_n_take_key_where_parted", test_first_n_take_key_where_parted, contract_setup, contract_teardown },
     { "agg_contract/group_where_order_dependent", test_group_where_order_dependent, contract_setup, contract_teardown },
+    { "agg_contract/first_n_take_running_input", test_first_n_take_running_input, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
     { "agg_contract/timespan_rank_admission", test_timespan_rank_admission, contract_setup, contract_teardown },
