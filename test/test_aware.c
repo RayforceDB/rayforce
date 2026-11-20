@@ -3269,6 +3269,69 @@ static test_result_t test_topk_cancel_at_dispatch(void) {
     PASS();
 }
 
+/* sel_compact's row list over a selection of 80000 rows is filled on the
+ * pool; a cancel landing before that dispatch (its first) leaves the list
+ * unwritten, which fresh blocks fill with 0xA5 (ray_heap_test_scribble).
+ * The compaction answers `cancel` and leaves no block behind, never a
+ * gather of the parted key or the flat column over garbage rows (the
+ * pooled parted gather read them as offsets far past its segments); both
+ * cancel modes, then the plain run answers the selected rows. */
+static test_result_t test_sel_compact_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    for (int p = 0; p < 2; p++) {
+        char q[400];
+        snprintf(q, sizeof q, "(set X (+ %d (til 40000)))", p * 40000);
+        aw_eval_ok(q);
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/scx/2024.01.0%d/t/\" (table [r up] (list X X)) \"" AW_TMP "/scx/.sym\")", p + 1);
+        aw_eval_ok(q);
+    }
+    ray_t* t = aw_eval("(.db.parted.get \"" AW_TMP "/scx\" 't)");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t) && t->type == RAY_TABLE);
+    const int64_t n = 80000;
+    ray_t* pred = ray_vec_new(RAY_BOOL, n);
+    TEST_ASSERT_TRUE(pred && !RAY_IS_ERR(pred));
+    pred->len = n;
+    for (int64_t r = 0; r < n; r++) ((uint8_t*)ray_data(pred))[r] = r % 10 > 0;
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    ray_release(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    const int64_t keep[] = { ray_sym_intern("r", 1), ray_sym_intern("up", 2) };
+    for (int mode = 0; mode < 2; mode++) {
+        ray_heap_gc();
+        int64_t live0 = aw_live_blocks();
+        ray_heap_test_scribble(true);
+        ray_pool_test_cancel_at(1, mode == 1);
+        ray_t* got = sel_compact(NULL, t, sel, keep, 2);
+        ray_pool_test_cancel_at(0, false);
+        ray_heap_test_scribble(false);
+        ray_clear_interrupt();
+        atomic_store_explicit(&ray_pool_get()->cancelled, 0, memory_order_relaxed);
+        bool is_cancel = got && RAY_IS_ERR(got) && strcmp(ray_err_code(got), "cancel") == 0;
+        if (got && RAY_IS_ERR(got)) ray_error_free(got); else if (got) ray_release(got);
+        ray_heap_gc();
+        int64_t live = aw_live_blocks() - live0;
+        if (!is_cancel || live) { ray_rowsel_release(sel); ray_release(t); }
+        TEST_ASSERT_FMT(is_cancel, "mode %d: not cancel", mode);
+        TEST_ASSERT_FMT(live == 0, "mode %d: %lld blocks left", mode, (long long)live);
+    }
+    ray_t* got = sel_compact(NULL, t, sel, keep, 2);
+    ray_rowsel_release(sel);
+    ray_release(t);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE);
+    bool same = ray_table_nrows(got) == 72000;
+    for (int c = 0; c < 2 && same; c++) {
+        ray_t* col = ray_table_col_idx(got, c);
+        same = col && !RAY_IS_ERR(col) && col->type == RAY_I64 && col->len == 72000;
+        for (int64_t i = 0; i < 72000 && same; i++)
+            same = ((const int64_t*)ray_data(col))[i] == i / 9 * 10 + i % 9 + 1;
+    }
+    ray_release(got);
+    TEST_ASSERT_TRUE(same);
+    aw_eval_ok("(set X 0)");
+    PASS();
+}
+
 /* The in-place top-k (#1122): a K near the rows selects within the keys
  * and a row index array, one range per worker (70000 rows at K 8192, 4
  * workers: 17500-row ranges), or one range off the pool (20000 rows at K
@@ -5869,6 +5932,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
+    { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/topk_inplace", test_topk_inplace, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },

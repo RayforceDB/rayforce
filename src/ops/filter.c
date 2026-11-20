@@ -1178,6 +1178,12 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             };
             ray_pool_dispatch_n(sc_pool, scidx_fill_fn, &sc, sc_chunks);
             scratch_free(soff_hdr);
+            /* a cancelled dispatch skips its tasks: match_idx is unfilled
+             * and every gather below would read its garbage as rows */
+            if (pool_cancelled(sc_pool)) {
+                scratch_free(idx_hdr);
+                return ray_error("cancel", NULL);
+            }
         } else {
             int64_t j = 0;
             for (uint32_t seg = 0; seg < n_segs; seg++) {
