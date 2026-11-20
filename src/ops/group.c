@@ -10177,10 +10177,9 @@ static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
  * Its terms are whole-column pointers read at absolute rows: the plan
  * declines a term that is not ready (try_linear_sumavg_input_i64), and as
  * the only input it never runs in a staged context. */
-static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
-    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
-    da_accum_t* acc = c->acc;
-    const agg_linear_t* lin = &c->agg_linear[0];
+/* SUM/AVG of linear plan lin over rows [start, end) into slot a. */
+static void scalar_linear_sum(da_accum_t* acc, const agg_linear_t* lin, uint32_t a,
+                              int64_t start, int64_t end) {
     int64_t n = end - start;
 
     if (acc->sum_hi) {
@@ -10195,7 +10194,7 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
         int8_t t0 = lin->term_types[0];
         if (bare && (t0 == RAY_I64 || t0 == RAY_TIMESPAN || t0 == RAY_TIMESTAMP)) {
             group_i128_sum_i64_range((const int64_t*)lin->term_ptrs[0] + start, n,
-                                     &acc->sum_hi[0], (uint64_t*)&acc->sum[0].i);
+                                     &acc->sum_hi[a], (uint64_t*)&acc->sum[a].i);
         } else if (bare && t0 != RAY_SYM) {
             /* <= 32-bit values: 2^30 of them stay far inside int64 */
             const int64_t blk = (int64_t)1 << 30;
@@ -10204,7 +10203,7 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
                 int64_t sum = 0;
                 for (int64_t r = b; r < e; r++)
                     sum += scalar_i64_at(lin->term_ptrs[0], t0, r);
-                ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, sum);
+                ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, sum);
             }
         } else {
             for (int64_t r = start; r < end; r++) {
@@ -10212,10 +10211,9 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
                 for (uint8_t t = 0; t < lin->n_terms; t++)
                     iv = wrap_add_i64(iv, wrap_mul_i64(lin->coeff_i64[t],
                             scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r)));
-                ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, iv);
+                ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, iv);
             }
         }
-        acc->count[0] += n;
         return;
     }
     int64_t sum = wrap_mul_i64(lin->bias_i64, n);
@@ -10233,8 +10231,13 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
         sum = wrap_add_i64(sum, wrap_mul_i64(coeff, term_sum));
     }
 
-    acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);
-    acc->count[0] += n;
+    acc->sum[a].i = wrap_add_i64(acc->sum[a].i, sum);
+}
+
+static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
+    scalar_linear_sum(c->acc, &c->agg_linear[0], 0, start, end);
+    c->acc->count[0] += end - start;
 }
 
 /* An input the scalar route reads by pieces when it is staged: a fixed-width
@@ -10332,15 +10335,14 @@ static void scalar_emit_vecs_free(ray_t* hdr, ray_t** ev, ray_t** agg_vecs, uint
 
 /* Generic scalar accumulation: handles all ops, all types, mask */
 /* Inner scalar accumulation for a single row */
-static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r) {
-    uint32_t n_aggs = c->n_aggs;
-    acc->count[0]++;
+/* Row r into aggregate a (acc->count[0] is the caller's). */
+static inline void scalar_accum_agg(scalar_ctx_t* c, da_accum_t* acc, int64_t r, uint32_t a) {
     /* Per-(group, agg) non-null counters drive AVG/VAR/STDDEV divisors
      * and all-null finalization for MIN/MAX/PROD/FIRST/LAST.  Only
      * allocated when at least one agg can produce a null
      * (acc->nn_count != NULL). */
     int64_t* nn = acc->nn_count;
-    for (uint32_t a = 0; a < n_aggs; a++) {
+    {
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = prod_val_f64(&c->agg_prod[a], r);
@@ -10358,7 +10360,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             }
             fv = (double)iv;
         } else {
-            if (!c->agg_ptrs[a]) continue;
+            if (!c->agg_ptrs[a]) return;
             if (c->agg_strlen && c->agg_strlen[a]) {
                 if (!c->agg_cols[a]) {
                     /* Encoded SYM: read the current piece, not a whole column. */
@@ -10478,14 +10480,141 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
     }
 }
 
+static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r) {
+    acc->count[0]++;
+    for (uint32_t a = 0; a < c->n_aggs; a++) scalar_accum_agg(c, acc, r, a);
+}
+
+/* Can the rows go aggregate by aggregate?  PROD and FIRST without
+ * non-null counters take "first value" from count[0] == 1, which only a
+ * row-by-row walk keeps. */
+static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
+    if (acc->nn_count) return true;
+    for (uint32_t a = 0; a < c->n_aggs; a++)
+        if (c->agg_ops[a] == OP_PROD || c->agg_ops[a] == OP_FIRST) return false;
+    return true;
+}
+
+/* The rows of a column run: [start, start + n), or with idx the rows
+ * start + idx[0 .. n) (a morsel's selected rows, start its first row). */
+#define SC_ROW(i) (idx ? start + idx[i] : start + (i))
+
+/* SUM/AVG/MIN/MAX of null-free integer rows of input a: one tight loop.
+ * Values as read_col_i64 reads them. */
+#define SC_INT_RUN(T)                                                          \
+    do {                                                                       \
+        const T* restrict d = (const T*)base;   /* row row_base */             \
+        if (op == OP_MIN) {                                                    \
+            int64_t m = acc->min_val[a].i;                                     \
+            for (int64_t i = 0; i < n; i++) { int64_t v = (int64_t)d[SC_ROW(i) - c->row_base]; m = v < m ? v : m; } \
+            acc->min_val[a].i = m;                                             \
+        } else if (op == OP_MAX) {                                             \
+            int64_t m = acc->max_val[a].i;                                     \
+            for (int64_t i = 0; i < n; i++) { int64_t v = (int64_t)d[SC_ROW(i) - c->row_base]; m = v > m ? v : m; } \
+            acc->max_val[a].i = m;                                             \
+        } else if (sizeof(T) == 8 && acc->sum_hi) {                            \
+            if (!idx)                                                          \
+                group_i128_sum_i64_range((const int64_t*)(const void*)(d + (start - c->row_base)), n, \
+                                         &acc->sum_hi[a], (uint64_t*)&acc->sum[a].i); \
+            else                                                               \
+                for (int64_t i = 0; i < n; i++)                                \
+                    ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, (int64_t)d[SC_ROW(i) - c->row_base]); \
+        } else {                                                               \
+            uint64_t s = 0;                                                    \
+            for (int64_t i = 0; i < n; i++) s += (uint64_t)(int64_t)d[SC_ROW(i) - c->row_base]; \
+            if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, (int64_t)s); \
+            else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, (int64_t)s);      \
+        }                                                                      \
+    } while (0)
+
+/* Input a over the run, if one of the tight loops computes it exactly as
+ * scalar_accum_agg would row by row; false leaves it to the caller. */
+static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
+                              int64_t start, int64_t n, const uint16_t* idx) {
+    uint16_t op = c->agg_ops[a];
+    if (op == OP_COUNT) return true;            /* count[0] is the caller's */
+    if (c->agg_linear && c->agg_linear[a].enabled && (op == OP_SUM || op == OP_AVG)) {
+        const agg_linear_t* lin = &c->agg_linear[a];   /* null-free terms */
+        if (!idx) {
+            scalar_linear_sum(acc, lin, a, start, start + n);
+        } else {
+            for (int64_t i = 0; i < n; i++) {
+                int64_t r = SC_ROW(i), iv = lin->bias_i64;
+                for (uint8_t t = 0; t < lin->n_terms; t++)
+                    iv = wrap_add_i64(iv, wrap_mul_i64(lin->coeff_i64[t],
+                            scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r)));
+                if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, iv);
+                else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
+            }
+        }
+        if (acc->nn_count) acc->nn_count[a] += n;
+        return true;
+    }
+    const void* base = c->agg_ptrs[a];
+    if (!base || (c->agg_prod && c->agg_prod[a].enabled) ||
+        (c->agg_strlen && c->agg_strlen[a]) || c->agg_int_null_has[a])
+        return false;
+    if (op != OP_SUM && op != OP_AVG && op != OP_MIN && op != OP_MAX) return false;
+    switch (c->agg_types[a]) {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: SC_INT_RUN(int64_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:         SC_INT_RUN(int32_t); break;
+    case RAY_I16:                                       SC_INT_RUN(int16_t); break;
+    case RAY_U8: case RAY_BOOL:                         SC_INT_RUN(uint8_t); break;
+    default: return false;
+    }
+    if (acc->nn_count) acc->nn_count[a] += n;
+    return true;
+}
+#undef SC_INT_RUN
+
+/* A run of rows (see SC_ROW), all of them aggregated: input by input. */
+static void scalar_accum_columns(scalar_ctx_t* c, da_accum_t* acc, int64_t start, int64_t n,
+                                 const uint16_t* idx) {
+    acc->count[0] += n;
+    for (uint32_t a = 0; a < c->n_aggs; a++)
+        if (!scalar_column_run(c, acc, a, start, n, idx))
+            for (int64_t i = 0; i < n; i++) scalar_accum_agg(c, acc, SC_ROW(i), a);
+}
+#undef SC_ROW
+
 static void scalar_accum_body(scalar_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
     da_accum_t* acc = c->acc;
     const int64_t* match_idx = c->match_idx;   /* NULL whenever staged */
 
-    for (int64_t i = start; i < end; i++) {
-        int64_t r = match_idx ? match_idx[i] : i;
-        if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue;
-        scalar_accum_row(c, acc, r);
+    if (match_idx) {
+        for (int64_t i = start; i < end; i++) scalar_accum_row(c, acc, match_idx[i]);
+        return;
+    }
+    bool by_col = scalar_by_column_ok(c, acc);
+    if (!c->rowsel) {
+        if (by_col) scalar_accum_columns(c, acc, start, end - start, NULL);
+        else for (int64_t r = start; r < end; r++) scalar_accum_row(c, acc, r);
+        return;
+    }
+    /* A selection, morsel by morsel: a whole one as a range, a partial one
+     * by its selected rows. */
+    ray_rowsel_t* m = ray_rowsel_meta(c->rowsel);
+    if (end > m->nrows) end = m->nrows;
+    const uint8_t*  flags = ray_rowsel_flags(c->rowsel);
+    const uint32_t* offs  = ray_rowsel_offsets(c->rowsel);
+    const uint16_t* idx   = ray_rowsel_idx(c->rowsel);
+    for (int64_t b = start; b < end; ) {
+        int64_t seg = b / RAY_MORSEL_ELEMS;
+        int64_t s0 = seg * RAY_MORSEL_ELEMS;
+        int64_t e = s0 + RAY_MORSEL_ELEMS < end ? s0 + RAY_MORSEL_ELEMS : end;
+        uint8_t f = flags[seg];
+        if (f == RAY_SEL_ALL) {
+            if (by_col) scalar_accum_columns(c, acc, b, e - b, NULL);
+            else for (int64_t r = b; r < e; r++) scalar_accum_row(c, acc, r);
+        } else if (f != RAY_SEL_NONE) {
+            uint32_t p = offs[seg], q = offs[seg + 1];
+            while (p < q && s0 + idx[p] < b) p++;
+            while (q > p && s0 + idx[q - 1] >= e) q--;
+            if (by_col) scalar_accum_columns(c, acc, s0, q - p, idx + p);
+            else for (; p < q; p++) scalar_accum_row(c, acc, s0 + idx[p]);
+        }
+        b = e;
     }
 }
 

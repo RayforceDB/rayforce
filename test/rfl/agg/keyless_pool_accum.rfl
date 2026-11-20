@@ -57,3 +57,21 @@
 (set PBN 0)
 (times 8 (if (all (== PB0 (PBF))) (set PBN (+ PBN 1))))
 PBN -- 8
+;; several aggregates of null-free narrow and wide integers, read input by
+;; input: each must equal its vector reduction, with no filter, under a
+;; filter whose morsels are whole, empty and partial, and with PROD / FIRST
+;; (row by row) beside them
+(set NT (table [i x y z u t] (list i (as 'I32 (- (% (* i 37) 2001) 1000)) (as 'I16 (- (% (* i 13) 601) 300)) (- (* (% i 977) 1000000007) 500000000000) (as 'U8 (% (* i 11) 256)) (as 'TIMESTAMP (* (% (* i 7) 100003) 1000)))))
+(set NR (select {from: NT c: (count i) sx: (sum x) ax: (avg x) mnx: (min x) mxx: (max x) sy: (sum y) mny: (min y) mxy: (max y) sz: (sum z) az: (avg z) mnz: (min z) mxz: (max z) su: (sum u) mxu: (max u) mnt: (min t) mxt: (max t) lin: (sum (+ (* 3 z) (- x 7)))}))
+(set NV (list N (sum (at NT 'x)) (avg (at NT 'x)) (min (at NT 'x)) (max (at NT 'x)) (sum (at NT 'y)) (min (at NT 'y)) (max (at NT 'y)) (sum (at NT 'z)) (avg (at NT 'z)) (min (at NT 'z)) (max (at NT 'z)) (sum (at NT 'u)) (max (at NT 'u)) (min (at NT 't)) (max (at NT 't)) (sum (+ (* 3 (at NT 'z)) (- (at NT 'x) 7)))))
+(== (map (fn [k] (at (at NR k) 0)) (key NR)) NV) -- (take [true] 17)
+;; rows 0..2999 all pass (whole morsels, then a partial one), every 7th
+;; row past them, and none of rows 100000..150000
+(set NP (and (or (< i 3000) (== 0 (% i 7))) (or (< i 100000) (>= i 150000))))
+(set NF (select {from: NT where: (and (or (< i 3000) (== 0 (% i 7))) (or (< i 100000) (>= i 150000))) c: (count i) sx: (sum x) ax: (avg x) mnx: (min x) mxx: (max x) sy: (sum y) mny: (min y) mxy: (max y) sz: (sum z) az: (avg z) mnz: (min z) mxz: (max z) su: (sum u) mxu: (max u) mnt: (min t) mxt: (max t) lin: (sum (+ (* 3 z) (- x 7)))}))
+(set NS (select {from: NT where: NP}))
+(set NFV (list (count (at NS 'i)) (sum (at NS 'x)) (avg (at NS 'x)) (min (at NS 'x)) (max (at NS 'x)) (sum (at NS 'y)) (min (at NS 'y)) (max (at NS 'y)) (sum (at NS 'z)) (avg (at NS 'z)) (min (at NS 'z)) (max (at NS 'z)) (sum (at NS 'u)) (max (at NS 'u)) (min (at NS 't)) (max (at NS 't)) (sum (+ (* 3 (at NS 'z)) (- (at NS 'x) 7)))))
+(== (map (fn [k] (at (at NF k) 0)) (key NF)) NFV) -- (take [true] 17)
+(set NQ (select {from: NT where: NP p: (prod u) fx: (first x) sx: (sum x) mxz: (max z)}))
+(list (at (at NQ 'fx) 0) (== (at (at NQ 'sx) 0) (sum (at NS 'x))) (== (at (at NQ 'mxz) 0) (max (at NS 'z)))) -- (list (at (at NS 'x) 0) true true)
+(== (at (at NQ 'p) 0) (prod (at NS 'u))) -- true
