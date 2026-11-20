@@ -1516,7 +1516,7 @@ static test_result_t test_journal_is_open_states(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  9. Open replay — covers DESER/DECOMP switch branches via replay helper.
+ *  9. Open replay — covers the DESER switch branch via replay helper.
  *     We can't force decomp failure without a compressed payload; but we
  *     can force the DESER branch by constructing a frame whose payload
  *     claims a valid header but has garbage content for ray_de_raw.
@@ -1528,7 +1528,7 @@ static test_result_t test_journal_is_open_states(void) {
 
 /* The replay function itself aborts on DESER (status = DESER, returns
  * RAY_ERR_DOMAIN).  In ray_journal_open, the switch on that status
- * reaches the DESER/DECOMP case.  To trigger it we need to write a log
+ * reaches the DESER case.  To trigger it we need to write a log
  * where the IPC header is well-formed (right magic, right version, size
  * matching bytes present) but the payload bytes cannot be deserialized
  * by ray_de_raw.

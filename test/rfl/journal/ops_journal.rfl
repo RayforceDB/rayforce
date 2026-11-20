@@ -10,7 +10,7 @@
 ;;       the payload (unknown type tag, bad length, etc.).  Crafting the
 ;;       binary file with .sys.exec/python3 is the only RFL-reachable path.
 ;;
-;;   (b) ray_log_replay_fn: RAY_JREPLAY_DECOMP switch arm.
+;;   (b) ray_log_replay_fn: RAY_JREPLAY_FORMAT switch arm.
 ;;       Reached when the COMPRESSED flag is set in the frame header but
 ;;       the compressed bytes cannot be decompressed.
 ;;

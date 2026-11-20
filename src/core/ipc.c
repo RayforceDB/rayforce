@@ -1375,8 +1375,7 @@ static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel)
     if (cd->hdr.prefix != RAY_SERDE_PREFIX ||
         cd->hdr.version != RAY_SERDE_WIRE_VERSION ||
         cd->hdr.endian != RAY_SERDE_ENDIAN ||
-        /* A journal note exists only in a log the server wrote. */
-        cd->hdr.msgtype == RAY_IPC_MSG_JNOTE ||
+        /* A journal commit exists only in a log the server wrote. */
         cd->hdr.msgtype == RAY_IPC_MSG_JREC ||
         !ray_ipc_body_size_ok(cd->hdr.size)) {
         ray_poll_deregister(poll, sel->id);

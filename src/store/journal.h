@@ -63,7 +63,6 @@ typedef enum {
     RAY_JREPLAY_IO      = 2, /* file open / read I/O failure                                    */
     RAY_JREPLAY_OOM     = 3, /* allocation failed mid-replay — transient, retryable             */
     RAY_JREPLAY_DESER   = 4, /* header valid but ray_de_raw rejected the payload                */
-    RAY_JREPLAY_DECOMP  = 5, /* compressed payload, but decompression failed                    */
     RAY_JREPLAY_CANCEL  = 6, /* interrupted mid-replay — clean abort, log intact, DO NOT truncate */
     RAY_JREPLAY_TORN    = 7, /* the last frame ends early — a commit that never finished        */
     RAY_JREPLAY_FORMAT  = 8, /* a command entry of the old log format                           */

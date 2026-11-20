@@ -224,26 +224,6 @@ void ray_eval_restrict_leave(const ray_restrict_save_t* s) {
     __VM->restricted_base = s->base;
 }
 
-/* The lift log of the request in progress on this thread (see eval.h),
- * NULL when none: then every trusted call runs lifted. */
-static _Thread_local ray_lift_log_t* g_lift_log;
-
-void ray_eval_lift_record(ray_lift_log_t* log) {
-    *log = (ray_lift_log_t){ .ids = log->inline_ids, .cap = 8, .prev = g_lift_log };
-    g_lift_log = log;
-}
-
-void ray_eval_lift_check(ray_lift_log_t* log, const int64_t* ids, int64_t n) {
-    *log = (ray_lift_log_t){ .check = true, .ids = (int64_t*)ids, .n = n, .prev = g_lift_log };
-    g_lift_log = log;
-}
-
-void ray_eval_lift_done(ray_lift_log_t* log) {
-    g_lift_log = log->prev;
-    if (!log->check && log->ids != log->inline_ids) ray_sys_free(log->ids);
-    log->ids = log->inline_ids;
-}
-
 static uint64_t trust_hash(uint64_t h, const void* bytes, int64_t n) {
     const uint8_t* p = (const uint8_t*)bytes;
     for (int64_t i = 0; i < n; i++) { h ^= p[i]; h *= UINT64_C(0x100000001b3); }
@@ -284,31 +264,6 @@ static uint64_t trust_identity(ray_t* lambda, int64_t name) {
 bool ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
     LAMBDA_TRUSTED(lambda) = trust_identity(lambda, name);
     return LAMBDA_TRUSTED(lambda) != 0;
-}
-
-/* Whether a trusted call of restricted code may run lifted, given the
- * request's lift log: recording keeps its identity (and refuses the lift
- * when it cannot, so that replay, which will find no record, agrees);
- * checking lets it run lifted only as the next call recorded live. */
-static bool lift_permitted(ray_t* lambda) {
-    ray_lift_log_t* log = g_lift_log;
-    if (!log) return true;
-    int64_t id = (int64_t)LAMBDA_TRUSTED(lambda);
-    if (log->check) {
-        if (log->next < log->n && log->ids[log->next] == id) { log->next++; return true; }
-        return false;
-    }
-    if (log->n == log->cap) {
-        int64_t cap = log->cap * 2;
-        int64_t* ids = (int64_t*)ray_sys_alloc((size_t)cap * sizeof(int64_t));
-        if (!ids) { log->failed = true; return false; }
-        memcpy(ids, log->ids, (size_t)log->n * sizeof(int64_t));
-        if (log->ids != log->inline_ids) ray_sys_free(log->ids);
-        log->ids = ids;
-        log->cap = cap;
-    }
-    log->ids[log->n++] = id;
-    return true;
 }
 
 bool ray_fn_is_local_mutator(const ray_t* fn) {
@@ -3645,7 +3600,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
     if (out_rows) *out_rows = -1;
-    if (RAY_UNLIKELY(lambda_lifts(lambda)) && lift_permitted(lambda)) {
+    if (RAY_UNLIKELY(lambda_lifts(lambda))) {
         /* Isolated as well as lifted: the body sees its arguments, its
          * captures and the globals, as it would called at the top level.
          * The caller's locals, eval windows and query stay hidden, so a

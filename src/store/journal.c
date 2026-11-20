@@ -963,15 +963,13 @@ ray_err_t ray_journal_recover(const char* base) {
                     "log:       (.log.snapshot), then start this one.\n", log_path);
             return RAY_ERR_DOMAIN;
         }
-        case RAY_JREPLAY_DESER:
-        case RAY_JREPLAY_DECOMP: {
+        case RAY_JREPLAY_DESER: {
             fprintf(stderr,
-                    "log: ERROR replay failed at chunk %lld in %s: %s — framing\n"
+                    "log: ERROR replay failed at chunk %lld in %s: deserialization failed — framing\n"
                     "log:       was intact so this is content/code mismatch, NOT\n"
                     "log:       tail truncation.  Do NOT truncate the log; either\n"
                     "log:       fix the version skew or restore from .qdb backup.\n",
-                    (long long)chunks, log_path,
-                    status == RAY_JREPLAY_DECOMP ? "decompression failed" : "deserialization failed");
+                    (long long)chunks, log_path);
             return RAY_ERR_DOMAIN;
         }
         case RAY_JREPLAY_OOM:

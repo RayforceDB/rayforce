@@ -244,10 +244,6 @@ static ray_t* log_replay_impl(ray_t* path, bool reporting) {
         return ray_error("deser",
                          "%s: deserialization failed at chunk %lld — framing intact, content/version skew",
                          p, (long long)chunks);
-    case RAY_JREPLAY_DECOMP:
-        return ray_error("decompress",
-                         "%s: decompression failed at chunk %lld — framing intact, do not truncate",
-                         p, (long long)chunks);
     case RAY_JREPLAY_OOM:
         return ray_error("oom",
                          "%s: out of memory mid-replay after %lld entries",
