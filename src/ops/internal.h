@@ -925,7 +925,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
  * predicate among CD_GATE_WHERE_SAMPLE sampled ones in *rows, *nrows of
  * them, *population the rows the whole predicate would keep.  NULL (the
  * outputs then describe the whole table) when the predicate names no
- * column the gather covers or keeps every sampled row. */
+ * column the gather covers or keeps every sampled row — *population is the
+ * table's rows in the second case, 0 in the first. */
 ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
                                 const int64_t** rows, int64_t* nrows, int64_t* population);
 
@@ -1494,6 +1495,10 @@ uint64_t ray_exec_test_in_single_within(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: the grouped distinct counts the route gate
+ * (ray_cd_two_pass_preferred) sent to the two-pass rewrite, and those it
+ * sent to the slices, since process start. */
+void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
 /* query.c test hook: selects whose parted source was pruned before fetch,
  * and the partitions they dropped, since process start. */
 void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);

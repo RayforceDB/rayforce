@@ -5153,6 +5153,53 @@ static test_result_t test_cd_route(void) {
     x = ray_eval_str("(til 300000)");
     TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 300000, 0, 28));
     ray_release(k[0]); ray_release(x);
+    /* ...but not on an estimate it cannot take at its word: the whole
+     * table's, standing for a `where:` the gate could not sample (a
+     * negative population); two 8-byte keys, whose (K, X) tuples the
+     * rewrite orders a row each; or a key in runs of 10 equal values,
+     * unsorted, which the sample's stride reads as singletons (most sampled
+     * rows have the next row's key) */
+    k[0] = ray_eval_str("(% cr 349525)");
+    x = ray_eval_str("cr");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, -1, 28));
+    k[1] = ray_eval_str("(* (% cr 349525) 3)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 2, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(k[1]);
+    k[0] = ray_eval_str("(% (* (div cr 10) 7919) 1000003)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    /* the same through a select: 50 groups on 600,000 rows beside 400,000
+     * singletons.  A text predicate the gate cannot sample keeps the 50
+     * groups — the slices, not the rewrite the whole table's count would
+     * pick; an integer one keeping them is sampled, the slices; one keeping
+     * the singletons is sampled, groups of a row, the rewrite */
+    setup = ray_eval_str(
+        "(set fr (til 1000000)) (set fb (as 'I64 (< fr 600000)))"
+        "(set Tf (table [k x t b] (list (+ (* fb (% fr 50)) (* (- 1 fb) (+ 1000 fr)))"
+        " (% (* fr 7919) 1000003) (as 'STR fb) fb)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    {
+        static const struct { const char* q; int64_t groups; bool rewrite; } fq[] = {
+            { "(count (select {from: Tf where: (== t \"1\") by: k n: (count (distinct x))}))", 50, false },
+            { "(count (select {from: Tf where: (== b 1) by: k n: (count (distinct x))}))", 50, false },
+            { "(count (select {from: Tf where: (== b 0) by: k n: (count (distinct x))}))", 400000, true },
+        };
+        for (size_t i = 0; i < sizeof fq / sizeof fq[0]; i++) {
+            uint64_t rw0, sl0, rw1, sl1;
+            ray_query_test_cd_gate(&rw0, &sl0);
+            ray_t* got = ray_eval_str(fq[i].q);
+            ray_query_test_cd_gate(&rw1, &sl1);
+            TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == -RAY_I64 && got->i64 == fq[i].groups,
+                            "query %zu", i);
+            ray_release(got);
+            TEST_ASSERT_FMT(rw1 - rw0 == (fq[i].rewrite ? 1u : 0u) && sl1 - sl0 == (fq[i].rewrite ? 0u : 1u),
+                            "query %zu: %llu rewrites, %llu slices", i,
+                            (unsigned long long)(rw1 - rw0), (unsigned long long)(sl1 - sl0));
+        }
+    }
+    setup = ray_eval_str("(set Tf 0) (set fr 0) (set fb 0)");
+    if (setup) ray_release(setup);
 
     /* 524,288 groups of 19 rows over 10 M rows, within the band: the
      * tuples decide — a twentieth of the rows (K determines X) take the
@@ -5274,6 +5321,16 @@ static test_result_t test_cd_route(void) {
         w = ray_eval_str("(quote (>= k 0))");
         TEST_ASSERT_NULL(query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop));
         TEST_ASSERT_EQ_I(nrows, N);
+        TEST_ASSERT_EQ_I(pop, N);   /* every row kept: the table's rows */
+        {
+            /* a text predicate: not sampled, no population */
+            ray_t* ts = ray_eval_str("(table [k t] (list (% cr 1000) (as 'STR (% cr 2))))");
+            ray_t* ws = ray_eval_str("(quote (== t \"1\"))");
+            TEST_ASSERT_TRUE(ts && !RAY_IS_ERR(ts) && ws && !RAY_IS_ERR(ws));
+            TEST_ASSERT_NULL(query_cd_gate_where_rows(ts, ws, N, &rows, &nrows, &pop));
+            TEST_ASSERT_EQ_I(pop, 0);
+            ray_release(ws); ray_release(ts);
+        }
         /* the sampled table and its filter leave nothing behind: eight
          * rounds hold no more memory than none */
         ray_release(w);

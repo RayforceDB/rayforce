@@ -63,7 +63,10 @@ int64_t ray_cd_test_sample_row(int64_t nrows, int i);
  * otherwise.  A sampled group count the slices would rely on is confirmed
  * by an approximate distinct count over the whole key column (a key the
  * sample reads as singletons may hold far more values than the Chao1
- * says): past a million there, the rewrite. */
+ * says): past a million there, the rewrite.
+ * A negative `population`: the rows stand for a `where:` the gate could not
+ * sample (query_cd_gate_where_rows declined), so the estimates are the whole
+ * table's and do not decide groups of a few rows (cd_few_rows). */
 bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
                                const int64_t* rows, int64_t nrows, int64_t population,
                                int64_t workers);

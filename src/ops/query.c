@@ -11416,6 +11416,13 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
                                 int64_t* out_syms, int max_out, int n);
 
 
+/* The route gate's decisions (test hook). */
+static _Atomic(uint64_t) g_cd_gate_rewrite, g_cd_gate_slices;
+void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices) {
+    *rewrite = atomic_load(&g_cd_gate_rewrite);
+    *slices  = atomic_load(&g_cd_gate_slices);
+}
+
 /* Planner rewrite for `(select {K: K c: (count (distinct X)) from: T
  * [where: W] by: K [desc: c take: N]})`.
  *
@@ -11701,11 +11708,16 @@ static ray_t* try_count_distinct_v2_rewrite(
         ray_t* sel_hdr = where_expr
             ? query_cd_gate_where_rows(tbl, where_expr, n_table, &sel_rows, &sel_nrows, &sel_pop)
             : NULL;
+        /* a `where:` the sample could not read: the estimates are the
+         * whole table's, which the gate is told (a negative population) */
+        if (where_expr && !sel_hdr && sel_pop == 0) sel_pop = -1;
         ray_pool_t* pool = ray_pool_get();
         int64_t workers = pool ? ray_pool_total_workers(pool) : 1;
         bool two_pass = ray_cd_two_pass_preferred(K_cols, n_K, X_col, sel_rows, sel_nrows,
                                                   sel_pop, workers);
         if (sel_hdr) scratch_free(sel_hdr);
+        atomic_fetch_add_explicit(two_pass ? &g_cd_gate_rewrite : &g_cd_gate_slices, 1,
+                                  memory_order_relaxed);
         if (!two_pass) return NULL;
     }
 
@@ -15988,6 +16000,8 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
                 if (kept > 0 && *population < kept) *population = kept;
             } else if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
             if (ind) ray_release(ind);
+        } else if (fres && !RAY_IS_ERR(fres)) {
+            *population = n_table;   /* no selection: every sampled row kept */
         }
         if (fres) { if (RAY_IS_ERR(fres)) ray_error_free(fres); else ray_release(fres); }
         ray_graph_free(gs);
