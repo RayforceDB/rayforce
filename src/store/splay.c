@@ -815,9 +815,15 @@ static ray_err_t splay_feed_ranges(ray_col_stream_t* w, ray_t* seg, int8_t type)
             b->len += v.n;
         } else if (type == RAY_STR) {
             const ray_str_t* d = (const ray_str_t*)v.data;
-            for (int64_t i = 0; i < v.n && b && !RAY_IS_ERR(b); i++)
-                b = ray_str_vec_append(b, ray_str_t_ptr(&d[i], v.str_pool), d[i].len);
-            if (!b || RAY_IS_ERR(b)) { if (b) ray_error_free(b); b = NULL; e = RAY_ERR_OOM; break; }
+            /* On failure the append frees only a COW copy it made, so `b` is
+             * still ours and the release after the loop frees it. */
+            for (int64_t i = 0; i < v.n; i++) {
+                ray_t* nb = ray_str_vec_append(b, ray_str_t_ptr(&d[i], v.str_pool), d[i].len);
+                if (!nb) { e = RAY_ERR_OOM; break; }
+                if (RAY_IS_ERR(nb)) { e = ray_err_from_obj(nb); ray_error_free(nb); break; }
+                b = nb;
+            }
+            if (e != RAY_OK) break;
         } else {
             memcpy((char*)ray_data(b) + (size_t)b->len * esz, v.data, (size_t)v.n * esz);
             b->len += v.n;
