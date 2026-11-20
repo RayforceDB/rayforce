@@ -2,8 +2,9 @@
 ;; the key, as a single key does (#1235): `{a: a b: b u: …} by: [a b]` is
 ;; `{u: …} by: [a b]`, the same columns, types, values and row order, for
 ;; every aggregate, a by-dict, where:, desc:/take:, and no aggregate at all.
-;; A projected key placed after an output keeps its place, as `{u: … a: a}
-;; by: a` does.  A renamed or computed projection of a key is no identity
+;; The keys come first, in by: order, wherever the projections are written
+;; and in whatever order (a single key's `{u: … a: a} by: a` still gives
+;; `[u a]`; that is left to its own issue).  A renamed or computed projection of a key is no identity
 ;; projection and stays a per-group output.
 ;; columns, row count, types and values, all equal
 (set eqt (fn [x y] (and (== (count (cols x)) (count (cols y))) (all (== (cols x) (cols y))) (== (count x) (count y)) (all (map (fn [c] (and (== (type (at x c)) (type (at y c))) (all (== (at x c) (at y c))))) (cols x))))))
@@ -14,8 +15,11 @@
 (cols (select {a: a u: (count h) from: S by: [a b]})) -- [a b u]
 (cols (select {b: b u: (count h) from: S by: [a b]})) -- [a b u]
 (cols (select {a: a b: b from: S by: [a b]})) -- [a b h]
-(cols (select {u: (count h) a: a b: b from: S by: [a b]})) -- [u a b]
-(cols (select {u: (count h) b: b from: S by: [a b]})) -- [a u b]
+(cols (select {u: (count h) a: a b: b from: S by: [a b]})) -- [a b u]
+(cols (select {u: (count h) b: b from: S by: [a b]})) -- [a b u]
+(cols (select {b: b a: a u: (count h) from: S by: [a b]})) -- [a b u]
+(cols (select {b: b a: a from: S by: [a b]})) -- [a b h]
+(cols (select {x: (first h) a: a b: b u: (count h) from: S by: [a b]})) -- [a b x u]
 (cols (select {u: (count h) a: a from: S by: a})) -- [u a]
 (at (select {a: a b: b u: (count h) from: S by: [a b]}) 'u) -- [3 1 1 1]
 (at (select {u: (count h) a: a b: b from: S by: [a b]}) 'a) -- (as 'I32 [1 2 2 3])
@@ -64,11 +68,10 @@
 (eqt (select {a: a b: b u: (count h) from: T where: (> h 100) by: [a b] desc: u take: 10}) (select {u: (count h) from: T where: (> h 100) by: [a b] desc: u take: 10})) -- true
 (eqt (select {a: a b: b u: (count h) from: T by: [a b] take: 10}) (select {u: (count h) from: T by: [a b] take: 10})) -- true
 (eqt (select {a: a s: s u: (count h) from: T by: [a s]}) (select {u: (count h) from: T by: [a s]})) -- true
-;; placed after the output: the same rows, the projected keys last
-(set A (select {u: (count h) a: a b: b from: T by: [a b]}))
-(set B (select {u: (count h) from: T by: [a b]}))
-(cols A) -- [u a b]
-(and (all (== (at A 'u) (at B 'u))) (all (== (at A 'a) (at B 'a))) (all (== (at A 'b) (at B 'b)))) -- true
+;; written after the output, or in another order: the unprojected select
+(eqt (select {u: (count h) a: a b: b from: T by: [a b]}) (select {u: (count h) from: T by: [a b]})) -- true
+(eqt (select {b: b a: a u: (max h) from: T by: [a b]}) (select {u: (max h) from: T by: [a b]})) -- true
+(eqt (select {a: a s: s u: (max h) from: T by: [s a]}) (select {u: (max h) from: T by: [s a]})) -- true
 
 ;; a saved parted table
 (.sys.exec "rm -rf rf_test_ckproj") -- 0

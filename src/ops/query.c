@@ -16156,12 +16156,10 @@ void ray_select_scan_filtered(ray_t* sel, int64_t kept) {
  * more keys) whose outputs project key columns as themselves, `a: a`, folds
  * them into the key, as a single key does (is_single_group_key_projection):
  * the select runs as if they were not there, so it takes the routes, and
- * gives the rows in the order, of the select without them.  The dict
- * without those outputs, or NULL when there is none to drop.  `*relayout`
- * is set when outputs remain: the caller then moves the projected keys to
- * their place among the outputs, as the single key's layout does. */
-static ray_t* select_strip_key_projections(ray_t* dict, bool* relayout) {
-    *relayout = false;
+ * gives the columns and rows, in their order, of the select without them:
+ * the keys first, in by: order (#1235).  The dict without those outputs, or
+ * NULL when there is none to drop. */
+static ray_t* select_strip_key_projections(ray_t* dict) {
     ray_t* by = dict_get(dict, "by");
     if (!by) return NULL;
     ray_t* kv = NULL;
@@ -16180,13 +16178,12 @@ static ray_t* select_strip_key_projections(ray_t* dict, bool* relayout) {
     int64_t cid[7];
     for (int c = 0; c < 7; c++) cid[c] = ray_sym_intern(clause[c], strlen(clause[c]));
     ray_t** v = (ray_t**)ray_data(vals);
-    int64_t n_drop = 0, n_out = 0;
+    int64_t n_drop = 0;
     for (int64_t i = 0; i < nd; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         bool is_clause = false;
         for (int c = 0; c < 7; c++) is_clause |= kid == cid[c];
         if (is_clause) continue;
-        n_out++;
         if (!v[i] || v[i]->type != -RAY_SYM || (v[i]->attrs & ATTR_QUOTED) || v[i]->i64 != kid)
             continue;
         for (int64_t j = 0; j < nk; j++)
@@ -16210,7 +16207,6 @@ static ray_t* select_strip_key_projections(ray_t* dict, bool* relayout) {
         cv = ray_list_append(cv, v[i]);
     }
     if (!cv || RAY_IS_ERR(cv)) { ray_release(ck); return cv ? cv : ray_error("oom", NULL); }
-    *relayout = n_out > n_drop;
     return ray_dict_new(ck, cv);
 }
 
@@ -16218,9 +16214,8 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     ray_t* merged = n > 0 ? ray_select_merge_plan(args[0]) : NULL;
     if (merged) args = &merged;
     ray_t* user = n > 0 ? args[0] : NULL;
-    bool relayout = false;
     ray_t* folded = n == 1 && user && user->type == RAY_DICT
-        ? select_strip_key_projections(user, &relayout) : NULL;
+        ? select_strip_key_projections(user) : NULL;
     if (folded && RAY_IS_ERR(folded)) { if (merged) ray_release(merged); return folded; }
     if (folded) args = &folded;
     select_scan_t ss = { .args = args };
@@ -16233,10 +16228,6 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     t_select_scan = prev_ss;
     ray_pool_scan_set(prev_scan);
     if (ss.gate_hdr) scratch_free(ss.gate_hdr);
-    if (relayout && r && !RAY_IS_ERR(r)) {
-        select_alias_plan_t layout = {0};
-        r = select_apply_derived(r, user, &layout, NULL);
-    }
     if (folded) ray_release(folded);
     if (merged) ray_release(merged);
     return r;

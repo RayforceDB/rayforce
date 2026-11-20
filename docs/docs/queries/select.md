@@ -246,15 +246,16 @@ Group by multiple keys:
 
 An output that projects a key column as itself (`sym: sym`) is the key
 column: it is not repeated after the keys, with one key or with several, and
-the select gives the same rows in the same order as without it. A projected
-key written after another output keeps its place among the outputs. A
-renamed (`s: sym`) or computed projection of a key is an ordinary output.
+the select gives the same rows in the same order as without it. With several
+keys the result is exactly the select without the projections: the keys
+come first, in `by:` order, wherever the projections are written. A renamed
+(`s: sym`) or computed projection of a key is an ordinary output.
 
 ```lisp
 (select {from: trades by: [sym side]
          sym: sym side: side total: (sum qty)})   ; columns sym side total
 (select {from: trades by: [sym side]
-         total: (sum qty) sym: sym side: side})   ; columns total sym side
+         total: (sum qty) side: side sym: sym})   ; columns sym side total
 ```
 
 Expressions over aggregates work with any number of keys and with binary aggregates such as `pearson_corr`, `cov`, or `wsum`; the aggregates are computed in the grouping pass and the outer expression once per group:
