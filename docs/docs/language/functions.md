@@ -603,7 +603,7 @@ spills exactly as it did before.
 | `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
 | `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |

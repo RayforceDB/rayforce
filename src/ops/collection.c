@@ -515,11 +515,37 @@ uint64_t ray_find_test_sorted_runs(bool reset) {
     return n;
 }
 #define FIND_SORTED_NOTE_RUN() (++find_sorted_runs)
+static _Thread_local uint64_t find_typed_scans;
+/* Unboxed same-type atom scans: unsorted, or sorted and at most 64 rows. */
+uint64_t ray_find_test_typed_scans(bool reset) {
+    uint64_t n = find_typed_scans;
+    if (reset) find_typed_scans = 0;
+    return n;
+}
+#define FIND_SCAN_NOTE_RUN() (++find_typed_scans)
 #else
 #define FIND_SORTED_NOTE_RUN() ((void)0)
+#define FIND_SCAN_NOTE_RUN() ((void)0)
 #endif
 
+/* NAME##_one: first row of a non-descending, null-free window equal to key,
+ * or NULL_I64 -- one typed lower_bound plus an equality check.
+ * NAME##_scan: the same answer by a forward scan, for unsorted windows. */
 #define DEFINE_SORTED_FIND(NAME, CELL) \
+static inline int64_t NAME##_one(const CELL* h, int64_t n, CELL key) { \
+    int64_t lo = 0, hi = n; \
+    while (lo < hi) { \
+        int64_t mid = lo + (hi - lo) / 2; \
+        if (h[mid] < key) lo = mid + 1; \
+        else hi = mid; \
+    } \
+    return lo < n && h[lo] == key ? lo : NULL_I64; \
+} \
+static inline int64_t NAME##_scan(const CELL* h, int64_t n, CELL key) { \
+    for (int64_t i = 0; i < n; i++) \
+        if (h[i] == key) return i; \
+    return NULL_I64; \
+} \
 static __attribute__((noinline)) bool NAME(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) { \
     const CELL* h = (const CELL*)ray_data(hay); \
     const CELL* q = (const CELL*)ray_data(nd); \
@@ -553,14 +579,8 @@ static __attribute__((noinline)) bool NAME(ray_t* hay, ray_t* nd, int64_t* out, 
     } \
     /* Scalar tail uses the same typed lower_bound and exact equality. */ \
     for (; j < m; j++) { \
-        int64_t lo = 0, hi = n; \
-        while (lo < hi) { \
-            int64_t mid = lo + (hi - lo) / 2; \
-            if (h[mid] < q[j]) lo = mid + 1; \
-            else hi = mid; \
-        } \
-        if (lo < n && h[lo] == q[j]) out[j] = lo; \
-        else { out[j] = NULL_I64; *any_null = true; } \
+        out[j] = NAME##_one(h, n, q[j]); \
+        if (out[j] == NULL_I64) *any_null = true; \
     } \
     FIND_SORTED_NOTE_RUN(); \
     return true; \
@@ -571,7 +591,43 @@ DEFINE_SORTED_FIND(find_sorted_i16, int16_t)
 DEFINE_SORTED_FIND(find_sorted_i32, int32_t)
 DEFINE_SORTED_FIND(find_sorted_i64, int64_t)
 #undef DEFINE_SORTED_FIND
+
+/* Atom needle of the haystack's own integer type, both null-free: a SORTED
+ * haystack longer than FIND_ATOM_SORTED_MIN takes one lower_bound, any other
+ * a typed scan; no row is boxed.  Mixed widths, floats and nullable
+ * haystacks decline (atom_eq owns promotion and null classes).  *pos is
+ * view-relative, NULL_I64 on a miss.  Up to 64 rows the early-exit scan is
+ * a few ns cheaper than the lower_bound's unpredictable branches; from 128
+ * the lower_bound wins on misses and ties on random hits (release, -c 1). */
+#define FIND_ATOM_SORTED_MIN 64
+static bool find_atom_integer(ray_t* hay, ray_t* key, int64_t* pos) {
+    if (key->type != -hay->type || ray_vec_may_have_nulls(hay)) return false;
+    const void* d = ray_data(hay);
+    int64_t n = hay->len;
+    if (n > FIND_ATOM_SORTED_MIN && ray_attr_is_sorted(hay)) {
+        switch (hay->type) {
+            case RAY_U8:  *pos = find_sorted_u8_one(d, n, key->u8); break;
+            case RAY_I16: *pos = find_sorted_i16_one(d, n, key->i16); break;
+            case RAY_I32: *pos = find_sorted_i32_one(d, n, key->i32); break;
+            case RAY_I64: *pos = find_sorted_i64_one(d, n, key->i64); break;
+            default:      return false;
+        }
+        FIND_SORTED_NOTE_RUN();
+        return true;
+    }
+    switch (hay->type) {
+        case RAY_U8:  *pos = find_sorted_u8_scan(d, n, key->u8); break;
+        case RAY_I16: *pos = find_sorted_i16_scan(d, n, key->i16); break;
+        case RAY_I32: *pos = find_sorted_i32_scan(d, n, key->i32); break;
+        case RAY_I64: *pos = find_sorted_i64_scan(d, n, key->i64); break;
+        default:      return false;
+    }
+    FIND_SCAN_NOTE_RUN();
+    return true;
+}
 #undef FIND_SORTED_NOTE_RUN
+#undef FIND_SCAN_NOTE_RUN
+#undef FIND_ATOM_SORTED_MIN
 
 /* Same-type integer payloads only. Verify metadata once, outside the typed
  * lower-bound loops; declines leave output untouched. ray_data keeps views
@@ -3880,6 +3936,14 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     return ray_typed_null(-RAY_I64);
                 return make_i64(row);
             }
+        }
+
+        /* Same-type integer atom, null-free haystack: typed lower_bound
+         * when SORTED and over 64 rows, else a typed scan (find_atom_integer). */
+        if (!val_null) {
+            int64_t pos;
+            if (find_atom_integer(vec, val, &pos))
+                return pos == NULL_I64 ? ray_typed_null(-RAY_I64) : make_i64(pos);
         }
 
         /* A guid in a guid vector: compare the cells' bytes in place, a

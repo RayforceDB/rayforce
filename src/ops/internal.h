@@ -1094,6 +1094,10 @@ extern uint64_t ray_join_dup_fallbacks;
 extern uint64_t ray_join_null_fallbacks;
 extern bool     ray_join_force_null_checks;
 extern uint64_t ray_join_nullfree_keys;
+/* #595: right-side key bitmap prefilter on the chained probe */
+extern bool     ray_join_no_prefilter;
+extern uint64_t ray_join_prefilter_builds;
+extern _Atomic(uint64_t) ray_join_prefilter_skips;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
@@ -1479,6 +1483,8 @@ void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
 #ifdef DEBUG
 /* Completed synchronous sorted-find kernels; no release instrumentation. */
 uint64_t ray_find_test_sorted_runs(bool reset);
+/* Unboxed same-type atom scans: unsorted, or sorted and at most 64 rows. */
+uint64_t ray_find_test_typed_scans(bool reset);
 /* Successful query-level narrowed-source constructions, not physical reads. */
 uint64_t ray_query_test_parted_pruned_sources(bool reset);
 #endif
