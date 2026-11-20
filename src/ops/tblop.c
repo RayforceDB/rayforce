@@ -33,6 +33,7 @@
 #include "ops/linkop.h"
 #include "table/sym.h"
 #include "mem/heap.h"
+#include "store/journal.h"
 #include <stdio.h>
 #include <inttypes.h>
 
@@ -1393,7 +1394,12 @@ static ray_t* alter_target(ray_t** args, int64_t n,
                            const ray_env_target_t* target, ray_t* var,
                            ray_t* name_sym);
 
+static ray_t* alter_impl(ray_t** args, int64_t n);
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
+    return ray_journal_mutator(alter_impl, args, n);
+}
+
+static ray_t* alter_impl(ray_t** args, int64_t n) {
     bool via_callee = ray_env_mutator_callee_take();   /* before anything else runs */
     if (n < 3) return ray_error("domain", "alter: expects at least 3 arguments (var, op, ...), got %lld", (long long)n);
     /* First arg: evaluate to get the symbol */

@@ -21,27 +21,29 @@
  *   SOFTWARE.
  */
 
-/* Transaction-log journaling — the `-l` / `-L` feature.
+/* Journaling — the `-l` / `-L` feature.
  *
- * Wire format: every entry is a complete IPC message (16-byte
- * ray_ipc_header_t followed by serialized payload), so log frames
- * share parser code with the live IPC path.  Concatenation by `cat`
- * is valid by construction.
+ * The log holds what changed, not the command that changed it: each entry
+ * is one commit, a frame (16-byte ray_ipc_header_t, msgtype
+ * RAY_IPC_MSG_JREC) whose payload is the commit's records — a global
+ * bound, unbound, or a table appended to (see "Physical records" below
+ * and journal.c).  Replay applies values and evaluates nothing, so it
+ * rebuilds the state the writer had whatever `rand` or the clock said.
  *
  * Open with ray_journal_open(base, mode):
  *   1. If <base>.qdb exists, load it and bind every key into the global env.
- *   2. If <base>.log exists, replay it (badtail is fatal, eval errors warn).
+ *   2. If <base>.log exists, apply it.  A last entry cut short is a commit
+ *      that never finished: it is dropped.  Broken framing anywhere else
+ *      (badtail) is fatal.
  *   3. Open <base>.log for append.
  *
- * After open, the IPC dispatch hook (eval_payload in core/ipc.c) calls
- * ray_journal_write_bytes() for every inbound sync message before
- * evaluating it.  Async messages and responses are not journaled,
- * journaling only the .z.ps stream.
+ * After open, every change to a global is noted as it is made, and every
+ * evaluation boundary — an IPC message of any kind, a REPL line, a script,
+ * a timer callback, a ray_eval_str — commits what was noted.
  *
  * Replay is single-threaded by construction (it runs from main, before
- * the poll loop starts) so the module is intentionally not thread-safe;
- * the IPC dispatch loop is also single-threaded for eval_payload, so the
- * shared file handle does not need a mutex either.
+ * the poll loop starts), and so is the commit; only the buffer notes go
+ * into takes a lock, since a worker thread may set a global.
  */
 #ifndef RAY_JOURNAL_H
 #define RAY_JOURNAL_H
@@ -63,6 +65,8 @@ typedef enum {
     RAY_JREPLAY_DESER   = 4, /* header valid but ray_de_raw rejected the payload                */
     RAY_JREPLAY_DECOMP  = 5, /* compressed payload, but decompression failed                    */
     RAY_JREPLAY_CANCEL  = 6, /* interrupted mid-replay — clean abort, log intact, DO NOT truncate */
+    RAY_JREPLAY_TORN    = 7, /* the last frame ends early — a commit that never finished        */
+    RAY_JREPLAY_FORMAT  = 8, /* a command entry of the old log format                           */
 } ray_jreplay_status_t;
 
 /* Open the journal: load <base>.qdb, replay <base>.log, open log for append.
@@ -109,16 +113,45 @@ typedef struct {
 
 void ray_journal_info(ray_journal_info_t* out);
 
-/* Append one entry to the active journal.  No-op (returns RAY_OK) if
- * no journal is open or if a replay is currently in progress (we do
- * NOT recursively log replayed messages even if .log.write is called
- * from a replayed entry).  In RAY_JOURNAL_SYNC mode, fflush + fsync
- * before returning. */
+/* Append one entry to the active journal: what ray_journal_commit does
+ * with the records it holds.  No-op (returns RAY_OK) if no journal is
+ * open or a replay is in progress.  In RAY_JOURNAL_SYNC mode, fflush +
+ * fsync before returning. */
 ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
                                   const uint8_t*          payload,
                                   int64_t                 payload_len);
 
-/* Replay a log file, evaluating each entry in order.  *out_chunks counts
+/* ── Physical records ─────────────────────────────────────────────────
+ * The log holds what changed, not the command that changed it (see
+ * journal.c).  Changes are noted as they are made and written as one
+ * frame by ray_journal_commit(), which every evaluation boundary calls:
+ * the end of an IPC message, of a REPL line, of a script. */
+
+/* True while a journal is open for append and no replay runs: the gate
+ * in front of every call below. */
+extern bool ray_journal_capture;
+
+/* Note `name := val` (NULL unbinds) BEFORE binding it; an error means the
+ * change cannot be logged and must not be made.  ray_journal_rewind() to a
+ * ray_journal_mark() taken first drops the note when the bind then fails. */
+ray_err_t ray_journal_note_set(int64_t name, ray_t* val);
+int64_t   ray_journal_mark(void);
+void      ray_journal_rewind(int64_t mark);
+
+/* Run a mutator (insert, upsert, update, delete, alter) and note what it
+ * changed when it returns the name it amended. */
+ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64_t n);
+/* insert, right before it appends to the global table `name` of `rows0`
+ * rows: the rows past rows0 are noted in place of the whole table. */
+void ray_journal_mut_target(int64_t name, int64_t rows0);
+
+/* Write the changes noted since the last commit as one frame (fsync in
+ * RAY_JOURNAL_SYNC mode).  RAY_OK when there are none.  On an error the
+ * log misses a change memory has: later commits fail too, until
+ * ray_journal_snapshot() writes memory out whole. */
+ray_err_t ray_journal_commit(void);
+
+/* Replay a log file, applying each entry in order.  *out_chunks counts
  * evaluated entries INCLUDING entries whose evaluation returned an error;
  * *out_eval_errors counts those errors.  They warn and replay continues:
  * no rollback of an entry's partial effects or the already-applied prefix.

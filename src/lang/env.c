@@ -30,6 +30,7 @@
 #include "ops/linkop.h"
 #include "ops/ops.h"       /* ray_is_lazy, ray_lazy_materialize — lazy captures */
 #include "mem/sys.h"
+#include "store/journal.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1197,9 +1198,18 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
      * binder so the journal snapshot can pick this slot.  Without this
      * flip, env_bind_global would also be reached via ray_env_bind below
      * and the slot would carry user=0 — leaving it out of <base>.qdb. */
-    if (ray_sym_is_dotted(sym_id))
-        return env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global_user, -1);
-    return env_bind_global_user(sym_id, val);
+    /* Log first: a change the journal cannot hold is not made. */
+    int64_t mark = -1;
+    if (ray_journal_capture) {
+        mark = ray_journal_mark();
+        ray_err_t je = ray_journal_note_set(sym_id, val);
+        if (je != RAY_OK) return je;
+    }
+    ray_err_t e = ray_sym_is_dotted(sym_id)
+        ? env_set_dotted(sym_id, val, ray_env_get_global, env_bind_global_user, -1)
+        : env_bind_global_user(sym_id, val);
+    if (e != RAY_OK && mark >= 0) ray_journal_rewind(mark);
+    return e;
 }
 
 /* Resolve like a read, but never turn query columns or dotted accessors into

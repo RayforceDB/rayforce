@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "store/journal.h"
 #include "lang/eval.h"
 #include "core/runtime.h"
 #include "lang/internal.h"
@@ -5381,10 +5382,10 @@ static void ray_register_builtins(void) {
     /* Query operations */
     register_vary("select",    RAY_FN_SPECIAL_FORM, ray_select);
     register_vary("window",    RAY_FN_SPECIAL_FORM, ray_window_fn);
-    register_vary("update",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_update);
-    register_vary("insert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_insert);
-    register_vary("upsert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_upsert);
-    register_vary("delete",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_delete);
+    register_vary("update",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_update_fn);
+    register_vary("insert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_insert_fn);
+    register_vary("upsert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_upsert_fn);
+    register_vary("delete",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_delete_fn);
     /* xbar is registered NON-atomic so the call path lands in
      * ray_xbar_fn(VEC, scalar) directly.  ray_xbar_fn handles the
      * vector fast path itself (tight per-element loop, no per-atom
@@ -5583,7 +5584,6 @@ static void ray_register_builtins(void) {
      * for manual control (open from a script, snapshot on demand, etc). */
     register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
     register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
-    register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
     register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
     register_unary(".log.replay_report", RAY_FN_RESTRICTED, ray_log_replay_report_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
@@ -6327,5 +6327,12 @@ ray_t* ray_eval_str(const char* source) {
      * chain before returning to callers who expect a concrete value. */
     if (ray_is_lazy(result))
         result = ray_lazy_materialize(result);
+    /* And a commit: what the source changed reaches the journal before
+     * the caller hears it ran. */
+    if (ray_journal_capture && ray_journal_commit() != RAY_OK) {
+        if (result && RAY_IS_ERR(result)) ray_error_free(result);
+        else if (result) ray_release(result);
+        result = ray_error("io", "journal write failed; this change is not logged");
+    }
     return result;
 }

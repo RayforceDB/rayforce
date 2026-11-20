@@ -46,6 +46,7 @@
 #include "ops/ops.h"
 #include "core/profile.h"
 #include "core/qlog.h"
+#include "store/journal.h"
 #include "table/sym.h"
 #include <inttypes.h>
 #include <stdio.h>
@@ -900,6 +901,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
         if (profiling) profile_print(use_color);
     }
 
+    (void)ray_journal_commit();   /* a statement is a commit */
     ray_heap_gc();
     ray_enccol_cache_trim();
     ray_heap_relieve();
@@ -1618,6 +1620,7 @@ int ray_repl_run_file(const char* path) {
      * calls would service mid-run, which is the one thing the threshold
      * exists to avoid. */
     ray_heap_note_activity();
+    (void)ray_journal_commit();   /* a statement is a commit */
     ray_heap_gc();
     ray_enccol_cache_trim();
     /* The script's own temporaries — a load, say, before it hands over to a

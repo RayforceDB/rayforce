@@ -53,6 +53,7 @@
 #include "store/enccol.h"    /* ray_enccol_adopt_domain — empty columns of encoded SYM */
 #include "store/enceval.h"   /* ray_enc_count_cmp — the count fast path on views */
 #include "mem/heap.h"
+#include "store/journal.h"
 #include "mem/arena.h"       /* the views of a compressed vocabulary (dk_chunk_views) */
 
 #include <string.h>
@@ -29247,7 +29248,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
 }
 
 ray_t* ray_update_fn(ray_t** args, int64_t n) {
-    return ray_update(args, n);
+    return ray_journal_mutator(ray_update, args, n);
 }
 
 ray_t* ray_update(ray_t** args, int64_t n) {
@@ -31601,7 +31602,7 @@ static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows, bool sole)
 static void ukey_extend_after_append(ray_t* tbl, int64_t nrows0);
 
 ray_t* ray_insert_fn(ray_t** args, int64_t n) {
-    return ray_insert(args, n);
+    return ray_journal_mutator(ray_insert, args, n);
 }
 
 ray_t* ray_insert(ray_t** args, int64_t n) {
@@ -32002,6 +32003,9 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
 
     ray_t** row_elems = (ray_t**)ray_data(row);
     int64_t nrows = ray_table_nrows(tbl);
+    /* Every argument is evaluated: from here the journal notes the rows
+     * this insert adds, not the table it publishes. */
+    if (inplace_sym >= 0 && target.scope < 0) ray_journal_mut_target(inplace_sym, nrows);
 
     /* ---- In-place append fast path (#455) -------------------------------
      * The rebuild below copies every existing row on every call, which
@@ -33387,7 +33391,7 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
 }
 
 ray_t* ray_upsert_fn(ray_t** args, int64_t n) {
-    return ray_upsert(args, n);
+    return ray_journal_mutator(ray_upsert, args, n);
 }
 
 ray_t* ray_upsert(ray_t** args, int64_t n) {
@@ -36634,7 +36638,7 @@ static void ukey_patch_after_delete(ray_t* tbl, const int64_t* rows, int64_t k,
 }
 
 ray_t* ray_delete_fn(ray_t** args, int64_t n) {
-    return ray_delete(args, n);
+    return ray_journal_mutator(ray_delete, args, n);
 }
 
 /* (delete {from: t where: <pred>}) — remove the rows the predicate matches.

@@ -1106,7 +1106,7 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
     TEST_ASSERT_EQ_I(kv2, 19);
     TEST_ASSERT_EQ_I(kv3, 8);
     TEST_ASSERT_EQ_I(kv4, 8);
-    TEST_ASSERT_EQ_I(kv5, 5);   /* the changed verb's call is refused on replay */
+    TEST_ASSERT_EQ_I(kv5, 60);  /* what run 2 left: recovery applies values, it calls no verb again */
     TEST_ASSERT_EQ_I(kv6, 5);
     TEST_ASSERT_EQ_I(kv7, 4);
     TEST_ASSERT_TRUE(restored);

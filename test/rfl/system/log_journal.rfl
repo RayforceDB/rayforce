@@ -4,7 +4,8 @@
 ;; Two named processes are spawned in sequence under -l <base>; this
 ;; test asserts that user mutations survive process death + restart
 ;; via .log replay, that .log.snapshot collapses replay state into
-;; .qdb, and that a corrupted .log triggers the badtail exit (rc=2)
+;; .qdb, that a commit cut short is dropped, and that a corrupted .log
+;; triggers the badtail exit (rc=2)
 ;; with a recoverable hint.
 ;;
 ;; Port: 19990 (fixed, picked to avoid collision with ipc_diff at
@@ -99,11 +100,10 @@
 ;; pattern is passed to ls which fails non-zero).
 (.sys.exec "ls /tmp/rftest_journal.*.log >/dev/null 2>&1") -- 0
 
-;; .log.validate parses the log without evaluating; the post-snapshot
-;; log only contains the validate IPC call itself.  Loose assertion:
-;; chunks >= 1, valid_bytes > 0.
+;; .log.validate parses the log without applying it; nothing has changed
+;; since the snapshot, so the fresh log holds no commit yet.
 (set v (.ipc.send h2 "(.log.validate \"/tmp/rftest_journal.log\")"))
-(>= (first v) 1) -- true
+(first v) -- 0
 
 (.ipc.close h2)
 (.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
@@ -116,18 +116,37 @@
 (set h3 (.ipc.open "127.0.0.1:19990"))
 (.ipc.send h3 "a") -- 100
 (.ipc.send h3 "d") -- 101
+;; Two commits on the fresh log, for phase 4 to cut into.
+(.ipc.send h3 "(set e 5)") -- 5
+(.ipc.send h3 "(set g 6)") -- 6
 
 (.ipc.close h3)
 (.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
 (.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
 
-;; ── phase 4: corruption is fatal (rc=2 with badtail message) ────────
-;; The post-snapshot fresh log holds at least one frame from phase 2.5
-;; (the validate call) plus whatever phase 3 added before exit; cut
-;; the last 4 bytes to leave the trailing frame mid-payload.  Restart
-;; must exit with rc=2 — main.c special-cases badtail with that code
-;; so a supervisor can distinguish it from any other startup failure.
+;; ── phase 4: a commit cut short is dropped, the rest survives ───────
+;; Cut the last 4 bytes: the trailing frame (set g 6) ends mid-payload,
+;; which is what a crash in the middle of a commit leaves.  Nobody was
+;; told that commit had happened, so restart drops it and keeps going.
 (.sys.exec "truncate -s -4 /tmp/rftest_journal.log")
+(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+
+(set h4 (.ipc.open "127.0.0.1:19990"))
+(.ipc.send h4 "a") -- 100
+(.ipc.send h4 "e") -- 5
+(.ipc.send h4 "(try g (fn [x] 'unbound))") -- 'unbound
+(.ipc.close h4)
+(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
+(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; ── phase 5: corruption is fatal (rc=2 with badtail message) ────────
+;; A broken frame header in the middle is not an unfinished commit:
+;; overwrite the first frame's prefix (right after the 16-byte
+;; preamble).  Restart must exit with rc=2 — main.c special-cases
+;; badtail with that code so a supervisor can tell it from any other
+;; startup failure.
+(.sys.exec "printf 'XXXX' | dd of=/tmp/rftest_journal.log bs=1 seek=16 conv=notrunc 2>/dev/null")
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1; test $? -eq 2") -- 0
 
 ;; ── teardown ────────────────────────────────────────────────────────
@@ -156,7 +175,6 @@
 (.log.roll)     !- domain
 (.log.snapshot) !- domain
 ;; .log.write errors with "noopen" when no journal is active.
-(.log.write 42) !- noopen
 ;; .log.sync / .log.close are no-ops on a closed journal — succeed silently.
 (nil? (.log.sync))  -- true
 (nil? (.log.close)) -- true
@@ -196,11 +214,11 @@
 ;; would parse "hello" as an unbound name and warn.  Integers, floats,
 ;; and integer-vector literals all evaluate to themselves and replay
 ;; cleanly.
-(nil? (.log.write 1))            -- true
-(nil? (.log.write 42))           -- true
-(nil? (.log.write [1 2 3 4 5]))  -- true
+(set jw_e 1)            -- 1
+(set jw_e 42)           -- 42
+(set jw_e [1 2 3 4 5])  -- [1 2 3 4 5]
 ;; Lazy scalar values materialise before journal serialization.
-(nil? (.log.write (sum [1 2 3]))) -- true
+(set jw_e (sum [1 2 3])) -- (sum [1 2 3])
 ;; .log.sync on an async journal flushes + fsyncs — returns null.
 (nil? (.log.sync)) -- true
 ;; The on-disk log file must be non-empty after four writes.
@@ -214,7 +232,6 @@
 (nil? (.log.close)) -- true
 (.log.roll)     !- domain
 (.log.snapshot) !- domain
-(.log.write 99) !- noopen
 
 ;; ── stage F: replay the file we just wrote (single-shot) ───────────
 ;; Replay returns the chunk count.  The four .log.write entries
@@ -232,7 +249,7 @@
 (.sys.exec "rm -f /tmp/rfl_log_inproc.log")
 (nil? (.log.open 'sync "/tmp/rfl_log_inproc")) -- true
 ;; See stage E comment — only self-evaluating payloads.
-(nil? (.log.write 999)) -- true
+(set jw_e 999) -- 999
 (nil? (.log.sync)) -- true
 ;; .log.roll renames /tmp/rfl_log_inproc.log → /tmp/rfl_log_inproc.<UTC>.log
 ;; and opens a fresh empty .log for append.  Returns null on success.
@@ -249,7 +266,7 @@
 ;; Fresh .log post-roll exists (open for append always creates it).
 (.sys.exec "test -f /tmp/rfl_log_inproc.log") -- 0
 ;; A write into the post-roll fresh log proves the journal stayed open.
-(nil? (.log.write 777)) -- true
+(set jw_e 777) -- 777
 
 ;; ── stage H: snapshot collapses live env into .qdb, rolls log ──────
 ;; Snapshot serialises every user binding; pre-seed something so the
@@ -273,9 +290,9 @@
 ;; "badtail" error (not silently accept the prefix).
 (.sys.exec "rm -f /tmp/rfl_log_inproc_other.log /tmp/rfl_log_inproc_other.qdb")
 (nil? (.log.open 'async "/tmp/rfl_log_inproc_other")) -- true
-(nil? (.log.write 11)) -- true
-(nil? (.log.write 22)) -- true
-(nil? (.log.write 33)) -- true
+(set jw_e 11) -- 11
+(set jw_e 22) -- 22
+(set jw_e 33) -- 33
 (nil? (.log.close)) -- true
 ;; Validate first — the clean file should give chunks=3, valid_bytes>0.
 (set vB (.log.validate "/tmp/rfl_log_inproc_other.log"))

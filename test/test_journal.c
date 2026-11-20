@@ -95,24 +95,59 @@ static void jrn_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
 /* ── Helper: write a well-formed journal entry for `val` to file `f` ── */
 
-static bool write_journal_entry_version(FILE* f, ray_t* val, uint8_t version) {
-    int64_t psize = ray_serde_size(val);
-    if (psize <= 0) return false;
+/* The entry is one commit holding one record: SET (0) binds `name` to
+ * `val`, DEL (1) unbinds it, APPEND (2) concats `val` to it. */
+#define JREC_SET    0
+#define JREC_DEL    1
+#define JREC_APPEND 2
+static bool write_journal_rec(FILE* f, int64_t opcode, const char* name, ray_t* val, uint8_t version) {
+    ray_t* rec = ray_list_new(3);
+    ray_t* op  = ray_i64(opcode);
+    ray_t* sym = ray_sym(ray_sym_intern(name, strlen(name)));
+    rec = ray_list_append(rec, op);
+    rec = ray_list_append(rec, sym);
+    if (val) rec = ray_list_append(rec, val);
+    ray_release(op);
+    ray_release(sym);
+    int64_t psize = ray_serde_size(rec);
+    if (psize <= 0) { ray_release(rec); return false; }
     uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
-    if (!buf) return false;
-    int64_t written = ray_ser_raw(buf, val);
+    if (!buf) { ray_release(rec); return false; }
+    int64_t written = ray_ser_raw(buf, rec);
+    ray_release(rec);
     if (written != psize) { ray_sys_free(buf); return false; }
 
     ray_ipc_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.prefix  = RAY_SERDE_PREFIX;
     hdr.version = version;
+    hdr.msgtype = RAY_IPC_MSG_JREC;
     hdr.size    = psize;
 
     bool ok = (fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)) &&
               (fwrite(buf, 1, (size_t)psize, f) == (size_t)psize);
     ray_sys_free(buf);
     return ok;
+}
+
+static bool write_journal_set(FILE* f, const char* name, int64_t v) {
+    ray_t* val = ray_i64(v);
+    bool ok = write_journal_rec(f, JREC_SET, name, val, RAY_SERDE_WIRE_VERSION);
+    ray_release(val);
+    return ok;
+}
+
+/* An entry that cannot apply: nothing is bound to append to. */
+static bool write_journal_bad(FILE* f) {
+    ray_t* val = ray_i64(1);
+    bool ok = write_journal_rec(f, JREC_APPEND, "jrn_never_bound", val, RAY_SERDE_WIRE_VERSION);
+    ray_release(val);
+    return ok;
+}
+
+/* An entry whose content the test does not look at. */
+static bool write_journal_entry_version(FILE* f, ray_t* val, uint8_t version) {
+    return write_journal_rec(f, JREC_SET, "jrn_entry", val, version);
 }
 
 static bool write_journal_entry(FILE* f, ray_t* val) {
@@ -440,9 +475,9 @@ static test_result_t test_journal_replay_v3_frame(void) {
 
     FILE* f = fopen(lpath, "wb");
     TEST_ASSERT_NOT_NULL(f);
-    ray_t* expr = ray_str("(set jrn_v3 88)", 15);
-    TEST_ASSERT_TRUE(write_journal_entry_version(f, expr, RAY_SERDE_WIRE_VERSION_MIN));
-    ray_release(expr);
+    ray_t* v88 = ray_i64(88);
+    TEST_ASSERT_TRUE(write_journal_rec(f, JREC_SET, "jrn_v3", v88, RAY_SERDE_WIRE_VERSION_MIN));
+    ray_release(v88);
     fclose(f);
 
     int64_t chunks = 0, errs = 0;
@@ -500,7 +535,7 @@ static test_result_t test_journal_replay_badtail_short_hdr(void) {
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
     ray_err_t e = ray_journal_replay(lpath, &chunks, NULL, &status);
     TEST_ASSERT_EQ_I(e, RAY_ERR_DOMAIN);
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_BADTAIL);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_TORN);
     TEST_ASSERT_EQ_I(chunks, 1);
 
     cleanup_base(base);
@@ -624,7 +659,7 @@ static test_result_t test_journal_replay_badtail_short_payload(void) {
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
     ray_err_t e = ray_journal_replay(lpath, NULL, NULL, &status);
     TEST_ASSERT_EQ_I(e, RAY_ERR_DOMAIN);
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_BADTAIL);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_TORN);
     PASS();
 }
 
@@ -672,14 +707,6 @@ static bool replay_report_test_counts(ray_t* r, int64_t entries, int64_t errors)
            counts[1] == errors;
 }
 
-static bool replay_report_test_write(FILE* f, const char* expression) {
-    if (!f) return false;
-    ray_t* v = ray_str(expression, strlen(expression));
-    bool ok = v && !RAY_IS_ERR(v) && write_journal_entry(f, v);
-    replay_report_test_free(v);
-    return ok;
-}
-
 static bool replay_report_test_read(const char* path, uint8_t* data,
                                     size_t cap, size_t* out) {
     FILE* f = fopen(path, "rb");
@@ -694,9 +721,9 @@ static test_result_t test_journal_replay_report_mixed(void) {
     char base[256]; make_base(base, sizeof(base), "report_mixed");
     char path[270]; log_path(path, sizeof(path), base);
     FILE* f = fopen(path, "wb");
-    bool wrote = replay_report_test_write(f, "(set _replay_report_marker (+ _replay_report_marker 1))");
-    wrote = replay_report_test_write(f, "(_replay_report_missing_handler 7)") && wrote;
-    wrote = replay_report_test_write(f, "(set _replay_report_marker (+ _replay_report_marker 10))") && wrote;
+    bool wrote = f && write_journal_set(f, "_replay_report_marker", 1);
+    wrote = f && write_journal_bad(f) && wrote;
+    wrote = f && write_journal_set(f, "_replay_report_marker", 11) && wrote;
     if (f && fclose(f) != 0) wrote = false;
     uint8_t before[1024], after[1024];
     size_t nb = 0, na = 0;
@@ -751,7 +778,7 @@ static test_result_t test_journal_replay_report_clean(void) {
     bool empty = replay_report_test_counts(r, 0, 0);
     replay_report_test_free(r);
     f = fopen(path, "wb");
-    bool wrote = replay_report_test_write(f, "42");
+    bool wrote = f && write_journal_set(f, "_replay_report_any", 42);
     if (f && fclose(f) != 0) wrote = false;
     r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
     bool clean = replay_report_test_counts(r, 1, 0);
@@ -771,7 +798,7 @@ static test_result_t test_journal_replay_report_terminal(void) {
     bool missing = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "io") == 0;
     replay_report_test_free(r);
     FILE* f = fopen(path, "wb");
-    bool wrote = replay_report_test_write(f, "(set _replay_report_prefix 1)");
+    bool wrote = f && write_journal_set(f, "_replay_report_prefix", 1);
     if (f && fputc(0, f) == EOF) wrote = false; /* short next header */
     if (f && fclose(f) != 0) wrote = false;
     r = ray_eval_str("(set _replay_report_prefix 0)");
@@ -797,42 +824,6 @@ static test_result_t test_journal_replay_report_terminal(void) {
     PASS();
 }
 
-static test_result_t test_journal_replay_report_restricted_cancel(void) {
-    char base[256]; make_base(base, sizeof(base), "report_restricted");
-    char path[270]; log_path(path, sizeof(path), base);
-    FILE* f = fopen(path, "wb");
-    bool wrote = replay_report_test_write(f, "(set _replay_report_guard 1)");
-    if (f && fclose(f) != 0) wrote = false;
-    ray_t* r = ray_eval_str("(set _replay_report_guard 0)");
-    bool initialized = r && !RAY_IS_ERR(r);
-    replay_report_test_free(r);
-    bool previous = ray_eval_get_restricted();
-    ray_eval_set_restricted(true);
-    char call[512]; snprintf(call, sizeof(call), "(.log.replay_report \"%s\")", path);
-    r = ray_eval_str(call);
-    bool restricted = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "access") == 0;
-    replay_report_test_free(r);
-    ray_eval_set_restricted(previous);
-    r = ray_eval_str("_replay_report_guard");
-    bool not_applied = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 0;
-    replay_report_test_free(r);
-    ray_t* arg = ray_str(path, strlen(path));
-    ray_request_interrupt();
-    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
-    bool cancelled = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "cancel") == 0;
-    replay_report_test_free(r);
-    ray_clear_interrupt();
-    r = arg && !RAY_IS_ERR(arg) ? ray_log_replay_report_fn(arg) : NULL;
-    bool healthy = replay_report_test_counts(r, 1, 0);
-    replay_report_test_free(r);
-    replay_report_test_free(arg);
-    cleanup_base(base);
-    TEST_ASSERT_TRUE(wrote && initialized);
-    TEST_ASSERT_TRUE(restricted && not_applied);
-    TEST_ASSERT_TRUE(cancelled && healthy);
-    PASS();
-}
-
 static test_result_t test_journal_replay_eval_error(void) {
     char base[256]; make_base(base, sizeof(base), "rep_evalerr");
     char lpath[270]; log_path(lpath, sizeof(lpath), base);
@@ -850,9 +841,7 @@ static test_result_t test_journal_replay_eval_error(void) {
 
     /* This string expression is syntactically valid but evaluates to an error
      * because the symbol `__no_such_sym_ever__` is undefined. */
-    ray_t* v2 = ray_str("__no_such_sym_ever__", 20);
-    TEST_ASSERT_TRUE(write_journal_entry(f, v2));
-    ray_release(v2);
+    TEST_ASSERT_TRUE(write_journal_bad(f));
 
     /* One more good integer. */
     ray_t* v3 = ray_i64(7);
@@ -966,9 +955,7 @@ static test_result_t test_journal_open_replays_existing_log(void) {
     /* Pre-create a log with one good entry (set jrn_rep_var 55). */
     FILE* f = fopen(lpath, "wb");
     TEST_ASSERT_NOT_NULL(f);
-    ray_t* expr = ray_str("(set jrn_rep_var 55)", 20);
-    TEST_ASSERT_TRUE(write_journal_entry(f, expr));
-    ray_release(expr);
+    TEST_ASSERT_TRUE(write_journal_set(f, "jrn_rep_var", 55));
     fclose(f);
 
     /* Open should replay without error. */
@@ -1323,14 +1310,13 @@ static test_result_t test_journal_crash_window_no_double_apply(void) {
     char base[256]; make_base(base, sizeof(base), "cwin");
     char lpath[270]; log_path(lpath, sizeof(lpath), base);
 
-    /* Session 1: journal an increment (non-idempotent on purpose) and
-     * apply it once, exactly like the IPC eval+log path. */
+    /* Session 1: journal an append (non-idempotent on purpose: applied
+     * twice it leaves one row too many). */
     char src[640];
     snprintf(src, sizeof(src),
-             "(set jw_x 0)"
+             "(set jw_t (table [x] (list [0])))"
              "(.log.open 'async \"%s\")"
-             "(.log.write (quote (set jw_x (+ jw_x 1))))"
-             "(set jw_x (+ jw_x 1))",
+             "(insert 'jw_t (list 1))",
              base);
     ray_t* a = ray_eval_str(src);
     TEST_ASSERT_NOT_NULL(a);
@@ -1338,7 +1324,7 @@ static test_result_t test_journal_crash_window_no_double_apply(void) {
     if (a != RAY_NULL_OBJ) ray_release(a);
 
     /* Value the snapshot will hold. */
-    ray_t* pre = ray_eval_str("jw_x");
+    ray_t* pre = ray_eval_str("(count jw_t)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(pre));
     int64_t v_pre = pre->i64;
     ray_release(pre);
@@ -1364,10 +1350,10 @@ static test_result_t test_journal_crash_window_no_double_apply(void) {
 
     /* Restart: clobber the binding, recover.  The covered log must be
      * skipped — jw_x comes back as the snapshot value, not value+1. */
-    ray_t* c = ray_eval_str("(set jw_x 100)");
+    ray_t* c = ray_eval_str("(set jw_t 100)");
     if (c && !RAY_IS_ERR(c)) ray_release(c);
     TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
-    ray_t* r1 = ray_eval_str("jw_x");
+    ray_t* r1 = ray_eval_str("(count jw_t)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     TEST_ASSERT_EQ_I(r1->i64, v_pre);
     ray_release(r1);
@@ -1377,7 +1363,7 @@ static test_result_t test_journal_crash_window_no_double_apply(void) {
     char more[640];
     snprintf(more, sizeof(more),
              "(.log.open 'async \"%s\")"
-             "(.log.write (quote (set jw_x (+ jw_x 1))))"
+             "(insert 'jw_t (list 1))"
              "(.log.close)",
              base);
     ray_t* m = ray_eval_str(more);
@@ -1385,10 +1371,10 @@ static test_result_t test_journal_crash_window_no_double_apply(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(m));
     if (m != RAY_NULL_OBJ) ray_release(m);
 
-    ray_t* c2 = ray_eval_str("(set jw_x 100)");
+    ray_t* c2 = ray_eval_str("(set jw_t 100)");
     if (c2 && !RAY_IS_ERR(c2)) ray_release(c2);
     TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
-    ray_t* r2 = ray_eval_str("jw_x");
+    ray_t* r2 = ray_eval_str("(count jw_t)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
     TEST_ASSERT_EQ_I(r2->i64, v_pre + 1);
     ray_release(r2);
@@ -1511,302 +1497,6 @@ static test_result_t test_journal_snapshot_function_binding_recovers(void) {
     ray_release(val);
 
     cleanup_base(base);
-    PASS();
-}
-
-/* 7f. #787: a snapshot keeps its lambdas' .sys.trust marks.  A trusted verb
- * and its unmarked twin are snapshotted, then three restricted requests are
- * logged after the snapshot, as a live server logs them: the verb's call,
- * which ran lifted (its note names it, two frames later), the twin's, and
- * a call of the verb that was refused live (no note, as when its trust
- * was revoked after the snapshot).  Recovery, in a process where neither is bound,
- * restores the mark before it replays the log: only the call that ran
- * lifted live runs lifted again.  Outside the snapshot the mark is
- * neither written nor read. */
-/* Wire version of the frames the two helpers below write: a test of a log
- * written before the bump sets it to RAY_SERDE_WIRE_VERSION_MIN. */
-static uint8_t jrn_frame_version = RAY_SERDE_WIRE_VERSION;
-
-static bool jrn_log_restricted(const char* text) {
-    ray_t* msg = ray_str(text, strlen(text));
-    if (!msg || RAY_IS_ERR(msg)) return false;
-    int64_t psize = ray_serde_size(msg);
-    uint8_t* buf = psize > 0 ? (uint8_t*)ray_sys_alloc((size_t)psize) : NULL;
-    bool ok = buf && ray_ser_raw(buf, msg) == psize;
-    ray_release(msg);
-    if (ok) {
-        ray_ipc_header_t hdr;
-        memset(&hdr, 0, sizeof(hdr));
-        hdr.prefix  = RAY_SERDE_PREFIX;
-        hdr.version = jrn_frame_version;
-        hdr.flags   = RAY_IPC_FLAG_RESTRICTED;
-        hdr.size    = psize;
-        ok = ray_journal_write_bytes(&hdr, buf, psize) == RAY_OK;
-    }
-    if (buf) ray_sys_free(buf);
-    return ok;
-}
-
-/* The note a live server writes after a restricted request whose trusted
- * calls ran lifted (RAY_IPC_MSG_JNOTE): the generation and offset of the
- * request's frame, then the calls' identities. */
-static bool jrn_log_note(int64_t gen, int64_t off, const int64_t* ids, int64_t n) {
-    int64_t raw[18] = { gen, off };
-    if (n > 16) return false;
-    memcpy(raw + 2, ids, (size_t)n * sizeof(int64_t));
-    ray_t* v = ray_vec_from_raw(RAY_I64, raw, n + 2);
-    if (!v || RAY_IS_ERR(v)) return false;
-    int64_t psize = ray_serde_size(v);
-    uint8_t* buf = psize > 0 ? (uint8_t*)ray_sys_alloc((size_t)psize) : NULL;
-    bool ok = buf && ray_ser_raw(buf, v) == psize;
-    ray_release(v);
-    if (ok) {
-        ray_ipc_header_t hdr;
-        memset(&hdr, 0, sizeof(hdr));
-        hdr.prefix  = RAY_SERDE_PREFIX;
-        hdr.version = jrn_frame_version;
-        hdr.endian  = RAY_SERDE_ENDIAN;
-        hdr.msgtype = RAY_IPC_MSG_JNOTE;
-        hdr.size    = psize;
-        ok = ray_journal_write_bytes(&hdr, buf, psize) == RAY_OK;
-    }
-    if (buf) ray_sys_free(buf);
-    return ok;
-}
-
-static ray_t* jrn_eval_restricted(const char* text) {
-    ray_restrict_save_t saved;
-    ray_eval_restrict_enter(true, &saved);
-    ray_t* r = ray_eval_str(text);
-    ray_eval_restrict_leave(&saved);
-    return r;
-}
-
-static test_result_t test_journal_snapshot_keeps_trust(void) {
-    char base[256]; make_base(base, sizeof(base), "snap_trust");
-
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-    ray_t* r = ray_eval_str("(do (set jrn_tr_kv 0)"
-                            "    (set jrn_tr_put (fn [v] (set jrn_tr_kv v) v))"
-                            "    (set jrn_tr_plain (fn [v] (set jrn_tr_kv v) v))"
-                            "    (.sys.trust 'jrn_tr_put) 0)");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-    ray_release(r);
-    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
-    ray_t* live_put = ray_env_get_global(ray_sym_intern("jrn_tr_put", 10));
-    TEST_ASSERT_NOT_NULL(live_put);
-    int64_t put_id = (int64_t)LAMBDA_TRUSTED(live_put);
-    int64_t gen = 0, off = 0;
-    TEST_ASSERT_TRUE(ray_journal_position(&gen, &off));
-    TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 6)"));
-    /* Frames logged between a request and its note do not part them. */
-    TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_plain 7)"));
-    int64_t gen3 = 0, off3 = 0;
-    TEST_ASSERT_TRUE(ray_journal_position(&gen3, &off3));
-    TEST_ASSERT_TRUE(jrn_log_restricted("(jrn_tr_put 8)"));
-    TEST_ASSERT_TRUE(jrn_log_note(gen, off, &put_id, 1));
-    /* A note of another log generation names no request of this log. */
-    TEST_ASSERT_TRUE(jrn_log_note(gen3 + 1, off3, &put_id, 1));
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-
-    /* A fresh process: nothing bound, nothing marked. */
-    const char* names[] = { "jrn_tr_kv", "jrn_tr_put", "jrn_tr_plain" };
-    ray_t* zero = ray_i64(0);
-    for (int i = 0; i < 3; i++)
-        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern(names[i], strlen(names[i])), zero), RAY_OK);
-    ray_release(zero);
-
-    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
-    cleanup_base(base);
-    ray_t* kv = ray_env_get_global(ray_sym_intern("jrn_tr_kv", 9));
-    TEST_ASSERT_NOT_NULL(kv);
-    TEST_ASSERT_EQ_I(kv->i64, 6);
-    TEST_ASSERT_FALSE(ray_eval_get_restricted());
-
-    /* Restored: the verb is trusted again, the twin still is not. */
-    ray_t* put = jrn_eval_restricted("(jrn_tr_put 8)");
-    ray_t* plain = jrn_eval_restricted("(jrn_tr_plain 9)");
-    bool put_ok = put && !RAY_IS_ERR(put) && put->i64 == 8;
-    bool plain_refused = plain && RAY_IS_ERR(plain) && strcmp(ray_err_code(plain), "access") == 0;
-    if (put && RAY_IS_ERR(put)) ray_error_free(put); else if (put) ray_release(put);
-    if (plain && RAY_IS_ERR(plain)) ray_error_free(plain); else if (plain) ray_release(plain);
-    TEST_ASSERT_TRUE(put_ok);
-    TEST_ASSERT_TRUE(plain_refused);
-
-    /* Outside a snapshot the bit is not written, and a frame carrying it
-     * marks nothing. */
-    ray_t* fn = ray_env_get_global(ray_sym_intern("jrn_tr_put", 10));
-    TEST_ASSERT_TRUE(fn && fn->type == RAY_LAMBDA && LAMBDA_TRUSTED(fn));
-    ray_t* plain_bytes = ray_ser(fn);
-    bool prev = ray_serde_keep_trust(true);
-    ray_t* marked_bytes = ray_ser(fn);
-    ray_t* from_plain = ray_de(plain_bytes);
-    ray_serde_keep_trust(prev);
-    ray_t* from_marked = ray_de(marked_bytes);
-    bool plain_unmarked = from_plain && !RAY_IS_ERR(from_plain) &&
-                          from_plain->type == RAY_LAMBDA && !LAMBDA_TRUSTED(from_plain);
-    bool marked_unmarked = from_marked && !RAY_IS_ERR(from_marked) &&
-                           from_marked->type == RAY_LAMBDA && !LAMBDA_TRUSTED(from_marked);
-    ray_t* objs[] = { plain_bytes, marked_bytes, from_plain, from_marked };
-    for (int i = 0; i < 4; i++) {
-        if (objs[i] && RAY_IS_ERR(objs[i])) ray_error_free(objs[i]);
-        else if (objs[i]) ray_release(objs[i]);
-    }
-    TEST_ASSERT_TRUE(plain_unmarked);
-    TEST_ASSERT_TRUE(marked_unmarked);
-    PASS();
-}
-
-/* 7g. #787: a journal note is no entry.  One that names a request of this
- * log, one that names no frame and one of another log generation (left by
- * a roll or a snapshot between a request and its note) are all skipped:
- * replay counts and evaluates the requests only. */
-static test_result_t test_journal_lift_note_not_an_entry(void) {
-    char base[256]; make_base(base, sizeof(base), "lift_note");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-    int64_t ids[2] = { 1, 2 };
-    int64_t gen = 0, off = 0;
-    TEST_ASSERT_TRUE(jrn_log_note(0, 0, &ids[0], 1));
-    TEST_ASSERT_TRUE(ray_journal_position(&gen, &off));
-    TEST_ASSERT_TRUE(jrn_log_restricted("(+ 1 2)"));
-    TEST_ASSERT_TRUE(jrn_log_note(gen, off, &ids[1], 1));
-    TEST_ASSERT_TRUE(jrn_log_note(gen + 1, off, &ids[1], 1));
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-
-    int64_t chunks = -1, errs = -1;
-    ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_err_t e = ray_journal_replay(lpath, &chunks, &errs, &status);
-    cleanup_base(base);
-    TEST_ASSERT_EQ_I(e, RAY_OK);
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
-    TEST_ASSERT_EQ_I(chunks, 1);
-    TEST_ASSERT_EQ_I(errs, 0);
-    TEST_ASSERT_FALSE(ray_eval_get_restricted());
-    PASS();
-}
-
-/* 7i. #787: a log with no preamble is generation 0, and its notes name
- * that generation: replay reads the generation from the log it replays. */
-static test_result_t test_journal_lift_note_headerless_log(void) {
-    char base[256]; make_base(base, sizeof(base), "lift_legacy");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-    ray_t* r = ray_eval_str("(do (set jrn_lg_kv 0) (set jrn_lg_put (fn [v] (set jrn_lg_kv v) v))"
-                            "    (.sys.trust 'jrn_lg_put) 0)");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-    ray_release(r);
-    ray_t* put = ray_env_get_global(ray_sym_intern("jrn_lg_put", 10));
-    TEST_ASSERT_NOT_NULL(put);
-    int64_t note[3] = { 0, 0, (int64_t)LAMBDA_TRUSTED(put) };
-    ray_t* frames[2] = { ray_str("(jrn_lg_put 3)", 14), ray_vec_from_raw(RAY_I64, note, 3) };
-    FILE* f = fopen(lpath, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    bool ok = true;
-    for (int i = 0; i < 2 && ok; i++) {
-        int64_t psize = ray_serde_size(frames[i]);
-        uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
-        ok = buf && ray_ser_raw(buf, frames[i]) == psize;
-        ray_ipc_header_t hdr;
-        memset(&hdr, 0, sizeof(hdr));
-        hdr.prefix  = RAY_SERDE_PREFIX;
-        hdr.version = RAY_SERDE_WIRE_VERSION;
-        hdr.endian  = RAY_SERDE_ENDIAN;
-        hdr.flags   = i == 0 ? RAY_IPC_FLAG_RESTRICTED : 0;
-        hdr.msgtype = i == 0 ? RAY_IPC_MSG_SYNC : RAY_IPC_MSG_JNOTE;
-        hdr.size    = psize;
-        ok = ok && fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
-             fwrite(buf, 1, (size_t)psize, f) == (size_t)psize;
-        if (buf) ray_sys_free(buf);
-        ray_release(frames[i]);
-    }
-    fclose(f);
-    TEST_ASSERT_TRUE(ok);
-
-    int64_t chunks = -1, errs = -1;
-    ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_err_t e = ray_journal_replay(lpath, &chunks, &errs, &status);
-    cleanup_base(base);
-    TEST_ASSERT_EQ_I(e, RAY_OK);
-    TEST_ASSERT_EQ_I(chunks, 1);
-    TEST_ASSERT_EQ_I(errs, 0);
-    ray_t* kv = ray_env_get_global(ray_sym_intern("jrn_lg_kv", 9));
-    TEST_ASSERT_TRUE(kv && kv->i64 == 3);
-    PASS();
-}
-
-/* 7h. #787: a request finds its note wherever the log holds it.  4000
- * restricted calls of a trusted verb are logged, then their notes in the
- * reverse order; recovery lifts every one. */
-static test_result_t test_journal_lift_notes_any_order(void) {
-    enum { N = 4000 };
-    char base[256]; make_base(base, sizeof(base), "lift_many");
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-    ray_t* r = ray_eval_str("(do (set jrn_ln_c 0) (set jrn_ln_inc (fn [] (set jrn_ln_c (+ jrn_ln_c 1))))"
-                            "    (.sys.trust 'jrn_ln_inc) 0)");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-    ray_release(r);
-    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
-    ray_t* inc = ray_env_get_global(ray_sym_intern("jrn_ln_inc", 10));
-    TEST_ASSERT_NOT_NULL(inc);
-    int64_t id = (int64_t)LAMBDA_TRUSTED(inc);
-    int64_t* offs = (int64_t*)ray_sys_alloc(N * sizeof(int64_t));
-    TEST_ASSERT_NOT_NULL(offs);
-    int64_t gen = 0;
-    bool ok = true;
-    for (int i = 0; i < N && ok; i++)
-        ok = ray_journal_position(&gen, &offs[i]) && jrn_log_restricted("(jrn_ln_inc)");
-    for (int i = N - 1; i >= 0 && ok; i--) ok = jrn_log_note(gen, offs[i], &id, 1);
-    ray_sys_free(offs);
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    TEST_ASSERT_TRUE(ok);
-
-    ray_t* zero = ray_i64(0);
-    (void)ray_env_set(ray_sym_intern("jrn_ln_c", 8), zero);
-    (void)ray_env_set(ray_sym_intern("jrn_ln_inc", 10), zero);
-    ray_release(zero);
-    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
-    cleanup_base(base);
-    ray_t* c = ray_env_get_global(ray_sym_intern("jrn_ln_c", 8));
-    TEST_ASSERT_NOT_NULL(c);
-    TEST_ASSERT_EQ_I(c->i64, N);
-    PASS();
-}
-
-/* A log started before the wire version bump and continued after it: a
- * restricted request and its note written as v3 frames, then another pair
- * as v4.  Recovery collects both notes, so both calls run lifted again. */
-static test_result_t test_journal_lift_notes_v3_frames(void) {
-    char base[256]; make_base(base, sizeof(base), "lift_v3");
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-    ray_t* r = ray_eval_str("(do (set jrn_l3_c 0) (set jrn_l3_inc (fn [] (set jrn_l3_c (+ jrn_l3_c 1))))"
-                            "    (.sys.trust 'jrn_l3_inc) 0)");
-    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
-    ray_release(r);
-    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
-    ray_t* inc = ray_env_get_global(ray_sym_intern("jrn_l3_inc", 10));
-    TEST_ASSERT_NOT_NULL(inc);
-    int64_t id = (int64_t)LAMBDA_TRUSTED(inc);
-    int64_t gen = 0, off = 0;
-    bool ok = true;
-    uint8_t versions[2] = { RAY_SERDE_WIRE_VERSION_MIN, RAY_SERDE_WIRE_VERSION };
-    for (int i = 0; i < 2 && ok; i++) {
-        jrn_frame_version = versions[i];
-        ok = ray_journal_position(&gen, &off) && jrn_log_restricted("(jrn_l3_inc)") &&
-             jrn_log_note(gen, off, &id, 1);
-    }
-    jrn_frame_version = RAY_SERDE_WIRE_VERSION;
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    TEST_ASSERT_TRUE(ok);
-
-    ray_t* zero = ray_i64(0);
-    (void)ray_env_set(ray_sym_intern("jrn_l3_c", 8), zero);
-    (void)ray_env_set(ray_sym_intern("jrn_l3_inc", 10), zero);
-    ray_release(zero);
-    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
-    cleanup_base(base);
-    ray_t* c = ray_env_get_global(ray_sym_intern("jrn_l3_c", 8));
-    TEST_ASSERT_NOT_NULL(c);
-    TEST_ASSERT_EQ_I(c->i64, 2);
     PASS();
 }
 
@@ -1945,166 +1635,6 @@ static test_result_t test_journal_write_during_replay_noop(void) {
 
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     unlink(src_log);
-    cleanup_base(base);
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- *  11. Restricted flag propagation through replay
- * ═══════════════════════════════════════════════════════════════════════ */
-
-static test_result_t test_journal_replay_restricted_flag(void) {
-    char base[256]; make_base(base, sizeof(base), "rep_restricted");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-
-    FILE* f = fopen(lpath, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-
-    /* Write an entry with RAY_IPC_FLAG_RESTRICTED set. */
-    ray_t* v = ray_i64(100);
-    int64_t psize = ray_serde_size(v);
-    uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
-    TEST_ASSERT_NOT_NULL(buf);
-    ray_ser_raw(buf, v);
-    ray_release(v);
-
-    ray_ipc_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.prefix  = RAY_SERDE_PREFIX;
-    hdr.version = RAY_SERDE_WIRE_VERSION;
-    hdr.flags   = 0x02;  /* RAY_IPC_FLAG_RESTRICTED */
-    hdr.size    = psize;
-    bool ok = (fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)) &&
-              (fwrite(buf, 1, (size_t)psize, f) == (size_t)psize);
-    ray_sys_free(buf);
-    TEST_ASSERT_TRUE(ok);
-    fclose(f);
-
-    int64_t chunks = 0;
-    ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_err_t e = ray_journal_replay(lpath, &chunks, NULL, &status);
-    TEST_ASSERT_EQ_I(e, RAY_OK);
-    TEST_ASSERT_EQ_I(chunks, 1);
-
-    /* Restricted flag must be restored after replay. */
-    TEST_ASSERT_FALSE(ray_eval_get_restricted());
-
-    cleanup_base(base);
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- *  12. Compressed frame replay (decompress_if_needed happy path)
- * ═══════════════════════════════════════════════════════════════════════ */
-
-/* Build a valid compressed journal frame manually:
- * header with RAY_IPC_FLAG_COMPRESSED, payload = 4-byte uncomp_size
- * followed by the LZ4-like compressed bytes.  We use ray_ipc_compress
- * which requires >2000 bytes to actually compress; for smaller payloads
- * it returns 0 and we must write uncompressed.  Instead, we craft a
- * "compressed" frame by using the same format ipc.c uses:
- *   [uint32_t uncomp_size][compressed_bytes...]
- * where we compress using ray_ipc_compress.  If compress returns 0 for
- * our small payload, we skip the test rather than injecting bad data. */
-static test_result_t test_journal_replay_compressed_frame(void) {
-    char base[256]; make_base(base, sizeof(base), "rep_comp");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-
-    /* Serialize a value and try to compress it. */
-    ray_t* v = ray_i64(12345);
-    int64_t psize = ray_serde_size(v);
-    uint8_t* raw = (uint8_t*)ray_sys_alloc((size_t)psize);
-    TEST_ASSERT_NOT_NULL(raw);
-    ray_ser_raw(raw, v);
-    ray_release(v);
-
-    /* ray_ipc_compress requires src len > RAY_IPC_COMPRESS_THRESHOLD (2000). */
-    /* Build a larger payload by repeating the serialized value. */
-    size_t bigsize = 3000;
-    uint8_t* big = (uint8_t*)ray_sys_alloc(bigsize);
-    TEST_ASSERT_NOT_NULL(big);
-    /* Fill with repetitive pattern (compresses well). */
-    for (size_t i = 0; i < bigsize; i++) big[i] = (uint8_t)(i % 7);
-
-    uint8_t* comp_buf = (uint8_t*)ray_sys_alloc(bigsize);
-    TEST_ASSERT_NOT_NULL(comp_buf);
-
-    size_t clen = ray_ipc_compress(big, bigsize, comp_buf, bigsize);
-    if (clen == 0 || clen + 4 >= bigsize) {
-        /* Compression yielded nothing useful for this input — skip. */
-        ray_sys_free(raw); ray_sys_free(big); ray_sys_free(comp_buf);
-        cleanup_base(base);
-        PASS(); /* Not a failure — just can't exercise this path here. */
-    }
-
-    /* Build the compressed payload: [uint32_t uncomp_size][compressed_bytes]. */
-    size_t payload_size = 4 + clen;
-    uint8_t* payload = (uint8_t*)ray_sys_alloc(payload_size);
-    TEST_ASSERT_NOT_NULL(payload);
-    uint32_t uncomp = (uint32_t)bigsize;
-    memcpy(payload, &uncomp, 4);
-    memcpy(payload + 4, comp_buf, clen);
-
-    ray_ipc_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.prefix  = RAY_SERDE_PREFIX;
-    hdr.version = RAY_SERDE_WIRE_VERSION;
-    hdr.flags   = RAY_IPC_FLAG_COMPRESSED;
-    hdr.size    = (int64_t)payload_size;
-
-    FILE* f = fopen(lpath, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    fwrite(&hdr, 1, sizeof(hdr), f);
-    fwrite(payload, 1, payload_size, f);
-    fclose(f);
-
-    ray_sys_free(raw); ray_sys_free(big); ray_sys_free(comp_buf); ray_sys_free(payload);
-
-    /* Replay — decompress_if_needed will take the COMPRESSED branch.
-     * The decompressed bytes are the big[] pattern, which ray_de_raw
-     * might reject (not a valid ray object) — that's OK, we care
-     * that the compressed path ran, not that eval succeeded. */
-    int64_t chunks = 0;
-    ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_journal_replay(lpath, &chunks, NULL, &status);
-    /* Either DESER (de_raw rejected) or OK — both mean decompress ran. */
-    TEST_ASSERT_TRUE(status == RAY_JREPLAY_DESER ||
-                     status == RAY_JREPLAY_OK ||
-                     status == RAY_JREPLAY_DECOMP);
-
-    cleanup_base(base);
-    PASS();
-}
-
-/* Test the decompress_if_needed failure paths:
- * 1. payload_len < 4 with COMPRESSED flag -> false
- * 2. uncomp_size == 0 -> false
- * 3. uncomp_size > 256 MiB -> false
- * These are exercised via replay with a COMPRESSED header + invalid payload. */
-static test_result_t test_journal_replay_compressed_bad_payload(void) {
-    char base[256]; make_base(base, sizeof(base), "rep_comp_bad");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-
-    FILE* f = fopen(lpath, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-
-    /* Compressed frame with only 3 bytes of payload (< 4 -> decompress rejects). */
-    ray_ipc_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.prefix  = RAY_SERDE_PREFIX;
-    hdr.version = RAY_SERDE_WIRE_VERSION;
-    hdr.flags   = RAY_IPC_FLAG_COMPRESSED;
-    hdr.size    = 3;
-    fwrite(&hdr, 1, sizeof(hdr), f);
-    uint8_t short_payload[3] = {0x01, 0x02, 0x03};
-    fwrite(short_payload, 1, 3, f);
-    fclose(f);
-
-    ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_journal_replay(lpath, NULL, NULL, &status);
-    /* decompress returns false -> status = RAY_JREPLAY_DECOMP. */
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_DECOMP);
-
     cleanup_base(base);
     PASS();
 }
@@ -2606,109 +2136,6 @@ static test_result_t test_ops_open_sync_mode(void) {
     PASS();
 }
 
-/* 22o. ray_log_write_fn: NULL expr — the !expr guard at line 89.
- *  Journal must be open first so we pass the is_open guard. */
-static test_result_t test_ops_write_null_expr(void) {
-    char base[256]; make_base(base, sizeof(base), "ops_null_expr");
-
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-
-    ray_t* r = ray_log_write_fn(NULL);
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    ray_release(r);
-
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    cleanup_base(base);
-    PASS();
-}
-
-/* 22p. ray_log_write_fn: journal not open — noopen guard (line 87-88).
- *  Also exercises ray_log_write_fn entry with a valid non-NULL expr so we
- *  confirm the !is_open branch returns an error atom. */
-static test_result_t test_ops_write_noopen(void) {
-    /* Ensure journal is closed. */
-    ray_journal_close();
-
-    ray_t* expr = ray_i64(42);
-    ray_t* r    = ray_log_write_fn(expr);
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    ray_release(expr);
-    ray_release(r);
-    PASS();
-}
-
-/* 22qa. ray_ipc_set_auto_journal_eval: production setter, returns the previous
- * value so a nested scope restores correctly. */
-static test_result_t test_ops_write_auto_journal_eval_scope(void) {
-    char base[256]; make_base(base, sizeof(base), "ops_auto_scope");
-
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-
-    /* The flag is thread-local state the fixture teardown does not reset:
-     * collect every observation, restore the previous scope and release what
-     * the test owns, and only then assert. */
-    bool before = ray_ipc_auto_journal_eval();
-    bool outer  = ray_ipc_set_auto_journal_eval(true);
-    bool in_scope = ray_ipc_auto_journal_eval();
-
-    ray_t* expr = ray_i64(42);
-    ray_t* r_in = expr ? ray_log_write_fn(expr) : NULL;
-    bool in_is_err = r_in && RAY_IS_ERR(r_in);
-    bool in_code_domain = in_is_err && strcmp(ray_err_code(r_in), "domain") == 0;
-
-    /* nested: the inner scope sees true and restores true */
-    bool inner = ray_ipc_set_auto_journal_eval(true);
-    ray_ipc_set_auto_journal_eval(inner);
-    bool after_nested = ray_ipc_auto_journal_eval();
-
-    ray_ipc_set_auto_journal_eval(outer);
-    bool after_restore = ray_ipc_auto_journal_eval();
-    ray_t* r_out = expr ? ray_log_write_fn(expr) : NULL;   /* outside the scope the write is accepted */
-    bool out_ok = r_out && !RAY_IS_ERR(r_out);
-
-    if (r_in) { if (RAY_IS_ERR(r_in)) ray_error_free(r_in); else ray_release(r_in); }
-    if (r_out) { if (RAY_IS_ERR(r_out)) ray_error_free(r_out); else ray_release(r_out); }
-    if (expr) ray_release(expr);
-    ray_journal_close();
-    cleanup_base(base);
-
-    TEST_ASSERT_FALSE(before);
-    TEST_ASSERT_FALSE(outer);
-    TEST_ASSERT_TRUE(in_scope);
-    TEST_ASSERT_TRUE(in_is_err);
-    TEST_ASSERT_TRUE(in_code_domain);
-    TEST_ASSERT_TRUE(inner);
-    TEST_ASSERT_TRUE(after_nested);
-    TEST_ASSERT_FALSE(after_restore);
-    TEST_ASSERT_TRUE(out_ok);
-    PASS();
-}
-
-/* 22q. ray_log_write_fn: reject explicit writes from auto-journaled IPC eval. */
-static test_result_t test_ops_write_rejects_auto_journal_eval(void) {
-    char base[256]; make_base(base, sizeof(base), "ops_auto_eval");
-
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-
-    ray_t* expr = ray_i64(42);
-    TEST_ASSERT_NOT_NULL(expr);
-    ray_ipc_set_auto_journal_eval_for_test(true);
-    ray_t* r = ray_log_write_fn(expr);
-    ray_ipc_set_auto_journal_eval_for_test(false);
-    ray_release(expr);
-
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
-    ray_error_free(r);
-
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    cleanup_base(base);
-    PASS();
-}
-
 /* 22qb. (.ipc.auto_journal_eval): the Rayfall-visible predicate reads the
  * auto-journal scope, so code running inside a journaled request can skip
  * its own frames instead of hitting the `.log.write` refusal. */
@@ -2998,137 +2425,6 @@ static test_result_t test_ops_log_status_open_stage(void) {
     PASS();
 }
 
-/* 22r. ray_log_write_fn: pay_size <= 0 (lines 100-103).
- *
- *  ray_serde_size returns 0 for object types not in its switch (any type
- *  value that is not a known atom/vector/container type).  We manufacture
- *  a stack-local ray_t with type=14 — outside the known range — so the
- *  function hits the "serde size 0" domain error without touching any
- *  heap internals of the fake object.
- *
- *  Safety: ray_is_lazy checks type==104; RAY_IS_ERR checks type==127;
- *  RAY_IS_NULL checks type==126.  Type=14 passes all three predicates
- *  safely.  ray_serde_size dereferences obj->len (for the overflow guard)
- *  which is 0 from the memset — safe. */
-static test_result_t test_ops_write_serde_size_zero(void) {
-    char base[256]; make_base(base, sizeof(base), "ops_serde_zero");
-
-    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
-
-    /* Stack object with an unknown type tag (14 is not RAY_LIST through
-     * RAY_STR, not RAY_LAZY, RAY_ERROR, or RAY_NULL). */
-    ray_t fake;
-    memset(&fake, 0, sizeof(fake));
-    fake.type = 14;       /* positive unknown → ray_serde_size returns 0 */
-    fake.rc   = 1;        /* non-zero so any accidental retain/release is safe */
-
-    ray_t* r = ray_log_write_fn(&fake);
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    ray_release(r);
-
-    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
-    cleanup_base(base);
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- *  23. End-to-end RFL round-trip: both `.log.write` symbol-head forms replay.
- *
- *  A symbol in functional position applies the named function, so BOTH the
- *  tick form `(list 'f 10)` and the quote form `(list (quote f) 5)` replay
- *  by applying `f`.  We drive the public RFL verbs, then reset the
- *  accumulator and replay explicitly, observing the side effect (15).
- * ═══════════════════════════════════════════════════════════════════════ */
-static test_result_t test_journal_replay_symbol_head_both_forms(void) {
-    char base[256]; make_base(base, sizeof(base), "symhead");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-
-    /* Open async, define an accumulating fn, write both symbol-head forms,
-     * then close.  Multiple top-level forms in one source string are wrapped
-     * in an implicit (do ...) by the parser, so this evaluates in order. */
-    char src[640];
-    snprintf(src, sizeof(src),
-             "(set _acc 0)"
-             "(set f (fn [x] (set _acc (+ _acc x))))"
-             "(.log.open 'async \"%s\")"
-             "(.log.write (list 'f 10))"
-             "(.log.write (list (quote f) 5))"
-             "(.log.close)",
-             base);
-    ray_t* a = ray_eval_str(src);
-    TEST_ASSERT_NOT_NULL(a);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
-    if (a != RAY_NULL_OBJ) ray_release(a);
-
-    /* Reset the accumulator, then replay the log: both records apply `f`. */
-    char replay[400];
-    snprintf(replay, sizeof(replay),
-             "(set _acc 0)(.log.replay \"%s\")", lpath);
-    ray_t* z = ray_eval_str(replay);
-    TEST_ASSERT_NOT_NULL(z);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(z));
-    if (z != RAY_NULL_OBJ) ray_release(z);
-
-    /* Both records applied: 0 + 10 + 5 == 15. */
-    ray_t* acc = ray_eval_str("_acc");
-    TEST_ASSERT_NOT_NULL(acc);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(acc));
-    TEST_ASSERT_EQ_I(acc->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(acc->i64, 15);
-    ray_release(acc);
-
-    cleanup_base(base);
-    PASS();
-}
-
-/* ═══════════════════════════════════════════════════════════════════════
- *  23b. A well-framed record whose head symbol is UNBOUND replays to a
- *  graceful per-chunk eval error — replay counts it and continues, it
- *  must NEVER crash.
- *
- *  A symbol in functional position resolves+applies; an unbound head
- *  yields a `name` error from eval rather than a crash.  Framing stays
- *  intact (the frame deserialized fine), so replay returns RAY_OK with
- *  status RAY_JREPLAY_OK, chunks == 1, and the failure observable as
- *  errs == 1.  This guards the eval-corruption fix against regression.
- * ═══════════════════════════════════════════════════════════════════════ */
-static test_result_t test_journal_replay_unbound_head_is_graceful(void) {
-    char base[256]; make_base(base, sizeof(base), "unbound_head");
-    char lpath[270]; log_path(lpath, sizeof(lpath), base);
-
-    /* Drive the public RFL verbs to write ONE record whose head symbol is
-     * not bound to anything, then close.  Multiple top-level forms in one
-     * source string are wrapped in an implicit (do ...), so this evaluates
-     * in order. */
-    char src[512];
-    snprintf(src, sizeof(src),
-             "(.log.open 'async \"%s\")"
-             "(.log.write (list 'definitely_not_bound 1))"
-             "(.log.close)",
-             base);
-    ray_t* a = ray_eval_str(src);
-    TEST_ASSERT_NOT_NULL(a);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
-    if (a != RAY_NULL_OBJ) ray_release(a);
-
-    /* Replay: the lone frame deserializes fine (framing intact) but its
-     * eval raises a `name` error.  No crash; the error is counted. */
-    int64_t chunks = 0, errs = 0;
-    ray_jreplay_status_t status = RAY_JREPLAY_OK;
-    ray_err_t rc = ray_journal_replay(lpath, &chunks, &errs, &status);
-
-    /* Framing valid -> RAY_OK / RAY_JREPLAY_OK; the one record was replayed
-     * (chunks == 1) and its eval failure noted (errs == 1). */
-    TEST_ASSERT_EQ_I(rc, RAY_OK);
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
-    TEST_ASSERT_EQ_I(chunks, 1);
-    TEST_ASSERT_EQ_I(errs, 1);
-
-    cleanup_base(base);
-    PASS();
-}
-
 /* ═══════════════════════════════════════════════════════════════════════
  *  24. `.log.open` opens for append only — it must NOT replay the existing
  *  log.  Explicit `.log.replay` still applies it.
@@ -3144,7 +2440,7 @@ static test_result_t test_journal_open_does_not_replay(void) {
     snprintf(src, sizeof(src),
              "(set _m 0)"
              "(.log.open 'async \"%s\")"
-             "(.log.write \"(set _m 7)\")"
+             "(set _m 7)"
              "(.log.close)",
              base);
     ray_t* a = ray_eval_str(src);
@@ -3581,7 +2877,6 @@ const test_entry_t journal_entries[] = {
     { "journal/replay_report_mixed", test_journal_replay_report_mixed, jrn_setup, jrn_teardown },
     { "journal/replay_report_clean", test_journal_replay_report_clean, jrn_setup, jrn_teardown },
     { "journal/replay_report_terminal", test_journal_replay_report_terminal, jrn_setup, jrn_teardown },
-    { "journal/replay_report_restricted_cancel", test_journal_replay_report_restricted_cancel, jrn_setup, jrn_teardown },
     /* Open/Close */
     { "journal/open_close_basic",          test_journal_open_close_basic,          jrn_setup, jrn_teardown },
     { "journal/open_bad_base",             test_journal_open_bad_base,             jrn_setup, jrn_teardown },
@@ -3611,20 +2906,12 @@ const test_entry_t journal_entries[] = {
     { "journal/open_with_qdb",             test_journal_open_with_qdb,             jrn_setup, jrn_teardown },
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
-    { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },
-    { "journal/lift_note_not_an_entry",    test_journal_lift_note_not_an_entry,    jrn_setup, jrn_teardown },
-    { "journal/lift_notes_any_order",      test_journal_lift_notes_any_order,      jrn_setup, jrn_teardown },
-    { "journal/lift_notes_v3_frames",      test_journal_lift_notes_v3_frames,      jrn_setup, jrn_teardown },
-    { "journal/lift_note_headerless_log",  test_journal_lift_note_headerless_log,  jrn_setup, jrn_teardown },
     /* is_open */
     { "journal/is_open_states",            test_journal_is_open_states,            jrn_setup, jrn_teardown },
     /* Misc */
     { "journal/open_deser_error",          test_journal_open_deser_error,          jrn_setup, jrn_teardown },
     { "journal/write_during_replay_noop",  test_journal_write_during_replay_noop,  jrn_setup, jrn_teardown },
-    { "journal/replay_restricted_flag",    test_journal_replay_restricted_flag,    jrn_setup, jrn_teardown },
     /* Compressed frame */
-    { "journal/replay_compressed_frame",       test_journal_replay_compressed_frame,       jrn_setup, jrn_teardown },
-    { "journal/replay_compressed_bad_payload", test_journal_replay_compressed_bad_payload, jrn_setup, jrn_teardown },
     /* Bad .qdb */
     { "journal/open_bad_qdb_corrupt",      test_journal_open_bad_qdb_corrupt,      jrn_setup, jrn_teardown },
     { "journal/open_qdb_not_dict",         test_journal_open_qdb_not_dict,         jrn_setup, jrn_teardown },
@@ -3652,17 +2939,10 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_open_bad_mode",         test_ops_open_bad_mode,                jrn_setup, jrn_teardown },
     { "journal/ops_open_long_base",        test_ops_open_long_base,               jrn_setup, jrn_teardown },
     { "journal/ops_open_sync_mode",        test_ops_open_sync_mode,               jrn_setup, jrn_teardown },
-    { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
-    { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
-    { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
     { "journal/ops_auto_journal_eval_predicate", test_ops_auto_journal_eval_predicate, jrn_setup, jrn_teardown },
     { "journal/ops_log_status", test_ops_log_status, jrn_setup, jrn_teardown },
     { "journal/ops_log_status_open_stage", test_ops_log_status_open_stage, jrn_setup, jrn_teardown },
-    { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
-    { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
-    { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
-    { "journal/replay_unbound_head_is_graceful", test_journal_replay_unbound_head_is_graceful, jrn_setup, jrn_teardown },
     /* Open opens for append only — no replay */
     { "journal/open_does_not_replay",      test_journal_open_does_not_replay,      jrn_setup, jrn_teardown },
     { "journal/de_depth_limit",            test_journal_de_depth_limit,            jrn_setup, jrn_teardown },

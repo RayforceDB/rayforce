@@ -29,13 +29,17 @@
 #include "fileio.h"
 #include "serde.h"
 #include "core/ipc.h"
+#include "core/platform.h"   /* RAY_CPU_RELAX */
 #include "core/timer.h"
 #include "lang/eval.h"
 #include "lang/env.h"
+#include "lang/internal.h"
+#include "table/sym.h"
 #include "mem/sys.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +188,18 @@ static bool file_exists(const char* path) {
 #endif
 }
 
+static ray_err_t log_truncate(const char* path, int64_t len) {
+#ifdef RAY_OS_WINDOWS
+    FILE* f = fopen(path, "r+b");
+    if (!f) return RAY_ERR_IO;
+    int rc = _chsize_s(_fileno(f), len);
+    fclose(f);
+    return rc == 0 ? RAY_OK : RAY_ERR_IO;
+#else
+    return truncate(path, (off_t)len) == 0 ? RAY_OK : RAY_ERR_IO;
+#endif
+}
+
 /* ── log generation preamble (#420) ──────────────────────────────────
  *
  * Snapshot-then-roll is two renames that are individually but not
@@ -228,22 +244,6 @@ static int64_t jlog_probe(const char* path, int64_t* out_gen) {
     return RAY_JLOG_PREAMBLE;
 }
 
-/* The generation of an open log, 0 when it has no preamble; the position
- * is left where it was.  False on a read or seek failure. */
-static bool jlog_gen_of(FILE* f, int64_t* out_gen) {
-    *out_gen = 0;
-    long pos = ftell(f);
-    if (pos < 0 || fseek(f, 0, SEEK_SET) != 0) return false;
-    uint8_t pre[RAY_JLOG_PREAMBLE];
-    size_t r = fread(pre, 1, sizeof(pre), f);
-    bool failed = ferror(f) != 0;
-    clearerr(f);
-    if (fseek(f, pos, SEEK_SET) != 0 || failed) return false;
-    if (r == sizeof(pre) && memcmp(pre, RAY_JLOG_MAGIC, 8) == 0)
-        memcpy(out_gen, pre + 8, sizeof(*out_gen));
-    return true;
-}
-
 /* Generation ids need only be distinct across the rolls of one journal;
  * wall-clock ms with a low sequence salt is ample. */
 static int64_t jlog_fresh_gen(void) {
@@ -271,129 +271,226 @@ static size_t read_full(FILE* f, void* buf, size_t want) {
     return got;
 }
 
-/* Decompress an IPC payload in place if the COMPRESSED flag is set;
- * otherwise no-op.  Returns owned buffer + length on success (caller
- * frees with ray_sys_free), NULL on failure.  When no decompression
- * is needed, *out_owned is set to false and *out_buf aliases payload. */
-static bool decompress_if_needed(const ray_ipc_header_t* hdr,
-                                 const uint8_t* payload, int64_t payload_len,
-                                 uint8_t** out_buf, int64_t* out_len,
-                                 bool* out_owned)
-{
-    if (!(hdr->flags & RAY_IPC_FLAG_COMPRESSED)) {
-        *out_buf   = (uint8_t*)payload;
-        *out_len   = payload_len;
-        *out_owned = false;
-        return true;
+/* ── physical records ─────────────────────────────────────────────────
+ *
+ * The log holds what a commit changed, not the command that changed it:
+ * replay applies values and never evaluates code, so `rand`, the clock and
+ * every other source of nondeterminism are settled once, when the change
+ * was made.  A commit is one frame (RAY_IPC_MSG_JREC) whose payload is its
+ * records back to back, each a serialized list:
+ *
+ *     [RAY_JREC_SET, name, value]    bind the global
+ *     [RAY_JREC_DEL, name]           unbind it
+ *     [RAY_JREC_APPEND, name, tail]  concat `tail` to the bound table
+ *
+ * Records are serialized as they are noted, so the buffer holds no reference
+ * that would turn a later in-place write into a copy. */
+
+#define RAY_JREC_SET     0
+#define RAY_JREC_DEL     1
+#define RAY_JREC_APPEND  2
+#define RAY_JREC_MAX     (256LL * 1024 * 1024)   /* the frame size replay accepts */
+
+bool ray_journal_capture = false;
+
+static struct {
+    uint8_t* buf;
+    int64_t  len, cap;
+    bool     lost;       /* a change of this commit could not be noted */
+    bool     stale;      /* the log misses a change memory has: refuse until a snapshot */
+    _Atomic(int) lock;   /* globals are also set from worker threads */
+} g_rec;
+
+/* The mutator in flight on this thread, innermost first. */
+typedef struct jmut {
+    struct jmut* prev;
+    int64_t target;      /* insert's global table, -1 when not announced */
+    int64_t rows0;       /* its row count before the insert */
+    int64_t set_name;    /* last global this mutator published through ray_env_set */
+} jmut_t;
+static _Thread_local jmut_t* g_mut;
+
+static void capture_sync(void) {
+    ray_journal_capture = g_journal.fp != NULL && !g_journal.in_replay;
+}
+
+static ray_err_t rec_push(int64_t op, int64_t name, ray_t* val) {
+    if (g_rec.stale) { g_rec.lost = true; return RAY_OK; }
+    ray_t* rec = ray_list_new(3);
+    ray_t* o = ray_i64(op);
+    ray_t* s = ray_sym(name);
+    ray_t* parts[3] = { o, s, val };
+    ray_err_t e = !rec || RAY_IS_ERR(rec) ? RAY_ERR_OOM : RAY_OK;
+    for (int i = 0; i < (val ? 3 : 2) && e == RAY_OK; i++) {
+        if (!parts[i] || RAY_IS_ERR(parts[i])) { e = RAY_ERR_OOM; break; }
+        ray_t* grown = ray_list_append(rec, parts[i]);   /* retains the item */
+        if (!grown || RAY_IS_ERR(grown)) { if (grown) ray_error_free(grown); e = RAY_ERR_OOM; }
+        else rec = grown;
     }
-    if (payload_len < 4) return false;
-    uint32_t uncomp_size;
-    memcpy(&uncomp_size, payload, 4);
-    if (uncomp_size == 0 || uncomp_size > 256u * 1024u * 1024u) return false;
+    if (o && !RAY_IS_ERR(o)) ray_release(o);
+    if (s && !RAY_IS_ERR(s)) ray_release(s);
+    if (e != RAY_OK) {
+        if (rec && !RAY_IS_ERR(rec)) ray_release(rec);
+        return e;
+    }
 
-    uint8_t* tmp = (uint8_t*)ray_sys_alloc(uncomp_size);
-    if (!tmp) return false;
-    size_t dlen = ray_ipc_decompress(payload + 4, (size_t)payload_len - 4,
-                                     tmp, uncomp_size);
-    if (dlen != uncomp_size) { ray_sys_free(tmp); return false; }
-    *out_buf   = tmp;
-    *out_len   = (int64_t)uncomp_size;
-    *out_owned = true;
-    return true;
+    /* The log is the server's own data: lambdas keep their .sys.trust marks. */
+    bool prev_trust = ray_serde_keep_trust(true);
+    int64_t size = ray_serde_size(rec);
+    if (size <= 0) e = RAY_ERR_DOMAIN;           /* a value serde cannot write */
+    while (atomic_exchange_explicit(&g_rec.lock, 1, memory_order_acquire)) RAY_CPU_RELAX();
+    if (e == RAY_OK && g_rec.len + size > RAY_JREC_MAX) e = RAY_ERR_LIMIT;
+    if (e == RAY_OK && g_rec.len + size > g_rec.cap) {
+        int64_t cap = g_rec.cap ? g_rec.cap : 4096;
+        while (cap < g_rec.len + size) cap *= 2;
+        uint8_t* nb = (uint8_t*)ray_sys_realloc(g_rec.buf, (size_t)cap);
+        if (nb) { g_rec.buf = nb; g_rec.cap = cap; } else e = RAY_ERR_OOM;
+    }
+    if (e == RAY_OK) {
+        if (ray_ser_raw(g_rec.buf + g_rec.len, rec) == size) g_rec.len += size;
+        else e = RAY_ERR_DOMAIN;
+    }
+    atomic_store_explicit(&g_rec.lock, 0, memory_order_release);
+    ray_serde_keep_trust(prev_trust);
+    ray_release(rec);
+    return e;
 }
 
-/* Evaluate a deserialized message exactly as eval_payload would: string
- * payloads run through ray_eval_str, everything else through ray_eval. */
-/* The notes of a log (RAY_IPC_MSG_JNOTE): after a restricted request
- * whose trusted calls ran lifted, the server writes an I64 vector of the
- * log generation and offset of that request's frame, then the identities
- * of those calls.  A note names its request, so frames logged between the
- * two (requests a peer pushed back while a trusted body waited on it) do
- * not come between them.  Collected in one pass before replay. */
-typedef struct { int64_t off; ray_t* note; } lift_note_t;
-typedef struct { lift_note_t* v; int64_t n, cap; } lift_notes_t;
+int64_t ray_journal_mark(void) { return g_rec.len; }
+void    ray_journal_rewind(int64_t mark) { if (mark < g_rec.len) g_rec.len = mark; }
 
-static void lift_notes_free(lift_notes_t* ns) {
-    for (int64_t i = 0; i < ns->n; i++) ray_release(ns->v[i].note);
-    if (ns->v) ray_sys_free(ns->v);
-    *ns = (lift_notes_t){0};
+ray_err_t ray_journal_note_set(int64_t name, ray_t* val) {
+    jmut_t* m = g_mut;
+    /* insert publishes its table itself: the appended rows are noted when
+     * it returns, not the whole table now. */
+    if (m && m->target == name) return RAY_OK;
+    ray_err_t e = rec_push(val ? RAY_JREC_SET : RAY_JREC_DEL, name, val);
+    if (e == RAY_OK && m) m->set_name = name;
+    return e;
 }
 
-static int lift_note_cmp(const void* a, const void* b) {
-    int64_t x = ((const lift_note_t*)a)->off, y = ((const lift_note_t*)b)->off;
-    return x < y ? -1 : x > y;
+void ray_journal_mut_target(int64_t name, int64_t rows0) {
+    if (!g_mut) return;
+    g_mut->target = name;
+    g_mut->rows0  = rows0;
 }
 
-/* Reads from the current position to the end, or to the first frame that
- * does not parse, which the replay loop reports; leaves the position where
- * it was.  False when memory ran out. */
-static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
-    *ns = (lift_notes_t){0};
-    long start = ftell(f);
-    if (start < 0) return true;
-    bool ok = true;
-    for (;;) {
-        ray_ipc_header_t h;
-        if (read_full(f, &h, sizeof(h)) != sizeof(h)) break;
-        if (h.prefix != RAY_SERDE_PREFIX || !ray_serde_wire_version_supported(h.version) ||
-            h.endian != RAY_SERDE_ENDIAN || h.size <= 0 || h.size > 256LL*1024*1024) break;
-        if (h.msgtype != RAY_IPC_MSG_JNOTE || (h.flags & RAY_IPC_FLAG_COMPRESSED)) {
-            if (fseek(f, (long)h.size, SEEK_CUR) != 0) break;
-            continue;
+/* The global a (possibly dotted) name reads, owned; NULL when unbound. */
+static ray_t* global_value(int64_t name) {
+    if (!ray_sym_is_dotted(name)) {
+        ray_t* v = ray_env_get_global(name);
+        if (v) ray_retain(v);
+        return v;
+    }
+    const int64_t* segs;
+    if (ray_sym_segs(name, &segs) < 2) return NULL;
+    ray_t* v = ray_env_path_get(ray_env_get_global(segs[0]), name);
+    if (v && RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    return v;
+}
+
+/* A mutator returned the name it amended.  A write that went through
+ * ray_env_set is noted already; one made in place is noted here. */
+static ray_err_t mut_record(const jmut_t* m, int64_t name) {
+    if (m->target != name && m->set_name == name) return RAY_OK;
+    ray_t* cur = global_value(name);
+    if (!cur) return RAY_OK;                     /* a local target: no global changed */
+    ray_err_t e;
+    int64_t added = m->target == name && cur->type == RAY_TABLE
+                  ? ray_table_nrows(cur) - m->rows0 : -1;
+    if (added == 0) {
+        e = RAY_OK;
+    } else if (added > 0) {
+        ray_t* k = ray_i64(-added);
+        ray_t* tail = k && !RAY_IS_ERR(k) ? ray_take_fn(cur, k) : NULL;
+        if (k && !RAY_IS_ERR(k)) ray_release(k);
+        if (!tail || RAY_IS_ERR(tail)) {
+            if (tail) ray_error_free(tail);
+            e = RAY_ERR_OOM;
+        } else {
+            e = rec_push(RAY_JREC_APPEND, name, tail);
+            ray_release(tail);
         }
-        uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)h.size);
-        if (!buf) { ok = false; break; }
-        if (read_full(f, buf, (size_t)h.size) != (size_t)h.size) { ray_sys_free(buf); break; }
-        int64_t len = h.size;
-        ray_t* v = ray_de_raw_version(buf, &len, h.version);
-        ray_sys_free(buf);
-        if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); continue; }
-        const int64_t* d = (const int64_t*)ray_data(v);
-        if (v->type != RAY_I64 || v->len < 2 || d[0] != gen) { ray_release(v); continue; }
-        if (ns->n == ns->cap) {
-            int64_t cap = ns->cap ? ns->cap * 2 : 16;
-            lift_note_t* nv = (lift_note_t*)ray_sys_alloc((size_t)cap * sizeof(lift_note_t));
-            if (!nv) { ray_release(v); ok = false; break; }
-            if (ns->n) memcpy(nv, ns->v, (size_t)ns->n * sizeof(lift_note_t));
-            if (ns->v) ray_sys_free(ns->v);
-            ns->v = nv;
-            ns->cap = cap;
-        }
-        ns->v[ns->n++] = (lift_note_t){ d[1], v };
+    } else {
+        e = rec_push(RAY_JREC_SET, name, cur);
     }
-    if (fseek(f, start, SEEK_SET) != 0) ok = false;
-    if (!ok) lift_notes_free(ns);
-    /* By offset, for the lookup: a nested request's note precedes its
-     * outer request's, so the log does not hold them in that order. */
-    else if (ns->n > 1) qsort(ns->v, (size_t)ns->n, sizeof(lift_note_t), lift_note_cmp);
-    return ok;
+    ray_release(cur);
+    return e;
 }
 
-/* The note of the request whose frame starts at `off` (borrowed), or NULL. */
-static ray_t* lift_notes_find(const lift_notes_t* ns, int64_t off) {
-    int64_t lo = 0, hi = ns->n;
-    while (lo < hi) {
-        int64_t mid = lo + (hi - lo) / 2;
-        if (ns->v[mid].off < off) lo = mid + 1; else hi = mid;
-    }
-    return lo < ns->n && ns->v[lo].off == off ? ns->v[lo].note : NULL;
+ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64_t n) {
+    if (!ray_journal_capture) return impl(args, n);
+    jmut_t m = { .prev = g_mut, .target = -1, .rows0 = 0, .set_name = -1 };
+    g_mut = &m;
+    ray_t* r = impl(args, n);
+    g_mut = m.prev;
+    /* The change is made: one that cannot be noted leaves the log behind. */
+    if (r && !RAY_IS_ERR(r) && r->type == -RAY_SYM && mut_record(&m, r->i64) != RAY_OK)
+        g_rec.lost = true;
+    return r;
 }
 
-static ray_t* eval_one(ray_t* msg) {
-    if (!msg || RAY_IS_ERR(msg)) return msg;
-    if (msg->type == -RAY_STR) {
-        const char* s = ray_str_ptr(msg);
-        size_t      n = ray_str_len(msg);
-        if (!s || n == 0) return RAY_NULL_OBJ;
-        char* tmp = (char*)ray_sys_alloc(n + 1);
-        if (!tmp) return ray_error("oom", NULL);
-        memcpy(tmp, s, n);
-        tmp[n] = '\0';
-        ray_t* r = ray_eval_str(tmp);
-        ray_sys_free(tmp);
-        return r;
+ray_err_t ray_journal_commit(void) {
+    if (g_rec.lost) {
+        g_rec.lost = false;
+        g_rec.len = 0;
+        if (!g_rec.stale)
+            fprintf(stderr, "log: ERROR  a change could not be logged; the log is stale "
+                            "until the next .log.snapshot\n");
+        g_rec.stale = true;
+        return RAY_ERR_IO;
     }
-    return ray_eval(msg);
+    if (g_rec.len == 0) return RAY_OK;
+    ray_ipc_header_t hdr = { .prefix = RAY_SERDE_PREFIX, .version = RAY_SERDE_WIRE_VERSION,
+                             .endian = RAY_SERDE_ENDIAN, .msgtype = RAY_IPC_MSG_JREC,
+                             .size = g_rec.len };
+    ray_err_t e = ray_journal_write_bytes(&hdr, g_rec.buf, g_rec.len);
+    g_rec.len = 0;
+    if (g_rec.cap > (1 << 20)) {                 /* a large commit: give the buffer back */
+        ray_sys_free(g_rec.buf);
+        g_rec.buf = NULL;
+        g_rec.cap = 0;
+    }
+    if (e != RAY_OK) {
+        fprintf(stderr, "log: ERROR  journal write failed (rc=%d); the log is stale "
+                        "until the next .log.snapshot\n", (int)e);
+        g_rec.stale = true;
+    }
+    return e;
+}
+
+/* Apply one record of a replayed frame. */
+static ray_err_t rec_apply(ray_t* rec) {
+    if (!rec || rec->type != RAY_LIST || rec->len < 2) return RAY_ERR_DOMAIN;
+    ray_t* o = ray_list_get(rec, 0);
+    ray_t* s = ray_list_get(rec, 1);
+    ray_t* v = rec->len > 2 ? ray_list_get(rec, 2) : NULL;
+    if (!o || o->type != -RAY_I64 || !s || s->type != -RAY_SYM) return RAY_ERR_DOMAIN;
+    int64_t name = s->i64;
+    switch (o->i64) {
+    case RAY_JREC_DEL:
+        return ray_env_set(name, NULL);
+    case RAY_JREC_SET: {
+        if (!v) return RAY_ERR_DOMAIN;
+        ray_err_t e = ray_env_set(name, v);
+        /* A verb trusted by name: its identity includes that name. */
+        if (e == RAY_OK && v->type == RAY_LAMBDA && (LAMBDA_TRUSTED(v) & 1))
+            (void)ray_eval_lambda_trust(v, name);
+        return e;
+    }
+    case RAY_JREC_APPEND: {
+        ray_t* cur = global_value(name);
+        if (!cur || !v) { if (cur) ray_release(cur); return RAY_ERR_DOMAIN; }
+        ray_t* all = ray_concat_fn(cur, v);
+        ray_release(cur);
+        if (!all || RAY_IS_ERR(all)) { if (all) ray_error_free(all); return RAY_ERR_DOMAIN; }
+        ray_err_t e = ray_env_set(name, all);
+        ray_release(all);
+        return e;
+    }
+    default:
+        return RAY_ERR_DOMAIN;
+    }
 }
 
 /* ── public API ───────────────────────────────────────────────────── */
@@ -498,23 +595,9 @@ static ray_err_t journal_replay_from(const char*           path,
         return RAY_ERR_IO;
     }
 
-    /* The generation the log's notes must name, read from the file being
-     * replayed; a log with no preamble is generation 0. */
-    int64_t log_gen = 0;
-    if (!jlog_gen_of(f, &log_gen)) {
-        fclose(f);
-        if (out_status) *out_status = RAY_JREPLAY_IO;
-        return RAY_ERR_IO;
-    }
-    lift_notes_t notes;
-    if (!lift_notes_collect(f, log_gen, &notes)) {
-        fclose(f);
-        if (out_status) *out_status = RAY_JREPLAY_OOM;
-        return RAY_ERR_OOM;
-    }
-
     bool prev_in_replay = g_journal.in_replay;
     g_journal.in_replay = true;
+    capture_sync();
 
     int64_t chunks = 0;
     int64_t errs   = 0;
@@ -526,12 +609,11 @@ static ray_err_t journal_replay_from(const char*           path,
          * this must NOT be treated as a truncatable BADTAIL. */
         if (ray_interrupted()) { status = RAY_JREPLAY_CANCEL; break; }
 
-        long frame_off = ftell(f);
         ray_ipc_header_t hdr;
         size_t r = read_full(f, &hdr, sizeof(hdr));
         if (r == 0) break;                          /* clean EOF */
         if (r == SIZE_MAX)                          { status = RAY_JREPLAY_IO;      break; }
-        if (r != sizeof(hdr))                       { status = RAY_JREPLAY_BADTAIL; break; }
+        if (r != sizeof(hdr))                       { status = RAY_JREPLAY_TORN;    break; }
         if (hdr.prefix  != RAY_SERDE_PREFIX)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (!ray_serde_wire_version_supported(hdr.version))
                                                     { status = RAY_JREPLAY_DESER;   break; }
@@ -545,72 +627,52 @@ static ray_err_t journal_replay_from(const char*           path,
         if (pr == SIZE_MAX) { ray_sys_free(buf); status = RAY_JREPLAY_IO;      break; }
         if (pr != (size_t)hdr.size) {
             ray_sys_free(buf);
-            status = RAY_JREPLAY_BADTAIL;
+            status = RAY_JREPLAY_TORN;
             break;
         }
-
-        uint8_t* payload  = NULL;
-        int64_t  pay_len  = 0;
-        bool     owned    = false;
-        if (!decompress_if_needed(&hdr, buf, hdr.size,
-                                  &payload, &pay_len, &owned)) {
+        /* A frame of the command format this log used to hold: replaying
+         * it would mean evaluating it, which is what the log no longer does. */
+        if (hdr.msgtype != RAY_IPC_MSG_JREC) {
             ray_sys_free(buf);
-            /* Framing was intact (header parsed OK, payload size matched);
-             * "decode failed" is a content/code bug, NOT a tail truncation,
-             * so do not point the operator at `truncate to recover`. */
-            status = RAY_JREPLAY_DECOMP;
+            status = RAY_JREPLAY_FORMAT;
             break;
         }
 
-        int64_t consumed = pay_len;
-        ray_t*  msg      = ray_de_raw_version(payload, &consumed, hdr.version);
-        if (owned) ray_sys_free(payload);
+        uint8_t* payload = buf;
+        int64_t  pay_len = hdr.size;
+
+        /* The records of one commit, back to back. */
+        bool prev_trust = ray_serde_keep_trust(true);
+        int64_t off = 0;
+        while (off < pay_len && status == RAY_JREPLAY_OK) {
+            int64_t left = pay_len - off;             /* ray_de_raw leaves what it did not read */
+            ray_t* rec = ray_de_raw_version(payload + off, &left, hdr.version);
+            int64_t consumed = pay_len - off - left;
+            if (!rec || RAY_IS_ERR(rec) || consumed <= 0) {
+                if (rec && RAY_IS_ERR(rec)) ray_error_free(rec);
+                else if (rec) ray_release(rec);
+                status = RAY_JREPLAY_DESER;
+                break;
+            }
+            off += consumed;
+            ray_err_t ae = rec_apply(rec);
+            ray_release(rec);
+            if (ae != RAY_OK) {
+                fprintf(stderr, "log: WARN  chunk %lld: a record did not apply (rc=%d)\n",
+                        (long long)chunks, (int)ae);
+                errs++;
+            }
+        }
+        ray_serde_keep_trust(prev_trust);
         ray_sys_free(buf);
-
-        if (!msg || RAY_IS_ERR(msg)) {
-            if (msg) ray_error_free(msg);   /* ray_release is a no-op on errors */
-            status = RAY_JREPLAY_DESER;
-            break;
-        }
-        /* A note is not an entry: its request, if this log holds it,
-         * found it by offset. */
-        if (hdr.msgtype == RAY_IPC_MSG_JNOTE) { ray_release(msg); continue; }
-
-        /* Re-impose the sender's restricted state for THIS frame.  Without
-         * this a `-U` client's writes silently elevate to full privilege
-         * across crash-restart, since replay runs in the main thread with
-         * no IPC connection context.  A restricted frame's trusted calls
-         * run lifted only as recorded live: its note lists them, and
-         * without one none does. */
-        bool restricted = hdr.flags & RAY_IPC_FLAG_RESTRICTED;
-        ray_t* note = restricted ? lift_notes_find(&notes, (int64_t)frame_off) : NULL;
-        ray_lift_log_t lifts;
-        if (restricted)
-            ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) + 2 : NULL,
-                                note ? note->len - 2 : 0);
-        ray_restrict_save_t prev_restricted;
-        ray_eval_restrict_enter(restricted, &prev_restricted);
-        ray_t* result = eval_one(msg);
-        ray_eval_restrict_leave(&prev_restricted);
-        if (restricted) ray_eval_lift_done(&lifts);
-        ray_release(msg);
-
-        if (result && RAY_IS_ERR(result)) {
-            const char* code = ray_err_code(result);
-            fprintf(stderr, "log: WARN  chunk %lld raised: %s (during replay)\n",
-                    (long long)chunks, code ? code : "?");
-            errs++;
-            ray_error_free(result);
-        } else if (result && result != RAY_NULL_OBJ) {
-            ray_release(result);
-        }
+        if (status != RAY_JREPLAY_OK) break;
 
         chunks++;
     }
 
-    lift_notes_free(&notes);
     fclose(f);
     g_journal.in_replay = prev_in_replay;
+    capture_sync();
 
     if (out_chunks)      *out_chunks      = chunks;
     if (out_eval_errors) *out_eval_errors = errs;
@@ -717,6 +779,7 @@ static ray_err_t open_log_for_append(void) {
             fflush(g_journal.fp) != 0) {
             fclose(g_journal.fp);
             g_journal.fp = NULL;
+    capture_sync();
             return RAY_ERR_IO;
         }
         g_journal.log_gen = gen;
@@ -733,6 +796,7 @@ static ray_err_t open_log_for_append(void) {
     memcpy(g_journal.ok_path, g_journal.log_path, sizeof(g_journal.ok_path));
     g_journal.ok_mode   = g_journal.mode;
     g_journal.opened_ok = true;
+    capture_sync();
     return RAY_OK;
 }
 
@@ -860,7 +924,22 @@ ray_err_t ray_journal_recover(const char* base) {
         int64_t chunks = 0, errs = 0;
         ray_jreplay_status_t status = RAY_JREPLAY_OK;
         journal_replay_from(log_path, start, &chunks, &errs, &status);
+        if (status == RAY_JREPLAY_TORN) {
+            /* The last frame was cut short: a commit that never finished,
+             * so nobody was told it had.  Drop it and keep the rest. */
+            int64_t valid_chunks = 0, valid_bytes = 0;
+            ray_journal_validate(log_path, &valid_chunks, &valid_bytes);
+            if (log_truncate(log_path, valid_bytes) != RAY_OK) {
+                fprintf(stderr, "log: ERROR  cannot drop the unfinished commit at offset %lld of %s\n",
+                        (long long)valid_bytes, log_path);
+                return RAY_ERR_IO;
+            }
+            fprintf(stderr, "log: dropped an unfinished commit at offset %lld of %s\n",
+                    (long long)valid_bytes, log_path);
+            status = RAY_JREPLAY_OK;
+        }
         switch (status) {
+        case RAY_JREPLAY_TORN:
         case RAY_JREPLAY_OK: {
             fprintf(stderr, "log: replayed %lld entries (%lld eval errors) from %s\n",
                     (long long)chunks, (long long)errs, log_path);
@@ -875,6 +954,13 @@ ray_err_t ray_journal_recover(const char* base) {
                     "log:       valid prefix, then restart\n",
                     log_path, (long long)chunks,
                     (long long)valid_bytes, (long long)valid_bytes);
+            return RAY_ERR_DOMAIN;
+        }
+        case RAY_JREPLAY_FORMAT: {
+            fprintf(stderr,
+                    "log: ERROR %s holds command entries, which this version does not\n"
+                    "log:       replay.  Start the previous version on it, run\n"
+                    "log:       (.log.snapshot), then start this one.\n", log_path);
             return RAY_ERR_DOMAIN;
         }
         case RAY_JREPLAY_DESER:
@@ -953,9 +1039,10 @@ ray_err_t ray_journal_open(const char* base, ray_journal_mode_t mode) {
 static ray_err_t journal_close_fp(void);
 
 ray_err_t ray_journal_close(void) {
+    ray_err_t ce = ray_journal_commit();
     ray_err_t r = journal_close_fp();
     journal_unlock();
-    return r;
+    return ce != RAY_OK ? ce : r;
 }
 
 static ray_err_t journal_close_fp(void) {
@@ -967,6 +1054,7 @@ static ray_err_t journal_close_fp(void) {
     int flush_rc = fflush(g_journal.fp);
     int close_rc = fclose(g_journal.fp);
     g_journal.fp = NULL;
+    capture_sync();
     if (flush_rc != 0 || close_rc != 0) {
         fprintf(stderr, "log: ERROR  journal close (flush rc=%d, close rc=%d)\n",
                 flush_rc, close_rc);
@@ -1074,6 +1162,8 @@ ray_err_t ray_journal_purge(void) {
 
 ray_err_t ray_journal_sync(void) {
     if (!g_journal.fp) return RAY_OK;
+    ray_err_t ce = ray_journal_commit();
+    if (ce != RAY_OK) return ce;
     if (g_journal.mode == RAY_JOURNAL_SYNC) return RAY_OK;
     if (fflush(g_journal.fp) != 0) return RAY_ERR_IO;
 #ifndef RAY_OS_WINDOWS
@@ -1099,6 +1189,8 @@ static void utc_stamp(char* buf, size_t bufsz) {
 
 ray_err_t ray_journal_roll(void) {
     if (!g_journal.fp) return RAY_ERR_DOMAIN;
+    ray_err_t ce = ray_journal_commit();
+    if (ce != RAY_OK) return ce;
 
     /* Build the archive name BEFORE closing the fp — if path build
      * fails we can return without leaving the journal in a closed
@@ -1121,6 +1213,7 @@ ray_err_t ray_journal_roll(void) {
     int flush_rc = fflush(g_journal.fp);
     int close_rc = fclose(g_journal.fp);
     g_journal.fp = NULL;
+    capture_sync();
     if (flush_rc != 0 || close_rc != 0) {
         /* Don't rename a partial/possibly-corrupt log.  Try to reopen
          * for append so subsequent writes still land somewhere. */
@@ -1151,6 +1244,9 @@ ray_err_t ray_journal_roll(void) {
 
 ray_err_t ray_journal_snapshot(void) {
     if (!g_journal.fp) return RAY_ERR_DOMAIN;
+    /* What is buffered belongs before the snapshot.  A commit that fails
+     * here is covered anyway: the snapshot is the whole of memory. */
+    (void)ray_journal_commit();
 
     /* Enumerate ONLY user-defined globals (slots last written via
      * ray_env_set).  Builtin function objects must NOT enter the
@@ -1284,5 +1380,6 @@ ray_err_t ray_journal_snapshot(void) {
      * isn't durable across a power loss without it.  Best-effort. */
     (void)ray_file_sync_dir(qdb_path);
 
+    g_rec.stale = false;
     return ray_journal_roll();
 }

@@ -175,70 +175,6 @@ ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
-/* (.log.write expr) — append a synthetic entry containing the
- * serialized form of `expr`.  Useful for users who want REPL-driven
- * mutations captured in the log alongside the IPC stream.
- *
- * If the journal isn't open, ERROR rather than silently no-op — a
- * silent no-op would lie to the user about durability ("I logged
- * your change") when in fact nothing was persisted. */
-static ray_t* log_write_held(ray_t* expr);
-
-ray_t* ray_log_write_fn(ray_t* expr) {
-    ray_serde_msg_hold();
-    ray_t* r = log_write_held(expr);
-    ray_serde_msg_release();
-    return r;
-}
-
-static ray_t* log_write_held(ray_t* expr) {
-    if (!ray_journal_is_open())
-        return ray_error("noopen", ".log.write: no journal open (start with -l/-L)");
-    if (ray_ipc_auto_journal_eval())
-        return ray_error("domain", ".log.write is disabled inside auto-journaled IPC eval");
-    if (!expr) return ray_error("type", ".log.write expects an argument");
-
-    bool owned = false;
-    if (ray_is_lazy(expr)) {
-        ray_retain(expr);
-        expr = ray_lazy_materialize(expr); /* consumes the retain */
-        if (RAY_IS_ERR(expr)) return expr;
-        owned = true;
-    }
-
-    int64_t pay_size = ray_serde_size(expr);
-    if (pay_size <= 0) {
-        if (owned) ray_release(expr);
-        return ray_error("domain", ".log.write: serde size 0");
-    }
-
-    uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)pay_size);
-    if (!payload) {
-        if (owned) ray_release(expr);
-        return ray_error("oom", NULL);
-    }
-
-    int64_t written = ray_ser_raw(payload, expr);
-    if (written != pay_size) {
-        ray_sys_free(payload);
-        if (owned) ray_release(expr);
-        return ray_error("io", NULL);
-    }
-
-    ray_ipc_header_t hdr = {
-        .prefix  = RAY_SERDE_PREFIX,
-        .version = RAY_SERDE_WIRE_VERSION,
-        .flags   = 0,
-        .endian  = RAY_SERDE_ENDIAN,
-        .msgtype = RAY_IPC_MSG_ASYNC,
-        .size    = pay_size,
-    };
-    ray_err_t e = ray_journal_write_bytes(&hdr, payload, pay_size);
-    ray_sys_free(payload);
-    if (owned) ray_release(expr);
-    return err_to_ray(e, "io");
-}
-
 /* Prepare the private report BEFORE evaluating any journal entry.  A result-
  * construction failure must not first apply the log and then hide its counts.
  * The dictionary owns both vectors; its two I64 cells are filled after replay. */
@@ -295,6 +231,15 @@ static ray_t* log_replay_impl(ray_t* path, bool reporting) {
                          "%s: framing broken after %lld entries (valid bytes = %lld)",
                          p, (long long)chunks, (long long)valid_bytes);
     }
+    case RAY_JREPLAY_TORN:
+        return ray_error("badtail",
+                         "%s: the last entry is cut short after %lld entries (an unfinished commit)",
+                         p, (long long)chunks);
+    case RAY_JREPLAY_FORMAT:
+        return ray_error("format",
+                         "%s: a command entry of the old log format at chunk %lld; "
+                         "snapshot it with the previous version",
+                         p, (long long)chunks);
     case RAY_JREPLAY_DESER:
         return ray_error("deser",
                          "%s: deserialization failed at chunk %lld — framing intact, content/version skew",

@@ -21,12 +21,12 @@
 ;;    then purge while the journal is still OPEN.
 ;; ════════════════════════════════════════════════════════════════════════
 (nil? (.log.open 'async "/tmp/rfl_ops_journal_purge")) -- true
-(nil? (.log.write 1)) -- true
+(set jw_e 1) -- 1
 (nil? (.log.roll))    -- true
-(nil? (.log.write 2)) -- true
+(set jw_e 2) -- 2
 (set jrn_purge_g 99)  -- 99
 (nil? (.log.snapshot)) -- true
-(nil? (.log.write 3)) -- true
+(set jw_e 3) -- 3
 
 ;; Footprint exists: active log, the snapshot, and at least one archive.
 (.sys.exec "test -f /tmp/rfl_ops_journal_purge.log") -- 0
@@ -48,7 +48,7 @@
 ;;    re-passing the path.  The base persists across .log.close.
 ;; ════════════════════════════════════════════════════════════════════════
 (nil? (.log.open 'sync "/tmp/rfl_ops_journal_purge")) -- true
-(nil? (.log.write 42)) -- true
+(set jw_e 42) -- 42
 (nil? (.log.close)) -- true
 (.sys.exec "test -f /tmp/rfl_ops_journal_purge.log") -- 0
 

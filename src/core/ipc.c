@@ -716,32 +716,6 @@ static ray_t* deser_frame(uint8_t* payload, size_t payload_len, uint8_t flags)
     return msg;
 }
 
-/* Journal the note of a restricted request whose trusted calls ran lifted:
- * the log generation and offset of the request's own frame, which tie the
- * note to it whatever was logged in between, then the identities of those
- * calls' lambdas, in call order (RAY_IPC_MSG_JNOTE). */
-static ray_err_t journal_lift_note(int64_t gen, int64_t off, const int64_t* ids, int64_t n) {
-    ray_t* v = ray_vec_new(RAY_I64, n + 2);
-    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return RAY_ERR_OOM; }
-    int64_t* d = (int64_t*)ray_data(v);
-    d[0] = gen;
-    d[1] = off;
-    memcpy(d + 2, ids, (size_t)n * sizeof(int64_t));
-    v->len = n + 2;
-    int64_t size = ray_serde_size(v);
-    uint8_t* buf = size > 0 ? (uint8_t*)ray_sys_alloc((size_t)size) : NULL;
-    ray_err_t e = RAY_ERR_OOM;
-    if (buf && ray_ser_raw(buf, v) == size) {
-        ray_ipc_header_t hdr = { .prefix = RAY_SERDE_PREFIX, .version = RAY_SERDE_WIRE_VERSION,
-                                 .endian = RAY_SERDE_ENDIAN, .msgtype = RAY_IPC_MSG_JNOTE,
-                                 .size = size };
-        e = ray_journal_write_bytes(&hdr, buf, size);
-    }
-    if (buf) ray_sys_free(buf);
-    ray_release(v);
-    return e;
-}
-
 /* Run the actual decompress + de-serialize + ray_eval pipeline on a
  * single inbound payload.  The wrapper eval_payload() below decides
  * whether to capture stdout/stderr (RAY_IPC_FLAG_VERBOSE) and whether
@@ -759,53 +733,6 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         __VM->raise_val = NULL;
     }
 
-    /* Journal hook: log every inbound SYNC message (state-mutation
-     * channel in the IPC model) before evaluation, so a crash mid-handler
-     * still leaves the message on disk for replay.  We write the raw
-     * inbound bytes — header + payload — verbatim, no decompression
-     * round-trip.  Async messages and responses are not logged, so
-     * background pings and result frames don't pollute the log.
-     * No-op when no journal is open or during in-progress replay.
-     *
-     * RAY_IPC_FLAG_RESTRICTED is captured into a LOCAL header copy:
-     * we mark the persisted frame with the connection's restricted
-     * state at write time so replay can re-impose it.  Without this
-     * a `-U` client's writes silently elevate to full privilege on
-     * crash-recovery, since replay runs on the main thread with no
-     * IPC connection context.  The bit is meaningless on the live
-     * IPC wire and doesn't affect this handler's eval — that uses
-     * the connection's own flag set by the caller above us.
-     *
-     * If the journal write fails (disk full, EIO), we ABORT the
-     * eval and return an error to the client.  The documented
-     * behaviour: "the message has not been logged so we cannot
-     * accept it".  Silently evaluating un-logged mutations defeats
-     * the entire durability premise of `-l`/`-L`. */
-    bool auto_journaled = false;
-    bool have_pos = false;
-    int64_t req_gen = 0, req_off = 0;
-    if (ray_journal_is_open() && hdr->msgtype == RAY_IPC_MSG_SYNC) {
-        have_pos = ray_journal_position(&req_gen, &req_off);
-        ray_ipc_header_t log_hdr = *hdr;
-        if (ray_eval_get_restricted())
-            log_hdr.flags |= RAY_IPC_FLAG_RESTRICTED;
-        ray_err_t je = ray_journal_write_bytes(&log_hdr, payload, (int64_t)payload_len);
-        if (je != RAY_OK) {
-            fprintf(stderr, "log: ERROR  journal write failed (rc=%d) — refusing to evaluate\n", (int)je);
-            ray_t* err = ray_error("io", "journal write failed; mutation refused");
-            if (__VM) {
-                ray_raise_clear();
-                __VM->raise_val = saved_raise;
-            }
-            return err;
-        }
-        auto_journaled = true;
-    }
-    /* A journaled restricted request records which trusted calls ran
-     * lifted; the note written after it lets replay lift exactly those. */
-    ray_lift_log_t lifts;
-    bool record_lifts = auto_journaled && have_pos && ray_eval_get_restricted();
-    if (record_lifts) ray_eval_lift_record(&lifts);
 
     /* Query-statistics ring: bracket the eval so the server records one
      * summary row per handled query.  No-op when logging is disabled. */
@@ -836,7 +763,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     }
 
     ray_t* result = NULL;
-    bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
+    bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
         if (msg->type == RAY_LIST) {
             ray_t** elems = (ray_t**)ray_data(msg);
@@ -901,16 +828,14 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     if (result && ray_is_lazy(result))
         result = ray_lazy_materialize(result);  /* consumes the retain */
 
-    if (record_lifts) {
-        ray_err_t ne = lifts.n > 0 ? journal_lift_note(req_gen, req_off, lifts.ids, lifts.n) : RAY_OK;
-        ray_eval_lift_done(&lifts);
-        if (ne != RAY_OK) {
-            /* The calls ran lifted, but replay would refuse them. */
-            fprintf(stderr, "log: ERROR  journal note write failed (rc=%d) after a trusted call\n", (int)ne);
-            if (result && RAY_IS_ERR(result)) ray_error_free(result);
-            else if (result) ray_release(result);
-            result = ray_error("io", "journal write failed; the trusted calls of this request will not replay");
-        }
+    /* The durability line: what this message changed reaches the log
+     * before its reply leaves.  A change that cannot be logged is in memory
+     * all the same, so the reply says so and the log stays refused until a
+     * snapshot (see ray_journal_commit). */
+    if (ray_journal_capture && ray_journal_commit() != RAY_OK) {
+        if (result && RAY_IS_ERR(result)) ray_error_free(result);
+        else if (result) ray_release(result);
+        result = ray_error("io", "journal write failed; this change is not logged");
     }
 
     /* `raise x` deliberately keeps x as a pending value instead of eagerly
@@ -1452,6 +1377,7 @@ static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel)
         cd->hdr.endian != RAY_SERDE_ENDIAN ||
         /* A journal note exists only in a log the server wrote. */
         cd->hdr.msgtype == RAY_IPC_MSG_JNOTE ||
+        cd->hdr.msgtype == RAY_IPC_MSG_JREC ||
         !ray_ipc_body_size_ok(cd->hdr.size)) {
         ray_poll_deregister(poll, sel->id);
         return NULL;

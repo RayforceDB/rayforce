@@ -72,10 +72,10 @@
 ;; ════════════════════════════════════════════════════════════════════════
 (nil? (.log.open 'async "/tmp/rfl_ops_journal_wrap")) -- true
 
-(nil? (.log.write 42))            -- true
-(nil? (.log.write 3.14))          -- true
-(nil? (.log.write -123))          -- true
-(nil? (.log.write [10 20 30]))    -- true
+(set jw_e 42)            -- 42
+(set jw_e 3.14)          -- 3.14
+(set jw_e -123)          -- -123
+(set jw_e [10 20 30])    -- [10 20 30]
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 3. .log.sync on an OPEN async journal — flush + fsync, RAY_OK → null.
@@ -91,7 +91,7 @@
 (nil? (.log.roll)) -- true
 
 ;; Write again into the fresh log so the post-roll log is non-empty.
-(nil? (.log.write 7)) -- true
+(set jw_e 7) -- 7
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 5. .log.snapshot on a live journal — bind a global, snapshot it.
@@ -128,7 +128,6 @@
 ;; 9. .log.write while closed → noopen error (ray_log_write_fn line 87-88).
 ;;    The journal is closed after step 6.
 ;; ════════════════════════════════════════════════════════════════════════
-(.log.write 99) !- noopen
 
 ;; ── teardown ─────────────────────────────────────────────────────────────
 (.sys.exec "rm -f /tmp/rfl_ops_journal_wrap.log /tmp/rfl_ops_journal_wrap.qdb /tmp/rfl_ops_journal_wrap.qdb.tmp /tmp/rfl_ops_journal_wrap.*.log")

@@ -33,11 +33,6 @@
  * opens <base>.log for append. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n);
 
-/* (.log.write expr) — append a synthetic entry containing the
- * serialized form of `expr`.  No-op (returns null) if no journal is
- * open or if a replay is currently in progress. */
-ray_t* ray_log_write_fn(ray_t* expr);
-
 /* (.log.replay "path") -> I64 processed-entry count, including evaluation
  * errors.  Warns and continues on those errors; terminal framing/read/decode/
  * resource/interruption errors remain errors.  No rollback of prior effects. */

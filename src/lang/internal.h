@@ -708,7 +708,6 @@ ray_t* ray_guid_fn(ray_t* n_arg);
  * is src/store/journal.c. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n);
 ray_t* ray_log_status_fn(ray_t** args, int64_t n);
-ray_t* ray_log_write_fn(ray_t* expr);
 ray_t* ray_log_replay_fn(ray_t* path);
 ray_t* ray_log_replay_report_fn(ray_t* path);
 ray_t* ray_log_validate_fn(ray_t* path);
@@ -804,6 +803,7 @@ bool   ray_select_form_whole(ray_t* expr);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);
 ray_t* ray_upsert_fn(ray_t** args, int64_t n);
+ray_t* ray_delete_fn(ray_t** args, int64_t n);
 ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);

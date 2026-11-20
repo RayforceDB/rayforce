@@ -89,6 +89,9 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * payload is an I64 vector of those lambdas' identities, in call order;
  * replay pairs it with the frame right before it (ray_lift_log_t). */
 #define RAY_IPC_MSG_JNOTE   4
+/* A journal commit: the physical records of one commit (store/journal.c),
+ * written by the server, never sent on the wire. */
+#define RAY_IPC_MSG_JREC    5
 
 /* ===== Transports =====
  *
