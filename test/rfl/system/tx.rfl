@@ -14,7 +14,7 @@
 (set stop_server (fn [] (do (.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_tx' 2>/dev/null; true") (.sys.exec "for i in $(seq 50); do pgrep -f '[r]ayforce -L /tmp/rftest_tx' >/dev/null || exit 0; sleep 0.05; done; exit 1"))))
 
 (stop_server)
-(.sys.exec "rm -f /tmp/rftest_tx*")
+(.sys.exec "rm -rf /tmp/rftest_tx*")
 (start_server)
 (set h (wait_ipc "127.0.0.1:19981" 50))
 (>= h 0) -- true
@@ -187,10 +187,6 @@
 (nil? (.ipc.send h "(.tx.rollback)")) -- true
 (nil? (.ipc.send h "(.tx.begin)")) -- true
 (.ipc.send h "(set n 99)") -- 99
-(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_d/\" t)") !- access
-(nil? (.ipc.send h "(.tx.rollback)")) -- true
-(nil? (.ipc.send h "(.tx.begin)")) -- true
-(.ipc.send h "(set n 99)") -- 99
 (.ipc.send h "(.log.open (quote async) \"/tmp/rftest_tx_other\")") !- access
 (nil? (.ipc.send h "(.tx.rollback)")) -- true
 (nil? (.ipc.send h "(.tx.begin)")) -- true
@@ -224,6 +220,47 @@
 (.ipc.send h "n") -- 4
 (.sys.exec "test ! -e /tmp/rftest_tx_w && test ! -e /tmp/rftest_tx_d && test ! -e /tmp/rftest_tx_other.log") -- 0
 
+;; ── a table written in a transaction is published by its commit ─────
+;; This process reads the directory as any other process would; the owner
+;; reads its own write through the server.
+(.sys.exec "rm -rf /tmp/rftest_tx_db")
+(.ipc.send h "(set d (table [k v] (list [1 2 3] [10 20 30])))")
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 'd (list 4 40))") -- 'd
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/fresh/\" d)")
+(.ipc.send h "(count (.db.splayed.get \"/tmp/rftest_tx_db/d/\"))") -- 4
+(.ipc.send h "(count (.db.splayed.get \"/tmp/rftest_tx_db/fresh/\"))") -- 4
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+(.sys.exec "test ! -e /tmp/rftest_tx_db/fresh/.current && test ! -e /tmp/rftest_tx_db/fresh/.d") -- 0
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+(.ipc.send h "(count (.db.splayed.get \"/tmp/rftest_tx_db/d/\"))") -- 3
+(.sys.exec "test ! -e /tmp/rftest_tx_db/fresh/.current && test ! -e /tmp/rftest_tx_db/fresh/.d") -- 0
+
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 'd (list 4 40))") -- 'd
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/fresh/\" d)")
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 4
+(count (.db.splayed.get "/tmp/rftest_tx_db/fresh/")) -- 4
+
+;; an error after the write: the table stays as it was
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 'd (list 5 50))") -- 'd
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(.ipc.send h "(no_such_function 1)") !- name
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 4
+;; and the table is free to write again
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 4
+
 ;; ── the owner disconnects: rolled back, the server goes on ──────────
 (nil? (.ipc.send h "(.tx.begin)")) -- true
 (.ipc.send h "(set n 60)") -- 60
@@ -256,4 +293,4 @@
 ;; ── teardown ────────────────────────────────────────────────────────
 (.ipc.close h)
 (stop_server)
-(.sys.exec "rm -f /tmp/rftest_tx*")
+(.sys.exec "rm -rf /tmp/rftest_tx*")

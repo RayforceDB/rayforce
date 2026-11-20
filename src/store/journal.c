@@ -35,6 +35,7 @@
 #include "lang/env.h"
 #include "lang/internal.h"
 #include "table/sym.h"
+#include "store/splay.h"
 #include "mem/sys.h"
 
 #include <dirent.h>
@@ -282,6 +283,9 @@ static size_t read_full(FILE* f, void* buf, size_t want) {
  *     [RAY_JREC_SET, name, value]    bind the global
  *     [RAY_JREC_DEL, name]           unbind it
  *     [RAY_JREC_APPEND, name, tail]  concat `tail` to the bound table
+ *     [RAY_JREC_PUBLISH, _, [root, gen]]  a splayed table written in a
+ *                                    transaction: make `gen` its current
+ *                                    generation, unless it already is
  *
  * Records are serialized as they are noted, so the buffer holds no reference
  * that would turn a later in-place write into a copy. */
@@ -289,6 +293,7 @@ static size_t read_full(FILE* f, void* buf, size_t want) {
 #define RAY_JREC_SET     0
 #define RAY_JREC_DEL     1
 #define RAY_JREC_APPEND  2
+#define RAY_JREC_PUBLISH 3
 #define RAY_JREC_MAX     (256LL * 1024 * 1024)   /* the frame size replay accepts */
 
 bool ray_journal_capture = false;
@@ -497,6 +502,7 @@ static ray_err_t log_truncate_open(int64_t len) {
 
 bool ray_tx_active = false;
 
+
 static struct {
     int64_t owner;
     int64_t idle_ms, idle_at, end_at;            /* 0: no limit */
@@ -507,6 +513,21 @@ static struct {
     bool    doomed;      /* opened to be rolled back (see ray_tx_doom) */
     bool    acked;       /* the owner rolled a doomed transaction back itself */
 } g_tx;
+
+#ifdef DEBUG
+/* Tests: end the transaction as a process dying at this point would leave
+ * things.  Before the commit: nothing logged, the tables' generations on
+ * disk unpublished.  After it reached the journal: the same, but logged. */
+static bool g_tx_crash;
+static void tx_end(bool undo);
+void ray_tx_crash_for_test(bool committed) {
+    if (!ray_tx_active) return;
+    g_tx_crash = true;
+    if (committed) (void)ray_tx_commit();
+    else { ray_journal_rewind(g_tx.mark); tx_end(false); }
+    g_tx_crash = false;
+}
+#endif
 
 int64_t ray_tx_owner(void) { return g_tx.owner; }
 
@@ -531,6 +552,7 @@ ray_err_t ray_tx_begin(int64_t owner, int64_t idle_ms, int64_t total_ms) {
     g_tx.mark = ray_journal_mark();
     g_tx.broken = g_tx.doomed = g_tx.acked = false;
     ray_tx_active = true;
+    ray_splay_defer = true;                      /* table writes wait for the commit */
     ray_tx_heard();
     return RAY_OK;
 }
@@ -554,6 +576,16 @@ void ray_tx_touch(int64_t name) {
 /* Close the transaction; `undo` binds the kept values back first. */
 static void tx_end(bool undo) {
     ray_tx_active = false;
+    ray_splay_defer = false;
+    /* The tables written in it: published now that the commit is logged,
+     * or removed.  A publication that fails here is finished by recovery,
+     * which finds it in the journal. */
+#ifdef DEBUG
+    if (g_tx_crash) ray_splay_pending_abandon();
+#endif
+    if (ray_splay_pending_end(!undo) != RAY_OK)
+        fprintf(stderr, "tx: ERROR  a table written by the transaction is committed but not "
+                        "published; a restart with the journal publishes it\n");
     bool capture = ray_journal_capture;
     ray_journal_capture = false;                 /* restoring is not a change to log */
     for (int64_t i = g_tx.n - 1; i >= 0; i--) {
@@ -580,8 +612,25 @@ ray_err_t ray_tx_commit(void) {
     if (!ray_tx_active) return RAY_ERR_DOMAIN;
     if (g_tx.broken || g_tx.doomed) { tx_end(true); return RAY_ERR_DOMAIN; }
     bool was_stale = g_rec.stale;
+    /* The tables it wrote go into the commit: once it is on disk they are
+     * published even if the process dies before publishing them. */
+    ray_err_t e = RAY_OK;
+    for (int64_t i = 0; ray_journal_capture && i < ray_splay_pending_count() && e == RAY_OK; i++) {
+        const char* part[2] = { ray_splay_pending_root(i), ray_splay_pending_gen(i) };
+        ray_t* pair = ray_list_new(2);
+        for (int k = 0; k < 2 && pair && !RAY_IS_ERR(pair); k++) {
+            ray_t* str = ray_str(part[k], strlen(part[k]));
+            ray_t* grown = str && !RAY_IS_ERR(str) ? ray_list_append(pair, str) : NULL;
+            if (str && !RAY_IS_ERR(str)) ray_release(str);
+            if (!grown || RAY_IS_ERR(grown)) { ray_release(pair); pair = NULL; }
+            else pair = grown;
+        }
+        e = pair && !RAY_IS_ERR(pair) ? rec_push(RAY_JREC_PUBLISH, 0, pair) : RAY_ERR_OOM;
+        if (pair && !RAY_IS_ERR(pair)) ray_release(pair);
+    }
+    if (e != RAY_OK) g_rec.lost = true;
     ray_tx_active = false;                       /* let the journal write */
-    ray_err_t e = ray_journal_commit();
+    e = ray_journal_commit();
     ray_tx_active = true;
     if (e != RAY_OK) {
         /* Not logged, so not done: memory goes back to match the log,
@@ -614,6 +663,20 @@ static ray_err_t rec_apply(ray_t* rec) {
     if (!o || o->type != -RAY_I64 || !s || s->type != -RAY_SYM) return RAY_ERR_DOMAIN;
     int64_t name = s->i64;
     switch (o->i64) {
+    case RAY_JREC_PUBLISH: {
+        if (!v || v->type != RAY_LIST || v->len != 2) return RAY_ERR_DOMAIN;
+        ray_t* root = ray_list_get(v, 0);
+        ray_t* gen  = ray_list_get(v, 1);
+        if (!root || root->type != -RAY_STR || !gen || gen->type != -RAY_STR) return RAY_ERR_DOMAIN;
+        char r[1024], g[256];
+        if (ray_str_len(root) >= sizeof(r) || ray_str_len(gen) >= sizeof(g)) return RAY_ERR_DOMAIN;
+        memcpy(r, ray_str_ptr(root), ray_str_len(root)); r[ray_str_len(root)] = '\0';
+        memcpy(g, ray_str_ptr(gen), ray_str_len(gen));   g[ray_str_len(gen)] = '\0';
+        /* A generation name is all this may put under the table. */
+        if (strncmp(g, ".generations/g-", 15) != 0 || strchr(g + 13, '/') || strstr(g, ".."))
+            return RAY_ERR_DOMAIN;
+        return ray_splay_publish(r, g);
+    }
     case RAY_JREC_DEL:
         return ray_env_set(name, NULL);
     case RAY_JREC_SET: {

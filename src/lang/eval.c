@@ -5432,7 +5432,7 @@ static void ray_register_builtins(void) {
      * dedicated `.db.*` namespace so format-specific siblings stay
      * grouped (set/get per format) and there's room to grow
      * without polluting the top-level builtin namespace. */
-    register_vary(".db.splayed.set",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_set_splayed_fn);
+    register_vary(".db.splayed.set",   RAY_FN_RESTRICTED, ray_set_splayed_fn);
     register_vary(".db.splayed.get",   RAY_FN_NONE,       ray_get_splayed_fn);
     register_vary(".db.parted.get",    RAY_FN_NONE,       ray_get_parted_fn);
     register_vary(".db.parted.tables", RAY_FN_NONE,       ray_get_parted_tables_fn);

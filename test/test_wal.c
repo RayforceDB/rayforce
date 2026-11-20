@@ -44,6 +44,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include "store/fileio.h"
+#include "core/timer.h"
 
 static void wal_setup(void)    { ray_runtime_create(0, NULL); }
 static void wal_teardown(void) { ray_runtime_destroy(__RUNTIME); }
@@ -404,6 +407,216 @@ static test_result_t test_tx_begin_commit_rules(void) {
     PASS();
 }
 
+/* ── transactions: tables on disk ─────────────────────────────────── */
+
+static void txd_dir(char* dir, size_t sz, const char* tag) {
+    snprintf(dir, sz, "/tmp/wal_test_db_%s_%d", tag, (int)getpid());
+    char cmd[400];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    if (system(cmd) != 0) { /* best effort */ }
+}
+
+/* The generation the table's .current names, "" when it has none. */
+static void txd_current(const char* dir, char* out, size_t sz) {
+    char path[400];
+    snprintf(path, sizeof(path), "%s/.current", dir);
+    out[0] = '\0';
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    size_t n = fread(out, 1, sz - 1, f);
+    out[n] = '\0';
+    fclose(f);
+}
+
+static int txd_generations(const char* dir) {
+    char cmd[500];
+    snprintf(cmd, sizeof(cmd), "test \"$(ls %s/.generations 2>/dev/null | wc -l)\" -eq 1", dir);
+    return system(cmd) == 0 ? 1 : 0;
+}
+
+static bool txd_evalf(const char* fmt, const char* dir) {
+    char src[700];
+    snprintf(src, sizeof(src), fmt, dir);
+    return wal_run(src);
+}
+
+/* Rows of the table as this process reads it, -1 when it cannot. */
+static int64_t txd_rows(const char* dir) {
+    char src[500];
+    snprintf(src, sizeof(src), "(count (.db.splayed.get \"%s/\"))", dir);
+    ray_t* v = ray_eval_str(src);
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return -1; }
+    int64_t n = v->i64;
+    ray_release(v);
+    return n;
+}
+
+/* A table written in a transaction is on disk but not published: its
+ * owner reads the new rows, .current still names the old generation, and
+ * a rollback removes what was written. */
+static test_result_t test_tx_table_write_waits_for_commit(void) {
+    char dir[256], before[300], during[300], after[300];
+    txd_dir(dir, sizeof(dir), "wait");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));     /* now a generation */
+    txd_current(dir, before, sizeof(before));
+    TEST_ASSERT_TRUE(before[0] != '\0');
+
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    txd_current(dir, during, sizeof(during));
+    TEST_ASSERT_STR_EQ(during, before);            /* nobody else sees it */
+    TEST_ASSERT_EQ_I(txd_rows(dir), 4);            /* its owner does */
+    TEST_ASSERT_FALSE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));    /* once per transaction */
+    ray_tx_rollback();
+    txd_current(dir, after, sizeof(after));
+    TEST_ASSERT_STR_EQ(after, before);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    TEST_ASSERT_EQ_I(txd_generations(dir), 1);     /* the unpublished one is gone */
+
+    /* ...and a commit publishes it. */
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+    txd_current(dir, after, sizeof(after));
+    TEST_ASSERT_TRUE(strcmp(after, before) != 0);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 4);
+    TEST_ASSERT_EQ_I(txd_generations(dir), 1);
+    /* Outside a transaction a write publishes at once, as ever. */
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_EQ_I(txd_rows(dir), 5);
+    txd_dir(dir, sizeof(dir), "wait");
+    PASS();
+}
+
+/* A table that did not exist: nothing of it is published before the
+ * commit, and after a rollback there is no table. */
+static test_result_t test_tx_new_table_waits_for_commit(void) {
+    char dir[256], cur[300];
+    txd_dir(dir, sizeof(dir), "new");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    txd_current(dir, cur, sizeof(cur));
+    TEST_ASSERT_STR_EQ(cur, "");
+    char schema[300];
+    snprintf(schema, sizeof(schema), "%s/.d", dir);
+    TEST_ASSERT_TRUE(access(schema, F_OK) != 0);   /* nor the first-write layout */
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    ray_tx_rollback();
+    TEST_ASSERT_EQ_I(txd_rows(dir), -1);
+    txd_current(dir, cur, sizeof(cur));
+    TEST_ASSERT_STR_EQ(cur, "");
+
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    txd_dir(dir, sizeof(dir), "new");
+    PASS();
+}
+
+/* A table another process is writing: the transaction's write fails at
+ * once.  Waiting would stop the server for everyone. */
+static test_result_t test_tx_table_locked_elsewhere_fails_fast(void) {
+    char dir[256], lock[300];
+    txd_dir(dir, sizeof(dir), "lock");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    snprintf(lock, sizeof(lock), "%s/.write.lock", dir);
+    int to_child[2], from_child[2];
+    TEST_ASSERT_EQ_I(pipe(to_child), 0);
+    TEST_ASSERT_EQ_I(pipe(from_child), 0);
+    pid_t pid = fork();
+    if (pid == 0) {                                /* hold the table's lock until told */
+        ray_fd_t fd = ray_file_open(lock, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+        char c = fd != RAY_FD_INVALID && ray_file_lock_ex(fd) == RAY_OK ? 'k' : 'x';
+        if (write(from_child[1], &c, 1) != 1) _exit(1);
+        if (read(to_child[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c = 0;
+    TEST_ASSERT_EQ_I((int64_t)read(from_child[0], &c, 1), 1);
+    int64_t t0 = ray_time_now_ms();
+    bool wrote = true;
+    if (c == 'k' && ray_tx_begin(RAY_TX_LOCAL, 0, 0) == RAY_OK) {
+        wrote = txd_evalf("(.db.splayed.set \"%s/\" t)", dir);
+        ray_tx_rollback();
+    }
+    int64_t took = ray_time_now_ms() - t0;
+    if (write(to_child[1], &c, 1) != 1) { /* the child exits on EOF too */ }
+    close(to_child[1]); close(from_child[0]); close(to_child[0]); close(from_child[1]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    TEST_ASSERT_EQ_I(c, 'k');
+    TEST_ASSERT_FALSE(wrote);
+    TEST_ASSERT_TRUE(took < 2000);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    txd_dir(dir, sizeof(dir), "lock");
+    PASS();
+}
+
+/* A process that dies after its commit reached the journal but before the
+ * tables were published: recovery publishes them, once.  One that dies
+ * before the commit leaves the tables as they were. */
+static test_result_t test_tx_crash_around_commit(void) {
+#ifndef DEBUG
+    SKIP("needs the debug build's ray_tx_crash_for_test");
+#else
+    char base[256], d1[256], d2[256], cur1[300], cur2[300], now1[300], now2[300];
+    wal_base(base, sizeof(base), "txcrash");
+    txd_dir(d1, sizeof(d1), "c1");
+    txd_dir(d2, sizeof(d2), "c2");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
+    txd_current(d1, cur1, sizeof(cur1));
+    txd_current(d2, cur2, sizeof(cur2));            /* "": d2 does not exist yet */
+
+    for (int logged = 0; logged < 2; logged++) {
+        TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_SYNC), RAY_OK);
+        TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+        TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+        TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+        TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
+        TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d2));
+        ray_tx_crash_for_test(logged);              /* the process dies here */
+        TEST_ASSERT_FALSE(ray_tx_active);
+        TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+        /* Either way nothing is published yet. */
+        txd_current(d1, now1, sizeof(now1));
+        txd_current(d2, now2, sizeof(now2));
+        TEST_ASSERT_STR_EQ(now1, cur1);
+        TEST_ASSERT_STR_EQ(now2, cur2);
+
+        wal_teardown();
+        wal_setup();
+        TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+        if (!logged) {
+            TEST_ASSERT_EQ_I(txd_rows(d1), 3);      /* never committed: as it was */
+            TEST_ASSERT_EQ_I(txd_rows(d2), -1);
+        } else {
+            TEST_ASSERT_EQ_I(txd_rows(d1), 4);      /* committed: both tables, and memory */
+            TEST_ASSERT_EQ_I(txd_rows(d2), 4);
+            TEST_ASSERT_TRUE(wal_run("(if (== (count t) 4) 1 (no_such_function))"));
+            txd_current(d1, now1, sizeof(now1));
+            TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);   /* a second recovery changes nothing */
+            txd_current(d1, now2, sizeof(now2));
+            TEST_ASSERT_STR_EQ(now2, now1);
+            TEST_ASSERT_EQ_I(txd_rows(d1), 4);
+        }
+        wal_cleanup(base);
+    }
+    txd_dir(d1, sizeof(d1), "c1");
+    txd_dir(d2, sizeof(d2), "c2");
+    PASS();
+#endif
+}
+
 /* An insert is logged as the rows it adds: the commit of one row into a
  * large table must not grow with the table. */
 static test_result_t test_wal_insert_logs_rows_not_table(void) {
@@ -585,5 +798,9 @@ const test_entry_t wal_entries[] = {
     { "tx/gives_references_back",   test_tx_gives_references_back,   wal_setup, wal_teardown },
     { "tx/is_one_commit",           test_tx_is_one_commit,           wal_setup, wal_teardown },
     { "tx/begin_commit_rules",      test_tx_begin_commit_rules,      wal_setup, wal_teardown },
+    { "tx/table_write_waits",       test_tx_table_write_waits_for_commit, wal_setup, wal_teardown },
+    { "tx/new_table_waits",         test_tx_new_table_waits_for_commit, wal_setup, wal_teardown },
+    { "tx/table_locked_elsewhere",  test_tx_table_locked_elsewhere_fails_fast, wal_setup, wal_teardown },
+    { "tx/crash_around_commit",     test_tx_crash_around_commit,     wal_setup, wal_teardown },
     { NULL, NULL, NULL, NULL },
 };

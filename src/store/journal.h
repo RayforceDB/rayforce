@@ -182,6 +182,12 @@ void      ray_tx_touch(int64_t name);
  * own (.tx.rollback) — the acknowledgement that ends the aborted state. */
 void      ray_tx_doom(int64_t owner);
 bool      ray_tx_doom_end(void);
+#ifdef DEBUG
+/* Tests: end the open transaction as a process dying would leave things —
+ * before its commit (false), or after the commit reached the journal but
+ * before its tables were published (true). */
+void      ray_tx_crash_for_test(bool committed);
+#endif
 
 /* Replay a log file, applying each entry in order.  *out_chunks counts
  * evaluated entries INCLUDING entries whose evaluation returned an error;

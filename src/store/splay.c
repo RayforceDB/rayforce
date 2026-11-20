@@ -277,8 +277,39 @@ static ray_err_t splay_current_dir(const char* dir, char* out, size_t out_sz,
     return RAY_OK;
 }
 
+/* ── writes held back for a transaction ───────────────────────────────
+ * While ray_splay_defer is set, ray_splay_write_finish stops short of
+ * publishing: the generation is complete and synced, its table's lock is
+ * kept, and the write waits here until the transaction ends.  Readers of
+ * this process resolve such a table to the waiting generation — the owner
+ * reads its own writes — and everyone else to the published one. */
+bool ray_splay_defer = false;
+static ray_splay_write_t* g_pending;
+static int64_t g_npending, g_cappending;
+
+static size_t splay_root_len(const char* dir) {
+    size_t n = strlen(dir);
+    while (n > 1 && (dir[n - 1] == '/' || dir[n - 1] == '\\')) n--;
+    return n;
+}
+
+static const ray_splay_write_t* splay_pending_for(const char* dir) {
+    size_t n = splay_root_len(dir);
+    for (int64_t i = g_npending - 1; i >= 0; i--)
+        if (splay_root_len(g_pending[i].root) == n && memcmp(g_pending[i].root, dir, n) == 0)
+            return &g_pending[i];
+    return NULL;
+}
+
 ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz) {
     if (!dir || !out || !out_sz) return RAY_ERR_IO;
+    if (g_npending) {
+        const ray_splay_write_t* w = splay_pending_for(dir);
+        if (w) {
+            int k = snprintf(out, out_sz, "%s", w->dir);
+            return k < 0 || (size_t)k >= out_sz ? RAY_ERR_RANGE : RAY_OK;
+        }
+    }
     bool active;
     ray_err_t err = splay_current_dir(dir, out, out_sz, &active);
     if (err != RAY_OK || active) return err;
@@ -1322,9 +1353,27 @@ ray_err_t ray_splay_write_finish(ray_splay_write_t* write, ray_err_t result,
         /* ray_file_sync_dir syncs the PARENT of its argument. */
         char schema[1100];
         snprintf(schema, sizeof(schema), "%s/.d", write->dir);
-        if (durable && (ray_file_sync_dir(schema) != RAY_OK ||
-                        ray_file_sync_dir(write->dir) != RAY_OK))
+        bool hold = ray_splay_defer;
+        if ((durable || hold) && (ray_file_sync_dir(schema) != RAY_OK ||
+                                  ray_file_sync_dir(write->dir) != RAY_OK))
             result = RAY_ERR_IO;
+        if (result == RAY_OK && hold) {
+            if (g_npending == g_cappending) {
+                int64_t cap = g_cappending ? g_cappending * 2 : 4;
+                void* np = ray_sys_realloc(g_pending, (size_t)cap * sizeof(*g_pending));
+                if (np) { g_pending = np; g_cappending = cap; } else result = RAY_ERR_OOM;
+            }
+            if (result == RAY_OK) {
+                if (write->before) ray_free_raw(write->before);
+                ray_free_raw(write->gens);
+                write->before = NULL; write->nbefore = 0;
+                write->gens = NULL;   write->ngens = 0;
+                g_pending[g_npending++] = *write;    /* with its lock */
+                write->lock = RAY_FD_INVALID;
+                write->locked = false;
+                return RAY_OK;
+            }
+        }
         if (result == RAY_OK)
             result = splay_publish_generation(write->root, write->generation, durable);
         if (result == RAY_OK) {
@@ -1410,7 +1459,10 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
             if (errno == ENOENT) continue;
             return ray_splay_write_finish(write, err, false);
         }
-        err = ray_file_lock_ex(write->lock);
+        /* A transaction never waits for a lock: the server would stop for
+         * everyone, and for good when the holder is the transaction itself. */
+        err = ray_splay_defer ? ray_file_trylock_ex(write->lock)
+                              : ray_file_lock_ex(write->lock);
         if (err != RAY_OK) {
             /* A wait cut short (EINTR) is retried without waiting.  When
              * that fails for any reason but another holder, locking itself
@@ -1449,7 +1501,9 @@ ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write) {
     err = splay_has_file(write->root, ".d", &schema);
     if (err == RAY_OK) err = splay_has_file(write->root, ".current", &current);
     if (err != RAY_OK) return ray_splay_write_finish(write, err, false);
-    write->staged = schema || current;
+    /* A first write publishes in place as it goes; held back for a
+     * transaction it has to be a generation like any other. */
+    write->staged = schema || current || ray_splay_defer;
     /* The destination's current generation, read under the lock: the
      * generation inheritance rule compares against it. */
     write->cur[0] = '\0';
@@ -2093,4 +2147,76 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
         if (!why) return tbl;
         ray_error_free(tbl);
     }
+}
+
+/* ── the end of a transaction's held-back writes ──────────────────── */
+
+int64_t     ray_splay_pending_count(void)        { return g_npending; }
+const char* ray_splay_pending_root(int64_t i)    { return g_pending[i].root; }
+const char* ray_splay_pending_gen(int64_t i)     { return g_pending[i].generation; }
+
+ray_err_t ray_splay_pending_end(bool publish) {
+    ray_err_t result = RAY_OK;
+    for (int64_t i = 0; i < g_npending; i++) {
+        ray_splay_write_t* w = &g_pending[i];
+        if (publish) {
+            ray_err_t e = splay_publish_generation(w->root, w->generation, true);
+            if (e == RAY_OK) {
+                splay_retire_legacy_schema(w->root);
+                splay_prune_generations(w->root, w->generation);
+            } else {
+                result = e;                      /* recovery finishes it from the journal */
+            }
+        } else {
+            splay_remove_tree_best_effort(w->dir);
+            if (w->created[0]) {                 /* a table this write would have created */
+                char gens[1100];
+                snprintf(gens, sizeof(gens), "%s/.generations", w->root);
+                (void)rmdir(gens);
+#ifndef RAY_OS_WINDOWS
+                splay_remove_created(w, true);
+#endif
+            }
+        }
+        if (w->lock != RAY_FD_INVALID) {
+            (void)ray_file_unlock(w->lock);
+            ray_file_close(w->lock);
+        }
+    }
+    g_npending = 0;
+    return result;
+}
+
+#ifdef DEBUG
+/* Tests: what a process that dies leaves — the generations on disk, the
+ * locks gone with it, nothing published and nothing removed. */
+void ray_splay_pending_abandon(void) {
+    for (int64_t i = 0; i < g_npending; i++)
+        if (g_pending[i].lock != RAY_FD_INVALID) {
+            (void)ray_file_unlock(g_pending[i].lock);
+            ray_file_close(g_pending[i].lock);
+        }
+    g_npending = 0;
+}
+#endif
+
+ray_err_t ray_splay_publish(const char* root, const char* gen) {
+    char schema[1200], cur[1024];
+    int n = snprintf(schema, sizeof(schema), "%s/%s/.d", root, gen);
+    if (n < 0 || (size_t)n >= sizeof(schema)) return RAY_ERR_RANGE;
+    FILE* f = fopen(schema, "rb");
+    if (!f) return RAY_OK;                       /* published and since replaced, or never finished */
+    fclose(f);
+    bool active = false;
+    size_t rl = strlen(root);
+    if (splay_current_dir(root, cur, sizeof(cur), &active) == RAY_OK && active &&
+        strlen(cur) > rl + 1 && strcmp(cur + rl + 1, gen) == 0)
+        return RAY_OK;                           /* already current */
+    /* shortcut: no .write.lock taken: recovery runs before this process
+     * serves anyone; take it once another process may write the table then. */
+    ray_err_t e = splay_publish_generation(root, gen, true);
+    if (e != RAY_OK) return e;
+    splay_retire_legacy_schema(root);
+    splay_prune_generations(root, gen);
+    return RAY_OK;
 }
