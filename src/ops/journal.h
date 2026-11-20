@@ -66,4 +66,10 @@ ray_t* ray_log_close_fn(ray_t** args, int64_t n);
  * archives, <base>.qdb, and a stray <base>.qdb.tmp. */
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
 
+/* (.tx.begin [idle-ms total-ms]), (.tx.commit), (.tx.rollback) — a
+ * transaction owned by the calling IPC connection (store/journal.h). */
+ray_t* ray_tx_begin_fn(ray_t** args, int64_t n);
+ray_t* ray_tx_commit_fn(ray_t** args, int64_t n);
+ray_t* ray_tx_rollback_fn(ray_t** args, int64_t n);
+
 #endif /* RAY_OPS_JOURNAL_H */

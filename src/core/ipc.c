@@ -720,6 +720,10 @@ static ray_t* deser_frame(uint8_t* payload, size_t payload_len, uint8_t flags)
  * single inbound payload.  The wrapper eval_payload() below decides
  * whether to capture stdout/stderr (RAY_IPC_FLAG_VERBOSE) and whether
  * to wrap the result in a [captured_str, result] list. */
+/* Whether the last eval_payload_core on this thread returned an error:
+ * the verbose wrapper turns one into a child of its result. */
+static _Thread_local bool g_eval_failed;
+
 static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
                                 ray_ipc_header_t* hdr)
 {
@@ -827,6 +831,8 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
      * client blocks forever waiting for a reply (issue #285). */
     if (result && ray_is_lazy(result))
         result = ray_lazy_materialize(result);  /* consumes the retain */
+
+    g_eval_failed = result && RAY_IS_ERR(result);   /* before any wrapping hides it */
 
     /* The durability line: what this message changed reaches the log
      * before its reply leaves.  A change that cannot be logged is in memory
@@ -983,6 +989,10 @@ typedef struct {
      * instead of being evaluated.  Interleaved ASYNC/SYNC frames still
      * dispatch normally during the wait. */
     bool             sync_waiting;
+    /* The transaction this connection owned was rolled back under it (an
+     * error in one of its messages): until it says (.tx.rollback) itself,
+     * nothing it sends takes effect (see ipc_read_payload). */
+    bool             tx_aborted;
     bool             sync_ready;
     ray_t*           sync_resp;
     /* Transport negotiation: the capabilities the peer shares, whether
@@ -1199,6 +1209,44 @@ static void ipc_sigurg_handler(int sig)
         ray_request_interrupt();
 }
 #endif
+
+/* Serve the owner of the open transaction alone until it ends: everything
+ * else the poll watches — other connections, timers, the REPL — waits, which
+ * is the whole of the isolation.  Runs where a sync send waits for its reply:
+ * one connection pumped, one descriptor polled, with a deadline.  A message
+ * the pump dispatches comes back through ipc_read_payload. */
+static bool g_tx_serving;
+
+static void tx_serve(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd)
+{
+    g_tx_serving = true;
+    while (ray_tx_active && ray_tx_owner() == id) {
+        int rc = ray_poll_serve_rx(poll, id);
+        /* The pump can close the connection (ipc_on_close rolls back) and a
+         * dispatched eval can open another under the same id. */
+        ray_selector_t* sel = ray_poll_get(poll, id);
+        if (rc < 0 || !sel || sel->data != (void*)cd) break;
+        if (!ray_tx_active || ray_tx_owner() != id) break;
+        int64_t left = ray_tx_left_ms();
+        if (left <= 0) {
+            /* The owner went quiet or took too long.  Rolling back alone would
+             * let what it sends next land outside the transaction, so it is
+             * also disconnected, as a sync send that timed out is. */
+            fprintf(stderr, "tx: transaction of handle %lld timed out; rolled back\n", (long long)id);
+            ray_tx_rollback();
+            ray_poll_deregister(poll, id);
+            break;
+        }
+        int w = conn_wait_readable(sel, left > INT_MAX ? INT_MAX : (int)left);
+        if (w == -2) continue;                    /* a signal */
+        if (w < 0) {                              /* the peer is gone */
+            ray_poll_deregister(poll, id);
+            break;
+        }
+        if (w > 0) ray_tx_heard();
+    }
+    g_tx_serving = false;
+}
 
 static void ipc_install_oob_cancel(void)
 {
@@ -1480,6 +1528,11 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * which unblocks the waiting client.  A cancel is thus always scoped to the
      * connection that sent it and never affects another client's query. */
     ray_t* result;
+    /* An owner whose transaction was aborted: this message runs in one that
+     * is rolled back whatever it does, unless it is the owner's rollback. */
+    bool doomed = cd->tx_aborted;
+    if (doomed) ray_tx_doom(id);
+    g_eval_failed = false;
     if (hdr.msgtype == RAY_IPC_MSG_SYNC) cd->rx_sync_seq++;
     int cancel_seq = !sel->xport ? CANCEL_ANY
                    : hdr.msgtype == RAY_IPC_MSG_SYNC ? (int)cd->rx_sync_seq : CANCEL_NONE;
@@ -1515,6 +1568,23 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * raised its SIGURG then, against the nested connection: look again. */
         if (prev_fd >= 0 && oob_cancel_for(prev_fd, prev_seq, &g_ipc_oob_taken))
             ray_request_interrupt();
+    }
+
+    if (doomed) {
+        bool acked = ray_tx_doom_end();
+        ray_selector_t* own = ray_poll_get(poll, id);
+        if (acked && own && own->data == (void*)cd) cd->tx_aborted = false;
+        if (!acked) {
+            if (RAY_IS_ERR(result)) ray_error_free(result);
+            else if (result != RAY_NULL_OBJ) ray_release(result);
+            result = ray_error("tx", "the transaction was rolled back; send (.tx.rollback) to go on");
+        }
+    } else if (ray_tx_active && ray_tx_owner() == id && (g_eval_failed || RAY_IS_ERR(result))) {
+        /* An error inside a transaction ends it: all of it is undone, and
+         * what the owner sends next must not land outside it unnoticed. */
+        ray_tx_rollback();
+        ray_selector_t* own = ray_poll_get(poll, id);
+        if (own && own->data == (void*)cd) cd->tx_aborted = true;
     }
 
     ipc_ctx_set(prev_handle, prev_poll);
@@ -1554,6 +1624,10 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     ray_enccol_cache_trim();
     ray_heap_relieve();
 
+    /* This message opened a transaction: its reply is out, and from here to
+     * the commit only this connection is served. */
+    if (ray_tx_active && ray_tx_owner() == id && !g_tx_serving) tx_serve(poll, id, cd);
+
     return NULL;
 }
 
@@ -1577,6 +1651,8 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
      * so one handler can tell the direction. */
     if (sel->data) {
         ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
+        /* Its transaction dies with it, before the hook can look at the state. */
+        if (ray_tx_active && ray_tx_owner() == sel->id) ray_tx_rollback();
         if (cd->phase == RAY_IPC_PHASE_HEADER ||
             cd->phase == RAY_IPC_PHASE_PAYLOAD) {
             hook_call_lifecycle(poll, IPC_HOOK_CLOSE, sel->id);

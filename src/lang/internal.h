@@ -716,6 +716,9 @@ ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n);
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n);
 ray_t* ray_log_close_fn(ray_t** args, int64_t n);
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
+ray_t* ray_tx_begin_fn(ray_t** args, int64_t n);
+ray_t* ray_tx_commit_fn(ray_t** args, int64_t n);
+ray_t* ray_tx_rollback_fn(ray_t** args, int64_t n);
 
 /* Group (formerly static in eval.c, now extern for query.c) */
 ray_t* ray_group_indices_fn(ray_t* x);

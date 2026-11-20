@@ -297,6 +297,7 @@ static struct {
     uint8_t* buf;
     int64_t  len, cap;
     bool     lost;       /* a change of this commit could not be noted */
+    bool     torn;       /* the last failed commit left part of a frame in the file */
     bool     stale;      /* the log misses a change memory has: refuse until a snapshot */
     _Atomic(int) lock;   /* globals are also set from worker threads */
 } g_rec;
@@ -430,7 +431,11 @@ ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64
     return r;
 }
 
+static ray_err_t log_truncate_open(int64_t len);
+
 ray_err_t ray_journal_commit(void) {
+    if (ray_tx_active) return RAY_OK;            /* the transaction commits as one */
+    g_rec.torn = false;
     if (g_rec.lost) {
         g_rec.lost = false;
         g_rec.len = 0;
@@ -444,7 +449,13 @@ ray_err_t ray_journal_commit(void) {
     ray_ipc_header_t hdr = { .prefix = RAY_SERDE_PREFIX, .version = RAY_SERDE_WIRE_VERSION,
                              .endian = RAY_SERDE_ENDIAN, .msgtype = RAY_IPC_MSG_JREC,
                              .size = g_rec.len };
+    int64_t gen, pos = -1;
+    if (!ray_journal_position(&gen, &pos)) pos = -1;
     ray_err_t e = ray_journal_write_bytes(&hdr, g_rec.buf, g_rec.len);
+    /* Part of the frame may be in the file: take it back out, or the next
+     * commit lands behind garbage. */
+    if (e != RAY_OK && g_journal.fp && (pos < 0 || log_truncate_open(pos) != RAY_OK))
+        g_rec.torn = true;
     g_rec.len = 0;
     if (g_rec.cap > (1 << 20)) {                 /* a large commit: give the buffer back */
         ray_sys_free(g_rec.buf);
@@ -457,6 +468,141 @@ ray_err_t ray_journal_commit(void) {
         g_rec.stale = true;
     }
     return e;
+}
+
+static ray_err_t log_truncate_open(int64_t len) {
+    if (fflush(g_journal.fp) != 0) return RAY_ERR_IO;
+#ifdef RAY_OS_WINDOWS
+    return _chsize_s(_fileno(g_journal.fp), len) == 0 ? RAY_OK : RAY_ERR_IO;
+#else
+    return ftruncate(fileno(g_journal.fp), (off_t)len) == 0 ? RAY_OK : RAY_ERR_IO;
+#endif
+}
+
+/* ── transactions ─────────────────────────────────────────────────────
+ *
+ * One at a time, and while it is open nobody but its owner is served (the
+ * owner's loop is in core/ipc.c), so isolation needs no versions: the
+ * owner writes the globals themselves and reads its own writes.
+ *
+ * Atomicity is an undo log: the first time a name is about to change, the
+ * value it holds is kept (one reference), and rollback binds the kept
+ * values back, last first.  Holding the old value is also what makes a
+ * mutator copy instead of writing in place.
+ * shortcut: the first write to a table in a transaction copies it; undo an
+ * insert by truncating instead once large tables in transactions matter.
+ *
+ * Durability is the journal: the records noted during the transaction are
+ * held back and written as one frame by the commit. */
+
+bool ray_tx_active = false;
+
+static struct {
+    int64_t owner;
+    int64_t idle_ms, idle_at, end_at;            /* 0: no limit */
+    struct { int64_t name; ray_t* old; }* undo;
+    int64_t n, cap;
+    int64_t mark;        /* journal buffer position at begin */
+    bool    broken;      /* an old value could not be kept: only rollback is left */
+    bool    doomed;      /* opened to be rolled back (see ray_tx_doom) */
+    bool    acked;       /* the owner rolled a doomed transaction back itself */
+} g_tx;
+
+int64_t ray_tx_owner(void) { return g_tx.owner; }
+
+void ray_tx_heard(void) {
+    if (g_tx.idle_ms > 0) g_tx.idle_at = ray_time_now_ms() + g_tx.idle_ms;
+}
+
+int64_t ray_tx_left_ms(void) {
+    int64_t at = g_tx.idle_ms > 0 ? g_tx.idle_at : INT64_MAX;
+    if (g_tx.end_at > 0 && g_tx.end_at < at) at = g_tx.end_at;
+    return at == INT64_MAX ? INT64_MAX : at - ray_time_now_ms();
+}
+
+ray_err_t ray_tx_begin(int64_t owner, int64_t idle_ms, int64_t total_ms) {
+    if (ray_tx_active) return RAY_ERR_DOMAIN;
+    ray_err_t e = ray_journal_commit();          /* what came before is not part of it */
+    if (e != RAY_OK) return e;
+    g_tx.owner = owner;
+    g_tx.idle_ms = idle_ms;
+    g_tx.end_at = total_ms > 0 ? ray_time_now_ms() + total_ms : 0;
+    g_tx.n = 0;
+    g_tx.mark = ray_journal_mark();
+    g_tx.broken = g_tx.doomed = g_tx.acked = false;
+    ray_tx_active = true;
+    ray_tx_heard();
+    return RAY_OK;
+}
+
+void ray_tx_touch(int64_t name) {
+    if (!ray_tx_active) return;
+    for (int64_t i = 0; i < g_tx.n; i++)
+        if (g_tx.undo[i].name == name) return;
+    if (g_tx.n == g_tx.cap) {
+        int64_t cap = g_tx.cap ? g_tx.cap * 2 : 16;
+        void* nu = ray_sys_realloc(g_tx.undo, (size_t)cap * sizeof(*g_tx.undo));
+        if (!nu) { g_tx.broken = true; return; }
+        g_tx.undo = nu;
+        g_tx.cap = cap;
+    }
+    g_tx.undo[g_tx.n].name = name;
+    g_tx.undo[g_tx.n].old  = global_value(name);     /* NULL: it was not bound */
+    g_tx.n++;
+}
+
+/* Close the transaction; `undo` binds the kept values back first. */
+static void tx_end(bool undo) {
+    ray_tx_active = false;
+    bool capture = ray_journal_capture;
+    ray_journal_capture = false;                 /* restoring is not a change to log */
+    for (int64_t i = g_tx.n - 1; i >= 0; i--) {
+        ray_t* old = g_tx.undo[i].old;
+        if (undo && ray_env_set(g_tx.undo[i].name, old) != RAY_OK)
+            fprintf(stderr, "tx: ERROR  rollback could not restore a binding\n");
+        if (old) ray_release(old);
+    }
+    ray_journal_capture = capture;
+    g_tx.n = 0;
+    if (undo) {
+        ray_journal_rewind(g_tx.mark);
+        g_rec.lost = false;
+    }
+}
+
+void ray_tx_rollback(void) {
+    if (!ray_tx_active) return;
+    if (g_tx.doomed) g_tx.acked = true;
+    tx_end(true);
+}
+
+ray_err_t ray_tx_commit(void) {
+    if (!ray_tx_active) return RAY_ERR_DOMAIN;
+    if (g_tx.broken || g_tx.doomed) { tx_end(true); return RAY_ERR_DOMAIN; }
+    bool was_stale = g_rec.stale;
+    ray_tx_active = false;                       /* let the journal write */
+    ray_err_t e = ray_journal_commit();
+    ray_tx_active = true;
+    if (e != RAY_OK) {
+        /* Not logged, so not done: memory goes back to match the log,
+         * which is then no staler than it was. */
+        tx_end(true);
+        if (!g_rec.torn) g_rec.stale = was_stale;
+        return e;
+    }
+    tx_end(false);
+    return RAY_OK;
+}
+
+void ray_tx_doom(int64_t owner) {
+    if (ray_tx_begin(owner, 0, 0) == RAY_OK) g_tx.doomed = true;
+}
+
+bool ray_tx_doom_end(void) {
+    bool acked = g_tx.acked;
+    if (ray_tx_active && g_tx.doomed) tx_end(true);
+    g_tx.acked = false;
+    return acked;
 }
 
 /* Apply one record of a replayed frame. */

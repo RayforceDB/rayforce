@@ -150,6 +150,39 @@ void ray_journal_mut_target(int64_t name, int64_t rows0);
  * ray_journal_snapshot() writes memory out whole. */
 ray_err_t ray_journal_commit(void);
 
+/* ── Transactions ─────────────────────────────────────────────────────
+ * One at a time (see journal.c).  The owner is the handle of the IPC
+ * connection that opened it, or RAY_TX_LOCAL for the REPL or a script. */
+
+#define RAY_TX_LOCAL (-1)
+
+extern bool ray_tx_active;
+
+/* Open a transaction for `owner`; RAY_ERR_DOMAIN when one is open.
+ * idle_ms bounds the owner's silence between messages and total_ms the
+ * whole transaction; 0 is no limit. */
+ray_err_t ray_tx_begin(int64_t owner, int64_t idle_ms, int64_t total_ms);
+/* Write the transaction's changes as one journal commit and close it.  On
+ * an error nothing is logged and everything is rolled back. */
+ray_err_t ray_tx_commit(void);
+/* Bind every global back to what it held at begin and close.  No-op when
+ * none is open. */
+void      ray_tx_rollback(void);
+int64_t   ray_tx_owner(void);
+/* The owner was heard from: its idle limit starts over. */
+void      ray_tx_heard(void);
+/* Milliseconds until a limit of the open transaction runs out (<= 0: it
+ * has); INT64_MAX when it has none. */
+int64_t   ray_tx_left_ms(void);
+/* `name` is about to change: keep what it holds, once per transaction. */
+void      ray_tx_touch(int64_t name);
+/* A message from an owner whose transaction was aborted runs in one that
+ * can only be rolled back: ray_tx_doom before it, ray_tx_doom_end after,
+ * which rolls back whatever it did and tells whether it was the owner's
+ * own (.tx.rollback) — the acknowledgement that ends the aborted state. */
+void      ray_tx_doom(int64_t owner);
+bool      ray_tx_doom_end(void);
+
 /* Replay a log file, applying each entry in order.  *out_chunks counts
  * evaluated entries INCLUDING entries whose evaluation returned an error;
  * *out_eval_errors counts those errors.  They warn and replay continues:

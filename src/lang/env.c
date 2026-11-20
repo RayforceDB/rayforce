@@ -1198,6 +1198,7 @@ ray_err_t ray_env_set(int64_t sym_id, ray_t* val) {
      * binder so the journal snapshot can pick this slot.  Without this
      * flip, env_bind_global would also be reached via ray_env_bind below
      * and the slot would carry user=0 — leaving it out of <base>.qdb. */
+    if (ray_tx_active) ray_tx_touch(sym_id);
     /* Log first: a change the journal cannot hold is not made. */
     int64_t mark = -1;
     if (ray_journal_capture) {
@@ -1281,6 +1282,8 @@ ray_err_t ray_env_target_resolve_via(int64_t name, bool via_callee,
                                      ray_env_target_t* target, ray_t** value) {
     *target = (ray_env_target_t){ .name = name, .root = name, .scope = -1 };
     *value = NULL;
+    /* A mutator is about to write this binding, possibly in place. */
+    if (ray_tx_active) ray_tx_touch(name);
     if (ray_sym_is_reserved(name) && !ray_sym_is_ipc_hook(name))
         return RAY_ERR_RESERVED;
     ray_err_t err = target_flat(name, via_callee, &target->scope, value);

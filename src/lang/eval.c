@@ -5548,6 +5548,11 @@ static void ray_register_builtins(void) {
     register_vary(".log.close",    RAY_FN_RESTRICTED, ray_log_close_fn);
     register_vary(".log.purge",    RAY_FN_RESTRICTED, ray_log_purge_fn);
 
+    /* Transactions under `.tx.*`: one at a time, owned by a connection. */
+    register_vary(".tx.begin",     RAY_FN_RESTRICTED, ray_tx_begin_fn);
+    register_vary(".tx.commit",    RAY_FN_RESTRICTED, ray_tx_commit_fn);
+    register_vary(".tx.rollback",  RAY_FN_RESTRICTED, ray_tx_rollback_fn);
+
     /* quote — special form (unevaluated argument) */
     register_vary("quote",       RAY_FN_SPECIAL_FORM, ray_quote_fn);
 

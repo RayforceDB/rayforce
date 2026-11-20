@@ -29267,6 +29267,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         /* from: 't — resolve symbol to table variable */
         inplace_sym = tbl->i64;
         ray_release(tbl);
+        if (ray_tx_active) ray_tx_touch(inplace_sym);   /* before any in-place write */
         tbl = ray_env_get(inplace_sym);
         if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "update: `from:` symbol is unbound");
         ray_retain(tbl);
@@ -33413,6 +33414,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             /* Symbol value → resolve the named global for in-place upsert */
             inplace_sym = tbl->i64;
             ray_release(tbl);
+            if (ray_tx_active) ray_tx_touch(inplace_sym);   /* before any in-place write */
             tbl = ray_env_get(inplace_sym);
             if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "upsert: target symbol is unbound");
             ray_retain(tbl);
@@ -36669,6 +36671,7 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
     if (tbl->type == -RAY_SYM) {
         inplace_sym = tbl->i64;
         ray_release(tbl);
+        if (ray_tx_active) ray_tx_touch(inplace_sym);   /* before any in-place write */
         tbl = ray_env_get(inplace_sym);
         if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "delete: `from:` symbol is unbound");
         ray_retain(tbl);
