@@ -1,9 +1,11 @@
 ;; topk_chunked.rfl — top/bot over vectors long enough that the single-key
-;; top-k runs on the pool (#1122): each task keeps the rows that beat its
-;; worker's threshold and the workers' candidates are merged.  The answer
-;; must be the full sort's first K: ties by position, nulls where asc/desc
-;; put them, for keys rising, falling, constant, in runs across the task
-;; edges (8192 rows) and with nulls, at K 1, 8192 and 8193.
+;; top-k runs on the pool (#1122): at these K the rows are cut into one
+;; range per worker, n/W rows for W workers, each range keeps its K best (in
+;; a buffer, or in place at K 8192 and 8193 from 7 workers on) and their
+;; sorted lists are merged.  The answer must be the full sort's first K:
+;; ties by position, nulls where asc/desc put them, for keys rising,
+;; falling, constant, in runs of 3000 across the range edges and with
+;; nulls, at K 1, 8192 and 8193.
 (set n 200000)
 (set up (til n))
 (set dn (- n (til n)))

@@ -3111,11 +3111,14 @@ static test_result_t test_sort_head_late(void) {
 }
 
 /* Issue #1122: the late route's top-k runs on the
- * pool, a selection per task and a merge.  72000 selected rows of two
- * partitions are nine tasks; keys rising (up, i: I32), falling (dn),
- * constant (c), in runs of 3000 across the task edges (d), with nulls (n:
- * I64, f: F64).  At K 1 and 8192 the late route answers on the pool; at 8193
- * the full sort does.  Every answer's row ids are the first K of the full
+ * pool, a selection per range and a merge.  72000 selected rows of two
+ * partitions: the top-k cuts them into one range per worker (topk_sel_run;
+ * K 1 buffers its candidates, K 8192 selects in place once there are 3+
+ * workers), and the gather of the selected key, in 8192-row grains, is
+ * nine pool tasks.  Keys rising (up, i: I32), falling (dn), constant (c),
+ * in runs of 3000 across the range edges (d), with nulls (n: I64, f: F64).
+ * At K 1 and 8192 the late route answers on the pool; at 8193 the full
+ * sort does.  Every answer's row ids are the first K of the full
  * sort over the same rows in memory, materialized before the take so no
  * top-k answers it (ties by row, nulls where the sort puts them).  The
  * keys without nulls are compacted from the partitions on the pool too.
