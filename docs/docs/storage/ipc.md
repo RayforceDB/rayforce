@@ -291,7 +291,7 @@ Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, follow
 |---|---|---|---|
 | 0 | 4 bytes | `prefix` | Magic bytes `0xcefadefa` — identifies Rayforce binary data |
 | 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `4`). Decoupled from `RAY_VERSION_MAJOR`. Readers accept version 3 for existing serialized objects and journals; live IPC peers still require an exact handshake match before exchanging frames. |
-| 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). Bit 3 (`0x08`, `RAY_IPC_FLAG_CANCEL_SEEN`): on a reply over a shared-memory or RDMA connection, the server has taken a cancel byte since its last reply (see the transports above). |
+| 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`): unused. Bit 3 (`0x08`, `RAY_IPC_FLAG_CANCEL_SEEN`): on a reply over a shared-memory or RDMA connection, the server has taken a cancel byte since its last reply (see the transports above). |
 | 6 | 1 byte | `endian` | Endianness: `0` = little-endian |
 | 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response, `3` = upgrade (a transport record, never evaluated or journaled; see [Transports](#transports)) |
 | 8 | 8 bytes | `size` | Payload size in bytes (`int64`) |
