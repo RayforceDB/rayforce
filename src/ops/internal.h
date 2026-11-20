@@ -1505,6 +1505,11 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
  * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
  * Disarmed by ray_test_hooks_off. */
 void ray_query_test_cd_route(int route);
+/* query.c test hook: the largest unordered take the rewrite's first-N pick
+ * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
+ * first row is found.  Negative restores the default; disarmed by
+ * ray_test_hooks_off. */
+void ray_query_test_cd_firstn_set_max(int64_t cap);
 /* query.c test hook: selects whose parted source was pruned before fetch,
  * and the partitions they dropped, since process start. */
 void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);

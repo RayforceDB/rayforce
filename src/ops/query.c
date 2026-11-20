@@ -11425,6 +11425,342 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices) {
 }
 void ray_query_test_cd_route(int route) { g_cd_gate_force = route; }
 
+/* ---- First-N groups for the rewrite's unordered `take: N` ----
+ * An unordered take keeps the first N groups in first-seen order
+ * (pipeline.md); the two passes run without a limit and emit their groups
+ * in key order, so the first min(N, groups) seen are picked out of the
+ * counted result:
+ *   - up to CD_FIRSTN_SET_MAX groups, a serial scan from the first selected
+ *     source row collects the first N distinct key tuples into a small set,
+ *     within a row budget (16 rows a group, AGG_FIRSTN_PROBE_ROWS at
+ *     least), and one parallel probe of the result's keys finds each;
+ *   - otherwise, or past the budget, every group's first selected row is
+ *     found in parallel (the result's keys hashed into a table of result
+ *     rows, the selected rows probed against it, an atomic min per group)
+ *     and the groups are sorted by it: about one more grouping pass.
+ * The set's cap, measured over 10M rows and 10M groups: take 524288 in
+ * 173 ms from the set, 222 on the full path (dev 165); past it the set
+ * stops paying (take 1M of 2M groups under a where:: 85 ms against 26).
+ * A scan that runs out of budget costs about 15 ms over the full path
+ * alone (take 262144 over keys first seen past 4M rows).
+ * Keys read as int64 (agg_key_i64_type); SYM cells of different domains
+ * are compared as runtime ids. */
+#define CD_FIRSTN_SET_MAX 524288
+static int64_t g_cd_firstn_set_max = CD_FIRSTN_SET_MAX;
+void ray_query_test_cd_firstn_set_max(int64_t cap) {
+    g_cd_firstn_set_max = cap < 0 ? CD_FIRSTN_SET_MAX : cap;
+}
+
+typedef struct {
+    ray_t*      col;
+    const void* data;
+    bool        xl;    /* SYM: translate the cell id to its runtime id */
+} cd_firstn_key_t;
+
+static inline int64_t cd_firstn_read(const cd_firstn_key_t* k, int64_t r) {
+    int64_t v = agg_read_key_i64(k->col, k->data, r);
+    return RAY_UNLIKELY(k->xl) ? sym_id_runtime(k->col, v) : v;
+}
+
+/* Reads row r's tuple into kv and hashes it. */
+static inline uint64_t cd_firstn_hash(const cd_firstn_key_t* kc, uint32_t nk, int64_t r, int64_t* kv) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (uint32_t k = 0; k < nk; k++) {
+        kv[k] = cd_firstn_read(&kc[k], r);
+        h = (h ^ (uint64_t)kv[k]) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+    }
+    return h * 0xD6E8FEB86659FD93ULL;
+}
+
+/* The selected rows (all when `sel` is NULL) of morsels [s0, s1) in row
+ * order, each as `r`, while `go` holds. */
+#define CD_FIRSTN_ROWS(sel, nrows, s0, s1, go, body) do {                         \
+    const uint8_t*  fl_ = (sel) ? ray_rowsel_flags(sel) : NULL;                  \
+    const uint32_t* of_ = (sel) ? ray_rowsel_offsets(sel) : NULL;                \
+    const uint16_t* ix_ = (sel) ? ray_rowsel_idx(sel) : NULL;                    \
+    for (int64_t seg_ = (s0); seg_ < (s1) && (go); seg_++) {                     \
+        if (fl_ && fl_[seg_] == RAY_SEL_NONE) continue;                          \
+        int64_t b_ = seg_ * RAY_MORSEL_ELEMS;                                    \
+        int64_t len_ = (nrows) - b_ < RAY_MORSEL_ELEMS ? (nrows) - b_ : RAY_MORSEL_ELEMS; \
+        bool mix_ = fl_ && fl_[seg_] == RAY_SEL_MIX;                             \
+        int64_t je_ = mix_ ? (int64_t)of_[seg_ + 1] : len_;                      \
+        for (int64_t j_ = mix_ ? (int64_t)of_[seg_] : 0; j_ < je_ && (go); j_++) { \
+            int64_t r = b_ + (mix_ ? (int64_t)ix_[j_] : j_);                     \
+            body                                                                 \
+        }                                                                        \
+    }                                                                            \
+} while (0)
+
+typedef struct {
+    cd_firstn_key_t src[15];   /* the source's keys */
+    cd_firstn_key_t res[15];   /* the counted result's */
+    uint32_t        nk;
+    uint32_t        bits;      /* 1 << bits slots, at most half full */
+    int64_t*        keys;      /* small N: the set's tuples, nk a slot; else each result
+                                * row's tuple and first row, nk + 1 a row */
+    int64_t*        slot;      /* small N: rank; else hash tag << 32 | result row; -1 empty */
+    int64_t*        out;       /* small N: rank -> result row; else result row -> first row */
+    ray_t*          sel;
+    int64_t         nrows, n_segs, n_tasks;
+} cd_firstn_t;
+
+/* Small N: the rank of tuple kv (hash h), or -1; `insert` adds it. */
+static inline int64_t cd_firstn_set_probe(cd_firstn_t* c, uint64_t h, const int64_t* kv,
+                                          bool insert, int64_t* n) {
+    uint64_t mask = ((uint64_t)1 << c->bits) - 1;
+    for (uint64_t i = h >> (64 - c->bits);; i = (i + 1) & mask) {
+        int64_t r = c->slot[i];
+        int64_t* sk = c->keys + i * c->nk;
+        if (r < 0) {
+            if (insert) {
+                for (uint32_t k = 0; k < c->nk; k++) sk[k] = kv[k];
+                c->slot[i] = (*n)++;
+            }
+            return -1;
+        }
+        uint32_t k = 0;
+        while (k < c->nk && sk[k] == kv[k]) k++;
+        if (k == c->nk) return r;
+    }
+}
+
+/* Small N: each result row the set holds goes to its rank (each result row
+ * a distinct tuple, so each rank is written once). */
+static void cd_firstn_rank_fn(void* raw, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    cd_firstn_t* c = (cd_firstn_t*)raw;
+    int64_t kv[15];
+    for (int64_t g = b; g < e; g++) {
+        int64_t r = cd_firstn_set_probe(c, cd_firstn_hash(c->res, c->nk, g, kv), kv, false, NULL);
+        if (r >= 0) c->out[r] = g;
+    }
+}
+
+/* Every result row into the table (distinct tuples: nothing to compare),
+ * its tuple copied next to its first row, unset: a probe then reads one
+ * slot and one row, not a key column each. */
+static void cd_firstn_build_fn(void* raw, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    cd_firstn_t* c = (cd_firstn_t*)raw;
+    uint64_t mask = ((uint64_t)1 << c->bits) - 1;
+    for (int64_t g = b; g < e; g++) {
+        int64_t* kv = c->keys + g * (c->nk + 1);
+        uint64_t h = cd_firstn_hash(c->res, c->nk, g, kv);
+        kv[c->nk] = INT64_MAX;
+        int64_t v = (int64_t)((h & 0x7FFFFFFFu) << 32 | (uint64_t)g);
+        for (uint64_t i = h >> (64 - c->bits);; i = (i + 1) & mask) {
+            int64_t empty = -1;
+            if (__atomic_compare_exchange_n(&c->slot[i], &empty, v, false,
+                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                break;
+        }
+    }
+}
+
+/* The empty table, in parallel (it is twice the groups). */
+static void cd_firstn_clear_fn(void* raw, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    cd_firstn_t* c = (cd_firstn_t*)raw;
+    memset(c->slot + b, 0xff, (size_t)(e - b) * sizeof(int64_t));
+}
+
+/* The first rows out of the rows' copies, for the sort. */
+static void cd_firstn_out_fn(void* raw, uint32_t wid, int64_t b, int64_t e) {
+    (void)wid;
+    cd_firstn_t* c = (cd_firstn_t*)raw;
+    for (int64_t g = b; g < e; g++) c->out[g] = c->keys[g * (c->nk + 1) + c->nk];
+}
+
+/* Task t's morsels: each selected row lowers its group's first row.  Rows
+ * go in batches: every row's slot is prefetched, then every found row's
+ * entry, before any is compared. */
+#define CD_FIRSTN_BATCH 16
+static void cd_firstn_scan_fn(void* raw, uint32_t wid, int64_t t, int64_t t_end) {
+    (void)wid; (void)t_end;
+    cd_firstn_t* c = (cd_firstn_t*)raw;
+    uint64_t mask = ((uint64_t)1 << c->bits) - 1;
+    uint32_t nk = c->nk, sh = 64 - c->bits;
+    int64_t E = nk + 1;
+    int64_t s0 = c->n_segs * t / c->n_tasks, s1 = c->n_segs * (t + 1) / c->n_tasks;
+    const uint8_t*  fl = c->sel ? ray_rowsel_flags(c->sel) : NULL;
+    const uint32_t* of = c->sel ? ray_rowsel_offsets(c->sel) : NULL;
+    const uint16_t* ix = c->sel ? ray_rowsel_idx(c->sel) : NULL;
+    int64_t  rows[CD_FIRSTN_BATCH], kv[CD_FIRSTN_BATCH][15], sv[CD_FIRSTN_BATCH];
+    uint64_t hs[CD_FIRSTN_BATCH], at[CD_FIRSTN_BATCH];
+    for (int64_t seg = s0; seg < s1; seg++) {
+        if (fl && fl[seg] == RAY_SEL_NONE) continue;
+        int64_t base = seg * RAY_MORSEL_ELEMS;
+        int64_t len = c->nrows - base < RAY_MORSEL_ELEMS ? c->nrows - base : RAY_MORSEL_ELEMS;
+        bool mix = fl && fl[seg] == RAY_SEL_MIX;
+        int64_t j = mix ? (int64_t)of[seg] : 0, je = mix ? (int64_t)of[seg + 1] : len;
+        while (j < je) {
+            int64_t nb = je - j < CD_FIRSTN_BATCH ? je - j : CD_FIRSTN_BATCH;
+            for (int64_t q = 0; q < nb; q++, j++) {
+                rows[q] = base + (mix ? (int64_t)ix[j] : j);
+                hs[q] = cd_firstn_hash(c->src, nk, rows[q], kv[q]);
+                at[q] = hs[q] >> sh;
+                __builtin_prefetch(&c->slot[at[q]]);
+            }
+            for (int64_t q = 0; q < nb; q++) {
+                sv[q] = c->slot[at[q]];
+                if (sv[q] >= 0) __builtin_prefetch(c->keys + (int64_t)(uint32_t)sv[q] * E);
+            }
+            for (int64_t q = 0; q < nb; q++) {
+                int64_t* first = NULL;
+                for (uint64_t i = at[q];; i = (i + 1) & mask) {
+                    int64_t s = i == at[q] ? sv[q] : c->slot[i];
+                    if (s < 0) break;
+                    if ((uint64_t)s >> 32 != (hs[q] & 0x7FFFFFFFu)) continue;
+                    int64_t* rk = c->keys + (int64_t)(uint32_t)s * E;
+                    uint32_t k = 0;
+                    while (k < nk && rk[k] == kv[q][k]) k++;
+                    if (k == nk) { first = rk + nk; break; }
+                }
+                if (!first) continue;
+                int64_t r = rows[q], cur = __atomic_load_n(first, __ATOMIC_RELAXED);
+                while (r < cur && !__atomic_compare_exchange_n(first, &cur, r, false,
+                                                               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+            }
+        }
+    }
+}
+
+/* `result`'s first min(take_n, groups) groups in first-seen order over the
+ * rows `sel` selects of the source keys `K_cols` (`key_ci`: each key's
+ * column in `result`).  Consumes `result` unless it returns NULL (a column
+ * this does not read), leaving it to the caller. */
+static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_ci,
+                              int n_K, ray_t* sel, int64_t nrows, int64_t take_n) {
+    int64_t n_res = ray_table_nrows(result);
+    int64_t want = take_n < n_res ? take_n : n_res;
+    if (want <= 0 || n_res >= INT32_MAX) return NULL;
+    cd_firstn_t c = { .nk = (uint32_t)n_K, .sel = sel, .nrows = nrows };
+    for (int j = 0; j < n_K; j++) {
+        ray_t* rc = key_ci[j] >= 0 ? tbl_col_idx_or_null(result, key_ci[j]) : NULL;
+        ray_t* sc = K_cols[j];
+        if (!rc || !sc || rc->type != sc->type || !agg_key_i64_type(sc->type) ||
+            !ray_is_vec(sc) || sc->len != nrows || rc->len != n_res)
+            return NULL;
+        bool xl = sc->type == RAY_SYM && ray_sym_vec_domain(sc) != ray_sym_vec_domain(rc);
+        if (xl) {   /* the runtime-id LUTs are built on first use: here, before any task */
+            (void)ray_sym_domain_runtime_lut(ray_sym_vec_domain(sc));
+            (void)ray_sym_domain_runtime_lut(ray_sym_vec_domain(rc));
+        }
+        c.src[j] = (cd_firstn_key_t){ .col = sc, .data = ray_data(sc), .xl = xl };
+        c.res[j] = (cd_firstn_key_t){ .col = rc, .data = ray_data(rc), .xl = xl };
+    }
+    c.n_segs = (nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, n_res, RAY_PARALLEL_THRESHOLD);
+    ray_t *keys_hdr = NULL, *slot_hdr = NULL, *out_hdr = NULL;
+    ray_t *firstv = NULL, *perm = NULL, *out = NULL;
+    const int64_t* pos = NULL;
+
+    /* A cancelled dispatch skips the tasks it has not started: each output
+     * is read only after a check, and a cancel answers `cancel`. */
+#define CD_FIRSTN_CHECK() do { if (pool_cancelled(pool)) goto cancel; } while (0)
+    if (want <= g_cd_firstn_set_max) {
+        c.bits = 4;
+        while (((int64_t)1 << c.bits) < want * 2) c.bits++;
+        size_t cap = (size_t)1 << c.bits;
+        c.keys = (int64_t*)scratch_alloc(&keys_hdr, cap * (size_t)n_K * sizeof(int64_t));
+        c.slot = (int64_t*)scratch_alloc(&slot_hdr, cap * sizeof(int64_t));
+        c.out  = (int64_t*)scratch_alloc(&out_hdr, (size_t)want * sizeof(int64_t));
+        if (!c.keys || !c.slot || !c.out) goto oom;
+        memset(c.slot, 0xff, cap * sizeof(int64_t));
+        int64_t n = 0, scanned = 0, kv[15];
+        int64_t budget = want * 16 > AGG_FIRSTN_PROBE_ROWS ? want * 16 : AGG_FIRSTN_PROBE_ROWS;
+        CD_FIRSTN_ROWS(sel, nrows, 0, c.n_segs, n < want && scanned < budget, {
+            cd_firstn_set_probe(&c, cd_firstn_hash(c.src, c.nk, r, kv), kv, true, &n);
+            scanned++;
+        });
+        if (n == want) {
+            memset(c.out, 0xff, (size_t)want * sizeof(int64_t));
+            if (par) ray_pool_dispatch(pool, cd_firstn_rank_fn, &c, n_res);
+            else cd_firstn_rank_fn(&c, 0, 0, n_res);
+            CD_FIRSTN_CHECK();
+            pos = c.out;
+        }
+        scratch_free(keys_hdr); keys_hdr = NULL;
+        scratch_free(slot_hdr); slot_hdr = NULL;
+    }
+    if (!pos) {
+        c.bits = 4;
+        while (((int64_t)1 << c.bits) < n_res * 2) c.bits++;
+        size_t cap = (size_t)1 << c.bits;
+        c.slot = (int64_t*)scratch_alloc(&slot_hdr, cap * sizeof(int64_t));
+        c.keys = (int64_t*)scratch_alloc(&keys_hdr, (size_t)n_res * (n_K + 1) * sizeof(int64_t));
+        firstv = ray_vec_new(RAY_I64, n_res);
+        if (!c.slot || !c.keys || !firstv || RAY_IS_ERR(firstv)) goto oom;
+        firstv->len = n_res;
+        c.out = (int64_t*)ray_data(firstv);
+        if (par) ray_pool_dispatch(pool, cd_firstn_clear_fn, &c, (int64_t)cap);
+        else cd_firstn_clear_fn(&c, 0, 0, (int64_t)cap);
+        CD_FIRSTN_CHECK();   /* the build's claims need every slot empty */
+        bool par_rows = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+        c.n_tasks = par_rows ? (int64_t)ray_pool_total_workers(pool) * 4 : 1;
+        if (c.n_tasks > c.n_segs) c.n_tasks = c.n_segs > 0 ? c.n_segs : 1;
+        if (par) ray_pool_dispatch(pool, cd_firstn_build_fn, &c, n_res);
+        else cd_firstn_build_fn(&c, 0, 0, n_res);
+        CD_FIRSTN_CHECK();
+        if (c.n_tasks > 1) ray_pool_dispatch_n(pool, cd_firstn_scan_fn, &c, (uint32_t)c.n_tasks);
+        else cd_firstn_scan_fn(&c, 0, 0, 1);
+        CD_FIRSTN_CHECK();
+        if (par) ray_pool_dispatch(pool, cd_firstn_out_fn, &c, n_res);
+        else cd_firstn_out_fn(&c, 0, 0, n_res);
+        CD_FIRSTN_CHECK();
+        scratch_free(slot_hdr); slot_hdr = NULL;
+        scratch_free(keys_hdr); keys_hdr = NULL;
+        if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
+        uint8_t asc = 0;
+        perm = ray_sort_indices(&firstv, &asc, NULL, 1, n_res);
+        if (perm && RAY_IS_ERR(perm)) {
+            out = perm; perm = NULL;
+            goto fail;
+        }
+        if (!perm) goto oom;
+        CD_FIRSTN_CHECK();
+        /* cannot happen: every group has a selected row */
+        if (((int64_t*)ray_data(firstv))[((int64_t*)ray_data(perm))[want - 1]] == INT64_MAX) {
+            ray_release(firstv); ray_release(perm);
+            return NULL;
+        }
+        ray_release(firstv); firstv = NULL;
+        pos = (const int64_t*)ray_data(perm);
+    }
+#undef CD_FIRSTN_CHECK
+
+    int64_t nc = ray_table_ncols(result);
+    out = ray_table_new(nc);
+    for (int64_t ci = 0; ci < nc && out && !RAY_IS_ERR(out); ci++) {
+        ray_t* col = tbl_col_idx_or_null(result, ci);
+        ray_t* gc = col ? ray_group_gather(col, pos, want) : ray_error("oom", NULL);
+        if (!gc || RAY_IS_ERR(gc)) { ray_release(out); out = gc ? gc : ray_error("oom", NULL); break; }
+        out = ray_table_add_col(out, ray_table_col_name(result, ci), gc);
+        ray_release(gc);
+    }
+    if (!out) out = ray_error("oom", NULL);
+    if (out_hdr) scratch_free(out_hdr);
+    if (perm) ray_release(perm);
+    ray_release(result);
+    return out;
+cancel:
+    out = ray_error("cancel", NULL);
+    goto fail;
+oom:
+    out = ray_error("oom", NULL);
+fail:
+    if (keys_hdr) scratch_free(keys_hdr);
+    if (slot_hdr) scratch_free(slot_hdr);
+    if (out_hdr) scratch_free(out_hdr);
+    if (firstv && !RAY_IS_ERR(firstv)) ray_release(firstv);
+    if (perm) ray_release(perm);
+    ray_release(result);
+    return out;
+}
+#undef CD_FIRSTN_ROWS
+
 /* Planner rewrite for `(select {K: K c: (count (distinct X)) from: T
  * [where: W] by: K [desc: c take: N]})`.
  *
@@ -11702,7 +12038,12 @@ static ray_t* try_count_distinct_v2_rewrite(
      * the group slices (a by-dict of column refs is rewritten to a key
      * vector on the way there).  The estimates the gate takes describe the
      * rows a `where:` keeps (query_cd_gate_where_rows): a filter that drops a
-     * dominant key value hides the groups and the shares of what remains. */
+     * dominant key value hides the groups and the shares of what remains.
+     * An unordered take picks its first-seen groups by reading the keys as
+     * int64 (cd_first_n_pick); other key types go to the slices. */
+    bool first_n = has_take && desc_col_sym < 0 && asc_col_sym < 0;
+    for (int j = 0; first_n && j < n_K; j++)
+        if (!agg_key_i64_type(K_cols[j]->type) || !ray_is_vec(K_cols[j])) return NULL;
     if (!enc_cols) {
         const int64_t  n_table = ray_table_nrows(tbl);
         const int64_t* sel_rows = NULL;
@@ -11727,6 +12068,9 @@ static ray_t* try_count_distinct_v2_rewrite(
     /* === Inner pass: group by (K1, ..., Kn, X) on the source table === */
     ray_graph_t* g_in = ray_graph_new(tbl);
     if (!g_in) return NULL;
+    ray_t* first_sel = NULL;   /* the where:'s rows, for the first-N pick */
+#define CD_RW_RETURN(v) \
+    do { ray_t* rv_ = (v); if (first_sel) ray_release(first_sel); return rv_; } while (0)
     ray_t* K_names[15];
     ray_op_t* K_scans[15];
     for (int j = 0; j < n_K; j++) {
@@ -11773,24 +12117,25 @@ static ray_t* try_count_distinct_v2_rewrite(
          * ray_graph_free, so this one is dropped now; kept, it pinned `tbl`
          * for good and the next insert into it copied every column (#757). */
         ray_release(fres);
+        if (first_n && g_in->selection) { first_sel = g_in->selection; ray_retain(first_sel); }
     }
     ray_op_t* inner = ray_group(g_in, keys_in, n_K + 1,
                                 agg_ops_in, agg_ins_in, 1);
-    if (!inner) { scratch_free(ki_hdr); ray_graph_free(g_in); return NULL; }
+    if (!inner) { scratch_free(ki_hdr); ray_graph_free(g_in); CD_RW_RETURN(NULL); }
     ray_t* dedup = ray_execute(g_in, inner);
     scratch_free(ki_hdr);
     ray_graph_free(g_in);
-    if (!dedup) return NULL;
-    if (RAY_IS_ERR(dedup)) return dedup;
-    if (dedup->type != RAY_TABLE) { ray_release(dedup); return NULL; }
+    if (!dedup) CD_RW_RETURN(NULL);
+    if (RAY_IS_ERR(dedup)) CD_RW_RETURN(dedup);
+    if (dedup->type != RAY_TABLE) { ray_release(dedup); CD_RW_RETURN(NULL); }
 
     /* === Outer pass: group dedup table by (K1, ..., Kn) with COUNT === */
     ray_graph_t* g_out = ray_graph_new(dedup);
-    if (!g_out) { ray_release(dedup); return ray_error("oom", NULL); }
+    if (!g_out) { ray_release(dedup); CD_RW_RETURN(ray_error("oom", NULL)); }
     ray_op_t* K_scans2[15];
     for (int j = 0; j < n_K; j++) {
         K_scans2[j] = ray_scan(g_out, ray_str_ptr(K_names[j]));
-        if (!K_scans2[j]) { ray_graph_free(g_out); ray_release(dedup); return NULL; }
+        if (!K_scans2[j]) { ray_graph_free(g_out); ray_release(dedup); CD_RW_RETURN(NULL); }
     }
     ray_op_t* keys_out[15];
     for (int j = 0; j < n_K; j++) keys_out[j] = K_scans2[j];
@@ -11822,14 +12167,14 @@ static ray_t* try_count_distinct_v2_rewrite(
         if (emit_set) ray_group_emit_filter_set(prev_emit);
         ray_graph_free(g_out);
         ray_release(dedup);
-        return ray_error("oom", NULL);
+        CD_RW_RETURN(ray_error("oom", NULL));
     }
     ray_t* result = ray_execute(g_out, outer);
     if (emit_set) ray_group_emit_filter_set(prev_emit);
     ray_graph_free(g_out);
     ray_release(dedup);
-    if (!result || RAY_IS_ERR(result)) return result;
-    if (result->type != RAY_TABLE) return result;
+    if (!result || RAY_IS_ERR(result)) CD_RW_RETURN(result);
+    if (result->type != RAY_TABLE) CD_RW_RETURN(result);
 
     /* Rename the count output column to the user's requested c_sym
      * alias.  The outer pass counts a key column, so ray_group names
@@ -11838,6 +12183,8 @@ static ray_t* try_count_distinct_v2_rewrite(
      * name matches none of the K syms.  A by-dict's key columns then
      * take their aliases (`{a: k1 b: k2}` → a, b), as every other grouping
      * path names them. */
+    int64_t key_ci[15];   /* positions first, then the renames: an
+                           * alias may repeat another key's source name */
     {
         int64_t nc = ray_table_ncols(result);
         for (int64_t ci = 0; ci < nc; ci++) {
@@ -11849,8 +12196,6 @@ static ray_t* try_count_distinct_v2_rewrite(
                 break;
             }
         }
-        int64_t key_ci[15];   /* positions first, then the renames: an
-                               * alias may repeat another key's source name */
         for (int j = 0; j < n_K; j++) {
             key_ci[j] = -1;
             for (int64_t ci = 0; ci < nc; ci++)
@@ -11860,6 +12205,15 @@ static ray_t* try_count_distinct_v2_rewrite(
             if (key_ci[j] >= 0 && K_alias[j] != K_syms[j])
                 ray_table_set_col_name(result, key_ci[j], K_alias[j]);
     }
+    /* An unordered take keeps the first N groups seen, not the N smallest
+     * keys the passes' order would leave to the trim below. */
+    if (first_n) {
+        ray_t* picked = cd_first_n_pick(result, K_cols, key_ci, n_K, first_sel,
+                                        ray_table_nrows(tbl), take_n);
+        if (picked) CD_RW_RETURN(picked);
+    }
+    if (first_sel) ray_release(first_sel);
+#undef CD_RW_RETURN
     /* Apply the user's desc:/asc:/take: clauses on the dedup'd, counted
      * output.  The emit_filter trims to top-N during the outer pass but
      * leaves rows in HT-iteration order, so without this final sort the
