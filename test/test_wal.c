@@ -617,6 +617,95 @@ static test_result_t test_tx_crash_around_commit(void) {
 #endif
 }
 
+/* ── a random history ─────────────────────────────────────────────── */
+
+static uint32_t rnd_state;
+static uint32_t rnd(uint32_t n) {
+    rnd_state = rnd_state * 1664525u + 1013904223u;
+    return (rnd_state >> 8) % n;
+}
+
+/* One random change to one of three names: two tables (one under a
+ * namespace) and a vector. */
+static void rnd_op(void) {
+    static const char* tbl[2] = { "t", "ns.t" };
+    const char* t = tbl[rnd(2)];
+    int k = (int)rnd(6), v = (int)rnd(1000);
+    char src[300];
+    switch (rnd(9)) {
+    case 0: snprintf(src, sizeof(src), "(insert '%s (list %d %d 'r%d))", t, k, v, k); break;
+    case 1: snprintf(src, sizeof(src), "(insert '%s (table [k v s] (list [%d %d] [%d %d] ['a 'b])))", t, k, k + 1, v, v + 1); break;
+    case 2: snprintf(src, sizeof(src), "(upsert '%s 1 (list %d %d 'u%d))", t, k, v, k); break;
+    case 3: snprintf(src, sizeof(src), "(update {from: '%s v: %d where: (== k %d)})", t, v, k); break;
+    case 4: snprintf(src, sizeof(src), "(delete {from: '%s where: (== k %d)})", t, k); break;
+    case 5: snprintf(src, sizeof(src), "(set vec (rand %d 100))", k + 1); break;
+    case 6: snprintf(src, sizeof(src), "(insert 'vec %d)", v); break;
+    case 7: snprintf(src, sizeof(src), "(set extra%d %d)", k, v); break;
+    default: snprintf(src, sizeof(src), "(try (del extra%d) (fn [e] 0))", k); break;
+    }
+    (void)wal_run(src);                            /* one that fails is part of the history too */
+}
+
+/* A long random history of changes, transactions that commit or roll back,
+ * snapshots and restarts.  Two things must hold throughout: a rollback
+ * leaves exactly what the transaction found, and a restart brings back
+ * exactly what the process held. */
+static int rnd_history(uint32_t seed, int steps) {
+    static const char* probe = "(list t ns vec (try extra0 (fn [e] 0)) (try extra3 (fn [e] 0)) (try extra5 (fn [e] 0)))";
+    char base[256];
+    wal_base(base, sizeof(base), "rnd");
+    rnd_state = seed;
+    int fail = 0;
+    wal_teardown();
+    wal_setup();
+    if (ray_journal_open(base, RAY_JOURNAL_ASYNC) != RAY_OK) fail = 1;
+    if (!fail && !(wal_run("(set t " T3 ")") && wal_run("(set ns.t " T3 ")") && wal_run("(set vec [1 2 3])"))) fail = 2;
+    for (int i = 0; i < steps && !fail; i++) {
+        uint32_t what = rnd(20);
+        if (what == 0) {                           /* restart */
+            int64_t nwant = 0, ngot = 0;
+            uint8_t* want = wal_probe(probe, &nwant);
+            if (ray_journal_close() != RAY_OK) fail = 3;
+            wal_teardown();
+            wal_setup();
+            if (!fail && ray_journal_open(base, RAY_JOURNAL_ASYNC) != RAY_OK) fail = 4;
+            uint8_t* got = fail ? NULL : wal_probe(probe, &ngot);
+            if (!fail && !(want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0)) fail = 5;
+            if (want) ray_sys_free(want);
+            if (got) ray_sys_free(got);
+        } else if (what == 1) {
+            if (ray_journal_snapshot() != RAY_OK) fail = 6;
+        } else if (what < 6) {                     /* a transaction of a few changes */
+            int64_t nwant = 0, ngot = 0;
+            uint8_t* want = wal_probe(probe, &nwant);
+            if (ray_tx_begin(RAY_TX_LOCAL, 0, 0) != RAY_OK) fail = 7;
+            for (uint32_t k = rnd(6); k > 0 && !fail; k--) rnd_op();
+            if (!fail && rnd(2)) {
+                if (ray_tx_commit() != RAY_OK) fail = 8;
+            } else if (!fail) {
+                ray_tx_rollback();
+                uint8_t* got = wal_probe(probe, &ngot);
+                if (!(want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0)) fail = 9;
+                if (got) ray_sys_free(got);
+            }
+            if (want) ray_sys_free(want);
+        } else {
+            rnd_op();
+        }
+    }
+    if (ray_journal_is_open()) ray_journal_close();
+    wal_cleanup(base);
+    return fail;
+}
+
+static test_result_t test_tx_random_histories(void) {
+    for (uint32_t seed = 1; seed <= 8; seed++) {
+        int fail = rnd_history(seed * 2654435761u, 400);
+        TEST_ASSERT_FMT(fail == 0, "seed %u failed at step kind %d", (unsigned)seed, fail);
+    }
+    PASS();
+}
+
 /* An insert is logged as the rows it adds: the commit of one row into a
  * large table must not grow with the table. */
 static test_result_t test_wal_insert_logs_rows_not_table(void) {
@@ -802,5 +891,6 @@ const test_entry_t wal_entries[] = {
     { "tx/new_table_waits",         test_tx_new_table_waits_for_commit, wal_setup, wal_teardown },
     { "tx/table_locked_elsewhere",  test_tx_table_locked_elsewhere_fails_fast, wal_setup, wal_teardown },
     { "tx/crash_around_commit",     test_tx_crash_around_commit,     wal_setup, wal_teardown },
+    { "tx/random_histories",        test_tx_random_histories,        wal_setup, wal_teardown },
     { NULL, NULL, NULL, NULL },
 };
