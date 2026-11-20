@@ -2845,24 +2845,42 @@ static test_result_t test_dense_native_topn(void) {
         "(set dt_i (til 1000000)) "
         "(set dt_t (table [k v] (list (as 'I32 (% (* dt_i 7919) 50000)) (% dt_i 13))))");
     TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
-    agg_route_reset();
-    ray_t* r = ray_eval_str("(select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5})");
-    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    agg_route_stats_t stats = agg_route_stats();
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
-    TEST_ASSERT_TRUE(stats.topn_native);
     /* 50k groups sit below the parallel threshold (one selection task): the
-     * native selection must still cut the group set down to N plus ties —
-     * here every group whose sum equals the maximum (126), 3,846 of 50,000. */
-    TEST_ASSERT_EQ_I(stats.topn_kept, 3846);
-    TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
-    ray_t* check = ray_eval_str(
-        "(all (== (at (select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5}) 's) "
-        "(take (at (xdesc (select {from:dt_t by:k s:(sum v)}) 's) 's) 5)))");
-    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
-    TEST_ASSERT_EQ_I(check->i64, 1);
-    ray_release(check); ray_release(r);
+     * native selection must still cut the group set down — every group
+     * whose sum equals the maximum (126) ties, 3,846 of 50,000.  A
+     * partitioned slab keeps the N of them the stable sort takes (in key-slot
+     * order, its unfiltered order); the other strategies keep every tie and
+     * leave the cut to the sort.  The strategy follows the worker count and
+     * the cache size, so each pool size checks the count of the strategy it
+     * took, and the answer is the full sort's first five, row for row. */
+    static const uint32_t pools[] = { 1, 2, 4, 28 };
+    for (size_t p = 0; p < sizeof pools / sizeof pools[0]; p++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(pools[p]), RAY_OK);
+        agg_route_reset();
+        ray_t* r = ray_eval_str("(select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5})");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        agg_route_stats_t stats = agg_route_stats();
+        TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+        TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
+        TEST_ASSERT_TRUE(stats.topn_native);
+        bool part = stats.dense_strategy == AGG_DENSE_PARTITIONED;
+        TEST_ASSERT_FMT(stats.topn_kept == (part ? 5u : 3846u), "%u workers, strategy %d: %llu kept",
+                        pools[p], (int)stats.dense_strategy, (unsigned long long)stats.topn_kept);
+        TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
+        ray_t* full = ray_eval_str("(take (select {from:dt_t by:k s:(sum v) c:(count v) desc:s}) 5)");
+        TEST_ASSERT_NOT_NULL(full); TEST_ASSERT_FALSE(RAY_IS_ERR(full));
+        ray_t* fr = ray_fmt(r, 0);
+        ray_t* ff = ray_fmt(full, 0);
+        bool same = fr && ff && ray_str_len(fr) == ray_str_len(ff) &&
+                    memcmp(ray_str_ptr(fr), ray_str_ptr(ff), ray_str_len(fr)) == 0;
+        if (fr) ray_release(fr);
+        if (ff) ray_release(ff);
+        ray_release(full); ray_release(r);
+        TEST_ASSERT_FMT(same, "%u workers: not the full sort's first five", pools[p]);
+    }
+    ray_t* r;
+    ray_t* check;
     /* the asc direction on the count keeps the smallest groups */
     agg_route_reset();
     r = ray_eval_str("(select {from:dt_t by:k c:(count v) asc:c take:3})");
