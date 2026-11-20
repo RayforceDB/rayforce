@@ -2845,24 +2845,42 @@ static test_result_t test_dense_native_topn(void) {
         "(set dt_i (til 1000000)) "
         "(set dt_t (table [k v] (list (as 'I32 (% (* dt_i 7919) 50000)) (% dt_i 13))))");
     TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
-    agg_route_reset();
-    ray_t* r = ray_eval_str("(select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5})");
-    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    agg_route_stats_t stats = agg_route_stats();
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
-    TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
-    TEST_ASSERT_TRUE(stats.topn_native);
     /* 50k groups sit below the parallel threshold (one selection task): the
-     * native selection must still cut the group set down to N plus ties —
-     * here every group whose sum equals the maximum (126), 3,846 of 50,000. */
-    TEST_ASSERT_EQ_I(stats.topn_kept, 3846);
-    TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
-    ray_t* check = ray_eval_str(
-        "(all (== (at (select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5}) 's) "
-        "(take (at (xdesc (select {from:dt_t by:k s:(sum v)}) 's) 's) 5)))");
-    TEST_ASSERT_NOT_NULL(check); TEST_ASSERT_FALSE(RAY_IS_ERR(check));
-    TEST_ASSERT_EQ_I(check->i64, 1);
-    ray_release(check); ray_release(r);
+     * native selection must still cut the group set down — every group
+     * whose sum equals the maximum (126) ties, 3,846 of 50,000.  A
+     * partitioned slab keeps the N of them the stable sort takes (in key-slot
+     * order, its unfiltered order); the other strategies keep every tie and
+     * leave the cut to the sort.  The strategy follows the worker count and
+     * the cache size, so each pool size checks the count of the strategy it
+     * took, and the answer is the full sort's first five, row for row. */
+    static const uint32_t pools[] = { 1, 2, 4, 28 };
+    for (size_t p = 0; p < sizeof pools / sizeof pools[0]; p++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(pools[p]), RAY_OK);
+        agg_route_reset();
+        ray_t* r = ray_eval_str("(select {from:dt_t by:k s:(sum v) c:(count v) desc:s take:5})");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        agg_route_stats_t stats = agg_route_stats();
+        TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_V2_DENSE], 1);
+        TEST_ASSERT_EQ_I(stats.routes[AGG_ROUTE_LEGACY], 0);
+        TEST_ASSERT_TRUE(stats.topn_native);
+        bool part = stats.dense_strategy == AGG_DENSE_PARTITIONED;
+        TEST_ASSERT_FMT(stats.topn_kept == (part ? 5u : 3846u), "%u workers, strategy %d: %llu kept",
+                        pools[p], (int)stats.dense_strategy, (unsigned long long)stats.topn_kept);
+        TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
+        ray_t* full = ray_eval_str("(take (select {from:dt_t by:k s:(sum v) c:(count v) desc:s}) 5)");
+        TEST_ASSERT_NOT_NULL(full); TEST_ASSERT_FALSE(RAY_IS_ERR(full));
+        ray_t* fr = ray_fmt(r, 0);
+        ray_t* ff = ray_fmt(full, 0);
+        bool same = fr && ff && ray_str_len(fr) == ray_str_len(ff) &&
+                    memcmp(ray_str_ptr(fr), ray_str_ptr(ff), ray_str_len(fr)) == 0;
+        if (fr) ray_release(fr);
+        if (ff) ray_release(ff);
+        ray_release(full); ray_release(r);
+        TEST_ASSERT_FMT(same, "%u workers: not the full sort's first five", pools[p]);
+    }
+    ray_t* r;
+    ray_t* check;
     /* the asc direction on the count keeps the smallest groups */
     agg_route_reset();
     r = ray_eval_str("(select {from:dt_t by:k c:(count v) asc:c take:3})");
@@ -3456,6 +3474,204 @@ static test_result_t test_group_where_order_dependent(void) {
     TEST_ASSERT_EQ_I(((const int64_t*)ray_data(r))[1], 45);
     ray_release(r);
     ray_release(ray_eval_str("(set od_s 0) (set od_b 0) (set od_x 0) (set od_n 0)"));
+    PASS();
+}
+
+/* An unordered keyed take keeps the first N groups in first-seen order
+ * (pipeline.md) when a group input is a running function or holds a
+ * one-element vector constant too (#1234).  Both used to fall to the legacy
+ * path, which emits the groups in key order: a running function because the
+ * expression bridge could not name its columns, a `[2]` under a sparse
+ * where: because the bridge evaluated it over the uncompacted table.  Flat
+ * and parted, with and without a where:, at sizes that take the parallel
+ * routes.  The kept keys are the first N distinct keys of the materialized
+ * where:, and each kept group's value is the whole-table answer (#916): the
+ * same function stored as a column first, then grouped. */
+static test_result_t test_first_n_take_running_input(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_agg_fs_run_%lld", wave_pid());
+    (void)ray_test_rm_rf(dir);
+    char src[1024];
+    snprintf(src, sizeof src,
+        "(set fs_n (til 200000)) "
+        "(set fs_t (table [k h v i] (list (%% (* fs_n 7919) 40) (%% (* fs_n 7919) 60000) "
+        "(%% fs_n 27) (+ 1 (%% fs_n 997))))) "
+        "(.db.splayed.set \"%s/1/t/\" (take fs_t 100000)) "
+        "(.db.splayed.set \"%s/2/t/\" (take fs_t -100000)) "
+        "(set fs_p (.db.parted.get \"%s/\" 't))", dir, dir, dir);
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
+    /* aggregate, the input it reads, and whether that input is an integer
+     * (the first-N pre-pass serves integer inputs; a float sum regroups) */
+    static const struct { const char* agg; const char* in; bool ints; } aggs[] = {
+        { "max", "(sums i)", true }, { "sum", "(deltas i)", true }, { "sum", "(mavg 2 i)", false },
+        { "sum", "(* v [2])", true }, { "max", "(+ i [7])", true },
+    };
+    /* where: ("" for none), and whether the selected rows reach the first-N
+     * pre-pass's parallel threshold */
+    static const struct { const char* w; bool fn; } wh[] = {
+        { "", true }, { " where:(> i 600)", true }, { " where:(== v 5)", false },
+        { " where:(> k 3)", true },
+    };
+    static const char* keys[] = { "k", "h" };
+    static const char* tabs[] = { "fs_t", "fs_p" };
+    for (size_t a = 0; a < sizeof(aggs) / sizeof(aggs[0]); a++) {
+        char buf[512];
+        snprintf(buf, sizeof buf, "(set fs_x (update {from:fs_t x:%s}))", aggs[a].in);
+        ray_t* x = ray_eval_str(buf);
+        TEST_ASSERT_FMT(x && !RAY_IS_ERR(x), "%s: failed", buf);
+        ray_release(x);
+        for (size_t w = 0; w < sizeof(wh) / sizeof(wh[0]); w++)
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            /* first-seen keys of the materialized where: */
+            snprintf(buf, sizeof buf,
+                "(set fs_w (select {from:fs_t%s})) "
+                "(set fs_w (update {from:fs_w rid:(til (count fs_w))})) "
+                "(take (at (xasc (select {from:fs_w by:%s f:(min rid)}) 'f) '%s) 5)",
+                wh[w].w, keys[k], keys[k]);
+            ray_t* first = ray_eval_str(buf);
+            TEST_ASSERT_FMT(first && !RAY_IS_ERR(first) && first->type == RAY_I64 && first->len == 5,
+                            "%s: oracle failed", buf);
+            /* the whole-table answer of every group */
+            snprintf(buf, sizeof buf, "(select {from:fs_x%s by:%s s:(%s x)})",
+                     wh[w].w, keys[k], aggs[a].agg);
+            ray_t* all = ray_eval_str(buf);
+            TEST_ASSERT_FMT(all && !RAY_IS_ERR(all), "%s: whole-table select failed", buf);
+            for (size_t t = 0; t < sizeof(tabs) / sizeof(tabs[0]); t++) {
+                char q[512];
+                snprintf(q, sizeof q, "(select {from:%s%s by:%s s:(%s %s) take:5})",
+                         tabs[t], wh[w].w, keys[k], aggs[a].agg, aggs[a].in);
+                agg_route_reset();
+                ray_t* got = ray_eval_str(q);
+                agg_route_stats_t st = agg_route_stats();
+                TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE, "%s: error", q);
+                TEST_ASSERT_FMT(od_take_rows_in(got, all, 5), "%s: differs from the whole-table column", q);
+                const int64_t* gk = (const int64_t*)ray_data(ray_table_get_col_idx(got, 0));
+                for (int r = 0; r < 5; r++)
+                    TEST_ASSERT_FMT(gk[r] == ((const int64_t*)ray_data(first))[r],
+                                    "%s: group %d is %lld, first-seen is %lld", q, r,
+                                    (long long)gk[r], (long long)((const int64_t*)ray_data(first))[r]);
+                uint64_t v2 = 0;
+                for (int r = AGG_ROUTE_V2_SERIAL_DENSE; r < AGG_ROUTE_COUNT; r++) v2 += st.routes[r];
+                TEST_ASSERT_FMT(st.routes[AGG_ROUTE_LEGACY] == 0 && v2 > 0, "%s: legacy path ran", q);
+                /* 40 groups hold too large a share of the rows for the
+                 * pre-pass: the full run selects their first N itself */
+                bool fn = wh[w].fn && k == 1 && aggs[a].ints;
+                TEST_ASSERT_FMT(!fn || st.first_n == 1, "%s: first-N ran %d times, expected 1",
+                                q, (int)st.first_n);
+                ray_release(got);
+            }
+            ray_release(all);
+            ray_release(first);
+        }
+    }
+    /* An encoded column keeps the legacy path (the bridge would decode the
+     * table's columns whole); its answer is still the whole-table one. */
+    snprintf(src, sizeof src,
+        "(.db.splayed.set \"%s/c/\" fs_t \"%s/c.sym\" {compress: true}) "
+        "(set fs_c (.db.splayed.get \"%s/c/\" \"%s/c.sym\")) "
+        "(set fs_x (update {from:fs_t x:(sums i)}))", dir, dir, dir, dir);
+    setup = ray_eval_str(src);
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    ray_t* all = ray_eval_str("(select {from:fs_x where:(> i 600) by:h s:(max x)})");
+    TEST_ASSERT_TRUE(all && !RAY_IS_ERR(all));
+    agg_route_reset();
+    ray_t* got = ray_eval_str("(select {from:fs_c where:(> i 600) by:h s:(max (sums i)) take:5})");
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    TEST_ASSERT_TRUE(agg_route_stats().routes[AGG_ROUTE_LEGACY] >= 1);
+    TEST_ASSERT_TRUE(od_take_rows_in(got, all, 5));
+    ray_release(got); ray_release(all);
+    ray_release(ray_eval_str("(set fs_t 0) (set fs_p 0) (set fs_c 0) (set fs_x 0) (set fs_w 0) (set fs_n 0)"));
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* The expression bridge evaluates a non-row-local group input over the
+ * whole table with the where: selection cleared, so it may take only what
+ * the language runs over the whole table: running, moving and shift
+ * functions over row-local expressions (#916).  An aggregate is not one: on
+ * its own, in an inlined lambda, it sees the rows the where: keeps (#1234
+ * review: `(sum (f i))` with f = `(- x (first x))` answered [6 8] for [2 4]).
+ * An aggregate nested in a running function sees the whole table (select.md
+ * "Running functions under where:").  Small fixed answers, then the same
+ * shapes at 200K rows against the materialized where: (an aggregate on its
+ * own) or the function stored as a whole-table column (nested in a running
+ * function), keyed, with and without a take. */
+static test_result_t test_group_bridge_lambda_aggregate(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set la_t (table [k i] (list [0 1 0 1 0 1] [1 2 3 4 5 6]))) "
+        "(set la_f (fn [x] (- x (first x)))) "
+        "(set la_c (fn [x] (* x (count x)))) "
+        "(set la_a (fn [x] (- x (avg x)))) "
+        "(set la_s (fn [x] (* x (sum x)))) "
+        "(set la_g (fn [x] (sums (- x (first x))))) "
+        "(set la_d (fn [x] (deltas (* x (count x)))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    static const struct { const char* q; const char* want; } small[] = {
+        { "(select {from:la_t where:(> i 2) s:(la_f i)})", "[0 1 2 3]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_f i))})", "[2 4]" },
+        { "(select {from:la_t where:(> i 2) s:(sum (la_c i))})", "[72]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_c i))})", "[32 40]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_a i))})", "[-1.0 1.0]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_s i))})", "[144 180]" },
+        /* nested in a running function: the whole table */
+        { "(select {from:la_t where:(> i 2) s:(la_g i)})", "[3 6 10 15]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(max (la_g i))})", "[10 15]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(max (la_d i))})", "[6 6]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(max (sums i))})", "[15 21]" },
+    };
+    for (size_t q = 0; q < sizeof(small) / sizeof(small[0]); q++) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "(format \"%%\" (at %s 's))", small[q].q);
+        ray_t* r = ray_eval_str(buf);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == -RAY_STR, "%s: error", small[q].q);
+        TEST_ASSERT_FMT(ray_str_len(r) == strlen(small[q].want) &&
+                        memcmp(ray_str_ptr(r), small[q].want, strlen(small[q].want)) == 0,
+                        "%s: got %.*s, want %s", small[q].q, (int)ray_str_len(r), ray_str_ptr(r),
+                        small[q].want);
+        ray_release(r);
+    }
+    setup = ray_eval_str(
+        "(set la_n (til 200000)) "
+        "(set la_b (table [k i] (list (% (* la_n 7919) 6000) (+ 1 (% la_n 997)))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    /* the input, and whether an aggregate sits on its own (the oracle is
+     * then the materialized where:) or nested in a running function (the
+     * function stored as a whole-table column) */
+    static const struct { const char* agg; const char* in; bool own; } big[] = {
+        { "sum", "(la_f i)", true }, { "sum", "(la_c i)", true }, { "sum", "(la_s i)", true },
+        { "max", "(la_g i)", false }, { "max", "(la_d i)", false },
+    };
+    static const char* wh[] = { "(> i 600)", "(< (% i 10) 2)" };
+    static const char* tk[] = { "", " take:5" };
+    for (size_t b = 0; b < sizeof(big) / sizeof(big[0]); b++)
+    for (size_t w = 0; w < sizeof(wh) / sizeof(wh[0]); w++)
+    for (size_t t = 0; t < sizeof(tk) / sizeof(tk[0]); t++) {
+        char buf[512], q[256];
+        if (big[b].own)
+            snprintf(buf, sizeof buf,
+                "(set la_w (select {from:la_b where:%s})) "
+                "(select {from:la_w by:k s:(%s %s)})", wh[w], big[b].agg, big[b].in);
+        else
+            snprintf(buf, sizeof buf,
+                "(set la_x (update {from:la_b x:%s})) "
+                "(select {from:la_x where:%s by:k s:(%s x)})", big[b].in, wh[w], big[b].agg);
+        ray_t* all = ray_eval_str(buf);
+        TEST_ASSERT_FMT(all && !RAY_IS_ERR(all) && all->type == RAY_TABLE, "%s: oracle failed", buf);
+        snprintf(q, sizeof q, "(select {from:la_b where:%s by:k s:(%s %s)%s})",
+                 wh[w], big[b].agg, big[b].in, tk[t]);
+        ray_t* got = ray_eval_str(q);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE, "%s: error", q);
+        int64_t n = ray_table_nrows(got);
+        TEST_ASSERT_FMT(n == (t ? 5 : ray_table_nrows(all)), "%s: %lld rows", q, (long long)n);
+        TEST_ASSERT_FMT(od_take_rows_in(got, all, n), "%s: differs from the oracle", q);
+        ray_release(got); ray_release(all);
+    }
+    ray_release(ray_eval_str("(set la_t 0) (set la_b 0) (set la_w 0) (set la_x 0) (set la_n 0)"));
     PASS();
 }
 
@@ -4279,7 +4495,8 @@ static test_result_t test_agg_topk_ask_ahead(void) {
 /* The route gate of a distinct count (#760) samples before the select
  * runs: the rows a where: keeps (query_cd_gate_where_rows), the key and
  * value columns at them (agg_group_card_sample), and a key column whole
- * when the sample leaves its count open (ray_cd_two_pass_preferred).  Over
+ * when the sample leaves its count open (ray_cd_two_pass_preferred; the
+ * sparse selection below is answered on its sample, #900).  Over
  * a mapped table whose pages were evicted each page read is asked for
  * ahead, in parallel, as the select's own scan asks for its — the bytes
  * asked for (ray_vm_willneed_bytes) cover what the step reads, and its
@@ -4401,10 +4618,9 @@ static test_result_t test_cd_gate_read_ahead(void) {
     /* The gate over a selection sparser than a row per page: the pages of
      * the sampled rows alone are asked for.  k3 (272 MB, 66,406 pages; a
      * million values) over 33,000 rows, one to every other page: 32,768
-     * of them are sampled, read as distinct, and the estimate stands at
-     * the span, a million — past the sample's reach and short of the
-     * many-groups mark — so the count is confirmed in full, over the half
-     * of the column the estimate never touched. */
+     * of them are sampled and read as distinct, groups of a row each,
+     * which take the rewrite on the sample (#900) — the column is not
+     * counted whole. */
     enum { N3 = 34000000, SEL3 = 33000 };
     r = ray_eval_str(ray_test_tmp(
         "(set pfs_j (til 34000000))"
@@ -4431,13 +4647,52 @@ static test_result_t test_cd_gate_read_ahead(void) {
     long f_gate = cd_major_faults() - f0;
     uint64_t b_gate = ray_vm_willneed_bytes() - b0;
     free(sel);
-    TEST_ASSERT_FALSE(two_pass);   /* a million groups counted, not many: the slices */
-    /* the sampled rows' pages of k3 (one each) for the estimate, and k3
-     * whole for the count; x3 besides */
-    const uint64_t b_need = (uint64_t)N3 * 8 + (uint64_t)SEL3 * 4096;
-    TEST_ASSERT_FMT(b_gate >= b_need, "gate asked for %llu bytes, needs %llu",
-                    (unsigned long long)b_gate, (unsigned long long)b_need);
+    TEST_ASSERT_TRUE(two_pass);
+    /* the sampled rows' pages of k3 (one each) and x3 besides, not k3
+     * whole */
+    const uint64_t b_need = (uint64_t)AGG_EST_SAMPLE_ROWS * 4096;
+    TEST_ASSERT_FMT(b_gate >= b_need && b_gate < (uint64_t)N3 * 8,
+                    "gate asked for %llu bytes, needs %llu, k3 is %llu", (unsigned long long)b_gate,
+                    (unsigned long long)b_need, (unsigned long long)N3 * 8);
     TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);
+    ray_release(m);
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+
+    /* The count in full asks for its column ahead.  k4 (80 MB, 40,000
+     * values) over a slice of 100,000 rows standing for 10 M: the estimate
+     * asks for the slice's span alone and reads 40,000 groups, past the
+     * sample's reach, short of a few rows each — so k4 is counted whole,
+     * the rest of the column still cold, and asked for (40,000 values, not
+     * many: the slices). */
+    enum { N4 = 10000000, SL4 = 100000 };
+    r = ray_eval_str(ray_test_tmp(
+        "(set pfs_j (til 10000000))"
+        "(set pfs_t (table [k4 x4] (list (% pfs_j 40000) (% (* pfs_j 7919) 10000019))))"
+        "(set pfs_j 0)"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_t 0)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE(pfs_evict() && !pfs_col_resident("k4"));
+    m = ray_eval_str("pfs_m");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_t* k4 = ray_table_get_col(m, ray_sym_intern("k4", 2));
+    ray_t* x4 = ray_table_get_col(m, ray_sym_intern("x4", 2));
+    TEST_ASSERT_TRUE(k4 && x4 && k4->mmod == 1 && x4->mmod == 1);
+    int64_t* sl4 = malloc((size_t)SL4 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(sl4);
+    for (int64_t i = 0; i < SL4; i++) sl4[i] = N4 / 2 + i;
+    b0 = ray_vm_willneed_bytes();
+    two_pass = ray_cd_two_pass_preferred(&k4, 1, x4, sl4, SL4, N4, 4);
+    uint64_t b_count = ray_vm_willneed_bytes() - b0;
+    free(sl4);
+    TEST_ASSERT_FALSE(two_pass);
+    TEST_ASSERT_FMT(b_count >= (uint64_t)N4 * 8 * 15 / 16, "count asked for %llu bytes, k4 is %llu",
+                    (unsigned long long)b_count, (unsigned long long)N4 * 8);
 
     ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
@@ -5137,6 +5392,111 @@ static test_result_t test_cd_route(void) {
     TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
     ray_release(k[0]); ray_release(x);
 
+    /* groups of a few rows take the rewrite whatever the tuples dedup
+     * (#900): 349,525 groups of 3 rows beside a value of its own on every
+     * row, within the band, and 100,000 groups of 3 rows over 300,000,
+     * below it; 174,763 groups of 6 rows take the slices */
+    k[0] = ray_eval_str("(% cr 349525)");
+    x = ray_eval_str("cr");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]);
+    k[0] = ray_eval_str("(% cr 174763)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    k[0] = ray_eval_str("(% (til 300000) 100000)");
+    x = ray_eval_str("(til 300000)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 300000, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    /* ...but not on an estimate it cannot take at its word: the whole
+     * table's, standing for a `where:` the gate could not sample (a
+     * negative population); two 8-byte keys, whose (K, X) tuples the
+     * rewrite orders a row each; or a key in runs of 10 equal values,
+     * unsorted, which the sample's stride reads as singletons (most sampled
+     * rows have the next row's key) */
+    k[0] = ray_eval_str("(% cr 349525)");
+    x = ray_eval_str("cr");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, -1, 28));
+    k[1] = ray_eval_str("(* (% cr 349525) 3)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 2, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(k[1]);
+    k[0] = ray_eval_str("(% (* (div cr 10) 7919) 1000003)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    /* the same through a select: 50 groups on 600,000 rows beside 400,000
+     * singletons.  A text predicate the gate cannot sample keeps the 50
+     * groups — the slices, not the rewrite the whole table's count would
+     * pick; an integer one keeping them is sampled, the slices; one keeping
+     * the singletons is sampled, groups of a row, the rewrite */
+    setup = ray_eval_str(
+        "(set fr (til 1000000)) (set fb (as 'I64 (< fr 600000)))"
+        "(set Tf (table [k x t b] (list (+ (* fb (% fr 50)) (* (- 1 fb) (+ 1000 fr)))"
+        " (% (* fr 7919) 1000003) (as 'STR fb) fb)))");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    {
+        static const struct { const char* q; int64_t groups; bool rewrite; } fq[] = {
+            { "(count (select {from: Tf where: (== t \"1\") by: k n: (count (distinct x))}))", 50, false },
+            { "(count (select {from: Tf where: (== b 1) by: k n: (count (distinct x))}))", 50, false },
+            { "(count (select {from: Tf where: (== b 0) by: k n: (count (distinct x))}))", 400000, true },
+        };
+        for (size_t i = 0; i < sizeof fq / sizeof fq[0]; i++) {
+            uint64_t rw0, sl0, rw1, sl1;
+            ray_query_test_cd_gate(&rw0, &sl0);
+            ray_t* got = ray_eval_str(fq[i].q);
+            ray_query_test_cd_gate(&rw1, &sl1);
+            TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == -RAY_I64 && got->i64 == fq[i].groups,
+                            "query %zu", i);
+            ray_release(got);
+            TEST_ASSERT_FMT(rw1 - rw0 == (fq[i].rewrite ? 1u : 0u) && sl1 - sl0 == (fq[i].rewrite ? 0u : 1u),
+                            "query %zu: %llu rewrites, %llu slices", i,
+                            (unsigned long long)(rw1 - rw0), (unsigned long long)(sl1 - sl0));
+        }
+    }
+    setup = ray_eval_str("(set Tf 0) (set fr 0) (set fb 0)");
+    if (setup) ray_release(setup);
+
+    /* a predicate the zone gate answers in whole chunks: a splayed table
+     * (64 K-row chunk zones on id) of 7 chunks of singletons, then 50
+     * groups.  `(>= id 458752)` rules the singletons' chunks out and keeps
+     * every row it samples among the rest — those rows stand for the
+     * selection (population P), not the table: the slices.  The table's
+     * estimate (the singletons' share) took the rewrite. */
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_cd_zone"));
+    setup = ray_eval_str(ray_test_tmp(
+        "(set zr (til 1048576)) (set zl (< zr 458752))"
+        "(.db.splayed.set \"/tmp/rayforce_test_cd_zone/t/\" (table [id k x]"
+        " (list zr (+ (* zl (+ 1000 zr)) (* (- 1 zl) (% zr 50))) (% (* zr 7919) 1000003))))"
+        "(set Tz (.db.splayed.get \"/tmp/rayforce_test_cd_zone/t/\")) (set zr 0) (set zl 0)"));
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    {
+        ray_t* tz = ray_eval_str("Tz");
+        ray_t* w  = ray_eval_str("(quote (>= id 458752))");
+        TEST_ASSERT_TRUE(tz && !RAY_IS_ERR(tz) && w && !RAY_IS_ERR(w));
+        const int64_t* rows = NULL;
+        int64_t nrows = 0, pop = 0;
+        ray_t* hdr = query_cd_gate_where_rows(tz, w, N, &rows, &nrows, &pop);
+        TEST_ASSERT_NOT_NULL(hdr);
+        TEST_ASSERT_EQ_I(pop, N - 458752);
+        TEST_ASSERT_EQ_I(nrows, 262144);
+        int64_t below = 0;
+        for (int64_t j = 0; j < nrows; j++) if (rows[j] < 458752) below++;
+        TEST_ASSERT_EQ_I(below, 0);
+        scratch_free(hdr);
+        ray_release(w); ray_release(tz);
+        uint64_t rw0, sl0, rw1, sl1;
+        ray_query_test_cd_gate(&rw0, &sl0);
+        ray_t* got = ray_eval_str("(count (select {from: Tz where: (>= id 458752) by: k n: (count (distinct x))}))");
+        ray_query_test_cd_gate(&rw1, &sl1);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == -RAY_I64 && got->i64 == 50, "zone-gated select");
+        ray_release(got);
+        TEST_ASSERT_FMT(rw1 - rw0 == 0 && sl1 - sl0 == 1, "zone-gated select: %llu rewrites, %llu slices",
+                        (unsigned long long)(rw1 - rw0), (unsigned long long)(sl1 - sl0));
+    }
+    setup = ray_eval_str("(set Tz 0)");
+    if (setup) ray_release(setup);
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_cd_zone"));
+
     /* 524,288 groups of 19 rows over 10 M rows, within the band: the
      * tuples decide — a twentieth of the rows (K determines X) take the
      * rewrite, every row distinct the slices */
@@ -5257,6 +5617,16 @@ static test_result_t test_cd_route(void) {
         w = ray_eval_str("(quote (>= k 0))");
         TEST_ASSERT_NULL(query_cd_gate_where_rows(tw, w, N, &rows, &nrows, &pop));
         TEST_ASSERT_EQ_I(nrows, N);
+        TEST_ASSERT_EQ_I(pop, N);   /* every row kept: the table's rows */
+        {
+            /* a text predicate: not sampled, no population */
+            ray_t* ts = ray_eval_str("(table [k t] (list (% cr 1000) (as 'STR (% cr 2))))");
+            ray_t* ws = ray_eval_str("(quote (== t \"1\"))");
+            TEST_ASSERT_TRUE(ts && !RAY_IS_ERR(ts) && ws && !RAY_IS_ERR(ws));
+            TEST_ASSERT_NULL(query_cd_gate_where_rows(ts, ws, N, &rows, &nrows, &pop));
+            TEST_ASSERT_EQ_I(pop, 0);
+            ray_release(ws); ray_release(ts);
+        }
         /* the sampled table and its filter leave nothing behind: eight
          * rounds hold no more memory than none */
         ray_release(w);
@@ -5325,9 +5695,180 @@ static test_result_t test_cd_route(void) {
     PASS();
 }
 
+/* The rewrite and the slices answer a grouped distinct count alike, column
+ * for column and row for row (ray_query_test_cd_route forces each): with no
+ * key projection, under a where:, with a single key's projection, and with
+ * a composite key's projections ({a: a b: b ... by: [a b]}), which the
+ * select folds into the key (#1235): [a b u] on both routes, the answer of
+ * the select without them.  At 3,000 rows over 1,000 groups and at 300,000
+ * rows over 100,000. */
+static test_result_t test_cd_route_key_proj(void) {
+    /* 8 workers partition the dense slab the tie cases cut (a single
+     * worker would not) */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    /* ref: the select a composite key's projections fold into */
+    static const struct { const char* q; const char* ref; } qs[] = {
+        { "(select {a: a b: b u: (count (distinct h)) from: Tq by: [a b]})",
+          "(select {u: (count (distinct h)) from: Tq by: [a b]})" },
+        { "(select {a: a b: b u: (count (distinct h)) from: Tq by: {a: a b: b}})",
+          "(select {u: (count (distinct h)) from: Tq by: [a b]})" },
+        { "(select {u: (count (distinct h)) from: Tq by: [a b]})", NULL },
+        { "(select {u: (count (distinct h)) from: Tq where: (>= h 0) by: [a b]})", NULL },
+        { "(select {a: a u: (count (distinct h)) from: Tq where: (>= h 0) by: a})", NULL },
+    };
+    static const char* const mk[] = {
+        "(set qi (til 3000)) (set q0 (% (* qi 7919) 1000))",
+        "(set qi (til 300000)) (set q0 (% (* qi 7919) 100000))",
+    };
+    for (size_t m = 0; m < sizeof mk / sizeof mk[0]; m++) {
+        char src[512];
+        snprintf(src, sizeof src, "%s (set Tq (table [a b h] (list (as 'I32 (%% q0 100))"
+                 " (as 'I32 (div q0 100)) (%% (* qi 104729) 1000003))))", mk[m]);
+        ray_t* setup = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            ray_t* got[2];
+            uint64_t rw0, sl0, rw1, sl1;
+            for (int r = 0; r < 2; r++) {
+                ray_query_test_cd_route(r + 1);
+                ray_query_test_cd_gate(&rw0, &sl0);
+                got[r] = ray_eval_str(qs[i].q);
+                ray_query_test_cd_gate(&rw1, &sl1);
+                ray_query_test_cd_route(0);
+                TEST_ASSERT_FMT(got[r] && !RAY_IS_ERR(got[r]) && got[r]->type == RAY_TABLE,
+                                "size %zu query %zu route %d", m, i, r + 1);
+                TEST_ASSERT_FMT(rw1 - rw0 == (r == 0 ? 1u : 0u) && sl1 - sl0 == (r == 1 ? 1u : 0u),
+                                "size %zu query %zu route %d: %llu rewrites, %llu slices", m, i, r + 1,
+                                (unsigned long long)(rw1 - rw0), (unsigned long long)(sl1 - sl0));
+            }
+            ray_t* ref = qs[i].ref ? ray_eval_str(qs[i].ref) : NULL;
+            TEST_ASSERT_FMT(!qs[i].ref || (ref && !RAY_IS_ERR(ref)), "size %zu query %zu: reference", m, i);
+            ray_t* fr = ref ? ray_fmt(ref, 0) : NULL;
+            if (ref) ray_release(ref);
+            ray_t* fa = ray_fmt(got[0], 0);
+            ray_t* fb = ray_fmt(got[1], 0);
+            bool same = fa && fb && ray_str_len(fa) == ray_str_len(fb) &&
+                        memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+            bool as_ref = !fr || (fa && ray_str_len(fr) == ray_str_len(fa) &&
+                                  memcmp(ray_str_ptr(fr), ray_str_ptr(fa), ray_str_len(fa)) == 0);
+            if (fa) ray_release(fa);
+            if (fb) ray_release(fb);
+            if (fr) ray_release(fr);
+            ray_release(got[0]); ray_release(got[1]);
+            TEST_ASSERT_FMT(same, "size %zu query %zu: the routes differ", m, i);
+            TEST_ASSERT_FMT(as_ref, "size %zu query %zu: not the select without the projections", m, i);
+        }
+    }
+    /* Ties under desc:/take:: groups of a few rows count the same few
+     * values, and both routes keep the tied groups the full stable sort
+     * would, in its order.  The rewrite's outer group cut them from a
+     * partitioned slab in slab order (key 1, 129, 257, ... at 28 workers,
+     * 1, 65, 129, ... at 8) where the slices' sort keeps 1, 2, 3, ... */
+    static const char* const tq[] = {
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k desc: u take: 5})",
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k desc: u take: 1000})",
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k asc: u take: 5})",
+        "(select {u: (count (distinct h)) from: Tt where: (> g 0) by: [a b] desc: u take: 5})",
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k desc: u})",
+    };
+    static const char* const tm[] = {
+        "(set ti (til 300000)) (set tk (% (* ti 7919) 100000))",
+        "(set ti (til 3000)) (set tk (% (* ti 7919) 1000))",
+        "(set ti (til 1200000)) (set tk (% (* ti 7919) 1000000))",
+    };
+    for (size_t m = 0; m < sizeof tm / sizeof tm[0]; m++) {
+        char src[512];
+        snprintf(src, sizeof src, "%s (set Tt (table [k a b h g] (list tk (as 'I32 (%% tk 1000))"
+                 " (as 'I32 (div tk 1000)) (%% (* ti 104729) 1000003) (%% ti 10))))", tm[m]);
+        ray_t* setup = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        for (size_t i = 0; i < sizeof tq / sizeof tq[0]; i++) {
+            ray_t* got[2];
+            for (int r = 0; r < 2; r++) {
+                ray_query_test_cd_route(r + 1);
+                got[r] = ray_eval_str(tq[i]);
+                ray_query_test_cd_route(0);
+                TEST_ASSERT_FMT(got[r] && !RAY_IS_ERR(got[r]) && got[r]->type == RAY_TABLE,
+                                "ties %zu query %zu route %d", m, i, r + 1);
+            }
+            ray_t* fa = ray_fmt(got[0], 0);
+            ray_t* fb = ray_fmt(got[1], 0);
+            bool same = fa && fb && ray_str_len(fa) == ray_str_len(fb) &&
+                        memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+            if (fa) ray_release(fa);
+            if (fb) ray_release(fb);
+            ray_release(got[0]); ray_release(got[1]);
+            TEST_ASSERT_FMT(same, "ties %zu query %zu: the routes differ", m, i);
+        }
+    }
+    ray_t* r = ray_eval_str("(set Tq 0) (set qi 0) (set q0 0) (set Tt 0) (set ti 0) (set tk 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
+/* A top-N cut over a partitioned dense slab (agg_dense_lean_select) keeps
+ * the groups tied at the threshold that the stable sort would take — tied
+ * exactly, not as doubles: 64-bit values past 2^53 that a double cannot tell
+ * apart (an I64 or TIMESTAMP near 1.7e18, spaced 256 apart) are ranked by
+ * their own values.  Each answer is the full sort's first rows.  Pinned at 8
+ * workers, which partition the slab (a single worker would not). */
+static test_result_t test_topn_ties_exact(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set ti (til 1000000)) (set tk (% ti 100000))"
+        "(set tv (+ 1700000000000000000 (+ (* (== tk 99999) 100) (* (== tk 99998) 50))))"
+        "(set tw (- 1700000000000000000 (+ (* (== tk 99999) 100) (* (== tk 99998) 50))))"
+        "(set Ti (table [k v w] (list tk tv tw)))"
+        "(set Tt (table [k v w] (list tk (as 'TIMESTAMP tv) (as 'TIMESTAMP tw))))"
+        "(set ti 0) (set tk 0) (set tv 0) (set tw 0)");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* const tbls[] = { "Ti", "Tt" };
+    static const char* const aggs[][2] = {
+        { "(max v)", "desc" }, { "(min w)", "asc" }, { "(max w)", "desc" }, { "(min v)", "asc" },
+    };
+    static const int takes[] = { 2, 5, 3000 };
+    for (size_t t = 0; t < 2; t++)
+        for (size_t a = 0; a < sizeof aggs / sizeof aggs[0]; a++)
+            for (size_t n = 0; n < sizeof takes / sizeof takes[0]; n++) {
+                char q[256], ref[256];
+                snprintf(q, sizeof q, "(select {k: k m: %s from: %s by: k %s: m take: %d})",
+                         aggs[a][0], tbls[t], aggs[a][1], takes[n]);
+                snprintf(ref, sizeof ref, "(take (select {k: k m: %s from: %s by: k %s: m}) %d)",
+                         aggs[a][0], tbls[t], aggs[a][1], takes[n]);
+                ray_t* got = ray_eval_str(q);
+                ray_t* want = ray_eval_str(ref);
+                TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want), "%s", q);
+                ray_t* fg = ray_fmt(got, 0);
+                ray_t* fw = ray_fmt(want, 0);
+                bool same = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                            memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fg)) == 0;
+                TEST_ASSERT_FMT(same, "%s: %.120s, the full sort %.120s", q,
+                                fg ? ray_str_ptr(fg) : "", fw ? ray_str_ptr(fw) : "");
+                if (fg) ray_release(fg);
+                if (fw) ray_release(fw);
+                ray_release(got); ray_release(want);
+            }
+    /* the winners themselves: the two keys off the base */
+    ray_t* k = ray_eval_str("(at (select {k: k m: (max v) from: Ti by: k desc: m take: 2}) 'k)");
+    TEST_ASSERT_TRUE(k && !RAY_IS_ERR(k) && k->type == RAY_I64 && k->len == 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(k))[0], 99999);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(k))[1], 99998);
+    ray_release(k);
+    ray_t* r = ray_eval_str("(set Ti 0) (set Tt 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
+    { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
+    { "agg_contract/topn_ties_exact", test_topn_ties_exact, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_floor", test_cd_bounded_floor, contract_setup, contract_teardown },
@@ -5372,6 +5913,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/first_n_take_where", test_first_n_take_where, contract_setup, contract_teardown },
     { "agg_contract/first_n_take_key_where_parted", test_first_n_take_key_where_parted, contract_setup, contract_teardown },
     { "agg_contract/group_where_order_dependent", test_group_where_order_dependent, contract_setup, contract_teardown },
+    { "agg_contract/first_n_take_running_input", test_first_n_take_running_input, contract_setup, contract_teardown },
+    { "agg_contract/group_bridge_lambda_aggregate", test_group_bridge_lambda_aggregate, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
     { "agg_contract/timespan_rank_admission", test_timespan_rank_admission, contract_setup, contract_teardown },
