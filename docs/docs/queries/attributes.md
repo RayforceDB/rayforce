@@ -108,7 +108,7 @@ But a column holds at most one backing index — setting `grouped` or `parted` r
 
 ## Conservative Propagation
 
-Attributes propagate **conservatively**.  Only operations that trivially preserve the values — a refcount / copy-on-write copy, a plain rebind — keep the attributes.  *Any* transform that could change ordering, length, or values (arithmetic, `filter` / `where`, `reverse`, reordering `take`) **drops** them.  This keeps the invariant honest: a held attribute always reflects the current bytes.
+Attributes propagate **conservatively**.  Only operations that trivially preserve the values — a refcount / copy-on-write copy, a plain rebind — keep the attributes.  *Any* transform that could change ordering, length, or values (arithmetic, `filter` / `where`, `reverse`, `take`) **drops** them.  This keeps the invariant honest: a held attribute always reflects the current bytes.
 
 An append is the exception.  `(concat v rows)`, `(concat v atom)`, `(alter 'v concat rows)`, an `insert` of one value into a `grouped` vector and an `insert` of rows into a table's `grouped` column (in place or not) keep the hash.  An `insert` of several values into a vector builds a fresh, unattributed one; `concat` keeps the attribute.  With the hash kept, each appended row with a **new** key becomes a group of its own, so an append-only keyed vector never pays a rebuild, and `unique` stays.  An appended row that **repeats** a key the hash already holds is not added to that key's group, which would cost a re-lay of every row: the hash is left first-row-only (`.idx.info` reports `first_only: true`).  It still answers `find`, `in`, a dict lookup and `distinct` — a key's first row and its presence are exact — but `grouped` and `unique` are no longer claimed, every other consult reads the column, and a save writes a complete hash built from the values.  `.attr.set 'grouped` rebuilds a complete one.  A null appended (to any column but a guid one, whose hash keys the null guid), or a symbol from another domain, leaves the result a plain vector, as before; `sorted` is always dropped by an append.
 
@@ -166,6 +166,22 @@ For a partitioned join `(asof-join [Key Time] L R)`, if the single numeric equal
           [10:00:00.000 10:00:02.000 10:00:00.000 10:00:01.000]
           [0.9 1.8 2.9 3.8])))
 (asof-join [ID Time] Lgp Rgp)
+```
+
+## Exact `find` on a `sorted` Vector
+
+`find` on a `sorted` `U8`, `I16`, `I32` or `I64` vector without nulls uses binary search instead of a scan, when the needle has the vector's own type:
+
+- **An atom** takes one lower-bound search once the vector is longer than 64 rows; a shorter vector is scanned, which is cheaper at that size.
+- **A vector of needles** of the same type runs eight searches side by side when the vector has at least 4096 rows and there is at most one needle per eight rows; denser needle sets keep the hash route.
+
+A duplicated value answers its first position, and a missing value answers `0Nl`, exactly as the scan does. An attached hash index (`.idx.hash`, `grouped`) is consulted first. A needle of another width (`(find v32 7)` with an `I64` atom against an `I32` vector), a float on either side, a null needle and a vector holding nulls keep the scan or hash route and its numeric comparison. A `take` of a `sorted` vector does not carry `sorted` over, so its result is scanned unless it is stamped again.
+
+```lisp
+(set s (.attr.set 'sorted (asc (concat (til 100) [5 5 50]))))
+(find s 50)                ; ⇒ 52 (the first of rows 52-53)
+(find s 100)               ; ⇒ 0Nl
+(find s [5 50 100])        ; ⇒ [5 52 0Nl] (too few rows for the vector route; same answer)
 ```
 
 ## Caveats and Limits
