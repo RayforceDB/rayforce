@@ -5809,6 +5809,225 @@ static test_result_t test_cd_route_key_proj(void) {
     PASS();
 }
 
+/* An unordered `take: N` keeps the first N groups seen (pipeline.md), on
+ * the two-pass rewrite as on the gate's own choice: the passes count every
+ * group in key order, and the rewrite picks the first N seen out of them.
+ * Keys whose first-seen order is not their key order (k*7919 mod m), with
+ * and without a where:, a key with nulls, a SYM key, a composite key, a
+ * take past the group count (2000 over 40 groups; 200000 over kl's 150003
+ * at 300,000 rows, with the pick's small set off: every group, in
+ * first-seen order, as `(count x)` gives them), and a key whose 4th group
+ * first shows past the small set's row budget (kl, take 5).  Flat at 3,000 and 300,000
+ * rows, and parted (which the rewrite declines).  The answer is the
+ * groups' keys and counts ordered by first selected row, the count taken
+ * over an expression (not the rewrite's shape); `(count x)` under the same
+ * take keeps the same groups in the same order.  Pinned at 8 workers. */
+static test_result_t test_cd_first_n_take(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_cd_first_n_%lld", wave_pid());
+    (void)ray_test_rm_rf(dir);
+    static const char* const mk[] = {
+        "(set fi (til 3000))", "(set fi (til 300000))",
+    };
+    static const char* const wh[] = { "", " where: (> i 600)", " where: (> k 3)", " where: (== i 5)" };
+    static const struct { const char* by; const char* cols; } ks[] = {
+        { "k", "(at R 'k)" }, { "kn", "(at R 'kn)" }, { "kh", "(at R 'kh)" }, { "kl", "(at R 'kl)" },
+        { "s", "(at R 's)" },
+        { "[k k2]", "(at R 'k) (at R 'k2)" }, { "[s k2]", "(at R 's) (at R 'k2)" },
+    };
+    static const int takes[] = { 5, 2000, 200000 };
+    for (size_t m = 0; m < sizeof mk / sizeof mk[0] + 1; m++) {
+        bool parted = m == sizeof mk / sizeof mk[0];
+        char src[1024];
+        snprintf(src, sizeof src, "%s (set fk (%% (* fi 7919) 40))"
+                 " (set Tf (table [k kn kh kl s k2 x i] (list fk"
+                 " (at (concat (til 40) 0Nl) (+ fk (* (as 'I64 (== (%% fi 11) 3)) (- 40 fk))))"
+                 " (%% (* fi 7919) 60000)"
+                 " (+ (* (as 'I64 (< fi 150000)) (%% fi 3)) (* (as 'I64 (>= fi 150000)) fi)) (as 'SYM (as 'STR (%% (* fi 31) 50))) (%% fi 7) (%% fi 1000)"
+                 " (+ 1 (%% fi 997)))))", parted ? mk[1] : mk[m]);
+        ray_t* setup = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        if (parted) {
+            snprintf(src, sizeof src,
+                     "(.db.splayed.set \"%s/1/t/\" (take Tf 150000))"
+                     " (.db.splayed.set \"%s/2/t/\" (take Tf -150000))"
+                     " (set Tf (.db.parted.get \"%s/\" 't))", dir, dir, dir);
+            setup = ray_eval_str(src);
+            TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "parted store");
+            ray_release(setup);
+        }
+        for (size_t w = 0; w < sizeof wh / sizeof wh[0]; w++) {
+            char q[512];
+            snprintf(q, sizeof q, "(set Wf (select {from: Tf%s})) (set Wf (update {from: Wf rid: (til (count Wf))}))",
+                     wh[w]);
+            setup = ray_eval_str(q);
+            TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "where %zu", w);
+            ray_release(setup);
+            for (size_t k = 0; k < sizeof ks / sizeof ks[0]; k++) {
+                char ref[512];
+                snprintf(ref, sizeof ref, "(set Of (xasc (select {from: Wf by: %s f: (min rid)"
+                         " u: (count (distinct (+ x 0)))}) 'f))", ks[k].by);
+                setup = ray_eval_str(ref);
+                TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "%s", ref);
+                ray_release(setup);
+                for (size_t n = 0; n < sizeof takes / sizeof takes[0]; n++) {
+                    snprintf(ref, sizeof ref, "(do (set R (take Of (min %d (count Of)))) (list %s (at R 'u)))",
+                             takes[n], ks[k].cols);
+                    ray_t* want = ray_eval_str(ref);
+                    TEST_ASSERT_FMT(want && !RAY_IS_ERR(want), "%s", ref);
+                    ray_t* fw = ray_fmt(want, 0);
+                    ray_release(want);
+                    /* the keys alone, and those of `(count x)` under the take */
+                    snprintf(ref, sizeof ref, "(do (set R (take Of (min %d (count Of)))) (list %s))",
+                             takes[n], ks[k].cols);
+                    ray_t* wk = ray_eval_str(ref);
+                    snprintf(q, sizeof q, "(do (set R (select {from: Tf%s by: %s c: (count x) take: %d}))"
+                             " (list %s))", wh[w], ks[k].by, takes[n], ks[k].cols);
+                    ray_t* ck = ray_eval_str(q);
+                    TEST_ASSERT_FMT(wk && !RAY_IS_ERR(wk) && ck && !RAY_IS_ERR(ck), "%s", q);
+                    ray_t* fwk = ray_fmt(wk, 0);
+                    ray_t* fck = ray_fmt(ck, 0);
+                    ray_release(wk); ray_release(ck);
+                    bool csame = fwk && fck && ray_str_len(fwk) == ray_str_len(fck) &&
+                                 memcmp(ray_str_ptr(fwk), ray_str_ptr(fck), ray_str_len(fwk)) == 0;
+                    TEST_ASSERT_FMT(csame, "size %zu: %s: %.160s, first seen %.160s", m, q,
+                                    fck ? ray_str_ptr(fck) : "", fwk ? ray_str_ptr(fwk) : "");
+                    if (fwk) ray_release(fwk);
+                    if (fck) ray_release(fck);
+                    /* 200000 finds every group's first row, past the small set */
+                    ray_query_test_cd_firstn_set_max(takes[n] == 200000 ? 0 : -1);
+                    for (int r = 0; r < (parted ? 1 : 2); r++) {   /* the gate, the rewrite; parted: never the rewrite */
+                        snprintf(q, sizeof q, "(do (set R (select {from: Tf%s by: %s u: (count (distinct x))"
+                                 " take: %d})) (list %s (at R 'u)))", wh[w], ks[k].by, takes[n], ks[k].cols);
+                        uint64_t rw0, sl0, rw1, sl1;
+                        ray_query_test_cd_route(r);
+                        ray_query_test_cd_gate(&rw0, &sl0);
+                        ray_t* got = ray_eval_str(q);
+                        ray_query_test_cd_gate(&rw1, &sl1);
+                        ray_query_test_cd_route(0);
+                        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%s route %d", q, r);
+                        /* forced, a flat table takes the rewrite (the fused
+                         * kernel serves one key at 300,000 rows unfiltered) */
+                        if (r == 1 && !parted && (m == 0 || w > 0 || ks[k].by[0] == '['))
+                            TEST_ASSERT_FMT(rw1 - rw0 == 1, "%s: not on the rewrite", q);
+                        ray_t* fg = ray_fmt(got, 0);
+                        ray_release(got);
+                        bool same = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                                    memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fg)) == 0;
+                        TEST_ASSERT_FMT(same, "size %zu: %s route %d: %.160s, first seen %.160s", m, q, r,
+                                        fg ? ray_str_ptr(fg) : "", fw ? ray_str_ptr(fw) : "");
+                        if (fg) ray_release(fg);
+                    }
+                    ray_query_test_cd_firstn_set_max(-1);
+                    if (fw) ray_release(fw);
+                }
+            }
+        }
+    }
+    ray_t* r = ray_eval_str("(set Tf 0) (set Wf 0) (set Of 0) (set R 0) (set fi 0) (set fk 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* Cancellation under the rewrite's first-N pick.  The pool skips every
+ * ticket of a cancelled query, so a dispatch the cancel lands before writes
+ * none of its output: the ranks of the small set's probe, the emptied
+ * table, the built entries, the first rows, their copy for the sort, the
+ * sort's permutation.  Each query, the rewrite forced, runs once per
+ * dispatch it makes with the cancel landing right before that dispatch
+ * (ray_pool_test_cancel_at, both modes), over blocks filled with garbage
+ * (ray_heap_test_scribble): each run is `cancel` leaving no block behind,
+ * or the answer, never a pick read from unwritten buffers (a permutation
+ * of garbage indexed the first rows out of bounds).  The small set (take
+ * 5 and 100000 of 150000 groups), and with it off 100000 and every group
+ * (200000).  No
+ * where: until the gate's sample of it checks for a cancel (#1246).
+ * Pinned at 8 workers. */
+/* Blocks live over every heap: a worker's block the main thread frees
+ * counts its alloc on one heap and its free on another. */
+static int64_t cdn_live_blocks(void) {
+    int64_t live = 0;
+    for (int h = 0; h < RAY_HEAP_REGISTRY_SIZE; h++) {
+        ray_heap_t* hp = ray_heap_registry[h];
+        if (hp) live += (int64_t)hp->stats.alloc_count - (int64_t)hp->stats.free_count;
+    }
+    return live;
+}
+
+static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str("(set zi (til 150000))"
+        " (set Tz (table [kh k2 x i] (list (% (* zi 7919) 200003) (% zi 7) (% zi 1000) (% zi 997))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    /* cap: the small set's (-1: the default; 0: every group's first row) */
+    static const struct { const char* q; int64_t cap; } qs[] = {
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 5})", -1 },
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 100000})", -1 },
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 100000})", 0 },
+        { "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 200000})", 0 },
+    };
+    int cancelled = 0, answered = 0;
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        ray_query_test_cd_route(1);
+        ray_query_test_cd_firstn_set_max(qs[i].cap);
+        ray_t* ref = ray_eval_str(qs[i].q);
+        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref) && ref->type == RAY_TABLE, "%s", qs[i].q);
+        ray_t* fr = ray_fmt(ref, 0);
+        ray_release(ref);
+        ray_heap_test_scribble(true);
+        /* mode 0, a cancel request, up to the first run that answers (armed
+         * past the query's last dispatch); mode 1, the pool's flag alone,
+         * over those dispatches */
+        int last = 96;
+        for (int mode = 0; mode < 2; mode++)
+            for (int k = 1; k <= last; k++) {
+                ray_heap_gc();
+                int64_t live0 = cdn_live_blocks();
+                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_t* got = ray_eval_str(qs[i].q);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                atomic_store_explicit(&ray_pool_get()->cancelled, 0, memory_order_relaxed);
+                bool ok = got != NULL;
+                if (ok && RAY_IS_ERR(got)) {
+                    ok = strcmp(ray_err_code(got), "cancel") == 0;
+                    ray_error_free(got);
+                    ray_heap_gc();
+                    int64_t live = cdn_live_blocks() - live0;
+                    if (!ok || live) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); ray_query_test_cd_firstn_set_max(-1); }
+                    TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: an error other than cancel",
+                                    qs[i].q, mode, k);
+                    TEST_ASSERT_FMT(live == 0, "%s, mode %d, cancel before dispatch %d: %lld blocks left",
+                                    qs[i].q, mode, k, (long long)live);
+                    cancelled++;
+                    continue;
+                }
+                ray_t* fg = ok ? ray_fmt(got, 0) : NULL;
+                if (got) ray_release(got);
+                ok = fg && fr && ray_str_len(fg) == ray_str_len(fr) &&
+                     memcmp(ray_str_ptr(fg), ray_str_ptr(fr), ray_str_len(fr)) == 0;
+                if (fg) ray_release(fg);
+                if (!ok) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); ray_query_test_cd_firstn_set_max(-1); }
+                TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: not the answer", qs[i].q, mode, k);
+                answered++;
+                if (mode == 0) { last = k - 1; break; }
+            }
+        ray_heap_test_scribble(false);
+        if (fr) ray_release(fr);
+    }
+    ray_query_test_cd_route(0);
+    ray_query_test_cd_firstn_set_max(-1);
+    TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
+    ray_t* r = ray_eval_str("(set Tz 0) (set zi 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
 /* A top-N cut over a partitioned dense slab (agg_dense_lean_select) keeps
  * the groups tied at the threshold that the stable sort would take — tied
  * exactly, not as doubles: 64-bit values past 2^53 that a double cannot tell
@@ -5868,6 +6087,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
+    { "agg_contract/cd_first_n_take", test_cd_first_n_take, contract_setup, contract_teardown },
+    { "agg_contract/cd_first_n_cancel_at_dispatch", test_cd_first_n_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/topn_ties_exact", test_topn_ties_exact, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
