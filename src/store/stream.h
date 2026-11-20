@@ -30,14 +30,18 @@ typedef struct {
      * fixed at W32: a streaming writer can't know the final vocabulary
      * before the last chunk, and W32 covers any STRL count. */
     struct ray_sym_domain_s* dom;
-    /* runtime id -> domain position, direct-mapped: the chunk vecs are
-     * runtime-domain and a column's values repeat across rows and chunks,
-     * so a value is interned into the symfile's domain (a locked probe) the
-     * first time it is met and looked up here after.  Made by the first
-     * runtime-domain chunk: NULL while every chunk is already encoded over
-     * `dom` (a converter's own symbol decode) and needs no translation. */
-    int64_t*  lut_id;    /* [COL_STREAM_LUT] runtime id per slot, -1 empty */
+    /* source id -> domain position, direct-mapped: the chunk vecs are
+     * runtime-domain (or over a parted table's root symfile) and a column's
+     * values repeat across rows and chunks, so a value is interned into the
+     * symfile's domain (a locked probe) the first time it is met and looked
+     * up here after.  Made by the first chunk over another domain: NULL
+     * while every chunk is already encoded over `dom` (a converter's own
+     * symbol decode) and needs no translation. */
+    int64_t*  lut_id;    /* [COL_STREAM_LUT] source id per slot, -1 empty */
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
+    /* the domain the cached ids resolve over: the runtime one, or a file
+     * domain (a parted table's segments, all over the root symfile) */
+    struct ray_sym_domain_s* lut_dom;
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
     bool    want_dict;      /* generation 2, STR: index_begin asked for the DICT (built at finish) */
@@ -103,4 +107,7 @@ ray_err_t ray_col_stream_publish(ray_col_stream_t* w, bool durable);
 ray_err_t ray_col_stream_close_all(ray_col_stream_t* w, int64_t n, bool durable,
                                    int64_t* col_ns);
 void ray_col_stream_abort(ray_col_stream_t* w);
+/* Test hook: SYM cells a writer resolved through a probe of their source
+ * domain (a cache miss, or no cache), over every writer. */
+int64_t ray_col_stream_test_sym_probes(void);
 #endif

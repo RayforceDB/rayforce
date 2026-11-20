@@ -19,6 +19,9 @@
 #include <limits.h>
 #include <string.h>
 
+static _Atomic(int64_t) g_sym_probes;   /* test hook: SYM cells resolved through a domain probe */
+int64_t ray_col_stream_test_sym_probes(void) { return atomic_load_explicit(&g_sym_probes, memory_order_relaxed); }
+
 #define COL_STREAM_LUT_BITS 19
 #define COL_STREAM_LUT (1u << COL_STREAM_LUT_BITS)
 
@@ -119,20 +122,25 @@ static void stream_drop_mem(ray_col_stream_t* w) {
 
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
-    w->lut_id = NULL; w->lut_pos = NULL;
+    w->lut_id = NULL; w->lut_pos = NULL; w->lut_dom = NULL;
 }
 
-/* The runtime id -> position cache, made by the first runtime-domain chunk:
- * 4 MiB of ids and 2 MiB of positions, each a block one order up with its
- * header (8 MB and 4 MB, 12 MB committed, the 4 MiB of ids written here).
- * A writer fed chunks already encoded over its domain never needs it.  Best
- * effort: without it every cell probes the domain. */
-static bool ray_col_stream_lut(ray_col_stream_t* w) {
-    if (w->lut_id) return true;
-    w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
-    w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
-    if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
+/* The source id -> position cache, made by the first chunk over another
+ * domain: 4 MiB of ids and 2 MiB of positions, each a block one order up
+ * with its header (8 MB and 4 MB, 12 MB committed, the 4 MiB of ids written
+ * here).  It caches one source domain at a time (the runtime one, or the
+ * file domain a parted table's segments share); a chunk over another domain
+ * empties it.  A writer fed chunks already encoded over its domain never
+ * needs it.  Best effort: without it every cell probes the domain. */
+static bool ray_col_stream_lut(ray_col_stream_t* w, struct ray_sym_domain_s* dom) {
+    if (w->lut_id && w->lut_dom == dom) return true;
+    if (!w->lut_id) {
+        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
+        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
+        if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
+    }
     memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
+    w->lut_dom = dom;
     return true;
 }
 
@@ -264,11 +272,13 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
          * find-or-append into the target (distinct work rides the
          * write).  The domain is flushed before the column files are
          * committed (close), preserving the sym-first crash ordering.
-         * A runtime-domain chunk vec goes through the id -> position
-         * cache: only a value's first encounter pays the domain probe. */
-        bool direct = ray_sym_vec_domain(col) == w->dom;
-        bool cached = !direct && ray_sym_vec_domain(col) == ray_sym_runtime_domain() &&
-                      ray_col_stream_lut(w);
+         * A chunk vec over another domain goes through the id ->
+         * position cache: only a value's first encounter pays the domain
+         * probe. */
+        struct ray_sym_domain_s* cdom = ray_sym_vec_domain(col);
+        bool direct = cdom == w->dom;
+        bool cached = !direct && ray_col_stream_lut(w, cdom);
+        bool rt = cdom == ray_sym_runtime_domain();
         const void* cd = ray_data(col);
         uint32_t buf[8192];
         for (int64_t off = 0; off < n; ) {
@@ -286,8 +296,9 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                     if (w->lut_id[slot] == id) {
                         pos = w->lut_pos[slot];
                     } else {
-                        ray_t* s = ray_sym_str(id);
+                        ray_t* s = rt ? ray_sym_str(id) : ray_sym_domain_str(cdom, id);
                         if (!s) return RAY_ERR_CORRUPT;
+                        atomic_fetch_add_explicit(&g_sym_probes, 1, memory_order_relaxed);
                         pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
                         if (pos < 0) return RAY_ERR_OOM;
                         w->lut_id[slot] = id; w->lut_pos[slot] = (uint32_t)pos;
@@ -295,6 +306,7 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                 } else {
                     ray_t* s = ray_sym_vec_cell(col, off + i);
                     if (!s) return RAY_ERR_CORRUPT;
+                    atomic_fetch_add_explicit(&g_sym_probes, 1, memory_order_relaxed);
                     pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
                     if (pos < 0) return RAY_ERR_OOM;
                 }

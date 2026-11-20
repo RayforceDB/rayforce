@@ -1070,9 +1070,11 @@ static test_result_t test_staged_and_sym(void) {
 
 /* Preflight admits a single encoded column but keeps refusing parted kinds
  * (a parted RAY_ENCCOL and a plain parted wrapper) and the partition key
- * column: a splayed save of a table carrying one is nyi before anything is
- * written, and nothing is decoded. */
-static test_result_t test_save_refuses_parted_kinds(void) {
+ * column: they have no single-file form.  A splayed save of a table
+ * carrying one streams it a segment at a time (#1182): the column comes to
+ * every partition's rows, in the generation the mode asks for, and nothing
+ * is decoded whole. */
+static test_result_t test_save_streams_parted_kinds(void) {
     for (int pass = 0; pass < 2; pass++) {
         write_part("2024.01.01", pass ? 0 : 2); write_part("2024.01.02", pass ? 0 : 2);
         ray_t* pt = ray_read_parted(ray_test_tmp(CS_TMP "/pdb"), "tb");
@@ -1096,9 +1098,19 @@ static test_result_t test_save_refuses_parted_kinds(void) {
                 TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
             }
             for (int m = 0; m < 3; m++) {
-                TEST_ASSERT_EQ_I(ray_splay_save_mode(t, ray_test_tmp(CS_TMP "/pref"), NULL, (ray_compress_t)m), RAY_ERR_NYI);
-                TEST_ASSERT_FALSE(ray_splay_has_schema(ray_test_tmp(CS_TMP "/pref")));
-                TEST_ASSERT_EQ_I(access(ray_test_tmp(CS_TMP "/pref/c"), F_OK), -1);
+                (void)ray_test_rm_rf(ray_test_tmp(CS_TMP "/pref"));
+                TEST_ASSERT_EQ_I(ray_splay_save_mode(t, ray_test_tmp(CS_TMP "/pref"), NULL, (ray_compress_t)m), RAY_OK);
+                ray_t* back = ray_read_splayed(ray_test_tmp(CS_TMP "/pref"), NULL);
+                TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
+                TEST_ASSERT_EQ_I(ray_table_nrows(back), 6000);
+                ray_release(back);
+                /* the source decides an absent mode: an encoded parted column stays 2 */
+                uint8_t want = m == RAY_COMPRESS_ON ? 2 : m == RAY_COMPRESS_OFF ? 0
+                             : (pass == 0 && which != 1) ? 2 : 0;
+                const char* name = which == 2 ? "a" : "c";
+                TEST_ASSERT_FMT(col_gen_in(ray_test_tmp(CS_TMP "/pref"), name) == want,
+                                "pass %d, table %d, mode %d: generation %u, want %u", pass, which, m,
+                                col_gen_in(ray_test_tmp(CS_TMP "/pref"), name), want);
             }
             ray_release(t);
         }
@@ -5771,7 +5783,7 @@ const test_entry_t compress_entries[] = {
     { "compress/chunk_zone_recorded", test_chunk_zone_recorded, cs_setup, cs_teardown },
     { "compress/matrix_parted_indexed", test_matrix_parted_indexed, cs_setup, cs_teardown },
     { "compress/staged_and_sym",      test_staged_and_sym,      cs_setup, cs_teardown },
-    { "compress/save_refuses_parted_kinds", test_save_refuses_parted_kinds, rt_setup, rt_teardown },
+    { "compress/save_streams_parted_kinds", test_save_streams_parted_kinds, rt_setup, rt_teardown },
     { "compress/resolver_rules",      test_resolver_rules,      cs_setup, cs_teardown },
     { "compress/write_sym_domains",      test_write_sym_domains,      cs_setup, cs_teardown },
     { "compress/write_parted_refused",   test_write_parted_refused,   rt_setup, rt_teardown },

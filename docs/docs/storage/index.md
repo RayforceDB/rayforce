@@ -204,6 +204,17 @@ What this guarantees:
 - **Pruning.** A predicate on the key (`(== part 7)`, `(> date 2024.01.15)`) prunes from the directory names alone; it needs no `compress` option. `compress: true` matters only for pruning on a *data* column, whose per-partition minimum and maximum are kept for compressed columns and for plain columns of 65,536 rows or more.
 - **Tables in every partition.** Write each table into every partition. A table that appears in later partitions only, because it was added midway, is handled by `.db.parted.fill`, which gives every partition that lacks a table an empty copy of it. It does not change existing data and a repeat call is a no-op.
 
+### Writing a Parted Table as One Splayed Table
+
+`.db.splayed.set` takes a parted table as it takes any other, and writes it a partition segment at a time: the table is never held in memory. Use it to merge the partitions of a root into one larger partition, or to copy a parted table elsewhere.
+
+```lisp
+(set P (.db.parted.get "/data/db" 'trades))
+(.db.splayed.set "/data/merged/2024.01/trades" (xcols P (drop (cols P) 1)) "/data/merged/.sym")
+```
+
+The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls. The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds; only a string column's dictionary index (up to about 12 bytes a row while it is built, `{index: false}` skips it) grows with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
+
 ### Loading Partitioned Data
 
 The `ray_read_parted()` function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with [parted columns](../data-types/collections.md#partitioned-columns) and a virtual `MAPCOMMON` date column.
@@ -385,6 +396,8 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 ```
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
+
+The table may be a parted one: it is then written a partition segment at a time, never held in memory (see [Writing a Parted Table as One Splayed Table](#writing-a-parted-table-as-one-splayed-table)).
 
 A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked and nested/list columns are always written uncompressed. Compressed files record their indexes in the file header: those you built, and the dictionary or chunk zone a save builds on its own.
 

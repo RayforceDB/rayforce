@@ -41,6 +41,7 @@
 #include "store/serde.h"
 #include "store/splay.h"
 #include "store/col.h"
+#include "store/stream.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -815,7 +816,165 @@ static test_result_t test_partition_key_position(void) {
     PASS();
 }
 
+/* .db.splayed.set of a parted table (#1182): every column is streamed a
+ * segment at a time (one append per segment, none longer than the largest
+ * partition), no encoded column is decoded whole and no parted column is
+ * flattened, and the table reads back as its in-memory copy, the partition
+ * key a real column.  Plain, encoded, mixed and ragged partitions. */
+int64_t ray_group_test_flat_copies(void);
+static bool fmt_same(ray_t* x, ray_t* y, const char* q) {
+    bind_t(x); ray_t* fx = pr_fmt_q(q);
+    bind_t(y); ray_t* fy = pr_fmt_q(q);
+    bind_t(NULL);
+    bool same = fx && fy && ray_str_len(fx) == ray_str_len(fy) &&
+                memcmp(ray_str_ptr(fx), ray_str_ptr(fy), ray_str_len(fx)) == 0;
+    if (fx) ray_release(fx);
+    if (fy) ray_release(fy);
+    return same;
+}
+static test_result_t test_splay_set_streams(void) {
+    static const struct { unsigned gen2; bool ragged; } shapes[] = {
+        { 0, false }, { 7, false }, { 5, false }, { 0, true }, { 7, true },
+    };
+    for (size_t k = 0; k < sizeof shapes / sizeof shapes[0]; k++) {
+        char root[256], out[300], sym[320];
+        snprintf(root, sizeof root, "%s/s%zu", ray_test_tmp(PR_TMP), k);
+        snprintf(out, sizeof out, "%s/out", root);
+        snprintf(sym, sizeof sym, "%s/.sym", out);
+        TEST_ASSERT_TRUE(write_db(root, shapes[k].gen2, shapes[k].ragged));
+        ray_t* src = load_db(root);
+        TEST_ASSERT_NOT_NULL(src);
+        int64_t nc = ray_table_ncols(src);
+        TEST_ASSERT_EQ_I(nc, 8);                     /* date, then a b s f str d flag */
+        ray_splay_test_parted_reset();
+        ray_enc_counters_reset();
+        int64_t f0 = ray_group_test_flat_copies(), p0 = ray_col_stream_test_sym_probes();
+        TEST_ASSERT_EQ_I(ray_splay_save(src, out, sym), RAY_OK);
+        /* s holds x, y, z and the null over 9 rows: one probe a value (and
+         * one more for the ragged shapes' null segment, over another domain) */
+        int64_t probes = ray_col_stream_test_sym_probes() - p0;
+        TEST_ASSERT_FMT(probes <= 5, "shape %zu: %lld symbol probes for 4 values", k, (long long)probes);
+        TEST_ASSERT_FMT(ray_splay_test_parted_appends() == nc * 3,
+                        "shape %zu: %lld appends, want one per segment (%lld)", k,
+                        (long long)ray_splay_test_parted_appends(), (long long)(nc * 3));
+        TEST_ASSERT_FMT(ray_splay_test_parted_max_rows() == 4,
+                        "shape %zu: an append of %lld rows, the largest partition holds 4", k,
+                        (long long)ray_splay_test_parted_max_rows());
+        ray_enc_counters_t ec;
+        ray_enc_counters_get(&ec);
+        TEST_ASSERT_FMT(ec.materialized == 0, "shape %zu: %llu encoded columns decoded whole", k,
+                        (unsigned long long)ec.materialized);
+        TEST_ASSERT_FMT(ray_group_test_flat_copies() == f0, "shape %zu: a parted column flattened", k);
+        ray_t* got = ray_read_splayed(out, sym);
+        TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+        TEST_ASSERT_FMT(fmt_same(src, got, "(select {from: t where: (> a 0)})"),
+                        "shape %zu: the written table is not the in-memory copy", k);
+        ray_release(got);
+        ray_release(src);
+    }
+    PASS();
+}
+
+/* A hand-built wrapper's missing segment is written as its partition's
+ * nulls when the table carries the partition key, and refused (domain,
+ * nothing written) when a projection without the key leaves its rows
+ * unknown. */
+static test_result_t test_splay_set_missing_segment(void) {
+    TEST_ASSERT_TRUE(write_db(ray_test_tmp(PR_TMP "/miss"), 0, false));
+    ray_t* src = load_db(ray_test_tmp(PR_TMP "/miss"));
+    TEST_ASSERT_NOT_NULL(src);
+    ray_t* b = ray_table_col(src, ray_sym_intern("b", 1));
+    TEST_ASSERT_TRUE(b && RAY_IS_PARTED(b->type) && b->len == 3);
+    ray_t* w = ray_alloc(3 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(w);
+    w->type = b->type; w->len = 3; w->attrs = 0; memset(w->aux, 0, 16);
+    for (int i = 0; i < 3; i++) {
+        ray_t* s = i == 1 ? NULL : ((ray_t**)ray_data(b))[i];
+        if (s) ray_retain(s);
+        ((ray_t**)ray_data(w))[i] = s;
+    }
+    ray_t* keyed = ray_table_new(3);
+    keyed = ray_table_add_col(keyed, ray_table_col_name(src, 0), ray_table_col_idx(src, 0));
+    keyed = ray_table_add_col(keyed, ray_sym_intern("a", 1), ray_table_col(src, ray_sym_intern("a", 1)));
+    keyed = ray_table_add_col(keyed, ray_sym_intern("b", 1), w);
+    TEST_ASSERT_TRUE(keyed && !RAY_IS_ERR(keyed));
+    ray_t* bare = ray_table_new(2);
+    bare = ray_table_add_col(bare, ray_sym_intern("a", 1), ray_table_col(src, ray_sym_intern("a", 1)));
+    bare = ray_table_add_col(bare, ray_sym_intern("b", 1), w);
+    TEST_ASSERT_TRUE(bare && !RAY_IS_ERR(bare));
+    ray_release(w);
+    char out[300];
+    snprintf(out, sizeof out, "%s/out", ray_test_tmp(PR_TMP "/miss"));
+    TEST_ASSERT_EQ_I(ray_splay_save(keyed, out, NULL), RAY_OK);
+    ray_t* got = ray_read_splayed(out, NULL);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    TEST_ASSERT_TRUE(fmt_same(keyed, got, "(select {from: t})"));
+    bind_t(got);
+    ray_t* nn = ray_eval_str("(count (select {from: t where: (nil? b)}))");
+    bind_t(NULL);
+    TEST_ASSERT_TRUE(nn && !RAY_IS_ERR(nn) && nn->i64 == 6);   /* 2 rows of the missing segment, 4 saved nulls */
+    drop_out(nn);
+    ray_release(got);
+    char out2[300];
+    snprintf(out2, sizeof out2, "%s/out2", ray_test_tmp(PR_TMP "/miss"));
+    TEST_ASSERT_EQ_I(ray_splay_save(bare, out2, NULL), RAY_ERR_DOMAIN);
+    TEST_ASSERT_FALSE(ray_splay_has_schema(out2));
+    ray_release(keyed); ray_release(bare); ray_release(src);
+    PASS();
+}
+
+/* A hand-built parted SYM column whose segments resolve over two different
+ * symfiles: each segment's ids are read in its own domain (the writer's id
+ * cache is per source domain), so every cell keeps its string. */
+static test_result_t test_splay_set_mixed_domains(void) {
+    char qa[512], qb[512];
+    snprintf(qa, sizeof qa, "(.db.splayed.set \"%s/2024.01.01/t/\" (table [a s] (list [1 2 3] ['x 'y 'x])))",
+             ray_test_tmp(PR_TMP "/mda"));
+    snprintf(qb, sizeof qb, "(.db.splayed.set \"%s/2024.01.01/t/\" (table [a s] (list [4 5] ['m 'n])))",
+             ray_test_tmp(PR_TMP "/mdb"));
+    TEST_ASSERT_TRUE(ev_ok(qa) && ev_ok(qb));
+    ray_t* ta = ray_read_parted(ray_test_tmp(PR_TMP "/mda"), "t");
+    ray_t* tb = ray_read_parted(ray_test_tmp(PR_TMP "/mdb"), "t");
+    TEST_ASSERT_TRUE(ta && !RAY_IS_ERR(ta) && tb && !RAY_IS_ERR(tb));
+    ray_t* sa = ray_table_col(ta, ray_sym_intern("s", 1));
+    ray_t* sb = ray_table_col(tb, ray_sym_intern("s", 1));
+    TEST_ASSERT_TRUE(sa && RAY_IS_PARTED(sa->type) && sb && RAY_IS_PARTED(sb->type));
+    ray_t* s0 = ((ray_t**)ray_data(sa))[0];
+    ray_t* s1 = ((ray_t**)ray_data(sb))[0];
+    TEST_ASSERT_TRUE(ray_sym_vec_domain(s0) != ray_sym_vec_domain(s1));
+    ray_t* w = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(w);
+    w->type = sa->type; w->len = 2; w->attrs = 0; memset(w->aux, 0, 16);
+    ray_retain(s0); ray_retain(s1);
+    ((ray_t**)ray_data(w))[0] = s0;
+    ((ray_t**)ray_data(w))[1] = s1;
+    ray_t* t = ray_table_new(1);
+    t = ray_table_add_col(t, ray_sym_intern("s", 1), w);
+    ray_release(w);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    char out[300], sym[320];
+    snprintf(out, sizeof out, "%s/out", ray_test_tmp(PR_TMP "/mda"));
+    snprintf(sym, sizeof sym, "%s/.sym", out);
+    TEST_ASSERT_EQ_I(ray_splay_save(t, out, sym), RAY_OK);
+    ray_t* got = ray_read_splayed(out, sym);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
+    ray_t* gs = ray_table_get_col_idx(got, 0);
+    TEST_ASSERT_TRUE(gs && gs->type == RAY_SYM && gs->len == 5);
+    static const char* const want[] = { "x", "y", "x", "m", "n" };
+    for (int64_t i = 0; i < 5; i++) {
+        ray_t* c = ray_sym_vec_cell(gs, i);
+        TEST_ASSERT_FMT(c && ray_str_len(c) == 1 && ray_str_ptr(c)[0] == want[i][0],
+                        "row %lld: %.*s, want %s", (long long)i, c ? (int)ray_str_len(c) : 1,
+                        c ? ray_str_ptr(c) : "?", want[i]);
+    }
+    ray_release(got); ray_release(t); ray_release(ta); ray_release(tb);
+    PASS();
+}
+
 const test_entry_t parted_ragged_entries[] = {
+    { "parted_ragged/splay_set_streams",    test_splay_set_streams,    pr_setup, pr_teardown },
+    { "parted_ragged/splay_set_missing_seg", test_splay_set_missing_segment, pr_setup, pr_teardown },
+    { "parted_ragged/splay_set_mixed_doms", test_splay_set_mixed_domains, pr_setup, pr_teardown },
     { "parted_ragged/key_position",         test_partition_key_position, pr_setup, pr_teardown },
     { "parted_ragged/fill_every_type",      test_fill_every_type,      pr_setup, pr_teardown },
     { "parted_ragged/issue_repro",          test_issue_repro,          pr_setup, pr_teardown },
