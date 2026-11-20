@@ -306,6 +306,20 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 !!! note "Performance note"
     Join key columns must be symbol (`RAY_SYM`) or numeric. Symbol columns are dictionary-encoded integers and join fastest. String (`RAY_STR`) key columns are **not** supported — a join keyed on a string column raises `nyi`. Convert string keys to symbols (`(as 'sym col)`) before joining.
 
+### Parallel probe floor
+
+An inner, left or full join whose right side has at most 65536 rows takes the small-input (chained) path. It builds a hash table over the right side and probes it with the left side in morsels of 8192 rows. By default the probe goes to the thread pool once the left side has more than one morsel, from 8193 rows. Most other parallel operators start at 65536 rows.
+
+That default favours latency. A small probe split across many workers finishes sooner but costs more CPU in total, mostly because the main thread spins while it waits for the slowest worker. For a service that is not latency-bound, [`.sys.join.par.min`](../namespaces/sys.md#sys-join-par-min) raises the floor so that smaller probes run on the calling thread:
+
+```lisp
+(.sys.join.par.min 65536)   ;; probes under 65536 left rows stay serial
+```
+
+Measured on joins below 65536 rows, a floor of 65536 costs about 2.6x the wall time for about 44% less CPU. The gain depends on how much work each probed row does. A join against a few keys, where the [prefilter](#how-joins-compile-to-the-dag) drops most left rows before they are hashed, saves about half its CPU at much the same wall time. A join where every left row matches saves 20–40% of its CPU and takes 1.3–2.8x as long. Joins above the floor, and joins whose right side is over 65536 rows (the radix path), are unchanged. The result is the same at any floor, rows and row order included.
+
+`-c` and this floor control different things. `-c` sets how many threads the pool has. The floor sets how large a join must be before it uses them. With a raised floor, the pool is still there for an occasional large job while the steady small joins run serially.
+
 ## Quick Reference
 
 | Function | Syntax | Description |
