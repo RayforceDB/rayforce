@@ -4279,7 +4279,8 @@ static test_result_t test_agg_topk_ask_ahead(void) {
 /* The route gate of a distinct count (#760) samples before the select
  * runs: the rows a where: keeps (query_cd_gate_where_rows), the key and
  * value columns at them (agg_group_card_sample), and a key column whole
- * when the sample leaves its count open (ray_cd_two_pass_preferred).  Over
+ * when the sample leaves its count open (ray_cd_two_pass_preferred; the
+ * sparse selection below is answered on its sample, #900).  Over
  * a mapped table whose pages were evicted each page read is asked for
  * ahead, in parallel, as the select's own scan asks for its — the bytes
  * asked for (ray_vm_willneed_bytes) cover what the step reads, and its
@@ -4401,10 +4402,9 @@ static test_result_t test_cd_gate_read_ahead(void) {
     /* The gate over a selection sparser than a row per page: the pages of
      * the sampled rows alone are asked for.  k3 (272 MB, 66,406 pages; a
      * million values) over 33,000 rows, one to every other page: 32,768
-     * of them are sampled, read as distinct, and the estimate stands at
-     * the span, a million — past the sample's reach and short of the
-     * many-groups mark — so the count is confirmed in full, over the half
-     * of the column the estimate never touched. */
+     * of them are sampled and read as distinct, groups of a row each,
+     * which take the rewrite on the sample (#900) — the column is not
+     * counted whole. */
     enum { N3 = 34000000, SEL3 = 33000 };
     r = ray_eval_str(ray_test_tmp(
         "(set pfs_j (til 34000000))"
@@ -4431,12 +4431,13 @@ static test_result_t test_cd_gate_read_ahead(void) {
     long f_gate = cd_major_faults() - f0;
     uint64_t b_gate = ray_vm_willneed_bytes() - b0;
     free(sel);
-    TEST_ASSERT_FALSE(two_pass);   /* a million groups counted, not many: the slices */
-    /* the sampled rows' pages of k3 (one each) for the estimate, and k3
-     * whole for the count; x3 besides */
-    const uint64_t b_need = (uint64_t)N3 * 8 + (uint64_t)SEL3 * 4096;
-    TEST_ASSERT_FMT(b_gate >= b_need, "gate asked for %llu bytes, needs %llu",
-                    (unsigned long long)b_gate, (unsigned long long)b_need);
+    TEST_ASSERT_TRUE(two_pass);
+    /* the sampled rows' pages of k3 (one each) and x3 besides, not k3
+     * whole */
+    const uint64_t b_need = (uint64_t)AGG_EST_SAMPLE_ROWS * 4096;
+    TEST_ASSERT_FMT(b_gate >= b_need && b_gate < (uint64_t)N3 * 8,
+                    "gate asked for %llu bytes, needs %llu, k3 is %llu", (unsigned long long)b_gate,
+                    (unsigned long long)b_need, (unsigned long long)N3 * 8);
     TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);
 
     ray_release(m);
@@ -5135,6 +5136,22 @@ static test_result_t test_cd_route(void) {
     k[0] = ray_eval_str("(% cr 100000)");
     x = ray_eval_str("(% cr 200000)");
     TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+
+    /* groups of a few rows take the rewrite whatever the tuples dedup
+     * (#900): 349,525 groups of 3 rows beside a value of its own on every
+     * row, within the band, and 100,000 groups of 3 rows over 300,000,
+     * below it; 174,763 groups of 6 rows take the slices */
+    k[0] = ray_eval_str("(% cr 349525)");
+    x = ray_eval_str("cr");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]);
+    k[0] = ray_eval_str("(% cr 174763)");
+    TEST_ASSERT_FALSE(ray_cd_two_pass_preferred(k, 1, x, NULL, N, 0, 28));
+    ray_release(k[0]); ray_release(x);
+    k[0] = ray_eval_str("(% (til 300000) 100000)");
+    x = ray_eval_str("(til 300000)");
+    TEST_ASSERT_TRUE(ray_cd_two_pass_preferred(k, 1, x, NULL, 300000, 0, 28));
     ray_release(k[0]); ray_release(x);
 
     /* 524,288 groups of 19 rows over 10 M rows, within the band: the

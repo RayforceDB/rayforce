@@ -851,7 +851,8 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * post-group row→group map and a per-group dedup over the slices (the
  * global-hash kernel past 50 K groups).  Up to CD_SCATTER_MAX_GROUPS groups
  * it is the route whenever the rewrite's (K, X) grouping would not be
- * dense; past CD_SCATTER_MANY_GROUPS its map and kernel fall behind the
+ * dense and the groups hold more than a few rows each (CD_SCATTER_FEW_ROWS);
+ * past CD_SCATTER_MANY_GROUPS its map and kernel fall behind the
  * rewrite's radix grouping whatever that grouping dedups; between the two
  * the tuple count decides. */
 #define CD_SCATTER_MAX_GROUPS  (256 * 1024)
@@ -866,6 +867,21 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * 138, uniform groups 89 against 140 (12 M rows surviving a filter over
  * 100 M; the issue's 45 groups hold 2% each). */
 #define CD_SCATTER_SKEW 8
+
+/* Groups of a few rows each: the scatter's row map and per-group dedup cost
+ * the same per group whatever it holds, while the rewrite's (K, X) pass is
+ * no more than the rows.  Past this many groups for every CD_SCATTER_FEW_ROWS
+ * rows the rewrite is the route, whatever the tuples dedup: at 1.4 M rows
+ * surviving a filter over 10 M, 835 K groups of distinct values took 16 ms on
+ * the rewrite against 21 on the scatter (the search phrases of the hits
+ * table, 835 K groups of 1.4 M rows, 12 against 22), 400 K groups 16 against
+ * 17; 100 K groups of 300 K rows 5.0 against 8.4; 900 K groups of 3 M rows
+ * 26 against 31.  At 5 to 6 rows a group it is about even, at 6 and more the
+ * scatter takes less time and memory (835 K groups of 5 M rows, 45 against
+ * 49 ms; 300 K of 5 M, 37 against 45).  The group count is a sampled
+ * estimate that errs low on a key of many singletons, towards the scatter
+ * (#900). */
+#define CD_SCATTER_FEW_ROWS 4
 
 /* Whether the two-pass rewrite (group by (K, X), then count per K; query.c)
  * beats grouping by K and counting distinct X over each group's slice — the
@@ -882,7 +898,8 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * at 750 K groups whose (K, X) tuples were as many as the rows the scatter
  * took 1.3x less time and 1.9x less memory, and at 750 K groups whose
  * tuples were a sixth of the rows the rewrite took 1.3x less time; below
- * 256 K groups the scatter is the route (#756).  Few groups do not favour
+ * 256 K groups the scatter is the route (#756) unless the groups hold a few
+ * rows each (CD_SCATTER_FEW_ROWS, #900).  Few groups do not favour
  * the rewrite: at 2 to 9 groups of 3 M to 6 M values on 28 workers the
  * slice dedup took the same time or less and 40% of the memory, and the
  * issue's 45 groups on 46 workers would otherwise have taken the rewrite at
@@ -942,6 +959,8 @@ bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
     if (k_span <= nrows / x_est) return true;        /* dense: a direct-index dedup */
     /* a dominant group: the scatter would dedup it on one worker */
     if (workers > 1 && k_max > nrows / workers * CD_SCATTER_SKEW) return true;
+    /* groups of a few rows: the scatter pays per group, the rewrite per row */
+    if (k_card >= nrows / CD_SCATTER_FEW_ROWS) return true;
     if (k_card > CD_SCATTER_MANY_GROUPS) return true;
     /* the slices on a count the sample cannot vouch for (more sampled
      * singletons than the Chao1's repeats explain: any count past the
