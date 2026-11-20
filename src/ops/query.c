@@ -11648,6 +11648,9 @@ static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_
     ray_t *firstv = NULL, *perm = NULL, *out = NULL;
     const int64_t* pos = NULL;
 
+    /* A cancelled dispatch skips the tasks it has not started: each output
+     * is read only after a check, and a cancel answers `cancel`. */
+#define CD_FIRSTN_CHECK() do { if (pool_cancelled(pool)) goto cancel; } while (0)
     if (want <= CD_FIRSTN_SET_MAX) {
         c.bits = 4;
         while (((int64_t)1 << c.bits) < want * 2) c.bits++;
@@ -11667,6 +11670,7 @@ static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_
             memset(c.out, 0xff, (size_t)want * sizeof(int64_t));
             if (par) ray_pool_dispatch(pool, cd_firstn_rank_fn, &c, n_res);
             else cd_firstn_rank_fn(&c, 0, 0, n_res);
+            CD_FIRSTN_CHECK();
             pos = c.out;
         }
         scratch_free(keys_hdr); keys_hdr = NULL;
@@ -11684,25 +11688,30 @@ static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_
         c.out = (int64_t*)ray_data(firstv);
         if (par) ray_pool_dispatch(pool, cd_firstn_clear_fn, &c, (int64_t)cap);
         else cd_firstn_clear_fn(&c, 0, 0, (int64_t)cap);
+        CD_FIRSTN_CHECK();   /* the build's claims need every slot empty */
         bool par_rows = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
         c.n_tasks = par_rows ? (int64_t)ray_pool_total_workers(pool) * 4 : 1;
         if (c.n_tasks > c.n_segs) c.n_tasks = c.n_segs > 0 ? c.n_segs : 1;
         if (par) ray_pool_dispatch(pool, cd_firstn_build_fn, &c, n_res);
         else cd_firstn_build_fn(&c, 0, 0, n_res);
+        CD_FIRSTN_CHECK();
         if (c.n_tasks > 1) ray_pool_dispatch_n(pool, cd_firstn_scan_fn, &c, (uint32_t)c.n_tasks);
         else cd_firstn_scan_fn(&c, 0, 0, 1);
+        CD_FIRSTN_CHECK();
         if (par) ray_pool_dispatch(pool, cd_firstn_out_fn, &c, n_res);
         else cd_firstn_out_fn(&c, 0, 0, n_res);
+        CD_FIRSTN_CHECK();
         scratch_free(slot_hdr); slot_hdr = NULL;
         scratch_free(keys_hdr); keys_hdr = NULL;
         if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
         uint8_t asc = 0;
         perm = ray_sort_indices(&firstv, &asc, NULL, 1, n_res);
-        if (!perm || RAY_IS_ERR(perm)) {
-            ray_release(firstv);
-            ray_release(result);
-            return perm ? perm : ray_error("oom", NULL);
+        if (perm && RAY_IS_ERR(perm)) {
+            out = perm; perm = NULL;
+            goto fail;
         }
+        if (!perm) goto oom;
+        CD_FIRSTN_CHECK();
         /* cannot happen: every group has a selected row */
         if (((int64_t*)ray_data(firstv))[((int64_t*)ray_data(perm))[want - 1]] == INT64_MAX) {
             ray_release(firstv); ray_release(perm);
@@ -11711,6 +11720,7 @@ static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_
         ray_release(firstv); firstv = NULL;
         pos = (const int64_t*)ray_data(perm);
     }
+#undef CD_FIRSTN_CHECK
 
     int64_t nc = ray_table_ncols(result);
     out = ray_table_new(nc);
@@ -11726,13 +11736,19 @@ static ray_t* cd_first_n_pick(ray_t* result, ray_t** K_cols, const int64_t* key_
     if (perm) ray_release(perm);
     ray_release(result);
     return out;
+cancel:
+    out = ray_error("cancel", NULL);
+    goto fail;
 oom:
+    out = ray_error("oom", NULL);
+fail:
     if (keys_hdr) scratch_free(keys_hdr);
     if (slot_hdr) scratch_free(slot_hdr);
     if (out_hdr) scratch_free(out_hdr);
     if (firstv && !RAY_IS_ERR(firstv)) ray_release(firstv);
+    if (perm) ray_release(perm);
     ray_release(result);
-    return ray_error("oom", NULL);
+    return out;
 }
 #undef CD_FIRSTN_ROWS
 

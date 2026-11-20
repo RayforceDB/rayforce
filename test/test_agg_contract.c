@@ -5732,6 +5732,96 @@ static test_result_t test_cd_first_n_take(void) {
     PASS();
 }
 
+/* Cancellation under the rewrite's first-N pick.  The pool skips every
+ * ticket of a cancelled query, so a dispatch the cancel lands before writes
+ * none of its output: the ranks of the small set's probe, the emptied
+ * table, the built entries, the first rows, their copy for the sort, the
+ * sort's permutation.  Each query, the rewrite forced, runs once per
+ * dispatch it makes with the cancel landing right before that dispatch
+ * (ray_pool_test_cancel_at, both modes), over blocks filled with garbage
+ * (ray_heap_test_scribble): each run is `cancel` leaving no block behind,
+ * or the answer, never a pick read from unwritten buffers (a permutation
+ * of garbage indexed the first rows out of bounds).  The small set (take
+ * 5), past it (100000 of 150000 groups) and every group (200000).  No
+ * where: until the gate's sample of it checks for a cancel (#1246).
+ * Pinned at 8 workers. */
+/* Blocks live over every heap: a worker's block the main thread frees
+ * counts its alloc on one heap and its free on another. */
+static int64_t cdn_live_blocks(void) {
+    int64_t live = 0;
+    for (int h = 0; h < RAY_HEAP_REGISTRY_SIZE; h++) {
+        ray_heap_t* hp = ray_heap_registry[h];
+        if (hp) live += (int64_t)hp->stats.alloc_count - (int64_t)hp->stats.free_count;
+    }
+    return live;
+}
+
+static test_result_t test_cd_first_n_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str("(set zi (til 150000))"
+        " (set Tz (table [kh k2 x i] (list (% (* zi 7919) 200003) (% zi 7) (% zi 1000) (% zi 997))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    static const char* const qs[] = {
+        "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 5})",
+        "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 100000})",
+        "(select {u: (count (distinct x)) from: Tz by: [kh k2] take: 200000})",
+    };
+    int cancelled = 0, answered = 0;
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        ray_query_test_cd_route(1);
+        ray_t* ref = ray_eval_str(qs[i]);
+        TEST_ASSERT_FMT(ref && !RAY_IS_ERR(ref) && ref->type == RAY_TABLE, "%s", qs[i]);
+        ray_t* fr = ray_fmt(ref, 0);
+        ray_release(ref);
+        ray_heap_test_scribble(true);
+        /* mode 0, a cancel request, up to the first run that answers (armed
+         * past the query's last dispatch); mode 1, the pool's flag alone,
+         * over those dispatches */
+        int last = 96;
+        for (int mode = 0; mode < 2; mode++)
+            for (int k = 1; k <= last; k++) {
+                ray_heap_gc();
+                int64_t live0 = cdn_live_blocks();
+                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_t* got = ray_eval_str(qs[i]);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                atomic_store_explicit(&ray_pool_get()->cancelled, 0, memory_order_relaxed);
+                bool ok = got != NULL;
+                if (ok && RAY_IS_ERR(got)) {
+                    ok = strcmp(ray_err_code(got), "cancel") == 0;
+                    ray_error_free(got);
+                    ray_heap_gc();
+                    int64_t live = cdn_live_blocks() - live0;
+                    if (!ok || live) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); }
+                    TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: an error other than cancel",
+                                    qs[i], mode, k);
+                    TEST_ASSERT_FMT(live == 0, "%s, mode %d, cancel before dispatch %d: %lld blocks left",
+                                    qs[i], mode, k, (long long)live);
+                    cancelled++;
+                    continue;
+                }
+                ray_t* fg = ok ? ray_fmt(got, 0) : NULL;
+                if (got) ray_release(got);
+                ok = fg && fr && ray_str_len(fg) == ray_str_len(fr) &&
+                     memcmp(ray_str_ptr(fg), ray_str_ptr(fr), ray_str_len(fr)) == 0;
+                if (fg) ray_release(fg);
+                if (!ok) { ray_heap_test_scribble(false); ray_query_test_cd_route(0); }
+                TEST_ASSERT_FMT(ok, "%s, mode %d, cancel before dispatch %d: not the answer", qs[i], mode, k);
+                answered++;
+                if (mode == 0) { last = k - 1; break; }
+            }
+        ray_heap_test_scribble(false);
+        if (fr) ray_release(fr);
+    }
+    ray_query_test_cd_route(0);
+    TEST_ASSERT_FMT(cancelled > 0 && answered > 0, "%d cancelled, %d answered", cancelled, answered);
+    ray_t* r = ray_eval_str("(set Tz 0) (set zi 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
 /* A top-N cut over a partitioned dense slab (agg_dense_lean_select) keeps
  * the groups tied at the threshold that the stable sort would take — tied
  * exactly, not as doubles: 64-bit values past 2^53 that a double cannot tell
@@ -5792,6 +5882,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
     { "agg_contract/cd_first_n_take", test_cd_first_n_take, contract_setup, contract_teardown },
+    { "agg_contract/cd_first_n_cancel_at_dispatch", test_cd_first_n_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/topn_ties_exact", test_topn_ties_exact, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
