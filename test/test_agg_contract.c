@@ -5616,13 +5616,14 @@ static test_result_t test_cd_route_key_proj(void) {
  * group in key order, and the rewrite picks the first N seen out of them.
  * Keys whose first-seen order is not their key order (k*7919 mod m), with
  * and without a where:, a key with nulls, a SYM key, a composite key, a
- * take past the group count and past the pick's small set (2000), and a
- * key whose 4th group first shows past the small set's row budget (kl);
- * the last two find every group's first row instead.  Flat at 3,000 and
- * 300,000 rows, and parted (which the rewrite declines).  The answer is
- * the groups' keys and counts ordered by first selected row, the count
- * taken over an expression (not the rewrite's shape).  Pinned at 8
- * workers. */
+ * take past the group count (2000 over 40 groups; 200000 over kl's 150003
+ * at 300,000 rows, past the pick's small set: every group, in first-seen
+ * order, as `(count x)` gives them), and a key whose 4th group first shows
+ * past the small set's row budget (kl, take 5).  Flat at 3,000 and 300,000
+ * rows, and parted (which the rewrite declines).  The answer is the
+ * groups' keys and counts ordered by first selected row, the count taken
+ * over an expression (not the rewrite's shape); `(count x)` under the same
+ * take keeps the same groups in the same order.  Pinned at 8 workers. */
 static test_result_t test_cd_first_n_take(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
@@ -5638,7 +5639,7 @@ static test_result_t test_cd_first_n_take(void) {
         { "s", "(at R 's)" },
         { "[k k2]", "(at R 'k) (at R 'k2)" }, { "[s k2]", "(at R 's) (at R 'k2)" },
     };
-    static const int takes[] = { 5, 2000 };
+    static const int takes[] = { 5, 2000, 200000 };
     for (size_t m = 0; m < sizeof mk / sizeof mk[0] + 1; m++) {
         bool parted = m == sizeof mk / sizeof mk[0];
         char src[1024];
@@ -5681,6 +5682,23 @@ static test_result_t test_cd_first_n_take(void) {
                     TEST_ASSERT_FMT(want && !RAY_IS_ERR(want), "%s", ref);
                     ray_t* fw = ray_fmt(want, 0);
                     ray_release(want);
+                    /* the keys alone, and those of `(count x)` under the take */
+                    snprintf(ref, sizeof ref, "(do (set R (take Of (min %d (count Of)))) (list %s))",
+                             takes[n], ks[k].cols);
+                    ray_t* wk = ray_eval_str(ref);
+                    snprintf(q, sizeof q, "(do (set R (select {from: Tf%s by: %s c: (count x) take: %d}))"
+                             " (list %s))", wh[w], ks[k].by, takes[n], ks[k].cols);
+                    ray_t* ck = ray_eval_str(q);
+                    TEST_ASSERT_FMT(wk && !RAY_IS_ERR(wk) && ck && !RAY_IS_ERR(ck), "%s", q);
+                    ray_t* fwk = ray_fmt(wk, 0);
+                    ray_t* fck = ray_fmt(ck, 0);
+                    ray_release(wk); ray_release(ck);
+                    bool csame = fwk && fck && ray_str_len(fwk) == ray_str_len(fck) &&
+                                 memcmp(ray_str_ptr(fwk), ray_str_ptr(fck), ray_str_len(fwk)) == 0;
+                    TEST_ASSERT_FMT(csame, "size %zu: %s: %.160s, first seen %.160s", m, q,
+                                    fck ? ray_str_ptr(fck) : "", fwk ? ray_str_ptr(fwk) : "");
+                    if (fwk) ray_release(fwk);
+                    if (fck) ray_release(fck);
                     for (int r = 0; r < (parted ? 1 : 2); r++) {   /* the gate, the rewrite; parted: never the rewrite */
                         snprintf(q, sizeof q, "(do (set R (select {from: Tf%s by: %s u: (count (distinct x))"
                                  " take: %d})) (list %s (at R 'u)))", wh[w], ks[k].by, takes[n], ks[k].cols);
