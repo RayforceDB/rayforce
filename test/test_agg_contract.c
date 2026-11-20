@@ -3478,9 +3478,11 @@ static test_result_t test_group_where_order_dependent(void) {
 }
 
 /* An unordered keyed take keeps the first N groups in first-seen order
- * (pipeline.md) when a group input is a running function too (#1234).  It
- * used to fall to the legacy path, which emits the groups in key order,
- * because the expression bridge could not name the function's columns.  Flat
+ * (pipeline.md) when a group input is a running function or holds a
+ * one-element vector constant too (#1234).  Both used to fall to the legacy
+ * path, which emits the groups in key order: a running function because the
+ * expression bridge could not name its columns, a `[2]` under a sparse
+ * where: because the bridge evaluated it over the uncompacted table.  Flat
  * and parted, with and without a where:, at sizes that take the parallel
  * routes.  The kept keys are the first N distinct keys of the materialized
  * where:, and each kept group's value is the whole-table answer (#916): the
@@ -3505,6 +3507,7 @@ static test_result_t test_first_n_take_running_input(void) {
      * (the first-N pre-pass serves integer inputs; a float sum regroups) */
     static const struct { const char* agg; const char* in; bool ints; } aggs[] = {
         { "max", "(sums i)", true }, { "sum", "(deltas i)", true }, { "sum", "(mavg 2 i)", false },
+        { "sum", "(* v [2])", true }, { "max", "(+ i [7])", true },
     };
     /* where: ("" for none), and whether the selected rows reach the first-N
      * pre-pass's parallel threshold */

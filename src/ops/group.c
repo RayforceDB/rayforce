@@ -14674,9 +14674,21 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * at full length (the final gather only compacts tables, but the
              * node's own paths need not see the selection). */
             ray_t* saved_sel = g->selection;
+            ray_t* saved_tbl = g->table;
+            /* An input that reads only its own row reads the group's table,
+             * which a sparse where: may have compacted to its survivors
+             * (group_sel_precompact); over g->table it came back at the
+             * table's length and the group fell to the legacy path (#1234).
+             * An input that reads other rows keeps g->table: it runs over
+             * the whole table, and a length that differs from tbl's keeps
+             * the legacy path. */
+            int64_t rl_syms[64];
+            if (tbl != g->table && group_expr_src_syms(g, in->id, rl_syms, 64) >= 0)
+                g->table = tbl;
             g->selection = NULL;
             v = ray_execute(g, in);
             g->selection = saved_sel;
+            g->table = saved_tbl;
         }
         if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
             if (v && !RAY_IS_ERR(v)) ray_release(v);
