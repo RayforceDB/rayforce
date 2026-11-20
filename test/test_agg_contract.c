@@ -4439,6 +4439,44 @@ static test_result_t test_cd_gate_read_ahead(void) {
                     "gate asked for %llu bytes, needs %llu, k3 is %llu", (unsigned long long)b_gate,
                     (unsigned long long)b_need, (unsigned long long)N3 * 8);
     TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);
+    ray_release(m);
+    r = ray_eval_str("(set pfs_m 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(ray_test_tmp(PFS_ROOT));
+
+    /* The count in full asks for its column ahead.  k4 (80 MB, 40,000
+     * values) over a slice of 100,000 rows standing for 10 M: the estimate
+     * asks for the slice's span alone and reads 40,000 groups, past the
+     * sample's reach, short of a few rows each — so k4 is counted whole,
+     * the rest of the column still cold, and asked for (40,000 values, not
+     * many: the slices). */
+    enum { N4 = 10000000, SL4 = 100000 };
+    r = ray_eval_str(ray_test_tmp(
+        "(set pfs_j (til 10000000))"
+        "(set pfs_t (table [k4 x4] (list (% pfs_j 40000) (% (* pfs_j 7919) 10000019))))"
+        "(set pfs_j 0)"
+        "(.db.splayed.set \"" PFS_DIR "\" pfs_t)"
+        "(set pfs_t 0)"
+        "(set pfs_m (.db.splayed.get \"" PFS_DIR "\"))"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_TRUE(pfs_evict() && !pfs_col_resident("k4"));
+    m = ray_eval_str("pfs_m");
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    ray_t* k4 = ray_table_get_col(m, ray_sym_intern("k4", 2));
+    ray_t* x4 = ray_table_get_col(m, ray_sym_intern("x4", 2));
+    TEST_ASSERT_TRUE(k4 && x4 && k4->mmod == 1 && x4->mmod == 1);
+    int64_t* sl4 = malloc((size_t)SL4 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(sl4);
+    for (int64_t i = 0; i < SL4; i++) sl4[i] = N4 / 2 + i;
+    b0 = ray_vm_willneed_bytes();
+    two_pass = ray_cd_two_pass_preferred(&k4, 1, x4, sl4, SL4, N4, 4);
+    uint64_t b_count = ray_vm_willneed_bytes() - b0;
+    free(sl4);
+    TEST_ASSERT_FALSE(two_pass);
+    TEST_ASSERT_FMT(b_count >= (uint64_t)N4 * 8 * 15 / 16, "count asked for %llu bytes, k4 is %llu",
+                    (unsigned long long)b_count, (unsigned long long)N4 * 8);
 
     ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
