@@ -16175,8 +16175,13 @@ static ray_t* select_strip_key_projections(ray_t* dict) {
         for (int64_t i = 0; i < j; i++)
             if (sym_cell_runtime_id(kv, i) == sym_cell_runtime_id(kv, j)) return NULL;
     static const char* const clause[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
-    int64_t cid[7];
-    for (int c = 0; c < 7; c++) cid[c] = ray_sym_intern(clause[c], strlen(clause[c]));
+    /* Interned once per symbol-table epoch (sym.h). */
+    static _Thread_local int64_t cid[7];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (int c = 0; c < 7; c++) cid[c] = ray_sym_intern(clause[c], strlen(clause[c]));
+        epoch = ray_sym_epoch();
+    }
     ray_t** v = (ray_t**)ray_data(vals);
     int64_t n_drop = 0;
     for (int64_t i = 0; i < nd; i++) {

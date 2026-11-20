@@ -4,8 +4,9 @@
 ;; every aggregate, a by-dict, where:, desc:/take:, and no aggregate at all.
 ;; The keys come first, in by: order, wherever the projections are written
 ;; and in whatever order (a single key's `{u: … a: a} by: a` still gives
-;; `[u a]`; that is left to its own issue).  A renamed or computed projection of a key is no identity
-;; projection and stays a per-group output.
+;; `[u a]`; that is left to its own issue, #1237).  A renamed or computed
+;; projection of a key is no identity projection and stays a per-group
+;; output.
 ;; columns, row count, types and values, all equal
 (set eqt (fn [x y] (and (== (count (cols x)) (count (cols y))) (all (== (cols x) (cols y))) (== (count x) (count y)) (all (map (fn [c] (and (== (type (at x c)) (type (at y c))) (all (== (at x c) (at y c))))) (cols x))))))
 ;; small: the layout of every variant
