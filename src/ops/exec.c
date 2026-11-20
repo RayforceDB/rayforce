@@ -2953,7 +2953,9 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * `deltas`, `mavg` and the rest): it runs over the whole table and the
  * group keeps the selected rows of it (#916, docs: running functions under
  * where:), so such an input must not be compacted first.  collect_scan_syms
- * declines it, as it declines a vector constant.
+ * declines it, as it declines a vector constant of more than one element
+ * (sliced per group over the table's rows); a one-element vector spreads
+ * like an atom and is admitted.
  * On success *tbl and *owned_tbl name the compacted table and the selection
  * is dropped; any decline or failure leaves both and the selection as
  * they were. */
@@ -2983,9 +2985,11 @@ static void group_sel_precompact(ray_graph_t* g, ray_op_t* op,
      * tradeoff (16x).  A keyless group (an all-aggregate select) is one
      * row and its aggregates read the selection themselves; compacted, a
      * no-match where: handed exec_group an empty table and it came back
-     * with no row (#679).  A vector constant under the inputs stands for a
-     * column of the whole table: collect_scan_syms declines it, so such a
-     * group keeps the lazy path. */
+     * with no row (#679).  A vector constant of more than one element
+     * under the inputs stands for a column of the whole table:
+     * collect_scan_syms declines it, so such a group keeps the lazy path.
+     * A one-element vector spreads over the rows like an atom and compacts
+     * with them. */
     if (!gx || gx->n_keys == 0 || !meta || nrows <= 0 ||
         meta->total_pass * (contig ? 2 : 4) > nrows)
         return;
