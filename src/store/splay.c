@@ -904,7 +904,7 @@ static ray_err_t splay_write_col(ray_t* col, const char* path, const char* name,
     uint8_t rec_kind = m.index_kind, rec_flags = 0;
     if (ray_is_vec(col)) ray_col_gen2_index_meta(col, &rec_kind, &rec_flags);
     if (w.gen == 2 && auto_index && ray_zone_acc_supported(m.type) &&
-        m.len >= RAY_ENC_CHUNK && rec_kind == 0)
+        ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, m.type) && m.len >= RAY_ENC_CHUNK && rec_kind == 0)
         w.index_kind = RAY_IDX_CHUNK_ZONE;
     /* generation 0 builds a STR DICT in the same pass (splay_build_index_col):
      * at least RAY_DICT_MIN_ROWS rows, unless a HASH takes the slot */
