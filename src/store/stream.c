@@ -86,6 +86,35 @@ bool ray_col_stream_stage_mem(ray_col_stream_t* w) {
 #endif
 }
 
+ray_err_t ray_col_stream_sym_width(ray_col_stream_t* w, uint8_t width) {
+    if (w->type != RAY_SYM || w->gen != 0 || !w->fp || w->ew || w->rows) return RAY_ERR_DOMAIN;
+    if (width > RAY_SYM_W32) return RAY_OK;       /* positions stay 32-bit */
+    w->attrs = (uint8_t)((w->attrs & ~RAY_SYM_W_MASK) | width);
+    w->pos_w = (uint8_t)(width + 1);
+    return RAY_OK;
+}
+
+/* n positions at the file's width: as they are at W32, else narrowed (a
+ * position past the width is a domain that grew after the width was set). */
+static ray_err_t stream_put_pos(ray_col_stream_t* w, const uint32_t* pos, int64_t n) {
+    uint8_t width = w->pos_w ? (uint8_t)(w->pos_w - 1) : RAY_SYM_W32;
+    if (width == RAY_SYM_W32)
+        return !n || fwrite(pos, sizeof(uint32_t), (size_t)n, w->fp) == (size_t)n ? RAY_OK : RAY_ERR_IO;
+    uint32_t max = width == RAY_SYM_W8 ? UINT8_MAX : UINT16_MAX;
+    union { uint8_t b8[8192]; uint16_t b16[8192]; } u;
+    for (int64_t off = 0; off < n; off += 8192) {
+        int64_t cnt = n - off < 8192 ? n - off : 8192;
+        for (int64_t i = 0; i < cnt; i++) {
+            uint32_t v = pos[off + i];
+            if (v > max) return RAY_ERR_RANGE;
+            if (width == RAY_SYM_W8) u.b8[i] = (uint8_t)v; else u.b16[i] = (uint16_t)v;
+        }
+        size_t esz = width == RAY_SYM_W8 ? 1 : 2;
+        if (fwrite(&u, esz, (size_t)cnt, w->fp) != (size_t)cnt) return RAY_ERR_IO;
+    }
+    return RAY_OK;
+}
+
 bool ray_col_stream_chunked_ok(const ray_col_stream_t* w) {
     return w->gen == 2 && w->type != RAY_STR && (w->type != RAY_SYM || w->dom) &&
            ray_encw_type_supported(w->type) && w->fp && !w->in_mem && !w->ew && !w->rows;
@@ -122,6 +151,7 @@ static void stream_drop_mem(ray_col_stream_t* w) {
 
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
+    if (w->lut_dom) ray_sym_domain_release(w->lut_dom);
     w->lut_id = NULL; w->lut_pos = NULL; w->lut_dom = NULL;
 }
 
@@ -140,6 +170,11 @@ static bool ray_col_stream_lut(ray_col_stream_t* w, struct ray_sym_domain_s* dom
         if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
     }
     memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
+    /* held while its ids are cached: a caller may drop the chunk (and its
+     * domain) between appends, and a new domain at the same address must
+     * not hit stale entries */
+    ray_sym_domain_retain(dom);
+    if (w->lut_dom) ray_sym_domain_release(w->lut_dom);
     w->lut_dom = dom;
     return true;
 }
@@ -213,7 +248,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return RAY_ERR_RANGE;
                 u.pos[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;
             }
-            if (fwrite(u.pos,sizeof(*u.pos),(size_t)count,w->fp) != (size_t)count) return RAY_ERR_IO;
+            ray_err_t pe = stream_put_pos(w, u.pos, count);
+            if (pe != RAY_OK) return pe;
         }
     } else if (w->type == RAY_STR) {
         uint64_t bytes = col->str_pool ? (uint64_t)col->str_pool->len : 0;
@@ -264,8 +300,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
             for (int64_t i = off; i < end; i++) lo = p[i] < lo ? p[i] : lo;
             if (!lo) w->had_nulls = true;
         }
-        if (n && fwrite(p, sizeof(uint32_t), (size_t)n, w->fp) != (size_t)n)
-            return RAY_ERR_IO;
+        ray_err_t pe = stream_put_pos(w, p, n);
+        if (pe != RAY_OK) return pe;
     } else if (w->type == RAY_SYM) {
         /* Encode cells as positions in the target symfile's domain:
          * resolve each cell through the chunk vec's own domain and
@@ -320,8 +356,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                  * non-SYM arm below propagated it (issue #416). */
                 if (pos == 0) w->had_nulls = true;
             }
-            if (fwrite(buf, sizeof(uint32_t), (size_t)cnt, w->fp) != (size_t)cnt)
-                return RAY_ERR_IO;
+            ray_err_t pe = stream_put_pos(w, buf, cnt);
+            if (pe != RAY_OK) return pe;
             off += cnt;
         }
     } else {

@@ -687,17 +687,18 @@ static int64_t splay_slot_rows(ray_t* col, const int64_t* cnt, int64_t ncnt) {
     return n;
 }
 
-/* Whether the writer below takes the slot: its type is a vector type, and
- * every segment is a plain vector of that type or a single-file encoded one;
- * the partition key has a key and a row count per partition. */
+/* Whether the writer below takes the slot: its type is a vector type (else
+ * nyi), every segment is a plain vector or a single-file encoded column of
+ * that type (a segment of another type: domain, a parted one: nyi), and the
+ * partition key has a key and a row count per partition. */
 static ray_err_t splay_parted_preflight(ray_t* col) {
     int8_t t = splay_slot_type(col);
     if (!ray_is_vector_type(t)) return RAY_ERR_NYI;
     if (col->attrs & RAY_ATTR_SLICE) return RAY_ERR_NYI;
     if (col->type == RAY_MAPCOMMON) {
         ray_t** p = (ray_t**)ray_data(col);   /* not-a-table: keys, row counts */
-        return (p[1] && !RAY_IS_ERR(p[1]) && p[1]->type == RAY_I64 && p[1]->len == p[0]->len)
-            ? RAY_OK : RAY_ERR_CORRUPT;
+        return (p[0] && !RAY_IS_ERR(p[0]) && p[1] && !RAY_IS_ERR(p[1]) && p[1]->type == RAY_I64 &&
+                p[1]->len == p[0]->len) ? RAY_OK : RAY_ERR_CORRUPT;
     }
     ray_t* w = splay_parted_wrapper(col);
     ray_t** segs = (ray_t**)ray_data(w);
@@ -705,7 +706,9 @@ static ray_err_t splay_parted_preflight(ray_t* col) {
         ray_t* s = segs[i];
         if (!s) continue;
         if (RAY_IS_ERR(s)) return ray_err_from_obj(s);
-        if (s->type == RAY_ENCCOL ? ray_enccol_is_parted(s) : s->type != t) return RAY_ERR_NYI;
+        if (s->type == RAY_ENCCOL && ray_enccol_is_parted(s)) return RAY_ERR_NYI;
+        /* a segment read as another type would be copied at the wrong width */
+        if ((s->type == RAY_ENCCOL ? ray_enccol_of(s)->type : s->type) != t) return RAY_ERR_DOMAIN;
     }
     return RAY_OK;
 }
@@ -840,6 +843,10 @@ static ray_err_t splay_write_parted_col(ray_t* tbl, ray_t* col, const char* dir,
     int8_t type = splay_slot_type(col);
     ray_col_stream_t w;
     ray_err_t e = ray_col_stream_open(&w, dir, name_id, type, dom, gen);
+    /* the vocabulary is merged already: the domain's count is final, so
+     * generation 0 stores positions at its width, as a flat save does */
+    if (e == RAY_OK && type == RAY_SYM && gen == 0)
+        e = ray_col_stream_sym_width(&w, ray_sym_dict_width(ray_sym_domain_count(dom)));
     if (e == RAY_OK && auto_index) e = ray_col_stream_index_begin(&w, 0);
     if (e == RAY_OK && col->type == RAY_MAPCOMMON) {
         e = splay_feed_keys(&w, col);

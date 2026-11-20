@@ -39,14 +39,18 @@ typedef struct {
      * symbol decode) and needs no translation. */
     int64_t*  lut_id;    /* [COL_STREAM_LUT] source id per slot, -1 empty */
     uint32_t* lut_pos;   /* [COL_STREAM_LUT] position per slot */
-    /* the domain the cached ids resolve over: the runtime one, or a file
-     * domain (a parted table's segments, all over the root symfile) */
+    /* the domain the cached ids resolve over (retained while cached;
+     * released when the cache is reset or dropped at finish / abort): the
+     * runtime one, or a file domain (a parted table's segments) */
     struct ray_sym_domain_s* lut_dom;
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
     bool    want_dict;      /* generation 2, STR: index_begin asked for the DICT (built at finish) */
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
     uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
+    /* SYM: 0 writes positions at W32 (a zeroed writer a converter builds by
+     * hand included); else the width ray_col_stream_sym_width set, plus 1 */
+    uint8_t pos_w;
     uint64_t dec_pool;      /* generation 2: decoded STR pool bytes so far */
     ray_encw_t* ew;         /* ray_col_stream_chunked_begin: the column file's writer, chunks put as they come */
     /* generation 2, SYM: the prefix bounds of every vector, borrowed from a
@@ -59,6 +63,12 @@ typedef struct {
  * transcodes it chunk by chunk at finish (any other gen: RAY_ERR_VERSION). */
 ray_err_t ray_col_stream_open(ray_col_stream_t* w, const char* dir, int64_t name,
                               int8_t type, struct ray_sym_domain_s* domain, uint8_t gen);
+/* Generation 0, SYM, before the first append: store positions at `width`
+ * (RAY_SYM_W8 / W16; W32 and wider keep 32-bit) instead of W32, for a caller
+ * that merged the column's vocabulary into the domain first
+ * (ray_sym_dict_width of its count).  A position past the width fails the
+ * append with RAY_ERR_RANGE.  RAY_ERR_DOMAIN for any other writer. */
+ray_err_t ray_col_stream_sym_width(ray_col_stream_t* w, uint8_t width);
 /* Generation 2, before the first append: stage the raw payload in a memory
  * file (ray_file_open_mem) instead of the staging file, so no staging file
  * is written back before finish encodes it; the column file is then
