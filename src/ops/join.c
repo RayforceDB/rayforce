@@ -2706,6 +2706,189 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
 }
 
 /* ============================================================================
+ * semi-mask / anti-mask (#596): the probe's matched flag per left row,
+ * written as a BOOL vector over the left side instead of gathered.  Same
+ * build, the same #595 prefilter and the same key equality as the inner
+ * join, so a left row is true in the semi mask iff the inner join emits it.
+ * ============================================================================ */
+
+typedef struct {
+    _Atomic(uint32_t)* ht_heads;
+    const uint32_t*    ht_next;
+    uint32_t           ht_mask;
+    ray_t**            l_key_vecs;
+    ray_t**            r_key_vecs;
+    uint32_t           n_keys;
+    const join_pf_col_t* pf;
+    uint32_t           n_pf;
+    bool               nullfree;
+    uint8_t            hit;     /* written for a matched row: 1 semi, 0 anti */
+    uint8_t*           out;
+} join_mask_ctx_t;
+
+RAY_INLINE void join_mask_rows(void* raw, int64_t start, int64_t end,
+                               bool prefetch_heads, bool single64) {
+    join_mask_ctx_t* c = (join_mask_ctx_t*)raw;
+    const join_pf_col_t* pf = c->pf;
+    uint32_t n_pf = c->n_pf;
+    const int64_t*  d64    = single64 ? (const int64_t*)pf[0].data : NULL;
+    const uint64_t* bits64 = single64 ? pf[0].bits : NULL;
+    uint64_t base64 = single64 ? (uint64_t)pf[0].base : 0;
+    uint64_t span64 = single64 ? pf[0].span : 0;
+    uint8_t hit = c->hit, miss = (uint8_t)!hit;
+    uint8_t* restrict out = c->out;
+    uint32_t ht_mask = c->ht_mask;
+
+    int64_t skipped = 0;
+    for (int64_t l = start; l < end; l++) {
+        if (JOIN_PF_REJECT(l)) { out[l] = miss; skipped++; continue; }
+        if (prefetch_heads && l + 8 < end) {
+            uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
+            __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
+        }
+        uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
+        uint8_t v = miss;
+        for (uint32_t r = c->ht_heads[(uint32_t)(h & ht_mask)]; r != JHT_EMPTY; r = c->ht_next[r])
+            if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, (int64_t)r, c->nullfree)) {
+                v = hit;
+                break;
+            }
+        out[l] = v;
+    }
+    if (skipped)
+        atomic_fetch_add_explicit(&ray_join_prefilter_skips, (uint64_t)skipped,
+                                  memory_order_relaxed);
+}
+
+static void join_mask_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; join_mask_rows(raw, start, end, true, false);
+}
+static void join_mask_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; join_mask_rows(raw, start, end, false, false);
+}
+static void join_mask_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; join_mask_rows(raw, start, end, false, true);
+}
+
+/* BOOL vector over left's rows: true where some right row equals it on
+ * every key in key_names[0..n_keys) (anti: the negation).  Keys are column
+ * names present in both tables (the caller checks). */
+ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
+                     const int64_t* key_names, uint32_t n_keys, bool anti) {
+    /* Parted sides: flatten, as join_with_parted_guard does for a join. */
+    if (join_table_has_parted_col(left_table) || join_table_has_parted_col(right_table)) {
+        ray_t* lf = join_table_has_parted_col(left_table) ? join_flatten_parted(left_table) : NULL;
+        if (lf && RAY_IS_ERR(lf)) return lf;
+        ray_t* rf = join_table_has_parted_col(right_table) ? join_flatten_parted(right_table) : NULL;
+        if (rf && RAY_IS_ERR(rf)) { if (lf) ray_release(lf); return rf; }
+        ray_t* m = ray_join_mask(lf ? lf : left_table, rf ? rf : right_table,
+                                 key_names, n_keys, anti);
+        if (lf) ray_release(lf);
+        if (rf) ray_release(rf);
+        return m;
+    }
+
+    int64_t left_rows  = ray_table_nrows(left_table);
+    int64_t right_rows = ray_table_nrows(right_table);
+    if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
+        return ray_error("nyi", NULL);
+
+    ray_t* mask = ray_vec_new(RAY_BOOL, left_rows);
+    if (!mask || RAY_IS_ERR(mask)) return mask ? mask : ray_error("oom", NULL);
+    mask->len = left_rows;
+    uint8_t* out = (uint8_t*)ray_data(mask);
+    if (right_rows == 0 || left_rows == 0) {
+        memset(out, anti, (size_t)left_rows);
+        return mask;
+    }
+
+    ray_t* key_vecs_hdr = NULL;
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
+                                               (size_t)n_keys * 2 * sizeof(ray_t*));
+    if (!key_vecs) { ray_release(mask); return ray_error("oom", NULL); }
+    ray_t** l_key_vecs = key_vecs;
+    ray_t** r_key_vecs = key_vecs + n_keys;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_t* lc = ray_table_col(left_table, key_names[k]);
+        ray_t* rc = ray_table_col(right_table, key_names[k]);
+        ray_t* e = (lc && RAY_IS_ERR(lc)) ? lc : (rc && RAY_IS_ERR(rc)) ? rc : NULL;
+        if (e || !lc || !rc) {
+            scratch_free(key_vecs_hdr); ray_release(mask);
+            return e ? e : ray_error("domain", "mask: key column not found");
+        }
+        l_key_vecs[k] = lc;
+        r_key_vecs[k] = rc;
+    }
+
+    ray_t* err = NULL;
+    ray_t* ht_next_hdr = NULL;
+    ray_t* ht_heads_hdr = NULL;
+    join_pf_col_t pf_cols[JOIN_PF_MAX_CAND];
+    uint32_t n_pf = 0;
+
+    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
+        err = ray_error("oom", "join: sym domain runtime-id LUT build failed");
+        goto out;
+    }
+    bool keys_nullfree = join_keys_nullfree(l_key_vecs, r_key_vecs, n_keys);
+    if (keys_nullfree) ray_join_nullfree_keys++;
+
+    uint64_t ht_cap64 = JHT_MIN_CAP;
+    while (ht_cap64 < (uint64_t)right_rows * 2) ht_cap64 *= 2;
+    if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
+    uint32_t ht_cap = (uint32_t)ht_cap64;
+    uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
+    _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr,
+                                                                     ht_cap * sizeof(uint32_t));
+    if (!ht_next || !ht_heads) { err = ray_error("oom", NULL); goto out; }
+    memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY */
+
+    ray_pool_t* pool = ray_pool_get();
+    join_build_ctx_t bctx = {
+        .ht_heads = ht_heads, .ht_next = ht_next, .ht_mask = ht_cap - 1,
+        .r_key_vecs = r_key_vecs, .n_keys = n_keys,
+        .asp_bits = NULL, .asp_key_max = 0, .nullfree = keys_nullfree,
+    };
+    if (pool && right_rows > RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
+    else
+        join_build_fn(&bctx, 0, 0, right_rows);
+    if (pool_cancelled(pool)) { err = ray_error("cancel", NULL); goto out; }
+
+    /* Same gate as the join's Pass 1.5. */
+    if (!ray_join_no_prefilter && left_rows > right_rows * 2) {
+        n_pf = join_pf_choose(pf_cols, l_key_vecs, r_key_vecs, n_keys,
+                              left_rows, right_rows);
+        if (n_pf) ray_join_prefilter_builds++;
+    }
+
+    join_mask_ctx_t mctx = {
+        .ht_heads = ht_heads, .ht_next = ht_next, .ht_mask = ht_cap - 1,
+        .l_key_vecs = l_key_vecs, .r_key_vecs = r_key_vecs, .n_keys = n_keys,
+        .pf = pf_cols, .n_pf = n_pf, .nullfree = keys_nullfree,
+        .hit = (uint8_t)!anti, .out = out,
+    };
+    /* Lookahead hashing pays only when heads outgrow cache and most rows
+     * reach the probe; behind a prefilter the survivors are few. */
+    ray_pool_fn probe = join_pf_single64(pf_cols, n_pf) ? join_mask_s64_fn
+                      : (ht_cap > JHT_MIN_CAP && !n_pf) ? join_mask_fn
+                      : join_mask_tiny_fn;
+    if (pool && left_rows > RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, probe, &mctx, left_rows);
+    else
+        probe(&mctx, 0, 0, left_rows);
+    if (pool_cancelled(pool)) err = ray_error("cancel", NULL);
+
+out:
+    for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
+    if (ht_next_hdr) scratch_free(ht_next_hdr);
+    if (ht_heads_hdr) scratch_free(ht_heads_hdr);
+    scratch_free(key_vecs_hdr);
+    if (err) { ray_release(mask); return err; }
+    return mask;
+}
+
+/* ============================================================================
  * OP_WINDOW_JOIN: ASOF join (sort-merge)
  * For each left row, find the most recent right row where right.time <= left.time,
  * optionally partitioned by equality keys. O(N+M) after sorting.

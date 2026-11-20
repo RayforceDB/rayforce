@@ -1679,6 +1679,8 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
                      ray_t* left_table, ray_t* right_table);
 ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                         ray_t* left_table, ray_t* right_table);
+ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
+                     const int64_t* key_names, uint32_t n_keys, bool anti);
 
 /* ── group.c ── */
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
