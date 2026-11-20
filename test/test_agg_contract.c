@@ -5611,6 +5611,109 @@ static test_result_t test_cd_route_key_proj(void) {
     PASS();
 }
 
+/* An unordered `take: N` keeps the first N groups seen (pipeline.md), on
+ * the two-pass rewrite as on the gate's own choice: the passes count every
+ * group in key order, and the rewrite picks the first N seen out of them.
+ * Keys whose first-seen order is not their key order (k*7919 mod m), with
+ * and without a where:, a key with nulls, a SYM key, a composite key, a
+ * take past the group count and past the pick's small set (2000), and a
+ * key whose 4th group first shows past the small set's row budget (kl);
+ * the last two find every group's first row instead.  Flat at 3,000 and
+ * 300,000 rows, and parted (which the rewrite declines).  The answer is
+ * the groups' keys and counts ordered by first selected row, the count
+ * taken over an expression (not the rewrite's shape).  Pinned at 8
+ * workers. */
+static test_result_t test_cd_first_n_take(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_cd_first_n_%lld", wave_pid());
+    (void)ray_test_rm_rf(dir);
+    static const char* const mk[] = {
+        "(set fi (til 3000))", "(set fi (til 300000))",
+    };
+    static const char* const wh[] = { "", " where: (> i 600)", " where: (> k 3)", " where: (== i 5)" };
+    static const struct { const char* by; const char* cols; } ks[] = {
+        { "k", "(at R 'k)" }, { "kn", "(at R 'kn)" }, { "kh", "(at R 'kh)" }, { "kl", "(at R 'kl)" },
+        { "s", "(at R 's)" },
+        { "[k k2]", "(at R 'k) (at R 'k2)" }, { "[s k2]", "(at R 's) (at R 'k2)" },
+    };
+    static const int takes[] = { 5, 2000 };
+    for (size_t m = 0; m < sizeof mk / sizeof mk[0] + 1; m++) {
+        bool parted = m == sizeof mk / sizeof mk[0];
+        char src[1024];
+        snprintf(src, sizeof src, "%s (set fk (%% (* fi 7919) 40))"
+                 " (set Tf (table [k kn kh kl s k2 x i] (list fk"
+                 " (at (concat (til 40) 0Nl) (+ fk (* (as 'I64 (== (%% fi 11) 3)) (- 40 fk))))"
+                 " (%% (* fi 7919) 60000)"
+                 " (+ (* (as 'I64 (< fi 150000)) (%% fi 3)) (* (as 'I64 (>= fi 150000)) fi)) (as 'SYM (as 'STR (%% (* fi 31) 50))) (%% fi 7) (%% fi 1000)"
+                 " (+ 1 (%% fi 997)))))", parted ? mk[1] : mk[m]);
+        ray_t* setup = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        if (parted) {
+            snprintf(src, sizeof src,
+                     "(.db.splayed.set \"%s/1/t/\" (take Tf 150000))"
+                     " (.db.splayed.set \"%s/2/t/\" (take Tf -150000))"
+                     " (set Tf (.db.parted.get \"%s/\" 't))", dir, dir, dir);
+            setup = ray_eval_str(src);
+            TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "parted store");
+            ray_release(setup);
+        }
+        for (size_t w = 0; w < sizeof wh / sizeof wh[0]; w++) {
+            char q[512];
+            snprintf(q, sizeof q, "(set Wf (select {from: Tf%s})) (set Wf (update {from: Wf rid: (til (count Wf))}))",
+                     wh[w]);
+            setup = ray_eval_str(q);
+            TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "where %zu", w);
+            ray_release(setup);
+            for (size_t k = 0; k < sizeof ks / sizeof ks[0]; k++) {
+                char ref[512];
+                snprintf(ref, sizeof ref, "(set Of (xasc (select {from: Wf by: %s f: (min rid)"
+                         " u: (count (distinct (+ x 0)))}) 'f))", ks[k].by);
+                setup = ray_eval_str(ref);
+                TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "%s", ref);
+                ray_release(setup);
+                for (size_t n = 0; n < sizeof takes / sizeof takes[0]; n++) {
+                    snprintf(ref, sizeof ref, "(do (set R (take Of (min %d (count Of)))) (list %s (at R 'u)))",
+                             takes[n], ks[k].cols);
+                    ray_t* want = ray_eval_str(ref);
+                    TEST_ASSERT_FMT(want && !RAY_IS_ERR(want), "%s", ref);
+                    ray_t* fw = ray_fmt(want, 0);
+                    ray_release(want);
+                    for (int r = 0; r < (parted ? 1 : 2); r++) {   /* the gate, the rewrite; parted: never the rewrite */
+                        snprintf(q, sizeof q, "(do (set R (select {from: Tf%s by: %s u: (count (distinct x))"
+                                 " take: %d})) (list %s (at R 'u)))", wh[w], ks[k].by, takes[n], ks[k].cols);
+                        uint64_t rw0, sl0, rw1, sl1;
+                        ray_query_test_cd_route(r);
+                        ray_query_test_cd_gate(&rw0, &sl0);
+                        ray_t* got = ray_eval_str(q);
+                        ray_query_test_cd_gate(&rw1, &sl1);
+                        ray_query_test_cd_route(0);
+                        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%s route %d", q, r);
+                        /* forced, a flat table takes the rewrite (the fused
+                         * kernel serves one key at 300,000 rows unfiltered) */
+                        if (r == 1 && !parted && (m == 0 || w > 0 || ks[k].by[0] == '['))
+                            TEST_ASSERT_FMT(rw1 - rw0 == 1, "%s: not on the rewrite", q);
+                        ray_t* fg = ray_fmt(got, 0);
+                        ray_release(got);
+                        bool same = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                                    memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fg)) == 0;
+                        TEST_ASSERT_FMT(same, "size %zu: %s route %d: %.160s, first seen %.160s", m, q, r,
+                                        fg ? ray_str_ptr(fg) : "", fw ? ray_str_ptr(fw) : "");
+                        if (fg) ray_release(fg);
+                    }
+                    if (fw) ray_release(fw);
+                }
+            }
+        }
+    }
+    ray_t* r = ray_eval_str("(set Tf 0) (set Wf 0) (set Of 0) (set R 0) (set fi 0) (set fk 0)");
+    if (r) ray_release(r);
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 /* A top-N cut over a partitioned dense slab (agg_dense_lean_select) keeps
  * the groups tied at the threshold that the stable sort would take — tied
  * exactly, not as doubles: 64-bit values past 2^53 that a double cannot tell
@@ -5670,6 +5773,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
+    { "agg_contract/cd_first_n_take", test_cd_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/topn_ties_exact", test_topn_ties_exact, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
