@@ -14545,11 +14545,26 @@ static bool group_const_input_spreads(ray_graph_t* g, ray_op_t* in, int64_t nrow
     return ray_is_atom(lit) || (ray_is_vec(lit) && (lit->len == 1 || lit->len == nrows));
 }
 
-/* Does any scan under `in` read a table other than the default one, or is
- * the subtree too large to walk?  Every opcode is walked, row-local or not. */
-static bool grp_expr_scans_other(ray_graph_t* g, uint32_t root_id) {
+/* A running, moving or shift function: it reads other rows than its own,
+ * and under a where: it runs over the whole table (#916).  Each is unary;
+ * a window is a parameter, not an input node. */
+static inline bool group_expr_running_opcode(uint16_t opcode) {
+    return opcode == OP_LAG || opcode == OP_LEAD ||
+           (opcode >= OP_DELTAS && opcode <= OP_MDEV);
+}
+
+/* Is every node under `root_id` one the bridge may evaluate over the whole
+ * table with the selection cleared?  An allowlist: a scan of the default
+ * table, a constant, a row-local element-wise op, or a running, moving or
+ * shift function.  Anything else is refused, an aggregate above all (an
+ * inlined lambda's `first`, `count`, `avg`): on its own it sees the rows the
+ * where: keeps, so it must not see the whole table; and so must anything
+ * else whose value depends on which rows are selected (`distinct`, `asc`,
+ * `rank`, ...).  An aggregate nested in a running function is refused too
+ * and keeps the legacy path's answer.  So is a subtree too large to walk. */
+static bool grp_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
     uint32_t nc = g->node_count;
-    if (nc > 4096 || root_id >= nc) return true;
+    if (nc > 4096 || root_id >= nc) return false;
     uint32_t stack[64];
     int sp = 0;
     bool visited[4096];
@@ -14561,34 +14576,37 @@ static bool grp_expr_scans_other(ray_graph_t* g, uint32_t root_id) {
         visited[nid] = true;
         ray_op_t* node = &g->nodes[nid];
         if (node->flags & OP_FLAG_DEAD) continue;
+        if (node->opcode == OP_CONST) continue;
         if (node->opcode == OP_SCAN) {
             ray_op_ext_t* sx = find_ext(g, nid);
-            if (!sx) return true;
+            if (!sx) return false;
             uint16_t tbl_id = 0;
             memcpy(&tbl_id, sx->base.pad, sizeof(uint16_t));
-            if (tbl_id != 0) return true;
+            if (tbl_id != 0) return false;
             continue;
         }
+        if (!group_expr_rowlocal_opcode(node->opcode) &&
+            !group_expr_running_opcode(node->opcode)) return false;
         for (int i = 0; i < node->arity && i < 2; i++) {
             if (node->in_id[i] == RAY_OP_NONE) continue;
-            if (sp >= 64) return true;
+            if (sp >= 64) return false;
             stack[sp++] = node->in_id[i];
         }
         ray_op_ext_t* nx = find_ext(g, nid);
         if (nx && nx->third_in != RAY_OP_NONE && nx->third_in != 0) {
-            if (sp >= 64) return true;
+            if (sp >= 64) return false;
             stack[sp++] = nx->third_in;
         }
     }
-    return false;
+    return true;
 }
 
-/* Does the expression `in` read an encoded column of `tbl` (or a column it
- * cannot place)?  An input that reads other rows than its own (a running,
- * moving or shift function) names no source columns here: it is refused
- * only when some column of the table is encoded, or a scan under it reads
- * another table.  Otherwise the executor materializes it over the whole
- * table (#916) and v2 groups it, first-N pre-pass included (#1234). */
+/* Does the expression `in` read an encoded column of `tbl` (or is it one
+ * the bridge must not take)?  An input that is not row-local names no
+ * source columns here.  It is taken only when grp_expr_whole_table_ok
+ * admits it (running functions over row-local expressions) and no column
+ * of the table is encoded: the executor then materializes it over the
+ * whole table (#916) and v2 groups it, first-N pre-pass included (#1234). */
 static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
     int64_t syms[64];
     int n = group_expr_src_syms(g, in->id, syms, 64);
@@ -14596,10 +14614,11 @@ static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
         for (int i = 0; i < n; i++) if (ray_table_get_col_enc(tbl, syms[i])) return true;
         return false;
     }
+    if (!grp_expr_whole_table_ok(g, in->id)) return true;
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++)
         if (ray_table_get_col_enc(tbl, ray_table_col_name(tbl, c))) return true;
-    return grp_expr_scans_other(g, in->id);
+    return false;
 }
 
 /* v2 bridge for expression agg inputs — see the call site in

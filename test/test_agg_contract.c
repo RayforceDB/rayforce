@@ -3538,6 +3538,7 @@ static test_result_t test_first_n_take_running_input(void) {
             snprintf(buf, sizeof buf, "(select {from:fs_x%s by:%s s:(%s x)})",
                      wh[w].w, keys[k], aggs[a].agg);
             ray_t* all = ray_eval_str(buf);
+            TEST_ASSERT_FMT(all && !RAY_IS_ERR(all), "%s: whole-table select failed", buf);
             for (size_t t = 0; t < sizeof(tabs) / sizeof(tabs[0]); t++) {
                 char q[512];
                 snprintf(q, sizeof q, "(select {from:%s%s by:%s s:(%s %s) take:5})",
@@ -3575,6 +3576,7 @@ static test_result_t test_first_n_take_running_input(void) {
     setup = ray_eval_str(src);
     TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
     ray_t* all = ray_eval_str("(select {from:fs_x where:(> i 600) by:h s:(max x)})");
+    TEST_ASSERT_TRUE(all && !RAY_IS_ERR(all));
     agg_route_reset();
     ray_t* got = ray_eval_str("(select {from:fs_c where:(> i 600) by:h s:(max (sums i)) take:5})");
     TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got));
@@ -3583,6 +3585,93 @@ static test_result_t test_first_n_take_running_input(void) {
     ray_release(got); ray_release(all);
     ray_release(ray_eval_str("(set fs_t 0) (set fs_p 0) (set fs_c 0) (set fs_x 0) (set fs_w 0) (set fs_n 0)"));
     (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
+/* The expression bridge evaluates a non-row-local group input over the
+ * whole table with the where: selection cleared, so it may take only what
+ * the language runs over the whole table: running, moving and shift
+ * functions over row-local expressions (#916).  An aggregate is not one: on
+ * its own, in an inlined lambda, it sees the rows the where: keeps (#1234
+ * review: `(sum (f i))` with f = `(- x (first x))` answered [6 8] for [2 4]).
+ * An aggregate nested in a running function sees the whole table (select.md
+ * "Running functions under where:").  Small fixed answers, then the same
+ * shapes at 200K rows against the materialized where: (an aggregate on its
+ * own) or the function stored as a whole-table column (nested in a running
+ * function), keyed, with and without a take. */
+static test_result_t test_group_bridge_lambda_aggregate(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set la_t (table [k i] (list [0 1 0 1 0 1] [1 2 3 4 5 6]))) "
+        "(set la_f (fn [x] (- x (first x)))) "
+        "(set la_c (fn [x] (* x (count x)))) "
+        "(set la_a (fn [x] (- x (avg x)))) "
+        "(set la_s (fn [x] (* x (sum x)))) "
+        "(set la_g (fn [x] (sums (- x (first x))))) "
+        "(set la_d (fn [x] (deltas (* x (count x)))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    static const struct { const char* q; const char* want; } small[] = {
+        { "(select {from:la_t where:(> i 2) s:(la_f i)})", "[0 1 2 3]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_f i))})", "[2 4]" },
+        { "(select {from:la_t where:(> i 2) s:(sum (la_c i))})", "[72]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_c i))})", "[32 40]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_a i))})", "[-1.0 1.0]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_s i))})", "[144 180]" },
+        /* nested in a running function: the whole table */
+        { "(select {from:la_t where:(> i 2) s:(la_g i)})", "[3 6 10 15]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(max (la_g i))})", "[10 15]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(max (la_d i))})", "[6 6]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(max (sums i))})", "[15 21]" },
+    };
+    for (size_t q = 0; q < sizeof(small) / sizeof(small[0]); q++) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "(format \"%%\" (at %s 's))", small[q].q);
+        ray_t* r = ray_eval_str(buf);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == -RAY_STR, "%s: error", small[q].q);
+        TEST_ASSERT_FMT(ray_str_len(r) == strlen(small[q].want) &&
+                        memcmp(ray_str_ptr(r), small[q].want, strlen(small[q].want)) == 0,
+                        "%s: got %.*s, want %s", small[q].q, (int)ray_str_len(r), ray_str_ptr(r),
+                        small[q].want);
+        ray_release(r);
+    }
+    setup = ray_eval_str(
+        "(set la_n (til 200000)) "
+        "(set la_b (table [k i] (list (% (* la_n 7919) 6000) (+ 1 (% la_n 997)))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
+    /* the input, and whether an aggregate sits on its own (the oracle is
+     * then the materialized where:) or nested in a running function (the
+     * function stored as a whole-table column) */
+    static const struct { const char* agg; const char* in; bool own; } big[] = {
+        { "sum", "(la_f i)", true }, { "sum", "(la_c i)", true }, { "sum", "(la_s i)", true },
+        { "max", "(la_g i)", false }, { "max", "(la_d i)", false },
+    };
+    static const char* wh[] = { "(> i 600)", "(< (% i 10) 2)" };
+    static const char* tk[] = { "", " take:5" };
+    for (size_t b = 0; b < sizeof(big) / sizeof(big[0]); b++)
+    for (size_t w = 0; w < sizeof(wh) / sizeof(wh[0]); w++)
+    for (size_t t = 0; t < sizeof(tk) / sizeof(tk[0]); t++) {
+        char buf[512], q[256];
+        if (big[b].own)
+            snprintf(buf, sizeof buf,
+                "(set la_w (select {from:la_b where:%s})) "
+                "(select {from:la_w by:k s:(%s %s)})", wh[w], big[b].agg, big[b].in);
+        else
+            snprintf(buf, sizeof buf,
+                "(set la_x (update {from:la_b x:%s})) "
+                "(select {from:la_x where:%s by:k s:(%s x)})", big[b].in, wh[w], big[b].agg);
+        ray_t* all = ray_eval_str(buf);
+        TEST_ASSERT_FMT(all && !RAY_IS_ERR(all) && all->type == RAY_TABLE, "%s: oracle failed", buf);
+        snprintf(q, sizeof q, "(select {from:la_b where:%s by:k s:(%s %s)%s})",
+                 wh[w], big[b].agg, big[b].in, tk[t]);
+        ray_t* got = ray_eval_str(q);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE, "%s: error", q);
+        int64_t n = ray_table_nrows(got);
+        TEST_ASSERT_FMT(n == (t ? 5 : ray_table_nrows(all)), "%s: %lld rows", q, (long long)n);
+        TEST_ASSERT_FMT(od_take_rows_in(got, all, n), "%s: differs from the oracle", q);
+        ray_release(got); ray_release(all);
+    }
+    ray_release(ray_eval_str("(set la_t 0) (set la_b 0) (set la_w 0) (set la_x 0) (set la_n 0)"));
     PASS();
 }
 
@@ -5825,6 +5914,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/first_n_take_key_where_parted", test_first_n_take_key_where_parted, contract_setup, contract_teardown },
     { "agg_contract/group_where_order_dependent", test_group_where_order_dependent, contract_setup, contract_teardown },
     { "agg_contract/first_n_take_running_input", test_first_n_take_running_input, contract_setup, contract_teardown },
+    { "agg_contract/group_bridge_lambda_aggregate", test_group_bridge_lambda_aggregate, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves", test_radix_topn_waves, contract_setup, contract_teardown },
     { "agg_contract/radix_topn_waves_gen2", test_radix_topn_waves_gen2, contract_setup, contract_teardown },
     { "agg_contract/timespan_rank_admission", test_timespan_rank_admission, contract_setup, contract_teardown },
