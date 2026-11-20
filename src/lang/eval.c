@@ -5045,9 +5045,11 @@ static void ray_register_builtins(void) {
     register_unary_op("reciprocal", RAY_FN_NONE, ray_reciprocal_fn, OP_RECIPROCAL);
     register_unary_op("signum",     RAY_FN_NONE, ray_signum_fn,     OP_SIGNUM);
     register_binary_op("pow", RAY_FN_ATOMIC, ray_pow_fn, OP_POW);
-    /* Partial-sort top/bottom-N: O(N log K) bounded-heap fast path
-     * via topk_indices_single, falls back to full sort for unsupported
-     * types.  Per-group usage works through the eval-level scatter. */
+    /* Partial-sort top/bottom-N (topk_take_vec): O(N + K log K) via the
+     * selection topk_indices_single runs, on the pool for long vectors (a
+     * comparator heap for SYM/STR/GUID); falls back to full sort + take
+     * when it declines (K >= N, unsupported types).  Per-group usage
+     * works through the eval-level scatter. */
     register_binary("top", RAY_FN_NONE, ray_top_fn);
     register_binary("bot", RAY_FN_NONE, ray_bot_fn);
     /* pearson_corr: 2-input scalar reducer.  Marked AGGR + LAZY_AWARE so

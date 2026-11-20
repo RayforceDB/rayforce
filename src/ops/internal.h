@@ -1639,6 +1639,17 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
  * the shape is not the top-k shortcut's (compact the table and sort). */
 ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit);
 uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered */
+#ifdef DEBUG
+/* Single-key top-k selections run on the pool (topk_sel_run). */
+uint64_t ray_sort_test_topk_chunked(void);
+/* Buffer pairs (ranges x room) the last single-key top-k selection reserved
+ * (0 when it ran in place). */
+int64_t ray_sort_test_topk_pairs(void);
+/* Single-key top-k selections made in place (topk_place_fn), no buffers. */
+uint64_t ray_sort_test_topk_inplace(void);
+/* Parted columns sel_compact gathered on the pool (sel_parted_gather). */
+uint64_t ray_filter_test_parted_runs(void);
+#endif
 
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);
