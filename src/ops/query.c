@@ -11416,12 +11416,14 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
                                 int64_t* out_syms, int max_out, int n);
 
 
-/* The route gate's decisions (test hook). */
+/* The route gate's decisions, and a route forced over them (test hooks). */
 static _Atomic(uint64_t) g_cd_gate_rewrite, g_cd_gate_slices;
+static int g_cd_gate_force;
 void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices) {
     *rewrite = atomic_load(&g_cd_gate_rewrite);
     *slices  = atomic_load(&g_cd_gate_slices);
 }
+void ray_query_test_cd_route(int route) { g_cd_gate_force = route; }
 
 /* Planner rewrite for `(select {K: K c: (count (distinct X)) from: T
  * [where: W] by: K [desc: c take: N]})`.
@@ -11716,6 +11718,7 @@ static ray_t* try_count_distinct_v2_rewrite(
         bool two_pass = ray_cd_two_pass_preferred(K_cols, n_K, X_col, sel_rows, sel_nrows,
                                                   sel_pop, workers);
         if (sel_hdr) scratch_free(sel_hdr);
+        if (RAY_UNLIKELY(g_cd_gate_force)) two_pass = g_cd_gate_force == 1;
         atomic_fetch_add_explicit(two_pass ? &g_cd_gate_rewrite : &g_cd_gate_slices, 1,
                                   memory_order_relaxed);
         if (!two_pass) return NULL;

@@ -5479,9 +5479,77 @@ static test_result_t test_cd_route(void) {
     PASS();
 }
 
+/* The rewrite and the slices answer a grouped distinct count alike, column
+ * for column and row for row (ray_query_test_cd_route forces each): with no
+ * key projection, under a where:, with a single key's projection, and with
+ * a composite key's projections ({a: a b: b ... by: [a b]}), which the
+ * select folds into the key (#1235): [a b u] on both routes, the answer of
+ * the select without them.  At 3,000 rows over 1,000 groups and at 300,000
+ * rows over 100,000. */
+static test_result_t test_cd_route_key_proj(void) {
+    /* ref: the select a composite key's projections fold into */
+    static const struct { const char* q; const char* ref; } qs[] = {
+        { "(select {a: a b: b u: (count (distinct h)) from: Tq by: [a b]})",
+          "(select {u: (count (distinct h)) from: Tq by: [a b]})" },
+        { "(select {a: a b: b u: (count (distinct h)) from: Tq by: {a: a b: b}})",
+          "(select {u: (count (distinct h)) from: Tq by: [a b]})" },
+        { "(select {u: (count (distinct h)) from: Tq by: [a b]})", NULL },
+        { "(select {u: (count (distinct h)) from: Tq where: (>= h 0) by: [a b]})", NULL },
+        { "(select {a: a u: (count (distinct h)) from: Tq where: (>= h 0) by: a})", NULL },
+    };
+    static const char* const mk[] = {
+        "(set qi (til 3000)) (set q0 (% (* qi 7919) 1000))",
+        "(set qi (til 300000)) (set q0 (% (* qi 7919) 100000))",
+    };
+    for (size_t m = 0; m < sizeof mk / sizeof mk[0]; m++) {
+        char src[512];
+        snprintf(src, sizeof src, "%s (set Tq (table [a b h] (list (as 'I32 (%% q0 100))"
+                 " (as 'I32 (div q0 100)) (%% (* qi 104729) 1000003))))", mk[m]);
+        ray_t* setup = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            ray_t* got[2];
+            uint64_t rw0, sl0, rw1, sl1;
+            for (int r = 0; r < 2; r++) {
+                ray_query_test_cd_route(r + 1);
+                ray_query_test_cd_gate(&rw0, &sl0);
+                got[r] = ray_eval_str(qs[i].q);
+                ray_query_test_cd_gate(&rw1, &sl1);
+                ray_query_test_cd_route(0);
+                TEST_ASSERT_FMT(got[r] && !RAY_IS_ERR(got[r]) && got[r]->type == RAY_TABLE,
+                                "size %zu query %zu route %d", m, i, r + 1);
+                TEST_ASSERT_FMT(rw1 - rw0 == (r == 0 ? 1u : 0u) && sl1 - sl0 == (r == 1 ? 1u : 0u),
+                                "size %zu query %zu route %d: %llu rewrites, %llu slices", m, i, r + 1,
+                                (unsigned long long)(rw1 - rw0), (unsigned long long)(sl1 - sl0));
+            }
+            ray_t* ref = qs[i].ref ? ray_eval_str(qs[i].ref) : NULL;
+            TEST_ASSERT_FMT(!qs[i].ref || (ref && !RAY_IS_ERR(ref)), "size %zu query %zu: reference", m, i);
+            ray_t* fr = ref ? ray_fmt(ref, 0) : NULL;
+            if (ref) ray_release(ref);
+            ray_t* fa = ray_fmt(got[0], 0);
+            ray_t* fb = ray_fmt(got[1], 0);
+            bool same = fa && fb && ray_str_len(fa) == ray_str_len(fb) &&
+                        memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+            bool as_ref = !fr || (fa && ray_str_len(fr) == ray_str_len(fa) &&
+                                  memcmp(ray_str_ptr(fr), ray_str_ptr(fa), ray_str_len(fa)) == 0);
+            if (fa) ray_release(fa);
+            if (fb) ray_release(fb);
+            if (fr) ray_release(fr);
+            ray_release(got[0]); ray_release(got[1]);
+            TEST_ASSERT_FMT(same, "size %zu query %zu: the routes differ", m, i);
+            TEST_ASSERT_FMT(as_ref, "size %zu query %zu: not the select without the projections", m, i);
+        }
+    }
+    ray_t* r = ray_eval_str("(set Tq 0) (set qi 0) (set q0 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
+    { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_floor", test_cd_bounded_floor, contract_setup, contract_teardown },

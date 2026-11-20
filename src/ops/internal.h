@@ -1501,6 +1501,10 @@ uint64_t ray_query_test_count_fast(void);
  * (ray_cd_two_pass_preferred) sent to the two-pass rewrite, and those it
  * sent to the slices, since process start. */
 void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
+/* query.c test hook: the route a grouped distinct count takes past the gate,
+ * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
+ * Disarmed by ray_test_hooks_off. */
+void ray_query_test_cd_route(int route);
 /* query.c test hook: selects whose parted source was pruned before fetch,
  * and the partitions they dropped, since process start. */
 void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);
