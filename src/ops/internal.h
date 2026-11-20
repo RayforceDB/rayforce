@@ -1874,6 +1874,15 @@ bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
  * ray_expr_subset_invariant leaves to its caller. */
 bool filter_input_default_domain(ray_graph_t* g, uint32_t id);
 
+/* Does every node under `root_id` read only its own row or run over the
+ * whole table (a running, moving or shift function, #916)?  Defined in
+ * group.c; an aggregate, an order or distinct op, or anything else whose
+ * value depends on which rows a where: keeps answers false. */
+bool ray_group_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id);
+/* Does every node under `root_id` read only its own row?  Defined in
+ * group.c (group_expr_src_syms). */
+bool ray_group_expr_rowlocal_ok(ray_graph_t* g, uint32_t root_id);
+
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.
  * Defined in exec.c; consumed by the streaming parted asof path in query.c. */
