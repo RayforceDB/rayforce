@@ -63,7 +63,7 @@ Signatures:
 - `(.csv.splayed "src.csv" "out_dir")`
 - `(.csv.splayed [types] "src.csv" "out_dir")`
 - `(.csv.splayed [names] [types] "src.csv" "out_dir")`
-- `(.csv.splayed {compress: true} ...)` — any arrangement above may start with an options dict. `compress` true writes generation-2 (compressed) column files where eligible, false generation 0; absent inherits per file (generation 2 when the existing destination's current file is generation 2). Unknown keys, a non-bool value or a second options dict are a `domain` error. Linked and nested/list columns are always written uncompressed. A compressed string column persists its dictionary index, as a generation-0 one does.
+- `(.csv.splayed {compress: true} ...)` — any arrangement above may start with an options dict. `compress` true writes generation-2 (compressed) column files where eligible, false generation 0; absent inherits per file (generation 2 when the existing destination's current file is generation 2). Unknown keys, a non-bool value or a second options dict are a `domain` error. Linked and nested/list columns are always written uncompressed. A compressed string column persists its dictionary index, as a generation-0 one does, unless it would make the file larger than the generation-0 one (mostly distinct strings); see `.db.splayed.set` in [Storage](../storage/index.md).
 
 Streams `src.csv` chunk-by-chunk through the parser into a splayed directory at `out_dir` (one column file per field, `.d` schema, and `.sym` symbol dictionary when needed). Returns the resulting splayed table loaded with `ray_read_splayed`: generation-0 columns are zero-copy mmap, so the bytes stay on disk; a compressed column decodes into heap memory the first time a query reads it.
 
