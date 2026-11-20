@@ -65,7 +65,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 ### Variadic / Special
 
 `and`, `or`, `if`, `do`, `fn`, `map`, `pmap`, `fold`, `scan`, `prior`, `apply`, `list`, `select`, `window`,
-`update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
+`update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `semi-mask`, `anti-mask`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
@@ -518,6 +518,8 @@ Rayforce supports seven join types, including time-series-aware as-of and window
 | `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join [product_id] orders products)` |
 | `full-join` | variadic | — | Full outer join — all rows from both sides, unmatched columns filled with null | `(full-join [sym] trades quotes)` |
 | `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join [key] t1 t2)` |
+| `semi-mask` | variadic | — | Boolean vector over left rows — true where the row has a right match | `(semi-mask [key] t1 t2)` |
+| `anti-mask` | variadic | — | Boolean vector over left rows — true where the row has no right match | `(anti-mask [key] t1 t2)` |
 | `window-join` | variadic | special | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict | `(window-join [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `window-join1` | variadic | special | Window join variant (strict window, no prevailing quote) | `(window-join1 [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `asof-join` | variadic | — | As-of join — match most recent preceding value. Keys come first, last key is the time key. | `(asof-join [sym time] trades quotes)` |
