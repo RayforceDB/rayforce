@@ -796,6 +796,12 @@ static void eval_and_print_remote(const char* input) {
     ray_release(resp);
 }
 
+/* A transaction opened here was rolled back by an error in one of its
+ * lines: until (.tx.rollback) is typed, lines take no effect, so what was
+ * meant for the transaction cannot land outside it (a piped script goes on
+ * after a failed line). */
+static bool g_tx_aborted;
+
 static void eval_and_print(ray_term_t* term, const char* input,
                            bool use_color, bool timeit) {
     /* Remote-REPL redirect: when a session is active every input goes
@@ -847,6 +853,9 @@ static void eval_and_print(ray_term_t* term, const char* input,
     ray_clear_error_trace();
     ray_raise_clear();
 
+    bool doomed = g_tx_aborted;
+    if (doomed) ray_tx_doom(RAY_TX_LOCAL);
+
     ray_t* parsed = ray_parse_with_nfo(input, nfo);
     if (profiling) ray_profile_tick("parse");
 
@@ -862,6 +871,21 @@ static void eval_and_print(ray_term_t* term, const char* input,
         ray_release(parsed);
     }
     ray_release(nfo);
+
+    if (doomed) {
+        if (ray_tx_doom_end()) {
+            g_tx_aborted = false;
+        } else {
+            if (result && !RAY_IS_ERR(result)) ray_release(result);
+            else if (result) ray_error_free(result);
+            result = ray_error("tx", "the transaction was rolled back; (.tx.rollback) to go on");
+        }
+    } else if (ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL &&
+               ((result && RAY_IS_ERR(result)) || ray_term_interrupted())) {
+        /* An error, or ^C, inside a transaction ends it: all of it is undone. */
+        ray_tx_rollback();
+        g_tx_aborted = true;
+    }
 
     /* Clear any pull-based progress state left over from this
      * top-level eval. Some paths (e.g. ray_group_indices_fn invoked from
@@ -1062,6 +1086,28 @@ static ray_t* repl_read(ray_poll_t* poll, ray_selector_t* sel)
 
 /* repl_on_data callback: receives a complete line string.
  * Handles commands, evals, and prints. */
+/* A line opened a transaction: until it ends only the terminal is served.
+ * The poll's other selectors — connections, timers — wait, as they do for
+ * a transaction a connection owns (core/ipc.c); there is no time limit,
+ * the console's operator answers for the wait.  A line the pump completes
+ * comes back through repl_on_data. */
+static void repl_tx_serve(ray_poll_t* poll, ray_repl_t* repl)
+{
+    static bool serving;
+    if (serving) return;
+    serving = true;
+    while (ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL && poll->code < 0) {
+#ifndef RAY_OS_WINDOWS
+        /* -2 is a signal: ^C is repl_read's to see. */
+        if (ray_sock_wait_readable_intr((ray_sock_t)STDIN_FD, -1) == -1) break;
+#endif
+        if (ray_poll_serve_rx(poll, repl->id) < 0) break;
+    }
+    /* Still open: the terminal is gone, or the REPL was told to quit. */
+    if (ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL) ray_tx_rollback();
+    serving = false;
+}
+
 static ray_t* repl_on_data(ray_poll_t* poll, ray_selector_t* sel, void* data)
 {
     (void)poll;
@@ -1104,6 +1150,7 @@ static ray_t* repl_on_data(ray_poll_t* poll, ray_selector_t* sel, void* data)
     eval_and_print(repl->term, str, true, repl->timeit);
     ray_release(line);
     ray_term_begin(repl->term);
+    repl_tx_serve(poll, repl);
     return NULL;
 }
 
@@ -1307,7 +1354,9 @@ static char* piped_fgets(pipe_rd_t* rd, char* line, size_t size) {
             rd->head = 0; rd->tail = avail;
         }
         ray_poll_t* poll = rd->repl ? rd->repl->poll : NULL;
-        if (poll && rd->sel_id >= 0) {
+        /* Inside a transaction opened here only this input is served: read
+         * it directly, the poll's other selectors wait. */
+        if (poll && rd->sel_id >= 0 && !(ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL)) {
             if (ray_poll_run_for(poll, 1000) < 0 || poll->code >= 0) {
                 /* The loop was told to exit (an IPC hook, a callback):
                  * stop reading, let run_piped wind down. */
@@ -1428,6 +1477,12 @@ static void run_piped(ray_repl_t* repl) {
     if (accum_len > 0) {
         accum[accum_len] = '\0';
         eval_and_print(NULL, accum, false, repl->timeit);
+    }
+
+    /* The input ended inside a transaction: nothing will commit it. */
+    if (ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL) {
+        ray_tx_rollback();
+        fprintf(stderr, "error: tx: input ended inside a transaction; rolled back\n");
     }
 
     if (repl->poll) {
@@ -1598,8 +1653,16 @@ int ray_repl_run_file(const char* path) {
     if (profiling) ray_profile_span_end("top-level");
 
     int rc;
+    /* A script is served alone, so a transaction it opens needs no loop;
+     * one it leaves open, by an error or by ending, is rolled back. */
+    bool tx_left = ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL;
+    if (tx_left) ray_tx_rollback();
     if (RAY_IS_ERR(result)) {
         repl_print_result(stderr, result, color_err);
+        rc = 1;
+    } else if (tx_left) {
+        fprintf(stderr, "error: tx: '%s' ended inside a transaction; rolled back\n", path);
+        if (result) ray_release(result);
         rc = 1;
     } else {
         if (result) {

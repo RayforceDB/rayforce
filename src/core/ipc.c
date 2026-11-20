@@ -383,8 +383,16 @@ static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
     int64_t prev = ipc_ctx_handle();
     ray_poll_t* prev_poll = ipc_ctx_poll();
     ipc_ctx_set(handle, poll ? poll : prev_poll);
+    bool tx_was = ray_tx_active;
     ray_t* r = call_fn1(fn, arg);
     ipc_ctx_set(prev, prev_poll);
+    /* Nothing would end a transaction a hook left open: no message of its
+     * connection is being answered, so nobody enters the owner's loop. */
+    if (ray_tx_active && !tx_was) {
+        ray_tx_rollback();
+        fprintf(stderr, "tx: a connection hook left a transaction open; rolled back (handle=%lld)\n",
+                (long long)handle);
+    }
     if (r && RAY_IS_ERR(r)) {
         const char* name = (idx == IPC_HOOK_OPEN) ? ".ipc.on.open" : ".ipc.on.close";
         fprintf(stderr, "ipc: %s hook raised an error (handle=%lld)\n",

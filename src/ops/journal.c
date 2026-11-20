@@ -335,16 +335,17 @@ ray_t* ray_log_purge_fn(ray_t** args, int64_t n) {
  * by the calling connection.  Until it commits or rolls back, the server
  * serves nobody else; 0 lifts a limit. */
 ray_t* ray_tx_begin_fn(ray_t** args, int64_t n) {
-    int64_t lim[2] = { TX_IDLE_MS, TX_TOTAL_MS };
+    /* The REPL and scripts have no limits: nobody else is asked to wait
+     * without the console's operator knowing. */
+    int64_t owner = ray_ipc_current_handle();
+    int64_t lim[2] = { owner < 0 ? 0 : TX_IDLE_MS, owner < 0 ? 0 : TX_TOTAL_MS };
     if (n > 2) return ray_error("arity", ".tx.begin: expects at most 2 arguments, got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++) {
         if (!args[i] || args[i]->type != -RAY_I64 || args[i]->i64 < 0)
             return ray_error("type", ".tx.begin: a limit is a non-negative i64 of milliseconds");
         lim[i] = args[i]->i64;
     }
-    int64_t owner = ray_ipc_current_handle();
-    if (owner < 0)
-        return ray_error("nyi", ".tx.begin: only over an IPC connection");
+    if (owner < 0) owner = RAY_TX_LOCAL;
     if (ray_tx_active) return ray_error("tx", ".tx.begin: a transaction is already open");
     return err_to_ray(ray_tx_begin(owner, lim[0], lim[1]), "io");
 }

@@ -1,0 +1,69 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; Transactions opened outside a connection: by a script, and by the REPL
+;; reading a pipe.  (The terminal REPL is driven through a pty in
+;; test/test_repl.c.)
+;;
+;; Every step is a ./rayforce of its own under -L /tmp/rftest_txl; what it
+;; left is read back by the next one, which recovers it from the journal.
+;; Port (the piped server only): 19982.
+
+(.sys.exec "pkill -KILL -f '[r]ayforce .*-L /tmp/rftest_txl' 2>/dev/null; rm -rf /tmp/rftest_txl*; true")
+(set run (fn [src] (do (.sys.exec (format "printf '%' > /tmp/rftest_txl_s.rfl" src)) (.sys.exec "./rayforce -L /tmp/rftest_txl -f /tmp/rftest_txl_s.rfl </dev/null >/tmp/rftest_txl.out 2>/tmp/rftest_txl.err"))))
+(set shows (fn [text] (.sys.exec (format "grep -qxF '%' /tmp/rftest_txl.out" text))))
+
+;; ── a script commits ────────────────────────────────────────────────
+(run "(set n 1)\\n(.tx.begin)\\n(set n 2)\\n(set t (table [k] (list [1 2 3])))\\n(println (list n (count t)))\\n(.tx.commit)\\n") -- 0
+(shows "[2 3]") -- 0
+(run "(println (list n (count t)))\\n") -- 0
+(shows "[2 3]") -- 0
+
+;; ── a script rolls back ─────────────────────────────────────────────
+(run "(.tx.begin)\\n(set n 3)\\n(insert (quote t) (list 4))\\n(.tx.rollback)\\n(println (list n (count t)))\\n") -- 0
+(shows "[2 3]") -- 0
+(run "(println (list n (count t)))\\n") -- 0
+(shows "[2 3]") -- 0
+
+;; ── an error in the transaction: the script fails, nothing is kept ──
+(run "(.tx.begin)\\n(set n 4)\\n(no_such_function 1)\\n(.tx.commit)\\n") -- 1
+(run "(println n)\\n") -- 0
+(shows "2") -- 0
+
+;; ── a script that ends inside one: rolled back, and it says so ──────
+(run "(.tx.begin)\\n(set n 5)\\n") -- 1
+(.sys.exec "grep -q 'ended inside a transaction' /tmp/rftest_txl.err") -- 0
+(run "(println n)\\n") -- 0
+(shows "2") -- 0
+
+;; ── what a rollback cannot undo is refused in a script's too ────────
+(run "(.tx.begin)\\n(set n 6)\\n(write \"/tmp/rftest_txl_w\" \"x\")\\n(.tx.commit)\\n") -- 1
+(.sys.exec "test ! -e /tmp/rftest_txl_w") -- 0
+(run "(println n)\\n") -- 0
+(shows "2") -- 0
+
+;; ── the REPL on a pipe: a client that asks in the middle waits ──────
+;; The input opens a transaction, pauses, then commits; the client connects
+;; during the pause and gets its answer only after the commit, with the
+;; committed value.
+(.sys.exec "printf '(set b (.ipc.open \"127.0.0.1:19982\"))\\n(println (.ipc.send b \"n\"))\\n' > /tmp/rftest_txl_b.rfl; rm -f /tmp/rftest_txl_b.out")
+(.sys.exec "( (printf '(.tx.begin)\\n(set n 7)\\n'; sleep 1.5; printf '(.tx.commit)\\n'; sleep 1.5) | ./rayforce -i -L /tmp/rftest_txl -p 19982 >/dev/null 2>&1 & )")
+(.sys.exec "for i in $(seq 100); do bash -c '(echo > /dev/tcp/127.0.0.1/19982) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "./rayforce -f /tmp/rftest_txl_b.rfl </dev/null >/tmp/rftest_txl_b.out 2>&1 &")
+(.sys.exec "sleep 0.6")
+(.sys.exec "test ! -s /tmp/rftest_txl_b.out") -- 0
+(.sys.exec "for i in $(seq 60); do test -s /tmp/rftest_txl_b.out && exit 0; sleep 0.05; done; exit 1") -- 0
+(.sys.exec "grep -qx 7 /tmp/rftest_txl_b.out") -- 0
+(.sys.exec "for i in $(seq 80); do pgrep -f '[r]ayforce -i -L /tmp/rftest_txl' >/dev/null || exit 0; sleep 0.05; done; pkill -KILL -f '[r]ayforce -i -L /tmp/rftest_txl'; exit 0") -- 0
+
+;; ── the pipe: an error rolls back, later lines take no effect ───────
+(.sys.exec "printf '(.tx.begin)\\n(set n 8)\\n(no_such_function 1)\\n(set n 9)\\n(.tx.rollback)\\n(set m 1)\\n' | ./rayforce -L /tmp/rftest_txl >/tmp/rftest_txl.out 2>&1; true")
+(.sys.exec "grep -q 'the transaction was rolled back' /tmp/rftest_txl.out") -- 0
+(run "(println (list n m))\\n") -- 0
+(shows "[7 1]") -- 0
+
+;; ── the pipe ends inside a transaction: rolled back ─────────────────
+(.sys.exec "printf '(.tx.begin)\\n(set n 10)\\n' | ./rayforce -L /tmp/rftest_txl >/tmp/rftest_txl.out 2>&1; true")
+(.sys.exec "grep -q 'input ended inside a transaction' /tmp/rftest_txl.out") -- 0
+(run "(println n)\\n") -- 0
+(shows "7") -- 0
+
+(.sys.exec "rm -rf /tmp/rftest_txl*")
