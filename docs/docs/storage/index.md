@@ -213,7 +213,7 @@ What this guarantees:
 (.db.splayed.set "/data/merged/2024.01/trades" (xcols P (drop (cols P) 1)) "/data/merged/.sym")
 ```
 
-The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls. The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds; only a string column's dictionary index (up to about 12 bytes a row while it is built, `{index: false}` skips it) grows with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
+The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null). The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds; only a string column's dictionary index (up to about 12 bytes a row while it is built, `{index: false}` skips it) grows with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
 
 ### Loading Partitioned Data
 
