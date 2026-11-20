@@ -3934,14 +3934,53 @@ typedef struct {
     int64_t** kept;
     int64_t* kept_n;
     int64_t* kept_cap;
-    /* tie: [tasks][cap] max-heaps of the smallest key slots tied at the
-     * threshold (agg_lean_key), tie_n their sizes; NULL keeps every tie */
-    int64_t* tie;
+    /* tie: [tasks][cap] heaps of the groups tied at the threshold that the
+     * stable sort would take (agg_tie_worse at the top), tie_n their sizes;
+     * NULL keeps every tie.  exact64: the values are 64-bit integers, which
+     * the double threshold ties when they only round alike — the heap ranks
+     * them by their own values. */
+    struct agg_lean_tie* tie;
     int64_t* tie_n;
     int64_t ps;
     uint32_t bits;
+    bool exact64;
     _Atomic(int) fail;
 } agg_lean_ctx_t;
+
+/* A group tied at a top-N threshold: its value (exact64; else 0, the
+ * double being exact) and its key slot (agg_lean_key). */
+typedef struct agg_lean_tie { int64_t ex, key; } agg_lean_tie_t;
+
+/* a ranks after b in the take's direction: the worse value, then the later
+ * key slot (the stable sort keeps the earlier) */
+static inline bool agg_tie_worse(agg_lean_tie_t a, agg_lean_tie_t b, bool desc) {
+    if (a.ex != b.ex) return desc ? a.ex < b.ex : a.ex > b.ex;
+    return a.key > b.key;
+}
+static int agg_tie_cmp_desc(const void* pa, const void* pb) {
+    agg_lean_tie_t a = *(const agg_lean_tie_t*)pa, b = *(const agg_lean_tie_t*)pb;
+    return agg_tie_worse(a, b, true) ? 1 : agg_tie_worse(b, a, true) ? -1 : 0;
+}
+static int agg_tie_cmp_asc(const void* pa, const void* pb) {
+    agg_lean_tie_t a = *(const agg_lean_tie_t*)pa, b = *(const agg_lean_tie_t*)pb;
+    return agg_tie_worse(a, b, false) ? 1 : agg_tie_worse(b, a, false) ? -1 : 0;
+}
+
+/* The exact values of 64-bit integer groups (agg_group_values_f64's
+ * counterpart for the ties): a null as INT64_MIN, one value for all nulls. */
+static bool agg_group_values_i64(const agg_vtable_t* vt, const char* states, size_t stride,
+                                 size_t off, const int64_t* slots, int64_t n, int64_t param,
+                                 int64_t* out) {
+    ray_t* cell = ray_vec_new(vt->out_type, 1);
+    if (!cell || RAY_IS_ERR(cell)) { if (cell) ray_error_free(cell); return false; }
+    cell->len = 1;
+    for (int64_t i = 0; i < n; i++) {
+        bool is_null = agg_finalize_value(vt, states + (size_t)slots[i] * stride + off, cell, 0, param);
+        out[i] = is_null ? INT64_MIN : ((const int64_t*)ray_data(cell))[0];
+    }
+    ray_release(cell);
+    return true;
+}
 
 /* The key slot of slab index x (agg_part_index inverted): the order the slab
  * emits its groups unfiltered. */
@@ -4012,28 +4051,56 @@ static void agg_lean_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
                 int64_t k = agg_topn_mark(vals, n, ef, c->have_thr, c->thr, keep);
                 if (c->tie) {
                     /* ties go to the task's heap, the strict ones (fewer
-                     * than N in all) to the kept list */
-                    int64_t* h = c->tie + (size_t)t * c->cap;
+                     * than N in all) to the kept list.  The double order is
+                     * monotone in the exact one: a strict group beats every
+                     * tie exactly, and only the ties need their own values. */
+                    agg_lean_tie_t* h = c->tie + (size_t)t * c->cap;
                     int64_t hn = c->tie_n[t], ns = 0;
-                    for (int64_t i = 0; i < n; i++) {
-                        if (!keep[i]) continue;
-                        if (ef->desc ? vals[i] > c->thr : vals[i] < c->thr) { keep[ns++] = (uint8_t)1; slots[ns - 1] = slots[i]; continue; }
-                        int64_t key = agg_lean_key(slots[i], c->ps, c->bits), at;
-                        if (hn < c->cap) {
-                            at = hn++;
-                            while (at > 0 && h[(at - 1) / 2] < key) { h[at] = h[(at - 1) / 2]; at = (at - 1) / 2; }
-                            h[at] = key;
-                        } else if (key < h[0]) {
-                            at = 0;
-                            for (;;) {
-                                int64_t ch = 2 * at + 1;
-                                if (ch >= hn) break;
-                                if (ch + 1 < hn && h[ch + 1] > h[ch]) ch++;
-                                if (h[ch] <= key) break;
-                                h[at] = h[ch]; at = ch;
+                    const bool desc = ef->desc;
+                    enum { TB = 256 };
+                    int64_t tsl[TB], tex[TB];
+                    int64_t tn = 0;
+                    for (int64_t i = 0; i <= n; i++) {
+                        if (i < n) {
+                            if (!keep[i]) continue;
+                            if (desc ? vals[i] > c->thr : vals[i] < c->thr) {
+                                keep[ns++] = (uint8_t)1; slots[ns - 1] = slots[i];
+                                continue;
                             }
-                            h[at] = key;
+                            tsl[tn++] = slots[i];
+                            if (tn < TB) continue;
                         }
+                        if (tn == 0) continue;
+                        if (c->exact64) {
+                            const agg_lean_src_t* sr = c->src;
+                            if (!agg_group_values_i64(sr->vt, sr->states, sr->block, sr->off, tsl, tn,
+                                                      sr->param, tex)) {
+                                atomic_store_explicit(&c->fail, 1, memory_order_relaxed);
+                                return;
+                            }
+                        }
+                        for (int64_t j = 0; j < tn; j++) {
+                            agg_lean_tie_t e = { c->exact64 ? tex[j] : 0, agg_lean_key(tsl[j], c->ps, c->bits) };
+                            int64_t at;
+                            if (hn < c->cap) {
+                                at = hn++;
+                                while (at > 0 && agg_tie_worse(e, h[(at - 1) / 2], desc)) {
+                                    h[at] = h[(at - 1) / 2]; at = (at - 1) / 2;
+                                }
+                                h[at] = e;
+                            } else if (agg_tie_worse(h[0], e, desc)) {
+                                at = 0;
+                                for (;;) {
+                                    int64_t ch = 2 * at + 1;
+                                    if (ch >= hn) break;
+                                    if (ch + 1 < hn && agg_tie_worse(h[ch + 1], h[ch], desc)) ch++;
+                                    if (!agg_tie_worse(h[ch], e, desc)) break;
+                                    h[at] = h[ch]; at = ch;
+                                }
+                                h[at] = e;
+                            }
+                        }
+                        tn = 0;
                     }
                     c->tie_n[t] = hn;
                     n = k = ns;
@@ -4106,9 +4173,11 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
             if (cap > 0) c.have_thr = agg_topn_union_threshold(all, nc, total, ef, &c.thr);
             *have_thr = c.have_thr; *thr = c.thr;
             if (ps > 0 && c.have_thr) {
-                c.tie = ray_alloc_raw((size_t)tasks * per * sizeof(int64_t));
+                c.tie = ray_alloc_raw((size_t)tasks * per * sizeof(agg_lean_tie_t));
                 c.tie_n = ray_calloc_raw((size_t)tasks * sizeof(int64_t));
                 c.ps = ps; c.bits = bits;
+                int8_t ot = src->vt->out_type;
+                c.exact64 = !src->cnt32 && (ot == RAY_I64 || ot == RAY_TIMESTAMP || ot == RAY_TIMESPAN);
                 if (!c.tie || !c.tie_n) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
             }
             c.pass = 1;
@@ -4129,14 +4198,22 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
                     if (ps > 0 && cap > 0) {
                         /* key-slot order; the ties the stable sort takes */
                         for (int64_t i = 0; i < n; i++) o[i] = agg_lean_key(o[i], ps, bits);
-                        if (c.tie) {
+                        if (c.tie && nt > 0) {
+                            /* the tasks' ties, best first: the ones the
+                             * stable sort takes after the strict groups */
+                            agg_lean_tie_t* all_t = ray_alloc_raw((size_t)nt * sizeof(agg_lean_tie_t));
+                            if (!all_t) { ray_free_raw(o); o = NULL; goto lean_done; }
+                            int64_t m = 0;
                             for (uint32_t t = 0; t < tasks; t++) {
-                                if (c.tie_n[t]) memcpy(o + at, c.tie + (size_t)t * per, (size_t)c.tie_n[t] * sizeof(int64_t));
-                                at += c.tie_n[t];
+                                if (c.tie_n[t]) memcpy(all_t + m, c.tie + (size_t)t * per, (size_t)c.tie_n[t] * sizeof(agg_lean_tie_t));
+                                m += c.tie_n[t];
                             }
-                            qsort(o + n, (size_t)nt, sizeof(int64_t), agg_i64_cmp);
+                            qsort(all_t, (size_t)nt, sizeof(agg_lean_tie_t), ef->desc ? agg_tie_cmp_desc : agg_tie_cmp_asc);
                             int64_t room = cap - n;
-                            n += room < nt ? (room > 0 ? room : 0) : nt;
+                            if (room > nt) room = nt;
+                            for (int64_t i = 0; i < room; i++) o[n + i] = all_t[i].key;
+                            if (room > 0) n += room;
+                            ray_free_raw(all_t);
                         }
                         qsort(o, (size_t)n, sizeof(int64_t), agg_i64_cmp);
                         const int64_t mask = ((int64_t)1 << bits) - 1;
@@ -4147,6 +4224,7 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
                 }
             }
         }
+lean_done:
         for (uint32_t t = 0; t < tasks; t++) ray_free_raw(kept[t]);
         ray_free_raw(c.tie); ray_free_raw(c.tie_n);
     }

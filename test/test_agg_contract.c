@@ -5487,6 +5487,10 @@ static test_result_t test_cd_route(void) {
  * the select without them.  At 3,000 rows over 1,000 groups and at 300,000
  * rows over 100,000. */
 static test_result_t test_cd_route_key_proj(void) {
+    /* 8 workers partition the dense slab the tie cases cut (a single
+     * worker would not) */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
     /* ref: the select a composite key's projections fold into */
     static const struct { const char* q; const char* ref; } qs[] = {
         { "(select {a: a b: b u: (count (distinct h)) from: Tq by: [a b]})",
@@ -5589,10 +5593,66 @@ static test_result_t test_cd_route_key_proj(void) {
     PASS();
 }
 
+/* A top-N cut over a partitioned dense slab (agg_dense_lean_select) keeps
+ * the groups tied at the threshold that the stable sort would take — tied
+ * exactly, not as doubles: 64-bit values past 2^53 that a double cannot tell
+ * apart (an I64 or TIMESTAMP near 1.7e18, spaced 256 apart) are ranked by
+ * their own values.  Each answer is the full sort's first rows.  Pinned at 8
+ * workers, which partition the slab (a single worker would not). */
+static test_result_t test_topn_ties_exact(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* setup = ray_eval_str(
+        "(set ti (til 1000000)) (set tk (% ti 100000))"
+        "(set tv (+ 1700000000000000000 (+ (* (== tk 99999) 100) (* (== tk 99998) 50))))"
+        "(set tw (- 1700000000000000000 (+ (* (== tk 99999) 100) (* (== tk 99998) 50))))"
+        "(set Ti (table [k v w] (list tk tv tw)))"
+        "(set Tt (table [k v w] (list tk (as 'TIMESTAMP tv) (as 'TIMESTAMP tw))))"
+        "(set ti 0) (set tk 0) (set tv 0) (set tw 0)");
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const char* const tbls[] = { "Ti", "Tt" };
+    static const char* const aggs[][2] = {
+        { "(max v)", "desc" }, { "(min w)", "asc" }, { "(max w)", "desc" }, { "(min v)", "asc" },
+    };
+    static const int takes[] = { 2, 5, 3000 };
+    for (size_t t = 0; t < 2; t++)
+        for (size_t a = 0; a < sizeof aggs / sizeof aggs[0]; a++)
+            for (size_t n = 0; n < sizeof takes / sizeof takes[0]; n++) {
+                char q[256], ref[256];
+                snprintf(q, sizeof q, "(select {k: k m: %s from: %s by: k %s: m take: %d})",
+                         aggs[a][0], tbls[t], aggs[a][1], takes[n]);
+                snprintf(ref, sizeof ref, "(take (select {k: k m: %s from: %s by: k %s: m}) %d)",
+                         aggs[a][0], tbls[t], aggs[a][1], takes[n]);
+                ray_t* got = ray_eval_str(q);
+                ray_t* want = ray_eval_str(ref);
+                TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && want && !RAY_IS_ERR(want), "%s", q);
+                ray_t* fg = ray_fmt(got, 0);
+                ray_t* fw = ray_fmt(want, 0);
+                bool same = fg && fw && ray_str_len(fg) == ray_str_len(fw) &&
+                            memcmp(ray_str_ptr(fg), ray_str_ptr(fw), ray_str_len(fg)) == 0;
+                TEST_ASSERT_FMT(same, "%s: %.120s, the full sort %.120s", q,
+                                fg ? ray_str_ptr(fg) : "", fw ? ray_str_ptr(fw) : "");
+                if (fg) ray_release(fg);
+                if (fw) ray_release(fw);
+                ray_release(got); ray_release(want);
+            }
+    /* the winners themselves: the two keys off the base */
+    ray_t* k = ray_eval_str("(at (select {k: k m: (max v) from: Ti by: k desc: m take: 2}) 'k)");
+    TEST_ASSERT_TRUE(k && !RAY_IS_ERR(k) && k->type == RAY_I64 && k->len == 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(k))[0], 99999);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(k))[1], 99998);
+    ray_release(k);
+    ray_t* r = ray_eval_str("(set Ti 0) (set Tt 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
+    { "agg_contract/topn_ties_exact", test_topn_ties_exact, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_rounds", test_cd_bounded_rounds, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_edges", test_cd_bounded_edges, contract_setup, contract_teardown },
     { "agg_contract/cd_bounded_floor", test_cd_bounded_floor, contract_setup, contract_teardown },
