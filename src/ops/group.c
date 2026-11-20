@@ -2363,6 +2363,11 @@ static ray_t* count_distinct_per_group_parallel(
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
     if (!ctx.hist) { return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
+    /* Each pass reads the one before it: the histogram sizes and places the
+     * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
+     * their part unwritten (a short histogram would send the scatter past
+     * its partitions). */
+    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2413,13 +2418,16 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 3: per-partition dedup; partition is keyed on gid via
      * CDPG_PART_HASH so each gid is owned by exactly one task — odata
      * updates run without atomics. */
-    if (total > 0)
+    bool cancelled = pool_cancelled(pool);
+    if (total > 0 && !cancelled) {
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
+        cancelled = pool_cancelled(pool);
+    }
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
     scratch_free(hist_hdr);
-    return out;
+    return cancelled ? ray_error("cancel", NULL) : out;
 }
 
 /* Approximate per-group count(distinct) via HyperLogLog with sparse
@@ -2563,6 +2571,7 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     if (n_rows >= 200000) {
         ray_t* par = count_distinct_per_group_parallel(src, row_gid,
                                                         n_rows, n_groups, out);
+        if (par && RAY_IS_ERR(par)) ray_release(out);   /* a cancel */
         if (par) return par;
         /* par == NULL → no pool / OOM in scratch alloc → fall through to
          * serial path with the already-allocated `out` (still zeroed). */

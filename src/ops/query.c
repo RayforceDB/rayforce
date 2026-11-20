@@ -12394,6 +12394,12 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                 .oom       = 0,
             };
             ray_group_dispatch(cdpg_buf_par_fn, &pctx, grp_cnt, n_groups);
+            /* a cancel skips the groups it lands before: their counts are
+             * unwritten */
+            if (pool_cancelled(pool)) {
+                ray_release(src); ray_release(out);
+                return ray_error("cancel", NULL);
+            }
             if (!atomic_load_explicit(&pctx.oom, memory_order_relaxed)) {
                 ray_release(src);
                 return out;
@@ -25409,6 +25415,17 @@ by_dict_done:
                     if (gk64_hdr) scratch_free(gk64_hdr);
                 }
                 #undef KEY_READ
+                /* the probes run on the pool: a cancel skips the rows it
+                 * lands before, whose gids stay unwritten (and index the
+                 * group arrays below) */
+                if (pool_cancelled(ray_pool_get())) {
+                    ray_free(gk_hdr); ray_free(rg_hdr); ray_free(cnt_hdr);
+                    ray_free(off_hdr); ray_free(pos_hdr);
+                    RELEASE_SCAN_KEY();
+                    ray_release(result); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return ray_error("cancel", NULL);
+                }
 
                 /* When path A was taken (no materialisation), the probe
                  * above looked up gids for every row in the original
