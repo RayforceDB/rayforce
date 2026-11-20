@@ -810,13 +810,12 @@ static test_result_t test_dict_variants(void) {
     ST_Q_OK("(.db.splayed.set \"" ST_TMP "/u0/\" (table [s] (list U)) {compress: false})");
     ray_encw_test_force_str(RAY_ENC_STR_DICT);
     /* 70000 distinct strings: a save leaves the DICT out by its size (#1094,
-     * test_idict_kept_iff_fits); the subject here is a DICT with UNIQUE */
-    ray_encw_test_keep_dict(true);
-    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/u2/\" (table [s] (list U)) {compress: true})");
-    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/uq/\" (.db.splayed.get \"" ST_TMP "/u2/\") {compress: true})");   /* encoded passenger */
-    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/up/\" (.db.splayed.get \"" ST_TMP "/u0/\") {compress: true})");   /* generation-0 passenger */
+     * test_idict_kept_iff_fits) unless index: true; the subject here is a
+     * DICT with UNIQUE */
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/u2/\" (table [s] (list U)) {compress: true index: true})");
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/uq/\" (.db.splayed.get \"" ST_TMP "/u2/\") {compress: true index: true})");   /* encoded passenger */
+    ST_Q_OK("(.db.splayed.set \"" ST_TMP "/up/\" (.db.splayed.get \"" ST_TMP "/u0/\") {compress: true index: true})");   /* generation-0 passenger */
     ray_encw_test_force_str(-1);
-    ray_encw_test_keep_dict(false);
     static const struct { const char* dir; bool unique; const char* ref; } vs[3] = {
         { "/u2", true,  "U" },
         { "/uq", true,  "U" },
@@ -2483,12 +2482,11 @@ static uint64_t st_kif_write(ray_t* v, bool keep, uint8_t* kind) {
     FILE* f = fopen(STP("/kif"), "wb+");
     if (!f) return 0;
     ray_encw_t w; memset(&w, 0, sizeof w);
-    ray_encw_test_keep_dict(keep);
     const char* pool = v->str_pool ? (const char*)ray_data(v->str_pool) : NULL;
     ray_err_t e = ray_encw_begin(&w, f, RAY_STR, 0, v->len, 0, RAY_IDX_DICT, 0);
+    w.keep_dict = keep;                                    /* the save's index: true */
     if (e == RAY_OK) e = ray_encw_chunk(&w, ray_data(v), pool, v->len);
     if (e == RAY_OK) e = ray_encw_finish(&w);
-    ray_encw_test_keep_dict(false);
     uint64_t size = 0;
     ray_enc_hdr_t eh;
     if (e == RAY_OK && fseek(f, 32, SEEK_SET) == 0 && fread(&eh, 1, sizeof eh, f) == sizeof eh &&

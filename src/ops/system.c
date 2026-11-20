@@ -214,7 +214,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     }
     /* options: compress (true/false), symfile ('shared/'column) and index
      * (true/false: false builds no automatic dictionary or chunk zone; an
-     * index the column already carries is written as usual) and durable
+     * index the column already carries is written as usual; true also keeps
+     * a generation-2 dictionary absent leaves out for its size) and durable
      * (true/false: false takes the bulk path, no fsync) */
     ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
     for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
@@ -233,8 +234,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     ray_symfile_t layout;
     oerr = ray_symfile_opt_parse(opts, &layout);
     if (oerr) return oerr;
-    bool auto_index;
-    oerr = ray_splay_index_opt_parse(opts, &auto_index);
+    ray_index_opt_t index;
+    oerr = ray_splay_index_opt_parse(opts, &index);
     if (oerr) return oerr;
     bool durable;
     oerr = ray_splay_durable_opt_parse(opts, &durable);
@@ -256,7 +257,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                 : ".db.splayed.set: symfile 'column for a partition of a parted table");
     }
 
-    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, auto_index, durable);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, index, durable);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);

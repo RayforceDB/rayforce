@@ -46,6 +46,9 @@ typedef struct {
     ray_zone_acc_t* zone;   /* numeric / temporal: the running chunk zone */
     ray_dict_acc_t* dict;   /* STR: the running dictionary */
     bool    want_dict;      /* generation 2, STR: index_begin asked for the DICT (built at finish) */
+    bool    keep_dict;      /* with want_dict: write it whatever it costs (the save's index: true);
+                             * else finish leaves out one that would make the file larger
+                             * than generation 0's (ray_encw_finish) */
     bool    finished;       /* finish done: the tmp file is complete, not yet renamed */
     uint8_t gen;            /* output generation: 0, or 2 (transcoded at finish) */
     /* SYM: 0 writes positions at W32 (a zeroed writer a converter builds by

@@ -97,12 +97,6 @@ void      ray_encw_test_force_float(int enc);
  * would pass RAY_ENCW_SDICT_CAP; any other code. */
 void      ray_encw_test_force_str(int enc);
 
-/* Test hook: keep a STR column's automatic DICT whatever it costs
- * (ray_encw_finish otherwise leaves out one that would make the file larger
- * than generation 0's; the region fixtures hold a DICT over a handful of
- * strings).  false restores. */
-void      ray_encw_test_keep_dict(bool keep);
-
 /* Column assembly (spec "Format"): begin, one chunk per 65536 rows, finish. */
 typedef struct {
     FILE*    f;
@@ -130,6 +124,7 @@ typedef struct {
     bool     fsst_used;        /* some vector is FSST: the FSST_TABLE entry is written */
     uint64_t str_occ_bytes;    /* per-occurrence pooled bytes (the generation-0 bound) */
     struct ray_dict_acc_s* idict;  /* STR, index_kind DICT (P6b): generation 0's accumulator, fed per chunk */
+    bool     keep_dict;        /* set after begin: write idict whatever it costs (the save's index: true) */
     ray_sym_domain_t* sym_dom;     /* SYM: the domain the codes are positions of (RAY_ENC_SYM_PFX); NULL: no bounds */
     ray_sym_domain_raw_t sym_raw; bool sym_raw_ok;
     struct ray_symimp_s* sym_imp; int64_t sym_imp_count;   /* an import domain's dictionary */
@@ -143,6 +138,8 @@ typedef struct {
  * An OOM building it fails the column (ray_encw_chunk / finish). */
 ray_err_t ray_encw_begin(ray_encw_t* w, FILE* f, int8_t type, uint8_t attrs, int64_t len,
                          uint32_t sym_count, uint8_t index_kind, uint8_t col_flags);
+/* finish leaves that DICT out when the file with it would be larger than
+ * the generation-0 file of the same column (#1094), unless w->keep_dict. */
 ray_err_t ray_encw_chunk(ray_encw_t* w, const void* data, const char* str_pool, int64_t n);
 /* Every chunk not yet written, of a column whose rows lie contiguously at
  * `data` (row i at data + i * esz): the file is byte for byte what
