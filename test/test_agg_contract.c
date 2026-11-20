@@ -5239,6 +5239,48 @@ static test_result_t test_cd_route(void) {
     setup = ray_eval_str("(set Tf 0) (set fr 0) (set fb 0)");
     if (setup) ray_release(setup);
 
+    /* a predicate the zone gate answers in whole chunks: a splayed table
+     * (64 K-row chunk zones on id) of 7 chunks of singletons, then 50
+     * groups.  `(>= id 458752)` rules the singletons' chunks out and keeps
+     * every row it samples among the rest — those rows stand for the
+     * selection (population P), not the table: the slices.  The table's
+     * estimate (the singletons' share) took the rewrite. */
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_cd_zone"));
+    setup = ray_eval_str(ray_test_tmp(
+        "(set zr (til 1048576)) (set zl (< zr 458752))"
+        "(.db.splayed.set \"/tmp/rayforce_test_cd_zone/t/\" (table [id k x]"
+        " (list zr (+ (* zl (+ 1000 zr)) (* (- 1 zl) (% zr 50))) (% (* zr 7919) 1000003))))"
+        "(set Tz (.db.splayed.get \"/tmp/rayforce_test_cd_zone/t/\")) (set zr 0) (set zl 0)"));
+    TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    {
+        ray_t* tz = ray_eval_str("Tz");
+        ray_t* w  = ray_eval_str("(quote (>= id 458752))");
+        TEST_ASSERT_TRUE(tz && !RAY_IS_ERR(tz) && w && !RAY_IS_ERR(w));
+        const int64_t* rows = NULL;
+        int64_t nrows = 0, pop = 0;
+        ray_t* hdr = query_cd_gate_where_rows(tz, w, N, &rows, &nrows, &pop);
+        TEST_ASSERT_NOT_NULL(hdr);
+        TEST_ASSERT_EQ_I(pop, N - 458752);
+        TEST_ASSERT_EQ_I(nrows, 262144);
+        int64_t below = 0;
+        for (int64_t j = 0; j < nrows; j++) if (rows[j] < 458752) below++;
+        TEST_ASSERT_EQ_I(below, 0);
+        scratch_free(hdr);
+        ray_release(w); ray_release(tz);
+        uint64_t rw0, sl0, rw1, sl1;
+        ray_query_test_cd_gate(&rw0, &sl0);
+        ray_t* got = ray_eval_str("(count (select {from: Tz where: (>= id 458752) by: k n: (count (distinct x))}))");
+        ray_query_test_cd_gate(&rw1, &sl1);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == -RAY_I64 && got->i64 == 50, "zone-gated select");
+        ray_release(got);
+        TEST_ASSERT_FMT(rw1 - rw0 == 0 && sl1 - sl0 == 1, "zone-gated select: %llu rewrites, %llu slices",
+                        (unsigned long long)(rw1 - rw0), (unsigned long long)(sl1 - sl0));
+    }
+    setup = ray_eval_str("(set Tz 0)");
+    if (setup) ray_release(setup);
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_cd_zone"));
+
     /* 524,288 groups of 19 rows over 10 M rows, within the band: the
      * tuples decide — a twentieth of the rows (K determines X) take the
      * rewrite, every row distinct the slices */

@@ -16001,7 +16001,14 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
             } else if (out_hdr) { scratch_free(out_hdr); out_hdr = NULL; }
             if (ind) ray_release(ind);
         } else if (fres && !RAY_IS_ERR(fres)) {
-            *population = n_table;   /* no selection: every sampled row kept */
+            /* no selection: every sampled row kept.  Over the whole table
+             * the table's estimate is the selection's; over the P rows the
+             * zone gate let through, the sampled rows stand for them. */
+            if (P < n_table) {
+                *rows = idx; *nrows = n_s;
+                out_hdr = idx_hdr; idx_hdr = NULL;
+            }
+            *population = P;
         }
         if (fres) { if (RAY_IS_ERR(fres)) ray_error_free(fres); else ray_release(fres); }
         ray_graph_free(gs);
