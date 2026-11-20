@@ -128,6 +128,102 @@
 (nil? (.ipc.send h "(.tx.commit)")) -- true
 (.ipc.send h "n") -- 4
 
+;; ── what a rollback could not take back is refused inside one ───────
+;; ...and being an error, the refusal rolls the transaction back.  Outside
+;; a transaction the same verbs run as ever.
+(.ipc.send h "(.sys.exec \"true\")") -- 0
+(nil? (.ipc.send h "(.log.sync)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.sys.exec \"true\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.sys.trust (quote n))") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.sys.listen 19982)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(write \"/tmp/rftest_tx_w\" \"x\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(write-bytes \"/tmp/rftest_tx_w\" \"x\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(write-csv t \"/tmp/rftest_tx_w\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.csv.write t \"/tmp/rftest_tx_w\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.csv.splayed \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.csv.parted \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.parquet.splayed \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.parquet.parted \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(hnsw-save 0 \"/tmp/rftest_tx_w\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.db.parted.fill \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_d/\" t)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.open (quote async) \"/tmp/rftest_tx_other\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.replay \"/tmp/rftest_tx_none\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.replay_report \"/tmp/rftest_tx_none\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.roll)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.snapshot)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.sync)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.close)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.purge)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 4
+(.sys.exec "test ! -e /tmp/rftest_tx_w && test ! -e /tmp/rftest_tx_d && test ! -e /tmp/rftest_tx_other.log") -- 0
+
 ;; ── the owner disconnects: rolled back, the server goes on ──────────
 (nil? (.ipc.send h "(.tx.begin)")) -- true
 (.ipc.send h "(set n 60)") -- 60

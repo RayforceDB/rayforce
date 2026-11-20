@@ -282,8 +282,11 @@ static bool mutator_head_is_global(const ray_t* hd, const ray_t* head) {
     return !ray_env_get_local(hd->i64) && ray_env_get_global(hd->i64) == head;
 }
 
+/* Also what a transaction refuses: a verb whose effect a rollback could
+ * not take back. */
 static inline bool fn_is_restricted(ray_t* fn_obj) {
-    return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
+    return (__VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED)) ||
+           (ray_tx_active && (fn_obj->attrs & RAY_FN_NO_TX));
 }
 
 /* A lambda the server marked with .sys.trust, called by restricted code:
@@ -5371,23 +5374,23 @@ static void ray_register_builtins(void) {
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
-    register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
+    register_vary("write-csv",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
-    register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
-    register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
-    register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
+    register_vary(".csv.splayed",      RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_read_csv_splayed_fn);
+    register_vary(".csv.parted",       RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_read_csv_parted_fn);
+    register_vary(".csv.write",        RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_csv_fn);
     register_vary(".parquet.scan",     RAY_FN_RESTRICTED, ray_parquet_scan_fn);
     register_unary(".parquet.meta",    RAY_FN_RESTRICTED, ray_parquet_metadata_fn);
     register_vary(".parquet.read",     RAY_FN_RESTRICTED, ray_parquet_read_fn);
     register_vary(".parquet.each",     RAY_FN_RESTRICTED, ray_parquet_each_fn);
-    register_vary(".parquet.splayed",  RAY_FN_RESTRICTED, ray_parquet_splayed_fn);
-    register_vary(".parquet.parted",   RAY_FN_RESTRICTED, ray_parquet_parted_fn);
+    register_vary(".parquet.splayed",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_parquet_splayed_fn);
+    register_vary(".parquet.parted",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_parquet_parted_fn);
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
     register_unary("read-bytes", RAY_FN_RESTRICTED, ray_read_bytes_fn);
-    register_binary("write",    RAY_FN_RESTRICTED, ray_write_file_fn);
-    register_binary("write-bytes", RAY_FN_RESTRICTED, ray_write_bytes_fn);
+    register_binary("write",    RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_file_fn);
+    register_binary("write-bytes", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_bytes_fn);
     register_unary("load",      RAY_FN_RESTRICTED, ray_load_file_fn);
     register_unary("exit",      RAY_FN_RESTRICTED, ray_exit_fn);
     register_vary("resolve",    RAY_FN_SPECIAL_FORM, ray_resolve_fn);
@@ -5429,11 +5432,11 @@ static void ray_register_builtins(void) {
      * dedicated `.db.*` namespace so format-specific siblings stay
      * grouped (set/get per format) and there's room to grow
      * without polluting the top-level builtin namespace. */
-    register_vary(".db.splayed.set",   RAY_FN_RESTRICTED, ray_set_splayed_fn);
+    register_vary(".db.splayed.set",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_set_splayed_fn);
     register_vary(".db.splayed.get",   RAY_FN_NONE,       ray_get_splayed_fn);
     register_vary(".db.parted.get",    RAY_FN_NONE,       ray_get_parted_fn);
     register_vary(".db.parted.tables", RAY_FN_NONE,       ray_get_parted_tables_fn);
-    register_vary(".db.parted.fill",   RAY_FN_RESTRICTED, ray_fill_parted_fn);
+    register_vary(".db.parted.fill",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_fill_parted_fn);
 
     /* GUID generation */
     register_unary("guid",       RAY_FN_NONE, ray_guid_fn);
@@ -5473,7 +5476,7 @@ static void ray_register_builtins(void) {
      * user code can't shadow them and a glance at the name identifies
      * the category. */
     register_vary (".sys.gc",   RAY_FN_NONE,        ray_gc_fn);
-    register_vary (".sys.exec", RAY_FN_RESTRICTED,  ray_system_fn);
+    register_vary (".sys.exec", RAY_FN_RESTRICTED | RAY_FN_NO_TX,  ray_system_fn);
     register_unary(".mem.objsize", RAY_FN_NONE,      ray_mem_objsize_fn);
     register_vary (".mem.ts",      RAY_FN_SPECIAL_FORM, ray_mem_ts_fn);
     /* Registry-dispatched system commands.  `.sys.cmd "name args"` is
@@ -5482,8 +5485,8 @@ static void ray_register_builtins(void) {
      * in hand.  All share the table in lang/syscmd.c. */
     register_unary(".sys.cmd",    RAY_FN_RESTRICTED, ray_syscmd_string_dispatch_fn);
     register_vary (".sys.timeit", RAY_FN_NONE,       ray_sys_timeit_fn);
-    register_unary(".sys.listen", RAY_FN_RESTRICTED, ray_sys_listen_fn);
-    register_unary(".sys.trust",  RAY_FN_RESTRICTED, ray_sys_trust_fn);
+    register_unary(".sys.listen", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_sys_listen_fn);
+    register_unary(".sys.trust",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_sys_trust_fn);
     register_vary (".sys.env",    RAY_FN_NONE,       ray_sys_env_fn);
     register_vary (".sys.args",   RAY_FN_NONE,       ray_sys_args_fn);
 
@@ -5537,16 +5540,16 @@ static void ray_register_builtins(void) {
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at
      * startup; these builtins expose the same machinery to Rayfall code
      * for manual control (open from a script, snapshot on demand, etc). */
-    register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
+    register_vary(".log.open",     RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_open_fn);
     register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
-    register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
-    register_unary(".log.replay_report", RAY_FN_RESTRICTED, ray_log_replay_report_fn);
+    register_unary(".log.replay",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_replay_fn);
+    register_unary(".log.replay_report", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_replay_report_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
-    register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
-    register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);
-    register_vary(".log.sync",     RAY_FN_NONE,       ray_log_sync_fn);
-    register_vary(".log.close",    RAY_FN_RESTRICTED, ray_log_close_fn);
-    register_vary(".log.purge",    RAY_FN_RESTRICTED, ray_log_purge_fn);
+    register_vary(".log.roll",     RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_roll_fn);
+    register_vary(".log.snapshot", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_snapshot_fn);
+    register_vary(".log.sync",     RAY_FN_NONE | RAY_FN_NO_TX,       ray_log_sync_fn);
+    register_vary(".log.close",    RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_close_fn);
+    register_vary(".log.purge",    RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_purge_fn);
 
     /* Transactions under `.tx.*`: one at a time, owned by a connection. */
     register_vary(".tx.begin",     RAY_FN_RESTRICTED, ray_tx_begin_fn);
@@ -5643,7 +5646,7 @@ static void ray_register_builtins(void) {
     register_vary  ("hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
     register_vary  ("ann",         RAY_FN_NONE, ray_ann_fn);
     register_unary ("hnsw-free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
-    register_binary("hnsw-save",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
+    register_binary("hnsw-save",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_hnsw_save_fn);
     register_unary ("hnsw-load",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
     register_unary ("hnsw-info",   RAY_FN_NONE, ray_hnsw_info_fn);
 
