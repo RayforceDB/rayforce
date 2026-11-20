@@ -35,6 +35,7 @@
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
+#include "lang/callprof.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -13021,7 +13022,65 @@ static test_result_t test_dotted_local_read_slot(void) {
     PASS();
 }
 
+/* ---- Call profiler: every timed call closes its frame ---- */
+/* An error leaves a timed call by its normal return (the VM and the tree
+ * walker test for errors after the callee returns), so the frame stack is
+ * empty after each top-level expression, whatever failed inside it: a
+ * builtin's error in compiled code, caught or not, one inside a lambda run
+ * by map, one at top level, and a call that switched profiling off or
+ * reset it while frames were open. */
+static test_result_t test_callprof_error_unwinds(void) {
+    static const char* const setup[] = {
+        "(set pe-bad (fn [x] (+ x 'a)))",
+        "(set pe-map (fn [v] (map (fn [y] (+ y 'a)) v)))",
+        "(set pe-try (fn [x] (try (pe-bad x) 0)))",
+        "(set pe-deep (fn [x] (sum (map pe-try (til x)))))",
+        "(set pe-off (fn [] (.sys.profile.enable 0) (+ 1 2)))",
+        "(set pe-reset (fn [] (.sys.profile.reset) (map (fn [y] (+ y 1)) [1 2])))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    static const struct { const char* src; bool err; } runs[] = {
+        { "(pe-bad 1)",          true  },
+        { "(pe-map [1 2])",      true  },
+        { "(map pe-bad [1 2])",  true  },
+        { "(pe-try 1)",          false },
+        { "(pe-deep 4)",         false },
+        { "(+ 1 'a)",            true  },
+        { "(raise 'boom)",       true  },
+        { "(pe-reset)",          false },
+        { "(pe-off)",            false },
+    };
+    for (size_t i = 0; i < sizeof runs / sizeof *runs; i++) {
+        ray_callprof_set_enabled(true);
+        TEST_ASSERT_TRUE(ray_callprof_on());
+        ray_t* r = ray_eval_str(runs[i].src);
+        TEST_ASSERT_EQ_I(RAY_IS_ERR(r) ? 1 : 0, runs[i].err ? 1 : 0);
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    }
+    /* An erroring call is still counted at its site: from scratch, pe-deep
+     * reaches pe-bad's `+` once per element, each error caught by pe-try. */
+    ray_callprof_set_enabled(false);
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    ray_t* r = ray_eval_str("(pe-deep 4)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+    r = ray_eval_str("(sum (at (select {from: (.sys.profile) where: (== fn 'pe-bad)}) 'calls))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 4);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
+    { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
