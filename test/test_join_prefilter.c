@@ -92,9 +92,9 @@ static ray_t* jp_add(ray_t* tbl, const char* name, ray_t* col) {
 static ray_t* jp_table(const int64_t* book, int64_t n, uint8_t wv, uint8_t wi,
                        bool sid32) {
     size_t cap = (size_t)(n ? n : 1);
-    int64_t* vid = malloc(cap * sizeof *vid);
-    int64_t* iid = malloc(cap * sizeof *iid);
-    int64_t* sid = malloc(cap * sizeof *sid);
+    int64_t* vid = calloc(cap, sizeof *vid);
+    int64_t* iid = calloc(cap, sizeof *iid);
+    int64_t* sid = calloc(cap, sizeof *sid);
     int64_t* px  = malloc(cap * sizeof *px);
     if (!vid || !iid || !sid || !px) {
         free(vid); free(iid); free(sid); free(px);
