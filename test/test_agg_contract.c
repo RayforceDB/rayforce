@@ -5541,7 +5541,50 @@ static test_result_t test_cd_route_key_proj(void) {
             TEST_ASSERT_FMT(as_ref, "size %zu query %zu: not the select without the projections", m, i);
         }
     }
-    ray_t* r = ray_eval_str("(set Tq 0) (set qi 0) (set q0 0)");
+    /* Ties under desc:/take:: groups of a few rows count the same few
+     * values, and both routes keep the tied groups the full stable sort
+     * would, in its order.  The rewrite's outer group cut them from a
+     * partitioned slab in slab order (key 1, 129, 257, ... at 28 workers,
+     * 1, 65, 129, ... at 8) where the slices' sort keeps 1, 2, 3, ... */
+    static const char* const tq[] = {
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k desc: u take: 5})",
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k desc: u take: 1000})",
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k asc: u take: 5})",
+        "(select {u: (count (distinct h)) from: Tt where: (> g 0) by: [a b] desc: u take: 5})",
+        "(select {k: k u: (count (distinct h)) from: Tt where: (> g 0) by: k desc: u})",
+    };
+    static const char* const tm[] = {
+        "(set ti (til 300000)) (set tk (% (* ti 7919) 100000))",
+        "(set ti (til 3000)) (set tk (% (* ti 7919) 1000))",
+        "(set ti (til 1200000)) (set tk (% (* ti 7919) 1000000))",
+    };
+    for (size_t m = 0; m < sizeof tm / sizeof tm[0]; m++) {
+        char src[512];
+        snprintf(src, sizeof src, "%s (set Tt (table [k a b h g] (list tk (as 'I32 (%% tk 1000))"
+                 " (as 'I32 (div tk 1000)) (%% (* ti 104729) 1000003) (%% ti 10))))", tm[m]);
+        ray_t* setup = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+        ray_release(setup);
+        for (size_t i = 0; i < sizeof tq / sizeof tq[0]; i++) {
+            ray_t* got[2];
+            for (int r = 0; r < 2; r++) {
+                ray_query_test_cd_route(r + 1);
+                got[r] = ray_eval_str(tq[i]);
+                ray_query_test_cd_route(0);
+                TEST_ASSERT_FMT(got[r] && !RAY_IS_ERR(got[r]) && got[r]->type == RAY_TABLE,
+                                "ties %zu query %zu route %d", m, i, r + 1);
+            }
+            ray_t* fa = ray_fmt(got[0], 0);
+            ray_t* fb = ray_fmt(got[1], 0);
+            bool same = fa && fb && ray_str_len(fa) == ray_str_len(fb) &&
+                        memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+            if (fa) ray_release(fa);
+            if (fb) ray_release(fb);
+            ray_release(got[0]); ray_release(got[1]);
+            TEST_ASSERT_FMT(same, "ties %zu query %zu: the routes differ", m, i);
+        }
+    }
+    ray_t* r = ray_eval_str("(set Tq 0) (set qi 0) (set q0 0) (set Tt 0) (set ti 0) (set tk 0)");
     if (r) ray_release(r);
     PASS();
 }

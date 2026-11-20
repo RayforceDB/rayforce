@@ -3934,8 +3934,21 @@ typedef struct {
     int64_t** kept;
     int64_t* kept_n;
     int64_t* kept_cap;
+    /* tie: [tasks][cap] max-heaps of the smallest key slots tied at the
+     * threshold (agg_lean_key), tie_n their sizes; NULL keeps every tie */
+    int64_t* tie;
+    int64_t* tie_n;
+    int64_t ps;
+    uint32_t bits;
     _Atomic(int) fail;
 } agg_lean_ctx_t;
+
+/* The key slot of slab index x (agg_part_index inverted): the order the slab
+ * emits its groups unfiltered. */
+static inline int64_t agg_lean_key(int64_t x, int64_t ps, uint32_t bits) {
+    int64_t p = x / ps;
+    return ((x - p * ps) << bits) | p;
+}
 
 static bool agg_lean_vals(const agg_lean_src_t* s, const int64_t* slots, int64_t n, double* out) {
     if (s->cnt32) {
@@ -3997,6 +4010,34 @@ static void agg_lean_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
                 }
             } else {
                 int64_t k = agg_topn_mark(vals, n, ef, c->have_thr, c->thr, keep);
+                if (c->tie) {
+                    /* ties go to the task's heap, the strict ones (fewer
+                     * than N in all) to the kept list */
+                    int64_t* h = c->tie + (size_t)t * c->cap;
+                    int64_t hn = c->tie_n[t], ns = 0;
+                    for (int64_t i = 0; i < n; i++) {
+                        if (!keep[i]) continue;
+                        if (ef->desc ? vals[i] > c->thr : vals[i] < c->thr) { keep[ns++] = (uint8_t)1; slots[ns - 1] = slots[i]; continue; }
+                        int64_t key = agg_lean_key(slots[i], c->ps, c->bits), at;
+                        if (hn < c->cap) {
+                            at = hn++;
+                            while (at > 0 && h[(at - 1) / 2] < key) { h[at] = h[(at - 1) / 2]; at = (at - 1) / 2; }
+                            h[at] = key;
+                        } else if (key < h[0]) {
+                            at = 0;
+                            for (;;) {
+                                int64_t ch = 2 * at + 1;
+                                if (ch >= hn) break;
+                                if (ch + 1 < hn && h[ch + 1] > h[ch]) ch++;
+                                if (h[ch] <= key) break;
+                                h[at] = h[ch]; at = ch;
+                            }
+                            h[at] = key;
+                        }
+                    }
+                    c->tie_n[t] = hn;
+                    n = k = ns;
+                }
                 if (c->kept_n[t] + k > c->kept_cap[t]) {
                     int64_t nc = c->kept_cap[t] ? c->kept_cap[t] * 2 : 64;
                     while (nc < c->kept_n[t] + k) nc *= 2;
@@ -4011,12 +4052,23 @@ static void agg_lean_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 
+static int agg_i64_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return x < y ? -1 : x > y;
+}
+
 /* The kept slots among the occupied ones, ascending, in *out (the caller
  * frees it); their count, or -1 when the filter aggregate has no scalar order
- * or memory ran out. */
+ * or memory ran out.  With ps > 0 (slab index x holds key slot
+ * agg_lean_key(x, ps, bits)) the kept slots come in key-slot order instead,
+ * the order the slab emits its groups unfiltered, and of the groups tied at
+ * the threshold only the ones the stable sort downstream would take stay
+ * (the smallest key slots), so N groups remain: a partitioned slab lists its
+ * slots partition first, and the sort then kept other tied groups than the
+ * unfiltered output gives it.  Each task keeps its ties in a heap of N. */
 static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src,
         const uint64_t* occ, int64_t total_slots, const ray_group_emit_filter_t* ef,
-        int64_t** out, bool* have_thr, double* thr) {
+        int64_t ps, uint32_t bits, int64_t** out, bool* have_thr, double* thr) {
     *out = NULL; *have_thr = false; *thr = 0;
     int64_t words = (total_slots + 63) / 64;
     int64_t cap = ef->top_count_take > 0 ? ef->top_count_take : 0;
@@ -4053,19 +4105,42 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
             }
             if (cap > 0) c.have_thr = agg_topn_union_threshold(all, nc, total, ef, &c.thr);
             *have_thr = c.have_thr; *thr = c.thr;
+            if (ps > 0 && c.have_thr) {
+                c.tie = ray_alloc_raw((size_t)tasks * per * sizeof(int64_t));
+                c.tie_n = ray_calloc_raw((size_t)tasks * sizeof(int64_t));
+                c.ps = ps; c.bits = bits;
+                if (!c.tie || !c.tie_n) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
+            }
             c.pass = 1;
             if (tasks > 1) ray_pool_dispatch_n(pool, agg_lean_fn, &c, tasks);
             else agg_lean_fn(&c, 0, 0, 1);
             if (agg_cancelled()) atomic_store_explicit(&c.fail, 1, memory_order_relaxed);
             if (!atomic_load_explicit(&c.fail, memory_order_relaxed)) {
-                int64_t n = 0;
+                int64_t n = 0, nt = 0;
                 for (uint32_t t = 0; t < tasks; t++) n += c.kept_n[t];
-                int64_t* o = ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+                if (c.tie) for (uint32_t t = 0; t < tasks; t++) nt += c.tie_n[t];
+                int64_t* o = ray_alloc_raw((size_t)(n + nt > 0 ? n + nt : 1) * sizeof(int64_t));
                 if (o) {
                     int64_t at = 0;
                     for (uint32_t t = 0; t < tasks; t++) {
                         if (c.kept_n[t]) memcpy(o + at, c.kept[t], (size_t)c.kept_n[t] * sizeof(int64_t));
                         at += c.kept_n[t];
+                    }
+                    if (ps > 0 && cap > 0) {
+                        /* key-slot order; the ties the stable sort takes */
+                        for (int64_t i = 0; i < n; i++) o[i] = agg_lean_key(o[i], ps, bits);
+                        if (c.tie) {
+                            for (uint32_t t = 0; t < tasks; t++) {
+                                if (c.tie_n[t]) memcpy(o + at, c.tie + (size_t)t * per, (size_t)c.tie_n[t] * sizeof(int64_t));
+                                at += c.tie_n[t];
+                            }
+                            qsort(o + n, (size_t)nt, sizeof(int64_t), agg_i64_cmp);
+                            int64_t room = cap - n;
+                            n += room < nt ? (room > 0 ? room : 0) : nt;
+                        }
+                        qsort(o, (size_t)n, sizeof(int64_t), agg_i64_cmp);
+                        const int64_t mask = ((int64_t)1 << bits) - 1;
+                        for (int64_t i = 0; i < n; i++) o[i] = (o[i] & mask) * ps + (o[i] >> bits);
                     }
                     *out = o;
                     result = n;
@@ -4073,10 +4148,12 @@ static int64_t agg_dense_lean_select(ray_pool_t* pool, const agg_lean_src_t* src
             }
         }
         for (uint32_t t = 0; t < tasks; t++) ray_free_raw(kept[t]);
+        ray_free_raw(c.tie); ray_free_raw(c.tie_n);
     }
     ray_free_raw(cand); ray_free_raw(all); ray_free_raw(meta); ray_free_raw(kept);
     return result;
 }
+
 
 /* The occupancy bitmap of a first-row array: bit s is set when slot s holds a
  * group (first[s] != INT64_MAX).  Word ranges, one task each. */
@@ -4280,7 +4357,10 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             .off = off[ef->agg_index], .param = ext->agg_k ? ext->agg_k[ef->agg_index] : 0,
             .cnt32 = u32c ? (const uint32_t*)gstates : NULL };
         bool lean_thr; double lean_thrv;
-        int64_t kept = pre_n >= 0 ? pre_n : agg_dense_lean_select(pool, &src, occ, total_slots, ef, &occupied_slot, &lean_thr, &lean_thrv);
+        int64_t kept = pre_n >= 0 ? pre_n
+                     : agg_dense_lean_select(pool, &src, occ, total_slots, ef,
+                                             key_bits ? key_part_slots : total_slots, key_bits,
+                                             &occupied_slot, &lean_thr, &lean_thrv);
         if (pre_n >= 0) occupied_slot = pre_slots;
         if (kept >= 0) {
             ng = kept;
@@ -5257,7 +5337,7 @@ static ray_t* agg_dense_shared(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
             .cnt32 = u32c ? c.cnt32 : NULL };
         bool have_thr;
         double thr;
-        int64_t k = agg_dense_lean_select(pool, &src, (const uint64_t*)c.occupied, slots, ef, &pre, &have_thr, &thr);
+        int64_t k = agg_dense_lean_select(pool, &src, (const uint64_t*)c.occupied, slots, ef, 0, 0, &pre, &have_thr, &thr);
         if (k >= 0) {
             if (!agg_dense_cut_ties(pool, &c, d, &src, ef, have_thr, thr, rows, pre, &k, &ferr)) {
                 ray_free_raw(pre);
