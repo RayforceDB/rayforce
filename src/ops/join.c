@@ -57,6 +57,21 @@ bool ray_join_no_prefilter = false;
 uint64_t ray_join_prefilter_builds = 0;
 _Atomic(uint64_t) ray_join_prefilter_skips = 0;
 
+/* #599: probe-side rows from which the chained probe goes to the pool, set by
+ * (.sys.join.par.min).  The default reproduces the morsel rule — a probe of
+ * more than one JOIN_MORSEL splits — so a value at or below it changes
+ * nothing.  Raising it trades latency for CPU on joins under the floor.  Read
+ * once per join, relaxed: a concurrent set takes effect from the next join. */
+static _Atomic(int64_t) g_join_par_min = RAY_JOIN_PAR_MIN_DEFAULT;
+int64_t ray_join_par_min(void) {
+    return atomic_load_explicit(&g_join_par_min, memory_order_relaxed);
+}
+void ray_join_set_par_min(int64_t rows) {
+    atomic_store_explicit(&g_join_par_min, rows, memory_order_relaxed);
+}
+/* Diagnostic: chained probes dispatched to the pool. */
+_Atomic(uint64_t) ray_join_par_probes = 0;
+
 /* ── #597: null-free key proof ───────────────────────────────────────────
  * ray_vec_is_null is an out-of-line call (no LTO), and the join makes one
  * per key column per row in hash_row_keys plus two per key column per
@@ -1026,6 +1041,8 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
 }
 
 #define JOIN_MORSEL 8192
+_Static_assert(RAY_JOIN_PAR_MIN_DEFAULT == JOIN_MORSEL + 1,
+               "the default probe floor must keep the one-morsel split rule");
 
 /* ── #595: right-side key bitmap prefilter ────────────────────────────────
  * One bitmap per chosen key column, over the right side's values of that
@@ -1911,6 +1928,11 @@ chained_ht_fallback:;
     /* Pass 2: Parallel probe (two-pass: count → prefix-sum → fill) */
     uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
     if (n_tasks == 0) n_tasks = 1;
+    /* #599: below the settable floor the morsels run on this thread.  Same
+     * morsels either way, so the output and its order do not change. */
+    bool par_probe = pool && n_tasks > 1 && left_rows >= ray_join_par_min();
+    if (par_probe)
+        atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
 
     int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
@@ -1953,7 +1975,7 @@ chained_ht_fallback:;
         ? (pf_s64 ? join_count_s64_fn : join_count_fn)
         : (pf_s64 ? join_count_tiny_s64_fn : join_count_tiny_fn);
     /* 2a: Count matches per morsel */
-    if (pool && n_tasks > 1)
+    if (par_probe)
         ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
     else
         for (uint32_t t = 0; t < n_tasks; t++)
@@ -1983,7 +2005,7 @@ chained_ht_fallback:;
         const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP
             ? (pf_s64 ? join_fill_s64_fn : join_fill_fn)
             : (pf_s64 ? join_fill_tiny_s64_fn : join_fill_tiny_fn);
-        if (pool && n_tasks > 1)
+        if (par_probe)
             ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
         else
             for (uint32_t t = 0; t < n_tasks; t++)

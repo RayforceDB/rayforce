@@ -1590,6 +1590,24 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     return make_i64(on ? 1 : 0);
 }
 
+/* (.sys.join.par.min [rows]) — the probe-side row count from which a hash
+ * join's chained probe is split across the pool (#599).  No arg reads it; an
+ * i64 >= 0 sets it.  Returns the value in effect.  Values at or below the
+ * default (8193) all behave as the default: a probe of one 8192-row morsel
+ * never splits.  Restricted: it changes server-wide behaviour. */
+ray_t* ray_join_par_min_fn(ray_t** args, int64_t n) {
+    if (n > 1) return ray_error("arity", ".sys.join.par.min takes no argument or a row count");
+    if (n == 1) {
+        if (args[0]->type != -RAY_I64)
+            return ray_error("type", ".sys.join.par.min: rows must be i64, got %s",
+                             ray_type_name(args[0]->type));
+        if (RAY_ATOM_IS_NULL(args[0]) || args[0]->i64 < 0)
+            return ray_error("domain", ".sys.join.par.min: rows must be a non-negative count");
+        ray_join_set_par_min(args[0]->i64);
+    }
+    return make_i64(ray_join_par_min());
+}
+
 /* Process id of this process.  getpid() is already used internally for heap
  * swap-file names; this is the same value, made reachable from Rayfall. */
 static int64_t ray_os_pid(void) {
