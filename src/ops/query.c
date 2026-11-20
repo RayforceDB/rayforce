@@ -12059,6 +12059,9 @@ static ray_t* try_count_distinct_v2_rewrite(
         bool two_pass = ray_cd_two_pass_preferred(K_cols, n_K, X_col, sel_rows, sel_nrows,
                                                   sel_pop, workers);
         if (sel_hdr) scratch_free(sel_hdr);
+        /* a cancel during the gate's sample or estimates: they stand on
+         * skipped tasks, and so would the route */
+        if (pool_cancelled(pool)) return ray_error("cancel", NULL);
         if (RAY_UNLIKELY(g_cd_gate_force)) two_pass = g_cd_gate_force == 1;
         atomic_fetch_add_explicit(two_pass ? &g_cd_gate_rewrite : &g_cd_gate_slices, 1,
                                   memory_order_relaxed);
@@ -16325,6 +16328,9 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
             ray_pool_dispatch(pool, cd_gate_gather_fn, &ctx, n_s);
         else
             cd_gate_gather_fn(&ctx, 0, 0, n_s);
+        /* a cancel skips the tasks it lands before: their rows of the
+         * sampled columns are unwritten (garbage SYM codes, values) */
+        if (pool_cancelled(pool)) { ray_release(st); st = NULL; }
         for (int i = 0; i < n_g && st; i++) {
             /* add_col releases the table on an error and returns the error */
             st = ray_table_add_col(st, syms[i], gv[i]);
@@ -16345,9 +16351,19 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
         /* the filter returns its input (the sampled table) retained, with
          * the selection installed on the graph */
         ray_t* fres = froot ? exec_node(gs, froot) : NULL;
+        /* The filter and the selection's indices run on the pool: the
+         * tasks a cancel skipped leave them unfilled, and the indices would
+         * read past the sample.  No sample then (the caller answers the
+         * cancel). */
+        ray_pool_t* pool = ray_pool_get();
+        if (fres && !RAY_IS_ERR(fres) && pool_cancelled(pool)) {
+            ray_release(fres);
+            fres = NULL;
+        }
         if (fres && !RAY_IS_ERR(fres) && gs->selection) {
             const int64_t kept = ray_rowsel_meta(gs->selection)->total_pass;
             ray_t* ind = kept > 0 ? ray_rowsel_to_indices(gs->selection) : NULL;
+            if (ind && pool_cancelled(pool)) { ray_release(ind); ind = NULL; }
             int64_t* out = (int64_t*)scratch_alloc(&out_hdr, (size_t)(kept > 0 ? kept : 1) * sizeof(int64_t));
             if (out && (ind || kept == 0)) {
                 const int64_t* ii = ind ? (const int64_t*)ray_data(ind) : NULL;
@@ -18944,6 +18960,13 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     ray_t* r = ray_select_body(args, n, plan, &own);
     if (own.selection) ray_release(own.selection);
     if (own.by_syms) ray_release(own.by_syms);
+    /* A dispatch a cancel landed before ran none of its tasks: a stage that
+     * read its unwritten output without checking answered from garbage.
+     * The query was cancelled, whatever the stage made of it. */
+    if (r && !RAY_IS_ERR(r) && pool_cancelled(ray_pool_get())) {
+        ray_release(r);
+        r = ray_error("cancel", NULL);
+    }
     return r;
 }
 
