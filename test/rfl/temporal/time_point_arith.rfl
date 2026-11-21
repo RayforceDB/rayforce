@@ -190,3 +190,31 @@
 (+ sv 10:00:00.000) -- (+ 10:00:00.000 sv)
 (- 0D12:00:00 (enlist 10:00:00.000 0Nt 23:00:00.000)) -- (enlist 02:00:00.000 0Nt -11:00:00.000)
 (- sv (enlist 10:00:00.000 10:00:00.000 0Nt 00:00:00.000 01:00:00.000)) -- (enlist -09:00:00.000 0Nt 0Nt 0Nt -03:00:00.000)
+
+;; ─── only + and - move a TIME: xbar buckets it, div and / reject it ────────
+(xbar 10:37:00.000 0D00:15:00) -- 10:30:00.000
+(type (xbar 10:37:00.000 0D00:15:00)) -- 'time
+(xbar (enlist 10:37:00.000 10:41:00.000 0Nt -00:07:00.000) 0D00:15:00) -- (enlist 10:30:00.000 10:30:00.000 0Nt -00:15:00.000)
+(xbar (enlist 10:37:00.000 10:41:00.000) (enlist 0D00:15:00 0D00:10:00)) -- (enlist 10:30:00.000 10:40:00.000)
+(xbar 10:37:00.123 0D00:00:00.0005) -- 10:37:00.123
+(set XB (table [t v] (list (enlist 10:37:00.000 10:41:00.000 10:52:00.000 0Nt 10:29:59.999) [1 2 3 4 5])))
+(at (select {t: (xbar t 0D00:15:00) from: XB}) 't) -- (enlist 10:30:00.000 10:30:00.000 10:45:00.000 0Nt 10:15:00.000)
+(at (select {c: (sum v) by: {b: (xbar t 0D00:15:00)} from: XB}) 'c) -- [3 3 4 5]
+(div 10:37:00.000 0D00:15:00) !- type
+(div (enlist 10:37:00.000) 0D00:15:00) !- type
+(div 0D00:00:01 00:00:01.000) -- (as 'TIMESPAN 1000000)
+(/ 10:37:00.000 0D00:15:00) !- type
+(/ 0D00:00:01 (enlist 00:00:01.000)) -- [1000000.0]
+(select {d: (div t 0D00:15:00) from: XB}) !- type
+
+;; ─── a TIMESTAMP difference that wraps onto the null sentinel is null ──────
+(nil? (- (as 'TIMESTAMP [-1 5]) (as 'TIMESTAMP [9223372036854775807 3]))) -- [true false]
+(nil? (- (as 'TIMESTAMP [-1 5]) (as 'TIMESTAMP 9223372036854775807))) -- [true false]
+(nil? (- (as 'TIMESTAMP -1) (as 'TIMESTAMP [9223372036854775807 3]))) -- [true false]
+
+;; ─── last over a lazy duration chain ────────────────────────────────────────
+(last (deltas (enlist 10:00:00.000 10:00:01.000 10:00:03.000))) -- 0D00:00:02
+(last (deltas (enlist 2024.01.01D00:00:00.000000000 2024.01.01D00:00:05.000000000))) -- 0D00:00:05
+(last (fills (enlist 0Nn 0D00:00:01 0D00:00:03))) -- 0D00:00:03
+(last (fills (enlist 0Nn 0D00:00:01 0Nn))) -- 0D00:00:01
+(last (deltas (as 'TIME (* 1000 (til 200000))))) -- 0D00:00:01
