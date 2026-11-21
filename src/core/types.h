@@ -108,4 +108,28 @@ static inline int64_t wrap_mul_i64(int64_t a, int64_t b) {
     return (int64_t)((uint64_t)a * (uint64_t)b);
 }
 
+/* The numeric promotion table (#972), the one rule for atoms, vectors, the
+ * planner and the fused evaluator: B8 < U8 < I16 < I32 < I64 < F32 < F64 and
+ * the wider type wins, two operands of one type keep it (an integer result
+ * wraps in that width), and F32 beside any other type is F64.  Symmetric.
+ * Takes and returns vector (positive) type codes; 0 when either operand is
+ * not one of the seven numeric types.  The type codes are the ranks. */
+_Static_assert(RAY_BOOL == 1 && RAY_U8 == 2 && RAY_I16 == 3 && RAY_I32 == 4 &&
+               RAY_I64 == 5 && RAY_F32 == 6 && RAY_F64 == 7,
+               "ray_num_type ranks numeric types by their codes");
+static inline int8_t ray_num_type(int8_t a, int8_t b) {
+    if ((uint8_t)(a - RAY_BOOL) > RAY_F64 - RAY_BOOL ||
+        (uint8_t)(b - RAY_BOOL) > RAY_F64 - RAY_BOOL) return 0;
+    if (a == b) return a;
+    if (a == RAY_F32 || b == RAY_F32) return RAY_F64;
+    return a > b ? a : b;
+}
+
+/* The table for + - * div %: as ray_num_type, but B8 with B8 counts as I64
+ * (`(+ true true)` is 2).  min and max keep B8 (ray_num_type). */
+static inline int8_t ray_arith_type(int8_t a, int8_t b) {
+    int8_t t = ray_num_type(a, b);
+    return t == RAY_BOOL ? RAY_I64 : t;
+}
+
 #endif /* RAY_TYPES_H */

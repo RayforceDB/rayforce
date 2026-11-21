@@ -16,7 +16,7 @@ Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-
 | `*` | binary | Multiplication | `(* 3 4)` → `12` |
 | `/` | binary | Float division (always f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | Modulo | `(% 7 3)` → `1` |
-| `div` | binary | Integer division (floor) | `(div 7 2)` → `3` |
+| `div` | binary | Floor division, promoted type | `(div 7 2)` → `3` |
 | `neg` | unary | Negate | `(neg 5)` → `-5` |
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
