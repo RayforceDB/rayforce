@@ -5432,6 +5432,7 @@ static void ray_register_builtins(void) {
     register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
     register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
     register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
+    register_vary(".sys.join.par.min",    RAY_FN_RESTRICTED, ray_join_par_min_fn);
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);

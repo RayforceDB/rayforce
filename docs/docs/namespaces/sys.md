@@ -3,7 +3,7 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging or execution behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
@@ -16,6 +16,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
+| [`.sys.join.par.min`](#sys-join-par-min) | variadic (0–1) | restricted | Read or set the probe-side row count from which a hash join's probe is split across the pool. |
 | [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Run allocator maintenance and return `0`; `(.sys.gc 1)` also releases free pages now, best effort. |
 | [`.sys.env`](#sys-env) | variadic (0–1) | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
@@ -264,6 +265,37 @@ server-wide behaviour.
 ```
 
 The `-Q` startup flag is the equivalent for enabling logging from launch.
+
+## `.sys.join.par.min` { #sys-join-par-min }
+
+Signature: `(.sys.join.par.min [rows])`. Reads or sets the probe-side row count
+from which a hash join's probe is split across the thread pool. No argument
+returns the current value; an `i64` of `0` or more sets it. Either way it
+returns the value in effect. Anything else is an error: a negative or null
+count is a `domain` error, a non-`i64` a `type` error, more than one argument an
+`arity` error. Restricted under `-U`, since it changes execution for the whole
+process.
+
+The default is `8193`. The probe runs in morsels of 8192 rows, and a probe of
+more than one morsel goes to the pool, so values from `0` to `8193` all give the
+default behaviour. Raising the value makes probes below it run on the calling
+thread. That trades latency for CPU: past a few workers, a small parallel probe
+costs more CPU than it saves in wall time. Most of the extra is the main thread
+spinning while it waits for the slowest worker, not extra work. The answer is
+the same either way, rows and row order included.
+
+```lisp
+(.sys.join.par.min)          ;; => 8193   (the default)
+(.sys.join.par.min 65536)    ;; => 65536  probes under 65536 rows stay serial
+(.sys.join.par.min 8193)     ;; => 8193   back to the default
+```
+
+Set it in the startup script of a process that is not latency-bound. `-c` sets
+how many threads the pool may use; this knob sets how large a join must be
+before it uses them. The pool stays available for the rare large job while the
+steady small joins run serially. See
+[parallel probe floor](../queries/joins.md#parallel-probe-floor) for which joins
+it covers and the measured trade-off.
 
 ## `.sys.gc` { #sys-gc }
 
