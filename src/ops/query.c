@@ -18309,7 +18309,11 @@ enum {
 };
 
 static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth);
-static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl) {
+static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth);
+
+/* `mode`: 0 outside where:; 1 in where:, at a conjunct; 2 in where:, an
+ * operand of a call. */
+static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
     if (!e || RAY_IS_ERR(e)) return false;
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return true;
@@ -18327,23 +18331,37 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl) {
         int budget = PRUNE_IF_MAX_VISITS;
         return prune_if_cond(el[1], tbl, &budget, 0);
     }
+    /* An operand IF in where: (#1181), of the bounded ungrouped grammar: a
+     * value per row, never a necessary partition constraint (the mask reads
+     * no comparison below it). The route (compiled per row or interpreted)
+     * is chosen from the AST and the schema; interpreted whole, any non-null
+     * vector condition is truthy (is_truthy), so ray_cond_fn takes THEN on
+     * the pruned source as on the full one. */
+    if (mode == 2 && n == 4 && fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
+        (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn && prune_head_named(el[0], "if")) {
+        int budget = PRUNE_IF_MAX_VISITS;
+        return prune_if_projection(e, tbl, &budget, 0) != 0;
+    }
+    int sub = mode ? 2 : 0;
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
-        return prune_where_elementwise_impl(el[1], tbl) && el[2] &&
+        return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
                 prune_bound_const(el[2], tbl, true));        /* a set: a typed vector, written or bound */
-    if (!prune_logic_head(el[0], fn)) {
+    if (prune_logic_head(el[0], fn)) {
+        sub = mode ? 1 : 0;              /* a logic operand is a condition, not an IF */
+    } else {
         if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) ||
             !(fn->attrs & RAY_FN_ATOMIC) || (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
     }
     for (int64_t i = 1; i < n; i++)
-        if (!prune_where_elementwise_impl(el[i], tbl)) return false;
+        if (!prune_where_elementwise_impl(el[i], tbl, sub)) return false;
     return true;
 }
 
 static bool prune_where_elementwise(ray_t* e, ray_t* tbl) {
     /* Preserve the uncapped ordinary ATOMIC walk. Only the newly admitted
      * NOT/IF grammars and grouped alternative have proof budgets. */
-    return prune_where_elementwise_impl(e, tbl);
+    return prune_where_elementwise_impl(e, tbl, 0);
 }
 
 /* Type-only source-schema proof: no column materialization or partition row
@@ -18380,24 +18398,31 @@ static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
     uint16_t op = prune_cmp_op(el[0], fn);
     if (!op || op == OP_IN) return false;
     int8_t l = prune_if_leaf_type(el[1], tbl), r = prune_if_leaf_type(el[2], tbl);
-    return (l == RAY_I64 && r == RAY_I64) ||
+    /* F64 as I64: a null (NaN reads as null) is the lowest value and equals
+     * itself on every route, the filter's included. */
+    return (l == r && (l == RAY_I64 || l == RAY_F64)) ||
            (l == RAY_SYM && r == RAY_SYM && (op == OP_EQ || op == OP_NE));
 }
 
-/* Only a sole, ungrouped I64 projection with explicit ELSE. Compiled IF is
- * per-row; its aggregate-free fallback scatters per-row after WHERE too.
- * Aggregate inputs, WHERE/BY IF, mixed types and aliases stay declined. */
-static bool prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) {
-    if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return false;
-    if (prune_if_leaf_type(e, tbl) == RAY_I64) return true;
-    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 4) return false;
+/* An ungrouped projection with explicit ELSE whose branches share one type,
+ * I64, F64 or SYM (0: declined). Compiled IF is per-row; its
+ * aggregate-free fallback scatters per-row after WHERE too. A SYM branch
+ * reads as text: OP_IF re-expresses every side in the runtime domain.
+ * Also an operand in where: (prune_where_elementwise_impl). Mixed branch
+ * types (an I64 null read as an F64), aggregate inputs, BY IF and aliases
+ * stay declined. */
+static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) {
+    if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return 0;
+    int8_t t = prune_if_leaf_type(e, tbl);
+    if (t == RAY_I64 || t == RAY_F64 || t == RAY_SYM) return t;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 4) return 0;
     ray_t** el = (ray_t**)ray_data(e);
     ray_t* fn = prune_head_fn(el[0], tbl);
     if (!fn || fn->type != RAY_VARY || !(fn->attrs & RAY_FN_SPECIAL_FORM) ||
-        (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn || !prune_head_named(el[0], "if")) return false;
-    return prune_if_cond(el[1], tbl, budget, depth + 1) &&
-           prune_if_projection(el[2], tbl, budget, depth + 1) &&
-           prune_if_projection(el[3], tbl, budget, depth + 1);
+        (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn || !prune_head_named(el[0], "if")) return 0;
+    if (!prune_if_cond(el[1], tbl, budget, depth + 1)) return 0;
+    int8_t a = prune_if_projection(el[2], tbl, budget, depth + 1);
+    return (a && a == prune_if_projection(el[3], tbl, budget, depth + 1)) ? a : 0;
 }
 
 /* An output reads only the rows the where keeps: elementwise, or an
@@ -18547,7 +18572,7 @@ static bool prune_group_cond(ray_t* e, ray_t* tbl, prune_group_proof_t* p,
     if (l != r || (!lc && !rc)) return false;
     if (l == RAY_SYM)
         return (op == OP_EQ || op == OP_NE) && lc != rc;
-    return l == RAY_I64 || (where && l == RAY_DATE);
+    return l == RAY_I64 || l == RAY_F64 || (where && l == RAY_DATE);
 }
 
 static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
@@ -18569,9 +18594,9 @@ static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
     if (!fn || fn->type != RAY_VARY || !(fn->attrs & RAY_FN_SPECIAL_FORM) ||
         RAY_FN_OPCODE(fn) || (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn ||
         !prune_head_named(a[0], "if")) return false;
-    return prune_group_cond(a[1], tbl, p, 0, false) &&
-           prune_group_leaf(a[2], tbl, p, false) == RAY_I64 &&
-           prune_group_leaf(a[3], tbl, p, false) == RAY_I64;
+    if (!prune_group_cond(a[1], tbl, p, 0, false)) return false;
+    int8_t t = prune_group_leaf(a[2], tbl, p, false);
+    return (t == RAY_I64 || t == RAY_F64) && prune_group_leaf(a[3], tbl, p, false) == t;
 }
 
 static int prune_group_id_cmp(const void* a, const void* b) {
@@ -18687,10 +18712,19 @@ static bool prune_group_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     return true;
 }
 
+/* Is the select key `k` a clause (from, where, by, take, ...)? */
+static bool prune_clause_key(ray_t* k) {
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    for (size_t r = 0; r < sizeof reserved / sizeof *reserved; r++)
+        if (ray_str_len(k) == strlen(reserved[r]) &&
+            memcmp(ray_str_ptr(k), reserved[r], ray_str_len(k)) == 0) return true;
+    return false;
+}
+
 /* Every where conjunct, by: expression and output of the select reads only
  * the rows the where keeps. */
 static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
-    if (!prune_where_elementwise(where, tbl)) return false;
+    if (!prune_where_elementwise_impl(where, tbl, 1)) return false;
     ray_t* by = dict_get(dict, "by");
     if (!prune_by_ok(by, tbl)) return false;
     bool grouped = by && ((by->type == -RAY_SYM) || (by->type == RAY_SYM && by->len > 0) ||
@@ -18698,22 +18732,37 @@ static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
-    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    int n_clauses = 0;
     for (int64_t i = 0; i < keys->len; i++) {
         ray_t* k = ray_sym_vec_cell(keys, i);
         if (!k) return false;
-        bool res = false;
-        for (size_t r = 0; r < sizeof reserved / sizeof *reserved; r++)
-            if (ray_str_len(k) == strlen(reserved[r]) &&
-                memcmp(ray_str_ptr(k), reserved[r], ray_str_len(k)) == 0) res = true;
-        if (!res && !prune_output_ok(((ray_t**)ray_data(vals))[i], tbl, grouped)) {
-            int budget = PRUNE_IF_MAX_VISITS;
-            if (by || keys->len != 3 || !dict_get(dict, "from") || !dict_get(dict, "where")) return false;
-            /* Clause keys can have a compact width or a non-runtime domain. */
-            int64_t output_id = sym_cell_runtime_id(keys, i);
-            if (output_id < 0 || ray_table_slot(tbl, output_id) ||
-                !prune_if_projection(((ray_t**)ray_data(vals))[i], tbl, &budget, 0)) return false;
+        n_clauses += prune_clause_key(k);
+    }
+    bool if_checked = false;
+    for (int64_t i = 0; i < keys->len; i++) {
+        if (prune_clause_key(ray_sym_vec_cell(keys, i)) ||
+            prune_output_ok(((ray_t**)ray_data(vals))[i], tbl, grouped)) continue;
+        /* An ungrouped IF beside other outputs as well: they are admitted
+         * above, and the projection either compiles every output (rowwise
+         * IF) or filters first and scatters each output per row (select's
+         * eval fallback), a choice made from the AST and the schema, which
+         * the pruned source keeps. */
+        int budget = PRUNE_IF_MAX_VISITS;
+        if (by || n_clauses != 2 || !dict_get(dict, "from") || !dict_get(dict, "where")) return false;
+        /* Clause keys can have a compact width or a non-runtime domain. */
+        int64_t output_id = sym_cell_runtime_id(keys, i);
+        if (output_id < 0 || ray_table_slot(tbl, output_id) ||
+            !prune_if_projection(((ray_t**)ray_data(vals))[i], tbl, &budget, 0)) return false;
+        /* The proof types the IF's names from the source; an earlier output
+         * may rebind one for later outputs (`a: (avg a)`). Only a column
+         * passed through under its own name keeps its type. */
+        for (int64_t j = 0; !if_checked && j < keys->len; j++) {
+            int64_t id = sym_cell_runtime_id(keys, j);
+            ray_t* v = ((ray_t**)ray_data(vals))[j];
+            if (id < 0 || prune_clause_key(ray_sym_vec_cell(keys, j)) || !ray_table_slot(tbl, id)) continue;
+            if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) || v->i64 != id) return false;
         }
+        if_checked = true;
     }
     return true;
 }
