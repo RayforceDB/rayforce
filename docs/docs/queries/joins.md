@@ -133,9 +133,36 @@ The `anti-join` function keeps rows from the left table whose key does not appea
 ;  3 MSFT
 ```
 
+## Semi and Anti Masks
+
+`semi-mask` and `anti-mask` answer the same question as `inner-join` and `anti-join`, but return a boolean vector over the left table's rows instead of a table. `semi-mask` is true where the row has a match in the right table on every key; `anti-mask` is its negation. No column is gathered, so the cost is the match alone: use a mask when all you want is a selection, for `where:` or `delete`.
+
+### Signature
+
+`(semi-mask [keys] left right)`
+`(anti-mask [keys] left right)`
+
+The keys may also come last, as with the joins: `(semi-mask left right [keys])`.
+
+### Examples
+
+```lisp
+(set levels (table [venue instrument px] (list [V0 V1 V0 V1 V2 V0] [A B C B A A] [1 2 3 4 5 6])))
+(set resets (table [venue instrument] (list [V0 V1 V9] [A B Q])))
+
+(semi-mask [venue instrument] levels resets)  ; [true true false true false true]
+(anti-mask [venue instrument] levels resets)  ; [false false true false true false]
+
+(set M (semi-mask [venue instrument] levels resets))
+(select {from: levels where: M})              ; the rows inner-join would emit, once each
+(delete {from: 'levels where: M})             ; drop them in place
+```
+
+A compound key matches the tuple, not each column on its own: `(V0 C)` above is false although both `V0` and `C` occur somewhere in `resets`. A left row is true in `semi-mask` exactly when `inner-join` emits it (once, however many right rows it matches), and `(select {from: left where: (anti-mask ks left right)})` returns the rows of `(anti-join ks left right)` in the same order. Null keys match each other, as in every equi-join below.
+
 ## Null-key semantics (equi-joins)
 
-`inner-join`, `left-join`, `full-join` and `anti-join` treat **a null key as equal to another null key**, and never equal to a non-null one:
+`inner-join`, `left-join`, `full-join`, `anti-join`, `semi-mask` and `anti-mask` treat **a null key as equal to another null key**, and never equal to a non-null one:
 
 ```lisp
 (set left  (table [k v] (list (as 'SYM ["a" ""]) [1 2])))
@@ -301,10 +328,10 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 
 1. **DAG construction** — `inner-join`, `left-join`, and `full-join` emit `OP_JOIN` nodes with join type flags. `asof-join` emits `OP_ASOF_JOIN`. `window-join` emits `OP_WINDOW_JOIN`.
 2. **Optimizer** — Predicate pushdown moves filters closer to data sources (past `SELECT`/`ALIAS`, `GROUP`, and `EXPAND` nodes); filters on join inputs are not currently pushed across join boundaries. Type inference propagates column types through join boundaries. SIP (Sideways Information Passing) can prune the build side using selection bitmaps.
-3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order for inner joins on the radix-parallel path is partition- and thread-dependent and is not guaranteed to be stable. On the small-input (chained) path, an inner or left join whose left side is more than twice the size of the right first builds a bitmap of the right side's values for its symbol and integer key columns (a column gets none when its right-side values span more than 2^24, when that span is more than 64 times the left row count, or when it pairs a symbol key with a non-symbol one). The executor tests a sample of 1024 left rows and keeps only the bitmaps that reject enough of them, up to four, most selective first. A left row whose value on a kept column appears nowhere on the right cannot match, so it is not hashed: an inner join drops it, and a left join emits it with null right-side columns. This works for any number of key columns. For `(inner-join [venue instrument] big small)` with a few books in `small`, the sample usually keeps `instrument` alone, since `venue` rejects nothing more after it. The cost becomes a bit test per left row plus hashing only for the rows whose instrument occurs in `small`. A join where most left rows match keeps no bitmap and pays almost nothing extra: only the bitmap build over the right side and the sample. Null keys are unaffected and still match each other. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
+3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order for inner joins on the radix-parallel path is partition- and thread-dependent and is not guaranteed to be stable. On the small-input (chained) path, an inner or left join whose left side is more than twice the size of the right first builds a bitmap of the right side's values for its symbol and integer key columns (a column gets none when its right-side values span more than 2^24, when that span is more than 64 times the left row count, or when it pairs a symbol key with a non-symbol one). The executor tests a sample of 1024 left rows and keeps only the bitmaps that reject enough of them, up to four, most selective first. A left row whose value on a kept column appears nowhere on the right cannot match, so it is not hashed: an inner join drops it, and a left join emits it with null right-side columns. This works for any number of key columns. For `(inner-join [venue instrument] big small)` with a few books in `small`, the sample usually keeps `instrument` alone, since `venue` rejects nothing more after it. The cost becomes a bit test per left row plus hashing only for the rows whose instrument occurs in `small`. A join where most left rows match keeps no bitmap and pays almost nothing extra: only the bitmap build over the right side and the sample. Null keys are unaffected and still match each other. `semi-mask` and `anti-mask` run the same probe on the chained hash table built over the right side, with the same bitmap rule, at any right-side size; the probe is split across workers, and each left row writes its own byte of the mask instead of a row pair. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
 
 !!! note "Performance note"
-    Join key columns must be symbol (`RAY_SYM`) or numeric. Symbol columns are dictionary-encoded integers and join fastest. String (`RAY_STR`) key columns are **not** supported — a join keyed on a string column raises `nyi`. Convert string keys to symbols (`(as 'sym col)`) before joining.
+    Join key columns may be symbol (`RAY_SYM`), numeric or string (`RAY_STR`); a string key must be paired with a string key on the other side. Symbol columns are dictionary-encoded integers and join fastest. A string key is hashed and compared by its bytes and gets no bitmap prefilter, so converting it to a symbol (`(as 'sym col)`) pays off when the same column is joined repeatedly.
 
 ### Parallel probe floor
 
@@ -328,5 +355,7 @@ Measured on joins below 65536 rows, a floor of 65536 costs about 2.6x the wall t
 | `left-join` | `(left-join [keys] left right)` | Left outer join; all left rows preserved |
 | `full-join` | `(full-join [keys] left right)` | Full outer join; all rows from both sides preserved |
 | `anti-join` | `(anti-join [keys] left right)` | Keep left rows with no right match |
+| `semi-mask` | `(semi-mask [keys] left right)` | Boolean vector over left: true where the row has a right match |
+| `anti-mask` | `(anti-mask [keys] left right)` | Boolean vector over left: true where the row has no right match |
 | `asof-join` | `(asof-join [keys time-col] left right)` | Time-series alignment; most recent match |
 | `window-join` | `(window-join [keys tc] intervals left right {aggs})` | Window aggregation over time intervals |

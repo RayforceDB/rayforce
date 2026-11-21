@@ -147,6 +147,7 @@ extern const test_entry_t idx_route_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
 extern const test_entry_t join_buildside_entries[];
+extern const test_entry_t join_mask_entries[];
 extern const test_entry_t join_prefilter_entries[];
 extern const test_entry_t journal_entries[];
 extern const test_entry_t lang_entries[];
@@ -227,6 +228,7 @@ static const test_entry_t* const compiled_groups[] = {
     idx_route_entries,
     index_entries,    ipc_entries,
     join_buildside_entries,
+    join_mask_entries,
     join_prefilter_entries,
     journal_entries,
     lang_entries,     link_entries,
