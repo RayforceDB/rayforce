@@ -585,8 +585,11 @@ static bool dag_cmp_operands_ok(ray_graph_t* g, const char* fname, size_t fname_
  * (is_truthy): zero, null and NaN are false, any other number or temporal
  * true; a symbol, string or GUID is true unless null.  The AND/OR kernels
  * read BOOL bytes, so a non-boolean column is lowered to a mask first:
- * `(not (not x))` for a number or temporal, `(not (nil? x))` for text and
- * GUID.  Reading the raw cells instead is what kept rows a where: on `x`
+ * `(and (not (nil? x)) (!= x 0))` for a number or temporal (`(!= x 0)` for
+ * U8, which has no null), `(not (nil? x))` for text and GUID.  Both stay
+ * on the fused kernels over a nullable column, where `(not (not x))`
+ * fell back to the element-wise path twice (2x slower under a where:,
+ * 30x as a projection).  Reading the raw cells instead is what kept rows a where: on `x`
  * alone rejects (#678).  A BOOL operand is passed through untouched, and
  * an atom literal becomes the BOOL constant of its truth value.  A
  * partition key's wrapper goes to the evaluator (NULL, no error); any
@@ -612,8 +615,17 @@ static ray_op_t* dag_bool_operand(ray_graph_t* g, ray_op_t* a, bool is_and) {
     case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
     case RAY_TIMESTAMP: case RAY_TIMESPAN: {
-        ray_op_t* n = ray_not(g, a);
-        return n ? ray_not(g, n) : NULL;
+        /* Node creation may realloc g->nodes: re-derive by id. */
+        uint32_t a_id = a->id;
+        ray_op_t* z = ray_const_i64(g, 0);
+        if (!z) return NULL;
+        ray_op_t* ne = ray_ne(g, &g->nodes[a_id], z);
+        if (!ne || bt == RAY_U8) return ne;        /* U8 has no null */
+        uint32_t ne_id = ne->id;
+        ray_op_t* nn = ray_isnull(g, &g->nodes[a_id]);
+        if (!nn) return NULL;
+        nn = ray_not(g, nn);
+        return nn ? ray_and(g, nn, &g->nodes[ne_id]) : NULL;
     }
     case RAY_SYM: case RAY_STR: case RAY_GUID: {
         ray_op_t* n = ray_isnull(g, a);
