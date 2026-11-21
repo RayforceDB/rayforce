@@ -341,8 +341,9 @@ static test_result_t test_optimizer_fold_atom_arith(void) {
     ray_release(out_i32);
     ray_graph_free(g);
 
-    /* TIME - TIME → I32 (delta in milliseconds).  ray_time stores ms since
-     * midnight; 11:00 - 09:00 = 7200000 ms. */
+    /* TIME - TIME → TIMESPAN: two points of the day are a duration apart.
+     * ray_time stores ms since midnight; 11:00 - 09:00 = 2 h in ns.  The
+     * node is typed TIMESPAN, which the folder leaves to the kernel. */
     g = ray_graph_new(NULL);
     TEST_ASSERT_NOT_NULL(g);
     ray_t* t1 = ray_time(11LL * 3600 * 1000);
@@ -352,16 +353,34 @@ static test_result_t test_optimizer_fold_atom_arith(void) {
     ray_release(t1);
     ray_release(t2);
     ray_op_t* tsub = ray_sub(g, ct1, ct2);
+    TEST_ASSERT_EQ_I(tsub->out_type, RAY_TIMESPAN);
     ray_op_t* opt_t = ray_optimize(g, tsub);
     TEST_ASSERT_NOT_NULL(opt_t);
-    TEST_ASSERT_EQ_I(opt_t->opcode, OP_CONST);
 
     ray_t* out_t = ray_execute(g, opt_t);
     TEST_ASSERT_FALSE(RAY_IS_ERR(out_t));
-    /* TIME - TIME folds via the I32/DATE/TIME arm → I32 atom carrying the
-     * raw 32-bit difference of the millisecond payloads. */
-    TEST_ASSERT_EQ_I(out_t->type, -RAY_I32);
-    TEST_ASSERT_EQ_I(out_t->i32, 7200000);
+    TEST_ASSERT_EQ_I(out_t->type, -RAY_TIMESPAN);
+    TEST_ASSERT_EQ_I(out_t->i64, 7200LL * 1000000000LL);
+    ray_release(out_t);
+    ray_graph_free(g);
+
+    /* TIME + TIMESPAN → TIME, not folded as raw ms + ns. */
+    g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    t1 = ray_time(9LL * 3600 * 1000);
+    t2 = ray_timespan(90LL * 60 * 1000000000LL);
+    ct1 = ray_const_atom(g, t1);
+    ct2 = ray_const_atom(g, t2);
+    ray_release(t1);
+    ray_release(t2);
+    ray_op_t* tadd = ray_add(g, ct1, ct2);
+    TEST_ASSERT_EQ_I(tadd->out_type, RAY_TIME);
+    opt_t = ray_optimize(g, tadd);
+    TEST_ASSERT_NOT_NULL(opt_t);
+    out_t = ray_execute(g, opt_t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out_t));
+    TEST_ASSERT_EQ_I(out_t->type, -RAY_TIME);
+    TEST_ASSERT_EQ_I(out_t->i32, (int32_t)(10LL * 3600 * 1000 + 30LL * 60 * 1000));
     ray_release(out_t);
     ray_graph_free(g);
 

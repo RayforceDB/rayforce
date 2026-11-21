@@ -46,7 +46,9 @@ static bool span_divisor(int8_t t) {
 int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
     int8_t a = span_base(left), b = span_base(right);
     bool an = a == RAY_TIMESPAN, bn = b == RAY_TIMESPAN;
-    if (op == OP_SUB && a == RAY_TIMESTAMP && b == RAY_TIMESTAMP) return RAY_TIMESPAN;
+    /* Two points of the same kind are a duration apart; a TIME is a point
+     * of the day, so TIME + TIME has no meaning (as TIMESTAMP + TIMESTAMP). */
+    if (op == OP_SUB && a == b && (a == RAY_TIMESTAMP || a == RAY_TIME)) return RAY_TIMESPAN;
     if (!an && !bn) return 0;
     if (op == SPAN_BUCKET && span_divisor(a) && span_divisor(b))
         return a == RAY_F64 || a == RAY_F32 || b == RAY_F64 || b == RAY_F32
@@ -58,10 +60,16 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
     if (op == OP_ADD || op == OP_SUB) {
         if (a == RAY_DATE || b == RAY_DATE || a == RAY_TIMESTAMP || b == RAY_TIMESTAMP)
             return RAY_TIMESTAMP;
+        /* A TIME moved by a duration is a TIME, not wrapped at 24 h. */
+        if ((a == RAY_TIME && bn) || (an && b == RAY_TIME)) return RAY_TIME;
         if ((an || span_number(a) || a == RAY_TIME) &&
             (bn || span_number(b) || b == RAY_TIME))
             return a == RAY_F64 || b == RAY_F64 ? RAY_F64 : RAY_TIMESPAN;
     }
+    /* A TIME is a point of the day: it has no quotient by a duration.  (A
+     * duration divided by a TIME reads the TIME as its millisecond count,
+     * as q does.) */
+    if ((op == OP_DIV || op == OP_IDIV) && a == RAY_TIME) return -1;
     if (op == OP_DIV && span_divisor(a) && span_divisor(b)) return RAY_F64;
     if (op == OP_IDIV && span_divisor(a) && span_divisor(b))
         return an ? RAY_TIMESPAN : (a == RAY_F32 ? RAY_F64 : a == RAY_BOOL || a == RAY_U8 || a == RAY_I16 ? RAY_I32 : a);
@@ -105,6 +113,8 @@ typedef struct {
 static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
     bool na = RAY_ATOM_IS_NULL(a), nb = RAY_ATOM_IS_NULL(b);
     int64_t av = span_value(a, op), bv = span_value(b, op), value = 0;
+    /* a TIME bucketed by a duration is bucketed in nanoseconds */
+    if (op == SPAN_BUCKET && a->type == -RAY_TIME) av = (int64_t)a->i32 * INT64_C(1000000);
     if (out == RAY_BOOL) {
         if (a->type == -RAY_TIMESTAMP && !na) {
             av %= INT64_C(86400000000000);
@@ -137,6 +147,17 @@ static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
                    op == OP_IDIV ? floor(x / y) : op == SPAN_BUCKET ? y * floor(x / y) : x - y * floor(x / y);
         return (span_result_t){.f = __builtin_isfinite(v) ? v : NULL_F64};
     }
+    if (out == RAY_TIME && (op == OP_ADD || op == OP_SUB)) {
+        /* nanoseconds, floored to the TIME's milliseconds; a result outside
+         * the lane (or on its null) is null, not a wrapped time */
+        if (op == OP_ADD ? __builtin_add_overflow(av, bv, &value)
+                         : __builtin_sub_overflow(av, bv, &value))
+            return (span_result_t){.missing = true};
+        int64_t ms = value / 1000000;
+        if (value % 1000000 < 0) ms--;
+        if (ms <= INT32_MIN || ms > INT32_MAX) return (span_result_t){.missing = true};
+        return (span_result_t){.i = ms};
+    }
     switch (op) {
     case OP_ADD: value = wrap_add_i64(av, bv); break;
     case OP_SUB: value = (int64_t)((uint64_t)av - (uint64_t)bv); break;
@@ -150,6 +171,13 @@ static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
             if (value && (av < 0) != (bv < 0)) value += bv;
         }
         if (op == SPAN_BUCKET) value = wrap_mul_i64(value, bv);
+        if (op == SPAN_BUCKET && out == RAY_TIME) {
+            /* the bucket start in nanoseconds, floored back to milliseconds */
+            int64_t ms = value / 1000000;
+            if (value % 1000000 < 0) ms--;
+            if (ms <= INT32_MIN || ms > INT32_MAX) return (span_result_t){.missing = true};
+            value = ms;
+        }
         break;
     case OP_MIN2: value = av < bv ? av : bv; break;
     case OP_MAX2: value = av > bv ? av : bv; break;
@@ -186,6 +214,133 @@ static ray_t span_cell(ray_t* vector, int64_t row) {
     return atom;
 }
 
+/* Vector kernels for the shapes a point-in-time column meets most:
+ *  - TIME - TIME: the millisecond difference as TIMESPAN nanoseconds.  A
+ *    TIME lane times 1e6 fits an I64, so nothing overflows.
+ *  - TIMESTAMP - TIMESTAMP: the nanosecond difference, wrapping as
+ *    span_eval does.
+ *  - TIME ± a TIMESPAN atom, and a TIMESPAN atom ± TIME: the TIME moved by
+ *    the duration, floored to milliseconds as span_eval does.  With the
+ *    duration split as q ms + r ns (0 <= r < 1e6), floor((x*1e6 + d)/1e6)
+ *    is x + q, so a row is one add and a range check: a result outside the
+ *    lane is null.
+ * A null on either side is null.  A null atom side nulls every row. */
+typedef struct {
+    const void* a;
+    const void* b;
+    int64_t a0, b0;        /* the atom side of a difference */
+    int64_t sign, q;       /* shift: sign * x + q */
+    void* out;
+    _Atomic bool nulls;
+} span_time_ctx_t;
+
+static void span_ts_diff_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    span_time_ctx_t* c = vctx;
+    const int64_t* a = c->a;
+    const int64_t* b = c->b;
+    int64_t* o = c->out;
+    /* a wrapped difference can land on the null sentinel: count it as one */
+    bool any = false;
+    if (a && b)
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = a[i] == NULL_I64 || b[i] == NULL_I64 ? NULL_I64
+                      : (int64_t)((uint64_t)a[i] - (uint64_t)b[i]);
+            o[i] = v; any |= v == NULL_I64;
+        }
+    else if (a)
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = a[i] == NULL_I64 ? NULL_I64 : (int64_t)((uint64_t)a[i] - (uint64_t)c->b0);
+            o[i] = v; any |= v == NULL_I64;
+        }
+    else
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = b[i] == NULL_I64 ? NULL_I64 : (int64_t)((uint64_t)c->a0 - (uint64_t)b[i]);
+            o[i] = v; any |= v == NULL_I64;
+        }
+    if (any) atomic_store_explicit(&c->nulls, true, memory_order_relaxed);
+}
+
+static void span_time_diff_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    span_time_ctx_t* c = vctx;
+    const int32_t* a = c->a;
+    const int32_t* b = c->b;
+    int64_t* o = c->out;
+    if (a && b)
+        for (int64_t i = lo; i < hi; i++)
+            o[i] = a[i] == NULL_I32 || b[i] == NULL_I32 ? NULL_I64
+                 : ((int64_t)a[i] - b[i]) * INT64_C(1000000);
+    else if (a)
+        for (int64_t i = lo; i < hi; i++)
+            o[i] = a[i] == NULL_I32 ? NULL_I64 : ((int64_t)a[i] - c->b0) * INT64_C(1000000);
+    else
+        for (int64_t i = lo; i < hi; i++)
+            o[i] = b[i] == NULL_I32 ? NULL_I64 : ((int64_t)c->a0 - b[i]) * INT64_C(1000000);
+}
+
+static void span_time_shift_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    span_time_ctx_t* c = vctx;
+    const int32_t* a = c->a;
+    int32_t* o = c->out;
+    int64_t sign = c->sign, q = c->q;
+    bool any = false;
+    for (int64_t i = lo; i < hi; i++) {
+        int64_t v = sign * a[i] + q;
+        bool null = a[i] == NULL_I32 || v <= INT32_MIN || v > INT32_MAX;
+        o[i] = null ? NULL_I32 : (int32_t)v;
+        any |= null;
+    }
+    if (any) atomic_store_explicit(&c->nulls, true, memory_order_relaxed);
+}
+
+static ray_t* span_point_vec(uint16_t op, ray_t* a, ray_t* b, int64_t n, bool shift, int8_t type) {
+    ray_t* r = ray_vec_new(type, n);
+    if (RAY_IS_ERR(r)) return r;
+    r->len = n;
+    span_time_ctx_t c = { .out = ray_data(r) };
+    bool av = ray_is_vec(a), bv = ray_is_vec(b);
+    ray_t* atom = av ? b : a;
+    if (!av || !bv) {
+        if (RAY_ATOM_IS_NULL(atom)) {
+            if (type == RAY_TIME) for (int64_t i = 0; i < n; i++) ((int32_t*)c.out)[i] = NULL_I32;
+            else for (int64_t i = 0; i < n; i++) ((int64_t*)c.out)[i] = NULL_I64;
+            if (n) r->attrs |= RAY_ATTR_HAS_NULLS;
+            return r;
+        }
+    }
+    if (shift) {
+        /* TIME ± d is x + (±d), d - TIME is -x + d; the atom is not the
+         * null, so -d does not overflow */
+        int64_t d = av && op == OP_SUB ? -atom->i64 : atom->i64;
+        c.a = av ? ray_data(a) : ray_data(b);
+        c.sign = !av && op == OP_SUB ? -1 : 1;
+        c.q = d / 1000000;
+        if (d % 1000000 < 0) c.q--;
+    } else {
+        c.a = av ? ray_data(a) : NULL;
+        c.b = bv ? ray_data(b) : NULL;
+        bool ms = span_base(a->type) == RAY_TIME;
+        c.a0 = av ? 0 : ms ? a->i32 : a->i64;
+        c.b0 = bv ? 0 : ms ? b->i32 : b->i64;
+    }
+    ray_pool_fn fn = shift ? span_time_shift_fn
+                   : span_base(a->type) == RAY_TIME ? span_time_diff_fn : span_ts_diff_fn;
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, fn, &c, n);
+    else fn(&c, 0, 0, n);
+    if (pool && atomic_load_explicit(&pool->cancelled, memory_order_acquire)) {
+        ray_release(r);
+        return ray_error("cancel", NULL);
+    }
+    if (atomic_load_explicit(&c.nulls, memory_order_relaxed) ||
+        (fn == span_time_diff_fn &&
+         ((av && ray_vec_may_have_nulls(a)) || (bv && ray_vec_may_have_nulls(b)))))
+        r->attrs |= RAY_ATTR_HAS_NULLS;
+    return r;
+}
+
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b) {
     if (a->type == RAY_LIST || b->type == RAY_LIST ||
         RAY_IS_PARTED(a->type) || RAY_IS_PARTED(b->type)) {
@@ -200,6 +355,12 @@ ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b) {
     if (av && bv && a->len != b->len)
         return ray_error("length", "duration operand lengths must match");
     int64_t n = av ? a->len : b->len;
+    if (op == OP_SUB && type == RAY_TIMESPAN && span_base(a->type) == span_base(b->type) &&
+        (span_base(a->type) == RAY_TIME || span_base(a->type) == RAY_TIMESTAMP))
+        return span_point_vec(op, a, b, n, false, type);
+    if (type == RAY_TIME && (op == OP_ADD || op == OP_SUB) && av != bv &&
+        (av ? b : a)->type == -RAY_TIMESPAN)
+        return span_point_vec(op, a, b, n, true, type);
     ray_t* result = ray_vec_new(type, n);
     if (RAY_IS_ERR(result)) return result;
     result->len = n;
