@@ -257,7 +257,10 @@ Check if each element of a vector is within a range (inclusive). The second argu
 Logical AND. On atoms it answers one boolean; on a vector or a list it
 works element by element, each element by its truthiness, and returns a
 boolean vector (a nested list keeps its shape). An atom broadcasts, and two
-collections of different lengths are a `length` error.
+collections of different lengths are a `length` error. The exception is a
+first operand that is an atom and already decides the answer: it is
+returned without reading the rest, as one boolean: `(and false [1 0 2])` is `false`, `(or true [1 0])`
+is `true`. Inside a query the answer is per row either way.
 
 ```lisp
 (set x 5)
