@@ -18,3 +18,21 @@
 (at (left-join [k] identity_left (table [k r] (list [1 1 3] [4 5 6]))) 'k) -- [1 1 2 3]
 ;; FULL joins must allocate, since right-only rows change the left side.
 (count (full-join [k] identity_left (table [k r] (list [1 8] [4 5])))) -- 4
+;; One null-free 8-byte integer key on both sides: every left row finds
+;; its key's right row, as with a key of another width.
+(set ik_n 100000)
+(set ik_r (table [ck reg fac] (list (* 3 (til 5000)) (% (til 5000) 16) (+ 1 (% (til 5000) 5)))))
+(set ik_l (table [id ck q] (list (til ik_n) (% (* (til ik_n) 7) 16000) (% (til ik_n) 10))))
+(set ik_j (inner-join [ck] ik_l ik_r))
+(set ik_m (filter (til ik_n) (and (== 0 (% (at ik_l 'ck) 3)) (< (at ik_l 'ck) 15000))))
+(count ik_j) -- (count ik_m)
+(== (asc (at ik_j 'id)) ik_m) -- (take [true] (count ik_m))
+(all (== (at ik_j 'reg) (% (/ (at ik_j 'ck) 3) 16))) -- true
+(all (== (at ik_j 'fac) (+ 1 (% (/ (at ik_j 'ck) 3) 5)))) -- true
+(set ik_lj (left-join [ck] ik_l ik_r))
+(count ik_lj) -- ik_n
+(sum (nil? (at ik_lj 'reg))) -- (- ik_n (count ik_m))
+;; a TIMESTAMP key and an I64 key against an I32 one join alike
+(set ik_tr (table [ck reg] (list (as 'TIMESTAMP (* 3 (til 5000))) (% (til 5000) 16))))
+(count (inner-join [ck] (table [id ck] (list (til ik_n) (as 'TIMESTAMP (at ik_l 'ck)))) ik_tr)) -- (count ik_m)
+(count (inner-join [ck] ik_l (table [ck reg] (list (as 'I32 (* 3 (til 5000))) (% (til 5000) 16))))) -- (count ik_m)
