@@ -1,0 +1,142 @@
+;; Every public vector type: direct, dictionary, table and compiled paths.
+(set typed-eq (fn [a b] (== a b)))
+;; B8
+(set V (as 'B8 [true false]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; U8
+(set V (as 'U8 [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; I16
+(set V (as 'I16 [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; I32
+(set V (as 'I32 [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; I64
+(set V (as 'I64 [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; F32
+(set V (as 'F32 [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; F64
+(set V (as 'F64 [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; DATE
+(set V (as 'DATE [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; TIME
+(set V (as 'TIME [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; TIMESTAMP
+(set V (as 'TIMESTAMP [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; TIMESPAN
+(set V (as 'TIMESPAN [1 2]))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; SYM
+(set V ['a 'b])
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; STR
+(set V ["a" "b"])
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true
+;; GUID
+(set V (guid 2))
+(set D (dict (til (count V)) V))
+(set T (table [v] (list V)))
+(identical V (de (ser V))) -- true
+(== D D) -- (dict (til (count V)) (take [true] (count V)))
+(== T T) -- (table [v] (list (take [true] (count V))))
+(identical (typed-eq T T) (== T T)) -- true
+(identical (== T (first V)) (== (first V) T)) -- true
+(identical (== D (first V)) (== (first V) D)) -- true

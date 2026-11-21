@@ -342,6 +342,7 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b);
 ray_t* ray_min2_fn(ray_t* a, ray_t* b);
 ray_t* ray_max2_fn(ray_t* a, ray_t* b);
 ray_t* ray_eq_fn(ray_t* a, ray_t* b);
+ray_t* ray_identical_fn(ray_t* a, ray_t* b);
 ray_t* ray_neq_fn(ray_t* a, ray_t* b);
 
 /* Logic */
