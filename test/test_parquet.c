@@ -480,6 +480,54 @@ static test_result_t test_pq_lz4_multichunk(void) {
     char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial); pq_rm_rf(root);
     PASS();
 }
+/* A staged tree is flushed with one call where the host has one (Linux syncfs on
+ * a local filesystem), opened before the writes. Where it has none, or the
+ * filesystem is not one syncfs is known to work on (a container's overlay, a
+ * network mount), begin answers NONE and the caller syncs each file: so every
+ * answer is accepted here, and each must be consistent. */
+static test_result_t test_pq_sync_tree(void) {
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-sync-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(mkdir(dir,0755),0);
+    int h = ray_file_sync_tree_begin(dir);
+    TEST_ASSERT_TRUE(h >= 0 || h == RAY_SYNC_TREE_NONE || h == RAY_SYNC_TREE_SKIP);
+    if (h >= 0) { TEST_ASSERT_TRUE(ray_file_sync_tree_end(h)); }
+    else if (h == RAY_SYNC_TREE_SKIP) { TEST_ASSERT_TRUE(ray_file_sync_tree_end(h)); }
+    else { TEST_ASSERT_FALSE(ray_file_sync_tree_end(h)); }
+    /* A handle that is aborted is only closed. */
+    h = ray_file_sync_tree_begin(dir);
+    ray_file_sync_tree_abort(h);
+    /* Nothing to open: the caller syncs each file. */
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin("/nonexistent-rayforce-dir/x"),RAY_SYNC_TREE_NONE);
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin(NULL),RAY_SYNC_TREE_NONE);
+    TEST_ASSERT_FALSE(ray_file_sync_tree_end(RAY_SYNC_TREE_NONE));
+    /* The knob that forces the fallback. */
+    ray_file_sync_tree_force_fallback(true);
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin(dir),RAY_SYNC_TREE_NONE);
+    ray_file_sync_tree_force_fallback(false);
+    rmdir(dir);
+    PASS();
+}
+/* The per-file fallback of a native import (the only path on other hosts, before
+ * Linux 5.8 and on filesystems syncfs is not trusted on) still produces the table:
+ * the Linux suite would otherwise only run the single flush. */
+static test_result_t test_pq_sync_fallback(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    const char* two[] = {FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet"};
+    char root[160];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-fallback-%d",(int)getpid());
+    ray_file_sync_tree_force_fallback(true);
+    ray_t* n = ray_parquet_parted_files(two,2,root,"hits",types);
+    ray_file_sync_tree_force_fallback(false);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,36); ray_release(n);
+    ray_t* t = ray_read_parted(root,"hits");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),36);
+    ray_release(t);
+    pq_rm_rf(root);
+    ray_release(types);
+    PASS();
+}
 static test_result_t test_pq_matrix(void) {
     const char* names[] = {FIX "flat-0-v1.parquet",FIX "flat-0-v2.parquet",FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet",FIX "legacy.parquet",FIX "v2-uncompressed.parquet",FIX "no-statistics.parquet",
                            FIX "flat-5-v1.parquet",FIX "flat-5-v2.parquet",FIX "flat-7-v1.parquet",FIX "flat-7-v2.parquet",FIX "flat-5raw-v1.parquet",FIX "flat-5raw-v2.parquet"};
@@ -5440,6 +5488,8 @@ const test_entry_t parquet_entries[] = {
     {"parquet/unsupported-columns",test_pq_unsupported_columns,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
+    {"parquet/sync_tree",test_pq_sync_tree,pq_setup,pq_teardown},
+    {"parquet/sync_fallback",test_pq_sync_fallback,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},
