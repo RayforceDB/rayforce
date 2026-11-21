@@ -141,7 +141,7 @@ errors; argument, I/O, allocation, and cancellation errors also propagate.
 The options dict also takes `compress`: `true` writes generation-2
 (compressed) column files where the column is eligible, `false` (or no
 option, since the destination is always new) generation 0. A non-bool
-`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, because the import writes through the same splayed-table writer as `.db.splayed.set`.
+`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, unless a string column's dictionary would make the file larger than the generation-0 one (mostly distinct strings; see `.db.splayed.set` in [Storage](../storage/index.md)): the import writes through the same splayed-table writer as `.db.splayed.set`.
 For example:
 
 ```lisp
