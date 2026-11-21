@@ -65,7 +65,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 ### Variadic / Special
 
 `and`, `or`, `if`, `do`, `fn`, `map`, `pmap`, `fold`, `scan`, `prior`, `apply`, `list`, `select`, `window`,
-`update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
+`update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `semi-mask`, `anti-mask`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
@@ -90,7 +90,7 @@ Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-
 | `*` | binary | atomic | Multiplication | `(* 3 4)` → `12` |
 | `/` | binary | atomic | Float division (always returns f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | atomic | Modulo (remainder) | `(% 7 3)` → `1` |
-| `div` | binary | atomic | Integer division (floor) | `(div 7 2)` → `3` |
+| `div` | binary | atomic | Floor division, promoted type | `(div 7 2)` → `3` |
 | `neg` | unary | atomic | Negate value | `(neg 5)` → `-5` |
 | `round` | unary | atomic | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | atomic | Floor (round down) | `(floor 3.7)` → `3.0` |
@@ -301,7 +301,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | lazy/DAG | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | lazy/DAG | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
-| `deltas` | unary | lazy/DAG | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIME, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `deltas` | unary | lazy/DAG | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIMESPAN, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | lazy/DAG | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
 | `fills` | unary | lazy/DAG | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | lazy/DAG | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
@@ -518,6 +518,8 @@ Rayforce supports seven join types, including time-series-aware as-of and window
 | `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join [product_id] orders products)` |
 | `full-join` | variadic | — | Full outer join — all rows from both sides, unmatched columns filled with null | `(full-join [sym] trades quotes)` |
 | `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join [key] t1 t2)` |
+| `semi-mask` | variadic | — | Boolean vector over left rows — true where the row has a right match | `(semi-mask [key] t1 t2)` |
+| `anti-mask` | variadic | — | Boolean vector over left rows — true where the row has no right match | `(anti-mask [key] t1 t2)` |
 | `window-join` | variadic | special | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict | `(window-join [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `window-join1` | variadic | special | Window join variant (strict window, no prevailing quote) | `(window-join1 [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `asof-join` | variadic | — | As-of join — match most recent preceding value. Keys come first, last key is the time key. | `(asof-join [sym time] trades quotes)` |

@@ -193,7 +193,7 @@ projections.
 
 ## Vectors
 
-Vectors are homogeneous, typed, columnar arrays. Created with square brackets. The type is inferred from the first element.
+Vectors are homogeneous, typed, columnar arrays. Created with square brackets. The type comes from the element literals (see [Typed vector literals](#typed-vector-literals)).
 
 ```lisp
 [1 2 3 4 5]         ; i64 vector
@@ -204,6 +204,46 @@ Vectors are homogeneous, typed, columnar arrays. Created with square brackets. T
 ```
 
 Vector operations are morsel-driven, processing 1024 elements at a time for cache efficiency.
+
+### Typed vector literals
+
+Each element of a vector literal is parsed as its own literal, so `[1h 2h 3h]`
+is an `I16` vector. Two rules let a literal mix element spellings:
+
+- Unsuffixed integers and floats promote to `F64`: `[1 2 3.0]` and `[1.5 2 3]`
+  are `F64` vectors.
+- A final `h`, `i` or `e` suffix types the whole vector: `[1 2 3h]` is
+  `[1h 2h 3h]`, `[1 2 3i]` is `[1i 2i 3i]`, and `[1 2 3e]` is `[1e 2e 3e]`.
+  The last element may be a typed null: `[1 0Nh]` is `[1h 0Nh]`.
+
+Under a final suffix every earlier element is an unsuffixed integer or float,
+the bare null `0N`, or a literal of the suffix's own type (`[1h 2 3h]`,
+`[1 0Nh 3h]`). Anything else is a `domain` error. The comments show each
+result as `repr` writes it:
+
+```lisp
+[1 2 3h]        ; I16 [1h 2h 3h]
+[1 0N 3i]       ; I32 [1i 0Ni 3i]
+[1.5 2 3e]      ; F32 [1.5e 2e 3e]
+[1h 2i]         ; error: 1h conflicts with the final i
+[1i 2 3h]       ; error: 1i conflicts with the final h
+[1 0Nl 3h]      ; error: 0Nl is an I64 null
+[40000 1h]      ; error: 40000 is out of the I16 range
+[-9223372036854775808 1h] ; error: out of range (the I64 null bit pattern)
+[1.5 2h]        ; error: a float literal under h or i
+[1 2h 3]        ; error: the suffix must be on the last element
+```
+
+Under `h` and `i` an integer must fit the type (`-32767..32767` for `I16`,
+`-2147483647..2147483647` for `I32`) and a float literal, `2.0` or `1e3`
+included, is an error. Under `e` integers and floats narrow as `(as 'F32 ...)`
+does, so `[1e39 1e]` saturates its first element to `3.40e+38e`. The suffix is
+read on input only: `repr` and the REPL display keep a suffix on every element
+(`[1h 2h 3h]`), so saved text reads back with the same type; `format` and
+`println` print `h` and `i` elements bare (`[1 2 3]`) and `e` elements with
+their suffix (`[1.0e 2.5e]`). `read-value` accepts the same vector grammar
+but, as for its scalars, rejects a lossy element: a float past the F32 range
+under `e`, or an integer past the I64 range.
 
 ### Vector Arithmetic
 

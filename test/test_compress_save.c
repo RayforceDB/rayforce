@@ -4544,6 +4544,17 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         { "a: a", "(and (== date 2024.01.02) (== (and (> a 0) (< a 12000)) true))", 2999, true },
         { "by: b s: (sum (if (< a 8) a 0))", "(== date 2024.01.02)", 3000, true },
         { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, false },
+        /* an IF beside other row-local outputs (#1181) */
+        { "b: b a: a q: (if (or (< a 8) (> a 11990)) a 0)", "(== date 2024.01.02)", 3000, true },
+        { "q: (if (< a 8) a b) r: (if (> b a) 1 0) s: (+ a b)", "(and (== date 2024.01.02) (> a 5))", 2998, true },
+        { "q: (if (< a 8) a 0) r: (if (> a 11992) b a)", "(> date 2024.01.03)", 0, true },
+        { "a: a q: (if (< a 8) a 0)", "(>= date 2024.01.01)", 9000, false },
+        { "a: a q: (if (< a 8) a 0) take: 5", "(== date 2024.01.02)", 5, false },
+        /* an IF operand in where: (#1181) */
+        { "a: a", "(and (== date 2024.01.02) (> (if (< a 8) b a) 10))", 2997, true },
+        { "a: a b: b", "(and (== date 2024.01.02) (== (if (< a 8) a b) (if (> a 4) b a)))", 3000, true },
+        { "a: a", "(and (>= date 2024.01.02) (> (if (< a 8) b a) 10))", 5994, true },
+        { "a: a", "(and (== date 2024.01.02) (> (if (< a 8) b (sum a)) 10))", 2998, false },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];
@@ -4756,6 +4767,96 @@ static test_result_t test_select_parted_prunes_if_limits(void) {
             if (!values || !structure) {
                 sp_bind(NULL); ray_release(t);
                 TEST_ASSERT_FMT(values && structure, "IF limits gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
+/* F64 conditions, F64 and SYM branches (#1181): pruned and unpruned answers
+ * agree, nulls (an F64 NaN is null) and symbols outside the root's domain
+ * included; mixed I64/F64 branches keep the full source. */
+static test_result_t test_select_parted_prunes_if_f64_sym(void) {
+    /* rows: of the answer over 2024.01.02 */
+    static const struct { const char* output; bool pruned; const char* pred; int64_t rows; } cases[] = {
+        { "q: (if (>= px 1.0) qty 0)", true, NULL, 8 },
+        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true, NULL, 8 },
+        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true, NULL, 8 },
+        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true, NULL, 8 },
+        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true, NULL, 8 },
+        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true, NULL, 2 },
+        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true, NULL, 2 },
+        { "q: (if (> qty 2) px qty)", false, NULL, 8 },
+        { "by: g n: (sum (if (> qty 2) px qty))", false, NULL, 2 },
+        /* an output rebinding a column the IF reads */
+        { "px: (* px 2.0) q: (if (> px 1.0) px 0.0)", false, NULL, 8 },
+        { "qty: (avg qty) q: (if (> px 1.0) qty 0)", false, NULL, 8 },
+        /* an IF operand in where: */
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) 'A 'B) 'B))", 4 },
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) act side) 'New))", 2 },
+        { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))", 5 },
+        { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))", 2 },
+        { "q: qty", true, "(and (== date 2024.01.02) (in (if (== side 'b) act side) ['New 's]))", 5 },
+        /* not an operand: a bare conjunct, under a logic head, in by: */
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) (> qty 2) (< qty 2)))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) qty 0))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) act side))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (or (if (> px 1.0) (> qty 2) (< qty 2)) (> qty 4)))", -1 },
+        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", false, NULL, -1 },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256], sym_path[512];
+        snprintf(root, sizeof root, "%s/if_f64_sym%d", ray_test_tmp(CS_TMP), gen);
+        snprintf(sym_path, sizeof sym_path, "%s/.sym", root);
+        for (int p = 0; p < 3; p++) {
+            char dir[512], src[1024];
+            snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+            snprintf(src, sizeof src,
+                "(table [g px qty act side] (list [7 7 7 7 8 8 8 8] "
+                "(+ %d.0 [0.5 1.5 0Nf 2.0 -0.0 1.0 0.25 0Nf]) [1 3 0Nl 4 5 0Nl 2 9] "
+                "(as 'SYM [\"New\" \"Accepted\" \"\" \"New\" \"Rejected\" \"New\" \"Accepted\" \"P%d\"]) "
+                "(as 'SYM [\"b\" \"s\" \"b\" \"\" \"s\" \"b\" \"s\" \"b\"])))", p, p);
+            ray_t* t = ray_eval_str(src);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t) && t->type == RAY_TABLE);
+            ray_err_t err = ray_splay_save_mode(t, dir, sym_path,
+                gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+            ray_release(t);
+            TEST_ASSERT_TRUE(err == RAY_OK);
+        }
+        ray_t* t = ray_read_parted(root, "t");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char q[1024], ref[1536];
+            const char* pred = cases[i].pred ? cases[i].pred : "(== date 2024.01.02)";
+            snprintf(q, sizeof q, "(xasc (select {from: t where: %s %s}) (key (select {from: t where: %s %s})))",
+                     pred, cases[i].output, pred, cases[i].output);
+            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or %s %s) %s}) (key (select {from: t where: (or %s %s) %s})))",
+                     pred, pred, cases[i].output, pred, pred, cases[i].output);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            /* the query runs the select twice: the rows and their key */
+            structure = ray_query_test_parted_pruned_sources(true) == (cases[i].pruned ? 2u : 0u);
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          (cases[i].rows < 0 || ray_table_nrows(r) == cases[i].rows) && sp_same(r, u);
+            /* rows -1: the answer may be an error; both sources must agree on it */
+            if (cases[i].rows < 0 && r && u && RAY_IS_ERR(r) && RAY_IS_ERR(u))
+                values = strcmp(ray_err_code(r), ray_err_code(u)) == 0;
+            drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "if f64/sym gen=%d case=%zu values=%d structure=%d",
                                 gen, i, (int)values, (int)structure);
             }
         }
@@ -6016,6 +6117,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_local_shapes", test_select_parted_prunes_local_shapes, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_if_f64_sym", test_select_parted_prunes_if_f64_sym, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_ordinary_uncapped", test_select_parted_prunes_ordinary_uncapped, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if", test_select_parted_prunes_grouped_if, rt_setup, rt_teardown },

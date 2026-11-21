@@ -36,6 +36,7 @@
 #include "table/sym.h"
 #include "lang/internal.h"
 #include "lang/callprof.h"
+#include "core/pool.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -4910,6 +4911,95 @@ static test_result_t test_eval_select_parted_stats_absent(void) {
     test_result_t result = test_eval_select_parted_stats_absent_impl(root);
     lang_parted_insert_rm_rf(root);
     return result;
+}
+
+/* ---- Test: an if answers the same with and without pool workers -------- */
+
+/* With no workers the selected arm of OP_IF (compact each branch's rows,
+ * scatter back) runs only under a sparse where; otherwise the eager fill,
+ * typed when both sides already hold the output's cells.  Every shape must
+ * give the same bytes at one worker as at four. */
+static test_result_t test_eval_if_workers_same(void) {
+    static const char* const qs[] = {
+        "(select {from: wt r: (if (> i 50) i j)})",
+        "(select {from: wt r: (if (> i 50) i 0N)})",
+        "(select {from: wt where: (> j -5) r: (if (> i 50) 7 i)})",
+        "(select {from: wt where: (> j 5) r: (if (> i 50) i 0)})",
+        "(select {from: wt r: (if (> x 5.0) x 0N) s: (if (> x 5.0) 1.5 x)})",
+        "(select {from: wt where: (> j -6) r: (if (> x 5.0) x y)})",
+        "(select {from: wt r: (if (> i 5) d 0Nd) s: (if (> i 5) d e)})",
+        "(select {from: wt r: (if (> i 5) h (as 'I32 1)) s: (if (> i 5) h i)})",
+        "(select {from: wt r: (if (> i 5) sp 00:00:01.000) s: (if (> i 5) ts 2020.01.01D00:00:00.000)})",
+        "(select {from: wt r: (if (> i 5) i sp)})",
+        "(select {from: wt r: (if (> i 5) x i)})",
+        "(select {from: wt where: (> j -5) r: (if (> i 50) s 'none) t: (if (> i 50) str \"no\")})",
+        "(select {from: wt where: (> j 4) r: (if (> i 50) str \"no\")})",
+        "(select {from: wt where: (> j -5) by: s r: (sum (if (> i 50) i 0)) q: (sum (if (> x 5.0) x 0.0))})",
+    };
+    enum { NQ = sizeof qs / sizeof qs[0] };
+    ray_t* setup = ray_eval_str(
+        "(do (set N 200000)"
+        " (set wt (table ['i 'j 'x 'y 'd 'e 'h 'sp 'ts 's 'str]"
+        "  (list (% (til N) 97) (- (% (til N) 13) 6) (* 0.5 (as 'F64 (% (til N) 50))) (as 'F64 (% (til N) 7))"
+        "   (+ 2024.01.01 (% (til N) 30)) (+ 2025.01.01 (% (til N) 11)) (as 'I32 (% (til N) 33))"
+        "   (as 'TIMESPAN (* 1000000 (% (til N) 9))) (+ 2024.01.01D00:00:00.000 (% (til N) 1000))"
+        "   (take ['a 'b 'c] N) (take [\"p\" \"qq\" \"rrr\"] N))))"
+        " (set wt (update {from: wt i: (if (== (% i 10) 0) 0N i) x: (if (== (% i 7) 0) 0N x)})) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_t* ser[2][NQ] = {{ NULL }};
+    static const uint32_t totals[2] = { 1, 4 };
+    for (int w = 0; w < 2; w++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(totals[w]), RAY_OK);
+        for (int q = 0; q < NQ; q++) {
+            char src[1024];
+            snprintf(src, sizeof src, "(ser (try %s (fn [e] e)))", qs[q]);
+            ser[w][q] = ray_eval_str(src);
+        }
+    }
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    /* Values, against the interpreter's if row by row: scalar and column
+     * sides of the typed fills, F64 beside I64 (j has no nulls: #1279). */
+    static const char* const vals[] = {
+        "(if (> x 5.0) x 1.5)", "(if (> x 5.0) -2.5 x)", "(if (> x 5.0) 0.25 -0.5)",
+        "(if (> x 5.0) x j)", "(if (> x 5.0) j x)", "(if (> x 5.0) j 0.5)", "(if (> x 5.0) 0.5 j)",
+        "(if (> i 50) i -7)", "(if (> i 50) 9 j)", "(if (> i 50) d 2020.01.01)",
+    };
+    for (size_t v = 0; v < sizeof vals / sizeof vals[0]; v++) {
+        char src[1024];
+        snprintf(src, sizeof src,
+                 "(do (set ws (take wt 20000))"
+                 " (set got (at (select {from: ws r: %s}) 'r))"
+                 " (set wI (at ws 'i)) (set wJ (at ws 'j)) (set wX (at ws 'x)) (set wD (at ws 'd))"
+                 " (set want (map (fn [k] (do (let i (at wI k)) (let j (at wJ k)) (let x (at wX k))"
+                 "  (let d (at wD k)) %s)) (til (count ws))))"
+                 /* mixed branches: the interpreter's atoms form a list */
+                 " (if (== (type want) 'LIST) (set want (as (type got) want)) 0)"
+                 " (and (== (type got) (type want)) (all (== got want))))", vals[v], vals[v]);
+        ray_t* ok = ray_eval_str(src);
+        bool good = ok && !RAY_IS_ERR(ok) && ok->type == -RAY_BOOL && ok->b8;
+        if (ok) { if (RAY_IS_ERR(ok)) ray_error_free(ok); else ray_release(ok); }
+        TEST_ASSERT_FMT(good, "if values differ from the interpreter: %s", vals[v]);
+    }
+    test_result_t res = { TEST_PASS, NULL };
+    for (int q = 0; q < NQ; q++) {
+        ray_t* a = ser[0][q];
+        ray_t* b = ser[1][q];
+        bool same = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) &&
+                    a->type == b->type && a->len == b->len &&
+                    memcmp(ray_data(a), ray_data(b), (size_t)a->len) == 0;
+        if (!same && res.status == TEST_PASS) {
+            static char msg[256];
+            snprintf(msg, sizeof msg, "worker counts disagree: %s", qs[q]);
+            res = (test_result_t){ TEST_FAIL, msg };
+        }
+        if (a) { if (RAY_IS_ERR(a)) ray_error_free(a); else ray_release(a); }
+        if (b) { if (RAY_IS_ERR(b)) ray_error_free(b); else ray_release(b); }
+    }
+    return res;
 }
 
 static test_result_t test_eval_select_parted_stats(void) {
@@ -11076,7 +11166,8 @@ static test_result_t test_builtin_within_fn(void) {
 }
 
 /* ── builtins.c coverage: ray_idiv_fn ───────────────────────────────────────
- * ray_idiv_fn always returns I64, handles zero-div and nulls. */
+ * ray_idiv_fn takes the promotion table's type (#972): F64 over floats,
+ * handles zero-div and nulls. */
 static test_result_t test_builtin_idiv_fn(void) {
     /* Normal division: floor(7.0 / 2.0) = 3 */
     ray_t* a = ray_f64(7.0);
@@ -11084,8 +11175,8 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r = ray_idiv_fn(a, b);
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(r->i64, 3);
+    TEST_ASSERT_EQ_I(r->type, -RAY_F64);
+    TEST_ASSERT_TRUE(r->f64 == 3.0);
     ray_release(r);
     ray_release(a);
     ray_release(b);
@@ -11096,7 +11187,7 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r2 = ray_idiv_fn(c, z);
     TEST_ASSERT_NOT_NULL(r2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
-    TEST_ASSERT_EQ_I(r2->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r2->type, -RAY_F64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r2));
     ray_release(r2);
     ray_release(c);
@@ -11108,7 +11199,7 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r3 = ray_idiv_fn(tn, d);
     TEST_ASSERT_NOT_NULL(r3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
-    TEST_ASSERT_EQ_I(r3->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r3->type, -RAY_F64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r3));
     ray_release(r3);
     ray_release(tn);
@@ -11403,7 +11494,8 @@ static test_result_t test_builtin_within_rfl(void) {
 /* ── builtins.c coverage: ray_idiv_fn via rfl ───────────────────────────────
  * Covers the div builtin (integer floor division). */
 static test_result_t test_builtin_idiv_rfl(void) {
-    ASSERT_EQ("(div 7.0 2.0)", "3");
+    ASSERT_EQ("(div 7.0 2.0)", "3.0");
+    ASSERT_EQ("(div 7 2)", "3");
     PASS();
 }
 
@@ -13390,6 +13482,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/if_workers_same", test_eval_if_workers_same, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },

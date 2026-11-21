@@ -16,7 +16,7 @@ Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-
 | `*` | binary | Multiplication | `(* 3 4)` → `12` |
 | `/` | binary | Float division (always f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | Modulo | `(% 7 3)` → `1` |
-| `div` | binary | Integer division (floor) | `(div 7 2)` → `3` |
+| `div` | binary | Floor division, promoted type | `(div 7 2)` → `3` |
 | `neg` | unary | Negate | `(neg 5)` → `-5` |
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
@@ -59,6 +59,7 @@ All comparison operators are **atomic** and return boolean results.
 | `<` | binary | Less than | `(< 3 5)` → `true` |
 | `>=` | binary | Greater than or equal | `(>= 5 5)` → `true` |
 | `<=` | binary | Less than or equal | `(<= 3 5)` → `true` |
+| `identical` | binary | Same type, shape and contents | `(identical 1 1i)` → `false` |
 | `==` | binary | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | Check which vector elements fall within a range | `(within [1 5 10] [3 7])` → `[false true false]` |
@@ -67,8 +68,8 @@ All comparison operators are **atomic** and return boolean results.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
-| `or` | binary | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (zero, null and NaN are false), in a query too (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
+| `or` | binary | Logical OR; element-wise on vectors and lists, each element by its truthiness, in a query too (lengths must match) | `(or true false)` → `true` |
 | `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation
@@ -202,7 +203,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
-| `deltas` | unary | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIME, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `deltas` | unary | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIMESPAN, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
 | `fills` | unary | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
@@ -358,6 +359,8 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `inner-join` | variadic | Inner join — only matching rows. |
 | `full-join` | variadic | Full outer join. All left and right rows are preserved; unmatched columns are null. |
 | `anti-join` | variadic | Anti-semi-join. Keep left rows with no right match. |
+| `semi-mask` | variadic | Boolean vector over the left rows: true where the row has a right match. |
+| `anti-mask` | variadic | Boolean vector over the left rows: true where the row has no right match. |
 | `window-join` | variadic, special | Join with time window constraint. Match rows within a time range. |
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 

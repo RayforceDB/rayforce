@@ -6,6 +6,26 @@ All numeric, logical, aggregation, ordering, generation, and higher-order operat
 
 Arithmetic operations work on scalars and auto-map element-wise over vectors. Numeric typed-vector calls and query expressions lower to morsel-based DAG kernels where available.
 
+### Result types { #result-types }
+
+`+`, `-`, `*`, `div`, `%` and the two-argument `min` and `max` take their result type from one promotion table. It depends only on the two operand types, so swapping the operands, or passing atoms, vectors or `select` / `update` columns, gives the same type:
+
+- the order is b8 < u8 < i16 < i32 < i64 < f32 < f64, and the wider type wins;
+- two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`), and a vector reports it as null only when the vector is marked as possibly holding nulls (see the types guide);
+- f32 with any other type is f64;
+- two b8 operands give i64 for `+ - * div %` and b8 for `min` and `max`.
+
+`/`, `pow` and the math functions below always return f64.
+
+```lisp
+(type (+ 2h 3i))              ; 'i32
+(type (+ [2i] [true]))        ; 'I32
+(type (min 2h 3i))            ; 'i32
+(type (div [7i] [2h]))        ; 'I32
+(type (+ (as 'F32 2.5) 1))    ; 'f64
+(+ true true)                 ; 2
+```
+
 ### `(+ a b)` — atomic
 
 Addition. Works on integers, floats, dates, and times.
@@ -46,11 +66,34 @@ integer (floor) division.
 
 ### `(% a b)` — atomic
 
-Modulo (remainder).
+Modulo: `a - b * floor(a / b)`, so the result takes the sign of `b`. The
+result type comes from the [table above](#result-types). A zero divisor
+gives null, with one exception kept from u8 byte modulo: an integer result
+with a u8 divisor (or a u8 result) gives `0`. A float result of a zero
+divisor is always null: `(% 7.5 0x00)` is `0Nf`.
 
 ```lisp
 (% 10 3)  ; 1
+(% -7 2)  ; 1
 (% [10 11 12] 3)  ; [1 2 0]
+(% 300 0xff)  ; 45
+(% 7.5 0x02)  ; 1.5
+```
+
+### `(div a b)` — atomic
+
+Floor division: the largest integer not above `a / b`. The result type
+comes from the [table above](#result-types), so integers stay integers of
+the wider operand's width and a float operand gives a float. A zero divisor
+gives null, or `0` for a u8 result, which has no null. Unlike `%`, a u8
+divisor alone does not make it `0`: `(div 7 0x00)` is `0Nl`, while
+`(% 7 0x00)` is `0`.
+
+```lisp
+(div 7 2)  ; 3
+(div -7 2)  ; -4
+(type (div 7i 2i))  ; 'i32
+(div 7.5 2.0)  ; 3.0
 ```
 
 ### `(neg x)` — atomic
@@ -175,6 +218,23 @@ The direct numeric unary functions accept `BOOL`, `U8`, `I16`, `I32`, `I64`, and
 
 All comparison operations are atomic and return boolean values (or boolean vectors).
 
+The operand types must be comparable; any other pair is a `type` error:
+
+- numbers (`BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`) with each other
+  and with `TIMESPAN`;
+- `DATE`, `TIME` and `TIMESTAMP` with each other, on one nanosecond scale;
+  `TIME` and `TIMESTAMP` also with `TIMESPAN`;
+- `GUID`, `SYM` and `STR` each with its own type.
+
+A temporal value is not a number: `(> 2024.01.02 8000)` is a `type` error
+rather than a comparison of the stored day count, and so is ordering a
+symbol against a number. `==` and `!=` against a null answer without
+looking at the other type: `(== 2024.01.02 0N)` is `false`.
+
+The same rule holds inside a query, with the same errors. The one difference
+is a string literal, which a query reads as a symbol, so `(== sym "AAPL")`
+compares a `SYM` column with the symbol `AAPL`.
+
 ### `(== a b)` — atomic
 
 Equal. Works on all types including strings and symbols.
@@ -182,6 +242,39 @@ Equal. Works on all types including strings and symbols.
 ```lisp
 (== 3 3)  ; true
 (== [1 2 3] 2)  ; [false true false]
+```
+
+Dictionaries retain their keys and compare values by key. When keys differ,
+the result contains the left keys followed by new right keys; a key present
+on only one side compares `false`. An atom broadcasts over dictionary values.
+Tables compare cell by cell, returning boolean columns. Table column names
+and order and row counts must agree, otherwise `==` raises `length`. An atom
+broadcasts over all cells. Other comparisons and arithmetic keep their
+existing behavior. In particular, `!=` still rejects dictionaries and tables.
+Nonempty dictionary key vector types must match; different key types raise `type`.
+Identical key vectors (including duplicate keys) compare values positionally;
+otherwise each left value compares with the first right value for its key,
+including repeated left keys. For example, `[a a b]` versus `[a a c]` with
+values `[1 2 3]` on both sides yields `{a:true a:false b:false c:false}`.
+Keyed-table comparisons support single and composite keys, including durations.
+
+### `(identical a b)`
+
+Returns one boolean for whole-value identity: the same type, shape and
+contents recursively. Numeric types are never promoted. Type and length
+mismatches return `false`. Lists and typed vectors are distinct types.
+Nulls match only the same type; floating values compare exactly, with NaNs
+matching NaNs and negative zero matching positive zero. Strings compare by
+bytes and symbols by text. Storage attributes and indexes do not matter.
+Dictionary keys and values must agree in order; tables must have the same
+column names in order and identical columns. Lazy values are evaluated.
+Builtins match the same builtin; lambdas match only the same function object.
+
+```clojure
+(identical [1 2] [1 2])  ; true
+(identical 1 1i)        ; false
+(identical (list 1 2) [1 2]) ; false
+(== {a: 1 b: 2} 1)     ; {a:true b:false}
 ```
 
 ### `(!= a b)` — atomic
@@ -240,7 +333,10 @@ Check if each element of a vector is within a range (inclusive). The second argu
 Logical AND. On atoms it answers one boolean; on a vector or a list it
 works element by element, each element by its truthiness, and returns a
 boolean vector (a nested list keeps its shape). An atom broadcasts, and two
-collections of different lengths are a `length` error.
+collections of different lengths are a `length` error. The exception is a
+first operand that is an atom and already decides the answer: it is
+returned without reading the rest, as one boolean: `(and false [1 0 2])` is `false`, `(or true [1 0])`
+is `true`. Inside a query the answer is per row either way.
 
 ```lisp
 (set x 5)
@@ -248,6 +344,12 @@ collections of different lengths are a `length` error.
 (and [true false] (list true true))  ; [true false]
 (and [1 0 2] true)                   ; [true false true]
 ```
+
+The truth value of an element: `false`, zero, null and NaN are false; any
+other number or temporal is true, and so is any symbol, string or GUID that
+is not null. A query reads its operands the same way, so
+`(select {from: t where: (and qty (> price 100))})` keeps the rows where
+`qty` is non-zero and not null.
 
 ### `(or a b)` — atomic
 
@@ -336,18 +438,22 @@ A TIMESPAN vector is also accepted by `sums`, `mins`, `maxs`, `msum`, `mmin`,
 
 ### `(min x)` — aggregate
 
-Minimum value.
+Minimum value. With two arguments, `(min a b)` is the element-wise minimum,
+typed by the [promotion table](#result-types).
 
 ```lisp
 (min [5 1 9])  ; 1
+(min [5 1 9] [2 2 2])  ; [2 1 2]
 ```
 
 ### `(max x)` — aggregate
 
-Maximum value.
+Maximum value. With two arguments, `(max a b)` is the element-wise maximum,
+typed by the [promotion table](#result-types).
 
 ```lisp
 (max [5 1 9])  ; 9
+(max [5 1 9] [2 2 2])  ; [5 2 9]
 ```
 
 ### `(med x)` — aggregate
@@ -710,3 +816,9 @@ described in [Multiple Instances](../guides/instances.md).
 
 !!! note "Auto-mapping"
     Arithmetic, comparison, and logic functions automatically map over vectors element-wise. You do not need explicit `map` calls for these — `(+ [1 2 3] 10)` works directly.
+
+For equality, mixing a dictionary with a table is a `type` error in either
+operand order; a dictionary's keys are not interpreted as table columns.
+
+Table equality and identity read stored columns as values: encoded and
+partitioned columns are materialized, including virtual partition columns.

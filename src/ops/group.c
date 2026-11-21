@@ -485,7 +485,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
                 (acc)->first_i = v; (acc)->has_first = true; \
             } \
-            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_LAST) { \
+                (acc)->last_i = v; (acc)->has_first = true; /* a value seen */ \
+            } \
             if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
@@ -523,7 +525,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
                 (acc)->first_i = v; (acc)->has_first = true; \
             } \
-            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_LAST) { \
+                (acc)->last_i = v; (acc)->has_first = true; /* a value seen */ \
+            } \
             if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
@@ -546,7 +550,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
                 (acc)->first_f = v; (acc)->has_first = true; \
             } \
-            if ((NEEDS) & RED_NEED_LAST) (acc)->last_f = v; \
+            if ((NEEDS) & RED_NEED_LAST) { \
+                (acc)->last_f = v; (acc)->has_first = true; /* a value seen */ \
+            } \
             if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
@@ -1548,6 +1554,15 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         .values = out_buf, .part_off = part_off, .part_count = part_count,
     };
     ray_pool_dispatch_n(pool, cd_part_dedup_fn, &dctx, (uint32_t)P);
+    /* A cancel skips the tasks it lands before, and the flag stays set, so
+     * every later pass runs none: a cancel in any pass leaves the dedup's
+     * counts unwritten, read only here.  (A histogram task skipped leaves
+     * zeros, hist being zeroed; the scatter that would trust it never runs.) */
+    if (pool_cancelled(pool)) {
+        scratch_free(pcnt_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     int64_t total_distinct = 0;
     for (uint64_t p = 0; p < P; p++) {
@@ -2049,8 +2064,11 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     }
     part_off[P] = total;
     if (total != len) {
+        /* a cancel leaves its skipped tasks' counts zero (hist is zeroed):
+         * the histogram is short */
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
-        return ray_error("nyi", "distinct: histogram mismatch");
+        return pool_cancelled(pool) ? ray_error("cancel", NULL)
+                                    : ray_error("nyi", "distinct: histogram mismatch");
     }
 
     /* Pass 2: scatter (value, row id) pairs. */
@@ -2092,6 +2110,15 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
         .part_count = part_count, .first = first,
     };
     ray_pool_dispatch_n(pool, dv_part_dedup_fn, &dctx, (uint32_t)P);
+    /* A cancel skips the tasks it lands before, and the flag stays set, so
+     * the passes after it run none: a cancel in the scatter or the dedup
+     * leaves the dedup's counts and marks unwritten, read only here. */
+    if (pool_cancelled(pool)) {
+        scratch_free(pcnt_hdr); scratch_free(first_hdr);
+        scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     int64_t total_distinct = 0;
     for (uint64_t p = 0; p < P; p++) {
@@ -2363,6 +2390,11 @@ static ray_t* count_distinct_per_group_parallel(
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
     if (!ctx.hist) { return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
+    /* Each pass reads the one before it: the histogram sizes and places the
+     * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
+     * their part unwritten (a short histogram would send the scatter past
+     * its partitions). */
+    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2413,13 +2445,16 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 3: per-partition dedup; partition is keyed on gid via
      * CDPG_PART_HASH so each gid is owned by exactly one task — odata
      * updates run without atomics. */
-    if (total > 0)
+    bool cancelled = pool_cancelled(pool);
+    if (total > 0 && !cancelled) {
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
+        cancelled = pool_cancelled(pool);
+    }
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
     scratch_free(hist_hdr);
-    return out;
+    return cancelled ? ray_error("cancel", NULL) : out;
 }
 
 /* Approximate per-group count(distinct) via HyperLogLog with sparse
@@ -2563,6 +2598,7 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     if (n_rows >= 200000) {
         ray_t* par = count_distinct_per_group_parallel(src, row_gid,
                                                         n_rows, n_groups, out);
+        if (par && RAY_IS_ERR(par)) ray_release(out);   /* a cancel */
         if (par) return par;
         /* par == NULL → no pool / OOM in scratch alloc → fall through to
          * serial path with the already-allocated `out` (still zeroed). */
@@ -10041,6 +10077,29 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     scalar_run_staged((scalar_ctx_t*)ctx, worker_id, start, end, scalar_sum_i64_body);
 }
 
+/* The same over a narrow integer input (I32 / I16 / U8, no mask): a fused
+ * narrow expression keeps its planned width (#973), and its SUM / AVG must
+ * not fall back to the generic per-row loop.  A range's int64 total cannot
+ * overflow (a scan chunk holds far fewer than 2^32 rows). */
+#define SCALAR_SUM_NARROW(NAME, T)                                                     \
+static void NAME##_body(scalar_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) { \
+    (void)worker_id;                                                                   \
+    da_accum_t* acc = c->acc;                                                          \
+    const T* restrict data = (const T*)c->agg_ptrs[0] + (start - c->row_base);        \
+    int64_t n = end - start, sum = 0;                                                  \
+    for (int64_t r = 0; r < n; r++) sum += data[r];                                    \
+    if (acc->sum_hi) ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, sum);   \
+    else acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);                             \
+    acc->count[0] += n;                                                                \
+}                                                                                      \
+static void NAME##_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {     \
+    scalar_run_staged((scalar_ctx_t*)ctx, worker_id, start, end, NAME##_body);         \
+}
+SCALAR_SUM_NARROW(scalar_sum_i32, int32_t)
+SCALAR_SUM_NARROW(scalar_sum_i16, int16_t)
+SCALAR_SUM_NARROW(scalar_sum_u8,  uint8_t)
+#undef SCALAR_SUM_NARROW
+
 /* Tight loop for single SUM/AVG on f64 (no mask), by explicit lanes: row r
  * adds into lane r mod SC_F64_LANES, each lane in row order, and the task's
  * partial is the lanes combined in one fixed order.  The answer therefore
@@ -16933,6 +16992,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_fn = scalar_sum_i64_fn;
             else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_F64)
                 sc_fn = scalar_sum_f64_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_I32)
+                sc_fn = scalar_sum_i32_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_I16)
+                sc_fn = scalar_sum_i16_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_U8)
+                sc_fn = scalar_sum_u8_fn;
         } else if (n_aggs == 1 && !match_idx && !rowsel && agg_linear[0].enabled) {
             uint16_t op0 = ext->agg_ops[0];
             if (op0 == OP_SUM || op0 == OP_AVG)

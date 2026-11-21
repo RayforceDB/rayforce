@@ -104,15 +104,10 @@
 (nil? (+ (as 'TIME 0) 0Nd))    -- true
 (type (+ (as 'TIME 0) 0Nd))    -- 'timestamp
 
-;; ── L72-74: TIME + TIME → TIME (null propagation) ──
+;; ── TIME + TIME → type error, with a null on either side too ──
 
-;; null TIME + TIME → null TIME
-(nil? (+ 0Nt (as 'TIME 1000)))    -- true
-(type (+ 0Nt (as 'TIME 1000)))    -- 'time
-
-;; TIME + null TIME → null TIME
-(nil? (+ (as 'TIME 1000) 0Nt))    -- true
-(type (+ (as 'TIME 1000) 0Nt))    -- 'time
+(+ 0Nt (as 'TIME 1000))    !- type
+(+ (as 'TIME 1000) 0Nt)    !- type
 
 ;; ── L77-79: TIME + TIMESTAMP → TIMESTAMP (null propagation) ──
 
@@ -203,13 +198,13 @@
 (nil? (- (as 'DATE 7305) 0Nt))      -- true
 (type (- (as 'DATE 7305) 0Nt))      -- 'timestamp
 
-;; ── L132-134: TIME - TIME null → null TIME ──
+;; ── TIME - TIME null → null TIMESPAN ──
 
 (nil? (- 0Nt (as 'TIME 2000)))      -- true
-(type (- 0Nt (as 'TIME 2000)))      -- 'time
+(type (- 0Nt (as 'TIME 2000)))      -- 'timespan
 
 (nil? (- (as 'TIME 5000) 0Nt))      -- true
-(type (- (as 'TIME 5000) 0Nt))      -- 'time
+(type (- (as 'TIME 5000) 0Nt))      -- 'timespan
 
 ;; ── L141-143: TIMESTAMP - TIME null → null TIMESTAMP ──
 
@@ -413,14 +408,14 @@
 (% -10 3) -- 2
 (% 10 -3) -- -2
 
-;; Integer mod: result type I32 (line 296)
+;; Integer mod: the promoted type, I64 beside an I64 dividend (#972)
 (% 100 (as 'I32 7)) -- 2
 
 ;; Integer mod: result type I16 (line 297)
 (% 100 (as 'I16 7)) -- 2
 
-;; Integer mod: U8 result (line 298)
-(% 100 (as 'U8 7)) -- 0x02
+;; Integer mod: an I64 dividend keeps I64 against a U8 divisor (#1227)
+(% 100 (as 'U8 7)) -- 2
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_neg_fn — negation branches

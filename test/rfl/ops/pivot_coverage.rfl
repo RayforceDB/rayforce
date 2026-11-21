@@ -774,15 +774,14 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (as 'I64 (at (select {r: (if true ts ts) from: PT}) 'r)) -- [100 200 300 45 145 245]
 (.sys.exec "rm -rf /tmp/rfl_ifpt")
 
-;; ── the declared type is a floor, not the answer ───────────────────────
-;; The graph promotes the declared types of the branch EXPRESSIONS, but
-;; arithmetic widens past them: (* a a) over an I32 column is computed and
-;; stored as I64.  Reporting the declared I32 does not relabel the result, it
-;; truncates every value.  Non-trivial branches keep the eager arm away, so
-;; this is the selected arm's own answer.
+;; ── the declared type is the answer ───────────────────────────────────
+;; The branch expressions compute in their planned types (#973): (* a a)
+;; over an I32 column is I32 and wraps, as the builtin does, and (+ b b)
+;; over I16 is I16.  Non-trivial branches keep the eager arm away, so this
+;; is the selected arm's own answer.
 (set TW (table [c a b] (list [true false true] (as 'I32 [100000 100000 100000]) (as 'I16 [30000 30000 30000]))))
-(at (select {r: (if c (* a a) (* a a)) from: TW}) 'r) -- [10000000000 10000000000 10000000000]
-(at (select {r: (if c (+ b b) (+ b b)) from: TW}) 'r) -- [60000 60000 60000]
+(at (select {r: (if c (* a a) (* a a)) from: TW}) 'r) -- [1410065408i 1410065408i 1410065408i]
+(at (select {r: (if c (+ b b) (+ b b)) from: TW}) 'r) -- [-5536h -5536h -5536h]
 
 ;; ── narrowing belongs to the branch that supplied nothing ──────────────
 ;; Two temporal branches promote to I64 because of the pair, not because of

@@ -190,14 +190,13 @@ static inline int64_t sym_intern_safe(const char* s, size_t len) {
 }
 
 /* Result type of `deltas`: the type `-` answers between consecutive elements.
- * A difference of two TIMESTAMPs is a TIMESPAN, of two TIMEs a TIME and of two
- * DATEs an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64
- * and every other integer family I64. */
+ * A difference of two TIMESTAMPs or two TIMEs is a TIMESPAN and of two DATEs
+ * an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64 and
+ * every other integer family I64. */
 static inline int8_t deltas_out_type(int8_t t) {
     switch (t) {
         case RAY_F32: case RAY_F64:      return RAY_F64;
-        case RAY_TIMESTAMP: case RAY_TIMESPAN: return RAY_TIMESPAN;
-        case RAY_TIME:                   return RAY_TIME;
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_TIME: return RAY_TIMESPAN;
         case RAY_DATE:                   return RAY_I32;
         default:                         return RAY_I64;
     }
@@ -1511,6 +1510,10 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
  * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
  * Disarmed by ray_test_hooks_off. */
 void ray_query_test_cd_route(int route);
+/* query.c test hook: true turns off ray_select_impl's net (a select that
+ * answers while the pool's dispatches were cancelled answers `cancel`), so a
+ * test pins each stage's own check.  Disarmed by ray_test_hooks_off. */
+void ray_query_test_cancel_net_off(bool off);
 /* query.c test hook: the largest unordered take the rewrite's first-N pick
  * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
  * first row is found.  Negative restores the default; disarmed by
@@ -1679,6 +1682,8 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
                      ray_t* left_table, ray_t* right_table);
 ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                         ray_t* left_table, ray_t* right_table);
+ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
+                     const int64_t* key_names, uint32_t n_keys, bool anti);
 
 /* ── group.c ── */
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
@@ -2519,6 +2524,7 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
     const int64_t* offsets, const int64_t* counts, int64_t groups, int64_t* winners);
 
 /* Gather winning group rows, retaining source domains and native types. */
+ray_t* ray_tbl_col_empty(ray_t* tbl, int64_t sym);
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
 /* Keep a grouped key column's "may have nulls" flag only when a key value is
  * null (vectorised, pool-split scan); see agg_engine.c. */

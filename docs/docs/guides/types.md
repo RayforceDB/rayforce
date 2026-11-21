@@ -43,7 +43,10 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 
 F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
 Scientific notation keeps its exponent: `1e3` is F64, while `1e3e` is F32.
-F32 vectors require a suffix on each non-null element: `[1e 2e 0Ne]`.
+An F32 vector is written with a suffix on each element, `[1e 2e 0Ne]`, or
+with one final suffix that types the whole literal, `[1 2.5 0N 3e]`; `h` and
+`i` work the same way for I16 and I32 (`[1 2 3h]`). See
+[Typed vector literals](../language/syntax.md#typed-vector-literals).
 Finite values beyond the F32 range saturate just as casts do. F32 values
 print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.
@@ -184,10 +187,12 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 
 !!! note "Coercion rules"
 
-    - **i64 + f64 → f64:** Arithmetic between integers and floats promotes to float.
-    - **f32 op f32 → f32:** `+ - * %` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with an i64, i32, or f64 operand widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
+    - **One promotion table:** `+ - * div %` and the two-argument `min` and `max` take their result type from the operand types alone, the same for atoms, vectors and `select` / `update` columns, and the same with the operands swapped. The order is **b8 < u8 < i16 < i32 < i64 < f32 < f64** and the wider type wins: `(+ 2h 3i)` is i32, `(+ 1 2.0)` is f64, `(+ true 0xff)` is u8.
+    - **Same width keeps the width:** two operands of one integer type give that type, and the result wraps there as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`, `(* 50000i 50000i)` is `-1794967296`. Cast an operand first (`(* (as 'I64 x) x)`) to compute wider. A query computes the same values: `(select {r: (* x x) from: t})` over an i16 column is an i16 column. For i16, i32 and i64, the minimum value is the null sentinel, so a result that wraps exactly onto it is that null: `(+ 32767h 1h)` is `0Nh`. A vector reports such a cell as null only when the vector is marked as possibly holding nulls, as i64 always has: `(nil? (+ [2147483647i 5i] [1i 0i]))` is `[false false]`, but `(nil? (+ [2147483647i 5i 0Ni] [1i 0i 0i]))` is `[true false true]`. With the mark set, `fill` and the aggregates treat the cell as missing. Cast to a wider type first when a result can reach the minimum.
+    - **f32 op f32 → f32:** `+ - * div % min max` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with any other type, integer or f64, widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
+    - **b8 with b8:** `+ - * div %` of two booleans give i64 (`(+ true true)` is `2`); `min` and `max` of two booleans give b8.
     - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
-    - **bool → i64:** Booleans coerce to 1/0 in arithmetic contexts.
+    - **bool → 1/0:** Booleans count as 1/0 in arithmetic contexts.
     - **i64 → bool:** In boolean contexts (if, cond), 0 is false, non-zero is true.
     - **Narrower → wider:** Comparisons across numeric types promote the narrower operand.
     - **No string coercion:** Strings never implicitly convert to numbers. Use `as` explicitly.
@@ -200,14 +205,26 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 ; f32 stays f32 against f32, widens against anything else
 (type (+ (as 'F32 [1.5 2.5]) (as 'F32 [1.0 1.0])))  ; 'F32
 (type (+ (as 'F32 [1.5 2.5]) 1))                    ; 'F64
+(type (min (as 'F32 2.5) 1))                        ; 'f64
 (* 3e38e 3e38e)                                     ; 0Ne
 (type (min (as 'F32 [1.5 2.5])))                    ; 'f32
 (type (sum (as 'F32 [1.5 2.5])))                    ; 'f64
 (mins (as 'F32 [2.5 -3.5 0Nf 1.25]))                ; [2.5e -3.5e -3.5e -3.5e]
 (fill 0.0 (as 'F32 [2.5 0Nf]))                      ; [2.5e 0.0e]
 
+; The wider type wins, whichever side it is on
+(type (+ [1h 2h] [3i 4i]))  ; 'I32
+(type (+ [3i 4i] [1h 2h]))  ; 'I32
+(type (div 7i 2h))          ; 'i32
+(div 7.5 2.0)               ; 3.0
+
+; Same width keeps the width and wraps
+(+ 0xff 0x01)            ; 0x00
+(* 300h 300h)            ; 24464
+
 ; Boolean in arithmetic
 (+ 10 true)              ; 11
+(+ true true)            ; 2
 (sum [true false true])   ; 2
 
 ; Boolean context
@@ -350,14 +367,26 @@ Rayforce represents calendar points and clock times with DATE, TIME, and TIMESTA
 
 `date` and `time` are 32-bit counts (of days and of milliseconds). A `time`
 is not limited to one day: `48:00:00.000` and negative values are valid, up to
-about ±596 hours. A result past the 32-bit range keeps its low 32 bits, the
-same for an atom and for a vector cell, so `(* 25 24:00:00.000)` is
-`-593:02:47.296`.
+about ±596 hours. A result of integer arithmetic past the 32-bit range keeps
+its low 32 bits, the same for an atom and for a vector cell, so
+`(* 25 24:00:00.000)` is `-593:02:47.296`; a `time` moved by a TIMESPAN past
+that range is null instead.
 
-Subtracting two timestamps returns TIMESPAN. Cast the difference with
-`as 'I64` when an integer nanosecond count is needed. A duration may be
-added to a timestamp, scaled by an integer, or used as an `xbar` width.
-See [Timespan](timespan.md) for operator result types and migration details.
+A `time` and a `timestamp` are points: subtracting two timestamps, or two
+times, returns TIMESPAN, and adding a duration to either returns the same
+point type (`(+ 20:30:00.000 0D09:30:00)` is `30:00:00.000`; a time does not
+wrap at 24 hours, and a result past its 32-bit range is null). Two points do
+not add: `time + time`, like `timestamp + timestamp` and `date + date`, is a
+type error. Adding or subtracting an integer still counts the type's own unit
+(milliseconds for a `time`). Cast a difference with `as 'I64` when an integer
+nanosecond count is needed. A duration may also be scaled by an integer, or
+used as an `xbar` width for a timestamp or a time (`(xbar 10:37:00.000
+0D00:15:00)` is `10:30:00.000`). A time has no quotient by a duration: `div`
+and `/` of a time by a TIMESPAN are type errors. See [Timespan](timespan.md) for operator result
+types and migration details.
+
+Subtracting two dates returns an I32 count of days, so a date plus the
+difference of two dates is a date again (`d0 + (d - d0)` is `d`).
 
 **Date arithmetic:**
 
@@ -366,11 +395,26 @@ See [Timespan](timespan.md) for operator result types and migration details.
 (+ 2024.01.15 1)        ; 2024.01.16
 (+ 2024.01.15 30)       ; 2024.02.14
 
-; Subtract dates to get days between
+; Subtract dates to get days between (an i32 day count)
 (- 2024.01.15 2024.01.01)  ; 14
 
 ; Create a date range
 (+ 2024.01.01 (til 7))   ; [2024.01.01 2024.01.02 ... 2024.01.07]
+```
+
+**Time arithmetic:**
+
+```lisp
+; The difference of two times is a duration
+(- 10:30:00.000 09:30:00.000)      ; 0D01:00:00.000000000
+
+; A time moved by a duration is a time, past 24 h if need be
+(+ 20:30:00.000 0D09:30:00)        ; 30:00:00.000
+
+; Integers count milliseconds
+(+ 10:30:00.000 1500)              ; 10:30:01.500
+
+(+ 20:30:00.000 09:30:00.000)      ; error: type
 ```
 
 **Casting between temporal types:**
