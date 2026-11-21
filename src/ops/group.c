@@ -1548,6 +1548,15 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         .values = out_buf, .part_off = part_off, .part_count = part_count,
     };
     ray_pool_dispatch_n(pool, cd_part_dedup_fn, &dctx, (uint32_t)P);
+    /* A cancel skips the tasks it lands before, and the flag stays set, so
+     * every later pass runs none: a cancel in any pass leaves the dedup's
+     * counts unwritten, read only here.  (A histogram task skipped leaves
+     * zeros, hist being zeroed; the scatter that would trust it never runs.) */
+    if (pool_cancelled(pool)) {
+        scratch_free(pcnt_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     int64_t total_distinct = 0;
     for (uint64_t p = 0; p < P; p++) {

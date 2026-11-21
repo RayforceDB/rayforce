@@ -11279,7 +11279,10 @@ static void slice_scatter_fn(void* vctx, uint32_t worker_id, int64_t t0, int64_t
 
 /* Build the slices into grp_cnt / offsets (caller's [n_groups] arrays) and
  * *idx_hdr, using pos[n_groups] as scratch.  sel may be NULL.  Returns
- * false on allocation failure. */
+ * false on allocation failure or a cancel (pool_cancelled tells them apart).
+ * The counts need no check of their own: their tasks a cancel skips leave
+ * zeros (hist is zeroed), and the flag stays set, so the scatter then runs
+ * none of its tasks, its rows all unwritten -- the check is after it. */
 static bool slice_build(const int64_t* row_gid, int64_t nrows, ray_t* sel,
                         int64_t n_groups, int64_t* grp_cnt, int64_t* offsets,
                         int64_t* pos, ray_t** idx_hdr) {
@@ -11356,11 +11359,16 @@ static bool slice_build(const int64_t* row_gid, int64_t nrows, ray_t* sel,
     *idx_hdr = ray_alloc((size_t)(total > 0 ? total : 1) * sizeof(int64_t));
     if (!*idx_hdr) { scratch_free(hist_hdr); scratch_free(seg_hdr); return false; }
     c.idx_buf = (int64_t*)ray_data(*idx_hdr);
-    if (n_tasks > 1) ray_pool_dispatch_n(pool, slice_scatter_fn, &c, (uint32_t)n_tasks);
-    else             slice_scatter_fn(&c, 0, 0, 1);
+    bool ok = true;
+    if (n_tasks > 1) {
+        ray_pool_dispatch_n(pool, slice_scatter_fn, &c, (uint32_t)n_tasks);
+        if (pool_cancelled(pool)) { ray_free(*idx_hdr); *idx_hdr = NULL; ok = false; }
+    } else {
+        slice_scatter_fn(&c, 0, 0, 1);
+    }
     scratch_free(hist_hdr);
     scratch_free(seg_hdr);
-    return true;
+    return ok;
 }
 
 /* `tbl` is the column's table (or NULL): its partition counts give a NULL
@@ -12424,6 +12432,9 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
             ray_release(src); ray_release(out);
             return err;
         }
+        /* A cancel in the gather leaves part of the subset unwritten:
+         * exec_count_distinct answers it, a gather on the pool being one it
+         * counts on the pool too, past its dispatches' checks. */
         ray_t* cv = exec_count_distinct(NULL, NULL, subset);
         ray_release(subset);
         if (!cv || RAY_IS_ERR(cv)) {
@@ -25532,7 +25543,8 @@ by_dict_done:
                         ray_free(pos_hdr);
                         RELEASE_SCAN_KEY();
                         ray_release(result); ray_release(tbl);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return ray_error(pool_cancelled(ray_pool_get()) ? "cancel" : "oom", NULL);
                     }
                     idx_buf = (int64_t*)ray_data(idx_hdr);
                 }
