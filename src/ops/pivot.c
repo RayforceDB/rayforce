@@ -850,6 +850,13 @@ static bool if_branch_trivial(ray_graph_t* g, ray_op_t* op) {
     return false;
 }
 
+/* A literal branch, under any alias. */
+static bool if_branch_const(ray_graph_t* g, ray_op_t* op) {
+    while (op && (op->opcode == OP_ALIAS || op->opcode == OP_MATERIALIZE))
+        op = op_child(g, op, 0);
+    return op && op->opcode == OP_CONST;
+}
+
 /* A branch that is cheap to evaluate over ALL rows and total (no row can
  * fail): scans, constants, substrings, string case/trim/length, add/sub/mul,
  * comparisons, and/or/not, and `if` over such — a descriptor-only STR
@@ -907,7 +914,9 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
     }
 }
 
-static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
+/* Out of line: inlined into exec_if it cost the serial STR descriptor
+ * build there about 5% (same instructions, its loops laid out worse). */
+static __attribute__((noinline)) ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     if (!g || !g->table || !cond_v || cond_v->type != RAY_BOOL)
         return NULL;
     int64_t nrows = ray_table_nrows(g->table);
@@ -972,10 +981,13 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
                            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op));
     /* Serially too unless the selection is sparse: the typed eager fill
      * costs about a nanosecond a row, this arm's compaction and scatter
-     * several per selected row (#1181). */
+     * several per selected row (#1181).  Not a STR result with a literal
+     * side: the serial descriptor build for it loses to this arm. */
     {
         ray_pool_t* rp = ray_pool_get();
-        if (eager_possible && ((rp && rp->n_workers > 0) || !sparse_sel))
+        bool serial_eager = !sparse_sel &&
+            !(op->out_type == RAY_STR && (if_branch_const(g, then_op) || if_branch_const(g, else_op)));
+        if (eager_possible && ((rp && rp->n_workers > 0) || serial_eager))
             return NULL;
     }
 
@@ -1127,6 +1139,30 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         if ((c->then_scalar || c->then_v->type == RAY_F64) &&
             (c->else_scalar || c->else_v->type == RAY_F64)) {
             IF_FILL_SAME(double, c->t_f64, c->e_f64);
+            break;
+        }
+        /* An I64-cell side beside an F64 or scalar one: converted as
+         * if_vec_f64 converts it, (double) of the raw cell. */
+        bool t_i = !c->then_scalar && if_side_i64_cells(c->then_v, false);
+        bool e_i = !c->else_scalar && if_side_i64_cells(c->else_v, false);
+        if ((t_i || c->then_scalar || c->then_v->type == RAY_F64) &&
+            (e_i || c->else_scalar || c->else_v->type == RAY_F64)) {
+            double* dst = (double*)c->dst;
+            const void* tp = c->then_scalar ? NULL : ray_data(c->then_v);
+            const void* ep = c->else_scalar ? NULL : ray_data(c->else_v);
+            const int64_t* ti = (const int64_t*)tp;
+            const int64_t* ei = (const int64_t*)ep;
+            const double* tf = (const double*)tp;
+            const double* ef = (const double*)ep;
+            double ts = c->t_f64, es = c->e_f64;
+#define IF_FILL_LOOP(TX, EX) \
+            for (int64_t i = i0; i < i1; i++) dst[i] = cond_p[i] ? (TX) : (EX)
+            if (t_i && e_i)          IF_FILL_LOOP((double)ti[i], (double)ei[i]);
+            else if (t_i && ep)      IF_FILL_LOOP((double)ti[i], ef[i]);
+            else if (t_i)            IF_FILL_LOOP((double)ti[i], es);
+            else if (tp)             IF_FILL_LOOP(tf[i], (double)ei[i]);
+            else                     IF_FILL_LOOP(ts, (double)ei[i]);
+#undef IF_FILL_LOOP
             break;
         }
         double* dst = (double*)c->dst;

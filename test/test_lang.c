@@ -4961,6 +4961,29 @@ static test_result_t test_eval_if_workers_same(void) {
     }
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    /* Values, against the interpreter's if row by row: scalar and column
+     * sides of the typed fills, F64 beside I64 (j has no nulls: #1279). */
+    static const char* const vals[] = {
+        "(if (> x 5.0) x 1.5)", "(if (> x 5.0) -2.5 x)", "(if (> x 5.0) 0.25 -0.5)",
+        "(if (> x 5.0) x j)", "(if (> x 5.0) j x)", "(if (> x 5.0) j 0.5)", "(if (> x 5.0) 0.5 j)",
+        "(if (> i 50) i -7)", "(if (> i 50) 9 j)", "(if (> i 50) d 2020.01.01)",
+    };
+    for (size_t v = 0; v < sizeof vals / sizeof vals[0]; v++) {
+        char src[1024];
+        snprintf(src, sizeof src,
+                 "(do (set ws (take wt 20000))"
+                 " (set got (at (select {from: ws r: %s}) 'r))"
+                 " (set wI (at ws 'i)) (set wJ (at ws 'j)) (set wX (at ws 'x)) (set wD (at ws 'd))"
+                 " (set want (map (fn [k] (do (let i (at wI k)) (let j (at wJ k)) (let x (at wX k))"
+                 "  (let d (at wD k)) %s)) (til (count ws))))"
+                 /* mixed branches: the interpreter's atoms form a list */
+                 " (if (== (type want) 'LIST) (set want (as (type got) want)) 0)"
+                 " (and (== (type got) (type want)) (all (== got want))))", vals[v], vals[v]);
+        ray_t* ok = ray_eval_str(src);
+        bool good = ok && !RAY_IS_ERR(ok) && ok->type == -RAY_BOOL && ok->b8;
+        if (ok) { if (RAY_IS_ERR(ok)) ray_error_free(ok); else ray_release(ok); }
+        TEST_ASSERT_FMT(good, "if values differ from the interpreter: %s", vals[v]);
+    }
     test_result_t res = { TEST_PASS, NULL };
     for (int q = 0; q < NQ; q++) {
         ray_t* a = ser[0][q];
