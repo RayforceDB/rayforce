@@ -1101,6 +1101,12 @@ extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_join_no_prefilter;
 extern uint64_t ray_join_prefilter_builds;
 extern _Atomic(uint64_t) ray_join_prefilter_skips;
+/* #599: settable dispatch floor of the chained probe (.sys.join.par.min).
+ * The default is one join morsel plus one row: the split rule before #599. */
+#define RAY_JOIN_PAR_MIN_DEFAULT 8193
+int64_t  ray_join_par_min(void);
+void     ray_join_set_par_min(int64_t rows);
+extern _Atomic(uint64_t) ray_join_par_probes; /* count + fill dispatches */
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
