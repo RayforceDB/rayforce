@@ -485,7 +485,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
                 (acc)->first_i = v; (acc)->has_first = true; \
             } \
-            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_LAST) { \
+                (acc)->last_i = v; (acc)->has_first = true; /* a value seen */ \
+            } \
             if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
@@ -523,7 +525,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
                 (acc)->first_i = v; (acc)->has_first = true; \
             } \
-            if ((NEEDS) & RED_NEED_LAST) (acc)->last_i = v; \
+            if ((NEEDS) & RED_NEED_LAST) { \
+                (acc)->last_i = v; (acc)->has_first = true; /* a value seen */ \
+            } \
             if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)
@@ -546,7 +550,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if (((NEEDS) & RED_NEED_FIRST) && !(acc)->has_first) { \
                 (acc)->first_f = v; (acc)->has_first = true; \
             } \
-            if ((NEEDS) & RED_NEED_LAST) (acc)->last_f = v; \
+            if ((NEEDS) & RED_NEED_LAST) { \
+                (acc)->last_f = v; (acc)->has_first = true; /* a value seen */ \
+            } \
             if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
         } \
     } while (0)

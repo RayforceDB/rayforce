@@ -38,8 +38,12 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 
 | Expression | Result |
 |---|---|
-| `timestamp - timestamp` | TIMESPAN |
+| `timestamp - timestamp`, `time - time` | TIMESPAN |
 | `timestamp + span`, `timestamp - span`, `span + timestamp` | TIMESTAMP |
+| `time + span`, `time - span`, `span + time`, `span - time` | TIME, floored to the millisecond; no 24 h wrap, a result past the 32-bit range is null |
+| `time + time` | Type error, as `timestamp + timestamp` |
+| `time div span`, `time / span` | Type error (a span divided by a time reads the time as its millisecond count) |
+| `xbar time span` | TIME: the start of the time's bucket, floored to the millisecond |
 | `span + span`, `span - span`, `neg span`, `abs span` | TIMESPAN |
 | `span + integer`, `integer + span`, `span - integer` | TIMESPAN; integer counts nanoseconds |
 | `span * integer`, `integer * span` | TIMESPAN |
@@ -80,11 +84,13 @@ Nulls propagate through arithmetic. Integer division, remainder, and duration bu
 typed null. F64 results retain the engine's existing
 policy of converting non-finite results to `0Nf`.
 
-`xbar` accepts a TIMESPAN bucket width for timestamps:
+`xbar` accepts a TIMESPAN bucket width for timestamps and times:
 
 ```lisp
 (xbar 2024.01.15D12:34:56.000000000 0D01:00:00)
 ; 2024.01.15D12:00:00.000000000
+(xbar 10:37:00.000 0D00:15:00)
+; 10:30:00.000
 ```
 
 Scalar, vector and query column expressions use the same duration arithmetic.
@@ -92,11 +98,14 @@ Ordinary, encoded and partitioned storage preserve duration types and nulls.
 Explicit CSV schemas accept TIMESPAN and CSV writes use its literal syntax.
 Parquet duration and clock-time annotations are not remapped by this change.
 
-## Migrating timestamp differences
+## Migrating timestamp and time differences
 
-Timestamp subtraction previously returned I64. It now returns TIMESPAN,
-including in queries and updates. To retain the previous integer-count
-behavior, explicitly cast the difference before further arithmetic:
+Timestamp subtraction previously returned I64, and time subtraction a TIME.
+Both now return TIMESPAN, including in queries, updates and `deltas`, and
+`time ± span` returns a TIME (it returned a TIMESPAN). `time + time` is a
+type error. To retain the previous integer-count behavior, explicitly cast
+the difference before further arithmetic (`(as 'TIME (div (as 'I64 (- t1
+t0)) 1000000))` gives back the old TIME difference):
 
 ```lisp
 (as 'I64 (- finish start))

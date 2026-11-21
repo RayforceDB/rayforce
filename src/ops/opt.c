@@ -467,6 +467,12 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
     if (!le || !re || !le->literal || !re->literal) return false;
     if (!ray_is_atom(le->literal) || !ray_is_atom(re->literal)) return false;
 
+    /* A TIME counts milliseconds, a TIMESPAN nanoseconds: the arms below
+     * would mix the raw counts.  The kernel (ray_timespan_binary) scales. */
+    if ((lhs->out_type == RAY_TIME && rhs->out_type == RAY_TIMESPAN) ||
+        (lhs->out_type == RAY_TIMESPAN && rhs->out_type == RAY_TIME))
+        return false;
+
     /* Symbol ids cannot be constant-folded as ordered integers (#738). */
     if ((node->opcode == OP_LT || node->opcode == OP_LE ||
          node->opcode == OP_GT || node->opcode == OP_GE) &&
