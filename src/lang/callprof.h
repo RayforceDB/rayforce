@@ -6,8 +6,8 @@
  *
  *   While on, every builtin call compiled code makes (keyed by the lambda's
  *   bytecode and the call's offset) and every call top-level code makes
- *   (keyed by the parsed expression) is timed and aggregated into one row
- *   per site: calls, self and total wall time, and the pool workers' busy
+ *   (keyed by its source position, so a repeated request aggregates) is
+ *   timed and aggregated into one row per site: calls, self and total wall time, and the pool workers' busy
  *   time spent under the call.  (.sys.profile) reads the rows as a table.
  *
  *   Off, a call site pays one predicted-not-taken test of g_ray_callprof.
@@ -44,8 +44,9 @@ static inline bool ray_callprof_on(void) {
 int32_t ray_callprof_enter_vm(ray_t* fn, int32_t ip);
 
 /* The same for a call the tree walker makes at top level: `node` is the
- * call's parsed list, its span read from the running eval's source info.
- * Nodes without a span (built by C rather than parsed) are not timed. */
+ * call's parsed list, its site the span the running eval's source info
+ * records for it.  Nodes without a span (built by C rather than parsed)
+ * are not timed. */
 int32_t ray_callprof_enter_node(ray_t* node);
 
 /* Close a frame opened above.  Always called, flag on or off, so a call

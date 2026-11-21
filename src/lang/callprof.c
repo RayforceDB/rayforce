@@ -4,11 +4,24 @@
  *
  *   Call profiler (see callprof.h).
  *
- *   State is the main thread's alone: sites, the lookup table and the frame
- *   stack are allocated on first enable and written only by the main VM.
- *   A site holds a reference to its key (a lambda's bytecode, or the parsed
- *   call), so the key's address cannot be reused by another site's while the
- *   row lives; reset drops the references.
+ *   State is the main thread's alone: sites, the lookup tables and the
+ *   frame stack are allocated on first enable and written only by the main
+ *   VM.
+ *
+ *   A site is a source position: the file, the call's line and column and,
+ *   inside a lambda, the lambda's own position and the call's offset.  Every
+ *   IPC request and REPL line is a fresh parse (and a fresh compile of any
+ *   lambda it writes), so keying sites by node or bytecode would add sites,
+ *   and pin a parse tree, per request; by position, repeats aggregate.
+ *
+ *   Two caches put a call on its site without reading the source info:
+ *   compiled calls by (bytecode, offset), each slot holding a reference so
+ *   the address is not reused under it; top-level calls by node, valid for
+ *   the running source alone (its nodes live as long as it does).  A site
+ *   holds a reference to the last bytecode seen at it, to name it.  Slots
+ *   for bytecode other than their site's are bounded: past CP_DUPS_MAX the
+ *   compiled cache is dropped and refills, so requests that compile lambdas
+ *   pin at most that many beside the sites'.
  */
 
 #include "lang/callprof.h"
@@ -28,14 +41,16 @@
 
 _Atomic(bool) g_ray_callprof = false;
 
-/* Lookup slots: a power of two, four per site, so the table stays sparse
- * with the negative entries (top-level nodes without a span) beside the
- * sites. */
-#define CP_SLOTS (RAY_CALLPROF_SITES_MAX * 4)
-#define CP_OTHER RAY_CALLPROF_SITES_MAX       /* the overflow row's index */
+/* Lookup slots: powers of two, at most about a third (compiled cache) or
+ * half (positions) full, so a probe always ends at a free slot. */
+#define CP_SLOTS    (RAY_CALLPROF_SITES_MAX * 4)
+#define CP_PSLOTS   (RAY_CALLPROF_SITES_MAX * 2)
+#define CP_NSLOTS   4096                        /* node cache, direct-mapped */
+#define CP_DUPS_MAX 64
+#define CP_OTHER    RAY_CALLPROF_SITES_MAX      /* the overflow row's index */
 
 typedef struct {
-    ray_t*   key;       /* retained: bytecode (VM site) or call node (top) */
+    ray_t*   key;       /* retained: last bytecode seen (VM site); NULL: top */
     int32_t  ip;        /* call offset; -1 for a top-level site */
     int32_t  line;      /* 1-based source line, 0 unknown */
     int32_t  def_line;  /* VM site: the lambda's first line, for its label */
@@ -47,11 +62,27 @@ typedef struct {
     int64_t  busy_ns;   /* worker busy time, exclusive of nested sites */
 } cp_site_t;
 
-typedef struct {
-    const ray_t* key;   /* NULL: empty */
-    int32_t      ip;
-    int32_t      idx;   /* site index, or -1: a node with no span */
+typedef struct {        /* compiled cache: (bytecode, offset) -> site */
+    ray_t*   key;       /* retained; NULL: empty */
+    int32_t  ip;
+    int32_t  idx;
 } cp_slot_t;
+
+typedef struct {        /* site by position */
+    int64_t  file;      /* symbol; or the bytecode's address when it has no
+                           debug info (def is then CP_NODBG) */
+    uint32_t pos;       /* call: start line << 16 | start column */
+    uint32_t def;       /* lambda's position, 0 at top level */
+    int32_t  ip;
+    int32_t  idx;       /* site index + 1; 0: empty */
+} cp_pslot_t;
+#define CP_NODBG UINT32_MAX
+
+typedef struct {        /* top-level node -> site, under source `ngen` */
+    const ray_t* node;
+    uint32_t     gen;
+    int32_t      idx;   /* site index, or -1: a node with no span */
+} cp_nslot_t;
 
 typedef struct {
     int32_t  site;
@@ -65,11 +96,16 @@ typedef struct {
 typedef struct {
     cp_site_t  sites[RAY_CALLPROF_SITES_MAX + 1];
     cp_slot_t  slots[CP_SLOTS];
+    cp_pslot_t pslots[CP_PSLOTS];
+    cp_nslot_t nodes[CP_NSLOTS];
     cp_frame_t stack[RAY_CALLPROF_DEPTH_MAX];
     int32_t    n_sites;
-    int32_t    n_slots;     /* occupied lookup slots */
+    int32_t    n_dups;      /* compiled slots not on their site's bytecode */
     int32_t    sp;
     uint32_t   gen;         /* bumped by reset: frames of before skip */
+    uint32_t   ngen;        /* node cache generation: bumped per source */
+    ray_t*     nfo;         /* retained: the source the node cache is for */
+    int64_t    nfo_file;    /* its file name symbol */
 } cp_state_t;
 
 static cp_state_t* g_cp;
@@ -97,6 +133,13 @@ static cp_slot_t* cp_find(const ray_t* key, int32_t ip) {
     }
 }
 
+static void cp_drop_slots(void) {
+    for (int32_t i = 0; i < CP_SLOTS; i++)
+        if (g_cp->slots[i].key) ray_release(g_cp->slots[i].key);
+    memset(g_cp->slots, 0, sizeof g_cp->slots);
+    g_cp->n_dups = 0;
+}
+
 static int64_t cp_file_sym(ray_t* nfo) {
     ray_t* f = nfo ? NFO_FILENAME(nfo) : NULL;
     if (!f || RAY_IS_ERR(f) || f->type != -RAY_STR) return ray_sym_intern("", 0);
@@ -107,23 +150,46 @@ static int32_t cp_line(ray_span_t span) {
     return span.id ? (int32_t)span.start_line + 1 : 0;
 }
 
-/* A new site for `key`, or the overflow row once the sites are spent. */
-static int32_t cp_add(cp_slot_t* slot, ray_t* key, int32_t ip) {
-    if (g_cp->n_sites >= RAY_CALLPROF_SITES_MAX) return CP_OTHER;
-    /* The lookup keeps a free slot for every probe: sites take at most a
-     * quarter of it and the negative entries half (enter_node). */
-    if (g_cp->n_slots >= CP_SLOTS - CP_SLOTS / 4) return CP_OTHER;
-    int32_t idx = g_cp->n_sites++;
-    cp_site_t* s = &g_cp->sites[idx];
-    memset(s, 0, sizeof *s);
-    ray_retain(key);
-    s->key = key;
-    s->ip = ip;
-    slot->key = key;
-    slot->ip = ip;
-    slot->idx = idx;
-    g_cp->n_slots++;
-    return idx;
+static uint32_t cp_pos(ray_span_t span) {
+    return (uint32_t)span.start_line << 16 | span.start_col;
+}
+
+/* The site at a position, made on first sight; the overflow row once the
+ * sites are spent.  *made says which. */
+static int32_t cp_site_at(int64_t file, uint32_t pos, uint32_t def, int32_t ip, bool* made) {
+    uint64_t h = (uint64_t)file * 0x9E3779B97F4A7C15ull
+               ^ ((uint64_t)pos << 32 | def) * 0xBF58476D1CE4E5B9ull
+               ^ (uint64_t)(uint32_t)ip * 0x94D049BB133111EBull;
+    h ^= h >> 31;
+    *made = false;
+    for (uint32_t i = (uint32_t)h & (CP_PSLOTS - 1);; i = (i + 1) & (CP_PSLOTS - 1)) {
+        cp_pslot_t* t = &g_cp->pslots[i];
+        if (t->idx) {
+            if (t->file == file && t->pos == pos && t->def == def && t->ip == ip) return t->idx - 1;
+            continue;
+        }
+        if (g_cp->n_sites >= RAY_CALLPROF_SITES_MAX) return CP_OTHER;
+        int32_t idx = g_cp->n_sites++;
+        cp_site_t* s = &g_cp->sites[idx];
+        memset(s, 0, sizeof *s);
+        s->ip = ip;
+        s->file = file;
+        *t = (cp_pslot_t){ file, pos, def, ip, idx + 1 };
+        *made = true;
+        return idx;
+    }
+}
+
+/* Point the node cache at `nfo`: nodes of the source before may be gone. */
+static void cp_switch_nfo(ray_t* nfo) {
+    if (nfo) ray_retain(nfo);
+    if (g_cp->nfo) ray_release(g_cp->nfo);
+    g_cp->nfo = nfo;
+    g_cp->nfo_file = cp_file_sym(nfo);
+    if (++g_cp->ngen == 0) {
+        memset(g_cp->nodes, 0, sizeof g_cp->nodes);
+        g_cp->ngen = 1;
+    }
 }
 
 static int32_t cp_push(int32_t site) {
@@ -140,49 +206,71 @@ static int32_t cp_push(int32_t site) {
     return d;
 }
 
+/* Cache miss: the site of (fn's bytecode, ip) by position.  *dup: the
+ * site held other code, whose slots it now does not keep alive. */
+static int32_t cp_vm_site(ray_t* fn, ray_t* bc, int32_t ip, bool* dup) {
+    ray_t* dbg = LAMBDA_DBG(fn);
+    ray_span_t call = ray_bc_dbg_get(dbg, ip);
+    ray_span_t def = ray_bc_dbg_get(dbg, 0);
+    bool made;
+    int32_t site = call.id && def.id
+        ? cp_site_at(cp_file_sym(LAMBDA_NFO(fn)), cp_pos(call), cp_pos(def), ip, &made)
+        : cp_site_at((int64_t)(uintptr_t)bc, 0, CP_NODBG, ip, &made);
+    *dup = site == CP_OTHER;
+    if (site == CP_OTHER) return site;
+    cp_site_t* s = &g_cp->sites[site];
+    if (made) {
+        if (!call.id || !def.id) s->file = cp_file_sym(LAMBDA_NFO(fn));
+        s->line = cp_line(call);
+        s->def_line = cp_line(def);
+    }
+    if (s->key != bc) {       /* name the site by the newest code at it */
+        *dup = s->key != NULL;
+        ray_retain(bc);
+        if (s->key) ray_release(s->key);
+        s->key = bc;
+    }
+    return site;
+}
+
 int32_t ray_callprof_enter_vm(ray_t* fn, int32_t ip) {
     /* The owner test first: g_cp is the main thread's to read. */
     if (!ray_callprof_owner() || !g_cp || !fn || fn->type != RAY_LAMBDA) return -1;
     ray_t* bc = LAMBDA_BC(fn);
     if (!bc) return -1;
     cp_slot_t* slot = cp_find(bc, ip);
-    int32_t site = slot->key ? slot->idx : -1;
-    if (!slot->key) {
-        site = cp_add(slot, bc, ip);
-        if (site != CP_OTHER) {
-            cp_site_t* s = &g_cp->sites[site];
-            ray_t* dbg = LAMBDA_DBG(fn);
-            s->file = cp_file_sym(LAMBDA_NFO(fn));
-            s->line = cp_line(ray_bc_dbg_get(dbg, ip));
-            s->def_line = cp_line(ray_bc_dbg_get(dbg, 0));
-        }
+    if (slot->key) return cp_push(slot->idx);
+    bool dup;
+    int32_t site = cp_vm_site(fn, bc, ip, &dup);
+    /* Slots for code no site holds (the code before at a repeated position,
+     * calls in the overflow row) are bounded. */
+    if (dup && g_cp->n_dups >= CP_DUPS_MAX) {
+        cp_drop_slots();
+        slot = cp_find(bc, ip);
     }
+    ray_retain(bc);
+    *slot = (cp_slot_t){ bc, ip, site };
+    g_cp->n_dups += dup;
     return cp_push(site);
 }
 
 int32_t ray_callprof_enter_node(ray_t* node) {
     if (!ray_callprof_owner() || !g_cp || __VM->lambda_depth != 0) return -1;
-    cp_slot_t* slot = cp_find(node, -1);
-    if (slot->key) return slot->idx < 0 ? -1 : cp_push(slot->idx);
-    ray_span_t span = ray_nfo_get(__VM->nfo, node);
-    if (!span.id) {
-        /* Built by C, not parsed: remembered as such while there is room
-         * (the reference is not taken, so a reused address at worst goes
-         * untimed until the next reset). */
-        if (g_cp->n_slots < CP_SLOTS / 2) {
-            slot->key = node;
-            slot->ip = -1;
-            slot->idx = -1;
-            g_cp->n_slots++;
+    ray_t* nfo = __VM->nfo;
+    if (nfo != g_cp->nfo) cp_switch_nfo(nfo);
+    cp_nslot_t* c = &g_cp->nodes[cp_hash(node, -1) & (CP_NSLOTS - 1)];
+    if (c->node != node || c->gen != g_cp->ngen) {
+        /* Nodes without a span (built by C, not parsed) are not timed. */
+        ray_span_t span = ray_nfo_get(nfo, node);
+        int32_t site = -1;
+        if (span.id) {
+            bool made;
+            site = cp_site_at(g_cp->nfo_file, cp_pos(span), 0, -1, &made);
+            if (made) g_cp->sites[site].line = cp_line(span);
         }
-        return -1;
+        *c = (cp_nslot_t){ node, g_cp->ngen, site };
     }
-    int32_t site = cp_add(slot, node, -1);
-    if (site != CP_OTHER) {
-        g_cp->sites[site].file = cp_file_sym(__VM->nfo);
-        g_cp->sites[site].line = cp_line(span);
-    }
-    return cp_push(site);
+    return c->idx < 0 ? -1 : cp_push(c->idx);
 }
 
 void ray_callprof_exit(int32_t frame) {
@@ -210,10 +298,17 @@ static void cp_release_sites(void) {
     for (int32_t i = 0; i < g_cp->n_sites; i++)
         if (g_cp->sites[i].key) ray_release(g_cp->sites[i].key);
     g_cp->n_sites = 0;
-    g_cp->n_slots = 0;
-    memset(g_cp->slots, 0, sizeof g_cp->slots);
+    cp_drop_slots();
+    memset(g_cp->pslots, 0, sizeof g_cp->pslots);
+    cp_switch_nfo(NULL);    /* the cached nodes name dropped sites */
     memset(&g_cp->sites[CP_OTHER], 0, sizeof g_cp->sites[CP_OTHER]);
     g_cp->gen++;
+}
+
+static int32_t cp_row_count(void) {
+    int32_t n = 0;
+    for (int32_t i = 0; g_cp && i < g_cp->n_sites; i++) n += g_cp->sites[i].calls > 0;
+    return n;
 }
 
 int32_t ray_callprof_depth(void) {
@@ -316,7 +411,9 @@ static int cp_row_cmp(const void* a, const void* b) {
 }
 
 ray_t* ray_callprof_table(void) {
-    int32_t n = g_cp ? g_cp->n_sites : 0;
+    /* Sites whose every call is still open (the one reading the table,
+     * say) have not run yet: no row. */
+    int32_t n = cp_row_count();
     bool other = g_cp && g_cp->sites[CP_OTHER].calls > 0;
     int64_t nrows = n + (other ? 1 : 0);
 
@@ -353,7 +450,7 @@ ray_t* ray_callprof_table(void) {
         return ray_error("oom", ".sys.profile: column alloc");
     }
 
-    for (int32_t i = 0; i < n; i++) order[i] = i;
+    for (int32_t i = 0, r = 0; r < n; i++) if (g_cp->sites[i].calls > 0) order[r++] = i;
     if (n > 1) { g_cp_sort = g_cp; qsort(order, (size_t)n, sizeof *order, cp_row_cmp); }
     if (other) order[n] = CP_OTHER;
 

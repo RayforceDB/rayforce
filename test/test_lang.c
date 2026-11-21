@@ -13079,8 +13079,103 @@ static test_result_t test_callprof_error_unwinds(void) {
     PASS();
 }
 
+/* Every text request is a fresh parse.  Top-level sites are source
+ * positions, so repeats aggregate into the rows they had, the cap stays
+ * free for the sites that follow, and no request's parse tree outlives it. */
+static test_result_t test_callprof_repeated_requests(void) {
+    static const char* const setup[] = {
+        "(set rq-work (fn [x] (+ x 1)))",
+        "(set rq-later (fn [x] (* x 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    int64_t n = RAY_CALLPROF_SITES_MAX + 200;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* r = ray_eval_str("(rq-work 10)");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    /* A large literal per request: kept by nothing once it has run. */
+    char big[8192];
+    int len = snprintf(big, sizeof big, "(count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(big + len, sizeof big - (size_t)len, "%d ", i);
+    snprintf(big + len, sizeof big - (size_t)len, "])");
+    ray_t* r = ray_eval_str(big);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_mem_stats_t ms;
+    ray_mem_stats(&ms);
+    size_t mem0 = ms.bytes_allocated;
+    for (int i = 0; i < 300; i++) {
+        r = ray_eval_str(big);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 1000);
+        ray_release(r);
+    }
+    ray_mem_stats(&ms);
+    TEST_ASSERT_TRUE(ms.bytes_allocated < mem0 + 64 * 1024);
+    /* A lambda written in the request is compiled anew each time: its
+     * calls are one site all the same, and the profile pins none of its
+     * code.  (Requests that make lambdas retain some memory profiled or
+     * not: the bound is on what profiling adds.) */
+    char lam[8192];
+    len = snprintf(lam, sizeof lam, "((fn [] (count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(lam + len, sizeof lam - (size_t)len, "%d ", i);
+    snprintf(lam + len, sizeof lam - (size_t)len, "])))");
+    int64_t grow[2];
+    for (int on = 0; on < 2; on++) {
+        ray_callprof_set_enabled(on);
+        ray_mem_stats(&ms);
+        mem0 = ms.bytes_allocated;
+        for (int i = 0; i < 1000; i++) {
+            r = ray_eval_str(lam);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->i64, 1000);
+            ray_release(r);
+        }
+        ray_mem_stats(&ms);
+        grow[on] = (int64_t)ms.bytes_allocated - (int64_t)mem0;
+    }
+    TEST_ASSERT_TRUE(grow[1] < grow[0] + 512 * 1024);
+    r = ray_eval_str("(rq-later 5)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+
+    /* The request's outermost call is line 1 column 1 of `repl` for every
+     * request: one row, every call counted (the lambda requests add one
+     * more `<top>` row, for the `fn` form at column 2).  rq-work's `+`,
+     * rq-later's `*` and the request lambda's `count` keep rows of their
+     * own; nothing folds into `<other>`. */
+    static const struct { const char* src; int64_t want; } rows[] = {
+        { "(count (.sys.profile))", 5 },
+        { "(sum (at (select {from: (.sys.profile) where: (== fn '<lambda@1>)}) 'calls))", 1000 },
+        { "(sum (at (select {from: (.sys.profile) where: (== fn '<top>)}) 'calls))", 0 },
+        { "(sum (at (select {from: (.sys.profile) where: (== fn 'rq-work)}) 'calls))", 0 },
+        { "(sum (at (select {from: (.sys.profile) where: (== fn 'rq-later)}) 'calls))", 1 },
+        { "(count (select {from: (.sys.profile) where: (== fn '<other>)}))", 0 },
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) {
+        r = ray_eval_str(rows[i].src);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        int64_t want = rows[i].want;
+        if (i == 2) want = n + 301 + 2 * 1000 + 1;
+        if (i == 3) want = n;
+        TEST_ASSERT_EQ_I(r->i64, want);
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },

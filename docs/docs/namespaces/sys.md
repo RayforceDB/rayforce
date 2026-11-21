@@ -226,6 +226,15 @@ A call site is a builtin call inside a compiled function (a `select`, a
 compiled function to another are not rows of their own: the callee's calls
 are its rows.
 
+A site is a place in the source: its file, line and column (and, inside a
+function, the function's own place). Running the same text again adds to
+the rows it had, so a client sending the same request a thousand times,
+or a lambda written inside a request, keeps one set of rows. Every IPC
+request and REPL line starts at line 1 of `repl`, so their top-level calls
+share the `<top>` rows there. Each distinct site counts toward the
+4096-site cap; calls at sites past it land in the `<other>` row until
+`(.sys.profile.reset)`.
+
 | Column | Meaning |
 |---|---|
 | `file` | Source file of the call (`repl` for typed or IPC text). |
