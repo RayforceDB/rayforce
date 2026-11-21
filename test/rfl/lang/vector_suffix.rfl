@@ -1,0 +1,180 @@
+;; A final h, i or e suffix types a whole vector literal (#912).  repr pins
+;; both the vector type and every element: the compact printer drops h and i.
+
+;; ---- per-element suffixes and the F64 promotion stay as they were ---------
+(type [1h 2h 3h]) -- 'I16
+(repr [1h 2h 3h]) -- "[1h 2h 3h]"
+(type [1 2 3.0]) -- 'F64
+(repr [1 2 3.0]) -- "[1.0 2.0 3.0]"
+(type [1.5 2 3]) -- 'F64
+(type [1 0Nl 2.5]) -- 'F64
+
+;; ---- a final suffix types every element -----------------------------------
+(type [1 2 3h]) -- 'I16
+(repr [1 2 3h]) -- "[1h 2h 3h]"
+(type [1 2 3i]) -- 'I32
+(repr [1 2 3i]) -- "[1i 2i 3i]"
+(type [1 2 3e]) -- 'F32
+(repr [1 2 3e]) -- "[1e 2e 3e]"
+(repr [-1 0 1h]) -- "[-1h 0h 1h]"
+(repr [7h]) -- "[7h]"
+
+;; the final element may be a typed null
+(type [1 0Nh]) -- 'I16
+(repr [1 0Nh]) -- "[1h 0Nh]"
+(repr [1 0Ni]) -- "[1i 0Ni]"
+(repr [1.5 0Ne]) -- "[1.5e 0Ne]"
+(nil? [1 0Nh]) -- [false true]
+
+;; earlier elements may carry the same suffix, or be a null of that type
+(repr [1h 2 3h]) -- "[1h 2h 3h]"
+(repr [1 0Nh 3h]) -- "[1h 0Nh 3h]"
+(repr [0Ni 2 3i]) -- "[0Ni 2i 3i]"
+
+;; bare 0N is unsuffixed: it becomes the suffix type's null
+(repr [1 0N 3h]) -- "[1h 0Nh 3h]"
+(repr [0N 2i]) -- "[0Ni 2i]"
+(repr [0N 2e]) -- "[0Ne 2e]"
+(nil? [1 0N 3i]) -- [false true false]
+
+;; range edges under h and i
+(repr [-32767 32767h]) -- "[-32767h 32767h]"
+(repr [-2147483647 2147483647i]) -- "[-2147483647i 2147483647i]"
+
+;; under e, integers and floats narrow as the F32 cast does
+(repr [1.5 2 3e]) -- "[1.5e 2e 3e]"
+(repr [0.1 1e]) -- (repr [0.1e 1e])
+(== [0.1 1e] (as 'F32 [0.1 1.0])) -- [true true]
+(== [16777217 1e] (as 'F32 [16777217 1])) -- [true true]
+(== [1e39 1e] (as 'F32 [1e39 1.0])) -- [true true]
+(== [1e3 2e] [1000e 2e]) -- [true true]
+
+;; nested vectors and lists are typed on their own
+(type (at (list [1 2h] [1 2]) 0)) -- 'I16
+(type (at (list [1 2h] [1 2]) 1)) -- 'I64
+(type (at (list [1 2h] [1 2i]) 1)) -- 'I32
+
+;; ---- errors ---------------------------------------------------------------
+;; em / rm: the message of a parse / read-value error
+(set em (fn [s] (at (try (parse s) (fn [e] e)) 'msg)))
+(set rm (fn [s] (at (try (read-value s) (fn [e] e)) 'msg)))
+;; a conflicting suffix
+[1h 2i] !- domain
+(em "[1h 2i]") -- "parse: vector element 0 (I16) conflicts with suffix 'i'"
+(em "[1i 2 3h]") -- "parse: vector element 0 (I32) conflicts with suffix 'h'"
+(em "[1 2e 3h]") -- "parse: vector element 1 (F32) conflicts with suffix 'h'"
+(em "[1 2h 3e]") -- "parse: vector element 1 (I16) conflicts with suffix 'e'"
+;; a typed null of another type, 0Nl and 0Nf included
+(em "[1 0Nl 3h]") -- "parse: vector element 1 (0Nl) conflicts with suffix 'h'"
+(em "[0Nl 2e]") -- "parse: vector element 0 (0Nl) conflicts with suffix 'e'"
+(em "[1 0Nf 2e]") -- "parse: vector element 1 (0Nf) conflicts with suffix 'e'"
+(em "[1 0Nf 2i]") -- "parse: vector element 1 (0Nf) conflicts with suffix 'i'"
+(em "[1 0Ni 2h]") -- "parse: vector element 1 (0Ni) conflicts with suffix 'h'"
+;; a non-numeric element
+(em "[a 1h]") -- "parse: vector element 0 (SYM) conflicts with suffix 'h'"
+(em "[\"a\" 1h]") -- "parse: vector element 0 (STR) conflicts with suffix 'h'"
+(em "[2024.01.01 1i]") -- "parse: vector element 0 (DATE) conflicts with suffix 'i'"
+;; overflow
+[40000 1h] !- domain
+(em "[40000 1h]") -- "parse: vector element 0 out of range for suffix 'h' [-32767,32767], got 40000"
+(em "[-32768 1h]") -- "parse: vector element 0 out of range for suffix 'h' [-32767,32767], got -32768"
+(em "[2147483648 1i]") -- "parse: vector element 0 out of range for suffix 'i' [-2147483647,2147483647], got 2147483648"
+(em "[99999999999999999999 1h]") -- "parse: vector element 0 out of range for suffix 'h'"
+;; a float literal under h or i, integral or not
+(em "[1.5 2h]") -- "parse: vector element 0 is a float literal; suffix 'h' needs integers"
+(em "[2.0 2h]") -- "parse: vector element 0 is a float literal; suffix 'h' needs integers"
+(em "[1e3 2i]") -- "parse: vector element 0 is a float literal; suffix 'i' needs integers"
+;; a suffix is final: an unsuffixed element after it is not typed by it
+(em "[1 2h 3]") -- "parse: vector literal mixes incompatible element types"
+(em "[1h 2]") -- "parse: vector literal mixes incompatible element types"
+;; an out-of-range suffixed element is still the scalar error
+(em "[1 40000h]") -- "parse: i16 literal out of range [-32767,32767], got 40000"
+
+;; ---- read-value takes the same grammar -------------------------------------
+(type (read-value "[1 2 3h]")) -- 'I16
+(repr (read-value "[1 2 3h]")) -- "[1h 2h 3h]"
+(repr (read-value "[1 2 3i]")) -- "[1i 2i 3i]"
+(repr (read-value "[1 2 3e]")) -- "[1e 2e 3e]"
+(repr (read-value "[1 0Nh]")) -- "[1h 0Nh]"
+(repr (read-value "[1h 2 3h]")) -- "[1h 2h 3h]"
+(repr (read-value "[1 0N 3i]")) -- "[1i 0Ni 3i]"
+(repr (read-value "[0Ni 2 3i]")) -- "[0Ni 2i 3i]"
+(repr (read-value "[1.5 2 3e]")) -- "[1.5e 2e 3e]"
+(nil? (read-value "[1 0N 3h]")) -- [false true false]
+(repr (read-value "[-32767 32767h]")) -- "[-32767h 32767h]"
+(== (read-value "[16777217 0.1 1e]") (as 'F32 [16777217 0.1 1])) -- [true true true]
+;; and the F64 promotion
+(type (read-value "[1 2.5]")) -- 'F64
+(repr (read-value "[1 2.5]")) -- "[1.0 2.5]"
+(repr (read-value "[1.5 2 0N]")) -- "[1.5 2.0 0Nf]"
+(repr (read-value "[1 0Nl 2.5]")) -- "[1.0 0Nf 2.5]"
+;; each read-value result equals the parsed literal
+(== (read-value "[1 2 3h]") [1 2 3h]) -- [true true true]
+(== (read-value "[1 2.5]") [1 2.5]) -- [true true]
+;; errors
+(read-value "[1h 2i]") !- parse
+(rm "[1h 2i]") -- "read-value: vector element 0 (I16) conflicts with suffix 'i' at byte 1"
+(rm "[1i 2 3h]") -- "read-value: vector element 0 (I32) conflicts with suffix 'h' at byte 1"
+(rm "[1 0Nl 3h]") -- "read-value: vector element 1 (0Nl) conflicts with suffix 'h' at byte 3"
+(rm "[1 0Nf 2e]") -- "read-value: vector element 1 (0Nf) conflicts with suffix 'e' at byte 3"
+(read-value "[40000 1h]") !- domain
+(rm "[40000 1h]") -- "read-value: vector element 0 out of range for suffix 'h' at byte 1"
+(rm "[2147483648 1i]") -- "read-value: vector element 0 out of range for suffix 'i' at byte 1"
+(rm "[1.5 2h]") -- "read-value: vector element 0 is a float literal; suffix 'h' needs integers at byte 1"
+(rm "[1e3 2i]") -- "read-value: vector element 0 is a float literal; suffix 'i' needs integers at byte 1"
+(rm "[1e39 1e]") -- "read-value: vector element 0 out of range for suffix 'e' at byte 1"
+(rm "[1 2h 3]") -- "read-value: vector elements must all have one type at byte 3"
+(rm "[1 \"a\" 2h]") -- "read-value: vector elements must all have one type at byte 6"
+(rm "[1 2h true]") -- "read-value: vector elements must all have one type at byte 10"
+(rm "[1 2h 'a]") -- "read-value: vector elements must all have one type at byte 8"
+
+;; ---- repr keeps per-element suffixes, so saved text round-trips ------------
+(repr [1 2 3h]) -- "[1h 2h 3h]"
+(type (eval (parse (repr [1 2 3h])))) -- 'I16
+(type (eval (parse (repr [1 0N 3i])))) -- 'I32
+(type (eval (parse (repr [1 2.5 3e])))) -- 'F32
+(repr (eval (parse (repr [1 0N 3h])))) -- "[1h 0Nh 3h]"
+(type (read-value (repr [1 2 3h]))) -- 'I16
+(type (read-value (repr [1 0N 3i]))) -- 'I32
+(repr (read-value (repr [1 2.5 3e]))) -- "[1e 2.5e 3e]"
+
+;; ---- 0Nl is blamed where it is, beside bare 0N ------------------------------
+[0N 0Nl 2h] !- domain
+(em "[0N 0Nl 2h]") -- "parse: vector element 1 (0Nl) conflicts with suffix 'h'"
+(em "[0Nl 0N 2h]") -- "parse: vector element 0 (0Nl) conflicts with suffix 'h'"
+(rm "[0N 0Nl 2h]") -- "read-value: vector element 1 (0Nl) conflicts with suffix 'h' at byte 4"
+(rm "[1h 0N 0Nl 2h]") -- "read-value: vector element 2 (0Nl) conflicts with suffix 'h' at byte 7"
+;; a 0Nl in one literal does not reach a sibling or a later one
+(repr (list [0Nl 1] [0N 2h])) -- "(list [0Nl 1] [0Nh 2h])"
+(repr [0Nl 1]) -- "[0Nl 1]"
+(repr [0N 2h]) -- "[0Nh 2h]"
+;; the I64 minimum is the I64 null bit pattern, not 0N: out of range
+[-9223372036854775808 1h] !- domain
+(em "[-9223372036854775808 1h]") -- "parse: vector element 0 out of range for suffix 'h'"
+(em "[-9223372036854775808 1e]") -- "parse: vector element 0 out of range for suffix 'e'"
+(em "[0N -9223372036854775808 2i]") -- "parse: vector element 1 out of range for suffix 'i'"
+(read-value "[-9223372036854775808 1h]") !- parse
+(rm "[-9223372036854775808 1h]") -- "read-value: literal out of range for its type at byte 1"
+;; without a suffix it stays the existing I64 null
+(repr [-9223372036854775808 1]) -- "[0Nl 1]"
+;; nested containers name their type
+(em "[(list 1) 1h]") -- "parse: vector element 0 (LIST) conflicts with suffix 'h'"
+;; read-value names the offending element's byte
+(rm "[1 2 1.5 3h]") -- "read-value: vector element 2 is a float literal; suffix 'h' needs integers at byte 5"
+(rm "[1 2 1e39 3e]") -- "read-value: vector element 2 out of range for suffix 'e' at byte 5"
+;; an F64 that overflowed to null is 0Nf, which conflicts under e
+(em "[1e400 1e]") -- "parse: vector element 0 (0Nf) conflicts with suffix 'e'"
+
+;; ---- more read-value cases ------------------------------------------------
+(repr (read-value "[0N 1.5 2e]")) -- "[0Ne 1.5e 2e]"
+(rm "[1 2.5 3h]") -- "read-value: vector element 1 is a float literal; suffix 'h' needs integers at byte 3"
+;; read-value rejects a lossy element the language accepts
+(repr [99999999999999999999 1e]) -- "[1e+20e 1e]"
+(rm "[99999999999999999999 1e]") -- "read-value: integer literal out of the I64 range at byte 1"
+
+;; ---- long literals: the element buffer grows past 64 ----------------------
+(type [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99h]) -- 'I16
+(sum [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99h]) -- 4950h
+(type (read-value "[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99h]")) -- 'I16
+(sum (read-value "[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99i]")) -- 4950i
+(sum (read-value "[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 0.5]")) -- 4851.5
