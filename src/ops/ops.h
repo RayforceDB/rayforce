@@ -62,6 +62,13 @@ ray_t*    ray_lazy_materialize(ray_t* val);
 ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
 
 bool ray_has_timespan(const ray_t* x);
+/* Two TIMEs or two TIMESTAMPs (atoms or vectors): their difference is a
+ * TIMESPAN, computed by ray_timespan_binary. */
+static inline bool ray_point_diff(const ray_t* a, const ray_t* b) {
+    int8_t x = a->type < 0 ? (int8_t)-a->type : a->type;
+    int8_t y = b->type < 0 ? (int8_t)-b->type : b->type;
+    return x == y && (x == RAY_TIME || x == RAY_TIMESTAMP);
+}
 int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
 ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);

@@ -4264,10 +4264,12 @@ static void ts_deltas_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t 
             out[r] = ray_f64_fin(cur - prev);
         }
     } else {
-        /* the lane of the result: 8 bytes, or 4 for a TIME or DATE difference */
+        /* the lane of the result: 8 bytes, or 4 for a DATE difference; a
+         * TIME difference is milliseconds scaled to a TIMESPAN's nanoseconds */
         void* out = ray_data(c->dst);
         int8_t ot = c->dst->type;
-        int64_t null_v = ot == RAY_TIME || ot == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64;
+        int64_t null_v = ot == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64;
+        int64_t unit = t == RAY_TIME ? INT64_C(1000000) : 1;
         for (int64_t r = start + 1; r < end + 1; r++) {
             if (ts_morsel_checkpoint(c->pool, r - (start + 1))) return;
             if (c->has_nulls && (ray_vec_is_null(src, r) || ray_vec_is_null(src, r - 1))) {
@@ -4276,7 +4278,7 @@ static void ts_deltas_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t 
             }
             int64_t cur = read_col_i64(d, r, t, src->attrs);
             int64_t prev = read_col_i64(d, r - 1, t, src->attrs);
-            write_col_i64(out, r, (int64_t)((uint64_t)cur - (uint64_t)prev), ot, c->dst->attrs);
+            write_col_i64(out, r, (int64_t)((uint64_t)cur - (uint64_t)prev) * unit, ot, c->dst->attrs);
         }
     }
 }
@@ -4302,7 +4304,7 @@ ray_t* deltas_vec_eager(ray_t* x) {
     if (n == 0) return out;
     out->attrs |= RAY_ATTR_HAS_NULLS;
     if (out_type == RAY_F64) ((double*)ray_data(out))[0] = NULL_F64;
-    else write_col_i64(ray_data(out), 0, out_type == RAY_TIME || out_type == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64,
+    else write_col_i64(ray_data(out), 0, out_type == RAY_I32 ? (int64_t)NULL_I32 : NULL_I64,
                        out_type, out->attrs);
     if (n == 1) return out;
 

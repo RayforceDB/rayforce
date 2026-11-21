@@ -1888,7 +1888,7 @@ static test_result_t test_wide_key_routes(void) {
     ray_t* out = ray_eval_str("(select {from:(table [k a b] (list [0 0 1 1] (as 'TIME [1 2 3 4]) (as 'TIME [5 7 10 12]))) by:k s:(sum (- b a))})");
     TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
     TEST_ASSERT_EQ_I(agg_route_stats().routes[AGG_ROUTE_V2_SERIAL_DENSE], 1);
-    TEST_ASSERT_EQ_I(ray_table_get_col_idx(out, 1)->type, RAY_TIME);
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(out, 1)->type, RAY_TIMESPAN);
     ray_release(out);
     PASS();
 }
