@@ -4970,6 +4970,157 @@ static test_result_t test_select_parted_prunes_grouped_if(void) {
     PASS();
 }
 
+/* Partitions that differ row for row, so a wrong partition shows. */
+static const char* const pdb_mix_parts[3] = {
+    "(table [g x a b act qty] (list [7 7 7 7 8 8 8 8] [-1 1 0 2 -1 1 0 2] "
+    "[10 20 0Nl 40 0Nl 2 0Nl 4] [100 200 300 0Nl 5 0Nl 7 8] "
+    "(as 'SYM [\"Accepted\" \"\" \"New\" \"Accepted\" \"Accepted\" \"\" \"New\" \"Accepted\"]) "
+    "[10 0Nl 30 40 0Nl 2 0Nl 4]))",
+    "(table [g x a b act qty] (list [8 7 8 7 7 8 9 7] [2 -3 1 0 5 -1 1 2] "
+    "[3 0Nl 5 6 7 8 0Nl 1] [0Nl 11 12 13 14 15 16 17] "
+    "(as 'SYM [\"New\" \"New\" \"\" \"Rejected\" \"Accepted\" \"Accepted\" \"\" \"New\"]) "
+    "[1 2 0Nl 4 5 6 7 0Nl]))",
+    "(table [g x a b act qty] (list [9 9 7 8 7 8 7 8] [1 1 -1 0 3 2 1 -2] "
+    "[50 60 70 0Nl 90 100 0Nl 120] [1 2 3 4 0Nl 6 7 8] "
+    "(as 'SYM [\"Rejected\" \"\" \"Accepted\" \"New\" \"New\" \"Rejected\" \"Accepted\" \"\"]) "
+    "[0Nl 9 8 7 6 5 4 3]))",
+};
+
+/* The same rows three ways: parted (_pm_p), splayed (_pm_s, the partition
+ * key a column) and in memory (_pm_f). */
+static bool pdb_mix_bind(const char* root, bool compressed) {
+    char path[512], src[2048];
+    snprintf(path, sizeof path, "%s/.sym", root);
+    for (int p = 0; p < 3; p++) {
+        char dir[512];
+        snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+        ray_t* t = ray_eval_str(pdb_mix_parts[p]);
+        if (!t || RAY_IS_ERR(t) || t->type != RAY_TABLE) { drop_out(t); return false; }
+        ray_err_t err = ray_splay_save_mode(t, dir, path, compressed ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+        ray_release(t);
+        if (err != RAY_OK) return false;
+    }
+    ray_t* t = ray_read_parted(root, "t");
+    if (!t || RAY_IS_ERR(t)) { drop_out(t); return false; }
+    ray_env_set(ray_sym_intern("_pm_p", 5), t);
+    ray_release(t);
+    int n = snprintf(src, sizeof src, "(do (.db.splayed.set \"%s_s/t/\" _pm_p) "
+                     "(set _pm_s (.db.splayed.get \"%s_s/t/\")) 0)", root, root);
+    if (n < 0 || (size_t)n >= sizeof src) return false;
+    ray_t* r = ray_eval_str(src);
+    bool ok = r && !RAY_IS_ERR(r);
+    drop_out(r);
+    n = snprintf(src, sizeof src, "(do (set _pm_1 %s) (set _pm_2 %s) (set _pm_3 %s) "
+                 "(set _pm_f (table [date g x a b act qty] (list "
+                 "(concat (take 2024.01.01 8) (concat (take 2024.01.02 8) (take 2024.01.03 8))) "
+                 "(concat (at _pm_1 'g) (concat (at _pm_2 'g) (at _pm_3 'g))) "
+                 "(concat (at _pm_1 'x) (concat (at _pm_2 'x) (at _pm_3 'x))) "
+                 "(concat (at _pm_1 'a) (concat (at _pm_2 'a) (at _pm_3 'a))) "
+                 "(concat (at _pm_1 'b) (concat (at _pm_2 'b) (at _pm_3 'b))) "
+                 "(concat (at _pm_1 'act) (concat (at _pm_2 'act) (at _pm_3 'act))) "
+                 "(concat (at _pm_1 'qty) (concat (at _pm_2 'qty) (at _pm_3 'qty)))))) 0)",
+                 pdb_mix_parts[0], pdb_mix_parts[1], pdb_mix_parts[2]);
+    if (!ok || n < 0 || (size_t)n >= sizeof src) return false;
+    r = ray_eval_str(src);
+    ok = r && !RAY_IS_ERR(r);
+    drop_out(r);
+    return ok;
+}
+
+static void pdb_mix_unbind(void) {
+    static const char* const names[] = { "_pm_p", "_pm_s", "_pm_f", "_pm_r", "_pm_1", "_pm_2", "_pm_3" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        ray_env_set(ray_sym_intern(names[i], strlen(names[i])), NULL);
+}
+
+/* SUM(IF) beside other aggregates, and grouped by a SYM column. Each answer
+ * equals, cell for cell, the unpruned parted answer (in order), and the
+ * splayed and in-memory answers sorted by the key; the part-prune counter
+ * pins which shapes prune. Declined: an unproven companion (a bare
+ * projection, COUNT(DISTINCT)), an output name another output spells, a
+ * composite or partition-key BY. */
+static test_result_t test_select_parted_prunes_grouped_if_mixed(void) {
+    static const struct {
+        const char* pred;
+        const char* by;
+        const char* outputs;
+        uint64_t pruned;           /* partitions dropped; 0: declined */
+        const char* want;          /* optional: (at <sorted> 's) */
+    } cases[] = {
+        { "(== date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) m:(sum qty)", 2, "[32 23 0]" },
+        { "(== date 2024.01.02)", "g",
+          "s:(sum (if (> x 0) a b)) c:(count qty) v:(avg a) lo:(min b) hi:(max qty)", 2, "[32 23 0]" },
+        { "(== date 2024.01.02)", "g", "s:(sum (if (== act 'New) qty 0)) f:(first act) l:(last qty) md:(med a)", 2, "[2 1 0]" },
+        { "(== date 2024.01.02)", "g", "qty:(sum qty) s:(sum (if (!= act 'New) 1 0))", 2, NULL },
+        { "(and (== date 2024.01.02) (!= act 'Rejected))", "g", "s:(sum (if (> x 0) a b)) n:(count b)", 2, NULL },
+        { "(>= date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) m:(sum (+ qty a))", 1, NULL },
+        { "(== date 2024.01.02)", "act", "s:(sum (if (> x 0) a b)) m:(sum qty)", 2, "[5 22 15 13]" },
+        { "(== date 2024.01.02)", "act", "s:(sum (if (> x 0) a b)) t:(sum (if (<= x 0) a b))", 2, NULL },
+        { "(>= date 2024.01.02)", "act", "s:(sum (if (and (> x 0) (!= g 9)) a 0)) f:(first g) c:(count x)", 1, NULL },
+        { "(== date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) q:qty", 0, NULL },
+        { "(== date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) c:(count (distinct act))", 0, NULL },
+        { "(== date 2024.01.02)", "g", "a:(sum qty) s:(sum (if (> x 0) a b))", 0, NULL },
+        { "(== date 2024.01.02)", "[g act]", "s:(sum (if (> x 0) a b)) m:(sum qty)", 0, NULL },
+        { "(== date 2024.01.02)", "date", "s:(sum (if (> x 0) a b)) m:(sum qty)", 0, NULL },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256];
+        snprintf(root, sizeof root, "%s/group_mix%d", ray_test_tmp(CS_TMP), gen);
+        if (!pdb_mix_bind(root, gen != 0)) { pdb_mix_unbind(); FAIL("grouped mix fixture"); }
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            /* sorted by the whole key: a composite one sorts by its columns */
+            char key[32];
+            snprintf(key, sizeof key, cases[i].by[0] == '[' ? "%s" : "'%s", cases[i].by);
+            char q[1024], ref[1536], flat[1536], spl[1536], want[64];
+            int n0 = snprintf(q, sizeof q, "(select {from:_pm_p where:%s by:%s %s})",
+                              cases[i].pred, cases[i].by, cases[i].outputs);
+            int n1 = snprintf(ref, sizeof ref, "(select {from:_pm_p where:(or %s %s) by:%s %s})",
+                              cases[i].pred, cases[i].pred, cases[i].by, cases[i].outputs);
+            int n2 = snprintf(flat, sizeof flat, "(xasc (select {from:_pm_f where:%s by:%s %s}) %s)",
+                              cases[i].pred, cases[i].by, cases[i].outputs, key);
+            int n3 = snprintf(spl, sizeof spl, "(xasc (select {from:_pm_s where:%s by:%s %s}) %s)",
+                              cases[i].pred, cases[i].by, cases[i].outputs, key);
+            int n4 = snprintf(want, sizeof want, "(at (xasc _pm_r %s) 's)", key);
+            if (n0 < 0 || (size_t)n0 >= sizeof q || n1 < 0 || (size_t)n1 >= sizeof ref ||
+                n2 < 0 || (size_t)n2 >= sizeof flat || n3 < 0 || (size_t)n3 >= sizeof spl ||
+                n4 < 0 || (size_t)n4 >= sizeof want) {
+                pdb_mix_unbind(); FAIL("grouped mix query buffer");
+            }
+            uint64_t runs0, parts0, runs1, parts1, runs2, parts2;
+            ray_query_test_part_prune(&runs0, &parts0);
+            ray_t* r = ray_eval_str(q);
+            ray_query_test_part_prune(&runs1, &parts1);
+            ray_t* u = ray_eval_str(ref);
+            ray_query_test_part_prune(&runs2, &parts2);
+            bool counted = runs1 - runs0 == (cases[i].pruned ? 1u : 0u) &&
+                           parts1 - parts0 == cases[i].pruned && runs2 == runs1 && parts2 == parts1;
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) > 0 && sp_same(r, u);
+            if (values) ray_env_set(ray_sym_intern("_pm_r", 5), r);
+            char sorted[96];
+            snprintf(sorted, sizeof sorted, "(xasc _pm_r %s)", key);
+            ray_t* rs = values ? ray_eval_str(sorted) : NULL;
+            ray_t* f = values ? ray_eval_str(flat) : NULL;
+            ray_t* sp = values ? ray_eval_str(spl) : NULL;
+            values = values && t29_same(rs, f) && t29_same(rs, sp);
+            if (values && cases[i].want) {
+                ray_t* got = ray_eval_str(want);
+                ray_t* exp = ray_eval_str(cases[i].want);
+                values = got && exp && !RAY_IS_ERR(got) && !RAY_IS_ERR(exp) && t29_same(got, exp);
+                drop_out(got); drop_out(exp);
+            }
+            drop_out(rs); drop_out(f); drop_out(sp); drop_out(r); drop_out(u);
+            if (!values || !counted) {
+                pdb_mix_unbind();
+                TEST_ASSERT_FMT(values && counted, "grouped mix gen %d case %zu: values=%d counted=%d "
+                                "(runs %llu parts %llu): %s", gen, i, (int)values, (int)counted,
+                                (unsigned long long)(runs1 - runs0), (unsigned long long)(parts1 - parts0), q);
+            }
+        }
+        pdb_mix_unbind();
+    }
+    PASS();
+}
+
 /* Local canonical-looking heads and earlier output aliases must not be
  * mistaken for the native, fresh-name grammar. Keep one admitted control so
  * blanket rejection cannot satisfy the decline assertions. */
@@ -5868,6 +6019,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_ordinary_uncapped", test_select_parted_prunes_ordinary_uncapped, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if", test_select_parted_prunes_grouped_if, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_grouped_if_mixed", test_select_parted_prunes_grouped_if_mixed, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_group_limits", test_select_parted_prunes_group_limits, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_if_symbols", test_select_parted_prunes_if_symbols, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_if_limits", test_select_parted_prunes_if_limits, rt_setup, rt_teardown },
