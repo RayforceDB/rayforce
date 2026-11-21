@@ -180,6 +180,14 @@ Combine multiple conditions:
 ; GOOG   280    400
 ```
 
+The predicate itself must give a boolean mask (or a scalar truth value): a
+numeric column alone, `where: volume`, is a `type` error. Inside `and` and
+`or`, though, an operand is read by its truth value, as outside a query, so
+`where: (and volume (> price 100))` keeps the rows with a non-zero, non-null
+volume. Comparisons take the operand types they take outside a query
+([Comparison](../language/math.md#comparison)): `where: (> date 8000)` over
+a `DATE` column is a `type` error; compare with a date, `(> date 2021.11.26)`.
+
 ### Running functions under `where:`
 
 A running, moving or shift function in a projection (`sums`, `deltas`,

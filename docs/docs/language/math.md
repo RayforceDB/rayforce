@@ -175,6 +175,23 @@ The direct numeric unary functions accept `BOOL`, `U8`, `I16`, `I32`, `I64`, and
 
 All comparison operations are atomic and return boolean values (or boolean vectors).
 
+The operand types must be comparable; any other pair is a `type` error:
+
+- numbers (`BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`) with each other
+  and with `TIMESPAN`;
+- `DATE`, `TIME` and `TIMESTAMP` with each other, on one nanosecond scale;
+  `TIME` and `TIMESTAMP` also with `TIMESPAN`;
+- `GUID`, `SYM` and `STR` each with its own type.
+
+A temporal value is not a number: `(> 2024.01.02 8000)` is a `type` error
+rather than a comparison of the stored day count, and so is ordering a
+symbol against a number. `==` and `!=` against a null answer without
+looking at the other type: `(== 2024.01.02 0N)` is `false`.
+
+The same rule holds inside a query, with the same errors. The one difference
+is a string literal, which a query reads as a symbol, so `(== sym "AAPL")`
+compares a `SYM` column with the symbol `AAPL`.
+
 ### `(== a b)` — atomic
 
 Equal. Works on all types including strings and symbols.
@@ -248,6 +265,12 @@ collections of different lengths are a `length` error.
 (and [true false] (list true true))  ; [true false]
 (and [1 0 2] true)                   ; [true false true]
 ```
+
+The truth value of an element: `false`, zero, null and NaN are false; any
+other number or temporal is true, and so is any symbol, string or GUID that
+is not null. A query reads its operands the same way, so
+`(select {from: t where: (and qty (> price 100))})` keeps the rows where
+`qty` is non-zero and not null.
 
 ### `(or a b)` — atomic
 
