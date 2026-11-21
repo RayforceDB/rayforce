@@ -231,12 +231,20 @@ once over the whole columns. A helper runs once per group instead when
 - it has an effect (it prints, sets a global), so it runs as often as before;
 - its last statement is an aggregate (`(fn [x] (let y x) (avg y))`), so it
   gives no value per row;
+- its code uses a whole-column verb (`(fn [x] (let y x) (reverse y))`), or a
+  helper it calls does, or one is passed to it (`(f reverse i)`): the verb
+  sees each group's surviving rows, as `(reverse i)` does inline. These are
+  the verbs above and `rotate`, `xrank`, `xasc`, `xdesc`, `group`, `take`
+  and `drop`;
 - or its call over the whole table fails or gives anything but one typed
   value per row (a scalar, a LIST). That call is a probe: its cost is paid
   once over the whole table before the helper runs per group.
 
 A running call in the arguments of a helper that runs per group still runs
-over the whole table. Over the table `r` above:
+over the whole table: given `(sums i)`, the reversing helper above reverses
+each group's surviving rows of the whole-table `sums`. A running call in the helper's own body runs with
+the helper, over the group's rows: `(fn [x] (let y (sums x)) (reverse y))`
+sums each group. Over the table `r` above:
 
 ```lisp
 (select {s: (sums score) from: r by: room})                         ; A: [60 125], B: [80 160]

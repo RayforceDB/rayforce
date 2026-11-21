@@ -533,6 +533,48 @@ NR -- 2
 (Z (select {from: T by: k n: (sum i) z: (deltas n)})) -- [0Nl 21]
 ;; A running call in the where: or the by: is not an output: it is unchanged.
 (Z (select {from: T by: k where: (> (sums i) 5) z: (sum i)})) -- [20 40]
+;; A whole-column verb (reverse, desc, rank, ...) sees the surviving rows,
+;; as it does inline: a helper whose code uses one runs per group, given
+;; the group's surviving rows, a lambda written in place, a helper it calls
+;; or a verb passed to it included.  The running calls in its arguments
+;; still see the whole table; the ones in its own body see the group's rows.
+(set hrev (fn [x] (let y x) (reverse y)))
+(set hdsc (fn [x] (let y x) (desc y)))
+(set hrk (fn [x] (let y x) (rank y)))
+(set hrev2 (fn [x] (let y x) (hrev y)))
+(set hpass (fn [f x] (let y x) (f y)))
+(set hmixr (fn [x] (let y (sums x)) (reverse y)))
+(set hmixa (fn [x] (let y x) (+ (sums y) (reverse y))))
+(Z (select {from: T by: k where: (> i 2) z: (last (hrev i))})) -- [4 8]
+(Z (select {from: T by: k where: (> i 2) z: (last (reverse i))})) -- [4 8]
+(Z (select {from: T by: k z: (last (hrev i))})) -- [1 2]
+(Z (select {from: T by: k z: (last (reverse i))})) -- [1 2]
+(Z (select {from: T by: k where: (> i 2) z: (hrev i)})) -- (list [16 4] [32 8])
+(Z (select {from: T by: k z: (hrev i)})) -- (list [16 4 1] [32 8 2])
+(Z (select {from: T by: k z: (reverse i)})) -- (list [16 4 1] [32 8 2])
+(Z (select {from: P by: k where: (> i 2) z: (last (hrev i))})) -- [4 8]
+(Z (select {from: S by: k where: (> i 2) z: (hrev i)})) -- (list [16 4] [32 8])
+(Z (select {from: T by: k where: (> i 2) z: (last (hdsc i))})) -- [4 8]
+(Z (select {from: T by: k where: (> i 2) z: (hdsc i)})) -- (list [16 4] [32 8])
+(Z (select {from: T by: k where: (> i 2) z: (sum (hrk i))})) -- [1 1]
+(Z (select {from: T by: k where: (> i 2) z: (last ((fn [x] (let y x) (reverse y)) i))})) -- [4 8]
+(Z (select {from: P by: k z: (last ((fn [x] (let y x) (reverse y)) i))})) -- [1 2]
+(Z (select {from: T by: k where: (> i 2) z: (last (hrev2 i))})) -- [4 8]
+(Z (select {from: T by: k where: (> i 2) z: (last (hpass reverse i))})) -- [4 8]
+(Z (select {from: T by: k where: (> i 2) z: (hmixr i)})) -- (list [20 4] [40 8])
+(Z (select {from: T by: k where: (> i 2) z: (sum (hmixa i))})) -- [44 88]
+(Z (select {from: T by: k where: (> i 2) z: (last (hrev (sums i)))})) -- [7 15]
+(Z (select {from: T by: k where: (> i 2) z: (hrev (sums i))})) -- (list [31 7] [63 15])
+(Z (select {from: P by: k where: (> i 2) z: (hrev (sums i))})) -- (list [31 7] [63 15])
+(at (xasc (select {from: T by: k where: (> i 2) z: (last (hrev i)) y: (last (hs2 i))}) 'k) 'y) -- [31 63]
+;; ... while the running helpers still see the whole table.
+(Z (select {from: T by: k where: (> i 2) z: (last (hpass sums i))})) -- [31 63]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hs2 i))})) -- [38 78]
+(Z (select {from: T by: k where: (> i 2) z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hd2 i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (lp i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (hs2 i)})) -- (list [7 31] [15 63])
+(Z (select {from: S by: k where: (> i 2) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
 ;; update by: stays per group.
 (at (update {from: T z: (sums i) by: k}) 'z) -- [1 2 5 10 21 42]
 (at (update {from: T z: (hs2 i) by: k}) 'z) -- [1 2 5 10 21 42]

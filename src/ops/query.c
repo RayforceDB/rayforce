@@ -17309,11 +17309,65 @@ static bool query_result_reduces(ray_t* v, int depth) {
     return false;
 }
 
+/* The whole-column verbs: what they give at a row depends on the order or
+ * the contents of the whole column, not on the rows up to it.  Written
+ * inline they see the surviving rows (docs: "Running functions under
+ * where:"), so a helper that uses one is not called over the whole table. */
+static const void* const query_whole_col_verbs[] = {
+    (void*)ray_reverse_fn, (void*)ray_asc_fn,   (void*)ray_desc_fn,  (void*)ray_iasc_fn,
+    (void*)ray_idesc_fn,   (void*)ray_rank_fn,  (void*)ray_xrank_fn, (void*)ray_rotate_fn,
+    (void*)ray_xasc_fn,    (void*)ray_xdesc_fn, (void*)ray_distinct_fn, (void*)ray_where_fn,
+    (void*)ray_group_indices_fn, (void*)ray_take_fn, (void*)ray_drop_fn,
+};
+
+/* Does the code `e` (a helper's statement, or a value it names) use a
+ * whole-column verb: by name, called or passed as a value, or in the body
+ * of a helper or a capture it reaches?  Names resolve as globals, a column
+ * of `tbl` (the call's arguments) as that column; `*budget`
+ * bounds the walk, and a walk that exhausts it says yes, which only keeps
+ * the helper per group. */
+static bool query_uses_whole_col_verb(ray_t* e, ray_t* tbl, int depth, int* budget) {
+    if (!e) return false;
+    if (--*budget < 0 || depth > 16) return true;
+    if (e->type == -RAY_SYM) {
+        if ((e->attrs & ATTR_QUOTED) || (tbl && tbl_has_col(tbl, e->i64))) return false;
+        ray_t* v = ray_env_get_global(e->i64);
+        if (!v && ray_sym_is_dotted(e->i64)) v = ray_env_get(e->i64);
+        /* code only: data a name holds is not walked */
+        return v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY)) &&
+               query_uses_whole_col_verb(v, NULL, depth + 1, budget);
+    }
+    if (e->type == RAY_UNARY || e->type == RAY_BINARY || e->type == RAY_VARY) {
+        const void* fp = (const void*)(uintptr_t)e->i64;
+        for (size_t i = 0; i < sizeof query_whole_col_verbs / sizeof *query_whole_col_verbs; i++)
+            if (query_whole_col_verbs[i] == fp) return true;
+        return false;
+    }
+    if (e->type == RAY_LAMBDA) {
+        ray_t* c = LAMBDA_CLOSURE(e);
+        ray_t* cv = c ? ray_dict_vals(c) : NULL;
+        for (int64_t i = 0; cv && cv->type == RAY_LIST && i < cv->len; i++) {
+            ray_t* v = ((ray_t**)ray_data(cv))[i];
+            if (v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY)) &&
+                query_uses_whole_col_verb(v, NULL, depth + 1, budget)) return true;
+        }
+        return query_uses_whole_col_verb(LAMBDA_BODY(e), NULL, depth + 1, budget);
+    }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++)
+        if (query_uses_whole_col_verb(es[i], tbl, depth + 1, budget)) return true;
+    return false;
+}
+
 /* Is the call `e` of the helper `f` (a lambda, or a `(fn ...)` literal) one
  * the grouped hoist takes: an argument reads the rows, none holds an
  * aggregate (that aggregate is the group's, as it is inline, so the call
  * stays where it stands and a running call in an argument is taken on its
- * own), and the helper's result is not plainly a reduction? */
+ * own), the helper's result is not plainly a reduction, and its code uses
+ * no whole-column verb (`(fn [x] (let y x) (reverse y))` reverses each
+ * group's surviving rows, as `(reverse i)` does inline; the running calls
+ * in its arguments are still taken)? */
 static bool query_helper_call_hoists(ray_t* e, ray_t* tbl, ray_t* f) {
     ray_t** es = (ray_t**)ray_data(e);
     bool rows = false;
@@ -17330,7 +17384,14 @@ static bool query_helper_call_hoists(ray_t* e, ray_t* tbl, ray_t* f) {
     } else if (f->type == RAY_LIST && f->len >= 3) {
         last = ((ray_t**)ray_data(f))[f->len - 1];
     }
-    return !query_result_reduces(last, 0);
+    if (query_result_reduces(last, 0)) return false;
+    /* and the functions passed to it, `(h reverse i)`; a verb called in an
+     * argument is that argument's, as inline */
+    int budget = 4096;
+    for (int64_t i = 1; i < e->len; i++)
+        if ((es[i]->type == -RAY_SYM || key_literal_is_fn(es[i])) &&
+            query_uses_whole_col_verb(es[i], tbl, 0, &budget)) return false;
+    return !query_uses_whole_col_verb(f, NULL, 0, &budget);
 }
 
 /* What the call `e` is to the hoist: 1 a running call, 0 a call whose
