@@ -40,8 +40,17 @@
  *   Version 3 — atoms: type(1) + flags(1) + value-bytes.  `flags` bit 0
  *               carries the typed-null marker so (de (ser 0Nl)) round-
  *               trips (previously decoded as ray_i64(0) and dropped the
- *               null bit). */
-#define RAY_SERDE_WIRE_VERSION 3
+ *               null bit).
+ *   Version 4 — errors: code(8) + message-length(1) + message bytes, so IPC
+ *               callers receive the diagnostic text as well as its code. */
+#define RAY_SERDE_WIRE_VERSION_MIN 3
+#define RAY_SERDE_ERROR_MESSAGE_VERSION 4
+#define RAY_SERDE_WIRE_VERSION 4
+
+static inline bool ray_serde_wire_version_supported(uint8_t version) {
+    return version >= RAY_SERDE_WIRE_VERSION_MIN &&
+           version <= RAY_SERDE_WIRE_VERSION;
+}
 
 /* Wire-only null marker (not a valid ray_t type) */
 #define RAY_SERDE_NULL 126
@@ -73,9 +82,24 @@ int64_t ray_serde_size(ray_t* obj);
  * Buffer must have at least ray_serde_size(obj) bytes. */
 int64_t ray_ser_raw(uint8_t* buf, ray_t* obj);
 
+/* An error record carries the thread's last error message (ray_error_msg).
+ * A new error raised between the size pass and the write pass of one
+ * serialization (an encoded column that fails to decode, ...) would change
+ * that text, and the write pass would then write a different length than
+ * the size pass reserved.  ray_serde_msg_hold takes the text once; until
+ * the matching ray_serde_msg_release both passes write that copy.  Holds
+ * nest: the outermost one takes the text. */
+void    ray_serde_msg_hold(void);
+void    ray_serde_msg_release(void);
+
 /* Deserialize object from buffer. Returns reconstructed ray_t*.
  * *len is updated to reflect bytes consumed. */
 ray_t*  ray_de_raw(uint8_t* buf, int64_t* len);
+
+/* Decode a raw payload using the record layout associated with its header.
+ * Needed by journals, which may contain frames written before a wire-format
+ * upgrade. */
+ray_t*  ray_de_raw_version(uint8_t* buf, int64_t* len, uint8_t version);
 
 /* Top-level: serialize to U8 vector with IPC header */
 ray_t*  ray_ser(ray_t* obj);

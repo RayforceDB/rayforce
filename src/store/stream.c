@@ -19,6 +19,9 @@
 #include <limits.h>
 #include <string.h>
 
+static _Atomic(int64_t) g_sym_probes;   /* test hook: SYM cells resolved through a domain probe */
+int64_t ray_col_stream_test_sym_probes(void) { return atomic_load_explicit(&g_sym_probes, memory_order_relaxed); }
+
 #define COL_STREAM_LUT_BITS 19
 #define COL_STREAM_LUT (1u << COL_STREAM_LUT_BITS)
 
@@ -83,6 +86,35 @@ bool ray_col_stream_stage_mem(ray_col_stream_t* w) {
 #endif
 }
 
+ray_err_t ray_col_stream_sym_width(ray_col_stream_t* w, uint8_t width) {
+    if (w->type != RAY_SYM || w->gen != 0 || !w->fp || w->ew || w->rows) return RAY_ERR_DOMAIN;
+    if (width > RAY_SYM_W32) return RAY_OK;       /* positions stay 32-bit */
+    w->attrs = (uint8_t)((w->attrs & ~RAY_SYM_W_MASK) | width);
+    w->pos_w = (uint8_t)(width + 1);
+    return RAY_OK;
+}
+
+/* n positions at the file's width: as they are at W32, else narrowed (a
+ * position past the width is a domain that grew after the width was set). */
+static ray_err_t stream_put_pos(ray_col_stream_t* w, const uint32_t* pos, int64_t n) {
+    uint8_t width = w->pos_w ? (uint8_t)(w->pos_w - 1) : RAY_SYM_W32;
+    if (width == RAY_SYM_W32)
+        return !n || fwrite(pos, sizeof(uint32_t), (size_t)n, w->fp) == (size_t)n ? RAY_OK : RAY_ERR_IO;
+    uint32_t max = width == RAY_SYM_W8 ? UINT8_MAX : UINT16_MAX;
+    union { uint8_t b8[8192]; uint16_t b16[8192]; } u;
+    for (int64_t off = 0; off < n; off += 8192) {
+        int64_t cnt = n - off < 8192 ? n - off : 8192;
+        for (int64_t i = 0; i < cnt; i++) {
+            uint32_t v = pos[off + i];
+            if (v > max) return RAY_ERR_RANGE;
+            if (width == RAY_SYM_W8) u.b8[i] = (uint8_t)v; else u.b16[i] = (uint16_t)v;
+        }
+        size_t esz = width == RAY_SYM_W8 ? 1 : 2;
+        if (fwrite(&u, esz, (size_t)cnt, w->fp) != (size_t)cnt) return RAY_ERR_IO;
+    }
+    return RAY_OK;
+}
+
 bool ray_col_stream_chunked_ok(const ray_col_stream_t* w) {
     return w->gen == 2 && w->type != RAY_STR && (w->type != RAY_SYM || w->dom) &&
            ray_encw_type_supported(w->type) && w->fp && !w->in_mem && !w->ew && !w->rows;
@@ -119,20 +151,31 @@ static void stream_drop_mem(ray_col_stream_t* w) {
 
 static void ray_col_stream_drop_lut(ray_col_stream_t* w) {
     ray_free_raw(w->lut_id); ray_free_raw(w->lut_pos);
-    w->lut_id = NULL; w->lut_pos = NULL;
+    if (w->lut_dom) ray_sym_domain_release(w->lut_dom);
+    w->lut_id = NULL; w->lut_pos = NULL; w->lut_dom = NULL;
 }
 
-/* The runtime id -> position cache, made by the first runtime-domain chunk:
- * 4 MiB of ids and 2 MiB of positions, each a block one order up with its
- * header (8 MB and 4 MB, 12 MB committed, the 4 MiB of ids written here).
- * A writer fed chunks already encoded over its domain never needs it.  Best
- * effort: without it every cell probes the domain. */
-static bool ray_col_stream_lut(ray_col_stream_t* w) {
-    if (w->lut_id) return true;
-    w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
-    w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
-    if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
+/* The source id -> position cache, made by the first chunk over another
+ * domain: 4 MiB of ids and 2 MiB of positions, each a block one order up
+ * with its header (8 MB and 4 MB, 12 MB committed, the 4 MiB of ids written
+ * here).  It caches one source domain at a time (the runtime one, or the
+ * file domain a parted table's segments share); a chunk over another domain
+ * empties it.  A writer fed chunks already encoded over its domain never
+ * needs it.  Best effort: without it every cell probes the domain. */
+static bool ray_col_stream_lut(ray_col_stream_t* w, struct ray_sym_domain_s* dom) {
+    if (w->lut_id && w->lut_dom == dom) return true;
+    if (!w->lut_id) {
+        w->lut_id  = (int64_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(int64_t));
+        w->lut_pos = (uint32_t*)ray_alloc_raw((size_t)COL_STREAM_LUT * sizeof(uint32_t));
+        if (!w->lut_id || !w->lut_pos) { ray_col_stream_drop_lut(w); return false; }
+    }
     memset(w->lut_id, 0xff, (size_t)COL_STREAM_LUT * sizeof(int64_t));
+    /* held while its ids are cached: a caller may drop the chunk (and its
+     * domain) between appends, and a new domain at the same address must
+     * not hit stale entries */
+    ray_sym_domain_retain(dom);
+    if (w->lut_dom) ray_sym_domain_release(w->lut_dom);
+    w->lut_dom = dom;
     return true;
 }
 
@@ -205,7 +248,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return RAY_ERR_RANGE;
                 u.pos[i] = (uint32_t)ids[i]; if (!ids[i]) w->had_nulls = true;
             }
-            if (fwrite(u.pos,sizeof(*u.pos),(size_t)count,w->fp) != (size_t)count) return RAY_ERR_IO;
+            ray_err_t pe = stream_put_pos(w, u.pos, count);
+            if (pe != RAY_OK) return pe;
         }
     } else if (w->type == RAY_STR) {
         uint64_t bytes = col->str_pool ? (uint64_t)col->str_pool->len : 0;
@@ -256,19 +300,21 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
             for (int64_t i = off; i < end; i++) lo = p[i] < lo ? p[i] : lo;
             if (!lo) w->had_nulls = true;
         }
-        if (n && fwrite(p, sizeof(uint32_t), (size_t)n, w->fp) != (size_t)n)
-            return RAY_ERR_IO;
+        ray_err_t pe = stream_put_pos(w, p, n);
+        if (pe != RAY_OK) return pe;
     } else if (w->type == RAY_SYM) {
         /* Encode cells as positions in the target symfile's domain:
          * resolve each cell through the chunk vec's own domain and
          * find-or-append into the target (distinct work rides the
          * write).  The domain is flushed before the column files are
          * committed (close), preserving the sym-first crash ordering.
-         * A runtime-domain chunk vec goes through the id -> position
-         * cache: only a value's first encounter pays the domain probe. */
-        bool direct = ray_sym_vec_domain(col) == w->dom;
-        bool cached = !direct && ray_sym_vec_domain(col) == ray_sym_runtime_domain() &&
-                      ray_col_stream_lut(w);
+         * A chunk vec over another domain goes through the id ->
+         * position cache: only a value's first encounter pays the domain
+         * probe. */
+        struct ray_sym_domain_s* cdom = ray_sym_vec_domain(col);
+        bool direct = cdom == w->dom;
+        bool cached = !direct && ray_col_stream_lut(w, cdom);
+        bool rt = cdom == ray_sym_runtime_domain();
         const void* cd = ray_data(col);
         uint32_t buf[8192];
         for (int64_t off = 0; off < n; ) {
@@ -286,8 +332,9 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                     if (w->lut_id[slot] == id) {
                         pos = w->lut_pos[slot];
                     } else {
-                        ray_t* s = ray_sym_str(id);
+                        ray_t* s = rt ? ray_sym_str(id) : ray_sym_domain_str(cdom, id);
                         if (!s) return RAY_ERR_CORRUPT;
+                        atomic_fetch_add_explicit(&g_sym_probes, 1, memory_order_relaxed);
                         pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
                         if (pos < 0) return RAY_ERR_OOM;
                         w->lut_id[slot] = id; w->lut_pos[slot] = (uint32_t)pos;
@@ -295,6 +342,7 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                 } else {
                     ray_t* s = ray_sym_vec_cell(col, off + i);
                     if (!s) return RAY_ERR_CORRUPT;
+                    atomic_fetch_add_explicit(&g_sym_probes, 1, memory_order_relaxed);
                     pos = ray_sym_domain_intern(w->dom, ray_str_ptr(s), ray_str_len(s));
                     if (pos < 0) return RAY_ERR_OOM;
                 }
@@ -308,8 +356,8 @@ ray_err_t ray_col_stream_append(ray_col_stream_t* w,
                  * non-SYM arm below propagated it (issue #416). */
                 if (pos == 0) w->had_nulls = true;
             }
-            if (fwrite(buf, sizeof(uint32_t), (size_t)cnt, w->fp) != (size_t)cnt)
-                return RAY_ERR_IO;
+            ray_err_t pe = stream_put_pos(w, buf, cnt);
+            if (pe != RAY_OK) return pe;
             off += cnt;
         }
     } else {
@@ -370,6 +418,7 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     uint8_t attrs = (uint8_t)(w->attrs | (w->had_nulls ? RAY_ATTR_HAS_NULLS : 0));
     uint32_t sc = w->type == RAY_SYM ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
     if (err == RAY_OK) err = ray_encw_begin(&ew, f, w->type, attrs, w->rows, sc, ik, 0);
+    ew.keep_dict = w->keep_dict;
     if (err == RAY_OK && w->type == RAY_SYM) {
         ray_encw_set_sym_domain(&ew, w->dom);
         if (w->sym_bhas) ray_encw_set_sym_bounds(&ew, w->sym_bmn, w->sym_bmx, w->sym_bhas);

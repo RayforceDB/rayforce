@@ -25,6 +25,7 @@
 #include "core/timer.h"
 #include "mem/sys.h"
 #include <errno.h>
+#include <string.h>
 
 /* ===== Shared (platform-independent) poll helpers ===== */
 
@@ -36,6 +37,47 @@ void ray_poll_exit(ray_poll_t* poll, int64_t code)
 void ray_poll_set_restricted(ray_poll_t* poll, bool restricted)
 {
     if (poll) poll->restricted = restricted;
+}
+
+/* A poll has one optional password and an evaluation role. Native IPC and
+ * embedders with another wire protocol must use this same verifier rather
+ * than grow subtly different password rules. */
+void ray_poll_auth_set(ray_poll_t* poll, const char* password, bool restricted)
+{
+    if (!poll) return;
+    memset(poll->auth_secret, 0, sizeof(poll->auth_secret));
+    if (password) {
+        size_t n = strlen(password);
+        if (n >= sizeof(poll->auth_secret)) n = sizeof(poll->auth_secret) - 1;
+        memcpy(poll->auth_secret, password, n);
+    }
+    poll->restricted = restricted;
+}
+
+/* Credentials are "user:password" (or a bare password), with no terminating
+ * NUL included. Compare a fixed-size zero-padded buffer, as the native path
+ * has always done: no password-length-dependent comparison or secret output. */
+bool ray_poll_auth_check(const ray_poll_t* poll, const uint8_t* credentials, size_t len)
+{
+    if (!poll || poll->auth_secret[0] == '\0') return true;
+    if (!credentials || len == 0) return false;
+    const uint8_t* colon = memchr(credentials, ':', len);
+    const uint8_t* password = colon ? colon + 1 : credentials;
+    size_t n = len - (size_t)(password - credentials);
+    if (n && password[n - 1] == '\0') n--;
+    if (n >= sizeof(poll->auth_secret)) n = sizeof(poll->auth_secret) - 1;
+    uint8_t supplied[256] = {0};
+    memcpy(supplied, password, n);
+    const volatile uint8_t* a = supplied;
+    const volatile uint8_t* b = (const volatile uint8_t*)poll->auth_secret;
+    uint8_t different = 0;
+    for (size_t i = 0; i < sizeof supplied; i++) different |= a[i] ^ b[i];
+    return different == 0;
+}
+
+bool ray_poll_auth_restricted(const ray_poll_t* poll)
+{
+    return poll && poll->restricted;
 }
 
 ray_selector_t* ray_poll_get(ray_poll_t* poll, int64_t id)

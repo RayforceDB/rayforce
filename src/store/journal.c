@@ -335,7 +335,7 @@ static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
     for (;;) {
         ray_ipc_header_t h;
         if (read_full(f, &h, sizeof(h)) != sizeof(h)) break;
-        if (h.prefix != RAY_SERDE_PREFIX || h.version != RAY_SERDE_WIRE_VERSION ||
+        if (h.prefix != RAY_SERDE_PREFIX || !ray_serde_wire_version_supported(h.version) ||
             h.endian != RAY_SERDE_ENDIAN || h.size <= 0 || h.size > 256LL*1024*1024) break;
         if (h.msgtype != RAY_IPC_MSG_JNOTE || (h.flags & RAY_IPC_FLAG_COMPRESSED)) {
             if (fseek(f, (long)h.size, SEEK_CUR) != 0) break;
@@ -345,7 +345,7 @@ static bool lift_notes_collect(FILE* f, int64_t gen, lift_notes_t* ns) {
         if (!buf) { ok = false; break; }
         if (read_full(f, buf, (size_t)h.size) != (size_t)h.size) { ray_sys_free(buf); break; }
         int64_t len = h.size;
-        ray_t* v = ray_de_raw(buf, &len);
+        ray_t* v = ray_de_raw_version(buf, &len, h.version);
         ray_sys_free(buf);
         if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); continue; }
         const int64_t* d = (const int64_t*)ray_data(v);
@@ -533,7 +533,8 @@ static ray_err_t journal_replay_from(const char*           path,
         if (r == SIZE_MAX)                          { status = RAY_JREPLAY_IO;      break; }
         if (r != sizeof(hdr))                       { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.prefix  != RAY_SERDE_PREFIX)        { status = RAY_JREPLAY_BADTAIL; break; }
-        if (hdr.version != RAY_SERDE_WIRE_VERSION)  { status = RAY_JREPLAY_BADTAIL; break; }
+        if (!ray_serde_wire_version_supported(hdr.version))
+                                                    { status = RAY_JREPLAY_DESER;   break; }
         if (hdr.endian  != RAY_SERDE_ENDIAN)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024)
                                                     { status = RAY_JREPLAY_BADTAIL; break; }
@@ -562,7 +563,7 @@ static ray_err_t journal_replay_from(const char*           path,
         }
 
         int64_t consumed = pay_len;
-        ray_t*  msg      = ray_de_raw(payload, &consumed);
+        ray_t*  msg      = ray_de_raw_version(payload, &consumed, hdr.version);
         if (owned) ray_sys_free(payload);
         ray_sys_free(buf);
 
@@ -663,7 +664,7 @@ ray_err_t ray_journal_validate(const char* path,
         if (r == 0) break;                                /* clean EOF */
         if (r != sizeof(hdr))                       break;
         if (hdr.prefix  != RAY_SERDE_PREFIX)        break;
-        if (hdr.version != RAY_SERDE_WIRE_VERSION)  break;
+        if (!ray_serde_wire_version_supported(hdr.version)) break;
         if (hdr.endian  != RAY_SERDE_ENDIAN)        break;
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024) break;
 

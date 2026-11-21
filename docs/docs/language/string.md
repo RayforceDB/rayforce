@@ -179,19 +179,30 @@ ray> (format "% + % = %" 1 2 3)
 
 ### repr
 
-**`(repr value)`** — unary
+**`(repr value [max-bytes])`**
 
-Returns Rayfall source text that parses back to the same value. Unlike
-`format`, `repr` preserves narrow integer types, floating-point bits (including
-negative zero), and GUID types.
+Returns Rayfall source text that reads back to the same value. Unlike
+`format`, `repr` preserves narrow integer types, the shortest exact
+floating-point text (including negative zero), symbols of any spelling, GUIDs,
+empty typed vectors and the generic list, dictionary and table kinds. The text
+is evaluable with `(eval (parse ...))` and is the text
+[`read-value`](read-value.md) reads without evaluating anything.
 
 ```lisp
 ray> (repr [1i 2i])
 "[1i 2i]"
 
-ray> (eval (parse (repr [1i 2i])))
-[1 2]
+ray> (repr (dict ['a 'b] [1 2]))
+"(dict (as 'SYM (list \"a\" \"b\")) (list 1 2))"
+
+ray> (repr (list 1h "x" 'a))
+"(list 1h \"x\" (as 'SYM \"a\"))"
 ```
+
+`repr` fails with a `format` error for values that have no data text:
+functions, builtins and error values, including when they are nested. Output
+beyond `max-bytes` (default 8 MiB) is a `limit` error, never a truncated
+string.
 
 ## String Operations in the DAG
 

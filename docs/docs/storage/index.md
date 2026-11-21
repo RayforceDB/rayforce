@@ -184,6 +184,37 @@ The shared symbol table lives in the parted root (`db/`) as the dotfile
 per table name (`db/<date>/<table>/cols`). Partitions have no own symfile and
 encode their SYM columns (e.g. `sym`) against the shared `.sym`.
 
+### Writing a Partitioned Database from Rayfall
+
+There is no `.db.parted.set`. The supported way to write a partitioned database is to save each partition's table with `.db.splayed.set` into `<root>/<partition>/<table>`, passing the root's one shared symbol file. `.db.parted.get` then loads the result.
+
+```lisp
+(set root "/data/db")
+(set symfile (format "%/.sym" root))
+(.db.splayed.set (format "%/0/ohlcv" root) t0 symfile)
+(.db.splayed.set (format "%/1/ohlcv" root) t1 symfile)
+(.db.parted.get root 'ohlcv)              ; adds the `part` column
+```
+
+What this guarantees:
+
+- **Directories.** `.db.splayed.set` creates the partition directory and any missing parents; nothing needs to exist beforehand.
+- **Partition names.** Any name `.db.parted.get` accepts is a partition: dates (`2024.01.15`), timestamps (`YYYY.MM.DD.HH.MM.SS`) or plain integers. Integer names need not start at 0, be consecutive or be zero-padded; they are ordered by value (`1`, `2`, `10`), and the `part` column is `I64`. See [`.db.parted.get`](../namespaces/db.md#db-parted-get) for the full rule and for how mixed names are handled.
+- **Shared symbol file.** Pass the same `sym_path` (conventionally `<root>/.sym`) for every partition and every table of the root. `SYM` columns of all partitions then share one vocabulary, which is what the loader reads (see [Symbol Table Persistence](#symbol-table-persistence)). New symbols append to the file, so partitions can be written one at a time, in any order.
+- **Pruning.** A predicate on the key (`(== part 7)`, `(> date 2024.01.15)`) prunes from the directory names alone; it needs no `compress` option. `compress: true` matters only for pruning on a *data* column, whose per-partition minimum and maximum are kept for compressed columns and for plain columns of 65,536 rows or more.
+- **Tables in every partition.** Write each table into every partition. A table that appears in later partitions only, because it was added midway, is handled by `.db.parted.fill`, which gives every partition that lacks a table an empty copy of it. It does not change existing data and a repeat call is a no-op.
+
+### Writing a Parted Table as One Splayed Table
+
+`.db.splayed.set` takes a parted table as it takes any other, and writes it a partition segment at a time: the table is never held in memory. Use it to merge the partitions of a root into one larger partition, or to copy a parted table elsewhere.
+
+```lisp
+(set P (.db.parted.get "/data/db" 'trades))
+(.db.splayed.set "/data/merged/2024.01/trades" (xcols P (drop (cols P) 1)) "/data/merged/.sym")
+```
+
+The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null). The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds; only a string column's dictionary index (up to about 12 bytes a row while it is built, `{index: false}` skips it) grows with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
+
 ### Loading Partitioned Data
 
 The `ray_read_parted()` function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with [parted columns](../data-types/collections.md#partitioned-columns) and a virtual `MAPCOMMON` date column.
@@ -221,14 +252,14 @@ Ordinary row-local atomic expressions retain their uncapped admission walk. Cano
 Two additional IF shapes have deliberately bounded proofs:
 
 - **Ungrouped:** one fresh output, `from` and `where`, no `by`, and an explicit ELSE. Branches must be I64 columns or literals, or nested `if` expressions with explicit ELSE. Conditions use BOOL literals, I64 comparisons or SYM equality/inequality, with canonical `and`/`or` and unary `not`. The proof allows 128 visits and depth 32. Quoted SYM names that resolve to source columns decline this proof.
-- **Grouped:** one bare I64 group key and up to 32 fresh outputs, each `sum(if condition then else)` with explicit ELSE and I64 branches. Conditions must depend on a column; supported predicates include I64 comparisons and SYM equality/inequality against one unambiguous non-NULL literal. The shared proof allows 256 visits, depth 24 and 256 recorded references. Output names must not capture referenced source or literal names.
+- **Grouped:** one bare I64 or SYM group key (not the partition key unless it is I64) and up to 32 outputs, each a fresh `sum(if condition then else)` with explicit ELSE and I64 branches, or an aggregate beside them: a native aggregate (`sum`, `count`, `avg`, `min`, `max`, `med`, `dev`, ...) or `first`/`last` of row-local arguments. Conditions must depend on a column; supported predicates include I64 comparisons and SYM equality/inequality against one unambiguous non-NULL literal. The shared proof allows 256 visits, depth 24 and 256 recorded references. No output, `where` or `by` may spell another output's name; only an aggregate beside the `sum(if)`s may spell its own (`qty: (sum qty)`). A bare projection or `count(distinct ...)` beside a `sum(if)` keeps the full source.
 
-These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, wider grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
+These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, composite, computed or other-typed grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
 
 ```lisp
 ;; A supported narrow grouped shape; the literal date bound selects partitions.
 (select {from: trades where: (== date 2024.01.02) by: account
-         qty_ok: (sum (if (> qty 0) qty 0))})
+         qty_ok: (sum (if (> qty 0) qty 0)) n: (count qty)})
 ```
 
 The example assumes `account` and `qty` are I64 columns. A declined proof changes optimization, not permission to substitute a different query result.
@@ -366,9 +397,11 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
 
+The table may be a parted one: it is then written a partition segment at a time, never held in memory (see [Writing a Parted Table as One Splayed Table](#writing-a-parted-table-as-one-splayed-table)).
+
 A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked and nested/list columns are always written uncompressed. Compressed files record their indexes in the file header: those you built, and the dictionary or chunk zone a save builds on its own.
 
-A save also builds indexes of its own for columns of at least 65 536 rows: a dictionary for a string column and a chunk zone (per-chunk min/max) for a numeric or temporal one. `{index: false}` builds neither, in either generation, for a table that is never queried by value (read by partition, by position or whole); the write is faster and the files are smaller. It governs only what the save builds. An index the column already carries is written as it always is: one you built (`.idx.hash`, `.idx.sort`, `.idx.bloom`), or a chunk zone a loaded column brought from its file, as when a table read from one splayed store is saved to another. A dictionary is only ever built, never carried over from the source, so `{index: false}` leaves a loaded string column without one. A column without an index reads as it does after a save of a short one. `true`, the default, builds the automatic indexes; a non-bool value is a `domain` error. `compress`, `symfile` and `index` combine in one dict: `{compress: true index: false}`.
+A save also builds indexes of its own for columns of at least 65 536 rows: a dictionary for a string column and a chunk zone (per-chunk min/max) for a numeric or temporal one. `{index: false}` builds neither, in either generation, for a table that is never queried by value (read by partition, by position or whole); the write is faster and the files are smaller. It governs only what the save builds. An index the column already carries is written as it always is: one you built (`.idx.hash`, `.idx.sort`, `.idx.bloom`), or a chunk zone a loaded column brought from its file, as when a table read from one splayed store is saved to another. A dictionary is only ever built, never carried over from the source, so `{index: false}` leaves a loaded string column without one. A column without an index reads as it does after a save of a short one. A generation-2 (compressed) save keeps a string column's dictionary only while the file with it is no larger than the generation-0 file of the same column with its dictionary, headers and padding included: 16 bytes a row plus the bytes of every string over 12 bytes for the column, 4 bytes a row and 4 bytes per distinct string for the dictionary (generation 0 reads the dictionary's strings through the column), plus 256 bytes of headers, each part padded to 32 bytes. A generation-2 dictionary also stores an uncompressed copy of every distinct string, so for mostly distinct strings (IDs, raw messages, payloads) it is left out and the column is the file `{index: false}` writes: `.idx.info` reports `index: 'none`. 140 000 distinct 264-byte strings save as 39.2 MB, as raw, instead of 78.4 MB. Each file decides for its own rows, on every save, re-save, partition, write of a parted table and `.csv.splayed` or Parquet import; generation 0 is unchanged. Such a column answers equality filters, `distinct` and group-by without the dictionary's codes, so they read the strings: on 1 000 000 distinct short IDs a point filter took 0.94 ms instead of 0.04 ms and a group-by 45 ms instead of 3.8 ms, with a 3.6 MB file instead of 27.5 MB (one measurement, 28-core Linux). `{index: true}` keeps the dictionary whatever it costs, for a column filtered or grouped by value: the 140 000 strings above then take 78.4 MB. So the option has three states: absent builds the automatic indexes under this size rule, `true` builds them all, `false` builds none; a non-bool value is a `domain` error. The CSV and Parquet converters take no `index` option and follow the size rule. `compress`, `symfile` and `index` combine in one dict: `{compress: true index: false}`.
 
 `{durable: false}` skips every fsync of the save (column files, symbol files, directories), the path `.csv.splayed` and the Parquet import already take; `true`, the default, syncs as before. Column files are still written through temporary files and atomic renames, so a reader sees whole files; the shared symbol file is appended to in place, as described under [Append-Only .sym Files](#append-only-sym-files). A crash or power loss may lose the write or leave it torn. For a table that is republished often and can be rebuilt from its source. A non-bool value is a `domain` error; it combines with the other options: `{durable: false compress: true}`.
 

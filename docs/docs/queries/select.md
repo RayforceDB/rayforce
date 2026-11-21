@@ -244,6 +244,24 @@ Group by multiple keys:
 ; GOOG Buy    125
 ```
 
+An output that projects a key column as itself (`sym: sym`) is the key
+column: it is not repeated after the keys, and the result is exactly the
+select without the projections, the same columns and the same rows in the
+same order. The keys come first, in `by:` order, wherever the projections
+are written, with one key or with several: `{total: (sum qty) sym: sym}
+by: sym` gives the columns `sym total`, and `{n: (count qty) k: k}
+by: {k: sym}` gives `k n`. A select whose only outputs are key projections
+is the select with no outputs. A computed projection of a key is an
+ordinary output.
+
+```lisp
+(select {from: trades by: sym total: (sum qty) sym: sym})   ; columns sym total
+(select {from: trades by: [sym side]
+         sym: sym side: side total: (sum qty)})   ; columns sym side total
+(select {from: trades by: [sym side]
+         total: (sum qty) side: side sym: sym})   ; columns sym side total
+```
+
 Expressions over aggregates work with any number of keys and with binary aggregates such as `pearson_corr`, `cov`, or `wsum`; the aggregates are computed in the grouping pass and the outer expression once per group:
 
 ```lisp
