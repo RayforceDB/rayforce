@@ -18380,24 +18380,30 @@ static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
     uint16_t op = prune_cmp_op(el[0], fn);
     if (!op || op == OP_IN) return false;
     int8_t l = prune_if_leaf_type(el[1], tbl), r = prune_if_leaf_type(el[2], tbl);
-    return (l == RAY_I64 && r == RAY_I64) ||
+    /* F64 as I64: a null (NaN reads as null) is the lowest value and equals
+     * itself on every route, the filter's included. */
+    return (l == r && (l == RAY_I64 || l == RAY_F64)) ||
            (l == RAY_SYM && r == RAY_SYM && (op == OP_EQ || op == OP_NE));
 }
 
-/* Only a sole, ungrouped I64 projection with explicit ELSE. Compiled IF is
- * per-row; its aggregate-free fallback scatters per-row after WHERE too.
- * Aggregate inputs, WHERE/BY IF, mixed types and aliases stay declined. */
-static bool prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) {
-    if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return false;
-    if (prune_if_leaf_type(e, tbl) == RAY_I64) return true;
-    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 4) return false;
+/* An ungrouped projection with explicit ELSE whose branches share one type,
+ * I64, F64 or SYM (0: declined). Compiled IF is per-row; its
+ * aggregate-free fallback scatters per-row after WHERE too. A SYM branch
+ * reads as text: OP_IF re-expresses every side in the runtime domain.
+ * Mixed branch types (an I64 null read as an F64), aggregate inputs,
+ * WHERE/BY IF and aliases stay declined. */
+static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) {
+    if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return 0;
+    int8_t t = prune_if_leaf_type(e, tbl);
+    if (t == RAY_I64 || t == RAY_F64 || t == RAY_SYM) return t;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 4) return 0;
     ray_t** el = (ray_t**)ray_data(e);
     ray_t* fn = prune_head_fn(el[0], tbl);
     if (!fn || fn->type != RAY_VARY || !(fn->attrs & RAY_FN_SPECIAL_FORM) ||
-        (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn || !prune_head_named(el[0], "if")) return false;
-    return prune_if_cond(el[1], tbl, budget, depth + 1) &&
-           prune_if_projection(el[2], tbl, budget, depth + 1) &&
-           prune_if_projection(el[3], tbl, budget, depth + 1);
+        (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn || !prune_head_named(el[0], "if")) return 0;
+    if (!prune_if_cond(el[1], tbl, budget, depth + 1)) return 0;
+    int8_t a = prune_if_projection(el[2], tbl, budget, depth + 1);
+    return a && a == prune_if_projection(el[3], tbl, budget, depth + 1) ? a : 0;
 }
 
 /* An output reads only the rows the where keeps: elementwise, or an
@@ -18547,7 +18553,7 @@ static bool prune_group_cond(ray_t* e, ray_t* tbl, prune_group_proof_t* p,
     if (l != r || (!lc && !rc)) return false;
     if (l == RAY_SYM)
         return (op == OP_EQ || op == OP_NE) && lc != rc;
-    return l == RAY_I64 || (where && l == RAY_DATE);
+    return l == RAY_I64 || l == RAY_F64 || (where && l == RAY_DATE);
 }
 
 static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
@@ -18569,9 +18575,9 @@ static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
     if (!fn || fn->type != RAY_VARY || !(fn->attrs & RAY_FN_SPECIAL_FORM) ||
         RAY_FN_OPCODE(fn) || (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn ||
         !prune_head_named(a[0], "if")) return false;
-    return prune_group_cond(a[1], tbl, p, 0, false) &&
-           prune_group_leaf(a[2], tbl, p, false) == RAY_I64 &&
-           prune_group_leaf(a[3], tbl, p, false) == RAY_I64;
+    if (!prune_group_cond(a[1], tbl, p, 0, false)) return false;
+    int8_t t = prune_group_leaf(a[2], tbl, p, false);
+    return (t == RAY_I64 || t == RAY_F64) && prune_group_leaf(a[3], tbl, p, false) == t;
 }
 
 static int prune_group_id_cmp(const void* a, const void* b) {

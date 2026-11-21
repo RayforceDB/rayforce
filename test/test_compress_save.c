@@ -4770,6 +4770,76 @@ static test_result_t test_select_parted_prunes_if_limits(void) {
     PASS();
 }
 
+/* F64 conditions, F64 and SYM branches (#1181): pruned and unpruned answers
+ * agree, nulls (an F64 NaN is null) and symbols outside the root's domain
+ * included; mixed I64/F64 branches keep the full source. */
+static test_result_t test_select_parted_prunes_if_f64_sym(void) {
+    static const struct { const char* output; bool pruned; } cases[] = {
+        { "q: (if (>= px 1.0) qty 0)", true },
+        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true },
+        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true },
+        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true },
+        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true },
+        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true },
+        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true },
+        { "q: (if (> qty 2) px qty)", false },
+        { "by: g n: (sum (if (> qty 2) px qty))", false },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256], sym_path[512];
+        snprintf(root, sizeof root, "%s/if_f64_sym%d", ray_test_tmp(CS_TMP), gen);
+        snprintf(sym_path, sizeof sym_path, "%s/.sym", root);
+        for (int p = 0; p < 3; p++) {
+            char dir[512], src[1024];
+            snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+            snprintf(src, sizeof src,
+                "(table [g px qty act side] (list [7 7 7 7 8 8 8 8] "
+                "(+ %d.0 [0.5 1.5 0Nf 2.0 -0.0 1.0 0.25 0Nf]) [1 3 0Nl 4 5 0Nl 2 9] "
+                "(as 'SYM [\"New\" \"Accepted\" \"\" \"New\" \"Rejected\" \"New\" \"Accepted\" \"P%d\"]) "
+                "(as 'SYM [\"b\" \"s\" \"b\" \"\" \"s\" \"b\" \"s\" \"b\"])))", p, p);
+            ray_t* t = ray_eval_str(src);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t) && t->type == RAY_TABLE);
+            ray_err_t err = ray_splay_save_mode(t, dir, sym_path,
+                gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+            ray_release(t);
+            TEST_ASSERT_TRUE(err == RAY_OK);
+        }
+        ray_t* t = ray_read_parted(root, "t");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char q[768], ref[1024];
+            snprintf(q, sizeof q, "(xasc (select {from: t where: (== date 2024.01.02) %s}) (key (select {from: t where: (== date 2024.01.02) %s})))",
+                     cases[i].output, cases[i].output);
+            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or (== date 2024.01.02) (== date 2024.01.02)) %s}) (key (select {from: t where: (or (== date 2024.01.02) (== date 2024.01.02)) %s})))",
+                     cases[i].output, cases[i].output);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            /* the query runs the select twice: the rows and their key */
+            structure = ray_query_test_parted_pruned_sources(true) == (cases[i].pruned ? 2u : 0u);
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          ray_table_nrows(r) == (strstr(cases[i].output, "by:") ? 2 : 8) && sp_same(r, u);
+            drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "if f64/sym gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
 /* SYM conditions in the separate ungrouped IF proof. A tick name that
  * resolves to a source column is not a literal, even when values agree. */
 static test_result_t test_select_parted_prunes_if_symbols(void) {
@@ -6022,6 +6092,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_local_shapes", test_select_parted_prunes_local_shapes, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_if_f64_sym", test_select_parted_prunes_if_f64_sym, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_ordinary_uncapped", test_select_parted_prunes_ordinary_uncapped, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if", test_select_parted_prunes_grouped_if, rt_setup, rt_teardown },
