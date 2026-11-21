@@ -913,8 +913,11 @@ static test_result_t test_fmt_vec_i16(void) {
     ray_t* result = ray_fmt(vec, 1);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "100"));
+    TEST_ASSERT_STR_EQ(ray_str_ptr(result), "[100h 200h 300h]");
+    ray_release(result);
+    /* The display keeps the suffix; the compact form stays bare. */
+    result = ray_fmt(vec, 0);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(result), "[100 200 300]");
     ray_release(result);
     ray_release(vec);
     PASS();
@@ -928,8 +931,13 @@ static test_result_t test_fmt_vec_i32(void) {
     ray_t* result = ray_fmt(vec, 1);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "10"));
+    TEST_ASSERT_STR_EQ(ray_str_ptr(result), "[10i 20i 30i]");
+    ray_release(result);
+    result = ray_fmt(vec, 2);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(result), "[10i 20i 30i]");
+    ray_release(result);
+    result = ray_fmt(vec, 0);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(result), "[10 20 30]");
     ray_release(result);
     ray_release(vec);
     PASS();

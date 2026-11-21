@@ -170,37 +170,17 @@ static inline int both_f32_atoms(ray_t* a, ray_t* b) {
 
 /* RAY_ATOM_IS_NULL and ray_typed_null are in rayforce.h */
 
-/* Return a typed null for the promoted result type of two operands */
-static inline ray_t* null_for_promoted(ray_t* a, ray_t* b) {
-    if (a->type == -RAY_F64 || b->type == -RAY_F64)
-        return ray_typed_null(-RAY_F64);
-    if (a->type == -RAY_F32 || b->type == -RAY_F32)
-        return ray_typed_null(both_f32_atoms(a, b) ? -RAY_F32 : -RAY_F64);
-    if (a->type == -RAY_I64 || b->type == -RAY_I64)
-        return ray_typed_null(-RAY_I64);
-    if (a->type == -RAY_I32 || b->type == -RAY_I32)
-        return ray_typed_null(-RAY_I32);
-    if (a->type == -RAY_I16 || b->type == -RAY_I16)
-        return ray_typed_null(-RAY_I16);
-    return ray_typed_null(-RAY_I64);
+/* The atom type (negative) of + - * div % over two numeric atoms: the
+ * promotion table (ray_arith_type, core/types.h).  -RAY_I64 when either is
+ * not numeric. */
+static inline int8_t arith_atom_type(ray_t* a, ray_t* b) {
+    int8_t t = ray_arith_type((int8_t)-a->type, (int8_t)-b->type);
+    return t ? (int8_t)-t : -RAY_I64;
 }
 
-/* ══════════════════════════════════════════
- * Type promotion
- * ══════════════════════════════════════════ */
-
-/* Determine the promoted integer result type for two numeric operands.
- * Returns atom type code (negative). */
-static inline int8_t promote_int_type(ray_t* a, ray_t* b) {
-    if (a->type == -RAY_I64 || b->type == -RAY_I64) return -RAY_I64;
-    if (a->type == -RAY_I32 || b->type == -RAY_I32) return -RAY_I32;
-    if (a->type == -RAY_U8 || b->type == -RAY_U8) {
-        /* u8 op u8 -> u8, but u8 op i16 -> i16 etc */
-        if (a->type == -RAY_U8 && b->type == -RAY_U8) return -RAY_U8;
-        return (a->type == -RAY_I16 || b->type == -RAY_I16) ? -RAY_I16 : -RAY_I64;
-    }
-    if (a->type == -RAY_I16 || b->type == -RAY_I16) return -RAY_I16;
-    return -RAY_I64;
+/* Return a typed null for the promoted result type of two operands */
+static inline ray_t* null_for_promoted(ray_t* a, ray_t* b) {
+    return ray_typed_null(arith_atom_type(a, b));
 }
 
 /* Create a result atom of the given type from an int64_t value */

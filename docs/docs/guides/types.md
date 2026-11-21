@@ -43,7 +43,10 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 
 F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
 Scientific notation keeps its exponent: `1e3` is F64, while `1e3e` is F32.
-F32 vectors require a suffix on each non-null element: `[1e 2e 0Ne]`.
+An F32 vector is written with a suffix on each element, `[1e 2e 0Ne]`, or
+with one final suffix that types the whole literal, `[1 2.5 0N 3e]`; `h` and
+`i` work the same way for I16 and I32 (`[1 2 3h]`). See
+[Typed vector literals](../language/syntax.md#typed-vector-literals).
 Finite values beyond the F32 range saturate just as casts do. F32 values
 print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.
@@ -184,10 +187,12 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 
 !!! note "Coercion rules"
 
-    - **i64 + f64 → f64:** Arithmetic between integers and floats promotes to float.
-    - **f32 op f32 → f32:** `+ - * %` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with an i64, i32, or f64 operand widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
+    - **One promotion table:** `+ - * div %` and the two-argument `min` and `max` take their result type from the operand types alone, the same for atoms, vectors and `select` / `update` columns, and the same with the operands swapped. The order is **b8 < u8 < i16 < i32 < i64 < f32 < f64** and the wider type wins: `(+ 2h 3i)` is i32, `(+ 1 2.0)` is f64, `(+ true 0xff)` is u8.
+    - **Same width keeps the width:** two operands of one integer type give that type, and the result wraps there as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`, `(* 50000i 50000i)` is `-1794967296`. Cast an operand first (`(* (as 'I64 x) x)`) to compute wider. A query computes the same values: `(select {r: (* x x) from: t})` over an i16 column is an i16 column. For i16, i32 and i64, the minimum value is the null sentinel, so a result that wraps exactly onto it is that null: `(+ 32767h 1h)` is `0Nh`. A vector reports such a cell as null only when the vector is marked as possibly holding nulls, as i64 always has: `(nil? (+ [2147483647i 5i] [1i 0i]))` is `[false false]`, but `(nil? (+ [2147483647i 5i 0Ni] [1i 0i 0i]))` is `[true false true]`. With the mark set, `fill` and the aggregates treat the cell as missing. Cast to a wider type first when a result can reach the minimum.
+    - **f32 op f32 → f32:** `+ - * div % min max` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with any other type, integer or f64, widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
+    - **b8 with b8:** `+ - * div %` of two booleans give i64 (`(+ true true)` is `2`); `min` and `max` of two booleans give b8.
     - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
-    - **bool → i64:** Booleans coerce to 1/0 in arithmetic contexts.
+    - **bool → 1/0:** Booleans count as 1/0 in arithmetic contexts.
     - **i64 → bool:** In boolean contexts (if, cond), 0 is false, non-zero is true.
     - **Narrower → wider:** Comparisons across numeric types promote the narrower operand.
     - **No string coercion:** Strings never implicitly convert to numbers. Use `as` explicitly.
@@ -200,14 +205,26 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 ; f32 stays f32 against f32, widens against anything else
 (type (+ (as 'F32 [1.5 2.5]) (as 'F32 [1.0 1.0])))  ; 'F32
 (type (+ (as 'F32 [1.5 2.5]) 1))                    ; 'F64
+(type (min (as 'F32 2.5) 1))                        ; 'f64
 (* 3e38e 3e38e)                                     ; 0Ne
 (type (min (as 'F32 [1.5 2.5])))                    ; 'f32
 (type (sum (as 'F32 [1.5 2.5])))                    ; 'f64
 (mins (as 'F32 [2.5 -3.5 0Nf 1.25]))                ; [2.5e -3.5e -3.5e -3.5e]
 (fill 0.0 (as 'F32 [2.5 0Nf]))                      ; [2.5e 0.0e]
 
+; The wider type wins, whichever side it is on
+(type (+ [1h 2h] [3i 4i]))  ; 'I32
+(type (+ [3i 4i] [1h 2h]))  ; 'I32
+(type (div 7i 2h))          ; 'i32
+(div 7.5 2.0)               ; 3.0
+
+; Same width keeps the width and wraps
+(+ 0xff 0x01)            ; 0x00
+(* 300h 300h)            ; 24464
+
 ; Boolean in arithmetic
 (+ 10 true)              ; 11
+(+ true true)            ; 2
 (sum [true false true])   ; 2
 
 ; Boolean context

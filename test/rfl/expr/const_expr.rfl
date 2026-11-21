@@ -46,10 +46,10 @@
 ;; At line 111: l_is_f64=true → F64 branch fires.
 ;; Line 120: case OP_IDIV: r = rv!=0.0 ? floor(lv/rv) : NAN → floor(10.0/3)=3.0.
 ;; const_expr_to_i64: c_is_f64=true → declines the linear plan; the
-;; evaluator applies the builtin, whose (div 10.0 3) is the I64 3.
-;; sum(x * 3) = 45.
+;; evaluator applies the builtin, whose (div 10.0 3) is the F64 3.0
+;; (div of a float is a float, #972).  sum(x * 3.0) = 45.0.
 ;; ===================================================================
-(select {s: (sum (* x (div 10.0 3))) from: Tce}) -- (table [s] (list [45]))
+(select {s: (sum (* x (div 10.0 3))) from: Tce}) -- (table [s] (list [45.0]))
 
 ;; ===================================================================
 ;; linear_expr_scale k=1: covers the early-return branch at line 208
@@ -83,14 +83,14 @@
 ;; at isfinite check (line 169: !isfinite(NaN) → return false → fallback)
 ;; 0.0/0.0 = NaN; x*NaN = NaN for all x; sum([NaN...]) = 0 (nulls ignored)
 ;; ===================================================================
-(select {s: (sum (* x (div 0.0 0.0))) from: Tce}) -- (table [s] (list [0]))
+(select {s: (sum (* x (div 0.0 0.0))) from: Tce}) -- (table [s] (list [0.0]))
 
 ;; ===================================================================
 ;; Inf additive constant → try_affine_sumavg_input rejects at isfinite
 ;; check (line 377: !isfinite(Inf) → return false → fallback)
 ;; sum(x + Inf) = sum([Inf,Inf,...]) = 0 (NaN/Inf collapsed to null)
 ;; ===================================================================
-(select {s: (sum (+ x (div 1.0 0.0))) from: Tce}) -- (table [s] (list [0]))
+(select {s: (sum (+ x (div 1.0 0.0))) from: Tce}) -- (table [s] (list [0.0]))
 
 ;; ===================================================================
 ;; Fractional additive constant → try_affine_sumavg_input rejects at
