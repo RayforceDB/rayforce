@@ -485,40 +485,146 @@ static ray_op_t* dag_temporal_mod(ray_graph_t* g, const char* name, size_t len,
     return ray_cast(g, m, lt);
 }
 
-/* A comparison between a temporal and a float has no meaning — the eval
- * path rejects it (`cannot compare timestamp and f64`, cmp.c).  The DAG
- * kernel promoted both sides to double, where a TIMESTAMP near 2024 has a
- * 128 ns ULP: against the F64 mean of the column, (> ts (avg ts)) read
- * every row as equal to the mean (#694).  Integer scalars stay on the
- * exact int64 kernel, as they always did. */
-static bool dag_cmp_rejects_temporal_float(const char* fname, size_t fname_len,
-                                           int8_t lt, int8_t rt) {
-    bool cmp = (fname_len == 1 && (fname[0] == '>' || fname[0] == '<')) ||
-               (fname_len == 2 && fname[1] == '=' &&
-                (fname[0] == '>' || fname[0] == '<' ||
-                 fname[0] == '=' || fname[0] == '!'));
-    if (!cmp) return false;
-    if (RAY_IS_PARTED(lt)) lt = (int8_t)RAY_PARTED_BASETYPE(lt);
-    if (RAY_IS_PARTED(rt)) rt = (int8_t)RAY_PARTED_BASETYPE(rt);
-    bool lf = lt == RAY_F64 || lt == RAY_F32;
-    bool rf = rt == RAY_F64 || rt == RAY_F32;
-    return (dag_type_is_temporal(lt) && rf) || (lf && dag_type_is_temporal(rt));
+/* The kind of a comparison operand, for the type rule the builtins apply
+ * (cmp.c): 0 for a type the rule has no say on (LIST, a partition key's
+ * wrapper, ...).  A string literal is its own kind: a query reads it as a
+ * symbol, so it meets a SYM column as well as a STR one. */
+enum { CK_NUM = 1, CK_DATE, CK_CLOCK, CK_SPAN, CK_GUID, CK_SYM, CK_STR, CK_TEXT };
+
+static int dag_cmp_kind(ray_graph_t* g, ray_op_t* x, int8_t t) {
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64:   return CK_NUM;
+    case RAY_DATE:                return CK_DATE;
+    case RAY_TIME: case RAY_TIMESTAMP: return CK_CLOCK;
+    case RAY_TIMESPAN:            return CK_SPAN;
+    case RAY_GUID:                return CK_GUID;
+    case RAY_STR:                 return CK_STR;
+    case RAY_SYM: {
+        if (x->opcode != OP_CONST) return CK_SYM;
+        ray_op_ext_t* ext = find_ext(g, x->id);
+        return ext && ext->literal && ext->literal->type == -RAY_STR ? CK_TEXT : CK_SYM;
+    }
+    default:                      return 0;
+    }
 }
 
-/* A column operand of `and` / `or` must be boolean: the kernel read an I64
- * column by its bytes, so `(and x (> y 2))` kept rows a where: on `x`
- * alone rejects (#678).  A literal keeps its scalar truth value, as a
- * where: scalar does.  Sets compile_err and returns false on a bad operand. */
+static bool dag_cmp_kinds_ok(int a, int b) {
+    if (a > b) { int t = a; a = b; b = t; }
+    switch (a) {
+    case CK_NUM:   return b == CK_NUM || b == CK_SPAN;
+    case CK_DATE:  return b == CK_DATE || b == CK_CLOCK;
+    case CK_CLOCK: return b == CK_CLOCK || b == CK_SPAN;
+    case CK_SPAN:  return b == CK_SPAN;
+    case CK_GUID:  return b == CK_GUID;
+    case CK_SYM:   return b == CK_SYM || b == CK_TEXT;
+    case CK_STR:   return b == CK_STR || b == CK_TEXT;
+    default:       return true;   /* CK_TEXT against CK_TEXT */
+    }
+}
+
+static bool dag_const_is_atom(ray_graph_t* g, ray_op_t* x) {
+    if (x->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    return ext && ext->literal && ray_is_atom(ext->literal);
+}
+
+static bool dag_const_is_null(ray_graph_t* g, ray_op_t* x) {
+    if (x->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    return ext && ext->literal && (RAY_IS_NULL(ext->literal) ||
+           (ray_is_atom(ext->literal) && RAY_ATOM_IS_NULL(ext->literal)));
+}
+
+/* A comparison the builtins reject is rejected in a query too, with their
+ * message (#974).  The DAG kernels compare the stored values, so a DATE
+ * against an integer compared day counts, a SYM ordered against a number
+ * compared intern ids (#768), and a TIMESTAMP against the F64 mean of its
+ * column lost the ns digits (#694).  The rule, as in cmp.c: a number
+ * (B8 to F64) meets a number or a TIMESPAN; DATE meets DATE, TIME and
+ * TIMESTAMP; TIME and TIMESTAMP also meet TIMESPAN; GUID, SYM and STR
+ * each meet their own kind, and a string literal both text kinds (the one
+ * place a query is looser: it reads the literal as a symbol).  `==`
+ * and `!=` against a null literal answer without looking at its type, as
+ * the builtins do.  Sets compile_err and returns false on a bad pair. */
+static bool dag_cmp_operands_ok(ray_graph_t* g, const char* fname, size_t fname_len,
+                                ray_op_t* l, ray_op_t* r, int8_t lt, int8_t rt) {
+    bool eq = fname_len == 2 && fname[1] == '=' && (fname[0] == '=' || fname[0] == '!');
+    bool ord = (fname_len == 1 && (fname[0] == '>' || fname[0] == '<')) ||
+               (fname_len == 2 && fname[1] == '=' && (fname[0] == '>' || fname[0] == '<'));
+    if (!eq && !ord) return true;
+    int lk = dag_cmp_kind(g, l, lt), rk = dag_cmp_kind(g, r, rt);
+    if (!lk || !rk || dag_cmp_kinds_ok(lk, rk)) return true;
+    bool span = lk == CK_SPAN || rk == CK_SPAN;
+    if (eq && !span && (dag_const_is_null(g, l) || dag_const_is_null(g, r)))
+        return true;
+    if (g->compile_err) return false;
+    if (RAY_IS_PARTED(lt)) lt = (int8_t)RAY_PARTED_BASETYPE(lt);
+    if (RAY_IS_PARTED(rt)) rt = (int8_t)RAY_PARTED_BASETYPE(rt);
+    if (lk == CK_TEXT) lt = RAY_STR;
+    if (rk == CK_TEXT) rt = RAY_STR;
+    /* A TIMESPAN pair is ray_timespan_binary's error, which names a
+     * vector operand by its vector type and a literal by its atom type. */
+    if (span) {
+        g->compile_err = ray_error("type", "duration operation is not defined for %s and %s",
+            ray_type_name(dag_const_is_atom(g, l) ? (int8_t)-lt : lt),
+            ray_type_name(dag_const_is_atom(g, r) ? (int8_t)-rt : rt));
+        return false;
+    }
+    const char* ln = ray_type_name((int8_t)-lt);
+    const char* rn = ray_type_name((int8_t)-rt);
+    g->compile_err = eq
+        ? ray_error("type", "%s: incomparable operand types, got %s and %s",
+                    fname[0] == '=' ? "=" : "<>", ln, rn)
+        : ray_error("type", "cannot compare %s and %s", ln, rn);
+    return false;
+}
+
+/* `and` / `or` read each operand by its truth value, as the builtins do
+ * (is_truthy): zero, null and NaN are false, any other number or temporal
+ * true; a symbol, string or GUID is true unless null.  The AND/OR kernels
+ * read BOOL bytes, so a non-boolean column is lowered to a mask first:
+ * `(not (not x))` for a number or temporal, `(not (nil? x))` for text and
+ * GUID.  Reading the raw cells instead is what kept rows a where: on `x`
+ * alone rejects (#678).  A BOOL operand is passed through untouched, and
+ * an atom literal becomes the BOOL constant of its truth value.  A
+ * partition key's wrapper goes to the evaluator (NULL, no error); any
+ * other type sets compile_err.  Returns the operand to combine, or NULL. */
 static int8_t dag_operand_type(ray_graph_t* g, ray_op_t* x);
 
-static bool dag_bool_operand_ok(ray_graph_t* g, ray_op_t* a, bool is_and) {
+static ray_op_t* dag_bool_operand(ray_graph_t* g, ray_op_t* a, bool is_and) {
     int8_t t = dag_operand_type(g, a);
-    if (a->opcode == OP_CONST || t <= 0 || t == RAY_BOOL)
-        return true;
-    if (!g->compile_err)
-        g->compile_err = ray_error("type", "%s: operand must be boolean, got %s",
-                                   is_and ? "and" : "or", ray_type_name(t));
-    return false;
+    if (t == RAY_BOOL) return a;
+    if (a->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, a->id);
+        ray_t* lit = ext ? ext->literal : NULL;
+        if (!lit || !(RAY_IS_NULL(lit) || ray_is_atom(lit)) || lit->type == -RAY_BOOL)
+            return a;
+        return ray_const_bool(g, is_truthy(lit));
+    }
+    if (t <= 0) return a;
+    if (t != a->out_type) return NULL;
+    int8_t bt = RAY_IS_PARTED(t) ? (int8_t)RAY_PARTED_BASETYPE(t) : t;
+    switch (bt) {
+    case RAY_BOOL:
+        return a;
+    case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
+    case RAY_TIMESTAMP: case RAY_TIMESPAN: {
+        ray_op_t* n = ray_not(g, a);
+        return n ? ray_not(g, n) : NULL;
+    }
+    case RAY_SYM: case RAY_STR: case RAY_GUID: {
+        ray_op_t* n = ray_isnull(g, a);
+        return n ? ray_not(g, n) : NULL;
+    }
+    default:
+        if (!g->compile_err)
+            g->compile_err = ray_error("type", "%s: operand must be boolean, got %s",
+                                       is_and ? "and" : "or", ray_type_name(t));
+        return NULL;
+    }
 }
 
 static bool dag_unary_numeric_name(const char* name, size_t len) {
@@ -2471,7 +2577,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 for (int64_t i = 0; i < k; i++) {
                     ray_op_t* a = compile_expr_dag(g, elems[i + 1]);
                     if (!a) return NULL;
-                    if (!dag_bool_operand_ok(g, a, is_and)) return NULL;
+                    a = dag_bool_operand(g, a, is_and);
+                    if (!a) return NULL;
                     arg_ids[i] = a->id;
                 }
                 dag_binary_ctor ctor = is_and ? ray_and : ray_or;
@@ -2545,10 +2652,15 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 if (!right) right = compile_expr_dag(g, elems[2]);
                 if (!right) return NULL;
                 left = &g->nodes[left_id];
-                if ((ctor == ray_and || ctor == ray_or) &&
-                    (!dag_bool_operand_ok(g, left, ctor == ray_and) ||
-                     !dag_bool_operand_ok(g, right, ctor == ray_and)))
-                    return NULL;
+                if (ctor == ray_and || ctor == ray_or) {
+                    uint32_t right_id = right->id;
+                    left = dag_bool_operand(g, left, ctor == ray_and);
+                    if (!left) return NULL;
+                    left_id = left->id;
+                    right = dag_bool_operand(g, &g->nodes[right_id], ctor == ray_and);
+                    if (!right) return NULL;
+                    left = &g->nodes[left_id];
+                }
                 int8_t lvt = dag_operand_type(g, left);
                 int8_t rvt = dag_operand_type(g, right);
                 if (dag_temporal_arith_needs_eval(fname, fname_len, lvt, rvt))
@@ -2563,13 +2675,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     return NULL;
                 }
                 if (g->if_arm_depth == 0 &&
-                    dag_cmp_rejects_temporal_float(fname, fname_len, lvt, rvt)) {
-                    if (!g->compile_err)
-                        g->compile_err = ray_error("type", "cannot compare %s and %s",
-                            ray_type_name((int8_t)-lvt),
-                            ray_type_name((int8_t)-rvt));
+                    !dag_cmp_operands_ok(g, fname, fname_len, left, right, lvt, rvt))
                     return NULL;
-                }
                 if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
                     (!dag_pow_type_admitted(left->out_type) ||
                      !dag_pow_type_admitted(right->out_type)))
@@ -14093,8 +14200,9 @@ static bool count_cmp_parse(ray_t* tbl, ray_t* e, count_cmp_op_t* op_out,
 }
 
 /* The literal suits the compare of a `type` column, as the single-compare
- * count reads it: an integer, BOOL or temporal column takes an integer or
- * temporal literal (no float; a temporal of another type only on TIMESTAMP),
+ * count reads it: an integer or BOOL column takes an integer literal, a
+ * temporal column a temporal one (a temporal of another type only on
+ * TIMESTAMP), a TIMESPAN column an integer (never a float literal),
  * a SYM column a symbol under == / != only (#738).  `float_ok` also admits a
  * numeric literal on an F32 / F64 column (the conjunction whitelist; the
  * single-compare kernel has no float compare). */
@@ -14104,6 +14212,12 @@ static bool count_cmp_types_ok(int8_t type, count_cmp_op_t op, ray_t* rhs, bool 
     case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
         if (!is_numeric(rhs) && !is_temporal(rhs)) return false;
         if (rhs->type == -RAY_F64 || rhs->type == -RAY_F32) return false;
+        /* An integer against a DATE / TIME / TIMESTAMP, either way round,
+         * is the builtins' type error, not a compare of the stored counts
+         * (#974): the select raises it. */
+        if (type != RAY_TIMESPAN &&
+            (type == RAY_DATE || type == RAY_TIME || type == RAY_TIMESTAMP) != !!is_temporal(rhs))
+            return false;
         if (is_temporal(rhs) && rhs->type != -type && type != RAY_TIMESTAMP) return false;
         return true;
     case RAY_SYM:
@@ -20733,6 +20847,9 @@ by_dict_done:
                      * evaluate over a far smaller rowsel. */
                     for (int64_t i = 0; i < k && all_ok; i++) {
                         ray_op_t* p = compile_expr_dag(g, elems[i + 1]);
+                        /* A conjunct is an `and` operand: by truthiness. */
+                        if (p && p->opcode != OP_CONST)
+                            p = dag_bool_operand(g, p, true);
                         if (!p || p->opcode == OP_CONST ||
                             !ray_expr_subset_invariant(g, p->id)) {
                             all_ok = 0;
