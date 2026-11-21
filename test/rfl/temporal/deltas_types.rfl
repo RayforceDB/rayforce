@@ -6,10 +6,11 @@
 (nil? (deltas t)) -- [true false true true]
 
 (set tm (enlist 09:30:00.000 10:30:00.000 12:00:00.000))
-(type (deltas tm)) -- 'TIME
-(type (- (at tm 1) (at tm 0))) -- 'time
-(as 'I64 (at (deltas tm) 1)) -- 3600000
-(as 'I64 (at (deltas tm) 2)) -- 5400000
+(type (deltas tm)) -- 'TIMESPAN
+(type (- (at tm 1) (at tm 0))) -- 'timespan
+(as 'I64 (at (deltas tm) 1)) -- 3600000000000
+(as 'I64 (at (deltas tm) 2)) -- 5400000000000
+(deltas tm) -- (- tm (lag tm))
 (nil? (deltas tm)) -- [true false false]
 
 (set dt (enlist 2024.01.02 2024.01.05 2024.01.04))
