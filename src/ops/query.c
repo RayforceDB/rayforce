@@ -1263,7 +1263,8 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                     }
                 }
             } else if (tv) {
-                ray_release(tv);
+                /* an error (a cancel) is answered by the take below */
+                if (RAY_IS_ERR(tv)) ray_error_free(tv); else ray_release(tv);
             }
         }
     }
@@ -4650,7 +4651,9 @@ static bool match_group_count_emit_filter(ray_t* from_expr, ray_t* where_expr,
 static bool positive_take_i64(ray_t* expr, int64_t* out) {
     if (!expr) return false;
     ray_t* v = ray_eval(expr);
-    if (!v || RAY_IS_ERR(v)) return false;
+    /* an error (a cancel among them) is the select's to report: it reads
+     * take: again on the route it goes on to */
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return false; }
     bool ok = false;
     int64_t n = 0;
     if (v->type == -RAY_I64) { n = v->i64; ok = n > 0; }
