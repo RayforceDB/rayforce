@@ -4550,6 +4550,11 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         { "q: (if (< a 8) a 0) r: (if (> a 11992) b a)", "(> date 2024.01.03)", 0, true },
         { "a: a q: (if (< a 8) a 0)", "(>= date 2024.01.01)", 9000, false },
         { "a: a q: (if (< a 8) a 0) take: 5", "(== date 2024.01.02)", 5, false },
+        /* an IF operand in where: (#1181) */
+        { "a: a", "(and (== date 2024.01.02) (> (if (< a 8) b a) 10))", 2997, true },
+        { "a: a b: b", "(and (== date 2024.01.02) (== (if (< a 8) a b) (if (> a 4) b a)))", 3000, true },
+        { "a: a", "(and (>= date 2024.01.02) (> (if (< a 8) b a) 10))", 5994, true },
+        { "a: a", "(and (== date 2024.01.02) (> (if (< a 8) b (sum a)) 10))", 2998, false },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];
@@ -4774,16 +4779,21 @@ static test_result_t test_select_parted_prunes_if_limits(void) {
  * agree, nulls (an F64 NaN is null) and symbols outside the root's domain
  * included; mixed I64/F64 branches keep the full source. */
 static test_result_t test_select_parted_prunes_if_f64_sym(void) {
-    static const struct { const char* output; bool pruned; } cases[] = {
-        { "q: (if (>= px 1.0) qty 0)", true },
-        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true },
-        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true },
-        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true },
-        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true },
-        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true },
-        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true },
-        { "q: (if (> qty 2) px qty)", false },
-        { "by: g n: (sum (if (> qty 2) px qty))", false },
+    static const struct { const char* output; bool pruned; const char* pred; } cases[] = {
+        { "q: (if (>= px 1.0) qty 0)", true, NULL },
+        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true, NULL },
+        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true, NULL },
+        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true, NULL },
+        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true, NULL },
+        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true, NULL },
+        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true, NULL },
+        { "q: (if (> qty 2) px qty)", false, NULL },
+        { "by: g n: (sum (if (> qty 2) px qty))", false, NULL },
+        /* an IF operand in where: */
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) 'A 'B) 'B))" },
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) act side) 'New))" },
+        { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))" },
+        { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))" },
     };
     for (int gen = 0; gen < 2; gen++) {
         char root[256], sym_path[512];
@@ -4808,11 +4818,12 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
         TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
         sp_bind(t);
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-            char q[768], ref[1024];
-            snprintf(q, sizeof q, "(xasc (select {from: t where: (== date 2024.01.02) %s}) (key (select {from: t where: (== date 2024.01.02) %s})))",
-                     cases[i].output, cases[i].output);
-            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or (== date 2024.01.02) (== date 2024.01.02)) %s}) (key (select {from: t where: (or (== date 2024.01.02) (== date 2024.01.02)) %s})))",
-                     cases[i].output, cases[i].output);
+            char q[1024], ref[1536];
+            const char* pred = cases[i].pred ? cases[i].pred : "(== date 2024.01.02)";
+            snprintf(q, sizeof q, "(xasc (select {from: t where: %s %s}) (key (select {from: t where: %s %s})))",
+                     pred, cases[i].output, pred, cases[i].output);
+            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or %s %s) %s}) (key (select {from: t where: (or %s %s) %s})))",
+                     pred, pred, cases[i].output, pred, pred, cases[i].output);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
 #endif
@@ -4827,7 +4838,8 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
             structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
 #endif
             bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
-                          ray_table_nrows(r) == (strstr(cases[i].output, "by:") ? 2 : 8) && sp_same(r, u);
+                          (cases[i].pred || ray_table_nrows(r) == (strstr(cases[i].output, "by:") ? 2 : 8)) &&
+                          sp_same(r, u);
             drop_out(r); drop_out(u);
             if (!values || !structure) {
                 sp_bind(NULL); ray_release(t);
