@@ -371,9 +371,11 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
         return (b->type == -RAY_U8 || rt == -RAY_U8) ? make_typed_int(rt, 0)
                                                      : ray_typed_null(rt);
 
-    int64_t q = av / bv;
-    if ((av ^ bv) < 0 && q * bv != av) q--;  /* floor division */
-    return make_typed_int(rt, av - bv * q);
+    /* Floor modulo without the av - bv*q product, which can overflow
+     * (INT64_MIN is the null, so av % -1 never traps here). */
+    int64_t r = av % bv;
+    if (r != 0 && ((r ^ bv) < 0)) r += bv;
+    return make_typed_int(rt, r);
 }
 
 ray_t* ray_neg_fn(ray_t* x) {

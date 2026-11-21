@@ -67,9 +67,10 @@ integer (floor) division.
 ### `(% a b)` — atomic
 
 Modulo: `a - b * floor(a / b)`, so the result takes the sign of `b`. The
-result type comes from the [table above](#result-types); a zero divisor
-gives null, except where the divisor or the result is u8, which has no null
-and gives `0`.
+result type comes from the [table above](#result-types). A zero divisor
+gives null, with one exception kept from u8 byte modulo: an integer result
+with a u8 divisor (or a u8 result) gives `0`. A float result of a zero
+divisor is always null: `(% 7.5 0x00)` is `0Nf`.
 
 ```lisp
 (% 10 3)  ; 1
@@ -84,7 +85,9 @@ and gives `0`.
 Floor division: the largest integer not above `a / b`. The result type
 comes from the [table above](#result-types), so integers stay integers of
 the wider operand's width and a float operand gives a float. A zero divisor
-gives null, or `0` for a u8 result.
+gives null, or `0` for a u8 result, which has no null. Unlike `%`, a u8
+divisor alone does not make it `0`: `(div 7 0x00)` is `0Nl`, while
+`(% 7 0x00)` is `0`.
 
 ```lisp
 (div 7 2)  ; 3

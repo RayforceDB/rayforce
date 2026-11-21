@@ -26744,6 +26744,23 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
          * low bytes, so bucket->i64 of an I16/I32 -7 is 65529/4294967289. */
         int64_t b = as_i64(bucket);
         if (b == 0) return ray_error("domain", "xbar: bucket size must be non-zero");
+        /* An integer column takes the promotion table's type with the
+         * bucket (#972), as the atom and the query lowering do: widen the
+         * column first (a temporal column keeps its type). */
+        if (col->type == RAY_I32 || col->type == RAY_I16) {
+            int8_t wt = ray_arith_type(col->type, (int8_t)-bucket->type);
+            if (wt != col->type) {
+                const char* nm = ray_type_name(wt);
+                ray_t* ts = ray_sym(ray_sym_intern(nm, strlen(nm)));
+                if (!ts || RAY_IS_ERR(ts)) return ts ? ts : ray_error("oom", NULL);
+                ray_t* w = ray_cast_fn(ts, col);
+                ray_release(ts);
+                if (!w || RAY_IS_ERR(w)) return w ? w : ray_error("oom", NULL);
+                ray_t* r = ray_xbar_fn(w, bucket);
+                ray_release(w);
+                return r;
+            }
+        }
         if (!xbar_bucket_fits_vec_type(col->type, b))
             return atomic_map_binary(ray_xbar_fn, col, bucket);
         int64_t n = col->len;
