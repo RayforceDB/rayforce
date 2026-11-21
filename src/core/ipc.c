@@ -775,6 +775,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     }
 
     ray_t* result = NULL;
+    bool hook_failed = false;
     bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
         if (msg->type == RAY_LIST) {
@@ -805,6 +806,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
                 fprintf(stderr, "ipc: .ipc.on.async hook raised an error\n");
                 ray_error_free(result);   /* an error object is not reference counted */
                 result = NULL;
+                hook_failed = true;              /* still an error to a transaction */
             }
         } else if (msg->type == -RAY_STR) {
             const char* str  = ray_str_ptr(msg);
@@ -840,7 +842,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     if (result && ray_is_lazy(result))
         result = ray_lazy_materialize(result);  /* consumes the retain */
 
-    g_eval_failed = result && RAY_IS_ERR(result);   /* before any wrapping hides it */
+    g_eval_failed = hook_failed || (result && RAY_IS_ERR(result));   /* before any wrapping hides it */
 
     /* The durability line: what this message changed reaches the log
      * before its reply leaves.  A change that cannot be logged is in memory

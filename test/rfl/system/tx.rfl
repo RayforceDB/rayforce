@@ -89,6 +89,20 @@
 (.ipc.send h2 "n") -- 1
 (.ipc.close h2)
 
+;; an async message has no reply to carry its error, and ends it all the same
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(.ipc.post h "(no_such_function 1)")
+(.ipc.send h "(set n 8)") !- tx
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+;; and one that succeeds is part of the transaction
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.post h "(set n 7)")
+(.ipc.send h "n") -- 7
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+
 ;; a second begin is such an error
 (nil? (.ipc.send h "(.tx.begin)")) -- true
 (.ipc.send h "(set n 7)") -- 7
