@@ -171,3 +171,22 @@
 (at (select {r: (sum (- a b)) by: k from: D}) 'r) -- (* 2 (at (select {r: (sum (- a b)) by: k from: S}) 'r))
 (select {d: (+ a b) from: D}) !- type
 (.sys.exec "rm -rf /tmp/rfl_time_point_store") -- 0
+
+;; ─── with `time` and `trunc` (#1225): time-of-day offsets are durations ─────
+(set tsv (enlist 2024.03.06D09:30:00.123456789 2024.03.06D12:45:10.500000000))
+(- (time tsv) 09:00:00.000) -- (enlist 0D00:30:00.123 0D03:45:10.500)
+(- (time tsv) (trunc 'hour (time tsv))) -- (enlist 0D00:30:00.123 0D00:45:10.500)
+(+ (trunc 'hour (time tsv)) 0D00:30:00) -- (enlist 09:30:00.000 12:30:00.000)
+(set TS (table [ts] (list tsv)))
+(type (at (select {d: (- ts.time 09:00:00.000) from: TS}) 'd)) -- 'TIMESPAN
+(at (select {d: (- ts.time 09:00:00.000) from: TS}) 'd) -- (- (time tsv) 09:00:00.000)
+(type (at (select {d: (deltas ts.time) from: TS}) 'd)) -- 'TIMESPAN
+
+;; ─── a TIMESPAN vector with a TIME atom, and span - TIME over vectors ──────
+(set sv (enlist 0D01:00:00 0Nn 0D00:00:00.0015 (as 'TIMESPAN 2147483648000000) -0D02:00:00))
+(+ 10:00:00.000 sv) -- (enlist 11:00:00.000 0Nt 10:00:00.001 0Nt 08:00:00.000)
+(- 10:00:00.000 sv) -- (enlist 09:00:00.000 0Nt 09:59:59.998 (as 'TIME -2111483648) 12:00:00.000)
+(- sv 10:00:00.000) -- (enlist -09:00:00.000 0Nt -09:59:59.999 (as 'TIME 2111483648) -12:00:00.000)
+(+ sv 10:00:00.000) -- (+ 10:00:00.000 sv)
+(- 0D12:00:00 (enlist 10:00:00.000 0Nt 23:00:00.000)) -- (enlist 02:00:00.000 0Nt -11:00:00.000)
+(- sv (enlist 10:00:00.000 10:00:00.000 0Nt 00:00:00.000 01:00:00.000)) -- (enlist -09:00:00.000 0Nt 0Nt 0Nt -03:00:00.000)
