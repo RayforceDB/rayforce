@@ -40,6 +40,7 @@
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
 #include "core/qmeasure.h" /* shared per-query worker lifecycle */
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
+#include "lang/callprof.h" /* per-call-site profiler */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
 #include "store/col.h"    /* ray_col_want_rows — gather read-ahead */
@@ -3673,6 +3674,17 @@ static bool vm_text_value(const ray_t* v) {
     return v->type == RAY_SYM || v->type == RAY_STR || v->type == -RAY_SYM || v->type == -RAY_STR;
 }
 
+/* A unary builtin applied by compiled code to `arg` (borrowed). */
+static inline ray_t* vm_apply_unary(ray_t* fn_obj, ray_t* arg) {
+    ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+    if (RAY_UNLIKELY(RAY_IS_NULL(arg)))
+        return (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
+               ? fn(arg) : ray_error("type", NULL);
+    if ((fn_obj->attrs & RAY_FN_ATOMIC) && arg->type >= 0)
+        return atomic_map_unary(fn, arg);
+    return fn(arg);
+}
+
 /* A binary builtin applied by compiled code.  Consumes `left` and `right`;
  * `left_rows`/`right_rows` are their row-provenance flags and `*out_rows`
  * receives the result's.  Returns an owned result or error. */
@@ -3721,6 +3733,42 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     }
     ray_release(left);
     ray_release(right);
+    return result;
+}
+
+/* The calls above, timed by the call profiler under the running lambda
+ * `self` and the call's offset `ip`.  Out of line: the dispatch loop pays
+ * only the test of the profiler flag. */
+static __attribute__((noinline))
+ray_t* vm_prof_unary(ray_t* fn_obj, ray_t* arg, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = vm_apply_unary(fn_obj, arg);
+    ray_callprof_exit(frame);
+    return result;
+}
+
+static __attribute__((noinline))
+ray_t* vm_prof_binary(ray_t* fn_obj, ray_t* left, ray_t* right, uint8_t left_rows,
+                      uint8_t right_rows, uint8_t* out_rows, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, out_rows);
+    ray_callprof_exit(frame);
+    return result;
+}
+
+static __attribute__((noinline))
+ray_t* vm_prof_vary(ray_vary_fn fn, ray_t** args, int64_t n, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = fn(args, n);
+    ray_callprof_exit(frame);
+    return result;
+}
+
+static __attribute__((noinline))
+ray_t* vm_prof_eval(ray_t* ast, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = ray_eval(ast);
+    ray_callprof_exit(frame);
     return result;
 }
 
@@ -4002,6 +4050,92 @@ op_jmpf: {
     DISPATCH();
 }
 
+/* The builtin call handlers, as macros: each opcode's handler and its
+ * profiled twin (the *_prof labels below, reached when the call profiler
+ * is on) differ only in how they apply the builtin.  The twin's entry is
+ * the handler's first test, so the hot handler keeps its own registers. */
+#define VM_CALL1(APPLY) {                                                   \
+    ray_t *arg = POP();                                                     \
+    uint8_t arg_rows = POPPED_ROWS();                                       \
+    ray_t *fn_obj = POP();                                                  \
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
+        ray_release(arg);                                                   \
+        ray_release(fn_obj);                                                \
+        vm_err_obj = ray_error("access", "restricted");                     \
+        goto vm_error;                                                      \
+    }                                                                       \
+    /* Materialise lazy args for non-lazy-aware fns.  arg is an owned ref   \
+     * (POPped from VM stack); ray_lazy_materialize consumes it. */         \
+    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && arg && ray_is_lazy(arg)) {  \
+        arg = ray_lazy_materialize(arg);                                    \
+        if (!arg || RAY_IS_ERR(arg)) {                                      \
+            ray_release(fn_obj);                                            \
+            vm_err_obj = arg ? arg : ray_error("type", NULL);               \
+            goto vm_error;                                                  \
+        }                                                                   \
+    }                                                                       \
+    RAY_ASSERT_VALUE(arg);                                                  \
+    ray_t *result = APPLY;                                                  \
+    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0; \
+    ray_release(arg);                                                       \
+    ray_release(fn_obj);                                                    \
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
+    PUSHR(result, result_rows);                                             \
+    DISPATCH();                                                             \
+}
+
+#define VM_CALL2(APPLY) {                                                   \
+    ray_t *right = POP();                                                   \
+    uint8_t right_rows = POPPED_ROWS();                                     \
+    ray_t *left = POP();                                                    \
+    uint8_t left_rows = POPPED_ROWS();                                      \
+    ray_t *fn_obj = POP();                                                  \
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
+        ray_release(left);                                                  \
+        ray_release(right);                                                 \
+        ray_release(fn_obj);                                                \
+        vm_err_obj = ray_error("access", "restricted");                     \
+        goto vm_error;                                                      \
+    }                                                                       \
+    uint8_t result_rows = 0;                                                \
+    ray_t *result = APPLY;                                                  \
+    ray_release(fn_obj);                                                    \
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
+    PUSHR(result, result_rows);                                             \
+    DISPATCH();                                                             \
+}
+
+#define VM_CALLN(APPLY) {                                                   \
+    uint8_t n = code[ip++];                                                 \
+    if (n > 64) goto vm_error;                                              \
+    ray_t *fn_args[64];                                                     \
+    uint8_t args_rows = 0;                                                  \
+    for (int32_t i = n - 1; i >= 0; i--) {                                  \
+        fn_args[i] = POP();                                                 \
+        args_rows = vrows_join(args_rows, POPPED_ROWS());                   \
+    }                                                                       \
+    ray_t *fn_obj = POP();                                                  \
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
+        for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);            \
+        ray_release(fn_obj);                                                \
+        vm_err_obj = ray_error("access", "restricted");                     \
+        goto vm_error;                                                      \
+    }                                                                       \
+    ray_vary_fn fn = (ray_vary_fn)(uintptr_t)fn_obj->i64;                   \
+    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {                             \
+        ray_t* err = materialize_owned_args(fn_args, n);                    \
+        if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }  \
+    }                                                                       \
+    ray_t *result = APPLY;                                                  \
+    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0; \
+    for (int32_t i = 0; i < n; i++)                                         \
+        ray_release(fn_args[i]);                                            \
+    ray_release(fn_obj);                                                    \
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
+    PUSHR(result, result_rows);                                             \
+    DISPATCH();                                                             \
+}
+
 op_call1r:
     /* A builtin a closure body resolved when it ran: OP_CALL1 while the
      * name still holds a unary builtin, the general call (which reads
@@ -4011,91 +4145,22 @@ op_call1r:
                      RAY_IS_NULL(vm.ps[vm.sp - 1])))
         goto op_callf;
     ip++;
-op_call1: {
-    ray_t *arg = POP();
-    uint8_t arg_rows = POPPED_ROWS();
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        ray_release(arg);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-    ray_t *result;
-    /* Materialise lazy args for non-lazy-aware fns.
-     * arg is an owned ref (POPped from VM stack); ray_lazy_materialize consumes
-     * it internally — no extra ray_release needed here. */
-    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && arg && ray_is_lazy(arg)) {
-        arg = ray_lazy_materialize(arg); /* consumes owned ref; result is new owned ref */
-        if (!arg || RAY_IS_ERR(arg)) {
-            ray_release(fn_obj);
-            vm_err_obj = arg ? arg : ray_error("type", NULL);
-            goto vm_error;
-        }
-    }
-    RAY_ASSERT_VALUE(arg);
-    if (RAY_UNLIKELY(RAY_IS_NULL(arg))) {
-        result = (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
-                 ? fn(arg) : ray_error("type", NULL);
-    } else if ((fn_obj->attrs & RAY_FN_ATOMIC) && arg->type >= 0)
-        result = atomic_map_unary(fn, arg);
-    else
-        result = fn(arg);
-    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0;
-    ray_release(arg);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+op_call1:
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_call1_prof;
+    VM_CALL1(vm_apply_unary(fn_obj, arg))
 
-op_call2r: {
+op_call2r:
     /* OP_CALL2 for a resolved binary builtin, with the same rows in and
      * out as a baked call; the general call when the name holds anything
      * else. */
     if (RAY_UNLIKELY(!vm.ps[vm.sp - 3] || vm.ps[vm.sp - 3]->type != RAY_BINARY)) goto op_callf;
     ip++;
-    ray_t *right = POP();
-    uint8_t right_rows = POPPED_ROWS();
-    ray_t *left = POP();
-    uint8_t left_rows = POPPED_ROWS();
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        ray_release(left);
-        ray_release(right);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    uint8_t result_rows = 0;
-    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_call2_prof;
+    VM_CALL2(vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows))
 
-op_call2: {
-    ray_t *right = POP();
-    uint8_t right_rows = POPPED_ROWS();
-    ray_t *left = POP();
-    uint8_t left_rows = POPPED_ROWS();
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        ray_release(left);
-        ray_release(right);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    uint8_t result_rows = 0;
-    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+op_call2:
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_call2_prof;
+    VM_CALL2(vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows))
 
 op_callnr: {
     /* OP_CALLN for a resolved variadic builtin; the general call when the
@@ -4105,36 +4170,9 @@ op_callnr: {
     goto op_calln;
 }
 
-op_calln: {
-    uint8_t n = code[ip++];
-    if (n > 64) goto vm_error;
-    ray_t *fn_args[64];
-    uint8_t args_rows = 0;
-    for (int32_t i = n - 1; i >= 0; i--) {
-        fn_args[i] = POP();
-        args_rows = vrows_join(args_rows, POPPED_ROWS());
-    }
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    ray_vary_fn fn = (ray_vary_fn)(uintptr_t)fn_obj->i64;
-    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
-        ray_t* err = materialize_owned_args(fn_args, n);
-        if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }
-    }
-    ray_t *result = fn(fn_args, n);
-    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0;
-    for (int32_t i = 0; i < n; i++)
-        ray_release(fn_args[i]);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+op_calln:
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_calln_prof;
+    VM_CALLN(fn(fn_args, n))
 
 op_pathget: {
     /* A dotted name whose head is a local: the head was loaded as the name
@@ -4234,6 +4272,8 @@ op_callf: {
     {
         ray_t *result;
         int8_t lambda_rows = -1;
+        int32_t prof_frame = -1;
+        if (RAY_UNLIKELY(ray_callprof_on())) prof_frame = ray_callprof_enter_vm(vm.fn, ip - 1);
         switch (fn_obj->type) {
         case RAY_UNARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
@@ -4329,6 +4369,7 @@ unary_done:
             result = head_not_callable_error(fn_obj->type);
             break;
         }
+        if (RAY_UNLIKELY(prof_frame >= 0)) ray_callprof_exit(prof_frame);
         uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
             : fn_obj->type == RAY_BINARY ? (uint8_t)(lambda_rows == 1)
             : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_VARY) &&
@@ -4373,7 +4414,7 @@ op_calld: {
     if (n == 0) {
         /* n=0: the AST itself is on the stack, eval it directly */
         ray_t *ast = POP();
-        ray_t *result = ray_eval(ast);
+        ray_t *result = RAY_UNLIKELY(ray_callprof_on()) ? vm_prof_eval(ast, vm.fn, ip - 1) : ray_eval(ast);
         ray_release(ast);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
         PUSHR(result, vrows_from(g_eval_rows));
@@ -4398,7 +4439,8 @@ op_calld: {
     for (int32_t i = 0; i < n; i++)
         elems[i + 1] = fn_args[i];
 
-    ray_t *result = ray_eval(call_list);
+    ray_t *result = RAY_UNLIKELY(ray_callprof_on()) ? vm_prof_eval(call_list, vm.fn, ip - 1)
+                                                    : ray_eval(call_list);
     ray_release(call_list);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, vrows_from(g_eval_rows));
@@ -4699,6 +4741,18 @@ op_scope_end: {
     ray_release(syms);
     DISPATCH();
 }
+
+/* The call handlers' profiled twins (the call profiler is on).  `ip`
+ * is inside the call instruction, which is all the site key needs. */
+op_call1_prof:
+    VM_CALL1(vm_prof_unary(fn_obj, arg, vm.fn, ip - 1))
+op_call2_prof:
+    VM_CALL2(vm_prof_binary(fn_obj, left, right, left_rows, right_rows, &result_rows, vm.fn, ip - 1))
+op_calln_prof:
+    VM_CALLN(vm_prof_vary(fn, fn_args, n, vm.fn, ip - 1))
+#undef VM_CALL1
+#undef VM_CALL2
+#undef VM_CALLN
 
     const char *vm_err_str = "domain";
     const char *vm_err_detail = NULL;
@@ -5433,6 +5487,9 @@ static void ray_register_builtins(void) {
     register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
     register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
     register_vary(".sys.join.par.min",    RAY_FN_RESTRICTED, ray_join_par_min_fn);
+    register_vary(".sys.profile",         RAY_FN_NONE,       ray_callprof_fn);
+    register_vary(".sys.profile.enable",  RAY_FN_RESTRICTED, ray_callprof_enable_fn);
+    register_vary(".sys.profile.reset",   RAY_FN_RESTRICTED, ray_callprof_reset_fn);
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);
@@ -5544,6 +5601,7 @@ ray_err_t ray_lang_init(void) {
 void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
     closure_tmpl_reset();
+    ray_callprof_destroy();
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
     ray_env_destroy();
@@ -5622,6 +5680,7 @@ ray_t* ray_eval(ray_t* obj) {
     ray_prof_span_t* ev_span = NULL;
     const char*      ev_name = NULL;
     int64_t          ev_idx  = -1;
+    int32_t          cp_frame = -1;   /* call profiler frame (lang/callprof.h) */
 
     /* Atoms: return themselves (retain) */
     if (ray_is_atom(obj)) {
@@ -5752,6 +5811,9 @@ ray_t* ray_eval(ray_t* obj) {
             eval_span_payload(ev_span, NULL);
         }
     }
+
+    /* The call profiler times top-level calls by their parsed list. */
+    if (RAY_UNLIKELY(ray_callprof_on())) cp_frame = ray_callprof_enter_node(obj);
 
     switch (head->type) {
         case RAY_UNARY: {
@@ -6056,6 +6118,7 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
 out:
+    if (RAY_UNLIKELY(cp_frame >= 0)) ray_callprof_exit(cp_frame);
     /* Close the direct-builtin span opened before the dispatch switch.
      * ev_span is non-NULL only when profiling is active and we opened one,
      * so error/atom paths (which never reach the switch) skip this. */
