@@ -6048,8 +6048,12 @@ static bool pq_delta_check(const char* fixture, int type, int64_t batch) {
 
 /* The test writer for delta_errors: one REQUIRED column, one DELTA data page
  * whose value stream is the crafted bytes. The page header stays consistent
- * with the file; only the codec stream is malformed. */
-static bool pq_delta_synth_enc(const char* path, int physical, int encoding, const uint8_t* stream, size_t n, int64_t rows) {
+ * with the file; only the codec stream is malformed.  The column takes an
+ * optional DECIMAL annotation (converted type 5): scale and precision, or -1
+ * for an unannotated column. */
+static bool pq_delta_synth_full(const char* path, int physical, int encoding,
+                                int64_t dec_scale, int64_t dec_prec,
+                                const uint8_t* stream, size_t n, int64_t rows) {
     pq_buf f = {0};
     pb_bytes(&f, "PAR1", 4);
     int64_t start = (int64_t)f.n;
@@ -6070,7 +6074,11 @@ static bool pq_delta_synth_enc(const char* path, int physical, int encoding, con
     { int l = 0; pb_i(&f, &l, 3, PB_I32, 0); pb_field(&f, &l, 4, PB_BIN);
       pb_bin(&f, "schema", 6); pb_i(&f, &l, 5, PB_I32, 1); pb_byte(&f, 0); }
     { int l = 0; pb_i(&f, &l, 1, PB_I32, physical); pb_i(&f, &l, 3, PB_I32, 0);
-      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "id", 2); pb_byte(&f, 0); }
+      pb_field(&f, &l, 4, PB_BIN); pb_bin(&f, "id", 2);
+      if (dec_scale >= 0) { pb_i(&f, &l, 6, PB_I32, 5);
+                            pb_i(&f, &l, 7, PB_I32, dec_scale);
+                            pb_i(&f, &l, 8, PB_I32, dec_prec); }
+      pb_byte(&f, 0); }
     pb_i(&f, &last, 3, PB_I64, rows);
     pb_field(&f, &last, 4, PB_LIST); pb_list(&f, 1, PB_STRUCT);
     { int l = 0;
@@ -6098,6 +6106,9 @@ static bool pq_delta_synth_enc(const char* path, int physical, int encoding, con
     if (out && fclose(out)) ok = false;
     ray_sys_free(f.p);
     return ok;
+}
+static bool pq_delta_synth_enc(const char* path, int physical, int encoding, const uint8_t* stream, size_t n, int64_t rows) {
+    return pq_delta_synth_full(path,physical,encoding,-1,-1,stream,n,rows);
 }
 static bool pq_delta_synth(const char* path, int physical, const uint8_t* stream, size_t n, int64_t rows) {
     return pq_delta_synth_enc(path,physical,5,stream,n,rows);
@@ -6385,6 +6396,107 @@ static test_result_t test_pq_delta_dpb_width(void) {
     TEST_ASSERT_TRUE(pq_dpb_width_case("w64", v64, 3, v64));
     PASS();
 }
+/* INT32 DELTA_BINARY_PACKED streams written in 64-bit arithmetic: alternating
+ * values at the INT32 edges give a min delta of -4,294,967,295 and 33-bit
+ * miniblocks, and a header whose first value is 2^31.  Both decode; the
+ * reconstructed values truncate to 32 bits. */
+static test_result_t test_pq_delta_i32_wide(void) {
+    enum { N = 100000 };
+    int64_t* v = ray_alloc_raw((size_t)N*sizeof(*v));
+    TEST_ASSERT_NOT_NULL(v);
+    for (int i = 0; i < N; i++) v[i] = (i & 1) ? INT32_MAX : INT32_MIN;
+    pq_buf s = {0}; pq_dpb_write(&s, v, N);
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-i32wide-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_delta_synth(path, 1, s.p, s.n, N));
+    ray_sys_free(s.p);
+    ray_t* t = ray_parquet_read(path, NULL);
+    TEST_ASSERT_TRUE(t != NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), N);
+    ray_t* col = ray_table_get_col_idx(t, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_I32);
+    {
+        const int32_t* got = (const int32_t*)ray_data(col);
+        int bad = 0, first = -1;
+        for (int i = 0; i < N; i++) if (got[i] != (int32_t)v[i]) { if (!bad) first = i; bad++; }
+        if (bad) fprintf(stderr, "  i32 wide: %d rows differ, first %d: %d\n", bad, first, (int)got[first]);
+        TEST_ASSERT_EQ_I(bad, 0);
+    }
+    ray_release(t);
+    unlink(path);
+    /* A block min delta outside int32: the second value is 0 + 2^31. */
+    pq_buf h = {0};
+    pq_delta_head(&h, 2); pb_zz(&h, INT64_C(2147483648));
+    pb_byte(&h, 0); pb_byte(&h, 0); pb_byte(&h, 0); pb_byte(&h, 0);
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-i32delta-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_delta_synth(path, 1, h.p, h.n, 2));
+    ray_sys_free(h.p);
+    t = ray_parquet_read(path, NULL);
+    TEST_ASSERT_TRUE(t != NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    {
+        const int32_t* got = (const int32_t*)ray_data(ray_table_get_col_idx(t, 0));
+        TEST_ASSERT_EQ_I(got[0], 0);
+        TEST_ASSERT_EQ_I(got[1], INT32_MIN);
+    }
+    ray_release(t);
+    unlink(path);
+    /* A header first value outside int32 truncates the same way. */
+    pq_buf f = {0};
+    pq_dpb_head(&f, 1, INT64_C(2147483648));
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-i32first-%d.parquet", (int)getpid());
+    TEST_ASSERT_TRUE(pq_delta_synth(path, 1, f.p, f.n, 1));
+    ray_sys_free(f.p);
+    t = ray_parquet_read(path, NULL);
+    TEST_ASSERT_TRUE(t != NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(((const int32_t*)ray_data(ray_table_get_col_idx(t, 0)))[0], INT32_MIN);
+    ray_release(t);
+    unlink(path);
+    ray_free_raw(v);
+    PASS();
+}
+/* A BYTE_ARRAY DECIMAL read through the DELTA string arms: the batch vector
+ * is F64, so the arm's string-pool bound must be guarded by PQ_STRCOL. */
+static test_result_t test_pq_delta_decimal(void) {
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/rayforce-pq-ddec-%d.parquet", (int)getpid());
+    /* DELTA_LENGTH_BYTE_ARRAY: two big-endian integers, 1 and 2. */
+    pq_buf s = {0};
+    int64_t len[] = {2,2};
+    pq_dpb_write(&s, len, 2);
+    static const uint8_t lbody[] = {0,1,0,2};
+    pb_bytes(&s, lbody, sizeof(lbody));
+    TEST_ASSERT_TRUE(pq_delta_synth_full(path, 6, 6, 2, 10, s.p, s.n, 2));
+    s.n = 0;
+    ray_t* t = ray_parquet_read(path, NULL);
+    TEST_ASSERT_TRUE(t != NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, 0)->type, RAY_F64);
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[0] == 1/1e2);
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[1] == 2/1e2);
+    ray_release(t);
+    unlink(path);
+    /* DELTA_BYTE_ARRAY: the second value is the first byte of the first plus
+     * one suffix byte, so the two integers are again 1 and 2. */
+    int64_t pre[] = {0,1}, suf[] = {2,1};
+    pq_dpb_write(&s, pre, 2);
+    pq_dpb_write(&s, suf, 2);
+    static const uint8_t d0[] = {0,1}, d1[] = {2};
+    pb_bytes(&s, d0, sizeof(d0)); pb_bytes(&s, d1, sizeof(d1));
+    TEST_ASSERT_TRUE(pq_delta_synth_full(path, 6, 7, 2, 10, s.p, s.n, 2));
+    ray_sys_free(s.p);
+    t = ray_parquet_read(path, NULL);
+    TEST_ASSERT_TRUE(t != NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_get_col_idx(t, 0)->type, RAY_F64);
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[0] == 1/1e2);
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[1] == 2/1e2);
+    ray_release(t);
+    unlink(path);
+    PASS();
+}
 static void pq_page_v1(pq_buf* f, const pq_buf* body, int encoding, int64_t rows) {
     int last = 0;
     pb_i(f, &last, 1, PB_I32, 0);
@@ -6501,8 +6613,8 @@ static test_result_t test_pq_delta_errors(void) {
     pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 8); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
     TEST_ASSERT_TRUE(pq_delta_reject("body", 2, b.p, b.n, 2, -1, NULL, 0, "truncated delta miniblock"));
     b.n = 0;
-    /* A width wider than the physical type. */
-    pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 33); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
+    /* A width above 64 is outside the format for every physical type. */
+    pq_delta_head(&b, 2); pb_zz(&b, 0); pb_byte(&b, 65); pb_byte(&b, 0); pb_byte(&b, 0); pb_byte(&b, 0);
     TEST_ASSERT_TRUE(pq_delta_reject("width", 2, b.p, b.n, 1, -1, NULL, 0, "invalid delta bit width"));
     b.n = 0;
     /* The header count is below the values the rows require. */
@@ -6528,18 +6640,8 @@ static test_result_t test_pq_delta_errors(void) {
     /* DELTA on a physical type outside INT32/INT64 is refused at the page gate. */
     pq_delta_head(&b, 2);
     TEST_ASSERT_TRUE(pq_delta_reject("physical", 2, b.p, b.n, 5, -1, NULL, 0, "unsupported value encoding"));
-    /* A zigzag varint that does not fit the 32-bit physical type is refused,
-     * not truncated (Arrow's rule): the header's first value and each
-     * block's min delta, for INT32 data and the byte-array length streams. */
-    b.n = 0;
-    pq_dpb_head(&b, 1, INT64_C(2147483648));
-    TEST_ASSERT_TRUE(pq_delta_reject("first32", 1, b.p, b.n, 1, -1, NULL, 0, "delta first value out of range"));
-    b.n = 0;
-    pq_delta_head(&b, 2); pb_zz(&b, INT64_C(2147483648));
-    TEST_ASSERT_TRUE(pq_delta_reject("mindelta32", 2, b.p, b.n, 1, -1, NULL, 0, "delta min-delta out of range"));
-    b.n = 0;
-    pq_dpb_head(&b, 1, INT64_C(-2147483649));
-    TEST_ASSERT_TRUE(pq_delta_reject("dlba-first32", 1, b.p, b.n, 6, 6, NULL, 0, "delta first value out of range"));
+    /* The INT32-range cells moved to parquet/delta_i32_wide: the header's
+     * first value and a block's min delta are read as 64-bit values now. */
     /* A v2 page whose declared null count disagrees with the levels. */
     b.n = 0;
     {
@@ -6559,7 +6661,7 @@ static test_result_t test_pq_delta_errors(void) {
         pq_dpb_head(&s, 2, 0); pb_zz(&s, 1); pb_byte(&s, 8); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
         TEST_ASSERT_TRUE(pq_delta_reject("dlba-body", 2, s.p, s.n, 6, 6, NULL, 0, "truncated delta miniblock"));
         s.n = 0;
-        pq_dpb_head(&s, 2, 0); pb_zz(&s, 0); pb_byte(&s, 33); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
+        pq_dpb_head(&s, 2, 0); pb_zz(&s, 0); pb_byte(&s, 65); pb_byte(&s, 0); pb_byte(&s, 0); pb_byte(&s, 0);
         TEST_ASSERT_TRUE(pq_delta_reject("dlba-width", 2, s.p, s.n, 6, 6, NULL, 0, "invalid delta bit width"));
         s.n = 0;
         pq_dpb_head(&s, 1, 100);
@@ -6877,37 +6979,154 @@ static test_result_t test_pq_delta_symbol_import(void) {
     ray_release(types);
     PASS();
 }
-/* A DELTA_BYTE_ARRAY page whose footer does not name the encoding (the
- * synthesizer lists only PLAIN): the import decision cannot see the prefix
- * expansion, so the column takes the direct path and the collection arena
- * holds every reconstructed value.  Row 0 is 65,536 'P's plus "0000"; each
- * later row repeats the whole prefix with no suffix, so `rows` x 65,540
- * bytes accumulate before the collection is interned. */
-static bool pq_arena_synth(const char* path, int64_t rows) {
+/* A DELTA_BYTE_ARRAY page of `rows` values of `value_len` bytes; row 0 carries
+ * the whole value and each later row either repeats it exactly (prefix = the
+ * whole previous value, no suffix) or extends the value's leading bytes with a
+ * four-digit suffix, so every row is a distinct value.  The footer lists only
+ * PLAIN, so the import decision cannot see the encoding and the column takes
+ * the direct path; the page's reconstructed total is rows x value_len. */
+static bool pq_dba_synth(const char* path, int64_t rows, int64_t value_len, bool repeat) {
+    if (rows < 1 || value_len < 4) return false;
     pq_buf s = {0};
     int64_t* pre = ray_alloc_raw((size_t)rows*sizeof(*pre));
     int64_t* suf = ray_alloc_raw((size_t)rows*sizeof(*suf));
     if (!pre || !suf) { ray_free_raw(pre); ray_free_raw(suf); return false; }
-    pre[0] = 0; suf[0] = 65540;
-    for (int64_t i = 1; i < rows; i++) { pre[i] = 65540; suf[i] = 0; }
+    pre[0] = 0; suf[0] = value_len;
+    for (int64_t i = 1; i < rows; i++) {
+        pre[i] = repeat ? value_len : value_len-4; suf[i] = repeat ? 0 : 4;
+    }
     pq_dpb_write(&s, pre, (int)rows);
     pq_dpb_write(&s, suf, (int)rows);
-    for (int64_t i = 0; i < 65536; i++) pb_byte(&s, 'P');
-    pb_bytes(&s, "0000", 4);
+    for (int64_t i = 0; i < value_len; i++) pb_byte(&s, 'P');
+    if (!repeat) {
+        char tail[8];
+        for (int64_t i = 1; i < rows; i++) {
+            int tn = snprintf(tail, sizeof(tail), "%04d", (int)(i % 10000));
+            pb_bytes(&s, tail, (size_t)tn);
+        }
+    }
     bool ok = pq_delta_synth_enc(path, 6, 7, s.p, s.n, rows);
     ray_sys_free(s.p); ray_free_raw(pre); ray_free_raw(suf);
     return ok;
 }
+#define PQ_DBA_PAGE_CAP "delta byte array page expands past the 64 MiB page limit"
+/* One symbol import of `src` in a forced mode; the refusal must carry `want`. */
+static bool pq_dba_import_refused(const char* src, const char* mode, const char* want) {
+    char dir[160], partial[200];
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-dba-page-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    int64_t sym = ray_sym_intern("SYM",3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
+    pq_set_symmode(mode);
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    pq_set_symmode(NULL);
+    bool ok = res && RAY_IS_ERR(res) &&
+              ray_err_code(res) && !strcmp(ray_err_code(res), "parquet") &&
+              ray_error_msg() && strstr(ray_error_msg(), want) != NULL;
+    if (!ok && res) fprintf(stderr, "  dba import %s: %s / %s\n", mode,
+                            ray_err_code(res) ? ray_err_code(res) : "(no code)",
+                            ray_error_msg() ? ray_error_msg() : "(no message)");
+    if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
+    pq_rm_rf(dir); pq_rm_rf(partial);
+    ray_release(types);
+    return ok;
+}
+/* The DELTA_BYTE_ARRAY page cap: a page whose prefix expansion would rebuild
+ * past the 64 MiB page bound is refused, on .parquet.read and on both symbol
+ * import paths, before the expansion is allocated.  A page that reconstructs
+ * exactly 64 MiB still reads. */
+static test_result_t test_pq_delta_dba_page_cap(void) {
+    char big[160], edge[160];
+    snprintf(big, sizeof(big), "/tmp/rayforce-pq-pagecap-%d.parquet", (int)getpid());
+    snprintf(edge, sizeof(edge), "/tmp/rayforce-pq-pageedge-%d.parquet", (int)getpid());
+    /* 3,000 rows of 1 MiB: ~3 GiB reconstructed from a ~1 MiB page. */
+    TEST_ASSERT_TRUE(pq_dba_synth(big, 3000, INT64_C(1)<<20, true));
+    ray_t* t = ray_parquet_read(big, NULL);
+    TEST_ASSERT_TRUE(t && RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(ray_err_code(t) && !strcmp(ray_err_code(t), "parquet"));
+    if (t && RAY_IS_ERR(t) && ray_error_msg())
+        TEST_ASSERT_TRUE(strstr(ray_error_msg(), PQ_DBA_PAGE_CAP) != NULL);
+    if (t) { if (RAY_IS_ERR(t)) ray_error_free(t); else ray_release(t); }
+    TEST_ASSERT_TRUE(pq_dba_import_refused(big, "direct", PQ_DBA_PAGE_CAP));
+    TEST_ASSERT_TRUE(pq_dba_import_refused(big, "grouped", PQ_DBA_PAGE_CAP));
+    unlink(big);
+    /* 64 rows of 1 MiB reconstruct exactly the bound: the read succeeds. */
+    TEST_ASSERT_TRUE(pq_dba_synth(edge, 64, INT64_C(1)<<20, true));
+    t = ray_parquet_read(edge, NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t), 64);
+    {
+        ray_t* col = ray_table_get_col_idx(t, 0);
+        TEST_ASSERT_EQ_I(col->type, RAY_STR);
+        const char* pool = col->str_pool ? (const char*)ray_data(col->str_pool) : NULL;
+        const ray_str_t* elems = (const ray_str_t*)ray_data(col);
+        for (int64_t row = 0; row < 64; row++) {
+            const ray_str_t* e = &elems[row];
+            TEST_ASSERT_EQ_I((int64_t)e->len, INT64_C(1)<<20);
+            const char* p = ray_str_t_ptr(e, pool);
+            TEST_ASSERT_TRUE(!memcmp(p, "PPPP", 4));
+            TEST_ASSERT_TRUE(!memcmp(p + e->len - 4, "PPPP", 4));
+        }
+    }
+    ray_release(t);
+    unlink(edge);
+    PASS();
+}
+/* The direct symbol path reuses the previous value's arena copy when the page
+ * repeats the value (prefix = the previous length, no suffix).  One distinct
+ * 1 MiB-scale value repeated across a page stays inside a small memory budget
+ * that the per-value copy would exceed. */
+static test_result_t test_pq_delta_symbol_repeat(void) {
+    char src[160], dir[160], partial[200];
+    snprintf(src, sizeof(src), "/tmp/rayforce-pq-repeat-%d.parquet", (int)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-repeat-%d", (int)getpid());
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_dba_synth(src, 512, 65540, true));
+    int64_t sym = ray_sym_intern("SYM",3);
+    ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
+    ray_heap_set_anon_watermark(64 << 20);
+    ray_t* res = ray_parquet_splayed_typed(src, dir, types);
+    ray_heap_set_anon_watermark(0);
+    bool loaded = res && !RAY_IS_ERR(res);
+    if (!loaded && res && RAY_IS_ERR(res))
+        fprintf(stderr, "  repeat import: %s: %s\n", ray_err_code(res), ray_error_msg());
+    if (res && RAY_IS_ERR(res)) ray_error_free(res);
+    TEST_ASSERT_TRUE(loaded);
+    TEST_ASSERT_EQ_I(res->i64, 512);
+    ray_release(res);
+    /* The 512 rows intern to one symbol holding the repeated value. */
+    char domain[220]; snprintf(domain, sizeof(domain), "%s/.sym", dir);
+    ray_t* tbl = ray_read_splayed(dir, domain);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_table_nrows(tbl), 512);
+    ray_t* col = ray_table_get_col_idx(tbl, 0);
+    for (int64_t row = 0; row < 512; row += 255) {
+        ray_t* atom = ray_sym_vec_cell(col, row);
+        TEST_ASSERT_NOT_NULL(atom);
+        TEST_ASSERT_EQ_I((int64_t)ray_str_len(atom), 65540);
+        const char* text = ray_str_ptr(atom);
+        TEST_ASSERT_TRUE(!memcmp(text, "PPPP", 4) && !memcmp(text + 65532, "PPPP", 4));
+    }
+    ray_release(tbl);
+    pq_rm_rf(dir); pq_rm_rf(partial);
+    unlink(src);
+    ray_release(types);
+    PASS();
+}
 /* The collection arena is bounded by the memory budget the engine was given
- * (-m; here the heap watermark): 512 long values are ~32 MiB, and a 64 MiB
- * budget allows the arena a sixteenth of it, so the import refuses the
- * expansion instead of committing up to the 4 GiB pool ceiling.  The
- * unconstrained read of a long-prefix page is dba-prefix-long's. */
+ * (-m; here the heap watermark): 512 distinct 65,540-byte values are ~32 MiB,
+ * and a 64 MiB budget allows the arena a sixteenth of it, so the import
+ * refuses the expansion instead of committing up to the 4 GiB pool ceiling.
+ * The page's reconstruction (33.5 MiB) stays under the page cap, so this path
+ * is the arena's own bound. Every value is distinct, so a repeated offset
+ * cannot stand in for the copy.  The unconstrained read of a long-prefix page
+ * is dba-prefix-long's. */
 static test_result_t test_pq_delta_arena_bound(void) {
-    char src[160], dir[160];
+    char src[160], dir[160], partial[200];
     snprintf(src, sizeof(src), "/tmp/rayforce-pq-arena-%d.parquet", (int)getpid());
     snprintf(dir, sizeof(dir), "/tmp/rayforce-pq-arena-%d", (int)getpid());
-    TEST_ASSERT_TRUE(pq_arena_synth(src, 512));
+    snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
+    TEST_ASSERT_TRUE(pq_dba_synth(src, 512, 65540, false));
     int64_t sym = ray_sym_intern("SYM",3);
     ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
     ray_heap_set_anon_watermark(64 << 20);
@@ -6919,9 +7138,13 @@ static test_result_t test_pq_delta_arena_bound(void) {
                    strstr(ray_error_msg(), "delta byte array expansion exceeds the memory budget");
     if (res) { if (RAY_IS_ERR(res)) ray_error_free(res); else ray_release(res); }
     pq_rm_rf(dir);
+    pq_rm_rf(partial);
     unlink(src);
     ray_release(types);
     TEST_ASSERT_TRUE(refused);
+    /* A failed import stages into <destination>.parquet-partial; the cell
+     * leaves no staging residue behind. */
+    TEST_ASSERT_TRUE(access(partial, F_OK) != 0);
     PASS();
 }
 /* The arena floor: a budget below 16 bytes divides to 0, which must not read as
@@ -6936,7 +7159,7 @@ static test_result_t test_pq_delta_arena_floor(void) {
     snprintf(partial, sizeof(partial), "%s.parquet-partial", dir);
     int64_t sym = ray_sym_intern("SYM",3);
     ray_t* types = ray_vec_from_raw(RAY_SYM,&sym,1);
-    TEST_ASSERT_TRUE(pq_arena_synth(src, 512));
+    TEST_ASSERT_TRUE(pq_dba_synth(src, 512, 65540, false));
     ray_heap_set_anon_watermark(15);
     ray_t* res = ray_parquet_splayed_typed(src, dir, types);
     ray_heap_set_anon_watermark(0);
@@ -6948,7 +7171,7 @@ static test_result_t test_pq_delta_arena_floor(void) {
     pq_rm_rf(dir);
     pq_rm_rf(partial);
     TEST_ASSERT_TRUE(refused);
-    TEST_ASSERT_TRUE(pq_arena_synth(small, 8));
+    TEST_ASSERT_TRUE(pq_dba_synth(small, 8, 65540, false));
     ray_heap_set_anon_watermark(15);
     res = ray_parquet_splayed_typed(small, dir, types);
     ray_heap_set_anon_watermark(0);
@@ -7259,17 +7482,18 @@ static bool pq_bigprefix_values(ray_t* t, int64_t rows, int64_t P) {
 static test_result_t test_pq_delta_bigprefix(void) {
     char path[160];
     snprintf(path, sizeof(path), "/tmp/rayforce-pq-dbig-%d.parquet", (int)getpid());
-    const int64_t rows = 2000, P = 40960;
+    /* 1,000 rows of 40,970 bytes rebuild to ~39 MiB, inside the page bound. */
+    const int64_t rows = 1000, P = 40960;
     TEST_ASSERT_TRUE(pq_write_bigprefix(path, rows, P));
     ray_error_clear();
-    /* The plain batch read fills its pool at the pool bound: the control. */
+    /* The plain batch read fills its pool: the control. */
     ray_t* plain = ray_parquet_read(path, NULL);
     TEST_ASSERT_FALSE(RAY_IS_ERR(plain));
     TEST_ASSERT_EQ_I(ray_table_nrows(plain), rows);
     TEST_ASSERT_TRUE(pq_bigprefix_values(plain, rows, P));
     ray_release(plain);
     /* The failing path: the typed native SYM scan. Its collection arena must
-     * admit the prefix-expanded batch, not the 64 MiB page bound. */
+     * admit the prefix-expanded batch. */
     int64_t sym = ray_sym_intern("SYM",3);
     ray_t* types = ray_vec_from_raw(RAY_SYM, &sym, 1);
     int64_t key = ray_sym_intern("types",5);
@@ -7468,6 +7692,10 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_errors",test_pq_delta_errors,pq_setup,pq_teardown},
     {"parquet/delta_arena_bound",test_pq_delta_arena_bound,pq_setup,pq_teardown},
     {"parquet/delta_arena_floor",test_pq_delta_arena_floor,pq_setup,pq_teardown},
+    {"parquet/delta_dba_page_cap",test_pq_delta_dba_page_cap,pq_setup,pq_teardown},
+    {"parquet/delta_symbol_repeat",test_pq_delta_symbol_repeat,pq_setup,pq_teardown},
+    {"parquet/delta_i32_wide",test_pq_delta_i32_wide,pq_setup,pq_teardown},
+    {"parquet/delta_decimal",test_pq_delta_decimal,pq_setup,pq_teardown},
     {"parquet/duckdb_dict_tolerance",test_pq_duckdb_dict_tolerance,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},

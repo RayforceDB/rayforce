@@ -490,8 +490,11 @@ typedef struct {
     const uint8_t *payload_start, *suffix_start;
     uint8_t* rebuild;
     size_t rebuild_cap, rebuild_len;
+    uint64_t rebuild_total; /* this page's reconstructed bytes, capped at PQ_MAX_PAGE */
     uint8_t* sym_arena;
     size_t sym_arena_cap, sym_arena_len;
+    size_t last_aoff;       /* the previous value's copy in sym_arena */
+    bool last_aoff_valid;
     int str_delta;       /* 0, or the page's DELTA byte-array code (6, 7) */
 } pq_column;
 /* End-of-page check for a hybrid (bit-packed / RLE) stream. The strict rule
@@ -500,12 +503,12 @@ typedef struct {
 static bool pq_hybrid_done(const pq_column* c, const pq_rle* r) {
     return c->pad_final_run ? pq_rle_done_padded(r) : pq_rle_done(r);
 }
-/* The end-of-page rule for a definition-level stream is the same one the
- * dictionary-id stream uses (pq_hybrid_done): in a writer-tolerant file both
- * accept the over-declared final bit-packed run that is the tolerance this
- * fixture branch exercises.  PQ_DEF_STRICT (debug builds) restores the strict
- * rule for the tolerance counterfactual; the reader reads it once at open
- * (pq_cursor_budget), not at every page end. */
+/* The end-of-page rule for a definition-level stream is the dictionary-id
+ * stream's (pq_hybrid_done): both accept the over-declared final bit-packed
+ * run that a writer-tolerant file permits.  PQ_DEF_STRICT (debug builds)
+ * restores the strict rule, for a read that must reject such a file; the
+ * reader reads the variable once at open (pq_cursor_budget), not at every
+ * page end. */
 static bool pq_def_done(const pq_column* c, const pq_rle* r) {
 #if defined(DEBUG)
     if (c->def_strict) return pq_rle_done(r);
@@ -514,19 +517,15 @@ static bool pq_def_done(const pq_column* c, const pq_rle* r) {
 }
 
 #define PQ_DELTA_SUPPORTED "unsupported value encoding (supported: plain, dictionary, RLE booleans, delta binary packed, delta length byte array, delta byte array)"
-/* A zigzag varint that does not fit the column's 32-bit physical type is
- * refused rather than silently truncated (Arrow's rule): for INT32 data
- * (physical 1) and for the DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY length
- * streams (physical 6) the header's first value and every block's min delta
- * must lie in INT32_MIN..INT32_MAX.  The values themselves wrap in 32-bit
- * arithmetic, as the writer's own deltas do. */
-static bool pq_delta_fits32(const pq_schema* s, int64_t v) {
-    return (s->physical != 1 && s->physical != 6) || (v >= INT32_MIN && v <= INT32_MAX);
-}
 /* Read one value from the page's DELTA_BINARY_PACKED stream, reconstructing
- * the two's-complement wrapping values of the physical type. The stream is
+ * the two's-complement wrapping values of the physical type.  The stream is
  * consumed lazily: only the miniblocks whose values are asked for are read.
- * Coarse checkpoints every 4096 values bound the work between interrupts. */
+ * Coarse checkpoints every 4096 values bound the work between interrupts.
+ *
+ * A writer may encode an INT32 stream in 64-bit arithmetic (its min delta and
+ * bit widths then exceed 32 bits), so every value is reconstructed in 64 bits
+ * and an INT32 or byte-array value truncates to 32 bits, as the format's
+ * wrapping arithmetic requires. */
 static const char* pq_delta_next(pq_delta* d, const pq_schema* s, int64_t* out) {
     if (d->read >= d->total) return "delta value count exceeds the stream header";
     if (!(d->read & 4095)) {
@@ -547,14 +546,13 @@ static const char* pq_delta_next(pq_delta* d, const pq_schema* s, int64_t* out) 
     if (!d->block_left) {
         d->min_delta = pq_int(&d->c);
         if (d->c.bad) return "truncated delta block header";
-        if (!pq_delta_fits32(s,d->min_delta)) return "delta min-delta out of range";
         if (!pq_take(&d->c,d->miniblocks,&d->widths)) return "truncated delta miniblock widths";
         d->block_left = d->block_size; d->mini = 0; d->body_left = 0;
     }
     if (!d->body_left) {
         if (d->mini >= d->miniblocks) return "truncated delta miniblock";
         d->width = d->widths[d->mini++];
-        if (d->width > ((s->physical == 1 || s->physical == 6) ? 32u : 64u)) return "invalid delta bit width";
+        if (d->width > 64) return "invalid delta bit width";
         uint64_t bytes = ((uint64_t)d->width*d->per_block + 7)/8;
         if (!pq_take(&d->c,bytes,&d->body)) return "truncated delta miniblock";
         d->body_left = d->per_block; d->bit = 0;
@@ -572,8 +570,8 @@ static const char* pq_delta_next(pq_delta* d, const pq_schema* s, int64_t* out) 
     }
     d->bit += d->width; d->body_left--; d->block_left--;
     uint64_t delta = (uint64_t)d->min_delta + rem;
-    if (s->physical == 1 || s->physical == 6) { uint32_t v = (uint32_t)d->last + (uint32_t)delta; d->last = (int32_t)v; }
-    else { uint64_t v = (uint64_t)d->last + delta; d->last = (int64_t)v; }
+    uint64_t v = (uint64_t)d->last + delta;
+    d->last = (s->physical == 1 || s->physical == 6) ? (int32_t)(uint32_t)v : (int64_t)v;
     *out = d->last;
     return NULL;
 }
@@ -585,7 +583,6 @@ static const char* pq_delta_init(pq_delta* d, const pq_schema* s, pq_cur* v) {
     uint64_t block = pq_var(&d->c), minis = pq_var(&d->c), total = pq_var(&d->c);
     d->last = pq_int(&d->c);
     if (d->c.bad) return "truncated delta header";
-    if (!pq_delta_fits32(s,d->last)) return "delta first value out of range";
     if (!block || block % 128 || block > INT32_MAX || !minis || minis > block ||
         block % minis || !(block/minis) || (block/minis) % 32) return "invalid delta block size";
     d->block_size = block; d->miniblocks = minis; d->per_block = block/minis;
@@ -647,15 +644,19 @@ static const char* pq_str_delta_page(pq_column* c, const pq_schema* s, int enc, 
         if (!err) err = pq_delta_init(&c->dlen,s,&suffix);
     } else err = pq_delta_init(&c->dlen,s,&start);
     if (err) return err;
-    c->str_delta = enc; c->rebuild_len = 0;
+    c->str_delta = enc; c->rebuild_len = 0; c->rebuild_total = 0;
     return NULL;
 }
 /* One present value from the page's streams: a DLBA length plus payload
  * slice, or a DBA prefix plus suffix reconstruction.  The returned pointer
- * is page- or cursor-owned; callers copy it into their own storage. */
-static const char* pq_str_delta_next(pq_column* c, const pq_schema* s, const uint8_t** p, uint32_t* len) {
+ * is page- or cursor-owned; callers copy it into their own storage.  `same`
+ * reports that the value equals the previous one (the whole previous value as
+ * its prefix, no suffix), so a caller holding that copy need not make
+ * another. */
+static const char* pq_str_delta_next(pq_column* c, const pq_schema* s, const uint8_t** p, uint32_t* len, bool* same) {
     int64_t x;
     const char* err;
+    if (same) *same = false;
     if (c->str_delta == 6) {
         err = pq_delta_next(&c->dlen,s,&x);
         if (err) return err;
@@ -676,11 +677,18 @@ static const char* pq_str_delta_next(pq_column* c, const pq_schema* s, const uin
     if (pre < 0 || suf < 0) return "invalid delta length";
     if ((uint64_t)pre > c->rebuild_len) return "delta prefix exceeds the previous value";
     uint64_t n = (uint64_t)pre + (uint64_t)suf;
-    if (n > PQ_MAX_PAGE || (uint64_t)suf > (uint64_t)(c->payload.end - c->payload.p))
+    bool repeated = (uint64_t)pre == c->rebuild_len && !suf;
+    if ((uint64_t)suf > (uint64_t)(c->payload.end - c->payload.p))
         return "delta length exceeds the page";
+    /* A page's prefix expansion is its reconstructed total, which gets the
+     * same bound a PLAIN page's decoded size has. */
+    c->rebuild_total += n;
+    if (c->rebuild_total > PQ_MAX_PAGE)
+        return "delta byte array page expands past the 64 MiB page limit";
     if (!pq_reserve(&c->rebuild,&c->rebuild_cap,(size_t)n)) return "delta byte array allocation failed";
     if (suf) memcpy(c->rebuild + pre,c->payload.p,(size_t)suf);
     c->payload.p += suf; c->rebuild_len = (size_t)n;
+    if (same) *same = repeated;
     *p = c->rebuild; *len = (uint32_t)n;
     return NULL;
 }
@@ -1337,7 +1345,8 @@ static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
         c->codec = (int)codec; c->page_left = 0; c->chunk_left = r->group_left;
         c->have_dict = false; c->dict_count = 0; c->optional = r->schema[r->selected[i]].optional;
         c->delta.active = false; c->pad_final_run = r->duckdb_writer;
-        c->str_delta = 0; c->rebuild_len = 0; c->sym_arena_len = 0;
+        c->str_delta = 0; c->rebuild_len = 0; c->rebuild_total = 0; c->sym_arena_len = 0;
+        c->last_aoff_valid = false;
         c->payload_start = NULL; c->suffix_start = NULL;
         ray_free_raw(c->strings); c->strings = NULL;
         ray_free_raw(c->symbol_ids); c->symbol_ids = NULL;
@@ -1449,9 +1458,9 @@ static const char* pq_page(pq_column* c, pq_schema* s, int64_t* skip, int64_t ad
         pq_span f[10];
         c->page_all_present = false;
         c->delta.active = false;
-        c->str_delta = 0; c->rebuild_len = 0;
+        c->str_delta = 0; c->rebuild_len = 0; c->rebuild_total = 0;
         c->payload_start = NULL; c->suffix_start = NULL;
-        c->sym_arena_len = 0;
+        c->sym_arena_len = 0; c->last_aoff_valid = false;
         int64_t raw, size;
         const uint8_t* payload;
         const char* perr = pq_page_take(&c->chunk,f,&raw,&size,&payload);
@@ -1732,14 +1741,22 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
                 if (c->optional && (!pq_rle_next(&c->defs,&present) || present > 1)) return "invalid definition levels";
                 if (!present) { dst[at+i] = 0; v->attrs |= RAY_ATTR_HAS_NULLS; c->page_nulls++; continue; }
                 const uint8_t* p; uint32_t len;
-                const char* derr = pq_str_delta_next(c,s,&p,&len);
+                bool same;
+                const char* derr = pq_str_delta_next(c,s,&p,&len,&same);
                 if (derr) return derr;
                 if (s->strict && (!len || (s->converted == 0 && !pq_utf8(p,len))))
                     return "nonnull text is empty or invalid UTF-8";
                 if (c->str_delta == 7) {
                     size_t off;
-                    const char* aerr = pq_sym_arena_put(c,p,len,&off);
-                    if (aerr) return aerr;
+                    if (same && c->last_aoff_valid) {
+                        /* The page repeats the previous value: the arena copy
+                         * already holds these bytes. */
+                        off = c->last_aoff;
+                    } else {
+                        const char* aerr = pq_sym_arena_put(c,p,len,&off);
+                        if (aerr) return aerr;
+                        c->last_aoff = off; c->last_aoff_valid = true;
+                    }
                     scratch->aoffs[count] = off;
                     strings[count] = NULL;   /* filled from the arena before interning */
                 } else strings[count] = (const char*)p;
@@ -1791,6 +1808,7 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
             }
         }
         c->sym_arena_len = 0;   /* interned, so this collection's copies can go */
+        c->last_aoff_valid = false;
         at += n; c->page_left -= n; c->chunk_left -= n;
         if (!c->page_left) {
             if (c->optional && !pq_def_done(c,&c->defs)) return "excess definition levels";
@@ -1838,12 +1856,12 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                 c->page_nulls++;
             } else {
                 const uint8_t* p; uint32_t len;
-                const char* derr = pq_str_delta_next(c,s,&p,&len);
+                const char* derr = pq_str_delta_next(c,s,&p,&len,NULL);
                 if (derr) return derr;
                 if (len > PQ_MAX_PAGE) return PQ_PUT_FAIL;
                 /* DELTA pages bypass the per-value PLAIN arm that carries
                  * the batch pool bound. */
-                if (v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
+                if (PQ_STRCOL(s) && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
                 const char* perr = pq_put_value(&v,i,s,p,len);
                 if (perr) return perr;
                 *out = v;
@@ -3835,7 +3853,7 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
                 if (c->optional && (!pq_rle_next(&c->defs,&present) || present > 1)) return "invalid definition levels";
                 if (!present) { c->page_nulls++; if (!pq_g_emit(k,0,1)) return "symbol code write failed"; continue; }
                 const uint8_t* p; uint32_t len;
-                const char* derr = pq_str_delta_next(c,s,&p,&len);
+                const char* derr = pq_str_delta_next(c,s,&p,&len,NULL);
                 if (derr) return derr;
                 if (s->strict && (!len || (s->converted == 0 && !pq_utf8(p,len))))
                     return "nonnull text is empty or invalid UTF-8";
