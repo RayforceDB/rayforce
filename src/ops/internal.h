@@ -190,14 +190,13 @@ static inline int64_t sym_intern_safe(const char* s, size_t len) {
 }
 
 /* Result type of `deltas`: the type `-` answers between consecutive elements.
- * A difference of two TIMESTAMPs is a TIMESPAN, of two TIMEs a TIME and of two
- * DATEs an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64
- * and every other integer family I64. */
+ * A difference of two TIMESTAMPs or two TIMEs is a TIMESPAN and of two DATEs
+ * an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64 and
+ * every other integer family I64. */
 static inline int8_t deltas_out_type(int8_t t) {
     switch (t) {
         case RAY_F32: case RAY_F64:      return RAY_F64;
-        case RAY_TIMESTAMP: case RAY_TIMESPAN: return RAY_TIMESPAN;
-        case RAY_TIME:                   return RAY_TIME;
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_TIME: return RAY_TIMESPAN;
         case RAY_DATE:                   return RAY_I32;
         default:                         return RAY_I64;
     }

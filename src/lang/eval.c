@@ -1401,9 +1401,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         fn == ray_gt_fn || fn == ray_gte_fn;
     if (duration_binary && left->type != RAY_LIST && right->type != RAY_LIST &&
         (ray_has_timespan(left) || ray_has_timespan(right) ||
-         (fn == ray_sub_fn &&
-          (left->type == RAY_TIMESTAMP || left->type == -RAY_TIMESTAMP) &&
-          (right->type == RAY_TIMESTAMP || right->type == -RAY_TIMESTAMP))))
+         (fn == ray_sub_fn && ray_point_diff(left, right))))
         return fn(left, right);
 
     int left_coll = is_collection(left);

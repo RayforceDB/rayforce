@@ -4966,14 +4966,22 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     int8_t right_type = g->nodes[op->in_id[1]].out_type;
     if (ray_has_timespan(lhs) || ray_has_timespan(rhs) ||
         left_type == RAY_TIMESPAN || right_type == RAY_TIMESPAN ||
-        (op->opcode == OP_SUB && left_type == RAY_TIMESTAMP && right_type == RAY_TIMESTAMP)) {
-        /* Constant payloads are integers; the graph carries their temporal types. */
+        (op->opcode == OP_SUB && left_type == right_type &&
+         (left_type == RAY_TIMESTAMP || left_type == RAY_TIME))) {
+        /* Constant payloads are integers; the graph carries their temporal
+         * types.  A TIME constant may hold an I64 null. */
         ray_t left_atom, right_atom;
-        if (ray_is_atom(lhs) && (left_type == RAY_TIMESPAN || left_type == RAY_TIMESTAMP)) {
+        if (ray_is_atom(lhs) && (left_type == RAY_TIMESPAN || left_type == RAY_TIMESTAMP ||
+                                 left_type == RAY_TIME)) {
             left_atom = *lhs; left_atom.type = -left_type; lhs = &left_atom;
+            if (left_type == RAY_TIME)
+                left_atom.i64 = left_atom.i64 == NULL_I64 ? NULL_I32 : (int32_t)left_atom.i64;
         }
-        if (ray_is_atom(rhs) && (right_type == RAY_TIMESPAN || right_type == RAY_TIMESTAMP)) {
+        if (ray_is_atom(rhs) && (right_type == RAY_TIMESPAN || right_type == RAY_TIMESTAMP ||
+                                 right_type == RAY_TIME)) {
             right_atom = *rhs; right_atom.type = -right_type; rhs = &right_atom;
+            if (right_type == RAY_TIME)
+                right_atom.i64 = right_atom.i64 == NULL_I64 ? NULL_I32 : (int32_t)right_atom.i64;
         }
         return ray_timespan_binary(op->opcode, lhs, rhs);
     }

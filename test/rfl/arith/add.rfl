@@ -200,8 +200,8 @@
 (type (+ (as 'DATE 7305) (as 'TIME 0))) -- 'timestamp
 (type (+ (as 'TIME 0) (as 'DATE 7305))) -- 'timestamp
 
-;; TIME + TIME → TIME
-(+ (as 'TIME 1000) (as 'TIME 2000)) -- 00:00:03.000
+;; TIME + TIME → type error, as for the other point types
+(+ (as 'TIME 1000) (as 'TIME 2000)) !- type
 
 ;; TIME + TIMESTAMP → TIMESTAMP (and reverse)
 (type (+ (as 'TIME 1000) (as 'TIMESTAMP 2000))) -- 'timestamp
