@@ -2471,13 +2471,35 @@ static test_result_t test_idict_first_touch_race(void) {
 }
 
 /* The automatic DICT is kept exactly when the file with it is no larger
- * than the generation-0 file: 16 B a row and every pooled byte for the
- * column, 4 B a row and 4 B per distinct string for its DICT (#1094).  Each
- * column is written twice through the column writer, once keeping the DICT
- * whatever it costs (that file's size) and once deciding.  The sweep (inline
- * and pooled strings, a null every 7th row, 1 to 256 distinct) crosses the
- * bound in steps smaller than the region's padding, so a size estimate that
- * leaves the padding out keeps a DICT that does not fit. */
+ * than the generation-0 file of the same column with its DICT (#1094), as
+ * generation 0 writes it: ray_col_save(_bulk), then ray_col_append_index of
+ * ray_index_dict_compute, headers and padding included.  Each column is
+ * written twice through the column writer, once keeping the DICT whatever
+ * it costs (that file's size) and once deciding.  The sweep (inline and
+ * pooled strings, a null every 7th row, 1 to 250 distinct; 250 rows, so
+ * the code block does not end 32-aligned) crosses the bound in steps
+ * smaller than either file's padding, so an estimate that leaves out the
+ * padding or generation 0's headers keeps a DICT that does not fit or
+ * leaves out one that does. */
+static uint64_t st_file_size(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    long end = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    fclose(f);
+    return end > 0 ? (uint64_t)end : 0;
+}
+
+static uint64_t st_kif_gen0(ray_t* v) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s", STP("/kif0"));
+    if (ray_col_save_bulk(v, path) != RAY_OK) return 0;        /* ray_col_save without the fsync */
+    ray_t* ix = ray_index_dict_compute(v);
+    if (!ix || RAY_IS_ERR(ix)) { if (ix) ray_error_free(ix); return 0; }
+    ray_err_t e = ray_col_append_index(path, ray_index_payload(ix), v->len, RAY_STR);
+    ray_release(ix);
+    return e == RAY_OK ? st_file_size(path) : 0;
+}
+
 static uint64_t st_kif_write(ray_t* v, bool keep, uint8_t* kind) {
     FILE* f = fopen(STP("/kif"), "wb+");
     if (!f) return 0;
@@ -2503,33 +2525,23 @@ static test_result_t test_idict_kept_iff_fits(void) {
     static const int lens[] = { 5, 13, 20, 33 };
     int kept = 0, dropped = 0;
     for (int li = 0; li < 4; li++) {
-        for (int k = 1; k <= 256; k++) {
+        for (int k = 1; k <= 250; k++) {
             const int L = lens[li];
-            ray_t* v = ray_vec_new(RAY_STR, 256);
-            uint64_t occ = 0;
-            for (int i = 0; i < 256 && v && !RAY_IS_ERR(v); i++) {
+            ray_t* v = ray_vec_new(RAY_STR, 250);
+            for (int i = 0; i < 250 && v && !RAY_IS_ERR(v); i++) {
                 char b[40];
                 int m = i % 7 ? L : 0;                     /* "" is the null */
                 snprintf(b, sizeof b, "%0*d", L, i % k);
                 v = ray_str_vec_append(v, b, (size_t)m);
-                if (m > 12) occ += (uint64_t)m;
             }
             TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
-            int64_t nd = 0;                                /* distinct strings, the null included */
-            {
-                ray_dict_acc_t a;
-                TEST_ASSERT_EQ_I(ray_dict_acc_init(&a), RAY_OK);
-                TEST_ASSERT_EQ_I(ray_dict_acc_add(&a, v), RAY_OK);
-                nd = a.n_distinct;
-                ray_dict_acc_free(&a);
-            }
+            const uint64_t gen0 = st_kif_gen0(v);          /* the real generation-0 file */
             uint8_t kind_with = 0, kind = 0;
             uint64_t with = st_kif_write(v, true, &kind_with);
             uint64_t size = st_kif_write(v, false, &kind);
             ray_release(v);
-            TEST_ASSERT_TRUE(with > 0 && size > 0);
+            TEST_ASSERT_TRUE(with > 0 && size > 0 && gen0 > 0);
             TEST_ASSERT_EQ_I(kind_with, RAY_IDX_DICT);
-            const uint64_t gen0 = 20ull * 256 + 4ull * (uint64_t)nd + occ;
             const bool fits = with <= gen0;
             TEST_ASSERT_FMT(kind == (fits ? RAY_IDX_DICT : 0),
                             "%d-byte strings, %d distinct: %llu bytes with the DICT against %llu, index kind %d",

@@ -1186,20 +1186,22 @@ static ray_err_t encw_side(ray_encw_t* w, uint64_t* side_off, uint64_t* side_len
  * (#1094)?  Its region holds 4 B of code a row, the first-occurrence rows,
  * 8 B of offset and a second, uncompressed copy of every distinct string.
  * When the strings are mostly distinct the vectors stay RAW (no encoding
- * pays), so the region roughly doubles the file.  Generation 0 holds the
- * same column as 16 B a row plus every pooled byte (str_occ_bytes) and its
- * DICT as codes and first-occurrence rows only, its strings read through
- * the column: 20 B a row, 4 B per distinct string and the pooled bytes
- * (its few fixed header bytes left out).  The DICT is kept while the file
- * with it, the column so far padded to the region plus the region exactly
- * as ray_enc_dict_write lays it out, is no larger than that; else the
- * column is written without it, as with index: false.  keep_dict (the
+ * pays), so the region roughly doubles the file.  The generation-0 file of
+ * the same column (ray_col_save, then ray_col_append_index) is its 32 B
+ * header, 16 B a row, the pool's 32 B header and every pooled byte
+ * (str_occ_bytes: its pool holds each row's string), padded to 32, then its
+ * DICT region of codes and first-occurrence rows only, its strings read
+ * through the column (ray_index_dict_inline_size).  The DICT is kept while
+ * the file with it, the column so far padded to the region plus the region
+ * exactly as ray_enc_dict_write lays it out, is no larger than that; else
+ * the column is written without it, as with index: false.  keep_dict (the
  * save's explicit index: true) writes it whatever it costs. */
 static bool encw_dict_outweighs(const ray_encw_t* w) {
     if (w->keep_dict) return false;
     const ray_dict_acc_t* a = w->idict;
     uint64_t region = ray_enc_dict_region_bytes(w->len, a->n_distinct, a->pool_len);
-    uint64_t gen0 = 20ull * (uint64_t)w->len + 4ull * (uint64_t)a->n_distinct + w->str_occ_bytes;
+    uint64_t gen0 = ray_enc_pad32(64ull + 16ull * (uint64_t)w->len + w->str_occ_bytes) +
+                    (uint64_t)ray_index_dict_inline_size(w->len, a->n_distinct);
     return region > gen0 || ray_enc_pad32(w->pos) > gen0 - region;
 }
 
