@@ -107,7 +107,7 @@ static void colw_region_msg(const char* path) {
 }
 
 static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8_t ik_override,
-                               uint8_t ix_decision) {
+                               uint8_t ix_decision, bool keep_dict) {
     if (!ray_enc_gen2_supported()) return RAY_ERR_NYI;      /* before <path>.tmp exists */
     char tmp[1100];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return RAY_ERR_IO;
@@ -138,6 +138,7 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
                        ? (const char*)ray_data(owner->str_pool) : NULL;
     ray_encw_t w;
     ray_err_t e = ray_encw_begin(&w, f, vec->type, vec->attrs, vec->len, sc, ik, cf);
+    w.keep_dict = keep_dict;
     /* A hash an append left first-row-only is not what a file may hold: the
      * region is a complete one, built from the values (owned; the writer
      * borrows it until ray_encw_free). */
@@ -358,6 +359,7 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     ray_err_t e = !buf ? RAY_ERR_OOM : (!f ? RAY_ERR_IO : RAY_OK);
     ray_encw_t ew; memset(&ew, 0, sizeof ew);
     if (e == RAY_OK) e = ray_encw_begin(&ew, f, type, attrs, s->len, sc, ik, cf);
+    ew.keep_dict = w->keep_dict;
     /* the codes are positions of the target domain, else runtime ids */
     if (e == RAY_OK && type == RAY_SYM)
         ray_encw_set_sym_domain(&ew, w->target_dom ? w->target_dom : ray_sym_runtime_domain());
@@ -449,7 +451,8 @@ ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path) {
     if (w->gen == 2 && colw_src_gen2_ok(obj)) {
         /* direct pointers; a REBUILD goes by range, the path that holds it */
         if (obj->type != RAY_ENCCOL && obj->type != RAY_SYM && w->index_decision != RAY_COL_IDX_REBUILD)
-            return colw_gen2_vec(obj, path, w->durable, w->index_kind, w->index_decision);
+            return colw_gen2_vec(obj, path, w->durable, w->index_kind, w->index_decision,
+                                 w->keep_dict);
         return colw_gen2_range(w, path);
     }
     if (w->gen != 0 && w->gen != 2) return RAY_ERR_VERSION;
