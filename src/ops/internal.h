@@ -2524,6 +2524,7 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
     const int64_t* offsets, const int64_t* counts, int64_t groups, int64_t* winners);
 
 /* Gather winning group rows, retaining source domains and native types. */
+ray_t* ray_tbl_col_empty(ray_t* tbl, int64_t sym);
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
 /* Keep a grouped key column's "may have nulls" flag only when a key value is
  * null (vectorised, pool-split scan); see agg_engine.c. */

@@ -1120,7 +1120,10 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             /* RAY_LIST == 0; ray_vec_new rejects type <= 0, so a LIST
              * column needs ray_list_new — otherwise the empty result
              * silently drops it and the 0-row schema loses a column. */
-            ray_t* nc = (ct == RAY_LIST) ? ray_list_new(0) : ray_vec_new(ct, 0);
+            /* Even an empty partial can supply the symbol dictionary for a merge. */
+            ray_t* nc = ct == RAY_SYM ? ray_tbl_col_empty(tbl, ray_table_col_name(tbl, c))
+                      : ct == RAY_LIST ? ray_list_new(0) : ray_vec_new(ct, 0);
+            if (!nc || RAY_IS_ERR(nc)) { ray_release(empty); return nc; }
             if (nc && !RAY_IS_ERR(nc)) {
                 nc->len = 0;
                 empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), nc);

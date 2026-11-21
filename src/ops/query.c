@@ -880,7 +880,7 @@ static bool tbl_col_may_have_nulls(ray_t* tbl, int64_t sym) {
  * wrapper as its first segment (its base type and domain); an encoded one is
  * built the same way from its metadata, without a decode, a parted one at its
  * base type. */
-static ray_t* tbl_col_empty(ray_t* tbl, int64_t sym) {
+ray_t* ray_tbl_col_empty(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     if (!ray_table_col_meta(tbl, sym, &m)) return NULL;
     if (!m.enc) {                                   /* plain: no decode */
@@ -23882,7 +23882,7 @@ by_dict_done:
                     int64_t empty_key_name = key_sym;
                     ray_t* empty_key_vec = NULL;
                     if (key_sym >= 0) {
-                        empty_key_vec = tbl_col_empty(filtered_tbl, key_sym);
+                        empty_key_vec = ray_tbl_col_empty(filtered_tbl, key_sym);
                     } else {
                         /* Match the computed-key fallback's naming
                          * rules (dotted tail / last name arg) and
