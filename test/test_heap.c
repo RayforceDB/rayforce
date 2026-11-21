@@ -4967,15 +4967,30 @@ static test_result_t test_relieve_make_room_workers(void) {
     relieve_env_t e;
     relieve_env_begin(&e);
     ray_heap_t* h = relieve_heap_new(&e);
+
+    /* Whether a short block can spill at all: before the workers hold any
+     * empty pool, and off the main VM inside a dispatch besides. */
+    __VM = NULL;
+    atomic_store(&ray_parallel_flag, 1);
+    bool can_spill = h && relieve_short_block_spills();
+    atomic_store(&ray_parallel_flag, 0);
+
     bool workers = h && relieve_worker_pool(&w);
-    uint32_t p0[RELIEVE_PIN_WORKERS], p1[RELIEVE_PIN_WORKERS],
-             p2[RELIEVE_PIN_WORKERS], p3[RELIEVE_PIN_WORKERS];
+    uint32_t p0[RELIEVE_PIN_WORKERS], p1[RELIEVE_PIN_WORKERS], p2[RELIEVE_PIN_WORKERS],
+             p3[RELIEVE_PIN_WORKERS], p4[RELIEVE_PIN_WORKERS];
     workers = workers && relieve_worker_snap(p0);
 
     /* No main VM on this thread: the workers' heaps are not its to touch. */
     __VM = NULL;
     bool spill_novm = workers && relieve_short_block_spills();
     bool kept_novm = workers && relieve_worker_snap(p1) && !memcmp(p0, p1, sizeof p0);
+
+    /* An IPC hook's temporary VM (id -1): not that either. */
+    static ray_vm_t vmx;
+    ray_vm_init(&vmx, -1);
+    __VM = &vmx;
+    bool spill_ipc = workers && relieve_short_block_spills();
+    bool kept_ipc = workers && relieve_worker_snap(p4) && !memcmp(p0, p4, sizeof p0);
 
     /* The main VM's thread, inside a dispatch: not then either. */
     __VM = &vm0;
@@ -4995,9 +5010,10 @@ static test_result_t test_relieve_make_room_workers(void) {
     relieve_env_end(&e, h, NULL);
     ray_pool_destroy();
     if (prev_total) ray_pool_init_total(prev_total);
+    if (!can_spill) SKIP("no spill file");
     if (!workers) SKIP("no pool workers");
-    if (!spill_novm) SKIP("no spill file");
-    TEST_ASSERT(kept_novm, "without the main VM the workers kept their pools");
+    TEST_ASSERT(spill_novm && kept_novm, "without the main VM the block spilled, the workers kept their pools");
+    TEST_ASSERT(spill_ipc && kept_ipc, "under an IPC hook's VM the block spilled, the workers kept their pools");
     TEST_ASSERT(spill_par && kept_par, "inside a dispatch the block spilled, the workers kept their pools");
     TEST_ASSERT(!spill_main, "between dispatches the block fit in the workers' empty pools");
     TEST_ASSERT_FMT(took, "the first worker gave its empty pools, the second none "
