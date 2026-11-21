@@ -896,7 +896,7 @@ static test_result_t test_group_routes_and_bool_outputs(void) {
     TEST_ASSERT_NOT_NULL(setup); TEST_ASSERT_FALSE(RAY_IS_ERR(setup)); ray_release(setup);
     const char* queries[] = {
         "(select {from:traffic_t by:k s:(min v)})",
-        "(select {from:traffic_t by:k s:(min v) where:(> v 100)})"
+        "(select {from:traffic_t by:k s:(min v) where:(> v 00:00:00.100)})"
     };
     for (int selected = 0; selected < 2; selected++) {
         agg_route_reset(); r = ray_eval_str(queries[selected]);
@@ -972,7 +972,7 @@ static test_result_t test_dense_partition_order(void) {
     const char* queries[] = {
         "(select {from:order_t by:k s:(min v)})",
         "(select {from:order_t by:{b:b k:k} s:(min v)})",
-        "(select {from:order_t by:{b:b k:k} s:(min v) where:(> v 100)})",
+        "(select {from:order_t by:{b:b k:k} s:(min v) where:(> v 00:00:00.100)})",
     };
     for (size_t q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
         ray_t* first = NULL;
