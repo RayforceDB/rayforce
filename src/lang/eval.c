@@ -555,8 +555,21 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         *handled = 0;
         return NULL;
     }
-
     *handled = 1;
+    /* A narrow result (I16 + I16 is I16, #972) wraps or rounds per row in
+     * its own width, which sum(x) + n*c does not: sum the rows instead
+     * (the vector is evaluated once either way). */
+    {
+        int8_t rt = ray_arith_type(vec->type, (int8_t)-c_expr->type);
+        if (rt == RAY_U8 || rt == RAY_I16 || rt == RAY_I32 || rt == RAY_F32) {
+            ray_t* rows = atomic_map_binary_op(ray_add_fn, OP_ADD, vec, c_expr);
+            ray_release(vec);
+            if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+            ray_t* sum = ray_sum_fn(rows);
+            ray_release(rows);
+            return materialize_owned_value(sum);
+        }
+    }
     affine_sum_cache_entry_t ce;
     if (!affine_sum_cache_lookup(vec, &ce)) {
         ray_t* sum = ray_sum_fn(vec);
@@ -1480,62 +1493,15 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     int force_boxed = (left_coll && left->type == RAY_LIST) ||
                       (right_coll && right->type == RAY_LIST);
 
-    /* When the probed result is a null atom, the fn already chose the correct
-     * result type (e.g., division returns left-operand-typed null).  Skip the
-     * wider-wins promotion so the typed null lands in the right vector type. */
-    int e0_null = RAY_ATOM_IS_NULL(e0);
-
-    /* When the probed result is a boolean (from comparison ops like ==, <, etc.),
-     * preserve the bool output type — do not promote to wider integer type. */
-    int e0_bool = (e0->type == -RAY_BOOL);
-
-    /* When LEFT is scalar broadcast to RIGHT vector, the output type follows
-     * the RIGHT vector's element type for integer types,
-     * unless float or temporal promotion is involved. */
-    /* Not for the dyadic min/max: their result type is already the
-     * operands' promoted one (minmax_type), and narrowing it here would
-     * wrap a chosen scalar, (max 300 u8vec) giving 0x2c. */
-    if (!e0_null && !e0_bool && !left_coll && right_coll && ray_is_vec(right) && out_type != RAY_F64 &&
-        fn != ray_min2_fn && fn != ray_max2_fn) {
-        int8_t vec_type = right->type;
-        /* Only override for integer family: if probed type is wider int, downcast */
-        int out_is_int = (out_type == RAY_I64 || out_type == RAY_I32 || out_type == RAY_I16 || out_type == RAY_U8);
-        int vec_is_int = (vec_type == RAY_I64 || vec_type == RAY_I32 || vec_type == RAY_I16 || vec_type == RAY_U8);
-        if (out_is_int && vec_is_int)
-            out_type = vec_type;
-        /* For temporal: only override if both are same temporal family */
-        if ((vec_type == RAY_DATE || vec_type == RAY_TIME || vec_type == RAY_TIMESTAMP) &&
-            out_type == vec_type)
-            out_type = vec_type; /* no-op, just keep it */
-    }
-    /* When LEFT is vector and RIGHT is scalar, output follows WIDER integer
-     * type between left vector and right scalar */
-    if (!e0_null && !e0_bool && left_coll && !right_coll && ray_is_vec(left) && out_type != RAY_F64 &&
-        ray_is_atom(right)) {
-        int8_t vt = left->type, st = -(right->type);
-        int vt_int = (vt == RAY_I64 || vt == RAY_I32 || vt == RAY_I16 || vt == RAY_U8);
-        int st_int = (st == RAY_I64 || st == RAY_I32 || st == RAY_I16 || st == RAY_U8);
-        int out_is_int = (out_type == RAY_I64 || out_type == RAY_I32 || out_type == RAY_I16 || out_type == RAY_U8);
-        if (out_is_int && vt_int && st_int)
-            out_type = (vt >= st) ? vt : st; /* wider wins */
-    }
-    /* When both are vectors, output type follows wider integer type */
-    if (!e0_null && !e0_bool && left_coll && right_coll && ray_is_vec(left) && ray_is_vec(right) && out_type != RAY_F64) {
-        int8_t lt = left->type, rt = right->type;
-        int lt_int = (lt == RAY_I64 || lt == RAY_I32 || lt == RAY_I16 || lt == RAY_U8);
-        int rt_int = (rt == RAY_I64 || rt == RAY_I32 || rt == RAY_I16 || rt == RAY_U8);
-        if (lt_int && rt_int) {
-            /* Pick wider: I64 > I32 > I16 > U8 (using type tag ordering) */
-            out_type = (lt >= rt) ? lt : rt;
-        }
-    }
-
-    /* When LEFT is a vector collection, override i32 output to match the
-     * left vector type or i64 (e.g., [DATE]-DATE → i64, [i64]-i32 → i64).
-     * Keeps i32 only when left vector is actually i32. */
-    if (!e0_null && !e0_bool && out_type == RAY_I32 && left_coll && ray_is_vec(left) && left->type != RAY_I32) {
+    /* The probe's type is the result type: the builtins take it from the
+     * promotion table (ray_num_type, core/types.h), the same for either
+     * operand order and for atoms as for vectors (#972), and the DAG below
+     * plans the same one.  The one adjustment left is for a left vector
+     * outside the numeric table (temporal, TIMESPAN, ...): an I32 probe
+     * answers I64 there, as it always has (DATE - DATE days, (min span 5i)). */
+    if (out_type == RAY_I32 && left_coll && ray_is_vec(left) &&
+        !ray_num_type(left->type, left->type) && !RAY_ATOM_IS_NULL(e0))
         out_type = RAY_I64;
-    }
 
     /* DAG executor — for F64 and comparisons */
     if (!force_boxed && dag_opcode > 0) {

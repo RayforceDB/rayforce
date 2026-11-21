@@ -11076,7 +11076,8 @@ static test_result_t test_builtin_within_fn(void) {
 }
 
 /* ── builtins.c coverage: ray_idiv_fn ───────────────────────────────────────
- * ray_idiv_fn always returns I64, handles zero-div and nulls. */
+ * ray_idiv_fn takes the promotion table's type (#972): F64 over floats,
+ * handles zero-div and nulls. */
 static test_result_t test_builtin_idiv_fn(void) {
     /* Normal division: floor(7.0 / 2.0) = 3 */
     ray_t* a = ray_f64(7.0);
@@ -11084,8 +11085,8 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r = ray_idiv_fn(a, b);
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(r->i64, 3);
+    TEST_ASSERT_EQ_I(r->type, -RAY_F64);
+    TEST_ASSERT_TRUE(r->f64 == 3.0);
     ray_release(r);
     ray_release(a);
     ray_release(b);
@@ -11096,7 +11097,7 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r2 = ray_idiv_fn(c, z);
     TEST_ASSERT_NOT_NULL(r2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
-    TEST_ASSERT_EQ_I(r2->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r2->type, -RAY_F64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r2));
     ray_release(r2);
     ray_release(c);
@@ -11108,7 +11109,7 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r3 = ray_idiv_fn(tn, d);
     TEST_ASSERT_NOT_NULL(r3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
-    TEST_ASSERT_EQ_I(r3->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r3->type, -RAY_F64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r3));
     ray_release(r3);
     ray_release(tn);
@@ -11403,7 +11404,8 @@ static test_result_t test_builtin_within_rfl(void) {
 /* ── builtins.c coverage: ray_idiv_fn via rfl ───────────────────────────────
  * Covers the div builtin (integer floor division). */
 static test_result_t test_builtin_idiv_rfl(void) {
-    ASSERT_EQ("(div 7.0 2.0)", "3");
+    ASSERT_EQ("(div 7.0 2.0)", "3.0");
+    ASSERT_EQ("(div 7 2)", "3");
     PASS();
 }
 

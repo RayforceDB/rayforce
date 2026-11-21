@@ -65,9 +65,8 @@
 ;; I32 dominates I16 in the absence of I64/F64 (opt.c:60)
 (set THJ (table [a b] (list (as 'I16 [1 2 3 4]) (as 'I32 [10 20 30 40]))))
 (sum (at (select {x: (+ a b) from: THJ}) 'x)) -- 110
-;; DAG widens to I64 anyway (cf. dag_binary_ops.rfl:38) — promote_type
-;; still ran during inference even if downstream lowering widens.
-(type (at (select {x: (+ a b) from: THJ}) 'x)) -- 'I64
+;; The DAG keeps the planned I32 (#973).
+(type (at (select {x: (+ a b) from: THJ}) 'x)) -- 'I32
 
 ;; I16 + I16 promotes via opt.c:62 — same I16 path
 (set TH16 (table [a b] (list (as 'I16 [1 2 3]) (as 'I16 [4 5 6]))))

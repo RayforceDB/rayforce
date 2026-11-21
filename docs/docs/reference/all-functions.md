@@ -90,7 +90,7 @@ Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-
 | `*` | binary | atomic | Multiplication | `(* 3 4)` → `12` |
 | `/` | binary | atomic | Float division (always returns f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | atomic | Modulo (remainder) | `(% 7 3)` → `1` |
-| `div` | binary | atomic | Integer division (floor) | `(div 7 2)` → `3` |
+| `div` | binary | atomic | Floor division, promoted type | `(div 7 2)` → `3` |
 | `neg` | unary | atomic | Negate value | `(neg 5)` → `-5` |
 | `round` | unary | atomic | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | atomic | Floor (round down) | `(floor 3.7)` → `3.0` |

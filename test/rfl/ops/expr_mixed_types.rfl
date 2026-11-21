@@ -395,11 +395,9 @@
 (+ VBOOL 10)        -- [11 10 11 10 11]
 (type (+ VBOOL 10)) -- 'I64
 
-;; BOOL + U8-vec — the eval.c slow path widens to I64 (boolean coerce
-;; to int, then I64 arithmetic) rather than the DAG promote(BOOL,U8)=U8.
-;; Pin the observed behavior; the underlying values are correct.
-(+ VBOOL VU8)       -- [2 2 4 4 6]
-(type (+ VBOOL VU8)) -- 'I64
+;; BOOL + U8-vec — U8, the wider type (#972), as the DAG plans it.
+(+ VBOOL VU8)       -- [0x02 0x02 0x04 0x04 0x06]
+(type (+ VBOOL VU8)) -- 'U8
 
 ;; BOOL compare BOOL → BOOL
 (== VBOOL [true true false false true])  -- [true false false true true]
