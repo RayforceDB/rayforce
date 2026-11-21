@@ -1,0 +1,93 @@
+;; @requires: posix  (fixtures built and removed through .sys.exec)
+;; .db.splayed.set of a parted table (#1182): the table is written column by
+;; column, each column a segment at a time, and reads back as the in-memory
+;; copy of the same table, the partition key included as a real column as
+;; that copy holds it.  (select {from: P}) answers the parted table itself; a
+;; where clause materializes it.
+(.sys.exec "rm -rf /tmp/rf_splay_parted") -- 0
+(set mk (fn [d n o] (table [id px s name ts q] (list (+ o (til n)) (map (fn [j] (if (== 0 (% j 3)) 0Nf (* 0.5 j))) (til n)) (take (if (> o 0) ['c 'd 'e] ['a 'b 'c 'd]) n) (map (fn [j] (if (== 0 (% j 4)) "" (format "n%" (% (+ j o) 7)))) (til n)) (+ (+ d 00:00:00.000) (* 1000000 (til n))) (map (fn [j] (if (== 0 (% j 2)) 0N j)) (til n))))))
+(set D "/tmp/rf_splay_parted/db")
+(.db.splayed.set (format "%/2026.10.21/t" D) (mk 2026.10.21 7 0) (format "%/.sym" D))
+(.db.splayed.set (format "%/2026.10.22/t" D) (select {from: (mk 2026.10.22 3 0) where: (< id 0)}) (format "%/.sym" D))
+(.db.splayed.set (format "%/2026.10.23/t" D) (mk 2026.10.23 5 100) (format "%/.sym" D))
+(set P (.db.parted.get D 't))
+(set M (select {from: P where: (>= id 0)}))
+(at (.idx.info P 'id) 'segments) -- 3
+(in 'segments (key (.idx.info M 'id))) -- false
+(select {from: P}) -- M
+(count M) -- 12
+(cols M) -- [date id px s name ts q]
+
+;; The whole parted table, into a table root of its own (its own symfile).
+(.db.splayed.set "/tmp/rf_splay_parted/out/t" P)
+(set R (.db.splayed.get "/tmp/rf_splay_parted/out/t"))
+(cols R) -- [date id px s name ts q]
+(map (fn [c] (type (get R c))) (cols R)) -- (map (fn [c] (type (get M c))) (cols M))
+(select {from: R}) -- M
+(get R 'date) -- (get M 'date)
+(get R 's) -- (get M 's)
+(get R 'name) -- (get M 'name)
+(get R 'px) -- (get M 'px)
+(get R 'q) -- (get M 'q)
+(count (select {from: R where: (== s 'e)})) -- 1
+(count (select {from: R where: (== name "")})) -- 4
+(count (select {from: R where: (== date 2026.10.23)})) -- 5
+
+;; A projection without the partition key, into the root's own symfile.
+(.db.splayed.set "/tmp/rf_splay_parted/out2/t" (xcols P (drop (cols P) 1)) (format "%/.sym" D))
+(set R2 (.db.splayed.get "/tmp/rf_splay_parted/out2/t" (format "%/.sym" D)))
+(cols R2) -- [id px s name ts q]
+(select {from: R2}) -- (select {id: id px: px s: s name: name ts: ts q: q from: M})
+
+;; Generation 2 output, and the per-column symfile layout.
+(.db.splayed.set "/tmp/rf_splay_parted/out3/t" P {compress: true})
+(set R3 (.db.splayed.get "/tmp/rf_splay_parted/out3/t"))
+(at (.idx.info R3 'id) 'gen) -- 2
+(at (.idx.info R3 'date) 'gen) -- 2
+(select {from: R3}) -- M
+(.db.splayed.set "/tmp/rf_splay_parted/out4/t" P {symfile: 'column index: false})
+(select {from: (.db.splayed.get "/tmp/rf_splay_parted/out4/t")}) -- M
+
+;; An existing target is replaced, as for an in-memory table.
+(.db.splayed.set "/tmp/rf_splay_parted/out/t" (mk 2026.10.30 2 0))
+(count (.db.splayed.get "/tmp/rf_splay_parted/out/t")) -- 2
+(.db.splayed.set "/tmp/rf_splay_parted/out/t" P)
+(select {from: (.db.splayed.get "/tmp/rf_splay_parted/out/t")}) -- M
+
+;; Encoded partitions (generation 2) and a ragged one (no q column).
+(set D2 "/tmp/rf_splay_parted/db2")
+(.db.splayed.set (format "%/2026.10.21/t" D2) (mk 2026.10.21 70000 0) (format "%/.sym" D2) {compress: true})
+(.db.splayed.set (format "%/2026.10.22/t" D2) (mk 2026.10.22 9 0) (format "%/.sym" D2))
+(.db.splayed.set (format "%/2026.10.23/t" D2) (select {id: id px: px s: s name: name ts: ts from: (mk 2026.10.23 4 100)}) (format "%/.sym" D2))
+(set P2 (.db.parted.get D2 't))
+(set M2 (select {from: P2 where: (>= id 0)}))
+(count M2) -- 70013
+(.db.splayed.set "/tmp/rf_splay_parted/out5/t" P2)
+(set R5 (.db.splayed.get "/tmp/rf_splay_parted/out5/t"))
+(select {from: R5}) -- M2
+(count (select {from: R5 where: (nil? q)})) -- 35009
+(.db.splayed.set "/tmp/rf_splay_parted/out6/t" P2 {compress: false})
+(at (.idx.info (.db.splayed.get "/tmp/rf_splay_parted/out6/t") 'id) 'gen) -- 0
+(select {from: (.db.splayed.get "/tmp/rf_splay_parted/out6/t")}) -- M2
+
+;; Partitions keyed by symbols: the key column is written over the target
+;; symfile, which takes the keys before any column is written.
+(.db.splayed.set "/tmp/rf_splay_parted/db4/1.5/t" (table [a] (list [1 2])))
+(.db.splayed.set "/tmp/rf_splay_parted/db4/2.5/t" (table [a] (list [3])))
+(set P4 (.db.parted.get "/tmp/rf_splay_parted/db4" 't))
+(cols P4) -- [part a]
+(.db.splayed.set "/tmp/rf_splay_parted/out8/t" P4)
+(select {from: (.db.splayed.get "/tmp/rf_splay_parted/out8/t")}) -- (select {from: P4 where: (> a 0)})
+(type (get (.db.splayed.get "/tmp/rf_splay_parted/out8/t") 'part)) -- 'SYM
+
+;; A parted column the writer has no streamed form for (a list column) is
+;; refused before anything is written: the existing target stays as it was.
+(.db.splayed.set "/tmp/rf_splay_parted/db3/2026.10.21/t" (table [a l] (list [1 2] (list [1 2] [3]))))
+(.db.splayed.set "/tmp/rf_splay_parted/db3/2026.10.22/t" (table [a l] (list [3] (list [4 5 6]))))
+(set P3 (.db.parted.get "/tmp/rf_splay_parted/db3" 't))
+(.db.splayed.set "/tmp/rf_splay_parted/out/t" P3) !- nyi
+(select {from: (.db.splayed.get "/tmp/rf_splay_parted/out/t")}) -- M
+(.db.splayed.set "/tmp/rf_splay_parted/out7/t" (xcols P3 [date a]))
+(select {from: (.db.splayed.get "/tmp/rf_splay_parted/out7/t")}) -- (select {date: date a: a from: P3})
+
+(.sys.exec "rm -rf /tmp/rf_splay_parted") -- 0

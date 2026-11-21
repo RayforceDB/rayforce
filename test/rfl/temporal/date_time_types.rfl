@@ -1,0 +1,49 @@
+;; `date` and `time` answer a DATE and a TIME (#1223), not a TIMESTAMP:
+;; the same type as (date 0) / (time 0), for atoms, vectors and queries.
+
+(set ts 2024.03.06D12:30:00.123456789)
+(type (date ts)) -- 'date
+(type (time ts)) -- 'time
+(date ts) -- 2024.03.06
+(time ts) -- 12:30:00.123
+
+;; a DATE is its own date, a TIME its own time of day
+(date 2024.03.06) -- 2024.03.06
+(time 12:30:00.000) -- 12:30:00.000
+
+;; the same type as the clock forms
+(type (date ts)) -- (type (date 0))
+(type (time ts)) -- (type (time 0))
+
+;; a TIME has no date and a DATE no time of day
+(date 12:30:00.000) !- type
+(time 2024.03.06) !- type
+
+;; vectors keep their type and their nulls
+(set v (as 'TIMESTAMP [763828051000000000 0N -1800000000000]))
+(type (date v)) -- 'DATE
+(type (time v)) -- 'TIME
+(date v) -- [2024.03.15 0Nd 1999.12.31]
+(time v) -- [14:27:31.000 0Nt 23:30:00.000]
+(date [2024.03.06 0Nd]) -- [2024.03.06 0Nd]
+(time [12:30:00.000 0Nt]) -- [12:30:00.000 0Nt]
+
+;; one kernel with `as`
+(date v) -- (as 'DATE v)
+(time v) -- (as 'TIME v)
+
+;; in a query: dotted forms, a group key, a predicate, a chained field
+(set T (table [ts n] (list (as 'TIMESTAMP [763828051000000000 0N 763828051000000001 -1800000000000]) [1 2 3 4])))
+(type (at (select {d: ts.date from: T}) 'd)) -- 'DATE
+(type (at (select {t: ts.time from: T}) 't)) -- 'TIME
+(at (select {d: ts.date from: T}) 'd) -- [2024.03.15 0Nd 2024.03.15 1999.12.31]
+(at (select {t: ts.time from: T}) 't) -- [14:27:31.000 0Nt 14:27:31.000 23:30:00.000]
+(count (select {s: (sum n) by: ts.date from: T})) -- 3
+(at (select {n: n from: T where: (== ts.date 2024.03.15)}) 'n) -- [1 3]
+(at (select {y: ts.date.yyyy from: T}) 'y) -- [2024 0N 2024 1999]
+
+;; a TIME column has no `.date`, a DATE column no `.time`
+(set Tm (table [t] (list [12:30:00.000])))
+(set Dd (table [d] (list [2024.03.06])))
+(select {x: t.date from: Tm}) !- type
+(select {x: d.time from: Dd}) !- type

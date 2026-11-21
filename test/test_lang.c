@@ -6963,6 +6963,29 @@ static test_result_t test_dotted_del_nested(void) {
     PASS();
 }
 
+/* (del t 'col) reads as dropping a column.  del unbinds names only, so a
+ * surplus argument must be refused rather than silently discarded: the old
+ * behaviour unbound `t` and ignored 'col, and the caller saw success. */
+static test_result_t test_del_rejects_surplus_args(void) {
+    ray_eval_str("(set __dela (table [a b] (list [1 2] [10 20])))");
+
+    ASSERT_ER_CODE("(del __dela 'b)", "arity");
+    ASSERT_ER_CODE("(del __dela 'b 'c)", "arity");
+    ASSERT_ER_CODE("(del)", "arity");
+
+    /* The half-applied case is the one to guard: the binding must survive a
+     * refused call, so a caller that meant "drop a column" gets an error
+     * instead of a silently unbound table. */
+    ASSERT_EQ("(count __dela)", "2");
+
+    /* One argument still unbinds, and returns 0. */
+    ASSERT_EQ("(del __dela)", "0");
+    ray_t* gone = ray_eval_str("__dela");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(gone));
+    ray_error_free(gone);
+    PASS();
+}
+
 static test_result_t test_dotted_del_cascade(void) {
     /* Deleting the only key in a namespace removes the namespace itself. */
     ray_eval_str("(set __cascns.only 5)");
@@ -7191,14 +7214,14 @@ static test_result_t test_dotted_temporal_atom(void) {
 }
 
 static test_result_t test_dotted_temporal_truncate_atom(void) {
-    /* `.date` / `.time` truncate a temporal value to day / second
-     * boundary, returning RAY_TIMESTAMP.  Atom path: 90,000,000,000,000
-     * ns = 1 day + 1 hour; truncating to day gives exactly 1 day =
-     * 86,400 s * 1e9 ns = 86,400,000,000,000; truncating to second
-     * leaves the value unchanged (no sub-second remainder here). */
+    /* `.date` / `.time` answer the DATE / TIME of a TIMESTAMP.  Atom path:
+     * 90,000,000,000,000 ns = 1 day + 1 hour: day 1 since 2000.01.01, and
+     * 3,600,000 ms into the day. */
     ray_eval_str("(set __tsa (as 'TIMESTAMP 90000000000000))");
-    ASSERT_EQ("(as 'I64 __tsa.date)", "86400000000000");
-    ASSERT_EQ("(as 'I64 __tsa.time)", "90000000000000");
+    ASSERT_EQ("(type __tsa.date)", "'date");
+    ASSERT_EQ("(type __tsa.time)", "'time");
+    ASSERT_EQ("(as 'I64 __tsa.date)", "1");
+    ASSERT_EQ("(as 'I64 __tsa.time)", "3600000");
     PASS();
 }
 
@@ -7351,11 +7374,10 @@ static test_result_t test_select_by_xbar_empty_type(void) {
     ASSERT_EQ("(count (select {from: __xe by: (xbar Ts 10000)}))", "0");
     ASSERT_EQ("(type (at (select {from: __xe by: (xbar Ts 10000)}) 'Ts))", "'TIME");
 
-    /* Unary path: dotted `.date` truncate should produce TIMESTAMP on
-     * an empty TIMESTAMP column, not I64 (the tail accessor `.date`
-     * returns TIMESTAMP per ray_temporal_truncate). */
+    /* Unary path: dotted `.date` should produce DATE on an empty
+     * TIMESTAMP column, not I64. */
     ray_eval_str("(set __xe2 (table [Timestamp] (list (as 'TIMESTAMP []))))");
-    ASSERT_EQ("(type (at (select {from: __xe2 by: Timestamp.date}) 'date))", "'TIMESTAMP");
+    ASSERT_EQ("(type (at (select {from: __xe2 by: Timestamp.date}) 'date))", "'DATE");
     PASS();
 }
 
@@ -7439,9 +7461,8 @@ static test_result_t test_dag_temporal_extract_nulls(void) {
     /* Null row must surface as 0Nl, not 0 — this is the regression. */
     ASSERT_EQ("(at (at (select {from: __dvt s: Ts.ss}) 's) 1)", "0Nl");
 
-    /* OP_DATE_TRUNC path: `.date` truncates to day boundary and emits
-     * a TIMESTAMP column.  Null row must stay 0Np. */
-    ASSERT_EQ("(at (at (select {from: __dvt s: Ts.date}) 's) 1)", "0Np");
+    /* `.date` emits a DATE column.  Null row must stay 0Nd. */
+    ASSERT_EQ("(at (at (select {from: __dvt s: Ts.date}) 's) 1)", "0Nd");
     PASS();
 }
 
@@ -12347,20 +12368,20 @@ static test_result_t test_temporal_clock_global(void) {
  * with RAY_DATE and RAY_TIME types (not just RAY_TIMESTAMP).
  * Also exercises ray_temporal_trunc_from_sym "time" branch via (time ts). */
 static test_result_t test_temporal_truncate_date_time_atoms(void) {
-    /* DATE atom truncated to day (date path) — already midnight so unchanged */
+    /* DATE atom: a DATE is its own date */
     ray_eval_str("(set __trd (as 'DATE 10))");
     ray_t* r1 = ray_eval_str("(date __trd)");
     TEST_ASSERT_NOT_NULL(r1);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
-    TEST_ASSERT_EQ_I(r1->type, -RAY_TIMESTAMP);
+    TEST_ASSERT_EQ_I(r1->type, -RAY_DATE);
     ray_release(r1);
 
-    /* TIME atom truncated to second boundary via (time t) */
+    /* TIME atom: a TIME is its own time of day */
     ray_eval_str("(set __trt (as 'TIME 3661500))");
     ray_t* r2 = ray_eval_str("(time __trt)");
     TEST_ASSERT_NOT_NULL(r2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
-    TEST_ASSERT_EQ_I(r2->type, -RAY_TIMESTAMP);
+    TEST_ASSERT_EQ_I(r2->type, -RAY_TIME);
     ray_release(r2);
 
     /* Null DATE atom — null output */
@@ -12411,10 +12432,9 @@ static test_result_t test_temporal_date_trunc_subday(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     ray_release(r1);
 
-    /* Verify truncation: 3661000000000 ns = 1h1m1s, .time should give
-     * timestamp at 1h1m1s mark, i.e. 3661 * 1e9 ns */
+    /* 3661000000000 ns = 1h1m1s, .time gives the TIME 3661000 ms */
     ASSERT_EQ("(as 'I64 (at (at (select {from: __dts_col s: Ts.time}) 's) 0))",
-              "3661000000000");
+              "3661000");
     PASS();
 }
 
@@ -13217,6 +13237,7 @@ const test_entry_t lang_entries[] = {
     { "lang/dotted/flat_binding_wins", test_dotted_flat_binding_wins, lang_setup, lang_teardown },
     { "lang/dotted/del_removes_key", test_dotted_del_removes_key, lang_setup, lang_teardown },
     { "lang/dotted/del_nested", test_dotted_del_nested, lang_setup, lang_teardown },
+    { "lang/dotted/del_rejects_surplus_args", test_del_rejects_surplus_args, lang_setup, lang_teardown },
     { "lang/dotted/del_cascade", test_dotted_del_cascade, lang_setup, lang_teardown },
     { "lang/dotted/table_column", test_dotted_table_column, lang_setup, lang_teardown },
     { "lang/dotted/temporal_atom", test_dotted_temporal_atom, lang_setup, lang_teardown },

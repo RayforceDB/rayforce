@@ -38,11 +38,11 @@
 
 ;; DATE atom: already day-aligned, so truncating to day is idempotent
 ;; in value-space but switches the type to TIMESTAMP.
-(type (date 2024.03.15))                      -- 'timestamp
-(date 2024.03.15)                              -- 2024.03.15D00:00:00.000000000
-(date 2000.01.01)                              -- 2000.01.01D00:00:00.000000000
-(date 1999.12.31)                              -- 1999.12.31D00:00:00.000000000
-(date 2024.02.29)                              -- 2024.02.29D00:00:00.000000000
+(type (date 2024.03.15)) -- 'date
+(date 2024.03.15) -- 2024.03.15
+(date 2000.01.01) -- 2000.01.01
+(date 1999.12.31) -- 1999.12.31
+(date 2024.02.29) -- 2024.02.29
 ;; Printer-independent value check: the source DATE literals encode the
 ;; correct days-since-2000.01.01 count (raw i32), so a wrong instant with
 ;; the right type cannot slip past the rendered-form assertions above.
@@ -51,24 +51,24 @@
 (as 'i32 1999.12.31)                           -- -1i
 (as 'i32 2024.02.29)                           -- 8825i
 ;; …and the truncated TIMESTAMP result re-encodes to ns-since-epoch.
-(as 'i64 (date 2024.03.15))                    -- 763776000000000000
+(as 'i64 (date 2024.03.15)) -- 8840
 (as 'i64 (date 2000.01.01))                    -- 0
 
 ;; TIMESTAMP atom: truncate to midnight (drops the time-of-day).
-(type (date 2024.03.15D12:34:56.789000000))   -- 'timestamp
-(date 2024.03.15D12:34:56.789000000)          -- 2024.03.15D00:00:00.000000000
-(date 2024.07.04D23:59:59.999999999)          -- 2024.07.04D00:00:00.000000000
-(date 2024.01.01D00:00:00.000000000)          -- 2024.01.01D00:00:00.000000000
+(type (date 2024.03.15D12:34:56.789000000)) -- 'date
+(date 2024.03.15D12:34:56.789000000) -- 2024.03.15
+(date 2024.07.04D23:59:59.999999999) -- 2024.07.04
+(date 2024.01.01D00:00:00.000000000) -- 2024.01.01
 ;; Pre-epoch (us < 0): the floor-toward -inf branch in
 ;; ray_temporal_truncate (`r < 0 ? bucket : 0`) trims to the prior
 ;; midnight, not toward zero.
-(date 1999.12.31D12:00:00.000000000)          -- 1999.12.31D00:00:00.000000000
+(date 1999.12.31D12:00:00.000000000) -- 1999.12.31
 
 ;; TIME atom: ms since midnight has no date component, so it
 ;; truncates to the 2000-01-01 epoch midnight.
-(type (date 12:34:56.789))                     -- 'timestamp
-(date 12:34:56.789)                            -- 2000.01.01D00:00:00.000000000
-(date 00:00:00.000)                            -- 2000.01.01D00:00:00.000000000
+(type (date 12:34:56.789)) !- type
+(date 12:34:56.789) !- type
+(date 00:00:00.000) !- type
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;                  2.  (time X) — atom overload
@@ -76,31 +76,31 @@
 ;; Same atom path, kind=RAY_EXTRACT_SECOND.  Sub-second fractions
 ;; drop; the result is TIMESTAMP at the second boundary.
 
-(type (time 2024.03.15D12:34:56.789123456))   -- 'timestamp
-(time 2024.03.15D12:34:56.789123456)          -- 2024.03.15D12:34:56.000000000
-(time 2024.03.15D00:00:00.000000000)          -- 2024.03.15D00:00:00.000000000
-(time 2024.03.15D23:59:59.999999999)          -- 2024.03.15D23:59:59.000000000
+(type (time 2024.03.15D12:34:56.789123456)) -- 'time
+(time 2024.03.15D12:34:56.789123456) -- 12:34:56.789
+(time 2024.03.15D00:00:00.000000000) -- 00:00:00.000
+(time 2024.03.15D23:59:59.999999999) -- 23:59:59.999
 ;; Printer-independent: source TIMESTAMP literal carries full ns
 ;; precision (raw i64); (time …) trims to the second boundary, so the
 ;; result's raw count loses the sub-second remainder.
 (as 'i64 2024.03.15D12:34:56.789123456)        -- 763821296789123456
-(as 'i64 (time 2024.03.15D12:34:56.789123456)) -- 763821296000000000
-(as 'i64 (date 2024.03.15D12:34:56.789123456)) -- 763776000000000000
+(as 'i64 (time 2024.03.15D12:34:56.789123456)) -- 45296789
+(as 'i64 (date 2024.03.15D12:34:56.789123456)) -- 8840
 
 ;; TIME atom: sub-second fraction trims.  12:34:56.789 ms → 12:34:56 at
 ;; epoch.
-(type (time 12:34:56.789))                     -- 'timestamp
-(time 12:34:56.789)                            -- 2000.01.01D12:34:56.000000000
-(time 00:00:00.000)                            -- 2000.01.01D00:00:00.000000000
+(type (time 12:34:56.789)) -- 'time
+(time 12:34:56.789) -- 12:34:56.789
+(time 00:00:00.000) -- 00:00:00.000
 ;; Printer-independent: the TIME literal stores ms-since-midnight (raw
 ;; i32); the second-truncated TIMESTAMP result stores ns-since-epoch.
 (as 'i32 12:34:56.789)                          -- 45296789i
 (as 'i32 00:00:00.000)                          -- 0i
-(as 'i64 (time 12:34:56.789))                   -- 45296000000000
+(as 'i64 (time 12:34:56.789)) -- 45296789
 (as 'i64 (time 00:00:00.000))                   -- 0
 
 ;; DATE atom: no sub-day component to trim, result lands on midnight.
-(time 2024.03.15)                              -- 2024.03.15D00:00:00.000000000
+(time 2024.03.15) !- type
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;                  3.  Null atom branches
@@ -108,14 +108,14 @@
 ;; RAY_ATOM_IS_NULL on a typed-null temporal atom routes to
 ;; ray_typed_null(-RAY_TIMESTAMP) → 0Np.
 
-(type (date 0Nd))                              -- 'timestamp
-(date 0Nd)                                     -- 0Np
-(date 0Nt)                                     -- 0Np
-(date 0Np)                                     -- 0Np
-(type (time 0Nd))                              -- 'timestamp
-(time 0Nd)                                     -- 0Np
-(time 0Nt)                                     -- 0Np
-(time 0Np)                                     -- 0Np
+(type (date 0Nd)) -- 'date
+(date 0Nd) -- 0Nd
+(date 0Nt) !- type
+(date 0Np) -- 0Nd
+(type (time 0Nd)) !- type
+(time 0Nd) !- type
+(time 0Nt) -- 0Nt
+(time 0Np) -- 0Nt
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;                  4.  Vector path — ray_temporal_truncate
@@ -127,37 +127,37 @@
 
 ;; DATE vector → TIMESTAMP vector at each day's midnight.
 (set DV  [2024.01.01 2024.06.15 2024.12.31])
-(type (date DV))                               -- 'TIMESTAMP
+(type (date DV)) -- 'DATE
 (count (date DV))                              -- 3
-(at (date DV) 0)                               -- 2024.01.01D00:00:00.000000000
-(at (date DV) 1)                               -- 2024.06.15D00:00:00.000000000
-(at (date DV) 2)                               -- 2024.12.31D00:00:00.000000000
+(at (date DV) 0) -- 2024.01.01
+(at (date DV) 1) -- 2024.06.15
+(at (date DV) 2) -- 2024.12.31
 
 ;; TIMESTAMP vector → trim time-of-day.
 (set TV [2024.03.15D12:34:56.789000000 2024.07.04D23:59:59.999999999 2024.01.01D00:00:00.000000000])
 (count (date TV))                              -- 3
-(at (date TV) 0)                               -- 2024.03.15D00:00:00.000000000
-(at (date TV) 1)                               -- 2024.07.04D00:00:00.000000000
-(at (date TV) 2)                               -- 2024.01.01D00:00:00.000000000
+(at (date TV) 0) -- 2024.03.15
+(at (date TV) 1) -- 2024.07.04
+(at (date TV) 2) -- 2024.01.01
 
 ;; (time TV) → trim sub-second.
 (count (time TV))                              -- 3
-(at (time TV) 0)                               -- 2024.03.15D12:34:56.000000000
-(at (time TV) 1)                               -- 2024.07.04D23:59:59.000000000
-(at (time TV) 2)                               -- 2024.01.01D00:00:00.000000000
+(at (time TV) 0) -- 12:34:56.789
+(at (time TV) 1) -- 23:59:59.999
+(at (time TV) 2) -- 00:00:00.000
 
 ;; TIME vector via (date V) → all rows collapse to epoch midnight
 ;; because TIME has no date component.
 (set TmV [00:00:00.000 12:34:56.789 23:59:59.999])
-(count (date TmV))                             -- 3
-(at (date TmV) 0)                              -- 2000.01.01D00:00:00.000000000
-(at (date TmV) 1)                              -- 2000.01.01D00:00:00.000000000
-(at (date TmV) 2)                              -- 2000.01.01D00:00:00.000000000
+(count (date TmV)) !- type
+(at (date TmV) 0) !- type
+(at (date TmV) 1) !- type
+(at (date TmV) 2) !- type
 
 ;; (time TmV) → trim ms → seconds at epoch.
-(at (time TmV) 0)                              -- 2000.01.01D00:00:00.000000000
-(at (time TmV) 1)                              -- 2000.01.01D12:34:56.000000000
-(at (time TmV) 2)                              -- 2000.01.01D23:59:59.000000000
+(at (time TmV) 0) -- 00:00:00.000
+(at (time TmV) 1) -- 12:34:56.789
+(at (time TmV) 2) -- 23:59:59.999
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;       5.  DAG path — exec_date_trunc via dotted .date / .time
@@ -173,42 +173,39 @@
 
 (set Rts_date (select {from: Tts s: Ts.date}))
 (count Rts_date)                               -- 3
-(at (at Rts_date 's) 0)                        -- 2024.03.15D00:00:00.000000000
-(at (at Rts_date 's) 1)                        -- 2024.07.04D00:00:00.000000000
-(at (at Rts_date 's) 2)                        -- 2024.01.01D00:00:00.000000000
-(type (at Rts_date 's))                        -- 'TIMESTAMP
+(at (at Rts_date 's) 0)                        -- 2024.03.15
+(at (at Rts_date 's) 1)                        -- 2024.07.04
+(at (at Rts_date 's) 2)                        -- 2024.01.01
+(type (at Rts_date 's))                        -- 'DATE
 
 (set Rts_time (select {from: Tts s: Ts.time}))
 (count Rts_time)                               -- 3
-(at (at Rts_time 's) 0)                        -- 2024.03.15D12:34:56.000000000
-(at (at Rts_time 's) 1)                        -- 2024.07.04D23:59:59.000000000
-(at (at Rts_time 's) 2)                        -- 2024.01.01D00:00:00.000000000
+(at (at Rts_time 's) 0)                        -- 12:34:56.789
+(at (at Rts_time 's) 1)                        -- 23:59:59.999
+(at (at Rts_time 's) 2)                        -- 00:00:00.000
 
-;; DATE source column.  exec_date_trunc's int32-path with
-;; RAY_EXTRACT_DAY bucket — already day-aligned, so values
-;; round-trip in TIMESTAMP space.
+;; DATE source column: a DATE is its own date, so values round-trip.
 (set Tdt (table [D] (list [2024.01.01 2024.06.15 2024.12.31])))
 (set Rdt (select {from: Tdt s: D.date}))
 (count Rdt)                                    -- 3
-(at (at Rdt 's) 0)                             -- 2024.01.01D00:00:00.000000000
-(at (at Rdt 's) 1)                             -- 2024.06.15D00:00:00.000000000
-(at (at Rdt 's) 2)                             -- 2024.12.31D00:00:00.000000000
+(at (at Rdt 's) 0)                             -- 2024.01.01
+(at (at Rdt 's) 1)                             -- 2024.06.15
+(at (at Rdt 's) 2)                             -- 2024.12.31
 
-;; TIME source column.  exec_date_trunc int32-path with
-;; RAY_EXTRACT_SECOND bucket — ms granularity trims to whole seconds.
+;; TIME source column: a TIME is its own time of day, milliseconds kept.
 (set Ttm (table [T] (list [00:00:00.500 12:34:56.789 23:59:59.999])))
 (set Rtm (select {from: Ttm s: T.time}))
 (count Rtm)                                    -- 3
-(at (at Rtm 's) 0)                             -- 2000.01.01D00:00:00.000000000
-(at (at Rtm 's) 1)                             -- 2000.01.01D12:34:56.000000000
-(at (at Rtm 's) 2)                             -- 2000.01.01D23:59:59.000000000
+(at (at Rtm 's) 0)                             -- 00:00:00.500
+(at (at Rtm 's) 1)                             -- 12:34:56.789
+(at (at Rtm 's) 2)                             -- 23:59:59.999
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;       6.  Group-by .date — produces day buckets
 ;; ═══════════════════════════════════════════════════════════════════
 ;; Two timestamps on 2024-03-15 plus one on 2024-03-16 collapse to
-;; exactly 2 groups, confirming exec_date_trunc emits identical
-;; bucket values for same-day inputs.
+;; exactly 2 groups, confirming `.date` emits identical DATE
+;; keys for same-day inputs.
 (set Tgb (table [Ts Px] (list [2024.03.15D09:00:00.000000000 2024.03.15D17:30:00.000000000 2024.03.16D12:00:00.000000000] [1.0 2.0 3.0])))
 (count (select {from: Tgb by: Ts.date}))      -- 2
 
@@ -226,6 +223,15 @@
 (type (date 'global))                          -- 'date
 (type (time 'global))                          -- 'time
 (type (timestamp 'global))                     -- 'timestamp
+
+;; The clock reads carry the system clock's sub-second part rather than
+;; a whole-second value with a zero fraction.  Five samples: the odds of
+;; every one landing exactly on a second (timestamp) or a millisecond
+;; (time) boundary are 1e-45 / 1e-15, so the assertion is stable.
+(set clock-ts (list (as 'i64 (timestamp 'global)) (as 'i64 (timestamp 'global)) (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 0))))
+(any (!= 0 (% (as 'i64 clock-ts) 1000000000)))  -- true
+(set clock-tm (list (as 'i64 (time 'global)) (as 'i64 (time 'global)) (as 'i64 (time 'local)) (as 'i64 (time 'local)) (as 'i64 (time 0))))
+(any (!= 0 (% (as 'i64 clock-tm) 1000)))        -- true
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;       8.  Duration arithmetic — DATE / TIMESTAMP differences
@@ -257,13 +263,13 @@
 ;; ═══════════════════════════════════════════════════════════════════
 ;; Re-truncating a value that's already on the day boundary returns
 ;; the same TIMESTAMP.
-(date (date 2024.03.15D12:34:56.789000000))   -- 2024.03.15D00:00:00.000000000
-(time (time 2024.03.15D12:34:56.789000000))   -- 2024.03.15D12:34:56.000000000
+(date (date 2024.03.15D12:34:56.789000000)) -- 2024.03.15
+(time (time 2024.03.15D12:34:56.789000000)) -- 12:34:56.789
 
 ;; (date ∘ time) on a TIMESTAMP still yields the day-boundary because
 ;; trimming sub-seconds keeps the date intact, then `(date …)` drops
 ;; the hours.
-(date (time 2024.03.15D12:34:56.789000000))   -- 2024.03.15D00:00:00.000000000
+(date (time 2024.03.15D12:34:56.789000000)) !- type
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;       10. Combined extract → truncate consistency

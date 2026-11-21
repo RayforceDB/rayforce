@@ -1,0 +1,64 @@
+;; prefilter_compound.rfl -- answers of compound and SYM key joins whose large
+;; left side is skipped through the right-side key bitmap prefilter (#595).
+;;
+;; A left row whose value on some key column no right row holds is dropped by
+;; an inner join and emitted unmatched by a left join without being hashed.
+;; These are the answers the full probe gives; test_join_prefilter.c pins that
+;; the filter is actually taken and compares it against the plain probe.
+;; @requires: posix
+
+;; 20000 left rows over 97 books (venue, instrument); book b = row % 97 lives
+;; on venue b % 6.  Book 3 holds 207 rows, book 40 holds 206.
+(set PI (as 'SYM (map (fn [i] (format "I%" i)) (til 97))))
+(set PV (at (as 'SYM (map (fn [i] (format "V%" i)) (til 6))) (% (til 97) 6)))
+(set PL (table [venue instrument sid px] (list (take PV 20000) (take PI 20000) (% (til 20000) 5) (til 20000))))
+(set PR (table [venue instrument sid w] (list (at PV [3 40]) (at PI [3 40]) [1 0] [100 200])))
+
+;; ── two SYM keys ──────────────────────────────────────────────────────────
+(count (inner-join [venue instrument] PL PR)) -- 413
+(sum (at (inner-join [venue instrument] PL PR) 'px)) -- 4125153
+(count (left-join [venue instrument] PL PR)) -- 20000
+(sum (fill 0 (at (left-join [venue instrument] PL PR) 'w))) -- 61900
+(count (select {from: (left-join [venue instrument] PL PR) where: (nil? w)})) -- 19587
+
+;; ── three keys, the third an integer ──────────────────────────────────────
+(count (inner-join [venue instrument sid] PL PR)) -- 83
+(sum (at (inner-join [venue instrument sid] PL PR) 'px)) -- 832996
+(count (left-join [venue instrument sid] PL PR)) -- 20000
+(sum (fill 0 (at (left-join [venue instrument sid] PL PR) 'w))) -- 12500
+
+;; ── a pair no left row holds: instrument 3 on book 40's venue ─────────────
+(set PX (table [venue instrument w] (list (at PV [40]) (at PI [3]) [5])))
+(count (inner-join [venue instrument] PL PX)) -- 0
+(count (left-join [venue instrument] PL PX)) -- 20000
+(sum (fill 0 (at (left-join [venue instrument] PL PX) 'w))) -- 0
+
+;; ── null keys: null equals null, never a value ────────────────────────────
+;; Every 50th left row has a null venue and instrument.
+(set PNV (as 'SYM (map (fn [i] (if (== 0 (% i 50)) "" (format "V%" (% (% i 97) 6)))) (til 20000))))
+(set PNI (as 'SYM (map (fn [i] (if (== 0 (% i 50)) "" (format "I%" (% i 97)))) (til 20000))))
+(set PN (table [venue instrument px] (list PNV PNI (til 20000))))
+(set PRN (table [venue instrument w] (list (as 'SYM ["V3" "V4" ""]) (as 'SYM ["I3" "I40" ""]) [100 200 7])))
+(count (inner-join [venue instrument] PN PRN)) -- 804
+(count (inner-join [venue instrument] PN PR)) -- 404
+(count (left-join [venue instrument] PN PRN)) -- 20000
+(sum (fill 0 (at (left-join [venue instrument] PN PRN) 'w))) -- 63400
+
+;; ── an empty right side, and one where every left row matches ─────────────
+(set PE (select {from: PR where: (> w 1000)}))
+(count PE) -- 0
+(count (inner-join [venue instrument] PL PE)) -- 0
+(count (left-join [venue instrument] PL PE)) -- 20000
+(set PA (table [venue instrument w] (list PV PI (til 97))))
+(count (inner-join [venue instrument] PL PA)) -- 20000
+(sum (at (inner-join [venue instrument] PL PA) 'w)) -- 959289
+(count (left-join [venue instrument] PL PA)) -- 20000
+
+;; ── FILE-domain keys from a splayed table, against runtime keys ───────────
+(.sys.exec "rm -rf /tmp/rfl_join_prefilter")
+(.db.splayed.set "/tmp/rfl_join_prefilter/l/" PL "/tmp/rfl_join_prefilter/.sym")
+(set PF (.db.splayed.get "/tmp/rfl_join_prefilter/l/" "/tmp/rfl_join_prefilter/.sym"))
+(count (inner-join [venue instrument] PF PR)) -- 413
+(sum (at (inner-join [venue instrument] PF PR) 'px)) -- 4125153
+(sum (fill 0 (at (left-join [venue instrument sid] PF PR) 'w))) -- 12500
+(.sys.exec "rm -rf /tmp/rfl_join_prefilter")

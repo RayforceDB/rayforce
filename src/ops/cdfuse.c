@@ -851,7 +851,8 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * post-group row→group map and a per-group dedup over the slices (the
  * global-hash kernel past 50 K groups).  Up to CD_SCATTER_MAX_GROUPS groups
  * it is the route whenever the rewrite's (K, X) grouping would not be
- * dense; past CD_SCATTER_MANY_GROUPS its map and kernel fall behind the
+ * dense and the groups hold more than a few rows each (CD_SCATTER_FEW_ROWS);
+ * past CD_SCATTER_MANY_GROUPS its map and kernel fall behind the
  * rewrite's radix grouping whatever that grouping dedups; between the two
  * the tuple count decides. */
 #define CD_SCATTER_MAX_GROUPS  (256 * 1024)
@@ -866,6 +867,67 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * 138, uniform groups 89 against 140 (12 M rows surviving a filter over
  * 100 M; the issue's 45 groups hold 2% each). */
 #define CD_SCATTER_SKEW 8
+
+/* Groups of a few rows each: the scatter's row map and per-group dedup cost
+ * the same per group whatever it holds, while the rewrite's (K, X) pass is
+ * no more than the rows.  Past this many groups for every CD_SCATTER_FEW_ROWS
+ * rows the rewrite is the route, whatever the tuples dedup: at 1.4 M rows
+ * surviving a filter over 10 M, 835 K groups of distinct values took 16 ms on
+ * the rewrite against 21 on the scatter (the search phrases of the hits
+ * table, 835 K groups of 1.4 M rows, 12 against 22), 400 K groups 16 against
+ * 17; 100 K groups of 300 K rows 5.0 against 8.4; 900 K groups of 3 M rows
+ * 26 against 31.  At 5 to 6 rows a group it is about even, at 6 and more the
+ * scatter takes less time and memory (835 K groups of 5 M rows, 45 against
+ * 49 ms; 300 K of 5 M, 37 against 45).
+ * Only where the count is the selection's and the rewrite stays narrow
+ * (cd_few_rows):
+ * - a `where:` the gate could not sample leaves an estimate of the whole
+ *   table, whose groups may be the ones the filter drops: 50 groups kept
+ *   beside a million singletons dropped took 26 ms and 570 MB on the
+ *   rewrite against 14 ms and 330 MB on the scatter;
+ * - the rewrite orders a (K, X) tuple a row, its width the keys' bytes and
+ *   X's: two 8-byte keys of 3 rows a group over 3 M rows took the same time
+ *   and 175 MB more, fifteen 1.9x the time at -m 1G and twice the memory;
+ *   CD_FEW_ROWS_KEY_BYTES bounds the keys' bytes;
+ * - a key clustered in runs of equal values, unsorted, reads as singletons
+ *   at the sample's stride and estimates as many groups as rows: runs of
+ *   10 over 900 K rows estimated 870 K groups for 100 K, and took 9.9 ms on
+ *   the rewrite against 7.1 on the scatter.  The rows next to sampled ones
+ *   tell: the rule holds off when most sampled rows have the next row's key
+ *   (runs of CD_SCATTER_FEW_ROWS rows and more). */
+#define CD_SCATTER_FEW_ROWS 4
+#define CD_FEW_ROWS_KEY_BYTES 8
+#define CD_RUN_PROBES 4096
+
+/* Whether the groups of the `nrows` rows of `rows` (NULL: the first nrows)
+ * hold a few rows each on the estimate (k_card over pop) and that estimate
+ * can be taken at its word: the keys narrow, and the sampled rows' keys
+ * mostly unlike the next row's (see CD_SCATTER_FEW_ROWS). */
+static bool cd_few_rows(ray_t** K_cols, int n_K, const int64_t* rows, int64_t nrows,
+                        int64_t pop, int64_t k_card) {
+    if (k_card < pop / CD_SCATTER_FEW_ROWS) return false;
+    int64_t kb = 0;
+    for (int j = 0; j < n_K; j++) kb += col_esz(K_cols[j]);
+    if (kb > CD_FEW_ROWS_KEY_BYTES) return false;
+    const int64_t len = K_cols[0]->len;
+    const int64_t n = nrows < CD_RUN_PROBES ? nrows : CD_RUN_PROBES;
+    int64_t probed = 0, same = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const int64_t j = agg_est_sample_row(i, n, nrows);
+        const int64_t r = rows ? rows[j] : j;
+        if (r + 1 >= len) continue;
+        bool eq = true;
+        for (int k = 0; k < n_K && eq; k++) {
+            const ray_t* c = K_cols[k];
+            const void* d = ray_data((ray_t*)c);
+            eq = read_col_i64(d, r, c->type, c->attrs) == read_col_i64(d, r + 1, c->type, c->attrs);
+        }
+        probed++;
+        same += eq;
+    }
+    /* a run of L rows has its next row alike for L-1 of them */
+    return probed > 0 && same * CD_SCATTER_FEW_ROWS < probed * (CD_SCATTER_FEW_ROWS - 1);
+}
 
 /* Whether the two-pass rewrite (group by (K, X), then count per K; query.c)
  * beats grouping by K and counting distinct X over each group's slice — the
@@ -882,7 +944,8 @@ ray_t* ray_cd_fused(ray_t* key_col, ray_t* val_col, int64_t nrows) {
  * at 750 K groups whose (K, X) tuples were as many as the rows the scatter
  * took 1.3x less time and 1.9x less memory, and at 750 K groups whose
  * tuples were a sixth of the rows the rewrite took 1.3x less time; below
- * 256 K groups the scatter is the route (#756).  Few groups do not favour
+ * 256 K groups the scatter is the route (#756) unless the groups hold a few
+ * rows each (CD_SCATTER_FEW_ROWS, #900).  Few groups do not favour
  * the rewrite: at 2 to 9 groups of 3 M to 6 M values on 28 workers the
  * slice dedup took the same time or less and 40% of the memory, and the
  * issue's 45 groups on 46 workers would otherwise have taken the rewrite at
@@ -942,6 +1005,10 @@ bool ray_cd_two_pass_preferred(ray_t** K_cols, int n_K, ray_t* X_col,
     if (k_span <= nrows / x_est) return true;        /* dense: a direct-index dedup */
     /* a dominant group: the scatter would dedup it on one worker */
     if (workers > 1 && k_max > nrows / workers * CD_SCATTER_SKEW) return true;
+    /* groups of a few rows: the scatter pays per group, the rewrite per row;
+     * not on the whole table's count for a `where:` it could not sample
+     * (population < 0) */
+    if (population >= 0 && cd_few_rows(K_cols, n_K, rows, nrows_list, nrows, k_card)) return true;
     if (k_card > CD_SCATTER_MANY_GROUPS) return true;
     /* the slices on a count the sample cannot vouch for (more sampled
      * singletons than the Chao1's repeats explain: any count past the

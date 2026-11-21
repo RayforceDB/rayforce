@@ -444,6 +444,27 @@ static size_t heap_rss_kb(void) {
 #endif
 }
 
+/* 1 if the page holding p is resident, 0 if not, -1 if this platform cannot
+ * tell (macOS releases with MADV_FREE, which leaves pages resident until the
+ * kernel wants them). */
+static int relieve_resident(const void* p) {
+#if defined(__linux__)
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)p & ~(uintptr_t)(ps - 1);
+    unsigned char v = 0;
+    if (mincore((void*)a, (size_t)ps, &v) != 0) return -1;
+    return v & 1;
+#else
+    (void)p;
+    return -1;
+#endif
+}
+
+static bool relieve_mincore(void) {
+    static char page[8192];
+    return relieve_resident(page + 4096) >= 0;
+}
+
 static test_result_t test_idle_decay_releases_pages(void) {
     /* Threshold 0 means "release at the first maintenance point after any
      * work", so the test asserts the mechanism without sleeping on a clock. */
@@ -457,25 +478,33 @@ static test_result_t test_idle_decay_releases_pages(void) {
     if (!v) { ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT); SKIP("16 MB block unavailable"); }
     memset(ray_data(v), 0xA5, big);          /* fault every page in */
 
+    const char* probe = (const char*)v + (8u << 20);
+    int res0 = relieve_resident(probe);
     size_t rss_live = heap_rss_kb();
     ray_free(v);
 
     /* One collector pass can only age a freshly inserted block (attrs 0 -> 1),
-     * never release it. */
+     * never release it.  Aggregate RSS is not this block's state: pass 5 may
+     * first release older free blocks, because its cursor and budget are
+     * deliberately incremental. */
     ray_heap_gc();
-    size_t rss_gc = heap_rss_kb();
+    int res1 = relieve_resident(probe);
 
     ray_heap_note_activity();
     int64_t released = ray_heap_decay();
+    int res2 = relieve_resident(probe);
     size_t rss_decay = heap_rss_kb();
 
     ray_heap_set_decay_ms(RAY_HEAP_DECAY_MS_TEST_DEFAULT);
 
     TEST_ASSERT(released >= 1, "the decay sweep released at least one block");
+    if (relieve_mincore()) {
+        TEST_ASSERT(res0 == 1, "the written block was resident");
+        TEST_ASSERT(res1 == 1, "collector alone keeps this block resident");
+        TEST_ASSERT(res2 == 0, "decay handed this block back");
+    }
     if (rss_live > 0) {
         size_t half = (big / 1024) / 2;
-        TEST_ASSERT(rss_gc + half > rss_live,
-                    "collector alone keeps the freed block resident");
         TEST_ASSERT(rss_decay + half < rss_live,
                     "decay handed most of the freed block back");
     }
@@ -879,6 +908,45 @@ static test_result_t test_heap_abandon_is_adopted(void) {
 
     ray_heap_destroy();   /* real teardown — no thread owns heap_b now */
     ray_tl_heap = heap_a;
+    PASS();
+}
+
+/* Environment is process state, not a property of an abandoned heap.  A new
+ * owner must see the same swap directory as a newly mapped heap would. */
+static test_result_t test_heap_abandon_refreshes_swap_path(void) {
+    ray_heap_t* base = ray_tl_heap;
+    const char* old_swap = getenv("RAY_HEAP_SWAP");
+    const char* old_tmp = getenv("TMPDIR");
+    char* saved_swap = old_swap ? strdup(old_swap) : NULL;
+    char* saved_tmp = old_tmp ? strdup(old_tmp) : NULL;
+    bool saved = (!old_swap || saved_swap) && (!old_tmp || saved_tmp);
+
+    ray_tl_heap = NULL;
+    unsetenv("RAY_HEAP_SWAP");
+    setenv("TMPDIR", "/tmp/rayforce_adopt_old", 1);
+    ray_heap_init();
+    ray_heap_t* abandoned = ray_tl_heap;
+    ray_heap_abandon();
+
+    setenv("TMPDIR", "/tmp/rayforce_adopt_new", 1);
+    ray_heap_init();
+    bool same = ray_tl_heap == abandoned;
+    bool fresh = ray_tl_heap &&
+        strcmp(ray_tl_heap->swap_path, "/tmp/rayforce_adopt_new/") == 0;
+    ray_heap_destroy();
+    ray_tl_heap = base;
+
+    unsetenv("RAY_HEAP_SWAP");
+    unsetenv("TMPDIR");
+    if (saved_swap) setenv("RAY_HEAP_SWAP", saved_swap, 1);
+    if (saved_tmp) setenv("TMPDIR", saved_tmp, 1);
+    free(saved_swap);
+    free(saved_tmp);
+
+    TEST_ASSERT(saved, "saved the swap environment");
+    TEST_ASSERT_NOT_NULL(abandoned);
+    TEST_ASSERT(same, "the abandoned heap was adopted");
+    TEST_ASSERT(fresh, "adoption refreshed the swap directory");
     PASS();
 }
 
@@ -3036,30 +3104,6 @@ static int relieve_parked(ray_heap_t* h) {
     uint32_t n = 0;
     for (uint32_t p = 0; p < h->pool_count; p++) n += h->pools[p].parked;
     return n == h->parked ? (int)n : -1;
-}
-
-/* 1 if the page holding p is resident, 0 if not, -1 if this platform cannot
- * tell (macOS releases with MADV_FREE, which leaves pages resident until the
- * kernel wants them). */
-static int relieve_resident(const void* p) {
-#if defined(__linux__)
-    long ps = sysconf(_SC_PAGESIZE);
-    uintptr_t a = (uintptr_t)p & ~(uintptr_t)(ps - 1);
-    unsigned char v = 0;
-    if (mincore((void*)a, (size_t)ps, &v) != 0) return -1;
-    return v & 1;
-#else
-    (void)p;
-    return -1;
-#endif
-}
-
-/* Whether residency can be read here at all (mincore): the checks of it
- * are skipped where it cannot be — never because the page looked at is
- * gone, which reads as -1 and fails them. */
-static bool relieve_mincore(void) {
-    static char page[8192];
-    return relieve_resident(page + 4096) >= 0;
 }
 
 /* Relief visits this heap and the singleton pool's quiescent workers.
@@ -5330,8 +5374,11 @@ static test_result_t test_anon_watermark_spill(void) {
      * anonymous instead of spilling. */
     ray_heap_direct_cache_drain();
     int64_t base = ray_heap_anon_committed();
-    /* Headroom for exactly one ~40 MB block, not two. */
-    ray_heap_set_anon_watermark(base + 48 * 1024 * 1024);
+    /* Each direct map is 41.94 MiB including its header and page rounding.
+     * Base 42 MiB: above the first allocation alone, below two of them.
+     * The old 48 MiB ceiling exceeded two maps with an empty heap, so it
+     * legitimately let the second allocation stay anonymous. */
+    ray_heap_set_anon_watermark(base + 42 * 1024 * 1024);
 
     ray_t* a = ray_alloc(sz);
     bool a_file = a ? ray_direct_file_backed(a) : true;   /* expect anon (RAM) */
@@ -6463,6 +6510,7 @@ const test_entry_t heap_entries[] = {
     { "heap/reclaim_worker_drains_owner", test_reclaim_worker_drains_owner_list, heap_setup, heap_teardown },
     { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
     { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
+    { "heap/abandon_refreshes_swap_path", test_heap_abandon_refreshes_swap_path, heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
     { "heap/str_pool_owned_ref",       test_str_pool_owned_ref,          heap_setup, heap_teardown },
     { "heap/sentinel_null_release",    test_sentinel_null_release,       heap_setup, heap_teardown },

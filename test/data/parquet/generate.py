@@ -88,6 +88,7 @@ def plain(pt, values):
     if pt == 6:
         encoded = [x if isinstance(x,bytes) else x.encode() for x in values]
         return b''.join(struct.pack('<I',len(x))+x for x in encoded)
+    if pt in (3, 7): return b''.join(values)   # INT96 and FIXED_LEN_BYTE_ARRAY: no length prefix
     return struct.pack('<'+{1:'i',2:'q',4:'f',5:'d'}[pt]*len(values), *values)
 
 def integer_hash(x, width):
@@ -126,10 +127,15 @@ def write(path, specs, groups, codec=1, v2=False, dictionary=True, crc=False, le
     schema = [[(3,I32,0),(4,BINARY,'schema'),(5,I32,len(specs))]]
     for name,pt,optional,converted in specs:
         s = [(1,I32,pt),(3,I32,int(optional)),(4,BINARY,name)]
-        if isinstance(converted,tuple):
-            # ('decimal', scale, precision, logical): DECIMAL on an integer column,
-            # as the converted type, and also as the logical type when asked.
-            _, dscale, dprec, logical = converted
+        if isinstance(converted,tuple) and converted[0] == 'fixed':
+            # ('fixed', length): FIXED_LEN_BYTE_ARRAY with no annotation.
+            s.append((2,I32,converted[1]))
+        elif isinstance(converted,tuple):
+            # ('decimal', scale, precision, logical[, length]): DECIMAL on an
+            # integer column, as the converted type, and also as the logical type
+            # when asked; with a length, on a FIXED_LEN_BYTE_ARRAY of that many bytes.
+            _, dscale, dprec, logical, *length = converted
+            if length: s.append((2,I32,length[0]))
             s += [(6,I32,5),(7,I32,dscale),(8,I32,dprec)]
             if logical: s.append((10,STRUCT,[(5,STRUCT,[(1,I32,dscale),(2,I32,dprec)])]))
         elif converted is not None: s.append((6,I32,converted))
@@ -351,4 +357,35 @@ if __name__ == '__main__':
     # Refused: a decimal on a byte array (fixed or variable length), whose
     # values are no integers, and a scale above the precision.
     write(root/'decimal-binary.parquet',[('d',6,False,('decimal',2,10,True))],[[[b'\x01',b'\x02']]],dictionary=False)
+    # DECIMAL on a FIXED_LEN_BYTE_ARRAY: the unscaled integer, big-endian two's
+    # complement, in `length` bytes. A DECIMAL(38,19) in 16 bytes, a DECIMAL(20,4)
+    # in 9 (nullable, to check the sign extension of a short length), a DECIMAL(9,2)
+    # in 4, beside an integer column. Dictionary and plain pages, v1 and v2 pages.
+    def be(n, length): return n.to_bytes(length, 'big', signed=True)
+    wide_vals=[0, 5*10**18, -2*10**19, 1234500000000000000000, -10**37, 10**38-1, 1, 71894300000000000000000]
+    mid_vals=[12345678, None, -1, 10**18, 0, None, -12345678, 7]
+    narrow_vals=[12345, -1, 0, 99999999, -99999999, 1, 100, -100]
+    ids=list(range(1,9))
+    def be_min(n): return be(n, max(1, (n.bit_length()+8)//8))   # shortest two's complement
+    var_vals=[1, -1, 255, -256, 10**20, -10**20, 0, 12345678901234567890123]
+    specs_wide=[('id',1,False,None),
+                ('wide',7,False,('decimal',19,38,True,16)),
+                ('mid',7,True,('decimal',4,20,True,9)),
+                ('narrow',7,False,('decimal',2,9,False,4)),
+                ('var',6,False,('decimal',3,30,True))]
+    rows_wide=[ids,[be(x,16) for x in wide_vals],[None if x is None else be(x,9) for x in mid_vals],[be(x,4) for x in narrow_vals],[be_min(x) for x in var_vals]]
+    for dictionary in (False,True):
+        for v2 in (False,True):
+            write(root/f'decimal-wide-{int(dictionary)}-{int(v2)}.parquet',specs_wide,[rows_wide],codec=0,v2=v2,dictionary=dictionary)
+    # Rounding of the unscaled integer to a double: exact below 2^53, ties to even
+    # above (2^53+1 down, 2^53+3 up, 2^100 plus half an ulp down, plus one up).
+    round_vals=[2**53+1, 2**53+3, -(2**53+1), 2**100+2**47, 2**100+2**47+1, -(2**100+2**47+1), 10**38-1, -(10**38-1)]
+    write(root/'decimal-round.parquet',[('d',7,False,('decimal',0,38,True,16))],[[[be(x,16) for x in round_vals]]],codec=0,dictionary=False)
+    # Columns the reader does not read, beside two it does: a DECIMAL on a
+    # BYTE_ARRAY, a FIXED_LEN_BYTE_ARRAY with no annotation and an INT96.
+    specs_unsupported=[('id',1,False,None),('amount',2,False,('decimal',3,18,True)),
+                       ('blob_dec',6,False,('decimal',2,10,True)),
+                       ('fixed',7,False,('fixed',16)),('i96',3,False,None)]
+    rows_unsupported=[[1,2,3],[1500,-250,0],[b'\x01',b'\x02',b'\x03'],[bytes([i])*16 for i in (1,2,3)],[bytes([i])*12 for i in (1,2,3)]]
+    write(root/'unsupported-columns.parquet',specs_unsupported,[rows_unsupported],codec=0,dictionary=False)
     write(root/'decimal-bad-scale.parquet',[('d',2,False,('decimal',5,3,True))],[[[1,2,3]]],dictionary=False)
