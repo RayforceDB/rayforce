@@ -40,11 +40,11 @@
 (at (at Rdatek 'mx) 2) -- 30
 ;; Per-group order-independent checks: positional (at 'mn)/(at 'mx) above
 ;; assume emission order; key-masked lookup pins each DATE group's min/max.
-(at (at (select {s: (sum v) mn: (min v) mx: (max v) from: Tdatek by: k where: (== k 7305)}) 'mn) 0) -- 1
-(at (at (select {mx: (max v) from: Tdatek by: k where: (== k 7305)}) 'mx) 0) -- 10
-(at (at (select {mn: (min v) from: Tdatek by: k where: (== k 7307)}) 'k) 0) -- 2020.01.03
-(at (at (select {mn: (min v) from: Tdatek by: k where: (== k 7307)}) 'mn) 0) -- 3
-(at (at (select {mx: (max v) from: Tdatek by: k where: (== k 7307)}) 'mx) 0) -- 30
+(at (at (select {s: (sum v) mn: (min v) mx: (max v) from: Tdatek by: k where: (== k 2020.01.01)}) 'mn) 0) -- 1
+(at (at (select {mx: (max v) from: Tdatek by: k where: (== k 2020.01.01)}) 'mx) 0) -- 10
+(at (at (select {mn: (min v) from: Tdatek by: k where: (== k 2020.01.03)}) 'k) 0) -- 2020.01.03
+(at (at (select {mn: (min v) from: Tdatek by: k where: (== k 2020.01.03)}) 'mn) 0) -- 3
+(at (at (select {mx: (max v) from: Tdatek by: k where: (== k 2020.01.03)}) 'mx) 0) -- 30
 
 ;; TIME key (I32-width arm)
 (set Ttimek (table [k v] (list (as 'TIME [1000 2000 3000 1000 2000 3000]) (as 'I64 [5 10 15 20 30 40]))))
@@ -53,11 +53,11 @@
 (sum (at Rtimek 's)) -- 120
 ;; Per-group order-independent checks: the sum total above is the only value
 ;; assertion; key-masked lookup pins each TIME group's sum and key.
-(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 1000)}) 's) 0) -- 25
-(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 1000)}) 'k) 0) -- 00:00:01.000
-(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 2000)}) 's) 0) -- 40
-(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 2000)}) 'k) 0) -- 00:00:02.000
-(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 3000)}) 's) 0) -- 55
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 00:00:01.000)}) 's) 0) -- 25
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 00:00:01.000)}) 'k) 0) -- 00:00:01.000
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 00:00:02.000)}) 's) 0) -- 40
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 00:00:02.000)}) 'k) 0) -- 00:00:02.000
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 00:00:03.000)}) 's) 0) -- 55
 
 ;; ─── I32 agg values in group-by (da_accum_fn I32 arm) ────────────────
 ;; I32 value column with SUM/MIN/MAX aggregation; key is I64 so DA path
@@ -365,14 +365,14 @@
 (set T_t_datek (table [k v] (list (as 'DATE [7305 7305 7306 7306]) (as 'I64 [10 20 30 40]))))
 (sum (raze (at (select {t: (top v 1) by: k from: T_t_datek}) 't))) -- 60
 ;; Key-masked lookups pin each DATE-key group's top value and key.
-(at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7305)}) 't) 0) 0) -- 20
-(at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7305)}) 'k) 0) -- 2020.01.01
-(at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7306)}) 't) 0) 0) -- 40
+(at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 2020.01.01)}) 't) 0) 0) -- 20
+(at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 2020.01.01)}) 'k) 0) -- 2020.01.01
+(at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 2020.01.02)}) 't) 0) 0) -- 40
 
 ;; grpt_key_read TIME arm
 (set T_t_timek (table [k v] (list (as 'TIME [1000 1000 2000 2000]) (as 'I64 [5 10 15 20]))))
 (sum (raze (at (select {t: (top v 1) by: k from: T_t_timek}) 't))) -- 30
 ;; Key-masked lookups pin each TIME-key group's top value and key.
-(at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 1000)}) 't) 0) 0) -- 10
-(at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 1000)}) 'k) 0) -- 00:00:01.000
-(at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 2000)}) 't) 0) 0) -- 20
+(at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 00:00:01.000)}) 't) 0) 0) -- 10
+(at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 00:00:01.000)}) 'k) 0) -- 00:00:01.000
+(at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 00:00:02.000)}) 't) 0) 0) -- 20

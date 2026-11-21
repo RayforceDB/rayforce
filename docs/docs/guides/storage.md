@@ -428,11 +428,21 @@ write pass. A native STR pool has 32-bit offsets: use `SYM` or partitioned outpu
 when a column's pooled bytes exceed 4 GiB. CSV splayed STR import now uses the
 same streaming column writer, without materializing the entire CSV.
 
-Partitioned conversion dispatches row groups independently and assigns numeric
+Partitioned conversion dispatches partitions independently and assigns numeric
 partition IDs in source order, with at most 65,536 rows per partition by default.
+For a multi-file import the dispatch covers all the files of a batch (up to 256
+files, or 64 partitions' worth of rows) at once, and its unit is a partition: a
+row group larger than `rows` makes several, and smaller row groups, across files
+too, are packed into one. Parallelism is therefore bounded by the number of
+partitions, so a very large `rows` trades parallelism for fewer, larger
+partitions; a pack is assembled in memory, so peak memory rises with `rows` and the
+workers. Symbols of a `SYM` column are interned by whichever worker reaches them
+first, so the vocabulary order (the `.sym` file and the ids in the column) can differ
+between runs of the same import; the values do not.
 An import options dictionary can replace the positional type vector:
 `{types: [I64 SYM] rows: 262144 strict: true}`. `types` and `strict` are optional;
-`rows` accepts 1 through 1,048,576. Row-group boundaries also end partitions.
+`rows` accepts 1 through 1,048,576. A row group larger than `rows` is split; smaller
+ones are packed together into partitions of up to `rows`.
 Larger batches require more memory. Partitions holding long strings are
 smaller than `rows`, since a partition is one decode batch and batches keep
 STR pools near 64 MiB. Splayed imports accept the same options to control their decode batches.

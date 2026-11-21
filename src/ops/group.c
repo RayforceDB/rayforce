@@ -1548,6 +1548,15 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         .values = out_buf, .part_off = part_off, .part_count = part_count,
     };
     ray_pool_dispatch_n(pool, cd_part_dedup_fn, &dctx, (uint32_t)P);
+    /* A cancel skips the tasks it lands before, and the flag stays set, so
+     * every later pass runs none: a cancel in any pass leaves the dedup's
+     * counts unwritten, read only here.  (A histogram task skipped leaves
+     * zeros, hist being zeroed; the scatter that would trust it never runs.) */
+    if (pool_cancelled(pool)) {
+        scratch_free(pcnt_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     int64_t total_distinct = 0;
     for (uint64_t p = 0; p < P; p++) {
@@ -2049,8 +2058,11 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     }
     part_off[P] = total;
     if (total != len) {
+        /* a cancel leaves its skipped tasks' counts zero (hist is zeroed):
+         * the histogram is short */
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
-        return ray_error("nyi", "distinct: histogram mismatch");
+        return pool_cancelled(pool) ? ray_error("cancel", NULL)
+                                    : ray_error("nyi", "distinct: histogram mismatch");
     }
 
     /* Pass 2: scatter (value, row id) pairs. */
@@ -2092,6 +2104,15 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
         .part_count = part_count, .first = first,
     };
     ray_pool_dispatch_n(pool, dv_part_dedup_fn, &dctx, (uint32_t)P);
+    /* A cancel skips the tasks it lands before, and the flag stays set, so
+     * the passes after it run none: a cancel in the scatter or the dedup
+     * leaves the dedup's counts and marks unwritten, read only here. */
+    if (pool_cancelled(pool)) {
+        scratch_free(pcnt_hdr); scratch_free(first_hdr);
+        scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     int64_t total_distinct = 0;
     for (uint64_t p = 0; p < P; p++) {
@@ -2363,6 +2384,11 @@ static ray_t* count_distinct_per_group_parallel(
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
     if (!ctx.hist) { return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
+    /* Each pass reads the one before it: the histogram sizes and places the
+     * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
+     * their part unwritten (a short histogram would send the scatter past
+     * its partitions). */
+    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2413,13 +2439,16 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 3: per-partition dedup; partition is keyed on gid via
      * CDPG_PART_HASH so each gid is owned by exactly one task — odata
      * updates run without atomics. */
-    if (total > 0)
+    bool cancelled = pool_cancelled(pool);
+    if (total > 0 && !cancelled) {
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
+        cancelled = pool_cancelled(pool);
+    }
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
     scratch_free(hist_hdr);
-    return out;
+    return cancelled ? ray_error("cancel", NULL) : out;
 }
 
 /* Approximate per-group count(distinct) via HyperLogLog with sparse
@@ -2563,6 +2592,7 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     if (n_rows >= 200000) {
         ray_t* par = count_distinct_per_group_parallel(src, row_gid,
                                                         n_rows, n_groups, out);
+        if (par && RAY_IS_ERR(par)) ray_release(out);   /* a cancel */
         if (par) return par;
         /* par == NULL → no pool / OOM in scratch alloc → fall through to
          * serial path with the already-allocated `out` (still zeroed). */
@@ -14545,6 +14575,13 @@ static bool group_const_input_spreads(ray_graph_t* g, ray_op_t* in, int64_t nrow
     return ray_is_atom(lit) || (ray_is_vec(lit) && (lit->len == 1 || lit->len == nrows));
 }
 
+/* Does every node under `root_id` read only its own row (a scan of the
+ * default table, a constant, a row-local element-wise op)? */
+bool ray_group_expr_rowlocal_ok(ray_graph_t* g, uint32_t root_id) {
+    int64_t syms[64];
+    return group_expr_src_syms(g, root_id, syms, 64) >= 0;
+}
+
 /* A running, moving or shift function: it reads other rows than its own,
  * and under a where: it runs over the whole table (#916).  Each is unary;
  * a window is a parameter, not an input node. */
@@ -14561,8 +14598,10 @@ static inline bool group_expr_running_opcode(uint16_t opcode) {
  * where: keeps, so it must not see the whole table; and so must anything
  * else whose value depends on which rows are selected (`distinct`, `asc`,
  * `rank`, ...).  An aggregate nested in a running function is refused too
- * and keeps the legacy path's answer.  So is a subtree too large to walk. */
-static bool grp_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
+ * and keeps the legacy path's answer.  So is a subtree too large to walk.
+ * The select planner asks the same of an aggregate's input before it defers
+ * a where: on the group key until after grouping (query.c). */
+bool ray_group_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
     uint32_t nc = g->node_count;
     if (nc > 4096 || root_id >= nc) return false;
     uint32_t stack[64];
@@ -14603,7 +14642,7 @@ static bool grp_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
 
 /* Does the expression `in` read an encoded column of `tbl` (or is it one
  * the bridge must not take)?  An input that is not row-local names no
- * source columns here.  It is taken only when grp_expr_whole_table_ok
+ * source columns here.  It is taken only when ray_group_expr_whole_table_ok
  * admits it (running functions over row-local expressions) and no column
  * of the table is encoded: the executor then materializes it over the
  * whole table (#916) and v2 groups it, first-N pre-pass included (#1234). */
@@ -14614,7 +14653,7 @@ static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
         for (int i = 0; i < n; i++) if (ray_table_get_col_enc(tbl, syms[i])) return true;
         return false;
     }
-    if (!grp_expr_whole_table_ok(g, in->id)) return true;
+    if (!ray_group_expr_whole_table_ok(g, in->id)) return true;
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++)
         if (ray_table_get_col_enc(tbl, ray_table_col_name(tbl, c))) return true;

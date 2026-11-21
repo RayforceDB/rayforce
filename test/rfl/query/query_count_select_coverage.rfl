@@ -141,7 +141,8 @@
 (count (select {from: TAN where: (and (< a 50) (or (> f 3.0) (< f 1.0)))})) -- (count (select {x: a from: TAN where: (and (< a 50) (or (> f 3.0) (< f 1.0)))}))
 (count (select {from: TAN where: (and (or (< a 10) (and (> b 3) (< b 9))) (> f 1.0))})) -- (count (select {x: a from: TAN where: (and (or (< a 10) (and (> b 3) (< b 9))) (> f 1.0))}))
 (count (select {from: TA where: (and (< a 50) (or 0.0 (> b 1)))})) -- (count (select {x: a from: TA where: (and (< a 50) (or 0.0 (> b 1)))}))
-(count (select {from: TA where: (and (< a 50) (+ b 1))})) !- type
+;; an `and` operand that is not boolean counts by its truth value (#974)
+(count (select {from: TA where: (and (< a 50) (+ b 1))})) -- (sum (and (< (at TA 'a) 50) (+ (at TA 'b) 1)))
 (count (select {from: TA where: (and (< a 50) (> zz 1))})) !- schema
 
 ;; ────────────────────────────────────────────────────────────────────

@@ -59,6 +59,7 @@ All comparison operators are **atomic** and return boolean results.
 | `<` | binary | Less than | `(< 3 5)` → `true` |
 | `>=` | binary | Greater than or equal | `(>= 5 5)` → `true` |
 | `<=` | binary | Less than or equal | `(<= 3 5)` → `true` |
+| `identical` | binary | Same type, shape and contents | `(identical 1 1i)` → `false` |
 | `==` | binary | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | Check which vector elements fall within a range | `(within [1 5 10] [3 7])` → `[false true false]` |
@@ -67,8 +68,8 @@ All comparison operators are **atomic** and return boolean results.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
-| `or` | binary | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (zero, null and NaN are false), in a query too (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
+| `or` | binary | Logical OR; element-wise on vectors and lists, each element by its truthiness, in a query too (lengths must match) | `(or true false)` → `true` |
 | `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation

@@ -5057,11 +5057,11 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         }
     }
 
-    /* GUID comparison: 16-byte cells, memcmp equality.  Without this
-     * branch a guid predicate fell into the numeric loops, which read
-     * the cells at the wrong width and silently matched nothing.  Only
-     * == and != are defined for guid operands here (cmp.c orders guid
-     * ATOMS, but a ranged guid predicate over a column has no use). */
+    /* GUID comparison: 16-byte cells, memcmp order, as cmp.c orders guid
+     * atoms (a null guid is all zero bytes and sorts first).  Without this
+     * branch a guid predicate fell into the numeric loops, which read the
+     * cells at the wrong width and silently matched nothing.  A guid
+     * against any other type is the builtins' type error. */
     {
         bool l_guid = (l_scalar ? (lhs->type == -RAY_GUID || lhs->type == RAY_GUID)
                                 : lhs->type == RAY_GUID);
@@ -5069,14 +5069,48 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                                 : rhs->type == RAY_GUID);
         if (l_guid || r_guid) {
             uint16_t opc = op->opcode;
-            if (!l_guid || !r_guid) {
+            if (opc < OP_EQ || opc > OP_GE) {
                 ray_release(result);
-                return ray_error("type", "expr eval: cannot compare %s and %s",
-                                 ray_type_name(lhs->type), ray_type_name(rhs->type));
+                return ray_error("type", "expr eval: guid operands support only comparisons");
             }
-            if (opc != OP_EQ && opc != OP_NE) {
+            if (!l_guid || !r_guid) {
+                /* == / != against a null literal of any type answers by the
+                 * guid cell's own nullness (all zero bytes), as cmp.c's
+                 * null forms do before looking at types. */
+                ray_t* o = l_guid ? rhs : lhs;
+                ray_t* gv = l_guid ? lhs : rhs;
+                bool g_scalar = l_guid ? l_scalar : r_scalar;
+                if ((opc == OP_EQ || opc == OP_NE) && ray_is_atom(o) && RAY_ATOM_IS_NULL(o)) {
+                    uint8_t* out = (uint8_t*)ray_data(result);
+                    const uint8_t* gb = gv->type == -RAY_GUID
+                                      ? (const uint8_t*)ray_data(gv->obj)
+                                      : (const uint8_t*)ray_data(gv);
+                    static const uint8_t zero16[16];
+                    for (int64_t i = 0; i < len; i++) {
+                        uint8_t isnull = memcmp(gb + (g_scalar ? 0 : i * 16), zero16, 16) == 0;
+                        out[i] = opc == OP_EQ ? isnull : (uint8_t)!isnull;
+                    }
+                    return result;
+                }
+                /* The mirror: a null guid literal against a cell of another
+                 * type answers by that cell's nullness. */
+                if ((opc == OP_EQ || opc == OP_NE) && ray_is_atom(gv) && RAY_ATOM_IS_NULL(gv)) {
+                    bool o_scalar = l_guid ? r_scalar : l_scalar;
+                    uint8_t* out = (uint8_t*)ray_data(result);
+                    for (int64_t i = 0; i < len; i++) {
+                        uint8_t isnull = ray_is_atom(o) ? RAY_ATOM_IS_NULL(o)
+                                       : ray_vec_is_null(o, o_scalar ? 0 : i);
+                        out[i] = opc == OP_EQ ? isnull : (uint8_t)!isnull;
+                    }
+                    return result;
+                }
                 ray_release(result);
-                return ray_error("type", "expr eval: guid operands support only == and !=");
+                if (opc == OP_EQ || opc == OP_NE)
+                    return ray_error("type", "%s: incomparable operand types, got %s and %s",
+                                     opc == OP_EQ ? "=" : "<>",
+                                     ray_type_name((int8_t)-lt), ray_type_name((int8_t)-rt));
+                return ray_error("type", "cannot compare %s and %s",
+                                 ray_type_name((int8_t)-lt), ray_type_name((int8_t)-rt));
             }
             uint8_t* out = (uint8_t*)ray_data(result);
             const uint8_t* lb = (lhs->type == -RAY_GUID)
@@ -5088,8 +5122,17 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             for (int64_t i = 0; i < len; i++) {
                 const uint8_t* lp = lb + (l_scalar ? 0 : i * 16);
                 const uint8_t* rp = rb + (r_scalar ? 0 : i * 16);
-                uint8_t eq = (memcmp(lp, rp, 16) == 0) ? 1 : 0;
-                out[i] = (opc == OP_EQ) ? eq : (uint8_t)!eq;
+                int c = memcmp(lp, rp, 16);
+                uint8_t v;
+                switch (opc) {
+                case OP_EQ: v = c == 0; break;
+                case OP_NE: v = c != 0; break;
+                case OP_LT: v = c < 0;  break;
+                case OP_LE: v = c <= 0; break;
+                case OP_GT: v = c > 0;  break;
+                default:    v = c >= 0; break;
+                }
+                out[i] = v;
             }
             return result;
         }

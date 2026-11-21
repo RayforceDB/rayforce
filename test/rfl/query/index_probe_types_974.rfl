@@ -1,0 +1,66 @@
+;; #974 follow-up: every index fast path probes with the literal the way
+;; the comparison reads it, or leaves the predicate to the scan.
+;;
+;; The select-side consult (idx_filter_decode) probed a TIMESPAN column with
+;; a TIME literal's raw milliseconds and a DATE literal's day count; the
+;; delete / in-place update path (update_where_index_rows) probed an F32
+;; hash with the integer bits of 1 (deleting nothing) and a file-domain SYM
+;; hash with the global intern id.  The sweep runs every index kind (hash,
+;; sort, zone, bloom) over 12 column types with 18 literals (each type's 1,
+;; 1.5, nulls, -1, out of range), under ==, !=, <, >=, in and an eq+range
+;; conjunction, in select, count, delete and in-place update,
+;; and compares each answer (or error) with the same table without an index.
+;; An entry of `all` is a disagreement.
+;; @requires: posix
+
+(.sys.exec "rm -rf /tmp/rfl_idx_probe_974")
+(set N 1200)
+(set w (% (til N) 300))
+(set s1 (as 'SYM "1"))
+(set V (dict ['B8 'U8 'I16 'I32 'I64 'F32 'F64 'DATE 'TIME 'TIMESTAMP 'TIMESPAN 'SYM] (list (== w 1) (as 'U8 w) (as 'I16 w) (as 'I32 w) w (as 'F32 w) (as 'F64 w) (as 'DATE w) (as 'TIME w) (as 'TIMESTAMP w) (as 'TIMESPAN w) (as 'SYM (as 'STR w)))))
+(set T (key V))
+(set L (list true 0x01 1h 1i 1 1.0e 1.0 1.5 2000.01.02 00:00:00.001 2000.01.01D00:00:00.000000001 0D00:00:00.000000001 's1 "1" 0Nl 0Nf -1 300))
+(set msg (fn [e] (concat "ERR:" (at e 'msg))))
+(set ix (fn [k v] (if (== k 'hash) (.idx.hash v) (if (== k 'sort) (.idx.sort v) (if (== k 'zone) (.idx.zone v) (if (== k 'bloom) (.idx.bloom v) v))))))
+(set mk (fn [t k] (set X (table [c i] (list (try (ix k (at V t)) (fn [e] (at V t))) (til N))))))
+(set pred (fn [op lit] (if (== op 'in) (list 'in 'c (list 'enlist lit)) (if (== op 'conj) (list 'and (list '== 'c lit) (list '>= 'i 5)) (list op 'c lit)))))
+(set run (fn [ctx op lit] (if (== ctx 'sel) (at (eval (list 'select (dict ['from 'where] (list X (pred op lit))))) 'i) (if (== ctx 'cnt) (count (eval (list 'select (dict ['from 'where] (list X (pred op lit)))))) (if (== ctx 'grp) (eval (list 'select (dict ['n 'from 'where 'by] (list (list 'count 'i) X (pred op lit) 'c)))) (if (== ctx 'del) (do (eval (list 'delete (dict ['from 'where] (list 'X (pred op lit))))) (sum (at X 'i))) (do (eval (list 'update (dict ['i 'from 'where] (list 99 'X (pred op lit))))) (sum (at X 'i)))))))))
+(set q (fn [t k ctx op lit] (do (mk t k) (format "%" (try (run ctx op lit) msg)))))
+(set bad (fn [k ctx op] (raze (map (fn [t] (map (fn [j] (list k ctx op t (at L j) (q t k ctx op (at L j)) (q t 'none ctx op (at L j)))) (where (map (fn [lit] (!= (q t k ctx op lit) (q t 'none ctx op lit))) L)))) T))))
+(set K ['hash 'sort 'zone 'bloom])
+(set C ['sel 'cnt 'del 'upd])
+(set O ['== '!= '< '>= 'in 'conj])
+(set all (raze (map (fn [k] (raze (map (fn [c] (raze (map (fn [o] (bad k c o)) O))) C))) K)))
+all -- (list)
+
+;; the same over generation-2 (compressed) files saved with the index
+;; recorded, probed from the file (a SYM column in its own symbol domain):
+;; the select and delete sites, under the equality shapes
+(set ixk (fn [k v] (if (== k 'hash) (.idx.hash v) (if (== k 'sort) (.idx.sort v) (if (== k 'zone) (.idx.zone v) (if (== k 'bloom) (.idx.bloom v) v))))))
+(set save (fn [k] (do (.db.splayed.set (concat "/tmp/rfl_idx_probe_974/g2/" (concat (format "%" k) "/t/")) (table T (map (fn [t] (if (or (== t 'TIMESPAN) (and (== t 'SYM) (!= k 'hash))) (at V t) (ixk k (at V t)))) T)) (concat "/tmp/rfl_idx_probe_974/g2/" (concat (format "%" k) ".sym")) {compress: true}) (.db.splayed.get (concat "/tmp/rfl_idx_probe_974/g2/" (concat (format "%" k) "/t/")) (concat "/tmp/rfl_idx_probe_974/g2/" (concat (format "%" k) ".sym"))))))
+(set DB (dict ['hash 'sort 'zone 'bloom 'none] (map save ['hash 'sort 'zone 'bloom 'none])))
+(set mk (fn [t k] (set X (table [c i] (list (at (at DB k) t) (til N))))))
+(set C ['sel 'del])
+(set O ['== 'in 'conj])
+(set all (raze (map (fn [k] (raze (map (fn [c] (raze (map (fn [o] (bad k c o)) O))) C))) K)))
+all -- (list)
+
+;; a file-domain SYM hash: the delete probe maps the symbol into the
+;; column's domain
+(set S0 (table [s i] (list (as 'SYM (concat (as 'STR (% (til 1199) 300)) ["p9"])) (til 1200))))
+(.db.splayed.set "/tmp/rfl_idx_probe_974/fd/t/" S0 "/tmp/rfl_idx_probe_974/fd/t.sym")
+(set S3 (.db.splayed.get "/tmp/rfl_idx_probe_974/fd/t/" "/tmp/rfl_idx_probe_974/fd/t.sym"))
+(set S3 (update {s: (.idx.hash s) from: S3}))
+(delete {from: 'S3 where: (== s 'p9)})
+(count S3) -- 1199
+(delete {from: 'S3 where: (== s 'zz)})
+(count S3) -- 1199
+(update {i: 99 from: 'S3 where: (== s '7)})
+(sum (at S3 'i)) -- (+ (- (sum (til 1199)) (sum [7 307 607 907])) (* 4 99))
+
+;; the reported F32 case
+(set F3 (table [f i] (list (.idx.hash (as 'F32 [0.5 1.0 1.5 2.0])) (til 4))))
+(delete {from: 'F3 where: (== f 1)})
+(at F3 'i) -- [0 2 3]
+
+(.sys.exec "rm -rf /tmp/rfl_idx_probe_974")

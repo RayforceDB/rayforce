@@ -62,8 +62,8 @@
 (count (select {from: A where: (!= u 0)})) -- (count (select {from: B where: (!= u 0)}))
 (select {u: u c: (count u) from: A where: (!= u 0) by: u desc: c take: 10}) -- (select {u: u c: (count u) from: B where: (!= u 0) by: u desc: c take: 10})
 (select {c: (count h) from: A by: {h: h s: s} take: 10}) -- (select {c: (count h) from: B by: {h: h s: s} take: 10})
-(take (select {s: s p: (count s) from: A where: (and (== g 3) (>= d 100) (<= d 400) (== b false) (!= u 0)) by: s desc: p take: 1010}) -10) -- (take (select {s: s p: (count s) from: B where: (and (== g 3) (>= d 100) (<= d 400) (== b false) (!= u 0)) by: s desc: p take: 1010}) -10)
-(select {n: (count u) from: A where: (and (== s 'z) (>= d 100) (<= d 130) (== b false)) by: {u: u g: g} desc: n take: 10}) -- (select {n: (count u) from: B where: (and (== s 'z) (>= d 100) (<= d 130) (== b false)) by: {u: u g: g} desc: n take: 10})
+(take (select {s: s p: (count s) from: A where: (and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04) (== b false) (!= u 0)) by: s desc: p take: 1010}) -10) -- (take (select {s: s p: (count s) from: B where: (and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04) (== b false) (!= u 0)) by: s desc: p take: 1010}) -10)
+(select {n: (count u) from: A where: (and (== s 'z) (>= d 2000.04.10) (<= d 2000.05.10) (== b false)) by: {u: u g: g} desc: n take: 10}) -- (select {n: (count u) from: B where: (and (== s 'z) (>= d 2000.04.10) (<= d 2000.05.10) (== b false)) by: {u: u g: g} desc: n take: 10})
 ;; nothing above read these columns whole
 (at (.idx.info A 'g) 'materialized) -- false
 (at (.idx.info A 'u) 'materialized) -- false
