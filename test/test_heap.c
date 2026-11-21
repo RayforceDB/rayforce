@@ -83,6 +83,7 @@ static int munmap(void* p, size_t len) {
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>   /* fstat: spill-file link count */
+#include <sched.h>      /* sched_yield: a task waiting for the other workers */
 #endif
 #if defined(__linux__)
 #include <sys/inotify.h>  /* IN_ACCESS: when the cgroup files are read */
@@ -4870,22 +4871,45 @@ static test_result_t test_relieve_visit_drains(void) {
  * many empty pools, none of them its last. */
 #define RELIEVE_WORKERS 64
 typedef struct {
-    _Atomic(int) ran[RELIEVE_WORKERS];
-    ray_t*       keep[RELIEVE_WORKERS];
-    int          empty;
+    _Atomic(int)      ran[RELIEVE_WORKERS];
+    ray_t*            keep[RELIEVE_WORKERS];
+    int               empty;
+    uint32_t          need;    /* workers that must have run a task */
+    _Atomic(uint32_t) done;    /* workers that have */
 } relieve_workers_t;
+
+/* Hold the calling thread in its task until every worker has run one (10 s
+ * at most): a thread that waits takes no further task, so the dispatch's
+ * other tasks are left for the workers that have not run yet, however late
+ * they wake. */
+static void relieve_worker_wait(relieve_workers_t* w) {
+    int64_t t0 = ray_time_now_ms();
+    while (atomic_load_explicit(&w->done, memory_order_acquire) < w->need &&
+           ray_time_now_ms() - t0 < 10000) {
+#if defined(_WIN32)
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+}
 
 static void relieve_worker_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)start; (void)end;
     relieve_workers_t* w = raw;
-    if (wid == 0 || wid >= RELIEVE_WORKERS) return;   /* the dispatching thread */
+    if (wid == 0 || wid >= RELIEVE_WORKERS) {   /* the dispatching thread */
+        relieve_worker_wait(w);
+        return;
+    }
     if (!w->keep[wid]) w->keep[wid] = ray_alloc(RELIEVE_HALF);
     ray_t* b[4] = {0};
     int n = w->empty < 1 ? 1 : w->empty > 4 ? 4 : w->empty;
     for (int i = 0; i < n; i++)
         if ((b[i] = ray_alloc(RELIEVE_HALF))) memset(ray_data(b[i]), 1, 4096);
     for (int i = 0; i < n; i++) if (b[i]) ray_free(b[i]);
-    atomic_store_explicit(&w->ran[wid], 1, memory_order_relaxed);
+    if (!atomic_exchange_explicit(&w->ran[wid], 1, memory_order_relaxed))
+        atomic_fetch_add_explicit(&w->done, 1, memory_order_release);
+    relieve_worker_wait(w);
 }
 
 /* The empty pools each worker is to keep for at least `pools` in all,
@@ -4896,18 +4920,18 @@ static int relieve_worker_share(int pools) {
     return n > 0 ? (pools + n - 1) / n : 1;
 }
 
-/* Dispatch until every worker has run a task; false without workers. */
+/* Dispatch until every worker has run a task; false without workers.  A
+ * task's thread waits for the others in it (relieve_worker_wait), so one
+ * dispatch of more tasks than threads reaches every worker. */
 static bool relieve_worker_pool(relieve_workers_t* w) {
     ray_pool_t* pool = ray_pool_get();
     if (!pool || pool->n_workers == 0 || pool->n_workers >= RELIEVE_WORKERS) return false;
-    uint32_t n = pool->n_workers, done = 0;
+    uint32_t n = pool->n_workers;
     for (uint32_t i = 1; i <= n; i++) atomic_store(&w->ran[i], 0);
-    for (int round = 0; round < 1000 && done < n; round++) {
-        ray_pool_dispatch_n(pool, relieve_worker_task, w, 64);
-        done = 0;
-        for (uint32_t i = 1; i <= n; i++) done += atomic_load(&w->ran[i]) != 0;
-    }
-    return done == n;
+    w->need = n;
+    atomic_store(&w->done, 0);
+    ray_pool_dispatch_n(pool, relieve_worker_task, w, RELIEVE_WORKERS);
+    return atomic_load(&w->done) == n;
 }
 
 static void relieve_count_pools(ray_heap_t* h, void* ctx) {
