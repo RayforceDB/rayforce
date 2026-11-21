@@ -252,14 +252,14 @@ Ordinary row-local atomic expressions retain their uncapped admission walk. Cano
 Two additional IF shapes have deliberately bounded proofs:
 
 - **Ungrouped:** one fresh output, `from` and `where`, no `by`, and an explicit ELSE. Branches must be I64 columns or literals, or nested `if` expressions with explicit ELSE. Conditions use BOOL literals, I64 comparisons or SYM equality/inequality, with canonical `and`/`or` and unary `not`. The proof allows 128 visits and depth 32. Quoted SYM names that resolve to source columns decline this proof.
-- **Grouped:** one bare I64 group key and up to 32 fresh outputs, each `sum(if condition then else)` with explicit ELSE and I64 branches. Conditions must depend on a column; supported predicates include I64 comparisons and SYM equality/inequality against one unambiguous non-NULL literal. The shared proof allows 256 visits, depth 24 and 256 recorded references. Output names must not capture referenced source or literal names.
+- **Grouped:** one bare I64 or SYM group key (not the partition key unless it is I64) and up to 32 outputs, each a fresh `sum(if condition then else)` with explicit ELSE and I64 branches, or an aggregate beside them: a native aggregate (`sum`, `count`, `avg`, `min`, `max`, `med`, `dev`, ...) or `first`/`last` of row-local arguments. Conditions must depend on a column; supported predicates include I64 comparisons and SYM equality/inequality against one unambiguous non-NULL literal. The shared proof allows 256 visits, depth 24 and 256 recorded references. No output, `where` or `by` may spell another output's name; only an aggregate beside the `sum(if)`s may spell its own (`qty: (sum qty)`). A bare projection or `count(distinct ...)` beside a `sum(if)` keeps the full source.
 
-These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, wider grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
+These limits apply only to the added proofs, not ordinary atomic traversal. Unsupported shapes conservatively keep the original source. In particular, arbitrary calls, lexical heads, mixed/F64/SYM-result IF branches, composite, computed or other-typed grouping, `take`/sorting in the grouped IF proof, and variadic grouped logical predicates are not covered. Nonliteral partition bounds are not resolved by this pass. Ordinary nonlocal operations such as running sums or an aggregate inside `where` can require all rows and therefore prevent pruning.
 
 ```lisp
 ;; A supported narrow grouped shape; the literal date bound selects partitions.
 (select {from: trades where: (== date 2024.01.02) by: account
-         qty_ok: (sum (if (> qty 0) qty 0))})
+         qty_ok: (sum (if (> qty 0) qty 0)) n: (count qty)})
 ```
 
 The example assumes `account` and `qty` are I64 columns. A declined proof changes optimization, not permission to substitute a different query result.

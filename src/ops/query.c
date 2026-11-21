@@ -18409,16 +18409,22 @@ static bool prune_by_ok(ray_t* by, ray_t* tbl) {
  * the ungrouped IF grammar. This slice requires the owned-error classifier
  * prerequisite: an allocation failure must not choose interpreter IF. */
 typedef struct {
+    int64_t id;
+    int owner;                  /* the output whose proof read it; -1: a clause */
+} prune_group_name_t;
+
+typedef struct {
     int budget;
     int n_refs;
-    int64_t refs[PRUNE_GROUP_MAX_REFS];
+    int owner;
+    prune_group_name_t refs[PRUNE_GROUP_MAX_REFS];
 } prune_group_proof_t;
 
 static bool prune_group_ref(prune_group_proof_t* p, ray_t* s) {
     if (!s || s->type != -RAY_SYM || (s->attrs & ATTR_QUOTED) ||
         ray_sym_is_dotted(s->i64) || ray_env_has_lexical_local(s->i64) ||
         p->n_refs == PRUNE_GROUP_MAX_REFS) return false;
-    p->refs[p->n_refs++] = s->i64;
+    p->refs[p->n_refs++] = (prune_group_name_t){ s->i64, p->owner };
     return true;
 }
 
@@ -18458,7 +18464,7 @@ static int8_t prune_group_cmp_leaf(ray_t* e, ray_t* tbl,
     if (e && e->type == -RAY_SYM && (e->attrs & ATTR_QUOTED)) {
         if (--p->budget < 0 || RAY_ATOM_IS_NULL(e) ||
             ray_table_slot(tbl, e->i64) || p->n_refs == PRUNE_GROUP_MAX_REFS) return 0;
-        p->refs[p->n_refs++] = e->i64;
+        p->refs[p->n_refs++] = (prune_group_name_t){ e->i64, p->owner };
         return RAY_SYM;
     }
     int8_t t = prune_group_leaf(e, tbl, p, key_ok);
@@ -18521,23 +18527,69 @@ static int prune_group_id_cmp(const void* a, const void* b) {
     return (l > r) - (l < r);
 }
 
-/* All outputs in this alternative are fresh SUM(IF)s. Collect references
- * once, sort IDs, then merge against sorted output IDs: no per-output AST
- * search, new symbols, domain scans or trial compilation. Caps belong only
- * to this new shape, not ordinary pruning. */
+static int prune_group_name_cmp(const void* a, const void* b) {
+    return prune_group_id_cmp(&((const prune_group_name_t*)a)->id, &((const prune_group_name_t*)b)->id);
+}
+
+/* Every name an expression spells, heads, quoted names and SYM literal
+ * cells included: the capture check below needs no finer reading. */
+static bool prune_group_names(ray_t* e, prune_group_proof_t* p) {
+    if (--p->budget < 0 || !e || RAY_IS_ERR(e)) return false;
+    if (e->type == -RAY_SYM) {
+        if (p->n_refs == PRUNE_GROUP_MAX_REFS) return false;
+        p->refs[p->n_refs++] = (prune_group_name_t){ e->i64, p->owner };
+        return true;
+    }
+    if (e->type == RAY_SYM) {
+        for (int64_t i = 0; i < e->len; i++) {
+            int64_t id = sym_cell_runtime_id(e, i);
+            if (id < 0 || --p->budget < 0 || p->n_refs == PRUNE_GROUP_MAX_REFS) return false;
+            p->refs[p->n_refs++] = (prune_group_name_t){ id, p->owner };
+        }
+        return true;
+    }
+    if (e->type != RAY_LIST) return true;
+    for (int64_t i = 0; i < ray_len(e); i++)
+        if (!prune_group_names(((ray_t**)ray_data(e))[i], p)) return false;
+    return true;
+}
+
+/* An aggregate beside the SUM(IF)s: what the ordinary proof admits as a
+ * grouped output, less a bare projection (the post-group scatter) and
+ * COUNT(DISTINCT) (its route gate samples rows). A native AGGR call or
+ * first/last of elementwise arguments is a DAG aggregate on any source,
+ * so it leaves the SUM(IF)s on the rowwise IF lowering. */
+static bool prune_group_companion(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || match_count_distinct(e) ||
+        prune_where_elementwise(e, tbl) || !prune_output_ok(e, tbl, true)) return false;
+    return prune_group_names(e, p);
+}
+
+/* The outputs in this alternative are fresh SUM(IF)s and companion
+ * aggregates. Collect references once, sort IDs, then merge against sorted
+ * output IDs: no per-output AST search, new symbols, domain scans or trial
+ * compilation. Only a companion may name itself (`qty: (sum qty)`): no
+ * other output or clause may spell an output's name. Caps belong only to
+ * this new shape, not ordinary pruning. */
 static bool prune_group_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST ||
         keys->len != vals->len || keys->len < 4 || keys->len > PRUNE_GROUP_MAX_OUTPUTS + 3) return false;
-    prune_group_proof_t p = { .budget = PRUNE_GROUP_MAX_VISITS };
+    prune_group_proof_t p = { .budget = PRUNE_GROUP_MAX_VISITS, .owner = -1 };
     ray_t* by = dict_get(dict, "by");
     ray_t* from = dict_get(dict, "from");
-    /* First slice: a bare named source and one bare logical-I64 BY column. */
-    if (!prune_group_ref(&p, from) || !by || by->type != -RAY_SYM ||
-        prune_group_leaf(by, tbl, &p, true) != RAY_I64 ||
-        !prune_group_cond(where, tbl, &p, 0, true)) return false;
-    int64_t outputs[PRUNE_GROUP_MAX_OUTPUTS];
+    /* A bare named source and one bare BY column: logical I64, or a SYM
+     * column (not the partition key), both DAG group keys on any source. */
+    if (!prune_group_ref(&p, from) || !by || by->type != -RAY_SYM) return false;
+    int8_t by_t = prune_group_leaf(by, tbl, &p, true);
+    if (by_t == RAY_SYM) {
+        ray_t* c = ray_table_slot(tbl, by->i64);
+        if (!c || c->type == RAY_MAPCOMMON) return false;
+    } else if (by_t != RAY_I64) return false;
+    if (!prune_group_cond(where, tbl, &p, 0, true)) return false;
+    prune_group_name_t outputs[PRUNE_GROUP_MAX_OUTPUTS];
+    int owners[PRUNE_GROUP_MAX_OUTPUTS];          /* the one ref owner that may spell it */
     int n_outputs = 0, n_from = 0, n_where = 0, n_by = 0;
     for (int64_t i = 0; i < keys->len; i++) {
         /* Width/domain-aware lookup, never read the key vector as int64_t*. */
@@ -18554,18 +18606,31 @@ static bool prune_group_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
             (n == 4 && !memcmp(s, "desc", 4)) ||
             (n == 7 && !memcmp(s, "nearest", 7))) return false;
         if (n_outputs == PRUNE_GROUP_MAX_OUTPUTS || ray_sym_is_dotted(id) ||
-            ray_env_has_lexical_local(id) || ray_table_slot(tbl, id) ||
-            !prune_group_sum_if(((ray_t**)ray_data(vals))[i], tbl, &p)) return false;
-        outputs[n_outputs++] = id;
+            ray_env_has_lexical_local(id)) return false;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        int n_refs = p.n_refs, budget = p.budget;
+        p.owner = n_outputs;
+        if (!ray_table_slot(tbl, id) && prune_group_sum_if(v, tbl, &p)) {
+            owners[n_outputs] = -2;                         /* fresh: no ref may spell it */
+        } else {
+            p.n_refs = n_refs;
+            p.budget = budget;
+            if (!prune_group_companion(v, tbl, &p)) return false;
+            owners[n_outputs] = n_outputs;                  /* its own refs may */
+        }
+        outputs[n_outputs].id = id;
+        outputs[n_outputs].owner = n_outputs;
+        n_outputs++;
     }
     if (n_from != 1 || n_where != 1 || n_by != 1 || !n_outputs) return false;
-    qsort(outputs, (size_t)n_outputs, sizeof *outputs, prune_group_id_cmp);
-    qsort(p.refs, (size_t)p.n_refs, sizeof *p.refs, prune_group_id_cmp);
+    qsort(outputs, (size_t)n_outputs, sizeof *outputs, prune_group_name_cmp);
+    qsort(p.refs, (size_t)p.n_refs, sizeof *p.refs, prune_group_name_cmp);
     int j = 0;
     for (int i = 0; i < n_outputs; i++) {
-        if (i && outputs[i] == outputs[i - 1]) return false;
-        while (j < p.n_refs && p.refs[j] < outputs[i]) j++;
-        if (j < p.n_refs && p.refs[j] == outputs[i]) return false;
+        if (i && outputs[i].id == outputs[i - 1].id) return false;
+        while (j < p.n_refs && p.refs[j].id < outputs[i].id) j++;
+        for (int k = j; k < p.n_refs && p.refs[k].id == outputs[i].id; k++)
+            if (p.refs[k].owner != owners[outputs[i].owner]) return false;
     }
     return true;
 }
