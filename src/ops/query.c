@@ -16590,24 +16590,36 @@ void ray_select_scan_filtered(ray_t* sel, int64_t kept) {
     d->n = 0;
 }
 
-/* A composite by: (a vector of two or more names, or a by-dict of two or
- * more keys) whose outputs project key columns as themselves, `a: a`, folds
- * them into the key, as a single key does (is_single_group_key_projection):
- * the select runs as if they were not there, so it takes the routes, and
- * gives the columns and rows, in their order, of the select without them:
- * the keys first, in by: order (#1235).  The dict without those outputs, or
- * NULL when there is none to drop. */
+/* Key j of a by: naming its keys: the vector `kv`, or the bare name `k1`. */
+static inline int64_t strip_key_id(ray_t* kv, int64_t k1, int64_t j) {
+    return kv ? sym_cell_runtime_id(kv, j) : k1;
+}
+
+/* A by: naming its keys (a name, a vector of names, or a by-dict)
+ * whose outputs project key columns as themselves, `a: a`, folds them into
+ * the key: the select runs as if they were not there, so it takes the
+ * routes, and gives the columns and rows, in their order, of the select
+ * without them: the keys first, in by: order, wherever the projections are
+ * written (#1235, and #1237 for a single key).  The dict without those
+ * outputs, or NULL when there is none to drop. */
 static ray_t* select_strip_key_projections(ray_t* dict) {
     ray_t* by = dict_get(dict, "by");
     if (!by) return NULL;
     ray_t* kv = NULL;
-    if (by->type == RAY_SYM) kv = by;
-    else if (by->type == RAY_DICT) kv = ray_dict_keys(by);
-    if (!kv || kv->type != RAY_SYM || kv->len < 2) return NULL;
+    int64_t k1 = -1, nk;
+    if (by->type == -RAY_SYM) {         /* `by: 'a` names the column a too */
+        k1 = by->i64;
+        nk = 1;
+    } else {
+        if (by->type == RAY_SYM) kv = by;
+        else if (by->type == RAY_DICT) kv = ray_dict_keys(by);
+        if (!kv || kv->type != RAY_SYM || kv->len < 1) return NULL;
+        nk = kv->len;
+    }
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
-    int64_t nk = kv->len, nd = keys->len;
+    int64_t nd = keys->len;
     /* a key named twice is no column of its own name */
     for (int64_t j = 1; j < nk; j++)
         for (int64_t i = 0; i < j; i++)
@@ -16630,7 +16642,7 @@ static ray_t* select_strip_key_projections(ray_t* dict) {
         if (!v[i] || v[i]->type != -RAY_SYM || (v[i]->attrs & ATTR_QUOTED) || v[i]->i64 != kid)
             continue;
         for (int64_t j = 0; j < nk; j++)
-            if (sym_cell_runtime_id(kv, j) == kid) { n_drop++; break; }
+            if (strip_key_id(kv, k1, j) == kid) { n_drop++; break; }
     }
     if (n_drop == 0) return NULL;
     ray_t* ck = ray_vec_new(RAY_SYM, nd - n_drop);
@@ -16644,7 +16656,7 @@ static ray_t* select_strip_key_projections(ray_t* dict) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         bool drop = false;
         if (v[i] && v[i]->type == -RAY_SYM && !(v[i]->attrs & ATTR_QUOTED) && v[i]->i64 == kid)
-            for (int64_t j = 0; j < nk && !drop; j++) drop = sym_cell_runtime_id(kv, j) == kid;
+            for (int64_t j = 0; j < nk && !drop; j++) drop = strip_key_id(kv, k1, j) == kid;
         if (drop) continue;
         ((int64_t*)ray_data(ck))[ck->len++] = kid;
         cv = ray_list_append(cv, v[i]);
