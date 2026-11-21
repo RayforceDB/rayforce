@@ -24,10 +24,10 @@ Value formulas (10,000 rows unless stated):
   unsupported-bss (8 rows)                           id = 0..7, BYTE_STREAM_SPLIT
   duckdb-v2-mixed (21,000 rows)                      the DuckDB COPY at the end of main()
       (just past the reader's 4,096-value interrupt checkpoint and the
-      16,384-row certification-admission threshold)
+      16,384-row level-count threshold)
   duckdb-deflevel (1,000 rows)                       id = 0..999, name = 'v' || id, null when
       range % 3 == 0; DuckDB-written, definition-level stream over-declared
-      (the PQ_DEF_STRICT counterfactual fails with 'excess definition levels')
+      (with PQ_DEF_STRICT set, the read fails with 'excess definition levels')
 
 Page layouts: data_page_version 1.0 except the *-v2page and dbp-i32-nulls-v2,
 dbp-i32-overflow and dba-nulls-v2 files (2.0); use_dictionary=False;
@@ -158,8 +158,8 @@ def main():
     # DuckDB 1.5.6 mixed file: INT64 DELTA_BINARY_PACKED plus a
     # RLE_DICTIONARY BYTE_ARRAY column, DATA_PAGE v1 headers.  21,000 rows:
     # just past the reader's 4,096-value interrupt checkpoint (the value
-    # phase's third checkpoint fires) and its 16,384-row certification
-    # admission threshold, and well inside one 65,536-row batch.
+    # phase's third checkpoint fires) and its 16,384-row level-count
+    # threshold, and well inside one 65,536-row batch.
     sql = ("COPY (SELECT range::BIGINT AS id, 'track_' || (range % 1000) AS name "
            "FROM range(21000)) TO '" + os.path.join(OUT, "duckdb-v2-mixed.parquet") +
            "' (FORMAT parquet, COMPRESSION uncompressed, PARQUET_VERSION V2);")
@@ -169,7 +169,7 @@ def main():
     # The probe: DuckDB 1.5.6 writes DELTA_LENGTH_BYTE_ARRAY, not
     # DELTA_BYTE_ARRAY, for a unique-string column (parquet_metadata), so the
     # DBA fixtures above stay pyarrow-written.  This file exercises the
-    # definition-level tolerance half (PQ_DEF_STRICT makes it fail).
+    # definition-level tolerance (with PQ_DEF_STRICT set the read fails).
     sql = ("COPY (SELECT CASE WHEN range % 3 = 0 THEN NULL "
            "ELSE 'v' || range::VARCHAR END AS name, range::BIGINT AS id FROM range(1000)) TO '"
            + os.path.join(OUT, "duckdb-deflevel.parquet") +

@@ -66,6 +66,28 @@ others, and `.parquet.meta` lists every column, giving the reason in its
 `unsupported` column (null for a readable one). Naming such a column, or
 reading all columns, fails with `column <name>: <reason>`.
 
+## Encodings and limits { #parquet-encodings }
+
+Value encodings: `PLAIN`, dictionary (including the legacy dictionary tag and
+the plain fallback a writer may take within a chunk), RLE-encoded `BOOLEAN`
+values, `DELTA_BINARY_PACKED` on `INT32` and `INT64`, and
+`DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY` on `BYTE_ARRAY`. A page in any
+other value encoding fails the read with `unsupported value encoding`, followed
+by the supported list.
+
+A page decodes to at most 64 MiB. For `DELTA_BYTE_ARRAY` the bound covers the
+page's reconstructed total, so a page whose prefix chain would rebuild past it
+is refused with `delta byte array page expands past the 64 MiB page limit`, on
+`.parquet.read` and on both symbol import paths.
+
+A decoded batch's string pool holds up to 4 GiB. A `SYM` import of
+`DELTA_BYTE_ARRAY` values copies each page's reconstructed values into an arena
+capped at a sixteenth of the engine's memory budget (`-m` when set, the machine
+limit otherwise), never below 1 MiB and never above 4 GiB; a value repeated by
+the page's prefix chain is interned from the copy already there. An import that
+would grow the arena past its cap fails with `delta byte array expansion exceeds
+the memory budget`.
+
 ## `.parquet.scan` { #parquet-scan }
 
 Create a descriptor for `select`. Each query reopens the file and infers eligible
