@@ -1553,6 +1553,12 @@ int64_t ray_index_inline_size(const ray_index_t* ix) {
     return total;
 }
 
+/* The same blocks for a DICT: the head, the I32 codes, the I32
+ * first-occurrence rows (ray_index_dict_compute, ray_dict_acc_finish). */
+int64_t ray_index_dict_inline_size(int64_t len, int64_t n_distinct) {
+    return IDX_HEAD_BYTES + IDX_ALIGN32(32 + len * 4) + IDX_ALIGN32(32 + n_distinct * 4);
+}
+
 /* Persisted-index layout generation, carried in the RAY_INDEX block's
  * on-disk-free `order` byte (mirrors the column-header scheme in col.h).
  * The index region is a rebuildable ACCELERATOR: a mismatched generation is
