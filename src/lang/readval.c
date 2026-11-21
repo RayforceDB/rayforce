@@ -417,7 +417,7 @@ static ray_t* build_str_vec(rd_t* rd, size_t n, const uint32_t* cells, const cha
     size_t poff = 0;
     for (size_t i = 0; i < n; i++) {
         uint32_t len = cells[2 * i + 1];
-        const char* s = pool + cells[2 * i];
+        const char* s = len ? pool + cells[2 * i] : NULL;
         memset(&el[i], 0, sizeof el[i]);
         el[i].len = len;
         if (len == 0) v->attrs |= RAY_ATTR_HAS_NULLS;
@@ -552,8 +552,8 @@ static bool expect_close(rd_t* rd) {
 
 /* A list of already-read children kids[base..], as one LIST block. */
 static ray_t* finish_list(rd_t* rd, size_t base) {
-    ray_t** k = (ray_t**)rd->kids.p + base;
     size_t n = rd->kids.len / sizeof(ray_t*) - base;
+    ray_t** k = n ? (ray_t**)rd->kids.p + base : NULL;
     ray_t* v = ray_read_list(&rd->bud, k, n);
     rd->kids.len = base * sizeof(ray_t*);
     return v ? v : fail_budget(rd);
