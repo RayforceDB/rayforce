@@ -922,9 +922,9 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
 
     /* Both branches trivial AND type-safe for the eager fill → eager
      * (POOL-PARALLEL elementwise) wins over the serial id-scaffolding
-     * here.  Only when workers exist: with a 0-worker pool (-c 1) the
-     * eager fill runs serially over ALL rows for BOTH branches, which
-     * loses to the selected path's touch-only-passing-rows scheme. */
+     * here.  With a 0-worker pool (-c 1) the eager fill runs serially over
+     * ALL rows, which loses to the selected path's touch-only-passing-rows
+     * scheme only under a sparse selection (below). */
     /* Whether the eager arm is even a candidate for this node — not whether
      * it runs, which also depends on the pool.  Where it is, this arm must
      * answer exactly as it would, or the same expression gets two types
@@ -970,9 +970,12 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
                            (then_op->out_type == RAY_SYM || then_op->out_type == RAY_STR) &&
                            (else_op->out_type == RAY_SYM || else_op->out_type == RAY_STR) &&
                            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op));
+    /* Serially too unless the selection is sparse: the typed eager fill
+     * costs about a nanosecond a row, this arm's compaction and scatter
+     * several per selected row (#1181). */
     {
         ray_pool_t* rp = ray_pool_get();
-        if (rp && rp->n_workers > 0 && eager_possible)
+        if (eager_possible && ((rp && rp->n_workers > 0) || !sparse_sel))
             return NULL;
     }
 
@@ -1094,10 +1097,38 @@ static inline int64_t if_fill_sym_cell(const if_fill_ctx_t* c, if_sym_side_t* si
     return if_sym_cell_value(side, i);
 }
 
+/* Both sides already stored as the output's cells (a vector of that width,
+ * or a scalar): a typed select per row the compiler can vectorise, instead
+ * of if_vec_i64/if_vec_f64's per-cell call and type switch, which cost
+ * about three times the select (#1181).  Same cells as the generic loop. */
+#define IF_FILL_SAME(T, TSC, ESC) do {                                        \
+    T* dst_ = (T*)c->dst;                                                     \
+    const T* tp_ = c->then_scalar ? NULL : (const T*)ray_data(c->then_v);     \
+    const T* ep_ = c->else_scalar ? NULL : (const T*)ray_data(c->else_v);     \
+    T ts_ = (T)(TSC), es_ = (T)(ESC);                                         \
+    if (tp_ && ep_)                                                           \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? tp_[i] : ep_[i]; \
+    else if (tp_)                                                             \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? tp_[i] : es_; \
+    else if (ep_)                                                             \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? ts_ : ep_[i]; \
+    else                                                                      \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? ts_ : es_;    \
+} while (0)
+
+static inline bool if_side_i64_cells(ray_t* v, bool scalar) {
+    return scalar || v->type == RAY_I64 || v->type == RAY_TIMESTAMP || v->type == RAY_TIMESPAN;
+}
+
 static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
     const uint8_t* cond_p = c->cond;
     switch (c->out_type) {
     case RAY_F64: {
+        if ((c->then_scalar || c->then_v->type == RAY_F64) &&
+            (c->else_scalar || c->else_v->type == RAY_F64)) {
+            IF_FILL_SAME(double, c->t_f64, c->e_f64);
+            break;
+        }
         double* dst = (double*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
             double tv = c->then_scalar ? c->t_f64 : if_vec_f64(c->then_v, i);
@@ -1106,6 +1137,11 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         }
         break; }
     case RAY_I64: case RAY_TIMESTAMP: {
+        if (if_side_i64_cells(c->then_v, c->then_scalar) &&
+            if_side_i64_cells(c->else_v, c->else_scalar)) {
+            IF_FILL_SAME(int64_t, c->t_i64, c->e_i64);
+            break;
+        }
         int64_t* dst = (int64_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
             int64_t tv = c->then_scalar ? c->t_i64 : if_vec_i64(c->then_v, i);
@@ -1125,6 +1161,11 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         }
         break; }
     case RAY_I32: case RAY_TIME: case RAY_DATE: {
+        if ((c->then_scalar || c->then_v->type == c->out_type) &&
+            (c->else_scalar || c->else_v->type == c->out_type)) {
+            IF_FILL_SAME(int32_t, c->t_i64, c->e_i64);
+            break;
+        }
         int32_t* dst = (int32_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
             int32_t tv = c->then_scalar ? (int32_t)c->t_i64 : (int32_t)if_vec_i64(c->then_v, i);
@@ -1166,6 +1207,7 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
     default: break;
     }
 }
+#undef IF_FILL_SAME
 
 static void if_fill_par_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
