@@ -89,7 +89,7 @@ static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
 #define RAY_EVAL_MAX_DEPTH 512
 
 typedef struct {
-    const ray_t* vec;
+    ray_t* vec;  /* owned until this evaluation root finishes */
     const void* data;
     int64_t len;
     int8_t type;
@@ -104,7 +104,13 @@ static _Thread_local affine_sum_cache_entry_t affine_sum_cache[AFFINE_SUM_CACHE_
 static _Thread_local uint8_t affine_sum_cache_n = 0;
 
 static void affine_sum_cache_clear(void) {
+    /* Detach before releasing: completed roots must not leave borrowed
+     * identities that can match a later allocation at the same address. */
+    ray_t* owners[AFFINE_SUM_CACHE_N];
+    uint8_t n = affine_sum_cache_n;
+    for (uint8_t i = 0; i < n; i++) owners[i] = affine_sum_cache[i].vec;
     affine_sum_cache_n = 0;
+    for (uint8_t i = 0; i < n; i++) ray_release(owners[i]);
 }
 
 /* Eval-context nfo (source locations) and the error trace (list of
@@ -436,7 +442,9 @@ static int affine_sum_cache_lookup(ray_t* vec, affine_sum_cache_entry_t* out) {
 }
 
 static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* in) {
-    if (affine_sum_cache_n >= AFFINE_SUM_CACHE_N) return;
+    /* Arena values cannot acquire an independent owner via ray_retain. */
+    if (affine_sum_cache_n >= AFFINE_SUM_CACHE_N || (vec->attrs & RAY_ATTR_ARENA)) return;
+    ray_retain(vec);
     affine_sum_cache[affine_sum_cache_n++] = *in;
 }
 
@@ -6119,7 +6127,12 @@ out:
      * returns to 0 guarantees the progress bar is cleared no matter
      * which builtin drove the update (including ray_group_indices_fn etc.
      * that bypass ray_execute). */
-    if (__VM->eval_depth == 0) ray_progress_end();
+    if (__VM->eval_depth == 0) {
+        /* Release pins before a final progress callback can start more work,
+         * and before a caller is allowed to destroy its runtime. */
+        affine_sum_cache_clear();
+        ray_progress_end();
+    }
     return ret;
 }
 
