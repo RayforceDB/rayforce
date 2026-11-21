@@ -2387,6 +2387,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             if (tgt < 0) return NULL;
             ray_op_t* col = compile_expr_dag(g, elems[2]);
             if (!col) return NULL;
+            /* SYM lanes store intern IDs, not numeric values. Let eager as
+             * decide the cast instead of exposing the storage representation. */
+            if (col->out_type == RAY_SYM) return NULL;
             if (quoted_call) {
                 int8_t it = col->out_type;
                 if (it != RAY_BOOL && it != RAY_U8 && it != RAY_I16 && it != RAY_I32 &&

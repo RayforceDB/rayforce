@@ -1,0 +1,5 @@
+(set T (table [s i] (list ['a 'b 'c] [1 2 3])))
+(set errtext (fn [e] (format "%" e)))
+(set eager (try (as 'I64 (at T 's)) errtext))
+(try (select {from: T z: (as 'I64 s)}) errtext) -- eager
+(at (select {from: T z: (as 'I64 i)}) 'z) -- [1 2 3]
