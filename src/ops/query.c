@@ -500,11 +500,11 @@ static int dag_cmp_kind(ray_graph_t* g, ray_op_t* x, int8_t t) {
     case RAY_TIME: case RAY_TIMESTAMP: return CK_CLOCK;
     case RAY_TIMESPAN:            return CK_SPAN;
     case RAY_GUID:                return CK_GUID;
-    case RAY_STR:                 return CK_STR;
-    case RAY_SYM: {
-        if (x->opcode != OP_CONST) return CK_SYM;
+    case RAY_STR: case RAY_SYM: {
+        if (x->opcode != OP_CONST) return t == RAY_STR ? CK_STR : CK_SYM;
         ray_op_ext_t* ext = find_ext(g, x->id);
-        return ext && ext->literal && ext->literal->type == -RAY_STR ? CK_TEXT : CK_SYM;
+        if (ext && ext->literal && ext->literal->type == -RAY_STR) return CK_TEXT;
+        return t == RAY_STR ? CK_STR : CK_SYM;
     }
     default:                      return 0;
     }
