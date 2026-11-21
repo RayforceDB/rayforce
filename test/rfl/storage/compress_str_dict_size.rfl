@@ -1,0 +1,95 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; #1094: a generation-2 save leaves out a STR column's automatic DICT when
+;; the file with it would be larger than the generation-0 file, so a column of
+;; mostly distinct strings is written raw-sized (what index: false writes)
+;; instead of about twice that.  A low-cardinality column keeps its DICT.
+;; Both shapes carry nulls ("" is STR's null) and read back unchanged.
+;; An explicit {index: true} keeps the DICT whatever it costs; false never
+;; builds it.  A parted table's streamed write decides the same way.
+(.sys.exec "rm -rf /tmp/rf_test_strdict_size") -- 0
+(set n 66000)
+(set i (til n))
+(set pad "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+;; distinct ~100-byte strings, every 97th row null
+(set big (as 'STR (map (fn [j] (if (== 0 (% j 97)) "" (format "%/%" j pad))) i)))
+;; 211 short values, every 13th row null
+(set lo (as 'STR (map (fn [j] (if (== 0 (% j 13)) "" (format "k%" (% j 211)))) i)))
+(set t (table [r s] (list big lo)))
+(.db.splayed.set "/tmp/rf_test_strdict_size/g0/" t {compress: false})
+(.db.splayed.set "/tmp/rf_test_strdict_size/z/" t {compress: true})
+(.db.splayed.set "/tmp/rf_test_strdict_size/zni/" t {compress: true index: false})
+(.db.splayed.set "/tmp/rf_test_strdict_size/zi/" t {compress: true index: true})
+(set G (.db.splayed.get "/tmp/rf_test_strdict_size/g0/"))
+(set Z (.db.splayed.get "/tmp/rf_test_strdict_size/z/"))
+
+;; the encoding chosen: no index on the distinct column, the DICT on the other
+(at (.idx.info Z 'r) 'gen) -- 2
+(at (.idx.info Z 'r) 'index) -- 'none
+(at (.idx.info Z 's) 'index) -- 'dict
+;; generation 0 keeps its own DICT (codes only, strings read through the column)
+(at (at (.idx.info G 'r) 'index) 'kind) -- 'dict
+
+;; the size bound: never larger than the generation-0 file; the distinct
+;; column is the index: false file, the low-cardinality one still compresses
+(<= (.fs.size "/tmp/rf_test_strdict_size/z/r") (.fs.size "/tmp/rf_test_strdict_size/g0/r")) -- true
+(== (.fs.size "/tmp/rf_test_strdict_size/z/r") (.fs.size "/tmp/rf_test_strdict_size/zni/r")) -- true
+(< (.fs.size "/tmp/rf_test_strdict_size/z/s") (.fs.size "/tmp/rf_test_strdict_size/g0/s")) -- true
+
+;; index: true keeps the DICT on the distinct column too, at its cost
+(set ZI (.db.splayed.get "/tmp/rf_test_strdict_size/zi/"))
+(at (.idx.info ZI 'r) 'index) -- 'dict
+(at (.idx.info ZI 's) 'index) -- 'dict
+(> (.fs.size "/tmp/rf_test_strdict_size/zi/r") (.fs.size "/tmp/rf_test_strdict_size/g0/r")) -- true
+(> (.fs.size "/tmp/rf_test_strdict_size/zi/r") (.fs.size "/tmp/rf_test_strdict_size/z/r")) -- true
+(== (.fs.size "/tmp/rf_test_strdict_size/zi/s") (.fs.size "/tmp/rf_test_strdict_size/z/s")) -- true
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_size/zni/") 'r) 'index) -- 'none
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_size/zni/") 's) 'index) -- 'none
+(all (== (at ZI 'r) big)) -- true
+(count (select {from: ZI where: (== r (at big 12345))})) -- 1
+(count (select {from: ZI where: (== r "")})) -- 681
+(count (distinct (at ZI 'r))) -- 65320
+
+;; read back: values, nulls, a point filter, distinct, a filter on the DICT column
+(all (== (at Z 'r) big)) -- true
+(all (== (at Z 's) lo)) -- true
+(count (where (nil? (at Z 'r)))) -- 681
+(count (where (nil? (at Z 's)))) -- 5077
+(count (select {from: Z where: (== r (at big 12345))})) -- 1
+(count (distinct (at Z 'r))) -- 65320
+(count (distinct (at Z 's))) -- (count (distinct lo))
+(count (select {from: Z where: (== s "k5")})) -- (count (select {from: t where: (== s "k5")}))
+(count (select {from: Z where: (== s "")})) -- 5077
+
+;; a re-save of the loaded table decides again; index: true keeps it
+(.db.splayed.set "/tmp/rf_test_strdict_size/z2/" Z {compress: true})
+(set Z2 (.db.splayed.get "/tmp/rf_test_strdict_size/z2/"))
+(at (.idx.info Z2 'r) 'index) -- 'none
+(at (.idx.info Z2 's) 'index) -- 'dict
+(all (== (at Z2 'r) big)) -- true
+(.db.splayed.set "/tmp/rf_test_strdict_size/z3/" Z {compress: true index: true})
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_size/z3/") 'r) 'index) -- 'dict
+(.fs.size "/tmp/rf_test_strdict_size/z3/r") -- (.fs.size "/tmp/rf_test_strdict_size/zi/r")
+
+;; a parted table, written a segment at a time: the same three states
+(set D "/tmp/rf_test_strdict_size/db")
+(.db.splayed.set (format "%/2026.10.21/t" D) (take t 33000) (format "%/.sym" D))
+(.db.splayed.set (format "%/2026.10.22/t" D) (drop t 33000) (format "%/.sym" D))
+(set P (.db.parted.get D 't))
+(.db.splayed.set "/tmp/rf_test_strdict_size/pz/" P {compress: true})
+(.db.splayed.set "/tmp/rf_test_strdict_size/pzi/" P {compress: true index: true})
+(.db.splayed.set "/tmp/rf_test_strdict_size/pzni/" P {compress: true index: false})
+(set PZ (.db.splayed.get "/tmp/rf_test_strdict_size/pz/"))
+(set PZI (.db.splayed.get "/tmp/rf_test_strdict_size/pzi/"))
+(at (.idx.info PZ 'r) 'index) -- 'none
+(at (.idx.info PZ 's) 'index) -- 'dict
+(at (.idx.info PZI 'r) 'index) -- 'dict
+(at (.idx.info PZI 's) 'index) -- 'dict
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_strdict_size/pzni/") 'r) 'index) -- 'none
+(.fs.size "/tmp/rf_test_strdict_size/pz/r") -- (.fs.size "/tmp/rf_test_strdict_size/z/r")
+(.fs.size "/tmp/rf_test_strdict_size/pzi/r") -- (.fs.size "/tmp/rf_test_strdict_size/zi/r")
+(.fs.size "/tmp/rf_test_strdict_size/pzni/r") -- (.fs.size "/tmp/rf_test_strdict_size/zni/r")
+(all (== (at PZ 'r) big)) -- true
+(all (== (at PZI 'r) big)) -- true
+(count (select {from: PZI where: (== r (at big 40000))})) -- 1
+
+(.sys.exec "rm -rf /tmp/rf_test_strdict_size") -- 0

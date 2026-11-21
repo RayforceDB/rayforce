@@ -1182,6 +1182,29 @@ static ray_err_t encw_side(ray_encw_t* w, uint64_t* side_off, uint64_t* side_len
     return RAY_OK;
 }
 
+/* Does the automatic STR DICT make the file larger than generation 0's
+ * (#1094)?  Its region holds 4 B of code a row, the first-occurrence rows,
+ * 8 B of offset and a second, uncompressed copy of every distinct string.
+ * When the strings are mostly distinct the vectors stay RAW (no encoding
+ * pays), so the region roughly doubles the file.  The generation-0 file of
+ * the same column (ray_col_save, then ray_col_append_index) is its 32 B
+ * header, 16 B a row, the pool's 32 B header and every pooled byte
+ * (str_occ_bytes: its pool holds each row's string), padded to 32, then its
+ * DICT region of codes and first-occurrence rows only, its strings read
+ * through the column (ray_index_dict_inline_size).  The DICT is kept while
+ * the file with it, the column so far padded to the region plus the region
+ * exactly as ray_enc_dict_write lays it out, is no larger than that; else
+ * the column is written without it, as with index: false.  keep_dict (the
+ * save's explicit index: true) writes it whatever it costs. */
+static bool encw_dict_outweighs(const ray_encw_t* w) {
+    if (w->keep_dict) return false;
+    const ray_dict_acc_t* a = w->idict;
+    uint64_t region = ray_enc_dict_region_bytes(w->len, a->n_distinct, a->pool_len);
+    uint64_t gen0 = ray_enc_pad32(64ull + 16ull * (uint64_t)w->len + w->str_occ_bytes) +
+                    (uint64_t)ray_index_dict_inline_size(w->len, a->n_distinct);
+    return region > gen0 || ray_enc_pad32(w->pos) > gen0 - region;
+}
+
 ray_err_t ray_encw_finish(ray_encw_t* w) {
     if (w->chunk_i != w->n_chunks) return RAY_ERR_RANGE;
     ray_err_t err;
@@ -1191,6 +1214,10 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
     if (w->sdict.used) w->str_pool_bytes += w->sdict.pooled;
     /* the index region follows the side data, 32-aligned (spec "Writers") */
     uint64_t index_off = 0;
+    if (w->idict && encw_dict_outweighs(w)) {
+        ray_dict_acc_free(w->idict); ray_free_raw(w->idict); w->idict = NULL;
+        w->index_kind = 0;
+    }
     if (w->has_idx || w->idx_copy || w->idict) {
         index_off = ray_enc_pad32(w->pos);
         if ((err = fput(w, NULL, (size_t)(index_off - w->pos))) != RAY_OK) return err;
