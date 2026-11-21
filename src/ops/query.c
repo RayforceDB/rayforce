@@ -22952,6 +22952,14 @@ by_dict_done:
                         list_col->len = gi + 1;  /* commit slot */
                     }
                     ray_release(full_val);
+                    /* a cancel in a gather that dispatched: its cell unwritten */
+                    if (full_is_row_aligned && pool_cancelled(ray_pool_get())) {
+                        ray_release(list_col);
+                        for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                        ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("cancel", NULL);
+                    }
                     agg_names[n_agg_out] = kid;
                     agg_results[n_agg_out] = list_col;
                     n_agg_out++;
@@ -26495,6 +26503,11 @@ by_dict_done:
                     if (!gather_ok) {
                         ray_release(list_col);  /* releases exactly len filled slots */
                         scatter_err = ray_error("oom", NULL); break;
+                    }
+                    /* a cancel in a gather that dispatched: its cell unwritten */
+                    if (full_is_row_aligned && pool_cancelled(ray_pool_get())) {
+                        ray_release(list_col);
+                        scatter_err = ray_error("cancel", NULL); break;
                     }
 
                     result = ray_table_add_col(result, nonagg_names[ni], list_col);
