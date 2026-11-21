@@ -17255,37 +17255,19 @@ static ray_t* query_hoist_running(ray_t* e, run_hoist_t* h, int depth) {
     return out;
 }
 
-/* Does the select's own engine run output `x` with the where: in place
- * (the DAG), so that a running call in it already sees the whole table? */
-static bool select_output_dag_runs(ray_t* x, ray_t* tbl) {
-    if (!x || x->type != RAY_LIST || (x->attrs & ATTR_QUOTED)) return true;
-    if (is_agg_expr(x)) {
-        ray_t* err = NULL;
-        int ok = is_group_dag_agg_expr_dag_safe(x, tbl, &err);
-        if (err) { ray_error_free(err); return false; }
-        return ok != 0;
-    }
-    ray_graph_t* pg = ray_graph_new(tbl);
-    if (!pg) return false;
-    bool ok = compile_expr_dag(pg, x) != NULL;
-    ray_t* err = graph_take_compile_err(pg);
-    if (err) { ray_error_free(err); ok = false; }
-    ray_graph_free(pg);
-    return ok;
-}
-
 /* The keyless select with every outermost running call of its outputs
  * evaluated over the whole table into a hidden column of a new from: table,
- * when an output would reach the evaluator; a where: then keeps that
+ * when the select falls back to the evaluator; a where: then keeps that
  * column's rows with the rest, so the select reads the whole-table value at
  * the kept rows, as the DAG gives it, and a where: that keeps every row
  * gives what no where: gives.  An aggregate nested in such a call sees the
  * whole table with it, one beside it the kept rows, as in the DAG.  A
  * parted table is read flat for it (the evaluator flattens it anyway).
- * NULL when the select is grouped, when no output holds a running call,
- * when the DAG runs every output, when a call reads a name an earlier
- * output rebinds, or when a call does not give one value per row: the
- * select then plans as before. */
+ * Asked only where a keyless select falls back (ray_select_body), so a
+ * select the DAG runs pays nothing for it.  NULL when the select is
+ * grouped, when no output holds a running call, when a call reads a name
+ * an earlier output rebinds, or when a call does not give one value per
+ * row: the select then falls back as before. */
 static ray_t* select_plan_running_where(ray_t* dict, ray_t* tbl) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -17313,7 +17295,6 @@ static ray_t* select_plan_running_where(ray_t* dict, ray_t* tbl) {
     ray_t* engine = NULL;
     ray_t* src = NULL;
     int64_t ncalls = 0;
-    bool all_dag = true;
     for (int64_t i = 0; i < nd; i++) {
         xs[i] = NULL;
         if (select_clause_key(rid, sym_cell_runtime_id(keys, i)) || !vs[i] || vs[i]->type != RAY_LIST) continue;
@@ -17322,9 +17303,7 @@ static ray_t* select_plan_running_where(ray_t* dict, ray_t* tbl) {
         xs[i] = x;
         ncalls += query_count_running(x, tbl, 0);
     }
-    for (int64_t i = 0; i < nd && ncalls && all_dag; i++)
-        if (xs[i]) all_dag = select_output_dag_runs(xs[i], tbl);
-    if (!ncalls || all_dag) goto out;
+    if (!ncalls) goto out;
 
     ray_t** calls = (ray_t**)scratch_alloc(&hdr2, (size_t)ncalls * (sizeof(ray_t*) + sizeof(int64_t)));
     if (!calls) { engine = ray_error("oom", NULL); goto out; }
@@ -17402,6 +17381,19 @@ out:
     scratch_free(hdr2);
     scratch_free(xs_hdr);
     return engine;
+}
+
+/* The keyless select `dict` over `tbl` with its running calls hoisted
+ * (select_plan_running_where) and re-entered; NULL when there is none to
+ * hoist.  Called where the select would hand its outputs to the
+ * evaluator. */
+static ray_t* select_running_fallback(ray_t* dict, ray_t* tbl, unsigned plan) {
+    if (plan & SELECT_RUNNING_PLANNED) return NULL;
+    ray_t* engine = select_plan_running_where(dict, tbl);
+    if (!engine || RAY_IS_ERR(engine)) return engine;
+    ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_RUNNING_PLANNED);
+    ray_release(engine);
+    return r ? r : ray_error("oom", NULL);
 }
 
 /* Does an aggregate's argument `a` read only its own row, or, when
@@ -19508,17 +19500,6 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
         if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
         if (engine) {
             ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_COLUMN_FREE_PLANNED);
-            ray_release(engine);
-            ray_release(tbl);
-            return r;
-        }
-    }
-
-    if (!(plan & SELECT_RUNNING_PLANNED)) {
-        ray_t* engine = select_plan_running_where(dict, tbl);
-        if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
-        if (engine) {
-            ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_RUNNING_PLANNED);
             ray_release(engine);
             ray_release(tbl);
             return r;
@@ -24313,6 +24294,13 @@ by_dict_done:
                 s_n_aggs++;
             }
             if (s_use_eval_fallback) {
+                ray_t* hoisted = select_running_fallback(dict, tbl, plan);
+                if (hoisted) {
+                    if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sagg_hdr);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hoisted;
+                }
                 ray_t* eval_tbl = tbl;
                 int release_eval_tbl = 0;
                 if (g->selection) {
@@ -24477,6 +24465,12 @@ by_dict_done:
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(colops_hdr);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr;
+                }
+                ray_t* hoisted = nearest_expr ? NULL : select_running_fallback(dict, tbl, plan);
+                if (hoisted) {
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(colops_hdr);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hoisted;
                 }
                 /* The fallback evaluates projections directly over `tbl`,
                  * bypassing the DAG's ray_execute — so a WHERE clause (wired

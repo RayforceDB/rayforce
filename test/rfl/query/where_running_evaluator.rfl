@@ -100,6 +100,17 @@
 (set __run0 1000)
 (at (select {from: U where: (> i 20) q: (+ i __run0) p: (prior - i)}) 'q) -- [1030 1040 1050 1060]
 (count (select {from: U where: (> __run0 i) p: (prior - i)})) -- 6
+;; The hoist runs only where a keyless select falls back to the evaluator:
+;; the scalar reduction (every output an aggregate, one the DAG declines,
+;; or a count over a constant collection) and the projection.  A select
+;; the DAG runs whole keeps the DAG's answer.
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) b: (max (prior - i))}) 'a) -- [40]
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) b: (max (prior - i))}) 'b) -- [10]
+(at (select {from: U where: (> i 20) a: (sum (sums i)) c: (count (til 3))}) 'a) -- [520]
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) c: (count [1 2 3])}) 'c) -- [3]
+(at (select {from: U where: (> i 20) z: (prior - i) take: 2}) 'z) -- [10 10]
+(at (select {from: U where: (> i 20) z: (sums i) q: (+ i 1)}) 'z) -- [60 100 150 210]
+(at (select {from: U where: (> i 20) z: (sum (sums i))}) 'z) -- [520]
 ;; An unbound name in a value, a where: or a take: is never the hidden
 ;; column: it is not found, as without the hoist.
 (select {from: U where: (> __run1 5) z: (prior - i)}) !- schema
