@@ -66,8 +66,10 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
             (bn || span_number(b) || b == RAY_TIME))
             return a == RAY_F64 || b == RAY_F64 ? RAY_F64 : RAY_TIMESPAN;
     }
-    /* A TIME is a point of the day: it has no quotient by a duration. */
-    if ((op == OP_DIV || op == OP_IDIV) && (a == RAY_TIME || b == RAY_TIME)) return -1;
+    /* A TIME is a point of the day: it has no quotient by a duration.  (A
+     * duration divided by a TIME reads the TIME as its millisecond count,
+     * as q does.) */
+    if ((op == OP_DIV || op == OP_IDIV) && a == RAY_TIME) return -1;
     if (op == OP_DIV && span_divisor(a) && span_divisor(b)) return RAY_F64;
     if (op == OP_IDIV && span_divisor(a) && span_divisor(b))
         return an ? RAY_TIMESPAN : (a == RAY_F32 ? RAY_F64 : a == RAY_BOOL || a == RAY_U8 || a == RAY_I16 ? RAY_I32 : a);
@@ -79,9 +81,8 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
 }
 
 static int64_t span_value(ray_t* x, uint16_t op) {
-    /* a TIME bucketed by a duration is bucketed in nanoseconds */
     if (op == OP_DIV || op == OP_IDIV || op == SPAN_BUCKET) {
-        if (x->type == -RAY_DATE || (x->type == -RAY_TIME && op != SPAN_BUCKET)) return x->i32;
+        if (x->type == -RAY_DATE || x->type == -RAY_TIME) return x->i32;
     }
     if (x->type == -RAY_DATE) return wrap_mul_i64(x->i32, INT64_C(86400000000000));
     if (x->type == -RAY_TIME) return (int64_t)x->i32 * INT64_C(1000000);
@@ -112,6 +113,8 @@ typedef struct {
 static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
     bool na = RAY_ATOM_IS_NULL(a), nb = RAY_ATOM_IS_NULL(b);
     int64_t av = span_value(a, op), bv = span_value(b, op), value = 0;
+    /* a TIME bucketed by a duration is bucketed in nanoseconds */
+    if (op == SPAN_BUCKET && a->type == -RAY_TIME) av = (int64_t)a->i32 * INT64_C(1000000);
     if (out == RAY_BOOL) {
         if (a->type == -RAY_TIMESTAMP && !na) {
             av %= INT64_C(86400000000000);

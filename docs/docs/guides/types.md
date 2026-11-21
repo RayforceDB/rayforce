@@ -365,7 +365,7 @@ type error. Adding or subtracting an integer still counts the type's own unit
 nanosecond count is needed. A duration may also be scaled by an integer, or
 used as an `xbar` width for a timestamp or a time (`(xbar 10:37:00.000
 0D00:15:00)` is `10:30:00.000`). A time has no quotient by a duration: `div`
-and `/` of a time and a TIMESPAN are type errors. See [Timespan](timespan.md) for operator result
+and `/` of a time by a TIMESPAN are type errors. See [Timespan](timespan.md) for operator result
 types and migration details.
 
 Subtracting two dates returns an I32 count of days, so a date plus the
