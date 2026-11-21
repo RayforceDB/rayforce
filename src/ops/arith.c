@@ -134,7 +134,7 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return null_for_promoted(a, b);
     if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(as_f64(a) + as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) + as_f64(b));
-    int8_t rt = promote_int_type(a, b);
+    int8_t rt = arith_atom_type(a, b);
     /* Wrap on overflow (defined) rather than signed-overflow UB, matching the
      * vector arithmetic kernel (src/ops/expr.c OP_ADD/SUB/MUL).  The wrapped
      * i64 (INT64_MIN on MAX+1) is the null sentinel, so results are unchanged
@@ -218,7 +218,7 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
         if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(r));
         return make_f64(r);
     }
-    int8_t rt = promote_int_type(a, b);
+    int8_t rt = arith_atom_type(a, b);
     /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
     int64_t la = as_i64(a), lb = as_i64(b);
     return make_typed_int(rt, (int64_t)((uint64_t)la - (uint64_t)lb));
@@ -255,7 +255,7 @@ ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return null_for_promoted(a, b);
     if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(as_f64(a) * as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) * as_f64(b));
-    int8_t rt = promote_int_type(a, b);
+    int8_t rt = arith_atom_type(a, b);
     /* uint64 wrap on overflow (defined), like ray_add_fn / the vector kernel. */
     int64_t la = as_i64(a), lb = as_i64(b);
     return make_typed_int(rt, (int64_t)((uint64_t)la * (uint64_t)lb));
@@ -281,19 +281,21 @@ ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
     if (!is_numeric(a) || !is_numeric(b))
         return ray_error("type", "cannot div %s by %s",
                          ray_type_name(a->type), ray_type_name(b->type));
+    /* The result takes the promotion table's type, as + - * do (#972):
+     * integers floor-divide in the wider width, floats floor in float. */
+    int8_t rt = arith_atom_type(a, b);
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
-        return ray_typed_null(-RAY_I64);
+        return ray_typed_null(rt);
     if (is_float_op(a, b)) {
         double bv = as_f64(b);
         if (bv == 0.0)
-            return ray_typed_null(-RAY_I64);
+            return ray_typed_null(rt);
         double q = floor(as_f64(a) / bv);
-        if (q >= 0x1p63 /* 2^63: first double past INT64_MAX */ || q < (double)INT64_MIN)
-            return ray_typed_null(-RAY_I64);
-        return make_i64((int64_t)q);
+        if (rt == -RAY_F32) return ray_f32(ray_f64_to_f32_fin(q));
+        return make_f64(q);
     }
-    /* Integer div: stay in int64 space. The double round-trip above silently
-     * loses precision for magnitudes > 2^53 and is UB for q == 2^63. */
+    /* Integer div: stay in int64 space. The double round-trip silently
+     * loses precision for magnitudes > 2^53. */
     int64_t bv = as_i64(b);
     int64_t la = as_i64(a);
     /* bv==0 → null; INT64_MIN/-1 overflow → null (unreachable while INT64_MIN
@@ -301,11 +303,13 @@ ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
      * scalar path can never trip signed-overflow UB — symmetric with the
      * vector floor_idiv_i64_checked kernel). */
     if (bv == 0 || (la == INT64_MIN && bv == -1))
-        return ray_typed_null(-RAY_I64);
+        return rt == -RAY_U8 ? make_typed_int(rt, 0)   /* U8 has no null */
+                             : ray_typed_null(rt);
     int64_t q = la / bv;
     if (la % bv != 0 && ((la < 0) != (bv < 0)))
         q--; /* floor toward -inf */
-    return make_i64(q);
+    /* |q| <= |la|: the quotient fits the wider operand's width */
+    return make_typed_int(rt, q);
 }
 
 ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
@@ -340,51 +344,38 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
         return ray_error("type", "cannot mod %s by %s",
                          ray_type_name(a->type), ray_type_name(b->type));
 
-    /* u8: unsigned byte modulo, no null sentinel — mod by 0 returns 0 */
-    if (b->type == -RAY_U8) {
-        uint8_t bv = b->u8;
-        if (bv == 0) return make_u8(0);
-        return make_u8((uint8_t)((uint8_t)as_i64(a) % bv));
-    }
-    if (a->type == -RAY_U8) {
-        /* a is u8 but b is not u8 — treat as integer, result follows b's type */
-    }
+    /* The result takes the promotion table's type (#972), so a narrow
+     * divisor no longer truncates a wider dividend (#1227: (% 300 0xff)
+     * read 300 as its low byte). */
+    int8_t rt = arith_atom_type(a, b);
+    if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
+        return ray_typed_null(rt);
 
-    /* Null propagation and division by zero: null type follows RIGHT operand */
-    if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) {
-        return null_for_promoted(a, b);
-    }
-
-    /* Float modulo: result = a - b * floor(a/b), type follows RIGHT or f64 */
+    /* Float modulo: result = a - b * floor(a/b) */
     if (is_float_op(a, b)) {
         double av = as_f64(a), bv = as_f64(b);
-        if (bv == 0.0) {
-            return null_for_promoted(a, b);
-        }
+        if (bv == 0.0)
+            return ray_typed_null(rt);
         double result = av - bv * floor(av / bv);
         /* Snap tiny residual to 0 */
         if (fabs(result) < 1e-12 || fabs(result - fabs(bv)) < 1e-12) result = bv > 0 ? 0.0 : -0.0;
-        if (both_f32_atoms(a, b)) return ray_f32(ray_f64_to_f32_fin(result));
-        if (b->type == -RAY_F64 || a->type == -RAY_F64 ||
-            b->type == -RAY_F32 || a->type == -RAY_F32) return make_f64(result);
-        if (b->type == -RAY_I32) return make_i32((int32_t)(int64_t)result);
-        if (b->type == -RAY_I16) return make_i16((int16_t)(int64_t)result);
-        return make_i64((int64_t)result);
+        if (rt == -RAY_F32) return ray_f32(ray_f64_to_f32_fin(result));
+        return make_f64(result);
     }
 
-    /* Integer modulo: result = a - b * floor(a/b), sign follows b (divisor) */
+    /* Integer modulo: result = a - b * floor(a/b), sign follows b (divisor).
+     * A zero divisor is null, except a U8 one and a U8 result, which have
+     * no null: unsigned byte modulo by 0 is 0, as the vector kernels give. */
     int64_t av = as_i64(a), bv = as_i64(b);
     if (bv == 0)
-        return ray_typed_null(b->type);
+        return (b->type == -RAY_U8 || rt == -RAY_U8) ? make_typed_int(rt, 0)
+                                                     : ray_typed_null(rt);
 
-    int64_t q = av / bv;
-    if ((av ^ bv) < 0 && q * bv != av) q--;  /* floor division */
-    int64_t result = av - bv * q;
-    /* Result type follows RIGHT operand */
-    if (b->type == -RAY_I32) return make_i32((int32_t)result);
-    if (b->type == -RAY_I16) return make_i16((int16_t)result);
-    if (b->type == -RAY_U8) return make_u8((uint8_t)result);
-    return make_i64(result);
+    /* Floor modulo without the av - bv*q product, which can overflow
+     * (INT64_MIN is the null, so av % -1 never traps here). */
+    int64_t r = av % bv;
+    if (r != 0 && ((r ^ bv) < 0)) r += bv;
+    return make_typed_int(rt, r);
 }
 
 ray_t* ray_neg_fn(ray_t* x) {
