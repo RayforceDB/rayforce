@@ -56,8 +56,8 @@
 (CF P) -- (CF T)
 (CT T) -- (CF T)
 ;; Grouped outputs the evaluator runs: a where: that keeps every row gives
-;; the answer no where: gives, on T, P and S alike (#1249 is the separate
-;; question of per group vs whole table).
+;; the answer no where: gives, on T, P and S alike (whole table under by:
+;; too, #1249: rfl/query/grouped_running_whole_table).
 (set G (fn [s q] (at (xasc (select q) 'k) 'z)))
 (set Q0 (fn [s] (xasc (select {from: s by: k z: (sum (prior - i)) c: (sums v)}) 'k)))
 (set Q1 (fn [s] (xasc (select {from: s by: k where: (> i 0) z: (sum (prior - i)) c: (sums v)}) 'k)))
