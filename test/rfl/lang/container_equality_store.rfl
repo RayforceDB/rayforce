@@ -1,0 +1,24 @@
+;; @requires: posix
+;; Persisted columns must compare by values, including file-domain symbols.
+(set eqdir "rfl_container_equality_store/")
+(set S (table [n s text] (list [1 2 0Nl] ['x 'y '] ["x" "y" ""])))
+(.db.splayed.set eqdir S)
+(set R (.db.splayed.get eqdir))
+(identical R S) -- true
+(identical (== R S) (== S S)) -- true
+(identical (== S R) (== S S)) -- true
+(identical (== R R) (== S S)) -- true
+(identical (== (at R 's) 'x) (== (at S 's) 'x)) -- true
+(identical (at R 's) (at S 's)) -- true
+(identical (at R 'text) (at S 'text)) -- true
+(identical R (de (ser S))) -- true
+
+;; Fresh parted loads, including the virtual MAPCOMMON partition column.
+(.db.splayed.set "rfl_eqpart/2024.01.01/t/" S)
+(.db.splayed.set "rfl_eqpart/2024.01.02/t/" S)
+(set P (.db.parted.get "rfl_eqpart/" 't))
+(== P P) -- (table [date n s text] (list (take [true] 6) (take [true] 6) (take [true] 6) (take [true] 6)))
+(set Q (.db.parted.get "rfl_eqpart/" 't))
+(identical P Q) -- true
+(identical (== P Q) (== Q P)) -- true
+(identical (== (.db.parted.get "rfl_eqpart/" 't) null) (== P null)) -- true

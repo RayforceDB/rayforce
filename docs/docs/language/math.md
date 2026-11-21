@@ -201,6 +201,39 @@ Equal. Works on all types including strings and symbols.
 (== [1 2 3] 2)  ; [false true false]
 ```
 
+Dictionaries retain their keys and compare values by key. When keys differ,
+the result contains the left keys followed by new right keys; a key present
+on only one side compares `false`. An atom broadcasts over dictionary values.
+Tables compare cell by cell, returning boolean columns. Table column names
+and order and row counts must agree, otherwise `==` raises `length`. An atom
+broadcasts over all cells. Other comparisons and arithmetic keep their
+existing behavior. In particular, `!=` still rejects dictionaries and tables.
+Nonempty dictionary key vector types must match; different key types raise `type`.
+Identical key vectors (including duplicate keys) compare values positionally;
+otherwise each left value compares with the first right value for its key,
+including repeated left keys. For example, `[a a b]` versus `[a a c]` with
+values `[1 2 3]` on both sides yields `{a:true a:false b:false c:false}`.
+Keyed-table comparisons support single and composite keys, including durations.
+
+### `(identical a b)`
+
+Returns one boolean for whole-value identity: the same type, shape and
+contents recursively. Numeric types are never promoted. Type and length
+mismatches return `false`. Lists and typed vectors are distinct types.
+Nulls match only the same type; floating values compare exactly, with NaNs
+matching NaNs and negative zero matching positive zero. Strings compare by
+bytes and symbols by text. Storage attributes and indexes do not matter.
+Dictionary keys and values must agree in order; tables must have the same
+column names in order and identical columns. Lazy values are evaluated.
+Builtins match the same builtin; lambdas match only the same function object.
+
+```clojure
+(identical [1 2] [1 2])  ; true
+(identical 1 1i)        ; false
+(identical (list 1 2) [1 2]) ; false
+(== {a: 1 b: 2} 1)     ; {a:true b:false}
+```
+
 ### `(!= a b)` — atomic
 
 Not equal.
@@ -736,3 +769,9 @@ described in [Multiple Instances](../guides/instances.md).
 
 !!! note "Auto-mapping"
     Arithmetic, comparison, and logic functions automatically map over vectors element-wise. You do not need explicit `map` calls for these — `(+ [1 2 3] 10)` works directly.
+
+For equality, mixing a dictionary with a table is a `type` error in either
+operand order; a dictionary's keys are not interpreted as table columns.
+
+Table equality and identity read stored columns as values: encoded and
+partitioned columns are materialized, including virtual partition columns.

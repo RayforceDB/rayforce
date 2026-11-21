@@ -1387,6 +1387,10 @@ static ray_t* bool_cmp_fast(uint16_t op, ray_t* left, ray_t* right) {
 }
 
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    if (fn == ray_eq_fn && left && right && !RAY_IS_ERR(left) && !RAY_IS_ERR(right) &&
+        (left->type == RAY_DICT || right->type == RAY_DICT ||
+                            left->type == RAY_TABLE || right->type == RAY_TABLE))
+        return fn(left, right);
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
         return atomic_map_binary_parted(fn, dag_opcode, left, right);
@@ -3707,7 +3711,7 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     }
     RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
     if (RAY_UNLIKELY(RAY_IS_NULL(left) || RAY_IS_NULL(right))) {
-        result = (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
+        result = (fn == ray_identical_fn || fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
                  ? fn(left, right) : ray_error("type", NULL);
     } else if (fn == ray_concat_fn && (left_rows == 1 || right_rows == 1) &&
                vm_text_value(left) && vm_text_value(right) &&
@@ -5170,6 +5174,7 @@ static void ray_register_builtins(void) {
     register_vary("apply",  RAY_FN_NONE, ray_apply_fn);
 
     /* Collection operations */
+    register_binary("identical", RAY_FN_NONE, ray_identical_fn);
     register_unary("distinct", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_distinct_fn);
     register_binary("in",      RAY_FN_NONE, ray_in_eval_fn);
     register_binary("not-in",  RAY_FN_NONE, ray_not_in_fn);
@@ -5969,7 +5974,7 @@ ray_t* ray_eval(ray_t* obj) {
             /* If either arg is NULL/void, only == and != can handle it */
             RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
             if (RAY_IS_NULL(left) || RAY_IS_NULL(right)) {
-                if (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn) {
+                if (fn == ray_identical_fn || fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn) {
                     ray_release(head);
                     ray_t* result = fn(left, right);
                     ray_release(left);
