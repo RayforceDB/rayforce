@@ -815,6 +815,8 @@ ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
 ray_t* ray_full_join_fn(ray_t** args, int64_t n);
 ray_t* ray_anti_join_fn(ray_t** args, int64_t n);
+ray_t* ray_semi_mask_fn(ray_t** args, int64_t n);
+ray_t* ray_anti_mask_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 ray_t* ray_asof_join_fn(ray_t** args, int64_t n);

@@ -32663,6 +32663,65 @@ static ray_t* antijoin_impl(ray_t** args, int64_t n) {
 
 ray_t* ray_anti_join_fn(ray_t** args, int64_t n) { return antijoin_impl(args, n); }
 
+/* (semi-mask [keys] left right) / (anti-mask [keys] left right), or with
+ * the keys last like the joins: a BOOL vector over left's rows, true where
+ * the row has a match in right on every key (anti: where it has none).
+ * The rows inner-join / anti-join would emit, as a selection. */
+static ray_t* join_mask_impl(ray_t** args, int64_t n, bool anti) {
+    const char* fn = anti ? "anti-mask" : "semi-mask";
+    if (n != 3) return ray_error("arity", "%s: expects keys, left table and right table, got %lld args",
+                                 fn, (long long)n);
+    ray_t* left_tbl = args[0], *right_tbl = args[1], *keys = args[2];
+    if (left_tbl->type != RAY_TABLE && args[1]->type == RAY_TABLE && args[2]->type == RAY_TABLE) {
+        keys = args[0]; left_tbl = args[1]; right_tbl = args[2];
+    }
+    if (left_tbl->type != RAY_TABLE || right_tbl->type != RAY_TABLE)
+        return ray_error("type", "%s: both operands must be tables, got %s and %s", fn,
+                         ray_type_name(left_tbl->type), ray_type_name(right_tbl->type));
+    ray_t* bxk = NULL;
+    keys = unbox_vec_arg(keys, &bxk);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* res = NULL;
+    ray_t* ids_hdr = NULL;
+    int64_t nk = is_list(keys) ? ray_len(keys) : 0;
+    if (!is_list(keys)) { res = ray_error("type", "%s: keys must be a symbol list, got %s", fn, ray_type_name(keys->type)); goto out; }
+    if (nk == 0) { res = ray_error("domain", "%s: requires at least 1 key", fn); goto out; }
+    int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)nk * sizeof(int64_t));
+    if (!ids) { res = ray_error("oom", NULL); goto out; }
+    ray_t** ke = (ray_t**)ray_data(keys);
+    for (int64_t i = 0; i < nk; i++) {
+        if (ke[i]->type != -RAY_SYM) {
+            res = ray_error("type", "%s: key must be a symbol name, got %s", fn, ray_type_name(ke[i]->type));
+            goto out;
+        }
+        ray_col_meta_t lkm, rkm;
+        bool has_l = ray_table_col_meta(left_tbl, ke[i]->i64, &lkm);
+        bool has_r = ray_table_col_meta(right_tbl, ke[i]->i64, &rkm);
+        if (!has_l || !has_r) {
+            ray_t* s = ray_sym_str(ke[i]->i64);
+            res = ray_error("domain", "%s: key column '%.*s' not found in %s table", fn,
+                            s ? (int)ray_str_len(s) : 0, s ? ray_str_ptr(s) : "",
+                            !has_l ? "left" : "right");
+            goto out;
+        }
+        int8_t lt = RAY_IS_PARTED(lkm.type) ? (int8_t)RAY_PARTED_BASETYPE(lkm.type) : lkm.type;
+        int8_t rt = RAY_IS_PARTED(rkm.type) ? (int8_t)RAY_PARTED_BASETYPE(rkm.type) : rkm.type;
+        if ((lt == RAY_STR) != (rt == RAY_STR)) {
+            res = ray_error("type", "%s: string key columns must have string type on both sides", fn);
+            goto out;
+        }
+        ids[i] = ke[i]->i64;
+    }
+    res = ray_join_mask(left_tbl, right_tbl, ids, (uint32_t)nk, anti);
+out:
+    if (ids_hdr) scratch_free(ids_hdr);
+    if (bxk) ray_release(bxk);
+    return res;
+}
+
+ray_t* ray_semi_mask_fn(ray_t** args, int64_t n) { return join_mask_impl(args, n, false); }
+ray_t* ray_anti_mask_fn(ray_t** args, int64_t n) { return join_mask_impl(args, n, true); }
+
 /* ------------------------------------------------------------------------ */
 /* window-join parallel worker                                              */
 /* ------------------------------------------------------------------------ */

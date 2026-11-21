@@ -5251,6 +5251,8 @@ static void ray_register_builtins(void) {
     register_vary("inner-join",  RAY_FN_NONE, ray_inner_join_fn);
     register_vary("full-join",   RAY_FN_NONE, ray_full_join_fn);
     register_vary("anti-join",   RAY_FN_NONE, ray_anti_join_fn);
+    register_vary("semi-mask",   RAY_FN_NONE, ray_semi_mask_fn);
+    register_vary("anti-mask",   RAY_FN_NONE, ray_anti_mask_fn);
     register_vary("window-join", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
     register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join1_fn);
     /* Special form: asof-join inspects its operand ASTs (parted-select
