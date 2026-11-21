@@ -296,6 +296,14 @@ completes (slowly) instead of being terminated. The progress bar's `used / total
 figure shows the footprint approaching total RAM; spill begins below it, at the
 watermark.
 
+Before a large block spills, the heap gives back the empty pools it holds
+for small blocks: those of the allocating thread's heap, then, while no
+parallel operator is running, those of the idle worker threads, one worker
+after another until the block fits. The workers' pools are given back only
+when the block is allocated on the thread that runs queries; a heap of
+another live thread, such as an embedding's own thread, is left to that
+thread.
+
 ### Checking total RAM
 
 ```lisp
