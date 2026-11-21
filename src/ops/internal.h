@@ -1505,6 +1505,10 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
  * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
  * Disarmed by ray_test_hooks_off. */
 void ray_query_test_cd_route(int route);
+/* query.c test hook: true turns off ray_select_impl's net (a select that
+ * answers while the pool's dispatches were cancelled answers `cancel`), so a
+ * test pins each stage's own check.  Disarmed by ray_test_hooks_off. */
+void ray_query_test_cancel_net_off(bool off);
 /* query.c test hook: the largest unordered take the rewrite's first-N pick
  * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
  * first row is found.  Negative restores the default; disarmed by

@@ -6111,55 +6111,66 @@ static test_result_t test_cd_gate_cancel_at_dispatch(void) {
     ray_t* r = ray_eval_str(ray_test_tmp(
         "(set fi (til 300000))"
         "(set Tc (table [i kh k5 x] (list fi (% (* fi 7919) 200003) (% (* fi 7919) 5003) (% (* fi 104729) 1000003))))"
+        "(set Tc (select {i: i kh: kh k5: k5 x: x xf: (as 'F32 x) k3: (% i 3) from: Tc}))"
         "(.db.splayed.set \"/tmp/rayforce_test_cdg_cancel/t/\" Tc)"
-        "(set Ts (.db.splayed.get \"/tmp/rayforce_test_cdg_cancel/t/\")) (set fi 0)"));
+        "(set Ts (.db.splayed.get \"/tmp/rayforce_test_cdg_cancel/t/\")) (set fj fi) (set fi 0)"));
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     /* route 2: the slices forced past the gate — the row-to-group probe
      * over 300,000 rows, then the per-group distinct counts: 200,003 groups
      * by the partitioned global kernel (ray_count_distinct_per_group), 5,003
-     * by the per-group slices (count_distinct_per_group_buf) */
+     * by the per-group slices (count_distinct_per_group_buf); their serial
+     * loop for an F32 column, and for 3 groups (a gather per group, over
+     * rows the slices' scatter lists).  Route -1: not the gate's, a take:
+     * the top-N matcher evaluates (positive_take_i64), on the pool. */
     static const struct { const char* q; int route; } qd[] = {
         { "(select {u: (count (distinct x)) from: Tc where: (> i 2) by: kh take: 100000})", 0 },
         { "(select {u: (count (distinct x)) from: Tc where: (< x 500000) by: kh})", 0 },
+        { "(select {u: (count (distinct x)) from: Tc where: (> i 2) by: k5 desc: u take: (count (where (> fj 299990)))})", -1 },
         { "(select {u: (count (distinct x)) from: Ts where: (> i 2) by: kh take: 100000})", 0 },
         { "(select {u: (count (distinct x)) from: Ts where: (>= i 131072) by: kh})", 0 },
         { "(select {u: (count (distinct x)) from: Ts where: (and (>= i 70000) (< i 200000)) by: kh})", 0 },
         { "(select {u: (count (distinct x)) from: Tc where: (> i 2) by: kh})", 2 },
         { "(select {u: (count (distinct x)) from: Tc where: (> i 2) by: k5})", 2 },
         { "(select {u: (count (distinct x)) from: Ts where: (>= i 65536) by: kh})", 2 },
+        { "(select {u: (count (distinct xf)) from: Tc where: (> i 2) by: k5})", 2 },
+        { "(select {u: (count (distinct x)) from: Tc where: (> i 2) by: k3})", 2 },
     };
     const char* qs[sizeof qd / sizeof qd[0]];
     for (size_t qi = 0; qi < sizeof qd / sizeof qd[0]; qi++) qs[qi] = qd[qi].q;
     for (size_t qi = 0; qi < sizeof qs / sizeof qs[0]; qi++) {
         uint64_t rw0, sl0, rw1, sl1;
-        ray_query_test_cd_route(qd[qi].route);
+        ray_query_test_cd_route(qd[qi].route > 0 ? qd[qi].route : 0);
         ray_query_test_cd_gate(&rw0, &sl0);
         ray_t* want = ray_eval_str(qs[qi]);
         ray_query_test_cd_gate(&rw1, &sl1);
         TEST_ASSERT_FMT(want && !RAY_IS_ERR(want), "%s: the plain query fails", qs[qi]);
-        TEST_ASSERT_FMT(rw1 + sl1 == rw0 + sl0 + 1, "%s: the gate is not reached", qs[qi]);
+        TEST_ASSERT_FMT(qd[qi].route < 0 || rw1 + sl1 == rw0 + sl0 + 1, "%s: the gate is not reached", qs[qi]);
         ray_t* ws = ray_fmt(want, 0);
         ray_release(want);
         int cancelled = 0, answered = 0;
-        for (int mode = 0; mode < 2; mode++) {
+        /* modes 2, 3: 0, 1 with select's cancel net off, which would hide a
+         * stage that answers from the unwritten output (the route-2 stages) */
+        for (int mode = 0; mode < (qd[qi].route == 2 ? 4 : 2); mode++) {
+            ray_query_test_cancel_net_off(mode >= 2);
             for (int k = 1; k <= 96; k++) {
                 int64_t live0 = cdg_live_blocks();
                 ray_heap_test_scribble(true);
-                ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+                ray_pool_test_cancel_at((uint32_t)k, mode & 1);
                 ray_t* got = ray_eval_str(qs[qi]);
                 ray_pool_test_cancel_at(0, false);
                 ray_heap_test_scribble(false);
                 ray_clear_interrupt();
-                atomic_store_explicit(&ray_pool_get()->cancelled, 0, memory_order_relaxed);
-                if (!got) { ray_query_test_cd_route(0); ray_release(ws); }
+                if (!got) { ray_test_hooks_off(); ray_release(ws); }
                 TEST_ASSERT_FMT(got != NULL, "%s mode %d, cancel before dispatch %d: NULL", qs[qi], mode, k);
                 if (RAY_IS_ERR(got)) {
-                    bool is_cancel = strcmp(ray_err_code(got), "cancel") == 0;
+                    char code[16];
+                    snprintf(code, sizeof code, "%s", ray_err_code(got));
+                    bool is_cancel = strcmp(code, "cancel") == 0;
                     ray_error_free(got);
                     int64_t live = cdg_live_blocks() - live0;
                     if (!is_cancel || live) ray_release(ws);
-                    TEST_ASSERT_FMT(is_cancel, "%s mode %d, cancel before dispatch %d: an error other than cancel",
-                                    qs[qi], mode, k);
+                    TEST_ASSERT_FMT(is_cancel, "%s mode %d, cancel before dispatch %d: %s, not cancel",
+                                    qs[qi], mode, k, code);
                     TEST_ASSERT_FMT(live == 0, "%s mode %d, cancel before dispatch %d: %lld blocks left",
                                     qs[qi], mode, k, (long long)live);
                     cancelled++;
@@ -6178,10 +6189,11 @@ static test_result_t test_cd_gate_cancel_at_dispatch(void) {
         }
         ray_release(ws);
         ray_query_test_cd_route(0);
+        ray_query_test_cancel_net_off(false);
         TEST_ASSERT_FMT(cancelled > 0, "%s: no run cancelled", qs[qi]);
         (void)answered;
     }
-    r = ray_eval_str("(set Tc 0) (set Ts 0)");
+    r = ray_eval_str("(set Tc 0) (set Ts 0) (set fj 0)");
     if (r) ray_release(r);
     (void)ray_test_rm_rf(ray_test_tmp("/tmp/rayforce_test_cdg_cancel"));
     PASS();

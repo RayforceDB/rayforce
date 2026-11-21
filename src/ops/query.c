@@ -11435,6 +11435,10 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices) {
     *slices  = atomic_load(&g_cd_gate_slices);
 }
 void ray_query_test_cd_route(int route) { g_cd_gate_force = route; }
+/* ray_select_impl's cancel net off (test hook): the stages' own checks are
+ * all that answer a cancel */
+static bool g_select_cancel_net_off;
+void ray_query_test_cancel_net_off(bool off) { g_select_cancel_net_off = off; }
 
 /* ---- First-N groups for the rewrite's unordered `take: N` ----
  * An unordered take keeps the first N groups in first-seen order
@@ -18983,7 +18987,8 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     /* A dispatch a cancel landed before ran none of its tasks: a stage that
      * read its unwritten output without checking answered from garbage.
      * The query was cancelled, whatever the stage made of it. */
-    if (r && !RAY_IS_ERR(r) && pool_cancelled(ray_pool_get())) {
+    if (r && !RAY_IS_ERR(r) && pool_cancelled(ray_pool_get()) &&
+        RAY_LIKELY(!g_select_cancel_net_off)) {
         ray_release(r);
         r = ray_error("cancel", NULL);
     }

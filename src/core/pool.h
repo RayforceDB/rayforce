@@ -277,7 +277,8 @@ void ray_pool_test_ring_fail(uint32_t cap);
  * pool is skipped and nothing of it runs: a cancel request (the eval flag
  * and the pool's cancelled flag, as ray_request_interrupt sets them), or the
  * pool's cancelled flag alone when pool_only (as ray_cancel sets it); nth 0
- * off.  Disarmed by ray_test_hooks_off (which clears the interrupt).
+ * off, and clears the pool's flag (the eval flag stays: ray_clear_interrupt
+ * clears both).  Disarmed by ray_test_hooks_off (which clears the interrupt).
  * Compiled only under DEBUG, as the test objects are. */
 #ifdef DEBUG
 void ray_pool_test_cancel_at(uint32_t nth, bool pool_only);
