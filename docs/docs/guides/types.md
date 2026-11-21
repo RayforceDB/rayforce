@@ -350,9 +350,10 @@ Rayforce represents calendar points and clock times with DATE, TIME, and TIMESTA
 
 `date` and `time` are 32-bit counts (of days and of milliseconds). A `time`
 is not limited to one day: `48:00:00.000` and negative values are valid, up to
-about ±596 hours. A result past the 32-bit range keeps its low 32 bits, the
-same for an atom and for a vector cell, so `(* 25 24:00:00.000)` is
-`-593:02:47.296`.
+about ±596 hours. A result of integer arithmetic past the 32-bit range keeps
+its low 32 bits, the same for an atom and for a vector cell, so
+`(* 25 24:00:00.000)` is `-593:02:47.296`; a `time` moved by a TIMESPAN past
+that range is null instead.
 
 A `time` and a `timestamp` are points: subtracting two timestamps, or two
 times, returns TIMESPAN, and adding a duration to either returns the same
@@ -362,7 +363,9 @@ not add: `time + time`, like `timestamp + timestamp` and `date + date`, is a
 type error. Adding or subtracting an integer still counts the type's own unit
 (milliseconds for a `time`). Cast a difference with `as 'I64` when an integer
 nanosecond count is needed. A duration may also be scaled by an integer, or
-used as an `xbar` width. See [Timespan](timespan.md) for operator result
+used as an `xbar` width for a timestamp or a time (`(xbar 10:37:00.000
+0D00:15:00)` is `10:30:00.000`). A time has no quotient by a duration: `div`
+and `/` of a time and a TIMESPAN are type errors. See [Timespan](timespan.md) for operator result
 types and migration details.
 
 Subtracting two dates returns an I32 count of days, so a date plus the

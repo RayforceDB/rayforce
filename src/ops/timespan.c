@@ -66,6 +66,8 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
             (bn || span_number(b) || b == RAY_TIME))
             return a == RAY_F64 || b == RAY_F64 ? RAY_F64 : RAY_TIMESPAN;
     }
+    /* A TIME is a point of the day: it has no quotient by a duration. */
+    if ((op == OP_DIV || op == OP_IDIV) && (a == RAY_TIME || b == RAY_TIME)) return -1;
     if (op == OP_DIV && span_divisor(a) && span_divisor(b)) return RAY_F64;
     if (op == OP_IDIV && span_divisor(a) && span_divisor(b))
         return an ? RAY_TIMESPAN : (a == RAY_F32 ? RAY_F64 : a == RAY_BOOL || a == RAY_U8 || a == RAY_I16 ? RAY_I32 : a);
@@ -77,8 +79,9 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
 }
 
 static int64_t span_value(ray_t* x, uint16_t op) {
+    /* a TIME bucketed by a duration is bucketed in nanoseconds */
     if (op == OP_DIV || op == OP_IDIV || op == SPAN_BUCKET) {
-        if (x->type == -RAY_DATE || x->type == -RAY_TIME) return x->i32;
+        if (x->type == -RAY_DATE || (x->type == -RAY_TIME && op != SPAN_BUCKET)) return x->i32;
     }
     if (x->type == -RAY_DATE) return wrap_mul_i64(x->i32, INT64_C(86400000000000));
     if (x->type == -RAY_TIME) return (int64_t)x->i32 * INT64_C(1000000);
@@ -141,7 +144,7 @@ static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
                    op == OP_IDIV ? floor(x / y) : op == SPAN_BUCKET ? y * floor(x / y) : x - y * floor(x / y);
         return (span_result_t){.f = __builtin_isfinite(v) ? v : NULL_F64};
     }
-    if (out == RAY_TIME) {
+    if (out == RAY_TIME && (op == OP_ADD || op == OP_SUB)) {
         /* nanoseconds, floored to the TIME's milliseconds; a result outside
          * the lane (or on its null) is null, not a wrapped time */
         if (op == OP_ADD ? __builtin_add_overflow(av, bv, &value)
@@ -165,6 +168,13 @@ static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
             if (value && (av < 0) != (bv < 0)) value += bv;
         }
         if (op == SPAN_BUCKET) value = wrap_mul_i64(value, bv);
+        if (op == SPAN_BUCKET && out == RAY_TIME) {
+            /* the bucket start in nanoseconds, floored back to milliseconds */
+            int64_t ms = value / 1000000;
+            if (value % 1000000 < 0) ms--;
+            if (ms <= INT32_MIN || ms > INT32_MAX) return (span_result_t){.missing = true};
+            value = ms;
+        }
         break;
     case OP_MIN2: value = av < bv ? av : bv; break;
     case OP_MAX2: value = av > bv ? av : bv; break;
@@ -227,16 +237,25 @@ static void span_ts_diff_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     const int64_t* a = c->a;
     const int64_t* b = c->b;
     int64_t* o = c->out;
+    /* a wrapped difference can land on the null sentinel: count it as one */
+    bool any = false;
     if (a && b)
-        for (int64_t i = lo; i < hi; i++)
-            o[i] = a[i] == NULL_I64 || b[i] == NULL_I64 ? NULL_I64
-                 : (int64_t)((uint64_t)a[i] - (uint64_t)b[i]);
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = a[i] == NULL_I64 || b[i] == NULL_I64 ? NULL_I64
+                      : (int64_t)((uint64_t)a[i] - (uint64_t)b[i]);
+            o[i] = v; any |= v == NULL_I64;
+        }
     else if (a)
-        for (int64_t i = lo; i < hi; i++)
-            o[i] = a[i] == NULL_I64 ? NULL_I64 : (int64_t)((uint64_t)a[i] - (uint64_t)c->b0);
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = a[i] == NULL_I64 ? NULL_I64 : (int64_t)((uint64_t)a[i] - (uint64_t)c->b0);
+            o[i] = v; any |= v == NULL_I64;
+        }
     else
-        for (int64_t i = lo; i < hi; i++)
-            o[i] = b[i] == NULL_I64 ? NULL_I64 : (int64_t)((uint64_t)c->a0 - (uint64_t)b[i]);
+        for (int64_t i = lo; i < hi; i++) {
+            int64_t v = b[i] == NULL_I64 ? NULL_I64 : (int64_t)((uint64_t)c->a0 - (uint64_t)b[i]);
+            o[i] = v; any |= v == NULL_I64;
+        }
+    if (any) atomic_store_explicit(&c->nulls, true, memory_order_relaxed);
 }
 
 static void span_time_diff_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
@@ -306,14 +325,15 @@ static ray_t* span_point_vec(uint16_t op, ray_t* a, ray_t* b, int64_t n, bool sh
     ray_pool_fn fn = shift ? span_time_shift_fn
                    : span_base(a->type) == RAY_TIME ? span_time_diff_fn : span_ts_diff_fn;
     ray_pool_t* pool = ray_pool_get();
-    if (pool && n >= RAY_PARALLEL_THRESHOLD) ray_pool_dispatch(pool, fn, &c, n);
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, fn, &c, n);
     else fn(&c, 0, 0, n);
     if (pool && atomic_load_explicit(&pool->cancelled, memory_order_acquire)) {
         ray_release(r);
         return ray_error("cancel", NULL);
     }
     if (atomic_load_explicit(&c.nulls, memory_order_relaxed) ||
-        (!shift && ((av && ray_vec_may_have_nulls(a)) || (bv && ray_vec_may_have_nulls(b)))))
+        (fn == span_time_diff_fn &&
+         ((av && ray_vec_may_have_nulls(a)) || (bv && ray_vec_may_have_nulls(b)))))
         r->attrs |= RAY_ATTR_HAS_NULLS;
     return r;
 }
@@ -335,7 +355,8 @@ ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b) {
     if (op == OP_SUB && type == RAY_TIMESPAN && span_base(a->type) == span_base(b->type) &&
         (span_base(a->type) == RAY_TIME || span_base(a->type) == RAY_TIMESTAMP))
         return span_point_vec(op, a, b, n, false, type);
-    if (type == RAY_TIME && av != bv && (av ? b : a)->type == -RAY_TIMESPAN)
+    if (type == RAY_TIME && (op == OP_ADD || op == OP_SUB) && av != bv &&
+        (av ? b : a)->type == -RAY_TIMESPAN)
         return span_point_vec(op, a, b, n, true, type);
     ray_t* result = ray_vec_new(type, n);
     if (RAY_IS_ERR(result)) return result;
