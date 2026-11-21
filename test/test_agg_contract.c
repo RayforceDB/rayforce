@@ -6339,12 +6339,83 @@ static test_result_t test_cd_groups_cancel_at_dispatch(void) {
     PASS();
 }
 
+/* A row expression (w: (+ x 1)) beside a per-group count distinct is
+ * evaluated over the table, then gathered group by group, each gather of
+ * 100,000 rows on the pool.  A cancel landing before any dispatch answers
+ * `cancel` with every block freed, or the answer, with the select's own net
+ * off (modes 2, 3) as on — never a w cell the skipped gather left unwritten
+ * (heap scribbled).  Over the evaluator's grouping (a STR key) and the DAG
+ * grouping's scatter to it (a SYM key). */
+static test_result_t test_cd_groups_row_gather_cancel_at_dispatch(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
+    ray_t* r = ray_eval_str(
+        "(set gi (til 300000))"
+        "(set Tw (table [s y x] (list (as 'STR (% gi 3)) (as 'SYM (as 'STR (% gi 3)))"
+        " (% (* gi 104729) 1000003)))) (set gi 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    static const char* const qs[] = {
+        "(select {u: (count (distinct x)) w: (+ x 1) from: Tw by: s})",
+        "(select {u: (count (distinct x)) w: (+ x 1) from: Tw by: y})",
+    };
+    for (size_t qi = 0; qi < sizeof qs / sizeof qs[0]; qi++) {
+        ray_t* want = ray_eval_str(qs[qi]);
+        TEST_ASSERT_FMT(want && !RAY_IS_ERR(want), "%s: the plain query fails", qs[qi]);
+        ray_t* ws = ray_fmt(want, 0);
+        ray_release(want);
+        int cancelled = 0;
+        for (int mode = 0; mode < 4; mode++) {
+            ray_query_test_cancel_net_off(mode >= 2);
+            for (int k = 1; k <= 96; k++) {
+                int64_t live0 = cdg_live_blocks();
+                ray_heap_test_scribble(true);
+                ray_pool_test_cancel_at((uint32_t)k, mode & 1);
+                ray_t* got = ray_eval_str(qs[qi]);
+                ray_pool_test_cancel_at(0, false);
+                ray_heap_test_scribble(false);
+                ray_clear_interrupt();
+                if (!got) { ray_test_hooks_off(); ray_release(ws); }
+                TEST_ASSERT_FMT(got != NULL, "%s mode %d, cancel before dispatch %d: NULL", qs[qi], mode, k);
+                if (RAY_IS_ERR(got)) {
+                    char code[16];
+                    snprintf(code, sizeof code, "%s", ray_err_code(got));
+                    bool is_cancel = strcmp(code, "cancel") == 0;
+                    ray_error_free(got);
+                    int64_t live = cdg_live_blocks() - live0;
+                    if (!is_cancel || live) { ray_test_hooks_off(); ray_release(ws); }
+                    TEST_ASSERT_FMT(is_cancel, "%s mode %d, cancel before dispatch %d: %s, not cancel",
+                                    qs[qi], mode, k, code);
+                    TEST_ASSERT_FMT(live == 0, "%s mode %d, cancel before dispatch %d: %lld blocks left",
+                                    qs[qi], mode, k, (long long)live);
+                    cancelled++;
+                    continue;
+                }
+                ray_t* gs = ray_fmt(got, 0);
+                bool same = gs && ray_str_len(gs) == ray_str_len(ws) &&
+                            memcmp(ray_str_ptr(gs), ray_str_ptr(ws), ray_str_len(ws)) == 0;
+                if (gs) ray_release(gs);
+                ray_release(got);
+                if (!same) { ray_test_hooks_off(); ray_release(ws); }
+                TEST_ASSERT_FMT(same, "%s mode %d, cancel before dispatch %d: a wrong answer", qs[qi], mode, k);
+                break;   /* armed past the query's last dispatch */
+            }
+        }
+        ray_release(ws);
+        ray_query_test_cancel_net_off(false);
+        TEST_ASSERT_FMT(cancelled > 0, "%s: no run cancelled", qs[qi]);
+    }
+    r = ray_eval_str("(set Tw 0)");
+    if (r) ray_release(r);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
     { "agg_contract/cd_gate_cancel_at_dispatch", test_cd_gate_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/distinct_radix_cancel_at_dispatch", test_distinct_radix_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/cd_groups_cancel_at_dispatch", test_cd_groups_cancel_at_dispatch, contract_setup, contract_teardown },
+    { "agg_contract/cd_groups_row_gather_cancel_at_dispatch", test_cd_groups_row_gather_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/cd_route_key_proj", test_cd_route_key_proj, contract_setup, contract_teardown },
     { "agg_contract/cd_first_n_take", test_cd_first_n_take, contract_setup, contract_teardown },
     { "agg_contract/cd_first_n_cancel_at_dispatch", test_cd_first_n_cancel_at_dispatch, contract_setup, contract_teardown },
