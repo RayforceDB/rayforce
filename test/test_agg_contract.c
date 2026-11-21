@@ -5038,13 +5038,26 @@ static test_result_t test_cd_bounded_rounds(void) {
  * floor — 100 K pairs, whose sets fit the floor, count in one round whatever
  * the room, and the others in at most CDB_MAX_ROUNDS_TEST — and the same
  * query repeated under one watermark fixed beforehand takes the same rounds
- * (the blocks the first leaves on the heap's freelists are room again). */
+ * (the blocks the first leaves on the heap's freelists are room again).
+ * The floor bounds the whole kernel: its per-worker buffers (record buffer,
+ * staging, counts: some 0.1 MB a worker there) come out of it before the
+ * sets, which keep a quarter of it at least.  The 100 K pairs' one round
+ * holds on a pool of 4 (2 MB of sets in some 3 MB); at 28 workers the
+ * buffers take the floor, the sets their quarter: 3 rounds.  So the cases
+ * run on the suite's pool (bounded rounds, counts), then again on 4. */
 static test_result_t test_cd_bounded_floor(void) {
     static const struct { int64_t n, ng, room; } c[] = {
         { 100000, 1000, 2 }, { 100000, 1000, 0 }, { 200000, 1000, 2 }, { 400000, 1000, 2 },
         { 200000, 50, 0 }, { 800000, 1000, 2 }, { 1500000, 1000, 2 }, { 300000, 70000, 2 },
     };
-    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+    const size_t nc = sizeof(c) / sizeof(c[0]);
+    for (size_t k = 0; k < 2 * nc; k++) {
+        size_t i = k % nc;
+        bool pin = k >= nc;
+        if (k == nc) {   /* contract_teardown restores the pool */
+            ray_pool_destroy();
+            TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+        }
         char b[160];
         snprintf(b, sizeof b, "(%% (til %lld) %lld)", (long long)c[i].n, (long long)c[i].ng);
         ray_t* key = ray_eval_str(b);
@@ -5066,8 +5079,10 @@ static test_result_t test_cd_bounded_floor(void) {
         g_ray_profile.n = 0;
         ray_heap_set_anon_watermark(watermark);
         TEST_ASSERT_FMT(out && !RAY_IS_ERR(out) && out->len == c[i].ng, "case %zu failed", i);
-        if (i < 2) TEST_ASSERT_FMT(rounds == 1, "case %zu: %d rounds for sets within the floor", i, rounds);
-        TEST_ASSERT_FMT(rounds >= 1 && rounds <= CDB_MAX_ROUNDS_TEST, "case %zu: %d rounds", i, rounds);
+        if (pin && i < 2)
+            TEST_ASSERT_FMT(rounds == 1, "case %zu: %d rounds for sets within the floor", i, rounds);
+        TEST_ASSERT_FMT(rounds >= 1 && rounds <= CDB_MAX_ROUNDS_TEST, "case %zu, pool of %u: %d rounds", i,
+                        ray_pool_total_workers(ray_pool_get()), rounds);
         for (int64_t g = 0; g < c[i].ng; g++) {
             int64_t want = (c[i].n - g + c[i].ng - 1) / c[i].ng;
             TEST_ASSERT_FMT(((int64_t*)ray_data(out))[g] == want &&
