@@ -541,7 +541,8 @@ static test_result_t test_jp_knob(void) {
 }
 
 /* #599: run `src` with the probe floor at `floor`; *probes gets the number of
- * chained probes that went to the pool. */
+ * chained-probe passes that went to the pool: 2 (count and fill) for a
+ * dispatched join with matches, 0 for a serial one. */
 static ray_t* jp_at_floor(const char* src, int64_t floor, uint64_t* probes) {
     ray_join_set_par_min(floor);
     uint64_t p0 = atomic_load(&ray_join_par_probes);
@@ -569,9 +570,10 @@ static test_result_t test_jp_par_min(void) {
         "(left-join [venue instrument] L R)",
         "(full-join [venue instrument] L R)",
     };
-    /* floor -> dispatched?  JP_NL is 40000 rows, five morsels. */
+    /* floor -> dispatched passes.  JP_NL is 40000 rows, five morsels; every
+     * join here has matches, so a dispatched one sends both count and fill. */
     static const struct { int64_t floor; uint64_t want; } cases[] = {
-        { RAY_JOIN_PAR_MIN_DEFAULT, 1 }, { 0, 1 }, { JP_NL, 1 },
+        { RAY_JOIN_PAR_MIN_DEFAULT, 2 }, { 0, 2 }, { JP_NL, 2 },
         { JP_NL + 1, 0 }, { 65536, 0 }, { INT64_MAX, 0 },
     };
     for (size_t s = 0; s < sizeof srcs / sizeof srcs[0]; s++) {
@@ -579,7 +581,7 @@ static test_result_t test_jp_par_min(void) {
         ray_join_no_prefilter = false;
         ray_t* want = jp_at_floor(srcs[s], RAY_JOIN_PAR_MIN_DEFAULT, &probes);
         TEST_ASSERT(want && !RAY_IS_ERR(want), "default join");
-        TEST_ASSERT_EQ_I((int64_t)probes, 1);
+        TEST_ASSERT_EQ_I((int64_t)probes, 2);
         for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
             ray_t* got = jp_at_floor(srcs[s], cases[c].floor, &probes);
             test_result_t r = jp_tables_equal(got, want);

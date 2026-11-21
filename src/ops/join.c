@@ -69,7 +69,7 @@ int64_t ray_join_par_min(void) {
 void ray_join_set_par_min(int64_t rows) {
     atomic_store_explicit(&g_join_par_min, rows, memory_order_relaxed);
 }
-/* Diagnostic: chained probes dispatched to the pool. */
+/* Diagnostic: chained-probe passes (count, fill) dispatched to the pool. */
 _Atomic(uint64_t) ray_join_par_probes = 0;
 
 /* ── #597: null-free key proof ───────────────────────────────────────────
@@ -1931,8 +1931,6 @@ chained_ht_fallback:;
     /* #599: below the settable floor the morsels run on this thread.  Same
      * morsels either way, so the output and its order do not change. */
     bool par_probe = pool && n_tasks > 1 && left_rows >= ray_join_par_min();
-    if (par_probe)
-        atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
 
     int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
@@ -1975,9 +1973,10 @@ chained_ht_fallback:;
         ? (pf_s64 ? join_count_s64_fn : join_count_fn)
         : (pf_s64 ? join_count_tiny_s64_fn : join_count_tiny_fn);
     /* 2a: Count matches per morsel */
-    if (par_probe)
+    if (par_probe) {
+        atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
         ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
-    else
+    } else
         for (uint32_t t = 0; t < n_tasks; t++)
             count_probe(&probe_ctx, 0, t, t + 1);
 
@@ -2005,9 +2004,10 @@ chained_ht_fallback:;
         const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP
             ? (pf_s64 ? join_fill_s64_fn : join_fill_fn)
             : (pf_s64 ? join_fill_tiny_s64_fn : join_fill_tiny_fn);
-        if (par_probe)
+        if (par_probe) {
+            atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
             ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
-        else
+        } else
             for (uint32_t t = 0; t < n_tasks; t++)
                 fill_probe(&probe_ctx, 0, t, t + 1);
     }

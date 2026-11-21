@@ -1106,7 +1106,7 @@ extern _Atomic(uint64_t) ray_join_prefilter_skips;
 #define RAY_JOIN_PAR_MIN_DEFAULT 8193
 int64_t  ray_join_par_min(void);
 void     ray_join_set_par_min(int64_t rows);
-extern _Atomic(uint64_t) ray_join_par_probes;
+extern _Atomic(uint64_t) ray_join_par_probes; /* count + fill dispatches */
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
