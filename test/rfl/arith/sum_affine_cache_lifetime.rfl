@@ -1,0 +1,16 @@
+;; A cached base sum must own its input, not an allocator address.
+;; Distinct same-length temporaries below used to reuse a stale entry.
+(set _cache_h [32767h 30000h 5h -32767h])
+(set _cache_k [2h 3h 4h 5h])
+(sum (+ (* _cache_h 3h) 5)) -- 24499
+(list (sum (+ (as 'I64 (+ _cache_h _cache_k)) 5)) (sum (+ (as 'I64 (* _cache_h 3h)) 5))) -- (list -35497 24499)
+(list (sum (+ (as 'I64 (* _cache_h 3h)) 5)) (sum (+ (as 'I64 (+ _cache_h _cache_k)) 5))) -- (list 24499 -35497)
+(set _cache_a [1 2 3 4])
+(set _cache_b [10 20 30 40])
+(list (sum (+ (* _cache_a 3) 5)) (sum (+ (+ _cache_a _cache_b) 5))) -- (list 50 130)
+
+;; A memo owner also participates in ordinary supported COW mutation.
+(do (set _cache_mut (til 3)) (alter '_cache_mut set 0 7) (set _cache_first (sum (+ _cache_mut 1))) (alter '_cache_mut set 0 8) (list _cache_first (sum (+ _cache_mut 1)) _cache_mut)) -- (list 13 14 [8 1 2])
+;; Reuse is still legal within a root, and a following root is independent.
+(do (set _cache_repeat [1 2 3]) (list (sum (+ _cache_repeat 1)) (sum (+ _cache_repeat 2)) (sum (+ _cache_repeat 1)))) -- (list 9 12 9)
+(sum (+ [10 20 30] 1)) -- 63
