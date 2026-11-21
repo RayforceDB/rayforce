@@ -6,6 +6,26 @@ All numeric, logical, aggregation, ordering, generation, and higher-order operat
 
 Arithmetic operations work on scalars and auto-map element-wise over vectors. Numeric typed-vector calls and query expressions lower to morsel-based DAG kernels where available.
 
+### Result types { #result-types }
+
+`+`, `-`, `*`, `div`, `%` and the two-argument `min` and `max` take their result type from one promotion table. It depends only on the two operand types, so swapping the operands, or passing atoms, vectors or `select` / `update` columns, gives the same type:
+
+- the order is b8 < u8 < i16 < i32 < i64 < f32 < f64, and the wider type wins;
+- two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`;
+- f32 with any other type is f64;
+- two b8 operands give i64 for `+ - * div %` and b8 for `min` and `max`.
+
+`/`, `pow` and the math functions below always return f64.
+
+```lisp
+(type (+ 2h 3i))              ; 'i32
+(type (+ [2i] [true]))        ; 'I32
+(type (min 2h 3i))            ; 'i32
+(type (div [7i] [2h]))        ; 'I32
+(type (+ (as 'F32 2.5) 1))    ; 'f64
+(+ true true)                 ; 2
+```
+
 ### `(+ a b)` — atomic
 
 Addition. Works on integers, floats, dates, and times.
@@ -46,11 +66,31 @@ integer (floor) division.
 
 ### `(% a b)` — atomic
 
-Modulo (remainder).
+Modulo: `a - b * floor(a / b)`, so the result takes the sign of `b`. The
+result type comes from the [table above](#result-types); a zero divisor
+gives null, except where the divisor or the result is u8, which has no null
+and gives `0`.
 
 ```lisp
 (% 10 3)  ; 1
+(% -7 2)  ; 1
 (% [10 11 12] 3)  ; [1 2 0]
+(% 300 0xff)  ; 45
+(% 7.5 0x02)  ; 1.5
+```
+
+### `(div a b)` — atomic
+
+Floor division: the largest integer not above `a / b`. The result type
+comes from the [table above](#result-types), so integers stay integers of
+the wider operand's width and a float operand gives a float. A zero divisor
+gives null, or `0` for a u8 result.
+
+```lisp
+(div 7 2)  ; 3
+(div -7 2)  ; -4
+(type (div 7i 2i))  ; 'i32
+(div 7.5 2.0)  ; 3.0
 ```
 
 ### `(neg x)` — atomic
@@ -336,18 +376,22 @@ A TIMESPAN vector is also accepted by `sums`, `mins`, `maxs`, `msum`, `mmin`,
 
 ### `(min x)` — aggregate
 
-Minimum value.
+Minimum value. With two arguments, `(min a b)` is the element-wise minimum,
+typed by the [promotion table](#result-types).
 
 ```lisp
 (min [5 1 9])  ; 1
+(min [5 1 9] [2 2 2])  ; [2 1 2]
 ```
 
 ### `(max x)` — aggregate
 
-Maximum value.
+Maximum value. With two arguments, `(max a b)` is the element-wise maximum,
+typed by the [promotion table](#result-types).
 
 ```lisp
 (max [5 1 9])  ; 9
+(max [5 1 9] [2 2 2])  ; [5 2 9]
 ```
 
 ### `(med x)` — aggregate

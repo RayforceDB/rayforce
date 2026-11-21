@@ -91,7 +91,7 @@
 (* 2.0 3.5)  -- 7.0
 ;; `/` is true division; `div` is integer floor division.
 (/ 9.0 2.0)  -- 4.5
-(div 9.0 2.0) -- 4
+(div 9.0 2.0) -- 4.0
 (% 5.5 2.0)  -- 1.5
 
 ;; Mixed-type promote (i64 + f64 → f64) — opt.c:79 promote_type

@@ -413,14 +413,14 @@
 (% -10 3) -- 2
 (% 10 -3) -- -2
 
-;; Integer mod: result type I32 (line 296)
+;; Integer mod: the promoted type, I64 beside an I64 dividend (#972)
 (% 100 (as 'I32 7)) -- 2
 
 ;; Integer mod: result type I16 (line 297)
 (% 100 (as 'I16 7)) -- 2
 
-;; Integer mod: U8 result (line 298)
-(% 100 (as 'U8 7)) -- 0x02
+;; Integer mod: an I64 dividend keeps I64 against a U8 divisor (#1227)
+(% 100 (as 'U8 7)) -- 2
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_neg_fn — negation branches

@@ -177,7 +177,7 @@ void     ray_cancel_reset(void);
 #define OP_DATE_TRUNC   46
 #define OP_IN           47   /* binary: col in set_vec -> BOOL */
 #define OP_NOT_IN       48   /* binary: col not in set_vec -> BOOL */
-#define OP_IDIV         49   /* binary: integer floor division -> I64 */
+#define OP_IDIV         49   /* binary: floor division, promoted type (#972) */
 #define OP_SIN          137  /* unary: sine -> F64 */
 #define OP_ASIN         138  /* unary: arcsine -> F64 */
 #define OP_COS          139  /* unary: cosine -> F64 */

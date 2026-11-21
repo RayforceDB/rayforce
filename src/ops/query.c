@@ -351,15 +351,10 @@ static bool dag_unary_arith_type_admitted(const char* name, size_t len, int8_t t
  * operand node itself, or a cast to F64.  NULL for any other verb or
  * operand type, which the regular admission then handles; a literal
  * operand is left to it as well (the evaluator folds it, where a cast
- * of an atom has no vector to run on).  The identity is taken only over
- * a column or an I64 operand: the fused kernels compute narrower integer
- * arithmetic in I64 lanes and return it as I64 (`(neg i)` over I32), so
- * `(floor (neg i))` would lose the I32 the builtin keeps.  That case is
- * left on the evaluator at its old cost (about 1.2 s over 10M rows,
- * against 0.01 ms for the lowered forms).  The thing to fix is the
- * widening: once a fused result over a narrow integer column comes back
- * in the column's own width, the identity holds for any integer operand
- * and the OP_SCAN / I64 condition below can go. */
+ * of an atom has no vector to run on).  The identity holds for any
+ * integer operand: the fused evaluator returns narrow integer arithmetic
+ * in its planned width (#973), so `(floor (neg i))` over I32 keeps the
+ * I32 the builtin keeps. */
 static ray_op_t* dag_int_rounding(ray_graph_t* g, const char* name, size_t len,
                                   ray_op_t* arg) {
     int8_t t = arg->out_type;
@@ -370,7 +365,7 @@ static ray_op_t* dag_int_rounding(ray_graph_t* g, const char* name, size_t len,
         return NULL;
     if ((len == 4 && memcmp(name, "ceil", 4) == 0) ||
         (len == 5 && memcmp(name, "floor", 5) == 0))
-        return t == RAY_I64 || arg->opcode == OP_SCAN ? arg : NULL;
+        return arg;
     if (len == 5 && memcmp(name, "round", 5) == 0)
         return ray_cast(g, arg, RAY_F64);
     return NULL;
@@ -26532,19 +26527,15 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         int64_t a = as_i64(col), b = as_i64(bucket);
         if (b == 0 || RAY_ATOM_IS_NULL(bucket))
             return ray_error("domain", "xbar: bucket size must be non-zero and non-null");
-        /* Result type follows the wider of the two operands */
-        int8_t rt = -RAY_I64;
-        if (col->type == -RAY_I32 && bucket->type == -RAY_I32) rt = -RAY_I32;
-        if (col->type == -RAY_I16 && bucket->type == -RAY_I16) rt = -RAY_I16;
+        /* Result type: the promotion table's, as + - * div % (#972), so
+         * the atom, the vector and the query lowering agree */
+        int8_t rt = arith_atom_type(col, bucket);
         /* A null value buckets to the null of the result type, as a null
          * element of a vector does. */
         if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(rt);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
-        int64_t result = q * b;
-        if (rt == -RAY_I32) return make_i32((int32_t)result);
-        if (rt == -RAY_I16) return make_i16((int16_t)result);
-        return make_i64(result);
+        return make_typed_int(rt, q * b);
     }
     /* Float path: either operand is f64 */
     if (is_numeric(col) && is_numeric(bucket)) {

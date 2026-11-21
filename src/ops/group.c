@@ -10041,6 +10041,29 @@ static void scalar_sum_i64_fn(void* ctx, uint32_t worker_id, int64_t start, int6
     scalar_run_staged((scalar_ctx_t*)ctx, worker_id, start, end, scalar_sum_i64_body);
 }
 
+/* The same over a narrow integer input (I32 / I16 / U8, no mask): a fused
+ * narrow expression keeps its planned width (#973), and its SUM / AVG must
+ * not fall back to the generic per-row loop.  A range's int64 total cannot
+ * overflow (a scan chunk holds far fewer than 2^32 rows). */
+#define SCALAR_SUM_NARROW(NAME, T)                                                     \
+static void NAME##_body(scalar_ctx_t* c, uint32_t worker_id, int64_t start, int64_t end) { \
+    (void)worker_id;                                                                   \
+    da_accum_t* acc = c->acc;                                                          \
+    const T* restrict data = (const T*)c->agg_ptrs[0] + (start - c->row_base);        \
+    int64_t n = end - start, sum = 0;                                                  \
+    for (int64_t r = 0; r < n; r++) sum += data[r];                                    \
+    if (acc->sum_hi) ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, sum);   \
+    else acc->sum[0].i = wrap_add_i64(acc->sum[0].i, sum);                             \
+    acc->count[0] += n;                                                                \
+}                                                                                      \
+static void NAME##_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {     \
+    scalar_run_staged((scalar_ctx_t*)ctx, worker_id, start, end, NAME##_body);         \
+}
+SCALAR_SUM_NARROW(scalar_sum_i32, int32_t)
+SCALAR_SUM_NARROW(scalar_sum_i16, int16_t)
+SCALAR_SUM_NARROW(scalar_sum_u8,  uint8_t)
+#undef SCALAR_SUM_NARROW
+
 /* Tight loop for single SUM/AVG on f64 (no mask), by explicit lanes: row r
  * adds into lane r mod SC_F64_LANES, each lane in row order, and the task's
  * partial is the lanes combined in one fixed order.  The answer therefore
@@ -16933,6 +16956,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_fn = scalar_sum_i64_fn;
             else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_F64)
                 sc_fn = scalar_sum_f64_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_I32)
+                sc_fn = scalar_sum_i32_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_I16)
+                sc_fn = scalar_sum_i16_fn;
+            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_U8)
+                sc_fn = scalar_sum_u8_fn;
         } else if (n_aggs == 1 && !match_idx && !rowsel && agg_linear[0].enabled) {
             uint16_t op0 = ext->agg_ops[0];
             if (op0 == OP_SUM || op0 == OP_AVG)
