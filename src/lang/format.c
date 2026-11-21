@@ -677,6 +677,12 @@ static void fmt_vector(fmt_buf_t* b, ray_t* vec, int limit, int mode) {
     }
     if (len == 0) { fmt_puts(b, "[]"); return; }
 
+    /* The display keeps an I16 or I32 vector's suffix, as for F32: [1h 2h]
+     * is not the I64 [1 2].  The compact form stays bare. */
+    if ((mode == RAY_FMT_REPL || mode == RAY_FMT_SHOW) &&
+        (vec->type == RAY_I16 || vec->type == RAY_I32))
+        mode = RAY_FMT_ROUNDTRIP;
+
     fmt_puts(b, "[");
     int32_t start_len = b->len;
 
