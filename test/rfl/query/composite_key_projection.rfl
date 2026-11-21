@@ -3,10 +3,9 @@
 ;; `{u: …} by: [a b]`, the same columns, types, values and row order, for
 ;; every aggregate, a by-dict, where:, desc:/take:, and no aggregate at all.
 ;; The keys come first, in by: order, wherever the projections are written
-;; and in whatever order (a single key's `{u: … a: a} by: a` still gives
-;; `[u a]`; that is left to its own issue, #1237).  A renamed or computed
-;; projection of a key is no identity projection and stays a per-group
-;; output.
+;; and in whatever order, as for a single key (single_key_projection.rfl,
+;; #1237).  A renamed or computed projection of a key is no identity
+;; projection and stays a per-group output.
 ;; columns, row count, types and values, all equal
 (set eqt (fn [x y] (and (== (count (cols x)) (count (cols y))) (all (== (cols x) (cols y))) (== (count x) (count y)) (all (map (fn [c] (and (== (type (at x c)) (type (at y c))) (all (== (at x c) (at y c))))) (cols x))))))
 ;; small: the layout of every variant
@@ -21,7 +20,7 @@
 (cols (select {b: b a: a u: (count h) from: S by: [a b]})) -- [a b u]
 (cols (select {b: b a: a from: S by: [a b]})) -- [a b h]
 (cols (select {x: (first h) a: a b: b u: (count h) from: S by: [a b]})) -- [a b x u]
-(cols (select {u: (count h) a: a from: S by: a})) -- [u a]
+(cols (select {u: (count h) a: a from: S by: a})) -- [a u]
 (at (select {a: a b: b u: (count h) from: S by: [a b]}) 'u) -- [3 1 1 1]
 (at (select {u: (count h) a: a b: b from: S by: [a b]}) 'a) -- (as 'I32 [1 2 2 3])
 (at (select {u: (count h) a: a b: b from: S by: [a b]}) 'b) -- (as 'I32 [5 5 6 5])
