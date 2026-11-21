@@ -1399,7 +1399,8 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                     }
                 }
             } else if (tv) {
-                ray_release(tv);
+                /* an error (a cancel) is answered by the take below */
+                if (RAY_IS_ERR(tv)) ray_error_free(tv); else ray_release(tv);
             }
         }
     }
@@ -4809,7 +4810,9 @@ static bool match_group_count_emit_filter(ray_t* from_expr, ray_t* where_expr,
 static bool positive_take_i64(ray_t* expr, int64_t* out) {
     if (!expr) return false;
     ray_t* v = ray_eval(expr);
-    if (!v || RAY_IS_ERR(v)) return false;
+    /* an error (a cancel among them) is the select's to report: it reads
+     * take: again on the route it goes on to */
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return false; }
     bool ok = false;
     int64_t n = 0;
     if (v->type == -RAY_I64) { n = v->i64; ok = n > 0; }
@@ -11438,7 +11441,10 @@ static void slice_scatter_fn(void* vctx, uint32_t worker_id, int64_t t0, int64_t
 
 /* Build the slices into grp_cnt / offsets (caller's [n_groups] arrays) and
  * *idx_hdr, using pos[n_groups] as scratch.  sel may be NULL.  Returns
- * false on allocation failure. */
+ * false on allocation failure or a cancel (pool_cancelled tells them apart).
+ * The counts need no check of their own: their tasks a cancel skips leave
+ * zeros (hist is zeroed), and the flag stays set, so the scatter then runs
+ * none of its tasks, its rows all unwritten -- the check is after it. */
 static bool slice_build(const int64_t* row_gid, int64_t nrows, ray_t* sel,
                         int64_t n_groups, int64_t* grp_cnt, int64_t* offsets,
                         int64_t* pos, ray_t** idx_hdr) {
@@ -11515,11 +11521,16 @@ static bool slice_build(const int64_t* row_gid, int64_t nrows, ray_t* sel,
     *idx_hdr = ray_alloc((size_t)(total > 0 ? total : 1) * sizeof(int64_t));
     if (!*idx_hdr) { scratch_free(hist_hdr); scratch_free(seg_hdr); return false; }
     c.idx_buf = (int64_t*)ray_data(*idx_hdr);
-    if (n_tasks > 1) ray_pool_dispatch_n(pool, slice_scatter_fn, &c, (uint32_t)n_tasks);
-    else             slice_scatter_fn(&c, 0, 0, 1);
+    bool ok = true;
+    if (n_tasks > 1) {
+        ray_pool_dispatch_n(pool, slice_scatter_fn, &c, (uint32_t)n_tasks);
+        if (pool_cancelled(pool)) { ray_free(*idx_hdr); *idx_hdr = NULL; ok = false; }
+    } else {
+        slice_scatter_fn(&c, 0, 0, 1);
+    }
     scratch_free(hist_hdr);
     scratch_free(seg_hdr);
-    return true;
+    return ok;
 }
 
 /* `tbl` is the column's table (or NULL): its partition counts give a NULL
@@ -11583,6 +11594,10 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices) {
     *slices  = atomic_load(&g_cd_gate_slices);
 }
 void ray_query_test_cd_route(int route) { g_cd_gate_force = route; }
+/* ray_select_impl's cancel net off (test hook): the stages' own checks are
+ * all that answer a cancel */
+static bool g_select_cancel_net_off;
+void ray_query_test_cancel_net_off(bool off) { g_select_cancel_net_off = off; }
 
 /* ---- First-N groups for the rewrite's unordered `take: N` ----
  * An unordered take keeps the first N groups in first-seen order
@@ -12218,6 +12233,9 @@ static ray_t* try_count_distinct_v2_rewrite(
         bool two_pass = ray_cd_two_pass_preferred(K_cols, n_K, X_col, sel_rows, sel_nrows,
                                                   sel_pop, workers);
         if (sel_hdr) scratch_free(sel_hdr);
+        /* a cancel during the gate's sample or estimates: they stand on
+         * skipped tasks, and so would the route */
+        if (pool_cancelled(pool)) return ray_error("cancel", NULL);
         if (RAY_UNLIKELY(g_cd_gate_force)) two_pass = g_cd_gate_force == 1;
         atomic_fetch_add_explicit(two_pass ? &g_cd_gate_rewrite : &g_cd_gate_slices, 1,
                                   memory_order_relaxed);
@@ -12550,6 +12568,12 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
                 .oom       = 0,
             };
             ray_group_dispatch(cdpg_buf_par_fn, &pctx, grp_cnt, n_groups);
+            /* a cancel skips the groups it lands before: their counts are
+             * unwritten */
+            if (pool_cancelled(pool)) {
+                ray_release(src); ray_release(out);
+                return ray_error("cancel", NULL);
+            }
             if (!atomic_load_explicit(&pctx.oom, memory_order_relaxed)) {
                 ray_release(src);
                 return out;
@@ -12574,6 +12598,9 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
             ray_release(src); ray_release(out);
             return err;
         }
+        /* A cancel in the gather leaves part of the subset unwritten:
+         * exec_count_distinct answers it, a gather on the pool being one it
+         * counts on the pool too, past its dispatches' checks. */
         ray_t* cv = exec_count_distinct(NULL, NULL, subset);
         ray_release(subset);
         if (!cv || RAY_IS_ERR(cv)) {
@@ -16492,6 +16519,9 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
             ray_pool_dispatch(pool, cd_gate_gather_fn, &ctx, n_s);
         else
             cd_gate_gather_fn(&ctx, 0, 0, n_s);
+        /* a cancel skips the tasks it lands before: their rows of the
+         * sampled columns are unwritten (garbage SYM codes, values) */
+        if (pool_cancelled(pool)) { ray_release(st); st = NULL; }
         for (int i = 0; i < n_g && st; i++) {
             /* add_col releases the table on an error and returns the error */
             st = ray_table_add_col(st, syms[i], gv[i]);
@@ -16512,9 +16542,19 @@ ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
         /* the filter returns its input (the sampled table) retained, with
          * the selection installed on the graph */
         ray_t* fres = froot ? exec_node(gs, froot) : NULL;
+        /* The filter and the selection's indices run on the pool: the
+         * tasks a cancel skipped leave them unfilled, and the indices would
+         * read past the sample.  No sample then (the caller answers the
+         * cancel). */
+        ray_pool_t* pool = ray_pool_get();
+        if (fres && !RAY_IS_ERR(fres) && pool_cancelled(pool)) {
+            ray_release(fres);
+            fres = NULL;
+        }
         if (fres && !RAY_IS_ERR(fres) && gs->selection) {
             const int64_t kept = ray_rowsel_meta(gs->selection)->total_pass;
             ray_t* ind = kept > 0 ? ray_rowsel_to_indices(gs->selection) : NULL;
+            if (ind && pool_cancelled(pool)) { ray_release(ind); ind = NULL; }
             int64_t* out = (int64_t*)scratch_alloc(&out_hdr, (size_t)(kept > 0 ? kept : 1) * sizeof(int64_t));
             if (out && (ind || kept == 0)) {
                 const int64_t* ii = ind ? (const int64_t*)ray_data(ind) : NULL;
@@ -19603,6 +19643,14 @@ static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     ray_t* r = ray_select_body(args, n, plan, &own);
     if (own.selection) ray_release(own.selection);
     if (own.by_syms) ray_release(own.by_syms);
+    /* A dispatch a cancel landed before ran none of its tasks: a stage that
+     * read its unwritten output without checking answered from garbage.
+     * The query was cancelled, whatever the stage made of it. */
+    if (r && !RAY_IS_ERR(r) && pool_cancelled(ray_pool_get()) &&
+        RAY_LIKELY(!g_select_cancel_net_off)) {
+        ray_release(r);
+        r = ray_error("cancel", NULL);
+    }
     return r;
 }
 
@@ -26074,6 +26122,17 @@ by_dict_done:
                     if (gk64_hdr) scratch_free(gk64_hdr);
                 }
                 #undef KEY_READ
+                /* the probes run on the pool: a cancel skips the rows it
+                 * lands before, whose gids stay unwritten (and index the
+                 * group arrays below) */
+                if (pool_cancelled(ray_pool_get())) {
+                    ray_free(gk_hdr); ray_free(rg_hdr); ray_free(cnt_hdr);
+                    ray_free(off_hdr); ray_free(pos_hdr);
+                    RELEASE_SCAN_KEY();
+                    ray_release(result); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return ray_error("cancel", NULL);
+                }
 
                 /* When path A was taken (no materialisation), the probe
                  * above looked up gids for every row in the original
@@ -26180,7 +26239,8 @@ by_dict_done:
                         ray_free(pos_hdr);
                         RELEASE_SCAN_KEY();
                         ray_release(result); ray_release(tbl);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return ray_error(pool_cancelled(ray_pool_get()) ? "cancel" : "oom", NULL);
                     }
                     idx_buf = (int64_t*)ray_data(idx_hdr);
                 }
