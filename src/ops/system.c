@@ -214,7 +214,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     }
     /* options: compress (true/false), symfile ('shared/'column) and index
      * (true/false: false builds no automatic dictionary or chunk zone; an
-     * index the column already carries is written as usual) and durable
+     * index the column already carries is written as usual; true also keeps
+     * a generation-2 dictionary absent leaves out for its size) and durable
      * (true/false: false takes the bulk path, no fsync) */
     ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
     for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
@@ -233,8 +234,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     ray_symfile_t layout;
     oerr = ray_symfile_opt_parse(opts, &layout);
     if (oerr) return oerr;
-    bool auto_index;
-    oerr = ray_splay_index_opt_parse(opts, &auto_index);
+    ray_index_opt_t index;
+    oerr = ray_splay_index_opt_parse(opts, &index);
     if (oerr) return oerr;
     bool durable;
     oerr = ray_splay_durable_opt_parse(opts, &durable);
@@ -256,7 +257,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                 : ".db.splayed.set: symfile 'column for a partition of a parted table");
     }
 
-    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, auto_index, durable);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, index, durable);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);
@@ -1588,6 +1589,24 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     }
     ray_qlog_set_enabled(on);
     return make_i64(on ? 1 : 0);
+}
+
+/* (.sys.join.par.min [rows]) — the probe-side row count from which a hash
+ * join's chained probe is split across the pool (#599).  No arg reads it; an
+ * i64 >= 0 sets it.  Returns the value in effect.  Values at or below the
+ * default (8193) all behave as the default: a probe of one 8192-row morsel
+ * never splits.  Restricted: it changes server-wide behaviour. */
+ray_t* ray_join_par_min_fn(ray_t** args, int64_t n) {
+    if (n > 1) return ray_error("arity", ".sys.join.par.min takes no argument or a row count");
+    if (n == 1) {
+        if (args[0]->type != -RAY_I64)
+            return ray_error("type", ".sys.join.par.min: rows must be i64, got %s",
+                             ray_type_name(args[0]->type));
+        if (RAY_ATOM_IS_NULL(args[0]) || args[0]->i64 < 0)
+            return ray_error("domain", ".sys.join.par.min: rows must be a non-negative count");
+        ray_join_set_par_min(args[0]->i64);
+    }
+    return make_i64(ray_join_par_min());
 }
 
 /* Process id of this process.  getpid() is already used internally for heap

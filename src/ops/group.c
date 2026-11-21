@@ -14545,6 +14545,13 @@ static bool group_const_input_spreads(ray_graph_t* g, ray_op_t* in, int64_t nrow
     return ray_is_atom(lit) || (ray_is_vec(lit) && (lit->len == 1 || lit->len == nrows));
 }
 
+/* Does every node under `root_id` read only its own row (a scan of the
+ * default table, a constant, a row-local element-wise op)? */
+bool ray_group_expr_rowlocal_ok(ray_graph_t* g, uint32_t root_id) {
+    int64_t syms[64];
+    return group_expr_src_syms(g, root_id, syms, 64) >= 0;
+}
+
 /* A running, moving or shift function: it reads other rows than its own,
  * and under a where: it runs over the whole table (#916).  Each is unary;
  * a window is a parameter, not an input node. */
@@ -14561,8 +14568,10 @@ static inline bool group_expr_running_opcode(uint16_t opcode) {
  * where: keeps, so it must not see the whole table; and so must anything
  * else whose value depends on which rows are selected (`distinct`, `asc`,
  * `rank`, ...).  An aggregate nested in a running function is refused too
- * and keeps the legacy path's answer.  So is a subtree too large to walk. */
-static bool grp_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
+ * and keeps the legacy path's answer.  So is a subtree too large to walk.
+ * The select planner asks the same of an aggregate's input before it defers
+ * a where: on the group key until after grouping (query.c). */
+bool ray_group_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
     uint32_t nc = g->node_count;
     if (nc > 4096 || root_id >= nc) return false;
     uint32_t stack[64];
@@ -14603,7 +14612,7 @@ static bool grp_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id) {
 
 /* Does the expression `in` read an encoded column of `tbl` (or is it one
  * the bridge must not take)?  An input that is not row-local names no
- * source columns here.  It is taken only when grp_expr_whole_table_ok
+ * source columns here.  It is taken only when ray_group_expr_whole_table_ok
  * admits it (running functions over row-local expressions) and no column
  * of the table is encoded: the executor then materializes it over the
  * whole table (#916) and v2 groups it, first-N pre-pass included (#1234). */
@@ -14614,7 +14623,7 @@ static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
         for (int i = 0; i < n; i++) if (ray_table_get_col_enc(tbl, syms[i])) return true;
         return false;
     }
-    if (!grp_expr_whole_table_ok(g, in->id)) return true;
+    if (!ray_group_expr_whole_table_ok(g, in->id)) return true;
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++)
         if (ray_table_get_col_enc(tbl, ray_table_col_name(tbl, c))) return true;

@@ -2228,7 +2228,19 @@ static ray_t* pq_publish(const char* staging, const char* root, int64_t rows) {
     if (ray_file_sync_dir(root) != RAY_OK) return pq_error("native destination published but directory sync failed");
     return ray_i64(rows);
 }
-static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char* table, int64_t parts) {
+/* Make the staged tree durable before it is published. `tree` is the handle
+ * ray_file_sync_tree_begin gave when staging began, before any write: one flush of
+ * the staged tree where the host has one (a table of many small files otherwise
+ * spends its time in thousands of sequential fsyncs: 14,900 for 16 million rows in
+ * 1,145 files, about 55 s), else, or if that flush fails, every file and directory
+ * synced in turn, which finds a failed write itself. The flush is not a check that
+ * every column file exists, nor is it interruptible: the writers report their own
+ * errors and cancellation. Publication still syncs the staging root and renames it
+ * into place. The handle is consumed. */
+static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char* table, int64_t parts, int* tree) {
+    int handle = *tree;
+    *tree = RAY_SYNC_TREE_NONE;
+    if (ray_file_sync_tree_end(handle)) return NULL;
     char path[1600], leaf[1400];
     for (int64_t part = 0; part < parts; part++) {
         if (ray_interrupted()) return ray_error("cancel","parquet conversion interrupted");
@@ -2287,6 +2299,7 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
     root = dest;
     ray_parquet_t* first = NULL; ray_t* err = NULL;
     char staging[1100] = "", sym[1200] = ""; int64_t parts = 0, rows = 0;
+    int tree = RAY_SYNC_TREE_NONE;   /* the flush of the staged tree, opened before its first write */
     ray_sym_domain_t* domain = NULL;
     for (size_t i = 0; i < npaths && !err; i++) {
         ray_parquet_t* r = NULL;
@@ -2296,7 +2309,10 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
         if (!err && i) err = pq_same_ncols(first,r);
         if (!err) err = pq_import_types(r,types);
         if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
-        if (!err && !i) err = pq_stage(r,root,staging,sizeof(staging),true);
+        if (!err && !i) {
+            err = pq_stage(r,root,staging,sizeof(staging),true);
+            if (!err) tree = ray_file_sync_tree_begin(staging);
+        }
         if (!err && i) err = pq_same_schema(first,r);
         if (!err) {
             /* Global runtime interning is not worker-safe. Decode symbols
@@ -2334,7 +2350,8 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
         ray_err_t e = ray_sym_domain_flush(domain,true);
         if (e != RAY_OK) err = ray_error(ray_err_code_str(e),"parquet: cannot flush symbol file");
     }
-    if (!err) err = pq_sync_partitions(first,staging,table,parts);
+    if (!err) err = pq_sync_partitions(first,staging,table,parts,&tree);
+    ray_file_sync_tree_abort(tree);   /* still open: an error before the flush */
     if (!err) err = pq_publish(staging,root,rows);
     if (domain) ray_sym_domain_release(domain);
     if (first) ray_parquet_close(first);

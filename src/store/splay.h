@@ -55,6 +55,9 @@ typedef struct {
     bool no_auto_index;     /* the index option false: build no size-gated dictionary
                              * or chunk zone; an index the column already carries is
                              * written as usual; set after begin */
+    bool keep_dict;         /* the index option true: a generation-2 STR dictionary is
+                             * written even where it makes the file larger than
+                             * generation 0's (absent leaves it out); set after begin */
 } ray_splay_write_t;
 
 ray_err_t ray_splay_write_begin(const char* dir, ray_splay_write_t* write);
@@ -109,7 +112,12 @@ ray_err_t ray_splay_save_staged_bulk_mode(ray_t* tbl, const char* dir, const cha
  * they were given; a column without one resolves over the shared domain as
  * before. */
 typedef enum { RAY_SYMFILE_SHARED = 0, RAY_SYMFILE_COLUMN = 1 } ray_symfile_t;
-/* auto_index false builds none of the indexes a save builds on its own (a
+/* The tri-state `index` option of a save: absent builds the automatic
+ * indexes, leaving out a generation-2 STR dictionary that would make its
+ * file larger than generation 0's (#1094); true builds them and keeps that
+ * dictionary; false builds none. */
+typedef enum { RAY_INDEX_ABSENT = 0, RAY_INDEX_ON = 1, RAY_INDEX_OFF = 2 } ray_index_opt_t;
+/* index OFF builds none of the indexes a save builds on its own (a
  * STR column's dictionary, a numeric column's chunk zone, in either
  * generation).  It governs only what this save builds: an index the column
  * already carries — one the caller attached (.idx.hash and the like), or a
@@ -118,14 +126,15 @@ typedef enum { RAY_SYMFILE_SHARED = 0, RAY_SYMFILE_COLUMN = 1 } ray_symfile_t;
  * loaded STR column is written without one. */
 ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
                                 ray_compress_t mode, ray_symfile_t layout,
-                                bool auto_index, bool durable);
+                                ray_index_opt_t index, bool durable);
 /* The `symfile` option of an options dict (NULL or no key: SHARED): the
  * symbol 'shared or 'column, anything else a domain error.  Returns NULL or
  * an owned error. */
 ray_t*    ray_symfile_opt_parse(ray_t* opts, ray_symfile_t* layout);
-/* The `index` option of an options dict (NULL or no key: true): true or
- * false, anything else a domain error.  Returns NULL or an owned error. */
-ray_t*    ray_splay_index_opt_parse(ray_t* opts, bool* auto_index);
+/* The `index` option of an options dict (NULL or no key: ABSENT): true
+ * (ON) or false (OFF), anything else a domain error.  Returns NULL or an
+ * owned error. */
+ray_t*    ray_splay_index_opt_parse(ray_t* opts, ray_index_opt_t* index);
 /* The `durable` option of an options dict (NULL or no key: true): true or
  * false, anything else a domain error.  false is the bulk path: no fsync of
  * a column file, the symfile or a directory, so a crash may lose or tear the
