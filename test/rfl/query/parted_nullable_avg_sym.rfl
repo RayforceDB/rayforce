@@ -1,0 +1,12 @@
+;; #1270: the empty first partition supplies the dictionary for later keys.
+(.sys.exec "rm -rf rf_test_pavg_sym") -- 0
+(set i (til 1000))
+(set qty (at i (+ i (* 1000 (== 0 (% i 5))))))
+(set tab (table [b qty] (list (at ['b0 'b1 'b2] (% i 3)) qty)))
+(.db.splayed.set "rf_test_pavg_sym/2026.10.01/t/" tab "rf_test_pavg_sym/.sym")
+(.db.splayed.set "rf_test_pavg_sym/2026.10.02/t/" tab "rf_test_pavg_sym/.sym")
+(set t (.db.parted.get "rf_test_pavg_sym/" 't))
+(at (select {from: t where: (== date 2026.10.02) by: b v: (avg qty)}) 'b) -- [b0 b1 b2]
+(at (select {from: t where: (== date 2026.10.02) by: b v: (sum qty)}) 'b) -- [b0 b1 b2]
+(at (select {from: t by: b v: (avg qty)}) 'b) -- [b0 b1 b2]
+(.sys.exec "rm -rf rf_test_pavg_sym") -- 0
