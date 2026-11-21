@@ -104,15 +104,10 @@
 (nil? (+ (as 'TIME 0) 0Nd))    -- true
 (type (+ (as 'TIME 0) 0Nd))    -- 'timestamp
 
-;; ── L72-74: TIME + TIME → TIME (null propagation) ──
+;; ── TIME + TIME → type error, with a null on either side too ──
 
-;; null TIME + TIME → null TIME
-(nil? (+ 0Nt (as 'TIME 1000)))    -- true
-(type (+ 0Nt (as 'TIME 1000)))    -- 'time
-
-;; TIME + null TIME → null TIME
-(nil? (+ (as 'TIME 1000) 0Nt))    -- true
-(type (+ (as 'TIME 1000) 0Nt))    -- 'time
+(+ 0Nt (as 'TIME 1000))    !- type
+(+ (as 'TIME 1000) 0Nt)    !- type
 
 ;; ── L77-79: TIME + TIMESTAMP → TIMESTAMP (null propagation) ──
 
@@ -203,13 +198,13 @@
 (nil? (- (as 'DATE 7305) 0Nt))      -- true
 (type (- (as 'DATE 7305) 0Nt))      -- 'timestamp
 
-;; ── L132-134: TIME - TIME null → null TIME ──
+;; ── TIME - TIME null → null TIMESPAN ──
 
 (nil? (- 0Nt (as 'TIME 2000)))      -- true
-(type (- 0Nt (as 'TIME 2000)))      -- 'time
+(type (- 0Nt (as 'TIME 2000)))      -- 'timespan
 
 (nil? (- (as 'TIME 5000) 0Nt))      -- true
-(type (- (as 'TIME 5000) 0Nt))      -- 'time
+(type (- (as 'TIME 5000) 0Nt))      -- 'timespan
 
 ;; ── L141-143: TIMESTAMP - TIME null → null TIMESTAMP ──
 

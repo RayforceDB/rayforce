@@ -1,0 +1,192 @@
+;; A TIME is a point in the day, as a TIMESTAMP is a point in time (#1081):
+;; TIME - TIME is a TIMESPAN, TIME ± TIMESPAN a TIME (no 24 h wrap), and
+;; TIME + TIME a type error.  TIME ± integer milliseconds and DATE - DATE
+;; (an I32 day count) are unchanged.
+
+;; ─── atoms ──────────────────────────────────────────────────────────────────
+(- 10:30:00.000 09:30:00.000) -- 0D01:00:00
+(type (- 10:30:00.000 09:30:00.000)) -- 'timespan
+(- 09:30:00.000 10:30:00.000) -- -0D01:00:00
+(- 10:30:00.250 10:30:00.000) -- 0D00:00:00.250
+(+ 10:30:00.000 0D01:00:00) -- 11:30:00.000
+(type (+ 10:30:00.000 0D01:00:00)) -- 'time
+(- 10:30:00.000 0D01:00:00) -- 09:30:00.000
+(type (- 10:30:00.000 0D01:00:00)) -- 'time
+(+ 0D01:00:00 10:30:00.000) -- 11:30:00.000
+(- 0D01:00:00 10:30:00.000) -- -09:30:00.000
+;; no wrap at 24 h, either way
+(+ 20:30:00.000 0D09:30:00) -- 30:00:00.000
+(- 01:00:00.000 0D02:00:00) -- -01:00:00.000
+;; a duration finer than a millisecond is floored to the TIME's millisecond
+(+ 10:00:00.000 0D00:00:00.0015) -- 10:00:00.001
+(+ 10:00:00.000 0D00:00:00.000000001) -- 10:00:00.000
+(- 10:00:00.000 0D00:00:00.000000001) -- 09:59:59.999
+;; two points do not add, as for TIMESTAMP and DATE
+(+ 20:30:00.000 09:30:00.000) !- type
+(+ 2024.01.02D00:00:00.000000000 2024.01.02D00:00:00.000000000) !- type
+(+ 2024.01.02 2024.01.02) !- type
+;; TIME ± integer milliseconds stays a TIME
+(+ 10:00:00.000 1500) -- 10:00:01.500
+(- 10:00:00.000 1) -- 09:59:59.999
+(type (+ 10:00:00.000 1i)) -- 'time
+;; the round trips
+(set t0 09:15:00.250)
+(set t1 17:45:10.000)
+(+ t0 (- t1 t0)) -- t1
+(- t1 (- t1 t0)) -- t0
+(set d0 2024.01.02)
+(set d1 2024.03.05)
+(- d1 d0) -- 63i
+(type (- d1 d0)) -- 'i32
+(+ d0 (- d1 d0)) -- d1
+;; the other operand types are unchanged
+(+ 2024.01.05 10:30:00.000) -- 2024.01.05D10:30:00.000000000
+(+ 2024.01.02D09:30:00.000000000 10:30:00.000) -- 2024.01.02D20:00:00.000000000
+(- 2024.01.03D10:30:00.000000000 2024.01.02D09:30:00.000000000) -- 1D01:00:00
+
+;; ─── nulls ──────────────────────────────────────────────────────────────────
+(nil? (- 0Nt 10:00:00.000)) -- true
+(type (- 0Nt 10:00:00.000)) -- 'timespan
+(nil? (- 10:00:00.000 0Nt)) -- true
+(type (- 10:00:00.000 0Nt)) -- 'timespan
+(nil? (+ 0Nt 0D01:00:00)) -- true
+(type (+ 0Nt 0D01:00:00)) -- 'time
+(nil? (+ 10:00:00.000 0Nn)) -- true
+(type (+ 10:00:00.000 0Nn)) -- 'time
+(nil? (- 0Nn 10:00:00.000)) -- true
+(type (- 0Nn 10:00:00.000)) -- 'time
+(+ 0Nt 10:00:00.000) !- type
+
+;; ─── overflow: a TIME outside its lane is null, not wrapped ─────────────────
+(set big (as 'TIMESPAN 2147483647000000))
+(+ 00:00:00.000 big) -- (as 'TIME 2147483647)
+(- 00:00:00.000 big) -- (as 'TIME -2147483647)
+(nil? (+ 00:00:00.001 big)) -- true
+(nil? (- 00:00:00.000 (+ big 0D00:00:00.001))) -- true
+(nil? (+ 12:00:00.000 30D00:00:00)) -- true
+(nil? (+ 23:00:00.000 (as 'TIMESPAN 9223372036854775807))) -- true
+(nil? (- 23:00:00.000 (as 'TIMESPAN -9223372036854775807))) -- true
+(nil? (+ [00:00:00.001 00:00:00.000] big)) -- [true false]
+(nil? (- 0D00:00:00 (as 'TIME [-2147483647 0]))) -- [false false]
+
+;; ─── vectors ────────────────────────────────────────────────────────────────
+(set a (enlist 10:30:00.000 11:00:00.000 0Nt 23:59:59.999))
+(set b (enlist 09:30:00.000 12:00:00.000 01:00:00.000 0Nt))
+(type (- a b)) -- 'TIMESPAN
+(- a b) -- (enlist 0D01:00:00 -0D01:00:00 0Nn 0Nn)
+(- a 09:30:00.000) -- (enlist 0D01:00:00 0D01:30:00 0Nn 0D14:29:59.999)
+(- 12:00:00.000 a) -- (enlist 0D01:30:00 0D01:00:00 0Nn -0D11:59:59.999)
+(type (+ a 0D01:00:00)) -- 'TIME
+(+ a 0D01:00:00) -- (enlist 11:30:00.000 12:00:00.000 0Nt 24:59:59.999)
+(- a 0D01:00:00) -- (enlist 09:30:00.000 10:00:00.000 0Nt 22:59:59.999)
+(+ 0D01:00:00 a) -- (+ a 0D01:00:00)
+(- 0D12:00:00 a) -- (enlist 01:30:00.000 01:00:00.000 0Nt -11:59:59.999)
+(set s (enlist 0D00:00:01 0Nn 0D01:00:00 0D02:00:00))
+(+ a s) -- (enlist 10:30:01.000 0Nt 0Nt 25:59:59.999)
+(- a s) -- (enlist 10:29:59.000 0Nt 0Nt 21:59:59.999)
+(+ a b) !- type
+(+ a 10:00:00.000) !- type
+;; a null atom side nulls every row
+(- a 0Nt) -- (enlist 0Nn 0Nn 0Nn 0Nn)
+(- 0Nt a) -- (enlist 0Nn 0Nn 0Nn 0Nn)
+(+ a 0Nn) -- (enlist 0Nt 0Nt 0Nt 0Nt)
+;; empty vectors keep the result type
+(type (- (take a 0) (take b 0))) -- 'TIMESPAN
+(type (+ (take a 0) 0D01:00:00)) -- 'TIME
+;; a slice
+(- (take a -2) (take b -2)) -- (enlist 0Nn 0Nn)
+(- (take a 2) (take b 2)) -- (enlist 0D01:00:00 -0D01:00:00)
+;; the vector forms agree with the atom form, past the parallel threshold
+(set tv (concat (as 'TIME (- (% (* 7919 (til 150000)) 172800000) 86400000)) (enlist 0Nt)))
+(set rv (reverse tv))
+(set sp (as 'TIMESPAN (- (* 1234567891 (til 150001)) 99999999999)))
+(all (== (as 'I64 (- tv rv)) (as 'I64 (map (fn [i] (- (at tv i) (at rv i))) (til 150001))))) -- true
+(all (== (as 'I64 (- tv 10:00:00.000)) (as 'I64 (map (fn [x] (- x 10:00:00.000)) tv)))) -- true
+(all (== (as 'I64 (+ tv sp)) (as 'I64 (map (fn [i] (+ (at tv i) (at sp i))) (til 150001))))) -- true
+(all (== (as 'I64 (+ tv 0D01:02:03.0004567)) (as 'I64 (map (fn [x] (+ x 0D01:02:03.0004567)) tv)))) -- true
+(all (== (as 'I64 (- tv 0D01:02:03.0004567)) (as 'I64 (map (fn [x] (- x 0D01:02:03.0004567)) tv)))) -- true
+(all (== (as 'I64 (- 0D01:02:03.0004567 tv)) (as 'I64 (map (fn [x] (- 0D01:02:03.0004567 x)) tv)))) -- true
+(sum (nil? (- tv rv))) -- 2
+(sum (nil? (+ tv 0D01:00:00))) -- 1
+;; TIMESTAMP - TIMESTAMP over vectors agrees with its atom form too
+(set ts (concat (as 'TIMESTAMP (- (* 98765432109 (til 150000)) 9000000000000000)) (enlist 0Np)))
+(set rs (reverse ts))
+(all (== (as 'I64 (- ts rs)) (as 'I64 (map (fn [i] (- (at ts i) (at rs i))) (til 150001))))) -- true
+(all (== (as 'I64 (- ts 2024.01.02D09:30:00.000000000)) (as 'I64 (map (fn [x] (- x 2024.01.02D09:30:00.000000000)) ts)))) -- true
+(sum (nil? (- 2024.01.02D09:30:00.000000000 ts))) -- 1
+
+;; ─── deltas follows - ───────────────────────────────────────────────────────
+(set tm (enlist 09:30:00.000 10:30:00.000 0Nt 12:00:00.000 11:00:00.000))
+(type (deltas tm)) -- 'TIMESPAN
+(deltas tm) -- (enlist 0Nn 0D01:00:00 0Nn 0Nn -0D01:00:00)
+(deltas tm) -- (- tm (lag tm))
+(type (deltas (take tm 0))) -- 'TIMESPAN
+(type (deltas (take tm 1))) -- 'TIMESPAN
+(type (avg (deltas tm))) -- 'timespan
+
+;; ─── select and update ──────────────────────────────────────────────────────
+(set T (table [k a b s] (list [x x y y] a b s)))
+(type (at (select {d: (- a b) from: T}) 'd)) -- 'TIMESPAN
+(at (select {d: (- a b) from: T}) 'd) -- (- a b)
+(at (select {d: (- a 09:30:00.000) from: T}) 'd) -- (- a 09:30:00.000)
+(type (at (select {d: (+ a s) from: T}) 'd)) -- 'TIME
+(at (select {d: (+ a s) from: T}) 'd) -- (+ a s)
+(at (select {d: (+ a 0D01:00:00) from: T}) 'd) -- (+ a 0D01:00:00)
+(at (select {d: (- a b) from: T where: (> a 10:45:00.000)}) 'd) -- (enlist -0D01:00:00 0Nn)
+(type (at (select {d: (deltas a) from: T}) 'd)) -- 'TIMESPAN
+(at (select {d: (deltas a) from: T}) 'd) -- (deltas a)
+(type (at (update {d: (- a b) from: T}) 'd)) -- 'TIMESPAN
+(at (update {d: (- a b) from: T}) 'd) -- (- a b)
+(type (at (update {d: (+ a s) from: T}) 'd)) -- 'TIME
+(at (update {d: (deltas a) by: k from: T}) 'd) -- (enlist 0Nn 0D00:30:00 0Nn 0Nn)
+(type (at (update {d: (deltas a) by: k from: T}) 'd)) -- 'TIMESPAN
+(select {d: (+ a b) from: T}) !- type
+(update {d: (+ a b) from: T}) !- type
+;; the aggregates of a difference are durations
+(type (at (select {r: (avg (- a b)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (sum (- a b)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (max (- a b)) by: k from: T}) 'r)) -- 'TIMESPAN
+(at (at (select {r: (max (- a b)) by: k from: T}) 'r) 0) -- 0D01:00:00
+(type (at (select {r: (avg (deltas a)) from: T}) 'r)) -- 'TIMESPAN
+(type (at (select {r: (first (+ a 0D01:00:00)) by: k from: T}) 'r)) -- 'TIME
+
+;; ─── encoded and parted storage ─────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_time_point_store") -- 0
+(set S (table [k a b] (list (take [x y] 3000) (as 'TIME (* 1000 (% (til 3000) 7))) (as 'TIME (* 999 (% (til 3000) 5))))))
+(.db.splayed.set "/tmp/rfl_time_point_store/enc" S {compress:true})
+(set E (.db.splayed.get "/tmp/rfl_time_point_store/enc"))
+(type (at (select {d: (- a b) from: E}) 'd)) -- 'TIMESPAN
+(at (select {d: (- a b) from: E}) 'd) -- (- (at S 'a) (at S 'b))
+(- (at E 'a) (at E 'b)) -- (- (at S 'a) (at S 'b))
+(+ (at E 'a) 0D00:00:00.5) -- (+ (at S 'a) 0D00:00:00.5)
+(deltas (at E 'a)) -- (deltas (at S 'a))
+(.db.splayed.set "/tmp/rfl_time_point_store/parts/2024.01.01/t" S {compress:false})
+(.db.splayed.set "/tmp/rfl_time_point_store/parts/2024.01.02/t" S {compress:true})
+(set D (.db.parted.get "/tmp/rfl_time_point_store/parts" 't))
+(type (at (select {d: (- a b) from: D}) 'd)) -- 'TIMESPAN
+(at (select {d: (- a b) from: D}) 'd) -- (concat (- (at S 'a) (at S 'b)) (- (at S 'a) (at S 'b)))
+(type (at (select {d: (+ a 0D01:00:00) from: D}) 'd)) -- 'TIME
+(at (select {d: (+ a 0D01:00:00) from: D}) 'd) -- (concat (+ (at S 'a) 0D01:00:00) (+ (at S 'a) 0D01:00:00))
+(type (at (select {d: (deltas a) from: D}) 'd)) -- 'TIMESPAN
+(at (select {r: (sum (- a b)) by: k from: D}) 'r) -- (* 2 (at (select {r: (sum (- a b)) by: k from: S}) 'r))
+(select {d: (+ a b) from: D}) !- type
+(.sys.exec "rm -rf /tmp/rfl_time_point_store") -- 0
+
+;; ─── with `time` and `trunc` (#1225): time-of-day offsets are durations ─────
+(set tsv (enlist 2024.03.06D09:30:00.123456789 2024.03.06D12:45:10.500000000))
+(- (time tsv) 09:00:00.000) -- (enlist 0D00:30:00.123 0D03:45:10.500)
+(- (time tsv) (trunc 'hour (time tsv))) -- (enlist 0D00:30:00.123 0D00:45:10.500)
+(+ (trunc 'hour (time tsv)) 0D00:30:00) -- (enlist 09:30:00.000 12:30:00.000)
+(set TS (table [ts] (list tsv)))
+(type (at (select {d: (- ts.time 09:00:00.000) from: TS}) 'd)) -- 'TIMESPAN
+(at (select {d: (- ts.time 09:00:00.000) from: TS}) 'd) -- (- (time tsv) 09:00:00.000)
+(type (at (select {d: (deltas ts.time) from: TS}) 'd)) -- 'TIMESPAN
+
+;; ─── a TIMESPAN vector with a TIME atom, and span - TIME over vectors ──────
+(set sv (enlist 0D01:00:00 0Nn 0D00:00:00.0015 (as 'TIMESPAN 2147483648000000) -0D02:00:00))
+(+ 10:00:00.000 sv) -- (enlist 11:00:00.000 0Nt 10:00:00.001 0Nt 08:00:00.000)
+(- 10:00:00.000 sv) -- (enlist 09:00:00.000 0Nt 09:59:59.998 (as 'TIME -2111483648) 12:00:00.000)
+(- sv 10:00:00.000) -- (enlist -09:00:00.000 0Nt -09:59:59.999 (as 'TIME 2111483648) -12:00:00.000)
+(+ sv 10:00:00.000) -- (+ 10:00:00.000 sv)
+(- 0D12:00:00 (enlist 10:00:00.000 0Nt 23:00:00.000)) -- (enlist 02:00:00.000 0Nt -11:00:00.000)
+(- sv (enlist 10:00:00.000 10:00:00.000 0Nt 00:00:00.000 01:00:00.000)) -- (enlist -09:00:00.000 0Nt 0Nt 0Nt -03:00:00.000)

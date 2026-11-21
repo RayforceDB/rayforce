@@ -116,11 +116,7 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return ray_typed_null(-RAY_TIMESTAMP);
         return ray_timestamp(b->i64 * 86400000000000LL + a->i64 * 1000000LL);
     }
-    /* TIME + TIME → TIME */
-    if (a->type == -RAY_TIME && b->type == -RAY_TIME) {
-        if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return ray_typed_null(-RAY_TIME);
-        return ray_time(a->i64 + b->i64);
-    }
+    /* TIME + TIME: two points of the day do not add (falls to the error) */
     /* TIME + TIMESTAMP → TIMESTAMP (add ms as ns) */
     if (a->type == -RAY_TIME && b->type == -RAY_TIMESTAMP) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return ray_typed_null(-RAY_TIMESTAMP);
@@ -148,9 +144,7 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
-    if (ray_has_timespan(a) || ray_has_timespan(b) ||
-        ((a->type == -RAY_TIMESTAMP || a->type == RAY_TIMESTAMP) &&
-         (b->type == -RAY_TIMESTAMP || b->type == RAY_TIMESTAMP)))
+    if (ray_has_timespan(a) || ray_has_timespan(b) || ray_point_diff(a, b))
         return ray_timespan_binary(OP_SUB, a, b);
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_sub_fn, OP_SUB, a, b);
@@ -193,11 +187,6 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
     /* int - TIME → TIME (negative) */
     if (is_numeric(a) && b->type == -RAY_TIME) {
         return ray_time(as_i64(a) - b->i64);
-    }
-    /* TIME - TIME → TIME */
-    if (a->type == -RAY_TIME && b->type == -RAY_TIME) {
-        if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return ray_typed_null(-RAY_TIME);
-        return ray_time(a->i64 - b->i64);
     }
     /* TIMESTAMP - int → TIMESTAMP */
     if (a->type == -RAY_TIMESTAMP && is_numeric(b)) {

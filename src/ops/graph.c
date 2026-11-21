@@ -2118,8 +2118,7 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_LEAD:
             out_type = prev->out_type; break;     /* shifts preserve type */
         case OP_DELTAS:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
-            break;
+            out_type = deltas_out_type(prev->out_type); break;
         case OP_RATIOS:
             out_type = RAY_F64; break;
         case OP_FILLS:
