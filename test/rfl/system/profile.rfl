@@ -49,9 +49,14 @@
 ;; Every site of the fixture names it as its file.
 (count (select {from: P where: (== fn 'prof-inc)})) -- 1
 (at (select {from: P where: (== fn 'prof-inc)}) 'file) -- ['test/data/profile/calls.rfl]
-;; Top-level calls are `<top>` sites: the four above and the call that
-;; switched profiling off (the one that switched it on ran before it was).
-(sum (at (select {from: P where: (== fn '<top>)}) 'calls)) -- 5
+;; Top-level calls are `<top>` sites named by their callee: the four above
+;; and the call that switched profiling off (the one that switched it on ran
+;; before it was).
+(sum (at (select {from: P where: (like fn "<top>*")}) 'calls)) -- 5
+(set TopCalls (fn [name] (sum (at (select {from: P where: (== fn name)}) 'calls))))
+(TopCalls '<top>prof-loop) -- 1
+(TopCalls '<top>map) -- 1
+(TopCalls '<top>.sys.profile.enable) -- 1
 ;; A nested call's time is inside its caller's: map over a lambda.
 (set MapRow (first (select {from: P where: (and (== fn 'prof-map) (== line 13))})))
 (>= (at MapRow 'total-ms) (at MapRow 'self-ms)) -- true

@@ -226,20 +226,23 @@ A call site is a builtin call inside a compiled function (a `select`, a
 compiled function to another are not rows of their own: the callee's calls
 are its rows.
 
-A site is a place in the source: its file, line and column (and, inside a
-function, the function's own place). Running the same text again adds to
-the rows it had, so a client sending the same request a thousand times,
-or a lambda written inside a request, keeps one set of rows. Every IPC
-request and REPL line starts at line 1 of `repl`, so their top-level calls
-share the `<top>` rows there. Each distinct site counts toward the
-4096-site cap; calls at sites past it land in the `<other>` row until
+A site is the code at a place in the source: its file, line and column,
+and what is there. A top-level call is told apart by its callee (`(work
+10)` and `(work 11)` share the `<top>work` row; `(later 5)` has its own),
+a call inside a function by the function's own place. Every IPC request
+and REPL line is parsed from line 1 of `repl`, so there the text tells
+sites apart too: lambdas written on different lines are different rows.
+Running the same text again adds to the rows it had, so a client sending
+the same request a thousand times, or a lambda written inside a request,
+keeps one set of rows. Each distinct site counts toward the 4096-site cap;
+calls at sites past it land in the `<other>` row until
 `(.sys.profile.reset)`.
 
 | Column | Meaning |
 |---|---|
 | `file` | Source file of the call (`repl` for typed or IPC text). |
 | `line` | 1-based line of the call; `0` when unknown. |
-| `fn` | The global the enclosing function is bound to (dotted names included); `<lambda@N>` for a function bound to no global, whose body starts on line N; `<top>` for top-level code; `<other>` for calls past the 4096-site cap. |
+| `fn` | The global the enclosing function is bound to (dotted names included); `<lambda@N>` for a function bound to no global, whose body starts on line N; `<top>NAME` for a top-level call to `NAME` (`<top>` when the head is not a name); `<other>` for calls past the 4096-site cap. |
 | `calls` | Times the call ran. Errors count. |
 | `self-ms` | Wall time inside the call, less the timed calls it made (a lambda run by `map`, say). Sums to the profiled time. |
 | `total-ms` | Wall time inside the call, its nested calls included. A site that calls itself counts its outermost activation. |

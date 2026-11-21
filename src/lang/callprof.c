@@ -8,11 +8,15 @@
  *   frame stack are allocated on first enable and written only by the main
  *   VM.
  *
- *   A site is a source position: the file, the call's line and column and,
- *   inside a lambda, the lambda's own position and the call's offset.  Every
- *   IPC request and REPL line is a fresh parse (and a fresh compile of any
- *   lambda it writes), so keying sites by node or bytecode would add sites,
- *   and pin a parse tree, per request; by position, repeats aggregate.
+ *   A site is the code at a source position: the file, the call's line and
+ *   column, and what is there.  At top level that is the callee's name when
+ *   the call's head is one (so `(f 1)` and `(f 2)` share a row); inside a
+ *   lambda, the lambda's own position and the call's offset.  Every IPC
+ *   request and REPL line is a fresh parse from line 1 of `repl` (and a
+ *   fresh compile of any lambda it writes), so there the position says
+ *   little: a hash of the text (a top-level call's without a named head, a
+ *   lambda's) tells sites apart.  Keying by node or bytecode would add
+ *   sites, and pin a parse tree, per request; by content, repeats aggregate.
  *
  *   Two caches put a call on its site without reading the source info:
  *   compiled calls by (bytecode, offset), each slot holding a reference so
@@ -54,6 +58,7 @@ typedef struct {
     int32_t  ip;        /* call offset; -1 for a top-level site */
     int32_t  line;      /* 1-based source line, 0 unknown */
     int32_t  def_line;  /* VM site: the lambda's first line, for its label */
+    int64_t  callee;    /* top site: the head's name symbol, or -1 */
     int32_t  active;    /* activations open: total counts the outermost */
     int64_t  file;      /* symbol: the source's file name */
     uint64_t calls;
@@ -75,6 +80,8 @@ typedef struct {        /* site by position */
     uint32_t def;       /* lambda's position, 0 at top level */
     int32_t  ip;
     int32_t  idx;       /* site index + 1; 0: empty */
+    uint64_t what;      /* top: the callee's symbol, else a hash of the text
+                           (REPL/IPC text only; 0 elsewhere) */
 } cp_pslot_t;
 #define CP_NODBG UINT32_MAX
 
@@ -106,6 +113,7 @@ typedef struct {
     uint32_t   ngen;        /* node cache generation: bumped per source */
     ray_t*     nfo;         /* retained: the source the node cache is for */
     int64_t    nfo_file;    /* its file name symbol */
+    int64_t    repl_file;   /* the symbol of RAY_NFO_REPL_NAME */
 } cp_state_t;
 
 static cp_state_t* g_cp;
@@ -154,18 +162,43 @@ static uint32_t cp_pos(ray_span_t span) {
     return (uint32_t)span.start_line << 16 | span.start_col;
 }
 
+/* Byte offset of (line, col) in src, clamped to its length. */
+static size_t cp_offset(const char* src, size_t len, uint32_t line, uint32_t col) {
+    size_t i = 0;
+    for (uint32_t l = 0; l < line && i < len; i++) if (src[i] == '\n') l++;
+    return i + col < len ? i + col : len;
+}
+
+/* Hash of the text `span` covers in nfo's source, for text that is parsed
+ * from line 1 again and again (REPL lines, IPC requests): only there do
+ * positions collide.  0 for other sources, which positions tell apart. */
+static uint64_t cp_text_hash(ray_t* nfo, int64_t file, ray_span_t span) {
+    if (!nfo || file != g_cp->repl_file) return 0;
+    ray_t* src = NFO_SOURCE(nfo);
+    if (!src || RAY_IS_ERR(src) || src->type != -RAY_STR) return 0;
+    const char* p = ray_str_ptr(src);
+    size_t len = ray_str_len(src);
+    size_t a = cp_offset(p, len, span.start_line, span.start_col);
+    size_t b = cp_offset(p, len, span.end_line, span.end_col);
+    uint64_t h = 0xCBF29CE484222325ull;   /* FNV-1a; 0 is kept for "none" */
+    for (size_t i = a; i < b; i++) h = (h ^ (uint8_t)p[i]) * 0x100000001B3ull;
+    return h | 1;
+}
+
 /* The site at a position, made on first sight; the overflow row once the
  * sites are spent.  *made says which. */
-static int32_t cp_site_at(int64_t file, uint32_t pos, uint32_t def, int32_t ip, bool* made) {
+static int32_t cp_site_at(int64_t file, uint32_t pos, uint32_t def, int32_t ip, uint64_t what,
+                          bool* made) {
     uint64_t h = (uint64_t)file * 0x9E3779B97F4A7C15ull
                ^ ((uint64_t)pos << 32 | def) * 0xBF58476D1CE4E5B9ull
-               ^ (uint64_t)(uint32_t)ip * 0x94D049BB133111EBull;
+               ^ (uint64_t)(uint32_t)ip * 0x94D049BB133111EBull ^ what;
     h ^= h >> 31;
     *made = false;
     for (uint32_t i = (uint32_t)h & (CP_PSLOTS - 1);; i = (i + 1) & (CP_PSLOTS - 1)) {
         cp_pslot_t* t = &g_cp->pslots[i];
         if (t->idx) {
-            if (t->file == file && t->pos == pos && t->def == def && t->ip == ip) return t->idx - 1;
+            if (t->file == file && t->pos == pos && t->def == def && t->ip == ip && t->what == what)
+                return t->idx - 1;
             continue;
         }
         if (g_cp->n_sites >= RAY_CALLPROF_SITES_MAX) return CP_OTHER;
@@ -174,7 +207,8 @@ static int32_t cp_site_at(int64_t file, uint32_t pos, uint32_t def, int32_t ip, 
         memset(s, 0, sizeof *s);
         s->ip = ip;
         s->file = file;
-        *t = (cp_pslot_t){ file, pos, def, ip, idx + 1 };
+        s->callee = -1;
+        *t = (cp_pslot_t){ file, pos, def, ip, idx + 1, what };
         *made = true;
         return idx;
     }
@@ -213,9 +247,14 @@ static int32_t cp_vm_site(ray_t* fn, ray_t* bc, int32_t ip, bool* dup) {
     ray_span_t call = ray_bc_dbg_get(dbg, ip);
     ray_span_t def = ray_bc_dbg_get(dbg, 0);
     bool made;
-    int32_t site = call.id && def.id
-        ? cp_site_at(cp_file_sym(LAMBDA_NFO(fn)), cp_pos(call), cp_pos(def), ip, &made)
-        : cp_site_at((int64_t)(uintptr_t)bc, 0, CP_NODBG, ip, &made);
+    int32_t site;
+    if (call.id && def.id) {
+        ray_t* nfo = LAMBDA_NFO(fn);
+        int64_t file = cp_file_sym(nfo);
+        site = cp_site_at(file, cp_pos(call), cp_pos(def), ip, cp_text_hash(nfo, file, def), &made);
+    } else {
+        site = cp_site_at((int64_t)(uintptr_t)bc, 0, CP_NODBG, ip, 0, &made);
+    }
     *dup = site == CP_OTHER;
     if (site == CP_OTHER) return site;
     cp_site_t* s = &g_cp->sites[site];
@@ -264,9 +303,17 @@ int32_t ray_callprof_enter_node(ray_t* node) {
         ray_span_t span = ray_nfo_get(nfo, node);
         int32_t site = -1;
         if (span.id) {
+            /* The callee's name, when the head is one, keeps `(f 1)` and
+             * `(f 2)` on one row and `(f 1)`, `(g 1)` on two. */
+            ray_t* head = node->type == RAY_LIST && node->len > 0 ? ((ray_t**)ray_data(node))[0] : NULL;
+            int64_t callee = head && head->type == -RAY_SYM && !(head->attrs & ATTR_QUOTED) ? head->i64 : -1;
+            uint64_t what = callee >= 0 ? (uint64_t)callee + 1 : cp_text_hash(nfo, g_cp->nfo_file, span);
             bool made;
-            site = cp_site_at(g_cp->nfo_file, cp_pos(span), 0, -1, &made);
-            if (made) g_cp->sites[site].line = cp_line(span);
+            site = cp_site_at(g_cp->nfo_file, cp_pos(span), 0, -1, what, &made);
+            if (made && site != CP_OTHER) {
+                g_cp->sites[site].line = cp_line(span);
+                g_cp->sites[site].callee = callee;
+            }
         }
         *c = (cp_nslot_t){ node, g_cp->ngen, site };
     }
@@ -319,6 +366,7 @@ void ray_callprof_set_enabled(bool on) {
     if (on && !g_cp) {
         g_cp = (cp_state_t*)ray_sys_alloc(sizeof(cp_state_t));
         if (!g_cp) return;
+        g_cp->repl_file = ray_sym_intern(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME));
     }
     ray_qstats_set_calls(on);
     atomic_store_explicit(&g_ray_callprof, on, memory_order_relaxed);
@@ -459,6 +507,12 @@ ray_t* ray_callprof_table(void) {
         const cp_site_t* s = &g_cp->sites[order[r]];
         int64_t fn;
         if (order[r] == CP_OTHER) fn = ray_sym_intern("<other>", 7);
+        else if (s->ip < 0 && s->callee >= 0) {
+            ray_t* name = ray_sym_str(s->callee);
+            char buf[256];
+            int len = name ? snprintf(buf, sizeof buf, "<top>%.*s", (int)ray_str_len(name), ray_str_ptr(name)) : -1;
+            fn = len > 0 && len < (int)sizeof buf ? ray_sym_intern(buf, (size_t)len) : top;
+        }
         else if (s->ip < 0) fn = top;
         else {
             fn = cp_names_find(&names, s->key);

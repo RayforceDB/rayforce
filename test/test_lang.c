@@ -13079,6 +13079,23 @@ static test_result_t test_callprof_error_unwinds(void) {
     PASS();
 }
 
+/* Rows of (.sys.profile), and the calls of the rows named `fn`. */
+static int64_t cp_rows(void) {
+    ray_t* r = ray_eval_str("(count (.sys.profile))");
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+static int64_t cp_calls(const char* fn) {
+    char q[256];
+    snprintf(q, sizeof q, "(sum (at (select {from: (.sys.profile) where: (== fn '%s)}) 'calls))", fn);
+    ray_t* r = ray_eval_str(q);
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
 /* Every text request is a fresh parse.  Top-level sites are source
  * positions, so repeats aggregate into the rows they had, the cap stays
  * free for the sites that follow, and no request's parse tree outlives it. */
@@ -13147,28 +13164,62 @@ static test_result_t test_callprof_repeated_requests(void) {
     ray_release(r);
     ray_callprof_set_enabled(false);
 
-    /* The request's outermost call is line 1 column 1 of `repl` for every
-     * request: one row, every call counted (the lambda requests add one
-     * more `<top>` row, for the `fn` form at column 2).  rq-work's `+`,
-     * rq-later's `*` and the request lambda's `count` keep rows of their
-     * own; nothing folds into `<other>`. */
-    static const struct { const char* src; int64_t want; } rows[] = {
-        { "(count (.sys.profile))", 5 },
-        { "(sum (at (select {from: (.sys.profile) where: (== fn '<lambda@1>)}) 'calls))", 1000 },
-        { "(sum (at (select {from: (.sys.profile) where: (== fn '<top>)}) 'calls))", 0 },
-        { "(sum (at (select {from: (.sys.profile) where: (== fn 'rq-work)}) 'calls))", 0 },
-        { "(sum (at (select {from: (.sys.profile) where: (== fn 'rq-later)}) 'calls))", 1 },
-        { "(count (select {from: (.sys.profile) where: (== fn '<other>)}))", 0 },
+    /* One row per callee at top level, every call counted: the requests'
+     * outermost calls share line 1 of `repl`, the callee tells them apart.
+     * The lambda requests' head is no name: one `<top>` row by their text,
+     * and one for the `fn` form inside.  rq-work's `+`, rq-later's `*` and
+     * the request lambda's `count` keep rows of their own; nothing folds
+     * into `<other>`. */
+    TEST_ASSERT_EQ_I(cp_rows(), 8);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("<top>count"), 301);
+    TEST_ASSERT_EQ_I(cp_calls("<top>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>fn"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<lambda@1>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<other>"), 0);
+    ray_callprof_reset();
+    PASS();
+}
+
+/* REPL lines and IPC requests are separate parses, each from line 1 column
+ * 1 of `repl`: different calls there are different rows, and so are
+ * lambdas defined on different lines at the same column. */
+static test_result_t test_callprof_repl_calls(void) {
+    static const char* const setup[] = {
+        "(set work (fn [n] (+ n 1)))",
+        "(set later (fn [n] (* n 2)))",
+        "(set wa (fn [n] (+ n 1)))",
+        "(set wb (fn [n] (* n 2)))",
     };
-    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) {
-        r = ray_eval_str(rows[i].src);
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
         TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-        int64_t want = rows[i].want;
-        if (i == 2) want = n + 301 + 2 * 1000 + 1;
-        if (i == 3) want = n;
-        TEST_ASSERT_EQ_I(r->i64, want);
         ray_release(r);
     }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    static const char* const lines[] = {
+        "(work 10)", "(work 10)", "(later 5)", "(neg 3)", "(wa 1)", "(wa 2)", "(wb 3)",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) {
+        ray_t* r = ray_eval_str(lines[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_set_enabled(false);
+    TEST_ASSERT_EQ_I(cp_rows(), 9);
+    TEST_ASSERT_EQ_I(cp_calls("<top>work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>neg"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wb"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("wb"), 1);
     ray_callprof_reset();
     PASS();
 }
@@ -13176,6 +13227,7 @@ static test_result_t test_callprof_repeated_requests(void) {
 const test_entry_t lang_entries[] = {
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
+    { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
