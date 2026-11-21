@@ -4801,6 +4801,8 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
         { "q: qty", true, "(and (== date 2024.01.02) (in (if (== side 'b) act side) ['New 's]))", 5 },
         /* not an operand: a bare conjunct, under a logic head, in by: */
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) (> qty 2) (< qty 2)))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) qty 0))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) act side))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (or (if (> px 1.0) (> qty 2) (< qty 2)) (> qty 4)))", -1 },
         { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", false, NULL, -1 },
     };
