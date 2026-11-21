@@ -18687,6 +18687,15 @@ static bool prune_group_shape_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     return true;
 }
 
+/* Is the select key `k` a clause (from, where, by, take, ...)? */
+static bool prune_clause_key(ray_t* k) {
+    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    for (size_t r = 0; r < sizeof reserved / sizeof *reserved; r++)
+        if (ray_str_len(k) == strlen(reserved[r]) &&
+            memcmp(ray_str_ptr(k), reserved[r], ray_str_len(k)) == 0) return true;
+    return false;
+}
+
 /* Every where conjunct, by: expression and output of the select reads only
  * the rows the where keeps. */
 static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
@@ -18698,22 +18707,26 @@ static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
-    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    int n_clauses = 0;
     for (int64_t i = 0; i < keys->len; i++) {
         ray_t* k = ray_sym_vec_cell(keys, i);
         if (!k) return false;
-        bool res = false;
-        for (size_t r = 0; r < sizeof reserved / sizeof *reserved; r++)
-            if (ray_str_len(k) == strlen(reserved[r]) &&
-                memcmp(ray_str_ptr(k), reserved[r], ray_str_len(k)) == 0) res = true;
-        if (!res && !prune_output_ok(((ray_t**)ray_data(vals))[i], tbl, grouped)) {
-            int budget = PRUNE_IF_MAX_VISITS;
-            if (by || keys->len != 3 || !dict_get(dict, "from") || !dict_get(dict, "where")) return false;
-            /* Clause keys can have a compact width or a non-runtime domain. */
-            int64_t output_id = sym_cell_runtime_id(keys, i);
-            if (output_id < 0 || ray_table_slot(tbl, output_id) ||
-                !prune_if_projection(((ray_t**)ray_data(vals))[i], tbl, &budget, 0)) return false;
-        }
+        n_clauses += prune_clause_key(k);
+    }
+    for (int64_t i = 0; i < keys->len; i++) {
+        if (prune_clause_key(ray_sym_vec_cell(keys, i)) ||
+            prune_output_ok(((ray_t**)ray_data(vals))[i], tbl, grouped)) continue;
+        /* An ungrouped IF beside other outputs as well: they are row-local
+         * (admitted above), and the projection either compiles every output
+         * (rowwise IF) or filters first and scatters each output per row
+         * (select's eval fallback), a choice made from the AST and the
+         * schema, which the pruned source keeps. */
+        int budget = PRUNE_IF_MAX_VISITS;
+        if (by || n_clauses != 2 || !dict_get(dict, "from") || !dict_get(dict, "where")) return false;
+        /* Clause keys can have a compact width or a non-runtime domain. */
+        int64_t output_id = sym_cell_runtime_id(keys, i);
+        if (output_id < 0 || ray_table_slot(tbl, output_id) ||
+            !prune_if_projection(((ray_t**)ray_data(vals))[i], tbl, &budget, 0)) return false;
     }
     return true;
 }

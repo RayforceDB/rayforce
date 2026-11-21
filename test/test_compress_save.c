@@ -4544,6 +4544,12 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         { "a: a", "(and (== date 2024.01.02) (== (and (> a 0) (< a 12000)) true))", 2999, true },
         { "by: b s: (sum (if (< a 8) a 0))", "(== date 2024.01.02)", 3000, true },
         { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, false },
+        /* an IF beside other row-local outputs (#1181) */
+        { "b: b a: a q: (if (or (< a 8) (> a 11990)) a 0)", "(== date 2024.01.02)", 3000, true },
+        { "q: (if (< a 8) a b) r: (if (> b a) 1 0) s: (+ a b)", "(and (== date 2024.01.02) (> a 5))", 2998, true },
+        { "q: (if (< a 8) a 0) r: (if (> a 11992) b a)", "(> date 2024.01.03)", 0, true },
+        { "a: a q: (if (< a 8) a 0)", "(>= date 2024.01.01)", 9000, false },
+        { "a: a q: (if (< a 8) a 0) take: 5", "(== date 2024.01.02)", 5, false },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];
