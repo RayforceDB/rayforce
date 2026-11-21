@@ -1,4 +1,4 @@
-;; Invariants for `div` (integer floor division; always i64 result).
+;; Invariants for `div` (floor division; the promoted type of its operands, #972).
 
 ;; concrete
 (div 7 2) -- 3
@@ -15,10 +15,10 @@
 ;; typed null and type
 (nil? (div 1.0 0.0)) -- true
 (nil? (div 0.0 0.0)) -- true
-(type (div 7.0 2.0)) -- 'i64
+(type (div 7.0 2.0)) -- 'f64
+(div 7.0 2.0) -- 3.0
 (div [7 10 -7] 2) -- [3 5 -4]
 
-;; idiv overflow: floor(a/b) exceeds INT64_MAX → typed-null
-;; (arith.c:219-220) — 1e200 / 1.0 = 1e200, way past INT64_MAX≈9.2e18
-(nil? (div 1e200 1.0)) -- true
-(nil? (div -1e200 1.0)) -- true
+;; a float quotient stays a float: no integer range to overflow
+(div 1e200 1.0) -- 1e200
+(div -1e200 1.0) -- -1e200

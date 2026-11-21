@@ -587,9 +587,31 @@ done:
     return res;
 }
 
+/* ";; @also-unfused" in a file runs it a second time with the fused
+ * expression evaluator turned off, so every query also goes through the
+ * typed per-node executor (the path a fused program falls back to when it
+ * runs out of registers) and is held to the same answers. */
+extern bool ray_expr_disable;
+static bool rfl_file_has(const char* path, const char* needle) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof line, f)) found = strstr(line, needle) != NULL;
+    fclose(f);
+    return found;
+}
+
 static test_result_t run_rfl_at(int idx) {
     if (idx < 0 || idx >= g_rfl_count) FAIL("invalid .rfl index");
-    return run_rfl_file(g_rfl_paths[idx]);
+    test_result_t r = run_rfl_file(g_rfl_paths[idx]);
+    if (r.status == TEST_PASS && rfl_file_has(g_rfl_paths[idx], ";; @also-unfused")) {
+        ray_expr_disable = true;
+        r = run_rfl_file(g_rfl_paths[idx]);
+        ray_expr_disable = false;
+        if (r.status == TEST_FAIL) fprintf(stderr, "        (in the unfused pass)\n");
+    }
+    return r;
 }
 
 /* The runtime poll mirrors main.c: unified IPC handles are selector ids
