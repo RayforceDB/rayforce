@@ -459,6 +459,38 @@ static test_result_t test_jm_errors(void) {
     PASS();
 }
 
+/* A table whose only special column is MAPCOMMON counts as parted but has
+ * no segments: it flattens to nothing, which is an error, as in the joins,
+ * not a retry with the same table. */
+static test_result_t test_jm_mapcommon_only(void) {
+    ray_t* keys = ray_vec_new(RAY_I64, 2); keys->len = 2;
+    ray_t* counts = ray_vec_new(RAY_I64, 2); counts->len = 2;
+    ((int64_t*)ray_data(keys))[0] = 1; ((int64_t*)ray_data(keys))[1] = 2;
+    ((int64_t*)ray_data(counts))[0] = 3; ((int64_t*)ray_data(counts))[1] = 4;
+    ray_t* mc = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(mc);
+    mc->type = RAY_MAPCOMMON; mc->len = 2;
+    ((ray_t**)ray_data(mc))[0] = keys; ((ray_t**)ray_data(mc))[1] = counts;
+    int64_t k = ray_sym_intern("k", 1);
+    ray_t* mt = ray_table_add_col(ray_table_new(1), k, mc);
+    ray_release(mc);
+    ray_t* kv = ray_vec_new(RAY_I64, 3); kv->len = 3;
+    for (int64_t i = 0; i < 3; i++) ((int64_t*)ray_data(kv))[i] = i;
+    ray_t* ft = ray_table_add_col(ray_table_new(1), k, kv);
+    ray_release(kv);
+    TEST_ASSERT(mt && !RAY_IS_ERR(mt) && ft && !RAY_IS_ERR(ft), "tables");
+    for (int anti = 0; anti < 2; anti++) {
+        ray_t* a = ray_join_mask(mt, ft, &k, 1, anti);
+        ray_t* b = ray_join_mask(ft, mt, &k, 1, anti);
+        bool ok = a && RAY_IS_ERR(a) && b && RAY_IS_ERR(b);
+        if (a) ray_release(a);
+        if (b) ray_release(b);
+        TEST_ASSERT(ok, "a MAPCOMMON-only side is an error");
+    }
+    ray_release(mt); ray_release(ft);
+    PASS();
+}
+
 const test_entry_t join_mask_entries[] = {
     { "join_mask/big_left_few_books", test_jm_big_left_few_books, jm_setup, jm_teardown },
     { "join_mask/random",             test_jm_random,             jm_setup, jm_teardown },
@@ -469,5 +501,6 @@ const test_entry_t join_mask_entries[] = {
     { "join_mask/unfiltered_types",   test_jm_unfiltered_types,   jm_setup, jm_teardown },
     { "join_mask/where",              test_jm_where,              jm_setup, jm_teardown },
     { "join_mask/errors",             test_jm_errors,             jm_setup, jm_teardown },
+    { "join_mask/mapcommon_only",     test_jm_mapcommon_only,     jm_setup, jm_teardown },
     { NULL, NULL, NULL, NULL },
 };

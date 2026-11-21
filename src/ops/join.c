@@ -2772,22 +2772,10 @@ static void join_mask_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end
 
 /* BOOL vector over left's rows: true where some right row equals it on
  * every key in key_names[0..n_keys) (anti: the negation).  Keys are column
- * names present in both tables (the caller checks). */
-ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
-                     const int64_t* key_names, uint32_t n_keys, bool anti) {
-    /* Parted sides: flatten, as join_with_parted_guard does for a join. */
-    if (join_table_has_parted_col(left_table) || join_table_has_parted_col(right_table)) {
-        ray_t* lf = join_table_has_parted_col(left_table) ? join_flatten_parted(left_table) : NULL;
-        if (lf && RAY_IS_ERR(lf)) return lf;
-        ray_t* rf = join_table_has_parted_col(right_table) ? join_flatten_parted(right_table) : NULL;
-        if (rf && RAY_IS_ERR(rf)) { if (lf) ray_release(lf); return rf; }
-        ray_t* m = ray_join_mask(lf ? lf : left_table, rf ? rf : right_table,
-                                 key_names, n_keys, anti);
-        if (lf) ray_release(lf);
-        if (rf) ray_release(rf);
-        return m;
-    }
-
+ * names present in both tables (the caller checks).  Flat tables only:
+ * ray_join_mask below flattens a parted side first. */
+static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
+                             const int64_t* key_names, uint32_t n_keys, bool anti) {
     int64_t left_rows  = ray_table_nrows(left_table);
     int64_t right_rows = ray_table_nrows(right_table);
     if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
@@ -2886,6 +2874,35 @@ out:
     scratch_free(key_vecs_hdr);
     if (err) { ray_release(mask); return err; }
     return mask;
+}
+
+ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
+                     const int64_t* key_names, uint32_t n_keys, bool anti) {
+    bool lp = join_table_has_parted_col(left_table);
+    bool rp = join_table_has_parted_col(right_table);
+    if (!lp && !rp)
+        return join_mask_flat(left_table, right_table, key_names, n_keys, anti);
+    /* Parted sides: flatten, as join_with_parted_guard does for a join.  A
+     * table whose only special column is MAPCOMMON has no segments, and
+     * flattens to NULL: an error, as there. */
+    ray_t* lf = NULL;
+    ray_t* rf = NULL;
+    if (lp) {
+        lf = join_flatten_parted(left_table);
+        if (!lf || RAY_IS_ERR(lf)) return lf ? lf : ray_error("oom", NULL);
+    }
+    if (rp) {
+        rf = join_flatten_parted(right_table);
+        if (!rf || RAY_IS_ERR(rf)) {
+            if (lf) ray_release(lf);
+            return rf ? rf : ray_error("oom", NULL);
+        }
+    }
+    ray_t* m = join_mask_flat(lf ? lf : left_table, rf ? rf : right_table,
+                              key_names, n_keys, anti);
+    if (lf) ray_release(lf);
+    if (rf) ray_release(rf);
+    return m;
 }
 
 /* ============================================================================
