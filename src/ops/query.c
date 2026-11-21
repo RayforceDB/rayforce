@@ -26861,7 +26861,8 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
     if (!ray_is_atom(val_node)) return 0;
     if (m.index_kind != RAY_IDX_HASH) return 0;            /* metadata first: no null scan */
     if (ray_table_col_has_nulls(tbl, col_sym)) return 0;
-    if (m.type == RAY_F64 || m.type == RAY_STR || m.type == RAY_GUID) return 0;
+    if (m.type == RAY_F64 || m.type == RAY_F32 || m.type == RAY_STR || m.type == RAY_GUID)
+        return 0;                                  /* float keys: the compare promotes */
     ray_t* ix;
     ray_t* ie = ray_table_col_index(tbl, col_sym, &ix);
     if (ie) { ray_error_free(ie); return 0; }
@@ -26882,11 +26883,22 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
                                       v->type == -RAY_I32 || v->type == -RAY_I16 ||
                                       v->type == -RAY_U8));
     int64_t key = ok ? (col->type == RAY_SYM ? v->i64 : upsert_atom_int(v)) : 0;
+    bool absent = false;
+    if (ok && col->type == RAY_SYM) {
+        /* global intern id -> the column's domain id, as the select-side
+         * probe maps it (a file-domain column keeps its own ids) */
+        ray_t* ks = ray_sym_str(key);
+        int64_t dom_id = ks ? ray_sym_domain_find(ray_sym_vec_domain(col),
+                                                  ray_str_ptr(ks), ray_str_len(ks)) : -1;
+        if (dom_id < 0) absent = true;
+        else key = dom_id;
+    }
     ray_release(v);
     if (!ok) return 0;
     ray_idx_rows_t ids = { NULL, false }; int64_t n = 0;
-    int hit = ray_index_hash_group(col, key, &ids, &n);
+    int hit = absent ? 0 : ray_index_hash_group(col, key, &ids, &n);
     if (hit < 0) return 0;
+    if (absent) n = 0;                             /* not in the domain: no row */
     int64_t* out = (int64_t*)scratch_alloc(rows_hdr, (size_t)(n > 0 ? n : 1) * sizeof(int64_t));
     if (!out) return 0;
     for (int64_t i = 0; i < n; i++) out[i] = ray_idx_rows_at(ids, i);
