@@ -132,6 +132,9 @@ typedef struct {
     uint8_t       index_decision;         /* RAY_COL_IDX_*: generation 2 keeps, rebuilds or drops a
                                            * region index; generation 0 takes KEEP only */
     uint8_t       index_kind;             /* generation 2: kind to record (0 = from the source) */
+    bool          keep_dict;              /* index_kind DICT: write it whatever it costs (the
+                                           * save's index: true; ray_encw_finish otherwise leaves
+                                           * out one larger than generation 0's) */
     bool          durable;
 } ray_col_write_t;
 ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path);

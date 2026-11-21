@@ -1,0 +1,85 @@
+;; A single by: key folds its identity projection into the key, as a
+;; composite one does (composite_key_projection.rfl, #1235): `{u: … a: a}
+;; by: a` is `{u: …} by: a`, the key first wherever the projection is
+;; written, with the same columns, types, values and row order, on every
+;; route: the grouping DAG, the distinct-count rewrite, take:, a parted
+;; table and the evaluator's grouping (#1237).  A computed projection of
+;; the key stays a per-group output.
+;; columns, row count, types and values, all equal
+(set eqt (fn [x y] (and (== (count (cols x)) (count (cols y))) (all (== (cols x) (cols y))) (== (count x) (count y)) (all (map (fn [c] (and (== (type (at x c)) (type (at y c))) (all (== (at x c) (at y c))))) (cols x))))))
+(set S (table [a b h] (list (as 'I32 [1 2 1 2 1 3]) (as 'I32 [5 5 5 6 5 5]) [10 20 30 40 50 60])))
+;; the layout on every route, the projection before and after the output
+(cols (select {u: (count h) a: a from: S by: a})) -- [a u]
+(cols (select {a: a u: (count h) from: S by: a})) -- [a u]
+(cols (select {u: (count h) from: S by: a})) -- [a u]
+(cols (select {u: (count (distinct h)) a: a from: S by: a})) -- [a u]
+(cols (select {u: (count h) a: a from: S by: a desc: u take: 2})) -- [a u]
+(cols (select {u: (count h) a: a from: S by: a take: 2})) -- [a u]
+(cols (select {u: (count h) a: a from: S where: (> h 10) by: a})) -- [a u]
+(cols (select {x: h a: a from: S by: a})) -- [a x]
+(cols (select {x: (first h) a: a u: (count h) from: S by: a})) -- [a x u]
+(cols (select {u: (count h) a: a from: S by: [a]})) -- [a u]
+(cols (select {u: (count h) k: k from: S by: {k: a}})) -- [k u]
+(cols (select {a: a from: S by: a})) -- [a b h]
+(cols (select {u: (count h) a: a from: S by: 'a})) -- [a u]
+(cols (select {u: (count (distinct h)) a: a from: S by: 'a})) -- [a u]
+(cols (select {u: (count h) a: a from: S by: [a] desc: u take: 2})) -- [a u]
+(cols (select {u: (count h) k: k from: S by: {k: (* a 2)}})) -- [k u]
+(at (select {u: (count h) k: k from: S by: {k: (* a 2)}}) 'k) -- [2 4 6]
+;; a by: name bound to a vector groups by its values, under its name
+(cols ((fn [a] (select {u: (count h) a: a from: S by: a})) [7 7 1 2 1 3])) -- [a u]
+(at ((fn [a] (select {u: (count h) a: a from: S by: a})) [7 7 1 2 1 3]) 'u) -- (at ((fn [a] (select {u: (count h) from: S by: a})) [7 7 1 2 1 3]) 'u)
+(at (select {u: (count h) a: a from: S by: a}) 'a) -- (as 'I32 [1 2 3])
+(at (select {u: (count h) a: a from: S by: a}) 'u) -- [3 2 1]
+;; a computed key stays a per-group output
+(cols (select {u: (count h) a: (* a 2) from: S by: a})) -- [a u a]
+;; a quoted symbol is a constant, not the key
+(cols (select {u: (count h) a: 'a from: S by: a})) -- [a u a]
+(at (value (select {u: (count h) a: 'a from: S by: a})) 2) -- ['a 'a 'a]
+
+;; 300K rows, 100K groups: the projected select is the unprojected one
+(set n 300000)
+(set k0 (% (* (til n) 7919) 100000))
+(set T (table [a h s t] (list (as 'I32 k0) (% (* (til n) 31) 1000) (at ['p 'q 'r 'w] (% (til n) 4)) (as 'STR (at ["pp" "qq" "rr"] (% (til n) 3))))))
+(eqt (select {u: (count h) a: a from: T by: a}) (select {u: (count h) from: T by: a})) -- true
+(eqt (select {a: a u: (count h) from: T by: a}) (select {u: (count h) from: T by: a})) -- true
+(eqt (select {u: (sum h) a: a from: T by: a}) (select {u: (sum h) from: T by: a})) -- true
+(eqt (select {u: (first h) l: (last h) a: a from: T by: a}) (select {u: (first h) l: (last h) from: T by: a})) -- true
+(eqt (select {u: (min h) m: (max h) v: (avg h) a: a from: T by: a}) (select {u: (min h) m: (max h) v: (avg h) from: T by: a})) -- true
+(eqt (select {u: (med h) a: a from: T by: a}) (select {u: (med h) from: T by: a})) -- true
+(eqt (select {r: (- (max h) (min h)) a: a from: T by: a}) (select {r: (- (max h) (min h)) from: T by: a})) -- true
+(eqt (select {u: (count (distinct h)) a: a from: T by: a}) (select {u: (count (distinct h)) from: T by: a})) -- true
+(eqt (select {u: (count (distinct h)) a: a from: T where: (> h 100) by: a}) (select {u: (count (distinct h)) from: T where: (> h 100) by: a})) -- true
+(eqt (select {u: (count h) a: a from: T where: (> h 100) by: a}) (select {u: (count h) from: T where: (> h 100) by: a})) -- true
+(eqt (select {u: (count h) a: a from: T by: a desc: u take: 10}) (select {u: (count h) from: T by: a desc: u take: 10})) -- true
+(eqt (select {u: (sum h) a: a from: T by: a asc: u take: 10}) (select {u: (sum h) from: T by: a asc: u take: 10})) -- true
+(eqt (select {u: (count (distinct h)) a: a from: T by: a desc: u take: 10}) (select {u: (count (distinct h)) from: T by: a desc: u take: 10})) -- true
+(eqt (select {u: (count h) a: a from: T by: a take: 10}) (select {u: (count h) from: T by: a take: 10})) -- true
+(eqt (select {u: (count h) a: a from: T by: a take: -10}) (select {u: (count h) from: T by: a take: -10})) -- true
+(eqt (select {u: (count h) a: a from: T by: [a]}) (select {u: (count h) from: T by: [a]})) -- true
+(eqt (select {u: (count h) k: k from: T by: {k: a}}) (select {u: (count h) from: T by: {k: a}})) -- true
+(eqt (select {u: (sum h) s: s from: T by: s}) (select {u: (sum h) from: T by: s})) -- true
+(eqt (select {u: (sum h) t: t from: T by: t}) (select {u: (sum h) from: T by: t})) -- true
+;; the evaluator's grouping: an output the grouping DAG does not serve
+(eqt (select {x: (last (map (fn [v] (+ v 1)) h)) a: a from: T by: a}) (select {x: (last (map (fn [v] (+ v 1)) h)) from: T by: a})) -- true
+(eqt (select {x: ((fn [v] (sum v)) h) a: a u: (count h) from: T by: a}) (select {x: ((fn [v] (sum v)) h) u: (count h) from: T by: a})) -- true
+(repr (select {x: h a: a from: S by: a})) -- (repr (select {x: h from: S by: a}))
+;; inside a function, and over a select
+(eqt ((fn [tb] (select {u: (count h) a: a from: tb by: a})) T) (select {u: (count h) from: T by: a})) -- true
+(eqt (select {u: (count h) a: a from: (select {from: T where: (> h 10)}) by: a}) (select {u: (count h) from: T where: (> h 10) by: a})) -- true
+
+;; a saved parted table
+(.sys.exec "rm -rf rf_test_skproj") -- 0
+(set days [2024.01.01 2024.01.02])
+(count (map (fn [d] (.db.splayed.set (format "rf_test_skproj/%/t/" (at days d)) (select {from: T where: (== d (% (til n) 2))}) "rf_test_skproj/.sym")) (til 2))) -- 2
+(set P (.db.parted.get "rf_test_skproj/" 't))
+(cols (select {u: (count h) a: a from: P by: a})) -- [a u]
+(cols (select {u: (count (distinct h)) a: a from: P by: a})) -- [a u]
+(eqt (select {u: (count h) a: a from: P by: a}) (select {u: (count h) from: P by: a})) -- true
+(eqt (select {u: (sum h) a: a from: P by: a}) (select {u: (sum h) from: P by: a})) -- true
+(eqt (select {u: (count (distinct h)) a: a from: P by: a}) (select {u: (count (distinct h)) from: P by: a})) -- true
+(eqt (select {u: (count h) a: a from: P where: (== date 2024.01.02) by: a}) (select {u: (count h) from: P where: (== date 2024.01.02) by: a})) -- true
+(eqt (select {u: (count h) a: a from: P by: a desc: u take: 10}) (select {u: (count h) from: P by: a desc: u take: 10})) -- true
+(eqt (select {u: (count h) s: s from: P by: s}) (select {u: (count h) from: P by: s})) -- true
+(eqt (select {u: (count h) date: date from: P by: date}) (select {u: (count h) from: P by: date})) -- true
+(.sys.exec "rm -rf rf_test_skproj") -- 0

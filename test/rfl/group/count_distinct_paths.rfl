@@ -466,3 +466,18 @@
 (sum (at (select {u: (count (distinct v)) c: (count c) from: Pb16 by: k}) 'u)) -- 42940
 (sum (at (select {n: (count x) from: (select {x: (count c) from: Pb16 by: [k v]}) by: k}) 'n)) -- 42940
 (.sys.exec "rm -rf /tmp/rfl_cdb16") -- 0
+
+;; an unordered take: N keeps the first N groups seen (first-seen order is
+;; not key order here: k*7919 mod 40 runs 0 39 38 ...).  At 200000 rows the
+;; route gate sends these to the two-pass rewrite, which counts every group
+;; in key order and picks the first seen out of them.
+;; agg_contract/cd_first_n_take forces each route.
+(set nf (til 200000))
+(set Tff (table [k k2 x i] (list (% (* nf 7919) 40) (% nf 7) (% nf 1000) (+ 1 (% nf 997)))))
+(set Rff (select {k: k u: (count (distinct x)) from: Tff where: (> i 600) by: k take: 5}))
+(at Rff 'k) -- [0 39 38 37 36]
+(at Rff 'u) -- (at (at (select {u: (count (distinct x)) from: Tff where: (> i 600) by: k asc: k}) 'u) [0 39 38 37 36])
+(at (select {k: k u: (count (distinct x)) from: Tff where: (> k 3) by: k take: 3}) 'k) -- [39 38 37]
+(at (select {u: (count (distinct x)) from: Tff by: [k k2] take: 4}) 'k) -- [0 39 38 37]
+(at (select {u: (count (distinct x)) from: Tff by: [k k2] take: 4}) 'k2) -- [0 1 2 3]
+(at (select {u: (count (distinct x)) from: Tff where: (> i 600) by: k take: 100}) 'k) -- (at (xasc (select {f: (first nf) from: (update {from: Tff nf: nf}) where: (> i 600) by: k}) 'f) 'k)

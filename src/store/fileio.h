@@ -62,6 +62,44 @@ bool ray_fsync_disabled(void);
 int  ray_fsync_fd(int fd);
 #endif
 ray_err_t ray_file_sync_dir(const char* path);
+/* Flush everything written under a tree with one call, where the host can: the
+ * whole filesystem holding it (Linux syncfs), on a local filesystem whose syncfs
+ * reports a failed write (Linux 5.8 and later; not FUSE, whose syncfs asks the
+ * server for nothing). A table of many small files otherwise spends its time in
+ * thousands of fsyncs.
+ *
+ * Open the tree BEFORE the first write under it: syncfs reports a writeback error
+ * the descriptor has not seen, and a descriptor opened after the writes samples
+ * the filesystem's error state late, so an error that another syncfs (another
+ * process, `sync -f`, a second import) saw first would be lost. A per-file fsync
+ * has no such hole.
+ *
+ *   int h = ray_file_sync_tree_begin(root);      // before the writes
+ *   ... write ...
+ *   if (!ray_file_sync_tree_end(h)) { sync each file }   // or _abort(h) on failure
+ *
+ * begin returns a descriptor (>= 0), RAY_SYNC_TREE_NONE (-1) where the caller must
+ * sync each file (no such call, an old kernel, a filesystem not known to report
+ * errors, a missing tree, ray_file_sync_tree_force_fallback), or RAY_SYNC_TREE_SKIP
+ * (-2) under ray_fsync_disabled(), where there is nothing to flush. end flushes
+ * and closes: true when everything is flushed (always for SKIP, never for NONE),
+ * false when the flush failed, and the caller then syncs each file, which finds
+ * the error itself. abort closes without flushing.
+ *
+ * It waits for ALL the dirty data of the filesystem, other processes' included:
+ * on a busy shared volume the last step of an import can take longer than its own
+ * data needs. It is not a completeness check (a missing file is not noticed, as
+ * the per-file loop noticed it) and cannot be interrupted: the writers report
+ * their own errors and cancellation. */
+#define RAY_SYNC_TREE_NONE (-1)
+#define RAY_SYNC_TREE_SKIP (-2)
+int  ray_file_sync_tree_begin(const char* root);
+bool ray_file_sync_tree_end(int handle);
+void ray_file_sync_tree_abort(int handle);
+/* Test-suite knob: while set, ray_file_sync_tree_begin answers NONE, so the
+ * per-file fallback runs where syncfs would be used (it is the only path on other
+ * hosts and old kernels, and the Linux suite would not exercise it otherwise). */
+void ray_file_sync_tree_force_fallback(bool on);
 ray_err_t ray_file_rename(const char* old_path, const char* new_path);
 /* Publish a new path without replacing any existing destination, including
  * an empty directory.  Uses the host's no-replace rename; where the host or

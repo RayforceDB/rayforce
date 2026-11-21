@@ -1,0 +1,53 @@
+;; par_min.rfl -- (.sys.join.par.min), the probe-side row count from which a
+;; hash join's chained probe is split across the pool (#599).
+;;
+;; The floor only moves the probe's morsels between the pool and the calling
+;; thread, so every answer is the same at any setting.  test_join_prefilter.c
+;; pins that the probe is dispatched at the default and runs serially under a
+;; raised floor.
+
+;; ── getter / setter ───────────────────────────────────────────────────────
+(.sys.join.par.min) -- 8193
+(.sys.join.par.min 65536) -- 65536
+(.sys.join.par.min) -- 65536
+(.sys.join.par.min 0) -- 0
+(.sys.join.par.min) -- 0
+(.sys.join.par.min 8193) -- 8193
+
+;; ── validation: a non-negative i64, at most one argument ─────────────────
+;; off the default, so a rejected call that reset the floor would show
+(.sys.join.par.min 65536) -- 65536
+(.sys.join.par.min -1) !- domain
+(.sys.join.par.min 0N) !- domain
+(.sys.join.par.min 1.5) !- type
+(.sys.join.par.min 'rows) !- type
+(.sys.join.par.min [65536]) !- type
+(.sys.join.par.min 1 2) !- arity
+;; a rejected value leaves the floor where it was
+(.sys.join.par.min) -- 65536
+(.sys.join.par.min 8193) -- 8193
+
+;; ── the same answers either side of the floor ────────────────────────────
+;; 30000 left rows (four morsels) over 97 books against three of them.
+(set QI (as 'SYM (map (fn [i] (format "I%" i)) (til 97))))
+(set QV (at (as 'SYM (map (fn [i] (format "V%" i)) (til 6))) (% (til 97) 6)))
+(set QL (table [venue instrument px] (list (take QV 30000) (take QI 30000) (til 30000))))
+(set QR (table [venue instrument w] (list (at QV [3 40 41]) (at QI [3 40 41]) [1 2 3])))
+
+(set QA (inner-join [venue instrument] QL QR))
+(set QB (left-join [venue instrument] QL QR))
+(set QF (full-join [venue instrument] QL QR))
+(count QA) -- 928
+(.sys.join.par.min 1000000) -- 1000000
+(inner-join [venue instrument] QL QR) -- QA
+(left-join [venue instrument] QL QR) -- QB
+(full-join [venue instrument] QL QR) -- QF
+(.sys.join.par.min 0) -- 0
+(inner-join [venue instrument] QL QR) -- QA
+(left-join [venue instrument] QL QR) -- QB
+(full-join [venue instrument] QL QR) -- QF
+(.sys.join.par.min 8193) -- 8193
+
+;; ── a reserved name: .sys.join is a namespace dict, par.min cannot be rebound
+(type .sys.join) -- 'DICT
+(set .sys.join.par.min 0) !- reserve

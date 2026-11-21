@@ -49,6 +49,28 @@ uint64_t ray_join_null_fallbacks = 0;
 bool ray_join_force_null_checks = false;
 /* Diagnostic: joins whose key columns were all proven null-free. */
 uint64_t ray_join_nullfree_keys = 0;
+/* Test knob: suppress the right-side key bitmap prefilter (#595) so the
+ * differential harness can compare it against the plain probe. */
+bool ray_join_no_prefilter = false;
+/* Diagnostic: chained joins that probed through the key prefilter, and the
+ * left rows it rejected before hashing (count pass only, so once per row). */
+uint64_t ray_join_prefilter_builds = 0;
+_Atomic(uint64_t) ray_join_prefilter_skips = 0;
+
+/* #599: probe-side rows from which the chained probe goes to the pool, set by
+ * (.sys.join.par.min).  The default reproduces the morsel rule — a probe of
+ * more than one JOIN_MORSEL splits — so a value at or below it changes
+ * nothing.  Raising it trades latency for CPU on joins under the floor.  Read
+ * once per join, relaxed: a concurrent set takes effect from the next join. */
+static _Atomic(int64_t) g_join_par_min = RAY_JOIN_PAR_MIN_DEFAULT;
+int64_t ray_join_par_min(void) {
+    return atomic_load_explicit(&g_join_par_min, memory_order_relaxed);
+}
+void ray_join_set_par_min(int64_t rows) {
+    atomic_store_explicit(&g_join_par_min, rows, memory_order_relaxed);
+}
+/* Diagnostic: chained-probe passes (count, fill) dispatched to the pool. */
+_Atomic(uint64_t) ray_join_par_probes = 0;
 
 /* ── #597: null-free key proof ───────────────────────────────────────────
  * ray_vec_is_null is an out-of-line call (no LTO), and the join makes one
@@ -1019,6 +1041,246 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
 }
 
 #define JOIN_MORSEL 8192
+_Static_assert(RAY_JOIN_PAR_MIN_DEFAULT == JOIN_MORSEL + 1,
+               "the default probe floor must keep the one-morsel split rule");
+
+/* ── #595: right-side key bitmap prefilter ────────────────────────────────
+ * One bitmap per chosen key column, over the right side's values of that
+ * column.  A left row whose value's bit is clear in ANY chosen bitmap
+ * cannot equal any right row on that column, so it cannot match, and the
+ * probe skips it before hash_row_keys (an inner join drops it, a left join
+ * emits it unmatched — exactly what the full probe would have produced).
+ *
+ * The value space is the one join_keys_eq compares in: read_col_i64 for
+ * the integer family, raw SYM ids when both sides share a domain, runtime
+ * ids when they do not.  Negative values (integer null sentinels, an
+ * untranslatable SYM id) are never rejected; they take the full probe, so
+ * null == null holds with no special case.  The SYM null is id 0 in every
+ * domain and is kept as 0 by the translation, so a left null passes iff
+ * the right side holds one.  Rejecting is the only thing the filter does,
+ * and it rejects only values no right row holds.
+ *
+ * Bits cover [base, base + span] where base is the smallest non-negative
+ * right value; a value below base wraps to a huge offset and is rejected
+ * by the same range test as one above. */
+#define JOIN_PF_MAX_CAND  8         /* key columns given a bitmap */
+#define JOIN_PF_MAX_COLS  4         /* key columns tested per row */
+#define JOIN_PF_SAMPLE    1024      /* left rows sampled to choose them */
+#define JOIN_PF_MAX_SPAN  ((int64_t)1 << 24)
+
+typedef struct {
+    const void*    data;     /* left key payload (slice-resolved) */
+    const int64_t* lut;      /* left SYM domain -> runtime id, NULL = raw */
+    int64_t        lut_n;
+    uint64_t*      bits;
+    int64_t        base;
+    uint64_t       span;
+    uint8_t        kind;     /* JOIN_PF_K_*: cell width and signedness */
+    ray_t*         bits_hdr;
+} join_pf_col_t;
+
+enum { JOIN_PF_K_U8, JOIN_PF_K_U16, JOIN_PF_K_U32, JOIN_PF_K_I16,
+       JOIN_PF_K_I32, JOIN_PF_K_I64 };
+
+/* read_col_i64's answer for the filter's types, decided once per column
+ * instead of through its type-then-width switch on every row. */
+static uint8_t join_pf_kind(const ray_t* v) {
+    if (v->type == RAY_SYM) {
+        switch (v->attrs & RAY_SYM_W_MASK) {
+        case RAY_SYM_W8:  return JOIN_PF_K_U8;
+        case RAY_SYM_W16: return JOIN_PF_K_U16;
+        case RAY_SYM_W32: return JOIN_PF_K_U32;
+        default:          return JOIN_PF_K_I64;
+        }
+    }
+    switch (v->type) {
+    case RAY_BOOL: case RAY_U8: return JOIN_PF_K_U8;
+    case RAY_I16:               return JOIN_PF_K_I16;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return JOIN_PF_K_I32;
+    default:                    return JOIN_PF_K_I64;
+    }
+}
+
+static inline int64_t join_pf_read(const void* d, int64_t row, uint8_t kind) {
+    switch (kind) {
+    case JOIN_PF_K_U8:  return ((const uint8_t*)d)[row];
+    case JOIN_PF_K_U16: return ((const uint16_t*)d)[row];
+    case JOIN_PF_K_U32: return ((const uint32_t*)d)[row];
+    case JOIN_PF_K_I16: return ((const int16_t*)d)[row];
+    case JOIN_PF_K_I32: return ((const int32_t*)d)[row];
+    default:            return ((const int64_t*)d)[row];
+    }
+}
+
+static bool join_pf_int_type(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+    case RAY_SYM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* SYM id in the filter's value space: raw (lut NULL) or runtime. */
+static inline int64_t join_pf_xlat(int64_t v, const int64_t* lut, int64_t lut_n) {
+    if (!lut || v == 0) return v;
+    return (v > 0 && v < lut_n) ? lut[v] : -1;
+}
+
+static inline bool join_pf_pass(const join_pf_col_t* p, int64_t row) {
+    int64_t v = join_pf_read(p->data, row, p->kind);
+    if (RAY_UNLIKELY(p->lut != NULL)) v = join_pf_xlat(v, p->lut, p->lut_n);
+    if (v < 0) return true;
+    uint64_t off = (uint64_t)v - (uint64_t)p->base;
+    return off <= p->span && RAY_SEL_BIT_TEST(p->bits, off);
+}
+
+static inline bool join_pf_reject(const join_pf_col_t* pf, uint32_t n_pf, int64_t row) {
+    for (uint32_t j = 0; j < n_pf; j++)
+        if (!join_pf_pass(&pf[j], row)) return true;
+    return false;
+}
+
+/* One plain 8-byte column (I64 family, or a W64 SYM compared raw) is the
+ * common single-key shape.  Its probe variant keeps the column in scalar
+ * locals: the general path reloads every descriptor field per row, because
+ * the out-of-line hash/compare calls in the same loop may clobber memory. */
+static bool join_pf_single64(const join_pf_col_t* pf, uint32_t n_pf) {
+    return n_pf == 1 && pf[0].kind == JOIN_PF_K_I64 && !pf[0].lut;
+}
+
+/* join_pf_pass negated, for that column. */
+static inline bool join_pf_miss64(int64_t v, uint64_t base, uint64_t span,
+                                  const uint64_t* bits) {
+    uint64_t off = (uint64_t)v - base;
+    return v >= 0 && (off > span || !RAY_SEL_BIT_TEST(bits, off));
+}
+
+/* Row test in the probe loops; single64 is a compile-time constant there. */
+#define JOIN_PF_REJECT(l)                                                      \
+    (single64 ? join_pf_miss64(d64[(l)], base64, span64, bits64)             \
+              : (n_pf && join_pf_reject(pf, n_pf, (l))))
+
+/* Bitmap of the right column's values.  Returns false (no bitmap) when the
+ * pair is outside the filter's value space or the span is too wide. */
+static bool join_pf_build_col(join_pf_col_t* p, ray_t* lc, ray_t* rc,
+                              int64_t left_rows, int64_t right_rows) {
+    if (!lc || !rc || ray_is_atom(lc) || ray_is_atom(rc)) return false;
+    if (!join_pf_int_type(lc->type) || !join_pf_int_type(rc->type)) return false;
+    /* join_keys_eq compares a SYM against a non-SYM as raw integers; that
+     * pairing is not worth a filter, leave it to the probe. */
+    if ((lc->type == RAY_SYM) != (rc->type == RAY_SYM)) return false;
+
+    const int64_t* llut = NULL; int64_t llut_n = 0;
+    const int64_t* rlut = NULL; int64_t rlut_n = 0;
+    if (lc->type == RAY_SYM) {
+        struct ray_sym_domain_s* ld = ray_sym_vec_domain(lc);
+        struct ray_sym_domain_s* rd = ray_sym_vec_domain(rc);
+        if (ld != rd) {
+            /* LUTs were built by join_warm_sym_luts; NULL = runtime domain. */
+            if (ld != ray_sym_runtime_domain()) {
+                llut = ray_sym_domain_runtime_lut(ld);
+                llut_n = ray_sym_domain_count(ld);
+                if (!llut) return false;
+            }
+            if (rd != ray_sym_runtime_domain()) {
+                rlut = ray_sym_domain_runtime_lut(rd);
+                rlut_n = ray_sym_domain_count(rd);
+                if (!rlut) return false;
+            }
+        }
+    }
+
+    const void* rdata = ray_data(rc);
+    int8_t rt = rc->type; uint8_t ra = rc->attrs;
+    int64_t lo = INT64_MAX, hi = -1;
+    for (int64_t i = 0; i < right_rows; i++) {
+        int64_t v = read_col_i64(rdata, i, rt, ra);
+        if (rt == RAY_SYM) v = join_pf_xlat(v, rlut, rlut_n);
+        if (v < 0) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (hi < 0) lo = hi = 0;               /* no right value: reject all >= 0 */
+    if (hi - lo >= JOIN_PF_MAX_SPAN) return false;
+    uint64_t span = (uint64_t)(hi - lo);
+    /* Never zero more bitmap than there are left rows to test. */
+    if ((int64_t)(span >> 6) > left_rows) return false;
+
+    uint64_t* bits = (uint64_t*)scratch_calloc(&p->bits_hdr,
+                                               ((size_t)(span >> 6) + 1) * sizeof(uint64_t));
+    if (!bits) return false;
+    for (int64_t i = 0; i < right_rows; i++) {
+        int64_t v = read_col_i64(rdata, i, rt, ra);
+        if (rt == RAY_SYM) v = join_pf_xlat(v, rlut, rlut_n);
+        if (v < 0) continue;
+        RAY_SEL_BIT_SET(bits, (uint64_t)(v - lo));
+    }
+    p->data = ray_data(lc);
+    p->lut = llut; p->lut_n = llut_n;
+    p->bits = bits; p->base = lo; p->span = span;
+    p->kind = join_pf_kind(lc);
+    return true;
+}
+
+/* Build candidate bitmaps, then keep the ones that earn their bit test on a
+ * stratified sample of left rows: greedily the column rejecting the most
+ * sampled rows still alive, while it rejects at least 1/8 of them.  A
+ * filter that would pass nearly every row (a join where most left rows
+ * match) is dropped entirely — its per-row test would be pure overhead.
+ * Returns the number of chosen columns, compacted to pf[0..n). */
+static uint32_t join_pf_choose(join_pf_col_t* pf, ray_t** l_key_vecs, ray_t** r_key_vecs,
+                               uint32_t n_keys, int64_t left_rows, int64_t right_rows) {
+    uint32_t n_cand = 0;
+    for (uint32_t k = 0; k < n_keys && n_cand < JOIN_PF_MAX_CAND; k++) {
+        memset(&pf[n_cand], 0, sizeof pf[n_cand]);
+        if (join_pf_build_col(&pf[n_cand], l_key_vecs[k], r_key_vecs[k],
+                              left_rows, right_rows))
+            n_cand++;
+        else if (pf[n_cand].bits_hdr)
+            scratch_free(pf[n_cand].bits_hdr);
+    }
+    if (!n_cand) return 0;
+
+    /* One row from each of n_s equal strata, at a hashed offset inside it:
+     * a plain stride aliases with periodic data (every sampled row landing
+     * on the same key) and misjudges the filter. */
+    int64_t n_s = left_rows < JOIN_PF_SAMPLE ? left_rows : JOIN_PF_SAMPLE;
+    int64_t stride = n_s ? left_rows / n_s : 1;
+    uint32_t srow[JOIN_PF_SAMPLE];
+    for (int64_t s = 0; s < n_s; s++)
+        srow[s] = (uint32_t)(s * stride +
+                             (int64_t)(ray_hash_i64(s) % (uint64_t)stride));
+    uint8_t alive[JOIN_PF_SAMPLE];
+    memset(alive, 1, (size_t)n_s);
+    int64_t n_alive = n_s;
+
+    uint32_t n_pf = 0;
+    while (n_pf < JOIN_PF_MAX_COLS && n_pf < n_cand) {
+        uint32_t best = UINT32_MAX;
+        int64_t best_alive = n_alive;
+        for (uint32_t c = n_pf; c < n_cand; c++) {
+            int64_t cnt = 0;
+            for (int64_t s = 0; s < n_s; s++)
+                cnt += alive[s] && join_pf_pass(&pf[c], srow[s]);
+            if (cnt < best_alive) { best_alive = cnt; best = c; }
+        }
+        /* Must reject at least 1/8 of what is still alive. */
+        if (best == UINT32_MAX || best_alive * 8 > n_alive * 7) break;
+        join_pf_col_t t = pf[n_pf]; pf[n_pf] = pf[best]; pf[best] = t;
+        for (int64_t s = 0; s < n_s; s++)
+            if (alive[s] && !join_pf_pass(&pf[n_pf], srow[s])) alive[s] = 0;
+        n_alive = best_alive;
+        n_pf++;
+    }
+    for (uint32_t c = n_pf; c < n_cand; c++) {
+        scratch_free(pf[c].bits_hdr);
+        pf[c].bits_hdr = NULL;
+    }
+    return n_pf;
+}
 
 typedef struct {
     _Atomic(uint32_t)* ht_heads;
@@ -1037,14 +1299,14 @@ typedef struct {
     int64_t*     r_idx;
     /* FULL OUTER: track which right rows were matched (NULL if not full) */
     _Atomic(uint8_t)* matched_right;
-    /* S-Join: semijoin filter bitmap (NULL if not applicable) */
-    uint64_t*    sjoin_bits;
-    int64_t      sjoin_key_max;
+    /* #595: key bitmap prefilter, n_pf == 0 when not applicable */
+    const join_pf_col_t* pf;
+    uint32_t     n_pf;
     bool         nullfree;  /* #597: no key column can hold a null */
 } join_probe_ctx_t;
 
 /* Pass 2a: count matches per morsel */
-RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
+RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1052,17 +1314,20 @@ RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int
     int64_t row_end = row_start + JOIN_MORSEL;
     if (row_end > c->left_rows) row_end = c->left_rows;
 
-    /* S-Join: precompute pointer for fast semijoin check */
-    uint64_t* sjbits = c->sjoin_bits;
-    int64_t sjmax = c->sjoin_key_max;
-    int64_t* lk0 = (sjbits && c->n_keys == 1) ? (int64_t*)ray_data(c->l_key_vecs[0]) : NULL;
+    const join_pf_col_t* pf = c->pf;
+    uint32_t n_pf = c->n_pf;
+    const int64_t*  d64    = single64 ? (const int64_t*)pf[0].data : NULL;
+    const uint64_t* bits64 = single64 ? pf[0].bits : NULL;
+    uint64_t base64 = single64 ? (uint64_t)pf[0].base : 0;
+    uint64_t span64 = single64 ? pf[0].span : 0;
 
     int64_t count = 0;
+    int64_t skipped = 0;
     uint32_t ht_mask = c->ht_cap - 1;
     for (int64_t l = row_start; l < row_end; l++) {
-        /* S-Join skip: if left key not in right-side bitmap, skip probe */
-        if (lk0 && lk0[l] >= 0 && lk0[l] <= sjmax &&
-            !RAY_SEL_BIT_TEST(sjbits, lk0[l])) {
+        /* #595: no right row holds this key value, skip the probe */
+        if (JOIN_PF_REJECT(l)) {
+            skipped++;
             if (c->join_type >= 1) count++;  /* LEFT/FULL: emit unmatched */
             continue;
         }
@@ -1083,18 +1348,27 @@ RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int
         if (!matched && c->join_type >= 1) count++;
     }
     c->morsel_counts[tid] = count;
+    if (skipped)
+        atomic_fetch_add_explicit(&ray_join_prefilter_skips, (uint64_t)skipped,
+                                  memory_order_relaxed);
 }
 
 /* Compile both modes from one body; select once per pass, not per row. */
 static void join_count_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_count_rows(raw, wid, start, end, true);
+    join_count_rows(raw, wid, start, end, true, false);
 }
 static void join_count_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_count_rows(raw, wid, start, end, false);
+    join_count_rows(raw, wid, start, end, false, false);
+}
+static void join_count_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, true, true);
+}
+static void join_count_tiny_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, false, true);
 }
 
 /* Pass 2b: fill match pairs using pre-computed offsets */
-RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads) {
+RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
@@ -1106,16 +1380,17 @@ RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int6
     int64_t* restrict li = c->l_idx;
     int64_t* restrict ri = c->r_idx;
 
-    /* S-Join: precompute pointer for fast semijoin check */
-    uint64_t* sjbits = c->sjoin_bits;
-    int64_t sjmax = c->sjoin_key_max;
-    int64_t* lk0 = (sjbits && c->n_keys == 1) ? (int64_t*)ray_data(c->l_key_vecs[0]) : NULL;
+    const join_pf_col_t* pf = c->pf;
+    uint32_t n_pf = c->n_pf;
+    const int64_t*  d64    = single64 ? (const int64_t*)pf[0].data : NULL;
+    const uint64_t* bits64 = single64 ? pf[0].bits : NULL;
+    uint64_t base64 = single64 ? (uint64_t)pf[0].base : 0;
+    uint64_t span64 = single64 ? pf[0].span : 0;
 
     uint32_t ht_mask = c->ht_cap - 1;
     for (int64_t l = row_start; l < row_end; l++) {
-        /* S-Join skip: if left key not in right-side bitmap, skip probe */
-        if (lk0 && lk0[l] >= 0 && lk0[l] <= sjmax &&
-            !RAY_SEL_BIT_TEST(sjbits, lk0[l])) {
+        /* #595: the same test as the count pass, so offsets line up */
+        if (JOIN_PF_REJECT(l)) {
             if (c->join_type >= 1) {
                 li[off] = l;
                 ri[off] = -1;
@@ -1151,10 +1426,16 @@ RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int6
 
 /* Compile both modes from one body; select once per pass, not per row. */
 static void join_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_fill_rows(raw, wid, start, end, true);
+    join_fill_rows(raw, wid, start, end, true, false);
 }
 static void join_fill_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_fill_rows(raw, wid, start, end, false);
+    join_fill_rows(raw, wid, start, end, false, false);
+}
+static void join_fill_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, true, true);
+}
+static void join_fill_tiny_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, false, true);
 }
 
 /* Segment count of a parted table = length of any parted column's segs
@@ -1272,7 +1553,8 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
     ray_t* l_idx_hdr = NULL;
     ray_t* r_idx_hdr = NULL;
     ray_t* matched_right_hdr = NULL;
-    ray_t* sjoin_sel = NULL;
+    join_pf_col_t pf_cols[JOIN_PF_MAX_CAND];
+    uint32_t n_pf = 0;
     ray_t* asp_sel = NULL;
     ray_t* ht_next_hdr = NULL;
     ray_t* ht_heads_hdr = NULL;
@@ -1631,44 +1913,32 @@ chained_ht_fallback:;
     }
     CHECK_CANCEL_GOTO(pool, join_cleanup);
 
-    /* Pass 1.5: S-Join semijoin filter extraction.
-     * Build a RAY_SEL bitmap of all distinct right-side key values that
-     * appear in the hash table. This can be used to skip left-side rows
-     * whose key cannot match any right-side row.
-     *
-     * Applied when: single I64 key, inner join, left side is large enough
-     * to benefit from filtering (> 2x right side). */
-    if (n_keys == 1 && join_type == 0 && l_key_vecs[0] && r_key_vecs[0] &&
-        l_key_vecs[0]->type == RAY_I64 && r_key_vecs[0]->type == RAY_I64 &&
+    /* Pass 1.5 (#595): right-side key bitmap prefilter.  Any key count and
+     * the whole integer/SYM key family, inner and left joins; applied when
+     * the left side is large enough to amortise the bitmaps (> 2x right).
+     * join_pf_choose keeps only bitmaps that reject on a sample of the left
+     * side, so a join where most left rows match pays no per-row test. */
+    if ((join_type == 0 || join_type == 1) && !ray_join_no_prefilter &&
         left_rows > right_rows * 2) {
-        /* Determine key range to size the bitmap */
-        int64_t* rk = (int64_t*)ray_data(r_key_vecs[0]);
-        int64_t key_max = 0;
-        for (int64_t i = 0; i < right_rows; i++)
-            if (rk[i] > key_max) key_max = rk[i];
-
-        if (key_max < (int64_t)1 << 24) {  /* only for reasonably bounded keys */
-            sjoin_sel = ray_sel_new(key_max + 1);
-            if (sjoin_sel && !RAY_IS_ERR(sjoin_sel)) {
-                uint64_t* bits = ray_sel_bits(sjoin_sel);
-                for (int64_t i = 0; i < right_rows; i++) {
-                    int64_t k = rk[i];
-                    if (k >= 0 && k <= key_max)
-                        RAY_SEL_BIT_SET(bits, k);
-                }
-            }
-        }
+        n_pf = join_pf_choose(pf_cols, l_key_vecs, r_key_vecs, n_keys,
+                              left_rows, right_rows);
+        if (n_pf) ray_join_prefilter_builds++;
     }
 
     /* Pass 2: Parallel probe (two-pass: count → prefix-sum → fill) */
     uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
     if (n_tasks == 0) n_tasks = 1;
+    /* #599: below the settable floor the morsels run on this thread.  Same
+     * morsels either way, so the output and its order do not change. */
+    bool par_probe = pool && n_tasks > 1 && left_rows >= ray_join_par_min();
 
     int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
     if (!morsel_counts) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
         scratch_free(key_vecs_hdr);
+        for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
+        if (asp_sel) ray_release(asp_sel);
         return ray_error("oom", NULL);
     }
 
@@ -1677,14 +1947,6 @@ chained_ht_fallback:;
         matched_right = (_Atomic(uint8_t)*)scratch_calloc(&matched_right_hdr,
                                                            (size_t)right_rows);
         if (!matched_right) goto join_cleanup;
-    }
-
-    /* Prepare S-Join fields for probe context */
-    uint64_t* sjoin_bits = NULL;
-    int64_t sjoin_key_max = 0;
-    if (sjoin_sel && !RAY_IS_ERR(sjoin_sel)) {
-        sjoin_bits = ray_sel_bits(sjoin_sel);
-        sjoin_key_max = sjoin_sel->len - 1;
     }
 
     join_probe_ctx_t probe_ctx = {
@@ -1698,19 +1960,23 @@ chained_ht_fallback:;
         .left_rows   = left_rows,
         .morsel_counts = morsel_counts,
         .matched_right = matched_right,
-        .sjoin_bits  = sjoin_bits,
-        .sjoin_key_max = sjoin_key_max,
+        .pf          = pf_cols,
+        .n_pf        = n_pf,
         .nullfree    = keys_nullfree,
     };
 
     /* Minimum heads occupy only 1 KiB: choose no-lookahead callbacks here.
      * Bodies share their implementation; constant modes remove the row-loop
      * capacity decision instead of relying on compiler loop unswitching. */
-    const ray_pool_fn count_probe = ht_cap > JHT_MIN_CAP ? join_count_fn : join_count_tiny_fn;
+    bool pf_s64 = join_pf_single64(pf_cols, n_pf);
+    const ray_pool_fn count_probe = ht_cap > JHT_MIN_CAP
+        ? (pf_s64 ? join_count_s64_fn : join_count_fn)
+        : (pf_s64 ? join_count_tiny_s64_fn : join_count_tiny_fn);
     /* 2a: Count matches per morsel */
-    if (pool && n_tasks > 1)
+    if (par_probe) {
+        atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
         ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
-    else
+    } else
         for (uint32_t t = 0; t < n_tasks; t++)
             count_probe(&probe_ctx, 0, t, t + 1);
 
@@ -1735,10 +2001,13 @@ chained_ht_fallback:;
     probe_ctx.r_idx = r_idx;
 
     if (pair_count > 0) {
-        const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP ? join_fill_fn : join_fill_tiny_fn;
-        if (pool && n_tasks > 1)
+        const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP
+            ? (pf_s64 ? join_fill_s64_fn : join_fill_fn)
+            : (pf_s64 ? join_fill_tiny_s64_fn : join_fill_tiny_fn);
+        if (par_probe) {
+            atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
             ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
-        else
+        } else
             for (uint32_t t = 0; t < n_tasks; t++)
                 fill_probe(&probe_ctx, 0, t, t + 1);
     }
@@ -2041,7 +2310,7 @@ join_cleanup:
     if (counts_hdr) scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
     scratch_free(key_vecs_hdr);
-    if (sjoin_sel) ray_release(sjoin_sel);
+    for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
     if (asp_sel) ray_release(asp_sel);
 
     return result;

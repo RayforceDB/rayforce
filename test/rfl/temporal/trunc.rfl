@@ -1,0 +1,113 @@
+;; `(trunc 'unit x)` floors a DATE, TIME or TIMESTAMP to the start of a
+;; calendar or clock unit, in x's own type: year, quarter, month, week
+;; (Monday-based, as `dow` counts), day, hour, minute, second.  The same
+;; kernel serves `x.month`-style dotted paths and `by:` keys in queries.
+
+;; ── a DATE keeps its type ─────────────────────────────────────────────
+(trunc 'year 2024.05.17) -- 2024.01.01
+(trunc 'quarter 2024.05.17) -- 2024.04.01
+(trunc 'month 2024.05.17) -- 2024.05.01
+(trunc 'day 2024.05.17) -- 2024.05.17
+(type (trunc 'month 2024.05.17)) -- 'date
+(trunc 'quarter 2024.03.31) -- 2024.01.01
+(trunc 'quarter 2024.04.01) -- 2024.04.01
+(trunc 'quarter 2024.12.31) -- 2024.10.01
+
+;; weeks start on Monday: 2024.02.26 is a Monday, 2024.02.25 a Sunday
+(dow 2024.02.26) -- 1
+(trunc 'week 2024.02.26) -- 2024.02.26
+(trunc 'week 2024.05.17) -- 2024.05.13
+(trunc 'week 2024.02.27) -- 2024.02.26
+(trunc 'week 2024.03.03) -- 2024.02.26
+(trunc 'week 2024.03.04) -- 2024.03.04
+;; across a year boundary, and before the epoch (2000.01.01 was a Saturday)
+(trunc 'week 2024.01.01) -- 2024.01.01
+(trunc 'week 2023.01.01) -- 2022.12.26
+(trunc 'week 2000.01.01) -- 1999.12.27
+(trunc 'week 1999.12.31) -- 1999.12.27
+(trunc 'month 1999.12.31) -- 1999.12.01
+(trunc 'year 1999.12.31) -- 1999.01.01
+;; leap day
+(trunc 'month 2024.02.29) -- 2024.02.01
+(trunc 'year 2024.02.29) -- 2024.01.01
+
+;; ── a TIMESTAMP keeps its type ────────────────────────────────────────
+(set ts 2024.02.27D13:45:12.123456789)
+(trunc 'year ts) -- 2024.01.01D00:00:00.000000000
+(trunc 'quarter ts) -- 2024.01.01D00:00:00.000000000
+(trunc 'month ts) -- 2024.02.01D00:00:00.000000000
+(trunc 'week ts) -- 2024.02.26D00:00:00.000000000
+(trunc 'day ts) -- 2024.02.27D00:00:00.000000000
+(trunc 'hour ts) -- 2024.02.27D13:00:00.000000000
+(trunc 'minute ts) -- 2024.02.27D13:45:00.000000000
+(trunc 'second ts) -- 2024.02.27D13:45:12.000000000
+(type (trunc 'month ts)) -- 'timestamp
+;; the last nanosecond of a month stays in it
+(trunc 'month 2024.01.31D23:59:59.999999999) -- 2024.01.01D00:00:00.000000000
+(trunc 'month 2024.02.01D00:00:00.000000000) -- 2024.02.01D00:00:00.000000000
+;; before the epoch the floor goes down, not toward zero
+(trunc 'hour 1999.12.31D23:30:00.000000000) -- 1999.12.31D23:00:00.000000000
+(trunc 'day 1999.12.31D23:30:00.000000000) -- 1999.12.31D00:00:00.000000000
+(trunc 'week 1999.12.31D23:30:00.000000000) -- 1999.12.27D00:00:00.000000000
+
+;; ── a TIME takes the clock units ──────────────────────────────────────
+(trunc 'hour 13:45:12.123) -- 13:00:00.000
+(trunc 'minute 13:45:12.123) -- 13:45:00.000
+(trunc 'second 13:45:12.123) -- 13:45:12.000
+(type (trunc 'hour 13:45:12.123)) -- 'time
+
+;; ── pairings that make no sense are type errors ──────────────────────
+(trunc 'hour 2024.02.27) !- type
+(trunc 'second 2024.02.27) !- type
+(trunc 'month 13:45:12.123) !- type
+(trunc 'day 13:45:12.123) !- type
+(trunc 'month 5) !- type
+(trunc 'month "2024.02.27") !- type
+(trunc 'fortnight 2024.02.27) !- domain
+(trunc "month" 2024.02.27) !- type
+(trunc 5 2024.02.27) !- type
+
+;; ── nulls ─────────────────────────────────────────────────────────────
+(trunc 'month 0Nd) -- 0Nd
+(type (trunc 'month 0Nd)) -- 'date
+(trunc 'month 0Np) -- 0Np
+(trunc 'hour 0Nt) -- 0Nt
+
+;; ── vectors keep their type and their nulls ──────────────────────────
+(trunc 'month [2024.02.27 1999.12.31 0Nd]) -- [2024.02.01 1999.12.01 0Nd]
+(type (trunc 'month [2024.02.27 1999.12.31 0Nd])) -- 'DATE
+(trunc 'week [2024.02.27 1999.12.31 0Nd]) -- [2024.02.26 1999.12.27 0Nd]
+(set tv (as 'TIMESTAMP [763828051000000000 0N -1800000000000]))
+(type (trunc 'day tv)) -- 'TIMESTAMP
+(at (trunc 'day tv) 1) -- 0Np
+(count (trunc 'day tv)) -- 3
+(set tt (as 'TIME [3723000 0N 86399999]))
+(trunc 'hour tt) -- [01:00:00.000 0Nt 23:00:00.000]
+(type (trunc 'hour tt)) -- 'TIME
+
+;; a slice truncates the slice
+(trunc 'month (take [2024.02.27 2024.03.15 2024.04.02] 2)) -- [2024.02.01 2024.03.01]
+
+;; ── the edge of the range ────────────────────────────────────────────
+;; the low day boundary of a TIMESTAMP round-trips; a period that starts
+;; before it is null, not a wrapped value
+(trunc 'day 1707.09.23D00:00:00.000000000) -- 1707.09.23D00:00:00.000000000
+(trunc 'month 1707.09.23D00:00:00.000000000) -- 0Np
+(trunc 'year 2292.01.01D00:00:00.000000000) -- 2292.01.01D00:00:00.000000000
+
+;; ── a query: by: keys, projections, dotted paths ─────────────────────
+(set Q (table [ts p] (list (as 'TIMESTAMP [757382400000000000 759974399999999999 759974400000000000 762652800000000000]) [1 2 3 4])))
+;; 2024.01.01, 2024.01.30D23:59:59.999999999, 2024.01.31, 2024.03.02: January three times, March once
+(count (select {from: Q by: {m: (trunc 'month ts)} n: (count p)})) -- 2
+(at (select {from: Q by: {m: (trunc 'month ts)} n: (count p) asc: m}) 'n) -- [3 1]
+(type (at (select {from: Q m: (trunc 'month ts)}) 'm)) -- 'TIMESTAMP
+(at (select {from: Q m: ts.month}) 'm) -- (trunc 'month (at Q 'ts))
+(at (select {from: Q w: ts.week}) 'w) -- (trunc 'week (at Q 'ts))
+(at (select {from: Q q: ts.quarter}) 'q) -- (trunc 'quarter (at Q 'ts))
+(set QD (table [d p] (list [2024.01.01 2024.01.31 2024.02.01] [1 2 3])))
+(type (at (select {from: QD m: d.month}) 'm)) -- 'DATE
+(at (select {from: QD m: d.month}) 'm) -- [2024.01.01 2024.01.01 2024.02.01]
+(at (select {from: QD m: (trunc 'month d)}) 'm) -- [2024.01.01 2024.01.01 2024.02.01]
+(at (select {from: QD by: {m: d.month} n: (count p) asc: m}) 'n) -- [2 1]
+;; a pairing the column's type does not allow is the type error
+(select {from: QD h: (trunc 'hour d)}) !- type

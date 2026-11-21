@@ -35,6 +35,7 @@
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
+#include "lang/callprof.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -4785,6 +4786,39 @@ static test_result_t test_eval_select_parted_stats_impl(const char* root) {
         TEST_ASSERT_EQ_U(parts1 - parts0, cases[i].pruned);
     }
 
+    /* A name bound to a constant prunes as the constant written out does:
+     * a global, a `let`, a lambda's argument; an atom anywhere, a typed
+     * vector as the set of an `in`.  A name beside a literal conjunct does
+     * not cost that conjunct its pruning.  A vector compared by position
+     * is no constant: nothing is pruned, the rows still line up. */
+    struct { const char* src; const char* want; uint64_t pruned; } bound[] = {
+        { "(do (set lo 2024.01.16D12:00:00.000) (at (select {from: p where: (>= Time lo)}) 'v))", "[5 6]", 1 },
+        { "(do (let hi 2024.01.15D20:00:00.000) (at (select {from: p where: (<= Time hi)}) 'v))", "[1 2 4]", 1 },
+        { "((fn [t] (at (select {from: p where: (> Time t)}) 'v)) 2024.01.17D00:30:00.000)", "[6]", 2 },
+        { "(do (set ts [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000]) (at (select {from: p where: (in Time ts)}) 'v))", "[2 6]", 1 },
+        { "(do (let vs [6 1]) (at (select {from: p where: (and (> Time 2024.01.17D00:30:00.000) (in v vs))}) 'v))", "[6]", 2 },
+        { "(do (let d 2024.01.17) (at (select {from: p where: (== date d)}) 'v))", "[6]", 2 },
+        { "(do (let d 2024.01.16) (let vs [3 5 6]) (at (select {from: p where: (and (>= date d) (in v vs))}) 'v))", "[3 5 6]", 1 },
+        { "(do (set vv [1 0 3 0 5 6]) (at (select {from: p where: (and (> Time 2024.01.15D12:00:00.000) (== v vv))}) 'v))", "[3 5 6]", 0 },
+    };
+    for (size_t i = 0; i < sizeof bound / sizeof bound[0]; i++) {
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        ray_t* r = ray_eval_str(bound[i].src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_t* want = ray_eval_str(bound[i].want);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_EQ_I(r->len, want->len);
+        for (int64_t k = 0; k < r->len; k++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[k], ((int64_t*)ray_data(want))[k]);
+        ray_release(r);
+        ray_release(want);
+        ray_query_test_part_prune(&runs1, &parts1);
+        TEST_ASSERT_EQ_U(runs1 - runs0, bound[i].pruned ? 1 : 0);
+        TEST_ASSERT_EQ_U(parts1 - parts0, bound[i].pruned);
+    }
+
     /* The same answers as the plain scan: the count fast path and a sum. */
     ray_t* r = ray_eval_str("(count (select {from: p where: (< Time 2024.01.15D12:00:00.000)}))");
     TEST_ASSERT_NOT_NULL(r);
@@ -6930,6 +6964,29 @@ static test_result_t test_dotted_del_nested(void) {
     PASS();
 }
 
+/* (del t 'col) reads as dropping a column.  del unbinds names only, so a
+ * surplus argument must be refused rather than silently discarded: the old
+ * behaviour unbound `t` and ignored 'col, and the caller saw success. */
+static test_result_t test_del_rejects_surplus_args(void) {
+    ray_eval_str("(set __dela (table [a b] (list [1 2] [10 20])))");
+
+    ASSERT_ER_CODE("(del __dela 'b)", "arity");
+    ASSERT_ER_CODE("(del __dela 'b 'c)", "arity");
+    ASSERT_ER_CODE("(del)", "arity");
+
+    /* The half-applied case is the one to guard: the binding must survive a
+     * refused call, so a caller that meant "drop a column" gets an error
+     * instead of a silently unbound table. */
+    ASSERT_EQ("(count __dela)", "2");
+
+    /* One argument still unbinds, and returns 0. */
+    ASSERT_EQ("(del __dela)", "0");
+    ray_t* gone = ray_eval_str("__dela");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(gone));
+    ray_error_free(gone);
+    PASS();
+}
+
 static test_result_t test_dotted_del_cascade(void) {
     /* Deleting the only key in a namespace removes the namespace itself. */
     ray_eval_str("(set __cascns.only 5)");
@@ -7158,14 +7215,14 @@ static test_result_t test_dotted_temporal_atom(void) {
 }
 
 static test_result_t test_dotted_temporal_truncate_atom(void) {
-    /* `.date` / `.time` truncate a temporal value to day / second
-     * boundary, returning RAY_TIMESTAMP.  Atom path: 90,000,000,000,000
-     * ns = 1 day + 1 hour; truncating to day gives exactly 1 day =
-     * 86,400 s * 1e9 ns = 86,400,000,000,000; truncating to second
-     * leaves the value unchanged (no sub-second remainder here). */
+    /* `.date` / `.time` answer the DATE / TIME of a TIMESTAMP.  Atom path:
+     * 90,000,000,000,000 ns = 1 day + 1 hour: day 1 since 2000.01.01, and
+     * 3,600,000 ms into the day. */
     ray_eval_str("(set __tsa (as 'TIMESTAMP 90000000000000))");
-    ASSERT_EQ("(as 'I64 __tsa.date)", "86400000000000");
-    ASSERT_EQ("(as 'I64 __tsa.time)", "90000000000000");
+    ASSERT_EQ("(type __tsa.date)", "'date");
+    ASSERT_EQ("(type __tsa.time)", "'time");
+    ASSERT_EQ("(as 'I64 __tsa.date)", "1");
+    ASSERT_EQ("(as 'I64 __tsa.time)", "3600000");
     PASS();
 }
 
@@ -7318,11 +7375,10 @@ static test_result_t test_select_by_xbar_empty_type(void) {
     ASSERT_EQ("(count (select {from: __xe by: (xbar Ts 10000)}))", "0");
     ASSERT_EQ("(type (at (select {from: __xe by: (xbar Ts 10000)}) 'Ts))", "'TIME");
 
-    /* Unary path: dotted `.date` truncate should produce TIMESTAMP on
-     * an empty TIMESTAMP column, not I64 (the tail accessor `.date`
-     * returns TIMESTAMP per ray_temporal_truncate). */
+    /* Unary path: dotted `.date` should produce DATE on an empty
+     * TIMESTAMP column, not I64. */
     ray_eval_str("(set __xe2 (table [Timestamp] (list (as 'TIMESTAMP []))))");
-    ASSERT_EQ("(type (at (select {from: __xe2 by: Timestamp.date}) 'date))", "'TIMESTAMP");
+    ASSERT_EQ("(type (at (select {from: __xe2 by: Timestamp.date}) 'date))", "'DATE");
     PASS();
 }
 
@@ -7406,9 +7462,8 @@ static test_result_t test_dag_temporal_extract_nulls(void) {
     /* Null row must surface as 0Nl, not 0 — this is the regression. */
     ASSERT_EQ("(at (at (select {from: __dvt s: Ts.ss}) 's) 1)", "0Nl");
 
-    /* OP_DATE_TRUNC path: `.date` truncates to day boundary and emits
-     * a TIMESTAMP column.  Null row must stay 0Np. */
-    ASSERT_EQ("(at (at (select {from: __dvt s: Ts.date}) 's) 1)", "0Np");
+    /* `.date` emits a DATE column.  Null row must stay 0Nd. */
+    ASSERT_EQ("(at (at (select {from: __dvt s: Ts.date}) 's) 1)", "0Nd");
     PASS();
 }
 
@@ -12314,20 +12369,20 @@ static test_result_t test_temporal_clock_global(void) {
  * with RAY_DATE and RAY_TIME types (not just RAY_TIMESTAMP).
  * Also exercises ray_temporal_trunc_from_sym "time" branch via (time ts). */
 static test_result_t test_temporal_truncate_date_time_atoms(void) {
-    /* DATE atom truncated to day (date path) — already midnight so unchanged */
+    /* DATE atom: a DATE is its own date */
     ray_eval_str("(set __trd (as 'DATE 10))");
     ray_t* r1 = ray_eval_str("(date __trd)");
     TEST_ASSERT_NOT_NULL(r1);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
-    TEST_ASSERT_EQ_I(r1->type, -RAY_TIMESTAMP);
+    TEST_ASSERT_EQ_I(r1->type, -RAY_DATE);
     ray_release(r1);
 
-    /* TIME atom truncated to second boundary via (time t) */
+    /* TIME atom: a TIME is its own time of day */
     ray_eval_str("(set __trt (as 'TIME 3661500))");
     ray_t* r2 = ray_eval_str("(time __trt)");
     TEST_ASSERT_NOT_NULL(r2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
-    TEST_ASSERT_EQ_I(r2->type, -RAY_TIMESTAMP);
+    TEST_ASSERT_EQ_I(r2->type, -RAY_TIME);
     ray_release(r2);
 
     /* Null DATE atom — null output */
@@ -12378,10 +12433,9 @@ static test_result_t test_temporal_date_trunc_subday(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     ray_release(r1);
 
-    /* Verify truncation: 3661000000000 ns = 1h1m1s, .time should give
-     * timestamp at 1h1m1s mark, i.e. 3661 * 1e9 ns */
+    /* 3661000000000 ns = 1h1m1s, .time gives the TIME 3661000 ms */
     ASSERT_EQ("(as 'I64 (at (at (select {from: __dts_col s: Ts.time}) 's) 0))",
-              "3661000000000");
+              "3661000");
     PASS();
 }
 
@@ -12968,7 +13022,212 @@ static test_result_t test_dotted_local_read_slot(void) {
     PASS();
 }
 
+/* ---- Call profiler: every timed call closes its frame ---- */
+/* An error leaves a timed call by its normal return (the VM and the tree
+ * walker test for errors after the callee returns), so the frame stack is
+ * empty after each top-level expression, whatever failed inside it: a
+ * builtin's error in compiled code, caught or not, one inside a lambda run
+ * by map, one at top level, and a call that switched profiling off or
+ * reset it while frames were open. */
+static test_result_t test_callprof_error_unwinds(void) {
+    static const char* const setup[] = {
+        "(set pe-bad (fn [x] (+ x 'a)))",
+        "(set pe-map (fn [v] (map (fn [y] (+ y 'a)) v)))",
+        "(set pe-try (fn [x] (try (pe-bad x) 0)))",
+        "(set pe-deep (fn [x] (sum (map pe-try (til x)))))",
+        "(set pe-off (fn [] (.sys.profile.enable 0) (+ 1 2)))",
+        "(set pe-reset (fn [] (.sys.profile.reset) (map (fn [y] (+ y 1)) [1 2])))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    static const struct { const char* src; bool err; } runs[] = {
+        { "(pe-bad 1)",          true  },
+        { "(pe-map [1 2])",      true  },
+        { "(map pe-bad [1 2])",  true  },
+        { "(pe-try 1)",          false },
+        { "(pe-deep 4)",         false },
+        { "(+ 1 'a)",            true  },
+        { "(raise 'boom)",       true  },
+        { "(pe-reset)",          false },
+        { "(pe-off)",            false },
+    };
+    for (size_t i = 0; i < sizeof runs / sizeof *runs; i++) {
+        ray_callprof_set_enabled(true);
+        TEST_ASSERT_TRUE(ray_callprof_on());
+        ray_t* r = ray_eval_str(runs[i].src);
+        TEST_ASSERT_EQ_I(RAY_IS_ERR(r) ? 1 : 0, runs[i].err ? 1 : 0);
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    }
+    /* An erroring call is still counted at its site: from scratch, pe-deep
+     * reaches pe-bad's `+` once per element, each error caught by pe-try. */
+    ray_callprof_set_enabled(false);
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    ray_t* r = ray_eval_str("(pe-deep 4)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+    r = ray_eval_str("(sum (at (select {from: (.sys.profile) where: (== fn 'pe-bad)}) 'calls))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 4);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    PASS();
+}
+
+/* Rows of (.sys.profile), and the calls of the rows named `fn`. */
+static int64_t cp_rows(void) {
+    ray_t* r = ray_eval_str("(count (.sys.profile))");
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+static int64_t cp_calls(const char* fn) {
+    char q[256];
+    snprintf(q, sizeof q, "(sum (at (select {from: (.sys.profile) where: (== fn '%s)}) 'calls))", fn);
+    ray_t* r = ray_eval_str(q);
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+/* Every text request is a fresh parse.  Top-level sites are source
+ * positions, so repeats aggregate into the rows they had, the cap stays
+ * free for the sites that follow, and no request's parse tree outlives it. */
+static test_result_t test_callprof_repeated_requests(void) {
+    static const char* const setup[] = {
+        "(set rq-work (fn [x] (+ x 1)))",
+        "(set rq-later (fn [x] (* x 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    int64_t n = RAY_CALLPROF_SITES_MAX + 200;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* r = ray_eval_str("(rq-work 10)");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    /* A large literal per request: kept by nothing once it has run. */
+    char big[8192];
+    int len = snprintf(big, sizeof big, "(count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(big + len, sizeof big - (size_t)len, "%d ", i);
+    snprintf(big + len, sizeof big - (size_t)len, "])");
+    ray_t* r = ray_eval_str(big);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_mem_stats_t ms;
+    ray_mem_stats(&ms);
+    size_t mem0 = ms.bytes_allocated;
+    for (int i = 0; i < 300; i++) {
+        r = ray_eval_str(big);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 1000);
+        ray_release(r);
+    }
+    ray_mem_stats(&ms);
+    TEST_ASSERT_TRUE(ms.bytes_allocated < mem0 + 64 * 1024);
+    /* A lambda written in the request is compiled anew each time: its
+     * calls are one site all the same, and the profile pins none of its
+     * code.  (Requests that make lambdas retain some memory profiled or
+     * not: the bound is on what profiling adds.) */
+    char lam[8192];
+    len = snprintf(lam, sizeof lam, "((fn [] (count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(lam + len, sizeof lam - (size_t)len, "%d ", i);
+    snprintf(lam + len, sizeof lam - (size_t)len, "])))");
+    int64_t grow[2];
+    for (int on = 0; on < 2; on++) {
+        ray_callprof_set_enabled(on);
+        ray_mem_stats(&ms);
+        mem0 = ms.bytes_allocated;
+        for (int i = 0; i < 1000; i++) {
+            r = ray_eval_str(lam);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->i64, 1000);
+            ray_release(r);
+        }
+        ray_mem_stats(&ms);
+        grow[on] = (int64_t)ms.bytes_allocated - (int64_t)mem0;
+    }
+    TEST_ASSERT_TRUE(grow[1] < grow[0] + 512 * 1024);
+    r = ray_eval_str("(rq-later 5)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+
+    /* One row per callee at top level, every call counted: the requests'
+     * outermost calls share line 1 of `repl`, the callee tells them apart.
+     * The lambda requests' head is no name: one `<top>` row by their text,
+     * and one for the `fn` form inside.  rq-work's `+`, rq-later's `*` and
+     * the request lambda's `count` keep rows of their own; nothing folds
+     * into `<other>`. */
+    TEST_ASSERT_EQ_I(cp_rows(), 8);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("<top>count"), 301);
+    TEST_ASSERT_EQ_I(cp_calls("<top>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>fn"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<lambda@1>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<other>"), 0);
+    ray_callprof_reset();
+    PASS();
+}
+
+/* REPL lines and IPC requests are separate parses, each from line 1 column
+ * 1 of `repl`: different calls there are different rows, and so are
+ * lambdas defined on different lines at the same column. */
+static test_result_t test_callprof_repl_calls(void) {
+    static const char* const setup[] = {
+        "(set work (fn [n] (+ n 1)))",
+        "(set later (fn [n] (* n 2)))",
+        "(set wa (fn [n] (+ n 1)))",
+        "(set wb (fn [n] (* n 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    static const char* const lines[] = {
+        "(work 10)", "(work 10)", "(later 5)", "(neg 3)", "(wa 1)", "(wa 2)", "(wb 3)",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) {
+        ray_t* r = ray_eval_str(lines[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_set_enabled(false);
+    TEST_ASSERT_EQ_I(cp_rows(), 9);
+    TEST_ASSERT_EQ_I(cp_calls("<top>work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>neg"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wb"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("wb"), 1);
+    ray_callprof_reset();
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
+    { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
+    { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
@@ -13184,6 +13443,7 @@ const test_entry_t lang_entries[] = {
     { "lang/dotted/flat_binding_wins", test_dotted_flat_binding_wins, lang_setup, lang_teardown },
     { "lang/dotted/del_removes_key", test_dotted_del_removes_key, lang_setup, lang_teardown },
     { "lang/dotted/del_nested", test_dotted_del_nested, lang_setup, lang_teardown },
+    { "lang/dotted/del_rejects_surplus_args", test_del_rejects_surplus_args, lang_setup, lang_teardown },
     { "lang/dotted/del_cascade", test_dotted_del_cascade, lang_setup, lang_teardown },
     { "lang/dotted/table_column", test_dotted_table_column, lang_setup, lang_teardown },
     { "lang/dotted/temporal_atom", test_dotted_temporal_atom, lang_setup, lang_teardown },

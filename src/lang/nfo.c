@@ -88,7 +88,11 @@ ray_span_t ray_nfo_get(ray_t* nfo, ray_t* node) {
     int64_t* kdata = (int64_t*)ray_data(keys);
     int64_t* vdata = (int64_t*)ray_data(vals);
 
-    for (int64_t i = 0; i < n; i++) {
+    /* Newest first: the parser frees some nodes it recorded (a lambda's
+     * parameter vector, for one), and a node allocated later at the same
+     * address is recorded after them.  Only the newest record can name
+     * the live node; the first match named the freed one's span. */
+    for (int64_t i = n - 1; i >= 0; i--) {
         if (kdata[i] == needle) {
             ray_span_t span;
             span.id = vdata[i];

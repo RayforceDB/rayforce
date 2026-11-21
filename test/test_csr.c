@@ -3820,7 +3820,11 @@ static test_result_t test_csr_parallel_cancel(void) {
     ray_csr_par_min_edges = saved;
     ray_release(tbl);
 
-    TEST_ASSERT(r == NULL, "a cancelled parallel build returns no relation");
+    bool cancelled = (r == NULL);
+    ray_rel_free(r);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    TEST_ASSERT(cancelled, "a cancelled parallel build returns no relation");
     PASS();
 }
 

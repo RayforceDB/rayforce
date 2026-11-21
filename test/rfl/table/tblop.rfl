@@ -228,6 +228,16 @@ Lr -- (list 1 2 3)
 ;; Arity guard.  `del` is a special form, but a 0-arg call still fails arity.
 (del) !- arity
 
+;; Surplus arguments are refused: `(del t 'col)` reads as dropping a column,
+;; so it must not half-apply.  The binding has to survive the refusal.
+(set tblop_tmp_tbl (table [a b] (list [1 2] [10 20])))
+(del tblop_tmp_tbl 'b) !- arity
+(count tblop_tmp_tbl) -- 2
+(del tblop_tmp_tbl 'b 'c) !- arity
+(count tblop_tmp_tbl) -- 2
+(del tblop_tmp_tbl) -- 0
+tblop_tmp_tbl !- name
+
 ;; Type guard — args[0] must be a sym (special-form: the literal token).
 ;; A bare integer literal isn't a symbol.
 (del 42) !- type

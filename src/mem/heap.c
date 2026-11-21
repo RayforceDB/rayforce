@@ -1749,14 +1749,14 @@ static void direct_cache_release(ray_direct_cache_node_t* node) {
 
 /* Best fitting cached block within the existing waste bound. Exact matches
  * stop the search; similar-sized analytical scratch is the common case. */
-static void* direct_cache_take(size_t need, size_t* out_size, bool* out_locked) {
+static void* direct_cache_take(size_t need, size_t maximum, size_t* out_size, bool* out_locked) {
     direct_cache_lock();
     size_t slack = need / 4;
     if (slack < (2u << 20)) slack = (2u << 20);
     ray_direct_cache_node_t* best = NULL;
     for (ray_direct_cache_node_t* node = g_direct_cache_head; node; node = node->next) {
         size_t bytes = node->map_size;
-        if (bytes >= need && bytes - need <= slack && (!best || bytes < best->map_size)) {
+        if (bytes >= need && bytes <= maximum && bytes - need <= slack && (!best || bytes < best->map_size)) {
             best = node;
             if (bytes == need) break;
         }
@@ -1865,7 +1865,7 @@ static int64_t direct_cache_bytes(void) {
 
 /* Direct large allocation: mmap the exact page-rounded size instead of a
  * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
-static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
+static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cache) {
     if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return NULL;
     size_t map_size = (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095;
 
@@ -1879,7 +1879,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     size_t cached_size = 0;
     bool locked = false;
     bool fresh = true;
-    base = direct_cache_take(map_size, &cached_size, &locked);
+    base = direct_cache_take(map_size, exact_cache ? map_size : SIZE_MAX, &cached_size, &locked);
     if (base) {
         map_size = cached_size;
         fresh = false;
@@ -1951,6 +1951,33 @@ static bool alloc_fails_for_test(void) {
     return true;
 }
 #endif
+bool ray_alloc_charge(size_t data_size, size_t* charge) {
+    if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return false;
+    uint8_t order = ray_order_for_size(data_size);
+    *charge = order >= RAY_HEAP_POOL_ORDER
+        ? (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095
+        : BSIZEOF(order);
+    return true;
+}
+
+ray_t* ray_alloc_admitted(size_t data_size, size_t limit, size_t* charge) {
+    size_t bytes;
+    if (!ray_alloc_charge(data_size, &bytes) || bytes > limit) return NULL;
+    ray_t* value;
+    if (ray_order_for_size(data_size) < RAY_HEAP_POOL_ORDER) {
+        value = ray_alloc(data_size);
+    } else {
+        /* No buddy fallback: its different charge was not admitted. */
+        ray_heap_t* h = ray_tl_heap;
+        if (!h) { ray_heap_init(); h = ray_tl_heap; }
+        if (!h) return NULL;
+        value = heap_alloc_direct(h, data_size, true);
+        if (value) mem_trace_note_alloc(bytes);
+    }
+    if (value) *charge = bytes;
+    return value;
+}
+
 
 /* Test hook (ray_heap_test_scribble): fresh blocks filled with 0xA5.
  * Test/debug objects only: a release ray_alloc carries no trace of it. */
@@ -1985,7 +2012,7 @@ static ray_t* heap_alloc_impl(size_t data_size, bool* fresh) {
      * mmap failure, fall through to the buddy pool only when the buddy model
      * can still represent the request. */
     if (RAY_UNLIKELY(order >= RAY_HEAP_POOL_ORDER)) {
-        ray_t* v = heap_alloc_direct(h, data_size);
+        ray_t* v = heap_alloc_direct(h, data_size, false);
         if (v) {
             ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)((char*)v - RAY_DIRECT_HDR);
             mem_trace_note_alloc(hdr->map_size);
@@ -2926,6 +2953,8 @@ void ray_heap_init(void) {
     ray_registry_unlock();
     if (reuse) {
         reuse->idle_next = NULL;
+        /* Environment belongs to the adopting thread, not the old owner. */
+        heap_swap_dir(reuse->swap_path, sizeof(reuse->swap_path));
         ray_tl_heap = reuse;
         return;
     }
@@ -3669,9 +3698,56 @@ static void heap_spill_pools_age(ray_heap_t* h, uint32_t now) {
  * ever cut from.  A statement that freed its pool temporaries and goes on to
  * large blocks would otherwise spill those while the pools sit empty and
  * counted, and no rule at the boundary can tell that the next statement
- * wants large blocks rather than its pools back.  Only the caller's heap:
- * any other, a worker's included, may be allocating right now.  Returns
- * whether `bytes` still crosses the watermark. */
+ * wants large blocks rather than its pools back.
+ *
+ * Then, if that was not enough, the parked pool workers' empty anonymous
+ * pools, one worker after another until the block fits — but only from the
+ * dispatcher's thread with no dispatch in flight (heap_make_room_workers_ok).
+ * A heavy query run again keeps its workers' pools from the run before,
+ * empty and counted, and without this its large blocks spill against them
+ * (#750): the boundary that could have given them back declines to, since
+ * a heap that spilled wants its pools for the next run.  Any other heap
+ * may be allocating right now: an embedding's own thread, a server's poll
+ * thread, a helper thread of an import.  Returns whether `bytes` still
+ * crosses the watermark. */
+typedef struct { size_t bytes; int64_t got; } make_room_t;
+
+static void heap_make_room_worker(ray_heap_t* h, void* ctx) {
+    make_room_t* m = ctx;
+    if (!heap_anon_would_exceed(m->bytes)) return;   /* fits: the rest keep theirs */
+    heap_drain_foreign(h);
+    heap_flush_slabs(h);
+    m->got += heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON);
+}
+
+/* Whether the workers' heaps are this thread's to work on: it is bound to
+ * the runtime's main VM, and ray_parallel_flag is clear.
+ *
+ * Evaluation is single-threaded: the pool has one producer (see
+ * ray_pool_par_dispatch_ok), the thread that runs queries, which is the main
+ * VM's — so no dispatch opens while this thread is in here.  (A query run
+ * on another thread at the same time — an IPC hook on an embedder's thread
+ * under a temporary VM — is outside that rule, as for the pool itself.)
+ * The flag is clear on this thread outside pool_run_window: it raises
+ * it before it publishes a window and clears it only after an acquire of
+ * pending == 0, which every worker's last pending-- (acq_rel, after its last
+ * allocation and free of the window) is ordered before.  From there until
+ * the next window a worker claims nothing — one woken by a surplus token
+ * finds the window drained and waits again — so it allocates and frees
+ * nothing; the same ground pool_reclaim_worker_heaps, the relief and the
+ * decay stand on.  Inside a dispatch — this thread as worker 0, or any
+ * worker — the flag is up, and a pool worker's thread, a VM-less thread or
+ * an IPC hook's temporary VM (id -1) never qualifies.  What others may still
+ * do to a worker heap meanwhile is push onto its foreign list, which the
+ * drain takes in one exchange; a block on its way there is live in its pool
+ * until it is on a freelist, so the pool is not found empty under it.  No
+ * registry lock is needed: nothing here reads another heap's lists or the
+ * registry. */
+static bool heap_make_room_workers_ok(void) {
+    return __VM && __VM->id == 0
+        && atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) == 0;
+}
+
 static bool heap_make_room(size_t bytes) {
     direct_cache_drain();
     if (!heap_anon_would_exceed(bytes)) return false;
@@ -3680,8 +3756,10 @@ static bool heap_make_room(size_t bytes) {
     if (!h) return true;
     heap_drain_foreign(h);
     heap_flush_slabs(h);
-    int64_t got = heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON);
-    return got == 0 || heap_anon_would_exceed(bytes);
+    make_room_t m = { bytes, heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON) };
+    if (heap_anon_would_exceed(bytes) && heap_make_room_workers_ok())
+        ray_pool_each_worker_heap(heap_make_room_worker, &m);
+    return m.got == 0 || heap_anon_would_exceed(bytes);
 #else
     return true;   /* past the watermark the block comes from RAM all the same */
 #endif

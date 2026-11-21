@@ -33,6 +33,7 @@
 #include "store/encfmt.h"
 #include "store/fileio.h"
 #include "store/serde.h"
+#include "store/stream.h"
 #include "table/sym.h"
 #include "table/table.h"
 #include "table/domain.h"
@@ -63,23 +64,35 @@
  * (rejecting '/', '\\', '..', leading '.') cover main attack vector.
  * -------------------------------------------------------------------------- */
 
-/* True when the table has at least one top-level RAY_SYM column — the
- * data that encodes as symfile positions.  SYM data NESTED in list
- * columns serializes as self-contained strings (store/col.c recursive
- * format) and needs no symfile. */
-static bool table_has_sym_cols(ray_t* tbl) {
-    int64_t nc = ray_table_ncols(tbl);
-    ray_col_meta_t m;
-    for (int64_t c = 0; c < nc; c++)
-        if (ray_table_col_meta_idx(tbl, c, &m) && m.type == RAY_SYM) return true;
-    return false;
-}
-
 /* The slot object of column c: its RAY_ENCCOL, or the plain column.  Never
  * decodes. */
 static ray_t* splay_slot(ray_t* tbl, int64_t c) {
     ray_t* e = ray_table_get_col_enc_idx(tbl, c);
     return e ? e : ray_table_col_idx(tbl, c);
+}
+
+static bool splay_slot_parted(ray_t* col);
+static int8_t splay_slot_type(ray_t* col);
+static ray_err_t splay_parted_preflight(ray_t* col);
+static const int64_t* splay_part_counts(ray_t* tbl, int64_t* n);
+static int64_t splay_slot_rows(ray_t* col, const int64_t* cnt, int64_t ncnt);
+
+/* True when the table has at least one top-level RAY_SYM column — the
+ * data that encodes as symfile positions; a parted SYM column and a
+ * partition key of symbols are written as one.  SYM data NESTED in list
+ * columns serializes as self-contained strings (store/col.c recursive
+ * format) and needs no symfile. */
+static bool table_has_sym_cols(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    ray_col_meta_t m;
+    for (int64_t c = 0; c < nc; c++) {
+        if (!ray_table_col_meta_idx(tbl, c, &m)) continue;
+        if (m.type == RAY_SYM) return true;
+        if ((RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) &&
+            splay_slot_type(splay_slot(tbl, c)) == RAY_SYM)
+            return true;
+    }
+    return false;
 }
 
 /* The symfile of SYM column `name` under the per-column layout: the dotfile
@@ -114,8 +127,8 @@ ray_t* ray_symfile_opt_parse(ray_t* opts, ray_symfile_t* layout) {
     return ok ? NULL : ray_error("domain", "symfile must be 'shared or 'column");
 }
 
-ray_t* ray_splay_index_opt_parse(ray_t* opts, bool* auto_index) {
-    *auto_index = true;
+ray_t* ray_splay_index_opt_parse(ray_t* opts, ray_index_opt_t* index) {
+    *index = RAY_INDEX_ABSENT;
     if (!opts || opts->type != RAY_DICT) return NULL;
     ray_t* key = ray_sym(ray_sym_intern("index", 5));
     if (!key || RAY_IS_ERR(key)) return key ? key : ray_error("oom", NULL);
@@ -124,7 +137,7 @@ ray_t* ray_splay_index_opt_parse(ray_t* opts, bool* auto_index) {
     if (!v) return NULL;
     if (RAY_IS_ERR(v)) return v;
     bool ok = v->type == -RAY_BOOL;
-    if (ok) *auto_index = v->b8 != 0;
+    if (ok) *index = v->b8 ? RAY_INDEX_ON : RAY_INDEX_OFF;
     ray_release(v);
     return ok ? NULL : ray_error("domain", "index must be true or false");
 }
@@ -482,6 +495,7 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
      * value in a later recursive LIST cell can return NYI after earlier
      * columns have already replaced an existing committed generation. */
     int64_t preflight_ncols = ray_table_ncols(tbl);
+    bool any_parted = false;
     for (int64_t c = 0; c < preflight_ncols; c++) {
         ray_t* col = splay_slot(tbl, c);
         if (col && RAY_IS_ERR(col)) {           /* a failed decode: its code, message left in the slot */
@@ -489,8 +503,25 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
             ray_error_free(col);
             return derr;
         }
-        ray_err_t err = ray_col_save_preflight(col);
+        bool parted = splay_slot_parted(col);
+        any_parted |= parted;
+        ray_err_t err = parted ? splay_parted_preflight(col) : ray_col_save_preflight(col);
         if (err != RAY_OK) return err;
+    }
+    /* A parted table's columns are written one by one from their segments:
+     * every column must come to the same rows (a missing segment counts its
+     * partition's rows, which a projection without the key has lost). */
+    if (any_parted) {
+        int64_t ncnt;
+        const int64_t* cnt = splay_part_counts(tbl, &ncnt);
+        int64_t want = -1;
+        for (int64_t c = 0; c < preflight_ncols; c++) {
+            ray_t* col = splay_slot(tbl, c);
+            if (!col) continue;
+            int64_t n = splay_slot_rows(col, cnt, ncnt);
+            if (want < 0) want = n;
+            else if (n != want) return RAY_ERR_DOMAIN;
+        }
     }
 
     /* Symfile/column collision guard.  A column is written as `dir/<name>`;
@@ -574,6 +605,327 @@ static void splay_release_cdoms(ray_sym_domain_t** cdoms, int64_t n) {
     ray_free_raw(cdoms);
 }
 
+/* --------------------------------------------------------------------------
+ * Parted sources (#1182)
+ *
+ * A column of a parted table is written through the streaming column writer
+ * (store/stream.h), a segment at a time: a plain segment is appended as it
+ * is (mapped, never copied), an encoded one is decoded a chunk at a time, a
+ * missing one (a hand-built wrapper) stands for its partition's rows as
+ * nulls, and the partition key (MAPCOMMON) is written as the column a
+ * materialized copy of the table holds, each partition's key repeated over
+ * its rows.  No column is held whole: the writer's memory is one chunk, the
+ * symbol cache and the index accumulators.
+ * -------------------------------------------------------------------------- */
+
+#define SPLAY_PARTED_BATCH RAY_ENC_CHUNK
+
+static _Atomic(int64_t) g_parted_appends;    /* test hook: appends to a writer */
+static _Atomic(int64_t) g_parted_max_rows;   /* test hook: the longest append */
+int64_t ray_splay_test_parted_appends(void) { return atomic_load(&g_parted_appends); }
+int64_t ray_splay_test_parted_max_rows(void) { return atomic_load(&g_parted_max_rows); }
+void ray_splay_test_parted_reset(void) {
+    atomic_store(&g_parted_appends, 0);
+    atomic_store(&g_parted_max_rows, 0);
+}
+
+/* The plain parted wrapper behind a slot (itself, or an encoded one's), or NULL. */
+static ray_t* splay_parted_wrapper(ray_t* col) {
+    if (!col || RAY_IS_ERR(col)) return NULL;
+    if (col->type == RAY_ENCCOL)
+        return ray_enccol_is_parted(col) ? ray_enccol_of(col)->wrapper : NULL;
+    return RAY_IS_PARTED(col->type) ? col : NULL;
+}
+
+static bool splay_slot_parted(ray_t* col) {
+    return col && !RAY_IS_ERR(col) && (col->type == RAY_MAPCOMMON || splay_parted_wrapper(col));
+}
+
+/* The type a slot is written as: a parted column's base type, the partition
+ * key's type, else the column's own logical type (0 when unknown). */
+static int8_t splay_slot_type(ray_t* col) {
+    if (!col || RAY_IS_ERR(col)) return 0;
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* kv = ((ray_t**)ray_data(col))[0];
+        return kv && !RAY_IS_ERR(kv) ? kv->type : 0;
+    }
+    ray_t* w = splay_parted_wrapper(col);
+    if (w) return (int8_t)RAY_PARTED_BASETYPE(w->type);
+    ray_col_meta_t m;
+    return ray_col_meta_of(col, &m) ? m.type : 0;
+}
+
+/* The table's partition row counts (its MAPCOMMON column), or NULL. */
+static const int64_t* splay_part_counts(ray_t* tbl, int64_t* n) {
+    *n = 0;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = splay_slot(tbl, c);
+        if (!col || RAY_IS_ERR(col) || col->type != RAY_MAPCOMMON) continue;
+        ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
+        if (!rc || RAY_IS_ERR(rc) || rc->type != RAY_I64) return NULL;
+        *n = rc->len;
+        return (const int64_t*)ray_data(rc);
+    }
+    return NULL;
+}
+
+/* Rows a slot writes: a missing segment counts its partition's rows. */
+static int64_t splay_slot_rows(ray_t* col, const int64_t* cnt, int64_t ncnt) {
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t* rc = ((ray_t**)ray_data(col))[1];   /* not-a-table */
+        int64_t n = 0;
+        for (int64_t p = 0; rc && p < rc->len; p++) n += ((const int64_t*)ray_data(rc))[p];
+        return n;
+    }
+    ray_t* w = splay_parted_wrapper(col);
+    if (!w) return ray_table_col_nrows(col);
+    ray_t** segs = (ray_t**)ray_data(w);
+    int64_t n = 0;
+    for (int64_t i = 0; i < w->len; i++)
+        n += segs[i] ? ray_table_col_nrows(segs[i]) : (cnt && i < ncnt ? cnt[i] : 0);
+    return n;
+}
+
+/* Whether the writer below takes the slot: its type is a vector type (else
+ * nyi), every segment is a plain vector or a single-file encoded column of
+ * that type (a segment of another type: domain, a parted one: nyi), and the
+ * partition key has a key and a row count per partition. */
+static ray_err_t splay_parted_preflight(ray_t* col) {
+    int8_t t = splay_slot_type(col);
+    if (!ray_is_vector_type(t)) return RAY_ERR_NYI;
+    if (col->attrs & RAY_ATTR_SLICE) return RAY_ERR_NYI;
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t** p = (ray_t**)ray_data(col);   /* not-a-table: keys, row counts */
+        return (p[0] && !RAY_IS_ERR(p[0]) && p[1] && !RAY_IS_ERR(p[1]) && p[1]->type == RAY_I64 &&
+                p[1]->len == p[0]->len) ? RAY_OK : RAY_ERR_CORRUPT;
+    }
+    ray_t* w = splay_parted_wrapper(col);
+    ray_t** segs = (ray_t**)ray_data(w);
+    for (int64_t i = 0; i < w->len; i++) {
+        ray_t* s = segs[i];
+        if (!s) continue;
+        if (RAY_IS_ERR(s)) return ray_err_from_obj(s);
+        if (s->type == RAY_ENCCOL && ray_enccol_is_parted(s)) return RAY_ERR_NYI;
+        /* a segment read as another type would be copied at the wrong width */
+        if ((s->type == RAY_ENCCOL ? ray_enccol_of(s)->type : s->type) != t) return RAY_ERR_DOMAIN;
+    }
+    return RAY_OK;
+}
+
+/* A SYM vector's ids resolve over `dom` (retained; the vector releases it). */
+static void splay_sym_set_dom(ray_t* v, ray_sym_domain_t* dom) {
+    if (v->sym_domain == dom) return;
+    ray_sym_domain_retain(dom);
+    ray_sym_domain_release(v->sym_domain);
+    v->sym_domain = dom;
+}
+
+/* An empty batch of the writer's type: SYM at full width (ids of any
+ * source domain), STR grown by appends. */
+static ray_t* splay_batch_new(int8_t type) {
+    ray_t* b = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, SPLAY_PARTED_BATCH)
+                               : ray_vec_new(type, SPLAY_PARTED_BATCH);
+    if (!b) return ray_error("oom", NULL);
+    if (!RAY_IS_ERR(b)) b->len = 0;
+    return b;
+}
+
+static ray_err_t splay_feed(ray_col_stream_t* w, ray_t* v) {
+    if (v->len <= 0) return RAY_OK;
+    ray_err_t e = ray_col_stream_append(w, v);
+    if (e != RAY_OK) return e;
+    atomic_fetch_add(&g_parted_appends, 1);
+    int64_t m = atomic_load(&g_parted_max_rows);
+    while (v->len > m && !atomic_compare_exchange_weak(&g_parted_max_rows, &m, v->len)) {}
+    return RAY_OK;
+}
+
+/* n rows of `type`'s null (BOOL and U8: zero, as a ragged flatten fills). */
+static ray_err_t splay_feed_nulls(ray_col_stream_t* w, int8_t type, int64_t n) {
+    if (n <= 0) return RAY_OK;
+    int64_t k = n < SPLAY_PARTED_BATCH ? n : SPLAY_PARTED_BATCH;
+    ray_t* b = type == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W32, k) : ray_vec_new(type, k);
+    if (!b || RAY_IS_ERR(b)) { if (b) ray_error_free(b); return RAY_ERR_OOM; }
+    b->len = k;
+    memset(ray_data(b), 0, (size_t)k * ray_sym_elem_size(b->type, b->attrs));
+    if (type == RAY_SYM) splay_sym_set_dom(b, w->dom);   /* position 0: the null */
+    else if (type != RAY_STR && type != RAY_BOOL && type != RAY_U8)
+        for (int64_t i = 0; i < k; i++) ray_vec_set_null(b, i, true);
+    ray_err_t e = RAY_OK;
+    for (int64_t left = n; e == RAY_OK && left > 0; left -= b->len) {
+        b->len = left < k ? left : k;
+        e = splay_feed(w, b);
+    }
+    ray_release(b);
+    return e;
+}
+
+/* The partition key, each partition's key repeated over its rows. */
+static ray_err_t splay_feed_keys(ray_col_stream_t* w, ray_t* mc) {
+    ray_t* kv = ((ray_t**)ray_data(mc))[0];
+    const int64_t* cnt = (const int64_t*)ray_data(((ray_t**)ray_data(mc))[1]);   /* not-a-table */
+    uint8_t esz = ray_sym_elem_size(kv->type, kv->attrs);
+    ray_t* b = kv->type == RAY_SYM ? ray_sym_vec_new(kv->attrs & RAY_SYM_W_MASK, SPLAY_PARTED_BATCH)
+                                   : ray_vec_new(kv->type, SPLAY_PARTED_BATCH);
+    if (!b || RAY_IS_ERR(b)) { if (b) ray_error_free(b); return RAY_ERR_OOM; }
+    if (kv->type == RAY_SYM) ray_sym_vec_adopt_domain(b, kv);
+    ray_err_t e = RAY_OK;
+    for (int64_t p = 0; e == RAY_OK && p < kv->len; p++) {
+        if (ray_interrupted()) { e = RAY_ERR_CANCEL; break; }
+        int64_t k = cnt[p] < SPLAY_PARTED_BATCH ? cnt[p] : SPLAY_PARTED_BATCH;
+        const char* key = (const char*)ray_data(kv) + (size_t)p * esz;
+        for (int64_t i = 0; i < k; i++) memcpy((char*)ray_data(b) + (size_t)i * esz, key, esz);
+        for (int64_t left = cnt[p]; e == RAY_OK && left > 0; left -= b->len) {
+            b->len = left < k ? left : k;
+            e = splay_feed(w, b);
+        }
+    }
+    ray_release(b);
+    return e;
+}
+
+/* A segment the writer cannot take as it is (an encoded one), read by
+ * range into chunk-sized batches. */
+static ray_err_t splay_feed_ranges(ray_col_stream_t* w, ray_t* seg, int8_t type) {
+    ray_col_src_t s;
+    ray_t* berr = ray_col_src_bind(seg, &s);
+    if (berr) { ray_err_t e = ray_err_from_obj(berr); ray_error_free(berr); return e; }
+    ray_col_scratch_t scr; ray_col_scratch_init(&scr);
+    uint8_t esz = ray_sym_elem_size(type, type == RAY_SYM ? RAY_SYM_W64 : 0);
+    ray_t* b = NULL;
+    ray_err_t e = RAY_OK;
+    for (int64_t r = 0; e == RAY_OK && r < s.len; ) {
+        if (ray_interrupted()) { e = RAY_ERR_CANCEL; break; }
+        if (!b) {
+            b = splay_batch_new(type);
+            if (RAY_IS_ERR(b)) { ray_error_free(b); b = NULL; e = RAY_ERR_OOM; break; }
+            if (s.may_null && type != RAY_SYM && type != RAY_STR) b->attrs |= RAY_ATTR_HAS_NULLS;
+        }
+        ray_col_range_t v;
+        ray_t* rerr = ray_col_range(&s, r, s.len - r < SPLAY_PARTED_BATCH - b->len
+                                           ? s.len - r : SPLAY_PARTED_BATCH - b->len, &scr, &v);
+        if (rerr) { e = ray_err_from_obj(rerr); ray_error_free(rerr); break; }
+        if (v.n <= 0) { e = RAY_ERR_CORRUPT; break; }
+        if (type == RAY_SYM) {
+            if (b->len == 0) splay_sym_set_dom(b, v.dom);
+            for (int64_t i = 0; i < v.n; i++)
+                ray_write_sym(ray_data(b), b->len + i,
+                              (uint64_t)ray_read_sym(v.data, i, RAY_SYM, v.attrs), RAY_SYM, b->attrs);
+            b->len += v.n;
+        } else if (type == RAY_STR) {
+            const ray_str_t* d = (const ray_str_t*)v.data;
+            /* On failure the append frees only a COW copy it made, so `b` is
+             * still ours and the release after the loop frees it. */
+            for (int64_t i = 0; i < v.n; i++) {
+                ray_t* nb = ray_str_vec_append(b, ray_str_t_ptr(&d[i], v.str_pool), d[i].len);
+                if (!nb) { e = RAY_ERR_OOM; break; }
+                if (RAY_IS_ERR(nb)) { e = ray_err_from_obj(nb); ray_error_free(nb); break; }
+                b = nb;
+            }
+            if (e != RAY_OK) break;
+        } else {
+            memcpy((char*)ray_data(b) + (size_t)b->len * esz, v.data, (size_t)v.n * esz);
+            b->len += v.n;
+        }
+        r += v.n;
+        if (b->len == SPLAY_PARTED_BATCH || r == s.len) {
+            e = splay_feed(w, b);
+            ray_release(b);
+            b = NULL;
+        }
+    }
+    if (b) ray_release(b);
+    ray_col_scratch_free(&scr);
+    ray_col_src_release(&s);
+    return e;
+}
+
+/* Column `col` (a parted slot) of `tbl` into dir/<name>, at generation
+ * `gen`; a SYM column's ids as positions in `dom`. */
+static ray_err_t splay_write_parted_col(ray_t* tbl, ray_t* col, const char* dir, int64_t name_id,
+                                        uint8_t gen, ray_sym_domain_t* dom, bool durable,
+                                        bool auto_index, bool keep_dict) {
+    int8_t type = splay_slot_type(col);
+    ray_col_stream_t w;
+    ray_err_t e = ray_col_stream_open(&w, dir, name_id, type, dom, gen);
+    /* the vocabulary is merged already: the domain's count is final, so
+     * generation 0 stores positions at its width, as a flat save does */
+    if (e == RAY_OK && type == RAY_SYM && gen == 0)
+        e = ray_col_stream_sym_width(&w, ray_sym_dict_width(ray_sym_domain_count(dom)));
+    if (e == RAY_OK && auto_index) e = ray_col_stream_index_begin(&w, 0);
+    w.keep_dict = keep_dict;            /* index: true keeps a generation-2 DICT at any size */
+    if (e == RAY_OK && col->type == RAY_MAPCOMMON) {
+        e = splay_feed_keys(&w, col);
+    } else if (e == RAY_OK) {
+        int64_t ncnt;
+        const int64_t* cnt = splay_part_counts(tbl, &ncnt);
+        ray_t* pw = splay_parted_wrapper(col);
+        ray_t** segs = (ray_t**)ray_data(pw);
+        for (int64_t i = 0; e == RAY_OK && i < pw->len; i++) {
+            ray_t* s = segs[i];
+            if (ray_interrupted()) e = RAY_ERR_CANCEL;
+            else if (!s) e = splay_feed_nulls(&w, type, cnt && i < ncnt ? cnt[i] : 0);
+            else if (s->type == type && !(s->attrs & RAY_ATTR_SLICE)) e = splay_feed(&w, s);
+            else e = splay_feed_ranges(&w, s, type);
+        }
+    }
+    if (e == RAY_OK) e = ray_col_stream_close(&w, durable);
+    if (e != RAY_OK) ray_col_stream_abort(&w);
+    return e;
+}
+
+/* Distinct-merge a slot's vocabulary into `dom`: the partition key's keys,
+ * else its cells (splay_merge_vocab, which reads a parted column by range,
+ * each segment over its own domain). */
+static ray_err_t splay_merge_vocab_slot(ray_t* col, ray_sym_domain_t* dom) {
+    if (col->type != RAY_MAPCOMMON) return splay_merge_vocab(col, dom);
+    ray_t* kv = ((ray_t**)ray_data(col))[0];
+    for (int64_t i = 0; i < kv->len; i++) {
+        ray_t* s = ray_sym_vec_cell(kv, i);
+        if (!s) return RAY_ERR_CORRUPT;
+        if (ray_sym_domain_intern(dom, ray_str_ptr(s), ray_str_len(s)) < 0) return RAY_ERR_OOM;
+    }
+    return RAY_OK;
+}
+
+/* Column `col` (a plain or single-file encoded slot) into `path`, in its
+ * resolved generation, from the slot object (an encoded slot is read by
+ * range for generation 2); a SYM column's ids as positions in `sym_dom`. */
+static ray_err_t splay_write_col(ray_t* col, const char* path, const char* name, uint8_t gen,
+                                 ray_sym_domain_t* sym_dom, bool durable, bool auto_index,
+                                 bool keep_dict) {
+    ray_col_meta_t m;
+    ray_col_meta_of(col, &m);
+    ray_col_write_t w;
+    memset(&w, 0, sizeof w);
+    ray_t* berr = ray_col_src_bind(col, &w.src);
+    if (berr) { ray_err_t e = ray_err_from_obj(berr); ray_error_free(berr); return e; }
+    w.name = name;
+    w.gen = gen;
+    w.target_dom = m.type != RAY_SYM ? NULL : sym_dom;
+    w.durable = durable;
+    /* Generation 0 persists a chunk zone for numeric columns of at least
+     * one chunk (ray_splay_build_indexes); generation 2 records it when
+     * the column records no other kind (a stale root records none).
+     * Neither when the call's index option is false. */
+    uint8_t rec_kind = m.index_kind, rec_flags = 0;
+    if (ray_is_vec(col)) ray_col_gen2_index_meta(col, &rec_kind, &rec_flags);
+    if (w.gen == 2 && auto_index && ray_zone_acc_supported(m.type) &&
+        ray_index_kind_admits(RAY_IDX_CHUNK_ZONE, m.type) && m.len >= RAY_ENC_CHUNK && rec_kind == 0)
+        w.index_kind = RAY_IDX_CHUNK_ZONE;
+    /* generation 0 builds a STR DICT in the same pass (splay_build_index_col):
+     * at least RAY_DICT_MIN_ROWS rows, unless a HASH takes the slot */
+    if (w.gen == 2 && auto_index && ray_col_dict_wanted(m.type, m.len) && rec_kind != RAY_IDX_HASH)
+        w.index_kind = RAY_IDX_DICT;
+    /* index: true keeps that DICT where it makes the file larger than
+     * generation 0's; absent leaves it out (ray_encw_finish, #1094) */
+    w.keep_dict = keep_dict;
+    ray_err_t err = ray_col_save_ctx(&w, path);
+    ray_col_src_release(&w.src);
+    return err;
+}
+
 /* write: the held lock's state (mode, current generation; receives the
  * resolved generations), or NULL for a private directory. */
 static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
@@ -586,6 +938,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
     /* the size-gated dictionary and chunk zone this save would build; an
      * index the column already carries follows build_indexes alone */
     bool auto_index = build_indexes && !(write && write->no_auto_index);
+    bool keep_dict = auto_index && write && write->keep_dict;
     /* Create directory and any missing parents (mkdir -p semantics).
      * Required for partitioned layouts like "/db/2024.01.01/t/" where the
      * caller hasn't pre-created the date partition. */
@@ -641,8 +994,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         if (!cdoms) { ret = RAY_ERR_OOM; goto out; }
         for (int64_t c = 0; c < ncols_res; c++) {
             ray_t* col = splay_slot(tbl, c);
-            ray_col_meta_t m;
-            if (!col || RAY_IS_ERR(col) || !ray_col_meta_of(col, &m) || m.type != RAY_SYM)
+            if (!col || RAY_IS_ERR(col) || splay_slot_type(col) != RAY_SYM)
                 continue;
             ray_t* na = ray_sym_str(ray_table_col_name(tbl, c));
             char cpath[1024];
@@ -658,7 +1010,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
                 ret = RAY_ERR_OOM;
                 goto out;
             }
-            ray_err_t merr = splay_merge_vocab(col, cdoms[c]);
+            ray_err_t merr = splay_merge_vocab_slot(col, cdoms[c]);
             if (merr == RAY_OK && flush_sym) merr = ray_sym_domain_flush_append(cdoms[c], durable);
             if (merr != RAY_OK) { ret = merr; goto out; }
         }
@@ -684,10 +1036,9 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
         int64_t nc = ray_table_ncols(tbl);
         for (int64_t c = 0; c < nc; c++) {
             ray_t* col = splay_slot(tbl, c);
-            ray_col_meta_t m;
-            if (!col || RAY_IS_ERR(col) || !ray_col_meta_of(col, &m) || m.type != RAY_SYM)
+            if (!col || RAY_IS_ERR(col) || splay_slot_type(col) != RAY_SYM)
                 continue;
-            ray_err_t merr = splay_merge_vocab(col, dom);
+            ray_err_t merr = splay_merge_vocab_slot(col, dom);
             if (merr != RAY_OK) { ret = merr; goto out; }
         }
 
@@ -725,31 +1076,13 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
             ret = RAY_ERR_RANGE;
             goto out;
         }
-        ray_col_meta_t m;
-        ray_col_meta_of(col, &m);
-        ray_col_write_t w;
-        memset(&w, 0, sizeof w);
-        ray_t* berr = ray_col_src_bind(col, &w.src);
-        if (berr) { ret = ray_err_from_obj(berr); ray_error_free(berr); goto out; }
-        w.name = name;
-        w.gen = gens[c];
-        w.target_dom = m.type != RAY_SYM ? NULL : cdoms ? cdoms[c] : dom;
-        w.durable = durable;
-        /* Generation 0 persists a chunk zone for numeric columns of at least
-         * one chunk (ray_splay_build_indexes); generation 2 records it when
-         * the column records no other kind (a stale root records none).
-         * Neither when the call's index option is false. */
-        uint8_t rec_kind = m.index_kind, rec_flags = 0;
-        if (ray_is_vec(col)) ray_col_gen2_index_meta(col, &rec_kind, &rec_flags);
-        if (w.gen == 2 && auto_index && ray_zone_acc_supported(m.type) &&
-            m.len >= RAY_ENC_CHUNK && rec_kind == 0)
-            w.index_kind = RAY_IDX_CHUNK_ZONE;
-        /* generation 0 builds a STR DICT in the same pass (splay_build_index_col):
-         * at least RAY_DICT_MIN_ROWS rows, unless a HASH takes the slot */
-        if (w.gen == 2 && auto_index && ray_col_dict_wanted(m.type, m.len) && rec_kind != RAY_IDX_HASH)
-            w.index_kind = RAY_IDX_DICT;
-        ray_err_t err = ray_col_save_ctx(&w, path);
-        ray_col_src_release(&w.src);
+        ray_sym_domain_t* sdom = cdoms ? cdoms[c] : dom;
+        /* a parted column is streamed a segment at a time, its index with it */
+        ray_err_t err = splay_slot_parted(col)
+            ? splay_write_parted_col(tbl, col, dir, ray_table_col_name(tbl, c), gens[c],
+                                     splay_slot_type(col) == RAY_SYM ? sdom : NULL, durable,
+                                     auto_index, keep_dict)
+            : splay_write_col(col, path, name, gens[c], sdom, durable, auto_index, keep_dict);
         /* No new .d or .current is published on failure. */
         if (err != RAY_OK) { ret = err; goto out; }
         schema = ray_str_vec_append(schema, name, name_len);
@@ -1167,7 +1500,7 @@ ray_err_t ray_splay_write_begin_mode(const char* dir, ray_compress_t mode,
 static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable,
                                  ray_compress_t mode, bool sym_col,
-                                 bool auto_index) {
+                                 ray_index_opt_t index) {
     /* the per-column layout writes no shared symfile: no collision to check */
     ray_err_t err = splay_validate_save(tbl, dir, sym_col ? NULL : sym_path);
     if (err != RAY_OK) return err;
@@ -1175,34 +1508,37 @@ static ray_err_t splay_save_impl(ray_t* tbl, const char* dir,
     err = ray_splay_write_begin_mode(dir, mode, &write);
     if (err != RAY_OK) return err;
     write.sym_col = sym_col;
-    write.no_auto_index = !auto_index;
+    write.no_auto_index = index == RAY_INDEX_OFF;
+    write.keep_dict = index == RAY_INDEX_ON;
     err = ray_splay_write_table_ctx(tbl, &write, sym_path, durable);
     return ray_splay_write_finish(&write, err, durable);
 }
 
 ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, true, RAY_COMPRESS_ABSENT, false, true);
+    return splay_save_impl(tbl, dir, sym_path, true, RAY_COMPRESS_ABSENT, false,
+                           RAY_INDEX_ABSENT);
 }
 
 ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
-    return splay_save_impl(tbl, dir, sym_path, false, RAY_COMPRESS_ABSENT, false, true);
+    return splay_save_impl(tbl, dir, sym_path, false, RAY_COMPRESS_ABSENT, false,
+                           RAY_INDEX_ABSENT);
 }
 
 ray_err_t ray_splay_save_mode(ray_t* tbl, const char* dir, const char* sym_path,
                               ray_compress_t mode) {
-    return splay_save_impl(tbl, dir, sym_path, true, mode, false, true);
+    return splay_save_impl(tbl, dir, sym_path, true, mode, false, RAY_INDEX_ABSENT);
 }
 
 ray_err_t ray_splay_save_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
                                    ray_compress_t mode) {
-    return splay_save_impl(tbl, dir, sym_path, false, mode, false, true);
+    return splay_save_impl(tbl, dir, sym_path, false, mode, false, RAY_INDEX_ABSENT);
 }
 
 ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
                                 ray_compress_t mode, ray_symfile_t layout,
-                                bool auto_index, bool durable) {
+                                ray_index_opt_t index, bool durable) {
     return splay_save_impl(tbl, dir, sym_path, durable, mode, layout == RAY_SYMFILE_COLUMN,
-                           auto_index);
+                           index);
 }
 
 ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
@@ -1564,6 +1900,9 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
      * for any generation; only explicit .idx.hash indexes are (below).
      * A generation-2 file records its zone in the enc header. */
     if (gens && gens[c] == 2) return;
+    /* a parted column's index was written with it (splay_write_parted_col),
+     * and its slot is never read whole */
+    if (splay_slot_parted(splay_slot(tbl, c))) return;
     {
         ray_t* col = ray_table_col_idx(tbl, c);
         if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return; }   /* best effort: no index */
