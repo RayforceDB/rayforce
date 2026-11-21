@@ -354,10 +354,19 @@ about ±596 hours. A result past the 32-bit range keeps its low 32 bits, the
 same for an atom and for a vector cell, so `(* 25 24:00:00.000)` is
 `-593:02:47.296`.
 
-Subtracting two timestamps returns TIMESPAN. Cast the difference with
-`as 'I64` when an integer nanosecond count is needed. A duration may be
-added to a timestamp, scaled by an integer, or used as an `xbar` width.
-See [Timespan](timespan.md) for operator result types and migration details.
+A `time` and a `timestamp` are points: subtracting two timestamps, or two
+times, returns TIMESPAN, and adding a duration to either returns the same
+point type (`(+ 20:30:00.000 0D09:30:00)` is `30:00:00.000`; a time does not
+wrap at 24 hours, and a result past its 32-bit range is null). Two points do
+not add: `time + time`, like `timestamp + timestamp` and `date + date`, is a
+type error. Adding or subtracting an integer still counts the type's own unit
+(milliseconds for a `time`). Cast a difference with `as 'I64` when an integer
+nanosecond count is needed. A duration may also be scaled by an integer, or
+used as an `xbar` width. See [Timespan](timespan.md) for operator result
+types and migration details.
+
+Subtracting two dates returns an I32 count of days, so a date plus the
+difference of two dates is a date again (`d0 + (d - d0)` is `d`).
 
 **Date arithmetic:**
 
@@ -366,11 +375,26 @@ See [Timespan](timespan.md) for operator result types and migration details.
 (+ 2024.01.15 1)        ; 2024.01.16
 (+ 2024.01.15 30)       ; 2024.02.14
 
-; Subtract dates to get days between
+; Subtract dates to get days between (an i32 day count)
 (- 2024.01.15 2024.01.01)  ; 14
 
 ; Create a date range
 (+ 2024.01.01 (til 7))   ; [2024.01.01 2024.01.02 ... 2024.01.07]
+```
+
+**Time arithmetic:**
+
+```lisp
+; The difference of two times is a duration
+(- 10:30:00.000 09:30:00.000)      ; 0D01:00:00.000000000
+
+; A time moved by a duration is a time, past 24 h if need be
+(+ 20:30:00.000 0D09:30:00)        ; 30:00:00.000
+
+; Integers count milliseconds
+(+ 10:30:00.000 1500)              ; 10:30:01.500
+
+(+ 20:30:00.000 09:30:00.000)      ; error: type
 ```
 
 **Casting between temporal types:**

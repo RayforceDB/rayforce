@@ -157,7 +157,7 @@ ray> (+ 2024.01.15 30)
 
 ### RAY_TIME
 
-Stored as a 32-bit signed integer counting **milliseconds since midnight**. A time of day uses 0 to 86,399,999 ms, but values past 24 hours and negative values are valid, up to about ±596 hours (±2^31 ms). A result past that range keeps its low 32 bits, the same for an atom and for a vector cell: `(* 25 24:00:00.000)` is `-593:02:47.296`.
+Stored as a 32-bit signed integer counting **milliseconds since midnight**. A time of day uses 0 to 86,399,999 ms, but values past 24 hours and negative values are valid, up to about ±596 hours (±2^31 ms). A result of integer arithmetic past that range keeps its low 32 bits, the same for an atom and for a vector cell: `(* 25 24:00:00.000)` is `-593:02:47.296`. A time is a point in the day: the difference of two times is a TIMESPAN, a time plus or minus a TIMESPAN is a time (null past that range), and two times do not add.
 
 ```lisp
 ray> 09:30:00.000
