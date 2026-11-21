@@ -801,7 +801,11 @@ void ray_pool_test_ring_fail(uint32_t cap) { atomic_store_explicit(&g_pool_test_
 #ifdef DEBUG
 static _Atomic(uint32_t) g_pool_test_cancel_at, g_pool_test_dispatches;
 static _Atomic(bool) g_pool_test_cancel_pool_only;
+void ray_cancel_reset(void);   /* ops/ops.h; below */
 void ray_pool_test_cancel_at(uint32_t nth, bool pool_only) {
+    /* disarming ends the cancel: nothing else resets a pool-only flag (a
+     * cancel request's is cleared with the interrupt) */
+    if (!nth) ray_cancel_reset();
     atomic_store_explicit(&g_pool_test_dispatches, 0, memory_order_relaxed);
     atomic_store_explicit(&g_pool_test_cancel_pool_only, pool_only, memory_order_relaxed);
     atomic_store_explicit(&g_pool_test_cancel_at, nth, memory_order_relaxed);

@@ -2645,7 +2645,24 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
     case -RAY_F64:       key_f = cv->f64;    is_float = 1; break;
     case -RAY_F32:       key_f = cv->f64;    is_float = 1; break; /* F32 atoms use f64 slot */
     case -RAY_SYM:       key_i = cv->i64;               break; /* global intern id; domain-resolved at consult */
+    case -RAY_TIMESPAN:  key_i = cv->i64;               break;
     default: return 0;  /* str / guid — not eligible */
+    }
+
+    /* The probe is the literal's raw value, so it must be in the column's
+     * own unit, as the comparison reads it (#974): a DATE / TIME /
+     * TIMESTAMP column takes a literal of its own type (a cross-temporal
+     * one is rewritten to it at plan time, cmp_temporal_rewrite; anything
+     * else is not that compare); a TIMESPAN literal only a TIMESPAN column
+     * (an integer meets a TIMESPAN as nanoseconds, as the builtin does);
+     * a symbol only a SYM column.  Any other pair takes the scan. */
+    {
+        int8_t ct = m.type, lt = (int8_t)-cv->type;
+        bool ctemp = ct == RAY_DATE || ct == RAY_TIME || ct == RAY_TIMESTAMP;
+        bool ltemp = lt == RAY_DATE || lt == RAY_TIME || lt == RAY_TIMESTAMP;
+        if ((ctemp || ltemp) && ct != lt) return 0;
+        if (lt == RAY_TIMESPAN && ct != RAY_TIMESPAN) return 0;
+        if ((ct == RAY_SYM) != (lt == RAY_SYM)) return 0;
     }
 
     /* Reconcile the literal's family with the COLUMN's family.  Index

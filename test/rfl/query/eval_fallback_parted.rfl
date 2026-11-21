@@ -58,8 +58,8 @@
 (set gdx (fn [x] (set gdq 1) (+ date x)))
 (at (select {i: i from: P where: (== (gdx 1) 2024.01.03)}) 'i) -- [1 2 3 4]
 (at (select {i: i from: P where: (== (gdx 1) 2024.01.03)}) 'i) -- (at (select {i: i from: F where: (== (gdx 1) 2024.01.03)}) 'i)
-;; The key's value type guards unary ops, aggregate admission and `and`
-;; too.  The wrapper holds one value per partition, which `neg`/`abs` read
+;; The key's value type guards unary ops and aggregate admission too.
+;; The wrapper holds one value per partition, which `neg`/`abs` read
 ;; as the rows (dates came back), and `sum` folded the day counts.  A unary
 ;; op on the key is evaluated, as the builtin over the key's values; `sum`
 ;; rejects a DATE key as it rejects a flat DATE column.
@@ -71,8 +71,10 @@
 (select {c: (sum date) by: i from: P}) !- type
 (select {c: (sum date) by: i from: F}) !- type
 (select {c: (+ (sum date) 0) from: P}) !- type
-(select {c: (and date (> i 0)) from: P}) !- type
-(select {c: (and date (> i 0)) from: F}) !- type
+;; `and` reads the key by the truth value of its dates, as the builtin
+;; reads a DATE vector (#974)
+(at (select {c: (and date (> i 2)) from: P}) 'c) -- [false false true true false false true true]
+(at (select {c: (and date (> i 2)) from: F}) 'c) -- [false false true true false false true true]
 (at (select {d: (min date) from: P}) 'd) -- (at (select {d: (min date) from: F}) 'd)
 (at (select {d: (neg date) from: F}) 'd) !- type
 (at (select {d: (abs date) from: F}) 'd) !- type

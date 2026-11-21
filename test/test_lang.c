@@ -35,6 +35,8 @@
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
+#include "lang/callprof.h"
+#include "core/pool.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -4909,6 +4911,95 @@ static test_result_t test_eval_select_parted_stats_absent(void) {
     test_result_t result = test_eval_select_parted_stats_absent_impl(root);
     lang_parted_insert_rm_rf(root);
     return result;
+}
+
+/* ---- Test: an if answers the same with and without pool workers -------- */
+
+/* With no workers the selected arm of OP_IF (compact each branch's rows,
+ * scatter back) runs only under a sparse where; otherwise the eager fill,
+ * typed when both sides already hold the output's cells.  Every shape must
+ * give the same bytes at one worker as at four. */
+static test_result_t test_eval_if_workers_same(void) {
+    static const char* const qs[] = {
+        "(select {from: wt r: (if (> i 50) i j)})",
+        "(select {from: wt r: (if (> i 50) i 0N)})",
+        "(select {from: wt where: (> j -5) r: (if (> i 50) 7 i)})",
+        "(select {from: wt where: (> j 5) r: (if (> i 50) i 0)})",
+        "(select {from: wt r: (if (> x 5.0) x 0N) s: (if (> x 5.0) 1.5 x)})",
+        "(select {from: wt where: (> j -6) r: (if (> x 5.0) x y)})",
+        "(select {from: wt r: (if (> i 5) d 0Nd) s: (if (> i 5) d e)})",
+        "(select {from: wt r: (if (> i 5) h (as 'I32 1)) s: (if (> i 5) h i)})",
+        "(select {from: wt r: (if (> i 5) sp 00:00:01.000) s: (if (> i 5) ts 2020.01.01D00:00:00.000)})",
+        "(select {from: wt r: (if (> i 5) i sp)})",
+        "(select {from: wt r: (if (> i 5) x i)})",
+        "(select {from: wt where: (> j -5) r: (if (> i 50) s 'none) t: (if (> i 50) str \"no\")})",
+        "(select {from: wt where: (> j 4) r: (if (> i 50) str \"no\")})",
+        "(select {from: wt where: (> j -5) by: s r: (sum (if (> i 50) i 0)) q: (sum (if (> x 5.0) x 0.0))})",
+    };
+    enum { NQ = sizeof qs / sizeof qs[0] };
+    ray_t* setup = ray_eval_str(
+        "(do (set N 200000)"
+        " (set wt (table ['i 'j 'x 'y 'd 'e 'h 'sp 'ts 's 'str]"
+        "  (list (% (til N) 97) (- (% (til N) 13) 6) (* 0.5 (as 'F64 (% (til N) 50))) (as 'F64 (% (til N) 7))"
+        "   (+ 2024.01.01 (% (til N) 30)) (+ 2025.01.01 (% (til N) 11)) (as 'I32 (% (til N) 33))"
+        "   (as 'TIMESPAN (* 1000000 (% (til N) 9))) (+ 2024.01.01D00:00:00.000 (% (til N) 1000))"
+        "   (take ['a 'b 'c] N) (take [\"p\" \"qq\" \"rrr\"] N))))"
+        " (set wt (update {from: wt i: (if (== (% i 10) 0) 0N i) x: (if (== (% i 7) 0) 0N x)})) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_t* ser[2][NQ] = {{ NULL }};
+    static const uint32_t totals[2] = { 1, 4 };
+    for (int w = 0; w < 2; w++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(totals[w]), RAY_OK);
+        for (int q = 0; q < NQ; q++) {
+            char src[1024];
+            snprintf(src, sizeof src, "(ser (try %s (fn [e] e)))", qs[q]);
+            ser[w][q] = ray_eval_str(src);
+        }
+    }
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    /* Values, against the interpreter's if row by row: scalar and column
+     * sides of the typed fills, F64 beside I64 (j has no nulls: #1279). */
+    static const char* const vals[] = {
+        "(if (> x 5.0) x 1.5)", "(if (> x 5.0) -2.5 x)", "(if (> x 5.0) 0.25 -0.5)",
+        "(if (> x 5.0) x j)", "(if (> x 5.0) j x)", "(if (> x 5.0) j 0.5)", "(if (> x 5.0) 0.5 j)",
+        "(if (> i 50) i -7)", "(if (> i 50) 9 j)", "(if (> i 50) d 2020.01.01)",
+    };
+    for (size_t v = 0; v < sizeof vals / sizeof vals[0]; v++) {
+        char src[1024];
+        snprintf(src, sizeof src,
+                 "(do (set ws (take wt 20000))"
+                 " (set got (at (select {from: ws r: %s}) 'r))"
+                 " (set wI (at ws 'i)) (set wJ (at ws 'j)) (set wX (at ws 'x)) (set wD (at ws 'd))"
+                 " (set want (map (fn [k] (do (let i (at wI k)) (let j (at wJ k)) (let x (at wX k))"
+                 "  (let d (at wD k)) %s)) (til (count ws))))"
+                 /* mixed branches: the interpreter's atoms form a list */
+                 " (if (== (type want) 'LIST) (set want (as (type got) want)) 0)"
+                 " (and (== (type got) (type want)) (all (== got want))))", vals[v], vals[v]);
+        ray_t* ok = ray_eval_str(src);
+        bool good = ok && !RAY_IS_ERR(ok) && ok->type == -RAY_BOOL && ok->b8;
+        if (ok) { if (RAY_IS_ERR(ok)) ray_error_free(ok); else ray_release(ok); }
+        TEST_ASSERT_FMT(good, "if values differ from the interpreter: %s", vals[v]);
+    }
+    test_result_t res = { TEST_PASS, NULL };
+    for (int q = 0; q < NQ; q++) {
+        ray_t* a = ser[0][q];
+        ray_t* b = ser[1][q];
+        bool same = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) &&
+                    a->type == b->type && a->len == b->len &&
+                    memcmp(ray_data(a), ray_data(b), (size_t)a->len) == 0;
+        if (!same && res.status == TEST_PASS) {
+            static char msg[256];
+            snprintf(msg, sizeof msg, "worker counts disagree: %s", qs[q]);
+            res = (test_result_t){ TEST_FAIL, msg };
+        }
+        if (a) { if (RAY_IS_ERR(a)) ray_error_free(a); else ray_release(a); }
+        if (b) { if (RAY_IS_ERR(b)) ray_error_free(b); else ray_release(b); }
+    }
+    return res;
 }
 
 static test_result_t test_eval_select_parted_stats(void) {
@@ -13021,7 +13112,212 @@ static test_result_t test_dotted_local_read_slot(void) {
     PASS();
 }
 
+/* ---- Call profiler: every timed call closes its frame ---- */
+/* An error leaves a timed call by its normal return (the VM and the tree
+ * walker test for errors after the callee returns), so the frame stack is
+ * empty after each top-level expression, whatever failed inside it: a
+ * builtin's error in compiled code, caught or not, one inside a lambda run
+ * by map, one at top level, and a call that switched profiling off or
+ * reset it while frames were open. */
+static test_result_t test_callprof_error_unwinds(void) {
+    static const char* const setup[] = {
+        "(set pe-bad (fn [x] (+ x 'a)))",
+        "(set pe-map (fn [v] (map (fn [y] (+ y 'a)) v)))",
+        "(set pe-try (fn [x] (try (pe-bad x) 0)))",
+        "(set pe-deep (fn [x] (sum (map pe-try (til x)))))",
+        "(set pe-off (fn [] (.sys.profile.enable 0) (+ 1 2)))",
+        "(set pe-reset (fn [] (.sys.profile.reset) (map (fn [y] (+ y 1)) [1 2])))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    static const struct { const char* src; bool err; } runs[] = {
+        { "(pe-bad 1)",          true  },
+        { "(pe-map [1 2])",      true  },
+        { "(map pe-bad [1 2])",  true  },
+        { "(pe-try 1)",          false },
+        { "(pe-deep 4)",         false },
+        { "(+ 1 'a)",            true  },
+        { "(raise 'boom)",       true  },
+        { "(pe-reset)",          false },
+        { "(pe-off)",            false },
+    };
+    for (size_t i = 0; i < sizeof runs / sizeof *runs; i++) {
+        ray_callprof_set_enabled(true);
+        TEST_ASSERT_TRUE(ray_callprof_on());
+        ray_t* r = ray_eval_str(runs[i].src);
+        TEST_ASSERT_EQ_I(RAY_IS_ERR(r) ? 1 : 0, runs[i].err ? 1 : 0);
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    }
+    /* An erroring call is still counted at its site: from scratch, pe-deep
+     * reaches pe-bad's `+` once per element, each error caught by pe-try. */
+    ray_callprof_set_enabled(false);
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    ray_t* r = ray_eval_str("(pe-deep 4)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+    r = ray_eval_str("(sum (at (select {from: (.sys.profile) where: (== fn 'pe-bad)}) 'calls))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 4);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    PASS();
+}
+
+/* Rows of (.sys.profile), and the calls of the rows named `fn`. */
+static int64_t cp_rows(void) {
+    ray_t* r = ray_eval_str("(count (.sys.profile))");
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+static int64_t cp_calls(const char* fn) {
+    char q[256];
+    snprintf(q, sizeof q, "(sum (at (select {from: (.sys.profile) where: (== fn '%s)}) 'calls))", fn);
+    ray_t* r = ray_eval_str(q);
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+/* Every text request is a fresh parse.  Top-level sites are source
+ * positions, so repeats aggregate into the rows they had, the cap stays
+ * free for the sites that follow, and no request's parse tree outlives it. */
+static test_result_t test_callprof_repeated_requests(void) {
+    static const char* const setup[] = {
+        "(set rq-work (fn [x] (+ x 1)))",
+        "(set rq-later (fn [x] (* x 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    int64_t n = RAY_CALLPROF_SITES_MAX + 200;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* r = ray_eval_str("(rq-work 10)");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    /* A large literal per request: kept by nothing once it has run. */
+    char big[8192];
+    int len = snprintf(big, sizeof big, "(count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(big + len, sizeof big - (size_t)len, "%d ", i);
+    snprintf(big + len, sizeof big - (size_t)len, "])");
+    ray_t* r = ray_eval_str(big);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_mem_stats_t ms;
+    ray_mem_stats(&ms);
+    size_t mem0 = ms.bytes_allocated;
+    for (int i = 0; i < 300; i++) {
+        r = ray_eval_str(big);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 1000);
+        ray_release(r);
+    }
+    ray_mem_stats(&ms);
+    TEST_ASSERT_TRUE(ms.bytes_allocated < mem0 + 64 * 1024);
+    /* A lambda written in the request is compiled anew each time: its
+     * calls are one site all the same, and the profile pins none of its
+     * code.  (Requests that make lambdas retain some memory profiled or
+     * not: the bound is on what profiling adds.) */
+    char lam[8192];
+    len = snprintf(lam, sizeof lam, "((fn [] (count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(lam + len, sizeof lam - (size_t)len, "%d ", i);
+    snprintf(lam + len, sizeof lam - (size_t)len, "])))");
+    int64_t grow[2];
+    for (int on = 0; on < 2; on++) {
+        ray_callprof_set_enabled(on);
+        ray_mem_stats(&ms);
+        mem0 = ms.bytes_allocated;
+        for (int i = 0; i < 1000; i++) {
+            r = ray_eval_str(lam);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->i64, 1000);
+            ray_release(r);
+        }
+        ray_mem_stats(&ms);
+        grow[on] = (int64_t)ms.bytes_allocated - (int64_t)mem0;
+    }
+    TEST_ASSERT_TRUE(grow[1] < grow[0] + 512 * 1024);
+    r = ray_eval_str("(rq-later 5)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+
+    /* One row per callee at top level, every call counted: the requests'
+     * outermost calls share line 1 of `repl`, the callee tells them apart.
+     * The lambda requests' head is no name: one `<top>` row by their text,
+     * and one for the `fn` form inside.  rq-work's `+`, rq-later's `*` and
+     * the request lambda's `count` keep rows of their own; nothing folds
+     * into `<other>`. */
+    TEST_ASSERT_EQ_I(cp_rows(), 8);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("<top>count"), 301);
+    TEST_ASSERT_EQ_I(cp_calls("<top>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>fn"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<lambda@1>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<other>"), 0);
+    ray_callprof_reset();
+    PASS();
+}
+
+/* REPL lines and IPC requests are separate parses, each from line 1 column
+ * 1 of `repl`: different calls there are different rows, and so are
+ * lambdas defined on different lines at the same column. */
+static test_result_t test_callprof_repl_calls(void) {
+    static const char* const setup[] = {
+        "(set work (fn [n] (+ n 1)))",
+        "(set later (fn [n] (* n 2)))",
+        "(set wa (fn [n] (+ n 1)))",
+        "(set wb (fn [n] (* n 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    static const char* const lines[] = {
+        "(work 10)", "(work 10)", "(later 5)", "(neg 3)", "(wa 1)", "(wa 2)", "(wb 3)",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) {
+        ray_t* r = ray_eval_str(lines[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_set_enabled(false);
+    TEST_ASSERT_EQ_I(cp_rows(), 9);
+    TEST_ASSERT_EQ_I(cp_calls("<top>work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>neg"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wb"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("wb"), 1);
+    ray_callprof_reset();
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
+    { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
+    { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
@@ -13184,6 +13480,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/if_workers_same", test_eval_if_workers_same, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },

@@ -1198,6 +1198,7 @@ static const char* idx_golden_emit(const char* dir) {
         ray_encw_t w; memset(&w, 0, sizeof w);
         ray_encw_test_force_str(RAY_ENC_RAW);                  /* the subject is the region */
         ray_err_t e = f ? ray_encw_begin(&w, f, RAY_STR, 0, 300, 0, RAY_IDX_DICT, 0) : RAY_ERR_IO;
+        w.keep_dict = true;                                    /* whatever the DICT costs */
         const ray_t* own = ds;
         const char* pool = own->str_pool ? (const char*)ray_data(own->str_pool) : NULL;
         if (e == RAY_OK) e = ray_encw_chunk(&w, ray_data(ds), pool, 300);
@@ -2974,6 +2975,7 @@ static test_result_t test_dict_write_layout(void) {
     TEST_ASSERT_EQ_U(d.bytes_len, 7);
     for (int i = 16 + 48; i < 96; i++) TEST_ASSERT_EQ_I(b[i], 0);   /* kind-area tail, root padding */
     TEST_ASSERT_EQ_U(n, ix_p32((uint64_t)d.bytes + 7));
+    TEST_ASSERT_EQ_U(ray_enc_dict_region_bytes(s.len, s.n_distinct, s.bytes_len), n);   /* what encw weighs */
     uint64_t last; memcpy(&last, b + d.offs + 4 * 8, 8);
     TEST_ASSERT_EQ_U(last, 7);                                      /* the terminal offset */
     TEST_ASSERT_TRUE(memcmp(b + d.bytes, "abbdddd", 7) == 0);

@@ -3,7 +3,7 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile.enable`, `.sys.profile.reset` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging, profiling or execution behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.profile`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
@@ -14,8 +14,12 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.info`](#sys-info) | nullary | — | Host and process facts: cores, page size, total memory, pool size, pid, hostname. |
 | [`.sys.mem`](#sys-mem) | nullary | — | Allocator statistics. |
 | [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
+| [`.sys.profile`](#sys-profile) | nullary | — | Per-call-site profile of Rayfall code (file, line, function) as a table. |
+| [`.sys.profile.enable`](#sys-profile-enable) | variadic | restricted | Toggle the call profiler. |
+| [`.sys.profile.reset`](#sys-profile-reset) | nullary | restricted | Drop the call profiler's rows. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
+| [`.sys.join.par.min`](#sys-join-par-min) | variadic (0–1) | restricted | Read or set the probe-side row count from which a hash join's probe is split across the pool. |
 | [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Run allocator maintenance and return `0`; `(.sys.gc 1)` also releases free pages now, best effort. |
 | [`.sys.env`](#sys-env) | variadic (0–1) | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
@@ -209,6 +213,95 @@ time, so scanning that column finds the bottleneck directly.
 The `:t` command also prints this as an indented tree after each query,
 with self time, percent, and the same payload appended to every operator line.
 
+## `.sys.profile` { #sys-profile }
+
+Signature: `(.sys.profile)`. Returns the **call profile** as a table: one row
+per Rayfall call site that ran while the call profiler was on, highest self
+time first. Where `.sys.prof` breaks one query into engine operators,
+`.sys.profile` names the Rayfall code that spent the time — which line of
+which function — across everything the process ran, IPC requests included.
+
+A call site is a builtin call inside a compiled function (a `select`, a
+`left-join`, a `+`) or a call written in top-level code. Calls from one
+compiled function to another are not rows of their own: the callee's calls
+are its rows.
+
+A site is the code at a place in the source: its file, line and column,
+and what is there. A top-level call is told apart by its callee (`(work
+10)` and `(work 11)` share the `<top>work` row; `(later 5)` has its own),
+a call inside a function by the function's own place. Every IPC request
+and REPL line is parsed from line 1 of `repl`, so there the text tells
+sites apart too: lambdas written on different lines are different rows.
+Running the same text again adds to the rows it had, so a client sending
+the same request a thousand times, or a lambda written inside a request,
+keeps one set of rows. Each distinct site counts toward the 4096-site cap;
+calls at sites past it land in the `<other>` row until
+`(.sys.profile.reset)`.
+
+| Column | Meaning |
+|---|---|
+| `file` | Source file of the call (`repl` for typed or IPC text). |
+| `line` | 1-based line of the call; `0` when unknown. |
+| `fn` | The global the enclosing function is bound to (dotted names included); `<lambda@N>` for a function bound to no global, whose body starts on line N; `<top>NAME` for a top-level call to `NAME` (`<top>` when the head is not a name); `<other>` for calls past the 4096-site cap. |
+| `calls` | Times the call ran. Errors count. |
+| `self-ms` | Wall time inside the call, less the timed calls it made (a lambda run by `map`, say). Sums to the profiled time. |
+| `total-ms` | Wall time inside the call, its nested calls included. A site that calls itself counts its outermost activation. |
+| `busy-ms` | Time the worker pool spent while the call ran, less the timed calls it made: the parallel work the call dispatched. The call waits for the pool, so this is where pool time lands. |
+
+Profiling is off by default: `(.sys.profile.enable 1)` turns it on, and rows
+accumulate until `(.sys.profile.reset)`. Turning it off keeps the rows. Off,
+each call pays one predicted branch; on, each call reads the clock twice and
+updates its row, about 25 ns per call. A loop of cheap builtin calls (`<`,
+`+`) runs 1.5-1.9x slower profiled; beside a call that does real work (a
+join, a `select`) the cost vanishes.
+
+The profiler times the main thread, which runs the REPL, scripts and IPC
+requests. Calls on other threads that own a VM (an embedding host's, an IPC
+hook thread's) are not timed. Functions made inside a query run on the tree
+walker; their time stays in the call that ran them.
+
+### Finding the hot spot in a running service
+
+```lisp
+;; over IPC or at the REPL of the running process
+(.sys.profile.enable 1)
+;; ... let it serve traffic for a while ...
+(.sys.profile.enable 0)
+
+;; where the time went, by call site
+(select {from: (.sys.profile) where: (> self-ms 10.0)})
+
+;; by function
+(select {self: (sum self-ms) busy: (sum busy-ms) calls: (sum calls)
+         from: (.sys.profile) by: fn})
+
+;; the calls that kept the worker pool busy
+(select {from: (.sys.profile) where: (> busy-ms 0.0)})
+
+(.sys.profile.reset)   ;; start the next measurement from zero
+```
+
+A row with a large `busy-ms` beside a small `self-ms` is a call that spread
+its work over the pool — a join or a grouped `select`, typically; a large
+`self-ms` with `busy-ms` near zero ran on the calling thread alone.
+
+## `.sys.profile.enable` { #sys-profile-enable }
+
+Signature: `(.sys.profile.enable [flag])`. Toggles the call profiler, as
+`.sys.querylog.enable` toggles logging: no argument flips the current state,
+`0` disables, anything non-zero enables. Returns the new state as `i64`
+(0/1). Restricted under `-U`.
+
+```lisp
+(.sys.profile.enable 1)   ;; => 1  (profiling on)
+(.sys.profile.enable)     ;; => 0  (flip: now off)
+```
+
+## `.sys.profile.reset` { #sys-profile-reset }
+
+Signature: `(.sys.profile.reset)`. Drops every row of the call profile;
+whether profiling is on does not change. Returns null. Restricted under `-U`.
+
 ## `.sys.querylog` { #sys-querylog }
 
 Signature: `(.sys.querylog)`. Returns the **query-statistics ring** as a table —
@@ -264,6 +357,37 @@ server-wide behaviour.
 ```
 
 The `-Q` startup flag is the equivalent for enabling logging from launch.
+
+## `.sys.join.par.min` { #sys-join-par-min }
+
+Signature: `(.sys.join.par.min [rows])`. Reads or sets the probe-side row count
+from which a hash join's probe is split across the thread pool. No argument
+returns the current value; an `i64` of `0` or more sets it. Either way it
+returns the value in effect. Anything else is an error: a negative or null
+count is a `domain` error, a non-`i64` a `type` error, more than one argument an
+`arity` error. Restricted under `-U`, since it changes execution for the whole
+process.
+
+The default is `8193`. The probe runs in morsels of 8192 rows, and a probe of
+more than one morsel goes to the pool, so values from `0` to `8193` all give the
+default behaviour. Raising the value makes probes below it run on the calling
+thread. That trades latency for CPU: past a few workers, a small parallel probe
+costs more CPU than it saves in wall time. Most of the extra is the main thread
+spinning while it waits for the slowest worker, not extra work. The answer is
+the same either way, rows and row order included.
+
+```lisp
+(.sys.join.par.min)          ;; => 8193   (the default)
+(.sys.join.par.min 65536)    ;; => 65536  probes under 65536 rows stay serial
+(.sys.join.par.min 8193)     ;; => 8193   back to the default
+```
+
+Set it in the startup script of a process that is not latency-bound. `-c` sets
+how many threads the pool may use; this knob sets how large a join must be
+before it uses them. The pool stays available for the rare large job while the
+steady small joins run serially. See
+[parallel probe floor](../queries/joins.md#parallel-probe-floor) for which joins
+it covers and the measured trade-off.
 
 ## `.sys.gc` { #sys-gc }
 

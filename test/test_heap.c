@@ -83,6 +83,7 @@ static int munmap(void* p, size_t len) {
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>   /* fstat: spill-file link count */
+#include <sched.h>      /* sched_yield: a task waiting for the other workers */
 #endif
 #if defined(__linux__)
 #include <sys/inotify.h>  /* IN_ACCESS: when the cgroup files are read */
@@ -4870,22 +4871,45 @@ static test_result_t test_relieve_visit_drains(void) {
  * many empty pools, none of them its last. */
 #define RELIEVE_WORKERS 64
 typedef struct {
-    _Atomic(int) ran[RELIEVE_WORKERS];
-    ray_t*       keep[RELIEVE_WORKERS];
-    int          empty;
+    _Atomic(int)      ran[RELIEVE_WORKERS];
+    ray_t*            keep[RELIEVE_WORKERS];
+    int               empty;
+    uint32_t          need;    /* workers that must have run a task */
+    _Atomic(uint32_t) done;    /* workers that have */
 } relieve_workers_t;
+
+/* Hold the calling thread in its task until every worker has run one (10 s
+ * at most): a thread that waits takes no further task, so the dispatch's
+ * other tasks are left for the workers that have not run yet, however late
+ * they wake. */
+static void relieve_worker_wait(relieve_workers_t* w) {
+    int64_t t0 = ray_time_now_ms();
+    while (atomic_load_explicit(&w->done, memory_order_acquire) < w->need &&
+           ray_time_now_ms() - t0 < 10000) {
+#if defined(_WIN32)
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+}
 
 static void relieve_worker_task(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)start; (void)end;
     relieve_workers_t* w = raw;
-    if (wid == 0 || wid >= RELIEVE_WORKERS) return;   /* the dispatching thread */
+    if (wid == 0 || wid >= RELIEVE_WORKERS) {   /* the dispatching thread */
+        relieve_worker_wait(w);
+        return;
+    }
     if (!w->keep[wid]) w->keep[wid] = ray_alloc(RELIEVE_HALF);
     ray_t* b[4] = {0};
     int n = w->empty < 1 ? 1 : w->empty > 4 ? 4 : w->empty;
     for (int i = 0; i < n; i++)
         if ((b[i] = ray_alloc(RELIEVE_HALF))) memset(ray_data(b[i]), 1, 4096);
     for (int i = 0; i < n; i++) if (b[i]) ray_free(b[i]);
-    atomic_store_explicit(&w->ran[wid], 1, memory_order_relaxed);
+    if (!atomic_exchange_explicit(&w->ran[wid], 1, memory_order_relaxed))
+        atomic_fetch_add_explicit(&w->done, 1, memory_order_release);
+    relieve_worker_wait(w);
 }
 
 /* The empty pools each worker is to keep for at least `pools` in all,
@@ -4896,18 +4920,18 @@ static int relieve_worker_share(int pools) {
     return n > 0 ? (pools + n - 1) / n : 1;
 }
 
-/* Dispatch until every worker has run a task; false without workers. */
+/* Dispatch until every worker has run a task; false without workers.  A
+ * task's thread waits for the others in it (relieve_worker_wait), so one
+ * dispatch of more tasks than threads reaches every worker. */
 static bool relieve_worker_pool(relieve_workers_t* w) {
     ray_pool_t* pool = ray_pool_get();
     if (!pool || pool->n_workers == 0 || pool->n_workers >= RELIEVE_WORKERS) return false;
-    uint32_t n = pool->n_workers, done = 0;
+    uint32_t n = pool->n_workers;
     for (uint32_t i = 1; i <= n; i++) atomic_store(&w->ran[i], 0);
-    for (int round = 0; round < 1000 && done < n; round++) {
-        ray_pool_dispatch_n(pool, relieve_worker_task, w, 64);
-        done = 0;
-        for (uint32_t i = 1; i <= n; i++) done += atomic_load(&w->ran[i]) != 0;
-    }
-    return done == n;
+    w->need = n;
+    atomic_store(&w->done, 0);
+    ray_pool_dispatch_n(pool, relieve_worker_task, w, RELIEVE_WORKERS);
+    return atomic_load(&w->done) == n;
 }
 
 static void relieve_count_pools(ray_heap_t* h, void* ctx) {
@@ -4917,6 +4941,108 @@ static uint32_t relieve_worker_pools(void) {
     uint32_t n = 0;
     ray_pool_each_worker_heap(relieve_count_pools, &n);
     return n;
+}
+
+#define RELIEVE_PIN_WORKERS 2
+static void relieve_snap_pools(ray_heap_t* h, void* ctx) {
+    uint32_t* s = ctx;
+    if (s[0] < RELIEVE_PIN_WORKERS) s[1 + s[0]++] = h->pool_count;
+}
+/* Each worker's pool count, in the order heap_make_room visits them; false
+ * unless there are exactly RELIEVE_PIN_WORKERS. */
+static bool relieve_worker_snap(uint32_t out[RELIEVE_PIN_WORKERS]) {
+    uint32_t s[1 + RELIEVE_PIN_WORKERS] = {0};
+    ray_pool_each_worker_heap(relieve_snap_pools, s);
+    memcpy(out, s + 1, sizeof(uint32_t) * RELIEVE_PIN_WORKERS);
+    return s[0] == RELIEVE_PIN_WORKERS;
+}
+/* A 48 MB block 24 MB short of room, with only the workers' empty pools to
+ * make it: true if it spilled. */
+static bool relieve_short_block_spills(void) {
+    ray_heap_direct_cache_drain();
+    ray_heap_set_anon_watermark(ray_heap_anon_committed() + 24 * RELIEVE_MB);
+    ray_t* d = ray_alloc((size_t)48 << 20);
+    bool spilled = d && ray_direct_file_backed(d);
+    if (d) ray_free(d);
+    ray_heap_direct_cache_drain();
+    ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    return spilled;
+}
+
+/* A large block short of room takes the parked pool workers' empty pools
+ * rather than spill — worker after worker, only until it fits — when it is
+ * allocated on the main VM's thread with no dispatch in flight (#750).  Not
+ * on a thread without it, and not while ray_parallel_flag is up: a worker
+ * may be allocating then.  The pool is pinned to two workers, each left
+ * with a live block and two empty pools. */
+static test_result_t test_relieve_make_room_workers(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    uint32_t prev_total = ray_pool_live() ? ray_pool_size() : 0;
+    ray_pool_destroy();
+    ray_pool_init(RELIEVE_PIN_WORKERS);
+    static relieve_workers_t w;
+    memset(&w, 0, sizeof w);
+    w.empty = 2;
+    static ray_vm_t vm0;                          /* the main VM, bound below */
+    ray_vm_init(&vm0, 0);
+    ray_vm_t* vm_prev = __VM;
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+
+    /* Whether a short block can spill at all: before the workers hold any
+     * empty pool, and off the main VM inside a dispatch besides. */
+    __VM = NULL;
+    atomic_store(&ray_parallel_flag, 1);
+    bool can_spill = h && relieve_short_block_spills();
+    atomic_store(&ray_parallel_flag, 0);
+
+    bool workers = h && relieve_worker_pool(&w);
+    uint32_t p0[RELIEVE_PIN_WORKERS], p1[RELIEVE_PIN_WORKERS], p2[RELIEVE_PIN_WORKERS],
+             p3[RELIEVE_PIN_WORKERS], p4[RELIEVE_PIN_WORKERS];
+    workers = workers && relieve_worker_snap(p0);
+
+    /* No main VM on this thread: the workers' heaps are not its to touch. */
+    __VM = NULL;
+    bool spill_novm = workers && relieve_short_block_spills();
+    bool kept_novm = workers && relieve_worker_snap(p1) && !memcmp(p0, p1, sizeof p0);
+
+    /* An IPC hook's temporary VM (id -1): not that either. */
+    static ray_vm_t vmx;
+    ray_vm_init(&vmx, -1);
+    __VM = &vmx;
+    bool spill_ipc = workers && relieve_short_block_spills();
+    bool kept_ipc = workers && relieve_worker_snap(p4) && !memcmp(p0, p4, sizeof p0);
+
+    /* The main VM's thread, inside a dispatch: not then either. */
+    __VM = &vm0;
+    atomic_store(&ray_parallel_flag, 1);
+    bool spill_par = workers && relieve_short_block_spills();
+    atomic_store(&ray_parallel_flag, 0);
+    bool kept_par = workers && relieve_worker_snap(p2) && !memcmp(p0, p2, sizeof p0);
+
+    /* The main VM's thread between dispatches: the first worker's empty
+     * pools make the room, the second keeps its own. */
+    bool spill_main = !workers || relieve_short_block_spills();
+    bool took = workers && relieve_worker_snap(p3)
+             && p3[0] + 2 <= p0[0] && p3[1] == p0[1];
+    __VM = vm_prev;
+
+    for (int i = 0; i < RELIEVE_WORKERS; i++) if (w.keep[i]) ray_free(w.keep[i]);
+    relieve_env_end(&e, h, NULL);
+    ray_pool_destroy();
+    if (prev_total) ray_pool_init_total(prev_total);
+    if (!can_spill) SKIP("no spill file");
+    if (!workers) SKIP("no pool workers");
+    TEST_ASSERT(spill_novm && kept_novm, "without the main VM the block spilled, the workers kept their pools");
+    TEST_ASSERT(spill_ipc && kept_ipc, "under an IPC hook's VM the block spilled, the workers kept their pools");
+    TEST_ASSERT(spill_par && kept_par, "inside a dispatch the block spilled, the workers kept their pools");
+    TEST_ASSERT(!spill_main, "between dispatches the block fit in the workers' empty pools");
+    TEST_ASSERT_FMT(took, "the first worker gave its empty pools, the second none "
+                    "(before %u %u, after %u %u)", p0[0], p0[1], p3[0], p3[1]);
+    PASS();
 }
 
 /* A relief that takes the pool workers' empty pools leaves the heap that
@@ -6599,6 +6725,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_spill_only",       test_relieve_spill_only,          heap_setup, heap_teardown },
     { "heap/relieve_make_room",        test_relieve_make_room,           heap_setup, heap_teardown },
     { "heap/relieve_make_room_drains", test_relieve_make_room_drains,    heap_setup, heap_teardown },
+    { "heap/relieve_make_room_workers", test_relieve_make_room_workers,  heap_setup, heap_teardown },
     { "heap/relieve_visit_drains",     test_relieve_visit_drains,        heap_setup, heap_teardown },
     { "heap/relieve_spill_reads",      test_relieve_spill_reads,         heap_setup, heap_teardown },
     { "heap/relieve_spilled_keeps",    test_relieve_spilled_keeps,       heap_setup, heap_teardown },

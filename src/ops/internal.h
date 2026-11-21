@@ -1101,6 +1101,12 @@ extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_join_no_prefilter;
 extern uint64_t ray_join_prefilter_builds;
 extern _Atomic(uint64_t) ray_join_prefilter_skips;
+/* #599: settable dispatch floor of the chained probe (.sys.join.par.min).
+ * The default is one join morsel plus one row: the split rule before #599. */
+#define RAY_JOIN_PAR_MIN_DEFAULT 8193
+int64_t  ray_join_par_min(void);
+void     ray_join_set_par_min(int64_t rows);
+extern _Atomic(uint64_t) ray_join_par_probes; /* count + fill dispatches */
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
@@ -1505,6 +1511,10 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
  * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
  * Disarmed by ray_test_hooks_off. */
 void ray_query_test_cd_route(int route);
+/* query.c test hook: true turns off ray_select_impl's net (a select that
+ * answers while the pool's dispatches were cancelled answers `cancel`), so a
+ * test pins each stage's own check.  Disarmed by ray_test_hooks_off. */
+void ray_query_test_cancel_net_off(bool off);
 /* query.c test hook: the largest unordered take the rewrite's first-N pick
  * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
  * first row is found.  Negative restores the default; disarmed by
@@ -1867,6 +1877,15 @@ bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
  * and materializations only?  Defined in opt.c; the correspondence
  * ray_expr_subset_invariant leaves to its caller. */
 bool filter_input_default_domain(ray_graph_t* g, uint32_t id);
+
+/* Does every node under `root_id` read only its own row or run over the
+ * whole table (a running, moving or shift function, #916)?  Defined in
+ * group.c; an aggregate, an order or distinct op, or anything else whose
+ * value depends on which rows a where: keeps answers false. */
+bool ray_group_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id);
+/* Does every node under `root_id` read only its own row?  Defined in
+ * group.c (group_expr_src_syms). */
+bool ray_group_expr_rowlocal_ok(ray_graph_t* g, uint32_t root_id);
 
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.
