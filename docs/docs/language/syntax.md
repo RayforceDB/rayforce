@@ -229,15 +229,18 @@ the bare null `0N`, or a literal of the suffix's own type (`[1h 2 3h]`,
 [1 0Nl 3h]      ; error: 0Nl is an I64 null
 [40000 1h]      ; error: 40000 is out of the I16 range
 [1.5 2h]        ; error: a float literal under h or i
+[1 2h 3]        ; error: the suffix must be on the last element
 ```
 
 Under `h` and `i` an integer must fit the type (`-32767..32767` for `I16`,
 `-2147483647..2147483647` for `I32`) and a float literal, `2.0` or `1e3`
 included, is an error. Under `e` integers and floats narrow as `(as 'F32 ...)`
 does, so `[1e39 1e]` saturates its first element to `3.40e+38e`. The suffix is
-read on input only: printed and `repr` output keep a suffix on every element,
-so saved text reads back with the same type. `read-value` accepts the same
-vector grammar.
+read on input only: `repr` and the REPL display keep a suffix on every element
+(`[1h 2h 3h]`), so saved text reads back with the same type; `format` and
+`println` print the bare numbers. `read-value` accepts the same vector grammar
+but, as for its scalars, rejects a lossy element: a float past the F32 range
+under `e`, or an integer past the I64 range.
 
 ### Vector Arithmetic
 

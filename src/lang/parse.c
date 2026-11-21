@@ -27,6 +27,7 @@
 #include "lang/env.h"
 #include "core/numparse.h"
 #include "lang/format.h"   /* ray_type_name, ray_fmt_null_literal */
+#include "core/platform.h" /* RAY_UNLIKELY */
 #include "table/sym.h"   /* RAY_SYM_W64 */
 #include <string.h>
 #include <limits.h>
@@ -92,7 +93,7 @@ typedef struct {
     int32_t col;
     ray_t  *nfo;
     int32_t depth;   /* recursion depth guard (see RAY_PARSE_MAX_DEPTH) */
-    bool    nul_l;   /* the open vector literal holds a 0Nl (see parse_vector) */
+    bool    nul_l;   /* a 0Nl was parsed since parse_vector last cleared it */
 } ray_parser_t;
 
 /* Recursive-descent depth ceiling.  Container literals (lists, vectors,
@@ -632,8 +633,9 @@ static ray_t* parse_name(ray_parser_t *p) {
  * typed null), an unsuffixed integer or float, or bare 0N; any other element,
  * 0Nl and 0Nf included, conflicts.  Under h and i an integer must fit and a
  * float literal is an error; under e every element narrows as the F32 cast
- * does.  `nul_l` says the literal held a 0Nl, whose atom is that of 0N. */
-static ray_t* vec_by_suffix(ray_t** e, int32_t n, int8_t vt, bool nul_l) {
+ * does.  `nul_l_at` is the first element that held a 0Nl (-1 for none): its
+ * atom is that of 0N. */
+static ray_t* vec_by_suffix(ray_t** e, int32_t n, int8_t vt, int32_t nul_l_at) {
     char sfx = vt == RAY_I16 ? 'h' : vt == RAY_I32 ? 'i' : 'e';
     int64_t lim = vt == RAY_I16 ? 32767 : 2147483647LL;
     ray_t* vec = ray_vec_new(vt, n);
@@ -652,7 +654,7 @@ static ray_t* vec_by_suffix(ray_t** e, int32_t n, int8_t vt, bool nul_l) {
             else                    f[i] = (float)a->f64;   /* F32 atoms keep the f64 slot */
             continue;
         }
-        if (a->type == -RAY_I64 && !(null && nul_l)) {
+        if (a->type == -RAY_I64 && !(null && i == nul_l_at)) {
             if (null) { ray_vec_set_null(vec, i, true); continue; }
             int64_t v = a->i64;
             if (vt == RAY_F32) { f[i] = (float)v; continue; }
@@ -692,7 +694,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
     int32_t count = 0;
 
     skip_ws_and_comments(p);
-    bool outer_nul_l = p->nul_l;
+    int32_t nul_l_at = -1;   /* the first element holding a 0Nl */
     p->nul_l = false;
     while (*p->pos && *p->pos != ']') {
         if (count == cap) {
@@ -720,11 +722,13 @@ static ray_t* parse_vector(ray_parser_t *p) {
             ray_free(elems_buf);
             return elem;
         }
+        if (RAY_UNLIKELY(p->nul_l)) {
+            if (nul_l_at < 0) nul_l_at = count;
+            p->nul_l = false;
+        }
         elems[count++] = elem;
         skip_ws_and_comments(p);
     }
-    bool nul_l = p->nul_l;
-    p->nul_l = outer_nul_l;
     if (*p->pos != ']') {
         for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
         ray_free(elems_buf);
@@ -859,7 +863,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
     /* [1 2 3h]: a final h, i or e suffix types the whole vector. */
     int8_t last_type = elems[count - 1]->type;
     if (last_type == -RAY_I16 || last_type == -RAY_I32 || last_type == -RAY_F32) {
-        ray_t* vec = vec_by_suffix(elems, count, (int8_t)-last_type, nul_l);
+        ray_t* vec = vec_by_suffix(elems, count, (int8_t)-last_type, nul_l_at);
         for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
         ray_free(elems_buf);
         return vec;

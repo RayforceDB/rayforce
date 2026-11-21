@@ -65,7 +65,9 @@ Things worth knowing:
   [typed vector literal](syntax.md#typed-vector-literals) rules: `[1 2.5]` is
   `F64` and `[1 2 3h]` is `I16`, while `[1h 2i]`, `[1 0Nl 3h]` and `[1.5 2h]`
   are `parse` errors and `[40000 1h]` is a `domain` error. Under a final `e`
-  a float past the F32 range is an error, as it is for the scalar `1e39e`.
+  a float past the F32 range is an error, as it is for the scalar `1e39e`,
+  where the language saturates it; an integer past the I64 range is an error
+  under every suffix.
 - A bare name inside `[...]` is a symbol, as in the language (`[a b]` is
   `['a 'b]`). Outside brackets a bare name is an error.
 - `list`, `dict`, `table` and `as` are keywords of this grammar. They are not
