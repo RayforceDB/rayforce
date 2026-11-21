@@ -184,6 +184,37 @@ The shared symbol table lives in the parted root (`db/`) as the dotfile
 per table name (`db/<date>/<table>/cols`). Partitions have no own symfile and
 encode their SYM columns (e.g. `sym`) against the shared `.sym`.
 
+### Writing a Partitioned Database from Rayfall
+
+There is no `.db.parted.set`. The supported way to write a partitioned database is to save each partition's table with `.db.splayed.set` into `<root>/<partition>/<table>`, passing the root's one shared symbol file. `.db.parted.get` then loads the result.
+
+```lisp
+(set root "/data/db")
+(set symfile (format "%/.sym" root))
+(.db.splayed.set (format "%/0/ohlcv" root) t0 symfile)
+(.db.splayed.set (format "%/1/ohlcv" root) t1 symfile)
+(.db.parted.get root 'ohlcv)              ; adds the `part` column
+```
+
+What this guarantees:
+
+- **Directories.** `.db.splayed.set` creates the partition directory and any missing parents; nothing needs to exist beforehand.
+- **Partition names.** Any name `.db.parted.get` accepts is a partition: dates (`2024.01.15`), timestamps (`YYYY.MM.DD.HH.MM.SS`) or plain integers. Integer names need not start at 0, be consecutive or be zero-padded; they are ordered by value (`1`, `2`, `10`), and the `part` column is `I64`. See [`.db.parted.get`](../namespaces/db.md#db-parted-get) for the full rule and for how mixed names are handled.
+- **Shared symbol file.** Pass the same `sym_path` (conventionally `<root>/.sym`) for every partition and every table of the root. `SYM` columns of all partitions then share one vocabulary, which is what the loader reads (see [Symbol Table Persistence](#symbol-table-persistence)). New symbols append to the file, so partitions can be written one at a time, in any order.
+- **Pruning.** A predicate on the key (`(== part 7)`, `(> date 2024.01.15)`) prunes from the directory names alone; it needs no `compress` option. `compress: true` matters only for pruning on a *data* column, whose per-partition minimum and maximum are kept for compressed columns and for plain columns of 65,536 rows or more.
+- **Tables in every partition.** Write each table into every partition. A table that appears in later partitions only, because it was added midway, is handled by `.db.parted.fill`, which gives every partition that lacks a table an empty copy of it. It does not change existing data and a repeat call is a no-op.
+
+### Writing a Parted Table as One Splayed Table
+
+`.db.splayed.set` takes a parted table as it takes any other, and writes it a partition segment at a time: the table is never held in memory. Use it to merge the partitions of a root into one larger partition, or to copy a parted table elsewhere.
+
+```lisp
+(set P (.db.parted.get "/data/db" 'trades))
+(.db.splayed.set "/data/merged/2024.01/trades" (xcols P (drop (cols P) 1)) "/data/merged/.sym")
+```
+
+The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null). The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds; only a string column's dictionary index (up to about 12 bytes a row while it is built, `{index: false}` skips it) grows with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
+
 ### Loading Partitioned Data
 
 The `ray_read_parted()` function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with [parted columns](../data-types/collections.md#partitioned-columns) and a virtual `MAPCOMMON` date column.
@@ -232,6 +263,8 @@ These limits apply only to the added proofs, not ordinary atomic traversal. Unsu
 ```
 
 The example assumes `account` and `qty` are I64 columns. A declined proof changes optimization, not permission to substitute a different query result.
+
+A predicate on a parted integer or temporal data column prunes as well, by the partitions' statistics: the non-null minimum and maximum of a column saved with `compress: true` (its chunk directory) or of a plain column of 65,536 rows or more (its chunk zone). A partition is dropped only when they decide the comparison false for every row, by the rule row-level zone skipping uses, so nulls are kept and a partition without statistics is kept. `(> time 2024.01.16D12:00:00.000)` over a date-partitioned table thus reads the partitions whose `time` range reaches past the literal and no other. Partition directories may also be named `YYYY.MM.DD.HH.MM.SS`, which gives a `timestamp` partition key. See [`.db.parted.get`](../namespaces/db.md#db-parted-get).
 
 ## Symbol Table Persistence
 
@@ -363,6 +396,8 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 ```
 
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
+
+The table may be a parted one: it is then written a partition segment at a time, never held in memory (see [Writing a Parted Table as One Splayed Table](#writing-a-parted-table-as-one-splayed-table)).
 
 A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked and nested/list columns are always written uncompressed. Compressed files record their indexes in the file header: those you built, and the dictionary or chunk zone a save builds on its own.
 

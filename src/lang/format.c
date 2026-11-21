@@ -55,6 +55,8 @@ typedef struct {
                          * only for modes that never read back what they
                          * appended (mode 2) */
     bool    io_err;     /* err was a failed write to sink */
+    int64_t limit;      /* when non-zero, output beyond this many bytes is an error */
+    bool    over_limit; /* err was the byte limit */
     bool    flushed;    /* some output already reached sink */
     char    cause_code[16];   /* code of the error that stopped a column from loading */
     char    cause_msg[192];   /* its detail (names the column file) */
@@ -77,6 +79,8 @@ static void fmt_init(fmt_buf_t* b) {
     b->sink    = NULL;
     b->io_err  = false;
     b->flushed = false;
+    b->limit   = 0;
+    b->over_limit = false;
     b->cause_code[0] = '\0';
     b->cause_msg[0]  = '\0';
     b->block   = ray_alloc(256);
@@ -103,7 +107,7 @@ static void fmt_destroy(fmt_buf_t* b) {
 /* extra is int64 so a >2GiB length from a call site reaches the ceiling check
  * intact instead of wrapping int32 first (a length in [2^31,2^32) used to wrap
  * negative and, via the fast path below, sneak past as a no-grow "fit"). */
-static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
+static void fmt_ensure_space(fmt_buf_t* b, int64_t extra, bool terminator) {
     if (b->err) return;
     /* Guard a negative/oversize request BEFORE the fast-path return: for a
      * negative extra, need = len + extra < len <= cap, so the fast path would
@@ -118,6 +122,12 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
         b->flushed = true;
     }
     int64_t need = (int64_t)b->len + extra;
+    if (b->limit && need > b->limit) {
+        b->err = true; b->over_limit = true; b->err_msg = "output exceeds the byte limit";
+        return;
+    }
+    /* vsnprintf needs a NUL slot that is not part of the output limit. */
+    if (terminator) need++;
     if (need <= (int64_t)b->cap) return;
     if (need > (int64_t)INT32_MAX) {
         /* int32 buffer ceiling: the doubling loop and cap field are int32, so
@@ -141,6 +151,10 @@ static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
     b->block = new_block;
     b->buf   = new_buf;
     b->cap   = (int32_t)new_cap;   /* new_cap <= INT32_MAX by the clamp above */
+}
+
+static void fmt_ensure(fmt_buf_t* b, int64_t extra) {
+    fmt_ensure_space(b, extra, false);
 }
 
 static void fmt_putc(fmt_buf_t* b, char c) {
@@ -169,13 +183,20 @@ static void fmt_printf(fmt_buf_t* b, const char* fmt, ...) {
 
     if (n < 0) return; /* encoding error */
 
+    /* The byte limit is checked here too: text that fits the current capacity
+     * never reaches fmt_ensure, where the other writers check it. */
+    if (b->limit && (int64_t)b->len + n > b->limit) {
+        b->err = true; b->over_limit = true; b->err_msg = "output exceeds the byte limit";
+        return;
+    }
+
     if (n < avail) {
         b->len += n;
         return;
     }
 
     /* Need more space — grow and retry */
-    fmt_ensure(b, (int64_t)n + 1);
+    fmt_ensure_space(b, n, true);
     if (b->err) return;
     va_start(ap, fmt);
     vsnprintf(b->buf + b->len, (size_t)(b->cap - b->len), fmt, ap);
@@ -192,6 +213,11 @@ static void fmt_putn(fmt_buf_t* b, const char* s, int64_t n) {
 
 static ray_t* fmt_to_str(fmt_buf_t* b) {
     if (b->err) {
+        if (b->over_limit) {
+            int64_t lim = b->limit;
+            fmt_destroy(b);
+            return ray_error("limit", "repr: output exceeds the limit of %lld bytes", (long long)lim);
+        }
         ray_t* e = b->cause_code[0]
             ? ray_error(b->cause_code, "%s: %s", b->err_msg, b->cause_msg)
             : ray_error("format", "%s", b->err_msg ? b->err_msg : "output buffer error");
@@ -202,6 +228,20 @@ static ray_t* fmt_to_str(fmt_buf_t* b) {
     fmt_destroy(b);
     return result;
 }
+
+#ifdef DEBUG
+/* Exercise the printf growth path directly: language repr values usually
+ * finish with a delimiter, so they do not expose its exact-limit boundary. */
+ray_t* ray_fmt_test_printf_growth(int64_t limit) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    if (b.err) return fmt_to_str(&b);
+    b.cap = 5;
+    b.limit = limit;
+    fmt_printf(&b, "%d", 12345);
+    return fmt_to_str(&b);
+}
+#endif
 
 /* ===== Static globals ===== */
 
@@ -1847,6 +1887,14 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
 ray_t* ray_fmt(ray_t* obj, int mode) {
     fmt_buf_t b;
     fmt_init(&b);
+    fmt_obj(&b, obj, mode);
+    return fmt_to_str(&b);
+}
+
+ray_t* ray_fmt_limited(ray_t* obj, int mode, int64_t max_bytes) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    b.limit = max_bytes;
     fmt_obj(&b, obj, mode);
     return fmt_to_str(&b);
 }

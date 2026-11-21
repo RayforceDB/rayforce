@@ -106,6 +106,9 @@ than running it. C tests use `#ifndef RAY_OS_WINDOWS` / `SKIP(...)` for the
 same purpose. Prefer the shell-free helpers `ray_test_rm_rf` /
 `ray_test_mkdir_p` (`test/test.h`) over `system("rm -rf …")` in C tests.
 
+The test driver puts its scratch files under the directory `TMPDIR` names, so set
+it to an existing disk-backed directory to keep them off a RAM-backed `/tmp`.
+
 ### Windows
 
 Build with the MSYS2 CLANG64 (or MINGW64) toolchain — `pacman -S

@@ -22,6 +22,7 @@
  */
 
 #include "ops/colbind.h"
+#include "ops/temporal.h"   /* ray_temporal_trunc_type */
 #include "graph.h"
 #include "internal.h"   /* EXT_TRAIL, graph_alloc_ext_node_ex */
 #include "store/csr.h"
@@ -544,13 +545,15 @@ static int8_t cmp_temporal_type(ray_graph_t* g, ray_op_t* x) {
     int8_t t = x->out_type;
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     if (t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP) return t;
-    /* A date-partitioned table's key scans as MAPCOMMON over DATE values. */
+    /* A date- or timestamp-partitioned table's key scans as MAPCOMMON over
+     * DATE or TIMESTAMP values. */
     if (t == RAY_MAPCOMMON && x->opcode == OP_SCAN && g->table) {
         ray_op_ext_t* ext = find_ext(g, x->id);
         ray_col_meta_t m;
-        if (ext && ray_table_col_meta(g->table, ext->sym, &m)
-            && m.type == RAY_MAPCOMMON && m.attrs == RAY_MC_DATE)
-            return RAY_DATE;
+        if (ext && ray_table_col_meta(g->table, ext->sym, &m) && m.type == RAY_MAPCOMMON) {
+            if (m.attrs == RAY_MC_DATE) return RAY_DATE;
+            if (m.attrs == RAY_MC_TIMESTAMP) return RAY_TIMESTAMP;
+        }
     }
     return 0;
 }
@@ -1479,7 +1482,8 @@ ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field) {
     ext->base.opcode = OP_EXTRACT;
     ext->base.arity = 1;
     ext->base.in_id[0] = col->id;
-    ext->base.out_type = RAY_I64;
+    ext->base.out_type = field == RAY_EXTRACT_DATE ? RAY_DATE
+                       : field == RAY_EXTRACT_TIME ? RAY_TIME : RAY_I64;
     ext->base.est_rows = est;
     ext->sym = field;
 
@@ -1488,6 +1492,16 @@ ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field) {
 }
 
 ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field) {
+    /* Not a truncation unit (a TIMESTAMP takes every real one): no op. */
+    if (!ray_temporal_trunc_type(RAY_TIMESTAMP, (int)field)) return NULL;
+    /* The result keeps the column's type.  A pairing the type does not allow
+     * (a clock unit on a DATE, a calendar unit on a TIME, a non-temporal
+     * column) is built anyway and fails at execution with the type error. */
+    int8_t in_t = col->out_type;
+    if (RAY_IS_PARTED(in_t)) in_t = (int8_t)RAY_PARTED_BASETYPE(in_t);
+    int8_t out_t = ray_temporal_trunc_type(in_t, (int)field);
+    if (!out_t) out_t = in_t;
+
     uint32_t col_id = col->id;
     uint32_t est = col->est_rows;
 
@@ -1498,7 +1512,7 @@ ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field) {
     ext->base.opcode = OP_DATE_TRUNC;
     ext->base.arity = 1;
     ext->base.in_id[0] = col->id;
-    ext->base.out_type = RAY_TIMESTAMP;  /* returns timestamp (microseconds) */
+    ext->base.out_type = out_t;
     ext->base.est_rows = est;
     ext->sym = field;
 

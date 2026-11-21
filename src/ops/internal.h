@@ -923,9 +923,12 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
 /* The rows a `where:` keeps, sampled for the distinct-count route gate
  * (query.c; exposed for the contract tests): the table rows surviving the
  * predicate among CD_GATE_WHERE_SAMPLE sampled ones in *rows, *nrows of
- * them, *population the rows the whole predicate would keep.  NULL (the
- * outputs then describe the whole table) when the predicate names no
- * column the gather covers or keeps every sampled row. */
+ * them, *population the rows the whole predicate would keep.  The sample is
+ * drawn from the P rows of the chunks the zone gate lets through; when it
+ * keeps every sampled row, those sampled rows with *population = P, or NULL
+ * with *population the table's rows when no chunk was ruled out.  NULL with
+ * *population 0 (the outputs describe the whole table) when the predicate
+ * names no column the gather covers. */
 ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
                                 const int64_t** rows, int64_t* nrows, int64_t* population);
 
@@ -1094,6 +1097,10 @@ extern uint64_t ray_join_dup_fallbacks;
 extern uint64_t ray_join_null_fallbacks;
 extern bool     ray_join_force_null_checks;
 extern uint64_t ray_join_nullfree_keys;
+/* #595: right-side key bitmap prefilter on the chained probe */
+extern bool     ray_join_no_prefilter;
+extern uint64_t ray_join_prefilter_builds;
+extern _Atomic(uint64_t) ray_join_prefilter_skips;
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
@@ -1477,6 +1484,10 @@ uint64_t ray_exec_test_refine_in(void);
  * segments (vectors) they dropped, since process start. */
 void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
 #ifdef DEBUG
+/* Completed synchronous sorted-find kernels; no release instrumentation. */
+uint64_t ray_find_test_sorted_runs(bool reset);
+/* Unboxed same-type atom scans: unsorted, or sorted and at most 64 rows. */
+uint64_t ray_find_test_typed_scans(bool reset);
 /* Successful query-level narrowed-source constructions, not physical reads. */
 uint64_t ray_query_test_parted_pruned_sources(bool reset);
 #endif
@@ -1486,6 +1497,22 @@ uint64_t ray_exec_test_in_single_within(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: the grouped distinct counts the route gate
+ * (ray_cd_two_pass_preferred) sent to the two-pass rewrite, and those it
+ * sent to the slices, since process start. */
+void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
+/* query.c test hook: the route a grouped distinct count takes past the gate,
+ * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
+ * Disarmed by ray_test_hooks_off. */
+void ray_query_test_cd_route(int route);
+/* query.c test hook: the largest unordered take the rewrite's first-N pick
+ * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
+ * first row is found.  Negative restores the default; disarmed by
+ * ray_test_hooks_off. */
+void ray_query_test_cd_firstn_set_max(int64_t cap);
+/* query.c test hook: selects whose parted source was pruned before fetch,
+ * and the partitions they dropped, since process start. */
+void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);
 /* query.c test hook: rows of data[0, n) of `type` (BOOL, U8, I16, I32,
  * I64, DATE, TIME, TIMESTAMP) for which `x op rhs` holds, op 1..6 = == !=
  * < <= > >=; ref: through the reference widening compare instead of the
@@ -1628,6 +1655,17 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
  * the shape is not the top-k shortcut's (compact the table and sort). */
 ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit);
 uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered */
+#ifdef DEBUG
+/* Single-key top-k selections run on the pool (topk_sel_run). */
+uint64_t ray_sort_test_topk_chunked(void);
+/* Buffer pairs (ranges x room) the last single-key top-k selection reserved
+ * (0 when it ran in place). */
+int64_t ray_sort_test_topk_pairs(void);
+/* Single-key top-k selections made in place (topk_place_fn), no buffers. */
+uint64_t ray_sort_test_topk_inplace(void);
+/* Parted columns sel_compact gathered on the pool (sel_parted_gather). */
+uint64_t ray_filter_test_parted_runs(void);
+#endif
 
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);

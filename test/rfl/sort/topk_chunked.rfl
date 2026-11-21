@@ -1,0 +1,41 @@
+;; topk_chunked.rfl — top/bot over vectors long enough that the single-key
+;; top-k runs on the pool (#1122): at these K the rows are cut into one
+;; range per worker, n/W rows for W workers, each range keeps its K best (in
+;; a buffer, or in place at K 8192 and 8193 from 7 workers on) and their
+;; sorted lists are merged.  The answer must be the full sort's first K:
+;; ties by position, nulls where asc/desc put them, for keys rising,
+;; falling, constant, in runs of 3000 across the range edges and with
+;; nulls, at K 1, 8192 and 8193.
+(set n 200000)
+(set up (til n))
+(set dn (- n (til n)))
+(set cs (+ 7 (* 0 (til n))))
+(set rn (div (til n) 3000))
+(set nl (+ (% (* (til n) 7919) 1000) (at [0 0N] (+ 0 (== 0 (% (til n) 97))))))
+(set fl (+ (* 0.5 (% (til n) 5000)) (at [0.0 0Nf] (+ 0 (== 0 (% (til n) 89))))))
+(set ck (fn [v k] (and (all (== (top v k) (take (desc v) k))) (all (== (bot v k) (take (asc v) k))))))
+(ck up 1) -- true
+(ck up 8192) -- true
+(ck up 8193) -- true
+(ck dn 1) -- true
+(ck dn 8192) -- true
+(ck dn 8193) -- true
+(ck rn 1) -- true
+(ck rn 8192) -- true
+(ck nl 1) -- true
+(ck nl 8192) -- true
+(ck nl 8193) -- true
+(ck fl 1) -- true
+(ck fl 8192) -- true
+(ck fl 8193) -- true
+(ck (as 'I32 dn) 8192) -- true
+(ck (as 'I16 (% (til n) 300)) 8192) -- true
+;; constant: the first K positions, in order
+(ck cs 8192) -- true
+(take (top (+ (* 0 (til n)) (til n)) 3) 3) -- [199999 199998 199997]
+(top up 1) -- [199999]
+(bot dn 1) -- [1]
+(count (top nl 8192)) -- 8192
+;; nulls go last under top (desc) and first under bot (asc)
+(take (bot nl 3) 3) -- [0Nl 0Nl 0Nl]
+(sum (== 0N (top nl 8192))) -- 0

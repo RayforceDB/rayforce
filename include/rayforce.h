@@ -870,6 +870,23 @@ void        ray_poll_destroy(ray_poll_t* poll);
  * A NULL poll is ignored. */
 void ray_poll_set_restricted(ray_poll_t* poll, bool restricted);
 
+/* Embedders can require this API before starting a password-protected
+ * listener on an older core. */
+#define RAY_POLL_AUTH_API 1
+/* Configure one optional password for every listener on the poll, native IPC
+ * and embedder-provided wire protocols alike. A NULL/empty password disables
+ * authentication. The same password is truncated to 255 bytes as before.
+ * A NULL password with restricted=true still selects the restricted role. */
+void ray_poll_auth_set(ray_poll_t* poll, const char* password, bool restricted);
+/* Check "user:password" (or a bare password) against the poll's secret in
+ * constant time. With no configured password, any credentials are accepted.
+ * A single trailing NUL (as on a q or native login) is ignored. No secret is
+ * returned. */
+bool ray_poll_auth_check(const ray_poll_t* poll, const uint8_t* credentials, size_t len);
+/* The evaluation role selected by the poll's password option. Embedders
+ * should snapshot it on accepted connections, as ray_poll_set_restricted. */
+bool ray_poll_auth_restricted(const ray_poll_t* poll);
+
 /* Run until ray_poll_exit is called. */
 int64_t ray_poll_run(ray_poll_t* poll);
 

@@ -55,17 +55,39 @@ ray_t* ray_temporal_extract(ray_t* input, int field);
  * dotted walk that has no container-type-dependent dispatch. */
 int ray_temporal_field_from_sym(int64_t sym_id);
 
-/* Truncate a temporal value/vector to day boundary (`kind == 0`) or to
- * time-of-day (`kind == 1`, i.e. microseconds within the current day).
- * Returns a freshly-allocated RAY_TIMESTAMP-typed ray_t* (caller-owned);
- * nulls in the input propagate to nulls in the output.  `kind` uses
- * RAY_EXTRACT_DAY (for `.date`) or RAY_EXTRACT_SECOND (for `.time`) so
- * the set of codes stays consistent with exec_date_trunc.  Returns
- * ray_error("type", ...) if input isn't a supported temporal type. */
-ray_t* ray_temporal_truncate(ray_t* input, int kind);
+/* Truncate a DATE / TIME / TIMESTAMP atom or vector to the start of the
+ * calendar or clock unit that holds it, in the input's own type.  `unit` is
+ * RAY_EXTRACT_YEAR / MONTH / DAY / HOUR / MINUTE / SECOND or RAY_TRUNC_QUARTER
+ * / RAY_TRUNC_WEEK (Monday-based, as `dow` counts).  A DATE takes the
+ * calendar units (year .. day), a TIME the clock units (hour .. second), a
+ * TIMESTAMP either; the other pairings are type errors.  Nulls, and values
+ * whose period starts outside the type's range, truncate to null.  The result
+ * is caller-owned; `input` is borrowed. */
+ray_t* ray_temporal_truncate(ray_t* input, int unit);
 
-/* Dotted-segment sym → truncate kind (see above).  Returns -1 if the
- * segment isn't one of the truncate-flavoured names (`date` / `time`). */
+/* The result type of truncating `in_type` (RAY_DATE / RAY_TIME /
+ * RAY_TIMESTAMP, unparted) to `unit`, or 0 when the pairing is not allowed. */
+int8_t ray_temporal_trunc_type(int8_t in_type, int unit);
+
+/* A unit name (year, quarter, month, week, day, hour, minute, second) ->
+ * truncation unit code; -1 for any other name. */
+int ray_temporal_unit_from_name(const char* name, size_t len);
+
+/* (trunc 'unit x): see ray_temporal_truncate.  `unit` is a symbol atom. */
+ray_t* ray_trunc_fn(ray_t* unit, ray_t* x);
+
+/* The DATE / TIME (`want` = RAY_DATE / RAY_TIME) of a temporal atom or
+ * vector; see the definition.  `x` is borrowed, the result caller-owned. */
+ray_t* ray_temporal_to(int8_t want, ray_t* x);
+
+/* Dotted-segment sym → RAY_EXTRACT_DATE for `date`, RAY_EXTRACT_TIME for
+ * `time`, -1 for any other segment. */
+int ray_temporal_whole_from_sym(int64_t sym_id);
+
+/* Dotted-segment sym → truncation unit.  Returns -1 if the segment isn't a
+ * unit name other than `minute` (year / quarter / month / week / day / hour /
+ * second; `minute` is the extract segment); `date` and `time` are not
+ * truncations, they answer a DATE and a TIME (see ray_date_clock_fn). */
 int ray_temporal_trunc_from_sym(int64_t sym_id);
 
 /* Unary builtins: thin wrappers over ray_temporal_extract with the

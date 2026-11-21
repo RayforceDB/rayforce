@@ -136,8 +136,11 @@ The full surface and worked examples live on the [Linked Columns](../queries/lin
 For very large datasets, partition by the discriminator that filter predicates target most often:
 
 - **Date partitioning** — the canonical choice for time-series. Filters of the form `where: (> Date 2024.01.01)` let the optimizer load only the matching partition directories.
+- **Timestamp partitioning** — `YYYY.MM.DD.HH.MM.SS` directories for a finer interval than a day; the `part` key is a `timestamp`, and a `date` literal compared with it is rescaled.
 - **Integer partitioning** — for bucketed numeric data (e.g. user-id ranges, region codes).
 - **Symbol partitioning** — for categorical data with stable, low-cardinality discriminators.
+
+A filter on a time column rather than the key prunes too, from the partitions' statistics: save the partitions with `compress: true` (or let a plain column reach 65,536 rows for its chunk zone), and `where: (> Time 2024.01.16D12:00:00.000)` skips every partition whose `Time` range ends before the literal, without rewriting the predicate onto the key. See [`.db.parted.get`](../namespaces/db.md#db-parted-get).
 
 The directory layout drives partition selection — see [Storage Guide: partitioned tables](storage.md#partitioned-tables) for the on-disk shape and [Block Offloading](../architecture/offloading.md) for how the optimizer streams across partitions without loading them all at once.
 

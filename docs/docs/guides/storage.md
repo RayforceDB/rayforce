@@ -162,14 +162,14 @@ db/
 The loader:
 
 1. Loads the shared `.sym` file from `db_root`
-2. Discovers date directories (sorted numerically)
+2. Discovers partition directories (sorted numerically): `YYYY.MM.DD` for a `date` key, `YYYY.MM.DD.HH.MM.SS` for a `timestamp` key, digit-only names for an `int64` key
 3. Loads each partition as a splayed table
-4. Adds a virtual `Date` column from the directory name
+4. Adds a virtual key column from the directory name: `date` for `YYYY.MM.DD` names, `part` (typed `timestamp` or `int64`) otherwise
 5. Concatenates all partitions into a single table
 
 This is the recommended layout for time-series data that grows continuously. New partitions can be added without rewriting existing data.
 
-For datasets larger than available RAM, Rayforce can process partitioned tables one segment at a time using **block offloading** — streaming through partitions without loading them all at once. The optimizer's partition pruning pass can skip entire partitions that don't match filter predicates. See [Block Offloading](../architecture/offloading.md) for details.
+For datasets larger than available RAM, Rayforce can process partitioned tables one segment at a time using **block offloading** — streaming through partitions without loading them all at once. The optimizer's partition pruning pass can skip entire partitions that don't match filter predicates, on the key and, from the partitions' statistics, on a data column (see [`.db.parted.get`](../namespaces/db.md#db-parted-get)). See [Block Offloading](../architecture/offloading.md) for details.
 
 ## 6. Memory-Mapped I/O { #mmap }
 
@@ -336,12 +336,18 @@ table operations.
   TIMESTAMP annotations. Narrow signed annotations may use a wider native type
   to preserve values otherwise reserved as a null sentinel. UINT64 reads as
   I64, and a value above INT64_MAX (which has no native representation) fails
-  the read. DECIMAL on an INT32 (precision up to 9) or INT64 (up to 18) column
-  reads as F64, the stored integer divided by 10^scale: one correctly rounded
-  division, exact for stored values below 2^53, whether the file carries the
-  converted type or the logical type, and null where the column is null. INT96,
-  decimals on byte arrays, nested/repeated data, fixed byte arrays, and other
-  annotations are rejected. BYTE_ARRAY bytes are preserved; annotated UTF8 is
+  the read. DECIMAL on an INT32 (precision up to 9), INT64 (up to 18),
+  FIXED_LEN_BYTE_ARRAY (up to 16 bytes) or BYTE_ARRAY (up to 38 digits) column
+  reads as F64, the stored integer divided by 10^scale, whether the file
+  carries the converted type or the logical type, and null where the column is
+  null. On INT32 and INT64 that is one correctly rounded division, exact for
+  stored values below 2^53; on a byte array the big-endian integer is first
+  rounded to the nearest double (ties to even), so values past 2^53 lose
+  digits. INT96, nested/repeated data, fixed byte arrays that are not decimals,
+  and other annotations cannot be read, but they only matter when selected: a
+  projection or a query that never names such a column reads the rest, and
+  `.parquet.meta` lists every column with the reason. Reading one fails with
+  `column <name>: <reason>`. BYTE_ARRAY bytes are preserved; annotated UTF8 is
   validated when `strict: true` is enabled.
 - Parquet dates/timestamps are converted from the Unix epoch to Rayforce's
   2000 epoch. Timestamp timezone annotations are not retained as separate

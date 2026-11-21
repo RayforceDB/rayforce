@@ -36,10 +36,11 @@ Signatures:
 
 Compressed F32/F64 writes and whole-column materialization require default FP controls (nearest rounding, masked exceptions, no FTZ/DAZ) on every calling/executing thread. Rayforce never silently normalizes the host's controls. Detected unsupported controls return `fpenv`; restore supported controls before retrying. Detection is not a complete portable validator: see [the compressed floating-point environment contract](../storage/index.md#compressed-floating-point-environment) for conservative refusal scope, platform-specific checks, and embedder responsibilities.
 
+**A parted table** (one loaded with [`.db.parted.get`](#db-parted-get)) is written without holding it in memory: each column is written a partition segment at a time, a segment of a plain partition straight from its mapped file and a compressed one decoded a chunk (65,536 rows) at a time, so the process's own memory does not grow with the table's rows. The result is the table its in-memory copy would be: the partition key (`date`, `part`, …) is written as an ordinary column holding each row's key, `SYM` columns are re-encoded into the destination's symbol file, and a partition that lacks a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null), as in the in-memory copy. Drop the key from the written table with `xcols`, e.g. `(xcols P (drop (cols P) 1))`. When `compress` is absent, a parted column follows the inherit rule above: it is written at generation 2 when any of its partitions is compressed (so a root mixing plain and compressed partitions writes the whole column at generation 2) or when the destination's current file is generation 2, else at generation 0. The one cost that still grows with the rows is the dictionary index a save builds for a string column of 65,536 rows or more, up to about 12 bytes a row while it is built; `{index: false}` skips it. Use it to merge the partitions of a root into one splayed table, or to copy a parted table elsewhere.
 
 Returns `tbl` (retained), so the call can be threaded inside a larger expression.
 
-Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / too long), and any `io`/`oom`/`corrupt` error code surfaced by the splayed writer.
+Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / too long; a parted column built through the C API whose segments come to a different row count than the table's, which Rayfall cannot produce), `nyi` (a parted column of a type without a streamed form, such as a list column; nothing is written), and any `io`/`oom`/`corrupt` error code surfaced by the splayed writer.
 
 ```lisp
 (set t (table [city temp rain]
@@ -70,9 +71,12 @@ Calling it again on the same thread reuses unchanged partitions while the earlie
 
 Each thread caches at most 1024 partition tables, evicting the least recently mounted entries first. GC (including `(.sys.gc)`), symbol-domain opens and the next mount release cached tables whose columns have no remaining users. Dropping a view and running GC therefore releases its mappings and copied LIST payloads, even if the database directory was deleted. Thread heap teardown and runtime shutdown clear the cache.
 
-Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Supported `select` shapes can prune partitions using literal bounds on the virtual column; see [Partition Pruning](../storage/index.md#partition-pruning) for admission limits and conservative declines.
+Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Supported `select` shapes can prune partitions using literal bounds on the virtual column, and on a data column whose partitions carry statistics (see below); see [Partition Pruning](../storage/index.md#partition-pruning) for admission limits and conservative declines.
 
-The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
+The directory names decide the key type and the partition order. `YYYY.MM.DD` names give a `date` column; `YYYY.MM.DD.HH.MM.SS` names (a real calendar date and a time of day, seconds precision, a year whose nanoseconds fit `int64` — about 1708 to 2292) give a `timestamp` `part` column, in chronological order; digit-only names give an `int64` `part` column and are ordered by value, so `1`, `2`, `10` load as `[1 2 10]` with no zero-padding; any other digit/dot names give a `sym` `part` column in name order. A set that mixes these forms, or holds an impossible date, time or year, is a `sym` set. A digit-only name that does not fit `int64` is rejected as `corrupt`, and the message names the directory.
+
+!!! note "Compatibility"
+    `YYYY.MM.DD.HH.MM.SS` names used to load as a `sym` `part` column; they now load as `timestamp`. Mixed sets are unchanged.
 
 ```lisp
 (set dbroot "/tmp/rayforce-parted-db")
@@ -90,6 +94,24 @@ The directory names decide the key type and the partition order. `YYYY.MM.DD` na
 ```
 
 Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string or name not a sym), `name` (sym ID unknown).
+
+### Pruning by partition statistics
+
+A `where:` comparison of a parted integer or temporal data column with a literal (`== != < <= > >= in`, alone or as a conjunct of a top-level `and`) prunes the partitions whose statistics decide it false for every row: a partition's non-null minimum and maximum, from the chunk directory of a column saved with `compress: true` or the chunk zone of a plain column of 65,536 rows or more. The rule is the one row-level zone skipping uses, so a null (which ranks below every value) keeps its partition for `<` and `<=`, and a partition without statistics is always kept. A time-series table partitioned by day therefore answers `(> Time 2024.01.16D12:00:00.000)` from the partitions of `2024.01.16` and later, with no declaration about how `Time` relates to the key; a late row in the live tail, a renamed column and a null are all found, because the statistics describe the rows themselves.
+
+```lisp
+(set jan15 (table ['time 'sym 'price]
+             (list [2024.01.15D10:00:00.000 2024.01.15D20:00:00.000] ['AAPL 'GOOG] [150.5 2800.0])))
+(set jan16 (table ['time 'sym 'price]
+             (list [2024.01.16D00:00:00.000 2024.01.16D12:00:00.000] ['MSFT 'AAPL] [410.0 151.0])))
+(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 symfile {compress: true})
+(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile {compress: true})
+(set trades (.db.parted.get dbroot 'trades))
+;; 2024.01.15 ends at 20:00: its statistics decide the comparison false,
+;; and only 2024.01.16 is read
+(select {from: trades where: (> time 2024.01.16D06:00:00.000)})
+;; one row: date 2024.01.16, time 2024.01.16D12:00:00.000, sym AAPL, price 151.0
+```
 
 ### In-memory live-tail inserts
 

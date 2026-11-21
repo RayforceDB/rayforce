@@ -12,11 +12,11 @@
 |---|---|---|
 | [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
-| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (13) | [Table Operations](#table-ops) (20) |
+| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (13) | [Table Operations](#table-ops) (21) |
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
 | [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (3) |
 | [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (15) |
-| [Serialization](#serialization) (2) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
+| [Serialization](#serialization) (5) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
 | [EAV Triple Store](#eav) (5) | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) |
 
 The examples below use these small in-memory fixtures where a table is needed:
@@ -65,7 +65,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 ### Variadic / Special
 
 `and`, `or`, `if`, `do`, `fn`, `map`, `pmap`, `fold`, `scan`, `prior`, `apply`, `list`, `select`, `window`,
-`update`, `insert`, `upsert`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
+`update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
@@ -77,7 +77,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
-`substr`, `replace`
+`substr`, `replace`, `repr`, `read-value`, `read-limits`
 
 ## Arithmetic
 
@@ -403,7 +403,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
 | `alter` | variadic | special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector (for a dict, `idx` is a key or a vector of keys: an existing key is replaced, a missing one is added), `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
-| `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
+| `del` | unary | special, restricted | Unbind one variable or dotted-path leaf and return `0`; deleting the last leaf of a dotted path removes the intermediate dicts too. Extra arguments raise `arity` | `(del cfg.db.host)` |
 
 ```lisp
 ; Variable binding and branching
@@ -443,6 +443,7 @@ Create and manipulate tables, dictionaries, and their metadata.
 | `union-all` | binary | — | Concatenate two tables (all rows, no dedup) | `(union-all t1 t2)` |
 | `unify` | binary | — | Merge two tables/dicts (second takes precedence) | `(unify d1 d2)` |
 | `modify` | variadic | restricted | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
+| `delete` | unary | special, restricted | Remove the rows a predicate matches: `{from: 't where: p}` removes them in place, `{from: t where: p}` returns a new table. Both clauses are required | `(delete {from: 'trades where: (> price 100)})` |
 | `ungroup` | unary | — | Flatten a grouped table's nested list columns into one row per element | `(ungroup gt)` |
 | `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price sum)` |
 
@@ -605,8 +606,8 @@ Temporal constructors. Pass `0` to get the current clock value. Cross-temporal c
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `date` | unary | — | Current date, or extract date from timestamp | `(date 0)` → today's date |
-| `time` | unary | — | Current time, or extract time from timestamp | `(time 0)` → current time |
-| `timestamp` | unary | — | Current timestamp (nanosecond precision) | `(timestamp 0)` |
+| `time` | unary | — | Current wall-clock time (millisecond resolution), or extract time from timestamp | `(time 0)` → current time |
+| `timestamp` | unary | — | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
 
 ```lisp
 ; Get current date/time
@@ -723,6 +724,9 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 |---|---|---|---|---|
 | `ser` | unary | — | Serialize any value to binary format (byte vector) | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
+| `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
+| `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
+| `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
 
 ```lisp
 ; Round-trip serialization
@@ -740,7 +744,7 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | — | Load splayed table from a directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |

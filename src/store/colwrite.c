@@ -424,9 +424,17 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     return colw_publish(tmp, path, w->durable);
 }
 
+/* A parted source (plain or encoded wrapper, or the partition key) has no
+ * single-file form here, but the splayed writer streams it a segment at a
+ * time (store/splay.c), so it resolves its generation as its type would. */
 static bool colw_src_gen2_ok(ray_t* obj) {
     if (!obj) return false;
-    if (obj->type == RAY_ENCCOL) return !ray_enccol_is_parted(obj);
+    if (obj->type == RAY_ENCCOL) return true;
+    if (RAY_IS_PARTED(obj->type)) return ray_encw_type_supported((int8_t)RAY_PARTED_BASETYPE(obj->type));
+    if (obj->type == RAY_MAPCOMMON) {
+        ray_t* kv = ((ray_t**)ray_data(obj))[0];
+        return kv && !RAY_IS_ERR(kv) && ray_encw_type_supported(kv->type);
+    }
     return ray_col_gen2_eligible(obj);
 }
 

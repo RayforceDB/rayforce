@@ -264,7 +264,8 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
 | `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
 | `alter` | variadic, special | Amend a named local or global binding and return its name: `(alter 'name set idx val)` writes `val` at an index or index vector (for a dict, `idx` is a key or a vector of keys: an existing key is replaced, a missing one is added), `(alter 'name concat vals)` appends, `(alter 'name remove idx)` drops list items. The innermost visible local or parameter takes precedence over a global, through a literal `alter` head or a global alias of it; shared values retain copy-on-write isolation | `(alter 'v set 0 99)` |
-| `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
+| `del` | unary, special | Unbind one variable or dotted-path leaf and return `0`; deleting the last leaf of a dotted path removes the intermediate dicts too. Not a table operation: extra arguments raise `arity` | `(del cfg.db.host)` |
+| `delete` | unary, special | Remove the rows a predicate matches: `{from: 't where: p}` removes them in place, `{from: t where: p}` returns a new table. Both clauses are required | `(delete {from: 'trades where: (> price 100)})` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 
 `xkey` returns a dictionary keyed by unique key column value(s). Duplicate keys are a domain error; use `xgroup` to get a dictionary whose values are grouped table slices. Passing a typed vector of keys to `at` performs a batch lookup and returns a list of the corresponding values.
@@ -439,9 +440,9 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `date` | unary | Current date or extract date from timestamp | `(date 0)` → today's date |
-| `time` | unary | Current time or extract time from timestamp | `(time 0)` → current time |
-| `timestamp` | unary | Current timestamp (nanosecond precision) | `(timestamp 0)` |
+| `date` | unary | Current date; of a timestamp, its day. Answers a DATE | `(date 0)` → today's date |
+| `time` | unary | Current wall-clock time (millisecond resolution); of a timestamp, its time of day. Answers a TIME | `(time 0)` → current time |
+| `timestamp` | unary | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
 
 ### Calendar/Clock Field Extraction
 
@@ -458,7 +459,34 @@ Unary functions that pull a single calendar or clock field out of a DATE / TIME 
 | `dow` | 1..7 (Mon=1) | `(dow 2024.03.15)` → `5` |
 | `doy` | 1..366 | `(doy 2024.03.15)` → `75` |
 
-`mm` is unambiguously MONTH; the minute spelling stays long-form because a two-letter token can't serve both meanings in a uniform dotted walk. Two dotted-only truncations exist: `.date` drops the time-of-day component (keeps the day), and `.time` drops the date component (keeps the microseconds within the day).
+`mm` is unambiguously MONTH; the minute spelling stays long-form because a two-letter token can't serve both meanings in a uniform dotted walk. `.date` and `.time` answer the whole DATE and the whole TIME of a timestamp.
+
+### Calendar/Clock Truncation
+
+`(trunc 'unit x)` floors a DATE, TIME or TIMESTAMP (atom or vector) to the start of the calendar or clock unit that holds it. The result has the **type of `x`**: a DATE floored to its month is a DATE, a TIMESTAMP stays a TIMESTAMP. Null rows stay null.
+
+| Unit | Start of the... | Takes | Example |
+|---|---|---|---|
+| `'year` | year | DATE, TIMESTAMP | `(trunc 'year 2024.05.17)` → `2024.01.01` |
+| `'quarter` | quarter (Jan, Apr, Jul, Oct) | DATE, TIMESTAMP | `(trunc 'quarter 2024.05.17)` → `2024.04.01` |
+| `'month` | month | DATE, TIMESTAMP | `(trunc 'month 2024.05.17)` → `2024.05.01` |
+| `'week` | week, **Monday-based** as `dow` counts | DATE, TIMESTAMP | `(trunc 'week 2024.05.17)` → `2024.05.13` |
+| `'day` | day | DATE, TIMESTAMP | `(trunc 'day 2024.05.17D13:45:00.000000000)` → `2024.05.17D00:00:00.000000000` |
+| `'hour` | hour | TIME, TIMESTAMP | `(trunc 'hour 13:45:12.123)` → `13:00:00.000` |
+| `'minute` | minute | TIME, TIMESTAMP | `(trunc 'minute 13:45:12.123)` → `13:45:00.000` |
+| `'second` | second | TIME, TIMESTAMP | `(trunc 'second 13:45:12.123)` → `13:45:12.000` |
+
+A calendar unit on a TIME and a clock unit on a DATE are `type` errors (neither carries what the unit needs); an unknown unit is a `domain` error. A TIMESTAMP whose period starts before the TIMESTAMP range (1707.09.23 onward) truncates to null, as does a DATE whose period starts below the DATE range. All calendar arithmetic is UTC.
+
+It works as a `by:` key and in projections, which is how calendar bucketing is written (`xbar` takes a fixed width, so it cannot do months or years):
+
+```lisp
+(select {from: Bars
+         by:   {m: (trunc 'month ts)}
+         open: (first px)  high: (max px)  low: (min px)  close: (last px)})
+```
+
+Inside queries the same truncations are available as dotted segments: `ts.year`, `ts.quarter`, `ts.month`, `ts.week`, `ts.day`, `ts.hour`, `ts.second` (`ts.minute` is the extract, `(trunc 'minute ts)` the truncation). Outside a query, use `trunc`.
 
 Cross-temporal comparisons are supported: dates, times, and timestamps are all converted to nanoseconds internally for comparison operations.
 
@@ -572,7 +600,10 @@ spills exactly as it did before.
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
+| `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
+| `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
+| `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |

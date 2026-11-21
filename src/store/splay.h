@@ -143,6 +143,12 @@ ray_t*    ray_read_splayed(const char* dir, const char* sym_path);
  * inline in the stream writer.  Best-effort, per numeric column. */
 void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
 
+/* Test hooks: appends the writer of a parted table's columns made, and the
+ * rows of the longest (a parted column is streamed a segment at a time). */
+int64_t   ray_splay_test_parted_appends(void);
+int64_t   ray_splay_test_parted_max_rows(void);
+void      ray_splay_test_parted_reset(void);
+
 /* Loader accepting a shared FILE domain. It resolves the generation first,
  * then refreshes the cached domain to include any externally appended symbols. */
 ray_t*    ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom);

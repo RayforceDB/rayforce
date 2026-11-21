@@ -200,39 +200,6 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 static int64_t g_tx_limit_bytes  = RAY_IPC_TX_DEFAULT_BYTES;
 static int64_t g_tx_limit_frames = 0;   /* unlimited */
 
-/* Constant-time comparison — prevents timing side-channel on password. */
-static bool ct_eq(const void* a, const void* b, size_t len) {
-    const volatile uint8_t* x = a;
-    const volatile uint8_t* y = b;
-    volatile uint8_t diff = 0;
-    for (size_t i = 0; i < len; i++)
-        diff |= x[i] ^ y[i];
-    return diff == 0;
-}
-
-/* Validate credential buffer against secret. Returns true if password matches.
- * creds is "user:password\0" with length cred_len.
- * secret MUST point to a char[256] buffer (zero-padded beyond the password).
- * Compares pw against the full 256-byte secret buffer in constant time.
- * No strlen, no secret-length-dependent copies. */
-static bool validate_creds(const uint8_t* buf, uint8_t cred_len,
-                           const char* secret) {
-    if (cred_len == 0) return false;
-    const char* creds = (const char*)buf;
-    const char* colon = memchr(creds, ':', cred_len);
-    const char* pw = colon ? colon + 1 : creds;
-    size_t pw_len = colon ? (size_t)(cred_len - (pw - creds)) : cred_len;
-    if (pw_len > 0 && pw[pw_len - 1] == '\0') pw_len--;
-    if (pw_len > 255) pw_len = 255;
-
-    /* Zero-pad pw into a 256-byte buffer, then compare all 256 bytes
-     * against the secret buffer (also 256 bytes, zero-padded at init).
-     * Matching passwords produce identical 256-byte buffers. */
-    uint8_t pw_buf[256] = {0};
-    memcpy(pw_buf, pw, pw_len);
-    return ct_eq(pw_buf, secret, 256);
-}
-
 /* ===== Connection hooks (.ipc.on.*) =====
  *
  * Five user-settable lambdas that intercept the connection lifecycle.
@@ -594,6 +561,9 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
                           uint8_t extra_flags)
 {
     ray_serde_fail_clear();
+    /* Each size/write pair below holds the error text across both passes
+     * (ray_serde_msg_hold); a fallback error takes a new hold of its own. */
+    ray_serde_msg_hold();
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -604,6 +574,7 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
      * can put on the wire and we drop as before. */
     ray_t* fallback = NULL;
     if (!ray_ipc_body_size_ok(ser_size)) {
+        ray_serde_msg_release();
         if (ser_size > RAY_IPC_BODY_MAX_BYTES) {
             fallback = ray_error("io", "IPC result exceeds the 256 MiB decoded payload limit");
         } else {
@@ -620,13 +591,23 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         }
         if (!fallback) return;
         result   = fallback;
+        ray_serde_msg_hold();
         ser_size = ray_serde_size(result);
-        if (!ray_ipc_body_size_ok(ser_size)) { ray_error_free(fallback); return; }
+        if (!ray_ipc_body_size_ok(ser_size)) {
+            ray_serde_msg_release();
+            ray_error_free(fallback);
+            return;
+        }
     }
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
-    if (!payload) { if (fallback) ray_error_free(fallback); return; }
+    if (!payload) {
+        ray_serde_msg_release();
+        if (fallback) ray_error_free(fallback);
+        return;
+    }
     int64_t  wrote    = ray_ser_raw(payload, result);
+    ray_serde_msg_release();
     if (wrote != ser_size) {
         /* The write phase disagrees with the size phase (an encoded column
          * failed to decode): never send the frame, answer with an error. */
@@ -634,9 +615,12 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         if (fallback) { ray_error_free(fallback); return; }
         fallback = ray_error("io", "result could not be serialized over IPC");
         result   = fallback;
+        ray_serde_msg_hold();
         ser_size = ray_serde_size(result);
         payload  = ray_ipc_body_size_ok(ser_size) ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
-        if (!payload || ray_ser_raw(payload, result) != ser_size) {
+        bool ok  = payload && ray_ser_raw(payload, result) == ser_size;
+        ray_serde_msg_release();
+        if (!ok) {
             if (payload) ray_free_raw(payload);
             ray_error_free(fallback);
             return;
@@ -750,6 +734,16 @@ static ray_err_t journal_lift_note(int64_t gen, int64_t off, const int64_t* ids,
 static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
                                 ray_ipc_header_t* hdr)
 {
+    /* An inbound frame is a top-level evaluation boundary even when its
+     * payload is a raw expression LIST (which bypasses ray_eval_str's
+     * boundary cleanup).  Detach any outer/nested evaluation's pending
+     * raise while this request runs, then restore it before returning. */
+    ray_t* saved_raise = NULL;
+    if (__VM) {
+        saved_raise = __VM->raise_val;
+        __VM->raise_val = NULL;
+    }
+
     /* Journal hook: log every inbound SYNC message (state-mutation
      * channel in the IPC model) before evaluation, so a crash mid-handler
      * still leaves the message on disk for replay.  We write the raw
@@ -783,7 +777,12 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         ray_err_t je = ray_journal_write_bytes(&log_hdr, payload, (int64_t)payload_len);
         if (je != RAY_OK) {
             fprintf(stderr, "log: ERROR  journal write failed (rc=%d) — refusing to evaluate\n", (int)je);
-            return ray_error("io", "journal write failed; mutation refused");
+            ray_t* err = ray_error("io", "journal write failed; mutation refused");
+            if (__VM) {
+                ray_raise_clear();
+                __VM->raise_val = saved_raise;
+            }
+            return err;
         }
         auto_journaled = true;
     }
@@ -894,7 +893,25 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         }
     }
 
+    /* `raise x` deliberately keeps x as a pending value instead of eagerly
+     * formatting it into ray_error_msg().  Capture it before the outer
+     * verbose wrapper turns the error into a child of [captured, result];
+     * send_response can no longer recognize a top-level error after that. */
+    if (result && RAY_IS_ERR(result) && !ray_error_msg()) {
+        char raised[256];
+        if (ray_raise_render(raised, sizeof raised)) {
+            char code[8];
+            snprintf(code, sizeof code, "%s", ray_err_code(result));
+            ray_t* marker = ray_error(code, "%s", raised);
+            if (marker) ray_error_free(marker);
+        }
+    }
+
     ray_qlog_end(&qc, qsrc, qsrc_len, result);
+    if (__VM) {
+        ray_raise_clear();
+        __VM->raise_val = saved_raise;
+    }
     return result ? result : RAY_NULL_OBJ;
 }
 
@@ -1295,8 +1312,17 @@ static ray_t* ipc_read_handshake(ray_poll_t* poll, ray_selector_t* sel)
     /* Refuse peers speaking a different wire version BEFORE we commit to
      * exchanging any serialized payloads.  Without this check a new
      * server would happily send v3-layout values to a v2 client, which
-     * would misparse every atom after the version-bump byte. */
+     * would misparse every atom after the version-bump byte.
+     *
+     * Reply with our own version byte before the drop: the client checks
+     * the first reply byte (v3 clients do too), so it reports a wire
+     * version mismatch instead of a connection reset. */
     if (sel->rx.buf->data[0] != RAY_SERDE_WIRE_VERSION) {
+        fprintf(stderr, "ipc: dropping peer with wire version %u "
+                        "(this server speaks %u)\n",
+                (unsigned)sel->rx.buf->data[0], (unsigned)RAY_SERDE_WIRE_VERSION);
+        uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+        ray_sock_send((ray_sock_t)sel->fd, resp, 2);
         ray_poll_deregister(poll, sel->id);
         return NULL;
     }
@@ -1355,8 +1381,7 @@ static ray_t* ipc_read_creds(ray_poll_t* poll, ray_selector_t* sel)
 
     ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
 
-    bool ok = validate_creds(sel->rx.buf->data + 1, cred_len,
-                             poll->auth_secret);
+    bool ok = ray_poll_auth_check(poll, sel->rx.buf->data + 1, cred_len);
 
     /* Secondary user-defined check via `.ipc.on.auth`.  Only consulted
      * when the constant-time secret compare already passed — this hook
@@ -2465,9 +2490,23 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
  * counted frame (rc = 1 to the caller).  Built once per message however
  * many connections it goes to: ray_mcast_pub shares one frame across
  * every subscriber's queue (#487). */
+static ray_poll_frame_t* conn_frame_msg_held(ray_t* msg, uint8_t msgtype,
+                                             uint8_t extra_flags, size_t threshold,
+                                             ray_err_t* err_out);
+
 static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
                                         uint8_t extra_flags, size_t threshold,
                                         ray_err_t* err_out)
+{
+    ray_serde_msg_hold();
+    ray_poll_frame_t* f = conn_frame_msg_held(msg, msgtype, extra_flags, threshold, err_out);
+    ray_serde_msg_release();
+    return f;
+}
+
+static ray_poll_frame_t* conn_frame_msg_held(ray_t* msg, uint8_t msgtype,
+                                             uint8_t extra_flags, size_t threshold,
+                                             ray_err_t* err_out)
 {
     if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
