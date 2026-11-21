@@ -911,6 +911,45 @@ static test_result_t test_heap_abandon_is_adopted(void) {
     PASS();
 }
 
+/* Environment is process state, not a property of an abandoned heap.  A new
+ * owner must see the same swap directory as a newly mapped heap would. */
+static test_result_t test_heap_abandon_refreshes_swap_path(void) {
+    ray_heap_t* base = ray_tl_heap;
+    const char* old_swap = getenv("RAY_HEAP_SWAP");
+    const char* old_tmp = getenv("TMPDIR");
+    char* saved_swap = old_swap ? strdup(old_swap) : NULL;
+    char* saved_tmp = old_tmp ? strdup(old_tmp) : NULL;
+    bool saved = (!old_swap || saved_swap) && (!old_tmp || saved_tmp);
+
+    ray_tl_heap = NULL;
+    unsetenv("RAY_HEAP_SWAP");
+    setenv("TMPDIR", "/tmp/rayforce_adopt_old", 1);
+    ray_heap_init();
+    ray_heap_t* abandoned = ray_tl_heap;
+    ray_heap_abandon();
+
+    setenv("TMPDIR", "/tmp/rayforce_adopt_new", 1);
+    ray_heap_init();
+    bool same = ray_tl_heap == abandoned;
+    bool fresh = ray_tl_heap &&
+        strcmp(ray_tl_heap->swap_path, "/tmp/rayforce_adopt_new/") == 0;
+    ray_heap_destroy();
+    ray_tl_heap = base;
+
+    unsetenv("RAY_HEAP_SWAP");
+    unsetenv("TMPDIR");
+    if (saved_swap) setenv("RAY_HEAP_SWAP", saved_swap, 1);
+    if (saved_tmp) setenv("TMPDIR", saved_tmp, 1);
+    free(saved_swap);
+    free(saved_tmp);
+
+    TEST_ASSERT(saved, "saved the swap environment");
+    TEST_ASSERT_NOT_NULL(abandoned);
+    TEST_ASSERT(same, "the abandoned heap was adopted");
+    TEST_ASSERT(fresh, "adoption refreshed the swap directory");
+    PASS();
+}
+
 /* ---- Owned-ref retain/release: LIST containing children ---------------- *
  *
  * ray_alloc_copy on a RAY_LIST exercises the LIST branch of both
@@ -6471,6 +6510,7 @@ const test_entry_t heap_entries[] = {
     { "heap/reclaim_worker_drains_owner", test_reclaim_worker_drains_owner_list, heap_setup, heap_teardown },
     { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
     { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
+    { "heap/abandon_refreshes_swap_path", test_heap_abandon_refreshes_swap_path, heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
     { "heap/str_pool_owned_ref",       test_str_pool_owned_ref,          heap_setup, heap_teardown },
     { "heap/sentinel_null_release",    test_sentinel_null_release,       heap_setup, heap_teardown },

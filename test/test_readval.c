@@ -33,6 +33,46 @@ static const char* KITCHEN =
     "(table (as 'SYM (list \"c1\" \"c2\")) (list [1 2] (list 1 \"x\"))) "
     "(table (as 'SYM (list \"c3\")) (list (as 'I64 []))))";
 
+/* Exercise zero staging storage directly, independent of random generation. */
+static test_result_t empty_lists(void) {
+    const char* cases[] = {"()", "(list)", "(list (list))"};
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        ray_t* v = ray_read_value(cases[i], strlen(cases[i]), NULL);
+        bool ok = v && !RAY_IS_ERR(v) && v->type == RAY_LIST;
+        if (ok) {
+            ok = v->len == (i == 2 ? 1 : 0);
+            if (ok && i == 2) {
+                ray_t* child = ray_list_get(v, 0); /* borrowed */
+                ok = child && !RAY_IS_ERR(child) && child->type == RAY_LIST && child->len == 0;
+            }
+        }
+        drop(v);
+        TEST_ASSERT(ok, cases[i]);
+    }
+    PASS();
+}
+
+static test_result_t empty_string_pool(void) {
+    const char* cases[] = {"(as 'STR [])", "[\"\"]", "[\"\" \"\"]", "[\"\" \"x\" \"\"]"};
+    const int64_t lengths[] = {0, 1, 2, 3};
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        ray_t* v = ray_read_value(cases[i], strlen(cases[i]), NULL);
+        bool ok = v && !RAY_IS_ERR(v) && v->type == RAY_STR && v->len == lengths[i];
+        if (ok && v->len) {
+            ray_str_t* cells = (ray_str_t*)ray_data(v);
+            for (int64_t j = 0; j < v->len; j++) {
+                bool nonempty = i == 3 && j == 1;
+                ok &= cells[j].len == (nonempty ? 1 : 0);
+                ok &= ray_vec_is_null(v, j) == !nonempty;
+                if (nonempty) ok &= cells[j].data[0] == 'x';
+            }
+        }
+        drop(v);
+        TEST_ASSERT(ok, cases[i]);
+    }
+    PASS();
+}
+
 static test_result_t limit_edges(void) {
     ray_read_limits_t d = ray_read_limits_default();
     TEST_ASSERT_EQ_U(d.max_input, 8u << 20);
@@ -625,6 +665,8 @@ static test_result_t node_count_contract(void) {
 }
 
 const test_entry_t readval_entries[] = {
+    {"readval/empty_lists", empty_lists, setup, teardown},
+    {"readval/empty_string_pool", empty_string_pool, setup, teardown},
     {"readval/limit_edges", limit_edges, setup, teardown},
     {"readval/node_count_contract", node_count_contract, setup, teardown},
     {"readval/faults_leave_nothing", faults_leave_nothing, setup, teardown},

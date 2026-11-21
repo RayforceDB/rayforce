@@ -2953,6 +2953,8 @@ void ray_heap_init(void) {
     ray_registry_unlock();
     if (reuse) {
         reuse->idle_next = NULL;
+        /* Environment belongs to the adopting thread, not the old owner. */
+        heap_swap_dir(reuse->swap_path, sizeof(reuse->swap_path));
         ray_tl_heap = reuse;
         return;
     }
