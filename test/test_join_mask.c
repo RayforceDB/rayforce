@@ -38,6 +38,8 @@
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "table/sym.h"
+#include "core/pool.h"
+#include "mem/heap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -459,6 +461,79 @@ static test_result_t test_jm_errors(void) {
     PASS();
 }
 
+/* Cancellation.  The mask dispatches the build (a right side past the
+ * parallel threshold) and the probe; a cancel that lands before either
+ * leaves its buffers unwritten, over blocks scribbled with garbage
+ * (ray_heap_test_scribble).  The query runs once per dispatch with the
+ * cancel armed right before it (ray_pool_test_cancel_at): each run is
+ * `cancel` or the answer, never a mask read out of a skipped probe.  Mode
+ * 0 is a cancel request (both flags), until the run armed past the last
+ * dispatch answers; mode 1 the pool's flag alone, under which every one of
+ * those dispatches answers `cancel`. */
+static test_result_t jm_cancel_case(const char* q, int min_dispatches) {
+    ray_t* want = ray_eval_str(q);
+    TEST_ASSERT(want && !RAY_IS_ERR(want), q);
+    int64_t n = ray_len(want);
+    ray_heap_test_scribble(true);
+    int last = 0, cancelled = 0;
+    const char* fail = NULL;
+    for (int mode = 0; mode < 2 && !fail; mode++) {
+        for (int k = 1; k <= 16 && (mode == 0 || k <= last) && !fail; k++) {
+            ray_pool_test_cancel_at((uint32_t)k, mode == 1);
+            ray_t* r = ray_eval_str(q);
+            ray_pool_test_cancel_at(0, false);
+            ray_clear_interrupt();
+            if (r && RAY_IS_ERR(r)) {
+                if (strcmp(ray_err_code(r), "cancel") != 0) fail = "an error other than cancel";
+                cancelled++;
+                ray_release(r);
+                continue;
+            }
+            if (mode == 1) fail = "answered under the pool's cancel";
+            else if (!r || r->type != RAY_BOOL || ray_len(r) != n ||
+                     memcmp(ray_data(r), ray_data(want), (size_t)n) != 0)
+                fail = "a wrong mask after a cancel";
+            else last = k - 1;
+            if (r) ray_release(r);
+            break;
+        }
+    }
+    ray_heap_test_scribble(false);
+    ray_release(want);
+    if (!fail && last < min_dispatches) fail = "fewer dispatches than expected";
+    if (!fail && cancelled != 2 * last) fail = "a run neither cancelled nor answered";
+    if (fail) {
+        snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf, "%s: %s (%d dispatches)",
+                 q, fail, last);
+        return (test_result_t){ TEST_FAIL, ray_test_fail_buf };
+    }
+    PASS();
+}
+
+static test_result_t test_jm_cancel_at_dispatch(void) {
+    ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    jm_bind("L", jm_table(&(jm_spec_t){ .n = 200000, .nv = 6, .ni = 800, .ns = 4,
+        .null_1in = 101, .wv = RAY_SYM_W16, .wi = RAY_SYM_W16, .sid_t = RAY_I32,
+        .left = true, .seed = 51 }));
+    jm_bind("R", jm_table(&(jm_spec_t){ .n = 25, .nv = 6, .ni = 800, .ns = 4,
+        .null_1in = 0, .wv = RAY_SYM_W64, .wi = RAY_SYM_W64, .sid_t = RAY_I64,
+        .left = false, .seed = 52 }));
+    jm_bind("B", jm_table(&(jm_spec_t){ .n = 80000, .nv = 6, .ni = 1600, .ns = 4,
+        .null_1in = 97, .wv = RAY_SYM_W32, .wi = RAY_SYM_W32, .sid_t = RAY_I64,
+        .left = false, .seed = 53 }));
+    static const struct { const char* q; int d; } cases[] = {
+        { "(semi-mask [venue instrument sid] L B)", 2 },   /* build + lookahead probe */
+        { "(anti-mask [venue instrument sid] L B)", 2 },
+        { "(semi-mask [venue instrument] L R)", 1 },       /* prefiltered probe */
+        { "(anti-mask [venue instrument] L R)", 1 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        test_result_t r = jm_cancel_case(cases[i].q, cases[i].d);
+        if (r.status != TEST_PASS) return r;
+    }
+    PASS();
+}
+
 /* A table whose only special column is MAPCOMMON counts as parted but has
  * no segments: it flattens to nothing, which is an error, as in the joins,
  * not a retry with the same table. */
@@ -501,6 +576,7 @@ const test_entry_t join_mask_entries[] = {
     { "join_mask/unfiltered_types",   test_jm_unfiltered_types,   jm_setup, jm_teardown },
     { "join_mask/where",              test_jm_where,              jm_setup, jm_teardown },
     { "join_mask/errors",             test_jm_errors,             jm_setup, jm_teardown },
+    { "join_mask/cancel_at_dispatch", test_jm_cancel_at_dispatch, jm_setup, jm_teardown },
     { "join_mask/mapcommon_only",     test_jm_mapcommon_only,     jm_setup, jm_teardown },
     { NULL, NULL, NULL, NULL },
 };
