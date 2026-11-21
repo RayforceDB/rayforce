@@ -547,9 +547,11 @@ static bool dag_const_is_null(ray_graph_t* g, ray_op_t* x) {
  * each meet their own kind, and a string literal both text kinds (the one
  * place a query is looser: it reads the literal as a symbol).  `==`
  * and `!=` against a null literal answer without looking at its type, as
- * the builtins do.  Sets compile_err and returns false on a bad pair. */
+ * the builtins do.  Returns false on a bad pair, setting compile_err unless
+ * `quiet`. */
 static bool dag_cmp_operands_ok(ray_graph_t* g, const char* fname, size_t fname_len,
-                                ray_op_t* l, ray_op_t* r, int8_t lt, int8_t rt) {
+                                ray_op_t* l, ray_op_t* r, int8_t lt, int8_t rt,
+                                bool quiet) {
     bool eq = fname_len == 2 && fname[1] == '=' && (fname[0] == '=' || fname[0] == '!');
     bool ord = (fname_len == 1 && (fname[0] == '>' || fname[0] == '<')) ||
                (fname_len == 2 && fname[1] == '=' && (fname[0] == '>' || fname[0] == '<'));
@@ -559,7 +561,7 @@ static bool dag_cmp_operands_ok(ray_graph_t* g, const char* fname, size_t fname_
     bool span = lk == CK_SPAN || rk == CK_SPAN;
     if (eq && !span && (dag_const_is_null(g, l) || dag_const_is_null(g, r)))
         return true;
-    if (g->compile_err) return false;
+    if (quiet || g->compile_err) return false;
     if (RAY_IS_PARTED(lt)) lt = (int8_t)RAY_PARTED_BASETYPE(lt);
     if (RAY_IS_PARTED(rt)) rt = (int8_t)RAY_PARTED_BASETYPE(rt);
     if (lk == CK_TEXT) lt = RAY_STR;
@@ -2686,8 +2688,11 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                             ray_type_name((int8_t)-rvt));
                     return NULL;
                 }
-                if (g->if_arm_depth == 0 &&
-                    !dag_cmp_operands_ok(g, fname, fname_len, left, right, lvt, rvt))
+                /* Inside an if / cond arm a bad pair is not raised here
+                 * (the arm may never be selected) but is not compiled as a
+                 * raw compare either: the evaluator takes the expression. */
+                if (!dag_cmp_operands_ok(g, fname, fname_len, left, right, lvt, rvt,
+                                         g->if_arm_depth > 0))
                     return NULL;
                 if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
                     (!dag_pow_type_admitted(left->out_type) ||
@@ -26868,6 +26873,11 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
     if (RAY_IS_ERR(v)) { ray_error_free(v); return 0; }
     int ok = ray_is_atom(v) && !RAY_ATOM_IS_NULL(v) &&
              (col->type == RAY_SYM ? v->type == -RAY_SYM
+              /* a DATE / TIME / TIMESTAMP key takes its own type only: an
+               * integer against it is the builtins' type error (#974),
+               * which the general path raises */
+              : (col->type == RAY_DATE || col->type == RAY_TIME ||
+                 col->type == RAY_TIMESTAMP) ? v->type == -col->type
                                    : (v->type == -col->type || v->type == -RAY_I64 ||
                                       v->type == -RAY_I32 || v->type == -RAY_I16 ||
                                       v->type == -RAY_U8));

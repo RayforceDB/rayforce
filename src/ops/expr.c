@@ -5092,6 +5092,18 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                     }
                     return result;
                 }
+                /* The mirror: a null guid literal against a cell of another
+                 * type answers by that cell's nullness. */
+                if ((opc == OP_EQ || opc == OP_NE) && ray_is_atom(gv) && RAY_ATOM_IS_NULL(gv)) {
+                    bool o_scalar = l_guid ? r_scalar : l_scalar;
+                    uint8_t* out = (uint8_t*)ray_data(result);
+                    for (int64_t i = 0; i < len; i++) {
+                        uint8_t isnull = ray_is_atom(o) ? RAY_ATOM_IS_NULL(o)
+                                       : ray_vec_is_null(o, o_scalar ? 0 : i);
+                        out[i] = opc == OP_EQ ? isnull : (uint8_t)!isnull;
+                    }
+                    return result;
+                }
                 ray_release(result);
                 if (opc == OP_EQ || opc == OP_NE)
                     return ray_error("type", "%s: incomparable operand types, got %s and %s",

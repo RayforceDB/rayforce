@@ -133,3 +133,26 @@
 (count (select {from: BX where: (and x (> y 10))})) -- (sum (and (at BX 'x) (> (at BX 'y) 10)))
 (count (select {from: BX where: (or x (< y 10))})) -- (sum (or (at BX 'x) (< (at BX 'y) 10)))
 (at (select {c: (count y) from: BX where: (and (> y 10) x)}) 'c) -- (enlist (sum (and (at BX 'x) (> (at BX 'y) 10))))
+
+;; the hash-index fast path of delete / in-place update takes the same rule:
+;; an integer against an indexed DATE key is the type error, not a probe of
+;; the day count
+(set H (table [d i] (list (.idx.hash (as 'DATE (til 8))) (til 8))))
+(delete {from: 'H where: (== d 3)}) !- type
+(update {i: 99 from: 'H where: (== d 3)}) !- type
+(at H 'i) -- [0 1 2 3 4 5 6 7]
+(delete {from: 'H where: (== d 2000.01.04)})
+(at H 'i) -- [0 1 2 4 5 6 7]
+
+;; inside an if arm a bad pair goes to the evaluator, which raises it,
+;; instead of compiling a compare of the stored counts
+(select {r: (if b (> d 8000) false) from: R}) !- type
+(select {r: (if b (== n d) false) from: R}) !- type
+(at (select {r: (if b (> d 2024.01.02) false) from: R}) 'r) -- [false false]
+
+;; a null literal of another type: == / != answer by nullness, both ways
+(set NL (table [n g] (list [1 0 0Nl] (concat (guid 2) [0Ng]))))
+(at (select {r: (== n 0Ng) from: NL}) 'r) -- (== (at NL 'n) 0Ng)
+(at (select {r: (!= n 0Ng) from: NL}) 'r) -- (!= (at NL 'n) 0Ng)
+(at (select {r: (== g 0Nl) from: NL}) 'r) -- (== (at NL 'g) 0Nl)
+(at (select {from: (update {k: (til 3) from: NL}) where: (== n 0Ng)}) 'k) -- [2]
