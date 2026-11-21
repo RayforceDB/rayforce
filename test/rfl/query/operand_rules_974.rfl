@@ -1,0 +1,158 @@
+;; #974: inside a query the comparisons and `and` / `or` take the operand
+;; types the builtins take, with the same answers and the same errors.
+;;
+;; Before, `(== n d)` over an I64 and a DATE column compared the day counts
+;; in a select and was a type error on the vectors, `(< n s)` ordered a
+;; number against SYM intern ids (#768), `(< g g)` over GUID columns was an
+;; error only in a select, and `(and b f)` over a non-BOOL column was
+;; "operand must be boolean" in a select and a truth-value AND outside.
+;;
+;; The matrix runs every operator over every pair of 14 column types (each
+;; column holds a true, a zero / empty and a null cell) and compares the
+;; vector builtin with the select projection and the where: rows.  An entry
+;; of `bad` is a pair whose two sides differ (value or error message).
+
+(set T (table [cb8 cu8 ci16 ci32 ci64 cf32 cf64 cdate ctime cts cspan cguid csym cstr] (list [true false true] (as 'U8 [1 0 2]) [1h 0h 0Nh] [1i 0i 0Ni] [1 0 0Nl] (as 'F32 [1.0 0.0 0Nf]) [1.0 0.0 0Nf] (as 'DATE [1 0 0Nl]) (as 'TIME [1 0 0Nl]) (as 'TIMESTAMP [1 0 0Nl]) (as 'TIMESPAN [1 0 0Nl]) (concat (guid 2) [0Ng]) (as 'SYM ["a" "" "b"]) ["a" "" "b"])))
+(set TK (update {k: (til 3) from: T}))
+(set C (key T))
+(set msg (fn [e] (concat "ERR:" (at e 'msg))))
+;; column against column: vector builtin, select projection, where: rows
+(set out (fn [op a b] (try (eval (list op (at T a) (at T b))) msg)))
+(set inq (fn [op a b] (try (at (eval (list 'select (dict ['r 'from] (list (list op a b) T)))) 'r) msg)))
+(set wout (fn [op a b] (try (where (eval (list op (at T a) (at T b)))) msg)))
+(set winq (fn [op a b] (try (at (eval (list 'select (dict ['k 'from 'where] (list 'k TK (list op a b))))) 'k) msg)))
+(set same (fn [f g op a b] (== (format "%" (f op a b)) (format "%" (g op a b)))))
+(set bad (fn [f g op] (raze (map (fn [a] (map (fn [b] (list a b (f op a b) (g op a b))) (at C (where (not (map (fn [b] (same f g op a b)) C)))))) C))))
+
+(bad out inq '==) -- (list)
+(bad out inq '!=) -- (list)
+(bad out inq '<) -- (list)
+(bad out inq '<=) -- (list)
+(bad out inq '>) -- (list)
+(bad out inq '>=) -- (list)
+(bad out inq 'and) -- (list)
+(bad out inq 'or) -- (list)
+(bad wout winq '==) -- (list)
+(bad wout winq '!=) -- (list)
+(bad wout winq '<) -- (list)
+(bad wout winq '>=) -- (list)
+(bad wout winq 'and) -- (list)
+(bad wout winq 'or) -- (list)
+
+;; column against literal.  A string literal is a symbol in a query
+;; (`(== s "a")` matches the symbol `a`), which the builtin does not do, so
+;; the SYM column is checked against literals separately below.
+(set L (list true (as 'U8 0) 1h 0i 1 (as 'F32 0.0) 1.0 2000.01.02 00:00:00.000 2000.01.01D00:00:00.000000001 0D00:00:00.000000000 "a" ""))
+(set CL (at C (where (!= C 'csym))))
+(set sout (fn [op a v] (try (eval (list op (at T a) v)) msg)))
+(set sinq (fn [op a v] (try (at (eval (list 'select (dict ['r 'from] (list (list op a v) T)))) 'r) msg)))
+(set swout (fn [op a v] (try (where (eval (list op (at T a) v))) msg)))
+(set swinq (fn [op a v] (try (at (eval (list 'select (dict ['k 'from 'where] (list 'k TK (list op a v))))) 'k) msg)))
+(set ssame (fn [f g op a v] (== (format "%" (f op a v)) (format "%" (g op a v)))))
+(set sbad (fn [f g op] (raze (map (fn [a] (map (fn [v] (list a v (f op a v) (g op a v))) (at L (where (not (map (fn [v] (ssame f g op a v)) L)))))) CL))))
+
+(sbad sout sinq '==) -- (list)
+(sbad sout sinq '!=) -- (list)
+(sbad sout sinq '<) -- (list)
+(sbad sout sinq '>=) -- (list)
+(sbad sout sinq 'and) -- (list)
+(sbad sout sinq 'or) -- (list)
+(sbad swout swinq '==) -- (list)
+(sbad swout swinq '>) -- (list)
+(sbad swout swinq 'and) -- (list)
+(sbad swout swinq 'or) -- (list)
+
+;; the report's table
+(set R (table [n d b f] (list [8767 0] [2024.01.02 2024.01.03] [true false] [2.5 0.0])))
+(select {r: (== n d) from: R}) !- type
+(select {r: (< b d) from: R}) !- type
+(select {from: R where: (> d 8000)}) !- type
+(count (select {from: R where: (> d 8000)})) !- type
+(select {c: (count n) from: R where: (> d 8000)}) !- type
+(update {n: 0 from: R where: (> d 8000)}) !- type
+(delete {from: R where: (== d 8767)}) !- type
+(at (select {r: (and b f) from: R}) 'r) -- [true false]
+(at (select {r: (or b n) from: R}) 'r) -- [true false]
+(at (select {r: (and b f) from: R}) 'r) -- (and (at R 'b) (at R 'f))
+(count (select {from: R where: (> d 2024.01.02)})) -- 1
+(count (select {from: R where: (> n 8000)})) -- 1
+
+;; error messages are the builtins'
+(try (select {r: (== n d) from: R}) (fn [e] (at e 'msg))) -- "=: incomparable operand types, got i64 and date"
+(try (select {r: (!= d n) from: R}) (fn [e] (at e 'msg))) -- "<>: incomparable operand types, got date and i64"
+(try (select {from: R where: (> d 8000)}) (fn [e] (at e 'msg))) -- "cannot compare date and i64"
+
+;; TIMESPAN stays comparable with integers
+(set SP (table [s i] (list (as 'TIMESPAN [5 10 15]) [10 10 10])))
+(at (select {r: (< s i) from: SP}) 'r) -- [true false false]
+(count (select {from: SP where: (>= s 10)})) -- 2
+
+;; SYM ordering against a number or temporal is the builtins' error (#768);
+;; SYM against SYM orders by text, and a string literal is a symbol
+(set S (table [s i d] (list ['b 'a 'c] [1 2 3] [2024.01.01 2024.01.02 2024.01.03])))
+(select {r: (< s i) from: S}) !- type
+(select {from: S where: (> s 1)}) !- type
+(select {from: S where: (<= d s)}) !- type
+(try (select {r: (< s i) from: S}) (fn [e] (at e 'msg))) -- "cannot compare sym and i64"
+(at (select {r: (< s 'b) from: S}) 'r) -- [false true false]
+(at (select {r: (< s "b") from: S}) 'r) -- [false true false]
+(at (select {r: (== s "a") from: S}) 'r) -- [false true false]
+
+;; GUID: ordered by its bytes, as the builtin orders it; against another
+;; type, the builtin's error
+(set g3 (guid 3))
+(set G (table [g h s] (list g3 (reverse g3) ['a 'b 'c])))
+(at (select {r: (< g h) from: G}) 'r) -- (< g3 (reverse g3))
+(at (select {r: (>= g h) from: G}) 'r) -- (>= g3 (reverse g3))
+(count (select {from: G where: (> g h)})) -- (sum (> g3 (reverse g3)))
+(try (select {r: (< g s) from: G}) (fn [e] (at e 'msg))) -- "cannot compare guid and sym"
+(try (select {r: (== g s) from: G}) (fn [e] (at e 'msg))) -- "=: incomparable operand types, got guid and sym"
+
+;; and / or by truthiness: zero, null and NaN are false.  256 has a zero
+;; low byte, which the old kernel read as false (#678).
+(set X (table [x y f s] (list [0 256 0N 1 0 3] (til 6) [0.0 1.5 0Nf 2.0 0.0 0.0] (as 'SYM ["a" "" "b" "c" "" "d"]))))
+(at (select {r: (and x (> y 2)) from: X}) 'r) -- [false false false true false true]
+(at (select {from: X where: (and x (> y 2))}) 'y) -- [3 5]
+(at (select {from: X where: (and (> y 2) x)}) 'y) -- [3 5]
+(at (select {from: X where: (and x f s)}) 'y) -- [3]
+(at (select {from: X where: (or x f)}) 'y) -- [1 3 5]
+(at (select {c: (count y) from: X where: (and x (> y 2))}) 'c) -- [2]
+(at (select {c: (count y) from: X where: (or x (> y 4))}) 'c) -- [3]
+(at (update {y: 99 from: X where: (and x (> y 2))}) 'y) -- [0 1 2 99 4 99]
+(at (delete {from: X where: (or x (> y 4))}) 'y) -- [0 2 4]
+(at (select {r: (and x 2) from: X}) 'r) -- (and (at X 'x) 2)
+(at (select {r: (or f 0) from: X}) 'r) -- (or (at X 'f) 0)
+(at (select {r: (and s "x") from: X}) 'r) -- [true false true true false true]
+(at (select {r: (or (not x) s) from: X}) 'r) -- (or (not (at X 'x)) (at X 's))
+;; where: itself still takes a boolean mask
+(select {from: X where: x}) !- type
+
+;; the parallel paths: 300000 rows
+(set N 300000)
+(set BX (table [x y] (list (* 256 (% (til N) 3)) (til N))))
+(count (select {from: BX where: (and x (> y 10))})) -- (sum (and (at BX 'x) (> (at BX 'y) 10)))
+(count (select {from: BX where: (or x (< y 10))})) -- (sum (or (at BX 'x) (< (at BX 'y) 10)))
+(at (select {c: (count y) from: BX where: (and (> y 10) x)}) 'c) -- (enlist (sum (and (at BX 'x) (> (at BX 'y) 10))))
+
+;; the hash-index fast path of delete / in-place update takes the same rule:
+;; an integer against an indexed DATE key is the type error, not a probe of
+;; the day count
+(set H (table [d i] (list (.idx.hash (as 'DATE (til 8))) (til 8))))
+(delete {from: 'H where: (== d 3)}) !- type
+(update {i: 99 from: 'H where: (== d 3)}) !- type
+(at H 'i) -- [0 1 2 3 4 5 6 7]
+(delete {from: 'H where: (== d 2000.01.04)})
+(at H 'i) -- [0 1 2 4 5 6 7]
+
+;; inside an if arm a bad pair goes to the evaluator, which raises it,
+;; instead of compiling a compare of the stored counts
+(select {r: (if b (> d 8000) false) from: R}) !- type
+(select {r: (if b (== n d) false) from: R}) !- type
+(at (select {r: (if b (> d 2024.01.02) false) from: R}) 'r) -- [false false]
+
+;; a null literal of another type: == / != answer by nullness, both ways
+(set NL (table [n g] (list [1 0 0Nl] (concat (guid 2) [0Ng]))))
+(at (select {r: (== n 0Ng) from: NL}) 'r) -- (== (at NL 'n) 0Ng)
+(at (select {r: (!= n 0Ng) from: NL}) 'r) -- (!= (at NL 'n) 0Ng)
+(at (select {r: (== g 0Nl) from: NL}) 'r) -- (== (at NL 'g) 0Nl)
+(at (select {from: (update {k: (til 3) from: NL}) where: (== n 0Ng)}) 'k) -- [2]
