@@ -40,7 +40,7 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 |---|---|
 | `timestamp - timestamp`, `time - time` | TIMESPAN |
 | `timestamp + span`, `timestamp - span`, `span + timestamp` | TIMESTAMP |
-| `time + span`, `time - span`, `span + time` | TIME, floored to the millisecond; no 24 h wrap, a result past the 32-bit range is null |
+| `time + span`, `time - span`, `span + time`, `span - time` | TIME, floored to the millisecond; no 24 h wrap, a result past the 32-bit range is null |
 | `time + time` | Type error, as `timestamp + timestamp` |
 | `span + span`, `span - span`, `neg span`, `abs span` | TIMESPAN |
 | `span + integer`, `integer + span`, `span - integer` | TIMESPAN; integer counts nanoseconds |
