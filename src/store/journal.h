@@ -143,6 +143,14 @@ ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64
 /* insert, right before it appends to the global table `name` of `rows0`
  * rows: the rows past rows0 are noted in place of the whole table. */
 void ray_journal_mut_target(int64_t name, int64_t rows0);
+/* upsert, once its key and rows are evaluated, amending `tbl` under the
+ * name `name`: the two are noted in place of the table they leave. */
+void ray_journal_mut_upsert(int64_t name, ray_t* tbl, ray_t* key, ray_t* rows);
+/* update and delete, having amended `tbl` in place: rows `idx` now hold
+ * `rows`, or are gone when rows is NULL. */
+void ray_journal_mut_rows(int64_t name, ray_t* tbl, ray_t* idx, ray_t* rows);
+/* What replay does with such a record: a new table (ops/query.c). */
+ray_t* ray_table_patch_rows(ray_t* tbl, ray_t* idx, ray_t* rows);
 
 /* Write the changes noted since the last commit as one frame (fsync in
  * RAY_JOURNAL_SYNC mode).  RAY_OK when there are none.  On an error the

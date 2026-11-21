@@ -190,6 +190,8 @@ static const struct { const char* name; const char* ops; const char* probe; } wa
     { "upsert existing", "(set t " T3 ")\n(upsert 't 1 (list 2 77 'z))", "t" },
     { "upsert twice",    "(set t " T3 ")\n(upsert 't 1 (list 2 77 'z))\n(upsert 't 1 (list 9 99 'y))", "t" },
     { "upsert shared",   "(set t " T3 ")\n(set u t)\n(upsert 't 1 (list 2 77 'z))", "(list t u)" },
+    { "upsert a local",  "(set t " T3 ")\n(set f (fn [t] (do (upsert 't 1 (list 2 77 'z)) (count t))))\n(f (table [k v s] (list [9] [9] ['q])))", "t" },
+    { "upsert dict row", "(set t " T3 ")\n(upsert 't 1 (dict ['k 'v 's] (list 2 55 'w)))", "t" },
     { "upsert dotted",   "(set ns.t " T3 ")\n(upsert 'ns.t 1 (list 2 77 'z))", "ns.t" },
 
     { "update where",    "(set t " T3 ")\n(update {from: 't v: 99 where: (== k 2)})", "t" },
@@ -198,6 +200,10 @@ static const struct { const char* name; const char* ops; const char* probe; } wa
     { "update shared",   "(set t " T3 ")\n(set u t)\n(update {from: 't v: 99 where: (== k 2)})", "(list t u)" },
     { "update dotted",   "(set ns.t " T3 ")\n(update {from: 'ns.t v: 99 where: (== k 2)})", "ns.t" },
 
+    { "update nulls",    "(set t " T3 ")\n(update {from: 't v: 0Nl where: (== k 2)})\n(update {from: 't s: 'zz where: (> k 1)})", "(list t (nil? (at t 'v)))" },
+    { "update twice",    "(set t " T3 ")\n(update {from: 't v: (+ v 1) where: (> k 1)})\n(update {from: 't v: (* v 3) where: (< k 3)})", "t" },
+    { "delete all",      "(set t " T3 ")\n(delete {from: 't where: (> k 0)})\n(insert 't (list 9 90 'q))", "t" },
+    { "delete then upsert", "(set t " T3 ")\n(upsert 't 1 (list 2 77 'z))\n(delete {from: 't where: (== k 1)})\n(upsert 't 1 (list 3 33 'y))\n(upsert 't 1 (list 1 11 'x))", "t" },
     { "delete where",    "(set t " T3 ")\n(delete {from: 't where: (> k 1)})", "t" },
     { "delete shared",   "(set t " T3 ")\n(set u t)\n(delete {from: 't where: (> k 1)})", "(list t u)" },
     { "delete dotted",   "(set ns.t " T3 ")\n(delete {from: 'ns.t where: (== k 2)})", "ns.t" },
@@ -726,6 +732,50 @@ static test_result_t test_wal_insert_logs_rows_not_table(void) {
     PASS();
 }
 
+/* So is an upsert: its key and its rows, whether it changes a row that is
+ * there or adds one. */
+static test_result_t test_wal_upsert_logs_rows_not_table(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "ups");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set big (table [k v] (list (til 100000) (til 100000))))"));
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(upsert 'big 1 (list 7 -1))"));
+    int64_t changed = wal_file_size(base) - before;
+    TEST_ASSERT_TRUE(wal_run("(upsert 'big 1 (list 500000 -2))"));
+    int64_t added = wal_file_size(base) - before - changed;
+    TEST_ASSERT_TRUE(wal_run("(upsert 'big 1 (table [k v] (list [8 500001] [-3 -4])))"));
+    int64_t both = wal_file_size(base) - before - changed - added;
+    /* ...and an update or a delete of a few rows: those rows. */
+    int64_t mark = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(update {from: 'big v: -9 where: (== k 11)})"));
+    int64_t updated = wal_file_size(base) - mark;
+    TEST_ASSERT_TRUE(wal_run("(update {from: 'big v: (* v 2) where: (< k 5)})"));
+    mark = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(delete {from: 'big where: (== k 12)})"));
+    int64_t deleted = wal_file_size(base) - mark;
+    TEST_ASSERT_TRUE(wal_run("(delete {from: 'big where: (and (> k 20) (< k 25))})"));
+    TEST_ASSERT_TRUE(wal_run("(update {from: 'big v: 0 where: (== k 99999999)})"));   /* matches nothing */
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("(list (count big) (sum (at big 'v)) (sum (at big 'k)) (take (at big 'v) 30) (take (at big 'k) 30))", &nwant);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    uint8_t* got = wal_probe("(list (count big) (sum (at big 'v)) (sum (at big 'k)) (take (at big 'v) 30) (take (at big 'k) 30))", &ngot);
+    bool same = want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(changed > 0 && changed < 512);
+    TEST_ASSERT_TRUE(added > 0 && added < 512);
+    TEST_ASSERT_TRUE(both > 0 && both < 1024);
+    TEST_ASSERT_TRUE(updated > 0 && updated < 512);
+    TEST_ASSERT_TRUE(deleted > 0 && deleted < 512);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
 /* A statement that changes nothing writes nothing. */
 static test_result_t test_wal_read_writes_no_frame(void) {
     char base[256];
@@ -874,6 +924,7 @@ const test_entry_t wal_entries[] = {
     { "wal/probe_sees_content",     test_wal_probe_sees_content,     wal_setup, wal_teardown },
     { "wal/roundtrip_paths",        test_wal_roundtrip_paths,        wal_setup, wal_teardown },
     { "wal/insert_logs_rows",       test_wal_insert_logs_rows_not_table, wal_setup, wal_teardown },
+    { "wal/upsert_logs_rows",       test_wal_upsert_logs_rows_not_table, wal_setup, wal_teardown },
     { "wal/read_writes_no_frame",   test_wal_read_writes_no_frame,   wal_setup, wal_teardown },
     { "wal/failed_statement",       test_wal_failed_statement_logs_what_it_changed, wal_setup, wal_teardown },
     { "wal/unloggable_refused",     test_wal_unloggable_value_is_refused, wal_setup, wal_teardown },

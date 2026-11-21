@@ -29236,6 +29236,14 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     }
     for (int64_t u = 0; u < nu && !err; u++)
         err = update_scatter(slots, ucol[u], rows, k, uval[u]);
+    /* The journal notes the rows as they now stand, not the table. */
+    if (!err && idxv && ray_journal_capture) {
+        ray_t* now = ray_at_fn(tbl, idxv);
+        if (now && !RAY_IS_ERR(now)) {
+            ray_journal_mut_rows(inplace_sym, tbl, idxv, now);
+            ray_release(now);
+        } else if (now) ray_error_free(now);
+    }
 
     for (int64_t u = 0; u < nu; u++) if (uval[u]) ray_release(uval[u]);
     if (sub) ray_release(sub);
@@ -33436,6 +33444,9 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
     if (!row || RAY_IS_ERR(row)) { ray_release(tbl); ray_release(key_sym); return row ? row : ray_error("type", "upsert: row evaluation failed"); }
 
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("type", "upsert: target must be a table, got %s", ray_type_name(tbl_t)); }
+    /* Every argument is evaluated: the journal notes the key and the rows,
+     * not the table this upsert publishes. */
+    if (inplace_sym >= 0 && ray_journal_capture) ray_journal_mut_upsert(inplace_sym, tbl, key_sym, row);
     if (!is_list(row) && row->type != RAY_TABLE && row->type != RAY_DICT) { int8_t row_t = row->type; ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("type", "upsert: row must be a list, table or dict, got %s", ray_type_name(row_t)); }
 
     int64_t ncols = ray_table_ncols(tbl);
@@ -36759,6 +36770,16 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         ray_t* cerr = delete_compact_cols(slots, ncols, nrows0, rows, k);
         if (cerr) { scratch_free(rows_hdr); ray_release(tbl); return cerr; }
         ukey_patch_after_delete(tbl, rows, k, nrows0);
+        /* The journal notes which rows went, not the table that is left. */
+        if (ray_journal_capture) {
+            ray_t* gone = ray_vec_new(RAY_I64, k);
+            ray_t* full = gone && !RAY_IS_ERR(gone) ? ray_vec_append_raw(gone, rows, k) : NULL;
+            if (full && !RAY_IS_ERR(full)) {
+                /* tbl is still held here: rc 2, as the note's owner check reads it */
+                ray_journal_mut_rows(inplace_sym, tbl, full, NULL);
+                ray_release(full);
+            } else if (gone && !RAY_IS_ERR(gone)) ray_release(gone);
+        }
         scratch_free(rows_hdr);
         ray_release(tbl);
         return ray_sym(inplace_sym);
@@ -36802,5 +36823,44 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         ray_release(work);
         return ray_sym(inplace_sym);
     }
+    return work;
+}
+
+/* Journal replay of an update or a delete made in place (store/journal.c):
+ * the rows `idx` of `tbl` take the rows of `sub`, column by column, or are
+ * removed when `sub` is NULL (`idx` ascending, as delete noted it).  A new
+ * table of private columns; `tbl` is left alone. */
+ray_t* ray_table_patch_rows(ray_t* tbl, ray_t* idx, ray_t* sub) {
+    int64_t ncols = ray_table_ncols(tbl), nrows = ray_table_nrows(tbl);
+    if (!idx || idx->type != RAY_I64 || (sub && (sub->type != RAY_TABLE ||
+        ray_table_ncols(sub) != ncols || ray_table_nrows(sub) != idx->len)))
+        return ray_error("domain", NULL);
+    const int64_t* rows = (const int64_t*)ray_data(idx);
+    int64_t k = idx->len;
+    for (int64_t i = 0; i < k; i++)
+        if (rows[i] < 0 || rows[i] >= nrows || (!sub && i > 0 && rows[i] <= rows[i - 1]))
+            return ray_error("domain", NULL);
+    ray_t* work = ray_table_new(ncols);
+    ray_t* err = !work || RAY_IS_ERR(work) ? (work ? work : ray_error("oom", NULL)) : NULL;
+    if (err) return err;
+    for (int64_t c = 0; c < ncols && !err; c++) {
+        ray_t* orig = ray_table_col_idx(tbl, c);
+        if (!orig || RAY_IS_ERR(orig)) { err = orig ? orig : ray_error("oom", NULL); break; }
+        ray_retain(orig);
+        ray_t* cp = ray_cow(orig);
+        if (!cp || RAY_IS_ERR(cp)) { ray_release(orig); err = cp ? cp : ray_error("oom", NULL); break; }
+        work = ray_table_add_col(work, ray_table_col_name(tbl, c), cp);
+        ray_release(cp);
+        if (!work || RAY_IS_ERR(work)) { err = work ? work : ray_error("oom", NULL); work = NULL; }
+    }
+    ray_t* wc = err ? NULL : ray_table_cols_inplace(work);
+    if (!err && !wc) err = ray_error("oom", NULL);
+    if (!err && !sub) err = delete_compact_cols((ray_t**)ray_data(wc), ncols, nrows, rows, k);
+    for (int64_t c = 0; !err && sub && c < ncols; c++) {
+        ray_t* val = ray_table_col_idx(sub, c);
+        if (!val || RAY_IS_ERR(val)) { err = val ? val : ray_error("oom", NULL); break; }
+        err = update_scatter((ray_t**)ray_data(wc), c, rows, k, val);
+    }
+    if (err) { if (work) ray_release(work); return err; }
     return work;
 }

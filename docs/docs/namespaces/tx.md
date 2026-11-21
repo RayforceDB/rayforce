@@ -88,7 +88,7 @@ Not refused, and not undone either: timers set, environment variables set, conne
 
 - **The first write to a table in a transaction copies it.** The transaction keeps the old table for the rollback, so the write cannot be made in place. Later writes to the same table in the same transaction are in place again.
 - **Everyone waits.** Keep transactions short; a transaction that thinks between messages stops every other client for that long.
-- A commit of an `update`, `delete`, `upsert` or `alter` logs the table it leaves; an `insert` logs its rows (see [the journal](log.md)).
+- For the same reason the first `update` or `delete` of a table in a transaction logs the table it leaves, where outside a transaction it logs the rows it touched; `insert` and `upsert` log their rows either way (see [the journal](log.md)).
 
 ## See also
 

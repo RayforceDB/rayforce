@@ -283,6 +283,11 @@ static size_t read_full(FILE* f, void* buf, size_t want) {
  *     [RAY_JREC_SET, name, value]    bind the global
  *     [RAY_JREC_DEL, name]           unbind it
  *     [RAY_JREC_APPEND, name, tail]  concat `tail` to the bound table
+ *     [RAY_JREC_UPSERT, name, [key, rows]]  upsert `rows` into the bound
+ *                                    table by `key`, as (upsert name key rows)
+ *     [RAY_JREC_ROWS, name, [idx, rows]]  rows `idx` of the bound table now
+ *                                    hold `rows` (an update with where:)
+ *     [RAY_JREC_DROP, name, [idx]]   rows `idx` of it are gone (a delete)
  *     [RAY_JREC_PUBLISH, _, [root, gen]]  a splayed table written in a
  *                                    transaction: make `gen` its current
  *                                    generation, unless it already is
@@ -294,6 +299,9 @@ static size_t read_full(FILE* f, void* buf, size_t want) {
 #define RAY_JREC_DEL     1
 #define RAY_JREC_APPEND  2
 #define RAY_JREC_PUBLISH 3
+#define RAY_JREC_UPSERT  4
+#define RAY_JREC_ROWS    5
+#define RAY_JREC_DROP    6
 #define RAY_JREC_MAX     (256LL * 1024 * 1024)   /* the frame size replay accepts */
 
 bool ray_journal_capture = false;
@@ -313,6 +321,8 @@ typedef struct jmut {
     int64_t target;      /* insert's global table, -1 when not announced */
     int64_t rows0;       /* its row count before the insert */
     int64_t set_name;    /* last global this mutator published through ray_env_set */
+    int64_t op;          /* the record a mutator made itself for `target`... */
+    ray_t*  val;         /* ...and its value, owned; NULL for an insert */
 } jmut_t;
 static _Thread_local jmut_t* g_mut;
 
@@ -381,6 +391,37 @@ void ray_journal_mut_target(int64_t name, int64_t rows0) {
     g_mut->rows0  = rows0;
 }
 
+static ray_t* global_value(int64_t name);
+
+/* A mutator that amended `tbl` under `name` says what it did, as the record
+ * `op` of the one or two values: it is noted in place of the table. */
+static void mut_note(int64_t name, ray_t* tbl, int64_t op, ray_t* a, ray_t* b) {
+    jmut_t* m = g_mut;
+    if (!m || m->val) return;
+    /* A local of that name is not the global the record would amend. */
+    ray_t* cur = global_value(name);
+    if (cur) ray_release(cur);
+    if (cur != tbl) return;
+    ray_t* pair = ray_list_new(2);
+    ray_t* parts[2] = { a, b };
+    for (int i = 0; i < (b ? 2 : 1) && pair && !RAY_IS_ERR(pair); i++) {
+        ray_t* grown = ray_list_append(pair, parts[i]);
+        if (!grown || RAY_IS_ERR(grown)) { ray_release(pair); pair = NULL; }
+        else pair = grown;
+    }
+    if (!pair || RAY_IS_ERR(pair)) return;       /* the whole table is logged instead */
+    m->op = op;
+    m->val = pair;
+    m->target = name;
+}
+
+void ray_journal_mut_upsert(int64_t name, ray_t* tbl, ray_t* key, ray_t* rows) {
+    mut_note(name, tbl, RAY_JREC_UPSERT, key, rows);
+}
+void ray_journal_mut_rows(int64_t name, ray_t* tbl, ray_t* idx, ray_t* rows) {
+    mut_note(name, tbl, rows ? RAY_JREC_ROWS : RAY_JREC_DROP, idx, rows);
+}
+
 /* The global a (possibly dotted) name reads, owned; NULL when unbound. */
 static ray_t* global_value(int64_t name) {
     if (!ray_sym_is_dotted(name)) {
@@ -399,6 +440,7 @@ static ray_t* global_value(int64_t name) {
  * ray_env_set is noted already; one made in place is noted here. */
 static ray_err_t mut_record(const jmut_t* m, int64_t name) {
     if (m->target != name && m->set_name == name) return RAY_OK;
+    if (m->target == name && m->val) return rec_push(m->op, name, m->val);
     ray_t* cur = global_value(name);
     if (!cur) return RAY_OK;                     /* a local target: no global changed */
     ray_err_t e;
@@ -426,13 +468,14 @@ static ray_err_t mut_record(const jmut_t* m, int64_t name) {
 
 ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64_t n) {
     if (!ray_journal_capture) return impl(args, n);
-    jmut_t m = { .prev = g_mut, .target = -1, .rows0 = 0, .set_name = -1 };
+    jmut_t m = { .prev = g_mut, .target = -1, .rows0 = 0, .set_name = -1, .op = 0, .val = NULL };
     g_mut = &m;
     ray_t* r = impl(args, n);
     g_mut = m.prev;
     /* The change is made: one that cannot be noted leaves the log behind. */
     if (r && !RAY_IS_ERR(r) && r->type == -RAY_SYM && mut_record(&m, r->i64) != RAY_OK)
         g_rec.lost = true;
+    if (m.val) ray_release(m.val);
     return r;
 }
 
@@ -685,6 +728,34 @@ static ray_err_t rec_apply(ray_t* rec) {
         /* A verb trusted by name: its identity includes that name. */
         if (e == RAY_OK && v->type == RAY_LAMBDA && (LAMBDA_TRUSTED(v) & 1))
             (void)ray_eval_lambda_trust(v, name);
+        return e;
+    }
+    case RAY_JREC_UPSERT: {
+        ray_t* cur = global_value(name);
+        if (!cur || !v || v->type != RAY_LIST || v->len != 2) { if (cur) ray_release(cur); return RAY_ERR_DOMAIN; }
+        /* A table in first place is the mutator's own already-evaluated
+         * form: it evaluates none of the three and returns the new table. */
+        ray_t* args[3] = { cur, ray_list_get(v, 0), ray_list_get(v, 1) };
+        ray_t* all = cur->type == RAY_TABLE && args[1] && args[2] ? ray_upsert(args, 3) : NULL;
+        ray_release(cur);
+        if (!all || RAY_IS_ERR(all)) { if (all) ray_error_free(all); return RAY_ERR_DOMAIN; }
+        ray_err_t e = ray_env_set(name, all);
+        ray_release(all);
+        return e;
+    }
+    case RAY_JREC_ROWS:
+    case RAY_JREC_DROP: {
+        ray_t* cur = global_value(name);
+        bool rows = o->i64 == RAY_JREC_ROWS;
+        if (!cur || !v || v->type != RAY_LIST || v->len != (rows ? 2 : 1) || cur->type != RAY_TABLE) {
+            if (cur) ray_release(cur);
+            return RAY_ERR_DOMAIN;
+        }
+        ray_t* all = ray_table_patch_rows(cur, ray_list_get(v, 0), rows ? ray_list_get(v, 1) : NULL);
+        ray_release(cur);
+        if (!all || RAY_IS_ERR(all)) { if (all) ray_error_free(all); return RAY_ERR_DOMAIN; }
+        ray_err_t e = ray_env_set(name, all);
+        ray_release(all);
         return e;
     }
     case RAY_JREC_APPEND: {

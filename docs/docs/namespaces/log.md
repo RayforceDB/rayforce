@@ -6,15 +6,18 @@ Each entry is one **commit**. It holds physical records, not the command that pr
 
 | Record | Written for | Recovery does |
 |---|---|---|
-| bind | `set`, top-level `let`, `update`, `delete`, `upsert`, `alter` | binds the name to the recorded value |
+| bind | `set`, top-level `let`, `alter`, and any mutator that had to rebuild its table | binds the name to the recorded value |
 | unbind | `del` | removes the name |
 | append | `insert` into a named table | appends the recorded rows |
+| upsert | `upsert` into a named table | upserts the recorded rows by the recorded key |
+| rows | `update` with `where:`, made in place | writes the recorded rows at the recorded positions |
+| drop | `delete`, made in place | removes the rows at the recorded positions |
 | publish | a splayed table written in a [transaction](tx.md) | makes its new generation current, if it is not already |
 
 Consequences worth knowing:
 
 - **Recovery is deterministic.** `rand`, the clock and anything else a command consulted were settled when the change was made; recovery reproduces the values, not the computation.
-- **An `insert` costs its rows.** One row into a large table writes one row. `update`, `delete`, `upsert` and `alter` write the value they leave, so on a large table each of them writes the table.
+- **A change costs its rows.** `insert` and `upsert` write the rows they were given; an `update` with `where:` and a `delete` write the rows they touched. The whole table is written only when the mutator could not work in place and rebuilt it: an `update` without `where:` or with `by:`, one that adds a column, any `alter`, a table that something else also holds, or the first write to a table inside a [transaction](tx.md).
 - **An entry cannot exceed 256 MB.** A change larger than that is refused.
 - **A value that cannot be serialised cannot be bound while a journal is open** (a graph or index handle, for example): `set` fails with `domain` and the name stays as it was.
 - **Only globals come back.** A timer, a listener, an open handle or a file written by a request is not re-created by recovery.
