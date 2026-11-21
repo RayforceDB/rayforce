@@ -466,12 +466,24 @@ static bool mix_begin(rd_t* rd, int8_t vt, size_t n) {
     return true;
 }
 
+/* Points rd->p at element i of the vector literal opening at v: an error
+ * found after `]` names the element, as other element errors do.  Mixed
+ * vectors hold numeric tokens only, which end at token_end. */
+static void mix_elem_at(rd_t* rd, const char* v, size_t i) {
+    rd->p = v + 1;
+    for (;;) {
+        skip_ws(rd);
+        if (i-- == 0) return;
+        while (!token_end(rd)) rd->p++;
+    }
+}
+
 /* Types a mixed vector as parse_vector does: a final I16, I32 or F32 element
  * (an h, i or e suffix) types every element, otherwise I64 and F64 elements
  * promote to F64.  Under a suffix each earlier element is of that type, an
  * unsuffixed integer or float, or bare 0N; `nul_l_at` is the first 0Nl
- * (SIZE_MAX for none), whose cell is that of 0N. */
-static ray_t* mix_finish(rd_t* rd, size_t n, size_t nul_l_at) {
+ * (SIZE_MAX for none), whose cell is that of 0N.  `vstart` is the `[`. */
+static ray_t* mix_finish(rd_t* rd, const char* vstart, size_t n, size_t nul_l_at) {
     const mix_t* m = (const mix_t*)rd->pool.p;
     int8_t vt = m[n - 1].t;
     bool sfx = vt == RAY_I16 || vt == RAY_I32 || vt == RAY_F32;
@@ -486,28 +498,41 @@ static ray_t* mix_finish(rd_t* rd, size_t n, size_t nul_l_at) {
         mix_t x = m[i];
         nulls |= x.null;
         if (!sfx) {
-            if (x.t != RAY_I64 && x.t != RAY_F64) return fail_at(rd, "vector elements must all have one type");
+            if (x.t != RAY_I64 && x.t != RAY_F64) {
+                mix_elem_at(rd, vstart, i);
+                return fail_at(rd, "vector elements must all have one type");
+            }
             ((double*)ray_data(v))[i] = x.null ? NULL_F64 : x.t == RAY_F64 ? x.f : (double)x.i;
             continue;
         }
         bool ok = x.t == vt || (x.t == RAY_I64 && !(x.null && i == nul_l_at)) || (x.t == RAY_F64 && !x.null);
-        if (!ok)
+        if (!ok) {
+            mix_elem_at(rd, vstart, i);
             return fail_at(rd, "vector element %zu (%s) conflicts with suffix '%c'", i,
-                           x.null ? ray_fmt_null_literal(x.t) : ray_type_name((int8_t)-x.t), c);
+                           x.null ? ray_fmt_null_literal(x.t) : ray_type_name(x.t), c);
+        }
         if (vt == RAY_F32) {
             float f = NULL_F32;
             if (!x.null) {
                 double d = x.t == RAY_I64 ? (double)x.i : x.f;
-                if (x.t == RAY_F64 && fabs(d) >= 0x1.ffffffp127) return fail_at(rd, "vector element %zu out of range for suffix 'e'", i);
+                if (x.t == RAY_F64 && fabs(d) >= 0x1.ffffffp127) {
+                    mix_elem_at(rd, vstart, i);
+                    return fail_at(rd, "vector element %zu out of range for suffix 'e'", i);
+                }
                 f = x.t == RAY_I64 ? (float)x.i : x.t == RAY_F64 ? ray_cast_f64_to_f32_null(x.f) : (float)x.f;
             }
             ((float*)ray_data(v))[i] = f;
             continue;
         }
-        if (x.t == RAY_F64) return fail_at(rd, "vector element %zu is a float literal; suffix '%c' needs integers", i, c);
-        if (!x.null && (x.i < -lim || x.i > lim))
+        if (x.t == RAY_F64) {
+            mix_elem_at(rd, vstart, i);
+            return fail_at(rd, "vector element %zu is a float literal; suffix '%c' needs integers", i, c);
+        }
+        if (!x.null && (x.i < -lim || x.i > lim)) {
+            mix_elem_at(rd, vstart, i);
             return fail(rd, "domain", "read-value: vector element %zu out of range for suffix '%c' at byte %zu",
                         i, c, (size_t)(rd->p - rd->src));
+        }
         if (vt == RAY_I16) ((int16_t*)ray_data(v))[i] = x.null ? NULL_I16 : (int16_t)x.i;
         else               ((int32_t*)ray_data(v))[i] = x.null ? NULL_I32 : (int32_t)x.i;
     }
@@ -518,6 +543,7 @@ static ray_t* mix_finish(rd_t* rd, size_t n, size_t nul_l_at) {
 /* `[` elem* `]`: a typed vector from literal elements.  Elements of one type
  * are staged in their cells; mixed numeric elements switch to mix_t records. */
 static ray_t* read_vec_literal(rd_t* rd) {
+    const char* vstart = rd->p;
     rd->p++;
     int8_t vt = 0;
     size_t n = 0, es = 0;
@@ -615,7 +641,7 @@ static ray_t* read_vec_literal(rd_t* rd) {
     }
     if (n == 0) return fail_at(rd, "an empty vector needs its type: write (as 'I64 [])");
     if (!DATA(rd, n + 1)) return NULL;
-    if (mixed) return mix_finish(rd, n, nul_l_at);
+    if (mixed) return mix_finish(rd, vstart, n, nul_l_at);
     if (vt == RAY_SYM) return build_sym_vec(rd, n, (const size_t*)rd->cells.p);
     if (vt == RAY_STR) return build_str_vec(rd, n, (const uint32_t*)rd->cells.p, (const char*)rd->pool.p);
     ray_t* v = vec_blk(rd, vt, n, es);

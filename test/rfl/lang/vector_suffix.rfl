@@ -60,10 +60,10 @@
 (set rm (fn [s] (at (try (read-value s) (fn [e] e)) 'msg)))
 ;; a conflicting suffix
 [1h 2i] !- domain
-(em "[1h 2i]") -- "parse: vector element 0 (i16) conflicts with suffix 'i'"
-(em "[1i 2 3h]") -- "parse: vector element 0 (i32) conflicts with suffix 'h'"
-(em "[1 2e 3h]") -- "parse: vector element 1 (f32) conflicts with suffix 'h'"
-(em "[1 2h 3e]") -- "parse: vector element 1 (i16) conflicts with suffix 'e'"
+(em "[1h 2i]") -- "parse: vector element 0 (I16) conflicts with suffix 'i'"
+(em "[1i 2 3h]") -- "parse: vector element 0 (I32) conflicts with suffix 'h'"
+(em "[1 2e 3h]") -- "parse: vector element 1 (F32) conflicts with suffix 'h'"
+(em "[1 2h 3e]") -- "parse: vector element 1 (I16) conflicts with suffix 'e'"
 ;; a typed null of another type, 0Nl and 0Nf included
 (em "[1 0Nl 3h]") -- "parse: vector element 1 (0Nl) conflicts with suffix 'h'"
 (em "[0Nl 2e]") -- "parse: vector element 0 (0Nl) conflicts with suffix 'e'"
@@ -71,9 +71,9 @@
 (em "[1 0Nf 2i]") -- "parse: vector element 1 (0Nf) conflicts with suffix 'i'"
 (em "[1 0Ni 2h]") -- "parse: vector element 1 (0Ni) conflicts with suffix 'h'"
 ;; a non-numeric element
-(em "[a 1h]") -- "parse: vector element 0 (sym) conflicts with suffix 'h'"
-(em "[\"a\" 1h]") -- "parse: vector element 0 (str) conflicts with suffix 'h'"
-(em "[2024.01.01 1i]") -- "parse: vector element 0 (date) conflicts with suffix 'i'"
+(em "[a 1h]") -- "parse: vector element 0 (SYM) conflicts with suffix 'h'"
+(em "[\"a\" 1h]") -- "parse: vector element 0 (STR) conflicts with suffix 'h'"
+(em "[2024.01.01 1i]") -- "parse: vector element 0 (DATE) conflicts with suffix 'i'"
 ;; overflow
 [40000 1h] !- domain
 (em "[40000 1h]") -- "parse: vector element 0 out of range for suffix 'h' [-32767,32767], got 40000"
@@ -113,17 +113,17 @@
 (== (read-value "[1 2.5]") [1 2.5]) -- [true true]
 ;; errors
 (read-value "[1h 2i]") !- parse
-(rm "[1h 2i]") -- "read-value: vector element 0 (i16) conflicts with suffix 'i' at byte 7"
-(rm "[1i 2 3h]") -- "read-value: vector element 0 (i32) conflicts with suffix 'h' at byte 9"
-(rm "[1 0Nl 3h]") -- "read-value: vector element 1 (0Nl) conflicts with suffix 'h' at byte 10"
-(rm "[1 0Nf 2e]") -- "read-value: vector element 1 (0Nf) conflicts with suffix 'e' at byte 10"
+(rm "[1h 2i]") -- "read-value: vector element 0 (I16) conflicts with suffix 'i' at byte 1"
+(rm "[1i 2 3h]") -- "read-value: vector element 0 (I32) conflicts with suffix 'h' at byte 1"
+(rm "[1 0Nl 3h]") -- "read-value: vector element 1 (0Nl) conflicts with suffix 'h' at byte 3"
+(rm "[1 0Nf 2e]") -- "read-value: vector element 1 (0Nf) conflicts with suffix 'e' at byte 3"
 (read-value "[40000 1h]") !- domain
-(rm "[40000 1h]") -- "read-value: vector element 0 out of range for suffix 'h' at byte 10"
-(rm "[2147483648 1i]") -- "read-value: vector element 0 out of range for suffix 'i' at byte 15"
-(rm "[1.5 2h]") -- "read-value: vector element 0 is a float literal; suffix 'h' needs integers at byte 8"
-(rm "[1e3 2i]") -- "read-value: vector element 0 is a float literal; suffix 'i' needs integers at byte 8"
-(rm "[1e39 1e]") -- "read-value: vector element 0 out of range for suffix 'e' at byte 9"
-(rm "[1 2h 3]") -- "read-value: vector elements must all have one type at byte 8"
+(rm "[40000 1h]") -- "read-value: vector element 0 out of range for suffix 'h' at byte 1"
+(rm "[2147483648 1i]") -- "read-value: vector element 0 out of range for suffix 'i' at byte 1"
+(rm "[1.5 2h]") -- "read-value: vector element 0 is a float literal; suffix 'h' needs integers at byte 1"
+(rm "[1e3 2i]") -- "read-value: vector element 0 is a float literal; suffix 'i' needs integers at byte 1"
+(rm "[1e39 1e]") -- "read-value: vector element 0 out of range for suffix 'e' at byte 1"
+(rm "[1 2h 3]") -- "read-value: vector elements must all have one type at byte 3"
 (rm "[1 \"a\" 2h]") -- "read-value: vector elements must all have one type at byte 6"
 (rm "[1 2h true]") -- "read-value: vector elements must all have one type at byte 10"
 (rm "[1 2h 'a]") -- "read-value: vector elements must all have one type at byte 8"
@@ -142,18 +142,32 @@
 [0N 0Nl 2h] !- domain
 (em "[0N 0Nl 2h]") -- "parse: vector element 1 (0Nl) conflicts with suffix 'h'"
 (em "[0Nl 0N 2h]") -- "parse: vector element 0 (0Nl) conflicts with suffix 'h'"
-(rm "[0N 0Nl 2h]") -- "read-value: vector element 1 (0Nl) conflicts with suffix 'h' at byte 11"
-(rm "[1h 0N 0Nl 2h]") -- "read-value: vector element 2 (0Nl) conflicts with suffix 'h' at byte 14"
+(rm "[0N 0Nl 2h]") -- "read-value: vector element 1 (0Nl) conflicts with suffix 'h' at byte 4"
+(rm "[1h 0N 0Nl 2h]") -- "read-value: vector element 2 (0Nl) conflicts with suffix 'h' at byte 7"
 ;; a 0Nl in one literal does not reach a sibling or a later one
 (repr (list [0Nl 1] [0N 2h])) -- "(list [0Nl 1] [0Nh 2h])"
 (repr [0Nl 1]) -- "[0Nl 1]"
 (repr [0N 2h]) -- "[0Nh 2h]"
+;; the I64 minimum is the I64 null bit pattern, not 0N: out of range
+[-9223372036854775808 1h] !- domain
+(em "[-9223372036854775808 1h]") -- "parse: vector element 0 out of range for suffix 'h'"
+(em "[-9223372036854775808 1e]") -- "parse: vector element 0 out of range for suffix 'e'"
+(em "[0N -9223372036854775808 2i]") -- "parse: vector element 1 out of range for suffix 'i'"
+(read-value "[-9223372036854775808 1h]") !- parse
+(rm "[-9223372036854775808 1h]") -- "read-value: literal out of range for its type at byte 1"
+;; without a suffix it stays the existing I64 null
+(repr [-9223372036854775808 1]) -- "[0Nl 1]"
+;; nested containers name their type
+(em "[(list 1) 1h]") -- "parse: vector element 0 (LIST) conflicts with suffix 'h'"
+;; read-value names the offending element's byte
+(rm "[1 2 1.5 3h]") -- "read-value: vector element 2 is a float literal; suffix 'h' needs integers at byte 5"
+(rm "[1 2 1e39 3e]") -- "read-value: vector element 2 out of range for suffix 'e' at byte 5"
 ;; an F64 that overflowed to null is 0Nf, which conflicts under e
 (em "[1e400 1e]") -- "parse: vector element 0 (0Nf) conflicts with suffix 'e'"
 
 ;; ---- more read-value cases ------------------------------------------------
 (repr (read-value "[0N 1.5 2e]")) -- "[0Ne 1.5e 2e]"
-(rm "[1 2.5 3h]") -- "read-value: vector element 1 is a float literal; suffix 'h' needs integers at byte 10"
+(rm "[1 2.5 3h]") -- "read-value: vector element 1 is a float literal; suffix 'h' needs integers at byte 3"
 ;; read-value rejects a lossy element the language accepts
 (repr [99999999999999999999 1e]) -- "[1e+20e 1e]"
 (rm "[99999999999999999999 1e]") -- "read-value: integer literal out of the I64 range at byte 1"

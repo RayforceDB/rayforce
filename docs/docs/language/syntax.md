@@ -218,16 +218,18 @@ is an `I16` vector. Two rules let a literal mix element spellings:
 
 Under a final suffix every earlier element is an unsuffixed integer or float,
 the bare null `0N`, or a literal of the suffix's own type (`[1h 2 3h]`,
-`[1 0Nh 3h]`). Anything else is a `domain` error:
+`[1 0Nh 3h]`). Anything else is a `domain` error. The comments show each
+result as `repr` writes it:
 
 ```lisp
 [1 2 3h]        ; I16 [1h 2h 3h]
 [1 0N 3i]       ; I32 [1i 0Ni 3i]
-[1.5 2 3e]      ; F32 [1.5e 2.0e 3.0e]
+[1.5 2 3e]      ; F32 [1.5e 2e 3e]
 [1h 2i]         ; error: 1h conflicts with the final i
 [1i 2 3h]       ; error: 1i conflicts with the final h
 [1 0Nl 3h]      ; error: 0Nl is an I64 null
 [40000 1h]      ; error: 40000 is out of the I16 range
+[-9223372036854775808 1h] ; error: out of range (the I64 null bit pattern)
 [1.5 2h]        ; error: a float literal under h or i
 [1 2h 3]        ; error: the suffix must be on the last element
 ```
@@ -238,7 +240,8 @@ included, is an error. Under `e` integers and floats narrow as `(as 'F32 ...)`
 does, so `[1e39 1e]` saturates its first element to `3.40e+38e`. The suffix is
 read on input only: `repr` and the REPL display keep a suffix on every element
 (`[1h 2h 3h]`), so saved text reads back with the same type; `format` and
-`println` print the bare numbers. `read-value` accepts the same vector grammar
+`println` print `h` and `i` elements bare (`[1 2 3]`) and `e` elements with
+their suffix (`[1.0e 2.5e]`). `read-value` accepts the same vector grammar
 but, as for its scalars, rejects a lossy element: a float past the F32 range
 under `e`, or an integer past the I64 range.
 
