@@ -377,6 +377,20 @@
 (Z (select {from: T by: k z: (sum (ha i))})) -- [7.0 14.0]
 (set he (fn [x] (let y x) (if (> (count y) 3) (raise "big") (sums y))))
 (Z (select {from: T by: k z: (sum (he i))})) -- [27 54]
+;; An aggregate passed to a helper is the group's, as it is inline: the
+;; helper call stays per group, and a running call in its arguments is
+;; still taken over the whole table.
+(set hz (fn [x y] (let q x) (- q y)))
+(Z (select {from: T by: k z: (hz i (first i))})) -- (list [0 3 15] [0 6 30])
+(Z (select {from: T by: k z: (hz i (avg i))})) -- (list [-6.0 -3.0 9.0] [-12.0 -6.0 18.0])
+(Z (select {from: T by: k where: (> i 2) z: (hz i (first i))})) -- (list [0 12] [0 24])
+(select {from: T by: k z: (sum (hz i (count i)))}) !- domain
+(Z (select {from: T by: k z: (hz (sums i) (sum i))})) -- (list [-20 -14 10] [-39 -27 21])
+;; A call that runs per group still takes the running calls in its
+;; arguments over the whole table.
+(set h3 (fn [x] (let n (count x)) (take x 2)))
+(Z (select {from: T by: k z: (h3 (sums i))})) -- (list [1 7] [3 15])
+(Z (select {from: P by: k where: (> i 2) z: (h3 (sums i))})) -- (list [7 31] [15 63])
 ;; A running call over a per-group alias runs across the groups, as before.
 (Z (select {from: T by: k n: (sum i) z: (deltas n)})) -- [0Nl 21]
 ;; A running call in the where: or the by: is not an output: it is unchanged.
