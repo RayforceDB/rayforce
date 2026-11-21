@@ -1,0 +1,313 @@
+# Reader-visible expected values for the DELTA fixtures.
+# Oracle values recorded from DuckDB 1.5.6 and pyarrow 26.0.1 during
+# fixture development; manifest.txt records the writer and encoding
+# metadata. Values apply the reader's null policy: a stored value
+# equal to the native sentinel (INT32_MIN, INT64_MIN, any NaN) or an
+# empty BYTE_ARRAY value is a native null. "N" is the null token; "-"
+# means the field is empty (an all-null fixture has no min, max or sum).
+# The digest is MD5 over the canonical stream: decimal or byte values,
+# joined by a comma for numeric columns and a pipe for string columns,
+# with NULL as the null token. Strings are recorded by their length
+# fields; the dba-prefix-long anchor is the 65,536-byte "P" prefix plus
+# the recorded four-digit suffix.
+
+fixture dbp-i64-v1.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dbp-i64-v2page.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dbp-i32-v1.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dbp-i32-nulls-v2.parquet
+rows 10000
+nulls 1429
+min 1
+max 9999
+sum 42852858
+distinct 8571
+digest c9f5462bc2ef595016ff5dc977d4a79b
+anchors first 1 2 3 4 5 6 8 9
+anchors last 9995 9997 9998 9999
+
+fixture dbp-i32-date.parquet
+rows 10000
+nulls 1429
+min -10956
+max -958
+sum -51059589
+distinct 8571
+digest 6e564a329eb0ccef467d2436a4bc272c
+anchors first N -10956 -10955 -10954 -10953 -10952 -10951 N
+anchors last N -960 -959 -958
+
+fixture dbp-i32-overflow.parquet
+rows 4096
+nulls 316
+min -2147483647
+max 2147483647
+sum 676457347860
+distinct 12
+digest a620320f65ca93493f70f3358aa2a1e0
+anchors first N 2147483647 -2147483647 2147483646 0 -1 1 -2147483646
+anchors last 2147483644 -2 2 N
+
+fixture dbp-allnull.parquet
+rows 64
+nulls 64
+min -
+max -
+sum -
+distinct 0
+digest dce0eb26f26028cf4b618ec3a7564017
+values
+0 N
+1 N
+2 N
+3 N
+4 N
+5 N
+6 N
+7 N
+8 N
+9 N
+10 N
+11 N
+12 N
+13 N
+14 N
+15 N
+16 N
+17 N
+18 N
+19 N
+20 N
+21 N
+22 N
+23 N
+24 N
+25 N
+26 N
+27 N
+28 N
+29 N
+30 N
+31 N
+32 N
+33 N
+34 N
+35 N
+36 N
+37 N
+38 N
+39 N
+40 N
+41 N
+42 N
+43 N
+44 N
+45 N
+46 N
+47 N
+48 N
+49 N
+50 N
+51 N
+52 N
+53 N
+54 N
+55 N
+56 N
+57 N
+58 N
+59 N
+60 N
+61 N
+62 N
+63 N
+
+fixture dbp-i64-required.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dbp-i64-2page.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dbp-i64-multirg.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dbp-i64-snappy.parquet
+rows 10000
+nulls 0
+min 0
+max 9999
+sum 49995000
+distinct 10000
+digest d7908f524e961b1bf427dba6bcbb20a4
+anchors first 0 1 2 3 4 5 6 7
+anchors last 9996 9997 9998 9999
+
+fixture dlba-v1.parquet
+rows 1000
+nulls 0
+minlen 9
+maxlen 9
+totallen 9000
+distinct 500
+digest 0d9f294d8e5e826b0d3a6ed70a17f92e
+anchors first track_000 track_001 track_002 track_003 track_004 track_005 track_006 track_007
+anchors last track_496 track_497 track_498 track_499
+
+fixture dlba-v2page.parquet
+rows 1000
+nulls 0
+minlen 9
+maxlen 9
+totallen 9000
+distinct 500
+digest 0d9f294d8e5e826b0d3a6ed70a17f92e
+anchors first track_000 track_001 track_002 track_003 track_004 track_005 track_006 track_007
+anchors last track_496 track_497 track_498 track_499
+
+fixture dba-v1.parquet
+rows 10000
+nulls 0
+minlen 9
+maxlen 9
+totallen 90000
+distinct 500
+digest 614ef88e2eb4b7d725ae91bf9c988ce0
+anchors first track_000 track_001 track_002 track_003 track_004 track_005 track_006 track_007
+anchors last track_496 track_497 track_498 track_499
+
+fixture dba-v2page.parquet
+rows 10000
+nulls 0
+minlen 9
+maxlen 9
+totallen 90000
+distinct 500
+digest 614ef88e2eb4b7d725ae91bf9c988ce0
+anchors first track_000 track_001 track_002 track_003 track_004 track_005 track_006 track_007
+anchors last track_496 track_497 track_498 track_499
+
+fixture dba-prefix-long.parquet
+rows 512
+nulls 0
+minlen 65540
+maxlen 65540
+totallen 33556480
+distinct 512
+digest 09a992ad9090d03c39e7f2a55100fc2d
+prefix_len 65536
+prefix_char P
+anchor_suffix first 0000 0001 0002 0003 0004 0005 0006 0007
+anchor_suffix last 0508 0509 0510 0511
+
+fixture dba-nulls-v2.parquet
+rows 10000
+nulls 770
+minlen 9
+maxlen 9
+totallen 83070
+distinct 500
+digest ae70ad6c3de21c9e48d41a33a99d3a5e
+anchors first track_001 track_002 track_003 track_004 track_005 track_006 track_007 track_008
+anchors last track_495 track_496 track_498 track_499
+
+fixture dba-empty.parquet
+rows 8
+nulls 5
+minlen 1
+maxlen 3
+totallen 6
+distinct 3
+digest dc12b7694d3676d141007e5095acf033
+values
+0 N
+1 a
+2 N
+3 ab
+4 N
+5 abc
+6 N
+7 N
+
+fixture duckdb-deflevel.parquet
+rows 1000
+nulls 334
+minlen 2
+maxlen 4
+totallen 2592
+distinct 666
+digest 8e7cb75063493f5e801ad03e5340f426
+anchors first v1 v2 v4 v5 v7 v8 v10 v11
+anchors last v994 v995 v997 v998
+
+fixture duckdb-v2-mixed.parquet
+rows 21000
+nulls 0
+min 0
+max 20999
+sum 220489500
+distinct 21000
+digest bdde8255fc3f61313ebcc40c83965b0a
+anchors first 0 1 2 3 4 5 6 7
+anchors last 20996 20997 20998 20999
+name_minlen 7
+name_maxlen 9
+name_totallen 186690
+name_distinct 1000
+name_digest bce109f694c49b77bf2e59539a2b5064
+name_anchors first track_0 track_1 track_2 track_3 track_4 track_5 track_6 track_7
+name_anchors last track_996 track_997 track_998 track_999
+
+fixture unsupported-bss.parquet
