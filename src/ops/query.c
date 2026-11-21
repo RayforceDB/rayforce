@@ -17415,6 +17415,21 @@ static int64_t prune_col_name(ray_t* x) {
     return x && x->type == -RAY_SYM && !(x->attrs & ATTR_QUOTED) ? x->i64 : -1;
 }
 
+/* The constant a name in a where stands for when the select runs: the atom
+ * a lexical local or a global holds, or its typed vector when `vec` (the
+ * set of an `in`).  NULL for anything else: a literal, a column of `tbl`
+ * (which shadows a global), a name bound both as a local and as a column, a
+ * dotted path, a list, a table, a function.  Borrowed. */
+static ray_t* prune_bound_const(ray_t* x, ray_t* tbl, bool vec) {
+    if (!x || x->type != -RAY_SYM || (x->attrs & ATTR_QUOTED) || ray_sym_is_dotted(x->i64)) return NULL;
+    if (ray_table_slot(tbl, x->i64)) return NULL;
+    ray_t* v = ray_env_get_lexical_local(x->i64);
+    if (!v) v = ray_env_get(x->i64);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    if (v->type < 0) return v;
+    return vec && ray_is_vec(v) && v->type != RAY_LIST ? v : NULL;
+}
+
 /* The index of parted data column `name` of `tbl` (not the key, not
  * shadowed by a lexical local), or -1. */
 static int64_t prune_stats_col(ray_t* tbl, int64_t name) {
@@ -17452,8 +17467,12 @@ static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
     }
     uint16_t op = prune_cmp_op(x[0], fn);
     if (!op || n != 3) return;
-    ray_t* l = x[1];
-    ray_t* r = x[2];
+    /* a name bound to a constant compares as that constant (a symbol it
+     * holds is left to the filter: it reads here as a name would) */
+    ray_t* lb = prune_bound_const(x[1], tbl, op == OP_IN);
+    ray_t* rb = prune_bound_const(x[2], tbl, op == OP_IN);
+    ray_t* l = lb && lb->type != -RAY_SYM ? lb : x[1];
+    ray_t* r = rb && rb->type != -RAY_SYM ? rb : x[2];
     int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
     bool l_key = l_col == key_id, r_key = r_col == key_id;
     if (l_key == r_key) {
@@ -17681,6 +17700,7 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl) {
     if (!e || RAY_IS_ERR(e)) return false;
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return true;
+        if (prune_bound_const(e, tbl, false)) return true;   /* an atom: it reads as a literal does */
         if (ray_env_has_lexical_local(e->i64)) return false;
         ray_t* c = ray_table_slot(tbl, e->i64);
         return c && !RAY_IS_ERR(c);
@@ -17696,7 +17716,8 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl) {
     }
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
         return prune_where_elementwise_impl(el[1], tbl) && el[2] &&
-               el[2]->type > 0 && el[2]->type != RAY_LIST;
+               ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
+                prune_bound_const(el[2], tbl, true));        /* a set: a typed vector, written or bound */
     if (!prune_logic_head(el[0], fn)) {
         if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) ||
             !(fn->attrs & RAY_FN_ATOMIC) || (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
