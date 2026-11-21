@@ -1,0 +1,146 @@
+;; @also-unfused
+;; @requires: posix  (parted fixture under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; A grouped aggregate over a computed temporal argument follows the plain
+;; column's type rule (issue #1284).
+;;
+;; `(sum d)` over a DATE column is a type error, checked when the planner
+;; compiles the aggregate.  `(if (> c 0) d (+ d 1))` has no DAG node (the
+;; DATE arm `(+ d 1)` is left to the builtin), so the query fell to the
+;; per-group path: it evaluated the argument, called `sum` on each group's
+;; slice, dropped every group's type error and returned a column nobody had
+;; written, whose values changed from run to run.  The per-group paths now
+;; apply the planner's admission rule once to the evaluated argument and
+;; return a group's error instead of skipping it.  Each computed form raises
+;; the plain column's error where the column is rejected, at every size, on
+;; both grouping routes, flat and parted.
+
+(set E (fn [e] (at e 'msg)))
+(set DATE_ERR "select by: aggregation does not admit input type DATE")
+
+;; ── the issue's case ────────────────────────────────────────────────────────
+(set T (table ['g 'c 'd] (list ['a 'a 'b 'b] [1 0 1 0] [2024.01.01 2024.01.02 2024.01.03 2024.01.04])))
+(try (select {from: T by: g s: (sum d)}) E) -- DATE_ERR
+(try (select {from: T by: g s: (sum (if (> c 0) d (+ d 1)))}) E) -- DATE_ERR
+(select {from: T by: g s: (sum (if (> c 0) d (+ d 1)))}) !- type
+;; ungrouped, both spellings were already type errors
+(select {from: T s: (sum d)}) !- type
+(select {from: T s: (sum (if (> c 0) d (+ d 1)))}) !- type
+
+;; the plain-column counterparts: the `if` computed outside the query, one
+;; column per temporal type (1 is added where c <= 4)
+(set mkB (fn [n] (let c (% (til n) 10)) (let d (+ 2024.01.01 (% (til n) 100))) (let t (+ 10:00:00.000 (% (til n) 100))) (let p (+ 2024.01.01D10:00:00.000000000 (% (til n) 100))) (let s (as 'TIMESPAN (% (til n) 100))) (let k (as 'I64 (<= c 4))) (table ['g 'h 'c 'd 't 'p 's 'de 'te 'pe 'se] (list (take ['a 'b] n) (take [1 1 1] n) c d t p s (+ d k) (+ t k) (+ p k) (+ s (as 'TIMESPAN k))))))
+
+;; ── 65,537 rows, the size that returned changing values; repeated ──────────
+(set B (mkB 65537))
+(try (select {from: B by: g s: (sum de)}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: [g h] s: (sum (if (> c 4) d (+ d 1))) x: (+ c 1)}) E) -- DATE_ERR
+
+;; the sibling forms over fewer rows: the routes are the same
+(set B (mkB 2000))
+
+;; ── DATE: sibling forms, without and with where: ────────────────────────────
+;; a nested if, a cond, an if whose arms both compile, the arithmetic alone
+(try (select {from: B by: g s: (sum (if (> c 7) d (if (> c 4) (+ d 1) d)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 4) d (if (> c 2) (+ d 1) (- d 1))))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (cond ((> c 7) d) ((> c 4) d) (else d)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 4) d d))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (+ d 1))}) E) -- DATE_ERR
+(try (select {from: B by: g where: (> c 2) s: (sum de)}) E) -- DATE_ERR
+(try (select {from: B by: g where: (> c 2) s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g where: (> c 2) s: (sum (if (> c 7) d (if (> c 4) (+ d 1) d)))}) E) -- DATE_ERR
+(try (select {from: B by: g where: (> c 2) s: (sum (+ d 1))}) E) -- DATE_ERR
+;; the other aggregates that reject a DATE column
+(try (select {from: B by: g s: (prod de)}) E) -- DATE_ERR
+(try (select {from: B by: g s: (prod (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (all de)}) E) -- DATE_ERR
+(try (select {from: B by: g s: (all (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (any de)}) E) -- DATE_ERR
+(try (select {from: B by: g s: (any (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: g where: (> c 2) s: (prod (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+;; the aggregates that admit DATE are not rejected and keep their result
+;; type.  Their values are not pinned here: the per-group path still tests an
+;; `if` condition vector whole (tracked separately).
+(type (at (select {from: B by: g s: (avg (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+(type (at (select {from: B by: g s: (var (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+(type (at (select {from: B by: g s: (med (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+(type (at (select {from: B by: g s: (min (if (> c 4) d (+ d 1)))}) 's)) -- 'DATE
+(type (at (select {from: B by: g s: (max (if (> c 4) d (+ d 1)))}) 's)) -- 'DATE
+(type (at (select {from: B by: g where: (> c 2) s: (avg (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+
+;; ── TIME: sum admitted, prod rejected ──────────────────────────────────────
+(type (at (select {from: B by: g s: (sum (if (> c 4) t (+ t 1)))}) 's)) -- 'TIME
+(try (select {from: B by: g s: (prod te)}) E) -- "select by: aggregation does not admit input type TIME"
+(try (select {from: B by: g s: (prod (if (> c 4) t (+ t 1)))}) E) -- "select by: aggregation does not admit input type TIME"
+(try (select {from: B by: g where: (> c 2) s: (prod (if (> c 4) t (+ t 1)))}) E) -- "select by: aggregation does not admit input type TIME"
+
+;; ── TIMESTAMP: sum rejected, avg admitted ───────────────────────────────────
+(try (select {from: B by: g s: (sum pe)}) E) -- "select by: aggregation does not admit input type TIMESTAMP"
+(try (select {from: B by: g s: (sum (if (> c 4) p (+ p 1)))}) E) -- "select by: aggregation does not admit input type TIMESTAMP"
+(try (select {from: B by: g where: (> c 2) s: (sum (if (> c 4) p (+ p 1)))}) E) -- "select by: aggregation does not admit input type TIMESTAMP"
+(try (select {from: B by: g s: (sum (+ p 1))}) E) -- "select by: aggregation does not admit input type TIMESTAMP"
+(type (at (select {from: B by: g s: (avg (if (> c 4) p (+ p 1)))}) 's)) -- 'F64
+
+;; ── TIMESPAN: sum admitted (this `if` compiles: values are row-wise) ───────
+(all (== (as 'I64 (at (select {from: B by: g s: (sum (if (> c 4) s (+ s 1)))}) 's)) (as 'I64 (at (select {from: B by: g s: (sum se)}) 's)))) -- true
+(try (select {from: B by: g s: (prod se)}) E) -- "select by: aggregation does not admit input type TIMESPAN"
+
+;; ── evaluator-level grouping: a dict key, and a multi-key by: with a row
+;; projection beside the aggregate (the eval-group path) ─────────────────────
+(try (select {from: B by: {k: (% c 2)} s: (sum de)}) E) -- DATE_ERR
+(try (select {from: B by: {k: (% c 2)} s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: {k: (% c 2)} where: (> c 2) s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: B by: [g h] s: (sum de) x: (+ c 1)}) E) -- DATE_ERR
+(try (select {from: B by: [g h] s: (sum (if (> c 4) d (+ d 1))) x: (+ c 1)}) E) -- DATE_ERR
+(try (select {from: B by: [g h] s: (prod (if (> c 4) t (+ t 1))) x: (+ c 1)}) E) -- "select by: aggregation does not admit input type TIME"
+(type (at (select {from: B by: {k: (% c 2)} s: (avg (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+(type (at (select {from: B by: [g h] s: (sum (if (> c 4) t (+ t 1))) x: (+ c 1)}) 's)) -- 'TIME
+
+;; ── numeric arguments keep their answers ───────────────────────────────────
+(at (select {from: B by: g s: (sum (if (> c 4) c (+ c 1)))}) 's) -- [4600 5400]
+(at (select {from: B by: g s: (sum (if (> c 4) (as 'F64 c) (+ c 0.5)))}) 's) -- [4300.0 5200.0]
+
+;; ── a group's error is the query's ────────────────────────────────────────
+;; A LIST argument has no element type to admit, so the per-group builtin
+;; raises.  The groups' errors used to be skipped, leaving the column
+;; unwritten (scatter) or out of the result (eval-level grouping).
+(set TL (table ['g 'h 'c 'l] (list ['a 'a 'b 'b] [1 1 1 1] [1 0 1 0] (list [1 2] "y" [3] "w"))))
+(sum (at TL 'l)) !- type
+(select {from: TL by: g s: (sum (if (> c 0) l l))}) !- type
+(try (select {from: TL by: g s: (sum (if (> c 0) l l))}) E) -- (try (sum (at TL 'l)) E)
+(select {from: TL by: g where: (> h 0) s: (sum (if (> c 0) l l))}) !- type
+(select {from: TL by: [g h] s: (sum (if (> c 0) l l)) x: (+ c 1)}) !- type
+(try (select {from: TL by: [g h] s: (sum (if (> c 0) l l)) x: (+ c 1)}) E) -- (try (sum (at TL 'l)) E)
+
+;; ── no rows: the rule holds, and admitted aggregates keep their type ────────
+(set Z (select {from: B where: (> c 100)}))
+(try (select {from: Z by: g s: (sum (+ d 1))}) E) -- DATE_ERR
+(try (select {from: Z by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: Z by: g s: (prod (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: Z by: {k: (% c 2)} s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(type (at (select {from: Z by: g s: (avg (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+(type (at (select {from: Z by: g s: (min (if (> c 4) d (+ d 1)))}) 's)) -- 'DATE
+(type (at (select {from: Z by: g s: (med (if (> c 4) d (+ d 1)))}) 's)) -- 'F64
+(type (at (select {from: Z by: g s: (sum (if (> c 4) t (+ t 1)))}) 's)) -- 'TIME
+
+;; ── parted: a DATE data column and the partition key itself ─────────────────
+(.sys.exec "rm -rf /tmp/rfl_gact_parted/") -- 0
+(set mk (fn [o] (table [g c d] (list (take ['a 'b] 4000) (% (+ o (til 4000)) 10) (+ 2024.01.01 (% (til 4000) 100))))))
+(.db.splayed.set "/tmp/rfl_gact_parted/2024.01.01/t/" (mk 0) "/tmp/rfl_gact_parted/.sym")
+(.db.splayed.set "/tmp/rfl_gact_parted/2024.01.02/t/" (mk 3) "/tmp/rfl_gact_parted/.sym")
+(set P (.db.parted.get "/tmp/rfl_gact_parted/" 't))
+(try (select {from: P by: g s: (sum d)}) E) -- DATE_ERR
+(try (select {from: P by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: P by: g s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: P by: g where: (> c 2) s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: P by: g s: (sum date)}) E) -- DATE_ERR
+(try (select {from: P by: g s: (sum (if (> c 4) date (+ date 1)))}) E) -- DATE_ERR
+(try (select {from: P by: [g c] s: (sum (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(try (select {from: P by: g s: (prod (if (> c 4) d (+ d 1)))}) E) -- DATE_ERR
+(at (select {from: P by: g s: (avg (if (> c 4) d d))}) 's) -- (at (select {from: P by: g s: (avg d)}) 's)
+;; the mapped table goes first, so the unfused pass can write the fixture again
+(set P 0)
+(.sys.exec "rm -rf /tmp/rfl_gact_parted/") -- 0
