@@ -97,3 +97,29 @@
 (set P (.sys.profile))
 (Calls 'prof-loop 8) -- 3
 (.sys.profile.reset)
+
+;; Builtins reached through compiled code's other call paths: one passed
+;; as an argument (called through OP_CALLF) and a select inside a lambda
+;; (a dynamic form, OP_CALLD).
+(set T (table [a] (list [1 2 3])))
+(.sys.profile.enable 1) -- 1
+(prof-apply neg 4) -- -4
+(prof-apply neg 5) -- -5
+(prof-apply prof-inc 1) -- 2
+(count (prof-sel T)) -- 2
+(count (prof-sel T)) -- 2
+(count (prof-sel T)) -- 2
+(.sys.profile.enable 0) -- 0
+(set P (.sys.profile))
+(Calls 'prof-apply 22) -- 2
+(Calls 'prof-inc 4) -- 1
+(Calls 'prof-sel 24) -- 3
+(.sys.profile.reset)
+
+;; A row is a site that ran: the calls still open when the table is read
+;; (the count around it, the read itself) are not rows yet.
+(.sys.profile.enable 1) -- 1
+(.sys.profile.reset)
+(count (.sys.profile)) -- 0
+(.sys.profile.enable 0) -- 0
+(.sys.profile.reset)

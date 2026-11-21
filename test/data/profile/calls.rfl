@@ -18,3 +18,7 @@
   (try (prof-bad x) -1)))
 (set prof.ns.inner (fn [x]
   (neg x)))
+(set prof-apply (fn [f x]
+  (f x)))
+(set prof-sel (fn [t]
+  (select {from: t where: (> a 1)})))
