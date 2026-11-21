@@ -878,6 +878,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
      * never wraps and never reaches the INT64_MIN null sentinel. */
     uint8_t nbits[nc];
     memset(nbits, 63, nc * sizeof(uint8_t));
+    /* One widening CAST per narrow register, shared by all its readers
+     * (registers are written once, so a widened copy stays valid). */
+    uint8_t wide_i64[EXPR_MAX_REGS], wide_f64[EXPR_MAX_REGS];
+    memset(wide_i64, 0xFF, sizeof wide_i64);
+    memset(wide_f64, 0xFF, sizeof wide_f64);
     if (root->id < nc) exact_use[root->id] = 1;
     ray_col_src_t* fd_src[EXPR_MAX_REGS];
     bool           const_unres[EXPR_MAX_REGS];
@@ -1202,9 +1207,15 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                  * mismatched kernel.  Skip for OP_CAST — the instruction
                  * itself IS the conversion. */
 #define EXPR_PROMOTE(sreg, T) do {                                   \
+                    uint8_t _src = (sreg);                            \
+                    uint8_t* _wc = (T) == RAY_I64 ? &wide_i64[_src]   \
+                                 : (T) == RAY_F64 ? &wide_f64[_src]   \
+                                 : NULL;                              \
+                    if (_wc && *_wc != 0xFF) { (sreg) = *_wc; break; }\
                     (sreg) = expr_ensure_type(out, (sreg), (T));      \
                     if (out->regs[(sreg)].type != (T))                \
                         EXPR_BAIL(EXPR_BAIL_REGS);                    \
+                    if (_wc && (sreg) != _src) *_wc = (sreg);         \
                 } while (0)
                 if (op == OP_CAST) {
                     /* No promotion needed; CAST handles the conversion */
@@ -1338,9 +1349,10 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 if (ot == RAY_I64 && op != OP_CAST) {
                     int8_t pt = node->out_type;
                     if (RAY_IS_PARTED(pt)) pt = (int8_t)RAY_PARTED_BASETYPE(pt);
-                    /* A deferred wrap (exact_use above) needs plain lanes:
-                     * a null-aware widen would read a wrapped INT_MIN as a
-                     * null, so a nullable result always narrows here. */
+                    /* A deferred wrap (exact_use above) keeps the value
+                     * in the I64 lane: below 2^62 it never reaches the
+                     * NULL_I64 sentinel, so a nullable lane holds its real
+                     * nulls only and stays deferrable. */
                     bool narrow = pt == RAY_BOOL || pt == RAY_U8 || pt == RAY_I16 || pt == RAY_I32;
                     if (narrow && node->id < nc) {
                         uint8_t b1 = nbits[node->in_id[0]];
@@ -1350,7 +1362,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                                     : (unsigned)(b1 > b2 ? b1 : b2) + 1;
                         bool defer = !exact_use[node->id] && bb <= 62 &&
                                      (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_NEG) &&
-                                     !dst_nullable && !gen_null;
+                                     !gen_null;
                         if (defer) nbits[node->id] = (uint8_t)bb;
                         else { narrow_to = pt; nbits[node->id] = expr_type_bits(pt); }
                     } else if (narrow) {
@@ -1707,7 +1719,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
         switch (opcode) {
             case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)((uint16_t)a[j] + (uint16_t)b[j]); break;
             case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)((uint16_t)a[j] - (uint16_t)b[j]); break;
-            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)((uint16_t)a[j] * (uint16_t)b[j]); break;
+            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)(uint16_t)((uint32_t)(uint16_t)a[j] * (uint16_t)b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) { d[j] = b[j] ? a[j] / b[j] : 0; } break;
             case OP_MOD: for (int64_t j = 0; j < n; j++) { d[j] = b[j] ? a[j] % b[j] : 0; } break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
@@ -3953,6 +3965,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                  in_type == RAY_I16 ? (double)((int16_t*)m.morsel_ptr)[i] : \
                                       (double)((uint8_t*)m.morsel_ptr)[i])
             switch (opc) {
+                case OP_SQRT:  for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(sqrt(v)); } break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(log(v)); } break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(exp(v)); } break;
                 case OP_SIN:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(sin(v)); } break;
                 case OP_ASIN:  for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(asin(v)); } break;
                 case OP_COS:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(cos(v)); } break;
@@ -4031,6 +4046,45 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             } else {
                 const uint8_t* src = (const uint8_t*)m.morsel_ptr;
                 for (int64_t i = 0; i < n; i++) dst[i] = !src[i];
+            }
+            out_off += n;
+        }
+    } else if ((opc == OP_NEG || opc == OP_ABS) && in_type == out_type &&
+               (in_type == RAY_I32 || in_type == RAY_I16)) {
+        /* neg / abs over a narrow integer keeps its width and wraps there,
+         * as the builtins do.  Without this arm the result was allocated
+         * and never written (a query that fell back here, e.g. once the
+         * fused program ran out of registers, read garbage). */
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            if (in_type == RAY_I32) {
+                const int32_t* src = (const int32_t*)m.morsel_ptr;
+                int32_t* dst = (int32_t*)ray_data(result) + out_off;
+                if (opc == OP_NEG) for (int64_t i = 0; i < n; i++) dst[i] = (int32_t)(0u - (uint32_t)src[i]);
+                else for (int64_t i = 0; i < n; i++) dst[i] = src[i] < 0 ? (int32_t)(0u - (uint32_t)src[i]) : src[i];
+            } else {
+                const int16_t* src = (const int16_t*)m.morsel_ptr;
+                int16_t* dst = (int16_t*)ray_data(result) + out_off;
+                if (opc == OP_NEG) for (int64_t i = 0; i < n; i++) dst[i] = (int16_t)(uint16_t)(0u - (uint16_t)src[i]);
+                else for (int64_t i = 0; i < n; i++) dst[i] = src[i] < 0 ? (int16_t)(uint16_t)(0u - (uint16_t)src[i]) : src[i];
+            }
+            out_off += n;
+        }
+    } else if (opc == OP_CAST && in_type == RAY_F32 &&
+               (out_type == RAY_I32 || out_type == RAY_I16 ||
+                out_type == RAY_U8 || out_type == RAY_BOOL)) {
+        /* F32 to a narrow type: as the F64 arm below, through double. */
+        size_t osz = ray_elem_size(out_type);
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            const float* src = (const float*)m.morsel_ptr;
+            char* dst = (char*)ray_data(result) + (size_t)out_off * osz;
+            for (int64_t i = 0; i < n; i++) {
+                double v = (double)src[i];
+                if (out_type == RAY_I32)      ((int32_t*)dst)[i] = ray_cast_f64_to_i32_null(v);
+                else if (out_type == RAY_I16) ((int16_t*)dst)[i] = ray_cast_f64_to_i16_null(v);
+                else if (out_type == RAY_U8)  ((uint8_t*)dst)[i] = ray_cast_f64_to_u8_null(v);
+                else                          ((uint8_t*)dst)[i] = ray_cast_f64_to_bool_null(v);
             }
             out_off += n;
         }
