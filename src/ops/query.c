@@ -17130,25 +17130,82 @@ static int query_running_call_kind(ray_t* e, ray_t* tbl) {
     return 0;
 }
 
-static bool query_has_running_call(ray_t* e, ray_t* tbl, int depth) {
-    if (depth > 32) return false;
-    int k = query_running_call_kind(e, tbl);
+/* The outermost running calls of `e` the hoist takes (query_hoist_running
+ * replaces exactly these). */
+static int64_t query_count_running(ray_t* e, ray_t* tbl, int depth) {
+    int k = depth > 32 ? -1 : query_running_call_kind(e, tbl);
+    if (k > 0) return query_expr_effect_free(e) ? 1 : 0;
+    if (k < 0) return 0;
+    ray_t** es = (ray_t**)ray_data(e);
+    int64_t c = 0;
+    for (int64_t i = 1; i < e->len; i++) c += query_count_running(es[i], tbl, depth + 1);
+    return c;
+}
+
+/* Could `e` hold a running call, before its helpers are inlined?  A call of
+ * a helper may hide one in its body. */
+static bool query_may_run(ray_t* e, ray_t* tbl, int depth) {
+    int k = depth > 32 ? -1 : query_running_call_kind(e, tbl);
     if (k > 0) return true;
     if (k < 0) return false;
     ray_t** es = (ray_t**)ray_data(e);
+    if (es[0]->type == RAY_LIST) return true;
+    ray_t* fn = ray_env_get(es[0]->i64);
+    if (fn && fn->type == RAY_LAMBDA) return true;
     for (int64_t i = 1; i < e->len; i++)
-        if (query_has_running_call(es[i], tbl, depth + 1)) return true;
+        if (query_may_run(es[i], tbl, depth + 1)) return true;
     return false;
 }
 
-enum { RUN_HOIST_MAX = 16 };
+/* Does `e` name (unquoted) any of `ids`? */
+static bool query_expr_names_any(ray_t* e, const int64_t* ids, int64_t n) {
+    if (!e || n == 0) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return false;
+        for (int64_t i = 0; i < n; i++) if (ids[i] == e->i64) return true;
+        return false;
+    }
+    ray_t** el;
+    int64_t len;
+    if (e->type == RAY_LIST) { el = (ray_t**)ray_data(e); len = ray_len(e); }
+    else if (e->type == RAY_DICT) {
+        ray_t* vals = ray_dict_vals(e);
+        if (!vals || vals->type != RAY_LIST) return false;
+        el = (ray_t**)ray_data(vals); len = ray_len(vals);
+    } else return false;
+    for (int64_t i = 0; i < len; i++) if (query_expr_names_any(el[i], ids, n)) return true;
+    return false;
+}
+
+/* The select's clause names, interned once per symbol-table epoch (sym.h):
+ * every keyless select asks. */
+enum { SELECT_N_CLAUSES = 7 };
+static const int64_t* select_clause_ids(void) {
+    static const char* const names[SELECT_N_CLAUSES] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    static _Thread_local int64_t ids[SELECT_N_CLAUSES];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (int i = 0; i < SELECT_N_CLAUSES; i++) ids[i] = ray_sym_intern(names[i], strlen(names[i]));
+        epoch = ray_sym_epoch();
+    }
+    return ids;
+}
+
+static inline bool select_clause_key(const int64_t* rid, int64_t kid) {
+    bool c = false;
+    for (int r = 0; r < SELECT_N_CLAUSES; r++) c |= kid == rid[r];
+    return c;
+}
+
 typedef struct {
-    ray_t*  tbl;
-    ray_t*  keys;                   /* the select's clause and output names */
-    ray_t*  calls[RUN_HOIST_MAX];   /* borrowed from the expressions walked */
-    int64_t syms[RUN_HOIST_MAX];
-    int     n;
-    bool    full;
+    ray_t*   tbl;                   /* the select's table (the call kinds) */
+    ray_t*   src;                   /* the table the hidden columns join */
+    ray_t*   keys;                  /* the select's clause and output names */
+    ray_t**  calls;                 /* borrowed from the expressions walked */
+    int64_t* syms;
+    int64_t  n, cap;
+    int64_t  next;                  /* the next hidden name to try */
+    bool     full;
 } run_hoist_t;
 
 /* `e` with each outermost running call replaced by the name of a hidden
@@ -17158,21 +17215,21 @@ typedef struct {
 static ray_t* query_hoist_running(ray_t* e, run_hoist_t* h, int depth) {
     int k = depth > 32 ? -1 : query_running_call_kind(e, h->tbl);
     if (k > 0 && query_expr_effect_free(e)) {
-        if (h->n >= RUN_HOIST_MAX) { h->full = true; ray_retain(e); return e; }
+        /* sized by query_count_running over the same walk */
+        if (h->n >= h->cap) { h->full = true; ray_retain(e); return e; }
+        /* `#` is no name character (parse.c parse_name), so no expression
+         * the parser reads names the hidden column; a column or an output
+         * of that name, made from a string, is stepped over. */
         int64_t s = -1;
-        for (int t = 0; s < 0 && t < 4096; t++) {
-            char nm[24];
-            int ln = snprintf(nm, sizeof nm, "__run%d", t);
+        while (s < 0) {
+            char nm[32];
+            int ln = snprintf(nm, sizeof nm, "#run%lld", (long long)h->next++);
             int64_t c = ray_sym_intern(nm, (size_t)ln);
-            /* not a column, a name bound anywhere (a global, a local) or a
-             * name of the select: the hidden column would shadow it */
-            bool used = tbl_has_col(h->tbl, c) || ray_env_get(c) != NULL;
+            bool used = tbl_has_col(h->src, c);
             for (int64_t j = 0; h->keys && j < h->keys->len && !used; j++)
                 used = sym_cell_runtime_id(h->keys, j) == c;
-            for (int j = 0; j < h->n && !used; j++) used = h->syms[j] == c;
             if (!used) s = c;
         }
-        if (s < 0) { h->full = true; ray_retain(e); return e; }
         h->calls[h->n] = e;
         h->syms[h->n++] = s;
         return ray_sym(s);
@@ -17230,83 +17287,80 @@ static bool select_output_dag_runs(ray_t* x, ray_t* tbl) {
  * output rebinds, or when a call does not give one value per row: the
  * select then plans as before. */
 static ray_t* select_plan_running_where(ray_t* dict, ray_t* tbl) {
-    if (dict_get(dict, "nearest") || dict_get(dict, "by")) return NULL;
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
-    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
-    int64_t rid[7];
-    for (int i = 0; i < 7; i++) rid[i] = ray_sym_intern(reserved[i], strlen(reserved[i]));
+    const int64_t* rid = select_clause_ids();
     int64_t nd = ray_dict_len(dict);
-    bool any_run = false, all_dag = true;
-    for (int pass = 0; pass < 2 && (pass == 0 || any_run); pass++) {
-        for (int64_t i = 0; i < nd && (pass == 0 ? !any_run : all_dag); i++) {
-            int64_t kid = sym_cell_runtime_id(keys, i);
-            bool clause = false;
-            for (int r = 0; r < 7; r++) clause |= kid == rid[r];
-            if (clause) continue;
-            ray_t* v = ((ray_t**)ray_data(vals))[i];
-            if (!v || v->type != RAY_LIST) continue;
-            ray_t* x = query_inline_helpers(v, tbl);
-            if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
-            if (pass == 0) any_run = query_has_running_call(x, tbl, 0);
-            else all_dag = select_output_dag_runs(x, tbl);
-            ray_release(x);
-        }
+    ray_t** vs = (ray_t**)ray_data(vals);
+    /* by: and nearest: are keys too: one pass finds them and a candidate */
+    bool cand = false;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid == rid[2] || kid == rid[6]) return NULL;
+        if (!cand && !select_clause_key(rid, kid) && vs[i] && vs[i]->type == RAY_LIST)
+            cand = query_may_run(vs[i], tbl, 0);
     }
-    if (!any_run || all_dag) return NULL;
+    if (!cand) return NULL;
 
-    ray_t* src;
+    /* Scratch sized from the dict: each output's inlined expression (the
+     * calls point into them) and the names of the outputs before it. */
+    ray_t* xs_hdr = NULL;
+    ray_t** xs = (ray_t**)scratch_alloc(&xs_hdr, (size_t)nd * (sizeof(ray_t*) + sizeof(int64_t)));
+    if (!xs) return ray_error("oom", NULL);
+    int64_t* seen = (int64_t*)(xs + nd);
+    ray_t* hdr2 = NULL;
+    ray_t* engine = NULL;
+    ray_t* src = NULL;
+    int64_t ncalls = 0;
+    bool all_dag = true;
+    for (int64_t i = 0; i < nd; i++) {
+        xs[i] = NULL;
+        if (select_clause_key(rid, sym_cell_runtime_id(keys, i)) || !vs[i] || vs[i]->type != RAY_LIST) continue;
+        ray_t* x = query_inline_helpers(vs[i], tbl);
+        if (!x || RAY_IS_ERR(x)) { engine = x ? x : ray_error("oom", NULL); goto out; }
+        xs[i] = x;
+        ncalls += query_count_running(x, tbl, 0);
+    }
+    for (int64_t i = 0; i < nd && ncalls && all_dag; i++)
+        if (xs[i]) all_dag = select_output_dag_runs(xs[i], tbl);
+    if (!ncalls || all_dag) goto out;
+
+    ray_t** calls = (ray_t**)scratch_alloc(&hdr2, (size_t)ncalls * (sizeof(ray_t*) + sizeof(int64_t)));
+    if (!calls) { engine = ray_error("oom", NULL); goto out; }
     if (table_has_parted_columns(tbl)) {
         src = parted_flatten_read_cols(dict, tbl, false, NULL);
-        if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("oom", NULL);
+        if (!src || RAY_IS_ERR(src)) { engine = src ? src : ray_error("oom", NULL); src = NULL; goto out; }
     } else { ray_retain(tbl); src = tbl; }
-    run_hoist_t h = { .tbl = src, .keys = keys };
+    run_hoist_t h = { .tbl = tbl, .src = src, .keys = keys, .calls = calls,
+                      .syms = (int64_t*)(calls + ncalls), .cap = ncalls };
     /* An output sees the outputs before it under their names; a call that
      * reads such a name cannot run over the source table. */
-    int64_t seen[RUN_HOIST_MAX * 4];
-    int nseen = 0;
-    ray_t* engine = dict;
+    int64_t nseen = 0;
+    engine = dict;
     ray_retain(engine);
-    ray_t* xs[RUN_HOIST_MAX];
-    int nx = 0;
-    for (int64_t i = 0; i < nd && engine && !RAY_IS_ERR(engine) && !h.full; i++) {
+    for (int64_t i = 0; i < nd && !h.full; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
-        bool clause = false;
-        for (int r = 0; r < 7; r++) clause |= kid == rid[r];
-        if (clause) continue;
-        ray_t* v = ((ray_t**)ray_data(vals))[i];
-        if (!v || v->type != RAY_LIST) {
-            if (nseen < RUN_HOIST_MAX * 4) seen[nseen++] = kid;
-            else h.full = true;
-            continue;
-        }
-        ray_t* x = query_inline_helpers(v, tbl);
-        if (!x || RAY_IS_ERR(x)) { ray_release(engine); engine = x ? x : ray_error("oom", NULL); break; }
-        int before = h.n;
+        if (select_clause_key(rid, kid)) continue;
+        ray_t* x = xs[i];
+        if (!x) { seen[nseen++] = kid; continue; }
+        int64_t before = h.n;
         ray_t* nv = query_hoist_running(x, &h, 0);
-        for (int j = before; j < h.n && !h.full; j++) {
-            int64_t refs[64];
-            int nr = collect_syms(h.calls[j], refs, 64, 0);
-            if (nr >= 64) h.full = true;
-            for (int r = 0; r < nr && !h.full; r++)
-                for (int q = 0; q < nseen && !h.full; q++) h.full = refs[r] == seen[q];
-        }
-        if (nseen < RUN_HOIST_MAX * 4) seen[nseen++] = kid;
-        else h.full = true;
-        if (h.n > before && nx < RUN_HOIST_MAX) xs[nx++] = x;   /* the calls point into it */
-        else ray_release(x);
-        if (!nv || RAY_IS_ERR(nv)) { ray_release(engine); engine = nv ? nv : ray_error("oom", NULL); break; }
-        if (h.n > before) {
+        if (!nv || RAY_IS_ERR(nv)) { ray_release(engine); engine = nv ? nv : ray_error("oom", NULL); goto out; }
+        for (int64_t j = before; j < h.n && !h.full; j++)
+            h.full = query_expr_names_any(h.calls[j], seen, nseen);
+        seen[nseen++] = kid;
+        if (h.n > before && !h.full) {
             ray_t* k = ray_sym(kid);
-            if (!k || RAY_IS_ERR(k)) { ray_release(nv); ray_release(engine); engine = k ? k : ray_error("oom", NULL); break; }
+            if (!k || RAY_IS_ERR(k)) { ray_release(nv); ray_release(engine); engine = k ? k : ray_error("oom", NULL); goto out; }
             engine = ray_dict_upsert(engine, k, nv);
             ray_release(k);
+            if (!engine || RAY_IS_ERR(engine)) { ray_release(nv); if (!engine) engine = ray_error("oom", NULL); goto out; }
         }
         ray_release(nv);
     }
     int64_t nrows = ray_table_nrows(src);
-    for (int j = 0; j < h.n && engine && !RAY_IS_ERR(engine) && !h.full; j++) {
+    for (int64_t j = 0; j < h.n && !h.full; j++) {
         ray_t* col = eval_expr_whole_column_impl(h.calls[j], src);
         /* `prior` over a builtin it does not specialise boxes its cells:
          * cells of one atom type are that type's vector. */
@@ -17320,7 +17374,7 @@ static ray_t* select_plan_running_where(ray_t* dict, ray_t* tbl) {
         if (col && !RAY_IS_ERR(col) && ray_is_vec(col) && col->type != RAY_LIST && col->len == nrows) {
             src = ray_table_add_col(src, h.syms[j], col);
             ray_release(col);
-            if (!src || RAY_IS_ERR(src)) { ray_release(engine); engine = src ? src : ray_error("oom", NULL); src = NULL; }
+            if (!src || RAY_IS_ERR(src)) { ray_release(engine); engine = src ? src : ray_error("oom", NULL); src = NULL; goto out; }
             continue;
         }
         /* Not one value per row, or an error: plan as before, which
@@ -17334,18 +17388,20 @@ static ray_t* select_plan_running_where(ray_t* dict, ray_t* tbl) {
         } else if (col) ray_release(col);
         h.full = true;
     }
-    for (int j = 0; j < nx; j++) ray_release(xs[j]);
-    if (h.full || h.n == 0 || !engine || RAY_IS_ERR(engine)) {
-        if (src) ray_release(src);
-        if (engine && !RAY_IS_ERR(engine)) { ray_release(engine); engine = NULL; }
-        return engine;
+    if (h.full || h.n == 0) { ray_release(engine); engine = NULL; goto out; }
+    {
+        ray_t* k_from = ray_sym(rid[0]);
+        if (!k_from || RAY_IS_ERR(k_from)) { ray_release(engine); engine = k_from ? k_from : ray_error("oom", NULL); goto out; }
+        engine = ray_dict_upsert(engine, k_from, src);
+        ray_release(k_from);
+        if (!engine) engine = ray_error("oom", NULL);
     }
-    ray_t* k_from = ray_sym(rid[0]);
-    if (!k_from || RAY_IS_ERR(k_from)) { ray_release(src); ray_release(engine); return k_from ? k_from : ray_error("oom", NULL); }
-    engine = ray_dict_upsert(engine, k_from, src);
-    ray_release(k_from);
-    ray_release(src);
-    return engine ? engine : ray_error("oom", NULL);
+out:
+    if (src) ray_release(src);
+    for (int64_t i = 0; i < nd; i++) if (xs[i]) ray_release(xs[i]);
+    scratch_free(hdr2);
+    scratch_free(xs_hdr);
+    return engine;
 }
 
 /* Does an aggregate's argument `a` read only its own row, or, when
@@ -17385,16 +17441,12 @@ static bool select_outputs_group_local(ray_t* dict, ray_t* tbl) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
-    static const char* const reserved[] = { "from", "where", "by", "take", "asc", "desc", "nearest" };
+    const int64_t* rid = select_clause_ids();
     int64_t nd = ray_dict_len(dict);
     bool dag_all = true;
     for (int pass = 0; pass < 2; pass++) {
         for (int64_t i = 0; i < nd; i++) {
-            int64_t kid = sym_cell_runtime_id(keys, i);
-            bool clause = false;
-            for (int r = 0; r < 7 && !clause; r++)
-                clause = kid == ray_sym_intern(reserved[r], strlen(reserved[r]));
-            if (clause) continue;
+            if (select_clause_key(rid, sym_cell_runtime_id(keys, i))) continue;
             ray_t* v = ((ray_t**)ray_data(vals))[i];
             if (!v || v->type != RAY_LIST || (v->attrs & ATTR_QUOTED) || v->len == 0) continue;
             ray_t* cd = match_count_distinct(v);

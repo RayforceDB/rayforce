@@ -100,6 +100,19 @@
 (set __run0 1000)
 (at (select {from: U where: (> i 20) q: (+ i __run0) p: (prior - i)}) 'q) -- [1030 1040 1050 1060]
 (count (select {from: U where: (> __run0 i) p: (prior - i)})) -- 6
+;; An unbound name in a value, a where: or a take: is never the hidden
+;; column: it is not found, as without the hoist.
+(select {from: U where: (> __run1 5) z: (prior - i)}) !- schema
+(select {from: U where: (> i 20) z: (prior - i) q: (+ i __run1)}) !- schema
+(select {from: U where: (> i 20) z: (prior - i) q: (sum i) take: __run1}) !- name
+;; No count of calls, outputs or names makes the hoist give up.
+(set W (table [k i] (list [1 2 3 4 5 6 7] [5 1 9 2 8 3 7])))
+(set WR (rank (at (deltas (at W 'i)) (where (> (at W 'i) 2)))))
+WR -- [0 4 3 1 2]
+(at (select {from: W where: (> i 2) a1: (rank (deltas i)) a2: (rank (deltas i)) a3: (rank (deltas i)) a4: (rank (deltas i)) a5: (rank (deltas i)) a6: (rank (deltas i)) a7: (rank (deltas i)) a8: (rank (deltas i)) a9: (rank (deltas i)) a10: (rank (deltas i)) a11: (rank (deltas i)) a12: (rank (deltas i)) a13: (rank (deltas i)) a14: (rank (deltas i)) a15: (rank (deltas i)) a16: (rank (deltas i)) a17: (rank (deltas i))}) 'a17) -- WR
+(at (select {from: W where: (> i 2) b1: k b2: k b3: k b4: k b5: k b6: k b7: k b8: k b9: k b10: k b11: k b12: k b13: k b14: k b15: k b16: k b17: k b18: k b19: k b20: k b21: k b22: k b23: k b24: k b25: k b26: k b27: k b28: k b29: k b30: k b31: k b32: k b33: k b34: k b35: k b36: k b37: k b38: k b39: k b40: k b41: k b42: k b43: k b44: k b45: k b46: k b47: k b48: k b49: k b50: k b51: k b52: k b53: k b54: k b55: k b56: k b57: k b58: k b59: k b60: k b61: k b62: k b63: k b64: k b65: k z: (rank (deltas i))}) 'z) -- WR
+(set WC (table [k i c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17 c18 c19 c20 c21 c22 c23 c24 c25 c26 c27 c28 c29 c30 c31 c32 c33 c34 c35 c36 c37 c38 c39 c40 c41 c42 c43 c44 c45 c46 c47 c48 c49 c50 c51 c52 c53 c54 c55 c56 c57 c58 c59 c60 c61 c62 c63 c64 c65 c66 c67 c68 c69] (list [1 2 3 4 5 6 7] [5 1 9 2 8 3 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7])))
+(at (select {from: WC where: (> i 2) z: (rank (deltas (+ (+ (+ (+ (+ (+ c0 c1) (+ c2 c3)) (+ (+ c4 c5) (+ c6 c7))) (+ (+ (+ c8 c9) (+ c10 c11)) (+ (+ c12 c13) (+ c14 (+ c15 c16))))) (+ (+ (+ (+ c17 c18) (+ c19 c20)) (+ (+ c21 c22) (+ c23 (+ c24 c25)))) (+ (+ (+ c26 c27) (+ c28 c29)) (+ (+ c30 c31) (+ c32 (+ c33 c34)))))) (+ (+ (+ (+ (+ c35 c36) (+ c37 c38)) (+ (+ c39 c40) (+ c41 c42))) (+ (+ (+ c43 c44) (+ c45 c46)) (+ (+ c47 c48) (+ c49 (+ c50 c51))))) (+ (+ (+ (+ c52 c53) (+ c54 c55)) (+ (+ c56 c57) (+ c58 (+ c59 c60)))) (+ (+ (+ c61 c62) (+ c63 c64)) (+ (+ c65 c66) (+ c67 (+ c68 c69)))))))))}) 'z) -- (rank (at (deltas (* 70 (at WC 'k))) (where (> (at WC 'i) 2))))
 
 ;; prior over + - * is one vector op; it gives the cell-by-cell answer,
 ;; nulls, wrapping and float edges included, and its type does not depend
