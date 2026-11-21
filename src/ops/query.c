@@ -17295,20 +17295,6 @@ static bool query_running_builtin(const ray_t* fn) {
     return false;
 }
 
-/* Does the value `v` a helper returns (its last statement) reduce: an
- * aggregate, or an `if`/`do` whose every outcome is one?  Then the helper
- * gives no value per row, and a whole-table call of it is not tried. */
-static bool query_result_reduces(ray_t* v, int depth) {
-    if (!v || v->type != RAY_LIST || (v->attrs & ATTR_QUOTED) || v->len < 2 || depth > 8) return false;
-    if (is_agg_expr(v)) return true;
-    ray_t** es = (ray_t**)ray_data(v);
-    if (!es[0] || es[0]->type != -RAY_SYM || (es[0]->attrs & ATTR_QUOTED)) return false;
-    if (es[0]->i64 == ray_sym_intern("do", 2)) return query_result_reduces(es[v->len - 1], depth + 1);
-    if (es[0]->i64 == ray_sym_intern("if", 2) && v->len == 4)
-        return query_result_reduces(es[2], depth + 1) && query_result_reduces(es[3], depth + 1);
-    return false;
-}
-
 /* The whole-column verbs: what they give at a row depends on the order or
  * the contents of the whole column, not on the rows up to it.  Written
  * inline they see the surviving rows (docs: "Running functions under
@@ -17320,23 +17306,51 @@ static const void* const query_whole_col_verbs[] = {
     (void*)ray_group_indices_fn, (void*)ray_take_fn, (void*)ray_drop_fn,
 };
 
-/* Does the code `e` (a helper's statement, or a value it names) use a
- * whole-column verb: by name, called or passed as a value, or in the body
- * of a helper or a capture it reaches?  Names resolve as globals, a column
- * of `tbl` (the call's arguments) as that column; `*budget`
- * bounds the walk, and a walk that exhausts it says yes, which only keeps
- * the helper per group. */
-static bool query_uses_whole_col_verb(ray_t* e, ray_t* tbl, int depth, int* budget) {
+static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget);
+
+/* A value a name holds that is code: a lambda or a builtin. */
+static bool query_value_is_code(const ray_t* v) {
+    return v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY));
+}
+
+/* Does the code `e` (a helper's statement, or a value it names) need the
+ * group's rows: does it use a whole-column verb, called or passed as a
+ * value, or an aggregate (is_agg_expr, as the planner reads one inline; by
+ * name when passed as a value), here or in the body of a helper or a
+ * capture it reaches?  Either sees the surviving rows of its group when
+ * written inline, `(- i (avg i))` as `(reverse i)`, so such a helper is
+ * not called over the whole table.  Names resolve as globals, a column of
+ * `tbl` (the call's arguments) as that column; `head` is set for a call's
+ * head, whose arity is_agg_expr has judged.  `*budget` bounds the walk,
+ * and a walk that exhausts it says yes, which only keeps the helper per
+ * group. */
+static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget) {
     if (!e) return false;
     if (--*budget < 0 || depth > 16) return true;
     if (e->type == -RAY_SYM) {
         if ((e->attrs & ATTR_QUOTED) || (tbl && tbl_has_col(tbl, e->i64))) return false;
+        /* an aggregate passed as a value: `max`/`min` also name the
+         * pairwise verbs, so only their unary calls count */
+        if (!head) {
+            uint16_t op = resolve_agg_opcode(e->i64);
+            if (op && op != OP_MIN && op != OP_MAX) return true;
+        }
         ray_t* v = ray_env_get_global(e->i64);
         if (!v && ray_sym_is_dotted(e->i64)) v = ray_env_get(e->i64);
         /* code only: data a name holds is not walked */
-        return v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY)) &&
-               query_uses_whole_col_verb(v, NULL, depth + 1, budget);
+        return query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget);
     }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return query_code_needs_group_v(e, tbl, depth, budget);
+    if (is_agg_expr(e)) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++)
+        if (query_code_needs_group(es[i], tbl, i == 0, depth + 1, budget)) return true;
+    return false;
+}
+
+/* query_code_needs_group for a value: a builtin, by the C function behind
+ * it, a lambda, by its body and the code it captures. */
+static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget) {
     if (e->type == RAY_UNARY || e->type == RAY_BINARY || e->type == RAY_VARY) {
         const void* fp = (const void*)(uintptr_t)e->i64;
         for (size_t i = 0; i < sizeof query_whole_col_verbs / sizeof *query_whole_col_verbs; i++)
@@ -17348,15 +17362,11 @@ static bool query_uses_whole_col_verb(ray_t* e, ray_t* tbl, int depth, int* budg
         ray_t* cv = c ? ray_dict_vals(c) : NULL;
         for (int64_t i = 0; cv && cv->type == RAY_LIST && i < cv->len; i++) {
             ray_t* v = ((ray_t**)ray_data(cv))[i];
-            if (v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY)) &&
-                query_uses_whole_col_verb(v, NULL, depth + 1, budget)) return true;
+            if (query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget)) return true;
         }
-        return query_uses_whole_col_verb(LAMBDA_BODY(e), NULL, depth + 1, budget);
+        ray_t* body = LAMBDA_BODY(e);
+        return body && query_code_needs_group(body, NULL, false, depth + 1, budget);
     }
-    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return false;
-    ray_t** es = (ray_t**)ray_data(e);
-    for (int64_t i = 0; i < e->len; i++)
-        if (query_uses_whole_col_verb(es[i], tbl, depth + 1, budget)) return true;
     return false;
 }
 
@@ -17364,10 +17374,12 @@ static bool query_uses_whole_col_verb(ray_t* e, ray_t* tbl, int depth, int* budg
  * the grouped hoist takes: an argument reads the rows, none holds an
  * aggregate (that aggregate is the group's, as it is inline, so the call
  * stays where it stands and a running call in an argument is taken on its
- * own), the helper's result is not plainly a reduction, and its code uses
- * no whole-column verb (`(fn [x] (let y x) (reverse y))` reverses each
- * group's surviving rows, as `(reverse i)` does inline; the running calls
- * in its arguments are still taken)? */
+ * own), and its code needs no group's rows (query_code_needs_group): a
+ * helper with an aggregate anywhere in it (`(fn [x] (let y x) (- y (avg
+ * y)))` demeans each group, as `(- i (avg i))` does inline) or a
+ * whole-column verb (`(fn [x] (let y x) (reverse y))` reverses each
+ * group's surviving rows) runs per group, and the running calls in its
+ * arguments are still taken? */
 static bool query_helper_call_hoists(ray_t* e, ray_t* tbl, ray_t* f) {
     ray_t** es = (ray_t**)ray_data(e);
     bool rows = false;
@@ -17376,22 +17388,26 @@ static bool query_helper_call_hoists(ray_t* e, ray_t* tbl, ray_t* f) {
         rows |= expr_refs_row_column(es[i], tbl) != 0;
     }
     if (!rows) return false;
-    ray_t* last = NULL;
-    if (f->type == RAY_LAMBDA) {
-        ray_t* bodies = LAMBDA_BODY(f);
-        if (bodies && bodies->type == RAY_LIST && bodies->len > 0)
-            last = ((ray_t**)ray_data(bodies))[bodies->len - 1];
-    } else if (f->type == RAY_LIST && f->len >= 3) {
-        last = ((ray_t**)ray_data(f))[f->len - 1];
-    }
-    if (query_result_reduces(last, 0)) return false;
     /* and the functions passed to it, `(h reverse i)`; a verb called in an
      * argument is that argument's, as inline */
     int budget = 4096;
     for (int64_t i = 1; i < e->len; i++)
         if ((es[i]->type == -RAY_SYM || key_literal_is_fn(es[i])) &&
-            query_uses_whole_col_verb(es[i], tbl, 0, &budget)) return false;
-    return !query_uses_whole_col_verb(f, NULL, 0, &budget);
+            query_code_needs_group(es[i], tbl, false, 0, &budget)) return false;
+    return f->type == RAY_LAMBDA ? !query_code_needs_group_v(f, NULL, 0, &budget)
+                                 : !query_code_needs_group(f, NULL, false, 0, &budget);
+}
+
+/* Does `e` call a helper whose code needs the group's rows
+ * (query_code_needs_group), or pass such code to one?  A plain grouped
+ * output that does is evaluated per group, not once over the kept rows and
+ * split: `(hz i)`, `hz` demeaning through a `let`, demeans each group as
+ * `(- i (avg i))` does.  False at once for an expression with no helper
+ * call. */
+static bool query_expr_calls_group_helper(ray_t* e, ray_t* tbl) {
+    if (!query_expr_has_helper(e)) return false;
+    int budget = 4096;
+    return query_code_needs_group(e, tbl, false, 0, &budget);
 }
 
 /* What the call `e` is to the hoist: 1 a running call, 0 a call whose
@@ -23193,7 +23209,10 @@ by_dict_done:
                     agg_results[n_agg_out] = agg_vec;
                     n_agg_out++;
                 } else {
-                    if (is_agg_expr(val_expr_item)) {
+                    /* an aggregate, or a helper call whose code reads the
+                     * group (query_expr_calls_group_helper): per group */
+                    if (is_agg_expr(val_expr_item) ||
+                        query_expr_calls_group_helper(val_expr_item, eval_tbl)) {
                         ray_t* per_group = nonagg_eval_per_group(
                             val_expr_item, eval_tbl, groups, n_groups);
                         if (RAY_IS_ERR(per_group)) {
@@ -26744,7 +26763,8 @@ by_dict_done:
                      * agg (max/min/sum/...) globally and broadcasts the
                      * scalar across all groups. */
                     if (is_agg_expr(nonagg_exprs[ni]) ||
-                        expr_contains_agg(nonagg_exprs[ni])) {
+                        expr_contains_agg(nonagg_exprs[ni]) ||
+                        query_expr_calls_group_helper(nonagg_exprs[ni], tbl)) {
                         ray_t* per_group = nonagg_eval_per_group_buf(
                             nonagg_exprs[ni], tbl, idx_buf, offsets, grp_cnt, n_groups);
                         if (RAY_IS_ERR(per_group)) {

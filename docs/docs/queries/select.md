@@ -229,22 +229,26 @@ once over the whole columns. A helper runs once per group instead when
 - an argument holds an aggregate (`(f i (avg i))`): that aggregate is the
   group's, as it is written inline;
 - it has an effect (it prints, sets a global), so it runs as often as before;
-- its last statement is an aggregate (`(fn [x] (let y x) (avg y))`), so it
-  gives no value per row;
-- its code uses a whole-column verb (`(fn [x] (let y x) (reverse y))`), or a
-  helper it calls does, or one is passed to it (`(f reverse i)`): the verb
-  sees each group's surviving rows, as `(reverse i)` does inline. These are
-  the verbs above and `rotate`, `xrank`, `xasc`, `xdesc`, `group`, `take`
-  and `drop`;
+- its code uses an aggregate anywhere, in any statement
+  (`(fn [x] (let y x) (- y (avg y)))`, `(fn [x] (let n (count x)) (% x n))`),
+  or a helper it calls does, or one is passed to it (`(f avg i)`): the
+  aggregate is the group's, as `(- i (avg i))` gives it inline;
+- its code uses a whole-column verb (`(fn [x] (let y x) (reverse y))`), in
+  the same ways: the verb sees each group's surviving rows, as `(reverse i)`
+  does inline. These are the verbs above and `rotate`, `xrank`, `xasc`,
+  `xdesc`, `group`, `take` and `drop`;
 - or its call over the whole table fails or gives anything but one typed
   value per row (a scalar, a LIST). That call is a probe: its cost is paid
   once over the whole table before the helper runs per group.
 
 A running call in the arguments of a helper that runs per group still runs
 over the whole table: given `(sums i)`, the reversing helper above reverses
-each group's surviving rows of the whole-table `sums`. A running call in the helper's own body runs with
-the helper, over the group's rows: `(fn [x] (let y (sums x)) (reverse y))`
-sums each group. Over the table `r` above:
+each group's surviving rows of the whole-table `sums`. A running call in the
+helper's own body runs with the helper, over the group's rows:
+`(fn [x] (let y (sums x)) (reverse y))` and
+`(fn [x] (let s (sums x)) (- s (avg s)))` sum each group. The same holds for
+a plain output of such a helper: it is the helper over each group's rows.
+Over the table `r` above:
 
 ```lisp
 (select {s: (sums score) from: r by: room})                         ; A: [60 125], B: [80 160]
