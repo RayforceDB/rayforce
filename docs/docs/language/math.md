@@ -11,7 +11,7 @@ Arithmetic operations work on scalars and auto-map element-wise over vectors. Nu
 `+`, `-`, `*`, `div`, `%` and the two-argument `min` and `max` take their result type from one promotion table. It depends only on the two operand types, so swapping the operands, or passing atoms, vectors or `select` / `update` columns, gives the same type:
 
 - the order is b8 < u8 < i16 < i32 < i64 < f32 < f64, and the wider type wins;
-- two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`);
+- two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`), and a vector reports it as null only when the vector is marked as possibly holding nulls (see the types guide);
 - f32 with any other type is f64;
 - two b8 operands give i64 for `+ - * div %` and b8 for `min` and `max`.
 
