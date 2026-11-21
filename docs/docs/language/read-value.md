@@ -45,6 +45,7 @@ allowed; a second value or any other trailing text is an error.
 | `'name` | `SYM` atom; the name uses `A-Z a-z 0-9 _ . -`, and `'` alone is the empty symbol |
 | `null` | the generic null |
 | `[1 2 3]` `[1h 2h]` `["a" "b"]` `['a 'b]` | a typed vector; its elements are literals of one type |
+| `[1 2.5]` `[1 2 3h]` `[1 0N 3e]` | a numeric vector typed as the language types it: unsuffixed integers and floats promote to `F64`, and a final `h`, `i` or `e` suffix types every element |
 | `(as 'T [])` | an empty vector of type `T` |
 | `(as 'SYM "any text")` | a `SYM` atom whose name may contain anything |
 | `(as 'SYM (list "a b" "c"))` | a `SYM` vector |
@@ -60,7 +61,11 @@ Type tags are `B8 U8 I16 I32 I64 F32 F64 DATE TIME TIMESTAMP TIMESPAN GUID SYM S
 Things worth knowing:
 
 - An empty vector always needs its type: `[]` is an error, `(as 'I64 [])` is not.
-- Vector literals do not promote: `[1 2.5]` and `[1h 2i]` are errors.
+- Vector literals follow the language's
+  [typed vector literal](syntax.md#typed-vector-literals) rules: `[1 2.5]` is
+  `F64` and `[1 2 3h]` is `I16`, while `[1h 2i]`, `[1 0Nl 3h]` and `[1.5 2h]`
+  are `parse` errors and `[40000 1h]` is a `domain` error. Under a final `e`
+  a float past the F32 range is an error, as it is for the scalar `1e39e`.
 - A bare name inside `[...]` is a symbol, as in the language (`[a b]` is
   `['a 'b]`). Outside brackets a bare name is an error.
 - `list`, `dict`, `table` and `as` are keywords of this grammar. They are not

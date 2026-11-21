@@ -26,6 +26,7 @@
 #include "lang/nfo.h"
 #include "lang/env.h"
 #include "core/numparse.h"
+#include "lang/format.h"   /* ray_type_name, ray_fmt_null_literal */
 #include "table/sym.h"   /* RAY_SYM_W64 */
 #include <string.h>
 #include <limits.h>
@@ -91,6 +92,7 @@ typedef struct {
     int32_t col;
     ray_t  *nfo;
     int32_t depth;   /* recursion depth guard (see RAY_PARSE_MAX_DEPTH) */
+    bool    nul_l;   /* the open vector literal holds a 0Nl (see parse_vector) */
 } ray_parser_t;
 
 /* Recursive-descent depth ceiling.  Container literals (lists, vectors,
@@ -203,6 +205,7 @@ static const char* try_parse_time(const char* start, int32_t *ms_out) {
  * not evaluate or allocate per token. */
 #define LIT_INT(T, V)  do { out->type = (T); out->i = (int64_t)(V); return NULL; } while (0)
 #define LIT_NULL(T)    do { out->type = (T); out->null = true; return NULL; } while (0)
+#define LIT_TNULL(T)   do { out->suffixed = true; LIT_NULL(T); } while (0)
 
 static ray_t* scan_number(ray_parser_t *p, ray_scalar_lit_t *out) {
     memset(out, 0, sizeof *out);
@@ -229,16 +232,16 @@ static ray_t* scan_number(ray_parser_t *p, ray_scalar_lit_t *out) {
     /* Null literal: 0N{h,i,d,t,p,l,f,e,g} or bare 0N (defaults to i64 null). */
     if (!is_neg && p->pos[0] == '0' && p->pos[1] == 'N') {
         switch (p->pos[2]) {
-        case 'h': p->pos += 3; LIT_NULL(-RAY_I16);
-        case 'i': p->pos += 3; LIT_NULL(-RAY_I32);
-        case 'd': p->pos += 3; LIT_NULL(-RAY_DATE);
-        case 't': p->pos += 3; LIT_NULL(-RAY_TIME);
-        case 'p': p->pos += 3; LIT_NULL(-RAY_TIMESTAMP);
-        case 'n': p->pos += 3; LIT_NULL(-RAY_TIMESPAN);
-        case 'l': p->pos += 3; LIT_NULL(-RAY_I64);
-        case 'f': p->pos += 3; LIT_NULL(-RAY_F64);
-        case 'e': p->pos += 3; LIT_NULL(-RAY_F32);
-        case 'g': p->pos += 3; LIT_NULL(-RAY_GUID);
+        case 'h': p->pos += 3; LIT_TNULL(-RAY_I16);
+        case 'i': p->pos += 3; LIT_TNULL(-RAY_I32);
+        case 'd': p->pos += 3; LIT_TNULL(-RAY_DATE);
+        case 't': p->pos += 3; LIT_TNULL(-RAY_TIME);
+        case 'p': p->pos += 3; LIT_TNULL(-RAY_TIMESTAMP);
+        case 'n': p->pos += 3; LIT_TNULL(-RAY_TIMESPAN);
+        case 'l': p->pos += 3; LIT_TNULL(-RAY_I64);
+        case 'f': p->pos += 3; LIT_TNULL(-RAY_F64);
+        case 'e': p->pos += 3; LIT_TNULL(-RAY_F32);
+        case 'g': p->pos += 3; LIT_TNULL(-RAY_GUID);
         /* SYM has no typed null and no `0Ns` literal.  The empty symbol
          * (sym 0) is written `'` (parse_symbol below). */
         }
@@ -389,7 +392,7 @@ plain_number:;
     size_t span = (size_t)(p->pos - start);
 
     int is_f32 = (*p->pos == 'e');
-    if (is_f32) p->pos++;
+    if (is_f32) { p->pos++; out->suffixed = true; }
     if (is_float || is_f32) {
         double v = 0.0;
         if (ray_parse_f64(start, span, &v) == 0)
@@ -418,11 +421,13 @@ plain_number:;
     /* Type suffix: h (i16), i (i32) */
     if (*p->pos == 'h') {
         p->pos++;
+        out->suffixed = true;
         if (v < -32767 || v > 32767) return ray_error("domain", "parse: i16 literal out of range [-32767,32767], got %lld", (long long)v);
         LIT_INT(-RAY_I16, v);
     }
     if (*p->pos == 'i') {
         p->pos++;
+        out->suffixed = true;
         if (v < -2147483647LL || v > 2147483647LL) return ray_error("domain", "parse: i32 literal out of range [-2147483647,2147483647], got %lld", (long long)v);
         LIT_INT(-RAY_I32, v);
     }
@@ -452,6 +457,9 @@ static ray_t* parse_number(ray_parser_t *p) {
     ray_scalar_lit_t lit;
     ray_t* err = scan_number(p, &lit);
     if (err) return err;
+    /* 0N and 0Nl build the same atom; only 0Nl names a type that conflicts
+     * with a vector's final suffix. */
+    if (lit.null) p->nul_l |= lit.suffixed && lit.type == -RAY_I64;
     return lit_atom(&lit);
 }
 
@@ -619,6 +627,57 @@ static ray_t* parse_name(ray_parser_t *p) {
     return s;
 }
 
+/* [1 2 3h]: the final element's h, i or e suffix types the whole vector
+ * (#912).  Each earlier element is of that type (a suffixed literal or its
+ * typed null), an unsuffixed integer or float, or bare 0N; any other element,
+ * 0Nl and 0Nf included, conflicts.  Under h and i an integer must fit and a
+ * float literal is an error; under e every element narrows as the F32 cast
+ * does.  `nul_l` says the literal held a 0Nl, whose atom is that of 0N. */
+static ray_t* vec_by_suffix(ray_t** e, int32_t n, int8_t vt, bool nul_l) {
+    char sfx = vt == RAY_I16 ? 'h' : vt == RAY_I32 ? 'i' : 'e';
+    int64_t lim = vt == RAY_I16 ? 32767 : 2147483647LL;
+    ray_t* vec = ray_vec_new(vt, n);
+    if (RAY_IS_ERR(vec)) return vec;
+    vec->len = n;
+    int16_t* h = (int16_t*)ray_data(vec);
+    int32_t* w = (int32_t*)ray_data(vec);
+    float*   f = (float*)ray_data(vec);
+    for (int32_t i = 0; i < n; i++) {
+        ray_t* a = e[i];
+        bool null = RAY_ATOM_IS_NULL(a);
+        if (a->type == -vt) {
+            if (null)              ray_vec_set_null(vec, i, true);
+            else if (vt == RAY_I16) h[i] = a->i16;
+            else if (vt == RAY_I32) w[i] = a->i32;
+            else                    f[i] = (float)a->f64;   /* F32 atoms keep the f64 slot */
+            continue;
+        }
+        if (a->type == -RAY_I64 && !(null && nul_l)) {
+            if (null) { ray_vec_set_null(vec, i, true); continue; }
+            int64_t v = a->i64;
+            if (vt == RAY_F32) { f[i] = (float)v; continue; }
+            if (v < -lim || v > lim) {
+                ray_free(vec);
+                return ray_error("domain", "parse: vector element %d out of range for suffix '%c' [%lld,%lld], got %lld",
+                                 i, sfx, (long long)-lim, (long long)lim, (long long)v);
+            }
+            if (vt == RAY_I16) h[i] = (int16_t)v; else w[i] = (int32_t)v;
+            continue;
+        }
+        if (a->type == -RAY_F64 && !null) {
+            if (vt == RAY_F32) { f[i] = ray_cast_f64_to_f32_null(a->f64); continue; }
+            ray_free(vec);
+            if (fabs(a->f64) >= 0x1p63)
+                return ray_error("domain", "parse: vector element %d out of range for suffix '%c'", i, sfx);
+            return ray_error("domain", "parse: vector element %d is a float literal; suffix '%c' needs integers", i, sfx);
+        }
+        ray_free(vec);
+        return ray_error("domain", "parse: vector element %d (%s) conflicts with suffix '%c'",
+                         i, null && a->type < 0 ? ray_fmt_null_literal((int8_t)-a->type) : ray_type_name(a->type), sfx);
+    }
+    return vec;
+}
+
 /* ── Vector literal: [1 2 3] ── */
 static ray_t* parse_vector(ray_parser_t *p) {
     advance(p, 1); /* skip [ */
@@ -633,6 +692,8 @@ static ray_t* parse_vector(ray_parser_t *p) {
     int32_t count = 0;
 
     skip_ws_and_comments(p);
+    bool outer_nul_l = p->nul_l;
+    p->nul_l = false;
     while (*p->pos && *p->pos != ']') {
         if (count == cap) {
             if (cap > INT32_MAX / 2) {
@@ -662,6 +723,8 @@ static ray_t* parse_vector(ray_parser_t *p) {
         elems[count++] = elem;
         skip_ws_and_comments(p);
     }
+    bool nul_l = p->nul_l;
+    p->nul_l = outer_nul_l;
     if (*p->pos != ']') {
         for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
         ray_free(elems_buf);
@@ -789,6 +852,15 @@ static ray_t* parse_vector(ray_parser_t *p) {
                 ray_vec_set_null(vec, i, true);
             ray_release(elems[i]);
         }
+        ray_free(elems_buf);
+        return vec;
+    }
+
+    /* [1 2 3h]: a final h, i or e suffix types the whole vector. */
+    int8_t last_type = elems[count - 1]->type;
+    if (last_type == -RAY_I16 || last_type == -RAY_I32 || last_type == -RAY_F32) {
+        ray_t* vec = vec_by_suffix(elems, count, (int8_t)-last_type, nul_l);
+        for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
         ray_free(elems_buf);
         return vec;
     }

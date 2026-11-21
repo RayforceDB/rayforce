@@ -43,7 +43,10 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 
 F32 literals use a trailing lowercase `e`: `42e`, `1.5e`, or `-1.5e`.
 Scientific notation keeps its exponent: `1e3` is F64, while `1e3e` is F32.
-F32 vectors require a suffix on each non-null element: `[1e 2e 0Ne]`.
+An F32 vector is written with a suffix on each element, `[1e 2e 0Ne]`, or
+with one final suffix that types the whole literal, `[1 2.5 0N 3e]`; `h` and
+`i` work the same way for I16 and I32 (`[1 2 3h]`). See
+[Typed vector literals](../language/syntax.md#typed-vector-literals).
 Finite values beyond the F32 range saturate just as casts do. F32 values
 print with the suffix so parsing the output preserves the element type;
 the configured display precision still controls decimal rounding.

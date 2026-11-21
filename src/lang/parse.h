@@ -43,13 +43,17 @@ ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo);
  * parse/domain error ray_parse reports.  `widened` marks integer text that
  * overflowed I64 and was promoted to F64; `nonfinite` marks float text that
  * overflowed their own width; `byte_out_of_range` marks negative or oversized
- * hex byte text. These flags let data readers reject lossy conversions. */
+ * hex byte text. These flags let data readers reject lossy conversions.
+ * `suffixed` marks a literal that spells its type with a letter (1h, 2i,
+ * 3e, 0Nl, ...); bare 0N, plain integers and plain floats leave it clear,
+ * so a vector literal's final suffix (#912) can tell 0N from 0Nl. */
 typedef struct {
     int8_t  type;       /* atom type tag (negative): -RAY_I64, -RAY_F32, ... */
     bool    null;       /* a typed null literal (0Nx, bare 0N)               */
     bool    widened;
     bool    nonfinite;
     bool    byte_out_of_range;
+    bool    suffixed;
     int64_t i;          /* integer, date, time, timestamp and timespan value */
     double  f;          /* F64 value; an F32 is held as its float, widened   */
 } ray_scalar_lit_t;
